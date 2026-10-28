@@ -33,10 +33,10 @@ use super::auth::{AuthService, AuthStatus, OAuthProvider, OpenAuthorize};
 use super::auto_connect::{capture_auto_intent, write_auto_intent, AutoIntentClaim};
 use super::bridge::{BridgeManager, DataOutcome};
 use super::capability::{
-    confirm_pending, confirm_selection, confirm_send, resolve_capabilities, Capability,
-    CapabilityKey, CapabilityRecord, CapabilityState, ConfirmationBaseline, ConfirmationContext,
-    ConfirmationObservation, ConfirmationOutcome, ConfirmationTarget, SelectionObservation,
-    SendObservation,
+    confirm_interrupt, confirm_pending, confirm_selection, confirm_send, resolve_capabilities,
+    Capability, CapabilityKey, CapabilityRecord, CapabilityState, ConfirmationBaseline,
+    ConfirmationContext, ConfirmationObservation, ConfirmationOutcome, ConfirmationTarget,
+    InterruptObservation, SelectionObservation, SendObservation,
 };
 use super::command::CommandSender;
 use super::config::{get_config, ConfigState};
@@ -109,6 +109,14 @@ mod confirmation_words {
     pub(crate) const PENDING_CLEARED: &str = "pending_cleared";
     /// pending 卡到点未决且最后观察里目标卡仍在场。
     pub(crate) const PENDING_STILL_PRESENT: &str = "pending_still_present";
+    /// interrupt 确认（泵观察判据路径）：目标守卫消失 + 会话 revision 前进。
+    pub(crate) const INTERRUPT_CONFIRMED: &str = "guard_cleared+revision_advanced";
+    /// interrupt 确认（回执因果终态路径）：宿主停止终态确证目标守卫消失
+    /// （CommandSender 的 wait_stop_cleared 观察）；会话 revision 前进由泵判据
+    /// 负责，这里绝不冒写。
+    pub(crate) const INTERRUPT_CLEARED: &str = "guard_cleared";
+    /// interrupt 到点未决且最后观察里目标守卫仍在场。
+    pub(crate) const INTERRUPT_STILL_ACTIVE: &str = "guard_still_active";
     /// 确认窗到点未取得证据（不重发，保持候选）。
     pub(crate) const TIMEOUT: &str = "timeout_5s";
     /// 动作回执显式失败（host rejected/noop）。
@@ -212,8 +220,8 @@ impl ConfirmationTracker {
                 }
                 // 到点未决：inconclusive（有界窗，绝不重发）。
                 if now >= ctx.deadline {
-                    // Pending 目标：最后观察里目标卡仍在场 → 判据词如实记「卡未撤」；
-                    // 其余形态沿用一般超窗词。
+                    // Pending/Interrupt 目标：最后观察里目标卡/守卫仍在场 → 判据词
+                    // 如实记「卡未撤 / 守卫未清」；其余形态沿用一般超窗词。
                     let record = match &ctx.target {
                         ConfirmationTarget::Pending { request_key }
                             if view
@@ -224,6 +232,18 @@ impl ConfirmationTracker {
                             inconclusive_record_with(
                                 slot.1,
                                 confirmation_words::PENDING_STILL_PRESENT,
+                            )
+                        }
+                        ConfirmationTarget::Interrupt { guard_id }
+                            if view.control.as_ref().is_some_and(|control| {
+                                control.active_works.iter().any(|work| {
+                                    work.foreground_execution_id.as_deref() == Some(guard_id)
+                                })
+                            }) =>
+                        {
+                            inconclusive_record_with(
+                                slot.1,
+                                confirmation_words::INTERRUPT_STILL_ACTIVE,
                             )
                         }
                         _ => inconclusive_record(slot.1),
@@ -267,6 +287,25 @@ impl ConfirmationTracker {
                         let mut after = view.clone();
                         after.generation = generation;
                         confirm_pending(&ctx, &after)
+                    }
+                    ConfirmationTarget::Interrupt { .. } => {
+                        // 等效 control 快照：守卫 id 集合只在宿主明确宣告 control
+                        // （activeWorks 是数组）时才算证据；未宣告 → 没有任何
+                        // 「守卫消失」证据，等下一帧。generation 实参 = 本 Hub 代际
+                        // （与 send/selection 同源）。
+                        let active_works = view.control.as_ref().map(|control| {
+                            control
+                                .active_works
+                                .iter()
+                                .filter_map(|work| work.foreground_execution_id.clone())
+                                .collect::<Vec<_>>()
+                        });
+                        let obs = InterruptObservation {
+                            generation,
+                            revision: view.revision,
+                            active_works,
+                        };
+                        confirm_interrupt(&ctx, &obs)
                     }
                 };
                 if outcome == ConfirmationOutcome::Confirmed {
@@ -484,15 +523,19 @@ fn confirmed_evidence(target: &ConfirmationTarget) -> &'static str {
         ConfirmationTarget::UserMessage { .. } => confirmation_words::SEND_CONFIRMED,
         ConfirmationTarget::Selection { .. } => confirmation_words::SELECTION_CONFIRMED,
         ConfirmationTarget::Pending { .. } => confirmation_words::PENDING_CONFIRMED,
+        ConfirmationTarget::Interrupt { .. } => confirmation_words::INTERRUPT_CONFIRMED,
     }
 }
 
 /// 回执因果终态路径的 confirmed 判据词：pending 类能力在这里只确证「宿主已撤卡」
 /// （CommandSender 的 wait_host_cleared 观察），会话 revision 前进由泵判据负责
-/// ——判据词如实只写撤卡，绝不冒写未验证的判据。
+/// ——判据词如实只写撤卡，绝不冒写未验证的判据。interrupt 同理：回执终态只写
+/// 停止终态直接确证的守卫消失（`wait_stop_cleared` 的会话水位基线是派发在途的
+/// 写前复核值，不是登记时刻 baseline，不冒写 revision 前进）。
 fn confirmed_receipt_evidence(target: &ConfirmationTarget) -> &'static str {
     match target {
         ConfirmationTarget::Pending { .. } => confirmation_words::PENDING_CLEARED,
+        ConfirmationTarget::Interrupt { .. } => confirmation_words::INTERRUPT_CLEARED,
         _ => confirmed_evidence(target),
     }
 }
@@ -974,6 +1017,7 @@ impl HubBackend for PartsBackend {
                     revision: None,
                     provider: None,
                     log_fingerprint: None,
+                    active_works: None,
                 }),
             })
         })
@@ -2953,6 +2997,10 @@ impl ZcodeHub {
             // 审批应答：只确认「回答既有 permission 卡」（spec §4.1）——登记只发生
             // 在用户对既有卡的动作上，不监听「发送触发审批卡」/elicitation/新卡。
             ControlAction::Permission { .. } => vec![Capability::ApprovalReply],
+            // 打断：interrupt 首次真实使用（spec R4：目标 guard 从 activeWorks 消失
+            // + 停止终态）。登记面在 `register_confirmations` 里再按「初始 control
+            // 已宣告且目标守卫在场」收窄——无守卫可等待时不登记、不触发。
+            ControlAction::Stop { .. } => vec![Capability::Interrupt],
             // Snooze 只暂停自动结束计时，不是作答/审批：零登记。
             _ => Vec::new(),
         };
@@ -3061,6 +3109,28 @@ impl ZcodeHub {
                 (ControlAction::Permission { interaction_id, .. }, Capability::ApprovalReply) => {
                     ConfirmationTarget::Pending {
                         request_key: interaction_id.clone(),
+                    }
+                }
+                // 打断：目标守卫 = 动作自带的 `expectedForegroundExecutionId`（只存
+                // id 形状）。初始 control 未宣告（None）或目标守卫已不在 activeWorks
+                // → 没有可等待的守卫，**不登记**（无确认窗、不触发、不确认）。
+                (
+                    ControlAction::Stop {
+                        expected_foreground_execution_id,
+                        ..
+                    },
+                    Capability::Interrupt,
+                ) => {
+                    let guard_present = baseline
+                        .observation
+                        .active_works
+                        .as_ref()
+                        .is_some_and(|guards| guards.contains(expected_foreground_execution_id));
+                    if !guard_present {
+                        continue;
+                    }
+                    ConfirmationTarget::Interrupt {
+                        guard_id: expected_foreground_execution_id.clone(),
                     }
                 }
                 _ => continue,
@@ -7913,6 +7983,7 @@ mod tests {
                 revision: Some(10),
                 provider: None,
                 log_fingerprint: Some("u0".to_owned()),
+                active_works: None,
             },
         }
     }
@@ -7925,6 +7996,7 @@ mod tests {
                 revision: Some(10),
                 provider: Some("synthetic-provider".to_owned()),
                 log_fingerprint: None,
+                active_works: None,
             },
         }
     }
@@ -8253,6 +8325,7 @@ mod tests {
                 revision: Some(12),
                 provider: None,
                 log_fingerprint: Some("u9".to_owned()),
+                active_works: None,
             },
         });
         hub.execute(ctx("send-dup-2"), send_action(generation))
@@ -8299,6 +8372,7 @@ mod tests {
                 revision: Some(10),
                 provider: Some("synthetic-provider".to_owned()),
                 log_fingerprint: Some("u0".to_owned()),
+                active_works: None,
             },
         });
         let (hub, _events, _pump) = confirmation_hub(
@@ -8361,6 +8435,7 @@ mod tests {
                 revision: Some(10),
                 provider: Some("synthetic-provider".to_owned()),
                 log_fingerprint: Some("u0".to_owned()),
+                active_works: None,
             },
         });
         let (hub, _events, _pump) = confirmation_hub(
@@ -8594,6 +8669,7 @@ mod tests {
                 revision: Some(10),
                 provider: None,
                 log_fingerprint: None,
+                active_works: None,
             },
         }
     }
@@ -9043,5 +9119,349 @@ mod tests {
             };
             assert_eq!(row.evidence.as_deref(), Some(expected));
         }
+    }
+
+    // ====================================================================
+    // T7：首次真实打断确认（spec R4）——interrupt 接线
+    // ====================================================================
+
+    /// interrupt 确认测试的 baseline：revision 10 + 初始 control 守卫集合
+    /// （`None` = control 未宣告；只存 id 形状，回合内容不入账本）。
+    fn interrupt_baseline(active_works: Option<Vec<String>>) -> ConfirmationBaseline {
+        ConfirmationBaseline {
+            key: confirmation_key(),
+            observation: ConfirmationObservation {
+                revision: Some(10),
+                provider: None,
+                log_fingerprint: None,
+                active_works,
+            },
+        }
+    }
+
+    /// 打断测试动作：守卫 id = 动作自带的 `expectedForegroundExecutionId`
+    /// （id 形状；绝不进日志/账本/断言正文）。
+    fn stop_action(generation: u64, guard_id: &str) -> ControlAction {
+        ControlAction::Stop {
+            session_id: "sess_synthetic0000".into(),
+            generation,
+            expected_foreground_execution_id: guard_id.into(),
+        }
+    }
+
+    /// 带宿主 control 守卫集合的变化视图（其余字段与 `changed_view` 同形）。
+    fn changed_view_with_control(
+        session_id: &str,
+        revision: u64,
+        guards: Vec<&str>,
+    ) -> SessionView {
+        let mut view = changed_view(session_id, revision);
+        view.control = Some(ControlView {
+            active_works: guards
+                .into_iter()
+                .map(|guard_id| ActiveWork {
+                    kind: "primaryTurn".to_owned(),
+                    foreground_execution_id: Some(guard_id.to_owned()),
+                })
+                .collect(),
+        });
+        view
+    }
+
+    /// 打断首次使用：ACK 后泵观察到目标守卫从 activeWorks 消失 + revision 前进
+    /// → confirmed（判据词 `guard_cleared+revision_advanced`；确认窗内绝不重发）。
+    ///
+    /// 长确认窗（2s）：不赌计时器，让确认走观察路径（T5/T6 同款纪律）。
+    #[tokio::test]
+    async fn stop_confirmation_confirms_via_pump_when_guard_cleared() {
+        let store = stored(URL);
+        let ledger: Arc<dyn CapabilityLedger> = Arc::new(DbCapabilityLedger::new(store.clone()));
+        let fake = Arc::new(FakeBackend::default());
+        fake.set_baseline(interrupt_baseline(Some(vec!["work-1".to_owned()])));
+        let (hub, events, pump) = confirmation_hub_with_timeout(
+            fake.clone(),
+            ledger.clone(),
+            policy_with(&["interrupt"]),
+            Duration::from_secs(2),
+        )
+        .await;
+        let generation = hub.connection().generation;
+
+        let receipt = hub
+            .execute(ctx("stop-confirm-1"), stop_action(generation, "work-1"))
+            .await
+            .expect("stop 应被受理");
+        assert_eq!(receipt.state, ActionState::Accepted);
+
+        // 新投影：revision 前进 + 目标守卫已从 activeWorks 消失（显式空数组）。
+        pump.push_outcome(
+            Ok(()),
+            vec![changed_view_with_control("sess_synthetic0000", 11, vec![])],
+        );
+        events
+            .send(RelayEvent::Data(serde_json::json!({"seq": 1})))
+            .await
+            .unwrap();
+
+        wait_until_with_sleep(|| {
+            ledger
+                .get(&confirmation_key())
+                .first()
+                .is_some_and(|row| row.state == CapabilityState::Confirmed)
+        })
+        .await;
+
+        let rows = ledger.get(&confirmation_key());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].capability, Capability::Interrupt);
+        assert_eq!(rows[0].state, CapabilityState::Confirmed);
+        // 判据词经真实 T2 硬闸落库（DbCapabilityLedger 的受限校验在场）。
+        assert_eq!(
+            rows[0].evidence.as_deref(),
+            Some("guard_cleared+revision_advanced")
+        );
+        assert_eq!(rows[0].reason_code, None);
+        // 结构性不重发：确认窗内只派发过一次动作。
+        assert_eq!(fake.execute_calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// 初始 control 未宣告 / 目标守卫不在场 → 无守卫可等待：不登记（无确认窗），
+    /// 随后哪怕投影 revision 前进 + 守卫消失（判据形态全满足）也绝不确认。
+    #[tokio::test]
+    async fn stop_without_target_guard_in_initial_control_does_not_register() {
+        for (case, active_works) in [
+            ("control 未宣告", None),
+            ("目标守卫不在场", Some(vec!["work-other".to_owned()])),
+        ] {
+            let store = stored(URL);
+            let ledger: Arc<dyn CapabilityLedger> =
+                Arc::new(DbCapabilityLedger::new(store.clone()));
+            let fake = Arc::new(FakeBackend::default());
+            fake.set_baseline(interrupt_baseline(active_works));
+            let (hub, events, pump) = confirmation_hub_with_timeout(
+                fake.clone(),
+                ledger.clone(),
+                policy_with(&["interrupt"]),
+                Duration::from_secs(2),
+            )
+            .await;
+            let generation = hub.connection().generation;
+
+            let receipt = hub
+                .execute(ctx("stop-no-guard-1"), stop_action(generation, "work-1"))
+                .await
+                .expect("stop 应被受理");
+            assert_eq!(receipt.state, ActionState::Accepted);
+
+            // 即便随后的投影满足判据形态（revision 前进 + 显式空 activeWorks），
+            // 没登记过就没有确认窗：绝不确认。
+            pump.push_outcome(
+                Ok(()),
+                vec![changed_view_with_control("sess_synthetic0000", 11, vec![])],
+            );
+            events
+                .send(RelayEvent::Data(serde_json::json!({"seq": 2})))
+                .await
+                .unwrap();
+            // 先证明帧确实进了桥（观察已发生），负断言才有意义。
+            wait_until(|| !pump.data.lock().unwrap().is_empty()).await;
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            assert!(
+                ledger.get(&confirmation_key()).is_empty(),
+                "{case}：无守卫不登记，绝不确认"
+            );
+            // 结构性不重发：只派发过一次动作。
+            assert_eq!(fake.execute_calls.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    /// 目标守卫仍在场（哪怕 revision 前进、别的守卫消失了）：绝不确认——不把
+    /// 其它回合的停止当目标打断成功；保持候选，等后续帧或到点结算（不重发）。
+    #[tokio::test]
+    async fn stop_confirmation_keeps_candidate_while_target_guard_still_active() {
+        let store = stored(URL);
+        let ledger: Arc<dyn CapabilityLedger> = Arc::new(DbCapabilityLedger::new(store.clone()));
+        let fake = Arc::new(FakeBackend::default());
+        fake.set_baseline(interrupt_baseline(Some(vec![
+            "work-1".to_owned(),
+            "work-2".to_owned(),
+        ])));
+        let (hub, events, pump) = confirmation_hub_with_timeout(
+            fake.clone(),
+            ledger.clone(),
+            policy_with(&["interrupt"]),
+            Duration::from_secs(2),
+        )
+        .await;
+        let generation = hub.connection().generation;
+
+        hub.execute(ctx("stop-present-1"), stop_action(generation, "work-1"))
+            .await
+            .expect("stop 应被受理");
+
+        // 新投影：revision 前进，别的守卫（work-2）消失，但目标守卫（work-1）仍在。
+        pump.push_outcome(
+            Ok(()),
+            vec![changed_view_with_control(
+                "sess_synthetic0000",
+                11,
+                vec!["work-1"],
+            )],
+        );
+        events
+            .send(RelayEvent::Data(serde_json::json!({"seq": 3})))
+            .await
+            .unwrap();
+        // 先证明帧确实进了桥（观察已发生），负断言才有意义。
+        wait_until(|| !pump.data.lock().unwrap().is_empty()).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            ledger.get(&confirmation_key()).is_empty(),
+            "目标守卫在场绝不确认（保持候选，零落账）"
+        );
+        // 结构性不重发：确认窗内只派发过一次动作。
+        assert_eq!(fake.execute_calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// 回执因果终态（CommandSender 的 wait_stop_cleared 确证停止终态后升级
+    /// confirmed）→ interrupt 直接 confirmed，判据词如实只写守卫消失
+    /// （`guard_cleared`；会话 revision 前进由泵判据负责，绝不冒写）。
+    #[tokio::test]
+    async fn stop_receipt_terminal_confirms_interrupt() {
+        let store = stored(URL);
+        let ledger: Arc<dyn CapabilityLedger> = Arc::new(DbCapabilityLedger::new(store.clone()));
+        let fake = Arc::new(FakeBackend::default());
+        fake.set_baseline(interrupt_baseline(Some(vec!["work-1".to_owned()])));
+        fake.set_execute_receipt(ActionState::Confirmed, None);
+        let (hub, _events, _pump) =
+            confirmation_hub(fake.clone(), ledger.clone(), policy_with(&["interrupt"])).await;
+        let generation = hub.connection().generation;
+
+        let receipt = hub
+            .execute(ctx("stop-terminal-1"), stop_action(generation, "work-1"))
+            .await
+            .expect("回执带回显，execute 返回 Ok");
+        assert_eq!(receipt.state, ActionState::Confirmed);
+
+        let rows = ledger.get(&confirmation_key());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].capability, Capability::Interrupt);
+        assert_eq!(rows[0].state, CapabilityState::Confirmed);
+        assert_eq!(rows[0].evidence.as_deref(), Some("guard_cleared"));
+        assert_eq!(rows[0].reason_code, None);
+    }
+
+    /// 回执结果未知（写后 ACK 超窗）→ inconclusive（保持候选，不重发）。
+    #[tokio::test]
+    async fn stop_receipt_unknown_settles_inconclusive_without_resend() {
+        let store = stored(URL);
+        let ledger: Arc<dyn CapabilityLedger> = Arc::new(DbCapabilityLedger::new(store.clone()));
+        let fake = Arc::new(FakeBackend::default());
+        fake.set_baseline(interrupt_baseline(Some(vec!["work-1".to_owned()])));
+        fake.set_execute_receipt(ActionState::Unknown, None);
+        let (hub, _events, _pump) =
+            confirmation_hub(fake.clone(), ledger.clone(), policy_with(&["interrupt"])).await;
+        let generation = hub.connection().generation;
+
+        let receipt = hub
+            .execute(ctx("stop-unknown-1"), stop_action(generation, "work-1"))
+            .await
+            .expect("回执带回显，execute 返回 Ok");
+        assert_eq!(receipt.state, ActionState::Unknown);
+
+        let rows = ledger.get(&confirmation_key());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].capability, Capability::Interrupt);
+        assert_eq!(rows[0].state, CapabilityState::Inconclusive);
+        assert_eq!(rows[0].evidence.as_deref(), Some("unknown_receipt"));
+        // 结构性不重发：只派发过一次动作。
+        assert_eq!(fake.execute_calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// ACK-only 不升级：stop 被 accepted 后确认窗内无新投影证据 → 账本不写
+    /// confirmed；短窗到期由计时器写 inconclusive（保持候选，绝不重发）。
+    #[tokio::test]
+    async fn ack_only_stop_times_out_inconclusive_without_resend() {
+        let store = stored(URL);
+        let ledger: Arc<dyn CapabilityLedger> = Arc::new(DbCapabilityLedger::new(store.clone()));
+        let fake = Arc::new(FakeBackend::default());
+        fake.set_baseline(interrupt_baseline(Some(vec!["work-1".to_owned()])));
+        let (hub, _events, _pump) =
+            confirmation_hub(fake.clone(), ledger.clone(), policy_with(&["interrupt"])).await;
+        let generation = hub.connection().generation;
+
+        let receipt = hub
+            .execute(ctx("stop-ack-1"), stop_action(generation, "work-1"))
+            .await
+            .expect("stop 应被受理");
+        assert_eq!(receipt.state, ActionState::Accepted);
+
+        // 不喂任何帧：确认窗到点 → inconclusive。
+        wait_until_with_sleep(|| !ledger.get(&confirmation_key()).is_empty()).await;
+        let rows = ledger.get(&confirmation_key());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].capability, Capability::Interrupt);
+        assert_eq!(rows[0].state, CapabilityState::Inconclusive);
+        assert_eq!(rows[0].evidence.as_deref(), Some("timeout_5s"));
+        // 结构性不重发：确认窗内只派发过一次动作。
+        assert_eq!(fake.execute_calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// 到点未决的 Interrupt 登记：最后观察里目标守卫仍在场 → 判据词如实记
+    /// `guard_still_active`；守卫已不在的到点登记沿用一般超窗词（直调 tracker，
+    /// 与计时器醒来的 sweep 语义一致——到点即 inconclusive，绝不重判）。
+    #[tokio::test]
+    async fn expired_interrupt_observation_reports_guard_still_active() {
+        let store = stored(URL);
+        let ledger: Arc<dyn CapabilityLedger> = Arc::new(DbCapabilityLedger::new(store.clone()));
+        let fake = Arc::new(FakeBackend::default());
+        fake.set_baseline(interrupt_baseline(Some(vec!["work-1".to_owned()])));
+        let (hub, _events, _pump) =
+            confirmation_hub(fake.clone(), ledger.clone(), policy_with(&["interrupt"])).await;
+        let generation = hub.connection().generation;
+
+        // 到点登记 #1：观察帧里目标守卫仍在场。
+        assert!(hub.confirmations.register(ConfirmationContext {
+            capability: Capability::Interrupt,
+            key: confirmation_key(),
+            session_id: "sess_synthetic0000".to_owned(),
+            generation,
+            baseline_revision: 10,
+            target: ConfirmationTarget::Interrupt {
+                guard_id: "work-1".to_owned(),
+            },
+            deadline: Instant::now(),
+        }));
+        hub.confirmations.observe_session(
+            &changed_view_with_control("sess_synthetic0000", 11, vec!["work-1"]),
+            generation,
+            None,
+        );
+        let rows = ledger.get(&confirmation_key());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].state, CapabilityState::Inconclusive);
+        assert_eq!(rows[0].evidence.as_deref(), Some("guard_still_active"));
+
+        // 到点登记 #2（同槽位已被摘除，可再登记）：观察帧里目标守卫已不在。
+        assert!(hub.confirmations.register(ConfirmationContext {
+            capability: Capability::Interrupt,
+            key: confirmation_key(),
+            session_id: "sess_synthetic0000".to_owned(),
+            generation,
+            baseline_revision: 11,
+            target: ConfirmationTarget::Interrupt {
+                guard_id: "work-1".to_owned(),
+            },
+            deadline: Instant::now(),
+        }));
+        hub.confirmations.observe_session(
+            &changed_view_with_control("sess_synthetic0000", 12, vec!["work-9"]),
+            generation,
+            None,
+        );
+        let rows = ledger.get(&confirmation_key());
+        assert_eq!(rows.len(), 1, "同 key 同能力 upsert 覆盖");
+        assert_eq!(rows[0].state, CapabilityState::Inconclusive);
+        assert_eq!(rows[0].evidence.as_deref(), Some("timeout_5s"));
     }
 }

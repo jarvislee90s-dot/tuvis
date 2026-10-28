@@ -1411,6 +1411,15 @@ impl BridgeManager {
             revision: view.revision,
             provider: view.selection.as_ref().map(|s| s.provider.clone()),
             log_fingerprint: entry.log_fingerprint.clone(),
+            // 初始 control 的守卫 id 集合（interrupt 登记面）：宿主未宣告 control
+            // = None（无守卫可等待）；宣告了则只留 foregroundExecutionId 的 id 形状。
+            active_works: view.control.as_ref().map(|control| {
+                control
+                    .active_works
+                    .iter()
+                    .filter_map(|work| work.foreground_execution_id.clone())
+                    .collect()
+            }),
         })
     }
 

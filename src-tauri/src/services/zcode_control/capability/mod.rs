@@ -19,9 +19,9 @@ pub(crate) mod state;
 // 便捷再导出（T2-T5 的统一入口面）；全部有生产消费方
 // （resolver / hub / dao / types / bridge），不再放宽 unused_imports。
 pub(crate) use confirm::{
-    confirm_pending, confirm_selection, confirm_send, ConfirmationBaseline, ConfirmationContext,
-    ConfirmationObservation, ConfirmationOutcome, ConfirmationTarget, SelectionObservation,
-    SendObservation,
+    confirm_interrupt, confirm_pending, confirm_selection, confirm_send, ConfirmationBaseline,
+    ConfirmationContext, ConfirmationObservation, ConfirmationOutcome, ConfirmationTarget,
+    InterruptObservation, SelectionObservation, SendObservation,
 };
 pub(crate) use interface::interface_capabilities;
 pub(crate) use key::{shipped_state, CapabilityKey};

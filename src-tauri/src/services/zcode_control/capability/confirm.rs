@@ -12,10 +12,12 @@
 //!   wrong model → 不确认，保持候选）；
 //! - pending 卡（single/multi/free/approval）= generation 匹配 AND revision 前进
 //!   AND 目标 `request_key` 不在观察视图的 pending 列表（只认**目标卡**撤下，
-//!   旁边的卡消失绝不代答）。
+//!   旁边的卡消失绝不代答）；
+//! - interrupt = generation 匹配 AND revision 前进 AND 目标守卫 id 不在观察快照的
+//!   `activeWorks`（只认**目标守卫**消失，别的回合停止绝不代答）。
 //!
-//! 边界纪律：观察输入只含 id 形状的指纹、选择三元组与 pending 卡的 id 集合，
-//! **绝不**承载正文、题目、选项、答案、JWT、链接。
+//! 边界纪律：观察输入只含 id 形状的指纹、选择三元组、pending 卡的 id 集合与
+//! 守卫 id 集合，**绝不**承载正文、题目、选项、答案、命令、JWT、链接。
 //!
 //! # 自裁偏差（已报备）
 //!
@@ -48,6 +50,13 @@ pub(crate) enum ConfirmationTarget {
     Pending {
         /// 登记时刻动作指向的宿主卡 id；观察侧它不在 pending 列表 = 目标卡撤下。
         request_key: String,
+    },
+    /// 打断（stop）：目标守卫 id（动作自带的 `expectedForegroundExecutionId`；
+    /// 只存 id 形状，绝不存命令/回合内容）。观察侧它不在 control 的 `activeWorks`
+    /// = 目标守卫消失。
+    Interrupt {
+        /// 登记时刻动作指向的守卫 id；观察侧它不在 activeWorks = 目标守卫消失。
+        guard_id: String,
     },
 }
 
@@ -102,6 +111,24 @@ pub(crate) struct SelectionObservation {
     pub thought: String,
 }
 
+/// 纯判据输入（由桥/事件泵/测试构造；不含正文）：interrupt 侧观察。
+///
+/// 这是 T7 接口里 `ControlView` 的**等效 control 快照**（自裁偏差，已报备）：现有
+/// `types::ControlView` 是协议 DTO，只承载 `activeWorks` 数组，没有 generation/
+/// revision 的安放处，而 interrupt 判据要求「generation 匹配 AND revision 前进
+/// AND 守卫消失」三合一；不改协议 DTO（不猜协议），判据输入用本快照。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct InterruptObservation {
+    /// 观察时刻的 Hub 代际（与 ctx.generation 对拍；旧代际一律不确认）。
+    pub generation: u64,
+    /// 观察侧会话 revision（投影尚无水位 = None：没有任何新证据，等下一帧）。
+    pub revision: Option<u64>,
+    /// 宿主宣告的 activeWorks 守卫 id 集合（只装 `foregroundExecutionId` 的 id
+    /// 形状；control 未宣告 = None：没有「守卫消失」的证据，等下一帧——绝不把
+    /// control 未知当成已清空）。
+    pub active_works: Option<Vec<String>>,
+}
+
 /// 动作提交路径的**会话侧** baseline 观察（bridge 只读快照产出；key 由后端补齐）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ConfirmationObservation {
@@ -111,6 +138,10 @@ pub(crate) struct ConfirmationObservation {
     pub provider: Option<String>,
     /// 会话日志头指纹（`logEpoch:seq`；快照未携带 = None）。
     pub log_fingerprint: Option<String>,
+    /// 当前 control 宣告的守卫 id 集合（interrupt 登记面用：初始 control 未宣告
+    /// = None → 没有可等待的守卫，不登记；宣告了则只装 `foregroundExecutionId`
+    /// 的 id 形状）。
+    pub active_works: Option<Vec<String>>,
 }
 
 /// 动作提交路径的 baseline（`HubBackend::confirmation_baseline` 产出）。
@@ -205,6 +236,43 @@ pub(crate) fn confirm_pending(
         .iter()
         .any(|card| card.interaction_id == *request_key);
     if revision_advanced && target_cleared {
+        ConfirmationOutcome::Confirmed
+    } else {
+        ConfirmationOutcome::Inconclusive
+    }
+}
+
+/// interrupt 判据（spec R4；生产计划 T7）：目标守卫从 activeWorks 消失 + revision 前进。
+///
+/// generation 不匹配的兜底语义同 [`confirm_send`]；`after.revision` 缺席（投影尚无
+/// 水位）与 `after.active_works` 缺席（宿主从未宣告 control）都是「没有任何新证据」
+/// ——保守不确认，等下一帧（绝不把 control 未知当成守卫已清空）。
+///
+/// 判定只读 `after.active_works` 的守卫 id 集合：**别的**守卫消失绝不构成目标守卫
+/// 消失的证据（不把其它回合的停止当目标打断成功）；「无守卫不登记」的边界由登记
+/// 侧保证——登记只发生在提交时目标守卫已在初始 control 的 activeWorks 里（见
+/// hub.rs `register_confirmations`），control 未知时根本不开确认窗。
+pub(crate) fn confirm_interrupt(
+    ctx: &ConfirmationContext,
+    after: &InterruptObservation,
+) -> ConfirmationOutcome {
+    if after.generation != ctx.generation {
+        return ConfirmationOutcome::Inconclusive;
+    }
+    let ConfirmationTarget::Interrupt { guard_id } = &ctx.target else {
+        return ConfirmationOutcome::Inconclusive;
+    };
+    let Some(revision) = after.revision else {
+        // 水位未取得（投影尚无快照）：没有任何新证据，等下一帧。
+        return ConfirmationOutcome::Inconclusive;
+    };
+    let Some(active_works) = after.active_works.as_ref() else {
+        // control 未宣告：没有「守卫消失」的证据，等下一帧。
+        return ConfirmationOutcome::Inconclusive;
+    };
+    let revision_advanced = revision > ctx.baseline_revision;
+    let guard_cleared = !active_works.iter().any(|id| id == guard_id);
+    if revision_advanced && guard_cleared {
         ConfirmationOutcome::Confirmed
     } else {
         ConfirmationOutcome::Inconclusive
@@ -525,6 +593,138 @@ mod tests {
         let after = session_with(6, vec![]);
         assert_eq!(
             confirm_pending(&ctx, &after),
+            ConfirmationOutcome::Inconclusive
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // T7：interrupt 的纯判据（目标守卫从 activeWorks 消失 + revision 前进）
+    // -----------------------------------------------------------------------
+
+    /// brief 指定的测试助手（不是生产接口）：Interrupt 确认上下文（generation 7，
+    /// 与 `control_with` 的固定代际对齐）。
+    fn interrupt_ctx(guard_id: &str, revision: u64) -> ConfirmationContext {
+        ConfirmationContext {
+            capability: Capability::Interrupt,
+            key: CapabilityKey::new("macos", "9.9.9.9999", 3, "shape", 1),
+            session_id: "sess_interrupt".to_owned(),
+            generation: 7,
+            baseline_revision: revision,
+            target: ConfirmationTarget::Interrupt {
+                guard_id: guard_id.to_owned(),
+            },
+            deadline: Instant::now() + std::time::Duration::from_secs(5),
+        }
+    }
+
+    /// brief 指定的测试助手（不是生产接口）：等效 control 快照（generation 固定 7；
+    /// `active_works` 只装守卫 id 字符串，回合内容不入测试断言）。
+    fn control_with(revision: u64, active_works: Vec<String>) -> InterruptObservation {
+        InterruptObservation {
+            generation: 7,
+            revision: Some(revision),
+            active_works: Some(active_works),
+        }
+    }
+
+    /// brief Step 1 逐字用例：目标守卫仍在场（同形观察）→ 不确认。
+    #[test]
+    fn guard_still_active_is_not_confirmed() {
+        let ctx = interrupt_ctx("work-1", 2);
+        let after = control_with(2, vec!["work-1".into()]);
+        assert_eq!(
+            confirm_interrupt(&ctx, &after),
+            ConfirmationOutcome::Inconclusive
+        );
+    }
+
+    /// brief Step 1 逐字用例：目标守卫消失 + revision 前进 → confirmed。
+    #[test]
+    fn guard_cleared_confirms_interrupt() {
+        let ctx = interrupt_ctx("work-1", 2);
+        let after = control_with(3, vec![]);
+        assert_eq!(
+            confirm_interrupt(&ctx, &after),
+            ConfirmationOutcome::Confirmed
+        );
+    }
+
+    /// 补充：守卫已消失但 revision 未前进（同形观察）→ 不确认（两判据缺一不可）。
+    #[test]
+    fn interrupt_cleared_without_revision_advance_is_not_confirmed() {
+        let ctx = interrupt_ctx("work-1", 2);
+        let after = control_with(2, vec![]);
+        assert_eq!(
+            confirm_interrupt(&ctx, &after),
+            ConfirmationOutcome::Inconclusive
+        );
+    }
+
+    /// 补充：目标守卫还在场（别的守卫在场/消失都不影响判定）+ revision 前进
+    /// → 不确认（不把其它回合的停止当目标打断成功；「基线里另一个守卫此后消失、
+    /// 目标仍在」的完整场景由 hub 侧
+    /// `stop_confirmation_keeps_candidate_while_target_guard_still_active` 钉住——
+    /// 纯判据看不到登记时刻的 activeWorks 基线，只认「目标守卫是否还在」）。
+    #[test]
+    fn other_guard_cleared_is_not_confirmed() {
+        let ctx = interrupt_ctx("work-1", 2);
+        let after = control_with(3, vec!["work-1".into(), "work-9".into()]);
+        assert_eq!(
+            confirm_interrupt(&ctx, &after),
+            ConfirmationOutcome::Inconclusive
+        );
+    }
+
+    /// 补充：旧代际观察 → 纯函数侧保守不确认（tracker 另行丢弃不落账）。
+    #[test]
+    fn stale_generation_interrupt_observation_is_never_confirmed() {
+        let ctx = interrupt_ctx("work-1", 2);
+        let mut stale = control_with(3, vec![]);
+        stale.generation = 6;
+        assert_eq!(
+            confirm_interrupt(&ctx, &stale),
+            ConfirmationOutcome::Inconclusive
+        );
+    }
+
+    /// 补充：revision 未取得（投影尚无水位）→ 没有任何新证据，等下一帧。
+    #[test]
+    fn interrupt_missing_revision_is_never_confirmed() {
+        let ctx = interrupt_ctx("work-1", 2);
+        let after = InterruptObservation {
+            generation: 7,
+            revision: None,
+            active_works: Some(vec![]),
+        };
+        assert_eq!(
+            confirm_interrupt(&ctx, &after),
+            ConfirmationOutcome::Inconclusive
+        );
+    }
+
+    /// 补充：control 未宣告（宿主从未给出 activeWorks 数组）→ 没有「守卫消失」
+    /// 的证据，保守不确认（绝不把 control 未知当成已清空）。
+    #[test]
+    fn interrupt_missing_control_is_never_confirmed() {
+        let ctx = interrupt_ctx("work-1", 2);
+        let after = InterruptObservation {
+            generation: 7,
+            revision: Some(3),
+            active_works: None,
+        };
+        assert_eq!(
+            confirm_interrupt(&ctx, &after),
+            ConfirmationOutcome::Inconclusive
+        );
+    }
+
+    /// 补充：send 上下文配了 interrupt 判据（登记侧接线错误）→ 保守不确认。
+    #[test]
+    fn interrupt_wrong_target_type_is_never_confirmed() {
+        let ctx = send_ctx(7, 2);
+        let after = control_with(3, vec![]);
+        assert_eq!(
+            confirm_interrupt(&ctx, &after),
             ConfirmationOutcome::Inconclusive
         );
     }
