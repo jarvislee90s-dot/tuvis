@@ -470,8 +470,10 @@ pub fn run() {
 pub(crate) fn exit_cleanup() {
     crate::remote::tunnel::stop_all();
     // T7.1 C2b：退出断开唯一 ZCode 控制 Hub（推进代际、关 relay/计时器）。
-    // 与远程停止同一断开口；重启需显式 connect（不自动重连）。
-    crate::remote::disconnect_zcode_hub();
+    // 退出专用**静默**入口：只释放并清位，绝不补唤醒自动连接——退出时 remote.enabled/
+    // auto 意图/内存 JWT 可能都还有效，普通入口的 P2-5 补唤醒会真的新开 relay。
+    // 重启需显式 connect（不自动重连）。
+    crate::remote::disconnect_zcode_hub_silent();
     // §C1 修复轮 1 Finding 2②：Funnel 无子进程可 kill_on_drop（守护 =
     // 轮询线程 + tailscaled 常驻配置），进程退出必须显式撤 + 收 DESIRED
     crate::remote::tailscale::stop_all();

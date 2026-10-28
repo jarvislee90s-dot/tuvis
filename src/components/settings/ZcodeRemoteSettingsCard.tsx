@@ -285,7 +285,9 @@ export function ZcodeRemoteSettingsCard({
   const providerVerified = provider === PROVIDER_BIGMODEL || ZAI_LIVE_VERIFIED;
   const connectionState: ConnectionState = connection?.state ?? "unknown";
   const authView = authPresentation(auth);
-  const canForget = auth !== null && (auth.authorized || auth.remembered);
+  // P2-8：删除失败后后端回 authorized/remembered=false + problem；problem 非 null 说明
+  // 确有一次待清理的授权/存储动作，按钮必须保持可用，否则用户无法重试幂等删除。
+  const canForget = auth !== null && (auth.authorized || auth.remembered || auth.problem !== null);
   const busy = saving || controlBusy !== null;
 
   // 授权 / 连接 / 断开：只走 IPC，参数里没有 URL/token（凭据只在本机 Rust 内存里）；
@@ -585,7 +587,7 @@ export function ZcodeRemoteSettingsCard({
               >
                 {t("settings.remote.zcode.disconnect")}
               </Button>
-              {/* C4：忘记授权 = 清本机记住的账号（链接保留）；只在确有授权时可用 */}
+              {/* C4：忘记授权 = 清本机记住的账号（链接保留）；有授权或删除失败待重试时可用 */}
               <Button
                 size="sm"
                 variant="outline"
