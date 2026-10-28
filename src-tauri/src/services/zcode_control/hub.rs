@@ -3964,9 +3964,11 @@ mod tests {
     /// epoch 本任务恒 0。
     #[test]
     fn capability_key_is_stable_per_evidence_and_content_free() {
-        let mut evidence = HostEvidence::default();
-        evidence.app_build = Some("3.16.2.8769".to_owned());
-        evidence.protocol_version = Some(3);
+        let evidence = HostEvidence {
+            app_build: Some("3.16.2.8769".to_owned()),
+            protocol_version: Some(3),
+            ..Default::default()
+        };
         assert_eq!(capability_key(&evidence), capability_key(&evidence));
         // build / 协议变化 → 不同 key（失效单元语义）。
         let mut upgraded = evidence.clone();

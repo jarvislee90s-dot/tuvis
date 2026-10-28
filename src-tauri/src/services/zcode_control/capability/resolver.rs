@@ -180,8 +180,10 @@ mod tests {
     #[test]
     fn unknown_build_opens_only_interface_matched() {
         let key = CapabilityKey::new("macos", "9.9.9.9999", 3, "shape", 1);
-        let mut ev = ZcodeInterfaceEvidence::default();
-        ev.method_send = true;
+        let ev = ZcodeInterfaceEvidence {
+            method_send: true,
+            ..Default::default()
+        };
         let view = resolve_capabilities(&key, &ev, &MemoryLedger::default());
         assert!(view.send.enabled);
         assert!(!view.approval_reply.enabled);
@@ -191,8 +193,10 @@ mod tests {
     #[test]
     fn degraded_overrides_interface_candidate() {
         let key = CapabilityKey::new("macos", "9.9.9.9999", 3, "shape", 1);
-        let mut ev = ZcodeInterfaceEvidence::default();
-        ev.method_send = true;
+        let ev = ZcodeInterfaceEvidence {
+            method_send: true,
+            ..Default::default()
+        };
         let ledger = MemoryLedger::with(key.clone(), Capability::Send, CapabilityState::Degraded);
         let view = resolve_capabilities(&key, &ev, &ledger);
         assert!(!view.send.enabled);
@@ -270,11 +274,13 @@ mod tests {
     #[test]
     fn known_build_shipped_beats_interface_candidates() {
         let key = known_build_key();
-        let mut ev = ZcodeInterfaceEvidence::default();
-        ev.method_send = true;
-        ev.has_user_input_pending = true;
-        ev.has_multi_select = true;
-        ev.has_free_text = true;
+        let ev = ZcodeInterfaceEvidence {
+            method_send: true,
+            has_user_input_pending: true,
+            has_multi_select: true,
+            has_free_text: true,
+            ..Default::default()
+        };
         let view = resolve_capabilities(&key, &ev, &MemoryLedger::default());
         // shipped Confirmed + 方法在场 → 可用。
         assert!(view.send.enabled);
@@ -314,10 +320,12 @@ mod tests {
     #[test]
     fn ledger_confirmed_overrides_shipped() {
         let key = known_build_key();
-        let mut ev = ZcodeInterfaceEvidence::default();
-        ev.method_send = true;
-        ev.has_user_input_pending = true;
-        ev.has_multi_select = true;
+        let ev = ZcodeInterfaceEvidence {
+            method_send: true,
+            has_user_input_pending: true,
+            has_multi_select: true,
+            ..Default::default()
+        };
         let ledger = MemoryLedger::default();
         ledger.records.lock().unwrap().push((
             key.clone(),
@@ -340,8 +348,10 @@ mod tests {
     #[test]
     fn ledger_inconclusive_stays_candidate() {
         let key = known_build_key();
-        let mut ev = ZcodeInterfaceEvidence::default();
-        ev.method_send = true;
+        let ev = ZcodeInterfaceEvidence {
+            method_send: true,
+            ..Default::default()
+        };
         let ledger =
             MemoryLedger::with_state(key.clone(), Capability::Send, CapabilityState::Inconclusive);
         let view = resolve_capabilities(&key, &ev, &ledger);
@@ -353,8 +363,10 @@ mod tests {
     #[test]
     fn ledger_degraded_overrides_shipped_and_passes_reason() {
         let key = known_build_key();
-        let mut ev = ZcodeInterfaceEvidence::default();
-        ev.method_send = true;
+        let ev = ZcodeInterfaceEvidence {
+            method_send: true,
+            ..Default::default()
+        };
         let ledger = MemoryLedger::with_degraded(key.clone(), Capability::Send, "action_failed");
         let view = resolve_capabilities(&key, &ev, &ledger);
         assert!(!view.send.enabled);
@@ -365,8 +377,10 @@ mod tests {
     #[test]
     fn ledger_panic_falls_back_to_production_unverified() {
         let key = known_build_key();
-        let mut ev = ZcodeInterfaceEvidence::default();
-        ev.method_send = true;
+        let ev = ZcodeInterfaceEvidence {
+            method_send: true,
+            ..Default::default()
+        };
         let view = resolve_capabilities(&key, &ev, &PanicLedger);
         assert_eq!(view, CapabilityPolicy::production_unverified());
     }

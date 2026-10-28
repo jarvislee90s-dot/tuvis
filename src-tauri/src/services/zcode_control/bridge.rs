@@ -5028,9 +5028,11 @@ mod tests {
     /// brief Step 1 逐字用例：invalidate 把形状位全部清空。
     #[test]
     fn invalidate_clears_interface_evidence() {
-        let mut ev = ZcodeInterfaceEvidence::default();
-        ev.method_send = true;
-        ev.has_active_work = true;
+        let mut ev = ZcodeInterfaceEvidence {
+            method_send: true,
+            has_active_work: true,
+            ..Default::default()
+        };
         ev.invalidate();
         assert!(!ev.method_send);
         assert!(!ev.has_active_work);
