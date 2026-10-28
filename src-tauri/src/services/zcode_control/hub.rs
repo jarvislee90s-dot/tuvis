@@ -1547,6 +1547,9 @@ pub struct ZcodeHub {
     /// 清理单飞：重叠关闭的 `finish_disconnect` 串行执行（后者不得越过前者的清理
     /// 窗口；陈旧 owner 在窗口外一律零副作用）。`connect` 绝不取本锁。
     disconnect_lock: AsyncMutex<()>,
+    /// 抢回单飞（T8）：并发 `takeover_requested` 只让一个真正执行「断开→重连」，
+    /// 其余等它收尾后按已落定的新状态走幂等/前置检查，绝不叠加第二轮流。
+    takeover_lock: AsyncMutex<()>,
     /// 自动连接单 worker 的启动幂等标记（`start_auto_connect` 只成功一次）。
     auto_started: AtomicBool,
     /// 启动恢复是否已经尝试过（失败也算）：自动连接 worker 不再第二次读原生存储。
@@ -1748,6 +1751,7 @@ impl ZcodeHub {
             })),
             connect_lock: AsyncMutex::new(()),
             disconnect_lock: AsyncMutex::new(()),
+            takeover_lock: AsyncMutex::new(()),
             auto_started: AtomicBool::new(false),
             auto_restore_attempted: AtomicBool::new(false),
             auto_notify: Arc::new(Notify::new()),
@@ -2234,6 +2238,46 @@ impl ZcodeHub {
         )?;
         self.pause_auto_connect();
         Ok(self.disconnect().await)
+    }
+
+    /// 手机「断开并抢回」（T8，spec §6.5）：冲突态（官方页面把 Tuvis 踢成 conflict）
+    /// 的一次性自救——显式断开后立刻按显式连接路径重连（复用既有 JWT，auto 意图置
+    /// true），**不**触发 OAuth。
+    ///
+    /// 检查顺序：
+    /// 1. 已配对/握手中 → 幂等返回当前视图（零断开零重连）；
+    /// 2. 未配置 → `needs_config`；
+    /// 3. 未授权 → `needs_auth`（零 OAuth：绝不调 `authorize`/开浏览器）；
+    /// 4. 其余（含 conflict 终态）→ 复用既有断开编排（[`Self::disconnect`]，含两段
+    ///    `backend.disconnect` 的清理窗口与 `connect_lock` 串行）→
+    ///    [`Self::connect_requested`]（JWT 复用）。
+    ///
+    /// 结果仍 conflict 时**原样返回**该视图（`Ok`，不循环不重试）：再连一次也只会
+    /// 再次被踢，调用方 UI 提示用户先关闭官方页面。并发抢回由 `takeover_lock` 单飞：
+    /// 第二个调用等第一个收尾后按新状态走幂等/前置检查，绝不叠加第二轮流。
+    pub async fn takeover_requested(&self) -> ZResult<ConnectionView> {
+        let _single = self.takeover_lock.lock().await;
+        let (state, configured, authorized) = {
+            let inner = self.lock();
+            (inner.state, inner.configured, inner.authorized)
+        };
+        // 幂等：同一 Hub 的第二个调用方（另一台手机/桌面）复用当前连接。
+        if matches!(state, ConnectionState::Paired | ConnectionState::Connecting) {
+            return Ok(self.connection());
+        }
+        if !configured {
+            self.publish(ConnectionState::NeedsConfig, None);
+            return Err(ZcodeError::of(codes::NEEDS_CONFIG));
+        }
+        // 未授权：零 OAuth——不调 authorize、不开浏览器，如实回冻结码。
+        if !authorized {
+            self.publish(ConnectionState::NeedsAuth, None);
+            return Err(ZcodeError::of(codes::NEEDS_AUTH));
+        }
+        // 冲突终态先显式断开（推进代际、清理在途握手与竞态窗口连接），再按显式
+        // 连接路径重连；重连结果（含仍 conflict）原样透出，绝不二次尝试。
+        self.disconnect().await;
+        self.connect_requested().await
     }
 
     /// 忘记授权：暂停自动连接、推进代际并断开 relay、清 Hub 授权缓存，再让后端清内存
@@ -5176,6 +5220,67 @@ mod tests {
 
         let view = hub.disconnect().await;
         assert_eq!(view.state, ConnectionState::Offline);
+    }
+
+    /// T8 夹具：conflict 视图（reasonCode = 冻结码 conflict，无设备标签）。
+    fn conflict_view() -> ConnectionView {
+        ConnectionView {
+            state: ConnectionState::Conflict,
+            generation: 1,
+            reason_code: Some(codes::CONFLICT.into()),
+            device_label: None,
+        }
+    }
+
+    /// 手机「断开并抢回」（spec §6.5）：conflict → 显式断开 → 显式连接各**一次**，
+    /// 成功落 paired。绝不循环：抢回后再收到 conflict 也原样返回，不做第二次尝试。
+    #[tokio::test]
+    async fn takeover_conflict_disconnects_then_connects_once() {
+        let fake = Arc::new(FakeBackend::default());
+        fake.jwt.store(true, Ordering::SeqCst);
+        fake.auth_state.lock().unwrap().authorized = true;
+        let hub = ZcodeHub::with_parts(stored(URL), fake.clone(), send_policy());
+        hub.mark_authorized_for_test();
+        fake.set_connect(Ok(conflict_view()));
+        let first = hub.connect().await.unwrap();
+        assert_eq!(first.state, ConnectionState::Conflict);
+
+        fake.set_connect(Ok(FakeBackend::paired_view()));
+        let view = hub.takeover_requested().await.unwrap();
+        assert!(view.is_paired());
+        // 一次断开（quiesce 两段 backend.disconnect）+ 一次重连（初连 + 抢回）。
+        assert_eq!(fake.disconnect_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(fake.connect_calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// 未授权的抢回：`needs_auth` 且**零 OAuth**——不调 authorize、不开浏览器。
+    #[tokio::test]
+    async fn takeover_requires_auth_without_oauth() {
+        let fake = Arc::new(FakeBackend::default());
+        let hub = ZcodeHub::with_parts(stored(URL), fake.clone(), send_policy());
+        let err = hub.takeover_requested().await.unwrap_err();
+        assert!(err.is(codes::NEEDS_AUTH));
+        assert_eq!(fake.authorize_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            fake.connect_calls.load(Ordering::SeqCst),
+            0,
+            "未授权不得发起任何连接"
+        );
+    }
+
+    /// 已配对/握手中时抢回是幂等的：直接返回当前视图，零断开零重连。
+    #[tokio::test]
+    async fn takeover_paired_is_idempotent() {
+        let fake = Arc::new(FakeBackend::default());
+        let hub = paired_hub(fake.clone()).await;
+        let view = hub.takeover_requested().await.unwrap();
+        assert!(view.is_paired());
+        assert_eq!(fake.connect_calls.load(Ordering::SeqCst), 1, "不重连");
+        assert_eq!(
+            fake.disconnect_calls.load(Ordering::SeqCst),
+            0,
+            "已配对不得断开"
+        );
     }
 
     /// 未开闸能力：needs_evidence 且零后端执行（手机不可自报能力）。

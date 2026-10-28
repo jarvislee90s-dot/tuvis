@@ -641,6 +641,11 @@ fn api_router(state: Arc<RemoteState>) -> Router<Arc<RemoteState>> {
         // 设备身份只取 cookie/DB（请求体多字段即 400 `invalid_action`）；回执一律
         // no-store，accepted/confirmed/noop/unknown 均 200 并按 state 区分。
         .route("/zcode/actions", post(super::zcode::actions))
+        // ZCode 手机「断开并抢回」（T8）：conflict 终态的一次性 disconnect→connect。
+        // 空请求体；成功 200 ConnectionView（与 connection 同款 DTO，无凭据字段），
+        // 失败冻结码 `{error}`。PIN 门禁内层 gate 结构性覆盖——未配对在 handler
+        // 之前 403。
+        .route("/zcode/takeover", post(super::zcode::takeover))
         // ZCode 控制事件流（T7.1 B3）：SSE 首帧连接+会话状态，随后转发连接/本会话
         // 事件；lag 只发 resync（客户端重 GET），设备吊销/停服经 SseRegistry 即时断流。
         // PIN 门禁内层 gate 结构性覆盖——未配对在 handler 之前 403。

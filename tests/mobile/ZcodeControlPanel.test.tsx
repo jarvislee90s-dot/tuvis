@@ -57,6 +57,7 @@ import {
   type SessionView,
 } from "@/lib/api/zcodeControl";
 import { pinZhNavigator } from "./pinZhNavigator";
+import { ZCODE_TAKEOVER_PATH } from "@/mobile/api";
 
 const SID = "session_0000000000000000000000000000000a";
 const GEN = 3;
@@ -1513,5 +1514,98 @@ describe("ZCode 控制面板：原因码 zh/en 全覆盖", () => {
     ]) {
       expect(panel.textContent ?? "", phrase).not.toContain(phrase);
     }
+  });
+});
+
+describe("ZCode 控制面板：冲突态断开并抢回", () => {
+  /** 冲突态替身：POST 返回的视图即其后权威 GET 的连接面（抢回后现读口径）。 */
+  function conflictBackend(takeoverView: ConnectionView) {
+    let takeoverDone = false;
+    return (url: string, init?: RequestInit) => {
+      if (url.includes("/official-control")) {
+        return json({ configState: "missing", url: null });
+      }
+      if (url === ZCODE_CONNECTION_PATH) {
+        return json(
+          takeoverDone ? takeoverView : connection({ state: "conflict", reasonCode: "conflict" })
+        );
+      }
+      if (url.startsWith(`${ZCODE_SESSION_PATH}?`)) return json(sessionView());
+      if (url === ZCODE_TAKEOVER_PATH && init?.method === "POST") {
+        takeoverDone = true;
+        return json(takeoverView);
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    };
+  }
+
+  const takeoverCalls = () =>
+    fetchMock.mock.calls.filter(([url]) => String(url).endsWith(ZCODE_TAKEOVER_PATH));
+
+  it("conflict shows takeover and posts endpoint once", async () => {
+    installFetch(conflictBackend(connection({ state: "paired", generation: GEN + 1 })));
+    render(<ZcodeControlPanel sessionId={SID} />);
+    fireEvent.click(await screen.findByTestId("zcode-takeover"));
+    await waitFor(() => expect(takeoverCalls()).toHaveLength(1));
+    // 抢回成功后权威 GET 刷新连接面：conflict → paired（不依赖 SSE）。
+    await waitFor(() =>
+      expect(screen.getByTestId("zcode-control-panel").getAttribute("data-connection-state")).toBe(
+        "paired"
+      )
+    );
+  });
+
+  it("still_conflict_only_hints_without_second_request", async () => {
+    installFetch(
+      conflictBackend(
+        connection({ state: "conflict", generation: GEN + 1, reasonCode: "conflict" })
+      )
+    );
+    render(<ZcodeControlPanel sessionId={SID} />);
+    fireEvent.click(await screen.findByTestId("zcode-takeover"));
+    // 服务端一次抢回后仍 conflict：只显示「先关官方页面」的提示。
+    const notice = await screen.findByTestId("zcode-takeover-still-conflict");
+    expect(notice.textContent ?? "").toMatch(/官方/);
+    await act(async () => {});
+    // 不循环：无论等多久，抢回端点只被 POST 过这一次。
+    expect(takeoverCalls()).toHaveLength(1);
+  });
+
+  it("takeover_failure_shows_frozen_reason_code", async () => {
+    installFetch((url, init) => {
+      if (url.includes("/official-control")) {
+        return json({ configState: "missing", url: null });
+      }
+      if (url === ZCODE_CONNECTION_PATH) {
+        return json(connection({ state: "conflict", reasonCode: "conflict" }));
+      }
+      if (url.startsWith(`${ZCODE_SESSION_PATH}?`)) return json(sessionView());
+      if (url === ZCODE_TAKEOVER_PATH && init?.method === "POST") {
+        return json({ error: "needs_auth" }, 503);
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+    render(<ZcodeControlPanel sessionId={SID} />);
+    fireEvent.click(await screen.findByTestId("zcode-takeover"));
+    const error = await screen.findByTestId("zcode-takeover-error");
+    expect(error.getAttribute("data-reason-code")).toBe("needs_auth");
+    // 文案是本地化原因，不是码原文。
+    expect(error.textContent ?? "").toMatch(/授权/);
+    expect(error.textContent ?? "").not.toContain("needs_auth");
+  });
+
+  it("no_takeover_button_when_not_conflict", async () => {
+    installFetch((url) => {
+      if (url.includes("/official-control")) {
+        return json({ configState: "missing", url: null });
+      }
+      if (url === ZCODE_CONNECTION_PATH) return json(connection());
+      if (url.startsWith(`${ZCODE_SESSION_PATH}?`)) return json(sessionView());
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+    render(<ZcodeControlPanel sessionId={SID} />);
+    await screen.findByTestId("zcode-draft");
+    await act(async () => {});
+    expect(screen.queryByTestId("zcode-takeover")).toBeNull();
   });
 });

@@ -21,9 +21,10 @@ import {
   type QuestionView,
   type SessionView,
   type ZcodeErrorCode,
+  ZcodeControlApiError,
 } from "@/lib/api/zcodeControl";
 import useZcodeControl from "./useZcodeControl";
-import { fetchZcodeControl } from "./api";
+import { fetchZcodeControl, postZcodeTakeover } from "./api";
 
 interface ZcodeControlPanelProps {
   /** 会话原 ID（服务端按它绑定 ZCode 会话；手机不自报 workspace） */
@@ -418,7 +419,7 @@ function PendingCard({
 }
 
 export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps) {
-  const { connection, session, reason, submitting, draftCleared, submit } =
+  const { connection, session, reason, submitting, draftCleared, submit, refresh } =
     useZcodeControl(sessionId);
   const [draft, setDraft] = useState("");
   const [receipt, setReceipt] = useState<ActionReceipt | null>(null);
@@ -449,6 +450,11 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
     setDraft("");
     draftRef.current = "";
     submittedDraftRef.current = null;
+    // 抢回面同样不跨会话残留（T8）。
+    setTakeoverBusy(false);
+    setTakeoverStillConflict(false);
+    setTakeoverError(null);
+    takeoverInFlightRef.current = false;
   }, [sessionId]);
 
   // A5 基线「打开官方页面」的显式辅助入口：只读已保存链接（不自动打开、不代理点击）。
@@ -462,6 +468,43 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
       alive = false;
     };
   }, [sessionId]);
+
+  // ==== T8 冲突态「断开并抢回」 ====
+  /** 抢回 POST 在途（busy 态 + 同帧双击闸）。 */
+  const [takeoverBusy, setTakeoverBusy] = useState(false);
+  /** 服务端一次抢回后仍 conflict：只提示先关官方页面，绝不二次请求。 */
+  const [takeoverStillConflict, setTakeoverStillConflict] = useState(false);
+  /** 抢回失败的冻结原因码（文案按码本地化，码只进 data-reason-code）。 */
+  const [takeoverError, setTakeoverError] = useState<ZcodeErrorCode | "unknown" | null>(null);
+  const takeoverInFlightRef = useRef(false);
+
+  /** 一次抢回一个在途槽：busy 期间重入一律丢弃（绝不产生第二次 POST）。 */
+  const handleTakeover = () => {
+    if (takeoverInFlightRef.current) return;
+    takeoverInFlightRef.current = true;
+    setTakeoverBusy(true);
+    setTakeoverStillConflict(false);
+    setTakeoverError(null);
+    void postZcodeTakeover()
+      .then((view) => {
+        // 仍 conflict（官方页还在线）：服务端已按契约只试一次，这里只提示。
+        setTakeoverStillConflict(view.state === "conflict");
+        // 成功（含仍 conflict）后重拉权威连接/会话视图（现有 GET 纠偏机制）。
+        void refresh();
+      })
+      .catch((error: unknown) => {
+        // 失败显示冻结码原因：网络层（status=null）按 offline 口径，其余按服务端码。
+        setTakeoverError(
+          error instanceof ZcodeControlApiError
+            ? (error.code ?? (error.status === null ? "offline" : "unknown"))
+            : "unknown"
+        );
+      })
+      .finally(() => {
+        takeoverInFlightRef.current = false;
+        setTakeoverBusy(false);
+      });
+  };
 
   const openOfficial = () => {
     if (officialUrl === null) return;
@@ -600,6 +643,43 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
         >
           {zcodeReasonText(displayReason)}
         </p>
+      )}
+      {/* T8 冲突态「断开并抢回」：只在 conflict 出现。确认文案常驻按钮旁（点击即
+          执行一次），busy 禁用；仍 conflict 只提示先关官方页面，失败显示冻结码原因。 */}
+      {connection?.state === "conflict" && (
+        <div className="mb-2">
+          <button
+            type="button"
+            data-testid="zcode-takeover"
+            disabled={takeoverBusy}
+            onClick={handleTakeover}
+            className="rounded-full border border-[var(--cb)] px-4 py-1 text-sm text-[var(--tx)] disabled:opacity-40"
+          >
+            {i18n.t(
+              takeoverBusy ? "mobile.zcodeControl.takeoverBusy" : "mobile.zcodeControl.takeover"
+            )}
+          </button>
+          <p data-testid="zcode-takeover-hint" className="mt-1 text-xs text-[var(--mut)]">
+            {i18n.t("mobile.zcodeControl.takeoverHint")}
+          </p>
+          {takeoverStillConflict && (
+            <p
+              data-testid="zcode-takeover-still-conflict"
+              className="mt-1 text-xs text-[var(--mut)]"
+            >
+              {i18n.t("mobile.zcodeControl.takeoverStillConflict")}
+            </p>
+          )}
+          {takeoverError !== null && (
+            <p
+              data-testid="zcode-takeover-error"
+              data-reason-code={takeoverError}
+              className="mt-1 text-xs text-[var(--mut)]"
+            >
+              {zcodeReasonText(takeoverError)}
+            </p>
+          )}
+        </div>
       )}
       {/* A5 显式辅助入口：只打开**已保存**的官方链接（挂载不自动外跳、不代理点击）。 */}
       {officialUrl !== null && (
