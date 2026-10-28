@@ -1855,7 +1855,7 @@ pub fn codex_user_note_from_output(output: &str) -> Option<String> {
 
 // ============================================================
 // Task 5：codex 单选 select 阶段机（设计 §3.2 非末题 / §3.3 末题与单题）
-// 取证依据：2026-10-09 底料 `docs/superpowers/specs/2026-10-08-codex-160-question-
+// 取证依据：2026-10-09 底料 `docs/engineering/specs/2026-10-08-codex-160-question-
 // 屏读底料.md` §1 定案总表（A–H）。**关键通道更正（底料 §1）：codex 0.160.0 问答
 // 面板对 VT 箭头（ESC[B/A/C/D）与真 VK 箭头全部免疫——走位必须用 vim j/k（j=下移
 // k=上移，双向环绕），切题用 vim h/l（本阶段机不切题，注释留档防误引箭头键）。
@@ -2363,7 +2363,7 @@ fn run_codex_select_final<T: MenuTerminal>(
 
 // ============================================================
 // Task 6：codex 切题 advance 阶段机（设计 §3.5）
-// 取证依据：2026-10-09 底料 `docs/superpowers/specs/2026-10-08-codex-160-question-
+// 取证依据：2026-10-09 底料 `docs/engineering/specs/2026-10-08-codex-160-question-
 // 屏读底料.md` §1 定案总表。**键序更正（底料 §1）：切题通道 = vim h/l（h=上一题
 // l=下一题）——VT 箭头与真 VK 箭头对 codex 面板全部无效（S2 上真 VK_LEFT 未切题
 // 实证）。切题环形（末→首、首→末）；单题上 h/l 无任何效果（S3 footer 无导航段，
@@ -12256,7 +12256,7 @@ pub(crate) mod live_fixtures {
     }
 
     // ===== codex 0.160.0 问答面板活体夹具（2026-10-09 取证批，Task 1 底料
-    // `docs/superpowers/specs/2026-10-08-codex-160-question-屏读底料.md` §9 点名；
+    // `docs/engineering/specs/2026-10-08-codex-160-question-屏读底料.md` §9 点名；
     // 证据根 `%USERPROFILE%\mam-probe-m6r\evidence\`，FIXTURE 行程序化提取生成）=====
     // 形态总纲：`›` = 焦点（非选中，选中态只在属性层 0x0030 族，字符层无标记）；
     // 题号头词形 未答 `Question i/N (M unanswered)` / 全答 `Question i/N`（计数段整个消失）；

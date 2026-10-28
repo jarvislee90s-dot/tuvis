@@ -1,0 +1,10 @@
+{
+  "receiptFiles": 15,
+  "ledger": {
+    "thread-follower-command-approval-decision v1 Accepted": 3,
+    "thread-follower-file-approval-decision v1 Accepted": 2,
+    "thread-follower-interrupt-turn v4 Accepted": 1,
+    "thread-follower-start-turn v2 Accepted": 8,
+    "thread-follower-submit-user-input v1 Accepted": 1
+  }
+}

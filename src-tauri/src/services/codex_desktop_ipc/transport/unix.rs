@@ -113,6 +113,38 @@ impl EndpointResolver for UnixEndpointResolver {
     }
 }
 
+/// 运行中官方 Codex Desktop 的 **bundle 路径**（身份判据与 endpoint／指纹同源：
+/// `CFBundleIdentifier` 精确等于 [`CODEX_BUNDLE_ID`]；排序去重）。
+///
+/// 契约识别（T01）与探测指纹共用本入口：本函数**如实返回全部**官方安装，
+/// "是否多义"由调用方决定（解析端点按"唯一才取"处理，不在这里替调用方挑一个）。
+#[cfg(target_os = "macos")]
+pub fn official_codex_bundles() -> Vec<std::path::PathBuf> {
+    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+    let mut sys = System::new();
+    sys.refresh_processes_specifics(
+        ProcessesToUpdate::All,
+        true,
+        ProcessRefreshKind::nothing().with_exe(UpdateKind::Always),
+    );
+    let mut bundles: Vec<std::path::PathBuf> = sys
+        .processes()
+        .values()
+        .filter_map(|process| process.exe())
+        .filter_map(|exe| app_bundle_prefix(&exe.to_string_lossy()))
+        .filter(|bundle| is_official_codex_bundle(bundle))
+        .collect();
+    bundles.sort();
+    bundles.dedup();
+    bundles
+}
+
+/// 非 macOS 主机没有 macOS 官方安装可探：诚实返回空（不做跨平台推断）。
+#[cfg(not(target_os = "macos"))]
+pub fn official_codex_bundles() -> Vec<std::path::PathBuf> {
+    Vec::new()
+}
+
 /// 连接 Unix socket，超时见 [`super::CONNECT_TIMEOUT`]。
 #[cfg(unix)]
 pub async fn connect(endpoint: &DesktopEndpoint) -> Result<Box<dyn super::IpcIo>, ProtocolError> {

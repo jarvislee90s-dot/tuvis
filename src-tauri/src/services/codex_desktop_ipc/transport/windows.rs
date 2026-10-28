@@ -33,7 +33,7 @@ const DESKTOP_EXE: &str = "ChatGPT.exe";
 
 /// 管道服务端进程名白名单（默认=取证值，可经 [`connect_with_allowlist`] 注入覆盖）。
 /// 取证出处：2026-10-17 Windows 实机验证批
-/// （`docs/superpowers/reviews/2026-10-17-codex-desktop-ipc-windows-validation-results.md` §2）
+/// （`docs/engineering/reviews/2026-10-17-codex-desktop-ipc-windows-validation-results.md` §2）
 /// —— `GetNamedPipeServerProcessId(\\.\pipe\codex-ipc)` → 服务端 PID 12372 =
 /// **ChatGPT.exe**；与 `monitor::process` 的 MSIX 宿主取证一致
 /// （`WindowsApps\OpenAI.Codex_*\app\ChatGPT.exe`，宿主不叫 codex）。
@@ -95,6 +95,53 @@ fn desktop_build() -> Option<String> {
     } else {
         None
     }
+}
+
+/// 运行中官方 Desktop 的 **MSIX 包根**（含 `AppxManifest.xml` 的目录；排序去重）。
+///
+/// 契约识别（T01）用它在包内定位 `app/resources/app.asar`；与 `desktop_build`
+/// 同一套进程与包身份判据（`ChatGPT.exe` + `AppxManifest.xml`），不另造第二套。
+#[cfg(windows)]
+pub fn official_desktop_bundles() -> Vec<std::path::PathBuf> {
+    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+    let mut sys = System::new();
+    sys.refresh_processes_specifics(
+        ProcessesToUpdate::All,
+        true,
+        ProcessRefreshKind::nothing().with_exe(UpdateKind::Always),
+    );
+    let mut roots: Vec<std::path::PathBuf> = sys
+        .processes()
+        .values()
+        .filter_map(|process| process.exe())
+        .filter(|exe| {
+            exe.file_name()
+                .is_some_and(|name| name.eq_ignore_ascii_case(DESKTOP_EXE))
+        })
+        .filter_map(package_root_for_exe)
+        .collect();
+    roots.sort();
+    roots.dedup();
+    roots
+}
+
+/// 非 Windows 主机没有 Windows 官方安装可探：诚实返回空。
+#[cfg(not(windows))]
+pub fn official_desktop_bundles() -> Vec<std::path::PathBuf> {
+    Vec::new()
+}
+
+/// exe 路径向上找 MSIX 包根（含 `AppxManifest.xml`；最多三层，与版本探测一致）。
+#[cfg(windows)]
+fn package_root_for_exe(exe: &std::path::Path) -> Option<std::path::PathBuf> {
+    let mut dir = exe.parent()?;
+    for _ in 0..3 {
+        if dir.join("AppxManifest.xml").is_file() {
+            return Some(dir.to_path_buf());
+        }
+        dir = dir.parent()?;
+    }
+    None
 }
 
 /// MSIX 包版本：从 exe 路径向上找包根（含 `AppxManifest.xml`），取 `Identity/@Version`。

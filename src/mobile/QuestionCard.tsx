@@ -64,6 +64,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import i18n from "@/i18n";
 import { formatInvokeError } from "@/lib/invokeError";
 import InteractiveCard, { toneTokens } from "./InteractiveCard";
+import QuestionChoiceRow from "./QuestionChoiceRow";
 import {
   ApiError,
   fetchSessionQuestion,
@@ -1468,36 +1469,17 @@ export default function QuestionCard({ session }: QuestionCardProps) {
         <>
           <div className="mt-2 space-y-1.5">
             {q.options.map((o, i) => (
-              <button
+              <QuestionChoiceRow
                 key={`question-option-${i}`}
-                type="button"
-                data-testid={`question-option-${i}`}
-                data-checked={q.multiSelect && checked.has(i) ? "true" : undefined}
+                index={i}
+                label={o.label}
+                description={o.description}
+                checked={q.multiSelect && checked.has(i)}
+                multiSelect={q.multiSelect}
                 disabled={busy}
+                testId={`question-option-${i}`}
                 onClick={() => handleAnswer(q.multiSelect ? "toggle" : "select", i)}
-                className={`flex w-full items-start gap-2 rounded-lg px-2.5 py-1.5 text-left text-sm disabled:opacity-40 ${
-                  q.multiSelect && checked.has(i)
-                    ? "bg-[var(--btnp)]/15 text-[var(--tx)] ring-1 ring-[var(--btnp)]"
-                    : "bg-[var(--btnp)]/5 text-[var(--tx)] hover:bg-[var(--btnp)]/10 dark:hover:bg-[var(--bub)]"
-                }`}
-              >
-                <span className="mt-0.5 inline-flex h-4 w-4 shrink-0 items-center justify-center rounded bg-[var(--btnp)]/15 text-[10px] font-semibold text-[var(--tx)]">
-                  {i + 1}
-                </span>
-                {/* 多选：勾选框字形（与终端 `[ ]`/`[✓]` 同形——2026-09-24「手机端
-                    同步终端操作逻辑」；与多题卡的 checkedHere 字形同一形态） */}
-                {q.multiSelect && (
-                  <span className="mt-0.5 mr-0.5 font-mono text-xs text-[var(--tx)]">
-                    {checked.has(i) ? "[✓]" : "[ ]"}
-                  </span>
-                )}
-                <span className="min-w-0">
-                  <span className="block font-medium">{o.label}</span>
-                  {o.description && (
-                    <span className="mt-0.5 block text-xs text-[var(--mut)]">{o.description}</span>
-                  )}
-                </span>
-              </button>
+              />
             ))}
           </div>
           {q.multiSelect && (

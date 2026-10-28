@@ -61,6 +61,42 @@ pub const DELIVERY_UNKNOWN: &str = "delivery_unknown";
 /// 落点：回执 `reasonCode`（`remote::codex_ipc` 的 `confirm_decision_gone`）。
 pub const DECISION_UNCONFIRMED: &str = "decision_unconfirmed";
 
+/// 逐操作策略：未知集合（老载荷缺 `effectiveOperations`）——"还不知道"，不是永久不支持。
+pub const OPERATION_UNKNOWN_POLICY: &str = "operation_unknown_policy";
+
+/// 逐操作策略：本阶段未实现该操作（F09—F11／无专用 RPC）。
+pub const OPERATION_NOT_IMPLEMENTED: &str = "operation_not_implemented";
+
+/// 逐操作策略：当前目标不可归因／连接不在场（状态过期，动作撤回）。
+pub const OPERATION_TARGET_STALE: &str = "operation_target_stale";
+
+/// 逐操作策略：自动适配已关闭，未 shipped 的适配动作撤回。
+pub const OPERATION_AUTO_ADAPT_OFF: &str = "operation_auto_adapt_off";
+
+/// 逐操作策略：当前运行包的契约未匹配（或契约识别失败）。
+pub const OPERATION_CONTRACT_UNMATCHED: &str = "operation_contract_unmatched";
+
+/// 逐操作策略：没有任何当前证据（未识别／未验证）。
+pub const OPERATION_NO_EVIDENCE: &str = "operation_no_evidence";
+
+/// 逐操作策略：线程正在运行（异步正式答题需空闲）。
+pub const OPERATION_RUNTIME_ACTIVE: &str = "operation_runtime_active";
+
+/// 逐操作策略：运行态未知（断链/状态过期），不猜。
+pub const OPERATION_RUNTIME_UNKNOWN: &str = "operation_runtime_unknown";
+
+/// 逐操作策略：另有原生阻塞请求在场（先处理该请求）。
+pub const OPERATION_BLOCKING_PENDING: &str = "operation_blocking_pending";
+
+/// 逐操作策略：队列处于暂停保护（需用户显式恢复或本条先发）。
+pub const OPERATION_QUEUE_PAUSED: &str = "operation_queue_paused";
+
+/// 异步题的相关答复范围（题目 → 当前）不完整/不可读：保持 Unknown，不清卡。
+pub const ASYNC_HISTORY_INCOMPLETE: &str = "async_answer_history_incomplete";
+
+/// 逐操作策略：没有可打断的活动回合。
+pub const OPERATION_NO_ACTIVE_TURN: &str = "operation_no_active_turn";
+
 /// 合法探测级（动态码 `probe_failed:<stage>` 的 stage 取值域）。
 ///
 /// 账本 `probe_stage` 列只可能出现这四个词；其它词（历史脏数据 / 未来扩展）
@@ -89,6 +125,40 @@ pub const PROBE_INCONCLUSIVE_MESSAGE: &str = "PROBE_INCONCLUSIVE: 只读探测�
 
 /// `errors.deliveryUnknown` 的中文原文。
 pub const DELIVERY_UNKNOWN_MESSAGE: &str = "DELIVERY_UNKNOWN: 投递结果未知，这条消息可能已送达也可能没有；请到桌面端核对后再决定是否重发，兔维斯不会自动重发";
+
+/// `errors.asyncAnswerHistoryIncomplete` 的中文原文。
+pub const ASYNC_HISTORY_INCOMPLETE_MESSAGE: &str = "ASYNC_ANSWER_HISTORY_INCOMPLETE: 该题到当前之间的答复范围尚未完整加载，无法确认是否已作答；答案会保留，请刷新或稍后重试，兔维斯不会自动代答";
+/// `errors.operationUnknownPolicy` 的中文原文。
+pub const OPERATION_UNKNOWN_POLICY_MESSAGE: &str = "OPERATION_UNKNOWN_POLICY: 当前客户端还没有该会话的能力事实（投影缺字段）；请刷新后重试，兔维斯不会据此猜测可用能力";
+/// `errors.operationNotImplemented` 的中文原文。
+pub const OPERATION_NOT_IMPLEMENTED_MESSAGE: &str =
+    "OPERATION_NOT_IMPLEMENTED: 该操作本阶段尚未接入（没有已核验的协议出口）；请到 Desktop 端处理";
+/// `errors.operationTargetStale` 的中文原文。
+pub const OPERATION_TARGET_STALE_MESSAGE: &str =
+    "OPERATION_TARGET_STALE: 连接或目标状态已过期，操作已撤回；请刷新状态后重试";
+/// `errors.operationAutoAdaptOff` 的中文原文。
+pub const OPERATION_AUTO_ADAPT_OFF_MESSAGE: &str =
+    "OPERATION_AUTO_ADAPT_OFF: 自动适配已关闭，新版本的适配操作已撤回；可在适配详情中重新开启";
+/// `errors.operationContractUnmatched` 的中文原文。
+pub const OPERATION_CONTRACT_UNMATCHED_MESSAGE: &str = "OPERATION_CONTRACT_UNMATCHED: 当前 Desktop 运行包的契约与已核验分支不匹配，该操作暂不可用；可到桌面端处理或查看适配详情";
+/// `errors.operationNoEvidence` 的中文原文。
+pub const OPERATION_NO_EVIDENCE_MESSAGE: &str =
+    "OPERATION_NO_EVIDENCE: 该操作在当前 Desktop 上还没有证据（未识别或未验证），暂不可用";
+/// `errors.operationRuntimeActive` 的中文原文。
+pub const OPERATION_RUNTIME_ACTIVE_MESSAGE: &str =
+    "OPERATION_RUNTIME_ACTIVE: 当前回合正在运行；答案可先保存，空闲后再由你点击提交";
+/// `errors.operationRuntimeUnknown` 的中文原文。
+pub const OPERATION_RUNTIME_UNKNOWN_MESSAGE: &str =
+    "OPERATION_RUNTIME_UNKNOWN: 运行状态暂时无法确认；请刷新状态后再试";
+/// `errors.operationBlockingPending` 的中文原文。
+pub const OPERATION_BLOCKING_PENDING_MESSAGE: &str =
+    "OPERATION_BLOCKING_PENDING: 另有一张原生请求正在等待处理；请先处理该请求";
+/// `errors.operationQueuePaused` 的中文原文。
+pub const OPERATION_QUEUE_PAUSED_MESSAGE: &str =
+    "OPERATION_QUEUE_PAUSED: 队列处于暂停保护；请明确恢复队列，或选择仅本条先发";
+/// `errors.operationNoActiveTurn` 的中文原文。
+pub const OPERATION_NO_ACTIVE_TURN_MESSAGE: &str =
+    "OPERATION_NO_ACTIVE_TURN: 当前没有可打断的活动回合";
 
 /// `errors.decisionUnconfirmed` 的中文原文。
 pub const DECISION_UNCONFIRMED_MESSAGE: &str = "DECISION_UNCONFIRMED: 审批决策已被受理但尚未确认生效，请到桌面端核对该请求是否已消失；必要时可终止本轮";
@@ -119,6 +189,18 @@ pub fn message_of(machine_code: &str) -> Option<&'static str> {
         PROBE_INCONCLUSIVE => Some(PROBE_INCONCLUSIVE_MESSAGE),
         DELIVERY_UNKNOWN => Some(DELIVERY_UNKNOWN_MESSAGE),
         DECISION_UNCONFIRMED => Some(DECISION_UNCONFIRMED_MESSAGE),
+        ASYNC_HISTORY_INCOMPLETE => Some(ASYNC_HISTORY_INCOMPLETE_MESSAGE),
+        OPERATION_UNKNOWN_POLICY => Some(OPERATION_UNKNOWN_POLICY_MESSAGE),
+        OPERATION_NOT_IMPLEMENTED => Some(OPERATION_NOT_IMPLEMENTED_MESSAGE),
+        OPERATION_TARGET_STALE => Some(OPERATION_TARGET_STALE_MESSAGE),
+        OPERATION_AUTO_ADAPT_OFF => Some(OPERATION_AUTO_ADAPT_OFF_MESSAGE),
+        OPERATION_CONTRACT_UNMATCHED => Some(OPERATION_CONTRACT_UNMATCHED_MESSAGE),
+        OPERATION_NO_EVIDENCE => Some(OPERATION_NO_EVIDENCE_MESSAGE),
+        OPERATION_RUNTIME_ACTIVE => Some(OPERATION_RUNTIME_ACTIVE_MESSAGE),
+        OPERATION_RUNTIME_UNKNOWN => Some(OPERATION_RUNTIME_UNKNOWN_MESSAGE),
+        OPERATION_BLOCKING_PENDING => Some(OPERATION_BLOCKING_PENDING_MESSAGE),
+        OPERATION_QUEUE_PAUSED => Some(OPERATION_QUEUE_PAUSED_MESSAGE),
+        OPERATION_NO_ACTIVE_TURN => Some(OPERATION_NO_ACTIVE_TURN_MESSAGE),
         _ => None,
     }
 }

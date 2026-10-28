@@ -488,6 +488,12 @@ export interface SendInfo {
   reason?: string;
   channels?: string[];
   visibility?: "realtime" | "after_refresh";
+  /**
+   * S2：打断后持久暂停（serde default 向后兼容——旧后端缺省 undefined）。
+   * 暂停**不置灰**：用户仍可选「恢复队列」（POST /codex/queue/resume，唯一解除出口）
+   * 或「本条先发送」（一次性越队授权 bypassPausedQueue）。
+   */
+  queuePaused?: boolean;
 }
 
 /** 拉取输入区可用性（W4：输入区挂载时一次）。403（设备失效，与 fetchSessions
@@ -564,12 +570,17 @@ export type SendResult =
  *  抛 ApiError。
  *  queueOnly（D6 修改重发，可选）：true = 只入队（后端跳过直发尝试，即使快照显示
  *  可输入也强制入队，防变相插队）；入队后 flush 循环对其与普通队列项同权（转闲
- *  按序自动放行）。**缺省不带该键**——保持既有请求体形态不变（普通发送路径零漂移） */
+ *  按序自动放行）。**缺省不带该键**——保持既有请求体形态不变（普通发送路径零漂移）。
+ *  bypassPausedQueue（S2 一次性越队，可选）：true = 用户显式选择「保留旧队列暂停，
+ *  本条先发送」——后端为**本 action** 建绑定授权（消费即失效，不穿透 pending）。
+ *  **缺省不带该键**；授权失效重放会得 NotSent(`grant_consumed`)——前端引导重选
+ *  而非原样重放。 */
 export async function sessionSend(
   sessionId: string,
   text: string,
   queueOnly?: boolean,
-  actionId?: string
+  actionId?: string,
+  bypassPausedQueue?: boolean
 ): Promise<SendResult> {
   let r: Response;
   try {
@@ -581,6 +592,7 @@ export async function sessionSend(
         text,
         ...(queueOnly ? { queueOnly: true } : {}),
         ...(actionId !== undefined ? { actionId } : {}),
+        ...(bypassPausedQueue ? { bypassPausedQueue: true } : {}),
       }),
     });
   } catch (e) {

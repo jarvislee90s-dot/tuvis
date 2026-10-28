@@ -39,6 +39,15 @@ import QuestionCard from "./QuestionCard";
 // Codex Desktop IPC：原生投影接管内容源与交互卡（Codex APP 会话）
 import CodexQueuePanel from "./CodexQueuePanel";
 import PendingRequestCard, { CodexAvailabilityBanner } from "./PendingRequestCard";
+import AsyncQuestionGroupCard from "./AsyncQuestionGroupCard";
+import CodexOperationToolbar from "./CodexOperationToolbar";
+import CodexAdaptSheet from "./CodexAdaptSheet";
+import {
+  fetchCodexAdaptStatus,
+  updateCodexAdaptSettings,
+  type CodexAsyncQuestionView,
+} from "./codexIpcApi";
+import AnswerBubble from "./AnswerBubble";
 import ProjectedArtifacts, { buildArtifactMessageContexts } from "./ProjectedArtifacts";
 import useArtifactImages from "./useArtifactImages";
 import useCodexThread from "./useCodexThread";
@@ -351,6 +360,37 @@ export function isPlanPending(
 // 组件
 // ============================================================
 
+type CodexQuestionGroup = {
+  key: string;
+  members: CodexAsyncQuestionView[];
+  live: CodexAsyncQuestionView[];
+  allAnswered: boolean;
+};
+
+/** 按来源 turn/item 分组，供停靠区与已答锚清理共用（去重 + 题号排序）。 */
+function groupCodexQuestions(questions: CodexAsyncQuestionView[]): CodexQuestionGroup[] {
+  const unique = questions.filter(
+    (question, index, all) =>
+      all.findIndex((other) => other.questionKey === question.questionKey) === index
+  );
+  const grouped = new Map<string, CodexAsyncQuestionView[]>();
+  for (const question of unique) {
+    const key = `${question.sourceTurnId}|${question.sourceItemId}`;
+    grouped.set(key, [...(grouped.get(key) ?? []), question]);
+  }
+  return [...grouped.entries()].map(([key, members]) => {
+    const sorted = [...members].sort((a, b) => a.questionIndex - b.questionIndex);
+    return {
+      key,
+      members: sorted,
+      live: sorted.filter(
+        (question) => question.state === "pending" || question.state === "temporarily_blocked"
+      ),
+      allAnswered: sorted.length > 0 && sorted.every((question) => question.state === "answered"),
+    };
+  });
+}
+
 export default function SessionDetail({ session, onBack }: SessionDetailProps) {
   const [messages, setMessages] = useState<SessionMessage[] | null>(null);
   // ===== Codex Desktop IPC 投影（A snapshot）=====
@@ -363,7 +403,9 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
   //   能力横幅仍按服务端档位诚实展示；
   // - state=null（无 IPC / 拉取中）：旧路径照旧，零回归。
   // stale：保留最后视图但禁写。
-  const codex = useCodexThread(session.id, session.agentType === "codex");
+  // H12：**来源随形态**——只有 Desktop(App) 形态的 codex 会话才订阅投影；
+  // CLI/TUI 同 thread 即使被 Desktop 认识，也必须走终端卡路径，不能取得投影。
+  const codex = useCodexThread(session.id, session.agentType === "codex" && session.form === "app");
   /** 附件图片资源控制器（Task 6）：整页共用一份，保证同会话消费者共享请求与
    *  object URL、全局最多两个在途；换会话时 hook 内部销毁旧 store。 */
   const artifactImages = useArtifactImages(session.id);
@@ -376,13 +418,170 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
   /** 队列刷新独立信号（2026-10-20 复审 P2）：不依赖 Desktop 必须产生新帧——
    *  投影 revision 变化与发送回执各推进一次；旧会话的回调随组件卸载丢弃。 */
   const [queueTick, setQueueTick] = useState(0);
-  const bumpQueue = useCallback(() => setQueueTick((t) => t + 1), []);
+  /** 底部只展开一组；其余有效组收成一行切换（卡片仍挂载保草稿）。 */
+  const [activeGroupKey, setActiveGroupKey] = useState<string | null>(null);
+  // F08：适配详情/开关（移动端页内 sheet；只读展示 + 与桌面同源开关）。
+  const [codexAdaptOpen, setCodexAdaptOpen] = useState(false);
+  // R16：首次进入 App 会话的**轻提示**（一次；不要求用户先打开详情）。
+  const [adaptHintVisible, setAdaptHintVisible] = useState(false);
+  // S5：发送静态门「可尝试」结论（唯一来源 = MessageComposer 拉取的 send-info——
+  // send_gate_static 的展示面单点；本组件不另发请求不另判）。能力横幅据此在
+  // 可尝试时不再宣称「暂不能远程发送」（设计 §3.4）。换会话由 composer 重报。
+  const [codexSendGate, setCodexSendGate] = useState<boolean | undefined>(undefined);
+  useEffect(() => {
+    // 换会话即失效（等新 composer 的 send-info 重报；undefined = 不猜）
+    setCodexSendGate(undefined);
+  }, [session.id]);
+  // F8/R6：send-info 外部刷新信号——三类**后端真实状态变化**都推进此 tick，
+  // composer 据此事件驱动重拉（不做时刻轮询、不引 Tauri channel）：
+  // ① 同页打断受理/恢复队列（CodexQueuePanel 的 onQueueStateChanged）；
+  // ② 能力档位翻转（设置页关闭/重开自动适配——R6 后端 republish 生产帧，
+  //    availability 随 caps 活门翻转，SSE 下游真收到）；
+  // ③ 投影帧到达（跨设备起源）。R-T4 起投影帧自带 queuePaused，且暂停变化点
+  //    （打断前置落行/撤回/resume/settle）各自 republish——**只翻 queuePaused** 的
+  //    帧（revision 不动，Desktop 零新帧）正是 B 打断 RPC 超时 UnknownDelivery 时
+  //    A 能看到暂停的唯一通道；send-info 仍是暂停门的唯一权威读取口。③ 走去抖
+  //    合并（流式输出每 ~100ms 推进 revision，若每次都重拉会打爆 send-info；自
+  //    首个未处理触发起超过上限即立即重拉——与 CodexQueuePanel 的 refreshSignal
+  //    同款节奏）。
+  const [sendInfoTick, setSendInfoTick] = useState(0);
+  const bumpSendInfo = useCallback(() => setSendInfoTick((t) => t + 1), []);
+  // R02：消息进入 codex 队列后也必须重拉 send-info——空暂停在发送前自隐，
+  // 但新消息留队后暂停会冻结接力，必须立即显示“队列已暂停，恢复后发送”。
+  const bumpQueue = useCallback(() => {
+    setQueueTick((t) => t + 1);
+    bumpSendInfo();
+  }, [bumpSendInfo]);
+  const codexAvailability = codex.state?.availability ?? null;
+  const codexRuntime = codex.state?.runtimeStatus ?? null;
+  const codexPendingCount = codex.state?.pending.length ?? -1;
+  const codexRevisionNow = codex.state?.revision ?? null;
+  // R-T4：队列暂停事实（旧载荷缺省 undefined → 与 false 同签——只有真实翻转才触发）
+  const codexQueuePaused = codex.state?.queuePaused === true;
+  const prevFrameSigRef = useRef<string | null>(null);
+  const sendInfoDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const sendInfoFirstPendingAtRef = useRef<number | null>(null);
+  useEffect(() => {
+    // 帧签名：档位 / 运行态 / pending 数 / revision / 队列暂停任一变化 = 一帧事件。
+    // 首拍（null → 首帧）不触发——composer 挂载时本来就会拉一次。
+    // Gate F 修正：挂载渲染（codex.state=null）**不是帧**——不写哨兵。此前哨兵在
+    // 挂载即被写成 null 态签名字符串，导致首帧（snapshot）被误判为变化：去抖
+    // 250ms 后必然多拉一次 send-info（浪费请求；对照测试里会拉到过渡期响应）。
+    // availability=null ⇔ codex.state=null（投影未达），据此判定「非帧」。
+    const sig =
+      codexAvailability === null
+        ? null
+        : `${codexAvailability}|${codexRuntime}|${codexPendingCount}|${codexRevisionNow}|${codexQueuePaused ? "paused" : "resumed"}`;
+    if (sig === null) return;
+    const prev = prevFrameSigRef.current;
+    prevFrameSigRef.current = sig;
+    // 首帧（prev=null = 哨兵未置）只记录不触发——composer 挂载时本来就拉一次；
+    // 此后只有签名真变化（availability/runtimeStatus/pending 数/revision/queuePaused）
+    // 才触发。
+    if (prev === null || prev === sig) return;
+    // 去抖 + 上限等待（CodexQueuePanel 同款：合并流式帧、不被流式饿死）
+    if (sendInfoDebounceRef.current !== null) clearTimeout(sendInfoDebounceRef.current);
+    const now = Date.now();
+    if (sendInfoFirstPendingAtRef.current === null) sendInfoFirstPendingAtRef.current = now;
+    const elapsed = now - sendInfoFirstPendingAtRef.current;
+    const delay = Math.max(0, Math.min(250, 2000 - elapsed));
+    sendInfoDebounceRef.current = setTimeout(() => {
+      sendInfoDebounceRef.current = null;
+      sendInfoFirstPendingAtRef.current = null;
+      bumpSendInfo();
+    }, delay);
+  }, [
+    codexAvailability,
+    codexRuntime,
+    codexPendingCount,
+    codexRevisionNow,
+    codexQueuePaused,
+    bumpSendInfo,
+  ]);
+  useEffect(
+    () => () => {
+      if (sendInfoDebounceRef.current !== null) {
+        clearTimeout(sendInfoDebounceRef.current);
+        sendInfoDebounceRef.current = null;
+      }
+    },
+    []
+  );
+  // R16：**稳定来源路由**——Codex App 会话只走投影+新控件，断链也不回旧 TUI 卡；
+  // CLI 会话保持旧的终端卡路径。
+  const appForm = session.agentType === "codex" && session.form === "app";
+  useEffect(() => {
+    if (!appForm) return;
+    let alive = true;
+    void (async () => {
+      try {
+        const details = await fetchCodexAdaptStatus(session.id);
+        if (alive) setAdaptHintVisible(!details.hintSeen);
+      } catch {
+        // 读不到详情不打扰用户（提示只是辅助）。
+      }
+    })();
+    return () => {
+      alive = false;
+    };
+  }, [appForm, session.id]);
+  const dismissAdaptHint = useCallback(() => {
+    setAdaptHintVisible(false);
+    void updateCodexAdaptSettings({ sessionId: session.id, action: "dismiss_hint" }).catch(
+      () => undefined
+    );
+  }, [session.id]);
   const codexReady = codex.state !== null;
   const codexRevision = codex.state?.revision ?? null;
   useEffect(() => {
     if (codexReady) bumpQueue();
   }, [codexRevision, codexReady, bumpQueue]);
   const codexState = codex.state;
+  // 有效卡：当前可答组，或本机已发出过动作（sessionStorage 锚）的待核对组。
+  // 历史已答/无锚 unknown 一律不渲染（2026-10-28 用户裁决）。
+  const inbox = useMemo(() => {
+    const pending = (codexState?.pending ?? []).filter(
+      (item, index, all) => all.findIndex((other) => other.requestKey === item.requestKey) === index
+    );
+    const groups = groupCodexQuestions(codexState?.asyncQuestions ?? []).map((group) => ({
+      ...group,
+      hasAnchor: Boolean(
+        window.sessionStorage.getItem(
+          `codex:group:${session.id}:${group.members[0]?.sourceTurnId}:${group.members[0]?.sourceItemId}`
+        )
+      ),
+    }));
+    const visibleGroups = groups.filter(
+      (group) => group.live.length > 0 || (group.hasAnchor && !group.allAnswered)
+    );
+    return {
+      pending,
+      groups: visibleGroups,
+      count: pending.length + visibleGroups.length,
+    };
+  }, [codexState, session.id, queueTick]);
+
+  const activeGroup =
+    inbox.groups.find((group) => group.key === activeGroupKey) ??
+    inbox.groups.find((group) => group.live.length > 0) ??
+    inbox.groups[0] ??
+    null;
+  useEffect(() => {
+    if (activeGroupKey !== null && !inbox.groups.some((group) => group.key === activeGroupKey)) {
+      setActiveGroupKey(null);
+    }
+  }, [activeGroupKey, inbox.groups]);
+
+  // 已答组的旧 sessionStorage 锚只用于核对，不应跨组留存；在数据更新后清理。
+  useEffect(() => {
+    for (const group of groupCodexQuestions(codexState?.asyncQuestions ?? [])) {
+      if (!group.allAnswered) continue;
+      const first = group.members[0];
+      window.sessionStorage.removeItem(
+        `codex:group:${session.id}:${first.sourceTurnId}:${first.sourceItemId}`
+      );
+    }
+  }, [codexState, session.id]);
   const codexProjectionActive =
     codexState !== null &&
     (codexState.availability === "controllable" ||
@@ -1327,7 +1526,16 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
       data-testid="card-dock"
       className="flex max-h-[55vh] shrink-0 flex-col gap-2 overflow-y-auto"
     >
+      {/* T09/T10：Desktop 会话的**原生卡优先**——投影里已有原生 pending（命令/文件/
+          权限/问答）时不再挂旧 TUI 屏读卡，避免同一事件两张卡（一张永远读不到
+          终端选项）。终端会话（codexState === null）保持原 ApproveCard 行为。 */}
       {approveMounted &&
+        !appForm &&
+        !(
+          codexState !== null &&
+          codexProjectionActive &&
+          (codexState.pending.length > 0 || (codexState.asyncQuestions?.length ?? 0) > 0)
+        ) &&
         (planFeedbackActive ? null : (
           <ApproveCard
             key={`approve-${session.id}`}
@@ -1347,30 +1555,124 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
           展示。QuestionCard 仍保持原总结态门（终端卡行为不变）。 */}
       {codexState !== null ? (
         <>
-          <CodexAvailabilityBanner
-            key={`codex-banner-${session.id}`}
-            availability={codexState.availability}
-            stale={codexState.stale}
-            probeStatus={codexState.probeStatus}
+          {/* R16：App 会话不再挂"总能力徽标"（逐操作工具栏已承担解释职责）；
+              CLI/兼容会话仍保留横幅（它承载 stale/探测骨架语义）。 */}
+          {!appForm ? (
+            <CodexAvailabilityBanner
+              key={`codex-banner-${session.id}`}
+              availability={codexState.availability}
+              stale={codexState.stale}
+              probeStatus={codexState.probeStatus}
+              sendAttemptable={codexSendGate}
+            />
+          ) : (
+            // R16：App 会话去掉"总能力徽标"，但**stale（断链/换代）必须如实显示**。
+            codexState.stale && (
+              <p
+                data-testid="codex-stale-note"
+                className="text-xs text-amber-700 dark:text-amber-400"
+              >
+                {i18n.t("mobile.codex.staleBanner")}
+              </p>
+            )
+          )}
+          {appForm && adaptHintVisible && (
+            <div
+              data-testid="codex-adapt-hint-inline"
+              className="rounded-xl border border-[var(--bd)] bg-[var(--cd)] px-3 py-2 text-xs text-[var(--mut)]"
+            >
+              <p>{i18n.t("mobile.codex.adapt.hint")}</p>
+              <button
+                type="button"
+                data-testid="codex-adapt-hint-dismiss"
+                onClick={dismissAdaptHint}
+                className="mt-1 underline"
+              >
+                {i18n.t("mobile.codex.adapt.hintOk")}
+              </button>
+            </div>
+          )}
+          <CodexOperationToolbar
+            key={`codex-ops-${session.id}`}
+            operations={codexState.effectiveOperations}
+            onOpenDetails={() => setCodexAdaptOpen(true)}
           />
-          {codexProjectionActive &&
-            codexState.pending.map((p) => (
-              <PendingRequestCard
-                key={`codex-pending-${session.id}-${p.requestKey}`}
-                sessionId={session.id}
-                request={p}
-                writeLocked={codexState.stale}
-              />
-            ))}
+          {codexAdaptOpen && (
+            <CodexAdaptSheet
+              key={`codex-adapt-${session.id}`}
+              sessionId={session.id}
+              open={codexAdaptOpen}
+              onClose={() => setCodexAdaptOpen(false)}
+            />
+          )}
+          {/* 2026-10-28 用户裁决：只展示当前有效交互卡——当前可答组，或本机
+              已发出过动作的待核对组；已答/无锚 unknown 不再有历史入口。 */}
+          {codexProjectionActive && (
+            <div data-testid="codex-dock-cards" className="contents">
+              {inbox.pending.map((p) => (
+                <PendingRequestCard
+                  key={`codex-pending-${session.id}-${p.requestKey}`}
+                  sessionId={session.id}
+                  request={p}
+                  writeLocked={codexState.stale}
+                />
+              ))}
+              {inbox.groups
+                .filter((group) => group.key !== activeGroup?.key)
+                .map((group) => (
+                  <button
+                    key={`codex-group-row-${session.id}-${group.key}`}
+                    type="button"
+                    data-testid="codex-group-row"
+                    data-group-key={group.key}
+                    onClick={() => setActiveGroupKey(group.key)}
+                    className="flex w-full items-center justify-between rounded-xl border border-[var(--bd)] bg-[var(--cd)] px-3 py-1.5 text-left text-xs text-[var(--mut)]"
+                  >
+                    <span>
+                      {group.live.length > 0
+                        ? i18n.t("mobile.codex.async.otherGroup", {
+                            count: group.live.length,
+                          })
+                        : i18n.t("mobile.codex.async.verifyGroup", {
+                            count: group.members.length,
+                          })}
+                    </span>
+                    <span className="underline">{i18n.t("mobile.codex.async.openGroup")}</span>
+                  </button>
+                ))}
+              {inbox.groups.map((group) => (
+                <div
+                  key={`codex-group-panel-${session.id}-${group.key}`}
+                  data-testid={`codex-group-panel-${group.key}`}
+                  hidden={group.key !== activeGroup?.key}
+                >
+                  <AsyncQuestionGroupCard
+                    sessionId={session.id}
+                    questions={group.members}
+                    onChanged={() => setQueueTick((tick) => tick + 1)}
+                  />
+                </div>
+              ))}
+            </div>
+          )}
           <CodexQueuePanel
             key={`codex-queue-${session.id}`}
             sessionId={session.id}
             refreshSignal={queueTick}
+            onQueueStateChanged={bumpSendInfo}
           />
-          {!codexProjectionActive && !isSummary && (
+          {!codexProjectionActive && !isSummary && !appForm && (
             <QuestionCard key={`question-${session.id}`} session={session} />
           )}
         </>
+      ) : appForm ? (
+        // App 会话尚无投影：如实显示"连接中"，**不回退终端屏读卡**。
+        <p
+          data-testid="codex-connecting"
+          className="rounded-xl border border-[var(--bd)] bg-[var(--cd)] px-3 py-2 text-xs text-[var(--mut)]"
+        >
+          {i18n.t("mobile.codex.ops.connecting")}
+        </p>
       ) : (
         !isSummary && <QuestionCard key={`question-${session.id}`} session={session} />
       )}
@@ -1381,7 +1683,7 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
           观察台 T5：chip 改纯展示，名单由上方 subagentList 单一数据源下发
           （拉取不再自持），点击直达详情对话框（§二.4）。 */}
       <div data-testid="status-row" className="flex flex-wrap items-center gap-2">
-        <ModeBar key={`mode-${session.id}`} session={session} />
+        {!appForm && <ModeBar key={`mode-${session.id}`} session={session} />}
         {session.status !== "finished" && (
           <SubagentChips
             key={`subagents-${session.id}`}
@@ -1458,6 +1760,9 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
                       isUser ? "flex flex-col items-end" : "flex flex-col items-start"
                     } data-[jump-hit=true]:rounded-xl data-[jump-hit=true]:bg-amber-500/10 data-[jump-hit=true]:ring-2 data-[jump-hit=true]:ring-amber-500/70`}
                   >
+                    {m.interactionAnswer ? (
+                      <AnswerBubble answer={m.interactionAnswer} messageId={m.id} />
+                    ) : null}
                     {m.text !== "" && (
                       <div
                         className={
@@ -1908,6 +2213,9 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
               key={`composer-${session.id}`}
               session={session}
               onQueueChanged={bumpQueue}
+              onSendGate={setCodexSendGate}
+              refreshSendInfoSignal={sendInfoTick}
+              disableTerminalProbes={appForm}
             />
           </div>
           <SplitHandle
@@ -1983,6 +2291,9 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
             key={`composer-${session.id}`}
             session={session}
             onQueueChanged={bumpQueue}
+            onSendGate={setCodexSendGate}
+            refreshSendInfoSignal={sendInfoTick}
+            disableTerminalProbes={appForm}
           />
         </div>
       )}

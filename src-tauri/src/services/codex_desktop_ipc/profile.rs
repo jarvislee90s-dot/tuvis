@@ -278,7 +278,7 @@ pub fn profile_for(platform: &str, build: &str) -> Option<ProtocolProfile> {
         ("windows", "26.1016.6573.0") => Some(windows_6573_profile(build)),
         ("macos", "26.1013.31256") => Some(macos_profile(build)),
         // 40934：2026-10-18 实机登记 + 2026-10-21 interrupt 取证
-        //（docs/superpowers/reviews/2026-10-22-codex-interrupt-probe-results.md）
+        //（docs/engineering/evidence/codex-desktop-ipc/2026-10-22-codex-interrupt-probe-results.md）
         ("macos", "26.1013.40934") => Some(macos_interrupt_profile(build)),
         // 51333：2026-10-22 复探零漂移（reviews/2026-10-22-codex-app-51333-reprobe.md）
         ("macos", "26.1016.51333") => Some(macos_interrupt_profile(build)),
@@ -321,6 +321,29 @@ pub fn profile_for_or_compat(platform: &str, build: &str) -> ProtocolProfile {
         Some(p) => p,
         None if !build.is_empty() => compat_send_profile(platform, build),
         None => ProtocolProfile::closed(),
+    }
+}
+
+/// **自动适配关闭**时的未知 build 档（S1，设计 §3.3「关闭自动适配」行）：只读
+/// 可尝试（state=true），发送关（send=false），破坏性能力照旧证据门控。
+///
+/// 为什么不是 closed：关闭自动适配阻止的是「新的未知 build **自动探测、普通发送
+/// 和兼容审批决策**」，不 brick 只读查看——「已发动作仍可收尾核对」要求只读链仍在。
+/// 已验证 build 不经本档（按已验证能力运行，不受开关影响）。
+pub fn compat_readonly_profile(platform: &str, build: &str) -> ProtocolProfile {
+    ProtocolProfile {
+        platform: platform.to_string(),
+        build: build.to_string(),
+        capabilities: CapabilitySet {
+            send: false,
+            state: true,
+            command: false,
+            permissions: false,
+            blocking_input: false,
+            interrupt: false,
+        },
+        method_versions: method_table(),
+        evidence: EvidenceLevel::Unverified,
     }
 }
 
@@ -388,7 +411,7 @@ mod tests {
         assert!(!p.capabilities.command);
         assert!(!p.capabilities.blocking_input);
         // 51333 = 2026-10-22 复探登记（方法表/协商/安全阀零漂移，见
-        // docs/superpowers/reviews/2026-10-22-codex-app-51333-reprobe.md）：
+        // docs/engineering/evidence/codex-desktop-ipc/2026-10-22-codex-app-51333-reprobe.md）：
         // caps 与 40934 同面；相邻 build 仍 fail-closed
         let p51333 = profile_for("macos", "26.1016.51333").expect("registered");
         assert!(p51333.capabilities.send && p51333.capabilities.state);
@@ -398,7 +421,7 @@ mod tests {
         assert!(!p51333.capabilities.blocking_input);
         assert!(profile_for("macos", "26.1016.51334").is_none());
         // 61520 = 2026-10-22 深夜复探登记（当日第二次自动升级，零漂移，
-        // 见 docs/superpowers/reviews/2026-10-22-codex-app-61520-reprobe.md）
+        // 见 docs/engineering/evidence/codex-desktop-ipc/2026-10-22-codex-app-61520-reprobe.md）
         let p61520 = profile_for("macos", "26.1016.61520").expect("registered");
         assert!(p61520.capabilities.send && p61520.capabilities.state);
         assert!(p61520.capabilities.interrupt);

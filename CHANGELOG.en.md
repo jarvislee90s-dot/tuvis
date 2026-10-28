@@ -7,15 +7,24 @@ English · [中文](CHANGELOG.md)
      ② 版本标题 `## [x.y.z] - YYYY-MM-DD`、分区顺序与条目顺序同中文版逐条对齐；
         分区名用英文（`Engineering` 对应中文版「工程」）；
      ③ 未译条目不留占位——直接不写（网站英文页按「仅列已译版本」展示）；
-     ④ 新增版本时两份文件同批更新（发版文档纪律见 docs/RELEASE.md）；
+     ④ 新增版本时两份文件同批更新（发版文档纪律见 docs/operations/RELEASE.md）；
      ⑤ 网站（tuvis-website）构建时按双源同步：本文件 → 英文站，CHANGELOG.md → 中文站。 -->
 
 _Only versions translated so far are listed here; the full history lives in the
 [Chinese changelog](CHANGELOG.md)._
 
-## [Unreleased]
+## [0.6.3] - 2026-10-28
+
+### Upgrade notes
+
+- **Codex Desktop adaptive control is now the main path**: Codex Desktop actions are gated **per operation by contract evidence**, not by a whole-build allowlist. Unknown Desktop builds enable auto-adapt by default and attempt plain sends under target/state/protocol guards; destructive actions (interrupt, approvals) remain behind a read-only probe and evidence gates. Desktop sessions never fall back to headless; unsupported actions stay closed with a stated reason.
+- **Queue pause is protection, not a fault**: after an interrupt/cancel the outgoing queue stays paused until you explicitly choose "Resume queue" or "Send this one first"; an ordinary refresh never deletes an old pause.
 
 ### Added
+
+- **Codex Desktop adaptive control (0.6.3 flagship)**: plain messages, blocking Q&A (multi-question / multi-value / free text), command and file approvals (accept / decline / cancel the turn), targeted interrupt, and idle async answers are unlocked per operation. Uncertain contracts close the action with a reason — no guessing, no blind sends. The phone exposes adaptation details with evidence sources and an auto-adapt switch.
+- **Grouped async questions: one card, one submit**: questions from the same source share a card; previous/next keeps drafts and the last question submits the whole group once. Answered groups close automatically and do not return after refresh. Options and free text are mutually exclusive; a restored draft never submits an answer that is not visible.
+- **Red approvals / blue questions, effective-card dock, queue-pause notice**: approval and question cards are visually distinct; only currently answerable groups or groups with a local action stay docked, the rest collapse to one row; pause/resume entries and reasons are shown in place.
 
 - **Output Speed dual-metric page (same-window four tabs)**: the main window gains an "Output Speed"
   tab — a combined "tool · model · channel" list on the left (search / filter by tool / sort by
@@ -120,6 +129,8 @@ _Only versions translated so far are listed here; the full history lives in the
   independent). **Upgrade notes**:
   after upgrading, reach Usage and Output Speed from the main window's tabs; the cross-window
   detail entries change from "opens a new window" to "wakes the main window and selects the tab".
+
+- **Codex APP compatibility is evidence-per-operation**: shipped / current-package contract match / local observed success replace whole-build registration. Unknown builds still send only under target/state/protocol guards, and destructive actions do not turn on with auto-adapt by default.
 
 ## [0.6.2] - 2026-10-26
 

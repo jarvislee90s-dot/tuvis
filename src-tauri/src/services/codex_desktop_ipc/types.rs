@@ -16,6 +16,18 @@ pub struct ThreadKey {
     pub thread_id: String,
 }
 
+/// H02：无账本动作（interrupt）的写边界资格复核闭包。
+pub type InteractionRecheck = std::sync::Arc<dyn Fn() -> Option<String> + Send + Sync>;
+
+/// G04：**写边界异步资格复核**（账本动作专用）——writer 在取得首写权之前于
+/// 同一临界区再次投影，逐题核对完整组成员/状态/token；`Some(reason)` = 零首次
+/// 写出。与同步 `InteractionRecheck` 区分（后者无投影 IO）。
+pub type AsyncWriteRecheck = std::sync::Arc<
+    dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send>>
+        + Send
+        + Sync,
+>;
+
 /// 投递结果。`NotSent` = 保守判定**零投递**（写尝试开始前即失败）；`UnknownDelivery`
 /// = 已发出但结果未知——**禁止**自动重试、禁止自动 fallback（spec S5）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -25,6 +37,18 @@ pub enum Delivery {
     Accepted,
     Rejected,
     UnknownDelivery,
+}
+
+impl Delivery {
+    /// 账本/DTO 的稳定字符串（`Delivery` 的 serde 值，单一来源）。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Delivery::NotSent => "not_sent",
+            Delivery::Accepted => "accepted",
+            Delivery::Rejected => "rejected",
+            Delivery::UnknownDelivery => "unknown_delivery",
+        }
+    }
 }
 
 /// 动作类型。只承载真正可执行的动作，未知协议类别不进这里（投影里走
@@ -38,6 +62,9 @@ pub enum ActionKind {
     FileChangeApproval,
     PermissionsApproval,
     UserInput,
+    /// F03：异步 Question 的**正式答题**（独立动作类别；进动作账本，但**不进普通
+    /// 消息 FIFO**——它开启真实回合并有独立屏障）。
+    AsyncQuestion,
     /// 打断桌面当前回合（`thread-follower-interrupt-turn`）。**不进动作账本**（打断
     /// 不经队列登记），只用于 ActionContext/审计语义如实——2026-10-22 复审 P3-3：
     /// 打断审计上下文不再复用 `Send`。
@@ -120,6 +147,75 @@ pub struct CodexActionView {
     /// 当前设备视角的 FIFO 位置（1 起）；非 queued 为 None。
     pub position: Option<usize>,
     pub receipt: Option<ActionReceipt>,
+    /// S3 投递阶段（稳定动作查询的消费面，设计 §5.2 前台五分类的账本投影）：
+    /// `queued`（排队/校验等待）/ `dispatching`（reserve 后、终态前——含前台已结束、
+    /// 后台收尾中的「待确认」）/ `settled`（账本终态）。由 state 派生，不单独持久化。
+    #[serde(default)]
+    pub stage: DeliveryStage,
+}
+
+/// S3 投递阶段枚举（`CodexActionView.stage`；serde snake_case）。
+/// 截止原因不在本枚举——经回执 `reasonCode` 表达（`front_budget_elapsed` /
+/// `wrapup_elapsed` / `late_result` / `late_slot_capacity`，单源见
+/// `services/codex_control/router.rs` 常量）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeliveryStage {
+    /// 排队/校验等待（state=queued）。
+    #[default]
+    Queued,
+    /// 派发中（state=reserved）：前台等待可能已结束，动作由后台预算有界收尾。
+    Dispatching,
+    /// 账本终态（accepted/rejected/unknown/cancelled）。
+    Settled,
+}
+
+impl DeliveryStage {
+    /// 从账本状态派生投递阶段（`view_of` 单点消费）。
+    pub fn of_state(state: ActionState) -> Self {
+        match state {
+            ActionState::Queued => Self::Queued,
+            ActionState::Reserved => Self::Dispatching,
+            _ => Self::Settled,
+        }
+    }
+}
+
+/// S4 只读核对结论（`CodexActionVerifyView.outcome`；设计 §6.1 结果表）。
+/// 词汇与稳定动作查询同源（stage 复用 [`DeliveryStage`]），不另造分类。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodexVerifyOutcome {
+    /// 明确零投递证明（账本 NotSent 终态 / cancelled）——解除对应投递不确定屏障
+    /// （该类动作本就无屏障在册）。
+    NotDelivered,
+    /// 送达/已受理（账本 accepted 既有事实，或核对经迟到回执/正式 userMessage
+    /// 回显收敛 accepted）。运行顺序限制仍按绑定 Turn 实时状态（不立即 flush）。
+    Delivered,
+    /// 已受理但始终无 turnId 且核对无法补绑——「消息已受理，执行状态待确认」；
+    /// 显式解除运行屏障的出口（force-continue）对它开放。
+    AcceptedUnbound,
+    /// 无证据 / 快照缺失或过期 / 查不到原消息——继续待确认、保留屏障
+    ///（「没找到」≠「没发送」）。
+    Unresolved,
+}
+
+/// S4 只读核对结果（`GET /codex/action/verify`；serde camelCase）。
+/// `run_limit_released` = 本次核对按「绑定 Turn 终态证据 + 新鲜目标状态」解除了
+/// 运行顺序限制（与设计 §6.1 结果表第 4 行对应）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexActionVerifyView {
+    #[serde(rename = "actionId")]
+    pub action_id: String,
+    pub stage: DeliveryStage,
+    pub outcome: CodexVerifyOutcome,
+    #[serde(rename = "turnId")]
+    pub turn_id: Option<String>,
+    pub run_limit_released: bool,
+    #[serde(rename = "reasonCode")]
+    pub reason_code: Option<String>,
+    pub verified_at: i64,
 }
 
 /// 队列视图。`blocked_reason_code` 非 None（如 `compat_outstanding`）时排队不派发，
@@ -139,6 +235,18 @@ pub struct CodexQueueView {
     /// P2-2：无能力 build 的按钮在源头隐藏；`#[serde(default)]` 兼容旧载荷消费方。
     #[serde(default)]
     pub can_interrupt: bool,
+    /// S2：该 Thread 队列是否处于打断后的持久暂停（旧队列冻结，恢复只经用户显式
+    /// 「继续发送」）。`#[serde(default)]` 兼容旧载荷消费方。
+    #[serde(default, rename = "queuePaused")]
+    pub queue_paused: bool,
+    /// S2：暂停原因（机器码：`interrupt_accepted` / `interrupt_uncertain`；未暂停
+    /// 为 None）。S5 据此区分文案。
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "queuePauseReason"
+    )]
+    pub queue_pause_reason: Option<String>,
 }
 
 /// 官方 Desktop 持有租约：owner 身份随连接生命周期变化（spec F6），epoch 由
@@ -183,12 +291,39 @@ pub struct ThreadProjection {
     /// **只读**：不携带任何写语义，也不改变既有字段的含义——它只是把「为什么这台
     /// build 只能只读/不能写」这一事实如实说给前端看。
     pub probe_status: ProbeStatus,
+    /// T03：异步 Question 视图（逐题独立生命周期；老载荷缺字段 → 空数组）。
+    ///
+    /// **注意**：空数组不等于"没有未答题"——缺字段时按"未知"展示（不据此清卡）。
+    #[serde(default, rename = "asyncQuestions")]
+    pub async_questions: Vec<crate::services::codex_desktop_ipc::async_question::AsyncQuestionView>,
+    /// T02：**逐操作有效集合**（后端唯一事实；spec §3.1「UI 不自行拼按钮」）。
+    ///
+    /// 老载荷缺字段 → [`super::capability::EffectiveOperations::unknown`]（全部
+    /// 操作"未知/不可用"），**不据此推断任何能力**。普通消息仍以既有发送门为准。
+    #[serde(default, rename = "effectiveOperations")]
+    pub effective_operations: super::capability::EffectiveOperations,
+    /// 复审 R-T4 后端：该 Thread 的队列暂停（打断后旧队列冻结，恢复只经用户显式
+    /// 「继续发送」）。**队列控制状态有自己的可靠传播**——暂停变化点（前置落行/
+    /// 撤回/resume/settle）都重发布该线程投影（local_seq 决胜穿透），不依赖
+    /// Desktop 状态帧做必然触发器。读失败按 true 保守（与发送门同口径）。
+    #[serde(default, rename = "queuePaused")]
+    pub queue_paused: bool,
     /// Owner 代际（epoch, generation）：**不序列化给前端**，只用于 SSE 首快照与
     /// 订阅缓冲事件的先后判定（跨 owner revision 可能回退，不能只比 revision）。
     #[serde(skip)]
     pub owner_epoch: u64,
     #[serde(skip)]
     pub owner_generation: u64,
+    /// 终审 F5：**本地投影序号**（与 Desktop revision 完全分离）：快照路径在镜像
+    /// 临界区内盖章（= 观察到的版本）；发布路径经发布点的 **CAS 预留**取得
+    /// （复审 round 5 W1：以观察版本为比较值预留下一版，观察被越过即重观察——
+    /// 不再按发送时刻分配）。用途 = SSE `supersedes` 的最终
+    /// 决胜——Desktop 侧标识（epoch/generation/revision/stale）全同时，本地策略
+    /// 更新（schema 证据安装/恢复、探测通过的重发布）靠它竞争，**不伪造
+    /// revision**；序号单调递增，旧世界的投影不可能反超新序号（不回退）。
+    /// 手工构造（测试夹具/旧路径缺省）= 0：与既有「无序号」事件语义一致。
+    #[serde(skip, default)]
+    pub local_seq: u64,
 }
 
 /// 探测结论的**只读事实**（#172/T9a；随投影下发）。
@@ -313,6 +448,29 @@ pub struct ProjectedMessage {
     /// 仅服务端数量／字节预算省略；与 UI 展示限额分开，不保证已进入文件池。
     #[serde(default)]
     pub omitted_artifact_count: usize,
+    /// T03：正式答复的"问题／答案"摘要（正文不再重复内部信封标记）。
+    ///
+    /// 计入尾窗 1 MiB／500 条预算（序列化体积一部分）——不能靠塞进 metadata
+    /// 绕开限额。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interaction_answer: Option<InteractionAnswerSummary>,
+}
+
+/// 正式答复的安全呈现摘要（T03；`correlated=false` 表示未配对到已知题）。
+///
+/// **不携带写语义**：它只说明"这条用户消息把哪个题答成了什么"，不提升任何动作
+/// 的送达状态（送达与生命周期仍由 `AsyncQuestionView` 的派生状态表达）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InteractionAnswerSummary {
+    /// 官方紧凑题目标识（与 `AsyncQuestionView.questionKey` 同一字符串空间）。
+    pub question_key: String,
+    /// 原题题干（安全展示；来自信封或原题）。
+    pub question: String,
+    /// 用户答案（安全展示）。
+    pub answer: String,
+    /// 是否配对到本线程的已知题（外部/引用文本不能自行提升为"已解决"）。
+    pub correlated: bool,
 }
 
 /// 只读历史消息页状态（计划任务 4 的五个值，逐字对齐；**非正常状态不得被当作
@@ -450,6 +608,52 @@ pub struct QuestionView {
     #[serde(rename = "isSecret")]
     pub is_secret: bool,
     pub options: Vec<QuestionOption>,
+    /// T04：该题可用的答案策略（后端按**当前已核验契约**给出；前端不自行推断）。
+    ///
+    /// 老载荷缺字段 → 保守单值（[`AnswerPolicy::conservative`]），不因字段名猜多值。
+    #[serde(default)]
+    pub answer_policy: AnswerPolicy,
+}
+
+/// 单题的作答策略（T04，spec §5 功能点 4）。
+///
+/// 多值允许与否**只来自已核验契约**（当前分支：答案数组、无数量标志、真机多值
+/// 记账成功），不来自"字段是数组"这种形状猜测。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnswerPolicy {
+    /// 是否允许多值（当前已核验分支：是）。
+    pub allow_multiple: bool,
+    /// 单题答案数量上限（当前分支 32）。
+    pub max_answers: u32,
+    /// 是否允许自由文本（逐题 `isOther`，不按整个请求一刀切）。
+    pub allow_free_text: bool,
+}
+
+impl AnswerPolicy {
+    /// 当前已核验分支的策略（数组答案 + min/max 数量）。
+    pub fn verified(allow_free_text: bool) -> Self {
+        Self {
+            allow_multiple: true,
+            max_answers: 32,
+            allow_free_text,
+        }
+    }
+
+    /// 保守缺省（老载荷 / 未知分支）：单值、无自由文本。
+    pub fn conservative() -> Self {
+        Self {
+            allow_multiple: false,
+            max_answers: 1,
+            allow_free_text: false,
+        }
+    }
+}
+
+impl Default for AnswerPolicy {
+    fn default() -> Self {
+        Self::conservative()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -463,8 +667,12 @@ pub struct QuestionOption {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PendingAction {
+    /// 单次批准（当前请求）。
     Approve,
+    /// 拒绝当前请求（**不**终止回合）——只发 `decline`。
     Reject,
+    /// 拒绝并**终止本轮**——只发 `cancel`（与 Reject 明确分开，不再隐式猜后果）。
+    Cancel,
     Answer(BTreeMap<String, Vec<String>>),
 }
 
@@ -720,10 +928,13 @@ mod tests {
                 state: ActionState::Queued,
                 position: Some(1),
                 receipt: None,
+                stage: DeliveryStage::Queued,
             }],
             blocked_reason_code: None,
             barrier_action_ids: Vec::new(),
             can_interrupt: false,
+            queue_paused: false,
+            queue_pause_reason: None,
         };
         let v = serde_json::to_value(&view).unwrap();
         assert!(v["actions"][0]["actionId"].is_string());

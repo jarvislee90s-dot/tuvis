@@ -1,10 +1,12 @@
 // 远程接入层（M2）：axum 内嵌服务器 + 访问密码配对（M5）+ 移动看板 API
-// 范围与红线见 docs/superpowers/plans/2026-09-17-m5-access-pin-and-file-pool.md
+// 范围与红线见 docs/engineering/plans/2026-09-17-m5-access-pin-and-file-pool.md
 
 pub mod api;
 #[cfg(test)]
 pub mod attachment_fixtures;
 pub mod attachments;
+pub mod codex_adapt;
+pub mod codex_evidence;
 pub mod codex_ipc;
 pub mod content;
 pub mod events;
@@ -59,13 +61,21 @@ pub const KEY_ACCESS_PIN: &str = "remote.access_pin";
 pub const KEY_HEADLESS: &str = "remote.headless_enabled";
 /// H3 关闭态文案：移动端输入区置灰的原因——send-info 的 reason 原样透出
 pub const HEADLESS_DISABLED_REASON: &str = "无头通道未开启，请在电脑端 Tuvis 设置中开启";
-/// **兼容发送开关（#172/T8；实验）**：默认关（缺键 = 关），显式开启才允许对
-/// **写能力未取证**的 Codex 桌面 build 尝试发送（消息可能被投递到错误会话，
-/// 风险自负）。值口径与 KEY_HEADLESS 同：写侧恒 "true"/"false" 显式两值，
-/// 读侧只认 "true"（不认第二真值）。
-/// 消费方：发送门（`remote::codex_ipc` 的兼容发送分支）、`remote_status.compatSendEnabled`
-/// 下发、设置页「兼容发送（实验）」开关。
+/// **兼容发送开关（#172/T8；实验，S1 起**仅剩旧设置 UI 的记录值，不再参与任何门——
+/// 设计 §1.4「移除旧开关的冲突接线」：它的 false 不得被当成新「自动适配」的退出
+/// 选择）。键与命令保留至 S5 换装设置界面 / S6 同步旧契约。
 pub const KEY_COMPAT_SEND: &str = "remote.compat_send_enabled";
+/// **自动适配开关（S1 新设置）**：Codex Desktop 自动适配的总开关，**缺省开**。
+/// 值口径三态：缺键 = 未显式写过 → 生效值 true；"true"/"false" = 用户显式选择，
+/// 一律尊重；乱串 = 视同未写。**不借旧「兼容发送（实验）」开关的缺值/false 当
+/// 缺省来源**（2026-10-23 用户裁决）。消费方：未知 build 的可尝试发送门
+/// （`codex_ipc` 三处 send 门）、adapter 的自动探测门/审批档门（经
+/// `DesktopIpcAdapter::set_auto_adapt_gate` 注入）、`remote_status.codexAutoAdapt*`
+/// 下发、`codex_adapt_status` DTO。
+pub const KEY_AUTO_ADAPT: &str = "remote.codex_auto_adapt";
+/// T08：**首次提示已展示**（移动端轻提示只出现一次；与桌面设置同源，不随 build
+/// 重置）。值口径：`"true"` = 已展示；其余/缺键 = 未展示。
+pub const KEY_AUTO_ADAPT_HINT_SEEN: &str = "remote.codex_auto_adapt_hint_seen";
 /// 兼容发送前置未满足时的拒绝文案（前端置灰提示同源一句；后端是最终裁决）
 pub const COMPAT_SEND_NEEDS_PROBE_MSG: &str =
     "COMPAT_SEND_NEEDS_PROBE: 需先完成只读探测（该 Codex 桌面版本的读链尚未取证）";
@@ -161,9 +171,125 @@ pub fn remote_toggle_headless(enabled: bool) -> Result<(), String> {
 }
 
 /// 兼容发送开关解析（纯函数）：仅 `"true"` 为开——缺键（未设置 = 默认关）/
-/// `"false"` / 乱串一律判关（与 `headless_enabled_from` 同口径，不认第二真值）
+/// `"false"` / 乱串一律判关（与 `headless_enabled_from` 同口径，不认第二真值）。
+/// S1 起该键不再参与任何门（见 [`KEY_COMPAT_SEND`]），仅供旧设置 UI 显示。
 pub fn compat_send_enabled_from(v: Option<&str>) -> bool {
     v == Some("true")
+}
+
+/// **自动适配三态解析（纯函数，S1 单点）**：`None` = 未显式写过（缺键/乱串）→
+/// 生效值取缺省**开**；`Some(true/false)` = 用户显式选择，一律尊重。
+pub fn auto_adapt_setting_from(v: Option<&str>) -> Option<bool> {
+    match v.map(str::trim) {
+        Some("true") => Some(true),
+        Some("false") => Some(false),
+        _ => None,
+    }
+}
+
+/// 自动适配**生效值**读取（store 缝版本）：缺键 = 缺省开。发送门与状态装配共用
+/// 这一个读取点（与 adapter 注入门同源同语义）。
+pub fn auto_adapt_enabled_conn(conn: &rusqlite::Connection) -> bool {
+    auto_adapt_setting_from(
+        crate::database::dao::settings::get_setting_conn(conn, KEY_AUTO_ADAPT).as_deref(),
+    )
+    .unwrap_or(true)
+}
+
+/// **自动适配状态下发装配（可测缝）**：设置真值 + 是否显式写过两件事实进 status
+/// （设置页初值；完整适配状态 DTO 走 `codex_adapt_status` 命令）。
+pub fn apply_codex_auto_adapt_status(st: &mut serde_json::Value, conn: &rusqlite::Connection) {
+    let explicit = auto_adapt_setting_from(
+        crate::database::dao::settings::get_setting_conn(conn, KEY_AUTO_ADAPT).as_deref(),
+    );
+    st["codexAutoAdaptEnabled"] = serde_json::json!(explicit.unwrap_or(true));
+    st["codexAutoAdaptExplicit"] = serde_json::json!(explicit);
+}
+
+/// 自动适配开关翻转内核（**可测核**；conn、审计出口与开启通知以参数注入）：
+/// 恒写显式两值（"true"/"false"）——写过后即成为「显式选择」，永远被尊重。
+/// **终审 F9**：`enabled=true` 时写完设置即调用 `on_enabled`（生产 = 通知适配器
+/// 对已存活连接补触发 schema 按需取证——只写设置不触发的话，关闭态建立的活连接
+/// 不会重走连接期探针，必须断开/重启才恢复）；`enabled=false` 不调用。
+fn toggle_codex_auto_adapt_core(
+    conn: &rusqlite::Connection,
+    enabled: bool,
+    audit: impl FnOnce(&str, &str),
+    notify: impl FnOnce(bool),
+) {
+    crate::database::dao::settings::set_setting_conn(
+        conn,
+        KEY_AUTO_ADAPT,
+        if enabled { "true" } else { "false" },
+    );
+    audit("codex_auto_adapt_toggled", &format!("autoAdapt={enabled}"));
+    events::emit_ui(
+        "remote-changed",
+        serde_json::json!({ "codexAutoAdaptEnabled": enabled }),
+    );
+    // 终审 R4/R6：开/关都通知适配器（重开 = 补触发取证；关闭 = 重发布投影翻转
+    // availability）。适配器侧决定各方向的实际动作。
+    notify(enabled);
+}
+
+/// T08：**共用设置服务**——桌面命令与移动端点都走这里（同一 DB 写入、同一 UI 事件、
+/// 同一适配器通知），不出现"只改库不通知"的第二条路径。
+pub fn apply_codex_auto_adapt_toggle(conn: &rusqlite::Connection, enabled: bool) -> bool {
+    let in_async = tokio::runtime::Handle::try_current().is_ok();
+    toggle_codex_auto_adapt_core(conn, enabled, events::audit, |on| {
+        if in_async {
+            STATE
+                .codex_control
+                .adapter
+                .notify_auto_adapt_changed_async(on);
+        } else {
+            STATE.codex_control.adapter.notify_auto_adapt_changed(on);
+        }
+    });
+    enabled
+}
+
+/// T08：读首次提示事实（缺键/乱串 → 未展示）。
+pub fn codex_auto_adapt_hint_seen_conn(conn: &rusqlite::Connection) -> bool {
+    crate::database::dao::settings::get_setting_conn(conn, KEY_AUTO_ADAPT_HINT_SEEN)
+        .as_deref()
+        .map(str::trim)
+        == Some("true")
+}
+
+/// T08：写首次提示事实（幂等）。
+pub fn dismiss_codex_auto_adapt_hint_conn(conn: &rusqlite::Connection) {
+    // `set_setting_conn` 恒成功（内部 upsert），返回 ()；失败面由调用方的事务保证。
+    crate::database::dao::settings::set_setting_conn(conn, KEY_AUTO_ADAPT_HINT_SEEN, "true");
+}
+
+/// 自动适配开关翻转（S1：缺省开；显式选择被尊重；关闭 = 阻止新的未知 build 自动
+/// 探测/普通发送/兼容审批决策，已验证 build 与只读收尾核对不受影响，设计 §3.3）。
+#[tauri::command]
+pub fn remote_toggle_codex_auto_adapt(enabled: bool) -> Result<(), String> {
+    pairing::DeviceStore::global().with(|c| {
+        toggle_codex_auto_adapt_core(c, enabled, events::audit, |en| {
+            // 终审 R4/R6：开启 → 活连接补触发 schema 取证；关闭 → 重发布投影翻转。
+            // disabled hub 的 adapter 是 closed 档（无 probe 目标）——通知是安全 no-op。
+            STATE.codex_control.adapter.notify_auto_adapt_changed(en);
+        })
+    });
+    Ok(())
+}
+
+/// **适配状态 DTO**（S1 登记边界的调用入口）：桌面设置页/详情页读取「可尝试 ×
+/// 已取证 × schema 决策词 × 最近失败观测 × 探测事实」的单一来源；S5 直接消费本
+/// 命令，不另造第二套 DTO。失败语义：hub 不可用（测试态/装配失败）→ Err 字符串。
+#[tauri::command]
+pub async fn codex_adapt_status() -> Result<serde_json::Value, String> {
+    let hub = STATE.codex_control.clone();
+    let explicit = pairing::DeviceStore::global().with(|c| {
+        auto_adapt_setting_from(
+            crate::database::dao::settings::get_setting_conn(c, KEY_AUTO_ADAPT).as_deref(),
+        )
+    });
+    let status = hub.adapter.adapt_status(explicit).await;
+    serde_json::to_value(status).map_err(|e| format!("codex_adapt_status: {e}"))
 }
 
 /// 兼容发送开关读取（**store 缝版本**）：直用调用方传入的 conn（锁内只做这一条
@@ -174,12 +300,12 @@ pub fn compat_send_enabled_conn(conn: &rusqlite::Connection) -> bool {
     )
 }
 
-/// 兼容发送放行判据（纯函数，#172/T8）：**开关开** ∧ **本 build 写能力未取证**。
-///
-/// 为什么已验证 build 恒 false：shipped 证据里的 build 行为**完全不变**——兼容开关
-/// 对它零影响（既不放开也不收紧），避免「同一台机器换个 build 语义就变了」。
-pub fn compat_send_allowed(switch_on: bool, build_send_verified: bool) -> bool {
-    switch_on && !build_send_verified
+/// 兼容**尝试**放行判据（纯函数，#172/T8；S1 语义原样，S2 正名形参）：**自动适配
+/// 开** ∧ **本 build 档位不带写能力（快照）**。已取证档位恒 false（自动适配不放开
+/// 也不收紧已判明的证据边界——S0 §3.1 二分）。S2 起该判据只服务「未知 build 的
+/// 尝试门与发送记账」，与 headless 无关（Desktop 兜底臂已删）。
+pub fn compat_send_allowed(auto_adapt: bool, profile_send_capable: bool) -> bool {
+    auto_adapt && !profile_send_capable
 }
 
 /// **兼容发送状态下发装配（可测缝）**：从注入的连接读开关 + 写入「读链是否已取证」
@@ -1287,6 +1413,9 @@ pub fn remote_status() -> serde_json::Value {
         let eligible = codex_ipc::read_chain_verified(&store);
         store.with(|c| apply_compat_send_status(&mut st, c, eligible));
     }
+    // S1：自动适配（新设置）设置真值 + 显式标记（设置页初值；完整适配状态 DTO 走
+    // `codex_adapt_status` 命令——remote_status 轮询热路径不装配 hub 运行态）。
+    pairing::DeviceStore::global().with(|c| apply_codex_auto_adapt_status(&mut st, c));
     // M5 A5：通道开关（read_channels 含惰性迁移）+ 隧道双通道快照 + tailscale 快照
     let chans = read_channels();
     let tun = tunnel::snapshot();
@@ -2250,6 +2379,115 @@ mod tests {
         assert_eq!(st["compatSendEligible"], serde_json::json!(true));
     }
 
+    /// S1：自动适配（新设置）的**三态**取值口径——缺键/乱串 = 未显式写过（生效值
+    /// 缺省**开**）；只有显式 "true"/"false" 被尊重。旧「兼容发送（实验）」键的
+    /// 缺值/false 不作为本设置的缺省来源（2026-10-23 用户裁决），故这里是独立键。
+    #[test]
+    fn auto_adapt_setting_tri_state_defaults_open() {
+        assert_eq!(KEY_AUTO_ADAPT, "remote.codex_auto_adapt");
+        // 三态解析
+        assert_eq!(auto_adapt_setting_from(None), None, "缺键 = 未显式写过");
+        assert_eq!(auto_adapt_setting_from(Some(" true ")), Some(true));
+        assert_eq!(auto_adapt_setting_from(Some("false")), Some(false));
+        assert_eq!(auto_adapt_setting_from(Some("1")), None, "乱串视同未写");
+        assert_eq!(auto_adapt_setting_from(Some("TRUE")), None, "只认小写真值");
+        assert_eq!(auto_adapt_setting_from(Some("")), None);
+        // 生效值：未写 → 开（缺省开的口径单点在 unwrap_or(true)）
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::database::schema::init(&conn);
+        assert!(
+            auto_adapt_enabled_conn(&conn),
+            "缺省开：旧实验开关的缺值/false 不迁怒到新设置"
+        );
+        // 旧「兼容发送（实验）」键对生效值零影响（冲突接线已移除）
+        crate::database::dao::settings::set_setting_conn(&conn, KEY_COMPAT_SEND, "false");
+        assert!(
+            auto_adapt_enabled_conn(&conn),
+            "旧开关 false ≠ 新设置的退出选择"
+        );
+        // 显式选择被尊重
+        crate::database::dao::settings::set_setting_conn(&conn, KEY_AUTO_ADAPT, "false");
+        assert!(!auto_adapt_enabled_conn(&conn));
+        crate::database::dao::settings::set_setting_conn(&conn, KEY_AUTO_ADAPT, "true");
+        assert!(auto_adapt_enabled_conn(&conn));
+    }
+
+    /// S1：自动适配状态装配（设置页初值）——enabled = 生效值；explicit = 显式标记。
+    #[test]
+    fn codex_auto_adapt_status_payload_shape() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::database::schema::init(&conn);
+        let mut st = serde_json::json!({});
+        apply_codex_auto_adapt_status(&mut st, &conn);
+        assert_eq!(
+            st["codexAutoAdaptEnabled"],
+            serde_json::json!(true),
+            "缺省开"
+        );
+        assert_eq!(st["codexAutoAdaptExplicit"], serde_json::json!(null));
+        crate::database::dao::settings::set_setting_conn(&conn, KEY_AUTO_ADAPT, "false");
+        let mut st = serde_json::json!({});
+        apply_codex_auto_adapt_status(&mut st, &conn);
+        assert_eq!(st["codexAutoAdaptEnabled"], serde_json::json!(false));
+        assert_eq!(st["codexAutoAdaptExplicit"], serde_json::json!(false));
+    }
+
+    /// S1：自动适配翻转内核——恒写显式两值（写过后即成为显式选择，永远被尊重）。
+    #[test]
+    fn toggle_codex_auto_adapt_writes_explicit_value_and_audits() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::database::schema::init(&conn);
+        let log = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
+        let log2 = log.clone();
+        toggle_codex_auto_adapt_core(
+            &conn,
+            false,
+            |action, _| log2.borrow_mut().push(action.to_string()),
+            |en| {
+                let _ = en;
+            },
+        );
+        assert_eq!(
+            crate::database::dao::settings::get_setting_conn(&conn, KEY_AUTO_ADAPT).as_deref(),
+            Some("false"),
+            "关 = 显式 false（不是删键回缺省）"
+        );
+        let log3 = log.clone();
+        toggle_codex_auto_adapt_core(
+            &conn,
+            true,
+            |action, _| log3.borrow_mut().push(action.to_string()),
+            |en| {
+                let _ = en;
+            },
+        );
+        assert_eq!(
+            crate::database::dao::settings::get_setting_conn(&conn, KEY_AUTO_ADAPT).as_deref(),
+            Some("true")
+        );
+        assert_eq!(log.borrow().len(), 2, "两次翻转都留审计");
+    }
+
+    /// 终审 F9/R4：翻转内核的**通知**（notify(bool)）——开启与关闭都通知适配器
+    ///（重开 = 补触发取证；关闭 = 重发布翻转），适配器侧按方向分支；本单测钉
+    ///「core 恰好通知一次、且 enabled 值如实传递」。适配器侧的实际动作由
+    /// codex_ipc_remote 的 r4/r6 集成用例钉住。
+    #[test]
+    fn toggle_core_notifies_adapter_with_true_value() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::database::schema::init(&conn);
+        let notified = std::rc::Rc::new(std::cell::RefCell::new(Vec::<bool>::new()));
+        let n1 = notified.clone();
+        toggle_codex_auto_adapt_core(&conn, false, |_, _| {}, |en| n1.borrow_mut().push(en));
+        let n2 = notified.clone();
+        toggle_codex_auto_adapt_core(&conn, true, |_, _| {}, |en| n2.borrow_mut().push(en));
+        assert_eq!(
+            *notified.borrow(),
+            vec![false, true],
+            "每次翻转恰好一次通知、enabled 值如实传递"
+        );
+    }
+
     /// 三终端语言自适应（C-3）：推送命令的值集闸门——"zh"/"en" 之外一律 Err
     /// （Rust 只存不判）。只测拒收路径：Ok 路径写全局 STATE，单测不触
     /// （内存源推送次序语义由 language::tests 的 LanguageSource 用例覆盖）
@@ -2442,11 +2680,16 @@ mod tests {
         assert!(!status_enabled(false, false), "DB 关 + 句柄死 → OFF");
     }
 
-    /// (a-佐证) spawn 用法裁决的运行时证据：本测试线程**不进入任何 tokio runtime 上下文**，
-    /// 与 sync tauri 命令线程、lib.rs `.setup()` 主线程同境——裸 `tokio::spawn` 在此会
-    /// panic（no reactor running），而 `tauri::async_runtime::spawn`（内部先 enter 再
+    /// (a-佐证) spawn 用法裁决的运行时证据：本测试线程**不进入任何 tokio runtime
+    /// 上下文**，与 lib.rs `.setup()` 主线程同境——裸 `tokio::spawn` 在此会 panic
+    ///（no reactor running），而 `tauri::async_runtime::spawn`（内部先 enter 再
     /// spawn，tauri async_runtime.rs `Runtime::spawn`）必须正常工作。同时锁定句柄
-    /// `abort()` 能力（stop_server 依赖 SERVER_HANDLE 存此类型）
+    /// `abort()` 能力（stop_server 依赖 SERVER_HANDLE 存此类型）。
+    /// **终审 R4 更正**：sync tauri 命令线程的 runtime 语境**取决于执行路径**
+    ///（Blocking 池内不保证 enter——Gate D 复核指出旧注释「与 sync 命令线程同境/
+    /// 必无语境」与实现细节相悖）——因此**任何入口都不得依赖调用线程的 runtime
+    /// 语境**，一律用 `tauri::async_runtime::spawn`（见
+    /// `DesktopIpcAdapter::notify_auto_adapt_changed`）。
     #[test]
     fn async_runtime_spawn_works_without_runtime_context() {
         let h = tauri::async_runtime::spawn(async { 41 + 1 });

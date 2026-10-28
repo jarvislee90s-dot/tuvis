@@ -468,6 +468,12 @@ async fn conn_discovery(conn: &ConnectionHandle, key: &ThreadKey) -> Result<Stri
             validity: None,
             source_client_id: Some(source_client_id),
             timeout_ms: Some(DISCOVERY_TIMEOUT_MS),
+            action_id: None,
+            compat_licensed: false,
+            deadline: None,
+            pre_dispatch_turns: Default::default(),
+            interaction_recheck: None,
+            async_write_recheck: None,
         })
         .await;
     match outcome.delivery {

@@ -2060,7 +2060,8 @@ describe("MessageComposer：Codex 动作账本与队列刷新", () => {
     const input = (await screen.findByTestId("composer-input")) as HTMLTextAreaElement;
     fireEvent.change(input, { target: { value: "第一条" } });
     fireEvent.click(screen.getByTestId("composer-send"));
-    expect(await screen.findByTestId("send-receipt-codex-unknown")).toBeTruthy();
+    // S5：unknown → 待确认面板接管（检查是否送达 / 报告问题；无普通重试）
+    expect(await screen.findByTestId("codex-recovery-panel")).toBeTruthy();
 
     // 用户明确再发一条新动作：正文没清空（unknown 不假清），actionId 必须换新
     fireEvent.change(input, { target: { value: "第二条" } });
@@ -2129,5 +2130,41 @@ describe("MessageComposer：Codex 动作账本与队列刷新", () => {
     fireEvent.click(screen.getByTestId("composer-send"));
     expect(await screen.findByTestId("send-receipt-codex-accepted")).toBeTruthy();
     await waitFor(() => expect(onQueueChanged).toHaveBeenCalled());
+  });
+});
+
+// ============================================================
+// H12：App 形态零终端探针（投影/原生端点是唯一来源）
+// ============================================================
+
+describe("MessageComposer：H12 App 形态零终端探针", () => {
+  it("h12_app_form_skips_terminal_probes_and_sends_plain_message", async () => {
+    installFetch();
+    routes.info = sendInfo();
+    // 终端探针若被调用会命中下面的"在场"载荷（旧 proposed_plan 会误拦 App 发送）
+    routes.approveOptions = {
+      available: true,
+      options: [{ label: "Approve", description: "" }],
+      verifiedWith: "t",
+      currentVersion: null,
+      drift: false,
+    };
+    routes.questionInfo = { available: true, questions: [] };
+    routes.send = { status: "delivered" };
+    render(<MessageComposer session={{ id: "sess-1" }} disableTerminalProbes />);
+    const input = await screen.findByTestId("composer-input");
+    await act(async () => {
+      await Promise.resolve();
+    });
+    const probeCalls = fetchMock.mock.calls.filter(([u]) => {
+      const url = String(u);
+      return url.includes("/session-approve-options") || url.includes("/session-question");
+    });
+    expect(probeCalls).toHaveLength(0);
+    fireEvent.change(input, { target: { value: "App 里正常发消息" } });
+    fireEvent.click(screen.getByTestId("composer-send"));
+    await waitFor(() => expect(sendCalls()).toHaveLength(1));
+    // 不因终端探针在场而拦截
+    expect(screen.queryByTestId("send-receipt-blocked")).toBeNull();
   });
 });

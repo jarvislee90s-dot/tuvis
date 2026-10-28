@@ -86,15 +86,32 @@ import {
   fetchCodexQueue,
   newActionId,
   reconcileCodexQueuedReceipt,
+  resumeCodexQueue,
   type ActionReceipt,
+  type CodexSuccessorSend,
 } from "./codexIpcApi";
+// S5：发送结果待确认面板（30 秒截止后的接管呈现；核对/人工继续出口）
+import CodexSendRecoveryPanel from "./CodexSendRecovery";
+// S5：统一报告入口（R5 前身）——payload 只含安全引用
+import { reportIssue, reportIssueSummary, type ReportIssueRef } from "@/lib/reportIssue";
 
 interface MessageComposerProps {
   /** 发送回执触发的队列刷新信号（2026-10-20 复审 P2）：本地队列可见性不依赖
    *  Desktop 必须产生新帧——queued / desktop_ipc 回执都会让队列视图变化。 */
   onQueueChanged?: () => void;
+  /** S5：发送静态门结论上报（send-info 是 send_gate_static 的展示面单点）——
+   *  SessionDetail 据此驱动能力横幅（可尝试时不再宣称「暂不能远程发送」）。
+   *  判据：injectable=true，或 reasonCode 非两能力码（native_pending 等非能力
+   *  拒绝不算「不能发送」的能力结论）。拉取失败不回调（横幅维持原状，不猜）。 */
+  onSendGate?: (attemptable: boolean) => void;
+  /** F8：send-info 外部刷新信号（单调递增 tick；0 = 尚无信号不拉）。触发源 =
+   *  同页打断受理/恢复队列（队列暂停态可能翻转）与投影能力档位翻转（设置页
+   *  关闭/重开自动适配）——事件驱动重拉，不做时刻轮询、不引 Tauri channel。 */
+  refreshSendInfoSignal?: number;
   /** 会话（本组件只消费 id；结构化类型，完整 Session 可直接传入） */
   session: { id: string };
+  /** H12：Desktop(App) 形态禁用终端审批/问答探针（App 发送期间零 TUI 请求）。 */
+  disableTerminalProbes?: boolean;
 }
 
 /** 待发附件条目（组件内态）：status=uploading → ready/failed；
@@ -145,9 +162,29 @@ type Receipt =
   | {
       /** **Desktop IPC 原生回执**（Codex APP）：按 delivery 分诊渲染。
        *  unknown_delivery 显示「投递结果未知，请在 Desktop 核对」，**无重试语义**
-       *  （S5：不确定结果绝不重试；文本已清空防双投）。 */
+       *  （S5：不确定结果绝不重试；文本已清空防双投）。
+       *  S5：`retriedFrom` = 本动作由「明确未送达后的重试」创建时的原动作 ID
+       *  （安全引用，展示前 8 位）——重试创建关联的新动作，不永远重放原失败。 */
       kind: "codex";
       receipt: ActionReceipt;
+      retriedFrom?: string | null;
+    }
+  | {
+      /** S5：**发送结果待确认**（设计 §5.2 第五分类）——已可能写出但未取得足够
+       *  证据（30 秒截止 / 网络层失败）。结束转圈、保留可见消息和原动作，由
+       *  CodexSendRecoveryPanel 接管（检查是否送达 / 报告问题 / 人工继续）；
+       *  **绝不**渲染普通重试（结果未知重试 = 双投窗口）。 */
+      kind: "codexUnknown";
+      actionId: string;
+      /** 原文（人工继续的后继重发就是原消息——服务器权威核验） */
+      text: string;
+      /** 进入面板时的已知理由码（网络异常 → null） */
+      reasonCode: string | null;
+      /** true = 30 秒前台预算到期呈现 */
+      deadline?: boolean;
+      /** W2：本动作是原动作人工继续创建的后继时携带原动作 ID（父子关系展示，
+       *  面板据此渲染「原动作 → 本后继」关联行） */
+      resumedFrom?: string | null;
     }
   | {
       /** **兼容通道回执**（Codex APP 兼容发送）：后端 headless 封套原样透出。 */
@@ -163,11 +200,19 @@ type Receipt =
       kind: "codexQueued";
       position: number;
       actionId: string;
+      /** W2：本动作是原动作人工继续创建的后继时携带原动作 ID（父子关联展示） */
+      resumedFrom?: string | null;
     }
   | null;
 
-/** 排队态轮询间隔（毫秒）：有排队项时刷新队位（与看板轮询同量级） */
+/** 排队列 3s 轮询间隔（毫秒）：有排队项时刷新队位（与看板轮询同量级） */
 const QUEUE_POLL_MS = 3000;
+
+/** S3 前台统一预算的前台面（30 秒）：前端本地单调计时——从点击发送起算，到期
+ *  强制结束转圈（不依赖服务端时钟同步）；此后按服务端动作 stage/核对结果呈现
+ *  五分类之一。只作用于 Codex APP 路径（Desktop IPC 的统一预算概念；终端注入
+ *  路径的慢消费者可达分钟级，不受此约束）。 */
+const FRONT_DEADLINE_MS = 30_000;
 
 /** 正文长度上限：与后端 MAX_SEND_CHARS 对齐（服务端超限 400 拒收，前端
  *  maxLength 截断是第一道防线，onChange slice 为 jsdom/旧内核兜底的双保险） */
@@ -255,6 +300,26 @@ function queueItemPreview(content: string): string {
   return body.length > PREVIEW_MAX_CHARS ? `${body.slice(0, PREVIEW_MAX_CHARS)}…` : body;
 }
 
+/** S5：NotSent 理由码（S2 枚举单源的移动端词表）→ 用户可读文案。词表内给**出口
+ *  指引**（不只是「失败，请重试」）；词表外返回 null → 回落 {{reason}} 模板（不猜，
+ *  绝不渲染 raw i18n 键）。 */
+function notSentReasonCopy(reasonCode: string | null): string | null {
+  switch (reasonCode) {
+    case "queue_paused":
+      return i18n.t("mobile.codex.composer.reasonQueuePaused");
+    case "grant_consumed":
+      return i18n.t("mobile.codex.composer.reasonGrantConsumed");
+    case "native_pending":
+      return i18n.t("mobile.codex.composer.reasonNativePending");
+    case "capability_unverified":
+      return i18n.t("mobile.codex.composer.reasonCapabilityUnverified");
+    case "capability_unavailable":
+      return i18n.t("mobile.codex.composer.reasonCapabilityUnavailable");
+    default:
+      return null;
+  }
+}
+
 /** 行按 id upsert（乐观插入/更新共用的收敛入口）：命中替换、未命中尾部追加——
  *  发送入队的即时反馈与复核保守恢复都经它把行放回列表，3s 轮询随后以服务端
  *  权威列表整表覆盖 */
@@ -266,7 +331,13 @@ function upsertQueueItem(items: QueueItemView[], item: QueueItemView): QueueItem
   return next;
 }
 
-export default function MessageComposer({ session, onQueueChanged }: MessageComposerProps) {
+export default function MessageComposer({
+  session,
+  onQueueChanged,
+  onSendGate,
+  refreshSendInfoSignal = 0,
+  disableTerminalProbes = false,
+}: MessageComposerProps) {
   // 可用性：sendInfo=null 且未就绪 → 不渲染（加载中 / 拉取失败 / 403）
   const [sendInfo, setSendInfo] = useState<SendInfo | null>(null);
   const [infoReady, setInfoReady] = useState(false);
@@ -314,6 +385,52 @@ export default function MessageComposer({ session, onQueueChanged }: MessageComp
    *  生命周期：明确终态（delivered/submitted/queued/desktop_ipc/headless）即清空；
    *  unknown_delivery / 网络异常保留（结果未知的核对锚，绝不换 ID 重投）；换会话清空。 */
   const codexActionIdRef = useRef<string | null>(null);
+  /** F6：核对锚对应的**逻辑发送载荷**（与 codexActionIdRef 同生命周期）——
+   *  运输重试的判据从「ref 非空」收紧为「ref 非空 ∧ 载荷相同」：上一动作结果未知
+   *  时，同载荷重按 = 同一次逻辑发送的运输重试（同 ID，服务端账本去重防双投）；
+   *  **换了正文 = 新逻辑发送**，必须换新 ID（否则同 ID 异载荷 → 服务端
+   *  action_conflict，且旧锚永不清 → 死锁）。 */
+  const codexActionPayloadRef = useRef<string | null>(null);
+  /** S5+F6：30 秒前台预算的**当前发送**计时器把手（{epoch, timer}；闭包内另有
+   *  逐发送的本地句柄——共享 ref 只供卸载清理兜底，读写一律按 epoch 归属）。
+   *  到期 = 呈现所有权移交待确认面板：此后迟到的原始回执不再覆盖面板
+   *  （核对/队列视图才是权威呈现——面板自己可随时核对账本）。 */
+  const deadlineTimerRef = useRef<{ epoch: number; timer: ReturnType<typeof setTimeout> } | null>(
+    null
+  );
+  /** S5：发送代际（每次 handleSend 递增）——旧发送闭包的迟到响应/迟到回执在代际
+   *  前进后一律作废（不回写新发送的回执槽；「刷新/切会话旧 promise 不回写」在
+   *  发送流上的同源防线）。 */
+  const sendEpochRef = useRef(0);
+  /** Q2（复审 round 6）：当前恢复上下文归属快照——最近一次以「发送结果待确认」
+   *  呈现的动作 {actionId, epoch, draftVersion}。人工继续的 onSuccessorResolved
+   *  是**父组件回调**，不受面板按 actionId 重挂的局部状态保护：旧面板卸载后，
+   *  在途的人工继续 promise 依然会调用它。回执槽建立 codexUnknown 的同一刻在此
+   *  登记；回调落地先核对「当前恢复动作 + 发送代际」仍归属发起时的原动作，不一致
+   *  直接作废（在**全部副作用之前**——锚释放/回执覆盖/清草稿一概不发生）。 */
+  const codexRecoveryOwnerRef = useRef<{
+    actionId: string;
+    epoch: number;
+    draftVersion: number;
+  } | null>(null);
+  /** Q2：草稿版本号——用户编辑正文/附件即前移。后继实际提交的是原动作的原文，
+   *  只有「发起人工继续后未再编辑」的草稿（= 仍是实际提交的那份）才允许被
+   *  成功/入队清理；在途编辑出的新草稿绝不代清。 */
+  const draftVersionRef = useRef(0);
+  /** S5：「本条先发送」一次性越队标志（队列暂停时的二选一之一；arm 后下一次
+   *  发送携带 bypassPausedQueue=true，消费即清——授权失效重放会得 grant_consumed） */
+  const [bypassNext, setBypassNext] = useState(false);
+  /** S5：重试关联——明确未送达后用户点「重试」时记录原动作 ID（安全引用，展示前 8 位） */
+  const retriedFromRef = useRef<string | null>(null);
+  /** S5：报告入口的「诊断服务未开启」展开态（未部署 = sink 恒 null → 如实呈现） */
+  const [reportUnavailable, setReportUnavailable] = useState(false);
+  /** S5：最近一次报告请求的安全引用（复制摘要出口用；只含引用不含正文） */
+  const [lastReportRef, setLastReportRef] = useState<{
+    errorCode: string | null;
+    actionId: string | null;
+  } | null>(null);
+  /** S5：恢复队列进行中（防连点） */
+  const [resumingQueue, setResumingQueue] = useState(false);
   /** D8 完整队列表（/session-queue 的 items）：逐条渲染的数据源——不限本端发送
    *  的条目（桌面端/他端排的队同样可见可操作）。乐观行（发送即时反馈/复核保守
    *  恢复）与权威列表（挂载拉取/3s 轮询）都收敛到这里 */
@@ -362,6 +479,8 @@ export default function MessageComposer({ session, onQueueChanged }: MessageComp
    *  4. `!questions[0].multiSelect`（多选屏的自由作答行带勾选框，定位判据不匹配 →
    *     后端恒 409，见 `question::free_text_shape_supported` 的实机证据）。 */
   const probeCardPresence = useCallback(async (): Promise<TerminalCardPresence> => {
+    // H12：App 形态 = 投影/原生端点唯一来源，**零终端探针**（含发送前复探）。
+    if (disableTerminalProbes) return "none";
     const [approve, question] = await Promise.all([
       fetchApproveOptions(session.id).catch(() => null),
       fetchSessionQuestion(session.id).catch(() => null),
@@ -378,7 +497,7 @@ export default function MessageComposer({ session, onQueueChanged }: MessageComp
       q.length === 1 &&
       !q[0].multiSelect;
     return canFreeText ? "questionFreeText" : "questionBlocked";
-  }, [session.id]);
+  }, [session.id, disableTerminalProbes]);
 
   // 挂载拉取一次输入区可用性；任何失败静默保持隐藏
   useEffect(() => {
@@ -387,13 +506,28 @@ export default function MessageComposer({ session, onQueueChanged }: MessageComp
     // 换会话即弃修改重发标志（D6）：queueOnlyNext 是上一个会话「修改」的遗愿，
     // 不得泄漏到新会话的首发（保守方向虽无害，语义上仍属错位）
     setQueueOnlyNext(false);
+    // S5：越队标志/报告展开态同属上一会话的遗愿，一并清
+    setBypassNext(false);
+    setReportUnavailable(false);
     // actionId 同理——一次用户动作不跨会话，切换即清（下一条消息是新动作）
     codexActionIdRef.current = null;
+    codexActionPayloadRef.current = null;
+    retriedFromRef.current = null;
+    // Q2：恢复归属快照同属上一会话的现场，一并清
+    codexRecoveryOwnerRef.current = null;
+    if (deadlineTimerRef.current !== null) {
+      clearTimeout(deadlineTimerRef.current.timer);
+      deadlineTimerRef.current = null;
+    }
     fetchSendInfo(session.id)
       .then((info) => {
         if (!alive) return;
         setSendInfo(info);
         setInfoReady(info !== null);
+        // S5：静态门结论上报（能力横幅的「可尝试」唯一来源）
+        if (info !== null) {
+          onSendGate?.(sendGateAttemptable(info));
+        }
       })
       .catch(() => {
         if (alive) setInfoReady(false);
@@ -401,7 +535,27 @@ export default function MessageComposer({ session, onQueueChanged }: MessageComp
     return () => {
       alive = false;
     };
-  }, [session.id]);
+  }, [session.id, onSendGate]);
+
+  // F8：外部信号（同页打断受理 / 恢复队列 / 投影能力档位翻转）→ 事件驱动重拉
+  // send-info（队列暂停态、静态门结论都可能已变）。失败静默——下一次信号或重挂
+  // 自愈；403（设备失效）返回 null 跳过（全局判废通道处理）。
+  useEffect(() => {
+    if (refreshSendInfoSignal <= 0) return;
+    let alive = true;
+    fetchSendInfo(session.id)
+      .then((info) => {
+        if (!alive || info === null) return;
+        setSendInfo(info);
+        onSendGate?.(sendGateAttemptable(info));
+      })
+      .catch(() => {
+        /* 单次刷新失败静默 */
+      });
+    return () => {
+      alive = false;
+    };
+  }, [refreshSendInfoSignal, session.id, onSendGate]);
 
   // D8：挂载/换会话拉一次完整队列——进入会话即见既有队列（桌面端/他端排的队也要
   // 能看到）；换会话先清列表防串台。拉取失败静默（列表留空），排队回执在场的 3s
@@ -521,11 +675,153 @@ export default function MessageComposer({ session, onQueueChanged }: MessageComp
 
   const injectable = sendInfo !== null && sendInfo.injectable;
 
+  /** S5：发送静态门的「可尝试」判据（send-info 展示面单点的消费；不复刻能力策略
+   *  ——只区分「两能力码拒绝」与「其余一切」）。native_pending / queue_paused 等
+   *  拒绝是**操作层**的（处理卡片/排队即可），不是「不能远程发送」的能力结论。 */
+  function sendGateAttemptable(info: SendInfo): boolean {
+    if (info.injectable) return true;
+    return (
+      info.reasonCode !== "capability_unverified" && info.reasonCode !== "capability_unavailable"
+    );
+  }
+
+  /** S5：统一报告入口。诊断出口未接线（R5 未部署）→ 如实展开「诊断服务未开启 +
+     复制摘要」，绝不显示提交成功。payload 只含安全引用（无正文/日志/路径）。 */
+  const handleReportIssue = useCallback(
+    (errorCode: string | null, actionId: string | null) => {
+      const ref: ReportIssueRef = {
+        tool: "codex",
+        surface: "composer_send",
+        sessionId: session.id,
+        actionId,
+        errorCode,
+        adaptSummary: null,
+      };
+      if (!reportIssue(ref)) {
+        setLastReportRef({ errorCode, actionId });
+        setReportUnavailable(true);
+        return;
+      }
+      setReportUnavailable(false);
+    },
+    [session.id]
+  );
+
+  const copyReportSummary = useCallback(async () => {
+    if (lastReportRef === null) return;
+    const text = reportIssueSummary({
+      tool: "codex",
+      surface: "composer_send",
+      sessionId: session.id,
+      actionId: lastReportRef.actionId,
+      errorCode: lastReportRef.errorCode,
+      adaptSummary: null,
+    });
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch {
+      /* 剪贴板不可用：静默（复制失败不伪造成功） */
+    }
+  }, [lastReportRef, session.id]);
+
+  /** S5：恢复被打断暂停的发送队列（POST /codex/queue/resume = 唯一解除出口）；
+   *  成功后重拉 send-info 刷新暂停态。 */
+  const resumeQueue = useCallback(async () => {
+    if (resumingQueue) return;
+    setResumingQueue(true);
+    try {
+      await resumeCodexQueue(session.id);
+      const info = await fetchSendInfo(session.id);
+      setSendInfo(info);
+      if (info !== null) onSendGate?.(sendGateAttemptable(info));
+      // F8：恢复成功 → 队列视图必然变化（暂停解除、派发接力）——通知同页队列
+      // 面板刷新（不依赖 Desktop 必须产生新帧）
+      onQueueChanged?.();
+    } catch {
+      /* 恢复失败静默：暂停态以服务端为准（send-info 重挂/轮询自愈） */
+    } finally {
+      setResumingQueue(false);
+    }
+  }, [resumingQueue, session.id, onSendGate, onQueueChanged]);
+
   const handleSend = useCallback(async () => {
     const body = text.trim();
     if (!body || sending || busy || sendInfo === null || !sendInfo.injectable) return;
     if (attachments.some((a) => a.status === "uploading")) return; // 上传中禁发（防消息先于落盘）
     setSending(true);
+    // S5：本次发送的代际（迟到响应作废判据；见 sendEpochRef 声明处）
+    const myEpoch = ++sendEpochRef.current;
+    const staleEpoch = () => sendEpochRef.current !== myEpoch;
+    // ===== F6：点击即建立 30 秒前台总预算（S3 前台统一预算的前台面）=====
+    // 预算覆盖**整次编排**：前置卡片探测 + session-send 消费同一窗——此前计时器
+    // 在探测之后才武装，探测挂起即可无限转圈。计时器/到期标记/回执写入全部按
+    // **本次发送闭包**归属：旧发送的迟到收尾（成功/失败/finally）碰不到新动作的
+    // 计时器、转圈与回执槽（finally 一并承担所有出口的计时器清理）。
+    // 附件标记行与 actionId 在点击时一次算定（handleSend 闭包已把 text/attachments
+    // 定格在点击帧——与探测后计算逐字等价）。
+    const markup = attachments
+      .filter((a) => a.status === "ready" && a.path)
+      .map((a) => (a.isImage ? `<image path="${a.path}">` : `<file path="${a.path}">`))
+      .join("\n");
+    const fullText = markup ? `${text}\n${markup}` : text;
+    // Q2（复审 round 7）：草稿版本在**提交时点**冻结（与 fullText 同刻定格）——
+    // textarea 在发送等待期间仍可编辑，回执/计时器落地时再采样 draftVersionRef
+    // 会把等待期编辑出的新稿版本记到本次动作头上，后继人工继续的版本门随之
+    // 误判「草稿未变」清掉未提交的新稿。handleSend 自身不动版本号（bump 全在
+    // onChange/addFiles/removeAttachment/handleEdit），此刻读到的就是提交内容
+    // 对应的版本；四个 Unknown 登记点一律携带本值。
+    const submittedDraftVersion = draftVersionRef.current;
+    const needsActionId = sendInfo?.channels?.some((c) => c.startsWith("headless_codex_")) ?? false;
+    // F6：actionId 按逻辑发送的载荷键控（见 codexActionPayloadRef 声明处）——
+    // 上一动作结果未知（核对锚在 ref）时：同载荷重按 = 运输重试（同 ID）；换正文
+    // = 新逻辑发送（新 ID——否则撞 action_conflict 且旧锚死锁）。
+    let actionId: string | undefined;
+    if (needsActionId) {
+      const prevId = codexActionIdRef.current;
+      if (prevId !== null && codexActionPayloadRef.current === fullText) {
+        actionId = prevId;
+      } else {
+        actionId = newActionId();
+        codexActionIdRef.current = actionId;
+        codexActionPayloadRef.current = fullText;
+      }
+    }
+    // S5：Codex 路径武装标记（catch 臂可见；null = 本次发送非 Codex 路径/未武装）
+    const armedCodexActionId: string | null = actionId ?? null;
+    // F6：本次发送专属的 30 秒计时器（闭包归属；共享 ref 只留卸载清理把手）
+    let myExpired = false;
+    let myTimer: ReturnType<typeof setTimeout> | null = null;
+    const clearMyDeadline = () => {
+      if (myTimer !== null) {
+        clearTimeout(myTimer);
+        myTimer = null;
+      }
+      if (deadlineTimerRef.current?.epoch === myEpoch) deadlineTimerRef.current = null;
+    };
+    if (actionId !== undefined) {
+      myTimer = setTimeout(() => {
+        myTimer = null;
+        if (deadlineTimerRef.current?.epoch === myEpoch) deadlineTimerRef.current = null;
+        // 代际已前进（用户已开新发送）→ 本计时器作废，不碰任何状态
+        if (staleEpoch()) return;
+        myExpired = true;
+        setSending(false);
+        setReceipt({
+          kind: "codexUnknown",
+          actionId,
+          text: fullText,
+          reasonCode: null,
+          deadline: true,
+        });
+        // Q2：待确认现场自此归属本动作（回调落地据此核对）
+        codexRecoveryOwnerRef.current = {
+          actionId,
+          epoch: myEpoch,
+          draftVersion: submittedDraftVersion,
+        };
+      }, FRONT_DEADLINE_MS);
+      deadlineTimerRef.current = { epoch: myEpoch, timer: myTimer };
+    }
     try {
       // ===== 丁T3 接入②：发送时刻**复探**卡片在场（§2.4 裁3 的安全面）=====
       // 挂载时探到的是快照；对话框可能在挂载之后才出现（模型提问/请求批准是回合
@@ -544,6 +840,14 @@ export default function MessageComposer({ session, onQueueChanged }: MessageComp
       //
       // 拦截时输入框内容**保留**（与 failed 态同口径：用户可复制到卡片输入框或终端）。
       const presence = await probeCardPresence();
+      // R7（F6 前端半边）：前探也是异步边界——恢复后先核**发送归属**（代际），
+      // 再写 cardPresence 或分流。A 前探挂起、B 先开始后 A 迟到返回（真实可达：
+      // api.rs:2589 审批扫描不排除 App，rollout 尾部 proposed_plan 经 plan_pending
+      // 在 :2921 返回 available=true）→ A 的拦截结果不得驱动 B 的分流/回执。
+      // 只核代际不核本发预算：A 自己超时（面板已接管呈现）后其发送照常继续——
+      // 既有 F6 语义（f6_probe：探测晚到 → 发送照发 → 迟到回执不覆盖面板），
+      // 本发预算的写状态闸在下游回执点（myExpired）。
+      if (staleEpoch()) return;
       setCardPresence(presence);
       if (presence === "approve") {
         setReceipt({ kind: "blocked", message: APPROVE_PRESENT_RECEIPT });
@@ -581,6 +885,10 @@ export default function MessageComposer({ session, onQueueChanged }: MessageComp
           });
           return;
         }
+        // R7：应答返回同为异步边界——迟到结果先核归属（B 已开新发送时，A 的自由
+        // 作答回执不得写入 B 的回执槽）；本发预算已到期移交呈现的同样不再写
+        //（面板是唯一呈现，回执不得覆盖）
+        if (staleEpoch() || myExpired) return;
         if (res.status === "key_sent") {
           // 回执与卡内路径**同口径**（不另编一套文案）：
           // - `verified === true`（屏读到终态锚 = 走完整条闭环）= delivered；
@@ -600,28 +908,27 @@ export default function MessageComposer({ session, onQueueChanged }: MessageComp
         }
         return;
       }
-      // 附件标记行（文件池既有约定 <image|file path>）：拼在正文之后随消息注入，
-      // agent 据路径读文件；failed 附件不拼（未落盘，拼了 agent 也读不到）
-      const markup = attachments
-        .filter((a) => a.status === "ready" && a.path)
-        .map((a) => (a.isImage ? `<image path="${a.path}">` : `<file path="${a.path}">`))
-        .join("\n");
-      const fullText = markup ? `${text}\n${markup}` : text;
       // D6：修改重发的下一次发送带 queueOnly=true 强制入队，消费即清——本次发送
       // 失败的话，用户重试走的是普通发送语义（后端失败行已退出 pending，可重发）
       const forceQueue = queueOnlyNext;
       setQueueOnlyNext(false);
-      // 多行原样上行（trim 只用于判空，不改写正文——归一在服务端）
-      // **actionId**：仅 Codex APP 通道（`headless_codex_*`）携带——Desktop IPC 的
-      // 必填账本锚；同一动作复用（双击防双投）。CLI 与其他工具**不传**（请求体对旧
-      // 合同逐字保持：未修改不带该键）。
-      const needsActionId =
-        sendInfo?.channels?.some((c) => c.startsWith("headless_codex_")) ?? false;
-      const actionId = needsActionId ? (codexActionIdRef.current ?? newActionId()) : undefined;
-      if (actionId !== undefined) {
-        codexActionIdRef.current = actionId;
-      }
-      const res = await sessionSend(session.id, fullText, forceQueue ? true : undefined, actionId);
+      // 多行原样上行（trim 只用于判空，不改写正文——归一在服务端）。
+      // **actionId / fullText 已在点击时算定**（F6：预算与载荷键控见函数头）。
+      // S5：「本条先发送」一次性越队授权（队列暂停二选一之一）——arm 后消费即清；
+      // 授权失效重放会得 NotSent(grant_consumed)，前端引导重选而非原样重放。
+      const bypass = needsActionId && bypassNext ? true : undefined;
+      if (bypass) setBypassNext(false);
+      const res = await sessionSend(
+        session.id,
+        fullText,
+        forceQueue ? true : undefined,
+        actionId,
+        bypass
+      );
+      // S5：代际已前进（新发送已开）或本次预算已到期移交面板的，本响应一律
+      // 作废不回写（计时器清理在 finally，按闭包归属——碰不到新动作的计时器）
+      if (staleEpoch()) return;
+      if (myExpired) return;
       if (res.status === "delivered") {
         setText("");
         setAttachments([]);
@@ -656,9 +963,11 @@ export default function MessageComposer({ session, onQueueChanged }: MessageComp
           })
         );
       } else if (res.status === "desktop_ipc") {
-        // **Desktop IPC 原生回执**：accepted = 已受理（≠ Turn 完成）；unknown =
-        // 投递结果未知（保留 actionId + 文本已清空，绝不重试）；not_sent/rejected
-        // = 明确零投递/拒绝——文本保留让用户自行决定（不自动重发）。
+        // **Desktop IPC 原生回执**（S5 前台五分类）：
+        // - accepted = 已受理（显示「已受理/正在执行」，不宣称本轮已完成）；
+        // - unknown_delivery = 发送结果待确认 → 待确认面板接管（检查是否送达 /
+        //   报告问题；绝不普通重试——结果未知重试 = 双投窗口）；
+        // - not_sent/rejected = 明确未送达（保留草稿；重试 = 建新动作并展示关联）。
         if (res.receipt.delivery === "accepted") {
           setText("");
           setAttachments([]);
@@ -667,7 +976,26 @@ export default function MessageComposer({ session, onQueueChanged }: MessageComp
         // 分离——保留回执里的 actionId 供核对，但**新一次发送必须生成新 ID**，
         // 不得复用旧 ID 撞 action_conflict，也绝不自动重发。
         codexActionIdRef.current = null;
-        setReceipt({ kind: "codex", receipt: res.receipt });
+        codexActionPayloadRef.current = null;
+        if (res.receipt.delivery === "unknown_delivery") {
+          setReceipt({
+            kind: "codexUnknown",
+            actionId: res.receipt.actionId,
+            text: fullText,
+            reasonCode: res.receipt.reasonCode,
+            deadline: false,
+          });
+          // Q2：待确认现场自此归属本动作（回调落地据此核对）
+          codexRecoveryOwnerRef.current = {
+            actionId: res.receipt.actionId,
+            epoch: myEpoch,
+            draftVersion: submittedDraftVersion,
+          };
+        } else {
+          const linkedFrom = retriedFromRef.current;
+          retriedFromRef.current = null;
+          setReceipt({ kind: "codex", receipt: res.receipt, retriedFrom: linkedFrom });
+        }
         onQueueChanged?.();
       } else if (res.status === "codex_queued") {
         // 忙 Thread 留队：消息已进服务端 FIFO（账本锚 = actionId），由调度循环按序派发。
@@ -677,6 +1005,7 @@ export default function MessageComposer({ session, onQueueChanged }: MessageComp
         setText("");
         setAttachments([]);
         codexActionIdRef.current = null;
+        codexActionPayloadRef.current = null;
         setReceipt({
           kind: "codexQueued",
           position: res.position,
@@ -689,6 +1018,7 @@ export default function MessageComposer({ session, onQueueChanged }: MessageComp
           setText("");
           setAttachments([]);
           codexActionIdRef.current = null;
+          codexActionPayloadRef.current = null;
         }
         setReceipt({
           kind: "headless",
@@ -703,7 +1033,38 @@ export default function MessageComposer({ session, onQueueChanged }: MessageComp
         setReceipt({ kind: "failed", error: formatInvokeError(res.error, i18n.t) });
       }
     } catch (e) {
+      // S5/F6：代际已前进（新发送已开）或本次预算已到期移交面板的迟到异常，
+      // 一律作废不回写（计时器清理解释权在 finally，按闭包归属）
+      if (staleEpoch()) return;
+      if (myExpired) return;
       if (e instanceof ApiError) {
+        // S5 分诊：Codex 路径上**非确定性失败**（网络层/5xx/408——代理可能在服务端
+        // 已处理后返回错误）= 提交结果未知 → 待确认面板（沿同 ID 只读核对，绝不
+        // 换 ID 重投）；确定性拒绝（4xx 状态码在响应在手）才落 failed 可重试。
+        const definiteRefusal = e.status !== null && e.status < 500 && e.status !== 408;
+        if (armedCodexActionId !== null && !definiteRefusal) {
+          // 结果未知：核对锚保留（同载荷重按 = 运输重试，服务端账本去重防双投）
+          setReceipt({
+            kind: "codexUnknown",
+            actionId: armedCodexActionId,
+            text: fullText,
+            reasonCode: null,
+            deadline: false,
+          });
+          // Q2：待确认现场自此归属本动作（回调落地据此核对）
+          codexRecoveryOwnerRef.current = {
+            actionId: armedCodexActionId,
+            epoch: myEpoch,
+            draftVersion: submittedDraftVersion,
+          };
+          return;
+        }
+        // F6：确定性拒绝 = 零投递终局——核对锚让位（含 action_conflict 同 ID 异
+        // 载荷撞库的形态），下一次发送取新 ID，不遗留死锁锚
+        if (armedCodexActionId !== null) {
+          codexActionIdRef.current = null;
+          codexActionPayloadRef.current = null;
+        }
         // 2026-10-20 复审 P7：已知 reasonCode 走本地化文案（后端 reason 只有中文，
         // en 界面不能原样显示）；未知码才回退服务端 reason/错误消息。
         const code = typeof e.data?.reasonCode === "string" ? e.data.reasonCode : null;
@@ -711,11 +1072,32 @@ export default function MessageComposer({ session, onQueueChanged }: MessageComp
           code === "headless_disabled" ? i18n.t("mobile.composer.headlessDisabled") : null;
         const reason = typeof e.data?.reason === "string" ? e.data.reason : null;
         setReceipt({ kind: "failed", error: localized ?? reason ?? e.message });
+      } else if (armedCodexActionId !== null) {
+        // 非 ApiError 异常（网络层断开等）：Codex 路径提交结果未知 → 待确认面板
+        //（核对锚保留：同载荷重按 = 运输重试，绝不换 ID 重投）
+        setReceipt({
+          kind: "codexUnknown",
+          actionId: armedCodexActionId,
+          text: fullText,
+          reasonCode: null,
+          deadline: false,
+        });
+        // Q2：待确认现场自此归属本动作（回调落地据此核对）
+        codexRecoveryOwnerRef.current = {
+          actionId: armedCodexActionId,
+          epoch: myEpoch,
+          draftVersion: submittedDraftVersion,
+        };
       } else {
         setReceipt({ kind: "failed", error: String(e) });
       }
     } finally {
-      setSending(false);
+      // F6：计时器清理由 finally 单点承担（覆盖一切出口：探测拦截早退 / 响应 /
+      // 异常），且只清**本次发送自己的**计时器（闭包句柄）——旧发送的迟到收尾
+      // 碰不到新动作的计时器。sending 同理归当前发送所有：代际已前进的迟到
+      // finally 不得关掉新动作的转圈。
+      clearMyDeadline();
+      if (!staleEpoch()) setSending(false);
     }
   }, [
     text,
@@ -725,9 +1107,119 @@ export default function MessageComposer({ session, onQueueChanged }: MessageComp
     sendInfo,
     session.id,
     queueOnlyNext,
+    bypassNext,
     probeCardPresence,
     onQueueChanged,
   ]);
+
+  // S5：明确未送达后的「重试」——创建**关联的新动作**（新 actionId），不永远重放
+  // 原失败动作。原动作 ID 记入 retriedFromRef（安全引用，随新回执展示前 8 位）。
+  // 草稿保留在输入框中（用户可在重试前修改——改后发送的是新动作新内容）。
+  // 核对锚先行让位：明确零投递已终局，同 ID 重放只会再次回到账本同一终态
+  // （「永远重放原失败」正是本按钮要消灭的形态）。
+  const retryNotSent = useCallback(
+    (predecessorActionId: string) => {
+      if (sending || busy) return;
+      codexActionIdRef.current = null;
+      codexActionPayloadRef.current = null;
+      retriedFromRef.current = predecessorActionId;
+      void handleSend();
+    },
+    [sending, busy, handleSend]
+  );
+
+  // W2（复审 round 5）：人工继续后继的真实结果按五分类接管。resumed 响应的
+  // `send` 字段表明后继是否受理 / 未送达 / 未知 / 排队——**绝不凭「后继已创建」
+  // 宣称已发**。原动作锚在人工继续事实成立时一律释放（此后同文重按 = 全新发送，
+  // 不沿已被撤销写出权的原 ID 重投）。Accepted 由面板保留「已重新发送」呈现
+  //（此处只释放锚）；无 send 信息（already_resumed / 旧后端）由面板呈现「待查」。
+  const handleSuccessorResolved = useCallback(
+    (info: {
+      originalActionId: string;
+      successorActionId: string;
+      text: string;
+      send: CodexSuccessorSend | null;
+    }) => {
+      // ===== Q2（复审 round 6）：归属守卫——全部副作用之前 =====
+      // 本回调是父组件回调，不受面板按 actionId 重挂的局部状态保护：旧面板卸载
+      // 后，在途的人工继续 promise 依然会调用它。落地第一件事核对「当前恢复动作
+      // + 发送代际」仍归属发起时的原动作 A；不一致 = 响应迟到（用户已发送 B /
+      // 恢复现场已切到别的动作）→ 一律作废：不释放锚、不覆盖回执、不清草稿。
+      //（不只保护 setReceipt——Accepted/空 send 路径的锚释放同在守卫之后。）
+      const owner = codexRecoveryOwnerRef.current;
+      if (
+        owner === null ||
+        owner.actionId !== info.originalActionId ||
+        owner.epoch !== sendEpochRef.current
+      ) {
+        return;
+      }
+      // Q2 草稿版本门：只有「发起人工继续后未再编辑」的草稿（= 仍是后继实际
+      // 提交的那份原文）才允许被成功/入队清理；在途编辑出的新草稿绝不代清。
+      const draftUnchanged = owner.draftVersion === draftVersionRef.current;
+      codexActionIdRef.current = null;
+      codexActionPayloadRef.current = null;
+      const r = info.send?.receipt;
+      if (r && (r.delivery === "not_sent" || r.delivery === "rejected")) {
+        // 后继明确未送达（如 pending 门拒绝）→ 标准 NotSent 五分类：理由文案 +
+        // 重试沿**后继 ID** + 报告；父子关联 = retriedFrom 展示原动作短 ID
+        retriedFromRef.current = info.originalActionId;
+        setReceipt({ kind: "codex", receipt: r, retriedFrom: info.originalActionId });
+      } else if (info.send?.queued === true) {
+        // 后继忙态留队 → 标准「已排队」五分类：位次 chip，队列对账沿后继 actionId。
+        // Q2：清正文/附件只针对仍是实际提交草稿的现场（版本门）
+        codexReceiptSetAtRef.current = Date.now();
+        if (draftUnchanged) {
+          setText("");
+          setAttachments([]);
+        }
+        setReceipt({
+          kind: "codexQueued",
+          position: info.send.position ?? 0,
+          actionId: info.successorActionId,
+          resumedFrom: info.originalActionId,
+        });
+        onQueueChanged?.();
+      } else if (r && r.delivery === "unknown_delivery") {
+        // 后继结果未知 → 面板按**后继 ID** 重挂（F7 隔离）：核对沿后继、只核对
+        // 不自动重发；父子关联行 + 理由码随后继回执
+        setReceipt({
+          kind: "codexUnknown",
+          actionId: info.successorActionId,
+          text: info.text,
+          reasonCode: r.reasonCode,
+          deadline: false,
+          resumedFrom: info.originalActionId,
+        });
+        // Q2：恢复现场随面板切到后继——归属快照同刻重登记（该后继自己的人工
+        // 继续/迟到响应此后沿新快照核对归属）。Q2（复审 round 7）：后继**继承
+        // 原提交版本**而不是重读当前草稿版本——后继重发的就是原消息
+        //（ManualResumeBody.text 契约），其提交版本即原动作提交时点冻结的
+        // owner.draftVersion；重读当前值会把等待期编辑出的新稿版本记到后继
+        // 头上，多层 Unknown 时版本门同样误清新稿。
+        codexRecoveryOwnerRef.current = {
+          actionId: info.successorActionId,
+          epoch: sendEpochRef.current,
+          draftVersion: owner.draftVersion,
+        };
+      }
+      // accepted：面板保留「已重新发送」；send 无 receipt 且未排队：面板呈现
+      // 「此前已创建后继…待查」——两种都不在此换回执
+    },
+    [onQueueChanged]
+  );
+
+  // S5/F6：卸载清理当前发送的 30 秒计时器（挂起 promise 的迟到回调经代际/闭包
+  // 作废；这里只兜底清掉真实挂在事件循环上的那一个）
+  useEffect(
+    () => () => {
+      if (deadlineTimerRef.current !== null) {
+        clearTimeout(deadlineTimerRef.current.timer);
+        deadlineTimerRef.current = null;
+      }
+    },
+    []
+  );
 
   // P2-7 失败对账（插队/撤回/修改共用）：失败后复核 /session-queue——
   // - 条目仍在 pending → 恢复排队视图（刷新队位，行同步更新，「立即发送/修改/撤回」
@@ -898,6 +1390,8 @@ export default function MessageComposer({ session, onQueueChanged }: MessageComp
     async (item: QueueItemView) => {
       if (busy) return;
       await retractWithOutcome(item.id, item.position, item.content, () => {
+        // Q2：「修改」回填 = 草稿被整体替换（版本前移）
+        draftVersionRef.current += 1;
         setText(stripMobileSignature(item.content).slice(0, MAX_SEND_CHARS));
         setQueueOnlyNext(true);
         setReceipt(null);
@@ -914,6 +1408,8 @@ export default function MessageComposer({ session, onQueueChanged }: MessageComp
   const addFiles = useCallback(
     async (files: File[]) => {
       for (const f of files) {
+        // Q2：附件增补也是草稿变更（版本前移）
+        draftVersionRef.current += 1;
         const id = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
         const isImage = f.type.startsWith("image/");
         setAttachments((prev) => [
@@ -979,6 +1475,8 @@ export default function MessageComposer({ session, onQueueChanged }: MessageComp
   );
 
   const removeAttachment = useCallback((id: string) => {
+    // Q2：附件移除也是草稿变更（版本前移）
+    draftVersionRef.current += 1;
     // 上传中移除 = 取消：中断在途传输（XHR abort），防止白传到底（2026-09-20 用户反馈）
     uploadCtrlsRef.current.get(id)?.abort();
     uploadCtrlsRef.current.delete(id);
@@ -1040,6 +1538,44 @@ export default function MessageComposer({ session, onQueueChanged }: MessageComp
             : i18n.t("mobile.composer.presenceQuestion")}
         </p>
       )}
+      {/* S5：队列暂停二选一（S2：暂停**不置灰**——用户仍可选恢复队列或本条先发送）。
+          恢复 = POST /codex/queue/resume（唯一解除出口）；先发送 = 一次性越队授权
+         （bypassPausedQueue，消费即失效；grant_consumed 引导重选而非原样重放）。 */}
+      {injectable && sendInfo?.queuePaused === true && (
+        <div
+          data-testid="send-queue-paused"
+          className="mb-2 rounded-lg bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:bg-amber-400/10 dark:text-amber-300"
+        >
+          <p>{i18n.t("mobile.codex.queue.pausedBanner")}</p>
+          {bypassNext && (
+            <p data-testid="queue-bypass-armed" className="mt-0.5">
+              {i18n.t("mobile.codex.queue.bypassArmed")}
+            </p>
+          )}
+          <div className="mt-1.5 flex flex-wrap gap-2">
+            <button
+              type="button"
+              data-testid="queue-resume"
+              disabled={resumingQueue || sending}
+              onClick={() => {
+                void resumeQueue();
+              }}
+              className="rounded-full bg-amber-500/20 px-2 py-0.5 disabled:opacity-40 dark:bg-amber-400/20"
+            >
+              {i18n.t("mobile.codex.queue.resume")}
+            </button>
+            <button
+              type="button"
+              data-testid="queue-bypass-arm"
+              disabled={sending}
+              onClick={() => setBypassNext((v) => !v)}
+              className="rounded-full bg-amber-500/20 px-2 py-0.5 disabled:opacity-40 dark:bg-amber-400/20"
+            >
+              {i18n.t("mobile.codex.queue.bypass")}
+            </button>
+          </div>
+        </div>
+      )}
       {/* 投递中（灰3）：send await 全程在场——慢消费者长文投递可达分钟级，
           期间不空白；与既有回执并存（排队态的撤回/插队按钮不因发送而失联），
           完成后被结果 chip 覆盖（sending 翻转 false 即消失） */}
@@ -1061,8 +1597,8 @@ export default function MessageComposer({ session, onQueueChanged }: MessageComp
           发送，或对任意行（含他端排队条目）的立即发送/修改/撤回：
           delivered/submitted/failed/gone。queued 态不再渲染 chip（由下方多列队
           列表取代），回执状态本身保留——乐观行即时反馈、失败对账与 3s 轮询仍以
-          其驱动 */}
-      {receipt !== null && receipt.kind !== "queued" && (
+          其驱动。codexUnknown 由待确认面板接管（下方独立块），不进 chip 容器 */}
+      {receipt !== null && receipt.kind !== "queued" && receipt.kind !== "codexUnknown" && (
         <div className="mb-2 flex flex-wrap items-center gap-2">
           {receipt.kind === "delivered" && (
             <span
@@ -1115,7 +1651,8 @@ export default function MessageComposer({ session, onQueueChanged }: MessageComp
             </span>
           )}
           {receipt.kind === "codex" && receipt.receipt.delivery === "accepted" && (
-            // 已受理 ≠ Turn 完成（终态以投影为准）——措辞只说「正在执行」
+            // 已受理 ≠ Turn 完成（终态以投影为准）——措辞只说「正在执行」，
+            // 绝不写「已完成/已送达」（设计 §11.1）
             <span
               data-testid="send-receipt-codex-accepted"
               className="rounded-full bg-emerald-500/10 px-2 py-0.5 text-xs text-emerald-700 dark:bg-emerald-400/10 dark:text-emerald-400"
@@ -1123,35 +1660,73 @@ export default function MessageComposer({ session, onQueueChanged }: MessageComp
               {i18n.t("mobile.codex.composer.codexAccepted")}
             </span>
           )}
-          {receipt.kind === "codex" && receipt.receipt.delivery === "unknown_delivery" && (
-            // S5 红线：结果未知 → 指向 Desktop 核对；**无按钮、无「重试」语义**
-            <span
-              data-testid="send-receipt-codex-unknown"
-              className="rounded-full bg-amber-500/10 px-2 py-0.5 text-xs text-amber-700 dark:bg-amber-400/10 dark:text-amber-400"
-            >
-              {i18n.t("mobile.codex.composer.codexUnknown")}
+          {receipt.kind === "codex" && receipt.retriedFrom && (
+            // S5：重试关联——新动作由「明确未送达后的重试」创建（安全引用，前 8 位）
+            <span data-testid="codex-retried-from" className="w-full text-[10px] text-[var(--mut)]">
+              {i18n.t("mobile.codex.composer.retriedFrom", {
+                short: receipt.retriedFrom.slice(0, 8),
+              })}
             </span>
           )}
           {receipt.kind === "codex" &&
             (receipt.receipt.delivery === "not_sent" ||
               receipt.receipt.delivery === "rejected") && (
-              <span
-                data-testid="send-receipt-codex-failed"
-                className="rounded-full bg-rose-500/10 px-2 py-0.5 text-xs text-rose-700 dark:bg-rose-400/10 dark:text-rose-400"
-              >
-                {i18n.t("mobile.codex.composer.codexNotDelivered", {
-                  reason: receipt.receipt.reasonCode ?? receipt.receipt.delivery,
-                })}
-              </span>
+              <>
+                <span
+                  data-testid="send-receipt-codex-failed"
+                  className="rounded-full bg-rose-500/10 px-2 py-0.5 text-xs text-rose-700 dark:bg-rose-400/10 dark:text-rose-400"
+                >
+                  {/* S2 理由码专属文案（词表内）优先；词表外回落 {{reason}} 模板 */}
+                  {notSentReasonCopy(receipt.receipt.reasonCode) ??
+                    i18n.t("mobile.codex.composer.codexNotDelivered", {
+                      reason: receipt.receipt.reasonCode ?? receipt.receipt.delivery,
+                    })}
+                </span>
+                {/* 明确未送达（§5.2）：保留草稿（在输入框），重试 = 新动作 + 关联展示；
+                    报告问题 = 统一安全引用入口。queue_paused 的重试预期再得同一拒绝
+                    ——先在上方二选一条处理队列选择。 */}
+                <button
+                  type="button"
+                  data-testid="codex-retry-notsent"
+                  disabled={sending || busy}
+                  onClick={() => retryNotSent(receipt.receipt.actionId)}
+                  className="rounded-full bg-emerald-500/15 px-2 py-0.5 text-xs text-emerald-800 disabled:opacity-40 dark:bg-emerald-400/15 dark:text-emerald-300"
+                >
+                  {i18n.t("mobile.codex.composer.codexRetry")}
+                </button>
+                <button
+                  type="button"
+                  data-testid="codex-report-notsent"
+                  onClick={() =>
+                    handleReportIssue(receipt.receipt.reasonCode, receipt.receipt.actionId)
+                  }
+                  className="rounded-full bg-[var(--cb)] px-2 py-0.5 text-xs text-[var(--mut)]"
+                >
+                  {i18n.t("reportIssue.button")}
+                </button>
+              </>
             )}
           {receipt.kind === "codexQueued" && (
             // 忙 Thread 留队——中性 chip（队列查看/撤回在 CodexQueuePanel）
-            <span
-              data-testid="send-receipt-codex-queued"
-              className="rounded-full bg-[var(--cb)]/70 px-2 py-0.5 text-xs text-[var(--mut)]"
-            >
-              {i18n.t("mobile.codex.composer.codexQueued", { position: receipt.position })}
-            </span>
+            <>
+              <span
+                data-testid="send-receipt-codex-queued"
+                className="rounded-full bg-[var(--cb)]/70 px-2 py-0.5 text-xs text-[var(--mut)]"
+              >
+                {i18n.t("mobile.codex.composer.codexQueued", { position: receipt.position })}
+              </span>
+              {receipt.resumedFrom && (
+                // W2：人工继续后继的父子关联（安全引用，前 8 位）
+                <span
+                  data-testid="codex-queued-resumed-from"
+                  className="w-full text-[10px] text-[var(--mut)]"
+                >
+                  {i18n.t("mobile.codex.composer.retriedFrom", {
+                    short: receipt.resumedFrom.slice(0, 8),
+                  })}
+                </span>
+              )}
+            </>
           )}
           {receipt.kind === "headless" && (
             <span
@@ -1168,6 +1743,46 @@ export default function MessageComposer({ session, onQueueChanged }: MessageComp
               })}
             </span>
           )}
+        </div>
+      )}
+      {/* S5：发送结果待确认（第五分类）——面板接管（结束转圈后保留消息与原动作；
+          检查是否送达 / 报告问题 / 人工继续三件风险；绝不普通重试） */}
+      {receipt !== null && receipt.kind === "codexUnknown" && (
+        <div className="mb-2">
+          {/* F7：按 actionId 键控重挂——新动作不继承旧动作的核对结论 / 确认臂 /
+              busy 态；旧面板实例卸载后其核对 promise 的迟到 setState 一并作废 */}
+          <CodexSendRecoveryPanel
+            key={receipt.actionId}
+            sessionId={session.id}
+            actionId={receipt.actionId}
+            text={receipt.text}
+            deadlineExceeded={receipt.deadline === true}
+            initialReasonCode={receipt.reasonCode}
+            resumedFrom={receipt.resumedFrom}
+            onRetryNewAction={retryNotSent}
+            onReportIssue={(code) => handleReportIssue(code, receipt.actionId)}
+            onSuccessorResolved={handleSuccessorResolved}
+          />
+        </div>
+      )}
+      {/* S5：诊断服务未部署的如实出口（不伪造上传成功）：明确「未开启」+ 复制摘要 */}
+      {reportUnavailable && (
+        <div
+          data-testid="codex-report-unavailable"
+          className="mb-2 rounded-lg bg-[var(--cb)]/70 px-3 py-2 text-xs text-[var(--mut)]"
+        >
+          <p>{i18n.t("reportIssue.unavailable")}</p>
+          <p className="mt-0.5">{i18n.t("reportIssue.unavailableHint")}</p>
+          <button
+            type="button"
+            data-testid="codex-report-copy"
+            onClick={() => {
+              void copyReportSummary();
+            }}
+            className="mt-1.5 rounded-full bg-[var(--cb)] px-2 py-0.5"
+          >
+            {i18n.t("reportIssue.copySummary")}
+          </button>
         </div>
       )}
       {/* D8 多列队列表（验收问题 #6）：完整 /session-queue 渲染——逐条预览 + 位次 +
@@ -1388,7 +2003,11 @@ export default function MessageComposer({ session, onQueueChanged }: MessageComp
           aria-label={i18n.t("mobile.composer.inputAria")}
           value={text}
           maxLength={MAX_SEND_CHARS}
-          onChange={(e) => setText(e.target.value.slice(0, MAX_SEND_CHARS))}
+          onChange={(e) => {
+            // Q2：用户编辑即前移草稿版本（在途人工继续的迟到入队不得代清新草稿）
+            draftVersionRef.current += 1;
+            setText(e.target.value.slice(0, MAX_SEND_CHARS));
+          }}
           onPaste={handlePaste}
           rows={2}
           disabled={!injectable}

@@ -16,6 +16,7 @@
 //! envelope_id 从表里取出并完成——先到先得，后到方查无此条。
 
 use super::types::{Delivery, OwnerLease, ProtocolError};
+use crate::services::codex_desktop_ipc::late::LateSlotRegistry;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::pin::Pin;
@@ -25,17 +26,49 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{broadcast, mpsc, oneshot, watch, Mutex};
 use tokio::time::Duration;
 
-/// initialize 握手超时。
+/// initialize 握手超时（缺省；经 [`ConnTuning`] 可注入收窄——受控时间测试）。
 pub const INIT_TIMEOUT: Duration = Duration::from_secs(3);
 /// RPC 等待超时（discovery/read/write-ack；覆盖 Desktop 的 discovery 等待窗口）。
+/// S3：实际等待取 `min(缺省 RPC 超时, 请求携带的预算截止)`——RPC 纳入统一预算，
+/// 子步骤只用剩余预算（设计 §5.1）。
 pub const RPC_TIMEOUT: Duration = Duration::from_secs(15);
 /// outbound 有界队列总字节预算。
 pub const OUTBOUND_BYTES: usize = 1024 * 1024;
 /// 每连接在飞 RPC 上限。
 pub const PENDING_RPC: usize = 64;
 
+/// S3 连接级可注入参数（生产 = [`ConnTuning::default`]；测试收窄到受控量级——
+/// 仓库既有注参模式（`set_reconcile_period_ms` 等）同款，禁止真实长 sleep 镜像）。
+#[derive(Debug, Clone, Copy)]
+pub struct ConnTuning {
+    pub rpc_timeout: Duration,
+    pub init_timeout: Duration,
+    /// 迟到槽位 TTL（惰性清理；语义见 `late::LateSlotRegistry`）。
+    pub late_slot_ttl: Duration,
+    /// 迟到槽位容量（mutation 写前预留；不足写前拒绝）。
+    pub late_slot_capacity: usize,
+}
+
+impl Default for ConnTuning {
+    fn default() -> Self {
+        Self {
+            rpc_timeout: RPC_TIMEOUT,
+            init_timeout: INIT_TIMEOUT,
+            late_slot_ttl: crate::services::codex_desktop_ipc::late::DEFAULT_LATE_TTL,
+            late_slot_capacity: crate::services::codex_desktop_ipc::late::DEFAULT_LATE_CAPACITY,
+        }
+    }
+}
+
 /// Tuvis 的 clientType（Desktop 原样接受；不做认证依据，spec S2）。
 pub const CLIENT_TYPE: &str = "tuvis";
+
+/// S3：RPC 等待超时的机器原因码（连接仍存活——迟到回执仍可能到达，收尾任务
+/// 据此决定是否轮询迟到槽位）。
+pub const RPC_TIMEOUT_REASON: &str = "timeout";
+/// S3：调用方提前放弃（oneshot receiver 被丢）的机器原因码（同上——帧已交给
+/// writer，连接仍可能送达迟到回执）。
+pub const CALLER_DROPPED_REASON: &str = "caller_dropped";
 
 /// 连接事件（owner/mirror/SSE 上层消费）。
 #[derive(Debug, Clone)]
@@ -48,7 +81,7 @@ pub enum ConnectionEvent {
 /// RPC 请求描述。`target` 携带当前 owner lease（服务端解析，spec S3）；
 /// `mutating` 标记状态改变操作（未知结果绝不自动重试的那一类）；
 /// `validity` 是 owner 活性信号——失效即零投递。
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct RpcRequest {
     pub method: String,
     pub params: Value,
@@ -63,6 +96,24 @@ pub struct RpcRequest {
     pub source_client_id: Option<String>,
     /// #172：**信封级** `timeoutMs`（上游 `sendRequest` 同样带在信封上）。
     pub timeout_ms: Option<u64>,
+    /// S3：绑定动作 id（mutation 专用）——RPC 超时后迟到回执经迟到槽位归还原动作；
+    /// `None` = 不预留槽位（读 RPC/无账本动作）。
+    pub action_id: Option<String>,
+    /// 终审 R2：本次写出是否**依赖兼容授权**（compat 尝试 ∨ 档位 send 来自兼容档）
+    /// ——writer 写前与派发权撤销一起原子复核（活门收回 → 零投递）。
+    pub compat_licensed: bool,
+    /// 终审 F10：**派发前**已存在的 Turn id 集合（mutation 携带；随槽位冻结——
+    /// 迟到回执的 stale-turn 判定比对这份快照，而非消费时的当前镜像）。
+    pub pre_dispatch_turns: std::collections::HashSet<String>,
+    /// S3：统一预算的绝对等待上界（`budget::Deadline` 换算的实际等待上界）；
+    /// `None` = 只受缺省 RPC 超时约束。
+    pub deadline: Option<tokio::time::Instant>,
+    /// H02：**无账本动作**（interrupt）的写边界资格复核——writer 在 write_all 前
+    /// 调用；`Some(reason)` → 零首次写出并按明确零投递收尾。账本动作走 claim，
+    /// 不使用本钩子。
+    pub interaction_recheck: Option<std::sync::Arc<dyn Fn() -> Option<String> + Send + Sync>>,
+    /// G04：账本动作的写边界异步复核（完整组投影）；写前调用。
+    pub async_write_recheck: Option<crate::services::codex_desktop_ipc::types::AsyncWriteRecheck>,
 }
 
 /// RPC 结果。`envelope_id` 恒为本次生成的 envelope UUID。
@@ -86,7 +137,7 @@ impl RpcOutcome {
             reason_code: Some(reason.to_string()),
         }
     }
-    fn unknown(envelope_id: String, reason: &str) -> Self {
+    pub(crate) fn unknown(envelope_id: String, reason: &str) -> Self {
         Self {
             delivery: Delivery::UnknownDelivery,
             envelope_id,
@@ -107,6 +158,28 @@ struct FrameCmd {
     envelope_id: String,
     frame: Vec<u8>,
     validity: Option<watch::Receiver<bool>>,
+    /// 终审 R2：受控派发权（mutation 专用）——writer 实际写前原子复核。
+    action_id: Option<String>,
+    /// 终审 R2：本次写出是否依赖兼容授权（活门收回时零投递）。
+    compat_licensed: bool,
+    /// H02：无账本动作的写边界资格复核。
+    interaction_recheck: Option<std::sync::Arc<dyn Fn() -> Option<String> + Send + Sync>>,
+    /// G04：账本动作的完整组写边界异步复核。
+    async_write_recheck: Option<crate::services::codex_desktop_ipc::types::AsyncWriteRecheck>,
+    /// N03：**首次写出硬截止**——writer 授予写权与 write_all 前都要检查；到点即
+    /// 强零投递（不再保留“未发帧的永久首写资格”）。
+    first_write_deadline: Option<tokio::time::Instant>,
+}
+
+impl std::fmt::Debug for RpcRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RpcRequest")
+            .field("method", &self.method)
+            .field("version", &self.version)
+            .field("action_id", &self.action_id)
+            .field("mutating", &self.mutating)
+            .finish_non_exhaustive()
+    }
 }
 
 impl FrameCmd {
@@ -115,6 +188,11 @@ impl FrameCmd {
             envelope_id: String::new(),
             frame: Vec::new(),
             validity: None,
+            action_id: None,
+            compat_licensed: false,
+            interaction_recheck: None,
+            async_write_recheck: None,
+            first_write_deadline: None,
         }
     }
     fn is_shutdown(&self) -> bool {
@@ -180,7 +258,36 @@ struct ConnectionShared {
     ///（split 的两半共享底层 io，只丢 WriteHalf 对端看不到 EOF）。
     teardown_tx: watch::Sender<bool>,
     teardown_rx: watch::Receiver<bool>,
+    /// S3：可注入超时/槽位参数。
+    tuning: ConnTuning,
+    /// S3：迟到结果槽位（适配器级共享、跨连接存活；连接退出只释放未成熟槽位）。
+    late: Arc<LateSlotRegistry>,
+    /// 终审 R2：**写右判定缝**（mutation 帧实际写前原子复核派发权）——生产 =
+    /// remote 层注入（读 `codex_write_revoke` + 兼容许可活值，与人工继续撤销
+    /// 事务同一持久源竞争）；`None` = 放行。锁纪律：std::Mutex 短临界区取 Arc
+    /// 后即释锁再调用（闭包内自取 DB 锁）。
+    write_right_check: std::sync::Mutex<Option<WriteRightCheck>>,
+    /// 复审 R-T1：**取得首次写出权**的 claim 闭包（生产 = remote 层注入的两态
+    /// CAS：`UPDATE … WHERE revoked IS NULL`，与人工继续撤销事务竞争同一持久行）。
+    /// 在最终判定 Allow 之后、真正 write_all 之前执行——这是「首次写出权」的
+    /// 线性化点。锁纪律与 write_right_check 相同（std::Mutex 短临界区取 Arc 后
+    /// 即释锁再调用，闭包内自取 DB 锁）。
+    write_right_claim: std::sync::Mutex<Option<crate::services::codex_control::WriteRightClaim>>,
+    /// 终审 R2 测试缝：writer 停在**最终判定之后、claim 之前**（红/绿测试共用
+    /// 的定序点——「最终 checker 已读 Allow、写出权尚未取得、帧未写」的窗口；
+    /// 复审 R-T1 把缝从最终判定之前搬到此处）。
+    write_right_gate: std::sync::Mutex<Option<Arc<tokio::sync::Notify>>>,
+    /// 终审 R2 测试缝探针：writer 已到达写右判定点。
+    write_right_reached: AtomicBool,
+    /// J01 测试缝：异步组复核之后、最终写权 claim 之前。
+    final_claim_gate: std::sync::Mutex<Option<Arc<tokio::sync::Notify>>>,
+    final_claim_reached: AtomicBool,
 }
+
+/// 终审 R2：写右判定闭包形状（action_id + 是否依赖兼容授权）——直接复用
+/// codex_control 的判定枚举（连接层已引用其常量；语义单源）。
+pub type WriteRightCheck =
+    Arc<dyn Fn(&str, bool) -> crate::services::codex_control::WriteGuardVerdict + Send + Sync>;
 
 /// 从 pending 表取出并完成一个 RPC（先到先得）。
 async fn complete_pending(shared: &ConnectionShared, envelope_id: &str, outcome: RpcOutcome) {
@@ -260,6 +367,11 @@ impl ConnectionHandle {
                 envelope_id: String::new(),
                 frame,
                 validity: None,
+                action_id: None,
+                compat_licensed: false,
+                interaction_recheck: None,
+                async_write_recheck: None,
+                first_write_deadline: None,
             };
             match this.main_tx.try_send(cmd) {
                 Ok(()) => Ok(()),
@@ -284,11 +396,65 @@ impl ConnectionHandle {
         Box::pin(async move { this.request_inner(req).await })
     }
 
+    /// 终审 R2：注入写右判定（生产 = remote 层；`None` = 放行）。连接建立后设置。
+    #[doc(hidden)]
+    pub fn set_write_right_check(&self, check: Option<WriteRightCheck>) {
+        *self
+            .shared
+            .write_right_check
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = check;
+    }
+
+    /// 复审 R-T1：注入**取得首次写出权**的 claim（生产 = remote 层；`None` =
+    /// 放行）。最终判定之后、write_all 之前执行。
+    #[doc(hidden)]
+    pub fn set_write_right_claim(
+        &self,
+        claim: Option<crate::services::codex_control::WriteRightClaim>,
+    ) {
+        *self
+            .shared
+            .write_right_claim
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = claim;
+    }
+
+    /// 终审 R2 测试缝：注入 writer 定序门（生产恒 None）。
+    #[doc(hidden)]
+    pub fn set_write_right_gate(&self, gate: Option<Arc<tokio::sync::Notify>>) {
+        *self
+            .shared
+            .write_right_gate
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = gate;
+    }
+
+    /// 终审 R2 测试缝探针：writer 是否正停在写右判定前（测试轮询替代固定睡眠）。
+    #[doc(hidden)]
+    pub fn write_right_gate_reached(&self) -> bool {
+        self.shared.write_right_reached.load(Ordering::SeqCst)
+    }
+
+    #[doc(hidden)]
+    pub fn set_final_claim_gate(&self, gate: Option<Arc<tokio::sync::Notify>>) {
+        *self
+            .shared
+            .final_claim_gate
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = gate;
+    }
+
+    #[doc(hidden)]
+    pub fn final_claim_gate_reached(&self) -> bool {
+        self.shared.final_claim_reached.load(Ordering::SeqCst)
+    }
+
     async fn request_inner(&self, req: RpcRequest) -> RpcOutcome {
         let envelope_id = super::types::new_uuid();
         // 等握手成功（initialized）或连接死亡；握手超时由 handshake 任务执行
         let mut init = self.shared.init.clone();
-        let deadline = tokio::time::Instant::now() + RPC_TIMEOUT;
+        let deadline = tokio::time::Instant::now() + self.shared.tuning.init_timeout;
         loop {
             if init.borrow_and_update().is_some() {
                 break;
@@ -345,12 +511,43 @@ impl ConnectionHandle {
         if !self.shared.budget.try_reserve(frame.len()) {
             return RpcOutcome::not_sent(envelope_id, "outbound_capacity");
         }
+        // S3 迟到槽位写前预留（mutation 专用，设计 §5.3「超出容量应在投递前明确
+        // 拒绝，不能投递后因没有核对槽位而失去跟踪」）：预留失败 = 写前明确零投递。
+        // 锁纪律：注册表内部短临界区、无嵌套等待（见 late.rs 模块注释），此处的
+        // 释放路径必须与预留成对。**字节预算同样必须退回**（本帧未进入 writer
+        // 队列，writer 不会替我们退）——Gate B Critical #2：原实现漏退，容量占满
+        // 期间每次被拒的 mutation 永久泄漏一帧字节（回归
+        // `late_slot_capacity_refuses_mutation_before_write` 的预算断言盖住）。
+        let slot_reserved = if req.mutating {
+            if req.action_id.is_some() {
+                let target_client = req.target.as_ref().map(|l| l.client_id.clone());
+                if !self.shared.late.try_reserve(
+                    &envelope_id,
+                    self.shared.epoch,
+                    target_client.as_deref(),
+                    &req.method,
+                    req.action_id.as_deref(),
+                    req.pre_dispatch_turns.clone(),
+                ) {
+                    self.shared.budget.release(frame.len());
+                    return RpcOutcome::not_sent(envelope_id, "late_slot_capacity");
+                }
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
         // 登记 waiter 后入队；入队失败退预算
         let (otx, orx) = oneshot::channel();
         {
             let mut pending = self.shared.pending.lock().await;
             if pending.len() >= PENDING_RPC {
                 self.shared.budget.release(frame.len());
+                if slot_reserved {
+                    self.shared.late.release(&envelope_id);
+                }
                 return RpcOutcome::not_sent(envelope_id, "pending_capacity");
             }
             pending.insert(
@@ -366,29 +563,50 @@ impl ConnectionHandle {
             envelope_id: envelope_id.clone(),
             frame,
             validity: req.validity,
+            action_id: req.action_id.clone(),
+            compat_licensed: req.compat_licensed,
+            interaction_recheck: req.interaction_recheck.clone(),
+            async_write_recheck: req.async_write_recheck.clone(),
+            first_write_deadline: req.deadline,
         };
         if let Err(e) = self.main_tx.try_send(cmd) {
             self.shared.pending.lock().await.remove(&envelope_id);
             // 帧未进入 writer 队列，writer 不会替我们退预算——这里退回
             self.shared.budget.release(frame_len);
+            if slot_reserved {
+                self.shared.late.release(&envelope_id);
+            }
             let reason = match e {
                 mpsc::error::TrySendError::Full(_) => "outbound_capacity",
                 mpsc::error::TrySendError::Closed(_) => "disconnected",
             };
             return RpcOutcome::not_sent(envelope_id, reason);
         }
-        match tokio::time::timeout(RPC_TIMEOUT, orx).await {
-            Ok(Ok(outcome)) => outcome,
+        // S3：等待上界 = min(缺省 RPC 超时, 预算截止)——RPC 纳入统一预算（子步骤
+        // 只用剩余预算）。超时/等待者放弃**不删除迟到关联**（旧路径 = 超时即删
+        // pending、迟到响应被静默丢弃——已按纪律以槽位正反例替换，见 late.rs 注释）：
+        // mutation 槽位继续持有，迟到回执经 handle_response 捕获、由消费方归原动作。
+        let wait_until = req
+            .deadline
+            .map(|d| d.min(tokio::time::Instant::now() + self.shared.tuning.rpc_timeout))
+            .unwrap_or_else(|| tokio::time::Instant::now() + self.shared.tuning.rpc_timeout);
+        match tokio::time::timeout_at(wait_until, orx).await {
+            Ok(Ok(outcome)) => {
+                // 明确回执在手：预留槽位使命完成（只清未成熟槽位；已捕获证据不受影响）
+                self.shared.late.release(&envelope_id);
+                outcome
+            }
             // 调用方提前放弃：帧已交给 writer（「断开 POST 不取消已派发写动作」），
-            // 回执无人接收；pending 条目由 reader/writer 以 envelope_id 清理
+            // 回执无人接收；mutation 槽位保留——迟到回执仍可归原动作（等待者丢失
+            // 安全收尾：槽位有界、到期清理）
             Ok(Err(_receiver_dropped)) => {
                 self.shared.pending.lock().await.remove(&envelope_id);
-                RpcOutcome::unknown(envelope_id, "caller_dropped")
+                RpcOutcome::unknown(envelope_id, CALLER_DROPPED_REASON)
             }
             Err(_elapsed) => {
                 self.shared.pending.lock().await.remove(&envelope_id);
                 // 超时读/写均未知（不区分是否已写出）
-                RpcOutcome::unknown(envelope_id, "timeout")
+                RpcOutcome::unknown(envelope_id, RPC_TIMEOUT_REASON)
             }
         }
     }
@@ -464,6 +682,18 @@ pub fn spawn(
     profile: super::profile::ProtocolProfile,
     epoch: u64,
 ) -> ConnectionHandle {
+    spawn_with_tuning(io, profile, epoch, ConnTuning::default(), Arc::default())
+}
+
+/// S3 注参变体：超时/迟到槽位参数与适配器级槽位注册表由调用方注入
+/// （生产 = adapter 持有共享注册表，跨连接换代不丢已捕获证据）。
+pub fn spawn_with_tuning(
+    io: super::transport::BoxIo,
+    profile: super::profile::ProtocolProfile,
+    epoch: u64,
+    tuning: ConnTuning,
+    late: Arc<LateSlotRegistry>,
+) -> ConnectionHandle {
     let (events, _) = broadcast::channel(256);
     let (main_tx, main_rx) = mpsc::channel::<FrameCmd>(64);
     let (disc_tx, disc_rx) = mpsc::channel::<FrameCmd>(8);
@@ -481,6 +711,14 @@ pub fn spawn(
         init_tx: std::sync::Mutex::new(Some(init_tx)),
         teardown_tx,
         teardown_rx,
+        tuning,
+        late,
+        write_right_check: std::sync::Mutex::new(None),
+        write_right_claim: std::sync::Mutex::new(None),
+        write_right_gate: std::sync::Mutex::new(None),
+        write_right_reached: AtomicBool::new(false),
+        final_claim_gate: std::sync::Mutex::new(None),
+        final_claim_reached: AtomicBool::new(false),
     });
     let handle = ConnectionHandle {
         shared: shared.clone(),
@@ -508,8 +746,10 @@ pub fn spawn(
     handle
 }
 
-/// writer：biased select——discovery 旁路优先。普通帧写前复核 validity；
-/// 一旦开始尝试写帧即越过保守投递边界（此后一切非明确回执 = Unknown）。
+/// writer：biased select——discovery 旁路优先。普通帧写前依次：validity 复核 →
+/// 写右最终判定（只读）→ 测试缝 → **claim 取得首次写出权**（复审 R-T1 原子线性
+/// 化点）；
+/// 一旦越过 claim 开始尝试写帧即越过保守投递边界（此后一切非明确回执 = Unknown）。
 async fn writer_task<W: tokio::io::AsyncWrite + Unpin + Send>(
     mut io: W,
     shared: Arc<ConnectionShared>,
@@ -526,6 +766,22 @@ async fn writer_task<W: tokio::io::AsyncWrite + Unpin + Send>(
         if cmd.is_shutdown() {
             break;
         }
+        // N03：**首次写出硬截止**——排队/等待期间到点即强零投递（不留“未发帧仍
+        // 可无限期取得首写资格”的窗口；已写出后的迟到回执仍按既有语义归账）。
+        if cmd
+            .first_write_deadline
+            .is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
+        {
+            shared.budget.release(cmd.frame.len());
+            shared.late.release(&cmd.envelope_id);
+            complete_pending(
+                &shared,
+                &cmd.envelope_id,
+                RpcOutcome::not_sent(cmd.envelope_id.clone(), "front_budget_exhausted"),
+            )
+            .await;
+            continue;
+        }
         // 写前活性复核：排队期间 owner 失活 → 零投递（跨过此检查即越过边界）
         if let Some(mut v) = cmd.validity {
             if !*v.borrow_and_update() {
@@ -539,6 +795,231 @@ async fn writer_task<W: tokio::io::AsyncWrite + Unpin + Send>(
                 continue;
             }
         }
+        // 终审 R2：**实际首次写出前的原子复核**——与人工继续撤销事务在同一持久
+        // 状态源上竞争（guard Allow 之后帧入队/排队期间的撤销与活门收回在此拦下）。
+        // 判定读失败由注入方保守映射为撤销。
+        if cmd.action_id.is_some() {
+            let check = shared
+                .write_right_check
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            if let Some(check) = check {
+                let verdict = (check)(cmd.action_id.as_deref().unwrap_or(""), cmd.compat_licensed);
+                match verdict {
+                    crate::services::codex_control::WriteGuardVerdict::Allow => {}
+                    crate::services::codex_control::WriteGuardVerdict::RejectRevoked => {
+                        shared.budget.release(cmd.frame.len());
+                        shared.late.release(&cmd.envelope_id);
+                        complete_pending(
+                            &shared,
+                            &cmd.envelope_id,
+                            RpcOutcome::unknown(
+                                cmd.envelope_id.clone(),
+                                crate::services::codex_control::MANUAL_RESUME_REVOKED_REASON,
+                            ),
+                        )
+                        .await;
+                        continue;
+                    }
+                    crate::services::codex_control::WriteGuardVerdict::RejectGuardReadFailed => {
+                        // Gate E #5：读失败独立定格码（≠ 人工继续语义；行为仍保守拒）
+                        shared.budget.release(cmd.frame.len());
+                        shared.late.release(&cmd.envelope_id);
+                        complete_pending(
+                            &shared,
+                            &cmd.envelope_id,
+                            RpcOutcome::unknown(
+                                cmd.envelope_id.clone(),
+                                crate::services::codex_control::WRITE_GUARD_READ_FAILED_REASON,
+                            ),
+                        )
+                        .await;
+                        continue;
+                    }
+                    crate::services::codex_control::WriteGuardVerdict::RejectCompatRetracted => {
+                        shared.budget.release(cmd.frame.len());
+                        shared.late.release(&cmd.envelope_id);
+                        complete_pending(
+                            &shared,
+                            &cmd.envelope_id,
+                            RpcOutcome::not_sent(cmd.envelope_id.clone(), "capability_unverified"),
+                        )
+                        .await;
+                        continue;
+                    }
+                }
+            }
+        }
+        // 复审 R-T1 测试缝（自最终判定**之前**搬到此处的「判定 Allow 之后、claim
+        // 之前」受控窗口）：writer 停在此门时，撤销/开关变化提交后放行——由下方
+        // claim CAS 竞争裁决；证明「最终 Allow ≠ 首次写出权」（只读 SELECT 释放
+        // DB 锁后仍存在竞争窗，claim 前的窗口才是原子性的试金石）。
+        let gate = shared
+            .write_right_gate
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some(gate) = gate {
+            shared.write_right_reached.store(true, Ordering::SeqCst);
+            gate.notified().await;
+            shared.write_right_reached.store(false, Ordering::SeqCst);
+        }
+        // N03：**资格授予前**再核首次写出截止——停在 interphase/测试门后到点的帧
+        // 不得再取得首写许可（不是只丢帧，而是按强零投递收尾）。
+        if cmd
+            .first_write_deadline
+            .is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
+        {
+            shared.budget.release(cmd.frame.len());
+            shared.late.release(&cmd.envelope_id);
+            complete_pending(
+                &shared,
+                &cmd.envelope_id,
+                RpcOutcome::not_sent(cmd.envelope_id.clone(), "front_budget_exhausted"),
+            )
+            .await;
+            continue;
+        }
+        // G04：账本动作的**完整组**写边界复核——停在 gate 后到点/被别端改变
+        // 任一成员（answered/移除/换 token）都必须零首次写出。此处与首写权
+        // 竞争窗口共用同一 writer 序列化点。
+        if let Some(recheck) = cmd.async_write_recheck.clone() {
+            if let Some(reason) = recheck().await {
+                shared.budget.release(cmd.frame.len());
+                shared.late.release(&cmd.envelope_id);
+                complete_pending(
+                    &shared,
+                    &cmd.envelope_id,
+                    RpcOutcome::not_sent(cmd.envelope_id.clone(), &reason),
+                )
+                .await;
+                continue;
+            }
+        }
+        // J01 测试缝：异步组复核已返回、最终写权 claim 之前的受控窗口。
+        let final_gate = shared
+            .final_claim_gate
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some(gate) = final_gate {
+            shared.final_claim_reached.store(true, Ordering::SeqCst);
+            gate.notified().await;
+            shared.final_claim_reached.store(false, Ordering::SeqCst);
+        }
+        // 复审 R-T1：**取得首次写出权**（原子线性化点）——单条持久 CAS 与人工
+        // 继续/撤销事务竞争同一两态行：撤销先到 → 零首次写出；claim 先到 → 撤销
+        // 必输（只收尾取证）。只读判定（上方）释放 DB 锁后到 write_all 之间的
+        // 竞争窗由此闭合——跨 worker/OS 抢占下不再依赖「无 await」的协作式假设。
+        if cmd.action_id.is_some() {
+            let claim = shared
+                .write_right_claim
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            if let Some(claim) = claim {
+                let outcome = (claim)(cmd.action_id.as_deref().unwrap_or(""), cmd.compat_licensed);
+                match outcome {
+                    crate::services::codex_control::WriteRightClaimOutcome::Claimed => {}
+                    crate::services::codex_control::WriteRightClaimOutcome::LostToRevoke => {
+                        shared.budget.release(cmd.frame.len());
+                        shared.late.release(&cmd.envelope_id);
+                        complete_pending(
+                            &shared,
+                            &cmd.envelope_id,
+                            RpcOutcome::unknown(
+                                cmd.envelope_id.clone(),
+                                crate::services::codex_control::MANUAL_RESUME_REVOKED_REASON,
+                            ),
+                        )
+                        .await;
+                        continue;
+                    }
+                    crate::services::codex_control::WriteRightClaimOutcome::CompatRetracted => {
+                        // 兼容活门在「最终判定 Allow → claim」窗口被收回（与 claim
+                        // 同锁重读）→ 零投递（与写右判定同码同语义）
+                        shared.budget.release(cmd.frame.len());
+                        shared.late.release(&cmd.envelope_id);
+                        complete_pending(
+                            &shared,
+                            &cmd.envelope_id,
+                            RpcOutcome::not_sent(cmd.envelope_id.clone(), "capability_unverified"),
+                        )
+                        .await;
+                        continue;
+                    }
+                    crate::services::codex_control::WriteRightClaimOutcome::InteractionDenied(
+                        reason,
+                    ) => {
+                        // R01：最终 claim 与交互资格同一同步来源——资格先失效则
+                        // **零首次写出**（明确 NotSent，不是 Unknown：本帧未进 socket）。
+                        log::info!(
+                            "写前资格复核拒绝（零投递 reason={reason}）action={:?}",
+                            cmd.action_id
+                        );
+                        shared.budget.release(cmd.frame.len());
+                        shared.late.release(&cmd.envelope_id);
+                        complete_pending(
+                            &shared,
+                            &cmd.envelope_id,
+                            RpcOutcome::not_sent(cmd.envelope_id.clone(), &reason),
+                        )
+                        .await;
+                        continue;
+                    }
+                    crate::services::codex_control::WriteRightClaimOutcome::ReadFailed => {
+                        // 读/写失败 ≠ 撤销发生——独立定格码（与 Gate C #4 同纪律；
+                        // 行为仍保守拒：宁可不写，不可在未知撤销状态下首写）
+                        shared.budget.release(cmd.frame.len());
+                        shared.late.release(&cmd.envelope_id);
+                        complete_pending(
+                            &shared,
+                            &cmd.envelope_id,
+                            RpcOutcome::unknown(
+                                cmd.envelope_id.clone(),
+                                crate::services::codex_control::WRITE_GUARD_READ_FAILED_REASON,
+                            ),
+                        )
+                        .await;
+                        continue;
+                    }
+                }
+            }
+        }
+        // H02：无账本动作的写边界复核（与 claim 同序：claim 段之后、write_all 之前）。
+        if let Some(recheck) = cmd.interaction_recheck.as_ref() {
+            if let Some(reason) = recheck() {
+                log::info!(
+                    "写边界资格复核拒绝（零投递 reason={reason}）action={:?}",
+                    cmd.action_id
+                );
+                shared.budget.release(cmd.frame.len());
+                shared.late.release(&cmd.envelope_id);
+                complete_pending(
+                    &shared,
+                    &cmd.envelope_id,
+                    RpcOutcome::not_sent(cmd.envelope_id.clone(), &reason),
+                )
+                .await;
+                continue;
+            }
+        }
+        // N03：写出前再核一次（claim 前取锁/复核可能已经跨过截止）。
+        if cmd
+            .first_write_deadline
+            .is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
+        {
+            shared.budget.release(cmd.frame.len());
+            shared.late.release(&cmd.envelope_id);
+            complete_pending(
+                &shared,
+                &cmd.envelope_id,
+                RpcOutcome::not_sent(cmd.envelope_id.clone(), "front_budget_exhausted"),
+            )
+            .await;
+            continue;
+        }
         // 跨越保守投递边界
         let written = io.write_all(&cmd.frame).await;
         shared.budget.release(cmd.frame.len());
@@ -549,6 +1030,8 @@ async fn writer_task<W: tokio::io::AsyncWrite + Unpin + Send>(
                 RpcOutcome::unknown(cmd.envelope_id.clone(), "write_failed"),
             )
             .await;
+            // S3：写失败即连接将亡，不会再有回执——释放未成熟槽位（有界收尾）
+            shared.late.release(&cmd.envelope_id);
             break;
         }
         // 写出成功 ≠ Accepted；等 reader 关联回执
@@ -580,12 +1063,15 @@ async fn writer_task<W: tokio::io::AsyncWrite + Unpin + Send>(
 }
 
 /// 已写出等待回执的 waiter：连接失败 → Unknown（结果未知）。
+/// S3 安全收尾：死连接不会再有回执——未成熟槽位一并释放（有界资源）；已捕获
+/// 证据的槽位保留（`release` 只清未成熟），消费方仍可归还原动作。
 async fn release_pending_as_unknown(shared: &ConnectionShared) {
     let mut pending = shared.pending.lock().await;
     for (eid, p) in pending.drain() {
         // 缺陷2：回执必须携带原 envelope UUID（契约见 RpcOutcome——envelope_id
         // 恒为本次生成的 envelope UUID），不得用 "released" 占位串顶替
-        let _ = p.tx.send(RpcOutcome::unknown(eid, "disconnected"));
+        let _ = p.tx.send(RpcOutcome::unknown(eid.clone(), "disconnected"));
+        shared.late.release(&eid);
     }
 }
 
@@ -659,6 +1145,11 @@ async fn handle_frame(
                     envelope_id: String::new(),
                     frame: bytes,
                     validity: None,
+                    action_id: None,
+                    compat_licensed: false,
+                    interaction_recheck: None,
+                    async_write_recheck: None,
+                    first_write_deadline: None,
                 });
             }
         }
@@ -676,6 +1167,10 @@ async fn handle_frame(
 /// ——**没有 method 字段**。旧实现要求 method 相等，会把这条回执扔回 pending，
 /// 于是 owner discovery 失败要卡到 15s RPC 超时才返回（#172 探测会把「无 owner」
 /// 误判成超时）。
+///
+/// S3 迟到关联：pending 查无此条（RPC 超时/等待者放弃已移除 waiter）→ 迟到响应
+/// **不再静默丢弃**——mutation 槽位在场且尚无结论时捕获（同一证据只收敛一次）；
+/// 无槽位（读 RPC/未预留/已消费/已过期）→ 丢弃（显式语义，见 late.rs 模块注释）。
 async fn handle_response(shared: &Arc<ConnectionShared>, rid: String, frame: Value) {
     let mut pending = shared.pending.lock().await;
     if let Some(p) = pending.remove(&rid) {
@@ -708,6 +1203,30 @@ async fn handle_response(shared: &Arc<ConnectionShared>, rid: String, frame: Val
             }
         };
         let _ = p.tx.send(outcome);
+        return;
+    }
+    drop(pending);
+    // S3：迟到响应捕获（槽位持有；envelope 绑定原尝试）。注意 pending 锁已放——
+    // 注册表锁与 pending 锁之间无嵌套等待（短临界区），不构成锁序面。
+    let delivery = if frame.get("resultType").and_then(|r| r.as_str()) == Some("success") {
+        Delivery::Accepted
+    } else {
+        Delivery::Rejected
+    };
+    let handled_by = frame
+        .get("handledByClientId")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let filled = shared.late.fill(
+        &rid,
+        super::late::LateOutcome {
+            delivery,
+            result: frame.get("result").cloned(),
+            handled_by,
+        },
+    );
+    if filled {
+        log::info!("codex_ipc: 捕获迟到回执 envelope={rid}（待消费归还原动作）");
     }
 }
 
@@ -750,6 +1269,11 @@ async fn initialize_handshake(handle: ConnectionHandle, shared: Arc<ConnectionSh
             envelope_id: envelope_id.clone(),
             frame: bytes,
             validity: None,
+            action_id: None,
+            compat_licensed: false,
+            interaction_recheck: None,
+            async_write_recheck: None,
+            first_write_deadline: None,
         })
         .is_err()
     {
@@ -760,7 +1284,7 @@ async fn initialize_handshake(handle: ConnectionHandle, shared: Arc<ConnectionSh
         fail_init_waiters(&shared);
         return;
     }
-    let outcome = match tokio::time::timeout(INIT_TIMEOUT, orx).await {
+    let outcome = match tokio::time::timeout(shared.tuning.init_timeout, orx).await {
         Ok(Ok(o)) => o,
         _ => {
             shared.pending.lock().await.remove(&envelope_id);
@@ -826,6 +1350,14 @@ mod tests {
             init_tx: std::sync::Mutex::new(Some(init_tx)),
             teardown_tx,
             teardown_rx,
+            tuning: ConnTuning::default(),
+            late: Arc::default(),
+            write_right_check: std::sync::Mutex::new(None),
+            write_right_claim: std::sync::Mutex::new(None),
+            write_right_gate: std::sync::Mutex::new(None),
+            write_right_reached: AtomicBool::new(false),
+            final_claim_gate: std::sync::Mutex::new(None),
+            final_claim_reached: AtomicBool::new(false),
         });
         let (main_tx, main_rx) = mpsc::channel::<FrameCmd>(64);
         drop(main_rx);

@@ -230,6 +230,13 @@ pub struct ThreadMirror {
     size: usize,
     /// #172/T7：审批决策策略覆盖（未知 build 用 schema 档；`None` = 按能力位取证据档）
     approval_policy: Option<PendingDecisionPolicy>,
+    /// T03：逐操作有效集合（adapter 在同一临界区内先求值再投影；缺省 = 未知集合）。
+    effective_operations:
+        Option<crate::services::codex_desktop_ipc::capability::EffectiveOperations>,
+    /// T03：持久交互提示的**已装载副本**（DB 读取在镜像锁外；投影只读它）。
+    interaction_hints: Option<
+        std::sync::Arc<Vec<crate::services::codex_desktop_ipc::async_question::InteractionHint>>,
+    >,
     /// 镜像重建代（历史页 token 的一段）：每成功装订一次**新 snapshot**（含首帧、
     /// 重拉、换代重建）递增；patch 是增量，不递增——否则流式补全会每帧打断分页。
     build_generation: u64,
@@ -265,6 +272,8 @@ impl ThreadMirror {
             ledger: None,
             size: 0,
             approval_policy: None,
+            effective_operations: None,
+            interaction_hints: None,
             build_generation: 0,
             budget_refused: false,
             content: Mutex::new(ContentObservation::default()),
@@ -273,6 +282,37 @@ impl ThreadMirror {
 
     /// #172/T7：下发审批决策策略（未知 build 的 schema 档由 adapter 在取证后设置）。
     /// `None` = 回到「按能力位取证据档」的缺省行为。
+    /// T03：下发逐操作有效集合（投影内的 `asyncQuestions` 与 `effectiveOperations`
+    /// 必须来自同一份事实；adapter 在镜像临界区内先求值再投影）。
+    pub fn set_effective_operations(
+        &mut self,
+        operations: crate::services::codex_desktop_ipc::capability::EffectiveOperations,
+    ) {
+        self.effective_operations = Some(operations);
+    }
+
+    /// T03：下发持久交互提示的已装载副本（不含正文；仅供"已知但未加载"展示）。
+    pub fn set_interaction_hints(
+        &mut self,
+        hints: Option<
+            std::sync::Arc<
+                Vec<crate::services::codex_desktop_ipc::async_question::InteractionHint>,
+            >,
+        >,
+    ) {
+        self.interaction_hints = hints;
+    }
+
+    /// T03：运行的只读预览（供 adapter 在**同一临界区内**求值策略，不重建投影）。
+    pub fn operation_preview(&self) -> (String, bool) {
+        let state = self.state.clone().unwrap_or(Value::Null);
+        let pending = state
+            .get("requests")
+            .and_then(Value::as_array)
+            .is_some_and(|requests| !requests.is_empty());
+        (runtime_status(&state), pending)
+    }
+
     pub fn set_approval_policy(&mut self, policy: Option<PendingDecisionPolicy>) {
         self.approval_policy = policy;
     }
@@ -392,6 +432,38 @@ impl ThreadMirror {
                         && item.get("clientId").and_then(Value::as_str) == Some(client_message_id)
                 })
         })
+    }
+
+    /// S4 补绑核对：在当前镜像**全部 Turn** 中查找承载本动作正式消息身份
+    ///（`userMessage.clientId == client_message_id`）的 Turn。只认正式实体回显
+    ///（同 [`Self::turn_has_client_message`] 的判据），「相同文字」「消息数增加」
+    /// 等弱形态一概不算。stale / 无镜像 / 查不到 → `None`（调用方按「无证据」保守）。
+    /// 多义（同一 clientId 出现在多个 Turn——正常协议不该发生）→ 取 canonical 序
+    /// 最先出现者并在调用侧按唯一性语义消费；`turn_ids_of_client_message` 供需要
+    /// 严格唯一性判定的调用方使用。
+    pub fn turn_of_client_message(&self, client_message_id: &str) -> Option<String> {
+        self.turn_ids_of_client_message(client_message_id)
+            .into_iter()
+            .next()
+    }
+
+    /// [`Self::turn_of_client_message`] 的全量形态（canonical 序）：核对用其长度
+    /// 判唯一性——多义 = 无法确定对应哪次投递 = 不作证据。
+    pub fn turn_ids_of_client_message(&self, client_message_id: &str) -> Vec<String> {
+        let Some(state) = self.state.as_ref() else {
+            return Vec::new();
+        };
+        HistoryView::new(state)
+            .turns()
+            .into_iter()
+            .filter(|t| {
+                t.items.iter().any(|item| {
+                    item.get("type").and_then(Value::as_str) == Some("userMessage")
+                        && item.get("clientId").and_then(Value::as_str) == Some(client_message_id)
+                })
+            })
+            .map(|t| t.turn_id.to_string())
+            .collect()
     }
 
     /// 指定 Turn 是否已以终态出现在当前镜像（completed/failed/**interrupted**）。
@@ -605,16 +677,21 @@ impl ThreadMirror {
     /// 被裁掉的前缀长度）：客户端用它 + 尾窗最早一条作为第一次更早分页的入参。
     /// 尾窗前移本身不换 token（R2）。
     pub fn project(&self, caps: CapabilitySet) -> ThreadProjection {
-        match &self.approval_policy {
-            Some(policy) => {
-                let policy = policy.clone();
-                self.project_with_policy(caps, &policy)
-            }
-            None => {
-                let policy = PendingDecisionPolicy::from_caps(&caps);
-                self.project_with_policy(caps, &policy)
-            }
-        }
+        // 兼容：未由 adapter 盖过逐操作事实（`unknown()`）时，按 caps/策略推导，
+        // 使历史直投影路径与生产投影一致（生产投影总会先 set_effective_operations）。
+        // `&self`：只在投影内用局部变量，不回写（回写需 &mut，会破坏调用方借用）。
+        let policy = self
+            .approval_policy
+            .clone()
+            .unwrap_or_else(|| PendingDecisionPolicy::from_caps(&caps));
+        let needs_compat = self
+            .effective_operations
+            .as_ref()
+            .is_none_or(|ops| ops.operations.values().all(|status| !status.implemented));
+        let compat = needs_compat.then(|| {
+            crate::services::codex_desktop_ipc::pending::compat_operations(&caps, &policy)
+        });
+        self.project_inner(caps, &policy, compat)
     }
 
     /// 同上，但**显式**指定审批策略（adapter 在 respond 路径上直接用当前生效策略，
@@ -624,9 +701,26 @@ impl ThreadMirror {
         caps: CapabilitySet,
         policy: &PendingDecisionPolicy,
     ) -> ThreadProjection {
+        self.project_inner(caps, policy, None)
+    }
+
+    /// 内部：可覆盖逐操作事实（compat 路径用；生产投影由 adapter 预先 set）。
+    fn project_inner(
+        &self,
+        caps: CapabilitySet,
+        policy: &PendingDecisionPolicy,
+        operations_override: Option<
+            crate::services::codex_desktop_ipc::capability::EffectiveOperations,
+        >,
+    ) -> ThreadProjection {
         // R1：state 即 conversationState 本体，按根直读
         let state = self.state.clone().unwrap_or(Value::Null);
-        let all = project_full_messages(&state);
+        let mut all = project_full_messages(&state);
+        // T03：正式答复在**同一份 canonical 投影**上标注（current 与历史分页同源）；
+        // 元数据计入尾窗预算（先标注、后裁剪）。
+        crate::services::codex_desktop_ipc::async_question::annotate_interaction_answers(
+            &mut all, &state,
+        );
         // 已结算内容观察与投影共用同一次完整 canonical 投影（不额外投影）。
         let content_epoch = self.observe_content(&all);
         let (messages, truncated) = bound_messages(all);
@@ -637,7 +731,31 @@ impl ThreadMirror {
             .and_then(|r| r.as_array())
             .cloned()
             .unwrap_or_default();
-        let pending = self.pending.project_with_policy(&requests, &caps, policy);
+        let effective_operations = operations_override
+            .or_else(|| self.effective_operations.clone())
+            .unwrap_or_else(
+                crate::services::codex_desktop_ipc::capability::EffectiveOperations::unknown,
+            );
+        let pending = self.pending.project_with_operations(
+            &requests,
+            &caps,
+            policy,
+            &effective_operations,
+            &self.key.thread_id,
+            &state,
+        );
+        let async_questions =
+            crate::services::codex_desktop_ipc::async_question::AsyncQuestionProjector
+                .project_with_hints(
+                    &self.key,
+                    self.lease.as_ref(),
+                    &state,
+                    &effective_operations,
+                    self.interaction_hints
+                        .as_deref()
+                        .map(Vec::as_slice)
+                        .unwrap_or(&[]),
+                );
         ThreadProjection {
             thread_id: self.key.thread_id.clone(),
             revision: self.revision,
@@ -650,14 +768,24 @@ impl ThreadMirror {
             messages,
             history_token,
             pending,
+            // T02/T03：逐操作有效集合由 adapter 在**同一临界区**求值后下发（本层
+            // 不知道契约证据/开关/账本）；`asyncQuestions` 与它同一份事实。
+            effective_operations,
+            async_questions,
             // #172/T9a：探测只读事实由 **adapter** 盖章（镜像层不知道账本/单飞器）；
             // 这里先给诚实缺省（idle + 无码），adapter 随后覆盖。
             probe_status: ProbeStatus::idle(),
+            // 复审 R-T4：队列暂停由 **adapter** 盖章（镜像层不知道账本）；诚实缺省 false。
+            queue_paused: false,
             // 代际来自镜像**绑定的 lease**（广播事件与 GET/首快照同源）——首快照
             // 不带 0，否则 SSE 启动缓冲的 `supersedes` 会把任何事件都判成更新
             //（2026-10-20 第三轮复审 Important）。
             owner_epoch: self.lease.as_ref().map(|l| l.epoch).unwrap_or(0),
             owner_generation: self.lease.as_ref().map(|l| l.generation).unwrap_or(0),
+            // 终审 F5：投影生成不带序号——快照路径在镜像临界区内盖章、发布路径
+            // 经发布点 CAS 预留（复审 round 5 W1；见 adapter 的
+            // seal_snapshot_seq / reserve_publish_seq）。
+            local_seq: 0,
         }
     }
 
@@ -710,7 +838,14 @@ impl ThreadMirror {
         if !view.turn_list_complete() || view.items_incomplete() {
             return status_page(MessagesPageStatus::Loading, "history_incomplete", revision);
         }
-        let all = project_full_messages(state);
+        let mut all = project_full_messages(state);
+        // H09：与 current 投影**同一份规范化产物**——先标注正式答复（剥离信封、
+        // 附 interactionAnswer），再做内容观察与分页；否则两条路径会对同一消息
+        // 观察到不同的已结算内容，分页 token 被误判为 history_rewritten，且更早
+        // 气泡仍显示原始信封。
+        crate::services::codex_desktop_ipc::async_question::annotate_interaction_answers(
+            &mut all, state,
+        );
         // 与投影同源的内容观察：分页也要在比对 token 前观察到最新已结算内容，
         // 否则「先改写、后分页」会漏掉 epoch 推进。
         let content_epoch = self.observe_content(&all);
@@ -1151,6 +1286,14 @@ fn fingerprint_message(hash: &mut Fnv64, message: &ProjectedMessage) {
     hash.push_str(&message.kind);
     hash.push_str(&message.text);
     serde_json::to_writer(&mut *hash, &message.artifacts).expect("附件只含 JSON 可序列化字段");
+    // 正式答复规范化后 text 可能为空：答案/问题/关联状态改变同样改变用户可见内容，
+    // 必须进入内容指纹（否则同 id 的 A→B 改写不会使旧分页 token 失效）。
+    if let Some(answer) = &message.interaction_answer {
+        hash.push_str(&answer.question_key);
+        hash.push_str(&answer.question);
+        hash.push_str(&answer.answer);
+        hash.write_bytes(&[u8::from(answer.correlated)]);
+    }
 }
 
 /// 两次内容观察是否等价（true = 不推进内容代）。
@@ -1381,6 +1524,7 @@ fn project_full_messages(state: &Value) -> Vec<ProjectedMessage> {
                         artifacts: batch.artifacts,
                         omitted_artifact_count: batch.omitted,
                         turn_image_count: 0,
+                        interaction_answer: None,
                     });
                 }
             }
@@ -1475,6 +1619,7 @@ fn project_full_messages(state: &Value) -> Vec<ProjectedMessage> {
                 artifacts: batch.artifacts,
                 omitted_artifact_count: batch.omitted,
                 turn_image_count: 0,
+                interaction_answer: None,
             });
         }
     }
@@ -2440,8 +2585,8 @@ mod tests {
         assert!(view.actionable, "证据档下命令审批可远程决策");
         assert_eq!(
             view.allowed_decisions,
-            vec!["accept", "decline"],
-            "决策词来自策略，不是 availableDecisions（后者没有 decline）"
+            vec!["accept", "cancel"],
+            "显式 availableDecisions 取安全交集（对象扩权词跳过；decline 未列出则不开放）"
         );
         assert_eq!(
             view.command.as_deref(),
@@ -3162,5 +3307,44 @@ mod tests {
                 .map(|m| (&m.id, &m.text))
                 .collect::<Vec<_>>()
         );
+    }
+}
+
+#[cfg(test)]
+mod h09_review_fingerprint_tests {
+    use super::*;
+    use crate::services::codex_desktop_ipc::types::{InteractionAnswerSummary, ProjectedMessage};
+
+    fn message(answer: &str) -> ProjectedMessage {
+        ProjectedMessage {
+            id: "m1".into(),
+            role: "user".into(),
+            kind: "userMessage".into(),
+            text: String::new(),
+            ts: None,
+            turn_id: Some("t1".into()),
+            artifacts: Vec::new(),
+            turn_image_count: 0,
+            omitted_artifact_count: 0,
+            interaction_answer: Some(InteractionAnswerSummary {
+                question_key: "q".into(),
+                question: "选一个".into(),
+                answer: answer.into(),
+                correlated: true,
+            }),
+        }
+    }
+
+    /// 第三轮补：同 id 的正式答复 A→B 必须改变内容指纹（旧分页 token 失效）。
+    #[test]
+    fn fingerprint_includes_interaction_answer_visible_fields() {
+        let mut a = Fnv64::offset();
+        fingerprint_message(&mut a, &message("A"));
+        let mut b = Fnv64::offset();
+        fingerprint_message(&mut b, &message("B"));
+        assert_ne!(a.finish(), b.finish());
+        let mut a2 = Fnv64::offset();
+        fingerprint_message(&mut a2, &message("A"));
+        assert_eq!(a.finish(), a2.finish(), "无变化读取指纹稳定");
     }
 }

@@ -44,6 +44,56 @@ pub fn migrate(conn: &Connection) -> Result<(), String> {
         log::warn!("usage: 检测到预览版账本形状，已重建（四表清空，下次采集重算）");
     }
 
+    let claims_exists = conn
+        .prepare("SELECT 1 FROM codex_interaction_claims LIMIT 0")
+        .is_ok();
+    // B05：旧库的 action_id 唯一索引会阻止同组多题共享一个动作，必须撤掉。
+    if claims_exists {
+        conn.execute(
+            "DROP INDEX IF EXISTS idx_codex_interaction_claims_action",
+            [],
+        )
+        .map_err(|e| format!("MIGRATE_CLAIM_GROUP_FAIL: 迁移同组占用索引失败: {e}"))?;
+    }
+    if claims_exists && !column_exists(conn, "codex_interaction_claims", "claim_owner") {
+        conn.execute(
+            "ALTER TABLE codex_interaction_claims ADD COLUMN claim_owner TEXT NOT NULL DEFAULT ''",
+            [],
+        )
+        .map_err(|e| format!("MIGRATE_CLAIM_OWNER_TOKEN_FAIL: 迁移占用调用令牌失败: {e}"))?;
+    }
+    if claims_exists && !column_exists(conn, "codex_interaction_claims", "claimed_owner") {
+        conn.execute(
+            "ALTER TABLE codex_interaction_claims ADD COLUMN claimed_owner TEXT NOT NULL DEFAULT ''",
+            [],
+        )
+        .map_err(|e| format!("MIGRATE_CLAIM_OWNER_FAIL: 迁移同题占用世系列失败: {e}"))?;
+    }
+    if claims_exists && !column_exists(conn, "codex_interaction_claims", "claimed_epoch") {
+        conn.execute(
+            "ALTER TABLE codex_interaction_claims ADD COLUMN claimed_epoch INTEGER NOT NULL DEFAULT 0",
+            [],
+        )
+        .map_err(|e| format!("MIGRATE_CLAIM_EPOCH_FAIL: 迁移同题占用代际列失败: {e}"))?;
+    }
+
+    // H01：旧成功表缺包内容身份（无 package_sha256）→ 重建（成功证据是派生数据，
+    // 旧行本就无归因，不能猜归属）。重建后由紧随的 init 按新 DDL 建表。
+    if !column_exists(conn, "codex_operation_success", "package_sha256") {
+        conn.execute_batch(
+            "DROP TABLE IF EXISTS codex_operation_success;
+             CREATE TABLE codex_operation_success (
+                 probe_key       TEXT NOT NULL,
+                 package_sha256  TEXT NOT NULL,
+                 operation       TEXT NOT NULL,
+                 rule_version    INTEGER NOT NULL,
+                 evidence_at     INTEGER NOT NULL,
+                 PRIMARY KEY (probe_key, package_sha256, operation, rule_version)
+             );",
+        )
+        .map_err(|e| format!("MIGRATE_OPERATION_SUCCESS_REBUILD_FAIL: 重建成功证据表失败: {e}"))?;
+    }
+
     // 先幂等重放 schema.rs 全量 DDL（全部 IF NOT EXISTS）：老库/裸连接补建新表，
     // 已存在的表保持原样（缺列由下方 ALTER 迁移补齐），与生产启动顺序（schema::init → migrate）一致。
     // 上面 DROP 掉的预览版账本四表，由这次 init 按新 DDL 重建为空表。
@@ -107,6 +157,196 @@ pub fn migrate(conn: &Connection) -> Result<(), String> {
             [],
         )
         .map_err(|e| format!("MIGRATE_FAIL: 迁移失败: {}", e))?;
+    }
+    // S1（2026-10-23 设计 §3.2）：成功证据与最近失败观测分离——补两列成功证据列。
+    // 幂等可重入；**不改任何旧行的既有列值**（「老数据」由读侧 has_evidence 按
+    // state∈probed|verified 兼容识别，写侧失败观测落账时按旧值提升，见 DAO）。
+    // 终审 R3：codex_queue_pause 补归属 token 列（旧行 NULL = 无归属，仅 resume
+    // /显式清除可删；新写入恒带 token——撤回只清本次拥有的行）。
+    if !column_exists(conn, "codex_queue_pause", "pause_token") {
+        conn.execute(
+            "ALTER TABLE codex_queue_pause ADD COLUMN pause_token TEXT",
+            [],
+        )
+        .map_err(|e| {
+            format!(
+                "MIGRATE_QUEUE_PAUSE_TOKEN_FAIL: 老库补列 codex_queue_pause.pause_token 失败: {e}"
+            )
+        })?;
+    }
+    // R17：契约证据缓存必须能核对**当前包内容**（同 build/CLI 但包被替换时，旧结论
+    // 不得安装）。新增两列记录取证时的包文件大小与 mtime；老行 NULL = 未记录 →
+    // 读侧按"未能核对"处理（重新识别，不猜）。
+    for (column, ddl) in [
+        (
+            "package_size",
+            "ALTER TABLE codex_ipc_contract_evidence ADD COLUMN package_size INTEGER",
+        ),
+        (
+            "package_mtime_ms",
+            "ALTER TABLE codex_ipc_contract_evidence ADD COLUMN package_mtime_ms INTEGER",
+        ),
+    ] {
+        if !column_exists(conn, "codex_ipc_contract_evidence", column) {
+            conn.execute(ddl, []).map_err(|e| {
+                format!("MIGRATE_CONTRACT_EVIDENCE_PKG_FAIL: 老库补契约证据包指纹列失败: {e}")
+            })?;
+        }
+    }
+    if !column_exists(conn, "codex_ipc_probe", "evidence_at") {
+        conn.execute(
+            "ALTER TABLE codex_ipc_probe ADD COLUMN evidence_at INTEGER",
+            [],
+        )
+        .map_err(|e| format!("MIGRATE_FAIL: 迁移失败: {}", e))?;
+    }
+    if !column_exists(conn, "codex_ipc_probe", "evidence_stage") {
+        conn.execute(
+            "ALTER TABLE codex_ipc_probe ADD COLUMN evidence_stage TEXT",
+            [],
+        )
+        .map_err(|e| format!("MIGRATE_FAIL: 迁移失败: {}", e))?;
+    }
+    // 复审 R-T1：`codex_write_revoke` 升级为**两态行**（revoked_at 可空 + 新增
+    // claimed_at 列）——旧表 `revoked_at NOT NULL` 且无 claimed_at，SQLite 无法
+    // ALTER 列约束，只能整表重建。旧行全部是撤销行（revoked_at 原样保留，语义
+    // 不变）；重建幂等（新形状已有 claimed_at → 跳过）。无该表（全新库）时由
+    // schema::init 直接建新形状，本块跳过。
+    if !column_exists(conn, "codex_write_revoke", "claimed_at")
+        && conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='codex_write_revoke'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap_or(0)
+            > 0
+    {
+        conn.execute_batch(
+            "BEGIN IMMEDIATE;
+             CREATE TABLE codex_write_revoke_migrated (
+                 action_id  TEXT PRIMARY KEY,
+                 revoked_at INTEGER,
+                 reason     TEXT,
+                 claimed_at INTEGER
+             );
+             INSERT INTO codex_write_revoke_migrated (action_id, revoked_at, reason)
+                 SELECT action_id, revoked_at, reason FROM codex_write_revoke;
+             DROP TABLE codex_write_revoke;
+             ALTER TABLE codex_write_revoke_migrated RENAME TO codex_write_revoke;
+             COMMIT;",
+        )
+        .map_err(|e| {
+            format!("MIGRATE_WRITE_REVOKE_TWO_STATE_FAIL: codex_write_revoke 两态行重建失败: {e}")
+        })?;
+    }
+    // 复审 R-T2：`codex_queue_pause` 升级为**按 token 多行共存**（复合主键
+    // thread_id+pause_token）——旧表 `thread_id` 单列主键只容一行，第二个打断的
+    // 前置保护落不进（ON CONFLICT DO NOTHING），首个打断失败撤回后后受理打断
+    // 的暂停保护随之丢失（R-T2 反向定序）。SQLite 无法改主键，整表重建；旧行
+    // 原样保留（NULL token 行与 token 行共存，NULL 在复合主键中互异）。幂等：
+    // 新形状（pause_token 在主键中）跳过；全新库由 schema::init 直接建新形状。
+    // 顺序：必须在上方 pause_token 补列之后（最老库先补列再重建）。
+    {
+        let composite_pk = conn
+            .prepare("PRAGMA table_info(codex_queue_pause)")
+            .ok()
+            .map(|mut stmt| {
+                stmt.query_map([], |r| Ok((r.get::<_, String>(1)?, r.get::<_, i64>(5)?)))
+                    .ok()
+                    .map(|rows| {
+                        rows.filter_map(Result::ok)
+                            .any(|(name, pk)| name == "pause_token" && pk > 0)
+                    })
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false);
+        let table_present = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='codex_queue_pause'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap_or(0)
+            > 0;
+        if table_present && !composite_pk {
+            conn.execute_batch(
+                "BEGIN IMMEDIATE;
+                 CREATE TABLE codex_queue_pause_migrated (
+                     thread_id    TEXT NOT NULL,
+                     paused_at    INTEGER NOT NULL,
+                     pause_reason TEXT NOT NULL,
+                     pause_token  TEXT,
+                     PRIMARY KEY (thread_id, pause_token)
+                 );
+                 INSERT INTO codex_queue_pause_migrated (thread_id, paused_at, pause_reason, pause_token)
+                     SELECT thread_id, paused_at, pause_reason, pause_token FROM codex_queue_pause;
+                 DROP TABLE codex_queue_pause;
+                 ALTER TABLE codex_queue_pause_migrated RENAME TO codex_queue_pause;
+                 COMMIT;",
+            )
+            .map_err(|e| {
+                format!("MIGRATE_QUEUE_PAUSE_MULTI_TOKEN_FAIL: codex_queue_pause 多行共存重建失败: {e}")
+            })?;
+        }
+    }
+    // 终审 F1 + Gate C 裁决（方向 b）+ 复审 R1（一次性化）：清除 bug 时代的假
+    // 成功证据——**只跑一次**，持久完成标记与清理**同一事务原子执行**。
+    // 背景：S1 的 INSERT 臂曾无条件把 now/stage 写进证据列——首次 failed/inconclusive
+    // 的行带上「从未成功」的证据（复用门与 DTO 据此误报已取证、跳过重试）。bug 写出
+    // 的假证据经 ON CONFLICT 的 COALESCE 保留臂**跨重试/跨重启累积**（attempts 推到
+    // ≥2），行级与真「成功后失败」不可判别——裁决：清除全部 failed|inconclusive 行
+    // 的证据列（表未发版，代价 = 少数真「成功后失败」行重探一次，可接受）。
+    // R1（P1）：无版本的 UPDATE 会在**每次启动**重复执行——历史修复完成后，新产生
+    // 的真「成功→暂时失败」证据也会被清，直接违反成功跨重启保留。修法：专用完成
+    // 标记表（`codex_ipc_probe_fake_evidence_purge_done`）为持久凭据——标记表缺席时
+    // 进入本块：清理 UPDATE、建标记表、落标记行在**同一事务**内提交（原子；无待清
+    // 行也落标记）；标记在位则永久跳过（后续新增的真证据绝不复发被清）。
+    // 不触其他表。
+    {
+        let already_done = conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type='table' \
+                 AND name='codex_ipc_probe_fake_evidence_purge_done'",
+                [],
+                |_| Ok(()),
+            )
+            .is_ok();
+        if !already_done {
+            let tx = conn
+                .unchecked_transaction()
+                .map_err(|e| format!("MIGRATE_FAIL: 清理事务开启失败: {}", e))?;
+            let cleaned = tx
+                .execute(
+                    "UPDATE codex_ipc_probe
+                         SET evidence_at = NULL, evidence_stage = NULL
+                     WHERE state IN ('failed', 'inconclusive')
+                       AND evidence_at IS NOT NULL",
+                    [],
+                )
+                .map_err(|e| format!("MIGRATE_FAIL: 清除假证据失败: {}", e))?;
+            tx.execute(
+                "CREATE TABLE codex_ipc_probe_fake_evidence_purge_done (
+                     done_at INTEGER NOT NULL
+                 )",
+                [],
+            )
+            .map_err(|e| format!("MIGRATE_FAIL: 建清理标记表失败: {}", e))?;
+            tx.execute(
+                "INSERT INTO codex_ipc_probe_fake_evidence_purge_done (done_at) \
+                 VALUES (strftime('%s','now') * 1000)",
+                [],
+            )
+            .map_err(|e| format!("MIGRATE_FAIL: 落清理标记失败: {}", e))?;
+            tx.commit()
+                .map_err(|e| format!("MIGRATE_FAIL: 清理事务提交失败: {}", e))?;
+            if cleaned > 0 {
+                log::warn!(
+                    "codex_ipc: 已一次性清除 {cleaned} 行 bug 时代的假成功证据（表未发版；\
+                     含真「成功后失败」行的代价重探；完成标记已落，此后不再执行）"
+                );
+            }
+        }
     }
 
     // 预设 v2（spec §4）：presets 补描述/类型/绑定工具三列（新表由 schema.rs IF NOT EXISTS 覆盖）
@@ -271,6 +511,14 @@ pub fn migrate(conn: &Connection) -> Result<(), String> {
     // 签名开关冻结值（2026-10-20 复审）：登记时固定该动作的签名形态，排队期间
     // 改设置/重启/同 actionId 重试都不改变既定正文。旧行补列后保持 NULL = 升级前
     // 语义（恒带签名），不误改已完成动作。
+    if !column_exists(conn, "codex_actions", "effect_probe_key") {
+        conn.execute_batch(
+            "ALTER TABLE codex_actions ADD COLUMN effect_probe_key TEXT;
+             ALTER TABLE codex_actions ADD COLUMN effect_package_sha256 TEXT;
+             ALTER TABLE codex_actions ADD COLUMN effect_rule_version INTEGER;",
+        )
+        .map_err(|e| format!("MIGRATE_EFFECT_TARGET_FAIL: 迁移效果归属列失败: {e}"))?;
+    }
     if !column_exists(conn, "codex_actions", "signature_applied") {
         conn.execute(
             "ALTER TABLE codex_actions ADD COLUMN signature_applied INTEGER",
@@ -1246,5 +1494,271 @@ mod tests {
             .unwrap();
         assert_eq!(now, Some(60000));
         migrate(&conn).unwrap(); // 幂等
+    }
+
+    /// S1：`codex_ipc_probe` 老库（无证据列）迁移补 `evidence_at` / `evidence_stage`
+    /// 两列 + 建 `codex_ipc_schema_evidence` 决策词表。**不改旧行**：存量行两列为
+    /// NULL（旧成功由读侧 has_evidence 按旧值兼容识别，见 DAO 老数据回归）；
+    /// 幂等两遍不报错。
+    #[test]
+    fn migrate_codex_ipc_probe_adds_evidence_columns_keeps_legacy_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE codex_ipc_probe (
+                probe_key        TEXT NOT NULL,
+                capability       TEXT NOT NULL,
+                state            TEXT NOT NULL,
+                probe_stage      TEXT,
+                error_code       TEXT,
+                attempts         INTEGER NOT NULL DEFAULT 1,
+                first_seen_at    INTEGER NOT NULL,
+                last_seen_at     INTEGER NOT NULL,
+                next_retry_at    INTEGER,
+                last_duration_ms INTEGER,
+                PRIMARY KEY (probe_key, capability)
+            );
+            INSERT INTO codex_ipc_probe
+                (probe_key, capability, state, probe_stage, attempts, first_seen_at, last_seen_at)
+             VALUES ('windows|old|-|1', 'state', 'probed', 'P3', 2, 500, 900);",
+        )
+        .unwrap();
+        migrate(&conn).unwrap();
+        // 两列就位 + 决策词表就位
+        assert!(conn
+            .prepare("SELECT evidence_at, evidence_stage FROM codex_ipc_probe LIMIT 0")
+            .is_ok());
+        assert!(conn
+            .prepare("SELECT probe_key FROM codex_ipc_schema_evidence LIMIT 0")
+            .is_ok());
+        // 旧行原样保留（不删不改），证据列取 NULL 缺省
+        let (state, evidence_at): (String, Option<i64>) = conn
+            .query_row(
+                "SELECT state, evidence_at FROM codex_ipc_probe WHERE probe_key = 'windows|old|-|1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((state.as_str(), evidence_at), ("probed", None));
+        // 幂等：迁移两遍不报错
+        migrate(&conn).unwrap();
+    }
+
+    /// 终审 F1 + Gate C 裁决（方向 b）：bug 时代的假证据（含**重试累积形态**）被
+    /// 迁移清除；真成功证据保留；**「成功后失败」行按裁决一并清据、承担一次性
+    /// 重探代价**（表未发版；写路径的保留语义由 ON CONFLICT 臂继续保证）。
+    /// 形态覆盖：①首次失败假证据（attempts=1）；②假证据经退避重试累积到
+    /// attempts=2（COALESCE 保留臂——初版 attempts=1 判据漏掉的形态）；③真首次
+    /// 成功（保留）；④真成功后失败（清据 + 注明代价）。幂等两遍。
+    #[test]
+    fn migrate_codex_ipc_probe_clears_fake_evidence_keeps_real() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE codex_ipc_probe (
+                probe_key        TEXT NOT NULL,
+                capability       TEXT NOT NULL,
+                state            TEXT NOT NULL,
+                probe_stage      TEXT,
+                error_code       TEXT,
+                attempts         INTEGER NOT NULL DEFAULT 1,
+                first_seen_at    INTEGER NOT NULL,
+                last_seen_at     INTEGER NOT NULL,
+                next_retry_at    INTEGER,
+                last_duration_ms INTEGER,
+                fingerprint      TEXT,
+                evidence_at      INTEGER,
+                evidence_stage   TEXT,
+                PRIMARY KEY (probe_key, capability)
+            );
+            -- 假证据①：首次 inconclusive（bug INSERT 臂写的 now=1000）
+            INSERT INTO codex_ipc_probe
+                (probe_key, capability, state, probe_stage, error_code, attempts,
+                 first_seen_at, last_seen_at, evidence_at, evidence_stage)
+             VALUES ('windows|fake|-|1', 'state', 'inconclusive', 'P1', 'timeout', 1,
+                     1000, 1000, 1000, 'P1');
+            -- 假证据②：首次 failed
+            INSERT INTO codex_ipc_probe
+                (probe_key, capability, state, probe_stage, error_code, attempts,
+                 first_seen_at, last_seen_at, evidence_at, evidence_stage)
+             VALUES ('windows|fake|-|1', 'send', 'failed', NULL, 'method_not_found', 1,
+                     2000, 2000, 2000, NULL);
+            -- 真证据①：首次成功（attempts=1 ∧ probed）
+            INSERT INTO codex_ipc_probe
+                (probe_key, capability, state, probe_stage, attempts,
+                 first_seen_at, last_seen_at, evidence_at, evidence_stage)
+             VALUES ('windows|real|-|1', 'state', 'probed', 'P3', 1,
+                     3000, 3000, 3000, 'P3');
+            -- 假证据③（Gate C 补充形态）：假证据经退避重试累积（attempts=2）——
+            -- ON CONFLICT 的 COALESCE 保留臂把首写假证据带到 attempts≥2，
+            -- 行级与真「成功后失败」不可判别（evidence_at 都=首写时间）
+            INSERT INTO codex_ipc_probe
+                (probe_key, capability, state, probe_stage, error_code, attempts,
+                 first_seen_at, last_seen_at, evidence_at, evidence_stage)
+             VALUES ('windows|fake|-|2', 'state', 'inconclusive', 'P1', 'timeout', 2,
+                     1500, 6000, 1500, 'P1');
+            -- 真证据②：成功后失败（attempts=2）——**Gate C 裁决：一并清据**，
+            -- 承担一次性重探代价（表未发版；新数据的保留语义由写路径继续保证）
+            INSERT INTO codex_ipc_probe
+                (probe_key, capability, state, probe_stage, error_code, attempts,
+                 first_seen_at, last_seen_at, evidence_at, evidence_stage)
+             VALUES ('windows|real|-|1', 'send', 'failed', 'P1', 'cli_missing', 2,
+                     4000, 5000, 4000, 'P1');",
+        )
+        .unwrap();
+        migrate(&conn).unwrap();
+        // 假证据被清（含 Gate C 补充的重试累积形态）——读侧 has_evidence 随之
+        // 回落 false → 重探不再被短路
+        for (key, cap) in [
+            ("windows|fake|-|1", "state"),
+            ("windows|fake|-|1", "send"),
+            ("windows|fake|-|2", "state"),
+        ] {
+            let (evidence_at, evidence_stage): (Option<i64>, Option<String>) = conn
+                .query_row(
+                    "SELECT evidence_at, evidence_stage FROM codex_ipc_probe \
+                     WHERE probe_key = ?1 AND capability = ?2",
+                    [key, cap],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                (evidence_at, evidence_stage),
+                (None, None),
+                "假证据（首写 + 重试累积形态）必须被清除：{key}/{cap}"
+            );
+        }
+        // 真首次成功保留
+        let real_state: Option<i64> = conn
+            .query_row(
+                "SELECT evidence_at FROM codex_ipc_probe \
+                 WHERE probe_key = 'windows|real|-|1' AND capability = 'state'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(real_state, Some(3000), "首次成功的真证据保留");
+        // Gate C 裁决：「成功后失败」行在修复后证据为空（一次性代价——下次触发
+        // 重探一次；写路径的保留语义由 ON CONFLICT 臂继续保证，新数据不受影响）
+        let real_send: Option<i64> = conn
+            .query_row(
+                "SELECT evidence_at FROM codex_ipc_probe \
+                 WHERE probe_key = 'windows|real|-|1' AND capability = 'send'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            real_send, None,
+            "成功后失败行按裁决清据（一次性重探代价，表未发版）"
+        );
+        // 幂等：迁移两遍不再清任何行（真成功证据不被二遍误清）
+        migrate(&conn).unwrap();
+        let real_state2: Option<i64> = conn
+            .query_row(
+                "SELECT evidence_at FROM codex_ipc_probe \
+                 WHERE probe_key = 'windows|real|-|1' AND capability = 'state'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(real_state2, Some(3000), "幂等：真成功证据不被二遍迁移误清");
+        // 完成标记已落（一次性清理的持久凭据；首跑无待清行也要落——见下方空表用例）
+        assert!(
+            conn.query_row(
+                "SELECT 1 FROM sqlite_master WHERE type='table' \
+                 AND name='codex_ipc_probe_fake_evidence_purge_done'",
+                [],
+                |_| Ok(()),
+            )
+            .is_ok(),
+            "一次性清理必须留持久完成标记"
+        );
+    }
+
+    /// 复审 R1（P1）：一次性清理必须**真的只跑一次**——标记后新增的真「成功→
+    /// 失败」证据不得被后续迁移清除。序列 = 复审原文：migrate（清一次）→ 写真
+    /// 成功证据 → 记失败（证据保留）→ 再 migrate → **断言证据保留**（红 = 被清）。
+    #[test]
+    fn fake_evidence_purge_is_one_shot_new_evidence_survives_later_migrations() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE codex_ipc_probe (
+                probe_key        TEXT NOT NULL,
+                capability       TEXT NOT NULL,
+                state            TEXT NOT NULL,
+                probe_stage      TEXT,
+                error_code       TEXT,
+                attempts         INTEGER NOT NULL DEFAULT 1,
+                first_seen_at    INTEGER NOT NULL,
+                last_seen_at     INTEGER NOT NULL,
+                next_retry_at    INTEGER,
+                last_duration_ms INTEGER,
+                fingerprint      TEXT,
+                evidence_at      INTEGER,
+                evidence_stage   TEXT,
+                PRIMARY KEY (probe_key, capability)
+            );",
+        )
+        .unwrap();
+        // 第一次 migrate：无待清行也必须落完成标记
+        migrate(&conn).unwrap();
+        assert!(
+            conn.query_row(
+                "SELECT 1 FROM codex_ipc_probe_fake_evidence_purge_done",
+                [],
+                |_| Ok(()),
+            )
+            .is_ok(),
+            "无待清行也要记录完成"
+        );
+        // 修复后写路径：真成功证据 → 随后失败（证据由 ON CONFLICT 保留）
+        crate::database::dao::codex_ipc_probe::upsert_ok_conn(
+            &conn,
+            "windows|fresh|-|1",
+            "state",
+            Some("P3"),
+            None,
+            Some(100),
+            1_000,
+        )
+        .unwrap();
+        crate::database::dao::codex_ipc_probe::upsert_fail_conn(
+            &conn,
+            "windows|fresh|-|1",
+            "state",
+            Some("P1"),
+            "cli_missing",
+            None,
+            Some(80),
+            2_000,
+        )
+        .unwrap();
+        let before: (Option<i64>, String, i64) = conn
+            .query_row(
+                "SELECT evidence_at, state, attempts FROM codex_ipc_probe \
+                 WHERE probe_key = 'windows|fresh|-|1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            before,
+            (Some(1_000), "failed".into(), 2),
+            "前置：成功后失败保留证据（既有契约）"
+        );
+        // 再 migrate：**不得**清除标记之后新增的真证据（红 = 被清成 NULL）
+        migrate(&conn).unwrap();
+        let after: (Option<i64>, Option<String>) = conn
+            .query_row(
+                "SELECT evidence_at, evidence_stage FROM codex_ipc_probe \
+                 WHERE probe_key = 'windows|fresh|-|1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            after,
+            (Some(1_000), Some("P3".into())),
+            "一次性清理完成后，新增真「成功→失败」证据必须跨迁移保留（R1 红 = 被清）"
+        );
     }
 }

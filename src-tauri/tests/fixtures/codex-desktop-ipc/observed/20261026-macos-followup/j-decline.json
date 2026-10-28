@@ -1,0 +1,22 @@
+{
+  "method": "thread-follower-command-approval-decision",
+  "version": 1,
+  "params": {
+    "conversationId": "<ID-9>#uuid",
+    "requestId": 75,
+    "decision": "decline"
+  },
+  "response": {
+    "type": "response",
+    "requestId": "<ID-296>#uuid",
+    "resultType": "success",
+    "method": "thread-follower-command-approval-decision",
+    "handledByClientId": "<ID-12>#uuid",
+    "result": {
+      "ok": true
+    }
+  },
+  "pendingMethod": "item/commandExecution/requestApproval",
+  "offeredWords": ["accept", "cancel"],
+  "wordWasOffered": false
+}

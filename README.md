@@ -38,37 +38,37 @@ English · [中文](README.zh-CN.md)
 
 ## Features
 
-Step-by-step documentation lives in the **[user manual](docs/user-manual/en/01-overview.md)** (13 chapters). The README is the porch; the manual is the house.
+Step-by-step documentation lives in the **[user manual](docs/product/manual/en/01-overview.md)** (13 chapters). The README is the porch; the manual is the house.
 
 | Feature                              |                                                                                                                                                   | Manual                                                  |
 | ------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------- |
-| 🎛️ **Session monitoring dashboard**  | Real-time traffic-light board: status, project, branch, last message, CPU — click a card to jump straight to the session's terminal or app window | [Ch. 4](docs/user-manual/en/04-dashboard.md)            |
-| 📶 **Remote access & mobile board**  | The same board on your phone, over four simultaneous channels with per-channel setup wizards and one permanent address option                     | [Ch. 8](docs/user-manual/en/08-mobile-remote.md)        |
-| 📱 **Remote control** (experimental) | Send & queue messages, approve tool calls and plans, answer Q&A cards, switch permission modes, create sessions — all screen-read verified        | [Ch. 8](docs/user-manual/en/08-mobile-remote.md)        |
-| 🕵️ **Sub-agent observatory**         | Live sub-agent chips, a dedicated sub-agent board and execution details in the session view (Claude Code)                                         | [Ch. 5](docs/user-manual/en/05-subagent-observatory.md) |
-| 🐰 **Desktop pets**                  | tuvis-3D & Foxbell watch your sessions with status cards and voice alerts; open pet format for custom imports                                     | [Ch. 7](docs/user-manual/en/07-pet.md)                  |
-| 🧮 **Token usage ledger**            | One ledger for seven tools: overview, trends, distribution, API-equivalent cost estimates, CSV export                                             | [Ch. 11](docs/user-manual/en/11-usage.md)               |
-| ⚡ **Output speed (TPS)**            | Locally sampled streaming TPS + inclusive response throughput, four-range chart with hover readouts; zero speed-test requests                     | [Ch. 11](docs/user-manual/en/11-usage.md)               |
-| 🖥️ **Four-tab desktop workspace**    | Main window tabs: Messages / Resources / Usage / Output Speed — each tab keeps its own state                                                      | [Ch. 11](docs/user-manual/en/11-usage.md)               |
-| 🔔 **Notifications & sound**         | Change-based desktop notifications with deduplication + Web Audio chimes, clickable to jump to the terminal                                       | [Ch. 6](docs/user-manual/en/06-notifications.md)        |
-| 🚀 **Launch at login**               | Shows the real OS-side state (no local cache); silent tray start when auto-launched                                                               | [Ch. 6](docs/user-manual/en/06-notifications.md)        |
-| ⚡ **Quick terminal jump**           | Click a card, land in the right terminal tab — even with the same project open twice                                                              | [Ch. 4](docs/user-manual/en/04-dashboard.md)            |
-| 🧩 **Extension resource management** | Skills / MCP servers / Plugins in one SSOT repository, auto-imported and format-converted per tool                                                | [Ch. 9](docs/user-manual/en/09-resources.md)            |
-| 🎚️ **Preset groups**                 | Bundle skills + MCP + plugins into named presets, apply or revert in one click from the tray                                                      | [Ch. 10](docs/user-manual/en/10-presets.md)             |
-| 👥 **Sub-agent resource allocation** | Allocate resource subsets to sub-agents; tool-level disable cascades down automatically                                                           | [Ch. 9](docs/user-manual/en/09-resources.md)            |
-| ✅ **Tool toggle management**        | Decide which tools Tuvis monitors and manages; unchecking fully restores and hides the tool                                                       | [Ch. 9](docs/user-manual/en/09-resources.md)            |
-| 🩺 **Signal health**                 | Hook trust-gate self-check per tool, with honest per-tool reasons instead of a bare "unregistered"                                                | [Ch. 12](docs/user-manual/en/12-troubleshooting.md)     |
+| 🎛️ **Session monitoring dashboard**  | Real-time traffic-light board: status, project, branch, last message, CPU — click a card to jump straight to the session's terminal or app window | [Ch. 4](docs/product/manual/en/04-dashboard.md)            |
+| 📶 **Remote access & mobile board**  | The same board on your phone, over four simultaneous channels with per-channel setup wizards and one permanent address option                     | [Ch. 8](docs/product/manual/en/08-mobile-remote.md)        |
+| 📱 **Remote control** (experimental) | Send & queue messages, approve tool calls and plans, answer Q&A cards, switch permission modes, create sessions — all screen-read verified        | [Ch. 8](docs/product/manual/en/08-mobile-remote.md)        |
+| 🕵️ **Sub-agent observatory**         | Live sub-agent chips, a dedicated sub-agent board and execution details in the session view (Claude Code)                                         | [Ch. 5](docs/product/manual/en/05-subagent-observatory.md) |
+| 🐰 **Desktop pets**                  | tuvis-3D & Foxbell watch your sessions with status cards and voice alerts; open pet format for custom imports                                     | [Ch. 7](docs/product/manual/en/07-pet.md)                  |
+| 🧮 **Token usage ledger**            | One ledger for seven tools: overview, trends, distribution, API-equivalent cost estimates, CSV export                                             | [Ch. 11](docs/product/manual/en/11-usage.md)               |
+| ⚡ **Output speed (TPS)**            | Locally sampled streaming TPS + inclusive response throughput, four-range chart with hover readouts; zero speed-test requests                     | [Ch. 11](docs/product/manual/en/11-usage.md)               |
+| 🖥️ **Four-tab desktop workspace**    | Main window tabs: Messages / Resources / Usage / Output Speed — each tab keeps its own state                                                      | [Ch. 11](docs/product/manual/en/11-usage.md)               |
+| 🔔 **Notifications & sound**         | Change-based desktop notifications with deduplication + Web Audio chimes, clickable to jump to the terminal                                       | [Ch. 6](docs/product/manual/en/06-notifications.md)        |
+| 🚀 **Launch at login**               | Shows the real OS-side state (no local cache); silent tray start when auto-launched                                                               | [Ch. 6](docs/product/manual/en/06-notifications.md)        |
+| ⚡ **Quick terminal jump**           | Click a card, land in the right terminal tab — even with the same project open twice                                                              | [Ch. 4](docs/product/manual/en/04-dashboard.md)            |
+| 🧩 **Extension resource management** | Skills / MCP servers / Plugins in one SSOT repository, auto-imported and format-converted per tool                                                | [Ch. 9](docs/product/manual/en/09-resources.md)            |
+| 🎚️ **Preset groups**                 | Bundle skills + MCP + plugins into named presets, apply or revert in one click from the tray                                                      | [Ch. 10](docs/product/manual/en/10-presets.md)             |
+| 👥 **Sub-agent resource allocation** | Allocate resource subsets to sub-agents; tool-level disable cascades down automatically                                                           | [Ch. 9](docs/product/manual/en/09-resources.md)            |
+| ✅ **Tool toggle management**        | Decide which tools Tuvis monitors and manages; unchecking fully restores and hides the tool                                                       | [Ch. 9](docs/product/manual/en/09-resources.md)            |
+| 🩺 **Signal health**                 | Hook trust-gate self-check per tool, with honest per-tool reasons instead of a bare "unregistered"                                                | [Ch. 12](docs/product/manual/en/12-troubleshooting.md)     |
 
 ## See it in action
 
 <table>
   <tr>
-    <td align="center"><img src="docs/user-manual/img/mobile-board.png" alt="Mobile session board" height="380" /><br><sub><b>Mobile board</b> — the same traffic-light board in your phone's browser</sub></td>
+    <td align="center"><img src="docs/product/manual/img/mobile-board.png" alt="Mobile session board" height="380" /><br><sub><b>Mobile board</b> — the same traffic-light board in your phone's browser</sub></td>
     <td align="center"><img src="docs/images/mobile-detail-v0.5.0.png" alt="Session detail page" height="380" /><br><sub><b>Session detail</b> — messages, files and sub-agents in one view</sub></td>
     <td align="center"><img src="docs/images/mobile-approve-v0.5.0.png" alt="Remote approval card" height="380" /><br><sub><b>Remote approvals</b> — approve tool calls &amp; plans from your phone</sub></td>
   </tr>
   <tr>
-    <td align="center"><img src="docs/user-manual/img/usage-dashboard.png" alt="Token usage dashboard" height="230" /><br><sub><b>Usage ledger</b> — tokens &amp; costs for seven tools, honestly accounted</sub></td>
+    <td align="center"><img src="docs/product/manual/img/usage-dashboard.png" alt="Token usage dashboard" height="230" /><br><sub><b>Usage ledger</b> — tokens &amp; costs for seven tools, honestly accounted</sub></td>
     <td align="center"><img src="docs/images/foxbell-pet.png" alt="Desktop pet" height="230" /><br><sub><b>Desktop pets</b> — status cards &amp; voice alerts in the corner of your screen</sub></td>
     <td align="center"><img src="docs/images/remote-settings-v0.6.0.png" alt="Remote access settings" height="230" /><br><sub><b>Remote access</b> — four channels, each with its own setup wizard</sub></td>
   </tr>
@@ -95,7 +95,7 @@ Step-by-step documentation lives in the **[user manual](docs/user-manual/en/01-o
 | Mobile · sub-agent observatory           | ✅          | ❌          | ❌       | ❌       | ❌           | ❌        | ❌              | ❌          |
 | Mobile · Codex APP control (Desktop IPC) | ❌          | 🧪          | ❌       | ❌       | ❌           | ❌        | ❌              | ❌          |
 
-> Injection and session creation are experimental and currently cover Claude Code / Codex CLI / OpenCode / Kimi Code; Codex APP control is unlocked per exact Desktop build. Per-tool status and known limitations are documented honestly in [Ch. 8](docs/user-manual/en/08-mobile-remote.md) of the manual.
+> **0.6.3 flagship: Codex Desktop adaptive control.** Per-operation contract evidence, grouped async answering, and a persistent queue-pause safety valve — no headless fallback and no guessed approvals. The matrix marks verified vs experimental; exact limits (Plan mode and permissions remain unsupported) are stated in [Ch. 8](docs/product/manual/en/08-mobile-remote.md).
 
 ## Quick Start
 

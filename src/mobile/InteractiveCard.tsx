@@ -108,6 +108,8 @@ export interface InteractiveCardProps {
   actions?: ReactNode;
   /** 底注（键位提示 / 未确认落盘提示 / 分诊文案 / 回执） */
   footer?: ReactNode;
+  /** 额外 data-* 钩子（既有卡片把 phase/progress 等挂在根节点）。 */
+  dataAttributes?: Record<string, string | number | undefined>;
 }
 
 /** 统一交互卡容器（§2.2 结构契约） */
@@ -121,6 +123,7 @@ export default function InteractiveCard({
   children,
   actions,
   footer,
+  dataAttributes,
 }: InteractiveCardProps) {
   const t = TONES[tone];
   return (
@@ -128,6 +131,11 @@ export default function InteractiveCard({
       data-testid={testId}
       data-mode={mode}
       data-tone={tone}
+      {...Object.fromEntries(
+        Object.entries(dataAttributes ?? {})
+          .filter(([, value]) => value !== undefined)
+          .map(([key, value]) => [`data-${key}`, value])
+      )}
       className={`card-slide-enter shrink-0 px-3 py-2 ${t.box}`}
     >
       {/* 状态色条头部：脉冲圆点 + 类型徽标（+ 可选附加） */}

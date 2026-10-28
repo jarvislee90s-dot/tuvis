@@ -51,7 +51,7 @@ describe("CodexAvailabilityBanner：三态徽标", () => {
     unmount();
 
     render(<CodexAvailabilityBanner availability="compat_only" stale={false} />);
-    expect(screen.getByTestId("codex-tier-badge").textContent).toBe("兼容探测（实验）");
+    expect(screen.getByTestId("codex-tier-badge").textContent).toBe("自动适配（未完全解锁）");
     expect(screen.getByTestId("codex-tier-badge").getAttribute("data-tier")).toBe("compat");
     cleanup();
 
@@ -159,7 +159,7 @@ describe("CodexAvailabilityBanner：失败/不确定态原因", () => {
     );
     expect(screen.queryByTestId("codex-probe-reason")).toBeNull();
     // 档位徽标照常（idle 不是探测在飞）
-    expect(screen.getByTestId("codex-tier-badge").textContent).toBe("兼容探测（实验）");
+    expect(screen.getByTestId("codex-tier-badge").textContent).toBe("自动适配（未完全解锁）");
   });
 
   it("probe_unverified_reason：idle + desktop_build_unverified → 显示「该版本尚未验证」基线文案", () => {

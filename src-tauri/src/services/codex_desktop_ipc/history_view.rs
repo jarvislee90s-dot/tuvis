@@ -84,6 +84,81 @@ impl<'a> HistoryView<'a> {
         keys
     }
 
+    /// R18：目标 turn **之后**是否存在悬空引用（实体缺失/无 turnId）。
+    ///
+    /// 返回 `None` = 目标 turn 不在引用链上（无法证明覆盖）；`Some(true)` = 之后
+    /// 有缺口（可能藏着正式答复，覆盖不能算完整）；`Some(false)` = 之后连续。
+    /// 更早的缺口不影响"最新题→当前"的完整性判定。
+    pub fn gap_after_turn(&self, turn_id: &str) -> Option<bool> {
+        let entities = self.entities().and_then(Value::as_object);
+        let mut seen_target = false;
+        let mut gap_after = false;
+        for key in self.referenced_keys() {
+            let entity = entities.and_then(|e| e.get(key));
+            let entity_turn = entity.and_then(|e| e.get("turnId")).and_then(Value::as_str);
+            match entity_turn {
+                Some(id) if id == turn_id => seen_target = true,
+                Some(_) => {
+                    if seen_target {
+                        // 实体在场：不是缺口
+                    }
+                }
+                None => {
+                    if seen_target {
+                        gap_after = true;
+                    }
+                }
+            }
+        }
+        if seen_target {
+            Some(gap_after)
+        } else {
+            None
+        }
+    }
+
+    /// H08：**严格**缺口判定（含非法引用）。
+    ///
+    /// 与 [`Self::gap_after_turn`] 的区别：`entries[i].value` 非字符串、或实体缺失/
+    /// 非对象/无 turnId，都计为缺口——非法引用同样可能藏着正式答复，不能当作
+    /// "没有这条"。目标 turn 不需要本身合法（由调用方先确认题目回合）。
+    pub fn strict_gap_after_turn(&self, turn_id: &str) -> Option<bool> {
+        let entities = self.entities().and_then(Value::as_object);
+        let islands = self
+            .history()
+            .and_then(|h| h.get("islands"))
+            .and_then(Value::as_array)?;
+        let mut seen_target = false;
+        let mut gap_after = false;
+        for island in islands {
+            let Some(entries) = island.get("entries").and_then(Value::as_array) else {
+                // 结构异常：整体视为缺口（若目标已出现）。
+                if seen_target {
+                    gap_after = true;
+                }
+                continue;
+            };
+            for entry in entries {
+                let entity_turn = entry
+                    .get("value")
+                    .and_then(Value::as_str)
+                    .and_then(|key| entities.and_then(|e| e.get(key)))
+                    .and_then(|entity| entity.get("turnId"))
+                    .and_then(Value::as_str);
+                match entity_turn {
+                    Some(id) if id == turn_id => seen_target = true,
+                    Some(_) => {}
+                    None => {
+                        if seen_target {
+                            gap_after = true;
+                        }
+                    }
+                }
+            }
+        }
+        seen_target.then_some(gap_after)
+    }
+
     /// canonical 顺序遍历被引用的 turn 实体。引用失效 / 实体缺失 / 非对象 /
     /// 无 `turnId` 字段 → 跳过（不猜）。
     pub fn turns(&self) -> Vec<TurnRef<'a>> {
@@ -226,9 +301,9 @@ pub struct TurnRef<'a> {
     pub params: Option<&'a Value>,
     /// 内联 item 对象数组（真实形态：正文在 items 上，不是字符串 id 表）。
     pub items: &'a [Value],
-    pagination: Option<&'a Value>,
+    pub pagination: Option<&'a Value>,
     /// 明确未加载标记（金样实证：start-turn 回执的 `itemsView:"notLoaded"`）
-    items_view: Option<&'a str>,
+    pub items_view: Option<&'a str>,
 }
 
 impl<'a> TurnRef<'a> {

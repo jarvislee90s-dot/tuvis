@@ -750,7 +750,7 @@ $ pnpm test                                   # 46 files, 228 tests ✅
 
 ## X1. 证据引用（spec F1–F6 摘引）
 
-依据 spec `docs/superpowers/specs/2026-09-09-codex-private-skill-dir-design.md` §2（2026-09-09 取证）：
+依据 spec `docs/engineering/specs/2026-09-09-codex-private-skill-dir-design.md` §2（2026-09-09 取证）：
 
 - **F1** codex 读 `~/.agents/skills`——官方文档（开放标准用户级路径）；
 - **F2** codex 也读私有 `~/.codex/skills`——codex 0.149.1 实机取证：全局状态留有

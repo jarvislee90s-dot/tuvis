@@ -208,6 +208,11 @@ pub fn init(conn: &Connection) {
             compat_rollout_baseline INTEGER,
             compat_wire_hash        TEXT,
             barrier_force_released_at INTEGER,
+            -- H01：原动作捕获的效果归属（probe_key/包 SHA/规则）；只在准确效果确认
+            -- 后结算一次，结算即清空（不猜当前目标）。
+            effect_probe_key      TEXT,
+            effect_package_sha256 TEXT,
+            effect_rule_version   INTEGER,
             -- 签名开关的登记时冻结值（1 = 正文已带 `[mobile 花名]` 签名）。
             -- NULL = 本列上线前登记的旧行：按升级前语义（恒带签名）派发。
             signature_applied       INTEGER
@@ -228,6 +233,62 @@ pub fn init(conn: &Connection) {
         CREATE INDEX IF NOT EXISTS idx_codex_actions_terminal_retention
             ON codex_actions(updated_at)
             WHERE state IN ('accepted', 'rejected', 'cancelled') AND compat_outstanding = 0;
+        -- ===== S2：打断后队列持久暂停（设计 §4.2/§4.3）=====
+        -- 复审 R-T2 起**按 token 多行共存**：每次打断（interrupt_pending 前置档）
+        -- 落**自己的行**，受理/不确定保留、Rejected/NotSent 只撤自己的行、显式
+        -- resume 清全部；「暂停中 = EXISTS 任意行」——并发/交错打断不再因「只有
+        -- 第一个 token 拥有行」而丢失后受理打断的保护。读取取**最早行**（首次
+        -- 暂停时间与原因保留，审计起点不漂移）。
+        CREATE TABLE IF NOT EXISTS codex_queue_pause (
+            thread_id    TEXT NOT NULL,
+            paused_at    INTEGER NOT NULL,
+            pause_reason TEXT NOT NULL,
+            -- 终审 R3：暂停归属 token（打断尝试标识）。撤回只清**本次 token 拥有**
+            -- 的行——重复打断失败/并发交错不得清除他人（上次受理）建立的暂停。
+            -- 老库经 migrate 幂等补列 + 重建（旧行 NULL = 无归属，仅 resume/显式
+            -- 清除可删；SQLite 复合主键允许 NULL 与 token 行共存）。
+            pause_token  TEXT,
+            PRIMARY KEY (thread_id, pause_token)
+        );
+        -- ===== S2：一次性越队授权（设计 §4.2「不能全局绕过」）=====
+        -- 绑定到具体新 action 的持久授权：授权跨 thread / 跨 action / 重复消费 /
+        -- pending 在场全部无效。consumed_at 非 NULL = 已消费（写出前 CAS 消费恰好
+        -- 一次）；行保留作审计（为什么这条先发了）。
+        CREATE TABLE IF NOT EXISTS codex_bypass_grant (
+            action_id   TEXT PRIMARY KEY,
+            thread_id   TEXT NOT NULL,
+            granted_at  INTEGER NOT NULL,
+            consumed_at INTEGER
+        );
+        -- ===== S4：人工继续的持久派发权撤销（设计 §6.2「撤销旧动作尚未取得的未来
+        -- 首次写出权」）=====
+        -- 行存在 = 该动作的**尚未发生的首次写出**已被撤销：旧派发任务、重启恢复、
+        -- 迟到 HTTP 在写出边界（真正 start-turn 之前）都必须查本表；已越过不可撤回
+        -- 写入点的旧动作不受追溯（只继续收尾取证）。单调标记（不删行）——撤销后
+        -- 任何路径不得重新取得首次写出权；迟到真实结果仍可补记（不动本表）。
+        -- 复审 R-T1（两态行）：同一行承载**两个互斥状态**——
+        --   * revoked_at 非 NULL = 写出权已撤销（人工继续胜出）；
+        --   * claimed_at 非 NULL（且 revoked_at NULL）= 首次写出权**已取得**（writer
+        --     在真正 write_all 前以单条 CAS 原子取得——这是「取得首次写出权」的
+        --     线性化点；此后人工继续的撤销 CAS 必输，按 §6.2 只收尾取证不建后继）。
+        -- 两态竞争靠同表单语句 UPSERT+WHERE 的 SQLite 写串行化保证原子（无中间窗口）。
+        CREATE TABLE IF NOT EXISTS codex_write_revoke (
+            action_id  TEXT PRIMARY KEY,
+            revoked_at INTEGER,
+            reason     TEXT,
+            claimed_at INTEGER
+        );
+        -- ===== S4：人工继续的唯一后继关联（设计 §6.2「服务端记录原 actionId、人工
+        -- 解除时间与原因、新 actionId 的关联；多设备并发也最多建立一个后继」）=====
+        -- old_action_id 主键 = 每个原动作至多一个后继（持久 CAS：并发第二台设备
+        -- INSERT 冲突 → 返回既有后继）。后继行本身在 codex_actions（同一事务内登记）。
+        CREATE TABLE IF NOT EXISTS codex_manual_resume (
+            old_action_id      TEXT PRIMARY KEY,
+            successor_action_id TEXT NOT NULL,
+            device_id          TEXT NOT NULL,
+            resumed_at         INTEGER NOT NULL,
+            reason             TEXT
+        );
         CREATE TABLE IF NOT EXISTS write_audit (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
             ts          INTEGER NOT NULL,
@@ -539,6 +600,11 @@ pub fn init(conn: &Connection) {
         --   fingerprint：官方 schema 探针的**内容指纹**（文件名+大小的 sha256）——只对
         --   capability='schema' 的行有意义；让「build × 能力」数据集能追到具体
         --   schema 版本（老库由 migration.rs 补列）。
+        --   S1（2026-10-23 设计 §3.2）：**成功证据与最近失败观测分离**——`state` 列降级为
+        --   「最近一次观测」，`evidence_at`/`evidence_stage` 记**最后一次成功取证**（NULL =
+        --   从未成功）。失败观测写入时两列原样保留（老库里 state∈probed|verified 的行由
+        --   读侧/写侧按旧值提升，migration 只补列不改行）。跨重启复用看证据列，不看
+        --   `state`——超时/断链不再把「该版本没能力」的错误结论盖掉成功证据。
         CREATE TABLE IF NOT EXISTS codex_ipc_probe (
             probe_key        TEXT NOT NULL,
             capability       TEXT NOT NULL,
@@ -551,6 +617,8 @@ pub fn init(conn: &Connection) {
             last_seen_at     INTEGER NOT NULL,
             next_retry_at    INTEGER,
             last_duration_ms INTEGER,
+            evidence_at      INTEGER,
+            evidence_stage   TEXT,
             PRIMARY KEY (probe_key, capability)
         );
         -- ===== TPS 短时抽样三表（2026-10-24 计划 Task 2 / spec §6 固定工程契约）=====
@@ -649,6 +717,83 @@ pub fn init(conn: &Connection) {
             key        TEXT PRIMARY KEY,
             value_json TEXT NOT NULL,
             updated_at INTEGER NOT NULL
+        );
+        -- S1：**schema 决策词持久证据**（设计 §3.2：只存文件指纹不能重建决策词，须持久
+        -- 保存经过校验的 decision 枚举；仍在每个 pending 上求交集，缓存不直接批准）。
+        -- probe_key 主键与账本同键（platform|build|cli_id|probe_epoch）；新表无存量，
+        -- CREATE IF NOT EXISTS 即幂等迁移，无老用户数据要搬。
+        -- T03：**异步题持久提示**（只存无正文身份与最后事实；用于重启后"已知但
+        -- 未加载"保持保守 Unknown，不复活写资格——contextToken 每代重生成）。
+        CREATE TABLE IF NOT EXISTS codex_interaction_hints (
+            thread_id        TEXT NOT NULL,
+            source_turn_id   TEXT NOT NULL,
+            source_item_id   TEXT NOT NULL,
+            question_index   INTEGER NOT NULL,
+            last_fact        TEXT NOT NULL,
+            updated_at       INTEGER NOT NULL,
+            PRIMARY KEY (thread_id, source_turn_id, source_item_id, question_index)
+        );
+        -- H01：**按完整捕获目标的逐操作真实成功证据**（效果确认后才写入；跨 build/
+        -- 包内容/规则版本不通用）。旧台账 Accepted 行只保留审计，不推导成功证据。
+        CREATE TABLE IF NOT EXISTS codex_operation_success (
+            probe_key       TEXT NOT NULL,
+            package_sha256  TEXT NOT NULL,
+            operation       TEXT NOT NULL,
+            rule_version    INTEGER NOT NULL,
+            evidence_at     INTEGER NOT NULL,
+            PRIMARY KEY (probe_key, package_sha256, operation, rule_version)
+        );
+        -- R02：**异步题持久排他占用**（同题只允许一个在途/未知正式提交）。
+        -- 主键 = 题的持久身份（thread + 官方紧凑 question_key）；action_id 绑定占用者，
+        -- state ∈ in_flight / unknown / answered。明确零投递（NotSent/Rejected）删除行，
+        -- 受理/未知保留——跨设备、换 actionId、重启后都不会重复正式提交。
+        -- 不存答案或信封正文。
+        CREATE TABLE IF NOT EXISTS codex_interaction_claims (
+            thread_id     TEXT NOT NULL,
+            question_key  TEXT NOT NULL,
+            action_id     TEXT NOT NULL,
+            context_token TEXT,
+            state         TEXT NOT NULL,
+            -- H05：取得占用的工作代际（owner epoch）。只有**代际已变**（旧拥有者
+            -- 确定失去写权）才允许接管；年龄本身不是失效证据。
+            claimed_epoch INTEGER NOT NULL DEFAULT 0,
+            -- N07：占用者世系（boot:epoch:generation）；与真实启动身份 + owner
+            -- 世代绑定，只有世系已变才允许接管。
+            claimed_owner TEXT NOT NULL DEFAULT '',
+            -- J02：本次调用对占用的拥有令牌（并发同 actionId 不同调用不能接管）。
+            claim_owner   TEXT NOT NULL DEFAULT '',
+            created_at    INTEGER NOT NULL,
+            updated_at    INTEGER NOT NULL,
+            PRIMARY KEY (thread_id, question_key)
+        );
+        -- B05：同组多题共享同一 action_id（一次动作、多行占用），不能再对
+        -- action_id 建唯一索引；互斥由 (thread_id, question_key) 主键保证。
+        -- T02：**逐操作契约证据**（当前运行包的有限结构匹配结论；spec §3.2「成功证据
+        -- 按完整目标指纹、能力与契约规则版本持久复用」）。主键含 rule_version 与
+        -- package_sha256：规则收紧或包内容变化后，旧结论不得当新证据复用。
+        -- 只存结构性规则（方法/版本/请求响应/语义），不存会话正文、命令、路径或凭据。
+        CREATE TABLE IF NOT EXISTS codex_ipc_contract_evidence (
+            probe_key       TEXT NOT NULL,
+            operation       TEXT NOT NULL,
+            rule_version    INTEGER NOT NULL,
+            package_sha256  TEXT NOT NULL,
+            method          TEXT NOT NULL,
+            package_size    INTEGER,
+            package_mtime_ms INTEGER,
+            base_version    INTEGER NOT NULL,
+            request_rule    TEXT NOT NULL,
+            response_rule   TEXT NOT NULL,
+            semantic_rule   TEXT NOT NULL,
+            evidenced_at    INTEGER NOT NULL,
+            observed_at     INTEGER NOT NULL,
+            PRIMARY KEY (probe_key, operation, rule_version, package_sha256)
+        );
+        CREATE TABLE IF NOT EXISTS codex_ipc_schema_evidence (
+            probe_key         TEXT PRIMARY KEY,
+            fingerprint       TEXT NOT NULL,
+            command_decisions TEXT NOT NULL,
+            file_decisions    TEXT NOT NULL,
+            evidence_at       INTEGER NOT NULL
         );
         "#,
     )

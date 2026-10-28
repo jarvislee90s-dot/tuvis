@@ -45,9 +45,7 @@
                 "ts": 1760000000000
               }
             },
-            "islands": [
-              { "entries": ["turn-w1"], "exhausted": true }
-            ]
+            "islands": [{ "entries": ["turn-w1"], "exhausted": true }]
           }
         }
       }
