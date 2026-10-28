@@ -17,7 +17,12 @@
 //! 用户意图落在既有 settings 表（设计 §3.3，无 schema 迁移）：
 //! `remote.zcode_auto_connect` 缺键 = true、非法值 = false；**读取失败按失败处理**
 //! （不当作缺键），写入一律 checked，失败如实回报 `storage_failed`。
+//!
+//! 意图写按**单调代际**排序（P2-6）：用户写（授权成功/显式连接/显式断开/忘记）
+//! 在 DB 锁内预占新代、恒为最新；KICKED 的延迟写在事件到达时预占一代，落库前
+//! 代际已过期即跳过——迟到的暂停绝不覆盖用户后来的连接/断开意图。
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -75,14 +80,72 @@ pub(crate) fn auto_connect_gate(store: &DeviceStore) -> Option<AutoConnectGate> 
 }
 
 /// 持久化自动连接意图（checked write；失败不假报已保存）。
+///
+/// P2-6 起**仅供测试直写**：生产一律走 [`write_auto_intent`]，由它在 DB 锁内复核
+/// 意图代际（迟到的 KICKED 写不得覆盖更新的用户意图）。
+#[cfg(test)]
 pub(crate) fn persist_auto_connect(store: &DeviceStore, enabled: bool) -> ZResult<()> {
     store
+        .with(|conn| write_auto_connect_conn(conn, enabled))
+        .map_err(|_| ZcodeError::of(codes::STORAGE_FAILED))
+}
+
+/// DB 锁内的裸写（调用方负责代际复核与 checked 错误映射）。
+fn write_auto_connect_conn(conn: &Connection, enabled: bool) -> rusqlite::Result<()> {
+    try_set_setting_conn(
+        conn,
+        AUTO_CONNECT_KEY,
+        if enabled { "true" } else { "false" },
+    )
+}
+
+/// 自动连接意图写入的代际凭据（P2-6）：所有意图写都带一个代，落库前在 DB 锁内
+/// 复核「仍是最新代」。
+///
+/// 用户写（授权成功/显式连接/显式断开/忘记/连接直接返回冲突）用 [`Self::Latest`]：
+/// 在 DB 锁内**预占新代**，因此恒为最新；KICKED 的延迟写用 [`Self::Captured`] 携带
+/// 事件到达时预占的代际——用户随后的写会拿到更高代，迟到的 KICKED 写必须跳过。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AutoIntentClaim {
+    /// 用户意图写：落库时在 DB 锁内预占新代（此后为最新）。
+    Latest,
+    /// 延迟写（KICKED）：事件到达时预占的代际；落库前仍是当前代才写。
+    Captured(u64),
+}
+
+/// 为一次延迟写预占新代（KICKED 事件到达时调用，先于任何后续用户写）。
+pub(crate) fn capture_auto_intent(generation: &AtomicU64) -> AutoIntentClaim {
+    AutoIntentClaim::Captured(generation.fetch_add(1, Ordering::SeqCst) + 1)
+}
+
+/// 统一意图写入口（P2-6）：**在 DB 锁内**复核代际，被更新的用户意图取代时跳过。
+///
+/// 返回值：`Ok(true)` = 已落库；`Ok(false)` = 代际已过期，主动跳过（不是错误）；
+/// `Err` = 存储失败（用户写必须原样上抛，绝不假报已保存）。
+///
+/// 只靠 DB 互斥不足以保证顺序：KICKED 的 blocking 写可能在用户写之后才拿到锁，
+/// 那时 DB 里已是用户的更新值——代际复核把它拦下。
+pub(crate) fn write_auto_intent(
+    store: &DeviceStore,
+    generation: &AtomicU64,
+    claim: AutoIntentClaim,
+    enabled: bool,
+) -> ZResult<bool> {
+    store
         .with(|conn| {
-            try_set_setting_conn(
-                conn,
-                AUTO_CONNECT_KEY,
-                if enabled { "true" } else { "false" },
-            )
+            match claim {
+                // 用户写：在本锁内预占新代——同一临界区里的后续写只会看到更高代。
+                AutoIntentClaim::Latest => {
+                    generation.fetch_add(1, Ordering::SeqCst);
+                }
+                // 延迟写：事件到达时的代已过期 ⇒ 用户更新过意图，跳过。
+                AutoIntentClaim::Captured(expected) => {
+                    if generation.load(Ordering::SeqCst) != expected {
+                        return Ok(false);
+                    }
+                }
+            }
+            write_auto_connect_conn(conn, enabled).map(|_| true)
         })
         .map_err(|_| ZcodeError::of(codes::STORAGE_FAILED))
 }
@@ -402,6 +465,93 @@ mod tests {
             stored_value(&store, AUTO_CONNECT_KEY).as_deref(),
             Some("true")
         );
+    }
+
+    // ------------------------------------------------------------------
+    // P2-6：意图代际（用户写恒最新；KICKED 延迟写携带旧代必须跳过）
+    // ------------------------------------------------------------------
+
+    /// 事件到达时预占的旧代，在用户更新的 true 之后落库必须被跳过。
+    #[test]
+    fn captured_false_claim_is_skipped_after_newer_true_intent() {
+        let store = stored(URL);
+        let generation = AtomicU64::new(0);
+        // KICKED 先到：预占一代（此代之后被用户写超越）。
+        let kicked = capture_auto_intent(&generation);
+
+        // 用户随后显式连接：预占更高代并落 true。
+        assert!(
+            write_auto_intent(&store, &generation, AutoIntentClaim::Latest, true).unwrap(),
+            "用户写必须落库"
+        );
+        assert_eq!(
+            stored_value(&store, AUTO_CONNECT_KEY).as_deref(),
+            Some("true")
+        );
+
+        // 迟到的 KICKED 写携带旧代：必须跳过，不得把用户意图改回 false。
+        let written = write_auto_intent(&store, &generation, kicked, false).unwrap();
+        assert!(!written, "旧代际的 KICKED 延迟写必须被跳过");
+        assert_eq!(
+            stored_value(&store, AUTO_CONNECT_KEY).as_deref(),
+            Some("true"),
+            "用户更新的 true 必须保持"
+        );
+    }
+
+    /// 镜像方向：旧代的 true 延迟写不得覆盖用户更新的 false。
+    #[test]
+    fn captured_true_claim_is_skipped_after_newer_false_intent() {
+        let store = stored(URL);
+        let generation = AtomicU64::new(0);
+        let stale = capture_auto_intent(&generation);
+
+        assert!(
+            write_auto_intent(&store, &generation, AutoIntentClaim::Latest, false).unwrap(),
+            "用户断开写必须落库"
+        );
+        assert_eq!(
+            stored_value(&store, AUTO_CONNECT_KEY).as_deref(),
+            Some("false")
+        );
+
+        let written = write_auto_intent(&store, &generation, stale, true).unwrap();
+        assert!(!written, "旧代际的 true 延迟写必须被跳过");
+        assert_eq!(
+            stored_value(&store, AUTO_CONNECT_KEY).as_deref(),
+            Some("false"),
+            "用户更新的 false 必须保持"
+        );
+    }
+
+    /// 事件晚于用户写：预占的代际最新，写入必须生效（KICKED 暂停不被误跳过）。
+    #[test]
+    fn captured_claim_newer_than_user_write_is_written() {
+        let store = stored(URL);
+        let generation = AtomicU64::new(0);
+        write_auto_intent(&store, &generation, AutoIntentClaim::Latest, true).unwrap();
+
+        let kicked = capture_auto_intent(&generation);
+        assert!(
+            write_auto_intent(&store, &generation, kicked, false).unwrap(),
+            "事件晚于用户写时，KICKED 的 false 必须落库"
+        );
+        assert_eq!(
+            stored_value(&store, AUTO_CONNECT_KEY).as_deref(),
+            Some("false")
+        );
+    }
+
+    /// 存储失败绝不因代际路径被吞掉：用户写与延迟写都如实回报。
+    #[test]
+    fn write_auto_intent_reports_storage_failure() {
+        let broken = DeviceStore::Owned(Arc::new(Mutex::new(
+            rusqlite::Connection::open_in_memory().unwrap(),
+        )));
+        let generation = AtomicU64::new(0);
+        assert!(write_auto_intent(&broken, &generation, AutoIntentClaim::Latest, true).is_err());
+        let claim = capture_auto_intent(&generation);
+        assert!(write_auto_intent(&broken, &generation, claim, false).is_err());
     }
 
     /// 空转驱动不应残留任务或 panic；这里只验证 gate 在「读失败」时快速返回。

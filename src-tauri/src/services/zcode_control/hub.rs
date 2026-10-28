@@ -29,7 +29,7 @@ use serde_json::Value;
 use tokio::sync::{broadcast, mpsc, Mutex as AsyncMutex, Notify};
 
 use super::auth::{AuthService, AuthStatus, OAuthProvider, OpenAuthorize};
-use super::auto_connect::persist_auto_connect;
+use super::auto_connect::{capture_auto_intent, write_auto_intent, AutoIntentClaim};
 use super::bridge::{BridgeManager, DataOutcome};
 use super::command::CommandSender;
 use super::config::{get_config, ConfigState};
@@ -436,6 +436,17 @@ fn lock_inner(inner: &Mutex<Inner>) -> std::sync::MutexGuard<'_, Inner> {
     inner
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// 「已配置 + 是否已授权」对应的展示态（配置变更第一/末段的唯一映射口径）。
+fn configured_state(configured: bool, authorized: bool) -> ConnectionState {
+    if !configured {
+        ConnectionState::NeedsConfig
+    } else if authorized {
+        ConnectionState::Offline
+    } else {
+        ConnectionState::NeedsAuth
+    }
 }
 
 /// 后端 `bind_session` 只产出桥投影代际；公开面一律用 Hub 代际：
@@ -885,6 +896,37 @@ impl Drop for CloseGuard {
     }
 }
 
+/// 测试专用：KICKED 延迟写的两段闸（生产不编译）。
+///
+/// 事件到达时泵在 blocking 池上异步落库；真实竞态窗口（事件已捕获代际、用户写
+/// 已落库、KICKED 写才拿到锁）无法用固定 sleep 稳定复现。这里让测试在**落库前**
+/// 放行、在**落库后**收到完成信号，从而确定性验证「旧代 KICKED 写被跳过」。
+#[cfg(test)]
+#[derive(Default)]
+struct KickedIntentProbe {
+    /// 非空时：延迟写先等这里放行（测试取走后由 `recv` 挂住）。
+    release: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    /// 非空时：延迟写落库/跳过之后向这里回报完成。
+    done: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+}
+
+#[cfg(test)]
+impl KickedIntentProbe {
+    fn wait(&self) {
+        let release = self.release.lock().unwrap().take();
+        if let Some(release) = release {
+            let _ = release.recv();
+        }
+    }
+
+    fn finish(&self) {
+        let done = self.done.lock().unwrap().take();
+        if let Some(done) = done {
+            let _ = done.send(());
+        }
+    }
+}
+
 /// 单实例 ZCode 控制 Hub（桌面与手机共享）。
 pub struct ZcodeHub {
     store: DeviceStore,
@@ -913,6 +955,15 @@ pub struct ZcodeHub {
     /// 「旧 restore 抢在新删除之前复活内存凭据」的窗口，不跨进程。`Arc` 让 relay
     /// 事件泵在 KICKED 时也能同步置位并唤醒 worker，立即取消待重试轮次。
     auto_paused: Arc<AtomicBool>,
+    /// 自动连接意图的写入代际（P2-6，单调递增）：用户意图写与 KICKED 延迟写共用。
+    ///
+    /// 用户写在 DB 锁内预占新代（此后恒为最新）；KICKED 在事件到达时预占一代，
+    /// 延迟的 blocking 写携带该代。落库前在 DB 锁内复核代际，被更新的用户意图取代
+    /// 时跳过——迟到的 KICKED 写绝不覆盖用户后来的 true/false。
+    auto_intent_generation: Arc<AtomicU64>,
+    /// 测试观察口：KICKED 延迟写的两段闸（见 [`KickedIntentProbe`]）。
+    #[cfg(test)]
+    kicked_intent_probe: Arc<KickedIntentProbe>,
     /// 测试观察口：自动连接 worker 已执行的尝试次数（证明「等 worker 跑完」而不是
     /// 靠固定 sleep；不影响生产行为）。
     #[cfg(test)]
@@ -1033,6 +1084,9 @@ impl ZcodeHub {
             auto_restore_attempted: AtomicBool::new(false),
             auto_notify: Arc::new(Notify::new()),
             auto_paused: Arc::new(AtomicBool::new(false)),
+            auto_intent_generation: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            kicked_intent_probe: Arc::new(KickedIntentProbe::default()),
             #[cfg(test)]
             auto_attempts: AtomicU64::new(0),
             #[cfg(all(feature = "zcode-bridge-evidence", debug_assertions))]
@@ -1076,6 +1130,10 @@ impl ZcodeHub {
         // 暂停标记 + 唤醒都走与 worker 共享的句柄。
         let auto_paused = self.auto_paused.clone();
         let auto_notify = self.auto_notify.clone();
+        // KICKED 的持久暂停同样走意图代际（P2-6）：事件到达即预占一代，延迟写携带它。
+        let auto_intent_generation = self.auto_intent_generation.clone();
+        #[cfg(test)]
+        let kicked_intent_probe = self.kicked_intent_probe.clone();
         tokio::spawn(async move {
             loop {
                 if let Some(lag) = &lag {
@@ -1108,18 +1166,46 @@ impl ZcodeHub {
                         let _ = outcome.result;
                     }
                     RelayEvent::State(view) => {
+                        // P2-6：KICKED 的意图代际在**事件到达时**（应用状态之前）预占，
+                        // 此后用户的任何意图写都拿到更高代、必然胜出；不能等
+                        // `apply_relay_state` 的 await（桥失效）之后再取，否则这期间
+                        // 落到 DB 的用户写会被误判为「更旧」。
+                        let entering_conflict = view.state == ConnectionState::Conflict
+                            && lock_inner(&inner).state != ConnectionState::Conflict;
+                        let conflict_claim =
+                            entering_conflict.then(|| capture_auto_intent(&auto_intent_generation));
                         let effects = apply_relay_state(&inner, &out, bridge.as_ref(), view).await;
                         if effects.entered_conflict {
                             // KICKED：先同步暂停并唤醒自动连接（取消待重试轮次），再持久化
                             // 「暂停自动连接」（设计 §5.2）。checked 写；失败不声称成功，
                             // 也不阻塞事件泵（阻塞型 DB 调用交给 blocking 池）。
+                            //
+                            // P2-6：事件到达即**预占意图代际**，延迟写携带该代。用户随后
+                            // 的显式连接/断开会预占更高代，本写落库时因代际过期被跳过——
+                            // 迟到的 KICKED 绝不覆盖更新的用户意图。
                             auto_paused.store(true, Ordering::SeqCst);
                             auto_notify.notify_one();
                             let store = store.clone();
+                            let generation = auto_intent_generation.clone();
+                            let claim = conflict_claim
+                                .unwrap_or_else(|| capture_auto_intent(&auto_intent_generation));
+                            #[cfg(test)]
+                            let probe = kicked_intent_probe.clone();
                             tokio::task::spawn_blocking(move || {
-                                if persist_auto_connect(&store, false).is_err() {
+                                #[cfg(test)]
+                                probe.wait();
+                                let outcome = write_auto_intent(&store, &generation, claim, false);
+                                #[cfg(test)]
+                                probe.finish();
+                                match outcome {
+                                    Ok(true) => {}
                                     // 只报失联事实：不打印 JWT/链接等任何凭据或目标。
-                                    log::warn!("ZCode KICKED：持久化自动暂停意图失败");
+                                    Ok(false) => log::warn!(
+                                        "ZCode KICKED：自动暂停意图已被更新的用户意图取代，跳过写入"
+                                    ),
+                                    Err(_) => {
+                                        log::warn!("ZCode KICKED：持久化自动暂停意图失败")
+                                    }
                                 }
                             });
                         }
@@ -1384,7 +1470,12 @@ impl ZcodeHub {
         }
         // 授权成功 = 用户连接意图（设计 §3.3/§5.1）。标记写失败不改变本次授权结果，
         // 但绝不假报已保存：唤醒后 worker 仍按现查的持久意图决定是否连接。
-        let _ = persist_auto_connect(&self.store, true);
+        let _ = write_auto_intent(
+            &self.store,
+            &self.auto_intent_generation,
+            AutoIntentClaim::Latest,
+            true,
+        );
         self.resume_auto_connect();
         self.wake_auto_connect();
         Ok(view)
@@ -1413,7 +1504,12 @@ impl ZcodeHub {
     /// 假报已保存），必要时重试一次授权恢复（**不自动 OAuth**），成功后走原
     /// [`Self::connect`]。
     pub async fn connect_requested(&self) -> ZResult<ConnectionView> {
-        persist_auto_connect(&self.store, true)?;
+        write_auto_intent(
+            &self.store,
+            &self.auto_intent_generation,
+            AutoIntentClaim::Latest,
+            true,
+        )?;
         self.resume_auto_connect();
         // 未保存链接：交给 connect 按既有 `needs_config` 语义处置（不读保险箱）。
         if !self.read_configured() {
@@ -1445,7 +1541,12 @@ impl ZcodeHub {
     /// 同时置内存暂停并唤醒 worker：正在退避的旧轮次立即作废（H1），不会在用户手动
     /// 断开后自行补连；显式连接/授权成功会解除暂停。
     pub async fn disconnect_requested(&self) -> ZResult<ConnectionView> {
-        persist_auto_connect(&self.store, false)?;
+        write_auto_intent(
+            &self.store,
+            &self.auto_intent_generation,
+            AutoIntentClaim::Latest,
+            false,
+        )?;
         self.pause_auto_connect();
         Ok(self.disconnect().await)
     }
@@ -1458,15 +1559,24 @@ impl ZcodeHub {
     pub async fn forget_authorization(&self) -> ZResult<ConnectionView> {
         // 1) 暂停本轮自动连接（内存闸封住忘记与删除之间的 restore 窗口），并持久化。
         self.pause_auto_connect();
-        let auto_persisted = persist_auto_connect(&self.store, false).is_ok();
-        // 2) 推进控制代际、进入关闭窗口并断开 relay（关闭窗口阻止并发新连接）。
+        let auto_persisted = write_auto_intent(
+            &self.store,
+            &self.auto_intent_generation,
+            AutoIntentClaim::Latest,
+            false,
+        )
+        .is_ok();
+        // 2) 推进控制代际、进入关闭窗口（关闭窗口阻止并发新连接）。
         let (closed, guard) = self.begin_disconnect();
         let closed_generation = closed.generation;
         self.lock().authorized = false;
-        self.finish_disconnect(guard).await;
-        // 3) 后端清内存/取消旧 epoch/禁用恢复并删除持久记录（删除失败如实上报）。
+        // 3) **全程持关闭凭据**清后端内存/取消旧 epoch/禁用恢复并删除持久记录：
+        //    身份失效、删除与 relay 清理必须同处一个关闭窗口——否则 finish 先清位、
+        //    删除在途时 connect_requested 仍能经 restore 复活旧 JWT 并建连（P2-4）。
         let status = self.backend.forget_authorization().await;
-        // 4) 链接保留（不碰 config）；展示落「需要重新授权 / 需要配置」。
+        // 4) 断 relay、等在途 connect 收尾；凭据在此 Drop（陈旧 owner 零清理）清位。
+        self.finish_disconnect(guard).await;
+        // 5) 链接保留（不碰 config）；展示落「需要重新授权 / 需要配置」。
         //
         // 删除可能耗时：期间若更新的配置变更/断开/冲突已接管代际，更新者的状态优先，
         // 本步骤绝不覆盖；删除失败仍如实回错（已清/不恢复语义不变）。
@@ -1576,6 +1686,32 @@ impl ZcodeHub {
     #[cfg(test)]
     pub(crate) fn record_auto_attempt(&self) {
         self.auto_attempts.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// 测试观察口：当前意图代际（KICKED 预占/用户写都会推进它）。
+    #[cfg(test)]
+    fn auto_intent_generation(&self) -> u64 {
+        self.auto_intent_generation.load(Ordering::SeqCst)
+    }
+
+    /// 测试观察口：给下一次 KICKED 延迟写装两段闸，返回 `(放行, 完成)` 两端。
+    ///
+    /// 只影响测试构建；生产泵不编译探针字段，也没有任何等待。
+    #[cfg(test)]
+    fn install_kicked_intent_probe(
+        &self,
+    ) -> (std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>) {
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        *self.kicked_intent_probe.release.lock().unwrap() = Some(release_rx);
+        *self.kicked_intent_probe.done.lock().unwrap() = Some(done_tx);
+        (release_tx, done_rx)
+    }
+
+    /// 测试观察口：KICKED 延迟写是否已到闸前（取走放行端 = 已进入 blocking 任务）。
+    #[cfg(test)]
+    fn kicked_write_at_gate(&self) -> bool {
+        self.kicked_intent_probe.release.lock().unwrap().is_none()
     }
 
     pub(crate) fn auto_connect_paused(&self) -> bool {
@@ -1748,7 +1884,14 @@ impl ZcodeHub {
                 if out.state == ConnectionState::Conflict {
                     // KICKED 也可能作为本次 connect 的结果直接落定：同样持久暂停自动
                     // 连接；普通掉线/显式断开绝不动用户意图。
-                    if persist_auto_connect(&self.store, false).is_err() {
+                    if write_auto_intent(
+                        &self.store,
+                        &self.auto_intent_generation,
+                        AutoIntentClaim::Latest,
+                        false,
+                    )
+                    .is_err()
+                    {
                         // 只报失联事实：不打印 JWT/链接等任何凭据或目标。
                         log::warn!("ZCode KICKED：持久化自动暂停意图失败");
                     }
@@ -1851,6 +1994,11 @@ impl ZcodeHub {
         self.backend.disconnect().await;
         // 持锁清位：新 connect 只可能在清理完全结束后才被允许。
         drop(guard);
+        // P2-5：清位后补一次唤醒。关闭窗口内到达的唤醒只能让 worker 看到
+        // Offline/closing 并以 Stopped 消费掉；不补这一次，「快关快开」就丢了唤醒。
+        // 只唤醒不越权：worker 现查 auto 意图/remote.enabled/链接，用户断开（auto=false）
+        // 仍不会自动连接。
+        self.wake_auto_connect();
     }
 
     /// 用户显式断开：推进代际、保留 JWT，可再次连接。
@@ -1870,61 +2018,81 @@ impl ZcodeHub {
     /// 调用方只在 DB 保存**成功后**调用；保存失败保持原连接，不由本函数处置。
     /// 代际推进与「不可控」状态在**同一把锁**内落定：`reset` 在途的窗口里
     /// `connection()`/`session()` 绝不会看到「新代际 + 旧配对/旧投影/旧标签」。
+    ///
+    /// **清理窗口**（P2-3）：代际推进的同时置 `closing`，`reset`/`auth_status` 全程
+    /// 持 [`CloseGuard`]；窗口内 `connect`/自动连接一律被拒，旧清理不得覆盖新代际的
+    /// Offline/NeedsConfig，也不得让新目标被提前连上。清理结束后 drop 凭据清位，
+    /// 再唤醒自动连接（关闭窗口内被消费的唤醒不得丢）。
     pub async fn config_changed(&self) -> ConnectionView {
         // 新配置已由调用方落库；先读形态（本地 KV，非网络、不持锁）。
         let configured = self.read_configured();
-        let (view, stale) = {
+        let (view, guard) = self.begin_config_change(configured);
+        // 锁外断 relay、作废旧投影（不在任何锁内 await 网络）。reset 不清 JWT。
+        self.backend.reset(view.generation).await;
+        // 以 AuthService 的权威状态落最终展示：已授权 → offline（可直接连新目标）。
+        let status = self.backend.auth_status();
+        let out = {
+            let mut inner = self.lock();
+            // 期间又发生了更新的配置变更/断开：以更新者的状态为准。
+            if inner.generation != view.generation {
+                inner.view()
+            } else {
+                inner.configured = configured;
+                inner.authorized = status.authorized;
+                inner.state = configured_state(configured, status.authorized);
+                inner.reason_code = None;
+                inner.device_label = None;
+                inner.relay_floor = inner.relay_generation;
+                let out = inner.view();
+                drop(inner);
+                if out != view {
+                    self.emit_connection(&out);
+                }
+                out
+            }
+        };
+        // 只看仍是本窗口的凭据清位：更新的配置变更已接管时绝不清它的新窗口。
+        drop(guard);
+        // 清位后补一次唤醒：清理窗口内 worker 只能看到 Offline/closing，唤醒许可
+        // 已被本轮消费；这里不补，快关快开的唤醒就丢了（gate 现查 intent/remote）。
+        self.wake_auto_connect();
+        out
+    }
+
+    /// 配置变更第一阶段（同步、锁内）：推进代际、置 `closing`、落新形态并降级旧投影，
+    /// 返回 `(视图, 关闭凭据)`。
+    ///
+    /// `closing` 与 `begin_disconnect` 同规：凭据 Drop 时**仅当仍是本 epoch** 才清位，
+    /// 因此更新的配置变更接管后，旧清理既不清新窗口、也不覆盖新代际状态。
+    fn begin_config_change(&self, configured: bool) -> (ConnectionView, CloseGuard) {
+        let (view, stale, epoch) = {
             let mut inner = self.lock();
             inner.generation = inner.generation.wrapping_add(1);
             let generation = inner.generation;
             inner.configured = configured;
             // 不无条件清 authorized：reset 只断连接、不清账号 JWT。
-            inner.state = if !configured {
-                ConnectionState::NeedsConfig
-            } else if inner.authorized {
-                ConnectionState::Offline
-            } else {
-                ConnectionState::NeedsAuth
-            };
+            inner.state = configured_state(configured, inner.authorized);
             inner.reason_code = None;
             inner.device_label = None;
             // reset 之前到达的旧 relay 状态（含 reset 触发的 offline）一律丢弃。
             inner.relay_floor = inner.relay_generation;
+            // 清理窗口：reset/auth_status 在途期间拒绝新连接与旧 relay 状态回写。
+            inner.closing = Some(generation);
             let view = inner.view();
             let stale = inner.stale_sessions(generation);
-            (view, stale)
+            (view, stale, generation)
         };
         self.emit_connection(&view);
         for stale in &stale {
             self.emit_session(stale);
         }
-        // 锁外断 relay、作废旧投影（不在任何锁内 await 网络）。reset 不清 JWT。
-        self.backend.reset(view.generation).await;
-        // 以 AuthService 的权威状态落最终展示：已授权 → offline（可直接连新目标）。
-        let status = self.backend.auth_status();
-        let mut inner = self.lock();
-        // 期间又发生了更新的配置变更/断开：以更新者的状态为准。
-        if inner.generation != view.generation {
-            return inner.view();
-        }
-        inner.configured = configured;
-        inner.authorized = status.authorized;
-        inner.state = if !configured {
-            ConnectionState::NeedsConfig
-        } else if status.authorized {
-            ConnectionState::Offline
-        } else {
-            ConnectionState::NeedsAuth
-        };
-        inner.reason_code = None;
-        inner.device_label = None;
-        inner.relay_floor = inner.relay_generation;
-        let out = inner.view();
-        drop(inner);
-        if out != view {
-            self.emit_connection(&out);
-        }
-        out
+        (
+            view,
+            CloseGuard {
+                inner: self.inner.clone(),
+                epoch,
+            },
+        )
     }
 
     /// 读取精确目标的会话投影（只接受当前代际内可精确绑定的 Tuvis sessionId）。
@@ -2384,6 +2552,10 @@ mod tests {
         /// `forget_authorization` 被调用次数与替身应答。
         forget_calls: AtomicUsize,
         forget_result: Mutex<Option<AuthStatus>>,
+        /// `forget_authorization` 的一次性闸：第一次调用等待放行（替身删除/清内存在途）。
+        forget_gate: Mutex<Option<Arc<Notify>>>,
+        /// 替身是否持有账号 JWT（authorize/restore 置位、forget 清除）。
+        jwt: AtomicBool,
     }
 
     impl FakeBackend {
@@ -2411,6 +2583,11 @@ mod tests {
         /// 设定 `forget_authorization` 的替身应答（如 `DeleteFailed`）。
         fn set_forget_result(&self, status: AuthStatus) {
             self.forget_result.lock().unwrap().replace(status);
+        }
+
+        /// 替身当前是否持有账号 JWT（忘记后必须为 false）。
+        fn holds_jwt(&self) -> bool {
+            self.jwt.load(Ordering::SeqCst)
         }
 
         /// 设定 `required_capabilities` 的应答（缺省 = `["single_select"]`，与既有
@@ -2441,6 +2618,7 @@ mod tests {
                 provider: Some(provider),
                 problem: None,
             };
+            self.jwt.store(true, Ordering::SeqCst);
             Box::pin(async { Ok(()) })
         }
 
@@ -2457,6 +2635,9 @@ mod tests {
                     restored
                 }
             };
+            if current.authorized {
+                self.jwt.store(true, Ordering::SeqCst);
+            }
             Box::pin(async move { current })
         }
 
@@ -2466,14 +2647,24 @@ mod tests {
 
         fn forget_authorization<'a>(&'a self) -> BoxFuture<'a, AuthStatus> {
             self.forget_calls.fetch_add(1, Ordering::SeqCst);
+            let gate = self.forget_gate.lock().unwrap().take();
             let status = self
                 .forget_result
                 .lock()
                 .unwrap()
                 .clone()
                 .unwrap_or_default();
-            *self.auth_state.lock().unwrap() = status.clone();
-            Box::pin(async move { status })
+            Box::pin(async move {
+                // 删除/清内存在途：闸放行前 AuthService 仍持有旧 JWT（正是要封的窗口）。
+                if let Some(gate) = gate {
+                    gate.notified().await;
+                }
+                *self.auth_state.lock().unwrap() = status.clone();
+                // 持久记录已删除 = 之后的 restore 不再返回已授权（替身的最简建模）。
+                *self.restored_auth.lock().unwrap() = status.clone();
+                self.jwt.store(false, Ordering::SeqCst);
+                status
+            })
         }
 
         fn connect<'a>(&'a self, route: DeviceRoute) -> BoxFuture<'a, ZResult<ConnectionView>> {
@@ -3683,6 +3874,132 @@ mod tests {
         let done = changing.await.unwrap();
         assert_eq!(done.state, ConnectionState::Offline);
         assert_eq!(done.generation, during.generation);
+    }
+
+    /// P2-3：`config_changed` 的 `reset`/`auth_status` 清理期间必须处于关闭窗口——
+    /// 显式连接与自动连接都不得提前连上新目标；清理结束后清位、可重连。
+    #[tokio::test]
+    async fn config_change_cleanup_window_blocks_connect_and_auto() {
+        let fake = Arc::new(FakeBackend::default());
+        fake.set_restored_auth(authorized_auth());
+        let store = stored(URL);
+        set_remote_enabled(&store, true);
+        let hub = Arc::new(ZcodeHub::with_parts(
+            store.clone(),
+            fake.clone(),
+            send_policy(),
+        ));
+        hub.start_auto_connect();
+        wait_for_connection(&hub, ConnectionState::Paired).await;
+        let paired = hub.connection();
+        let connects_before = fake.connect_calls.load(Ordering::SeqCst);
+
+        let gate = Arc::new(Notify::new());
+        fake.reset_gate.lock().unwrap().replace(gate.clone());
+        let changing = {
+            let hub = hub.clone();
+            tokio::spawn(async move { hub.config_changed().await })
+        };
+        wait_until(|| fake.reset_calls.load(Ordering::SeqCst) == 1).await;
+
+        // reset 在途：关闭窗口内 connect 必须立即 offline 且零后端连接。
+        assert_eq!(hub.connection().state, ConnectionState::Offline);
+        let err = hub.connect().await.unwrap_err();
+        assert!(
+            err.is(codes::OFFLINE),
+            "清理窗口内必须 offline，实际 {err:?}"
+        );
+        assert_eq!(
+            fake.connect_calls.load(Ordering::SeqCst),
+            connects_before,
+            "清理窗口内不得提前连新目标"
+        );
+
+        // auto 唤醒同样被关闭窗口拒绝（worker 确实跑过一次，但不连接）。
+        let attempts = hub.auto_attempt_count();
+        hub.wake_auto_connect();
+        wait_for_auto_attempt(&hub, attempts + 1).await;
+        assert_eq!(
+            fake.connect_calls.load(Ordering::SeqCst),
+            connects_before,
+            "清理窗口内自动连接不得连新目标"
+        );
+        assert_eq!(hub.connection().state, ConnectionState::Offline);
+
+        // 放行 reset：清位后必须可重连（旧清理不得把新代际留在 Offline）。
+        gate.notify_one();
+        let changed = changing.await.expect("spawn 不应 panic");
+        assert_eq!(changed.generation, paired.generation + 1);
+        assert_eq!(changed.state, ConnectionState::Offline);
+        assert!(hub.lock().closing.is_none(), "reset 结束后关闭窗口必须清位");
+        wait_for_connection(&hub, ConnectionState::Paired).await;
+        assert_eq!(
+            fake.connect_calls.load(Ordering::SeqCst),
+            connects_before + 1,
+            "清理结束后只允许一次新连接"
+        );
+    }
+
+    /// P2-3：重叠的配置变更——旧窗口的清理结束时不得清掉新窗口的 `closing`，
+    /// 也不得把新代际的展示状态覆盖回去。
+    #[tokio::test]
+    async fn stale_config_change_guard_cannot_clear_newer_closing() {
+        let fake = Arc::new(FakeBackend::default());
+        // 已配对：配置变更必须断旧连接；JWT 保留（fake 已授权）。
+        let hub = paired_hub(fake.clone()).await;
+        let paired = hub.connection();
+        let connects_before = fake.connect_calls.load(Ordering::SeqCst);
+
+        let gate = Arc::new(Notify::new());
+        fake.reset_gate.lock().unwrap().replace(gate.clone());
+        let first = {
+            let hub = hub.clone();
+            tokio::spawn(async move { hub.config_changed().await })
+        };
+        wait_until(|| fake.reset_calls.load(Ordering::SeqCst) == 1).await;
+        let after_first = hub.connection();
+        assert!(after_first.generation > paired.generation);
+
+        // 第二次配置变更接管：写入更高的关闭窗口。
+        let second = {
+            let hub = hub.clone();
+            tokio::spawn(async move { hub.config_changed().await })
+        };
+        wait_until(|| fake.reset_calls.load(Ordering::SeqCst) == 2).await;
+        let newer = hub.connection();
+        assert!(newer.generation > after_first.generation);
+        assert_eq!(newer.state, ConnectionState::Offline);
+
+        // 新窗口生效：connect 被拒绝且零后端连接。
+        let err = hub.connect().await.unwrap_err();
+        assert!(err.is(codes::OFFLINE), "新关闭窗口必须生效，实际 {err:?}");
+        assert_eq!(fake.connect_calls.load(Ordering::SeqCst), connects_before);
+
+        // 放行较早的清理：结束后它的旧凭据不得清新窗口，也不得覆盖新代际视图。
+        gate.notify_one();
+        let first_view = first.await.expect("spawn 不应 panic");
+        assert_eq!(
+            first_view.generation, newer.generation,
+            "旧清理不得覆盖新代际状态"
+        );
+        assert_eq!(
+            hub.lock().closing,
+            Some(newer.generation),
+            "旧 guard 不得清掉新窗口"
+        );
+        assert!(hub.connect().await.unwrap_err().is(codes::OFFLINE));
+
+        // 放行较新的清理：它清位后显式重连可达。
+        gate.notify_one();
+        let second_view = second.await.expect("spawn 不应 panic");
+        assert_eq!(second_view.generation, newer.generation);
+        assert!(hub.lock().closing.is_none(), "新窗口结束后必须清位");
+        let reconnected = hub.connect().await.expect("清理结束后必须可重连");
+        assert!(reconnected.is_paired());
+        assert_eq!(
+            fake.connect_calls.load(Ordering::SeqCst),
+            connects_before + 1
+        );
     }
 
     /// KICKED（conflict）是终态：不自动重连，只有显式断开/配置变更才复位。
@@ -5928,6 +6245,193 @@ mod tests {
         hub.wake_auto_connect();
         wait_for_auto_attempt(&hub, attempts + 1).await;
         assert_eq!(fake.connect_calls.load(Ordering::SeqCst), connects);
+    }
+
+    /// P2-4：忘授权的关闭窗口必须覆盖**身份清 + 持久删除 + relay 清理**整段——
+    /// 删除在途时 `connect_requested` 不得用旧 JWT 建连；放行后 needs_auth、JWT 清、
+    /// 记录删，显式连接不再拿旧凭据。
+    #[tokio::test]
+    async fn forget_holds_closing_through_identity_delete() {
+        let fake = Arc::new(FakeBackend::default());
+        fake.set_restored_auth(authorized_auth());
+        let store = stored(URL);
+        set_remote_enabled(&store, true);
+        let hub = Arc::new(ZcodeHub::with_parts(
+            store.clone(),
+            fake.clone(),
+            send_policy(),
+        ));
+        hub.start_auto_connect();
+        wait_for_connection(&hub, ConnectionState::Paired).await;
+        assert!(fake.holds_jwt(), "前置：替身持有账号 JWT");
+        let connects_before = fake.connect_calls.load(Ordering::SeqCst);
+
+        // 删除闸：forget 进入后停在替身内（AuthService 仍持有旧 JWT 的窗口）。
+        let gate = Arc::new(Notify::new());
+        fake.forget_gate.lock().unwrap().replace(gate.clone());
+        let forgetting = {
+            let hub = hub.clone();
+            tokio::spawn(async move { hub.forget_authorization().await })
+        };
+        wait_until(|| fake.forget_calls.load(Ordering::SeqCst) == 1).await;
+
+        // 身份缓存已清、自动连接已暂停，但删除在途：关闭窗口必须仍拒绝连接。
+        assert!(
+            fake.holds_jwt(),
+            "删除在途时替身仍持有旧 JWT（正是要封的窗口）"
+        );
+        assert!(hub.auto_connect_paused(), "忘记必须先置内存暂停");
+        let err = hub.connect_requested().await.unwrap_err();
+        assert!(
+            err.is(codes::OFFLINE),
+            "删除在途必须立即 offline（不得用旧 JWT 建连），实际 {err:?}"
+        );
+        assert_eq!(
+            fake.connect_calls.load(Ordering::SeqCst),
+            connects_before,
+            "关闭窗口内不得用旧 JWT 建连"
+        );
+
+        gate.notify_one();
+        let view = forgetting
+            .await
+            .expect("spawn 不应 panic")
+            .expect("忘记必须成功");
+        assert_eq!(view.state, ConnectionState::NeedsAuth);
+        assert_eq!(fake.forget_calls.load(Ordering::SeqCst), 1, "不得重复删除");
+        assert!(!fake.holds_jwt(), "JWT 必须已清");
+        assert!(!hub.auth_status().authorized);
+        assert!(
+            !hub.auth_status().remembered,
+            "持久记录已删除：替身恢复不再返回已授权"
+        );
+        assert!(hub.lock().closing.is_none(), "忘记结束后关闭窗口必须清位");
+
+        // guard 释放后显式连接不拿旧 JWT：needs_auth 且零后端连接。
+        let err = hub.connect_requested().await.unwrap_err();
+        assert!(err.is(codes::NEEDS_AUTH), "实际 {err:?}");
+        assert_eq!(
+            fake.connect_calls.load(Ordering::SeqCst),
+            connects_before,
+            "忘记后显式连接不得触达后端连接"
+        );
+    }
+
+    /// P2-5：关闭窗口内被消费的自动连接唤醒不得丢——`finish_disconnect` 清位后必须
+    /// 再唤醒一次；用户断开（auto=false）语义不变。
+    #[tokio::test]
+    async fn finish_disconnect_wakes_auto_after_fast_reopen() {
+        let fake = Arc::new(FakeBackend::default());
+        fake.set_restored_auth(authorized_auth());
+        let store = stored(URL);
+        set_remote_enabled(&store, true);
+        let hub = Arc::new(ZcodeHub::with_parts(
+            store.clone(),
+            fake.clone(),
+            send_policy(),
+        ));
+        hub.start_auto_connect();
+        wait_for_connection(&hub, ConnectionState::Paired).await;
+        let connects_before = fake.connect_calls.load(Ordering::SeqCst);
+
+        // 快关：关闭窗口内唤醒 worker——它只能看到 closing，唤醒许可被本轮消费。
+        let (_view, guard) = hub.begin_disconnect();
+        let attempts = hub.auto_attempt_count();
+        hub.wake_auto_connect();
+        wait_for_auto_attempt(&hub, attempts + 1).await;
+        assert_eq!(
+            fake.connect_calls.load(Ordering::SeqCst),
+            connects_before,
+            "关闭窗口内不得连接"
+        );
+
+        // 快开：finish 清位后必须补一次唤醒，否则上面那次唤醒就丢了。
+        hub.finish_disconnect(guard).await;
+        wait_until(|| fake.connect_calls.load(Ordering::SeqCst) > connects_before).await;
+        wait_for_connection(&hub, ConnectionState::Paired).await;
+        assert_eq!(
+            fake.connect_calls.load(Ordering::SeqCst),
+            connects_before + 1
+        );
+    }
+
+    /// P2-5：finish 的补唤醒只做一次现查判定——用户明确断开（auto=false）仍不连接。
+    #[tokio::test]
+    async fn finish_disconnect_wake_keeps_manual_disconnect_intent() {
+        let fake = Arc::new(FakeBackend::default());
+        fake.set_restored_auth(authorized_auth());
+        let store = stored(URL);
+        set_remote_enabled(&store, true);
+        let hub = Arc::new(ZcodeHub::with_parts(
+            store.clone(),
+            fake.clone(),
+            send_policy(),
+        ));
+        hub.start_auto_connect();
+        wait_for_connection(&hub, ConnectionState::Paired).await;
+        let connects_before = fake.connect_calls.load(Ordering::SeqCst);
+
+        let view = hub.disconnect_requested().await.unwrap();
+        assert_eq!(view.state, ConnectionState::Offline);
+        assert_eq!(stored_auto(&store).as_deref(), Some("false"));
+        let attempts = hub.auto_attempt_count();
+        hub.wake_auto_connect();
+        wait_for_auto_attempt(&hub, attempts + 1).await;
+        settle().await;
+        assert_eq!(
+            fake.connect_calls.load(Ordering::SeqCst),
+            connects_before,
+            "用户断开 auto=false：finish 的补唤醒不得自动重连"
+        );
+        assert_eq!(hub.connection().state, ConnectionState::Offline);
+    }
+
+    /// P2-6：事件路径——KICKED 的延迟写携带事件到达时的旧代际，用户之后的显式
+    /// 连接（true，更高代）绝不能被它覆盖。
+    #[tokio::test]
+    async fn kicked_late_write_cannot_override_newer_user_intent() {
+        let fake = Arc::new(FakeBackend::default());
+        fake.set_restored_auth(authorized_auth());
+        let store = stored(URL);
+        set_remote_enabled(&store, true);
+        let (hub, events, _pump) = pumped(store.clone(), fake.clone(), send_policy());
+        hub.start_auto_connect();
+        wait_for_connection(&hub, ConnectionState::Paired).await;
+
+        // KICKED 落库闸：事件到达即预占代际，真正的写被挂在 blocking 池上。
+        let (release, done) = hub.install_kicked_intent_probe();
+        events
+            .send(RelayEvent::State(relay_view(ConnectionState::Conflict, 7)))
+            .await
+            .unwrap();
+        wait_until(|| hub.connection().state == ConnectionState::Conflict).await;
+        // 等延迟写真正到闸前（此后它的落库顺序完全由测试决定）。
+        wait_until(|| hub.kicked_write_at_gate()).await;
+        let captured = hub.auto_intent_generation();
+        assert!(captured > 0, "KICKED 事件到达必须预占意图代际");
+
+        // 用户在事件之后显式连接：意图 true，代际更高。
+        let err = hub.connect_requested().await.unwrap_err();
+        assert!(err.is(codes::CONFLICT));
+        assert!(
+            hub.auto_intent_generation() > captured,
+            "用户写必须预占更高代"
+        );
+        assert_eq!(
+            stored_auto(&store).as_deref(),
+            Some("true"),
+            "用户显式连接必须落 true"
+        );
+
+        // 放行迟到的 KICKED 写：代际已过期，必须跳过而不是覆盖。
+        release.send(()).unwrap();
+        done.recv_timeout(Duration::from_secs(2))
+            .expect("KICKED 延迟写任务必须完成");
+        assert_eq!(
+            stored_auto(&store).as_deref(),
+            Some("true"),
+            "迟到的 KICKED 写不得覆盖用户更新的意图"
+        );
     }
 
     /// KICKED（relay conflict）进入时持久 auto=false 并停止本轮，唤醒也不重连。
