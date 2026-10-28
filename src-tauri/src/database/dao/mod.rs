@@ -21,3 +21,4 @@ pub mod usage_alias;
 pub mod usage_billing;
 pub mod usage_model_config;
 pub mod write_audit;
+pub mod zcode_capability;

@@ -44,6 +44,24 @@ impl CapabilityKey {
             probe_epoch,
         }
     }
+
+    /// 账本存储键（spec R6 `zcode_capability_evidence.key` 列）：五字段确定性拼接
+    /// `platform|app_build|protocol|schema_fingerprint|epoch`。只含上述字段——
+    /// 全部是 build 指纹类标识，不含凭据/令牌；任一字段变化即不同 storage key，
+    /// 旧账本记录天然失配（失效单元语义，见模块文档）。
+    ///
+    /// 字段来源均为受控标识（platform 枚举、build 版本串、探针指纹哈希、u32 epoch），
+    /// 不做 `|` 转义——与 `codex_ipc_probe.probe_key` 的既有拼接惯例一致。
+    pub(crate) fn to_storage_key(&self) -> String {
+        format!(
+            "{}|{}|{}|{}|{}",
+            self.platform,
+            self.app_build,
+            self.protocol_version,
+            self.schema_fingerprint,
+            self.probe_epoch
+        )
+    }
 }
 
 /// 查询已知 build 的 shipped 状态表（spec §6.3）。
@@ -86,6 +104,34 @@ mod tests {
         let c = CapabilityKey::new("macos", "3.16.2.8769", 3, "shape-a", 2);
         assert_ne!(a, b);
         assert_ne!(a, c);
+    }
+
+    /// T2 账本存储键（spec R6）：五字段确定性拼接，**不含凭据**；任一字段变化
+    /// 产生不同 storage key（「key 变化不命中旧记录」的验收点）。
+    #[test]
+    fn storage_key_distinguishes_all_five_fields() {
+        let base = CapabilityKey::new("macos", "3.16.2.8769", 3, "shape-a", 1);
+        let others = [
+            CapabilityKey::new("windows", "3.16.2.8769", 3, "shape-a", 1),
+            CapabilityKey::new("macos", "3.16.2.9999", 3, "shape-a", 1),
+            CapabilityKey::new("macos", "3.16.2.8769", 4, "shape-a", 1),
+            CapabilityKey::new("macos", "3.16.2.8769", 3, "shape-b", 1),
+            CapabilityKey::new("macos", "3.16.2.8769", 3, "shape-a", 2),
+        ];
+        assert_eq!(
+            base.to_storage_key(),
+            base.to_storage_key(),
+            "同 key 必须得到同 storage key"
+        );
+        for other in others {
+            assert_ne!(
+                base.to_storage_key(),
+                other.to_storage_key(),
+                "任一字段变化必须改变 storage key"
+            );
+        }
+        // 拼接序固定：platform|app_build|protocol|schema_fingerprint|epoch
+        assert_eq!(base.to_storage_key(), "macos|3.16.2.8769|3|shape-a|1");
     }
 
     /// brief Step 1 逐字用例：shipped 表只命中精确 build。
