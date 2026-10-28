@@ -1325,6 +1325,9 @@ fn wake_zcode_hub_auto_connect() {
 /// 同一 Hub 的自动连接 worker。由 `lib.rs` 在 `restore_on_launch` 之后调用；本函数
 /// 立即返回，不等待保险箱、不阻塞 Tauri 主线程。Hub 未配置/远程未启用时 worker 按
 /// 现查前置条件 no-op（零连接）。
+///
+/// P2-7：这里那次恢复即「启动恢复」——worker 复用内存快照，**不再第二次读原生存储**；
+/// 用户显式 connect 仍可重试恢复。
 pub(crate) fn start_zcode_auto_connect_after_restore(
     hub: std::sync::Arc<crate::services::zcode_control::ZcodeHub>,
 ) {
@@ -4789,9 +4792,9 @@ mod zcode_wiring_tests {
     use crate::database::dao::settings::try_set_setting_conn;
     use crate::remote::pairing::DeviceStore;
     use crate::services::zcode_control::{
-        codes, set_config, ActionContext, ActionReceipt, AuthStatus, BoundTarget, CapabilityView,
-        ConnectionState, ConnectionView, ControlAction, DeviceRoute, HubBackend, OAuthProvider,
-        OpenAuthorize, SessionView, TargetKey, ZResult, ZcodeError, ZcodeHub,
+        codes, set_config, ActionContext, ActionReceipt, AuthProblem, AuthStatus, BoundTarget,
+        CapabilityView, ConnectionState, ConnectionView, ControlAction, DeviceRoute, HubBackend,
+        OAuthProvider, OpenAuthorize, SessionView, TargetKey, ZResult, ZcodeError, ZcodeHub,
     };
 
     const URL: &str = "https://zcode.z.ai/remote/v4?sid=synthetic-wire-0001&name=SyntheticWire";
@@ -4810,6 +4813,8 @@ mod zcode_wiring_tests {
         /// C4 启动/唤醒接线：后端是否持有可用授权（默认未授权 = 无 OAuth 记录）。
         authorized: AtomicBool,
         remembered: AtomicBool,
+        /// 恢复结果的 problem（如系统保险箱锁定）；`None` = 无问题。
+        problem: Mutex<Option<AuthProblem>>,
         restore_calls: AtomicUsize,
     }
 
@@ -4844,6 +4849,7 @@ mod zcode_wiring_tests {
             AuthStatus {
                 authorized: self.authorized.load(Ordering::SeqCst),
                 remembered: self.remembered.load(Ordering::SeqCst),
+                problem: *self.problem.lock().unwrap(),
                 ..AuthStatus::default()
             }
         }
@@ -4999,9 +5005,10 @@ mod zcode_wiring_tests {
         .await;
         assert_eq!(fake.authorize_calls.load(Ordering::SeqCst), 0, "不得 OAuth");
         assert_eq!(fake.connect_calls.load(Ordering::SeqCst), 1);
-        assert!(
-            fake.restore_calls.load(Ordering::SeqCst) >= 1,
-            "启动必须先读取系统存储授权"
+        assert_eq!(
+            fake.restore_calls.load(Ordering::SeqCst),
+            1,
+            "启动助手恢复 + worker 尝试合计只允许读一次系统存储"
         );
     }
 
@@ -5035,6 +5042,111 @@ mod zcode_wiring_tests {
             "无授权不得连接"
         );
         assert_eq!(hub.connection().state, ConnectionState::NeedsAuth);
+    }
+
+    /// P2-7：启动恢复失败（系统保险箱锁定）后 worker 不得再读一次原生存储。
+    ///
+    /// gate 全开（remote.enabled + auto=true + 链接已保存）：旧实现 worker 会再调一次
+    /// `restore_authorization`，restore 次数变 2；启动恢复只允许尝试一次。
+    #[tokio::test]
+    async fn startup_wiring_locked_restore_is_attempted_only_once() {
+        let fake = Arc::new(FakeBackend::default());
+        *fake.problem.lock().unwrap() = Some(AuthProblem::LockedOrDenied);
+        let store = stored(URL);
+        store
+            .with(|conn| try_set_setting_conn(conn, KEY_ENABLED, "true"))
+            .unwrap();
+        let hub = fake_hub(fake.clone(), store);
+
+        start_zcode_auto_connect_after_restore(hub.clone());
+        wait_until(
+            || hub.auto_attempt_count() >= 1,
+            "worker 必须在 gate 全开时跑完首次尝试",
+        )
+        .await;
+        wait_until(
+            || hub.auth_status().problem == Some(AuthProblem::LockedOrDenied),
+            "首次恢复的锁定问题必须保留在状态里",
+        )
+        .await;
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            fake.restore_calls.load(Ordering::SeqCst),
+            1,
+            "锁定失败也只允许尝试一次启动恢复"
+        );
+        assert_eq!(
+            fake.connect_calls.load(Ordering::SeqCst),
+            0,
+            "锁定未授权不得连接"
+        );
+        assert_eq!(fake.authorize_calls.load(Ordering::SeqCst), 0, "不得 OAuth");
+        assert_eq!(hub.connection().state, ConnectionState::NeedsAuth);
+    }
+
+    /// P2-7：启动恢复无凭据（失败）后 worker 打开 gate 也不得二次恢复；零连接零 OAuth。
+    #[tokio::test]
+    async fn auto_worker_never_reads_native_store_after_startup_restore() {
+        let fake = Arc::new(FakeBackend::default());
+        let store = stored(URL);
+        store
+            .with(|conn| try_set_setting_conn(conn, KEY_ENABLED, "true"))
+            .unwrap();
+        let hub = fake_hub(fake.clone(), store);
+
+        start_zcode_auto_connect_after_restore(hub.clone());
+        wait_until(
+            || hub.auto_attempt_count() >= 1,
+            "gate 全开时 worker 必须跑完首次尝试",
+        )
+        .await;
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            fake.restore_calls.load(Ordering::SeqCst),
+            1,
+            "启动恢复只允许尝试一次（worker 不得再读原生存储）"
+        );
+        assert_eq!(fake.connect_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(fake.authorize_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(hub.connection().state, ConnectionState::NeedsAuth);
+    }
+
+    /// P2-7：显式 connect 是用户点击重试，不受「启动只恢复一次」限制。
+    #[tokio::test]
+    async fn explicit_connect_still_restores_after_startup_attempt() {
+        let fake = Arc::new(FakeBackend::default());
+        let store = stored(URL);
+        store
+            .with(|conn| try_set_setting_conn(conn, KEY_ENABLED, "true"))
+            .unwrap();
+        let hub = fake_hub(fake.clone(), store);
+
+        start_zcode_auto_connect_after_restore(hub.clone());
+        wait_until(
+            || fake.restore_calls.load(Ordering::SeqCst) >= 1,
+            "启动助手必须先恢复一次",
+        )
+        .await;
+        wait_until(
+            || hub.auto_attempt_count() >= 1,
+            "worker 必须跑完首次尝试（不得二次恢复）",
+        )
+        .await;
+        assert_eq!(fake.restore_calls.load(Ordering::SeqCst), 1);
+
+        // 用户点击连接：未授权 → 显式重试恢复（仍不打开浏览器/不连接）。
+        assert!(hub.connect_requested().await.is_err());
+        assert_eq!(
+            fake.restore_calls.load(Ordering::SeqCst),
+            2,
+            "显式 connect 必须能再次触发恢复"
+        );
+        assert_eq!(fake.authorize_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(fake.connect_calls.load(Ordering::SeqCst), 0);
     }
 
     /// C4 启动顺序可证伪用例：远程关闭 + auto=false（worker gate 必不通过），

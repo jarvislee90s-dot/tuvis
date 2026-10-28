@@ -3,6 +3,8 @@
 //! - 每次尝试都**现查**前置条件：远程总开关、用户自动连接意图、已保存链接、
 //!   Hub 不在关闭/冲突/已配对/握手中；任一不满足就停，绝不自动 OAuth；
 //! - 授权缺失时先经 [`ZcodeHub::restore_authorization`] 读系统存储，仍无效即停；
+//!   **启动恢复只尝试一次**：助手已恢复过（成功/锁定/失败都算）后，worker 只读内存
+//!   快照，不再第二次读原生存储；显式 `connect_requested` 仍可重试恢复；
 //! - 连接只调用既有 [`ZcodeHub::connect`]，共用 `connect_lock` 与关闭纪元；
 //!   本模块不调用 `execute`，不恢复任何写动作。
 //!
@@ -183,7 +185,13 @@ impl ZcodeHub {
         if !gate.allows() || !self.auto_connect_runtime_ready() {
             return AutoAttempt::Stopped;
         }
-        let status = self.restore_authorization().await;
+        // 启动恢复只尝试一次：助手已恢复过（成功/锁定/失败都算）就不再读原生存储，
+        // 本次尝试只用内存快照；用户显式 connect 仍可经 Hub 重试恢复。
+        let status = if self.auto_restore_attempted() {
+            self.auth_status()
+        } else {
+            self.restore_authorization().await
+        };
         if !status.authorized {
             // 恢复失败/无凭据：保持 needs_auth，绝不自动打开浏览器、不重试。
             return AutoAttempt::Stopped;

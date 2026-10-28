@@ -51,6 +51,8 @@ RED 证据：测试写完后，临时在 `AuthService::restore` 顶部插入 `re
 
 日志：`/tmp/h3-red.log`、`/tmp/h3-green-wire.log`。
 
+P2-2 补充（2026-10-28）：恢复标记按构建命名空间隔离——正式版 `remote.zcode_restore_allowed`、debug `remote.zcode_restore_allowed.dev`；旧共享键忽略（不迁移，功能未发布，debug 与正式互不影响）。证据见 `cargo test --lib services::zcode_control::credential_store` 的 `restore_marker_keys_are_namespaced_per_build`。
+
 ### 3.2 集成套件与全量测试
 
 | 命令 | 结果 | 退出码 |

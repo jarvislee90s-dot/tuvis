@@ -43,7 +43,7 @@ use tokio::sync::{mpsc, oneshot, Mutex as AsyncMutex};
 use super::credential_store::{
     CredentialError, CredentialStore, StoreResult, StoredCredential, SCHEMA_VERSION,
 };
-use super::types::{ZResult, ZcodeError};
+use super::types::{codes, ZResult, ZcodeError};
 
 /// 授权回调等待上限：到点关闭回环监听并以 `needs_auth` 收尾。
 /// 这是 Tuvis 自定的新策略（不冒称官方 TTL）。
@@ -219,7 +219,9 @@ pub struct AuthService {
     /// 系统存储 I/O 单飞锁：owned guard 随 blocking 任务存活到实际 OS 调用结束，
     /// 调用方超时/取消不会让仍在执行的写入脱离串行约束。`AuthState` 锁不跨越 I/O。
     store_lock: Arc<AsyncMutex<()>>,
-    state: Mutex<AuthState>,
+    /// 授权状态；`Arc` 让阻塞存储任务能在**仍持存储单飞锁**时落账「删除义务已完成」
+    /// （见 [`Self::purge_pending`]），排队的第二个 purge 复核时必然看到最新状态。
+    state: Arc<Mutex<AuthState>>,
 }
 
 #[derive(Default)]
@@ -246,6 +248,11 @@ struct AuthState {
     problem: Option<AuthProblem>,
     /// forget 后的内存级恢复禁用；新授权保存成功才重新允许恢复。
     restore_blocked: bool,
+    /// 尚未完成的**删除义务**（forget 登记）：epoch 推进不取消它。
+    ///
+    /// 旧实现让删除跟随 epoch 判定是否执行，新授权一旦推进 epoch，忘记排队的删除就被
+    /// 跳过，旧记录可能留在存储里、在重启后被恢复。删除成功（或确认新记录已接管）才清。
+    purge_pending: bool,
 }
 
 /// 回环回调的终局。
@@ -266,7 +273,7 @@ impl AuthService {
             callback_timeout: AUTHORIZE_TIMEOUT,
             credential_store: None,
             store_lock: Arc::new(AsyncMutex::new(())),
-            state: Mutex::new(AuthState::default()),
+            state: Arc::new(Mutex::new(AuthState::default())),
         }
     }
 
@@ -293,7 +300,7 @@ impl AuthService {
             callback_timeout: AUTHORIZE_TIMEOUT,
             credential_store: None,
             store_lock: Arc::new(AsyncMutex::new(())),
-            state: Mutex::new(AuthState::default()),
+            state: Arc::new(Mutex::new(AuthState::default())),
         }
     }
 
@@ -310,6 +317,10 @@ impl AuthService {
     /// 失败一律以冻结码收尾（超时/被取消/被拒 → `needs_auth`，网络不可达 → `offline`，
     /// 响应形态异常 → `unknown`）；错误不含 URL/state/code/JWT。
     pub async fn authorize(&self, provider: OAuthProvider, open: OpenAuthorize) -> ZResult<()> {
+        // 0) 忘记遗留的删除义务必须先完成：旧记录没删掉就开新授权，一旦新授权失败/
+        //    被取消，重启可能把旧记录恢复成新身份。删除失败时零浏览器、零 OAuth。
+        self.flush_pending_purge().await?;
+
         // 1) 回环监听：只 bind 127.0.0.1 的随机空闲端口（不接受外部地址）
         let listener = TcpListener::bind(("127.0.0.1", 0))
             .await
@@ -470,6 +481,16 @@ impl AuthService {
     /// - 无存储适配口、恢复已被忘记禁用、或有在途授权：只返回内存快照；
     /// - 读取问题（锁定/不可用/损坏/超限）如实报 `problem`，绝不自动打开浏览器。
     pub async fn restore(&self) -> AuthStatus {
+        // 0) 忘记遗留的删除义务：旧记录未真正删除之前不得读取，否则本次恢复会把它
+        //    当成当前身份（删除失败如实报 problem，零 load）。
+        let (purge_pending, purge_epoch) = {
+            let state = self.lock_state();
+            (state.purge_pending, state.epoch)
+        };
+        if purge_pending && self.purge_pending(purge_epoch).await.is_err() {
+            return self.status();
+        }
+
         // 1) 已有当前代有效内存 JWT：直接返回，不读 OS。
         //
         // 返回前必须收尾 `restoring`：并发恢复可能在早退前把标记置位（上一轮恢复
@@ -575,7 +596,7 @@ impl AuthService {
     ///
     /// 删除失败如实报 `delete_failed` 且保持恢复禁用（不得读回旧记录）。
     pub async fn forget(&self) -> AuthStatus {
-        let (delete_epoch, store) = {
+        let delete_epoch = {
             let mut state = self.lock_state();
             state.jwt = None;
             state.jwt_epoch = None;
@@ -584,31 +605,96 @@ impl AuthService {
             state.restoring = false;
             state.problem = None;
             state.restore_blocked = true;
+            // 删除义务：epoch 推进（新授权/清除）不取消它，只有真正删除成功才解除。
+            state.purge_pending = true;
             state.epoch = state.epoch.wrapping_add(1);
             if let Some(cancel) = state.cancel.take() {
                 let _ = cancel.send(());
             }
-            (state.epoch, self.credential_store.clone())
+            state.epoch
         };
-        let Some(store) = store else {
-            return self.status();
+        // 删除义务不看 epoch（与 `store_io_if_current` 的关键差别）：新授权代际不得让
+        // 忘记的删除被跳过。失败保留 `purge_pending` 并在状态里如实报 problem。
+        let _ = self.purge_pending(delete_epoch).await;
+        self.status()
+    }
+
+    /// 执行忘记遗留的**删除义务**。
+    ///
+    /// 与 [`Self::store_io_if_current`] 的关键差别：删除义务持续存在，**不再用 epoch
+    /// 决定是否跳过**——新授权推进 epoch 也不取消这次删除（否则旧记录可能在重启后复活）。
+    /// 删除前在存储单飞锁内复核：删除义务已被别的路径完成，或新授权已把新 JWT 落内存/
+    /// 保存，则旧义务作废，绝不删除新记录。
+    async fn purge_pending(&self, expected_epoch: u64) -> StoreResult<()> {
+        let Some(store) = self.credential_store.clone() else {
+            // 没有存储适配口 = 没有持久记录可删，义务视为已完成。
+            self.lock_state().purge_pending = false;
+            return Ok(());
         };
-        match self
-            .store_io_if_current(delete_epoch, store, |store| store.delete())
-            .await
-        {
-            Some(Ok(())) => {}
-            Some(Err(error)) => {
-                let mut state = self.lock_state();
-                // 只有仍是本次忘记的代际才回写问题；新授权已接管时不得覆盖。
-                if state.epoch == delete_epoch {
+        let guard = self.store_lock.clone().lock_owned().await;
+        if !self.purge_still_required(expected_epoch) {
+            return Ok(());
+        }
+        // 「删除成功」与「义务解除」在同一个串行窗口内落账：guard 释放前先清
+        // `purge_pending`，排队的第二个 purge 复核时必然看到已完成，不会重复删除。
+        let state = self.state.clone();
+        let joined = tokio::task::spawn_blocking(move || {
+            let _guard = guard;
+            let result = store.delete();
+            if result.is_ok() {
+                lock_state(&state).purge_pending = false;
+            }
+            result
+        })
+        .await;
+        let result = joined.unwrap_or(Err(CredentialError::Unavailable));
+        let mut state = self.lock_state();
+        match result {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                // 义务保留：下一次 forget/authorize/restore 继续重试。
+                state.purge_pending = true;
+                // 只有仍是登记义务的那一代才回写问题；新授权已接管时不得覆盖。
+                if state.epoch == expected_epoch {
                     state.problem = Some(AuthProblem::from_credential(error));
                 }
+                Err(error)
             }
-            // 新授权/新清除已接管：旧删除不得回写状态。
-            None => {}
         }
-        self.status()
+    }
+
+    /// 存储锁内复核：删除义务是否仍须执行（不得删除新授权保存的记录）。
+    ///
+    /// - 义务已被别的路径（并发的 forget/restore/authorize）完成 → 不需要；
+    /// - 新授权已接管（epoch 已推进）且当前代 JWT 已落内存 → 旧义务被新记录取代
+    ///   （同一账号只有一条记录，保存会覆盖），按已完成处理。
+    fn purge_still_required(&self, expected_epoch: u64) -> bool {
+        let mut state = self.lock_state();
+        if !state.purge_pending {
+            return false;
+        }
+        let newer_credential = state.epoch != expected_epoch
+            && state.jwt.is_some()
+            && state.jwt_epoch == Some(state.epoch);
+        if newer_credential {
+            state.purge_pending = false;
+            return false;
+        }
+        true
+    }
+
+    /// 新授权开始前的删除义务闸：未完成则 `storage_failed`（零浏览器/零 OAuth）。
+    async fn flush_pending_purge(&self) -> ZResult<()> {
+        let (pending, epoch) = {
+            let state = self.lock_state();
+            (state.purge_pending, state.epoch)
+        };
+        if !pending {
+            return Ok(());
+        }
+        self.purge_pending(epoch)
+            .await
+            .map_err(|_| ZcodeError::of(codes::STORAGE_FAILED))
     }
 
     /// 生产授权 origin：测试覆盖优先，否则固定官方常量（无配置/IPC 入口）。
@@ -619,9 +705,7 @@ impl AuthService {
     }
 
     fn lock_state(&self) -> std::sync::MutexGuard<'_, AuthState> {
-        self.state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        lock_state(&self.state)
     }
 
     /// 开始一次授权：epoch 递增（旧 epoch 的一切结果作废），并取消上一笔在途授权。
@@ -697,6 +781,8 @@ impl AuthService {
                     state.problem = None;
                     // 只有新授权保存成功才重新允许恢复（forget 的禁用到此解除）。
                     state.restore_blocked = false;
+                    // 新 JWT 已落库：忘记遗留的删除义务到此被新记录取代。
+                    state.purge_pending = false;
                 }
             }
             Some(Err(error)) => {
@@ -842,6 +928,13 @@ impl AuthService {
         let value: serde_json::Value = response.json().await.map_err(|_| ZcodeError::unknown())?;
         exchange_payload(&value)
     }
+}
+
+/// 取授权状态锁（中毒锁按内部值继续：状态只是内存快照，不因 panic 丢语义）。
+fn lock_state(state: &Mutex<AuthState>) -> std::sync::MutexGuard<'_, AuthState> {
+    state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// 由内存状态构造授权状态快照（只读：不访问系统存储，也不写回状态）。
@@ -3228,5 +3321,205 @@ mod tests {
         }
         assert!(!captured_output.contains("synthetic-signature"));
         assert!(!captured_output.contains("Bearer"));
+    }
+
+    // ───────────────── P2-1：忘记的删除义务不因新授权而取消 ─────────────────
+
+    /// P2-1 a：慢保存在途 → 忘记（删除排队）→ 新授权在开始前失败。
+    ///
+    /// 旧实现让删除跟随 epoch：新授权一旦推进 epoch，忘记排队的删除就被跳过，旧记录
+    /// 留在存储里，重启即被恢复。删除义务必须独立于新授权代际，删除成功才解除。
+    #[tokio::test]
+    async fn forget_during_slow_save_then_failed_authorize_keeps_purge_obligation() {
+        let fake = FakeZcode::start().await;
+        let jwt = valid_jwt();
+        fake.set_exchange(200, exchange_ok(&jwt));
+        let store = Arc::new(MemoryCredentialStore::new());
+        let auth = Arc::new(test_service(&fake).with_credential_store(store.clone()));
+
+        // 旧授权的保存停在「原生写完成前」：记录尚未落地，保存持有存储单飞锁。
+        let save_gate = store.gate_save();
+        let slot = UrlSlot::new();
+        let authorize = spawn_authorize(auth.clone(), OAuthProvider::Bigmodel, slot.clone());
+        let (redirect, state) = oauth_params(&slot.wait().await);
+        let delivered =
+            deliver_status(&redirect, &format!("state={state}&code={SYNTHETIC_CODE}")).await;
+        assert_eq!(delivered, Some(200));
+        save_gate.wait_entered().await;
+        assert!(store.stored().is_none(), "保存在放行前不得写入记录");
+
+        // 忘记：清内存并登记删除义务；删除排在被挂起的保存之后。
+        let forget = tokio::spawn({
+            let auth = auth.clone();
+            async move { auth.forget().await }
+        });
+        wait_until(|| !auth.status().authorized).await;
+        assert_eq!(store.delete_count(), 0, "在途保存未完成前删除必须排队");
+
+        // 新授权：删除义务未完成前不得开始 OAuth；open 直接失败让本次授权以错误收尾
+        // （不等待真实浏览器回调，RED 下也不会悬挂）。
+        let failed_authorize = tokio::spawn({
+            let auth = auth.clone();
+            async move {
+                let open: OpenAuthorize = Arc::new(|_url: String| Err(ZcodeError::unknown()));
+                auth.authorize(OAuthProvider::Bigmodel, open).await
+            }
+        });
+        // 让新授权先跑到「等待删除义务」（旧实现则会在这里推进 epoch）。不用固定 sleep。
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+
+        // 放行旧保存：写入旧记录 → 排队的删除必须真正执行（不得因 epoch 变化跳过）。
+        save_gate.release();
+        authorize
+            .await
+            .expect("旧授权任务不应 panic")
+            .expect("旧授权本身成功");
+        let status_after_forget = forget.await.expect("忘记任务不应 panic");
+        assert!(!status_after_forget.authorized);
+        assert_eq!(status_after_forget.problem, None, "删除成功不得留问题");
+        assert_eq!(store.save_count(), 1, "旧保存只执行一次");
+        assert_eq!(store.delete_count(), 1, "删除义务必须执行一次");
+        assert!(store.stored().is_none(), "忘记的旧记录必须被删除");
+
+        // 新授权以错误收尾，未产生任何交换。
+        assert!(
+            failed_authorize
+                .await
+                .expect("新授权任务不应 panic")
+                .is_err(),
+            "新授权本身失败"
+        );
+        assert_eq!(fake.exchange_count(), 1, "失败的授权不得发起交换");
+        assert!(store.stored().is_none(), "新授权失败后不得留下旧记录");
+
+        // 重启：全新 AuthService 对同一存储恢复，零授权（旧记录不得复活）。
+        let restarted = AuthService::new(test_client()).with_credential_store(store.clone());
+        let after_restart = restarted.restore().await;
+        assert!(!after_restart.authorized, "重启不得恢复被忘记的旧记录");
+        assert!(!after_restart.remembered);
+        assert_eq!(after_restart.provider, None);
+        assert_eq!(store.load_count(), 1, "重启只读一次存储");
+        assert_eq!(store.max_concurrent_store_calls(), 1, "存储调用必须串行");
+    }
+
+    /// P2-1 b：删除义务未完成时新授权必须 `storage_failed`（零浏览器/零交换/零保存），
+    /// 重试成功后可以继续授权。
+    #[tokio::test]
+    async fn forget_delete_failure_blocks_new_authorize_and_retries() {
+        let fake = FakeZcode::start().await;
+        fake.set_exchange(200, exchange_ok(&valid_jwt()));
+        let store = Arc::new(MemoryCredentialStore::new());
+        let auth = Arc::new(test_service(&fake).with_credential_store(store.clone()));
+        run_authorize(&auth, OAuthProvider::Bigmodel)
+            .await
+            .expect("首次授权成功");
+        assert_eq!(store.save_count(), 1);
+
+        // 忘记时删除失败：义务保留，记录可能仍在。
+        store.fail_next(CredentialError::DeleteFailed);
+        let status = auth.forget().await;
+        assert_eq!(status.problem, Some(AuthProblem::DeleteFailed));
+        assert_eq!(store.delete_count(), 1);
+        assert!(store.stored().is_some(), "删除失败时记录可能仍在");
+
+        // 新授权：删除义务未完成 → storage_failed，零浏览器、零交换、零保存。
+        // 再注入一次删除失败：义务重试仍失败，授权不得越过它开始。
+        store.fail_next(CredentialError::DeleteFailed);
+        let open_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let open: OpenAuthorize = {
+            let open_calls = open_calls.clone();
+            Arc::new(move |_url: String| {
+                open_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Err(ZcodeError::unknown())
+            })
+        };
+        let code = err_code(auth.authorize(OAuthProvider::Bigmodel, open).await);
+        assert_eq!(
+            code, "storage_failed",
+            "删除义务未完成必须报 storage_failed"
+        );
+        assert_eq!(
+            open_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "删除义务未完成不得打开浏览器"
+        );
+        assert_eq!(fake.exchange_count(), 1, "删除义务未完成不得发起交换");
+        assert_eq!(store.save_count(), 1, "删除义务未完成不得写入新记录");
+        assert_eq!(store.delete_count(), 2, "authorize 必须先重试删除义务");
+        assert!(store.stored().is_some(), "旧记录仍在（尚未删除）");
+
+        // 再忘记：重试删除成功，义务解除、problem 清空、记录真正删除。
+        let retried = auth.forget().await;
+        assert_eq!(retried.problem, None);
+        assert_eq!(store.delete_count(), 3, "删除义务必须重试");
+        assert!(store.stored().is_none(), "重试成功后旧记录必须删除");
+
+        // 之后的新授权可以正常继续（交换 + 保存 + 恢复标记解开）。
+        let next_jwt = synthetic_jwt(now_secs() + 7200);
+        fake.set_exchange(200, exchange_ok(&next_jwt));
+        run_authorize(&auth, OAuthProvider::Bigmodel)
+            .await
+            .expect("删除义务解除后授权必须可继续");
+        assert_eq!(store.save_count(), 2);
+        let status = auth.status();
+        assert!(status.authorized);
+        assert!(status.remembered);
+        assert_eq!(status.problem, None);
+        assert!(store.stored().expect("新记录应已保存").jwt == next_jwt);
+    }
+
+    /// P2-1 c：restore 在读取旧记录之前必须先完成待办删除；删除未完成时零读取，
+    /// 成功后也不得恢复旧身份。
+    #[tokio::test]
+    async fn restore_retries_pending_purge_before_loading() {
+        let fake = FakeZcode::start().await;
+        let jwt = valid_jwt();
+        fake.set_exchange(200, exchange_ok(&jwt));
+        let store = Arc::new(MemoryCredentialStore::new());
+        let auth = Arc::new(test_service(&fake).with_credential_store(store.clone()));
+        run_authorize(&auth, OAuthProvider::Bigmodel)
+            .await
+            .expect("授权成功");
+        assert_eq!(store.save_count(), 1);
+
+        // 忘记时删除失败：义务保留，旧记录仍在存储里。
+        store.fail_next(CredentialError::DeleteFailed);
+        let status = auth.forget().await;
+        assert_eq!(status.problem, Some(AuthProblem::DeleteFailed));
+        assert!(store.stored().is_some());
+
+        // 待办删除再次失败：restore 如实报 problem 且不读旧记录。
+        store.fail_next(CredentialError::DeleteFailed);
+        let blocked = auth.restore().await;
+        assert!(!blocked.authorized);
+        assert_eq!(blocked.problem, Some(AuthProblem::DeleteFailed));
+        assert_eq!(store.load_count(), 0, "删除义务未完成前不得读取旧记录");
+        assert_eq!(store.delete_count(), 2, "restore 必须重试待办删除");
+
+        // 待办删除挂起：restore 停在删除里（零 load），放行后才收尾。
+        let delete_gate = store.gate_delete();
+        let restore = tokio::spawn({
+            let auth = auth.clone();
+            async move { auth.restore().await }
+        });
+        delete_gate.wait_entered().await;
+        assert_eq!(store.load_count(), 0, "删除在途时不得读取旧记录");
+        assert_eq!(store.delete_count(), 3, "restore 必须再次重试待办删除");
+        delete_gate.release();
+        let after = restore.await.expect("restore 任务不应 panic");
+        assert!(!after.authorized, "待办删除完成后不得恢复旧记录");
+        assert!(!after.remembered);
+        assert_eq!(after.provider, None);
+        assert_eq!(store.load_count(), 0, "恢复仍被忘记禁用，不得读取旧记录");
+        assert!(store.stored().is_none(), "待办删除必须真正删除旧记录");
+
+        // 重启：零授权。
+        let restarted = AuthService::new(test_client()).with_credential_store(store.clone());
+        let restarted_status = restarted.restore().await;
+        assert!(!restarted_status.authorized, "重启不得恢复旧记录");
+        assert!(!restarted_status.remembered);
+        assert_eq!(store.load_count(), 1);
     }
 }

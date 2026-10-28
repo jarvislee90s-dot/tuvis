@@ -29,6 +29,7 @@
 ### 3.1 一个账号、一个条目
 
 - 正式版service：`com.jarvis.tuvis.zcode`；debug：`com.jarvis.tuvis.dev.zcode`；条目user／target后缀固定 `primary`。条目不按sid/mid存储。
+- 恢复标记与条目**同命名空间**：正式版settings键`remote.zcode_restore_allowed`，debug`remote.zcode_restore_allowed.dev`；生产读写按`cfg!(debug_assertions)`选键。两个构建共用同一个settings库，共用键会让开发版的忘记/删除把正式版恢复禁用掉。旧共享键不迁移（本功能尚未发布），debug与正式互不影响。
 - secret为UTF-8 JSON bytes：`{schemaVersion:1,provider:"bigmodel"|"zai",jwt:"..."}`。仅在Rust内序列化／解析；含JWT的类型不实现Debug，不作为IPC DTO。
 - `StoredCredential`只保存OAuth取得的ZCode账号JWT及必要provider，不保存terminal token、OAuth code/state或第三方access_token。
 - 一条记录成功替换当前账号；无多账号列表、导入导出或按设备复制凭据。
@@ -48,7 +49,8 @@
 | 键                             | 值与语义                                                                                                                             |
 | ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------ |
 | `remote.zcode_auto_connect`    | `true`／`false`；缺键=true，非法值=false。授权成功／显式连接设true；用户断开／KICKED／忘记授权设false；退出／总开关关闭不改它        |
-| `remote.zcode_restore_allowed` | `true`／`false`；缺键=true，非法值=false。保存前置false，保险箱写成功后才true；忘记／失效删除前置false，防删除失败后重启又恢复旧条目 |
+| `remote.zcode_restore_allowed` | 正式版恢复标记：`true`／`false`；缺键=true，非法值=false。保存前置false，保险箱写成功后才true；忘记／失效删除前置false，防删除失败后重启又恢复旧条目 |
+| `remote.zcode_restore_allowed.dev` | debug恢复标记：语义同上，只作用于debug保险箱条目（`com.jarvis.tuvis.dev.zcode`）；与正式版标记互不读取／覆盖 |
 
 读取失败必须作为失败处理，不能当缺键。非敏感标记也失败时报告storage_failed，不宣称已完成记住／忘记。禁用恢复不等于已删除，删除失败仍需明确提示。
 

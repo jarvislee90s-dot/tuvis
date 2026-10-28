@@ -85,26 +85,25 @@ mod tests {
     /// 可失败读取：表缺失/DB 错误必须回传 Err，不能伪装成「缺键 = None」
     #[test]
     fn checked_get_does_not_treat_broken_db_as_missing() {
+        // 真实标记键按构建命名空间选择（debug 为 `.dev` 键）；这里不手抄键名，
+        // 避免测试把某一构建的键固化成共享键。
+        let marker_key = crate::services::zcode_control::credential_store::restore_allowed_key_for(
+            cfg!(debug_assertions),
+        );
         assert!(
-            try_get_setting_conn(
-                &Connection::open_in_memory().unwrap(),
-                "remote.zcode_restore_allowed"
-            )
-            .is_err(),
+            try_get_setting_conn(&Connection::open_in_memory().unwrap(), marker_key).is_err(),
             "无 settings 表时读取必须报错"
         );
 
         let conn = mem();
         assert_eq!(
-            try_get_setting_conn(&conn, "remote.zcode_restore_allowed").unwrap(),
+            try_get_setting_conn(&conn, marker_key).unwrap(),
             None,
             "表存在但缺键才是 None"
         );
-        set_setting_conn(&conn, "remote.zcode_restore_allowed", "false");
+        set_setting_conn(&conn, marker_key, "false");
         assert_eq!(
-            try_get_setting_conn(&conn, "remote.zcode_restore_allowed")
-                .unwrap()
-                .as_deref(),
+            try_get_setting_conn(&conn, marker_key).unwrap().as_deref(),
             Some("false")
         );
     }

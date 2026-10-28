@@ -900,6 +900,11 @@ pub struct ZcodeHub {
     disconnect_lock: AsyncMutex<()>,
     /// 自动连接单 worker 的启动幂等标记（`start_auto_connect` 只成功一次）。
     auto_started: AtomicBool,
+    /// 启动恢复是否已经尝试过（失败也算）：自动连接 worker 不再第二次读原生存储。
+    ///
+    /// 显式 `connect_requested`/用户点击重试不受此限，可直接调
+    /// [`Self::restore_authorization`] 再次恢复。
+    auto_restore_attempted: AtomicBool,
     /// 自动连接唤醒（单 worker 消费；多次触发合并为逐次尝试）。
     auto_notify: Arc<Notify>,
     /// `forget_authorization` 后的内存暂停（授权成功/显式连接恢复）。
@@ -1025,6 +1030,7 @@ impl ZcodeHub {
             connect_lock: AsyncMutex::new(()),
             disconnect_lock: AsyncMutex::new(()),
             auto_started: AtomicBool::new(false),
+            auto_restore_attempted: AtomicBool::new(false),
             auto_notify: Arc::new(Notify::new()),
             auto_paused: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
@@ -1388,7 +1394,11 @@ impl ZcodeHub {
     ///
     /// `AuthService` 是权威；本方法把结果对齐 Hub 的 `authorized` 缓存与展示状态
     /// （已配置且已授权 = `offline`，可继续连接；未授权 = `needs_auth`）。
+    ///
+    /// 首次调用登记「启动恢复已尝试」（失败也登记）：自动连接 worker 之后只读内存快照，
+    /// 不再第二次读原生存储；显式 `connect_requested` 仍可直接调用本方法重试。
     pub async fn restore_authorization(&self) -> AuthStatus {
+        self.auto_restore_attempted.store(true, Ordering::SeqCst);
         let status = self.backend.restore_authorization().await;
         self.sync_authorization(&status);
         status
@@ -1550,6 +1560,11 @@ impl ZcodeHub {
 
     pub(crate) fn auto_connect_store(&self) -> &DeviceStore {
         &self.store
+    }
+
+    /// 自动连接 worker 的「启动恢复是否已尝试」观察口（P2-7：只读一次原生存储）。
+    pub(crate) fn auto_restore_attempted(&self) -> bool {
+        self.auto_restore_attempted.load(Ordering::SeqCst)
     }
 
     /// 测试观察口：worker 已执行到 `try_auto_connect` 的次数（同步信号，不用 sleep）。
