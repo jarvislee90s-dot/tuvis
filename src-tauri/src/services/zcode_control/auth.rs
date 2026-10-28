@@ -251,7 +251,8 @@ struct AuthState {
     /// 尚未完成的**删除义务**（forget 登记）：epoch 推进不取消它。
     ///
     /// 旧实现让删除跟随 epoch 判定是否执行，新授权一旦推进 epoch，忘记排队的删除就被
-    /// 跳过，旧记录可能留在存储里、在重启后被恢复。删除成功（或确认新记录已接管）才清。
+    /// 跳过，旧记录可能留在存储里、在重启后被恢复。只有两个解除点，且都在持
+    /// `store_lock` 的窗口内落账：删除成功，或新授权保存成功（新记录覆盖旧记录）。
     purge_pending: bool,
 }
 
@@ -623,8 +624,12 @@ impl AuthService {
     ///
     /// 与 [`Self::store_io_if_current`] 的关键差别：删除义务持续存在，**不再用 epoch
     /// 决定是否跳过**——新授权推进 epoch 也不取消这次删除（否则旧记录可能在重启后复活）。
-    /// 删除前在存储单飞锁内复核：删除义务已被别的路径完成，或新授权已把新 JWT 落内存/
-    /// 保存，则旧义务作废，绝不删除新记录。
+    /// 只要 `purge_pending` 仍为真就执行删除（不得用「内存里已有新代 JWT」当捷径：
+    /// 新 JWT 保存失败时旧记录会留下来，重启即可被恢复）。
+    ///
+    /// 唯一的跳过条件是义务已被解除：并发 purge 的删除成功、或新授权保存成功——两者
+    /// 都在**持 `store_lock` 的窗口内**清 `purge_pending`，因此这里看到 pending=false
+    /// 就说明无需再删（也保证不会把新授权刚保存的记录当成旧记录删掉）。
     async fn purge_pending(&self, expected_epoch: u64) -> StoreResult<()> {
         let Some(store) = self.credential_store.clone() else {
             // 没有存储适配口 = 没有持久记录可删，义务视为已完成。
@@ -632,7 +637,7 @@ impl AuthService {
             return Ok(());
         };
         let guard = self.store_lock.clone().lock_owned().await;
-        if !self.purge_still_required(expected_epoch) {
+        if !self.lock_state().purge_pending {
             return Ok(());
         }
         // 「删除成功」与「义务解除」在同一个串行窗口内落账：guard 释放前先清
@@ -652,35 +657,15 @@ impl AuthService {
         match result {
             Ok(()) => Ok(()),
             Err(error) => {
-                // 义务保留：下一次 forget/authorize/restore 继续重试。
-                state.purge_pending = true;
-                // 只有仍是登记义务的那一代才回写问题；新授权已接管时不得覆盖。
+                // 只有绑定同一义务代际的失败才保留义务 / 回写问题：新授权或新忘记已接管
+                // 时（epoch 已变且义务已清）不得把已解除的义务复活成僵尸。
                 if state.epoch == expected_epoch {
+                    state.purge_pending = true;
                     state.problem = Some(AuthProblem::from_credential(error));
                 }
                 Err(error)
             }
         }
-    }
-
-    /// 存储锁内复核：删除义务是否仍须执行（不得删除新授权保存的记录）。
-    ///
-    /// - 义务已被别的路径（并发的 forget/restore/authorize）完成 → 不需要；
-    /// - 新授权已接管（epoch 已推进）且当前代 JWT 已落内存 → 旧义务被新记录取代
-    ///   （同一账号只有一条记录，保存会覆盖），按已完成处理。
-    fn purge_still_required(&self, expected_epoch: u64) -> bool {
-        let mut state = self.lock_state();
-        if !state.purge_pending {
-            return false;
-        }
-        let newer_credential = state.epoch != expected_epoch
-            && state.jwt.is_some()
-            && state.jwt_epoch == Some(state.epoch);
-        if newer_credential {
-            state.purge_pending = false;
-            return false;
-        }
-        true
     }
 
     /// 新授权开始前的删除义务闸：未完成则 `storage_failed`（零浏览器/零 OAuth）。
@@ -770,21 +755,9 @@ impl AuthService {
             provider,
             jwt,
         };
-        match self
-            .store_io_if_current(epoch, store, move |store| store.save(&record))
-            .await
-        {
-            Some(Ok(())) => {
-                let mut state = self.lock_state();
-                if state.epoch == epoch && state.jwt_epoch == Some(epoch) {
-                    state.remembered = true;
-                    state.problem = None;
-                    // 只有新授权保存成功才重新允许恢复（forget 的禁用到此解除）。
-                    state.restore_blocked = false;
-                    // 新 JWT 已落库：忘记遗留的删除义务到此被新记录取代。
-                    state.purge_pending = false;
-                }
-            }
+        match self.save_authorized_record(epoch, store, record).await {
+            // 保存成功的状态提交已在存储锁窗口内完成（见 `save_authorized_record`）。
+            Some(Ok(())) => {}
             Some(Err(error)) => {
                 let mut state = self.lock_state();
                 if state.epoch == epoch && state.jwt_epoch == Some(epoch) {
@@ -795,6 +768,47 @@ impl AuthService {
             // 开始前已有新授权/忘记接管：旧保存不得回写「已记住」。
             None => {}
         }
+    }
+
+    /// 保存新授权记录：**状态提交与保存同在存储单飞锁窗口内**完成。
+    ///
+    /// 保存成功的提交（remembered/problem/restore_blocked/purge_pending）由阻塞任务在
+    /// 仍持 `store_lock` 时落账，guard 释放后调用方不再补写——否则排队的
+    /// [`Self::purge_pending`] 会在「记录已写入、状态未提交」的窗口看到
+    /// `purge_pending=true`，把刚保存的新记录当成旧记录删掉。
+    ///
+    /// `None` 与 [`Self::store_io_if_current`] 同语义：开始前代际已变，未触碰 OS。
+    async fn save_authorized_record(
+        &self,
+        epoch: u64,
+        store: Arc<dyn CredentialStore>,
+        record: StoredCredential,
+    ) -> Option<StoreResult<()>> {
+        let guard = self.store_lock.clone().lock_owned().await;
+        if !self.epoch_is_current(epoch) {
+            return None;
+        }
+        let state = self.state.clone();
+        let joined = tokio::task::spawn_blocking(move || {
+            let _guard = guard;
+            let result = store.save(&record);
+            if result.is_ok() {
+                let mut state = lock_state(&state);
+                // 保存期间 clear/忘记已接管：记录虽写入，但不得回写「已记住」；该记录
+                // 由忘记的删除义务在锁后清理。
+                if state.epoch == epoch && state.jwt_epoch == Some(epoch) {
+                    state.remembered = true;
+                    state.problem = None;
+                    // 只有新授权保存成功才重新允许恢复（forget 的禁用到此解除）。
+                    state.restore_blocked = false;
+                    // 新 JWT 已落库：忘记遗留的删除义务到此被新记录取代。
+                    state.purge_pending = false;
+                }
+            }
+            result
+        })
+        .await;
+        Some(joined.unwrap_or(Err(CredentialError::Unavailable)))
     }
 
     /// 串行删除持久记录（只删仍属 `expected_epoch` 的那一代）。
@@ -3521,5 +3535,188 @@ mod tests {
         assert!(!restarted_status.authorized, "重启不得恢复旧记录");
         assert!(!restarted_status.remembered);
         assert_eq!(store.load_count(), 1);
+    }
+
+    /// P2-1 复审回归：新代 JWT 只在内存（尚未保存成功）时，删除义务不得被
+    /// 「内存里已有新凭据」捷径跳过——旧记录必须真正删除。
+    ///
+    /// 触发条件：`forget` 登记的删除用旧代 epoch 排队，新授权已把新 JWT 落内存但保存
+    /// 未成功；旧实现据此把 `purge_pending` 清零且零删除，旧记录留在存储里。
+    #[tokio::test]
+    async fn pending_purge_deletes_old_record_with_unsaved_current_jwt() {
+        let old_jwt = valid_jwt();
+        let store = store_with(OAuthProvider::Zai, &old_jwt);
+        let auth = Arc::new(AuthService::new(test_client()).with_credential_store(store.clone()));
+        {
+            let mut state = auth.lock_state();
+            state.epoch = 10;
+            state.jwt = Some(synthetic_jwt(now_secs() + 7200));
+            state.jwt_epoch = Some(10);
+            state.provider = Some(OAuthProvider::Bigmodel);
+            state.remembered = false; // 新代 JWT 只在内存，保存尚未成功
+            state.purge_pending = true;
+        }
+
+        let delete_gate = store.gate_delete();
+        let purge = tokio::spawn({
+            let auth = auth.clone();
+            async move { auth.purge_pending(9).await } // 旧代排队中的删除义务
+        });
+        // 旧实现走 newer_credential 捷径：零删除，闸门永远等不到。
+        delete_gate.wait_entered().await;
+        assert_eq!(store.delete_count(), 1, "删除义务必须真正执行");
+        delete_gate.release();
+        purge
+            .await
+            .expect("purge 任务不应 panic")
+            .expect("删除应成功");
+        assert!(store.stored().is_none(), "旧记录必须删除");
+        assert!(!auth.lock_state().purge_pending, "删除成功后义务解除");
+    }
+
+    /// P2-1 复审回归：save 失败后删除义务仍在（不得被内存 JWT 视为已完成）；随后
+    /// 执行删除，重启不得恢复旧记录。
+    #[tokio::test]
+    async fn save_failure_keeps_purge_obligation_and_restart_never_restores() {
+        let old_jwt = valid_jwt();
+        let store = store_with(OAuthProvider::Zai, &old_jwt);
+        let auth = Arc::new(AuthService::new(test_client()).with_credential_store(store.clone()));
+        let epoch = {
+            let mut state = auth.lock_state();
+            state.epoch = 10;
+            state.jwt = Some(synthetic_jwt(now_secs() + 7200));
+            state.jwt_epoch = Some(10);
+            state.provider = Some(OAuthProvider::Bigmodel);
+            state.remembered = false;
+            state.purge_pending = true;
+            state.epoch
+        };
+
+        // 新 JWT 保存失败：不得宣称已记住，也不得把删除义务当成已完成。
+        store.fail_next(CredentialError::StorageFailed);
+        auth.persist_authorized(epoch, OAuthProvider::Bigmodel)
+            .await;
+        let status = auth.status();
+        assert!(!status.remembered, "保存失败不得假报已记住");
+        assert_eq!(status.problem, Some(AuthProblem::StorageFailed));
+        assert!(store.stored().is_some(), "保存失败时旧记录仍在");
+        assert!(
+            auth.lock_state().purge_pending,
+            "save 失败后删除义务必须保留"
+        );
+
+        // 义务仍为真 → 删除必须执行，旧记录消失。
+        auth.purge_pending(epoch).await.expect("删除应成功");
+        assert!(store.stored().is_none(), "删除义务必须真正删除旧记录");
+        assert!(!auth.lock_state().purge_pending);
+
+        // 重启：旧记录已删除，零授权。
+        let restarted = AuthService::new(test_client()).with_credential_store(store.clone());
+        let after_restart = restarted.restore().await;
+        assert!(!after_restart.authorized, "重启不得恢复已删除的旧记录");
+        assert!(!after_restart.remembered);
+        assert_eq!(store.load_count(), 1);
+    }
+
+    /// P2-1 复审回归：save 成功必须在**持 store_lock 的窗口内**清删除义务——
+    /// 排队的 purge 之后一定看到「已保存」，不得删除新记录。
+    #[tokio::test]
+    async fn save_success_clears_purge_obligation_inside_store_lock() {
+        let new_jwt = synthetic_jwt(now_secs() + 7200);
+        let store = store_with(OAuthProvider::Zai, &valid_jwt());
+        let auth = Arc::new(AuthService::new(test_client()).with_credential_store(store.clone()));
+        let epoch = {
+            let mut state = auth.lock_state();
+            state.epoch = 10;
+            state.jwt = Some(new_jwt.clone());
+            state.jwt_epoch = Some(10);
+            state.provider = Some(OAuthProvider::Bigmodel);
+            state.remembered = false;
+            state.purge_pending = true;
+            state.epoch
+        };
+
+        // 保存停在 fake 内（持有存储单飞锁）。
+        let save_gate = store.gate_save();
+        let persist = tokio::spawn({
+            let auth = auth.clone();
+            async move {
+                auth.persist_authorized(epoch, OAuthProvider::Bigmodel)
+                    .await
+            }
+        });
+        save_gate.wait_entered().await;
+
+        // 排队的 purge 必须等 save 完成；save 成功后不得删除新记录。
+        let purge = tokio::spawn({
+            let auth = auth.clone();
+            async move { auth.purge_pending(epoch).await }
+        });
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(store.delete_count(), 0, "save 在途时 purge 必须排队");
+        save_gate.release();
+        purge
+            .await
+            .expect("purge 任务不应 panic")
+            .expect("save 成功后 purge 必须零删除完成");
+        persist.await.expect("persist 任务不应 panic");
+
+        assert_eq!(store.delete_count(), 0, "save 成功后不得删除新记录");
+        assert!(
+            store.stored().expect("新记录仍在").jwt == new_jwt,
+            "持久记录必须仍是新 JWT"
+        );
+        let status = auth.status();
+        assert!(status.remembered);
+        assert_eq!(status.problem, None);
+        assert!(
+            !auth.lock_state().purge_pending,
+            "save 成功必须解除删除义务"
+        );
+    }
+
+    /// P2-1 复审 Minor：删除失败只在**同一义务代际**保留 pending/problem，
+    /// 已被新授权接管时不得把已解除的义务复活成僵尸。
+    ///
+    /// 交错：旧代 purge 的删除停在本机 fake 内（持存储单飞锁）→ 期间新授权保存成功
+    /// 的提交解锁义务（`purge_pending=false`）→ 放行删除并注入失败。旧实现无条件把
+    /// `pending` 置回 true，重启/后续 authorize 会被僵尸义务永久阻塞。
+    #[tokio::test]
+    async fn purge_failure_never_revives_cleared_obligation() {
+        let store = store_with(OAuthProvider::Zai, &valid_jwt());
+        let auth = Arc::new(AuthService::new(test_client()).with_credential_store(store.clone()));
+        {
+            let mut state = auth.lock_state();
+            state.epoch = 10;
+            state.purge_pending = true;
+        }
+
+        store.fail_next(CredentialError::DeleteFailed);
+        let delete_gate = store.gate_delete();
+        let purge = tokio::spawn({
+            let auth = auth.clone();
+            async move { auth.purge_pending(9).await }
+        });
+        delete_gate.wait_entered().await;
+
+        // 删除在途期间新授权保存成功（状态提交由 save 的锁内窗口完成）。
+        {
+            let mut state = auth.lock_state();
+            state.epoch = 11;
+            state.jwt = Some(synthetic_jwt(now_secs() + 7200));
+            state.jwt_epoch = Some(11);
+            state.remembered = true;
+            state.purge_pending = false;
+        }
+        delete_gate.release();
+        assert!(
+            purge.await.expect("purge 任务不应 panic").is_err(),
+            "删除本身失败"
+        );
+        let state = auth.lock_state();
+        assert!(!state.purge_pending, "新代已清义务，旧代失败不得复活");
+        assert_eq!(state.problem, None, "旧代失败不得污染新代状态");
     }
 }

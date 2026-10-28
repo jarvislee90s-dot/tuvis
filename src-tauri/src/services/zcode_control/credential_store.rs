@@ -912,17 +912,21 @@ mod tests {
     /// 空间：共用同一 settings 库时，开发版的禁用标记不得让正式版放弃恢复（反之亦然）。
     #[test]
     fn restore_marker_keys_are_namespaced_per_build() {
-        assert!(cfg!(debug_assertions), "cargo test 应在 debug 构建下运行");
-
         let debug_key = restore_allowed_key_for(true);
         let release_key = restore_allowed_key_for(false);
         assert_ne!(debug_key, release_key, "debug 与正式版必须使用不同标记键");
         assert_eq!(debug_key, "remote.zcode_restore_allowed.dev");
         assert_eq!(release_key, "remote.zcode_restore_allowed");
+        // 当前构建按 debug_assertions 选键（测试本身不假定一定跑在 debug 下）。
+        let expected_key = if cfg!(debug_assertions) {
+            debug_key
+        } else {
+            release_key
+        };
         assert_eq!(
             restore_allowed_key_for(cfg!(debug_assertions)),
-            RESTORE_ALLOWED_KEY_DEBUG,
-            "debug 构建必须使用 `.dev` 命名空间的恢复标记"
+            expected_key,
+            "生产读写必须按构建选键"
         );
 
         // 命名空间隔离：正式版/旧共享键的标记对 debug 不可见；debug 的标记也不得

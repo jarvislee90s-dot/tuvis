@@ -29,7 +29,7 @@
 ### 3.1 一个账号、一个条目
 
 - 正式版service：`com.jarvis.tuvis.zcode`；debug：`com.jarvis.tuvis.dev.zcode`；条目user／target后缀固定 `primary`。条目不按sid/mid存储。
-- 恢复标记与条目**同命名空间**：正式版settings键`remote.zcode_restore_allowed`，debug`remote.zcode_restore_allowed.dev`；生产读写按`cfg!(debug_assertions)`选键。两个构建共用同一个settings库，共用键会让开发版的忘记/删除把正式版恢复禁用掉。旧共享键不迁移（本功能尚未发布），debug与正式互不影响。
+- 恢复标记与条目**同命名空间**：正式版settings键`remote.zcode_restore_allowed`，debug`remote.zcode_restore_allowed.dev`；生产读写按`cfg!(debug_assertions)`选键。两个构建共用同一个settings库，共用键会让开发版的忘记/删除把正式版恢复禁用掉。旧共享键不迁移（本功能尚未发布）：debug 不再读写旧共享键（正式版继续使用该键名），debug与正式互不影响。
 - secret为UTF-8 JSON bytes：`{schemaVersion:1,provider:"bigmodel"|"zai",jwt:"..."}`。仅在Rust内序列化／解析；含JWT的类型不实现Debug，不作为IPC DTO。
 - `StoredCredential`只保存OAuth取得的ZCode账号JWT及必要provider，不保存terminal token、OAuth code/state或第三方access_token。
 - 一条记录成功替换当前账号；无多账号列表、导入导出或按设备复制凭据。
