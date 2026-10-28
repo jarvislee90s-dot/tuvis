@@ -1570,12 +1570,16 @@ impl ZcodeHub {
         let (closed, guard) = self.begin_disconnect();
         let closed_generation = closed.generation;
         self.lock().authorized = false;
-        // 3) **全程持关闭凭据**清后端内存/取消旧 epoch/禁用恢复并删除持久记录：
-        //    身份失效、删除与 relay 清理必须同处一个关闭窗口——否则 finish 先清位、
-        //    删除在途时 connect_requested 仍能经 restore 复活旧 JWT 并建连（P2-4）。
+        // 3) **先静默 relay**（持同一关闭凭据）：取消在途握手、等在途 connect 收尾、
+        //    再关掉竞态窗口内建立的连接。旧顺序先删身份后断 relay，会让在途握手在
+        //    （可能很慢/无超时的）删除期间完成并留下一条 live 的旧 JWT 连接——Hub 对
+        //    stale 结果不调 `backend.disconnect`，那条连接就会一直活着。
+        let current = self.quiesce_disconnect(&guard).await;
+        // 4) 再清后端内存/取消旧 epoch/禁用恢复并删除持久记录（删除失败如实上报）。
+        //    窗口若已被更新者接管（current=false），删除义务仍须完成（与旧语义一致），
+        //    但清位与末态只属于仍 current 的本窗口。
         let status = self.backend.forget_authorization().await;
-        // 4) 断 relay、等在途 connect 收尾；凭据在此 Drop（陈旧 owner 零清理）清位。
-        self.finish_disconnect(guard).await;
+        drop(guard);
         // 5) 链接保留（不碰 config）；展示落「需要重新授权 / 需要配置」。
         //
         // 删除可能耗时：期间若更新的配置变更/断开/冲突已接管代际，更新者的状态优先，
@@ -1609,6 +1613,11 @@ impl ZcodeHub {
         }
         for stale in &stale {
             self.emit_session(stale);
+        }
+        if current {
+            // 本窗口已清位且末态已落：补唤醒（理由同 `finish_disconnect` 的 P2-5）。
+            // 只唤醒不越权：auto=false/暂停/无授权时 worker 现查后即停。
+            self.wake_auto_connect();
         }
         if status.problem.is_some() || !auto_persisted {
             return Err(ZcodeError::of(codes::STORAGE_FAILED));
@@ -1882,18 +1891,19 @@ impl ZcodeHub {
                     self.emit_session(stale);
                 }
                 if out.state == ConnectionState::Conflict {
-                    // KICKED 也可能作为本次 connect 的结果直接落定：同样持久暂停自动
-                    // 连接；普通掉线/显式断开绝不动用户意图。
-                    if write_auto_intent(
-                        &self.store,
-                        &self.auto_intent_generation,
-                        AutoIntentClaim::Latest,
-                        false,
-                    )
-                    .is_err()
+                    // KICKED 也可能作为本次 connect 的结果直接落定：与事件泵同规——
+                    // 这是**事件性**写入，不是用户意图，先预占一代再写 false；若期间
+                    // 用户已写入更新的意图（更高代），本写跳过，绝不抢占。普通掉线/
+                    // 显式断开绝不动用户意图。
+                    let claim = capture_auto_intent(&self.auto_intent_generation);
+                    match write_auto_intent(&self.store, &self.auto_intent_generation, claim, false)
                     {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            log::warn!("ZCode KICKED：自动暂停意图已被更新的用户意图取代，跳过写入")
+                        }
                         // 只报失联事实：不打印 JWT/链接等任何凭据或目标。
-                        log::warn!("ZCode KICKED：持久化自动暂停意图失败");
+                        Err(_) => log::warn!("ZCode KICKED：持久化自动暂停意图失败"),
                     }
                 }
                 Ok(out)
@@ -1971,14 +1981,21 @@ impl ZcodeHub {
     /// 关掉新连接」的竞态。epoch 归属检查只能阻止**已被接管**的 owner 继续清理，
     /// 不能让已经发出的 disconnect 撤回。
     ///
-    /// 本 future 被取消/panic 时，`guard` 随栈帧 Drop，按 epoch 兜底清位。
-    pub(crate) async fn finish_disconnect(&self, guard: CloseGuard) {
+    /// 关闭清理的第一段（`finish_disconnect` 与 `forget_authorization` 复用）：
+    /// 取 `disconnect_lock` → 复核凭据 → `backend.disconnect`（取消在途握手）→
+    /// 取 `connect_lock`（等在途 connect 收尾）→ 再次复核 → 再 `backend.disconnect`
+    /// （关掉竞态窗口内建立的连接）。
+    ///
+    /// 返回 `true` = 凭据仍是当前窗口（relay 已静默、无在途握手）；`false` = 已被
+    /// 更新的关闭窗口接管（本段碰到 epoch 复核即停止，调用方不得清位/做本窗口收尾）。
+    ///
+    /// 锁序只有 `disconnect_lock → connect_lock`，`connect` 永不取 `disconnect_lock`。
+    async fn quiesce_disconnect(&self, guard: &CloseGuard) -> bool {
         // 清理单飞：重叠关闭的清理按到达顺序串行，后一个不得越过前一个的窗口。
         let _cleanup = self.disconnect_lock.lock().await;
         // 更新的 begin_disconnect 已接管：陈旧 owner 不得再发任何清理动作。
         if !guard.is_current() {
-            drop(guard);
-            return;
+            return false;
         }
         // 先取消在途握手：relay connect 等网络的 await 会就此收尾、释放 connect_lock。
         self.backend.disconnect().await;
@@ -1987,12 +2004,21 @@ impl ZcodeHub {
         // 等 connect_lock 期间可能又发生了更新的关闭（本凭据已过期）：不得再发第二次
         // disconnect（否则会关掉新窗口清位后建立的新连接），只按 epoch 兜底 Drop。
         if !guard.is_current() {
-            drop(guard);
-            return;
+            return false;
         }
         // 关掉竞态窗口内可能已建立的连接（本 Hub 期间绝不留下 paired）。
         self.backend.disconnect().await;
-        // 持锁清位：新 connect 只可能在清理完全结束后才被允许。
+        true
+    }
+
+    /// 本 future 被取消/panic 时，`guard` 随栈帧 Drop，按 epoch 兜底清位。
+    pub(crate) async fn finish_disconnect(&self, guard: CloseGuard) {
+        // 静默段与忘授权的顺序解耦（P2-4 复用同一实现）。
+        if !self.quiesce_disconnect(&guard).await {
+            drop(guard);
+            return;
+        }
+        // 静默完成后再清位：新 connect 只可能在清理完全结束后才被允许。
         drop(guard);
         // P2-5：清位后补一次唤醒。关闭窗口内到达的唤醒只能让 worker 看到
         // Offline/closing 并以 Stopped 消费掉；不补这一次，「快关快开」就丢了唤醒。
@@ -2556,6 +2582,11 @@ mod tests {
         forget_gate: Mutex<Option<Arc<Notify>>>,
         /// 替身是否持有账号 JWT（authorize/restore 置位、forget 清除）。
         jwt: AtomicBool,
+        /// 替身 relay 是否有一条 live 连接（成功配对置位、disconnect 清除）。
+        ///
+        /// P2-4 的关键观察位：旧代在途握手若在删除期间完成，它会把这里置 true；
+        /// Hub 对 stale 结果不调 `backend.disconnect`，于是旧 JWT 连接会一直活着。
+        live: AtomicBool,
     }
 
     impl FakeBackend {
@@ -2588,6 +2619,11 @@ mod tests {
         /// 替身当前是否持有账号 JWT（忘记后必须为 false）。
         fn holds_jwt(&self) -> bool {
             self.jwt.load(Ordering::SeqCst)
+        }
+
+        /// 替身 relay 是否仍有 live 连接（删除期间必须为 false）。
+        fn is_live(&self) -> bool {
+            self.live.load(Ordering::SeqCst)
         }
 
         /// 设定 `required_capabilities` 的应答（缺省 = `["single_select"]`，与既有
@@ -2675,11 +2711,17 @@ mod tests {
                 if let Some(gate) = gate {
                     gate.notified().await;
                 }
-                self.connect_result
+                let result = self
+                    .connect_result
                     .lock()
                     .unwrap()
                     .clone()
-                    .unwrap_or_else(|| Ok(Self::paired_view()))
+                    .unwrap_or_else(|| Ok(Self::paired_view()));
+                // 替身 relay：握手成功 = 一条 live 连接（关闭清理必须把它关掉）。
+                if matches!(&result, Ok(view) if view.state == ConnectionState::Paired) {
+                    self.live.store(true, Ordering::SeqCst);
+                }
+                result
             })
         }
 
@@ -2688,6 +2730,8 @@ mod tests {
             // 一次性：只有第一次调用取走闸并等待（后续立即返回）。
             let gate = self.disconnect_gate.lock().unwrap().take();
             Box::pin(async move {
+                // 替身 relay：断开即无 live 连接。
+                self.live.store(false, Ordering::SeqCst);
                 if let Some(gate) = gate {
                     gate.notified().await;
                 }
@@ -6266,7 +6310,10 @@ mod tests {
         assert!(fake.holds_jwt(), "前置：替身持有账号 JWT");
         let connects_before = fake.connect_calls.load(Ordering::SeqCst);
 
-        // 删除闸：forget 进入后停在替身内（AuthService 仍持有旧 JWT 的窗口）。
+        // 删除闸：替身把「清内存 + 删除」整体挂在闸后（比生产更保守——真实
+        // `AuthService::forget` 先同步清内存、再走慢删除；生产竞态另由
+        // `forget_quiesces_inflight_connect_before_deleting_identity` 与
+        // `production_forget_keeps_closing_across_slow_delete` 覆盖）。
         let gate = Arc::new(Notify::new());
         fake.forget_gate.lock().unwrap().replace(gate.clone());
         let forgetting = {
@@ -6315,6 +6362,169 @@ mod tests {
             connects_before,
             "忘记后显式连接不得触达后端连接"
         );
+    }
+
+    /// P2-4（复审 Important）：静默 relay（取消在途握手/等 connect_lock/再断一次）必须
+    /// **先于**删除身份。旧顺序先删后断：在途握手可在慢删除期间完成并留下一条 live 的
+    /// 旧 JWT 连接，而 Hub 对 stale 结果不调 `backend.disconnect`。
+    #[tokio::test]
+    async fn forget_quiesces_inflight_connect_before_deleting_identity() {
+        let fake = Arc::new(FakeBackend::default());
+        fake.set_restored_auth(authorized_auth());
+        let store = stored(URL);
+        set_remote_enabled(&store, true);
+        let hub = Arc::new(ZcodeHub::with_parts(
+            store.clone(),
+            fake.clone(),
+            send_policy(),
+        ));
+        hub.authorize(OAuthProvider::Bigmodel, noop_open())
+            .await
+            .unwrap();
+        assert!(fake.holds_jwt(), "前置：替身持有账号 JWT");
+
+        // 在途握手：卡在 fake.connect 内（持 connect_lock）。
+        let connect_gate = Arc::new(Notify::new());
+        fake.gate.lock().unwrap().replace(connect_gate.clone());
+        let inflight = {
+            let hub = hub.clone();
+            tokio::spawn(async move { hub.connect().await })
+        };
+        wait_until(|| fake.connect_calls.load(Ordering::SeqCst) == 1).await;
+
+        // 删除闸：让「静默完成、删除在途」的窗口可确定观察。
+        let forget_gate = Arc::new(Notify::new());
+        fake.forget_gate
+            .lock()
+            .unwrap()
+            .replace(forget_gate.clone());
+        let forgetting = {
+            let hub = hub.clone();
+            tokio::spawn(async move { hub.forget_authorization().await })
+        };
+        wait_until(|| hub.connection().state == ConnectionState::Offline).await;
+
+        // 关键顺序：删除尚未开始就必须已发出 relay 静默（第一断）；旧实现此时
+        // 仍卡在 backend.forget 内、disconnect_calls 为 0（本等待即超时 → RED）。
+        wait_until(|| fake.disconnect_calls.load(Ordering::SeqCst) >= 1).await;
+        assert!(
+            fake.forget_calls.load(Ordering::SeqCst) == 0,
+            "静默必须先于删除身份"
+        );
+
+        // 放行在途握手：Hub 结果作废（stale），绝不把状态拉回 paired。
+        connect_gate.notify_one();
+        let stale = inflight.await.expect("spawn 不应 panic");
+        assert!(
+            matches!(&stale, Err(err) if err.is(codes::STALE_GENERATION)),
+            "在途握手必须作废，实际 {stale:?}"
+        );
+        assert_eq!(hub.connection().state, ConnectionState::Offline);
+
+        // 删除在途：第二次静默已关掉竞态窗口内建立的连接 ⇒ 没有 live 的旧 JWT 连接。
+        wait_until(|| fake.forget_calls.load(Ordering::SeqCst) == 1).await;
+        assert!(
+            fake.disconnect_calls.load(Ordering::SeqCst) >= 2,
+            "删除前必须完成两次 relay 静默"
+        );
+        assert!(!fake.is_live(), "删除期间不得留下 live 的旧 JWT 连接");
+        assert!(fake.holds_jwt(), "删除在途：替身仍持旧 JWT（窗口前提）");
+        assert_eq!(hub.connection().state, ConnectionState::Offline);
+        // 删除在途仍拒绝新连接且零后端 connect。
+        let connects_before = fake.connect_calls.load(Ordering::SeqCst);
+        assert!(hub.connect().await.unwrap_err().is(codes::OFFLINE));
+        assert_eq!(fake.connect_calls.load(Ordering::SeqCst), connects_before);
+
+        // 放行删除：末态 needs_auth、JWT/记录清、关闭窗口清位。
+        forget_gate.notify_one();
+        let view = forgetting
+            .await
+            .expect("spawn 不应 panic")
+            .expect("忘记必须成功");
+        assert_eq!(view.state, ConnectionState::NeedsAuth);
+        assert_eq!(fake.forget_calls.load(Ordering::SeqCst), 1);
+        assert!(!fake.holds_jwt(), "JWT 必须已清");
+        assert!(!fake.is_live(), "忘记结束后不得留有 live 连接");
+        assert!(hub.lock().closing.is_none(), "忘记结束后必须清位");
+        assert!(hub
+            .connect_requested()
+            .await
+            .unwrap_err()
+            .is(codes::NEEDS_AUTH));
+    }
+
+    /// P2-4 生产语义（真实 AuthService + 内存保险箱）：生产 `AuthService::forget` 先
+    /// **同步**清内存 JWT、再在慢路径删除持久记录；关闭窗口必须覆盖整段慢删除——
+    /// 期间 connect 被拒且零 relay 连接，删除后持久记录消失、显式连接不再拿旧 JWT。
+    ///
+    /// 这条用例避免把测试替身「把清内存也挂在闸后」的保守契约当成生产 RED：真实实现
+    /// 下清内存不会被删除拖慢，真正要封的是「慢删除期间的连接窗口」。
+    #[tokio::test]
+    async fn production_forget_keeps_closing_across_slow_delete() {
+        // exp=2100 的合成 JWT：只验证本地 exp 解析，不涉及签名校验。
+        const FUTURE_JWT: &str = "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJzdWIiOiJzeW50aGV0aWMtYWNjb3VudCIsImV4cCI6NDEwMjQ0NDgwMH0.synthetic-signature";
+
+        let store = stored(URL);
+        set_remote_enabled(&store, true);
+        let credentials = Arc::new(MemoryCredentialStore::new());
+        credentials.seed(StoredCredential {
+            schema_version: SCHEMA_VERSION,
+            provider: OAuthProvider::Bigmodel,
+            jwt: FUTURE_JWT.to_owned(),
+        });
+        let auth = Arc::new(
+            AuthService::new(reqwest::Client::new()).with_credential_store(credentials.clone()),
+        );
+        let (parts, relay_events, lag) =
+            PartsBackend::production_test(store.clone(), auth.clone(), "ws://127.0.0.1:9".into());
+        let bridge = parts.pump_bridge();
+        let backend: Arc<dyn HubBackend> = Arc::new(parts);
+        let hub = Arc::new(ZcodeHub::with_pump_and_lag(
+            store.clone(),
+            backend,
+            send_policy(),
+            relay_events,
+            bridge,
+            lag,
+        ));
+        assert!(hub.restore_authorization().await.authorized);
+        assert_eq!(hub.connection().state, ConnectionState::Offline);
+
+        // 删除闸：停在 AuthService 的慢路径删除上（内存 JWT 此时已同步清掉）。
+        let gate = credentials.gate_delete();
+        let forgetting = {
+            let hub = hub.clone();
+            tokio::spawn(async move { hub.forget_authorization().await })
+        };
+        gate.wait_entered().await;
+        assert!(
+            hub.lock().closing.is_some(),
+            "慢删除在途：关闭窗口必须仍置位"
+        );
+        assert!(
+            !hub.auth_status().authorized,
+            "真实 forget 先同步清内存 JWT（不随慢删除推迟）"
+        );
+        let err = hub.connect().await.unwrap_err();
+        assert!(
+            err.is(codes::OFFLINE),
+            "慢删除在途 connect 必须 offline，实际 {err:?}"
+        );
+        assert_eq!(hub.connection().state, ConnectionState::Offline);
+        assert_eq!(credentials.delete_count(), 1, "删除已进入慢路径");
+
+        gate.release();
+        let view = forgetting
+            .await
+            .expect("spawn 不应 panic")
+            .expect("忘记必须成功");
+        assert_eq!(view.state, ConnectionState::NeedsAuth);
+        assert_eq!(credentials.delete_count(), 1, "不得重复删除");
+        assert!(credentials.stored().is_none(), "持久记录必须已删除");
+        assert!(hub.lock().closing.is_none(), "忘记结束后必须清位");
+        // 显式连接：真实 AuthService 已无内存/持久 JWT ⇒ needs_auth，零新 WS。
+        let err = hub.connect_requested().await.unwrap_err();
+        assert!(err.is(codes::NEEDS_AUTH), "实际 {err:?}");
     }
 
     /// P2-5：关闭窗口内被消费的自动连接唤醒不得丢——`finish_disconnect` 清位后必须
