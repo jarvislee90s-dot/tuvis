@@ -160,13 +160,23 @@ impl ConfirmationTracker {
         })
     }
 
-    /// 登记一条确认（同槽位已有 pending → 忽略，返回 false）。
+    /// 登记一条确认（同槽位已有 pending → **忽略并保留首个 baseline**，返回 false）。
+    ///
+    /// 不能用 `BTreeMap::insert` 直写：它对已存在键是**覆盖**并返回 `Some(old)`——
+    /// 「更晚 deadline、新 baseline」的 ctx 会顶掉旧登记，而返回 false 又不补计时器，
+    /// 新期限从此无人负责（会话安静时 pending 无限滞留，有界窗承诺被打破）。
+    /// 判空短路后同槽位二次登记是纯 no-op：旧 ctx（原 deadline、原计时器）原样保留。
     fn register(&self, ctx: ConfirmationContext) -> bool {
-        self.pending
+        let mut pending = self
+            .pending
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert((ctx.session_id.clone(), ctx.capability), ctx)
-            .is_none()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let slot = (ctx.session_id.clone(), ctx.capability);
+        if pending.contains_key(&slot) {
+            return false;
+        }
+        pending.insert(slot, ctx);
+        true
     }
 
     /// 事件泵观察：一条新投影（`generation` 是发布该视图的 Hub 代际；`fingerprint`
@@ -242,23 +252,54 @@ impl ConfirmationTracker {
         }
     }
 
-    /// 动作回执终态收口（派发返回后立即判定；只有真正的 pending 才会写账）。
-    fn settle_receipt(&self, session_id: &str, receipt: &ActionReceipt) {
+    /// 动作回执终态收口（派发返回后立即判定）。
+    ///
+    /// 只结算**本次 action 涉及的能力槽位**（`capabilities` 由登记点随 action 传入）：
+    /// 同会话其他能力（如仍在 ACK 窗内的 send）的未决确认绝不由本回执代答——selection
+    /// 的回执既不能替 send 写 confirmed（没有新用户消息证据），也不能把 send 一并降级。
+    ///
+    /// `current_generation` 是结算时刻的 Hub 当前代际：登记代际已过期（派发在途发生
+    /// 配置变更/断开/冲突）→ 全部摘除且**零落账**（spec R4「旧代际确认结果丢弃」
+    /// 覆盖**所有**写路径，回执收口不是帧观察的例外）。
+    fn settle_receipt(
+        &self,
+        session_id: &str,
+        capabilities: &[Capability],
+        receipt: &ActionReceipt,
+        current_generation: u64,
+    ) {
         let decisions: Vec<(ConfirmationContext, CapabilityRecord)> = {
             let mut pending = self
                 .pending
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let session_keys: Vec<(String, Capability)> = pending
+            // 本 action 的槽位 = 同会话 ∩ 本次动作的能力集。
+            let mut slots: Vec<(String, Capability)> = pending
                 .keys()
-                .filter(|(session, _)| session == session_id)
+                .filter(|(session, capability)| {
+                    session == session_id && capabilities.contains(capability)
+                })
                 .cloned()
                 .collect();
+            // 旧代际登记：摘除且零落账（本回执不构成新代际证据）。
+            let mut stale: Vec<(String, Capability)> = Vec::new();
+            slots.retain(|slot| {
+                let live = pending
+                    .get(slot)
+                    .is_some_and(|ctx| ctx.generation == current_generation);
+                if !live {
+                    stale.push(slot.clone());
+                }
+                live
+            });
+            for slot in stale {
+                pending.remove(&slot);
+            }
             match receipt.state {
                 // ACK-only：保持 pending，交给事件泵/计时器（绝不因此升级）。
                 ActionState::Accepted => Vec::new(),
                 // 因果终态（如 selection 的 wait_selection 命中）→ confirmed。
-                ActionState::Confirmed => session_keys
+                ActionState::Confirmed => slots
                     .iter()
                     .filter_map(|slot| pending.remove(slot).map(|ctx| (ctx, slot.1)))
                     .map(|(ctx, capability)| (ctx, confirmed_record(capability)))
@@ -266,7 +307,7 @@ impl ConfirmationTracker {
                 // 宿主显式失败 → degraded，只影响本 key 本能力（冻结原因码）。
                 ActionState::Rejected | ActionState::Noop => {
                     let reason = sanitized_reason(receipt);
-                    session_keys
+                    slots
                         .iter()
                         .filter_map(|slot| pending.remove(slot).map(|ctx| (ctx, slot.1)))
                         .map(|(ctx, capability)| {
@@ -277,7 +318,7 @@ impl ConfirmationTracker {
                         .collect()
                 }
                 // 结果未知（写后 ACK 超窗等）→ inconclusive（保持候选）。
-                ActionState::Unknown => session_keys
+                ActionState::Unknown => slots
                     .iter()
                     .filter_map(|slot| pending.remove(slot).map(|ctx| (ctx, slot.1)))
                     .map(|(ctx, capability)| {
@@ -292,7 +333,7 @@ impl ConfirmationTracker {
                     .collect(),
                 // 确证零写（桥写前拒绝）：本次尝试零证据 → 只摘除，不落账。
                 ActionState::SendFailed => {
-                    for slot in &session_keys {
+                    for slot in &slots {
                         pending.remove(slot);
                     }
                     Vec::new()
@@ -304,21 +345,23 @@ impl ConfirmationTracker {
         }
     }
 
-    /// 派发失败（Err，无回执）：摘除 pending，不落账。
+    /// 派发失败（Err，无回执）：只摘除**本次 action 能力集**内的 pending，不落账。
     ///
     /// CAS 陈旧（selection stale）与端口错误都不构成能力证据——前者只需刷新重试，
     /// 后者可能是瞬时连通性问题；降级只留给回执显式失败。
-    fn drop_pending(&self, session_id: &str) {
+    fn drop_pending(&self, session_id: &str, capabilities: &[Capability]) {
         let mut pending = self
             .pending
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let session_keys: Vec<(String, Capability)> = pending
+        let slots: Vec<(String, Capability)> = pending
             .keys()
-            .filter(|(session, _)| session == session_id)
+            .filter(|(session, capability)| {
+                session == session_id && capabilities.contains(capability)
+            })
             .cloned()
             .collect();
-        for slot in session_keys {
+        for slot in slots {
             pending.remove(&slot);
         }
     }
@@ -344,7 +387,11 @@ impl ConfirmationTracker {
     }
 
     /// 计时器回调：摘除并落账全部到点未决的登记（inconclusive）。
-    fn sweep_expired(&self, now: Instant) {
+    ///
+    /// `current_generation` 是醒来时刻的 Hub 当前代际：登记代际已过期 → 只摘除
+    /// **零落账**（确认结果随代际一起作废；没有事件帧帮它丢弃的旧代际 pending
+    /// 由此收口，绝不过期滞留、也绝不写旧判决）。
+    fn sweep_expired(&self, now: Instant, current_generation: u64) {
         let decisions: Vec<(ConfirmationContext, CapabilityRecord)> = {
             let mut pending = self
                 .pending
@@ -355,15 +402,18 @@ impl ConfirmationTracker {
                 .filter(|(_, ctx)| now >= ctx.deadline)
                 .map(|(slot, _)| slot.clone())
                 .collect();
-            expired
-                .iter()
-                .filter_map(|slot| {
-                    pending.remove(slot).map(|ctx| {
-                        let capability = slot.1;
-                        (ctx, inconclusive_record(capability))
-                    })
-                })
-                .collect()
+            let mut decisions = Vec::new();
+            for slot in expired {
+                let Some(ctx) = pending.remove(&slot) else {
+                    continue;
+                };
+                // 旧代际：到点只摘除零落账（确认结果随代际一起作废）。
+                if ctx.generation != current_generation {
+                    continue;
+                }
+                decisions.push((ctx, inconclusive_record(slot.1)));
+            }
+            decisions
         };
         for (ctx, record) in decisions {
             self.write(&ctx, record);
@@ -2822,12 +2872,16 @@ impl ZcodeHub {
         }
         // R4 首次真实动作确认：闸门已全过、派发未发生——此刻登记 baseline
         // （send/model/thought；已判决的能力与未提供 baseline 的后端跳过）。
-        let confirmable = matches!(
-            &action,
-            ControlAction::Send { .. } | ControlAction::Selection { .. }
-        );
-        if confirmable {
-            self.register_confirmations(&action, generation).await;
+        // 能力集随 action 固定，收口/摘除只结算同一集合（selection 的回执绝不
+        // 代答同会话仍在 ACK 窗内的 send）。
+        let confirmation_capabilities: &[Capability] = match &action {
+            ControlAction::Send { .. } => &[Capability::Send],
+            ControlAction::Selection { .. } => &[Capability::Model, Capability::ThoughtLevel],
+            _ => &[],
+        };
+        if !confirmation_capabilities.is_empty() {
+            self.register_confirmations(&action, confirmation_capabilities, generation)
+                .await;
         }
         let dispatch = self
             .backend
@@ -2837,8 +2891,14 @@ impl ZcodeHub {
             Ok(mut receipt) => {
                 // 回执终态先收口确认（Confirmed/Rejected/Unknown 直接落账，
                 // ACK-only 保持 pending）；spec R4 的 5s 窗从 ACK 起算 → 重置期限。
-                self.confirmations
-                    .settle_receipt(action.session_id(), &receipt);
+                // 结算用**当前**代际：派发在途若发生换代，旧代际登记摘除且零落账。
+                let current_generation = self.lock().generation;
+                self.confirmations.settle_receipt(
+                    action.session_id(),
+                    confirmation_capabilities,
+                    &receipt,
+                    current_generation,
+                );
                 if receipt.state == ActionState::Accepted {
                     for deadline in self.confirmations.rearm(
                         action.session_id(),
@@ -2856,9 +2916,10 @@ impl ZcodeHub {
                 Ok(receipt)
             }
             Err(error) => {
-                // 派发失败（CAS 陈旧/端口错误）不构成能力证据：只摘除 pending，
-                // 绝不据此降级（降级只留给回执显式失败）。
-                self.confirmations.drop_pending(action.session_id());
+                // 派发失败（CAS 陈旧/端口错误）不构成能力证据：只摘除本动作能力集
+                // 内的 pending，绝不据此降级（降级只留给回执显式失败）。
+                self.confirmations
+                    .drop_pending(action.session_id(), confirmation_capabilities);
                 Err(error)
             }
         }
@@ -2869,18 +2930,18 @@ impl ZcodeHub {
     /// 候选判定 = 账本无 Confirmed/Degraded/Unsupported 判决（Inconclusive/
     /// InterfaceMatched/无记录都重新确认）；后端不提供 baseline 或未装配账本时
     /// 整体跳过。确认窗的期限在 ACK 后重置（spec：「ACK 后等新投影……5s 有界」）。
-    async fn register_confirmations(&self, action: &ControlAction, generation: u64) {
+    async fn register_confirmations(
+        &self,
+        action: &ControlAction,
+        capabilities: &[Capability],
+        generation: u64,
+    ) {
         let Some(baseline) = self
             .backend
             .confirmation_baseline(action.session_id())
             .await
         else {
             return;
-        };
-        let capabilities: &[Capability] = match action {
-            ControlAction::Send { .. } => &[Capability::Send],
-            ControlAction::Selection { .. } => &[Capability::Model, Capability::ThoughtLevel],
-            _ => return,
         };
         for capability in capabilities {
             if !self
@@ -2931,14 +2992,21 @@ impl ZcodeHub {
     }
 
     /// 一条有界确认计时器：到点未决 → inconclusive（绝不重发动作）。
+    ///
+    /// 醒来时现读 Hub 当前代际交给 sweep：登记代际若已过期（配置变更/断开/冲突），
+    /// 到点只摘除零落账。`Weak` 持 Hub 状态——Hub 释放后计时器直接退出。
     fn spawn_confirmation_timer(&self, deadline: Instant) {
         let tracker = self.confirmations.clone();
+        let inner = Arc::downgrade(&self.inner);
         tokio::spawn(async move {
             let now = Instant::now();
             if deadline > now {
                 tokio::time::sleep(deadline - now).await;
             }
-            tracker.sweep_expired(Instant::now());
+            if let Some(inner) = inner.upgrade() {
+                let current_generation = lock_inner(&inner).generation;
+                tracker.sweep_expired(Instant::now(), current_generation);
+            }
         });
     }
 
@@ -3255,6 +3323,9 @@ mod tests {
         confirmation_baseline: Mutex<Option<ConfirmationBaseline>>,
         /// T5 确认观察：下一次 `execute` 的替身回执（`None` = 默认 Accepted）。
         execute_receipt: Mutex<Option<ZResult<ActionReceipt>>>,
+        /// 一次性 `execute` 闸：武装后下一次 execute 在替身内等待放行（登记已完成、
+        /// 回执未返回的「派发在途」窗口测试用）。
+        execute_gate: Mutex<Option<Arc<Notify>>>,
         /// 一次性 `disconnect()` 闸：第一次调用等待放行，后续调用立即返回
         /// （关闭清理重叠窗口测试用）。
         disconnect_gate: Mutex<Option<Arc<Notify>>>,
@@ -3373,6 +3444,14 @@ mod tests {
                 reason_code: reason,
             };
             self.execute_receipt.lock().unwrap().replace(Ok(receipt));
+        }
+
+        /// 武装一次性 `execute` 闸：下一次 execute 在替身内等待放行。返回放行把手
+        /// （回执收口测试用它制造「登记已完成、派发在途」的换代窗口）。
+        fn arm_execute_gate(&self) -> Arc<Notify> {
+            let gate = Arc::new(Notify::new());
+            self.execute_gate.lock().unwrap().replace(gate.clone());
+            gate
         }
     }
 
@@ -3538,6 +3617,7 @@ mod tests {
             self.execute_calls.fetch_add(1, Ordering::SeqCst);
             self.executed_targets.lock().unwrap().push(target.clone());
             let receipt = self.execute_receipt.lock().unwrap().clone();
+            let gate = self.execute_gate.lock().unwrap().take();
             let receipt = receipt.unwrap_or_else(|| {
                 Ok(ActionReceipt {
                     action_id: ctx.action_id.clone(),
@@ -3548,7 +3628,13 @@ mod tests {
                     reason_code: None,
                 })
             });
-            Box::pin(async move { receipt })
+            Box::pin(async move {
+                // 一次性闸：模拟「登记已完成、派发在途」的窗口（闸在计数之后）。
+                if let Some(gate) = gate {
+                    gate.notified().await;
+                }
+                receipt
+            })
         }
 
         fn existing_receipt<'a>(
@@ -7780,6 +7866,16 @@ mod tests {
         ledger: Arc<dyn CapabilityLedger>,
         policy: CapabilityView,
     ) -> (Arc<ZcodeHub>, mpsc::Sender<RelayEvent>, Arc<FakePump>) {
+        confirmation_hub_with_timeout(fake, ledger, policy, Duration::from_millis(50)).await
+    }
+
+    /// 同上，确认窗可注入（登记竞态敏感的用例用长窗靠观察路径确认，不赌计时器）。
+    async fn confirmation_hub_with_timeout(
+        fake: Arc<FakeBackend>,
+        ledger: Arc<dyn CapabilityLedger>,
+        policy: CapabilityView,
+        confirmation_timeout: Duration,
+    ) -> (Arc<ZcodeHub>, mpsc::Sender<RelayEvent>, Arc<FakePump>) {
         let (events, receiver) = mpsc::channel(8);
         let pump = Arc::new(FakePump::default());
         let hub = Arc::new(ZcodeHub::with_pump_and_confirmation(
@@ -7789,7 +7885,7 @@ mod tests {
             receiver,
             pump.clone(),
             ledger,
-            Duration::from_millis(50),
+            confirmation_timeout,
         ));
         hub.authorize(OAuthProvider::Bigmodel, noop_open())
             .await
@@ -7899,16 +7995,25 @@ mod tests {
         assert_eq!(rows[0].reason_code, None);
     }
 
-    /// 旧代际的确认结果丢弃：登记后代际推进（配置变更），随后哪怕新代际投影视图
-    /// 带着完全符合判据的证据，也不得写入账本。
+    /// 旧代际的确认结果丢弃（帧观察路径）：登记后代际推进（配置变更），随后哪怕
+    /// 新代际投影视图带着完全符合判据的证据，也不得写入账本。
+    ///
+    /// 长确认窗（2s）保证登记计时器在本测试内**不会**触发——帧路径的丢弃由观察
+    /// 自证；计时器路径由测试末尾的直调 `sweep_expired`（同计时器醒来语义：现读
+    /// 当前代际）确定性地覆盖，不依赖帧/计时器的到达时序。
     #[tokio::test]
     async fn stale_generation_confirmation_is_discarded_without_ledger_write() {
         let store = stored(URL);
         let ledger: Arc<dyn CapabilityLedger> = Arc::new(DbCapabilityLedger::new(store.clone()));
         let fake = Arc::new(FakeBackend::default());
         fake.set_baseline(send_baseline());
-        let (hub, events, pump) =
-            confirmation_hub(fake.clone(), ledger.clone(), send_policy()).await;
+        let (hub, events, pump) = confirmation_hub_with_timeout(
+            fake.clone(),
+            ledger.clone(),
+            send_policy(),
+            Duration::from_secs(2),
+        )
+        .await;
         let generation = hub.connection().generation;
 
         hub.execute(ctx("send-stale-1"), send_action(generation))
@@ -7917,20 +8022,298 @@ mod tests {
 
         // 配置变更推进 Hub 代际：旧代际 pending 的确认结果一律丢弃。
         hub.config_changed().await;
+        let current_generation = hub.connection().generation;
+        assert_ne!(current_generation, generation, "前置：换代已发生");
 
+        // 连续喂**满足判据**的新投影（revision 前进 + 指纹变化）：帧观察路径的
+        // 代际闸必须逐帧丢弃。
+        for seq in 3..8 {
+            pump.set_fingerprint("sess_synthetic0000", "u1");
+            pump.push_outcome(Ok(()), vec![changed_view("sess_synthetic0000", 11)]);
+            events
+                .send(RelayEvent::Data(serde_json::json!({"seq": seq})))
+                .await
+                .unwrap();
+        }
+        // 先证明帧确实都进了桥（处理面已发生），负断言才有意义。
+        wait_until(|| pump.data.lock().unwrap().len() >= 5).await;
+
+        // 计时器路径同语义覆盖：到点 sweep 用当前代际对拍（与计时器任务醒来时
+        // 的实参一致），旧代际登记只摘除零落账。
+        hub.confirmations
+            .sweep_expired(Instant::now(), current_generation);
+        assert!(
+            ledger.get(&confirmation_key()).is_empty(),
+            "旧代际确认结果丢弃，不落账（帧观察与计时器两条路径）"
+        );
+    }
+
+    /// 旧代际的到点收口不落账（计时器路径，端到端）：登记后代际推进、**不喂任何
+    /// 帧**，登记计时器在确认窗到点醒来（现读 Hub 当前代际交给 sweep）——旧代际
+    /// 登记只摘除，绝不写出 inconclusive 判决。
+    ///
+    /// 确认窗 2s + 睡 2.3s：唯一时序假设是「配置变更在 2s 内完成」（fake 全内存，
+    /// 实际毫秒级），不涉及帧/计时器赛跑。
+    #[tokio::test]
+    async fn stale_generation_sweep_discards_without_ledger_write() {
+        let store = stored(URL);
+        let ledger: Arc<dyn CapabilityLedger> = Arc::new(DbCapabilityLedger::new(store.clone()));
+        let fake = Arc::new(FakeBackend::default());
+        fake.set_baseline(send_baseline());
+        let (hub, _events, _pump) = confirmation_hub_with_timeout(
+            fake.clone(),
+            ledger.clone(),
+            send_policy(),
+            Duration::from_secs(2),
+        )
+        .await;
+        let generation = hub.connection().generation;
+
+        hub.execute(ctx("send-stale-sweep"), send_action(generation))
+            .await
+            .expect("send 应被受理");
+        hub.config_changed().await;
+        assert_ne!(hub.connection().generation, generation, "前置：换代已发生");
+
+        // 不喂任何帧：真实计时器在 2s 到点醒来，当前代际 ≠ 登记代际。
+        tokio::time::sleep(Duration::from_millis(2_300)).await;
+        assert!(
+            ledger.get(&confirmation_key()).is_empty(),
+            "旧代际登记到点只摘除，不落 inconclusive"
+        );
+    }
+
+    /// 旧代际的**回执收口**不落账：登记（gen G）→ 派发在途（execute 闸）→ 配置
+    /// 变更推进代际 → 回执 Rejected 返回——收口按当前代际对拍，旧代际登记摘除且
+    /// 零落账（degraded 也不得写；回执收口不是帧观察的例外）。
+    ///
+    /// 长确认窗（2s）保证闸放行前登记计时器不会先行触发（否则 sweep 抢先把旧
+    /// pending 摘掉，收口路径反而测不到）。
+    #[tokio::test]
+    async fn stale_generation_receipt_settlement_discards_without_ledger_write() {
+        let store = stored(URL);
+        let ledger: Arc<dyn CapabilityLedger> = Arc::new(DbCapabilityLedger::new(store.clone()));
+        let fake = Arc::new(FakeBackend::default());
+        fake.set_baseline(selection_baseline());
+        fake.set_execute_receipt(ActionState::Rejected, None);
+        let gate = fake.arm_execute_gate();
+        let (hub, _events, _pump) = confirmation_hub_with_timeout(
+            fake.clone(),
+            ledger.clone(),
+            policy_with(&["model", "thought_level"]),
+            Duration::from_secs(2),
+        )
+        .await;
+        let generation = hub.connection().generation;
+
+        let task = tokio::spawn({
+            let hub = hub.clone();
+            async move {
+                hub.execute(
+                    ctx("selection-stale-settle"),
+                    selection_action(generation, "GLM-5.3-Flash", "low"),
+                )
+                .await
+            }
+        });
+        // execute_calls ≥ 1 ⟹ 登记已完成（登记严格先于派发，替身计数在闸之前）。
+        wait_until(|| fake.execute_calls.load(Ordering::SeqCst) >= 1).await;
+        hub.config_changed().await;
+        gate.notify_one();
+        let receipt = task.await.unwrap().expect("回执返回 Ok");
+        assert_eq!(receipt.state, ActionState::Rejected);
+
+        // 收口用当前代际对拍：旧代际登记摘除零落账（登记计时器 2s 内保持沉默，
+        // 账本为空即证明收口路径既没写 degraded、也没有把 pending 留给计时器）。
+        assert!(
+            ledger.get(&confirmation_key()).is_empty(),
+            "旧代际回执收口不得落账（degraded 也不得写）"
+        );
+    }
+
+    /// 同槽位二次登记是纯 no-op：保留**首个** baseline 与原计时器——新投影按首个
+    /// baseline 确认落账（若第二次登记覆盖了首登记，rev 11 < 新 baseline 12 永不
+    /// 确认，且替换后的新期限无计时器负责，pending 无限滞留）。
+    #[tokio::test]
+    async fn duplicate_registration_keeps_first_baseline_and_timer_coverage() {
+        let store = stored(URL);
+        let ledger: Arc<dyn CapabilityLedger> = Arc::new(DbCapabilityLedger::new(store.clone()));
+        let fake = Arc::new(FakeBackend::default());
+        fake.set_baseline(send_baseline());
+        // 长窗：不赌计时器，让确认走观察路径（bug 形态下也无计时器可救）。
+        let (hub, events, pump) = confirmation_hub_with_timeout(
+            fake.clone(),
+            ledger.clone(),
+            send_policy(),
+            Duration::from_secs(2),
+        )
+        .await;
+        let generation = hub.connection().generation;
+
+        hub.execute(ctx("send-dup-1"), send_action(generation))
+            .await
+            .expect("send 应被受理");
+
+        // 确认窗未决期间的第二次真实使用：baseline 已漂移（rev 12 / u9）。
+        fake.set_baseline(ConfirmationBaseline {
+            key: confirmation_key(),
+            observation: ConfirmationObservation {
+                revision: Some(12),
+                provider: None,
+                log_fingerprint: Some("u9".to_owned()),
+            },
+        });
+        hub.execute(ctx("send-dup-2"), send_action(generation))
+            .await
+            .expect("send 应被受理");
+
+        // 新投影 rev 11 / u1：对首个 baseline（rev 10 / u0）构成确认。
         pump.set_fingerprint("sess_synthetic0000", "u1");
         pump.push_outcome(Ok(()), vec![changed_view("sess_synthetic0000", 11)]);
         events
-            .send(RelayEvent::Data(serde_json::json!({"seq": 3})))
+            .send(RelayEvent::Data(serde_json::json!({"seq": 7})))
             .await
             .unwrap();
 
-        // 确认窗（50ms）+ 余量：既不得 confirmed，也不得 inconclusive——直接丢弃。
-        tokio::time::sleep(Duration::from_millis(120)).await;
-        assert!(
-            ledger.get(&confirmation_key()).is_empty(),
-            "旧代际确认结果丢弃，不落账"
+        wait_until_with_sleep(|| {
+            ledger
+                .get(&confirmation_key())
+                .first()
+                .is_some_and(|row| row.state == CapabilityState::Confirmed)
+        })
+        .await;
+
+        let rows = ledger.get(&confirmation_key());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].capability, Capability::Send);
+        assert_eq!(rows[0].state, CapabilityState::Confirmed);
+        assert_eq!(
+            rows[0].evidence.as_deref(),
+            Some("revision_advanced+new_user_message")
         );
+    }
+
+    /// selection 回执显式失败不代答共存的 send pending：model/thought_level 各自
+    /// degraded，send 的未决确认保持独立并由**自己的**计时器结算（session 全量
+    /// 结算会把 send 一并 degraded——回执只属于产生它的 action 的能力集）。
+    #[tokio::test]
+    async fn selection_receipt_does_not_touch_pending_send_on_reject() {
+        let store = stored(URL);
+        let ledger: Arc<dyn CapabilityLedger> = Arc::new(DbCapabilityLedger::new(store.clone()));
+        let fake = Arc::new(FakeBackend::default());
+        fake.set_baseline(ConfirmationBaseline {
+            key: confirmation_key(),
+            observation: ConfirmationObservation {
+                revision: Some(10),
+                provider: Some("synthetic-provider".to_owned()),
+                log_fingerprint: Some("u0".to_owned()),
+            },
+        });
+        let (hub, _events, _pump) = confirmation_hub(
+            fake.clone(),
+            ledger.clone(),
+            policy_with(&["send", "model", "thought_level"]),
+        )
+        .await;
+        let generation = hub.connection().generation;
+
+        // send 先行：ACK-only，send pending 未决。
+        hub.execute(ctx("send-mixed-1"), send_action(generation))
+            .await
+            .expect("send 应被受理");
+
+        // selection 回执显式失败：只结算 model/thought_level。
+        fake.set_execute_receipt(ActionState::Rejected, None);
+        let receipt = hub
+            .execute(
+                ctx("selection-mixed-1"),
+                selection_action(generation, "GLM-5.3-Flash", "low"),
+            )
+            .await
+            .expect("回执带回显，execute 返回 Ok");
+        assert_eq!(receipt.state, ActionState::Rejected);
+
+        let rows = ledger.get(&confirmation_key());
+        assert_eq!(rows.len(), 2, "此刻只有 selection 两行");
+        for row in &rows {
+            assert!(matches!(
+                row.capability,
+                Capability::Model | Capability::ThoughtLevel
+            ));
+            assert_eq!(row.state, CapabilityState::Degraded);
+            assert_eq!(row.evidence.as_deref(), Some("explicit_failure"));
+        }
+
+        // send 未被代答：它自己的确认窗到期后自己结算。
+        wait_until_with_sleep(|| ledger.get(&confirmation_key()).len() == 3).await;
+        let rows = ledger.get(&confirmation_key());
+        let send_row = rows
+            .iter()
+            .find(|row| row.capability == Capability::Send)
+            .expect("send pending 应保留并由自己的计时器结算");
+        assert_eq!(send_row.state, CapabilityState::Inconclusive);
+        assert_eq!(send_row.evidence.as_deref(), Some("timeout_5s"));
+    }
+
+    /// selection 回执因果终态（confirmed）不代答共存的 send pending：model/thought
+    /// 各自 confirmed；**没有新用户消息证据的 send 绝不因此写 confirmed**（否则
+    /// 实质违反「ACK-only 不升级」），它由自己的计时器结算为 inconclusive。
+    #[tokio::test]
+    async fn selection_receipt_does_not_touch_pending_send_on_confirm() {
+        let store = stored(URL);
+        let ledger: Arc<dyn CapabilityLedger> = Arc::new(DbCapabilityLedger::new(store.clone()));
+        let fake = Arc::new(FakeBackend::default());
+        fake.set_baseline(ConfirmationBaseline {
+            key: confirmation_key(),
+            observation: ConfirmationObservation {
+                revision: Some(10),
+                provider: Some("synthetic-provider".to_owned()),
+                log_fingerprint: Some("u0".to_owned()),
+            },
+        });
+        let (hub, _events, _pump) = confirmation_hub(
+            fake.clone(),
+            ledger.clone(),
+            policy_with(&["send", "model", "thought_level"]),
+        )
+        .await;
+        let generation = hub.connection().generation;
+
+        hub.execute(ctx("send-mixed-2"), send_action(generation))
+            .await
+            .expect("send 应被受理");
+
+        // selection 回执因果终态。
+        fake.set_execute_receipt(ActionState::Confirmed, None);
+        let receipt = hub
+            .execute(
+                ctx("selection-mixed-2"),
+                selection_action(generation, "GLM-5.3-Flash", "low"),
+            )
+            .await
+            .expect("confirmed 回执返回 Ok");
+        assert_eq!(receipt.state, ActionState::Confirmed);
+
+        let rows = ledger.get(&confirmation_key());
+        assert_eq!(rows.len(), 2, "send 绝不随 selection 回执升级");
+        for row in &rows {
+            assert!(matches!(
+                row.capability,
+                Capability::Model | Capability::ThoughtLevel
+            ));
+            assert_eq!(row.state, CapabilityState::Confirmed);
+            assert_eq!(row.evidence.as_deref(), Some("selection_matched"));
+        }
+
+        // send pending 完好：自己的窗到期 → 自己的 inconclusive。
+        wait_until_with_sleep(|| ledger.get(&confirmation_key()).len() == 3).await;
+        let rows = ledger.get(&confirmation_key());
+        let send_row = rows
+            .iter()
+            .find(|row| row.capability == Capability::Send)
+            .expect("send pending 应保留并由自己的计时器结算");
+        assert_eq!(send_row.state, CapabilityState::Inconclusive);
+        assert_eq!(send_row.evidence.as_deref(), Some("timeout_5s"));
     }
 
     /// 动作回执显式失败 → 该 key 的该能力 degraded（冻结原因码），只影响它自己。
