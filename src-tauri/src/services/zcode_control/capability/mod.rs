@@ -6,22 +6,19 @@
 //! - `interface`：接口形状 → 候选能力的纯判定（spec §6.4）。
 //!
 //! 边界纪律：只记录存在性与形状，**绝不**存正文、题目、选项、答案、JWT、链接。
-//! T2 账本 / T3 形状采集 / T4 resolver 都建立在本核之上（T1 交付时尚无消费方，
-//! 故沿 `bridge.rs` 惯例仅在非测试构建放宽 dead_code / unused_imports——测试
-//! 构建必须全部用到）。
-#![cfg_attr(not(test), allow(dead_code))]
+//! T2 账本 / T3 形状采集 / T4 resolver 都建立在本核之上；T4 装配后全部符号都有
+//! 生产消费方，模块级 dead_code 放宽已收口（个别仍 staged 的符号在条目级单独放宽）。
 
 pub(crate) mod interface;
 pub(crate) mod key;
+pub(crate) mod resolver;
 pub(crate) mod state;
 
-// 便捷再导出（T2-T4 的统一入口面）；T1 阶段生产构建暂无消费方，仅非测试构建
-// 放宽 unused_imports（测试构建由下方冒烟用例消费，不得放宽）。
-#[cfg_attr(not(test), allow(unused_imports))]
+// 便捷再导出（T2-T4 的统一入口面）；全部有生产消费方
+// （resolver / hub / dao / types / bridge），不再放宽 unused_imports。
 pub(crate) use interface::interface_capabilities;
-#[cfg_attr(not(test), allow(unused_imports))]
 pub(crate) use key::{shipped_state, CapabilityKey};
-#[cfg_attr(not(test), allow(unused_imports))]
+pub(crate) use resolver::resolve_capabilities;
 pub(crate) use state::{Capability, CapabilityRecord, CapabilityState, ZcodeInterfaceEvidence};
 
 #[cfg(test)]

@@ -103,6 +103,9 @@ pub(crate) struct CapabilityRecord {
 
 impl CapabilityRecord {
     /// 首次真实动作确认成功（spec R4）。
+    ///
+    /// 生产写入方在 R4 确认流程任务接线（T4 只装配读侧）——条目级放宽，接线后移除。
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn confirmed(capability: Capability) -> Self {
         Self {
             capability,
@@ -113,6 +116,9 @@ impl CapabilityRecord {
     }
 
     /// 实机确认明确失败（spec R4/R6：降级并携带冻结原因码）。
+    ///
+    /// 生产写入方在 R4 确认流程任务接线（T4 只装配读侧）——条目级放宽，接线后移除。
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn degraded(capability: Capability, reason: String) -> Self {
         Self {
             capability,

@@ -31,15 +31,17 @@ use tokio::sync::{broadcast, mpsc, Mutex as AsyncMutex, Notify};
 use super::auth::{AuthService, AuthStatus, OAuthProvider, OpenAuthorize};
 use super::auto_connect::{capture_auto_intent, write_auto_intent, AutoIntentClaim};
 use super::bridge::{BridgeManager, DataOutcome};
+use super::capability::{resolve_capabilities, CapabilityKey};
 use super::command::CommandSender;
 use super::config::{get_config, ConfigState};
 use super::credential_store::OsCredentialStore;
 use super::relay::{DeviceRoute, RelayClient, RelayEvent, RelayLag};
 use super::types::{
     codes, ActionContext, ActionReceipt, BoundTarget, CapabilitySource, CapabilityView,
-    ConnectionState, ConnectionView, ControlAction, ControlEvent, ControlEventKind, SessionView,
-    TargetKey, ZResult, ZcodeError,
+    ConnectionState, ConnectionView, ControlAction, ControlEvent, ControlEventKind, HostEvidence,
+    SessionView, TargetKey, ZResult, ZcodeError,
 };
+use crate::database::dao::zcode_capability::DbCapabilityLedger;
 use crate::remote::pairing::DeviceStore;
 
 #[cfg(all(feature = "zcode-bridge-evidence", debug_assertions))]
@@ -54,9 +56,32 @@ const RELAY_EVENT_CAPACITY: usize = 64;
 /// 的会话（LRU），不随会话数无界增长。Data 溢出按此表逐会话降级）。
 const TRACKED_SESSION_CAP: usize = 32;
 
-/// 把静态矩阵包装成现算源（测试/固定夹具；生产源来自桥的宿主证据）。
+/// 把静态矩阵包装成现算源（测试/固定夹具；生产源来自 capability resolver）。
 fn static_policy_source(policy: CapabilityView) -> CapabilitySource {
     Arc::new(move || policy.clone())
+}
+
+/// schema 指纹占位（T4 裁决）：T3 尚未提供真实 schema 哈希；key 失效由
+/// `app_build` + `protocol_version` 承担，本占位只保证同 build 内 key 稳定
+/// （账本 confirmed/degraded 跨重连存活的前提）。恒为固定标识——正文/凭据
+/// 绝不进入 fingerprint。
+const SCHEMA_FINGERPRINT_PLACEHOLDER: &str = "v4";
+
+/// probe epoch 占位（T4 裁决）：本任务恒 0。失效面已由 invalidate 清空接口形状
+/// 证据 + build/协议变化换 key 覆盖；epoch 推进属后续探测复位任务。
+const PROBE_EPOCH: u32 = 0;
+
+/// 从宿主证据拼能力 key（spec R2 五元组）。platform 取本机 OS（`macos`/`windows`
+/// 与 shipped 表词表一致）；build/协议缺席按空串/0 处理（未知形态：shipped 不
+/// 命中、账本失配、仅接口候选可判——resolver 侧按缺证据保守关闭）。
+fn capability_key(evidence: &HostEvidence) -> CapabilityKey {
+    CapabilityKey::new(
+        std::env::consts::OS,
+        evidence.app_build.as_deref().unwrap_or(""),
+        evidence.protocol_version.unwrap_or(0),
+        SCHEMA_FINGERPRINT_PLACEHOLDER,
+        PROBE_EPOCH,
+    )
 }
 
 /// Hub 依赖的窄后端端口（测试注入 fake；生产 [`PartsBackend`]）。
@@ -225,7 +250,7 @@ pub struct PartsBackend {
     relay: Arc<RelayClient>,
     bridge: Arc<BridgeManager>,
     sender: Arc<CommandSender>,
-    /// 能力策略的**唯一**现算源：`bridge.host_evidence().policy()`。
+    /// 能力策略的**唯一**现算源：宿主证据 + DB 能力账本 → capability resolver。
     /// 会话矩阵（Hub）与执行闸（CommandSender）共用同一实例，禁止各存一份快照。
     policy_source: CapabilitySource,
     /// 投影代际：`reset`/重新连接/冲突时单调推进，保证 `BridgeManager::invalidate`
@@ -273,11 +298,22 @@ impl PartsBackend {
         let relay = Arc::new(relay_for(auth.clone(), events, ws_origin));
         let lag = relay.lag_watcher();
         let bridge = Arc::new(BridgeManager::new(relay.clone()));
-        // 单一策略源：桥的运行时证据（build/hello/协议/schema）→ for_host。
+        // 单一策略源（T4）：宿主证据（build/协议 → 能力 key）+ 接口形状 + DB 能力
+        // 账本 → capability resolver；解析路径异常由 resolver 兜底回退
+        // `production_unverified()` 全关（spec §6.6），账本读失败退化为
+        // shipped + 接口候选（不阻塞连接）。
         // sender 与会话 DTO 共用同一 source：证据变化后两边同时翻转。
         let policy_source: CapabilitySource = {
             let bridge = bridge.clone();
-            Arc::new(move || bridge.host_evidence().policy())
+            let ledger = Arc::new(DbCapabilityLedger::new(store.clone()));
+            Arc::new(move || {
+                let evidence = bridge.host_evidence();
+                resolve_capabilities(
+                    &capability_key(&evidence),
+                    &evidence.interface_evidence(),
+                    ledger.as_ref(),
+                )
+            })
         };
         let sender = Arc::new(
             CommandSender::new(bridge.clone(), store)
@@ -993,7 +1029,7 @@ impl ZcodeHub {
     /// （`BridgeManager` 会 spawn 出站 actor）。
     pub fn new(store: DeviceStore) -> Self {
         let (parts, relay_events, lag) = PartsBackend::production(store.clone());
-        // 生产唯一来源：桥的运行时证据 → `CapabilityPolicy::for_host`。
+        // 生产唯一来源：宿主证据 + DB 能力账本 → capability resolver（异常回退全关）。
         let policy_source = parts.policy_source();
         let bridge = parts.pump_bridge();
         let backend: Arc<dyn HubBackend> = Arc::new(parts);
@@ -1360,8 +1396,8 @@ impl ZcodeHub {
 
     /// 当前策略的唯一读取点：会话矩阵与 [`Self::check_policy`] 共用。
     ///
-    /// 生产 source = `BridgeManager::host_evidence().policy()`（build/hello/协议/
-    /// schema 运行时证据 → `CapabilityPolicy::for_host`）；测试可注入动态开关。
+    /// 生产 source = capability resolver（宿主证据 + DB 能力账本 + 接口形状证据，
+    /// 异常回退 `production_unverified`）；测试可注入动态开关。
     fn current_policy(&self) -> CapabilityView {
         (self.policy_source)()
     }
@@ -3004,6 +3040,32 @@ mod tests {
         let store = DeviceStore::memory();
         store.with(|conn| set_config(conn, url).unwrap());
         store
+    }
+
+    /// T4 装配裁决钉住：capability key 对同证据稳定（账本跨重连存活的前提），
+    /// build/协议变化即换 key；schema 指纹是占位常量（不含正文/凭据），probe
+    /// epoch 本任务恒 0。
+    #[test]
+    fn capability_key_is_stable_per_evidence_and_content_free() {
+        let mut evidence = HostEvidence::default();
+        evidence.app_build = Some("3.16.2.8769".to_owned());
+        evidence.protocol_version = Some(3);
+        assert_eq!(capability_key(&evidence), capability_key(&evidence));
+        // build / 协议变化 → 不同 key（失效单元语义）。
+        let mut upgraded = evidence.clone();
+        upgraded.app_build = Some("3.16.2.9999".to_owned());
+        assert_ne!(capability_key(&upgraded), capability_key(&evidence));
+        let mut pre_hello = evidence.clone();
+        pre_hello.protocol_version = None;
+        assert_ne!(capability_key(&pre_hello), capability_key(&evidence));
+        // 缺证据按未知处理（空 build / 协议 0），五元组其余字段为固定占位。
+        let unknown = capability_key(&HostEvidence::default());
+        assert_ne!(unknown, capability_key(&evidence));
+        assert_eq!(unknown.platform, std::env::consts::OS);
+        assert_eq!(unknown.app_build, "");
+        assert_eq!(unknown.protocol_version, 0);
+        assert_eq!(unknown.schema_fingerprint, "v4");
+        assert_eq!(unknown.probe_epoch, 0);
     }
 
     /// 一个已授权的持久身份（恢复路径的替身；不携带 JWT）。
