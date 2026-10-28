@@ -53,6 +53,29 @@ _Only versions translated so far are listed here; the full history lives in the
   and interrupt currently have an acceptance receipt only), the ZAI channel has source and
   simulated evidence only, and Windows has not been built or run; unverified capabilities say
   so in place and never open just because sending works.
+- **ZCode capabilities open per build (silent build-level capability resolution)**: on top
+  of the earlier "everything closed by default", build-level capability resolution ships —
+  the evidenced known build (`3.16.2.8769`) opens capabilities straight from a static table
+  (send / model / thought level / approval reply confirmed, single-select / interrupt as
+  candidates, multi-select / free text closed per contract); an **unknown build** (e.g.
+  after an official upgrade) no longer goes fully grey: capabilities whose interface shape
+  and real target match open as **candidates** first, and your **first real use** of one
+  runs a bounded confirmation (after the send, watch for 5 seconds for the host state to
+  advance — never resends, never sends any test message); a confirmed use sticks, an
+  explicit failure degrades that build + capability, and a timeout stays a candidate.
+  Capability keys invalidate and recompute automatically when the build / protocol changes,
+  and the confirmation ledger lives in the local database storing structured verdict
+  markers only (message content / questions / answers / credentials / links are never
+  recorded). The UI shows only "available / unavailable + an in-place reason" — there is no
+  probe page, probe button, or compatibility badge. Real-machine unknown-build verification
+  and send-fingerprint advancement forensics have not run yet; see the acceptance report.
+- **"Disconnect and take back" from the phone on conflict**: opening the ZCode official
+  page kicks Tuvis into "connection conflict" — the mobile ZCode control area then shows a
+  "**Disconnect and take back**" button: one tap drops the conflicting connection and
+  immediately reconnects with the saved authorization (credentials kept, no re-OAuth, no
+  second confirmation dialog), restoring "paired" on success; it tries **once** — if the
+  state is still conflict it only hints to close the official page first, and on failure
+  shows the localized reason for the frozen error code in place. It never loops.
 - **ZCode official remote link configuration with per-state phone hints**: the remote
   settings gained a "④ Tool-specific configuration" section whose first release is a
   single collapsed ZCode card — it stores the official remote-control link produced by

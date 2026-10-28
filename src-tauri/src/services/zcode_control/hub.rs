@@ -45,7 +45,7 @@ use super::relay::{DeviceRoute, RelayClient, RelayEvent, RelayLag};
 use super::types::{
     codes, ActionContext, ActionReceipt, ActionState, BoundTarget, CapabilitySource,
     CapabilityView, ConnectionState, ConnectionView, ControlAction, ControlEvent, ControlEventKind,
-    HostEvidence, SessionView, TargetKey, ZResult, ZcodeError,
+    HostBuildProbe, HostEvidence, SessionView, TargetKey, ZResult, ZcodeError,
 };
 use crate::database::dao::zcode_capability::{
     validate_evidence_token, CapabilityLedger, DbCapabilityLedger,
@@ -792,7 +792,7 @@ impl PartsBackend {
             AuthService::new(reqwest::Client::new())
                 .with_credential_store(Arc::new(OsCredentialStore::new(store.clone()))),
         );
-        Self::assemble_parts(store, auth, None)
+        Self::assemble_parts(store, auth, None, None)
     }
 
     /// 测试专用生产装配：复用测试里**真实**授权完成的 [`AuthService`]（同一 JWT 不
@@ -804,22 +804,40 @@ impl PartsBackend {
         auth: Arc<AuthService>,
         ws_origin: String,
     ) -> (Self, mpsc::Receiver<RelayEvent>, RelayLag) {
-        Self::assemble_parts(store, auth, Some(ws_origin))
+        Self::assemble_parts(store, auth, Some(ws_origin), None)
+    }
+
+    /// 测试专用生产装配（T9 未知 build e2e）：同 [`Self::production_test`]，另注入
+    /// 宿主 build 探针——真实探针读本机安装 APP 的 plist，跨机器/跨时间不可复现，
+    /// 「未知 build」用例必须确定性注入才能钉住 resolver 的接口候选路径。
+    #[cfg(test)]
+    pub(crate) fn production_test_with_host_build(
+        store: DeviceStore,
+        auth: Arc<AuthService>,
+        ws_origin: String,
+        host_build: HostBuildProbe,
+    ) -> (Self, mpsc::Receiver<RelayEvent>, RelayLag) {
+        Self::assemble_parts(store, auth, Some(ws_origin), Some(host_build))
     }
 
     /// 生产装配的唯一实现：`ws_origin = None` 恒走固定官方端点
     /// （[`RelayClient::new`]）；回环端点只在 `#[cfg(test)]` 下可注入。
+    /// `host_build` 只在测试目标下生效（见 [`bridge_with_host_build`]）。
     fn assemble_parts(
         store: DeviceStore,
         auth: Arc<AuthService>,
         ws_origin: Option<String>,
+        host_build: Option<HostBuildProbe>,
     ) -> (Self, mpsc::Receiver<RelayEvent>, RelayLag) {
         // 泵由 Hub 持有：State 溢出由 relay 无超时等待消费端（终态不丢），Data 溢出只
         // 置位 lag，由事件泵作废旧投影并让下一次 GET 重新 bind/现读（绝不阻塞 relay actor）。
         let (events, events_rx) = mpsc::channel(RELAY_EVENT_CAPACITY);
         let relay = Arc::new(relay_for(auth.clone(), events, ws_origin));
         let lag = relay.lag_watcher();
-        let bridge = Arc::new(BridgeManager::new(relay.clone()));
+        let bridge = Arc::new(bridge_with_host_build(
+            BridgeManager::new(relay.clone()),
+            host_build,
+        ));
         // 单一策略源（T4）：宿主证据（build/协议 → 能力 key）+ 接口形状 + DB 能力
         // 账本 → capability resolver；解析路径异常由 resolver 兜底回退
         // `production_unverified()` 全关（spec §6.6），账本读失败退化为
@@ -862,12 +880,14 @@ impl PartsBackend {
     }
 
     /// Hub 与会话能力矩阵使用的同一策略源（clone 只复制 `Arc`，不是矩阵快照）。
-    fn policy_source(&self) -> CapabilitySource {
+    /// `pub(crate)`：T9 e2e（wire_e2e）用生产同源 resolver 装配 Hub 时取同一实例。
+    pub(crate) fn policy_source(&self) -> CapabilitySource {
         self.policy_source.clone()
     }
 
     /// T2 能力账本实例（Hub 首次确认落账与 resolver 共用同一份）。
-    fn capability_ledger(&self) -> Arc<dyn CapabilityLedger> {
+    /// `pub(crate)`：T9 e2e（wire_e2e）装配 Hub 时把同一账本接进确认流程。
+    pub(crate) fn capability_ledger(&self) -> Arc<dyn CapabilityLedger> {
         self.ledger.clone()
     }
 
@@ -896,6 +916,28 @@ fn relay_for(
         Some(origin) => RelayClient::with_endpoint(auth, events, origin),
         _ => RelayClient::new(auth, events),
     }
+}
+
+/// 装配形态 → 宿主 build 探针：只在测试目标下把探针注入桥（`with_host_build` 是
+/// `#[cfg(test)]` 缝）；生产目标原样返回默认探针（读本机安装 APP，注入参数恒 `None`）。
+#[cfg(test)]
+fn bridge_with_host_build(
+    bridge: BridgeManager,
+    host_build: Option<HostBuildProbe>,
+) -> BridgeManager {
+    match host_build {
+        Some(probe) => bridge.with_host_build(probe),
+        None => bridge,
+    }
+}
+
+#[cfg(not(test))]
+fn bridge_with_host_build(
+    bridge: BridgeManager,
+    host_build: Option<HostBuildProbe>,
+) -> BridgeManager {
+    let _ = host_build;
+    bridge
 }
 
 impl HubBackend for PartsBackend {
@@ -1716,6 +1758,32 @@ impl ZcodeHub {
             Some((events, bridge, None)),
             Some(ledger),
             confirmation_timeout,
+        )
+    }
+
+    /// 事件泵测试构造 + 生产同源策略源与确认账本（T9 未知 build e2e）。
+    ///
+    /// 与生产 [`Self::new`] 的差别只在回环端点注入与探针来源：策略矩阵来自
+    /// `PartsBackend` 装配的 **capability resolver**（shipped + DB 账本 + 接口形状），
+    /// 确认落账与 resolver 共用同一份 DB 账本——e2e 据此证明「未知 build 接口候选
+    /// 开放 + 首次真实动作确认落账」走的是生产解析路径，不是注入的静态矩阵。
+    #[cfg(test)]
+    pub(crate) fn with_pump_policy_source_and_confirmation(
+        store: DeviceStore,
+        backend: Arc<dyn HubBackend>,
+        policy_source: CapabilitySource,
+        events: mpsc::Receiver<RelayEvent>,
+        bridge: Arc<dyn BridgePump>,
+        lag: RelayLag,
+        ledger: Arc<dyn CapabilityLedger>,
+    ) -> Self {
+        Self::assemble(
+            store,
+            backend,
+            policy_source,
+            Some((events, bridge, Some(lag))),
+            Some(ledger),
+            CONFIRMATION_TIMEOUT,
         )
     }
 

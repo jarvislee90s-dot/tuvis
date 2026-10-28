@@ -80,13 +80,16 @@ impl CapabilityLedger for DbCapabilityLedger {
 
 /// 读一个 storage key 的全部行（capability 名稳定排序）；表缺失/查询失败 → Err
 /// （由 trait 实现侧折成空 Vec）。
+///
+/// 错误正文带独立描述（不是裸 `{e}`）：错误码对账脚本按「同串多码」把不同码的
+/// 裸 `{e}` 体判成同一句，描述文本让每条错误正文唯一。
 fn get_conn(conn: &Connection, storage_key: &str) -> Result<Vec<CapabilityRecord>, String> {
     let mut stmt = conn
         .prepare(
             "SELECT capability, state, reason_code, evidence
              FROM zcode_capability_evidence WHERE key = ?1 ORDER BY capability",
         )
-        .map_err(|e| format!("CAPABILITY_LEDGER_READ_FAIL: {e}"))?;
+        .map_err(|e| format!("CAPABILITY_LEDGER_READ_FAIL: 能力账本读取失败: {e}"))?;
     let rows = stmt
         .query_map(params![storage_key], |row| {
             Ok((
@@ -96,11 +99,11 @@ fn get_conn(conn: &Connection, storage_key: &str) -> Result<Vec<CapabilityRecord
                 row.get::<_, Option<String>>(3)?,
             ))
         })
-        .map_err(|e| format!("CAPABILITY_LEDGER_READ_FAIL: {e}"))?;
+        .map_err(|e| format!("CAPABILITY_LEDGER_READ_FAIL: 能力账本行读取失败: {e}"))?;
     let mut records = Vec::new();
     for row in rows {
         let (capability, state, reason_code, evidence) =
-            row.map_err(|e| format!("CAPABILITY_LEDGER_READ_FAIL: {e}"))?;
+            row.map_err(|e| format!("CAPABILITY_LEDGER_READ_FAIL: 能力账本行解析失败: {e}"))?;
         // 只认冻结词表：capability/state 任一解析不出 → 跳过该行（不猜语义、不 panic）
         let (Some(capability), Some(state)) =
             (capability_from_str(&capability), state_from_str(&state))
@@ -137,7 +140,7 @@ fn put_conn(conn: &Connection, storage_key: &str, record: &CapabilityRecord) -> 
             now_ms(),
         ],
     )
-    .map_err(|e| format!("CAPABILITY_LEDGER_WRITE_FAIL: {e}"))?;
+    .map_err(|e| format!("CAPABILITY_LEDGER_WRITE_FAIL: 能力账本写入失败: {e}"))?;
     Ok(())
 }
 
@@ -190,12 +193,16 @@ fn capability_from_str(raw: &str) -> Option<Capability> {
 /// `pub(crate)`：T5 确认流程在写 degraded 前用同一闸净化回执原因码（冻结码外的
 /// 宿主原因一律换兜底码），保证落库形状与硬闸判定同源。
 pub(crate) fn validate_evidence_token(value: &str) -> Result<(), String> {
+    // 错误正文统一挂 `EVIDENCE_TOKEN_INVALID` 码前缀（错误码对账纪律：错误上下文的
+    // 中文文案必须带码；正文各不相同，不触发「同串多码」）。这些 Err 只被 `put`
+    // 包成 EVIDENCE_REJECTED/REASON_CODE_REJECTED 后内部消化（warn 日志），
+    // 绝不上屏。
     if value.is_empty() {
-        return Err("判据标识为空".to_owned());
+        return Err("EVIDENCE_TOKEN_INVALID: 判据标识为空".to_owned());
     }
     if value.len() > EVIDENCE_MAX_LEN {
         return Err(format!(
-            "判据标识超长（{}/{}）",
+            "EVIDENCE_TOKEN_INVALID: 判据标识超长（{}/{}）",
             value.len(),
             EVIDENCE_MAX_LEN
         ));
@@ -205,18 +212,18 @@ pub(crate) fn validate_evidence_token(value: &str) -> Result<(), String> {
         .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'+' | b'.' | b'-'))
     {
         return Err(format!(
-            "判据标识含白名单外字符（只允许 [A-Za-z0-9_.+-]）: {value:?}"
+            "EVIDENCE_TOKEN_INVALID: 判据标识含白名单外字符（只允许 [A-Za-z0-9_.+-]）: {value:?}"
         ));
     }
     for segment in value.split(['+', '.', '-']) {
         if segment.len() > EVIDENCE_SEGMENT_MAX_LEN {
             return Err(format!(
-                "判据段超长（>{}，疑似 base64/JWT 片段）: {segment:?}",
+                "EVIDENCE_TOKEN_INVALID: 判据段超长（>{}，疑似 base64/JWT 片段）: {segment:?}",
                 EVIDENCE_SEGMENT_MAX_LEN
             ));
         }
         if segment.starts_with("eyJ") {
-            return Err("判据段含疑似 JWT 片段（eyJ 前缀）".to_owned());
+            return Err("EVIDENCE_TOKEN_INVALID: 判据段含疑似 JWT 片段（eyJ 前缀）".to_owned());
         }
     }
     Ok(())

@@ -2139,7 +2139,12 @@
     "zcodeUrlSidDuplicate": "The sid parameter appears more than once in the link",
     "zcodeUrlSidInvalid": "sid must not be empty and must not exceed 128 bytes",
     "zcodeUrlParamDuplicate": "An identity parameter appears more than once in the link",
-    "zcodeUrlStorage": "Failed to save settings — the previous configuration is unchanged"
+    "zcodeUrlStorage": "Failed to save settings — the previous configuration is unchanged",
+    "capabilityLedgerReadFail": "Capability ledger read failed; continuing without it (connection unaffected)",
+    "capabilityLedgerWriteFail": "Capability ledger write failed; this verdict was not recorded",
+    "evidenceRejected": "Evidence token failed validation and was rejected from the capability ledger",
+    "reasonCodeRejected": "Reason code failed validation and was rejected from the capability ledger",
+    "evidenceTokenInvalid": "Invalid evidence token (only structured verdict names and +/-/. combinations are allowed)"
   },
   "mobile": {
     "common": {

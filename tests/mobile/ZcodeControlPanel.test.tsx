@@ -1517,6 +1517,50 @@ describe("ZCode 控制面板：原因码 zh/en 全覆盖", () => {
   });
 });
 
+describe("ZCode 控制面板：能力呈现合规（spec R5/§7.6）", () => {
+  it("no probe UI and no approval card without pending", async () => {
+    // paired + ready + 无 pending + 无 selection + 无运行回合：屏幕上只允许
+    // 出现「如实呈现 + 发送面」。钉住三条呈现纪律：
+    // - 无探测页/按钮/徽标（build 兼容态绝不外显成任何探测 UI）；
+    // - 无 pending 不渲染审批/问答卡，无 selection 目录不渲染模型/档位控件；
+    // - 只有 capabilities.send.enabled 才显示可用（开启 → 发送面可见、无原因行）。
+    installFetch((url) => {
+      if (url.includes("/official-control")) {
+        return json({ configState: "missing", url: null });
+      }
+      if (url === ZCODE_CONNECTION_PATH) return json(connection());
+      if (url.startsWith(`${ZCODE_SESSION_PATH}?`)) return json(sessionView());
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+
+    render(<ZcodeControlPanel sessionId={SID} />);
+    await screen.findByTestId("zcode-send");
+    // 等全部权威 GET 落定（连接/会话/官方链接），避免异步面晚到误判「缺失」。
+    await act(async () => {});
+
+    // 探测 UI 一律不存在：无测试 id、无「探测/probe」字样的任何元素。
+    expect(screen.queryByTestId("zcode-probe")).toBeNull();
+    expect(screen.queryByText(/探测/)).toBeNull();
+    expect(screen.queryByText(/probe/i)).toBeNull();
+
+    // 无 pending：审批/问答卡一张都不渲染（作答面只来自宿主真实 pending）。
+    expect(screen.queryByTestId("zcode-pending-card")).toBeNull();
+    expect(screen.queryByTestId("zcode-pending-submit")).toBeNull();
+
+    // 无 selection 目录/档位：模型/档位控件不渲染（不伪造目录）。
+    expect(screen.queryByTestId("zcode-model-select")).toBeNull();
+    expect(screen.queryByTestId("zcode-thought-select")).toBeNull();
+
+    // 无运行回合（activeWorks 空）：打断按钮不渲染。
+    expect(screen.queryByTestId("zcode-interrupt")).toBeNull();
+
+    // send 能力开启：发送面可用可见；能力开启时不得带「不可用原因」行。
+    expect(screen.getByTestId("zcode-send")).toBeVisible();
+    expect(screen.getByTestId("zcode-send")).toBeEnabled();
+    expect(screen.queryByTestId("zcode-send-reason")).toBeNull();
+  });
+});
+
 describe("ZCode 控制面板：冲突态断开并抢回", () => {
   /** 冲突态替身：POST 返回的视图即其后权威 GET 的连接面（抢回后现读口径）。 */
   function conflictBackend(takeoverView: ConnectionView) {

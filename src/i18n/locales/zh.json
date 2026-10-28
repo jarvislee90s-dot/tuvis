@@ -2139,7 +2139,12 @@
     "zcodeUrlSidDuplicate": "链接中 sid 参数重复",
     "zcodeUrlSidInvalid": "sid 不能为空且不得超过 128 字节",
     "zcodeUrlParamDuplicate": "链接中身份参数重复",
-    "zcodeUrlStorage": "设置写入失败，原配置未改变"
+    "zcodeUrlStorage": "设置写入失败，原配置未改变",
+    "capabilityLedgerReadFail": "能力账本读取失败，本次按无账本处理（不影响连接）",
+    "capabilityLedgerWriteFail": "能力账本写入失败，本次确认结果未落账",
+    "evidenceRejected": "判据标识未通过受限校验，已拒绝写入能力账本",
+    "reasonCodeRejected": "原因码未通过受限校验，已拒绝写入能力账本",
+    "evidenceTokenInvalid": "判据标识不合法（只允许结构化判据名与 +/-/. 组合）"
   },
   "mobile": {
     "common": {
