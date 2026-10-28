@@ -1,7 +1,7 @@
-//! 首次真实动作确认的**纯判据**（spec R4；生产计划 T5）。
+//! 首次真实动作确认的**纯判据**（spec R4；生产计划 T5/T6）。
 //!
 //! 本文件零 I/O（无网络 / 无 DB / 无文件 / 无日志）：只承载确认上下文、观察输入、
-//! 判定结果与两个纯判据函数。接线（登记 / 观察 / 落账 / 超时）住在 Hub 的
+//! 判定结果与三个纯判据函数。接线（登记 / 观察 / 落账 / 超时）住在 Hub 的
 //! `ConfirmationTracker`（hub.rs），本文件只回答「这条观察算不算确认」。
 //!
 //! 判据（spec R4，控制者裁决口径）：
@@ -9,10 +9,13 @@
 //!   （新用户消息可见——用 id 变化代表可见，绝不存正文）；
 //! - model/thought = generation 匹配 AND revision 前进 AND 新快照
 //!   `selection.{provider,model,thought}` 与目标**精确相等**（三字段全等；
-//!   wrong model → 不确认，保持候选）。
+//!   wrong model → 不确认，保持候选）；
+//! - pending 卡（single/multi/free/approval）= generation 匹配 AND revision 前进
+//!   AND 目标 `request_key` 不在观察视图的 pending 列表（只认**目标卡**撤下，
+//!   旁边的卡消失绝不代答）。
 //!
-//! 边界纪律：观察输入只含 id 形状的指纹与选择三元组，**绝不**承载正文、题目、
-//! 选项、答案、JWT、链接。
+//! 边界纪律：观察输入只含 id 形状的指纹、选择三元组与 pending 卡的 id 集合，
+//! **绝不**承载正文、题目、选项、答案、JWT、链接。
 //!
 //! # 自裁偏差（已报备）
 //!
@@ -24,6 +27,7 @@
 use std::time::Instant;
 
 use super::{Capability, CapabilityKey};
+use crate::services::zcode_control::types::SessionView;
 
 /// 确认目标（动作提交时登记；观察与之对拍）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,6 +42,12 @@ pub(crate) enum ConfirmationTarget {
         provider: String,
         model: String,
         thought: String,
+    },
+    /// 问答作答 / 审批应答：目标宿主卡的 requestKey（本实现取 `PendingView`
+    /// 的 `interaction_id`；只存 id 形状，绝不存题目/选项/答案）。
+    Pending {
+        /// 登记时刻动作指向的宿主卡 id；观察侧它不在 pending 列表 = 目标卡撤下。
+        request_key: String,
     },
 }
 
@@ -166,9 +176,45 @@ pub(crate) fn confirm_selection(
     }
 }
 
+/// pending 卡判据（spec R4；生产计划 T6）：目标 requestKey 撤下 + revision 前进。
+///
+/// generation 不匹配的兜底语义同 [`confirm_send`]；`after.revision` 缺席（投影尚未
+/// 取得水位）同样保守不确认，等下一帧。目标类型不匹配（send/selection 上下文配了
+/// 本判据）是登记侧接线错误，保守不确认。
+///
+/// 判定只读 `after.pending` 的 `interaction_id` 集合：旁边的卡消失绝不构成目标
+/// 卡撤下的证据；「只确认回答既有 permission 卡」的边界（spec §4.1）由登记侧保证
+/// ——登记只发生在用户对既有卡的动作（见 hub.rs `register_confirmations`）。
+pub(crate) fn confirm_pending(
+    ctx: &ConfirmationContext,
+    after: &SessionView,
+) -> ConfirmationOutcome {
+    if after.generation != ctx.generation {
+        return ConfirmationOutcome::Inconclusive;
+    }
+    let ConfirmationTarget::Pending { request_key } = &ctx.target else {
+        return ConfirmationOutcome::Inconclusive;
+    };
+    let Some(revision) = after.revision else {
+        // 水位未取得（投影尚无快照）：没有任何新证据，等下一帧。
+        return ConfirmationOutcome::Inconclusive;
+    };
+    let revision_advanced = revision > ctx.baseline_revision;
+    let target_cleared = !after
+        .pending
+        .iter()
+        .any(|card| card.interaction_id == *request_key);
+    if revision_advanced && target_cleared {
+        ConfirmationOutcome::Confirmed
+    } else {
+        ConfirmationOutcome::Inconclusive
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::services::zcode_control::types::{CapabilityView, PendingKind, PendingView};
 
     /// brief 指定的测试助手（不是生产接口）：send 上下文，baseline id 固定 `"u0"`
     /// （与 `send_obs` 的用例约定配套：before=u0 → ACK 同形；after=u1 → 变化）。
@@ -345,6 +391,140 @@ mod tests {
         stale.generation = 6;
         assert_eq!(
             confirm_selection(&ctx, &stale),
+            ConfirmationOutcome::Inconclusive
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // T6：pending 卡式能力（single/multi/free/approval）的纯判据
+    // -----------------------------------------------------------------------
+
+    /// brief 指定的测试助手（不是生产接口）：Pending 确认上下文（generation 7，
+    /// 与 `session_with` 的固定代际对齐）。
+    fn pending_ctx(request_key: &str, revision: u64) -> ConfirmationContext {
+        ConfirmationContext {
+            capability: Capability::SingleSelect,
+            key: CapabilityKey::new("macos", "9.9.9.9999", 3, "shape", 1),
+            session_id: "sess_pending".to_owned(),
+            generation: 7,
+            baseline_revision: revision,
+            target: ConfirmationTarget::Pending {
+                request_key: request_key.to_owned(),
+            },
+            deadline: Instant::now() + std::time::Duration::from_secs(5),
+        }
+    }
+
+    /// brief 指定的测试助手（不是生产接口）：最小会话视图（generation 固定 7）。
+    fn session_with(revision: u64, pending: Vec<PendingView>) -> SessionView {
+        SessionView {
+            session_id: "sess_pending".to_owned(),
+            generation: 7,
+            revision: Some(revision),
+            ready: true,
+            pending,
+            control: None,
+            selection: None,
+            capabilities: CapabilityView::default(),
+        }
+    }
+
+    /// 合成一张最小 pending 卡（判据只看 interaction_id；其余字段对判定不可见，
+    /// 也绝不携带题目/选项/答案正文）。
+    fn pending(interaction_id: &str) -> PendingView {
+        PendingView {
+            interaction_id: interaction_id.to_owned(),
+            kind: PendingKind::UserInput,
+            anchor_row_id: None,
+            tool_call_id: None,
+            created_at: None,
+            summary: None,
+            tool_name: None,
+            schema_interaction: None,
+            sensitive: false,
+            auto_resolution: false,
+            auto_resolution_state: None,
+            questions: Vec::new(),
+            options: Vec::new(),
+        }
+    }
+
+    /// brief Step 1 逐字用例：目标 pending 消失 + revision 前进 → confirmed。
+    #[test]
+    fn pending_cleared_and_revision_advanced_confirms_answer() {
+        let ctx = pending_ctx("req-1", 5);
+        let after = session_with(6, vec![]);
+        assert_eq!(
+            confirm_pending(&ctx, &after),
+            ConfirmationOutcome::Confirmed
+        );
+    }
+
+    /// brief Step 1 逐字用例：同一 pending 仍在（同形观察）→ 不确认。
+    #[test]
+    fn same_pending_does_not_confirm() {
+        let ctx = pending_ctx("req-1", 5);
+        let after = session_with(5, vec![pending("req-1")]);
+        assert_eq!(
+            confirm_pending(&ctx, &after),
+            ConfirmationOutcome::Inconclusive
+        );
+    }
+
+    /// 补充：目标卡仍在场（旁边别的卡撤下了）+ revision 前进 → 不确认
+    /// （「只确认目标 requestKey 消失，不把旁边的卡消失当成功」）。
+    #[test]
+    fn target_still_present_while_sibling_cleared_is_not_confirmed() {
+        let ctx = pending_ctx("req-1", 5);
+        let after = session_with(6, vec![pending("req-1"), pending("req-9")]);
+        assert_eq!(
+            confirm_pending(&ctx, &after),
+            ConfirmationOutcome::Inconclusive
+        );
+    }
+
+    /// 补充：目标卡已撤但 revision 未前进（同形观察）→ 不确认（两判据缺一不可）。
+    #[test]
+    fn cleared_without_revision_advance_is_not_confirmed() {
+        let ctx = pending_ctx("req-1", 5);
+        let after = session_with(5, vec![]);
+        assert_eq!(
+            confirm_pending(&ctx, &after),
+            ConfirmationOutcome::Inconclusive
+        );
+    }
+
+    /// 补充：观察证据缺一半（revision 未取得）→ 保守不确认，等下一帧。
+    #[test]
+    fn missing_revision_is_never_confirmed() {
+        let ctx = pending_ctx("req-1", 5);
+        let mut after = session_with(6, vec![]);
+        after.revision = None;
+        assert_eq!(
+            confirm_pending(&ctx, &after),
+            ConfirmationOutcome::Inconclusive
+        );
+    }
+
+    /// 补充：旧代际观察 → 纯函数侧保守不确认（tracker 另行丢弃不落账）。
+    #[test]
+    fn stale_generation_pending_observation_is_never_confirmed() {
+        let ctx = pending_ctx("req-1", 5);
+        let mut stale = session_with(6, vec![]);
+        stale.generation = 6;
+        assert_eq!(
+            confirm_pending(&ctx, &stale),
+            ConfirmationOutcome::Inconclusive
+        );
+    }
+
+    /// 补充：send 上下文配了 pending 判据（登记侧接线错误）→ 保守不确认。
+    #[test]
+    fn wrong_target_type_is_never_confirmed() {
+        let ctx = send_ctx(7, 5);
+        let after = session_with(6, vec![]);
+        assert_eq!(
+            confirm_pending(&ctx, &after),
             ConfirmationOutcome::Inconclusive
         );
     }

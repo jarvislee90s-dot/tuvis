@@ -33,8 +33,8 @@ use super::auth::{AuthService, AuthStatus, OAuthProvider, OpenAuthorize};
 use super::auto_connect::{capture_auto_intent, write_auto_intent, AutoIntentClaim};
 use super::bridge::{BridgeManager, DataOutcome};
 use super::capability::{
-    confirm_selection, confirm_send, resolve_capabilities, Capability, CapabilityKey,
-    CapabilityRecord, CapabilityState, ConfirmationBaseline, ConfirmationContext,
+    confirm_pending, confirm_selection, confirm_send, resolve_capabilities, Capability,
+    CapabilityKey, CapabilityRecord, CapabilityState, ConfirmationBaseline, ConfirmationContext,
     ConfirmationObservation, ConfirmationOutcome, ConfirmationTarget, SelectionObservation,
     SendObservation,
 };
@@ -102,6 +102,13 @@ mod confirmation_words {
     pub(crate) const SEND_CONFIRMED: &str = "revision_advanced+new_user_message";
     /// model/thought 确认：新快照选择三元组精确相等。
     pub(crate) const SELECTION_CONFIRMED: &str = "selection_matched";
+    /// pending 卡确认（泵观察判据路径）：目标卡撤下 + 会话 revision 前进。
+    pub(crate) const PENDING_CONFIRMED: &str = "pending_cleared+revision_advanced";
+    /// pending 卡确认（回执因果终态路径）：宿主已撤卡确证（CommandSender 的
+    /// wait_host_cleared 观察）；会话 revision 前进由泵判据负责，这里绝不冒写。
+    pub(crate) const PENDING_CLEARED: &str = "pending_cleared";
+    /// pending 卡到点未决且最后观察里目标卡仍在场。
+    pub(crate) const PENDING_STILL_PRESENT: &str = "pending_still_present";
     /// 确认窗到点未取得证据（不重发，保持候选）。
     pub(crate) const TIMEOUT: &str = "timeout_5s";
     /// 动作回执显式失败（host rejected/noop）。
@@ -205,7 +212,23 @@ impl ConfirmationTracker {
                 }
                 // 到点未决：inconclusive（有界窗，绝不重发）。
                 if now >= ctx.deadline {
-                    decisions.push((ctx, inconclusive_record(slot.1)));
+                    // Pending 目标：最后观察里目标卡仍在场 → 判据词如实记「卡未撤」；
+                    // 其余形态沿用一般超窗词。
+                    let record = match &ctx.target {
+                        ConfirmationTarget::Pending { request_key }
+                            if view
+                                .pending
+                                .iter()
+                                .any(|card| &card.interaction_id == request_key) =>
+                        {
+                            inconclusive_record_with(
+                                slot.1,
+                                confirmation_words::PENDING_STILL_PRESENT,
+                            )
+                        }
+                        _ => inconclusive_record(slot.1),
+                    };
+                    decisions.push((ctx, record));
                     continue;
                 }
                 let outcome = match &ctx.target {
@@ -237,9 +260,18 @@ impl ConfirmationTracker {
                         // 快照 config 未到：不判定，等下一帧。
                         None => ConfirmationOutcome::Inconclusive,
                     },
+                    ConfirmationTarget::Pending { .. } => {
+                        // 观察视图带的是桥投影代际：判定输入统一盖本 Hub 代际（与
+                        // send/selection 观察的 generation 实参同源），否则判据的
+                        // generation 闸永不咬合。
+                        let mut after = view.clone();
+                        after.generation = generation;
+                        confirm_pending(&ctx, &after)
+                    }
                 };
                 if outcome == ConfirmationOutcome::Confirmed {
-                    decisions.push((ctx, confirmed_record(slot.1)));
+                    let evidence = confirmed_evidence(&ctx.target);
+                    decisions.push((ctx, confirmed_record(slot.1, evidence)));
                 } else {
                     // Inconclusive：保持 pending（等后续帧或计时器）。
                     pending.insert(slot, ctx);
@@ -302,7 +334,10 @@ impl ConfirmationTracker {
                 ActionState::Confirmed => slots
                     .iter()
                     .filter_map(|slot| pending.remove(slot).map(|ctx| (ctx, slot.1)))
-                    .map(|(ctx, capability)| (ctx, confirmed_record(capability)))
+                    .map(|(ctx, capability)| {
+                        let evidence = confirmed_receipt_evidence(&ctx.target);
+                        (ctx, confirmed_record(capability, evidence))
+                    })
                     .collect(),
                 // 宿主显式失败 → degraded，只影响本 key 本能力（冻结原因码）。
                 ActionState::Rejected | ActionState::Noop => {
@@ -436,18 +471,30 @@ impl ConfirmationTracker {
     }
 }
 
-/// confirmed 行（evidence 按能力取判据词）。
-fn confirmed_record(capability: Capability) -> CapabilityRecord {
+/// confirmed 行（evidence 按调用方给的判据词落库；词由确认目标推导）。
+fn confirmed_record(capability: Capability, evidence: &str) -> CapabilityRecord {
     let mut record = CapabilityRecord::confirmed(capability);
-    record.evidence = Some(
-        match capability {
-            Capability::Send => confirmation_words::SEND_CONFIRMED,
-            Capability::Model | Capability::ThoughtLevel => confirmation_words::SELECTION_CONFIRMED,
-            _ => "confirmed",
-        }
-        .to_owned(),
-    );
+    record.evidence = Some(evidence.to_owned());
     record
+}
+
+/// 泵观察判据路径的 confirmed 判据词（按确认目标推导）。
+fn confirmed_evidence(target: &ConfirmationTarget) -> &'static str {
+    match target {
+        ConfirmationTarget::UserMessage { .. } => confirmation_words::SEND_CONFIRMED,
+        ConfirmationTarget::Selection { .. } => confirmation_words::SELECTION_CONFIRMED,
+        ConfirmationTarget::Pending { .. } => confirmation_words::PENDING_CONFIRMED,
+    }
+}
+
+/// 回执因果终态路径的 confirmed 判据词：pending 类能力在这里只确证「宿主已撤卡」
+/// （CommandSender 的 wait_host_cleared 观察），会话 revision 前进由泵判据负责
+/// ——判据词如实只写撤卡，绝不冒写未验证的判据。
+fn confirmed_receipt_evidence(target: &ConfirmationTarget) -> &'static str {
+    match target {
+        ConfirmationTarget::Pending { .. } => confirmation_words::PENDING_CLEARED,
+        _ => confirmed_evidence(target),
+    }
 }
 
 /// inconclusive 行（默认判据词 = 确认窗到点）。
@@ -608,7 +655,8 @@ pub trait HubBackend: Send + Sync {
     /// 本后端的证据能力矩阵（生产默认全关）。
     fn policy(&self) -> CapabilityView;
 
-    /// 动作提交路径的确认 baseline（T5 首次真实动作确认；send/model/thought 登记）。
+    /// 动作提交路径的确认 baseline（T5/T6 首次真实动作确认；send/model/thought/
+    /// 问答/审批登记）。
     ///
     /// 返回 `None` = 后端不提供 baseline（本次动作跳过确认登记）。生产
     /// [`PartsBackend`] 用桥的**只读快照**（revision/当前选择/日志头指纹，零网络）
@@ -997,6 +1045,21 @@ fn capability_flag<'a>(
         "thought_level" => &policy.thought_level,
         _ => return None,
     })
+}
+
+/// 宿主卡题型能力名 → 问答确认能力（`required_capabilities` 词表的确认侧逆映射）。
+///
+/// `approval_reply` **不在**本映射内（spec §4.1：审批确认只来自 Permission 动作）
+/// ——Answer 动作指向 permission 卡是客户端形状错误（build_user_answer 会拒绝），
+/// 其失败不构成审批能力证据。send/interrupt/model/thought_level 同样不在 pending
+/// 确认面上，返回 `None`。
+fn answer_capability(name: &str) -> Option<Capability> {
+    match name {
+        "single_select" => Some(Capability::SingleSelect),
+        "multi_select" => Some(Capability::MultiSelect),
+        "free_text" => Some(Capability::FreeText),
+        _ => None,
+    }
 }
 
 /// 广播一条控制事件（先取号再发送；调用方不得持内锁）。
@@ -1698,7 +1761,8 @@ impl ZcodeHub {
         let auto_notify = self.auto_notify.clone();
         // KICKED 的持久暂停同样走意图代际（P2-6）：事件到达即预占一代，延迟写携带它。
         let auto_intent_generation = self.auto_intent_generation.clone();
-        // T5 首次确认：事件泵把新投影喂给登记表（send/model/thought 的观察点）。
+        // T5/T6 首次确认：事件泵把新投影喂给登记表（send/model/thought 与
+        // pending 卡式能力的观察点）。
         let confirmations = self.confirmations.clone();
         #[cfg(test)]
         let kicked_intent_probe = self.kicked_intent_probe.clone();
@@ -2862,6 +2926,9 @@ impl ZcodeHub {
         }
         // CommandSender 只认公开代际（校验/落账/回执）；桥投影代际留在目标内部。
         let target = public_target(target, generation);
+        // 宿主卡题型推导出的能力名（Answer/Snooze；Permission 是静态闸不在此列）。
+        // 除过闸外，它还是问答确认登记的能力集来源（multi/free 只在形状存在时候选）。
+        let mut host_required: Vec<&'static str> = Vec::new();
         if host_aware {
             let required = self.backend.required_capabilities(&target, &action).await?;
             // 读宿主卡期间可能发生换代：旧代际动作零执行（与 `session` 同纪律）。
@@ -2869,18 +2936,28 @@ impl ZcodeHub {
                 return Err(ZcodeError::of(codes::STALE_GENERATION));
             }
             permits = self.check_required_policy(&action, &required)?;
+            host_required = required;
         }
         // R4 首次真实动作确认：闸门已全过、派发未发生——此刻登记 baseline
-        // （send/model/thought；已判决的能力与未提供 baseline 的后端跳过）。
-        // 能力集随 action 固定，收口/摘除只结算同一集合（selection 的回执绝不
-        // 代答同会话仍在 ACK 窗内的 send）。
-        let confirmation_capabilities: &[Capability] = match &action {
-            ControlAction::Send { .. } => &[Capability::Send],
-            ControlAction::Selection { .. } => &[Capability::Model, Capability::ThoughtLevel],
-            _ => &[],
+        // （send/model/thought/问答作答/审批应答；已判决的能力与未提供 baseline 的
+        // 后端跳过）。能力集随 action 固定，收口/摘除只结算同一集合（selection 的
+        // 回执绝不代答同会话仍在 ACK 窗内的 send）。
+        let confirmation_capabilities: Vec<Capability> = match &action {
+            ControlAction::Send { .. } => vec![Capability::Send],
+            ControlAction::Selection { .. } => vec![Capability::Model, Capability::ThoughtLevel],
+            // 问答作答：候选 = 宿主卡题型推导（客户端所选数量/freeText 内容不参与）。
+            ControlAction::Answer { .. } => host_required
+                .iter()
+                .filter_map(|name| answer_capability(name))
+                .collect(),
+            // 审批应答：只确认「回答既有 permission 卡」（spec §4.1）——登记只发生
+            // 在用户对既有卡的动作上，不监听「发送触发审批卡」/elicitation/新卡。
+            ControlAction::Permission { .. } => vec![Capability::ApprovalReply],
+            // Snooze 只暂停自动结束计时，不是作答/审批：零登记。
+            _ => Vec::new(),
         };
         if !confirmation_capabilities.is_empty() {
-            self.register_confirmations(&action, confirmation_capabilities, generation)
+            self.register_confirmations(&action, &confirmation_capabilities, generation)
                 .await;
         }
         let dispatch = self
@@ -2895,7 +2972,7 @@ impl ZcodeHub {
                 let current_generation = self.lock().generation;
                 self.confirmations.settle_receipt(
                     action.session_id(),
-                    confirmation_capabilities,
+                    &confirmation_capabilities,
                     &receipt,
                     current_generation,
                 );
@@ -2919,7 +2996,7 @@ impl ZcodeHub {
                 // 派发失败（CAS 陈旧/端口错误）不构成能力证据：只摘除本动作能力集
                 // 内的 pending，绝不据此降级（降级只留给回执显式失败）。
                 self.confirmations
-                    .drop_pending(action.session_id(), confirmation_capabilities);
+                    .drop_pending(action.session_id(), &confirmation_capabilities);
                 Err(error)
             }
         }
@@ -2971,6 +3048,21 @@ impl ZcodeHub {
                     model: model.clone(),
                     thought: thought.clone(),
                 },
+                // 问答作答：目标 = 动作指向的宿主卡 requestKey（本实现取
+                // `PendingView.interaction_id`；只存 id 形状，绝不存题目/选项/答案）。
+                (
+                    ControlAction::Answer { interaction_id, .. },
+                    Capability::SingleSelect | Capability::MultiSelect | Capability::FreeText,
+                ) => ConfirmationTarget::Pending {
+                    request_key: interaction_id.clone(),
+                },
+                // 审批应答：同上，且登记只发生在用户对**既有** permission 卡的动作
+                // （spec §4.1）——发送触发的新审批卡不在任何登记面上。
+                (ControlAction::Permission { interaction_id, .. }, Capability::ApprovalReply) => {
+                    ConfirmationTarget::Pending {
+                        request_key: interaction_id.clone(),
+                    }
+                }
                 _ => continue,
             };
             let ctx = ConfirmationContext {
@@ -8488,5 +8580,468 @@ mod tests {
             rows[0].evidence, None,
             "预置行未被确认流程改写（登记面已跳过）"
         );
+    }
+
+    // ====================================================================
+    // T6：首次真实作答/审批确认（spec R4/§4.1）——pending 卡式能力接线
+    // ====================================================================
+
+    /// Pending 确认测试的 baseline：revision 10（与纯判据用例同约定）。
+    fn pending_baseline() -> ConfirmationBaseline {
+        ConfirmationBaseline {
+            key: confirmation_key(),
+            observation: ConfirmationObservation {
+                revision: Some(10),
+                provider: None,
+                log_fingerprint: None,
+            },
+        }
+    }
+
+    /// 审批应答测试动作（既有 permission 卡的 optionId；option 原值不进账本）。
+    fn permission_action(generation: u64, interaction_id: &str, option_id: &str) -> ControlAction {
+        ControlAction::Permission {
+            session_id: "sess_synthetic0000".into(),
+            generation,
+            interaction_id: interaction_id.into(),
+            option_id: option_id.into(),
+        }
+    }
+
+    /// 合成一张最小宿主 pending 卡（观察面只保留 id 形状；题目/选项不入测试断言）。
+    fn pending_card(interaction_id: &str) -> PendingView {
+        PendingView {
+            interaction_id: interaction_id.to_owned(),
+            kind: PendingKind::UserInput,
+            anchor_row_id: None,
+            tool_call_id: None,
+            created_at: None,
+            summary: None,
+            tool_name: None,
+            schema_interaction: None,
+            sensitive: false,
+            auto_resolution: false,
+            auto_resolution_state: None,
+            questions: Vec::new(),
+            options: Vec::new(),
+        }
+    }
+
+    /// 带宿主卡集合的变化视图（其余字段与 `changed_view` 同形）。
+    fn changed_view_with_pending(
+        session_id: &str,
+        revision: u64,
+        cards: Vec<PendingView>,
+    ) -> SessionView {
+        let mut view = changed_view(session_id, revision);
+        view.pending = cards;
+        view
+    }
+
+    /// 问答作答首次使用：ACK 后泵观察到目标卡撤下 + revision 前进 → confirmed
+    /// （判据词 `pending_cleared+revision_advanced`；确认窗内绝不重发动作）。
+    ///
+    /// 长确认窗（2s）：不赌计时器，让确认走观察路径（T5 同款纪律）。
+    #[tokio::test]
+    async fn answer_confirmation_confirms_via_pump_when_target_cleared() {
+        let store = stored(URL);
+        let ledger: Arc<dyn CapabilityLedger> = Arc::new(DbCapabilityLedger::new(store.clone()));
+        let fake = Arc::new(FakeBackend::default());
+        fake.set_baseline(pending_baseline());
+        let (hub, events, pump) = confirmation_hub_with_timeout(
+            fake.clone(),
+            ledger.clone(),
+            policy_with(&["single_select"]),
+            Duration::from_secs(2),
+        )
+        .await;
+        let generation = hub.connection().generation;
+
+        let receipt = hub
+            .execute(
+                ctx("answer-confirm-1"),
+                answer_action(generation, "ix-synthetic-1", vec!["A"], None),
+            )
+            .await
+            .expect("answer 应被受理");
+        assert_eq!(receipt.state, ActionState::Accepted);
+
+        // 新投影：revision 前进 + 目标卡已从宿主集合撤下。
+        pump.push_outcome(
+            Ok(()),
+            vec![changed_view_with_pending("sess_synthetic0000", 11, vec![])],
+        );
+        events
+            .send(RelayEvent::Data(serde_json::json!({"seq": 1})))
+            .await
+            .unwrap();
+
+        wait_until_with_sleep(|| {
+            ledger
+                .get(&confirmation_key())
+                .first()
+                .is_some_and(|row| row.state == CapabilityState::Confirmed)
+        })
+        .await;
+
+        let rows = ledger.get(&confirmation_key());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].capability, Capability::SingleSelect);
+        assert_eq!(rows[0].state, CapabilityState::Confirmed);
+        assert_eq!(
+            rows[0].evidence.as_deref(),
+            Some("pending_cleared+revision_advanced")
+        );
+        assert_eq!(rows[0].reason_code, None);
+        // 结构性不重发：确认窗内只派发过一次动作。
+        assert_eq!(fake.execute_calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// 目标卡仍在场（哪怕 revision 前进、旁边的卡撤下了）：绝不确认——保持候选，
+    /// 等后续帧或到点结算（不重发）。
+    ///
+    /// 长确认窗（2s）：观察路径在窗内判定，判定结果由判据本身决定（目标卡在场 →
+    /// 永不 confirmed），账本为空即证明观察没有升级；到点词形由 tracker 级用例
+    /// 确定性钉住，这里不赌帧/计时器到达时序。
+    #[tokio::test]
+    async fn answer_confirmation_keeps_candidate_while_target_card_present() {
+        let store = stored(URL);
+        let ledger: Arc<dyn CapabilityLedger> = Arc::new(DbCapabilityLedger::new(store.clone()));
+        let fake = Arc::new(FakeBackend::default());
+        fake.set_baseline(pending_baseline());
+        let (hub, events, pump) = confirmation_hub_with_timeout(
+            fake.clone(),
+            ledger.clone(),
+            policy_with(&["single_select"]),
+            Duration::from_secs(2),
+        )
+        .await;
+        let generation = hub.connection().generation;
+
+        hub.execute(
+            ctx("answer-present-1"),
+            answer_action(generation, "ix-synthetic-1", vec!["A"], None),
+        )
+        .await
+        .expect("answer 应被受理");
+
+        // 新投影：revision 前进，但目标卡仍挂在宿主集合里（旁边卡撤下不算数）。
+        pump.push_outcome(
+            Ok(()),
+            vec![changed_view_with_pending(
+                "sess_synthetic0000",
+                11,
+                vec![
+                    pending_card("ix-synthetic-1"),
+                    pending_card("ix-synthetic-2"),
+                ],
+            )],
+        );
+        events
+            .send(RelayEvent::Data(serde_json::json!({"seq": 2})))
+            .await
+            .unwrap();
+        // 先证明帧确实进了桥（观察已发生），负断言才有意义。
+        wait_until(|| !pump.data.lock().unwrap().is_empty()).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            ledger.get(&confirmation_key()).is_empty(),
+            "目标卡在场绝不确认（保持候选，零落账）"
+        );
+        // 结构性不重发：确认窗内只派发过一次动作。
+        assert_eq!(fake.execute_calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// multi/free 只在宿主卡形状存在时候选：题型推导只报 single_select 时，策略里
+    /// 开着的多选/自由作答绝不登记、绝不确认（闸归 resolver，这里钉登记面）。
+    #[tokio::test]
+    async fn answer_confirmation_registers_only_shape_derived_capabilities() {
+        let store = stored(URL);
+        let ledger: Arc<dyn CapabilityLedger> = Arc::new(DbCapabilityLedger::new(store.clone()));
+        let fake = Arc::new(FakeBackend::default());
+        fake.set_baseline(pending_baseline());
+        let (hub, events, pump) = confirmation_hub_with_timeout(
+            fake.clone(),
+            ledger.clone(),
+            policy_with(&["single_select", "multi_select", "free_text"]),
+            Duration::from_secs(2),
+        )
+        .await;
+        let generation = hub.connection().generation;
+
+        hub.execute(
+            ctx("answer-shape-1"),
+            answer_action(generation, "ix-synthetic-1", vec!["A"], None),
+        )
+        .await
+        .expect("answer 应被受理");
+
+        pump.push_outcome(
+            Ok(()),
+            vec![changed_view_with_pending("sess_synthetic0000", 11, vec![])],
+        );
+        events
+            .send(RelayEvent::Data(serde_json::json!({"seq": 3})))
+            .await
+            .unwrap();
+
+        wait_until_with_sleep(|| !ledger.get(&confirmation_key()).is_empty()).await;
+        let rows = ledger.get(&confirmation_key());
+        assert_eq!(rows.len(), 1, "只有题型推导出的 single_select 登记确认");
+        assert_eq!(rows[0].capability, Capability::SingleSelect);
+        assert_eq!(rows[0].state, CapabilityState::Confirmed);
+        assert!(
+            rows.iter().all(|row| {
+                !matches!(
+                    row.capability,
+                    Capability::MultiSelect | Capability::FreeText
+                )
+            }),
+            "形状缺席的 multi/free 绝不登记"
+        );
+    }
+
+    /// 混合题型（单选+多选+自由作答）一次作答同时确认三项：同卡同 requestKey，
+    /// 一个观察把同动作能力集的三个槽位一起结算。
+    #[tokio::test]
+    async fn answer_confirmation_settles_all_shape_derived_capabilities() {
+        let store = stored(URL);
+        let ledger: Arc<dyn CapabilityLedger> = Arc::new(DbCapabilityLedger::new(store.clone()));
+        let fake = Arc::new(FakeBackend::default());
+        fake.set_baseline(pending_baseline());
+        fake.set_required(Ok(vec!["single_select", "multi_select", "free_text"]));
+        let (hub, events, pump) = confirmation_hub_with_timeout(
+            fake.clone(),
+            ledger.clone(),
+            policy_with(&["single_select", "multi_select", "free_text"]),
+            Duration::from_secs(2),
+        )
+        .await;
+        let generation = hub.connection().generation;
+
+        hub.execute(
+            ctx("answer-shape-2"),
+            answer_action(generation, "ix-synthetic-1", vec!["A"], None),
+        )
+        .await
+        .expect("answer 应被受理");
+
+        pump.push_outcome(
+            Ok(()),
+            vec![changed_view_with_pending("sess_synthetic0000", 11, vec![])],
+        );
+        events
+            .send(RelayEvent::Data(serde_json::json!({"seq": 4})))
+            .await
+            .unwrap();
+
+        wait_until_with_sleep(|| ledger.get(&confirmation_key()).len() == 3).await;
+        for row in ledger.get(&confirmation_key()) {
+            assert!(matches!(
+                row.capability,
+                Capability::SingleSelect | Capability::MultiSelect | Capability::FreeText
+            ));
+            assert_eq!(row.state, CapabilityState::Confirmed);
+            assert_eq!(
+                row.evidence.as_deref(),
+                Some("pending_cleared+revision_advanced")
+            );
+        }
+    }
+
+    /// 审批应答首次使用（既有 permission 卡）：泵观察到目标卡撤下 + revision 前进
+    /// → approval_reply confirmed（spec §4.1：只确认「回答既有卡」）。
+    #[tokio::test]
+    async fn permission_confirmation_confirms_via_pump_when_target_cleared() {
+        let store = stored(URL);
+        let ledger: Arc<dyn CapabilityLedger> = Arc::new(DbCapabilityLedger::new(store.clone()));
+        let fake = Arc::new(FakeBackend::default());
+        fake.set_baseline(pending_baseline());
+        let (hub, events, pump) = confirmation_hub_with_timeout(
+            fake.clone(),
+            ledger.clone(),
+            policy_with(&["approval_reply"]),
+            Duration::from_secs(2),
+        )
+        .await;
+        let generation = hub.connection().generation;
+
+        let receipt = hub
+            .execute(
+                ctx("permission-confirm-1"),
+                permission_action(generation, "ix-synthetic-1", "allowOnce"),
+            )
+            .await
+            .expect("permission 应被受理");
+        assert_eq!(receipt.state, ActionState::Accepted);
+
+        pump.push_outcome(
+            Ok(()),
+            vec![changed_view_with_pending("sess_synthetic0000", 11, vec![])],
+        );
+        events
+            .send(RelayEvent::Data(serde_json::json!({"seq": 5})))
+            .await
+            .unwrap();
+
+        wait_until_with_sleep(|| {
+            ledger
+                .get(&confirmation_key())
+                .first()
+                .is_some_and(|row| row.state == CapabilityState::Confirmed)
+        })
+        .await;
+        let rows = ledger.get(&confirmation_key());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].capability, Capability::ApprovalReply);
+        assert_eq!(rows[0].state, CapabilityState::Confirmed);
+        assert_eq!(
+            rows[0].evidence.as_deref(),
+            Some("pending_cleared+revision_advanced")
+        );
+    }
+
+    /// 审批回执显式失败 → approval_reply degraded（explicit_failure），只影响它自己。
+    #[tokio::test]
+    async fn permission_receipt_failure_degrades_approval_only() {
+        let store = stored(URL);
+        let ledger: Arc<dyn CapabilityLedger> = Arc::new(DbCapabilityLedger::new(store.clone()));
+        let fake = Arc::new(FakeBackend::default());
+        fake.set_baseline(pending_baseline());
+        fake.set_execute_receipt(ActionState::Rejected, None);
+        let (hub, _events, _pump) = confirmation_hub(
+            fake.clone(),
+            ledger.clone(),
+            policy_with(&["approval_reply"]),
+        )
+        .await;
+        let generation = hub.connection().generation;
+
+        let receipt = hub
+            .execute(
+                ctx("permission-reject-1"),
+                permission_action(generation, "ix-synthetic-1", "deny"),
+            )
+            .await
+            .expect("回执带回显，execute 返回 Ok");
+        assert_eq!(receipt.state, ActionState::Rejected);
+
+        let rows = ledger.get(&confirmation_key());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].capability, Capability::ApprovalReply);
+        assert_eq!(rows[0].state, CapabilityState::Degraded);
+        assert_eq!(rows[0].evidence.as_deref(), Some("explicit_failure"));
+    }
+
+    /// 审批能力只确认「回答既有 permission 卡」：发送动作只登记 send——即便随后的
+    /// 投影 revision 前进（且投影里没有任何卡），approval_reply 也绝不因此写行
+    /// （不把「发送触发审批卡」当能力，不监听 elicitation/新卡）。
+    #[tokio::test]
+    async fn send_action_does_not_register_approval_for_new_permission_card() {
+        let store = stored(URL);
+        let ledger: Arc<dyn CapabilityLedger> = Arc::new(DbCapabilityLedger::new(store.clone()));
+        let fake = Arc::new(FakeBackend::default());
+        fake.set_baseline(send_baseline());
+        let (hub, events, pump) = confirmation_hub_with_timeout(
+            fake.clone(),
+            ledger.clone(),
+            policy_with(&["send", "approval_reply"]),
+            Duration::from_secs(2),
+        )
+        .await;
+        let generation = hub.connection().generation;
+
+        let receipt = hub
+            .execute(ctx("send-no-approval-1"), send_action(generation))
+            .await
+            .expect("send 应被受理");
+        assert_eq!(receipt.state, ActionState::Accepted);
+
+        // 新投影：revision 前进 + 新用户消息可见（send 的确认判据全满足）。
+        pump.set_fingerprint("sess_synthetic0000", "u1");
+        pump.push_outcome(
+            Ok(()),
+            vec![changed_view_with_pending("sess_synthetic0000", 11, vec![])],
+        );
+        events
+            .send(RelayEvent::Data(serde_json::json!({"seq": 6})))
+            .await
+            .unwrap();
+
+        wait_until_with_sleep(|| {
+            ledger
+                .get(&confirmation_key())
+                .first()
+                .is_some_and(|row| row.state == CapabilityState::Confirmed)
+        })
+        .await;
+        let rows = ledger.get(&confirmation_key());
+        assert_eq!(rows.len(), 1, "只落 send 一行");
+        assert_eq!(rows[0].capability, Capability::Send);
+        assert!(
+            rows.iter()
+                .all(|row| row.capability != Capability::ApprovalReply),
+            "approval_reply 不随发送动作登记/确认"
+        );
+    }
+
+    /// 到点未决的 Pending 登记：最后观察里目标卡仍在场 → 判据词如实记
+    /// `pending_still_present`；卡已撤的到点登记沿用一般超窗词（直调 tracker，
+    /// 与计时器醒来的 sweep 语义一致——到点即 inconclusive，绝不重判）。
+    #[tokio::test]
+    async fn expired_pending_observation_reports_card_still_present() {
+        let store = stored(URL);
+        let ledger: Arc<dyn CapabilityLedger> = Arc::new(DbCapabilityLedger::new(store.clone()));
+        let fake = Arc::new(FakeBackend::default());
+        fake.set_baseline(pending_baseline());
+        let (hub, _events, _pump) = confirmation_hub(
+            fake.clone(),
+            ledger.clone(),
+            policy_with(&["single_select"]),
+        )
+        .await;
+        let generation = hub.connection().generation;
+
+        // 直调登记面：两条已到点的 Pending 登记（同会话不同能力槽位）。
+        for (capability, request_key) in [
+            (Capability::SingleSelect, "ix-synthetic-1"),
+            (Capability::MultiSelect, "ix-synthetic-2"),
+        ] {
+            assert!(hub.confirmations.register(ConfirmationContext {
+                capability,
+                key: confirmation_key(),
+                session_id: "sess_synthetic0000".to_owned(),
+                generation,
+                baseline_revision: 10,
+                target: ConfirmationTarget::Pending {
+                    request_key: request_key.to_owned(),
+                },
+                deadline: Instant::now(),
+            }));
+        }
+
+        // 观察帧：revision 前进，卡 ix-1 仍在场、卡 ix-2 已撤（但登记均已到点，
+        // 到点分支先于判据——证据词按最后观察如实区分）。
+        hub.confirmations.observe_session(
+            &changed_view_with_pending(
+                "sess_synthetic0000",
+                11,
+                vec![pending_card("ix-synthetic-1")],
+            ),
+            generation,
+            None,
+        );
+
+        let rows = ledger.get(&confirmation_key());
+        assert_eq!(rows.len(), 2);
+        for row in &rows {
+            assert_eq!(row.state, CapabilityState::Inconclusive);
+            let expected = match row.capability {
+                Capability::SingleSelect => "pending_still_present",
+                Capability::MultiSelect => "timeout_5s",
+                other => panic!("unexpected capability {other:?}"),
+            };
+            assert_eq!(row.evidence.as_deref(), Some(expected));
+        }
     }
 }
