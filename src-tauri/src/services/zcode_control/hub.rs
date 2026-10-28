@@ -2013,6 +2013,21 @@ impl ZcodeHub {
 
     /// 本 future 被取消/panic 时，`guard` 随栈帧 Drop，按 epoch 兜底清位。
     pub(crate) async fn finish_disconnect(&self, guard: CloseGuard) {
+        self.finish_disconnect_with(guard, true).await;
+    }
+
+    /// 静默收尾（**退出/进程终结专用**）：清位规则与 [`Self::finish_disconnect`] 相同，
+    /// 但**不唤醒**自动连接——退出只释放资源，绝不因补唤醒而用仍在内存的 JWT /
+    /// 仍有效的 auto 意图新开一条 relay（「退出只释放、不自动重连」）。
+    ///
+    /// 远程停服/显式断开仍必须用会唤醒的 [`Self::finish_disconnect`]（P2-5：
+    /// 关闭窗口内被消费的唤醒不得丢）。
+    pub(crate) async fn finish_disconnect_silent(&self, guard: CloseGuard) {
+        self.finish_disconnect_with(guard, false).await;
+    }
+
+    /// 关闭清理的公共收尾：静默段 → 按 epoch 清位 → 可选唤醒。
+    async fn finish_disconnect_with(&self, guard: CloseGuard, wake: bool) {
         // 静默段与忘授权的顺序解耦（P2-4 复用同一实现）。
         if !self.quiesce_disconnect(&guard).await {
             drop(guard);
@@ -2020,11 +2035,13 @@ impl ZcodeHub {
         }
         // 静默完成后再清位：新 connect 只可能在清理完全结束后才被允许。
         drop(guard);
-        // P2-5：清位后补一次唤醒。关闭窗口内到达的唤醒只能让 worker 看到
-        // Offline/closing 并以 Stopped 消费掉；不补这一次，「快关快开」就丢了唤醒。
-        // 只唤醒不越权：worker 现查 auto 意图/remote.enabled/链接，用户断开（auto=false）
-        // 仍不会自动连接。
-        self.wake_auto_connect();
+        if wake {
+            // P2-5：清位后补一次唤醒。关闭窗口内到达的唤醒只能让 worker 看到
+            // Offline/closing 并以 Stopped 消费掉；不补这一次，「快关快开」就丢了唤醒。
+            // 只唤醒不越权：worker 现查 auto 意图/remote.enabled/链接，用户断开
+            // （auto=false）仍不会自动连接。
+            self.wake_auto_connect();
+        }
     }
 
     /// 用户显式断开：推进代际、保留 JWT，可再次连接。
@@ -6563,6 +6580,45 @@ mod tests {
             fake.connect_calls.load(Ordering::SeqCst),
             connects_before + 1
         );
+    }
+
+    /// P2-5 反例（退出路径）：`finish_disconnect_silent` 清位后不得唤醒自动连接；
+    /// 条件本身仍允许连接（显式唤醒立刻重连），证明差异只在「是否补唤醒」。
+    #[tokio::test]
+    async fn silent_finish_disconnect_does_not_wake_auto() {
+        let fake = Arc::new(FakeBackend::default());
+        fake.set_restored_auth(authorized_auth());
+        let store = stored(URL);
+        set_remote_enabled(&store, true);
+        let hub = Arc::new(ZcodeHub::with_parts(
+            store.clone(),
+            fake.clone(),
+            send_policy(),
+        ));
+        hub.start_auto_connect();
+        wait_for_connection(&hub, ConnectionState::Paired).await;
+        let connects_before = fake.connect_calls.load(Ordering::SeqCst);
+        let attempts = hub.auto_attempt_count();
+
+        let (_view, guard) = hub.begin_disconnect();
+        hub.finish_disconnect_silent(guard).await;
+        settle().await;
+        assert_eq!(hub.connection().state, ConnectionState::Offline);
+        assert_eq!(
+            hub.auto_attempt_count(),
+            attempts,
+            "静默收尾不得唤醒自动连接 worker"
+        );
+        assert_eq!(
+            fake.connect_calls.load(Ordering::SeqCst),
+            connects_before,
+            "退出静默断开后不得自动重连"
+        );
+
+        // 反证：显式唤醒仍会重连（上面不连是静默，不是条件不允许）。
+        hub.wake_auto_connect();
+        wait_until(|| fake.connect_calls.load(Ordering::SeqCst) > connects_before).await;
+        wait_for_connection(&hub, ConnectionState::Paired).await;
     }
 
     /// P2-5：finish 的补唤醒只做一次现查判定——用户明确断开（auto=false）仍不连接。

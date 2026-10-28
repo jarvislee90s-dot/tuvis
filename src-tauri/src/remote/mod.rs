@@ -749,20 +749,27 @@ pub(crate) fn install_zcode_hub() -> std::sync::Arc<crate::services::zcode_contr
 /// 停服/退出断开内核（**仅测试缝**）：生产同步入口自己先 `begin_disconnect`，
 /// 再把 `finish_zcode_hub` 交给 runtime；本函数保留给测试一次调用断言「begin +
 /// 有界等待」的组合语义（`wait` 只约束等待，超时返回 `false` 且不取消清理）。
+///
+/// `wake` 必须与生产入口一致：远程停服 = `true`（P2-5 补唤醒），退出清理 =
+/// `false`（静默：退出只释放、不自动重连）。
 #[cfg(test)]
 async fn disconnect_zcode_hub_core(
     hub: Option<std::sync::Arc<crate::services::zcode_control::ZcodeHub>>,
     wait: std::time::Duration,
+    wake: bool,
 ) -> bool {
     let Some(hub) = hub else {
         return false;
     };
     // 前半段：同步、不持 connect_lock、不 await——到点前 Hub 必须已经 offline。
     let (_view, guard) = hub.begin_disconnect();
-    finish_zcode_hub(hub, guard, wait).await
+    finish_zcode_hub(hub, guard, wait, wake).await
 }
 
 /// 清理 + 有界等待（同步入口与可测内核共用）。
+///
+/// `wake`：`true` = 远程停服/显式关闭（清位后补唤醒自动连接，P2-5）；
+/// `false` = 退出清理（静默清位，绝不新开 relay）。
 ///
 /// `guard` 随 detached 任务移动：任务被取消、runtime 关停或 future 从未被调度时，
 /// future 析构会让 [`CloseGuard`](crate::services::zcode_control::hub::CloseGuard)
@@ -771,10 +778,15 @@ async fn finish_zcode_hub(
     hub: std::sync::Arc<crate::services::zcode_control::ZcodeHub>,
     guard: crate::services::zcode_control::hub::CloseGuard,
     wait: std::time::Duration,
+    wake: bool,
 ) -> bool {
     // 后半段：detached 清理（超时只影响下面的等待，不 abort 本任务）。
     let mut cleanup = tauri::async_runtime::spawn(async move {
-        hub.finish_disconnect(guard).await;
+        if wake {
+            hub.finish_disconnect(guard).await;
+        } else {
+            hub.finish_disconnect_silent(guard).await;
+        }
     });
     match tokio::time::timeout(wait, &mut cleanup).await {
         Ok(Ok(())) => true,
@@ -794,18 +806,31 @@ async fn finish_zcode_hub(
 /// 关停任务上限：兜住后台断开不无限悬住（relay 断开自身另有界）。
 const ZCODE_HUB_SHUTDOWN_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// 远程显性关闭与应用退出的断开口（T7.1 C2b / Fix round 2）。
+/// 远程显性关闭的断开口（T7.1 C2b / Fix round 2）：清位后**补唤醒**自动连接
+/// （P2-5：关闭窗口内被消费的唤醒不得丢；worker 现查 remote.enabled=false 即放弃）。
 ///
-/// 调用点（同步 Tauri 命令 / `RunEvent::Exit` / 升级前 `on_before_exit`）都在主线程
-/// 或同步上下文：这里**在调用线程只做同步前半段**（`begin_disconnect`：不 await、
-/// 不持 connect_lock，立即 Offline 并拿到关闭凭据），再把清理+有界等待交给 async
-/// runtime。即使 runtime 从未调度清理任务，凭据也会随 future 析构清位（不锁死 connect）。
+/// 调用点都在主线程或同步上下文：这里**在调用线程只做同步前半段**
+/// （`begin_disconnect`：不 await、不持 connect_lock，立即 Offline 并拿到关闭凭据），
+/// 再把清理+有界等待交给 async runtime。即使 runtime 从未调度清理任务，凭据也会随
+/// future 析构清位（不锁死 connect）。
 pub(crate) fn disconnect_zcode_hub() {
+    disconnect_zcode_hub_with(true);
+}
+
+/// 退出清理的断开口（`RunEvent::Exit` / 升级前 `on_before_exit`）：**静默**——只释放
+/// relay/计时器并清位，绝不唤醒自动连接。退出时 remote.enabled/auto 意图/内存 JWT
+/// 可能仍然有效，补唤醒会真的新开一条 relay，违反「退出只释放、不自动重连」。
+pub(crate) fn disconnect_zcode_hub_silent() {
+    disconnect_zcode_hub_with(false);
+}
+
+/// 同步前半段 + 交给 runtime 的公共实现（两个生产入口只差 `wake`）。
+fn disconnect_zcode_hub_with(wake: bool) {
     let Some(hub) = STATE.zcode_hub() else {
         return;
     };
     let (_view, guard) = hub.begin_disconnect();
-    tauri::async_runtime::spawn(finish_zcode_hub(hub, guard, ZCODE_HUB_SHUTDOWN_WAIT));
+    tauri::async_runtime::spawn(finish_zcode_hub(hub, guard, ZCODE_HUB_SHUTDOWN_WAIT, wake));
 }
 
 /// 从看板地址抽域名（纯函数）：快照 url 契约恒为含 /m 的完整地址（board_url 归一），
@@ -5256,7 +5281,7 @@ mod zcode_wiring_tests {
         let connects_before = fake.connect_calls.load(Ordering::SeqCst);
 
         assert!(
-            disconnect_zcode_hub_core(Some(hub.clone()), ZCODE_HUB_SHUTDOWN_WAIT).await,
+            disconnect_zcode_hub_core(Some(hub.clone()), ZCODE_HUB_SHUTDOWN_WAIT, true).await,
             "正常断开应完成"
         );
         assert_eq!(
@@ -5280,9 +5305,71 @@ mod zcode_wiring_tests {
         );
 
         assert!(
-            !disconnect_zcode_hub_core(None, ZCODE_HUB_SHUTDOWN_WAIT).await,
+            !disconnect_zcode_hub_core(None, ZCODE_HUB_SHUTDOWN_WAIT, true).await,
             "未装配 = no-op"
         );
+    }
+
+    /// 退出路径回归（P2-5 补唤醒不得外溢）：自动连接/远程/链接全开且已配对时，
+    /// **静默**入口（`disconnect_zcode_hub_silent` = `finish_zcode_hub(.., wake=false)`）
+    /// 清位后不得唤醒 worker——退出只释放，绝不因补唤醒用仍在内存的 JWT 新开 relay。
+    ///
+    /// 反证：条件本身允许自动连接（手动唤醒仍会立刻重连），因此本用例能证伪
+    /// 「退出路径误走会唤醒的入口」。
+    #[tokio::test]
+    async fn silent_shutdown_does_not_wake_auto_connect() {
+        let fake = Arc::new(FakeBackend::default());
+        fake.authorized.store(true, Ordering::SeqCst);
+        fake.remembered.store(true, Ordering::SeqCst);
+        let store = stored(URL);
+        store
+            .with(|conn| try_set_setting_conn(conn, KEY_ENABLED, "true"))
+            .unwrap();
+        let hub = fake_hub(fake.clone(), store);
+        hub.start_auto_connect();
+        wait_until(
+            || hub.connection().state == ConnectionState::Paired,
+            "前置：自动连接必须已配对",
+        )
+        .await;
+        let connects = fake.connect_calls.load(Ordering::SeqCst);
+        let attempts = hub.auto_attempt_count();
+
+        // 退出清理内核：begin（同步前半段）+ finish(..., wake=false)。
+        assert!(
+            disconnect_zcode_hub_core(Some(hub.clone()), ZCODE_HUB_SHUTDOWN_WAIT, false).await,
+            "静默断开应完成"
+        );
+        assert_eq!(hub.connection().state, ConnectionState::Offline);
+
+        // 观察窗：误唤醒会立刻让 worker 重跑 attempt 并 connect。
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            hub.auto_attempt_count(),
+            attempts,
+            "静默清位后不得唤醒自动连接 worker"
+        );
+        assert_eq!(
+            fake.connect_calls.load(Ordering::SeqCst),
+            connects,
+            "退出静默断开后不得自动重连"
+        );
+        assert_eq!(hub.connection().state, ConnectionState::Offline);
+
+        // 反证：条件仍允许自动连接——只有显式唤醒才会重连（误 wake 时上面已红）。
+        hub.wake_auto_connect();
+        wait_until(
+            || fake.connect_calls.load(Ordering::SeqCst) > connects,
+            "显式唤醒必须仍能自动重连（证明上面是静默而非条件不允许）",
+        )
+        .await;
+        wait_until(
+            || hub.connection().state == ConnectionState::Paired,
+            "显式唤醒后应重新配对",
+        )
+        .await;
     }
 
     /// 关停任务必须有界：清理被挂住时，内核按上限返回 false，Hub 仍**立即** offline，
@@ -5299,7 +5386,11 @@ mod zcode_wiring_tests {
         let started = std::time::Instant::now();
         let completed = tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            disconnect_zcode_hub_core(Some(hub.clone()), std::time::Duration::from_millis(50)),
+            disconnect_zcode_hub_core(
+                Some(hub.clone()),
+                std::time::Duration::from_millis(50),
+                true,
+            ),
         )
         .await
         .expect("关停内核必须在有界时间内返回");
@@ -5334,7 +5425,11 @@ mod zcode_wiring_tests {
 
         let completed = tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            disconnect_zcode_hub_core(Some(hub.clone()), std::time::Duration::from_millis(50)),
+            disconnect_zcode_hub_core(
+                Some(hub.clone()),
+                std::time::Duration::from_millis(50),
+                true,
+            ),
         )
         .await
         .expect("关停内核必须在有界时间内返回");
