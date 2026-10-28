@@ -955,6 +955,10 @@ pub struct ZcodeHub {
     /// 「旧 restore 抢在新删除之前复活内存凭据」的窗口，不跨进程。`Arc` 让 relay
     /// 事件泵在 KICKED 时也能同步置位并唤醒 worker，立即取消待重试轮次。
     auto_paused: Arc<AtomicBool>,
+    /// 退出清理已开始（P2-5 退出残留）：置位后自动连接 worker **单调停机**——在途尝试
+    /// 作废、退避轮取消、清位后也不再自行重连。只由退出路径置位，进程内不撤销
+    /// （退出/升级安装都会终结进程）；远程停服/显式断开绝不置位。
+    shutting_down: AtomicBool,
     /// 自动连接意图的写入代际（P2-6，单调递增）：用户意图写与 KICKED 延迟写共用。
     ///
     /// 用户写在 DB 锁内预占新代（此后恒为最新）；KICKED 在事件到达时预占一代，
@@ -1084,6 +1088,7 @@ impl ZcodeHub {
             auto_restore_attempted: AtomicBool::new(false),
             auto_notify: Arc::new(Notify::new()),
             auto_paused: Arc::new(AtomicBool::new(false)),
+            shutting_down: AtomicBool::new(false),
             auto_intent_generation: Arc::new(AtomicU64::new(0)),
             #[cfg(test)]
             kicked_intent_probe: Arc::new(KickedIntentProbe::default()),
@@ -1732,6 +1737,22 @@ impl ZcodeHub {
     pub(crate) fn pause_auto_connect(&self) {
         self.auto_paused.store(true, Ordering::SeqCst);
         self.wake_auto_connect();
+    }
+
+    /// 退出清理第一步（**仅退出路径**）：标记进程正在退出并同步取消自动连接的在途/
+    /// 退避轮次。
+    ///
+    /// 只置内存标记（`shutting_down` 单调、不撤销）+ 内存暂停 + 唤醒；**不**写持久
+    /// auto 意图（退出不改用户偏好）。worker 在入口与每次 await 后都检查该标记：
+    /// 即便关闭窗口随后清位，既有轮次也绝不自行重连。
+    pub(crate) fn begin_shutdown(&self) {
+        self.shutting_down.store(true, Ordering::SeqCst);
+        self.pause_auto_connect();
+    }
+
+    /// 退出清理是否已开始（worker 的单调停机闸）。
+    pub(crate) fn shutting_down(&self) -> bool {
+        self.shutting_down.load(Ordering::SeqCst)
     }
 
     pub(crate) fn resume_auto_connect(&self) {

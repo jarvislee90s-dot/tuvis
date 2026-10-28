@@ -236,6 +236,10 @@ impl ZcodeHub {
         // 测试观察口：证明本次尝试已开始（负向用例据此等待 worker 跑完，不用 sleep）。
         #[cfg(test)]
         self.record_auto_attempt();
+        // 退出清理：进程内单调停机闸——入口即停，绝不在清位后再自行连接。
+        if self.shutting_down() {
+            return AutoAttempt::Stopped;
+        }
         if self.auto_connect_paused() {
             return AutoAttempt::Stopped;
         }
@@ -259,7 +263,11 @@ impl ZcodeHub {
             // 恢复失败/无凭据：保持 needs_auth，绝不自动打开浏览器、不重试。
             return AutoAttempt::Stopped;
         }
-        // await 期间条件可能翻转（用户断开/远程关闭/换链接/KICKED）：连接前全部现查。
+        // await 期间条件可能翻转（退出清理/用户断开/远程关闭/换链接/KICKED）：连接前
+        // 全部现查——shutting_down 单调，一旦置位就绝不继续到 connect。
+        if self.shutting_down() {
+            return AutoAttempt::Stopped;
+        }
         if self.auto_connect_paused() {
             return AutoAttempt::Stopped;
         }
@@ -274,6 +282,10 @@ impl ZcodeHub {
         }
         // 共用既有连接内核与 connect_lock（不新增第二连接器）。
         let result = self.connect().await;
+        // 退出清理在 connect 在途时开始：结果一律作废，绝不进入重试/成交态。
+        if self.shutting_down() {
+            return AutoAttempt::Stopped;
+        }
         // 迟到结果若跨了代际：旧目标/旧轮次一律作废（connect 自己也会回 stale）。
         if self.auto_connect_generation() != generation {
             return AutoAttempt::Retargeted;
@@ -338,7 +350,8 @@ impl ZcodeHub {
 
     /// 退避等待后的前置复核（与 attempt 入口同口径；不触发任何网络/存储）。
     fn auto_retry_allowed(&self) -> bool {
-        if self.auto_connect_paused() || !self.auto_connect_runtime_ready() {
+        if self.shutting_down() || self.auto_connect_paused() || !self.auto_connect_runtime_ready()
+        {
             return false;
         }
         auto_connect_gate(self.auto_connect_store())
@@ -1226,6 +1239,86 @@ mod tests {
         advance_and_settle(Duration::from_secs(60)).await;
         assert_eq!(fake.connect_count(), 5, "恢复配对后不得再自动重连");
         assert_eq!(fake.execute_calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// 终审 scoped Important（exit-only 残留）：退避中的轮次不需要任何唤醒，1s/3s/10s
+    /// 定时器到点即可在关闭窗口清位后重连——退出路径必须先 `begin_shutdown` 单调停机。
+    ///
+    /// 虚拟时间验证：停机后推进 60s（远超三段退避）也不得再 connect。
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_cancels_auto_retry_backoff_and_never_reconnects() {
+        let fake = Arc::new(FakeConnector::authorized());
+        fake.queue_offline(4);
+        let store = stored(URL);
+        enable_remote(&store, true);
+        let hub = Arc::new(ZcodeHub::with_parts(
+            store,
+            fake.clone(),
+            CapabilityView::default(),
+        ));
+
+        hub.start_auto_connect();
+        wait_until(|| fake.connect_count() == 1).await;
+        // 首次失败后 worker 进入 1s 退避（不推进虚拟时间）。
+        settle_auto().await;
+        let attempts_in_backoff = hub.auto_attempt_count();
+        assert_eq!(attempts_in_backoff, 1, "前置：worker 正停在退避等待");
+
+        // 退出清理（与生产 silent 同序）：先单调停机，再静默断开。
+        hub.begin_shutdown();
+        let (_view, guard) = hub.begin_disconnect();
+        hub.finish_disconnect_silent(guard).await;
+        assert_eq!(hub.connection().state, ConnectionState::Offline);
+        settle_auto().await;
+        assert!(
+            hub.auto_attempt_count() > attempts_in_backoff,
+            "停机唤醒必须取消退避轮（worker 被叫醒后由停机闸停下）"
+        );
+
+        // 推进远超退避上限的虚拟时间：清位后的定时器/旧轮次绝不能再 connect。
+        advance_and_settle(Duration::from_secs(60)).await;
+        assert_eq!(
+            fake.connect_count(),
+            1,
+            "退出后即使退避定时器到点也不得自动连接"
+        );
+        assert_eq!(hub.connection().state, ConnectionState::Offline);
+    }
+
+    /// 单调停机闸独立于内存暂停：退出后即使暂停被解除（并发 `connect_requested`
+    /// 会 `resume_auto_connect`），worker 也不得再连接——只有 `shutting_down` 拦得住。
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_flag_stops_worker_even_after_pause_cleared() {
+        let fake = Arc::new(FakeConnector::authorized());
+        let store = stored(URL);
+        enable_remote(&store, true);
+        let hub = Arc::new(ZcodeHub::with_parts(
+            store,
+            fake.clone(),
+            CapabilityView::default(),
+        ));
+
+        hub.start_auto_connect();
+        wait_until(|| hub.connection().state == ConnectionState::Paired).await;
+        assert_eq!(fake.connect_count(), 1);
+
+        // 退出：停机 + 静默断开，随后暂停被解除（模拟并发用户入口的 resume）。
+        hub.begin_shutdown();
+        let (_view, guard) = hub.begin_disconnect();
+        hub.finish_disconnect_silent(guard).await;
+        hub.resume_auto_connect();
+        assert!(!hub.auto_connect_paused(), "前置：暂停已解除");
+
+        // 显式唤醒也不能复活：单调停机闸优先于一切自动连接条件。
+        hub.wake_auto_connect();
+        settle_auto().await;
+        advance_and_settle(Duration::from_secs(60)).await;
+        assert_eq!(
+            fake.connect_count(),
+            1,
+            "停机后即使暂停解除/显式唤醒也不得自动连接"
+        );
+        assert_eq!(hub.connection().state, ConnectionState::Offline);
     }
 
     /// 显式 connect 的 offline 失败 = 新用户触发：立即取消旧退避，预算从 1s 首档重开。
