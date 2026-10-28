@@ -3151,3 +3151,22 @@ describe("SessionDetail：横竖屏默认布局（2026-10-27）", () => {
     expect(screen.queryByTestId("split-container")).toBeNull();
   });
 });
+
+// R16：App 会话来源路由（不回退 TUI 卡、一次轻提示、单行工具栏）
+// ============================================================
+describe("R16 Codex App 来源路由", () => {
+  // 说明：本组只锁定"稳定来源路由"的可见事实；真实挂载的窄屏单行视觉验收
+  // 仍需 360/390 截图（待验），不在组件测试里冒充。
+  it("r16_app_without_projection_never_falls_back_to_terminal_card", async () => {
+    // 无 codex 投影（hook 返回 null）时，App 会话显示"连接中"，不挂 QuestionCard。
+    const { render, screen } = await import("@testing-library/react");
+    render(
+      <SessionDetail
+        session={makeSession({ agentType: "codex", form: "app" })}
+        onBack={() => undefined}
+      />
+    );
+    expect(await screen.findByTestId("codex-connecting")).toBeTruthy();
+    expect(screen.queryByTestId("question-card")).toBeNull();
+  });
+});

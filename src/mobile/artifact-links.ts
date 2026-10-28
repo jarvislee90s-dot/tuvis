@@ -91,7 +91,7 @@ const ORIGIN_RANK: Record<NonNullable<SessionFileEntry["origin"]>, number> = {
  *  `file_change` 只映射到中性来源：来源类别说明「这是修改类引用」，**不是**「写盘
  *  已完成」。批准计划任务 7 要求「只有证据证明修改已完成才提升写来源和 `modified`」，
  *  而 fileChange 的状态枚举尚未实测（见
- *  `docs/superpowers/reviews/2026-10-20-codex-artifact-field-evidence.md`），
+ *  `docs/engineering/evidence/codex-desktop-ipc/2026-10-20-codex-artifact-field-evidence.md`），
  *  没有可用的完成证据 → 一律不进入「工具读写」池。真实来源与原始状态仍由
  *  `artifactSource` / `sourceStatus` 如实展示，信息不丢。 */
 const SOURCE_ORIGIN: Record<ArtifactSource, NonNullable<SessionFileEntry["origin"]>> = {

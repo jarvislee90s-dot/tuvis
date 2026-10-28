@@ -40,6 +40,7 @@ import {
   fetchCodexQueue,
   forceContinueCodexAction,
   interruptCodexTurn,
+  resumeCodexQueue,
   retractCodexAction,
   type CodexActionState,
   type CodexQueueView,
@@ -108,12 +109,17 @@ function isPerIdSettledRefusal(e: unknown): boolean {
 export default function CodexQueuePanel({
   sessionId,
   refreshSignal = 0,
+  onQueueStateChanged,
 }: {
   sessionId: string;
   /** R11：外部刷新信号（单调递增 tick）。每次递增 → 去抖重拉一次队列视图；
    *  触发源：a) 投影跃迁（SessionDetail）；b) 发送入队回执（MessageComposer）。
    *  c) 面板自身撤回完成不经此信号（内部直接重拉）。 */
   refreshSignal?: number;
+  /** F8：队列暂停态可能翻转的通知口（打断受理 / 恢复完成后调用）——SessionDetail
+   *  据此触发同页 composer 重拉 send-info（否则打断后「本条先发送」二选一不出，
+   *  普通发送又被服务端 queue_paused 拒绝）。 */
+  onQueueStateChanged?: () => void;
 }) {
   const [view, setView] = useState<CodexQueueView | null>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
@@ -126,6 +132,8 @@ export default function CodexQueuePanel({
   const [interruptArmed, setInterruptArmed] = useState(false);
   /** 打断进行中（请求在飞期间禁用全部按钮） */
   const [interruptBusy, setInterruptBusy] = useState(false);
+  /** S5：恢复队列进行中（POST /codex/queue/resume = 打断后持久暂停的唯一解除出口） */
+  const [resumeBusy, setResumeBusy] = useState(false);
   /** 乱序防护（R11）：请求序号——每次发起 +1，响应落地时不再是最新序号即作废
    *  （先发后至的响应不得覆盖后发请求的结果） */
   const seqRef = useRef(0);
@@ -270,8 +278,30 @@ export default function CodexQueuePanel({
       setInterruptBusy(false);
       // 重拉：回合转终态后屏障会释放、队列接力——面板展示以服务端账本为唯一权威
       await load();
+      // F8：打断受理即置持久暂停（S2）——同页 composer 的 send-info 已过期，
+      // 通知上层触发重拉（失败尝试也可能改变服务端状态，一律通知，代价一次 GET）
+      onQueueStateChanged?.();
     }
-  }, [busyId, forceBusy, interruptBusy, sessionId, load]);
+  }, [busyId, forceBusy, interruptBusy, sessionId, load, onQueueStateChanged]);
+
+  // S5：恢复被打断暂停的队列（唯一解除出口；幂等——未暂停同样 200 paused:false）。
+  // 成功/失败都重拉：暂停态以服务端为唯一权威。
+  const resumeQueue = useCallback(async () => {
+    if (resumeBusy) return;
+    setResumeBusy(true);
+    setNote(null);
+    try {
+      await resumeCodexQueue(sessionId);
+    } catch (e) {
+      const message = e instanceof ApiError ? apiErrorReason(e) : String(e);
+      setNote(i18n.t("mobile.codex.queue.resumeFailed", { message }));
+    } finally {
+      setResumeBusy(false);
+      await load();
+      // F8：暂停解除 → 同页 composer 的 send-info（queuePaused）已过期，通知重拉
+      onQueueStateChanged?.();
+    }
+  }, [resumeBusy, sessionId, load, onQueueStateChanged]);
 
   if (view === null) return null;
   // 全空且无暂停原因：面板自隐（不渲染空壳）
@@ -328,6 +358,30 @@ export default function CodexQueuePanel({
           {i18n.t(blockedBannerKey())}
         </p>
       )}
+      {/* S5：打断后持久暂停（S2）——按序派发冻结，等用户显式选择；恢复是唯一
+          解除出口，二选一中的「本条先发送」（一次性越队）在发送区提供 */}
+      {(view.actions.length > 0 || (view.blockedActionIds?.length ?? 0) > 0) &&
+        view.queuePaused === true && (
+          <div data-testid="codex-queue-paused-block" className="mt-1">
+            <p
+              data-testid="codex-queue-paused"
+              className="text-xs text-amber-700 dark:text-amber-400"
+            >
+              {i18n.t("mobile.codex.queue.pausedNote")}
+            </p>
+            <button
+              type="button"
+              data-testid="codex-queue-resume"
+              disabled={resumeBusy || forceBusy || interruptBusy}
+              onClick={() => {
+                void resumeQueue();
+              }}
+              className="mt-1 rounded-full bg-amber-500/20 px-2 py-0.5 text-xs text-amber-700 disabled:opacity-40 dark:bg-amber-400/20 dark:text-amber-300"
+            >
+              {i18n.t("mobile.codex.queue.resume")}
+            </button>
+          </div>
+        )}
       {/* 人工解除（无出口屏障复审 Important）：两步确认——未确认不发任何请求；
           文案如实说明风险（消息可能实际已投出，继续后续消息可能造成重复内容）。
           人工解除是显式覆盖，「无自动恢复路径」的说明语义不变。 */}

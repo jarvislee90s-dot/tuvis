@@ -1,5 +1,5 @@
 // 设置页「远程接入」分区（§C4：按线稿 v6 重排为 4 张对外通道卡，UI 唯一契约 =
-// docs/superpowers/wireframes/2026-09-17-remote-settings-redesign.html）。
+// docs/engineering/architecture/wireframes/2026-09-17-remote-settings-redesign.html）。
 // 结构三段式：① 通用（总开关 / 电源保活 / 本机名称）② 通道四卡一排 + 唯一展开
 // 详情区（局域网连接 / 临时隧道 / 自有域名 / 外部域名——「本机」不是
 // 通道，是访问方式：走局域网卡地址，零豁免 §C4）③ 访问与安全（访问密码 / 重置设备
@@ -39,7 +39,7 @@ import {
   setPin,
   toggleChannel,
   toggleHeadless,
-  toggleCompatSend,
+  toggleCodexAutoAdapt,
   setHeadlessLimits,
   type RemoteDevice,
   type RemoteStatus,
@@ -54,6 +54,8 @@ import { TailscaleWizard } from "@/components/settings/TailscaleWizard";
 import { NamedDomainWizard } from "@/components/settings/NamedDomainWizard";
 import { ChannelQr } from "@/components/settings/ChannelQr";
 import { ProcessHint } from "@/components/settings/ProcessHint";
+// S5：Codex 自动适配卡（开关 + 状态详情 + 首次一次轻提示 + 报告入口）
+import { CodexAdaptSection } from "@/components/settings/CodexAdaptSection";
 
 // B1：撤销预览载荷（Rust 端 run_step("disable_preview") 的形状，见 wizard.rs 注释）
 type TsDisablePreview = {
@@ -350,11 +352,6 @@ export function RemoteSection() {
   const enabled = status?.enabled ?? false;
   // H3 无头总开关态：唯一数据源 = remote_status.headlessEnabled（缺键/旧载荷 = 关）
   const headlessEnabled = status?.headlessEnabled ?? false;
-  // #172/T8 兼容发送（实验）两个数据源（同源 remote_status，缺键 = 关 / 不可开）：
-  // - compatSendEnabled：开关真值；
-  // - compatSendEligible：前置判据（该 build 读链已取证 = 可开；false → 置灰）。
-  const compatSendEnabled = status?.compatSendEnabled ?? false;
-  const compatSendEligible = status?.compatSendEligible ?? false;
 
   // 花名册与状态 3s 轮询恒开（与移动端看板同节奏）。花名册是 DB 语义（已配对设备
   // 的吊销/重命名管理入口），不随远程关闭清空——Mac 报告七-6「关闭期间 0/10 而 DB
@@ -651,13 +648,13 @@ export function RemoteSection() {
     }
   };
 
-  // #172/T8 兼容发送（实验）总开关落盘（后端写 KV + 审计 + 广播）。**开启有前置**：
-  // 该 build 的读链须已取证（只读探测通过）——后端是最终裁决，前端同口径置灰。
-  const applyCompatSend = async (v: boolean) => {
+  // S5：Codex 自动适配开关落盘（后端写 KV + 审计 + 广播；toggle 恒成功，失败仅 toast）。
+  // 开关态以 status 为准（后端是唯一数据源）。
+  const applyCodexAdapt = async (v: boolean) => {
     if (busy) return;
     setBusy(true);
     try {
-      await toggleCompatSend(v);
+      await toggleCodexAutoAdapt(v);
       await refreshStatus();
     } catch (e) {
       toast.error(formatInvokeError(e, t));
@@ -954,33 +951,18 @@ export function RemoteSection() {
             </Button>
           </div>
 
-          {/* #172/T8 兼容发送（实验）：默认关；**读探测通过才允许开**——未取证时
-              置灰并提示先做只读探测（后端开启时同样拒：同一判据）。已验证的 Codex
-              桌面版本不受此开关影响（它的发送行为逐字不变）。 */}
-          <div className="text-muted-foreground mt-4 text-[12.5px] font-semibold">
-            {t("settings.remote.groupCompatSend")}
-          </div>
-          <div className="flex items-center justify-between gap-4 py-3">
-            <div className="flex-1">
-              <label className="text-sm font-semibold">
-                {t("settings.remote.compatSendTitle")}
-              </label>
-              <p className="text-muted-foreground mt-0.5 text-xs">
-                {t("settings.remote.compatSendHint")}
-              </p>
-              {!compatSendEligible && (
-                <p className="text-muted-foreground mt-0.5 text-xs">
-                  {t("settings.remote.compatSendNeedsProbe")}
-                </p>
-              )}
-            </div>
-            <Switch
-              aria-label={t("settings.remote.compatSendTitle")}
-              checked={compatSendEnabled}
-              disabled={busy || !status || (!compatSendEnabled && !compatSendEligible)}
-              onCheckedChange={(v) => void applyCompatSend(v)}
-            />
-          </div>
+          {/* ⑤ Codex 自动适配（S5 换装）：开关 = remote.codex_auto_adapt（S1 新设置键，
+              三态缺省开；命令 remote_toggle_codex_auto_adapt）。状态详情卡 =
+              codex_adapt_status DTO（attemptable/evidenced 两维度，前端只展示）。
+              旧「兼容发送（实验）」开关已随 S1 退出所有门，本批起不再渲染为可用开关
+              （键与命令保留至 S6 同步旧契约）。 */}
+          <CodexAdaptSection
+            enabled={status?.codexAutoAdaptEnabled ?? true}
+            explicit={status?.codexAutoAdaptExplicit ?? null}
+            loaded={status !== null}
+            busy={busy}
+            onToggle={(v) => void applyCodexAdapt(v)}
+          />
 
           {/* ② 通道（开关各自独立，可同时开启；点卡片在下方展开详情） */}
           <div className="text-muted-foreground mt-4 text-[12.5px] font-semibold">

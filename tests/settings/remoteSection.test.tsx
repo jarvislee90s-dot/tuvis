@@ -1928,9 +1928,10 @@ describe("RemoteSection i18n zh/en 无缺键（M5 A6）", () => {
     expect([...zhKeys].filter((k) => !enKeys.has(k))).toEqual([]);
     expect([...enKeys].filter((k) => !zhKeys.has(k))).toEqual([]);
 
-    // 源码扫描：两个消费方引用的键必须双 locale 存在
+    // 源码扫描：消费方引用的键必须双 locale 存在（S5 起含 Codex 自动适配卡）
     const sources = [
       path.join(root, "src/components/settings/RemoteSection.tsx"),
+      path.join(root, "src/components/settings/CodexAdaptSection.tsx"),
       path.join(root, "src/hooks/useRemoteEvents.ts"),
     ];
     const used = new Set<string>();
@@ -1947,5 +1948,177 @@ describe("RemoteSection i18n zh/en 无缺键（M5 A6）", () => {
     const missingEn = [...used].filter((k) => !enKeys.has(k));
     expect(missingZh).toEqual([]);
     expect(missingEn).toEqual([]);
+  });
+});
+
+// ============================================================
+// S5：Codex 自动适配（换装「兼容发送（实验）」→「自动适配」开关 + 状态详情）。
+// 消费面 = S1 登记：设置键 remote.codex_auto_adapt（命令 remote_toggle_codex_auto_adapt）、
+// remote_status.codexAutoAdaptEnabled/Explicit、Tauri 命令 codex_adapt_status（CodexAdaptStatus DTO）。
+// 用户裁决（S5 简报 §4.2）：已适配=有证据；检查中=探测在飞；连接异常=暂不可尝试且非关闭态；
+// 已关闭=显式关。首次轻提示只出现一次（记录已阅读）；未知状态不显示 raw i18n 键。
+// ============================================================
+
+// CodexAdaptStatus DTO mock（形状契约 = src-tauri adapt_status.rs，serde camelCase）
+function adaptStatusOf(over: Record<string, unknown> = {}) {
+  return {
+    autoAdaptEnabled: true,
+    autoAdaptExplicit: null,
+    platform: "mac",
+    desktopBuild: "0.55.0",
+    probeKey: "mac|0.55.0|cli-x|e1",
+    connectionEpoch: 3,
+    attemptable: { send: true, state: true },
+    evidenced: { state: true, send: false, schema: false },
+    schemaEvidence: null,
+    lastFailure: null,
+    probeStatus: { state: "idle", stage: null, reasonCode: null },
+    ...over,
+  };
+}
+
+const ADAPT_HINT_KEY = "remote.codex_auto_adapt_hint_seen";
+
+/** 安装「自动适配」分区的完整 mock：remote_status 带新字段 + codex_adapt_status + 提示键 */
+function installAdaptInvoke(
+  over: {
+    enabled?: boolean;
+    explicit?: boolean | null;
+    adapt?: Record<string, unknown> | "reject";
+    hintSeen?: string | null;
+  } = {}
+) {
+  invokeMock.mockImplementation(async (cmd: string, args?: { key?: string; enabled?: boolean }) => {
+    if (cmd === "remote_status")
+      return statusOf({
+        codexAutoAdaptEnabled: over.enabled ?? true,
+        codexAutoAdaptExplicit: over.explicit ?? null,
+      });
+    if (cmd === "codex_adapt_status") {
+      if (over.adapt === "reject") return Promise.reject("hub unavailable");
+      return adaptStatusOf(over.adapt);
+    }
+    if (cmd === "get_setting") {
+      if (args?.key === ADAPT_HINT_KEY) return over.hintSeen ?? null;
+      return null;
+    }
+    if (cmd === "remote_devices") return [];
+    return null;
+  });
+}
+
+describe("RemoteSection Codex 自动适配（S5 换装）", () => {
+  it("换装：旧「兼容发送（实验）」开关不再渲染为可用开关；新「自动适配」开关按 remote_status 渲染", async () => {
+    installAdaptInvoke({ enabled: true, explicit: null });
+    render(<RemoteSection />);
+    const master = screen.getByRole("switch", { name: /enable remote access/i });
+    await waitFor(() => expect(master).toBeEnabled());
+    // 旧开关退出：兼容发送（实验）标题与其开关都不再出现
+    expect(screen.queryByText("Compatibility send (experimental)")).toBeNull();
+    expect(screen.queryByRole("switch", { name: /compatibility send/i })).toBeNull();
+    // 新开关在场，初值 = remote_status.codexAutoAdaptEnabled（缺省开）
+    const adapt = screen.getByTestId("codex-adapt-switch");
+    expect(adapt).toBeTruthy();
+    expect(adapt).toBeChecked();
+  });
+
+  it("关闭后可再次开启：点关 → remote_toggle_codex_auto_adapt(false)；再点开 → true（同版本不重复弹首次提示）", async () => {
+    installAdaptInvoke({ enabled: true, explicit: null });
+    render(<RemoteSection />);
+    const master = screen.getByRole("switch", { name: /enable remote access/i });
+    await waitFor(() => expect(master).toBeEnabled());
+    // 首次提示在场（未读过）
+    expect(screen.getByTestId("codex-adapt-hint")).toBeTruthy();
+    // 模拟后端翻转（toggle 落库后 remote_status 重拍返回显式关）——先装再点，
+    // toggle 后的 refreshStatus 才会读到翻转后的 status
+    installAdaptInvoke({ enabled: false, explicit: false, hintSeen: null });
+    // 关
+    fireEvent.click(screen.getByTestId("codex-adapt-switch"));
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("remote_toggle_codex_auto_adapt", { enabled: false })
+    );
+    await waitFor(() => expect(screen.getByTestId("codex-adapt-switch")).not.toBeChecked());
+    // 再开：同一次挂载里重开可用（命令再次发出 true），且首次提示不回弹
+    fireEvent.click(screen.getByTestId("codex-adapt-switch"));
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("remote_toggle_codex_auto_adapt", { enabled: true })
+    );
+    expect(screen.getByTestId("codex-adapt-hint")).toBeTruthy();
+  });
+
+  it("首次轻提示一次语义：点「知道了」记录已读并消失；重新挂载不再出现", async () => {
+    installAdaptInvoke({ hintSeen: null });
+    const { unmount } = render(<RemoteSection />);
+    const master = screen.getByRole("switch", { name: /enable remote access/i });
+    await waitFor(() => expect(master).toBeEnabled());
+    // 本文件按默认英文断言（jsdom navigator.language=en）
+    expect(screen.getByTestId("codex-adapt-hint").textContent).toContain("actual capabilities");
+    fireEvent.click(screen.getByTestId("codex-adapt-hint-dismiss"));
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("set_setting", {
+        key: ADAPT_HINT_KEY,
+        value: "true",
+      })
+    );
+    expect(screen.queryByTestId("codex-adapt-hint")).toBeNull();
+    unmount();
+    // 已读过 → 再次进入（同版本、重新挂载）不重复弹
+    installAdaptInvoke({ hintSeen: "true" });
+    render(<RemoteSection />);
+    await waitFor(() => expect(screen.getByTestId("codex-adapt-switch")).toBeTruthy());
+    expect(screen.queryByTestId("codex-adapt-hint")).toBeNull();
+  });
+
+  it("状态四态映射（裁决口径）：evidenced→已适配；probing→检查中；不可尝试→连接异常；显式关→已关闭", async () => {
+    // 已适配 = 有证据（evidenced.state）
+    installAdaptInvoke({ adapt: { evidenced: { state: true, send: false, schema: false } } });
+    render(<RemoteSection />);
+    await waitFor(() => expect(screen.getByTestId("codex-adapt-state")).toBeTruthy());
+    expect(screen.getByTestId("codex-adapt-state").getAttribute("data-state")).toBe("adapted");
+    cleanup();
+
+    // 检查中 = 探测在飞
+    installAdaptInvoke({
+      adapt: {
+        evidenced: { state: false, send: false, schema: false },
+        probeStatus: { state: "probing", stage: "P1", reasonCode: null },
+      },
+    });
+    render(<RemoteSection />);
+    await waitFor(() => expect(screen.getByTestId("codex-adapt-state")).toBeTruthy());
+    expect(screen.getByTestId("codex-adapt-state").getAttribute("data-state")).toBe("probing");
+    cleanup();
+
+    // 连接异常 = 暂不可尝试 ∧ 非关闭态
+    installAdaptInvoke({
+      adapt: {
+        evidenced: { state: false, send: false, schema: false },
+        attemptable: { send: false, state: false },
+      },
+    });
+    render(<RemoteSection />);
+    await waitFor(() => expect(screen.getByTestId("codex-adapt-state")).toBeTruthy());
+    expect(screen.getByTestId("codex-adapt-state").getAttribute("data-state")).toBe("error");
+    cleanup();
+
+    // 已关闭 = 显式关（DTO explicit=false）
+    installAdaptInvoke({
+      enabled: false,
+      explicit: false,
+      adapt: { autoAdaptExplicit: false, autoAdaptEnabled: false },
+    });
+    render(<RemoteSection />);
+    await waitFor(() => expect(screen.getByTestId("codex-adapt-state")).toBeTruthy());
+    expect(screen.getByTestId("codex-adapt-state").getAttribute("data-state")).toBe("off");
+  });
+
+  it("未知状态不显示 raw i18n 键：codex_adapt_status 失败 → 通用「状态暂不可用」文案", async () => {
+    installAdaptInvoke({ adapt: "reject" });
+    render(<RemoteSection />);
+    await waitFor(() => expect(screen.getByTestId("codex-adapt-state")).toBeTruthy());
+    const state = screen.getByTestId("codex-adapt-state");
+    expect(state.getAttribute("data-state")).toBe("unknown");
+    expect(state.textContent).not.toMatch(/settings\.remote\./);
+    expect(state.textContent).not.toMatch(/codexAdapt[A-Z]/);
   });
 });

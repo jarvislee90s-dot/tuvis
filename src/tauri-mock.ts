@@ -732,6 +732,27 @@ if (!isTauri) {
           ? Promise.reject("终端启动失败（mock 注入）")
           : Promise.resolve(undefined);
 
+      // —— S5：Codex 自动适配（设置页「自动适配」卡的目验链路）——
+      // codex_adapt_status = CodexAdaptStatus DTO（S1 登记，形状见
+      // src/lib/api/remote.ts 的同名 interface）；toggle 恒成功（真实命令写 KV + 审计）。
+      case "codex_adapt_status":
+        return Promise.resolve({
+          autoAdaptEnabled: true,
+          autoAdaptExplicit: null,
+          platform: "mac",
+          desktopBuild: "0.55.0",
+          probeKey: "mac|0.55.0|cli-mock|e1",
+          connectionEpoch: 3,
+          attemptable: { send: true, state: true },
+          evidenced: { state: true, send: false, schema: false },
+          schemaEvidence: null,
+          lastFailure: null,
+          probeStatus: { state: "idle", stage: null, reasonCode: null },
+        });
+
+      case "remote_toggle_codex_auto_adapt":
+        return Promise.resolve(undefined);
+
       case "detect_tools":
         return Promise.resolve([
           { id: "claude", name: "Claude Code", available: true, path: "/usr/local/bin/claude" },

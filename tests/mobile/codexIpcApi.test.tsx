@@ -5,7 +5,10 @@ import {
   CODEX_THREAD_EVENTS_PATH,
   CODEX_THREAD_MESSAGES_PATH,
   CODEX_THREAD_PATH,
+  answerCodexAsync,
   fetchCodexAction,
+  fetchCodexAdaptStatus,
+  updateCodexAdaptSettings,
   fetchCodexMessagesPage,
   fetchCodexQueue,
   fetchCodexThread,
@@ -765,5 +768,170 @@ describe("reconcileCodexQueuedReceipt", () => {
     expect(reconcileCodexQueuedReceipt(prev, same)).toBe(prev);
     const nullPos = view([queued("act-1", null)]);
     expect(reconcileCodexQueuedReceipt(prev, nullPos)).toBe(prev);
+  });
+});
+
+// ============================================================
+// T08：移动端能力详情/开关/正式答题的**不可信载荷**处理
+// ============================================================
+
+describe("codexIpcApi：T08 能力详情与异步正式答题", () => {
+  function stubAdapt(payloads: {
+    thread?: unknown;
+    status?: unknown;
+    settings?: unknown;
+    answer?: unknown;
+  }) {
+    fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      const body = (value: unknown) =>
+        new Response(JSON.stringify(value), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      if (url.includes("/codex/adapt-status")) return body(payloads.status);
+      if (url.includes("/codex/adapt-settings")) return body(payloads.settings);
+      if (url.includes("/codex/async-answer")) return body(payloads.answer);
+      if (url.includes("/codex/thread")) return body(payloads.thread);
+      return new Response("no", { status: 404 });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+  }
+
+  it("T08 missing operations is unknown, not permission granted", async () => {
+    stubAdapt({
+      thread: {
+        threadId: "th-1",
+        revision: 1,
+        stale: false,
+        availability: "controllable",
+        capabilities: caps(),
+        runtimeStatus: "idle",
+        contentState: "ready",
+        messages: [],
+        truncated: false,
+        historyToken: "",
+        pending: [],
+      },
+    });
+    const parsed = await fetchCodexThread("s1");
+    // 缺字段 = 未知；绝不能从 availability/capabilities 推导"全部可用"。
+    expect(parsed?.effectiveOperations).toBeUndefined();
+    expect(parsed?.asyncQuestions).toBeUndefined();
+  });
+
+  it("T08 unknown operation keys are ignored and dirty statuses are not grants", async () => {
+    stubAdapt({
+      thread: {
+        ...projection(),
+        effectiveOperations: {
+          policyRevision: 7,
+          operations: {
+            blocking_input: {
+              implemented: true,
+              allowed: true,
+              requiresAutoAdapt: false,
+              evidence: "contract_matched",
+              reasonCode: null,
+            },
+            brand_new_operation: {
+              implemented: true,
+              allowed: true,
+              requiresAutoAdapt: false,
+              evidence: "shipped",
+              reasonCode: null,
+            },
+            send: { implemented: "yes" },
+          },
+        },
+        asyncQuestions: [
+          {
+            questionKey: '["request_user_input_async","call-a",0]',
+            contextToken: "ctx:1",
+            sourceTurnId: "t1",
+            sourceItemId: "call-a",
+            questionIndex: 0,
+            title: "选一个",
+            options: ["甲"],
+            state: "pending",
+            actionable: true,
+            disabledReasonCode: null,
+          },
+          { questionKey: "broken" },
+        ],
+      },
+    });
+    const parsed = await fetchCodexThread("s1");
+    expect(parsed?.effectiveOperations?.operations.blocking_input?.allowed).toBe(true);
+    expect(
+      (parsed?.effectiveOperations?.operations as Record<string, unknown>).brand_new_operation
+    ).toBeUndefined();
+    expect(parsed?.effectiveOperations?.operations.send).toBeUndefined();
+    expect(parsed?.asyncQuestions).toHaveLength(1);
+    expect(parsed?.asyncQuestions?.[0].state).toBe("pending");
+  });
+
+  it("T08 async answer body is strict (no raw/owner/method)", async () => {
+    stubAdapt({ answer: receipt("accepted") });
+    const result = await answerCodexAsync({
+      sessionId: "s1",
+      actionId: "act-1",
+      questionKey: '["request_user_input_async","call-a",0]',
+      contextToken: "ctx:1",
+      answer: "甲",
+    });
+    expect(result.delivery).toBe("accepted");
+    const call = fetchMock.mock.calls.find(([u]) => String(u).includes("/codex/async-answer"));
+    const body = JSON.parse(String((call![1] as RequestInit).body)) as Record<string, unknown>;
+    expect(Object.keys(body).sort()).toEqual([
+      "actionId",
+      "answer",
+      "contextToken",
+      "questionKey",
+      "sessionId",
+    ]);
+  });
+
+  it("T08 adapt details keep operations optional and never invent them", async () => {
+    stubAdapt({
+      status: {
+        sessionId: "s1",
+        systemVersion: "macos 27",
+        tuvisVersion: "0.6.1",
+        desktopBuild: "26.1021.31345",
+        autoAdaptEnabled: true,
+        hintSeen: false,
+        lastFailure: null,
+      },
+      settings: {
+        sessionId: "s1",
+        systemVersion: "macos 27",
+        tuvisVersion: "0.6.1",
+        desktopBuild: "26.1021.31345",
+        autoAdaptEnabled: false,
+        hintSeen: true,
+        effectiveOperations: {
+          policyRevision: 9,
+          operations: {
+            async_answer_idle: {
+              implemented: true,
+              allowed: false,
+              requiresAutoAdapt: true,
+              evidence: "contract_matched",
+              reasonCode: "operation_runtime_active",
+            },
+          },
+        },
+      },
+    });
+    const details = await fetchCodexAdaptStatus("s1");
+    expect(details.effectiveOperations).toBeUndefined();
+    const updated = await updateCodexAdaptSettings({
+      sessionId: "s1",
+      action: "set_enabled",
+      enabled: false,
+    });
+    expect(updated.autoAdaptEnabled).toBe(false);
+    expect(updated.effectiveOperations?.operations.async_answer_idle?.allowed).toBe(false);
   });
 });

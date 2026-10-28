@@ -33,7 +33,108 @@ export type RemoteStatus = {
    * 设置页把开关置灰并提示先做只读探测（后端开启时同样会拒）。
    */
   compatSendEligible?: boolean;
+  /**
+   * S1：Codex 自动适配开关**生效值**（缺省开；缺键/旧后端 → undefined，按缺省开渲染）。
+   */
+  codexAutoAdaptEnabled?: boolean;
+  /**
+   * S1：用户是否显式写过自动适配设置（`null` = 从未写过 → 缺省开；旧后端缺键 → undefined）。
+   */
+  codexAutoAdaptExplicit?: boolean | null;
 };
+
+// ============================================================
+// S1：Codex 自动适配（CodexAdaptStatus DTO；形状契约 =
+// src-tauri/src/services/codex_desktop_ipc/adapt_status.rs，serde camelCase，勿漂移）。
+// 「可尝试」（attemptable，随断链回落）与「已取证」（evidenced，持久证据）两维度
+// 刻意分开——徽标看 evidenced，发送按钮看 attemptable ∧ 设置开关，不得混同。
+// ============================================================
+
+/** 「可尝试」维度：当前档位能力位（不等于已取证）。 */
+export interface CodexAttemptableSet {
+  send: boolean;
+  state: boolean;
+}
+
+/** 「已取证」维度：持久成功证据（不随断链/超时/重启回落）。 */
+export interface CodexEvidencedSet {
+  state: boolean;
+  send: boolean;
+  schema: boolean;
+}
+
+/** schema 决策词证据摘要（已取证时非空）。 */
+export interface CodexSchemaEvidence {
+  fingerprint: string;
+  commandDecisions: string[];
+  fileDecisions: string[];
+  evidencedAt: number;
+}
+
+/** 最近失败观测（与成功证据分离；`null` = 无失败观测）。 */
+export interface CodexFailureObservation {
+  capability: string;
+  state: string;
+  stage: string | null;
+  errorCode: string | null;
+  observedAt: number | null;
+  nextRetryAt: number | null;
+}
+
+/** 探测只读事实（与移动端 ProbeStatus 同形：state/stage/reasonCode）。 */
+export interface CodexAdaptProbeStatus {
+  state: "idle" | "probing" | "probed" | "inconclusive" | "failed";
+  stage: "P0" | "P1" | "P2" | "P3" | null;
+  reasonCode: string | null;
+}
+
+/** 适配状态 DTO（S5 设置页详情的唯一数据源；R1 诊断快照同源）。 */
+export interface CodexAdaptStatus {
+  autoAdaptEnabled: boolean;
+  autoAdaptExplicit: boolean | null;
+  platform: string;
+  desktopBuild: string | null;
+  probeKey: string | null;
+  connectionEpoch: number;
+  attemptable: CodexAttemptableSet;
+  evidenced: CodexEvidencedSet;
+  schemaEvidence: CodexSchemaEvidence | null;
+  lastFailure: CodexFailureObservation | null;
+  probeStatus: CodexAdaptProbeStatus;
+}
+
+/**
+ * 读取适配状态（Tauri 命令 `codex_adapt_status`）。失败语义：hub 不可用 →
+ * Err 字符串 reject（调用方按「状态暂不可用」呈现，不猜）。
+ */
+export async function codexAdaptStatus(): Promise<CodexAdaptStatus> {
+  return await invoke<CodexAdaptStatus>("codex_adapt_status");
+}
+
+/**
+ * 自动适配开关（S1 设置键 `remote.codex_auto_adapt`；命令 `remote_toggle_codex_auto_adapt`）。
+ * 恒写显式两值；toggle 恒成功（后端写 KV + 审计 + 广播 remote-changed）。
+ */
+export async function toggleCodexAutoAdapt(enabled: boolean): Promise<void> {
+  return await invoke("remote_toggle_codex_auto_adapt", { enabled });
+}
+
+/**
+ * 适配状态的机器词摘要（报告入口的 `adaptSummary` 引用；只含机器词，无路径/正文）。
+ */
+export function adaptSummaryOf(s: CodexAdaptStatus | null): string | null {
+  if (s === null) return null;
+  const ev = s.evidenced;
+  const evidence = [ev.send ? "send" : null, ev.state ? "state" : null, ev.schema ? "schema" : null]
+    .filter((x): x is string => x !== null)
+    .join("+");
+  return [
+    `auto_adapt=${s.autoAdaptEnabled ? "on" : "off"}`,
+    `attemptable=send:${s.attemptable.send ? 1 : 0},state:${s.attemptable.state ? 1 : 0}`,
+    `evidence=${evidence === "" ? "none" : evidence}`,
+    `probe=${s.probeStatus.state}`,
+  ].join(";");
+}
 
 // M5 A5 四通道状态载荷（Rust 端 channels_payload 注释即唯一契约）：
 // enabled = 三通道 KV 开关（local 无此键——随总开关常驻）；running = 运行态；

@@ -101,6 +101,21 @@ interface Routes {
   respondReject?: boolean;
   /** R12：GET /codex/action 只读核对载荷；"missing"=404；"reject"=网络异常 */
   codexAction?: Record<string, unknown> | "missing" | "reject";
+  /** H11：GET /codex/action/verify 只读核对载荷（缺省 unresolved）。 */
+  codexVerify?: Record<string, unknown> | "missing" | "reject";
+}
+
+function verifyView(over: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    actionId: "act-1",
+    stage: "settled",
+    outcome: "unresolved",
+    turnId: null,
+    runLimitReleased: false,
+    reasonCode: null,
+    verifiedAt: 1,
+    ...over,
+  };
 }
 
 let routes: Routes;
@@ -113,6 +128,7 @@ beforeEach(() => {
   releaseRespond = null;
 });
 afterEach(() => {
+  window.sessionStorage.clear();
   cleanup();
   vi.unstubAllGlobals();
 });
@@ -133,6 +149,13 @@ function installFetch() {
         });
       }
       return new Response(JSON.stringify(routes.respond ?? receipt("accepted")), { status: 200 });
+    }
+    if (url.includes("/codex/action/verify")) {
+      if (routes.codexVerify === "reject") throw new TypeError("codex/action/verify 网络断开");
+      if (routes.codexVerify === "missing") {
+        return new Response(JSON.stringify({ error: "not_found" }), { status: 404 });
+      }
+      return new Response(JSON.stringify(routes.codexVerify ?? verifyView()), { status: 200 });
     }
     if (url.includes("/codex/action")) {
       // R12：fetchCodexAction 只读核对（缺省未终态 queued；"missing"=404 查不到）
@@ -190,6 +213,8 @@ describe("PendingRequestCard：command / permissions 两按钮", () => {
       requestKey: "n:9007199254740993",
       contextToken: "tok-1",
       action: "approve",
+      // H11：点击起算的前台剩余预算如实透传
+      frontBudgetMs: expect.any(Number),
     });
     // 回执上行（Accepted 只表示已受理——不标 Turn 完成）
     await waitFor(() => expect(onReceipt).toHaveBeenCalledWith(receipt("accepted")));
@@ -217,6 +242,20 @@ describe("PendingRequestCard：command / permissions 两按钮", () => {
 });
 
 describe("PendingRequestCard：user_input 阻塞问答", () => {
+  it("tone：批准=approve 红卡、阻塞问答=question 蓝卡", () => {
+    installFetch();
+    const { unmount } = render(<PendingRequestCard sessionId="s1" request={commandPending()} />);
+    expect(screen.getByTestId("codex-pending-card").getAttribute("data-tone")).toBe("approve");
+    unmount();
+    render(
+      <PendingRequestCard
+        sessionId="s1"
+        request={userInputPending([question({ id: "q-tone", isOther: true })])}
+      />
+    );
+    expect(screen.getByTestId("codex-pending-card").getAttribute("data-tone")).toBe("question");
+  });
+
   it("two_questions_require_all_answers：两题全答才可提交；提交体按原 qid 映射", async () => {
     installFetch();
     const onReceipt = vi.fn();
@@ -236,15 +275,23 @@ describe("PendingRequestCard：user_input 阻塞问答", () => {
         onReceipt={onReceipt}
       />
     );
-    const submit = screen.getByTestId("codex-pending-submit") as HTMLButtonElement;
-    expect(submit.textContent).toContain("提交回答");
-    // 未答全：提交禁用（防静默丢题）+ 未答题面可见
-    expect(submit.disabled).toBe(true);
-    expect(screen.getByTestId("codex-pending-incomplete").textContent).toContain("2");
-    // 第一题点选项（点击即选）
+    // B04：只显示第 1 题；未答时不能前进
+    expect(screen.getByTestId("codex-pending-progress").textContent).toContain("1／2");
+    expect(screen.queryByTestId("codex-q-q2")).toBeNull();
+    const next = screen.getByTestId("codex-pending-next") as HTMLButtonElement;
+    expect(next.disabled).toBe(true);
     fireEvent.click(screen.getByTestId(`codex-q-q1-opt-0`));
-    expect(submit.disabled).toBe(true); // 还差一题
+    expect(next.disabled).toBe(false);
+    fireEvent.click(next);
+    // 第 2 题；可返回第 1 题修改
+    expect(screen.getByTestId("codex-pending-progress").textContent).toContain("2／2");
+    expect(screen.getByTestId("codex-q-q2")).toBeTruthy();
     fireEvent.click(screen.getByTestId(`codex-q-q2-opt-1`));
+    fireEvent.click(screen.getByTestId("codex-pending-prev"));
+    expect((screen.getByTestId("codex-q-q1-opt-0") as HTMLInputElement).checked).toBe(true);
+    fireEvent.click(screen.getByTestId("codex-pending-next"));
+    const submit = screen.getByTestId("codex-pending-submit") as HTMLButtonElement;
+    expect(submit.textContent).toContain("提交全部答案");
     expect(submit.disabled).toBe(false);
     fireEvent.click(submit);
     const body = (await waitFor(() => respondBodies()))[0];
@@ -266,12 +313,13 @@ describe("PendingRequestCard：user_input 阻塞问答", () => {
     });
     const strictQ = question({ id: "qs", question: "选一个", isOther: false });
     render(<PendingRequestCard sessionId="s1" request={userInputPending([freeQ, strictQ])} />);
-    // isOther=false：不能自由文本
-    expect(screen.queryByTestId("codex-q-qs-free")).toBeNull();
     // isOther=true：自由文本框（非 secret → text）
     const free = screen.getByTestId("codex-q-qf-free") as HTMLInputElement;
     expect(free.type).toBe("text");
     fireEvent.change(free, { target: { value: "先跑冒烟再全量" } });
+    fireEvent.click(screen.getByTestId("codex-pending-next"));
+    // isOther=false：不能自由文本
+    expect(screen.queryByTestId("codex-q-qs-free")).toBeNull();
     fireEvent.click(screen.getByTestId("codex-q-qs-opt-0"));
     fireEvent.click(screen.getByTestId("codex-pending-submit"));
     const body = (await waitFor(() => respondBodies()))[0];
@@ -389,9 +437,14 @@ describe("PendingRequestCard：unsupported / 禁写 / 回执分诊", () => {
         request={userInputPending([question({ id: "q1" })], { contextToken: "tok-NEW" })}
       />
     );
-    // 旧选择被清空：提交回到禁用态（旧草稿绝不灌进新上下文）
+    // N14：旧稿不自动成为新上下文答案——提交保持禁用，需显式「恢复旧稿」。
     expect((screen.getByTestId("codex-pending-submit") as HTMLButtonElement).disabled).toBe(true);
     expect(screen.getByTestId("codex-pending-incomplete")).toBeInTheDocument();
+    const restore = screen.getByTestId("codex-pending-restore-draft");
+    fireEvent.click(restore);
+    await waitFor(() =>
+      expect((screen.getByTestId("codex-pending-submit") as HTMLButtonElement).disabled).toBe(false)
+    );
   });
 });
 
@@ -598,20 +651,12 @@ describe("PendingRequestCard：提交 ID 与响应守卫（R12）", () => {
     // 504 + 非我方机器码错误体 → 不可判零投递（C5：与无响应同——结果未知）
     routes.respondStatus = 504;
     routes.respondBody = { error: "gateway_timeout" };
-    // 核对：账本已 accepted（服务端确实处理了）
-    routes.codexAction = {
+    // 核对：已投递（服务端确实处理了）
+    routes.codexVerify = verifyView({
       actionId: "act-504",
-      state: "accepted",
-      position: null,
-      receipt: {
-        actionId: "act-504",
-        delivery: "accepted",
-        route: "desktop_ipc",
-        turnId: "t1",
-        envelopeId: "e1",
-        reasonCode: null,
-      },
-    };
+      outcome: "delivered",
+      turnId: "t1",
+    });
     render(<PendingRequestCard sessionId="s1" request={commandPending()} />);
     fireEvent.click(screen.getByTestId("codex-pending-approve"));
     await flushAsync();
@@ -632,20 +677,12 @@ describe("PendingRequestCard：提交 ID 与响应守卫（R12）", () => {
     installFetch();
     routes.respondStatus = 504;
     routes.respondBody = {};
-    // 账本：state=rejected 但原始回执 delivery=not_sent（DAO 同状态承载两语义）
-    routes.codexAction = {
+    // 账本：明确零投递（stage=settled + not_delivered）
+    routes.codexVerify = verifyView({
       actionId: "act-ns",
-      state: "rejected",
-      position: null,
-      receipt: {
-        actionId: "act-ns",
-        delivery: "not_sent",
-        route: "desktop_ipc",
-        turnId: null,
-        envelopeId: null,
-        reasonCode: "stale_context",
-      },
-    };
+      outcome: "not_delivered",
+      reasonCode: "stale_context",
+    });
     const onReceipt = vi.fn();
     render(<PendingRequestCard sessionId="s1" request={commandPending()} onReceipt={onReceipt} />);
     fireEvent.click(screen.getByTestId("codex-pending-approve"));
@@ -664,5 +701,478 @@ describe("PendingRequestCard：提交 ID 与响应守卫（R12）", () => {
     const bodies = respondBodies();
     expect(bodies).toHaveLength(2);
     expect(String(bodies[1].actionId)).not.toBe(String(bodies[0].actionId));
+  });
+});
+
+// ============================================================
+// S5：schema 证据晚到原地出按钮 + 输入草稿不丢 + 可发送时横幅不宣称「暂不能远程发送」。
+// - schema 晚到（S1 republish 推送新投影）：同 requestKey 同 token、actionable 翻转
+//   true → 按钮原地出现（组件不重挂），已输入草稿原样保留；
+// - 可发送判据唯一来源 = 发送静态门（send-info 单点，SessionDetail 下发）——横幅
+//   不得在可尝试时宣称「暂不能远程发送」（设计 §3.4）。
+// ============================================================
+describe("PendingRequestCard：H13 答案计数与 H11 未投递保稿", () => {
+  async function flushAsync() {
+    for (let i = 0; i < 6; i += 1) {
+      await act(async () => {
+        await Promise.resolve();
+      });
+    }
+  }
+  function answersOf(body: Record<string, unknown>): Record<string, string[]> {
+    return (body.answers ?? {}) as Record<string, string[]>;
+  }
+
+  it("h13_single_value_text_replaces_selected_option", async () => {
+    installFetch();
+    routes.respond = receipt("accepted");
+    render(
+      <PendingRequestCard
+        sessionId="s1"
+        request={userInputPending([
+          question({
+            id: "q1",
+            options: [{ label: "A", description: "" }],
+            isOther: true,
+            answerPolicy: { allowMultiple: false, maxAnswers: 1, allowFreeText: true },
+          }),
+        ])}
+      />
+    );
+    fireEvent.click(screen.getByTestId("codex-q-q1-opt-0"));
+    fireEvent.change(screen.getByTestId("codex-q-q1-free"), { target: { value: "自由作答" } });
+    fireEvent.click(screen.getByTestId("codex-pending-submit"));
+    await flushAsync();
+    expect(answersOf(respondBodies()[0]).q1).toEqual(["自由作答"]);
+  });
+
+  it("h13_multi_limit_counts_free_text", async () => {
+    installFetch();
+    routes.respond = receipt("accepted");
+    render(
+      <PendingRequestCard
+        sessionId="s1"
+        request={userInputPending([
+          question({
+            id: "q1",
+            options: [
+              { label: "A", description: "" },
+              { label: "B", description: "" },
+              { label: "C", description: "" },
+            ],
+            isOther: true,
+            answerPolicy: { allowMultiple: true, maxAnswers: 2, allowFreeText: true },
+          }),
+        ])}
+      />
+    );
+    fireEvent.click(screen.getByTestId("codex-q-q1-opt-0"));
+    fireEvent.change(screen.getByTestId("codex-q-q1-free"), { target: { value: "补充" } });
+    // 已满 2（选项 + 文本）→ 再勾第三个不得超额
+    fireEvent.click(screen.getByTestId("codex-q-q1-opt-1"));
+    fireEvent.click(screen.getByTestId("codex-pending-submit"));
+    await flushAsync();
+    const answers = answersOf(respondBodies()[0]).q1;
+    expect(answers).toHaveLength(2);
+    expect(answers).toEqual(["A", "补充"]);
+  });
+
+  it("h11_not_sent_keeps_the_whole_answer_table", async () => {
+    installFetch();
+    routes.respond = { ...receipt("not_sent"), reasonCode: "busy_before_write" };
+    render(
+      <PendingRequestCard
+        sessionId="s1"
+        request={userInputPending([
+          question({ id: "q1", options: [{ label: "A", description: "" }] }),
+        ])}
+      />
+    );
+    fireEvent.click(screen.getByTestId("codex-q-q1-opt-0"));
+    fireEvent.click(screen.getByTestId("codex-pending-submit"));
+    await flushAsync();
+    expect(screen.getByTestId("codex-pending-note").textContent).toContain("未发送");
+    expect((screen.getByTestId("codex-q-q1-opt-0") as HTMLInputElement).checked).toBe(true);
+  });
+});
+
+describe("PendingRequestCard：schema 晚到原地出按钮与草稿保留（S5）", () => {
+  function freeTextInputPending(over: Partial<PendingView> = {}): PendingView {
+    return userInputPending([question({ id: "q1", isOther: true, options: [] })], {
+      actionable: true,
+      disabledReasonCode: null,
+      ...over,
+    });
+  }
+
+  it("schema_late_unlock：未解锁（无作答入口）→ 原地出提交按钮（同 key 同 token 翻转，不重挂）", async () => {
+    installFetch();
+    const { rerender } = render(
+      <PendingRequestCard
+        sessionId="s1"
+        request={freeTextInputPending({
+          actionable: false,
+          disabledReasonCode: "capability_unverified",
+        })}
+      />
+    );
+    // 未解锁：无提交按钮，有禁用原因
+    expect(screen.queryByTestId("codex-pending-submit")).toBeNull();
+    expect(screen.getByTestId("codex-pending-disabled").textContent).toContain("未验证");
+    // schema 证据晚到（S1 republish）：同 key 同 token，actionable 翻转 → 原地出按钮
+    rerender(<PendingRequestCard sessionId="s1" request={freeTextInputPending()} />);
+    expect(screen.getByTestId("codex-pending-submit")).toBeTruthy();
+    expect(screen.queryByTestId("codex-pending-disabled")).toBeNull();
+  });
+
+  it("draft_survives_projection_update：投影更新（同 key 同 token）不丢已输入草稿；token 轮换才清草稿", async () => {
+    installFetch();
+    const { rerender } = render(
+      <PendingRequestCard sessionId="s1" request={freeTextInputPending()} />
+    );
+    const draft = screen.getByTestId("codex-q-q1-free") as HTMLInputElement;
+    fireEvent.change(draft, { target: { value: "采用方案 B 部署" } });
+    expect(draft.value).toBe("采用方案 B 部署");
+    // 投影例行更新（同 key 同 token，载荷细节变化）：草稿原样保留
+    rerender(
+      <PendingRequestCard
+        sessionId="s1"
+        request={freeTextInputPending({ reason: "clean build dir (updated)" })}
+      />
+    );
+    expect((screen.getByTestId("codex-q-q1-free") as HTMLInputElement).value).toBe(
+      "采用方案 B 部署"
+    );
+    // N14：token 轮换后旧非 secret 稿只作为「待确认」存在，不自动回填。
+    rerender(
+      <PendingRequestCard
+        sessionId="s1"
+        request={freeTextInputPending({ contextToken: "tok-ROTATED" })}
+      />
+    );
+    expect((screen.getByTestId("codex-q-q1-free") as HTMLInputElement).value).toBe("");
+    fireEvent.click(screen.getByTestId("codex-pending-restore-draft"));
+    await waitFor(() =>
+      expect((screen.getByTestId("codex-q-q1-free") as HTMLInputElement).value).toBe(
+        "采用方案 B 部署"
+      )
+    );
+  });
+});
+
+describe("CodexAvailabilityBanner：可发送时不宣称「暂不能远程发送」（S5）", () => {
+  it("banner_send_attemptable：read_only + 静态门放行 → 横幅不再含「暂不能远程发送」；静态门拒绝或未取得 → 维持原文案", () => {
+    // 静态门放行（send-info 单点判据下发）→ 不得出现「暂不能远程发送」
+    const { unmount } = render(
+      <CodexAvailabilityBanner availability="read_only" stale={false} sendAttemptable={true} />
+    );
+    const label = screen.getByTestId("codex-availability-label");
+    expect(label.textContent).not.toContain("暂不能远程发送");
+    expect(label.textContent).toContain("自动适配");
+    unmount();
+
+    // 静态门拒绝（capability_unverified/unavailable）→ 维持原「暂不能远程发送」文案
+    render(
+      <CodexAvailabilityBanner availability="read_only" stale={false} sendAttemptable={false} />
+    );
+    expect(screen.getByTestId("codex-availability-label").textContent).toContain("暂不能远程发送");
+    cleanup();
+
+    // 未取得（旧宿主/拉取失败）→ 维持原文案（不猜）
+    render(<CodexAvailabilityBanner availability="read_only" stale={false} />);
+    expect(screen.getByTestId("codex-availability-label").textContent).toContain("暂不能远程发送");
+  });
+});
+
+// ============================================================
+// R08：「拒绝并中止本轮」必须发 cancel（而非 reject）
+// ============================================================
+
+describe("R08 cancel 语义", () => {
+  it("r08_cancel_button_sends_cancel_word", async () => {
+    installFetch();
+    const { fireEvent } = await import("@testing-library/react");
+    render(
+      <PendingRequestCard
+        sessionId="s1"
+        request={commandPending({ allowedDecisions: ["accept", "cancel"] })}
+      />
+    );
+    const cancel = screen.getByTestId("codex-pending-cancel-turn");
+    fireEvent.click(cancel);
+    await waitFor(() => expect(respondBodies()[0]).toBeTruthy());
+    expect(respondBodies()[0].action).toBe("cancel");
+    expect(respondBodies()[0].action).not.toBe("reject");
+  });
+
+  it("r08_decline_and_cancel_are_distinct_when_both_offered", async () => {
+    installFetch();
+    // 明确零投递 → 卡片不锁定，可按第二个动作（观察两个真实请求体）
+    routes.respond = receipt("not_sent");
+    const { fireEvent } = await import("@testing-library/react");
+    render(
+      <PendingRequestCard
+        sessionId="s1"
+        request={commandPending({ allowedDecisions: ["decline", "cancel"] })}
+      />
+    );
+    fireEvent.click(screen.getByTestId("codex-pending-reject"));
+    await waitFor(() => expect(respondBodies().length).toBe(1));
+    fireEvent.click(screen.getByTestId("codex-pending-cancel-turn"));
+    await waitFor(() => expect(respondBodies().length).toBe(2));
+    const words = respondBodies().map((body) => body.action);
+    expect(words).toEqual(["reject", "cancel"]);
+  });
+
+  it("r08_no_cancel_button_without_the_word", () => {
+    installFetch();
+    render(
+      <PendingRequestCard
+        sessionId="s1"
+        request={commandPending({ allowedDecisions: ["accept", "decline"] })}
+      />
+    );
+    expect(screen.queryByTestId("codex-pending-cancel-turn")).toBeNull();
+  });
+});
+
+// ============================================================
+// R14：答策（单/多值、数量上限、自由文本）
+// ============================================================
+
+describe("R14 阻塞问答 answerPolicy", () => {
+  const baseQuestions = [
+    {
+      id: "q1",
+      header: "",
+      question: "选一个/多个",
+      isOther: true,
+      isSecret: false,
+      options: [
+        { label: "A", description: "" },
+        { label: "B", description: "" },
+      ],
+    },
+  ];
+
+  it("r14_single_value_policy_replaces_previous_choice", async () => {
+    installFetch();
+    const { fireEvent } = await import("@testing-library/react");
+    const p = userInputPending([
+      {
+        ...baseQuestions[0],
+        answerPolicy: { allowMultiple: false, maxAnswers: 1, allowFreeText: true },
+      },
+    ]);
+    render(<PendingRequestCard sessionId="s1" request={p} />);
+    const a = screen.getByTestId("codex-q-q1-opt-0") as HTMLInputElement;
+    const b = screen.getByTestId("codex-q-q1-opt-1") as HTMLInputElement;
+    expect(a.type).toBe("radio");
+    fireEvent.click(a);
+    fireEvent.click(b);
+    expect((screen.getByTestId("codex-q-q1-opt-0") as HTMLInputElement).checked).toBe(false);
+    expect((screen.getByTestId("codex-q-q1-opt-1") as HTMLInputElement).checked).toBe(true);
+  });
+
+  it("r14_multi_value_policy_respects_max_answers", async () => {
+    installFetch();
+    const { fireEvent } = await import("@testing-library/react");
+    const p = userInputPending([
+      {
+        ...baseQuestions[0],
+        answerPolicy: { allowMultiple: true, maxAnswers: 2, allowFreeText: false },
+      },
+    ]);
+    render(<PendingRequestCard sessionId="s1" request={p} />);
+    const [a, b] = ["0", "1"].map(
+      (i) => screen.getByTestId(`codex-q-q1-opt-${i}`) as HTMLInputElement
+    );
+    expect(a.type).toBe("checkbox");
+    fireEvent.click(a);
+    fireEvent.click(b);
+    expect((screen.getByTestId("codex-q-q1-opt-0") as HTMLInputElement).checked).toBe(true);
+    expect((screen.getByTestId("codex-q-q1-opt-1") as HTMLInputElement).checked).toBe(true);
+    // allowFreeText=false → 不渲染自由输入
+    expect(screen.queryByTestId("codex-q-q1-free")).toBeNull();
+  });
+
+  it("r14_missing_policy_defaults_to_single_and_hides_free_text_when_unavailable", () => {
+    installFetch();
+    const p = userInputPending([{ ...baseQuestions[0], isOther: false }]);
+    render(<PendingRequestCard sessionId="s1" request={p} />);
+    expect((screen.getByTestId("codex-q-q1-opt-0") as HTMLInputElement).type).toBe("radio");
+    expect(screen.queryByTestId("codex-q-q1-free")).toBeNull();
+  });
+});
+
+describe("PendingRequestCard：H11 截止归属与核对出口", () => {
+  async function flushAsync() {
+    for (let i = 0; i < 6; i += 1) {
+      await act(async () => {
+        await Promise.resolve();
+      });
+    }
+  }
+
+  it("h11_definitive_refusal_clears_own_timer_and_does_not_relock", async () => {
+    vi.useFakeTimers();
+    installFetch();
+    routes.respondStatus = 403;
+    routes.respondBody = { error: "forbidden" };
+    render(<PendingRequestCard sessionId="s1" request={commandPending()} />);
+    fireEvent.click(screen.getByTestId("codex-pending-approve"));
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(screen.getByTestId("codex-pending-note").textContent).toBeTruthy();
+    // 30 秒后旧 timer 不得把卡反锁成 Unknown
+    await act(async () => {
+      vi.advanceTimersByTime(30_000);
+    });
+    expect(screen.queryByTestId("codex-pending-verify")).toBeNull();
+    vi.useRealTimers();
+  });
+
+  it("h11_http_unknown_keeps_action_anchor_and_can_reverify", async () => {
+    installFetch();
+    routes.respond = receipt("unknown_delivery");
+    routes.codexVerify = verifyView({ outcome: "unresolved" });
+    render(<PendingRequestCard sessionId="s1" request={commandPending()} />);
+    fireEvent.click(screen.getByTestId("codex-pending-approve"));
+    await flushAsync();
+    // 结果未知：保留 ID → 有再次核对入口
+    const verify = await screen.findByTestId("codex-pending-verify");
+    expect(respondBodies()).toHaveLength(1);
+    // 核对到 delivered → 按 accepted 呈现，且不产生第二次 POST
+    routes.codexVerify = verifyView({ outcome: "delivered", turnId: "t1" });
+    fireEvent.click(verify);
+    await flushAsync();
+    expect(screen.getByTestId("codex-pending-note").textContent).toContain("已受理");
+    expect(respondBodies()).toHaveLength(1);
+  });
+
+  it("h11_accepted_keeps_non_secret_drafts_for_review", async () => {
+    installFetch();
+    routes.respond = receipt("accepted");
+    render(
+      <PendingRequestCard
+        sessionId="s1"
+        request={userInputPending([question({ id: "q1", isSecret: false, isOther: true })])}
+      />
+    );
+    fireEvent.change(screen.getByTestId("codex-q-q1-free"), { target: { value: "我的答案" } });
+    fireEvent.click(screen.getByTestId("codex-pending-submit"));
+    await flushAsync();
+    expect((screen.getByTestId("codex-q-q1-free") as HTMLInputElement).value).toBe("我的答案");
+  });
+});
+
+describe("PendingRequestCard：第四轮前端拥有者（N10/N11/N14）", () => {
+  async function flushAsync() {
+    for (let i = 0; i < 8; i += 1) {
+      await act(async () => {
+        await Promise.resolve();
+      });
+    }
+  }
+
+  it("n11_unconfirmed_acceptance_keeps_anchor_and_verify_entry", async () => {
+    installFetch();
+    routes.respond = { ...receipt("accepted"), reasonCode: "decision_unconfirmed" };
+    render(<PendingRequestCard sessionId="s1" request={commandPending()} />);
+    fireEvent.click(screen.getByTestId("codex-pending-approve"));
+    await flushAsync();
+    // 受理未确认：保留原动作锚 → 可再次只读核对（不新发）
+    expect(screen.getByTestId("codex-pending-verify")).toBeTruthy();
+    expect(respondBodies()).toHaveLength(1);
+  });
+
+  it("n11_anchor_survives_remount_without_new_post", async () => {
+    installFetch();
+    routes.respond = receipt("unknown_delivery");
+    const { unmount } = render(<PendingRequestCard sessionId="s1" request={commandPending()} />);
+    fireEvent.click(screen.getByTestId("codex-pending-approve"));
+    await flushAsync();
+    expect(screen.getByTestId("codex-pending-verify")).toBeTruthy();
+    const posts = respondBodies().length;
+    unmount();
+    render(<PendingRequestCard sessionId="s1" request={commandPending()} />);
+    // 重挂后仍能核对原动作（锚来自 sessionStorage），零新 POST
+    expect(await screen.findByTestId("codex-pending-verify")).toBeTruthy();
+    expect(respondBodies()).toHaveLength(posts);
+  });
+
+  it("n14_secret_draft_never_leaks_into_new_plain_question", async () => {
+    installFetch();
+    routes.respond = receipt("accepted");
+    const { rerender } = render(
+      <PendingRequestCard
+        sessionId="s1"
+        request={userInputPending([question({ id: "q1", isSecret: true, isOther: true })])}
+      />
+    );
+    fireEvent.change(screen.getByTestId("codex-q-q1-free"), { target: { value: "旧密码" } });
+    // 新 token 下同 qid 变成普通题：旧 secret 不得回填
+    rerender(
+      <PendingRequestCard
+        sessionId="s1"
+        request={userInputPending([question({ id: "q1", isSecret: false, isOther: true })], {
+          contextToken: "tok-SECRET-ROTATED",
+        })}
+      />
+    );
+    expect((screen.getByTestId("codex-q-q1-free") as HTMLInputElement).value).toBe("");
+    expect(screen.queryByTestId("codex-pending-restore-draft")).toBeNull();
+  });
+
+  it("n10_old_round_late_result_cannot_touch_new_round", async () => {
+    installFetch();
+    let releaseA: ((r: Response) => void) | null = null;
+    let call = 0;
+    fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes("/codex/action/verify")) {
+        return new Response(
+          JSON.stringify(verifyView({ outcome: "not_delivered", reasonCode: "stale_context" })),
+          { status: 200 }
+        );
+      }
+      if (url.includes("/codex/pending-response")) {
+        call += 1;
+        if (call === 1) {
+          return new Promise<Response>((resolve) => {
+            releaseA = resolve;
+          });
+        }
+        return new Response(JSON.stringify(receipt("unknown_delivery")), { status: 200 });
+      }
+      return new Response(JSON.stringify({ items: [] }), { status: 200 });
+    });
+    vi.useFakeTimers();
+    render(<PendingRequestCard sessionId="s1" request={commandPending()} />);
+    fireEvent.click(screen.getByTestId("codex-pending-approve")); // A 挂起
+    await act(async () => {
+      vi.advanceTimersByTime(30_000); // A 本地截止 → Unknown
+    });
+    // 核对确认 A 未投递 → 锚退休，用户开始 B 轮
+    fireEvent.click(screen.getByTestId("codex-pending-verify"));
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    fireEvent.click(screen.getByTestId("codex-pending-approve"));
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(call).toBe(2);
+    const anchorAfterB = screen.queryByTestId("codex-pending-verify");
+    // A 的迟到 accepted 回执：不得把 B 改成已受理、不得清 B 的锚/稿
+    await act(async () => {
+      releaseA?.(new Response(JSON.stringify(receipt("accepted")), { status: 200 }));
+      await Promise.resolve();
+    });
+    expect(screen.getByTestId("codex-pending-note").textContent).not.toContain("已受理");
+    expect(screen.queryByTestId("codex-pending-verify") !== null).toBe(anchorAfterB !== null);
+    vi.useRealTimers();
   });
 });
