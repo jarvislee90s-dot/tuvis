@@ -362,6 +362,10 @@ impl HubBackend for PartsBackend {
             // 换/删链接保留账号 JWT：只断 relay、作废旧桥/投影，绝不清 AuthService 内存，
             // 也不删除持久记录（真正忘记授权走 `forget_authorization`）。
             // 迟到 token 结果仍由 AuthService 自己的 credential epoch 作废。
+            //
+            // 本实现**不**用代际参数做 owner 校验（保持既有语义）：清理归属由 Hub 层
+            // 负责——`config_changed` 在 `disconnect_lock` 内复核 `CloseGuard` 仍是当前
+            // 窗口后才调用本方法，陈旧 owner 绝不触达这里。
             self.relay.disconnect().await;
             self.bridge.invalidate(self.advance_projection()).await;
         })
@@ -968,6 +972,10 @@ pub struct ZcodeHub {
     /// 测试观察口：KICKED 延迟写的两段闸（见 [`KickedIntentProbe`]）。
     #[cfg(test)]
     kicked_intent_probe: Arc<KickedIntentProbe>,
+    /// 测试观察口：`config_changed` 在 begin 之后、取清理串行锁之前的闸（P2-3 回归：
+    /// 让更新的配置变更先完整完成并重连，再放行陈旧 owner）。
+    #[cfg(test)]
+    config_pre_reset_gate: Mutex<Option<Arc<Notify>>>,
     /// 测试观察口：自动连接 worker 已执行的尝试次数（证明「等 worker 跑完」而不是
     /// 靠固定 sleep；不影响生产行为）。
     #[cfg(test)]
@@ -1092,6 +1100,8 @@ impl ZcodeHub {
             auto_intent_generation: Arc::new(AtomicU64::new(0)),
             #[cfg(test)]
             kicked_intent_probe: Arc::new(KickedIntentProbe::default()),
+            #[cfg(test)]
+            config_pre_reset_gate: Mutex::new(None),
             #[cfg(test)]
             auto_attempts: AtomicU64::new(0),
             #[cfg(all(feature = "zcode-bridge-evidence", debug_assertions))]
@@ -1722,6 +1732,20 @@ impl ZcodeHub {
         (release_tx, done_rx)
     }
 
+    /// 测试观察口：给下一次 `config_changed` 装「begin 后、取清理锁前」的闸。
+    #[cfg(test)]
+    fn install_config_pre_reset_gate(&self) -> Arc<Notify> {
+        let gate = Arc::new(Notify::new());
+        *self.config_pre_reset_gate.lock().unwrap() = Some(gate.clone());
+        gate
+    }
+
+    /// 测试观察口：`config_changed` 是否已停在 pre-reset 闸前。
+    #[cfg(test)]
+    fn config_waiting_before_reset(&self) -> bool {
+        self.config_pre_reset_gate.lock().unwrap().is_none()
+    }
+
     /// 测试观察口：KICKED 延迟写是否已到闸前（取走放行端 = 已进入 blocking 任务）。
     #[cfg(test)]
     fn kicked_write_at_gate(&self) -> bool {
@@ -2091,15 +2115,35 @@ impl ZcodeHub {
         // 新配置已由调用方落库；先读形态（本地 KV，非网络、不持锁）。
         let configured = self.read_configured();
         let (view, guard) = self.begin_config_change(configured);
-        // 锁外断 relay、作废旧投影（不在任何锁内 await 网络）。reset 不清 JWT。
-        self.backend.reset(view.generation).await;
-        // 以 AuthService 的权威状态落最终展示：已授权 → offline（可直接连新目标）。
+        #[cfg(test)]
+        {
+            let gate = self.config_pre_reset_gate.lock().unwrap().take();
+            if let Some(gate) = gate {
+                gate.notified().await;
+            }
+        }
+        // 清理串行 + owner 校验（终审 P2-3 残留）：`reset` 是清理动作，必须与断开清理
+        // 共用 `disconnect_lock`，且只有**仍是当前窗口**的 owner 才能执行——否则 B 已
+        // 完成并重连后，陈旧的 A 仍可能 reset 断掉 B 的连接/投影。
+        //
+        // 本函数不取 `connect_lock`、不调用 `finish_disconnect`：锁序只有
+        // `disconnect_lock`（config 不产生 `disconnect_lock → connect_lock` 嵌套），
+        // 与 finish 的 `disconnect_lock → connect_lock` 无反转、无死锁。
+        {
+            let _cleanup = self.disconnect_lock.lock().await;
+            if guard.is_current() {
+                // 仍是 owner 才断 relay、作废旧投影（reset 不清 JWT）。
+                self.backend.reset(view.generation).await;
+            }
+        }
+        // 非 owner 也读一次权威状态（只读、不触网），供下面的代际复核/诊断；
+        // 末态只在仍是本代际时落库，绝不覆盖更新的配置变更。
         let status = self.backend.auth_status();
-        let out = {
+        let (out, applied) = {
             let mut inner = self.lock();
             // 期间又发生了更新的配置变更/断开：以更新者的状态为准。
             if inner.generation != view.generation {
-                inner.view()
+                (inner.view(), false)
             } else {
                 inner.configured = configured;
                 inner.authorized = status.authorized;
@@ -2112,14 +2156,17 @@ impl ZcodeHub {
                 if out != view {
                     self.emit_connection(&out);
                 }
-                out
+                (out, true)
             }
         };
         // 只看仍是本窗口的凭据清位：更新的配置变更已接管时绝不清它的新窗口。
         drop(guard);
-        // 清位后补一次唤醒：清理窗口内 worker 只能看到 Offline/closing，唤醒许可
-        // 已被本轮消费；这里不补，快关快开的唤醒就丢了（gate 现查 intent/remote）。
-        self.wake_auto_connect();
+        if applied {
+            // 清位后补一次唤醒：清理窗口内 worker 只能看到 Offline/closing，唤醒许可
+            // 已被本轮消费；这里不补，快关快开的唤醒就丢了（gate 现查 intent/remote）。
+            // 被更新的配置变更取代（applied=false）时不补：新 owner 自己会唤醒。
+            self.wake_auto_connect();
+        }
         out
     }
 
@@ -2591,6 +2638,9 @@ mod tests {
         session_unready: AtomicBool,
         /// 在途 reset 的闸（配置变更窗口测试用）。
         reset_gate: Mutex<Option<Arc<Notify>>>,
+        /// reset 是否模拟「断掉 relay 连接」（默认 false 保持既有用例；P2-3 回归开 true
+        /// 后，陈旧 config_changed 若仍执行 reset 会把新连接的 live 断掉）。
+        reset_drops_live: AtomicBool,
         connect_result: Mutex<Option<ZResult<ConnectionView>>>,
         /// 持久幂等查询的替身结果（`None` = 无既有回执，即默认语义）。
         existing_result: Mutex<Option<ZResult<Option<ActionReceipt>>>>,
@@ -2779,7 +2829,12 @@ mod tests {
         fn reset<'a>(&'a self, generation: u64) -> BoxFuture<'a, ()> {
             self.reset_calls.fetch_add(1, Ordering::SeqCst);
             self.reset_generations.lock().unwrap().push(generation);
+            let drops_live = self.reset_drops_live.load(Ordering::SeqCst);
             Box::pin(async move {
+                // 进入 reset = relay 断开/投影作废：开了副作用开关就断掉 live 连接。
+                if drops_live {
+                    self.live.store(false, Ordering::SeqCst);
+                }
                 let gate = self.reset_gate.lock().unwrap().clone();
                 if let Some(gate) = gate {
                     gate.notified().await;
@@ -4042,22 +4097,33 @@ mod tests {
         let after_first = hub.connection();
         assert!(after_first.generation > paired.generation);
 
-        // 第二次配置变更接管：写入更高的关闭窗口。
+        // 第二次配置变更接管：begin 立即推进代际/写入更高的关闭窗口，但它的 reset
+        // 必须**等 A 的清理窗口结束**（同一把 disconnect_lock 串行）。
         let second = {
             let hub = hub.clone();
             tokio::spawn(async move { hub.config_changed().await })
         };
-        wait_until(|| fake.reset_calls.load(Ordering::SeqCst) == 2).await;
+        wait_until(|| {
+            let view = hub.connection();
+            view.generation > after_first.generation && view.state == ConnectionState::Offline
+        })
+        .await;
         let newer = hub.connection();
-        assert!(newer.generation > after_first.generation);
-        assert_eq!(newer.state, ConnectionState::Offline);
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            fake.reset_calls.load(Ordering::SeqCst),
+            1,
+            "B 的 reset 必须等 A 的清理窗口结束（清理串行）"
+        );
 
         // 新窗口生效：connect 被拒绝且零后端连接。
         let err = hub.connect().await.unwrap_err();
         assert!(err.is(codes::OFFLINE), "新关闭窗口必须生效，实际 {err:?}");
         assert_eq!(fake.connect_calls.load(Ordering::SeqCst), connects_before);
 
-        // 放行较早的清理：结束后它的旧凭据不得清新窗口，也不得覆盖新代际视图。
+        // 放行较早的清理：它（曾是 owner）的末态因代际已变被跳过，且不得清 B 的窗口。
         gate.notify_one();
         let first_view = first.await.expect("spawn 不应 panic");
         assert_eq!(
@@ -4069,9 +4135,12 @@ mod tests {
             Some(newer.generation),
             "旧 guard 不得清掉新窗口"
         );
+
+        // A 释放清理锁后 B 才进入 reset（同一闸），此时仍拒绝连接。
+        wait_until(|| fake.reset_calls.load(Ordering::SeqCst) == 2).await;
         assert!(hub.connect().await.unwrap_err().is(codes::OFFLINE));
 
-        // 放行较新的清理：它清位后显式重连可达。
+        // 放行较新的清理：它清位后显式重连可达（B 的连接胜出）。
         gate.notify_one();
         let second_view = second.await.expect("spawn 不应 panic");
         assert_eq!(second_view.generation, newer.generation);
@@ -4082,6 +4151,77 @@ mod tests {
             fake.connect_calls.load(Ordering::SeqCst),
             connects_before + 1
         );
+    }
+
+    /// P2-3 残留（终审）：`config_changed` 的 `reset` 必须与断开清理串行且校验 owner。
+    /// 「B 先完整完成并重连、A 后执行」时，陈旧 A 绝不能再 reset 断掉 B 的连接/投影。
+    #[tokio::test]
+    async fn stale_config_change_cannot_reset_newer_connection() {
+        let fake = Arc::new(FakeBackend::default());
+        let hub = paired_hub(fake.clone()).await;
+        assert_eq!(hub.connection().state, ConnectionState::Paired);
+        assert!(fake.is_live(), "前置：已配对 = relay live");
+        let resets_before = fake.reset_calls.load(Ordering::SeqCst);
+        assert_eq!(resets_before, 0);
+
+        // reset 的断链副作用：只要陈旧 A 还执行 reset，就会把 B 的 live 断掉（RED）。
+        fake.reset_drops_live.store(true, Ordering::SeqCst);
+
+        // A：begin 之后、取清理串行锁之前停住。
+        let gate = hub.install_config_pre_reset_gate();
+        let a = {
+            let hub = hub.clone();
+            tokio::spawn(async move { hub.config_changed().await })
+        };
+        wait_until(|| hub.config_waiting_before_reset()).await;
+        assert_eq!(
+            fake.reset_calls.load(Ordering::SeqCst),
+            resets_before,
+            "A 停住时不得已执行 reset"
+        );
+
+        // B：完整执行（reset/auth_status/清位）并显式重连——B 是当前 owner。
+        let b = hub.config_changed().await;
+        assert_eq!(b.state, ConnectionState::Offline);
+        assert_eq!(
+            fake.reset_calls.load(Ordering::SeqCst),
+            resets_before + 1,
+            "B（owner）必须执行一次 reset"
+        );
+        assert!(!fake.is_live(), "B 的 reset 必须断掉旧链");
+        assert!(hub.lock().closing.is_none(), "B 结束后关闭窗口清位");
+        let reconnected = hub.connect().await.expect("B 之后必须可重连");
+        assert!(reconnected.is_paired());
+        assert!(fake.is_live(), "B 的新连接必须 live");
+        let connects_after_b = fake.connect_calls.load(Ordering::SeqCst);
+
+        // 放行 A：陈旧 owner 不得再 reset / 断 B 的连接，也不得覆盖 B 的末态。
+        gate.notify_one();
+        let a_view = a.await.expect("spawn 不应 panic");
+        assert_eq!(
+            a_view.generation, b.generation,
+            "陈旧 A 不得覆盖 B 的代际/末态"
+        );
+        assert_eq!(
+            fake.reset_calls.load(Ordering::SeqCst),
+            resets_before + 1,
+            "陈旧 A 不得再执行 reset"
+        );
+        assert!(fake.is_live(), "陈旧 reset 不得断掉 B 的新连接");
+        assert_eq!(hub.connection().state, ConnectionState::Paired);
+        assert_eq!(
+            fake.connect_calls.load(Ordering::SeqCst),
+            connects_after_b,
+            "陈旧 A 不得追加连接"
+        );
+        // 投影仍有效：B 的连接可正常读取会话。
+        let session = hub
+            .session(&TargetKey {
+                session_id: "sess_synthetic0000".into(),
+            })
+            .await
+            .expect("B 的新连接投影必须仍有效");
+        assert!(session.ready);
     }
 
     /// KICKED（conflict）是终态：不自动重连，只有显式断开/配置变更才复位。
