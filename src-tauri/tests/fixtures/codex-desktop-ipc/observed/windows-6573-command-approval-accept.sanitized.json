@@ -20,18 +20,12 @@
           "command": "<synthetic command>"
         }
       ],
-      "proposedExecpolicyAmendment": [
-        "<redacted:4>",
-        "<redacted:13>"
-      ],
+      "proposedExecpolicyAmendment": ["<redacted:4>", "<redacted:13>"],
       "availableDecisions": [
         "accept",
         {
           "acceptWithExecpolicyAmendment": {
-            "execpolicy_amendment": [
-              "<redacted:4>",
-              "<redacted:13>"
-            ]
+            "execpolicy_amendment": ["<redacted:4>", "<redacted:13>"]
           }
         },
         "cancel"

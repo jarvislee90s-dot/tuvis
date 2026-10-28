@@ -131,6 +131,12 @@ fn simple_request(method: &str) -> RpcRequest {
         validity: None,
         source_client_id: None,
         timeout_ms: None,
+        action_id: None,
+        compat_licensed: false,
+        deadline: None,
+        pre_dispatch_turns: Default::default(),
+        interaction_recheck: None,
+        async_write_recheck: None,
     }
 }
 
@@ -851,6 +857,12 @@ async fn owner_rebind_invalidates_old_lease_end_to_end() {
             validity: Some(validity),
             source_client_id: None,
             timeout_ms: None,
+            action_id: None,
+            compat_licensed: false,
+            deadline: None,
+            pre_dispatch_turns: Default::default(),
+            interaction_recheck: None,
+            async_write_recheck: None,
         })
         .await;
     assert_eq!(outcome.delivery, Delivery::NotSent);
@@ -1105,7 +1117,10 @@ async fn native_command_approval_uses_decision_wire() {
         let key = key.clone();
         let rk = cmd_key.request_key.clone();
         let tk = cmd_key.context_token.clone();
-        tokio::spawn(async move { a.respond(&key, &rk, &tk, PendingAction::Approve).await })
+        tokio::spawn(async move {
+            a.respond(&key, &rk, &tk, PendingAction::Approve, "act-test")
+                .await
+        })
     };
     let frame = peer.recv().await;
     assert_eq!(frame["method"], "thread-follower-command-approval-decision");
@@ -1147,7 +1162,10 @@ async fn native_file_change_approval_uses_file_decision_wire() {
         WINDOWS_BUILD,
         vec![serde_json::json!({
             "id": 21, "method": "item/fileChange/requestApproval",
-            "params": { "cwd": "/w", "reason": "r", "changes": [{}, {}] }
+            "params": {
+                "cwd": "/w", "reason": "r",
+                "changes": [{"path": "a.rs", "kind": "update"}]
+            }
         })],
     )
     .await;
@@ -1171,7 +1189,10 @@ async fn native_file_change_approval_uses_file_decision_wire() {
         let key = key.clone();
         let rk = file_key.request_key.clone();
         let tk = file_key.context_token.clone();
-        tokio::spawn(async move { a.respond(&key, &rk, &tk, PendingAction::Reject).await })
+        tokio::spawn(async move {
+            a.respond(&key, &rk, &tk, PendingAction::Reject, "act-test")
+                .await
+        })
     };
     let frame = peer.recv().await;
     assert_eq!(
@@ -1268,7 +1289,10 @@ async fn native_permissions_approval_echoes_saved_permissions() {
         let key = key.clone();
         let rk = perm_key.request_key.clone();
         let tk = perm_key.context_token.clone();
-        tokio::spawn(async move { a.respond(&key, &rk, &tk, PendingAction::Approve).await })
+        tokio::spawn(async move {
+            a.respond(&key, &rk, &tk, PendingAction::Approve, "act-test")
+                .await
+        })
     };
     let frame = peer.recv().await;
     assert_eq!(
@@ -1307,7 +1331,10 @@ async fn native_permissions_approval_echoes_saved_permissions() {
         let key = key.clone();
         let rk = perm_key.request_key.clone();
         let tk = perm_key.context_token.clone();
-        tokio::spawn(async move { a.respond(&key, &rk, &tk, PendingAction::Reject).await })
+        tokio::spawn(async move {
+            a.respond(&key, &rk, &tk, PendingAction::Reject, "act-test")
+                .await
+        })
     };
     let frame = peer.recv().await;
     assert_eq!(
@@ -1360,7 +1387,13 @@ async fn native_answer_binds_current_pending() {
         .collect(),
     );
     let o = adapter
-        .respond(&key, &pending.request_key, &pending.context_token, bad)
+        .respond(
+            &key,
+            &pending.request_key,
+            &pending.context_token,
+            bad,
+            "act-test",
+        )
         .await;
     assert_eq!(o.delivery, Delivery::NotSent);
     assert_eq!(o.reason_code.as_deref(), Some("answers_mismatch"));
@@ -1373,7 +1406,13 @@ async fn native_answer_binds_current_pending() {
             .collect(),
     );
     let o = adapter
-        .respond(&key, &pending.request_key, &pending.context_token, missing)
+        .respond(
+            &key,
+            &pending.request_key,
+            &pending.context_token,
+            missing,
+            "act-test",
+        )
         .await;
     assert_eq!(o.delivery, Delivery::NotSent);
 
@@ -1388,7 +1427,13 @@ async fn native_answer_binds_current_pending() {
         .collect(),
     );
     let o = adapter
-        .respond(&key, &pending.request_key, "wrong-token", ok_answer.clone())
+        .respond(
+            &key,
+            &pending.request_key,
+            "wrong-token",
+            ok_answer.clone(),
+            "act-test",
+        )
         .await;
     assert_eq!(o.delivery, Delivery::NotSent);
     assert_eq!(o.reason_code.as_deref(), Some("stale_context"));
@@ -1402,7 +1447,7 @@ async fn native_answer_binds_current_pending() {
         let rk = pending.request_key.clone();
         let tk = pending.context_token.clone();
         let ans = ok_answer.clone();
-        tokio::spawn(async move { a.respond(&key, &rk, &tk, ans).await })
+        tokio::spawn(async move { a.respond(&key, &rk, &tk, ans, "act-test").await })
     };
     let frame = peer.recv().await;
     assert_eq!(frame["method"], "thread-follower-submit-user-input");
@@ -1459,6 +1504,7 @@ async fn native_is_other_false_rejects_free_text() {
             &pending.request_key,
             &pending.context_token,
             free_text,
+            "act-test",
         )
         .await;
     assert_eq!(o.delivery, Delivery::NotSent);
@@ -1480,6 +1526,7 @@ async fn native_is_other_false_rejects_free_text() {
                         .map(|(k, v)| (k.to_string(), v))
                         .collect(),
                 ),
+                "act-test",
             )
             .await
         })
@@ -1515,11 +1562,13 @@ async fn native_capability_gated_and_unsupported_requests_never_send() {
         multi_agents_manager_lib::services::codex_desktop_ipc::types::PendingKind::UserInput
     );
     assert!(!pending.actionable, "能力未验证 → 不可操作");
-    // 拆码契约：方法已知（user_input）但能力未验证 → capability_unverified
-    //（下一行回执的 capability_unavailable 是投递面 reason_code，与投影拆码无关）
+    // T04 语义细化（明确更新，非删测凑绿）：阻塞问答的可操作性改由**逐操作有效
+    // 策略**给出——该方法已知但当前无证据（无 shipped 位、无契约匹配、无真实成功）
+    // → `operation_no_evidence`。旧的笼统 `capability_unverified` 不再用于阻塞问答
+    // （它仍用于其他能力门的既有路径）。零写出语义不变。
     assert_eq!(
         pending.disabled_reason_code.as_deref(),
-        Some("capability_unverified")
+        Some("operation_no_evidence")
     );
     let o = adapter
         .respond(
@@ -1532,16 +1581,18 @@ async fn native_capability_gated_and_unsupported_requests_never_send() {
                     .map(|(k, v)| (k.to_string(), v))
                     .collect(),
             ),
+            "act-test",
         )
         .await;
     assert_eq!(o.delivery, Delivery::NotSent);
-    assert_eq!(o.reason_code.as_deref(), Some("capability_unavailable"));
+    // T04：投递面 reason_code 与投影同源（逐操作机器码），仍是零写出。
+    assert_eq!(o.reason_code.as_deref(), Some("operation_no_evidence"));
     let no_frame = tokio::time::timeout(Duration::from_millis(200), peer.recv()).await;
     assert!(no_frame.is_err(), "能力门拒绝不得写出帧");
 
     // 未知 method：Unsupported 卡
     let o = adapter
-        .respond(&key, "n:1", "t", PendingAction::Approve)
+        .respond(&key, "n:1", "t", PendingAction::Approve, "act-test")
         .await;
     assert_eq!(o.delivery, Delivery::NotSent);
     assert_eq!(
@@ -2149,7 +2200,9 @@ async fn client_status_changed_invalidates_all_threads_of_owner() {
     // 旧卡 respond 零写（旧 lease/token 全失效）
     let rk = p1.pending[0].request_key.clone();
     let tk = p1.pending[0].context_token.clone();
-    let o = adapter.respond(&k1, &rk, &tk, PendingAction::Approve).await;
+    let o = adapter
+        .respond(&k1, &rk, &tk, PendingAction::Approve, "act-test")
+        .await;
     assert_eq!(o.delivery, Delivery::NotSent);
     assert_eq!(o.reason_code.as_deref(), Some("stale_context"));
     // C2：owner 失效但 socket 仍活着 → 自动重跟随两 thread（发现顺序不固定，按帧分拣）
@@ -2449,7 +2502,8 @@ async fn follow_and_respond_do_not_deadlock() {
         let b = barrier.clone();
         tokio::spawn(async move {
             b.wait().await;
-            a.respond(&k, &rk, &tk, PendingAction::Approve).await
+            a.respond(&k, &rk, &tk, PendingAction::Approve, "act-test")
+                .await
         })
     };
     // 对端按 method 分拣驱动（两任务的帧任意交错）
@@ -2517,7 +2571,7 @@ async fn follow_and_respond_do_not_deadlock() {
         peer.send(&state_frame(&tid, "owner-1", change)).await;
     }
     let o2 = adapter
-        .respond(&key1, &rk, &tk, PendingAction::Approve)
+        .respond(&key1, &rk, &tk, PendingAction::Approve, "act-test")
         .await;
     assert_eq!(o2.delivery, Delivery::NotSent);
     assert_eq!(
@@ -2557,7 +2611,7 @@ async fn vanished_pending_revokes_token() {
 
     // 旧 token respond → 409/stale_context 零写
     let o = adapter
-        .respond(&key, &rk, &old_token, PendingAction::Approve)
+        .respond(&key, &rk, &old_token, PendingAction::Approve, "act-test")
         .await;
     assert_eq!(o.delivery, Delivery::NotSent);
     assert_eq!(o.reason_code.as_deref(), Some("stale_context"));
@@ -2569,7 +2623,10 @@ async fn vanished_pending_revokes_token() {
         let k = key.clone();
         let rk = rk.clone();
         let tk = new_token.clone();
-        tokio::spawn(async move { a.respond(&k, &rk, &tk, PendingAction::Approve).await })
+        tokio::spawn(async move {
+            a.respond(&k, &rk, &tk, PendingAction::Approve, "act-test")
+                .await
+        })
     };
     let frame = recv_frame(&mut peer, 5).await;
     assert_eq!(
@@ -2613,7 +2670,7 @@ async fn stale_mirror_rejects_respond() {
     }
     // 缺口后旧卡批准 → stale_context、零写（following 声明属 R1 有界重拉，允许）
     let o = adapter
-        .respond(&key, &rk, &tk, PendingAction::Approve)
+        .respond(&key, &rk, &tk, PendingAction::Approve, "act-test")
         .await;
     assert_eq!(o.delivery, Delivery::NotSent);
     assert_eq!(o.reason_code.as_deref(), Some("stale_context"));
@@ -2652,7 +2709,8 @@ async fn concurrent_submit_same_pending_writes_once() {
         let b = barrier.clone();
         tokio::spawn(async move {
             b.wait().await;
-            a.respond(&k, &rk, &tk, PendingAction::Approve).await
+            a.respond(&k, &rk, &tk, PendingAction::Approve, "act-test")
+                .await
         })
     };
     let tb = {
@@ -2663,7 +2721,8 @@ async fn concurrent_submit_same_pending_writes_once() {
         let b = barrier.clone();
         tokio::spawn(async move {
             b.wait().await;
-            a.respond(&k, &rk, &tk, PendingAction::Approve).await
+            a.respond(&k, &rk, &tk, PendingAction::Approve, "act-test")
+                .await
         })
     };
     // 恰一个 wire 帧
@@ -2711,7 +2770,10 @@ async fn unknown_delivery_blocks_retry_same_pending() {
         let k = key.clone();
         let rk = rk.clone();
         let tk = tk.clone();
-        tokio::spawn(async move { a.respond(&k, &rk, &tk, PendingAction::Approve).await })
+        tokio::spawn(async move {
+            a.respond(&k, &rk, &tk, PendingAction::Approve, "act-test")
+                .await
+        })
     };
     let frame = recv_frame(&mut peer, 5).await;
     let _ = frame;
@@ -2723,7 +2785,7 @@ async fn unknown_delivery_blocks_retry_same_pending() {
 
     // 新 actionId 再 respond 同一 pending → 拒（未知结果不能借新 actionId 重发）
     let o2 = adapter
-        .respond(&key, &rk, &tk, PendingAction::Approve)
+        .respond(&key, &rk, &tk, PendingAction::Approve, "act-test")
         .await;
     assert_eq!(o2.delivery, Delivery::NotSent);
     assert_eq!(
@@ -2756,7 +2818,7 @@ async fn unknown_delivery_blocks_retry_same_pending() {
     let fresh_token = now.pending[0].context_token.clone();
     assert_ne!(fresh_token, tk, "重现必须换 token（新世界）");
     let o_old = adapter
-        .respond(&key, &rk, &tk, PendingAction::Approve)
+        .respond(&key, &rk, &tk, PendingAction::Approve, "act-test")
         .await;
     assert_eq!(o_old.delivery, Delivery::NotSent);
     assert_eq!(
@@ -2770,7 +2832,7 @@ async fn unknown_delivery_blocks_retry_same_pending() {
         let k = key.clone();
         let rk = rk.clone();
         tokio::spawn(async move {
-            a.respond(&k, &rk, &fresh_token, PendingAction::Approve)
+            a.respond(&k, &rk, &fresh_token, PendingAction::Approve, "act-test")
                 .await
         })
     };
@@ -2974,7 +3036,10 @@ async fn respond_rejects_payload_when_owner_changes_between_phases() {
         let k = key.clone();
         let rk = rk.clone();
         let tk = tk.clone();
-        tokio::spawn(async move { a.respond(&k, &rk, &tk, PendingAction::Approve).await })
+        tokio::spawn(async move {
+            a.respond(&k, &rk, &tk, PendingAction::Approve, "act-test")
+                .await
+        })
     };
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
@@ -3657,23 +3722,40 @@ async fn probe_single_flight_emits_one_protocol_run() {
 // ============================================================
 
 use multi_agents_manager_lib::database::dao::codex_ipc_probe::ProbeState;
+use multi_agents_manager_lib::services::codex_desktop_ipc::probe::schema_probe::SchemaEvidence;
 use multi_agents_manager_lib::services::codex_desktop_ipc::probe::{
-    ProbeLedger, ProbeLedgerEntry, CAP_SCHEMA, CAP_STATE,
+    PersistedSchemaEvidence, ProbeLedger, ProbeLedgerEntry, CAP_SCHEMA, CAP_STATE,
 };
 use multi_agents_manager_lib::services::codex_desktop_ipc::profile::ProtocolProfile;
 use std::sync::Arc;
 
-/// 内存账本行：(state, next_retry_at, error_code, stage)。
-type LedgerRow = (ProbeState, Option<i64>, Option<String>, Option<String>);
+/// 内存账本键：(probe_key, capability)。
 type LedgerKey = (String, String);
 
+/// 内存账本行（S1 起 = DAO 同语义的精简镜像）：state 观测 + 成功证据分离。
+#[derive(Clone)]
+struct LedgerRow {
+    state: ProbeState,
+    next_retry_at: Option<i64>,
+    error_code: Option<String>,
+    stage: Option<String>,
+    /// 成功证据（与最近观测分离；失败写入时保留）
+    evidence_at: Option<i64>,
+    last_seen_at: Option<i64>,
+}
+
 /// 内存账本（测试用）：记录读写次数，方便断言「零帧复用」「未探测」。
+/// S1：另存持久 schema 决策词证据（`load/store_schema_evidence` 的内存实现），
+/// 并记录 load/store 次数供「重启恢复零重探」断言。
 #[derive(Default)]
 struct MemoryLedger {
     rows: StdMutex<std::collections::HashMap<LedgerKey, LedgerRow>>,
+    schema_words: StdMutex<std::collections::HashMap<String, (SchemaEvidence, i64)>>,
     gets: std::sync::atomic::AtomicUsize,
     records: std::sync::atomic::AtomicUsize,
     state_records: std::sync::atomic::AtomicUsize,
+    schema_loads: std::sync::atomic::AtomicUsize,
+    schema_stores: std::sync::atomic::AtomicUsize,
 }
 
 impl MemoryLedger {
@@ -3699,12 +3781,14 @@ impl MemoryLedger {
     ) {
         self.rows.lock().unwrap().insert(
             (probe_key.to_string(), capability.to_string()),
-            (
+            LedgerRow {
                 state,
                 next_retry_at,
-                error_code.map(str::to_string),
-                stage.map(str::to_string),
-            ),
+                error_code: error_code.map(str::to_string),
+                stage: stage.map(str::to_string),
+                evidence_at: None,
+                last_seen_at: None,
+            },
         );
     }
     fn gets(&self) -> usize {
@@ -3712,6 +3796,12 @@ impl MemoryLedger {
     }
     fn records(&self) -> usize {
         self.records.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    fn schema_loads(&self) -> usize {
+        self.schema_loads.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    fn schema_stores(&self) -> usize {
+        self.schema_stores.load(std::sync::atomic::Ordering::SeqCst)
     }
     fn row(&self, probe_key: &str, capability: &str) -> Option<LedgerRow> {
         self.rows
@@ -3725,17 +3815,18 @@ impl MemoryLedger {
 impl ProbeLedger for MemoryLedger {
     fn get(&self, probe_key: &str, capability: &str) -> Option<ProbeLedgerEntry> {
         self.gets.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        self.row(probe_key, capability)
-            .map(
-                |(state, next_retry_at, error_code, stage)| ProbeLedgerEntry {
-                    state,
-                    next_retry_at,
-                    error_code,
-                    stage,
-                    // 内存替身不存指纹（只对 capability='schema' 有意义）
-                    fingerprint: None,
-                },
-            )
+        self.row(probe_key, capability).map(|row| ProbeLedgerEntry {
+            evidenced: row.evidence_at.is_some()
+                || matches!(row.state, ProbeState::Probed | ProbeState::Verified),
+            evidenced_at: row.evidence_at,
+            last_seen_at: row.last_seen_at,
+            state: row.state,
+            next_retry_at: row.next_retry_at,
+            error_code: row.error_code,
+            stage: row.stage,
+            // 内存替身不存指纹（只对 capability='schema' 有意义）
+            fingerprint: None,
+        })
     }
 
     fn record(
@@ -3752,19 +3843,60 @@ impl ProbeLedger for MemoryLedger {
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
         // 与 DAO 同语义：inconclusive 带退避窗口（首探 30s），其余清空
+        let now = chrono::Utc::now().timestamp_millis();
         let next_retry_at = (outcome.as_state() == ProbeState::Inconclusive).then(|| {
-            chrono::Utc::now().timestamp_millis()
-                + multi_agents_manager_lib::database::dao::codex_ipc_probe::retry_backoff_ms(1)
+            now + multi_agents_manager_lib::database::dao::codex_ipc_probe::retry_backoff_ms(1)
         });
-        self.rows.lock().unwrap().insert(
-            (probe_key.to_string(), capability.to_string()),
-            (
-                outcome.as_state(),
+        let mut rows = self.rows.lock().unwrap();
+        let key = (probe_key.to_string(), capability.to_string());
+        // S1（与 DAO 契约同源）：失败观测写入**保留既有成功证据**（老数据兼容同 DAO：
+        // 旧行 state∈probed|verified 且无证据列 → 按旧值提升）。
+        let evidence_at = match rows.get(&key) {
+            Some(old) => old.evidence_at.or_else(|| {
+                matches!(old.state, ProbeState::Probed | ProbeState::Verified).then_some(now)
+            }),
+            None => None,
+        };
+        let evidenced_now = matches!(outcome.as_state(), ProbeState::Probed);
+        rows.insert(
+            key,
+            LedgerRow {
+                state: outcome.as_state(),
                 next_retry_at,
-                outcome.error_code().map(str::to_string),
-                Some(outcome.stage().as_str().to_string()),
-            ),
+                error_code: outcome.error_code().map(str::to_string),
+                stage: Some(outcome.stage().as_str().to_string()),
+                evidence_at: if evidenced_now {
+                    Some(now)
+                } else {
+                    evidence_at
+                },
+                last_seen_at: Some(now),
+            },
         );
+    }
+
+    fn load_schema_evidence(&self, probe_key: &str) -> Option<PersistedSchemaEvidence> {
+        self.schema_loads
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.schema_words
+            .lock()
+            .unwrap()
+            .get(probe_key)
+            .map(|(ev, at)| PersistedSchemaEvidence {
+                fingerprint: ev.fingerprint.clone(),
+                command_decisions: ev.command_decisions.clone(),
+                file_decisions: ev.file_decisions.clone(),
+                evidenced_at: *at,
+            })
+    }
+
+    fn store_schema_evidence(&self, probe_key: &str, evidence: &SchemaEvidence, at_ms: i64) {
+        self.schema_stores
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.schema_words
+            .lock()
+            .unwrap()
+            .insert(probe_key.to_string(), (evidence.clone(), at_ms));
     }
 }
 
@@ -3906,11 +4038,11 @@ async fn p0_unreachable_records_inconclusive() {
         .row(&expected_probe_key("macos", "26.9999.0"), CAP_STATE)
         .expect("P0 失败也要落账");
     assert_eq!(
-        row.0,
+        row.state,
         ProbeState::Inconclusive,
         "不可达只能记「没有证据」（Desktop 可能只是没起）"
     );
-    assert!(row.1.is_some(), "带退避窗口");
+    assert!(row.next_retry_at.is_some(), "带退避窗口");
 }
 
 /// 未知 build 首次 state 访问 → 探测通过 → 内存 profile 提升 `state` + 账本落 probed。
@@ -3950,7 +4082,7 @@ async fn unknown_build_probe_upgrades_state_and_records() {
     let row = ledger
         .row(&expected_probe_key("macos", "26.9999.0"), CAP_STATE)
         .expect("账本必须落一行");
-    assert_eq!(row.0, ProbeState::Probed);
+    assert_eq!(row.state, ProbeState::Probed);
     assert_eq!(
         ledger
             .state_records
@@ -4011,8 +4143,8 @@ async fn unknown_build_probe_failure_does_not_fake_state() {
     let row = ledger
         .row(&expected_probe_key("macos", "26.9999.0"), CAP_STATE)
         .expect("账本必须如实落一行");
-    assert_eq!(row.0, ProbeState::Inconclusive);
-    assert!(row.1.is_some(), "inconclusive 必须带退避窗口");
+    assert_eq!(row.state, ProbeState::Inconclusive);
+    assert!(row.next_retry_at.is_some(), "inconclusive 必须带退避窗口");
     // 失败路径同样释放临时 follow
     let off = expect_frame(&mut peer, "unfollow").await;
     assert_eq!(off["params"]["following"], serde_json::json!(false));
@@ -4076,8 +4208,8 @@ async fn schema_evidence_is_recorded_in_ledger() {
     let row = ledger
         .row(&expected_probe_key("macos", "26.9999.0"), CAP_SCHEMA)
         .expect("schema 结论必须落账（capability = \"schema\"）");
-    assert_eq!(row.0, ProbeState::Probed, "取到 decision 枚举 = probed");
-    assert_eq!(row.2, None, "成功没有错误码");
+    assert_eq!(row.state, ProbeState::Probed, "取到 decision 枚举 = probed");
+    assert_eq!(row.error_code, None, "成功没有错误码");
     assert_eq!(ledger.records(), 1, "只落一行（state 行不在本次范围）");
 
     // 取证后：审批策略切到 schema 档（accept + cancel；非空）
@@ -4120,16 +4252,16 @@ async fn schema_probe_failure_is_recorded_as_inconclusive() {
         .row(&expected_probe_key("macos", "26.9999.0"), CAP_SCHEMA)
         .expect("失败也必须如实落账");
     assert_eq!(
-        row.0,
+        row.state,
         ProbeState::Inconclusive,
         "取不到 schema = 没有证据（不是 failed：不是协议被证伪）"
     );
     assert_eq!(
-        row.2.as_deref(),
+        row.error_code.as_deref(),
         Some("cli_not_found"),
         "错误码必须带进账本（供人工排查）"
     );
-    assert!(row.1.is_some(), "inconclusive 必须带退避窗口");
+    assert!(row.next_retry_at.is_some(), "inconclusive 必须带退避窗口");
     assert_eq!(ledger.records(), 1);
     assert!(
         adapter.approval_policy().is_empty(),
@@ -5069,6 +5201,7 @@ fn artifacts_serialized_window_counts_commas_for_retained_non_newest_message() {
         artifacts: Vec::new(),
         turn_image_count: 0,
         omitted_artifact_count: 0,
+        interaction_answer: None,
     })
     .unwrap()
     .len();
@@ -6252,4 +6385,490 @@ mod messages_page {
             "活动 Turn 内追加新消息不得换投影 token"
         );
     }
+}
+
+// ============================================================
+// S1（2026-10-23）：默认开启、成功证据持久复用与即时投影
+//
+// 六类失败用例中的四个集成面（T1 在 DAO 单测、T4 在 adapter 单测）：
+// * 重启恢复 state/schema 无完整重探（T2）；
+// * 新 CLI 指纹必须重探（T3）；
+// * schema 比首快照晚到仍原地更新（T5）；
+// * 关闭后迟到结果不擅自恢复未知版本操作（T6）。
+// 「可尝试 ≠ 已取证」是全部用例的共同口径（S0 §3.1 用户裁决）。
+// ============================================================
+
+use multi_agents_manager_lib::services::codex_desktop_ipc::adapt_status::CodexAdaptStatus;
+use multi_agents_manager_lib::services::codex_desktop_ipc::probe::schema_probe::SchemaProbeOutcome;
+use multi_agents_manager_lib::services::codex_desktop_ipc::profile::compat_send_profile;
+use multi_agents_manager_lib::services::codex_desktop_ipc::types::{PendingKind, ThreadProjection};
+
+/// 驱动 ensure_thread 的握手/discovery/following/snapshot（自定义 adapter 构造；
+/// 与 harness_for 同一脚本，但档位/账本/开关由用例自定）。
+/// 返回快照后的投影。
+async fn ensure_thread_with(
+    adapter: Arc<DesktopIpcAdapter>,
+    mut peer: ScriptedPeer,
+    key: &ThreadKey,
+    requests: Vec<serde_json::Value>,
+) -> ThreadProjection {
+    let task = {
+        let a = adapter.clone();
+        let k = key.clone();
+        tokio::spawn(async move { a.ensure_thread(&k).await })
+    };
+    // 有界等待纪律（总计划 S3 同款）：每一帧都套 5s 超时——适配器侧任何意外挂起
+    // 都会响亮失败，而不是把整个测试进程吊死。
+    let init = expect_frame(&mut peer, "initialize").await;
+    assert_eq!(init["method"], "initialize");
+    peer.send(&serde_json::json!({
+        "type": "response", "requestId": init["requestId"],
+        "resultType": "success", "method": "initialize",
+        "handledByClientId": "owner-1", "result": { "clientId": "owner-1" }
+    }))
+    .await;
+    let disc = expect_frame(&mut peer, "discovery").await;
+    assert_eq!(disc["method"], "thread-owner-discovery");
+    peer.send(&discovery_response(
+        disc["requestId"].as_str().unwrap(),
+        "owner-1",
+    ))
+    .await;
+    let follow = expect_frame(&mut peer, "following").await;
+    assert_eq!(follow["method"], "thread-stream-following-changed");
+    peer.send(&serde_json::json!({
+        "type": "broadcast", "method": "thread-stream-state-changed", "version": 11,
+        "sourceClientId": "owner-1",
+        "params": {
+            "conversationId": key.thread_id, "hostId": "local",
+            "change": {
+                "type": "snapshot", "revision": 300,
+                "conversationState": {
+                    "turns": [], "requests": requests,
+                    "threadRuntimeStatus": { "type": "active" },
+                    "turnHistory": codex_fixture::canonical_turn_history(
+                        serde_json::json!({
+                            "t1": { "id": "t1", "type": "turn", "status": "inProgress", "items": ["u1"] },
+                            "u1": { "id": "u1", "type": "user_message", "text": "hi", "ts": 1 }
+                        }),
+                        serde_json::json!([{ "entries": ["t1"] }])
+                    )
+                }
+            }
+        }
+    }))
+    .await;
+    tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .expect("ensure_thread in time")
+        .expect("join")
+        .expect("projection")
+}
+
+fn schema_known_evidence() -> SchemaProbeOutcome {
+    SchemaProbeOutcome::Known(SchemaEvidence {
+        fingerprint: "fp-s1".into(),
+        command_decisions: vec!["accept".into(), "cancel".into()],
+        file_decisions: vec!["accept".into(), "cancel".into()],
+    })
+}
+
+/// T2：**重启恢复 state/schema 无完整重探**——同一持久账本（= 磁盘库）下，新进程
+/// （全新 adapter）命中成功证据：读链零帧复用、schema 决策词从持久证据装载
+/// （零 CLI 重跑、零重记账），审批档立即可用（冷启动审批无需重新进入才解锁）。
+#[tokio::test]
+async fn restart_restores_state_and_schema_without_reprobe() {
+    let key = probe_thread("thread-restart");
+    let probe_key = expected_probe_key("macos", "26.9999.0");
+    let ledger = Arc::new(MemoryLedger::default());
+
+    // —— 「重启前」进程 A：真探测一次（P0–P3 走 ScriptedPeer）+ schema 取证一次 ——
+    let (io, mut peer) = ScriptedPeer::new();
+    let a = Arc::new(DesktopIpcAdapter::new(
+        Arc::new(TestConnector::new(test_endpoint("macos", "26.9999.0"), io)),
+        ProtocolProfile::unverified("macos", "26.9999.0"),
+    ));
+    a.set_probe_ledger(ledger.clone());
+    a.set_probe_budget(probe_budget());
+    a.set_probe_key_override(Some(probe_key.clone()));
+    a.set_schema_probe_override(Some(schema_known_evidence()));
+    let a2 = a.clone();
+    let key_a = key.clone();
+    let probe = tokio::spawn(async move { a2.ensure_read_evidence(&key_a).await });
+    handshake(&mut peer, "owner-1").await;
+    let disc = expect_frame(&mut peer, "discovery").await;
+    peer.send(&discovery_ok(&disc["requestId"])).await;
+    let _follow = expect_frame(&mut peer, "following").await;
+    peer.send(&probe_snapshot(&key.thread_id, 3)).await;
+    tokio::time::timeout(Duration::from_secs(5), probe)
+        .await
+        .expect("探测在预算内结束")
+        .expect("task ok");
+    let _off = expect_frame(&mut peer, "unfollow").await;
+    a.ensure_schema_evidence().await;
+    assert_eq!(ledger.schema_stores(), 1, "A 取证后决策词落持久证据");
+    let records_after_a = ledger.records();
+    assert_eq!(records_after_a, 2, "A 共两行：state + schema");
+
+    // —— 「重启后」进程 B：全新 adapter + 同一持久账本；生产重启后按 endpoint 重算
+    //    = 兼容发送档（可尝试），证据是否成立只看账本 ——
+    let connector_b = Arc::new(FailingConnector::new());
+    let b = Arc::new(DesktopIpcAdapter::new(
+        connector_b.clone(),
+        compat_send_profile("macos", "26.9999.0"),
+    ));
+    b.set_probe_ledger(ledger.clone());
+    b.set_probe_key_override(Some(probe_key.clone()));
+    // 注入探针结论只为「若被消费即说明重跑了取证」的可观察性；恢复路径不得消费它
+    b.set_schema_probe_override(Some(schema_known_evidence()));
+
+    // 读链证据恢复：账本命中 → 零帧（不建连、不探测、不重写）
+    b.ensure_read_evidence(&key).await;
+    assert_eq!(connector_b.attempts(), 0, "重启后命中成功证据不得重探");
+    let status = b.adapt_status(None).await;
+    assert!(status.evidenced.state, "读链已取证（跨重启复用）");
+    assert!(
+        status.attemptable.send && status.attemptable.state,
+        "兼容档可尝试（两维度分列，不混同）"
+    );
+
+    // schema 证据恢复：决策词从持久证据装载——无 CLI 重跑、无重记账。
+    //（store 只在首次成功取证发生；A 连接期 spawn 的取证任务与显式调用的先后
+    // 次序不定，故 loads 不做精确计数——「证据来自装回而非重探」由下面的
+    // 不变量组钉死：stores 恒 1 ∧ records 不增 ∧ 审批档非空。）
+    b.ensure_schema_evidence().await;
+    assert!(
+        ledger.schema_loads() >= 1,
+        "恢复路径被查询过（装回先于 CLI 重跑）"
+    );
+    assert_eq!(ledger.schema_stores(), 1, "B 不得重写决策词证据");
+    assert_eq!(
+        ledger.records(),
+        records_after_a,
+        "重启恢复是零记账复用，不是重探"
+    );
+    let policy = b.approval_policy();
+    assert!(
+        !policy.is_empty(),
+        "冷启动审批档立即可用（无需重新进入会话才解锁）"
+    );
+    let status = b.adapt_status(None).await;
+    assert!(status.evidenced.schema, "DTO：schema 已取证");
+    let se = status.schema_evidence.expect("决策词证据随身携带");
+    assert_eq!(se.command_decisions, vec!["accept", "cancel"]);
+
+    // 同指纹再次触发：仍是零帧零记账（同指纹成功后探测帧/次数不增加）
+    b.ensure_read_evidence(&key).await;
+    assert_eq!(connector_b.attempts(), 0);
+    assert_eq!(ledger.records(), records_after_a);
+}
+
+/// T3：**新 CLI 指纹必须重探**——证据键含 `cli_id` 段；同 build 换了随包 CLI
+/// （键换）＝ 新身份，旧键的成功证据不跨身份复用（可尝试 ≠ 已取证）。
+#[tokio::test]
+async fn new_cli_fingerprint_requires_reprobe() {
+    let connector = Arc::new(FailingConnector::new());
+    let adapter = Arc::new(DesktopIpcAdapter::new(
+        connector.clone(),
+        // 生产重启后的可尝试档（send/state=true）——可尝试不妨碍「需要重新取证」
+        compat_send_profile("macos", "26.9999.0"),
+    ));
+    let ledger = Arc::new(MemoryLedger::default());
+    // 旧 CLI 指纹（cli-a）已有成功证据
+    ledger.seed(
+        "macos|26.9999.0|cli-a|1",
+        CAP_STATE,
+        ProbeState::Probed,
+        None,
+    );
+    adapter.set_probe_ledger(ledger.clone());
+    // 本机归因到**新的** CLI 指纹（cli 换代 → 键换）
+    adapter.set_probe_key_override(Some("macos|26.9999.0|cli-b|1".into()));
+
+    adapter
+        .ensure_read_evidence(&probe_thread("t-new-cli"))
+        .await;
+    assert_eq!(
+        connector.attempts(),
+        1,
+        "新 CLI 指纹必须重探（旧键证据不跨身份复用）"
+    );
+    let new_row = ledger
+        .row("macos|26.9999.0|cli-b|1", CAP_STATE)
+        .expect("新键必须落账（不可达 = inconclusive 如实）");
+    assert_eq!(new_row.state, ProbeState::Inconclusive);
+    // 旧键证据原样（不删不改）
+    let old_row = ledger
+        .row("macos|26.9999.0|cli-a|1", CAP_STATE)
+        .expect("旧键保留");
+    assert_eq!(old_row.state, ProbeState::Probed);
+    // DTO 口径：新指纹尚无成功证据
+    let status = adapter.adapt_status(None).await;
+    assert!(!status.evidenced.state, "新指纹尚未取证");
+    // 退避窗口内再触发：不再尝试建连
+    adapter
+        .ensure_read_evidence(&probe_thread("t-new-cli"))
+        .await;
+    assert_eq!(connector.attempts(), 1, "退避窗口内不重探");
+}
+
+/// T5：**schema 比首快照晚到仍原地更新**——卡已随首快照投出（策略空 = 不可操作），
+/// schema 异步取证完成后必须**原地**重发布已跟随线程：同一 request 同一 token，
+/// 决策词出现；L4（权限/问答）不被顺带解锁。
+#[tokio::test]
+async fn late_schema_evidence_unlocks_open_cards_in_place() {
+    let (io, peer) = ScriptedPeer::new();
+    let adapter = Arc::new(DesktopIpcAdapter::new(
+        Arc::new(TestConnector::new(test_endpoint("macos", "26.9999.0"), io)),
+        ProtocolProfile::unverified("macos", "26.9999.0"),
+    ));
+    let ledger = Arc::new(MemoryLedger::default());
+    adapter.set_probe_ledger(ledger.clone());
+    let probe_key = expected_probe_key("macos", "26.9999.0");
+    adapter.set_probe_key_override(Some(probe_key.clone()));
+    // 读链证据已在前次取证（seed）→ ensure_thread 零探测帧、直接跟随
+    ledger.seed(&probe_key, CAP_STATE, ProbeState::Probed, None);
+    // schema 结论注入为「未取证」：连接期自动跑的那次（ensure_connection spawn）
+    // 确定性落 Unknown（绝不 spawn 本机 CLI），首快照阶段策略必为空——无论它与
+    // 跟随的相对时序如何，首投影的「不可操作」都成立（不受调度竞态影响）。
+    adapter.set_schema_probe_override(Some(SchemaProbeOutcome::Unknown {
+        error_code: "cli_not_found".into(),
+    }));
+
+    let key = probe_thread("00000000-0000-4000-8000-0000000000s5");
+    let first = ensure_thread_with(
+        adapter.clone(),
+        peer,
+        &key,
+        vec![
+            serde_json::json!({
+                "id": 18, "method": "item/commandExecution/requestApproval",
+                "params": { "command": "pnpm test", "cwd": "/w",
+                            "availableDecisions": ["accept", "cancel"] }
+            }),
+            serde_json::json!({
+                "id": 19, "method": "item/permissions/requestApproval",
+                "params": { "cwd": "/w", "permissions": {} }
+            }),
+        ],
+    )
+    .await;
+    let cmd = first
+        .pending
+        .iter()
+        .find(|p| p.kind == PendingKind::CommandApproval)
+        .expect("command pending")
+        .clone();
+    assert!(
+        !cmd.actionable && cmd.allowed_decisions.is_empty(),
+        "首快照时 schema 未到：卡不可操作（不猜）"
+    );
+
+    let mut rx = adapter.subscribe();
+    // schema 证据**晚于**首快照到达：决策词持久证据先落库（等价于另一个进程/
+    // 上一轮取证写下的持久行），再触发取证入口——按「装回先于单飞」的次序，
+    // 即便本轮 epoch 已跑过一次未取证的探针，持久成功证据依然原地装回。
+    ledger.store_schema_evidence(
+        &probe_key,
+        &SchemaEvidence {
+            fingerprint: "fp-late".into(),
+            command_decisions: vec!["accept".into(), "cancel".into()],
+            file_decisions: vec!["accept".into(), "cancel".into()],
+        },
+        chrono::Utc::now().timestamp_millis(),
+    );
+    adapter.ensure_schema_evidence().await;
+    assert!(ledger.schema_loads() >= 1, "恢复路径必须查询持久决策词证据");
+
+    // 原地更新：SSE 通道推来新投影（不需要重新进入会话）
+    let updated = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .expect("schema 到达后必须原地重发布已跟随线程")
+        .expect("broadcast ok");
+    let cmd2 = updated
+        .pending
+        .iter()
+        .find(|p| p.kind == PendingKind::CommandApproval)
+        .expect("command pending 仍在场");
+    assert!(
+        cmd2.actionable,
+        "schema 到达后卡片原地解锁（不要求重新进入）"
+    );
+    assert_eq!(
+        cmd2.allowed_decisions,
+        vec!["accept", "cancel"],
+        "决策词 = schema 档（与请求词交集）"
+    );
+    assert_eq!(
+        cmd2.context_token, cmd.context_token,
+        "同内容同 token：卡片原地更新，不换上下文"
+    );
+    // L4 不被顺带解锁
+    let perms2 = updated
+        .pending
+        .iter()
+        .find(|p| p.kind == PendingKind::PermissionsApproval)
+        .expect("permissions pending 仍在场");
+    assert!(
+        !perms2.actionable && perms2.allowed_decisions.is_empty(),
+        "schema 档不解锁权限审批（未解锁 L4）"
+    );
+    adapter.shutdown().await;
+}
+
+/// T6：**关闭后迟到结果不擅自恢复未知版本操作**——新设置显式关闭（活值门）：
+/// 未知 build 连接装「只读可尝试」档（发送关）；晚到的 schema 结论不安装、不记账、
+/// 不解锁兼容审批；DTO 两维度如实分列。
+#[tokio::test]
+async fn disable_blocks_late_results_and_unknown_version_ops() {
+    let (io, peer) = ScriptedPeer::new();
+    let adapter = Arc::new(DesktopIpcAdapter::new(
+        Arc::new(TestConnector::new(test_endpoint("macos", "26.9999.0"), io)),
+        ProtocolProfile::unverified("macos", "26.9999.0"),
+    ));
+    // 新设置显式关闭（活值：翻转即刻约束新的探测/安装/装档）
+    adapter.set_auto_adapt_gate(Some(Arc::new(|| false)));
+    let ledger = Arc::new(MemoryLedger::default());
+    adapter.set_probe_ledger(ledger.clone());
+    adapter.set_probe_key_override(Some(expected_probe_key("macos", "26.9999.0")));
+    // 迟到的 schema 结论（关闭后才完成）
+    adapter.set_schema_probe_override(Some(schema_known_evidence()));
+
+    let key = probe_thread("00000000-0000-4000-8000-0000000000s6");
+    let _projection = ensure_thread_with(
+        adapter.clone(),
+        peer,
+        &key,
+        vec![serde_json::json!({
+            "id": 21, "method": "item/commandExecution/requestApproval",
+            "params": { "command": "echo hi", "availableDecisions": ["accept", "cancel"] }
+        })],
+    )
+    .await;
+    assert!(
+        !adapter.capabilities().send,
+        "关闭自动适配：未知 build 不得尝试发送（已验证 build 不受影响）"
+    );
+    assert!(
+        adapter.capabilities().state,
+        "只读不回撤（已发动作仍可收尾核对，设计 §3.3）"
+    );
+
+    // 迟到结果到达安装点：不安装、不记账、不解锁
+    adapter.ensure_schema_evidence().await;
+    assert!(
+        adapter.approval_policy().is_empty(),
+        "关闭后迟到结果不得恢复兼容审批决策"
+    );
+    assert_eq!(
+        ledger.records(),
+        0,
+        "关闭期间不探不记账（迟到结论也不落账本）"
+    );
+
+    let status: CodexAdaptStatus = adapter.adapt_status(Some(false)).await;
+    assert!(!status.auto_adapt_enabled, "生效值 = 显式关");
+    assert_eq!(status.auto_adapt_explicit, Some(false));
+    assert!(!status.attemptable.send, "DTO：发送不可尝试");
+    assert!(status.attemptable.state, "DTO：只读仍可尝试");
+    assert!(!status.evidenced.schema, "DTO：schema 未取证（未安装）");
+    adapter.shutdown().await;
+}
+
+// ============================================================
+// S3：迟到结果槽位——容量不足写前拒绝（设计 §5.3「超出容量应在投递前明确拒绝」）
+// ============================================================
+
+/// 槽位容量满时，携带 actionId 的 mutation 必须**写前**拒绝（`late_slot_capacity`，
+/// 零投递零写帧）；且被拒帧的 outbound 字节预算必须退回（Gate B Critical #2：
+/// 原实现漏退，容量占满期间每次拒绝永久泄漏一帧字节，累计耗尽 1 MiB 后该连接
+/// 所有请求恒 `outbound_capacity` 拒绝——本用例以「批量拒绝后读 RPC 仍可写出」
+/// 盖住）；无 actionId 的读 RPC 不占槽位、照常写出。
+/// 旧路径对照：旧实现没有槽位概念，任何 mutation 都直接写出（超时后丢失关联）。
+/// 【Gate B 修复轮补写】本用例在开发期真实跑过 RED/GREEN，但被临时探针清理脚本
+/// 一并误删、未进入 a5963568——报告曾失实声称已提交（详见 task-S3-report 修复轮）。
+#[tokio::test]
+async fn late_slot_capacity_refuses_mutation_before_write() {
+    let (io, mut peer) = ScriptedPeer::new();
+    let profile = profile_for("macos", "26.1013.31256").unwrap();
+    let registry = std::sync::Arc::new(
+        multi_agents_manager_lib::services::codex_desktop_ipc::late::LateSlotRegistry::new(
+            1,
+            Duration::from_secs(60),
+        ),
+    );
+    let conn = multi_agents_manager_lib::services::codex_desktop_ipc::connection::spawn_with_tuning(
+        io,
+        profile,
+        1,
+        multi_agents_manager_lib::services::codex_desktop_ipc::connection::ConnTuning {
+            rpc_timeout: Duration::from_millis(150),
+            ..Default::default()
+        },
+        registry.clone(),
+    );
+    handshake(&mut peer, "owner-1").await;
+    let _ = wait_initialized(&conn).await;
+
+    // 第一个 mutation（带 actionId）：写出但不回执 → RPC 超时后槽位持有
+    let mut req1 = simple_request("thread-follower-start-turn");
+    req1.mutating = true;
+    req1.action_id = Some("act-cap-1".into());
+    let t1 = request_in_task(&conn, req1);
+    let f1 = tokio::time::timeout(Duration::from_secs(5), peer.recv())
+        .await
+        .expect("第一个 mutation 必须写出");
+    assert_eq!(f1["method"], "thread-follower-start-turn");
+    let o1 = tokio::time::timeout(Duration::from_secs(3), t1)
+        .await
+        .expect("超时必须有界返回")
+        .expect("任务自身不 panic");
+    assert_eq!(o1.delivery, Delivery::UnknownDelivery, "超时 = 可能已写出");
+    assert_eq!(o1.reason_code.as_deref(), Some("timeout"));
+    assert_eq!(registry.len(), 1, "超时后槽位必须持有（迟到关联不删）");
+
+    // 第二个 mutation：槽位容量不足 → **写前**明确拒绝
+    let mut req2 = simple_request("thread-follower-start-turn");
+    req2.mutating = true;
+    req2.action_id = Some("act-cap-2".into());
+    let o2 = tokio::time::timeout(Duration::from_secs(2), conn.request(req2))
+        .await
+        .expect("写前拒绝必须有界返回");
+    assert_eq!(o2.delivery, Delivery::NotSent, "容量不足 = 零投递");
+    assert_eq!(
+        o2.reason_code.as_deref(),
+        Some("late_slot_capacity"),
+        "容量不足的机器原因码"
+    );
+    // 写前拒绝：wire 上不得出现第二帧
+    let more = tokio::time::timeout(Duration::from_millis(300), peer.recv()).await;
+    assert!(more.is_err(), "容量不足必须写前拒绝（不得写帧）");
+
+    // Gate B Critical #2 回归：被拒帧的字节预算必须退回。容量 1 已被占满，此后
+    // 每个 actionId mutation 都走拒绝臂——批量放大泄漏（约 1.4 MiB > 1 MiB
+    // OUTBOUND_BYTES），泄漏存在时预算耗尽、拒绝臂自身的 try_reserve 都会失败。
+    let blob = "x".repeat(2048);
+    for i in 0..700 {
+        let mut req = simple_request("thread-follower-start-turn");
+        req.mutating = true;
+        req.action_id = Some(format!("act-cap-flood-{i}"));
+        req.params = serde_json::json!({ "blob": blob });
+        let o = tokio::time::timeout(Duration::from_secs(2), conn.request(req))
+            .await
+            .expect("拒绝臂必须有界返回");
+        assert_eq!(
+            o.reason_code.as_deref(),
+            Some("late_slot_capacity"),
+            "第 {i} 次拒绝：若变成 outbound_capacity 即预算泄漏"
+        );
+    }
+
+    // 读 RPC（无 actionId）不占槽位、不因泄漏耗尽预算：照常写出
+    let t3 = request_in_task(&conn, simple_request("thread-owner-discovery"));
+    let f3 = tokio::time::timeout(Duration::from_secs(2), peer.recv())
+        .await
+        .expect("读 RPC 不受槽位容量约束（预算泄漏会在此以 outbound_capacity 暴露）");
+    assert_eq!(f3["method"], "thread-owner-discovery");
+    let _ = tokio::time::timeout(Duration::from_secs(2), t3).await;
+    conn.shutdown().await;
 }

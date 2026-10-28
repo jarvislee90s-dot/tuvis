@@ -1,5 +1,5 @@
 // 外部通道（M4 T1）：cloudflared 获取层 + 隧道进程管理（Task 5）。
-// 设计出处：docs/superpowers/specs/2026-09-16-m4-external-fullchain-design.md T1b/T1c/T1d
+// 设计出处：docs/engineering/specs/2026-09-16-m4-external-fullchain-design.md T1b/T1c/T1d
 
 use crate::remote::NoWindow;
 use std::path::{Path, PathBuf};
@@ -42,7 +42,7 @@ pub fn cloudflared_path() -> PathBuf {
 
 /// cloudflared 固定版本（用户实测版本）。**固定版本是 sha256 校验与镜像回退不引入
 /// 供应链风险的前提**——latest 会随上游漂移，校验表与镜像缓存都跟不上；升级 =
-/// 改本常量 + 逐项更新 expected_sha256 表（登记于 docs/superpowers/specs/2026-09-16-m4-external-fullchain-design.md §12.5）
+/// 改本常量 + 逐项更新 expected_sha256 表（登记于 docs/engineering/specs/2026-09-16-m4-external-fullchain-design.md §12.5）
 pub const CLOUDFLARED_VERSION: &str = "2026.9.1";
 
 /// 平台资产名（纯函数）：download_url_for 的 URL 末段、expected_sha256 查表键与

@@ -1,0 +1,54 @@
+{
+  "source": "只读扫描 /Applications/ChatGPT.app/Contents/Resources/app.asar（640,530,938 B），未启动/未操作应用",
+  "methodTable": {
+    "offset": "0xd6d026",
+    "entry": "\"thread-follower-steer-turn\":1",
+    "note": "仓内 profile.rs 方法表**没有**这一项 → 本轮显式带版本 1"
+  },
+  "ownerHandler": {
+    "offset": "0x8a66c6",
+    "fragment": "case`thread-follower-steer-turn`:{let n=await e.steerTurn(t.params.conversationId,t.params.input,t.params.restoreMessage,t.params.serviceTier,t.params.attachments,t.params.clientUserMessageId,t.params.additionalContext,t.params.toolOutput);return{method:t.method,result:{result:n}}}",
+    "finding": "restoreMessage 是**位置参数**，owner 侧随后 `r.cwd ?? getConversationCwd(t)` 直接解引用 ⇒ 缺它必抛 JS TypeError（本轮实测 resultType=error \"Cannot read properties of undefined (reading 'cwd')\"）"
+  },
+  "clientSteerFunction": {
+    "offset": "0x8e76da 起（函数 ADe）",
+    "order": [
+      "1) ib(getConversation(t)) 前置校验",
+      "2) Nb({... sendRequest: e.sendThreadFollowerRequest(i,'thread-follower-steer-turn',{conversationId,clientUserMessageId,input,serviceTier,attachments,additionalContext,toolOutput,restoreMessage})}) —— **stream role=follower 时走 IPC 转发**，成功即返回",
+      "3) 否则要求 getStreamRole(t).role==='owner'，不然 throw ownerWindowError",
+      "4) 再要求 isConversationStreaming(t)，不然 throw `Conversation ${t} is not being streamed.`",
+      "5) 取活动回合 C=X_(S)；`C?.status!=='inProgress'` ⇒ throw SteerTurnInactiveError(`Cannot steer conversation ${t} because its active turn already ended`)",
+      "6) 乐观条目 kr(E,T,r,{...,targetTurnId:C.turnId,targetTurnStartedAtMs:C.turnStartedAtMs})",
+      "7) 底层请求 {threadId,input,expectedTurnId,additionalContext,responsesapiClientMetadata}"
+    ]
+  },
+  "errorVocabulary": {
+    "steerTurnInactiveError": "Cannot steer conversation <id> because its active turn already ended",
+    "noActiveTurn": "NoActiveTurn",
+    "notSteerable": "jsonRpcCode -32600 + codexErrorInfo.activeTurnNotSteerable{turnKind:'compact'}",
+    "admissionOutcome": ["started", "steered", "duplicate"],
+    "permissionSideEffect": "`admissionOutcome!=='steered'` 时才 updateCurrentPermissions ⇒ 被 steering 的消息不更新权限面"
+  },
+  "questionEnvelope": {
+    "composeOffset": "0x3ac5086 (m1t)",
+    "parseOffset": "0x3ac5086 (h1t) / 0x8872cc (mxe)",
+    "markers": ["<send_user_message_question_reply>", "</send_user_message_question_reply>"],
+    "schema": "z.object({questionItemId:string,question:string,answer:string})，外层 union([array(min1), 单对象→包成数组])",
+    "idSynthesis": "p1t(x,n)=JSON.stringify(['request_user_input_async',x,n]) ⇒ **紧凑无空格**",
+    "parser": "取最后一次 `\\n<sep>\\n` 之后的文本，要求 startsWith/endsWith 标记，再 JSON.parse(slice(34,-35))；**answer 不与 options 校验**",
+    "optionsDefault": "x1t: options: t.options ?? [] ⇒ 无选项题在卡片模型里是空数组，属受支持形状"
+  },
+  "freeTextConclusion": "官方构造器允许 answer 为任意字符串（schema 三字段全是 string，配对只按 questionItemId）⇒ 自由文本在协议与客户端算法层都被接受；是否出现『无选项题』取决于模型是否愿发（上一轮模型自述阻塞工具要求每题≥1 选项，异步侧未观察到无选项样本）",
+  "tuvisGap": [
+    "mirror 的条目投影不认识 `steeringUserMessage` 与 `steered`（会以 [unsupported item: …] 呈现）",
+    "profile.rs 方法表无 thread-follower-steer-turn → 生产路径 version_of 会 UnsupportedMethod → 零投递",
+    "无构造 questionItemId/信封的代码路径"
+  ],
+  "uiNamingObservation": {
+    "at": "22:05",
+    "observation": "桌面把 `item/commandExecution/requestApproval` 的审批框标题渲染成「**请求权限**」，按钮是「拒绝 / 允许一次」；而 Tuvis 手机端同一 pending 渲染成「命令执行请求 · Desktop」+「批准 / 终止本轮」。",
+    "risk": "「请求权限」这个措辞与线上真实存在的另一类 pending（`item/permissions/requestApproval`）撞名 ⇒ 用户与实现都容易把两者混为一谈；F06 的摘要文案应按 wire method 分类命名，不沿用桌面口语。",
+    "evidence": "raw/screenshots/2026-10-26T2205-desktop-calls-command-approval-permission.png",
+    "buttonsSemantics": "桌面「拒绝」≈decline 语义、「允许一次」≈accept（无会话级授权按钮出现在这一帧）"
+  }
+}

@@ -1226,7 +1226,7 @@ fn read_codex_rollout_with(
 /// 无展示价值，照 zcode artifact 解析不到降级先例）。seq 与消息条目同一
 /// 标尺（PR #168 评审 I-1 修正）：event_msg 行的 seq = 窗口内其之前已映射的
 /// 消息条目数 − finalize 头部丢弃数（详见函数体内注释）。底料档：
-/// docs/superpowers/specs/2026-10-18-codex-local-images-file-pool-底料.md
+/// docs/engineering/specs/2026-10-18-codex-local-images-file-pool-底料.md
 pub(crate) fn read_codex_local_images_refs_with(
     home: &Path,
     session_id: &str,

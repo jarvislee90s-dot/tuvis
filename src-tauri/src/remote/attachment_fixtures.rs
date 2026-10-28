@@ -11,7 +11,7 @@
 //   `~/.zcode/cli/artifacts/<session>/*<tool-result-<uuid>>*`（尾段 glob 可解析）。
 // - claude（transcript JSONL，#69 补登 2026-10-18）：图片附件以 base64 内嵌于
 //   消息体，无独立文件路径可提取 → 不入文件池（结论落档
-//   docs/superpowers/specs/2026-10-18-claude-opencode-不入池结论.md）。
+//   docs/engineering/specs/2026-10-18-claude-opencode-不入池结论.md）。
 // - opencode（opencode.db，#69 补登 2026-10-18）：part 表无 file 类型 → 不入
 //   文件池（同上档）。重开条件：任一工具引入带路径的附件形态时重评。
 //

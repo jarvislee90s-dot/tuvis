@@ -8,11 +8,12 @@
 //! 据此零投递。
 use std::collections::BTreeMap;
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use sha2::{Digest, Sha256};
 
 use crate::database::dao::codex_actions as dao;
 use crate::inject::headless::codex::{production_queue_holds, QueueEvidence};
+use crate::inject::normalize::compose_injection_flagged;
 use crate::remote::pairing::{self, DeviceStore};
 use crate::services::codex_desktop_ipc::types::{
     new_uuid, ActionKind, ActionReceipt, ActionState, CodexActionView, ControlRoute, ProtocolError,
@@ -68,8 +69,23 @@ fn kind_str(kind: ActionKind) -> &'static str {
         ActionKind::PermissionsApproval => "permissions_approval",
         ActionKind::UserInput => "user_input",
         // 打断不进动作账本（仅供 ActionContext/审计语义如实），映射仅为 match 穷尽。
+        ActionKind::AsyncQuestion => "async_question",
+        // 打断不进动作账本（仅供 ActionContext/审计语义如实），映射仅为 match 穷尽。
         ActionKind::Interrupt => "interrupt",
     }
+}
+
+/// T07：**会开启真实回合**的动作（Accepted/Unknown 时需持久回合屏障与对账）。
+///
+/// 普通消息与异步正式答题都开启回合；审批/问答（原生响应）不开启新回合。
+pub fn action_opens_turn(kind: ActionKind) -> bool {
+    matches!(kind, ActionKind::Send | ActionKind::AsyncQuestion)
+}
+
+/// T07：**普通消息 FIFO** 只接收 `send`（异步答题有独立入口，绝不借 FIFO 偷发
+/// 信封；暂停/百科顺序语义不同）。
+pub fn action_is_fifo_message(kind: ActionKind) -> bool {
+    matches!(kind, ActionKind::Send)
 }
 
 fn kind_from_str(s: &str) -> Option<ActionKind> {
@@ -79,6 +95,7 @@ fn kind_from_str(s: &str) -> Option<ActionKind> {
         "file_change_approval" => Some(ActionKind::FileChangeApproval),
         "permissions_approval" => Some(ActionKind::PermissionsApproval),
         "user_input" => Some(ActionKind::UserInput),
+        "async_question" => Some(ActionKind::AsyncQuestion),
         "interrupt" => Some(ActionKind::Interrupt),
         _ => None,
     }
@@ -115,7 +132,8 @@ pub fn wire_text_hash(text: &str) -> String {
     sha256_hex(text.as_bytes())
 }
 
-fn now_ms() -> i64 {
+/// 毫秒级 UNIX 时间（本 crate 单点；remote 层装配的 claim 闭包同样消费）。
+pub(crate) fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
@@ -142,6 +160,16 @@ pub struct QueuedAction {
 }
 
 /// 动作账本（包装 `DeviceStore`；生产 = 全局库，测试 = 内存库注入）。
+/// H04：重放判定用的账本快照（只读）。
+pub struct ActionSnapshot {
+    pub request_key: Option<String>,
+    pub context_token: Option<String>,
+    pub kind: String,
+    pub payload_hash: String,
+    pub receipt: Option<ActionReceipt>,
+    pub state: crate::services::codex_desktop_ipc::types::ActionState,
+}
+
 pub struct ActionStore {
     store: DeviceStore,
 }
@@ -173,6 +201,41 @@ pub enum BarrierRelease {
     },
 }
 
+/// S4：人工继续（撤销旧派发权 + 解除屏障 + 建唯一后继，同一持久事务内一致完成）
+/// 的结果（HTTP 映射在 remote::codex_ipc）。
+#[derive(Debug)]
+pub enum ManualResume {
+    /// 确认期间原动作已收敛（accepted/rejected/cancelled）→ 返回最新状态；
+    /// **不建后继、不重发**（设计 §6.2「按过期确认自动再发」的禁止项）。
+    Converged { view: CodexActionView },
+    /// 幂等重放 / 并发输家：后继已存在。返回原动作视图 + 既有后继 actionId
+    ///（输家收到已收敛的最新状态，其自带的新 actionId 不登记）。
+    AlreadyResumed {
+        view: CodexActionView,
+        successor_action_id: String,
+    },
+    /// 复审 R-T1：写右已被 writer 取得（claim 胜出于撤销）——旧动作**可能已
+    /// 投递**且派发尝试仍在途（未收尾）。不建后继、不重发；HTTP 映射为独立状态
+    /// `write_right_in_flight`（复审 round 4 V2：**不得**返回 converged——「已收敛」
+    /// 只能表达真实终态，在途尝试须保持待确认，用户稍后再核对/收尾后人工继续
+    /// 仍可用）。
+    WriteRightObtained { view: CodexActionView },
+    /// 本次成功：原动作定格（Unknown 事实保持/补齐）+ 写出权撤销 + 屏障解除 +
+    /// 后继行登记（queued），全部同一事务。`thread_id` 供调用方清内存 Turn 限制。
+    Resumed {
+        view: CodexActionView,
+        successor_action_id: String,
+        thread_id: String,
+    },
+    /// 不存在（HTTP 404，不给存在性预言机之外的语义）。
+    NotFound,
+    /// 原动作仍 queued → 走既有撤回（HTTP 409 `queued_use_retract`）。
+    Queued { view: CodexActionView },
+    /// 正文与原动作 payload 不符（HTTP 409 `manual_resume_text_mismatch`；
+    /// 「同 ID 异载荷拒绝」的人工继续面）。
+    TextMismatch { view: CodexActionView },
+}
+
 fn db_err(e: rusqlite::Error) -> StoreError {
     StoreError::Database(e.to_string())
 }
@@ -202,6 +265,12 @@ impl ActionStore {
         f: impl FnOnce(&Connection) -> Result<R, StoreError>,
     ) -> Result<R, StoreError> {
         self.store.with(f)
+    }
+
+    /// T08：在**本 store 的库**上执行设置读写（与动作账本/适配器同一 DB；不碰全局
+    /// 单例——测试注入的 store 与生产 DeviceStore 走同一路径）。
+    pub fn with_settings<R>(&self, f: impl FnOnce(&Connection) -> R) -> Result<R, StoreError> {
+        self.with(|conn| Ok(f(conn)))
     }
 
     /// 登记动作（幂等）：同 action_id 且 device/thread/kind/requestKey/token/payload
@@ -288,16 +357,31 @@ impl ActionStore {
         })
     }
 
+    /// 按 action_id 读取单条 queued 行（S2 一次性越队：绕过 FIFO 队首直接派发
+    /// 授权动作时取得其发送输入）。非 queued / 不存在 → None（越队只对刚登记的
+    /// queued 行有意义）。
+    pub fn queued_action_by_id(&self, action_id: &str) -> Result<Option<QueuedAction>, StoreError> {
+        self.with(|c| {
+            let Some(row) = dao::get_row(c, action_id).map_err(db_err)? else {
+                return Ok(None);
+            };
+            if row.state != ActionState::Queued {
+                return Ok(None);
+            }
+            Ok(Some(queued_action_of(row)?))
+        })
+    }
+
     /// CAS queued→reserved（与审计起始行同事务；DB 失败零投递）。false = CAS 失败
     /// （已撤/已派发），绝不覆盖既有状态。
     pub fn reserve(&self, action_id: &str, route: ControlRoute) -> Result<bool, StoreError> {
         self.with(|c| dao::reserve_conn(c, action_id, route, now_ms()).map_err(db_err))
     }
 
-    /// 同 permit 把 reserved+DesktopIpc 原子改为 reserved+HeadlessCompat 并记降级审计
-    /// （恰好一次，绝不经过 queued）。false = 已交接过 / 状态或路由不符。
-    pub fn handoff_not_sent(&self, action_id: &str) -> Result<bool, StoreError> {
-        self.with(|c| dao::handoff_not_sent_conn(c, action_id, now_ms()).map_err(db_err))
+    /// S2：入队前拒绝落账（queued → rejected CAS；写尝试未开始）。false = 已离开
+    /// queued（竞态），不覆盖。
+    pub fn finish_queued_refusal(&self, receipt: &ActionReceipt) -> Result<bool, StoreError> {
+        self.with(|c| dao::finish_queued_refusal_conn(c, receipt, now_ms()).map_err(db_err))
     }
 
     /// 落账回执（仅 reserved 可落账；重复 finish = `Conflict`）。NotSent 同事务清
@@ -319,6 +403,362 @@ impl ActionStore {
         })
     }
 
+    /// S3：迟到证据归账（reserved/unknown → 真实终态的单次 CAS；已终态 = false，
+    /// 同一证据只收敛一次）。消费方：派发任务的迟到等待 + 调度循环对账兜底。
+    pub fn finish_late_result(&self, receipt: &ActionReceipt) -> Result<bool, StoreError> {
+        self.with(|c| dao::finish_late_result_conn(c, receipt, now_ms()).map_err(db_err))
+    }
+
+    // ---- S4：人工继续 / 派发权撤销 / 补绑 ----
+
+    /// 读派发权撤销标记（写出边界检查：旧派发任务在真正 start-turn 前必查）。
+    pub fn has_write_revoke(&self, action_id: &str) -> bool {
+        self.with(|c| dao::has_write_revoke_conn(c, action_id).map_err(db_err))
+            .unwrap_or(false)
+    }
+
+    /// 人工继续撤销臂的定格落账（T 写出边界观察到撤销标记时；不写帧、不置屏障）。
+    pub fn finish_manual_resume_unknown(
+        &self,
+        receipt: &ActionReceipt,
+    ) -> Result<bool, StoreError> {
+        self.with(|c| dao::finish_manual_resume_unknown_conn(c, receipt, now_ms()).map_err(db_err))
+    }
+
+    /// S4 补绑：accepted 且屏障在册但缺 turnId 的行，经正式 userMessage 回显找到
+    /// Turn 后补绑 Turn 身份（只补绑定槽位，不改写已受理事实）。false = 已绑定 /
+    /// 无屏障 / 已人工解除。
+    pub fn rebind_turn(&self, action_id: &str, turn_id: &str) -> Result<bool, StoreError> {
+        self.with(|c| dao::rebind_turn_conn(c, action_id, turn_id, now_ms()).map_err(db_err))
+    }
+
+    /// H05：落账与同题占用**同一事务**结算（崩溃不留半状态）。
+    pub fn finish_and_settle_claim(
+        &self,
+        receipt: &ActionReceipt,
+        turn_id: Option<&str>,
+    ) -> Result<(), StoreError> {
+        self.with(|c| {
+            crate::database::dao::codex_actions::finish_and_settle_claim_conn(
+                c,
+                receipt,
+                turn_id,
+                now_ms(),
+            )
+            .map_err(db_err)
+        })
+    }
+
+    /// H01：把**原动作捕获**的效果目标绑定到动作行（register 后、派发前）。
+    pub fn bind_effect_target(
+        &self,
+        action_id: &str,
+        target: &crate::services::codex_desktop_ipc::capability::ObservedTarget,
+    ) -> bool {
+        self.with(|c| {
+            crate::database::dao::codex_actions::bind_effect_target_conn(
+                c,
+                action_id,
+                &target.probe_key,
+                &target.package_sha256,
+                crate::services::codex_desktop_ipc::capability::CONTRACT_RULE_VERSION,
+            )
+            .map_err(db_err)
+        })
+        .unwrap_or(false)
+    }
+
+    /// H01：**按原动作归属**结算一次成功证据（同事务写成功表 + 清归属）。
+    ///
+    /// 不读取“当前目标”——只看动作行在准备时捕获的目标；没有绑定 → None（不猜）。
+    pub fn settle_confirmed_effect(
+        &self,
+        action_id: &str,
+    ) -> Option<crate::services::codex_desktop_ipc::capability::CodexOperation> {
+        use crate::services::codex_desktop_ipc::capability::CodexOperation;
+        self.with(|c| {
+            let target = crate::database::dao::codex_actions::take_effect_target_conn(c, action_id)
+                .map_err(db_err)?;
+            let Some((probe_key, package_sha256, rule_version)) = target else {
+                return Ok(None);
+            };
+            let kind: String = c
+                .query_row(
+                    "SELECT kind FROM codex_actions WHERE action_id = ?1",
+                    [action_id],
+                    |r| r.get(0),
+                )
+                .map_err(db_err)?;
+            let operation = match kind.as_str() {
+                "command_approval" => CodexOperation::CommandApproval,
+                "file_change_approval" => CodexOperation::FileChangeApproval,
+                "user_input" => CodexOperation::BlockingInput,
+                "async_question" => CodexOperation::AsyncAnswerIdle,
+                "send" => CodexOperation::Send,
+                _ => return Ok(None),
+            };
+            let tx = c.unchecked_transaction().map_err(db_err)?;
+            crate::database::dao::codex_ipc_probe::record_operation_success_conn(
+                &tx,
+                &probe_key,
+                &package_sha256,
+                operation.as_str(),
+                rule_version,
+                now_ms(),
+            )
+            .map_err(db_err)?;
+            crate::database::dao::codex_actions::clear_effect_target_conn(&tx, action_id)
+                .map_err(db_err)?;
+            tx.commit().map_err(db_err)?;
+            Ok(Some(operation))
+        })
+        .ok()
+        .flatten()
+    }
+
+    /// R02：同题持久排他占用（跨 actionId／设备／重启的唯一裁决点）。
+    /// B05：同组多题一次占用（整组事务；任何一题被别端解决/占用 → 整组拒绝）。
+    pub fn question_keys_for_action(&self, action_id: &str) -> Result<Vec<String>, StoreError> {
+        self.with(|c| {
+            crate::database::dao::codex_interactions::question_keys_for_action_conn(c, action_id)
+                .map_err(db_err)
+        })
+    }
+
+    /// G05：既有动作身份（不按设备过滤）——复用 ID 前必须先核设备/线程/载荷。
+    pub fn action_identity(
+        &self,
+        action_id: &str,
+    ) -> Option<(String, String, String, ActionSnapshot)> {
+        self.with(|c| {
+            let row = dao::get_row(c, action_id).map_err(db_err)?;
+            Ok(row.map(|row| {
+                (
+                    row.device_id,
+                    row.thread_id,
+                    row.payload_hash.clone(),
+                    ActionSnapshot {
+                        request_key: row.request_key,
+                        context_token: row.context_token,
+                        kind: row.kind,
+                        payload_hash: row.payload_hash,
+                        receipt: row.receipt,
+                        state: row.state,
+                    },
+                )
+            }))
+        })
+        .ok()
+        .flatten()
+    }
+
+    /// G05：按本次新增 keys 收尾占用（不按 action_id 全量清扫）。
+    pub fn settle_group_claim_keys(
+        &self,
+        thread_id: &str,
+        action_id: &str,
+        claim_owner: &str,
+        question_keys: &[String],
+        delivery: &str,
+    ) -> Result<(), StoreError> {
+        self.with(|c| {
+            crate::database::dao::codex_interactions::settle_group_claim_keys_conn(
+                c,
+                thread_id,
+                action_id,
+                claim_owner,
+                question_keys,
+                delivery,
+                now_ms(),
+            )
+            .map_err(db_err)
+        })
+    }
+
+    pub fn claim_question_group(
+        &self,
+        thread_id: &str,
+        action_id: &str,
+        claim_owner: &str,
+        entries: &[crate::database::dao::codex_interactions::GroupClaimEntry<'_>],
+        facts: &crate::database::dao::codex_interactions::ClaimFacts<'_>,
+    ) -> Result<crate::database::dao::codex_interactions::GroupClaimOutcome, StoreError> {
+        self.with(|c| {
+            crate::database::dao::codex_interactions::claim_question_group_conn(
+                c,
+                thread_id,
+                action_id,
+                claim_owner,
+                entries,
+                &crate::database::dao::codex_interactions::ClaimFacts {
+                    now_ms: now_ms(),
+                    ..*facts
+                },
+            )
+            .map_err(db_err)
+        })
+    }
+
+    pub fn claim_question(
+        &self,
+        thread_id: &str,
+        question_key: &str,
+        action_id: &str,
+        claim_owner: &str,
+        facts: &crate::database::dao::codex_interactions::ClaimFacts<'_>,
+    ) -> Result<crate::database::dao::codex_interactions::QuestionClaim, StoreError> {
+        self.with(|c| {
+            crate::database::dao::codex_interactions::claim_question_conn(
+                c,
+                thread_id,
+                question_key,
+                action_id,
+                claim_owner,
+                &crate::database::dao::codex_interactions::ClaimFacts {
+                    now_ms: now_ms(),
+                    ..*facts
+                },
+            )
+            .map_err(db_err)
+        })
+    }
+
+    /// R02：按动作终态收尾占用（见 DAO 规则）。
+    pub fn settle_question_claim(&self, action_id: &str, delivery: &str) -> Result<(), StoreError> {
+        self.with(|c| {
+            crate::database::dao::codex_interactions::settle_question_claim_conn(
+                c,
+                action_id,
+                delivery,
+                now_ms(),
+            )
+            .map_err(db_err)
+        })
+    }
+
+    /// 读动作的归属 thread 与正式消息身份（`client_message_id`）——S4 核对/人工继续
+    /// 的输入缝（动作行无对外 thread/cmid 字段，经此单点读）。无行 → None。
+    pub fn action_thread_and_cmid(&self, action_id: &str) -> Option<(String, String)> {
+        self.with(|c| {
+            let pair = c
+                .query_row(
+                    "SELECT thread_id, client_message_id FROM codex_actions WHERE action_id = ?1",
+                    [action_id],
+                    |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+                )
+                .optional()
+                .map_err(db_err)?;
+            Ok(pair)
+        })
+        .ok()
+        .flatten()
+    }
+
+    /// 读动作的持久 Turn 绑定槽位（`compat_turn_id`；核对 DTO 与 force-continue
+    /// 前置判定的单点读）。无行 → None。
+    pub fn bound_turn_id(&self, action_id: &str) -> Option<String> {
+        self.with(|c| {
+            c.query_row(
+                "SELECT compat_turn_id FROM codex_actions WHERE action_id = ?1",
+                [action_id],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .map_err(db_err)
+        })
+        .ok()
+        .flatten()
+    }
+
+    /// S4 人工继续（设计 §6.2）：撤销旧动作尚未取得的首次写出权 + 解除屏障 +
+    /// 建唯一后继，**同一持久事务**内一致完成（DAO 层定序保证中间态不可见）。
+    ///
+    /// * 文本核验：`text` 的 payload hash 必须与原动作一致（服务器权威——后继重发
+    ///   的就是原消息；不符 = 同 ID 异载荷拒绝，零写入）；
+    /// * 后继唯一：`codex_manual_resume` 主键 CAS（幂等重放/并发输家 →
+    ///   [`ManualResume::AlreadyResumed`] 携既有后继）；
+    /// * 派发权撤销：`codex_write_revoke` 单调标记，旧派发任务/重启恢复/迟到 HTTP
+    ///   在写出边界（真正 start-turn 前）必查；
+    /// * 旧动作定格：unknown 终态清屏障保事实；reserved 在飞 CAS 成 unknown
+    ///   （结果不确定事实保持，绝不 NotSent/Cancelled）且不置屏障；
+    /// * 复核期间已收敛 → [`ManualResume::Converged`]（返回最新状态，不建后继）。
+    #[allow(clippy::too_many_arguments)]
+    pub fn manual_resume(
+        &self,
+        old_action_id: &str,
+        device_id: &str,
+        device_name: &str,
+        new_action_id: &str,
+        text: &str,
+        reason: Option<&str>,
+    ) -> Result<ManualResume, StoreError> {
+        // 后继载荷与 wire 在**服务层**组装（与 router.send_inner 同源规则）：
+        // payload hash 按原文（thread 维度取自原动作行——权威比对在 DAO 事务内用
+        // 事务内读到的行重做，这里只为取得 thread 维度）；wire 按登记时签名设置冻结。
+        let old_thread = self.with(|c| {
+            Ok::<_, StoreError>(
+                dao::get_row(c, old_action_id)
+                    .map_err(db_err)?
+                    .map(|r| r.thread_id),
+            )
+        })?;
+        let Some(old_thread) = old_thread else {
+            return Ok(ManualResume::NotFound);
+        };
+        let hash = payload_hash(
+            ActionKind::Send,
+            &ThreadKey {
+                host_id: "local".into(),
+                thread_id: old_thread,
+            },
+            None,
+            None,
+            &ActionPayload::Text(text.to_string()),
+        );
+        // 签名开关在**登记时**读一次并冻结（与 send_inner 同源）；读失败按关闭处理。
+        let signed = self.message_signature_enabled();
+        let wire = compose_injection_flagged(device_name, text, signed);
+        let dao_r = self.with(|c| {
+            dao::manual_resume_conn(
+                c,
+                old_action_id,
+                device_id,
+                device_name,
+                new_action_id,
+                &hash,
+                &wire,
+                signed,
+                reason,
+                now_ms(),
+            )
+            .map_err(db_err)
+        })?;
+        Ok(match dao_r {
+            dao::ManualResumeDao::NotFound => ManualResume::NotFound,
+            dao::ManualResumeDao::Converged(row) => ManualResume::Converged {
+                view: self.with(|c| view_of(c, row).map_err(db_err))?,
+            },
+            dao::ManualResumeDao::AlreadyResumed(row, successor) => ManualResume::AlreadyResumed {
+                view: self.with(|c| view_of(c, row).map_err(db_err))?,
+                successor_action_id: successor,
+            },
+            dao::ManualResumeDao::WriteRightObtained(row) => ManualResume::WriteRightObtained {
+                view: self.with(|c| view_of(c, row).map_err(db_err))?,
+            },
+            dao::ManualResumeDao::Resumed(row, thread_id) => ManualResume::Resumed {
+                view: self.with(|c| view_of(c, row).map_err(db_err))?,
+                successor_action_id: new_action_id.to_string(),
+                thread_id,
+            },
+            dao::ManualResumeDao::Queued(row) => ManualResume::Queued {
+                view: self.with(|c| view_of(c, row).map_err(db_err))?,
+            },
+            dao::ManualResumeDao::TextMismatch(row) => ManualResume::TextMismatch {
+                view: self.with(|c| view_of(c, row).map_err(db_err))?,
+            },
+            dao::ManualResumeDao::Conflict => return Err(StoreError::Conflict),
+        })
+    }
+
     /// 落账回执**与** Turn 顺序屏障同一 UPDATE 原子持久化（2026-10-17 复审 C1.3）：
     /// A 路独立派发任务对 Accepted/UnknownDelivery 的唯一落账点——`turn_id` 有值绑
     /// Turn 身份，None 存保守屏障（unknown/缺 turnId），重启后限制同样保留。
@@ -333,6 +773,25 @@ impl ActionStore {
     }
 
     /// 本设备的动作视图（其他设备 / 不存在 → None；HTTP 层 404 语义）。
+    /// H04：同 ID 重放的**账本快照**（设备隔离；用于零预算/幂等判定，不写）。
+    pub fn snapshot_for_device(&self, action_id: &str, device_id: &str) -> Option<ActionSnapshot> {
+        self.with(|c| {
+            let row = dao::get_row(c, action_id).map_err(db_err)?;
+            Ok(row
+                .filter(|row| row.device_id == device_id)
+                .map(|row| ActionSnapshot {
+                    request_key: row.request_key,
+                    context_token: row.context_token,
+                    kind: row.kind,
+                    payload_hash: row.payload_hash,
+                    receipt: row.receipt,
+                    state: row.state,
+                }))
+        })
+        .ok()
+        .flatten()
+    }
+
     pub fn get_for_device(
         &self,
         action_id: &str,
@@ -347,6 +806,19 @@ impl ActionStore {
             }
             view_of(c, row).map(Some).map_err(db_err)
         })
+    }
+
+    /// S4：无设备隔离的动作视图（核对核心的账本读——属主隔离由端点先行完成，
+    /// 核对过程需要跨收敛步骤重读同一行）。无行 → None。
+    pub fn get_for_device_unisolated(&self, action_id: &str) -> Option<CodexActionView> {
+        self.with(|c| {
+            let Some(row) = dao::get_row(c, action_id).map_err(db_err)? else {
+                return Ok(None);
+            };
+            view_of(c, row).map(Some).map_err(db_err)
+        })
+        .ok()
+        .flatten()
     }
 
     /// 启动恢复（构造时已调用；重启测试可显式再调）。
@@ -374,6 +846,16 @@ impl ActionStore {
                 });
             }
             Ok(out)
+        })
+    }
+
+    /// 线程级是否存在 queued 普通消息（跨设备）——清“无队列的陈旧暂停”专用；
+    /// 不得用本设备 `list_queued` 代替，否则会误清别台设备仍在排队的保护闩。
+    pub fn has_queued_for_thread(&self, key: &ThreadKey) -> Result<bool, StoreError> {
+        self.with(|c| {
+            Ok(!dao::queued_for_thread_conn(c, &key.thread_id)
+                .map_err(db_err)?
+                .is_empty())
         })
     }
 
@@ -510,9 +992,70 @@ impl ActionStore {
     }
 
     /// 该 Thread 全部在册屏障的 action_id（队列视图 `blockedActionIds`——人工解除
-    /// 端点的靶向清单，前端按钮据此逐个解除）。
+    /// 端点的靶向清单，前端按钮据此逐个 force-continue）。
     pub fn barrier_action_ids(&self, key: &ThreadKey) -> Result<Vec<String>, StoreError> {
         self.with(|c| dao::barrier_action_ids_conn(c, &key.thread_id).map_err(db_err))
+    }
+
+    // ---- S2：打断后队列持久暂停 + 一次性越队授权 ----
+
+    /// 置 Thread 队列暂停（打断受理/不确定时由打断端点调用；幂等，首次信息保留）。
+    pub fn set_queue_pause(
+        &self,
+        key: &ThreadKey,
+        pause_reason: &str,
+        pause_token: &str,
+    ) -> Result<bool, StoreError> {
+        self.with(|c| {
+            dao::set_queue_pause_conn(c, &key.thread_id, pause_reason, pause_token, now_ms())
+                .map_err(db_err)
+        })
+    }
+
+    /// 终审 R3：撤回本次打断拥有的暂停（token 不匹配/行不存在 → false，不动他人）。
+    pub fn clear_queue_pause_owned(
+        &self,
+        key: &ThreadKey,
+        pause_token: &str,
+    ) -> Result<bool, StoreError> {
+        self.with(|c| {
+            dao::clear_queue_pause_owned_conn(c, &key.thread_id, pause_token).map_err(db_err)
+        })
+    }
+
+    /// 读 Thread 暂停状态（None = 未暂停）。
+    pub fn queue_pause(&self, key: &ThreadKey) -> Result<Option<QueuePause>, StoreError> {
+        self.with(|c| {
+            Ok(dao::queue_pause_conn(c, &key.thread_id)
+                .map_err(db_err)?
+                .map(|(paused_at, pause_reason)| QueuePause {
+                    paused_at,
+                    pause_reason,
+                }))
+        })
+    }
+
+    /// 用户显式「继续发送」：解除暂停（唯一出口）。返回是否确有暂停被解除。
+    pub fn clear_queue_pause(&self, key: &ThreadKey) -> Result<bool, StoreError> {
+        self.with(|c| dao::clear_queue_pause_conn(c, &key.thread_id).map_err(db_err))
+    }
+
+    /// 建一次性越队授权（绑定具体 action + thread；同 action 重放幂等）。
+    pub fn create_bypass_grant(&self, action_id: &str, key: &ThreadKey) -> Result<(), StoreError> {
+        self.with(|c| {
+            dao::create_bypass_grant_conn(c, action_id, &key.thread_id, now_ms()).map_err(db_err)
+        })
+    }
+
+    /// CAS 消费授权（写出前恰好一次）。false = 无此授权 / 跨 thread / 重复消费。
+    pub fn consume_bypass_grant(
+        &self,
+        action_id: &str,
+        key: &ThreadKey,
+    ) -> Result<bool, StoreError> {
+        self.with(|c| {
+            dao::consume_bypass_grant_conn(c, action_id, &key.thread_id, now_ms()).map_err(db_err)
+        })
     }
 
     /// 读取该 Thread 全部在册 fence（seq 序；reconcile 迭代输入）。
@@ -672,6 +1215,13 @@ pub struct TurnBinding {
     pub turn_id: Option<String>,
 }
 
+/// S2：Thread 队列暂停状态（`codex_queue_pause` 行；队列视图与打断回执消费）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueuePause {
+    pub paused_at: i64,
+    pub pause_reason: String,
+}
+
 fn view_of(c: &Connection, row: dao::ActionRow) -> rusqlite::Result<CodexActionView> {
     let position = if row.state == ActionState::Queued {
         dao::queued_for_thread_conn(c, &row.thread_id)?
@@ -686,6 +1236,7 @@ fn view_of(c: &Connection, row: dao::ActionRow) -> rusqlite::Result<CodexActionV
         state: row.state,
         position,
         receipt: row.receipt,
+        stage: crate::services::codex_desktop_ipc::types::DeliveryStage::of_state(row.state),
     })
 }
 

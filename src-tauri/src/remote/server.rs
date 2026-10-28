@@ -671,6 +671,11 @@ fn api_router(state: Arc<RemoteState>) -> Router<Arc<RemoteState>> {
         )
         .route("/codex/thread/events", get(super::codex_ipc::thread_events))
         .route("/codex/action", get(super::codex_ipc::action_status))
+        .route("/codex/action/verify", get(super::codex_ipc::action_verify))
+        .route(
+            "/codex/action/manual-resume",
+            post(super::codex_ipc::action_manual_resume),
+        )
         .route("/codex/queue", get(super::codex_ipc::queue_view))
         .route(
             "/codex/queue/retract",
@@ -681,10 +686,27 @@ fn api_router(state: Arc<RemoteState>) -> Router<Arc<RemoteState>> {
             "/codex/queue/force-continue",
             post(super::codex_ipc::queue_force_continue),
         )
+        // S2：打断后队列持久暂停的唯一恢复出口（用户显式「继续发送」）
+        .route("/codex/queue/resume", post(super::codex_ipc::queue_resume))
         // 原生审批/阻塞问答应答（绑定 thread + requestId + current owner）
         .route(
             "/codex/pending-response",
             post(super::codex_ipc::pending_response),
+        )
+        // F08/T08：移动端适配详情（只读）与开关（与桌面设置同源）
+        .route(
+            "/codex/adapt-status",
+            get(super::codex_adapt::codex_adapt_status),
+        )
+        .route(
+            "/codex/adapt-settings",
+            post(super::codex_adapt::codex_adapt_settings),
+        )
+        // F03：异步 Question 的空闲**正式答题**（独立动作类别；不进普通消息 FIFO）
+        .route("/codex/async-answer", post(super::codex_ipc::async_answer))
+        .route(
+            "/codex/async-answer-group",
+            post(super::codex_ipc::async_answer_group),
         )
         // 打断桌面当前回合（破坏性：打断后回合未完成的工作丢失）。回合终态到达时
         // 屏障释放、待发队列接力——「远程点掉那个卡」的闭环。

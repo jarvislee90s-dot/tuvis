@@ -10,9 +10,7 @@
           {
             "type": "userMessage",
             "id": "synthetic-item-image",
-            "content": [
-              { "type": "localImage", "path": "/project/fixtures/image.png" }
-            ]
+            "content": [{ "type": "localImage", "path": "/project/fixtures/image.png" }]
           }
         ]
       }
@@ -65,7 +63,12 @@
               { "type": "image", "url": "https://example.invalid/figure.png" }
             ]
           },
-          { "type": "imageGeneration", "id": "synthetic-generation-missing", "savedPath": null, "status": "synthetic-pending" },
+          {
+            "type": "imageGeneration",
+            "id": "synthetic-generation-missing",
+            "savedPath": null,
+            "status": "synthetic-pending"
+          },
           { "type": "imageView", "id": "synthetic-view-missing", "path": null }
         ]
       }

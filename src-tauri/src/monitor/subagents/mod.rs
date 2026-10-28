@@ -1,4 +1,4 @@
-//! 移动端子 agent 运行检测（spec：docs/superpowers/specs/2026-10-08-mobile-subagent-chips-design.md §5.1）
+//! 移动端子 agent 运行检测（spec：docs/engineering/specs/2026-10-08-mobile-subagent-chips-design.md §5.1）
 //!
 //! 模块职责：四工具（claude/opencode/kimi/codex）「该会话下有哪些运行中子 agent」
 //! 的判据与装配。判据/解析/累计全部纯函数化（注入字节流/路径，测试零真实磁盘）。
