@@ -254,6 +254,25 @@ pub fn init(conn: &Connection) {
         -- terminal_retention 同口径，清理入口由后续任务接入）。
         CREATE INDEX IF NOT EXISTS idx_zcode_actions_updated_at
             ON zcode_actions(updated_at);
+        -- ===== ZCode 能力证据账本（生产计划 T2，spec R6）=====
+        -- 每个 (key, capability) 一行，upsert 覆盖不追加（同一 key 重新解析出的能力
+        -- 结论覆盖旧值，不积累历史行）。key = 能力 key 五元组的确定性拼接
+        -- （CapabilityKey::to_storage_key：platform|app_build|protocol|
+        -- schema_fingerprint|epoch，只含 build 指纹类字段，不含凭据），五元组任一
+        -- 变化即换 key，旧记录天然失配（能力解析的失效单元语义）。
+        -- state ∈ confirmed/degraded/inconclusive/unsupported/interface_matched（小写冻结词表）。
+        -- reason_code/evidence 只存**结构化判据标识**（判据名/状态码，写入侧
+        -- validate_evidence_token 硬闸）——正文/题目/选项/答案、JWT、链接一律不落库。
+        -- 时间列用 INTEGER 毫秒（与 codex_ipc_probe 等既有表同惯例，不依赖本地时区）。
+        CREATE TABLE IF NOT EXISTS zcode_capability_evidence (
+            key         TEXT NOT NULL,
+            capability  TEXT NOT NULL,
+            state       TEXT NOT NULL,
+            reason_code TEXT,
+            evidence    TEXT,
+            updated_at  INTEGER NOT NULL,
+            PRIMARY KEY (key, capability)
+        );
         CREATE TABLE IF NOT EXISTS write_audit (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
             ts          INTEGER NOT NULL,

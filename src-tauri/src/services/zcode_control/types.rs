@@ -14,6 +14,8 @@ use std::time::Duration;
 use futures::future::BoxFuture;
 use serde_json::Value;
 
+use crate::services::zcode_control::capability::state::ZcodeInterfaceEvidence;
+
 /// 对外错误码（冻结：不得新增、改写或本地化；HTTP error 与 capability reasonCode 共用）。
 pub mod codes {
     /// 未保存官方链接/配置不可用。
@@ -30,6 +32,10 @@ pub mod codes {
     pub const NOT_READY: &str = "not_ready";
     /// 官方协议版本不受支持。
     pub const UNSUPPORTED_PROTOCOL: &str = "unsupported_protocol";
+
+    /// 能力被静态知识/账本明确判不可用（capability resolver 的 reasonCode；
+    /// 执行闸挡动作时成为错误码，与 `needs_evidence` 同为冻结码）。
+    pub const UNSUPPORTED: &str = "unsupported";
     /// 能力缺少实机证据（生产门保持关闭）。
     pub const NEEDS_EVIDENCE: &str = "needs_evidence";
     /// 目标会话不存在。
@@ -845,7 +851,9 @@ pub struct SessionView {
 }
 
 // ---------------------------------------------------------------------------
-// 能力策略（T8.2）：宿主证据门
+// 能力策略（T8.2 宿主证据门）：T4 起生产现算改走 `capability/resolver.rs`
+// （shipped 表 + DB 账本 + 接口形状证据），`for_host` 及其证据载体保留为
+// 历史证据闸（fake/证据路径与既有测试不动）。
 // ---------------------------------------------------------------------------
 
 /// 唯一已取证宿主 APP build（合同 `identity.appBuild`，macOS 3.16.2.8769）。
@@ -866,8 +874,9 @@ pub const EVIDENCED_PROTOCOL_VERSION: u32 = 3;
 /// `needs_evidence`）。任何未知组合（APP 升级、协议变更、schema/hello 未识别）也只
 /// 得到同一全关矩阵——未知绝不放宽。
 ///
-/// 生产代码中**不存在**把能力置 `true` 的路径；测试专用的
-/// [`verified_fixture`](Self::verified_fixture) 由 `#[cfg(test)]` 排除在发布构建之外。
+/// `for_host` 自身仍**永不**放行；T4 起「置 true」的唯一生产路径是 capability
+/// resolver（shipped 表 + DB 账本 + 接口形状证据，见 `capability/resolver.rs`），
+/// 本策略及其证据载体保留给 fake/证据路径与既有测试。
 pub struct CapabilityPolicy;
 
 impl CapabilityPolicy {
@@ -951,7 +960,9 @@ impl CapabilityPolicy {
 /// 未知（未 bind / 已 `invalidate`）= `None`/`false`，绝不猜测兼容。
 ///
 /// 证据只证明协议面可读：即使四项全部匹配，[`Self::policy`] 也只返回
-/// [`CapabilityPolicy::production_unverified`]（八项全关）。
+/// [`CapabilityPolicy::production_unverified`]（八项全关）。T4 起生产现算源改走
+/// capability resolver（消费 [`Self::app_build`] / [`Self::protocol_version`] 与
+/// [`Self::interface_evidence`]），本方法保留为历史证据闸。
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct HostEvidence {
     /// 宿主 APP build（macOS `Info.plist`；非 macOS 或读不到 = `None`）。
@@ -962,6 +973,10 @@ pub struct HostEvidence {
     pub schema_known: bool,
     /// 已通过 `helloConversationV4` 的 kind/协议/connectionId 校验。
     pub hello_known: bool,
+    /// 本代际真实观测到的接口形状证据（T3 桥采集；只含方法/形状布尔，
+    /// 绝不承载正文——字段面见 [`ZcodeInterfaceEvidence`]；`pub(crate)` 因该
+    /// 类型是 crate 内类型，读取口统一走 [`Self::interface_evidence`]）。
+    pub(crate) interface: ZcodeInterfaceEvidence,
 }
 
 impl HostEvidence {
@@ -974,6 +989,13 @@ impl HostEvidence {
             self.hello_known,
         )
     }
+
+    /// 接口形状证据的克隆读取口（T3 契约；`ZcodeInterfaceEvidence` 是 `Copy`）。
+    ///
+    /// T4 起 resolver 消费本读取口（`PartsBackend` 的能力现算源）。
+    pub(crate) fn interface_evidence(&self) -> ZcodeInterfaceEvidence {
+        self.interface
+    }
 }
 
 /// 宿主 APP build 探针（生产 = `host::installed_zcode_build`；测试注入固定值）。
@@ -984,8 +1006,9 @@ pub type HostBuildProbe = Arc<dyn Fn() -> Option<String> + Send + Sync>;
 
 /// 能力策略的**唯一**现算源（会话能力矩阵与执行闸共用同一实例）。
 ///
-/// 生产由 `BridgeManager::host_evidence().policy()` 提供；测试注入动态开关，
-/// 验证「矩阵翻转」与「执行闸翻转」来自同一来源。
+/// 生产由 `PartsBackend` 装配：宿主证据（build/协议 → 能力 key）+ DB 能力账本 +
+/// 接口形状证据 → capability resolver（异常回退 `production_unverified`）；
+/// 测试注入动态开关，验证「矩阵翻转」与「执行闸翻转」来自同一来源。
 pub type CapabilitySource = Arc<dyn Fn() -> CapabilityView + Send + Sync>;
 
 #[cfg(test)]
@@ -1119,6 +1142,7 @@ mod tests {
                 protocol_version: Some(EVIDENCED_PROTOCOL_VERSION),
                 schema_known: true,
                 hello_known: true,
+                ..Default::default()
             };
             assert_eq!(
                 evidence.policy(),
@@ -1145,6 +1169,7 @@ mod tests {
                     protocol_version,
                     schema_known,
                     hello_known,
+                    ..Default::default()
                 };
                 assert_all_closed(&evidence.policy());
             }
@@ -1154,6 +1179,7 @@ mod tests {
                 protocol_version: Some(EVIDENCED_PROTOCOL_VERSION),
                 schema_known: true,
                 hello_known: true,
+                ..Default::default()
             };
             assert_all_closed(&unknown_build.policy());
         }

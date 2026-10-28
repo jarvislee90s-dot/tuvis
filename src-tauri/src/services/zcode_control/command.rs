@@ -392,9 +392,10 @@ pub struct CommandSender {
     initial_control_poll: Duration,
     /// 能力矩阵的**现算源**（T11：会话矩阵与执行闸共用同一个来源）。
     ///
-    /// 生产由 Hub 注入 `BridgeManager::host_evidence().policy()`；每次闸门判定现取，
-    /// 不做写时快照——宿主证据/验收许可翻转后，下一次动作立即按新矩阵执行。
-    /// 默认 = [`CapabilityView::default`]（审批应答关闭，零帧）。
+    /// 生产由 Hub 注入 capability resolver 现算源（宿主证据 + DB 能力账本，与会话
+    /// 矩阵同一实例）；每次闸门判定现取，不做写时快照——宿主证据/验收许可翻转后，
+    /// 下一次动作立即按新矩阵执行。默认 = [`CapabilityView::default`]（审批应答
+    /// 关闭，零帧）。
     ///
     /// **粒度注意**：这是 **sender 级**装配，会话级 DTO 在 `SessionView.capabilities`；
     /// 生产必须传同一个 source，避免「手机显示可点、后端 needs_evidence」。
