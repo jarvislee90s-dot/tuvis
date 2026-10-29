@@ -7535,13 +7535,26 @@ mod tests {
         revision: Option<u64>,
         active_works: Value,
     ) -> Vec<SessionView> {
-        let bridge = peer.session_bridge_id(session_id);
-        let listen = peer.listen_id(&bridge);
-        let topic = format!("{CONVERSATION_TOPIC_PREFIX}{session_id}");
         let mut patch = json!({"control": {"activeWorks": active_works}});
         if let Some(revision) = revision {
             patch["revision"] = json!(revision);
         }
+        push_patch_on(peer, session_id, subscription, from, to, patch).await
+    }
+
+    /// 推一条任意 `state.updated` patch 的 delta（与 [`push_control_delta_on`] 同一
+    /// 封装；R1 用它证明「新卡随同代增量到达」也会产出会话变化视图）。
+    async fn push_patch_on(
+        peer: &Peer,
+        session_id: &str,
+        subscription: &str,
+        from: u64,
+        to: u64,
+        patch: Value,
+    ) -> Vec<SessionView> {
+        let bridge = peer.session_bridge_id(session_id);
+        let listen = peer.listen_id(&bridge);
+        let topic = format!("{CONVERSATION_TOPIC_PREFIX}{session_id}");
         let wire = json!({
             "wireVersion": V4_WIRE_PROTOCOL_VERSION,
             "kind": "complete",
@@ -7613,6 +7626,66 @@ mod tests {
             manager.session(&target).await.expect("session").revision,
             Some(3)
         );
+    }
+
+    /// R1：同代增量新增/撤下一张 pending 卡，桥必须产出**会话变化视图**（Hub 据此
+    /// 发布 SSE 帧；手机凭这一帧即可答题，不需要重进页面/补 GET）。
+    #[tokio::test]
+    async fn live_delta_reports_new_pending_card_in_changed_view() {
+        const SUB: &str = "conv-sub-synthetic-1";
+        let (manager, peer) = manager_with(single_workspace_config()).await;
+        let target = manager.bind(&key(SESSION_A)).await.expect("bind");
+        let baseline = manager.session(&target).await.expect("session");
+        assert!(baseline.ready);
+        assert!(baseline.pending.is_empty(), "首拍快照无卡");
+
+        // 同代增量：宿主新开一张 permission 卡（官方卡形状）。
+        let card = json!({
+            "interactionId": "perm-call_live_1",
+            "kind": "permission",
+            "anchorRowId": 5,
+            "createdAt": 1_700_000_000_000u64,
+            "payload": {
+                "kind": "permission",
+                "toolCallId": "call_live_1",
+                "toolName": "Bash",
+                "summary": "synthetic: live permission",
+                "freeText": true,
+                "options": [{"optionId": "allowOnce", "label": "Allow once", "kind": "allowOnce"}]
+            }
+        });
+        let changed = push_patch_on(
+            &peer,
+            SESSION_A,
+            SUB,
+            1,
+            2,
+            json!({"revision": 3, "pendingInteractions": [card]}),
+        )
+        .await;
+        assert_eq!(changed.len(), 1, "新卡必须产出会话变化视图");
+        let view = &changed[0];
+        assert!(view.ready);
+        assert_eq!(view.revision, Some(3));
+        assert_eq!(view.pending.len(), 1);
+        assert_eq!(view.pending[0].interaction_id, "perm-call_live_1");
+        assert_eq!(
+            view.pending[0].options[0].option_id, "allowOnce",
+            "选项身份原样透传到变化视图"
+        );
+
+        // 宿主撤卡（整数组替换为空）：同样必须产出变化视图，卡不得残留。
+        let cleared = push_patch_on(
+            &peer,
+            SESSION_A,
+            SUB,
+            2,
+            3,
+            json!({"revision": 4, "pendingInteractions": []}),
+        )
+        .await;
+        assert_eq!(cleared.len(), 1);
+        assert!(cleared[0].pending.is_empty(), "撤卡必须反映到变化视图");
     }
 
     /// 坏帧（CRC 校验失败）同样必须报告它造成的投影降级：`on_data_outcome` 返回

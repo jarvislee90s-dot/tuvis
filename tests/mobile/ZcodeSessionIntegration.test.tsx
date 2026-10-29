@@ -304,6 +304,40 @@ describe("ZCode 会话集成：控制失败不影响阅读", () => {
   );
 });
 
+describe("ZCode 会话集成：详情页只消费官方原生 pending（R1）", () => {
+  it("zcode_does_not_mount_legacy_question_or_approve_cards", async () => {
+    // status=waiting 是旧审批红卡的挂载门：若 ZCode 仍走旧卡，这里必然发生
+    // `/session-approve-options` 与 `/session-question` 取数（两卡挂载即拉取）。
+    const calls = installFetch({ connectionState: "paired" });
+    render(<SessionDetail session={makeSession({ status: "waiting" })} onBack={() => {}} />);
+
+    await screen.findByTestId("zcode-control-panel");
+    await act(async () => {});
+
+    expect(screen.queryByTestId("approve-card")).toBeNull();
+    expect(screen.queryByTestId("question-header")).toBeNull();
+    expect(calls.some((c) => c.url.includes("/session-question"))).toBe(false);
+    expect(calls.some((c) => c.url.includes("/session-approve-options"))).toBe(false);
+  });
+
+  it("non_zcode_still_mounts_legacy_approve_card", async () => {
+    // 正向对照：同一状态下的 Claude 会话仍走旧卡（证明上一条断言不是空断言）。
+    const calls = installFetch({ injectLegacy: true });
+    const session = makeSession({
+      id: "sess-legacy-waiting",
+      agentType: "claude",
+      form: "cli",
+      status: "waiting",
+    });
+    render(<SessionDetail session={session} onBack={() => {}} />);
+
+    await waitFor(() =>
+      expect(calls.some((c) => c.url.includes("/session-approve-options"))).toBe(true)
+    );
+    expect(screen.queryByTestId("zcode-control-panel")).toBeNull();
+  });
+});
+
 describe("ZCode 会话集成：非 ZCode 会话路径不变", () => {
   it.each(["claude", "codex"] as const)(
     "non_zcode_composer_path_is_unchanged（%s）",

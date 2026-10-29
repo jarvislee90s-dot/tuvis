@@ -189,6 +189,16 @@ mod tests {
         handshake_client_id: Arc<Mutex<Option<String>>>,
         strict_client_identity: Arc<Mutex<bool>>,
         command_fault: Arc<Mutex<Option<String>>>,
+        /// R2：假宿主当前是否「会话在跑」——官方 `control.activeWorks` 里的前台
+        /// `primaryTurn` 执行 id（`None` = 空闲）。它同时决定两件事：(a) 快照里下发
+        /// 的 `control`；(b) send 的**宿主 admission**（运行中 + 本次请求 queue 才入队）。
+        running: Arc<Mutex<Option<String>>>,
+        /// R2：`sendConversationCommandV4` 实际回出的 ACK body（断言 `result.inputId`
+        /// 与发送 `commandId` 同源、`delivery` 是宿主 admission 的结论）。
+        send_acks: Arc<Mutex<Vec<serde_json::Value>>>,
+        /// 外部注入的官方队列帧：每条连接 select 它，收到即以「下一水位快照」
+        /// 推出该 `state.queue`（模拟桌面侧消费/暂停等宿主状态推进）。
+        queue_tx: tokio::sync::broadcast::Sender<serde_json::Value>,
         /// `drop_link()` 的断链信号：每条连接 select 它，收到即发 Close 并收尾。
         drop_tx: tokio::sync::broadcast::Sender<()>,
         task: tokio::task::JoinHandle<()>,
@@ -252,6 +262,25 @@ mod tests {
             self.handshake_client_id.lock().expect("握手身份锁").clone()
         }
 
+        /// R2：让假宿主进入「会话在跑」：官方 `control.activeWorks` 带
+        /// `primaryTurn` + 执行 id，并推一条带该 control 的**下一水位快照**（生产投影
+        /// 据此观察到运行态；队列显式宣告为空）。此后 send 的 admission 才可能入队。
+        fn begin_running(&self, execution_id: &str) {
+            *self.running.lock().expect("运行态锁") = Some(execution_id.to_owned());
+            self.push_queue(Some(serde_json::json!({"items": [], "autoDrain": true})));
+        }
+
+        /// R2：假宿主已回出的 send ACK body（按到达顺序）。
+        fn send_acks(&self) -> Vec<serde_json::Value> {
+            self.send_acks.lock().expect("send ACK 账本锁").clone()
+        }
+
+        /// R2：以「下一水位快照」推出给定的官方 `state.queue`（模拟桌面侧消费 /
+        /// 暂停等宿主推进）。`queue = None` 表示新快照不带 queue 键。
+        fn push_queue(&self, queue: Option<serde_json::Value>) {
+            let _ = self.queue_tx.send(queue.unwrap_or(serde_json::Value::Null));
+        }
+
         /// 从假体侧主动断链：已建立的连接收到 Close（生产 relay 观察到掉线，但
         /// Hub 代际不变——符合「链路断开」而非「用户显式断开」）。
         fn drop_link(&self) {
@@ -313,6 +342,12 @@ mod tests {
         let strict_client_identity_per_conn = strict_client_identity.clone();
         let command_fault = Arc::new(Mutex::new(None));
         let command_fault_per_conn = command_fault.clone();
+        let running = Arc::new(Mutex::new(None));
+        let running_per_conn = running.clone();
+        let send_acks = Arc::new(Mutex::new(Vec::new()));
+        let send_acks_per_conn = send_acks.clone();
+        let (queue_tx, _keep_queue_rx) = tokio::sync::broadcast::channel(8);
+        let queue_signal = queue_tx.clone();
         let (drop_tx, _keep_drop_rx) = tokio::sync::broadcast::channel(8);
         let drop_signal = drop_tx.clone();
         let task = tokio::spawn(async move {
@@ -334,7 +369,10 @@ mod tests {
                         handshake_client_id: handshake_client_id_per_conn.clone(),
                         strict_client_identity: strict_client_identity_per_conn.clone(),
                         command_fault: command_fault_per_conn.clone(),
+                        running: running_per_conn.clone(),
+                        send_acks: send_acks_per_conn.clone(),
                     },
+                    queue_signal.subscribe(),
                     drop_signal.subscribe(),
                 ));
             }
@@ -352,6 +390,9 @@ mod tests {
             handshake_client_id,
             strict_client_identity,
             command_fault,
+            running,
+            send_acks,
+            queue_tx,
             drop_tx,
             task,
         }
@@ -371,6 +412,8 @@ mod tests {
     const CONVERSATION_SUBSCRIPTION: &str = "sub-conversation-synthetic";
     /// 假体任务索引里的单行任务（与 `TargetKey.session_id` 精确相等）。
     const SYNTHETIC_TASK_ID: &str = "session_synthetic";
+    /// R2：假宿主「会话在跑」时的前台 `primaryTurn` 执行 id（合成值）。
+    const RUNNING_EXECUTION_ID: &str = "E-run-synthetic";
     /// 假体 listing / 任务索引共用的 workspace 路径。
     const SYNTHETIC_WORKSPACE_PATH: &str = "/tmp/travel";
 
@@ -454,32 +497,147 @@ mod tests {
     }
 
     /// 合成会话快照（与 bridge 单元测试里官方假体的快照同形）：`revision` 可参数化、
-    /// 空 pending / 空 control、带当前选择 config。生产投影据此 `ready=true`。
+    /// 空 pending / 由 `running` 决定的 control、带当前选择 config。生产投影据此
+    /// `ready=true`。
     ///
     /// `seq` 与 `revision` 同值前进：`seq` 推进日志头指纹（send 确认的「新用户消息
     /// 可见」观察面），`revision` 推进会话水位（send 确认的「revision 前进」判据）。
     /// 同步合成会话快照；`model` 覆盖 `config.model`（P2 回归注入：宿主换模型的
     /// 实时快照）。
+    /// `queue` = 快照顶层的官方 `state.queue` 原值（`None` = 本宿主不宣告队列，
+    /// 快照里连键都没有 → 生产投影按 `known=false` 处理）。
+    /// `running` = 官方 `control.activeWorks` 里进行中的前台 `primaryTurn` 执行 id
+    /// （`None` = 空闲 → `activeWorks: []`）。R0 §3/§4：这是「会话在跑」的唯一来源，
+    /// 也是假宿主 admission 判定的前置。
     fn synthetic_conversation_snapshot_with_model(
         session_id: &str,
         revision: u64,
         pending_cards: &[serde_json::Value],
         model: &str,
+        queue: Option<&serde_json::Value>,
+        running: Option<&str>,
     ) -> serde_json::Value {
-        serde_json::json!({
+        let control = match running {
+            Some(execution_id) => serde_json::json!({
+                "activeWorks": [{
+                    "kind": "primaryTurn",
+                    "foregroundExecutionId": execution_id,
+                }],
+            }),
+            None => serde_json::json!({"activeWorks": []}),
+        };
+        let mut snapshot = serde_json::json!({
             "protocolVersion": 1,
             "sessionId": session_id,
             "logEpoch": "synthetic-epoch",
             "seq": revision,
             "revision": revision,
-            "control": {"activeWorks": []},
+            "control": control,
             "pendingInteractions": pending_cards,
             "config": {
                 "provider": "synthetic-provider",
                 "model": model,
                 "thought": "high",
             },
+        });
+        if let Some(queue) = queue {
+            snapshot["queue"] = queue.clone();
+        }
+        snapshot
+    }
+
+    /// 「运行中发送 → 官方受理入队」后的 `state.queue` 合成值。
+    ///
+    /// 形状逐字段取自 R0 证据（`docs/superpowers/reviews/2026-10-29-zcode-r0-wire-evidence.md`
+    /// §3）：容器 `{items[], autoDrain, pauseReason?}`，项 `{queueItemId, text,
+    /// delivery, order:{admissionSeq,queuePosition}, dispatch:{state}}`。身份派生
+    /// `queue_<commandId>` 是**宿主**规则（`queueItemIdForCommand`），生产侧只透传。
+    fn queued_state_after_send(envelope: &serde_json::Value) -> serde_json::Value {
+        let command_id = envelope
+            .get("commandId")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        let text = envelope
+            .get("payload")
+            .and_then(|payload| payload.get("text"))
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        serde_json::json!({
+            "items": [{
+                "queueItemId": format!("queue_{command_id}"),
+                "sourceCommandId": command_id,
+                "clientId": PROTOCOL_CLIENT_ID,
+                "kind": "sendText",
+                "text": text,
+                "delivery": {"requested": "queue", "admitted": "queue"},
+                "order": {"admissionSeq": 1, "queuePosition": 0},
+                "dispatch": {"state": "queued"},
+            }],
+            "autoDrain": true,
         })
+    }
+
+    /// 假宿主 admission 判定（R0 §3/§4）：只有当**会话在跑**（`control.activeWorks`
+    /// 里有前台 `primaryTurn`）**且**本次 send 明确请求 `requestedDelivery="queue"`
+    /// 时才入队；否则按 `startNow` 立即执行。
+    ///
+    /// 这条规则替代了「收到 send 就入队」的旧夹具：没有运行态前置就入不了队，
+    /// 因此「运行中发送 → 官方入队」这条时序真的被测到了。
+    fn admits_to_queue(host: &FakeHostState, envelope: Option<&serde_json::Value>) -> bool {
+        let running = host.running.lock().expect("运行态锁").is_some();
+        let requested_queue = envelope
+            .and_then(|envelope| envelope.get("payload"))
+            .and_then(|payload| payload.get("requestedDelivery"))
+            .and_then(|value| value.as_str())
+            == Some("queue");
+        running && requested_queue
+    }
+
+    /// 假宿主的 send ACK（形状取自 R0 §4 `ADK@38235` / `ADK@37225` / `CLI@14762292`）：
+    /// `{status, commandId, revisionAtDecision, result:{type:"inputAccepted",delivery,inputId}}`。
+    /// `delivery` 是**宿主 admission 的结论**，`inputId` 原样回显发送 `commandId`。
+    fn send_ack_body(
+        host: &FakeHostState,
+        mode: AckMode,
+        envelope: Option<&serde_json::Value>,
+    ) -> serde_json::Value {
+        match mode {
+            AckMode::Accepted => {
+                let command_id = envelope
+                    .and_then(|envelope| envelope.get("commandId"))
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default();
+                let delivery = if admits_to_queue(host, envelope) {
+                    "queue"
+                } else {
+                    "startNow"
+                };
+                serde_json::json!({
+                    "status": "accepted",
+                    "commandId": command_id,
+                    "revisionAtDecision": 1,
+                    "result": {
+                        "type": "inputAccepted",
+                        "delivery": delivery,
+                        "inputId": command_id,
+                    },
+                })
+            }
+            other => other.body(),
+        }
+    }
+
+    /// 一条合成会话快照的内容（水位 / 卡片 / 模型 / 官方队列 / 运行态）。
+    ///
+    /// 打包成结构体是为了让 [`push_conversation_snapshot`] 的入参保持可读
+    /// （逐个平铺会越过 clippy 的参数上限，也容易把 model 与 queue 传反）。
+    struct SnapshotSpec<'a> {
+        revision: u64,
+        pending_cards: &'a [serde_json::Value],
+        model: &'a str,
+        queue: Option<&'a serde_json::Value>,
+        /// 进行中的前台 `primaryTurn` 执行 id（`None` = 空闲）。
+        running: Option<&'a str>,
     }
 
     /// 推一条该会话 topic 的 conversation snapshot（204 事件帧）：
@@ -489,10 +647,15 @@ mod tests {
         peer: &mut FakePeer,
         bridge: &str,
         session_id: &str,
-        revision: u64,
-        pending_cards: &[serde_json::Value],
-        model: &str,
+        spec: SnapshotSpec<'_>,
     ) {
+        let SnapshotSpec {
+            revision,
+            pending_cards,
+            model,
+            queue,
+            running,
+        } = spec;
         // 生产在订阅 RPC 之前先发 EventListen；缺 listen id 就无法路由事件帧。
         let Some(listen) = peer.listen.get(bridge).copied() else {
             return;
@@ -511,6 +674,8 @@ mod tests {
                     revision,
                     pending_cards,
                     model,
+                    queue,
+                    running,
                 ),
             },
         });
@@ -525,6 +690,8 @@ mod tests {
             "frame": logical,
         });
         send_data(socket, peer.frame(bridge, encode_event_fire(listen, &wire))).await;
+        // 快照水位前进：外部注入的下一帧从它 +1 起（宿主侧 revision 单调）。
+        peer.revision = revision;
     }
 
     /// 处理一条入站 `rpc-frame`：解 header 记账 channel 方法，再按方法回 201。
@@ -551,6 +718,8 @@ mod tests {
             handshake_client_id,
             strict_client_identity,
             command_fault,
+            running,
+            send_acks,
         } = host;
         let bridge = payload
             .get("bridgeSessionId")
@@ -584,6 +753,7 @@ mod tests {
                     }
                 }
                 let mut command_client_id: Option<String> = None;
+                let mut send_envelope: Option<serde_json::Value> = None;
                 if method == AGENT_SEND_COMMAND_METHOD {
                     // 只记录解出的命令信封（正文/身份都在里面），供断言「恰一帧、
                     // 正文原样离机、clientId 与握手身份一致」。
@@ -591,6 +761,7 @@ mod tests {
                         // body[0] = `{workspacePath, envelope}`（生产 CommandPort 适配层
                         // 产物）；协议身份在内层 envelope.clientId。
                         let wrapper = message.body.get(0).cloned().unwrap_or_default();
+                        send_envelope = wrapper.get("envelope").cloned();
                         command_client_id = wrapper
                             .get("envelope")
                             .and_then(|envelope| envelope.get("clientId"))
@@ -650,7 +821,20 @@ mod tests {
                     AGENT_SUBSCRIBE_CONVERSATION_METHOD => {
                         serde_json::json!({"ack": {"subscriptionId": CONVERSATION_SUBSCRIPTION}})
                     }
-                    AGENT_SEND_COMMAND_METHOD => ack.lock().expect("ACK 模式锁").body(),
+                    AGENT_SEND_COMMAND_METHOD => {
+                        // R0 §4：ACK 带 `result`（`inputAccepted`/`delivery`/`inputId`），
+                        // `delivery` 是宿主 admission 的结论，`inputId` 回显发送 commandId。
+                        let body = send_ack_body(
+                            host,
+                            *ack.lock().expect("ACK 模式锁"),
+                            send_envelope.as_ref(),
+                        );
+                        send_acks
+                            .lock()
+                            .expect("send ACK 账本锁")
+                            .push(body.clone());
+                        body
+                    }
                     // 外部评审 C1：目录读应答（None = 既有空应答，目录采不到）。
                     "getView" => model_catalog
                         .lock()
@@ -688,6 +872,7 @@ mod tests {
                 }
                 if let Some(session_id) = conversation_session {
                     peer.conversation = Some(session_id.clone());
+                    peer.conversation_bridge = Some(bridge.clone());
                     // 初始快照的 pending 集合 = 测试注入的合成卡（未注入 = 空册）。
                     let cards = pending_card
                         .lock()
@@ -695,14 +880,20 @@ mod tests {
                         .clone()
                         .map(|card| vec![card])
                         .unwrap_or_default();
+                    // 运行态读成局部变量：锁不得跨 await 持有（future 必须 Send）。
+                    let running_id = running.lock().expect("运行态锁").clone();
                     push_conversation_snapshot(
                         socket,
                         peer,
                         &bridge,
                         &session_id,
-                        1,
-                        &cards,
-                        "synthetic-model-a",
+                        SnapshotSpec {
+                            revision: 1,
+                            pending_cards: &cards,
+                            model: "synthetic-model-a",
+                            queue: None,
+                            running: running_id.as_deref(),
+                        },
                     )
                     .await;
                 }
@@ -726,14 +917,30 @@ mod tests {
                             .expect("快照模型锁")
                             .clone()
                             .unwrap_or_else(|| "synthetic-model-a".to_owned());
+                        // R2：**宿主 admission** 决定是否入队（运行中 + 本次请求
+                        // `requestedDelivery="queue"`），不是「收到 send 就入队」。
+                        // 队列项身份由宿主派生（`queue_<commandId>`），正文/次序都
+                        // 来自官方 state.queue，生产侧原样透传、绝不重算。
+                        let queue = send_envelope
+                            .as_ref()
+                            .filter(|envelope| admits_to_queue(host, Some(envelope)))
+                            .map(queued_state_after_send);
+                        // 水位由宿主持有：ACK 跟进帧必须从当前水位 +1 起（外部注入的
+                        // 运行态/队列帧已经把水位推进过，硬编码 2 会被去重丢弃）。
+                        let revision = peer.revision.saturating_add(1);
+                        let running_id = running.lock().expect("运行态锁").clone();
                         push_conversation_snapshot(
                             socket,
                             peer,
                             &bridge,
                             &session_id,
-                            2,
-                            &[],
-                            &model,
+                            SnapshotSpec {
+                                revision,
+                                pending_cards: &[],
+                                model: &model,
+                                queue: queue.as_ref(),
+                                running: running_id.as_deref(),
+                            },
                         )
                         .await;
                     }
@@ -760,6 +967,10 @@ mod tests {
         /// 本连接上最近一次 `subscribeConversationV4` 的会话 id（send ACK 后的
         /// 跟进快照要推给它的 topic；未订阅过 = None，不推）。
         conversation: Option<String>,
+        /// 该会话订阅所在的桥（外部注入队列帧时按它编 rpc-frame）。
+        conversation_bridge: Option<String>,
+        /// 已推过的最大快照水位（外部注入帧从它 +1 起）。
+        revision: u64,
     }
 
     impl FakePeer {
@@ -835,6 +1046,12 @@ mod tests {
         strict_client_identity: Arc<Mutex<bool>>,
         /// 三轮 A：对写命令无条件回指定 fault code 的 202（本地错误分类用例）。
         command_fault: Arc<Mutex<Option<String>>>,
+        /// R2：假宿主当前是否「会话在跑」——官方 `control.activeWorks` 里的前台
+        /// `primaryTurn` 执行 id（`None` = 空闲）。快照的 `control` 与 send 的
+        /// **admission**（运行中 + 本次请求 queue 才入队）都由它推出。
+        running: Arc<Mutex<Option<String>>>,
+        /// R2：已回出的 send ACK body（断言 `result.inputId` 与发送 `commandId` 同源）。
+        send_acks: Arc<Mutex<Vec<serde_json::Value>>>,
     }
 
     /// 单条回环 WS 连接的握手/心跳应答（配对即刻完成）、app 请求分派与数据面回显。
@@ -842,6 +1059,7 @@ mod tests {
         stream: tokio::net::TcpStream,
         echoes: Arc<AtomicUsize>,
         host: FakeHostState,
+        mut queue_rx: tokio::sync::broadcast::Receiver<serde_json::Value>,
         mut close_rx: tokio::sync::broadcast::Receiver<()>,
     ) {
         let Ok(mut socket) = tokio_tungstenite::accept_async(stream).await else {
@@ -856,6 +1074,41 @@ mod tests {
                 _ = close_rx.recv() => {
                     let _ = socket.close(None).await;
                     break;
+                }
+                // R2：外部注入的宿主队列推进 → 以「下一水位快照」下发（不是
+                // 手推 SSE：手机看到的是生产投影对真实 conversation 帧的结果）。
+                injected = queue_rx.recv() => {
+                    if let Ok(queue) = injected {
+                        if let (Some(session_id), Some(bridge)) = (
+                            peer.conversation.clone(),
+                            peer.conversation_bridge.clone(),
+                        ) {
+                            let revision = peer.revision.saturating_add(1);
+                            let queue = (!queue.is_null()).then_some(queue);
+                            let model = host
+                                .snapshot_model
+                                .lock()
+                                .expect("快照模型锁")
+                                .clone()
+                                .unwrap_or_else(|| "synthetic-model-a".to_owned());
+                            let running_id = host.running.lock().expect("运行态锁").clone();
+                            push_conversation_snapshot(
+                                &mut socket,
+                                &mut peer,
+                                &bridge,
+                                &session_id,
+                                SnapshotSpec {
+                                    revision,
+                                    pending_cards: &[],
+                                    model: &model,
+                                    queue: queue.as_ref(),
+                                    running: running_id.as_deref(),
+                                },
+                            )
+                            .await;
+                        }
+                    }
+                    continue;
                 }
                 frame = socket.next() => frame,
             };
@@ -2175,6 +2428,198 @@ mod tests {
         assert_eq!(ledger_rows(&chain.store), 1, "重放零新账本行");
         assert_eq!(audit_rows(&chain.store, "zcode_send", "started"), 1);
         assert_eq!(audit_rows(&chain.store, "zcode_send", "accepted"), 1);
+    }
+
+    /// R2 全链：**会话在跑**（官方 `control.activeWorks` 有进行中的 `primaryTurn`）
+    /// → 运行中发送 → 宿主按官方 admission 判定入队 → SSE 显示**同一** inputId →
+    /// 桌面侧消费后消失；全程恰一帧 send（手机不重发），GET 刷新/重进从宿主重建。
+    ///
+    /// 队列只做**只读投影**：Tuvis 不建自建队列、不重算 `queueItemId`、不把「当前
+    /// 忙」本地猜成「已入队」。断言面全部落在官方 `control`/`state.queue` 与生产
+    /// 投影/事件上：
+    /// 1. bind 后宿主空闲、未宣告队列 → `known=false`（未知 ≠ 空）；
+    /// 2. 宿主进入运行态（下一水位快照带 `activeWorks`）→ 生产投影先看到「在跑」，
+    ///    手机侧才能把这次发送理解成「排队」；
+    /// 3. 运行中 send 的信封显式携带官方 `payload.requestedDelivery="queue"`（不改全局
+    ///    followupMode、不发 stop）；
+    /// 4. 假宿主 admission = 「运行中 + 本次请求 queue」→ 入队；ACK 是官方形状
+    ///    `result{type:"inputAccepted",delivery:"queue",inputId:<发送 commandId>}`，
+    ///    `inputId` 与发送 `commandId` **同源**；
+    /// 5. SSE 帧的 `queue.items[0].inputId` 等于 `queue_<commandId>`（commandId 来自
+    ///    假体真实收到的信封，不是测试侧另编的 id）；
+    /// 6. GET 两次（刷新/重进）都从宿主重建同一份待处理项；
+    /// 7. 宿主消费后（快照里 items 清空）SSE 与 GET 都不再出现该项、不复活，且
+    ///    **零新 send 帧**。
+    #[tokio::test]
+    async fn running_send_queues_officially_and_drains_without_resend() {
+        let chain = full_chain(send_policy()).await;
+        let app = router(remote_state(
+            &chain.conn,
+            chain.hub.clone(),
+            chain.injector.clone(),
+        ));
+        let generation = chain.hub.connection().generation;
+
+        // ---- 1) SSE 首帧 + 真实 bind/订阅（宿主空闲：无 queue、control 空）----
+        let resp = app
+            .clone()
+            .oneshot(get_req(&format!(
+                "/m/api/v1/zcode/events?sessionId={SYNTHETIC_TASK_ID}"
+            )))
+            .await
+            .expect("SSE 请求应完成");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let mut stream = resp.into_body().into_data_stream();
+        let first = next_sse_frame(&mut stream).await.expect("首帧不得缺失");
+        assert!(first.starts_with("event: snapshot\n"), "{first:?}");
+
+        let session = bind_and_wait_ready(&app, SYNTHETIC_TASK_ID).await;
+        assert_eq!(
+            session["queue"]["known"], false,
+            "宿主未宣告队列时必须是未知，不得下发空队列：{session}"
+        );
+        assert!(session["queue"]["paused"].is_null(), "{session}");
+        assert_eq!(
+            session["control"]["activeWorks"].as_array().map(Vec::len),
+            Some(0),
+            "bind 后宿主是空闲态（发送前的「运行中」前置必须由宿主状态进入）：{session}"
+        );
+        await_sse_event(&mut stream, "session", |data| {
+            data["data"]["ready"].as_bool() == Some(true)
+        })
+        .await;
+
+        // ---- 2) 官方进入运行态：宿主推一条带 activeWorks 的下一水位快照 ----
+        // 生产投影只有在真的读到「在跑」时才可能给出入队语义；这一步就是 U3/时序 3
+        // 要求的前置，缺了它后面所有断言都退化成「空闲 send 恰好也被入队」。
+        chain.ws.begin_running(RUNNING_EXECUTION_ID);
+        let running = await_sse_event(&mut stream, "session", |data| {
+            data["data"]["control"]["activeWorks"][0]["foregroundExecutionId"]
+                == serde_json::json!(RUNNING_EXECUTION_ID)
+        })
+        .await;
+        assert_eq!(running["data"]["ready"], true, "{running}");
+        assert_eq!(
+            running["data"]["queue"]["known"], true,
+            "运行中宿主宣告了队列（空）：{running}"
+        );
+        assert_eq!(
+            running["data"]["queue"]["items"].as_array().map(Vec::len),
+            Some(0),
+            "运行中但还没有排队项：{running}"
+        );
+
+        // ---- 3) 运行中发送：本次动作显式请求官方入队语义 ----
+        let (status, receipt) =
+            post_action(&app, &send_body(ACTION_ID, generation, SEND_TEXT)).await;
+        assert_eq!(status, StatusCode::OK, "{receipt}");
+        assert_eq!(receipt["state"], "accepted");
+        let commands = chain.ws.commands();
+        assert_eq!(commands.len(), 1, "只允许一帧 send：{commands:?}");
+        let envelope = &commands[0]["envelope"];
+        assert_eq!(envelope["type"], SEND_TEXT_TYPE);
+        assert_eq!(envelope["payload"]["text"], SEND_TEXT, "正文原样离机");
+        assert_eq!(
+            envelope["payload"]["requestedDelivery"], "queue",
+            "运行中发送必须携带官方投递请求（省略时跟随宿主 inputRouting.mode）：{envelope}"
+        );
+        let command_id = envelope["commandId"]
+            .as_str()
+            .expect("信封必须带 commandId")
+            .to_owned();
+        let expected_input = format!("queue_{command_id}");
+
+        // ---- 4) 宿主 admission：运行中 + 请求 queue → 入队，ACK 回同源 inputId ----
+        let acks = chain.ws.send_acks();
+        assert_eq!(acks.len(), 1, "send 恰一次 ACK：{acks:?}");
+        assert_eq!(acks[0]["status"], "accepted", "{acks:?}");
+        assert_eq!(acks[0]["result"]["type"], "inputAccepted", "{acks:?}");
+        assert_eq!(
+            acks[0]["result"]["delivery"], "queue",
+            "运行中 + requestedDelivery=queue → 宿主入队（accepted ≠ 已执行）：{acks:?}"
+        );
+        assert_eq!(
+            acks[0]["result"]["inputId"],
+            command_id.as_str(),
+            "ACK inputId 必须与发送 commandId 同源（官方原样回显）：{acks:?}"
+        );
+
+        // ---- 5) SSE 显示同一 inputId（正文/次序来自官方队列）----
+        let queued = await_sse_event(&mut stream, "session", |data| {
+            data["data"]["queue"]["items"][0]["inputId"] == serde_json::json!(expected_input)
+        })
+        .await;
+        assert_eq!(queued["data"]["queue"]["known"], true);
+        assert_eq!(
+            queued["data"]["queue"]["paused"], false,
+            "autoDrain=true → 未暂停"
+        );
+        assert_eq!(queued["data"]["queue"]["items"][0]["text"], SEND_TEXT);
+        assert_eq!(queued["data"]["queue"]["items"][0]["position"], 0);
+        assert_eq!(
+            queued["data"]["control"]["activeWorks"][0]["foregroundExecutionId"],
+            serde_json::json!(RUNNING_EXECUTION_ID),
+            "排队期间原回合仍在跑（入队不是执行完成）"
+        );
+
+        // ---- 6) 刷新/重进（两次 GET）：从宿主重建，不丢待处理项 ----
+        for _ in 0..2 {
+            let (status, refreshed) = get_json(
+                &app,
+                &format!("/m/api/v1/zcode/session?sessionId={SYNTHETIC_TASK_ID}"),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(refreshed["queue"]["known"], true, "{refreshed}");
+            assert_eq!(
+                refreshed["queue"]["items"].as_array().map(Vec::len),
+                Some(1),
+                "重进后待处理项不得丢失：{refreshed}"
+            );
+            assert_eq!(refreshed["queue"]["items"][0]["inputId"], expected_input);
+        }
+
+        // ---- 7) 桌面侧消费：队列项从宿主快照消失（无单独 consumed 事件）----
+        chain.ws.push_queue(Some(serde_json::json!({
+            "items": [],
+            "autoDrain": true,
+        })));
+        let drained = await_sse_event(&mut stream, "session", |data| {
+            data["data"]["queue"]["known"] == true
+                && data["data"]["queue"]["items"]
+                    .as_array()
+                    .is_some_and(|items| items.is_empty())
+        })
+        .await;
+        assert_eq!(
+            drained["data"]["queue"]["known"], true,
+            "消费后仍是已知队列"
+        );
+        // 已消费项不得复活：GET 也不得再列出它。
+        let (status, after) = get_json(
+            &app,
+            &format!("/m/api/v1/zcode/session?sessionId={SYNTHETIC_TASK_ID}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            after["queue"]["items"].as_array().map(Vec::len),
+            Some(0),
+            "已消费项不得复活：{after}"
+        );
+        // 全程零重发：命令帧与 send 方法各恰一条。
+        assert_eq!(chain.ws.commands().len(), 1, "消费后手机不得重发");
+        assert_eq!(
+            chain
+                .ws
+                .log()
+                .iter()
+                .filter(|method| method.as_str() == AGENT_SEND_COMMAND_METHOD)
+                .count(),
+            1,
+            "sendConversationCommandV4 只允许一帧"
+        );
+        assert_eq!(chain.injector.calls(), 0, "官方路径不得回落终端注入");
     }
 
     /// T9 e2e（spec §7.3/§7.6/§8）：未知 build（shipped 表不命中）走 resolver 的

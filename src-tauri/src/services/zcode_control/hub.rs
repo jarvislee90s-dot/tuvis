@@ -45,7 +45,7 @@ use super::relay::{DeviceRoute, RelayClient, RelayEvent, RelayLag};
 use super::types::{
     codes, ActionContext, ActionReceipt, ActionState, BoundTarget, CapabilitySource,
     CapabilityView, ConnectionState, ConnectionView, ControlAction, ControlEvent, ControlEventKind,
-    HostBuildProbe, HostEvidence, SessionView, TargetKey, ZResult, ZcodeError,
+    HostBuildProbe, HostEvidence, QueueView, SessionView, TargetKey, ZResult, ZcodeError,
 };
 use crate::database::dao::zcode_capability::{
     validate_evidence_token, CapabilityLedger, DbCapabilityLedger,
@@ -63,6 +63,13 @@ const RELAY_EVENT_CAPACITY: usize = 64;
 /// 已发布会话视图的跟踪上限（有界：**最后登记**的最多 32 个；超限淘汰最久未登记
 /// 的会话（LRU），不随会话数无界增长。Data 溢出按此表逐会话降级）。
 const TRACKED_SESSION_CAP: usize = 32;
+
+/// 会话/代际 → 能力矩阵的现算闭包（**GET 与 SSE 共用同一实现**）。
+///
+/// 存在理由：事件泵只持有 `Weak<Mutex<Inner>>`，但能力现算必须在锁**外**执行
+/// （resolver 会读 DB）。把实现放进 `Inner` 并只 `clone` 出 `Arc`，两条路径就不可
+/// 能各自算一套；`type` 别名同时满足 clippy 的 type-complexity 门。
+type SessionCapabilitySource = Arc<dyn Fn(&str, u64) -> CapabilityView + Send + Sync>;
 
 /// 把静态矩阵包装成现算源（测试/固定夹具；生产源来自 capability resolver）。
 fn static_policy_source(policy: CapabilityView) -> CapabilitySource {
@@ -1400,9 +1407,11 @@ async fn apply_relay_lag(
 ///   断开/冲突），旧代际的投影绝不得贴上新代际，一律丢弃；
 /// - `view.generation` 是**桥投影代际**，仅作诊断（不参与对外比较）：对外事件恒用
 ///   Hub 代际；
-/// - 能力矩阵：桥投影不携带 Hub 能力（基线全关，证据层由 Hub 在 GET 时现算）。只有
-///   `last_session` 恰好是同一会话时才沿用它的矩阵（GET 时现算的权威值），否则回到
-///   基线全关——绝不把别的会话或桥投影的能力扣到本会话上（不伪造开闸）。
+/// - 能力矩阵：**本帧现算**（`capabilities`，由调用方在锁外用 Hub 的同一 source
+///   计算后传入）。桥投影不携带 Hub 能力，也绝不沿用 `last_session` 里上一次 GET 的
+///   矩阵——空 GET 之后随 SSE 到达的新卡必须立刻可答（R1）；
+/// - `ready=false`（坏帧/解码/序号错误）一律回基线全关，绝不把旧开闸矩阵带到降级
+///   视图上。
 ///
 /// 调用方不得持内锁调用：本函数自己取锁，且广播在锁外进行。
 fn apply_relay_session(
@@ -1410,6 +1419,7 @@ fn apply_relay_session(
     events: &broadcast::Sender<ControlEvent>,
     hub_generation: u64,
     mut view: SessionView,
+    capabilities: CapabilityView,
 ) {
     let view = {
         let mut state = lock_inner(inner);
@@ -1418,14 +1428,9 @@ fn apply_relay_session(
         }
         view.generation = state.generation;
         view.capabilities = if view.ready {
-            state
-                .last_session
-                .as_ref()
-                .filter(|last| last.session_id == view.session_id)
-                .map(|last| last.capabilities.clone())
-                .unwrap_or_default()
+            capabilities
         } else {
-            // 降级视图（坏帧/解码/序号错误）：绝不沿用 last_session 里的旧开闸矩阵，
+            // 降级视图（坏帧/解码/序号错误）：绝不沿用任何旧开闸矩阵，
             // 否则手机在 ready=false 的投影上仍显示可点的控制面。
             CapabilityView::default()
         };
@@ -1471,6 +1476,12 @@ struct Inner {
     /// 跟踪表的**最后登记序**（LRU）：back = 最近登记/再次 GET，front = 最久未登记；
     /// 超限时按它淘汰（与 `tracked_sessions` 的 key 集合同步维护）。
     tracked_order: VecDeque<String>,
+    /// 能力矩阵的**唯一现算源**（会话/代际 → 能力），供事件泵在**锁外**调用。
+    ///
+    /// 与 [`ZcodeHub::session_capabilities`] 同一实现：基线 = `policy_source` 现算，
+    /// debug 证据构建再叠加本会话/本代际尚未消费的许可。放进 `Inner` 只是为了让
+    /// 事件泵能 `clone` 出 `Arc` 后在锁外计算——绝不在持锁期间做 resolver 的 DB 读。
+    capabilities_for: SessionCapabilitySource,
 }
 
 impl Inner {
@@ -1491,23 +1502,30 @@ impl Inner {
     /// 关键：relay **掉线不换代**（代际不变）时也必须逐会话通知；只发 connection 帧
     /// 时，停在别的会话的手机不一定重拉。`last_session` 只是兜底（它未进跟踪表且
     /// 仍 ready 的 legacy 状态），不是唯一广播对象。
+    /// 单条会话视图的「无结论」降级：当前代际、不新鲜、能力与官方队列一并作废。
+    ///
+    /// 队列必须一起清：`ready=false` 的视图若仍带着上一代/上一帧的队列项，手机就会
+    /// 看着一份宿主已不再声称的待处理列表（空 ≠ 未知，旧项更不是「仍在排队」）。
+    fn degrade_view(view: &mut SessionView, generation: u64) {
+        view.generation = generation;
+        view.ready = false;
+        // 投影已不新鲜：能力矩阵同步回到基线全关，绝不把旧代际的许可带进新代际事件。
+        view.capabilities = CapabilityView::default();
+        view.queue = QueueView::default();
+    }
+
     fn stale_sessions(&mut self, generation: u64) -> Vec<SessionView> {
         let mut changed = Vec::new();
         for view in self.tracked_sessions.values_mut() {
             if !view.ready {
                 continue;
             }
-            view.generation = generation;
-            view.ready = false;
-            // 投影已不新鲜：能力矩阵同步回到基线全关，绝不把旧代际的许可带进新代际事件。
-            view.capabilities = CapabilityView::default();
+            Self::degrade_view(view, generation);
             changed.push(view.clone());
         }
         if let Some(last) = self.last_session.as_mut() {
             let was_ready = last.ready;
-            last.generation = generation;
-            last.ready = false;
-            last.capabilities = CapabilityView::default();
+            Self::degrade_view(last, generation);
             let represented = changed
                 .iter()
                 .any(|view| view.session_id == last.session_id);
@@ -1558,16 +1576,11 @@ impl Inner {
             if !view.ready {
                 continue;
             }
-            view.generation = generation;
-            view.ready = false;
-            // 投影已不新鲜：能力矩阵同步回到基线全关，绝不把旧代际的许可带进新事件。
-            view.capabilities = CapabilityView::default();
+            Self::degrade_view(view, generation);
             changed.push(view.clone());
         }
         if let Some(last) = self.last_session.as_mut() {
-            last.generation = generation;
-            last.ready = false;
-            last.capabilities = CapabilityView::default();
+            Self::degrade_view(last, generation);
         }
         changed
     }
@@ -1689,8 +1702,11 @@ pub struct ZcodeHub {
     #[cfg(test)]
     auto_attempts: AtomicU64,
     /// T8.2 debug 证据构建的单次验收许可册（进程内存；不落 settings/DB）。
+    ///
+    /// `Arc` 共享给 `Inner::capabilities_for`：事件泵（SSE）与 `session()`（GET）
+    /// 必须用**同一份**许可册现算，否则两条路径的矩阵会漂移（R1）。
     #[cfg(all(feature = "zcode-bridge-evidence", debug_assertions))]
-    evidence: EvidencePermitStore,
+    evidence: Arc<EvidencePermitStore>,
     /// 首次真实动作确认的登记表（spec R4；send/model/thought 接线在 execute/事件泵）。
     confirmations: Arc<ConfirmationTracker>,
     /// 确认窗时长（生产 [`CONFIRMATION_TIMEOUT`]；测试注入短窗）。
@@ -1777,6 +1793,25 @@ impl ZcodeHub {
         )
     }
 
+    /// 事件泵测试构造 + **动态**策略源（R1：实时帧现算能力的回归入口）。
+    #[cfg(test)]
+    fn with_pump_policy_source(
+        store: DeviceStore,
+        backend: Arc<dyn HubBackend>,
+        policy_source: CapabilitySource,
+        events: mpsc::Receiver<RelayEvent>,
+        bridge: Arc<dyn BridgePump>,
+    ) -> Self {
+        Self::assemble(
+            store,
+            backend,
+            policy_source,
+            Some((events, bridge, None)),
+            None,
+            CONFIRMATION_TIMEOUT,
+        )
+    }
+
     /// 事件泵测试构造 + Data 溢出观察口（验证 lag → 投影失效接线）。
     #[cfg(test)]
     pub(crate) fn with_pump_and_lag(
@@ -1856,6 +1891,31 @@ impl ZcodeHub {
         confirmation_timeout: Duration,
     ) -> Self {
         let confirmations = Arc::new(ConfirmationTracker::new(ledger));
+        // 能力矩阵的**唯一现算实现**：会话 DTO（GET）与事件泵（SSE）共用本闭包，
+        // 杜绝两条路径各算一套。基线恒为 `policy_source`（与执行闸同源）；
+        // debug 证据构建再叠加本会话/本代际尚未消费的许可。
+        #[cfg(all(feature = "zcode-bridge-evidence", debug_assertions))]
+        let evidence = Arc::new(EvidencePermitStore::new());
+        let capabilities_for: SessionCapabilitySource = {
+            let source = policy_source.clone();
+            #[cfg(all(feature = "zcode-bridge-evidence", debug_assertions))]
+            let evidence = evidence.clone();
+            Arc::new(move |session_id: &str, generation: u64| {
+                #[allow(unused_mut)]
+                let mut view = source();
+                #[cfg(all(feature = "zcode-bridge-evidence", debug_assertions))]
+                {
+                    for capability in evidence.armed_capabilities(session_id, generation) {
+                        overlay_permit(&mut view, &capability);
+                    }
+                }
+                #[cfg(not(all(feature = "zcode-bridge-evidence", debug_assertions)))]
+                {
+                    let _ = (session_id, generation);
+                }
+                view
+            })
+        };
         let hub = Self {
             store,
             backend,
@@ -1876,6 +1936,7 @@ impl ZcodeHub {
                 last_session: None,
                 tracked_sessions: BTreeMap::new(),
                 tracked_order: VecDeque::new(),
+                capabilities_for,
             })),
             connect_lock: AsyncMutex::new(()),
             disconnect_lock: AsyncMutex::new(()),
@@ -1893,7 +1954,7 @@ impl ZcodeHub {
             #[cfg(test)]
             auto_attempts: AtomicU64::new(0),
             #[cfg(all(feature = "zcode-bridge-evidence", debug_assertions))]
-            evidence: EvidencePermitStore::new(),
+            evidence,
             confirmations,
             confirmation_timeout,
         };
@@ -1975,7 +2036,18 @@ impl ZcodeHub {
                                 let host_pending = bridge.host_pending_ids(&view.session_id);
                                 (view.clone(), fingerprint, host_pending)
                             });
-                            apply_relay_session(&inner, &out, hub_generation, view);
+                            // R1：能力矩阵按**本帧**现算，且在 Hub 状态锁**外**执行
+                            // （resolver 会读 DB，绝不持锁做阻塞读）。锁内只取 `Arc`。
+                            //
+                            // 复审 I3：`ready=false` 的帧在 `apply_relay_session` 里恒
+                            // 被清成全关，现算结果一定被丢弃——不为此读库。
+                            let capabilities = if view.ready {
+                                let capabilities_for = lock_inner(&inner).capabilities_for.clone();
+                                capabilities_for(&view.session_id, hub_generation)
+                            } else {
+                                CapabilityView::default()
+                            };
+                            apply_relay_session(&inner, &out, hub_generation, view, capabilities);
                             if let Some((view, fingerprint, host_pending)) = observed {
                                 confirmations.observe_session(
                                     &view,
@@ -2187,20 +2259,12 @@ impl ZcodeHub {
     /// 未过期**的许可（每项只放宽一次动作）。不跨会话、不跨代际、不缓存：许可被
     /// 消费/过期/换代后，下一次 `session()` GET 立即回到当前策略。普通构建没有许可
     /// 册，行为恒为当前策略（生产默认全关）。
+    ///
+    /// 与事件泵共用 `Inner::capabilities_for` 这**同一实现**：GET 与 SSE 的矩阵口径
+    /// 不可能漂移（R1）。取 `Arc` 在锁内、调用在锁外（resolver 读 DB，不持锁）。
     fn session_capabilities(&self, session_id: &str, generation: u64) -> CapabilityView {
-        #[allow(unused_mut)]
-        let mut view = self.current_policy();
-        #[cfg(all(feature = "zcode-bridge-evidence", debug_assertions))]
-        {
-            for capability in self.evidence.armed_capabilities(session_id, generation) {
-                overlay_permit(&mut view, &capability);
-            }
-        }
-        #[cfg(not(all(feature = "zcode-bridge-evidence", debug_assertions)))]
-        {
-            let _ = (session_id, generation);
-        }
-        view
+        let capabilities_for = self.lock().capabilities_for.clone();
+        capabilities_for(session_id, generation)
     }
 
     /// T8.2 **仅 debug 证据构建**：桌面发放一条单次验收许可（唯一发放入口）。
@@ -3650,7 +3714,7 @@ mod tests {
     };
     use crate::services::zcode_control::types::{
         ActionState, ActiveWork, AnswerEntry, CapabilityFlag, ControlView, PendingKind,
-        PendingView, SelectionView,
+        PendingView, QuestionOption, QuestionView, QueueItemView, QueueView, SelectionView,
     };
     use std::sync::atomic::{AtomicBool, AtomicUsize};
     use std::time::Duration;
@@ -3951,6 +4015,7 @@ mod tests {
                     control: None,
                     selection: None,
                     capabilities: CapabilityView::default(),
+                    queue: QueueView::default(),
                 })
             })
         }
@@ -6421,6 +6486,373 @@ mod tests {
         (hub, events, pump)
     }
 
+    /// 带事件泵 + **动态**策略源的 Hub（R1：验证实时帧按本帧现算能力，不沿用旧 GET）。
+    fn pumped_with_policy_source(
+        store: DeviceStore,
+        backend: Arc<FakeBackend>,
+        policy_source: CapabilitySource,
+    ) -> (Arc<ZcodeHub>, mpsc::Sender<RelayEvent>, Arc<FakePump>) {
+        let (events, receiver) = mpsc::channel(8);
+        let pump = Arc::new(FakePump::default());
+        let hub = Arc::new(ZcodeHub::with_pump_policy_source(
+            store,
+            backend,
+            policy_source,
+            receiver,
+            pump.clone(),
+        ));
+        (hub, events, pump)
+    }
+
+    /// 一张合成的 pending 卡（问答或审批），供 R1 的「新卡随 SSE 到达」用例。
+    fn synthetic_pending(kind: PendingKind) -> PendingView {
+        PendingView {
+            interaction_id: "pi-synthetic-live-card".into(),
+            kind,
+            anchor_row_id: Some(9),
+            tool_call_id: Some("call_synthetic_live_card".into()),
+            created_at: Some(1_700_000_000_000),
+            summary: Some("synthetic: live card".into()),
+            tool_name: Some("Bash".into()),
+            schema_interaction: None,
+            sensitive: false,
+            auto_resolution: false,
+            auto_resolution_state: None,
+            questions: if kind == PendingKind::UserInput {
+                vec![QuestionView {
+                    header: "Color".into(),
+                    question_text: "Which color?".into(),
+                    options: vec![QuestionOption {
+                        value: "Red".into(),
+                        label: "Red".into(),
+                        description: None,
+                        preview: None,
+                    }],
+                    multi_select: false,
+                    free_text_allowed: false,
+                }]
+            } else {
+                Vec::new()
+            },
+            options: Vec::new(),
+            detail: None,
+        }
+    }
+
+    fn live_session_view(session_id: &str, generation: u64, kind: PendingKind) -> SessionView {
+        SessionView {
+            session_id: session_id.to_owned(),
+            generation: generation + 9, // 桥投影代际 ≠ Hub 代际：发布时覆写
+            revision: Some(2),
+            ready: true,
+            pending: vec![synthetic_pending(kind)],
+            control: None,
+            selection: None,
+            capabilities: CapabilityView::default(),
+            queue: QueueView::default(),
+        }
+    }
+
+    fn live_answer_action(session_id: &str, generation: u64) -> ControlAction {
+        ControlAction::Answer {
+            session_id: session_id.to_owned(),
+            generation,
+            interaction_id: "pi-synthetic-live-card".into(),
+            answers: vec![AnswerEntry {
+                question_text: "Which color?".into(),
+                selected_values: vec!["Red".into()],
+                free_text: None,
+            }],
+        }
+    }
+
+    fn live_permission_action(session_id: &str, generation: u64) -> ControlAction {
+        ControlAction::Permission {
+            session_id: session_id.to_owned(),
+            generation,
+            interaction_id: "pi-synthetic-live-card".into(),
+            option_id: "allowOnce".into(),
+        }
+    }
+
+    /// R1：空闲无卡 GET → 同代真实 SSE 新问答卡 → **无需重进页面**即可作答。
+    ///
+    /// 缺陷现场：`apply_relay_session` 沿用最后一次 GET 的能力矩阵（当时无卡 → 全关），
+    /// 新卡随 SSE 到达时手机看到的仍是全关矩阵，只有手动刷新（GET 现算）才能答。
+    #[tokio::test]
+    async fn first_question_after_empty_get_is_answerable_without_refresh() {
+        const SESSION: &str = "sess_synthetic_first_question";
+        let open = Arc::new(AtomicBool::new(false));
+        let flag = open.clone();
+        let source: CapabilitySource = Arc::new(move || {
+            if flag.load(Ordering::SeqCst) {
+                policy_with(&["send", "single_select"])
+            } else {
+                CapabilityView::default()
+            }
+        });
+        let fake = Arc::new(FakeBackend::default());
+        let (hub, events, pump) = pumped_with_policy_source(stored(URL), fake.clone(), source);
+        hub.authorize(OAuthProvider::Bigmodel, noop_open())
+            .await
+            .unwrap();
+        hub.connect().await.unwrap();
+        let generation = hub.connection().generation;
+
+        // ① 空闲无卡 GET：现算矩阵全关（resolver 此时没有 pending 形状证据）。
+        let empty = hub
+            .session(&TargetKey {
+                session_id: SESSION.into(),
+            })
+            .await
+            .expect("empty GET");
+        assert!(empty.ready);
+        assert!(!empty.capabilities.single_select.enabled);
+        let mut subscriber = hub.subscribe();
+
+        // ② 同代 SSE：新问答卡到达，能力 source 已按新形状现算为开。
+        open.store(true, Ordering::SeqCst);
+        pump.push_outcome(
+            Ok(()),
+            vec![live_session_view(
+                SESSION,
+                generation,
+                PendingKind::UserInput,
+            )],
+        );
+        events
+            .send(RelayEvent::Data(serde_json::json!({"seq": 1})))
+            .await
+            .unwrap();
+        let event = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            next_session_event(&mut subscriber),
+        )
+        .await
+        .expect("新卡必须发布 Session 事件");
+        assert_eq!(event.data["sessionId"], SESSION);
+        assert_eq!(
+            event.data["capabilities"]["singleSelect"]["enabled"], true,
+            "新卡帧必须带本帧现算的能力矩阵（不得沿用空 GET 的全关矩阵）"
+        );
+
+        // ③ 手机可直接作答：能力闸放行，动作落到后端。
+        let receipt = hub
+            .execute(
+                ctx("r1-first-question"),
+                live_answer_action(SESSION, generation),
+            )
+            .await
+            .expect("新卡无需刷新即可作答");
+        assert_eq!(receipt.state, ActionState::Accepted);
+        assert_eq!(fake.execute_calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// R1：同代 SSE 新审批卡同样无需刷新即可应答。
+    #[tokio::test]
+    async fn first_permission_after_empty_get_is_answerable_without_refresh() {
+        const SESSION: &str = "sess_synthetic_first_permission";
+        let open = Arc::new(AtomicBool::new(false));
+        let flag = open.clone();
+        let source: CapabilitySource = Arc::new(move || {
+            if flag.load(Ordering::SeqCst) {
+                policy_with(&["send", "approval_reply"])
+            } else {
+                CapabilityView::default()
+            }
+        });
+        let fake = Arc::new(FakeBackend::default());
+        let (hub, events, pump) = pumped_with_policy_source(stored(URL), fake.clone(), source);
+        hub.authorize(OAuthProvider::Bigmodel, noop_open())
+            .await
+            .unwrap();
+        hub.connect().await.unwrap();
+        let generation = hub.connection().generation;
+        let empty = hub
+            .session(&TargetKey {
+                session_id: SESSION.into(),
+            })
+            .await
+            .expect("empty GET");
+        assert!(!empty.capabilities.approval_reply.enabled);
+        let mut subscriber = hub.subscribe();
+
+        open.store(true, Ordering::SeqCst);
+        pump.push_outcome(
+            Ok(()),
+            vec![live_session_view(
+                SESSION,
+                generation,
+                PendingKind::Permission,
+            )],
+        );
+        events
+            .send(RelayEvent::Data(serde_json::json!({"seq": 1})))
+            .await
+            .unwrap();
+        let event = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            next_session_event(&mut subscriber),
+        )
+        .await
+        .expect("新审批卡必须发布 Session 事件");
+        assert_eq!(
+            event.data["capabilities"]["approvalReply"]["enabled"], true,
+            "新审批卡帧必须带本帧现算的审批能力"
+        );
+        let receipt = hub
+            .execute(
+                ctx("r1-first-permission"),
+                live_permission_action(SESSION, generation),
+            )
+            .await
+            .expect("既有审批卡无需刷新即可应答");
+        assert_eq!(receipt.state, ActionState::Accepted);
+    }
+
+    /// R1：两个会话交替——能力矩阵只按**本帧**现算，绝不借用最后 GET 的别的会话矩阵；
+    /// `ready=false` 的帧必须全关。
+    #[tokio::test]
+    async fn live_frames_compute_capabilities_per_session_and_close_when_not_ready() {
+        const FIRST: &str = "sess_synthetic_matrix_first";
+        const SECOND: &str = "sess_synthetic_matrix_second";
+        let open = Arc::new(AtomicBool::new(false));
+        let flag = open.clone();
+        let source: CapabilitySource = Arc::new(move || {
+            if flag.load(Ordering::SeqCst) {
+                policy_with(&["send", "single_select"])
+            } else {
+                CapabilityView::default()
+            }
+        });
+        let fake = Arc::new(FakeBackend::default());
+        let (hub, events, pump) = pumped_with_policy_source(stored(URL), fake, source);
+        hub.authorize(OAuthProvider::Bigmodel, noop_open())
+            .await
+            .unwrap();
+        hub.connect().await.unwrap();
+        let generation = hub.connection().generation;
+
+        // FIRST 被 GET 过（此时全关），SECOND 从未 GET。
+        hub.session(&TargetKey {
+            session_id: FIRST.into(),
+        })
+        .await
+        .expect("first GET");
+        let mut subscriber = hub.subscribe();
+
+        // source 翻转为开：SECOND 的实时帧必须拿到开闸矩阵（不得因「不是最后 GET 的
+        // 会话」而回落到全关）。
+        open.store(true, Ordering::SeqCst);
+        pump.push_outcome(
+            Ok(()),
+            vec![live_session_view(
+                SECOND,
+                generation,
+                PendingKind::UserInput,
+            )],
+        );
+        events
+            .send(RelayEvent::Data(serde_json::json!({"seq": 1})))
+            .await
+            .unwrap();
+        let event = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            next_session_event(&mut subscriber),
+        )
+        .await
+        .expect("SECOND 帧必须发布");
+        assert_eq!(event.data["sessionId"], SECOND);
+        assert_eq!(
+            event.data["capabilities"]["singleSelect"]["enabled"], true,
+            "实时帧按本帧现算，不借用别的会话的矩阵"
+        );
+
+        // 同会话降级帧（ready=false）：必须全关，且不得沿用上一帧的开闸矩阵。
+        let mut degraded = live_session_view(SECOND, generation, PendingKind::UserInput);
+        degraded.ready = false;
+        pump.push_outcome(Ok(()), vec![degraded]);
+        events
+            .send(RelayEvent::Data(serde_json::json!({"seq": 2})))
+            .await
+            .unwrap();
+        let event = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            next_session_event(&mut subscriber),
+        )
+        .await
+        .expect("降级帧必须发布");
+        assert_eq!(
+            event.data["capabilities"],
+            serde_json::to_value(CapabilityView::default()).unwrap(),
+            "ready=false 必须全关"
+        );
+
+        // 恢复帧（ready=true）：重新按当前 source 开闸。
+        pump.push_outcome(
+            Ok(()),
+            vec![live_session_view(
+                SECOND,
+                generation,
+                PendingKind::UserInput,
+            )],
+        );
+        events
+            .send(RelayEvent::Data(serde_json::json!({"seq": 3})))
+            .await
+            .unwrap();
+        let event = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            next_session_event(&mut subscriber),
+        )
+        .await
+        .expect("恢复帧必须发布");
+        assert_eq!(event.data["capabilities"]["singleSelect"]["enabled"], true);
+
+        // 两会话**交替**读写：每帧都按当时 source 现算，既不复用本会话上一帧的
+        // 矩阵，也不借用别的会话的矩阵（复审 M4/M5）。
+        open.store(false, Ordering::SeqCst);
+        pump.push_outcome(
+            Ok(()),
+            vec![live_session_view(FIRST, generation, PendingKind::UserInput)],
+        );
+        events
+            .send(RelayEvent::Data(serde_json::json!({"seq": 4})))
+            .await
+            .unwrap();
+        let event = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            next_session_event(&mut subscriber),
+        )
+        .await
+        .expect("FIRST 帧必须发布");
+        assert_eq!(event.data["sessionId"], FIRST);
+        assert_eq!(
+            event.data["capabilities"]["singleSelect"]["enabled"], false,
+            "source 收回后 FIRST 必须立刻变关（不缓存上一帧）"
+        );
+
+        open.store(true, Ordering::SeqCst);
+        pump.push_outcome(
+            Ok(()),
+            vec![live_session_view(FIRST, generation, PendingKind::UserInput)],
+        );
+        events
+            .send(RelayEvent::Data(serde_json::json!({"seq": 5})))
+            .await
+            .unwrap();
+        let event = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            next_session_event(&mut subscriber),
+        )
+        .await
+        .expect("FIRST 恢复帧必须发布");
+        assert_eq!(
+            event.data["capabilities"]["singleSelect"]["enabled"], true,
+            "同一会话再次开闸也必须按当帧 source"
+        );
+    }
+
     /// 带事件泵 + Data 溢出观察口（`RelayLag`）的 Hub，用于验证溢出失效接线。
     fn pumped_with_lag(
         store: DeviceStore,
@@ -6516,6 +6948,7 @@ mod tests {
                     auto_resolution_state: None,
                     questions: Vec::new(),
                     options: Vec::new(),
+                    detail: None,
                 }],
                 control: Some(ControlView {
                     active_works: vec![ActiveWork {
@@ -6525,6 +6958,7 @@ mod tests {
                 }),
                 selection: None,
                 capabilities,
+                queue: QueueView::default(),
             };
         // ① 未 GET 过的会话：能力矩阵回基线全关，代际/会话/卡面全部按视图落事件。
         pump.push_outcome(Ok(()), vec![synthetic(7, generation + 9, send_policy())]);
@@ -6555,17 +6989,18 @@ mod tests {
         );
         assert_eq!(
             event.data["capabilities"],
-            serde_json::to_value(CapabilityView::default()).unwrap(),
-            "未知会话的能力矩阵必须回到基线全关（不伪造开闸）"
+            serde_json::to_value(send_policy()).unwrap(),
+            "R1：实时帧按本帧现算的策略下发（不再因「未 GET 过」回落到全关）"
         );
 
-        // ② 同一会话的后续变化：沿用 Hub 已持有的能力矩阵（GET 时现算的权威值）。
-        //    公开 GET 在普通构建只会给全关矩阵，这里直接播种上一条已发布视图。
+        // ② 同一会话的后续变化：**不**沿用 `last_session` 里上一次的矩阵，仍按本帧
+        //    现算。这里故意把 last_session 播成全关（模拟「空 GET 时无卡」），
+        //    下一帧必须是开闸——旧实现会原样沿用全关，新卡就永远答不了。
         {
             let mut inner = hub.lock();
-            let mut authoritative = inner.last_session.clone().expect("已发布会话视图");
-            authoritative.capabilities = send_policy();
-            inner.last_session = Some(authoritative);
+            let mut stale = inner.last_session.clone().expect("已发布会话视图");
+            stale.capabilities = CapabilityView::default();
+            inner.last_session = Some(stale);
         }
         pump.push_outcome(
             Ok(()),
@@ -6584,7 +7019,7 @@ mod tests {
         assert_eq!(event.data["revision"], 8);
         assert_eq!(
             event.data["capabilities"]["send"]["enabled"], true,
-            "同会话必须沿用 Hub 的能力矩阵"
+            "R1：同会话也必须按本帧现算，不得沿用 last_session 的旧矩阵"
         );
 
         // ③ 无变化的 Data：泵继续吸收，但绝不新增 Session 事件。
@@ -6639,6 +7074,7 @@ mod tests {
             control: None,
             selection: None,
             capabilities: send_policy(),
+            queue: QueueView::default(),
         };
         pump.push_outcome(
             Err(ZcodeError::of(codes::UNSUPPORTED_PROTOCOL)),
@@ -6688,6 +7124,7 @@ mod tests {
             control: None,
             selection: None,
             capabilities: CapabilityView::default(),
+            queue: QueueView::default(),
         };
         pump.push_outcome(Ok(()), vec![recovered]);
         events
@@ -6762,6 +7199,7 @@ mod tests {
             control: None,
             selection: None,
             capabilities: CapabilityView::default(),
+            queue: QueueView::default(),
         };
         pump.push_outcome(Ok(()), vec![alive]);
         events
@@ -6967,6 +7405,82 @@ mod tests {
         // 离开 paired（断开）：跟踪表清空，旧桥会话不得在重连后复活。
         hub.disconnect().await;
         assert!(hub.lock().tracked_sessions.is_empty(), "断开必须清空跟踪表");
+    }
+
+    /// 离开 paired 的逐会话降级必须把**官方输入队列**一并清成未知。
+    ///
+    /// 队列是「宿主此刻真的在排队什么」的断言：连接换代后旧队列项既不可信也不该
+    /// 继续展示（否则手机会看着上一代的待处理项等一个不存在的队列）。降级事件与
+    /// 缓存中的 `last_session` 都必须清空，而不是只在事件里装样子。
+    #[tokio::test]
+    async fn stale_sessions_clear_official_queue_across_generations() {
+        let fake = Arc::new(FakeBackend::default());
+        let (hub, events, pump, lag) = pumped_with_lag(stored(URL), fake.clone(), send_policy());
+        hub.authorize(OAuthProvider::Bigmodel, noop_open())
+            .await
+            .unwrap();
+        hub.connect().await.unwrap();
+        assert_eq!(hub.connection().state, ConnectionState::Paired);
+
+        let key = TargetKey {
+            session_id: "sess_queue_stale".into(),
+        };
+        assert!(hub.session(&key).await.expect("GET").ready);
+        // 注入一份「宿主宣告了队列」的视图（真实投影面同形）：GET 路径自身不带
+        // 队列快照（假后端的会话视图是空投影），这里只验证降级语义。
+        let queued = QueueView {
+            known: true,
+            paused: Some(true),
+            pause_reason: Some("stopped".into()),
+            items: vec![QueueItemView {
+                input_id: "queue_cmd-stale-1".into(),
+                text: "stale queued text".into(),
+                position: Some(0),
+            }],
+        };
+        {
+            let mut inner = hub.lock();
+            for view in inner.tracked_sessions.values_mut() {
+                view.queue = queued.clone();
+            }
+            inner
+                .last_session
+                .as_mut()
+                .expect("GET 后必有 last_session")
+                .queue = queued.clone();
+        }
+        let mut subscriber = hub.subscribe();
+
+        trigger_relay_lag(&events, &pump, &lag).await;
+
+        let downgraded = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            next_session_event(&mut subscriber),
+        )
+        .await
+        .expect("lag 必须发布降级 Session 事件");
+        assert_eq!(downgraded.data["ready"], false);
+        assert_eq!(
+            downgraded.data["queue"],
+            serde_json::to_value(QueueView::default()).unwrap(),
+            "降级事件必须把旧队列清成未知（known=false），不得带旧队列项"
+        );
+        assert_eq!(
+            downgraded.data["queue"]["known"], false,
+            "旧队列不得以「空队列」冒充（空 ≠ 未知）"
+        );
+        {
+            let inner = hub.lock();
+            assert!(
+                inner
+                    .last_session
+                    .as_ref()
+                    .expect("降级后仍有 last_session")
+                    .queue
+                    == QueueView::default(),
+                "缓存中的 last_session 必须同步清空队列"
+            );
+        }
     }
 
     /// relay 掉线**不换代**：离开 paired 时同样逐会话广播 ready=false（不只是
@@ -8325,6 +8839,7 @@ mod tests {
             control: None,
             selection: None,
             capabilities: CapabilityView::default(),
+            queue: QueueView::default(),
         }
     }
 
@@ -9082,6 +9597,7 @@ mod tests {
             auto_resolution_state: None,
             questions: Vec::new(),
             options: Vec::new(),
+            detail: None,
         }
     }
 

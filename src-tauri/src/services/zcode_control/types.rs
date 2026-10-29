@@ -712,6 +712,40 @@ pub struct PendingView {
     pub auto_resolution_state: Option<String>,
     pub questions: Vec<QuestionView>,
     pub options: Vec<PermissionOptionView>,
+    /// 官方 `payload.detail` 的**只读**投影（审批卡正文；Bash 即命令正文）。
+    ///
+    /// 只用于手机端展示：字符串原样，对象/数组取紧凑 JSON，缺失/空 → `None`；
+    /// 超长按 [`MAX_PENDING_DETAIL_CHARS`] 截断并加省略标记。绝不写日志/证据账本，
+    /// 也绝不回传进任何应答载荷。
+    #[serde(default)]
+    pub detail: Option<String>,
+}
+
+/// `payload.detail` 投影的长度上限（**字符**数，不是字节；截断按字符边界切，中文
+/// 不会切出半个 UTF-8 序列）。Bash 命令正文通常远小于此；超长输入只看开头足够
+/// 判断「允许/拒绝」，同时避免把巨型工具输入灌进手机视图。
+pub const MAX_PENDING_DETAIL_CHARS: usize = 2000;
+
+/// 把官方 `payload.detail` 投影成手机可读的只读正文（见 [`PendingView::detail`]）。
+///
+/// 纯函数、无副作用：不写日志、不落盘、不改输入。`null`/缺失/空串 → `None`
+/// （卡上不出现空的「查看详情」入口）；字符串原样；对象/数组等取紧凑 JSON。
+pub fn project_pending_detail(detail: Option<&Value>) -> Option<String> {
+    let value = detail?;
+    let text = match value {
+        Value::Null => return None,
+        Value::String(text) => text.clone(),
+        other => serde_json::to_string(other).ok()?,
+    };
+    if text.is_empty() {
+        return None;
+    }
+    if text.chars().count() <= MAX_PENDING_DETAIL_CHARS {
+        return Some(text);
+    }
+    let mut truncated: String = text.chars().take(MAX_PENDING_DETAIL_CHARS).collect();
+    truncated.push('…');
+    Some(truncated)
 }
 
 /// control 里的一条活动（`foregroundExecutionId` = stop 守卫 id 的来源）。
@@ -864,11 +898,18 @@ pub struct QueueItemView {
 /// - `paused=Some(false)`：`autoDrain=true`（未暂停）；`paused=Some(true)`：暂停
 ///   （`autoDrain=false`，可能带 `pauseReason`）；`paused=None`：宿主未给 `autoDrain`
 ///   → **不得**当成未暂停。
+///
+/// `pause_reason` 是官方 `pauseReason` 的**原样**透传，只可能是枚举
+/// `stopped|manual|error`（非枚举/缺席 = `None`，绝不猜原因）。官方暂停是**容器级**
+/// 状态：队列被清空后仍可能保持 `autoDrain=false`，因此「暂停且空」必须可下发。
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct QueueView {
     pub known: bool,
     pub paused: Option<bool>,
+    /// 官方暂停原因（枚举 `stopped|manual|error`）；缺席/非枚举 = `None`。
+    #[serde(default)]
+    pub pause_reason: Option<String>,
     pub items: Vec<QueueItemView>,
 }
 
@@ -887,6 +928,13 @@ pub struct SessionView {
     pub control: Option<ControlView>,
     pub selection: Option<SelectionView>,
     pub capabilities: CapabilityView,
+    /// 官方输入队列的只读投影（[`QueueView`]）。
+    ///
+    /// `#[serde(default)]`：旧载荷/旧版本手机不认识该键时按 [`QueueView::default`]
+    /// 反序列化——那是 `known=false`（未知），**不是**「空队列」。手机端同理把缺字段
+    /// 视为未知，绝不据此断言「没有排队」。
+    #[serde(default)]
+    pub queue: QueueView,
 }
 
 // ---------------------------------------------------------------------------
@@ -1057,6 +1105,152 @@ pub type CapabilitySource = Arc<dyn Fn() -> CapabilityView + Send + Sync>;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod session_view {
+        use super::*;
+
+        /// 旧载荷（R2 之前没有 `queue` 字段）必须仍可反序列化，且读出来是**未知**。
+        #[test]
+        fn legacy_payload_without_queue_deserializes_as_unknown() {
+            let legacy = serde_json::json!({
+                "sessionId": "sess_legacy",
+                "generation": 1,
+                "revision": 3,
+                "ready": true,
+                "pending": [],
+                "control": null,
+                "selection": null,
+                "capabilities": serde_json::to_value(CapabilityView::default()).unwrap(),
+            });
+            let view: SessionView = serde_json::from_value(legacy).expect("旧载荷必须仍可反序列化");
+            assert!(!view.queue.known, "缺 queue 字段 = 未知，不是空队列");
+            assert_eq!(view.queue.paused, None, "缺字段不得猜成未暂停");
+            assert!(view.queue.items.is_empty());
+        }
+
+        /// 队列的 wire 形状（camelCase）与手机 DTO 逐字段一致；身份原样透传。
+        #[test]
+        fn queue_serializes_camel_case_and_keeps_host_identity() {
+            let view = SessionView {
+                session_id: "sess_queue".to_owned(),
+                generation: 2,
+                revision: Some(5),
+                ready: true,
+                pending: Vec::new(),
+                control: None,
+                selection: None,
+                capabilities: CapabilityView::default(),
+                queue: QueueView {
+                    known: true,
+                    paused: Some(true),
+                    pause_reason: Some("stopped".to_owned()),
+                    items: vec![QueueItemView {
+                        input_id: "queue_cmd-1".to_owned(),
+                        text: "queued text".to_owned(),
+                        position: Some(0),
+                    }],
+                },
+            };
+            let value = serde_json::to_value(&view).expect("会话视图应可序列化");
+            assert_eq!(value["queue"]["known"], true);
+            assert_eq!(value["queue"]["paused"], true);
+            assert_eq!(
+                value["queue"]["pauseReason"], "stopped",
+                "官方暂停原因按 camelCase 原样下发"
+            );
+            assert_eq!(value["queue"]["items"][0]["inputId"], "queue_cmd-1");
+            assert_eq!(value["queue"]["items"][0]["text"], "queued text");
+            assert_eq!(value["queue"]["items"][0]["position"], 0);
+            // 位置缺席必须是 null（不是 0）：0 是合法位置，不能与「未知」混淆。
+            let without_position = serde_json::to_value(QueueItemView {
+                input_id: "queue_cmd-2".to_owned(),
+                text: "no position".to_owned(),
+                position: None,
+            })
+            .expect("队列项应可序列化");
+            assert!(without_position["position"].is_null());
+        }
+    }
+
+    /// R3 / R0 复审 I4：审批卡正文（`payload.detail`）的只读投影边界。
+    mod pending_detail {
+        use super::*;
+
+        /// 字符串原样透传（Bash 的 `{command}` 正文最终就是这个字符串）。
+        #[test]
+        fn string_detail_passes_through_verbatim() {
+            let value = Value::from("rm -rf /tmp/tuvis-scratch && echo done");
+            assert_eq!(
+                project_pending_detail(Some(&value)),
+                Some("rm -rf /tmp/tuvis-scratch && echo done".to_owned())
+            );
+        }
+
+        /// 对象/数组取紧凑 JSON（官方 `detail` 是 unknown，Bash 实际是 `{command,...}`）。
+        #[test]
+        fn object_and_array_details_become_compact_json() {
+            let object = serde_json::json!({"command": "ls -la", "description": "列目录"});
+            let projected = project_pending_detail(Some(&object)).expect("对象应可投影");
+            assert_eq!(projected, r#"{"command":"ls -la","description":"列目录"}"#);
+            assert!(!projected.contains('\n'), "紧凑 JSON 不带缩进换行");
+
+            let array = serde_json::json!(["a", "b"]);
+            assert_eq!(
+                project_pending_detail(Some(&array)),
+                Some(r#"["a","b"]"#.to_owned())
+            );
+        }
+
+        /// 超长截断：恰好保留上限字符 + 省略标记，且按字符边界切（中文不切半）。
+        #[test]
+        fn overlong_detail_is_truncated_with_ellipsis() {
+            let long = "命".repeat(MAX_PENDING_DETAIL_CHARS + 500);
+            let projected = project_pending_detail(Some(&Value::from(long))).expect("应可投影");
+            assert_eq!(projected.chars().count(), MAX_PENDING_DETAIL_CHARS + 1);
+            assert!(projected.ends_with('…'), "截断必须有显式省略标记");
+            assert!(projected
+                .chars()
+                .take(MAX_PENDING_DETAIL_CHARS)
+                .all(|c| c == '命'));
+
+            // 恰好等于上限：不截断、不加标记
+            let exact = "x".repeat(MAX_PENDING_DETAIL_CHARS);
+            let projected = project_pending_detail(Some(&Value::from(exact))).expect("应可投影");
+            assert_eq!(projected.chars().count(), MAX_PENDING_DETAIL_CHARS);
+            assert!(!projected.ends_with('…'));
+        }
+
+        /// 缺失/`null`/空串一律 `None`：卡上不出现空的「查看详情」入口。
+        #[test]
+        fn missing_null_and_empty_details_are_none() {
+            assert_eq!(project_pending_detail(None), None);
+            assert_eq!(project_pending_detail(Some(&Value::Null)), None);
+            assert_eq!(project_pending_detail(Some(&Value::from(""))), None);
+        }
+
+        /// wire 形状：`detail` 是 camelCase 且作为 `PendingView` 的唯一新增字段出现。
+        #[test]
+        fn detail_serializes_on_pending_view() {
+            let view = PendingView {
+                interaction_id: "pi-detail".to_owned(),
+                kind: PendingKind::Permission,
+                anchor_row_id: None,
+                tool_call_id: None,
+                created_at: None,
+                summary: None,
+                tool_name: Some("Bash".to_owned()),
+                schema_interaction: None,
+                sensitive: false,
+                auto_resolution: false,
+                auto_resolution_state: None,
+                questions: Vec::new(),
+                options: Vec::new(),
+                detail: Some("npm test".to_owned()),
+            };
+            let value = serde_json::to_value(&view).expect("pending 视图应可序列化");
+            assert_eq!(value["detail"], "npm test");
+        }
+    }
 
     mod policy {
         use super::*;

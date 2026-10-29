@@ -13,6 +13,7 @@
 | asar sha256 | `506a2d032707a584229c8e2f02f12c20…`（前 16 位 `506a2d032707a584`） |
 | 内置 CLI | `Contents/Resources/glm/zcode.cjs`，15,243,891 B，sha256 `a055234a6ca3da01…`（与 `contract.json identity.bundledCliFingerprint` 完全一致） |
 | 容器解析 | 标准 asar：`[u32=4][u32=7269396][u32=7269392][u32=7269387][JSON]`，JSON 起于 16，**data base = 7269400**；目录 27,765 文件，`/out/**` 4,218 个 |
+| 公开源码侧 | **本轮未取证**：本机无 `zai-org/ZCode` 源码 checkout，也未联网拉取固定 sha。计划要求的「公开源码与安装包不同的面分别记载」在本轮只完成了安装包一侧；凡下文未标注「源码」的结论，均只有安装包证据。 |
 | 检索方法 | ① 解析 asar 目录 → 按路径精确切片出 `/out/host/index.js`(2.0M)、`/out/main/index.js`、`/out/main/chunk-XYX2CJ3H.js`、`/out/main/chunk-ADKRHOZV.js`、`/out/scheduler/index.js`、`/out/renderer/assets/styles-n-UNIiNg.js`；② 对 341MB 原件做 `bytes.find` 全量检索并用 span 表把命中反查回「文件 + 文件内偏移」；③ 对 `zcode.cjs` 直接偏移切片。 |
 | 偏移记法 | `文件@文件内偏移 (+asar 绝对偏移)`。下文 `HOST`=`/out/host/index.js`，`XYX`=`/out/main/chunk-XYX2CJ3H.js`，`ADK`=`/out/main/chunk-ADKRHOZV.js`，`SCH`=`/out/scheduler/index.js`，`CLI`=`glm/zcode.cjs`。 |
 
@@ -187,7 +188,7 @@ _o=e.object({memoryEnabled?:bool,ttftExcluded?:"capacity",commandId,status:
 |---|---|---|
 | `parse_pending` 读 `interactionId/kind/anchorRowId/createdAt/payload.kind` 并强校验顶层=payload | `$$` | 一致 |
 | `pending_kind` 三分支（含 `workspaceHookReview`） | `kind` 枚举 | 一致 |
-| `parse_permission_options` 读 `optionId/label/kind` 且三者必填 | `ok` | 一致（但见 5.2） |
+| `parse_permission_options` 读 `optionId/label/kind`（官方卡内三者必填） | `ok` | 形状一致；**投影已改逐项宽容**（坏项跳过并计入 `invalid_option_skipped`，不再整卡丢弃，见 5.2#13） |
 | `parse_questions` 读 `question/header/options[].{value,label,description,preview}/multiSelect` | `z$`/`A$` | 一致 |
 | `parse_control` 要求 `activeWorks` 为数组、`kind` 必填、`foregroundExecutionId` 可缺 | `rk` | 一致（故意窄） |
 | snapshot 与 `state.updated` 都按「整键替换」处理 `pendingInteractions` | 官方 patch 即整数组 | 一致 |
@@ -209,6 +210,7 @@ _o=e.object({memoryEnabled?:bool,ttftExcluded?:"capacity",commandId,status:
 | 10 | control 只留 `activeWorks[].{kind,foregroundExecutionId}` | `_$`/`rk` | 丢弃 `phase/sessionEnded/canStop/stopState/stopTargetKind/lastError/apiRetry` 与 `activeWorks[].{sourceCommandId,startedAt}`；`stopTargetKind` 本是判「是否 primaryTurn」的直接依据 |
 | 11 | `classify_ack` 把 `stale`/`failed` 归入 `Unknown` | `status` 全值域含 `stale`/`failed` | 保守但语义丢失：`stale` 本可映射「刷新后重试」，`failed` 本可映射「确定失败」 |
 | 12 | 忽略 `state.pendingCommands[]`、`state.inputRouting`、`state.availability.{queueEdit,sendQueuedNow}` | 同名 | 无法在 UI 上正确置灰队列按钮 |
+| 13 | （已修，2026-10-29 R0）单个坏选项曾让整张审批卡被丢弃 | `ok`/`z$` | 已改逐项宽容 + `invalid_option_skipped` 计数；**现场「审批消失」仍未归因**（无真实帧） |
 
 ## 6. 无法证实项（如实列出，未作为结论）
 

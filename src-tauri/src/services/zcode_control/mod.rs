@@ -100,6 +100,7 @@ pub use types::{
     CapabilityFlag, CapabilitySource, CapabilityView, CommandPort, ConnectionState, ConnectionView,
     ControlAction, ControlEvent, ControlEventKind, ControlView, HostBuildProbe, HostEvidence,
     ModelChoice, PendingKind, PendingPort, PendingView, PermissionOptionView, QuestionOption,
-    QuestionView, RelaySink, SelectionPort, SelectionView, SessionView, StopPort, StopRequest,
-    TargetKey, ZResult, ZcodeError, PENDING_CLEARED_POLL, SELECTION_POLL, STOP_CLEARED_POLL,
+    QuestionView, QueueItemView, QueueView, RelaySink, SelectionPort, SelectionView, SessionView,
+    StopPort, StopRequest, TargetKey, ZResult, ZcodeError, PENDING_CLEARED_POLL, SELECTION_POLL,
+    STOP_CLEARED_POLL,
 };
