@@ -34,9 +34,9 @@ use super::auto_connect::{capture_auto_intent, write_auto_intent, AutoIntentClai
 use super::bridge::{BridgeManager, DataOutcome};
 use super::capability::{
     confirm_interrupt, confirm_pending, confirm_selection, confirm_send, resolve_capabilities,
-    Capability, CapabilityKey, CapabilityRecord, CapabilityState, ConfirmationBaseline,
-    ConfirmationContext, ConfirmationObservation, ConfirmationOutcome, ConfirmationTarget,
-    InterruptObservation, SelectionObservation, SendObservation,
+    shipped_state, Capability, CapabilityKey, CapabilityRecord, CapabilityState,
+    ConfirmationBaseline, ConfirmationContext, ConfirmationObservation, ConfirmationOutcome,
+    ConfirmationTarget, InterruptObservation, SelectionObservation, SendObservation,
 };
 use super::command::CommandSender;
 use super::config::{get_config, ConfigState};
@@ -160,7 +160,19 @@ impl ConfirmationTracker {
 
     /// 该能力是否还需要首次确认（账本无 Confirmed/Degraded/Unsupported 判决；
     /// Inconclusive/InterfaceMatched/无记录都算候选）。未装配账本 → false。
+    ///
+    /// 外部评审 I1：shipped 精确命中 Confirmed 的能力**不进**首次确认——登记面
+    /// 一开，一次动作级拒绝（会话忙/参数错/过期卡）就会经 `settle_receipt` 写成
+    /// 账本 degraded，而 resolver 里账本 degraded 优先于 shipped confirmed，等于
+    /// 一次普通失败把出厂判定的能力永久关闭且无 UI 恢复入口。shipped confirmed
+    /// 的证据等级高于首次确认，跳过。
     fn needs_confirmation(&self, key: &CapabilityKey, capability: Capability) -> bool {
+        if matches!(
+            shipped_state(key, capability),
+            Some(CapabilityState::Confirmed)
+        ) {
+            return false;
+        }
         let Some(ledger) = self.ledger.as_ref() else {
             return false;
         };
@@ -3218,12 +3230,13 @@ impl ZcodeHub {
             let target = match (action, capability) {
                 (ControlAction::Send { .. }, Capability::Send) => {
                     // 登记时刻的日志头指纹 = 「最后用户消息」基线（id 形状，非正文）。
-                    ConfirmationTarget::UserMessage {
-                        baseline_id: baseline
-                            .observation
-                            .log_fingerprint
-                            .clone()
-                            .unwrap_or_default(),
+                    // 外部评审 I2：基线**必须非空**——空串会让判据把「任意非空指纹」
+                    // 都当成「消息变化」（非消息 patch 一帧即假确认）；投影尚未给出
+                    // 日志头 = 没有消息基线，不开确认窗。
+                    let baseline_id = baseline.observation.log_fingerprint.clone();
+                    match baseline_id.filter(|id| !id.is_empty()) {
+                        Some(baseline_id) => ConfirmationTarget::UserMessage { baseline_id },
+                        None => continue,
                     }
                 }
                 (
@@ -8207,6 +8220,38 @@ mod tests {
         }
     }
 
+    /// 外部评审 I1 测试用能力 key：已知 build（shipped 表 send/model/thought/
+    /// approval_reply = Confirmed）。
+    fn known_build_key() -> CapabilityKey {
+        CapabilityKey::new("macos", "3.16.2.8769", 3, "shape", 1)
+    }
+
+    /// 外部评审 I1 测试用 baseline：已知 build key + 指纹基线 u0。
+    fn known_build_baseline() -> ConfirmationBaseline {
+        ConfirmationBaseline {
+            key: known_build_key(),
+            observation: ConfirmationObservation {
+                revision: Some(10),
+                provider: None,
+                log_fingerprint: Some("u0".to_owned()),
+                active_works: None,
+            },
+        }
+    }
+
+    /// 外部评审 I2 测试用 baseline：指纹缺席（投影尚未给出日志头）。
+    fn send_baseline_missing_fingerprint() -> ConfirmationBaseline {
+        ConfirmationBaseline {
+            key: confirmation_key(),
+            observation: ConfirmationObservation {
+                revision: Some(10),
+                provider: None,
+                log_fingerprint: None,
+                active_works: None,
+            },
+        }
+    }
+
     /// selection 确认测试的 baseline：revision 10、当前 provider。
     fn selection_baseline() -> ConfirmationBaseline {
         ConfirmationBaseline {
@@ -8331,6 +8376,84 @@ mod tests {
         assert_eq!(rows[0].reason_code, None);
         // 结构性不重发：确认窗内只派发过一次动作。
         assert_eq!(fake.execute_calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// 外部评审 I1：shipped 精确命中 Confirmed 的能力（已知 build 的 send）**不登记**
+    /// 首次确认——一次动作级拒绝/超窗（会话忙、参数错、过期卡）不得经账本 degraded
+    /// 把 shipped confirmed 永久关闭（resolver 里账本 degraded 优先于 shipped）。
+    /// 观察证据齐全也不写：登记面直接跳过，账本保持空。
+    #[tokio::test]
+    async fn shipped_confirmed_capability_skips_first_use_confirmation() {
+        let store = stored(URL);
+        let ledger: Arc<dyn CapabilityLedger> = Arc::new(DbCapabilityLedger::new(store.clone()));
+        let fake = Arc::new(FakeBackend::default());
+        fake.set_baseline(known_build_baseline());
+        let (hub, events, pump) =
+            confirmation_hub(fake.clone(), ledger.clone(), send_policy()).await;
+        let generation = hub.connection().generation;
+
+        // 登记面判定：已知 build shipped Confirmed → 不再需要首次确认；未知 build
+        // （无 shipped 命中）保持候选、仍走首次确认。
+        assert!(!hub
+            .confirmations
+            .needs_confirmation(&known_build_key(), Capability::Send));
+        assert!(hub
+            .confirmations
+            .needs_confirmation(&confirmation_key(), Capability::Send));
+
+        let receipt = hub
+            .execute(ctx("send-known-1"), send_action(generation))
+            .await
+            .expect("send 应被受理");
+        assert_eq!(receipt.state, ActionState::Accepted);
+
+        // 推进观察（指纹变化 + revision 前进）：若错误登记了首次确认，这里会写
+        // confirmed；I1 后登记面跳过，账本保持空。
+        pump.set_fingerprint("sess_synthetic0000", "u1");
+        pump.push_outcome(Ok(()), vec![changed_view("sess_synthetic0000", 11)]);
+        events
+            .send(RelayEvent::Data(serde_json::json!({"seq": 1})))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(
+            ledger.get(&known_build_key()).is_empty(),
+            "shipped confirmed 能力不登记/不落账"
+        );
+    }
+
+    /// 外部评审 I2：baseline 指纹缺席（投影未给日志头）→ send **不登记**确认。
+    /// 空 baseline 会让判据把「任意非空指纹」都当成「消息变化」——非消息 patch
+    /// （agent 输出、无关状态）推一帧就假 confirmed。登记面跳过后，确认只能等
+    /// 下一次带指纹基线的真实使用。
+    #[tokio::test]
+    async fn send_without_baseline_fingerprint_never_registers_confirmation() {
+        let store = stored(URL);
+        let ledger: Arc<dyn CapabilityLedger> = Arc::new(DbCapabilityLedger::new(store.clone()));
+        let fake = Arc::new(FakeBackend::default());
+        fake.set_baseline(send_baseline_missing_fingerprint());
+        let (hub, events, pump) =
+            confirmation_hub(fake.clone(), ledger.clone(), send_policy()).await;
+        let generation = hub.connection().generation;
+
+        let receipt = hub
+            .execute(ctx("send-nofp-1"), send_action(generation))
+            .await
+            .expect("send 应被受理");
+        assert_eq!(receipt.state, ActionState::Accepted);
+
+        // 任意非空指纹 + revision 前进：没有非空 baseline 时这不是「变化」证据。
+        pump.set_fingerprint("sess_synthetic0000", "any-later-fingerprint");
+        pump.push_outcome(Ok(()), vec![changed_view("sess_synthetic0000", 11)]);
+        events
+            .send(RelayEvent::Data(serde_json::json!({"seq": 1})))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(
+            ledger.get(&confirmation_key()).is_empty(),
+            "空 baseline 不开确认窗（指纹缺席 = 无消息基线）"
+        );
     }
 
     /// 新用户消息可见（指纹变化）+ revision 前进 → 事件泵观察确认并落账 confirmed。
