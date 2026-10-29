@@ -410,6 +410,17 @@ impl ConfirmationTracker {
                         .collect()
                 }
                 // 结果未知（写后 ACK 超窗等）→ inconclusive（保持候选）。
+                // 三轮 A：协议身份错误（`client_mismatch`）是确定性的客户端缺陷，命令
+                // 根本没被宿主执行——本次尝试零证据，与 SendFailed 同款只摘除不落账
+                // （不写 inconclusive 占槽、更不降级：身份/网络类错误不是能力失败）。
+                ActionState::Unknown
+                    if receipt.reason_code.as_deref() == Some(codes::CLIENT_MISMATCH) =>
+                {
+                    for slot in &slots {
+                        pending.remove(slot);
+                    }
+                    Vec::new()
+                }
                 ActionState::Unknown => slots
                     .iter()
                     .filter_map(|slot| pending.remove(slot).map(|ctx| (ctx, slot.1)))

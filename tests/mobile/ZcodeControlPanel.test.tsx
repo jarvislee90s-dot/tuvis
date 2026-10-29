@@ -1374,7 +1374,7 @@ function localeText(bundle: unknown, path: string): string | undefined {
 
 describe("ZCode 控制面板：原因码 zh/en 全覆盖", () => {
   it("all_reason_codes_have_zh_en_copy", () => {
-    // 冻结码表（20 码）每一码都必须映射到 zh/en 都存在的文案键（键集 = 码集）。
+    // 冻结码表（21 码）每一码都必须映射到 zh/en 都存在的文案键（键集 = 码集）。
     expect(Object.keys(ZCODE_REASON_KEYS).sort()).toEqual([...ZCODE_ERROR_CODES].sort());
     for (const code of ZCODE_ERROR_CODES) {
       const key = ZCODE_REASON_KEYS[code];

@@ -32,7 +32,7 @@ interface ZcodeControlPanelProps {
 }
 
 /**
- * 冻结原因码 → 本地化文案键（20 码全覆盖；`Record<ZcodeErrorCode, string>` 保证漏码
+ * 冻结原因码 → 本地化文案键（21 码全覆盖；`Record<ZcodeErrorCode, string>` 保证漏码
  * 在编译期报错）。码本身只进 `data-reason-code`，用户只看到这里的本地化文案。
  */
 export const ZCODE_REASON_KEYS: Record<ZcodeErrorCode, string> = {
@@ -45,6 +45,8 @@ export const ZCODE_REASON_KEYS: Record<ZcodeErrorCode, string> = {
   unsupported_protocol: "mobile.zcodeControl.reasonUnsupportedProtocol",
   // 账本/静态知识判死的**永久**不支持（Rust codes::UNSUPPORTED）：给专文案，不落中性兜底。
   unsupported: "mobile.zcodeControl.reasonUnsupported",
+  // 协议身份不一致（命令 clientId ≠ 握手身份）：确定性客户端缺陷，提示升级/反馈，不重试。
+  client_mismatch: "mobile.zcodeControl.reasonClientMismatch",
   needs_evidence: "mobile.zcodeControl.reasonNeedsEvidence",
   no_session: "mobile.zcodeControl.reasonNoSession",
   target_ambiguous: "mobile.zcodeControl.reasonTargetAmbiguous",

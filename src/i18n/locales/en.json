@@ -2254,6 +2254,7 @@
       "reasonNotReady": "Control is not ready yet — try again shortly",
       "reasonUnsupportedProtocol": "This interaction type is not supported yet — handle it in the terminal",
       "reasonUnsupported": "This action is not supported yet",
+      "reasonClientMismatch": "Protocol identity mismatch; update Tuvis and try again",
       "reasonNeedsEvidence": "This action still needs confirmation in the terminal — continue there",
       "reasonNoSession": "No bindable ZCode session found — open it on your computer first",
       "reasonTargetAmbiguous": "Multiple tasks can be interrupted — choose one in the terminal",

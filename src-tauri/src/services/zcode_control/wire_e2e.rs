@@ -37,8 +37,8 @@ mod tests {
         WORKSPACE_BRIDGE_OPEN, WORKSPACE_BRIDGE_READY, WORKSPACE_LIST_REQUEST,
     };
     use super::super::codec::{
-        decode_channel, encode_frame, encode_response_for_test, RpcIdentity,
-        REQUEST_TYPE_EVENT_LISTEN, REQUEST_TYPE_PROMISE, RESPONSE_TYPE_EVENT_FIRE,
+        decode_channel, encode_frame, encode_promise_error_for_test, encode_response_for_test,
+        RpcIdentity, REQUEST_TYPE_EVENT_LISTEN, REQUEST_TYPE_PROMISE, RESPONSE_TYPE_EVENT_FIRE,
     };
     use super::super::command::{
         AGENT_SEND_COMMAND_METHOD, RESOLVE_INTERACTION_TYPE, SEND_TEXT_TYPE,
@@ -50,7 +50,7 @@ mod tests {
     use super::super::relay::{DeviceRoute, RelayClient, RelayEvent};
     use super::super::types::{
         codes, CapabilityFlag, CapabilityView, ConnectionState, ControlEventKind, HostBuildProbe,
-        TargetKey, ZResult,
+        TargetKey, ZResult, PROTOCOL_CLIENT_ID,
     };
     use crate::database::dao::settings::try_set_setting_conn;
     use crate::database::{migration, schema};
@@ -185,6 +185,10 @@ mod tests {
         model_catalog: Arc<Mutex<Option<serde_json::Value>>>,
         /// P2 回归注入：后续会话快照的 `config.model` 覆盖（见 FakeHostState）。
         snapshot_model: Arc<Mutex<Option<String>>>,
+        /// 三轮 A：握手身份 / 严格校验 / 注入 fault（见 FakeHostState）。
+        handshake_client_id: Arc<Mutex<Option<String>>>,
+        strict_client_identity: Arc<Mutex<bool>>,
+        command_fault: Arc<Mutex<Option<String>>>,
         /// `drop_link()` 的断链信号：每条连接 select 它，收到即发 Close 并收尾。
         drop_tx: tokio::sync::broadcast::Sender<()>,
         task: tokio::task::JoinHandle<()>,
@@ -230,6 +234,22 @@ mod tests {
         /// 须在触发该帧的动作前设定）。
         fn set_snapshot_model(&self, model: &str) {
             *self.snapshot_model.lock().expect("快照模型锁") = Some(model.to_owned());
+        }
+
+        /// 三轮 A：开启严格身份校验（须在 connect 前设定；握手身份在 clientHello
+        /// 到达时记录）。
+        fn set_strict_client_identity(&self, strict: bool) {
+            *self.strict_client_identity.lock().expect("严格身份锁") = strict;
+        }
+
+        /// 三轮 A：对写命令无条件回 202 指定 fault code（本地分类用例）。
+        fn set_command_fault(&self, code: &str) {
+            *self.command_fault.lock().expect("fault 锁") = Some(code.to_owned());
+        }
+
+        /// 三轮 A：clientHello 宣告的 clientId（断言命令身份与握手一致）。
+        fn handshake_client_id(&self) -> Option<String> {
+            self.handshake_client_id.lock().expect("握手身份锁").clone()
         }
 
         /// 从假体侧主动断链：已建立的连接收到 Close（生产 relay 观察到掉线，但
@@ -287,6 +307,12 @@ mod tests {
         let model_catalog_per_conn = model_catalog.clone();
         let snapshot_model = Arc::new(Mutex::new(None));
         let snapshot_model_per_conn = snapshot_model.clone();
+        let handshake_client_id = Arc::new(Mutex::new(None));
+        let handshake_client_id_per_conn = handshake_client_id.clone();
+        let strict_client_identity = Arc::new(Mutex::new(false));
+        let strict_client_identity_per_conn = strict_client_identity.clone();
+        let command_fault = Arc::new(Mutex::new(None));
+        let command_fault_per_conn = command_fault.clone();
         let (drop_tx, _keep_drop_rx) = tokio::sync::broadcast::channel(8);
         let drop_signal = drop_tx.clone();
         let task = tokio::spawn(async move {
@@ -305,6 +331,9 @@ mod tests {
                         pending_card: pending_card_per_conn.clone(),
                         model_catalog: model_catalog_per_conn.clone(),
                         snapshot_model: snapshot_model_per_conn.clone(),
+                        handshake_client_id: handshake_client_id_per_conn.clone(),
+                        strict_client_identity: strict_client_identity_per_conn.clone(),
+                        command_fault: command_fault_per_conn.clone(),
                     },
                     drop_signal.subscribe(),
                 ));
@@ -320,6 +349,9 @@ mod tests {
             pending_card,
             model_catalog,
             snapshot_model,
+            handshake_client_id,
+            strict_client_identity,
+            command_fault,
             drop_tx,
             task,
         }
@@ -516,6 +548,9 @@ mod tests {
             pending_card,
             model_catalog,
             snapshot_model,
+            handshake_client_id,
+            strict_client_identity,
+            command_fault,
         } = host;
         let bridge = payload
             .get("bridgeSessionId")
@@ -535,12 +570,59 @@ mod tests {
         match message_type {
             REQUEST_TYPE_PROMISE => {
                 log.lock().expect("app 请求日志锁").push(method.clone());
+                // 三轮 A：记录 clientHello 宣告的协议身份（官方以它为命令身份基准）。
+                if method == AGENT_CLIENT_HELLO_METHOD {
+                    if let Ok(message) = decode_channel(&bytes) {
+                        if let Some(id) = message
+                            .body
+                            .get(0)
+                            .and_then(|hello| hello.get("clientId"))
+                            .and_then(|value| value.as_str())
+                        {
+                            *handshake_client_id.lock().expect("握手身份锁") = Some(id.to_owned());
+                        }
+                    }
+                }
+                let mut command_client_id: Option<String> = None;
                 if method == AGENT_SEND_COMMAND_METHOD {
                     // 只记录解出的命令信封（正文/身份都在里面），供断言「恰一帧、
-                    // 正文原样离机、clientId 来自配对设备」。
+                    // 正文原样离机、clientId 与握手身份一致」。
                     if let Ok(message) = decode_channel(&bytes) {
-                        let envelope = message.body.get(0).cloned().unwrap_or_default();
-                        commands.lock().expect("写命令日志锁").push(envelope);
+                        // body[0] = `{workspacePath, envelope}`（生产 CommandPort 适配层
+                        // 产物）；协议身份在内层 envelope.clientId。
+                        let wrapper = message.body.get(0).cloned().unwrap_or_default();
+                        command_client_id = wrapper
+                            .get("envelope")
+                            .and_then(|envelope| envelope.get("clientId"))
+                            .and_then(|value| value.as_str())
+                            .map(str::to_owned);
+                        commands.lock().expect("写命令日志锁").push(wrapper);
+                    }
+                }
+                // 三轮 A：写命令的 202 fault 路径——注入 fault 或严格身份校验失败
+                // （信封 clientId ≠ clientHello 身份）→ 官方语义 `fault.command.clientMismatch`。
+                if method == AGENT_SEND_COMMAND_METHOD {
+                    let injected = command_fault.lock().expect("fault 锁").clone();
+                    let mismatch = *strict_client_identity.lock().expect("严格身份锁")
+                        && handshake_client_id
+                            .lock()
+                            .expect("握手身份锁")
+                            .as_deref()
+                            .is_some_and(|handshake| {
+                                command_client_id.as_deref() != Some(handshake)
+                            });
+                    let fault_code = injected
+                        .or_else(|| mismatch.then(|| "fault.command.clientMismatch".to_owned()));
+                    if let Some(code) = fault_code {
+                        let body = serde_json::json!({
+                            "code": code,
+                            "message": "synthetic upstream text that must never leak",
+                        });
+                        let Ok(reply) = encode_promise_error_for_test(id, body) else {
+                            return;
+                        };
+                        send_data(socket, peer.frame(&bridge, reply)).await;
+                        return;
                     }
                 }
                 let conversation_session = if method == AGENT_SUBSCRIBE_CONVERSATION_METHOD {
@@ -745,6 +827,14 @@ mod tests {
         /// P2 回归注入：后续会话快照（ACK 跟进帧）的 `config.model` 覆盖。
         /// None = 合成默认 `synthetic-model-a`。
         snapshot_model: Arc<Mutex<Option<String>>>,
+        /// 三轮 A（协议身份）：clientHello 宣告的 clientId（官方宿主以它为后续
+        /// 命令的身份基准）。None = 尚未握手。
+        handshake_client_id: Arc<Mutex<Option<String>>>,
+        /// 三轮 A：严格身份校验开关——开启后写命令信封 `clientId` ≠ 握手身份即回
+        /// 202 `fault.command.clientMismatch`（模拟官方实际行为），而非无条件 ACK。
+        strict_client_identity: Arc<Mutex<bool>>,
+        /// 三轮 A：对写命令无条件回指定 fault code 的 202（本地错误分类用例）。
+        command_fault: Arc<Mutex<Option<String>>>,
     }
 
     /// 单条回环 WS 连接的握手/心跳应答（配对即刻完成）、app 请求分派与数据面回显。
@@ -2000,8 +2090,8 @@ mod tests {
             "正文必须原样离机（签名缺省关闭）"
         );
         assert_eq!(
-            envelope["clientId"], DEVICE_ID,
-            "clientId 只来自配对门，不来自请求体"
+            envelope["clientId"], PROTOCOL_CLIENT_ID,
+            "协议 clientId 与握手同源（三轮 A）；手机 device_id 只留在 Tuvis 侧归属"
         );
         assert_eq!(envelope["sessionId"], SYNTHETIC_TASK_ID);
         assert_eq!(
@@ -2136,7 +2226,7 @@ mod tests {
             envelope["payload"]["text"], SEND_TEXT,
             "正文必须原样离机，绝不携带探针文本"
         );
-        assert_eq!(envelope["clientId"], DEVICE_ID);
+        assert_eq!(envelope["clientId"], PROTOCOL_CLIENT_ID);
         assert_eq!(chain.injector.calls(), 0, "官方路径不得回落终端注入");
 
         // ---- 3) revision 前进：send 后会话水位推进（宿主状态前进的可观察证据）----
@@ -2348,6 +2438,131 @@ mod tests {
         assert_eq!(rows, 0, "已知 build shipped confirmed 零账本行");
     }
 
+    /// 三轮 A 回归 e2e：**严格假宿主执行官方身份校验**——写命令信封 `clientId`
+    /// 必须等于 clientHello 宣告的握手身份（官方对不一致回
+    /// `fault.command.clientMismatch`）。旧实现命令信封用手机 device_id（≠ 握手
+    /// 身份 `tuvis-remote`），严格宿主下全部写动作被拒；修复后命令与握手同源，
+    /// 手机 device_id 只留在 Tuvis 侧（配对/审计/幂等归属）。
+    #[tokio::test]
+    async fn strict_host_enforces_handshake_client_identity() {
+        let chain = resolver_chain(Arc::new(|| Some("9.9.9.9999".to_owned()))).await;
+        // 严格身份校验在连接建立前开启：握手身份被记录，命令信封逐一核对。
+        chain.ws.set_strict_client_identity(true);
+        let app = router(remote_state(
+            &chain.conn,
+            chain.hub.clone(),
+            chain.injector.clone(),
+        ));
+
+        let session = bind_and_wait_ready(&app, SYNTHETIC_TASK_ID).await;
+        assert_eq!(
+            session["capabilities"]["send"]["enabled"], true,
+            "{session}"
+        );
+        let generation = chain.hub.connection().generation;
+
+        // 真实 send：严格宿主只放行与握手身份一致的命令。
+        let (status, receipt) =
+            post_action(&app, &send_body(ACTION_ID, generation, SEND_TEXT)).await;
+        assert_eq!(status, StatusCode::OK, "{receipt}");
+        assert_eq!(
+            receipt["state"], "accepted",
+            "命令身份与握手一致时必须被严格宿主受理：{receipt}"
+        );
+        assert_eq!(chain.injector.calls(), 0, "不得回落终端注入");
+
+        // 命令信封身份 == clientHello 宣告身份（同一来源，逐字段断言）。
+        let handshake = chain
+            .ws
+            .handshake_client_id()
+            .expect("clientHello 必须宣告协议身份");
+        assert!(!handshake.is_empty());
+        let envelope = &chain.ws.commands()[0]["envelope"];
+        assert_eq!(
+            envelope["clientId"], handshake,
+            "命令协议身份必须与握手同源（不得混入手机 device_id）：{envelope}"
+        );
+        assert_ne!(
+            envelope["clientId"], DEVICE_ID,
+            "手机 device_id 不得进入协议信封"
+        );
+        assert_eq!(envelope["type"], SEND_TEXT_TYPE);
+        assert_eq!(envelope["payload"]["text"], SEND_TEXT);
+
+        // 手机 device_id 仍用于 Tuvis 侧归属：zcode_actions 行的 device = 配对设备。
+        let device_rows: i64 = chain.store.with(|c| {
+            c.query_row(
+                "SELECT COUNT(*) FROM zcode_actions WHERE device_id = ?1 AND state = 'accepted'",
+                rusqlite::params![DEVICE_ID],
+                |r| r.get(0),
+            )
+            .expect("zcode_actions 查询")
+        });
+        assert_eq!(device_rows, 1, "动作归属必须是配对手机 device_id");
+    }
+
+    /// 三轮 A 回归 e2e：官方 `fault.command.clientMismatch`（202）必须被**本地分类**为
+    /// 冻结码 `client_mismatch`——不透传上游原文、不自动重发、不写能力账本（身份
+    /// 错误不是能力失败，不得把 build 误判为不支持该能力）。
+    #[tokio::test]
+    async fn client_mismatch_fault_classifies_locally_without_resend_or_degrade() {
+        let chain = resolver_chain(Arc::new(|| Some("9.9.9.9999".to_owned()))).await;
+        // 无条件回 202 clientMismatch（模拟官方对身份不一致的拒绝）。
+        chain.ws.set_command_fault("fault.command.clientMismatch");
+        let app = router(remote_state(
+            &chain.conn,
+            chain.hub.clone(),
+            chain.injector.clone(),
+        ));
+        let _session = bind_and_wait_ready(&app, SYNTHETIC_TASK_ID).await;
+        let generation = chain.hub.connection().generation;
+
+        let (status, receipt) =
+            post_action(&app, &send_body(ACTION_ID, generation, SEND_TEXT)).await;
+        assert_eq!(status, StatusCode::OK, "{receipt}");
+        assert_eq!(
+            receipt["state"], "unknown",
+            "身份错误不伪装成 accepted：{receipt}"
+        );
+        assert_eq!(
+            receipt["reasonCode"],
+            codes::CLIENT_MISMATCH,
+            "必须是本地冻结分类，而非笼统 unknown：{receipt}"
+        );
+        let rendered = receipt.to_string();
+        assert!(
+            !rendered.contains("synthetic upstream text"),
+            "上游原文绝不透传到回执：{rendered}"
+        );
+
+        // 不自动重发：静置后仍恰一帧命令；不回落终端注入。
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(chain.ws.commands().len(), 1, "身份错误不得触发重发");
+        assert_eq!(chain.injector.calls(), 0);
+
+        // 不写能力账本：身份/网络类错误不是能力失败，send 保持候选。
+        let key = ledger_key_prefix("9.9.9.9999");
+        let rows: i64 = chain.store.with(|c| {
+            c.query_row(
+                "SELECT COUNT(*) FROM zcode_capability_evidence WHERE key LIKE ?1 || '%'",
+                [&key],
+                |r| r.get(0),
+            )
+            .expect("count")
+        });
+        assert_eq!(rows, 0, "身份错误不得写 degraded/任何账本行");
+        let (status, session) = get_json(
+            &app,
+            &format!("/m/api/v1/zcode/session?sessionId={SYNTHETIC_TASK_ID}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            session["capabilities"]["send"]["enabled"], true,
+            "send 能力不因身份错误被关闭：{session}"
+        );
+    }
+
     /// 外部评审 P2 回归 e2e：**实时广播不得覆盖合并目录**。
     ///
     /// GET 经读路径合并 `getView` 目录；随后宿主推一条正常快照（revision 2、换
@@ -2528,7 +2743,7 @@ mod tests {
             ANSWER_OPTION_VALUE,
             "单选答案以宿主题干为键、回传宿主原值：{envelope}"
         );
-        assert_eq!(envelope["clientId"], DEVICE_ID);
+        assert_eq!(envelope["clientId"], PROTOCOL_CLIENT_ID);
         assert_eq!(chain.injector.calls(), 0, "官方路径不得回落终端注入");
 
         // ---- 3) 宿主撤卡 + revision 前进：GET 会话 pending 清空、水位 2 ----

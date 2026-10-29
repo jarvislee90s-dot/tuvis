@@ -105,7 +105,7 @@ use super::selection::build_selection_command;
 use super::types::{
     codes, ActionContext, ActionReceipt, ActionState, ActiveWork, BoundTarget, CapabilitySource,
     CapabilityView, CommandPort, ControlAction, PendingPort, SelectionPort, SessionView, StopPort,
-    StopRequest, ZResult, ZcodeError,
+    StopRequest, ZResult, ZcodeError, PROTOCOL_CLIENT_ID,
 };
 
 /// 官方发送方法名（`zcodeAgent.ts:937`、探针 `SendOnceLoop`）。
@@ -786,7 +786,7 @@ impl CommandSender {
             }
         }
         let result = pending
-            .snooze(target, interaction_id, &ctx.device_id, self.ack_timeout)
+            .snooze(target, interaction_id, PROTOCOL_CLIENT_ID, self.ack_timeout)
             .await;
         // snooze 不消费卡：用户之后仍要作答，必须放开本地在途闸。
         pending.clear_local_inflight(target, interaction_id);
@@ -1069,7 +1069,9 @@ impl CommandSender {
             return Err(invalid_action());
         };
         object.insert("commandId".to_owned(), Value::from(new_command_id()));
-        object.insert("clientId".to_owned(), Value::from(ctx.device_id.clone()));
+        // 协议身份与握手同源（types::PROTOCOL_CLIENT_ID）；device_id 只用于
+        // Tuvis 侧归属（幂等身份/审计），官方按握手身份校验命令。
+        object.insert("clientId".to_owned(), Value::from(PROTOCOL_CLIENT_ID));
         object.insert(
             "sessionId".to_owned(),
             Value::from(target.session_id.clone()),
@@ -1158,7 +1160,7 @@ impl CommandSender {
             return None;
         }
         if let Err(error) = pending
-            .snooze(target, interaction_id, &ctx.device_id, self.ack_timeout)
+            .snooze(target, interaction_id, PROTOCOL_CLIENT_ID, self.ack_timeout)
             .await
         {
             // resolve 从未写出（可证明零写）：释放在途允许重试；snooze 本身幂等
@@ -1302,8 +1304,8 @@ impl CommandSender {
     ) -> ActionReceipt {
         let envelope = serde_json::json!({
             "commandId": new_command_id(),
-            // clientId 只来自可信调用方上下文（配对门/本机 DB）。
-            "clientId": ctx.device_id,
+            // 协议身份与握手同源；device_id 不进协议信封（官方校验握手身份）。
+            "clientId": PROTOCOL_CLIENT_ID,
             "sessionId": target.session_id,
             "type": RESOLVE_INTERACTION_TYPE,
             "payload": { "interactionId": interaction_id, "answer": answer },
@@ -1337,8 +1339,8 @@ impl CommandSender {
     ) -> ActionReceipt {
         let envelope = serde_json::json!({
             "commandId": new_command_id(),
-            // clientId 只来自可信调用方上下文（配对门/本机 DB）。
-            "clientId": ctx.device_id,
+            // 协议身份与握手同源；device_id 不进协议信封（官方校验握手身份）。
+            "clientId": PROTOCOL_CLIENT_ID,
             "sessionId": target.session_id,
             "type": STOP_TYPE,
             "payload": { "expectedForegroundExecutionId": execution_id },
@@ -1398,8 +1400,8 @@ impl CommandSender {
     ) -> ActionReceipt {
         let envelope = serde_json::json!({
             "commandId": new_command_id(),
-            // clientId 只来自可信调用方上下文（配对门/本机 DB），绝不取手机任意字段。
-            "clientId": ctx.device_id,
+            // 协议身份与握手同源；device_id 不进协议信封（官方校验握手身份）。
+            "clientId": PROTOCOL_CLIENT_ID,
             "sessionId": target.session_id,
             "type": SEND_TEXT_TYPE,
             "payload": { "text": text },
@@ -2408,7 +2410,7 @@ mod tests {
                 "type"
             ]
         );
-        assert_eq!(envelope["clientId"], serde_json::json!(DEVICE));
+        assert_eq!(envelope["clientId"], serde_json::json!(PROTOCOL_CLIENT_ID));
         assert_eq!(envelope["sessionId"], serde_json::json!(SESSION));
         assert_eq!(envelope["type"], serde_json::json!("sendText"));
         let payload = envelope["payload"].as_object().expect("payload");
@@ -3299,7 +3301,7 @@ mod tests {
                 }),
                 "resolve 载荷必须是宿主原值形状"
             );
-            assert_eq!(envelope["clientId"], json!(DEVICE));
+            assert_eq!(envelope["clientId"], json!(PROTOCOL_CLIENT_ID));
             assert_eq!(envelope["sessionId"], json!(SESSION));
             assert!(envelope["issuedAt"].as_i64().unwrap() >= 1_700_000_000_000);
             assert_eq!(
@@ -3509,11 +3511,11 @@ mod tests {
             assert_eq!(pending.snooze_calls(), 1, "snooze 恰一帧");
             assert_eq!(
                 pending.snooze_clients(),
-                vec![DEVICE.to_owned()],
-                "snooze 的 clientId 必须与 resolve 同源（可信设备 id）"
+                vec![PROTOCOL_CLIENT_ID.to_owned()],
+                "snooze 的 clientId 必须与 resolve/握手同源（协议身份，非设备 id）"
             );
             assert_eq!(resolve_frames(&fake).len(), 1, "noop 后仍必须 resolve");
-            assert_eq!(fake.envelope(0)["clientId"], json!(DEVICE));
+            assert_eq!(fake.envelope(0)["clientId"], json!(PROTOCOL_CLIENT_ID));
         }
 
         /// snooze 被宿主显式拒绝：硬失败，零 resolve，释放在途（可重试）。
@@ -3746,7 +3748,11 @@ mod tests {
                 .unwrap();
             assert_eq!(receipt.state, ActionState::Accepted);
             assert_eq!(pending.snooze_calls(), 1);
-            assert_eq!(pending.snooze_clients(), vec![DEVICE.to_owned()]);
+            // snooze 的协议身份同样与握手同源（三轮 A）。
+            assert_eq!(
+                pending.snooze_clients(),
+                vec![PROTOCOL_CLIENT_ID.to_owned()]
+            );
             assert!(!pending.inflight("ix-1"), "snooze 不消费卡，必须释放在途");
             assert!(pending.host_has_pending(&target(), "ix-1"));
             assert_eq!(resolve_frames(&fake).len(), 0);
@@ -4201,7 +4207,10 @@ mod tests {
             );
             assert_eq!(stop_frames[0]["type"], serde_json::json!(STOP_TYPE));
             assert_eq!(stop_frames[0]["sessionId"], serde_json::json!(SESSION));
-            assert_eq!(stop_frames[0]["clientId"], serde_json::json!(DEVICE));
+            assert_eq!(
+                stop_frames[0]["clientId"],
+                serde_json::json!(PROTOCOL_CLIENT_ID)
+            );
             assert!(stop_frames[0].get("baseRevision").is_none(), "stop 免 CAS");
 
             let frames = fake.frames();
@@ -5193,7 +5202,7 @@ mod tests {
                 json!({ "optionId": "once-id-9" }),
                 "应答必须是宿主原值 optionId"
             );
-            assert_eq!(envelope["clientId"], json!(DEVICE));
+            assert_eq!(envelope["clientId"], json!(PROTOCOL_CLIENT_ID));
             assert_eq!(envelope["sessionId"], json!(SESSION));
             assert_eq!(
                 fake.observed_timeouts(),
@@ -6067,7 +6076,7 @@ mod tests {
             );
             assert_eq!(envelope.get("baseRevision"), Some(&Value::from(REVISION)));
             assert!(envelope.get("baseLogEpoch").is_none());
-            assert_eq!(envelope["clientId"], Value::from(DEVICE));
+            assert_eq!(envelope["clientId"], Value::from(PROTOCOL_CLIENT_ID));
             assert_eq!(envelope["sessionId"], Value::from(SESSION));
             assert!(envelope["commandId"]
                 .as_str()

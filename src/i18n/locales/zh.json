@@ -2254,6 +2254,7 @@
       "reasonNotReady": "控制尚未就绪，请稍后重试",
       "reasonUnsupportedProtocol": "该交互形态暂不支持，请在终端处理",
       "reasonUnsupported": "暂不支持该操作",
+      "reasonClientMismatch": "协议身份不一致，请更新 Tuvis 后重试",
       "reasonNeedsEvidence": "该操作还需终端侧确认，请在终端处理",
       "reasonNoSession": "未找到可绑定的 ZCode 会话，请先在电脑端打开",
       "reasonTargetAmbiguous": "当前有多个可打断的任务，请在终端选择",

@@ -53,7 +53,7 @@ use super::selection::parse_selection_view;
 use super::types::{
     codes, BoundTarget, CommandPort, HostBuildProbe, HostEvidence, PendingKind, PendingPort,
     PendingView, RelaySink, SelectionPort, SelectionView, SessionView, StopPort, TargetKey,
-    ZResult, ZcodeError,
+    ZResult, ZcodeError, PROTOCOL_CLIENT_ID,
 };
 
 /// agent 服务 channel（`channels.ts:114`）。
@@ -158,9 +158,6 @@ impl BridgeLimits {
 const CLIENT_KIND: &str = "web";
 /// clientHello 的 appVersion（Tuvis 版本标识，不含机器/账号信息）。
 const APP_VERSION: &str = "tuvis";
-/// clientHello 的 clientId（稳定、无秘密）。
-const CLIENT_ID: &str = "tuvis-remote";
-
 fn unsupported() -> ZcodeError {
     ZcodeError::of(codes::UNSUPPORTED_PROTOCOL)
 }
@@ -2692,7 +2689,7 @@ impl Shared {
                         "protocolVersion".to_owned(),
                         Value::from(V4_WIRE_PROTOCOL_VERSION),
                     ),
-                    ("clientId".to_owned(), Value::from(CLIENT_ID)),
+                    ("clientId".to_owned(), Value::from(PROTOCOL_CLIENT_ID)),
                     ("clientKind".to_owned(), Value::from(CLIENT_KIND)),
                     ("appVersion".to_owned(), Value::from(APP_VERSION)),
                 ]
@@ -3063,7 +3060,15 @@ impl Shared {
             Ok(Ok(message)) => {
                 if message.message_type == RESPONSE_TYPE_PROMISE_ERROR {
                     // 上游原文（可能含路径/正文）绝不下发，只映射冻结码。
-                    Err(ZcodeError::unknown())
+                    // 三轮 A：身份不一致是确定性客户端缺陷（命令 clientId ≠ 握手
+                    // 身份），单独分类便于定位；同样不透传上游原文，且不属于能力
+                    // 失败（不降级能力，走既有 Err 路径零落账、不重发）。
+                    let fault = message.body.get("code").and_then(Value::as_str);
+                    if fault.is_some_and(|code| code.contains("clientMismatch")) {
+                        Err(ZcodeError::of(codes::CLIENT_MISMATCH))
+                    } else {
+                        Err(ZcodeError::unknown())
+                    }
                 } else {
                     Ok(message)
                 }
