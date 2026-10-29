@@ -179,6 +179,87 @@ const i18nLang = () => i18n.language;
 const changeLang = (lang: string) => i18n.changeLanguage(lang);
 
 describe("ZCode 面板：附件接入（三轮 C）", () => {
+  it("二轮 P2-2：延迟 ACK 期间续写草稿 → accepted 只清附件、草稿保留，再发不带旧附件", async () => {
+    // actions POST 挂起：回执延迟到续写之后才放行（accepted）。
+    let releaseActions: ((actionId: string) => void) | null = null;
+    const waiters: string[] = [];
+    const deferredBodies: (string | undefined)[] = [];
+    installXhr();
+    fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.startsWith("/m/api/v1/zcode/connection")) return json(connection());
+      if (url.startsWith("/m/api/v1/zcode/session?")) return json(sessionView());
+      if (url === ZCODE_ACTIONS_PATH && init?.method === "POST") {
+        const body = JSON.parse(String(init.body)) as { actionId: string };
+        deferredBodies.push(init?.body as string | undefined);
+        waiters.push(body.actionId);
+        return new Promise((resolve) => {
+          releaseActions = (id: string) => {
+            const idx = waiters.indexOf(id);
+            resolve(
+              json({ actionId: id, state: idx === 0 ? "accepted" : "accepted", reasonCode: null })
+            );
+          };
+        });
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    render(<ZcodeControlPanel sessionId={SID} />);
+    const draft = (await screen.findByTestId("zcode-draft")) as HTMLTextAreaElement;
+    await attachOneFile();
+
+    // 发送「A + 附件」→ 不放行回执。
+    fireEvent.change(draft, { target: { value: "A" } });
+    fireEvent.click(screen.getByTestId("zcode-send"));
+    await waitFor(() => expect(waiters).toHaveLength(1));
+
+    // 等待期间续写 B（草稿已变化）。
+    fireEvent.change(draft, { target: { value: "B" } });
+
+    // 放行 accepted：附件（本次提交批次）必须清，草稿 B 保留。
+    await act(async () => {
+      releaseActions?.(waiters[0]);
+    });
+    await waitFor(() => expect(screen.queryByTestId("zcode-attachment")).toBeNull());
+    expect((screen.getByTestId("zcode-draft") as HTMLTextAreaElement).value).toBe("B");
+
+    // 再发 B：正文恰为 B，不再携带旧附件引用。
+    fireEvent.click(screen.getByTestId("zcode-send"));
+    await waitFor(() => expect(waiters).toHaveLength(2));
+    await act(async () => {
+      releaseActions?.(waiters[1]);
+    });
+    const texts = deferredBodies.map((b) =>
+      String((JSON.parse(String(b)) as { action: { text?: string } }).action.text ?? "")
+    );
+    expect(texts[1]).toBe("B");
+    expect(texts[1]).not.toContain("<image path=");
+  });
+
+  it("二轮 P2-1：离开页面（组件卸载）取消在途上传", async () => {
+    installFetch((actionId) => ({ actionId, state: "accepted", reasonCode: null }));
+    const aborted: boolean[] = [];
+    const { unmount } = render(<ZcodeControlPanel sessionId={SID} />);
+    await screen.findByTestId("zcode-draft");
+    await attachOneFile((xhr) => {
+      const original = xhr.abort.bind(xhr);
+      xhr.abort = () => {
+        aborted.push(true);
+        original();
+      };
+      // 挂起：不放行
+    });
+    expect(screen.getByTestId("zcode-attachment").getAttribute("data-status")).toBe("uploading");
+
+    // 实际挂载点以会话 id 为 key（SessionDetail）：切会话 = 卸载整个组件，
+    // 卸载必须与「换 sessionId prop」同语义——取消在途上传。
+    unmount();
+    expect(aborted).toHaveLength(1);
+  });
+});
+
+describe("ZCode 面板：附件接入（三轮 C）", () => {
   it("ready 附件随 send 进正文并按 accepted 清条目；零旧通道", async () => {
     installFetch((actionId) => ({ actionId, state: "accepted", reasonCode: null }));
     render(<ZcodeControlPanel sessionId={SID} />);

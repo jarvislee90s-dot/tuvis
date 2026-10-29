@@ -462,16 +462,17 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
   useEffect(() => {
     if (!draftCleared) return;
     const submitted = submittedDraftRef.current;
-    // 竞态守卫先取比较结果（草稿被续写 → 那是新输入，草稿与附件都保留）。
+    // 竞态守卫：草稿被续写 → 那是新输入，草稿保留。
     const unchanged = submitted !== null && draftRef.current === submitted;
     if (unchanged) {
       draftRef.current = "";
       setDraft("");
     }
-    // 三轮 C：send accepted 时只清「随本次发送」的附件条目；草稿被续写时附件同样
-    // 保留——它们属于未确认发出的那份内容。
+    // 三轮评审 P2-2：附件清理**独立于草稿**——已上传并引用进已发送正文的附件属
+    // 本次提交，accepted 即按提交批次 id 清除（续加的新附件保留）；文字才按是否
+    // 续写决定去留。否则续写期间 accepted 会把旧附件留到下一次发送重复携带。
     const sentIds = submittedAttachmentIdsRef.current;
-    if (unchanged && sentIds !== null) {
+    if (sentIds !== null) {
       submittedAttachmentIdsRef.current = null;
       setAttachments((prev) => prev.filter((a) => !sentIds.includes(a.id)));
     }
@@ -483,9 +484,7 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
     setDraft("");
     draftRef.current = "";
     submittedDraftRef.current = null;
-    // 三轮 C：附件与在途上传同样不跨会话残留（取消在途 XHR，防止串盘）。
-    for (const ctrl of uploadCtrlsRef.current.values()) ctrl.abort();
-    uploadCtrlsRef.current.clear();
+    // 三轮 C：附件与在途上传不跨会话残留。
     setAttachments([]);
     submittedAttachmentIdsRef.current = null;
     setAttachNotice(null);
@@ -494,6 +493,13 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
     setTakeoverStillConflict(false);
     setTakeoverError(null);
     takeoverInFlightRef.current = false;
+    // 三轮评审 P2-1：实际挂载点（SessionDetail）以会话 id 为 **key**——切会话 =
+    // 卸载整个组件，本 effect 体不会执行；卸载必须与换 sessionId 同语义。cleanup
+    // 在卸载与依赖变更两条路径都取消在途上传（防旧会话附件继续传输落盘）。
+    return () => {
+      for (const ctrl of uploadCtrlsRef.current.values()) ctrl.abort();
+      uploadCtrlsRef.current.clear();
+    };
   }, [sessionId]);
 
   // A5 基线「打开官方页面」的显式辅助入口：只读已保存链接（不自动打开、不代理点击）。
