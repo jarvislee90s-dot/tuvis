@@ -97,7 +97,7 @@ function postedActions(): { actionId: string; action: { kind: string; text?: str
   return fetchMock.mock.calls
     .filter(
       ([input, init]) =>
-        String(input) === ZCODE_ACTIONS_PATH && (init as RequestInit | undefined)?.method === "POST",
+        String(input) === ZCODE_ACTIONS_PATH && (init as RequestInit | undefined)?.method === "POST"
     )
     .map(([, init]) => JSON.parse(String((init as RequestInit).body)))
     .map((body: { actionId: string; action: { kind: string; text?: string } }) => body);
@@ -128,7 +128,10 @@ class FakeXHR {
       attachResponder(this);
       return;
     }
-    this.respond(200, JSON.stringify({ path: "/tmp/travel/.tuvis-attachments/s-1/a.png", size: 1 }));
+    this.respond(
+      200,
+      JSON.stringify({ path: "/tmp/travel/.tuvis-attachments/s-1/a.png", size: 1 })
+    );
   }
   abort() {
     this.onabort?.();
@@ -189,18 +192,14 @@ describe("ZCode 面板：附件接入（三轮 C）", () => {
     const action = postedActions()[0].action;
     expect(action.kind).toBe("send");
     expect(action.text).toContain("看这个");
-    expect(action.text).toContain(
-      '<image path="/tmp/travel/.tuvis-attachments/s-1/a.png">',
-    );
+    expect(action.text).toContain('<image path="/tmp/travel/.tuvis-attachments/s-1/a.png">');
     // 先等清理 effect 落地（chip 移除），再断言草稿——POST 计数到位早于 hook 的
     // accepted 清理，直接断言草稿会与 effect 竞态。
-    await waitFor(() =>
-      expect(screen.queryByTestId("zcode-attachment")).toBeNull(),
-    );
+    await waitFor(() => expect(screen.queryByTestId("zcode-attachment")).toBeNull());
     expect(screen.getByTestId("zcode-draft").value).toBe("");
     expect(legacySendCalls()).toBe(0);
     expect(attachOpens[0]).toContain(
-      `/m/api/v1/session-attachment?session_id=${SID}&name=shot.png`,
+      `/m/api/v1/session-attachment?session_id=${SID}&name=shot.png`
     );
   });
 
@@ -228,7 +227,7 @@ describe("ZCode 面板：附件接入（三轮 C）", () => {
       release?.();
     });
     await waitFor(() =>
-      expect(screen.getByTestId("zcode-attachment").getAttribute("data-status")).toBe("ready"),
+      expect(screen.getByTestId("zcode-attachment").getAttribute("data-status")).toBe("ready")
     );
     fireEvent.click(screen.getByTestId("zcode-send"));
     await waitFor(() => expect(postedActions()).toHaveLength(1));
@@ -239,11 +238,9 @@ describe("ZCode 面板：附件接入（三轮 C）", () => {
     installFetch((actionId) => ({ actionId, state: "accepted", reasonCode: null }));
     render(<ZcodeControlPanel sessionId={SID} />);
     await screen.findByTestId("zcode-draft");
-    await attachOneFile((xhr) =>
-      xhr.respond(413, JSON.stringify({ error: "too_large" })),
-    );
+    await attachOneFile((xhr) => xhr.respond(413, JSON.stringify({ error: "too_large" })));
     await waitFor(() =>
-      expect(screen.getByTestId("zcode-attachment").getAttribute("data-status")).toBe("failed"),
+      expect(screen.getByTestId("zcode-attachment").getAttribute("data-status")).toBe("failed")
     );
 
     // 仅附件（空文本）也会被 failed 条目挡住：零 POST + 提示。
@@ -257,12 +254,12 @@ describe("ZCode 面板：附件接入（三轮 C）", () => {
     await waitFor(() => expect(screen.queryByTestId("zcode-attachment")).toBeNull());
     await attachOneFile();
     await waitFor(() =>
-      expect(screen.getByTestId("zcode-attachment").getAttribute("data-status")).toBe("ready"),
+      expect(screen.getByTestId("zcode-attachment").getAttribute("data-status")).toBe("ready")
     );
     fireEvent.click(screen.getByTestId("zcode-send"));
     await waitFor(() => expect(postedActions()).toHaveLength(1));
     expect(postedActions()[0].action.text).toBe(
-      '<image path="/tmp/travel/.tuvis-attachments/s-1/a.png">',
+      '<image path="/tmp/travel/.tuvis-attachments/s-1/a.png">'
     );
   });
 
