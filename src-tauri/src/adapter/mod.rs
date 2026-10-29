@@ -1,6 +1,7 @@
 // AgentAdapter trait + 枚举 + 会话发现调度器
 // 移植自 agent-sessions agent/mod.rs，扩展支持 Codex CLI/APP 和 OpenCode
 
+pub mod cadence;
 pub mod claude;
 pub mod codex;
 pub mod dsh;
