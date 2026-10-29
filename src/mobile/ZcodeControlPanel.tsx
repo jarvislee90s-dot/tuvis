@@ -8,7 +8,7 @@
 // - 回执如实：accepted=已受理（≠ 已生效），confirmed 才显示已生效，unknown 保持中性；
 //   send_failed/rejected/unknown 保留草稿、不自动重发。就地原因只展示本地化文案，
 //   `data-reason-code` 才是冻结错误码本身。
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type ClipboardEvent as ReactClipboardEvent } from "react";
 import i18n from "@/i18n";
 import {
   isZcodeErrorCode,
@@ -24,7 +24,13 @@ import {
   ZcodeControlApiError,
 } from "@/lib/api/zcodeControl";
 import useZcodeControl from "./useZcodeControl";
-import { fetchZcodeControl, postZcodeTakeover } from "./api";
+import {
+  attachmentMarkup,
+  isImageFile,
+  newAttachmentId,
+  type PendingAttachment,
+} from "./attachments";
+import { ApiError, fetchZcodeControl, postZcodeTakeover, uploadAttachment } from "./api";
 
 interface ZcodeControlPanelProps {
   /** 会话原 ID（服务端按它绑定 ZCode 会话；手机不自报 workspace） */
@@ -435,6 +441,20 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
   const submittedDraftRef = useRef<string | null>(null);
   /** 草稿即时值（effect 之外也要读最新值，避免闭包拿到旧草稿）。 */
   const draftRef = useRef(draft);
+  // 三轮 C：附件态（与 MessageComposer 同一上传管线/条目形状/引用约定）。
+  const [attachments, setAttachments] = useState<PendingAttachment[]>([]);
+  // 渲染期写 ref 被 react-hooks 规则禁止：同步镜像改在 effect（发送读 refs 语义不变）。
+  const attachmentsRef = useRef<PendingAttachment[]>([]);
+  useEffect(() => {
+    attachmentsRef.current = attachments;
+  }, [attachments]);
+  /** 上传中条目的取消柄（× 移除 = XHR abort，防白传到底）。 */
+  const uploadCtrlsRef = useRef(new Map<string, AbortController>());
+  /** 本次 send 提交的就绪附件 id：accepted 清的是「随本次发送」的条目，不碰续加。 */
+  const submittedAttachmentIdsRef = useRef<string[] | null>(null);
+  /** 附件闸提示（上传中/存在失败项时点击发送）：瞬态，随下次发送动作清除。 */
+  const [attachNotice, setAttachNotice] = useState<"uploading" | "failed" | null>(null);
+  const attachInputRef = useRef<HTMLInputElement | null>(null);
 
   // 仅 send 的 accepted 允许清本次草稿（hook 语义）；失败/拒绝/未知一律保留。
   // 迟到回执竞态：accepted 到达时若草稿已被续写成别的内容，那是**新**输入，必须保留——
@@ -442,9 +462,18 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
   useEffect(() => {
     if (!draftCleared) return;
     const submitted = submittedDraftRef.current;
-    if (submitted !== null && draftRef.current === submitted) {
+    // 竞态守卫先取比较结果（草稿被续写 → 那是新输入，草稿与附件都保留）。
+    const unchanged = submitted !== null && draftRef.current === submitted;
+    if (unchanged) {
       draftRef.current = "";
       setDraft("");
+    }
+    // 三轮 C：send accepted 时只清「随本次发送」的附件条目；草稿被续写时附件同样
+    // 保留——它们属于未确认发出的那份内容。
+    const sentIds = submittedAttachmentIdsRef.current;
+    if (unchanged && sentIds !== null) {
+      submittedAttachmentIdsRef.current = null;
+      setAttachments((prev) => prev.filter((a) => !sentIds.includes(a.id)));
     }
   }, [draftCleared]);
 
@@ -454,6 +483,12 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
     setDraft("");
     draftRef.current = "";
     submittedDraftRef.current = null;
+    // 三轮 C：附件与在途上传同样不跨会话残留（取消在途 XHR，防止串盘）。
+    for (const ctrl of uploadCtrlsRef.current.values()) ctrl.abort();
+    uploadCtrlsRef.current.clear();
+    setAttachments([]);
+    submittedAttachmentIdsRef.current = null;
+    setAttachNotice(null);
     // 抢回面同样不跨会话残留（T8）。
     setTakeoverBusy(false);
     setTakeoverStillConflict(false);
@@ -548,16 +583,91 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
       ? (session.capabilities.send.reasonCode ?? "not_ready")
       : null;
 
+  // 三轮 C：附件上传（通用通道；状态机与 MessageComposer 同形，无速率估算）。
+  const addZcodeFiles = (files: File[]) => {
+    for (const file of files) {
+      const id = newAttachmentId();
+      const isImage = isImageFile(file);
+      setAttachments((prev) => [
+        ...prev,
+        { id, name: file.name || (isImage ? file.name : "file"), isImage, status: "uploading" },
+      ]);
+      const ctrl = new AbortController();
+      uploadCtrlsRef.current.set(id, ctrl);
+      void uploadAttachment(sessionId, file, ctrl.signal, (loaded, total) => {
+        setAttachments((prev) =>
+          prev.map((a) => (a.id === id ? { ...a, loaded, total: total > 0 ? total : null } : a)),
+        );
+      })
+        .then((res) => {
+          if (res === null) throw new ApiError(403, i18n.t("mobile.zcodeControl.deviceInvalid"));
+          setAttachments((prev) =>
+            prev.map((a) => (a.id === id ? { ...a, status: "ready", path: res.path } : a)),
+          );
+        })
+        .catch((e: unknown) => {
+          if (ctrl.signal.aborted) {
+            // 用户取消：chip 已随 removeZcodeAttachment 移除，静默收尾。
+            setAttachments((prev) => prev.filter((a) => a.id !== id));
+            return;
+          }
+          const reason =
+            e instanceof ApiError
+              ? e.message
+              : e instanceof Error
+                ? e.message
+                : String(e);
+          setAttachments((prev) =>
+            prev.map((a) => (a.id === id ? { ...a, status: "failed", error: reason } : a)),
+          );
+        })
+        .finally(() => {
+          uploadCtrlsRef.current.delete(id);
+        });
+    }
+  };
+
+  const removeZcodeAttachment = (id: string) => {
+    // 上传中移除 = 取消（XHR abort），与 MessageComposer 同语义。
+    uploadCtrlsRef.current.get(id)?.abort();
+    uploadCtrlsRef.current.delete(id);
+    setAttachments((prev) => prev.filter((a) => a.id !== id));
+  };
+
+  /** 粘贴图片走同一上传链路；非图片放行默认文本行为。 */
+  const handleZcodePaste = (e: ReactClipboardEvent<HTMLTextAreaElement>) => {
+    const images = Array.from(e.clipboardData?.files ?? []).filter((f) => isImageFile(f));
+    if (images.length === 0) return;
+    e.preventDefault();
+    addZcodeFiles(images);
+  };
+
   const handleSend = () => {
-    if (!canSend || session === null || draft.trim().length === 0) return;
-    if (inFlightRef.current) return;
-    // 记下本次提交原文：accepted 迟到时据此判断草稿是否仍是「同一份」。
+    if (!canSend || session === null || inFlightRef.current) return;
+    const current = attachmentsRef.current;
+    // 附件闸：上传中或存在失败项时不静默丢附件发送（三轮 C 契约）。
+    if (current.some((a) => a.status === "uploading")) {
+      setAttachNotice("uploading");
+      return;
+    }
+    if (current.some((a) => a.status === "failed")) {
+      setAttachNotice("failed");
+      return;
+    }
+    const markup = attachmentMarkup(current);
+    const text = draft.trim();
+    if (text.length === 0 && markup.length === 0) return;
+    // 记下本次提交原文与随行附件：accepted 清「同一份」，失败/未知全保留。
     submittedDraftRef.current = draft;
+    submittedAttachmentIdsRef.current = current
+      .filter((a) => a.status === "ready")
+      .map((a) => a.id);
+    setAttachNotice(null);
     runOnce({
       kind: "send",
       sessionId,
       generation: session.generation,
-      text: draft, // 多行原样上行；trim 只用于判空
+      text: markup ? (text ? `${draft}\n${markup}` : markup) : draft, // 多行原样上行
     });
   };
 
@@ -782,7 +892,71 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
           )}
         </div>
       )}
+      {attachments.length > 0 && (
+        <div className="flex flex-wrap gap-2">
+          {attachments.map((a) => (
+            <span
+              key={a.id}
+              data-testid="zcode-attachment"
+              data-status={a.status}
+              title={a.error ?? a.path ?? undefined}
+              className="max-w-full truncate rounded-md border border-[var(--cb)] px-2 py-1 text-xs text-[var(--tx)]"
+            >
+              {a.isImage ? "🖼" : "📎"} {a.name}
+              {a.status === "uploading" && (
+                <span className="ml-1 text-[var(--mut)]">
+                  {typeof a.loaded === "number"
+                    ? ` ${a.loaded}${a.total ? `/${a.total}` : ""}B`
+                    : ""}
+                </span>
+              )}
+              {a.status === "failed" && a.error && (
+                <span className="ml-1 text-red-500">{a.error}</span>
+              )}
+              <button
+                type="button"
+                data-testid="zcode-attachment-remove"
+                aria-label={i18n.t("mobile.zcodeControl.removeAttachment")}
+                onClick={() => removeZcodeAttachment(a.id)}
+                className="ml-1 text-[var(--mut)]"
+              >
+                ×
+              </button>
+            </span>
+          ))}
+        </div>
+      )}
+      {attachNotice !== null && (
+        <p data-testid="zcode-attach-notice" className="text-xs text-amber-500">
+          {i18n.t(
+            attachNotice === "uploading"
+              ? "mobile.zcodeControl.attachBlockedUploading"
+              : "mobile.zcodeControl.attachBlockedFailed",
+          )}
+        </p>
+      )}
       <div className="flex items-end gap-2">
+        <button
+          type="button"
+          data-testid="zcode-attach"
+          aria-label={i18n.t("mobile.zcodeControl.attachAria")}
+          onClick={() => attachInputRef.current?.click()}
+          className="shrink-0 rounded-full bg-[var(--btnp)]/10 px-3 py-2 text-sm text-[var(--tx)]"
+        >
+          +
+        </button>
+        <input
+          ref={attachInputRef}
+          data-testid="zcode-attachment-input"
+          type="file"
+          multiple
+          className="hidden"
+          onChange={(e) => {
+            const files = Array.from(e.target.files ?? []);
+            e.target.value = "";
+            if (files.length > 0) addZcodeFiles(files);
+          }}
+        />
         <textarea
           data-testid="zcode-draft"
           aria-label={i18n.t("mobile.zcodeControl.draftAria")}
@@ -792,6 +966,7 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
             draftRef.current = e.target.value;
             setDraft(e.target.value);
           }}
+          onPaste={handleZcodePaste}
           placeholder={i18n.t("mobile.zcodeControl.draftPlaceholder")}
           className="min-h-0 flex-1 resize-none rounded-lg border border-[var(--cb)] px-3 py-2 text-sm text-[var(--tx)] placeholder:text-[var(--mut)] focus:ring-2 focus:ring-[var(--btnp)] focus:outline-none"
         />
