@@ -555,16 +555,28 @@ fn parse_questions(value: &Value, free_text_allowed: bool) -> Option<Vec<Questio
     Some(questions)
 }
 
+/// 解析问答选项：**逐项宽容**（坏选项只跳过该项，不牵连整题/整卡）。
+///
+/// 官方卡里 `options` 元素是 `{value,label,description?,preview?}`；单个元素形状不符
+/// （缺 `value`/`label`）只丢该项——整卡可见性优先，绝不因一个坏选项把整张问答卡
+/// 从手机端抹掉。
 fn parse_question_options(value: &Value) -> Option<Vec<QuestionOption>> {
     let items = value.as_array()?;
     let mut options = Vec::with_capacity(items.len());
     for item in items {
-        let record = item.as_object()?;
-        let value = record
-            .get("value")?
-            .as_str()
-            .filter(|text| !text.is_empty())?;
-        let label = record.get("label")?.as_str()?;
+        let Some(record) = item.as_object() else {
+            continue;
+        };
+        let Some(value) = record
+            .get("value")
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty())
+        else {
+            continue;
+        };
+        let Some(label) = record.get("label").and_then(Value::as_str) else {
+            continue;
+        };
         options.push(QuestionOption {
             value: value.to_owned(),
             label: label.to_owned(),
@@ -575,17 +587,35 @@ fn parse_question_options(value: &Value) -> Option<Vec<QuestionOption>> {
     Some(options)
 }
 
+/// 解析审批选项：**逐项宽容**（坏选项只跳过该项，不牵连整卡）。
+///
+/// R0 现场归因：旧实现用 `?` 逐字段展开，任何一个选项缺 `label`/`kind` 都会让
+/// `parse_pending` 返回 `None`，整张审批卡被静默丢弃（手机只看到「审批没出现」，
+/// 却没有任何卡面可读）。官方 `options` 本身没有 min 长度（`E$`），因此正确语义是
+/// 「保留能解析的选项 + 保留卡片身份」，不是「整卡作废」。
+///
+/// `kind` 只读原值（`allowOnce`/`allowAlways`/`deny`/`custom`），不在投影期改写或
+/// 过滤——是否可回传由 `build_permission_answer` 的冻结闸判定。
 fn parse_permission_options(value: &Value) -> Option<Vec<PermissionOptionView>> {
     let items = value.as_array()?;
     let mut options = Vec::with_capacity(items.len());
     for item in items {
-        let record = item.as_object()?;
-        let option_id = record
-            .get("optionId")?
-            .as_str()
-            .filter(|text| !text.is_empty())?;
-        let label = record.get("label")?.as_str()?;
-        let kind = record.get("kind")?.as_str()?;
+        let Some(record) = item.as_object() else {
+            continue;
+        };
+        let Some(option_id) = record
+            .get("optionId")
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty())
+        else {
+            continue;
+        };
+        let Some(label) = record.get("label").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(kind) = record.get("kind").and_then(Value::as_str) else {
+            continue;
+        };
         options.push(PermissionOptionView {
             option_id: option_id.to_owned(),
             label: label.to_owned(),
@@ -742,6 +772,161 @@ mod tests {
             Some("E-existing")
         );
         assert_eq!(control.active_works[1].foreground_execution_id, None);
+    }
+
+    // -----------------------------------------------------------------------
+    // R0：审批合同（形状取自安装包 3.16.2.8769 的 `pendingInteractions[]` 实证）
+    // -----------------------------------------------------------------------
+
+    /// 官方 permission 卡合成样本（字段名/值域见
+    /// `docs/superpowers/reviews/2026-10-29-zcode-r0-wire-evidence.md` §2）：
+    /// `options[].kind ∈ {allowOnce, allowAlways, deny, custom}`；
+    /// `fullAccessOption` 是**独立字段**（`optionId:"fullAccess"`, `kind:"custom"`），
+    /// 不在 `options[]` 里。
+    fn official_permission_card(interaction_id: &str) -> Value {
+        json!({
+            "interactionId": interaction_id,
+            "kind": "permission",
+            "anchorRowId": 21,
+            "createdAt": 1_700_000_000_000u64,
+            "payload": {
+                "kind": "permission",
+                "toolCallId": "call_synthetic_2001",
+                "toolName": "Bash",
+                "summary": "synthetic: run a shell command",
+                "freeText": true,
+                "detail": {"command": "synthetic-command"},
+                "fullAccessOption": {
+                    "optionId": "fullAccess",
+                    "kind": "custom",
+                    "label": "Full access",
+                    "response": {"decision": "deny"}
+                },
+                "options": [
+                    {
+                        "optionId": "allowOnce",
+                        "label": "Allow once",
+                        "kind": "allowOnce",
+                        "response": {"decision": "allow", "reason": "Approved once"}
+                    },
+                    {
+                        "optionId": "allowSession",
+                        "label": "Always allow in this session",
+                        "kind": "allowAlways",
+                        "response": {"decision": "allow"}
+                    },
+                    {
+                        "optionId": "deny",
+                        "label": "Deny",
+                        "kind": "deny",
+                        "response": {"decision": "deny"}
+                    }
+                ]
+            }
+        })
+    }
+
+    #[test]
+    fn permission_snapshot_is_retained_with_original_options() {
+        let mut book = PendingBook::new(SESSION, 1);
+        book.accept_snapshot(&snapshot(
+            None,
+            json!([official_permission_card("perm-call_synthetic_2001")]),
+        ))
+        .expect("snapshot shape");
+
+        let pending = book.pendings();
+        assert_eq!(pending.len(), 1, "官方形状的审批卡必须保留，不得整卡丢弃");
+        let card = &pending[0];
+        // 身份保留：interactionId 原样（官方 `requestId ?? perm-<toolCallId>` 派生）。
+        assert_eq!(card.interaction_id, "perm-call_synthetic_2001");
+        assert_eq!(card.tool_call_id.as_deref(), Some("call_synthetic_2001"));
+        assert_eq!(card.tool_name.as_deref(), Some("Bash"));
+        assert_eq!(card.kind, PendingKind::Permission);
+        // 选项原值/原序保留（kind 的 allowAlways 不得被改写成别的值）。
+        assert_eq!(
+            card.options
+                .iter()
+                .map(|option| (option.option_id.as_str(), option.kind.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("allowOnce", "allowOnce"),
+                ("allowSession", "allowAlways"),
+                ("deny", "deny"),
+            ]
+        );
+        // `fullAccessOption` 是独立字段：绝不并进 options（否则手机可能渲染成可点）。
+        assert!(
+            !card
+                .options
+                .iter()
+                .any(|option| option.option_id == "fullAccess"),
+            "fullAccess 不得出现在 options[] 里"
+        );
+        assert_eq!(book.invalid_pending_skipped(), 0);
+
+        // 宿主撤卡（整数组替换为空）→ 卡消失，身份不复活。
+        book.accept_delta_patch(&json!({"pendingInteractions": []}))
+            .expect("delta shape");
+        assert!(book.pendings().is_empty());
+    }
+
+    #[test]
+    fn malformed_sibling_option_does_not_drop_the_card() {
+        // 官方 `options` 无 min 长度；单个选项坏形状（缺 label）只跳过该项，
+        // 整卡必须仍可见（阅读面优先），绝不让「一个坏选项」吞掉整张审批卡。
+        let mut card = official_permission_card("perm-call_synthetic_2002");
+        card["payload"]["options"] = json!([
+            {"optionId": "allowOnce", "label": "Allow once", "kind": "allowOnce"},
+            {"optionId": "broken", "kind": "deny"},
+            {"optionId": "deny", "label": "Deny", "kind": "deny"}
+        ]);
+        let mut book = PendingBook::new(SESSION, 1);
+        book.accept_snapshot(&snapshot(None, json!([card])))
+            .expect("snapshot shape");
+        let pending = book.pendings();
+        assert_eq!(pending.len(), 1, "坏选项不得导致整卡被跳过");
+        assert_eq!(
+            pending[0]
+                .options
+                .iter()
+                .map(|option| option.option_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["allowOnce", "deny"]
+        );
+    }
+
+    #[test]
+    fn old_generation_permission_sample_is_dropped() {
+        // 旧代际的样本不得进入新代际的册：异会话快照直接拒收（零应用）。
+        let mut book = PendingBook::new(SESSION, 1);
+        let error = book
+            .accept_snapshot(&json!({
+                "sessionId": SESSION_HEX,
+                "pendingInteractions": [official_permission_card("perm-old-generation")]
+            }))
+            .expect_err("foreign session sample");
+        assert!(error.is(codes::NO_SESSION));
+        assert!(book.pendings().is_empty());
+
+        // 同会话但旧代际目标不得授权（stale_pending，零消费）。
+        book.accept_snapshot(&snapshot(
+            None,
+            json!([official_permission_card("perm-call_synthetic_2003")]),
+        ))
+        .expect("snapshot shape");
+        let stale_target = BoundTarget {
+            session_id: SESSION.to_owned(),
+            workspace_path: "/tmp/synthetic-workspace".to_owned(),
+            workspace_identity: None,
+            workspace_key: "/tmp/synthetic-workspace".to_owned(),
+            generation: 2,
+            bridge_generation: Some(2),
+        };
+        let error = book
+            .authorize(&stale_target, "perm-call_synthetic_2003")
+            .expect_err("old generation target");
+        assert!(error.is(codes::STALE_PENDING));
     }
 
     #[test]
