@@ -518,7 +518,13 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
   // ApproveCard 挂载门：红灯 ∨ 计划预期态（两个**并列**的门，不互相削弱——
   // waiting 门仍是审批红灯的入口，T1 裁决未动；预期态门是 codex/kimi 计划确认的
   // 唯一入口，两者都经同一张卡的 `available` 数据门做最终裁决）
-  const approveMounted = session.status === "waiting" || planPending;
+  //
+  // ZCode 例外（R1）：ZCode 的审批/问答**只**消费官方协议的原生 pending（由
+  // `ZcodeControlPanel` 渲染），旧 CLI 卡（终端屏读 + `/session-approve-options`
+  // + `/session-question` + 终端按键注入）对 ZCode 一律不挂载——两套卡并存会出现
+  // 「官方卡可答、旧只读卡残留在上方」的现场缺陷，且旧链路的写动作对 ZCode 不可达。
+  const isZcodeSession = session.agentType === "zcode";
+  const approveMounted = !isZcodeSession && (session.status === "waiting" || planPending);
 
   // 消息流拉取：挂载 / limit 变化 / 手动刷新时重拉（整页替换；M3 不做增量追加
   // 与滚动位置保持——「加载更多」按钮替代无限滚动的裁决即含此简化）
@@ -1302,12 +1308,15 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
             sessionId={session.id}
             refreshSignal={queueTick}
           />
-          {!codexProjectionActive && !isSummary && (
+          {!codexProjectionActive && !isSummary && !isZcodeSession && (
             <QuestionCard key={`question-${session.id}`} session={session} />
           )}
         </>
       ) : (
-        !isSummary && <QuestionCard key={`question-${session.id}`} session={session} />
+        // ZCode：原生 pending 只在 `ZcodeControlPanel` 里渲染（R1）；旧终端问答卡
+        // 一律不挂载——它不是原生降级卡，残留只会与官方卡并存。
+        !isSummary &&
+        !isZcodeSession && <QuestionCard key={`question-${session.id}`} session={session} />
       )}
       {/* 2026-10-08 子 agent chip：与 ModeBar 同一行（flex-wrap 兄弟），生命周期
           解耦——mode 视图失败/unsupported 时 chip 仍活，反之亦然（spec §6）。

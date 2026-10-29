@@ -349,6 +349,98 @@ describe("ZCode 生产流：初始 control 缺失时零 stop 触发", () => {
   });
 });
 
+describe("ZCode 生产流：同代 SSE 新卡无需刷新即可作答（R1）", () => {
+  it("sse_new_question_card_is_answerable_without_refresh", async () => {
+    vi.stubGlobal("EventSource", MockEventSource);
+
+    // 首拍 GET：宿主当时没有卡（能力矩阵因此全关）。随后同代 SSE 推来新问答卡 +
+    // 现算后的能力矩阵——手机不得再补 GET，也不得停留在全关矩阵。
+    const closedCapabilities: CapabilityView = {
+      ...capabilities(),
+      singleSelect: flag(false),
+      multiSelect: flag(false),
+      freeText: flag(false),
+    };
+    const livePending: PendingView = {
+      interactionId: "pi-sse-live-question",
+      kind: "userInput",
+      anchorRowId: 4,
+      toolCallId: "call-sse-live",
+      createdAt: 1_700_000_000_000,
+      summary: "synthetic: live question",
+      toolName: "AskUserQuestion",
+      schemaInteraction: null,
+      sensitive: false,
+      autoResolution: false,
+      autoResolutionState: null,
+      questions: [
+        {
+          header: "Color",
+          question: "Which color?",
+          multiSelect: false,
+          freeTextAllowed: false,
+          options: [{ value: "Red", label: "Red", description: null, preview: null }],
+        },
+      ],
+      options: [],
+    };
+    installFetch((url, init) => {
+      if (url === ZCODE_CONNECTION_PATH) return json(connection());
+      if (url.startsWith(`${ZCODE_SESSION_PATH}?`)) {
+        return json(sessionView({ pending: [], capabilities: closedCapabilities }));
+      }
+      if (url.includes("/official-control")) return json({ configState: "missing", url: null });
+      if (url === ZCODE_ACTIONS_PATH && init?.method === "POST") {
+        const body = JSON.parse(String(init.body)) as ActionPostBody;
+        return json({
+          actionId: body.actionId,
+          sessionId: SID,
+          generation: GEN,
+          state: "accepted",
+          reasonCode: null,
+        } satisfies ActionReceipt);
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+
+    render(<ZcodeControlPanel sessionId={SID} />);
+    await screen.findByTestId("zcode-control-panel");
+    await waitFor(() =>
+      expect(calledUrls().filter((url) => url.startsWith(`${ZCODE_SESSION_PATH}?`))).toHaveLength(1)
+    );
+    expect(screen.queryByTestId("zcode-pending-card")).toBeNull();
+
+    // 同代 SSE：新卡 + 本帧现算矩阵（real backend 行为），客户端直接落地。
+    await act(async () => {
+      MockEventSource.latest().emit("session", {
+        seq: 3,
+        generation: GEN,
+        sessionId: SID,
+        kind: "session",
+        data: sessionView({
+          revision: 13,
+          pending: [livePending],
+          capabilities: capabilities(),
+        }),
+      });
+      await Promise.resolve();
+    });
+
+    const option = (await screen.findByTestId("zcode-pending-option-0")) as HTMLButtonElement;
+    await waitFor(() => expect(option).toBeEnabled());
+    // 关键：没有补发 GET（新卡凭 SSE 自身即可答）。
+    expect(calledUrls().filter((url) => url.startsWith(`${ZCODE_SESSION_PATH}?`))).toHaveLength(1);
+
+    // 点选 + 提交：一次 answer（同一 interaction 原值回传）。
+    fireEvent.click(option);
+    fireEvent.click(screen.getByTestId("zcode-pending-submit"));
+    await waitFor(() => expect(postBodies()).toHaveLength(1));
+    const posted = postBodies()[0].action;
+    expect(posted.kind).toBe("answer");
+    expect(posted).toMatchObject({ interactionId: "pi-sse-live-question" });
+  });
+});
+
 describe("ZCode 生产流：SSE lag 先纠偏 GET 再放写", () => {
   it("sse_lag_resyncs_before_next_write", async () => {
     vi.stubGlobal("EventSource", MockEventSource);
