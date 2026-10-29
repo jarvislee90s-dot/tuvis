@@ -9101,7 +9101,6 @@ mod tests {
         // 新投影：revision 前进 + 目标卡已从宿主集合撤下（C2：撤卡证据显式声明
         // 在 FakePump 的宿主集合里，本地视图列表不再充当宿主状态）。
         pump.set_host_pending_ids("sess_synthetic0000", vec![]);
-        pump.set_host_pending_ids("sess_synthetic0000", vec![]);
         pump.push_outcome(
             Ok(()),
             vec![changed_view_with_pending("sess_synthetic0000", 11, vec![])],

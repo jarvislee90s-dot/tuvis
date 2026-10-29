@@ -82,9 +82,9 @@ Spec：`docs/superpowers/specs/2026-10-28-zcode-capability-parity-spec.md`；Pla
 
 ## 六、最终状态（2026-10-29 修订）
 
-- 最终 HEAD：`3b70a916`（`codex/zcode-unified-remote`）。初版报告写作 `a148dad9` 是错的——那是初版的代码尾 commit，初版报告自身提交于 `370d93a4`。
+- 最终代码 HEAD：复审轮修复 commit（紧随本报告修订之后，见 §八末）；初版报告写作 `a148dad9` 是错的——那是初版的代码尾 commit，初版报告自身提交于 `370d93a4`。
 - 工作树：干净（`git status` 零输出）。
-- 分支 commits：`0c111c06..3b70a916` 共 20 个 = T1-T9 计划内 13 个 + 最终审查修复 2 个（`191bcc31`/`a148dad9`）+ 初版报告 `370d93a4` + 外部评审修复 6 个（`95a38d83`/`56be58a7`/`4d1be38e`/`404ff524`/`3b70a916`/本报告修订）。
+- 分支 commits：`0c111c06..3b70a916` 共 19 个 = T1-T9 计划内 13 个 + 最终审查修复 2 个（`191bcc31`/`a148dad9`）+ 初版报告 `370d93a4` + 外部评审修复 5 个（`95a38d83`/`56be58a7`/`4d1be38e`/`404ff524`/`3b70a916`）；其后为报告修订（`581e6346`/`339c00f6`）与复审轮修复。
 - 未 push、未 merge、未 tag（遵执行纪律，合并由用户与外部评审决定）。
 
 ## 七、审查缓办项（历史分诊存档；初版「无必修项」结论已被外部评审推翻，见 §八）
@@ -98,7 +98,7 @@ Spec：`docs/superpowers/specs/2026-10-28-zcode-capability-parity-spec.md`；Pla
 | 项 | 根因（核实确认） | 修复 | commit | 证据 |
 |---|---|---|---|---|
 | P0-1 model/thought 生产自锁 | `has_model_catalog` 唯一写入点是 `SelectionPort::load`（bridge.rs），而 `load` 在 command.rs 能力闸**之后**才被调用；snapshot `config` 是扁平形状（无 models 目录），闸关 → 不读目录 → 永远 enabled=false，已知 build shipped confirmed 同样被锁死（只有 debug 证据许可可绕过，正好解释手工验证能过、生产不行） | 读路径惰性单飞目录读：`BridgeManager::ensure_selection_catalog`（绑定会话 + 投影就绪才读；同 revision 只尝试一次，失败也记位；不经任何能力闸；失败零报错），挂在 `HubBackend::session`（GET /zcode/session 读路径）；目录缓存 `SessionEntry::catalog` 与既有 `load` 共用（写前新鲜目录同步刷新缓存）；目录合并进 SessionView（模型下拉有真实候选） | `4d1be38e` | 桥级 2 用例（闸前采集形状 / 未 bind 零 RPC + 每 revision 恰一次 + 失败记位）；**已知 build resolver e2e** `known_build_opens_model_and_thought_via_catalog_read`：model/thought enabled、无原因码、目录模型回写视图、恰一帧 getView、重复 GET 零新读、零命令帧零注入、shipped 零账本行；**变异验证**：临时禁用目录读 → e2e 以「目录读自锁未解」失败（复现原缺陷）→ 恢复后通过 |
-| P0-2 pending 假确认 | 泵判据 `confirm_pending` 读本地投影 `SessionView.pending`；ACK 后 `mark_resolved_local` 已把卡从本地册消费（代码自注「本地消费 ≠ 宿主撤卡」但判据没用它）→ 任意 revision 前进帧即假 confirmed，尤其 approval_reply；证据价值被击穿 | 判据改签名 `confirm_pending(ctx, after, host_pending: Option<&[String]>)`：撤卡证据只认**宿主集合**（`PendingBook::host_pending_ids`，与回执腿 `wait_host_cleared` 同一权威源）；`None` = 桥无证据面 → 保守不确认（绝不把「取不到」当「已撤卡」）；加 `after.ready` 闸；到点判据词（`pending_still_present`）同源改按宿主集合；泵慢路径经 `BridgePump::host_pending_ids` 供给（生产 ProjectionBridge 覆写，fake 默认 None） | `95a38d83` | 纯判据反例 3 条（宿主卡在 + 本地册空 + revision 前进不确认；not-ready 不确认；None 无证据不确认）+ tracker 接线正反 2 条（宿主宣告撤卡 → confirmed；宿主未撤零落账）；既有 4 条泵路径测试改为 FakePump 显式 `set_host_pending_ids` 如实声明宿主状态后仍绿（证明修复后确认为真实撤卡证据驱动）；answer e2e 的泵腿经假体真实撤卡帧驱动 |
+| P0-2 pending 假确认 | 泵判据 `confirm_pending` 读本地投影 `SessionView.pending`；ACK 后 `mark_resolved_local` 已把卡从本地册消费（代码自注「本地消费 ≠ 宿主撤卡」但判据没用它）→ 任意 revision 前进帧即假 confirmed，尤其 approval_reply；证据价值被击穿 | 判据改签名 `confirm_pending(ctx, after, host_pending: Option<&[String]>)`：撤卡证据只认**宿主集合**（`PendingBook::host_pending_ids`，与回执腿 `wait_host_cleared` 同一权威源）；`None` = 桥无证据面 → 保守不确认（绝不把「取不到」当「已撤卡」）；加 `after.ready` 闸；到点判据词（`pending_still_present`）同源改按宿主集合；泵慢路径经 `BridgePump::host_pending_ids` 供给（生产 ProjectionBridge 覆写，fake 默认 None） | `95a38d83` | 纯判据反例 3 条（宿主卡在 + 本地册空 + revision 前进不确认；not-ready 不确认；None 无证据不确认）+ tracker 接线正反 2 条（宿主宣告撤卡 → confirmed；宿主未撤零落账）；既有 6 条泵路径测试改为 FakePump 显式 `set_host_pending_ids` 如实声明宿主状态后仍绿（证明修复后确认为真实撤卡证据驱动）；answer e2e 的泵腿经假体真实撤卡帧驱动 |
 | P1-1 shipped Confirmed 也登记首确认 | `needs_confirmation` 只查账本；已知 build 的 send/approval 也开确认窗，一次动作级拒绝（会话忙/参数错/过期卡）→ `settle_receipt` 写账本 degraded，resolver 里账本 degraded 优先于 shipped confirmed → 永久关闭无 UI 恢复 | `needs_confirmation` 前置 `shipped_state` 检查：`Some(Confirmed)` 直接 false——出厂判定不进首次确认 | `56be58a7` | `shipped_confirmed_capability_skips_first_use_confirmation`：needs_confirmation 对已知 build key false / 未知 build key true；send 被受理后观察证据齐全（指纹变化 + revision 前进）仍零落账 |
 | P1-2 空 baseline 假确认 | 登记时 `unwrap_or_default()` 把缺席指纹存成空串；判据「非空且 != baseline」→ 任意非空指纹 + revision 前进即 confirmed（非消息 patch 可触发） | 登记面过滤：`log_fingerprint` 缺席或空串 → `continue` 不登记（没有消息基线就不开确认窗，等下一次带指纹基线的真实使用） | `56be58a7` | `send_without_baseline_fingerprint_never_registers_confirmation`：空 baseline 下任意非空指纹 + revision 前进零落账（RED→GREEN） |
 | P1-3 schema 指纹占位 | `"v4"` 常量占位；spec R2「schema 变化即重算」不成立；renderer 热更不改版本时失效面不足 | 实现真实指纹：`SchemaShape`（桥内新类型）只记录 hello 应答 / 首个有效 snapshot / 其 `config` 子对象 / 首张 pending 卡的**键名骨架**，FNV-1a 64 哈希为定长 16 位十六进制 id 形状（跨版本稳定，不用 std DefaultHasher；值/正文/题干/JWT 对指纹不可见）；经 `HostEvidence.schema_fingerprint` 进 `capability_key`；占位常量删除 | `404ff524` | `schema_shape_fingerprint_hashes_keys_not_values`（同形状不同值同指纹 / snapshot 顶层键集或 config 子形状变化换指纹 / 定长 hex 不含原文 / 未观测 None / invalidate 清空）+ `host_evidence_carries_schema_fingerprint_after_hello_and_snapshot`（握手前 None → bind 后有指纹 → 换代清空）；e2e 账本断言改 `platform|build|protocol|` 前缀匹配（不再硬编码指纹哈希，前缀仍精确钉住 build+protocol） |
@@ -107,6 +107,14 @@ Spec：`docs/superpowers/specs/2026-10-28-zcode-capability-parity-spec.md`；Pla
 修复轮门禁（控制器独立复跑 @ `3b70a916`，全部绿）：见 §三修复轮列。
 
 评审报告问题两项已修正：①本报告 §结论/§六改写，如实标注初版「可合并」结论不成立；②HEAD 记录以 `3b70a916` 为准并解释初版错误来源。
+
+### 复审轮（requesting-code-review，范围 `a148dad9..339c00f6`）
+
+复审结论：**可进入合并评审**。两个 P0 经复审者独立变异验证证实真实关闭（禁用目录读 → 已知 build e2e 逐字复现 P0-1；判据无视宿主集合 → 新反例测试失败）；P1-1/P1-2/P1-3 原项关闭；P1-4 判 PARTIAL（缺陷关闭，但评审要求的「客户端断开用例」未补，复审接受为非阻塞跟进项）。
+
+复审发现修复自身引入 1 个 **Important**：`SchemaShape` 把 `pendingInteractions` 首卡键集纳入骨架，而首帧有无卡/首卡题型随会话状态变化 → 同 build 跨重启指纹漂移 → 账本分裂（confirmed 重开确认窗、degraded 被遗忘；方向保守无安全面，但削弱指纹本意）。**已在复审轮立即修复**：骨架剔除 pending 段，只保留 hello/snapshot/config 三段键集；补回归钉「有卡/无卡、卡题型/payload 形状都不改指纹」。另修复审 Minor：hub.rs 一处重复测试行；本报告 §六/§八三处计数笔误（19 commits、6 条泵路径测试）。
+
+复审登记的跟进项（不阻塞）：①takeover 客户端断开回归用例（gate 住 FakeBackend 中途 abort handler 任务，断言 Hub 最终 Paired）；②`ensure_selection_catalog` 与 `load` 各自合成 config JSON 的重复逻辑可抽取；③目录读每 revision 一次无重试计时（静止会话瞬时失败需等下一帧，有界自愈）。
 
 评审 P2/记录项处置（本轮不改码，逐项回应）：单击即发=产品裁决面（常驻说明文案保留，是否升级二次模态由用户裁决）；并发 takeover 二次冲突会再跑一轮（`takeover_lock` 串行化已保证不叠加连接流；注释已按实际语义核对，无并发用例留在缓办项）；interface 证据宿主级 OR（动作侧按目标再校验，无跨会话越权，接受）；`action_failed` 不在前端码表（下一批 UX 清理带走）；DB 读失败 fail-open（内存 last-known degraded 记为后续改进项）；读侧不复验 reason_code（写侧硬闸已挡源头，读侧复验记为潜在雷）；上传文件 spec 明确排除、未混入（另立项）；真机未跑项维持如实登记（§五），合并前需 unknown build 与 takeover 的真实链路证据。
 

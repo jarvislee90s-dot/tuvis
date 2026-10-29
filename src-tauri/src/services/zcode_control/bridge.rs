@@ -320,9 +320,14 @@ impl Default for Inner {
 /// schema 形状指纹（外部评审 P1-3；spec R2「schema 变化即重算」的 key 分量）。
 ///
 /// 只记录 wire 形状的**键名骨架**：hello 应答的顶层键集、首个有效 conversation
-/// snapshot 的顶层键集、其 `config` 子对象键集、`pendingInteractions` 首张卡的
-/// 顶层键集与 `payload` 子键集。**绝不**读取任何值——正文、id、模型名、题干、
-/// 答案、JWT、链接对指纹不可见（同形状不同内容 → 同指纹）。
+/// snapshot 的顶层键集、其 `config` 子对象键集。**绝不**读取任何值——正文、id、
+/// 模型名、题干、答案、JWT、链接对指纹不可见（同形状不同内容 → 同指纹）。
+///
+/// **骨架只取会话状态无关的稳定面**：`pendingInteractions` 的卡骨架**不**参与——
+/// 首帧有无卡、首卡题型随会话状态变化，若参与会让同一宿主跨重启/重连得到不同
+/// 指纹（账本按旧指纹孤立：confirmed 不命中重开确认窗、degraded 被遗忘），
+/// 复审轮已定级 Important 并剔除。hello/snapshot/config 三段键集已足以感知协议
+/// 帧形状的升级。
 ///
 /// 指纹 = 键名骨架的稳定哈希（FNV-1a 64，定长 16 位十六进制 id 形状）。用于
 /// [`CapabilityKey`] 的 `schema_fingerprint`：renderer 热更改了帧形状但 build/协议
@@ -334,8 +339,6 @@ pub(crate) struct SchemaShape {
     hello_keys: Option<Vec<String>>,
     snapshot_keys: Option<Vec<String>>,
     config_keys: Vec<String>,
-    pending_keys: Vec<String>,
-    pending_payload_keys: Vec<String>,
 }
 
 impl SchemaShape {
@@ -349,8 +352,8 @@ impl SchemaShape {
         }
     }
 
-    /// conversation snapshot 顶层键集 + `config` 子键集 + 首张 pending 卡骨架
-    /// （首次观测锁定）。
+    /// conversation snapshot 顶层键集 + `config` 子键集（首次观测锁定）。
+    /// pending 卡骨架刻意不采（见类型文档：随会话状态漂移，会分裂账本）。
     pub(crate) fn observe_snapshot(&mut self, snapshot: &Value) {
         if self.snapshot_keys.is_some() {
             return;
@@ -363,17 +366,6 @@ impl SchemaShape {
             .get("config")
             .and_then(Self::sorted_keys)
             .unwrap_or_default();
-        if let Some(card) = snapshot
-            .get("pendingInteractions")
-            .and_then(Value::as_array)
-            .and_then(|cards| cards.first())
-        {
-            self.pending_keys = Self::sorted_keys(card).unwrap_or_default();
-            self.pending_payload_keys = card
-                .get("payload")
-                .and_then(Self::sorted_keys)
-                .unwrap_or_default();
-        }
     }
 
     /// 定长 16 位十六进制指纹；hello/snapshot 骨架缺一 → `None`。
@@ -397,10 +389,6 @@ impl SchemaShape {
         snapshot.iter().for_each(|key| feed(key));
         feed("config");
         self.config_keys.iter().for_each(|key| feed(key));
-        feed("pending");
-        self.pending_keys.iter().for_each(|key| feed(key));
-        feed("payload");
-        self.pending_payload_keys.iter().for_each(|key| feed(key));
         Some(format!("{hash:016x}"))
     }
 
@@ -5354,6 +5342,31 @@ mod tests {
             "config": {"provider": "p", "model": "m", "thought": "t", "thoughtLevels": ["x"]}
         }));
         assert_ne!(a.fingerprint(), d.fingerprint(), "config 子形状变化改指纹");
+
+        // 复审轮 Important 回归钉：pending 卡有无 / 首卡题型 / payload 形状都**不**
+        // 改指纹——会话状态不属于协议形状，否则同宿主跨重启账本分裂。
+        let mut e = SchemaShape::default();
+        e.observe_hello(&json!({"kind": "hello", "protocolVersion": 3, "connectionId": "c-1"}));
+        e.observe_snapshot(&json!({
+            "revision": 1, "seq": 1, "logEpoch": "e1",
+            "control": {"activeWorks": []},
+            "pendingInteractions": [],
+            "config": {"provider": "p", "model": "m", "thought": "t"}
+        }));
+        assert_eq!(a.fingerprint(), e.fingerprint(), "有卡/无卡同指纹");
+        let mut f = SchemaShape::default();
+        f.observe_hello(&json!({"kind": "hello", "protocolVersion": 3, "connectionId": "c-1"}));
+        f.observe_snapshot(&json!({
+            "revision": 1, "seq": 1, "logEpoch": "e1",
+            "control": {"activeWorks": []},
+            "pendingInteractions": [{"kind": "permission", "payload": {"command": "rm", "options": []}, "extra": 1}],
+            "config": {"provider": "p", "model": "m", "thought": "t"}
+        }));
+        assert_eq!(
+            a.fingerprint(),
+            f.fingerprint(),
+            "卡题型/payload 形状同指纹"
+        );
 
         // 指纹是定长十六进制 id 形状，不含任何原文片段。
         assert_eq!(fa.len(), 16);
