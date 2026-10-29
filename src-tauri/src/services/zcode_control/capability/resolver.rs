@@ -269,7 +269,7 @@ mod tests {
     }
 
     /// 已知 build：shipped Confirmed/InterfaceMatched 命中且形状在场 → 可用；
-    /// shipped Unsupported 的 multi_select/free_text 即使接口形状在场也不可用
+    /// shipped 与接口对 multi_select/free_text 均按候选（形状在场即可用；三轮 B）
     /// （shipped 精确命中优先于接口候选）；形状缺席的项按 needs_evidence 关闭。
     #[test]
     fn known_build_shipped_beats_interface_candidates() {
@@ -448,8 +448,8 @@ mod tests {
         }
     }
 
-    /// 账本 confirmed 覆盖 shipped：single_select 从候选升级为确认可用，    /// 账本 confirmed 覆盖 shipped：single_select 从候选升级为确认可用，
-    /// multi_select 覆盖 shipped Unsupported（R4 首次真实动作确认的升级路径）。
+    /// 账本 confirmed 覆盖 shipped：single_select 从候选升级为确认可用；
+    /// multi_select 覆盖 shipped 候选（R4 首次真实动作确认的升级路径）。
     #[test]
     fn ledger_confirmed_overrides_shipped() {
         let key = known_build_key();

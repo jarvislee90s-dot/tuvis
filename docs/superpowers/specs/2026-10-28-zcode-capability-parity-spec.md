@@ -159,7 +159,9 @@ user real action
 - `approval_reply` confirmed（仅回答既有 permission 卡）
 - `single_select` interface_matched（ACK only）
 - `interrupt` interface_matched（ACK only）
-- `multi_select` / `free_text` unsupported（合同 false）
+- `multi_select` / `free_text` interface_matched（2026-10-29 三轮范围裁决：「未实测」≠
+  「明确不支持」——本仓解析/编码已支持，按接口形状开放为候选，首次真实动作确认
+  兜底；历史证据记录保留在 §4.1，不改写为实机通过）
 
 build 升级后不走该表。
 
