@@ -186,3 +186,19 @@ Spec：`docs/superpowers/specs/2026-10-28-zcode-capability-parity-spec.md`；Pla
 ### 7. 复审与遗留
 
 独立复审（general-purpose 约束镜，范围 `7ea6df25..8bd877df`）：四项 CLOSED，唯一必修（spec §6.3 与 shipped_state 矛盾）已修（`29b11ad2`）。遗留（非阻塞，记录在案）：①`view_with_catalog` 进广播 diff 的每帧目录克隆（会话数小+字节预算约束，可接受；后续可按 revision 预判短路）；②面板失败 chip 显示原始错误码未本地化（与 MessageComposer 既有口径一致）；③`addZcodeFiles` 无名图片的名称兜底是空操作（显示空名，不影响功能）；④takeover 客户端中断回归用例（前轮跟进项，仍开放）。
+
+
+## 十、二轮评审修复（2026-10-29，核查基线 `29b11ad2`，4 项 P2）
+
+二轮评审确认三轮方向与主体实现，列出 4 项 P2（现有测试未覆盖的分支），全部自主修复并验证：
+
+| 项 | 缺陷 | 修复 | commit | 回归 |
+|---|---|---|---|---|
+| P2-1 | 切会话实际是**卸载组件**（SessionDetail 以会话 id 为 key），面板清理只在换 sessionId prop 的 effect 体里执行——旧在途上传继续传输落盘 | 换会话 effect 增加 **unmount cleanup**（卸载与依赖变更两条路径都 abort 全部在途 XHR） | `2cc678e2` | `二轮 P2-1：离开页面（组件卸载）取消在途上传`（RED：unmount 后 aborted 为空 → GREEN） |
+| P2-2 | 发送期间续写草稿，accepted 的附件清理被「草稿未变化」守卫连坐——旧附件留到下一次发送重复携带 | 附件清理**独立于草稿**：accepted 即按提交批次 id 清除（续加的新附件保留）；文字才按是否续写决定去留 | `2cc678e2` | `二轮 P2-2：延迟 ACK 期间续写草稿 → accepted 只清附件、草稿保留，再发不带旧附件`（RED → GREEN；断言第二次发送正文恰为 B、无 markup） |
+| P2-3 | 错误分类只查 202 body 的 `code` 字段，而官方抛普通 Error（标识在 `message`）；假宿主人造 `code` 掩盖了形状差异 | 假宿主改真实形状（`{"message": 标识}`，无人造字段）；分类对 `message`/`code` 中的 `fault.command.clientMismatch` 做**精确匹配**（前缀包含不误判），其余保持 unknown | `34083bae` | 分类 e2e 扩展：正例（message 形状 → client_mismatch、零账本、不泄漏）+ 精确匹配负例（`clientMismatchPrefix` → 保持 unknown） |
+| P2-4 | `same_project_dir` 测试无平台限制却断言 macOS 特有 `/tmp↔/private/tmp` 布局，破坏 Linux/Windows 门禁 | 通用断言改 `std::env::temp_dir`（跨平台真实目录）；符号链接解析用 `std::os::unix::fs::symlink`（unix 门控）；macOS 布局断言单独 `#[cfg(target_os = "macos")]` | `34083bae` | 测试重构后本机全绿（覆盖：归一/同目录/异目录/不存在回退/符号链接/macOS 布局） |
+
+**门禁**（@ 最终 HEAD `34083bae`）：Rust lib 568 全绿；marker-helper 36 目标 ok；集成 4076/0；clippy 双构建零告警；fmt 干净；pnpm 195 文件 / 2379 passed / 0 failed（+2 条 P2 回归）；check、build:mobile 通过。
+
+**提交勘误**：`34083bae` 的 message 写作 style，实际包含 P2-3 分类实现 + P2-4 测试重构（提交时误判为纯格式化；不 amend 已提交 commit，此处如实标注）。`2cc678e2` 包含 P2-1/P2-2 修复与三条回归。
