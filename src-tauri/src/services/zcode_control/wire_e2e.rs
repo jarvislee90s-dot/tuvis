@@ -614,10 +614,10 @@ mod tests {
                     let fault_code = injected
                         .or_else(|| mismatch.then(|| "fault.command.clientMismatch".to_owned()));
                     if let Some(code) = fault_code {
-                        let body = serde_json::json!({
-                            "code": code,
-                            "message": "synthetic upstream text that must never leak",
-                        });
+                        // 官方形态（三轮评审 P2-3 修正）：普通 Error 序列化后错误
+                        // 标识在 `message`，**未必有 `code` 字段**——假体不得人为
+                        // 添加生产者不会发的形状（那会掩盖测试与真实宿主的差异）。
+                        let body = serde_json::json!({ "message": code });
                         let Ok(reply) = encode_promise_error_for_test(id, body) else {
                             return;
                         };
@@ -2705,6 +2705,23 @@ mod tests {
         assert_eq!(
             session["capabilities"]["send"]["enabled"], true,
             "send 能力不因身份错误被关闭：{session}"
+        );
+
+        // 精确匹配负例：只**包含**标识前缀但 ≠ 精确标识的 fault → 不是身份错误，
+        // 走既有 unknown 语义（保持候选，不误标 client_mismatch）。
+        chain
+            .ws
+            .set_command_fault("fault.command.clientMismatchPrefix");
+        let (status, receipt2) = post_action(
+            &app,
+            &send_body("act-cm-2", chain.hub.connection().generation, SEND_TEXT),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{receipt2}");
+        assert_eq!(receipt2["state"], "unknown", "{receipt2}");
+        assert_eq!(
+            receipt2["reasonCode"], "unknown",
+            "非精确标识不得误分类为 client_mismatch：{receipt2}"
         );
     }
 

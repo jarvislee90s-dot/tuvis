@@ -3075,11 +3075,19 @@ impl Shared {
             Ok(Ok(message)) => {
                 if message.message_type == RESPONSE_TYPE_PROMISE_ERROR {
                     // 上游原文（可能含路径/正文）绝不下发，只映射冻结码。
-                    // 三轮 A：身份不一致是确定性客户端缺陷（命令 clientId ≠ 握手
-                    // 身份），单独分类便于定位；同样不透传上游原文，且不属于能力
-                    // 失败（不降级能力，走既有 Err 路径零落账、不重发）。
-                    let fault = message.body.get("code").and_then(Value::as_str);
-                    if fault.is_some_and(|code| code.contains("clientMismatch")) {
+                    // 三轮评审 P2-3：官方抛的是普通 Error，序列化后错误标识在
+                    // `message`（未必有 `code` 字段）——对唯一允许识别的标识
+                    // `fault.command.clientMismatch` 做**精确匹配**（身份不一致是
+                    // 确定性客户端缺陷：命令 clientId ≠ 握手身份），其余一律
+                    // unknown（既有语义：零重发、保持候选）；均不透传上游原文，
+                    // 不属于能力失败（不降级能力，走既有 Err 路径零落账、不重发）。
+                    const CLIENT_MISMATCH_FAULT: &str = "fault.command.clientMismatch";
+                    let fault_code = message
+                        .body
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .or_else(|| message.body.get("code").and_then(Value::as_str));
+                    if fault_code == Some(CLIENT_MISMATCH_FAULT) {
                         Err(ZcodeError::of(codes::CLIENT_MISMATCH))
                     } else {
                         Err(ZcodeError::unknown())

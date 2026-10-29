@@ -20,8 +20,8 @@ use serde_json::{Map, Value};
 
 use super::pending::PendingBook;
 use super::types::{
-    codes, BoundTarget, CapabilityView, ModelChoice, SelectionView, SessionView, ZResult,
-    ZcodeError,
+    codes, BoundTarget, CapabilityView, ModelChoice, QueueItemView, QueueView, SelectionView,
+    SessionView, ZResult, ZcodeError,
 };
 
 /// conversation topic 前缀（`transport.ts:113,205`）。
@@ -43,6 +43,8 @@ pub struct Projection {
     last_to_seq: Option<u64>,
     book: PendingBook,
     selection: Option<SelectionView>,
+    /// 官方输入队列（`state.queue` 的只读投影；宿主未宣告 = `known=false`）。
+    queue: QueueView,
     capabilities: CapabilityView,
     applied_frames: usize,
     /// 单帧字节上限（超限 = `payload_too_large`，绝不让单帧撑爆投影）。
@@ -66,6 +68,7 @@ impl Projection {
             last_to_seq: None,
             book,
             selection: None,
+            queue: QueueView::default(),
             capabilities: CapabilityView::default(),
             applied_frames: 0,
             byte_limit,
@@ -82,6 +85,8 @@ impl Projection {
         self.subscription_id = None;
         self.ready = false;
         self.last_to_seq = None;
+        // 旧订阅的队列快照不得跨订阅/换代复活：解除 barrier 即视为未宣告。
+        self.queue = QueueView::default();
     }
 
     /// 当前激活的 subscriptionId（未激活 = `None`）。
@@ -235,6 +240,11 @@ impl Projection {
         }
     }
 
+    /// 本会话官方输入队列的只读投影（宿主未宣告 = `known=false`）。
+    pub fn queue(&self) -> &QueueView {
+        &self.queue
+    }
+
     /// 当前视图（手机唯一可见的会话状态面）。
     pub fn view(&self) -> SessionView {
         SessionView {
@@ -254,6 +264,9 @@ impl Projection {
         self.book.accept_snapshot(snapshot)?;
         self.revision = object.get("revision").and_then(Value::as_u64);
         self.selection = object.get("config").and_then(parse_selection);
+        // 快照是整份权威状态：`queue` 缺席 = 本宿主不宣告队列（`known=false`），
+        // 绝不沿用上一份快照的旧队列（旧代际/旧订阅的项不得复活）。
+        self.queue = object.get("queue").map(parse_queue).unwrap_or_default();
         Ok(())
     }
 
@@ -266,7 +279,64 @@ impl Projection {
         if object.contains_key("config") {
             self.selection = object.get("config").and_then(parse_selection);
         }
+        // 同规则：patch 带 queue 就整体换（含解析失败 → 未宣告）；缺席 = 本帧不动队列。
+        if let Some(queue) = object.get("queue") {
+            self.queue = parse_queue(queue);
+        }
         self.book.accept_delta_patch(patch)
+    }
+}
+
+/// 解析官方 `state.queue`（`{items[], autoDrain, pauseReason?}`）。
+///
+/// 纪律：
+/// - `items` 必须是数组、`autoDrain` 必须是布尔，否则整份队列按「未宣告」处理
+///   （`known=false`）——绝不把坏形状猜成空队列；
+/// - 单项坏形状只跳过该项（不丢整份队列、不丢身份）；
+/// - 身份只取宿主原值：`queueItemId` 原样作 `input_id`，`order.queuePosition` 原样作
+///   `position`；不按正文/数组下标重算身份；
+/// - 数组顺序即官方展示顺序（宿主已按 `order.queuePosition` 排好），本层不重排。
+fn parse_queue(value: &Value) -> QueueView {
+    let Some(object) = value.as_object() else {
+        return QueueView::default();
+    };
+    let (Some(items), Some(auto_drain)) = (
+        object.get("items").and_then(Value::as_array),
+        object.get("autoDrain").and_then(Value::as_bool),
+    ) else {
+        return QueueView::default();
+    };
+    let mut queue_items = Vec::with_capacity(items.len());
+    for item in items {
+        let Some(record) = item.as_object() else {
+            continue;
+        };
+        let Some(input_id) = record
+            .get("queueItemId")
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty())
+        else {
+            continue;
+        };
+        let Some(text) = record.get("text").and_then(Value::as_str) else {
+            continue;
+        };
+        let position = record
+            .get("order")
+            .and_then(Value::as_object)
+            .and_then(|order| order.get("queuePosition"))
+            .and_then(Value::as_u64)
+            .and_then(|position| u32::try_from(position).ok());
+        queue_items.push(QueueItemView {
+            input_id: input_id.to_owned(),
+            text: text.to_owned(),
+            position,
+        });
+    }
+    QueueView {
+        known: true,
+        paused: Some(!auto_drain),
+        items: queue_items,
     }
 }
 
@@ -643,6 +713,129 @@ mod tests {
             .is(codes::NOT_READY));
         assert!(!projection.view().ready);
         assert_eq!(projection.view().revision, Some(4));
+    }
+
+    // -----------------------------------------------------------------------
+    // R0：队列合同（形状取自安装包 3.16.2.8769 的 `state.queue` 实证）
+    // -----------------------------------------------------------------------
+
+    /// 官方 `state.queue` 合成样本：两项，`autoDrain=false` + `pauseReason`（暂停）。
+    ///
+    /// 字段名/形状来自 `app.asar` 内 zod schema（见
+    /// `docs/superpowers/reviews/2026-10-29-zcode-r0-wire-evidence.md` §3）：
+    /// `{items[], autoDrain, pauseReason?}`，项 = `{queueItemId, text, order:{queuePosition}}`。
+    fn queue_state(paused: bool, items: Value) -> Value {
+        let mut queue = json!({"items": items, "autoDrain": !paused});
+        if paused {
+            queue["pauseReason"] = json!("stopped");
+        }
+        queue
+    }
+
+    fn queue_item(id: &str, text: &str, position: u64) -> Value {
+        json!({
+            "queueItemId": id,
+            "sourceCommandId": id.trim_start_matches("queue_"),
+            "clientId": "client-synthetic",
+            "kind": "sendText",
+            "text": text,
+            "delivery": {"requested": "queue", "admitted": "queue"},
+            "order": {"admissionSeq": position + 1, "queuePosition": position},
+            "dispatch": {"state": "queued"},
+            "admittedAt": 1_700_000_000_000u64
+        })
+    }
+
+    #[test]
+    fn queue_snapshot_and_delta_preserve_input_identity() {
+        let mut projection = Projection::new(target(1));
+        projection.activate(SUB);
+        // 宿主未宣告队列时是「未知」，不是「空队列」。
+        assert!(!projection.queue().known);
+        assert_eq!(projection.queue().paused, None);
+
+        let mut snapshot = base_snapshot();
+        snapshot["queue"] = queue_state(
+            true,
+            json!([
+                queue_item("queue_cmd-synthetic-1", "first queued", 0),
+                queue_item("queue_cmd-synthetic-2", "second queued", 1),
+            ]),
+        );
+        projection
+            .apply(1, snapshot_frame(SUB, snapshot, 0, 1))
+            .expect("snapshot with queue");
+        let queue = projection.queue().clone();
+        assert!(queue.known, "宿主宣告了 queue → 已知");
+        assert_eq!(queue.paused, Some(true), "autoDrain=false → 暂停");
+        assert_eq!(queue.items.len(), 2);
+        // 身份/正文/次序全部保留宿主原值，不按正文或下标重算。
+        assert_eq!(queue.items[0].input_id, "queue_cmd-synthetic-1");
+        assert_eq!(queue.items[0].text, "first queued");
+        assert_eq!(queue.items[0].position, Some(0));
+        assert_eq!(queue.items[1].input_id, "queue_cmd-synthetic-2");
+        assert_eq!(queue.items[1].position, Some(1));
+
+        // 增量：整对象替换（官方 patch 即整键替换），消费首项 + 恢复 autoDrain。
+        projection
+            .apply(
+                1,
+                delta_frame(
+                    SUB,
+                    json!({
+                        "revision": 5,
+                        "queue": queue_state(false, json!([queue_item("queue_cmd-synthetic-2", "second queued", 0)]))
+                    }),
+                    1,
+                    2,
+                ),
+            )
+            .expect("queue delta");
+        let queue = projection.queue().clone();
+        assert_eq!(queue.paused, Some(false), "autoDrain=true → 未暂停");
+        assert_eq!(queue.items.len(), 1, "已消费项不得残留");
+        assert_eq!(queue.items[0].input_id, "queue_cmd-synthetic-2");
+        assert_eq!(queue.items[0].position, Some(0), "宿主重排后的位置原样保留");
+
+        // 缺 queue 键的增量不动队列（不把「本帧没提」当成「已清空」）。
+        projection
+            .apply(1, delta_frame(SUB, json!({"revision": 6}), 2, 3))
+            .expect("unrelated delta");
+        assert_eq!(projection.queue().items.len(), 1);
+
+        // 旧代际样本丢弃：零应用，队列原样。
+        assert!(projection
+            .apply(
+                2,
+                delta_frame(
+                    SUB,
+                    json!({"revision": 7, "queue": queue_state(true, json!([]))}),
+                    3,
+                    4
+                )
+            )
+            .is_err());
+        assert_eq!(projection.queue().items.len(), 1);
+        assert_eq!(projection.queue().paused, Some(false));
+
+        // 换代（重订阅解除 barrier）：旧队列不得复活。
+        projection.deactivate();
+        assert!(!projection.queue().known);
+        assert!(projection.queue().items.is_empty());
+    }
+
+    #[test]
+    fn malformed_queue_shape_is_unknown_not_empty() {
+        let mut projection = Projection::new(target(1));
+        projection.activate(SUB);
+        let mut snapshot = base_snapshot();
+        // `items` 不是数组：整份按未宣告处理，绝不猜成空队列。
+        snapshot["queue"] = json!({"items": "nope", "autoDrain": true});
+        projection
+            .apply(1, snapshot_frame(SUB, snapshot, 0, 1))
+            .expect("snapshot still readable");
+        assert!(!projection.queue().known);
+        assert_eq!(projection.queue().paused, None);
     }
 
     #[test]

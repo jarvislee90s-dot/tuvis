@@ -11054,28 +11054,60 @@ mod tests {
     /// 真实不同目录（canonicalize 后仍不等）。
     #[test]
     fn same_project_dir_normalizes_and_resolves_symlinks() {
+        // 通用面（跨平台）：尾斜杠/空白归一。
         assert!(same_project_dir("/tmp/travel", "/tmp/travel/"));
         assert!(same_project_dir(" /tmp/travel ", "/tmp/travel"));
-        // macOS：/tmp 是 /private/tmp 的符号链接——真实路径必须判等。
-        let unique = format!("tuvis-att-test-{}", std::process::id());
-        let as_tmp = format!("/tmp/{unique}");
-        let as_private = format!("/private/tmp/{unique}");
-        std::fs::create_dir_all(&as_private).expect("建临时目录");
-        assert!(
-            same_project_dir(&as_tmp, &as_private),
-            "{as_tmp} 与 {as_private} 应判同一目录"
-        );
-        // 真实不同目录：canonicalize 双侧成功仍不等。
-        let other = format!("/private/tmp/{unique}-other");
-        std::fs::create_dir_all(&other).expect("建另一临时目录");
-        assert!(!same_project_dir(&as_tmp, &other));
-        std::fs::remove_dir_all(&as_private).ok();
-        std::fs::remove_dir_all(&other).ok();
+        // 通用面：临时目录真实存在时 canonicalize 双侧成功；同一目录判等、
+        // 不同目录不等（std::env::temp_dir 在 Linux/Windows/macOS 都有稳定布局）。
+        let base = std::env::temp_dir();
+        let dir_a = base.join(format!("tuvis-att-a-{}", std::process::id()));
+        let dir_b = base.join(format!("tuvis-att-a-{}", std::process::id()));
+        let dir_c = base.join(format!("tuvis-att-c-{}", std::process::id()));
+        std::fs::create_dir_all(&dir_a).expect("建临时目录 a");
+        std::fs::create_dir_all(&dir_c).expect("建临时目录 c");
+        assert!(same_project_dir(
+            &dir_a.to_string_lossy(),
+            &dir_b.to_string_lossy()
+        ));
+        assert!(!same_project_dir(
+            &dir_a.to_string_lossy(),
+            &dir_c.to_string_lossy()
+        ));
+        std::fs::remove_dir_all(&dir_a).ok();
+        std::fs::remove_dir_all(&dir_c).ok();
         // 目录不存在：canonicalize 失败 → 回退字符串比较，不等。
         assert!(!same_project_dir(
             "/tmp/definitely-missing-a",
             "/tmp/definitely-missing-b"
         ));
+        // 符号链接解析（符号链接创建是 Unix 能力；macOS 特有的 /tmp↔/private/tmp
+        // 布局单独断言，不混入跨平台用例）。
+        #[cfg(unix)]
+        {
+            let real = base.join(format!("tuvis-att-real-{}", std::process::id()));
+            let link = base.join(format!("tuvis-att-link-{}", std::process::id()));
+            std::fs::create_dir_all(&real).expect("建真实目录");
+            std::os::unix::fs::symlink(&real, &link).expect("建符号链接");
+            assert!(same_project_dir(
+                &link.to_string_lossy(),
+                &real.to_string_lossy()
+            ));
+            std::fs::remove_dir_all(&real).ok();
+            std::fs::remove_file(&link).ok();
+        }
+        #[cfg(target_os = "macos")]
+        {
+            // macOS 布局：/tmp 是 /private/tmp 的符号链接。
+            let unique = format!("tuvis-att-macos-{}", std::process::id());
+            let as_tmp = format!("/tmp/{unique}");
+            let as_private = format!("/private/tmp/{unique}");
+            std::fs::create_dir_all(&as_private).expect("建临时目录");
+            assert!(
+                same_project_dir(&as_tmp, &as_private),
+                "{as_tmp} 与 {as_private} 应判同一目录"
+            );
+            std::fs::remove_dir_all(&as_private).ok();
+        }
     }
 
     /// 三轮 C：一致性闸只对已绑定会话生效；未绑定（无 hub / 桥不知会话）直接放行。

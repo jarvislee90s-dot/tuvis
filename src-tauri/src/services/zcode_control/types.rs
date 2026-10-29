@@ -842,6 +842,36 @@ pub struct ControlEvent {
     pub device_id: Option<String>,
 }
 
+/// 官方输入队列里的一项（`state.queue.items[]` 的只读投影）。
+///
+/// 身份只认宿主原值：`input_id` = 官方 `queueItemId`（`queue_<commandId>` 派生，
+/// 但 Tuvis **不重算**，直接透传），`position` = `order.queuePosition`（0 基，
+/// 缺席 = `None`，绝不按数组下标猜位置）。`text` 是官方队列项正文原文。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QueueItemView {
+    pub input_id: String,
+    pub text: String,
+    pub position: Option<u32>,
+}
+
+/// 官方输入队列视图（`state.queue`）。
+///
+/// 三态必须可区分（计划 R2）：
+/// - `known=false`：宿主**未宣告**队列（旧载荷/快照缺 `queue` 键）→ 前端视为未知，
+///   绝不渲染「队列为空」；
+/// - `known=true` + `items=[]`：宿主明确宣告空队列；
+/// - `paused=Some(false)`：`autoDrain=true`（未暂停）；`paused=Some(true)`：暂停
+///   （`autoDrain=false`，可能带 `pauseReason`）；`paused=None`：宿主未给 `autoDrain`
+///   → **不得**当成未暂停。
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QueueView {
+    pub known: bool,
+    pub paused: Option<bool>,
+    pub items: Vec<QueueItemView>,
+}
+
 /// 会话投影视图（手机唯一可见的会话状态面）。
 ///
 /// 只包含**已按本会话 topic + 当前 subscriptionId + 当前代际**过滤后的数据；
