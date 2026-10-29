@@ -42,21 +42,23 @@ Spec：`docs/superpowers/specs/2026-10-28-zcode-capability-parity-spec.md`；Pla
 | T8 | hub 两条 + handler 集成 + vitest | E0599 / handler 403 / 前端 3 failed | cargo 全量 3520；vitest 31 passed；check:i18n/lint 过 |
 | T9 | `cargo test --lib services::zcode_control::wire_e2e` + vitest | e2e 行为 RED（revision 停 1 + 账本无 confirmed）；UI 合规测试如实申报 GREEN on arrival（T1-T8 已交付合规 UI，未为凑 RED 破坏组件） | wire_e2e 14→15（补 pending 腿，行为级 RED→GREEN）；zcode_control 551；vitest 32/32 |
 
-## 三、全量门禁（plan §4；控制器独立复跑两轮：初版 @ a148dad9、修复轮 @ 3b70a916，两轮全绿）
+## 三、全量门禁（plan §4）
 
-| 门禁 | 初版 @ a148dad9 | 修复轮 @ 3b70a916 |
-|---|---|---|
-| `cargo test --lib services::zcode_control::` | ✅ 551 passed | ✅ 563 passed / 0 failed |
-| `cargo test --features marker-helper` | ✅ 36 目标全 ok | ✅ 36 目标全 ok，无 FAILED |
-| `cargo test --tests --features marker-helper,zcode-bridge-evidence` | ✅ 0 failed | ✅ 4069 passed / 0 failed |
-| `cargo clippy --all-targets --features marker-helper -- -D warnings` | ✅ | ✅ Finished，零告警 |
-| `cargo clippy --all-targets --features marker-helper,zcode-bridge-evidence -- -D warnings` | ✅ | ✅ Finished，零告警 |
-| `cargo fmt --check` | ✅ | ✅ |
-| `pnpm test` | ✅ 2372 passed | ✅ 194 文件 / 2372 passed、5 skipped / 0 failed |
-| `pnpm check` | ✅ exit 0 | ✅ exit 0 |
-| `pnpm build:mobile` | ✅ exit 0 | ✅ exit 0 |
+门禁共三轮，**最终轮在最终代码 HEAD `68c99327` 全量复跑，九条全绿**（此前轮次只证明对应历史 HEAD 的状态，不外推）：
 
-**门禁绿 ≠ 语义正确**：初版九条全绿时代码里仍有两处 P0（§八），因为相关测试把错误行为写成了预期（unknown-build e2e 断言 model 关闭、pending 泵路径测试依赖本地消费假确认通过）。修复轮补的测试均经过「失败测试先 RED / 变异验证」证明真实咬合。
+| 门禁 | @ a148dad9（初版） | @ 3b70a916（评审修复轮一） | @ 68c99327（最终代码 HEAD） |
+|---|---|---|---|
+| `cargo test --lib services::zcode_control::` | ✅ 551 | ✅ 563 | ✅ 564 passed / 0 failed |
+| `cargo test --features marker-helper` | ✅ 36 目标全 ok | ✅ 36 目标全 ok | ✅ 36 目标全 ok，无 FAILED |
+| `cargo test --tests --features marker-helper,zcode-bridge-evidence` | ✅ 0 failed | ✅ 4069 / 0 failed | ✅ 4070 passed / 0 failed |
+| `cargo clippy --all-targets --features marker-helper -- -D warnings` | ✅ | ✅ | ✅ exit 0 |
+| `cargo clippy --all-targets --features marker-helper,zcode-bridge-evidence -- -D warnings` | ✅ | ✅ | ✅ exit 0 |
+| `cargo fmt --check` | ✅ | ✅ | ✅ |
+| `pnpm test` | ✅ 2372 passed | ✅ 2372 passed | ✅ 首轮 1 个失败文件（未捕获到文件名，与已知 flaky 群体相容但未确证）；**随后 3 次全量重跑全绿**：194 文件 / 2372 passed、5 skipped / 0 failed |
+| `pnpm check` | ✅ | ✅ | ✅ exit 0 |
+| `pnpm build:mobile` | ✅ | ✅ | ✅ exit 0 |
+
+**门禁绿 ≠ 语义正确**：初版九条全绿时代码里仍有两处 P0（§八），因为相关测试把错误行为写成了预期。修复轮补的测试均经「失败测试先 RED / 变异验证」证明真实咬合（P0-1、P0-2、P2 各一次变异验证，含复审者独立复做）。
 
 ## 四、计划偏差（已裁决，全部记录在案）
 
@@ -82,9 +84,9 @@ Spec：`docs/superpowers/specs/2026-10-28-zcode-capability-parity-spec.md`；Pla
 
 ## 六、最终状态（2026-10-29 修订）
 
-- 最终代码 HEAD：复审轮修复 commit（紧随本报告修订之后，见 §八末）；初版报告写作 `a148dad9` 是错的——那是初版的代码尾 commit，初版报告自身提交于 `370d93a4`。
+- 最终代码 HEAD：`68c99327`（二轮评审修复，见 §八「二轮复审」）；初版报告写作 `a148dad9` 是错的——那是初版的代码尾 commit，初版报告自身提交于 `370d93a4`。
 - 工作树：干净（`git status` 零输出）。
-- 分支 commits：`0c111c06..3b70a916` 共 19 个 = T1-T9 计划内 13 个 + 最终审查修复 2 个（`191bcc31`/`a148dad9`）+ 初版报告 `370d93a4` + 外部评审修复 5 个（`95a38d83`/`56be58a7`/`4d1be38e`/`404ff524`/`3b70a916`）；其后为报告修订（`581e6346`/`339c00f6`）与复审轮修复。
+- 分支 commits：`0c111c06..3b70a916` 共 19 个 = T1-T9 计划内 13 个 + 最终审查修复 2 个（`191bcc31`/`a148dad9`）+ 初版报告 `370d93a4` + 一轮评审修复 5 个（`95a38d83`/`56be58a7`/`4d1be38e`/`404ff524`/`3b70a916`）；其后为报告修订（`581e6346`/`339c00f6`）、一轮复审修复（`646cb2d4`）、二轮评审修复（`68c99327`）与本报告修订。
 - 未 push、未 merge、未 tag（遵执行纪律，合并由用户与外部评审决定）。
 
 ## 七、审查缓办项（历史分诊存档；初版「无必修项」结论已被外部评审推翻，见 §八）
@@ -107,6 +109,15 @@ Spec：`docs/superpowers/specs/2026-10-28-zcode-capability-parity-spec.md`；Pla
 修复轮门禁（控制器独立复跑 @ `3b70a916`，全部绿）：见 §三修复轮列。
 
 评审报告问题两项已修正：①本报告 §结论/§六改写，如实标注初版「可合并」结论不成立；②HEAD 记录以 `3b70a916` 为准并解释初版错误来源。
+
+### 二轮评审与修复（2026-10-29，核查基线 `646cb2d4`）
+
+二轮评审确认一轮六项修复成立，新发现 1 项 **P2**（唯一合并阻塞）+ 3 项非阻塞建议：
+
+- **P2 实时帧覆盖合并目录**：GET 读路径（`view_with_catalog`）返回合并目录，而泵广播面 `on_data_outcome` 的前后 diff 用原始投影 `projection.view()`——手机在会话事件上整包覆盖状态，模型下拉刚由 GET 恢复就被下一条实时帧打回单项，且 ready=true 不触发补拉。**修复**：广播面前后视图统一走 `view_with_catalog`（与读路径同一出口）。commit `68c99327`。**证据**：e2e `session_broadcast_keeps_full_catalog_across_live_delta`（GET 得两模型 → 宿主正常快照换模型推进 revision 2 → Hub 广播 Session 事件必须仍带 [a,b] 且 selection.model=b → 实时帧后 GET 仍 [a,b]）；RED 精确复现（广播载荷 models=[b]）→ GREEN；**变异验证**（广播面还原原始投影 → 测试以同一症状失败）。
+- spec §12 的指纹条目已同步为真实形状哈希实现（原 `"v4"` 占位描述作废，历史见 §八一轮 P1-3 行）。
+- 门禁表述修正：§三改为三轮分列，最终轮在 `68c99327` 全量复跑（pnpm test 首轮 1 个失败文件未捕获名称、3 次重跑全绿，如实记录不掩盖）。
+- takeover 客户端中断回归：维持为测试跟进项（二轮评审确认非阻塞）。
 
 ### 复审轮（requesting-code-review，范围 `a148dad9..339c00f6`）
 
