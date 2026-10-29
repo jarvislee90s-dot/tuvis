@@ -1151,16 +1151,19 @@ impl BridgeManager {
             let mut inner = lock(&self.shared.state);
             // 前/后快照与 `handle_data` 在同一把状态锁内：视图差异就是「本帧」
             // 的效果，不会混入锁外其它调用者的读写。
+            // 前后视图都走「投影 + 目录缓存」合并（与读路径同一出口）：广播面若用
+            // 原始投影，实时帧会把 GET 合并出的完整模型目录整体覆盖掉（外部评审
+            // P2：手机在会话事件上整包覆盖状态，目录随帧丢失且 ready=true 不补拉）。
             let before: HashMap<String, SessionView> = inner
                 .sessions
                 .iter()
-                .map(|(session_id, entry)| (session_id.clone(), entry.projection.view()))
+                .map(|(session_id, entry)| (session_id.clone(), entry.view_with_catalog()))
                 .collect();
             let (result, acks, releases) = inner.handle_data(&payload);
             // 成败都做 diff：错误帧的降级/恢复视图同样是「本帧真实发生的状态变化」。
             let mut changed = Vec::new();
             for (session_id, entry) in inner.sessions.iter() {
-                let after = entry.projection.view();
+                let after = entry.view_with_catalog();
                 if before.get(session_id) != Some(&after) {
                     changed.push(after);
                 }

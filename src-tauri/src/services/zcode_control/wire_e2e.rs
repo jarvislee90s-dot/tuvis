@@ -49,7 +49,8 @@ mod tests {
     use super::super::projection::CONVERSATION_TOPIC_PREFIX;
     use super::super::relay::{DeviceRoute, RelayClient, RelayEvent};
     use super::super::types::{
-        codes, CapabilityFlag, CapabilityView, ConnectionState, HostBuildProbe, TargetKey, ZResult,
+        codes, CapabilityFlag, CapabilityView, ConnectionState, ControlEventKind, HostBuildProbe,
+        TargetKey, ZResult,
     };
     use crate::database::dao::settings::try_set_setting_conn;
     use crate::database::{migration, schema};
@@ -182,6 +183,8 @@ mod tests {
         /// 外部评审 C1：`model-selection.getView` 应答体。None = 既有空应答（目录
         /// 采不到）；Some = 真实目录形态（已知 build e2e 的目录形状来源）。
         model_catalog: Arc<Mutex<Option<serde_json::Value>>>,
+        /// P2 回归注入：后续会话快照的 `config.model` 覆盖（见 FakeHostState）。
+        snapshot_model: Arc<Mutex<Option<String>>>,
         /// `drop_link()` 的断链信号：每条连接 select 它，收到即发 Close 并收尾。
         drop_tx: tokio::sync::broadcast::Sender<()>,
         task: tokio::task::JoinHandle<()>,
@@ -221,6 +224,12 @@ mod tests {
         /// 设定 `getView` 的合成目录（外部评审 C1；须在触发目录读前设定）。
         fn set_model_catalog(&self, catalog: serde_json::Value) {
             *self.model_catalog.lock().expect("目录锁") = Some(catalog);
+        }
+
+        /// 设定后续会话快照（ACK 跟进帧）的 `config.model`（P2 回归注入；
+        /// 须在触发该帧的动作前设定）。
+        fn set_snapshot_model(&self, model: &str) {
+            *self.snapshot_model.lock().expect("快照模型锁") = Some(model.to_owned());
         }
 
         /// 从假体侧主动断链：已建立的连接收到 Close（生产 relay 观察到掉线，但
@@ -276,6 +285,8 @@ mod tests {
         let pending_card_per_conn = pending_card.clone();
         let model_catalog = Arc::new(Mutex::new(None));
         let model_catalog_per_conn = model_catalog.clone();
+        let snapshot_model = Arc::new(Mutex::new(None));
+        let snapshot_model_per_conn = snapshot_model.clone();
         let (drop_tx, _keep_drop_rx) = tokio::sync::broadcast::channel(8);
         let drop_signal = drop_tx.clone();
         let task = tokio::spawn(async move {
@@ -293,6 +304,7 @@ mod tests {
                         ack: ack_mode.clone(),
                         pending_card: pending_card_per_conn.clone(),
                         model_catalog: model_catalog_per_conn.clone(),
+                        snapshot_model: snapshot_model_per_conn.clone(),
                     },
                     drop_signal.subscribe(),
                 ));
@@ -307,6 +319,7 @@ mod tests {
             ack,
             pending_card,
             model_catalog,
+            snapshot_model,
             drop_tx,
             task,
         }
@@ -413,10 +426,13 @@ mod tests {
     ///
     /// `seq` 与 `revision` 同值前进：`seq` 推进日志头指纹（send 确认的「新用户消息
     /// 可见」观察面），`revision` 推进会话水位（send 确认的「revision 前进」判据）。
-    fn synthetic_conversation_snapshot(
+    /// 同步合成会话快照；`model` 覆盖 `config.model`（P2 回归注入：宿主换模型的
+    /// 实时快照）。
+    fn synthetic_conversation_snapshot_with_model(
         session_id: &str,
         revision: u64,
         pending_cards: &[serde_json::Value],
+        model: &str,
     ) -> serde_json::Value {
         serde_json::json!({
             "protocolVersion": 1,
@@ -428,7 +444,7 @@ mod tests {
             "pendingInteractions": pending_cards,
             "config": {
                 "provider": "synthetic-provider",
-                "model": "synthetic-model-a",
+                "model": model,
                 "thought": "high",
             },
         })
@@ -443,6 +459,7 @@ mod tests {
         session_id: &str,
         revision: u64,
         pending_cards: &[serde_json::Value],
+        model: &str,
     ) {
         // 生产在订阅 RPC 之前先发 EventListen；缺 listen id 就无法路由事件帧。
         let Some(listen) = peer.listen.get(bridge).copied() else {
@@ -457,7 +474,12 @@ mod tests {
             "sentAt": 0,
             "payload": {
                 "kind": "snapshot",
-                "snapshot": synthetic_conversation_snapshot(session_id, revision, pending_cards),
+                "snapshot": synthetic_conversation_snapshot_with_model(
+                    session_id,
+                    revision,
+                    pending_cards,
+                    model,
+                ),
             },
         });
         let wire = serde_json::json!({
@@ -493,6 +515,7 @@ mod tests {
             ack,
             pending_card,
             model_catalog,
+            snapshot_model,
         } = host;
         let bridge = payload
             .get("bridgeSessionId")
@@ -590,7 +613,16 @@ mod tests {
                         .clone()
                         .map(|card| vec![card])
                         .unwrap_or_default();
-                    push_conversation_snapshot(socket, peer, &bridge, &session_id, 1, &cards).await;
+                    push_conversation_snapshot(
+                        socket,
+                        peer,
+                        &bridge,
+                        &session_id,
+                        1,
+                        &cards,
+                        "synthetic-model-a",
+                    )
+                    .await;
                 }
                 // T9：Accepted ACK 后推一条 revision/seq 前进的会话快照（revision=2），
                 // 模拟宿主吸收用户消息/答案后的会话状态推进。这**不是**探针消息——
@@ -607,8 +639,21 @@ mod tests {
                     if let Some(session_id) = peer.conversation.clone() {
                         // 会话快照走该会话桥的 listen id；经 rpc-frame 的 bridge 就是
                         // 会话桥（send/resolve 命令只在会话桥上发出）。
-                        push_conversation_snapshot(socket, peer, &bridge, &session_id, 2, &[])
-                            .await;
+                        let model = snapshot_model
+                            .lock()
+                            .expect("快照模型锁")
+                            .clone()
+                            .unwrap_or_else(|| "synthetic-model-a".to_owned());
+                        push_conversation_snapshot(
+                            socket,
+                            peer,
+                            &bridge,
+                            &session_id,
+                            2,
+                            &[],
+                            &model,
+                        )
+                        .await;
                     }
                 }
             }
@@ -697,6 +742,9 @@ mod tests {
         ack: Arc<Mutex<AckMode>>,
         pending_card: Arc<Mutex<Option<serde_json::Value>>>,
         model_catalog: Arc<Mutex<Option<serde_json::Value>>>,
+        /// P2 回归注入：后续会话快照（ACK 跟进帧）的 `config.model` 覆盖。
+        /// None = 合成默认 `synthetic-model-a`。
+        snapshot_model: Arc<Mutex<Option<String>>>,
     }
 
     /// 单条回环 WS 连接的握手/心跳应答（配对即刻完成）、app 请求分派与数据面回显。
@@ -2298,6 +2346,112 @@ mod tests {
             )
             .expect("count");
         assert_eq!(rows, 0, "已知 build shipped confirmed 零账本行");
+    }
+
+    /// 外部评审 P2 回归 e2e：**实时广播不得覆盖合并目录**。
+    ///
+    /// GET 经读路径合并 `getView` 目录；随后宿主推一条正常快照（revision 2、换
+    /// 模型），Hub 广播的 Session 事件——即 `/zcode/events` 的 `event: session`
+    /// 载荷源（`control_frame` 只过滤转发 `ControlEvent.data`，手机
+    /// `useZcodeControl` 按它整体覆盖状态）——必须**仍带完整目录**且当前选择随
+    /// 宿主更新。修复前泵广播面用原始投影，模型下拉掉回单项。
+    #[tokio::test]
+    async fn session_broadcast_keeps_full_catalog_across_live_delta() {
+        let chain = resolver_chain(Arc::new(|| Some("9.9.9.9999".to_owned()))).await;
+        chain.ws.set_model_catalog(serde_json::json!({
+            "providers": [
+                {"providerId": "synthetic-provider", "models": [
+                    {"modelId": "synthetic-model-a", "config": {"optionSpecs": {"reasoningLevel": {"values": ["low", "high"]}}}},
+                    {"modelId": "synthetic-model-b", "config": {"optionSpecs": {"reasoningLevel": {"values": ["low"]}}}}
+                ]}
+            ]
+        }));
+        let app = router(remote_state(
+            &chain.conn,
+            chain.hub.clone(),
+            chain.injector.clone(),
+        ));
+
+        // ---- 1) GET：读路径合并目录，两个模型都在（当前 a）----
+        let session = bind_and_wait_ready(&app, SYNTHETIC_TASK_ID).await;
+        let ids: Vec<&str> = session["selection"]["models"]
+            .as_array()
+            .expect("selection.models 数组")
+            .iter()
+            .filter_map(|m| m["modelId"].as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            ["synthetic-model-a", "synthetic-model-b"],
+            "GET 必须给出合并后的完整目录：{session}"
+        );
+        assert_eq!(session["selection"]["model"], "synthetic-model-a");
+
+        // ---- 2) 订阅 Hub 广播（SSE 会话事件的同源载荷）----
+        let mut events = chain.hub.subscribe();
+
+        // ---- 3) 宿主正常推进：注入「换模型」覆盖后发一条 send，假体回 ACK 跟进
+        // 快照（revision 2、config.model = b）——这是一条普通实时帧 ----
+        chain.ws.set_snapshot_model("synthetic-model-b");
+        let generation = chain.hub.connection().generation;
+        let (status, receipt) =
+            post_action(&app, &send_body(ACTION_ID, generation, SEND_TEXT)).await;
+        assert_eq!(status, StatusCode::OK, "{receipt}");
+        assert_eq!(receipt["state"], "accepted");
+
+        // ---- 4) 广播 Session 事件（revision 2）：完整目录保留 + 选择随宿主更新 ----
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let payload = loop {
+            let event = tokio::time::timeout(Duration::from_secs(2), events.recv())
+                .await
+                .expect("广播事件读取超时")
+                .expect("广播通道不关闭");
+            if event.kind != ControlEventKind::Session {
+                continue;
+            }
+            if event.data["revision"].as_u64() != Some(2) {
+                continue;
+            }
+            break event.data;
+        };
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "时限内未取得 revision 2 的 Session 广播"
+        );
+        assert_eq!(
+            payload["selection"]["model"], "synthetic-model-b",
+            "当前选择必须随宿主快照更新：{payload}"
+        );
+        let ids: Vec<&str> = payload["selection"]["models"]
+            .as_array()
+            .expect("实时广播必须仍带 selection.models")
+            .iter()
+            .filter_map(|m| m["modelId"].as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            ["synthetic-model-a", "synthetic-model-b"],
+            "实时帧不得覆盖合并目录（P2）：{payload}"
+        );
+
+        // ---- 5) GET 再次核对：实时帧之后目录仍在 ----
+        let (status, session_after) = get_json(
+            &app,
+            &format!("/m/api/v1/zcode/session?sessionId={SYNTHETIC_TASK_ID}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let ids: Vec<&str> = session_after["selection"]["models"]
+            .as_array()
+            .expect("selection.models 数组")
+            .iter()
+            .filter_map(|m| m["modelId"].as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            ["synthetic-model-a", "synthetic-model-b"],
+            "实时帧后的 GET 仍须保留完整目录：{session_after}"
+        );
     }
 
     /// T9 补腿 e2e（brief 验收「pending 卡首答确认」）：未知 build 的会话快照带一张
