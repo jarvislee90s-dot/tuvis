@@ -214,7 +214,18 @@ pub async fn takeover(State(st): State<Arc<RemoteState>>) -> Response {
             serde_json::json!({ "error": codes::NOT_READY }),
         );
     };
-    match hub.takeover_requested().await {
+    // 外部评审 P1-4：抢回是**断开 + 重连**的长流程（持 `takeover_lock` 跨网络
+    // await）。若直接在 handler future 里 await，客户端断网/abort 丢弃 future 会
+    // 把流程腰斩——Hub 可能停在 `Connecting`，而 takeover 对 `Connecting` 幂等
+    // 返回、auto worker 也不接管，手机从此无法自救。改为独立任务跑完全程：
+    // handler 只是等它的结果；客户端提前离场，任务仍收敛（成功 Paired /
+    // 失败回显码），下一次请求按落定状态走幂等或重试。
+    let result = match tokio::spawn(async move { hub.takeover_requested().await }).await {
+        Ok(result) => result,
+        // 任务 panic/被运行时取消：按 unknown 回冻结码，不猜连接终态。
+        Err(_) => Err(ZcodeError::unknown()),
+    };
+    match result {
         Ok(view) => ([(CACHE_CONTROL, "no-store")], Json(view)).into_response(),
         Err(error) => takeover_error(error),
     }
