@@ -129,3 +129,60 @@ Spec：`docs/superpowers/specs/2026-10-28-zcode-capability-parity-spec.md`；Pla
 
 评审 P2/记录项处置（本轮不改码，逐项回应）：单击即发=产品裁决面（常驻说明文案保留，是否升级二次模态由用户裁决）；并发 takeover 二次冲突会再跑一轮（`takeover_lock` 串行化已保证不叠加连接流；注释已按实际语义核对，无并发用例留在缓办项）；interface 证据宿主级 OR（动作侧按目标再校验，无跨会话越权，接受）；`action_failed` 不在前端码表（下一批 UX 清理带走）；DB 读失败 fail-open（内存 last-known degraded 记为后续改进项）；读侧不复验 reason_code（写侧硬闸已挡源头，读侧复验记为潜在雷）；上传文件 spec 明确排除、未混入（另立项）；真机未跑项维持如实登记（§五），合并前需 unknown build 与 takeover 的真实链路证据。
 
+
+
+## 九、第三轮增量修复（2026-10-29，用户确认新范围）
+
+用户确认范围：①修复所有写动作的协议身份；②八项能力尽量按接口开放；③接入通用附件上传（正文引用方式）；并同步 spec/plan 旧「本批不接附件」范围条款（不改 MASTER-PLAN）。执行方式：systematic-debugging（先根因后修复，TDD RED→GREEN）+ 独立复审。基线 `7ea6df25`，最终 HEAD `29b11ad2`。
+
+### 1. 协议身份（commit `72994ffd`）
+
+- **根因（用户已确认）**：clientHello 用 `tuvis-remote`（bridge.rs），命令信封却用手机 device_id（command.rs 4 处 json!/insert + snooze 2 处实参）→ 官方 `fault.command.clientMismatch`（202 Promise Error），旧实现把它一律映射成 `unknown` 吞掉。
+- **修复**：`types::PROTOCOL_CLIENT_ID` 单一来源（clientHello + 全部五类信封：send/resolve/stop/selection/snooze）；手机 device_id 仍用于幂等身份（actionId+device+session+generation+kind）、审计（write_audit/zcode_actions.device_id）、回执归属，绝不进协议信封。
+- **错误分类**：`call_with_timeout` 对 202 按 fault code 分类——含 `clientMismatch` → 新冻结码 `codes::CLIENT_MISMATCH`（`client_mismatch`），其余保持 unknown；上游原文不透传；`settle_receipt` 对 client_mismatch 回执零落账（同 SendFailed：身份错误不是能力失败、不降级、不重发）。
+- **测试**：严格假宿主（记录握手身份 + 逐一核对命令信封，不一致回 202 fault）——RED 复现生产症状（send → unknown）→ GREEN；`client_mismatch_fault_classifies_locally_without_resend_or_degrade`（不透传/不重发/账本 0 行/send 保持 enabled）；审计归属断言（zcode_actions.device_id = 配对手机）；**变异验证**（信封改回 device_id → 严格宿主以 client_mismatch 拒绝）；纠正 7 处把旧错误身份写成预期的既有断言（command.rs 6 + wire_e2e 3 → PROTOCOL_CLIENT_ID）；前端 21 码表 + zh/en 文案。
+
+### 2. 八项能力开放（commits `8e79cf89` + `d34a3f5e` + `29b11ad2`）
+
+- shipped 表（已知 build 3.16.2.8769/protocol 3）：`multi_select`/`free_text` 从 Unsupported → **InterfaceMatched**（候选）。「未实测」≠「明确不支持」：历史证据记录保留在 spec §4.1（不改写为实机通过）；本仓解析（pending 卡 multiSelect/freeText 形状）与编码（build_user_answer 多选/自由作答）均已支持；无卡形状时接口闸仍关闭；首次真实动作确认/降级照常兜底。spec §6.3 同步（复审必修项）。
+- **矩阵回归** `eight_capabilities_matrix_across_builds_and_shapes`：已知+未知 build × 全形状八项全部候选开放（reasonCode=None）× 8 个逐一缺席分支关闭（needs_evidence）+ 兄弟能力不受牵连（multi 缺形状不影响 single/free）。混合题注册已有测试保持。
+- 不把身份/网络/会话错误误判为能力：身份错误零落账（新测）；网络（offline）/会话（stale_generation）错误维持既有 Err 路径（不降级、保持候选），本轮零改动。
+
+### 3. 通用附件上传（commits `96c94ab1` + `9f660872` + `41c4ebb0`）
+
+- **服务端闸**：`BridgeManager/HupBackend/ZcodeHub::bound_workspace_path`（桥精确绑定工作区）→ 附件 handler 一致性闸 `ensure_project_matches_bound_workspace`：仅对**已绑定** ZCode 会话生效，扫描快照 project_path 与绑定工作区不一致 → 409 `workspace_mismatch`（不透传路径原文）；`same_project_dir` 归一（尾斜杠 + canonicalize 解析 macOS /tmp↔/private/tmp 符号链接，单测钉住）。未绑定/非 ZCode 会话零变化（单测 + e2e 404 步）。
+- **回环 e2e** `attachment_uploads_to_bound_workspace_and_flows_into_send_body`：真实 HTTP 上传字节 → 落盘 `.tuvis-attachments/<sid>/hello.txt` 内容一致 → sendText 正文含 `<file path="...">` → `injector.calls()==0`（零终端/无头回落）→ 409 不一致。
+- **前端**：共享 `src/mobile/attachments.ts`（PendingAttachment 形状/`attachmentMarkup` 引用约定/`isImageFile`/id）——MessageComposer 改引共享（81 测试零回归）；ZcodeControlPanel 接入：附件钮/文件选择/图片粘贴/上传进度/×取消（XHR abort）/失败 chip、发送闸（uploading 或 failed 存在 → 零 POST + 可见提示，不静默丢附件）、仅附件可发（空文本 → 正文恰为 markup）、accepted 只清本次提交批次（unknown/失败保留草稿+全部附件，不自动重传重发）、切会话 abort 全部在途上传并清空（不串会话）。5 条 vitest 回归。
+- **范围边界**：本轮=「上传到项目 + 正文引用」；官方原生附件协议未实现（spec/plan 已同步该边界）。
+
+### 4. 门禁（plan §4，@ 最终代码 HEAD `29b11ad2` 全绿）
+
+| 门禁 | 结果 |
+|---|---|
+| `cargo test --lib services::zcode_control::` | ✅ 568 passed（其中一次交错运行出现 1 个失败，两次重跑全绿——既有计时敏感 flake 族，如实记录） |
+| `cargo test --features marker-helper` | ✅ 36 目标全 ok，无 FAILED |
+| `cargo test --tests --features marker-helper,zcode-bridge-evidence` | ✅ 4076 passed / 0 failed |
+| clippy 两 feature 构建 `-D warnings` | ✅ exit 0 |
+| `cargo fmt --check` | ✅ |
+| `pnpm test` | ✅ 195 文件 / 2377 passed、5 skipped / 0 failed（含新增 5 条附件面板回归） |
+| `pnpm check`（prettier+lint+i18n+错误码棘轮+build） | ✅ exit 0（首轮 prettier 3 文件未格式化已 `pnpm format` 修复后复跑） |
+| `pnpm build:mobile` | ✅ exit 0 |
+
+### 5. 实机待验项（不伪造）
+
+1. 官方宿主实机验证 `fault.command.clientMismatch` 的 202 wire 形态（本轮按 Promise Error + `{code}` 体分类；若官方把 fault 放在别处，分类分支需对齐——现有 unknown 兜底不回归）。
+2. 已知 build 实机多选/自由文本卡的端到端（候选开放 → 首答 → 账本 confirmed）；实机真跑后 §4.1 证据记录可升级。
+3. 真机附件链路：真实项目目录上传 → ZCode 终端内附件可读（正文引用最终消费方是官方 CLI 的 Read 能力）。
+4. 上传端点 409 `workspace_mismatch` 的实机触发面（扫描快照 project_path 与实际绑定工作区漂移的真实场景）。
+
+### 6. 计划偏差
+
+1. 「失败重试」：MessageComposer 现状无重试按钮（失败=移除后重加），ZCode 面板对齐既有口径，未新造重试按钮（「只做必要的共享逻辑提取」边界）。
+2. snooze 的协议身份：plan 未列 snooze，本轮按「所有写动作」覆盖（信封走 PROTOCOL_CLIENT_ID）——用户范围「覆盖发送、问答回答、审批、打断、模型/思考强度切换及 snooze」明示包含。
+3. 钥匙串反复弹窗（用户会上报的体验问题，非本轮代码范围）：根因 = dev/测试二进制 ad-hoc 签名每次重编译变化，macOS 钥匙串 ACL 按二进制签名记账，「始终允许」无法跨构建生效。已核实**测试链路不碰真实钥匙串**（凭据存储全部注入替身）。根治需用户拍板：①自签证书固定签名（一次配置永久有效，推荐）；②dev 构建环境变量跳过原生钥匙串（ZCode 登录不持久化）；③维持现状每次允许。未经确认未改动。
+4. 测试层 SSE 流读取在 current-thread 运行时不可靠（chunk 拆分 + 轮询饿死）——二轮已记录，本轮未复用该路径。
+5. 一处提交时序瑕疵：`9f660872` 提交时 5 条附件测试尚未全绿（删陈旧引用后 `41c4ebb0` 转绿）——如实记录，未掩盖。
+
+### 7. 复审与遗留
+
+独立复审（general-purpose 约束镜，范围 `7ea6df25..8bd877df`）：四项 CLOSED，唯一必修（spec §6.3 与 shipped_state 矛盾）已修（`29b11ad2`）。遗留（非阻塞，记录在案）：①`view_with_catalog` 进广播 diff 的每帧目录克隆（会话数小+字节预算约束，可接受；后续可按 revision 预判短路）；②面板失败 chip 显示原始错误码未本地化（与 MessageComposer 既有口径一致）；③`addZcodeFiles` 无名图片的名称兜底是空操作（显示空名，不影响功能）；④takeover 客户端中断回归用例（前轮跟进项，仍开放）。
