@@ -69,25 +69,23 @@ fn static_policy_source(policy: CapabilityView) -> CapabilitySource {
     Arc::new(move || policy.clone())
 }
 
-/// schema 指纹占位（T4 裁决）：T3 尚未提供真实 schema 哈希；key 失效由
-/// `app_build` + `protocol_version` 承担，本占位只保证同 build 内 key 稳定
-/// （账本 confirmed/degraded 跨重连存活的前提）。恒为固定标识——正文/凭据
-/// 绝不进入 fingerprint。
-const SCHEMA_FINGERPRINT_PLACEHOLDER: &str = "v4";
-
 /// probe epoch 占位（T4 裁决）：本任务恒 0。失效面已由 invalidate 清空接口形状
-/// 证据 + build/协议变化换 key 覆盖；epoch 推进属后续探测复位任务。
+/// 证据 + build/协议/schema 形状变化换 key 覆盖；epoch 推进属后续探测复位任务。
 const PROBE_EPOCH: u32 = 0;
 
 /// 从宿主证据拼能力 key（spec R2 五元组）。platform 取本机 OS（`macos`/`windows`
-/// 与 shipped 表词表一致）；build/协议缺席按空串/0 处理（未知形态：shipped 不
-/// 命中、账本失配、仅接口候选可判——resolver 侧按缺证据保守关闭）。
+/// 与 shipped 表词表一致）；build/协议/schema 指纹缺席按空串/0 处理（未知形态：
+/// shipped 不命中、账本失配、仅接口候选可判——resolver 侧按缺证据保守关闭）。
+///
+/// 外部评审 P1-3：`schema_fingerprint` 取桥真实观测的 hello+snapshot 键名骨架哈希
+/// （`HostEvidence::schema_fingerprint`），不再是固定占位——renderer 热更改了帧
+/// 形状但 build/协议未变时 key 换代，旧 confirmed/degraded 不命中（spec R2）。
 fn capability_key(evidence: &HostEvidence) -> CapabilityKey {
     CapabilityKey::new(
         std::env::consts::OS,
         evidence.app_build.as_deref().unwrap_or(""),
         evidence.protocol_version.unwrap_or(0),
-        SCHEMA_FINGERPRINT_PLACEHOLDER,
+        evidence.schema_fingerprint.as_deref().unwrap_or(""),
         PROBE_EPOCH,
     )
 }
@@ -4094,14 +4092,22 @@ mod tests {
         let mut pre_hello = evidence.clone();
         pre_hello.protocol_version = None;
         assert_ne!(capability_key(&pre_hello), capability_key(&evidence));
-        // 缺证据按未知处理（空 build / 协议 0），五元组其余字段为固定占位。
+        // 外部评审 P1-3：schema 形状指纹参与 key——形状变化（同 build 同协议）
+        // 即换 key（spec R2「schema 变化即重算」），旧 confirmed/degraded 不命中。
+        let mut reshaped = evidence.clone();
+        reshaped.schema_fingerprint = Some("shape-b".to_owned());
+        assert_ne!(capability_key(&reshaped), capability_key(&evidence));
+        // 缺证据按未知处理（空 build / 协议 0 / 空指纹 = 未观测到 schema 形状）。
         let unknown = capability_key(&HostEvidence::default());
         assert_ne!(unknown, capability_key(&evidence));
         assert_eq!(unknown.platform, std::env::consts::OS);
         assert_eq!(unknown.app_build, "");
         assert_eq!(unknown.protocol_version, 0);
-        assert_eq!(unknown.schema_fingerprint, "v4");
+        assert_eq!(unknown.schema_fingerprint, "");
         assert_eq!(unknown.probe_epoch, 0);
+        // 指纹只是形状哈希的 id 形状：固定长度十六进制，不含任何原文。
+        let fingerprint = &capability_key(&reshaped).schema_fingerprint;
+        assert_eq!(fingerprint, "shape-b");
     }
 
     /// 一个已授权的持久身份（恢复路径的替身；不携带 JWT）。

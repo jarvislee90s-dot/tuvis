@@ -293,6 +293,8 @@ struct Inner {
     protocol_version: Option<u32>,
     /// 本代际接口形状证据（T3 桥观察采集；invalidate 清空）。
     interface: ZcodeInterfaceEvidence,
+    /// 本代际 schema 形状骨架（P1-3 key 指纹分量；invalidate 清空）。
+    schema_shape: SchemaShape,
 }
 
 impl Default for Inner {
@@ -310,7 +312,109 @@ impl Default for Inner {
             schema_known: false,
             protocol_version: None,
             interface: ZcodeInterfaceEvidence::default(),
+            schema_shape: SchemaShape::default(),
         }
+    }
+}
+
+/// schema 形状指纹（外部评审 P1-3；spec R2「schema 变化即重算」的 key 分量）。
+///
+/// 只记录 wire 形状的**键名骨架**：hello 应答的顶层键集、首个有效 conversation
+/// snapshot 的顶层键集、其 `config` 子对象键集、`pendingInteractions` 首张卡的
+/// 顶层键集与 `payload` 子键集。**绝不**读取任何值——正文、id、模型名、题干、
+/// 答案、JWT、链接对指纹不可见（同形状不同内容 → 同指纹）。
+///
+/// 指纹 = 键名骨架的稳定哈希（FNV-1a 64，定长 16 位十六进制 id 形状）。用于
+/// [`CapabilityKey`] 的 `schema_fingerprint`：renderer 热更改了帧形状但 build/协议
+/// 版本未变时，key 换代 → 旧 confirmed/degraded 不命中（失效面不再只靠 build）。
+/// hello 与 snapshot 两段骨架都在场才有指纹（缺一 = 形状未观测完整 → `None`）；
+/// 骨架按首次观测锁定（同代际后续帧不翻转，避免指纹抖动），`invalidate` 清空。
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct SchemaShape {
+    hello_keys: Option<Vec<String>>,
+    snapshot_keys: Option<Vec<String>>,
+    config_keys: Vec<String>,
+    pending_keys: Vec<String>,
+    pending_payload_keys: Vec<String>,
+}
+
+impl SchemaShape {
+    /// hello 应答顶层键集（首次观测锁定）。
+    pub(crate) fn observe_hello(&mut self, body: &Value) {
+        if self.hello_keys.is_some() {
+            return;
+        }
+        if let Some(keys) = Self::sorted_keys(body) {
+            self.hello_keys = Some(keys);
+        }
+    }
+
+    /// conversation snapshot 顶层键集 + `config` 子键集 + 首张 pending 卡骨架
+    /// （首次观测锁定）。
+    pub(crate) fn observe_snapshot(&mut self, snapshot: &Value) {
+        if self.snapshot_keys.is_some() {
+            return;
+        }
+        let Some(keys) = Self::sorted_keys(snapshot) else {
+            return;
+        };
+        self.snapshot_keys = Some(keys);
+        self.config_keys = snapshot
+            .get("config")
+            .and_then(Self::sorted_keys)
+            .unwrap_or_default();
+        if let Some(card) = snapshot
+            .get("pendingInteractions")
+            .and_then(Value::as_array)
+            .and_then(|cards| cards.first())
+        {
+            self.pending_keys = Self::sorted_keys(card).unwrap_or_default();
+            self.pending_payload_keys = card
+                .get("payload")
+                .and_then(Self::sorted_keys)
+                .unwrap_or_default();
+        }
+    }
+
+    /// 定长 16 位十六进制指纹；hello/snapshot 骨架缺一 → `None`。
+    pub(crate) fn fingerprint(&self) -> Option<String> {
+        let hello = self.hello_keys.as_ref()?;
+        let snapshot = self.snapshot_keys.as_ref()?;
+        // FNV-1a 64：稳定、无依赖、与哈希器实现/平台无关（std 的 DefaultHasher 不
+        // 承诺跨版本稳定，账本 key 要跨升级可比）。
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        let mut feed = |segment: &str| {
+            for byte in segment.bytes() {
+                hash ^= u64::from(byte);
+                hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+            hash ^= 0xff;
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        };
+        feed("hello");
+        hello.iter().for_each(|key| feed(key));
+        feed("snapshot");
+        snapshot.iter().for_each(|key| feed(key));
+        feed("config");
+        self.config_keys.iter().for_each(|key| feed(key));
+        feed("pending");
+        self.pending_keys.iter().for_each(|key| feed(key));
+        feed("payload");
+        self.pending_payload_keys.iter().for_each(|key| feed(key));
+        Some(format!("{hash:016x}"))
+    }
+
+    /// 全清（换代 invalidate）。
+    pub(crate) fn invalidate(&mut self) {
+        *self = Self::default();
+    }
+
+    /// 对象的键名排序列表（非对象 → `None`）；只取键名，值不可见。
+    fn sorted_keys(value: &Value) -> Option<Vec<String>> {
+        let object = value.as_object()?;
+        let mut keys: Vec<String> = object.keys().cloned().collect();
+        keys.sort();
+        Some(keys)
     }
 }
 
@@ -1031,6 +1135,7 @@ impl BridgeManager {
             schema_known: inner.schema_known,
             hello_known: inner.hello_known,
             interface: inner.interface,
+            schema_fingerprint: inner.schema_shape.fingerprint(),
         }
     }
 
@@ -1154,6 +1259,7 @@ impl BridgeManager {
             inner.schema_known = false;
             inner.protocol_version = None;
             inner.interface.invalidate();
+            inner.schema_shape.invalidate();
             releases
         };
         for release in releases {
@@ -2584,6 +2690,8 @@ impl Shared {
                         Some(u32::try_from(protocol_version).map_err(|_| unsupported())?);
                     // T3：hello 校验通过即采集方法存在性（显式方法表或 v4 协议面）。
                     inner.interface.observe_hello(&hello.body);
+                    // P1-3：hello 顶层键集进 schema 形状指纹。
+                    inner.schema_shape.observe_hello(&hello.body);
                 }
             }
             let client_hello = Value::Object(
@@ -2655,7 +2763,13 @@ impl Shared {
         // 先落到 &mut Inner 再拆字段借用（MutexGuard 的 DerefMut 不能拆字段）。
         let state = &mut *inner;
         let applied = match state.sessions.get_mut(&target.session_id) {
-            Some(entry) => activate_and_flush(entry, &subscription, &mut state.interface),
+            Some(entry) => {
+                let mut observers = Observers {
+                    interface: &mut state.interface,
+                    schema: &mut state.schema_shape,
+                };
+                activate_and_flush(entry, &subscription, &mut observers)
+            }
             None => false,
         };
         if applied {
@@ -2839,8 +2953,11 @@ impl Shared {
                 let state = &mut *inner;
                 let applied = match state.sessions.get_mut(&target.session_id) {
                     Some(entry) => {
-                        let applied =
-                            activate_and_flush(entry, &subscription, &mut state.interface);
+                        let mut observers = Observers {
+                            interface: &mut state.interface,
+                            schema: &mut state.schema_shape,
+                        };
+                        let applied = activate_and_flush(entry, &subscription, &mut observers);
                         if entry.projection.is_ready() {
                             entry.resync_attempts = 0;
                             entry.last_resync_at = None;
@@ -3356,7 +3473,11 @@ impl Inner {
                     mark_session_unready(entry);
                     return;
                 }
-                applied = stage_or_apply(entry, frame, subscription, &mut self.interface);
+                let mut observers = Observers {
+                    interface: &mut self.interface,
+                    schema: &mut self.schema_shape,
+                };
+                applied = stage_or_apply(entry, frame, subscription, &mut observers);
             }
             Some("fragment") => {
                 let budget = entry.staged_budget;
@@ -3368,7 +3489,11 @@ impl Inner {
                     FragmentOutcome::Complete(frame) => {
                         entry.stats.fragments_reassembled =
                             entry.stats.fragments_reassembled.saturating_add(1);
-                        applied = stage_or_apply(entry, frame, subscription, &mut self.interface);
+                        let mut observers = Observers {
+                            interface: &mut self.interface,
+                            schema: &mut self.schema_shape,
+                        };
+                        applied = stage_or_apply(entry, frame, subscription, &mut observers);
                     }
                     FragmentOutcome::Fault => {
                         entry.fragments.clear();
@@ -3473,7 +3598,7 @@ fn stage_or_apply(
     entry: &mut SessionEntry,
     frame: Value,
     subscription: String,
-    interface: &mut ZcodeInterfaceEvidence,
+    observers: &mut Observers<'_>,
 ) -> bool {
     match entry.projection.subscription_id().map(str::to_owned) {
         None => {
@@ -3501,7 +3626,7 @@ fn stage_or_apply(
             });
             false
         }
-        Some(bound) if bound == subscription => apply_frame(entry, frame, interface),
+        Some(bound) if bound == subscription => apply_frame(entry, frame, observers),
         // 旧 subscriptionId（换代/重订阅后迟到）：零应用。
         Some(_) => false,
     }
@@ -3509,11 +3634,18 @@ fn stage_or_apply(
 
 /// ACK 到达后的本地 barrier 放行：只交付匹配 subscriptionId 的暂存帧。
 ///
+/// 帧观察器对（T3 接口形状 + P1-3 schema 形状骨架）：两者都是 `Inner` 的兄弟字段，
+/// 调用点在 `&mut Inner` 上拆字段借用后打包传入（一次 `&mut` 不能同时借两个字段）。
+struct Observers<'a> {
+    interface: &'a mut ZcodeInterfaceEvidence,
+    schema: &'a mut SchemaShape,
+}
+
 /// 返回 `true` = 至少一帧 schema 解析成功并进入投影（供宿主证据置位）。
 fn activate_and_flush(
     entry: &mut SessionEntry,
     subscription: &str,
-    interface: &mut ZcodeInterfaceEvidence,
+    observers: &mut Observers<'_>,
 ) -> bool {
     entry.projection.activate(subscription);
     let staged = std::mem::take(&mut entry.staged);
@@ -3523,7 +3655,7 @@ fn activate_and_flush(
         if item.subscription_id != subscription {
             continue;
         }
-        if apply_frame(entry, item.frame, interface) {
+        if apply_frame(entry, item.frame, observers) {
             entry.stats.staged_delivered = entry.stats.staged_delivered.saturating_add(1);
             applied = true;
         }
@@ -3532,15 +3664,19 @@ fn activate_and_flush(
 }
 
 /// 应用一帧；缺口/未知 schema 时标记重同步（stale/异会话只丢弃）。
-fn apply_frame(
-    entry: &mut SessionEntry,
-    frame: Value,
-    interface: &mut ZcodeInterfaceEvidence,
-) -> bool {
+fn apply_frame(entry: &mut SessionEntry, frame: Value, observers: &mut Observers<'_>) -> bool {
     // T3：形状观察在投影应用前做——帧已过 topic/subscriptionId 闸，属本代际
     // 订阅上的真实下行流量；观察是幂等 OR 的存在性记录（宿主宣告过的形状不因
     // 本帧应用成败回退），且避免为观察克隆整帧。
-    interface.observe_conversation_frame(&frame);
+    observers.interface.observe_conversation_frame(&frame);
+    // P1-3：首个 snapshot 的键名骨架进 schema 形状指纹（只看键名，值不可见）。
+    if let Some(snapshot) = frame
+        .get("payload")
+        .filter(|payload| payload.get("kind").and_then(Value::as_str) == Some("snapshot"))
+        .and_then(|payload| payload.get("snapshot"))
+    {
+        observers.schema.observe_snapshot(snapshot);
+    }
     // T5：日志头指纹同步推进（send 确认的「新用户消息可见」观察面；id 形状，
     // 不存正文）。快照应用成败不回退指纹——指纹跟随帧内容，不跟随投影状态。
     entry.log_fingerprint = advance_log_fingerprint(entry.log_fingerprint.as_deref(), &frame);
@@ -5168,6 +5304,90 @@ mod tests {
         ev.invalidate();
         assert!(!ev.method_send);
         assert!(!ev.has_active_work);
+    }
+
+    /// 外部评审 P1-3：schema 形状指纹只哈希**键名骨架**（hello/snapshot/config/
+    /// pending 卡的顶层键集），绝不哈希值——同形状不同正文/不同值 → 同指纹；
+    /// 形状变化（新增/删除顶层键）→ 不同指纹；未观测 → None。
+    #[test]
+    fn schema_shape_fingerprint_hashes_keys_not_values() {
+        let mut a = SchemaShape::default();
+        a.observe_hello(&json!({"kind": "hello", "protocolVersion": 3, "connectionId": "c-1"}));
+        a.observe_snapshot(&json!({
+            "revision": 1, "seq": 1, "logEpoch": "e1",
+            "control": {"activeWorks": []},
+            "pendingInteractions": [{"kind": "userInput", "payload": {"questions": [{"question": "SECRET-A"}]}}],
+            "config": {"provider": "p", "model": "m", "thought": "t"}
+        }));
+        let fa = a.fingerprint().expect("观测后有指纹");
+
+        // 同形状、不同值/正文（连接 id、revision、题干、模型名全不同）→ 同指纹。
+        let mut b = SchemaShape::default();
+        b.observe_hello(&json!({"kind": "hello", "protocolVersion": 3, "connectionId": "c-99"}));
+        b.observe_snapshot(&json!({
+            "revision": 77, "seq": 9, "logEpoch": "e9",
+            "control": {"activeWorks": [{"foregroundExecutionId": "x"}]},
+            "pendingInteractions": [{"kind": "permission", "payload": {"questions": [{"question": "SECRET-B"}]}}],
+            "config": {"provider": "q", "model": "n", "thought": "u"}
+        }));
+        assert_eq!(a.fingerprint(), b.fingerprint(), "值变化不改形状指纹");
+
+        // 形状变化：snapshot 多一个顶层键 → 不同指纹。
+        let mut c = SchemaShape::default();
+        c.observe_hello(&json!({"kind": "hello", "protocolVersion": 3, "connectionId": "c-1"}));
+        c.observe_snapshot(&json!({
+            "revision": 1, "seq": 1, "logEpoch": "e1",
+            "control": {"activeWorks": []},
+            "pendingInteractions": [],
+            "config": {"provider": "p", "model": "m", "thought": "t"},
+            "attachments": []
+        }));
+        assert_ne!(a.fingerprint(), c.fingerprint(), "顶层键集变化改指纹");
+
+        // config 子形状变化（多 thoughtLevels 键）→ 不同指纹。
+        let mut d = SchemaShape::default();
+        d.observe_hello(&json!({"kind": "hello", "protocolVersion": 3, "connectionId": "c-1"}));
+        d.observe_snapshot(&json!({
+            "revision": 1, "seq": 1, "logEpoch": "e1",
+            "control": {"activeWorks": []},
+            "pendingInteractions": [],
+            "config": {"provider": "p", "model": "m", "thought": "t", "thoughtLevels": ["x"]}
+        }));
+        assert_ne!(a.fingerprint(), d.fingerprint(), "config 子形状变化改指纹");
+
+        // 指纹是定长十六进制 id 形状，不含任何原文片段。
+        assert_eq!(fa.len(), 16);
+        assert!(fa.chars().all(|ch| ch.is_ascii_hexdigit()));
+        assert!(!fa.contains("SECRET"));
+
+        // 未观测 → None；invalidate 回到未观测。
+        assert!(SchemaShape::default().fingerprint().is_none());
+        a.invalidate();
+        assert!(a.fingerprint().is_none());
+    }
+
+    /// 外部评审 P1-3：桥把 hello + 首个有效 snapshot 的形状指纹暴露到
+    /// `HostEvidence.schema_fingerprint`；invalidate 后清空。
+    #[tokio::test]
+    async fn host_evidence_carries_schema_fingerprint_after_hello_and_snapshot() {
+        let config = PeerConfig {
+            workspaces: vec![workspace_entry(WS_A, Some("ws-a-identity"), "A")],
+            tasks: vec![task_row(WS_A, SESSION_A, "hi")],
+            conversation_snapshot: Some(conversation_snapshot(SESSION_A, 2, Vec::new())),
+            ..PeerConfig::default()
+        };
+        let (manager, _peer) = manager_with(config).await;
+        assert!(
+            manager.host_evidence().schema_fingerprint.is_none(),
+            "握手前无 schema 形状"
+        );
+        let _target = manager.bind(&key(SESSION_A)).await.expect("bind");
+        let after = manager.host_evidence();
+        let fingerprint = after.schema_fingerprint.expect("hello+snapshot 后有指纹");
+        assert_eq!(fingerprint.len(), 16);
+        // 换代全清。
+        manager.invalidate(2).await;
+        assert!(manager.host_evidence().schema_fingerprint.is_none());
     }
 
     /// 含真实感正文（题干/选项/命令/答案）的样本过 observe 后**只有形状位**变化：

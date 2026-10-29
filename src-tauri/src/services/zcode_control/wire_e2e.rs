@@ -1498,11 +1498,18 @@ mod tests {
     }
 
     /// 能力账本某行状态（T9 确认流转断言用；行不存在 = 测试失败）。
-    fn capability_ledger_state(store: &DeviceStore, key: &str, capability: &str) -> String {
+    /// 外部评审 P1-3：schema 形状指纹进 key 后，测试按 `platform|build|protocol|`
+    /// 前缀匹配账本行（不再硬编码指纹哈希；前缀仍精确钉住 build+protocol）。
+    fn ledger_key_prefix(build: &str) -> String {
+        format!("{}|{}|3|", std::env::consts::OS, build)
+    }
+
+    fn capability_ledger_state(store: &DeviceStore, key_prefix: &str, capability: &str) -> String {
         store.with(|c| {
             c.query_row(
-                "SELECT state FROM zcode_capability_evidence WHERE key = ?1 AND capability = ?2",
-                rusqlite::params![key, capability],
+                "SELECT state FROM zcode_capability_evidence \
+                 WHERE key LIKE ?1 || '%' AND capability = ?2",
+                rusqlite::params![key_prefix, capability],
                 |r| r.get::<_, String>(0),
             )
             .expect("zcode_capability_evidence 行必须存在")
@@ -1510,11 +1517,16 @@ mod tests {
     }
 
     /// 能力账本某行判据词（confirmed 行必带结构化判据标识）。
-    fn capability_ledger_evidence(store: &DeviceStore, key: &str, capability: &str) -> String {
+    fn capability_ledger_evidence(
+        store: &DeviceStore,
+        key_prefix: &str,
+        capability: &str,
+    ) -> String {
         store.with(|c| {
             c.query_row(
-                "SELECT evidence FROM zcode_capability_evidence WHERE key = ?1 AND capability = ?2",
-                rusqlite::params![key, capability],
+                "SELECT evidence FROM zcode_capability_evidence \
+                 WHERE key LIKE ?1 || '%' AND capability = ?2",
+                rusqlite::params![key_prefix, capability],
                 |r| r.get::<_, String>(0),
             )
             .expect("zcode_capability_evidence 行必须存在")
@@ -2022,7 +2034,7 @@ mod tests {
         let generation = chain.hub.connection().generation;
         // 能力 key 与 resolver 同一拼法（platform|build|protocol|schema|epoch；
         // schema 占位 "v4"、epoch 0 是 T4 裁决的生产常量）。
-        let key = format!("{}|9.9.9.9999|3|v4|0", std::env::consts::OS);
+        let key = ledger_key_prefix("9.9.9.9999");
 
         // ---- 1) resolver 候选开放：真实 bind/订阅/形状采集后 send enabled（无原因码）----
         let session = bind_and_wait_ready(&app, SYNTHETIC_TASK_ID).await;
@@ -2108,7 +2120,7 @@ mod tests {
         wait_until(|| {
             chain.store.with(|c| {
                 c.query_row(
-                    "SELECT state FROM zcode_capability_evidence WHERE key = ?1 AND capability = 'send'",
+                    "SELECT state FROM zcode_capability_evidence WHERE key LIKE ?1 || '%' AND capability = 'send'",
                     rusqlite::params![key],
                     |r| r.get::<_, String>(0),
                 )
@@ -2272,13 +2284,15 @@ mod tests {
         assert_eq!(get_views_after, 1, "同 revision 重复 GET 零新目录读");
 
         // I1：shipped confirmed 的能力不进首次确认——账本对该已知 build key 保持空。
-        let key = format!("{}|3.16.2.8769|3|v4|0", std::env::consts::OS);
+        // P1-3：按 build+protocol 前缀断言「零账本行」——指纹参与 key 后前缀仍
+        // 精确钉住该 build，任何指纹下的行都不会漏检。
+        let key = ledger_key_prefix("3.16.2.8769");
         let rows: i64 = chain
             .conn
             .lock()
             .expect("conn")
             .query_row(
-                "SELECT COUNT(*) FROM zcode_capability_evidence WHERE key = ?1",
+                "SELECT COUNT(*) FROM zcode_capability_evidence WHERE key LIKE ?1 || '%'",
                 [&key],
                 |row| row.get(0),
             )
@@ -2309,7 +2323,7 @@ mod tests {
             chain.injector.clone(),
         ));
         let generation = chain.hub.connection().generation;
-        let key = format!("{}|9.9.9.9999|3|v4|0", std::env::consts::OS);
+        let key = ledger_key_prefix("9.9.9.9999");
 
         // ---- 1) resolver 候选开放：卡形状在场 → single_select 候选可用（无原因码）----
         let session = bind_and_wait_ready(&app, SYNTHETIC_TASK_ID).await;
@@ -2396,7 +2410,7 @@ mod tests {
         wait_until(|| {
             chain.store.with(|c| {
                 c.query_row(
-                    "SELECT state FROM zcode_capability_evidence WHERE key = ?1 AND capability = 'single_select'",
+                    "SELECT state FROM zcode_capability_evidence WHERE key LIKE ?1 || '%' AND capability = 'single_select'",
                     rusqlite::params![key],
                     |r| r.get::<_, String>(0),
                 )
