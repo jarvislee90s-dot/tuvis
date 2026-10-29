@@ -144,7 +144,6 @@ function installXhr() {
   attachOpens.length = 0;
   attachBodies.length = 0;
   attachResponder = null;
-  pendingAttach = null;
   vi.stubGlobal("XMLHttpRequest", FakeXHR as unknown as typeof XMLHttpRequest);
 }
 
