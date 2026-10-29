@@ -887,6 +887,13 @@ pub struct SessionView {
     pub control: Option<ControlView>,
     pub selection: Option<SelectionView>,
     pub capabilities: CapabilityView,
+    /// 官方输入队列的只读投影（[`QueueView`]）。
+    ///
+    /// `#[serde(default)]`：旧载荷/旧版本手机不认识该键时按 [`QueueView::default`]
+    /// 反序列化——那是 `known=false`（未知），**不是**「空队列」。手机端同理把缺字段
+    /// 视为未知，绝不据此断言「没有排队」。
+    #[serde(default)]
+    pub queue: QueueView,
 }
 
 // ---------------------------------------------------------------------------
@@ -1057,6 +1064,67 @@ pub type CapabilitySource = Arc<dyn Fn() -> CapabilityView + Send + Sync>;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod session_view {
+        use super::*;
+
+        /// 旧载荷（R2 之前没有 `queue` 字段）必须仍可反序列化，且读出来是**未知**。
+        #[test]
+        fn legacy_payload_without_queue_deserializes_as_unknown() {
+            let legacy = serde_json::json!({
+                "sessionId": "sess_legacy",
+                "generation": 1,
+                "revision": 3,
+                "ready": true,
+                "pending": [],
+                "control": null,
+                "selection": null,
+                "capabilities": serde_json::to_value(CapabilityView::default()).unwrap(),
+            });
+            let view: SessionView = serde_json::from_value(legacy).expect("旧载荷必须仍可反序列化");
+            assert!(!view.queue.known, "缺 queue 字段 = 未知，不是空队列");
+            assert_eq!(view.queue.paused, None, "缺字段不得猜成未暂停");
+            assert!(view.queue.items.is_empty());
+        }
+
+        /// 队列的 wire 形状（camelCase）与手机 DTO 逐字段一致；身份原样透传。
+        #[test]
+        fn queue_serializes_camel_case_and_keeps_host_identity() {
+            let view = SessionView {
+                session_id: "sess_queue".to_owned(),
+                generation: 2,
+                revision: Some(5),
+                ready: true,
+                pending: Vec::new(),
+                control: None,
+                selection: None,
+                capabilities: CapabilityView::default(),
+                queue: QueueView {
+                    known: true,
+                    paused: Some(true),
+                    items: vec![QueueItemView {
+                        input_id: "queue_cmd-1".to_owned(),
+                        text: "queued text".to_owned(),
+                        position: Some(0),
+                    }],
+                },
+            };
+            let value = serde_json::to_value(&view).expect("会话视图应可序列化");
+            assert_eq!(value["queue"]["known"], true);
+            assert_eq!(value["queue"]["paused"], true);
+            assert_eq!(value["queue"]["items"][0]["inputId"], "queue_cmd-1");
+            assert_eq!(value["queue"]["items"][0]["text"], "queued text");
+            assert_eq!(value["queue"]["items"][0]["position"], 0);
+            // 位置缺席必须是 null（不是 0）：0 是合法位置，不能与「未知」混淆。
+            let without_position = serde_json::to_value(QueueItemView {
+                input_id: "queue_cmd-2".to_owned(),
+                text: "no position".to_owned(),
+                position: None,
+            })
+            .expect("队列项应可序列化");
+            assert!(without_position["position"].is_null());
+        }
+    }
 
     mod policy {
         use super::*;

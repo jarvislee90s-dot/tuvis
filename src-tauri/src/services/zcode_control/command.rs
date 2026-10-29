@@ -3796,7 +3796,7 @@ mod tests {
         use super::*;
 
         use crate::services::zcode_control::types::{
-            ActiveWork, CapabilityView, ControlView, SessionView, StopRequest,
+            ActiveWork, CapabilityView, ControlView, QueueView, SessionView, StopRequest,
         };
 
         fn work(kind: &str, execution_id: Option<&str>) -> ActiveWork {
@@ -3831,6 +3831,7 @@ mod tests {
                 control,
                 selection: None,
                 capabilities: CapabilityView::default(),
+                queue: QueueView::default(),
             }
         }
 
@@ -5665,7 +5666,7 @@ mod tests {
 
         use crate::services::zcode_control::selection::SWITCH_MODEL_CONFIG_TYPE;
         use crate::services::zcode_control::types::{
-            CapabilityFlag, CapabilityView, ModelChoice, SelectionView, SessionView,
+            CapabilityFlag, CapabilityView, ModelChoice, QueueView, SelectionView, SessionView,
         };
 
         use super::answer::stored_state;
@@ -5719,6 +5720,7 @@ mod tests {
                 control: None,
                 selection: Some(selection),
                 capabilities: CapabilityView::default(),
+                queue: QueueView::default(),
             }
         }
 

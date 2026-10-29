@@ -1063,6 +1063,7 @@ fn session_with_cards() -> SessionView {
         }),
         selection: None,
         capabilities: all_policy(),
+        queue: Default::default(),
     }
 }
 
@@ -1313,6 +1314,7 @@ async fn link_change_invalidates_old_pending_and_actions() {
         control: None,
         selection: None,
         capabilities: Default::default(),
+        queue: Default::default(),
     });
     let (status, session) = get_json(
         app.clone(),
@@ -1433,6 +1435,7 @@ async fn link_change_invalidates_old_pending_and_actions() {
         control: None,
         selection: None,
         capabilities: Default::default(),
+        queue: Default::default(),
     });
     let (status, body) = post_action(
         app.clone(),

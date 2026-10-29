@@ -45,7 +45,7 @@ use super::relay::{DeviceRoute, RelayClient, RelayEvent, RelayLag};
 use super::types::{
     codes, ActionContext, ActionReceipt, ActionState, BoundTarget, CapabilitySource,
     CapabilityView, ConnectionState, ConnectionView, ControlAction, ControlEvent, ControlEventKind,
-    HostBuildProbe, HostEvidence, SessionView, TargetKey, ZResult, ZcodeError,
+    HostBuildProbe, HostEvidence, QueueView, SessionView, TargetKey, ZResult, ZcodeError,
 };
 use crate::database::dao::zcode_capability::{
     validate_evidence_token, CapabilityLedger, DbCapabilityLedger,
@@ -1502,23 +1502,30 @@ impl Inner {
     /// 关键：relay **掉线不换代**（代际不变）时也必须逐会话通知；只发 connection 帧
     /// 时，停在别的会话的手机不一定重拉。`last_session` 只是兜底（它未进跟踪表且
     /// 仍 ready 的 legacy 状态），不是唯一广播对象。
+    /// 单条会话视图的「无结论」降级：当前代际、不新鲜、能力与官方队列一并作废。
+    ///
+    /// 队列必须一起清：`ready=false` 的视图若仍带着上一代/上一帧的队列项，手机就会
+    /// 看着一份宿主已不再声称的待处理列表（空 ≠ 未知，旧项更不是「仍在排队」）。
+    fn degrade_view(view: &mut SessionView, generation: u64) {
+        view.generation = generation;
+        view.ready = false;
+        // 投影已不新鲜：能力矩阵同步回到基线全关，绝不把旧代际的许可带进新代际事件。
+        view.capabilities = CapabilityView::default();
+        view.queue = QueueView::default();
+    }
+
     fn stale_sessions(&mut self, generation: u64) -> Vec<SessionView> {
         let mut changed = Vec::new();
         for view in self.tracked_sessions.values_mut() {
             if !view.ready {
                 continue;
             }
-            view.generation = generation;
-            view.ready = false;
-            // 投影已不新鲜：能力矩阵同步回到基线全关，绝不把旧代际的许可带进新代际事件。
-            view.capabilities = CapabilityView::default();
+            Self::degrade_view(view, generation);
             changed.push(view.clone());
         }
         if let Some(last) = self.last_session.as_mut() {
             let was_ready = last.ready;
-            last.generation = generation;
-            last.ready = false;
-            last.capabilities = CapabilityView::default();
+            Self::degrade_view(last, generation);
             let represented = changed
                 .iter()
                 .any(|view| view.session_id == last.session_id);
@@ -1569,16 +1576,11 @@ impl Inner {
             if !view.ready {
                 continue;
             }
-            view.generation = generation;
-            view.ready = false;
-            // 投影已不新鲜：能力矩阵同步回到基线全关，绝不把旧代际的许可带进新事件。
-            view.capabilities = CapabilityView::default();
+            Self::degrade_view(view, generation);
             changed.push(view.clone());
         }
         if let Some(last) = self.last_session.as_mut() {
-            last.generation = generation;
-            last.ready = false;
-            last.capabilities = CapabilityView::default();
+            Self::degrade_view(last, generation);
         }
         changed
     }
@@ -3712,7 +3714,7 @@ mod tests {
     };
     use crate::services::zcode_control::types::{
         ActionState, ActiveWork, AnswerEntry, CapabilityFlag, ControlView, PendingKind,
-        PendingView, QuestionOption, QuestionView, SelectionView,
+        PendingView, QuestionOption, QuestionView, QueueItemView, QueueView, SelectionView,
     };
     use std::sync::atomic::{AtomicBool, AtomicUsize};
     use std::time::Duration;
@@ -4013,6 +4015,7 @@ mod tests {
                     control: None,
                     selection: None,
                     capabilities: CapabilityView::default(),
+                    queue: QueueView::default(),
                 })
             })
         }
@@ -6545,6 +6548,7 @@ mod tests {
             control: None,
             selection: None,
             capabilities: CapabilityView::default(),
+            queue: QueueView::default(),
         }
     }
 
@@ -6952,6 +6956,7 @@ mod tests {
                 }),
                 selection: None,
                 capabilities,
+                queue: QueueView::default(),
             };
         // ① 未 GET 过的会话：能力矩阵回基线全关，代际/会话/卡面全部按视图落事件。
         pump.push_outcome(Ok(()), vec![synthetic(7, generation + 9, send_policy())]);
@@ -7067,6 +7072,7 @@ mod tests {
             control: None,
             selection: None,
             capabilities: send_policy(),
+            queue: QueueView::default(),
         };
         pump.push_outcome(
             Err(ZcodeError::of(codes::UNSUPPORTED_PROTOCOL)),
@@ -7116,6 +7122,7 @@ mod tests {
             control: None,
             selection: None,
             capabilities: CapabilityView::default(),
+            queue: QueueView::default(),
         };
         pump.push_outcome(Ok(()), vec![recovered]);
         events
@@ -7190,6 +7197,7 @@ mod tests {
             control: None,
             selection: None,
             capabilities: CapabilityView::default(),
+            queue: QueueView::default(),
         };
         pump.push_outcome(Ok(()), vec![alive]);
         events
@@ -7395,6 +7403,81 @@ mod tests {
         // 离开 paired（断开）：跟踪表清空，旧桥会话不得在重连后复活。
         hub.disconnect().await;
         assert!(hub.lock().tracked_sessions.is_empty(), "断开必须清空跟踪表");
+    }
+
+    /// 离开 paired 的逐会话降级必须把**官方输入队列**一并清成未知。
+    ///
+    /// 队列是「宿主此刻真的在排队什么」的断言：连接换代后旧队列项既不可信也不该
+    /// 继续展示（否则手机会看着上一代的待处理项等一个不存在的队列）。降级事件与
+    /// 缓存中的 `last_session` 都必须清空，而不是只在事件里装样子。
+    #[tokio::test]
+    async fn stale_sessions_clear_official_queue_across_generations() {
+        let fake = Arc::new(FakeBackend::default());
+        let (hub, events, pump, lag) = pumped_with_lag(stored(URL), fake.clone(), send_policy());
+        hub.authorize(OAuthProvider::Bigmodel, noop_open())
+            .await
+            .unwrap();
+        hub.connect().await.unwrap();
+        assert_eq!(hub.connection().state, ConnectionState::Paired);
+
+        let key = TargetKey {
+            session_id: "sess_queue_stale".into(),
+        };
+        assert!(hub.session(&key).await.expect("GET").ready);
+        // 注入一份「宿主宣告了队列」的视图（真实投影面同形）：GET 路径自身不带
+        // 队列快照（假后端的会话视图是空投影），这里只验证降级语义。
+        let queued = QueueView {
+            known: true,
+            paused: Some(true),
+            items: vec![QueueItemView {
+                input_id: "queue_cmd-stale-1".into(),
+                text: "stale queued text".into(),
+                position: Some(0),
+            }],
+        };
+        {
+            let mut inner = hub.lock();
+            for view in inner.tracked_sessions.values_mut() {
+                view.queue = queued.clone();
+            }
+            inner
+                .last_session
+                .as_mut()
+                .expect("GET 后必有 last_session")
+                .queue = queued.clone();
+        }
+        let mut subscriber = hub.subscribe();
+
+        trigger_relay_lag(&events, &pump, &lag).await;
+
+        let downgraded = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            next_session_event(&mut subscriber),
+        )
+        .await
+        .expect("lag 必须发布降级 Session 事件");
+        assert_eq!(downgraded.data["ready"], false);
+        assert_eq!(
+            downgraded.data["queue"],
+            serde_json::to_value(QueueView::default()).unwrap(),
+            "降级事件必须把旧队列清成未知（known=false），不得带旧队列项"
+        );
+        assert_eq!(
+            downgraded.data["queue"]["known"], false,
+            "旧队列不得以「空队列」冒充（空 ≠ 未知）"
+        );
+        {
+            let inner = hub.lock();
+            assert!(
+                inner
+                    .last_session
+                    .as_ref()
+                    .expect("降级后仍有 last_session")
+                    .queue
+                    == QueueView::default(),
+                "缓存中的 last_session 必须同步清空队列"
+            );
+        }
     }
 
     /// relay 掉线**不换代**：离开 paired 时同样逐会话广播 ready=false（不只是
@@ -8753,6 +8836,7 @@ mod tests {
             control: None,
             selection: None,
             capabilities: CapabilityView::default(),
+            queue: QueueView::default(),
         }
     }
 

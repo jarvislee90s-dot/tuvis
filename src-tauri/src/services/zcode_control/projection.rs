@@ -266,6 +266,8 @@ impl Projection {
             control: self.book.control().cloned(),
             selection: self.selection.clone(),
             capabilities: self.capabilities.clone(),
+            // 队列随投影一起走：GET 与 SSE 帧共用本视图，手机刷新/重进即从宿主重建。
+            queue: self.queue.clone(),
         }
     }
 
@@ -832,6 +834,177 @@ mod tests {
         projection.deactivate();
         assert!(!projection.queue().known);
         assert!(projection.queue().items.is_empty());
+    }
+
+    #[test]
+    fn queue_is_unknown_before_host_declaration() {
+        // 手机唯一可见的队列面是 `SessionView.queue`：宿主未宣告时必须是「未知」，
+        // 而不是「空队列」——两者对用户的意义完全不同（空 = 确认没有排队）。
+        let mut projection = Projection::new(target(1));
+        projection.activate(SUB);
+        let view = projection.view();
+        assert!(!view.queue.known, "尚未收到快照时队列必须是未知");
+        assert_eq!(view.queue.paused, None, "未知队列不得带暂停结论");
+        assert!(view.queue.items.is_empty());
+
+        // 旧载荷/未升级宿主的快照没有 `queue` 键：仍然未知，绝不降级成空队列。
+        projection
+            .apply(1, snapshot_frame(SUB, base_snapshot(), 0, 1))
+            .expect("snapshot without queue");
+        let view = projection.view();
+        assert!(view.ready, "队列缺席不影响正文可读性");
+        assert!(!view.queue.known, "缺 queue 键必须保持未知");
+        assert_eq!(view.queue.paused, None, "paused=None 不得当成未暂停");
+        assert!(view.queue.items.is_empty());
+    }
+
+    #[test]
+    fn queue_snapshot_then_paused_delta_reconciles() {
+        let mut projection = Projection::new(target(1));
+        projection.activate(SUB);
+        let mut snapshot = base_snapshot();
+        snapshot["queue"] = queue_state(
+            true,
+            json!([
+                queue_item("queue_cmd-reconcile-1", "queued one", 0),
+                queue_item("queue_cmd-reconcile-2", "queued two", 1),
+            ]),
+        );
+        projection
+            .apply(1, snapshot_frame(SUB, snapshot, 0, 1))
+            .expect("snapshot with paused queue");
+        let queue = projection.view().queue;
+        assert!(queue.known, "宿主宣告 queue → 已知");
+        assert_eq!(queue.paused, Some(true), "autoDrain=false → 暂停");
+        assert_eq!(queue.items.len(), 2);
+        assert_eq!(queue.items[0].input_id, "queue_cmd-reconcile-1");
+        assert_eq!(queue.items[1].position, Some(1));
+
+        // 官方暂停是容器级状态：`autoDrain` 翻转的整对象替换必须一次对齐。
+        projection
+            .apply(
+                1,
+                delta_frame(
+                    SUB,
+                    json!({
+                        "revision": 5,
+                        "queue": queue_state(
+                            false,
+                            json!([queue_item("queue_cmd-reconcile-2", "queued two", 0)])
+                        )
+                    }),
+                    1,
+                    2,
+                ),
+            )
+            .expect("unpaused queue delta");
+        let queue = projection.view().queue;
+        assert_eq!(queue.paused, Some(false), "autoDrain=true → 未暂停");
+        assert_eq!(queue.items.len(), 1, "已消费项不得残留");
+        assert_eq!(queue.items[0].input_id, "queue_cmd-reconcile-2");
+        assert_eq!(queue.items[0].position, Some(0), "宿主重排后的位置原样保留");
+
+        // 三态可区分：已知空队列 ≠ 未知。暂停标志缺席（None）也不等于未暂停。
+        projection
+            .apply(
+                1,
+                delta_frame(
+                    SUB,
+                    json!({"revision": 6, "queue": {"items": [], "autoDrain": true}}),
+                    2,
+                    3,
+                ),
+            )
+            .expect("empty queue delta");
+        let queue = projection.view().queue;
+        assert!(queue.known, "宿主明确宣告空队列 → 已知");
+        assert!(queue.items.is_empty());
+        assert_eq!(queue.paused, Some(false));
+        // 形状坏（缺 autoDrain）→ 未宣告，不是「空且未暂停」。
+        projection
+            .apply(
+                1,
+                delta_frame(SUB, json!({"revision": 7, "queue": {"items": []}}), 3, 4),
+            )
+            .expect("malformed queue delta");
+        let queue = projection.view().queue;
+        assert!(!queue.known, "缺 autoDrain 的坏形状必须按未宣告处理");
+        assert_eq!(queue.paused, None, "不得把未知暂停猜成未暂停");
+    }
+
+    #[test]
+    fn promoted_input_leaves_queue_without_duplicate_message() {
+        let mut projection = Projection::new(target(1));
+        projection.activate(SUB);
+        let mut snapshot = base_snapshot();
+        snapshot["queue"] = queue_state(
+            false,
+            json!([
+                queue_item("queue_cmd-promote-1", "promoted text", 0),
+                queue_item("queue_cmd-promote-2", "still waiting", 1),
+            ]),
+        );
+        projection
+            .apply(1, snapshot_frame(SUB, snapshot, 0, 1))
+            .expect("snapshot with queue");
+        assert_eq!(projection.view().queue.items.len(), 2);
+
+        // 桌面侧消费首项：它从 items[] 消失（官方没有单独的 consumed 事件），
+        // 同时 control 出现前台回合。队列只剩第二项，且不得因此多出重复项。
+        projection
+            .apply(
+                1,
+                delta_frame(
+                    SUB,
+                    json!({
+                        "revision": 5,
+                        "control": {"activeWorks": [{
+                            "kind": "primaryTurn",
+                            "foregroundExecutionId": "E-promoted"
+                        }]},
+                        "queue": queue_state(
+                            false,
+                            json!([queue_item("queue_cmd-promote-2", "still waiting", 0)])
+                        )
+                    }),
+                    1,
+                    2,
+                ),
+            )
+            .expect("promotion delta");
+        let view = projection.view();
+        let ids: Vec<&str> = view
+            .queue
+            .items
+            .iter()
+            .map(|item| item.input_id.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["queue_cmd-promote-2"],
+            "被提升的输入必须离开队列（不得与新消息重复）"
+        );
+        assert_eq!(
+            view.control
+                .expect("control observed")
+                .active_works
+                .first()
+                .and_then(|work| work.foreground_execution_id.as_deref()),
+            Some("E-promoted")
+        );
+
+        // 后续无关增量（不带 queue 键）不得让已消费项复活。
+        projection
+            .apply(1, delta_frame(SUB, json!({"revision": 6}), 2, 3))
+            .expect("unrelated delta");
+        assert_eq!(projection.view().queue.items.len(), 1);
+
+        // 代际/订阅更替：旧队列整体作废（未知），绝不跨代际复活。
+        projection.deactivate();
+        let view = projection.view();
+        assert!(!view.queue.known, "重订阅解除 barrier 后队列回到未知");
+        assert!(view.queue.items.is_empty());
+        assert_eq!(view.queue.paused, None);
     }
 
     #[test]

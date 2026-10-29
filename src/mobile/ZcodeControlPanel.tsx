@@ -24,6 +24,7 @@ import {
   ZcodeControlApiError,
 } from "@/lib/api/zcodeControl";
 import useZcodeControl from "./useZcodeControl";
+import ZcodeQueuePanel from "./ZcodeQueuePanel";
 import {
   attachmentMarkup,
   isImageFile,
@@ -831,6 +832,10 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
             submit={submit}
           />
         ))}
+      {/* 官方输入队列（只读）：默认一行（数量 + 暂停），点开才列正文。
+          放在 pending 卡之后、模型选择之前——运行中发送的排队事实比档位更贴近
+          用户此刻的疑问（「我刚发的那条去哪了」）。未知/空队列不占位。 */}
+      <ZcodeQueuePanel queue={session?.queue} />
       {selection !== null && (
         <div className="mb-2 flex flex-wrap items-center gap-2">
           <select

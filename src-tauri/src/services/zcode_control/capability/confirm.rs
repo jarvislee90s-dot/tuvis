@@ -296,7 +296,9 @@ pub(crate) fn confirm_interrupt(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::services::zcode_control::types::{CapabilityView, PendingKind, PendingView};
+    use crate::services::zcode_control::types::{
+        CapabilityView, PendingKind, PendingView, QueueView,
+    };
 
     /// brief 指定的测试助手（不是生产接口）：send 上下文，baseline id 固定 `"u0"`
     /// （与 `send_obs` 的用例约定配套：before=u0 → ACK 同形；after=u1 → 变化）。
@@ -508,6 +510,7 @@ mod tests {
             control: None,
             selection: None,
             capabilities: CapabilityView::default(),
+            queue: QueueView::default(),
         }
     }
 

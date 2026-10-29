@@ -2290,7 +2290,11 @@
       "takeover": "断开并抢回",
       "takeoverBusy": "正在断开并重新连接…",
       "takeoverHint": "点击将断开当前官方页面的连接，并由手机重新接管（只执行一次）。",
-      "takeoverStillConflict": "仍存在冲突：请先关闭官方 ZCode 页面，稍后再试。"
+      "takeoverStillConflict": "仍存在冲突：请先关闭官方 ZCode 页面，稍后再试。",
+      "queueCount": "排队 {{count}} 条",
+      "queuePaused": "已暂停",
+      "queuePauseUnknown": "暂停状态未知",
+      "queueToggleAria": "展开或收起排队列表"
     },
     "question": {
       "cancelInterrupt": "中断回合（破坏性）",

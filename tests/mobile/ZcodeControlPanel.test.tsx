@@ -1686,3 +1686,62 @@ describe("ZCode 控制面板：冲突态断开并抢回", () => {
     expect(screen.queryByTestId("zcode-takeover")).toBeNull();
   });
 });
+
+// R2：官方输入队列在面板里的落点（只读投影，不建自建队列、不给写入口）。
+describe("ZCode 控制面板：官方队列投影", () => {
+  it("renders_official_queue_from_session_view", async () => {
+    installFetch((url) => {
+      if (url.includes("/official-control")) {
+        return json({ configState: "missing", url: null });
+      }
+      if (url === ZCODE_CONNECTION_PATH) return json(connection());
+      if (url.startsWith(`${ZCODE_SESSION_PATH}?`)) {
+        return json(
+          sessionView({
+            queue: {
+              known: true,
+              paused: true,
+              items: [{ inputId: "queue_cmd-running", text: "运行中发的那条", position: 0 }],
+            },
+          })
+        );
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+    render(<ZcodeControlPanel sessionId={SID} />);
+    const root = await screen.findByTestId("zcode-queue");
+    // 默认一行：数量 + 暂停标志，正文不占首屏。
+    expect(root.dataset.state).toBe("paused");
+    expect(screen.getByTestId("zcode-queue-count").textContent).toContain("1");
+    expect(screen.queryByText("运行中发的那条")).toBeNull();
+    fireEvent.click(screen.getByTestId("zcode-queue-toggle"));
+    expect(screen.getByText("运行中发的那条")).toBeTruthy();
+  });
+
+  it("omitted_queue_stays_unknown_without_panel", async () => {
+    installFetch((url) => {
+      if (url.includes("/official-control")) {
+        return json({ configState: "missing", url: null });
+      }
+      if (url === ZCODE_CONNECTION_PATH) return json(connection());
+      if (url.startsWith(`${ZCODE_SESSION_PATH}?`)) {
+        // 旧服务端载荷：没有 queue 字段。
+        return json(
+          sessionView({
+            pending: [
+              pendingView({
+                kind: "permission",
+                options: [{ optionId: "allowOnce", label: "Allow once", kind: "allowOnce" }],
+              }),
+            ],
+          })
+        );
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+    render(<ZcodeControlPanel sessionId={SID} />);
+    // 投影已落地（pending 卡可读）但仍无队列面板：缺字段 ≠ 空队列。
+    await screen.findByTestId("zcode-pending-card");
+    expect(screen.queryByTestId("zcode-queue")).toBeNull();
+  });
+});

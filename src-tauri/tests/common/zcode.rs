@@ -42,7 +42,7 @@ use multi_agents_manager_lib::services::zcode_control::{
     ActionContext, ActionReceipt, AuthStatus, BoundTarget, CapabilityFlag, CapabilityView,
     CommandPort, CommandSender, ConnectionState, ConnectionView, ControlAction, ControlView,
     DeviceRoute, HubBackend, OAuthProvider, OpenAuthorize, PendingKind, PendingPort, PendingView,
-    SelectionPort, SelectionView, SessionView, StopPort, TargetKey, ZResult, ZcodeError,
+    QueueView, SelectionPort, SelectionView, SessionView, StopPort, TargetKey, ZResult, ZcodeError,
 };
 
 /// 命令层 `CommandPort::call` 入口的一条信封记录（`args[0]` 是命令层信封）。
@@ -152,6 +152,7 @@ fn bare_session(target: &BoundTarget) -> SessionView {
         control: None,
         selection: None,
         capabilities: CapabilityView::default(),
+        queue: QueueView::default(),
     }
 }
 
@@ -218,6 +219,7 @@ impl FakeOfficial {
             control: None,
             selection: None,
             capabilities: CapabilityView::default(),
+            queue: QueueView::default(),
         });
         view.control = control;
     }

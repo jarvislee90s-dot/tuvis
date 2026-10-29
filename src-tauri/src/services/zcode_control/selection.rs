@@ -265,7 +265,7 @@ fn catalog_models(raw: &Value, config: &SessionConfig<'_>) -> ZResult<Vec<ModelC
 mod tests {
     use super::*;
     use crate::services::zcode_control::types::{
-        CapabilityView, ModelChoice, SelectionView, SessionView,
+        CapabilityView, ModelChoice, QueueView, SelectionView, SessionView,
     };
 
     const PROVIDER: &str = "provider-host";
@@ -296,6 +296,7 @@ mod tests {
             control: None,
             selection,
             capabilities: CapabilityView::default(),
+            queue: QueueView::default(),
         }
     }
 

@@ -13,8 +13,8 @@ use multi_agents_manager_lib::remote::zcode::control_frame;
 use multi_agents_manager_lib::services::zcode_control::{
     codes, set_config, ActionContext, ActionReceipt, ActionState, AuthStatus, BoundTarget,
     CapabilityFlag, CapabilityView, ConnectionState, ConnectionView, ControlAction, ControlEvent,
-    ControlEventKind, DeviceRoute, HubBackend, OAuthProvider, SessionView, TargetKey, ZResult,
-    ZcodeError, ZcodeHub,
+    ControlEventKind, DeviceRoute, HubBackend, OAuthProvider, QueueView, SessionView, TargetKey,
+    ZResult, ZcodeError, ZcodeHub,
 };
 use multi_agents_manager_lib::session::{
     AgentType, ProcessForm, Session, SessionStatus, SessionsResponse,
@@ -394,6 +394,7 @@ impl HubBackend for FakeHubBackend {
             control: None,
             selection: None,
             capabilities: CapabilityView::default(),
+            queue: QueueView::default(),
         };
         Box::pin(async move { Ok(view) })
     }

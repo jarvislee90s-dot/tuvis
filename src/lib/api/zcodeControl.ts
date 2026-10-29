@@ -229,7 +229,28 @@ export interface CapabilityView {
   thoughtLevel: CapabilityFlag;
 }
 
-/** 会话投影视图（手机唯一可见的会话状态面）；`ready=false` 时控制面必须零写。 */
+/** 官方输入队列里的一项（`state.queue.items[]` 的只读投影）。
+ *  `inputId` = 官方 `queueItemId`（宿主派生 `queue_<commandId>`，Tuvis 原样透传、
+ *  **不重算**）；`position` = `order.queuePosition`（0 基，缺席 = null，绝不按数组
+ *  下标猜位置）；`text` 是官方队列项正文原文（与正文同等级，可下发、不落日志）。 */
+export interface QueueItemView {
+  inputId: string;
+  text: string;
+  position: number | null;
+}
+
+/** 官方输入队列视图（`state.queue`）。三态必须可区分：
+ *  - `known=false`：宿主**未宣告**队列（旧载荷/快照缺键）→ 未知，不是空队列；
+ *  - `known=true` + `items=[]`：宿主明确宣告空队列；
+ *  - `paused=null`：宿主未给 `autoDrain` → **不得**当成未暂停。 */
+export interface QueueView {
+  known: boolean;
+  paused: boolean | null;
+  items: QueueItemView[];
+}
+
+/** 会话投影视图（手机唯一可见的会话状态面）；`ready=false` 时控制面必须零写。
+ *  `queue` 可选：缺字段 = 未知（旧服务端载荷），前端绝不把缺省当成空队列。 */
 export interface SessionView {
   sessionId: string;
   generation: number;
@@ -239,6 +260,7 @@ export interface SessionView {
   control: ControlView | null;
   selection: SelectionView | null;
   capabilities: CapabilityView;
+  queue?: QueueView;
 }
 
 /** 问答答案条目。 */

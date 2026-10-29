@@ -2290,7 +2290,11 @@
       "takeover": "Disconnect and take over",
       "takeoverBusy": "Disconnecting and reconnecting…",
       "takeoverHint": "Clicking disconnects the current official page and takes over from this phone (runs once).",
-      "takeoverStillConflict": "Still in conflict: close the official ZCode page first, then try again."
+      "takeoverStillConflict": "Still in conflict: close the official ZCode page first, then try again.",
+      "queueCount": "{{count}} queued",
+      "queuePaused": "Paused",
+      "queuePauseUnknown": "Pause state unknown",
+      "queueToggleAria": "Expand or collapse the queued list"
     },
     "question": {
       "cancelInterrupt": "Interrupt turn (destructive)",
