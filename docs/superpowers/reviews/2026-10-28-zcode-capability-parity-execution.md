@@ -1,12 +1,14 @@
 # ZCode 能力对齐与 build 兼容 · 执行报告
 
-日期：2026-10-28。执行方式：subagent-driven-development（每任务独立实现者 + 任务级审查 + 修复循环 + 最终全分支审查）。
+日期：2026-10-28（初版）/ 2026-10-29（外部评审修复轮更新）。执行方式：subagent-driven-development（每任务独立实现者 + 任务级审查 + 修复循环 + 最终全分支审查）；外部评审修复轮按 systematic-debugging（先逐条核实根因，再写失败测试，再最小修复）。
 Spec：`docs/superpowers/specs/2026-10-28-zcode-capability-parity-spec.md`；Plan：`docs/superpowers/plans/2026-10-28-zcode-capability-parity-implementation.md`。
 分支：`codex/zcode-unified-remote`（从 `0c111c06` 开工）。未 push、未 merge、未 tag、未改 `docs/MASTER-PLAN.md`。
 
-## 结论
+## 结论（2026-10-29 修订）
 
-**DONE** —— T1-T9 全部完成并过审；plan §4 九条门禁由控制器独立复跑全绿；最终 HEAD `a148dad9`，工作树干净。全分支最终审查结论「可合并」，无 Critical/Important。
+**代码完成，等待复审。** 初版报告（commit `370d93a4`）写「无 Critical/Important、可合并」——**该结论不成立**：外部评审在 `a148dad9` 上查出 2 处 P0（model/thought 生产自锁；pending 首次确认可被本地消费 + 任意 revision 帧假确认）与 4 处 P1，初版的绿色门禁把错误行为写成了预期。本轮已逐条核实根因并修复（见 §八），plan §4 九条门禁在修复后 HEAD 重跑全绿。合并与否由外部评审复审裁决，本报告不再自行宣称「可合并」。
+
+初版报告的另一处错误：§六写最终 HEAD `a148dad9`，实际初版报告自身提交于 `370d93a4`（代码在 `a148dad9`、报告在 `370d93a4`）。本轮修正见 §六。
 
 ## 一、逐任务状态与 commit
 
