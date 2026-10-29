@@ -1650,6 +1650,21 @@ impl BridgeManager {
         let entry = inner.sessions.get(session_id)?;
         Some(entry.projection.pending_book().host_pending_ids())
     }
+
+    /// 三轮 C：精确会话的绑定工作区（`BoundTarget.workspace_path`，宿主 listing
+    /// 下发的精确值）。会话未绑定 → `None`。附件上传的项目一致性校验以此为准——
+    /// 手机/扫描快照的 project_path 必须与它一致，否则附件会落到 ZCode 工作区之外。
+    pub(crate) fn bound_workspace_path(&self, session_id: &str) -> Option<String> {
+        let inner = lock(&self.shared.state);
+        Some(
+            inner
+                .sessions
+                .get(session_id)?
+                .target
+                .workspace_path
+                .clone(),
+        )
+    }
 }
 
 /// 按**宿主 pending 卡**的题型推导本次应答所需的全部能力名。

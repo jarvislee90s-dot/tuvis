@@ -1407,11 +1407,16 @@ mod tests {
 
     /// 移动端快照里的唯一 ZCode 会话（id 与假体任务索引精确相等）。
     fn zcode_session() -> Session {
+        zcode_session_with_project("/tmp/travel")
+    }
+
+    /// 三轮 C：项目目录可注入的合成 ZCode 会话（附件上传一致性闸的扫描快照侧）。
+    fn zcode_session_with_project(project_path: &str) -> Session {
         Session {
             id: SYNTHETIC_TASK_ID.into(),
             agent_type: AgentType::ZCode,
             project_name: "zcode-full-chain".into(),
-            project_path: "/tmp/travel".into(),
+            project_path: project_path.to_owned(),
             title: None,
             git_branch: None,
             github_url: None,
@@ -1467,50 +1472,72 @@ mod tests {
         hub: Arc<ZcodeHub>,
         injector: Arc<RecordingInjector>,
     ) -> Arc<RemoteState> {
-        let sessions = vec![zcode_session()];
-        let store = DeviceStore::Owned(conn.clone());
-        let state = Arc::new(RemoteState {
-            ui_config_source: Box::new(|| None),
-            subagent_source: std::collections::HashMap::new(),
-            subagent_message_source: std::collections::HashMap::new(),
-            capability_table: new_table(),
-            session_source: Box::new(move || SessionsResponse {
-                total_count: sessions.len(),
-                sessions: sessions.clone(),
-                waiting_count: 0,
-            }),
-            pairing_counter: Box::new(Vec::new),
-            board_hidden_ids: Box::new(Vec::new),
-            board_hidden_hide: Arc::new(|_| 0usize),
-            board_hidden_unhide: Arc::new(|_| 0usize),
-            unread_mark_read: Arc::new(|_, _| ()),
-            session_close: Arc::new(|_| Ok(())),
-            store: store.clone(),
-            host_source: Box::new(|| serde_json::json!({ "host": { "name": "test-host" } })),
-            message_source: Box::new(|_, _, _| Err("测试桩：无内容".to_string())),
-            path_source: Box::new(|_, _, _| (Vec::new(), false)),
-            watcher_tx: tokio::sync::broadcast::channel(64).0,
-            sse_registry: Arc::new(SseRegistry::default()),
-            max_devices_source: Box::new(|| 3),
-            pin_limiter: Mutex::new(PinRateLimiter::new()),
-            global_pin_limiter: Mutex::new(PinRateLimiter::global()),
-            pin_source: Box::new(|| Some("1234".to_string())),
-            now_source: Box::new(|| chrono::Utc::now().timestamp_millis()),
-            via_hosts_source: Box::new(|| None),
-            rate_bucket_channels_source: Box::new(Vec::new),
-            home_source: Box::new(|| None),
-            injector: injector.clone(),
-            resume_spawner: Arc::new(|_: &crate::inject::resume::SpawnSpec| Ok(())),
-            create_hub: Arc::new(CreateTaskHub::stub()),
-            archive_source: Box::new(Vec::new),
-            archive_delete: Arc::new(|_: Option<&str>| 0usize),
-            confirm_probe: Arc::new(|_, _, _| true),
-            dialog_probe: Arc::new(|_, _| None),
-            screen_probe: Arc::new(|_, _| None),
-            codex_control: Arc::new(CodexControlHub::disabled_with_store(store)),
-            desktop_language: Default::default(),
-        });
+        remote_state_with_project(conn, hub, injector, SYNTHETIC_WORKSPACE_PATH)
+    }
+
+    /// 三轮 C：扫描快照的项目目录可注入——与桥绑定的 `SYNTHETIC_WORKSPACE_PATH`
+    /// 不一致时驱动附件上传的 `workspace_mismatch` 409 闸。
+    fn remote_state_with_project(
+        conn: &SharedConn,
+        hub: Arc<ZcodeHub>,
+        injector: Arc<RecordingInjector>,
+        project_path: &str,
+    ) -> Arc<RemoteState> {
+        let mut state = {
+            let sessions = vec![zcode_session()];
+            let store = DeviceStore::Owned(conn.clone());
+            let state = Arc::new(RemoteState {
+                ui_config_source: Box::new(|| None),
+                subagent_source: std::collections::HashMap::new(),
+                subagent_message_source: std::collections::HashMap::new(),
+                capability_table: new_table(),
+                session_source: Box::new(move || SessionsResponse {
+                    total_count: sessions.len(),
+                    sessions: sessions.clone(),
+                    waiting_count: 0,
+                }),
+                pairing_counter: Box::new(Vec::new),
+                board_hidden_ids: Box::new(Vec::new),
+                board_hidden_hide: Arc::new(|_| 0usize),
+                board_hidden_unhide: Arc::new(|_| 0usize),
+                unread_mark_read: Arc::new(|_, _| ()),
+                session_close: Arc::new(|_| Ok(())),
+                store: store.clone(),
+                host_source: Box::new(|| serde_json::json!({ "host": { "name": "test-host" } })),
+                message_source: Box::new(|_, _, _| Err("测试桩：无内容".to_string())),
+                path_source: Box::new(|_, _, _| (Vec::new(), false)),
+                watcher_tx: tokio::sync::broadcast::channel(64).0,
+                sse_registry: Arc::new(SseRegistry::default()),
+                max_devices_source: Box::new(|| 3),
+                pin_limiter: Mutex::new(PinRateLimiter::new()),
+                global_pin_limiter: Mutex::new(PinRateLimiter::global()),
+                pin_source: Box::new(|| Some("1234".to_string())),
+                now_source: Box::new(|| chrono::Utc::now().timestamp_millis()),
+                via_hosts_source: Box::new(|| None),
+                rate_bucket_channels_source: Box::new(Vec::new),
+                home_source: Box::new(|| None),
+                injector: injector.clone(),
+                resume_spawner: Arc::new(|_: &crate::inject::resume::SpawnSpec| Ok(())),
+                create_hub: Arc::new(CreateTaskHub::stub()),
+                archive_source: Box::new(Vec::new),
+                archive_delete: Arc::new(|_: Option<&str>| 0usize),
+                confirm_probe: Arc::new(|_, _, _| true),
+                dialog_probe: Arc::new(|_, _| None),
+                screen_probe: Arc::new(|_, _| None),
+                codex_control: Arc::new(CodexControlHub::disabled_with_store(store)),
+                desktop_language: Default::default(),
+            });
+            state
+        };
         state.set_zcode_hub(hub);
+        // 三轮 C：注入扫描快照的项目目录（Arc 独占期内替换，pub 字段直写）。
+        let owned = std::sync::Arc::get_mut(&mut state).expect("state 独占");
+        let project = project_path.to_owned();
+        owned.session_source = Box::new(move || SessionsResponse {
+            total_count: 1,
+            sessions: vec![zcode_session_with_project(&project)],
+            waiting_count: 0,
+        });
         state
     }
 
@@ -2436,6 +2463,127 @@ mod tests {
             )
             .expect("count");
         assert_eq!(rows, 0, "已知 build shipped confirmed 零账本行");
+    }
+
+    /// 三轮 C 回环 e2e：附件上传走通用通道落进绑定工作区，send 正文按
+    /// `<file path>` 约定携带落盘路径，经官方 actions/sendText 发送（**零终端注入
+    /// 回落**）；工作区不一致的上传被 409 `workspace_mismatch` 拒绝。
+    #[tokio::test]
+    async fn attachment_uploads_to_bound_workspace_and_flows_into_send_body() {
+        let chain = resolver_chain(Arc::new(|| Some("9.9.9.9999".to_owned()))).await;
+        let app = router(remote_state(
+            &chain.conn,
+            chain.hub.clone(),
+            chain.injector.clone(),
+        ));
+        let _session = bind_and_wait_ready(&app, SYNTHETIC_TASK_ID).await;
+
+        // ---- 1) 上传：原始字节走 /m/api/v1/session-attachment（配对门内）----
+        let payload = b"hello attachment body".to_vec();
+        let upload = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/m/api/v1/session-attachment?session_id={SYNTHETIC_TASK_ID}&name=hello.txt"
+                    ))
+                    .header("cookie", COOKIE)
+                    .header("content-type", "application/octet-stream")
+                    .body(axum::body::Body::from(payload.clone()))
+                    .expect("上传请求"),
+            )
+            .await
+            .expect("上传应完成");
+        assert_eq!(upload.status(), StatusCode::OK);
+        let uploaded = body_json(upload).await;
+        let path = uploaded["path"]
+            .as_str()
+            .expect("上传必须返回落盘路径")
+            .to_owned();
+        assert!(
+            path.starts_with(&format!(
+                "{SYNTHETIC_WORKSPACE_PATH}/.tuvis-attachments/{SYNTHETIC_TASK_ID}/"
+            )),
+            "落盘必须在绑定工作区的附件目录：{path}"
+        );
+
+        // ---- 2) 文件内容正确落盘 ----
+        let on_disk = std::fs::read(&path).expect("落盘文件必须可读");
+        assert_eq!(on_disk, payload, "落盘字节必须与上传一致");
+        let _ = std::fs::remove_file(&path);
+
+        // ---- 3) send 正文按约定引用路径，走官方 actions/sendText（零终端回落）----
+        let generation = chain.hub.connection().generation;
+        let body = send_body(ACTION_ID, generation, &format!("<file path=\"{path}\">"));
+        let (status, receipt) = post_action(&app, &body).await;
+        assert_eq!(status, StatusCode::OK, "{receipt}");
+        assert_eq!(receipt["state"], "accepted", "{receipt}");
+        let envelope = &chain.ws.commands()[0]["envelope"];
+        assert_eq!(envelope["type"], SEND_TEXT_TYPE);
+        assert!(
+            envelope["payload"]["text"]
+                .as_str()
+                .is_some_and(|text| text.contains(&format!("<file path=\"{path}\">"))),
+            "官方发送正文必须携带附件引用：{:?}",
+            envelope["payload"]["text"]
+        );
+        assert_eq!(chain.injector.calls(), 0, "附件引用发送不得走终端注入");
+
+        // ---- 4) 绑定工作区访问器：桥绑定的精确 workspacePath ----
+        assert_eq!(
+            chain.hub.bound_workspace_path(SYNTHETIC_TASK_ID).as_deref(),
+            Some(SYNTHETIC_WORKSPACE_PATH),
+            "绑定会话必须能取到精确工作区（一致性闸的对照值）"
+        );
+        assert_eq!(chain.hub.bound_workspace_path("sess_unknown"), None);
+
+        // ---- 5) 上传项目 ≠ 绑定工作区 → 409 workspace_mismatch（不透传路径）----
+        let mismatch_app = router(remote_state_with_project(
+            &chain.conn,
+            chain.hub.clone(),
+            chain.injector.clone(),
+            "/tmp/travel-elsewhere",
+        ));
+        let mismatch = mismatch_app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/m/api/v1/session-attachment?session_id={SYNTHETIC_TASK_ID}&name=x.txt"
+                    ))
+                    .header("cookie", COOKIE)
+                    .header("content-type", "application/octet-stream")
+                    .body(axum::body::Body::from(b"x".to_vec()))
+                    .expect("不一致上传请求"),
+            )
+            .await
+            .expect("不一致上传应完成");
+        assert_eq!(mismatch.status(), StatusCode::CONFLICT);
+        let body = body_json(mismatch).await;
+        assert_eq!(body["error"], "workspace_mismatch", "{body}");
+        let rendered = body.to_string();
+        assert!(
+            !rendered.contains("/tmp/travel"),
+            "409 响应不得透传任何一侧路径原文：{rendered}"
+        );
+
+        // ---- 6) 未绑定/未知会话照旧 404 no_session（非 ZCode 流程零变化）----
+        let unbound = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/m/api/v1/session-attachment?session_id=unbound-session&name=x.txt"
+                    ))
+                    .header("cookie", COOKIE)
+                    .header("content-type", "application/octet-stream")
+                    .body(axum::body::Body::from(b"x".to_vec()))
+                    .expect("错会话上传请求"),
+            )
+            .await
+            .expect("错会话上传应完成");
+        assert_eq!(unbound.status(), StatusCode::NOT_FOUND);
     }
 
     /// 三轮 A 回归 e2e：**严格假宿主执行官方身份校验**——写命令信封 `clientId`

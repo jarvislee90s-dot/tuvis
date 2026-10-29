@@ -657,6 +657,12 @@ pub trait HubBackend: Send + Sync {
     /// 读取精确目标的只读投影。
     fn session<'a>(&'a self, target: &'a BoundTarget) -> BoxFuture<'a, ZResult<SessionView>>;
 
+    /// 三轮 C：精确会话的绑定工作区（附件上传一致性校验；未绑定 = None）。
+    /// 测试 fake 默认 None（不启用校验）。
+    fn bound_workspace_path(&self, _session_id: &str) -> Option<String> {
+        None
+    }
+
     /// 派发一次写动作（目标已由 Hub 绑定并校验代际）。
     fn execute<'a>(
         &'a self,
@@ -1047,6 +1053,10 @@ impl HubBackend for PartsBackend {
                 .await;
             self.bridge.session(target).await
         })
+    }
+
+    fn bound_workspace_path(&self, session_id: &str) -> Option<String> {
+        self.bridge.bound_workspace_path(session_id)
     }
 
     fn execute<'a>(
@@ -2150,6 +2160,11 @@ impl ZcodeHub {
     /// 订阅控制事件（可多订阅者：桌面 + 手机共享同一 Hub）。
     pub fn subscribe(&self) -> broadcast::Receiver<ControlEvent> {
         self.events.subscribe()
+    }
+
+    /// 三轮 C：精确会话的绑定工作区（附件上传一致性校验用；未绑定/未知 = None）。
+    pub fn bound_workspace_path(&self, session_id: &str) -> Option<String> {
+        self.backend.bound_workspace_path(session_id)
     }
 
     /// 本 Hub 当前能力矩阵（现算；与执行闸同一个 source）。
