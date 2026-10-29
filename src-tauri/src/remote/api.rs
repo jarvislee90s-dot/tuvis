@@ -1165,6 +1165,50 @@ fn find_session_sync(st: &Arc<RemoteState>, session_id: &str) -> Option<crate::s
         .find(|s| s.id == session_id)
 }
 
+/// 附件上传拒绝码：扫描快照的项目目录与 ZCode 桥的精确绑定工作区不一致。
+/// （仅对已绑定的 ZCode 会话生效；其余会话不启用该校验，原上传流程零变化。）
+pub(crate) const WORKSPACE_MISMATCH: &str = "workspace_mismatch";
+
+/// 三轮 C：两个项目目录是否指同一目录。先做尾斜杠归一的字符串比较；不一致再尝试
+/// 双侧 `fs::canonicalize`（解析符号链接/`..`，如 macOS `/var` ↔ `/private/var`），
+/// 任一侧 canonicalize 失败（目录尚未创建等）则维持字符串比较结果。
+fn same_project_dir(left: &str, right: &str) -> bool {
+    fn trim(p: &str) -> &str {
+        p.trim().trim_end_matches('/')
+    }
+    let (l, r) = (trim(left), trim(right));
+    if l == r {
+        return true;
+    }
+    match (std::fs::canonicalize(l), std::fs::canonicalize(r)) {
+        (Ok(l), Ok(r)) => l == r,
+        _ => false,
+    }
+}
+
+/// 三轮 C：附件上传的「上传项目 ↔ ZCode 精确绑定工作区」一致性闸。
+///
+/// 仅当该会话已被 ZCode 桥**精确绑定**时启用（`hub.bound_workspace_path` 有值）：
+/// 附件必须落进 ZCode 实际工作的工作区，否则 send 正文里的相对引用会指向会话之外。
+/// 未绑定（非 ZCode 会话/桥未装配）→ 直接放行，原上传流程零变化。
+fn ensure_project_matches_bound_workspace(
+    hub: Option<&std::sync::Arc<crate::services::zcode_control::ZcodeHub>>,
+    session_id: &str,
+    project_path: &str,
+) -> Result<(), (axum::http::StatusCode, serde_json::Value)> {
+    let Some(bound) = hub.and_then(|hub| hub.bound_workspace_path(session_id)) else {
+        return Ok(());
+    };
+    if same_project_dir(project_path, &bound) {
+        return Ok(());
+    }
+    // 不透传两侧路径原文（可能含用户目录结构），只回冻结码。
+    Err((
+        axum::http::StatusCode::CONFLICT,
+        serde_json::json!({ "error": WORKSPACE_MISMATCH }),
+    ))
+}
+
 /// 端点审计 action 选择（丁T3 裁2，**单点**）：`/` 开头消息记 `slash`，其余按投递
 /// 路径记 `send` / `queue`。
 ///
@@ -2497,6 +2541,12 @@ pub async fn session_attachment(
             StatusCode::NOT_FOUND,
             serde_json::json!({ "error": "no_cwd" }),
         );
+    }
+    // 三轮 C：已绑定 ZCode 会话的附件必须落在其精确绑定工作区内。
+    if let Err((status, body)) =
+        ensure_project_matches_bound_workspace(st.zcode_hub().as_ref(), &sid, &cwd)
+    {
+        return json_no_store(status, body);
     }
     let tool = session.agent_type.tool_id().to_string();
     // ⑤ 写盘（spawn_blocking：同步 IO）+ 审计
@@ -11000,6 +11050,40 @@ pub async fn create_projects(
 
 #[cfg(test)]
 mod tests {
+    /// 三轮 C：项目目录同一性——尾斜杠归一、macOS symlink（/tmp ↔ /private/tmp）、
+    /// 真实不同目录（canonicalize 后仍不等）。
+    #[test]
+    fn same_project_dir_normalizes_and_resolves_symlinks() {
+        assert!(same_project_dir("/tmp/travel", "/tmp/travel/"));
+        assert!(same_project_dir(" /tmp/travel ", "/tmp/travel"));
+        // macOS：/tmp 是 /private/tmp 的符号链接——真实路径必须判等。
+        let unique = format!("tuvis-att-test-{}", std::process::id());
+        let as_tmp = format!("/tmp/{unique}");
+        let as_private = format!("/private/tmp/{unique}");
+        std::fs::create_dir_all(&as_private).expect("建临时目录");
+        assert!(
+            same_project_dir(&as_tmp, &as_private),
+            "{as_tmp} 与 {as_private} 应判同一目录"
+        );
+        // 真实不同目录：canonicalize 双侧成功仍不等。
+        let other = format!("/private/tmp/{unique}-other");
+        std::fs::create_dir_all(&other).expect("建另一临时目录");
+        assert!(!same_project_dir(&as_tmp, &other));
+        std::fs::remove_dir_all(&as_private).ok();
+        std::fs::remove_dir_all(&other).ok();
+        // 目录不存在：canonicalize 失败 → 回退字符串比较，不等。
+        assert!(!same_project_dir(
+            "/tmp/definitely-missing-a",
+            "/tmp/definitely-missing-b"
+        ));
+    }
+
+    /// 三轮 C：一致性闸只对已绑定会话生效；未绑定（无 hub / 桥不知会话）直接放行。
+    #[test]
+    fn workspace_gate_passes_when_session_unbound() {
+        assert!(ensure_project_matches_bound_workspace(None, "sess_x", "/anywhere").is_ok());
+    }
+
     use super::*;
     use crate::remote::content::SessionMessage;
 
