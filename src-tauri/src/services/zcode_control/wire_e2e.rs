@@ -1486,7 +1486,7 @@ mod tests {
         let mut state = {
             let sessions = vec![zcode_session()];
             let store = DeviceStore::Owned(conn.clone());
-            let state = Arc::new(RemoteState {
+            Arc::new(RemoteState {
                 ui_config_source: Box::new(|| None),
                 subagent_source: std::collections::HashMap::new(),
                 subagent_message_source: std::collections::HashMap::new(),
@@ -1526,8 +1526,7 @@ mod tests {
                 screen_probe: Arc::new(|_, _| None),
                 codex_control: Arc::new(CodexControlHub::disabled_with_store(store)),
                 desktop_language: Default::default(),
-            });
-            state
+            })
         };
         state.set_zcode_hub(hub);
         // 三轮 C：注入扫描快照的项目目录（Arc 独占期内替换，pub 字段直写）。
@@ -2573,9 +2572,7 @@ mod tests {
             .oneshot(
                 axum::http::Request::builder()
                     .method("POST")
-                    .uri(format!(
-                        "/m/api/v1/session-attachment?session_id=unbound-session&name=x.txt"
-                    ))
+                    .uri("/m/api/v1/session-attachment?session_id=unbound-session&name=x.txt")
                     .header("cookie", COOKIE)
                     .header("content-type", "application/octet-stream")
                     .body(axum::body::Body::from(b"x".to_vec()))

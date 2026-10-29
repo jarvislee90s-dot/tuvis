@@ -80,7 +80,12 @@ import {
   type SendInfo,
 } from "./api";
 import { ChannelBwNote } from "./FilePanel";
-import { attachmentMarkup, isImageFile, newAttachmentId, type PendingAttachment } from "./attachments";
+import {
+  attachmentMarkup,
+  isImageFile,
+  newAttachmentId,
+  type PendingAttachment,
+} from "./attachments";
 import { etaRemainingText, formatBytes, transferRateBps, type TransferSample } from "./board-logic";
 // Codex APP 原生发送（Desktop IPC）：actionId 生成与回执 DTO
 import {

@@ -596,13 +596,13 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
       uploadCtrlsRef.current.set(id, ctrl);
       void uploadAttachment(sessionId, file, ctrl.signal, (loaded, total) => {
         setAttachments((prev) =>
-          prev.map((a) => (a.id === id ? { ...a, loaded, total: total > 0 ? total : null } : a)),
+          prev.map((a) => (a.id === id ? { ...a, loaded, total: total > 0 ? total : null } : a))
         );
       })
         .then((res) => {
           if (res === null) throw new ApiError(403, i18n.t("mobile.zcodeControl.deviceInvalid"));
           setAttachments((prev) =>
-            prev.map((a) => (a.id === id ? { ...a, status: "ready", path: res.path } : a)),
+            prev.map((a) => (a.id === id ? { ...a, status: "ready", path: res.path } : a))
           );
         })
         .catch((e: unknown) => {
@@ -612,13 +612,9 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
             return;
           }
           const reason =
-            e instanceof ApiError
-              ? e.message
-              : e instanceof Error
-                ? e.message
-                : String(e);
+            e instanceof ApiError ? e.message : e instanceof Error ? e.message : String(e);
           setAttachments((prev) =>
-            prev.map((a) => (a.id === id ? { ...a, status: "failed", error: reason } : a)),
+            prev.map((a) => (a.id === id ? { ...a, status: "failed", error: reason } : a))
           );
         })
         .finally(() => {
@@ -931,7 +927,7 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
           {i18n.t(
             attachNotice === "uploading"
               ? "mobile.zcodeControl.attachBlockedUploading"
-              : "mobile.zcodeControl.attachBlockedFailed",
+              : "mobile.zcodeControl.attachBlockedFailed"
           )}
         </p>
       )}
