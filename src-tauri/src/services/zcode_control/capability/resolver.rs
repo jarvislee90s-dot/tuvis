@@ -367,7 +367,8 @@ mod tests {
         }
 
         // 目标形状逐一缺席：对应能力关闭（needs_evidence），其余不受牵连。
-        let cases: &[(&str, Box<dyn Fn(&mut ZcodeInterfaceEvidence)>)] = &[
+        type ShapeCase = (&'static str, Box<dyn Fn(&mut ZcodeInterfaceEvidence)>);
+        let cases: &[ShapeCase] = &[
             (
                 "send 缺方法",
                 Box::new(|e: &mut ZcodeInterfaceEvidence| {
