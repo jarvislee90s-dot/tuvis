@@ -179,6 +179,9 @@ mod tests {
         ack: Arc<Mutex<AckMode>>,
         /// 注入合成 pending 卡（T9 首答腿）：非 None 时 conversation 快照带这张卡。
         pending_card: Arc<Mutex<Option<serde_json::Value>>>,
+        /// 外部评审 C1：`model-selection.getView` 应答体。None = 既有空应答（目录
+        /// 采不到）；Some = 真实目录形态（已知 build e2e 的目录形状来源）。
+        model_catalog: Arc<Mutex<Option<serde_json::Value>>>,
         /// `drop_link()` 的断链信号：每条连接 select 它，收到即发 Close 并收尾。
         drop_tx: tokio::sync::broadcast::Sender<()>,
         task: tokio::task::JoinHandle<()>,
@@ -213,6 +216,11 @@ mod tests {
         /// 注入合成 pending 卡（须在 connect/bind 前设定：初始快照就带它）。
         fn set_pending_card(&self, card: serde_json::Value) {
             *self.pending_card.lock().expect("pending 卡锁") = Some(card);
+        }
+
+        /// 设定 `getView` 的合成目录（外部评审 C1；须在触发目录读前设定）。
+        fn set_model_catalog(&self, catalog: serde_json::Value) {
+            *self.model_catalog.lock().expect("目录锁") = Some(catalog);
         }
 
         /// 从假体侧主动断链：已建立的连接收到 Close（生产 relay 观察到掉线，但
@@ -266,6 +274,8 @@ mod tests {
         let ack_mode = ack.clone();
         let pending_card = Arc::new(Mutex::new(None));
         let pending_card_per_conn = pending_card.clone();
+        let model_catalog = Arc::new(Mutex::new(None));
+        let model_catalog_per_conn = model_catalog.clone();
         let (drop_tx, _keep_drop_rx) = tokio::sync::broadcast::channel(8);
         let drop_signal = drop_tx.clone();
         let task = tokio::spawn(async move {
@@ -277,10 +287,13 @@ mod tests {
                 tokio::spawn(serve_ws_handshake(
                     stream,
                     echo_counter.clone(),
-                    app_log.clone(),
-                    command_log.clone(),
-                    ack_mode.clone(),
-                    pending_card_per_conn.clone(),
+                    FakeHostState {
+                        log: app_log.clone(),
+                        commands: command_log.clone(),
+                        ack: ack_mode.clone(),
+                        pending_card: pending_card_per_conn.clone(),
+                        model_catalog: model_catalog_per_conn.clone(),
+                    },
                     drop_signal.subscribe(),
                 ));
             }
@@ -293,6 +306,7 @@ mod tests {
             commands,
             ack,
             pending_card,
+            model_catalog,
             drop_tx,
             task,
         }
@@ -470,12 +484,16 @@ mod tests {
     async fn serve_rpc_frame(
         socket: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
         peer: &mut FakePeer,
-        log: &Arc<Mutex<Vec<String>>>,
-        commands: &Arc<Mutex<Vec<serde_json::Value>>>,
-        ack: &Arc<Mutex<AckMode>>,
-        pending_card: &Arc<Mutex<Option<serde_json::Value>>>,
+        host: &FakeHostState,
         payload: &serde_json::Value,
     ) {
+        let FakeHostState {
+            log,
+            commands,
+            ack,
+            pending_card,
+            model_catalog,
+        } = host;
         let bridge = payload
             .get("bridgeSessionId")
             .and_then(|value| value.as_str())
@@ -528,6 +546,12 @@ mod tests {
                         serde_json::json!({"ack": {"subscriptionId": CONVERSATION_SUBSCRIPTION}})
                     }
                     AGENT_SEND_COMMAND_METHOD => ack.lock().expect("ACK 模式锁").body(),
+                    // 外部评审 C1：目录读应答（None = 既有空应答，目录采不到）。
+                    "getView" => model_catalog
+                        .lock()
+                        .expect("目录锁")
+                        .clone()
+                        .unwrap_or_else(|| serde_json::json!({})),
                     _ => serde_json::json!({}),
                 };
                 let Ok(reply) = encode_response_for_test(id, body) else {
@@ -665,14 +689,21 @@ mod tests {
         })
     }
 
-    /// 单条回环 WS 连接的握手/心跳应答（配对即刻完成）、app 请求分派与数据面回显。
-    async fn serve_ws_handshake(
-        stream: tokio::net::TcpStream,
-        echoes: Arc<AtomicUsize>,
+    /// 假宿主跨连接共享的注入态/账本（每条连接克隆一份 Arc 句柄）。
+    #[derive(Clone)]
+    struct FakeHostState {
         log: Arc<Mutex<Vec<String>>>,
         commands: Arc<Mutex<Vec<serde_json::Value>>>,
         ack: Arc<Mutex<AckMode>>,
         pending_card: Arc<Mutex<Option<serde_json::Value>>>,
+        model_catalog: Arc<Mutex<Option<serde_json::Value>>>,
+    }
+
+    /// 单条回环 WS 连接的握手/心跳应答（配对即刻完成）、app 请求分派与数据面回显。
+    async fn serve_ws_handshake(
+        stream: tokio::net::TcpStream,
+        echoes: Arc<AtomicUsize>,
+        host: FakeHostState,
         mut close_rx: tokio::sync::broadcast::Receiver<()>,
     ) {
         let Ok(mut socket) = tokio_tungstenite::accept_async(stream).await else {
@@ -719,20 +750,12 @@ mod tests {
                 if let Some(payload) = app_payload(&value) {
                     let zcode_type = payload.get("zcode_type").and_then(|kind| kind.as_str());
                     if zcode_type == Some("rpc-frame") {
-                        serve_rpc_frame(
-                            &mut socket,
-                            &mut peer,
-                            &log,
-                            &commands,
-                            &ack,
-                            &pending_card,
-                            payload,
-                        )
-                        .await;
+                        serve_rpc_frame(&mut socket, &mut peer, &host, payload).await;
                         continue;
                     }
                     if let Some(zcode_type) = zcode_type {
-                        log.lock()
+                        host.log
+                            .lock()
                             .expect("app 请求日志锁")
                             .push(zcode_type.to_owned());
                         let reply = match zcode_type {
@@ -2140,6 +2163,127 @@ mod tests {
         // 静置观察窗：确认落账后也不得冒出第二帧（零探针、零自动重发）。
         tokio::time::sleep(Duration::from_millis(150)).await;
         assert_eq!(chain.ws.commands().len(), 1, "静置期后仍只允许一帧命令信封");
+    }
+
+    /// 外部评审 C1 回归 e2e：**已知 build**（`3.16.2.8769`，shipped 表 model/thought
+    /// = Confirmed）走生产 resolver 全链，model/thought 必须 enabled。
+    ///
+    /// 修复前的自锁：`has_model_catalog` 只在写闸之后的 `SelectionPort::load` 里采集，
+    /// 闸又要求 enabled → 目录永远采不到 → 永远 needs_evidence（已知 build 也打不开）。
+    /// 修复后读路径（GET /zcode/session）惰性单飞读一次 getView（不经能力闸），
+    /// 目录形状进 evidence → resolver 放行 shipped confirmed。
+    ///
+    /// 本用例同时钉住：目录读恰一帧 getView、无探针文本、零命令帧（只读），以及
+    /// shipped confirmed 的 send 不随观察落账（I1：出厂判定不进首次确认）。
+    #[tokio::test]
+    async fn known_build_opens_model_and_thought_via_catalog_read() {
+        let known_build: HostBuildProbe = Arc::new(|| Some("3.16.2.8769".to_owned()));
+        let chain = resolver_chain(known_build).await;
+        // 已知 build 的宿主必须能回真实目录（只认当前 provider）。
+        chain.ws.set_model_catalog(serde_json::json!({
+            "providers": [
+                {"providerId": "synthetic-provider", "models": [
+                    {"modelId": "synthetic-model-a", "config": {"optionSpecs": {"reasoningLevel": {"values": ["low", "high"]}}}},
+                    {"modelId": "synthetic-model-b", "config": {"optionSpecs": {"reasoningLevel": {"values": ["low"]}}}}
+                ]}
+            ]
+        }));
+        let app = router(remote_state(
+            &chain.conn,
+            chain.hub.clone(),
+            chain.injector.clone(),
+        ));
+
+        // 第一次 GET：bind + 订阅 + 快照就绪；读路径顺带惰性读目录。目录读与快照就绪
+        // 可能同帧或下一帧生效，所以按能力位轮询（有界 10s）。
+        let mut session = bind_and_wait_ready(&app, SYNTHETIC_TASK_ID).await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while session["capabilities"]["model"]["enabled"] != true {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "已知 build 的 model 未在时限内开放（目录读自锁未解）：{session}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let (status, body) = get_json(
+                &app,
+                &format!("/m/api/v1/zcode/session?sessionId={SYNTHETIC_TASK_ID}"),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            session = body;
+        }
+        assert_eq!(
+            session["capabilities"]["model"]["enabled"], true,
+            "已知 build shipped confirmed + 目录形状 → model 可用：{session}"
+        );
+        assert!(session["capabilities"]["model"]["reasonCode"].is_null());
+        assert_eq!(
+            session["capabilities"]["thoughtLevel"]["enabled"], true,
+            "已知 build shipped confirmed + 档位形状 → thought_level 可用：{session}"
+        );
+        assert_eq!(
+            session["capabilities"]["send"]["enabled"], true,
+            "已知 build shipped confirmed send 可用：{session}"
+        );
+        // 目录写回视图：模型下拉有真实候选（非扁平快照的单项）。
+        let models = session["selection"]["models"]
+            .as_array()
+            .expect("selection.models 数组");
+        let ids: Vec<&str> = models
+            .iter()
+            .filter_map(|m| m["modelId"].as_str())
+            .collect();
+        assert!(
+            ids.contains(&"synthetic-model-a") && ids.contains(&"synthetic-model-b"),
+            "目录模型应写回视图：{ids:?}"
+        );
+
+        // 只读链：零命令帧、零终端注入；目录读恰一帧 getView（单飞、每 revision 一次）。
+        assert!(chain.ws.commands().is_empty(), "只读链不得发任何命令帧");
+        assert_eq!(chain.injector.calls(), 0);
+        let get_views = chain
+            .ws
+            .log()
+            .into_iter()
+            .filter(|method| method == "getView")
+            .count();
+        assert_eq!(
+            get_views,
+            1,
+            "目录读恰一次（同 revision 不重试）：{:?}",
+            chain.ws.log()
+        );
+
+        // 再 GET 若干次：目录读不再重复（revision 未前进）。
+        for _ in 0..3 {
+            let (status, _) = get_json(
+                &app,
+                &format!("/m/api/v1/zcode/session?sessionId={SYNTHETIC_TASK_ID}"),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+        }
+        let get_views_after = chain
+            .ws
+            .log()
+            .into_iter()
+            .filter(|method| method == "getView")
+            .count();
+        assert_eq!(get_views_after, 1, "同 revision 重复 GET 零新目录读");
+
+        // I1：shipped confirmed 的能力不进首次确认——账本对该已知 build key 保持空。
+        let key = format!("{}|3.16.2.8769|3|v4|0", std::env::consts::OS);
+        let rows: i64 = chain
+            .conn
+            .lock()
+            .expect("conn")
+            .query_row(
+                "SELECT COUNT(*) FROM zcode_capability_evidence WHERE key = ?1",
+                [&key],
+                |row| row.get(0),
+            )
+            .expect("count");
+        assert_eq!(rows, 0, "已知 build shipped confirmed 零账本行");
     }
 
     /// T9 补腿 e2e（brief 验收「pending 卡首答确认」）：未知 build 的会话快照带一张

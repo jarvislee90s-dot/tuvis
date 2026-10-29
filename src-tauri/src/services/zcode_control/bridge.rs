@@ -672,6 +672,16 @@ struct SessionEntry {
     /// 组合，只标识「日志头在哪」，**绝不**承载任何正文。快照整体替换、patch 前进
     /// `seq`、两者皆缺保持不变；无完整 (epoch, seq) 对 = `None`（无指纹证据）。
     log_fingerprint: Option<String>,
+    /// 外部评审 C1：`model-selection.getView` 目录缓存（只含当前 provider 的模型/
+    /// 档位名，id 形状）。快照 `config` 是扁平形状、不带模型目录，而目录形状
+    /// （`has_model_catalog`）又是 model/thought 能力候选的必要条件——若只在写闸
+    /// 之后的 `load` 里读目录，能力永远打不开（自锁）。本缓存由
+    /// [`BridgeManager::ensure_selection_catalog`] 在读路径惰性填充，与投影 selection
+    /// 合并出视图；`load` 直接复用，零额外 RPC。
+    catalog: Option<SelectionView>,
+    /// 最近一次目录读尝试对应的投影 revision（成功/失败都记；同 revision 不重试，
+    /// revision 前进才允许再读——有界、不打爆宿主）。`None` = 本代际尚未尝试。
+    catalog_attempted_at: Option<u64>,
     staged: Vec<StagedFrame>,
     staged_bytes: usize,
     /// 暂存帧/在途分片的总字节预算（来自 [`BridgeLimits::staged_bytes`]）。
@@ -697,6 +707,8 @@ impl SessionEntry {
             bridge_id,
             projection,
             log_fingerprint: None,
+            catalog: None,
+            catalog_attempted_at: None,
             staged: Vec::new(),
             staged_bytes: 0,
             staged_budget,
@@ -706,6 +718,24 @@ impl SessionEntry {
             last_resync_at: None,
             stats: SessionStats::default(),
         }
+    }
+
+    /// 投影视图 + 目录缓存合并：快照 `config` 的当前选择三项为准，目录模型列表
+    /// 来自缓存（快照不带目录）。当前模型不在目录里时保留快照自带的扁平档位项，
+    /// 绝不虚构候选、绝不带入其他 provider。
+    fn view_with_catalog(&self) -> SessionView {
+        let mut view = self.projection.view();
+        if let (Some(current), Some(catalog)) = (view.selection.as_mut(), self.catalog.as_ref()) {
+            if catalog.provider == current.provider {
+                let mut models = catalog.models.clone();
+                // 当前模型若目录里没有（宿主刚换了模型/目录陈旧），保留快照自带项。
+                if !models.iter().any(|choice| choice.model_id == current.model) {
+                    models.append(&mut current.models);
+                }
+                current.models = models;
+            }
+        }
+        view
     }
 }
 
@@ -1230,7 +1260,93 @@ impl BridgeManager {
             .sessions
             .get(&target.session_id)
             .ok_or_else(|| ZcodeError::of(codes::NO_SESSION))?;
-        Ok(entry.projection.view())
+        Ok(entry.view_with_catalog())
+    }
+
+    /// 外部评审 C1：在**读路径**惰性、单飞、有界地取一次 `model-selection.getView`
+    /// 目录（绑定会话、投影就绪时才读；不经任何能力闸）——目录形状
+    /// （`has_model_catalog` / `has_thought_levels`）是 model/thought 能力候选的必要
+    /// 条件，不能只在写闸之后的 [`SelectionPort::load`] 里采集，否则能力永远打不开。
+    ///
+    /// 节流：同一投影 revision 只尝试一次（成功/失败都记位），revision 前进才允许再读
+    /// （有界、不打爆宿主）；失败只记位不报错（读失败 = 本 revision 无目录证据，
+    /// resolver 侧按缺形状保守关闭）。`invalidate` 随 `sessions` 整体清空。
+    /// 会话未在册/未就绪/代际不符 → 零 RPC。
+    pub(crate) async fn ensure_selection_catalog(&self, session_id: &str) {
+        let Some((target, config)) = ({
+            let mut inner = lock(&self.shared.state);
+            let Some(entry) = inner.sessions.get_mut(session_id) else {
+                return;
+            };
+            if !entry.projection.is_ready() {
+                return;
+            }
+            let view = entry.projection.view();
+            let Some(revision) = view.revision else {
+                return;
+            };
+            if entry.catalog_attempted_at == Some(revision) {
+                return;
+            }
+            // 占位记尝试（单飞：并发第二个调用方看到同 revision 已记位即退出）。
+            entry.catalog_attempted_at = Some(revision);
+            let current = view.selection.as_ref();
+            let config = current.map(|current| {
+                let levels = current
+                    .models
+                    .iter()
+                    .find(|choice| choice.model_id == current.model)
+                    .map(|choice| choice.thought_levels.clone())
+                    .unwrap_or_default();
+                serde_json::json!({
+                    "provider": current.provider,
+                    "model": current.model,
+                    "thought": current.thought,
+                    "thoughtLevels": levels,
+                })
+            });
+            config.map(|config| (entry.target.clone(), config))
+        }) else {
+            return;
+        };
+        let budget = self.shared.timing.rpc;
+        let Ok(body) = self
+            .call_with_timeout(
+                &target,
+                MODEL_SELECTION_CHANNEL,
+                MODEL_SELECTION_GET_VIEW_METHOD,
+                Vec::new(),
+                budget,
+            )
+            .await
+        else {
+            return;
+        };
+        let mut raw = if body.is_object() {
+            body
+        } else {
+            serde_json::json!({})
+        };
+        if let Some(object) = raw.as_object_mut() {
+            object.insert("config".to_owned(), config);
+        }
+        let Ok(selection) = parse_selection_view(&raw) else {
+            return;
+        };
+        let mut inner = lock(&self.shared.state);
+        let Some(entry) = inner.sessions.get_mut(session_id) else {
+            return;
+        };
+        if !entry.target.same_binding(&target) {
+            // 等 RPC 期间会话换代/重绑：旧目录不入新账。
+            return;
+        }
+        // T3：目录解析成功即采集目录/档位形状（只认当前 provider；失败不观察）。
+        inner.interface.observe_selection_catalog(&raw);
+        let Some(entry) = inner.sessions.get_mut(session_id) else {
+            return;
+        };
+        entry.catalog = Some(selection);
     }
 
     /// 在绑定会话的桥上发一次 RPC（读调用；T3 起才用于写命令）。
@@ -1808,9 +1924,16 @@ impl SelectionPort for BridgeManager {
             }
             let selection = parse_selection_view(&raw)?;
             // T3：目录解析成功即采集目录/档位形状（只认当前 provider；失败不观察）。
+            // C1：写前新鲜目录同时刷新读路径缓存（同一权威源，视图/下拉与写闸同步）。
             {
                 let mut inner = lock(&self.shared.state);
                 inner.interface.observe_selection_catalog(&raw);
+                if let Some(entry) = inner.sessions.get_mut(&target.session_id) {
+                    if entry.target.same_binding(target) {
+                        entry.catalog = Some(selection.clone());
+                        entry.catalog_attempted_at = view.revision;
+                    }
+                }
             }
             Ok((view, selection))
         })
@@ -5271,6 +5394,90 @@ mod tests {
             !evidence.has_thought_levels,
             "其他账号 provider 的档位不得置位 has_thought_levels"
         );
+    }
+
+    /// 外部评审 C1：目录读必须在执行闸**之前**可用——`ensure_selection_catalog`
+    /// 惰性单飞地取 getView 目录（不经过能力闸），否则 shipped confirmed / 接口
+    /// 候选的 model/thought 永远采不到 `has_model_catalog`（enabled=false → 写闸
+    /// 挡住 load → 永远 enabled=false 的自锁）。成功后目录写回投影 selection。
+    #[tokio::test]
+    async fn ensure_selection_catalog_collects_shapes_without_capability_gate() {
+        const PROVIDER: &str = "synthetic-provider";
+        let config = PeerConfig {
+            workspaces: vec![workspace_entry(WS_A, Some("ws-a-identity"), "A")],
+            tasks: vec![task_row(WS_A, SESSION_A, "hi")],
+            conversation_snapshot: Some(conversation_snapshot(SESSION_A, 2, Vec::new())),
+            model_selection_view: Some(json!({
+                "providers": [
+                    {"providerId": PROVIDER, "models": [
+                        {"modelId": "synthetic-model-a", "config": {"optionSpecs": {"reasoningLevel": {"values": ["low", "high"]}}}},
+                        {"modelId": "synthetic-model-b", "config": {"optionSpecs": {"reasoningLevel": {"values": ["low"]}}}}
+                    ]}
+                ]
+            })),
+            ..PeerConfig::default()
+        };
+        let (manager, _peer) = manager_with(config).await;
+        let target = manager.bind(&key(SESSION_A)).await.expect("bind");
+
+        // 闸前基线：目录形状缺席——这正是旧世界的自锁点。
+        assert!(
+            !manager
+                .host_evidence()
+                .interface_evidence()
+                .has_model_catalog
+        );
+
+        // 惰性目录读：不经任何能力闸。
+        manager.ensure_selection_catalog(SESSION_A).await;
+
+        let evidence = manager.host_evidence().interface_evidence();
+        assert!(evidence.has_model_catalog, "闸前目录形状已采集");
+        assert!(evidence.has_thought_levels, "档位形状已采集");
+
+        // 目录写回投影：模型/档位下拉的数据源（绝不只留扁平快照 config）。
+        let view = manager.session(&target).await.expect("session");
+        let selection = view.selection.expect("selection 回写");
+        let ids: Vec<&str> = selection
+            .models
+            .iter()
+            .map(|choice| choice.model_id.as_str())
+            .collect();
+        assert_eq!(ids, ["synthetic-model-a", "synthetic-model-b"]);
+    }
+
+    /// 外部评审 C1：懒触发闸——未 bind（无会话在册）零 RPC；同一 revision 只尝试
+    /// 一次（失败也记尝试位）；revision 前进后才允许再次尝试（绝不打爆宿主）。
+    #[tokio::test]
+    async fn ensure_selection_catalog_is_lazy_once_per_revision() {
+        const SUB: &str = "conv-sub-synthetic-1";
+        // 无 model_selection_view：getView 应答不认识 → load 失败（仍记尝试位）。
+        let config = PeerConfig {
+            workspaces: vec![workspace_entry(WS_A, Some("ws-a-identity"), "A")],
+            tasks: vec![task_row(WS_A, SESSION_A, "hi")],
+            conversation_snapshot: Some(conversation_snapshot(SESSION_A, 2, Vec::new())),
+            ..PeerConfig::default()
+        };
+        let (manager, peer) = manager_with(config).await;
+        let attempts = || command_frames(&peer, MODEL_SELECTION_GET_VIEW_METHOD).len();
+
+        // 未 bind：零 RPC。
+        manager.ensure_selection_catalog(SESSION_A).await;
+        assert_eq!(attempts(), 0, "无会话在册不触发目录读");
+
+        // bind 后：第一次调用尝试 getView（失败也记位）。
+        let _target = manager.bind(&key(SESSION_A)).await.expect("bind");
+        manager.ensure_selection_catalog(SESSION_A).await;
+        assert_eq!(attempts(), 1, "本 revision 恰一次目录读");
+
+        // 同 revision 重复触发：缓存闸挡住，零新 RPC。
+        manager.ensure_selection_catalog(SESSION_A).await;
+        assert_eq!(attempts(), 1, "同 revision 不重试");
+
+        // revision 前进（新快照注入）→ 允许再次尝试。
+        push_pending_snapshot_on(&peer, SESSION_A, SUB, 3, Vec::new()).await;
+        manager.ensure_selection_catalog(SESSION_A).await;
+        assert_eq!(attempts(), 2, "revision 前进后允许再次尝试");
     }
 
     #[tokio::test]

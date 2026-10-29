@@ -1029,7 +1029,15 @@ impl HubBackend for PartsBackend {
     }
 
     fn session<'a>(&'a self, target: &'a BoundTarget) -> BoxFuture<'a, ZResult<SessionView>> {
-        Box::pin(async move { self.bridge.session(target).await })
+        Box::pin(async move {
+            // 外部评审 C1：读路径先惰性补一次目录（单飞、每 revision 一次、不经能力
+            // 闸）——目录形状是 model/thought 候选的必要条件，只能在读侧采集，
+            // 否则「闸关 → 不读目录 → 闸永远关」自锁。失败只记位，读视图照常。
+            self.bridge
+                .ensure_selection_catalog(&target.session_id)
+                .await;
+            self.bridge.session(target).await
+        })
     }
 
     fn execute<'a>(
