@@ -53,7 +53,7 @@ use super::selection::parse_selection_view;
 use super::types::{
     codes, BoundTarget, CommandPort, HostBuildProbe, HostEvidence, PendingKind, PendingPort,
     PendingView, RelaySink, SelectionPort, SelectionView, SessionView, StopPort, TargetKey,
-    ZResult, ZcodeError,
+    ZResult, ZcodeError, PROTOCOL_CLIENT_ID,
 };
 
 /// agent 服务 channel（`channels.ts:114`）。
@@ -158,9 +158,6 @@ impl BridgeLimits {
 const CLIENT_KIND: &str = "web";
 /// clientHello 的 appVersion（Tuvis 版本标识，不含机器/账号信息）。
 const APP_VERSION: &str = "tuvis";
-/// clientHello 的 clientId（稳定、无秘密）。
-const CLIENT_ID: &str = "tuvis-remote";
-
 fn unsupported() -> ZcodeError {
     ZcodeError::of(codes::UNSUPPORTED_PROTOCOL)
 }
@@ -320,9 +317,14 @@ impl Default for Inner {
 /// schema 形状指纹（外部评审 P1-3；spec R2「schema 变化即重算」的 key 分量）。
 ///
 /// 只记录 wire 形状的**键名骨架**：hello 应答的顶层键集、首个有效 conversation
-/// snapshot 的顶层键集、其 `config` 子对象键集、`pendingInteractions` 首张卡的
-/// 顶层键集与 `payload` 子键集。**绝不**读取任何值——正文、id、模型名、题干、
-/// 答案、JWT、链接对指纹不可见（同形状不同内容 → 同指纹）。
+/// snapshot 的顶层键集、其 `config` 子对象键集。**绝不**读取任何值——正文、id、
+/// 模型名、题干、答案、JWT、链接对指纹不可见（同形状不同内容 → 同指纹）。
+///
+/// **骨架只取会话状态无关的稳定面**：`pendingInteractions` 的卡骨架**不**参与——
+/// 首帧有无卡、首卡题型随会话状态变化，若参与会让同一宿主跨重启/重连得到不同
+/// 指纹（账本按旧指纹孤立：confirmed 不命中重开确认窗、degraded 被遗忘），
+/// 复审轮已定级 Important 并剔除。hello/snapshot/config 三段键集已足以感知协议
+/// 帧形状的升级。
 ///
 /// 指纹 = 键名骨架的稳定哈希（FNV-1a 64，定长 16 位十六进制 id 形状）。用于
 /// [`CapabilityKey`] 的 `schema_fingerprint`：renderer 热更改了帧形状但 build/协议
@@ -334,8 +336,6 @@ pub(crate) struct SchemaShape {
     hello_keys: Option<Vec<String>>,
     snapshot_keys: Option<Vec<String>>,
     config_keys: Vec<String>,
-    pending_keys: Vec<String>,
-    pending_payload_keys: Vec<String>,
 }
 
 impl SchemaShape {
@@ -349,8 +349,8 @@ impl SchemaShape {
         }
     }
 
-    /// conversation snapshot 顶层键集 + `config` 子键集 + 首张 pending 卡骨架
-    /// （首次观测锁定）。
+    /// conversation snapshot 顶层键集 + `config` 子键集（首次观测锁定）。
+    /// pending 卡骨架刻意不采（见类型文档：随会话状态漂移，会分裂账本）。
     pub(crate) fn observe_snapshot(&mut self, snapshot: &Value) {
         if self.snapshot_keys.is_some() {
             return;
@@ -363,17 +363,6 @@ impl SchemaShape {
             .get("config")
             .and_then(Self::sorted_keys)
             .unwrap_or_default();
-        if let Some(card) = snapshot
-            .get("pendingInteractions")
-            .and_then(Value::as_array)
-            .and_then(|cards| cards.first())
-        {
-            self.pending_keys = Self::sorted_keys(card).unwrap_or_default();
-            self.pending_payload_keys = card
-                .get("payload")
-                .and_then(Self::sorted_keys)
-                .unwrap_or_default();
-        }
     }
 
     /// 定长 16 位十六进制指纹；hello/snapshot 骨架缺一 → `None`。
@@ -397,10 +386,6 @@ impl SchemaShape {
         snapshot.iter().for_each(|key| feed(key));
         feed("config");
         self.config_keys.iter().for_each(|key| feed(key));
-        feed("pending");
-        self.pending_keys.iter().for_each(|key| feed(key));
-        feed("payload");
-        self.pending_payload_keys.iter().for_each(|key| feed(key));
         Some(format!("{hash:016x}"))
     }
 
@@ -1163,16 +1148,19 @@ impl BridgeManager {
             let mut inner = lock(&self.shared.state);
             // 前/后快照与 `handle_data` 在同一把状态锁内：视图差异就是「本帧」
             // 的效果，不会混入锁外其它调用者的读写。
+            // 前后视图都走「投影 + 目录缓存」合并（与读路径同一出口）：广播面若用
+            // 原始投影，实时帧会把 GET 合并出的完整模型目录整体覆盖掉（外部评审
+            // P2：手机在会话事件上整包覆盖状态，目录随帧丢失且 ready=true 不补拉）。
             let before: HashMap<String, SessionView> = inner
                 .sessions
                 .iter()
-                .map(|(session_id, entry)| (session_id.clone(), entry.projection.view()))
+                .map(|(session_id, entry)| (session_id.clone(), entry.view_with_catalog()))
                 .collect();
             let (result, acks, releases) = inner.handle_data(&payload);
             // 成败都做 diff：错误帧的降级/恢复视图同样是「本帧真实发生的状态变化」。
             let mut changed = Vec::new();
             for (session_id, entry) in inner.sessions.iter() {
-                let after = entry.projection.view();
+                let after = entry.view_with_catalog();
                 if before.get(session_id) != Some(&after) {
                     changed.push(after);
                 }
@@ -2701,7 +2689,7 @@ impl Shared {
                         "protocolVersion".to_owned(),
                         Value::from(V4_WIRE_PROTOCOL_VERSION),
                     ),
-                    ("clientId".to_owned(), Value::from(CLIENT_ID)),
+                    ("clientId".to_owned(), Value::from(PROTOCOL_CLIENT_ID)),
                     ("clientKind".to_owned(), Value::from(CLIENT_KIND)),
                     ("appVersion".to_owned(), Value::from(APP_VERSION)),
                 ]
@@ -3072,7 +3060,15 @@ impl Shared {
             Ok(Ok(message)) => {
                 if message.message_type == RESPONSE_TYPE_PROMISE_ERROR {
                     // 上游原文（可能含路径/正文）绝不下发，只映射冻结码。
-                    Err(ZcodeError::unknown())
+                    // 三轮 A：身份不一致是确定性客户端缺陷（命令 clientId ≠ 握手
+                    // 身份），单独分类便于定位；同样不透传上游原文，且不属于能力
+                    // 失败（不降级能力，走既有 Err 路径零落账、不重发）。
+                    let fault = message.body.get("code").and_then(Value::as_str);
+                    if fault.is_some_and(|code| code.contains("clientMismatch")) {
+                        Err(ZcodeError::of(codes::CLIENT_MISMATCH))
+                    } else {
+                        Err(ZcodeError::unknown())
+                    }
                 } else {
                     Ok(message)
                 }
@@ -5354,6 +5350,31 @@ mod tests {
             "config": {"provider": "p", "model": "m", "thought": "t", "thoughtLevels": ["x"]}
         }));
         assert_ne!(a.fingerprint(), d.fingerprint(), "config 子形状变化改指纹");
+
+        // 复审轮 Important 回归钉：pending 卡有无 / 首卡题型 / payload 形状都**不**
+        // 改指纹——会话状态不属于协议形状，否则同宿主跨重启账本分裂。
+        let mut e = SchemaShape::default();
+        e.observe_hello(&json!({"kind": "hello", "protocolVersion": 3, "connectionId": "c-1"}));
+        e.observe_snapshot(&json!({
+            "revision": 1, "seq": 1, "logEpoch": "e1",
+            "control": {"activeWorks": []},
+            "pendingInteractions": [],
+            "config": {"provider": "p", "model": "m", "thought": "t"}
+        }));
+        assert_eq!(a.fingerprint(), e.fingerprint(), "有卡/无卡同指纹");
+        let mut f = SchemaShape::default();
+        f.observe_hello(&json!({"kind": "hello", "protocolVersion": 3, "connectionId": "c-1"}));
+        f.observe_snapshot(&json!({
+            "revision": 1, "seq": 1, "logEpoch": "e1",
+            "control": {"activeWorks": []},
+            "pendingInteractions": [{"kind": "permission", "payload": {"command": "rm", "options": []}, "extra": 1}],
+            "config": {"provider": "p", "model": "m", "thought": "t"}
+        }));
+        assert_eq!(
+            a.fingerprint(),
+            f.fingerprint(),
+            "卡题型/payload 形状同指纹"
+        );
 
         // 指纹是定长十六进制 id 形状，不含任何原文片段。
         assert_eq!(fa.len(), 16);

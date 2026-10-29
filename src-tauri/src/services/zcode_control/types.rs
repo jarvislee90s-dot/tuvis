@@ -16,6 +16,12 @@ use serde_json::Value;
 
 use crate::services::zcode_control::capability::state::ZcodeInterfaceEvidence;
 
+/// 官方协议的 Tuvis 客户端身份：clientHello 与**全部**写命令信封的 `clientId`
+/// 唯一来源（外部评审三轮 A 裁决：协议身份单一来源）。手机 `device_id` 只用于
+/// Tuvis 侧（配对授权/审计/动作归属/幂等身份），绝不进入协议信封——官方按握手
+/// 身份校验命令（不一致回 `fault.command.clientMismatch`）。
+pub(crate) const PROTOCOL_CLIENT_ID: &str = "tuvis-remote";
+
 /// 对外错误码（冻结：不得新增、改写或本地化；HTTP error 与 capability reasonCode 共用）。
 pub mod codes {
     /// 未保存官方链接/配置不可用。
@@ -28,6 +34,9 @@ pub mod codes {
     pub const CONFLICT: &str = "conflict";
     /// 其他未知失败（官方形态变更、无法归类）。
     pub const UNKNOWN: &str = "unknown";
+    /// 协议身份不一致：命令 clientId ≠ clientHello 握手身份（官方
+    /// `fault.command.clientMismatch` 的本地冻结分类；不透传上游原文）。
+    pub const CLIENT_MISMATCH: &str = "client_mismatch";
     /// 投影/桥尚未就绪。
     pub const NOT_READY: &str = "not_ready";
     /// 官方协议版本不受支持。

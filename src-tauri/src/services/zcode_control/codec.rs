@@ -282,6 +282,14 @@ pub(crate) fn encode_response_for_test(id: u32, body: Value) -> ZResult<Vec<u8>>
     encode_message(&header, &body)
 }
 
+/// 测试专用：编码一条 202 失败应答（header `[202, id]` + fault body）。
+/// 协议身份校验（外部评审三轮 A）用它模拟官方 `fault.command.clientMismatch`。
+#[cfg(test)]
+pub(crate) fn encode_promise_error_for_test(id: u32, body: Value) -> ZResult<Vec<u8>> {
+    let header = vec![Value::from(RESPONSE_TYPE_PROMISE_ERROR), Value::from(id)];
+    encode_message(&header, &body)
+}
+
 // ---------------------------------------------------------------------------
 // 反序列化
 // ---------------------------------------------------------------------------

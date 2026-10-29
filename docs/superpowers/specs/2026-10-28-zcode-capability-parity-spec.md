@@ -233,7 +233,7 @@ POST takeover
 
 以下为实现期经控制者裁决的偏差，与上文条款冲突处**以本节为准**；其余章节结论不变。
 
-- **schema_fingerprint 占位 `"v4"` / probe_epoch 恒 0**（R2/§6.1 的 fingerprint/epoch 字段）：T3 未提供真实 schema 哈希，key 失效由 `app_build` + `protocol_version` 承担；占位只保证同 build 内 key 稳定（账本 confirmed/degraded 跨重连存活的前提）。epoch 推进（探测复位语义）留待后续任务。
+- **schema_fingerprint 已实现真实形状哈希（2026-10-29 外部评审修复轮取代原 `"v4"` 占位）/ probe_epoch 恒 0**（R2/§6.1 的 fingerprint/epoch 字段）：指纹取 hello 应答与首个有效 conversation snapshot（含其 `config` 子对象）的**键名骨架**哈希（FNV-1a 64，定长 16 位十六进制 id 形状；值/正文不可见；骨架只取会话状态无关的稳定面，pending 卡形态不参与——避免同 build 指纹随会话状态漂移分裂账本）。同 build 同协议下帧形状变化即换 key，旧 confirmed/degraded 不命中。epoch 推进（探测复位语义）仍留待后续任务，恒 0。
 - **send 确认的「新用户消息可见」用 `logEpoch:seq` 日志头指纹作代理判据**（R4 send 判据）：协议未提供「最后一条用户消息 id」的只读面；指纹是 id 形状（`"{epoch}:{seq}"`），消息追加即前进，语义与「新用户消息可见」等价且不存正文。指纹缺任一半（快照未携带 epoch/seq）时保守不确认。
 - **A 策略确认窗 5s vs 命令回执 rpc 超时 10s 的时序**（R4「5s 有界」）：确认窗自 **ACK 受理后**起算并重置（`rearm`），而命令 rpc 回执本身超时上限 10s——回执最晚 10s 才到达时，确认窗观察可能已先行收口（confirmed / 到点 inconclusive）；ACK-only 回执绝不升级判决，真实确认只来自事件泵的宿主状态观察，回执只负责终态（rejected/unknown）降级收口。两侧时序各自有界、互不阻塞。
 - **手机抢回的「确认」形态 = 常驻说明 + 单击即发**（R1「流程：确认 → disconnect → …」）：不做二次弹窗确认；「断开并抢回」按钮旁常驻一句说明（点击即执行一次抢回），busy 期间禁用，仍 conflict 只提示先关官方页面、失败显示冻结原因码——单飞一次、不循环的契约不变。
