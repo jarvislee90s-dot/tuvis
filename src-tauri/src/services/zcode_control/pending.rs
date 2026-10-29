@@ -135,6 +135,12 @@ impl PendingBook {
         self.host_pending_ids.contains(interaction_id)
     }
 
+    /// 宿主最近一次整体替换里的 pending id 集合（只含 id 形状，无题目/选项/答案；
+    /// 外部评审 C2：pending 首次确认判据的撤卡证据源）。
+    pub fn host_pending_ids(&self) -> Vec<String> {
+        self.host_pending_ids.iter().cloned().collect()
+    }
+
     /// 应答授权：精确校验会话/代际/卡锚，原子置本地 in-flight（重复提交闸）。
     ///
     /// 只证明「本进程尚未提交这张卡」——**不**代表宿主已收口：宿主 pending 集合

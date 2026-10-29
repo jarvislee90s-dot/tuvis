@@ -196,7 +196,13 @@ impl ConfirmationTracker {
 
     /// 事件泵观察：一条新投影（`generation` 是发布该视图的 Hub 代际；`fingerprint`
     /// 是观察时刻的会话日志头指纹，可缺）。两段式：锁内只做判定与摘除，锁外落账。
-    fn observe_session(&self, view: &SessionView, generation: u64, fingerprint: Option<String>) {
+    fn observe_session(
+        &self,
+        view: &SessionView,
+        generation: u64,
+        fingerprint: Option<String>,
+        host_pending: Option<&[String]>,
+    ) {
         let now = Instant::now();
         let decisions = {
             let mut pending = self
@@ -221,13 +227,12 @@ impl ConfirmationTracker {
                 // 到点未决：inconclusive（有界窗，绝不重发）。
                 if now >= ctx.deadline {
                     // Pending/Interrupt 目标：最后观察里目标卡/守卫仍在场 → 判据词
-                    // 如实记「卡未撤 / 守卫未清」；其余形态沿用一般超窗词。
+                    // 如实记「卡未撤 / 守卫未清」；其余形态沿用一般超窗词。C2：卡
+                    // 在场与否只认宿主集合（与判据同源），本地列表零证据力。
                     let record = match &ctx.target {
                         ConfirmationTarget::Pending { request_key }
-                            if view
-                                .pending
-                                .iter()
-                                .any(|card| &card.interaction_id == request_key) =>
+                            if host_pending
+                                .is_some_and(|ids| ids.iter().any(|id| id == request_key)) =>
                         {
                             inconclusive_record_with(
                                 slot.1,
@@ -286,7 +291,10 @@ impl ConfirmationTracker {
                         // generation 闸永不咬合。
                         let mut after = view.clone();
                         after.generation = generation;
-                        confirm_pending(&ctx, &after)
+                        // 外部评审 C2：撤卡证据只认宿主集合（调用方从桥的
+                        // `PendingBook::host_pending_ids` 取）；本地投影 pending
+                        // 列表在 ACK 后即被本地消费，对「宿主是否撤卡」零证据力。
+                        confirm_pending(&ctx, &after, host_pending)
                     }
                     ConfirmationTarget::Interrupt { .. } => {
                         // 等效 control 快照：守卫 id 集合只在宿主明确宣告 control
@@ -734,6 +742,15 @@ pub(crate) trait BridgePump: Send + Sync {
         let _ = session_id;
         None
     }
+
+    /// 外部评审 C2：精确会话的**宿主** pending id 集合（pending 判据的唯一撤卡
+    /// 证据源；与回执腿 `wait_host_cleared` 同一权威源）。默认 `None` = 「无宿主
+    /// 集合证据」，判据按无证据保守不确认（绝不把「取不到」当「已撤卡」）；测试
+    /// fake 零改动，生产 `ProjectionBridge` 必须覆写。
+    fn host_pending_ids(&self, session_id: &str) -> Option<Vec<String>> {
+        let _ = session_id;
+        None
+    }
 }
 
 /// 事件泵装配口：relay 事件接收端 + 泵桥 + 可选 Data 溢出观察口（测试可缺省）。
@@ -761,6 +778,10 @@ impl BridgePump for ProjectionBridge {
 
     fn log_fingerprint(&self, session_id: &str) -> Option<String> {
         self.bridge.log_fingerprint(session_id)
+    }
+
+    fn host_pending_ids(&self, session_id: &str) -> Option<Vec<String>> {
+        self.bridge.host_pending_ids(session_id)
     }
 }
 
@@ -1908,14 +1929,21 @@ impl ZcodeHub {
                         // 代际/配对闸在 apply_relay_session 内复核。
                         for view in outcome.changed {
                             // T5 确认观察：本会话有未决确认才取日志头指纹并克隆视图
-                            // （快速路径零克隆、零桥查询）。
+                            // （快速路径零克隆、零桥查询）。外部评审 C2：pending 判据
+                            // 的撤卡证据只认宿主集合，慢路径一并取宿主 pending ids。
                             let observed = confirmations.has_pending(&view.session_id).then(|| {
                                 let fingerprint = bridge.log_fingerprint(&view.session_id);
-                                (view.clone(), fingerprint)
+                                let host_pending = bridge.host_pending_ids(&view.session_id);
+                                (view.clone(), fingerprint, host_pending)
                             });
                             apply_relay_session(&inner, &out, hub_generation, view);
-                            if let Some((view, fingerprint)) = observed {
-                                confirmations.observe_session(&view, hub_generation, fingerprint);
+                            if let Some((view, fingerprint, host_pending)) = observed {
+                                confirmations.observe_session(
+                                    &view,
+                                    hub_generation,
+                                    fingerprint,
+                                    host_pending.as_deref(),
+                                );
                             }
                         }
                         // 错误只代表本帧未吸收：不改变连接终态、不拆泵（ACK 已尽力发出）。
@@ -6241,6 +6269,10 @@ mod tests {
         outcomes: Mutex<VecDeque<DataOutcome>>,
         /// T5 确认观察：按会话注入的日志头指纹（缺席 = `None`，与 trait 默认一致）。
         fingerprints: Mutex<BTreeMap<String, String>>,
+        /// 外部评审 C2：按会话注入的宿主 pending id 集合。缺席 = `None`（无证据，
+        /// 判据保守不确认）；`Some(vec![])` 才是「宿主宣告卡已撤」——与生产
+        /// ProjectionBridge 的语义一致，测试必须显式声明宿主状态。
+        host_pendings: Mutex<BTreeMap<String, Vec<String>>>,
     }
 
     impl FakePump {
@@ -6258,6 +6290,14 @@ mod tests {
                 .lock()
                 .unwrap()
                 .insert(session_id.to_owned(), fingerprint.to_owned());
+        }
+
+        /// 注入某会话的宿主 pending id 集合（C2 pending 判据的撤卡证据源）。
+        fn set_host_pending_ids(&self, session_id: &str, ids: Vec<String>) {
+            self.host_pendings
+                .lock()
+                .unwrap()
+                .insert(session_id.to_owned(), ids);
         }
     }
 
@@ -6283,6 +6323,10 @@ mod tests {
 
         fn log_fingerprint(&self, session_id: &str) -> Option<String> {
             self.fingerprints.lock().unwrap().get(session_id).cloned()
+        }
+
+        fn host_pending_ids(&self, session_id: &str) -> Option<Vec<String>> {
+            self.host_pendings.lock().unwrap().get(session_id).cloned()
         }
     }
 
@@ -8917,7 +8961,10 @@ mod tests {
             .expect("answer 应被受理");
         assert_eq!(receipt.state, ActionState::Accepted);
 
-        // 新投影：revision 前进 + 目标卡已从宿主集合撤下。
+        // 新投影：revision 前进 + 目标卡已从宿主集合撤下（C2：撤卡证据显式声明
+        // 在 FakePump 的宿主集合里，本地视图列表不再充当宿主状态）。
+        pump.set_host_pending_ids("sess_synthetic0000", vec![]);
+        pump.set_host_pending_ids("sess_synthetic0000", vec![]);
         pump.push_outcome(
             Ok(()),
             vec![changed_view_with_pending("sess_synthetic0000", 11, vec![])],
@@ -8977,6 +9024,10 @@ mod tests {
         .expect("answer 应被受理");
 
         // 新投影：revision 前进，但目标卡仍挂在宿主集合里（旁边卡撤下不算数）。
+        pump.set_host_pending_ids(
+            "sess_synthetic0000",
+            vec!["ix-synthetic-1".to_owned(), "ix-synthetic-2".to_owned()],
+        );
         pump.push_outcome(
             Ok(()),
             vec![changed_view_with_pending(
@@ -9027,6 +9078,7 @@ mod tests {
         .await
         .expect("answer 应被受理");
 
+        pump.set_host_pending_ids("sess_synthetic0000", vec![]);
         pump.push_outcome(
             Ok(()),
             vec![changed_view_with_pending("sess_synthetic0000", 11, vec![])],
@@ -9077,6 +9129,7 @@ mod tests {
         .await
         .expect("answer 应被受理");
 
+        pump.set_host_pending_ids("sess_synthetic0000", vec![]);
         pump.push_outcome(
             Ok(()),
             vec![changed_view_with_pending("sess_synthetic0000", 11, vec![])],
@@ -9126,6 +9179,7 @@ mod tests {
             .expect("permission 应被受理");
         assert_eq!(receipt.state, ActionState::Accepted);
 
+        pump.set_host_pending_ids("sess_synthetic0000", vec![]);
         pump.push_outcome(
             Ok(()),
             vec![changed_view_with_pending("sess_synthetic0000", 11, vec![])],
@@ -9210,6 +9264,7 @@ mod tests {
 
         // 新投影：revision 前进 + 新用户消息可见（send 的确认判据全满足）。
         pump.set_fingerprint("sess_synthetic0000", "u1");
+        pump.set_host_pending_ids("sess_synthetic0000", vec![]);
         pump.push_outcome(
             Ok(()),
             vec![changed_view_with_pending("sess_synthetic0000", 11, vec![])],
@@ -9281,6 +9336,7 @@ mod tests {
             ),
             generation,
             None,
+            Some(&["ix-synthetic-1".to_owned()]),
         );
 
         let rows = ledger.get(&confirmation_key());
@@ -9294,6 +9350,94 @@ mod tests {
             };
             assert_eq!(row.evidence.as_deref(), Some(expected));
         }
+    }
+
+    /// 外部评审 C2 接线钉（正例）：宿主集合宣告卡已撤 + revision 前进 → 泵观察
+    /// 判据 confirmed（撤卡面已从本地投影列表切到宿主集合，与回执腿同源）。
+    #[tokio::test]
+    async fn pending_confirmation_follows_host_pending_set_when_card_cleared() {
+        let store = stored(URL);
+        let ledger: Arc<dyn CapabilityLedger> = Arc::new(DbCapabilityLedger::new(store.clone()));
+        let fake = Arc::new(FakeBackend::default());
+        fake.set_baseline(pending_baseline());
+        let (hub, _events, _pump) = confirmation_hub(
+            fake.clone(),
+            ledger.clone(),
+            policy_with(&["single_select"]),
+        )
+        .await;
+        let generation = hub.connection().generation;
+        assert!(hub.confirmations.register(ConfirmationContext {
+            capability: Capability::SingleSelect,
+            key: confirmation_key(),
+            session_id: "sess_synthetic0000".to_owned(),
+            generation,
+            baseline_revision: 10,
+            target: ConfirmationTarget::Pending {
+                request_key: "ix-synthetic-1".to_owned(),
+            },
+            deadline: Instant::now() + Duration::from_secs(5),
+        }));
+
+        // 本地投影列表为空（ACK 已消费）+ 宿主集合宣告空 = 卡已撤 + revision 前进。
+        hub.confirmations.observe_session(
+            &changed_view_with_pending("sess_synthetic0000", 11, vec![]),
+            generation,
+            None,
+            Some(&[]),
+        );
+        let rows = ledger.get(&confirmation_key());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].state, CapabilityState::Confirmed);
+    }
+
+    /// 外部评审 C2 回归钉（反例）：宿主集合仍含目标卡时，本地册已空（ACK 消费）
+    /// + 任意 revision 前进帧都**不得** confirmed，也不落账——登记保留，等回执腿
+    /// （wait_host_cleared）或宿主真实撤卡收口。
+    #[tokio::test]
+    async fn pending_confirmation_ignores_local_consumption_without_host_clear() {
+        let store = stored(URL);
+        let ledger: Arc<dyn CapabilityLedger> = Arc::new(DbCapabilityLedger::new(store.clone()));
+        let fake = Arc::new(FakeBackend::default());
+        fake.set_baseline(pending_baseline());
+        let (hub, _events, _pump) = confirmation_hub(
+            fake.clone(),
+            ledger.clone(),
+            policy_with(&["single_select"]),
+        )
+        .await;
+        let generation = hub.connection().generation;
+        assert!(hub.confirmations.register(ConfirmationContext {
+            capability: Capability::SingleSelect,
+            key: confirmation_key(),
+            session_id: "sess_synthetic0000".to_owned(),
+            generation,
+            baseline_revision: 10,
+            target: ConfirmationTarget::Pending {
+                request_key: "ix-synthetic-1".to_owned(),
+            },
+            deadline: Instant::now() + Duration::from_secs(5),
+        }));
+
+        // 本地投影列表为空（ACK 已消费）+ revision 前进，但宿主集合仍含卡。
+        hub.confirmations.observe_session(
+            &changed_view_with_pending("sess_synthetic0000", 11, vec![]),
+            generation,
+            None,
+            Some(&["ix-synthetic-1".to_owned()]),
+        );
+        assert!(
+            ledger.get(&confirmation_key()).is_empty(),
+            "宿主未撤卡不得写 confirmed"
+        );
+        // 桥给不出宿主集合（None = 无证据面）同样不得确认。
+        hub.confirmations.observe_session(
+            &changed_view_with_pending("sess_synthetic0000", 12, vec![]),
+            generation,
+            None,
+            None,
+        );
+        assert!(ledger.get(&confirmation_key()).is_empty());
     }
 
     // ====================================================================
@@ -9611,6 +9755,7 @@ mod tests {
             &changed_view_with_control("sess_synthetic0000", 11, vec!["work-1"]),
             generation,
             None,
+            None,
         );
         let rows = ledger.get(&confirmation_key());
         assert_eq!(rows.len(), 1);
@@ -9632,6 +9777,7 @@ mod tests {
         hub.confirmations.observe_session(
             &changed_view_with_control("sess_synthetic0000", 12, vec!["work-9"]),
             generation,
+            None,
             None,
         );
         let rows = ledger.get(&confirmation_key());

@@ -207,18 +207,27 @@ pub(crate) fn confirm_selection(
     }
 }
 
-/// pending 卡判据（spec R4；生产计划 T6）：目标 requestKey 撤下 + revision 前进。
+/// pending 卡判据（spec R4；生产计划 T6 + 外部评审 C2 修正）：**宿主** pending
+/// 集合里目标 requestKey 消失 + revision 前进。
 ///
 /// generation 不匹配的兜底语义同 [`confirm_send`]；`after.revision` 缺席（投影尚未
 /// 取得水位）同样保守不确认，等下一帧。目标类型不匹配（send/selection 上下文配了
 /// 本判据）是登记侧接线错误，保守不确认。
 ///
-/// 判定只读 `after.pending` 的 `interaction_id` 集合：旁边的卡消失绝不构成目标
-/// 卡撤下的证据；「只确认回答既有 permission 卡」的边界（spec §4.1）由登记侧保证
-/// ——登记只发生在用户对既有卡的动作（见 hub.rs `register_confirmations`）。
+/// **撤卡证据只认宿主集合（`host_pending`）**：本地册在 ACK 后即把卡消费掉
+/// （`mark_resolved_local` 是「本地消费 ≠ 宿主撤卡」），本地投影的 pending 列表
+/// 对「宿主是否撤卡」没有任何证据力——若据它判定，ACK 后任意一条 revision 前进帧
+/// 都会假确认。`after.pending` 在本判据中**不参与**判定。宿主集合由桥供给
+/// （`PendingBook::host_pending_ids`，与回执腿 `wait_host_cleared` 同一权威源）；
+/// **`None` = 桥给不出宿主集合（无证据）→ 保守不确认**（`Some(&[])` 才是
+/// 「宿主宣告卡已不在」），绝不把「无证据」当「已撤卡」。
+///
+/// `after.ready` 闸：投影未就绪（订阅未生效/快照未落）时视图可能是陈旧快照，
+/// revision 与集合都不可作证据，保守不确认。
 pub(crate) fn confirm_pending(
     ctx: &ConfirmationContext,
     after: &SessionView,
+    host_pending: Option<&[String]>,
 ) -> ConfirmationOutcome {
     if after.generation != ctx.generation {
         return ConfirmationOutcome::Inconclusive;
@@ -226,15 +235,20 @@ pub(crate) fn confirm_pending(
     let ConfirmationTarget::Pending { request_key } = &ctx.target else {
         return ConfirmationOutcome::Inconclusive;
     };
+    if !after.ready {
+        // 投影未就绪：无新鲜证据，等下一帧。
+        return ConfirmationOutcome::Inconclusive;
+    }
     let Some(revision) = after.revision else {
         // 水位未取得（投影尚无快照）：没有任何新证据，等下一帧。
         return ConfirmationOutcome::Inconclusive;
     };
+    let Some(host_pending) = host_pending else {
+        // 桥给不出宿主集合：没有撤卡证据面，等回执腿（wait_host_cleared）收口。
+        return ConfirmationOutcome::Inconclusive;
+    };
     let revision_advanced = revision > ctx.baseline_revision;
-    let target_cleared = !after
-        .pending
-        .iter()
-        .any(|card| card.interaction_id == *request_key);
+    let target_cleared = !host_pending.iter().any(|id| id == request_key);
     if revision_advanced && target_cleared {
         ConfirmationOutcome::Confirmed
     } else {
@@ -523,7 +537,7 @@ mod tests {
         let ctx = pending_ctx("req-1", 5);
         let after = session_with(6, vec![]);
         assert_eq!(
-            confirm_pending(&ctx, &after),
+            confirm_pending(&ctx, &after, Some(&[])),
             ConfirmationOutcome::Confirmed
         );
     }
@@ -534,7 +548,7 @@ mod tests {
         let ctx = pending_ctx("req-1", 5);
         let after = session_with(5, vec![pending("req-1")]);
         assert_eq!(
-            confirm_pending(&ctx, &after),
+            confirm_pending(&ctx, &after, Some(&["req-1".to_owned()])),
             ConfirmationOutcome::Inconclusive
         );
     }
@@ -546,7 +560,47 @@ mod tests {
         let ctx = pending_ctx("req-1", 5);
         let after = session_with(6, vec![pending("req-1"), pending("req-9")]);
         assert_eq!(
-            confirm_pending(&ctx, &after),
+            confirm_pending(&ctx, &after, Some(&["req-1".to_owned()])),
+            ConfirmationOutcome::Inconclusive
+        );
+    }
+
+    /// 外部评审 C2 回归钉：宿主**未**撤卡时，本地册已空（ACK 消费）+ 任意
+    /// revision 前进帧都**不得**确认——「本地消费 ≠ 宿主撤卡」，撤卡证据只认
+    /// 宿主集合。这是 ACK-only 假确认（尤其 approval_reply）的直接反例。
+    #[test]
+    fn host_card_still_present_blocks_confirmation_even_when_local_view_cleared() {
+        let ctx = pending_ctx("req-1", 5);
+        // 本地投影里卡已被 ACK 消费（列表为空）、revision 已前进——
+        // 但宿主集合仍含 req-1：无撤卡证据。
+        let after = session_with(6, vec![]);
+        assert_eq!(
+            confirm_pending(&ctx, &after, Some(&["req-1".to_owned()])),
+            ConfirmationOutcome::Inconclusive
+        );
+    }
+
+    /// 外部评审 C2 修正配套：投影未就绪（陈旧快照）→ 即便宿主集合为空且
+    /// revision 数值占优，也不得确认（无新鲜证据）。
+    #[test]
+    fn not_ready_projection_is_not_confirmation_evidence() {
+        let ctx = pending_ctx("req-1", 5);
+        let mut after = session_with(6, vec![]);
+        after.ready = false;
+        assert_eq!(
+            confirm_pending(&ctx, &after, Some(&[])),
+            ConfirmationOutcome::Inconclusive
+        );
+    }
+
+    /// 外部评审 C2 修正配套：桥给不出宿主集合（None = 无证据面）→ 不得把
+    /// 「无证据」当「已撤卡」，保持候选等回执腿收口。
+    #[test]
+    fn missing_host_pending_observation_is_not_a_cleared_card() {
+        let ctx = pending_ctx("req-1", 5);
+        let after = session_with(6, vec![]);
+        assert_eq!(
+            confirm_pending(&ctx, &after, None),
             ConfirmationOutcome::Inconclusive
         );
     }
@@ -557,7 +611,7 @@ mod tests {
         let ctx = pending_ctx("req-1", 5);
         let after = session_with(5, vec![]);
         assert_eq!(
-            confirm_pending(&ctx, &after),
+            confirm_pending(&ctx, &after, Some(&[])),
             ConfirmationOutcome::Inconclusive
         );
     }
@@ -569,7 +623,7 @@ mod tests {
         let mut after = session_with(6, vec![]);
         after.revision = None;
         assert_eq!(
-            confirm_pending(&ctx, &after),
+            confirm_pending(&ctx, &after, Some(&[])),
             ConfirmationOutcome::Inconclusive
         );
     }
@@ -581,7 +635,7 @@ mod tests {
         let mut stale = session_with(6, vec![]);
         stale.generation = 6;
         assert_eq!(
-            confirm_pending(&ctx, &stale),
+            confirm_pending(&ctx, &stale, Some(&[])),
             ConfirmationOutcome::Inconclusive
         );
     }
@@ -592,7 +646,7 @@ mod tests {
         let ctx = send_ctx(7, 5);
         let after = session_with(6, vec![]);
         assert_eq!(
-            confirm_pending(&ctx, &after),
+            confirm_pending(&ctx, &after, Some(&[])),
             ConfirmationOutcome::Inconclusive
         );
     }
