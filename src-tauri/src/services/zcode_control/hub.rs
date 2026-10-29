@@ -64,7 +64,6 @@ const RELAY_EVENT_CAPACITY: usize = 64;
 /// 的会话（LRU），不随会话数无界增长。Data 溢出按此表逐会话降级）。
 const TRACKED_SESSION_CAP: usize = 32;
 
-/// 把静态矩阵包装成现算源（测试/固定夹具；生产源来自 capability resolver）。
 /// 会话/代际 → 能力矩阵的现算闭包（**GET 与 SSE 共用同一实现**）。
 ///
 /// 存在理由：事件泵只持有 `Weak<Mutex<Inner>>`，但能力现算必须在锁**外**执行
@@ -72,6 +71,7 @@ const TRACKED_SESSION_CAP: usize = 32;
 /// 能各自算一套；`type` 别名同时满足 clippy 的 type-complexity 门。
 type SessionCapabilitySource = Arc<dyn Fn(&str, u64) -> CapabilityView + Send + Sync>;
 
+/// 把静态矩阵包装成现算源（测试/固定夹具；生产源来自 capability resolver）。
 fn static_policy_source(policy: CapabilityView) -> CapabilitySource {
     Arc::new(move || policy.clone())
 }
@@ -2036,9 +2036,14 @@ impl ZcodeHub {
                             });
                             // R1：能力矩阵按**本帧**现算，且在 Hub 状态锁**外**执行
                             // （resolver 会读 DB，绝不持锁做阻塞读）。锁内只取 `Arc`。
-                            let capabilities = {
+                            //
+                            // 复审 I3：`ready=false` 的帧在 `apply_relay_session` 里恒
+                            // 被清成全关，现算结果一定被丢弃——不为此读库。
+                            let capabilities = if view.ready {
                                 let capabilities_for = lock_inner(&inner).capabilities_for.clone();
                                 capabilities_for(&view.session_id, hub_generation)
+                            } else {
+                                CapabilityView::default()
                             };
                             apply_relay_session(&inner, &out, hub_generation, view, capabilities);
                             if let Some((view, fingerprint, host_pending)) = observed {
@@ -6798,6 +6803,49 @@ mod tests {
         .await
         .expect("恢复帧必须发布");
         assert_eq!(event.data["capabilities"]["singleSelect"]["enabled"], true);
+
+        // 两会话**交替**读写：每帧都按当时 source 现算，既不复用本会话上一帧的
+        // 矩阵，也不借用别的会话的矩阵（复审 M4/M5）。
+        open.store(false, Ordering::SeqCst);
+        pump.push_outcome(
+            Ok(()),
+            vec![live_session_view(FIRST, generation, PendingKind::UserInput)],
+        );
+        events
+            .send(RelayEvent::Data(serde_json::json!({"seq": 4})))
+            .await
+            .unwrap();
+        let event = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            next_session_event(&mut subscriber),
+        )
+        .await
+        .expect("FIRST 帧必须发布");
+        assert_eq!(event.data["sessionId"], FIRST);
+        assert_eq!(
+            event.data["capabilities"]["singleSelect"]["enabled"], false,
+            "source 收回后 FIRST 必须立刻变关（不缓存上一帧）"
+        );
+
+        open.store(true, Ordering::SeqCst);
+        pump.push_outcome(
+            Ok(()),
+            vec![live_session_view(FIRST, generation, PendingKind::UserInput)],
+        );
+        events
+            .send(RelayEvent::Data(serde_json::json!({"seq": 5})))
+            .await
+            .unwrap();
+        let event = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            next_session_event(&mut subscriber),
+        )
+        .await
+        .expect("FIRST 恢复帧必须发布");
+        assert_eq!(
+            event.data["capabilities"]["singleSelect"]["enabled"], true,
+            "同一会话再次开闸也必须按当帧 source"
+        );
     }
 
     /// 带事件泵 + Data 溢出观察口（`RelayLag`）的 Hub，用于验证溢出失效接线。

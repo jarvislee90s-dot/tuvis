@@ -1308,7 +1308,7 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
             sessionId={session.id}
             refreshSignal={queueTick}
           />
-          {!codexProjectionActive && !isSummary && !isZcodeSession && (
+          {!codexProjectionActive && !isSummary && (
             <QuestionCard key={`question-${session.id}`} session={session} />
           )}
         </>

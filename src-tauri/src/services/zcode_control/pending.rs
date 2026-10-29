@@ -72,6 +72,9 @@ pub struct PendingBook {
     control: Option<ControlView>,
     host_pending_revision: u64,
     invalid_pending_skipped: u64,
+    /// 被跳过的**单个选项**数（卡片仍保留）：让「卡在但少了某个选项」可诊断，
+    /// 而不是静默丢项（R0 复审 I5）。
+    invalid_option_skipped: u64,
 }
 
 impl PendingBook {
@@ -87,6 +90,7 @@ impl PendingBook {
             control: None,
             host_pending_revision: 0,
             invalid_pending_skipped: 0,
+            invalid_option_skipped: 0,
         }
     }
 
@@ -180,6 +184,11 @@ impl PendingBook {
         self.invalid_pending_skipped
     }
 
+    /// 形状不符被跳过的**选项**数（卡片仍保留；证据计数，不含值）。
+    pub fn invalid_option_skipped(&self) -> u64 {
+        self.invalid_option_skipped
+    }
+
     /// 应用一帧 snapshot 的 `snapshot` 对象。
     ///
     /// `pendingInteractions` 是官方 schema 的必填数组：缺席/非数组 = 形状不符
@@ -218,6 +227,7 @@ impl PendingBook {
         self.pendings.clear();
         self.host_pending_ids.clear();
         self.host_pending_revision = self.host_pending_revision.saturating_add(1);
+        let mut skipped_options = 0u64;
         for card in cards {
             // 上限按「宿主本帧解析出的卡数」计（含已被本地消费的卡），避免本地消费
             // 让 host 集合绕过内存上限。
@@ -225,7 +235,7 @@ impl PendingBook {
                 self.invalid_pending_skipped = self.invalid_pending_skipped.saturating_add(1);
                 continue;
             }
-            let Some(parsed) = parse_pending(card) else {
+            let Some(parsed) = parse_pending(card, &mut skipped_options) else {
                 self.invalid_pending_skipped = self.invalid_pending_skipped.saturating_add(1);
                 continue;
             };
@@ -236,6 +246,7 @@ impl PendingBook {
             }
             self.pendings.insert(parsed.interaction_id.clone(), parsed);
         }
+        self.invalid_option_skipped = self.invalid_option_skipped.saturating_add(skipped_options);
         // 写后结果未知的在途闸只由宿主自己解除：该帧缺席（撤卡/换卡）= 宿主已
         // 不再等这张卡，释放闸允许重试；仍在本帧 = 保留（绝不自动重发）。
         self.inflight
@@ -461,7 +472,7 @@ fn optional_string(object: &Map<String, Value>, key: &str) -> Option<String> {
 }
 
 /// 解析一张 pending 卡；形状不符返回 `None`（调用方跳过并计数，绝不猜测）。
-fn parse_pending(card: &Value) -> Option<PendingView> {
+fn parse_pending(card: &Value, skipped_options: &mut u64) -> Option<PendingView> {
     let record = card.as_object()?;
     let interaction_id = record
         .get("interactionId")?
@@ -481,14 +492,14 @@ fn parse_pending(card: &Value) -> Option<PendingView> {
         .unwrap_or(false);
     let questions = match payload.get("questions") {
         None => Vec::new(),
-        Some(value) => parse_questions(value, free_text_allowed)?,
+        Some(value) => parse_questions(value, free_text_allowed, skipped_options)?,
     };
     if kind == PendingKind::UserInput && questions.is_empty() {
         return None;
     }
     let options = match payload.get("options") {
         None => Vec::new(),
-        Some(value) => parse_permission_options(value)?,
+        Some(value) => parse_permission_options(value, skipped_options)?,
     };
 
     let auto_resolution = record.get("autoResolution").and_then(Value::as_object);
@@ -527,7 +538,11 @@ fn parse_pending(card: &Value) -> Option<PendingView> {
     })
 }
 
-fn parse_questions(value: &Value, free_text_allowed: bool) -> Option<Vec<QuestionView>> {
+fn parse_questions(
+    value: &Value,
+    free_text_allowed: bool,
+    skipped_options: &mut u64,
+) -> Option<Vec<QuestionView>> {
     let items = value.as_array()?;
     let mut questions = Vec::with_capacity(items.len());
     for item in items {
@@ -539,7 +554,7 @@ fn parse_questions(value: &Value, free_text_allowed: bool) -> Option<Vec<Questio
         let header = record.get("header").and_then(Value::as_str)?;
         let options = match record.get("options") {
             None => Vec::new(),
-            Some(value) => parse_question_options(value)?,
+            Some(value) => parse_question_options(value, skipped_options)?,
         };
         questions.push(QuestionView {
             header: header.to_owned(),
@@ -560,11 +575,12 @@ fn parse_questions(value: &Value, free_text_allowed: bool) -> Option<Vec<Questio
 /// 官方卡里 `options` 元素是 `{value,label,description?,preview?}`；单个元素形状不符
 /// （缺 `value`/`label`）只丢该项——整卡可见性优先，绝不因一个坏选项把整张问答卡
 /// 从手机端抹掉。
-fn parse_question_options(value: &Value) -> Option<Vec<QuestionOption>> {
+fn parse_question_options(value: &Value, skipped_options: &mut u64) -> Option<Vec<QuestionOption>> {
     let items = value.as_array()?;
     let mut options = Vec::with_capacity(items.len());
     for item in items {
         let Some(record) = item.as_object() else {
+            *skipped_options = skipped_options.saturating_add(1);
             continue;
         };
         let Some(value) = record
@@ -572,9 +588,11 @@ fn parse_question_options(value: &Value) -> Option<Vec<QuestionOption>> {
             .and_then(Value::as_str)
             .filter(|text| !text.is_empty())
         else {
+            *skipped_options = skipped_options.saturating_add(1);
             continue;
         };
         let Some(label) = record.get("label").and_then(Value::as_str) else {
+            *skipped_options = skipped_options.saturating_add(1);
             continue;
         };
         options.push(QuestionOption {
@@ -589,18 +607,27 @@ fn parse_question_options(value: &Value) -> Option<Vec<QuestionOption>> {
 
 /// 解析审批选项：**逐项宽容**（坏选项只跳过该项，不牵连整卡）。
 ///
-/// R0 现场归因：旧实现用 `?` 逐字段展开，任何一个选项缺 `label`/`kind` 都会让
-/// `parse_pending` 返回 `None`，整张审批卡被静默丢弃（手机只看到「审批没出现」，
-/// 却没有任何卡面可读）。官方 `options` 本身没有 min 长度（`E$`），因此正确语义是
-/// 「保留能解析的选项 + 保留卡片身份」，不是「整卡作废」。
+/// 依据（安装包 3.16.2.8769 的 zod schema，`E$`）：官方 `options` 没有 min 长度，
+/// 元素为 `{optionId,label,kind,response?}`。旧实现用 `?` 逐字段展开，任何一个选项
+/// 缺 `label`/`kind` 都会让 `parse_pending` 返回 `None`，**整张审批卡被静默丢弃**。
+/// 因此这里改为「保留能解析的选项 + 保留卡片身份」。
+///
+/// **未定位项（如实申报）**：现场「图片三审批消失」是否由这条路径造成，本轮**没有**
+/// 真实帧证据（证据文档 §6：零实连、零帧捕获）；另一条已知差距是 `allowAlways`
+/// 被写闸拒绝（`forbidden_option`）。本改动只消除「一个坏选项吞整卡」这一**代码
+/// 层面可证伪**的丢卡路径，不宣称现场症状已归因。
 ///
 /// `kind` 只读原值（`allowOnce`/`allowAlways`/`deny`/`custom`），不在投影期改写或
 /// 过滤——是否可回传由 `build_permission_answer` 的冻结闸判定。
-fn parse_permission_options(value: &Value) -> Option<Vec<PermissionOptionView>> {
+fn parse_permission_options(
+    value: &Value,
+    skipped_options: &mut u64,
+) -> Option<Vec<PermissionOptionView>> {
     let items = value.as_array()?;
     let mut options = Vec::with_capacity(items.len());
     for item in items {
         let Some(record) = item.as_object() else {
+            *skipped_options = skipped_options.saturating_add(1);
             continue;
         };
         let Some(option_id) = record
@@ -608,12 +635,15 @@ fn parse_permission_options(value: &Value) -> Option<Vec<PermissionOptionView>> 
             .and_then(Value::as_str)
             .filter(|text| !text.is_empty())
         else {
+            *skipped_options = skipped_options.saturating_add(1);
             continue;
         };
         let Some(label) = record.get("label").and_then(Value::as_str) else {
+            *skipped_options = skipped_options.saturating_add(1);
             continue;
         };
         let Some(kind) = record.get("kind").and_then(Value::as_str) else {
+            *skipped_options = skipped_options.saturating_add(1);
             continue;
         };
         options.push(PermissionOptionView {
@@ -894,6 +924,9 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["allowOnce", "deny"]
         );
+        // 丢项必须可诊断（不是静默 continue）：计数 +1，卡仍在。
+        assert_eq!(book.invalid_option_skipped(), 1);
+        assert_eq!(book.invalid_pending_skipped(), 0, "整卡未被跳过");
     }
 
     #[test]

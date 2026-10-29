@@ -120,6 +120,16 @@ impl Projection {
         &mut self.book
     }
 
+    /// 投影降级：置不新鲜并**清空队列快照**。
+    ///
+    /// 降级（缺序/坏帧/超限/协议不符）之后宿主队列已不可信：旧队列项不得挂在
+    /// `ready=false` 的视图上继续展示（R2 接线前就必须成立，否则手机会看到
+    /// 「已失效投影 + 仍在排队」的自相矛盾状态）。
+    fn mark_unready(&mut self) {
+        self.ready = false;
+        self.queue = QueueView::default();
+    }
+
     /// 显式置就绪位（缺序/协议不符时由桥置 false，取新快照后由 apply 恢复）。
     pub fn set_ready(&mut self, ready: bool) {
         self.ready = ready;
@@ -139,7 +149,7 @@ impl Projection {
         // 字节上限（quality I-5）：单帧超预算即拒收，避免投影被单帧撑爆。
         let frame_bytes = serde_json::to_vec(&frame).map(|bytes| bytes.len());
         if frame_bytes.map_or(true, |bytes| bytes > self.byte_limit) {
-            self.ready = false;
+            self.mark_unready();
             return Err(ZcodeError::of(codes::PAYLOAD_TOO_LARGE));
         }
         let object = frame.as_object().ok_or_else(unsupported)?;
@@ -148,26 +158,26 @@ impl Projection {
             return Err(ZcodeError::of(codes::NO_SESSION));
         }
         let Some(bound) = self.subscription_id.as_deref() else {
-            self.ready = false;
+            self.mark_unready();
             return Err(ZcodeError::of(codes::NOT_READY));
         };
         if object.get("subscriptionId").and_then(Value::as_str) != Some(bound) {
             return Err(ZcodeError::of(codes::STALE_GENERATION));
         }
         let Some(payload) = object.get("payload").and_then(Value::as_object) else {
-            self.ready = false;
+            self.mark_unready();
             return Err(unsupported());
         };
         match payload.get("kind").and_then(Value::as_str) {
             Some("snapshot") => {
                 let Some(snapshot) = payload.get("snapshot") else {
-                    self.ready = false;
+                    self.mark_unready();
                     return Err(unsupported());
                 };
                 // logical `toSeq` 是快照水位的必填字段：缺席 = schema 不符，不能
                 // 以「无水位」进入 ready（否则后续所有缺口/去重检查永久失效）。
                 let Some(to_seq) = object.get("toSeq").and_then(Value::as_u64) else {
-                    self.ready = false;
+                    self.mark_unready();
                     return Err(unsupported());
                 };
                 self.apply_snapshot(snapshot)?;
@@ -182,7 +192,7 @@ impl Projection {
                     return Err(ZcodeError::of(codes::NOT_READY));
                 }
                 let Some(deltas) = payload.get("deltas").and_then(Value::as_array) else {
-                    self.ready = false;
+                    self.mark_unready();
                     return Err(unsupported());
                 };
                 // 增量必须携带完整 logical 水位（fromSeq/toSeq）；任一缺席都不得
@@ -191,15 +201,15 @@ impl Projection {
                     object.get("fromSeq").and_then(Value::as_u64),
                     object.get("toSeq").and_then(Value::as_u64),
                 ) else {
-                    self.ready = false;
+                    self.mark_unready();
                     return Err(unsupported());
                 };
                 if from_seq > to_seq {
-                    self.ready = false;
+                    self.mark_unready();
                     return Err(unsupported());
                 }
                 let Some(last) = self.last_to_seq else {
-                    self.ready = false;
+                    self.mark_unready();
                     return Err(ZcodeError::of(codes::NOT_READY));
                 };
                 if to_seq <= last {
@@ -210,7 +220,7 @@ impl Projection {
                     // 官方 logical 区间按 [fromSeq, toSeq] 闭合衔接：新帧必须从当前
                     // 水位起（from == last）。缺口（from > last）或重叠乱序
                     // （from < last 但 to > last）都不得带洞应用，等新快照。
-                    self.ready = false;
+                    self.mark_unready();
                     return Err(ZcodeError::of(codes::NOT_READY));
                 }
                 for delta in deltas {
@@ -224,7 +234,7 @@ impl Projection {
                         continue;
                     };
                     if !patch.is_object() {
-                        self.ready = false;
+                        self.mark_unready();
                         return Err(unsupported());
                     }
                     self.apply_patch(patch)?;
@@ -234,7 +244,7 @@ impl Projection {
                 Ok(())
             }
             _ => {
-                self.ready = false;
+                self.mark_unready();
                 Err(unsupported())
             }
         }
