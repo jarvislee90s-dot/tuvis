@@ -69,9 +69,13 @@ impl CapabilityKey {
 /// 只认 `("macos"|"windows", "3.16.2.8769", 3)`，其余 key 一律 `None`；
 /// `schema_fingerprint` / `probe_epoch` 不参与命中（见模块文档）。命中后按能力：
 /// - `send` / `model` / `thought_level` / `approval_reply` → `Confirmed`；
-/// - `single_select` / `interrupt` → `InterfaceMatched`（ACK only，首次真实
-///   使用确认后才升级）；
-/// - `multi_select` / `free_text` → `Unsupported`（合同 false）。
+/// - `single_select` / `interrupt` / `multi_select` / `free_text` →
+///   `InterfaceMatched`（候选，首次真实使用确认后才升级）。三轮范围裁决
+///   （2026-10-29）：「未实测」≠「明确不支持」——历史合同未验证多选/自由文本
+///   （证据记录保留在 spec §4.1，不改写为实机通过），但本仓解析（pending 卡
+///   multiSelect/freeText 形状）与编码（build_user_answer 多选/自由作答）均已
+///   支持，故按接口形状开放为候选；无卡形状时接口闸仍关闭，首次真实动作的
+///   确认/降级机制照常兜底。
 pub(crate) fn shipped_state(
     key: &CapabilityKey,
     capability: Capability,
@@ -87,8 +91,10 @@ pub(crate) fn shipped_state(
         | Capability::Model
         | Capability::ThoughtLevel
         | Capability::ApprovalReply => CapabilityState::Confirmed,
-        Capability::SingleSelect | Capability::Interrupt => CapabilityState::InterfaceMatched,
-        Capability::MultiSelect | Capability::FreeText => CapabilityState::Unsupported,
+        Capability::SingleSelect
+        | Capability::Interrupt
+        | Capability::MultiSelect
+        | Capability::FreeText => CapabilityState::InterfaceMatched,
     })
 }
 
@@ -167,8 +173,9 @@ mod tests {
         let expected = [
             (Capability::Send, CapabilityState::Confirmed),
             (Capability::SingleSelect, CapabilityState::InterfaceMatched),
-            (Capability::MultiSelect, CapabilityState::Unsupported),
-            (Capability::FreeText, CapabilityState::Unsupported),
+            // 三轮范围裁决：「未实测」按候选开放（接口形状闸仍生效），不再判死。
+            (Capability::MultiSelect, CapabilityState::InterfaceMatched),
+            (Capability::FreeText, CapabilityState::InterfaceMatched),
             (Capability::Interrupt, CapabilityState::InterfaceMatched),
             (Capability::ApprovalReply, CapabilityState::Confirmed),
             (Capability::Model, CapabilityState::Confirmed),

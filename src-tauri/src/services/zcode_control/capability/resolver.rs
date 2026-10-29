@@ -288,17 +288,12 @@ mod tests {
         // shipped InterfaceMatched + 形状在场 → 候选可用（UI 只见可用）。
         assert!(view.single_select.enabled);
         assert_eq!(view.single_select.reason_code, None);
-        // shipped Unsupported：合同 false，接口形状在场也不放行，原因码 unsupported。
-        assert!(!view.multi_select.enabled);
-        assert_eq!(
-            view.multi_select.reason_code.as_deref(),
-            Some(codes::UNSUPPORTED)
-        );
-        assert!(!view.free_text.enabled);
-        assert_eq!(
-            view.free_text.reason_code.as_deref(),
-            Some(codes::UNSUPPORTED)
-        );
+        // 三轮范围裁决：「未实测」≠「明确不支持」——multi/free 与 single 同为
+        // shipped InterfaceMatched，形状在场即候选可用（UI 只见可用，原因码空）。
+        assert!(view.multi_select.enabled);
+        assert_eq!(view.multi_select.reason_code, None);
+        assert!(view.free_text.enabled);
+        assert_eq!(view.free_text.reason_code, None);
         // 形状/方法缺席：即使 shipped 有正面知识也按缺证据关闭（缺形状不可用）。
         for (name, flag) in [
             ("interrupt", &view.interrupt),
@@ -315,7 +310,144 @@ mod tests {
         }
     }
 
-    /// 账本 confirmed 覆盖 shipped：single_select 从候选升级为确认可用，
+    /// 三轮 B 回归矩阵：已知/未知 build × 八项能力——接口形状齐备时八项**全部**
+    /// 候选开放（已知 build 的 shipped 项按其证据等级，未实测项按候选）；任一目标
+    /// 形状缺席时对应项按真实状态关闭（needs_evidence）。「未实测」与「明确不支持」
+    /// 分离：本矩阵不再断言任何 Unsupported（账本 Unsupported 记录才产生它）。
+    #[test]
+    fn eight_capabilities_matrix_across_builds_and_shapes() {
+        let full = ZcodeInterfaceEvidence {
+            method_send: true,
+            method_resolve_interaction: true,
+            method_stop: true,
+            method_selection_get: true,
+            method_selection_switch: true,
+            has_user_input_pending: true,
+            has_multi_select: true,
+            has_free_text: true,
+            has_permission_pending: true,
+            has_active_work: true,
+            has_model_catalog: true,
+            has_thought_levels: true,
+        };
+        let unknown = CapabilityKey::new("macos", "9.9.9.9999", 3, "shape", 1);
+        let known = known_build_key();
+        for (label, key) in [("unknown build", &unknown), ("known build", &known)] {
+            let view = resolve_capabilities(key, &full, &MemoryLedger::default());
+            for name in [
+                "send",
+                "single_select",
+                "multi_select",
+                "free_text",
+                "interrupt",
+                "approval_reply",
+                "model",
+                "thought_level",
+            ] {
+                let flag = match name {
+                    "send" => &view.send,
+                    "single_select" => &view.single_select,
+                    "multi_select" => &view.multi_select,
+                    "free_text" => &view.free_text,
+                    "interrupt" => &view.interrupt,
+                    "approval_reply" => &view.approval_reply,
+                    "model" => &view.model,
+                    _ => &view.thought_level,
+                };
+                assert!(
+                    flag.enabled,
+                    "{label} 全形状齐备时 {name} 必须开放：{:?}",
+                    flag.reason_code
+                );
+                assert_eq!(
+                    flag.reason_code, None,
+                    "{label} 开放项不得携带原因码（UI 只见可用）：{name}"
+                );
+            }
+        }
+
+        // 目标形状逐一缺席：对应能力关闭（needs_evidence），其余不受牵连。
+        let cases: &[(&str, Box<dyn Fn(&mut ZcodeInterfaceEvidence)>)] = &[
+            (
+                "send 缺方法",
+                Box::new(|e: &mut ZcodeInterfaceEvidence| {
+                    e.method_send = false;
+                }),
+            ),
+            (
+                "single 缺卡",
+                Box::new(|e: &mut ZcodeInterfaceEvidence| {
+                    e.has_user_input_pending = false;
+                }),
+            ),
+            (
+                "multi 缺形状",
+                Box::new(|e: &mut ZcodeInterfaceEvidence| {
+                    e.has_multi_select = false;
+                }),
+            ),
+            (
+                "free 缺形状",
+                Box::new(|e: &mut ZcodeInterfaceEvidence| {
+                    e.has_free_text = false;
+                }),
+            ),
+            (
+                "interrupt 缺回合",
+                Box::new(|e: &mut ZcodeInterfaceEvidence| {
+                    e.has_active_work = false;
+                }),
+            ),
+            (
+                "approval 缺审批卡",
+                Box::new(|e: &mut ZcodeInterfaceEvidence| {
+                    e.has_permission_pending = false;
+                }),
+            ),
+            (
+                "model 缺目录",
+                Box::new(|e: &mut ZcodeInterfaceEvidence| {
+                    e.has_model_catalog = false;
+                }),
+            ),
+            (
+                "thought 缺档位",
+                Box::new(|e: &mut ZcodeInterfaceEvidence| {
+                    e.has_thought_levels = false;
+                }),
+            ),
+        ];
+        for (label, mutate) in cases {
+            let mut ev = full;
+            mutate(&mut ev);
+            let view = resolve_capabilities(&unknown, &ev, &MemoryLedger::default());
+            let flag = match *label {
+                "send 缺方法" => &view.send,
+                "single 缺卡" => &view.single_select,
+                "multi 缺形状" => &view.multi_select,
+                "free 缺形状" => &view.free_text,
+                "interrupt 缺回合" => &view.interrupt,
+                "approval 缺审批卡" => &view.approval_reply,
+                "model 缺目录" => &view.model,
+                _ => &view.thought_level,
+            };
+            assert!(!flag.enabled, "{label} 时对应能力必须关闭");
+            assert_eq!(
+                flag.reason_code.as_deref(),
+                Some(codes::NEEDS_EVIDENCE),
+                "{label} 关闭原因码必须是 needs_evidence"
+            );
+            // 兄弟能力不受牵连：multi 缺形状不影响 single/free（同卡异题独立判据）。
+            if *label == "multi 缺形状" {
+                assert!(view.single_select.enabled && view.free_text.enabled);
+            }
+            if *label == "free 缺形状" {
+                assert!(view.single_select.enabled && view.multi_select.enabled);
+            }
+        }
+    }
+
+    /// 账本 confirmed 覆盖 shipped：single_select 从候选升级为确认可用，    /// 账本 confirmed 覆盖 shipped：single_select 从候选升级为确认可用，
     /// multi_select 覆盖 shipped Unsupported（R4 首次真实动作确认的升级路径）。
     #[test]
     fn ledger_confirmed_overrides_shipped() {
