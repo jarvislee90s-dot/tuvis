@@ -977,6 +977,10 @@ pub struct HostEvidence {
     /// 绝不承载正文——字段面见 [`ZcodeInterfaceEvidence`]；`pub(crate)` 因该
     /// 类型是 crate 内类型，读取口统一走 [`Self::interface_evidence`]）。
     pub(crate) interface: ZcodeInterfaceEvidence,
+    /// 本代际 schema 形状指纹（外部评审 P1-3；spec R2 key 分量）：hello 与首个
+    /// 有效 snapshot 的**键名骨架**哈希（定长 16 位十六进制 id 形状，值不可见；
+    /// 未观测完整 = `None`）。同 build 同协议下帧形状变化即换 key。
+    pub schema_fingerprint: Option<String>,
 }
 
 impl HostEvidence {
