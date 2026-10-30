@@ -266,9 +266,6 @@ mod action_path_snapshot_lock_tests {
         panic!("函数体未闭合");
     }
 
-    /// Fix 4 / F5：标已读必须在命令返回前**同步**补扫（未读卡 1s 内不再出现），
-    /// 即发即忘的 request_scan 会让卡片多留一个档位周期。
-    #[test]
     /// R1：mark_session_read 必须 async + spawn_blocking（补扫进阻塞池，
     /// 不冻结主线程 IPC），且不再同步跑 scan_now_blocking。
     #[test]
