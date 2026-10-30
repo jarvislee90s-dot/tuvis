@@ -177,7 +177,16 @@ function ZcodePendingCard({
 
   // 换卡（interaction 被替换）或换代：草稿、翻页位置、展开态、受理锁一并清空。
   // 旁路 revision 推进不在此列——那只是宿主投影在动，用户的输入必须留着。
+  //
+  // 首跑必须跳过：挂载时的本地状态本来就是各 state 的初值（`picked={}`、`step=0`、
+  // 未受理……），没有任何东西需要重置；而 passive effect 是在首帧**提交之后**才 flush 的，
+  // 无条件首跑会把「首帧到 effect flush 之间」用户已经点下的选中态/输入抹掉，表现为
+  // 「第一次点击没反应，再点一次才生效」。所以只记「已应用的身份键」（初始化为当前键），
+  // 键相同直接 return，键真的变了才 reset。
+  const appliedIdentityRef = useRef(identity);
   useEffect(() => {
+    if (appliedIdentityRef.current === identity) return;
+    appliedIdentityRef.current = identity;
     settledRef.current = false;
     inFlightRef.current = false;
     snoozedRef.current = false;
@@ -189,7 +198,7 @@ function ZcodePendingCard({
     setStep(0);
     setConfirming(false);
     setDetailOpen(false);
-  }, [pending.interactionId, generation]);
+  }, [identity]);
 
   /**
    * 一次动作一个在途槽：同帧重入/受理后重入一律丢弃，不产生第二个 actionId。
