@@ -464,7 +464,9 @@ fn discover_workbuddy_processes_with(
     home: &Path,
     process_info: &dyn Fn(u32) -> Option<(f32, Option<PathBuf>)>,
     now_ms: u64,
-    recent: &HashMap<String, WbDbSession>,
+    // **惰性**：只有真要发哨兵时才查 DB（评审 Minor：`find_processes` 在
+    // SHARED_SYSTEM 锁内执行，DB I/O 越少越好；有心跳进程时完全不碰数据库）
+    recent: &dyn Fn() -> HashMap<String, WbDbSession>,
     host_pid: Option<u32>,
 ) -> Vec<AgentProcess> {
     let sessions_dir = home.join(".workbuddy").join("sessions");
@@ -518,6 +520,7 @@ fn discover_workbuddy_processes_with(
     // 用于穿过 L1 门禁（cwd=None 表示「不是某个具体会话的心跳」）
     if found.is_empty() {
         if let Some(host_pid) = host_pid {
+            let recent = recent();
             if !recent.is_empty() {
                 let (cpu_usage, exe) = process_info(host_pid).unwrap_or((0.0, None));
                 log::debug!(
@@ -544,11 +547,12 @@ pub fn discover_workbuddy_processes(system: &sysinfo::System) -> Vec<AgentProces
     };
     let now = now_ms();
     // DB 候选只用于决定「要不要发宿主哨兵」；真正的判活/出卡在 get_workbuddy_sessions
-    let recent: HashMap<String, WbDbSession> =
+    let recent = || {
         recent_db_sessions(&home, now as i64 - SESSION_ACTIVE_WINDOW_MS)
             .into_iter()
             .map(|r| (r.id.clone(), r))
-            .collect();
+            .collect::<HashMap<String, WbDbSession>>()
+    };
     discover_workbuddy_processes_with(
         &home,
         &|pid| {
@@ -2045,7 +2049,7 @@ mod tests {
                 home.path(),
                 &process_table(&[11952]),
                 10_000,
-                &HashMap::new(),
+                &|| HashMap::new(),
                 None,
             );
             assert_eq!(found.len(), 1);
@@ -2070,7 +2074,7 @@ mod tests {
                 home.path(),
                 &process_table(&[8979]),
                 10_000,
-                &HashMap::new(),
+                &|| HashMap::new(),
                 None,
             );
             assert!(found.is_empty());
@@ -2089,7 +2093,7 @@ mod tests {
                 home.path(),
                 &process_table(&[17692]),
                 10_000,
-                &HashMap::new(),
+                &|| HashMap::new(),
                 None,
             );
             assert!(found.is_empty());
@@ -2106,7 +2110,7 @@ mod tests {
                 home.path(),
                 &process_table(&[11952]),
                 100_000,
-                &HashMap::new(),
+                &|| HashMap::new(),
                 None,
             );
             assert_eq!(
@@ -2126,7 +2130,7 @@ mod tests {
                 home.path(),
                 &process_table(&[]),
                 100_000,
-                &HashMap::new(),
+                &|| HashMap::new(),
                 Some(999),
             );
             // 宿主存活（999）但 DB 无近期会话 → 不发哨兵
@@ -2153,7 +2157,7 @@ mod tests {
                 home.path(),
                 &|pid| (pid == 8084).then_some((1.0f32, None)),
                 10_000,
-                &recent,
+                &|| recent.clone(),
                 Some(8084),
             );
             assert_eq!(found.len(), 1, "宿主 + 近期 DB 会话 → 一条哨兵");
@@ -2170,7 +2174,7 @@ mod tests {
                 home.path(),
                 &process_table(&[1]),
                 10_000,
-                &HashMap::new(),
+                &|| HashMap::new(),
                 None,
             );
             assert!(found.is_empty());
@@ -2196,7 +2200,7 @@ mod tests {
                 home.path(),
                 &process_table(&[11952, 8084]),
                 10_000,
-                &recent,
+                &|| recent.clone(),
                 Some(8084),
             );
             assert_eq!(found.len(), 1);
@@ -2213,7 +2217,7 @@ mod tests {
                 home.path(),
                 &process_table(&[]),
                 10_000,
-                &HashMap::new(),
+                &|| HashMap::new(),
                 None,
             );
             assert!(found.is_empty());
@@ -2230,7 +2234,7 @@ mod tests {
                 home.path(),
                 &process_table(&[111, 222]),
                 10_000,
-                &HashMap::new(),
+                &|| HashMap::new(),
                 None,
             );
             assert!(found.is_empty());
@@ -2244,7 +2248,7 @@ mod tests {
                 home.path(),
                 &process_table(&[1]),
                 10_000,
-                &HashMap::new(),
+                &|| HashMap::new(),
                 None,
             );
             assert!(found.is_empty());
@@ -2263,7 +2267,7 @@ mod tests {
                 home.path(),
                 &process_table(&[11952]),
                 10_000,
-                &HashMap::new(),
+                &|| HashMap::new(),
                 None,
             );
             assert_eq!(found.len(), 1);
@@ -2280,7 +2284,7 @@ mod tests {
                 home.path(),
                 &|pid| (pid == 42).then_some((3.5f32, Some(exe.clone()))),
                 10_000,
-                &HashMap::new(),
+                &|| HashMap::new(),
                 None,
             );
             assert_eq!(found.len(), 1);

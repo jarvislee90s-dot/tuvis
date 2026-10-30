@@ -619,6 +619,14 @@ fn get_all_sessions_inner() -> SessionsResponse {
         adapters.iter().map(|a| a.find_processes(system)).collect()
     }; // 释放 System 锁 — 下方文件 I/O 无需持锁
 
+    // 已知取舍（2026-10-30 评审 Minor）：上面这一行在 **SHARED_SYSTEM 锁内**执行
+    // `find_processes`，而 WorkBuddy 的发现逻辑在「没有可用心跳、要发宿主哨兵」时会做一次
+    // `workbuddy.db` 只读查询（`recent_db_sessions`，17 行的库、实测 0.03ms；打开有
+    // 1000ms busy_timeout 上限）。有心跳进程时该查询根本不发生（惰性闭包）。
+    // 未把 DB I/O 移出锁：`AgentAdapter::find_processes(&System)` 的签名不接受外部连接，
+    // 搬家要动 trait 与全部适配器；收益（微秒级）与风险不匹配。若将来该库变大或出现
+    // 写锁长持有，再按「发现阶段只做纯 os 查询」重构。
+
     // Phase 2: 解析会话（文件 I/O）
     let mut all_sessions: Vec<Session> = Vec::new();
     for (adapter, processes) in adapters.iter().zip(all_processes.iter()) {
