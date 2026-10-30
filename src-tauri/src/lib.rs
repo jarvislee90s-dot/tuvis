@@ -207,6 +207,9 @@ pub fn run() {
             commands::autostart::initialize_on_first_launch(app.handle());
             // 用量账本：应用启动采集一次（按需路径，绝不进 3 秒轮询）
             crate::services::usage::collect::spawn_initial_collection();
+            // 用量兜底 ticker：每「采集间隔 + 2 分钟」后台采一次，不依赖任何页面
+            // （debug 构建默认关闭，TUVIS_USAGE_TICKER=1 可开，见 ticker.rs 文档）
+            crate::services::usage::ticker::spawn_runtime();
             // 会话扫描总线：常驻线程 + 共享快照（所有消费方读快照，冷启动首扫立即执行）
             crate::adapter::scan_bus::start(app.handle().clone());
             // 事件唤醒：1s mtime 轮询（hook 事件目录 / 活跃事件文件 / facts / 会话库），

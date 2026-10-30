@@ -1740,9 +1740,9 @@ mod tests {
         );
     }
 
-    /// 自省锁的**扫描面**：`services/usage/**/*.rs` **全部 37 个文件**。
-    /// 与磁盘**逐一对账**见 `usage_source_scan_covers_every_file_on_disk`（防第 38 个文件静默逃逸）。
-    const USAGE_SOURCES: [(&str, &str); 37] = [
+    /// 自省锁的**扫描面**：`services/usage/**/*.rs` **全部 38 个文件**。
+    /// 与磁盘**逐一对账**见 `usage_source_scan_covers_every_file_on_disk`（防第 39 个文件静默逃逸）。
+    const USAGE_SOURCES: [(&str, &str); 38] = [
         ("caps.rs", include_str!("caps.rs")),
         ("collect.rs", include_str!("collect.rs")),
         ("collectors/claude.rs", include_str!("collectors/claude.rs")),
@@ -1773,6 +1773,7 @@ mod tests {
         ("semantics.rs", include_str!("semantics.rs")),
         ("settings.rs", include_str!("settings.rs")),
         ("stream.rs", include_str!("stream.rs")),
+        ("ticker.rs", include_str!("ticker.rs")),
         ("v2/billing.rs", include_str!("v2/billing.rs")),
         ("v2/channel.rs", include_str!("v2/channel.rs")),
         ("v2/cost.rs", include_str!("v2/cost.rs")),
@@ -2067,6 +2068,18 @@ mod tests {
     ///     新增 `v2/time_price.rs`（窗口校验/时区换算/峰谷判定，含测试排除区）；
     ///     其余变化来自 `v2/pricing.rs` 的自定义规则/精选精简、`v2/cost_query.rs` 的
     ///     小时取数与分时费用字段、`v2/model.rs` 的新 wire 类型。
+    ///
+    /// **第 49 轮同步（扫描总线计划 Task 8 用量兜底 ticker）**：13936/312799 →
+    /// **13991/313966**（+55 行 / +1167 字符）。变化**只来自新增文件**
+    /// `services/usage/ticker.rs` 的生产半边（兜底 ticker：步长/开关纯函数 + 常驻线程，
+    /// 含 `catch_unwind` 自愈）；其测试模块落在 BEGIN..END 排除区内 ⇒ 不进面。
+    /// 文件数 37 → 38、分类 32/5 → **33/5**（ticker 以测试模块区形态入面）。
+    ///
+    /// **第 50 轮同步（扫描总线计划 Task 8 质量复修：设置读取纳入 `catch_unwind`）**：
+    /// 13991/313966 → **14001/314132**（+10 行 / +166 字符）。变化**只来自**
+    /// `services/usage/ticker.rs` 生产半边：新增 `protected_interval_min()`（设置读取的
+    /// panic 安全包装），启动日志与每轮步长读取均改走该包装；文件数、分类与排除区
+    /// 标记均未动。
     #[test]
     fn scan_face_size_is_pinned() {
         let (mut lines, mut chars) = (0usize, 0usize);
@@ -2077,7 +2090,7 @@ mod tests {
         }
         assert_eq!(
             (lines, chars),
-            (13936, 312799),
+            (14001, 314132),
             "判据面尺寸变了（实测 {lines} 行 / {chars} 字符）：本用例是**声明 = 实际**的钉子——\
              先弄清面为什么变（新增文件？改了排除区标记？动了生产代码？），再同步本常量、\
              `no_source_timezone_is_fed_into_any_key_function` 的锁注释、`KNOWN-PLAN-DEFECTS.md` \
@@ -2132,8 +2145,8 @@ mod tests {
             .count();
         assert_eq!(
             (USAGE_SOURCES.len() - empty, empty),
-            (32, 5),
-            "排除区分类应为 **32 个测试模块区 / 5 个空区**（空区 = `caps.rs` / `delta.rs` / \
+            (33, 5),
+            "排除区分类应为 **33 个测试模块区 / 5 个空区**（空区 = `caps.rs` / `delta.rs` / \
              `model.rs` / `v2/model.rs` / `v2/mod.rs`）。改动某文件的\
              排除区形态（加测试模块 / 改成空区）时，必须**同步**本断言、`self_lock` 的文档与\
              两处锁的声明"

@@ -19,6 +19,7 @@ pub mod range;
 pub mod semantics;
 pub mod settings;
 pub mod stream;
+pub mod ticker;
 pub mod v2;
 
 pub use error::UsageError;
@@ -128,7 +129,7 @@ pub(crate) mod self_lock {
     ///   宿主裁定**不为此重引入结构推断 / 大括号深度判据**（那会引入「字符串与注释里的括号误判」
     ///   一整类新代价，收益不抵）。
     /// * **已知误报面**：排除区内的**多行字符串字面量**若某行顶格（如 `r#"…"#` 里顶格的 JSON 夹具），
-    ///   会被当成顶格代码行 ⇒ **假红**（响亮、安全方向；当前 37 个文件实测 0 例）。
+    ///   会被当成顶格代码行 ⇒ **假红**（响亮、安全方向；当前 38 个文件实测 0 例）。
     ///   修法是把该行缩进（rustfmt **不会**重排字符串内容）。
     fn assert_exclude_shape(name: &str, region: &[&str]) {
         if region.is_empty() {
