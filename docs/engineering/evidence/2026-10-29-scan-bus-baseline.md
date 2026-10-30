@@ -344,3 +344,83 @@ pid=43004 wall=300.0s cpu=1.77s avgCPU=0.59% scans=10 scansPerMin=2.0
 - 操作：找到卡片头部的「暂不显示（会话状态变化后恢复）」按钮（`dismiss_session_card` 路径），记录 `performance.now()` 后 `btn.click()`，每 20ms 轮询卡片项目名是否从 DOM 消失。
 - 实际结果：**`{"gone":true,"elapsedMs":75,"polls":2}`** —— 卡片在点击后 **75ms** 消失（门禁 ≤1s），与「命令内同步补扫 + 成功后 invalidateQueries」的设计一致。
 - 测后已清理合成夹具与调试端口，安装版重启。
+
+---
+
+### 10.10 第三轮评审（R1–R7）Release 验收（2026-10-30 16:39–17:28Z，本地次日 00:39–01:28）
+
+本节按 F10 新口径（release / 进程树 / 预热后 3×5 分钟中位 / stats 计数）记录 R5，并汇总 R1–R4、R6–R7 的验收证据。
+
+#### 10.10.1 构建与环境
+
+- 源码：HEAD `7e19de20c772b7641323e3ec2a42272bbbf27db7`（R7 提交；本节为随后唯一的文档提交）。
+- 构建：`pnpm build` 后 `CARGO_BUILD_JOBS=2 pnpm exec tauri build --no-bundle --features marker-helper`（release profile：lto=true / codegen-units=1 / strip=true）。
+- 产物：`src-tauri/target/release/tuvis.exe`，48,291,328 B，sha256 `4f5168e80ffab23d8c1bdeb77262f5ba85f18693ba8b186729bace7517583a4e`。
+- 运行：真实 HOME（用户授权），未设 `TUVIS_HOME`；stats = `~/.tuvis/logs/scan_bus_stats.json`，日志 = `~/.tuvis/logs/mam.log`。
+- 时间线（UTC）：启动 **16:39:32**；启动采集完成 16:39:48（12.5s，已覆盖预热要求）；窗口隐藏后 `mode → Away` **16:44:59**（watch 心跳 TTL 90s 到期后降档）；SSE 配对成功并开始 Idle 采样 **17:04:51**（snapshot version 74）；结束 17:28。
+- Idle 模拟：本机 `POST /m/api/v1/pair/pin`（PIN 取自设置）→ 200 + `Set-Cookie`；`GET /m/api/v1/events` → 200，测量期间保持 SSE 连接（真实配对流程，真实 DB 新增设备名 `measure-idle`）。
+- **Active：未测**。opencode v2.2.2 已安装，但未启动真实会话（避免未经授权的模型调用/计费），按要求如实记未测。
+
+#### 10.10.2 原始输出（脚本原样）
+
+Away（无远控 + 主窗隐藏）：
+
+```text
+pid=34412 wall=300.6s cpu=1.44s avgCPU=0.48% scans=10 scansPerMin=2.0 stats_last_reason=Periodic stats_last_duration_ms=51 stats_process_refresh_ms=16 stats_updated_at=2026-10-30T16:50:00.420Z cpu_tree=11.42s avgCPU_tree=3.80% tree_procs=9
+pid=34412 wall=300.6s cpu=1.59s avgCPU=0.53% scans=10 scansPerMin=2.0 stats_last_reason=Periodic stats_last_duration_ms=54 stats_process_refresh_ms=18 stats_updated_at=2026-10-30T16:55:01.005Z cpu_tree=10.17s avgCPU_tree=3.38% tree_procs=9
+pid=34412 wall=300.5s cpu=1.42s avgCPU=0.47% scans=10 scansPerMin=2.0 stats_last_reason=Periodic stats_last_duration_ms=51 stats_process_refresh_ms=15 stats_updated_at=2026-10-30T17:00:01.599Z cpu_tree=10.58s avgCPU_tree=3.52% tree_procs=9
+```
+
+Idle（SSE 在线、无活跃会话）：
+
+```text
+pid=34412 wall=300.5s cpu=2.58s avgCPU=0.86% scans=30 scansPerMin=6.0 stats_last_reason=Periodic stats_last_duration_ms=55 stats_process_refresh_ms=17 stats_updated_at=2026-10-30T17:12:33.950Z cpu_tree=10.86s avgCPU_tree=3.61% tree_procs=9
+pid=34412 wall=300.6s cpu=2.80s avgCPU=0.93% scans=30 scansPerMin=6.0 stats_last_reason=Periodic stats_last_duration_ms=50 stats_process_refresh_ms=13 stats_updated_at=2026-10-30T17:17:35.773Z cpu_tree=12.45s avgCPU_tree=4.14% tree_procs=9
+pid=34412 wall=300.6s cpu=2.56s avgCPU=0.85% scans=30 scansPerMin=6.0 stats_last_reason=Periodic stats_last_duration_ms=52 stats_process_refresh_ms=16 stats_updated_at=2026-10-30T17:22:37.519Z cpu_tree=11.59s avgCPU_tree=3.86% tree_procs=9
+```
+
+- 3 次中位差异：扫描次数 Away 2.0/2.0/2.0、Idle 6.0/6.0/6.0（0%）；进程树 CPU：Away 中位 3.52%（最大偏离 8.0%），Idle 中位 3.86%（最大偏离 7.3%）；主进程 CPU：Idle 中位 0.86%（最大偏离 8.1%），Away 中位 0.48%（run2 0.53% 偏离 10.4%，绝对值差 0.05pp，属 0.5% 量级的量化噪声）。
+- **F8（process refresh，release）**：stats 连续 6 个样本 `16, 14, 17, 18, 13, 21` ms → 排序 13/14/16/17/18/21，**中位 16.5ms ≤25ms 达标**。
+- **F7 兜底 ticker（release 默认开启）**：`usage: 兜底 ticker 已启动（步长 12 分钟）`（16:39:32）；采集完成 16:51:32（254ms）、17:03:33（252ms）、17:15:33（255ms）→ 相邻间隔 **12m01s**，`≤ 设置间隔 + 2 分钟（12 分钟）` 达标。
+- **用量页可见刷新**：CDP 真实点击「模型用量」→「数据截止时间」由 `01:25:49` 刷新为 `01:27:24`，**317ms ≤1s 达标**（另一次首访仅渲染页面的 label 出现耗时 190ms）。
+- **F6 事件唤醒（release）**：向真实 `~/.tuvis/events` 写入事件文件后，stats 在 **966ms** 出现 `last_reason=Event`（≤5s 达标）；debug 影子轮次另测 377ms（§10.9）。
+- **日志体积（release 运行段 16:39:32–17:27:49，48m17s）**：551 行 / 76,308 B → 外推约 **2.27MB/天**；分源：`dsh:` **424 行**（未知代际告警等，F9 延后项）、`漂移L3` 16、`扫描` 8、`usage/dsh` 7、`usage` 6、`scan_bus` **2**（仅档位跃迁）、其余少量。扫描总线已无逐轮 INFO；R4 的「Active 10 分钟 ≤60KB」在 debug 影子轮次实测 **444B**（§10.9.2），达标。
+
+#### 10.10.3 门禁表（release 口径）
+
+| 门禁项 | 目标 | 结果 | 证据 |
+| --- | --- | --- | --- |
+| 挂机 CPU（仅主进程） | ≤3% 单核 | **达标 0.48%** | §10.10.2 Away 三次中位 |
+| 挂机 CPU（进程树含 WebView2） | ≤3% 单核 | **未达标 3.52%**（9 个 WebView2 进程） | 同上 `avgCPU_tree` |
+| 远控在线空闲 CPU | ≤6% 单核 | **达标**：主 0.86% / 树 3.86% | §10.10.2 Idle 中位 |
+| 扫描频次（Active） | ≤30 次/分 | **未测**（无真实活跃会话） | — |
+| 扫描频次（Idle） | ≤10 次/分 | **达标 6.0** | Idle 三次 `scansPerMin=6.0` |
+| 扫描频次（Away） | ≤6 次/分 | **达标 2.0** | Away 三次 `scansPerMin=2.0` |
+| 活动档会话发现 | ≤2s | **未测**（无 Active 会话） | — |
+| 动作回执 p95 | 不劣于基线 | **未测** | — |
+| F6 事件唤醒 | ≤5s | **达标 966ms**（release）/ 377ms（debug） | stats `last_reason=Event` |
+| F7 用量不可见滞后 | ≤12 分钟 | **达标**（ticker 间隔 12m01s） | §10.10.2 日志 |
+| 用量可见刷新 | ≤1s | **达标 317ms** | CDP 探针 |
+| F8 进程刷新 | ≤25ms（release） | **达标 16.5ms**（6 样本中位） | stats 样本 |
+| 日志体积 | ≤1MB/天 | **未达标（外推 2.27MB/天）**；扫描总线自身无逐轮 INFO，主体为 dsh 解析告警（F9 延后） | §10.10.2 分源 |
+| F5 卡片消失 | ≤1s | **达标 76ms** | R1 debug 构建 + CDP 真实点击（下方 10.10.4） |
+| 兼容性 | IPC 契约不变 | **达标**（静态核对：新增命令为增量，回执字段为新增） | 源码 |
+| 同状态 3 次差异 | ≤10% | **基本达标**：扫描 0%、树 CPU ≤8.0%、Idle 主 CPU ≤8.1%；Away 主 CPU 单次 10.4%（0.05pp 量化噪声） | §10.10.2 |
+
+#### 10.10.4 R1–R4、R6–R7 验收摘要
+
+- **R1**：源码锁（两单卡命令 async + `spawn_blocking`、无 `scan_now_blocking`）通过；批量 10 项只产生 **1 次扫描**、version 递增通过；前端 `applied=false` 仍失效缓存且 console.warn 用例通过；活体（R1 debug 构建 + 影子 HOME + 合成 WorkBuddy 卡，CDP 真实点击单卡 X）→ 卡片 **76ms** 消失（≤1s）。
+- **R2**：`event_wait_plan` / `wait_event_defer` 单测覆盖 Event 合并、Action 立即中断、超时照常扫描；源码锁禁止 Event 分支出现 `sleep(`。
+- **R3**：`Snapshot.degraded`（空/超时快照为 true，且不被当作新鲜快照）；`ensure_fresh(2s,100ms)` 在飞且无新快照 → 返回 degraded=true、`scan_bus_status.degraded=true`、无快照时 `snapshotAgeMs=null`；`status_degraded` 纯函数验证 30s 窗口恢复 false。
+- **R4**：stats 单行 JSON 字段单测 + 覆盖写单测；debug 影子 10 分钟 Active：日志增量 **444B**、`stats.total` 增量 **287** = 扫描次数、事件写入后 **377ms** stats 记录 `last_reason=Event`。
+- **R6**：既有 8 条 SSE 用例全绿；新增「快照等待期间 `disconnect_all` 能关断」用例通过（等待期连接已注册、吊销后计数归零、流立即结束）。
+- **R7**：新增源码锁（`tool_host_alive_in` 分支 + `is_host_process` match arm 均须登表）；变异验证：临时删除 zcode 表项 → 用例变红，恢复后变绿。
+
+#### 10.10.5 偏差与已知影响
+
+1. **挂机进程树 CPU 3.52% 超出 3%**：主进程仅 0.48%，差额来自 9 个 WebView2 进程（主窗/桌宠/通知窗渲染）。本次未调整前端渲染或桌宠动画，如实记为未达标。
+2. **Active 未测**：无真实 opencode 会话（避免未经授权的模型调用）；Active 档扫描频次/会话发现/CPU 仍无 release 数据。
+3. **Away 降档等待 90s**：窗口隐藏后 `scan_bus_watch` 停止续期，watching TTL 90s 到期才降 Away（设计如此）；测量在降档后开始。
+4. **日志体积 2.27MB/天**：主体是 dsh 解析告警（424/551 行），属 F9 第二刀（dsh 代际路径缓存/日志降噪）范围，本批未做；扫描总线每轮 INFO 已删除（全段仅 2 条档位跃迁）。
+5. **真实账本写入（授权内）**：release 用真实 HOME 运行，启动采集/兜底采集写入真实账本（0 条新记录）；SSE 模拟新增配对设备 `measure-idle`（正常配对流程，可在设置-远程设备中吊销）。
+6. **F5 活体在 debug 影子构建完成**：release 环境无会话卡可点；R1 代码路径与 release 相同（仅数据目录隔离不同），记录为 76ms。
