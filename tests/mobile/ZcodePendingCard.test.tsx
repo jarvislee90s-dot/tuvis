@@ -139,6 +139,38 @@ function threeQuestions(): PendingView {
 
 type CardProps = ComponentProps<typeof ZcodePendingCard>;
 
+/**
+ * 浏览器存储写入探针（可证伪）。
+ *
+ * 为什么必须拦 `Storage.prototype` 而不是 storage 实例：jsdom 的 `localStorage` /
+ * `sessionStorage` 是 Proxy 包装，实例级 `vi.spyOn(window.localStorage, "setItem")`
+ * **装不上**——`Object.getOwnPropertyDescriptor(window.localStorage, "setItem")` 为
+ * `undefined`、装上后 `window.localStorage.setItem !== spy`，于是**任何真实写入都
+ * 不进计数**，「零写入」断言会永远是假绿。原型方法是两种存储共用的唯一入口，
+ * 拦它才拦得住真实写入（写操作仍照常落库，探针只旁观）。
+ *
+ * 按 `this` 分桶：localStorage 与 sessionStorage 各自计数，便于断言「两种都为零」。
+ */
+function installStorageProbe(): {
+  writes: Array<{ store: "local" | "session"; key: string; value: string }>;
+} {
+  const writes: Array<{ store: "local" | "session"; key: string; value: string }> = [];
+  const original = Storage.prototype.setItem;
+  vi.spyOn(Storage.prototype, "setItem").mockImplementation(function (
+    this: Storage,
+    key: string,
+    value: string
+  ) {
+    writes.push({
+      store: this === window.sessionStorage ? "session" : "local",
+      key,
+      value,
+    });
+    original.call(this, key, value);
+  });
+  return { writes };
+}
+
 function baseProps(overrides: Partial<CardProps> = {}): CardProps {
   return {
     pending: pendingView(),
@@ -342,15 +374,21 @@ describe("ZCode 待处理卡：空题边界", () => {
       <ZcodePendingCard {...baseProps({ pending: pendingView({ questions: [] }), submit: fn })} />
     );
 
-    const submit = screen.getByTestId("zcode-pending-submit") as HTMLButtonElement;
-    fireEvent.click(submit);
-    // 若还能进入确认页，也绝不允许提交空答案
-    const next = screen.queryByTestId("zcode-pending-next");
-    if (next !== null) {
-      fireEvent.click(next);
-      expect(screen.getByTestId("zcode-pending-confirm")).toBeVisible();
-      fireEvent.click(submit);
-    }
+    // 无条件断言（不写 `if (next !== null)` 之类的条件分支：那种写法在「下一题」
+    // 按钮不再渲染时会整段跳过，护栏静默消失且用例照样 PASS）。
+    // 0 题卡仍渲染导航与提交；提交按钮初始禁用（未进确认页）。
+    const next = screen.getByTestId("zcode-pending-next") as HTMLButtonElement;
+    expect(next).toBeEnabled();
+    expect(screen.getByTestId("zcode-pending-submit")).toBeDisabled();
+    // 题目页点提交：禁用 → 零 POST
+    fireEvent.click(screen.getByTestId("zcode-pending-submit"));
+    expect(calls).toHaveLength(0);
+    // 进确认页后提交按钮变可用——此时点它也必须零 POST（真正走到提交路径又被空题闸拦住）
+    fireEvent.click(next);
+    expect(screen.getByTestId("zcode-pending-confirm")).toBeVisible();
+    const confirmSubmit = screen.getByTestId("zcode-pending-submit") as HTMLButtonElement;
+    expect(confirmSubmit).toBeEnabled();
+    fireEvent.click(confirmSubmit);
     expect(calls).toHaveLength(0);
   });
 });
@@ -483,10 +521,9 @@ describe("ZCode 待处理卡：既有合同不回退", () => {
   });
 
   it("sensitive_answers_never_reach_browser_storage", async () => {
-    // 两种浏览器存储都单独监听：计数必须为 0（不是「没写就没写」的空转断言），
-    // 且本次提交载荷里带的确实是内存值，证明「失焦清可见态」不等于「丢弃答案」。
-    const localSet = vi.spyOn(window.localStorage, "setItem");
-    const sessionSet = vi.spyOn(window.sessionStorage, "setItem");
+    // 探针装在 `Storage.prototype` 上（jsdom 的 Storage 实例是 Proxy，实例级 spy
+    // 装不上、真实写入不会计数 → 断言会永远是假绿）。详见 installStorageProbe 注释。
+    const probe = installStorageProbe();
     const { fn, calls } = makeSubmit();
     const pending = pendingView({
       sensitive: true,
@@ -509,6 +546,7 @@ describe("ZCode 待处理卡：既有合同不回退", () => {
 
     fireEvent.click(screen.getByTestId("zcode-pending-submit"));
     await waitFor(() => expect(calls).toHaveLength(1));
+    // 载荷侧：提交带走的是**内存值**（「失焦清可见态」≠「丢弃答案」）。
     expect(calls[0]).toEqual({
       kind: "answer",
       sessionId: SID,
@@ -519,9 +557,22 @@ describe("ZCode 待处理卡：既有合同不回退", () => {
       ],
     });
 
-    // 全流程（含提交）零浏览器存储写入
-    expect(localSet).toHaveBeenCalledTimes(0);
-    expect(sessionSet).toHaveBeenCalledTimes(0);
+    // 存储侧：全流程（含提交）零浏览器存储写入 —— 两种存储分桶各为零。
+    expect(probe.writes.filter((write) => write.store === "local")).toEqual([]);
+    expect(probe.writes.filter((write) => write.store === "session")).toEqual([]);
+
+    // 自检（必须留在用例里）：同一个探针必须真的能观测到写入，否则上面两条
+    // 「零写入」就是假绿。此处**故意**各写一次并断言被观测到；写完立即清理。
+    window.localStorage.setItem("zcode-storage-probe", "probe-local");
+    window.sessionStorage.setItem("zcode-storage-probe", "probe-session");
+    expect(probe.writes).toEqual([
+      { store: "local", key: "zcode-storage-probe", value: "probe-local" },
+      { store: "session", key: "zcode-storage-probe", value: "probe-session" },
+    ]);
+    window.localStorage.removeItem("zcode-storage-probe");
+    window.sessionStorage.removeItem("zcode-storage-probe");
+    expect(window.localStorage.getItem("zcode-storage-probe")).toBeNull();
+    expect(window.sessionStorage.getItem("zcode-storage-probe")).toBeNull();
   });
 });
 

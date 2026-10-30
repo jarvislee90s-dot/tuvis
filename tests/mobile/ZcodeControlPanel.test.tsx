@@ -813,7 +813,12 @@ describe("ZCode 控制面板：写面门禁（paired + ready）", () => {
     ).toBeVisible();
     expect(screen.getByText("执行合成命令")).toBeVisible();
 
-    // 非当前组：容器 hidden + inert（不可见也不可聚焦/点击），但仍在册。
+    // 非当前组：容器 hidden + inert，但仍在册。
+    // 口径（务必如实）：jsdom **未实现 inert 的交互语义**（其 focusing.js 里 inert
+    // 只有 TODO：不排除焦点、不阻断点击），所以下面的 inert 断言只是**属性级**——
+    // 它能证伪「属性被漏掉」，但**不能**证明真实浏览器里的 Tab/读屏阻断。
+    // 自动回环里真正可证伪的隔离护栏是 hidden（见 not.toBeVisible()）+ 组内控件
+    // 显式禁用断言；浏览器侧语义列入实机待验。
     const permissionSlot = slotOf("int_00000000000000000000000000000001");
     const questionSlot = slotOf("int_00000000000000000000000000000002");
     expect(permissionSlot.hasAttribute("hidden")).toBe(false);
@@ -1882,18 +1887,26 @@ describe("ZCode 控制面板：多组待处理并存", () => {
     expect(() => screen.getByTestId("zcode-pending-submit")).toThrow(/multiple/i);
     // 按 slot 分别取控件：不抛，且取到的是**本组**那一个
     expect(cardIn(PENDING_ID).getByTestId("zcode-pending-submit")).toBeVisible();
-    expect(
-      cardIn(SECOND_QUESTION_ID).getByTestId("zcode-pending-submit", { hidden: true })
-    ).toBeDefined();
+    // 隐藏组同样能按 slot 取到（testid 查询**不**过滤可见性——这正是必须 within(slot)
+    // 的原因）。注意：`getByTestId` 没有 `hidden` 选项（那是 role 查询才有的），旧写法
+    // `getByTestId(..., { hidden: true })` + `toBeDefined()` 只证明「不抛异常」，近乎恒真。
+    // 这里改成**可证伪**的真实断言：隐藏组控件必须不可见 + 被禁用 + 点击零动作。
+    const hiddenSubmit = cardIn(SECOND_QUESTION_ID).getByTestId(
+      "zcode-pending-submit"
+    ) as HTMLButtonElement;
+    expect(hiddenSubmit).not.toBeVisible();
+    expect(hiddenSubmit).toBeDisabled();
+    fireEvent.click(hiddenSubmit);
+    expect(postedActions()).toHaveLength(0);
 
-    // tab ↔ tabpanel 关系成对；非当前组 hidden + inert
+    // tab ↔ tabpanel 关系成对（用实际 DOM id 互指，不断言 id 的字面格式）
     const tabA = screen.getByTestId(`zcode-pending-tab-${PENDING_ID}`);
     const tabB = screen.getByTestId(`zcode-pending-tab-${SECOND_QUESTION_ID}`);
     expect(tabA.id).not.toBe("");
-    expect(tabA.getAttribute("aria-controls")).toBe(`zcode-pending-panel-${PENDING_ID}`);
+    expect(tabA.getAttribute("aria-controls")).toBe(slotA.id);
     expect(slotA.getAttribute("role")).toBe("tabpanel");
     expect(slotA.getAttribute("aria-labelledby")).toBe(tabA.id);
-    expect(tabB.getAttribute("aria-controls")).toBe(`zcode-pending-panel-${SECOND_QUESTION_ID}`);
+    expect(tabB.getAttribute("aria-controls")).toBe(slotB.id);
     expect(slotB.getAttribute("role")).toBe("tabpanel");
     expect(slotB.getAttribute("aria-labelledby")).toBe(tabB.id);
     expect(slotB.hasAttribute("hidden")).toBe(true);
@@ -1911,6 +1924,61 @@ describe("ZCode 控制面板：多组待处理并存", () => {
     expect((cardIn(SECOND_QUESTION_ID).getByRole("textbox") as HTMLInputElement).value).toBe(
       "B 组草稿"
     );
+  });
+
+  it("host_interaction_ids_with_special_chars_are_encoded_for_dom_ids", async () => {
+    // 宿主 interactionId 是**外部输入**：含空格 / # / . 时，直接内插进 DOM id 会让
+    // IDREF（aria-controls / aria-labelledby）按空格断词失效，读屏器的 tab↔tabpanel
+    // 关系随之断开。这里要求：DOM id 只含安全字符、IDREF 双向可解析、slug 相同的
+    // 两个宿主 id 不产生同一个 DOM id，而数据面仍保留宿主原值。
+    const RAW_A = "int bad/#1";
+    // 与 RAW_A 非法字符替换后得到同一 slug（"int-bad--1"）→ 必须靠短哈希区分，不能相撞。
+    const RAW_B = "int bad-#1";
+    installFetch((url) => {
+      if (url.includes("/official-control")) return json({ configState: "missing", url: null });
+      if (url === ZCODE_CONNECTION_PATH) return json(connection());
+      if (url.startsWith(`${ZCODE_SESSION_PATH}?`)) {
+        return json(
+          sessionView({
+            pending: [
+              pendingView({ interactionId: RAW_A, questions: [questionView()] }),
+              pendingView({ interactionId: RAW_B, questions: [questionView()] }),
+            ],
+          })
+        );
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+
+    render(<ZcodeControlPanel sessionId={SID} />);
+    const slotA = await screen.findByTestId(`zcode-pending-slot-${RAW_A}`);
+    const slotB = screen.getByTestId(`zcode-pending-slot-${RAW_B}`);
+    const tabA = screen.getByTestId(`zcode-pending-tab-${RAW_A}`);
+    const tabB = screen.getByTestId(`zcode-pending-tab-${RAW_B}`);
+
+    // DOM id 只含安全字符，且在文档里唯一可寻址
+    for (const id of [slotA.id, slotB.id, tabA.id, tabB.id]) {
+      expect(id).not.toBe("");
+      expect(id).toMatch(/^[A-Za-z0-9_-]+$/);
+      expect(document.getElementById(id)).not.toBeNull();
+    }
+    // IDREF 双向可解析（读屏器据此建立 tab ↔ tabpanel 关系）
+    expect(document.getElementById(tabA.getAttribute("aria-controls") ?? "")).toBe(slotA);
+    expect(document.getElementById(slotA.getAttribute("aria-labelledby") ?? "")).toBe(tabA);
+    expect(document.getElementById(tabB.getAttribute("aria-controls") ?? "")).toBe(slotB);
+    expect(document.getElementById(slotB.getAttribute("aria-labelledby") ?? "")).toBe(tabB);
+
+    // slug 相同的两个宿主 id 不得产生相同 DOM id（哈希后缀生效）
+    expect(slotA.id).not.toBe(slotB.id);
+    expect(tabA.id).not.toBe(tabB.id);
+
+    // 数据面仍保留宿主原值（编码只用于 DOM id）
+    expect(
+      cardIn(RAW_A).getByTestId("zcode-pending-card").getAttribute("data-interaction-id")
+    ).toBe(RAW_A);
+    expect(
+      cardIn(RAW_B).getByTestId("zcode-pending-card").getAttribute("data-interaction-id")
+    ).toBe(RAW_B);
   });
 
   it("single_pending_renders_without_tab_strip", async () => {

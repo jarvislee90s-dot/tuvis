@@ -104,6 +104,34 @@ export interface PendingCardProps {
   submit: (action: ControlAction) => Promise<ActionReceipt>;
 }
 
+/**
+ * 把宿主 `interactionId` 编码成可安全用作 DOM `id` / `aria-controls` /
+ * `aria-labelledby` 的 IDREF 片段。
+ *
+ * 为什么需要：宿主 `interactionId` 是**外部输入**。直接内插时若含空格、`#`、`.` 等
+ * 字符，IDREF 会按空格断词（`aria-controls="a b"` 指向两个不存在的 id），CSS 选择器
+ * 也会误解析，读屏器的 tab↔tabpanel 关系随之失效。
+ *
+ * 规则：保留 `[A-Za-z0-9_-]`，其余字符逐字替换为 `-`，再附一段 32 位 FNV-1a 短哈希
+ * （base36）——替换会丢信息（`"a b"` 与 `"a-b"` 得到同一 slug），哈希保证两个不同的
+ * 宿主 id 仍得到不同的 DOM id。
+ *
+ * 只用于 DOM `id` 系属性；`data-interaction-id` 等**数据面**仍保留宿主原值。
+ */
+export function pendingDomId(prefix: string, interactionId: string): string {
+  return `${prefix}-${interactionId.replace(/[^A-Za-z0-9_-]/g, "-")}-${domIdHash(interactionId)}`;
+}
+
+/** 32 位 FNV-1a → 定长 base36（7 字符）；纯函数、无依赖，仅用于防撞后缀。 */
+function domIdHash(value: string): string {
+  let hash = 0x811c9dc5;
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 0x01000193) >>> 0;
+  }
+  return hash.toString(36).padStart(7, "0").slice(-7);
+}
+
 /** 单张 pending 卡：只读呈现 + 宿主原值回传；关闭的能力面禁用并说明原因。 */
 function ZcodePendingCard({
   pending,
@@ -311,8 +339,8 @@ function ZcodePendingCard({
 
   const answerDisabled = blocked !== null || submitting || settledState !== null;
   const submitDisabled = answerDisabled || snoozeInFlight || !confirming || missing.length > 0;
-  /** 命令详情锚点：同一页可能有多张卡，id 必须带 interaction 身份。 */
-  const detailId = `zcode-pending-detail-${pending.interactionId}`;
+  /** 命令详情锚点：同一页可能有多张卡，id 必须带 interaction 身份（且经 DOM 安全编码）。 */
+  const detailId = pendingDomId("zcode-pending-detail", pending.interactionId);
 
   const footer = (
     <>
