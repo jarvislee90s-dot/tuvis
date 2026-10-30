@@ -2318,7 +2318,9 @@ describe("ZCode 控制面板：多组待处理并存", () => {
 
     render(<ZcodeControlPanel sessionId={SID} />);
     const slotA = await screen.findByTestId(`zcode-pending-slot-${PENDING_ID}`);
-    const slotB = screen.getByTestId(`zcode-pending-slot-${SECOND_QUESTION_ID}`);
+    // 第二张卡可能与第一张不在同一次提交里落地：这里必须异步等，同步 getBy 会在
+    // 「第一张已在、第二张还差一个微任务」的时序下抛 Unable to find。
+    const slotB = await screen.findByTestId(`zcode-pending-slot-${SECOND_QUESTION_ID}`);
 
     // 卡根带 interaction 身份（按卡归属可核对）
     expect(
@@ -2400,7 +2402,8 @@ describe("ZCode 控制面板：多组待处理并存", () => {
 
     render(<ZcodeControlPanel sessionId={SID} />);
     const slotA = await screen.findByTestId(`zcode-pending-slot-${RAW_A}`);
-    const slotB = screen.getByTestId(`zcode-pending-slot-${RAW_B}`);
+    // 与上面同类：先等第一张卡、再取第二张，必须异步（第二张可能晚一次提交）。
+    const slotB = await screen.findByTestId(`zcode-pending-slot-${RAW_B}`);
     const tabA = screen.getByTestId(`zcode-pending-tab-${RAW_A}`);
     const tabB = screen.getByTestId(`zcode-pending-tab-${RAW_B}`);
 
