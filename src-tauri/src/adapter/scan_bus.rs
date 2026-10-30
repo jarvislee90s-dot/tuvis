@@ -111,6 +111,12 @@ pub fn ensure_fresh(max_age: Duration, wait: Duration) -> Arc<Snapshot> {
     snapshot().unwrap_or_else(scan_once)
 }
 
+/// 同步执行一次扫描并发布快照（F5：命令层的展示变更必须立即反映，不等档位周期）。
+/// 与周期扫描共用同一把单飞：并发时等待现有扫描完成，不会产生第二份快照。
+pub fn scan_now_blocking() -> Arc<Snapshot> {
+    scan_once()
+}
+
 /// 事件唤醒（节流策略在扫描线程内统一处理）
 pub fn request_scan(reason: ScanReason) {
     if let Some(tx) = TX.get() {

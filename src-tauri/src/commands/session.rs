@@ -71,6 +71,48 @@ fn normalize_watch_source(source: Option<String>) -> String {
 }
 
 #[cfg(test)]
+mod f5_immediate_scan_tests {
+    use super::*;
+
+    /// 取函数体源码（按花括号配对；签名必须唯一命中实现处）
+    fn function_body<'a>(src: &'a str, signature: &str) -> &'a str {
+        let start = src.find(signature).expect("函数签名缺失");
+        let open = src[start..].find('{').expect("函数体缺失") + start;
+        let mut depth = 0usize;
+        for (i, c) in src[open..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &src[open..=open + i];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("函数体未闭合");
+    }
+
+    /// Fix 4 / F5：隐藏卡片必须在命令返回前**同步**补扫——即发即忘的 request_scan
+    /// 让前端可能先读到上一版快照，卡片最多残留一个档位周期（Away 30s）。
+    #[test]
+    fn dismiss_session_card_scans_synchronously_before_returning() {
+        // 签名用 concat! 拆分：include_str! 含本测试自身，整串字面量会先命中测试代码
+        let signature = concat!("fn dismiss_session", "_card(");
+        let body = function_body(include_str!("session.rs"), signature);
+        assert!(
+            body.contains("scan_now_blocking"),
+            "dismiss_session_card 必须在返回前同步补扫（F5 ≤1s 收口），实际: {body}"
+        );
+        assert!(
+            !body.contains("request_scan"),
+            "同步补扫已覆盖即时性，dismiss 不应再留即发即忘的 request_scan"
+        );
+    }
+}
+
+#[cfg(test)]
 mod scan_bus_status_tests {
     use super::*;
 
@@ -423,11 +465,10 @@ pub fn dismiss_session_card(agent_type: String, session_id: String, status: Stri
         session_id,
         status.to_lowercase(),
     ));
-    // F5 即时重算：隐藏集合是扫描内的过滤条件（filter_dismissed_cards），补扫一次
-    // 让快照立即不再含该卡；否则已隐藏的卡要等下一个档位周期才消失。
-    // 已知残留窗口：本次补扫是「即发即忘」——前端可能在新快照发布前读到上一版快照，
-    // 卡片多显示一帧；该 F5 残留窗口留待后续以「版本门控失效」收口
-    crate::adapter::scan_bus::request_scan(crate::adapter::scan_bus::ScanReason::Action);
+    // F5 即时重算：隐藏集合是扫描内的过滤条件（filter_dismissed_cards），
+    // **同步**补扫后本命令才返回——前端随后的 invalidateQueries(["sessions"])
+    // 一定能读到不含该卡的新快照（即发即忘会让卡片残留一个档位周期，Away 最坏 30s）
+    crate::adapter::scan_bus::scan_now_blocking();
 }
 
 /// R5 一键 resume（桌面卡「在电脑上打开」）：按 session_id 在当前快照里找会话，

@@ -1,4 +1,5 @@
 import { useTranslation } from "react-i18next";
+import { useQueryClient } from "@tanstack/react-query";
 import { Cpu, Clock, Bot, ChevronRight, X, ArrowLeftRight, ExternalLink } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { cn } from "@/lib/utils";
@@ -53,6 +54,7 @@ export function SessionCard({
   pairingAmbiguous?: boolean;
 }) {
   const { t } = useTranslation();
+  const queryClient = useQueryClient();
   const badge = AGENT_BADGE[session.agentType];
   const Icon = badge.Icon;
   // 跳转共享逻辑（歧义候选窗口由 hook 状态承载，命中多个窗口时弹出选择器）
@@ -79,7 +81,10 @@ export function SessionCard({
       }
     } catch (err) {
       console.error("session card close failed:", err);
+      return;
     }
+    // F5：命令已同步补扫，失效后立刻读到不含该卡的新快照（失败不失效，不伪装成功）
+    void queryClient.invalidateQueries({ queryKey: ["sessions"] });
   };
 
   const handleClick = async () => {

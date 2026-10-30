@@ -51,10 +51,9 @@ pub fn mark_session_read(app: tauri::AppHandle, agent_type: String, session_id: 
         "session-read",
         serde_json::json!({ "agentType": agent_type, "sessionId": session_id }),
     );
-    // F5 即时重算：已读落库后请求一次动作补扫（Action 不吃事件合并节流），
-    // 前端已有的 invalidateQueries(["sessions"]) 下一帧即读到不含该未读卡的快照，
-    // 不必等下一个档位周期（最坏 30s）
-    crate::adapter::scan_bus::request_scan(crate::adapter::scan_bus::ScanReason::Action);
+    // F5 即时重算：**同步**补扫后本命令才返回——前端随后的 invalidateQueries(["sessions"])
+    // 一定能读到不含该未读卡的新快照（即发即忘会让卡片残留一个档位周期，Away 最坏 30s）
+    crate::adapter::scan_bus::scan_now_blocking();
 }
 
 /// 工具勾选列表（含 managed 标志：是否存在启用的分配）
@@ -222,6 +221,43 @@ mod action_path_snapshot_lock_tests {
         assert!(
             !src.contains(direct_scan),
             "不得直调 get_all_sessions（动作路径须保证快照新鲜）"
+        );
+    }
+
+    /// 取函数体源码（按花括号配对）
+    fn function_body<'a>(src: &'a str, signature: &str) -> &'a str {
+        let start = src.find(signature).expect("函数签名缺失");
+        let open = src[start..].find('{').expect("函数体缺失") + start;
+        let mut depth = 0usize;
+        for (i, c) in src[open..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &src[open..=open + i];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("函数体未闭合");
+    }
+
+    /// Fix 4 / F5：标已读必须在命令返回前**同步**补扫（未读卡 1s 内不再出现），
+    /// 即发即忘的 request_scan 会让卡片多留一个档位周期。
+    #[test]
+    fn mark_session_read_scans_synchronously_before_returning() {
+        // 签名用 concat! 拆分：include_str! 含本测试自身，整串字面量会先命中测试代码
+        let signature = concat!("pub fn mark_session", "_read(");
+        let body = function_body(include_str!("settings.rs"), signature);
+        assert!(
+            body.contains("scan_now_blocking"),
+            "mark_session_read 必须在返回前同步补扫（F5 ≤1s 收口），实际: {body}"
+        );
+        assert!(
+            !body.contains("request_scan"),
+            "同步补扫已覆盖即时性，不应再留即发即忘的 request_scan"
         );
     }
 }
