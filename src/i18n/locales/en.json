@@ -2280,6 +2280,7 @@
       "statusUnknown": "Result unknown — verify on your computer",
       "submit": "Submit",
       "interrupt": "Interrupt",
+      "primaryStopHint": "Running: with empty input this button interrupts the current turn",
       "modelAria": "Model",
       "thoughtAria": "Thinking level",
       "pendingBlocked": "This answer form is not available yet — handle it in the terminal",

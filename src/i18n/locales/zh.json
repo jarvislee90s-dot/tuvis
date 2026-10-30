@@ -2280,6 +2280,7 @@
       "statusUnknown": "结果未知，请到电脑端核对",
       "submit": "提交",
       "interrupt": "打断",
+      "primaryStopHint": "运行中：输入为空，此按钮将打断当前回合",
       "modelAria": "模型",
       "thoughtAria": "思考强度",
       "pendingBlocked": "该作答形态暂未开放，请在终端处理",
