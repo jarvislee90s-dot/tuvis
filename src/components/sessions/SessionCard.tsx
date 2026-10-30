@@ -63,27 +63,31 @@ export function SessionCard({
   // 手动关闭卡（X）：不触发卡片跳转。全部形态（App/CLI）均可关闭。
   // 未读卡 = 标记已读（mark_session_read，spec W4 已读信号 2）；
   // 非未读卡（黄/红/绿）= 暂离不提示（dismiss_session_card，T2）——写入进程内
-  // dismiss 集合从看板与宠物隐藏，同一会话状态变化后自然重现
+  // dismiss 集合从看板与宠物隐藏，同一会话状态变化后自然重现。
+  // R1：命令为 async（补扫在阻塞池内），回执 applied=false 表示补扫降级——
+  // 仍要失效缓存，但不得按成功展示。
   const handleClose = async (e: React.MouseEvent) => {
     e.stopPropagation(); // 不触发卡片跳转
+    let outcome: { applied: boolean; version: number };
     try {
-      if (session.unread) {
-        await invoke("mark_session_read", {
-          agentType: session.agentType,
-          sessionId: session.id,
-        });
-      } else {
-        await invoke("dismiss_session_card", {
-          agentType: session.agentType,
-          sessionId: session.id,
-          status: session.status,
-        });
-      }
+      outcome = session.unread
+        ? await invoke<{ applied: boolean; version: number }>("mark_session_read", {
+            agentType: session.agentType,
+            sessionId: session.id,
+          })
+        : await invoke<{ applied: boolean; version: number }>("dismiss_session_card", {
+            agentType: session.agentType,
+            sessionId: session.id,
+            status: session.status,
+          });
     } catch (err) {
       console.error("session card close failed:", err);
       return;
     }
-    // F5：命令已同步补扫，失效后立刻读到不含该卡的新快照（失败不失效，不伪装成功）
+    if (!outcome?.applied) {
+      console.warn("[sessions] 关闭后补扫降级（applied=false），卡片可能短暂残留", outcome);
+    }
+    // 失败（applied=false）也要失效：下一轮扫描会收敛，绝不假成功
     void queryClient.invalidateQueries({ queryKey: ["sessions"] });
   };
 

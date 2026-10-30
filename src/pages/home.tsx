@@ -65,23 +65,28 @@ export default function HomePage() {
   const filteredSessions = filterByAgent(sessions, toolFilter);
   const filterToolLabel = toolFilter === "all" ? undefined : AGENT_BADGE[toolFilter]?.label;
 
-  // 一键清除已完成卡片（绿/空闲）：对每张绿卡复用单卡 X 的同款语义——
-  // 未读卡标已读（mark_session_read），其余 dismiss（dismiss_session_card）；
-  // 全部完成后立即失效轮询缓存，不等 3 秒轮询自然生效
+  // 一键清除已完成卡片（绿/空闲）：R1 起走后端**批量**命令——未读/非未读的分流
+  // 由后端按未读池权威判定，全部变更完成后只补扫一次（N 张卡 ≠ N 次扫描）。
+  // 回执 applied=false 表示补扫降级：照常失效缓存，但 console.warn 不假成功。
   const finishedCards = sessions.filter((s) => s.status === "idle" || s.status === "finished");
   const clearFinishedCards = async () => {
-    await Promise.allSettled(
-      finishedCards.map((s) =>
-        s.unread
-          ? invoke("mark_session_read", { agentType: s.agentType, sessionId: s.id })
-          : invoke("dismiss_session_card", {
-              agentType: s.agentType,
-              sessionId: s.id,
-              status: s.status,
-            })
-      )
-    );
-    queryClient.invalidateQueries({ queryKey: ["sessions"] });
+    if (finishedCards.length === 0) return;
+    try {
+      const outcome = await invoke<{ applied: boolean; version: number }>("dismiss_session_cards", {
+        items: finishedCards.map((s) => ({
+          agentType: s.agentType,
+          sessionId: s.id,
+          status: s.status,
+        })),
+      });
+      if (!outcome?.applied) {
+        console.warn("[sessions] 一键清除补扫降级（applied=false），卡片可能短暂残留", outcome);
+      }
+    } catch (error) {
+      console.error("clear finished cards failed:", error);
+    } finally {
+      queryClient.invalidateQueries({ queryKey: ["sessions"] });
+    }
   };
 
   // 桌宠开关状态：与 petConfig 双向同步（标题栏开关/设置页/托盘改动经订阅回流）；

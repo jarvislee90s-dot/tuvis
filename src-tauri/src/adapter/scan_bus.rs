@@ -45,6 +45,8 @@ static TX: OnceLock<mpsc::Sender<ScanReason>> = OnceLock::new();
 static IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 /// 在飞扫描的起始时刻（毫秒）；0 = 无在飞扫描。看门狗据此判定疑似 hang
 static SCAN_STARTED_MS: AtomicI64 = AtomicI64::new(0);
+/// 进程内累计真实扫描次数（R1 断言「批量只扫一次」与 R4 stats.total 的数据源）
+static SCANS_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 /// 事件触发扫描的最小间隔上限（Away 档 30s 的间隔会让 hook 事件在 TTL 内等不到扫描）
 const EVENT_MIN_GAP_CAP: Duration = Duration::from_secs(5);
@@ -64,6 +66,11 @@ const TRAY_REFRESH: Duration = Duration::from_secs(30);
 
 pub fn version() -> u64 {
     VERSION.load(Ordering::SeqCst)
+}
+
+/// 进程内真实扫描次数（每次真正启动的 scan_once 计一次）
+pub fn scan_total() -> u64 {
+    SCANS_TOTAL.load(Ordering::SeqCst)
 }
 
 pub fn snapshot() -> Option<Arc<Snapshot>> {
@@ -115,6 +122,42 @@ pub fn ensure_fresh(max_age: Duration, wait: Duration) -> Arc<Snapshot> {
 /// 与周期扫描共用同一把单飞：并发时等待现有扫描完成，不会产生第二份快照。
 pub fn scan_now_blocking() -> Arc<Snapshot> {
     scan_once()
+}
+
+/// 变更后补扫的结果。`applied=false` = 等待在飞扫描超时，返回的是**变更前**的
+/// 旧快照：调用方不得按成功展示（R1），但可照常刷新缓存等下轮扫描。
+#[derive(Debug, Clone)]
+pub struct MutationScan {
+    pub snapshot: Arc<Snapshot>,
+    pub applied: bool,
+}
+
+/// 变更后的补扫（R1）：先**有界**等待当前在飞扫描结束，再执行一次在变更之后
+/// 启动的扫描。
+///
+/// 为什么必须等：在飞扫描可能在变更写入前就已读取隐藏集合/已读池，它发布的快照
+/// 不含本次变更；直接 scan_once 会等它并返回这份**旧**快照，命令报成功但卡片仍在。
+/// 等待期间若有别的线程抢先发起扫描，那次扫描同样在变更之后启动，结果可用。
+pub fn scan_after_mutation(wait: Duration) -> MutationScan {
+    let deadline = Instant::now() + wait;
+    while IN_FLIGHT.load(Ordering::SeqCst) {
+        if Instant::now() >= deadline {
+            log::warn!(
+                "scan_bus: 变更后等待在飞扫描超时（{:?}），返回旧快照（applied=false）",
+                wait
+            );
+            let snapshot = snapshot().unwrap_or_else(empty_snapshot);
+            return MutationScan {
+                snapshot,
+                applied: false,
+            };
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    MutationScan {
+        snapshot: scan_once(),
+        applied: true,
+    }
 }
 
 /// 事件唤醒（节流策略在扫描线程内统一处理）
@@ -204,6 +247,7 @@ fn scan_once_with_limit(wait_limit: Duration) -> Arc<Snapshot> {
         };
     }
     SCAN_STARTED_MS.store(now_ms(), Ordering::SeqCst);
+    SCANS_TOTAL.fetch_add(1, Ordering::SeqCst);
     struct Clear;
     impl Drop for Clear {
         fn drop(&mut self) {
@@ -449,6 +493,7 @@ pub fn reset_for_test() {
         .clear();
     IN_FLIGHT.store(false, Ordering::SeqCst);
     SCAN_STARTED_MS.store(0, Ordering::SeqCst);
+    SCANS_TOTAL.store(0, Ordering::SeqCst);
 }
 
 /// 单测用：占位/释放「在飞扫描」（模拟卡住的扫描，验证等待上限与诊断口）

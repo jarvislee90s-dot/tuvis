@@ -40,7 +40,7 @@ const mk = (over: Partial<Session>): Session => ({
 
 beforeEach(() => {
   invokeMock.mockReset();
-  invokeMock.mockResolvedValue(undefined);
+  invokeMock.mockResolvedValue({ applied: true, version: 1 });
 });
 
 /** SessionCard 通过 useQueryClient 在关闭成功后失效 ["sessions"]，测试需真 Provider */
@@ -103,5 +103,15 @@ describe("App 卡 X 关闭（T2）", () => {
     fireEvent.click(screen.getByRole("button", { name: /Hide for now/i }));
     await waitFor(() => expect(invokeMock).toHaveBeenCalled());
     expect(invalidate).not.toHaveBeenCalled();
+  });
+
+  it("补扫降级（applied=false）仍失效缓存，但不按成功展示", async () => {
+    invokeMock.mockResolvedValue({ applied: false, version: 3 });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const invalidate = renderCard(mk({ status: "waiting", form: "app", unread: false }));
+    fireEvent.click(screen.getByRole("button", { name: /Hide for now/i }));
+    await waitFor(() => expect(invalidate).toHaveBeenCalledWith({ queryKey: ["sessions"] }));
+    expect(warn).toHaveBeenCalled();
+    warn.mockRestore();
   });
 });

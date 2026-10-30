@@ -70,43 +70,111 @@ fn normalize_watch_source(source: Option<String>) -> String {
     }
 }
 
+/// 取函数体源码（按花括号配对；签名必须唯一命中实现处）。测试专用。
 #[cfg(test)]
-mod f5_immediate_scan_tests {
-    /// 取函数体源码（按花括号配对；签名必须唯一命中实现处）
-    fn function_body<'a>(src: &'a str, signature: &str) -> &'a str {
-        let start = src.find(signature).expect("函数签名缺失");
-        let open = src[start..].find('{').expect("函数体缺失") + start;
-        let mut depth = 0usize;
-        for (i, c) in src[open..].char_indices() {
-            match c {
-                '{' => depth += 1,
-                '}' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        return &src[open..=open + i];
-                    }
+fn function_body<'a>(src: &'a str, signature: &str) -> &'a str {
+    let start = src.find(signature).expect("函数签名缺失");
+    let open = src[start..].find('{').expect("函数体缺失") + start;
+    let mut depth = 0usize;
+    for (i, c) in src[open..].char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return &src[open..=open + i];
                 }
-                _ => {}
             }
+            _ => {}
         }
-        panic!("函数体未闭合");
+    }
+    panic!("函数体未闭合");
+}
+
+#[cfg(test)]
+mod r1_mutation_scan_tests {
+    use super::{apply_dismissals, function_body, DismissItem};
+    use crate::adapter::scan_bus;
+
+    fn empty_resp() -> crate::session::SessionsResponse {
+        crate::session::SessionsResponse {
+            sessions: Vec::new(),
+            total_count: 0,
+            waiting_count: 0,
+        }
     }
 
-    /// Fix 4 / F5：隐藏卡片必须在命令返回前**同步**补扫——即发即忘的 request_scan
-    /// 让前端可能先读到上一版快照，卡片最多残留一个档位周期（Away 30s）。
+    /// R1：单卡命令必须**非阻塞**（async + spawn_blocking），不得再同步跑
+    /// scan_now_blocking（同步命令在主线程执行，扫描会冻结全部窗口 IPC）。
     #[test]
-    fn dismiss_session_card_scans_synchronously_before_returning() {
-        // 签名用 concat! 拆分：include_str! 含本测试自身，整串字面量会先命中测试代码
-        let signature = concat!("fn dismiss_session", "_card(");
-        let body = function_body(include_str!("session.rs"), signature);
-        assert!(
-            body.contains("scan_now_blocking"),
-            "dismiss_session_card 必须在返回前同步补扫（F5 ≤1s 收口），实际: {body}"
+    fn single_card_commands_are_async_and_spawn_blocking() {
+        let session_src = include_str!("session.rs");
+        let dismiss = function_body(
+            session_src,
+            concat!("pub async fn dismiss_session", "_card("),
         );
         assert!(
-            !body.contains("request_scan"),
-            "同步补扫已覆盖即时性，dismiss 不应再留即发即忘的 request_scan"
+            dismiss.contains("spawn_blocking"),
+            "dismiss_session_card 必须 async + spawn_blocking，实际: {dismiss}"
         );
+        assert!(
+            !dismiss.contains(concat!("scan_now_", "blocking")),
+            "dismiss_session_card 不得同步跑完整扫描"
+        );
+
+        let settings_src = include_str!("settings.rs");
+        let mark = function_body(settings_src, concat!("pub async fn mark_session", "_read("));
+        assert!(
+            mark.contains("spawn_blocking"),
+            "mark_session_read 必须 async + spawn_blocking，实际: {mark}"
+        );
+        assert!(
+            !mark.contains(concat!("scan_now_", "blocking")),
+            "mark_session_read 不得同步跑完整扫描"
+        );
+    }
+
+    /// R1：一键清除 N 项只允许触发 **1 次**扫描，且返回版本必须晚于变更前版本。
+    #[test]
+    fn batch_dismissal_scans_once_and_advances_version() {
+        let _guard = scan_bus::test_guard();
+        scan_bus::reset_for_test();
+        crate::monitor::SESSION_DISMISALS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        let _ = scan_bus::publish_for_test(empty_resp);
+        let before_version = scan_bus::version();
+        let before_scans = scan_bus::scan_total();
+        let items: Vec<DismissItem> = (0..10)
+            .map(|i| DismissItem {
+                agent_type: "claude".to_string(),
+                session_id: format!("r1-batch-{i}"),
+                status: "idle".to_string(),
+            })
+            .collect();
+        let result = apply_dismissals(items, |_, _| {});
+        assert_eq!(
+            scan_bus::scan_total() - before_scans,
+            1,
+            "批量 10 项只能触发 1 次扫描（N 张卡 ≠ N 次扫描）"
+        );
+        assert!(result.applied, "无在飞扫描时批量补扫必须视为已应用");
+        assert!(
+            result.snapshot.version > before_version,
+            "返回版本 {} 必须晚于变更前 {}",
+            result.snapshot.version,
+            before_version
+        );
+        let inserted = crate::monitor::SESSION_DISMISALS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len();
+        assert!(inserted >= 10, "10 项隐藏变更都应落进 dismiss 集合");
+        crate::monitor::SESSION_DISMISALS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
     }
 }
 
@@ -451,22 +519,128 @@ pub fn focus_hwnd(hwnd: isize) -> Result<(), String> {
     }
 }
 
+/// 变更类命令的统一回执（R1）：`applied=false` = 变更后补扫等待超时（degraded），
+/// 前端必须照常失效缓存但不得按成功展示。`version` = 返回快照的发布版本。
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+pub struct MutationOutcome {
+    pub applied: bool,
+    pub version: u64,
+}
+
+/// 批量隐藏项（R1 一键清除）：字段 camelCase 对齐前端 invoke 载荷
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DismissItem {
+    pub agent_type: String,
+    pub session_id: String,
+    pub status: String,
+}
+
+/// 批量变更内核（R1，测试可直调）：逐项按**未读池权威**分流——
+/// 未读卡走已读语义（与单卡 mark_session_read 同口径），其余写进程内 dismiss 集合；
+/// 全部变更完成后**只补扫一次**（N 张卡 ≠ N 次扫描）。
+fn apply_dismissals(
+    items: Vec<DismissItem>,
+    emit_read: impl Fn(&str, &str),
+) -> crate::adapter::scan_bus::MutationScan {
+    let now = chrono::Utc::now().timestamp_millis();
+    let unread: std::collections::HashSet<(String, String)> =
+        crate::database::dao::unread::list(now)
+            .into_iter()
+            .map(|r| (r.tool_id, r.session_id))
+            .collect();
+    let mut to_dismiss = Vec::new();
+    for it in items {
+        let tool = it.agent_type.to_lowercase();
+        if unread.contains(&(tool.clone(), it.session_id.clone())) {
+            crate::database::dao::unread::delete(&tool, &it.session_id);
+            // issue #35-1：已读墓碑，防止缓存失忆后未读卡复活
+            crate::database::dao::unread::mark_read(&tool, &it.session_id);
+            emit_read(&it.agent_type, &it.session_id);
+        } else {
+            to_dismiss.push((tool, it.session_id, it.status.to_lowercase()));
+        }
+    }
+    if !to_dismiss.is_empty() {
+        let mut set = crate::monitor::SESSION_DISMISALS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for item in to_dismiss {
+            set.insert(item);
+        }
+    }
+    crate::adapter::scan_bus::scan_after_mutation(std::time::Duration::from_secs(2))
+}
+
 /// 手动关闭活跃 App 卡（T2 X 按钮，「暂离不提示」）：写入进程内 dismiss 集合，
 /// 从看板与宠物隐藏；同一会话状态变化后 key 不匹配自然重现。
 /// 不碰 unread_sessions 表（未读卡的 X 走 mark_session_read 已读语义）。
 /// status 用前端 SessionStatus 字符串（serde lowercase，如 "waiting"），
-/// 与 filter_dismissed_cards 的归一化（Debug 形态转小写）一致
+/// 与 filter_dismissed_cards 的归一化（Debug 形态转小写）一致。
+///
+/// R1：命令改为 async——变更本身是轻量内存写，**补扫**（可能等在飞 2s + 完整扫描）
+/// 放进阻塞线程池；同步命令在主线程跑扫描会冻结全部窗口 IPC。
 #[tauri::command]
-pub fn dismiss_session_card(agent_type: String, session_id: String, status: String) {
-    crate::monitor::SESSION_DISMISALS.lock().unwrap().insert((
-        agent_type.to_lowercase(),
-        session_id,
-        status.to_lowercase(),
-    ));
-    // F5 即时重算：隐藏集合是扫描内的过滤条件（filter_dismissed_cards），
-    // **同步**补扫后本命令才返回——前端随后的 invalidateQueries(["sessions"])
-    // 一定能读到不含该卡的新快照（即发即忘会让卡片残留一个档位周期，Away 最坏 30s）
-    crate::adapter::scan_bus::scan_now_blocking();
+pub async fn dismiss_session_card(
+    agent_type: String,
+    session_id: String,
+    status: String,
+) -> MutationOutcome {
+    {
+        let mut set = crate::monitor::SESSION_DISMISALS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        set.insert((agent_type.to_lowercase(), session_id, status.to_lowercase()));
+    }
+    // R1：完整扫描（可能等在飞 2s）放进阻塞线程池，命令本身不跑扫描
+    match tauri::async_runtime::spawn_blocking(|| {
+        crate::adapter::scan_bus::scan_after_mutation(std::time::Duration::from_secs(2))
+    })
+    .await
+    {
+        Ok(result) => MutationOutcome {
+            applied: result.applied,
+            version: result.snapshot.version,
+        },
+        Err(e) => {
+            ::log::error!("dismiss 变更后补扫任务异常: {e}");
+            MutationOutcome {
+                applied: false,
+                version: crate::adapter::scan_bus::version(),
+            }
+        }
+    }
+}
+
+/// 一键清除（R1）：批量隐藏/标已读，全部变更完成后只补扫一次。
+/// 未读卡的「X」是已读语义（spec W4）——按未读池权威判定，与单卡命令同口径。
+#[tauri::command]
+pub async fn dismiss_session_cards(
+    app: tauri::AppHandle,
+    items: Vec<DismissItem>,
+) -> MutationOutcome {
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        apply_dismissals(items, |agent_type, session_id| {
+            let _ = app.emit(
+                "session-read",
+                serde_json::json!({ "agentType": agent_type, "sessionId": session_id }),
+            );
+        })
+    })
+    .await;
+    match result {
+        Ok(r) => MutationOutcome {
+            applied: r.applied,
+            version: r.snapshot.version,
+        },
+        Err(e) => {
+            ::log::error!("一键清除补扫任务异常: {e}");
+            MutationOutcome {
+                applied: false,
+                version: crate::adapter::scan_bus::version(),
+            }
+        }
+    }
 }
 
 /// R5 一键 resume（桌面卡「在电脑上打开」）：按 session_id 在当前快照里找会话，
