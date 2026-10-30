@@ -22,6 +22,7 @@ import {
 import useZcodeControl from "./useZcodeControl";
 import ZcodePendingCard, { STATUS_KEYS, pendingDomId, zcodeReasonText } from "./ZcodePendingCard";
 import ZcodeQueuePanel from "./ZcodeQueuePanel";
+import { deriveZcodePrimaryAction } from "./zcode-primary-action";
 import {
   attachmentMarkup,
   isImageFile,
@@ -88,8 +89,6 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
   const uploadCtrlsRef = useRef(new Map<string, AbortController>());
   /** 本次 send 提交的就绪附件 id：accepted 清的是「随本次发送」的条目，不碰续加。 */
   const submittedAttachmentIdsRef = useRef<string[] | null>(null);
-  /** 附件闸提示（上传中/存在失败项时点击发送）：瞬态，随下次发送动作清除。 */
-  const [attachNotice, setAttachNotice] = useState<"uploading" | "failed" | null>(null);
   /**
    * 附件存储说明的展开态（R4/U1）：默认折叠，点「？」展开既有说明、再点收起。
    * 纯展示开关：绝不触发文件选择器 / 上传 / 发送。
@@ -133,7 +132,6 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
     // 三轮 C：附件与在途上传不跨会话残留。
     setAttachments([]);
     submittedAttachmentIdsRef.current = null;
-    setAttachNotice(null);
     // 附件说明的展开态同样不跨会话残留（说明属当前会话的附件管线）。
     setAttachHintOpen(false);
     // 切组选择不跨会话残留（旧会话的 interaction id 在新会话没有意义）。
@@ -238,15 +236,95 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
       });
   };
 
-  // 硬门：连接已配对 + 会话就绪 + send 能力开启 + 无在途提交。空草稿不阻挡按钮
-  // （按钮代表控制通道就绪），但点击时判空、绝不 POST 空动作。
-  const canSend =
-    gateReason === null && session !== null && session.capabilities.send.enabled && !submitting;
-  // 能力关闭就地说明（I1）：paired + ready 但 send 能力关时，禁用按钮之外必须有一句
-  // 可见原因（服务端 reasonCode），否则用户只会以为按钮坏了。
-  const sendCapabilityReason =
-    gateReason === null && session !== null && !session.capabilities.send.enabled
-      ? (session.capabilities.send.reasonCode ?? "not_ready")
+  // ==== R5/U3：发送／打断共用主按钮 ====
+  // 打断目标：只认新鲜 control 里唯一的 primaryTurn（多目标拒绝，禁止随取第一个）；
+  // 只发 stop，绝不夹带 sendText。
+  const stopTargets = (session?.control?.activeWorks ?? []).filter(
+    (work) => work.kind === "primaryTurn" && work.foregroundExecutionId !== null
+  );
+  const stopTarget = stopTargets.length === 1 ? stopTargets[0].foregroundExecutionId : null;
+  /** 官方新鲜 control 判定「运行中」（不看看板颜色、不猜本地忙态）。 */
+  const running = stopTargets.length > 0;
+  /**
+   * 附件闸：上传中/失败条目在列 → 此刻不可发送（沿用既有提示阻止发送）。附件在途
+   * 时主按钮**留在发送位**、绝不翻成打断（用户正在组装消息，不能被静默换成打断）。
+   */
+  const attachmentBlocked = attachments.some(
+    (a) => a.status === "uploading" || a.status === "failed"
+  );
+  /**
+   * 有内容在手：文字非空**或**存在**就绪**附件（就绪 = 上传完成、可随正文上行）。
+   * 上传中/失败附件不算可发内容——它们只把发送位锁住并挂既有提示。
+   */
+  const hasContent = draft.trim().length > 0 || attachments.some((a) => a.status === "ready");
+  /**
+   * 旧代际：会话投影代际落后于连接代际 → 写面零写（与服务端 stale_generation 同口径：
+   * 旧代际的 stop 目标必然失效、服务端也必然拒收）。只关主按钮，逐题卡语义不变（R3）。
+   */
+  const staleGeneration =
+    connection !== null && session !== null && session.generation < connection.generation;
+  /** 发送闸：写面硬门 + send 能力 + 附件闸 + 代际新鲜度。 */
+  const sendAllowed =
+    gateReason === null &&
+    session !== null &&
+    session.capabilities.send.enabled &&
+    !attachmentBlocked &&
+    !staleGeneration;
+  /** 打断闸：写面硬门 + interrupt 能力 + 唯一 stop 目标（既有守卫原值）+ 代际新鲜度。 */
+  const stopAllowed =
+    gateReason === null &&
+    session !== null &&
+    session.capabilities.interrupt.enabled &&
+    stopTarget !== null &&
+    !attachmentBlocked &&
+    !staleGeneration;
+  /** 在途（任一动作 POST 未回）→ 主按钮禁用：零第二个动作。 */
+  const busy = submitting;
+  /** 主按钮唯一动作（纯函数推导，见 zcode-primary-action.ts）。 */
+  const primaryAction = deriveZcodePrimaryAction({
+    hasContent,
+    running,
+    sendAllowed,
+    stopAllowed,
+    busy,
+  });
+  /**
+   * 打断位：运行中 + 手上无可发内容 + 附件闸未闭 → 按钮代表「打断当前回合」。
+   * 有内容（含就绪附件）时按钮留在发送位：有内容发送绝不先打断。
+   */
+  const stopSlot = running && !hasContent && !attachmentBlocked;
+  /**
+   * 主按钮旁的原因（冻结码）：删除独立打断行后，原因必须仍在按钮旁可见。
+   * 优先级：写面硬门 > 旧代际 > 打断位（能力关闭 / 目标歧义）> 发送位（能力关闭）。
+   * 附件闸另有既有提示（zcode-attach-notice）说明原因，这里不重复冻结码。
+   */
+  const primaryReason: string | null =
+    primaryAction !== "disabled"
+      ? null
+      : (gateReason ??
+        (staleGeneration
+          ? "stale_generation"
+          : stopSlot
+            ? session !== null && !session.capabilities.interrupt.enabled
+              ? (session.capabilities.interrupt.reasonCode ?? "unknown")
+              : stopTarget === null
+                ? "target_ambiguous"
+                : null
+            : session !== null && !session.capabilities.send.enabled
+              ? (session.capabilities.send.reasonCode ?? "not_ready")
+              : null));
+
+  /**
+   * 附件闸提示（既有提示，R5 保留）：上传中/失败条目在列 → 提示「等上传完成再发送」
+   * /「先移除失败附件」。**派生自附件状态**（不再是点击后的瞬时提示）：主按钮此时
+   * 已禁用，用户必须先看到原因才知道为什么点不动。
+   */
+  const attachNotice: "uploading" | "failed" | null = attachments.some(
+    (a) => a.status === "uploading"
+  )
+    ? "uploading"
+    : attachments.some((a) => a.status === "failed")
+      ? "failed"
       : null;
 
   // 三轮 C：附件上传（通用通道；状态机与 MessageComposer 同形，无速率估算）。
@@ -305,26 +383,18 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
   };
 
   const handleSend = () => {
-    if (!canSend || session === null || inFlightRef.current) return;
+    if (primaryAction !== "send") return;
+    if (!sendAllowed || session === null || inFlightRef.current) return;
     const current = attachmentsRef.current;
-    // 附件闸：上传中或存在失败项时不静默丢附件发送（三轮 C 契约）。
-    if (current.some((a) => a.status === "uploading")) {
-      setAttachNotice("uploading");
-      return;
-    }
-    if (current.some((a) => a.status === "failed")) {
-      setAttachNotice("failed");
-      return;
-    }
     const markup = attachmentMarkup(current);
     const text = draft.trim();
+    // 空正文绝不 POST（按钮是控制通道占位，不是「发空消息」的许可）。
     if (text.length === 0 && markup.length === 0) return;
     // 记下本次提交原文与随行附件：accepted 清「同一份」，失败/未知全保留。
     submittedDraftRef.current = draft;
     submittedAttachmentIdsRef.current = current
       .filter((a) => a.status === "ready")
       .map((a) => a.id);
-    setAttachNotice(null);
     runOnce({
       kind: "send",
       sessionId,
@@ -333,35 +403,30 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
     });
   };
 
-  // 打断：只认新鲜 control 里唯一的 primaryTurn（多目标拒绝，禁止随取第一个）；
-  // 只发 stop，绝不夹带 sendText。
-  const stopTargets = (session?.control?.activeWorks ?? []).filter(
-    (work) => work.kind === "primaryTurn" && work.foregroundExecutionId !== null
-  );
-  const stopTarget = stopTargets.length === 1 ? stopTargets[0].foregroundExecutionId : null;
-  const canInterrupt =
-    gateReason === null &&
-    session !== null &&
-    session.capabilities.interrupt.enabled &&
-    stopTarget !== null &&
-    !submitting;
-  // 不可打断的就地原因：写面硬门 > 能力关闭 > 多目标歧义。
-  const interruptReason =
-    gateReason ??
-    (session?.capabilities.interrupt.enabled === false
-      ? session.capabilities.interrupt.reasonCode
-      : stopTarget === null
-        ? "target_ambiguous"
-        : null);
-
   const handleInterrupt = () => {
-    if (!canInterrupt || session === null || stopTarget === null) return;
+    if (primaryAction !== "stop") return;
+    if (session === null || stopTarget === null || inFlightRef.current) return;
     runOnce({
       kind: "stop",
       sessionId,
       generation: session.generation,
       expectedForegroundExecutionId: stopTarget,
     });
+  };
+
+  /**
+   * 主按钮唯一入口：动作由纯函数推导的结果决定（send / stop / disabled）。
+   * 按钮上只有一个动作入口——绝不「先打断再发送」，也绝不在同一按钮上并列两个
+   * 动作（删除独立打断行后的唯一写入口）。
+   */
+  const handlePrimaryAction = () => {
+    if (primaryAction === "send") {
+      handleSend();
+      return;
+    }
+    if (primaryAction === "stop") {
+      handleInterrupt();
+    }
   };
 
   // 模型/档位：目录只来自 session.selection（当前 provider）；写面硬门 + 能力两闸
@@ -625,28 +690,6 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
           {zcodeReasonText(selectionReason)}
         </p>
       )}
-      {stopTargets.length > 0 && (
-        <div className="mb-2 flex flex-wrap items-center gap-2">
-          <button
-            type="button"
-            data-testid="zcode-interrupt"
-            disabled={!canInterrupt}
-            onClick={handleInterrupt}
-            className="rounded-full border border-[var(--cb)] px-4 py-1 text-sm text-[var(--tx)] disabled:opacity-40"
-          >
-            {i18n.t("mobile.zcodeControl.interrupt")}
-          </button>
-          {!canInterrupt && interruptReason !== null && (
-            <p
-              data-testid="zcode-interrupt-reason"
-              data-reason-code={interruptReason}
-              className="text-xs text-[var(--mut)]"
-            >
-              {zcodeReasonText(interruptReason)}
-            </p>
-          )}
-        </div>
-      )}
       {attachments.length > 0 && (
         <div className="flex flex-wrap gap-2">
           {attachments.map((a) => (
@@ -746,13 +789,41 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
         <button
           type="button"
           data-testid="zcode-send"
-          disabled={!canSend}
-          onClick={() => void handleSend()}
+          // 主按钮唯一动作（send / stop / disabled）：由纯函数推导，UI 不另做判断。
+          data-primary-action={primaryAction}
+          // 主按钮所处的语义位（stop = 运行中且无内容 → 此按钮代表打断；send = 发送）。
+          // 与 action 分离：位可以「是打断但此刻禁用」（例如多目标歧义 / 投影未就绪）。
+          data-primary-mode={stopSlot ? "stop" : "send"}
+          disabled={primaryAction === "disabled"}
+          onClick={() => void handlePrimaryAction()}
           className="shrink-0 rounded-full bg-[var(--btnp)]/10 px-4 py-2 text-sm text-[var(--tx)] disabled:opacity-40"
         >
-          {i18n.t(submitting ? "mobile.zcodeControl.sending" : "mobile.zcodeControl.send")}
+          {i18n.t(
+            stopSlot
+              ? "mobile.zcodeControl.interrupt"
+              : submitting
+                ? "mobile.zcodeControl.sending"
+                : "mobile.zcodeControl.send"
+          )}
         </button>
       </div>
+      {/* 主按钮旁的说明（删除独立打断行后，原因不再消失）：
+          - `zcode-send-reason`：冻结码原因（为什么不发/不打断）；
+          - `zcode-primary-stop-hint`：打断位说明（运行中 → 此按钮将打断当前回合）。 */}
+      {primaryReason !== null && (
+        <p
+          data-testid="zcode-send-reason"
+          data-reason-code={primaryReason}
+          className="mt-1 text-xs text-[var(--mut)]"
+        >
+          {zcodeReasonText(primaryReason)}
+        </p>
+      )}
+      {primaryAction === "stop" && (
+        <p data-testid="zcode-primary-stop-hint" className="mt-1 text-xs text-[var(--mut)]">
+          {i18n.t("mobile.zcodeControl.primaryStopHint")}
+        </p>
+      )}
       {/* 附件存储说明（知情披露）：？点开才显示，看过即收、不平铺常驻。
           文案**复用** MessageComposer 的既有说明（同一上传管线 → 同一落盘位置），
           不另写一份存储说明，也不改存储目录。 */}
@@ -763,15 +834,6 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
           className="mt-1 rounded-lg bg-[var(--cbg)] px-2 py-1.5 text-[11px] leading-4 text-[var(--mut)]"
         >
           {i18n.t("mobile.composer.attachHint")}
-        </p>
-      )}
-      {sendCapabilityReason !== null && (
-        <p
-          data-testid="zcode-send-reason"
-          data-reason-code={sendCapabilityReason}
-          className="mt-1 text-xs text-[var(--mut)]"
-        >
-          {zcodeReasonText(sendCapabilityReason)}
         </p>
       )}
     </div>

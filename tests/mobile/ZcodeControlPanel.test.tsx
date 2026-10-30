@@ -27,8 +27,14 @@
 //   optionId 是宿主原值；fullAccess（及其他永久/未知 kind）不渲染或禁用。
 //
 // 打断 / 模型档位（Slice B1c 契约；数据只来自新 SessionView.control/selection）：
-// - 打断按钮 `zcode-interrupt`：只认唯一 primaryTurn 的前台执行 id，提交 tagged stop
-//   （`expectedForegroundExecutionId` 精确等于该 id），绝不夹带 sendText。
+// - R5/U3：打断能力并入**唯一主按钮** `zcode-send`（`data-primary-action` =
+//   send / stop / disabled，`data-primary-mode` = 该按钮所处的语义位）：
+//   运行中且输入为空 → 按钮变打断（只认唯一 primaryTurn 的前台执行 id，提交 tagged
+//   stop，`expectedForegroundExecutionId` 精确等于该 id，绝不夹带 sendText）；
+//   有文字或就绪附件 → 按钮是发送（有内容发送不得先打断）；在途 → 禁用（零第二动作）。
+//   独立常驻打断行（`zcode-interrupt` / `zcode-interrupt-reason`）整块删除。
+// - 主按钮旁的原因 `zcode-send-reason`（`data-reason-code` = 冻结码）：删除独立行后
+//   原因不得消失（not_ready / target_ambiguous 等仍在按钮旁可见）。
 // - 模型选择 `zcode-model-select`（选项 = 当前 provider 的 models）、思考档位
 //   `zcode-thought-select`（选项 = 所选模型的 thoughtLevels）；model/thoughtLevel
 //   任一能力关闭 → 两个控件都禁用并给出可见原因，改值/点击零动作 POST。
@@ -240,6 +246,27 @@ function storageDump(): string {
       return JSON.stringify(entries);
     })
     .join("\n");
+}
+
+/**
+ * 上传中附件用的最小 XHR 替身：只实现 `uploadAttachment` 用到的面，且**永不回调**
+ * （附件永远停在 uploading）。用于锁定「上传中 → 主按钮禁用且保留原提示」。
+ */
+class PendingUploadXhr {
+  onload: ((e: ProgressEvent) => void) | null = null;
+  onerror: (() => void) | null = null;
+  onabort: (() => void) | null = null;
+  status = 0;
+  responseText = "";
+  upload = { onprogress: null as ((e: ProgressEvent) => void) | null };
+  open() {}
+  setRequestHeader() {}
+  send() {
+    /* 挂起：故意不回调 → 附件永远停在 uploading */
+  }
+  abort() {
+    this.onabort?.();
+  }
 }
 
 beforeEach(() => {
@@ -745,9 +772,16 @@ describe("ZCode 控制面板：打断只针对唯一的既有前台执行", () =
 
     render(<ZcodeControlPanel sessionId={SID} />);
 
-    const interrupt = (await screen.findByTestId("zcode-interrupt")) as HTMLButtonElement;
-    await waitFor(() => expect(interrupt).toBeEnabled());
-    fireEvent.click(interrupt);
+    // R5/U3：独立打断行整块删除——运行中且手上无内容时，**主按钮本身**就是打断按钮。
+    const primary = (await screen.findByTestId("zcode-send")) as HTMLButtonElement;
+    await waitFor(() => expect(primary.getAttribute("data-primary-action")).toBe("stop"));
+    expect(primary.getAttribute("data-primary-mode")).toBe("stop");
+    expect(primary).toBeEnabled();
+    // 旧打断入口真的没了（DOM 里不再存在第二个可点打断面）
+    expect(screen.queryByTestId("zcode-interrupt")).toBeNull();
+    expect(screen.queryByTestId("zcode-interrupt-reason")).toBeNull();
+
+    fireEvent.click(primary);
 
     await waitFor(() => expect(postedActions()).toHaveLength(1));
     // 打断目标 = 新鲜 control 里唯一 primaryTurn 的执行 id（不是最新执行、不是猜）
@@ -760,6 +794,226 @@ describe("ZCode 控制面板：打断只针对唯一的既有前台执行", () =
     // 打断绝不夹带 sendText：不发任何 send 动作，也不回退旧发送链
     expect(postedActions().filter(({ action }) => action.kind === "send")).toHaveLength(0);
     expect(legacySendCalls()).toBe(0);
+  });
+});
+
+// R5/U3 面板级集成：主按钮在「发送／打断」之间切换，且四种边界都不产生错误动作。
+describe("ZCode 控制面板：主按钮在发送与打断之间切换（R5/U3）", () => {
+  /** 运行中（唯一 primaryTurn E1）的会话投影。 */
+  const runningSession = (overrides: Partial<SessionView> = {}) =>
+    sessionView({
+      control: { activeWorks: [{ kind: "primaryTurn", foregroundExecutionId: "E1" }] },
+      ...overrides,
+    });
+
+  /** 安装「GET 连接 + GET 会话 + POST 动作」确定性替身。 */
+  function installRunning(
+    view: SessionView,
+    onPost?: (body: { actionId: string; action: ControlAction }) => unknown
+  ) {
+    installFetch((url, init) => {
+      if (url === ZCODE_CONNECTION_PATH) return json(connection());
+      if (url.startsWith(`${ZCODE_SESSION_PATH}?`)) return json(view);
+      if (url === ZCODE_ACTIONS_PATH && init?.method === "POST") {
+        const body = JSON.parse(String(init.body)) as { actionId: string; action: ControlAction };
+        const custom = onPost?.(body);
+        return json(custom ?? receipt(body.actionId, "accepted"));
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+  }
+
+  it("运行中且输入为空 → 主按钮是打断，一次点击只发一个 stop", async () => {
+    installRunning(runningSession());
+    render(<ZcodeControlPanel sessionId={SID} />);
+
+    const primary = (await screen.findByTestId("zcode-send")) as HTMLButtonElement;
+    await waitFor(() => expect(primary.getAttribute("data-primary-action")).toBe("stop"));
+    expect(primary).toBeEnabled();
+
+    fireEvent.click(primary);
+
+    await waitFor(() => expect(postedActions()).toHaveLength(1));
+    // 复用原 stop 守卫：expectedForegroundExecutionId = 唯一 primaryTurn 的执行 id
+    expect(postedActions()[0].action).toEqual({
+      kind: "stop",
+      sessionId: SID,
+      generation: GEN,
+      expectedForegroundExecutionId: "E1",
+    });
+    expect(postedActions().filter(({ action }) => action.kind === "send")).toHaveLength(0);
+  });
+
+  it("运行中但有文字 → 主按钮是发送，绝不先打断", async () => {
+    installRunning(runningSession());
+    render(<ZcodeControlPanel sessionId={SID} />);
+
+    const primary = (await screen.findByTestId("zcode-send")) as HTMLButtonElement;
+    const draft = screen.getByTestId("zcode-draft") as HTMLTextAreaElement;
+    fireEvent.change(draft, { target: { value: "运行中也要能发消息" } });
+
+    await waitFor(() => expect(primary.getAttribute("data-primary-action")).toBe("send"));
+    fireEvent.click(primary);
+
+    await waitFor(() => expect(postedActions()).toHaveLength(1));
+    expect(postedActions()[0].action).toEqual({
+      kind: "send",
+      sessionId: SID,
+      generation: GEN,
+      text: "运行中也要能发消息",
+    });
+    // 有内容发送不得先打断：一个 stop 都不许出现
+    expect(postedActions().filter(({ action }) => action.kind === "stop")).toHaveLength(0);
+  });
+
+  it("运行中但无唯一守卫（多目标）→ 主按钮禁用并带可见原因", async () => {
+    // 两个 primaryTurn：打断目标不唯一 → 绝不随取第一个（旧的 target_ambiguous 口径）。
+    installRunning(
+      sessionView({
+        control: {
+          activeWorks: [
+            { kind: "primaryTurn", foregroundExecutionId: "E1" },
+            { kind: "primaryTurn", foregroundExecutionId: "E2" },
+          ],
+        },
+      })
+    );
+    render(<ZcodeControlPanel sessionId={SID} />);
+
+    const primary = (await screen.findByTestId("zcode-send")) as HTMLButtonElement;
+    await waitFor(() => expect(primary).toBeDisabled());
+    expect(primary.getAttribute("data-primary-action")).toBe("disabled");
+    // 原因就在主按钮旁（删除独立打断行后原因不消失）
+    const reason = screen.getByTestId("zcode-send-reason");
+    expect(reason.getAttribute("data-reason-code")).toBe("target_ambiguous");
+    expect(reason.textContent?.trim().length ?? 0).toBeGreaterThan(0);
+
+    fireEvent.click(primary);
+    await act(async () => {});
+    expect(postedActions()).toHaveLength(0);
+  });
+
+  it("上传中附件 → 主按钮禁用并保留既有提示（不得翻成打断）", async () => {
+    vi.stubGlobal("XMLHttpRequest", PendingUploadXhr);
+    installRunning(runningSession());
+    render(<ZcodeControlPanel sessionId={SID} />);
+
+    const primary = (await screen.findByTestId("zcode-send")) as HTMLButtonElement;
+    const input = screen.getByTestId("zcode-attachment-input") as HTMLInputElement;
+    fireEvent.change(input, {
+      target: { files: [new File(["binary"], "shot.png", { type: "image/png" })] },
+    });
+    await waitFor(() => expect(screen.getByTestId("zcode-attachment")).toBeTruthy());
+
+    // 上传中：既不能发送（沿用既有提示），也不能退化成打断
+    await waitFor(() => expect(primary).toBeDisabled());
+    expect(primary.getAttribute("data-primary-action")).toBe("disabled");
+    expect(primary.getAttribute("data-primary-mode")).toBe("send");
+    expect(screen.getByTestId("zcode-attach-notice")).toBeVisible();
+
+    fireEvent.click(primary);
+    await act(async () => {});
+    expect(postedActions()).toHaveLength(0);
+  });
+
+  it("在途（busy）→ 主按钮禁用，双击零重复动作", async () => {
+    // 动作 POST 挂起：第一次点击后在途，按钮必须禁用且第二次点击不再产生动作。
+    const gate = deferred<Response>();
+    installFetch((url, init) => {
+      if (url === ZCODE_CONNECTION_PATH) return json(connection());
+      if (url.startsWith(`${ZCODE_SESSION_PATH}?`)) return json(runningSession());
+      if (url === ZCODE_ACTIONS_PATH && init?.method === "POST") {
+        const body = JSON.parse(String(init.body)) as { actionId: string };
+        return gate.promise.then(() => json(receipt(body.actionId, "accepted")));
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+    render(<ZcodeControlPanel sessionId={SID} />);
+
+    const primary = (await screen.findByTestId("zcode-send")) as HTMLButtonElement;
+    await waitFor(() => expect(primary.getAttribute("data-primary-action")).toBe("stop"));
+
+    fireEvent.click(primary);
+    await waitFor(() => expect(primary).toBeDisabled());
+    expect(primary.getAttribute("data-primary-action")).toBe("disabled");
+    // 双击（以及在途期间的任何点击）都不得产生第二个动作
+    fireEvent.click(primary);
+    fireEvent.click(primary);
+    await act(async () => {});
+    expect(postedActions()).toHaveLength(1);
+
+    await act(async () => {
+      gate.resolve(json(receipt(postedActions()[0].actionId, "accepted")));
+      await Promise.resolve();
+    });
+  });
+
+  it("旧代际（会话投影落后于连接代际）→ 主按钮禁用并带可见原因", async () => {
+    // 连接已推进到下一代，而会话投影还停在旧代：服务端会以 stale_generation 拒收，
+    // 手机侧必须**先**关掉写面（而不是发出去等服务端拒）。
+    installFetch((url, init) => {
+      if (url === ZCODE_CONNECTION_PATH) return json(connection({ generation: GEN + 1 }));
+      if (url.startsWith(`${ZCODE_SESSION_PATH}?`)) return json(runningSession());
+      if (url === ZCODE_ACTIONS_PATH && init?.method === "POST") {
+        const body = JSON.parse(String(init.body)) as { actionId: string };
+        return json(receipt(body.actionId, "accepted"));
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+    render(<ZcodeControlPanel sessionId={SID} />);
+
+    const primary = (await screen.findByTestId("zcode-send")) as HTMLButtonElement;
+    await waitFor(() => expect(primary).toBeDisabled());
+    expect(primary.getAttribute("data-primary-action")).toBe("disabled");
+    const reason = screen.getByTestId("zcode-send-reason");
+    expect(reason.getAttribute("data-reason-code")).toBe("stale_generation");
+
+    fireEvent.click(primary);
+    await act(async () => {});
+    expect(postedActions()).toHaveLength(0);
+  });
+
+  it("打断回执 Unknown → 不自动重发、不假清草稿", async () => {
+    // 回执挂起：在途期间用户继续打字 → Unknown 落地后这段字必须**原样保留**
+    // （打断不是发送：unknown 回执绝不允许借「已清理」之名清掉用户输入）。
+    const gate = deferred<Response>();
+    installFetch((url, init) => {
+      if (url === ZCODE_CONNECTION_PATH) return json(connection());
+      if (url.startsWith(`${ZCODE_SESSION_PATH}?`)) return json(runningSession());
+      if (url === ZCODE_ACTIONS_PATH && init?.method === "POST") {
+        const body = JSON.parse(String(init.body)) as { actionId: string };
+        return gate.promise.then(() => json(receipt(body.actionId, "unknown", "unknown")));
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+    render(<ZcodeControlPanel sessionId={SID} />);
+
+    const primary = (await screen.findByTestId("zcode-send")) as HTMLButtonElement;
+    const draft = screen.getByTestId("zcode-draft") as HTMLTextAreaElement;
+    await waitFor(() => expect(primary.getAttribute("data-primary-action")).toBe("stop"));
+
+    fireEvent.click(primary);
+    await waitFor(() => expect(postedActions()).toHaveLength(1));
+    expect(postedActions()[0].action.kind).toBe("stop");
+
+    // 在途期间用户继续输入（此刻按钮禁用，输入不受影响）
+    fireEvent.change(draft, { target: { value: "在途期间写的字" } });
+
+    await act(async () => {
+      gate.resolve(json(receipt(postedActions()[0].actionId, "unknown", "unknown")));
+      await Promise.resolve();
+    });
+
+    // Unknown 之后不得自动重发（也不得补发任何动作）
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(postedActions()).toHaveLength(1);
+    expect(postedActions().filter(({ action }) => action.kind === "send")).toHaveLength(0);
+    // 不假清草稿：unknown 回执不清用户输入
+    expect(draft.value).toBe("在途期间写的字");
+    const status = screen.getByTestId("zcode-action-status");
+    expect(status.getAttribute("data-action-state")).toBe("unknown");
   });
 });
 
@@ -850,8 +1104,9 @@ describe("ZCode 控制面板：写面门禁（paired + ready）", () => {
     ) as HTMLButtonElement;
     const model = screen.getByTestId("zcode-model-select") as HTMLSelectElement;
     const thought = screen.getByTestId("zcode-thought-select") as HTMLSelectElement;
-    const interrupt = screen.getByTestId("zcode-interrupt") as HTMLButtonElement;
-    for (const control of [option, submit, model, thought, interrupt]) {
+    // R5/U3：独立打断行已删除——打断位并入主按钮，陈旧投影下同样禁用。
+    const primary = screen.getByTestId("zcode-send") as HTMLButtonElement;
+    for (const control of [option, submit, model, thought, primary]) {
       expect(control).toBeVisible();
       expect(control).toBeDisabled();
     }
@@ -865,14 +1120,17 @@ describe("ZCode 控制面板：写面门禁（paired + ready）", () => {
     expect(screen.getByTestId("zcode-selection-reason").getAttribute("data-reason-code")).toBe(
       "not_ready"
     );
-    expect(screen.getByTestId("zcode-interrupt-reason").getAttribute("data-reason-code")).toBe(
+    // 主按钮旁的原因（不再有独立的打断原因行）
+    expect(screen.getByTestId("zcode-send-reason").getAttribute("data-reason-code")).toBe(
       "not_ready"
     );
+    expect(screen.queryByTestId("zcode-interrupt")).toBeNull();
+    expect(screen.queryByTestId("zcode-interrupt-reason")).toBeNull();
 
     // 可见组内的点击/改值均零动作 POST（隐藏组不参与本断言）。
     fireEvent.click(option);
     fireEvent.click(submit);
-    fireEvent.click(interrupt);
+    fireEvent.click(primary);
     fireEvent.change(model, { target: { value: "model-a" } });
     fireEvent.change(thought, { target: { value: "low" } });
     await act(async () => {});
@@ -1598,7 +1856,8 @@ describe("ZCode 控制面板：原因码 zh/en 全覆盖", () => {
     expect(selectionReason.textContent).toBe(
       "This action still needs confirmation in the terminal — continue there"
     );
-    const interruptReason = screen.getByTestId("zcode-interrupt-reason");
+    // R5/U3：独立打断行删除后，多目标歧义的原因并到主按钮旁（不再有第二行原因）。
+    const interruptReason = screen.getByTestId("zcode-send-reason");
     expect(interruptReason.getAttribute("data-reason-code")).toBe("target_ambiguous");
     expect(interruptReason.textContent).toBe(
       "Multiple tasks can be interrupted — choose one in the terminal"
@@ -1606,7 +1865,9 @@ describe("ZCode 控制面板：原因码 zh/en 全覆盖", () => {
 
     // 控件/无障碍文案同样走英文
     expect(cardIn().getByTestId("zcode-pending-submit").textContent).toBe("Submit");
-    expect(screen.getByTestId("zcode-interrupt").textContent).toBe("Interrupt");
+    // 打断位并入主按钮：运行中且输入为空 → 主按钮文案是 Interrupt
+    expect(screen.getByTestId("zcode-send").textContent).toBe("Interrupt");
+    expect(screen.queryByTestId("zcode-interrupt")).toBeNull();
     expect(screen.getByTestId("zcode-model-select").getAttribute("aria-label")).toBe("Model");
     expect(screen.getByTestId("zcode-thought-select").getAttribute("aria-label")).toBe(
       "Thinking level"

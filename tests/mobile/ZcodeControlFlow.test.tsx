@@ -328,10 +328,14 @@ describe("ZCode 生产流：初始 control 缺失时零 stop 触发", () => {
         await waitFor(() => expect(screen.getByTestId("zcode-send")).toBeEnabled());
       }
 
-      // 没有确认过的前台执行 = 没有打断入口（绝不随取/猜测 stop 目标）。
+      // 没有确认过的前台执行 = 主按钮不在打断位（绝不随取/猜测 stop 目标）。
+      expect(
+        screen.getByTestId("zcode-send").getAttribute("data-primary-mode"),
+        `${shape.label}: primary must not be in the interrupt slot`
+      ).toBe("send");
       expect(
         screen.queryByTestId("zcode-interrupt"),
-        `${shape.label}: interrupt must not be rendered`
+        `${shape.label}: standalone interrupt entry must not be rendered`
       ).toBeNull();
 
       // 发送面同样零写：空草稿点击不产生动作。
@@ -478,8 +482,10 @@ describe("ZCode 生产流：SSE lag 先纠偏 GET 再放写", () => {
     });
 
     const view = render(<ZcodeControlPanel sessionId={SID} />);
-    const initialInterrupt = (await screen.findByTestId("zcode-interrupt")) as HTMLButtonElement;
-    await waitFor(() => expect(initialInterrupt).toBeEnabled());
+    // R5/U3：打断位并入主按钮——运行中且无内容时主按钮就是打断按钮。
+    const initialPrimary = (await screen.findByTestId("zcode-send")) as HTMLButtonElement;
+    await waitFor(() => expect(initialPrimary.getAttribute("data-primary-action")).toBe("stop"));
+    await waitFor(() => expect(initialPrimary).toBeEnabled());
 
     const connectionGets = () => calledUrls().filter((url) => url === ZCODE_CONNECTION_PATH).length;
     const sessionGets = () =>
@@ -501,15 +507,15 @@ describe("ZCode 生产流：SSE lag 先纠偏 GET 再放写", () => {
     // GET 期间与完成之前：零动作 POST（本 mock 对 POST 直接抛错）。
     expect(postBodies()).toHaveLength(0);
 
-    // 纠偏落地 ready=false：打断入口仍在（目标仍存在）但禁用并申报 not_ready。
-    const interrupt = (await screen.findByTestId("zcode-interrupt")) as HTMLButtonElement;
-    await waitFor(() => expect(interrupt).toBeDisabled());
-    expect(screen.getByTestId("zcode-interrupt-reason").getAttribute("data-reason-code")).toBe(
+    // 纠偏落地 ready=false：主按钮仍在打断位（目标仍存在）但禁用并申报 not_ready。
+    const primary = (await screen.findByTestId("zcode-send")) as HTMLButtonElement;
+    await waitFor(() => expect(primary).toBeDisabled());
+    expect(screen.getByTestId("zcode-send-reason").getAttribute("data-reason-code")).toBe(
       "not_ready"
     );
 
-    // ready=false 期间：点击打断 / 发送零动作 POST（写面硬门先于任何写）。
-    fireEvent.click(interrupt);
+    // ready=false 期间：点击主按钮零动作 POST（写面硬门先于任何写）。
+    fireEvent.click(primary);
     fireEvent.change(screen.getByTestId("zcode-draft"), { target: { value: "lag 后草稿" } });
     fireEvent.click(screen.getByTestId("zcode-send"));
     await act(async () => {
