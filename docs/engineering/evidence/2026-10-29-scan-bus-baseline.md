@@ -331,3 +331,9 @@ pid=43004 wall=300.0s cpu=1.77s avgCPU=0.59% scans=10 scansPerMin=2.0
 | dsh | 未特别处理 | 影子库禁用（隔离 F9 已知解析成本） |
 | Active 次数/CPU | 146 / 2.69% | 147·146 / 10.57%·2.61% |
 | Away 次数/CPU | 10 / 0.37% | 10·10 / 3.23%·0.59% |
+
+#### 10.9.4 Fix 1 活体验收（事件唤醒：延后而非丢弃）
+
+- debug 构建的事件目录随 `TUVIS_HOME` 重定向到 `<shadow>/.tuvis/events`（真实 `~/.tuvis/events` 不被消费——首次误写真实目录时确实未触发扫描，已删除）。
+- 影子事件文件 `feedface-0000-4000-8000-000000000002.json` 写入时刻 **11:05:34Z**；日志在 **11:05:39Z** 出现 `scan_bus: scan reason=Event version=4`。
+- 这 5s 正是 Fix 1 的 `event_min_gap = min(档位间隔 30s, 5s)`：上一轮周期扫描在 11:05:34Z，孤立 Event 被**延后**到最小间隔后照常扫描。修复前该事件会落在 <500ms 窗口内被 `return` 丢弃（Away 档下一次周期扫描要等 30s，hook 文件 30s TTL 已过期）——活体行为与设计一致。
