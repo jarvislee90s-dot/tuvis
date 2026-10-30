@@ -25,8 +25,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde_json::{Map, Value};
 
 use super::types::{
-    codes, ActiveWork, AnswerEntry, BoundTarget, ControlView, PendingKind, PendingView,
-    PermissionOptionView, QuestionOption, QuestionView, ZResult, ZcodeError,
+    codes, project_pending_detail, ActiveWork, AnswerEntry, BoundTarget, ControlView, PendingKind,
+    PendingView, PermissionOptionView, QuestionOption, QuestionView, ZResult, ZcodeError,
 };
 
 /// 本册最多保留的 pending 卡数（防巨库/恶意帧撑爆内存；超出丢弃并计数）。
@@ -535,6 +535,9 @@ fn parse_pending(card: &Value, skipped_options: &mut u64) -> Option<PendingView>
             .map(str::to_owned),
         questions,
         options,
+        // R0 复审遗留 I4：Bash 审批的命令正文只在 payload.detail，手机端此前看不到。
+        // 只做只读投影（截断有界），不写日志/账本，也不参与任何应答载荷。
+        detail: project_pending_detail(payload.get("detail")),
     })
 }
 
@@ -1574,6 +1577,7 @@ mod tests {
                     kind: (*kind).to_owned(),
                 })
                 .collect(),
+            detail: None,
         }
     }
 
@@ -1679,5 +1683,60 @@ mod tests {
         let error = build_permission_answer(&hook, "once-id-9")
             .expect_err("hook review is read-only for approval");
         assert!(error.is(codes::INVALID_ANSWER));
+    }
+    // -----------------------------------------------------------------------
+    // R3 / R0 复审 I4：审批卡正文（payload.detail）进入手机视图
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn permission_detail_is_projected_without_touching_answers() {
+        // 官方 `detail` = 工具输入对象（Bash 即 {command,...}）：手机端要能只读展示，
+        // 但绝不进入应答载荷、也绝不被 Debug/序列化日志带出去。
+        let card = json!({
+            "interactionId": "pi-synthetic-detail",
+            "kind": "permission",
+            "anchorRowId": 21,
+            "createdAt": 1_700_000_000_600u64,
+            "payload": {
+                "kind": "permission",
+                "toolCallId": "call_synthetic_detail",
+                "toolName": "Bash",
+                "summary": "synthetic: run a command",
+                "detail": {"command": "rm -rf /tmp/tuvis-scratch", "description": "清理"},
+                "freeText": true,
+                "options": [
+                    {"optionId": "allowOnce", "label": "Allow once", "kind": "allowOnce"},
+                    {"optionId": "denyOnce", "label": "Deny", "kind": "deny"}
+                ]
+            }
+        });
+        let book = book_with(card.clone());
+        let cards = book.pendings();
+        assert_eq!(
+            cards[0].detail.as_deref(),
+            Some(r#"{"command":"rm -rf /tmp/tuvis-scratch","description":"清理"}"#),
+            "对象 detail 取紧凑 JSON"
+        );
+
+        // 应答载荷只有 optionId：正文一个字都不上行。
+        let answer = build_permission_answer(&cards[0], "allowOnce").expect("allow once");
+        assert_eq!(answer, json!({"optionId": "allowOnce"}));
+        assert!(!answer.to_string().contains("rm -rf"));
+
+        // 字符串 detail 原样投影；缺失 → None（不渲染空详情入口）。
+        let mut string_card = card.clone();
+        string_card["payload"]["detail"] = json!("npm test --silent");
+        let book = book_with(string_card);
+        assert_eq!(
+            book.pendings()[0].detail.as_deref(),
+            Some("npm test --silent")
+        );
+        let mut absent = card;
+        absent["payload"]
+            .as_object_mut()
+            .expect("payload")
+            .remove("detail");
+        let book = book_with(absent);
+        assert_eq!(book.pendings()[0].detail, None);
     }
 }

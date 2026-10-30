@@ -13,17 +13,14 @@ import i18n from "@/i18n";
 import {
   isZcodeErrorCode,
   type ActionReceipt,
-  type CapabilityFlag,
-  type CapabilityView,
   type ConnectionView,
   type ControlAction,
-  type PendingView,
-  type QuestionView,
   type SessionView,
   type ZcodeErrorCode,
   ZcodeControlApiError,
 } from "@/lib/api/zcodeControl";
 import useZcodeControl from "./useZcodeControl";
+import ZcodePendingCard, { STATUS_KEYS, zcodeReasonText } from "./ZcodePendingCard";
 import ZcodeQueuePanel from "./ZcodeQueuePanel";
 import {
   attachmentMarkup,
@@ -39,52 +36,11 @@ interface ZcodeControlPanelProps {
 }
 
 /**
- * 冻结原因码 → 本地化文案键（21 码全覆盖；`Record<ZcodeErrorCode, string>` 保证漏码
- * 在编译期报错）。码本身只进 `data-reason-code`，用户只看到这里的本地化文案。
+ * 冻结原因码 → 本地化文案键。词表随待处理卡一起下沉到
+ * [`ZcodePendingCard`](./ZcodePendingCard.tsx)（面板消费该组件，词表留在面板会形成
+ * 循环 import）；此处按原名 re-export，既有导入方与测试不受影响。
  */
-export const ZCODE_REASON_KEYS: Record<ZcodeErrorCode, string> = {
-  needs_config: "mobile.zcodeControl.reasonNeedsConfig",
-  needs_auth: "mobile.zcodeControl.reasonNeedsAuth",
-  offline: "mobile.zcodeControl.reasonOffline",
-  conflict: "mobile.zcodeControl.reasonConflict",
-  unknown: "mobile.zcodeControl.reasonUnknown",
-  not_ready: "mobile.zcodeControl.reasonNotReady",
-  unsupported_protocol: "mobile.zcodeControl.reasonUnsupportedProtocol",
-  // 账本/静态知识判死的**永久**不支持（Rust codes::UNSUPPORTED）：给专文案，不落中性兜底。
-  unsupported: "mobile.zcodeControl.reasonUnsupported",
-  // 协议身份不一致（命令 clientId ≠ 握手身份）：确定性客户端缺陷，提示升级/反馈，不重试。
-  client_mismatch: "mobile.zcodeControl.reasonClientMismatch",
-  needs_evidence: "mobile.zcodeControl.reasonNeedsEvidence",
-  no_session: "mobile.zcodeControl.reasonNoSession",
-  target_ambiguous: "mobile.zcodeControl.reasonTargetAmbiguous",
-  stale_generation: "mobile.zcodeControl.reasonStaleGeneration",
-  stale_pending: "mobile.zcodeControl.reasonStalePending",
-  invalid_action: "mobile.zcodeControl.reasonInvalidAction",
-  invalid_answer: "mobile.zcodeControl.reasonInvalidAnswer",
-  forbidden_option: "mobile.zcodeControl.reasonForbiddenOption",
-  action_payload_conflict: "mobile.zcodeControl.reasonActionPayloadConflict",
-  storage_failed: "mobile.zcodeControl.reasonStorageFailed",
-  payload_too_large: "mobile.zcodeControl.reasonPayloadTooLarge",
-  stop_target_changed: "mobile.zcodeControl.reasonStopTargetChanged",
-};
-
-/** 原因码 → 当前语言的用户文案；词表外的码一律中性兜底（绝不回显码原文）。 */
-export function zcodeReasonText(code: string): string {
-  const key = isZcodeErrorCode(code)
-    ? ZCODE_REASON_KEYS[code]
-    : "mobile.zcodeControl.reasonUnknown";
-  return i18n.t(key);
-}
-
-/** 回执状态 → 本地化文案键：accepted/confirmed/unknown 三种语义互不冒充 */
-const STATUS_KEYS: Record<string, string> = {
-  accepted: "mobile.zcodeControl.statusAccepted",
-  confirmed: "mobile.zcodeControl.statusConfirmed",
-  noop: "mobile.zcodeControl.statusNoop",
-  rejected: "mobile.zcodeControl.statusRejected",
-  send_failed: "mobile.zcodeControl.statusSendFailed",
-  unknown: "mobile.zcodeControl.statusUnknown",
-};
+export { ZCODE_REASON_KEYS, zcodeReasonText } from "./ZcodePendingCard";
 
 /**
  * 写面硬门：`connection.state === "paired"` **且** `session.ready === true` 才放行。
@@ -103,330 +59,6 @@ function actionGateReason(
   }
   if (session === null || !session.ready) return "not_ready";
   return null;
-}
-
-interface PendingCardProps {
-  pending: PendingView;
-  sessionId: string;
-  generation: number;
-  capabilities: CapabilityView;
-  /** 写面硬门原因（paired + ready）；null = 门开。陈旧投影绝不可点。 */
-  gateReason: string | null;
-  /** 全局动作在途（hook.submitting）：在途期间作答/审批面一并禁用。 */
-  submitting: boolean;
-  /** 宿主会话投影修订号：变化 = 宿主已推进，受理锁定随新投影重开。 */
-  revision: number | null;
-  submit: (action: ControlAction) => Promise<ActionReceipt>;
-}
-
-/** 单张 pending 卡：只读呈现 + 宿主原值回传；关闭的能力面禁用并说明原因。 */
-function PendingCard({
-  pending,
-  sessionId,
-  generation,
-  capabilities,
-  gateReason,
-  submitting,
-  revision,
-  submit,
-}: PendingCardProps) {
-  /** 每题的宿主选项原值集合：单选恒 0/1 个，多选按点击顺序累加（toggle 增删）。 */
-  const [picked, setPicked] = useState<Record<string, string[]>>({});
-  const [freeAnswers, setFreeAnswers] = useState<Record<string, string>>({});
-  const snoozedRef = useRef(false);
-  /** 同帧双击闸：一次用户动作只允许一个在途 POST（actionId 不重复生成）。 */
-  const inFlightRef = useRef(false);
-  /** 敏感作答的即时值：失焦清可见态，提交仍能带上本次输入（仅内存，不落存储）。 */
-  const sensitiveRef = useRef<Record<string, string>>({});
-  /**
-   * 本卡已受理/已生效的锁定：在宿主 pending/session 推进（revision 变化）前，
-   * 作答/审批面一律不可再点——同一份答案绝不换新 actionId 重发。
-   */
-  const [settledState, setSettledState] = useState<"accepted" | "confirmed" | null>(null);
-  const settledRef = useRef(false);
-  /** snooze POST 在途：提交禁用并显示「正在暂停计时」（不静默吞掉用户点击）。 */
-  const [snoozeInFlight, setSnoozeInFlight] = useState(false);
-
-  // 宿主投影推进才解锁受理态；初始挂载（settled 为空）是幂等的。
-  useEffect(() => {
-    settledRef.current = false;
-    setSettledState(null);
-  }, [revision]);
-
-  /** 一次动作一个在途槽：同帧重入/受理后重入一律丢弃，不产生第二个 actionId。 */
-  const submitOnce = (action: ControlAction, onSettled?: () => void): boolean => {
-    if (inFlightRef.current || settledRef.current) return false;
-    inFlightRef.current = true;
-    void submit(action)
-      .then((receipt) => {
-        // snooze 只暂停计时，不锁卡；作答/审批的受理/生效才进入锁定态。
-        if (action.kind === "snooze") return;
-        if (receipt.state === "accepted" || receipt.state === "confirmed") {
-          settledRef.current = true;
-          setSettledState(receipt.state);
-        }
-      })
-      .catch(() => {})
-      .finally(() => {
-        inFlightRef.current = false;
-        onSettled?.();
-      });
-    return true;
-  };
-
-  const isPermission = pending.kind === "permission";
-  const isUserInput = pending.kind === "userInput";
-  const flagFor = (question: QuestionView): CapabilityFlag =>
-    question.multiSelect ? capabilities.multiSelect : capabilities.singleSelect;
-  // 仅 allowOnce/deny 可回传；fullAccess 及其他永久/未知 kind 不渲染。
-  const permissionOptions = pending.options.filter(
-    (option) => option.kind === "allowOnce" || option.kind === "deny"
-  );
-
-  // 卡片级只展示首个关闭原因：阅读面照常，作答面禁用。
-  // 写面硬门优先于能力矩阵：连接未配对 / 投影 ready=false → 全套作答面零写。
-  // 审批卡过滤后无可选 option（宿主只给 fullAccess/未知 kind）→ 一样要就地说明，
-  // 否则卡片只剩摘要、无按钮也无原因（用户只会以为卡坏了）。
-  const capabilityBlocked: CapabilityFlag | null = isPermission
-    ? capabilities.approvalReply.enabled
-      ? permissionOptions.length === 0
-        ? { enabled: false, reasonCode: "unsupported_protocol" }
-        : null
-      : capabilities.approvalReply
-    : isUserInput
-      ? (pending.questions
-          .flatMap((question) => [
-            flagFor(question),
-            ...(question.freeTextAllowed ? [capabilities.freeText] : []),
-          ])
-          .find((flag) => !flag.enabled) ?? null)
-      : { enabled: false, reasonCode: "unsupported_protocol" };
-  const blocked: CapabilityFlag | null =
-    gateReason !== null ? { enabled: false, reasonCode: gateReason } : capabilityBlocked;
-  // 按码如实呈现：每个冻结原因码都有独立 zh/en 文案（表外码才用中性兜底）；
-  // 仅当服务端未给原因码时退回「该作答形态暂未开放」的上下文说明。
-  const blockedText =
-    blocked?.reasonCode != null
-      ? zcodeReasonText(blocked.reasonCode)
-      : i18n.t("mobile.zcodeControl.pendingBlocked");
-
-  /** auto_resolution：首次有效编辑补发一次 snooze（尽力而为，不阻塞渲染）。 */
-  const snoozeOnce = () => {
-    if (gateReason !== null) return; // 陈旧投影不发 snooze（写面硬门）
-    if (!pending.autoResolution || snoozedRef.current) return;
-    if (inFlightRef.current || settledRef.current) return;
-    snoozedRef.current = true;
-    setSnoozeInFlight(true);
-    // 与最终提交共用卡片级在途槽；结束（无论成败）复位可见提示。
-    const started = submitOnce(
-      {
-        kind: "snooze",
-        sessionId,
-        generation,
-        interactionId: pending.interactionId,
-      },
-      () => setSnoozeInFlight(false)
-    );
-    if (!started) setSnoozeInFlight(false);
-  };
-
-  const submitAnswer = () => {
-    if (blocked !== null || submitting || settledRef.current || inFlightRef.current) return;
-    const answers = pending.questions
-      .map((question) => {
-        // 敏感作答失焦后可见态已清空，提交取本次挂载的内存值（不落任何存储）。
-        const value = pending.sensitive
-          ? (sensitiveRef.current[question.questionText] ?? freeAnswers[question.questionText])
-          : freeAnswers[question.questionText];
-        const text = value?.length ? value : null;
-        // 兜底：一次作答只允许一类——有文本就丢弃选中项，否则 freeText 恒 null。
-        // （交互层已互斥；这里防历史状态/异常路径把两类混着上送给宿主。）
-        return {
-          questionText: question.questionText,
-          selectedValues: text !== null ? [] : (picked[question.questionText] ?? []),
-          freeText: text,
-        };
-      })
-      .filter((answer) => answer.selectedValues.length > 0 || answer.freeText !== null);
-    if (answers.length === 0) return;
-    submitOnce({
-      kind: "answer",
-      sessionId,
-      generation,
-      interactionId: pending.interactionId,
-      answers,
-    });
-  };
-
-  // 仅 allowOnce/deny 可回传（`permissionOptions` 已在能力闸处算好）；
-  // fullAccess 及其他永久/未知 kind 不渲染。
-  let optionIndex = 0;
-
-  return (
-    <div
-      data-testid="zcode-pending-card"
-      data-interaction-id={pending.interactionId}
-      className="mb-2 rounded-lg border border-[var(--cb)] px-3 py-2"
-    >
-      {pending.toolName !== null && <p className="text-xs text-[var(--mut)]">{pending.toolName}</p>}
-      {pending.summary !== null && <p className="text-sm text-[var(--tx)]">{pending.summary}</p>}
-      {isPermission &&
-        permissionOptions.map((option) => (
-          <button
-            key={option.optionId}
-            type="button"
-            data-testid={`zcode-permission-option-${option.optionId}`}
-            disabled={blocked !== null || submitting || settledState !== null}
-            onClick={() => {
-              if (blocked !== null || submitting || settledRef.current) return;
-              submitOnce({
-                kind: "permission",
-                sessionId,
-                generation,
-                interactionId: pending.interactionId,
-                optionId: option.optionId,
-              });
-            }}
-            className="mt-1 mr-2 rounded-lg border border-[var(--cb)] px-3 py-1 text-sm text-[var(--tx)] disabled:opacity-40"
-          >
-            {option.label}
-          </button>
-        ))}
-      {isUserInput &&
-        pending.questions.map((question, questionIndex) => {
-          const flag = flagFor(question);
-          return (
-            <div key={`${questionIndex}-${question.questionText}`} className="mt-1">
-              <p className="text-sm text-[var(--tx)]">{question.header}</p>
-              <p className="text-sm text-[var(--tx)]">{question.questionText}</p>
-              <div className="mt-1 flex flex-wrap gap-1">
-                {question.options.map((option) => {
-                  const index = optionIndex++;
-                  const selected = picked[question.questionText]?.includes(option.value) === true;
-                  return (
-                    <button
-                      key={option.value}
-                      type="button"
-                      data-testid={`zcode-pending-option-${index}`}
-                      aria-pressed={selected}
-                      disabled={
-                        blocked !== null || submitting || settledState !== null || !flag.enabled
-                      }
-                      onClick={() => {
-                        if (blocked !== null || submitting || settledRef.current || !flag.enabled) {
-                          return;
-                        }
-                        setPicked((prev) => {
-                          const current = prev[question.questionText] ?? [];
-                          // 多选 = toggle（增删，保留点击顺序）；单选 = 替换为本次点击项。
-                          const next = question.multiSelect
-                            ? current.includes(option.value)
-                              ? current.filter((value) => value !== option.value)
-                              : [...current, option.value]
-                            : [option.value];
-                          return { ...prev, [question.questionText]: next };
-                        });
-                        // 互斥：选项生效即清同题自由作答（敏感内存值一并删），
-                        // 否则提交会同时带 selectedValues 与 freeText（宿主要求二选一）。
-                        setFreeAnswers((prev) => {
-                          if (!(question.questionText in prev)) return prev;
-                          const next = { ...prev };
-                          delete next[question.questionText];
-                          return next;
-                        });
-                        delete sensitiveRef.current[question.questionText];
-                        snoozeOnce();
-                      }}
-                      className={`rounded-lg border px-3 py-1 text-sm text-[var(--tx)] disabled:opacity-40 ${
-                        selected ? "border-[var(--btnp)] bg-[var(--btnp)]/10" : "border-[var(--cb)]"
-                      }`}
-                    >
-                      {option.label}
-                    </button>
-                  );
-                })}
-              </div>
-              {question.freeTextAllowed && (
-                <input
-                  type={pending.sensitive ? "password" : "text"}
-                  data-testid={pending.sensitive ? "zcode-pending-sensitive-input" : undefined}
-                  value={freeAnswers[question.questionText] ?? ""}
-                  disabled={
-                    blocked !== null || !capabilities.freeText.enabled || settledState !== null
-                  }
-                  onChange={(event) => {
-                    if (blocked !== null || !capabilities.freeText.enabled) return;
-                    const value = event.target.value;
-                    // 敏感作答只存本次挂载的组件状态，不落任何草稿缓存。
-                    if (pending.sensitive) {
-                      if (value.length > 0) sensitiveRef.current[question.questionText] = value;
-                      else delete sensitiveRef.current[question.questionText];
-                    }
-                    setFreeAnswers((prev) => ({ ...prev, [question.questionText]: value }));
-                    // 互斥：一开始自由作答，同题已选中的选项即失效（只能提交一类）。
-                    setPicked((prev) => {
-                      if (!(question.questionText in prev)) return prev;
-                      const next = { ...prev };
-                      delete next[question.questionText];
-                      return next;
-                    });
-                    snoozeOnce();
-                  }}
-                  onBlur={() => {
-                    // 敏感输入失焦即清可见值（防肩窥/留屏）；提交值仍取本次内存副本。
-                    if (!pending.sensitive) return;
-                    setFreeAnswers((prev) => {
-                      const next = { ...prev };
-                      delete next[question.questionText];
-                      return next;
-                    });
-                  }}
-                  className="mt-1 w-full rounded-lg border border-[var(--cb)] px-3 py-1 text-sm text-[var(--tx)] disabled:opacity-40"
-                />
-              )}
-            </div>
-          );
-        })}
-      {isUserInput && (
-        <button
-          type="button"
-          data-testid="zcode-pending-submit"
-          disabled={blocked !== null || submitting || settledState !== null}
-          onClick={submitAnswer}
-          className="mt-1 rounded-full bg-[var(--btnp)]/10 px-4 py-1 text-sm text-[var(--tx)] disabled:opacity-40"
-        >
-          {i18n.t("mobile.zcodeControl.submit")}
-        </button>
-      )}
-      {blocked !== null && (
-        <p
-          data-testid="zcode-pending-reason"
-          data-reason-code={blocked.reasonCode ?? "unknown"}
-          className="mt-1 text-xs text-[var(--mut)]"
-        >
-          {blockedText}
-        </p>
-      )}
-      {blocked === null && settledState !== null && (
-        <p
-          data-testid="zcode-pending-notice"
-          data-state={settledState}
-          className="mt-1 text-xs text-[var(--mut)]"
-        >
-          {i18n.t(STATUS_KEYS[settledState])}
-        </p>
-      )}
-      {blocked === null && settledState === null && snoozeInFlight && (
-        <p
-          data-testid="zcode-pending-notice"
-          data-state="snoozing"
-          className="mt-1 text-xs text-[var(--mut)]"
-        >
-          {i18n.t("mobile.zcodeControl.pendingSnoozing")}
-        </p>
-      )}
-    </div>
-  );
 }
 
 export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps) {
@@ -456,6 +88,11 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
   /** 附件闸提示（上传中/存在失败项时点击发送）：瞬态，随下次发送动作清除。 */
   const [attachNotice, setAttachNotice] = useState<"uploading" | "failed" | null>(null);
   const attachInputRef = useRef<HTMLInputElement | null>(null);
+  /**
+   * 当前展示的待处理卡（多组并存时的切组状态）。存 id 而不是下标：宿主增删卡
+   * 不会把选择挪到别的请求上；id 一旦消失则回落到首张（绝不空屏丢卡）。
+   */
+  const [pendingTabId, setPendingTabId] = useState<string | null>(null);
 
   // 仅 send 的 accepted 允许清本次草稿（hook 语义）；失败/拒绝/未知一律保留。
   // 迟到回执竞态：accepted 到达时若草稿已被续写成别的内容，那是**新**输入，必须保留——
@@ -489,6 +126,8 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
     setAttachments([]);
     submittedAttachmentIdsRef.current = null;
     setAttachNotice(null);
+    // 切组选择不跨会话残留（旧会话的 interaction id 在新会话没有意义）。
+    setPendingTabId(null);
     // 抢回面同样不跨会话残留（T8）。
     setTakeoverBusy(false);
     setTakeoverStillConflict(false);
@@ -561,6 +200,16 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
   const gateReason = actionGateReason(connection, session);
   // 发送区原因优先取 hook 的如实连接/回执原因；连接正常但投影未就绪时显示 not_ready。
   const displayReason = reason ?? gateReason;
+
+  /**
+   * 待处理卡的展示组：默认第一张；用户切过的 id 若仍在册就继续用，被宿主撤掉则回落
+   * 首张——其余卡一直挂载（视觉隐藏），所以切组不会丢任何草稿，也绝不丢请求。
+   */
+  const pendings = session?.pending ?? [];
+  const activePendingId =
+    pendings.find((pending) => pending.interactionId === pendingTabId)?.interactionId ??
+    pendings[0]?.interactionId ??
+    null;
 
   /** 一次动作一个在途槽：同帧重入直接丢弃，回执只认第一次提交。 */
   const runOnce = (action: ControlAction) => {
@@ -818,19 +467,65 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
           {i18n.t(STATUS_KEYS[receipt.state] ?? "mobile.zcodeControl.statusUnknown")}
         </p>
       )}
+      {/* 多张 pending 并存：默认只展示一张「当前交互卡」，其余用紧凑小标签切换
+          （「问答 1/3」「审批 2/3」）。切组不删卡——每张卡各自保留草稿与受理锁，
+          绝不会把其他待处理请求静默丢掉。 */}
+      {pendings.length > 1 && (
+        <div
+          data-testid="zcode-pending-tabs"
+          role="tablist"
+          aria-label={i18n.t("mobile.zcodeControl.pendingTabsAria")}
+          className="mb-1 flex flex-wrap gap-1"
+        >
+          {pendings.map((pending, index) => {
+            const selected = pending.interactionId === activePendingId;
+            return (
+              <button
+                key={pending.interactionId}
+                type="button"
+                role="tab"
+                aria-selected={selected}
+                data-testid={`zcode-pending-tab-${pending.interactionId}`}
+                data-active={selected ? "true" : "false"}
+                onClick={() => setPendingTabId(pending.interactionId)}
+                className={`rounded-full border px-2 py-0.5 text-xs ${
+                  selected
+                    ? "border-[var(--btnp)] bg-[var(--btnp)]/10 text-[var(--tx)]"
+                    : "border-[var(--cb)] text-[var(--mut)]"
+                }`}
+              >
+                {i18n.t(
+                  pending.kind === "permission"
+                    ? "mobile.zcodeControl.pendingTabPermission"
+                    : "mobile.zcodeControl.pendingTabQuestion",
+                  { position: index + 1, total: pendings.length }
+                )}
+              </button>
+            );
+          })}
+        </div>
+      )}
       {session !== null &&
-        session.pending.map((pending) => (
-          <PendingCard
-            key={pending.interactionId}
-            pending={pending}
-            sessionId={sessionId}
-            generation={session.generation}
-            capabilities={session.capabilities}
-            gateReason={gateReason}
-            submitting={submitting}
-            revision={session.revision}
-            submit={submit}
-          />
+        pendings.map((pending) => (
+          // key 带代际：interaction 被替换或换代时整卡重挂（草稿/翻页/受理锁一并清空）。
+          // 非当前组仍挂载但视觉隐藏：草稿与锁定各自保留，切回来即恢复。
+          <div
+            key={`${session.generation}:${pending.interactionId}`}
+            data-testid={`zcode-pending-slot-${pending.interactionId}`}
+            data-active={pending.interactionId === activePendingId ? "true" : "false"}
+            hidden={pending.interactionId !== activePendingId}
+          >
+            <ZcodePendingCard
+              pending={pending}
+              sessionId={sessionId}
+              generation={session.generation}
+              capabilities={session.capabilities}
+              gateReason={gateReason}
+              submitting={submitting}
+              revision={session.revision}
+              submit={submit}
+            />
+          </div>
         ))}
       {/* 官方输入队列（只读）：默认一行（数量 + 暂停），点开才列正文。
           放在 pending 卡之后、模型选择之前——运行中发送的排队事实比档位更贴近

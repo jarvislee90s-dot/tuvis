@@ -431,8 +431,9 @@ describe("ZCode 生产流：同代 SSE 新卡无需刷新即可作答（R1）", 
     // 关键：没有补发 GET（新卡凭 SSE 自身即可答）。
     expect(calledUrls().filter((url) => url.startsWith(`${ZCODE_SESSION_PATH}?`))).toHaveLength(1);
 
-    // 点选 + 提交：一次 answer（同一 interaction 原值回传）。
+    // 点选 → 进入确认页（R3：本地暂存，确认后才上行）→ 提交：一次 answer。
     fireEvent.click(option);
+    fireEvent.click(screen.getByTestId("zcode-pending-next"));
     fireEvent.click(screen.getByTestId("zcode-pending-submit"));
     await waitFor(() => expect(postBodies()).toHaveLength(1));
     const posted = postBodies()[0].action;

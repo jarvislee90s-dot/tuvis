@@ -2922,6 +2922,7 @@ mod tests {
                 auto_resolution_state: auto_resolution.then(|| "visibleCountdown".to_owned()),
                 questions,
                 options: Vec::new(),
+                detail: None,
             }
         }
 
@@ -5170,6 +5171,7 @@ mod tests {
                 auto_resolution_state: None,
                 questions: Vec::new(),
                 options,
+                detail: None,
             }
         }
 

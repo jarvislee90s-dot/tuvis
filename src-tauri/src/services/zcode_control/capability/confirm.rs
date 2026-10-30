@@ -531,6 +531,7 @@ mod tests {
             auto_resolution_state: None,
             questions: Vec::new(),
             options: Vec::new(),
+            detail: None,
         }
     }
 

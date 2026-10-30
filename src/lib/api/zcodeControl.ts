@@ -184,6 +184,13 @@ export interface PendingView {
   autoResolutionState: string | null;
   questions: QuestionView[];
   options: PermissionOptionView[];
+  /**
+   * 官方 `payload.detail` 的只读投影（审批卡正文；Bash 即命令正文）。
+   *
+   * 服务端已做有界截断（2000 字符 + `…`）：字符串原样透传，对象/数组取紧凑 JSON，
+   * 缺失/空/null → `null`。手机端只展示，**不**回传、不落任何存储。
+   */
+  detail: string | null;
 }
 
 /** control 里的一条活动（`foregroundExecutionId` 是 stop 守卫 id 的来源）。 */

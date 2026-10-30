@@ -6535,6 +6535,7 @@ mod tests {
                 Vec::new()
             },
             options: Vec::new(),
+            detail: None,
         }
     }
 
@@ -6947,6 +6948,7 @@ mod tests {
                     auto_resolution_state: None,
                     questions: Vec::new(),
                     options: Vec::new(),
+                    detail: None,
                 }],
                 control: Some(ControlView {
                     active_works: vec![ActiveWork {
@@ -9595,6 +9597,7 @@ mod tests {
             auto_resolution_state: None,
             questions: Vec::new(),
             options: Vec::new(),
+            detail: None,
         }
     }
 
