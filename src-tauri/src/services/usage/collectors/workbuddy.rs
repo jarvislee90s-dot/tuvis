@@ -2181,6 +2181,213 @@ mod tests {
         assert!(delta.sessions.iter().any(|s| s.session_id == SUBAGENT_ID));
     }
 
+    // ---- A6：真机形态与增量/回归 ----
+
+    /// **真机 5.9.3 形态**：子代理文件的用量挂在 `function_call` 行的 `message.usage` 上，
+    /// 首条 user 行没有 `isSubAgent` / 没有模型（模型由后续行给出）
+    #[test]
+    fn subagent_usage_on_function_call_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        make_db(dir.path(), &[("s1", "/p/A")]);
+        write_jsonl(
+            dir.path(),
+            "p-A",
+            "s1",
+            &[
+                json!({"type":"message","role":"user","timestamp":1,"cwd":"/p/A","sessionId":"s1",
+                     "content":[{"type":"input_text","text":"hi"}]}),
+            ],
+        );
+        write_subagent_jsonl(
+            dir.path(),
+            "p-A",
+            "s1",
+            &format!("agent-{OTHER_UUID}.jsonl"),
+            &[
+                json!({"type":"message","role":"user","timestamp":1793320359773i64,
+                       "sessionId":SUBAGENT_ID,"cwd":"/p/A"}),
+                json!({"type":"function_call","name":"Bash","timestamp":1793320359800i64,
+                       "callId":"call_real","sessionId":SUBAGENT_ID,"cwd":"/p/A",
+                       "message":{"usage":{"input_tokens":22125,"output_tokens":162,
+                                           "total_tokens":22287,"cache_read_input_tokens":20096}},
+                       "providerData":{"model":"deepseek-v4.1-flash","isSubAgent":true,
+                                       "agent":"general-purpose"}}),
+            ],
+        );
+        let no_cursors = HashMap::new();
+        let (delta, _) = run(dir.path(), &no_cursors);
+        let sub: Vec<_> = delta
+            .details
+            .iter()
+            .filter(|d| d.key.session_id == SUBAGENT_ID)
+            .collect();
+        assert_eq!(sub.len(), 1, "子代理用量必须成为一行明细");
+        assert_eq!(
+            sub[0].requests, 1,
+            "function_call 行上的 usage 也算一次请求"
+        );
+        assert_eq!(sub[0].buckets.cache_read, 20096);
+        assert_eq!(sub[0].buckets.input_fresh, 22125 - 20096);
+        assert_eq!(sub[0].buckets.output, 162);
+        assert_eq!(sub[0].key.model, "deepseek-v4.1-flash");
+        assert_eq!(sub[0].counters.tool_calls, 1);
+        assert_eq!(sub[0].key.project_key, "a", "cwd 归属与父会话一致");
+    }
+
+    /// 两轮增量：第二轮只计**追加**的那一行，不得把已入账的重复计入
+    /// （`usage_detail` / `usage_daily` 是加法账本——重读即双计）
+    #[test]
+    fn subagent_incremental_append_is_not_double_counted() {
+        let dir = tempfile::tempdir().unwrap();
+        make_db(dir.path(), &[("s1", "/p/A")]);
+        write_jsonl(
+            dir.path(),
+            "p-A",
+            "s1",
+            &[
+                json!({"type":"function_call","name":"Bash","timestamp":1000,"callId":"c1",
+                     "cwd":"/p/A","sessionId":"s1",
+                     "message":{"usage":{"input_tokens":100,"output_tokens":10,"total_tokens":110}},
+                     "providerData":{"model":"deepseek-v4.1-flash"}}),
+            ],
+        );
+        let sub_path = write_subagent_jsonl(
+            dir.path(),
+            "p-A",
+            "s1",
+            &format!("agent-{OTHER_UUID}.jsonl"),
+            &[
+                json!({"type":"function_call","name":"Read","timestamp":2000,"callId":"sc1",
+                     "cwd":"/p/A","sessionId":SUBAGENT_ID,
+                     "message":{"usage":{"input_tokens":1000,"output_tokens":100,"total_tokens":1100}},
+                     "providerData":{"model":"deepseek-v4.1-flash","isSubAgent":true}}),
+            ],
+        );
+        let no_cursors = HashMap::new();
+        let (d1, _) = run(dir.path(), &no_cursors);
+        assert_eq!(d1.details.iter().map(|d| d.requests).sum::<i64>(), 2);
+
+        // 第二轮：子代理文件追加一行新的 usage（父文件不动 → L2 快速路）
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&sub_path)
+                .unwrap();
+            writeln!(
+                f,
+                "{}",
+                serde_json::to_string(&json!({"type":"function_call","name":"Bash",
+                    "timestamp":3000,"callId":"sc2","cwd":"/p/A","sessionId":SUBAGENT_ID,
+                    "message":{"usage":{"input_tokens":500,"output_tokens":50,"total_tokens":550}},
+                    "providerData":{"model":"deepseek-v4.1-flash","isSubAgent":true}}))
+                .unwrap()
+            )
+            .unwrap();
+        }
+        let cursors: HashMap<_, _> = d1
+            .cursors
+            .iter()
+            .map(|c| (c.session_id.clone(), c.clone()))
+            .collect();
+        let (d2, _) = run(dir.path(), &cursors);
+        assert_eq!(
+            d2.details.iter().map(|d| d.requests).sum::<i64>(),
+            1,
+            "第二轮只计追加的那一行（重读已入账部分 = 双计）"
+        );
+        assert_eq!(
+            d2.details
+                .iter()
+                .map(|d| d.buckets.input_fresh)
+                .sum::<i64>(),
+            500
+        );
+        assert_eq!(d2.parsed_files, 1, "只有子代理文件真读了（父文件未变）");
+        // 身份跨轮复用（缓存进 state_json，不必每轮重读文件头）
+        let sub_cursor = d2
+            .cursors
+            .iter()
+            .find(|c| c.session_id.contains("subagents"))
+            .unwrap();
+        assert!(
+            sub_cursor.state_json.contains(SUBAGENT_ID),
+            "子代理身份必须缓存在游标状态里：{}",
+            sub_cursor.state_json
+        );
+    }
+
+    /// **主会话零变化（R3 / AC1）**：同一父文件在「无子代理」与「有子代理」两种情形下，
+    /// 父会话的明细逐项相等
+    #[test]
+    fn main_session_numbers_unchanged_with_subagents_present() {
+        let dir = tempfile::tempdir().unwrap();
+        make_db(dir.path(), &[("s1", "/p/A")]);
+        write_jsonl(
+            dir.path(),
+            "p-A",
+            "s1",
+            &[
+                json!({"type":"function_call","name":"Bash","timestamp":1000,"callId":"c1",
+                       "cwd":"/p/A","sessionId":"s1",
+                       "message":{"usage":{"input_tokens":100,"output_tokens":10,"total_tokens":110,
+                                           "cache_read_input_tokens":40}},
+                       "providerData":{"model":"deepseek-v4.1-flash"}}),
+                json!({"type":"function_call_result","name":"Bash","callId":"c1",
+                       "timestamp":1700,"cwd":"/p/A","sessionId":"s1",
+                       "providerData":{"model":"deepseek-v4.1-flash"}}),
+            ],
+        );
+        let no_cursors = HashMap::new();
+        let (before, _) = run(dir.path(), &no_cursors);
+        // 追加一个子代理文件后**重跑一遍**（新游标 → 两文件都从头读）
+        write_subagent_jsonl(
+            dir.path(),
+            "p-A",
+            "s1",
+            &format!("agent-{OTHER_UUID}.jsonl"),
+            &[
+                json!({"type":"function_call","name":"Read","timestamp":2000,"callId":"sc1",
+                     "cwd":"/p/A","sessionId":SUBAGENT_ID,
+                     "message":{"usage":{"input_tokens":999999,"output_tokens":99999,
+                                         "total_tokens":1099998}},
+                     "providerData":{"model":"deepseek-v4.1-flash","isSubAgent":true}}),
+            ],
+        );
+        let (after, _) = run(dir.path(), &no_cursors);
+        let parent_of = |d: &SourceDelta| {
+            let rows: Vec<_> = d
+                .details
+                .iter()
+                .filter(|x| x.key.session_id == "s1")
+                .collect();
+            assert_eq!(rows.len(), 1, "父会话明细行");
+            (
+                rows[0].buckets.input_fresh,
+                rows[0].buckets.cache_read,
+                rows[0].buckets.cache_write,
+                rows[0].buckets.output,
+                rows[0].request_total,
+                rows[0].requests,
+                rows[0].counters.tool_calls,
+                rows[0].counters.tool_ms,
+                rows[0].key.model.clone(),
+                rows[0].key.project_key.clone(),
+            )
+        };
+        assert_eq!(
+            parent_of(&before),
+            parent_of(&after),
+            "子代理文件不得改变父会话的任何数值（R3 / AC1）"
+        );
+        // 总量确实变了（防「子代理其实没采」的假绿）
+        assert_eq!(
+            after.details.iter().map(|d| d.buckets.output).sum::<i64>()
+                - before.details.iter().map(|d| d.buckets.output).sum::<i64>(),
+            99999
+        );
+    }
+
     /// **登记锁（GC 20 / §3.2.2 阻塞 4）**：漏登记不是编译错——`run_collection` 只遍历
     /// `collectors::all()`，这个源会被静默跳过。
     #[test]
