@@ -337,3 +337,10 @@ pid=43004 wall=300.0s cpu=1.77s avgCPU=0.59% scans=10 scansPerMin=2.0
 - debug 构建的事件目录随 `TUVIS_HOME` 重定向到 `<shadow>/.tuvis/events`（真实 `~/.tuvis/events` 不被消费——首次误写真实目录时确实未触发扫描，已删除）。
 - 影子事件文件 `feedface-0000-4000-8000-000000000002.json` 写入时刻 **11:05:34Z**；日志在 **11:05:39Z** 出现 `scan_bus: scan reason=Event version=4`。
 - 这 5s 正是 Fix 1 的 `event_min_gap = min(档位间隔 30s, 5s)`：上一轮周期扫描在 11:05:34Z，孤立 Event 被**延后**到最小间隔后照常扫描。修复前该事件会落在 <500ms 窗口内被 `return` 丢弃（Away 档下一次周期扫描要等 30s，hook 文件 30s TTL 已过期）——活体行为与设计一致。
+
+#### 10.9.5 Fix 4 活体验收（F5：点单卡 X → 卡片 ≤1s 消失）
+
+- 环境同 §10.9：debug 构建（源码含 Fix 4）+ `TUVIS_HOME` 影子目录 + `pnpm dev` 前端 + 合成 WorkBuddy Processing 卡；额外给 WebView2 加 `--remote-debugging-port=9223`，经 CDP 在**真实主窗页面**执行点击与计时（非模拟事件）。
+- 操作：找到卡片头部的「暂不显示（会话状态变化后恢复）」按钮（`dismiss_session_card` 路径），记录 `performance.now()` 后 `btn.click()`，每 20ms 轮询卡片项目名是否从 DOM 消失。
+- 实际结果：**`{"gone":true,"elapsedMs":75,"polls":2}`** —— 卡片在点击后 **75ms** 消失（门禁 ≤1s），与「命令内同步补扫 + 成功后 invalidateQueries」的设计一致。
+- 测后已清理合成夹具与调试端口，安装版重启。
