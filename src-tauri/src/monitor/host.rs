@@ -46,6 +46,13 @@ pub fn is_host_process(exe_lower: &str, tool_id: &str) -> bool {
 /// 都复用该快照，不另起扫描——issue #35-4）
 pub fn tool_host_alive_in(system: &sysinfo::System, tool_id: &str) -> bool {
     system.processes().iter().any(|(_, p)| {
+        // Fix 5：与两段式候选白名单**同源**的预滤（`adapter::HOST_PROCESS_NAMES` +
+        // 解释器表）。非候选进程在第二段不读 exe/cmd，其判定必然 false；按同一张
+        // 名字表先短路，白名单与判定口径不再靠两份手写清单同步
+        let name = crate::adapter::bare_name(&p.name().to_string_lossy());
+        if !crate::adapter::name_may_host_tool(&name, tool_id) {
+            return false;
+        }
         // 会话 sidecar 不判宿主（issue #35-5，spec §5 孤儿防线）：Windows 上 sidecar
         // 与主进程 exe 同名（均为 WorkBuddy.exe），exe 路径判据区分不了，只能按
         // cmdline 里的 cli/bin/codebuddy 脚本路径排除；macOS 该路径在 exe 内，
@@ -251,5 +258,18 @@ mod tests {
             "/applications/zcode.app/contents/macos/zcode",
             "workbuddy"
         ));
+    }
+
+    /// Fix 5：宿主存活判定必须经**同一份宿主名表**预滤（与两段式候选白名单同源）——
+    /// 白名单漏名时第二段不读该进程的 exe/cmd，宿主判不出、该工具卡片整批消失。
+    /// 源码锁用 concat! 拆分，避免 include_str! 自我命中。
+    #[test]
+    fn host_alive_check_uses_shared_name_table() {
+        let src = include_str!("host.rs");
+        let needle = concat!("name_may_host", "_tool");
+        assert!(
+            src.contains(needle),
+            "tool_host_alive_in 必须经 name_may_host_tool 预滤（与候选白名单同源）"
+        );
     }
 }

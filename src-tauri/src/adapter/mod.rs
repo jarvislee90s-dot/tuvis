@@ -590,7 +590,7 @@ fn event_payload(event: Option<&crate::monitor::hooks::HookEvent>) -> Option<&st
 /// 进程名归一：取 basename（兼容 `/`、`\` 两种分隔符）→ 小写 → 去 `.exe`。
 /// sysinfo 各平台 name 形态不一（Windows 实测带 `.exe`，macOS 多为裸名），
 /// 候选匹配与白名单构建统一走此口径，避免大小写/扩展名差异导致漏配
-fn bare_name(name: &str) -> String {
+pub(crate) fn bare_name(name: &str) -> String {
     let base = name
         .rsplit(['/', '\\'])
         .next()
@@ -599,41 +599,58 @@ fn bare_name(name: &str) -> String {
     base.strip_suffix(".exe").unwrap_or(&base).to_string()
 }
 
+/// npm-shim 宿主解释器：工具实际进程名常是解释器（node/bun 等），
+/// 两段式第二段必须读其 cmd 才能判定，宿主判定也须放行这些名字
+pub(crate) const INTERPRETER_PROCESS_NAMES: &[&str] = &["node", "bun", "python", "python3", "deno"];
+
+/// 工具 id → 宿主进程名（小写裸名）。**单一事实源**：两段式候选白名单与
+/// `monitor::host::tool_host_alive_in` 的预滤共用本表——表里漏一个名字，
+/// 第二段就不读该进程的 exe/cmd，宿主判不出、该工具整批卡片被过滤。
+/// 条目来源以 `monitor/host.rs::is_host_process` 的现有判据为准：
+/// - workbuddy：Windows 安装形态 WorkBuddy.exe；macOS 主可执行体是 Electron；
+/// - codex：Windows MSIX 桌面端 ChatGPT.exe / macOS chatgpt.app 主进程 / codex.app 主进程；
+/// - zcode：Electron APP 主进程可执行名恰为 ZCode（macOS）/ ZCode.exe（Windows）；
+/// - dsh：桌面宿主 DeepSeek Harness(.exe)；web 宿主是 node（解释器表覆盖，靠 cmdline 判定）。
+pub(crate) const HOST_PROCESS_NAMES: &[(&str, &[&str])] = &[
+    ("workbuddy", &["workbuddy", "electron"]),
+    ("codex", &["chatgpt", "codex"]),
+    ("zcode", &["zcode"]),
+    ("dsh", &["deepseek harness"]),
+];
+
+/// 该工具的宿主进程名表（未登记工具返回空表）
+pub(crate) fn host_process_names(tool_id: &str) -> &'static [&'static str] {
+    HOST_PROCESS_NAMES
+        .iter()
+        .find(|(id, _)| *id == tool_id)
+        .map(|(_, names)| *names)
+        .unwrap_or(&[])
+}
+
+/// 该进程名是否可能承载该工具的宿主：命中宿主名表，或（npm-shim 场景）是解释器
+pub(crate) fn name_may_host_tool(name: &str, tool_id: &str) -> bool {
+    INTERPRETER_PROCESS_NAMES.contains(&name) || host_process_names(tool_id).contains(&name)
+}
+
 /// 扫描候选进程名白名单（全部小写归一、升序去重）。
 ///
 /// 两段式进程刷新的第一段只读名字层，第二段仅对候选 PID 读 cmd/cwd/exe/cpu。
-/// 白名单 =
-/// - 解释器（npm-shim 宿主：dsh 等工具的实际进程名是 node/bun，需读 cmd 才能判定）；
-/// - 全部 adapter 声明的 `process_names()`（经 [`bare_name`] 归一，如 `Codex`）；
-/// - 审计补白的特殊宿主名——名字不在 `process_names()` 里、但按 exe/cmd 发现：
-///   - `zcode`：`discover_zcode_host` 逐进程判定 exe/name（Windows 宿主 ZCode.exe），
-///     候选缺失则 exe/cmd 为空、宿主判不出 → 全部卡片消失；
-///   - `workbuddy`：心跳目录驱动发现，按 pid 回读 exe/cpu（宿主 WorkBuddy.exe）；
-///   - `chatgpt`：Windows Codex 桌面端为 MSIX（宿主 ChatGPT.exe），codex 的
-///     MSIX 形态分类与 `tool_host_alive_in` 依赖其 exe；
-///   - `deepseek harness`：dsh 声明空 `process_names()`（web 宿主名字是 node、靠 cmd
-///     判定），但桌面宿主进程名是 `DeepSeek Harness(.exe)`（Windows 安装形态见
-///     `docs/engineering/evidence/dsh-native-rpc/windows-report.md`）——漏名则第二段
-///     不读其 cmd，`find_dsh_processes` 因 `cmd.is_empty()` 跳过、`tool_host_alive_in`
-///     误判宿主死亡，dsh 卡片消失且未读池被清；
-///   - `electron`：macOS 上 WorkBuddy 的可执行体是
-///     `workbuddy.app/Contents/MacOS/Electron`（见 `monitor/host.rs` 的
-///     `is_host_process`），进程名即 `Electron`——漏名则其 exe 不读，宿主判不出。
-///     取舍：macOS 上全部 Electron 应用都会进候选集（多读若干进程的 cmd/cwd/exe），
-///     仍是全部进程的极小子集（约数十个），换取 WorkBuddy 桌面端不被误杀。
+/// 白名单 = 解释器表（npm-shim 宿主）+ **宿主名表**（单一事实源，见
+/// [`HOST_PROCESS_NAMES`]）+ 全部 adapter 声明的 `process_names()`（经 [`bare_name`] 归一）。
+/// 宿主名表与 `monitor::host::tool_host_alive_in` 的预滤同源：这张表漏一个名字，
+/// 第二段就不读该进程的 exe/cmd，宿主判不出、该工具整批卡片被过滤。
+/// 取舍：macOS 上全部 Electron 应用都会进候选集（多读若干进程的 cmd/cwd/exe），
+/// 仍是全部进程的极小子集（约数十个），换取 WorkBuddy 桌面端不被误杀。
 pub(crate) fn candidate_process_names(adapter_names: &[&[&str]]) -> Vec<String> {
-    let mut v: Vec<String> = vec![
-        "node".into(),
-        "bun".into(),
-        "python".into(),
-        "python3".into(),
-        "deno".into(),
-        "zcode".into(),
-        "workbuddy".into(),
-        "chatgpt".into(),
-        "deepseek harness".into(),
-        "electron".into(),
-    ];
+    let mut v: Vec<String> = INTERPRETER_PROCESS_NAMES
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    for (_, host_names) in HOST_PROCESS_NAMES {
+        for n in *host_names {
+            v.push(bare_name(n));
+        }
+    }
     for names in adapter_names {
         for n in *names {
             v.push(bare_name(n));
@@ -742,6 +759,58 @@ mod candidate_whitelist_tests {
         assert!(
             names.windows(2).all(|w| w[0] < w[1]),
             "候选白名单须有序去重"
+        );
+    }
+
+    /// Fix 5：宿主名表是**单一事实源**——两段式候选白名单与宿主存活判定共用它。
+    /// 表驱动、零进程依赖：白名单漏一个宿主名 → 第二段不读其 exe/cmd → 该工具
+    /// 整批卡片被过滤（历史事故），本用例在无任何工具运行的机器上也必须通过。
+    #[test]
+    fn host_process_names_are_all_in_candidate_whitelist() {
+        let names = candidate_process_names(&[]);
+        for (tool, hosts) in HOST_PROCESS_NAMES {
+            assert!(!hosts.is_empty(), "{tool} 的宿主名表不得为空");
+            for host in *hosts {
+                let bare = bare_name(host);
+                assert_eq!(
+                    bare, *host,
+                    "宿主名表条目必须是已归一的小写裸名（{tool}/{host}）"
+                );
+                assert!(
+                    names.contains(&bare),
+                    "{tool} 的宿主名 {host} 未进候选白名单（两段式不会读其 exe/cmd，宿主判不出）"
+                );
+                assert!(
+                    name_may_host_tool(&bare, tool),
+                    "{tool} 的宿主名 {host} 必须通过宿主判定预滤"
+                );
+                assert!(
+                    host_process_names(tool).contains(&host),
+                    "{tool} 的宿主判定必须取自同一张表"
+                );
+            }
+        }
+        // npm-shim 宿主：工具实际进程名是解释器，候选白名单与宿主判定都要放行
+        for interp in INTERPRETER_PROCESS_NAMES {
+            assert!(
+                names.contains(&interp.to_string()),
+                "解释器 {interp} 未进候选白名单"
+            );
+            assert!(
+                name_may_host_tool(interp, "dsh"),
+                "dsh web 宿主可能是解释器进程（{interp}）"
+            );
+            assert!(
+                name_may_host_tool(interp, "workbuddy"),
+                "npm-shim 工具的宿主可能是解释器进程（{interp}）"
+            );
+        }
+        // 负例：不相干的进程名不得被宿主预滤放行
+        assert!(!name_may_host_tool("codex", "workbuddy"));
+        assert!(!name_may_host_tool("explorer", "zcode"));
+        assert!(
+            host_process_names("unknown-tool").is_empty(),
+            "未登记工具不得凭空获得宿主名"
         );
     }
 
