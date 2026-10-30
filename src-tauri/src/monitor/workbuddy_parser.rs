@@ -289,6 +289,95 @@ fn resolve_title(
         .map(|t| t.chars().take(60).collect::<String>())
 }
 
+/// workbuddy.db 的一行「近期活跃会话」（R2 看板兜底的数据源）。
+///
+/// `activity_ms` 的取值**必须是 `MAX(last_activity_at, updated_at)`**：
+/// 真机 5.9.3 的 `last_activity_at` 冻结在心跳注册时刻（与心跳 `updatedAt` 同刻），
+/// 只有 `updated_at` 随父会话写入刷新；用 COALESCE 取 `last_activity_at` 时，
+/// 真机 12:00 实测「两个活跃会话」一个都查不出来（`COALESCE(...) >= now-300s` → 0 行）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WbDbSession {
+    pub id: String,
+    pub cwd: String,
+    /// `COALESCE(NULLIF(custom_title,''), title)`（标题的 COALESCE 不受本条裁决影响）
+    pub title: Option<String>,
+    /// 原始 `status`（真机实测只有 `working` / `completed`）
+    pub status: String,
+    /// `MAX(last_activity_at, updated_at)`（epoch ms）
+    pub activity_ms: i64,
+}
+
+/// 读取 `workbuddy.db` 中 `since_ms` 之后活跃的会话（R2）。
+///
+/// * **只读**打开（`open_readonly_with_timeout`）：失败 → 空表 + `log::warn!`，
+///   看板降级回心跳路径，**不 panic、不报错**（design §3.6）；
+/// * `deleted_at IS NULL OR deleted_at <= 0`：cloud 形态以 **-1** 表示未删
+///   （打包代码 15 处 `deleted_at = -1` 实证）；
+/// * `last_activity_at` 为 NULL 时退到 `updated_at`。**不是 COALESCE 取活动时间**：
+///   `CASE WHEN last_activity_at IS NULL THEN updated_at ELSE MAX(...) END` 在
+///   「非 NULL 但已冻结」的场合仍取两者较大值，语义与 `MAX` 一致（SQLite 的标量
+///   `max(a, NULL)` 会返回 NULL，直接写 `MAX` 会把 NULL 行整行滤掉）。
+pub fn recent_db_sessions(home: &Path, since_ms: i64) -> Vec<WbDbSession> {
+    let db = home.join(".workbuddy").join("workbuddy.db");
+    let Some(conn) = super::sqlite::open_readonly_with_timeout(&db) else {
+        // 未安装 / 打不开 / 被锁：看板降级（心跳路径仍工作），不是错误
+        log::debug!(
+            "workbuddy: 打开 {} 失败，看板 DB 兜底本轮跳过",
+            db.display()
+        );
+        return Vec::new();
+    };
+    let mut stmt = match conn.prepare(
+        "SELECT id, cwd, title, status, activity FROM (
+            SELECT id,
+                   cwd,
+                   COALESCE(NULLIF(custom_title,''), title) AS title,
+                   status,
+                   CASE WHEN last_activity_at IS NULL THEN updated_at
+                        ELSE MAX(last_activity_at, updated_at) END AS activity
+            FROM sessions
+            WHERE (deleted_at IS NULL OR deleted_at <= 0)
+         )
+         WHERE activity >= ?1
+         ORDER BY activity DESC",
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            // 版本漂移（列缺失）/ 库损坏：看板降级，不 panic
+            log::warn!(
+                "workbuddy: 读取 {} 的活跃会话失败（看板 DB 兜底本轮跳过）: {e}",
+                db.display()
+            );
+            return Vec::new();
+        }
+    };
+    let rows = stmt.query_map([since_ms], |r| {
+        Ok(WbDbSession {
+            id: r.get::<_, Option<String>>(0)?.unwrap_or_default(),
+            cwd: r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+            title: r.get::<_, Option<String>>(2)?,
+            status: r.get::<_, Option<String>>(3)?.unwrap_or_default(),
+            activity_ms: r.get::<_, Option<i64>>(4)?.unwrap_or(0),
+        })
+    });
+    let Ok(rows) = rows else {
+        log::warn!(
+            "workbuddy: 查询 {} 的活跃会话失败（看板 DB 兜底本轮跳过）",
+            db.display()
+        );
+        return Vec::new();
+    };
+    rows.filter_map(|r| match r {
+        Ok(row) if !row.id.is_empty() => Some(row),
+        Ok(_) => None, // id 为 NULL / 空串的行跳过（防御）
+        Err(e) => {
+            log::warn!("workbuddy: 会话行读取失败（跳过该行）: {e}");
+            None
+        }
+    })
+    .collect()
+}
+
 fn heartbeat_path(home: &Path, pid: u32) -> PathBuf {
     home.join(".workbuddy")
         .join("sessions")
@@ -1651,6 +1740,116 @@ mod observation_restore_tests {
         );
         assert_eq!(last_seen.get(&7).unwrap().1, "live-session");
         assert_eq!(last_seen.get(&8).unwrap().1, "restored");
+    }
+}
+
+#[cfg(test)]
+mod db_activity_tests {
+    use super::*;
+
+    const NOW: i64 = 1_793_343_808_404; // 真机快照时刻量级（ms）
+
+    /// 构造最小 workbuddy.db（列子集与真机一致：`last_activity_at` 可空、`deleted_at` 为整数）
+    fn seed(home: &Path, rows: &[(&str, &str, Option<i64>, i64, Option<i64>)]) {
+        let dir = home.join(".workbuddy");
+        std::fs::create_dir_all(&dir).unwrap();
+        let conn = rusqlite::Connection::open(dir.join("workbuddy.db")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                cwd TEXT NOT NULL,
+                title TEXT,
+                custom_title TEXT,
+                status TEXT NOT NULL DEFAULT 'Pending',
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                last_activity_at INTEGER,
+                deleted_at INTEGER
+            );",
+        )
+        .unwrap();
+        for (id, status, last_activity, updated_at, deleted_at) in rows {
+            conn.execute(
+                "INSERT INTO sessions (id, cwd, title, custom_title, status, created_at,
+                                       updated_at, last_activity_at, deleted_at)
+                 VALUES (?1, '/p/A', '标题', NULL, ?2, 0, ?3, ?4, ?5)",
+                rusqlite::params![id, status, updated_at, last_activity, deleted_at],
+            )
+            .unwrap();
+        }
+    }
+
+    /// **活性必须用 `MAX(last_activity_at, updated_at)`**：真机 5.9.3 的
+    /// `last_activity_at` 冻结在心跳注册时刻，只有 `updated_at` 随父会话写入刷新。
+    /// 用 COALESCE 取 `last_activity_at` → 真机实测 **0 行**（两个活跃会话全被丢掉）。
+    #[test]
+    fn activity_uses_max_of_last_activity_and_updated_at() {
+        let home = tempfile::tempdir().unwrap();
+        seed(
+            home.path(),
+            &[
+                // 活跃：last_activity 冻结在一小时前，updated_at 10 秒前
+                (
+                    "active",
+                    "working",
+                    Some(NOW - 3_600_000),
+                    NOW - 10_000,
+                    None,
+                ),
+                // 过期：两个时间都超窗
+                (
+                    "stale",
+                    "completed",
+                    Some(NOW - 3_600_000),
+                    NOW - 3_600_000,
+                    None,
+                ),
+                // 已删（deleted_at 非 0/负）：即便新鲜也不得返回
+                ("deleted", "completed", Some(NOW), NOW, Some(1)),
+                // cloud 形态的「未删」哨兵 -1：必须接受
+                (
+                    "cloud",
+                    "working",
+                    Some(NOW - 20_000),
+                    NOW - 20_000,
+                    Some(-1),
+                ),
+                // last_activity_at 为 NULL：MAX 在 SQLite 里遇 NULL 会返回 NULL →
+                // 必须仍按 updated_at 判活（否则新建会话永远不上板）
+                ("null_activity", "working", None, NOW - 5_000, None),
+            ],
+        );
+        let rows = recent_db_sessions(home.path(), NOW - 300_000);
+        let ids: Vec<&str> = rows.iter().map(|r| r.id.as_str()).collect();
+        assert!(
+            ids.contains(&"active"),
+            "MAX 判据必须看见 updated_at：{ids:?}"
+        );
+        assert!(ids.contains(&"cloud"), "deleted_at=-1 是未删哨兵：{ids:?}");
+        assert!(
+            ids.contains(&"null_activity"),
+            "last_activity 为 NULL 仍须判活：{ids:?}"
+        );
+        assert!(!ids.contains(&"stale"), "超窗会话不得返回：{ids:?}");
+        assert!(!ids.contains(&"deleted"), "已删会话不得复活：{ids:?}");
+        // 排序：活动时间倒序（最新在前）
+        assert_eq!(ids.first(), Some(&"null_activity"), "最新活动在前：{ids:?}");
+        let active = rows.iter().find(|r| r.id == "active").unwrap();
+        assert_eq!(
+            active.activity_ms,
+            NOW - 10_000,
+            "activity = updated_at（不是冻结的 last_activity_at）"
+        );
+        assert_eq!(active.cwd, "/p/A");
+        assert_eq!(active.title.as_deref(), Some("标题"));
+        assert_eq!(active.status, "working");
+    }
+
+    /// DB 不存在 / 打不开 → 空表 + 不 panic（看板降级，不报错）
+    #[test]
+    fn missing_db_yields_empty() {
+        let home = tempfile::tempdir().unwrap();
+        assert!(recent_db_sessions(home.path(), 0).is_empty());
     }
 }
 
