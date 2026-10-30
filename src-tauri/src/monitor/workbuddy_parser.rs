@@ -37,8 +37,15 @@ fn read_workbuddy_tail_digest(jsonl: &Path) -> WorkBuddyTailDigest {
     }
 }
 
-/// 心跳新鲜阈值：取 兔维斯 轮询周期（约 30s）的 3 倍，防止轮询间隙卡片闪烁
+/// 心跳新鲜阈值：取 兔维斯 轮询周期（约 30s）的 3 倍，防止轮询间隙卡片闪烁。
+/// **5.9.3 起不再用于「会话是否在场」**（心跳只写一次）：现仅用于 W4 补偿判「心跳消失」。
 pub const HEARTBEAT_FRESH_MS: u64 = 90_000;
+
+/// 会话活性窗口（R2）：DB `MAX(last_activity_at, updated_at)` 与主 jsonl mtime 的
+/// 300s 兜底窗，**只作用于 `completed` / DB-only 候选**——`runtime_present` 且
+/// `status='working'` 的会话不因父会话静默而下板（真机实测 10 分钟空档）。
+/// 与 `APP_STATUS_STALE_MS` 同值同源（`monitor/app_status.rs`：App 形态 mtime 叠加阈值）。
+pub const SESSION_ACTIVE_WINDOW_MS: i64 = super::app_status::APP_STATUS_STALE_MS as i64;
 
 /// 完成防抖窗（spec 假绿治理 §4.2）：assistant 语义尾 + JSONL mtime 年龄 < 该窗 → 拉回
 /// Processing（WorkBuddy 格式无轮次信号，中间消息假绿只能时间防抖），≥ 该窗才转绿。
@@ -393,60 +400,97 @@ fn now_ms() -> u64 {
 
 /// 心跳目录驱动的会话进程发现核心（P0-1）：
 /// 枚举 ~/.workbuddy/sessions/<PID>.json，逐个防御性解析心跳，按过滤规则（严格 UUID +
-/// kind 非 prewarm + 心跳新鲜 < 90s）判定活跃会话进程，再以 pid 回查进程表补充
+/// kind 非 prewarm + pid 文件/内容一致 + pid 存活）判定活跃会话进程，再以 pid 回查进程表补充
 /// cpu/exe 构装 AgentProcess；进程表查无此 pid → 跳过（消失场景由 W4 补偿经
 /// LAST_SEEN_SESSIONS 处理，语义不变）。
 /// 不使用进程名匹配——Windows 上会话宿主与主进程同名 WorkBuddy.exe（Electron 以自身
 /// 作 Node 运行 cli/bin/codebuddy 脚本，无 codebuddy 进程），进程名匹配恒空且「父进程
 /// 同名」会被通用子代理过滤误杀。任何文件缺失/损坏/解析失败一律跳过，不 panic。
 /// process_info 以闭包注入（pid → (cpu_usage, exe)），可测核心不依赖 sysinfo 进程表构造
+///
+/// **R2（5.9.3 心跳只写一次）**：这里**不再要求心跳新鲜**——`lastHeartbeat` 冻结但
+/// pid 仍存活就是「会话运行时在场」的候选；新鲜度/DB/jsonl 活性统一由
+/// `get_workbuddy_sessions_with` 判活（否则 discover 放行、get 又挡回去，修复完全无效）。
+///
+/// **DB 兜底哨兵**：没有可用心跳进程、但 DB 里仍有近 300s 活跃会话且 WorkBuddy 宿主存活时，
+/// 返回**一条宿主哨兵**（`cwd = None`）——它的唯一作用是穿过 `adapter/mod.rs` 的
+/// L1 零进程门禁（空进程列表不调 `find_sessions`），让 `get_workbuddy_sessions` 有机会
+/// 从 DB 出卡。无宿主 / 无近期 DB 会话 / 有心跳 → 不产哨兵（L1 契约保持）。
 fn discover_workbuddy_processes_with(
     home: &Path,
     process_info: &dyn Fn(u32) -> Option<(f32, Option<PathBuf>)>,
     now_ms: u64,
+    recent: &HashMap<String, WbDbSession>,
+    host_pid: Option<u32>,
 ) -> Vec<AgentProcess> {
     let sessions_dir = home.join(".workbuddy").join("sessions");
-    let Ok(entries) = std::fs::read_dir(&sessions_dir) else {
-        return Vec::new(); // 目录缺失/不可读 → 空集，不 panic
-    };
     let mut found = Vec::new();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        // 文件名须为 <PID>.json；其余文件（如 README/临时文件）跳过
-        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
-            continue;
-        };
-        let Ok(pid) = stem.parse::<u32>() else {
-            continue;
-        };
-        // 防御：心跳文件缺失/损坏 → 跳过该 pid
-        let Some(hb) = std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|s| parse_heartbeat(&s))
-        else {
-            continue;
-        };
-        // 过滤：严格 UUID + kind 非 prewarm + 心跳新鲜（与 get_workbuddy_sessions 同规）
-        // + pid 交叉校验（issue #35 nit）：pid 复用竞态窗口内文件名与内容 pid 可能
-        // 不一致，视为无效心跳，不为无关进程出卡（下轮真实心跳自愈）
-        if !heartbeat_session_id_is_uuid(&hb)
-            || hb.kind.as_deref() == Some("prewarm")
-            || !heartbeat_is_alive(&hb, now_ms)
-            || hb.pid != pid
-        {
-            continue;
+    // 目录缺失/不可读 → 不 panic（下面的哨兵分支仍可能给出 DB 兜底）
+    if let Ok(entries) = std::fs::read_dir(&sessions_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            // 文件名须为 <PID>.json；其余文件（如 README/临时文件）跳过
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            let Ok(pid) = stem.parse::<u32>() else {
+                continue;
+            };
+            // 防御：心跳文件缺失/损坏 → 跳过该 pid
+            let Some(hb) = std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|s| parse_heartbeat(&s))
+            else {
+                continue;
+            };
+            // 过滤：严格 UUID + kind 非 prewarm + pid 交叉校验（issue #35 nit：
+            // pid 复用竞态窗口内文件名与内容 pid 可能不一致，视为无效心跳，
+            // 不为无关进程出卡——下轮真实心跳自愈）。
+            // **心跳新鲜度不在这里判**（R2）：过期但 pid 存活的会话仍是「运行时在场」候选。
+            if !heartbeat_session_id_is_uuid(&hb)
+                || hb.kind.as_deref() == Some("prewarm")
+                || hb.pid != pid
+            {
+                continue;
+            }
+            // 以 pid 回查进程表：查无 → 跳过（进程已消失，不产出进程）
+            let Some((cpu_usage, exe)) = process_info(pid) else {
+                continue;
+            };
+            if !heartbeat_is_alive(&hb, now_ms) {
+                // 诊断可见：5.9.3 的心跳只写一次，这里过期是常态而非异常
+                log::debug!("workbuddy: 心跳 {pid} 已过期但 pid 存活，按在场候选放行");
+            }
+            found.push(AgentProcess {
+                pid,
+                cpu_usage,
+                cwd: Some(PathBuf::from(&hb.cwd)),
+                exe,
+                form: ProcessForm::App,
+            });
         }
-        // 以 pid 回查进程表：查无 → 跳过（进程已消失，不产出进程）
-        let Some((cpu_usage, exe)) = process_info(pid) else {
-            continue;
-        };
-        found.push(AgentProcess {
-            pid,
-            cpu_usage,
-            cwd: Some(PathBuf::from(&hb.cwd)),
-            exe,
-            form: ProcessForm::App,
-        });
+    }
+    // DB 兜底哨兵：仅当「没有心跳进程 ∧ DB 有近期会话 ∧ 宿主存活」时给出，
+    // 用于穿过 L1 门禁（cwd=None 表示「不是某个具体会话的心跳」）
+    if found.is_empty() {
+        if let Some(host_pid) = host_pid {
+            if !recent.is_empty() {
+                let (cpu_usage, exe) = process_info(host_pid)
+                    .map(|(c, e)| (c, e))
+                    .unwrap_or((0.0, None));
+                log::debug!(
+                    "workbuddy: 无可用心跳，使用宿主进程 {host_pid} 作为 DB 兜底哨兵（近期会话 {} 个）",
+                    recent.len()
+                );
+                found.push(AgentProcess {
+                    pid: host_pid,
+                    cpu_usage,
+                    cwd: None,
+                    exe,
+                    form: ProcessForm::App,
+                });
+            }
+        }
     }
     found
 }
@@ -456,6 +500,13 @@ pub fn discover_workbuddy_processes(system: &sysinfo::System) -> Vec<AgentProces
     let Some(home) = dirs::home_dir() else {
         return Vec::new();
     };
+    let now = now_ms();
+    // DB 候选只用于决定「要不要发宿主哨兵」；真正的判活/出卡在 get_workbuddy_sessions
+    let recent: HashMap<String, WbDbSession> =
+        recent_db_sessions(&home, now as i64 - SESSION_ACTIVE_WINDOW_MS)
+            .into_iter()
+            .map(|r| (r.id.clone(), r))
+            .collect();
     discover_workbuddy_processes_with(
         &home,
         &|pid| {
@@ -463,7 +514,9 @@ pub fn discover_workbuddy_processes(system: &sysinfo::System) -> Vec<AgentProces
                 .process(sysinfo::Pid::from_u32(pid))
                 .map(|p| (p.cpu_usage(), p.exe().map(|e| e.to_path_buf())))
         },
-        now_ms(),
+        now,
+        &recent,
+        super::host::tool_host_pid(system, "workbuddy"),
     )
 }
 
@@ -1511,8 +1564,13 @@ mod tests {
         fn fresh_real_task_produces_process() {
             let home = tempfile::tempdir().unwrap();
             write_heartbeat_json(home.path(), 11952, &active_hb(11952, 1_000));
-            let found =
-                discover_workbuddy_processes_with(home.path(), &process_table(&[11952]), 10_000);
+            let found = discover_workbuddy_processes_with(
+                home.path(),
+                &process_table(&[11952]),
+                10_000,
+                &HashMap::new(),
+                None,
+            );
             assert_eq!(found.len(), 1);
             assert_eq!(found[0].pid, 11952);
             assert_eq!(found[0].form, ProcessForm::App);
@@ -1531,8 +1589,13 @@ mod tests {
                 8979,
                 r#"{"pid":8979,"sessionId":"interactive-8979","cwd":"/tmp/host-cli","lastHeartbeat":9000,"kind":"interactive"}"#,
             );
-            let found =
-                discover_workbuddy_processes_with(home.path(), &process_table(&[8979]), 10_000);
+            let found = discover_workbuddy_processes_with(
+                home.path(),
+                &process_table(&[8979]),
+                10_000,
+                &HashMap::new(),
+                None,
+            );
             assert!(found.is_empty());
         }
 
@@ -1545,19 +1608,122 @@ mod tests {
                 17692,
                 r#"{"pid":17692,"sessionId":"prewarm-wb-pool-1788496419201-bb1050","cwd":"C:\\Users\\bunny\\WorkBuddy","lastHeartbeat":9000,"kind":"prewarm"}"#,
             );
-            let found =
-                discover_workbuddy_processes_with(home.path(), &process_table(&[17692]), 10_000);
+            let found = discover_workbuddy_processes_with(
+                home.path(),
+                &process_table(&[17692]),
+                10_000,
+                &HashMap::new(),
+                None,
+            );
             assert!(found.is_empty());
         }
 
+        /// **R2 翻转**：心跳过期（5.9.3 只写一次：`lastHeartbeat` 冻结在注册时刻）但
+        /// pid **仍然存活** → 仍是「会话运行时在场」候选，`find_processes` 必须放行。
+        /// 旧实现（要求 <90s 新鲜）在这里返回空 → 看板整源掉线。
         #[test]
-        fn stale_heartbeat_is_skipped() {
-            // 心跳过期（now - lastHeartbeat >= 90s）→ 不产进程
+        fn stale_heartbeat_with_live_pid_is_discovered() {
             let home = tempfile::tempdir().unwrap();
             write_heartbeat_json(home.path(), 11952, &active_hb(11952, 0));
-            let found =
-                discover_workbuddy_processes_with(home.path(), &process_table(&[11952]), 100_000);
+            let found = discover_workbuddy_processes_with(
+                home.path(),
+                &process_table(&[11952]),
+                100_000,
+                &HashMap::new(),
+                None,
+            );
+            assert_eq!(
+                found.len(),
+                1,
+                "过期心跳 + pid 存活必须放行（活性过滤在 B4）"
+            );
+            assert_eq!(found[0].pid, 11952);
+        }
+
+        /// 过期且 pid **不存活** → 跳过（不能为已退出的会话发进程）
+        #[test]
+        fn stale_heartbeat_with_dead_pid_is_skipped() {
+            let home = tempfile::tempdir().unwrap();
+            write_heartbeat_json(home.path(), 11952, &active_hb(11952, 0));
+            let found = discover_workbuddy_processes_with(
+                home.path(),
+                &process_table(&[]),
+                100_000,
+                &HashMap::new(),
+                Some(999),
+            );
+            // 宿主存活（999）但 DB 无近期会话 → 不发哨兵
             assert!(found.is_empty());
+        }
+
+        /// **DB 兜底哨兵**：无心跳文件 + DB 有近期活跃会话 + 宿主存活 → 一条宿主哨兵
+        /// （`cwd=None`、`pid=宿主 pid`），用于穿过 L1 门禁
+        #[test]
+        fn no_heartbeat_with_recent_db_session_and_host_yields_sentinel() {
+            let home = tempfile::tempdir().unwrap();
+            let mut recent = HashMap::new();
+            recent.insert(
+                SID.to_string(),
+                WbDbSession {
+                    id: SID.to_string(),
+                    cwd: "/Users/jarvis/proj".into(),
+                    title: None,
+                    status: "working".into(),
+                    activity_ms: 9_000,
+                },
+            );
+            let found = discover_workbuddy_processes_with(
+                home.path(),
+                &|pid| (pid == 8084).then_some((1.0f32, None)),
+                10_000,
+                &recent,
+                Some(8084),
+            );
+            assert_eq!(found.len(), 1, "宿主 + 近期 DB 会话 → 一条哨兵");
+            assert_eq!(found[0].pid, 8084);
+            assert_eq!(found[0].form, ProcessForm::App);
+            assert!(found[0].cwd.is_none(), "哨兵不属于某个具体会话");
+        }
+
+        /// 无宿主 ∧ 无心跳 ∧ 无 DB 会话 → 空（L1 契约：不调 find_sessions）
+        #[test]
+        fn no_host_no_heartbeat_no_db_yields_no_processes() {
+            let home = tempfile::tempdir().unwrap();
+            let found = discover_workbuddy_processes_with(
+                home.path(),
+                &process_table(&[1]),
+                10_000,
+                &HashMap::new(),
+                None,
+            );
+            assert!(found.is_empty());
+        }
+
+        /// 有心跳进程时**不发哨兵**（避免同一会话出两张卡 / 多一条伪进程）
+        #[test]
+        fn live_heartbeat_suppresses_the_host_sentinel() {
+            let home = tempfile::tempdir().unwrap();
+            write_heartbeat_json(home.path(), 11952, &active_hb(11952, 1_000));
+            let mut recent = HashMap::new();
+            recent.insert(
+                SID.to_string(),
+                WbDbSession {
+                    id: SID.to_string(),
+                    cwd: "/Users/jarvis/proj".into(),
+                    title: None,
+                    status: "working".into(),
+                    activity_ms: 9_000,
+                },
+            );
+            let found = discover_workbuddy_processes_with(
+                home.path(),
+                &process_table(&[11952, 8084]),
+                10_000,
+                &recent,
+                Some(8084),
+            );
+            assert_eq!(found.len(), 1);
+            assert_eq!(found[0].pid, 11952, "有心跳就用心跳 pid，不发哨兵");
         }
 
         #[test]
@@ -1566,7 +1732,13 @@ mod tests {
             // 发现阶段不写观测表，消失场景由 W4 补偿处理）
             let home = tempfile::tempdir().unwrap();
             write_heartbeat_json(home.path(), 11952, &active_hb(11952, 1_000));
-            let found = discover_workbuddy_processes_with(home.path(), &process_table(&[]), 10_000);
+            let found = discover_workbuddy_processes_with(
+                home.path(),
+                &process_table(&[]),
+                10_000,
+                &HashMap::new(),
+                None,
+            );
             assert!(found.is_empty());
         }
 
@@ -1577,8 +1749,13 @@ mod tests {
             let home = tempfile::tempdir().unwrap();
             // 文件名 111.json，内容声称 pid=222（竞态窗口产物形态）
             write_heartbeat_json(home.path(), 111, &active_hb(222, 1_000));
-            let found =
-                discover_workbuddy_processes_with(home.path(), &process_table(&[111, 222]), 10_000);
+            let found = discover_workbuddy_processes_with(
+                home.path(),
+                &process_table(&[111, 222]),
+                10_000,
+                &HashMap::new(),
+                None,
+            );
             assert!(found.is_empty());
         }
 
@@ -1586,8 +1763,13 @@ mod tests {
         fn missing_sessions_dir_is_empty_not_panic() {
             // 心跳目录不存在/不可读 → 空集，不 panic
             let home = tempfile::tempdir().unwrap();
-            let found =
-                discover_workbuddy_processes_with(home.path(), &process_table(&[1]), 10_000);
+            let found = discover_workbuddy_processes_with(
+                home.path(),
+                &process_table(&[1]),
+                10_000,
+                &HashMap::new(),
+                None,
+            );
             assert!(found.is_empty());
         }
 
@@ -1600,8 +1782,13 @@ mod tests {
             std::fs::write(dir.join("README.md"), "not a heartbeat").unwrap();
             std::fs::write(dir.join("abc.json"), "garbage").unwrap();
             write_heartbeat_json(home.path(), 11952, &active_hb(11952, 1_000));
-            let found =
-                discover_workbuddy_processes_with(home.path(), &process_table(&[11952]), 10_000);
+            let found = discover_workbuddy_processes_with(
+                home.path(),
+                &process_table(&[11952]),
+                10_000,
+                &HashMap::new(),
+                None,
+            );
             assert_eq!(found.len(), 1);
             assert_eq!(found[0].pid, 11952);
         }
@@ -1616,6 +1803,8 @@ mod tests {
                 home.path(),
                 &|pid| (pid == 42).then_some((3.5f32, Some(exe.clone()))),
                 10_000,
+                &HashMap::new(),
+                None,
             );
             assert_eq!(found.len(), 1);
             assert_eq!(found[0].cpu_usage, 3.5);
