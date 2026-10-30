@@ -319,18 +319,23 @@ pub fn publish_for_test(f: impl FnOnce() -> SessionsResponse) -> Arc<Snapshot> {
     publish(f())
 }
 
+/// 全局测试锁：本模块的进程共享状态（LAST / VERSION / MODE / WATCH_UNTIL_MS /
+/// IN_FLIGHT）会被跨模块测试读写（如 `remote::server` 的 SSE 用例种子快照），
+/// 并行执行会互相踩踏 → 凡触碰这些状态的测试一律持本锁串行化。
+#[cfg(test)]
+static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// 单测用：获取全局测试锁（本模块测试与 `remote::server` SSE 测试共用同一把，
+/// 避免任一侧的 reset/seed 插进另一侧「种子 → 断言」窗口，见 test_guard 使用方）
+#[cfg(test)]
+pub(crate) fn test_guard() -> std::sync::MutexGuard<'static, ()> {
+    TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::Duration;
-
-    /// 全局状态（LAST / VERSION / MODE / WATCH_UNTIL_MS / IN_FLIGHT）为进程共享，
-    /// 测试并行执行会互相踩踏 → 全部串行化
-    static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    fn lock_tests() -> std::sync::MutexGuard<'static, ()> {
-        TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
-    }
 
     fn resp(status: SessionStatus) -> crate::session::SessionsResponse {
         crate::session::SessionsResponse {
@@ -346,7 +351,7 @@ mod tests {
 
     #[test]
     fn publish_increments_version_and_stores_snapshot() {
-        let _guard = lock_tests();
+        let _guard = test_guard();
         reset_for_test();
         let s1 = publish_for_test(|| resp(SessionStatus::Idle));
         let s2 = publish_for_test(|| resp(SessionStatus::Idle));
@@ -360,7 +365,7 @@ mod tests {
 
     #[test]
     fn ensure_fresh_returns_cached_within_window() {
-        let _guard = lock_tests();
+        let _guard = test_guard();
         reset_for_test();
         let _ = publish_for_test(|| resp(SessionStatus::Idle));
         let s = ensure_fresh(Duration::from_secs(60), Duration::from_millis(10));
@@ -369,7 +374,7 @@ mod tests {
 
     #[test]
     fn ensure_fresh_falls_back_when_no_scanner_thread() {
-        let _guard = lock_tests();
+        let _guard = test_guard();
         reset_for_test();
         // 未 start（无通道）→ 直接同步扫一次并返回
         let s = ensure_fresh(Duration::from_millis(1), Duration::from_millis(50));
@@ -380,7 +385,7 @@ mod tests {
     /// 心跳续期、停止观察都不得触发额外扫描
     #[test]
     fn set_user_watching_reports_rising_edge_only() {
-        let _guard = lock_tests();
+        let _guard = test_guard();
         reset_for_test();
         assert!(set_user_watching(true), "首次开始观察 = 上升沿");
         assert!(!set_user_watching(true), "心跳续期不是上升沿");
@@ -390,7 +395,7 @@ mod tests {
 
     #[test]
     fn has_active_sessions_detects_processing() {
-        let _guard = lock_tests();
+        let _guard = test_guard();
         // 无 Session 公有构造样板 → 改为对六个状态逐一断言判定函数，
         // 再验证空会话响应不被误判为活跃
         for status in [

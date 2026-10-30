@@ -1668,7 +1668,8 @@ mod tests {
     }
 
     // ==== M3 Task 6：GET /m/api/v1/events（SSE 实时通道，C1 后半） ====
-    // 零污染：会话源经注入缝（假 SessionsResponse）、事件源经注入的空 broadcast 通道。
+    // 零污染：会话源自 Task 6 起改为 scan_bus 共享快照（不再读注入缝），故用
+    // [`seed_scan_bus_snapshot`] 预发布假快照；事件源经注入的空 broadcast 通道。
     // SSE 是长连接流式响应：**不能用 body_string（collect 会等流结束、永久挂起）**，
     // 只逐帧读（BodyExt::frame），够断言首帧快照与增量帧即可，读完即 drop（连接关闭）。
 
@@ -1683,6 +1684,22 @@ mod tests {
             .into_data()
             .unwrap_or_else(|_| panic!("SSE 应产生数据帧（非 trailers）"));
         String::from_utf8(bytes.to_vec()).expect("SSE 帧应为 UTF-8")
+    }
+
+    /// 预发布 scan_bus 共享快照（SSE 测试专用）：Task 6 起 /events 首帧走
+    /// `scan_bus::ensure_fresh`（不再直调 `session_source` 注入缝），测试无法再经
+    /// state 注入内容——预发布同一份快照即可①钉住首帧内容（totalCount=7）并验证
+    /// `version` 字段在场，②避免用例触发真实机器扫描（零 ~/.tuvis 接触、首帧无需等补扫）。
+    /// **调用方必须已持 `scan_bus::test_guard()`**：seed 写的是 scan_bus 进程级
+    /// `LAST`/`VERSION`，与 `scan_bus::tests` 的 `reset_for_test` 并发会互相插队
+    /// （reset 落在 seed 与 ensure_fresh 之间 → 用例落到真实补扫；seed 抬版本 →
+    /// 打断 reset 侧的精确版本断言）。本函数不自行加锁（否则持锁调用方死锁）。
+    fn seed_scan_bus_snapshot() {
+        crate::adapter::scan_bus::publish_for_test(|| crate::session::SessionsResponse {
+            sessions: vec![],
+            total_count: 7,
+            waiting_count: 0,
+        });
     }
 
     /// 预置有效设备（SSE 测试专用：复用 state_with_clock 的注入缝，零接触真实设备表）。
@@ -1723,11 +1740,22 @@ mod tests {
     }
 
     /// SSE 端点主链（控制者③）：认证后 200 + text/event-stream + 首帧 `event: snapshot`
-    /// 携带全量会话（注入源 totalCount=7 ⇒ 数据同源），随后 watcher_tx 上的事件以
-    /// `event: transition` + camelCase JSON 送达（wire 契约端到端锁定）
+    /// 携带全量会话（预发布 scan_bus 快照 totalCount=7 ⇒ 数据同源）与 `version`
+    /// （客户端对账用），随后 watcher_tx 上的事件以 `event: transition` + camelCase
+    /// JSON 送达（wire 契约端到端锁定）
     #[tokio::test]
+    // 刻意持「串行票据」跨 await（与 remote/tunnel.rs 测试同一先例）：本用例读写
+    // scan_bus 进程级 LAST/VERSION，必须与 scan_bus::tests 的 reset 互斥；tokio::test
+    // 是单线程 runtime，await 期间无任何路径重入 TEST_LOCK（生产代码不认识测试锁，
+    // ensure_fresh 落 scan_once 也不取它），不存在死锁。
+    #[allow(clippy::await_holding_lock)]
     async fn sse_events_streams_snapshot_then_transitions() {
+        // 持 scan_bus 全局测试锁覆盖「种子 → 首帧断言」全程：否则 scan_bus::tests 的
+        // reset_for_test 可能插在 seed 与 ensure_fresh 之间（首帧落到真实 scan_once、
+        // 触碰真实 ~/.tuvis），或本用例的 seed 抬高版本打断对方的精确版本断言。
+        let _guard = crate::adapter::scan_bus::test_guard();
         let state = test_state();
+        seed_scan_bus_snapshot();
         persist_device(&state, "ev");
         let app = router(state.clone());
         let r = app
@@ -1747,7 +1775,8 @@ mod tests {
         );
 
         let mut body = r.into_body();
-        // 首帧：全量快照（event: snapshot + SessionsResponse JSON，数据来自注入源）
+        // 首帧：全量快照（event: snapshot + SessionsResponse JSON，数据来自 scan_bus
+        // 共享快照，见 seed_scan_bus_snapshot）+ 扫描总线发布版本 version
         let first = next_frame(&mut body).await;
         assert!(
             first.starts_with("event: snapshot\n"),
@@ -1755,7 +1784,11 @@ mod tests {
         );
         assert!(
             first.contains("\"totalCount\":7"),
-            "首帧快照必须直调 session_source（注入源 totalCount=7），实际 {first:?}"
+            "首帧快照必须来自 scan_bus 共享快照（预发布 totalCount=7），实际 {first:?}"
+        );
+        assert!(
+            first.contains("\"version\":"),
+            "首帧快照必须携带 version（扫描总线发布版本，客户端对账/纠偏用），实际 {first:?}"
         );
 
         // 增量帧：watcher_tx 发一条跃迁 → transition 帧 + camelCase 键（前端按
@@ -1824,8 +1857,16 @@ mod tests {
     // ---- 吊销即时断流集成（SSE 流随 disconnect 终止）----
 
     #[tokio::test]
+    // 同上：跨 await 持测试锁是本用例的隔离手段，非死锁风险（单线程 runtime，
+    // 无重入 TEST_LOCK 的路径）
+    #[allow(clippy::await_holding_lock)]
     async fn sse_stream_ends_when_device_disconnected() {
+        // 同 sse_events_streams_snapshot_then_transitions：种子/首帧期间持 scan_bus
+        // 全局测试锁，禁止 scan_bus::tests 的 reset 并发插队（首帧不得落真实补扫）
+        let _guard = crate::adapter::scan_bus::test_guard();
         let state = test_state();
+        // 预发布共享快照：首帧不必等真实补扫（本用例 2s 首帧超时 < ensure_fresh 3s 等待上限）
+        seed_scan_bus_snapshot();
         // 直通配对拿有效 cookie（复用既有 pair 流程的简化版：直接 persist 一个设备）
         state.store.with(|c| {
             let _ = crate::remote::pairing::persist_device(

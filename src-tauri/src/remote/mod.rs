@@ -688,6 +688,23 @@ use std::sync::Mutex;
 static SERVER_HANDLE: Lazy<Mutex<Option<tauri::async_runtime::JoinHandle<()>>>> =
     Lazy::new(|| Mutex::new(None));
 
+/// C7 配对计数缓存条目：上一轮全进程扫描完成时刻（TTL 判定）+ 运行进程 (工具, 项目) 表。
+/// 用命名结构而非嵌套元组：静态量类型过深会触 `clippy::type_complexity`，且字段语义自解释。
+#[cfg(windows)]
+struct PairingProjectsCache {
+    at: std::time::Instant,
+    projects: Vec<(String, String)>,
+}
+
+/// C7 配对计数缓存（进程级，仅 Windows 有生产实现）：`System::new_all()` 全进程刷新是
+/// 重活，而 /sessions 3s 轮询 + SSE 接入都会消费本表，逐请求全刷会持续拖慢远程面。
+/// 10s TTL 内复用上一轮结果——配对歧义判据只需「粗粒度一致」，进程表在 10s 内的微变
+/// 不影响「同键 ≥2」结论（迟滞上限 10s，如实接受）。放在 STATE 之外：`#[cfg(not(windows))]`
+/// 下不定义静态量，不留 dead_code。
+#[cfg(windows)]
+static PAIRING_PROJECTS_CACHE: Lazy<Mutex<Option<PairingProjectsCache>>> =
+    Lazy::new(|| Mutex::new(None));
+
 /// 共享状态单例：服务器任务与 tauri 命令共用同一份 pairing / 会话源 / 设备存储
 static STATE: Lazy<std::sync::Arc<server::RemoteState>> = Lazy::new(|| {
     std::sync::Arc::new(server::RemoteState {
@@ -715,11 +732,27 @@ static STATE: Lazy<std::sync::Arc<server::RemoteState>> = Lazy::new(|| {
         // 快照 + 桌面跳转门同款收集函数（同一实现单点，桌面门零改动）。非 Windows
         // 无该收集实现（桌面配对不确定门本就仅 Windows 消费）→ 空表 = 不宣称歧义
         // （诚实缺省）。端点层据本表计同键 ≥2 判 pairingAmbiguous/pairingHint。
+        // 限频：10s 内复用缓存（见 PAIRING_PROJECTS_CACHE）——首调扫描，之后窗口内
+        // 直接克隆上轮结果；窗口外重扫。
         pairing_counter: Box::new(|| {
             #[cfg(windows)]
             {
+                let mut g = PAIRING_PROJECTS_CACHE
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                if let Some(cached) = g.as_ref() {
+                    if cached.at.elapsed() < std::time::Duration::from_secs(10) {
+                        return cached.projects.clone();
+                    }
+                }
+                // 持锁扫描：并发调用在此排队，拿到的仍是同一次扫描结果（不重复全刷）
                 let system = sysinfo::System::new_all();
-                crate::commands::session::running_projects_from_processes(&system)
+                let projects = crate::commands::session::running_projects_from_processes(&system);
+                *g = Some(PairingProjectsCache {
+                    at: std::time::Instant::now(),
+                    projects: projects.clone(),
+                });
+                projects
             }
             #[cfg(not(windows))]
             {

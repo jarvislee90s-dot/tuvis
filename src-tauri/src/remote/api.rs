@@ -90,6 +90,24 @@ fn empty_sessions_value() -> serde_json::Value {
     serde_json::json!({ "sessions": [], "totalCount": 0, "waitingCount": 0 })
 }
 
+/// SSE 首帧构造**单点**（handler 与测试共用，故虽名 `_for_test` 并非测试专用）：
+/// 快照 → Value 并附加 `version`（扫描总线发布版本）。**客户端据此做快照对账/纠偏**——
+/// 重连后拿 version 与本地已知版本比对，识别「首帧是否比本地记忆更新」。
+/// 序列化理论不可达失败（C 风格字段无 map 键/浮点 NaN）→ 空快照 Value 兜底。
+pub(crate) fn snapshot_frame_for_test(
+    resp: crate::session::SessionsResponse,
+    version: u64,
+) -> serde_json::Value {
+    let mut v = serde_json::to_value(resp).unwrap_or_else(|e| {
+        log::warn!("SSE 快照序列化失败，降级为空快照: {e}");
+        empty_sessions_value()
+    });
+    if let Some(obj) = v.as_object_mut() {
+        obj.insert("version".into(), serde_json::json!(version));
+    }
+    v
+}
+
 /// C7 配对键归一（与桌面跳转门 require_evidence 同判据）：工具小写；项目先走
 /// `normalize_cwd_for_match` 同域归一（尾分隔符/反斜杠/Windows 大小写），再整体
 /// 小写以对齐桌面门的 `to_lowercase` 口径（Unix 大小写敏感差异在此抹平）。
@@ -153,13 +171,15 @@ fn tag_pairing_ambiguous(
 }
 
 /// GET /m/api/v1/events（M3 Task 6，C1 后半）：SSE 实时通道。
-/// - 首帧 = 全量会话快照（**直调注入源**，数据同源铁律 3），此后只推跃迁边沿
-///   （watcher 是唯一去重点，铁律 4——本层不独立去重、来一条推一条）；
+/// - 首帧 = 全量会话快照（走 `scan_bus::ensure_fresh`：快照龄 ≤ 2s，超龄则请求补扫并
+///   等待上限 3s，超时按现有快照降级），帧内携带 `version`（扫描总线发布版本，
+///   **供客户端快照对账/纠偏**）；此后只推跃迁边沿（watcher 是唯一去重点，铁律 4——
+///   本层不独立去重、来一条推一条）；
 /// - gate 由 nest 内层 layer 结构性覆盖（本端点注册在 api_router 内），无需另加 middleware；
 /// - 心跳用 `Sse::keep_alive(KeepAlive::default())`：axum 自带 15s 空注释帧
 ///   （简报的 `: ping` 等效物，无需自拼 interval 流——简报 Step 1 注释"心跳省略实现"即指此）；
-/// - 断流：客户端断开 → axum drop 本流 → BroadcastStream 释放 Receiver →
-///   receiver_count 归零 → watcher 零订阅者守卫跳过扫描（Task 5 闭环）；
+/// - 断流：客户端断开 → axum drop 本流 → BroadcastStream 释放 Receiver；扫描侧已改为
+///   订阅共享快照（watcher 不再自行扫描），本层只负责连接注册与清理；
 /// - 吊销/停止即时断连（M4 T0a）：连接注册进 sse_registry，信号经 take_until 终止流
 pub async fn events(
     State(st): State<Arc<RemoteState>>,
@@ -172,28 +192,43 @@ pub async fn events(
     // M4 T0a：注册连接（gate 已过闸，此处必能取到设备 id；防御性 None 时跳过注册只服务）
     let device = super::gate::extract_device(&headers).unwrap_or_default();
     let (conn_id, close_rx) = st.sse_registry.register(&device);
-    // 注册表句柄先行克隆：st 整体 move 进下方 spawn_blocking 闭包（既有代码不动）
+    // 注册表句柄先行克隆：CloseCleanupStream 需要它
     let registry = st.sse_registry.clone();
-    // 快照走 spawn_blocking：session_source 是同步阻塞调用（sysinfo 全进程刷新 + 各工具
-    // 会话解析，冷启动可达数秒），直接 await 会周期性堵死 tokio worker——与 sessions
-    // handler 同一先例（实机教训见 commands/session.rs 的 get_all_sessions 注释）。
-    // 同过 apply_board_hidden 过滤（与 GET /sessions 同函数）：软归档隐藏卡片
-    // 不得经 SSE snapshot 通道诈尸
-    let snapshot =
-        tokio::task::spawn_blocking(move || apply_board_hidden(&st, (st.session_source)()))
-            .await
-            .unwrap_or_else(|e| {
-                // JoinError（任务 panic/取消）降级为空快照：移动端拿到 0 会话而非断流
-                log::error!("SSE 快照会话扫描任务异常: {e}");
-                crate::session::SessionsResponse {
-                    sessions: Vec::new(),
-                    total_count: 0,
-                    waiting_count: 0,
-                }
-            });
-    let snapshot_json = serde_json::to_string(&snapshot).unwrap_or_else(|e| {
-        log::warn!("SSE 快照序列化失败，降级为空快照: {e}");
-        EMPTY_SESSIONS_JSON.to_string()
+    // 快照走 spawn_blocking：ensure_fresh 内部可能等待补扫（上限 3s）并轮询，是同步
+    // 阻塞调用；直接 await 会堵死 tokio worker——与 sessions handler 同一先例
+    // （实机教训见 commands/session.rs 的 get_all_sessions 注释）。
+    // 闭包整体 move 一份 RemoteState 的 Arc（st 之后不再使用）：ensure_fresh **与**
+    // apply_board_hidden 过滤**全部在阻塞线程池内**完成——后者经
+    // database/dao/board_hidden.rs 锁全局 SQLite 互斥量，留在 async worker 上会被
+    // 长事务 DB 写者阻塞（2026-10-29 线程卫生回归点）。同过 apply_board_hidden
+    // （与 GET /sessions 同函数）：软归档隐藏卡片不得经 SSE snapshot 通道诈尸
+    let st_snap = st.clone();
+    let snapshot_json = tokio::task::spawn_blocking(move || {
+        let snap = crate::adapter::scan_bus::ensure_fresh(
+            std::time::Duration::from_secs(2),
+            std::time::Duration::from_secs(3),
+        );
+        let value = apply_board_hidden(&st_snap, snap.data.clone());
+        let frame = snapshot_frame_for_test(value, snap.version);
+        serde_json::to_string(&frame).unwrap_or_else(|e| {
+            log::warn!("SSE 快照序列化失败，降级为空快照: {e}");
+            EMPTY_SESSIONS_JSON.to_string()
+        })
+    })
+    .await
+    .unwrap_or_else(|e| {
+        // JoinError（任务 panic/取消）降级为空快照：移动端拿到 0 会话而非断流
+        log::error!("SSE 快照等待异常: {e}");
+        // 降级帧同样带 version(=0)，客户端对账口径一致
+        snapshot_frame_for_test(
+            crate::session::SessionsResponse {
+                sessions: Vec::new(),
+                total_count: 0,
+                waiting_count: 0,
+            },
+            0,
+        )
+        .to_string()
     });
     let initial = futures::stream::once(async move {
         Ok(sse::Event::default().event("snapshot").data(snapshot_json))
@@ -10672,6 +10707,21 @@ pub async fn create_projects(
 mod tests {
     use super::*;
     use crate::remote::content::SessionMessage;
+
+    /// Task 6 回归锁：SSE 首帧快照帧必须携带 `version`（客户端据此做快照对账/纠偏）。
+    /// 帧构造单点 = [`snapshot_frame_for_test`]（handler 与测试共用），本用例钉住字段在场。
+    #[tokio::test]
+    async fn sse_snapshot_frame_carries_version() {
+        let v = super::snapshot_frame_for_test(
+            crate::session::SessionsResponse {
+                sessions: vec![],
+                total_count: 0,
+                waiting_count: 0,
+            },
+            42,
+        );
+        assert_eq!(v.get("version").and_then(|x| x.as_u64()), Some(42));
+    }
 
     /// M4 回归锁：审计摘要文案**单点** [`mode_audit_content`]——成功臂与止血门拒绝臂
     /// 共用同一函数，本用例钉住两组各自的措辞（对账口径：账本正是拿它逐字对账，
