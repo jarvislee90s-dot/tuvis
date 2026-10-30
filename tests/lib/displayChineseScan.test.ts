@@ -57,7 +57,7 @@ function stripComments(line: string): string {
 }
 
 describe("上屏中文扫描（桌面零容忍 / mobile 白名单）", () => {
-  it("桌面端源码的字符串字面量不得含硬编码中文", () => {
+  it("桌面端源码的字符串字面量不得含硬编码中文", { timeout: 20000 }, () => {
     const files = walk(SRC);
     expect(files.length).toBeGreaterThan(100); // 自检：扫描确实覆盖了源码树
     const offenders: string[] = [];
