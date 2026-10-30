@@ -26,11 +26,15 @@
 //     挑「当前会话」。`title` 为 `null` → `usage.mini.untitled`（绝不印 `null` 字面量）。
 //     ⚠️ **日档（last7d / last30d / custom）后端恒给 `recentSession: null`**（日聚合行不带
 //     `session_id`，见契约 §2 与 `query.rs` 的口径）⇒ 该行必然空态，这是**预期行为不是 bug**。
+import { useEffect } from "react";
 import {
   useUsageCollect,
   useUsageDashboardQuery,
   useUsageSettingsQuery,
 } from "@/lib/query/queries/usage";
+import { HEARTBEAT_INTERVAL_MS } from "@/lib/query/queries/scanBus";
+import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { EM_DASH, fmtPct, fmtTokens, usageAgentLabel } from "@/lib/usage/format";
 import {
   MINI_BAR_TOOL_LIMIT,
@@ -252,6 +256,47 @@ export interface UsageMiniBarProps {
 export function UsageMiniBar({ scale, mode, onDetail, t }: UsageMiniBarProps) {
   const settings = useUsageSettingsQuery();
   useUsageCollect();
+  // 扫描档位（Task 9）：浮窗**展开期间**＝有人在看 → 以 source="pet" 报心跳。
+  // 与主窗心跳分开记账（后端按源并集判定）：本窗卸载只收回自己那份，不清主窗的；
+  // 反向亦然（主窗失焦心跳报 false 也不会把浮窗这份清掉）。
+  //
+  // 可见性判据（评审 Fix 1）：**不能只按「浮窗挂着」报 true**。托盘/菜单把宠物窗口隐藏后，
+  // 本 WebView 仍然活着（浮窗不会卸载）⇒ 若无条件续报 true，pet 源永不收回，后端档位
+  // 钉在 idle，Away 的 30s 空闲节奏永远进不去。故 `visible` 同时跟两个信号：
+  //  * `document.visibilityState`（窗口被隐藏/最小化时 WebView 会触发 visibilitychange）；
+  //  * `pet-visibility-changed`（`FoxbellPet` / 托盘 emit，pet.tsx 同款消费），载荷 `{visible}`。
+  // 30s 续期始终按**当前** visible 报：隐藏期间续报 false，档位才能落到 away。
+  useEffect(() => {
+    const send = (watching: boolean) => {
+      void invoke("scan_bus_watch", { watching, source: "pet" }).catch(() => {});
+    };
+    let visible = document.visibilityState === "visible";
+    let alive = true;
+    const update = (next: boolean) => {
+      if (!alive || next === visible) return;
+      visible = next;
+      send(visible);
+    };
+    // 挂载即报一次（浮窗展开 = 在看）；手动唤回的浮窗可长期停留，30s 续期必须
+    // 小于后端 90s TTL，否则驻留期间会静默掉出「在看」
+    send(visible);
+    const id = window.setInterval(() => send(visible), HEARTBEAT_INTERVAL_MS);
+    const onVisibilityChange = () => update(document.visibilityState === "visible");
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    // 载荷过类型守卫：非布尔值忽略（浏览器 mock 下 listen 只返回 undefined）
+    const un = listen<{ visible?: unknown }>("pet-visibility-changed", (e) => {
+      if (!alive) return;
+      const next = e.payload?.visible;
+      if (typeof next === "boolean") update(next);
+    }).catch(() => () => {});
+    return () => {
+      alive = false;
+      window.clearInterval(id);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+      void un.then((f) => f());
+      send(false); // 卸载收回本源的「在看」
+    };
+  }, []);
   const range: UsageRange = { preset: settings.data?.miniBarRange ?? "today" };
   const dashboard = useUsageDashboardQuery(range, "tool");
 

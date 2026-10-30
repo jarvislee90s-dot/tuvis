@@ -19,6 +19,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import { queryClient } from "@/lib/query/queryClient";
 import { setupToolsChangedListener } from "@/lib/query/toolsChangedSync";
 import { useRemoteEvents } from "@/hooks/useRemoteEvents";
+import { useScanBusHeartbeat } from "@/lib/query/queries/scanBus";
 
 const HomePage = lazy(() => import("./pages/home"));
 const AboutPage = lazy(() => import("./pages/about"));
@@ -53,6 +54,10 @@ function AppWrapper() {
   // 托盘触发的地址复制与开关失败提示）——本窗口挂载一次（浮窗/宠物窗口由
   // hook 内部 hash 守卫跳过，避免多 WebView 重复弹通知）
   useRemoteEvents();
+  // Task 9：主窗可见性心跳（可见且聚焦 = 有人在看 → 后端档位降 idle）。
+  // 只由主窗上报：通知浮窗是短暂提示窗，宠物浮窗由 UsageMiniBar 以 source="pet" 自己报
+  // （hook 不可条件调用，故用 enabled 门控）
+  useScanBusHeartbeat(!isNotificationWindow && !isPetWindow, "main");
   useEffect(() => {
     // 通知浮窗的显隐由 notification:new 事件驱动，宠物窗口由显隐状态驱动，创建时保持隐藏（避免空白窗抢显示）
     if (isNotificationWindow || isPetWindow) return;

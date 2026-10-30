@@ -1,7 +1,7 @@
 //! 扫描总线：进程内唯一的会话扫描者。
 //! 产出 Arc<Snapshot>（版本单调），所有消费方读快照；事件唤醒与动作路径补扫共用同一把单飞。
 
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -36,7 +36,11 @@ pub enum ScanReason {
 static LAST: Lazy<Mutex<Option<Arc<Snapshot>>>> = Lazy::new(|| Mutex::new(None));
 static VERSION: AtomicU64 = AtomicU64::new(0);
 static MODE: Lazy<Mutex<Mode>> = Lazy::new(|| Mutex::new(Mode::Idle));
-static WATCH_UNTIL_MS: AtomicI64 = AtomicI64::new(0);
+/// 「有人在看」按**源**记账：source → 心跳到期时刻（毫秒）。
+/// 主窗与宠物浮窗是两个 WebView，却共用同一个后端状态：单源退出（浮窗收起 / 主窗失焦）
+/// 不得清掉另一源的在看状态，故不能用一个布尔/时间戳表示
+static WATCH_UNTIL: Lazy<Mutex<std::collections::HashMap<String, i64>>> =
+    Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
 static TX: OnceLock<mpsc::Sender<ScanReason>> = OnceLock::new();
 static IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 
@@ -103,23 +107,39 @@ pub fn request_scan(reason: ScanReason) {
     }
 }
 
-/// 前端可见性心跳："有人在看" = 主窗可见且聚焦 / 浮窗展开；TTL 90s。
-/// 返回本次调用是否构成「开始观察」的上升沿（未在看/心跳过期 → 在看）：
+/// 前端可见性心跳："有人在看" = 主窗可见且聚焦 / 浮窗展开；**逐源**记账，TTL 90s。
+/// 返回本次调用是否构成「总体开始观察」的上升沿（任一源在看 → 有源在看）：
 /// 命令层据此立即请求一次补扫，窗口重新聚焦时数据不必等下一个档位周期。
-/// 用原子 swap 取旧值判定上升沿——并发心跳中只有一次能拿到边沿
-pub fn set_user_watching(watching: bool) -> bool {
+///
+/// 多源语义（主窗 "main" 与宠物浮窗 "pet" 各记一份）：
+/// * 已有任一生效源时新增/续期另一源 → 不是上升沿（总体状态没变）；
+/// * 单源退订只删自己那份，其他源仍生效 → 总体仍在看，不是上升沿；
+/// * 最后一个源退出后再有源回来 → 上升沿；过期源（心跳断供 > 90s）视同已退出。
+///
+/// 判定在锁内「先算前值、改完再算后值」，并发心跳不会各自拿到一次边沿。
+pub fn set_user_watching(source: &str, watching: bool) -> bool {
     let now = now_ms();
-    let prev = if watching {
-        WATCH_UNTIL_MS.swap(now + WATCH_TTL_MS, Ordering::SeqCst)
+    let mut map = WATCH_UNTIL.lock().unwrap_or_else(|e| e.into_inner());
+    let before = map.values().any(|until| *until > now);
+    // 每次写入顺手修剪过期项：源数量固定（main/pet），但断供的源不该长期占着 map
+    map.retain(|_, until| *until > now);
+    if watching {
+        map.insert(source.to_string(), now + WATCH_TTL_MS);
     } else {
-        WATCH_UNTIL_MS.swap(0, Ordering::SeqCst)
-    };
-    // 旧值 0（未在看）或已过期（<= now）都算上升沿
-    watching && prev <= now
+        map.remove(source);
+    }
+    let after = map.values().any(|until| *until > now);
+    !before && after
 }
 
+/// 总体「有人在看」= 任一源的心跳未过期
 fn user_watching() -> bool {
-    now_ms() < WATCH_UNTIL_MS.load(Ordering::SeqCst)
+    let now = now_ms();
+    WATCH_UNTIL
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .values()
+        .any(|until| *until > now)
 }
 
 fn now_ms() -> i64 {
@@ -309,7 +329,10 @@ pub fn reset_for_test() {
     *LAST.lock().unwrap_or_else(|e| e.into_inner()) = None;
     VERSION.store(0, Ordering::SeqCst);
     *MODE.lock().unwrap_or_else(|e| e.into_inner()) = Mode::Idle;
-    WATCH_UNTIL_MS.store(0, Ordering::SeqCst);
+    WATCH_UNTIL
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
     IN_FLIGHT.store(false, Ordering::SeqCst);
 }
 
@@ -319,7 +342,7 @@ pub fn publish_for_test(f: impl FnOnce() -> SessionsResponse) -> Arc<Snapshot> {
     publish(f())
 }
 
-/// 全局测试锁：本模块的进程共享状态（LAST / VERSION / MODE / WATCH_UNTIL_MS /
+/// 全局测试锁：本模块的进程共享状态（LAST / VERSION / MODE / WATCH_UNTIL /
 /// IN_FLIGHT）会被跨模块测试读写（如 `remote::server` 的 SSE 用例种子快照），
 /// 并行执行会互相踩踏 → 凡触碰这些状态的测试一律持本锁串行化。
 #[cfg(test)]
@@ -381,16 +404,56 @@ mod tests {
         assert!(s.version >= 1);
     }
 
-    /// F4 回归锁：只有「未在看 → 在看」的上升沿返回 true（命令层据此补扫）；
-    /// 心跳续期、停止观察都不得触发额外扫描
+    /// F4 回归锁：只有「未在看 → 在看」的**总体**上升沿返回 true（命令层据此补扫）；
+    /// 心跳续期、单源退出、停止观察都不得触发额外扫描。
+    /// 多源（main / pet）是 Task 9 的口径：两个 WebView 共用一个后端状态，单源退出
+    /// 不得清掉另一源的「在看」，也不得凭空造出一次上升沿
     #[test]
     fn set_user_watching_reports_rising_edge_only() {
         let _guard = test_guard();
         reset_for_test();
-        assert!(set_user_watching(true), "首次开始观察 = 上升沿");
-        assert!(!set_user_watching(true), "心跳续期不是上升沿");
-        assert!(!set_user_watching(false), "停止观察不是上升沿");
-        assert!(set_user_watching(true), "停止后重新观察 = 上升沿");
+        assert!(set_user_watching("main", true), "首次开始观察 = 上升沿");
+        assert!(!set_user_watching("main", true), "心跳续期不是上升沿");
+        assert!(
+            !set_user_watching("pet", true),
+            "已有源在场时新增另一源不是上升沿"
+        );
+        assert!(
+            !set_user_watching("main", false),
+            "主窗退出但 pet 仍在看 → 总体仍在看，不是上升沿"
+        );
+        assert!(user_watching(), "pet 源不因 main 退出而失效");
+        assert!(!set_user_watching("pet", true), "pet 续期仍不是上升沿");
+        assert!(
+            !set_user_watching("pet", false),
+            "最后一个源退出不是上升沿（是下降沿）"
+        );
+        assert!(!user_watching(), "全部源退出后不再是在看");
+        assert!(
+            set_user_watching("main", true),
+            "全部退出后重新观察 = 上升沿"
+        );
+        assert!(!set_user_watching("main", false));
+    }
+
+    /// TTL 按源判定：心跳断供超过 90s 的源不再算「在看」，
+    /// 也不该把另一源的首次心跳误判成续期（否则窗口重新聚焦不补扫）
+    #[test]
+    fn expired_source_does_not_count_as_watching() {
+        let _guard = test_guard();
+        reset_for_test();
+        {
+            let mut map = WATCH_UNTIL.lock().unwrap_or_else(|e| e.into_inner());
+            map.insert("pet".to_string(), now_ms() - 1);
+        }
+        assert!(!user_watching(), "过期源不算在看");
+        assert!(
+            set_user_watching("main", true),
+            "过期源在场时首个有效心跳也算上升沿"
+        );
+        // 过期项在写入时被修剪，不会长期占着 map
+        let map_len = WATCH_UNTIL.lock().unwrap_or_else(|e| e.into_inner()).len();
+        assert_eq!(map_len, 1, "过期源应被修剪，只留 main");
     }
 
     #[test]

@@ -43,12 +43,24 @@ pub fn scan_bus_status() -> serde_json::Value {
 }
 
 /// 前端可见性心跳（主窗可见且聚焦 / 浮窗展开）：置「有人在看」，TTL 内节奏降档到 idle。
-/// 上升沿（未在看 → 在看）立即请求一次事件补扫——窗口重新聚焦时数据立刻新鲜，
-/// 不必等下一个档位周期（最坏 30s）
+/// 上升沿（**总体**未在看 → 在看）立即请求一次事件补扫——窗口重新聚焦时数据立刻新鲜，
+/// 不必等下一个档位周期（最坏 30s）。
+///
+/// `source` 区分心跳来源：主窗 "main"（缺省）、宠物浮窗 "pet"。两个 WebView 共用同一后端
+/// 状态，按源记账才能让单源退出（浮窗收起 / 主窗失焦）不清掉另一源的「在看」
 #[tauri::command]
-pub fn scan_bus_watch(watching: bool) {
-    if crate::adapter::scan_bus::set_user_watching(watching) {
+pub fn scan_bus_watch(watching: bool, source: Option<String>) {
+    let source = normalize_watch_source(source);
+    if crate::adapter::scan_bus::set_user_watching(&source, watching) {
         crate::adapter::scan_bus::request_scan(crate::adapter::scan_bus::ScanReason::Event);
+    }
+}
+
+/// 心跳源归一：缺省（老前端 / 远端调用）一律记到主窗；空白串同缺省，避免造出无名源
+fn normalize_watch_source(source: Option<String>) -> String {
+    match source.map(|s| s.trim().to_string()) {
+        Some(s) if !s.is_empty() => s,
+        _ => "main".to_string(),
     }
 }
 
@@ -558,6 +570,22 @@ mod on_demand_tests {
             Some("cli"),
             false
         ));
+    }
+}
+
+#[cfg(test)]
+mod scan_watch_source_tests {
+    use super::normalize_watch_source;
+
+    /// 心跳源契约（Task 9）：缺省/空白 → "main"（老前端不带 source 也落主窗源，
+    /// 不会造出无名源干扰按源记账）；显式 source 原样保留（宠物浮窗报 "pet"）
+    #[test]
+    fn defaults_to_main_and_trims_explicit_source() {
+        assert_eq!(normalize_watch_source(None), "main");
+        assert_eq!(normalize_watch_source(Some(String::new())), "main");
+        assert_eq!(normalize_watch_source(Some("   ".to_string())), "main");
+        assert_eq!(normalize_watch_source(Some("pet".to_string())), "pet");
+        assert_eq!(normalize_watch_source(Some(" pet ".to_string())), "pet");
     }
 }
 
