@@ -1,0 +1,1104 @@
+[
+  {
+    "width": 360,
+    "theme": "light",
+    "lang": "zh",
+    "scale": "100",
+    "name": "toolbar-360-light-zh-100",
+    "ready": true,
+    "metrics": {
+      "viewportWidth": 360,
+      "docScrollWidth": 360,
+      "docClientWidth": 360,
+      "docHorizontalOverflow": false,
+      "panelScrollWidth": 360,
+      "panelClientWidth": 360,
+      "panelHorizontalOverflow": false,
+      "toolbarRows": 1,
+      "toolbarWidth": 336,
+      "toolbarScrollWidth": 336,
+      "toolbarHorizontalOverflow": false,
+      "modelWidth": 140,
+      "modelScrollWidth": 138,
+      "modelTitle": "zai/glm-4.6-air-2026-10-29-reasoning-long-context-window-variant",
+      "modelTextClipped": false,
+      "thoughtWidth": 90,
+      "officialWidth": 90,
+      "officialVisible": true,
+      "modelVisible": true,
+      "thoughtVisible": true,
+      "overflowingElements": [],
+      "toolbarChildren": [
+        {
+          "id": "zcode-open-official",
+          "left": 12,
+          "top": 310,
+          "width": 90,
+          "right": 102
+        },
+        {
+          "id": "zcode-model-select",
+          "left": 110,
+          "top": 307,
+          "width": 140,
+          "right": 250
+        },
+        {
+          "id": "zcode-thought-select",
+          "left": 258,
+          "top": 307,
+          "width": 90,
+          "right": 348
+        }
+      ]
+    },
+    "file": "docs/superpowers/reviews/2026-10-29-zcode-ui-screenshots/toolbar-360-light-zh-100.png"
+  },
+  {
+    "width": 360,
+    "theme": "light",
+    "lang": "zh",
+    "scale": "125",
+    "name": "toolbar-360-light-zh-125",
+    "ready": true,
+    "metrics": {
+      "viewportWidth": 360,
+      "docScrollWidth": 360,
+      "docClientWidth": 360,
+      "docHorizontalOverflow": false,
+      "panelScrollWidth": 360,
+      "panelClientWidth": 360,
+      "panelHorizontalOverflow": false,
+      "toolbarRows": 1,
+      "toolbarWidth": 336,
+      "toolbarScrollWidth": 336,
+      "toolbarHorizontalOverflow": false,
+      "modelWidth": 109,
+      "modelScrollWidth": 107,
+      "modelTitle": "zai/glm-4.6-air-2026-10-29-reasoning-long-context-window-variant",
+      "modelTextClipped": false,
+      "thoughtWidth": 103,
+      "officialWidth": 108,
+      "officialVisible": true,
+      "modelVisible": true,
+      "thoughtVisible": true,
+      "overflowingElements": [],
+      "toolbarChildren": [
+        {
+          "id": "zcode-open-official",
+          "left": 12,
+          "top": 356,
+          "width": 108,
+          "right": 120
+        },
+        {
+          "id": "zcode-model-select",
+          "left": 128,
+          "top": 353,
+          "width": 109,
+          "right": 237
+        },
+        {
+          "id": "zcode-thought-select",
+          "left": 245,
+          "top": 353,
+          "width": 103,
+          "right": 348
+        }
+      ]
+    },
+    "file": "docs/superpowers/reviews/2026-10-29-zcode-ui-screenshots/toolbar-360-light-zh-125.png"
+  },
+  {
+    "width": 360,
+    "theme": "light",
+    "lang": "en",
+    "scale": "100",
+    "name": "toolbar-360-light-en-100",
+    "ready": true,
+    "metrics": {
+      "viewportWidth": 360,
+      "docScrollWidth": 360,
+      "docClientWidth": 360,
+      "docHorizontalOverflow": false,
+      "panelScrollWidth": 360,
+      "panelClientWidth": 360,
+      "panelHorizontalOverflow": false,
+      "toolbarRows": 1,
+      "toolbarWidth": 336,
+      "toolbarScrollWidth": 336,
+      "toolbarHorizontalOverflow": false,
+      "modelWidth": 110,
+      "modelScrollWidth": 108,
+      "modelTitle": "zai/glm-4.6-air-2026-10-29-reasoning-long-context-window-variant",
+      "modelTextClipped": false,
+      "thoughtWidth": 90,
+      "officialWidth": 120,
+      "officialVisible": true,
+      "modelVisible": true,
+      "thoughtVisible": true,
+      "overflowingElements": [],
+      "toolbarChildren": [
+        {
+          "id": "zcode-open-official",
+          "left": 12,
+          "top": 310,
+          "width": 120,
+          "right": 132
+        },
+        {
+          "id": "zcode-model-select",
+          "left": 140,
+          "top": 307,
+          "width": 110,
+          "right": 250
+        },
+        {
+          "id": "zcode-thought-select",
+          "left": 258,
+          "top": 307,
+          "width": 90,
+          "right": 348
+        }
+      ]
+    },
+    "file": "docs/superpowers/reviews/2026-10-29-zcode-ui-screenshots/toolbar-360-light-en-100.png"
+  },
+  {
+    "width": 360,
+    "theme": "light",
+    "lang": "en",
+    "scale": "125",
+    "name": "toolbar-360-light-en-125",
+    "ready": true,
+    "metrics": {
+      "viewportWidth": 360,
+      "docScrollWidth": 360,
+      "docClientWidth": 360,
+      "docHorizontalOverflow": false,
+      "panelScrollWidth": 360,
+      "panelClientWidth": 360,
+      "panelHorizontalOverflow": false,
+      "toolbarRows": 1,
+      "toolbarWidth": 336,
+      "toolbarScrollWidth": 336,
+      "toolbarHorizontalOverflow": false,
+      "modelWidth": 71,
+      "modelScrollWidth": 69,
+      "modelTitle": "zai/glm-4.6-air-2026-10-29-reasoning-long-context-window-variant",
+      "modelTextClipped": false,
+      "thoughtWidth": 103,
+      "officialWidth": 146,
+      "officialVisible": true,
+      "modelVisible": true,
+      "thoughtVisible": true,
+      "overflowingElements": [],
+      "toolbarChildren": [
+        {
+          "id": "zcode-open-official",
+          "left": 12,
+          "top": 356,
+          "width": 146,
+          "right": 158
+        },
+        {
+          "id": "zcode-model-select",
+          "left": 166,
+          "top": 353,
+          "width": 71,
+          "right": 237
+        },
+        {
+          "id": "zcode-thought-select",
+          "left": 245,
+          "top": 353,
+          "width": 103,
+          "right": 348
+        }
+      ]
+    },
+    "file": "docs/superpowers/reviews/2026-10-29-zcode-ui-screenshots/toolbar-360-light-en-125.png"
+  },
+  {
+    "width": 360,
+    "theme": "dark",
+    "lang": "zh",
+    "scale": "100",
+    "name": "toolbar-360-dark-zh-100",
+    "ready": true,
+    "metrics": {
+      "viewportWidth": 360,
+      "docScrollWidth": 360,
+      "docClientWidth": 360,
+      "docHorizontalOverflow": false,
+      "panelScrollWidth": 360,
+      "panelClientWidth": 360,
+      "panelHorizontalOverflow": false,
+      "toolbarRows": 1,
+      "toolbarWidth": 336,
+      "toolbarScrollWidth": 336,
+      "toolbarHorizontalOverflow": false,
+      "modelWidth": 140,
+      "modelScrollWidth": 138,
+      "modelTitle": "zai/glm-4.6-air-2026-10-29-reasoning-long-context-window-variant",
+      "modelTextClipped": false,
+      "thoughtWidth": 90,
+      "officialWidth": 90,
+      "officialVisible": true,
+      "modelVisible": true,
+      "thoughtVisible": true,
+      "overflowingElements": [],
+      "toolbarChildren": [
+        {
+          "id": "zcode-open-official",
+          "left": 12,
+          "top": 310,
+          "width": 90,
+          "right": 102
+        },
+        {
+          "id": "zcode-model-select",
+          "left": 110,
+          "top": 307,
+          "width": 140,
+          "right": 250
+        },
+        {
+          "id": "zcode-thought-select",
+          "left": 258,
+          "top": 307,
+          "width": 90,
+          "right": 348
+        }
+      ]
+    },
+    "file": "docs/superpowers/reviews/2026-10-29-zcode-ui-screenshots/toolbar-360-dark-zh-100.png"
+  },
+  {
+    "width": 360,
+    "theme": "dark",
+    "lang": "zh",
+    "scale": "125",
+    "name": "toolbar-360-dark-zh-125",
+    "ready": true,
+    "metrics": {
+      "viewportWidth": 360,
+      "docScrollWidth": 360,
+      "docClientWidth": 360,
+      "docHorizontalOverflow": false,
+      "panelScrollWidth": 360,
+      "panelClientWidth": 360,
+      "panelHorizontalOverflow": false,
+      "toolbarRows": 1,
+      "toolbarWidth": 336,
+      "toolbarScrollWidth": 336,
+      "toolbarHorizontalOverflow": false,
+      "modelWidth": 109,
+      "modelScrollWidth": 107,
+      "modelTitle": "zai/glm-4.6-air-2026-10-29-reasoning-long-context-window-variant",
+      "modelTextClipped": false,
+      "thoughtWidth": 103,
+      "officialWidth": 108,
+      "officialVisible": true,
+      "modelVisible": true,
+      "thoughtVisible": true,
+      "overflowingElements": [],
+      "toolbarChildren": [
+        {
+          "id": "zcode-open-official",
+          "left": 12,
+          "top": 356,
+          "width": 108,
+          "right": 120
+        },
+        {
+          "id": "zcode-model-select",
+          "left": 128,
+          "top": 353,
+          "width": 109,
+          "right": 237
+        },
+        {
+          "id": "zcode-thought-select",
+          "left": 245,
+          "top": 353,
+          "width": 103,
+          "right": 348
+        }
+      ]
+    },
+    "file": "docs/superpowers/reviews/2026-10-29-zcode-ui-screenshots/toolbar-360-dark-zh-125.png"
+  },
+  {
+    "width": 360,
+    "theme": "dark",
+    "lang": "en",
+    "scale": "100",
+    "name": "toolbar-360-dark-en-100",
+    "ready": true,
+    "metrics": {
+      "viewportWidth": 360,
+      "docScrollWidth": 360,
+      "docClientWidth": 360,
+      "docHorizontalOverflow": false,
+      "panelScrollWidth": 360,
+      "panelClientWidth": 360,
+      "panelHorizontalOverflow": false,
+      "toolbarRows": 1,
+      "toolbarWidth": 336,
+      "toolbarScrollWidth": 336,
+      "toolbarHorizontalOverflow": false,
+      "modelWidth": 110,
+      "modelScrollWidth": 108,
+      "modelTitle": "zai/glm-4.6-air-2026-10-29-reasoning-long-context-window-variant",
+      "modelTextClipped": false,
+      "thoughtWidth": 90,
+      "officialWidth": 120,
+      "officialVisible": true,
+      "modelVisible": true,
+      "thoughtVisible": true,
+      "overflowingElements": [],
+      "toolbarChildren": [
+        {
+          "id": "zcode-open-official",
+          "left": 12,
+          "top": 310,
+          "width": 120,
+          "right": 132
+        },
+        {
+          "id": "zcode-model-select",
+          "left": 140,
+          "top": 307,
+          "width": 110,
+          "right": 250
+        },
+        {
+          "id": "zcode-thought-select",
+          "left": 258,
+          "top": 307,
+          "width": 90,
+          "right": 348
+        }
+      ]
+    },
+    "file": "docs/superpowers/reviews/2026-10-29-zcode-ui-screenshots/toolbar-360-dark-en-100.png"
+  },
+  {
+    "width": 360,
+    "theme": "dark",
+    "lang": "en",
+    "scale": "125",
+    "name": "toolbar-360-dark-en-125",
+    "ready": true,
+    "metrics": {
+      "viewportWidth": 360,
+      "docScrollWidth": 360,
+      "docClientWidth": 360,
+      "docHorizontalOverflow": false,
+      "panelScrollWidth": 360,
+      "panelClientWidth": 360,
+      "panelHorizontalOverflow": false,
+      "toolbarRows": 1,
+      "toolbarWidth": 336,
+      "toolbarScrollWidth": 336,
+      "toolbarHorizontalOverflow": false,
+      "modelWidth": 71,
+      "modelScrollWidth": 69,
+      "modelTitle": "zai/glm-4.6-air-2026-10-29-reasoning-long-context-window-variant",
+      "modelTextClipped": false,
+      "thoughtWidth": 103,
+      "officialWidth": 146,
+      "officialVisible": true,
+      "modelVisible": true,
+      "thoughtVisible": true,
+      "overflowingElements": [],
+      "toolbarChildren": [
+        {
+          "id": "zcode-open-official",
+          "left": 12,
+          "top": 356,
+          "width": 146,
+          "right": 158
+        },
+        {
+          "id": "zcode-model-select",
+          "left": 166,
+          "top": 353,
+          "width": 71,
+          "right": 237
+        },
+        {
+          "id": "zcode-thought-select",
+          "left": 245,
+          "top": 353,
+          "width": 103,
+          "right": 348
+        }
+      ]
+    },
+    "file": "docs/superpowers/reviews/2026-10-29-zcode-ui-screenshots/toolbar-360-dark-en-125.png"
+  },
+  {
+    "width": 390,
+    "theme": "light",
+    "lang": "zh",
+    "scale": "100",
+    "name": "toolbar-390-light-zh-100",
+    "ready": true,
+    "metrics": {
+      "viewportWidth": 390,
+      "docScrollWidth": 390,
+      "docClientWidth": 390,
+      "docHorizontalOverflow": false,
+      "panelScrollWidth": 390,
+      "panelClientWidth": 390,
+      "panelHorizontalOverflow": false,
+      "toolbarRows": 1,
+      "toolbarWidth": 366,
+      "toolbarScrollWidth": 366,
+      "toolbarHorizontalOverflow": false,
+      "modelWidth": 170,
+      "modelScrollWidth": 168,
+      "modelTitle": "zai/glm-4.6-air-2026-10-29-reasoning-long-context-window-variant",
+      "modelTextClipped": false,
+      "thoughtWidth": 90,
+      "officialWidth": 90,
+      "officialVisible": true,
+      "modelVisible": true,
+      "thoughtVisible": true,
+      "overflowingElements": [],
+      "toolbarChildren": [
+        {
+          "id": "zcode-open-official",
+          "left": 12,
+          "top": 310,
+          "width": 90,
+          "right": 102
+        },
+        {
+          "id": "zcode-model-select",
+          "left": 110,
+          "top": 307,
+          "width": 170,
+          "right": 280
+        },
+        {
+          "id": "zcode-thought-select",
+          "left": 288,
+          "top": 307,
+          "width": 90,
+          "right": 378
+        }
+      ]
+    },
+    "file": "docs/superpowers/reviews/2026-10-29-zcode-ui-screenshots/toolbar-390-light-zh-100.png"
+  },
+  {
+    "width": 390,
+    "theme": "light",
+    "lang": "zh",
+    "scale": "125",
+    "name": "toolbar-390-light-zh-125",
+    "ready": true,
+    "metrics": {
+      "viewportWidth": 390,
+      "docScrollWidth": 390,
+      "docClientWidth": 390,
+      "docHorizontalOverflow": false,
+      "panelScrollWidth": 390,
+      "panelClientWidth": 390,
+      "panelHorizontalOverflow": false,
+      "toolbarRows": 1,
+      "toolbarWidth": 366,
+      "toolbarScrollWidth": 366,
+      "toolbarHorizontalOverflow": false,
+      "modelWidth": 139,
+      "modelScrollWidth": 137,
+      "modelTitle": "zai/glm-4.6-air-2026-10-29-reasoning-long-context-window-variant",
+      "modelTextClipped": false,
+      "thoughtWidth": 103,
+      "officialWidth": 108,
+      "officialVisible": true,
+      "modelVisible": true,
+      "thoughtVisible": true,
+      "overflowingElements": [],
+      "toolbarChildren": [
+        {
+          "id": "zcode-open-official",
+          "left": 12,
+          "top": 356,
+          "width": 108,
+          "right": 120
+        },
+        {
+          "id": "zcode-model-select",
+          "left": 128,
+          "top": 353,
+          "width": 139,
+          "right": 267
+        },
+        {
+          "id": "zcode-thought-select",
+          "left": 275,
+          "top": 353,
+          "width": 103,
+          "right": 378
+        }
+      ]
+    },
+    "file": "docs/superpowers/reviews/2026-10-29-zcode-ui-screenshots/toolbar-390-light-zh-125.png"
+  },
+  {
+    "width": 390,
+    "theme": "light",
+    "lang": "en",
+    "scale": "100",
+    "name": "toolbar-390-light-en-100",
+    "ready": true,
+    "metrics": {
+      "viewportWidth": 390,
+      "docScrollWidth": 390,
+      "docClientWidth": 390,
+      "docHorizontalOverflow": false,
+      "panelScrollWidth": 390,
+      "panelClientWidth": 390,
+      "panelHorizontalOverflow": false,
+      "toolbarRows": 1,
+      "toolbarWidth": 366,
+      "toolbarScrollWidth": 366,
+      "toolbarHorizontalOverflow": false,
+      "modelWidth": 140,
+      "modelScrollWidth": 138,
+      "modelTitle": "zai/glm-4.6-air-2026-10-29-reasoning-long-context-window-variant",
+      "modelTextClipped": false,
+      "thoughtWidth": 90,
+      "officialWidth": 120,
+      "officialVisible": true,
+      "modelVisible": true,
+      "thoughtVisible": true,
+      "overflowingElements": [],
+      "toolbarChildren": [
+        {
+          "id": "zcode-open-official",
+          "left": 12,
+          "top": 310,
+          "width": 120,
+          "right": 132
+        },
+        {
+          "id": "zcode-model-select",
+          "left": 140,
+          "top": 307,
+          "width": 140,
+          "right": 280
+        },
+        {
+          "id": "zcode-thought-select",
+          "left": 288,
+          "top": 307,
+          "width": 90,
+          "right": 378
+        }
+      ]
+    },
+    "file": "docs/superpowers/reviews/2026-10-29-zcode-ui-screenshots/toolbar-390-light-en-100.png"
+  },
+  {
+    "width": 390,
+    "theme": "light",
+    "lang": "en",
+    "scale": "125",
+    "name": "toolbar-390-light-en-125",
+    "ready": true,
+    "metrics": {
+      "viewportWidth": 390,
+      "docScrollWidth": 390,
+      "docClientWidth": 390,
+      "docHorizontalOverflow": false,
+      "panelScrollWidth": 390,
+      "panelClientWidth": 390,
+      "panelHorizontalOverflow": false,
+      "toolbarRows": 1,
+      "toolbarWidth": 366,
+      "toolbarScrollWidth": 366,
+      "toolbarHorizontalOverflow": false,
+      "modelWidth": 101,
+      "modelScrollWidth": 99,
+      "modelTitle": "zai/glm-4.6-air-2026-10-29-reasoning-long-context-window-variant",
+      "modelTextClipped": false,
+      "thoughtWidth": 103,
+      "officialWidth": 146,
+      "officialVisible": true,
+      "modelVisible": true,
+      "thoughtVisible": true,
+      "overflowingElements": [],
+      "toolbarChildren": [
+        {
+          "id": "zcode-open-official",
+          "left": 12,
+          "top": 356,
+          "width": 146,
+          "right": 158
+        },
+        {
+          "id": "zcode-model-select",
+          "left": 166,
+          "top": 353,
+          "width": 101,
+          "right": 267
+        },
+        {
+          "id": "zcode-thought-select",
+          "left": 275,
+          "top": 353,
+          "width": 103,
+          "right": 378
+        }
+      ]
+    },
+    "file": "docs/superpowers/reviews/2026-10-29-zcode-ui-screenshots/toolbar-390-light-en-125.png"
+  },
+  {
+    "width": 390,
+    "theme": "dark",
+    "lang": "zh",
+    "scale": "100",
+    "name": "toolbar-390-dark-zh-100",
+    "ready": true,
+    "metrics": {
+      "viewportWidth": 390,
+      "docScrollWidth": 390,
+      "docClientWidth": 390,
+      "docHorizontalOverflow": false,
+      "panelScrollWidth": 390,
+      "panelClientWidth": 390,
+      "panelHorizontalOverflow": false,
+      "toolbarRows": 1,
+      "toolbarWidth": 366,
+      "toolbarScrollWidth": 366,
+      "toolbarHorizontalOverflow": false,
+      "modelWidth": 170,
+      "modelScrollWidth": 168,
+      "modelTitle": "zai/glm-4.6-air-2026-10-29-reasoning-long-context-window-variant",
+      "modelTextClipped": false,
+      "thoughtWidth": 90,
+      "officialWidth": 90,
+      "officialVisible": true,
+      "modelVisible": true,
+      "thoughtVisible": true,
+      "overflowingElements": [],
+      "toolbarChildren": [
+        {
+          "id": "zcode-open-official",
+          "left": 12,
+          "top": 310,
+          "width": 90,
+          "right": 102
+        },
+        {
+          "id": "zcode-model-select",
+          "left": 110,
+          "top": 307,
+          "width": 170,
+          "right": 280
+        },
+        {
+          "id": "zcode-thought-select",
+          "left": 288,
+          "top": 307,
+          "width": 90,
+          "right": 378
+        }
+      ]
+    },
+    "file": "docs/superpowers/reviews/2026-10-29-zcode-ui-screenshots/toolbar-390-dark-zh-100.png"
+  },
+  {
+    "width": 390,
+    "theme": "dark",
+    "lang": "zh",
+    "scale": "125",
+    "name": "toolbar-390-dark-zh-125",
+    "ready": true,
+    "metrics": {
+      "viewportWidth": 390,
+      "docScrollWidth": 390,
+      "docClientWidth": 390,
+      "docHorizontalOverflow": false,
+      "panelScrollWidth": 390,
+      "panelClientWidth": 390,
+      "panelHorizontalOverflow": false,
+      "toolbarRows": 1,
+      "toolbarWidth": 366,
+      "toolbarScrollWidth": 366,
+      "toolbarHorizontalOverflow": false,
+      "modelWidth": 139,
+      "modelScrollWidth": 137,
+      "modelTitle": "zai/glm-4.6-air-2026-10-29-reasoning-long-context-window-variant",
+      "modelTextClipped": false,
+      "thoughtWidth": 103,
+      "officialWidth": 108,
+      "officialVisible": true,
+      "modelVisible": true,
+      "thoughtVisible": true,
+      "overflowingElements": [],
+      "toolbarChildren": [
+        {
+          "id": "zcode-open-official",
+          "left": 12,
+          "top": 356,
+          "width": 108,
+          "right": 120
+        },
+        {
+          "id": "zcode-model-select",
+          "left": 128,
+          "top": 353,
+          "width": 139,
+          "right": 267
+        },
+        {
+          "id": "zcode-thought-select",
+          "left": 275,
+          "top": 353,
+          "width": 103,
+          "right": 378
+        }
+      ]
+    },
+    "file": "docs/superpowers/reviews/2026-10-29-zcode-ui-screenshots/toolbar-390-dark-zh-125.png"
+  },
+  {
+    "width": 390,
+    "theme": "dark",
+    "lang": "en",
+    "scale": "100",
+    "name": "toolbar-390-dark-en-100",
+    "ready": true,
+    "metrics": {
+      "viewportWidth": 390,
+      "docScrollWidth": 390,
+      "docClientWidth": 390,
+      "docHorizontalOverflow": false,
+      "panelScrollWidth": 390,
+      "panelClientWidth": 390,
+      "panelHorizontalOverflow": false,
+      "toolbarRows": 1,
+      "toolbarWidth": 366,
+      "toolbarScrollWidth": 366,
+      "toolbarHorizontalOverflow": false,
+      "modelWidth": 140,
+      "modelScrollWidth": 138,
+      "modelTitle": "zai/glm-4.6-air-2026-10-29-reasoning-long-context-window-variant",
+      "modelTextClipped": false,
+      "thoughtWidth": 90,
+      "officialWidth": 120,
+      "officialVisible": true,
+      "modelVisible": true,
+      "thoughtVisible": true,
+      "overflowingElements": [],
+      "toolbarChildren": [
+        {
+          "id": "zcode-open-official",
+          "left": 12,
+          "top": 310,
+          "width": 120,
+          "right": 132
+        },
+        {
+          "id": "zcode-model-select",
+          "left": 140,
+          "top": 307,
+          "width": 140,
+          "right": 280
+        },
+        {
+          "id": "zcode-thought-select",
+          "left": 288,
+          "top": 307,
+          "width": 90,
+          "right": 378
+        }
+      ]
+    },
+    "file": "docs/superpowers/reviews/2026-10-29-zcode-ui-screenshots/toolbar-390-dark-en-100.png"
+  },
+  {
+    "width": 390,
+    "theme": "dark",
+    "lang": "en",
+    "scale": "125",
+    "name": "toolbar-390-dark-en-125",
+    "ready": true,
+    "metrics": {
+      "viewportWidth": 390,
+      "docScrollWidth": 390,
+      "docClientWidth": 390,
+      "docHorizontalOverflow": false,
+      "panelScrollWidth": 390,
+      "panelClientWidth": 390,
+      "panelHorizontalOverflow": false,
+      "toolbarRows": 1,
+      "toolbarWidth": 366,
+      "toolbarScrollWidth": 366,
+      "toolbarHorizontalOverflow": false,
+      "modelWidth": 101,
+      "modelScrollWidth": 99,
+      "modelTitle": "zai/glm-4.6-air-2026-10-29-reasoning-long-context-window-variant",
+      "modelTextClipped": false,
+      "thoughtWidth": 103,
+      "officialWidth": 146,
+      "officialVisible": true,
+      "modelVisible": true,
+      "thoughtVisible": true,
+      "overflowingElements": [],
+      "toolbarChildren": [
+        {
+          "id": "zcode-open-official",
+          "left": 12,
+          "top": 356,
+          "width": 146,
+          "right": 158
+        },
+        {
+          "id": "zcode-model-select",
+          "left": 166,
+          "top": 353,
+          "width": 101,
+          "right": 267
+        },
+        {
+          "id": "zcode-thought-select",
+          "left": 275,
+          "top": 353,
+          "width": 103,
+          "right": 378
+        }
+      ]
+    },
+    "file": "docs/superpowers/reviews/2026-10-29-zcode-ui-screenshots/toolbar-390-dark-en-125.png"
+  },
+  {
+    "width": 360,
+    "theme": "light",
+    "lang": "zh",
+    "scale": "100",
+    "name": "longmodel-360-light-zh-100",
+    "ready": true,
+    "metrics": {
+      "viewportWidth": 360,
+      "docScrollWidth": 360,
+      "docClientWidth": 360,
+      "docHorizontalOverflow": false,
+      "panelScrollWidth": 360,
+      "panelClientWidth": 360,
+      "panelHorizontalOverflow": false,
+      "toolbarRows": 1,
+      "toolbarWidth": 336,
+      "toolbarScrollWidth": 336,
+      "toolbarHorizontalOverflow": false,
+      "modelWidth": 140,
+      "modelScrollWidth": 138,
+      "modelTitle": "zai/glm-4.6-air-2026-10-29-reasoning-long-context-window-variant",
+      "modelTextClipped": false,
+      "thoughtWidth": 90,
+      "officialWidth": 90,
+      "officialVisible": true,
+      "modelVisible": true,
+      "thoughtVisible": true,
+      "overflowingElements": [],
+      "toolbarChildren": [
+        {
+          "id": "zcode-open-official",
+          "left": 12,
+          "top": 310,
+          "width": 90,
+          "right": 102
+        },
+        {
+          "id": "zcode-model-select",
+          "left": 110,
+          "top": 307,
+          "width": 140,
+          "right": 250
+        },
+        {
+          "id": "zcode-thought-select",
+          "left": 258,
+          "top": 307,
+          "width": 90,
+          "right": 348
+        }
+      ]
+    },
+    "file": "docs/superpowers/reviews/2026-10-29-zcode-ui-screenshots/longmodel-360-light-zh-100.png"
+  },
+  {
+    "width": 320,
+    "theme": "light",
+    "lang": "zh",
+    "scale": "125",
+    "name": "narrow-320-light-zh-125",
+    "ready": true,
+    "metrics": {
+      "viewportWidth": 320,
+      "docScrollWidth": 320,
+      "docClientWidth": 320,
+      "docHorizontalOverflow": false,
+      "panelScrollWidth": 320,
+      "panelClientWidth": 320,
+      "panelHorizontalOverflow": false,
+      "toolbarRows": 1,
+      "toolbarWidth": 296,
+      "toolbarScrollWidth": 296,
+      "toolbarHorizontalOverflow": false,
+      "modelWidth": 69,
+      "modelScrollWidth": 67,
+      "modelTitle": "zai/glm-4.6-air-2026-10-29-reasoning-long-context-window-variant",
+      "modelTextClipped": false,
+      "thoughtWidth": 103,
+      "officialWidth": 108,
+      "officialVisible": true,
+      "modelVisible": true,
+      "thoughtVisible": true,
+      "overflowingElements": [],
+      "toolbarChildren": [
+        {
+          "id": "zcode-open-official",
+          "left": 12,
+          "top": 356,
+          "width": 108,
+          "right": 120
+        },
+        {
+          "id": "zcode-model-select",
+          "left": 128,
+          "top": 353,
+          "width": 69,
+          "right": 197
+        },
+        {
+          "id": "zcode-thought-select",
+          "left": 205,
+          "top": 353,
+          "width": 103,
+          "right": 308
+        }
+      ]
+    },
+    "file": "docs/superpowers/reviews/2026-10-29-zcode-ui-screenshots/narrow-320-light-zh-125.png"
+  },
+  {
+    "width": 360,
+    "theme": "light",
+    "lang": "zh",
+    "scale": "100",
+    "name": "attachhelp-360-light-zh-100",
+    "extra": "help=1",
+    "ready": true,
+    "metrics": {
+      "viewportWidth": 360,
+      "docScrollWidth": 360,
+      "docClientWidth": 360,
+      "docHorizontalOverflow": false,
+      "panelScrollWidth": 360,
+      "panelClientWidth": 360,
+      "panelHorizontalOverflow": false,
+      "toolbarRows": 1,
+      "toolbarWidth": 336,
+      "toolbarScrollWidth": 336,
+      "toolbarHorizontalOverflow": false,
+      "modelWidth": 140,
+      "modelScrollWidth": 138,
+      "modelTitle": "zai/glm-4.6-air-2026-10-29-reasoning-long-context-window-variant",
+      "modelTextClipped": false,
+      "thoughtWidth": 90,
+      "officialWidth": 90,
+      "officialVisible": true,
+      "modelVisible": true,
+      "thoughtVisible": true,
+      "overflowingElements": [],
+      "toolbarChildren": [
+        {
+          "id": "zcode-open-official",
+          "left": 12,
+          "top": 310,
+          "width": 90,
+          "right": 102
+        },
+        {
+          "id": "zcode-model-select",
+          "left": 110,
+          "top": 307,
+          "width": 140,
+          "right": 250
+        },
+        {
+          "id": "zcode-thought-select",
+          "left": 258,
+          "top": 307,
+          "width": 90,
+          "right": 348
+        }
+      ]
+    },
+    "file": "docs/superpowers/reviews/2026-10-29-zcode-ui-screenshots/attachhelp-360-light-zh-100.png"
+  },
+  {
+    "width": 360,
+    "theme": "light",
+    "lang": "zh",
+    "scale": "100",
+    "name": "approval-360-light-zh-100",
+    "extra": "tab=approval",
+    "ready": true,
+    "metrics": {
+      "viewportWidth": 360,
+      "docScrollWidth": 360,
+      "docClientWidth": 360,
+      "docHorizontalOverflow": false,
+      "panelScrollWidth": 360,
+      "panelClientWidth": 360,
+      "panelHorizontalOverflow": false,
+      "toolbarRows": 1,
+      "toolbarWidth": 336,
+      "toolbarScrollWidth": 336,
+      "toolbarHorizontalOverflow": false,
+      "modelWidth": 140,
+      "modelScrollWidth": 138,
+      "modelTitle": "zai/glm-4.6-air-2026-10-29-reasoning-long-context-window-variant",
+      "modelTextClipped": false,
+      "thoughtWidth": 90,
+      "officialWidth": 90,
+      "officialVisible": true,
+      "modelVisible": true,
+      "thoughtVisible": true,
+      "overflowingElements": [],
+      "toolbarChildren": [
+        {
+          "id": "zcode-open-official",
+          "left": 12,
+          "top": 274,
+          "width": 90,
+          "right": 102
+        },
+        {
+          "id": "zcode-model-select",
+          "left": 110,
+          "top": 271,
+          "width": 140,
+          "right": 250
+        },
+        {
+          "id": "zcode-thought-select",
+          "left": 258,
+          "top": 271,
+          "width": 90,
+          "right": 348
+        }
+      ]
+    },
+    "file": "docs/superpowers/reviews/2026-10-29-zcode-ui-screenshots/approval-360-light-zh-100.png"
+  }
+]
