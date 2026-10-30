@@ -171,6 +171,49 @@ function installStorageProbe(): {
   return { writes };
 }
 
+/**
+ * 浏览器存储的**白盒快照**（完全不依赖任何方法拦截）。
+ *
+ * 为什么需要它：`Storage.prototype.setItem` 探针只拦**方法调用**形式。jsdom 的
+ * `Storage` 是 Proxy，`localStorage.foo = "bar"` 走 `ProxyHandler.set` →
+ * `impl.setItem(...)`，**绕过原型方法**——探针观测不到，但值**真的落库**。
+ * 于是再加一层「读真实存储状态」的兜底：动作前后对比 `length` 与键集合/条目，
+ * 任何形式的写入都跑不掉。
+ *
+ * 与探针互为冗余，且**不依赖探针可用**：探针是「拦截写入」，快照是「读落库结果」，
+ * 后者的成立不需要前者生效（读路径没有「装不上」这种失败模式）。
+ *
+ * 键集合用两种口径互校：`Object.keys`（Proxy 的 ownKeys）与 `key(i)` 索引枚举；
+ * `entries` 额外覆盖「键集合没变但既有键被改写」的情况。
+ */
+function storageSnapshot(): {
+  local: {
+    length: number;
+    keys: string[];
+    indexedKeys: string[];
+    entries: Array<[string, string]>;
+  };
+  session: {
+    length: number;
+    keys: string[];
+    indexedKeys: string[];
+    entries: Array<[string, string]>;
+  };
+} {
+  const read = (storage: Storage) => ({
+    length: storage.length,
+    keys: Object.keys(storage).sort(),
+    indexedKeys: Array.from(
+      { length: storage.length },
+      (_, index) => storage.key(index) ?? ""
+    ).sort(),
+    entries: Object.keys(storage)
+      .sort()
+      .map((key) => [key, storage.getItem(key) ?? ""] as [string, string]),
+  });
+  return { local: read(window.localStorage), session: read(window.sessionStorage) };
+}
+
 function baseProps(overrides: Partial<CardProps> = {}): CardProps {
   return {
     pending: pendingView(),
@@ -524,6 +567,10 @@ describe("ZCode 待处理卡：既有合同不回退", () => {
     // 探针装在 `Storage.prototype` 上（jsdom 的 Storage 实例是 Proxy，实例级 spy
     // 装不上、真实写入不会计数 → 断言会永远是假绿）。详见 installStorageProbe 注释。
     const probe = installStorageProbe();
+    // 兜底基线：**不依赖任何方法拦截**的白盒快照。探针只拦方法调用形式，
+    // `localStorage.foo = "bar"` 这类属性赋值写入会绕过它（jsdom 走 Proxy 的
+    // set trap → impl.setItem），快照则直接读「有没有真的落库」，兜住所有形式。
+    const before = storageSnapshot();
     const { fn, calls } = makeSubmit();
     const pending = pendingView({
       sensitive: true,
@@ -557,9 +604,22 @@ describe("ZCode 待处理卡：既有合同不回退", () => {
       ],
     });
 
-    // 存储侧：全流程（含提交）零浏览器存储写入 —— 两种存储分桶各为零。
+    // 存储侧 ①：全流程（含提交）零浏览器存储写入 —— 两种存储分桶各为零。
     expect(probe.writes.filter((write) => write.store === "local")).toEqual([]);
     expect(probe.writes.filter((write) => write.store === "session")).toEqual([]);
+
+    // 存储侧 ②（兜底，不依赖方法拦截）：动作前后快照必须**完全一致** ——
+    // 无新增键、无新增条目、既有条目未被改写。属性赋值形式的写入也跑不掉
+    // （它绕过探针的原型方法，但一定改变 length / 键集合 / 条目）。
+    const after = storageSnapshot();
+    expect(after.local.length).toBe(before.local.length);
+    expect(after.local.keys).toEqual(before.local.keys);
+    expect(after.local.indexedKeys).toEqual(before.local.indexedKeys);
+    expect(after.local.entries).toEqual(before.local.entries);
+    expect(after.session.length).toBe(before.session.length);
+    expect(after.session.keys).toEqual(before.session.keys);
+    expect(after.session.indexedKeys).toEqual(before.session.indexedKeys);
+    expect(after.session.entries).toEqual(before.session.entries);
 
     // 自检（必须留在用例里）：同一个探针必须真的能观测到写入，否则上面两条
     // 「零写入」就是假绿。此处**故意**各写一次并断言被观测到；写完立即清理。
@@ -573,6 +633,25 @@ describe("ZCode 待处理卡：既有合同不回退", () => {
     window.sessionStorage.removeItem("zcode-storage-probe");
     expect(window.localStorage.getItem("zcode-storage-probe")).toBeNull();
     expect(window.sessionStorage.getItem("zcode-storage-probe")).toBeNull();
+
+    // 自检 ②：兜底快照同样必须能观测到写入——且**专挑探针可能抓不到的形式**
+    // （属性赋值 `localStorage.foo = v`）。若快照恒等，它就是空转断言；此处证明它会变。
+    //
+    // 为什么专挑属性赋值：jsdom 的 `Storage` 是 Proxy，`localStorage.foo = v` 走
+    // `ProxyHandler.set` → `impl.setItem(...)`，**绕过 `Storage.prototype.setItem`**
+    // （实测：值真的落库，探针观测不到——故有兜底快照的必要性）。
+    // 这里**不断言**探针是否观测到该形式（那是 jsdom 实现细节，未来版本可能改变，
+    // 断言它只会造成无谓的脆弱失败）；本用例只保证**兜底快照**对它敏感。
+    const probeBaseline = storageSnapshot();
+    (window.localStorage as unknown as Record<string, string>).zcodeStorageProbeAssign =
+      "probe-assign";
+    const probeAfter = storageSnapshot();
+    expect(probeAfter.local.length).toBe(probeBaseline.local.length + 1);
+    expect(probeAfter.local.keys).toContain("zcodeStorageProbeAssign");
+    expect(probeAfter.local.entries).toContainEqual(["zcodeStorageProbeAssign", "probe-assign"]);
+    delete (window.localStorage as unknown as Record<string, string>).zcodeStorageProbeAssign;
+    expect(storageSnapshot().local.length).toBe(probeBaseline.local.length);
+    expect(storageSnapshot().local.keys).toEqual(probeBaseline.local.keys);
   });
 });
 
