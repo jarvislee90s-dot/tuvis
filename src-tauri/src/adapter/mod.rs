@@ -20,7 +20,7 @@ use crate::session::{
 use once_cell::sync::Lazy;
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
-use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
+use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
 
 /// 读取 CLI grace period（秒），默认 5
 fn get_cli_grace_secs() -> i64 {
@@ -587,29 +587,199 @@ fn event_payload(event: Option<&crate::monitor::hooks::HookEvent>) -> Option<&st
     event.and_then(|e| e.tool_input.as_deref())
 }
 
-/// 实际扫描（单飞壳内执行；成功路径与原实现一致）
-pub(crate) fn get_all_sessions_inner() -> SessionsResponse {
-    // W5：未勾选工具不参与会话扫描（看板卡/通知随之静默）
-    let adapters: Vec<Box<dyn AgentAdapter>> = enabled_adapters();
+/// 进程名归一：取 basename（兼容 `/`、`\` 两种分隔符）→ 小写 → 去 `.exe`。
+/// sysinfo 各平台 name 形态不一（Windows 实测带 `.exe`，macOS 多为裸名），
+/// 候选匹配与白名单构建统一走此口径，避免大小写/扩展名差异导致漏配
+fn bare_name(name: &str) -> String {
+    let base = name
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(name)
+        .to_lowercase();
+    base.strip_suffix(".exe").unwrap_or(&base).to_string()
+}
 
-    // Phase 1: 刷新共享 System 快照，发现所有进程
-    let all_processes: Vec<Vec<AgentProcess>> = {
-        let mut guard = SHARED_SYSTEM.lock().unwrap();
-        let system = guard.get_or_insert_with(|| {
-            log::debug!("Initializing shared System instance");
-            System::new_with_specifics(
-                RefreshKind::nothing().with_processes(
-                    ProcessRefreshKind::nothing()
-                        .with_cmd(sysinfo::UpdateKind::Always)
-                        .with_cwd(sysinfo::UpdateKind::Always)
-                        // exe 路径是 Windows MSIX 形态判定（classify_form）的关键输入：
-                        // 缺失时 ChatGPT 内嵌 codex.exe 会被误判为 CLI（提权进程 cmd 也读不到）
-                        .with_exe(sysinfo::UpdateKind::Always)
-                        .with_cpu(),
-                ),
-            )
-        });
-        system.refresh_processes_specifics(
+/// 扫描候选进程名白名单（全部小写归一、升序去重）。
+///
+/// 两段式进程刷新的第一段只读名字层，第二段仅对候选 PID 读 cmd/cwd/exe/cpu。
+/// 白名单 =
+/// - 解释器（npm-shim 宿主：dsh 等工具的实际进程名是 node/bun，需读 cmd 才能判定）；
+/// - 全部 adapter 声明的 `process_names()`（经 [`bare_name`] 归一，如 `Codex`）；
+/// - 审计补白的特殊宿主名——名字不在 `process_names()` 里、但按 exe/cmd 发现：
+///   - `zcode`：`discover_zcode_host` 逐进程判定 exe/name（Windows 宿主 ZCode.exe），
+///     候选缺失则 exe/cmd 为空、宿主判不出 → 全部卡片消失；
+///   - `workbuddy`：心跳目录驱动发现，按 pid 回读 exe/cpu（宿主 WorkBuddy.exe）；
+///   - `chatgpt`：Windows Codex 桌面端为 MSIX（宿主 ChatGPT.exe），codex 的
+///     MSIX 形态分类与 `tool_host_alive_in` 依赖其 exe；
+///   - `deepseek harness`：dsh 声明空 `process_names()`（web 宿主名字是 node、靠 cmd
+///     判定），但桌面宿主进程名是 `DeepSeek Harness(.exe)`（Windows 安装形态见
+///     `docs/engineering/evidence/dsh-native-rpc/windows-report.md`）——漏名则第二段
+///     不读其 cmd，`find_dsh_processes` 因 `cmd.is_empty()` 跳过、`tool_host_alive_in`
+///     误判宿主死亡，dsh 卡片消失且未读池被清；
+///   - `electron`：macOS 上 WorkBuddy 的可执行体是
+///     `workbuddy.app/Contents/MacOS/Electron`（见 `monitor/host.rs` 的
+///     `is_host_process`），进程名即 `Electron`——漏名则其 exe 不读，宿主判不出。
+///     取舍：macOS 上全部 Electron 应用都会进候选集（多读若干进程的 cmd/cwd/exe），
+///     仍是全部进程的极小子集（约数十个），换取 WorkBuddy 桌面端不被误杀。
+pub(crate) fn candidate_process_names(adapter_names: &[&[&str]]) -> Vec<String> {
+    let mut v: Vec<String> = vec![
+        "node".into(),
+        "bun".into(),
+        "python".into(),
+        "python3".into(),
+        "deno".into(),
+        "zcode".into(),
+        "workbuddy".into(),
+        "chatgpt".into(),
+        "deepseek harness".into(),
+        "electron".into(),
+    ];
+    for names in adapter_names {
+        for n in *names {
+            v.push(bare_name(n));
+        }
+    }
+    v.sort();
+    v.dedup();
+    v
+}
+
+/// Phase 1 两段式刷新的候选白名单（生产入口）。
+///
+/// 刻意取自 **全部已注册 adapter**（`all_adapters()`），而非 `enabled_adapters()`：
+/// 宿主存活判定（`filter_host_dead_cards` / `dead_tools_from_pool` →
+/// `tool_host_alive_in`）复用同一 SHARED_SYSTEM 快照并按 exe/cmd 判宿主——若白名单
+/// 只含已勾选工具，「已禁用但仍在运行」的工具进程在第二段不读 exe/cmd，其宿主会被
+/// 误判死亡，未读池行被清空且重新启用后无法恢复。会话解析（Phase 2）仍只走
+/// `enabled_adapters()`，停用工具的卡/通知保持静默。
+fn refresh_candidate_process_names() -> Vec<String> {
+    let lists: Vec<&[&str]> = all_adapters().iter().map(|a| a.process_names()).collect();
+    candidate_process_names(&lists)
+}
+
+/// 两段式进程刷新（Phase 1 内核；抽为函数供活体回归测试直调，行为与内联版一致）：
+/// 第一段全量刷名字层，第二段只对候选 PID 读 cmd/cwd/exe/cpu。返回候选进程数
+fn refresh_processes_two_stage(system: &mut System, wanted_names: &[String]) -> usize {
+    // 第一段：全量刷新名字层（进程枚举本身即带名字，无需额外系统调用）
+    system.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::nothing());
+
+    // 候选集 = 名字命中「解释器 + adapter 声明名 + 特殊宿主名」白名单。
+    // 非候选进程的 cmd/cwd/exe 保持为空：所有 adapter 的发现入口要么按名字命中
+    // （白名单已全覆盖），要么按 exe/cmd 判定（特殊宿主名已补白，见
+    // candidate_process_names 文档）
+    let candidates: Vec<sysinfo::Pid> = system
+        .processes()
+        .iter()
+        .filter(|(_, p)| {
+            wanted_names
+                .binary_search(&bare_name(&p.name().to_string_lossy()))
+                .is_ok()
+        })
+        .map(|(pid, _)| *pid)
+        .collect();
+
+    // 第二段：只对候选 PID（约 20–40 个）读昂贵字段。cmd/cwd/exe 一律 Always：
+    // Windows 上 sysinfo 不保证 PID 复用时清空缓存字段，OnlyIfNotSet 会让复用后的
+    // 新进程沿用旧进程的 cmd/cwd/exe（旧的全量 Always 策略靠每轮重读自愈）；候选集
+    // 很小，每轮重读代价可忽略。cpu 需每轮刷新以维持使用率统计
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&candidates),
+        false,
+        ProcessRefreshKind::nothing()
+            .with_cmd(sysinfo::UpdateKind::Always)
+            .with_cwd(sysinfo::UpdateKind::Always)
+            // exe 路径是 Windows MSIX 形态判定（classify_form）的关键输入：
+            // 缺失时 ChatGPT 内嵌 codex.exe 会被误判为 CLI（提权进程 cmd 也读不到）
+            .with_exe(sysinfo::UpdateKind::Always)
+            .with_cpu(),
+    );
+
+    candidates.len()
+}
+
+#[cfg(test)]
+mod candidate_whitelist_tests {
+    use super::*;
+
+    #[test]
+    fn candidate_names_include_interpreters_for_shim_hosts() {
+        let names = candidate_process_names(&[&["kimi"][..]]);
+        assert!(names.contains(&"node".to_string()));
+        assert!(names.contains(&"bun".to_string()));
+        assert!(names.contains(&"kimi".to_string()));
+    }
+
+    #[test]
+    fn candidate_names_cover_all_adapters_and_special_hosts() {
+        // 生产白名单入口（get_all_sessions_inner Phase 1 实际调用）必须覆盖全部
+        // 已注册 adapter 的 process_names（大小写归一后）。
+        // 禁用状态存 DB、纯测试不触库：这里锁定可静态验证的超集性质——enabled 集
+        // 是 all 集的子集，全部 adapter 名字都在白名单 ⇒ 任意「已禁用但仍在运行」
+        // 的工具也必在白名单内，其 exe/cmd 照常刷新（宿主存活判定不误杀未读池）。
+        let names = refresh_candidate_process_names();
+        for (id, adapter) in all_adapters_with_ids() {
+            for n in adapter.process_names() {
+                assert!(
+                    names.contains(&bare_name(n)),
+                    "工具 {id} 的进程名 {n} 未进生产候选白名单"
+                );
+            }
+        }
+        // 审计补白：名字不在 process_names、但按 exe/cmd 发现的特殊宿主
+        for special in [
+            "zcode",
+            "workbuddy",
+            "chatgpt",
+            "deepseek harness",
+            "electron",
+        ] {
+            assert!(
+                names.contains(&special.to_string()),
+                "特殊宿主名 {special} 未进候选白名单"
+            );
+        }
+        // 确定性：升序且无重复（二分查找与稳定输出依赖此不变量）
+        assert!(
+            names.windows(2).all(|w| w[0] < w[1]),
+            "候选白名单须有序去重"
+        );
+    }
+
+    #[test]
+    fn candidate_names_are_normalized_to_bare_lowercase() {
+        let names = candidate_process_names(&[&["Codex", "Kimi.exe"][..]]);
+        assert!(names.contains(&"codex".to_string()));
+        assert!(names.contains(&"kimi".to_string()));
+        assert!(!names.contains(&"Codex".to_string()));
+        assert_eq!(bare_name("C:\\Program Files\\OpenAI\\Codex.EXE"), "codex");
+        assert_eq!(bare_name("/usr/local/bin/python3"), "python3");
+        // 特殊宿主名的生产形态必须归一成白名单口径（空格 + .exe / 包路径）
+        assert_eq!(
+            bare_name("D:\\Program Files\\Deepseek-Harness\\DeepSeek Harness.exe"),
+            "deepseek harness"
+        );
+        assert_eq!(
+            bare_name("/Applications/WorkBuddy.app/Contents/MacOS/Electron"),
+            "electron"
+        );
+    }
+
+    /// 活体回归（Task 11 核心验收）：全量刷新（旧路径）与两段式（新路径）
+    /// 在两个独立 System 上各跑一次，两段式的发现结果不得丢掉全量刷新已发现、
+    /// 且在两段式快照中仍然存活的进程——白名单漏名（如特殊宿主）会在此暴露。
+    ///
+    /// 机器相关：未运行的工具在两边均为 0，自然通过；只对「全量发现 ∧ 两段式
+    /// 快照仍存活」的 pid 断言覆盖，规避两次扫描间隙进程启停的抖动
+    #[test]
+    fn two_stage_refresh_preserves_all_adapter_discovery() {
+        let adapters = all_adapters();
+        // 直调生产白名单入口（全部注册 adapter），与 get_all_sessions_inner 同源
+        let wanted_names = refresh_candidate_process_names();
+
+        // 旧路径：一次全量刷新（cmd/cwd/exe/cpu 全读）
+        let mut full = System::new();
+        let full_started = std::time::Instant::now();
+        full.refresh_processes_specifics(
             ProcessesToUpdate::All,
             true,
             ProcessRefreshKind::nothing()
@@ -617,6 +787,99 @@ pub(crate) fn get_all_sessions_inner() -> SessionsResponse {
                 .with_cwd(sysinfo::UpdateKind::Always)
                 .with_exe(sysinfo::UpdateKind::Always)
                 .with_cpu(),
+        );
+        let full_elapsed = full_started.elapsed();
+
+        // 新路径：两段式刷新（生产函数直调）
+        let mut two_stage = System::new();
+        let two_stage_started = std::time::Instant::now();
+        let candidate_count = refresh_processes_two_stage(&mut two_stage, &wanted_names);
+        let two_stage_elapsed = two_stage_started.elapsed();
+
+        eprintln!(
+            "two-stage: {} processes, {} candidates, full refresh {:?} vs two-stage {:?}",
+            two_stage.processes().len(),
+            candidate_count,
+            full_elapsed,
+            two_stage_elapsed
+        );
+
+        for adapter in &adapters {
+            let expected = adapter.find_processes(&full);
+            let actual = adapter.find_processes(&two_stage);
+            eprintln!(
+                "{}: two-stage={} full={}",
+                adapter.name(),
+                actual.len(),
+                expected.len()
+            );
+
+            // 发现的每个进程都必须仍在快照中且名字非空（发现链路未读到野 pid）
+            for p in &actual {
+                let proc = two_stage
+                    .process(sysinfo::Pid::from_u32(p.pid))
+                    .unwrap_or_else(|| panic!("{} 发现 pid {} 不在快照中", adapter.name(), p.pid));
+                assert!(
+                    !proc.name().is_empty(),
+                    "{} 发现 pid {} 名字为空",
+                    adapter.name(),
+                    p.pid
+                );
+            }
+
+            // 旧路径发现、且新快照仍存活的进程必须在新路径同样被覆盖；
+            // 同时其名字必须在白名单内（否则即白名单漏名——第二段不会读它的 exe/cmd）
+            let actual_pids: HashSet<u32> = actual.iter().map(|p| p.pid).collect();
+            for p in &expected {
+                let Some(proc) = two_stage.process(sysinfo::Pid::from_u32(p.pid)) else {
+                    continue; // 两次扫描间隙退出：不判定
+                };
+                let name = bare_name(&proc.name().to_string_lossy());
+                assert!(
+                    wanted_names.binary_search(&name).is_ok(),
+                    "{} 发现进程 {}（pid={}）不在候选白名单",
+                    adapter.name(),
+                    name,
+                    p.pid
+                );
+                assert!(
+                    actual_pids.contains(&p.pid),
+                    "{} 两段式丢失存活进程 pid={}",
+                    adapter.name(),
+                    p.pid
+                );
+            }
+        }
+    }
+}
+
+/// 实际扫描（单飞壳内执行；成功路径与原实现一致）
+pub(crate) fn get_all_sessions_inner() -> SessionsResponse {
+    // W5：未勾选工具不参与会话扫描（看板卡/通知随之静默）
+    let adapters: Vec<Box<dyn AgentAdapter>> = enabled_adapters();
+
+    // Phase 1: 两段式刷新共享 System 快照，发现所有进程。
+    // 全量进程（约 400+）逐个读 cmd/cwd/exe/cpu 是本轮扫描的主要 CPU 开销，
+    // 而 adapter 的发现入口只关心「名字命中白名单」的少量进程——先全量刷名字层，
+    // 再只对候选 PID 读昂贵字段（Task 11 第二刀）
+    let all_processes: Vec<Vec<AgentProcess>> = {
+        let mut guard = SHARED_SYSTEM.lock().unwrap();
+        // 首次初始化只建空 System（廉价）；字段由下面两段刷新填充
+        let system = guard.get_or_insert_with(System::new);
+        let refresh_started = std::time::Instant::now();
+
+        // 候选白名单取自**全部注册 adapter**（非 enabled_adapters）：停用但仍在运行
+        // 的工具也须刷新 exe/cmd，否则宿主存活判定误杀其未读池行
+        // （详见 refresh_candidate_process_names 文档）
+        let candidate_names = refresh_candidate_process_names();
+        let candidate_count = refresh_processes_two_stage(system, &candidate_names);
+
+        // Task 12 验收测量入口（≤25ms）：保持 DEBUG，不得升 INFO 逐轮刷屏
+        log::debug!(
+            "scan: process refresh（两段式）耗时 {:?}，进程 {}，候选 {}",
+            refresh_started.elapsed(),
+            system.processes().len(),
+            candidate_count
         );
 
         adapters.iter().map(|a| a.find_processes(system)).collect()
