@@ -325,54 +325,98 @@ pub struct WbDbSession {
 ///   「非 NULL 但已冻结」的场合仍取两者较大值，语义与 `MAX` 一致（SQLite 的标量
 ///   `max(a, NULL)` 会返回 NULL，直接写 `MAX` 会把 NULL 行整行滤掉）。
 pub fn recent_db_sessions(home: &Path, since_ms: i64) -> Vec<WbDbSession> {
+    let sql =
+        format!("SELECT * FROM ({WB_DB_SESSIONS_SQL}) WHERE activity >= ?1 ORDER BY activity DESC");
+    query_db_sessions(home, &sql, &[&since_ms])
+}
+
+/// **按 sessionId 精确读取会话行，不受任何活动窗口约束**（R2 修正 I1）。
+///
+/// 为什么必须单独一条：心跳候选的 `status` 决定「working 时保持卡片」，而
+/// `recent_db_sessions` 会先按 300s 过滤——父会话静默 >300s（实测 10 分钟）但
+/// `status` 仍是 `working`（子代理在写）时，用 `recent` 查不到行 → `working=false`
+/// → 卡片在子代理运行期掉线（正是 08:05–08:15 的现场）。
+///
+/// 仍然遵守：`deleted_at IS NULL OR deleted_at <= 0`（-1 为 cloud 未删哨兵）、
+/// `MAX(last_activity_at, updated_at)` 的 NULL-safe 写法（见 [`WB_DB_SESSIONS_SQL`]）。
+pub fn db_sessions_by_ids(home: &Path, ids: &[String]) -> HashMap<String, WbDbSession> {
+    let mut out = HashMap::new();
+    if ids.is_empty() {
+        return out;
+    }
+    // 去重 + 排序：SQL 参数个数与顺序稳定（同 id 重复不影响结果）
+    let mut uniq: Vec<&String> = ids.iter().collect();
+    uniq.sort();
+    uniq.dedup();
+    let placeholders = vec!["?"; uniq.len()].join(",");
+    let sql = format!("SELECT * FROM ({WB_DB_SESSIONS_SQL}) WHERE id IN ({placeholders})");
+    let params: Vec<&dyn rusqlite::ToSql> =
+        uniq.iter().map(|s| *s as &dyn rusqlite::ToSql).collect();
+    for row in query_db_sessions(home, &sql, &params) {
+        out.insert(row.id.clone(), row);
+    }
+    out
+}
+
+/// 会话行的**唯一 SELECT 定义**（两个查询入口共用，杜绝漂移）：
+/// * `title` 的 `COALESCE` 是标题回退，**不受**「禁止 COALESCE 取活动时间」的裁决影响；
+/// * `activity` 必须是 `MAX(last_activity_at, updated_at)`。SQLite 的标量 `max(a, NULL)`
+///   返回 NULL，直接写 `MAX(...)` 会把 `last_activity_at` 为 NULL 的新会话整行滤掉，
+///   故只在 NULL 时退到 `updated_at`（语义仍是取较大活动时间，**不是** COALESCE 选优先级）；
+/// * `deleted_at <= 0`：cloud 形态以 **-1** 表示未删（打包代码 15 处实证）。
+const WB_DB_SESSIONS_SQL: &str = "\
+SELECT id,
+       cwd,
+       COALESCE(NULLIF(custom_title,''), title) AS title,
+       status,
+       CASE WHEN last_activity_at IS NULL THEN updated_at
+            ELSE MAX(last_activity_at, updated_at) END AS activity
+FROM sessions
+WHERE (deleted_at IS NULL OR deleted_at <= 0)";
+
+fn map_db_session_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<WbDbSession> {
+    Ok(WbDbSession {
+        id: r.get::<_, Option<String>>(0)?.unwrap_or_default(),
+        cwd: r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+        title: r.get::<_, Option<String>>(2)?,
+        status: r.get::<_, Option<String>>(3)?.unwrap_or_default(),
+        activity_ms: r.get::<_, Option<i64>>(4)?.unwrap_or(0),
+    })
+}
+
+/// 只读执行 + 逐行容错（版本漂移 / 坏行 → 空/跳过 + warn，看板降级，不 panic）。
+///
+/// 打开走 [`super::sqlite::open_usage_db`]：先 `mode=ro`（安全），失败回退
+/// `immutable=1`（缺 `-wal/-shm` 的库在 ro 下打不开）。看板读的是展示字段，
+/// 单轮滞后可容忍；打不开只降级（心跳路径仍在工作）。
+fn query_db_sessions(home: &Path, sql: &str, params: &[&dyn rusqlite::ToSql]) -> Vec<WbDbSession> {
     let db = home.join(".workbuddy").join("workbuddy.db");
-    let Some(conn) = super::sqlite::open_readonly_with_timeout(&db) else {
-        // 未安装 / 打不开 / 被锁：看板降级（心跳路径仍工作），不是错误
+    let Some(conn) = super::sqlite::open_usage_db(&db) else {
         log::debug!(
             "workbuddy: 打开 {} 失败，看板 DB 兜底本轮跳过",
             db.display()
         );
         return Vec::new();
     };
-    let mut stmt = match conn.prepare(
-        "SELECT id, cwd, title, status, activity FROM (
-            SELECT id,
-                   cwd,
-                   COALESCE(NULLIF(custom_title,''), title) AS title,
-                   status,
-                   CASE WHEN last_activity_at IS NULL THEN updated_at
-                        ELSE MAX(last_activity_at, updated_at) END AS activity
-            FROM sessions
-            WHERE (deleted_at IS NULL OR deleted_at <= 0)
-         )
-         WHERE activity >= ?1
-         ORDER BY activity DESC",
-    ) {
+    let mut stmt = match conn.prepare(sql) {
         Ok(s) => s,
         Err(e) => {
-            // 版本漂移（列缺失）/ 库损坏：看板降级，不 panic
             log::warn!(
-                "workbuddy: 读取 {} 的活跃会话失败（看板 DB 兜底本轮跳过）: {e}",
+                "workbuddy: 读取 {} 的会话行失败（看板 DB 兜底本轮跳过）: {e}",
                 db.display()
             );
             return Vec::new();
         }
     };
-    let rows = stmt.query_map([since_ms], |r| {
-        Ok(WbDbSession {
-            id: r.get::<_, Option<String>>(0)?.unwrap_or_default(),
-            cwd: r.get::<_, Option<String>>(1)?.unwrap_or_default(),
-            title: r.get::<_, Option<String>>(2)?,
-            status: r.get::<_, Option<String>>(3)?.unwrap_or_default(),
-            activity_ms: r.get::<_, Option<i64>>(4)?.unwrap_or(0),
-        })
-    });
-    let Ok(rows) = rows else {
-        log::warn!(
-            "workbuddy: 查询 {} 的活跃会话失败（看板 DB 兜底本轮跳过）",
-            db.display()
-        );
-        return Vec::new();
+    let rows = match stmt.query_map(params, map_db_session_row) {
+        Ok(r) => r,
+        Err(e) => {
+            log::warn!(
+                "workbuddy: 查询 {} 的会话行失败（看板 DB 兜底本轮跳过）: {e}",
+                db.display()
+            );
+            return Vec::new();
+        }
     };
     rows.filter_map(|r| match r {
         Ok(row) if !row.id.is_empty() => Some(row),
@@ -531,12 +575,17 @@ pub fn get_workbuddy_sessions(processes: &[AgentProcess]) -> Vec<Session> {
         return Vec::new();
     };
     let now = now_ms();
+    // 300s 窗口只用来选 **DB-only 候选**（没有心跳文件的兜底卡）
     let recent: HashMap<String, WbDbSession> =
         recent_db_sessions(&home, now as i64 - SESSION_ACTIVE_WINDOW_MS)
             .into_iter()
             .map(|r| (r.id.clone(), r))
             .collect();
-    get_workbuddy_sessions_with(&home, processes, now, &recent)
+    // 心跳候选的 status/标题走**按 id 查询**（I1）：不受 300s 约束，
+    // 否则 `working + 父静默 >300s` 会查不到行 → 卡片在子代理运行期掉线
+    get_workbuddy_sessions_with(&home, processes, now, &recent, &|ids| {
+        db_sessions_by_ids(&home, ids)
+    })
 }
 
 /// 看板候选（心跳候选与 DB-only 候选的统一形状）。
@@ -583,6 +632,7 @@ pub fn get_workbuddy_sessions_with(
     processes: &[AgentProcess],
     now: u64,
     recent: &HashMap<String, WbDbSession>,
+    by_id: &dyn Fn(&[String]) -> HashMap<String, WbDbSession>,
 ) -> Vec<Session> {
     // **L1（纵深防御）**：空进程列表不读 DB、不出卡
     if processes.is_empty() {
@@ -594,6 +644,9 @@ pub fn get_workbuddy_sessions_with(
     // ---- 候选 1：心跳进程（身份/pid 由心跳给；DB 行**必须合并**，否则拿不到 status）----
     let mut candidates: Vec<WbCandidate> = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // 先收齐心跳（pid → sessionId），再**一次性按 id** 查 DB：
+    // 一次查询、不受活动窗口约束（I1），也避免每会话各开一次 DB。
+    let mut heartbeat_hits: Vec<(String, String, u32, u64)> = Vec::new();
     for process in processes {
         // 防御：心跳文件缺失/损坏 → 跳过该进程（含 DB 兜底哨兵、空闲 prewarm）
         let Some(hb) = std::fs::read_to_string(heartbeat_path(home, process.pid))
@@ -613,12 +666,23 @@ pub fn get_workbuddy_sessions_with(
         if !seen.insert(hb.session_id.clone()) {
             continue; // 同一 sessionId 只出一张卡（心跳优先）
         }
-        let db = recent.get(&hb.session_id);
+        heartbeat_hits.push((hb.session_id, hb.cwd, process.pid, hb.last_heartbeat_ms));
+    }
+    // **关键（I1）**：这张表来自 `WHERE id IN (...)`，**没有任何活动时间过滤**——
+    // `working` 会话即使父会话静默 10 分钟也必须拿到 status，否则 `is_live` 失去主判据。
+    let by_id_rows = if heartbeat_hits.is_empty() {
+        HashMap::new()
+    } else {
+        let ids: Vec<String> = heartbeat_hits.iter().map(|(sid, ..)| sid.clone()).collect();
+        by_id(&ids)
+    };
+    for (sid, cwd, pid, last_heartbeat_ms) in heartbeat_hits {
+        let db = by_id_rows.get(&sid);
         candidates.push(WbCandidate {
-            sid: hb.session_id.clone(),
-            cwd: hb.cwd.clone(),
-            pid: process.pid,
-            last_heartbeat_ms: Some(hb.last_heartbeat_ms),
+            sid,
+            cwd,
+            pid,
+            last_heartbeat_ms: Some(last_heartbeat_ms),
             db_status: db.map(|d| d.status.clone()),
             db_title: db.and_then(|d| d.title.clone()),
             db_activity_ms: db.map(|d| d.activity_ms),
@@ -2335,6 +2399,10 @@ mod db_activity_tests {
 
 #[cfg(test)]
 mod board_tests {
+    //! 看板在场判据的**生产数据通路**测试（R2 / 评审 I1）：
+    //! 一律建真实临时 `workbuddy.db`，经 `recent_db_sessions`（300s 窗口）与
+    //! `db_sessions_by_ids`（无窗口）两条生产查询取数——**不手工往 `recent` 注入行**，
+    //! 否则测的只是本层算术，绕过了「300s 预过滤」这个真实故障点。
     use super::*;
 
     const SID: &str = "5d229cd1-c3ff-46a6-873d-4da4c4f07f8b";
@@ -2343,19 +2411,49 @@ mod board_tests {
     const ASSISTANT_TAIL: &str =
         r#"{"type":"message","role":"assistant","content":[{"type":"output_text","text":"完成"}]}"#;
 
-    fn write_heartbeat(home: &Path, pid: u32, sid: &str, cwd: &str, last_heartbeat: u64) {
+    /// 建真机同形的 `~/.workbuddy/workbuddy.db`（列子集与真机一致）
+    fn seed_db(home: &Path, rows: &[(&str, &str, i64, i64, Option<i64>)]) {
+        let dir = home.join(".workbuddy");
+        std::fs::create_dir_all(&dir).unwrap();
+        let conn = rusqlite::Connection::open(dir.join("workbuddy.db")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                cwd TEXT NOT NULL,
+                title TEXT,
+                custom_title TEXT,
+                status TEXT NOT NULL DEFAULT 'Pending',
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                last_activity_at INTEGER,
+                deleted_at INTEGER
+            );",
+        )
+        .unwrap();
+        for (id, status, last_activity, updated_at, deleted_at) in rows {
+            conn.execute(
+                "INSERT INTO sessions (id, cwd, title, custom_title, status, created_at,
+                                       updated_at, last_activity_at, deleted_at)
+                 VALUES (?1, ?2, 'DB 标题', NULL, ?3, 0, ?4, ?5, ?6)",
+                rusqlite::params![id, CWD, status, updated_at, last_activity, deleted_at],
+            )
+            .unwrap();
+        }
+    }
+
+    fn write_heartbeat(home: &Path, pid: u32, sid: &str, last_heartbeat: u64) {
         let dir = home.join(".workbuddy/sessions");
         std::fs::create_dir_all(&dir).unwrap();
         let json = format!(
-            r#"{{"pid":{pid},"sessionId":"{sid}","cwd":"{cwd}","lastHeartbeat":{last_heartbeat},"kind":"interactive"}}"#
+            r#"{{"pid":{pid},"sessionId":"{sid}","cwd":"{CWD}","lastHeartbeat":{last_heartbeat},"kind":"interactive"}}"#
         );
         std::fs::write(dir.join(format!("{pid}.json")), json).unwrap();
     }
 
-    fn write_jsonl(home: &Path, cwd: &str, sid: &str, mtime_ms: u64) {
+    fn write_jsonl(home: &Path, sid: &str, mtime_ms: u64) {
         let dir = home
             .join(".workbuddy/projects")
-            .join(mangle_project_path(cwd));
+            .join(mangle_project_path(CWD));
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join(format!("{sid}.jsonl"));
         std::fs::write(&p, format!("{ASSISTANT_TAIL}\n")).unwrap();
@@ -2365,14 +2463,16 @@ mod board_tests {
             .unwrap();
     }
 
-    fn db_row(sid: &str, status: &str, activity_ms: i64) -> WbDbSession {
-        WbDbSession {
-            id: sid.to_string(),
-            cwd: CWD.to_string(),
-            title: Some("DB 标题".into()),
-            status: status.to_string(),
-            activity_ms,
-        }
+    /// **生产数据通路**：与 `get_workbuddy_sessions` 完全相同的两条查询 + 同一个核心
+    fn run_board(home: &Path, processes: &[AgentProcess], now: u64) -> Vec<Session> {
+        let recent: HashMap<String, WbDbSession> =
+            recent_db_sessions(home, now as i64 - SESSION_ACTIVE_WINDOW_MS)
+                .into_iter()
+                .map(|r| (r.id.clone(), r))
+                .collect();
+        get_workbuddy_sessions_with(home, processes, now, &recent, &|ids| {
+            db_sessions_by_ids(home, ids)
+        })
     }
 
     fn process(pid: u32) -> AgentProcess {
@@ -2385,46 +2485,79 @@ mod board_tests {
         }
     }
 
+    fn sentinel(pid: u32) -> AgentProcess {
+        AgentProcess {
+            pid,
+            cpu_usage: 0.0,
+            cwd: None,
+            exe: None,
+            form: ProcessForm::App,
+        }
+    }
+
     /// 真机 5.9.3 现场：心跳冻结两小时，但 pid 存活 + DB 仍在写 → 必须出卡。
     /// 旧实现（90s 心跳新鲜）在这里**一张卡都没有**。
     #[test]
     fn stale_heartbeat_with_recent_db_session_is_discovered() {
         let home = tempfile::tempdir().unwrap();
         let now = now_ms();
-        write_heartbeat(home.path(), 11952, SID, CWD, now - 7_200_000);
-        write_jsonl(home.path(), CWD, SID, now - 600_000);
-        let mut recent = HashMap::new();
-        recent.insert(
-            SID.to_string(),
-            db_row(SID, "working", (now - 60_000) as i64),
+        write_heartbeat(home.path(), 11952, SID, now - 7_200_000);
+        write_jsonl(home.path(), SID, now - 600_000);
+        seed_db(
+            home.path(),
+            &[(
+                SID,
+                "working",
+                (now - 60_000) as i64,
+                (now - 60_000) as i64,
+                None,
+            )],
         );
-        let out = get_workbuddy_sessions_with(home.path(), &[process(11952)], now, &recent);
+        let out = run_board(home.path(), &[process(11952)], now);
         assert_eq!(out.len(), 1, "心跳冻结但 pid 存活 + DB 活跃 → 出卡");
         assert_eq!(out[0].id, SID);
         assert_eq!(out[0].pid, 11952);
         assert_eq!(out[0].title.as_deref(), Some("DB 标题"), "DB 标题优先");
     }
 
-    /// **08:05–08:15 现场**：心跳冻结、DB 与主 jsonl 都超过 300s、但 `status='working'`
-    /// 且进程活着（子代理仍在写）→ **不掉卡**，且状态上拉 Processing。
+    /// **I1 现场（08:05–08:15）**：心跳冻结、DB `MAX(last_activity_at,updated_at)` 与主 jsonl
+    /// **都超过 300s**、`status='working'`、pid 存活（子代理仍在写）→ **不掉卡，Processing**。
+    ///
+    /// 这个用例**必须走生产数据通路**：先断言 `recent_db_sessions` 真的把这个会话滤掉了
+    /// （否则测的不是真实故障点），再由 `db_sessions_by_ids` 把 status 取回来。
     #[test]
     fn working_session_with_frozen_heartbeat_and_stale_db_stays_while_process_alive() {
         let home = tempfile::tempdir().unwrap();
         let now = now_ms();
-        write_heartbeat(home.path(), 11952, SID, CWD, now - 7_200_000);
-        write_jsonl(home.path(), CWD, SID, now - 900_000); // 父 jsonl 静默 15 分钟
-        let mut recent = HashMap::new();
-        recent.insert(
-            SID.to_string(),
-            db_row(SID, "working", (now - 900_000) as i64),
+        write_heartbeat(home.path(), 11952, SID, now - 7_200_000);
+        write_jsonl(home.path(), SID, now - 900_000); // 父 jsonl 静默 15 分钟
+        seed_db(
+            home.path(),
+            &[(
+                SID,
+                "working",
+                (now - 900_000) as i64,
+                (now - 900_000) as i64,
+                None,
+            )],
         );
-        let out = get_workbuddy_sessions_with(home.path(), &[process(11952)], now, &recent);
+        // 前提断言（防假绿）：300s 窗口查询**确实**查不到这一行（修复前就死在这里）
+        assert!(
+            recent_db_sessions(home.path(), now as i64 - SESSION_ACTIVE_WINDOW_MS).is_empty(),
+            "前提不成立：这个夹具没有被 300s 窗口过滤，用例没测到真实故障点"
+        );
+        // 前提断言：按 id 查询**能**查回来（I1 的修复面）
+        let by_id = db_sessions_by_ids(home.path(), &[SID.to_string()]);
+        assert_eq!(by_id.get(SID).map(|r| r.status.as_str()), Some("working"));
+
+        let out = run_board(home.path(), &[process(11952)], now);
         assert_eq!(
             out.len(),
             1,
             "working + runtime_present → 父会话静默多久都不下板"
         );
         assert_eq!(out[0].status, SessionStatus::Processing, "AC9：状态上拉");
+        assert_eq!(out[0].pid, 11952);
     }
 
     /// completed 且 DB/jsonl 都超窗 → 下板（不复活、不残留）
@@ -2432,14 +2565,19 @@ mod board_tests {
     fn completed_session_with_stale_heartbeat_drops_after_window() {
         let home = tempfile::tempdir().unwrap();
         let now = now_ms();
-        write_heartbeat(home.path(), 11952, SID, CWD, now - 7_200_000);
-        write_jsonl(home.path(), CWD, SID, now - 900_000);
-        let mut recent = HashMap::new();
-        recent.insert(
-            SID.to_string(),
-            db_row(SID, "completed", (now - 900_000) as i64),
+        write_heartbeat(home.path(), 11952, SID, now - 7_200_000);
+        write_jsonl(home.path(), SID, now - 900_000);
+        seed_db(
+            home.path(),
+            &[(
+                SID,
+                "completed",
+                (now - 900_000) as i64,
+                (now - 900_000) as i64,
+                None,
+            )],
         );
-        let out = get_workbuddy_sessions_with(home.path(), &[process(11952)], now, &recent);
+        let out = run_board(home.path(), &[process(11952)], now);
         assert!(out.is_empty(), "completed + 超窗 → 无卡");
     }
 
@@ -2449,30 +2587,31 @@ mod board_tests {
     fn runtime_present_requires_matching_pid_and_session() {
         let home = tempfile::tempdir().unwrap();
         let now = now_ms();
-        // 文件名 11952.json，内容 pid=222（竞态窗口形态）
+        // DB 行**超窗**（否则 DB-only 路径会自己出一张卡，掩盖心跳判据）
+        seed_db(
+            home.path(),
+            &[(
+                SID,
+                "working",
+                (now - 900_000) as i64,
+                (now - 900_000) as i64,
+                None,
+            )],
+        );
+        write_jsonl(home.path(), SID, now - 900_000);
         let dir = home.path().join(".workbuddy/sessions");
         std::fs::create_dir_all(&dir).unwrap();
+        // 文件名 11952.json，内容 pid=222（竞态窗口形态）
         std::fs::write(
             dir.join("11952.json"),
             format!(r#"{{"pid":222,"sessionId":"{SID}","cwd":"{CWD}","lastHeartbeat":0}}"#),
         )
         .unwrap();
-        write_jsonl(home.path(), CWD, SID, now - 600_000);
-        let mut recent = HashMap::new();
-        recent.insert(
-            SID.to_string(),
-            db_row(SID, "working", (now - 60_000) as i64),
-        );
-        // DB 活跃本可以出 DB-only 卡，这里用**空 recent** 隔离出「心跳判据」本身
-        let out = get_workbuddy_sessions_with(home.path(), &[process(11952)], now, &HashMap::new());
+        let out = run_board(home.path(), &[process(11952)], now);
         assert!(out.is_empty(), "pid 交叉校验不过 → 无卡");
         // 前提断言（防假绿）：同一夹具在 pid 一致时确实出卡
-        std::fs::write(
-            dir.join("11952.json"),
-            format!(r#"{{"pid":11952,"sessionId":"{SID}","cwd":"{CWD}","lastHeartbeat":0}}"#),
-        )
-        .unwrap();
-        let out = get_workbuddy_sessions_with(home.path(), &[process(11952)], now, &recent);
+        write_heartbeat(home.path(), 11952, SID, 0);
+        let out = run_board(home.path(), &[process(11952)], now);
         assert_eq!(out.len(), 1);
     }
 
@@ -2481,9 +2620,9 @@ mod board_tests {
     fn stale_heartbeat_without_any_activity_is_dropped() {
         let home = tempfile::tempdir().unwrap();
         let now = now_ms();
-        write_heartbeat(home.path(), 11952, SID, CWD, now - 7_200_000);
-        write_jsonl(home.path(), CWD, SID, now - 900_000);
-        let out = get_workbuddy_sessions_with(home.path(), &[process(11952)], now, &HashMap::new());
+        write_heartbeat(home.path(), 11952, SID, now - 7_200_000);
+        write_jsonl(home.path(), SID, now - 900_000);
+        let out = run_board(home.path(), &[process(11952)], now);
         assert!(out.is_empty());
     }
 
@@ -2493,21 +2632,19 @@ mod board_tests {
     fn db_only_recent_session_produces_card_with_host_sentinel() {
         let home = tempfile::tempdir().unwrap();
         let now = now_ms();
-        write_jsonl(home.path(), CWD, SID, now - 600_000);
-        let mut recent = HashMap::new();
-        recent.insert(
-            SID.to_string(),
-            db_row(SID, "completed", (now - 30_000) as i64),
+        write_jsonl(home.path(), SID, now - 600_000);
+        seed_db(
+            home.path(),
+            &[(
+                SID,
+                "completed",
+                (now - 30_000) as i64,
+                (now - 30_000) as i64,
+                None,
+            )],
         );
-        let sentinel = AgentProcess {
-            pid: 8084,
-            cpu_usage: 0.0,
-            cwd: None,
-            exe: None,
-            form: ProcessForm::App,
-        };
         LAST_SEEN_SESSIONS.lock().unwrap().remove(&8084);
-        let out = get_workbuddy_sessions_with(home.path(), &[sentinel], now, &recent);
+        let out = run_board(home.path(), &[sentinel(8084)], now);
         assert_eq!(out.len(), 1, "DB 兜底必须出卡（心跳文件已不在）");
         assert_eq!(out[0].pid, 0, "DB-only 卡没有真实 pid");
         assert!(
@@ -2516,14 +2653,25 @@ mod board_tests {
         );
     }
 
-    /// 已删会话（DB 只有 `deleted_at` 过滤后的行）不得复活：recent 为空 → 无卡
+    /// 已删会话不得复活：**真实 DB** 里 `deleted_at=1` 的行两条查询都过滤掉
     #[test]
     fn deleted_db_session_is_not_shown() {
         let home = tempfile::tempdir().unwrap();
         let now = now_ms();
-        write_jsonl(home.path(), CWD, SID, now - 30_000);
-        // recent_db_sessions 已过滤 deleted_at；此处模拟过滤后的空集
-        let out = get_workbuddy_sessions_with(home.path(), &[process(8084)], now, &HashMap::new());
+        write_jsonl(home.path(), SID, now - 30_000);
+        seed_db(
+            home.path(),
+            &[(
+                SID,
+                "working",
+                (now - 30_000) as i64,
+                (now - 30_000) as i64,
+                Some(1),
+            )],
+        );
+        assert!(recent_db_sessions(home.path(), now as i64 - SESSION_ACTIVE_WINDOW_MS).is_empty());
+        assert!(db_sessions_by_ids(home.path(), &[SID.to_string()]).is_empty());
+        let out = run_board(home.path(), &[sentinel(8084)], now);
         assert!(out.is_empty(), "已删会话不得复活");
     }
 
@@ -2533,14 +2681,19 @@ mod board_tests {
     fn working_status_overrides_idle_tail_to_processing() {
         let home = tempfile::tempdir().unwrap();
         let now = now_ms();
-        write_heartbeat(home.path(), 11952, SID, CWD, now - 7_200_000);
-        write_jsonl(home.path(), CWD, SID, now - 60_000); // 1 分钟前（防抖窗之外）
-        let mut recent = HashMap::new();
-        recent.insert(
-            SID.to_string(),
-            db_row(SID, "working", (now - 30_000) as i64),
+        write_heartbeat(home.path(), 11952, SID, now - 7_200_000);
+        write_jsonl(home.path(), SID, now - 60_000); // 1 分钟前（防抖窗之外）
+        seed_db(
+            home.path(),
+            &[(
+                SID,
+                "working",
+                (now - 30_000) as i64,
+                (now - 30_000) as i64,
+                None,
+            )],
         );
-        let out = get_workbuddy_sessions_with(home.path(), &[process(11952)], now, &recent);
+        let out = run_board(home.path(), &[process(11952)], now);
         assert_eq!(out[0].status, SessionStatus::Processing);
     }
 
@@ -2549,14 +2702,19 @@ mod board_tests {
     fn completed_status_keeps_tail_derived_idle() {
         let home = tempfile::tempdir().unwrap();
         let now = now_ms();
-        write_heartbeat(home.path(), 11952, SID, CWD, now - 7_200_000);
-        write_jsonl(home.path(), CWD, SID, now - 60_000);
-        let mut recent = HashMap::new();
-        recent.insert(
-            SID.to_string(),
-            db_row(SID, "completed", (now - 30_000) as i64),
+        write_heartbeat(home.path(), 11952, SID, now - 7_200_000);
+        write_jsonl(home.path(), SID, now - 60_000);
+        seed_db(
+            home.path(),
+            &[(
+                SID,
+                "completed",
+                (now - 30_000) as i64,
+                (now - 30_000) as i64,
+                None,
+            )],
         );
-        let out = get_workbuddy_sessions_with(home.path(), &[process(11952)], now, &recent);
+        let out = run_board(home.path(), &[process(11952)], now);
         assert_eq!(
             out[0].status,
             SessionStatus::Idle,
@@ -2569,25 +2727,30 @@ mod board_tests {
     fn two_sessions_same_cwd_are_distinct_cards() {
         let home = tempfile::tempdir().unwrap();
         let now = now_ms();
-        write_heartbeat(home.path(), 11952, SID, CWD, now - 7_200_000);
-        write_heartbeat(home.path(), 36335, SID2, CWD, now - 7_200_000);
-        write_jsonl(home.path(), CWD, SID, now - 60_000);
-        write_jsonl(home.path(), CWD, SID2, now - 60_000);
-        let mut recent = HashMap::new();
-        recent.insert(
-            SID.to_string(),
-            db_row(SID, "working", (now - 30_000) as i64),
-        );
-        recent.insert(
-            SID2.to_string(),
-            db_row(SID2, "working", (now - 30_000) as i64),
-        );
-        let out = get_workbuddy_sessions_with(
+        write_heartbeat(home.path(), 11952, SID, now - 7_200_000);
+        write_heartbeat(home.path(), 36335, SID2, now - 7_200_000);
+        write_jsonl(home.path(), SID, now - 60_000);
+        write_jsonl(home.path(), SID2, now - 60_000);
+        seed_db(
             home.path(),
-            &[process(11952), process(36335)],
-            now,
-            &recent,
+            &[
+                (
+                    SID,
+                    "working",
+                    (now - 30_000) as i64,
+                    (now - 30_000) as i64,
+                    None,
+                ),
+                (
+                    SID2,
+                    "working",
+                    (now - 30_000) as i64,
+                    (now - 30_000) as i64,
+                    None,
+                ),
+            ],
         );
+        let out = run_board(home.path(), &[process(11952), process(36335)], now);
         assert_eq!(out.len(), 2);
         let ids: Vec<&str> = out.iter().map(|s| s.id.as_str()).collect();
         assert!(ids.contains(&SID) && ids.contains(&SID2));
