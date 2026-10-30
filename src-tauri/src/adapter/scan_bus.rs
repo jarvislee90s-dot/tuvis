@@ -76,7 +76,11 @@ pub fn ensure_fresh(max_age: Duration, wait: Duration) -> Arc<Snapshot> {
     match TX.get() {
         None => return scan_once(), // 扫描线程未启动 → 同步补扫
         Some(tx) => {
-            let _ = tx.send(ScanReason::Action);
+            // 已有补扫在飞 → 不再入队：并发动作调用（移动端详情页同时挂载多个端点）
+            // 否则会排 N 条冗余 Action。在飞那次发布的快照由下方轮询满足新鲜度判定
+            if !IN_FLIGHT.load(Ordering::SeqCst) {
+                let _ = tx.send(ScanReason::Action);
+            }
         }
     }
     let deadline = Instant::now() + wait;
@@ -122,10 +126,9 @@ fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
 
-/// 远控在线口径
-// TODO(Task 4): 接入 RemoteState 在线口径（SSE 在场或最近 60s API 请求）；接入前保守返回 false
+/// 远控在线口径：任一 SSE 连接在场，或最近 60s 有 API 请求（见 remote::is_online_now）
 fn remote_online() -> bool {
-    false
+    crate::remote::is_online_now()
 }
 
 /// 单飞扫描：并发调用者等待同一次扫描（返回同一快照）
@@ -200,13 +203,27 @@ pub fn start(app: tauri::AppHandle) {
                     Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 }
             };
+            // 突发合并：一次 recv 之后把通道里积压的原因全部吞掉（移动端详情页并发
+            // 挂载多端点会连发多条 Action）——一批突发只换一次扫描。纯 Event 突发仍
+            // 走既有合并节流（窗口内一次扫描，不会被放大）；积压里含非 Event 原因时
+            // 必须扫：否则与被节流的 Event 同批的 Action 会被一起丢掉。
+            let mut burst_has_job = false;
+            while let Ok(r) = rx.try_recv() {
+                if !matches!(r, ScanReason::Event) {
+                    burst_has_job = true;
+                }
+            }
             // F1 自愈：每轮工作（扫描 / 托盘 / 信号 / 档位 / emit）整体 catch_unwind。
             // 命令层已改为只读快照，唯一的扫描线程一旦被 panic 展开掉，看板与托盘就会
             // 冻结到重启——此处捕获后继续循环，最坏一个档位间隔（≤30s）内必有下一扫。
             // scan_once 内的 Drop 守卫会在展开时清 IN_FLIGHT，下一圈不会自锁。
             let round = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                // 事件合并节流：仅压 Event；Action 补扫与冷启动不得被丢弃
-                if matches!(reason, ScanReason::Event) && last_scan.elapsed() < EVENT_DEBOUNCE {
+                // 事件合并节流：仅压**孤立** Event；Action 补扫与冷启动不得被丢弃，
+                // 与 Event 同批的积压原因（burst_has_job）也不得被这条节流吞掉
+                if matches!(reason, ScanReason::Event)
+                    && !burst_has_job
+                    && last_scan.elapsed() < EVENT_DEBOUNCE
+                {
                     return;
                 }
                 let snap = scan_once();

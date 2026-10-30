@@ -1029,13 +1029,27 @@ async fn e2e_http_full_chain() {
         subagent_source: std::collections::HashMap::new(),
         subagent_message_source: std::collections::HashMap::new(),
         capability_table: multi_agents_manager_lib::inject::capability::new_table(),
-        session_source: Box::new(
-            move || multi_agents_manager_lib::session::SessionsResponse {
-                sessions: sessions.clone(),
-                total_count: total,
-                waiting_count: 0,
-            },
-        ),
+        session_source: {
+            let sessions = sessions.clone();
+            Box::new(
+                move || multi_agents_manager_lib::session::SessionsResponse {
+                    sessions: sessions.clone(),
+                    total_count: total,
+                    waiting_count: 0,
+                },
+            )
+        },
+        // 动作路径同源（Task 4）：镜像 session_source，保证端点测试数据一致
+        fresh_session_source: {
+            let sessions = sessions.clone();
+            Box::new(
+                move || multi_agents_manager_lib::session::SessionsResponse {
+                    sessions: sessions.clone(),
+                    total_count: total,
+                    waiting_count: 0,
+                },
+            )
+        },
         store: DeviceStore::memory(), // 内存库——零接触真实 ~/.tuvis/tuvis.db
         injector: Arc::new(multi_agents_manager_lib::inject::engine::RealInjector),
         resume_spawner: Arc::new(|_: &multi_agents_manager_lib::inject::resume::SpawnSpec| Ok(())),

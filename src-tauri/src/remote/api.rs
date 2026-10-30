@@ -662,8 +662,11 @@ pub async fn session_files(
     let st = st.clone();
     let (files, truncated) = tokio::task::spawn_blocking(move || {
         let (mut files, truncated) = (st.path_source)(agent.as_str(), sid.as_str(), limit);
-        // 与 /file 预览端点使用同一份会话快照 cwd，而非消息流里的 pg.cwd。
-        let preview_cwd = (st.session_source)()
+        // 列表/preview 的 cwd 基准与 /file 读取**不同源**（如实申报，勿再声称同一份）：
+        // 本端点算 file_key 用动作路径的**新鲜**快照（cwd 变更后旧快照会把 file_key
+        // 算错），而 /file（api::read_file）仍用显示快照 session_source 定 cwd——
+        // 分歧已接受，待后续收敛；两者都不使用消息流里的 pg.cwd
+        let preview_cwd = (st.fresh_session_source)()
             .sessions
             .into_iter()
             .find(|s| s.id == sid)
@@ -1130,9 +1133,11 @@ fn endpoint_audit(
 }
 
 /// 快照中按 session_id 找会话（spawn_blocking 内调用：session_source 是同步阻塞扫描）。
-/// 数据同源铁律：直调注入源（与看板/内容读取同一份快照），不另立查找函数
+/// 数据同源铁律：直调注入源（与看板/内容读取同一份快照），不另立查找函数。
+/// 动作路径口径（Task 4）：走 fresh_session_source——会话定位之后紧跟写终端动作，
+/// 不能按陈旧快照的 pid/cwd 动手
 fn find_session_sync(st: &Arc<RemoteState>, session_id: &str) -> Option<crate::session::Session> {
-    (st.session_source)()
+    (st.fresh_session_source)()
         .sessions
         .into_iter()
         .find(|s| s.id == session_id)
@@ -2597,7 +2602,8 @@ fn read_dialog_options_render_wait_with(
 /// 复合键说明（Task 5 教训）：本端点无 agent_type 入参，快照里按 id 找**第一个**匹配；
 /// id 跨工具撞名时取第一个匹配——契约如此。
 fn approve_options_scan(st: &Arc<RemoteState>, session_id: &str) -> Option<ApproveScanHit> {
-    let session = (st.session_source)()
+    // 动作路径：问答载荷组装前先取新鲜快照（按钮按下即写终端）
+    let session = (st.fresh_session_source)()
         .sessions
         .into_iter()
         .find(|s| s.id == session_id)?;
@@ -3276,8 +3282,8 @@ pub async fn session_approve(
     let probe_opt = option_id.clone();
     let lookup = match tokio::task::spawn_blocking(move || {
         // 复合键说明（Task 5 教训）：本端点无 agent_type 入参，快照里按 id 找第一个匹配；
-        // id 跨工具撞名时取第一个匹配——契约如此
-        let Some(session) = (probe_st.session_source)()
+        // id 跨工具撞名时取第一个匹配——契约如此。动作路径取新鲜快照（Task 4）
+        let Some(session) = (probe_st.fresh_session_source)()
             .sessions
             .into_iter()
             .find(|s| s.id == probe_sid)
@@ -3863,11 +3869,12 @@ pub async fn session_plan_feedback(
     if matches!(&op, PlanFeedbackOp::Type { text, submit: false } if text.trim().is_empty()) {
         return bad_request(); // 覆盖写入空文本无意义（前端已禁用，防御）
     }
-    // 会话查找（同 session_approve 的复合键契约：快照按 id 找第一个匹配）
+    // 会话查找（同 session_approve 的复合键契约：快照按 id 找第一个匹配）；
+    // 动作路径取新鲜快照（Task 4）
     let probe_st = st.clone();
     let probe_sid = sid.clone();
     let lookup = match tokio::task::spawn_blocking(move || {
-        let Some(session) = (probe_st.session_source)()
+        let Some(session) = (probe_st.fresh_session_source)()
             .sessions
             .into_iter()
             .find(|s| s.id == probe_sid)
@@ -4190,7 +4197,8 @@ pub async fn session_close(
     let sid2 = sid.clone(); // 移动副本进闭包，原值保留给审计（session-open 同一写法）
                             // Err 携带 (工具串, 原因)：工具串供审计（活快照命中才有，no_session 为空串）
     let outcome: Result<(String, ()), (String, String)> = tokio::task::spawn_blocking(move || {
-        let Some(s) = (st2.session_source)()
+        // 动作路径（远程杀进程前定位 pid）：取新鲜快照，绝不按旧 pid 杀进程
+        let Some(s) = (st2.fresh_session_source)()
             .sessions
             .into_iter()
             .find(|s| s.id == sid2)
@@ -4277,7 +4285,8 @@ pub async fn session_hide(
     };
     let st2 = st.clone();
     let outcome: Result<(), (String, String)> = tokio::task::spawn_blocking(move || {
-        let Some(s) = (st2.session_source)()
+        // 动作路径（软归档前确认 APP 会话在场）：取新鲜快照
+        let Some(s) = (st2.fresh_session_source)()
             .sessions
             .into_iter()
             .find(|s| s.id == sid)
@@ -7513,8 +7522,9 @@ pub async fn session_open(
     let outcome = match tokio::task::spawn_blocking(
         move || -> Result<(String, Result<(), String>, bool), String> {
             // 复合键口径（Task 5 教训）：快照里按 id 找第一个匹配——契约如此
-            // （mut：T3 信任归一在 spawn 前原地改写 project_path）
-            let mut session = match (probe_st.session_source)()
+            // （mut：T3 信任归一在 spawn 前原地改写 project_path）。
+            // 动作路径（远程 resume 开终端）：取新鲜快照，避免按已退出会话的旧记录开窗
+            let mut session = match (probe_st.fresh_session_source)()
                 .sessions
                 .into_iter()
                 .find(|s| s.id == probe_sid)
@@ -7675,7 +7685,8 @@ struct ModeScanHit {
 /// 权限组（codex 回执行 / kimi 底栏）不走这份快照——GET 组装处经
 /// [`read_axis_from_screen`] 单独读（权限组 current 见 `session_mode` 组载荷段）。
 fn mode_scan_sync(st: &Arc<RemoteState>, session_id: &str) -> Option<ModeScanHit> {
-    let session = (st.session_source)()
+    // 动作路径（模式/审批控制前定位会话）：取新鲜快照
+    let session = (st.fresh_session_source)()
         .sessions
         .into_iter()
         .find(|s| s.id == session_id)?;
@@ -8213,11 +8224,11 @@ pub async fn session_mode_menu(
     let Some((device_id, device_name)) = device_identity(&st, &headers) else {
         return forbidden_defense();
     };
-    // 会话查找（与 switch 端点同纪律：一个 spawn_blocking）
+    // 会话查找（与 switch 端点同纪律：一个 spawn_blocking；动作路径取新鲜快照）
     let probe_st = st.clone();
     let probe_sid = sid.clone();
     let found = tokio::task::spawn_blocking(move || {
-        (probe_st.session_source)()
+        (probe_st.fresh_session_source)()
             .sessions
             .into_iter()
             .find(|s| s.id == probe_sid)
@@ -8846,11 +8857,12 @@ pub async fn session_mode_switch(
     let Some((device_id, device_name)) = device_identity(&st, &headers) else {
         return forbidden_defense();
     };
-    // 会话查找 + 组推断 + 序列构造（一个 spawn_blocking；锁纪律同 approve）
+    // 会话查找 + 组推断 + 序列构造（一个 spawn_blocking；锁纪律同 approve）；
+    // 动作路径（写终端换模式）：取新鲜快照
     let probe_st = st.clone();
     let probe_sid = sid.clone();
     let lookup = match tokio::task::spawn_blocking(move || -> Result<_, String> {
-        let session = (probe_st.session_source)()
+        let session = (probe_st.fresh_session_source)()
             .sessions
             .into_iter()
             .find(|s| s.id == probe_sid)
@@ -9999,15 +10011,16 @@ fn tool_enabled(st: &Arc<RemoteState>, tool: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// 目标目录的活跃会话信号（黄字数据源，spec §3「不拦截」）：session_source 快照
-/// 中同工具 + 同目录（monitor::cwd 归一域，与 find_tui_pid 的 cwd 判据同款）≥1 条。
-/// spawn_blocking 内调用（session_source 是同步阻塞扫描）。
+/// 目标目录的活跃会话信号（黄字数据源，spec §3「不拦截」）：会话快照中同工具 +
+/// 同目录（monitor::cwd 归一域，与 find_tui_pid 的 cwd 判据同款）≥1 条。
+/// 动作路径（新建会话前的目录占用检查）：取新鲜快照，避免把刚退出的会话当活跃。
+/// spawn_blocking 内调用（fresh_session_source 是同步阻塞调用，可能等待补扫）
 fn has_active_session_for(st: &Arc<RemoteState>, tool: &str, dir: &str) -> bool {
     let want = crate::monitor::cwd::normalize_cwd_for_match(dir);
     if want.is_empty() {
         return false;
     }
-    (st.session_source)().sessions.iter().any(|s| {
+    (st.fresh_session_source)().sessions.iter().any(|s| {
         s.agent_type.tool_id() == tool
             && crate::monitor::cwd::normalize_cwd_for_match(&s.project_path) == want
     })

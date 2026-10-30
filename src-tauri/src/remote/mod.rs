@@ -632,6 +632,39 @@ pub fn is_online(registry_hit: bool, last_seen_at: i64, now: i64) -> bool {
     registry_hit || now - last_seen_at < 30_000
 }
 
+/// 最近一次**已认证** API 请求时刻（毫秒，0 = 从未有请求）：远控在线口径的补充信号——
+/// SSE 首帧/心跳之外，移动端每次动作请求都证明「有人在看」，扫描节奏据此不降档
+static LAST_API_AT_MS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+/// API 请求心跳（**唯一调用点**：`remote/gate.rs` 过闸成功、转发之前——只记已认证
+/// 请求；未认证的端口扫描 / 未知路径不得把扫描节奏升档）
+pub fn note_api_request() {
+    LAST_API_AT_MS.store(
+        chrono::Utc::now().timestamp_millis(),
+        std::sync::atomic::Ordering::SeqCst,
+    );
+}
+
+/// 在线窗口判定（纯函数，便于单测）：任一 SSE 连接在场，或最近 60s 有**已认证** API
+/// 请求。`last_api_ms == 0`（从未有请求）时差值极大 → 自然为假，无需特判
+fn online_from(sse: bool, last_api_ms: i64, now_ms: i64) -> bool {
+    sse || now_ms - last_api_ms < 60_000
+}
+
+/// 扫描节奏用「远控在线」口径：任一 SSE 连接在场，或最近 60s 有 API 请求。
+/// 消费方是扫描总线线程（remote_online）——**刻意不碰 `STATE`**：该单例的惰性初始化会
+/// 装配 DeviceStore / CodexControlHub / CreateTaskHub（Windows 上含 sysinfo 枚举 +
+/// AppxManifest 读盘），既不该发生在扫描线程上，且初始化一旦 panic 会永久污染 Lazy
+/// （此后本函数每次调用都 panic）。SSE 在场判据改读 `server.rs` 的独立原子计数
+/// （[`crate::remote::server::any_connection`]），与注册表增删严格配对
+pub fn is_online_now() -> bool {
+    online_from(
+        crate::remote::server::any_connection(),
+        LAST_API_AT_MS.load(std::sync::atomic::Ordering::SeqCst),
+        chrono::Utc::now().timestamp_millis(),
+    )
+}
+
 /// 16 字节随机 hex（设备 id 生成器，M5 A3 起 /pair/pin 落行消费）：零参随机形态，
 /// 不可位置式（生成器消费后复用会让不同设备撞行）
 fn random_hex_16() -> String {
@@ -661,8 +694,23 @@ static STATE: Lazy<std::sync::Arc<server::RemoteState>> = Lazy::new(|| {
         // 远程端外观配置读源（2026-10-05 UI 改版）：生产 = settings KV 单行 JSON
         //（桌面外观配置器经 set_setting 命令写入）；未配置 → None → 端点回落默认值
         ui_config_source: Box::new(|| crate::database::get_setting("remote_ui_config")),
-        // P8 数据同源：直调唯一聚合口（R3 单飞护栏保护第三消费者），禁止复制聚合逻辑
-        session_source: Box::new(crate::adapter::get_all_sessions),
+        // P8 数据同源：显示路径读扫描总线的共享快照（不触发补扫，陈旧上限 = 档位）
+        session_source: Box::new(crate::adapter::scan_bus::current_or_scan),
+        // 动作路径专用：保证快照新鲜——龄超 2s 补扫并等待（上限 3s）；超时按现有
+        // 快照降级继续并告警（F3 degraded 标记：本任务只落日志，API 契约留待后续）
+        fresh_session_source: Box::new(|| {
+            let snap = crate::adapter::scan_bus::ensure_fresh(
+                std::time::Duration::from_secs(2),
+                std::time::Duration::from_secs(3),
+            );
+            if snap.scanned_at.elapsed() > std::time::Duration::from_secs(2) {
+                log::warn!(
+                    "remote: 动作路径快照补扫超时（龄 {:?}），按 degraded 继续",
+                    snap.scanned_at.elapsed()
+                );
+            }
+            snap.data.clone()
+        }),
         // C7 配对不确定信号缝（spec §5）：运行进程 (工具, 项目) 表 = sysinfo 全量
         // 快照 + 桌面跳转门同款收集函数（同一实现单点，桌面门零改动）。非 Windows
         // 无该收集实现（桌面配对不确定门本就仅 Windows 消费）→ 空表 = 不宣称歧义
@@ -2282,6 +2330,23 @@ pub fn restore_on_launch() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 远控在线窗口的边界数学（纯函数，零全局态）：SSE 在场恒真；API 心跳的窗口
+    /// 是**严格小于** 60s——59_999ms 仍在线，整 60_000ms 已离线（扫描节奏据此降档）
+    #[test]
+    fn online_from_window_boundaries() {
+        let now = 1_700_000_000_000;
+        assert!(online_from(true, 0, now), "SSE 在场 → 在线（与心跳无关）");
+        assert!(
+            online_from(false, now - 59_999, now),
+            "心跳 59_999ms 前 → 窗口内"
+        );
+        assert!(
+            !online_from(false, now - 60_000, now),
+            "心跳整 60_000ms 前 → 出窗（严格小于）"
+        );
+        assert!(!online_from(false, 0, now), "从未有已认证请求（0）→ 不在线");
+    }
 
     /// 敏感黑名单基准的生产接线探针（M5 P2-a 追记，独立复核暴露的盲区）：
     /// 端点侧有注入缝探针，但生产 `STATE` 的接线本身此前无任何测试压住——

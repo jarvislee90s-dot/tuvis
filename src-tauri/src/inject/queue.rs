@@ -159,7 +159,8 @@ pub(crate) fn try_flush_with(
 ) -> FlushOutcome {
     // 会话 id 只在工具内唯一（watcher/dedup 同口径）：必须按 (tool, id) 复合匹配，
     // 跨工具撞 id 时裸 id 匹配会向错误会话的 pid 注入
-    let Some(session) = (st.session_source)()
+    // 动作路径：取新鲜快照（龄超窗补扫并等待），绝不按陈旧快照的会话定位去投递
+    let Some(session) = (st.fresh_session_source)()
         .sessions
         .into_iter()
         .find(|s| s.id == item.session_id && s.agent_type.tool_id() == item.agent_type)
@@ -1132,7 +1133,15 @@ mod tests {
             ui_config_source: Box::new(|| None),
             subagent_source: std::collections::HashMap::new(),
             subagent_message_source: std::collections::HashMap::new(),
-            session_source: Box::new(move || crate::session::SessionsResponse {
+            session_source: Box::new({
+                let sessions = sessions.clone();
+                move || crate::session::SessionsResponse {
+                    sessions: sessions.clone(),
+                    total_count: sessions.len(),
+                    waiting_count: 0,
+                }
+            }),
+            fresh_session_source: Box::new(move || crate::session::SessionsResponse {
                 sessions: sessions.clone(),
                 total_count: sessions.len(),
                 waiting_count: 0,

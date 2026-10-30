@@ -2016,8 +2016,23 @@ fn delivery_word(d: Delivery) -> &'static str {
 // 会话/Thread 解析（session → local ThreadKey 单点）
 // ============================================================
 
-/// 会话定位（spawn_blocking 内调用：快照扫描是重活；与 api::find_session_sync 同源）。
+/// 动作路径的会话定位（spawn_blocking 内调用：快照扫描是重活；与 api::find_session_sync 同源）。
+/// 调用方在定位之后紧跟发送/回复/中断/恢复等**写终端动作**：必须取新鲜快照，
+/// 不能按陈旧快照的 pid/cwd 动手（Task 4 F3）。
 pub(crate) fn find_session_sync(
+    st: &Arc<RemoteState>,
+    session_id: &str,
+) -> Option<crate::session::Session> {
+    // 动作路径需要新鲜快照（ensure_fresh），不得读显示层旧快照
+    (st.fresh_session_source)()
+        .sessions
+        .into_iter()
+        .find(|s| s.id == session_id)
+}
+
+/// 只读路径的会话定位（GET 线程/历史/事件流/队列/适配详情；spawn_blocking 内调用）。
+/// 纯展示读取读共享快照、不触发补扫——否则轮询会把扫描档位钉在 2s。
+pub(crate) fn find_session_display_sync(
     st: &Arc<RemoteState>,
     session_id: &str,
 ) -> Option<crate::session::Session> {
@@ -2219,7 +2234,9 @@ pub async fn thread_state(
     let probe_st = st.clone();
     let probe_sid = sid.clone();
     let session =
-        match tokio::task::spawn_blocking(move || find_session_sync(&probe_st, &probe_sid)).await {
+        match tokio::task::spawn_blocking(move || find_session_display_sync(&probe_st, &probe_sid))
+            .await
+        {
             Ok(v) => v,
             Err(e) => {
                 log::error!("codex/thread 会话扫描任务异常: {e}");
@@ -2278,7 +2295,7 @@ async fn live_projection(hub: &CodexControlHub, key: &ThreadKey) -> ThreadProjec
 ///   表示「历史末端锚点」：空历史下与投影 token 一起返回 `end`，非空历史返回
 ///   `cursor_invalid/cursor_required`（绝不猜成最新页）；
 /// - `limit` 缺省 50，允许 1..=50，其余（0/51/非数字/空）→ 400；
-/// - 复用远程鉴权（路由位于 gated nest）与 `find_session_sync` +
+/// - 复用远程鉴权（路由位于 gated nest）与 `find_session_display_sync` +
 ///   `resolve_session_thread`（错误会话 → 404；跨会话只解析到自己线程）；
 /// - 无镜像时复用 GET /codex/thread 的**有界只读** ensure/hydrate（连接 + follow +
 ///   snapshot + 既有 load-complete-history）；失败不报错，分页按镜像实际状态如实
@@ -2320,7 +2337,9 @@ pub async fn thread_messages(
     let probe_st = st.clone();
     let probe_sid = sid.clone();
     let session =
-        match tokio::task::spawn_blocking(move || find_session_sync(&probe_st, &probe_sid)).await {
+        match tokio::task::spawn_blocking(move || find_session_display_sync(&probe_st, &probe_sid))
+            .await
+        {
             Ok(value) => value,
             Err(e) => {
                 log::error!("codex/thread/messages 会话扫描任务异常: {e}");
@@ -2384,7 +2403,9 @@ pub async fn thread_events(
     let probe_st = st.clone();
     let probe_sid = sid.clone();
     let session =
-        match tokio::task::spawn_blocking(move || find_session_sync(&probe_st, &probe_sid)).await {
+        match tokio::task::spawn_blocking(move || find_session_display_sync(&probe_st, &probe_sid))
+            .await
+        {
             Ok(v) => v,
             Err(e) => {
                 log::error!("codex/thread/events 会话扫描任务异常: {e}");
@@ -3241,7 +3262,9 @@ pub async fn queue_view(
     let probe_st = st.clone();
     let probe_sid = sid.clone();
     let session =
-        match tokio::task::spawn_blocking(move || find_session_sync(&probe_st, &probe_sid)).await {
+        match tokio::task::spawn_blocking(move || find_session_display_sync(&probe_st, &probe_sid))
+            .await
+        {
             Ok(v) => v,
             Err(e) => {
                 log::error!("codex/queue 会话扫描任务异常: {e}");

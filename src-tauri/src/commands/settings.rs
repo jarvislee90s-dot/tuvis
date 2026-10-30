@@ -146,8 +146,9 @@ pub fn list_enabled_tools() -> Vec<EnabledTool> {
 
 /// T5 信号健康度：per-tool hook 通道状态（设置页「信号健康度」分区按需查询；
 /// 无轮询——仅分区打开/手动刷新时调用）。数据链路全复用既有设施：注册状态读
-/// KV、事件读 30s TTL 事件目录、会话归属走 adapter::get_all_sessions（自带单飞
-/// 护栏，与看板轮询共用快照/复扫同一份）——零新增扫描预算
+/// KV、事件读 30s TTL 事件目录、会话归属走 scan_bus::ensure_fresh（动作路径取
+/// 新鲜快照：快照龄超窗才补扫一次并等待，与扫描总线共用同一把单飞，零额外扫描
+/// 预算）
 #[tauri::command]
 pub async fn hook_signal_health() -> Vec<crate::monitor::hooks::ToolSignalHealth> {
     // 会话扫描是重活（sysinfo 全进程刷新 + 文件解析），同步命令在主线程执行会
@@ -158,7 +159,14 @@ pub async fn hook_signal_health() -> Vec<crate::monitor::hooks::ToolSignalHealth
             .filter(|a| a.hook_supported())
             .map(|a| (a.agent_type().tool_id().to_string(), a.name().to_string()))
             .collect();
-        let response = crate::adapter::get_all_sessions();
+        // 会话归属属于动作路径：宁可等一次补扫，也不拿陈旧快照做归属判定
+        //（超时上限 3s，超时后按现有快照降级继续，不阻塞面板）
+        let response = crate::adapter::scan_bus::ensure_fresh(
+            std::time::Duration::from_secs(2),
+            std::time::Duration::from_secs(3),
+        )
+        .data
+        .clone();
         let registered_of = |tool_id: &str| {
             crate::database::get_setting(&format!("hooks_registered_{tool_id}")).as_deref()
                 == Some("true")
@@ -194,4 +202,26 @@ pub async fn hook_signal_health() -> Vec<crate::monitor::hooks::ToolSignalHealth
         ::log::error!("hook_signal_health 扫描任务异常: {e}");
         Vec::new()
     })
+}
+
+#[cfg(test)]
+mod action_path_snapshot_lock_tests {
+    /// 源码锁：设置页「信号健康度」的会话归属属于动作路径，必须经
+    /// `scan_bus::ensure_fresh` 取新鲜快照，不得回退到直调扫描。
+    /// 断言串用 `concat!` 拼接：`include_str!` 会把本文件（含本测试）一并纳入被检
+    /// 源码，整串字面量直接写在断言里会自我命中（同 commands/session.rs 先例）。
+    #[test]
+    fn session_attribution_uses_fresh_snapshot() {
+        let src = include_str!("settings.rs");
+        let fresh = concat!("scan_bus::", "ensure_fresh");
+        let direct_scan = concat!("adapter::", "get_all_sessions");
+        assert!(
+            src.contains(fresh),
+            "会话归属应经 scan_bus::ensure_fresh 取新鲜快照"
+        );
+        assert!(
+            !src.contains(direct_scan),
+            "不得直调 get_all_sessions（动作路径须保证快照新鲜）"
+        );
+    }
 }

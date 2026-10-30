@@ -385,8 +385,9 @@ pub fn dismiss_session_card(agent_type: String, session_id: String, status: Stri
 
 /// R5 一键 resume（桌面卡「在电脑上打开」）：按 session_id 在当前快照里找会话，
 /// 交 inject::resume 核心开终端恢复（Windows wt/conhost、macOS iTerm2/Terminal）。
-/// 数据同源：读扫描总线的共享快照（与看板同一份数据；冷启动无快照才同步补扫）；
-/// id 跨工具撞名取第一个匹配（远端 session-open 端点同口径）。命令表未收录的
+/// 数据同源：动作路径经扫描总线的 ensure_fresh 取新鲜快照（龄超 2s 则补扫并等待，
+/// 上限 3s；超时按现有快照降级继续），与看板同一份数据；id 跨工具撞名取第一个
+/// 匹配（远端 session-open 端点同口径）。命令表未收录的
 /// 工具 / 无 cwd 由核心返回哨兵串，转译为前端可展示的中文文案；本机路径不写审计
 /// （audit_write 需设备身份，审计口径 = 远端设备动作留痕，见 inject::resume 模块注释）。
 /// 评审 M3：快照读取 + 核心并进同一 spawn_blocking——核心内 `where wt` 首调探测是
@@ -400,11 +401,16 @@ pub async fn session_open(app: tauri::AppHandle, session_id: String) -> Result<(
     tauri::async_runtime::spawn_blocking(move || {
         // mut：T3 信任归一在 spawn 前原地改写 project_path（claude 专属，只读
         // ~/.claude.json 永不写）
-        let mut session = crate::adapter::scan_bus::current_or_scan()
-            .sessions
-            .into_iter()
-            .find(|s| s.id == sid)
-            .ok_or_else(|| "会话不在当前列表（可能已退出）".to_string())?;
+        let mut session = crate::adapter::scan_bus::ensure_fresh(
+            std::time::Duration::from_secs(2),
+            std::time::Duration::from_secs(3),
+        )
+        .data
+        .sessions
+        .iter()
+        .find(|s| s.id == sid)
+        .cloned()
+        .ok_or_else(|| "会话不在当前列表（可能已退出）".to_string())?;
         // T3 信任归一：命中已信任条款复用其精确 casing（防 claude 信任弹窗挂起）。
         // 桌面发起 → 桌面 surface：不冒用会话状态卡浮窗（NotificationPayload 形态
         // 是会话卡，信任提醒非会话卡）——走系统通知 toast（consume_codex_trust_notice

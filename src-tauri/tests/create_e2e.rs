@@ -917,6 +917,8 @@ async fn e2e_create_http_full_chain() {
     let state = Arc::new(RemoteState {
         capability_table: multi_agents_manager_lib::inject::capability::new_table(),
         session_source: Box::new(multi_agents_manager_lib::adapter::get_all_sessions),
+        // 动作路径同源（Task 4）：镜像 session_source（同一真实聚合口）
+        fresh_session_source: Box::new(multi_agents_manager_lib::adapter::get_all_sessions),
         pairing_counter: Box::new(c9_running_projects),
         ui_config_source: Box::new(|| None),
         subagent_source: std::collections::HashMap::new(),

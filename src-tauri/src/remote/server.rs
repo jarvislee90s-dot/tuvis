@@ -145,6 +145,32 @@ async fn mobile_index() -> Response {
 /// 活跃连接句柄表（clippy::type_complexity 门禁适配：复杂类型抽别名，语义同原稿内联形）
 type DeviceConns = std::collections::HashMap<String, Vec<(u64, tokio::sync::oneshot::Sender<()>)>>;
 
+/// 活跃 SSE 连接计数（Task 4 评审修订）：扫描线程的「远控在线」口径只需一个全局布尔，
+/// **不得**为它解引用 `remote::STATE`——那会在扫描线程上首次触发 DeviceStore /
+/// CodexControlHub / CreateTaskHub 的惰性装配（Windows 上 `CodexControlHub::production`
+/// 还要做一次 sysinfo 枚举 + AppxManifest 读盘），且 STATE 初始化若 panic 会把 Lazy
+/// 永久污染，让在线判定此后每次调用都 panic。计数与 [`SseRegistry`] 的增删**一一对应**
+/// （register +1；仅实际移除的条目 -1），故恒不小于 0。
+static SSE_CONNS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// 是否存在任一活跃 SSE 连接（纯原子读：不加锁、不触任何 Lazy）。
+/// 在线口径的消费方见 `remote::is_online_now`（扫描线程每个档位读一次）
+pub fn any_connection() -> bool {
+    SSE_CONNS.load(std::sync::atomic::Ordering::SeqCst) > 0
+}
+
+/// 计数递减（**防下溢**）：只对真实移除的条数调用；即便将来出现配对失衡，
+/// `saturating_sub` 也只会把计数压在 0——回绕成巨值会让在线口径永久为真、节奏永不降档
+fn release_connections(n: usize) {
+    if n > 0 {
+        let _ = SSE_CONNS.fetch_update(
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+            |cur| Some(cur.saturating_sub(n)),
+        );
+    }
+}
+
 /// SSE 连接注册表（M4 T0a）：device_id → 活跃连接句柄表。
 /// 断连语义：吊销/停止时对目标设备的全部连接发 oneshot 关闭信号，
 /// SSE 流的 `take_until` 收到信号即终止 → axum 关闭该 HTTP 连接；
@@ -165,28 +191,41 @@ impl SseRegistry {
             .next_id
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let (tx, rx) = tokio::sync::oneshot::channel();
-        self.inner
-            .lock()
-            .unwrap()
-            .entry(device.to_string())
-            .or_default()
-            .push((id, tx));
+        {
+            // 插入条目与在线计数 +1 必须在**同一临界区**内完成：若先释放注册表锁再计数，
+            // 并发的 disconnect_*（或紧随其后的自然断开）可能在计数还是 0 时就递减
+            // （saturating 到 0），随后本次 +1 把计数留在 1 而注册表里已无对应条目，
+            // unregister 无从修复 → any_connection() 永久为真、节奏永不降档。
+            let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            guard.entry(device.to_string()).or_default().push((id, tx));
+            // 在线计数 +1（与下表条目严格配对；读侧 server::any_connection）
+            SSE_CONNS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
         (id, rx)
     }
 
     /// 自然断开反注册（幂等：未知 id 静默忽略）。
-    /// 写法适配（clippy::option_map_unit_fn 门禁）：原稿 `.map(|v| …)` 改 `if let`，语义不变
+    /// 写法适配（clippy::option_map_unit_fn 门禁）：原稿 `.map(|v| …)` 改 `if let`，语义不变。
+    /// **只有真的摘掉了一条**才递减在线计数（重复 Drop / 未知 id 不得多减）
     pub fn unregister(&self, device: &str, id: u64) {
-        if let Some(v) = self.inner.lock().unwrap().get_mut(device) {
-            v.retain(|(i, _)| *i != id);
-        }
+        // 摘除与计数递减同持一把锁：先减后放锁会给并发 register 留下「条目已无、计数未减」的窗口
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let removed = match guard.get_mut(device) {
+            Some(v) => {
+                let before = v.len();
+                v.retain(|(i, _)| *i != id);
+                before - v.len()
+            }
+            None => 0,
+        };
+        release_connections(removed);
     }
 
     /// 断开指定设备的全部连接，返回断开数
     pub fn disconnect_device(&self, device: &str) -> usize {
-        self.inner
-            .lock()
-            .unwrap()
+        // 移除与计数递减同持一把锁（避免释放锁后、减计数前与 register 交错的计数漂移）
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let removed = guard
             .remove(device)
             .map(|v| {
                 // 编译适配（oneshot::Sender::send 消费 self，不能按引用迭代 send）：
@@ -197,12 +236,14 @@ impl SseRegistry {
                 }
                 n
             })
-            .unwrap_or(0)
+            .unwrap_or(0);
+        release_connections(removed);
+        removed
     }
 
     /// 断开全部设备连接（停止远程 / 全部吊销），返回断开数
     pub fn disconnect_all(&self) -> usize {
-        let mut map = self.inner.lock().unwrap();
+        let mut map = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let n: usize = map.values().map(Vec::len).sum();
         // 编译适配（send 消费 Sender，需持所有权迭代）：drain 等价于原稿的
         // 「逐个 send 后 map.clear()」
@@ -211,6 +252,8 @@ impl SseRegistry {
                 let _ = tx.send(());
             }
         }
+        // drain 与计数递减同持一把锁（guard 在本行之后才随函数返回释放）
+        release_connections(n);
         n
     }
 
@@ -218,7 +261,7 @@ impl SseRegistry {
     pub fn has(&self, device: &str) -> bool {
         self.inner
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .get(device)
             .is_some_and(|v| !v.is_empty())
     }
@@ -479,8 +522,14 @@ pub type SubagentMessageSourceFn =
     dyn Fn(&str, &str, usize) -> Result<crate::remote::content::MessagesPage, String> + Send + Sync;
 
 pub struct RemoteState {
-    /// 会话数据源（P8 同源）：生产 = adapter::get_all_sessions；测试注入
+    /// 会话数据源（P8 同源）：生产 = scan_bus::current_or_scan（读共享快照）；
+    /// 测试注入。**显示路径**用本缝（不触发补扫，陈旧上限 = 扫描档位）
     pub session_source: Box<dyn Fn() -> crate::session::SessionsResponse + Send + Sync>,
+    /// 动作路径专用：保证快照新鲜（显示路径仍用 session_source 读旧快照）。
+    /// 生产 = scan_bus::ensure_fresh（龄超 2s 补扫并等待，上限 3s；超时降级用现有
+    /// 快照并告警）。发送/中断/问答/恢复/会话定位等**会写终端**的端点和注入队列
+    /// 只消费本缝——绝不拿陈旧快照定位会话后动手
+    pub fresh_session_source: Box<dyn Fn() -> crate::session::SessionsResponse + Send + Sync>,
     /// C7 配对不确定信号缝（spec §5）：运行进程的 (工具, 项目) 表——/sessions 打标
     /// `pairingAmbiguous`、session-send 成功回执附 `pairingHint`（**只提示不拦截**）。
     /// 生产 = sysinfo 全量快照 + 桌面跳转门同款 `running_projects_from_processes`
@@ -857,6 +906,11 @@ mod tests {
             subagent_message_source: std::collections::HashMap::new(),
             capability_table: crate::inject::capability::new_table(),
             session_source: Box::new(|| crate::session::SessionsResponse {
+                sessions: vec![],
+                total_count: 7,
+                waiting_count: 0,
+            }),
+            fresh_session_source: Box::new(|| crate::session::SessionsResponse {
                 sessions: vec![],
                 total_count: 7,
                 waiting_count: 0,
@@ -1517,6 +1571,14 @@ mod tests {
                     waiting_count: 0,
                 }
             }),
+            fresh_session_source: Box::new(|| {
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                crate::session::SessionsResponse {
+                    sessions: vec![],
+                    total_count: 42,
+                    waiting_count: 0,
+                }
+            }),
             store: crate::remote::pairing::DeviceStore::memory(),
             // M7 Task 5：注入器缝——端点测试不触 flush 路径，用生产占位（Windows 为 Err 桩）
             injector: std::sync::Arc::new(crate::inject::engine::RealInjector),
@@ -1907,6 +1969,11 @@ mod tests {
             subagent_message_source: std::collections::HashMap::new(),
             capability_table: crate::inject::capability::new_table(),
             session_source: Box::new(|| crate::session::SessionsResponse {
+                sessions: vec![],
+                total_count: 0,
+                waiting_count: 0,
+            }),
+            fresh_session_source: Box::new(|| crate::session::SessionsResponse {
                 sessions: vec![],
                 total_count: 0,
                 waiting_count: 0,
@@ -2344,6 +2411,11 @@ mod tests {
                 total_count: 0,
                 waiting_count: 0,
             }),
+            fresh_session_source: Box::new(|| crate::session::SessionsResponse {
+                sessions: vec![],
+                total_count: 0,
+                waiting_count: 0,
+            }),
             store: crate::remote::pairing::DeviceStore::memory(),
             // M7 Task 5：注入器缝——端点测试不触 flush 路径，用生产占位（Windows 为 Err 桩）
             injector: std::sync::Arc::new(crate::inject::engine::RealInjector),
@@ -2565,7 +2637,15 @@ mod tests {
             subagent_source: std::collections::HashMap::new(),
             subagent_message_source: std::collections::HashMap::new(),
             capability_table: crate::inject::capability::new_table(),
-            session_source: Box::new(move || crate::session::SessionsResponse {
+            session_source: Box::new({
+                let session = session.clone();
+                move || crate::session::SessionsResponse {
+                    sessions: vec![session.clone()],
+                    total_count: 1,
+                    waiting_count: 0,
+                }
+            }),
+            fresh_session_source: Box::new(move || crate::session::SessionsResponse {
                 sessions: vec![session.clone()],
                 total_count: 1,
                 waiting_count: 0,
@@ -2876,7 +2956,15 @@ mod tests {
             subagent_source: std::collections::HashMap::new(),
             subagent_message_source: std::collections::HashMap::new(),
             capability_table: crate::inject::capability::new_table(),
-            session_source: Box::new(move || crate::session::SessionsResponse {
+            session_source: Box::new({
+                let session = session.clone();
+                move || crate::session::SessionsResponse {
+                    sessions: vec![session.clone()],
+                    total_count: 1,
+                    waiting_count: 0,
+                }
+            }),
+            fresh_session_source: Box::new(move || crate::session::SessionsResponse {
                 sessions: vec![session.clone()],
                 total_count: 1,
                 waiting_count: 0,
@@ -3063,6 +3151,11 @@ mod tests {
                 subagent_message_source: std::collections::HashMap::new(),
                 capability_table: crate::inject::capability::new_table(),
                 session_source: Box::new(|| crate::session::SessionsResponse {
+                    sessions: vec![],
+                    total_count: 7,
+                    waiting_count: 0,
+                }),
+                fresh_session_source: Box::new(|| crate::session::SessionsResponse {
                     sessions: vec![],
                     total_count: 7,
                     waiting_count: 0,
@@ -4284,6 +4377,11 @@ mod tests {
                         total_count: 0,
                         waiting_count: 0,
                     }),
+                    fresh_session_source: Box::new(|| crate::session::SessionsResponse {
+                        sessions: vec![],
+                        total_count: 0,
+                        waiting_count: 0,
+                    }),
                     store: crate::remote::pairing::DeviceStore::memory(),
                     // M7 Task 5：注入器缝——端点测试不触 flush 路径，用生产占位（Windows 为 Err 桩）
                     injector: std::sync::Arc::new(crate::inject::engine::RealInjector),
@@ -4638,7 +4736,15 @@ mod tests {
             subagent_source: std::collections::HashMap::new(),
             subagent_message_source: std::collections::HashMap::new(),
             capability_table: crate::inject::capability::new_table(),
-            session_source: Box::new(move || crate::session::SessionsResponse {
+            session_source: Box::new({
+                let sessions = sessions.clone();
+                move || crate::session::SessionsResponse {
+                    sessions: sessions.clone(),
+                    total_count: sessions.len(),
+                    waiting_count: 0,
+                }
+            }),
+            fresh_session_source: Box::new(move || crate::session::SessionsResponse {
                 sessions: sessions.clone(),
                 total_count: sessions.len(),
                 waiting_count: 0,
@@ -4877,7 +4983,15 @@ mod tests {
             subagent_source: std::collections::HashMap::new(),
             subagent_message_source: std::collections::HashMap::new(),
             capability_table: crate::inject::capability::new_table(),
-            session_source: Box::new(move || crate::session::SessionsResponse {
+            session_source: Box::new({
+                let sessions = sessions.clone();
+                move || crate::session::SessionsResponse {
+                    sessions: sessions.clone(),
+                    total_count: sessions.len(),
+                    waiting_count: 0,
+                }
+            }),
+            fresh_session_source: Box::new(move || crate::session::SessionsResponse {
                 sessions: sessions.clone(),
                 total_count: sessions.len(),
                 waiting_count: 0,
@@ -5049,7 +5163,16 @@ mod tests {
     ) -> Arc<RemoteState> {
         let mut st = test_state();
         let s = Arc::get_mut(&mut st).expect("test_state 独占引用");
-        s.session_source = Box::new(move || crate::session::SessionsResponse {
+        s.session_source = Box::new({
+            let sessions = sessions.clone();
+            move || crate::session::SessionsResponse {
+                sessions: sessions.clone(),
+                total_count: sessions.len(),
+                waiting_count: 0,
+            }
+        });
+        // 动作路径同源（Task 4）：镜像 session_source 的数据
+        s.fresh_session_source = Box::new(move || crate::session::SessionsResponse {
             sessions: sessions.clone(),
             total_count: sessions.len(),
             waiting_count: 0,
@@ -7055,7 +7178,15 @@ mod tests {
             subagent_source: std::collections::HashMap::new(),
             subagent_message_source: std::collections::HashMap::new(),
             capability_table: crate::inject::capability::new_table(),
-            session_source: Box::new(move || crate::session::SessionsResponse {
+            session_source: Box::new({
+                let sessions = sessions.clone();
+                move || crate::session::SessionsResponse {
+                    sessions: sessions.clone(),
+                    total_count: sessions.len(),
+                    waiting_count: 0,
+                }
+            }),
+            fresh_session_source: Box::new(move || crate::session::SessionsResponse {
                 sessions: sessions.clone(),
                 total_count: sessions.len(),
                 waiting_count: 0,
@@ -8096,7 +8227,15 @@ mod tests {
             subagent_source: std::collections::HashMap::new(),
             subagent_message_source: std::collections::HashMap::new(),
             capability_table: crate::inject::capability::new_table(),
-            session_source: Box::new(move || crate::session::SessionsResponse {
+            session_source: Box::new({
+                let session = session.clone();
+                move || crate::session::SessionsResponse {
+                    sessions: vec![session.clone()],
+                    total_count: 1,
+                    waiting_count: 0,
+                }
+            }),
+            fresh_session_source: Box::new(move || crate::session::SessionsResponse {
                 sessions: vec![session.clone()],
                 total_count: 1,
                 waiting_count: 0,
@@ -11310,7 +11449,15 @@ mod tests {
             subagent_source: std::collections::HashMap::new(),
             subagent_message_source: std::collections::HashMap::new(),
             capability_table: crate::inject::capability::new_table(),
-            session_source: Box::new(move || crate::session::SessionsResponse {
+            session_source: Box::new({
+                let sessions = sessions.clone();
+                move || crate::session::SessionsResponse {
+                    sessions: sessions.clone(),
+                    total_count: sessions.len(),
+                    waiting_count: 0,
+                }
+            }),
+            fresh_session_source: Box::new(move || crate::session::SessionsResponse {
                 sessions: sessions.clone(),
                 total_count: sessions.len(),
                 waiting_count: 0,
@@ -11840,6 +11987,17 @@ mod tests {
                 total_count: 1,
                 waiting_count: 0,
             });
+            // 动作路径同源（Task 4）：镜像 session_source 的数据
+            s.fresh_session_source = Box::new(|| crate::session::SessionsResponse {
+                sessions: vec![inj_sess(
+                    "live-1",
+                    crate::session::AgentType::Codex,
+                    1,
+                    crate::session::SessionStatus::Waiting,
+                )],
+                total_count: 1,
+                waiting_count: 0,
+            });
             persist_device(&st, "arch");
             let app = crate::remote::server::router(st);
             let r = app
@@ -11968,7 +12126,16 @@ mod tests {
         fn state_with_sessions(sessions: Vec<crate::session::Session>) -> Arc<RemoteState> {
             let mut st = test_state();
             let s = std::sync::Arc::get_mut(&mut st).expect("test_state 独占引用");
-            s.session_source = Box::new(move || crate::session::SessionsResponse {
+            s.session_source = Box::new({
+                let sessions = sessions.clone();
+                move || crate::session::SessionsResponse {
+                    total_count: sessions.len(),
+                    waiting_count: 0,
+                    sessions: sessions.clone(),
+                }
+            });
+            // 动作路径同源（Task 4）：镜像 session_source 的数据
+            s.fresh_session_source = Box::new(move || crate::session::SessionsResponse {
                 total_count: sessions.len(),
                 waiting_count: 0,
                 sessions: sessions.clone(),
@@ -12067,7 +12234,16 @@ mod tests {
             let mut st = test_state();
             {
                 let s = std::sync::Arc::get_mut(&mut st).expect("独占");
-                s.session_source = Box::new(move || crate::session::SessionsResponse {
+                s.session_source = Box::new({
+                    let sessions = sessions.clone();
+                    move || crate::session::SessionsResponse {
+                        total_count: 1,
+                        waiting_count: 0,
+                        sessions: sessions.clone(),
+                    }
+                });
+                // 动作路径同源（Task 4）：镜像 session_source 的数据
+                s.fresh_session_source = Box::new(move || crate::session::SessionsResponse {
                     total_count: 1,
                     waiting_count: 0,
                     sessions: sessions.clone(),
@@ -12435,7 +12611,15 @@ mod tests {
             subagent_source: std::collections::HashMap::new(),
             subagent_message_source: std::collections::HashMap::new(),
             capability_table: crate::inject::capability::new_table(),
-            session_source: Box::new(move || crate::session::SessionsResponse {
+            session_source: Box::new({
+                let session = session.clone();
+                move || crate::session::SessionsResponse {
+                    sessions: vec![session.clone()],
+                    total_count: 1,
+                    waiting_count: 0,
+                }
+            }),
+            fresh_session_source: Box::new(move || crate::session::SessionsResponse {
                 sessions: vec![session.clone()],
                 total_count: 1,
                 waiting_count: 0,
@@ -12720,6 +12904,14 @@ mod tests {
             subagent_message_source: std::collections::HashMap::new(),
             capability_table: crate::inject::capability::new_table(),
             session_source: {
+                let s = codex_sess.clone();
+                Box::new(move || crate::session::SessionsResponse {
+                    sessions: vec![s.clone()],
+                    total_count: 1,
+                    waiting_count: 0,
+                })
+            },
+            fresh_session_source: {
                 let s = codex_sess.clone();
                 Box::new(move || crate::session::SessionsResponse {
                     sessions: vec![s.clone()],
@@ -13213,7 +13405,15 @@ mod tests {
             subagent_source: std::collections::HashMap::new(),
             subagent_message_source: std::collections::HashMap::new(),
             capability_table: crate::inject::capability::new_table(),
-            session_source: Box::new(move || crate::session::SessionsResponse {
+            session_source: Box::new({
+                let session = session.clone();
+                move || crate::session::SessionsResponse {
+                    sessions: vec![session.clone()],
+                    total_count: 1,
+                    waiting_count: 0,
+                }
+            }),
+            fresh_session_source: Box::new(move || crate::session::SessionsResponse {
                 sessions: vec![session.clone()],
                 total_count: 1,
                 waiting_count: 0,
@@ -13271,7 +13471,15 @@ mod tests {
             subagent_source: std::collections::HashMap::new(),
             subagent_message_source: std::collections::HashMap::new(),
             capability_table: crate::inject::capability::new_table(),
-            session_source: Box::new(move || crate::session::SessionsResponse {
+            session_source: Box::new({
+                let session = session.clone();
+                move || crate::session::SessionsResponse {
+                    sessions: vec![session.clone()],
+                    total_count: 1,
+                    waiting_count: 0,
+                }
+            }),
+            fresh_session_source: Box::new(move || crate::session::SessionsResponse {
                 sessions: vec![session.clone()],
                 total_count: 1,
                 waiting_count: 0,
@@ -13359,7 +13567,15 @@ mod tests {
             subagent_source: std::collections::HashMap::new(),
             subagent_message_source: std::collections::HashMap::new(),
             capability_table: crate::inject::capability::new_table(),
-            session_source: Box::new(move || crate::session::SessionsResponse {
+            session_source: Box::new({
+                let session = session.clone();
+                move || crate::session::SessionsResponse {
+                    sessions: vec![session.clone()],
+                    total_count: 1,
+                    waiting_count: 0,
+                }
+            }),
+            fresh_session_source: Box::new(move || crate::session::SessionsResponse {
                 sessions: vec![session.clone()],
                 total_count: 1,
                 waiting_count: 0,
@@ -14679,7 +14895,15 @@ mod tests {
             std::sync::Arc::new(std::sync::Mutex::new(screens.into()));
         let q = queue.clone();
         Arc::new(RemoteState {
-            session_source: Box::new(move || crate::session::SessionsResponse {
+            session_source: Box::new({
+                let sessions = sessions.clone();
+                move || crate::session::SessionsResponse {
+                    sessions: sessions.clone(),
+                    total_count: sessions.len(),
+                    waiting_count: 0,
+                }
+            }),
+            fresh_session_source: Box::new(move || crate::session::SessionsResponse {
                 sessions: sessions.clone(),
                 total_count: sessions.len(),
                 waiting_count: 0,
@@ -15652,6 +15876,11 @@ mod tests {
                 total_count: 7,
                 waiting_count: 0,
             }),
+            fresh_session_source: Box::new(|| crate::session::SessionsResponse {
+                sessions: vec![],
+                total_count: 7,
+                waiting_count: 0,
+            }),
             store: crate::remote::pairing::DeviceStore::memory(),
             injector: std::sync::Arc::new(crate::inject::engine::RealInjector),
             resume_spawner: std::sync::Arc::new(|_: &crate::inject::resume::SpawnSpec| Ok(())),
@@ -15812,6 +16041,11 @@ mod tests {
             subagent_message_source: fakes,
             capability_table: crate::inject::capability::new_table(),
             session_source: Box::new(|| crate::session::SessionsResponse {
+                sessions: vec![],
+                total_count: 7,
+                waiting_count: 0,
+            }),
+            fresh_session_source: Box::new(|| crate::session::SessionsResponse {
                 sessions: vec![],
                 total_count: 7,
                 waiting_count: 0,
@@ -15995,7 +16229,16 @@ mod tests {
             std::sync::Arc::new(|_, _| None),
         );
         let st = std::sync::Arc::get_mut(&mut state).expect("建造器返回独占引用");
-        st.session_source = Box::new(move || crate::session::SessionsResponse {
+        st.session_source = Box::new({
+            let sessions = sessions.clone();
+            move || crate::session::SessionsResponse {
+                total_count: sessions.len(),
+                waiting_count: 0,
+                sessions: sessions.clone(),
+            }
+        });
+        // 动作路径同源（Task 4）：镜像 session_source 的数据
+        st.fresh_session_source = Box::new(move || crate::session::SessionsResponse {
             total_count: sessions.len(),
             waiting_count: 0,
             sessions: sessions.clone(),
