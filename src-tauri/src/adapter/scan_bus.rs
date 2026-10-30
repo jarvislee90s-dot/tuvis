@@ -17,6 +17,8 @@ pub struct Snapshot {
     pub version: u64,
     /// 扫描完成时刻（用于动作路径的新鲜度判定）
     pub scanned_at: Instant,
+    /// 降级产物（空快照 / 补扫超时）：不得当作「新鲜扫描」使用，诊断口可查
+    pub degraded: bool,
     pub data: SessionsResponse,
 }
 
@@ -47,6 +49,8 @@ static IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 static SCAN_STARTED_MS: AtomicI64 = AtomicI64::new(0);
 /// 进程内累计真实扫描次数（R1 断言「批量只扫一次」与 R4 stats.total 的数据源）
 static SCANS_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// 最近一次补扫超时时刻（毫秒）；0 = 从未超时。30s 内 `scan_bus_status.degraded` 为真
+static LAST_TIMEOUT_MS: AtomicI64 = AtomicI64::new(0);
 
 /// 事件触发扫描的最小间隔上限（Away 档 30s 的间隔会让 hook 事件在 TTL 内等不到扫描）
 const EVENT_MIN_GAP_CAP: Duration = Duration::from_secs(5);
@@ -57,6 +61,8 @@ const SCAN_WAIT_LIMIT: Duration = Duration::from_secs(5);
 const HANG_THRESHOLD_MS: i64 = 120_000;
 /// 同一段 hang 的告警最小间隔
 const HANG_ALERT_INTERVAL_MS: i64 = 120_000;
+/// 补扫超时后的 degraded 诊断窗口（R3：超时后 30s 内 status.degraded 恒真）
+const TIMEOUT_DEGRADED_WINDOW_MS: i64 = 30_000;
 /// 看门狗巡检周期
 const WATCHDOG_PERIOD: Duration = Duration::from_secs(5);
 /// 「有人在看」心跳的有效期
@@ -88,14 +94,15 @@ pub fn current_or_scan() -> SessionsResponse {
         .unwrap_or_else(|| scan_once().data.clone())
 }
 
-/// 动作路径：快照龄超过 max_age → 请求补扫并等待（上限 wait），超时返回现有快照
+/// 动作路径：快照龄超过 max_age → 请求补扫并等待（上限 wait），超时返回降级快照。
+/// degraded 快照（空/上次超时产物）**永远不算新鲜**，必须重新补扫。
 pub fn ensure_fresh(max_age: Duration, wait: Duration) -> Arc<Snapshot> {
     if let Some(s) = snapshot() {
-        if s.scanned_at.elapsed() <= max_age {
+        if !s.degraded && s.scanned_at.elapsed() <= max_age {
             return s;
         }
     }
-    match TX.get() {
+    match scan_tx() {
         None => return scan_once(), // 扫描线程未启动 → 同步补扫
         Some(tx) => {
             // 已有补扫在飞 → 不再入队：并发动作调用（移动端详情页同时挂载多个端点）
@@ -108,14 +115,15 @@ pub fn ensure_fresh(max_age: Duration, wait: Duration) -> Arc<Snapshot> {
     let deadline = Instant::now() + wait;
     while Instant::now() < deadline {
         if let Some(s) = snapshot() {
-            if s.scanned_at.elapsed() <= max_age {
+            if !s.degraded && s.scanned_at.elapsed() <= max_age {
                 return s;
             }
         }
         std::thread::sleep(Duration::from_millis(20));
     }
-    // 超时：返回现有快照（陈旧但可用），绝不阻塞动作路径
-    snapshot().unwrap_or_else(scan_once)
+    // 超时：记录 30s 诊断窗口，返回 degraded 快照（applied/调用方不得当新鲜用）
+    note_timeout();
+    degraded_snapshot()
 }
 
 /// 同步执行一次扫描并发布快照（F5：命令层的展示变更必须立即反映，不等档位周期）。
@@ -162,9 +170,24 @@ pub fn scan_after_mutation(wait: Duration) -> MutationScan {
 
 /// 事件唤醒（节流策略在扫描线程内统一处理）
 pub fn request_scan(reason: ScanReason) {
-    if let Some(tx) = TX.get() {
+    if let Some(tx) = scan_tx() {
         let _ = tx.send(reason);
     }
+}
+
+/// 扫描唤醒发送端：生产 = `TX`；测试可注入 `TEST_TX`（验证 ensure_fresh 等待路径，
+/// 而无需真的启动扫描线程）。`mpsc::Sender` 是 Clone 的。
+fn scan_tx() -> Option<mpsc::Sender<ScanReason>> {
+    #[cfg(test)]
+    if let Some(tx) = TEST_TX.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+        return Some(tx);
+    }
+    TX.get().cloned()
+}
+
+/// 记录一次补扫超时（R3：30s 内 status.degraded 为真）
+fn note_timeout() {
+    LAST_TIMEOUT_MS.store(now_ms(), Ordering::SeqCst);
 }
 
 /// 前端可见性心跳："有人在看" = 主窗可见且聚焦 / 浮窗展开；**逐源**记账，TTL 90s。
@@ -263,10 +286,11 @@ fn scan_once_with_limit(wait_limit: Duration) -> Arc<Snapshot> {
         while IN_FLIGHT.load(Ordering::SeqCst) {
             if Instant::now() >= deadline {
                 log::warn!(
-                    "scan_bus: 等待在飞扫描超时（{:?}），按最近快照降级返回",
+                    "scan_bus: 等待在飞扫描超时（{:?}），按最近的降级快照返回",
                     wait_limit
                 );
-                return snapshot().unwrap_or_else(empty_snapshot);
+                note_timeout();
+                return degraded_snapshot();
             }
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -290,11 +314,13 @@ fn scan_once_with_limit(wait_limit: Duration) -> Arc<Snapshot> {
     publish(super::get_all_sessions_inner())
 }
 
-/// 无快照时的降级产物：不发布、不推进版本，仅让调用方拿到结构合法的空响应
+/// 无快照时的降级产物：不发布、不推进版本，且**标记 degraded**——
+/// 调用方不得把「刚刚构造」误当成「刚扫描过」（scanned_at 只是构造时刻）。
 fn empty_snapshot() -> Arc<Snapshot> {
     Arc::new(Snapshot {
         version: VERSION.load(Ordering::SeqCst),
         scanned_at: Instant::now(),
+        degraded: true,
         data: SessionsResponse {
             sessions: Vec::new(),
             total_count: 0,
@@ -303,11 +329,37 @@ fn empty_snapshot() -> Arc<Snapshot> {
     })
 }
 
-/// 诊断：扫描是否疑似 hang（在飞且超过阈值）。`scan_bus_status.degraded` 的数据源。
+/// 最近快照的降级副本（超时返回用）：保留版本/扫描时刻/数据，只翻 degraded 标记
+fn degraded_snapshot() -> Arc<Snapshot> {
+    match snapshot() {
+        Some(s) if s.degraded => s,
+        Some(s) => Arc::new(Snapshot {
+            version: s.version,
+            scanned_at: s.scanned_at,
+            degraded: true,
+            data: s.data.clone(),
+        }),
+        None => empty_snapshot(),
+    }
+}
+
+/// degraded 判定（纯函数，R3）：在飞超 120s（hang）或最近 30s 内发生过补扫超时。
+fn status_degraded(in_flight: bool, started_ms: i64, last_timeout_ms: i64, now: i64) -> bool {
+    let hang = in_flight && started_ms > 0 && now - started_ms > HANG_THRESHOLD_MS;
+    let timed_out =
+        last_timeout_ms > 0 && now.saturating_sub(last_timeout_ms) < TIMEOUT_DEGRADED_WINDOW_MS;
+    hang || timed_out
+}
+
+/// 诊断：扫描是否处于降级态（hang 或近期补扫超时）。`scan_bus_status.degraded` 数据源。
 /// 判定**不**清在飞位：hang 只能靠重启恢复，强杀会放进第二份并发扫描。
 pub fn is_degraded() -> bool {
-    let started = SCAN_STARTED_MS.load(Ordering::SeqCst);
-    IN_FLIGHT.load(Ordering::SeqCst) && started > 0 && now_ms() - started > HANG_THRESHOLD_MS
+    status_degraded(
+        IN_FLIGHT.load(Ordering::SeqCst),
+        SCAN_STARTED_MS.load(Ordering::SeqCst),
+        LAST_TIMEOUT_MS.load(Ordering::SeqCst),
+        now_ms(),
+    )
 }
 
 /// 看门狗判定（纯函数）：返回应告警的扫描龄（毫秒），None = 本拍不告警。
@@ -339,6 +391,7 @@ fn publish(data: SessionsResponse) -> Arc<Snapshot> {
     let snap = Arc::new(Snapshot {
         version,
         scanned_at: Instant::now(),
+        degraded: false,
         data,
     });
     *guard = Some(snap.clone());
@@ -528,6 +581,13 @@ pub fn reset_for_test() {
     IN_FLIGHT.store(false, Ordering::SeqCst);
     SCAN_STARTED_MS.store(0, Ordering::SeqCst);
     SCANS_TOTAL.store(0, Ordering::SeqCst);
+    LAST_TIMEOUT_MS.store(0, Ordering::SeqCst);
+}
+
+/// 单测用：注入扫描唤醒发送端（让 ensure_fresh 走「有扫描线程」的等待路径）
+#[cfg(test)]
+pub(crate) fn set_test_tx_for_test(tx: Option<mpsc::Sender<ScanReason>>) {
+    *TEST_TX.lock().unwrap_or_else(|e| e.into_inner()) = tx;
 }
 
 /// 单测用：占位/释放「在飞扫描」（模拟卡住的扫描，验证等待上限与诊断口）
@@ -552,6 +612,11 @@ pub fn publish_for_test(f: impl FnOnce() -> SessionsResponse) -> Arc<Snapshot> {
 /// 并行执行会互相踩踏 → 凡触碰这些状态的测试一律持本锁串行化。
 #[cfg(test)]
 static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// 单测用：扫描唤醒发送端注入（`OnceLock<TX>` 在测试进程内不可重置，用本槽位模拟
+/// 「扫描线程已启动」，见 `scan_tx`）。测试结束须置回 None，避免影响未启动线程的用例。
+#[cfg(test)]
+static TEST_TX: Lazy<Mutex<Option<mpsc::Sender<ScanReason>>>> = Lazy::new(|| Mutex::new(None));
 
 /// 单测用：获取全局测试锁（本模块测试与 `remote::server` SSE 测试共用同一把，
 /// 避免任一侧的 reset/seed 插进另一侧「种子 → 断言」窗口，见 test_guard 使用方）
@@ -847,6 +912,41 @@ mod tests {
             "超时后应照常扫描（实际 {:?}）",
             started.elapsed()
         );
+    }
+
+    /// R3：ensure_fresh 超时必须返回 degraded=true 的快照，并在 30s 窗口内把
+    /// `scan_bus_status.degraded` 置真；超窗后（纯函数注入时钟）恢复 false。
+    #[test]
+    fn ensure_fresh_timeout_marks_degraded() {
+        let _guard = test_guard();
+        reset_for_test();
+        let (tx, _rx) = mpsc::channel();
+        set_test_tx_for_test(Some(tx));
+        set_in_flight_for_test(true); // 无快照 + 在飞：补扫永远等不到新快照
+        let snap = ensure_fresh(Duration::from_secs(2), Duration::from_millis(100));
+        assert!(snap.degraded, "超时返回的快照必须标记 degraded");
+        let status = crate::commands::session::scan_bus_status();
+        assert_eq!(
+            status.get("degraded").and_then(|x| x.as_bool()),
+            Some(true),
+            "超时后 state.degraded 必须为 true"
+        );
+        assert!(
+            status
+                .get("snapshotAgeMs")
+                .and_then(|x| x.as_u64())
+                .is_none(),
+            "无快照时 snapshotAgeMs 必须为 null"
+        );
+        // 30s 窗口：29.9s 仍降级，满 30s 恢复
+        let now = 1_000_000;
+        assert!(status_degraded(false, 0, now - 29_999, now));
+        assert!(!status_degraded(false, 0, now - 30_000, now));
+        assert!(!status_degraded(false, 0, 0, now));
+        // hang 判定仍优先
+        assert!(status_degraded(true, now - 120_001, 0, now));
+        set_test_tx_for_test(None);
+        set_in_flight_for_test(false);
     }
 
     #[test]
