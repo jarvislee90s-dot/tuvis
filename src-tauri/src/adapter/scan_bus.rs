@@ -91,7 +91,7 @@ pub fn mode() -> Mode {
 pub fn current_or_scan() -> SessionsResponse {
     snapshot()
         .map(|s| s.data.clone())
-        .unwrap_or_else(|| scan_once().data.clone())
+        .unwrap_or_else(|| scan_once(ScanReason::ColdStart).data.clone())
 }
 
 /// 动作路径：快照龄超过 max_age → 请求补扫并等待（上限 wait），超时返回降级快照。
@@ -103,7 +103,7 @@ pub fn ensure_fresh(max_age: Duration, wait: Duration) -> Arc<Snapshot> {
         }
     }
     match scan_tx() {
-        None => return scan_once(), // 扫描线程未启动 → 同步补扫
+        None => return scan_once(ScanReason::Action), // 扫描线程未启动 → 同步补扫
         Some(tx) => {
             // 已有补扫在飞 → 不再入队：并发动作调用（移动端详情页同时挂载多个端点）
             // 否则会排 N 条冗余 Action。在飞那次发布的快照由下方轮询满足新鲜度判定
@@ -129,7 +129,7 @@ pub fn ensure_fresh(max_age: Duration, wait: Duration) -> Arc<Snapshot> {
 /// 同步执行一次扫描并发布快照（F5：命令层的展示变更必须立即反映，不等档位周期）。
 /// 与周期扫描共用同一把单飞：并发时等待现有扫描完成，不会产生第二份快照。
 pub fn scan_now_blocking() -> Arc<Snapshot> {
-    scan_once()
+    scan_once(ScanReason::Action)
 }
 
 /// 变更后补扫的结果。`applied=false` = 等待在飞扫描超时，返回的是**变更前**的
@@ -163,7 +163,7 @@ pub fn scan_after_mutation(wait: Duration) -> MutationScan {
         std::thread::sleep(Duration::from_millis(10));
     }
     MutationScan {
-        snapshot: scan_once(),
+        snapshot: scan_once(ScanReason::Action),
         applied: true,
     }
 }
@@ -271,15 +271,15 @@ fn wait_event_defer(
 }
 
 /// 单飞扫描：并发调用者等待同一次扫描（返回同一快照）
-fn scan_once() -> Arc<Snapshot> {
-    scan_once_with_limit(SCAN_WAIT_LIMIT)
+fn scan_once(reason: ScanReason) -> Arc<Snapshot> {
+    scan_once_with_limit(reason, SCAN_WAIT_LIMIT)
 }
 
 /// 单飞内核；等待上限参数化（测试用短上限验证「超时降级」而不真等 5s）。
 ///
-/// 超时语义：返回最近快照（无快照则返回空响应快照，**不发布**、不推进版本）；
+/// 超时语义：返回最近快照的降级副本（无快照则空响应快照，**不发布**、不推进版本）；
 /// 在飞位保持不动——清位会让等待方又抢到单飞，并发产生第二份扫描。
-fn scan_once_with_limit(wait_limit: Duration) -> Arc<Snapshot> {
+fn scan_once_with_limit(reason: ScanReason, wait_limit: Duration) -> Arc<Snapshot> {
     // IN_FLIGHT 表示已有扫描在跑；其他调用者自旋等待其结果，避免重复全量扫描
     if IN_FLIGHT.swap(true, Ordering::SeqCst) {
         let deadline = Instant::now() + wait_limit;
@@ -297,7 +297,7 @@ fn scan_once_with_limit(wait_limit: Duration) -> Arc<Snapshot> {
         return match snapshot() {
             Some(s) => s,
             // 上一次扫描在首次发布前 panic：本线程重新抢单飞再扫一次（不向调用方抛 panic）
-            None => scan_once_with_limit(wait_limit),
+            None => scan_once_with_limit(reason, wait_limit),
         };
     }
     SCAN_STARTED_MS.store(now_ms(), Ordering::SeqCst);
@@ -311,7 +311,77 @@ fn scan_once_with_limit(wait_limit: Duration) -> Arc<Snapshot> {
         }
     }
     let _clear = Clear;
-    publish(super::get_all_sessions_inner())
+    let started = Instant::now();
+    let data = super::get_all_sessions_inner();
+    let duration = started.elapsed();
+    let snap = publish(data);
+    // R4：每轮扫描只写一行 stats（覆盖写）；日志不再逐轮打 INFO（F9 ≤1MB/天）
+    write_stats(reason, &snap, duration);
+    snap
+}
+
+/// 扫描原因的可读名（stats.last_reason；前端/脚本按此对账）
+fn reason_name(reason: ScanReason) -> &'static str {
+    match reason {
+        ScanReason::Periodic => "Periodic",
+        ScanReason::Event => "Event",
+        ScanReason::Action => "Action",
+        ScanReason::ColdStart => "ColdStart",
+    }
+}
+
+/// stats 单行 JSON（纯函数，可测）：计数 + 最近一轮元数据 + F8 进程刷新耗时
+fn stats_json(
+    total: u64,
+    reason: ScanReason,
+    version: u64,
+    duration_ms: u64,
+    sessions: usize,
+    process_refresh_ms: u64,
+    updated_at: &str,
+) -> String {
+    serde_json::json!({
+        "total": total,
+        "last_reason": reason_name(reason),
+        "last_version": version,
+        "last_duration_ms": duration_ms,
+        "last_sessions": sessions,
+        "last_process_refresh_ms": process_refresh_ms,
+        "updated_at": updated_at,
+    })
+    .to_string()
+}
+
+/// stats 文件路径：与日志同目录（release = 真实 `~/.tuvis/logs/`；debug/test 走
+/// `app_data_home()`，影子 `TUVIS_HOME` 下不污染真实目录）
+fn stats_path() -> std::path::PathBuf {
+    crate::database::connection::app_data_home()
+        .join(".tuvis")
+        .join("logs")
+        .join("scan_bus_stats.json")
+}
+
+fn write_stats_to(path: &std::path::Path, payload: &str) {
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Err(e) = std::fs::write(path, payload) {
+        log::warn!("scan_bus: stats 写入失败（{}）: {e}", path.display());
+    }
+}
+
+/// 写本轮 stats（覆盖写，单行 JSON）。每轮扫描一次；脚本用 total 前后差值计扫描次数。
+fn write_stats(reason: ScanReason, snap: &Snapshot, duration: Duration) {
+    let payload = stats_json(
+        SCANS_TOTAL.load(Ordering::SeqCst),
+        reason,
+        snap.version,
+        duration.as_millis() as u64,
+        snap.data.sessions.len(),
+        super::last_process_refresh_ms(),
+        &chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+    );
+    write_stats_to(&stats_path(), &payload);
 }
 
 /// 无快照时的降级产物：不发布、不推进版本，且**标记 degraded**——
@@ -458,16 +528,10 @@ pub fn start(app: tauri::AppHandle) {
                         cadence.mode().interval(),
                     );
                 }
-                let scan_started = Instant::now();
-                let snap = scan_once();
+                // R4：每轮扫描的 reason/version/耗时写入 scan_bus_stats.json（覆盖写），
+                // 不再逐轮打 INFO（F9 日志体积 ≤1MB/天；档位切换 INFO 保留）
+                let snap = scan_once(reason);
                 last_scan = Instant::now();
-                log::info!(
-                    "scan_bus: scan reason={:?} version={} duration_ms={} sessions={}",
-                    reason,
-                    snap.version,
-                    scan_started.elapsed().as_millis(),
-                    snap.data.sessions.len()
-                );
                 update_tray(
                     &app,
                     &snap,
@@ -756,7 +820,13 @@ mod tests {
         let anchor = "if matches!(reason, ScanReason::Event)";
         let idx = src.find(anchor).expect("scan_bus.rs 缺少 Event 节流分支");
         assert!(idx < impl_end, "锚点必须命中实现处的节流分支");
-        let branch = &src[idx..(idx + 700).min(src.len())];
+        // 按字符数截取（中文多字节，不能按字节切）
+        let end = src[idx..]
+            .char_indices()
+            .nth(700)
+            .map(|(i, _)| idx + i)
+            .unwrap_or(src.len());
+        let branch = &src[idx..end];
         assert!(
             !branch.contains("return;"),
             "孤立 Event 不得被丢弃（应延后扫描），实际分支: {branch}"
@@ -772,7 +842,11 @@ mod tests {
         let wait_fn = src
             .find("fn wait_event_defer(")
             .expect("缺少 wait_event_defer");
-        let wait_body = &src[wait_fn..(wait_fn + 900).min(src.len())];
+        let wait_end = src[wait_fn..]
+            .find("\n}\n")
+            .map(|i| wait_fn + i + 2)
+            .unwrap_or(src.len());
+        let wait_body = &src[wait_fn..wait_end];
         assert!(
             wait_body.contains("recv_timeout"),
             "wait_event_defer 必须用 recv_timeout 等新唤醒"
@@ -792,7 +866,7 @@ mod tests {
         let seeded = publish_for_test(|| resp(SessionStatus::Idle));
         set_in_flight_for_test(true); // 模拟一次卡住的在飞扫描
         let started = Instant::now();
-        let got = scan_once_with_limit(Duration::from_millis(100));
+        let got = scan_once_with_limit(ScanReason::Action, Duration::from_millis(100));
         assert!(
             started.elapsed() < Duration::from_secs(2),
             "等待上限必须生效（实际 {:?}）",
@@ -947,6 +1021,49 @@ mod tests {
         assert!(status_degraded(true, now - 120_001, 0, now));
         set_test_tx_for_test(None);
         set_in_flight_for_test(false);
+    }
+
+    /// R4：stats 单行 JSON 必须包含计数、最近一轮元数据与 F8 的进程刷新耗时。
+    #[test]
+    fn stats_payload_contains_count_f8_and_last_round_fields() {
+        let payload = stats_json(
+            42,
+            ScanReason::Event,
+            7,
+            31,
+            3,
+            12,
+            "2026-10-30T12:00:00.000Z",
+        );
+        assert!(!payload.contains('\n'), "stats 必须是单行 JSON（覆盖写）");
+        let v: serde_json::Value = serde_json::from_str(&payload).expect("stats 必须是合法 JSON");
+        assert_eq!(v["total"].as_u64(), Some(42));
+        assert_eq!(v["last_reason"].as_str(), Some("Event"));
+        assert_eq!(v["last_version"].as_u64(), Some(7));
+        assert_eq!(v["last_duration_ms"].as_u64(), Some(31));
+        assert_eq!(v["last_sessions"].as_u64(), Some(3));
+        assert_eq!(v["last_process_refresh_ms"].as_u64(), Some(12));
+        assert_eq!(v["updated_at"].as_str(), Some("2026-10-30T12:00:00.000Z"));
+    }
+
+    /// R4：stats 写入后可被脚本按同一字段名读回（覆盖写，旧内容不残留）。
+    #[test]
+    fn stats_file_is_overwritten_with_latest_round() {
+        let dir = std::env::temp_dir().join(format!("tuvis-stats-test-{}", std::process::id()));
+        let path = dir.join("scan_bus_stats.json");
+        write_stats_to(
+            &path,
+            &stats_json(1, ScanReason::ColdStart, 1, 10, 0, 5, "t1"),
+        );
+        write_stats_to(
+            &path,
+            &stats_json(2, ScanReason::Periodic, 2, 11, 1, 6, "t2"),
+        );
+        let text = std::fs::read_to_string(&path).expect("stats 文件应存在");
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["total"].as_u64(), Some(2));
+        assert_eq!(v["last_reason"].as_str(), Some("Periodic"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

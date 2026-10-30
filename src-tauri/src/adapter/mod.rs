@@ -19,6 +19,7 @@ use crate::session::{
 };
 use once_cell::sync::Lazy;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
 
@@ -519,6 +520,15 @@ pub fn all_adapters_with_ids() -> Vec<(&'static str, Box<dyn AgentAdapter>)> {
 /// 共享 System 实例 — 每轮询周期刷新一次，所有 adapter 共用
 static SHARED_SYSTEM: Mutex<Option<System>> = Mutex::new(None);
 
+/// 最近一轮「进程刷新段」耗时（毫秒）：扫描总线把它写入 scan_bus_stats.json，
+/// 作为 F8（≤25ms）验收的数据源（R4）
+static LAST_PROCESS_REFRESH_MS: AtomicU64 = AtomicU64::new(0);
+
+/// 最近一轮进程刷新耗时（毫秒）
+pub(crate) fn last_process_refresh_ms() -> u64 {
+    LAST_PROCESS_REFRESH_MS.load(Ordering::Relaxed)
+}
+
 /// 会话级去重：同一 (工具, session id) 只保留首张卡。
 /// 全局防线：任何解析器的"文件级/进程级复制"型 bug（如 opencode 多进程同会话、
 /// codex 每轮新 rollout）在这里统一兜住，一处修复覆盖全部工具
@@ -896,10 +906,13 @@ pub(crate) fn get_all_sessions_inner() -> SessionsResponse {
         let candidate_names = refresh_candidate_process_names();
         let candidate_count = refresh_processes_two_stage(system, &candidate_names);
 
-        // Task 12 验收测量入口（≤25ms）：保持 DEBUG，不得升 INFO 逐轮刷屏
+        // Task 12 验收测量入口（≤25ms）：保持 DEBUG，不得升 INFO 逐轮刷屏。
+        // R4：同时写入 stats 原子量（scan_bus_stats.json 的 last_process_refresh_ms）
+        let refresh_elapsed = refresh_started.elapsed();
+        LAST_PROCESS_REFRESH_MS.store(refresh_elapsed.as_millis() as u64, Ordering::Relaxed);
         log::debug!(
             "scan: process refresh（两段式）耗时 {:?}，进程 {}，候选 {}",
-            refresh_started.elapsed(),
+            refresh_elapsed,
             system.processes().len(),
             candidate_count
         );
