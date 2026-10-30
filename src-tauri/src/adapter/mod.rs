@@ -896,7 +896,9 @@ pub(crate) fn get_all_sessions_inner() -> SessionsResponse {
         } else {
             adapter.find_sessions(processes)
         };
-        log::info!(
+        // 每个 adapter 每轮一行，INFO 会按轮次无限刷屏（挂机档 30s/轮也照涨），降为 DEBUG；
+        // 人工排障所需的跃迁信息仍由 scan_bus 的 `mode →` INFO 承担
+        log::debug!(
             "{}: {} processes, {} sessions",
             adapter.name(),
             processes.len(),
