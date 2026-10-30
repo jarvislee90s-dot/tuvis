@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::{file_key_of, file_read_failure_is_benign, DeltaBuilder, PendingTools};
-use crate::monitor::workbuddy_parser::find_session_jsonl;
+use crate::monitor::workbuddy_parser::{find_session_jsonl, is_strict_uuid_form};
 use crate::services::usage::collect::{CollectContext, UsageCollector};
 use crate::services::usage::delta::{DetailKey, SourceDelta};
 use crate::services::usage::error::UsageError;
@@ -306,6 +306,11 @@ pub fn collect_with_home(
     let rules = ctx.provider_rules();
     let mut b = DeltaBuilder::new(UsageSourceId::WorkBuddy, rules);
     let root = home.join(".workbuddy");
+    // **自指/串号防线（设计 §2.3 第 4 条 + 风险表）**：子代理身份解析结果不得等于**任何**
+    // DB 主会话 id（不只父 id）——一旦解析成另一个主会话，`usage_session.is_subagent` 会被
+    // `MAX()` 不可逆地写成 1，那个主会话就从会话数/turn 层消失。只含 id、只在首次读某子代理
+    // 文件时比较一次（线性、量级 = 会话数），不构成热路径开销。
+    let main_session_ids: Vec<String> = sessions.iter().map(|(id, _, _)| id.clone()).collect();
     for (id, cwd, title) in sessions {
         let Some(jsonl) = find_session_jsonl(home, &cwd, &id) else {
             continue;
@@ -314,14 +319,118 @@ pub fn collect_with_home(
         let file_key = file_key_of(&root, &jsonl);
         // 父会话维度：`is_subagent = false`、`parent = None`、`title = DB 标题`（与改动前逐字一致）
         collect_file(
-            ctx, &mut b, &jsonl, &file_key, &id, &cwd, title, false, None,
+            ctx,
+            &mut b,
+            &jsonl,
+            &file_key,
+            &id,
+            &cwd,
+            title,
+            false,
+            None,
+            &main_session_ids,
         )?;
     }
     Ok(b.finish())
 }
 
-/// **单文件采集（唯一实现）**：父会话 jsonl 与子代理 jsonl 走同一遍扫描。
+/// 子代理文件头部扫描上限（身份解析）：**64 KiB 或 200 行，取先到者**。
+/// 真机 5.9.3 的 `sessionId` 出现在首条 message 行，远在上限之内；上限只为防「异常文件
+/// 无 sessionId」时把整个 25.9 MB 前缀读一遍。
+const SUBAGENT_HEAD_BYTES: u64 = 64 * 1024;
+const SUBAGENT_HEAD_LINES: usize = 200;
+
+/// 读文件头部若干完整行（`max_bytes` 或 `max_lines`，先到者）。
+/// 截断点可能切在行中间 → 只在最后一个 `\n` 处切；整文件读完时按原样切行。
+/// 读失败 → 空表（身份解析随即走 stem 兜底；真正的读失败由 `read_incremental` 响亮上报，
+/// 这里不再重复报错——否则同一故障会被报两次、且此处无法区分是「消失」还是「读不了」）。
+fn read_head_lines(path: &std::path::Path, max_bytes: u64, max_lines: usize) -> Vec<String> {
+    use std::io::Read;
+    let Ok(file) = std::fs::File::open(path) else {
+        return Vec::new();
+    };
+    let mut buf = Vec::new();
+    if file.take(max_bytes).read_to_end(&mut buf).is_err() {
+        return Vec::new();
+    }
+    let truncated = buf.len() as u64 >= max_bytes;
+    let end = if truncated {
+        buf.iter().rposition(|b| *b == b'\n').map_or(0, |p| p + 1)
+    } else {
+        buf.len()
+    };
+    String::from_utf8_lossy(&buf[..end])
+        .lines()
+        .filter(|l| !l.is_empty())
+        .take(max_lines)
+        .map(str::to_string)
+        .collect()
+}
+
+/// 解析子代理会话身份（设计 §2.3）：返回 `(会话 id, 是否降级)`。
 ///
+/// 判据顺序：
+/// 1. **优先**「`providerData.isSubAgent == true` 且 `sessionId` 通过严格 UUID」的第一行
+///    ——真机 5.9.3 的 assistant / function_call 行带这个标记，首条 user 行可能没有；
+/// 2. 否则取任何通过严格 UUID 的第一行 `sessionId`；
+/// 3. **自指/串号拒绝**：结果等于父会话 id，或等于**任何** DB 主会话 id → 拒绝，回退文件名
+///    stem（`agent-<agentId>`）并 warn。`usage_session.is_subagent` 是 `MAX()` 只升不降，
+///    误标一次就永远改不回来，宁可降级也不能串号；
+/// 4. 完全没有 UUID → 文件名 stem + warn（stem 仍是稳定唯一键，**不丢用量**）。
+fn resolve_subagent_session_id(
+    path: &std::path::Path,
+    parent_id: &str,
+    main_session_ids: &[String],
+) -> (String, bool) {
+    let mut preferred: Option<String> = None;
+    let mut fallback: Option<String> = None;
+    for line in read_head_lines(path, SUBAGENT_HEAD_BYTES, SUBAGENT_HEAD_LINES) {
+        let Ok(v) = serde_json::from_str::<Value>(&line) else {
+            continue; // 坏行单行跳过（与行循环同口径）
+        };
+        let Some(sid) = v.get("sessionId").and_then(|s| s.as_str()) else {
+            continue;
+        };
+        if !is_strict_uuid_form(sid) {
+            continue;
+        }
+        let is_sub = v
+            .pointer("/providerData/isSubAgent")
+            .and_then(|b| b.as_bool())
+            .unwrap_or(false);
+        if is_sub {
+            preferred = Some(sid.to_string());
+            break;
+        }
+        if fallback.is_none() {
+            fallback = Some(sid.to_string());
+        }
+    }
+    let stem = || {
+        path.file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "unknown-subagent".to_string())
+    };
+    match preferred.or(fallback) {
+        Some(id) if id == parent_id || main_session_ids.iter().any(|m| *m == id) => {
+            log::warn!(
+                "usage/workbuddy: 子代理文件 {} 的 sessionId {id} 命中主会话 id（父 {parent_id}）\
+                 ——拒绝该身份，回退文件名 stem「{}」（否则会把主会话不可逆地标成子代理）",
+                path.display(),
+                stem()
+            );
+            (stem(), true)
+        }
+        Some(id) => (id, false),
+        None => (
+            // 降级本身由调用方 warn（这里返回标志位，保持「一处日志」）
+            stem(),
+            true,
+        ),
+    }
+}
+
+/// **单文件采集（唯一实现）**：父会话 jsonl 与子代理 jsonl 走同一遍扫描。
 /// 抽出来的目的（R1）：子代理文件与父会话同形（用量在 `message.usage`、模型在
 /// `providerData.model`、工具配对靠 `callId`），**口径必须逐字同源**——各写一份必然漂移。
 ///
@@ -343,6 +452,7 @@ fn collect_file(
     title: Option<String>,
     is_subagent: bool,
     parent_session_id: Option<String>,
+    main_session_ids: &[String],
 ) -> Result<bool, UsageError> {
     let read = match ctx.read_incremental(jsonl, file_key) {
         Ok(r) => r,
@@ -394,6 +504,27 @@ fn collect_file(
             None => WbState::default(),
         }
     };
+    // **子代理身份解析放在这里**（设计 §2.5/§2.3）：必须在游标/WbState 加载**之后**——
+    // 命中 `state.subagent_session_id` 就零文件头重读，否则每轮都要扫 64 KiB 前缀。
+    // `rescan`（截断/重写）时 state 是 `default()`（该字段为空）→ 自动按新代际重新解析。
+    let resolved_id: String = if !is_subagent {
+        session_id.to_string()
+    } else if state.subagent_session_id.is_empty() {
+        let parent_id = parent_session_id.as_deref().unwrap_or_default();
+        let (sid, degraded) = resolve_subagent_session_id(jsonl, parent_id, main_session_ids);
+        if degraded {
+            log::warn!(
+                "usage/workbuddy: 子代理文件 {} 的身份已降级为文件名 stem「{}」（父会话 {}）",
+                jsonl.display(),
+                sid,
+                parent_id
+            );
+        }
+        state.subagent_session_id = sid.clone();
+        sid
+    } else {
+        state.subagent_session_id.clone()
+    };
     // 「模型未知期间」的原始行（**按行缓存**，见 `process_line` 的文档；D-32 同款）
     let mut pending: Vec<String> = Vec::new();
     let mut dropped_no_model: i64 = 0;
@@ -405,10 +536,10 @@ fn collect_file(
         b.new_records += 1;
         // 模型已就绪 → 先把缓存行按**原序**重放（它们都排在本行之前）
         if !pending.is_empty() && !state.last_model.is_empty() {
-            let left = replay_pending(&mut pending, b, &mut state, session_id, cwd, ctx.now_ms);
-            warn_unattributed(&jsonl, left);
+            let left = replay_pending(&mut pending, b, &mut state, &resolved_id, cwd, ctx.now_ms);
+            warn_unattributed(jsonl, left);
         }
-        if !process_line(b, &mut state, &v, session_id, cwd, ctx.now_ms) {
+        if !process_line(b, &mut state, &v, &resolved_id, cwd, ctx.now_ms) {
             if pending.len() < PENDING_LINES_CAP {
                 pending.push(line.clone());
             } else {
@@ -437,7 +568,7 @@ fn collect_file(
             state.dropped_no_model += pending.len() as i64;
             pending.clear();
         } else {
-            let left = replay_pending(&mut pending, b, &mut state, session_id, cwd, ctx.now_ms);
+            let left = replay_pending(&mut pending, b, &mut state, &resolved_id, cwd, ctx.now_ms);
             warn_unattributed(&jsonl, left);
         }
     }
@@ -460,7 +591,7 @@ fn collect_file(
     // （mod.rs 的 W-13 注记已声明这半是「部分覆盖」），所以此处只做读码级核对——
     // 评审请核这一行是否仍在循环外（真机 266 行，挂进循环就是 266 次 syscall）。
     b.session(
-        session_id,
+        &resolved_id,
         Some(cwd),
         title,
         is_subagent,
@@ -558,6 +689,10 @@ struct WbState {
     last_model: String,
     #[serde(default)]
     dropped_no_model: i64,
+    /// 子代理文件的会话身份（设计 §2.3 第 6 条）：首次解析后跨轮缓存，避免每轮重读头部 64 KiB。
+    /// 父会话文件恒为空串；`serde(default)` 让 5.9.3 之前写下的旧 `state_json` 仍可反序列化。
+    #[serde(default)]
+    subagent_session_id: String,
 }
 
 // ==== usage 自省锁：以下为排除区（测试代码），勿删勿复制 ====
@@ -1483,6 +1618,104 @@ mod tests {
             state.contains("\"dropped_no_model\":2"),
             "丢弃必须**计数**且可断言：{state}"
         );
+    }
+
+    // ---- A2：子代理身份解析（真机 5.9.3 形态：文件名 agent-<agentId> ≠ 行内 sessionId）----
+
+    /// 真机 5.9.3 样本的父/子会话 id（两者都是 UUID，但不同）
+    const PARENT_ID: &str = "d0de8a03-21a4-4782-a24f-f923a3dcaff5";
+    const SUBAGENT_ID: &str = "01a18a39-174c-7065-9d83-be2a4e76a0a0";
+    /// 行内另一个 UUID（首条 user 行可能带的是**别的** id——偏好判据必须能分辨出来）
+    const OTHER_UUID: &str = "9bf48a4f-6b1a-4f3c-9f27-1c5d2a7e8b90";
+
+    fn write_head_file(dir: &std::path::Path, name: &str, lines: &[Value]) -> std::path::PathBuf {
+        std::fs::create_dir_all(dir).unwrap();
+        let p = dir.join(name);
+        let body: String = lines
+            .iter()
+            .map(|l| format!("{}\n", serde_json::to_string(l).unwrap()))
+            .collect();
+        std::fs::write(&p, body).unwrap();
+        p
+    }
+
+    /// 真机 5.9.3 形态：文件名 `agent-<agentId>.jsonl`，行内 `sessionId` 是另一个 UUID；
+    /// 首条 user 行**没有** `isSubAgent`，assistant / function_call 行有 `isSubAgent: true`
+    #[test]
+    fn subagent_identity_prefers_inline_uuid_over_file_stem() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write_head_file(
+            dir.path(),
+            &format!("agent-{}.jsonl", OTHER_UUID),
+            &[
+                json!({"type":"message","role":"user","sessionId":OTHER_UUID,
+                       "cwd":"/p/A","timestamp":1}),
+                json!({"type":"message","role":"assistant","sessionId":SUBAGENT_ID,
+                       "providerData":{"isSubAgent":true,"model":"deepseek-v4.1-flash"}}),
+            ],
+        );
+        let (id, degraded) = resolve_subagent_session_id(&p, PARENT_ID, &[]);
+        assert_eq!(id, SUBAGENT_ID, "身份必须取行内 sessionId，不是文件名");
+        assert!(!degraded, "行内 UUID 可用 → 不得降级");
+        assert!(!id.contains("agent-"), "不得回退文件名 stem：{id}");
+    }
+
+    /// 整文件没有严格 UUID 的 `sessionId` → 文件名 stem 兜底（稳定唯一键），**仍入账**
+    #[test]
+    fn subagent_identity_falls_back_to_file_stem() {
+        let dir = tempfile::tempdir().unwrap();
+        let stem = format!("agent-{OTHER_UUID}");
+        let p = write_head_file(
+            dir.path(),
+            &format!("{stem}.jsonl"),
+            &[
+                json!({"type":"message","role":"user","sessionId":"not-a-uuid","timestamp":1}),
+                json!({"type":"function_call","name":"Bash","sessionId":"",
+                       "providerData":{"isSubAgent":true}}),
+            ],
+        );
+        let (id, degraded) = resolve_subagent_session_id(&p, PARENT_ID, &[]);
+        assert_eq!(id, stem, "没有 UUID → 回退文件名 stem");
+        assert!(degraded, "降级必须可见（调用方据此 warn）");
+    }
+
+    /// **防自指**：解析结果 == 父会话 id → 拒绝并回退 stem。
+    /// 放任的后果不可逆：父会话被 `MAX(is_subagent)` 永久标成子代理 → 从会话数/turn 层消失。
+    #[test]
+    fn subagent_identity_equal_to_parent_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let stem = format!("agent-{OTHER_UUID}");
+        let p = write_head_file(
+            dir.path(),
+            &format!("{stem}.jsonl"),
+            &[
+                json!({"type":"message","role":"assistant","sessionId":PARENT_ID,
+                     "providerData":{"isSubAgent":true}}),
+            ],
+        );
+        let (id, degraded) = resolve_subagent_session_id(&p, PARENT_ID, &[]);
+        assert_ne!(id, PARENT_ID, "不得把父会话 id 当成子代理身份");
+        assert_eq!(id, stem);
+        assert!(degraded);
+    }
+
+    /// **防串号**：结果不得等于**任何** DB 主会话 id（不只父 id）
+    #[test]
+    fn subagent_identity_equal_to_another_main_session_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let stem = format!("agent-{OTHER_UUID}");
+        let p = write_head_file(
+            dir.path(),
+            &format!("{stem}.jsonl"),
+            &[
+                json!({"type":"message","role":"assistant","sessionId":OTHER_UUID,
+                     "providerData":{"isSubAgent":true}}),
+            ],
+        );
+        let mains = vec![PARENT_ID.to_string(), OTHER_UUID.to_string()];
+        let (id, degraded) = resolve_subagent_session_id(&p, PARENT_ID, &mains);
+        assert_eq!(id, stem, "命中任一主会话 id 都必须拒绝");
+        assert!(degraded);
     }
 
     /// **登记锁（GC 20 / §3.2.2 阻塞 4）**：漏登记不是编译错——`run_collection` 只遍历
