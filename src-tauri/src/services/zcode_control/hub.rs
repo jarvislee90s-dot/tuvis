@@ -7429,6 +7429,7 @@ mod tests {
         let queued = QueueView {
             known: true,
             paused: Some(true),
+            pause_reason: Some("stopped".into()),
             items: vec![QueueItemView {
                 input_id: "queue_cmd-stale-1".into(),
                 text: "stale queued text".into(),

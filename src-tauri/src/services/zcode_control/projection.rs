@@ -307,6 +307,8 @@ impl Projection {
 /// - 单项坏形状只跳过该项（不丢整份队列、不丢身份）；
 /// - 身份只取宿主原值：`queueItemId` 原样作 `input_id`，`order.queuePosition` 原样作
 ///   `position`；不按正文/数组下标重算身份；
+/// - 暂停原因是官方枚举 `stopped|manual|error` 的**原样**透传；非枚举/缺席一律
+///   `None`（绝不把未知值映射成某一种原因）；
 /// - 数组顺序即官方展示顺序（宿主已按 `order.queuePosition` 排好），本层不重排。
 fn parse_queue(value: &Value) -> QueueView {
     let Some(object) = value.as_object() else {
@@ -318,6 +320,13 @@ fn parse_queue(value: &Value) -> QueueView {
     ) else {
         return QueueView::default();
     };
+    // 官方暂停是容器级状态：`autoDrain=false` 时即使 `items` 已空也保留暂停事实
+    // （R0 §3：`{…queue, autoDrain:!1, pauseReason:"stopped"|"error"}`）。
+    let pause_reason = object
+        .get("pauseReason")
+        .and_then(Value::as_str)
+        .filter(|reason| matches!(*reason, "stopped" | "manual" | "error"))
+        .map(str::to_owned);
     let mut queue_items = Vec::with_capacity(items.len());
     for item in items {
         let Some(record) = item.as_object() else {
@@ -348,6 +357,7 @@ fn parse_queue(value: &Value) -> QueueView {
     QueueView {
         known: true,
         paused: Some(!auto_drain),
+        pause_reason,
         items: queue_items,
     }
 }
@@ -930,6 +940,108 @@ mod tests {
         let queue = projection.view().queue;
         assert!(!queue.known, "缺 autoDrain 的坏形状必须按未宣告处理");
         assert_eq!(queue.paused, None, "不得把未知暂停猜成未暂停");
+    }
+
+    #[test]
+    fn queue_pause_reason_is_projected_without_guessing() {
+        // 官方 `pauseReason`（`state.queue.pauseReason`，枚举 `stopped|manual|error`）
+        // 必须原样透传，且**暂停且队列已空**仍是可下发的暂停事实：
+        // 「0 条」不能把容器级暂停吞掉（前端据此保留一行暂停标志）。
+        //
+        // 断言面全部走 DTO 序列化（手机看到的形状），不依赖实现内部字段名。
+        fn queue_of(projection: &Projection) -> Value {
+            let view = serde_json::to_value(projection.view()).expect("视图可序列化");
+            view.get("queue").cloned().expect("视图必须带 queue")
+        }
+
+        let mut projection = Projection::new(target(1));
+        projection.activate(SUB);
+        let mut snapshot = base_snapshot();
+        snapshot["queue"] = json!({"items": [], "autoDrain": false, "pauseReason": "stopped"});
+        projection
+            .apply(1, snapshot_frame(SUB, snapshot, 0, 1))
+            .expect("snapshot with paused empty queue");
+        let queue = queue_of(&projection);
+        assert_eq!(queue["known"], true, "{queue}");
+        assert_eq!(queue["paused"], true, "暂停且空仍是暂停：{queue}");
+        assert_eq!(queue["items"].as_array().map(Vec::len), Some(0), "{queue}");
+        assert_eq!(
+            queue["pauseReason"], "stopped",
+            "官方枚举值必须原样透传：{queue}"
+        );
+
+        // 增量整对象替换：枚举值同样原样透传（`manual` 只在枚举里，仍是官方值域）。
+        projection
+            .apply(
+                1,
+                delta_frame(
+                    SUB,
+                    json!({
+                        "revision": 5,
+                        "queue": {"items": [], "autoDrain": false, "pauseReason": "manual"}
+                    }),
+                    1,
+                    2,
+                ),
+            )
+            .expect("delta with manual pause");
+        let queue = queue_of(&projection);
+        assert_eq!(queue["paused"], true, "{queue}");
+        assert_eq!(queue["pauseReason"], "manual", "{queue}");
+
+        // 非枚举值不得猜：暂停事实保留，原因置空（绝不映射成某一种原因）。
+        projection
+            .apply(
+                1,
+                delta_frame(
+                    SUB,
+                    json!({
+                        "revision": 6,
+                        "queue": {"items": [], "autoDrain": false, "pauseReason": "suspended"}
+                    }),
+                    2,
+                    3,
+                ),
+            )
+            .expect("delta with unknown pause reason");
+        let queue = queue_of(&projection);
+        assert_eq!(queue["paused"], true, "{queue}");
+        assert!(
+            queue["pauseReason"].is_null(),
+            "非枚举原因必须丢弃（null），不得猜：{queue}"
+        );
+
+        // 缺席（宿主只翻 autoDrain）同样不猜，暂停事实照旧。
+        projection
+            .apply(
+                1,
+                delta_frame(
+                    SUB,
+                    json!({"revision": 7, "queue": {"items": [], "autoDrain": false}}),
+                    3,
+                    4,
+                ),
+            )
+            .expect("delta without pause reason");
+        let queue = queue_of(&projection);
+        assert_eq!(queue["paused"], true, "{queue}");
+        assert!(queue["pauseReason"].is_null(), "{queue}");
+
+        // 恢复 autoDrain：暂停标志消失，且不残留上一帧的原因。
+        projection
+            .apply(
+                1,
+                delta_frame(
+                    SUB,
+                    json!({"revision": 8, "queue": {"items": [], "autoDrain": true}}),
+                    4,
+                    5,
+                ),
+            )
+            .expect("delta resumed");
+        let queue = queue_of(&projection);
+        assert_eq!(queue["paused"], false, "{queue}");
+        assert!(queue["pauseReason"].is_null(), "{queue}");
     }
 
     #[test]

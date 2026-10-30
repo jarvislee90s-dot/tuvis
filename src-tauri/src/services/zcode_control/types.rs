@@ -864,11 +864,18 @@ pub struct QueueItemView {
 /// - `paused=Some(false)`：`autoDrain=true`（未暂停）；`paused=Some(true)`：暂停
 ///   （`autoDrain=false`，可能带 `pauseReason`）；`paused=None`：宿主未给 `autoDrain`
 ///   → **不得**当成未暂停。
+///
+/// `pause_reason` 是官方 `pauseReason` 的**原样**透传，只可能是枚举
+/// `stopped|manual|error`（非枚举/缺席 = `None`，绝不猜原因）。官方暂停是**容器级**
+/// 状态：队列被清空后仍可能保持 `autoDrain=false`，因此「暂停且空」必须可下发。
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct QueueView {
     pub known: bool,
     pub paused: Option<bool>,
+    /// 官方暂停原因（枚举 `stopped|manual|error`）；缺席/非枚举 = `None`。
+    #[serde(default)]
+    pub pause_reason: Option<String>,
     pub items: Vec<QueueItemView>,
 }
 
@@ -1102,6 +1109,7 @@ mod tests {
                 queue: QueueView {
                     known: true,
                     paused: Some(true),
+                    pause_reason: Some("stopped".to_owned()),
                     items: vec![QueueItemView {
                         input_id: "queue_cmd-1".to_owned(),
                         text: "queued text".to_owned(),
@@ -1112,6 +1120,10 @@ mod tests {
             let value = serde_json::to_value(&view).expect("会话视图应可序列化");
             assert_eq!(value["queue"]["known"], true);
             assert_eq!(value["queue"]["paused"], true);
+            assert_eq!(
+                value["queue"]["pauseReason"], "stopped",
+                "官方暂停原因按 camelCase 原样下发"
+            );
             assert_eq!(value["queue"]["items"][0]["inputId"], "queue_cmd-1");
             assert_eq!(value["queue"]["items"][0]["text"], "queued text");
             assert_eq!(value["queue"]["items"][0]["position"], 0);

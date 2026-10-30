@@ -242,10 +242,13 @@ export interface QueueItemView {
 /** 官方输入队列视图（`state.queue`）。三态必须可区分：
  *  - `known=false`：宿主**未宣告**队列（旧载荷/快照缺键）→ 未知，不是空队列；
  *  - `known=true` + `items=[]`：宿主明确宣告空队列；
- *  - `paused=null`：宿主未给 `autoDrain` → **不得**当成未暂停。 */
+ *  - `paused=null`：宿主未给 `autoDrain` → **不得**当成未暂停。
+ *  `pauseReason` 是官方枚举 `stopped|manual|error` 的原样透传（服务端已白名单，
+ *  非枚举/缺席 = 缺省）；它只在 `paused=true` 时有展示意义，前端不猜原因。 */
 export interface QueueView {
   known: boolean;
   paused: boolean | null;
+  pauseReason?: string | null;
   items: QueueItemView[];
 }
 

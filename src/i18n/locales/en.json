@@ -2293,6 +2293,9 @@
       "takeoverStillConflict": "Still in conflict: close the official ZCode page first, then try again.",
       "queueCount": "{{count}} queued",
       "queuePaused": "Paused",
+      "queuePauseStopped": "The turn was stopped",
+      "queuePauseManual": "Paused manually",
+      "queuePauseError": "Paused after an error",
       "queuePauseUnknown": "Pause state unknown",
       "queueToggleAria": "Expand or collapse the queued list"
     },

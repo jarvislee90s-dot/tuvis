@@ -8,12 +8,15 @@
 // - 根节点 `data-testid="zcode-queue"`，`data-state` ∈
 //   `empty | active | paused | pause-unknown`。
 // - `known !== true`（旧载荷缺字段/宿主未宣告）→ **不渲染**：未知绝不冒充「空队列」。
-// - `known=true` 且 `items=[]` → 保留根节点（`data-state="empty"`）但**无可见文本**：
-//   与「未知」可区分，又不给每个会话常驻一段空文案。
+// - `known=true` 且 `items=[]` 且**未暂停** → 保留根节点（`data-state="empty"`）但
+//   **无可见文本**：与「未知」可区分，又不给每个会话常驻一段空文案。
 // - 默认一行：数量 + 暂停标志；点 `zcode-queue-toggle` 才展开正文列表
 //   （`aria-expanded` 同步）；正文原样展示，不截断语义。
 // - `paused === null`（宿主未给 `autoDrain`）→ 显示「暂停状态未知」，绝不写成
 //   「已暂停」，也绝不写成「运行中」。
+// - `paused === true` 且 `items=[]` → 仍显示一行暂停标志：官方暂停是**容器级**
+//   状态，队列被清空不等于「没暂停」（U6：暂停/已消费都要可见）。`pauseReason`
+//   只认官方枚举 `stopped|manual|error` 的可读文案，其它值一律不猜。
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import i18n from "@/i18n";
@@ -100,6 +103,72 @@ describe("ZCode 队列面板：三态可区分", () => {
     // paused=None 不得当成「已暂停」，也不得凭空宣称未暂停。
     expect(screen.queryByText(i18n.t("mobile.zcodeControl.queuePaused"))).toBeNull();
     expect(screen.getByTestId("zcode-queue-pause-unknown")).toBeTruthy();
+  });
+});
+
+describe("ZCode 队列面板：暂停原因与空队列", () => {
+  it("paused_empty_queue_still_shows_pause_flag", () => {
+    // 官方暂停但队列已被清空（如回合被停止后 drain）：暂停事实仍必须可见，
+    // 不能被「0 条」吞成隐藏的空节点。
+    render(<ZcodeQueuePanel queue={queue({ paused: true, items: [] })} />);
+    const root = screen.getByTestId("zcode-queue");
+    expect(root.dataset.state).toBe("paused");
+    expect(screen.getByTestId("zcode-queue-paused").textContent).toBe(
+      i18n.t("mobile.zcodeControl.queuePaused")
+    );
+    expect(screen.getByTestId("zcode-queue-count").textContent).toContain("0");
+    // 没有条目就没有可展开的列表开关语义（展开也只是空列表）：仍可点，但无正文。
+    expect(screen.queryByTestId("zcode-queue-items")).toBeNull();
+  });
+
+  it("pause_reason_is_rendered_as_readable_text", () => {
+    const { rerender } = render(
+      <ZcodeQueuePanel queue={queue({ paused: true, pauseReason: "stopped", items: [] })} />
+    );
+    expect(screen.getByTestId("zcode-queue-pause-reason").textContent).toBe(
+      i18n.t("mobile.zcodeControl.queuePauseStopped")
+    );
+
+    rerender(<ZcodeQueuePanel queue={queue({ paused: true, pauseReason: "manual", items: [] })} />);
+    expect(screen.getByTestId("zcode-queue-pause-reason").textContent).toBe(
+      i18n.t("mobile.zcodeControl.queuePauseManual")
+    );
+
+    rerender(<ZcodeQueuePanel queue={queue({ paused: true, pauseReason: "error", items: [] })} />);
+    expect(screen.getByTestId("zcode-queue-pause-reason").textContent).toBe(
+      i18n.t("mobile.zcodeControl.queuePauseError")
+    );
+  });
+
+  it("unknown_pause_reason_is_not_guessed", () => {
+    // 非枚举值：仍然确认「已暂停」，但绝不把未知值编成某一种原因。
+    const { rerender } = render(
+      <ZcodeQueuePanel queue={queue({ paused: true, pauseReason: "suspended", items: [] })} />
+    );
+    expect(screen.getByTestId("zcode-queue-paused")).toBeTruthy();
+    expect(screen.queryByTestId("zcode-queue-pause-reason")).toBeNull();
+
+    // 未暂停时残留的原因值也不得渲染（不给「暂停」假象）。
+    rerender(
+      <ZcodeQueuePanel
+        queue={queue({
+          paused: false,
+          pauseReason: "stopped",
+          items: [item("queue_cmd-p", "正文", 0)],
+        })}
+      />
+    );
+    expect(screen.getByTestId("zcode-queue").dataset.state).toBe("active");
+    expect(screen.queryByTestId("zcode-queue-pause-reason")).toBeNull();
+  });
+
+  it("pause_reason_is_localized_in_english", async () => {
+    await i18n.changeLanguage("en");
+    render(<ZcodeQueuePanel queue={queue({ paused: true, pauseReason: "error", items: [] })} />);
+    expect(screen.getByTestId("zcode-queue-pause-reason").textContent).toBe(
+      i18n.t("mobile.zcodeControl.queuePauseError")
+    );
+    expect(i18n.t("mobile.zcodeControl.queuePauseError")).toMatch(/error/i);
   });
 });
 

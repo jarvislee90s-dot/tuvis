@@ -19,6 +19,16 @@
 //! - 已 `accepted` 不被无关活动/迟到的失败证据降级（`ActionStore::record_result`
 //!   的恰好一次 CAS）。
 //!
+//! # 运行中发送的投递意向（R2 fix round 1）
+//!
+//! `sendText` 的投递意向在 `payload.requestedDelivery`（官方值域
+//! `auto|startNow|queue|guide`）；省略时官方跟随宿主 `state.inputRouting.mode`
+//! （R0 §4 `CLI@14762292`）。本层只在**本次动作**的新鲜官方 control 判定「会话在跑」
+//! （`primaryTurn` + 非空 `foregroundExecutionId`，见 [`running_primary_turn`]）时
+//! 显式携带 `requestedDelivery="queue"`；判据不成立一律不带（交回宿主默认 startNow）。
+//! 排队与否仍由宿主 admission 决定：ACK 的 `result.delivery` 是唯一结论，本端
+//! 不改全局 followupMode、不发 stop、不建自建队列、绝不把「当前忙」当「已入队」。
+//!
 //! # 正文纪律
 //!
 //! [`compose_official_text`] 是本路线**唯一**正文出口：保留真实换行/中文/emoji
@@ -113,6 +123,13 @@ pub const AGENT_SEND_COMMAND_METHOD: &str = "sendConversationCommandV4";
 
 /// 信封 `type`（普通文本；`command.ts:95-135` 的 `sendText` 只必带 `text`）。
 pub const SEND_TEXT_TYPE: &str = "sendText";
+
+/// sendText 的投递请求值（官方 `delivery.requested` 值域 `auto|startNow|queue|guide`
+/// 中的 `queue`；R0 §3 `AO`、§4 `CLI@14762292`）。
+///
+/// 只在**本次动作**的新鲜视图判定「会话在跑」时随 payload 携带：省略该字段时官方
+/// 跟随宿主 `state.inputRouting.mode`，本端不改全局 followupMode，也不自建队列。
+pub const REQUESTED_DELIVERY_QUEUE: &str = "queue";
 
 /// 信封 `type`（问答应答；探针 `INTERACTION_COMMAND_TYPES.resolve`，
 /// `command.ts:221-234`：payload `{interactionId, answer}`）。
@@ -294,6 +311,31 @@ fn authorize_stop_on(
         return Err(ZcodeError::of(codes::NOT_READY));
     }
     authorize_stop(view, request)
+}
+
+/// 「会话在跑」的**官方判据**（send 的投递语义；纯函数，零帧）。
+///
+/// 判据只取官方 `control` 的字段（R0 §3/§4）：
+/// - 视图必须是**精确目标**（`sessionId` + 本代际绑定）且 `ready=true`——缺口/
+///   未就绪的旧投影不作数；
+/// - `control` 必须是宿主已宣告的（`activeWorks` 是数组），且其中存在
+///   `primaryTurn` + 非空 `foregroundExecutionId`（与 stop 守卫同一 fail-closed
+///   判据 [`stop_target_id`]）；显式空数组、子 agent、compact、缺 id 都不算在跑。
+///
+/// 这条判据**只看**宿主已下发的状态，绝不用本地忙态/上一条 send 的推测。
+fn running_primary_turn(view: &SessionView, target: &BoundTarget) -> bool {
+    if view.session_id != target.session_id
+        || view.generation != target.bridge_generation()
+        || !view.ready
+    {
+        return false;
+    }
+    view.control.as_ref().is_some_and(|control| {
+        control
+            .active_works
+            .iter()
+            .any(|work| stop_target_id(work).is_some())
+    })
 }
 
 /// ACK 分类（官方 `CommandAck`：`status` ∈ accepted/duplicate/rejected/noop）。
@@ -614,9 +656,35 @@ impl CommandSender {
             Reservation::New => {}
         }
 
-        let receipt = self.dispatch_send(ctx, target, composed).await;
+        // 本次动作的投递意向（R2 fix round 1 / I-2）：只有**新**派发才现读一次
+        // 官方 control；判据不成立（未装配读面/读失败/不新鲜/control 未知/无主
+        // 回合）一律不带，交回宿主 `state.inputRouting.mode` 的默认处置。
+        let queue_delivery = self.send_is_running(target).await;
+        let receipt = self
+            .dispatch_send(ctx, target, composed, queue_delivery)
+            .await;
         self.record(&receipt);
         Ok(receipt)
+    }
+
+    /// 本次 send 是否处于「会话在跑」：只认**官方 control** 的新鲜字段。
+    ///
+    /// 读面复用已装配的精确目标视图端口（[`StopPort::session`]，与打断守卫同一
+    /// 来源：精确 session/代际、必要时只读重同步、预算内返回）。判据见
+    /// [`running_primary_turn`]。
+    ///
+    /// **预算为零**：投递意向只是一行本地提示，绝不值得让一次发送去等重同步
+    /// （缺口期间旧投影本来就不作数）。零预算下端口只回当前已就绪的投影，需要
+    /// 重同步时立即 `not_ready` → 本次不带。任何读不到/不可信的情形都返回
+    /// `false`——**宁可交回宿主默认，也不拿本地忙态猜**；读失败绝不影响发送本身。
+    async fn send_is_running(&self, target: &BoundTarget) -> bool {
+        let Some(port) = self.stop.as_ref() else {
+            return false;
+        };
+        match port.session(target, Duration::ZERO).await {
+            Ok(view) => running_primary_turn(&view, target),
+            Err(_) => false,
+        }
     }
 
     /// 预留动作（幂等指纹 = kind + 会话 + 代际 + 全部参数，只落指纹不落正文）。
@@ -1389,6 +1457,11 @@ impl CommandSender {
 
     /// 构造信封并**恰一次**调用发送端口（无重发、无第二次 sendText、无 CLI 降级）。
     ///
+    /// `queue_delivery` 为 `true` 时在 `payload` 里显式携带官方
+    /// `requestedDelivery="queue"`：这只是**本次动作**的投递意向，排队与否仍由宿主
+    /// admission 决定（ACK 的 `result.delivery` 才是结论）；本端不改全局
+    /// followupMode、不发 stop、不建本地队列。
+    ///
     /// 超时由端口拥有：`ack_timeout` 原样传入，桥按它给 RPC 待答条目设期限并在超窗时
     /// 自行清账；这里**不**外套 `tokio::time::timeout`（取消 future 会绕过桥的
     /// `unregister_rpc`，留下永不回收的 pending waiter）。
@@ -1397,14 +1470,19 @@ impl CommandSender {
         ctx: &ActionContext,
         target: &BoundTarget,
         text: String,
+        queue_delivery: bool,
     ) -> ActionReceipt {
+        let mut payload = serde_json::json!({ "text": text });
+        if queue_delivery {
+            payload["requestedDelivery"] = Value::from(REQUESTED_DELIVERY_QUEUE);
+        }
         let envelope = serde_json::json!({
             "commandId": new_command_id(),
             // 协议身份与握手同源；device_id 不进协议信封（官方校验握手身份）。
             "clientId": PROTOCOL_CLIENT_ID,
             "sessionId": target.session_id,
             "type": SEND_TEXT_TYPE,
-            "payload": { "text": text },
+            "payload": payload,
             "issuedAt": now_ms(),
         });
         let (state, reason_code) = match self
@@ -4798,6 +4876,259 @@ mod tests {
                 .unwrap();
             assert_eq!(first.state, ActionState::Accepted);
             assert_eq!(envelopes_of_type(&fake, "sendText").len(), 0);
+        }
+    }
+
+    // ============================================================
+    // R2 fix round 1（I-2）：运行中 send 的官方投递请求
+    // ============================================================
+
+    /// 本次 send 是否携带 `requestedDelivery="queue"` 的行为锁。
+    ///
+    /// 依据（`docs/superpowers/reviews/2026-10-29-zcode-r0-wire-evidence.md` §3/§4，
+    /// `CLI@14762292`）：`sendText` 的投递意向在 `payload.requestedDelivery`，省略时
+    /// **跟随宿主** `state.inputRouting.mode`。本端只在「本次动作的新鲜视图确认会话
+    /// 在跑」时显式请求入队；判据不成立一律不带（交回宿主默认 startNow）。
+    mod send_delivery {
+        use super::*;
+
+        use crate::services::zcode_control::types::{
+            ActiveWork, CapabilityView, ControlView, QueueView, SessionView,
+        };
+
+        /// 只实现 `session` 读的端口 fake：本组用例只关心「运行中判据」的来源。
+        /// `wait_stop_cleared`（停止终态）不在 send 路径上，恒 `false`。
+        struct FakeSessions {
+            read: Mutex<Result<SessionView, &'static str>>,
+            calls: AtomicUsize,
+        }
+
+        impl FakeSessions {
+            fn running() -> Arc<Self> {
+                Self::new(Ok(view(
+                    Some(control(vec![work("primaryTurn", Some("E-run"))])),
+                    true,
+                )))
+            }
+
+            fn new(read: Result<SessionView, &'static str>) -> Arc<Self> {
+                Arc::new(Self {
+                    read: Mutex::new(read),
+                    calls: AtomicUsize::new(0),
+                })
+            }
+
+            fn calls(&self) -> usize {
+                self.calls.load(Ordering::SeqCst)
+            }
+        }
+
+        impl StopPort for FakeSessions {
+            fn session<'a>(
+                &'a self,
+                _target: &'a BoundTarget,
+                _timeout: Duration,
+            ) -> BoxFuture<'a, ZResult<SessionView>> {
+                Box::pin(async move {
+                    self.calls.fetch_add(1, Ordering::SeqCst);
+                    self.read.lock().unwrap().clone().map_err(ZcodeError::of)
+                })
+            }
+
+            fn wait_stop_cleared<'a>(
+                &'a self,
+                _target: &'a BoundTarget,
+                _execution_id: &'a str,
+                _baseline_revision: u64,
+                _timeout: Duration,
+            ) -> BoxFuture<'a, bool> {
+                Box::pin(async { false })
+            }
+        }
+
+        fn work(kind: &str, execution_id: Option<&str>) -> ActiveWork {
+            ActiveWork {
+                kind: kind.to_owned(),
+                foreground_execution_id: execution_id.map(str::to_owned),
+            }
+        }
+
+        fn control(works: Vec<ActiveWork>) -> ControlView {
+            ControlView {
+                active_works: works,
+            }
+        }
+
+        fn view(control: Option<ControlView>, ready: bool) -> SessionView {
+            SessionView {
+                session_id: SESSION.to_owned(),
+                generation: GEN,
+                revision: Some(4),
+                ready,
+                pending: Vec::new(),
+                control,
+                selection: None,
+                capabilities: CapabilityView::default(),
+                queue: QueueView::default(),
+            }
+        }
+
+        /// 出站信封里的 `payload.requestedDelivery`（缺席 = `None`）。
+        fn requested_delivery(fake: &FakeBridge) -> Option<Value> {
+            fake.envelope(0)
+                .get("payload")
+                .and_then(|payload| payload.get("requestedDelivery"))
+                .cloned()
+        }
+
+        /// 运行中（官方 control：`primaryTurn` + 非空执行 id）→ 本次 send 显式请求入队。
+        #[tokio::test]
+        async fn running_send_requests_queue_delivery() {
+            let store = DeviceStore::memory();
+            let fake = FakeBridge::new(Reply::Body(accepted_body()));
+            let sessions = FakeSessions::running();
+            let sender = sender(&fake, &store).with_stop(sessions.clone());
+
+            let receipt = sender
+                .execute(&ctx("a-run"), &target(), &send_action("排队这条"))
+                .await
+                .unwrap();
+
+            assert_eq!(receipt.state, ActionState::Accepted);
+            assert_eq!(sessions.calls(), 1, "每次新派发读一次新鲜视图");
+            assert_eq!(fake.frames().len(), 1, "恰一帧");
+            let envelope = fake.envelope(0);
+            assert_eq!(envelope["type"], SEND_TEXT_TYPE);
+            assert_eq!(envelope["payload"]["text"], "排队这条", "正文原样");
+            assert_eq!(
+                requested_delivery(&fake),
+                Some(Value::from("queue")),
+                "运行中必须显式请求官方入队语义：{envelope}"
+            );
+            // 只带投递意向：不改全局 followupMode、不发 stop、不构造队列编辑命令。
+            assert_eq!(
+                fake.frames()
+                    .iter()
+                    .filter(|frame| frame.method != AGENT_SEND_COMMAND_METHOD)
+                    .count(),
+                0,
+                "send 之外不得有任何出站帧"
+            );
+
+            // 幂等重放：同 actionId 同载荷只回既有回执，零新帧、零新读。
+            sender
+                .execute(&ctx("a-run"), &target(), &send_action("排队这条"))
+                .await
+                .unwrap();
+            assert_eq!(fake.frames().len(), 1);
+            assert_eq!(sessions.calls(), 1, "重放不得重读宿主视图");
+        }
+
+        /// 空闲（宿主已确认 `activeWorks=[]`）→ 不带投递意向，跟随宿主默认。
+        #[tokio::test]
+        async fn idle_send_keeps_host_default_delivery() {
+            let store = DeviceStore::memory();
+            let fake = FakeBridge::new(Reply::Body(accepted_body()));
+            let sessions = FakeSessions::new(Ok(view(Some(control(Vec::new())), true)));
+            let sender = sender(&fake, &store).with_stop(sessions.clone());
+
+            sender
+                .execute(&ctx("a-idle"), &target(), &send_action("空闲发"))
+                .await
+                .unwrap();
+            assert_eq!(sessions.calls(), 1);
+            assert_eq!(fake.frames().len(), 1);
+            assert_eq!(requested_delivery(&fake), None, "空闲不得请求入队");
+        }
+
+        /// control 未知（宿主未宣告 `activeWorks`）→ 不猜「在跑」，不带投递意向。
+        #[tokio::test]
+        async fn unknown_control_send_keeps_host_default_delivery() {
+            let store = DeviceStore::memory();
+            let fake = FakeBridge::new(Reply::Body(accepted_body()));
+            let sessions = FakeSessions::new(Ok(view(None, true)));
+            let sender = sender(&fake, &store).with_stop(sessions.clone());
+
+            sender
+                .execute(&ctx("a-unknown"), &target(), &send_action("未知 control"))
+                .await
+                .unwrap();
+            assert_eq!(requested_delivery(&fake), None);
+        }
+
+        /// 投影不新鲜（`ready=false`）→ 旧视图不作数，不带投递意向。
+        #[tokio::test]
+        async fn stale_view_send_keeps_host_default_delivery() {
+            let store = DeviceStore::memory();
+            let fake = FakeBridge::new(Reply::Body(accepted_body()));
+            let sessions = FakeSessions::new(Ok(view(
+                Some(control(vec![work("primaryTurn", Some("E-stale"))])),
+                false,
+            )));
+            let sender = sender(&fake, &store).with_stop(sessions.clone());
+
+            sender
+                .execute(&ctx("a-stale"), &target(), &send_action("旧视图"))
+                .await
+                .unwrap();
+            assert_eq!(requested_delivery(&fake), None, "不新鲜视图不得当作在跑");
+        }
+
+        /// 只有子 agent / 无执行 id 的活动 → 不是「会话在跑」，不带投递意向。
+        #[tokio::test]
+        async fn non_primary_work_send_keeps_host_default_delivery() {
+            for works in [
+                vec![work("subAgent", Some("E-sub"))],
+                vec![work("compact", None)],
+                vec![work("primaryTurn", None)],
+            ] {
+                let store = DeviceStore::memory();
+                let fake = FakeBridge::new(Reply::Body(accepted_body()));
+                let sessions = FakeSessions::new(Ok(view(Some(control(works.clone())), true)));
+                let sender = sender(&fake, &store).with_stop(sessions.clone());
+
+                sender
+                    .execute(&ctx("a-non-primary"), &target(), &send_action("非主回合"))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    requested_delivery(&fake),
+                    None,
+                    "非主回合不得请求入队：{works:?}"
+                );
+            }
+        }
+
+        /// 读失败只降级为「不带投递意向」：发送本身照发（零影响于既有语义）。
+        #[tokio::test]
+        async fn unreadable_view_send_still_delivers_once() {
+            let store = DeviceStore::memory();
+            let fake = FakeBridge::new(Reply::Body(accepted_body()));
+            let sessions = FakeSessions::new(Err(codes::NOT_READY));
+            let sender = sender(&fake, &store).with_stop(sessions.clone());
+
+            let receipt = sender
+                .execute(&ctx("a-unreadable"), &target(), &send_action("读不到"))
+                .await
+                .unwrap();
+            assert_eq!(receipt.state, ActionState::Accepted, "读失败不得阻断发送");
+            assert_eq!(fake.frames().len(), 1, "仍恰一帧");
+            assert_eq!(requested_delivery(&fake), None);
+        }
+
+        /// 未装配视图读面 → 拿不到官方 control，不带投递意向（宁可不带，也不猜）。
+        #[tokio::test]
+        async fn unwired_view_port_send_keeps_host_default_delivery() {
+            let store = DeviceStore::memory();
+            let fake = FakeBridge::new(Reply::Body(accepted_body()));
+            let sender = sender(&fake, &store);
+
+            sender
+                .execute(&ctx("a-unwired"), &target(), &send_action("未装配"))
+                .await
+                .unwrap();
+            assert_eq!(fake.frames().len(), 1);
+            assert_eq!(requested_delivery(&fake), None);
         }
     }
 

@@ -2293,6 +2293,9 @@
       "takeoverStillConflict": "仍存在冲突：请先关闭官方 ZCode 页面，稍后再试。",
       "queueCount": "排队 {{count}} 条",
       "queuePaused": "已暂停",
+      "queuePauseStopped": "回合已停止",
+      "queuePauseManual": "已手动暂停",
+      "queuePauseError": "回合出错后暂停",
       "queuePauseUnknown": "暂停状态未知",
       "queueToggleAria": "展开或收起排队列表"
     },
