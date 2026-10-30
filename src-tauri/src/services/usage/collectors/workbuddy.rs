@@ -1468,23 +1468,48 @@ mod tests {
         );
     }
 
-    /// **M1 就地锁（R3 / D17 计数分层）**：workbuddy 本机无子代理会话、也无子代理概念
-    /// → `is_subagent` 必须是 `false`。置真的后果**不可逆**：① Task 18 按 R3 **硬过滤**该位
-    /// → 整个源从会话数 / turn 层消失；② DAO 是 `MAX(is_subagent, excluded)` **只升不降**（W-31）。
+    /// **M1 就地锁（R3 / D17 计数分层），5.9.3 起修订为「父不是、子代理是」**：
+    /// 父会话 `is_subagent` 必须为 `false`（置真的后果**不可逆**：① Task 18 按 R3 **硬过滤**
+    /// 该位 → 父会话从会话数 / turn 层消失；② DAO 是 `MAX(is_subagent, excluded)` 只升不降）；
+    /// 子代理文件必须为 `true` 且带 `parent_session_id`（token 计入、会话数不计）。
     /// （peer 都有就地锁：`kimi.rs` / `codex.rs` / `claude.rs`。）
     #[test]
-    fn session_is_never_marked_as_a_subagent() {
+    fn parent_session_is_not_subagent_while_subagent_files_are() {
         let dir = tempfile::tempdir().unwrap();
         fixture(dir.path());
+        write_subagent_jsonl(
+            dir.path(),
+            "p-A",
+            "s1",
+            &format!("agent-{OTHER_UUID}.jsonl"),
+            &[
+                json!({"type":"function_call","name":"Read","timestamp":2000,"callId":"sc1",
+                     "cwd":"/p/A","sessionId":SUBAGENT_ID,
+                     "message":{"usage":{"input_tokens":10,"output_tokens":1,"total_tokens":11}},
+                     "providerData":{"model":"deepseek-v4.1-flash","isSubAgent":true}}),
+            ],
+        );
         let no_cursors = HashMap::new();
         let (delta, _) = run(dir.path(), &no_cursors);
-        assert_eq!(delta.sessions.len(), 1);
+        assert_eq!(delta.sessions.len(), 2, "父 + 1 子");
+        let parent = delta
+            .sessions
+            .iter()
+            .find(|s| s.session_id == "s1")
+            .unwrap();
         assert!(
-            !delta.sessions[0].is_subagent,
-            "workbuddy 无子代理会话：is_subagent 必须为 false（置真会被 Task 18 硬过滤且不可逆）"
+            !parent.is_subagent,
+            "父会话不得被子代理文件连坐：置真会被 Task 18 硬过滤且不可逆"
         );
         // 前提断言（防假绿）：会话维度真的产出了（否则上面那条恒真）
-        assert_eq!(delta.sessions[0].project_key, "a");
+        assert_eq!(parent.project_key, "a");
+        let child = delta
+            .sessions
+            .iter()
+            .find(|s| s.session_id == SUBAGENT_ID)
+            .expect("子代理会话维度必须在场");
+        assert!(child.is_subagent);
+        assert_eq!(child.parent_session_id.as_deref(), Some("s1"));
     }
 
     /// **裁决 A（plan-mandated）**：`sessions` 表不在（版本漂移 / 库损坏）→ 必须**整源 Err**。

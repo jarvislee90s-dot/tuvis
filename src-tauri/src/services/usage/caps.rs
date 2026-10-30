@@ -64,7 +64,10 @@ pub fn caps_of(source: UsageSourceId) -> SourceCaps {
             tool_calls: true,
             user_est: false,
         },
-        // workbuddy：**无回合概念**、**无 duration 字段**、供应商不可得；错误弱可得（无分类）
+        // workbuddy：**无回合概念**、**无 duration 字段**、供应商不可得；错误弱可得（无分类）。
+        // 子代理（5.9.3 起 `subagents/*.jsonl`）自 2026-10-30 起独立入账为 `is_subagent=1` 的会话，
+        // 但**不代表口径变化**：token 仍计入总量、会话数/turn 数由查询层 D17 分层排除，
+        // 本表各字段的可得性对父/子代理完全一致（子代理文件同形），故不新增 caps 维度。
         UsageSourceId::WorkBuddy => SourceCaps {
             turn: false,
             error_model: false,
