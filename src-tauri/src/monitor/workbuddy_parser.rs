@@ -2472,8 +2472,10 @@ mod db_activity_tests {
 
     const NOW: i64 = 1_793_343_808_404; // 真机快照时刻量级（ms）
 
+    type SeedRow<'a> = (&'a str, &'a str, Option<i64>, i64, Option<i64>);
+
     /// 构造最小 workbuddy.db（列子集与真机一致：`last_activity_at` 可空、`deleted_at` 为整数）
-    fn seed(home: &Path, rows: &[(&str, &str, Option<i64>, i64, Option<i64>)]) {
+    fn seed(home: &Path, rows: &[SeedRow<'_>]) {
         let dir = home.join(".workbuddy");
         std::fs::create_dir_all(&dir).unwrap();
         let conn = rusqlite::Connection::open(dir.join("workbuddy.db")).unwrap();
