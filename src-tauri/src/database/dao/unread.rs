@@ -130,6 +130,17 @@ pub fn mark_read_tombstone_conn(
     );
 }
 
+/// 读取已读墓碑时间（epoch ms）；无墓碑 → None。
+/// 看板用它判断“DB-only completed 卡是否已被用户读掉、且没有新工作”。
+pub fn read_tombstone_at_conn(conn: &Connection, tool_id: &str, session_id: &str) -> Option<i64> {
+    conn.query_row(
+        "SELECT read_at FROM unread_read_tombstones WHERE tool_id = ?1 AND session_id = ?2",
+        params![tool_id, session_id],
+        |r| r.get::<_, i64>(0),
+    )
+    .ok()
+}
+
 /// TTL 内是否已读过该会话（真 = Insert 边沿不得为其复插未读行）
 pub fn was_read_recently_conn(
     conn: &Connection,
@@ -186,6 +197,12 @@ pub fn mark_read(tool_id: &str, session_id: &str) {
     let now = chrono::Utc::now().timestamp_millis();
     let conn = DB.lock().unwrap();
     mark_read_tombstone_conn(&conn, tool_id, session_id, now);
+}
+
+/// 读取已读墓碑时间（全局连接包装）；无墓碑 → None。
+pub fn read_tombstone_at(tool_id: &str, session_id: &str) -> Option<i64> {
+    let conn = DB.lock().unwrap();
+    read_tombstone_at_conn(&conn, tool_id, session_id)
 }
 
 /// TTL 内是否已读过该会话（Insert 边沿的防复活判据）
@@ -294,8 +311,10 @@ mod tests {
         let conn = mem();
         let now = 10_000_000i64;
         assert!(!was_read_recently_conn(&conn, "workbuddy", "s1", now));
+        assert_eq!(read_tombstone_at_conn(&conn, "workbuddy", "s1"), None);
         mark_read_tombstone_conn(&conn, "workbuddy", "s1", now);
         assert!(was_read_recently_conn(&conn, "workbuddy", "s1", now));
+        assert_eq!(read_tombstone_at_conn(&conn, "workbuddy", "s1"), Some(now));
         // 其他会话 / 其他工具不受影响
         assert!(!was_read_recently_conn(&conn, "workbuddy", "s2", now));
         assert!(!was_read_recently_conn(&conn, "codex", "s1", now));

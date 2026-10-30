@@ -700,6 +700,9 @@ fn get_all_sessions_inner() -> SessionsResponse {
     // DB 打不开时为空集（不误清）。合并阶段同时过滤/删除这些行。
     let deleted_workbuddy = deleted_workbuddy_unread_ids();
     sync_unread_sessions(&mut all_sessions, &deleted_workbuddy);
+    // 已读生命周期：DB-only completed 卡在用户已读（墓碑）且没有新工作后，不应继续
+    // 以普通 Idle 卡出现——否则“已读”只是去掉未读标记，卡仍在。
+    drop_read_completed_workbuddy_cards(&mut all_sessions);
 
     // Hook 事件集成：用新鲜事件（<30s）更新会话状态；T3 起审批等待持久化（DB
     // approval_wait_marks）——进入事件（PermissionRequest/Notification[注册侧已
@@ -2004,6 +2007,44 @@ fn deleted_workbuddy_unread_ids() -> HashSet<String> {
     crate::monitor::workbuddy_parser::deleted_workbuddy_session_ids(&home, &ids).unwrap_or_default()
 }
 
+/// DB-only completed WorkBuddy 卡的“已读后消失”判据：
+/// 必须同时满足 pid=0（没有真实心跳/进程）、Idle/Finished、存在已读墓碑，
+/// 且最后活动时间不晚于墓碑时间（没有新工作回合）。有新活动则保留。
+fn read_completed_card_should_drop(s: &Session, read_at: Option<i64>) -> bool {
+    if s.agent_type != AgentType::WorkBuddy
+        || s.pid != 0
+        || !matches!(s.status, SessionStatus::Idle | SessionStatus::Finished)
+    {
+        return false;
+    }
+    let Some(read_at) = read_at else {
+        return false;
+    };
+    chrono::DateTime::parse_from_rfc3339(&s.last_activity_at)
+        .map(|dt| dt.timestamp_millis() <= read_at)
+        .unwrap_or(true)
+}
+
+/// 纯核：按注入的墓碑查询剔除“已读且无新工作”的 DB-only completed 卡（可测）。
+fn retain_read_completed_cards(
+    active: &mut Vec<Session>,
+    read_at_of: &dyn Fn(&str) -> Option<i64>,
+) {
+    active.retain(|s| {
+        let is_candidate = s.agent_type == AgentType::WorkBuddy
+            && s.pid == 0
+            && matches!(s.status, SessionStatus::Idle | SessionStatus::Finished);
+        !(is_candidate && read_completed_card_should_drop(s, read_at_of(&s.id)))
+    });
+}
+
+/// 生产入口：墓碑来自 unread DAO。
+fn drop_read_completed_workbuddy_cards(active: &mut Vec<Session>) {
+    retain_read_completed_cards(active, &|sid| {
+        crate::database::dao::unread::read_tombstone_at("workbuddy", sid)
+    });
+}
+
 /// 未读池合并前的删除过滤（纯函数，可测）：
 /// 只丢弃 `deleted` 集合中命中的 WorkBuddy 行；其他工具同 id 不受影响。
 fn filter_deleted_unread(
@@ -2656,7 +2697,10 @@ mod sort_tests {
 
 #[cfg(test)]
 mod unread_card_tests {
-    use super::{build_unread_cards, filter_deleted_unread, mark_active_unread_cards};
+    use super::{
+        build_unread_cards, filter_deleted_unread, mark_active_unread_cards,
+        retain_read_completed_cards,
+    };
     use crate::database::dao::unread::UnreadSessionRecord;
     use crate::session::model::{AgentType, ProcessForm, Session, SessionStatus};
 
@@ -2704,6 +2748,35 @@ mod unread_card_tests {
         let filtered = filter_deleted_unread(pool, &deleted);
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].tool_id, "codex");
+    }
+
+    /// 第三轮 P1：DB-only completed → 已读墓碑 → 下一轮扫描不得再出普通卡；
+    /// 有新活动（last_activity 晚于墓碑）时必须保留。
+    #[test]
+    fn read_completed_db_only_card_is_dropped_until_new_activity() {
+        let read_at = 1_793_000_000_000i64;
+        let mut card = active_card(AgentType::WorkBuddy, "s1");
+        card.pid = 0;
+        card.status = SessionStatus::Idle;
+        card.last_activity_at = chrono::DateTime::from_timestamp_millis(read_at - 1_000)
+            .unwrap()
+            .to_rfc3339();
+
+        let mut active = vec![card.clone()];
+        retain_read_completed_cards(&mut active, &|_| Some(read_at));
+        assert!(active.is_empty(), "已读且无新工作 → 完成卡应消失");
+
+        card.last_activity_at = chrono::DateTime::from_timestamp_millis(read_at + 1_000)
+            .unwrap()
+            .to_rfc3339();
+        let mut active = vec![card.clone()];
+        retain_read_completed_cards(&mut active, &|_| Some(read_at));
+        assert_eq!(active.len(), 1, "墓碑之后有新工作 → 保留卡片");
+
+        card.pid = 42;
+        let mut active = vec![card];
+        retain_read_completed_cards(&mut active, &|_| Some(read_at));
+        assert_eq!(active.len(), 1, "有真实心跳 pid 的卡不按 DB-only 规则剔除");
     }
 
     /// P1：WorkBuddy DB-only completed 卡（pid=0）池里有未读行时，必须标 unread；

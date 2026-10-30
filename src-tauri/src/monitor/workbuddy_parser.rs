@@ -393,8 +393,13 @@ pub fn deleted_workbuddy_session_ids(
         .ok()?;
     let mut out = std::collections::HashSet::new();
     for row in rows {
-        if let Ok(Some(id)) = row {
-            out.insert(id);
+        match row {
+            Ok(Some(id)) => {
+                out.insert(id);
+            }
+            Ok(None) => {}
+            // 逐行解码失败也视为查询不可信：返回 None，调用方不得据此清理
+            Err(_) => return None,
         }
     }
     Some(out)
