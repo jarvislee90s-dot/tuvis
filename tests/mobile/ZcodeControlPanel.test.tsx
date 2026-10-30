@@ -269,9 +269,49 @@ class PendingUploadXhr {
   }
 }
 
+/**
+ * 可控上传结局的 XHR 替身：把实例登记到静态列表，测试手动触发
+ * `respondOk`（→ 附件就绪）或 `respondFail`（→ 附件失败）。
+ * 用于锁定「就绪附件计入可发内容」与「失败附件阻止发送」这两条面板级语义。
+ */
+class ControllableUploadXhr {
+  /** 本次测试内已创建的上传实例（按创建顺序）。 */
+  static instances: ControllableUploadXhr[] = [];
+  onload: ((e: ProgressEvent) => void) | null = null;
+  onerror: (() => void) | null = null;
+  onabort: (() => void) | null = null;
+  status = 0;
+  responseText = "";
+  upload = { onprogress: null as ((e: ProgressEvent) => void) | null };
+  constructor() {
+    ControllableUploadXhr.instances.push(this);
+  }
+  open() {}
+  setRequestHeader() {}
+  send() {
+    /* 挂起：等测试手动给结局 */
+  }
+  abort() {
+    this.onabort?.();
+  }
+  /** 上传成功（200 + path）→ 附件转就绪。 */
+  respondOk(path: string) {
+    this.status = 200;
+    this.responseText = JSON.stringify({ path, size: 1 });
+    this.onload?.(new ProgressEvent("load"));
+  }
+  /** 上传失败（4xx）→ 附件转 failed。 */
+  respondFail(status = 413) {
+    this.status = status;
+    this.responseText = JSON.stringify({ error: "too_large" });
+    this.onload?.(new ProgressEvent("load"));
+  }
+}
+
 beforeEach(() => {
   // jsdom 无 EventSource；显式置空让 hook 走「GET 首拍权威」路径（本文件只测面板）。
   vi.stubGlobal("EventSource", undefined);
+  ControllableUploadXhr.instances = [];
 });
 
 afterEach(async () => {
@@ -971,6 +1011,153 @@ describe("ZCode 控制面板：主按钮在发送与打断之间切换（R5/U3�
     fireEvent.click(primary);
     await act(async () => {});
     expect(postedActions()).toHaveLength(0);
+  });
+
+  it("运行中 + 只有就绪附件（无文字）→ 主按钮是发送，附件随正文上行", async () => {
+    // U3 明文：「有文字**或就绪附件**时为发送」。就绪附件（上传完成、带 path）本身
+    // 就是可提交内容 —— 即使运行中、即使没有文字，主按钮也必须是发送而不是打断，
+    // 否则用户上传好的附件将永远发不出去。
+    vi.stubGlobal("XMLHttpRequest", ControllableUploadXhr);
+    installRunning(runningSession());
+    render(<ZcodeControlPanel sessionId={SID} />);
+
+    const primary = (await screen.findByTestId("zcode-send")) as HTMLButtonElement;
+    const input = screen.getByTestId("zcode-attachment-input") as HTMLInputElement;
+    fireEvent.change(input, {
+      target: { files: [new File(["binary"], "shot.png", { type: "image/png" })] },
+    });
+    await waitFor(() => expect(screen.getByTestId("zcode-attachment")).toBeTruthy());
+
+    // 上传完成 → 附件就绪
+    await act(async () => {
+      ControllableUploadXhr.instances[0].respondOk("/tmp/synthetic/shot.png");
+      await Promise.resolve();
+    });
+    await waitFor(() =>
+      expect(screen.getByTestId("zcode-attachment").getAttribute("data-status")).toBe("ready")
+    );
+
+    // 运行中 + 就绪附件 + 无文字 → 主按钮仍是**发送**（不是打断）
+    await waitFor(() => expect(primary.getAttribute("data-primary-action")).toBe("send"));
+    expect(primary.getAttribute("data-primary-mode")).toBe("send");
+    expect(primary).toBeEnabled();
+
+    fireEvent.click(primary);
+
+    await waitFor(() => expect(postedActions()).toHaveLength(1));
+    // 正文 = 附件引用（无文字时正文恰为 markup）
+    expect(postedActions()[0].action).toEqual({
+      kind: "send",
+      sessionId: SID,
+      generation: GEN,
+      text: '<image path="/tmp/synthetic/shot.png">',
+    });
+    // 有内容（就绪附件）发送不得先打断
+    expect(postedActions().filter(({ action }) => action.kind === "stop")).toHaveLength(0);
+  });
+
+  it("failed 附件 + 有文字 → 主按钮禁用、零 POST，失败附件不被静默丢弃", async () => {
+    // brief §最小实现：「有 uploading/failed 附件时沿原提示阻止发送」。
+    // 失败附件绝不能被静默丢掉后照发文字 —— 按钮必须禁用且保留既有失败提示。
+    vi.stubGlobal("XMLHttpRequest", ControllableUploadXhr);
+    installRunning(runningSession());
+    render(<ZcodeControlPanel sessionId={SID} />);
+
+    const primary = (await screen.findByTestId("zcode-send")) as HTMLButtonElement;
+    const draft = screen.getByTestId("zcode-draft") as HTMLTextAreaElement;
+    const input = screen.getByTestId("zcode-attachment-input") as HTMLInputElement;
+    fireEvent.change(input, {
+      target: { files: [new File(["binary"], "shot.png", { type: "image/png" })] },
+    });
+    await waitFor(() => expect(screen.getByTestId("zcode-attachment")).toBeTruthy());
+
+    // 上传失败 → 附件转 failed
+    await act(async () => {
+      ControllableUploadXhr.instances[0].respondFail(413);
+      await Promise.resolve();
+    });
+    await waitFor(() =>
+      expect(screen.getByTestId("zcode-attachment").getAttribute("data-status")).toBe("failed")
+    );
+
+    // 即便有文字，失败附件在列 → 不得发出任何动作
+    fireEvent.change(draft, { target: { value: "文字不能把失败的附件悄悄丢掉" } });
+
+    await waitFor(() => expect(primary).toBeDisabled());
+    expect(primary.getAttribute("data-primary-action")).toBe("disabled");
+    // 既有失败提示可见（沿用 attachBlockedFailed 文案，不新造）
+    expect(screen.getByTestId("zcode-attach-notice")).toBeVisible();
+
+    fireEvent.click(primary);
+    await act(async () => {});
+    expect(postedActions()).toHaveLength(0);
+    expect(postedActions().filter(({ action }) => action.kind === "send")).toHaveLength(0);
+    // 失败附件仍在册（没被静默丢弃）
+    expect(screen.getByTestId("zcode-attachment").getAttribute("data-status")).toBe("failed");
+    expect(draft).toHaveValue("文字不能把失败的附件悄悄丢掉");
+  });
+
+  it("上传中附件 + 有文字 → 主按钮禁用、零 POST（不得翻成打断）", async () => {
+    // 与 failed 附件同口径：附件在途时发送位锁死，且**绝不**退化成打断。
+    vi.stubGlobal("XMLHttpRequest", PendingUploadXhr);
+    installRunning(runningSession());
+    render(<ZcodeControlPanel sessionId={SID} />);
+
+    const primary = (await screen.findByTestId("zcode-send")) as HTMLButtonElement;
+    const draft = screen.getByTestId("zcode-draft") as HTMLTextAreaElement;
+    const input = screen.getByTestId("zcode-attachment-input") as HTMLInputElement;
+    fireEvent.change(input, {
+      target: { files: [new File(["binary"], "shot.png", { type: "image/png" })] },
+    });
+    await waitFor(() => expect(screen.getByTestId("zcode-attachment")).toBeTruthy());
+    fireEvent.change(draft, { target: { value: "文字先到、附件还在路上" } });
+
+    await waitFor(() => expect(primary).toBeDisabled());
+    expect(primary.getAttribute("data-primary-action")).toBe("disabled");
+    expect(primary.getAttribute("data-primary-mode")).toBe("send");
+    expect(screen.getByTestId("zcode-attach-notice")).toBeVisible();
+
+    fireEvent.click(primary);
+    await act(async () => {});
+    expect(postedActions()).toHaveLength(0);
+    // 在途附件不得被静默丢掉后照发文字
+    expect(postedActions().filter(({ action }) => action.kind === "send")).toHaveLength(0);
+    expect(draft).toHaveValue("文字先到、附件还在路上");
+  });
+
+  it("运行中 + 有文字 + 就绪附件 → 主按钮是发送，正文含文字与附件引用", async () => {
+    // 组合态：文字与就绪附件同时在手 → 仍是发送，且正文两者都在（不得只发一半）。
+    vi.stubGlobal("XMLHttpRequest", ControllableUploadXhr);
+    installRunning(runningSession());
+    render(<ZcodeControlPanel sessionId={SID} />);
+
+    const primary = (await screen.findByTestId("zcode-send")) as HTMLButtonElement;
+    const draft = screen.getByTestId("zcode-draft") as HTMLTextAreaElement;
+    const input = screen.getByTestId("zcode-attachment-input") as HTMLInputElement;
+    fireEvent.change(input, {
+      target: { files: [new File(["binary"], "shot.png", { type: "image/png" })] },
+    });
+    await waitFor(() => expect(screen.getByTestId("zcode-attachment")).toBeTruthy());
+    await act(async () => {
+      ControllableUploadXhr.instances[0].respondOk("/tmp/synthetic/shot.png");
+      await Promise.resolve();
+    });
+    await waitFor(() =>
+      expect(screen.getByTestId("zcode-attachment").getAttribute("data-status")).toBe("ready")
+    );
+    fireEvent.change(draft, { target: { value: "文字与附件一起发" } });
+
+    await waitFor(() => expect(primary.getAttribute("data-primary-action")).toBe("send"));
+    fireEvent.click(primary);
+
+    await waitFor(() => expect(postedActions()).toHaveLength(1));
+    expect(postedActions()[0].action).toEqual({
+      kind: "send",
+      sessionId: SID,
+      generation: GEN,
+      text: '文字与附件一起发\n<image path="/tmp/synthetic/shot.png">',
+    });
+    expect(postedActions().filter(({ action }) => action.kind === "stop")).toHaveLength(0);
   });
 
   it("打断回执 Unknown → 不自动重发、不假清草稿", async () => {
