@@ -2036,6 +2036,151 @@ mod tests {
         assert_eq!(delta.parsed_files, 1);
     }
 
+    // ---- A5：错误与边界（W-06 / D-24：只有「读前消失」可跳过）----
+
+    /// 子代理目录**不可读**（权限）→ 整源 `usage-source-io`，不得静默少算。
+    /// 构造：`chmod 000`（非 root 下 `read_dir` 必然 EACCES）。跨平台不可伪：Windows 无该语义，
+    /// 故只在 unix 跑。
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_subagent_dir_fails_loudly() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        make_db(dir.path(), &[("s1", "/p/A")]);
+        write_jsonl(
+            dir.path(),
+            "p-A",
+            "s1",
+            &[
+                json!({"type":"message","role":"assistant","timestamp":1000,"cwd":"/p/A",
+                     "sessionId":"s1","content":[{"type":"output_text","text":"ok"}],
+                     "message":{"usage":{"input_tokens":10,"output_tokens":1,"total_tokens":11}},
+                     "providerData":{"model":"deepseek-v4.1-flash"}}),
+            ],
+        );
+        let sub_dir = dir.path().join(".workbuddy/projects/p-A/s1/subagents");
+        std::fs::create_dir_all(&sub_dir).unwrap();
+        std::fs::set_permissions(&sub_dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let no_cursors = HashMap::new();
+        let ctx = CollectContext::new(dir.path(), 1_700_000_000_000, &no_cursors);
+        let err = collect_with_home(&ctx, dir.path())
+            .expect_err("子代理目录不可读 → 整源报错（W-06：不得静默少算）");
+        // 复原权限，否则 tempdir 清理失败
+        std::fs::set_permissions(&sub_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(err.code, "usage-source-io");
+        assert!(
+            err.detail.contains("subagents"),
+            "错误里要能定位到目录：{}",
+            err.detail
+        );
+    }
+
+    /// 单个子代理文件**不可读**（权限）→ 整源 `usage-source-io`（只有「读前消失」才可跳过）
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_subagent_file_fails_loudly() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        make_db(dir.path(), &[("s1", "/p/A")]);
+        write_jsonl(
+            dir.path(),
+            "p-A",
+            "s1",
+            &[
+                json!({"type":"message","role":"assistant","timestamp":1000,"cwd":"/p/A",
+                     "sessionId":"s1","content":[{"type":"output_text","text":"ok"}],
+                     "message":{"usage":{"input_tokens":10,"output_tokens":1,"total_tokens":11}},
+                     "providerData":{"model":"deepseek-v4.1-flash"}}),
+            ],
+        );
+        let p = write_subagent_jsonl(
+            dir.path(),
+            "p-A",
+            "s1",
+            &format!("agent-{OTHER_UUID}.jsonl"),
+            &[
+                json!({"type":"function_call","name":"Bash","timestamp":2000,"callId":"sc1",
+                     "cwd":"/p/A","sessionId":SUBAGENT_ID,
+                     "message":{"usage":{"input_tokens":10,"output_tokens":1,"total_tokens":11}},
+                     "providerData":{"model":"deepseek-v4.1-flash","isSubAgent":true}}),
+            ],
+        );
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let no_cursors = HashMap::new();
+        let ctx = CollectContext::new(dir.path(), 1_700_000_000_000, &no_cursors);
+        let err =
+            collect_with_home(&ctx, dir.path()).expect_err("子代理文件不可读 → 整源报错（W-06）");
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(err.code, "usage-source-io");
+        assert!(err.detail.contains("agent-"), "{}", err.detail);
+    }
+
+    /// **旧 `state_json` 兼容**：5.9.3 之前的游标里没有 `subagent_session_id` 字段 →
+    /// 必须可反序列化且不丢 `tools` / `last_model`（否则跨轮配对与模型继承一起丢）
+    #[test]
+    fn old_cursor_state_without_subagent_field_still_parses() {
+        let legacy = r#"{"tools":{"open":{"c1":[1000,"Bash"]},"dropped":0},
+                          "last_model":"hy4-preview","dropped_no_model":1}"#;
+        let st: WbState = serde_json::from_str(legacy).expect("旧 state_json 必须仍可反序列化");
+        assert_eq!(st.last_model, "hy4-preview");
+        assert_eq!(st.dropped_no_model, 1);
+        assert_eq!(st.tools.open.len(), 1, "不得丢 tools（跨轮配对依赖它）");
+        assert!(st.subagent_session_id.is_empty());
+    }
+
+    /// 子代理文件的**整文件无模型** → 丢弃 + 计数进该文件自己的 `state_json`（不写 `model=""`）
+    #[test]
+    fn subagent_file_without_any_model_is_dropped_with_a_count() {
+        let dir = tempfile::tempdir().unwrap();
+        make_db(dir.path(), &[("s1", "/p/A")]);
+        write_jsonl(
+            dir.path(),
+            "p-A",
+            "s1",
+            &[
+                json!({"type":"message","role":"assistant","timestamp":1000,"cwd":"/p/A",
+                     "sessionId":"s1","content":[{"type":"output_text","text":"ok"}],
+                     "message":{"usage":{"input_tokens":10,"output_tokens":1,"total_tokens":11}},
+                     "providerData":{"model":"deepseek-v4.1-flash"}}),
+            ],
+        );
+        write_subagent_jsonl(
+            dir.path(),
+            "p-A",
+            "s1",
+            &format!("agent-{OTHER_UUID}.jsonl"),
+            &[
+                json!({"type":"function_call","name":"Bash","timestamp":2000,"callId":"sc1",
+                     "cwd":"/p/A","sessionId":SUBAGENT_ID,
+                     "message":{"usage":{"input_tokens":10,"output_tokens":1,"total_tokens":11}},
+                     "providerData":{"isSubAgent":true}}),
+            ],
+        );
+        let no_cursors = HashMap::new();
+        let (delta, _) = run(dir.path(), &no_cursors);
+        assert_eq!(
+            delta
+                .details
+                .iter()
+                .filter(|d| d.key.model.is_empty())
+                .count(),
+            0,
+            "不得写 model=\"\" 幽灵行"
+        );
+        let sub_cursor = delta
+            .cursors
+            .iter()
+            .find(|c| c.session_id.contains("subagents"))
+            .expect("子代理文件必须有自己的游标");
+        assert!(
+            sub_cursor.state_json.contains("\"dropped_no_model\":1"),
+            "丢弃必须计数且可断言：{}",
+            sub_cursor.state_json
+        );
+        // 该子代理会话维度仍登记（身份在轮次里解析出来了）——只是明细不入账
+        assert!(delta.sessions.iter().any(|s| s.session_id == SUBAGENT_ID));
+    }
+
     /// **登记锁（GC 20 / §3.2.2 阻塞 4）**：漏登记不是编译错——`run_collection` 只遍历
     /// `collectors::all()`，这个源会被静默跳过。
     #[test]
