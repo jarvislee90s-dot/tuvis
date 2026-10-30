@@ -546,6 +546,11 @@ fn collect_file(
     // **子代理身份解析放在这里**（设计 §2.5/§2.3）：必须在游标/WbState 加载**之后**——
     // 命中 `state.subagent_session_id` 就零文件头重读，否则每轮都要扫 64 KiB 前缀。
     // `rescan`（截断/重写）时 state 是 `default()`（该字段为空）→ 自动按新代际重新解析。
+    // **项目归属用哪个 cwd**：父/子共用 `process_line`，但归属口径不同——父会话沿用
+    // DB `sessions.cwd`（R3：主会话数值零变化），子代理优先取**行内** `cwd`（子代理可能
+    // 跑在别的项目下）。用独立布尔表达这个意图，别让 `is_subagent` 直接冒充 `row_cwd_first`
+    //（两者今天取值相同，但语义不是同一个概念）。
+    let row_cwd_first = is_subagent;
     let resolved_id: String = if !is_subagent {
         session_id.to_string()
     } else if state.subagent_session_id.is_empty() {
@@ -581,7 +586,7 @@ fn collect_file(
                 &mut state,
                 &resolved_id,
                 cwd,
-                is_subagent,
+                row_cwd_first,
                 ctx.now_ms,
             );
             warn_unattributed(jsonl, left);
