@@ -658,7 +658,26 @@ fn file_mtime_ms(path: &Path) -> Option<u64> {
         .map(|dur| dur.as_millis() as u64)
 }
 
-/// 可测核心（R2）：home / 进程表 / 时钟 / DB 活跃会话注入。
+/// 看板与补偿共用的在场判据：
+/// * `status='working'` 的 DB 行**无条件在场**（即使 DB/jsonl 已静默 >300s：父会话
+///   在等子代理，看板不能被 300s 窗掉卡，补偿也不能把它补成未读）；
+/// * 其余（completed）才用 DB `MAX(...)` / 主 jsonl mtime 的 300s 窗口；
+/// * `runtime_present` 不再单独构成在场（completed + 残留心跳+pid 必须能下板并被补偿）。
+fn workbuddy_is_live(
+    db_status: Option<&str>,
+    db_activity_ms: Option<i64>,
+    mtime_ms: Option<u64>,
+    now: u64,
+) -> bool {
+    let working = db_status == Some("working");
+    let db_age_ms = db_activity_ms.map_or(u64::MAX, |a| now.saturating_sub(a.max(0) as u64));
+    let mtime_age_ms = mtime_ms.map_or(0, |m| now.saturating_sub(m));
+    working
+        || db_age_ms <= SESSION_ACTIVE_WINDOW_MS as u64
+        || mtime_age_ms <= SESSION_ACTIVE_WINDOW_MS as u64
+}
+
+/// 可测核心（R2）：home / 进程表 / 时钟 / DB 活跃会话注入。/// 可测核心（R2）：home / 进程表 / 时钟 / DB 活跃会话注入。
 ///
 /// 在场判据（设计 §3.2，**唯一口径**）：
 /// ```text
@@ -685,7 +704,6 @@ pub fn get_workbuddy_sessions_with(
         return Vec::new();
     }
     let mut sessions = Vec::new();
-    let window = SESSION_ACTIVE_WINDOW_MS as u64;
 
     // ---- 候选 1：心跳进程（身份/pid 由心跳给；DB 行**必须合并**，否则拿不到 status）----
     let mut candidates: Vec<WbCandidate> = Vec::new();
@@ -769,16 +787,13 @@ pub fn get_workbuddy_sessions_with(
         };
         // 先判活、后读尾部：不活跃的候选只 stat，不解析 500 行
         let jsonl_mtime_ms = file_mtime_ms(&jsonl);
-        let mtime_age_ms = jsonl_mtime_ms.map_or(0, |m| now.saturating_sub(m));
-        let db_age_ms = c
-            .db_activity_ms
-            .map_or(u64::MAX, |a| now.saturating_sub(a.max(0) as u64));
         let working = c.db_status.as_deref() == Some("working");
-        // runtime_present：心跳候选 ∧ 内容 pid 存活（find_processes 已用进程表核过）
-        // ∧ sessionId 匹配（候选构造时已校验）→ 对心跳候选恒真；DB-only 候选恒假
-        let runtime_present = c.last_heartbeat_ms.is_some();
-        let is_live = (runtime_present && working) || db_age_ms <= window || mtime_age_ms <= window;
-        if !is_live {
+        if !workbuddy_is_live(
+            c.db_status.as_deref(),
+            c.db_activity_ms,
+            jsonl_mtime_ms,
+            now,
+        ) {
             continue;
         }
 
@@ -1167,31 +1182,33 @@ fn heartbeat_snapshot(home: &Path) -> HeartbeatSnapshot {
 fn session_is_live(
     home: &Path,
     now: u64,
-    recent: &HashMap<String, WbDbSession>,
+    by_id: &HashMap<String, WbDbSession>,
     live_ids: &std::collections::HashSet<String>,
     file_present_ids: &std::collections::HashSet<String>,
     sid: &str,
 ) -> bool {
-    // ① runtime_present 优先（运行中的 5.9.3 会话心跳恒过期，但 pid 存活即在场）
-    if live_ids.contains(sid) {
+    let row = by_id.get(sid);
+    let working = row.is_some_and(|r| r.status == "working");
+    // ① 心跳文件已被 unregister 删除：completed 立即补；DB 仍 working → 仍视为在场。
+    if !file_present_ids.contains(sid) {
+        return working;
+    }
+    // ② DB 状态不可得（打不开/行缺失）但心跳文件+pid 存活 → 保守视为在场，避免误补。
+    if row.is_none() && live_ids.contains(sid) {
         return true;
     }
-    // ② 心跳文件已删除：正常 unregister = 会话结束。completed 立即补；
-    //    DB 仍说 working（异常删文件/进程还在）则不补，避免误伤运行中的会话。
-    if !file_present_ids.contains(sid) {
-        return recent.get(sid).is_some_and(|r| r.status == "working");
-    }
-    // ③ 文件存在但过期（崩溃/异常）：300s 窗口兜底
-    if let Some(row) = recent.get(sid) {
-        if now as i64 - row.activity_ms <= SESSION_ACTIVE_WINDOW_MS {
-            return true;
-        }
-    }
-    // ④ 主 jsonl mtime 在 300s 内
-    let cwd = recent.get(sid).map(|r| r.cwd.clone()).unwrap_or_default();
-    find_session_jsonl(home, &cwd, sid)
-        .and_then(|p| file_mtime_ms(&p))
-        .is_some_and(|m| now.saturating_sub(m) <= SESSION_ACTIVE_WINDOW_MS as u64)
+    // ③ 文件存在且有 DB 行：与看板同一判据。completed + 残留心跳/pid 但 DB/jsonl 超窗
+    //    → 下板并补偿；working → 无条件在场（即使父会话静默 >300s）。
+    let mtime = row
+        .map(|r| r.cwd.clone())
+        .and_then(|cwd| find_session_jsonl(home, &cwd, sid))
+        .and_then(|p| file_mtime_ms(&p));
+    workbuddy_is_live(
+        row.map(|r| r.status.as_str()),
+        row.map(|r| r.activity_ms),
+        mtime,
+        now,
+    )
 }
 
 /// 主入口：真实 home / 真实时钟 / 全局 LAST_SEEN_SESSIONS 的薄包装（补偿行在此落库）。
@@ -1212,23 +1229,8 @@ pub fn compensate_vanished_heartbeats() {
     load_persisted_observations_once(now as i64);
     // R2 / D5：补偿与看板在场判据**同源**——运行中的 5.9.3 会话（心跳冻结）不得被补成未读。
     // 三项都是廉价只读：一次心跳目录扫描（含单 pid 定向存活检查）+ 一次小 DB 查询 + 少量 stat。
-    let recent: HashMap<String, WbDbSession> =
-        recent_db_sessions(&home, now as i64 - SESSION_ACTIVE_WINDOW_MS)
-            .into_iter()
-            .map(|r| (r.id.clone(), r))
-            .collect();
     // 单轮心跳快照：present/live 两视图来自同一次扫描，避免两份过滤规则漂移
     let snapshot = heartbeat_snapshot(&home);
-    let is_live = |sid: &str| -> bool {
-        session_is_live(
-            &home,
-            now,
-            &recent,
-            &snapshot.live_ids,
-            &snapshot.present_ids,
-            sid,
-        )
-    };
     // 删除状态必须贯穿补偿：DB 明确标记删除的会话不得因残留 LAST_SEEN/心跳再插未读。
     // 先按 LAST_SEEN 的 workbuddy id 一次查询；DB 打不开 → 空集（不清、不误判删除）。
     let last_seen_ids: Vec<String> = {
@@ -1238,6 +1240,21 @@ pub fn compensate_vanished_heartbeats() {
             .filter(|(tool, _)| tool == "workbuddy")
             .map(|(_, sid)| sid.clone())
             .collect()
+    };
+    // 按 id 查询状态（**不受 300s 窗口限制**）：补偿必须像看板一样看到 working，
+    // 否则 working+心跳消失+父静默会被误补；completed+残留心跳则必须能进入补偿。
+    let by_id: HashMap<String, WbDbSession> = db_sessions_by_ids(&home, &last_seen_ids)
+        .into_iter()
+        .collect();
+    let is_live = |sid: &str| -> bool {
+        session_is_live(
+            &home,
+            now,
+            &by_id,
+            &snapshot.live_ids,
+            &snapshot.present_ids,
+            sid,
+        )
     };
     let deleted_ids = deleted_workbuddy_session_ids(&home, &last_seen_ids).unwrap_or_default();
     if !deleted_ids.is_empty() {
@@ -1988,13 +2005,6 @@ mod tests {
             .unwrap();
         }
 
-        fn recent_window(home: &Path, now: u64) -> HashMap<String, WbDbSession> {
-            recent_db_sessions(home, now as i64 - SESSION_ACTIVE_WINDOW_MS)
-                .into_iter()
-                .map(|r| (r.id.clone(), r))
-                .collect()
-        }
-
         /// **I3-a**：正常完成 → CLI unregister 删除心跳文件 → **立即**补未读
         /// （恢复旧版完成提醒时延，不再等 300s）。
         #[test]
@@ -2018,14 +2028,17 @@ mod tests {
             )]));
             let no_live: std::collections::HashSet<String> = std::collections::HashSet::new();
             let no_files: std::collections::HashSet<String> = std::collections::HashSet::new();
-            let recent = recent_window(home.path(), now);
+            let by_id: HashMap<String, WbDbSession> =
+                db_sessions_by_ids(home.path(), &[SID.to_string()])
+                    .into_iter()
+                    .collect();
             let out = compensate_vanished_heartbeats_in(
                 home.path(),
                 now,
                 &last_seen,
                 &|_| None,
                 &|_| false,
-                &|sid| session_is_live(home.path(), now, &recent, &no_live, &no_files, sid),
+                &|sid| session_is_live(home.path(), now, &by_id, &no_live, &no_files, sid),
             );
             assert_eq!(
                 out.len(),
@@ -2069,14 +2082,17 @@ mod tests {
             let no_live: std::collections::HashSet<String> = std::collections::HashSet::new();
             let files = heartbeat_snapshot(home.path()).present_ids;
             assert!(files.contains(SID), "前提：心跳文件存在");
-            let recent = recent_window(home.path(), now);
+            let by_id: HashMap<String, WbDbSession> =
+                db_sessions_by_ids(home.path(), &[SID.to_string()])
+                    .into_iter()
+                    .collect();
             let out = compensate_vanished_heartbeats_in(
                 home.path(),
                 now,
                 &last_seen,
                 &|_| None,
                 &|_| false,
-                &|sid| session_is_live(home.path(), now, &recent, &no_live, &files, sid),
+                &|sid| session_is_live(home.path(), now, &by_id, &no_live, &files, sid),
             );
             assert!(
                 out.is_empty(),
@@ -2088,17 +2104,106 @@ mod tests {
                 .lock()
                 .unwrap()
                 .insert(11952, ("workbuddy".to_string(), SID.to_string()));
-            let recent2 = recent_window(home.path(), now);
+            let by_id2: HashMap<String, WbDbSession> =
+                db_sessions_by_ids(home.path(), &[SID.to_string()])
+                    .into_iter()
+                    .collect();
             let out2 = compensate_vanished_heartbeats_in(
                 home.path(),
                 now,
                 &last_seen,
                 &|_| None,
                 &|_| false,
-                &|sid| session_is_live(home.path(), now, &recent2, &no_live, &files, sid),
+                &|sid| session_is_live(home.path(), now, &by_id2, &no_live, &files, sid),
             );
             assert_eq!(out2.len(), 1, "窗口过后照常补一次未读");
             assert_eq!(out2[0].session_id, SID);
+        }
+
+        /// P1-A：completed + 残留心跳文件 + pid 存活 + DB/jsonl 超窗 → 看板下板，
+        /// 补偿必须**补一次**未读（不能因 live_ids 无条件在场而漏补）。
+        #[test]
+        fn completed_stale_heartbeat_with_live_pid_is_compensated() {
+            let home = tempfile::tempdir().unwrap();
+            let now = now_ms();
+            write_jsonl(home.path(), SID, ASSISTANT_TAIL);
+            let p = home
+                .path()
+                .join(".workbuddy/projects")
+                .join(mangle_project_path(CWD))
+                .join(format!("{SID}.jsonl"));
+            let f = std::fs::OpenOptions::new().write(true).open(&p).unwrap();
+            f.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_millis(now - 900_000))
+                .unwrap();
+            seed_status_db(home.path(), "completed", (now - 400_000) as i64);
+            let dir = home.path().join(".workbuddy/sessions");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("11952.json"),
+                format!(
+                    r#"{{"pid":11952,"sessionId":"{SID}","cwd":"{CWD}","lastHeartbeat":{},"kind":"interactive"}}"#,
+                    now - 7_200_000
+                ),
+            )
+            .unwrap();
+
+            let last_seen = Mutex::new(HashMap::from([(
+                11952u32,
+                ("workbuddy".to_string(), SID.to_string()),
+            )]));
+            let live: std::collections::HashSet<String> = [SID.to_string()].into_iter().collect();
+            let files = heartbeat_snapshot(home.path()).present_ids;
+            let by_id: HashMap<String, WbDbSession> =
+                db_sessions_by_ids(home.path(), &[SID.to_string()])
+                    .into_iter()
+                    .collect();
+            let out = compensate_vanished_heartbeats_in(
+                home.path(),
+                now,
+                &last_seen,
+                &|_| None,
+                &|_| false,
+                &|sid| session_is_live(home.path(), now, &by_id, &live, &files, sid),
+            );
+            assert_eq!(out.len(), 1, "completed + 残留心跳应在超窗后补一次未读");
+            assert_eq!(out[0].session_id, SID);
+        }
+
+        /// P1-B：working + 心跳文件消失 + DB/jsonl 超窗 + 父尾部 Idle →
+        /// DB 仍说 working，补偿不得误插未读（必须按 id 查不受窗口限制的状态）。
+        #[test]
+        fn working_missing_heartbeat_is_not_compensated() {
+            let home = tempfile::tempdir().unwrap();
+            let now = now_ms();
+            write_jsonl(home.path(), SID, ASSISTANT_TAIL);
+            let p = home
+                .path()
+                .join(".workbuddy/projects")
+                .join(mangle_project_path(CWD))
+                .join(format!("{SID}.jsonl"));
+            let f = std::fs::OpenOptions::new().write(true).open(&p).unwrap();
+            f.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_millis(now - 900_000))
+                .unwrap();
+            seed_status_db(home.path(), "working", (now - 400_000) as i64);
+            let last_seen = Mutex::new(HashMap::from([(
+                11952u32,
+                ("workbuddy".to_string(), SID.to_string()),
+            )]));
+            let no_live: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let no_files: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let by_id: HashMap<String, WbDbSession> =
+                db_sessions_by_ids(home.path(), &[SID.to_string()])
+                    .into_iter()
+                    .collect();
+            let out = compensate_vanished_heartbeats_in(
+                home.path(),
+                now,
+                &last_seen,
+                &|_| None,
+                &|_| false,
+                &|sid| session_is_live(home.path(), now, &by_id, &no_live, &no_files, sid),
+            );
+            assert!(out.is_empty(), "DB working 的会话不得因心跳缺失被补成未读");
         }
 
         /// P1：DB 已删除的会话即使 LAST_SEEN 残留、心跳消失，也不得补偿未读。
