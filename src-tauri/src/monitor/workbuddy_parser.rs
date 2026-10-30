@@ -787,12 +787,19 @@ fn first_user_text(lines: &[String]) -> Option<String> {
 /// 读其 JSONL 终态——完成 → 产出待插入的未读记录；运行中被杀 → 不产出。
 /// 返回补偿产物并由调用方落库（DAO 注入点，测试可断言产物而不触库）；
 /// 同时从 last_seen 移除已消失条目（未消失条目保留供下轮参考）
+///
+/// **R2 / D5：`is_live` 与看板在场判据同源**。5.9.3 的心跳只写一次（`lastHeartbeat`
+/// 永久过期），若「过期即消失」，每一轮都会把**正在工作**的会话补成未读卡——
+/// 卡片刚修好就被补偿逻辑插进未读池。因此消失 = `心跳缺失/过期 ∧ !is_live(session_id)`，
+/// 其中 `is_live`（生产实现）= `runtime_present`（心跳文件存在 + pid 存活 + sessionId 匹配）
+/// ∨ DB `MAX(last_activity_at, updated_at)` 在 300s 内 ∨ 主 jsonl mtime 在 300s 内。
 pub fn compensate_vanished_heartbeats_in(
     home: &Path,
     now_ms: u64,
     last_seen: &Mutex<HashMap<u32, (String, String)>>,
     status_of: &dyn Fn(&str) -> Option<String>,
     was_read: &dyn Fn(&str) -> bool,
+    is_live: &dyn Fn(&str) -> bool,
 ) -> Vec<crate::database::dao::unread::UnreadSessionRecord> {
     let mut compensated = Vec::new();
 
@@ -806,15 +813,17 @@ pub fn compensate_vanished_heartbeats_in(
     };
     let vanished: Vec<(u32, (String, String))> = candidates
         .into_iter()
-        .filter(|(pid, _)| {
-            // 心跳文件没了 = 回池/退出；过期同样视为消失
-            match std::fs::read_to_string(heartbeat_path(home, *pid))
+        .filter(|(pid, (_, sid))| {
+            // 心跳文件没了 = 回池/退出；过期同样视为「心跳消失」——
+            // 但**只有 is_live 为假**才算真消失（R2 / D5：5.9.3 心跳恒过期）
+            let heartbeat_gone = match std::fs::read_to_string(heartbeat_path(home, *pid))
                 .ok()
                 .and_then(|s| parse_heartbeat(&s))
             {
                 Some(hb) => !heartbeat_is_alive(&hb, now_ms),
                 None => true,
-            }
+            };
+            heartbeat_gone && !is_live(sid)
         })
         .collect();
     // issue #35 nit：单轮复用一条只读连接（cwd 反查 + 标题查询共用；
@@ -940,6 +949,53 @@ fn sync_observations_to_db(now_ms: u64) {
     crate::database::dao::heartbeat_seen::cleanup_before(now - OBSERVATION_TTL_MS);
 }
 
+/// 进程是否仍存活（**单 pid 定向刷新**，不扫全表）：补偿判 `runtime_present` 用
+fn pid_is_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    let mut sys = sysinfo::System::new();
+    let target = sysinfo::Pid::from_u32(pid);
+    sys.refresh_processes_specifics(
+        sysinfo::ProcessesToUpdate::Some(&[target]),
+        true,
+        sysinfo::ProcessRefreshKind::nothing(),
+    );
+    sys.process(target).is_some()
+}
+
+/// 当前「运行时在场」的会话 id 集合（心跳文件存在 ∧ 内容 pid == 文件名 pid ∧ pid 存活）。
+/// 单轮只扫一次（补偿候选数很少，但心跳文件枚举不该按候选重复）。
+fn live_session_ids(home: &Path) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    let Ok(entries) = std::fs::read_dir(home.join(".workbuddy").join("sessions")) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(pid) = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .and_then(|s| s.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let Some(hb) = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|s| parse_heartbeat(&s))
+        else {
+            continue;
+        };
+        if hb.pid != pid || !is_strict_uuid_form(&hb.session_id) {
+            continue;
+        }
+        if pid_is_alive(pid) {
+            out.insert(hb.session_id.clone());
+        }
+    }
+    out
+}
+
 /// 主入口：真实 home / 真实时钟 / 全局 LAST_SEEN_SESSIONS 的薄包装（补偿行在此落库）。
 /// 注：DAO upsert 冲突时仅刷新展示字段、保留原 turned_green_at/expires_at（见
 /// `upsert_unread`）——对已存在的行此处只起补展示快照作用；仅当行不存在（转绿从未
@@ -956,6 +1012,38 @@ pub fn compensate_vanished_heartbeats() {
     let now = now_ms();
     // issue #35-2：重启后还原近期观测，跨重启补偿「停机期间完成」的会话
     load_persisted_observations_once(now as i64);
+    // R2 / D5：补偿与看板在场判据**同源**——运行中的 5.9.3 会话（心跳冻结）不得被补成未读。
+    // 三项都是廉价只读：一次心跳目录扫描（含单 pid 定向存活检查）+ 一次小 DB 查询 + 少量 stat。
+    let recent: HashMap<String, WbDbSession> =
+        recent_db_sessions(&home, now as i64 - SESSION_ACTIVE_WINDOW_MS)
+            .into_iter()
+            .map(|r| (r.id.clone(), r))
+            .collect();
+    let live_cache: std::cell::RefCell<Option<std::collections::HashSet<String>>> =
+        std::cell::RefCell::new(None);
+    let is_live = |sid: &str| -> bool {
+        // ① runtime_present 优先：心跳文件存在 ∧ 内容 pid 存活 ∧ sessionId 匹配
+        {
+            let mut slot = live_cache.borrow_mut();
+            if slot.is_none() {
+                *slot = Some(live_session_ids(&home));
+            }
+            if slot.as_ref().is_some_and(|set| set.contains(sid)) {
+                return true;
+            }
+        }
+        // ② DB `MAX(last_activity_at, updated_at)` 在 300s 内
+        if let Some(row) = recent.get(sid) {
+            if now as i64 - row.activity_ms <= SESSION_ACTIVE_WINDOW_MS {
+                return true;
+            }
+        }
+        // ③ 主 jsonl mtime 在 300s 内
+        let cwd = recent.get(sid).map(|r| r.cwd.clone()).unwrap_or_default();
+        find_session_jsonl(&home, &cwd, sid)
+            .and_then(|p| file_mtime_ms(&p))
+            .is_some_and(|m| now.saturating_sub(m) <= SESSION_ACTIVE_WINDOW_MS as u64)
+    };
     for record in compensate_vanished_heartbeats_in(
         &home,
         now,
@@ -963,6 +1051,7 @@ pub fn compensate_vanished_heartbeats() {
         &|sid| crate::database::find_status(sid),
         // issue #35-1：已读墓碑判据（不依赖状态缓存的存活期）
         &|sid| crate::database::dao::unread::was_read_recently("workbuddy", sid, now as i64),
+        &is_live,
     ) {
         crate::database::dao::unread::upsert(&record);
     }
@@ -1448,6 +1537,7 @@ mod tests {
                 &last_seen,
                 &|_| None,
                 &|_| false,
+                &|_| false,
             );
             assert_eq!(out.len(), 1);
             assert_eq!(out[0].session_id, SID);
@@ -1471,6 +1561,7 @@ mod tests {
                 &last_seen,
                 &|_| None,
                 &|_| false,
+                &|_| false,
             );
             assert!(out.is_empty());
             // 消失即移除观测表条目（即便不补），防止陈旧 pid 长期滞留
@@ -1491,6 +1582,7 @@ mod tests {
                 10_000,
                 &last_seen,
                 &|_| None,
+                &|_| false,
                 &|_| false,
             );
             assert!(out.is_empty());
@@ -1520,6 +1612,7 @@ mod tests {
                 &last_seen,
                 &|_| None,
                 &|_| false,
+                &|_| false,
             );
             assert_eq!(out.len(), 1); // 过期 = 视为消失，终态完成 → 补
         }
@@ -1540,6 +1633,7 @@ mod tests {
                 10_000,
                 &last_seen,
                 &status_of,
+                &|_| false,
                 &|_| false,
             );
             assert!(out.is_empty(), "已观测绿的会话不得经补偿复活未读行");
@@ -1563,6 +1657,7 @@ mod tests {
                 &last_seen,
                 &|_| None,         // 缓存失忆：读不到上一轮状态
                 &|sid| sid == SID, // 但已读墓碑在场
+                &|_| false,
             );
             assert!(out.is_empty(), "缓存失忆的已读会话不得经补偿复活未读行");
             // 消失条目照常移除，不滞留
@@ -1583,8 +1678,68 @@ mod tests {
                 &last_seen,
                 &|_| None,
                 &|_| false,
+                &|_| false,
             );
             assert!(out.is_empty());
+        }
+
+        /// **R2 / D5**：5.9.3 的心跳**恒过期**（只写一次），若「过期即消失」，
+        /// 每一轮都会把正在工作的会话补成未读卡。`is_live` 为真 → 不得补。
+        #[test]
+        fn stale_heartbeat_with_active_db_is_not_compensated() {
+            let home = tempfile::tempdir().unwrap();
+            write_jsonl(home.path(), SID, ASSISTANT_TAIL);
+            write_heartbeat(home.path(), 11952, 0); // 过期（now-0 >= 90s）
+            let last_seen = Mutex::new(HashMap::from([(
+                11952u32,
+                ("workbuddy".to_string(), SID.to_string()),
+            )]));
+            let out = compensate_vanished_heartbeats_in(
+                home.path(),
+                100_000,
+                &last_seen,
+                &|_| None,
+                &|_| false,
+                // 运行中（DB 活跃 / runtime_present）：在场
+                &|sid| sid == SID,
+            );
+            assert!(out.is_empty(), "运行中的会话不得被补偿成未读（D5）");
+        }
+
+        /// 闸门不是粘滞的：会话真正结束（is_live 变假）后仍然照常补一次
+        #[test]
+        fn compensation_fires_once_the_session_really_ends() {
+            let home = tempfile::tempdir().unwrap();
+            write_jsonl(home.path(), SID, ASSISTANT_TAIL);
+            write_heartbeat(home.path(), 11952, 0);
+            let last_seen = Mutex::new(HashMap::from([(
+                11952u32,
+                ("workbuddy".to_string(), SID.to_string()),
+            )]));
+            let live = compensate_vanished_heartbeats_in(
+                home.path(),
+                100_000,
+                &last_seen,
+                &|_| None,
+                &|_| false,
+                &|_| true,
+            );
+            assert!(live.is_empty());
+            // 下一轮：会话结束（不在场）→ 照常补
+            last_seen
+                .lock()
+                .unwrap()
+                .insert(11952, ("workbuddy".to_string(), SID.to_string()));
+            let dead = compensate_vanished_heartbeats_in(
+                home.path(),
+                100_000,
+                &last_seen,
+                &|_| None,
+                &|_| false,
+                &|_| false,
+            );
+            assert_eq!(dead.len(), 1, "会话结束后仍须照常补一次未读");
+            assert_eq!(dead[0].session_id, SID);
         }
 
         /// P2-3 按工具隔离：观测表条目携带工具归属，非 workbuddy 条目不代偿
@@ -1602,6 +1757,7 @@ mod tests {
                 10_000,
                 &last_seen,
                 &|_| None,
+                &|_| false,
                 &|_| false,
             );
             assert!(out.is_empty(), "非 workbuddy 条目不得经 workbuddy 补偿复活");
