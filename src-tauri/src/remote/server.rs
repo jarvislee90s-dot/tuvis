@@ -866,7 +866,7 @@ pub async fn serve(bind: &str, port: u16, state: Arc<RemoteState>) -> Result<(),
         .map_err(|e| format!("RSERVER_BIND_FAIL: 绑定 {bind}:{port} 失败: {e}"))?;
     // M3 Task 5：事件桥在**绑定成功后**启动（幂等——全局 Once 保证扫描循环全进程只
     // spawn 一次）。放在 bind 之后：端口被占等启动失败不遗留 2s 会话扫描（扫描是重活，
-    // 见 adapter::get_all_sessions 的单飞护栏注释）；watcher 生命周期随进程结束，
+    // 单飞与节奏见 adapter::scan_bus）；watcher 生命周期随进程结束，
     // stop_server 不显式停止（关闭远程后循环仍扫描，为已有取舍）
     super::watcher::SessionWatcher::start();
     // M7 Task 6：注入 flush 循环接线（Task 5 交付的循环体在此合入编译）——订阅同一

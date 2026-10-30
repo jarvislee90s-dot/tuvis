@@ -715,7 +715,8 @@ mod tests {
     /// 第一版这把锁**瞄错了文件**（只扫 `hooks/useSessions.ts` + `stores/sessionStore.ts`，
     /// 而它们只同步/存状态、**不 invoke**）→ 评审 Important #2：往**真** poll 点插一行
     /// `invoke("usage_collect")` 时三条锁全绿，而那正是 GC 3 唯一会成真的「每 3 秒全量扫描」路径。
-    /// 现在改成**按内容发现**：凡含 `refetchInterval` / `POLL_INTERVAL` 的文件一律入清单。
+    /// 现在改成**按内容发现**：凡含 `refetchInterval` 的文件一律入清单
+    /// （旧前端轮询常量已随扫描总线改造删除，仅保留内容发现口径）。
     fn collect_src_files(
         dir: &std::path::Path,
         root: &std::path::Path,
@@ -749,7 +750,7 @@ mod tests {
     /// W-22 的**静态半边**：3 秒轮询热路径不得引用用量命令。行为式用例在
     /// `tests/usage_polling_budget_test.rs`（真跑扫描后 `collect_calls()` 仍为 0）。
     ///
-    /// 清单口径（评审 Important #2 的修法）：**所有**含 `refetchInterval` / `POLL_INTERVAL`
+    /// 清单口径（评审 Important #2 的修法）：**所有**含 `refetchInterval`
     /// 的前端文件（真 poll 点是 `lib/query/queries/sessions.ts` → `lib/api/session.ts` 的
     /// `invoke("get_all_sessions")`）+ 三个状态侧文件。含**前提断言**：若清单没命中真 poll 点
     /// 或递归扫描读不到源码，本用例自己先红（防「瞄错文件仍然全绿」）。
@@ -767,7 +768,7 @@ mod tests {
         // 前提 1：内容发现必须命中真 poll 点
         let poll_files: Vec<&(String, String)> = files
             .iter()
-            .filter(|(_, t)| t.contains("refetchInterval") || t.contains("POLL_INTERVAL"))
+            .filter(|(_, t)| t.contains("refetchInterval"))
             .collect();
         assert!(
             poll_files
@@ -791,11 +792,10 @@ mod tests {
             "stores/sessionStore.ts",
         ];
         let mut checked: Vec<&str> = Vec::new();
-        for (p, text) in files.iter().filter(|(p, t)| {
-            t.contains("refetchInterval")
-                || t.contains("POLL_INTERVAL")
-                || extra.contains(&p.as_str())
-        }) {
+        for (p, text) in files
+            .iter()
+            .filter(|(p, t)| t.contains("refetchInterval") || extra.contains(&p.as_str()))
+        {
             for forbidden in [
                 "usage_collect",
                 "usage_dashboard",

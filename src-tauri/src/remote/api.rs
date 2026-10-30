@@ -1,4 +1,4 @@
-// /m/api/v1/*：sessions（P8 数据同源直调 get_all_sessions）+ host（P8a/P8b 页头数据）
+// /m/api/v1/*：sessions（P8 数据同源，读扫描总线共享快照）+ host（P8a/P8b 页头数据）
 // + pair/pin（M5 A3 访问密码配对，唯一换 cookie 入口）+ events（M3 Task 6 SSE 实时通道）
 // + session-messages（Task 7）+ session-files / file（M3 Task 8 文件路径提取与安全读取）
 // + session-send / send-info / queue 系（M7 Task 6 注入三端点）
@@ -46,13 +46,14 @@ fn apply_board_hidden(
     resp
 }
 
-/// GET /m/api/v1/sessions：数据源注入（生产 = adapter::get_all_sessions），
+/// GET /m/api/v1/sessions：数据源注入（生产 = `scan_bus::current_or_scan`，读共享快照），
 /// `SessionsResponse` 已 camelCase 序列化（前端约定 totalCount）。
 ///
-/// 扫描必须在 `spawn_blocking` 里跑：生产源 `adapter::get_all_sessions` 是**同步阻塞**调用
-/// （sysinfo 全进程刷新 + 各工具会话解析，冷启动可达数秒），直接放在 async handler 里会
-/// 周期性堵死 tokio worker——移动端 3s 轮询下即为持续拖垮（桌面侧同一函数已按此包，
-/// 实机教训见 `commands/session.rs` 的 `get_all_sessions`）。
+/// 扫描必须在 `spawn_blocking` 里跑：生产源是**同步阻塞**调用
+/// （读快照通常即时；冷启动无快照时会同步首扫：sysinfo 全进程刷新 + 各工具会话解析，
+/// 可达数秒），直接放在 async handler 里会周期性堵死 tokio worker——移动端 3s 轮询下
+/// 即为持续拖垮（桌面侧同一函数已按此包，实机教训见 `commands/session.rs` 的
+/// `get_all_sessions`）。
 pub async fn sessions(State(st): State<Arc<RemoteState>>) -> impl IntoResponse {
     // 闭包捕获 state 的 Arc（Send + Sync + 'static）：`session_source` 是 Box<dyn Fn> 不可
     // clone，故整体 move 进阻塞线程池，在池内调用注入源
@@ -905,7 +906,7 @@ pub async fn read_file(
     };
     let st = st.clone();
     let outcome = tokio::task::spawn_blocking(move || {
-        // 数据同源铁律 3：cwd 直调注入的会话源（生产 = adapter::get_all_sessions，
+        // 数据同源铁律 3：cwd 直调注入的会话源（生产 = scan_bus::current_or_scan，
         // 与看板同一份快照），不另立查找函数
         let resp = (st.session_source)();
         let Some(session) = resp.sessions.into_iter().find(|s| s.id == sid) else {

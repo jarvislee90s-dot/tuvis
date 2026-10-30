@@ -17,7 +17,7 @@
 //
 // ⚠️ 源码锁约束（改注释前先读这一段）：本文件含 `refetchInterval`（三处读查询恒 `false`），会落进
 // ① 的静态锁 `src-tauri/src/commands/usage.rs` 的 `polling_hot_path_*` 用例的扫描面 —— 它按**纯文本**
-// 扫描「含 `refetchInterval` / `POLL_INTERVAL` 的前端文件」，断言其中不含四条用量命令的 snake_case
+// 扫描「含 `refetchInterval` 的前端文件」，断言其中不含四条用量命令的 snake_case
 // 字面量（采集 / 看板 / 记录 / 导出 csv，命令名见 `src/lib/api/usage.ts`）。故本文件**连注释都不能**
 // 写出这四个字面量（要引用就写中文名或 camelCase 包装名）；`tests/**` 不在扫描面内，测试文件不受限。
 import { useCallback, useEffect, useRef, useState } from "react";

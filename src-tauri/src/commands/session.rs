@@ -72,8 +72,6 @@ fn normalize_watch_source(source: Option<String>) -> String {
 
 #[cfg(test)]
 mod f5_immediate_scan_tests {
-    use super::*;
-
     /// 取函数体源码（按花括号配对；签名必须唯一命中实现处）
     fn function_body<'a>(src: &'a str, signature: &str) -> &'a str {
         let start = src.find(signature).expect("函数签名缺失");

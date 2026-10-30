@@ -10,6 +10,11 @@ const { invokeMock } = vi.hoisted(() => ({ invokeMock: vi.fn() }));
 vi.mock("@tauri-apps/api/core", () => ({ invoke: invokeMock }));
 vi.mock("sonner", () => ({ toast: { info: vi.fn(), error: vi.fn(), success: vi.fn() } }));
 vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn(async () => () => {}) }));
+// Fix 4 起 SessionCard 用 useQueryClient 在关闭成功后失效 ["sessions"]；
+// 本文件只断言 DOM 结构，注入无副作用桩即可（避免为 13 处 render 各包一层 Provider）
+vi.mock("@tanstack/react-query", () => ({
+  useQueryClient: () => ({ invalidateQueries: vi.fn() }),
+}));
 // tests/setup.ts 未初始化 i18n，显式引入（fallbackLng=en，与断言文案一致）
 import i18n from "@/i18n";
 import { SessionCard } from "@/components/sessions/SessionCard";

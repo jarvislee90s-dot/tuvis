@@ -398,7 +398,7 @@ pub trait AgentAdapter: Send + Sync {
 
     /// 解析该工具的会话。**会话扫描预算契约**（详见 `monitor::session_scan` 模块文档
     /// 与 AGENTS.md「Agent Adapter 模式」）：
-    /// - L1 零进程零解析：编排层（`get_all_sessions`）保证本工具进程为空时**不会调用**
+    /// - L1 零进程零解析：编排层（`scan_bus` 的每轮扫描）保证本工具进程为空时**不会调用**
     ///   本方法，且有遍历全部注册 adapter 的防回归测试；实现侧仍应自带空判早退作
     ///   纵深防御；
     /// - L2/L3 文件类解析必须走 `monitor::session_scan::SessionFileScan`
@@ -519,21 +519,6 @@ pub fn all_adapters_with_ids() -> Vec<(&'static str, Box<dyn AgentAdapter>)> {
 /// 共享 System 实例 — 每轮询周期刷新一次，所有 adapter 共用
 static SHARED_SYSTEM: Mutex<Option<System>> = Mutex::new(None);
 
-/// get_all_sessions 单飞护栏（评审 R3）：主窗口与桌宠各自 3s 轮询，相位接近时
-/// 两请求并发进入同一段多秒扫描——堆叠放大 CPU/IO 峰值。try_lock 抢扫描权，
-/// 抢不到的请求立即返回最近一次快照（0=尚无快照时返回空响应，首窗口可接受）。
-/// 扫描完成时刷新快照。不做去抖定时器，保持"谁抢到谁全量扫"的最简单飞语义
-struct ScanFlight {
-    /// 扫描进行中标志（try_lock 竞争点）
-    in_flight: std::sync::Mutex<bool>,
-    /// 最近一次完整扫描结果（快照返回用；含时间戳便于日志诊断陈旧度）
-    last_snapshot: std::sync::Mutex<Option<(std::time::Instant, SessionsResponse)>>,
-}
-static SCAN_FLIGHT: Lazy<ScanFlight> = Lazy::new(|| ScanFlight {
-    in_flight: std::sync::Mutex::new(false),
-    last_snapshot: std::sync::Mutex::new(None),
-});
-
 /// 会话级去重：同一 (工具, session id) 只保留首张卡。
 /// 全局防线：任何解析器的"文件级/进程级复制"型 bug（如 opencode 多进程同会话、
 /// codex 每轮新 rollout）在这里统一兜住，一处修复覆盖全部工具
@@ -542,43 +527,11 @@ pub fn dedup_sessions(sessions: &mut Vec<Session>) {
     sessions.retain(|s| seen.insert((s.agent_type.tool_id().to_string(), s.id.clone())));
 }
 
-/// 获取所有注册 adapter 的会话（单飞：并发请求直接复用最近快照）
+/// 兼容入口：委托扫描总线读共享快照（冷启动无快照时同步首扫）。
+/// 生产路径已统一走 `scan_bus`（单飞/版本/看门狗都在那里）；保留本函数给
+/// 集成测试与外部调用方，**不得**在此另起第二套单飞或快照。
 pub fn get_all_sessions() -> SessionsResponse {
-    // R3 单飞护栏：抢不到扫描权 → 返回上次快照，不排队不堆叠
-    let mut flying = SCAN_FLIGHT.in_flight.lock().unwrap();
-    if *flying {
-        let snap = SCAN_FLIGHT.last_snapshot.lock().unwrap();
-        if let Some((at, resp)) = snap.as_ref() {
-            log::debug!(
-                "get_all_sessions 单飞命中快照（扫描进行中，快照龄 {:?}）",
-                at.elapsed()
-            );
-            return resp.clone();
-        }
-        return SessionsResponse {
-            sessions: Vec::new(),
-            total_count: 0,
-            waiting_count: 0,
-        };
-    }
-    *flying = true;
-    drop(flying); // 先放手上的 in_flight 锁：Drop guard 析构时要重新拿它清位，
-                  // 不 drop 即自锁自等（本测试挂起事故的根因）
-                  // Drop guard：内层扫描 panic（如 DB 锁中毒 unwrap）时飞行位自动释放——
-                  // 若靠扫描返回后手动清位，一次 panic 即永久卡死单飞（看板冻结到重启），
-                  // 且把原失败模式（单次报错下轮重试）恶化成永久故障
-    let _guard = ScanFlightGuard;
-    let result = get_all_sessions_inner();
-    *SCAN_FLIGHT.last_snapshot.lock().unwrap() = Some((std::time::Instant::now(), result.clone()));
-    result
-}
-
-/// 扫描飞行位的 Drop 释放护栏（作用域结束/panic unwind 均自动清位）
-struct ScanFlightGuard;
-impl Drop for ScanFlightGuard {
-    fn drop(&mut self) {
-        *SCAN_FLIGHT.in_flight.lock().unwrap() = false;
-    }
+    crate::adapter::scan_bus::current_or_scan()
 }
 
 /// T8：问题事件的 tool_input 载荷提取（QuestionEntry 写标记时随行落库——questions
@@ -785,7 +738,7 @@ mod candidate_whitelist_tests {
                     "{tool} 的宿主名 {host} 必须通过宿主判定预滤"
                 );
                 assert!(
-                    host_process_names(tool).contains(&host),
+                    host_process_names(tool).contains(host),
                     "{tool} 的宿主判定必须取自同一张表"
                 );
             }
@@ -1199,70 +1152,35 @@ pub(crate) fn get_all_sessions_inner() -> SessionsResponse {
     }
 }
 
-/// R3 单飞护栏的测试互斥锁（跨模块共享）：直接操纵全局 SCAN_FLIGHT 的测试与
-/// 真实扫描类测试（会重置飞行位/快照，含 tests::test_get_all_sessions）互斥——
-/// cargo 默认并行测试下两个真实 get_all_sessions 同时起跑会互踩快照/飞行位
-/// （flight_released 断言 !in_flight 时另一测试的扫描仍在飞即红，评审 R6）
-#[cfg(test)]
-static SCAN_FLIGHT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-/// R3 单飞护栏测试：占住飞行位时第二请求返回快照而不进入扫描
-#[cfg(test)]
-mod scan_flight_tests {
-    use super::*;
-
-    #[test]
-    fn concurrent_request_reuses_snapshot_without_rescan() {
-        let _g = SCAN_FLIGHT_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        // 预置快照
-        let snapshot = SessionsResponse {
-            sessions: Vec::new(),
-            total_count: 7,
-            waiting_count: 0,
-        };
-        *SCAN_FLIGHT.last_snapshot.lock().unwrap() = Some((std::time::Instant::now(), snapshot));
-
-        // 占住飞行位（模拟另一请求正在扫描）
-        *SCAN_FLIGHT.in_flight.lock().unwrap() = true;
-
-        // 并发请求：应直接返回快照（total_count=7 来自快照而非真实扫描）
-        let resp = get_all_sessions();
-        assert_eq!(resp.total_count, 7, "单飞命中应返回最近快照");
-
-        // 清理：释放飞行位（真实扫描会重置快照，不影响其他测试）
-        *SCAN_FLIGHT.in_flight.lock().unwrap() = false;
-    }
-
-    #[test]
-    fn flight_released_after_scan_completes() {
-        let _g = SCAN_FLIGHT_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        // 正常调用：进入扫描并释放飞行位 + 刷新快照
-        let resp = get_all_sessions();
-        assert!(
-            !*SCAN_FLIGHT.in_flight.lock().unwrap(),
-            "扫描完成后飞行位应释放"
-        );
-        let snap = SCAN_FLIGHT.last_snapshot.lock().unwrap();
-        assert!(snap.is_some(), "扫描完成后应刷新快照");
-        assert_eq!(snap.as_ref().unwrap().1.total_count, resp.total_count);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// Fix 7 回归锁：旧入口 `adapter::get_all_sessions` 只允许**委托扫描总线**
+    /// （单飞/快照/panic 自愈由 scan_bus 统一负责），不得保留第二套单飞护栏。
+    /// 字面量用 concat! 拆分：include_str! 会把本测试自身纳入扫描面。
+    #[test]
+    fn get_all_sessions_is_a_thin_scan_bus_delegate() {
+        let src = include_str!("mod.rs");
+        let start = src
+            .find(concat!("pub fn get_all_", "sessions()"))
+            .expect("兼容入口缺失");
+        let body = &src[start..(start + 500).min(src.len())];
+        assert!(
+            body.contains(concat!("scan_bus::", "current_or_scan")),
+            "旧入口必须委托 scan_bus::current_or_scan，实际: {body}"
+        );
+        assert!(
+            !src.contains(concat!("SCAN_", "FLIGHT")),
+            "不得保留第二套单飞护栏（scan_bus 已是唯一扫描者）"
+        );
+    }
+
     #[test]
     fn test_get_all_sessions() {
-        // 与 scan_flight_tests 共用 SCAN_FLIGHT_TEST_LOCK：本测试触发真实
-        // get_all_sessions（刷新快照/飞行位），不互斥则并行起跑互踩（评审 R6）
-        let _g = SCAN_FLIGHT_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
+        // 委托入口会写 scan_bus 进程级快照：与 scan_bus 测试共用全局锁，
+        // 避免并行起跑时插进对方「种子 → 精确版本断言」窗口
+        let _g = crate::adapter::scan_bus::test_guard();
         let response = get_all_sessions();
         eprintln!("=== SESSION SCAN ===");
         eprintln!(
@@ -2290,7 +2208,7 @@ enum UnreadPoolAction {
 }
 
 /// 判定未读池动作。prev_status 为状态缓存中的上一轮状态
-/// （Debug 格式，与 get_all_sessions 末尾的统一更新一致）
+/// （Debug 格式，与扫描末尾的统一更新一致）
 fn unread_pool_action(prev_status: Option<&str>, idle: bool) -> UnreadPoolAction {
     if !idle {
         return UnreadPoolAction::None;
@@ -2319,7 +2237,7 @@ fn insert_allowed(prev_status: Option<&str>, was_read_recently: bool) -> bool {
 /// - 过期（24h）→ 清理
 /// - 数据驱动持久绿卡工具（Codex APP / ZCode，P1-3 通用化）：聚合卡即该会话的
 ///   「未读卡」形态——池有行时标记 unread=true（徽标/「未读卡排后」生效），
-///   已读删行后由 get_all_sessions 的前置过滤剔除，闭环「被已读信号清除」
+///   已读删行后由每轮扫描的前置过滤剔除，闭环「被已读信号清除」
 fn sync_unread_sessions(active: &mut Vec<Session>) {
     let now_ms = chrono::Utc::now().timestamp_millis();
 

@@ -128,7 +128,7 @@
 //! ## C9（HTTP 端到端总测试，移动端等效路径；只写不跑）
 //! 临时目录（`E:\tmp-c9-e2e`，信任树外）→ POST `/m/api/v1/session-create`（设备
 //! cookie；create 域真缝束 `CreateTaskHub::production()` + 真
-//! `adapter::get_all_sessions` 数据源）→ 轮询 `/session-create/status` 至
+//! 数据源）→ 轮询 `/session-create/status` 至
 //! `done{sessionId}` → GET `/sessions` 断言新卡在场且 `pairingAmbiguous=false` →
 //! 等会话回可输入态 → POST `/session-send` 第二条消息 `delivered`（回执含
 //! pairingHint）→ 审计三类行（create×1 / dialog≥1 / send×2）→ 回合落地等待 15s
@@ -861,7 +861,7 @@ fn c9_input_ready(card: &serde_json::Value) -> bool {
 ///
 /// 装配与 C8 内核直调链的差异：全链**只走 HTTP**（与移动端同一条路由/门禁/队列/
 /// 审计面），create 域用生产缝束（真 pid 锚定/真物化发现/真步距/真安装探测），
-/// session_source 用真 `adapter::get_all_sessions`（新会话真实上板）。
+/// session_source 用真扫描（`scan_bus::scan_now_blocking`，每次重扫；新会话真实上板）。
 #[tokio::test]
 #[ignore = "实机显式跑：cargo test --test create_e2e -- --ignored --nocapture --test-threads=1"]
 async fn e2e_create_http_full_chain() {
@@ -904,8 +904,9 @@ async fn e2e_create_http_full_chain() {
     // ① RemoteState 装配（m9r_e2e::e2e_http_full_chain 模板 + create 域真缝）：
     //    - create_hub = production（真 pid_finder 30s / 真 discoverer / 真 pacer /
     //      真 tool_probe）；
-    //    - session_source = 真 adapter::get_all_sessions（新建会话真实上板——本用例
-    //      的「上板」断言即建立在此）；
+    //    - session_source = 真扫描（scan_bus::scan_now_blocking——每次调用都重扫，
+    //      新建会话真实上板——本用例的「上板」断言即建立在此；旧
+    //      adapter::get_all_sessions 已改为读共享快照的兼容入口，不适合本用例）；
     //    - pairing_counter = mod.rs 生产形态（Windows 真 sysinfo 收集，测试侧最小
     //      复制 c9_running_projects）；
     //    - injector / resume_spawner / screen_probe / confirm_probe / dialog_probe =
@@ -916,9 +917,17 @@ async fn e2e_create_http_full_chain() {
     //      的 Null 桩；其余缝照 m9r 最小假体（本链不触归档/看板隐藏/未读/硬杀）。
     let state = Arc::new(RemoteState {
         capability_table: multi_agents_manager_lib::inject::capability::new_table(),
-        session_source: Box::new(multi_agents_manager_lib::adapter::get_all_sessions),
+        session_source: Box::new(|| {
+            multi_agents_manager_lib::adapter::scan_bus::scan_now_blocking()
+                .data
+                .clone()
+        }),
         // 动作路径同源（Task 4）：镜像 session_source（同一真实聚合口）
-        fresh_session_source: Box::new(multi_agents_manager_lib::adapter::get_all_sessions),
+        fresh_session_source: Box::new(|| {
+            multi_agents_manager_lib::adapter::scan_bus::scan_now_blocking()
+                .data
+                .clone()
+        }),
         pairing_counter: Box::new(c9_running_projects),
         ui_config_source: Box::new(|| None),
         subagent_source: std::collections::HashMap::new(),

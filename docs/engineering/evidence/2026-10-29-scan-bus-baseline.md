@@ -154,7 +154,7 @@ powershell -NoProfile -File scripts/measure-scan-bus.ps1 -ProcessId 1234 -Second
 
 - 时间：文档落笔 **2026-10-30 15:16 +0800**；活体复测窗口 **15:36–15:49 +0800**（2026-10-30T07:36–07:49Z）
 - 分支：`design/scan-bus-and-adaptive-cadence`
-- HEAD：Task 12 提交（`chore(scan): quiet per-round logs and record post-change measurements`）；复测二进制由该提交源码构建（`ebce4677` 之后的同一源码树，仅本证据文件在测后追加）
+- HEAD：Task 12 提交（`chore(scan): quiet per-round logs and record post-change measurements`）；复测二进制由该提交源码构建（`41ffd3c2` 之后的同一源码树，仅本证据文件在测后追加）
 - 本机进程数：`(Get-Process).Count` = **468**；同一时段的扫描器枚举 **481–487**（sysinfo 与 PowerShell 口径不同，与 §4 的说明一致）
 - 本任务 Step 1 的改动：`get_all_sessions_inner` 的每轮 `"{}: {} processes, {} sessions"` 由 `log::info!` 降为 `log::debug!`（`src-tauri/src/adapter/mod.rs`）。档位跃迁日志 `scan_bus: mode → {:?}` 保持 INFO；`scan: process refresh（两段式）耗时 …` 保持 DEBUG。
 
@@ -277,7 +277,7 @@ two-stage: 481 processes, 18 candidates, full refresh 64.1178ms vs two-stage 35.
 3. **F6 覆盖边界**：claude / codex / kimi 有 hook 事件；opencode 由 `opencode.db` + `-wal` 与 facts 文件覆盖；**openclaw 既无 hook 事件、也没有便宜的文件信号**（`wakeup.rs` 未覆盖），与 dsh 同理 → 二者仍靠档位兜底，Away 档下最坏 30s 才看到变化（`wakeup.rs` 模块文档已申报）。
 4. **F5 残余窗口（Fix 4 已收口）**：`dismiss_session_card` / `mark_session_read` 改为**同步补扫后再返回**（`scan_bus::scan_now_blocking`），前端关闭成功后 `invalidateQueries(["sessions"])`；即发即忘的一帧残留窗口已消除。活体 UI 点击未测（本机无 UI 自动化），由后端源码锁与前端用例覆盖。
 5. **看门狗退避 500ms**：panic 后 `sleep(500ms)` 再按当前档位 `recv_timeout`，最坏恢复 = 档位间隔 + 0.5s；Away 档即 **30.5s，略超 F1 的「≤30s 自动恢复」**（超 0.5s，可接受但需记账）。
-6. **`POLL_INTERVAL` 已成孤儿常量**：`src/config/constants.ts` 仍导出 `POLL_INTERVAL = 3000`，但已无代码消费者（仅 `commands/usage.rs` 的源码锁按文本扫描面匹配该字面量）；Fix 7 将删除并收窄扫描面。
+6. **`POLL_INTERVAL` 已删除（Fix 7）**：`src/config/constants.ts` 的孤儿常量已移除，前端热路径源码锁改为只按 `refetchInterval` 内容发现（`commands/usage.rs`）。
 7. **日志降噪的副作用（口径变更）**：旧计数源 `adapter] OpenCode:` 是 DEBUG 级；**Fix 1 起改用每轮 INFO `scan_bus: scan reason=`**（脚本 §7 已切换，且 `-Seconds ≥60` 零计数会抛错）。`RUST_LOG=info`（默认）即可计数。
 8. **热路径耗时（已观测，未达标）**：`scan: process refresh（两段式）耗时` DEBUG 行在 §10.2 的 300s 运行中共 215 拍；Active 窗口中位 29.6ms（p95 65.9ms），末 100 拍中位 42.9ms。debug 构建下 F8 的 ≤25ms **未达标**；release 未测（release 无法用影子目录，跑真实账本不在授权内）。Fix 轮 Active（WorkBuddy 单会话）整轮扫描 `duration_ms` 35–44ms（含解析，非纯进程刷新），量级一致。
 9. **启动采集的影响（Fix 轮新增）**：debug 构建即使 ticker 默认关闭，启动时仍会跑一次 `spawn_initial_collection`（本次 7 源 / 966 条 / 47.5s）。复测时若采样窗口与它重叠，CPU 会明显偏高（本轮两次首轮离群即此因）；正式验收应在启动采集完成后再开始计时。
