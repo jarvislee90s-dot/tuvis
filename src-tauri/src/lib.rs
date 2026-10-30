@@ -207,6 +207,8 @@ pub fn run() {
             commands::autostart::initialize_on_first_launch(app.handle());
             // 用量账本：应用启动采集一次（按需路径，绝不进 3 秒轮询）
             crate::services::usage::collect::spawn_initial_collection();
+            // 会话扫描总线：常驻线程 + 共享快照（所有消费方读快照，冷启动首扫立即执行）
+            crate::adapter::scan_bus::start(app.handle().clone());
             // TPS 短时抽样（2026-10-24 计划 Task 7）：调度/接收随 usage.enabled 总授权
             // 启停——关闭时每拍只读一行 settings（惯性，不改旧 usage 采集的启动时序）
             crate::services::tps::collector::spawn_runtime();
@@ -241,6 +243,9 @@ pub fn run() {
         update_tray_menu,
         refresh_tray,
         commands::session::get_all_sessions,
+        // 扫描总线状态与「有人在看」心跳（前端档位跟随 / 可见性上报）
+        commands::session::scan_bus_status,
+        commands::session::scan_bus_watch,
         commands::session::focus_session,
         commands::session::focus_hwnd,
         commands::session::kill_session,

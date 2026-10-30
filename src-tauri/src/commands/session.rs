@@ -1,6 +1,5 @@
 // 会话相关命令
 
-use crate::adapter;
 use crate::session::SessionsResponse;
 // Manager 的导入在下方 macOS cfg 块内局部引入：get_webview_window 仅 macOS
 // 路径消费，顶层导入在 Linux/Windows CI 上是 unused import（-D warnings 即挂）
@@ -8,33 +7,20 @@ use tauri::Emitter;
 
 #[tauri::command]
 pub async fn get_all_sessions(app: tauri::AppHandle) -> SessionsResponse {
-    // 重扫描移出主线程（同步命令在主线程执行）：sysinfo 全进程刷新 + 各工具
-    // 会话文件解析（如 dsh 冷启动全量解析数秒）会冻结整个 UI——dev 模式整机
-    // 卡顿的第二根因。托盘/预设更新是轻量 UI 操作，await 后照常执行
-    let response = tauri::async_runtime::spawn_blocking(adapter::get_all_sessions)
+    // 读扫描总线的共享快照（常驻扫描线程见 adapter::scan_bus::start）；只有冷启动
+    // 尚无快照时才同步补扫一次兜底。spawn_blocking 仍保留：兜底扫描（sysinfo 全进程
+    // 刷新 + 各工具文件解析，dsh 冷启动数秒）不得占主线程。托盘状态已迁入扫描线程
+    // （常驻线程内部 update_tray），命令层只剩预设刷新这类轻量 UI 操作
+    let response = tauri::async_runtime::spawn_blocking(crate::adapter::scan_bus::current_or_scan)
         .await
         .unwrap_or_else(|e| {
-            ::log::error!("会话扫描任务异常: {e}");
+            ::log::error!("会话快照读取任务异常: {e}");
             SessionsResponse {
                 sessions: Vec::new(),
                 total_count: 0,
                 waiting_count: 0,
             }
         });
-    let has_processing = response.sessions.iter().any(|s| {
-        matches!(
-            s.status,
-            crate::session::SessionStatus::Processing
-                | crate::session::SessionStatus::Thinking
-                | crate::session::SessionStatus::Compacting
-        )
-    });
-    crate::plugins::system_tray::update_tray_status(
-        &app,
-        response.waiting_count,
-        response.total_count,
-        has_processing,
-    );
     let preset_count = crate::database::list_presets().len();
     let last_count = crate::database::get_setting("last_preset_count")
         .and_then(|s| s.parse::<usize>().ok())
@@ -44,6 +30,26 @@ pub async fn get_all_sessions(app: tauri::AppHandle) -> SessionsResponse {
         crate::database::set_setting("last_preset_count", &preset_count.to_string());
     }
     response
+}
+
+/// 扫描总线状态（前端档位跟随的观测口）：mode 为 active/idle/away（serde lowercase），
+/// version 为快照发布版本（单调递增，前端据此判断数据是否已刷新）
+#[tauri::command]
+pub fn scan_bus_status() -> serde_json::Value {
+    serde_json::json!({
+        "mode": crate::adapter::scan_bus::mode(),
+        "version": crate::adapter::scan_bus::version(),
+    })
+}
+
+/// 前端可见性心跳（主窗可见且聚焦 / 浮窗展开）：置「有人在看」，TTL 内节奏降档到 idle。
+/// 上升沿（未在看 → 在看）立即请求一次事件补扫——窗口重新聚焦时数据立刻新鲜，
+/// 不必等下一个档位周期（最坏 30s）
+#[tauri::command]
+pub fn scan_bus_watch(watching: bool) {
+    if crate::adapter::scan_bus::set_user_watching(watching) {
+        crate::adapter::scan_bus::request_scan(crate::adapter::scan_bus::ScanReason::Event);
+    }
 }
 
 /// 跳转成功 → 标记该会话已读（仅删除对应未读行；同工具其他未读卡保留，spec W4）。
@@ -62,6 +68,10 @@ fn mark_read_on_jump(
             "session-read",
             serde_json::json!({ "agentType": agent, "sessionId": sid }),
         );
+        // F5 即时重算：已读落库后请求一次动作补扫（Action 不吃事件合并节流），
+        // 前端已有的 invalidateQueries(["sessions"]) 下一帧即读到新快照，
+        // 不必等下一个档位周期（最坏 30s）
+        crate::adapter::scan_bus::request_scan(crate::adapter::scan_bus::ScanReason::Action);
     }
 }
 
@@ -366,16 +376,21 @@ pub fn dismiss_session_card(agent_type: String, session_id: String, status: Stri
         session_id,
         status.to_lowercase(),
     ));
+    // F5 即时重算：隐藏集合是扫描内的过滤条件（filter_dismissed_cards），补扫一次
+    // 让快照立即不再含该卡；否则已隐藏的卡要等下一个档位周期才消失。
+    // 已知残留窗口：本次补扫是「即发即忘」——前端可能在新快照发布前读到上一版快照，
+    // 卡片多显示一帧；该 F5 残留窗口留待后续以「版本门控失效」收口
+    crate::adapter::scan_bus::request_scan(crate::adapter::scan_bus::ScanReason::Action);
 }
 
 /// R5 一键 resume（桌面卡「在电脑上打开」）：按 session_id 在当前快照里找会话，
 /// 交 inject::resume 核心开终端恢复（Windows wt/conhost、macOS iTerm2/Terminal）。
-/// 数据同源：直调 adapter::get_all_sessions（与看板同一份快照）；id 跨工具撞名取
-/// 第一个匹配（远端 session-open 端点同口径）。命令表未收录的工具 / 无 cwd 由核心
-/// 返回哨兵串，转译为前端可展示的中文文案；本机路径不写审计（audit_write 需设备
-/// 身份，审计口径 = 远端设备动作留痕，见 inject::resume 模块注释）。
-/// 评审 M3：扫描 + 核心并进同一 spawn_blocking——核心内 `where wt` 首调探测是
-/// 同步进程等待，留在闭包里不占 tokio worker。
+/// 数据同源：读扫描总线的共享快照（与看板同一份数据；冷启动无快照才同步补扫）；
+/// id 跨工具撞名取第一个匹配（远端 session-open 端点同口径）。命令表未收录的
+/// 工具 / 无 cwd 由核心返回哨兵串，转译为前端可展示的中文文案；本机路径不写审计
+/// （audit_write 需设备身份，审计口径 = 远端设备动作留痕，见 inject::resume 模块注释）。
+/// 评审 M3：快照读取 + 核心并进同一 spawn_blocking——核心内 `where wt` 首调探测是
+/// 同步进程等待，留在闭包里不占 tokio worker（冷启动兜底扫描同样不进主线程）。
 #[tauri::command]
 pub async fn session_open(app: tauri::AppHandle, session_id: String) -> Result<(), String> {
     let sid = session_id.trim().to_string();
@@ -385,7 +400,7 @@ pub async fn session_open(app: tauri::AppHandle, session_id: String) -> Result<(
     tauri::async_runtime::spawn_blocking(move || {
         // mut：T3 信任归一在 spawn 前原地改写 project_path（claude 专属，只读
         // ~/.claude.json 永不写）
-        let mut session = crate::adapter::get_all_sessions()
+        let mut session = crate::adapter::scan_bus::current_or_scan()
             .sessions
             .into_iter()
             .find(|s| s.id == sid)
@@ -473,7 +488,13 @@ pub fn kill_pid(pid: u32) -> Result<(), String> {
 
 #[tauri::command]
 pub fn kill_session(pid: u32) -> Result<(), String> {
-    kill_pid(pid)
+    let r = kill_pid(pid);
+    if r.is_ok() {
+        // F5 即时重算：进程已杀 → 动作补扫让该会话卡随新快照立即消失；
+        // 失败（进程已不在）不改动数据，无需补扫
+        crate::adapter::scan_bus::request_scan(crate::adapter::scan_bus::ScanReason::Action);
+    }
+    r
 }
 
 #[cfg(test)]
@@ -531,6 +552,26 @@ mod on_demand_tests {
             Some("cli"),
             false
         ));
+    }
+}
+
+#[cfg(test)]
+mod session_snapshot_lock_tests {
+    /// 源码锁：命令层不得再直调扫描（每请求全量扫描 = 前端 3 秒轮询下的 CPU 抖动
+    /// 根因），一律读 scan_bus 共享快照。
+    /// 断言串用 `concat!` 拼接：`include_str!` 会把本文件（含本测试）一并纳入被检
+    /// 源码，整串字面量直接写在断言里会自我命中——负向断言永远失败、正向断言永远
+    /// 通过（恒真恒假两条废锁）
+    #[test]
+    fn sessions_command_reads_snapshot_instead_of_scanning() {
+        let src = include_str!("session.rs");
+        let direct_scan = concat!("adapter::", "get_all_sessions");
+        let snapshot_read = concat!("scan_bus::", "current_or_scan");
+        assert!(
+            !src.contains(direct_scan),
+            "命令层不得再直调扫描；只允许读 scan_bus 共享快照"
+        );
+        assert!(src.contains(snapshot_read), "命令层应经共享快照读取会话");
     }
 }
 

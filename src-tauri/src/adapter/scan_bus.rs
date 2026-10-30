@@ -99,13 +99,19 @@ pub fn request_scan(reason: ScanReason) {
     }
 }
 
-/// 前端可见性心跳："有人在看" = 主窗可见且聚焦 / 浮窗展开；TTL 90s
-pub fn set_user_watching(watching: bool) {
-    if watching {
-        WATCH_UNTIL_MS.store(now_ms() + WATCH_TTL_MS, Ordering::SeqCst);
+/// 前端可见性心跳："有人在看" = 主窗可见且聚焦 / 浮窗展开；TTL 90s。
+/// 返回本次调用是否构成「开始观察」的上升沿（未在看/心跳过期 → 在看）：
+/// 命令层据此立即请求一次补扫，窗口重新聚焦时数据不必等下一个档位周期。
+/// 用原子 swap 取旧值判定上升沿——并发心跳中只有一次能拿到边沿
+pub fn set_user_watching(watching: bool) -> bool {
+    let now = now_ms();
+    let prev = if watching {
+        WATCH_UNTIL_MS.swap(now + WATCH_TTL_MS, Ordering::SeqCst)
     } else {
-        WATCH_UNTIL_MS.store(0, Ordering::SeqCst);
-    }
+        WATCH_UNTIL_MS.swap(0, Ordering::SeqCst)
+    };
+    // 旧值 0（未在看）或已过期（<= now）都算上升沿
+    watching && prev <= now
 }
 
 fn user_watching() -> bool {
@@ -182,6 +188,8 @@ pub fn start(app: tauri::AppHandle) {
         let mut last_processing = false;
         let mut first = true;
         loop {
+            // 取因必须留在 catch_unwind 之外：本轮无论是否 panic，下一圈都要回到
+            // recv_timeout 继续接收唤醒——线程自杀式退出等于看板永久冻结
             let reason = if first {
                 first = false;
                 ScanReason::ColdStart
@@ -192,31 +200,43 @@ pub fn start(app: tauri::AppHandle) {
                     Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 }
             };
-            // 事件合并节流：仅压 Event；Action 补扫与冷启动不得被丢弃
-            if matches!(reason, ScanReason::Event) && last_scan.elapsed() < EVENT_DEBOUNCE {
-                continue;
-            }
-            let snap = scan_once();
-            last_scan = Instant::now();
-            update_tray(
-                &app,
-                &snap,
-                &mut last_tray,
-                &mut last_waiting,
-                &mut last_processing,
-            );
-            let signals = Signals {
-                active_sessions: has_active_sessions(&snap.data),
-                remote_online: remote_online(),
-                user_watching: user_watching(),
-            };
-            if let Some(mode) = cadence.observe(signals, now_ms()) {
-                *MODE.lock().unwrap_or_else(|e| e.into_inner()) = mode;
-                log::info!("scan_bus: mode → {:?}", mode);
-                crate::remote::events::emit_ui(
-                    "scan-bus-mode",
-                    serde_json::json!({ "mode": mode }),
+            // F1 自愈：每轮工作（扫描 / 托盘 / 信号 / 档位 / emit）整体 catch_unwind。
+            // 命令层已改为只读快照，唯一的扫描线程一旦被 panic 展开掉，看板与托盘就会
+            // 冻结到重启——此处捕获后继续循环，最坏一个档位间隔（≤30s）内必有下一扫。
+            // scan_once 内的 Drop 守卫会在展开时清 IN_FLIGHT，下一圈不会自锁。
+            let round = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                // 事件合并节流：仅压 Event；Action 补扫与冷启动不得被丢弃
+                if matches!(reason, ScanReason::Event) && last_scan.elapsed() < EVENT_DEBOUNCE {
+                    return;
+                }
+                let snap = scan_once();
+                last_scan = Instant::now();
+                update_tray(
+                    &app,
+                    &snap,
+                    &mut last_tray,
+                    &mut last_waiting,
+                    &mut last_processing,
                 );
+                let signals = Signals {
+                    active_sessions: has_active_sessions(&snap.data),
+                    remote_online: remote_online(),
+                    user_watching: user_watching(),
+                };
+                if let Some(mode) = cadence.observe(signals, now_ms()) {
+                    *MODE.lock().unwrap_or_else(|e| e.into_inner()) = mode;
+                    log::info!("scan_bus: mode → {:?}", mode);
+                    crate::remote::events::emit_ui(
+                        "scan-bus-mode",
+                        serde_json::json!({ "mode": mode }),
+                    );
+                }
+            }));
+            if let Err(e) = round {
+                log::error!("scan_bus: 扫描轮次 panic，已捕获并继续（{:?}）", e);
+                // 退避 500ms：持续 panic 时不要以档位间隔空转（panic 风暴），
+                // 退避后下一圈仍按当前档位接收 → 满足 F1「≤30s 自动恢复」
+                std::thread::sleep(Duration::from_millis(500));
             }
         }
     });
@@ -337,6 +357,18 @@ mod tests {
         // 未 start（无通道）→ 直接同步扫一次并返回
         let s = ensure_fresh(Duration::from_millis(1), Duration::from_millis(50));
         assert!(s.version >= 1);
+    }
+
+    /// F4 回归锁：只有「未在看 → 在看」的上升沿返回 true（命令层据此补扫）；
+    /// 心跳续期、停止观察都不得触发额外扫描
+    #[test]
+    fn set_user_watching_reports_rising_edge_only() {
+        let _guard = lock_tests();
+        reset_for_test();
+        assert!(set_user_watching(true), "首次开始观察 = 上升沿");
+        assert!(!set_user_watching(true), "心跳续期不是上升沿");
+        assert!(!set_user_watching(false), "停止观察不是上升沿");
+        assert!(set_user_watching(true), "停止后重新观察 = 上升沿");
     }
 
     #[test]

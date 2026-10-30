@@ -51,6 +51,10 @@ pub fn mark_session_read(app: tauri::AppHandle, agent_type: String, session_id: 
         "session-read",
         serde_json::json!({ "agentType": agent_type, "sessionId": session_id }),
     );
+    // F5 即时重算：已读落库后请求一次动作补扫（Action 不吃事件合并节流），
+    // 前端已有的 invalidateQueries(["sessions"]) 下一帧即读到不含该未读卡的快照，
+    // 不必等下一个档位周期（最坏 30s）
+    crate::adapter::scan_bus::request_scan(crate::adapter::scan_bus::ScanReason::Action);
 }
 
 /// 工具勾选列表（含 managed 标志：是否存在启用的分配）
