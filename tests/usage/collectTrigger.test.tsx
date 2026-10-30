@@ -1,0 +1,138 @@
+// Task 10（扫描总线与自适应档位计划）· 用量可见即采的行为锁。
+//
+// 契约：
+//  * `useUsageCollect(active)` 在 active 的 false→true 边沿（含挂载即 active=true）以
+//    `force=true` 强制采集一次；首次激活必发（无历史 force 时间戳），60s 内重复可见边沿
+//    不再强制（F7）。去抖时间戳记在**模块作用域**、同一 WebView 的所有实例共享——宠物浮窗
+//    悬停/托盘菜单反复挂载卸载也不会绕过 60s 去抖（见「remount」用例）。
+//  * 手动路径 `collect()` 仍以 `force=false` 走「最小间隔 + 并发单飞由后端保证」的按需采集，
+//    不受可见边沿的 60s 去抖影响。
+//  * 后端兜底 ticker 的 `usage-collected` 事件到达时失效整个用量域。
+//
+// 测试可控性：模块级时间戳在同一测试文件内跨用例存活，故统一用假 Date（只伪造 `Date`，
+// 不伪造定时器——`waitFor` 仍走真实时钟），每个用例把系统时间拨到严格递增的未来 1 小时，
+// 上一用例留下的时间戳永远不会挡住本用例的首次强制采集；用例内部的 60s 窗口用
+// `vi.setSystemTime` 精确推进。
+//
+// `@tauri-apps/api/event` 的替身在 `tests/setup.ts`（全局），此处不重复 mock；
+// 本文件把用量 API 与 React Query 客户端替掉，只观察采集入参与失效键。
+import { act, renderHook, waitFor } from "@testing-library/react";
+import { listen } from "@tauri-apps/api/event";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+// vi.mock 工厂会被提升到文件顶部；顶层 `const` 在工厂执行时尚未初始化，
+// 故用 vi.hoisted 提前拿到同一组 spy（计划代码片段的已知坑，见报告 deviations）。
+const { usageCollect, invalidateQueries } = vi.hoisted(() => ({
+  usageCollect: vi.fn().mockResolvedValue({}),
+  invalidateQueries: vi.fn(),
+}));
+vi.mock("@/lib/api/usage", () => ({
+  usageCollect,
+  usageDashboard: vi.fn(),
+  usageGetSettings: vi.fn().mockResolvedValue({ enabled: true, collectIntervalMin: 10 }),
+  usageRecords: vi.fn(),
+}));
+vi.mock("@tanstack/react-query", () => ({
+  useQueryClient: () => ({ invalidateQueries }),
+  useQuery: () => ({ data: { enabled: true, collectIntervalMin: 10 } }),
+}));
+
+import { useUsageCollect } from "@/lib/query/queries/usage";
+
+const HOUR = 3_600_000;
+// 模块级去抖状态跨用例共享：基准时间整体落在未来且逐用例 +1h（详见文件头）。
+let clock = Date.now() + 24 * HOUR;
+
+beforeEach(() => {
+  clock += HOUR;
+  vi.useFakeTimers({ toFake: ["Date"] });
+  vi.setSystemTime(clock);
+  usageCollect.mockClear();
+  invalidateQueries.mockClear();
+});
+
+afterEach(() => {
+  vi.useRealTimers();
+});
+
+describe("useUsageCollect", () => {
+  it("forces a collect when the page becomes active", async () => {
+    const { rerender } = renderHook(({ active }) => useUsageCollect(active), {
+      initialProps: { active: false },
+    });
+
+    // 隐藏页不采集：active=false 的挂载帧不得发任何采集。
+    expect(usageCollect).not.toHaveBeenCalled();
+
+    rerender({ active: true });
+
+    // 可见边沿 = 强制采集（force=true）；首次激活不受 60s 去抖约束。
+    await waitFor(() => expect(usageCollect).toHaveBeenCalledWith(true));
+  });
+
+  it("debounces repeated activations within 60s", async () => {
+    const { rerender } = renderHook(({ active }) => useUsageCollect(active), {
+      initialProps: { active: true },
+    });
+    await waitFor(() => expect(usageCollect).toHaveBeenCalledTimes(1));
+    expect(usageCollect).toHaveBeenLastCalledWith(true);
+
+    // 60s 内二次可见：去抖命中，不再强制。
+    rerender({ active: false });
+    vi.setSystemTime(clock + 30_000);
+    rerender({ active: true });
+    expect(usageCollect).toHaveBeenCalledTimes(1);
+
+    // 越过 60s：再次可见恢复强制采集。
+    rerender({ active: false });
+    vi.setSystemTime(clock + 61_000);
+    rerender({ active: true });
+    await waitFor(() => expect(usageCollect).toHaveBeenCalledTimes(2));
+    expect(usageCollect).toHaveBeenLastCalledWith(true);
+  });
+
+  it("shares the 60s debounce across remounts (pet mini-bar hover)", async () => {
+    // 挂载即 active=true → 首次强制采集，写下模块级时间戳。
+    const first = renderHook(() => useUsageCollect(true));
+    await waitFor(() => expect(usageCollect).toHaveBeenCalledTimes(1));
+    expect(usageCollect).toHaveBeenLastCalledWith(true);
+    first.unmount();
+
+    // 60s 内重挂载（浮窗悬停/托盘菜单反复开关）：新实例沿用模块时间戳，不得再次强制。
+    vi.setSystemTime(clock + 30_000);
+    const second = renderHook(() => useUsageCollect(true));
+    expect(usageCollect).toHaveBeenCalledTimes(1);
+    second.unmount();
+
+    // 满 60s：重挂载恢复强制采集（阈值 `>= 60_000`）。
+    vi.setSystemTime(clock + 60_000);
+    renderHook(() => useUsageCollect(true));
+    await waitFor(() => expect(usageCollect).toHaveBeenCalledTimes(2));
+    expect(usageCollect).toHaveBeenLastCalledWith(true);
+  });
+
+  it("keeps manual collect outside the forced-edge debounce", async () => {
+    const { result } = renderHook(() => useUsageCollect(true));
+    await waitFor(() => expect(usageCollect).toHaveBeenCalledWith(true));
+
+    // 同一 60s 窗口内手动采集：force 默认 false，不走去抖。
+    await act(async () => {
+      await result.current.collect();
+    });
+    expect(usageCollect).toHaveBeenCalledTimes(2);
+    expect(usageCollect).toHaveBeenLastCalledWith(false);
+  });
+
+  it("invalidates the usage domain when the backend ticker emits usage-collected", () => {
+    renderHook(() => useUsageCollect(false));
+
+    const call = vi
+      .mocked(listen)
+      .mock.calls.find(([eventName]) => eventName === "usage-collected");
+    expect(call).toBeDefined();
+    const handler = call![1] as () => void;
+    handler();
+
+    expect(invalidateQueries).toHaveBeenCalledWith({ queryKey: ["usage"] });
+  });
+});

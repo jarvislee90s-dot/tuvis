@@ -15,7 +15,7 @@
 //  * 日档守卫三层（禁用 + 复位 + filters 双保险）**逐层断言**，判据是「日档绝不发出带 parentsOnly
 //    的调用」这条 API 级扫描，不是「界面看起来对」。
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeAll, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { ReactNode } from "react";
 
@@ -120,6 +120,11 @@ describe("usage-records（计划② Task 9：页签壳 + 用量记录页）", ()
   });
 
   it("1. 页签壳（默认看板，两页签共用同一 range / 同一次打开窗口）+ 每工具一卡、标题走展示名与合计", async () => {
+    // 可见即采的 60s 去抖记在模块作用域（跨实例共享）：前一个用例已记下时间戳，把 Date 拨过
+    // 窗口，模拟「新开窗口」的首次打开仍会强制采集；只伪造 Date，waitFor 仍走真实时钟。
+    const at = vi.spyOn(Date, "now").mockReturnValue(Date.now() + 61_000);
+    onTestFinished(() => at.mockRestore());
+
     renderPage();
 
     // 页签条在范围条下方，`aria-pressed` 表达当前页；默认「看板」

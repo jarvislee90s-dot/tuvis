@@ -4,8 +4,9 @@
 //    分工具汇总 1 行 / 本会话 / 详情 »）。行高按 `MINI_LINE_H` 给死、每行 nowrap + ellipsis，
 //    容器另加 `maxHeight` + `overflowY: auto` 兜底 ⇒ 窗口高度与纯层公式一致、不随文案抖动。
 //  * `UsageMiniBar`（数据容器）：三态与数据全部来自 `useUsageDashboardQuery`（档位取设置
-//    `miniBarRange`、分组恒 `tool`），并在**悬停那一刻**按需采集一次（`useUsageCollect`：
-//    `force=false`、最小间隔与单飞由后端保证；兜底 ticker 也在那个 hook 里，本文件不另起）。
+//    `miniBarRange`、分组恒 `tool`），并在**悬停展开那一刻**按需采集一次（`useUsageCollect`：
+//    挂载即可见边沿 → `force=true`，模块级 60s 去抖跨实例共享，故悬停/菜单反复重挂载不会
+//    反复强制扫描；兜底采集由后端 ticker 负责，本文件不另起）。
 //
 // 五条纪律（逐条都有出处）：
 //  ① **不可得一律空态、绝不填 0**（§3 第 5 条）：值取不到 → `EM_DASH`；`collectedAt === 0`
@@ -249,9 +250,9 @@ export interface UsageMiniBarProps {
  * * 档位只发**预设**（`miniBarRange` 的三值之一），窗口边界由后端裁定（契约 §3 要点 1）——
  *   本容器没有自定义区间，也不自行推算窗口；
  * * 分组恒 `tool`：第 3 行是分工具汇总（D20 的前提）；
- * * **悬停即按需采集**（spec §7.2 的触发清单：「打开大看板 / 悬停浮窗」）：`useUsageCollect` 挂载
- *   采一次（`force=false`）+ 沿用它的兜底 ticker。重复调用只拿上次结果（§3 第 16 条：最小间隔与
- *   单飞由后端保证，前端不做二次节流）；三个读查询**绝不**触发扫描（§3 第 15 条）。
+ * * **悬停即采**（spec §7.2 的触发清单：「打开大看板 / 悬停浮窗」）：`useUsageCollect()` 以挂载
+ *   为可见边沿强制采一次（`force=true`；模块级 60s 去抖跨实例共享，浮窗频繁重挂载不会反复强制
+ *   扫描）。兜底采集由后端 ticker 负责，本文件不另起；三个读查询**绝不**触发扫描（§3 第 15 条）。
  */
 export function UsageMiniBar({ scale, mode, onDetail, t }: UsageMiniBarProps) {
   const settings = useUsageSettingsQuery();

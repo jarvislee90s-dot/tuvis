@@ -13,7 +13,7 @@
 // tests/msw/tauriMocks.ts 的 `workspaceNavMock.listeners`，invoke 走 setup.ts 接线的
 // `tauriInvokeMock`（mock 队列先存后 emit），前端 store/hook 不被替身短路。
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeAll, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { ReactNode } from "react";
 
@@ -321,6 +321,12 @@ describe("workspace-navigation（Task 7：四页宿主与可靠导航）", () =>
   });
 
   it("8. 用量页隐藏时窗口聚焦零 usage IPC；可见时恢复（评审 Important 2：focus refetch）", async () => {
+    // 可见即采的 60s 去抖记在模块作用域（跨实例共享）：前面的用例已强制采集并记下时间戳，
+    // 把 Date 拨过窗口，让本次打开用量页重新触发可见即采。只伪造 Date，下面「隐藏页 focus」
+    // 场景按原用例自行接管假时钟并在结尾还原。
+    vi.useFakeTimers({ toFake: ["Date"], now: new Date(Date.now() + 61_000) });
+    onTestFinished(() => vi.useRealTimers());
+
     renderHost();
 
     // 访问用量页并等首屏数据齐（dashboard / collect / costs 都已发过）
