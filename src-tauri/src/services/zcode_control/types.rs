@@ -730,6 +730,17 @@ pub const MAX_PENDING_DETAIL_CHARS: usize = 2000;
 ///
 /// 纯函数、无副作用：不写日志、不落盘、不改输入。`null`/缺失/空串 → `None`
 /// （卡上不出现空的「查看详情」入口）；字符串原样；对象/数组等取紧凑 JSON。
+///
+/// # 安全裁决（R3 修复轮 M4）：**不脱敏**
+///
+/// 产品裁决：审批前必须让用户看到**将被执行的命令原文**。对 `token`/`secret` 一类
+/// 关键字做掩码会造成「看着安全、实际照跑」的假象——用户以为只是占位符，宿主却按
+/// 原样执行。约束改为四条，且都已在本函数/链路上成立：
+/// 1. 只读（只进 `PendingView.detail`，不参与任何应答载荷）；
+/// 2. 2000 字符有界截断（[`MAX_PENDING_DETAIL_CHARS`]）；
+/// 3. 不落盘（无 DB/账本写入）；
+/// 4. 不写日志（本函数不做任何日志/错误回显，`ZcodeError` 不携带 cause）。
+/// 若后续要加掩码，需产品重新裁决，并同步桌面端展示口径。
 pub fn project_pending_detail(detail: Option<&Value>) -> Option<String> {
     let value = detail?;
     let text = match value {

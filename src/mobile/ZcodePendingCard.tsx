@@ -257,9 +257,10 @@ function ZcodePendingCard({
         : answer.freeText;
     }
     if (answer.values.length === 0) return i18n.t("mobile.zcodeControl.pendingAnswerEmpty");
+    // 分隔符走已入库文案键（zh「、」/ en ", "），与 pendingMissing 的列表口径一致。
     return answer.values
       .map((value) => item.options.find((option) => option.value === value)?.label ?? value)
-      .join(", ");
+      .join(i18n.t("mobile.zcodeControl.pendingListSeparator"));
   };
 
   /** auto_resolution：首次有效编辑补发一次 snooze（尽力而为，不阻塞渲染）。 */
@@ -287,6 +288,8 @@ function ZcodePendingCard({
    * answers 按原始题序，题干与选项 value 都是宿主原值。
    */
   const submitAnswer = () => {
+    // 空题卡（宿主形状异常/上游漏拒）绝不上行 `answers: []`：空答案 ≠ 用户同意继续。
+    if (pending.questions.length === 0) return;
     if (blocked !== null || submitting || settledRef.current || inFlightRef.current) return;
     if (!confirming || missing.length > 0) return;
     const answers = pending.questions.map((item) => {
@@ -432,7 +435,9 @@ function ZcodePendingCard({
               type="button"
               data-testid="zcode-pending-detail-toggle"
               aria-expanded={detailOpen}
-              aria-controls={detailId}
+              // aria-controls 只在正文真的渲染时输出：折叠状态下指向未渲染元素
+              // 属 ARIA 违规（悬空引用）。
+              aria-controls={detailOpen ? detailId : undefined}
               onClick={() => setDetailOpen((open) => !open)}
               className="text-xs text-[var(--mut)] underline"
             >

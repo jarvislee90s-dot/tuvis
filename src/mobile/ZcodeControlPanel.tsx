@@ -482,9 +482,11 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
             return (
               <button
                 key={pending.interactionId}
+                id={`zcode-pending-tab-${pending.interactionId}`}
                 type="button"
                 role="tab"
                 aria-selected={selected}
+                aria-controls={`zcode-pending-panel-${pending.interactionId}`}
                 data-testid={`zcode-pending-tab-${pending.interactionId}`}
                 data-active={selected ? "true" : "false"}
                 onClick={() => setPendingTabId(pending.interactionId)}
@@ -511,9 +513,19 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
           // 非当前组仍挂载但视觉隐藏：草稿与锁定各自保留，切回来即恢复。
           <div
             key={`${session.generation}:${pending.interactionId}`}
+            id={`zcode-pending-panel-${pending.interactionId}`}
+            // 多组并存才成组：只有那时这个容器才是某个 tab 的 tabpanel，
+            // 单张卡没有 tab 指向它，不冒充 tabpanel 语义（避免悬空 aria-*）。
+            role={pendings.length > 1 ? "tabpanel" : undefined}
+            aria-labelledby={
+              pendings.length > 1 ? `zcode-pending-tab-${pending.interactionId}` : undefined
+            }
             data-testid={`zcode-pending-slot-${pending.interactionId}`}
             data-active={pending.interactionId === activePendingId ? "true" : "false"}
+            // inert 与 hidden 同时用：hidden 只管视觉，inert 保证隐藏组不会被 Tab/
+            // 读屏器/程序化激活误触（多组卡内层 testid 同名，测试也必须 within(slot)）。
             hidden={pending.interactionId !== activePendingId}
+            inert={pending.interactionId !== activePendingId}
           >
             <ZcodePendingCard
               pending={pending}

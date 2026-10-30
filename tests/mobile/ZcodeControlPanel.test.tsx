@@ -185,6 +185,16 @@ function installFetch(handler: (url: string, init?: RequestInit) => Response | P
   vi.stubGlobal("fetch", fetchMock);
 }
 
+/** 每张待处理卡的可寻址插槽（多组并存时同名内层 testid 会重复，必须 within(slot)）。 */
+function slotOf(interactionId: string = PENDING_ID): HTMLElement {
+  return screen.getByTestId(`zcode-pending-slot-${interactionId}`);
+}
+
+/** 卡内控件的定位基座：只在本组插槽里查，避免命中隐藏卡。 */
+function cardIn(interactionId: string = PENDING_ID) {
+  return within(slotOf(interactionId));
+}
+
 function calledUrls(): string[] {
   return fetchMock.mock.calls.map(([input]) => String(input));
 }
@@ -557,12 +567,14 @@ describe("ZCode 控制面板：不受支持的问答形态只读并说明原因"
     render(<ZcodeControlPanel sessionId={SID} />);
 
     // 阅读面照常：题干文本可见（不支持的是作答通道，不是题目本身）
-    const card = await screen.findByTestId("zcode-pending-card");
-    expect(card.getAttribute("data-interaction-id")).toBe(PENDING_ID);
+    await screen.findByTestId(`zcode-pending-slot-${PENDING_ID}`);
+    expect(cardIn().getByTestId("zcode-pending-card").getAttribute("data-interaction-id")).toBe(
+      PENDING_ID
+    );
     expect(screen.getByText(/这个任务接下来要做什么？/)).toBeVisible();
 
     // 选项只读：按钮禁用，点击零动作（不把官方 pending 喂给旧终端按键链）
-    const option = screen.getByTestId("zcode-pending-option-0") as HTMLButtonElement;
+    const option = cardIn().getByTestId("zcode-pending-option-0") as HTMLButtonElement;
     expect(option).toBeDisabled();
     fireEvent.click(option);
     await act(async () => {});
@@ -570,14 +582,14 @@ describe("ZCode 控制面板：不受支持的问答形态只读并说明原因"
     expect(legacySendCalls()).toBe(0);
 
     // 就地原因：可见的本地化文案 + 冻结码属性（码本身不是给用户看的）
-    const reason = screen.getByTestId("zcode-pending-reason");
+    const reason = cardIn().getByTestId("zcode-pending-reason");
     expect(reason).toBeVisible();
     expect(reason.getAttribute("data-reason-code")).toBe("needs_evidence");
     expect(reason.textContent?.trim().length ?? 0).toBeGreaterThan(0);
     expect(reason.textContent).not.toContain("needs_evidence");
 
     // 没有可用的最终提交钮（不支持的形态下缺失或 disabled——绝不假装能提交）
-    const submit = screen.queryByTestId("zcode-pending-submit");
+    const submit = cardIn().queryByTestId("zcode-pending-submit");
     if (submit !== null) expect(submit).toBeDisabled();
   });
 });
@@ -602,7 +614,8 @@ describe("ZCode 控制面板：敏感作答用密码框且不留草稿", () => {
     });
 
     const first = render(<ZcodeControlPanel sessionId={SID} />);
-    const input = (await screen.findByTestId("zcode-pending-sensitive-input")) as HTMLInputElement;
+    await screen.findByTestId(`zcode-pending-slot-${PENDING_ID}`);
+    const input = cardIn().getByTestId("zcode-pending-sensitive-input") as HTMLInputElement;
     // 敏感值只走密码框，不在明文输入面回显
     expect(input.type).toBe("password");
 
@@ -660,7 +673,7 @@ describe("ZCode 控制面板：审批选项回传宿主原值", () => {
     if (fullAccessLabel !== null) expect(fullAccessLabel.closest("button")).toBeDisabled();
 
     // 点击 allowOnce：回传宿主原 optionId（不是 kind 字面量，也不是 index）
-    fireEvent.click(screen.getByTestId("zcode-permission-option-host-allow-once-9"));
+    fireEvent.click(cardIn().getByTestId("zcode-permission-option-host-allow-once-9"));
     await waitFor(() => expect(permissionActions()).toHaveLength(1));
     expect(permissionActions()[0]).toEqual({
       kind: "permission",
@@ -704,7 +717,7 @@ describe("ZCode 控制面板：无可选审批项时就地说明原因", () => {
     expect(screen.queryByTestId("zcode-permission-option-host-unknown-9")).toBeNull();
 
     // 就地原因：可见的本地化文案 + 冻结码属性（码本身不是给用户看的）
-    const reason = screen.getByTestId("zcode-pending-reason");
+    const reason = cardIn().getByTestId("zcode-pending-reason");
     expect(reason).toBeVisible();
     expect(reason.getAttribute("data-reason-code")).toBe("unsupported_protocol");
     expect(reason.textContent?.trim().length ?? 0).toBeGreaterThan(0);
@@ -800,22 +813,41 @@ describe("ZCode 控制面板：写面门禁（paired + ready）", () => {
     ).toBeVisible();
     expect(screen.getByText("执行合成命令")).toBeVisible();
 
-    const permission = screen.getByTestId(
+    // 非当前组：容器 hidden + inert（不可见也不可聚焦/点击），但仍在册。
+    const permissionSlot = slotOf("int_00000000000000000000000000000001");
+    const questionSlot = slotOf("int_00000000000000000000000000000002");
+    expect(permissionSlot.hasAttribute("hidden")).toBe(false);
+    expect(permissionSlot.hasAttribute("inert")).toBe(false);
+    expect(questionSlot.hasAttribute("hidden")).toBe(true);
+    expect(questionSlot.hasAttribute("inert")).toBe(true);
+
+    // 可见组内的按钮**确实**被写面门禁禁用（不是靠「隐藏所以点不到」过关）。
+    const permission = cardIn("int_00000000000000000000000000000001").getByTestId(
       "zcode-permission-option-host-allow-once-9"
     ) as HTMLButtonElement;
+    expect(permission).toBeVisible();
     expect(permission).toBeDisabled();
+    fireEvent.click(permission);
+    expect(postedActions()).toHaveLength(0);
+
     // 未切换的问答卡不显示（但仍在册，不是被丢弃）
     expect(screen.getByText("这个任务接下来要做什么？")).not.toBeVisible();
 
     fireEvent.click(screen.getByTestId("zcode-pending-tab-int_00000000000000000000000000000002"));
     expect(screen.getByText("这个任务接下来要做什么？")).toBeVisible();
     expect(screen.getByText("执行合成命令")).not.toBeVisible();
-    const option = screen.getByTestId("zcode-pending-option-0") as HTMLButtonElement;
-    const submit = screen.getByTestId("zcode-pending-submit") as HTMLButtonElement;
+    expect(questionSlot.hasAttribute("inert")).toBe(false);
+    const option = cardIn("int_00000000000000000000000000000002").getByTestId(
+      "zcode-pending-option-0"
+    ) as HTMLButtonElement;
+    const submit = cardIn("int_00000000000000000000000000000002").getByTestId(
+      "zcode-pending-submit"
+    ) as HTMLButtonElement;
     const model = screen.getByTestId("zcode-model-select") as HTMLSelectElement;
     const thought = screen.getByTestId("zcode-thought-select") as HTMLSelectElement;
     const interrupt = screen.getByTestId("zcode-interrupt") as HTMLButtonElement;
     for (const control of [option, submit, model, thought, interrupt]) {
+      expect(control).toBeVisible();
       expect(control).toBeDisabled();
     }
 
@@ -832,8 +864,7 @@ describe("ZCode 控制面板：写面门禁（paired + ready）", () => {
       "not_ready"
     );
 
-    // 点击/改值均零动作 POST。
-    fireEvent.click(permission);
+    // 可见组内的点击/改值均零动作 POST（隐藏组不参与本断言）。
     fireEvent.click(option);
     fireEvent.click(submit);
     fireEvent.click(interrupt);
@@ -939,7 +970,8 @@ describe("ZCode 控制面板：同帧双击与敏感输入清理", () => {
     });
 
     const first = render(<ZcodeControlPanel sessionId={SID} />);
-    const input = (await screen.findByTestId("zcode-pending-sensitive-input")) as HTMLInputElement;
+    await screen.findByTestId(`zcode-pending-slot-${PENDING_ID}`);
+    const input = cardIn().getByTestId("zcode-pending-sensitive-input") as HTMLInputElement;
     expect(input.type).toBe("password");
     fireEvent.change(input, { target: { value: "合成敏感答案" } });
     expect(input.value).toBe("合成敏感答案");
@@ -995,12 +1027,13 @@ describe("ZCode 控制面板：pending 卡提交防重与选中态", () => {
 
     render(<ZcodeControlPanel sessionId={SID} />);
     // R3：提交按钮只在确认页可用 —— 先选中 → 进入确认页，再双击提交。
-    const submit = (await screen.findByTestId("zcode-pending-submit")) as HTMLButtonElement;
-    const option = screen.getByTestId("zcode-pending-option-0") as HTMLButtonElement;
+    await screen.findByTestId(`zcode-pending-slot-${PENDING_ID}`);
+    const submit = cardIn().getByTestId("zcode-pending-submit") as HTMLButtonElement;
+    const option = cardIn().getByTestId("zcode-pending-option-0") as HTMLButtonElement;
     await waitFor(() => expect(option).toBeEnabled());
     expect(submit).toBeDisabled();
     fireEvent.click(option);
-    fireEvent.click(screen.getByTestId("zcode-pending-next"));
+    fireEvent.click(cardIn().getByTestId("zcode-pending-next"));
     await waitFor(() => expect(submit).toBeEnabled());
 
     // 同帧双击「提交」：一个在途槽只放行一次 POST。
@@ -1016,7 +1049,7 @@ describe("ZCode 控制面板：pending 卡提交防重与选中态", () => {
       await Promise.resolve();
     });
     await waitFor(() => expect(submit).toBeDisabled());
-    expect(screen.getByTestId("zcode-pending-notice").textContent).toBe("已受理");
+    expect(cardIn().getByTestId("zcode-pending-notice").textContent).toBe("已受理");
 
     fireEvent.click(submit);
     await act(async () => {});
@@ -1067,8 +1100,9 @@ describe("ZCode 控制面板：pending 卡提交防重与选中态", () => {
     });
 
     render(<ZcodeControlPanel sessionId={SID} />);
-    const option = (await screen.findByTestId("zcode-pending-option-0")) as HTMLButtonElement;
-    const submit = screen.getByTestId("zcode-pending-submit") as HTMLButtonElement;
+    await screen.findByTestId(`zcode-pending-slot-${PENDING_ID}`);
+    const option = cardIn().getByTestId("zcode-pending-option-0") as HTMLButtonElement;
+    const submit = cardIn().getByTestId("zcode-pending-submit") as HTMLButtonElement;
     await waitFor(() => expect(option).toBeEnabled());
     // R3：未进确认页时提交恒禁用（本地暂存，不提前上送）
     expect(submit).toBeDisabled();
@@ -1080,7 +1114,7 @@ describe("ZCode 控制面板：pending 卡提交防重与选中态", () => {
 
     // snooze 在途：提交按钮禁用 + 可见「正在暂停计时」原因（不是吞点击）。
     await waitFor(() => expect(submit).toBeDisabled());
-    const notice = screen.getByTestId("zcode-pending-notice");
+    const notice = cardIn().getByTestId("zcode-pending-notice");
     expect(notice).toBeVisible();
     expect(notice.textContent).toContain("正在暂停计时");
     fireEvent.click(submit);
@@ -1092,10 +1126,10 @@ describe("ZCode 控制面板：pending 卡提交防重与选中态", () => {
       snoozeGate.resolve(json(receipt(postedActions()[0].actionId, "accepted")));
       await Promise.resolve();
     });
-    await waitFor(() => expect(screen.queryByTestId("zcode-pending-notice")).toBeNull());
+    await waitFor(() => expect(cardIn().queryByTestId("zcode-pending-notice")).toBeNull());
     // 题目页仍不可直接提交：必须先进入确认页（本地暂存不提前上送）。
     expect(submit).toBeDisabled();
-    fireEvent.click(screen.getByTestId("zcode-pending-next"));
+    fireEvent.click(cardIn().getByTestId("zcode-pending-next"));
     await waitFor(() => expect(submit).toBeEnabled());
 
     fireEvent.click(submit);
@@ -1138,9 +1172,10 @@ describe("ZCode 控制面板：pending 卡提交防重与选中态", () => {
     });
 
     render(<ZcodeControlPanel sessionId={SID} />);
-    const first = (await screen.findByTestId("zcode-pending-option-0")) as HTMLButtonElement;
-    const second = screen.getByTestId("zcode-pending-option-1") as HTMLButtonElement;
-    const submit = screen.getByTestId("zcode-pending-submit") as HTMLButtonElement;
+    await screen.findByTestId(`zcode-pending-slot-${PENDING_ID}`);
+    const first = cardIn().getByTestId("zcode-pending-option-0") as HTMLButtonElement;
+    const second = cardIn().getByTestId("zcode-pending-option-1") as HTMLButtonElement;
+    const submit = cardIn().getByTestId("zcode-pending-submit") as HTMLButtonElement;
 
     // 选中再取消 → 空选择：提交零动作（空 selectedValues 不得冒充作答）
     fireEvent.click(first);
@@ -1158,8 +1193,10 @@ describe("ZCode 控制面板：pending 卡提交防重与选中态", () => {
     expect(second).toHaveAttribute("aria-pressed", "true");
 
     // R3：先进入确认页（确认页显示两题全部答案）再提交，只发一次 answer。
-    fireEvent.click(screen.getByTestId("zcode-pending-next"));
-    expect(screen.getByTestId("zcode-pending-confirm-answer-0").textContent).toContain("继续实现");
+    fireEvent.click(cardIn().getByTestId("zcode-pending-next"));
+    expect(cardIn().getByTestId("zcode-pending-confirm-answer-0").textContent).toContain(
+      "继续实现"
+    );
     fireEvent.click(submit);
     await waitFor(() => expect(postedActions()).toHaveLength(1));
     expect(postedActions()[0].action).toEqual({
@@ -1188,8 +1225,9 @@ describe("ZCode 控制面板：pending 卡提交防重与选中态", () => {
     });
 
     render(<ZcodeControlPanel sessionId={SID} />);
-    const first = (await screen.findByTestId("zcode-pending-option-0")) as HTMLButtonElement;
-    const second = screen.getByTestId("zcode-pending-option-1") as HTMLButtonElement;
+    await screen.findByTestId(`zcode-pending-slot-${PENDING_ID}`);
+    const first = cardIn().getByTestId("zcode-pending-option-0") as HTMLButtonElement;
+    const second = cardIn().getByTestId("zcode-pending-option-1") as HTMLButtonElement;
     expect(first).toHaveAttribute("aria-pressed", "false");
     expect(second).toHaveAttribute("aria-pressed", "false");
 
@@ -1242,9 +1280,9 @@ describe("ZCode 控制面板：选项与自由文本互斥", () => {
     installAnswerBackend();
     render(<ZcodeControlPanel sessionId={SID} />);
 
-    const card = await screen.findByTestId("zcode-pending-card");
-    const freeText = within(card).getByRole("textbox") as HTMLInputElement;
-    const option = screen.getByTestId("zcode-pending-option-0") as HTMLButtonElement;
+    await screen.findByTestId(`zcode-pending-slot-${PENDING_ID}`);
+    const freeText = cardIn().getByRole("textbox") as HTMLInputElement;
+    const option = cardIn().getByTestId("zcode-pending-option-0") as HTMLButtonElement;
 
     fireEvent.click(option);
     await waitFor(() => expect(option).toHaveAttribute("aria-pressed", "true"));
@@ -1253,8 +1291,8 @@ describe("ZCode 控制面板：选项与自由文本互斥", () => {
     await waitFor(() => expect(option).toHaveAttribute("aria-pressed", "false"));
 
     // R3：进入确认页后才提交（未确认前零 answer POST）。
-    fireEvent.click(screen.getByTestId("zcode-pending-next"));
-    fireEvent.click(screen.getByTestId("zcode-pending-submit"));
+    fireEvent.click(cardIn().getByTestId("zcode-pending-next"));
+    fireEvent.click(cardIn().getByTestId("zcode-pending-submit"));
     await waitFor(() => expect(postedActions()).toHaveLength(1));
     expect(submittedAnswers()).toEqual([
       {
@@ -1270,9 +1308,9 @@ describe("ZCode 控制面板：选项与自由文本互斥", () => {
     installAnswerBackend();
     render(<ZcodeControlPanel sessionId={SID} />);
 
-    const card = await screen.findByTestId("zcode-pending-card");
-    const freeText = within(card).getByRole("textbox") as HTMLInputElement;
-    const option = screen.getByTestId("zcode-pending-option-1") as HTMLButtonElement;
+    await screen.findByTestId(`zcode-pending-slot-${PENDING_ID}`);
+    const freeText = cardIn().getByRole("textbox") as HTMLInputElement;
+    const option = cardIn().getByTestId("zcode-pending-option-1") as HTMLButtonElement;
 
     fireEvent.change(freeText, { target: { value: "自由补充说明" } });
     fireEvent.click(option);
@@ -1280,8 +1318,8 @@ describe("ZCode 控制面板：选项与自由文本互斥", () => {
     await waitFor(() => expect(freeText.value).toBe(""));
 
     // R3：进入确认页后才提交（未确认前零 answer POST）。
-    fireEvent.click(screen.getByTestId("zcode-pending-next"));
-    fireEvent.click(screen.getByTestId("zcode-pending-submit"));
+    fireEvent.click(cardIn().getByTestId("zcode-pending-next"));
+    fireEvent.click(cardIn().getByTestId("zcode-pending-submit"));
     await waitFor(() => expect(postedActions()).toHaveLength(1));
     expect(submittedAnswers()).toEqual([
       {
@@ -1303,15 +1341,15 @@ describe("ZCode 控制面板：选项与自由文本互斥", () => {
     fireEvent.change(sensitive, { target: { value: "合成敏感答案" } });
     expect(sensitive.value).toBe("合成敏感答案");
 
-    fireEvent.click(screen.getByTestId("zcode-pending-option-0"));
+    fireEvent.click(cardIn().getByTestId("zcode-pending-option-0"));
     await waitFor(() =>
-      expect(screen.getByTestId("zcode-pending-option-0")).toHaveAttribute("aria-pressed", "true")
+      expect(cardIn().getByTestId("zcode-pending-option-0")).toHaveAttribute("aria-pressed", "true")
     );
     expect(sensitive.value).toBe("");
 
     // R3：进入确认页后才提交（未确认前零 answer POST）。
-    fireEvent.click(screen.getByTestId("zcode-pending-next"));
-    fireEvent.click(screen.getByTestId("zcode-pending-submit"));
+    fireEvent.click(cardIn().getByTestId("zcode-pending-next"));
+    fireEvent.click(cardIn().getByTestId("zcode-pending-submit"));
     await waitFor(() => expect(postedActions()).toHaveLength(1));
     expect(submittedAnswers()).toEqual([
       {
@@ -1465,7 +1503,8 @@ describe("ZCode 控制面板：原因码 zh/en 全覆盖", () => {
     });
 
     render(<ZcodeControlPanel sessionId={SID} />);
-    const reason = await screen.findByTestId("zcode-pending-reason");
+    await screen.findByTestId(`zcode-pending-slot-${PENDING_ID}`);
+    const reason = cardIn().getByTestId("zcode-pending-reason");
     expect(reason.getAttribute("data-reason-code")).toBe("unsupported");
     // 专文案如实呈现；中性兜底一句话都不出现
     expect(reason.textContent).toBe("暂不支持该操作");
@@ -1542,9 +1581,9 @@ describe("ZCode 控制面板：原因码 zh/en 全覆盖", () => {
       throw new Error(`unexpected fetch: ${url}`);
     });
     render(<ZcodeControlPanel sessionId={SID} />);
-    await screen.findByTestId("zcode-pending-card");
+    await screen.findByTestId(`zcode-pending-slot-${PENDING_ID}`);
 
-    const pendingReason = screen.getByTestId("zcode-pending-reason");
+    const pendingReason = cardIn().getByTestId("zcode-pending-reason");
     expect(pendingReason.getAttribute("data-reason-code")).toBe("needs_evidence");
     expect(pendingReason.textContent).toBe(
       "This action still needs confirmation in the terminal — continue there"
@@ -1561,7 +1600,7 @@ describe("ZCode 控制面板：原因码 zh/en 全覆盖", () => {
     );
 
     // 控件/无障碍文案同样走英文
-    expect(screen.getByTestId("zcode-pending-submit").textContent).toBe("Submit");
+    expect(cardIn().getByTestId("zcode-pending-submit").textContent).toBe("Submit");
     expect(screen.getByTestId("zcode-interrupt").textContent).toBe("Interrupt");
     expect(screen.getByTestId("zcode-model-select").getAttribute("aria-label")).toBe("Model");
     expect(screen.getByTestId("zcode-thought-select").getAttribute("aria-label")).toBe(
@@ -1801,6 +1840,79 @@ describe("ZCode 控制面板：多组待处理并存", () => {
     expect(screen.getAllByTestId("zcode-pending-card")).toHaveLength(3);
   });
 
+  it("two_question_cards_stay_addressable_per_slot_with_independent_drafts", async () => {
+    // 两张**同类**卡并存是重复 testid 最容易炸的形状：全局查询会 found multiple，
+    // 因此必须按 slot 定位；同时验证两张卡的草稿完全独立、ARIA 关系成对。
+    const SECOND_QUESTION_ID = "int_00000000000000000000000000000003";
+    installFetch((url) => {
+      if (url.includes("/official-control")) return json({ configState: "missing", url: null });
+      if (url === ZCODE_CONNECTION_PATH) return json(connection());
+      if (url.startsWith(`${ZCODE_SESSION_PATH}?`)) {
+        return json(
+          sessionView({
+            pending: [
+              pendingView({ questions: [questionView({ freeTextAllowed: true })] }),
+              pendingView({
+                interactionId: SECOND_QUESTION_ID,
+                questions: [questionView({ questionText: "第二组问题？", freeTextAllowed: true })],
+              }),
+            ],
+          })
+        );
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+
+    render(<ZcodeControlPanel sessionId={SID} />);
+    const slotA = await screen.findByTestId(`zcode-pending-slot-${PENDING_ID}`);
+    const slotB = screen.getByTestId(`zcode-pending-slot-${SECOND_QUESTION_ID}`);
+
+    // 卡根带 interaction 身份（按卡归属可核对）
+    expect(
+      cardIn(PENDING_ID).getByTestId("zcode-pending-card").getAttribute("data-interaction-id")
+    ).toBe(PENDING_ID);
+    expect(
+      cardIn(SECOND_QUESTION_ID)
+        .getByTestId("zcode-pending-card")
+        .getAttribute("data-interaction-id")
+    ).toBe(SECOND_QUESTION_ID);
+
+    // 同名 testid 在全局确实重复（这正是「必须 within(slot)」的证据）
+    expect(screen.getAllByTestId("zcode-pending-submit")).toHaveLength(2);
+    expect(() => screen.getByTestId("zcode-pending-submit")).toThrow(/multiple/i);
+    // 按 slot 分别取控件：不抛，且取到的是**本组**那一个
+    expect(cardIn(PENDING_ID).getByTestId("zcode-pending-submit")).toBeVisible();
+    expect(
+      cardIn(SECOND_QUESTION_ID).getByTestId("zcode-pending-submit", { hidden: true })
+    ).toBeDefined();
+
+    // tab ↔ tabpanel 关系成对；非当前组 hidden + inert
+    const tabA = screen.getByTestId(`zcode-pending-tab-${PENDING_ID}`);
+    const tabB = screen.getByTestId(`zcode-pending-tab-${SECOND_QUESTION_ID}`);
+    expect(tabA.id).not.toBe("");
+    expect(tabA.getAttribute("aria-controls")).toBe(`zcode-pending-panel-${PENDING_ID}`);
+    expect(slotA.getAttribute("role")).toBe("tabpanel");
+    expect(slotA.getAttribute("aria-labelledby")).toBe(tabA.id);
+    expect(tabB.getAttribute("aria-controls")).toBe(`zcode-pending-panel-${SECOND_QUESTION_ID}`);
+    expect(slotB.getAttribute("role")).toBe("tabpanel");
+    expect(slotB.getAttribute("aria-labelledby")).toBe(tabB.id);
+    expect(slotB.hasAttribute("hidden")).toBe(true);
+    expect(slotB.hasAttribute("inert")).toBe(true);
+
+    // 草稿互不串、也不丢
+    fireEvent.change(cardIn(PENDING_ID).getByRole("textbox"), { target: { value: "A 组草稿" } });
+    fireEvent.click(tabB);
+    fireEvent.change(cardIn(SECOND_QUESTION_ID).getByRole("textbox"), {
+      target: { value: "B 组草稿" },
+    });
+    fireEvent.click(tabA);
+    expect((cardIn(PENDING_ID).getByRole("textbox") as HTMLInputElement).value).toBe("A 组草稿");
+    fireEvent.click(tabB);
+    expect((cardIn(SECOND_QUESTION_ID).getByRole("textbox") as HTMLInputElement).value).toBe(
+      "B 组草稿"
+    );
+  });
+
   it("single_pending_renders_without_tab_strip", async () => {
     // 只剩一张时不出现切组入口（不占屏），卡照常展示——宿主撤掉其他请求后不会空屏。
     let dropFirst = false;
@@ -1833,6 +1945,10 @@ describe("ZCode 控制面板：多组待处理并存", () => {
     expect(await screen.findByText("执行合成命令")).toBeVisible();
     expect(screen.queryByTestId("zcode-pending-tabs")).toBeNull();
     expect(screen.getAllByTestId("zcode-pending-card")).toHaveLength(1);
+    // 单张卡没有 tab 指向它，因此不冒充 tabpanel 语义
+    const slot = slotOf(PERMISSION_ID);
+    expect(slot.getAttribute("role")).toBeNull();
+    expect(slot.getAttribute("aria-labelledby")).toBeNull();
   });
 });
 
@@ -1889,7 +2005,7 @@ describe("ZCode 控制面板：官方队列投影", () => {
     });
     render(<ZcodeControlPanel sessionId={SID} />);
     // 投影已落地（pending 卡可读）但仍无队列面板：缺字段 ≠ 空队列。
-    await screen.findByTestId("zcode-pending-card");
+    await screen.findByTestId(`zcode-pending-slot-${PENDING_ID}`);
     expect(screen.queryByTestId("zcode-queue")).toBeNull();
   });
 });

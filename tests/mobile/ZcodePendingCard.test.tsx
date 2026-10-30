@@ -267,11 +267,9 @@ describe("ZCode 待处理卡：确认页与一次性提交", () => {
     expect(screen.getByTestId("zcode-pending-confirm-item-1").textContent).toContain("第二题？");
     expect(screen.getByTestId("zcode-pending-confirm-item-2").textContent).toContain("第三题？");
     expect(screen.getByTestId("zcode-pending-confirm-answer-0").textContent).toBe("先写测试");
-    expect(screen.getByTestId("zcode-pending-confirm-answer-1").textContent).toContain(
-      "第二题选项甲"
-    );
-    expect(screen.getByTestId("zcode-pending-confirm-answer-1").textContent).toContain(
-      "第二题选项乙"
+    // 多选答案按已入库分隔键拼接（zh「、」），不是硬编码 ", "
+    expect(screen.getByTestId("zcode-pending-confirm-answer-1").textContent).toBe(
+      "第二题选项甲、第二题选项乙"
     );
     expect(screen.getByTestId("zcode-pending-confirm-answer-2").textContent).toBe("第三题的补充");
     expect(fn).not.toHaveBeenCalled();
@@ -331,6 +329,28 @@ describe("ZCode 待处理卡：确认页与一次性提交", () => {
     expect(screen.getByTestId("zcode-pending-confirm-answer-1").textContent).toBe("未作答");
 
     fireEvent.click(submit);
+    expect(calls).toHaveLength(0);
+  });
+});
+
+describe("ZCode 待处理卡：空题边界", () => {
+  it("zero_question_card_never_posts_an_empty_answer", () => {
+    // 旧合同的兜底：空答案列表 ≠ 用户同意继续。上游投影已经丢弃 0 题卡，
+    // 但安全边界不外包给上游——卡片自己必须零 POST。
+    const { fn, calls } = makeSubmit();
+    render(
+      <ZcodePendingCard {...baseProps({ pending: pendingView({ questions: [] }), submit: fn })} />
+    );
+
+    const submit = screen.getByTestId("zcode-pending-submit") as HTMLButtonElement;
+    fireEvent.click(submit);
+    // 若还能进入确认页，也绝不允许提交空答案
+    const next = screen.queryByTestId("zcode-pending-next");
+    if (next !== null) {
+      fireEvent.click(next);
+      expect(screen.getByTestId("zcode-pending-confirm")).toBeVisible();
+      fireEvent.click(submit);
+    }
     expect(calls).toHaveLength(0);
   });
 });
@@ -462,28 +482,46 @@ describe("ZCode 待处理卡：既有合同不回退", () => {
     await waitFor(() => expect(calls.filter((action) => action.kind === "answer")).toHaveLength(1));
   });
 
-  it("sensitive_answers_never_reach_browser_storage", () => {
-    const setItem = vi.spyOn(Storage.prototype, "setItem");
+  it("sensitive_answers_never_reach_browser_storage", async () => {
+    // 两种浏览器存储都单独监听：计数必须为 0（不是「没写就没写」的空转断言），
+    // 且本次提交载荷里带的确实是内存值，证明「失焦清可见态」不等于「丢弃答案」。
+    const localSet = vi.spyOn(window.localStorage, "setItem");
+    const sessionSet = vi.spyOn(window.sessionStorage, "setItem");
+    const { fn, calls } = makeSubmit();
     const pending = pendingView({
       sensitive: true,
       questions: [questionView({ freeTextAllowed: true })],
     });
-    render(<ZcodePendingCard {...baseProps({ pending })} />);
+    render(<ZcodePendingCard {...baseProps({ pending, submit: fn })} />);
 
     const input = screen.getByTestId("zcode-pending-sensitive-input") as HTMLInputElement;
     expect(input.type).toBe("password");
     fireEvent.change(input, { target: { value: "合成敏感答案" } });
     expect(input.value).toBe("合成敏感答案");
 
-    const dumped = JSON.stringify(setItem.mock.calls);
-    expect(dumped).not.toContain("合成敏感答案");
-
     // 失焦清可见态，但确认页不显示明文（只显示「已填写」）
     fireEvent.blur(input);
+    expect(input.value).toBe("");
     fireEvent.click(screen.getByTestId("zcode-pending-next"));
     expect(screen.getByTestId("zcode-pending-confirm-answer-0").textContent).toBe(
       "已填写（不显示）"
     );
+
+    fireEvent.click(screen.getByTestId("zcode-pending-submit"));
+    await waitFor(() => expect(calls).toHaveLength(1));
+    expect(calls[0]).toEqual({
+      kind: "answer",
+      sessionId: SID,
+      generation: GEN,
+      interactionId: INTERACTION,
+      answers: [
+        { questionText: "这个任务接下来要做什么？", selectedValues: [], freeText: "合成敏感答案" },
+      ],
+    });
+
+    // 全流程（含提交）零浏览器存储写入
+    expect(localSet).toHaveBeenCalledTimes(0);
+    expect(sessionSet).toHaveBeenCalledTimes(0);
   });
 });
 
@@ -552,10 +590,11 @@ describe("ZCode 待处理卡：审批只放行一次性选项并展示命令正�
       />
     );
 
-    // 默认折叠：正文不占屏
+    // 默认折叠：正文不占屏，且不得出现指向未渲染元素的悬空 aria-controls
     expect(screen.queryByTestId("zcode-pending-detail")).toBeNull();
     const toggle = screen.getByTestId("zcode-pending-detail-toggle") as HTMLButtonElement;
     expect(toggle.getAttribute("aria-expanded")).toBe("false");
+    expect(toggle.getAttribute("aria-controls")).toBeNull();
 
     fireEvent.click(toggle);
     const body = screen.getByTestId("zcode-pending-detail");
