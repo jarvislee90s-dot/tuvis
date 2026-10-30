@@ -2020,6 +2020,174 @@ describe("ZCode 控制面板：多组待处理并存", () => {
   });
 });
 
+// R4（U2）：单行紧凑工具栏 —— 「打开官方页面」+ 模型 + 思考强度 三者同容器。
+//
+// 契约：
+// - 容器 `zcode-control-toolbar`：三个控件必须在**同一个**容器内（不是三处散落）。
+// - 行为零变化：`openOfficial` 仍只打开已保存链接（不自动跳转）；`handleModelChange`
+//   / `handleThoughtChange` 仍发同形状的 tagged selection 动作（协议不变）。
+// - 当前选择与目录不变（model value / options、thought value / options）。
+// - 禁用原因 `zcode-selection-reason` 语义不变：仍带 `data-reason-code` 且可见。
+// - 布局代理（**不是像素级证明**）：容器带 `data-layout` 行数钩子；容器 `flex-nowrap`
+//   + 模型 select `min-w-0`/`truncate` 是「360px/100% 保持一行」的可测代理条件。
+//   真实单行/省略/不溢出由浏览器截图证据承担（docs/superpowers/reviews/
+//   2026-10-29-zcode-ui-screenshots/），本文件的类名断言只是代理。
+describe("ZCode 控制面板：单行紧凑工具栏（R4/U2）", () => {
+  const OFFICIAL_URL = "https://zcode.z.ai/remote/v4?sid=synthetic-toolbar-0001";
+  /** 长模型名：视觉必须可省略，但可访问全名必须保留（title + option 原文）。 */
+  const LONG_MODEL = "zai/glm-4.6-flash-reasoning-very-long-model-name-2026-10-29";
+
+  function toolbarSession(overrides: Partial<SessionView> = {}): SessionView {
+    return sessionView({
+      selection: {
+        provider: "zai",
+        model: "model-a",
+        thought: "high",
+        models: [
+          { modelId: "model-a", thoughtLevels: ["low", "high"] },
+          { modelId: "model-b", thoughtLevels: ["medium"] },
+        ],
+      },
+      ...overrides,
+    });
+  }
+
+  it("three_controls_share_one_toolbar_container_and_keep_protocol", async () => {
+    const openSpy = vi.spyOn(window, "open").mockImplementation(() => null);
+    installFetch((url, init) => {
+      if (url.includes("/official-control")) {
+        return json({ configState: "saved", url: OFFICIAL_URL });
+      }
+      if (url === ZCODE_CONNECTION_PATH) return json(connection());
+      if (url.startsWith(`${ZCODE_SESSION_PATH}?`)) return json(toolbarSession());
+      if (url === ZCODE_ACTIONS_PATH && init?.method === "POST") {
+        const body = JSON.parse(String(init.body)) as { actionId: string };
+        return json(receipt(body.actionId, "accepted"));
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+
+    render(<ZcodeControlPanel sessionId={SID} />);
+    const toolbar = await screen.findByTestId("zcode-control-toolbar");
+    const scope = within(toolbar);
+
+    // 三个控件同处一个容器（不再散落在面板各处）。
+    const official = await scope.findByTestId("zcode-open-official");
+    const model = scope.getByTestId("zcode-model-select") as HTMLSelectElement;
+    const thought = scope.getByTestId("zcode-thought-select") as HTMLSelectElement;
+
+    // 当前选择与目录不变。
+    expect(model.value).toBe("model-a");
+    expect([...model.options].map((option) => option.value)).toEqual(["model-a", "model-b"]);
+    expect(thought.value).toBe("high");
+    expect([...thought.options].map((option) => option.value)).toEqual(["low", "high"]);
+
+    // 官方页仍是显式辅助动作：挂载不外跳，点击只开已保存链接（零动作 POST）。
+    expect(openSpy).not.toHaveBeenCalled();
+    fireEvent.click(official);
+    expect(openSpy).toHaveBeenCalledWith(OFFICIAL_URL, "_blank", "noopener,noreferrer");
+    expect(postedActions()).toHaveLength(0);
+
+    // 换模型协议不变：仍是同形状的 tagged selection 动作。
+    fireEvent.change(model, { target: { value: "model-b" } });
+    await waitFor(() => expect(postedActions()).toHaveLength(1));
+    expect(postedActions()[0].action).toEqual({
+      kind: "selection",
+      sessionId: SID,
+      generation: GEN,
+      model: "model-b",
+      thought: "medium",
+    });
+  });
+
+  it("disabled_selection_keeps_reason_semantics_next_to_toolbar", async () => {
+    const caps = capabilities();
+    caps.model = flag(false);
+    installFetch((url) => {
+      if (url.includes("/official-control")) {
+        return json({ configState: "saved", url: OFFICIAL_URL });
+      }
+      if (url === ZCODE_CONNECTION_PATH) return json(connection());
+      if (url.startsWith(`${ZCODE_SESSION_PATH}?`)) {
+        return json(toolbarSession({ capabilities: caps }));
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+
+    render(<ZcodeControlPanel sessionId={SID} />);
+    const toolbar = await screen.findByTestId("zcode-control-toolbar");
+    const scope = within(toolbar);
+
+    // 两个控件都禁用（能力关闭 → 零动作）。
+    expect(scope.getByTestId("zcode-model-select")).toBeDisabled();
+    expect(scope.getByTestId("zcode-thought-select")).toBeDisabled();
+    fireEvent.change(scope.getByTestId("zcode-model-select"), {
+      target: { value: "model-b" },
+    });
+    fireEvent.change(scope.getByTestId("zcode-thought-select"), { target: { value: "low" } });
+    await act(async () => {});
+    expect(postedActions()).toHaveLength(0);
+
+    // 禁用原因语义不变：冻结码进 data-reason-code，文本是本地化文案。
+    const reason = screen.getByTestId("zcode-selection-reason");
+    expect(reason).toBeVisible();
+    expect(reason.getAttribute("data-reason-code")).toBe("needs_evidence");
+    expect(reason.textContent).toBe("该操作还需终端侧确认，请在终端处理");
+  });
+
+  it("toolbar_exposes_row_layout_hook_and_keeps_long_model_name_accessible", async () => {
+    installFetch((url) => {
+      if (url.includes("/official-control")) {
+        return json({ configState: "saved", url: OFFICIAL_URL });
+      }
+      if (url === ZCODE_CONNECTION_PATH) return json(connection());
+      if (url.startsWith(`${ZCODE_SESSION_PATH}?`)) {
+        return json(
+          toolbarSession({
+            selection: {
+              provider: "zai",
+              model: LONG_MODEL,
+              thought: "high",
+              models: [{ modelId: LONG_MODEL, thoughtLevels: ["low", "high"] }],
+            },
+          })
+        );
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+
+    render(<ZcodeControlPanel sessionId={SID} />);
+    const toolbar = await screen.findByTestId("zcode-control-toolbar");
+    const scope = within(toolbar);
+
+    // 行数钩子：容器自报布局口径（供截图核对时对照）。
+    expect(toolbar.getAttribute("data-layout")).toBe("single-row");
+    // 极窄场景的行数上限（计划 §1 裁决：320px/125% 等场景最多两行）。
+    expect(toolbar.getAttribute("data-max-rows")).toBe("2");
+
+    // ⚠️ 以下是**代理条件**，不是像素级证明（像素证据见截图目录
+    // docs/superpowers/reviews/2026-10-29-zcode-ui-screenshots/）：
+    // - 容器可换行：极窄时换到第二行，**不**横向溢出；
+    // - 弹性项（模型 select）有最小宽度下限 + max-w-full：
+    //   长模型名由浏览器裁剪显示，但控件既不被压成 0 宽（不隐藏必要动作）、
+    //   也不撑破容器（不横向溢出）；
+    // - 固定项（官方页入口 / 档位 select）不收缩：动作与档位不被裁掉。
+    expect(toolbar.className).toContain("flex-wrap");
+    const model = scope.getByTestId("zcode-model-select");
+    expect(model.className).toContain("min-w-");
+    expect(model.className).toContain("max-w-full");
+    expect(model.className).toContain("flex-1");
+    expect(scope.getByTestId("zcode-thought-select").className).toContain("shrink-0");
+    expect(scope.getByTestId("zcode-open-official").className).toContain("shrink-0");
+
+    // 长模型名：视觉可省略，但可访问全名必须仍在（title + option 原文）。
+    expect(model.getAttribute("title")).toBe(LONG_MODEL);
+    expect([...(model as HTMLSelectElement).options].map((option) => option.textContent)).toEqual([
+      LONG_MODEL,
+    ]);
+  });
+});
+
 describe("ZCode 控制面板：官方队列投影", () => {
   it("renders_official_queue_from_session_view", async () => {
     installFetch((url) => {

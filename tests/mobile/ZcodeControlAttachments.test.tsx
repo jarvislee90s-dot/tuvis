@@ -382,3 +382,51 @@ describe("ZCode 面板：附件接入（三轮 C）", () => {
     expect(attachOpens[0]).toContain(`session_id=${SID}&`);
   });
 });
+
+// R4（U1）：附件「＋」旁的问号 = 既有存储说明的知情披露入口。
+//
+// 契约：
+// - 默认折叠；点开展示**既有**说明文案（逐字复用 mobile.composer.attachHint，
+//   不新写存储说明、不改存储目录、不接官方原生附件上传）；再点折叠。
+// - `aria-expanded` 如实反映开合；`aria-controls` 指向真实存在的说明元素
+//   （折叠态不指向未渲染元素 = 不悬空引用）。
+// - 问号交互**零副作用**：不打开文件选择器（file input 未被 click）、不上传
+//   （零 XHR）、不发送（零动作 POST）。
+describe("ZCode 面板：附件问号说明（R4/U1）", () => {
+  it("attach_help_toggles_existing_storage_hint_without_upload_or_send", async () => {
+    installFetch((actionId) => ({ actionId, state: "accepted", reasonCode: null }));
+    render(<ZcodeControlPanel sessionId={SID} />);
+    await screen.findByTestId("zcode-draft");
+
+    const help = screen.getByTestId("zcode-attach-help");
+    const input = screen.getByTestId("zcode-attachment-input") as HTMLInputElement;
+    const inputClick = vi.spyOn(input, "click");
+
+    // 默认折叠：说明不渲染，问号如实自报未展开。
+    expect(help.getAttribute("aria-expanded")).toBe("false");
+    expect(screen.queryByTestId("zcode-attach-hint")).toBeNull();
+
+    // 点开：展示**既有**存储说明（逐字复用，不另写文案）。
+    fireEvent.click(help);
+    const hint = screen.getByTestId("zcode-attach-hint");
+    expect(hint.textContent).toBe(i18n.t("mobile.composer.attachHint"));
+    expect(hint.textContent).toContain(".tuvis-attachments");
+    expect(help.getAttribute("aria-expanded")).toBe("true");
+    // aria-controls 指向真实存在的说明元素（不悬空）。
+    expect(help.getAttribute("aria-controls")).toBe(hint.id);
+    expect(document.getElementById(hint.id)).toBe(hint);
+
+    // 问号交互零副作用：不开文件选择器、不上传、不发送。
+    expect(inputClick).not.toHaveBeenCalled();
+    expect(attachOpens).toHaveLength(0);
+    expect(postedActions()).toHaveLength(0);
+
+    // 再点：折叠。
+    fireEvent.click(help);
+    expect(screen.queryByTestId("zcode-attach-hint")).toBeNull();
+    expect(help.getAttribute("aria-expanded")).toBe("false");
+    expect(inputClick).not.toHaveBeenCalled();
+    expect(attachOpens).toHaveLength(0);
+    expect(postedActions()).toHaveLength(0);
+  });
+});

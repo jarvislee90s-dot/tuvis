@@ -35,6 +35,9 @@ interface ZcodeControlPanelProps {
   sessionId: string;
 }
 
+/** 附件存储说明段落的 DOM id（aria-controls 的锚点；面板内唯一）。 */
+const ATTACH_HINT_ID = "zcode-attach-hint";
+
 /**
  * 冻结原因码 → 本地化文案键。词表随待处理卡一起下沉到
  * [`ZcodePendingCard`](./ZcodePendingCard.tsx)（面板消费该组件，词表留在面板会形成
@@ -87,6 +90,11 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
   const submittedAttachmentIdsRef = useRef<string[] | null>(null);
   /** 附件闸提示（上传中/存在失败项时点击发送）：瞬态，随下次发送动作清除。 */
   const [attachNotice, setAttachNotice] = useState<"uploading" | "failed" | null>(null);
+  /**
+   * 附件存储说明的展开态（R4/U1）：默认折叠，点「？」展开既有说明、再点收起。
+   * 纯展示开关：绝不触发文件选择器 / 上传 / 发送。
+   */
+  const [attachHintOpen, setAttachHintOpen] = useState(false);
   const attachInputRef = useRef<HTMLInputElement | null>(null);
   /**
    * 当前展示的待处理卡（多组并存时的切组状态）。存 id 而不是下标：宿主增删卡
@@ -126,6 +134,8 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
     setAttachments([]);
     submittedAttachmentIdsRef.current = null;
     setAttachNotice(null);
+    // 附件说明的展开态同样不跨会话残留（说明属当前会话的附件管线）。
+    setAttachHintOpen(false);
     // 切组选择不跨会话残留（旧会话的 interaction id 在新会话没有意义）。
     setPendingTabId(null);
     // 抢回面同样不跨会话残留（T8）。
@@ -447,17 +457,6 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
           )}
         </div>
       )}
-      {/* A5 显式辅助入口：只打开**已保存**的官方链接（挂载不自动外跳、不代理点击）。 */}
-      {officialUrl !== null && (
-        <button
-          type="button"
-          data-testid="zcode-open-official"
-          onClick={openOfficial}
-          className="mb-2 rounded-full border border-[var(--cb)] px-3 py-1 text-xs text-[var(--mut)]"
-        >
-          {i18n.t("mobile.composer.zcodeOpenOfficial")}
-        </button>
-      )}
       {receipt !== null && (
         <p
           data-testid="zcode-action-status"
@@ -545,49 +544,86 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
           </div>
         ))}
       {/* 官方输入队列（只读）：默认一行（数量 + 暂停），点开才列正文。
-          放在 pending 卡之后、模型选择之前——运行中发送的排队事实比档位更贴近
+          放在 pending 卡之后、工具栏之前——运行中发送的排队事实比档位更贴近
           用户此刻的疑问（「我刚发的那条去哪了」）。未知/空队列不占位。 */}
       <ZcodeQueuePanel queue={session?.queue} />
-      {selection !== null && (
-        <div className="mb-2 flex flex-wrap items-center gap-2">
-          <select
-            data-testid="zcode-model-select"
-            aria-label={i18n.t("mobile.zcodeControl.modelAria")}
-            value={selection.model}
-            disabled={!selectionEnabled}
-            onChange={(e) => handleModelChange(e.target.value)}
-            className="rounded-lg border border-[var(--cb)] px-2 py-1 text-sm text-[var(--tx)] disabled:opacity-40"
-          >
-            {selection.models.map((choice) => (
-              <option key={choice.modelId} value={choice.modelId}>
-                {choice.modelId}
-              </option>
-            ))}
-          </select>
-          <select
-            data-testid="zcode-thought-select"
-            aria-label={i18n.t("mobile.zcodeControl.thoughtAria")}
-            value={currentThought}
-            disabled={!selectionEnabled}
-            onChange={(e) => handleThoughtChange(e.target.value)}
-            className="rounded-lg border border-[var(--cb)] px-2 py-1 text-sm text-[var(--tx)] disabled:opacity-40"
-          >
-            {(currentChoice?.thoughtLevels ?? []).map((level) => (
-              <option key={level} value={level}>
-                {level}
-              </option>
-            ))}
-          </select>
-          {!selectionEnabled && (
-            <p
-              data-testid="zcode-selection-reason"
-              data-reason-code={selectionReason}
-              className="text-xs text-[var(--mut)]"
+      {/* ==== 单行紧凑工具栏（R4/U2）====
+          「打开官方页面」+ 模型 + 思考强度 三者同一容器、同一行；行为与协议
+          零变化（openOfficial 只开已保存链接，模型/档位仍发同形状 selection）。
+          布局裁决（计划 §1）：
+          - 360px/100% 字号：保持一行（模型 select 可伸缩，长模型名省略显示，
+            但全名保留在 title 与 option 原文里，键盘/读屏仍可取全名）；
+          - 320px/125% 等极窄场景：允许折到第二行（容器可换行 + 模型 select
+            有最小可用宽度），绝不横向溢出、绝不隐藏必要动作；
+          - 「打开官方页面」与档位 select 不收缩（shrink-0）：动作不被裁掉。
+          禁用原因另起一行放在工具栏下方：长句不参与行内排版。 */}
+      {(officialUrl !== null || selection !== null) && (
+        <div
+          data-testid="zcode-control-toolbar"
+          data-layout="single-row"
+          data-max-rows="2"
+          className="mb-2 flex flex-wrap items-center gap-x-2 gap-y-1"
+        >
+          {/* A5 显式辅助入口：只打开**已保存**的官方链接（挂载不自动外跳、不代理点击）。 */}
+          {officialUrl !== null && (
+            <button
+              type="button"
+              data-testid="zcode-open-official"
+              onClick={openOfficial}
+              className="shrink-0 rounded-full border border-[var(--cb)] px-2 py-1 text-xs text-[var(--mut)]"
             >
-              {zcodeReasonText(selectionReason)}
-            </p>
+              {i18n.t("mobile.composer.zcodeOpenOfficial")}
+            </button>
+          )}
+          {selection !== null && (
+            <>
+              {/* 模型 select：可伸缩 + 省略显示长名；title 保留全名（可访问全名）。
+                  不用 truncate 类：原生 select 上的 overflow-hidden 会连下拉箭头一起
+                  裁掉（Chrome 实测），浏览器的文本裁剪已足够，长名靠 title + option
+                  原文取全。 */}
+              <select
+                data-testid="zcode-model-select"
+                aria-label={i18n.t("mobile.zcodeControl.modelAria")}
+                title={selection.model}
+                value={selection.model}
+                disabled={!selectionEnabled}
+                onChange={(e) => handleModelChange(e.target.value)}
+                className="max-w-full min-w-[4rem] flex-1 rounded-lg border border-[var(--cb)] px-2 py-1 text-sm text-[var(--tx)] disabled:opacity-40"
+              >
+                {selection.models.map((choice) => (
+                  <option key={choice.modelId} value={choice.modelId}>
+                    {choice.modelId}
+                  </option>
+                ))}
+              </select>
+              {/* 档位 select：内容短，固定不收缩（长档位名靠 title 兜底）。 */}
+              <select
+                data-testid="zcode-thought-select"
+                aria-label={i18n.t("mobile.zcodeControl.thoughtAria")}
+                title={currentThought}
+                value={currentThought}
+                disabled={!selectionEnabled}
+                onChange={(e) => handleThoughtChange(e.target.value)}
+                className="max-w-[45%] shrink-0 rounded-lg border border-[var(--cb)] px-2 py-1 text-sm text-[var(--tx)] disabled:opacity-40"
+              >
+                {(currentChoice?.thoughtLevels ?? []).map((level) => (
+                  <option key={level} value={level}>
+                    {level}
+                  </option>
+                ))}
+              </select>
+            </>
           )}
         </div>
+      )}
+      {selection !== null && !selectionEnabled && (
+        <p
+          data-testid="zcode-selection-reason"
+          data-reason-code={selectionReason}
+          className="mb-2 text-xs text-[var(--mut)]"
+        >
+          {zcodeReasonText(selectionReason)}
+        </p>
       )}
       {stopTargets.length > 0 && (
         <div className="mb-2 flex flex-wrap items-center gap-2">
@@ -655,27 +691,45 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
         </p>
       )}
       <div className="flex items-end gap-2">
-        <button
-          type="button"
-          data-testid="zcode-attach"
-          aria-label={i18n.t("mobile.zcodeControl.attachAria")}
-          onClick={() => attachInputRef.current?.click()}
-          className="shrink-0 rounded-full bg-[var(--btnp)]/10 px-3 py-2 text-sm text-[var(--tx)]"
-        >
-          +
-        </button>
-        <input
-          ref={attachInputRef}
-          data-testid="zcode-attachment-input"
-          type="file"
-          multiple
-          className="hidden"
-          onChange={(e) => {
-            const files = Array.from(e.target.files ?? []);
-            e.target.value = "";
-            if (files.length > 0) addZcodeFiles(files);
-          }}
-        />
+        {/* 附件入口：＋选文件 + ？知情披露（存储说明）。与 MessageComposer 同款竖排
+            （＋在上、？在下）：横向位紧张时竖排更省宽（2026-10-04 用户裁决口径）。
+            ？只切换说明，**不**碰文件选择器 / 上传 / 发送（问号不是动作入口）。 */}
+        <span className="flex shrink-0 flex-col items-center gap-0.5">
+          <input
+            ref={attachInputRef}
+            data-testid="zcode-attachment-input"
+            type="file"
+            multiple
+            className="hidden"
+            onChange={(e) => {
+              const files = Array.from(e.target.files ?? []);
+              e.target.value = "";
+              if (files.length > 0) addZcodeFiles(files);
+            }}
+          />
+          <button
+            type="button"
+            data-testid="zcode-attach"
+            aria-label={i18n.t("mobile.zcodeControl.attachAria")}
+            onClick={() => attachInputRef.current?.click()}
+            className="shrink-0 rounded-full bg-[var(--btnp)]/10 px-3 py-2 text-sm text-[var(--tx)]"
+          >
+            +
+          </button>
+          <button
+            type="button"
+            data-testid="zcode-attach-help"
+            aria-label={i18n.t("mobile.composer.attachHelpAria")}
+            aria-expanded={attachHintOpen}
+            // aria-controls 只在说明真的渲染时给出：指向未渲染元素 = 悬空引用
+            // （与 ZcodePendingCard 的 detail 展开同一口径）。
+            aria-controls={attachHintOpen ? ATTACH_HINT_ID : undefined}
+            onClick={() => setAttachHintOpen((open) => !open)}
+            className="shrink-0 rounded-full p-0.5 text-[10px] leading-none text-[var(--mut)] hover:bg-[var(--cb)]"
+          >
+            ?
+          </button>
+        </span>
         <textarea
           data-testid="zcode-draft"
           aria-label={i18n.t("mobile.zcodeControl.draftAria")}
@@ -699,6 +753,18 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
           {i18n.t(submitting ? "mobile.zcodeControl.sending" : "mobile.zcodeControl.send")}
         </button>
       </div>
+      {/* 附件存储说明（知情披露）：？点开才显示，看过即收、不平铺常驻。
+          文案**复用** MessageComposer 的既有说明（同一上传管线 → 同一落盘位置），
+          不另写一份存储说明，也不改存储目录。 */}
+      {attachHintOpen && (
+        <p
+          id={ATTACH_HINT_ID}
+          data-testid="zcode-attach-hint"
+          className="mt-1 rounded-lg bg-[var(--cbg)] px-2 py-1.5 text-[11px] leading-4 text-[var(--mut)]"
+        >
+          {i18n.t("mobile.composer.attachHint")}
+        </p>
+      )}
       {sendCapabilityReason !== null && (
         <p
           data-testid="zcode-send-reason"
