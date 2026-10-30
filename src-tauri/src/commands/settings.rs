@@ -269,17 +269,20 @@ mod action_path_snapshot_lock_tests {
     /// Fix 4 / F5：标已读必须在命令返回前**同步**补扫（未读卡 1s 内不再出现），
     /// 即发即忘的 request_scan 会让卡片多留一个档位周期。
     #[test]
-    fn mark_session_read_scans_synchronously_before_returning() {
+    /// R1：mark_session_read 必须 async + spawn_blocking（补扫进阻塞池，
+    /// 不冻结主线程 IPC），且不再同步跑 scan_now_blocking。
+    #[test]
+    fn mark_session_read_is_async_non_blocking() {
         // 签名用 concat! 拆分：include_str! 含本测试自身，整串字面量会先命中测试代码
-        let signature = concat!("pub fn mark_session", "_read(");
+        let signature = concat!("pub async fn mark_session", "_read(");
         let body = function_body(include_str!("settings.rs"), signature);
         assert!(
-            body.contains("scan_now_blocking"),
-            "mark_session_read 必须在返回前同步补扫（F5 ≤1s 收口），实际: {body}"
+            body.contains("spawn_blocking"),
+            "mark_session_read 必须 async + spawn_blocking，实际: {body}"
         );
         assert!(
-            !body.contains("request_scan"),
-            "同步补扫已覆盖即时性，不应再留即发即忘的 request_scan"
+            !body.contains(concat!("scan_now_", "blocking")),
+            "mark_session_read 不得同步跑完整扫描"
         );
     }
 }
