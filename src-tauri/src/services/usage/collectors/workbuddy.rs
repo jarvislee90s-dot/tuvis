@@ -312,143 +312,182 @@ pub fn collect_with_home(
         };
         // 游标键 = **相对 `~/.workbuddy` 的路径**（B5：唯一性由路径给，不由文件名给）
         let file_key = file_key_of(&root, &jsonl);
-        let read = match ctx.read_incremental(&jsonl, &file_key) {
-            Ok(r) => r,
-            Err(e) => {
-                // **W-06 / D-24**：只有「枚举与读取之间的轮转竞态」（文件已消失）才允许跳过；
-                // 其余读失败（权限 / IO / mtime 不可得）必须整源响亮失败 → `UsageSourceStatus.errorCode`，
-                // 不得只 `log::warn!` 然后静默少算。
-                if file_read_failure_is_benign(&jsonl, &e) {
-                    log::warn!(
-                        "usage/workbuddy: 读取 {} 失败（文件已消失，跳过本轮）: {}",
-                        jsonl.display(),
-                        e
-                    );
-                    continue;
-                }
-                return Err(UsageError::new(
-                    "usage-source-io",
-                    format!("read {} failed: {e}", jsonl.display()),
-                ));
+        // 父会话维度：`is_subagent = false`、`parent = None`、`title = DB 标题`（与改动前逐字一致）
+        collect_file(
+            ctx, &mut b, &jsonl, &file_key, &id, &cwd, title, false, None,
+        )?;
+    }
+    Ok(b.finish())
+}
+
+/// **单文件采集（唯一实现）**：父会话 jsonl 与子代理 jsonl 走同一遍扫描。
+///
+/// 抽出来的目的（R1）：子代理文件与父会话同形（用量在 `message.usage`、模型在
+/// `providerData.model`、工具配对靠 `callId`），**口径必须逐字同源**——各写一份必然漂移。
+///
+/// 参数语义（与设计 §2.5 的表格对齐）：
+/// * 父会话：`session_id` = DB 主会话 id、`title` = DB 标题、`is_subagent = false`、`parent = None`
+/// * 子代理：`session_id` = 自身会话 id（A2 起由文件头解析）、`title = None`、
+///   `is_subagent = true`、`parent = Some(父会话 id)`
+///
+/// 返回 `Ok(true)` = 本轮**真读了**该文件（`parsed_files` 已在内部累加）；
+/// `Ok(false)` = 未变更文件（L2 快速路）。
+#[allow(clippy::too_many_arguments)]
+fn collect_file(
+    ctx: &CollectContext<'_>,
+    b: &mut DeltaBuilder,
+    jsonl: &std::path::Path,
+    file_key: &str,
+    session_id: &str,
+    cwd: &str,
+    title: Option<String>,
+    is_subagent: bool,
+    parent_session_id: Option<String>,
+) -> Result<bool, UsageError> {
+    let read = match ctx.read_incremental(jsonl, file_key) {
+        Ok(r) => r,
+        Err(e) => {
+            // **W-06 / D-24**：只有「枚举与读取之间的轮转竞态」（文件已消失）才允许跳过；
+            // 其余读失败（权限 / IO / mtime 不可得）必须整源响亮失败 → `UsageSourceStatus.errorCode`，
+            // 不得只 `log::warn!` 然后静默少算。
+            if file_read_failure_is_benign(jsonl, &e) {
+                log::warn!(
+                    "usage/workbuddy: 读取 {} 失败（文件已消失，跳过本轮）: {}",
+                    jsonl.display(),
+                    e
+                );
+                return Ok(false);
             }
-        };
-        if read.lines.is_empty() && !read.rescan {
-            // 未变文件（L2 快速路）：游标原样推回，**不计 parsed_files**（W-50：本字段的口径是
-            // 「本轮**真读到**的文件数」——与 claude / codex / kimi 一致，未变更文件在读之前就退出了）
-            b.push_cursor(read.next);
-            continue;
+            return Err(UsageError::new(
+                "usage-source-io",
+                format!("read {} failed: {e}", jsonl.display()),
+            ));
         }
-        let mut state: WbState = if read.rescan {
-            // 截断/重写：续读状态随文件代际一起重置（旧状态里的未配对调用指向的行已经不在了）
-            WbState::default()
-        } else {
-            // **游标必须被读**：增量读从文件中段开始时，上一轮发起的工具调用还在等回执，
-            // 只写不读 → 第二轮的 `open` 是空表 → 跨轮回执永远配不上（静默少算）。
-            // **解析失败不得静默重置**（形状演进时旧游标会连 `tools` / `last_model` 一起丢：
-            // 表现为 `tool_ms` 少算 + 模型继承失效，且没有任何信号）→ warn + 按 rescan 语义处理
-            // （重置本身语义等价，但它现在**可见**了）。
-            match ctx.cursor_of(&file_key) {
-                Some(p) => match serde_json::from_str::<WbState>(&p.state_json) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        log::warn!(
+    };
+    if read.lines.is_empty() && !read.rescan {
+        // 未变文件（L2 快速路）：游标原样推回，**不计 parsed_files**（W-50：本字段的口径是
+        // 「本轮**真读到**的文件数」——与 claude / codex / kimi 一致，未变更文件在读之前就退出了）
+        b.push_cursor(read.next);
+        return Ok(false);
+    }
+    let mut state: WbState = if read.rescan {
+        // 截断/重写：续读状态随文件代际一起重置（旧状态里的未配对调用指向的行已经不在了）
+        WbState::default()
+    } else {
+        // **游标必须被读**：增量读从文件中段开始时，上一轮发起的工具调用还在等回执，
+        // 只写不读 → 第二轮的 `open` 是空表 → 跨轮回执永远配不上（静默少算）。
+        // **解析失败不得静默重置**（形状演进时旧游标会连 `tools` / `last_model` 一起丢：
+        // 表现为 `tool_ms` 少算 + 模型继承失效，且没有任何信号）→ warn + 按 rescan 语义处理
+        // （重置本身语义等价，但它现在**可见**了）。
+        match ctx.cursor_of(&file_key) {
+            Some(p) => match serde_json::from_str::<WbState>(&p.state_json) {
+                Ok(s) => s,
+                Err(e) => {
+                    log::warn!(
                             "usage/workbuddy: {} 的游标状态反序列化失败（按 rescan 语义重置该文件续读状态）: {e}（state_json={:?}）",
                             jsonl.display(),
                             p.state_json
                         );
-                        WbState::default()
-                    }
-                },
-                None => WbState::default(),
-            }
-        };
-        // 「模型未知期间」的原始行（**按行缓存**，见 `process_line` 的文档；D-32 同款）
-        let mut pending: Vec<String> = Vec::new();
-        let mut dropped_no_model: i64 = 0;
-        // ---- 一遍扫描：四桶 + 工具 + 报错 全在这一轮里 ----
-        for line in &read.lines {
-            let Ok(v) = serde_json::from_str::<Value>(line) else {
-                continue; // 坏行单行丢弃，不影响同文件其余行
-            };
-            b.new_records += 1;
-            // 模型已就绪 → 先把缓存行按**原序**重放（它们都排在本行之前）
-            if !pending.is_empty() && !state.last_model.is_empty() {
-                let left = replay_pending(&mut pending, &mut b, &mut state, &id, &cwd, ctx.now_ms);
-                warn_unattributed(&jsonl, left);
-            }
-            if !process_line(&mut b, &mut state, &v, &id, &cwd, ctx.now_ms) {
-                if pending.len() < PENDING_LINES_CAP {
-                    pending.push(line.clone());
-                } else {
-                    if dropped_no_model == 0 {
-                        log::warn!(
-                            "usage/workbuddy: {} 的「模型未知」缓存超上限 {PENDING_LINES_CAP} 行，\
-                             超出部分丢弃（这些记录不入账）",
-                            jsonl.display()
-                        );
-                    }
-                    dropped_no_model += 1;
+                    WbState::default()
                 }
-            }
+            },
+            None => WbState::default(),
         }
-        // 收尾结算缓存行（**D-32 同款**，顺序不许颠倒：本文件解析出的模型 → 丢弃）：
-        // `state.last_model` 此刻可能已非空 —— 若本文件首条（也是唯一一条）带模型的行恰好落在
-        // **最后一行**，缓存就没机会在行循环里 inline 重放；漏掉这一步会把整段记录静默丢掉。
-        if !pending.is_empty() {
-            if state.last_model.is_empty() {
-                log::warn!(
-                    "usage/workbuddy: {} 有 {} 行产明细行的记录出现在任何带模型的行之前，且**整轮**\
-                     都拿不到模型 → 丢弃（不写 model=\"\" 行；B2 缺陷③ / D-32 同族）",
-                    jsonl.display(),
-                    pending.len()
-                );
-                state.dropped_no_model += pending.len() as i64;
-                pending.clear();
+    };
+    // 「模型未知期间」的原始行（**按行缓存**，见 `process_line` 的文档；D-32 同款）
+    let mut pending: Vec<String> = Vec::new();
+    let mut dropped_no_model: i64 = 0;
+    // ---- 一遍扫描：四桶 + 工具 + 报错 全在这一轮里 ----
+    for line in &read.lines {
+        let Ok(v) = serde_json::from_str::<Value>(line) else {
+            continue; // 坏行单行丢弃，不影响同文件其余行
+        };
+        b.new_records += 1;
+        // 模型已就绪 → 先把缓存行按**原序**重放（它们都排在本行之前）
+        if !pending.is_empty() && !state.last_model.is_empty() {
+            let left = replay_pending(&mut pending, b, &mut state, session_id, cwd, ctx.now_ms);
+            warn_unattributed(&jsonl, left);
+        }
+        if !process_line(b, &mut state, &v, session_id, cwd, ctx.now_ms) {
+            if pending.len() < PENDING_LINES_CAP {
+                pending.push(line.clone());
             } else {
-                let left = replay_pending(&mut pending, &mut b, &mut state, &id, &cwd, ctx.now_ms);
-                warn_unattributed(&jsonl, left);
+                if dropped_no_model == 0 {
+                    log::warn!(
+                        "usage/workbuddy: {} 的「模型未知」缓存超上限 {PENDING_LINES_CAP} 行，\
+                             超出部分丢弃（这些记录不入账）",
+                        jsonl.display()
+                    );
+                }
+                dropped_no_model += 1;
             }
         }
-        if dropped_no_model > 0 {
-            // 丢弃计数要有**可观测面**（不能只用来抑制重复 warn）：仓内无日志捕获设施（W-37），
-            // 故同时落进 `state_json`（有界、可断言、跨轮累计）。
-            state.dropped_no_model += dropped_no_model;
+    }
+    // 收尾结算缓存行（**D-32 同款**，顺序不许颠倒：本文件解析出的模型 → 丢弃）：
+    // `state.last_model` 此刻可能已非空 —— 若本文件首条（也是唯一一条）带模型的行恰好落在
+    // **最后一行**，缓存就没机会在行循环里 inline 重放；漏掉这一步会把整段记录静默丢掉。
+    if !pending.is_empty() {
+        if state.last_model.is_empty() {
             log::warn!(
+                "usage/workbuddy: {} 有 {} 行产明细行的记录出现在任何带模型的行之前，且**整轮**\
+                     都拿不到模型 → 丢弃（不写 model=\"\" 行；B2 缺陷③ / D-32 同族）",
+                jsonl.display(),
+                pending.len()
+            );
+            state.dropped_no_model += pending.len() as i64;
+            pending.clear();
+        } else {
+            let left = replay_pending(&mut pending, b, &mut state, session_id, cwd, ctx.now_ms);
+            warn_unattributed(&jsonl, left);
+        }
+    }
+    if dropped_no_model > 0 {
+        // 丢弃计数要有**可观测面**（不能只用来抑制重复 warn）：仓内无日志捕获设施（W-37），
+        // 故同时落进 `state_json`（有界、可断言、跨轮累计）。
+        state.dropped_no_model += dropped_no_model;
+        log::warn!(
                 "usage/workbuddy: {} 本轮因「模型未知」缓存超上限共丢弃 {dropped_no_model} 行（累计 {}）",
                 jsonl.display(),
                 state.dropped_no_model
             );
-        }
-        // **W-13 调用纪律**：`b.session(...)` 每会话**只调一次**（就在此处，循环之外）→
-        // `DeltaBuilder::session` 里那次 `record_project_for`（内含 `canonicalize`，本域唯一的
-        // 非纯函数）也就每会话一次；逐记录一律只走**零 FS** 的 `project_key_of(cwd)`（上面建 key 处）。
-        // 机械锁在共用层：`collectors::tests::record_project_is_called_once_per_session_not_per_record`。
-        // **本调用点拿不到独立的机械锁**（已用变异实证、如实登记）：`RECORD_PROJECT_CALLS` 只在
-        // `record_project_for` 里自增，采集器即使**逐记录直连** `project::record_project` 也数不着
-        // （mod.rs 的 W-13 注记已声明这半是「部分覆盖」），所以此处只做读码级核对——
-        // 评审请核这一行是否仍在循环外（真机 266 行，挂进循环就是 266 次 syscall）。
-        b.session(&id, Some(&cwd), title, false, None, None, ctx.now_ms);
-        // **W-50 口径**：`parsed_files` = 本轮**真读到**的文件数（走到了这里 = 真的读了）。
-        // 循环开头的 `find_session_jsonl(...) else { continue }`（没有 jsonl 的会话）与
-        // `read.lines.is_empty() && !read.rescan`（未变更文件）都在计数**之前**退出 →
-        // 未变更文件的第二轮计 0，与 claude / codex / kimi 同口径（不得改成逐会话累加）。
-        b.parsed_files += 1;
-        let mut next = read.next;
-        // 序列化失败**不得静默**：写空的 `state_json` 会让下一轮反序列化失败并重置续读状态
-        // （跨轮未配对调用与模型继承一起丢）→ warn（下一轮的 warn 会再报一次，两处都可见）
-        next.state_json = match serde_json::to_string(&state) {
-            Ok(s) => s,
-            Err(e) => {
-                log::warn!(
+    }
+    // **W-13 调用纪律**：`b.session(...)` 每会话**只调一次**（就在此处，循环之外）→
+    // `DeltaBuilder::session` 里那次 `record_project_for`（内含 `canonicalize`，本域唯一的
+    // 非纯函数）也就每会话一次；逐记录一律只走**零 FS** 的 `project_key_of(cwd)`（上面建 key 处）。
+    // 机械锁在共用层：`collectors::tests::record_project_is_called_once_per_session_not_per_record`。
+    // **本调用点拿不到独立的机械锁**（已用变异实证、如实登记）：`RECORD_PROJECT_CALLS` 只在
+    // `record_project_for` 里自增，采集器即使**逐记录直连** `project::record_project` 也数不着
+    // （mod.rs 的 W-13 注记已声明这半是「部分覆盖」），所以此处只做读码级核对——
+    // 评审请核这一行是否仍在循环外（真机 266 行，挂进循环就是 266 次 syscall）。
+    b.session(
+        session_id,
+        Some(cwd),
+        title,
+        is_subagent,
+        parent_session_id,
+        None,
+        ctx.now_ms,
+    );
+    // **W-50 口径**：`parsed_files` = 本轮**真读到**的文件数（走到了这里 = 真的读了）。
+    // 调用方的 `find_session_jsonl(...) else { continue }`（没有 jsonl 的会话）与
+    // `read.lines.is_empty() && !read.rescan`（未变更文件）都在计数**之前**退出 →
+    // 未变更文件的第二轮计 0，与 claude / codex / kimi 同口径（不得改成逐会话累加）。
+    b.parsed_files += 1;
+    let mut next = read.next;
+    // 序列化失败**不得静默**：写空的 `state_json` 会让下一轮反序列化失败并重置续读状态
+    // （跨轮未配对调用与模型继承一起丢）→ warn（下一轮的 warn 会再报一次，两处都可见）
+    next.state_json = match serde_json::to_string(&state) {
+        Ok(s) => s,
+        Err(e) => {
+            log::warn!(
                     "usage/workbuddy: {} 的游标状态序列化失败（下一轮会按 rescan 语义重置该文件续读状态）: {e}",
                     jsonl.display()
                 );
-                String::new()
-            }
-        };
-        b.push_cursor(next);
-    }
-    Ok(b.finish())
+            String::new()
+        }
+    };
+    b.push_cursor(next);
+    Ok(true)
 }
 
 /// 会话枚举。**失败必须整源响亮失败**（评审裁决 A / plan-mandated）：`open_usage_db` 的探针
