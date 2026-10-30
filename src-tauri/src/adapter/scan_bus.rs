@@ -217,6 +217,36 @@ fn event_min_gap(interval: Duration) -> Duration {
     interval.min(EVENT_MIN_GAP_CAP)
 }
 
+/// 事件延后剩余时长（纯函数）：距上次扫描不足最小间隔 → Some(剩余)；
+/// 已过最小间隔 → None（立即扫描）。
+fn event_wait_plan(elapsed: Duration, interval: Duration) -> Option<Duration> {
+    let gap = event_min_gap(interval);
+    (elapsed < gap).then(|| gap - elapsed)
+}
+
+/// 事件延后等待（R2，可测）：在最小间隔内用 `recv_timeout` 等**新的唤醒**——
+/// 收到 Event 继续合并等待；收到 Action/ColdStart 等非 Event 原因立即中断并以该
+/// 原因扫描；超时以原 Event 原因照常扫描；通道断开同样按当前原因继续（外层下一圈退出）。
+///
+/// 不得改回裸 `sleep`：睡在扫描线程里会让 Action 排队，而动作路径等待上限 3s
+/// 短于事件最小间隔上限 5s ⇒ 动作必然超时读到旧快照。
+fn wait_event_defer(
+    rx: &mpsc::Receiver<ScanReason>,
+    reason: ScanReason,
+    elapsed: impl Fn() -> Duration,
+    interval: Duration,
+) -> ScanReason {
+    while let Some(remaining) = event_wait_plan(elapsed(), interval) {
+        match rx.recv_timeout(remaining) {
+            Ok(ScanReason::Event) => continue,
+            Ok(other) => return other,
+            Err(mpsc::RecvTimeoutError::Timeout) => break,
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    reason
+}
+
 /// 单飞扫描：并发调用者等待同一次扫描（返回同一快照）
 fn scan_once() -> Arc<Snapshot> {
     scan_once_with_limit(SCAN_WAIT_LIMIT)
@@ -335,7 +365,8 @@ pub fn start(app: tauri::AppHandle) {
         loop {
             // 取因必须留在 catch_unwind 之外：本轮无论是否 panic，下一圈都要回到
             // recv_timeout 继续接收唤醒——线程自杀式退出等于看板永久冻结
-            let reason = if first {
+            // mut：事件延后等待可能被 Action 中断并以新原因扫描（R2）
+            let mut reason = if first {
                 first = false;
                 ScanReason::ColdStart
             } else {
@@ -363,13 +394,16 @@ pub fn start(app: tauri::AppHandle) {
                 // 事件合并节流：仅压**孤立** Event；Action 补扫与冷启动不得被丢弃，
                 // 与 Event 同批的积压原因（burst_has_job）也不得被这条节流吞掉。
                 // 节流动作是「延后」而非「丢弃」：Away 档下一次周期扫描要等 30s，
-                // hook 事件文件 30s TTL 会先过期——孤立事件必须在最小间隔处补扫
+                // hook 事件文件 30s TTL 会先过期——孤立事件必须在最小间隔处补扫。
+                // R2：等待期间用 recv_timeout 监听新唤醒——Event 合并继续等，
+                // Action/ColdStart 立即中断（不得裸睡阻塞动作路径）
                 if matches!(reason, ScanReason::Event) && !burst_has_job {
-                    let gap = event_min_gap(cadence.mode().interval());
-                    let elapsed = last_scan.elapsed();
-                    if elapsed < gap {
-                        std::thread::sleep(gap - elapsed);
-                    }
+                    reason = wait_event_defer(
+                        &rx,
+                        reason,
+                        || last_scan.elapsed(),
+                        cadence.mode().interval(),
+                    );
                 }
                 let scan_started = Instant::now();
                 let snap = scan_once();
@@ -648,8 +682,8 @@ mod tests {
         );
     }
 
-    /// Fix 1 回归锁：孤立 Event 不得被丢弃——必须**延后**到事件最小间隔后照常扫描。
-    /// 源码锁只扫实现处分支（文件前半），避免测试自身的字面量造成假绿。
+    /// Fix 1 回归锁（R2 更新）：孤立 Event 不得被丢弃，也不得用裸 sleep 阻塞扫描线程
+    /// （Action 会被排队到 5s，而动作等待上限 3s）。必须用 recv_timeout 等新唤醒。
     #[test]
     fn event_throttle_delays_instead_of_dropping() {
         let src = include_str!("scan_bus.rs");
@@ -663,12 +697,24 @@ mod tests {
             "孤立 Event 不得被丢弃（应延后扫描），实际分支: {branch}"
         );
         assert!(
-            branch.contains("sleep"),
-            "孤立 Event 应等待最小间隔后照常扫描，实际分支: {branch}"
+            !branch.contains("sleep("),
+            "事件延后不得裸睡（会阻塞 Action），实际分支: {branch}"
         );
         assert!(
-            src.contains("fn event_min_gap("),
-            "事件最小间隔须为独立纯函数（可单测）"
+            branch.contains("wait_event_defer"),
+            "事件延后必须走可中断等待（recv_timeout），实际分支: {branch}"
+        );
+        let wait_fn = src
+            .find("fn wait_event_defer(")
+            .expect("缺少 wait_event_defer");
+        let wait_body = &src[wait_fn..(wait_fn + 900).min(src.len())];
+        assert!(
+            wait_body.contains("recv_timeout"),
+            "wait_event_defer 必须用 recv_timeout 等新唤醒"
+        );
+        assert!(
+            src.contains("fn event_min_gap(") && src.contains("fn wait_event_defer("),
+            "事件最小间隔与可中断等待须为独立纯函数（可单测）"
         );
     }
 
@@ -720,6 +766,86 @@ mod tests {
         assert_eq!(
             hang_alert_age(true, 10_000, alert_at + 120_000, alert_at),
             Some(alert_at + 120_000 - 10_000)
+        );
+    }
+
+    /// R2：事件延后期间不得裸睡——必须用 recv_timeout 等新唤醒：
+    /// Event 合并继续等、Action/ColdStart 立即中断、超时照常扫描。
+    #[test]
+    fn event_defer_plan_uses_remaining_gap_only() {
+        assert_eq!(
+            event_wait_plan(Duration::ZERO, Duration::from_secs(2)),
+            Some(Duration::from_secs(2))
+        );
+        assert_eq!(
+            event_wait_plan(Duration::from_millis(1_500), Duration::from_secs(2)),
+            Some(Duration::from_millis(500))
+        );
+        assert_eq!(
+            event_wait_plan(Duration::from_secs(2), Duration::from_secs(2)),
+            None,
+            "已过最小间隔应立即扫描"
+        );
+        assert_eq!(
+            event_wait_plan(Duration::from_secs(5), Duration::from_secs(30)),
+            None,
+            "Away 档超过 5s 上限同样立即扫描"
+        );
+    }
+
+    #[test]
+    fn event_defer_merges_events_then_scans() {
+        let (tx, rx) = mpsc::channel();
+        tx.send(ScanReason::Event).unwrap();
+        let calls = std::cell::Cell::new(0u32);
+        let elapsed = || {
+            let n = calls.get();
+            calls.set(n + 1);
+            if n == 0 {
+                Duration::ZERO
+            } else {
+                Duration::from_secs(2)
+            }
+        };
+        let reason = wait_event_defer(&rx, ScanReason::Event, elapsed, Duration::from_secs(2));
+        assert!(matches!(reason, ScanReason::Event));
+        assert!(calls.get() >= 2, "合并一条 Event 后必须重新判定剩余间隔");
+    }
+
+    #[test]
+    fn event_defer_interrupts_immediately_on_action() {
+        let (tx, rx) = mpsc::channel();
+        tx.send(ScanReason::Action).unwrap();
+        let started = Instant::now();
+        let reason = wait_event_defer(
+            &rx,
+            ScanReason::Event,
+            || Duration::ZERO,
+            Duration::from_secs(30),
+        );
+        assert!(matches!(reason, ScanReason::Action), "Action 必须中断等待");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "Action 不得被 5s 事件间隔卡住（实际 {:?}）",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn event_defer_scans_after_timeout() {
+        let (_tx, rx) = mpsc::channel::<ScanReason>(); // 持住 sender，避免 Disconnected
+        let started = Instant::now();
+        let reason = wait_event_defer(
+            &rx,
+            ScanReason::Event,
+            || Duration::ZERO,
+            Duration::from_millis(50),
+        );
+        assert!(matches!(reason, ScanReason::Event));
+        assert!(
+            started.elapsed() >= Duration::from_millis(40),
+            "超时后应照常扫描（实际 {:?}）",
+            started.elapsed()
         );
     }
 
