@@ -8,6 +8,7 @@ pub mod dsh;
 pub mod kimi;
 pub mod openclaw;
 pub mod opencode;
+pub mod scan_bus;
 pub mod workbuddy;
 pub mod zcode;
 
@@ -586,7 +587,7 @@ fn event_payload(event: Option<&crate::monitor::hooks::HookEvent>) -> Option<&st
 }
 
 /// 实际扫描（单飞壳内执行；成功路径与原实现一致）
-fn get_all_sessions_inner() -> SessionsResponse {
+pub(crate) fn get_all_sessions_inner() -> SessionsResponse {
     // W5：未勾选工具不参与会话扫描（看板卡/通知随之静默）
     let adapters: Vec<Box<dyn AgentAdapter>> = enabled_adapters();
 
