@@ -740,7 +740,7 @@ pub const MAX_PENDING_DETAIL_CHARS: usize = 2000;
 /// 2. 2000 字符有界截断（[`MAX_PENDING_DETAIL_CHARS`]）；
 /// 3. 不落盘（无 DB/账本写入）；
 /// 4. 不写日志（本函数不做任何日志/错误回显，`ZcodeError` 不携带 cause）。
-/// 若后续要加掩码，需产品重新裁决，并同步桌面端展示口径。
+///    若后续要加掩码，需产品重新裁决，并同步桌面端展示口径。
 pub fn project_pending_detail(detail: Option<&Value>) -> Option<String> {
     let value = detail?;
     let text = match value {

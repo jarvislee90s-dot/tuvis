@@ -15,7 +15,7 @@
 // - autoResolution 首次有效编辑只补发一次 snooze；sensitive 值只留内存（不落存储）。
 // - 审批只渲染 allowOnce/deny（纵向），`fullAccess`/`allowAlways`/`allowSession` 一律
 //   不开放；`detail`（Bash 命令正文）默认折叠、展开只读、不参与提交。
-import type { ComponentProps } from "react";
+import { useLayoutEffect, type ComponentProps } from "react";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import i18n from "@/i18n";
@@ -227,6 +227,60 @@ function baseProps(overrides: Partial<CardProps> = {}): CardProps {
     ...overrides,
   };
 }
+
+/**
+ * 首帧点击探针：在「首帧 DOM 已提交、`useEffect` 尚未 flush」的窗口里真实点一次。
+ *
+ * 为什么必须这么做（而不是 `await act(async () => {})` / `setTimeout` 后再点）：那两种
+ * 写法会**先把挂载 effect 跑完**再点，恰好绕开本缺陷要暴露的窗口——真实浏览器/真人
+ * 完全可能在首帧刚上屏时就点到（卡在首帧就是可用的，按钮也不该在这段时间里「假死」）。
+ * `useLayoutEffect` 在提交阶段末尾运行，早于任何 passive effect，正好落在这个窗口内。
+ *
+ * 用原生 `element.click()` 而不是 `fireEvent`：`fireEvent` 自带 `act` 包裹，会把
+ * pending 的 passive effect 一起冲掉，窗口就消失了。
+ */
+function ClickOnFirstFrame({ testId }: { testId: string }) {
+  useLayoutEffect(() => {
+    document.querySelector<HTMLButtonElement>(`[data-testid="${testId}"]`)?.click();
+  }, [testId]);
+  return null;
+}
+
+describe("ZCode 待处理卡：首帧即可用", () => {
+  it("first_frame_click_is_not_swallowed_by_mount_reset", () => {
+    // 缺陷实测形状：多选卡首帧就点，选中态被「挂载重置」effect 的首跑抹掉，
+    // 表现为「第一次点击没反应，再点一次才生效」（曾导致 6%–25% 偶发超时）。
+    const { fn, calls } = makeSubmit();
+    const pending = pendingView({
+      questions: [
+        questionView({
+          multiSelect: true,
+          options: [
+            { value: "ff-a", label: "首帧甲", description: null, preview: null },
+            { value: "ff-b", label: "首帧乙", description: null, preview: null },
+          ],
+        }),
+      ],
+    });
+    render(
+      <>
+        <ZcodePendingCard {...baseProps({ pending, submit: fn })} />
+        <ClickOnFirstFrame testId="zcode-pending-option-0" />
+      </>
+    );
+
+    // render 结束时 passive effect 已全部 flush：此时选中态必须仍然成立，
+    // 不能被挂载重置吞掉（否则这里拿到的是 "false"）。
+    expect(screen.getByTestId("zcode-pending-option-0")).toHaveAttribute("aria-pressed", "true");
+    // 首帧点击同样只做本地暂存，不产生任何请求。
+    expect(calls).toHaveLength(0);
+    // 用户视角：点一次就够，不需要「再点一次」。
+    fireEvent.click(screen.getByTestId("zcode-pending-option-1"));
+    expect(screen.getByTestId("zcode-pending-option-0")).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByTestId("zcode-pending-option-1")).toHaveAttribute("aria-pressed", "true");
+    expect(calls).toHaveLength(0);
+  });
+});
 
 describe("ZCode 待处理卡：逐题分页", () => {
   it("three_questions_show_one_at_a_time_with_vertical_options", () => {

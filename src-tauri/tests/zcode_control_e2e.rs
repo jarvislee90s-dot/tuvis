@@ -1011,6 +1011,9 @@ fn question_card() -> PendingView {
             free_text_allowed: false,
         }],
         options: Vec::new(),
+        // 问答卡没有「将被执行的命令原文」：官方 AskUserQuestion 的 payload 不带
+        // `detail`，投影结果就是 None（卡上不出现空的详情入口）。
+        detail: None,
     }
 }
 
@@ -1033,6 +1036,10 @@ fn permission_card() -> PendingView {
             label: "允许一次".to_owned(),
             kind: "allowOnce".to_owned(),
         }],
+        // Bash 审批卡的 `detail` 就是命令原文（只读投影给手机端展示）。
+        // 本用例断言的是「一帧 resolveInteraction 且 optionId 回传宿主原值」与撤卡后
+        // confirmed，命令正文不参与任何应答载荷，也不得进审计摘要。
+        detail: Some("ls -la /tmp/tuvis-e2e-scratch".to_owned()),
     }
 }
 
@@ -1270,6 +1277,9 @@ fn old_pending_card() -> PendingView {
         auto_resolution_state: None,
         questions: Vec::new(),
         options: Vec::new(),
+        // 旧代际的问答卡没有工具调用（tool_call_id / tool_name 均缺省），
+        // 也就没有官方 payload.detail 可投影 → None。
+        detail: None,
     }
 }
 
