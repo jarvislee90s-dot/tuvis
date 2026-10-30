@@ -33,12 +33,18 @@ pub async fn get_all_sessions(app: tauri::AppHandle) -> SessionsResponse {
 }
 
 /// 扫描总线状态（前端档位跟随的观测口）：mode 为 active/idle/away（serde lowercase），
-/// version 为快照发布版本（单调递增，前端据此判断数据是否已刷新）
+/// version 为快照发布版本（单调递增，前端据此判断数据是否已刷新）。
+/// F3 裁决「诊断字段即可」：`degraded` = 扫描疑似 hang（在飞超 120s，需重启恢复）；
+/// `snapshotAgeMs` = 最近快照龄（毫秒；无快照为 null）——补扫超时降级时可查
 #[tauri::command]
 pub fn scan_bus_status() -> serde_json::Value {
+    let snapshot_age_ms =
+        crate::adapter::scan_bus::snapshot().map(|s| s.scanned_at.elapsed().as_millis() as u64);
     serde_json::json!({
         "mode": crate::adapter::scan_bus::mode(),
         "version": crate::adapter::scan_bus::version(),
+        "degraded": crate::adapter::scan_bus::is_degraded(),
+        "snapshotAgeMs": snapshot_age_ms,
     })
 }
 
@@ -61,6 +67,35 @@ fn normalize_watch_source(source: Option<String>) -> String {
     match source.map(|s| s.trim().to_string()) {
         Some(s) if !s.is_empty() => s,
         _ => "main".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod scan_bus_status_tests {
+    use super::*;
+
+    /// Fix 2 诊断字段回归锁：`scan_bus_status` 必须给出降级标志与快照龄——
+    /// F3 裁决是「诊断字段即可」，前端/巡检据此区分「新鲜」与「补扫超时降级」。
+    #[test]
+    fn status_reports_degraded_flag_and_snapshot_age() {
+        let _guard = crate::adapter::scan_bus::test_guard();
+        crate::adapter::scan_bus::reset_for_test();
+        crate::adapter::scan_bus::publish_for_test(|| SessionsResponse {
+            sessions: Vec::new(),
+            total_count: 0,
+            waiting_count: 0,
+        });
+        let v = scan_bus_status();
+        assert_eq!(
+            v.get("degraded").and_then(|x| x.as_bool()),
+            Some(false),
+            "无在飞扫描时不得标记 degraded"
+        );
+        assert!(
+            v.get("snapshotAgeMs").and_then(|x| x.as_u64()).is_some(),
+            "有快照时必须给出 snapshotAgeMs"
+        );
+        assert_eq!(v.get("version").and_then(|x| x.as_u64()), Some(1));
     }
 }
 

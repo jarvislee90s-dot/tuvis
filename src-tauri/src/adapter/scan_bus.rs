@@ -1,7 +1,7 @@
 //! 扫描总线：进程内唯一的会话扫描者。
 //! 产出 Arc<Snapshot>（版本单调），所有消费方读快照；事件唤醒与动作路径补扫共用同一把单飞。
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -43,9 +43,20 @@ static WATCH_UNTIL: Lazy<Mutex<std::collections::HashMap<String, i64>>> =
     Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
 static TX: OnceLock<mpsc::Sender<ScanReason>> = OnceLock::new();
 static IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+/// 在飞扫描的起始时刻（毫秒）；0 = 无在飞扫描。看门狗据此判定疑似 hang
+static SCAN_STARTED_MS: AtomicI64 = AtomicI64::new(0);
 
 /// 事件触发扫描的最小间隔上限（Away 档 30s 的间隔会让 hook 事件在 TTL 内等不到扫描）
 const EVENT_MIN_GAP_CAP: Duration = Duration::from_secs(5);
+/// 等待在飞扫描的上限：超过后按最近快照降级返回，动作路径不被卡死的扫描拖住
+const SCAN_WAIT_LIMIT: Duration = Duration::from_secs(5);
+/// 看门狗阈值：在飞超过该时长视为疑似 hang（只告警，**不强杀**——清在飞位会放进
+/// 第二份并发扫描，hang 需重启恢复，诊断口见 `scan_bus_status.degraded`）
+const HANG_THRESHOLD_MS: i64 = 120_000;
+/// 同一段 hang 的告警最小间隔
+const HANG_ALERT_INTERVAL_MS: i64 = 120_000;
+/// 看门狗巡检周期
+const WATCHDOG_PERIOD: Duration = Duration::from_secs(5);
 /// 「有人在看」心跳的有效期
 const WATCH_TTL_MS: i64 = 90_000;
 /// 托盘无状态变化时的最长刷新间隔
@@ -159,25 +170,80 @@ fn event_min_gap(interval: Duration) -> Duration {
 
 /// 单飞扫描：并发调用者等待同一次扫描（返回同一快照）
 fn scan_once() -> Arc<Snapshot> {
+    scan_once_with_limit(SCAN_WAIT_LIMIT)
+}
+
+/// 单飞内核；等待上限参数化（测试用短上限验证「超时降级」而不真等 5s）。
+///
+/// 超时语义：返回最近快照（无快照则返回空响应快照，**不发布**、不推进版本）；
+/// 在飞位保持不动——清位会让等待方又抢到单飞，并发产生第二份扫描。
+fn scan_once_with_limit(wait_limit: Duration) -> Arc<Snapshot> {
     // IN_FLIGHT 表示已有扫描在跑；其他调用者自旋等待其结果，避免重复全量扫描
     if IN_FLIGHT.swap(true, Ordering::SeqCst) {
+        let deadline = Instant::now() + wait_limit;
         while IN_FLIGHT.load(Ordering::SeqCst) {
+            if Instant::now() >= deadline {
+                log::warn!(
+                    "scan_bus: 等待在飞扫描超时（{:?}），按最近快照降级返回",
+                    wait_limit
+                );
+                return snapshot().unwrap_or_else(empty_snapshot);
+            }
             std::thread::sleep(Duration::from_millis(10));
         }
         return match snapshot() {
             Some(s) => s,
             // 上一次扫描在首次发布前 panic：本线程重新抢单飞再扫一次（不向调用方抛 panic）
-            None => scan_once(),
+            None => scan_once_with_limit(wait_limit),
         };
     }
+    SCAN_STARTED_MS.store(now_ms(), Ordering::SeqCst);
     struct Clear;
     impl Drop for Clear {
         fn drop(&mut self) {
             IN_FLIGHT.store(false, Ordering::SeqCst);
+            // panic unwind 同样走这里：看门狗不会把已展开的扫描误报成 hang
+            SCAN_STARTED_MS.store(0, Ordering::SeqCst);
         }
     }
     let _clear = Clear;
     publish(super::get_all_sessions_inner())
+}
+
+/// 无快照时的降级产物：不发布、不推进版本，仅让调用方拿到结构合法的空响应
+fn empty_snapshot() -> Arc<Snapshot> {
+    Arc::new(Snapshot {
+        version: VERSION.load(Ordering::SeqCst),
+        scanned_at: Instant::now(),
+        data: SessionsResponse {
+            sessions: Vec::new(),
+            total_count: 0,
+            waiting_count: 0,
+        },
+    })
+}
+
+/// 诊断：扫描是否疑似 hang（在飞且超过阈值）。`scan_bus_status.degraded` 的数据源。
+/// 判定**不**清在飞位：hang 只能靠重启恢复，强杀会放进第二份并发扫描。
+pub fn is_degraded() -> bool {
+    let started = SCAN_STARTED_MS.load(Ordering::SeqCst);
+    IN_FLIGHT.load(Ordering::SeqCst) && started > 0 && now_ms() - started > HANG_THRESHOLD_MS
+}
+
+/// 看门狗判定（纯函数）：返回应告警的扫描龄（毫秒），None = 本拍不告警。
+/// 同一段 hang 每 120s 最多告警一次（last_alert_ms = 上次告警时刻，0 = 尚未告警）。
+fn hang_alert_age(in_flight: bool, started_ms: i64, now: i64, last_alert_ms: i64) -> Option<i64> {
+    if !in_flight || started_ms <= 0 {
+        return None;
+    }
+    let age = now - started_ms;
+    if age <= HANG_THRESHOLD_MS {
+        return None;
+    }
+    if last_alert_ms > 0 && now - last_alert_ms < HANG_ALERT_INTERVAL_MS {
+        return None;
+    }
+    Some(age)
 }
 
 /// 发布新快照：版本单调递增，写入瞬间对读者可见。
@@ -294,6 +360,31 @@ pub fn start(app: tauri::AppHandle) {
             }
         }
     });
+    // 看门狗：扫描线程被卡死（非 panic）时 IN_FLIGHT 永真、档位与托盘停摆。
+    // 只告警不干预：清在飞位会让等待方抢到单飞、并发第二份扫描（双份快照/双倍 IO）。
+    std::thread::spawn(move || {
+        let mut last_alert_ms = 0i64;
+        loop {
+            std::thread::sleep(WATCHDOG_PERIOD);
+            let now = now_ms();
+            if let Some(age) = hang_alert_age(
+                IN_FLIGHT.load(Ordering::SeqCst),
+                SCAN_STARTED_MS.load(Ordering::SeqCst),
+                now,
+                last_alert_ms,
+            ) {
+                last_alert_ms = now;
+                log::error!(
+                    "scan_bus: 扫描疑似 hang（已 {}ms 未完成）——不强杀在飞扫描，需重启恢复",
+                    age
+                );
+                crate::remote::events::emit_ui(
+                    "scan-bus-degraded",
+                    serde_json::json!({ "ageMs": age }),
+                );
+            }
+        }
+    });
 }
 
 /// 托盘状态：状态变化立即刷新，无变化时最多每 30s 刷一次
@@ -351,6 +442,18 @@ pub fn reset_for_test() {
         .unwrap_or_else(|e| e.into_inner())
         .clear();
     IN_FLIGHT.store(false, Ordering::SeqCst);
+    SCAN_STARTED_MS.store(0, Ordering::SeqCst);
+}
+
+/// 单测用：占位/释放「在飞扫描」（模拟卡住的扫描，验证等待上限与诊断口）
+#[cfg(test)]
+pub(crate) fn set_in_flight_for_test(on: bool) {
+    IN_FLIGHT.store(on, Ordering::SeqCst);
+    if on {
+        SCAN_STARTED_MS.store(now_ms(), Ordering::SeqCst);
+    } else {
+        SCAN_STARTED_MS.store(0, Ordering::SeqCst);
+    }
 }
 
 /// 单测用：发布一份由闭包产出的快照
@@ -515,6 +618,57 @@ mod tests {
         assert!(
             src.contains("fn event_min_gap("),
             "事件最小间隔须为独立纯函数（可单测）"
+        );
+    }
+
+    /// Fix 2：扫描 hang 时等待方必须有上限——超时返回最近快照（版本不变），
+    /// 且**不得**清掉在飞位（否则会放进第二份并发扫描）。
+    #[test]
+    fn scan_wait_timeout_returns_recent_snapshot_without_version_bump() {
+        let _guard = test_guard();
+        reset_for_test();
+        let seeded = publish_for_test(|| resp(SessionStatus::Idle));
+        set_in_flight_for_test(true); // 模拟一次卡住的在飞扫描
+        let started = Instant::now();
+        let got = scan_once_with_limit(Duration::from_millis(100));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "等待上限必须生效（实际 {:?}）",
+            started.elapsed()
+        );
+        assert_eq!(
+            got.version, seeded.version,
+            "超时应返回旧快照，不发布新版本"
+        );
+        assert_eq!(version(), seeded.version, "超时不得推进版本号");
+        assert!(
+            IN_FLIGHT.load(Ordering::SeqCst),
+            "等待方不得清掉在飞位（并发第二份扫描会污染快照）"
+        );
+        set_in_flight_for_test(false);
+    }
+
+    /// Fix 2：看门狗判定（纯函数）——超阈值才告警，同一段 hang 每 120s 最多一次。
+    /// 刻意**不**做「超时强杀」：清在飞位会放进第二份并发扫描，hang 只能靠重启恢复。
+    #[test]
+    fn hang_alert_fires_after_threshold_and_not_repeats_within_interval() {
+        // 未在飞 / 无起点 → 不告警
+        assert_eq!(hang_alert_age(false, 1_000, 200_000, 0), None);
+        assert_eq!(hang_alert_age(true, 0, 200_000, 0), None);
+        // 恰在阈值上不算超（必须 > 120s）
+        assert_eq!(hang_alert_age(true, 10_000, 10_000 + 120_000, 0), None);
+        let first = hang_alert_age(true, 10_000, 10_000 + 120_001, 0);
+        assert_eq!(first, Some(120_001));
+        // 上次告警后 120s 内不重复
+        let alert_at = 10_000 + 120_001;
+        assert_eq!(
+            hang_alert_age(true, 10_000, alert_at + 119_999, alert_at),
+            None
+        );
+        // 满 120s 再告警
+        assert_eq!(
+            hang_alert_age(true, 10_000, alert_at + 120_000, alert_at),
+            Some(alert_at + 120_000 - 10_000)
         );
     }
 
