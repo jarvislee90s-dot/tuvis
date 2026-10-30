@@ -429,7 +429,7 @@ fn resolve_subagent_session_id(
             .unwrap_or_else(|| "unknown-subagent".to_string())
     };
     match preferred.or(fallback) {
-        Some(id) if id == parent_id || main_session_ids.iter().any(|m| *m == id) => {
+        Some(id) if id == parent_id || main_session_ids.contains(&id) => {
             log::warn!(
                 "usage/workbuddy: 子代理文件 {} 的 sessionId {id} 命中主会话 id（父 {parent_id}）\
                  ——拒绝该身份，回退文件名 stem「{}」（否则会把主会话不可逆地标成子代理）",
@@ -506,7 +506,7 @@ fn collect_file(
         // **解析失败不得静默重置**（形状演进时旧游标会连 `tools` / `last_model` 一起丢：
         // 表现为 `tool_ms` 少算 + 模型继承失效，且没有任何信号）→ warn + 按 rescan 语义处理
         // （重置本身语义等价，但它现在**可见**了）。
-        match ctx.cursor_of(&file_key) {
+        match ctx.cursor_of(file_key) {
             Some(p) => match serde_json::from_str::<WbState>(&p.state_json) {
                 Ok(s) => s,
                 Err(e) => {
@@ -610,7 +610,7 @@ fn collect_file(
                 is_subagent,
                 ctx.now_ms,
             );
-            warn_unattributed(&jsonl, left);
+            warn_unattributed(jsonl, left);
         }
     }
     if dropped_no_model > 0 {
