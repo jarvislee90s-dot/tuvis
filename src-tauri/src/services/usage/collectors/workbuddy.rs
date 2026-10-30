@@ -115,6 +115,7 @@ fn process_line(
     v: &Value,
     session_id: &str,
     cwd: &str,
+    row_cwd_first: bool,
     now_ms: i64,
 ) -> bool {
     let ts = v
@@ -147,9 +148,20 @@ fn process_line(
         session_id: session_id.to_string(),
         hour_key: hour.clone(),
         day_key: hour.chars().take(10).collect(),
-        // 记录级项目键：workbuddy 的归属来自 DB `sessions.cwd`（精确；目录名不可反解）。
-        // 真机复核：266/266 行的行内 `cwd` 与 `sessions.cwd` 逐字相等 → 两者取值等价。
-        project_key: project_key_of(Some(cwd)),
+        // 记录级项目键：父会话的归属来自 DB `sessions.cwd`（精确；目录名不可反解）。
+        // 真机复核：266/266 行的行内 `cwd` 与 `sessions.cwd` 逐字相等 → 两者取值等价，
+        // 因此**父会话维持 DB cwd**（零行为变化，R3 主会话数值不变）。
+        // 子代理文件（`row_cwd_first = true`）优先取**行内** `cwd`：子代理可能跑在别的项目下，
+        // 归属必须按行走；行内缺失时回退父会话 cwd（设计 §2.6）。
+        project_key: project_key_of(Some(if row_cwd_first {
+            v.get("cwd")
+                .and_then(|c| c.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or(cwd)
+        } else {
+            cwd
+        })),
         model,
         provider,
     };
@@ -252,6 +264,7 @@ fn replay_pending(
     state: &mut WbState,
     session_id: &str,
     cwd: &str,
+    row_cwd_first: bool,
     now_ms: i64,
 ) -> i64 {
     let mut unattributed = 0i64;
@@ -259,7 +272,7 @@ fn replay_pending(
         // 进缓存的行一定在主循环解析成功过 → 这里的 Err 理论上不可达（真发生即计数，不静默）
         match serde_json::from_str::<Value>(&line) {
             Ok(v) => {
-                if !process_line(b, state, &v, session_id, cwd, now_ms) {
+                if !process_line(b, state, &v, session_id, cwd, row_cwd_first, now_ms) {
                     unattributed += 1;
                 }
             }
@@ -330,6 +343,10 @@ pub fn collect_with_home(
             None,
             &main_session_ids,
         )?;
+        // R1：同一会话目录下的子代理转写（5.9.3 起为 `<parent>/subagents/*.jsonl`），
+        // 独立游标、独立会话维度（`is_subagent = 1` + `parent_session_id`）。
+        // 父会话游标完全不动 → 不重读父文件。
+        collect_subagents(ctx, &mut b, &root, &jsonl, &id, &cwd, &main_session_ids)?;
     }
     Ok(b.finish())
 }
@@ -536,10 +553,26 @@ fn collect_file(
         b.new_records += 1;
         // 模型已就绪 → 先把缓存行按**原序**重放（它们都排在本行之前）
         if !pending.is_empty() && !state.last_model.is_empty() {
-            let left = replay_pending(&mut pending, b, &mut state, &resolved_id, cwd, ctx.now_ms);
+            let left = replay_pending(
+                &mut pending,
+                b,
+                &mut state,
+                &resolved_id,
+                cwd,
+                is_subagent,
+                ctx.now_ms,
+            );
             warn_unattributed(jsonl, left);
         }
-        if !process_line(b, &mut state, &v, &resolved_id, cwd, ctx.now_ms) {
+        if !process_line(
+            b,
+            &mut state,
+            &v,
+            &resolved_id,
+            cwd,
+            is_subagent,
+            ctx.now_ms,
+        ) {
             if pending.len() < PENDING_LINES_CAP {
                 pending.push(line.clone());
             } else {
@@ -568,7 +601,15 @@ fn collect_file(
             state.dropped_no_model += pending.len() as i64;
             pending.clear();
         } else {
-            let left = replay_pending(&mut pending, b, &mut state, &resolved_id, cwd, ctx.now_ms);
+            let left = replay_pending(
+                &mut pending,
+                b,
+                &mut state,
+                &resolved_id,
+                cwd,
+                is_subagent,
+                ctx.now_ms,
+            );
             warn_unattributed(&jsonl, left);
         }
     }
@@ -619,6 +660,92 @@ fn collect_file(
     };
     b.push_cursor(next);
     Ok(true)
+}
+
+/// 枚举并采集父会话目录下的子代理转写（设计 §2.2）。
+///
+/// 路径只用**父 jsonl 的实际父目录**推导（不用 `mangle(cwd)` 重算）：`find_session_jsonl`
+/// 可能走目录扫描兜底，实际项目目录名与 `mangle(cwd)` 不同。
+///
+/// 错误语义（W-06 / D-24）：`NotFound` / `NotADirectory`（旧会话没有 `subagents/`，或该路径
+/// 被一个普通文件占住）→ 跳过；其余（权限 / IO）→ **整源 `usage-source-io`**，不得静默少算。
+fn collect_subagents(
+    ctx: &CollectContext<'_>,
+    b: &mut DeltaBuilder,
+    root: &std::path::Path,
+    main_jsonl: &std::path::Path,
+    parent_id: &str,
+    cwd: &str,
+    main_session_ids: &[String],
+) -> Result<(), UsageError> {
+    let Some(project_dir) = main_jsonl.parent() else {
+        return Ok(());
+    };
+    let sub_dir = project_dir.join(parent_id).join("subagents");
+    let entries = match std::fs::read_dir(&sub_dir) {
+        Ok(e) => e,
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            // 5.9.3 之前的会话目录里没有 subagents/（真机 10/24 及更早）
+            return Ok(());
+        }
+        Err(e) => {
+            return Err(UsageError::new(
+                "usage-source-io",
+                format!("read_dir {} failed: {e}", sub_dir.display()),
+            ))
+        }
+    };
+    let mut files: Vec<std::path::PathBuf> = Vec::new();
+    for entry in entries {
+        // 条目级错误不得静默（枚举到一半失败 = 这个目录读不了）
+        let entry = entry.map_err(|e| {
+            UsageError::new(
+                "usage-source-io",
+                format!("read_dir {} failed: {e}", sub_dir.display()),
+            )
+        })?;
+        let path = entry.path();
+        // 只读**直接子文件**的 `*.jsonl`（不递归；`tool-results/` 等目录不进）；
+        // 文件名**不限定 `agent-` 前缀**，防上游命名演进
+        if !path.is_file() {
+            continue;
+        }
+        if !path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("jsonl"))
+        {
+            continue;
+        }
+        files.push(path);
+    }
+    // 稳定顺序：目录枚举顺序依文件系统而变，排序让「同一批数据两轮跑出同一份游标/明细序」
+    files.sort();
+    for file in files {
+        // 游标键与父 jsonl 同一规则（相对 `~/.workbuddy` 的路径）→ 与主会话游标互不覆盖
+        let file_key = file_key_of(root, &file);
+        // 首次出现（`ctx.cursor_of(file_key) == None`）→ `read_incremental` 从**字节 0** 读，
+        // 即 D1 裁决的历史回填；此后只读追加字节。
+        collect_file(
+            ctx,
+            b,
+            &file,
+            &file_key,
+            // 身份占位：真正的子代理 sessionId 在 collect_file 加载 WbState 之后解析（A2）
+            "",
+            cwd,
+            None,
+            true,
+            Some(parent_id.to_string()),
+            main_session_ids,
+        )?;
+    }
+    Ok(())
 }
 
 /// 会话枚举。**失败必须整源响亮失败**（评审裁决 A / plan-mandated）：`open_usage_db` 的探针
@@ -1716,6 +1843,172 @@ mod tests {
         let (id, degraded) = resolve_subagent_session_id(&p, PARENT_ID, &mains);
         assert_eq!(id, stem, "命中任一主会话 id 都必须拒绝");
         assert!(degraded);
+    }
+
+    // ---- A3：子代理目录枚举与独立入账（真机 5.9.3 形态）----
+
+    /// 真机路径形态：`~/.workbuddy/projects/<mangled-cwd>/<parentSessionId>/subagents/<name>.jsonl`
+    fn write_subagent_jsonl(
+        home: &std::path::Path,
+        project_dir: &str,
+        parent_id: &str,
+        file_name: &str,
+        lines: &[Value],
+    ) -> std::path::PathBuf {
+        let dir = home
+            .join(".workbuddy/projects")
+            .join(project_dir)
+            .join(parent_id)
+            .join("subagents");
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join(file_name);
+        let body: String = lines
+            .iter()
+            .map(|l| format!("{}\n", serde_json::to_string(l).unwrap()))
+            .collect();
+        std::fs::write(&p, body).unwrap();
+        p
+    }
+
+    /// 父 + 2 个子代理文件：token 总量 = 三者之和；会话维度 = 1 父(false) + 2 子(true，父 id 正确)
+    #[test]
+    fn subagent_files_are_collected_as_separate_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        make_db(dir.path(), &[("s1", "/p/A")]);
+        write_jsonl(
+            dir.path(),
+            "p-A",
+            "s1",
+            &[
+                json!({"type":"function_call","name":"Bash","timestamp":1000,"callId":"c1",
+                     "cwd":"/p/A","sessionId":"s1",
+                     "message":{"usage":{"input_tokens":100,"output_tokens":10,"total_tokens":110}},
+                     "providerData":{"model":"deepseek-v4.1-flash"}}),
+            ],
+        );
+        write_subagent_jsonl(
+            dir.path(),
+            "p-A",
+            "s1",
+            &format!("agent-{OTHER_UUID}.jsonl"),
+            &[
+                json!({"type":"message","role":"user","timestamp":1500,"cwd":"/p/A",
+                       "sessionId":SUBAGENT_ID}),
+                json!({"type":"function_call","name":"Read","timestamp":2000,"callId":"sc1",
+                       "cwd":"/p/A","sessionId":SUBAGENT_ID,
+                       "message":{"usage":{"input_tokens":1000,"output_tokens":100,"total_tokens":1100}},
+                       "providerData":{"model":"deepseek-v4.1-flash","isSubAgent":true}}),
+            ],
+        );
+        write_subagent_jsonl(
+            dir.path(),
+            "p-A",
+            "s1",
+            "agent-second.jsonl",
+            &[
+                json!({"type":"function_call","name":"Bash","timestamp":2500,"callId":"sc2",
+                       "cwd":"/p/A","sessionId":OTHER_UUID,
+                       "message":{"usage":{"input_tokens":2000,"output_tokens":200,"total_tokens":2200}},
+                       "providerData":{"model":"deepseek-v4.1-flash","isSubAgent":true}}),
+            ],
+        );
+        let no_cursors = HashMap::new();
+        let (delta, _) = run(dir.path(), &no_cursors);
+
+        // token 总量 = 父 + 两个子代理
+        assert_eq!(
+            delta
+                .details
+                .iter()
+                .map(|d| d.buckets.input_fresh)
+                .sum::<i64>(),
+            3100,
+            "100(父) + 1000(子1) + 2000(子2)"
+        );
+        assert_eq!(
+            delta.details.iter().map(|d| d.buckets.output).sum::<i64>(),
+            310
+        );
+        assert_eq!(
+            delta.details.iter().map(|d| d.requests).sum::<i64>(),
+            3,
+            "一次 message.usage = 一次请求，父/子互不重复"
+        );
+        // 会话维度：1 父 + 2 子，归属正确
+        assert_eq!(delta.sessions.len(), 3, "父 + 2 子各一行会话维度");
+        let parent = delta
+            .sessions
+            .iter()
+            .find(|s| s.session_id == "s1")
+            .unwrap();
+        assert!(!parent.is_subagent, "父会话不得被子代理文件连坐");
+        assert!(parent.parent_session_id.is_none());
+        for sub in [SUBAGENT_ID, OTHER_UUID] {
+            let s = delta
+                .sessions
+                .iter()
+                .find(|s| s.session_id == sub)
+                .unwrap_or_else(|| panic!("缺少子代理会话维度 {sub}"));
+            assert!(s.is_subagent, "子代理会话必须 is_subagent=true");
+            assert_eq!(
+                s.parent_session_id.as_deref(),
+                Some("s1"),
+                "parent_session_id = 父会话 UUID"
+            );
+            assert!(s.title.is_none(), "子代理会话没有 DB 标题");
+        }
+        // 文件计数：父 + 2 子（W-50「本轮真读到的文件数」）
+        assert_eq!(delta.parsed_files, 3);
+        assert_eq!(delta.new_records, 1 + 2 + 1);
+    }
+
+    /// **旧会话（5.9.3 之前）没有 subagents 目录** → 跳过，不报错、零子代理产物
+    #[test]
+    fn missing_subagent_dir_is_not_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        make_db(dir.path(), &[("s1", "/p/A")]);
+        write_jsonl(
+            dir.path(),
+            "p-A",
+            "s1",
+            &[
+                json!({"type":"message","role":"assistant","timestamp":1000,"cwd":"/p/A",
+                     "sessionId":"s1","content":[{"type":"output_text","text":"ok"}],
+                     "message":{"usage":{"input_tokens":10,"output_tokens":1,"total_tokens":11}},
+                     "providerData":{"model":"deepseek-v4.1-flash"}}),
+            ],
+        );
+        let no_cursors = HashMap::new();
+        let (delta, _) = run(dir.path(), &no_cursors);
+        assert_eq!(delta.sessions.len(), 1);
+        assert_eq!(delta.parsed_files, 1);
+        assert_eq!(delta.details.iter().map(|d| d.requests).sum::<i64>(), 1);
+    }
+
+    /// `subagents` 路径被一个**普通文件**占住（真机证据：macOS `read_dir` 返回
+    /// `NotADirectory`，raw_os_error=20）→ 与「目录不存在」同族，跳过而非整源失败
+    #[test]
+    fn subagent_path_that_is_a_file_is_not_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        make_db(dir.path(), &[("s1", "/p/A")]);
+        write_jsonl(
+            dir.path(),
+            "p-A",
+            "s1",
+            &[
+                json!({"type":"message","role":"assistant","timestamp":1000,"cwd":"/p/A",
+                     "sessionId":"s1","content":[{"type":"output_text","text":"ok"}],
+                     "message":{"usage":{"input_tokens":10,"output_tokens":1,"total_tokens":11}},
+                     "providerData":{"model":"deepseek-v4.1-flash"}}),
+            ],
+        );
+        let blocked = dir.path().join(".workbuddy/projects/p-A/s1/subagents");
+        std::fs::create_dir_all(blocked.parent().unwrap()).unwrap();
+        std::fs::write(&blocked, "not a dir").unwrap();
+        let no_cursors = HashMap::new();
+        let (delta, _) = run(dir.path(), &no_cursors);
+        assert_eq!(delta.sessions.len(), 1);
+        assert_eq!(delta.parsed_files, 1);
     }
 
     /// **登记锁（GC 20 / §3.2.2 阻塞 4）**：漏登记不是编译错——`run_collection` 只遍历
