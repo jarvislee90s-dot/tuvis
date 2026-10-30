@@ -322,8 +322,9 @@ pub fn collect_with_home(
     // **自指/串号防线（设计 §2.3 第 4 条 + 风险表）**：子代理身份解析结果不得等于**任何**
     // DB 主会话 id（不只父 id）——一旦解析成另一个主会话，`usage_session.is_subagent` 会被
     // `MAX()` 不可逆地写成 1，那个主会话就从会话数/turn 层消失。只含 id、只在首次读某子代理
-    // 文件时比较一次（线性、量级 = 会话数），不构成热路径开销。
-    let main_session_ids: Vec<String> = sessions.iter().map(|(id, _, _)| id.clone()).collect();
+    // 文件时比较一次（HashSet，O(1)），不构成热路径开销。
+    let main_session_ids: std::collections::HashSet<String> =
+        sessions.iter().map(|(id, _, _)| id.clone()).collect();
     for (id, cwd, title) in sessions {
         let Some(jsonl) = find_session_jsonl(home, &cwd, &id) else {
             continue;
@@ -397,7 +398,7 @@ fn read_head_lines(path: &std::path::Path, max_bytes: u64, max_lines: usize) -> 
 fn resolve_subagent_session_id(
     path: &std::path::Path,
     parent_id: &str,
-    main_session_ids: &[String],
+    main_session_ids: &std::collections::HashSet<String>,
 ) -> (String, bool) {
     let mut preferred: Option<String> = None;
     let mut fallback: Option<String> = None;
@@ -456,8 +457,7 @@ fn resolve_subagent_session_id(
 /// * 子代理：`session_id` = 自身会话 id（A2 起由文件头解析）、`title = None`、
 ///   `is_subagent = true`、`parent = Some(父会话 id)`
 ///
-/// 返回 `Ok(true)` = 本轮**真读了**该文件（`parsed_files` 已在内部累加）；
-/// `Ok(false)` = 未变更文件（L2 快速路）。
+/// 本轮真读了该文件时 `parsed_files` 已在内部累加；未变更文件（L2 快速路）直接返回。
 #[allow(clippy::too_many_arguments)]
 fn collect_file(
     ctx: &CollectContext<'_>,
@@ -469,8 +469,8 @@ fn collect_file(
     title: Option<String>,
     is_subagent: bool,
     parent_session_id: Option<String>,
-    main_session_ids: &[String],
-) -> Result<bool, UsageError> {
+    main_session_ids: &std::collections::HashSet<String>,
+) -> Result<(), UsageError> {
     let read = match ctx.read_incremental(jsonl, file_key) {
         Ok(r) => r,
         Err(e) => {
@@ -483,7 +483,7 @@ fn collect_file(
                     jsonl.display(),
                     e
                 );
-                return Ok(false);
+                return Ok(());
             }
             return Err(UsageError::new(
                 "usage-source-io",
@@ -495,7 +495,7 @@ fn collect_file(
         // 未变文件（L2 快速路）：游标原样推回，**不计 parsed_files**（W-50：本字段的口径是
         // 「本轮**真读到**的文件数」——与 claude / codex / kimi 一致，未变更文件在读之前就退出了）
         b.push_cursor(read.next);
-        return Ok(false);
+        return Ok(());
     }
     let mut state: WbState = if read.rescan {
         // 截断/重写：续读状态随文件代际一起重置（旧状态里的未配对调用指向的行已经不在了）
@@ -686,7 +686,7 @@ fn collect_file(
         }
     };
     b.push_cursor(next);
-    Ok(true)
+    Ok(())
 }
 
 /// 枚举并采集父会话目录下的子代理转写（设计 §2.2）。
@@ -703,7 +703,7 @@ fn collect_subagents(
     main_jsonl: &std::path::Path,
     parent_id: &str,
     cwd: &str,
-    main_session_ids: &[String],
+    main_session_ids: &std::collections::HashSet<String>,
 ) -> Result<(), UsageError> {
     let Some(project_dir) = main_jsonl.parent() else {
         return Ok(());
@@ -738,15 +738,17 @@ fn collect_subagents(
         })?;
         let path = entry.path();
         // 只读**直接子文件**的 `*.jsonl`（不递归；`tool-results/` 等目录不进）；
-        // 文件名**不限定 `agent-` 前缀**，防上游命名演进
-        if !path.is_file() {
-            continue;
-        }
+        // 文件名**不限定 `agent-` 前缀**，防上游命名演进。
+        // 先做便宜的扩展名判断，再用 read_dir 已缓存的 file_type（Unix 免费），避免
+        // 对每个非 jsonl 目录项额外 stat。
         if !path
             .extension()
             .and_then(|e| e.to_str())
             .is_some_and(|e| e.eq_ignore_ascii_case("jsonl"))
         {
+            continue;
+        }
+        if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
             continue;
         }
         files.push(path);
@@ -1833,7 +1835,8 @@ mod tests {
                        "providerData":{"isSubAgent":true,"model":"deepseek-v4.1-flash"}}),
             ],
         );
-        let (id, degraded) = resolve_subagent_session_id(&p, PARENT_ID, &[]);
+        let (id, degraded) =
+            resolve_subagent_session_id(&p, PARENT_ID, &std::collections::HashSet::new());
         assert_eq!(id, SUBAGENT_ID, "身份必须取行内 sessionId，不是文件名");
         assert!(!degraded, "行内 UUID 可用 → 不得降级");
         assert!(!id.contains("agent-"), "不得回退文件名 stem：{id}");
@@ -1853,7 +1856,8 @@ mod tests {
                        "providerData":{"isSubAgent":true}}),
             ],
         );
-        let (id, degraded) = resolve_subagent_session_id(&p, PARENT_ID, &[]);
+        let (id, degraded) =
+            resolve_subagent_session_id(&p, PARENT_ID, &std::collections::HashSet::new());
         assert_eq!(id, stem, "没有 UUID → 回退文件名 stem");
         assert!(degraded, "降级必须可见（调用方据此 warn）");
     }
@@ -1872,7 +1876,8 @@ mod tests {
                      "providerData":{"isSubAgent":true}}),
             ],
         );
-        let (id, degraded) = resolve_subagent_session_id(&p, PARENT_ID, &[]);
+        let (id, degraded) =
+            resolve_subagent_session_id(&p, PARENT_ID, &std::collections::HashSet::new());
         assert_ne!(id, PARENT_ID, "不得把父会话 id 当成子代理身份");
         assert_eq!(id, stem);
         assert!(degraded);
@@ -1891,7 +1896,10 @@ mod tests {
                      "providerData":{"isSubAgent":true}}),
             ],
         );
-        let mains = vec![PARENT_ID.to_string(), OTHER_UUID.to_string()];
+        let mains: std::collections::HashSet<String> =
+            [PARENT_ID.to_string(), OTHER_UUID.to_string()]
+                .into_iter()
+                .collect();
         let (id, degraded) = resolve_subagent_session_id(&p, PARENT_ID, &mains);
         assert_eq!(id, stem, "命中任一主会话 id 都必须拒绝");
         assert!(degraded);

@@ -45,7 +45,9 @@ pub const HEARTBEAT_FRESH_MS: u64 = 90_000;
 /// 300s 兜底窗，**只作用于 `completed` / DB-only 候选**——`runtime_present` 且
 /// `status='working'` 的会话不因父会话静默而下板（真机实测 10 分钟空档）。
 /// 与 `APP_STATUS_STALE_MS` 同值同源（`monitor/app_status.rs`：App 形态 mtime 叠加阈值）。
-pub const SESSION_ACTIVE_WINDOW_MS: i64 = super::app_status::APP_STATUS_STALE_MS as i64;
+/// 看板在场 / 未读补偿的活动窗口。刻意**不**别名到 `APP_STATUS_STALE_MS`
+/// （状态叠加阈值与在场判定是两套产品语义；调一个不应静默改另一个）。
+pub const SESSION_ACTIVE_WINDOW_MS: i64 = 300_000;
 
 /// 完成防抖窗（spec 假绿治理 §4.2）：assistant 语义尾 + JSONL mtime 年龄 < 该窗 → 拉回
 /// Processing（WorkBuddy 格式无轮次信号，中间消息假绿只能时间防抖），≥ 该窗才转绿。
@@ -386,12 +388,11 @@ fn map_db_session_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<WbDbSession> {
 
 /// 只读执行 + 逐行容错（版本漂移 / 坏行 → 空/跳过 + warn，看板降级，不 panic）。
 ///
-/// 打开走 [`super::sqlite::open_usage_db`]：先 `mode=ro`（安全），失败回退
-/// `immutable=1`（缺 `-wal/-shm` 的库在 ro 下打不开）。看板读的是展示字段，
+/// 打开走 [`super::sqlite::open_readonly_with_timeout`]：看板读的是展示字段，
 /// 单轮滞后可容忍；打不开只降级（心跳路径仍在工作）。
 fn query_db_sessions(home: &Path, sql: &str, params: &[&dyn rusqlite::ToSql]) -> Vec<WbDbSession> {
     let db = home.join(".workbuddy").join("workbuddy.db");
-    let Some(conn) = super::sqlite::open_usage_db(&db) else {
+    let Some(conn) = super::sqlite::open_readonly_with_timeout(&db) else {
         log::debug!(
             "workbuddy: 打开 {} 失败，看板 DB 兜底本轮跳过",
             db.display()
@@ -469,52 +470,34 @@ fn discover_workbuddy_processes_with(
     recent: &dyn Fn() -> HashMap<String, WbDbSession>,
     host_pid: Option<u32>,
 ) -> Vec<AgentProcess> {
-    let sessions_dir = home.join(".workbuddy").join("sessions");
     let mut found = Vec::new();
-    // 目录缺失/不可读 → 不 panic（下面的哨兵分支仍可能给出 DB 兜底）
-    if let Ok(entries) = std::fs::read_dir(&sessions_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            // 文件名须为 <PID>.json；其余文件（如 README/临时文件）跳过
-            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
-                continue;
-            };
-            let Ok(pid) = stem.parse::<u32>() else {
-                continue;
-            };
-            // 防御：心跳文件缺失/损坏 → 跳过该 pid
-            let Some(hb) = std::fs::read_to_string(&path)
-                .ok()
-                .and_then(|s| parse_heartbeat(&s))
-            else {
-                continue;
-            };
-            // 过滤：严格 UUID + kind 非 prewarm + pid 交叉校验（issue #35 nit：
-            // pid 复用竞态窗口内文件名与内容 pid 可能不一致，视为无效心跳，
-            // 不为无关进程出卡——下轮真实心跳自愈）。
-            // **心跳新鲜度不在这里判**（R2）：过期但 pid 存活的会话仍是「运行时在场」候选。
-            if !heartbeat_session_id_is_uuid(&hb)
-                || hb.kind.as_deref() == Some("prewarm")
-                || hb.pid != pid
-            {
-                continue;
-            }
-            // 以 pid 回查进程表：查无 → 跳过（进程已消失，不产出进程）
-            let Some((cpu_usage, exe)) = process_info(pid) else {
-                continue;
-            };
-            if !heartbeat_is_alive(&hb, now_ms) {
-                // 诊断可见：5.9.3 的心跳只写一次，这里过期是常态而非异常
-                log::debug!("workbuddy: 心跳 {pid} 已过期但 pid 存活，按在场候选放行");
-            }
-            found.push(AgentProcess {
-                pid,
-                cpu_usage,
-                cwd: Some(PathBuf::from(&hb.cwd)),
-                exe,
-                form: ProcessForm::App,
-            });
+    // 一次目录扫描（与看板/补偿共用同一解析入口）；目录缺失/不可读 → 不 panic
+    for (pid, hb) in read_heartbeat_files(home) {
+        // 过滤：严格 UUID + kind 非 prewarm + pid 交叉校验（issue #35 nit：
+        // pid 复用竞态窗口内文件名与内容 pid 可能不一致，视为无效心跳，
+        // 不为无关进程出卡——下轮真实心跳自愈）。
+        // **心跳新鲜度不在这里判**（R2）：过期但 pid 存活的会话仍是「运行时在场」候选。
+        if !heartbeat_session_id_is_uuid(&hb)
+            || hb.kind.as_deref() == Some("prewarm")
+            || hb.pid != pid
+        {
+            continue;
         }
+        // 以 pid 回查进程表：查无 → 跳过（进程已消失，不产出进程）
+        let Some((cpu_usage, exe)) = process_info(pid) else {
+            continue;
+        };
+        if !heartbeat_is_alive(&hb, now_ms) {
+            // 诊断可见：5.9.3 的心跳只写一次，这里过期是常态而非异常
+            log::debug!("workbuddy: 心跳 {pid} 已过期但 pid 存活，按在场候选放行");
+        }
+        found.push(AgentProcess {
+            pid,
+            cpu_usage,
+            cwd: Some(PathBuf::from(&hb.cwd)),
+            exe,
+            form: ProcessForm::App,
+        });
     }
     // DB 兜底哨兵：仅当「没有心跳进程 ∧ DB 有近期会话 ∧ 宿主存活」时给出，
     // 用于穿过 L1 门禁（cwd=None 表示「不是某个具体会话的心跳」）
@@ -809,7 +792,7 @@ pub fn get_workbuddy_sessions_with(
 
         // 记录本轮 pid→(tool, session)（心跳消失补偿依据）。**只记有心跳文件的候选**：
         // DB-only 卡没有真实 pid（pid=0），记进去会让补偿逻辑对着 0 干活
-        if c.pid != 0 && c.last_heartbeat_ms.is_some() {
+        if c.last_heartbeat_ms.is_some() {
             LAST_SEEN_SESSIONS
                 .lock()
                 .unwrap()
@@ -1017,25 +1000,18 @@ fn sync_observations_to_db(now_ms: u64) {
     crate::database::dao::heartbeat_seen::cleanup_before(now - OBSERVATION_TTL_MS);
 }
 
-/// 进程是否仍存活（**单 pid 定向刷新**，不扫全表）：补偿判 `runtime_present` 用
-fn pid_is_alive(pid: u32) -> bool {
-    if pid == 0 {
-        return false;
-    }
-    let mut sys = sysinfo::System::new();
-    let target = sysinfo::Pid::from_u32(pid);
-    sys.refresh_processes_specifics(
-        sysinfo::ProcessesToUpdate::Some(&[target]),
-        true,
-        sysinfo::ProcessRefreshKind::nothing(),
-    );
-    sys.process(target).is_some()
+/// 一轮心跳目录扫描的两种视图（同一次 read_dir/parse，避免多份实现漂移）：
+/// * `present_ids`：心跳**文件存在**的会话 id（不判 pid 存活）；
+/// * `live_ids`：文件名 pid == 内容 pid ∧ pid 存活的会话 id（`runtime_present`）。
+#[derive(Default)]
+struct HeartbeatSnapshot {
+    present_ids: std::collections::HashSet<String>,
+    live_ids: std::collections::HashSet<String>,
 }
 
-/// 当前「运行时在场」的会话 id 集合（心跳文件存在 ∧ 内容 pid == 文件名 pid ∧ pid 存活）。
-/// 单轮只扫一次（补偿候选数很少，但心跳文件枚举不该按候选重复）。
-fn live_session_ids(home: &Path) -> std::collections::HashSet<String> {
-    let mut out = std::collections::HashSet::new();
+/// 枚举 `~/.workbuddy/sessions/<pid>.json` 并解析（不判存活；调用方按需过滤）。
+fn read_heartbeat_files(home: &Path) -> Vec<(u32, Heartbeat)> {
+    let mut out = Vec::new();
     let Ok(entries) = std::fs::read_dir(home.join(".workbuddy").join("sessions")) else {
         return out;
     };
@@ -1054,43 +1030,70 @@ fn live_session_ids(home: &Path) -> std::collections::HashSet<String> {
         else {
             continue;
         };
-        if hb.pid != pid || !is_strict_uuid_form(&hb.session_id) {
-            continue;
-        }
-        if pid_is_alive(pid) {
-            out.insert(hb.session_id.clone());
-        }
+        out.push((pid, hb));
     }
     out
 }
 
+/// 单轮心跳快照：一次目录扫描 + 一次多 pid 存活刷新。
+fn heartbeat_snapshot(home: &Path) -> HeartbeatSnapshot {
+    let entries = read_heartbeat_files(home);
+    let targets: Vec<sysinfo::Pid> = entries
+        .iter()
+        .filter(|(pid, hb)| hb.pid == *pid && heartbeat_session_id_is_uuid(hb))
+        .map(|(pid, _)| sysinfo::Pid::from_u32(*pid))
+        .collect();
+    let mut sys = sysinfo::System::new();
+    if !targets.is_empty() {
+        sys.refresh_processes_specifics(
+            sysinfo::ProcessesToUpdate::Some(&targets),
+            true,
+            sysinfo::ProcessRefreshKind::nothing(),
+        );
+    }
+    let mut snapshot = HeartbeatSnapshot::default();
+    for (pid, hb) in entries {
+        if !heartbeat_session_id_is_uuid(&hb) {
+            continue;
+        }
+        snapshot.present_ids.insert(hb.session_id.clone());
+        if hb.pid == pid && sys.process(sysinfo::Pid::from_u32(hb.pid)).is_some() {
+            snapshot.live_ids.insert(hb.session_id);
+        }
+    }
+    snapshot
+}
+
 /// 补偿判据「会话是否还在场」（与看板在场判据同源，评审 I3 的可测面）：
 /// 1. `runtime_present` 优先：心跳文件存在 ∧ 内容 pid 存活 ∧ sessionId 匹配（`live_ids`）；
-/// 2. DB `MAX(last_activity_at, updated_at)` 在 [`SESSION_ACTIVE_WINDOW_MS`]（300s）内；
-/// 3. 主 jsonl mtime 在 300s 内。
-///
-/// **已知产品行为（评审 I3，等待用户裁决）**：`completed` 会话在完成后 **300s 内不会补进未读池**
-/// （②③ 仍为真）——即「未读/通知最多晚 5 分钟」。这是设计 §3.5 的**有意**取舍（与看板
-/// `completed` 下板同一窗口），本次不改；[`tests::board_tests`] 与本文件的
-/// `compensation_waits_out_the_300s_window` 都锁住该行为。
+/// 2. **心跳文件已被正常 unregister 删除**（不在 `file_present_ids`）：
+///    `completed` → 立即补未读（恢复旧版完成提醒时延）；`working` → 仍视为在场；
+/// 3. 文件还在但过期（异常/崩溃）：DB `MAX(last_activity_at, updated_at)` 在 300s 内，
+///    或主 jsonl mtime 在 300s 内 → 视为在场。
 fn session_is_live(
     home: &Path,
     now: u64,
     recent: &HashMap<String, WbDbSession>,
     live_ids: &std::collections::HashSet<String>,
+    file_present_ids: &std::collections::HashSet<String>,
     sid: &str,
 ) -> bool {
     // ① runtime_present 优先（运行中的 5.9.3 会话心跳恒过期，但 pid 存活即在场）
     if live_ids.contains(sid) {
         return true;
     }
-    // ② DB 活动时间
+    // ② 心跳文件已删除：正常 unregister = 会话结束。completed 立即补；
+    //    DB 仍说 working（异常删文件/进程还在）则不补，避免误伤运行中的会话。
+    if !file_present_ids.contains(sid) {
+        return recent.get(sid).is_some_and(|r| r.status == "working");
+    }
+    // ③ 文件存在但过期（崩溃/异常）：300s 窗口兜底
     if let Some(row) = recent.get(sid) {
         if now as i64 - row.activity_ms <= SESSION_ACTIVE_WINDOW_MS {
             return true;
         }
     }
-    // ③ 主 jsonl mtime
+    // ④ 主 jsonl mtime 在 300s 内
     let cwd = recent.get(sid).map(|r| r.cwd.clone()).unwrap_or_default();
     find_session_jsonl(home, &cwd, sid)
         .and_then(|p| file_mtime_ms(&p))
@@ -1120,15 +1123,17 @@ pub fn compensate_vanished_heartbeats() {
             .into_iter()
             .map(|r| (r.id.clone(), r))
             .collect();
-    let live_cache: std::cell::RefCell<Option<std::collections::HashSet<String>>> =
-        std::cell::RefCell::new(None);
+    // 单轮心跳快照：present/live 两视图来自同一次扫描，避免两份过滤规则漂移
+    let snapshot = heartbeat_snapshot(&home);
     let is_live = |sid: &str| -> bool {
-        // 心跳目录扫描按轮记忆（单 pid 定向存活检查不重复付）
-        let live_ids = {
-            let mut slot = live_cache.borrow_mut();
-            slot.get_or_insert_with(|| live_session_ids(&home)).clone()
-        };
-        session_is_live(&home, now, &recent, &live_ids, sid)
+        session_is_live(
+            &home,
+            now,
+            &recent,
+            &snapshot.live_ids,
+            &snapshot.present_ids,
+            sid,
+        )
     };
     for record in compensate_vanished_heartbeats_in(
         &home,
@@ -1875,15 +1880,13 @@ mod tests {
                 .collect()
         }
 
-        /// **I3（已知产品行为，等待用户裁决）**：`completed` 会话完成后 **300s 内不补未读**
-        /// ——未读卡/完成通知最多晚 5 分钟。这是设计 §3.5 的有意取舍（与看板 completed 下板同窗），
-        /// 本次**保持不改**；本用例把该行为钉住，避免后续悄悄改成「心跳消失即补」。
+        /// **I3-a**：正常完成 → CLI unregister 删除心跳文件 → **立即**补未读
+        /// （恢复旧版完成提醒时延，不再等 300s）。
         #[test]
-        fn compensation_waits_out_the_300s_window() {
+        fn completed_session_with_unregistered_heartbeat_compensates_immediately() {
             let home = tempfile::tempdir().unwrap();
             let now = now_ms();
             write_jsonl(home.path(), SID, ASSISTANT_TAIL);
-            // jsonl mtime 也推到窗外（否则判据 ③ 会让会话「在场」）
             let p = home
                 .path()
                 .join(".workbuddy/projects")
@@ -1899,6 +1902,7 @@ mod tests {
                 ("workbuddy".to_string(), SID.to_string()),
             )]));
             let no_live: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let no_files: std::collections::HashSet<String> = std::collections::HashSet::new();
             let recent = recent_window(home.path(), now);
             let out = compensate_vanished_heartbeats_in(
                 home.path(),
@@ -1906,14 +1910,64 @@ mod tests {
                 &last_seen,
                 &|_| None,
                 &|_| false,
-                &|sid| session_is_live(home.path(), now, &recent, &no_live, sid),
+                &|sid| session_is_live(home.path(), now, &recent, &no_live, &no_files, sid),
+            );
+            assert_eq!(
+                out.len(),
+                1,
+                "I3：正常 unregister（心跳文件缺失）后 completed 立即补未读"
+            );
+            assert_eq!(out[0].session_id, SID);
+        }
+
+        /// **I3-b**：心跳文件还在但 lastHeartbeat 过期（崩溃/异常）→ 仍等 300s 窗口，
+        /// 避免把刚完成的会话当作异常而提前补/误补。
+        #[test]
+        fn stale_heartbeat_file_waits_out_the_300s_window() {
+            let home = tempfile::tempdir().unwrap();
+            let now = now_ms();
+            write_jsonl(home.path(), SID, ASSISTANT_TAIL);
+            let p = home
+                .path()
+                .join(".workbuddy/projects")
+                .join(mangle_project_path(CWD))
+                .join(format!("{SID}.jsonl"));
+            let f = std::fs::OpenOptions::new().write(true).open(&p).unwrap();
+            f.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_millis(now - 900_000))
+                .unwrap();
+            seed_status_db(home.path(), "completed", (now - 120_000) as i64);
+            let dir = home.path().join(".workbuddy/sessions");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("11952.json"),
+                format!(
+                    r#"{{"pid":11952,"sessionId":"{SID}","cwd":"{CWD}","lastHeartbeat":{},"kind":"interactive"}}"#,
+                    now - 7_200_000
+                ),
+            )
+            .unwrap();
+
+            let last_seen = Mutex::new(HashMap::from([(
+                11952u32,
+                ("workbuddy".to_string(), SID.to_string()),
+            )]));
+            let no_live: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let files = heartbeat_snapshot(home.path()).present_ids;
+            assert!(files.contains(SID), "前提：心跳文件存在");
+            let recent = recent_window(home.path(), now);
+            let out = compensate_vanished_heartbeats_in(
+                home.path(),
+                now,
+                &last_seen,
+                &|_| None,
+                &|_| false,
+                &|sid| session_is_live(home.path(), now, &recent, &no_live, &files, sid),
             );
             assert!(
                 out.is_empty(),
-                "I3：完成后 300s 内不补未读（未读/通知最多晚 5 分钟，有意行为）"
+                "I3：文件存在但过期，300s 内不补（异常/崩溃路径）"
             );
 
-            // 超过 300s 后照常补一次
             bump_activity(home.path(), (now - 400_000) as i64);
             last_seen
                 .lock()
@@ -1926,7 +1980,7 @@ mod tests {
                 &last_seen,
                 &|_| None,
                 &|_| false,
-                &|sid| session_is_live(home.path(), now, &recent2, &no_live, sid),
+                &|sid| session_is_live(home.path(), now, &recent2, &no_live, &files, sid),
             );
             assert_eq!(out2.len(), 1, "窗口过后照常补一次未读");
             assert_eq!(out2[0].session_id, SID);
