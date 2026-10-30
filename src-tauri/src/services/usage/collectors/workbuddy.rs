@@ -499,6 +499,28 @@ fn collect_file(
     }
     let mut state: WbState = if read.rescan {
         // 截断/重写：续读状态随文件代际一起重置（旧状态里的未配对调用指向的行已经不在了）
+        //
+        // **可观测性（评审 I4）**：`usage_detail` / `usage_daily` 是**加法账本**，
+        // 已被计过账的前缀从 0 重读会**重复计入**（子代理文件截断/重写即此风险；
+        // 不写成“UPSERT 幂等”）。行为不变，但必须留下运行期信号：
+        // 有旧游标 = 真的截断/重写（warn）；无旧游标 = 首读/回填（debug，预期路径）。
+        match ctx.cursor_of(file_key) {
+            Some(prev) => log::warn!(
+                "usage/workbuddy: {} 触发 rescan（截断/重写）：prev_byte_offset={} prev_file_size={} \
+                 new_file_size={} is_subagent={} —— 该文件已入账的用量会被**重复计入**（加法账本）",
+                jsonl.display(),
+                prev.byte_offset,
+                prev.file_size,
+                read.next.file_size,
+                is_subagent
+            ),
+            None => log::debug!(
+                "usage/workbuddy: {} 首次读取（从字节 0 回填）：file_size={} is_subagent={}",
+                jsonl.display(),
+                read.next.file_size,
+                is_subagent
+            ),
+        }
         WbState::default()
     } else {
         // **游标必须被读**：增量读从文件中段开始时，上一轮发起的工具调用还在等回执，
@@ -2126,6 +2148,88 @@ mod tests {
         assert_eq!(st.dropped_no_model, 1);
         assert_eq!(st.tools.open.len(), 1, "不得丢 tools（跨轮配对依赖它）");
         assert!(st.subagent_session_id.is_empty());
+    }
+
+    /// **I4 的可观测面**：子代理文件被截断/重写（`rescan`）时，续读状态（含缓存的身份）
+    /// 必须随之重置并**重新解析**——否则截断后的新代际会沿用旧 sessionId 入账（串号）。
+    ///
+    /// ⚠️ 双计风险本身**没有**被解决：`usage_detail`/`usage_daily` 是加法账本，重读的用量
+    /// 会重复计入；实现只在 rescan 分支打 warn（有旧游标 = 真实截断/重写；无游标 = 首读）。
+    /// 仓内无日志捕获设施（W-37），故这里断言**行为面**：重置 + 重解析。
+    #[test]
+    fn subagent_rescan_resets_the_cached_identity() {
+        const SID2: &str = "01a18b3a-d9f7-78f2-bc3a-3425a34f54db";
+        let dir = tempfile::tempdir().unwrap();
+        make_db(dir.path(), &[("s1", "/p/A")]);
+        write_jsonl(
+            dir.path(),
+            "p-A",
+            "s1",
+            &[
+                json!({"type":"message","role":"assistant","timestamp":1000,"cwd":"/p/A",
+                     "sessionId":"s1","content":[{"type":"output_text","text":"ok"}],
+                     "message":{"usage":{"input_tokens":10,"output_tokens":1,"total_tokens":11}},
+                     "providerData":{"model":"deepseek-v4.1-flash"}}),
+            ],
+        );
+        let sub = write_subagent_jsonl(
+            dir.path(),
+            "p-A",
+            "s1",
+            &format!("agent-{OTHER_UUID}.jsonl"),
+            &[
+                json!({"type":"message","role":"user","timestamp":1500,"cwd":"/p/A",
+                       "sessionId":SUBAGENT_ID}),
+                json!({"type":"function_call","name":"Read","timestamp":2000,"callId":"sc1",
+                       "cwd":"/p/A","sessionId":SUBAGENT_ID,
+                       "message":{"usage":{"input_tokens":100,"output_tokens":10,"total_tokens":110}},
+                       "providerData":{"model":"deepseek-v4.1-flash","isSubAgent":true}}),
+            ],
+        );
+        let no_cursors = HashMap::new();
+        let (d1, _) = run(dir.path(), &no_cursors);
+        assert!(
+            d1.sessions.iter().any(|s| s.session_id == SUBAGENT_ID),
+            "前提：第一代文件以 SUBAGENT_ID 入账"
+        );
+
+        // 截断重写：内容更短（必然 rescan）+ 行内 sessionId 换成另一个 UUID
+        std::fs::write(
+            &sub,
+            format!(
+                "{}\n",
+                serde_json::to_string(&json!({"type":"function_call","name":"Bash",
+                    "timestamp":2500,"callId":"sc2","cwd":"/p/A","sessionId":SID2,
+                    "message":{"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}},
+                    "providerData":{"model":"deepseek-v4.1-flash","isSubAgent":true}}))
+                .unwrap()
+            ),
+        )
+        .unwrap();
+        let cursors: HashMap<_, _> = d1
+            .cursors
+            .iter()
+            .map(|c| (c.session_id.clone(), c.clone()))
+            .collect();
+        let (d2, _) = run(dir.path(), &cursors);
+        assert!(
+            d2.sessions.iter().any(|s| s.session_id == SID2),
+            "rescan 后必须按新代际重新解析身份（沿用旧缓存 = 串号）：{:?}",
+            d2.sessions
+                .iter()
+                .map(|s| s.session_id.as_str())
+                .collect::<Vec<_>>()
+        );
+        let sub_cursor = d2
+            .cursors
+            .iter()
+            .find(|c| c.session_id.contains("subagents"))
+            .unwrap();
+        assert!(
+            sub_cursor.state_json.contains(SID2),
+            "游标状态里缓存的身份必须刷新：{}",
+            sub_cursor.state_json
+        );
     }
 
     /// 子代理文件的**整文件无模型** → 丢弃 + 计数进该文件自己的 `state_json`（不写 `model=""`）
