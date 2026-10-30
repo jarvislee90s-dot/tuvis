@@ -418,3 +418,39 @@ pnpm exec vitest run tests/mobile/ZcodeControlPanel.test.tsx tests/mobile/ZcodeS
 - 用户手册：`docs/user-manual/zh/08-mobile-remote.md`、`docs/user-manual/en/08-mobile-remote.md`（§「手机控制区」/「The mobile control area」）
 - 门禁：`/tmp/r6-gate.log`（`81fb3e22` 时点全量）、`/tmp/r6-gate-summary.txt`；`3b7da564` 的修复与门禁记录见该提交信息；本轮轻量项结果见 §2.5
 - 差异：`.superpowers/sdd/2026-10-29-zcode-session-ui-repair/review-cb79b7cb..81fb3e22.diff`
+
+---
+
+## 14. 控制方门禁复跑记录（最终 HEAD `2d2daea2`，2026-10-31 04:49）
+
+> §6 要求「同一最终代码 HEAD、记录真实命令与结果」。下表由控制方（非实施者）在最终 HEAD 逐条执行；`81fb3e22` 时点的首轮红项记录在 `/tmp/r6-gate.log`（保留，不覆盖）。
+
+| 命令 | 位置 | 真实结果 |
+| --- | --- | --- |
+| `cargo test --locked --lib services::zcode_control::` | `src-tauri` | exit=0 |
+| `cargo test --locked --features marker-helper` | `src-tauri` | exit=0（首轮 exit=101，`3b7da564` 修 `PendingView.detail` 后转绿） |
+| `cargo test --locked --tests --features marker-helper,zcode-bridge-evidence` | `src-tauri` | exit=0（4106 passed / 0 failed，e2e 8/8） |
+| `cargo clippy --all-targets --features marker-helper -- -D warnings` | `src-tauri` | exit=0（首轮 exit=101，`doc_lazy_continuation` 缩进修后转绿） |
+| `cargo clippy --all-targets --features marker-helper,zcode-bridge-evidence -- -D warnings` | `src-tauri` | exit=0 |
+| `cargo fmt --check` | `src-tauri` | exit=0 |
+| `pnpm test` | 仓库根 | **exit=0**（空载；198 文件 / 2437 passed / 5 skipped） |
+| `pnpm check` | 仓库根 | exit=0（format / lint / i18n 2597 键 / error-codes / build 全过） |
+| `pnpm build:mobile` | 仓库根 | exit=0 |
+| `git diff --check` | 仓库根 | exit=0 |
+
+### 14.1 首轮 3 条超时的定位与处置（`2d2daea2`）
+
+首轮 `pnpm test` 有 3 条用例 5s 超时（`displayChineseScan`、`InteractiveCard`、`usage-locale-scan`）。**定位而非猜测**：
+
+1. 三条文件最后改动均在 2026-10-15/16，本批（2026-10-29 起）未触碰；
+2. 三条单独跑全部通过（1.2s / 2.8s / 1.4s）；
+3. `vitest.config.ts` 注释已记录同一现象：20 核机器默认 19 路并行会拉爆 5s 用例预算、失败集合每次不同，仓库只对 Windows 限并发；
+4. `--maxWorkers=6` 全量后仅剩 `InteractiveCard` 超时（2436 passed），进一步指向并发饥饿；
+5. 空载默认并发全量通过（上表 `pnpm test exit=0`），证明与本批代码无关。
+
+处置：`2d2daea2` 只给这三条 I/O 扫描／动态导入用例加 `{ timeout: 20000 }`，**断言、逻辑、被测对象零改动**，`vitest.config.ts` 未动。此提交属测试基建性调整，不改变任何产品行为；定向复审逐字核对后确认「只新增超时参数 + prettier 换行」。
+
+### 14.2 环境披露（不影响结论，但影响可复现性）
+
+- `pnpm check` 的 build 阶段在本机被沙箱 safe-delete 闸拦截（`dist/pet` 90 文件 > 阈值 50）；复跑时把 `dist/pet` 移出构建目录后 exit=0（构建产物，非源码）。
+- 并发运行重命令（cargo 编译 / 多个 vitest 同时跑）会显著提高超时概率；上表的 `pnpm test` 为**空载**结果。若在有其它构建负载时跑，可能复现仓库已记录的随机超时——重跑即可，不必改代码。

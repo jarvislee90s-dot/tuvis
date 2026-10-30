@@ -20,8 +20,8 @@ use serde_json::{Map, Value};
 
 use super::pending::PendingBook;
 use super::types::{
-    codes, BoundTarget, CapabilityView, ModelChoice, QueueItemView, QueueView, SelectionView,
-    SessionView, ZResult, ZcodeError,
+    codes, BoundTarget, CapabilityView, InputRoutingView, ModelChoice, QueueItemView, QueueView,
+    SelectionView, SessionView, ZResult, ZcodeError,
 };
 
 /// conversation topic 前缀（`transport.ts:113,205`）。
@@ -45,6 +45,8 @@ pub struct Projection {
     selection: Option<SelectionView>,
     /// 官方输入队列（`state.queue` 的只读投影；宿主未宣告 = `known=false`）。
     queue: QueueView,
+    /// 官方 `state.inputRouting` 的最小投影（未宣告 = `None`）。
+    input_routing: Option<InputRoutingView>,
     capabilities: CapabilityView,
     applied_frames: usize,
     /// 单帧字节上限（超限 = `payload_too_large`，绝不让单帧撑爆投影）。
@@ -69,6 +71,7 @@ impl Projection {
             book,
             selection: None,
             queue: QueueView::default(),
+            input_routing: None,
             capabilities: CapabilityView::default(),
             applied_frames: 0,
             byte_limit,
@@ -87,6 +90,8 @@ impl Projection {
         self.last_to_seq = None;
         // 旧订阅的队列快照不得跨订阅/换代复活：解除 barrier 即视为未宣告。
         self.queue = QueueView::default();
+        // 发送路由同理：旧订阅的 `inputRouting` 不得影响换代后的 choice 判定。
+        self.input_routing = None;
     }
 
     /// 当前激活的 subscriptionId（未激活 = `None`）。
@@ -128,6 +133,8 @@ impl Projection {
     fn mark_unready(&mut self) {
         self.ready = false;
         self.queue = QueueView::default();
+        // 失效视图不得继续携带发送路由：手机只能按新鲜 ready 的状态判断 choice。
+        self.input_routing = None;
     }
 
     /// 显式置就绪位（缺序/协议不符时由桥置 false，取新快照后由 apply 恢复）。
@@ -268,6 +275,7 @@ impl Projection {
             capabilities: self.capabilities.clone(),
             // 队列随投影一起走：GET 与 SSE 帧共用本视图，手机刷新/重进即从宿主重建。
             queue: self.queue.clone(),
+            input_routing: self.input_routing.clone(),
         }
     }
 
@@ -279,6 +287,8 @@ impl Projection {
         // 快照是整份权威状态：`queue` 缺席 = 本宿主不宣告队列（`known=false`），
         // 绝不沿用上一份快照的旧队列（旧代际/旧订阅的项不得复活）。
         self.queue = object.get("queue").map(parse_queue).unwrap_or_default();
+        // 快照是整份权威状态：缺 `inputRouting` = 未知（`None`），绝不沿用上一份快照。
+        self.input_routing = object.get("inputRouting").and_then(parse_input_routing);
         Ok(())
     }
 
@@ -294,6 +304,10 @@ impl Projection {
         // 同规则：patch 带 queue 就整体换（含解析失败 → 未宣告）；缺席 = 本帧不动队列。
         if let Some(queue) = object.get("queue") {
             self.queue = parse_queue(queue);
+        }
+        // 增量 patch 缺 `inputRouting` 保持旧值；带坏形状 → 未知（绝不猜 choice）。
+        if object.contains_key("inputRouting") {
+            self.input_routing = object.get("inputRouting").and_then(parse_input_routing);
         }
         self.book.accept_delta_patch(patch)
     }
@@ -360,6 +374,27 @@ fn parse_queue(value: &Value) -> QueueView {
         pause_reason,
         items: queue_items,
     }
+}
+
+/// 解析官方 `state.inputRouting` 的最小值域（`mode` + 可选 `reasonCode`）。
+///
+/// - 非对象或 `mode` 非非空字符串 → `None`（未知，绝不猜 `choice`）；
+/// - `reasonCode` 原样透传（非字符串/缺席 = `None`）；
+/// - 其余字段一律不投影（不把宿主完整路由对象/敏感配置下发给手机）。
+fn parse_input_routing(value: &Value) -> Option<InputRoutingView> {
+    let object = value.as_object()?;
+    let mode = object
+        .get("mode")
+        .and_then(Value::as_str)
+        .filter(|mode| !mode.is_empty())?;
+    let reason_code = object
+        .get("reasonCode")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    Some(InputRoutingView {
+        mode: mode.to_owned(),
+        reason_code,
+    })
 }
 
 /// 解析 snapshot/patch 的 `config`（只读展示面；模型目录由 T6 的独立读取面填充）。
@@ -1042,6 +1077,73 @@ mod tests {
         let queue = queue_of(&projection);
         assert_eq!(queue["paused"], false, "{queue}");
         assert!(queue["pauseReason"].is_null(), "{queue}");
+    }
+
+    #[test]
+    fn input_routing_is_minimal_and_patch_scoped() {
+        let mut projection = Projection::new(target(1));
+        projection.activate(SUB);
+        // 快照带 inputRouting：只投影 mode/reasonCode。
+        let mut snapshot = base_snapshot();
+        snapshot["inputRouting"] = json!({
+            "mode": "choice",
+            "reasonCode": "heldQueueDispositionRequired",
+            "internal": {"secret": "not-for-phone"},
+        });
+        projection
+            .apply(1, snapshot_frame(SUB, snapshot, 0, 1))
+            .expect("snapshot with inputRouting");
+        let routing = projection
+            .view()
+            .input_routing
+            .expect("inputRouting 应被投影");
+        assert_eq!(routing.mode, "choice");
+        assert_eq!(
+            routing.reason_code.as_deref(),
+            Some("heldQueueDispositionRequired")
+        );
+        // 手机看到的 wire 形状：camelCase，且只含最小值域（不泄漏 internal 字段）。
+        let wire = serde_json::to_value(projection.view()).expect("视图可序列化");
+        assert_eq!(wire["inputRouting"]["mode"], "choice");
+        assert_eq!(
+            wire["inputRouting"]["reasonCode"],
+            "heldQueueDispositionRequired"
+        );
+        assert!(wire["inputRouting"].get("internal").is_none());
+
+        // 增量缺该键：保持旧值（本帧没提 ≠ 已清除）。
+        projection
+            .apply(1, delta_frame(SUB, json!({"revision": 5}), 1, 2))
+            .expect("unrelated delta");
+        assert_eq!(
+            projection.view().input_routing.expect("保持旧值").mode,
+            "choice"
+        );
+
+        // 增量带 null/坏形状：置未知（绝不猜 choice）。
+        projection
+            .apply(
+                1,
+                delta_frame(SUB, json!({"revision": 6, "inputRouting": null}), 2, 3),
+            )
+            .expect("delta clearing inputRouting");
+        assert!(projection.view().input_routing.is_none());
+
+        // 新快照缺该键：同样置未知（绝不沿用上一份快照）。
+        let mut fresh = base_snapshot();
+        fresh["inputRouting"] = json!({"mode": "choice"});
+        projection
+            .apply(1, snapshot_frame(SUB, fresh, 0, 1))
+            .expect("snapshot with routing");
+        assert!(projection.view().input_routing.is_some());
+        projection
+            .apply(1, snapshot_frame(SUB, base_snapshot(), 0, 1))
+            .expect("snapshot without routing");
+        assert!(projection.view().input_routing.is_none());
+
+        // 失效/解除 barrier 一并作废，避免旧路由影响换代后的 choice 判定。
+        projection.deactivate();
+        assert!(projection.view().input_routing.is_none());
     }
 
     #[test]

@@ -114,8 +114,8 @@ use super::pending::{build_permission_answer, build_user_answer};
 use super::selection::build_selection_command;
 use super::types::{
     codes, ActionContext, ActionReceipt, ActionState, ActiveWork, BoundTarget, CapabilitySource,
-    CapabilityView, CommandPort, ControlAction, PendingPort, SelectionPort, SessionView, StopPort,
-    StopRequest, ZResult, ZcodeError, PROTOCOL_CLIENT_ID,
+    CapabilityView, CommandPort, ControlAction, HeldQueueChoice, PendingPort, SelectionPort,
+    SessionView, StopPort, StopRequest, ZResult, ZcodeError, PROTOCOL_CLIENT_ID,
 };
 
 /// 官方发送方法名（`zcodeAgent.ts:937`、探针 `SendOnceLoop`）。
@@ -338,6 +338,65 @@ fn running_primary_turn(view: &SessionView, target: &BoundTarget) -> bool {
     })
 }
 
+/// 发送前对 `inputRouting.mode="choice"` 的旧队列处置做**新鲜状态**校验（F3）。
+///
+/// 规则（只认精确目标 + 本代 + `ready=true` 的现读视图）：
+/// - `choice` 且 `queue.items` 非空 → 必须携带 `held_queue`，否则拒绝（`invalid_action`，
+///   手机应刷新后重新选择）；
+/// - 携带了 `held_queue` → `expectedQueueItemIds` 必须与新鲜官方队列的**完整 ID 列表
+///   与顺序**逐项相等（CAS）；不等即拒绝，**绝不**悄悄清空或重试。冻结码里没有单独的
+///   `stale`，这里复用 `invalid_action`（文案「该操作在当前状态下无效，请刷新后重试」），
+///   不新造错误码；
+/// - 缺失新鲜视图（未装配/读失败/未就绪）时：没带 `held_queue` → 交回宿主默认（保持
+///   旧行为）；带了 → 无法验 CAS，按 `not_ready` 拒绝（绝不盲发）。
+fn resolve_held_queue(
+    choice: Option<&HeldQueueChoice>,
+    fresh: Option<&SessionView>,
+    target: &BoundTarget,
+) -> ZResult<Option<HeldQueueChoice>> {
+    let fresh = fresh.filter(|view| {
+        view.session_id == target.session_id
+            && view.generation == target.bridge_generation()
+            && view.ready
+    });
+    let requires_choice = fresh.is_some_and(|view| {
+        view.input_routing
+            .as_ref()
+            .is_some_and(|routing| routing.mode == "choice")
+            && !view.queue.items.is_empty()
+    });
+    let Some(choice) = choice else {
+        return if requires_choice {
+            Err(invalid_action())
+        } else {
+            Ok(None)
+        };
+    };
+    // 已显式选择处置：必须有可验证的新鲜官方状态，且当前确实处于 choice + 非空队列。
+    let Some(view) = fresh else {
+        return Err(ZcodeError::of(codes::NOT_READY));
+    };
+    if !requires_choice {
+        return Err(invalid_action());
+    }
+    let official: Vec<&str> = view
+        .queue
+        .items
+        .iter()
+        .map(|item| item.input_id.as_str())
+        .collect();
+    let matches = choice.expected_queue_item_ids.len() == official.len()
+        && choice
+            .expected_queue_item_ids
+            .iter()
+            .map(String::as_str)
+            .eq(official);
+    if !matches {
+        return Err(invalid_action());
+    }
+    Ok(Some(choice.clone()))
+}
+
 /// ACK 分类（官方 `CommandAck`：`status` ∈ accepted/duplicate/rejected/noop）。
 ///
 /// 只认显式状态：无法解释的应答既不当受理也不谎称拒绝，按保守 `unknown`。
@@ -348,6 +407,67 @@ fn classify_ack(ack: &Value) -> (ActionState, Option<String>) {
         Some("rejected") => (ActionState::Rejected, None),
         _ => (ActionState::Unknown, Some(codes::UNKNOWN.to_owned())),
     }
+}
+
+/// 官方 `sendText` 受理回执里的投递结论（`result.delivery`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SendDelivery {
+    /// 立即开始。
+    StartNow,
+    /// 已入官方队列。
+    Queue,
+    /// 作为当前回合的引导输入。
+    Guide,
+}
+
+impl SendDelivery {
+    /// 官方枚举原值（白名单；未知值不映射）。
+    fn from_wire(value: &str) -> Option<Self> {
+        match value {
+            "startNow" => Some(Self::StartNow),
+            "queue" => Some(Self::Queue),
+            "guide" => Some(Self::Guide),
+            _ => None,
+        }
+    }
+}
+
+/// 发送专用 ACK 分类（F2）：只有**完整四元组**才算受理。
+///
+/// `status ∈ accepted|duplicate` 且同时满足：
+/// - `result.type == "inputAccepted"`；
+/// - `result.inputId == sent_command_id`（对应本次出站 `commandId`）；
+/// - `result.delivery ∈ startNow|queue|guide`。
+///
+/// 任一缺失/不符 → `unknown`（冻结码 [`codes::UNKNOWN`]）：`status=accepted` 但没有
+/// 受理对象/投递结论的 ACK **绝不能**让手机清草稿。非 accepted/duplicate 状态回退
+/// 通用 [`classify_ack`]（rejected/noop/其它），绝不误认成功。
+fn classify_send_ack(
+    ack: &Value,
+    sent_command_id: &str,
+) -> (ActionState, Option<String>, Option<SendDelivery>) {
+    let status = ack.get("status").and_then(Value::as_str);
+    if matches!(status, Some("accepted") | Some("duplicate")) {
+        let result = ack.get("result");
+        let same_id = result
+            .and_then(|value| value.get("inputId"))
+            .and_then(Value::as_str)
+            == Some(sent_command_id);
+        let correct_type = result
+            .and_then(|value| value.get("type"))
+            .and_then(Value::as_str)
+            == Some("inputAccepted");
+        let delivery = result
+            .and_then(|value| value.get("delivery"))
+            .and_then(Value::as_str)
+            .and_then(SendDelivery::from_wire);
+        if correct_type && same_id && delivery.is_some() {
+            return (ActionState::Accepted, None, delivery);
+        }
+        return (ActionState::Unknown, Some(codes::UNKNOWN.to_owned()), None);
+    }
+    let (state, reason) = classify_ack(ack);
+    (state, reason, None)
 }
 
 /// `switchModelConfig` 的 ACK 分类（官方 `CommandAck.status`；B4 源码口径）。
@@ -630,7 +750,10 @@ impl CommandSender {
         target: &BoundTarget,
         action: &ControlAction,
     ) -> ZResult<ActionReceipt> {
-        let ControlAction::Send { text, .. } = action else {
+        let ControlAction::Send {
+            text, held_queue, ..
+        } = action
+        else {
             return Err(invalid_action());
         };
         // 正文出口（含空白/预算校验）：校验失败零帧零行，不去碰账本。
@@ -646,6 +769,23 @@ impl CommandSender {
             target.generation,
             &params,
         )?;
+        // 只读幂等预检（零帧零写）：重放直接回既有回执，**不**重读宿主视图，也不因
+        // 当前队列/路由变化把「做过」误报成「没做过」。
+        if let Some(existing) = self
+            .actions
+            .existing_receipt(ctx, target, action.kind(), &hash)?
+        {
+            return Ok(existing);
+        }
+
+        // 官方写前现读**一次**新鲜视图：同时服务「运行中投递意向」与「choice 队列
+        // 处置」。读失败/未就绪一律不猜（见 [`resolve_held_queue`]）。
+        let fresh = self.fresh_session_view(target).await;
+        let held_queue = resolve_held_queue(held_queue.as_ref(), fresh.as_ref(), target)?;
+        let queue_delivery = fresh
+            .as_ref()
+            .is_some_and(|view| running_primary_turn(view, target));
+
         // 审计摘要只含类别 + 字数（answer/permission 为答案/选项数），不含正文。
         let summary = audit_summary(action.kind(), &params);
         match self
@@ -656,35 +796,21 @@ impl CommandSender {
             Reservation::New => {}
         }
 
-        // 本次动作的投递意向（R2 fix round 1 / I-2）：只有**新**派发才现读一次
-        // 官方 control；判据不成立（未装配读面/读失败/不新鲜/control 未知/无主
-        // 回合）一律不带，交回宿主 `state.inputRouting.mode` 的默认处置。
-        let queue_delivery = self.send_is_running(target).await;
         let receipt = self
-            .dispatch_send(ctx, target, composed, queue_delivery)
+            .dispatch_send(ctx, target, composed, queue_delivery, held_queue.as_ref())
             .await;
         self.record(&receipt);
         Ok(receipt)
     }
 
-    /// 本次 send 是否处于「会话在跑」：只认**官方 control** 的新鲜字段。
+    /// 本次动作的**新鲜官方视图**（零预算；未装配读面/读失败 → `None`）。
     ///
-    /// 读面复用已装配的精确目标视图端口（[`StopPort::session`]，与打断守卫同一
-    /// 来源：精确 session/代际、必要时只读重同步、预算内返回）。判据见
-    /// [`running_primary_turn`]。
-    ///
-    /// **预算为零**：投递意向只是一行本地提示，绝不值得让一次发送去等重同步
-    /// （缺口期间旧投影本来就不作数）。零预算下端口只回当前已就绪的投影，需要
-    /// 重同步时立即 `not_ready` → 本次不带。任何读不到/不可信的情形都返回
-    /// `false`——**宁可交回宿主默认，也不拿本地忙态猜**；读失败绝不影响发送本身。
-    async fn send_is_running(&self, target: &BoundTarget) -> bool {
-        let Some(port) = self.stop.as_ref() else {
-            return false;
-        };
-        match port.session(target, Duration::ZERO).await {
-            Ok(view) => running_primary_turn(&view, target),
-            Err(_) => false,
-        }
+    /// 与 [`running_primary_turn`] 同一来源（[`StopPort::session`]）：零预算下端口只
+    /// 回当前已就绪的投影，需要重同步时立即 `not_ready` → 本次按「不可判定」处理，
+    /// 绝不拿旧投影猜 `inputRouting`/运行态。
+    async fn fresh_session_view(&self, target: &BoundTarget) -> Option<SessionView> {
+        let port = self.stop.as_ref()?;
+        port.session(target, Duration::ZERO).await.ok()
     }
 
     /// 预留动作（幂等指纹 = kind + 会话 + 代际 + 全部参数，只落指纹不落正文）。
@@ -1471,13 +1597,20 @@ impl CommandSender {
         target: &BoundTarget,
         text: String,
         queue_delivery: bool,
+        held_queue: Option<&HeldQueueChoice>,
     ) -> ActionReceipt {
         let mut payload = serde_json::json!({ "text": text });
         if queue_delivery {
             payload["requestedDelivery"] = Value::from(REQUESTED_DELIVERY_QUEUE);
         }
+        // 手机自定义的 `heldQueue` 形状必须展平为官方两个字段；未选择时一个都不带。
+        if let Some(choice) = held_queue {
+            payload["heldQueueDisposition"] = Value::from(choice.disposition.as_wire());
+            payload["expectedHeldQueueItemIds"] = serde_json::json!(choice.expected_queue_item_ids);
+        }
+        let command_id = new_command_id();
         let envelope = serde_json::json!({
-            "commandId": new_command_id(),
+            "commandId": command_id,
             // 协议身份与握手同源；device_id 不进协议信封（官方校验握手身份）。
             "clientId": PROTOCOL_CLIENT_ID,
             "sessionId": target.session_id,
@@ -1485,7 +1618,7 @@ impl CommandSender {
             "payload": payload,
             "issuedAt": now_ms(),
         });
-        let (state, reason_code) = match self
+        let (state, reason_code, _delivery) = match self
             .bridge
             .call(
                 target,
@@ -1496,8 +1629,13 @@ impl CommandSender {
             )
             .await
         {
-            Err(error) => classify_port_error(&error),
-            Ok(ack) => classify_ack(&ack),
+            Err(error) => {
+                let (state, reason_code) = classify_port_error(&error);
+                (state, reason_code, None)
+            }
+            // 发送成功只认完整 `inputAccepted` 四元组（F2）：仅 `status=accepted`
+            // 但没有受理对象的 ACK 一律 unknown，草稿/附件保留。
+            Ok(ack) => classify_send_ack(&ack, &command_id),
         };
         ActionReceipt {
             action_id: ctx.action_id.clone(),
@@ -1609,11 +1747,36 @@ mod tests {
             session_id: SESSION.to_string(),
             generation,
             text: text.to_string(),
+            held_queue: None,
         }
     }
 
+    /// 合成 send ACK 里的 commandId 占位：真实值只有出站时才生成，由 FakeBridge
+    /// 在应答前替换为信封里的 `commandId`（F2 要求 `result.inputId` 与之相等）。
+    const ACK_COMMAND_ID_PLACEHOLDER: &str = "$COMMAND_ID";
+
     fn accepted_body() -> Value {
-        serde_json::json!({ "status": "accepted" })
+        serde_json::json!({
+            "status": "accepted",
+            "result": {
+                "type": "inputAccepted",
+                "inputId": ACK_COMMAND_ID_PLACEHOLDER,
+                "delivery": "startNow",
+            },
+        })
+    }
+
+    /// 把测试应答里的占位受理对象绑定到本次出站 `commandId`（仅测试替身）。
+    fn bind_ack_command_id(body: &mut Value, command_id: Option<&str>) {
+        let (Some(command_id), Some(result)) = (
+            command_id,
+            body.get_mut("result").and_then(Value::as_object_mut),
+        ) else {
+            return;
+        };
+        if result.get("inputId").and_then(Value::as_str) == Some(ACK_COMMAND_ID_PLACEHOLDER) {
+            result.insert("inputId".to_owned(), Value::from(command_id));
+        }
     }
 
     /// 一次出站帧记录（测试观测：channel/method/args 原样）。
@@ -1758,6 +1921,12 @@ mod tests {
         ) -> BoxFuture<'a, ZResult<Value>> {
             Box::pin(async move {
                 self.observed_timeouts.lock().unwrap().push(timeout);
+                // 出站信封的 commandId：合成 send ACK 的 `result.inputId` 必须与它一致。
+                let command_id = args
+                    .first()
+                    .and_then(|envelope| envelope.get("commandId"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
                 {
                     self.frames.lock().unwrap().push(Frame {
                         target: target.clone(),
@@ -1780,13 +1949,17 @@ mod tests {
                     .unwrap_or_else(|| self.reply.lock().unwrap().clone());
                 let scale = |num: u32, den: u32| timeout.mul_f64(f64::from(num) / f64::from(den));
                 let outcome = match reply {
-                    Reply::Body(body) => Ok(body),
+                    Reply::Body(mut body) => {
+                        bind_ack_command_id(&mut body, command_id.as_deref());
+                        Ok(body)
+                    }
                     Reply::Error(code) => Err(ZcodeError::of(code)),
                     Reply::AckLost => {
                         tokio::time::sleep(timeout).await;
                         Err(ZcodeError::of(codes::NOT_READY))
                     }
-                    Reply::BodyAfter { body, num, den } => {
+                    Reply::BodyAfter { mut body, num, den } => {
+                        bind_ack_command_id(&mut body, command_id.as_deref());
                         tokio::time::sleep(scale(num, den)).await;
                         Ok(body)
                     }
@@ -2093,11 +2266,11 @@ mod tests {
     #[tokio::test]
     async fn accepted_is_not_confirmed_by_unrelated_activity() {
         let store = DeviceStore::memory();
-        let fake = FakeBridge::new(Reply::Body(serde_json::json!({
-            "status": "accepted",
-            "activeWorks": [{ "kind": "chat", "foregroundExecutionId": "exec-9" }],
-            "sessionActivity": 3,
-        })));
+        let mut ack = accepted_body();
+        ack["activeWorks"] =
+            serde_json::json!([{ "kind": "chat", "foregroundExecutionId": "exec-9" }]);
+        ack["sessionActivity"] = serde_json::json!(3);
+        let fake = FakeBridge::new(Reply::Body(ack));
         let sender = sender(&fake, &store);
         let (ctx, action) = (ctx("a-1"), send_action("正常一条"));
 
@@ -2429,6 +2602,7 @@ mod tests {
             session_id: SESSION.to_string(),
             generation: GEN + 1,
             text: "旧代际".to_string(),
+            held_queue: None,
         };
         assert_eq!(
             sender
@@ -2443,6 +2617,7 @@ mod tests {
             session_id: "sess_other".to_string(),
             generation: GEN,
             text: "别的会话".to_string(),
+            held_queue: None,
         };
         assert_eq!(
             sender
@@ -3083,6 +3258,7 @@ mod tests {
                         session_id: SESSION.to_owned(),
                         generation: GEN,
                         text: "synthetic".to_owned(),
+                        held_queue: None,
                     },
                     vec!["send"],
                 ),
@@ -3911,6 +4087,7 @@ mod tests {
                 selection: None,
                 capabilities: CapabilityView::default(),
                 queue: QueueView::default(),
+                input_routing: None,
             }
         }
 
@@ -4971,6 +5148,7 @@ mod tests {
                 selection: None,
                 capabilities: CapabilityView::default(),
                 queue: QueueView::default(),
+                input_routing: None,
             }
         }
 
@@ -5130,6 +5308,370 @@ mod tests {
                 .unwrap();
             assert_eq!(fake.frames().len(), 1);
             assert_eq!(requested_delivery(&fake), None);
+        }
+    }
+
+    // ============================================================
+    // F3：inputRouting.mode="choice" 的旧队列处置（held queue CAS）
+    // ============================================================
+
+    mod held_queue {
+        use super::*;
+
+        use crate::services::zcode_control::types::{
+            CapabilityView, HeldQueueChoice, HeldQueueDisposition, InputRoutingView, QueueItemView,
+            QueueView, SessionView,
+        };
+
+        struct FakeSessions {
+            read: SessionView,
+            calls: AtomicUsize,
+        }
+
+        impl FakeSessions {
+            fn new(read: SessionView) -> Arc<Self> {
+                Arc::new(Self {
+                    read,
+                    calls: AtomicUsize::new(0),
+                })
+            }
+
+            fn calls(&self) -> usize {
+                self.calls.load(Ordering::SeqCst)
+            }
+        }
+
+        impl StopPort for FakeSessions {
+            fn session<'a>(
+                &'a self,
+                _target: &'a BoundTarget,
+                _timeout: Duration,
+            ) -> BoxFuture<'a, ZResult<SessionView>> {
+                Box::pin(async move {
+                    self.calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(self.read.clone())
+                })
+            }
+
+            fn wait_stop_cleared<'a>(
+                &'a self,
+                _target: &'a BoundTarget,
+                _execution_id: &'a str,
+                _baseline_revision: u64,
+                _timeout: Duration,
+            ) -> BoxFuture<'a, bool> {
+                Box::pin(async { false })
+            }
+        }
+
+        fn view(mode: Option<&str>, ids: &[&str]) -> SessionView {
+            SessionView {
+                session_id: SESSION.to_owned(),
+                generation: GEN,
+                revision: Some(9),
+                ready: true,
+                pending: Vec::new(),
+                control: None,
+                selection: None,
+                capabilities: CapabilityView::default(),
+                queue: QueueView {
+                    known: true,
+                    paused: Some(false),
+                    pause_reason: None,
+                    items: ids
+                        .iter()
+                        .enumerate()
+                        .map(|(index, id)| QueueItemView {
+                            input_id: (*id).to_owned(),
+                            text: format!("queued {index}"),
+                            position: Some(index as u32),
+                        })
+                        .collect(),
+                },
+                input_routing: mode.map(|mode| InputRoutingView {
+                    mode: mode.to_owned(),
+                    reason_code: None,
+                }),
+            }
+        }
+
+        fn choice(disposition: HeldQueueDisposition, ids: &[&str]) -> HeldQueueChoice {
+            HeldQueueChoice {
+                disposition,
+                expected_queue_item_ids: ids.iter().map(|id| (*id).to_owned()).collect(),
+            }
+        }
+
+        fn send_with(text: &str, held: Option<HeldQueueChoice>) -> ControlAction {
+            ControlAction::Send {
+                session_id: SESSION.to_owned(),
+                generation: GEN,
+                text: text.to_owned(),
+                held_queue: held,
+            }
+        }
+
+        fn payload(fake: &FakeBridge) -> Value {
+            fake.envelope(0)["payload"].clone()
+        }
+
+        /// choice + 非空队列：保留旧队列并发送；官方两字段展平、CAS 原样。
+        #[tokio::test]
+        async fn choice_send_includes_expected_held_queue_ids() {
+            let store = DeviceStore::memory();
+            let fake = FakeBridge::new(Reply::Body(accepted_body()));
+            let sessions = FakeSessions::new(view(Some("choice"), &["queue_a", "queue_b"]));
+            let sender = sender(&fake, &store).with_stop(sessions.clone());
+
+            let receipt = sender
+                .execute(
+                    &ctx("a-choice-keep"),
+                    &target(),
+                    &send_with(
+                        "新的正文",
+                        Some(choice(
+                            HeldQueueDisposition::KeepQueueAndSend,
+                            &["queue_a", "queue_b"],
+                        )),
+                    ),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(receipt.state, ActionState::Accepted);
+            assert_eq!(sessions.calls(), 1, "写前只现读一次新鲜视图");
+            assert_eq!(fake.frames().len(), 1, "恰一帧 sendText");
+            let payload = payload(&fake);
+            assert_eq!(payload["text"], "新的正文");
+            assert_eq!(payload["heldQueueDisposition"], "keepQueueAndSend");
+            assert_eq!(
+                payload["expectedHeldQueueItemIds"],
+                serde_json::json!(["queue_a", "queue_b"]),
+                "完整 ID 列表与顺序原样：{payload}"
+            );
+            assert!(
+                payload.get("requestedDelivery").is_none(),
+                "空闲会话不得凭空加投递意向：{payload}"
+            );
+            assert!(
+                fake.frames()
+                    .iter()
+                    .all(|frame| frame.method == AGENT_SEND_COMMAND_METHOD),
+                "不得附带任何队列写命令"
+            );
+        }
+
+        /// CAS 失配：拒绝（现有冻结码 invalid_action）、零帧、不重试、不写队列。
+        #[tokio::test]
+        async fn choice_send_cas_mismatch_is_stale_and_not_retried() {
+            let store = DeviceStore::memory();
+            let fake = FakeBridge::new(Reply::Body(accepted_body()));
+            // 官方队列已经变化（第二项被消费/重排）。
+            let sessions = FakeSessions::new(view(Some("choice"), &["queue_b"]));
+            let sender = sender(&fake, &store).with_stop(sessions.clone());
+
+            let error = sender
+                .execute(
+                    &ctx("a-choice-stale"),
+                    &target(),
+                    &send_with(
+                        "新的正文",
+                        Some(choice(
+                            HeldQueueDisposition::ClearQueueAndSend,
+                            &["queue_a", "queue_b"],
+                        )),
+                    ),
+                )
+                .await
+                .expect_err("过期 CAS 必须拒绝");
+
+            assert!(error.is(codes::INVALID_ACTION), "{error:?}");
+            assert_eq!(fake.frames().len(), 0, "失配必须零帧（不试错、不清队列）");
+            assert_eq!(row_count(&store), 0, "拒绝不得占用 actionId");
+            assert_eq!(sessions.calls(), 1);
+            // 不自动重试：再次显式提交才会重读（这里只验证本端没有后台重放）。
+            assert_eq!(fake.frames().len(), 0);
+        }
+
+        /// 顺序也是 CAS 的一部分（同一批 ID 换序同样拒绝）。
+        #[tokio::test]
+        async fn choice_send_order_mismatch_is_rejected() {
+            let store = DeviceStore::memory();
+            let fake = FakeBridge::new(Reply::Body(accepted_body()));
+            let sessions = FakeSessions::new(view(Some("choice"), &["queue_a", "queue_b"]));
+            let sender = sender(&fake, &store).with_stop(sessions);
+
+            let error = sender
+                .execute(
+                    &ctx("a-choice-order"),
+                    &target(),
+                    &send_with(
+                        "新的正文",
+                        Some(choice(
+                            HeldQueueDisposition::KeepQueueAndSend,
+                            &["queue_b", "queue_a"],
+                        )),
+                    ),
+                )
+                .await
+                .expect_err("顺序不符必须拒绝");
+            assert!(error.is(codes::INVALID_ACTION));
+            assert_eq!(fake.frames().len(), 0);
+        }
+
+        /// choice 但队列为空：不需要处置参数，正常发送且 payload 不带两字段。
+        #[tokio::test]
+        async fn choice_with_empty_queue_sends_normally() {
+            let store = DeviceStore::memory();
+            let fake = FakeBridge::new(Reply::Body(accepted_body()));
+            let sessions = FakeSessions::new(view(Some("choice"), &[]));
+            let sender = sender(&fake, &store).with_stop(sessions);
+
+            let receipt = sender
+                .execute(
+                    &ctx("a-choice-empty"),
+                    &target(),
+                    &send_action("空队列发送"),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(receipt.state, ActionState::Accepted);
+            let payload = payload(&fake);
+            assert!(
+                payload.get("heldQueueDisposition").is_none(),
+                "空队列不得携带处置字段：{payload}"
+            );
+            assert!(payload.get("expectedHeldQueueItemIds").is_none());
+        }
+
+        /// choice + 非空队列但没带处置：拒绝（零帧），绝不默认清空/默认保留。
+        #[tokio::test]
+        async fn choice_requires_explicit_disposition() {
+            let store = DeviceStore::memory();
+            let fake = FakeBridge::new(Reply::Body(accepted_body()));
+            let sessions = FakeSessions::new(view(Some("choice"), &["queue_a"]));
+            let sender = sender(&fake, &store).with_stop(sessions);
+
+            let error = sender
+                .execute(&ctx("a-choice-missing"), &target(), &send_action("没选"))
+                .await
+                .expect_err("choice + 非空队列必须显式选择");
+            assert!(error.is(codes::INVALID_ACTION));
+            assert_eq!(fake.frames().len(), 0);
+        }
+
+        /// 带了处置但读不到新鲜状态：无法验 CAS → not_ready，零帧。
+        #[tokio::test]
+        async fn held_queue_without_fresh_view_is_not_ready() {
+            let store = DeviceStore::memory();
+            let fake = FakeBridge::new(Reply::Body(accepted_body()));
+            let sender = sender(&fake, &store);
+
+            let error = sender
+                .execute(
+                    &ctx("a-choice-unwired"),
+                    &target(),
+                    &send_with(
+                        "新的正文",
+                        Some(choice(HeldQueueDisposition::KeepQueueAndSend, &["queue_a"])),
+                    ),
+                )
+                .await
+                .expect_err("无法验 CAS 时不得盲发");
+            assert!(error.is(codes::NOT_READY), "{error:?}");
+            assert_eq!(fake.frames().len(), 0);
+        }
+    }
+
+    // ============================================================
+    // F2：发送 ACK 四元组（result.type/inputId/delivery）
+    // ============================================================
+
+    mod send_ack {
+        use super::*;
+
+        fn full(status: &str, input_id: &str, delivery: &str) -> Value {
+            serde_json::json!({
+                "status": status,
+                "result": {
+                    "type": "inputAccepted",
+                    "inputId": input_id,
+                    "delivery": delivery,
+                },
+            })
+        }
+
+        #[test]
+        fn send_ack_requires_full_input_accepted() {
+            for status in ["accepted", "duplicate"] {
+                for (delivery, expected) in [
+                    ("startNow", SendDelivery::StartNow),
+                    ("queue", SendDelivery::Queue),
+                    ("guide", SendDelivery::Guide),
+                ] {
+                    assert_eq!(
+                        classify_send_ack(&full(status, "cmd-1", delivery), "cmd-1"),
+                        (ActionState::Accepted, None, Some(expected)),
+                        "{status}/{delivery} 完整四元组必须受理"
+                    );
+                }
+            }
+
+            // 缺 result / 错 type / 错 inputId / 错 delivery → unknown。
+            let cases = [
+                serde_json::json!({ "status": "accepted" }),
+                serde_json::json!({
+                    "status": "accepted",
+                    "result": {"type": "queued", "inputId": "cmd-1", "delivery": "queue"},
+                }),
+                serde_json::json!({
+                    "status": "accepted",
+                    "result": {"type": "inputAccepted", "inputId": "cmd-other", "delivery": "queue"},
+                }),
+                serde_json::json!({
+                    "status": "accepted",
+                    "result": {"type": "inputAccepted", "inputId": "cmd-1", "delivery": "later"},
+                }),
+                serde_json::json!({
+                    "status": "accepted",
+                    "result": {"type": "inputAccepted", "inputId": "cmd-1"},
+                }),
+            ];
+            for ack in cases {
+                assert_eq!(
+                    classify_send_ack(&ack, "cmd-1"),
+                    (ActionState::Unknown, Some(codes::UNKNOWN.to_owned()), None),
+                    "不完整 ACK 绝不当受理：{ack}"
+                );
+            }
+        }
+
+        #[test]
+        fn send_ack_never_promotes_failure_states() {
+            for status in ["rejected", "failed", "stale", "noop"] {
+                let (state, _, delivery) =
+                    classify_send_ack(&full(status, "cmd-1", "queue"), "cmd-1");
+                assert_ne!(state, ActionState::Accepted, "{status} 不得认作受理");
+                assert!(delivery.is_none());
+            }
+        }
+
+        /// 集成：`dispatch_send` 必须走专用分类——status=accepted 但缺受理对象 → unknown。
+        #[tokio::test]
+        async fn send_accepted_without_input_accepted_is_unknown() {
+            let store = DeviceStore::memory();
+            let fake = FakeBridge::new(Reply::Body(serde_json::json!({ "status": "accepted" })));
+            let sender = sender(&fake, &store);
+
+            let receipt = sender
+                .execute(&ctx("a-f2-unknown"), &target(), &send_action("草稿保留"))
+                .await
+                .unwrap();
+
+            assert_eq!(receipt.state, ActionState::Unknown);
+            assert_eq!(receipt.reason_code.as_deref(), Some(codes::UNKNOWN));
+            assert_eq!(fake.frames().len(), 1, "仍恰一帧（写已发出，不重试）");
         }
     }
 
@@ -6054,6 +6596,7 @@ mod tests {
                 selection: Some(selection),
                 capabilities: CapabilityView::default(),
                 queue: QueueView::default(),
+                input_routing: None,
             }
         }
 

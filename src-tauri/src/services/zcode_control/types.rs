@@ -330,6 +330,52 @@ pub struct AnswerEntry {
     pub free_text: Option<String>,
 }
 
+/// `inputRouting.mode="choice"` 时用户对**已排队内容**的处置选择。
+///
+/// 严格枚举（serde 只接受这两个官方语义；任意字符串在反序列化阶段即被拒绝）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum HeldQueueDisposition {
+    /// 保留官方队列里的内容，再发送本次正文。
+    KeepQueueAndSend,
+    /// 清空官方队列里的内容，再发送本次正文（破坏性，必须由用户明确选择）。
+    ClearQueueAndSend,
+}
+
+impl HeldQueueDisposition {
+    /// 官方信封字段值（展平 `heldQueueDisposition` 用）。
+    pub fn as_wire(&self) -> &'static str {
+        match self {
+            Self::KeepQueueAndSend => "keepQueueAndSend",
+            Self::ClearQueueAndSend => "clearQueueAndSend",
+        }
+    }
+}
+
+/// 发送时对旧队列的处置（仅 `inputRouting.mode="choice"` + 非空队列时必需）。
+///
+/// `expected_queue_item_ids` 是**官方当前队列的完整 ID 列表与顺序**，写前由后端对新
+/// 鲜队列做 CAS；不匹配 → 拒绝并要求手机刷新后重选，绝不悄悄清空。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HeldQueueChoice {
+    pub disposition: HeldQueueDisposition,
+    pub expected_queue_item_ids: Vec<String>,
+}
+
+/// 官方 `state.inputRouting` 的最小投影（至少 `mode`，可选 `reasonCode`）。
+///
+/// 只用于发送合同判定（`mode=="choice"`）；不把宿主原文/额外字段暴露给手机。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InputRoutingView {
+    /// 官方模式原值（如 `choice`）；投影只接受非空字符串。
+    pub mode: String,
+    /// 官方原因码（原样透传，可缺省）。
+    #[serde(default)]
+    pub reason_code: Option<String>,
+}
+
 /// 统一控制动作（tagged `kind`；**全部**携 `sessionId,generation`）。
 ///
 /// 已接入 `Send`/`Answer`/`Snooze`/`Stop`/`Permission`/`Selection`。
@@ -341,11 +387,16 @@ pub struct AnswerEntry {
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum ControlAction {
     /// 普通文本发送（`sendText`）。
+    ///
+    /// `held_queue` 只在官方 `inputRouting.mode="choice"` 且队列非空时由手机显式
+    /// 提交（保留/清空旧队列）；其余情况缺省为 `None`，旧客户端载荷保持兼容。
     #[serde(rename_all = "camelCase")]
     Send {
         session_id: String,
         generation: u64,
         text: String,
+        #[serde(default)]
+        held_queue: Option<HeldQueueChoice>,
     },
     /// 暂停问答卡自动结束计时（T4）。
     ///
@@ -946,6 +997,12 @@ pub struct SessionView {
     /// 视为未知，绝不据此断言「没有排队」。
     #[serde(default)]
     pub queue: QueueView,
+    /// 官方 `state.inputRouting` 的最小投影（`None` = 宿主未宣告/未知）。
+    ///
+    /// 增量 patch 缺该键保持旧值；快照缺该键置 `None`（绝不沿用上一份快照）。
+    /// 发送前只认**新鲜且 ready** 的视图，绝不用手机屏幕上的旧值猜 `choice`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_routing: Option<InputRoutingView>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1161,6 +1218,7 @@ mod tests {
                         position: Some(0),
                     }],
                 },
+                input_routing: None,
             };
             let value = serde_json::to_value(&view).expect("会话视图应可序列化");
             assert_eq!(value["queue"]["known"], true);

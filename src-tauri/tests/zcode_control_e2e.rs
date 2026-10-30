@@ -1071,6 +1071,7 @@ fn session_with_cards() -> SessionView {
         selection: None,
         capabilities: all_policy(),
         queue: Default::default(),
+        input_routing: None,
     }
 }
 
@@ -1325,6 +1326,7 @@ async fn link_change_invalidates_old_pending_and_actions() {
         selection: None,
         capabilities: Default::default(),
         queue: Default::default(),
+        input_routing: None,
     });
     let (status, session) = get_json(
         app.clone(),
@@ -1446,6 +1448,7 @@ async fn link_change_invalidates_old_pending_and_actions() {
         selection: None,
         capabilities: Default::default(),
         queue: Default::default(),
+        input_routing: None,
     });
     let (status, body) = post_action(
         app.clone(),

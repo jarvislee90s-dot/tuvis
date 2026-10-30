@@ -1434,10 +1434,14 @@ fn apply_relay_session(
             // 否则手机在 ready=false 的投影上仍显示可点的控制面。
             CapabilityView::default()
         };
-        state.last_session = Some(view.clone());
-        // 本会话也可能被别的手机 GET 过：变化同样登记，lag 才能逐会话降级。
-        state.track_session(&view);
-        view
+        // 同会话同代的旧 revision 不得覆盖较新的已发布视图（例如慢 GET 的旧快照在
+        // 更新的事件之后写回）；降级视图（ready=false）独立放行。被拒绝时静默丢弃
+        // 本帧，绝不广播一次倒退事件。
+        let (applied, published) = state.publish_session(view);
+        if !applied {
+            return;
+        }
+        published
     };
     emit_session_event(inner, events, &view);
 }
@@ -1492,6 +1496,104 @@ impl Inner {
             reason_code: self.reason_code.clone(),
             device_label: self.device_label.clone(),
         }
+    }
+
+    /// 同会话同代的 revision 守卫：`incoming` 是否允许覆盖已发布视图。
+    ///
+    /// 只对**同一 `session_id` + 同一 generation** 做比较——`last_session` 可能属于
+    /// 另一个会话，跨会话绝不能拿一个全局「最后一份会话」比较。
+    ///
+    /// - `incoming.ready=false`：真实降级（掉线/坏帧/投影失效）独立放行，绝不能被
+    ///   revision 守卫挡住（安全先行：写面必须关）；
+    /// - `current.ready=false`：恢复视图放行；
+    /// - 双方 revision 均为数字且 `incoming < current` → 拒绝（慢 GET 的旧快照不得
+    ///   覆盖较新的已发布视图）；
+    /// - `incoming.revision=None` 的 `ready=true` 不得覆盖已有数字 revision；
+    /// - 同 revision 允许（权威 GET 恢复能力矩阵）。
+    fn should_replace_published(current: &SessionView, incoming: &SessionView) -> bool {
+        if current.session_id != incoming.session_id || current.generation != incoming.generation {
+            return true;
+        }
+        if !incoming.ready || !current.ready {
+            return true;
+        }
+        match (current.revision, incoming.revision) {
+            (Some(_), None) => false,
+            (Some(current_revision), Some(incoming_revision)) => {
+                incoming_revision >= current_revision
+            }
+            _ => true,
+        }
+    }
+
+    /// 同会话同代的**较旧安全降级**合并：`incoming.ready=false` 但 revision 落后。
+    ///
+    /// 不能整份覆盖——那会把已发布的较新 pending/queue 倒回旧快照，手机即使本地做了
+    /// 「只降级不覆盖」的合并，重开页面后从 GET 拿到的仍是旧内容。语义与手机侧
+    /// `mergeDegradedView` 对齐：内容取 `current`，`ready=false`，能力矩阵回基线全关
+    /// （写面必须关，且绝不携带旧的开闸矩阵）。
+    ///
+    /// 与 [`Inner::degrade_view`] 的区别：后者是**整体失效**（掉线/投影作废，队列已不再
+    /// 被宿主宣称，必须清空）；这里只是同一份较新内容的**新鲜度**丢失，内容仍然有效。
+    ///
+    /// 返回 `Some` = 需要发布合并视图；`None` = 不属于本场景（按原规则处理）。
+    fn merge_stale_degrade(current: &SessionView, incoming: &SessionView) -> Option<SessionView> {
+        if incoming.ready || !current.ready {
+            return None;
+        }
+        if current.session_id != incoming.session_id || current.generation != incoming.generation {
+            return None;
+        }
+        let stale = match (current.revision, incoming.revision) {
+            (Some(current_revision), Some(incoming_revision)) => {
+                incoming_revision < current_revision
+            }
+            (Some(_), None) => true,
+            _ => false,
+        };
+        if !stale {
+            return None;
+        }
+        let mut merged = current.clone();
+        merged.ready = false;
+        merged.capabilities = CapabilityView::default();
+        Some(merged)
+    }
+
+    /// 写回一份已发布会话视图：同一会话同代的旧 revision 不得覆盖较新的视图。
+    ///
+    /// 返回 `(是否写入, 当前权威视图)`：拒绝时第二个值是既有更新的已发布视图，调用方
+    /// 可据此回给手机（HTTP GET 不得回退），且不会广播一次倒退事件。
+    ///
+    /// 旧 revision 的 `ready=false` 仍会发布（安全降级必须能广播），但发布的是**合并
+    /// 视图**：内容用较新视图，`ready/capabilities` 取更严的一侧。
+    fn publish_session(&mut self, view: SessionView) -> (bool, SessionView) {
+        if let Some(current) = self.tracked_sessions.get(&view.session_id) {
+            if !Self::should_replace_published(current, &view) {
+                return (false, current.clone());
+            }
+            if let Some(merged) = Self::merge_stale_degrade(current, &view) {
+                self.last_session = Some(merged.clone());
+                self.track_session(&merged);
+                return (true, merged);
+            }
+        } else if let Some(current) = self.last_session.as_ref() {
+            if current.session_id == view.session_id
+                && !Self::should_replace_published(current, &view)
+            {
+                return (false, current.clone());
+            }
+            if current.session_id == view.session_id {
+                if let Some(merged) = Self::merge_stale_degrade(current, &view) {
+                    self.last_session = Some(merged.clone());
+                    self.track_session(&merged);
+                    return (true, merged);
+                }
+            }
+        }
+        self.last_session = Some(view.clone());
+        self.track_session(&view);
+        (true, view)
     }
 
     /// 连接离开 paired：把**所有就绪的**跟踪会话如实降级为不新鲜（当前代际、
@@ -3163,9 +3265,14 @@ impl ZcodeHub {
             if inner.state != ConnectionState::Paired {
                 return Err(Self::state_error(inner.state));
             }
-            inner.last_session = Some(view.clone());
-            // 每个成功 GET 的会话都进跟踪表：Data 溢出时逐会话降级（不止最后一个）。
-            inner.track_session(&view);
+            // 同会话同代的旧 revision 不得覆盖较新的已发布视图：拒绝时回既有视图
+            // （HTTP GET 也不得把手机倒回旧队列/旧暂停态）。ready=false 的降级仍照旧
+            // 写入并走既有失效路径。
+            let (applied, published) = inner.publish_session(view);
+            if !applied {
+                return Ok(published);
+            }
+            view = published;
         }
         self.emit_session(&view);
         Ok(view)
@@ -4016,6 +4123,7 @@ mod tests {
                     selection: None,
                     capabilities: CapabilityView::default(),
                     queue: QueueView::default(),
+                    input_routing: None,
                 })
             })
         }
@@ -4319,6 +4427,7 @@ mod tests {
             session_id: "sess_synthetic0000".into(),
             generation,
             text: "synthetic text".into(),
+            held_queue: None,
         }
     }
 
@@ -6095,6 +6204,199 @@ mod tests {
         );
     }
 
+    /// 同代 revision 守卫（纯函数）：只有同会话同代才比较，降级/恢复独立放行。
+    #[test]
+    fn published_session_revision_guard_is_scoped_and_safe() {
+        fn view(session: &str, generation: u64, revision: Option<u64>, ready: bool) -> SessionView {
+            SessionView {
+                session_id: session.into(),
+                generation,
+                revision,
+                ready,
+                pending: Vec::new(),
+                control: None,
+                selection: None,
+                capabilities: CapabilityView::default(),
+                queue: QueueView::default(),
+                input_routing: None,
+            }
+        }
+
+        let current = view("sess_a", 3, Some(12), true);
+        // 同会话同代：旧 revision / 缺 revision 的 ready=true 都不得覆盖。
+        assert!(!Inner::should_replace_published(
+            &current,
+            &view("sess_a", 3, Some(11), true)
+        ));
+        assert!(!Inner::should_replace_published(
+            &current,
+            &view("sess_a", 3, None, true)
+        ));
+        // 同 revision 允许（权威 GET 恢复能力矩阵）。
+        assert!(Inner::should_replace_published(
+            &current,
+            &view("sess_a", 3, Some(12), true)
+        ));
+        assert!(Inner::should_replace_published(
+            &current,
+            &view("sess_a", 3, Some(13), true)
+        ));
+        // 安全降级（ready=false）独立放行，即使没有可比较 revision。
+        assert!(Inner::should_replace_published(
+            &current,
+            &view("sess_a", 3, None, false)
+        ));
+        // 跨会话 / 换代：不做全局「最后一份会话」比较。
+        assert!(Inner::should_replace_published(
+            &current,
+            &view("sess_b", 3, Some(1), true)
+        ));
+        assert!(Inner::should_replace_published(
+            &current,
+            &view("sess_a", 4, Some(1), true)
+        ));
+        // 降级视图中的恢复视图放行。
+        assert!(Inner::should_replace_published(
+            &view("sess_a", 3, Some(12), false),
+            &view("sess_a", 3, Some(11), true)
+        ));
+    }
+
+    /// 异步 GET 的旧 revision 不得覆盖已发布的新视图（GET 也回既有权威视图）。
+    #[tokio::test]
+    async fn stale_get_cannot_rollback_newer_published_session() {
+        let fake = Arc::new(FakeBackend::default());
+        let hub = Arc::new(ZcodeHub::with_parts(
+            stored(URL),
+            fake.clone(),
+            send_policy(),
+        ));
+        hub.authorize(OAuthProvider::Bigmodel, noop_open())
+            .await
+            .expect("fake 授权应成功");
+        hub.connect().await.expect("fake 连接应成功");
+        let key = TargetKey {
+            session_id: "sess_revision_guard".into(),
+        };
+        let generation = hub.lock().generation;
+        let published = SessionView {
+            session_id: key.session_id.clone(),
+            generation,
+            revision: Some(12),
+            ready: true,
+            pending: Vec::new(),
+            control: None,
+            selection: None,
+            capabilities: CapabilityView::default(),
+            queue: QueueView {
+                known: true,
+                paused: Some(false),
+                pause_reason: None,
+                items: vec![QueueItemView {
+                    input_id: "queue_new".into(),
+                    text: "newer item".into(),
+                    position: Some(0),
+                }],
+            },
+            input_routing: None,
+        };
+        hub.lock().publish_session(published.clone());
+
+        // fake GET 仍返回 revision=1 的旧快照：不得回退已发布的 rev12。
+        let view = hub.session(&key).await.expect("GET 仍返回权威视图");
+        assert_eq!(view.revision, Some(12), "旧 GET 不得覆盖新视图");
+        assert_eq!(view.queue.items.len(), 1);
+        assert_eq!(view.queue.items[0].input_id, "queue_new");
+        {
+            let inner = hub.lock();
+            let last = inner.last_session.as_ref().expect("已发布会话");
+            assert_eq!(last.revision, Some(12));
+        }
+    }
+
+    /// 更旧的 `ready=false` GET：安全降级必须**仍能发布**，但内容不得倒回旧快照。
+    ///
+    /// 被拒并回「既有较新视图」会让手机永远收不到失效信号；整份覆盖又会把已发布的
+    /// 较新队列换成旧 GET 的内容。正确语义：内容用较新视图，`ready/capabilities` 取
+    /// 更严的一侧（与手机 `mergeDegradedView` 对齐）。
+    #[tokio::test]
+    async fn stale_degrading_get_keeps_newer_content_but_publishes_not_ready() {
+        let fake = Arc::new(FakeBackend::default());
+        let hub = Arc::new(ZcodeHub::with_parts(
+            stored(URL),
+            fake.clone(),
+            send_policy(),
+        ));
+        hub.authorize(OAuthProvider::Bigmodel, noop_open())
+            .await
+            .expect("fake 授权应成功");
+        hub.connect().await.expect("fake 连接应成功");
+        let key = TargetKey {
+            session_id: "sess_stale_degrade".into(),
+        };
+        let generation = hub.lock().generation;
+        let published = SessionView {
+            session_id: key.session_id.clone(),
+            generation,
+            revision: Some(12),
+            ready: true,
+            pending: Vec::new(),
+            control: None,
+            selection: None,
+            capabilities: send_policy(),
+            queue: QueueView {
+                known: true,
+                paused: Some(false),
+                pause_reason: None,
+                items: vec![
+                    QueueItemView {
+                        input_id: "queue_a".into(),
+                        text: "first".into(),
+                        position: Some(0),
+                    },
+                    QueueItemView {
+                        input_id: "queue_b".into(),
+                        text: "second".into(),
+                        position: Some(1),
+                    },
+                ],
+            },
+            input_routing: None,
+        };
+        hub.lock().publish_session(published.clone());
+
+        // fake 的 GET 返回 revision=1 且 ready=false：这是**迟到的旧降级快照**。
+        fake.session_unready.store(true, Ordering::SeqCst);
+        let view = hub.session(&key).await.expect("GET 仍成功返回视图");
+
+        assert!(!view.ready, "安全降级必须能发布（不能回既有较新视图）");
+        assert_eq!(
+            view.capabilities,
+            CapabilityView::default(),
+            "降级视图必须携带全关能力矩阵"
+        );
+        assert_eq!(view.revision, Some(12), "内容锚不得退回旧 GET 的序号");
+        assert_eq!(
+            view.queue.items.len(),
+            2,
+            "旧降级快照不得把较新的队列项冲掉"
+        );
+        assert_eq!(view.queue.items[0].input_id, "queue_a");
+        {
+            let inner = hub.lock();
+            let tracked = inner
+                .tracked_sessions
+                .get(&key.session_id)
+                .expect("降级视图仍须登记跟踪表");
+            assert!(!tracked.ready);
+            assert_eq!(tracked.revision, Some(12));
+            assert_eq!(tracked.queue.items.len(), 2);
+            let last = inner.last_session.as_ref().expect("已发布会话");
+            assert!(!last.ready);
+            assert_eq!(last.queue.items.len(), 2);
+        }
+    }
+
     /// 同一动态策略源同时喂会话矩阵与执行闸：翻转开/关，两者同步变化。
     #[tokio::test]
     async fn session_matrix_and_execute_gate_share_one_policy_source() {
@@ -6289,6 +6591,7 @@ mod tests {
             session_id: "sess_synthetic_other".into(),
             generation,
             text: "synthetic other".into(),
+            held_queue: None,
         };
         let err = hub.execute(ctx("evidence-3"), other).await.unwrap_err();
         assert!(err.is(codes::NEEDS_EVIDENCE));
@@ -6550,6 +6853,7 @@ mod tests {
             selection: None,
             capabilities: CapabilityView::default(),
             queue: QueueView::default(),
+            input_routing: None,
         }
     }
 
@@ -6959,6 +7263,7 @@ mod tests {
                 selection: None,
                 capabilities,
                 queue: QueueView::default(),
+                input_routing: None,
             };
         // ① 未 GET 过的会话：能力矩阵回基线全关，代际/会话/卡面全部按视图落事件。
         pump.push_outcome(Ok(()), vec![synthetic(7, generation + 9, send_policy())]);
@@ -7075,6 +7380,7 @@ mod tests {
             selection: None,
             capabilities: send_policy(),
             queue: QueueView::default(),
+            input_routing: None,
         };
         pump.push_outcome(
             Err(ZcodeError::of(codes::UNSUPPORTED_PROTOCOL)),
@@ -7125,6 +7431,7 @@ mod tests {
             selection: None,
             capabilities: CapabilityView::default(),
             queue: QueueView::default(),
+            input_routing: None,
         };
         pump.push_outcome(Ok(()), vec![recovered]);
         events
@@ -7200,6 +7507,7 @@ mod tests {
             selection: None,
             capabilities: CapabilityView::default(),
             queue: QueueView::default(),
+            input_routing: None,
         };
         pump.push_outcome(Ok(()), vec![alive]);
         events
@@ -8840,6 +9148,7 @@ mod tests {
             selection: None,
             capabilities: CapabilityView::default(),
             queue: QueueView::default(),
+            input_routing: None,
         }
     }
 

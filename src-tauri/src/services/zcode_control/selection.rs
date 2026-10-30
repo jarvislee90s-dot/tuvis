@@ -297,6 +297,7 @@ mod tests {
             selection,
             capabilities: CapabilityView::default(),
             queue: QueueView::default(),
+            input_routing: None,
         }
     }
 

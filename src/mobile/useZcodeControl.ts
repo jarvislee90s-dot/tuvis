@@ -22,6 +22,10 @@
 //   现算能力（每失效周期至多一次，绝不循环）。守卫只在 GET 落地 `ready=true`、切会话、
 //   连接换代时清空。卸载/切会话关闭流；别的会话或旧代次帧忽略。
 // - 阅读链（看板/正文/文件预览）不依赖本 hook 成功。
+// - 落地分三种语义（F1，见 [`resolveSessionViewLanding`]）：不比当前旧的视图**完整
+//   落地**；同会话同代但**更旧**的 `ready=false` 只做**安全降级**（内容留在较新视图，
+//   只关写面）；`recovery` 且更旧只做**能力收窄**（不得开机能力、不得替换内容）。
+//   迟到的旧 GET 绝不能让队列/pending 整体回退（§3.1 / §13 反模式 6）。
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   ZcodeControlApiError,
@@ -30,6 +34,8 @@ import {
   postZcodeAction,
   zcodeEventsUrl,
   type ActionReceipt,
+  type CapabilityFlag,
+  type CapabilityView,
   type ConnectionView,
   type ControlAction,
   type SessionView,
@@ -108,6 +114,170 @@ function isSessionView(value: unknown): value is SessionView {
   );
 }
 
+/**
+ * 会话视图来源：`safety-degrade` = 已确认的**安全降级**（`ready=false` 的实时失效）。
+ *
+ * 业务 revision 只能挡「同代旧快照」，绝不能挡安全降级：掉线/坏帧/投影失效时即使
+ * 没有可比较的 revision，也必须让写面立刻关闭（安全先行）。内容恢复仍走既有
+ * `staleRefreshRef`/`recoveryRefreshRef` 预算，不在本函数里重写恢复逻辑。
+ */
+export type SessionOrigin = "sse" | "get" | "safety-degrade" | "recovery";
+
+/**
+ * 一份 `incoming` 视图的**落地方式**（F1：把「落地」拆成三种语义）：
+ *
+ * - `replace`：完整落地（`setSession`）。只在 `incoming` **不比当前旧**时允许：
+ *   换代更大 / 同代 revision 不更小 / 当前无锚（含切会话）。
+ * - `degrade`：**仅安全降级**。`incoming` 同会话同代但更旧、且 `ready=false`：
+ *   内容字段（pending/queue/control/selection/revision）一律留在较新视图，只把
+ *   `ready` 置 false、能力矩阵全关。迟到的旧 GET 绝不能把队列/pending 倒回旧快照。
+ * - `caps`：**仅能力恢复**。`origin=recovery` 且 `incoming` 更旧：只允许把能力由开
+ *   改关（更严），不得开机能力、不得替换内容字段。
+ * - `drop`：什么都不写（旧代次 / 别的会话 / 更旧的普通 `ready=true` 快照）。
+ */
+export type SessionApplyMode = "replace" | "degrade" | "caps" | "drop";
+
+/** 已落地会话视图的时序锚（只含比较所需的四个字段）。 */
+export interface AppliedSessionView {
+  sessionId: string;
+  generation: number;
+  revision: number | null;
+  ready: boolean;
+}
+
+/** 同会话同代：`incoming` 的 revision 是否**严格更旧**（纯函数）。 */
+function isOlderRevision(current: AppliedSessionView, incoming: AppliedSessionView): boolean {
+  // 当前无锚（revision=null）：没有任何可比较序号，一律不判旧。
+  if (current.revision === null) return false;
+  // 宿主没给序号 ≠ 比已知序号新（与 shouldApplySessionView 既有口径一致）。
+  if (incoming.revision === null) return true;
+  return incoming.revision < current.revision;
+}
+
+/**
+ * 同代 revision 守卫（纯函数）：`incoming` 该按哪种语义落地。
+ *
+ * 规则（F1）：
+ * - 跨会话 / 换代更大 / 当前无锚 → `replace`（完整落地）；
+ * - 旧代次 → `drop`；
+ * - 同会话同代、`incoming` 不比当前旧（revision 不更小，或当前无锚）→ `replace`；
+ * - 同会话同代、`incoming` 更旧：
+ *   - `ready=false` → `degrade`：**安全降级独立放行**（实时失效必须能关写面），
+ *     但只关写面，内容留在较新视图——旧 GET 不得恢复旧队列/pending；
+ *   - `origin=recovery` 且 `ready=true` → `caps`：只收窄能力矩阵（把开改关），
+ *     绝不复活旧内容；
+ *   - 其余（普通 GET/SSE 的更旧 `ready=true` 快照）→ `drop`：旧内容不得回归。
+ */
+export function resolveSessionViewLanding(
+  current: AppliedSessionView | null,
+  incoming: AppliedSessionView,
+  origin: SessionOrigin
+): SessionApplyMode {
+  if (current === null) return "replace";
+  if (current.sessionId !== incoming.sessionId) return "replace";
+  if (incoming.generation > current.generation) return "replace";
+  if (incoming.generation < current.generation) return "drop";
+  if (!isOlderRevision(current, incoming)) return "replace";
+  if (!incoming.ready) return "degrade";
+  if (origin === "recovery") return "caps";
+  return "drop";
+}
+
+/**
+ * 同代 revision 守卫的布尔外壳（保留给调用方/测试）：`incoming` 是否**有任何**写入。
+ *
+ * 语义收窄为「不整份落地」不再等于「丢弃」：安全降级走 `degrade`、恢复走 `caps`
+ * 也算落地（都会写 state），但都不允许覆盖较新的业务内容。
+ */
+export function shouldApplySessionView(
+  current: AppliedSessionView | null,
+  incoming: AppliedSessionView,
+  origin: SessionOrigin
+): boolean {
+  return resolveSessionViewLanding(current, incoming, origin) !== "drop";
+}
+
+/** 降级能力矩阵的冻结原因码（与 Rust `CapabilityView::default()` 逐字一致）。 */
+const DEGRADED_REASON_CODE = "needs_evidence";
+
+function closedFlag(): CapabilityFlag {
+  return { enabled: false, reasonCode: DEGRADED_REASON_CODE };
+}
+
+/**
+ * 已降级视图的写能力矩阵：八项全关并带冻结原因码。
+ *
+ * 唯一一处在手机侧构造「全关」矩阵——安全降级不得携带旧的开闸能力，也不许另造
+ * 第二套字段/开关（与 Rust `CapabilityView::default()` 同形）。
+ */
+export function degradedCapabilities(): CapabilityView {
+  return {
+    send: closedFlag(),
+    singleSelect: closedFlag(),
+    multiSelect: closedFlag(),
+    freeText: closedFlag(),
+    interrupt: closedFlag(),
+    approvalReply: closedFlag(),
+    model: closedFlag(),
+    thoughtLevel: closedFlag(),
+  };
+}
+
+const CAPABILITY_KEYS = [
+  "send",
+  "singleSelect",
+  "multiSelect",
+  "freeText",
+  "interrupt",
+  "approvalReply",
+  "model",
+  "thoughtLevel",
+] as const;
+
+/** 逐项取「更严」：只在两侧都开时才算开；关闭时保留关闭侧的原因码。 */
+function tightenCapabilities(current: CapabilityView, incoming: CapabilityView): CapabilityView {
+  const merged = {} as CapabilityView;
+  for (const key of CAPABILITY_KEYS) {
+    const cur = current[key];
+    const next = incoming[key];
+    const enabled = cur.enabled && next.enabled;
+    merged[key] = {
+      enabled,
+      reasonCode: enabled ? null : cur.enabled ? next.reasonCode : cur.reasonCode,
+    };
+  }
+  return merged;
+}
+
+/**
+ * 仅安全降级（纯函数）：内容留在 `current`，只关写面。
+ *
+ * `incoming` 是**更旧**的降级快照（迟到的旧 GET / 旧帧）。它的 pending/queue/
+ * control/selection 一律不采信——那正是「旧队列复活」的来源；只借它的
+ * `ready=false` 关写面，能力矩阵回全关。`incoming.ready=true`（异常路径）时保留
+ * `current.ready`，绝不由旧视图开写面。
+ */
+export function mergeDegradedView(current: SessionView, incoming: SessionView): SessionView {
+  return {
+    ...current,
+    ready: incoming.ready ? current.ready : false,
+    capabilities: degradedCapabilities(),
+  };
+}
+
+/**
+ * 仅能力恢复（纯函数）：内容留在 `current`，能力矩阵逐项取「更严」。
+ *
+ * 用于 `origin=recovery` 且 `incoming` 更旧的权威现读：它可以把能力由开改关
+ * （更严），但**不得**开机能力、不得替换内容字段——否则旧视图会复活旧队列项。
+ */
+export function mergeRecoveredCaps(current: SessionView, incoming: SessionView): SessionView {
+  return {
+    ...current,
+    capabilities: tightenCapabilities(current.capabilities, incoming.capabilities),
+  };
+}
+
 /** `ControlEvent` 的线上形状（`snapshot`/`resync` 帧无此包裹，单独处理）。 */
 interface ControlEventFrame {
   seq: number;
@@ -143,6 +313,11 @@ export default function useZcodeControl(sessionId: string): UseZcodeControlResul
   const inflightSubmitsRef = useRef(0);
   /** 已落地的代次（连接/会话各自）：SSE/GET 帧低于它 = 迟到旧代，丢弃。 */
   const generationRef = useRef({ connection: -1, session: -1 });
+  /**
+   * 最近一次**成功落地**的会话视图时序锚（会话 + 代次 + revision + ready）：
+   * 同代 revision 守卫据此丢弃慢 GET 的旧快照。切会话/连接换代时复位。
+   */
+  const appliedSessionRef = useRef<AppliedSessionView | null>(null);
   /**
    * 最近一次**成功落地**的连接视图（state + generation）：判「同代状态跃迁」用。
    * 只在 applyConnection 真正写入 state 时更新——同代 `needs_auth/connecting → paired`
@@ -191,11 +366,44 @@ export default function useZcodeControl(sessionId: string): UseZcodeControlResul
     return true;
   }, []);
 
-  /** 落地会话投影并推进代次；别的会话/旧代次 → false（不写 state）。 */
-  const applySessionView = useCallback((view: SessionView): boolean => {
+  /**
+   * 落地会话投影并推进代次；别的会话/旧代次/不允许写入 → false（不写 state）。
+   *
+   * 三种落地语义（见 [`resolveSessionViewLanding`]）：完整落地；**仅安全降级**
+   * （保持较新的 pending/queue/control/selection，只关写面）；**仅能力恢复**
+   * （只收窄能力矩阵）。迟到的旧 GET 绝不能整份覆盖较新的业务内容。
+   */
+  const applySessionView = useCallback((view: SessionView, origin: SessionOrigin): boolean => {
     if (view.sessionId !== sessionRef.current) return false;
+    // 旧代次仍然直接丢弃（既有规则）；同代单调由纯函数统一判定（含安全降级分流）。
     if (view.generation < generationRef.current.session) return false;
+    const current = appliedSessionRef.current;
+    const incoming: AppliedSessionView = {
+      sessionId: view.sessionId,
+      generation: view.generation,
+      revision: view.revision,
+      ready: view.ready,
+    };
+    const landing = resolveSessionViewLanding(current, incoming, origin);
+    if (landing === "drop") return false;
+    if (landing === "degrade") {
+      // 只关写面：内容留在较新视图（绝不 setSession(view) 整份覆盖）。
+      setSession((prev) => (prev === null ? view : mergeDegradedView(prev, view)));
+      appliedSessionRef.current = {
+        sessionId: view.sessionId,
+        generation: view.generation,
+        revision: current?.revision ?? view.revision,
+        ready: false,
+      };
+      return true;
+    }
+    if (landing === "caps") {
+      // 只收窄能力：内容与 ready 一律留在较新视图，并保持时序锚不变。
+      setSession((prev) => (prev === null ? view : mergeRecoveredCaps(prev, view)));
+      return true;
+    }
     generationRef.current.session = view.generation;
+    appliedSessionRef.current = incoming;
     setSession(view);
     // 守卫**不**在这里按 `ready` 清空：SSE 帧的 ready=true 可能仍带着降级后的全关
     // 能力矩阵，只有 GET 落地 ready=true（applyRead）才算权威恢复。
@@ -204,7 +412,7 @@ export default function useZcodeControl(sessionId: string): UseZcodeControlResul
 
   /** 读连接 + 会话并落地；返回是否真正生效（旧会话/旧轮次 → false，不写 state）。 */
   const applyRead = useCallback(
-    async (sid: string, run: number): Promise<boolean> => {
+    async (sid: string, run: number, origin: SessionOrigin = "get"): Promise<boolean> => {
       const isCurrent = () => sessionRef.current === sid && readRunRef.current === run;
       // 两面分开读：任一失败不拖累另一面（控制失败时阅读链照常）。
       const connectionRead = getZcodeConnection().then(
@@ -221,7 +429,10 @@ export default function useZcodeControl(sessionId: string): UseZcodeControlResul
       });
       void sessionRead.then((outcome) => {
         if (!outcome.ok || !isCurrent()) return;
-        if (!applySessionView(outcome.value)) return;
+        // GET 的 ready=false 是真实失效（页面可能在失效窗口内打开）：按安全降级独立
+        // 放行（只关写面；内容若比当前旧则保持不倒退），不得被 revision 守卫挡在门外。
+        if (!applySessionView(outcome.value, outcome.value.ready ? origin : "safety-degrade"))
+          return;
         // 只有 **GET 落地** 的 ready=true 才算权威恢复（能力矩阵已现算）：清掉失效/
         // 恢复守卫。SSE 帧的 ready=true 走 requestStaleRefresh，不在此清。
         if (outcome.value.ready) {
@@ -265,6 +476,7 @@ export default function useZcodeControl(sessionId: string): UseZcodeControlResul
     // 换会话：旧代次与旧「已落地连接视图」一律作废（新会话从自己的首个快照重新起算）。
     generationRef.current = { connection: -1, session: -1 };
     appliedConnectionRef.current = null;
+    appliedSessionRef.current = null;
     // 旧会话的失效/恢复守卫不得吞掉新会话（同代次）的第一次降级自愈/恢复补拉。
     staleRefreshRef.current = null;
     recoveryRefreshRef.current = null;
@@ -285,12 +497,21 @@ export default function useZcodeControl(sessionId: string): UseZcodeControlResul
     };
   }, [sessionId, applyRead]);
 
+  /** 重读连接 + 会话；`recovery=true` 仅由失效/恢复守卫使用（事后权威现读）。 */
+  const readSessions = useCallback(
+    async (recovery: boolean) => {
+      const sid = sessionRef.current;
+      if (sid === null) return; // 已卸载：静默
+      const applied = await applyRead(sid, ++readRunRef.current, recovery ? "recovery" : "get");
+      if (applied) setLoading(false);
+    },
+    [applyRead]
+  );
+
+  /** 公开纠偏入口（SSE 重连/换代）：普通 GET，受同代 revision 单调约束。 */
   const refresh = useCallback(async () => {
-    const sid = sessionRef.current;
-    if (sid === null) return; // 已卸载：静默
-    const applied = await applyRead(sid, ++readRunRef.current);
-    if (applied) setLoading(false);
-  }, [applyRead]);
+    await readSessions(false);
+  }, [readSessions]);
 
   /**
    * 失效/恢复的一次性自愈（stale 每代次最多一发，恢复最多
@@ -315,7 +536,7 @@ export default function useZcodeControl(sessionId: string): UseZcodeControlResul
         recoveryRefreshRef.current = null;
         if (staleRefreshRef.current === generation) return;
         staleRefreshRef.current = generation;
-        void refresh();
+        void readSessions(true);
         return;
       }
       if (recoveryRefreshRef.current === generation) return;
@@ -325,13 +546,13 @@ export default function useZcodeControl(sessionId: string): UseZcodeControlResul
         if (used >= MAX_RECOVERY_ATTEMPTS_PER_GENERATION) return;
         recoveryAttemptsRef.current = { generation, attempts: used + 1 };
         recoveryRefreshRef.current = generation;
-        void refresh();
+        void readSessions(true);
         return;
       }
       staleRefreshRef.current = null;
       recoveryRefreshRef.current = null;
     },
-    [refresh]
+    [readSessions]
   );
 
   // ==== SSE：会话作用域事件流（DTO 直接落地；lag/断流只重 GET）====
@@ -357,7 +578,10 @@ export default function useZcodeControl(sessionId: string): UseZcodeControlResul
         // 首帧/重连基线：连接与（可绑定时的）会话投影一起纠偏
         const connectionView = isConnectionView(frame.connection) ? frame.connection : null;
         const sessionFrame = isSessionView(frame.session) ? frame.session : null;
-        const sessionApplied = sessionFrame !== null ? applySessionView(sessionFrame) : false;
+        const sessionApplied =
+          sessionFrame !== null
+            ? applySessionView(sessionFrame, sessionFrame.ready ? "sse" : "safety-degrade")
+            : false;
         const connectionApplied = connectionView !== null ? applyConnection(connectionView) : false;
         // 基线里的会话投影已失效（lag 后 ready=false）：与 session 帧同规，一次性自愈。
         if (sessionApplied && sessionFrame !== null) requestStaleRefresh(sessionFrame);
@@ -392,6 +616,7 @@ export default function useZcodeControl(sessionId: string): UseZcodeControlResul
         if (advanced) {
           // 换代：旧代 pending 失效（新投影由重 GET / 后续 session 帧补上）
           setSession(null);
+          appliedSessionRef.current = null;
           staleRefreshRef.current = null;
           recoveryRefreshRef.current = null;
           recoveryAttemptsRef.current = { generation: -1, attempts: 0 };
@@ -411,7 +636,9 @@ export default function useZcodeControl(sessionId: string): UseZcodeControlResul
         if (envelope.generation < generationRef.current.session) return; // 旧代次
         if (!isSessionView(envelope.data)) return;
         // 只有真正落地的帧才触发自愈（旧代次/别的会话一律不刷新）。
-        if (applySessionView(envelope.data)) requestStaleRefresh(envelope.data);
+        if (applySessionView(envelope.data, envelope.data.ready ? "sse" : "safety-degrade")) {
+          requestStaleRefresh(envelope.data);
+        }
         return;
       }
       if (name === "action") {
@@ -489,7 +716,9 @@ export default function useZcodeControl(sessionId: string): UseZcodeControlResul
     try {
       const receipt = await postZcodeAction(actionId, action);
       setReason(receiptReason(receipt));
-      // 仅 send 的 accepted 允许清本次草稿；confirmed 只表示已生效，不冒充发送结果。
+      // 仅 send 的 accepted 允许清本次草稿。`accepted` 已由服务端按 F2 的完整
+      // `inputAccepted` 四元组（type/inputId/delivery）验证过——手机侧**绝不再**
+      // 自行放宽成「status 看起来像成功」；`confirmed` 只表示已生效，不冒充发送结果。
       if (action.kind === "send" && receipt.state === "accepted") setDraftCleared(true);
       return receipt;
     } catch (error) {

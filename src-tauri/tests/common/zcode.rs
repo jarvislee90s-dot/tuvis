@@ -153,6 +153,7 @@ fn bare_session(target: &BoundTarget) -> SessionView {
         selection: None,
         capabilities: CapabilityView::default(),
         queue: QueueView::default(),
+        input_routing: None,
     }
 }
 
@@ -220,6 +221,7 @@ impl FakeOfficial {
             selection: None,
             capabilities: CapabilityView::default(),
             queue: QueueView::default(),
+            input_routing: None,
         });
         view.control = control;
     }

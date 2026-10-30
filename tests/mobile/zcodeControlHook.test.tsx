@@ -21,6 +21,7 @@ import {
   type CapabilityView,
   type ConnectionView,
   type ControlAction,
+  type QueueView,
   type SessionView,
 } from "@/lib/api/zcodeControl";
 import { MockEventSource } from "./eventSourceMock";
@@ -911,7 +912,10 @@ describe("useZcodeControl：SSE 纠偏（不重放动作）", () => {
             sessionView({ ready: false, revision: 11, capabilities: closedCapabilities() })
           );
         }
-        return json(sessionView({ ready: true, revision: 12, capabilities: capabilities() }));
+        // 权威现读必须**不比已落地视图旧**（rev13）才能恢复能力：更旧的现读只能把
+        // 能力由开改关（F1 `recovery` 语义），否则旧快照会把已开的写面关回去/或把
+        // 旧内容带回来。这里锁的是「自动补读能拿回 send」，故给同序号的权威读。
+        return json(sessionView({ ready: true, revision: 13, capabilities: capabilities() }));
       }
       throw new Error(`unexpected fetch: ${url}`);
     });
@@ -1140,5 +1144,254 @@ describe("useZcodeControl：SSE 纠偏（不重放动作）", () => {
     });
     await flush();
     expect(sessionGets()).toBe(afterPair);
+  });
+});
+
+describe("useZcodeControl：F1 同代 revision 单调", () => {
+  function queueView(ids: string[]): QueueView {
+    return {
+      known: true,
+      paused: false,
+      items: ids.map((id, position) => ({ inputId: id, text: id, position })),
+    };
+  }
+
+  it("old_get_cannot_rollback_newer_sse_queue", async () => {
+    // 首拍 GET 仍在途时，SSE 已把同代视图推进到 revision=12（新队列）。
+    const gate = deferred<Response>();
+    installFetch((url) => {
+      if (url === ZCODE_CONNECTION_PATH) return json(connection());
+      if (url.startsWith(`${ZCODE_SESSION_PATH}?`)) return gate.promise;
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+
+    const { result } = renderHook(() => useZcodeControl(SID));
+    await flush();
+    expect(result.current.session).toBeNull();
+
+    await act(async () => {
+      MockEventSource.latest().emit("session", {
+        seq: 1,
+        generation: 3,
+        sessionId: SID,
+        kind: "session",
+        data: sessionView({ revision: 12, queue: queueView(["queue_new"]) }),
+      });
+      await Promise.resolve();
+    });
+    await flush();
+    expect(result.current.session?.revision).toBe(12);
+
+    // 慢 GET 带着 revision=11 与旧队列迟到：不得回退视图。
+    await act(async () => {
+      gate.resolve(json(sessionView({ revision: 11, queue: queueView(["queue_old"]) })));
+      await Promise.resolve();
+    });
+    await flush();
+
+    expect(result.current.session?.revision).toBe(12);
+    expect(result.current.session?.queue?.items.map((item) => item.inputId)).toEqual(["queue_new"]);
+  });
+
+  it("sse_safety_degrade_without_revision_still_closes_writes", async () => {
+    // 首拍 GET 就绪；随后 SSE 宣布失效（ready=false、revision=null）：revision 守卫
+    // 绝不能挡住安全降级，写面必须立即关闭。
+    let degraded = false;
+    installFetch((url) => {
+      if (url === ZCODE_CONNECTION_PATH) return json(connection());
+      if (url.startsWith(`${ZCODE_SESSION_PATH}?`)) {
+        return json(
+          degraded
+            ? sessionView({ ready: false, revision: 11, capabilities: closedCapabilities() })
+            : sessionView()
+        );
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+
+    const { result } = renderHook(() => useZcodeControl(SID));
+    await flush();
+    expect(result.current.session?.ready).toBe(true);
+    expect(result.current.session?.capabilities.send.enabled).toBe(true);
+
+    degraded = true;
+    await act(async () => {
+      MockEventSource.latest().emit("session", {
+        seq: 1,
+        generation: 3,
+        sessionId: SID,
+        kind: "session",
+        data: sessionView({
+          ready: false,
+          revision: null,
+          capabilities: closedCapabilities(),
+        }),
+      });
+      await Promise.resolve();
+    });
+    await flush();
+
+    expect(result.current.session?.ready).toBe(false);
+    expect(result.current.session?.capabilities.send.enabled).toBe(false);
+  });
+
+  const CAPABILITY_KEYS = [
+    "send",
+    "singleSelect",
+    "multiSelect",
+    "freeText",
+    "interrupt",
+    "approvalReply",
+    "model",
+    "thoughtLevel",
+  ] as const;
+
+  function emitSessionFrame(data: SessionView) {
+    return act(async () => {
+      MockEventSource.latest().emit("session", {
+        seq: 1,
+        generation: data.generation,
+        sessionId: SID,
+        kind: "session",
+        data,
+      });
+      await Promise.resolve();
+    });
+  }
+
+  it("stale_degrade_keeps_newer_queue_content", async () => {
+    // 当前 rev12 就绪、队列两条。一个迟到的 rev11 `ready=false`（applyRead 会把它标成
+    // safety-degrade）只能关写面：队列/pending 一律留在 rev12，绝不能被旧快照覆盖。
+    let serverView = sessionView({
+      revision: 12,
+      queue: queueView(["queue_a", "queue_b"]),
+    });
+    installFetch((url) => {
+      if (url === ZCODE_CONNECTION_PATH) return json(connection());
+      if (url.startsWith(`${ZCODE_SESSION_PATH}?`)) return json(serverView);
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+
+    const { result } = renderHook(() => useZcodeControl(SID));
+    await flush();
+    const sessionGets = () =>
+      calledUrls().filter((url) => url.startsWith(`${ZCODE_SESSION_PATH}?`)).length;
+    expect(result.current.session?.revision).toBe(12);
+    expect(result.current.session?.queue?.items).toHaveLength(2);
+    expect(result.current.session?.capabilities.send.enabled).toBe(true);
+
+    // 迟到的旧快照：rev11、ready=false、空队列、能力全关。
+    serverView = sessionView({
+      revision: 11,
+      ready: false,
+      queue: queueView([]),
+      capabilities: closedCapabilities(),
+    });
+    await emitSessionFrame(serverView);
+    await flush();
+    // 失效自愈 GET 仍返回这份旧快照：同样只能降级、不得回退内容。
+    expect(sessionGets()).toBe(2);
+
+    expect(result.current.session?.queue?.items.map((item) => item.inputId)).toEqual([
+      "queue_a",
+      "queue_b",
+    ]);
+    expect(result.current.session?.revision).toBe(12);
+    expect(result.current.session?.ready).toBe(false);
+    // 写面全关（面板 sendAllowed = gateReason + send 能力 + 代际，见 ZcodeControlPanel）。
+    for (const key of CAPABILITY_KEYS) {
+      expect(result.current.session?.capabilities[key].enabled).toBe(false);
+    }
+    expect(postedActions()).toHaveLength(0);
+  });
+
+  it("recovery_never_restores_older_content", async () => {
+    // rev12 就绪（队列两条、能力全关）→ 更旧的降级帧关写面（内容不回退）→ 由它触发的
+    // 恢复 GET 返回更旧的 rev10 `ready=true` 且能力全开：只许收窄能力，旧队列不得复活。
+    let serverView = sessionView({
+      revision: 12,
+      queue: queueView(["queue_new1", "queue_new2"]),
+      capabilities: closedCapabilities(),
+    });
+    installFetch((url) => {
+      if (url === ZCODE_CONNECTION_PATH) return json(connection());
+      if (url.startsWith(`${ZCODE_SESSION_PATH}?`)) return json(serverView);
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+
+    const { result } = renderHook(() => useZcodeControl(SID));
+    await flush();
+    const sessionGets = () =>
+      calledUrls().filter((url) => url.startsWith(`${ZCODE_SESSION_PATH}?`)).length;
+    expect(result.current.session?.revision).toBe(12);
+    expect(result.current.session?.queue?.items).toHaveLength(2);
+
+    // 恢复 GET 的答案先换好：rev10（比当前旧）、ready=true、能力全开、旧队列。
+    serverView = sessionView({
+      revision: 10,
+      ready: true,
+      queue: queueView(["queue_old"]),
+      capabilities: capabilities(),
+    });
+    await emitSessionFrame(
+      sessionView({
+        revision: 11,
+        ready: false,
+        queue: queueView([]),
+        capabilities: closedCapabilities(),
+      })
+    );
+    await flush();
+    // 恢复现读确实发生过（否则下面的断言会因「根本没读」而空过）。
+    expect(sessionGets()).toBe(2);
+
+    expect(result.current.session?.queue?.items.map((item) => item.inputId)).toEqual([
+      "queue_new1",
+      "queue_new2",
+    ]);
+    expect(result.current.session?.revision).toBe(12);
+    // 能力不得由关变开：更旧的现读只能把开改关。
+    expect(result.current.session?.capabilities.send.enabled).toBe(false);
+    expect(result.current.session?.ready).toBe(false);
+    expect(postedActions()).toHaveLength(0);
+  });
+
+  it("recovery_restores_enabled_caps_when_newer", async () => {
+    // 恢复现读**不比当前旧**（rev13 > rev12）时仍走完整落地：能力按新视图生效。
+    let serverView = sessionView({
+      revision: 12,
+      queue: queueView(["queue_a"]),
+      capabilities: closedCapabilities(),
+    });
+    installFetch((url) => {
+      if (url === ZCODE_CONNECTION_PATH) return json(connection());
+      if (url.startsWith(`${ZCODE_SESSION_PATH}?`)) return json(serverView);
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+
+    const { result } = renderHook(() => useZcodeControl(SID));
+    await flush();
+    const sessionGets = () =>
+      calledUrls().filter((url) => url.startsWith(`${ZCODE_SESSION_PATH}?`)).length;
+    expect(result.current.session?.capabilities.send.enabled).toBe(false);
+
+    // 降级帧（同序 rev12）→ 触发恢复 GET；该 GET 返回 rev13（更新）且能力全开。
+    serverView = sessionView({ revision: 13, queue: queueView(["queue_b"]) });
+    await emitSessionFrame(
+      sessionView({
+        revision: 12,
+        ready: false,
+        queue: queueView([]),
+        capabilities: closedCapabilities(),
+      })
+    );
+    await flush();
+    expect(sessionGets()).toBe(2);
+
+    expect(result.current.session?.ready).toBe(true);
+    expect(result.current.session?.revision).toBe(13);
+    expect(result.current.session?.capabilities.send.enabled).toBe(true);
+    expect(result.current.session?.queue?.items.map((item) => item.inputId)).toEqual(["queue_b"]);
+    expect(postedActions()).toHaveLength(0);
   });
 });

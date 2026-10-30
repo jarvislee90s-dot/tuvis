@@ -15,6 +15,8 @@ import {
   type ActionReceipt,
   type ConnectionView,
   type ControlAction,
+  type HeldQueueChoice,
+  type HeldQueueDisposition,
   type SessionView,
   type ZcodeErrorCode,
   ZcodeControlApiError,
@@ -69,6 +71,12 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
   const { connection, session, reason, submitting, draftCleared, submit, refresh } =
     useZcodeControl(sessionId);
   const [draft, setDraft] = useState("");
+  /**
+   * `inputRouting.mode="choice"` + 非空队列：发送前必须让用户显式选择旧队列处置
+   * （保留/清空/取消）。默认焦点在「保留」，清空是破坏性操作绝不默认。
+   */
+  const [heldQueuePrompt, setHeldQueuePrompt] = useState(false);
+  const heldQueueKeepRef = useRef<HTMLButtonElement | null>(null);
   const [receipt, setReceipt] = useState<ActionReceipt | null>(null);
   /** 已保存的官方链接（只读 GET /m/api/v1/official-control；读不到 → null = 不挂入口）。 */
   const [officialUrl, setOfficialUrl] = useState<string | null>(null);
@@ -123,12 +131,19 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
     }
   }, [draftCleared]);
 
+  /** choice 选择器打开时默认焦点在「保留旧队列」（破坏性选项绝不默认聚焦）。 */
+  useEffect(() => {
+    if (heldQueuePrompt) heldQueueKeepRef.current?.focus();
+  }, [heldQueuePrompt]);
+
   // 换会话清旧回执与旧草稿：上一次会话的受理状态不得贴到新会话。
   useEffect(() => {
     setReceipt(null);
     setDraft("");
     draftRef.current = "";
     submittedDraftRef.current = null;
+    // 切会话：旧会话的 choice 选择器不得留下（期望 IDs 属于旧队列）。
+    setHeldQueuePrompt(false);
     // 三轮 C：附件与在途上传不跨会话残留。
     setAttachments([]);
     submittedAttachmentIdsRef.current = null;
@@ -382,6 +397,31 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
     addZcodeFiles(images);
   };
 
+  /** 真正提交发送（一次一个 actionId）；`heldQueue` 只在用户确认处置后携带。 */
+  const submitSend = (heldQueue?: HeldQueueChoice) => {
+    if (!sendAllowed || session === null || inFlightRef.current) return;
+    const current = attachmentsRef.current;
+    const markup = attachmentMarkup(current);
+    const text = draft.trim();
+    if (text.length === 0 && markup.length === 0) {
+      setHeldQueuePrompt(false);
+      return;
+    }
+    // 记下本次提交原文与随行附件：accepted 清「同一份」，失败/未知全保留。
+    submittedDraftRef.current = draft;
+    submittedAttachmentIdsRef.current = current
+      .filter((a) => a.status === "ready")
+      .map((a) => a.id);
+    setHeldQueuePrompt(false);
+    runOnce({
+      kind: "send",
+      sessionId,
+      generation: session.generation,
+      text: markup ? (text ? `${draft}\n${markup}` : markup) : draft, // 多行原样上行
+      ...(heldQueue ? { heldQueue } : {}),
+    });
+  };
+
   const handleSend = () => {
     if (primaryAction !== "send") return;
     if (!sendAllowed || session === null || inFlightRef.current) return;
@@ -390,16 +430,25 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
     const text = draft.trim();
     // 空正文绝不 POST（按钮是控制通道占位，不是「发空消息」的许可）。
     if (text.length === 0 && markup.length === 0) return;
-    // 记下本次提交原文与随行附件：accepted 清「同一份」，失败/未知全保留。
-    submittedDraftRef.current = draft;
-    submittedAttachmentIdsRef.current = current
-      .filter((a) => a.status === "ready")
-      .map((a) => a.id);
-    runOnce({
-      kind: "send",
-      sessionId,
-      generation: session.generation,
-      text: markup ? (text ? `${draft}\n${markup}` : markup) : draft, // 多行原样上行
+    // 官方 `choice` + 非空队列：先让用户显式决定旧队列的处置（保留/清空/取消）。
+    // 取消不发；确认后**一次** send（新 actionId）。UI 绝不默认清空。
+    if (session.inputRouting?.mode === "choice" && (session.queue?.items.length ?? 0) > 0) {
+      setHeldQueuePrompt(true);
+      return;
+    }
+    submitSend();
+  };
+
+  /** 用户确认旧队列处置：CAS 期望值取当前手机可见队列的完整 ID（服务端再核对）。 */
+  const confirmHeldQueue = (disposition: HeldQueueDisposition) => {
+    if (session === null) {
+      setHeldQueuePrompt(false);
+      return;
+    }
+    const expectedQueueItemIds = (session.queue?.items ?? []).map((item) => item.inputId);
+    submitSend({
+      disposition,
+      expectedQueueItemIds,
     });
   };
 
@@ -835,6 +884,49 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
         >
           {i18n.t("mobile.composer.attachHint")}
         </p>
+      )}
+      {heldQueuePrompt && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="zcode-held-queue-title"
+          data-testid="zcode-held-queue-dialog"
+          className="mt-2 rounded-lg border border-[var(--cb)] bg-[var(--cbg)] p-2"
+        >
+          <p id="zcode-held-queue-title" className="text-xs font-medium text-[var(--tx)]">
+            {i18n.t("mobile.zcodeControl.heldQueueTitle")}
+          </p>
+          <p className="mt-1 text-[11px] leading-4 text-[var(--mut)]">
+            {i18n.t("mobile.zcodeControl.heldQueueHint")}
+          </p>
+          <div className="mt-2 flex flex-wrap gap-2">
+            <button
+              ref={heldQueueKeepRef}
+              type="button"
+              data-testid="zcode-held-queue-keep"
+              onClick={() => confirmHeldQueue("keepQueueAndSend")}
+              className="rounded-lg border border-[var(--cb)] px-3 py-1.5 text-xs text-[var(--tx)]"
+            >
+              {i18n.t("mobile.zcodeControl.heldQueueKeep")}
+            </button>
+            <button
+              type="button"
+              data-testid="zcode-held-queue-clear"
+              onClick={() => confirmHeldQueue("clearQueueAndSend")}
+              className="rounded-lg border border-[var(--cb)] px-3 py-1.5 text-xs text-[var(--tx)]"
+            >
+              {i18n.t("mobile.zcodeControl.heldQueueClear")}
+            </button>
+            <button
+              type="button"
+              data-testid="zcode-held-queue-cancel"
+              onClick={() => setHeldQueuePrompt(false)}
+              className="rounded-lg px-3 py-1.5 text-xs text-[var(--mut)]"
+            >
+              {i18n.t("mobile.zcodeControl.heldQueueCancel")}
+            </button>
+          </div>
+        </div>
       )}
     </div>
   );

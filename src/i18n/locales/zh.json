@@ -2317,7 +2317,12 @@
       "queuePauseManual": "已手动暂停",
       "queuePauseError": "回合出错后暂停",
       "queuePauseUnknown": "暂停状态未知",
-      "queueToggleAria": "展开或收起排队列表"
+      "queueToggleAria": "展开或收起排队列表",
+      "heldQueueTitle": "现在发送，如何处理排队消息？",
+      "heldQueueHint": "官方要求先决定已有排队内容的去留。清空不可恢复。",
+      "heldQueueKeep": "保留排队消息并发送",
+      "heldQueueClear": "清空排队消息并发送",
+      "heldQueueCancel": "取消"
     },
     "question": {
       "cancelInterrupt": "中断回合（破坏性）",

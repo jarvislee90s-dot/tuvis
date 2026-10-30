@@ -179,7 +179,20 @@ pub fn payload_hash(
 /// 从统一动作提取参与指纹的全部参数（Slice B 的 `CommandSender` 与审计共用）。
 pub fn action_params(action: &ControlAction) -> Value {
     match action {
-        ControlAction::Send { text, .. } => serde_json::json!({ "text": text }),
+        ControlAction::Send {
+            text, held_queue, ..
+        } => match held_queue {
+            // `held_queue` 必须进指纹：同 actionId 从「保留」改成「清空」是**不同**
+            // 动作（前者保留队列、后者破坏性清空），绝不能被当成同一次重放。
+            Some(choice) => serde_json::json!({
+                "text": text,
+                "heldQueue": {
+                    "disposition": choice.disposition,
+                    "expectedQueueItemIds": &choice.expected_queue_item_ids,
+                },
+            }),
+            None => serde_json::json!({ "text": text }),
+        },
         ControlAction::Snooze { interaction_id, .. } => {
             serde_json::json!({ "interactionId": interaction_id })
         }
@@ -517,7 +530,9 @@ mod tests {
     use crate::database::dao::write_audit;
     use crate::database::schema;
     use crate::remote::pairing::DeviceStore;
-    use crate::services::zcode_control::types::AnswerEntry;
+    use crate::services::zcode_control::types::{
+        AnswerEntry, HeldQueueChoice, HeldQueueDisposition,
+    };
     use rusqlite::Connection;
 
     const SESSION: &str = "sess_0123456789abcdef0123456789abcdef";
@@ -1046,6 +1061,10 @@ mod tests {
                 session_id: SESSION.into(),
                 generation: GEN,
                 text: "第一行\n第二行".into(),
+                held_queue: Some(HeldQueueChoice {
+                    disposition: HeldQueueDisposition::KeepQueueAndSend,
+                    expected_queue_item_ids: vec!["queue_a".into()],
+                }),
             },
             ControlAction::Snooze {
                 session_id: SESSION.into(),
@@ -1126,6 +1145,48 @@ mod tests {
             payload_hash("answer", SESSION, GEN, &nested).unwrap(),
             "自由作答内容必须参与指纹"
         );
+    }
+
+    /// F3：同 actionId 从「保留队列」改成「清空队列」必须是**不同**动作，不能重放。
+    #[test]
+    fn send_held_queue_disposition_is_part_of_fingerprint() {
+        let keep = ControlAction::Send {
+            session_id: SESSION.into(),
+            generation: GEN,
+            text: "同一段正文".into(),
+            held_queue: Some(HeldQueueChoice {
+                disposition: HeldQueueDisposition::KeepQueueAndSend,
+                expected_queue_item_ids: vec!["queue_a".into(), "queue_b".into()],
+            }),
+        };
+        let clear = ControlAction::Send {
+            session_id: SESSION.into(),
+            generation: GEN,
+            text: "同一段正文".into(),
+            held_queue: Some(HeldQueueChoice {
+                disposition: HeldQueueDisposition::ClearQueueAndSend,
+                expected_queue_item_ids: vec!["queue_a".into(), "queue_b".into()],
+            }),
+        };
+        let none = ControlAction::Send {
+            session_id: SESSION.into(),
+            generation: GEN,
+            text: "同一段正文".into(),
+            held_queue: None,
+        };
+
+        let hash = |action: &ControlAction| {
+            payload_hash(
+                action.kind(),
+                action.session_id(),
+                action.generation(),
+                &action_params(action),
+            )
+            .unwrap()
+        };
+        assert_ne!(hash(&keep), hash(&clear), "保留/清空必须是不同动作");
+        assert_ne!(hash(&keep), hash(&none), "带/不带处置必须不同");
+        assert_ne!(hash(&clear), hash(&none));
     }
 
     /// 审计摘要：只含类别与计数，绝不包含正文/答案原值/选项原值。

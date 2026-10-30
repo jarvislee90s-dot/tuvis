@@ -259,8 +259,17 @@ export interface QueueView {
   items: QueueItemView[];
 }
 
+/** 官方 `state.inputRouting` 的最小投影（至少 `mode`；`reasonCode` 可缺省）。
+ *  只用于发送合同判定：`mode === "choice"` 且队列非空时，手机必须显式选择旧队列
+ *  的处置（保留/清空），并由服务端对新鲜队列做 CAS。 */
+export interface InputRoutingView {
+  mode: string;
+  reasonCode: string | null;
+}
+
 /** 会话投影视图（手机唯一可见的会话状态面）；`ready=false` 时控制面必须零写。
- *  `queue` 可选：缺字段 = 未知（旧服务端载荷），前端绝不把缺省当成空队列。 */
+ *  `queue` 可选：缺字段 = 未知（旧服务端载荷），前端绝不把缺省当成空队列。
+ *  `inputRouting` 可选：缺字段 = 宿主未宣告（未知），绝不猜 `choice`。 */
 export interface SessionView {
   sessionId: string;
   generation: number;
@@ -271,6 +280,7 @@ export interface SessionView {
   selection: SelectionView | null;
   capabilities: CapabilityView;
   queue?: QueueView;
+  inputRouting?: InputRoutingView;
 }
 
 /** 问答答案条目。 */
@@ -280,9 +290,25 @@ export interface AnswerEntry {
   freeText: string | null;
 }
 
+/** `inputRouting.mode="choice"` 时对旧队列的处置（严格枚举，不接受任意字符串）。 */
+export type HeldQueueDisposition = "keepQueueAndSend" | "clearQueueAndSend";
+
+/** 发送时对旧队列的处置；`expectedQueueItemIds` 是官方当前队列的完整 ID 列表与顺序，
+ *  服务端写前对新队列做 CAS，失配则拒绝并要求刷新后重选。 */
+export interface HeldQueueChoice {
+  disposition: HeldQueueDisposition;
+  expectedQueueItemIds: string[];
+}
+
 /** 统一控制动作（tagged `kind`；全部携带 `sessionId,generation`）。 */
 export type ControlAction =
-  | { kind: "send"; sessionId: string; generation: number; text: string }
+  | {
+      kind: "send";
+      sessionId: string;
+      generation: number;
+      text: string;
+      heldQueue?: HeldQueueChoice;
+    }
   | { kind: "snooze"; sessionId: string; generation: number; interactionId: string }
   | {
       kind: "answer";

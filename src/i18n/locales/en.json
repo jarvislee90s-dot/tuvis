@@ -2317,7 +2317,12 @@
       "queuePauseManual": "Paused manually",
       "queuePauseError": "Paused after an error",
       "queuePauseUnknown": "Pause state unknown",
-      "queueToggleAria": "Expand or collapse the queued list"
+      "queueToggleAria": "Expand or collapse the queued list",
+      "heldQueueTitle": "Send now—what about the queued messages?",
+      "heldQueueHint": "ZCode requires a decision about the existing queue. Clearing cannot be undone.",
+      "heldQueueKeep": "Keep queued messages and send",
+      "heldQueueClear": "Clear queued messages and send",
+      "heldQueueCancel": "Cancel"
     },
     "question": {
       "cancelInterrupt": "Interrupt turn (destructive)",

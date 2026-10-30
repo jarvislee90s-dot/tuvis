@@ -395,6 +395,7 @@ impl HubBackend for FakeHubBackend {
             selection: None,
             capabilities: CapabilityView::default(),
             queue: QueueView::default(),
+            input_routing: None,
         };
         Box::pin(async move { Ok(view) })
     }
@@ -1481,6 +1482,7 @@ async fn sse_does_not_leak_other_device_action_ids() {
             session_id: ZCODE_SESSION.into(),
             generation,
             text: "他机正文".into(),
+            held_queue: None,
         },
     )
     .await
@@ -1497,6 +1499,7 @@ async fn sse_does_not_leak_other_device_action_ids() {
             session_id: ZCODE_SESSION.into(),
             generation,
             text: "本机正文".into(),
+            held_queue: None,
         },
     )
     .await
