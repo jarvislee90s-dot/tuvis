@@ -19,7 +19,7 @@ use std::convert::Infallible;
 use std::sync::Arc;
 use tokio_stream::wrappers::BroadcastStream;
 
-use super::server::{CleanupStream, RemoteState};
+use super::server::{CleanupStream, RemoteState, SseConnGuard};
 
 /// 看板隐藏过滤（APP 软归档=「叉」语义，2026-09-20 体验批二修订）：hidden →
 /// 一律从响应剔除（仅手机看板；桌面走 invoke 不经此端点）。**无自动回归**——
@@ -192,6 +192,10 @@ pub async fn events(
     let rx = st.watcher_tx.subscribe();
     // M4 T0a：gate 已过闸，此处必能取到设备 id（防御性 None 时跳过注册只服务）
     let device = super::gate::extract_device(&headers).unwrap_or_default();
+    // R6：订阅之后、快照 await **之前**注册——注册守卫 Drop 即反注册：
+    // ① 握手期断开（handler future 被 drop）不泄漏计数；② 快照等待期间
+    // disconnect_all/吊销能关断本连接（旧实现在快照后才注册，有吊销窗口）
+    let (conn_guard, close_rx) = SseConnGuard::register(&st.sse_registry, &device);
     // 快照走 spawn_blocking：ensure_fresh 内部可能等待补扫（上限 3s）并轮询，是同步
     // 阻塞调用；直接 await 会堵死 tokio worker——与 sessions handler 同一先例
     // （实机教训见 commands/session.rs 的 get_all_sessions 注释）。
@@ -228,12 +232,6 @@ pub async fn events(
         )
         .to_string()
     });
-    // M4 T0a：注册必须在快照完成**之后**——快照等待最长 3s，握手期客户端断开时
-    // hyper 会直接 drop 本 handler future；若先注册，CleanupStream 尚未构造，
-    // 反注册永不发生 → 连接计数恒真、节奏永远进不了 Away（Fix 3 回归点）。
-    let (conn_id, close_rx) = st.sse_registry.register(&device);
-    // 注册表句柄先行克隆：CloseCleanupStream 需要它
-    let registry = st.sse_registry.clone();
     let initial = futures::stream::once(async move {
         Ok(sse::Event::default().event("snapshot").data(snapshot_json))
     });
@@ -255,9 +253,7 @@ pub async fn events(
     let guarded = base.take_until(close_rx);
     let cleaned = CleanupStream {
         inner: guarded,
-        reg: registry,
-        device,
-        conn_id,
+        _conn: conn_guard,
     };
     Sse::new(cleaned).keep_alive(sse::KeepAlive::default())
 }

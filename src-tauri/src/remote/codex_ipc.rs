@@ -2423,8 +2423,8 @@ pub async fn thread_events(
     };
     // 注册连接（gate 已过闸；防御性 None 跳过注册只服务）
     let device = super::gate::extract_device(&headers).unwrap_or_default();
-    let (conn_id, close_rx) = st.sse_registry.register(&device);
-    let registry = st.sse_registry.clone();
+    // R6：注册守卫 Drop 即反注册（与 /events 同口径）
+    let (conn_guard, close_rx) = super::server::SseConnGuard::register(&st.sse_registry, &device);
     let adapter = hub.adapter.clone();
     // R7.3：详情订阅引用计数（挂载 +1；流结束 -1；归零且无本地待发 → unfollow）
     hub.follow_ref_acquire(&key);
@@ -2443,9 +2443,7 @@ pub async fn thread_events(
     };
     let cleaned = super::server::CleanupStream {
         inner: guarded,
-        reg: registry,
-        device,
-        conn_id,
+        _conn: conn_guard,
     };
     (
         [(axum::http::header::CACHE_CONTROL, "no-store")],

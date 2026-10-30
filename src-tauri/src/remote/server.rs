@@ -268,12 +268,11 @@ impl SseRegistry {
 }
 
 /// 自然断开清理包装：axum drop SSE 流时反注册注册表项（不留陈旧句柄泄漏）。
-/// pub(crate) + 字段同可见性（编译适配）：api.rs（兄弟模块）按简报原稿以字段字面量构造
+/// R6：反注册语义下沉到 [`SseConnGuard`]（Drop 即反注册），本包装只负责持有守卫。
 pub(crate) struct CleanupStream<S> {
     pub(crate) inner: S,
-    pub(crate) reg: std::sync::Arc<SseRegistry>,
-    pub(crate) device: String,
-    pub(crate) conn_id: u64,
+    /// Drop 即反注册；正常建流后由本流持有，连接结束才释放
+    pub(crate) _conn: SseConnGuard,
 }
 impl<S: futures::Stream> futures::Stream for CleanupStream<S> {
     type Item = S::Item;
@@ -287,9 +286,40 @@ impl<S: futures::Stream> futures::Stream for CleanupStream<S> {
         unsafe { self.map_unchecked_mut(|s| &mut s.inner).poll_next(cx) }
     }
 }
-impl<S> Drop for CleanupStream<S> {
+
+/// SSE 连接守卫（R6）：register 即持有，Drop 即反注册。
+///
+/// 在事件 handler 中应于 `watcher_tx.subscribe()` 之后、快照 await **之前**创建：
+/// - 握手期客户端断开 → handler future 被 drop → 守卫 Drop → 反注册（不泄漏计数）；
+/// - 快照等待期间 disconnect_all/吊销 → 守卫已在注册表里，能收到关闭信号（无吊销窗口）；
+/// - 正常建流后守卫移入 [`CleanupStream`]，连接生命周期结束才反注册。
+pub(crate) struct SseConnGuard {
+    registry: std::sync::Arc<SseRegistry>,
+    device: String,
+    id: u64,
+}
+
+impl SseConnGuard {
+    /// 注册一条连接：返回 (守卫, 关闭信号接收端)
+    pub(crate) fn register(
+        registry: &std::sync::Arc<SseRegistry>,
+        device: &str,
+    ) -> (Self, tokio::sync::oneshot::Receiver<()>) {
+        let (id, close_rx) = registry.register(device);
+        (
+            Self {
+                registry: registry.clone(),
+                device: device.to_string(),
+                id,
+            },
+            close_rx,
+        )
+    }
+}
+
+impl Drop for SseConnGuard {
     fn drop(&mut self) {
-        self.reg.unregister(&self.device, self.conn_id);
+        self.registry.unregister(&self.device, self.id);
     }
 }
 
@@ -1821,6 +1851,55 @@ mod tests {
             !second.contains("session_id"),
             "transition 帧不得出现 snake_case 键，实际 {second:?}"
         );
+    }
+
+    /// R6：快照等待期间连接已注册（早注册 + RAII），吊销/停服必须能关断本连接。
+    /// 旧实现快照完成后才注册，等待窗口内 disconnect_all 对本连接无效。
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn sse_disconnect_during_snapshot_wait_closes_stream() {
+        let _sse = SSE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::adapter::scan_bus::test_guard();
+        crate::adapter::scan_bus::reset_for_test();
+        // 慢快照：无缓存 + 在飞占位（handler 内 ensure_fresh 等满 5s 上限）
+        crate::adapter::scan_bus::set_in_flight_for_test(true);
+        let state = test_state();
+        persist_device(&state, "ev-hold");
+        let app = router(state.clone());
+        let handle = tokio::spawn(async move {
+            app.oneshot(req(
+                "GET",
+                "/m/api/v1/events",
+                Some("mam_device=ev-hold"),
+                None,
+            ))
+            .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            any_connection(),
+            "快照等待期间连接应已注册（否则吊销/停服对该连接无效）"
+        );
+        assert_eq!(
+            state.sse_registry.disconnect_device("ev-hold"),
+            1,
+            "吊销必须能命中等待中的连接"
+        );
+        assert!(!any_connection(), "吊销后连接计数应立即归零");
+        let resp = tokio::time::timeout(std::time::Duration::from_secs(8), handle)
+            .await
+            .expect("handler 超时")
+            .expect("handler panic")
+            .expect("oneshot 失败");
+        let mut body = resp.into_body();
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(2), body.frame())
+            .await
+            .expect("吊销后流未在 2s 内结束");
+        assert!(
+            frame.is_none(),
+            "吊销信号已到，SSE 流必须立即结束（不得再出快照帧）"
+        );
+        crate::adapter::scan_bus::set_in_flight_for_test(false);
     }
 
     // ---- SseRegistry 单元（M4 T0a）----
