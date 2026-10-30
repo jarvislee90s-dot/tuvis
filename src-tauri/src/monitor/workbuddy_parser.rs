@@ -1060,6 +1060,39 @@ fn live_session_ids(home: &Path) -> std::collections::HashSet<String> {
     out
 }
 
+/// 补偿判据「会话是否还在场」（与看板在场判据同源，评审 I3 的可测面）：
+/// 1. `runtime_present` 优先：心跳文件存在 ∧ 内容 pid 存活 ∧ sessionId 匹配（`live_ids`）；
+/// 2. DB `MAX(last_activity_at, updated_at)` 在 [`SESSION_ACTIVE_WINDOW_MS`]（300s）内；
+/// 3. 主 jsonl mtime 在 300s 内。
+///
+/// **已知产品行为（评审 I3，等待用户裁决）**：`completed` 会话在完成后 **300s 内不会补进未读池**
+/// （②③ 仍为真）——即「未读/通知最多晚 5 分钟」。这是设计 §3.5 的**有意**取舍（与看板
+/// `completed` 下板同一窗口），本次不改；[`tests::board_tests`] 与本文件的
+/// `compensation_waits_out_the_300s_window` 都锁住该行为。
+fn session_is_live(
+    home: &Path,
+    now: u64,
+    recent: &HashMap<String, WbDbSession>,
+    live_ids: &std::collections::HashSet<String>,
+    sid: &str,
+) -> bool {
+    // ① runtime_present 优先（运行中的 5.9.3 会话心跳恒过期，但 pid 存活即在场）
+    if live_ids.contains(sid) {
+        return true;
+    }
+    // ② DB 活动时间
+    if let Some(row) = recent.get(sid) {
+        if now as i64 - row.activity_ms <= SESSION_ACTIVE_WINDOW_MS {
+            return true;
+        }
+    }
+    // ③ 主 jsonl mtime
+    let cwd = recent.get(sid).map(|r| r.cwd.clone()).unwrap_or_default();
+    find_session_jsonl(home, &cwd, sid)
+        .and_then(|p| file_mtime_ms(&p))
+        .is_some_and(|m| now.saturating_sub(m) <= SESSION_ACTIVE_WINDOW_MS as u64)
+}
+
 /// 主入口：真实 home / 真实时钟 / 全局 LAST_SEEN_SESSIONS 的薄包装（补偿行在此落库）。
 /// 注：DAO upsert 冲突时仅刷新展示字段、保留原 turned_green_at/expires_at（见
 /// `upsert_unread`）——对已存在的行此处只起补展示快照作用；仅当行不存在（转绿从未
@@ -1086,27 +1119,12 @@ pub fn compensate_vanished_heartbeats() {
     let live_cache: std::cell::RefCell<Option<std::collections::HashSet<String>>> =
         std::cell::RefCell::new(None);
     let is_live = |sid: &str| -> bool {
-        // ① runtime_present 优先：心跳文件存在 ∧ 内容 pid 存活 ∧ sessionId 匹配
-        {
+        // 心跳目录扫描按轮记忆（单 pid 定向存活检查不重复付）
+        let live_ids = {
             let mut slot = live_cache.borrow_mut();
-            if slot.is_none() {
-                *slot = Some(live_session_ids(&home));
-            }
-            if slot.as_ref().is_some_and(|set| set.contains(sid)) {
-                return true;
-            }
-        }
-        // ② DB `MAX(last_activity_at, updated_at)` 在 300s 内
-        if let Some(row) = recent.get(sid) {
-            if now as i64 - row.activity_ms <= SESSION_ACTIVE_WINDOW_MS {
-                return true;
-            }
-        }
-        // ③ 主 jsonl mtime 在 300s 内
-        let cwd = recent.get(sid).map(|r| r.cwd.clone()).unwrap_or_default();
-        find_session_jsonl(&home, &cwd, sid)
-            .and_then(|p| file_mtime_ms(&p))
-            .is_some_and(|m| now.saturating_sub(m) <= SESSION_ACTIVE_WINDOW_MS as u64)
+            slot.get_or_insert_with(|| live_session_ids(&home)).clone()
+        };
+        session_is_live(&home, now, &recent, &live_ids, sid)
     };
     for record in compensate_vanished_heartbeats_in(
         &home,
@@ -1804,6 +1822,110 @@ mod tests {
             );
             assert_eq!(dead.len(), 1, "会话结束后仍须照常补一次未读");
             assert_eq!(dead[0].session_id, SID);
+        }
+
+        /// 建最小 workbuddy.db（sessions 表），供 `recent_db_sessions` 走真实查询
+        fn seed_status_db(home: &Path, status: &str, activity_ms: i64) {
+            let dir = home.join(".workbuddy");
+            std::fs::create_dir_all(&dir).unwrap();
+            let conn = rusqlite::Connection::open(dir.join("workbuddy.db")).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS sessions (
+                    id TEXT PRIMARY KEY,
+                    cwd TEXT NOT NULL,
+                    title TEXT,
+                    custom_title TEXT,
+                    status TEXT NOT NULL DEFAULT 'Pending',
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    last_activity_at INTEGER,
+                    deleted_at INTEGER
+                );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT OR REPLACE INTO sessions
+                   (id, cwd, title, status, created_at, updated_at,
+                    last_activity_at, deleted_at)
+                 VALUES (?1, ?2, NULL, ?3, 0, ?4, ?4, NULL)",
+                rusqlite::params![SID, CWD, status, activity_ms],
+            )
+            .unwrap();
+        }
+
+        /// 把会话的活动时间推到 `activity_ms`（模拟「完成后又静默了一段时间」）
+        fn bump_activity(home: &Path, activity_ms: i64) {
+            let conn =
+                rusqlite::Connection::open(home.join(".workbuddy").join("workbuddy.db")).unwrap();
+            conn.execute(
+                "UPDATE sessions SET updated_at = ?1, last_activity_at = ?1 WHERE id = ?2",
+                rusqlite::params![activity_ms, SID],
+            )
+            .unwrap();
+        }
+
+        fn recent_window(home: &Path, now: u64) -> HashMap<String, WbDbSession> {
+            recent_db_sessions(home, now as i64 - SESSION_ACTIVE_WINDOW_MS)
+                .into_iter()
+                .map(|r| (r.id.clone(), r))
+                .collect()
+        }
+
+        /// **I3（已知产品行为，等待用户裁决）**：`completed` 会话完成后 **300s 内不补未读**
+        /// ——未读卡/完成通知最多晚 5 分钟。这是设计 §3.5 的有意取舍（与看板 completed 下板同窗），
+        /// 本次**保持不改**；本用例把该行为钉住，避免后续悄悄改成「心跳消失即补」。
+        #[test]
+        fn compensation_waits_out_the_300s_window() {
+            let home = tempfile::tempdir().unwrap();
+            let now = now_ms();
+            write_jsonl(home.path(), SID, ASSISTANT_TAIL);
+            // jsonl mtime 也推到窗外（否则判据 ③ 会让会话「在场」）
+            let p = home
+                .path()
+                .join(".workbuddy/projects")
+                .join(mangle_project_path(CWD))
+                .join(format!("{SID}.jsonl"));
+            let f = std::fs::OpenOptions::new().write(true).open(&p).unwrap();
+            f.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_millis(now - 900_000))
+                .unwrap();
+            seed_status_db(home.path(), "completed", (now - 120_000) as i64);
+
+            let last_seen = Mutex::new(HashMap::from([(
+                11952u32,
+                ("workbuddy".to_string(), SID.to_string()),
+            )]));
+            let no_live: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let recent = recent_window(home.path(), now);
+            let out = compensate_vanished_heartbeats_in(
+                home.path(),
+                now,
+                &last_seen,
+                &|_| None,
+                &|_| false,
+                &|sid| session_is_live(home.path(), now, &recent, &no_live, sid),
+            );
+            assert!(
+                out.is_empty(),
+                "I3：完成后 300s 内不补未读（未读/通知最多晚 5 分钟，有意行为）"
+            );
+
+            // 超过 300s 后照常补一次
+            bump_activity(home.path(), (now - 400_000) as i64);
+            last_seen
+                .lock()
+                .unwrap()
+                .insert(11952, ("workbuddy".to_string(), SID.to_string()));
+            let recent2 = recent_window(home.path(), now);
+            let out2 = compensate_vanished_heartbeats_in(
+                home.path(),
+                now,
+                &last_seen,
+                &|_| None,
+                &|_| false,
+                &|sid| session_is_live(home.path(), now, &recent2, &no_live, sid),
+            );
+            assert_eq!(out2.len(), 1, "窗口过后照常补一次未读");
+            assert_eq!(out2[0].session_id, SID);
         }
 
         /// P2-3 按工具隔离：观测表条目携带工具归属，非 workbuddy 条目不代偿
