@@ -44,7 +44,6 @@ pub const HEARTBEAT_FRESH_MS: u64 = 90_000;
 /// 会话活性窗口（R2）：DB `MAX(last_activity_at, updated_at)` 与主 jsonl mtime 的
 /// 300s 兜底窗，**只作用于 `completed` / DB-only 候选**——`runtime_present` 且
 /// `status='working'` 的会话不因父会话静默而下板（真机实测 10 分钟空档）。
-/// 与 `APP_STATUS_STALE_MS` 同值同源（`monitor/app_status.rs`：App 形态 mtime 叠加阈值）。
 /// 看板在场 / 未读补偿的活动窗口。刻意**不**别名到 `APP_STATUS_STALE_MS`
 /// （状态叠加阈值与在场判定是两套产品语义；调一个不应静默改另一个）。
 pub const SESSION_ACTIVE_WINDOW_MS: i64 = 300_000;
