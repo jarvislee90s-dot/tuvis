@@ -475,9 +475,7 @@ fn discover_workbuddy_processes_with(
     if found.is_empty() {
         if let Some(host_pid) = host_pid {
             if !recent.is_empty() {
-                let (cpu_usage, exe) = process_info(host_pid)
-                    .map(|(c, e)| (c, e))
-                    .unwrap_or((0.0, None));
+                let (cpu_usage, exe) = process_info(host_pid).unwrap_or((0.0, None));
                 log::debug!(
                     "workbuddy: 无可用心跳，使用宿主进程 {host_pid} 作为 DB 兜底哨兵（近期会话 {} 个）",
                     recent.len()
