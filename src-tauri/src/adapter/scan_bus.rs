@@ -44,8 +44,8 @@ static WATCH_UNTIL: Lazy<Mutex<std::collections::HashMap<String, i64>>> =
 static TX: OnceLock<mpsc::Sender<ScanReason>> = OnceLock::new();
 static IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 
-/// 事件唤醒的合并节流窗口：窗口内只接受一次事件扫描
-const EVENT_DEBOUNCE: Duration = Duration::from_millis(500);
+/// 事件触发扫描的最小间隔上限（Away 档 30s 的间隔会让 hook 事件在 TTL 内等不到扫描）
+const EVENT_MIN_GAP_CAP: Duration = Duration::from_secs(5);
 /// 「有人在看」心跳的有效期
 const WATCH_TTL_MS: i64 = 90_000;
 /// 托盘无状态变化时的最长刷新间隔
@@ -151,6 +151,12 @@ fn remote_online() -> bool {
     crate::remote::is_online_now()
 }
 
+/// 事件扫描的最小间隔：跟随时长档位，但不超过 5s。
+/// Away 档 30s 的间隔太长——hook 事件 30s TTL 会过期，孤立事件必须把扫描提前。
+fn event_min_gap(interval: Duration) -> Duration {
+    interval.min(EVENT_MIN_GAP_CAP)
+}
+
 /// 单飞扫描：并发调用者等待同一次扫描（返回同一快照）
 fn scan_once() -> Arc<Snapshot> {
     // IN_FLIGHT 表示已有扫描在跑；其他调用者自旋等待其结果，避免重复全量扫描
@@ -239,15 +245,26 @@ pub fn start(app: tauri::AppHandle) {
             // scan_once 内的 Drop 守卫会在展开时清 IN_FLIGHT，下一圈不会自锁。
             let round = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 // 事件合并节流：仅压**孤立** Event；Action 补扫与冷启动不得被丢弃，
-                // 与 Event 同批的积压原因（burst_has_job）也不得被这条节流吞掉
-                if matches!(reason, ScanReason::Event)
-                    && !burst_has_job
-                    && last_scan.elapsed() < EVENT_DEBOUNCE
-                {
-                    return;
+                // 与 Event 同批的积压原因（burst_has_job）也不得被这条节流吞掉。
+                // 节流动作是「延后」而非「丢弃」：Away 档下一次周期扫描要等 30s，
+                // hook 事件文件 30s TTL 会先过期——孤立事件必须在最小间隔处补扫
+                if matches!(reason, ScanReason::Event) && !burst_has_job {
+                    let gap = event_min_gap(cadence.mode().interval());
+                    let elapsed = last_scan.elapsed();
+                    if elapsed < gap {
+                        std::thread::sleep(gap - elapsed);
+                    }
                 }
+                let scan_started = Instant::now();
                 let snap = scan_once();
                 last_scan = Instant::now();
+                log::info!(
+                    "scan_bus: scan reason={:?} version={} duration_ms={} sessions={}",
+                    reason,
+                    snap.version,
+                    scan_started.elapsed().as_millis(),
+                    snap.data.sessions.len()
+                );
                 update_tray(
                     &app,
                     &snap,
@@ -454,6 +471,51 @@ mod tests {
         // 过期项在写入时被修剪，不会长期占着 map
         let map_len = WATCH_UNTIL.lock().unwrap_or_else(|e| e.into_inner()).len();
         assert_eq!(map_len, 1, "过期源应被修剪，只留 main");
+    }
+
+    /// Fix 1：事件扫描的最小间隔跟随时长档位，但硬顶 5s。
+    /// Away 档 30s 的间隔太长——hook 事件 30s TTL 会过期，孤立事件必须把扫描提前。
+    #[test]
+    fn event_min_gap_follows_mode_capped_at_five_seconds() {
+        assert_eq!(
+            event_min_gap(Duration::from_secs(2)),
+            Duration::from_secs(2),
+            "Active 档的最小间隔就是档位间隔"
+        );
+        assert_eq!(
+            event_min_gap(Duration::from_secs(10)),
+            Duration::from_secs(5),
+            "Idle 档硬顶 5s"
+        );
+        assert_eq!(
+            event_min_gap(Duration::from_secs(30)),
+            Duration::from_secs(5),
+            "Away 档硬顶 5s"
+        );
+    }
+
+    /// Fix 1 回归锁：孤立 Event 不得被丢弃——必须**延后**到事件最小间隔后照常扫描。
+    /// 源码锁只扫实现处分支（文件前半），避免测试自身的字面量造成假绿。
+    #[test]
+    fn event_throttle_delays_instead_of_dropping() {
+        let src = include_str!("scan_bus.rs");
+        let impl_end = src.find("mod tests").expect("测试模块标记缺失");
+        let anchor = "if matches!(reason, ScanReason::Event)";
+        let idx = src.find(anchor).expect("scan_bus.rs 缺少 Event 节流分支");
+        assert!(idx < impl_end, "锚点必须命中实现处的节流分支");
+        let branch = &src[idx..(idx + 700).min(src.len())];
+        assert!(
+            !branch.contains("return;"),
+            "孤立 Event 不得被丢弃（应延后扫描），实际分支: {branch}"
+        );
+        assert!(
+            branch.contains("sleep"),
+            "孤立 Event 应等待最小间隔后照常扫描，实际分支: {branch}"
+        );
+        assert!(
+            src.contains("fn event_min_gap("),
+            "事件最小间隔须为独立纯函数（可单测）"
+        );
     }
 
     #[test]
