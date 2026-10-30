@@ -1825,8 +1825,13 @@ mod tests {
 
     // ---- SseRegistry 单元（M4 T0a）----
 
+    /// Fix 3 测试互斥：`any_connection()` 读的是进程级计数，注册表单元用例与 SSE
+    /// 握手用例必须串行——否则断言窗口内会看到对方注册/反注册造成的计数抖动。
+    static SSE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn sse_registry_register_then_disconnect_device() {
+        let _sse = SSE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let reg = SseRegistry::default();
         let (id1, mut rx1) = reg.register("dev-a");
         let (_id2, rx2) = reg.register("dev-a");
@@ -1845,6 +1850,7 @@ mod tests {
 
     #[test]
     fn sse_registry_sender_dropped_when_entry_replaced_by_disconnect() {
+        let _sse = SSE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let reg = SseRegistry::default();
         // 编译适配（E0596）：try_recv 需 &mut self，原稿 rx 未加 mut
         let (_id, mut rx) = reg.register("dev");
@@ -1910,6 +1916,44 @@ mod tests {
             .await
             .expect("断连后流未在 2s 内结束");
         assert!(end.is_none());
+    }
+
+    /// Fix 3 回归：**握手期断开**（快照未就绪时客户端已走）不得泄漏连接计数。
+    /// 注册必须后置于快照完成——旧实现先注册，客户端在 ensure_fresh 等待期间断开时
+    /// CleanupStream 尚未构造就被 drop，反注册永不发生 → `any_connection()` 恒真、
+    /// 节奏永远进不了 Away。此处用「在飞占位」制造慢快照（无缓存 + 单飞等待），
+    /// 100ms 后丢弃 handler future 模拟连接关闭，断言计数在 2s 内回到 false。
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn sse_handshake_aborted_before_snapshot_does_not_leak_connection() {
+        let _sse = SSE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::adapter::scan_bus::test_guard();
+        crate::adapter::scan_bus::reset_for_test();
+        crate::adapter::scan_bus::set_in_flight_for_test(true);
+        let state = test_state();
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("cookie", "mam_device=ev-slow".parse().unwrap());
+        let fut = crate::remote::api::events(axum::extract::State(state), headers);
+        // 前提：快照必须仍处于未就绪（在飞等待中），否则本用例测不到握手窗口
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), fut)
+                .await
+                .is_err(),
+            "前提：快照应仍在等待中（在飞占位未被提前释放）"
+        );
+        // 2s 内计数回到 0（容忍其他测试的瞬时连接，最多重试 2s）
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while any_connection() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(
+            !any_connection(),
+            "握手期断开不得泄漏 SSE 连接计数（注册必须后置于快照完成）"
+        );
+        // 收尾：先发布快照再释放在飞位——后台仍在等待的 spawn_blocking 会直接拿到
+        // 该快照，不会落到真实扫描（零 ~/.tuvis 接触）
+        seed_scan_bus_snapshot();
+        crate::adapter::scan_bus::set_in_flight_for_test(false);
     }
 
     // ==== M5 A4：吊销收窄（gate 级回归） ====

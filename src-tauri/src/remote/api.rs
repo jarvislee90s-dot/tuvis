@@ -189,11 +189,8 @@ pub async fn events(
     // 落进 broadcast 缓冲（容量 64）并在快照帧之后依次送出；若反序，快照与订阅之间
     // 发生的跃迁会永久丢失（重连后的看板状态与真实脱节）
     let rx = st.watcher_tx.subscribe();
-    // M4 T0a：注册连接（gate 已过闸，此处必能取到设备 id；防御性 None 时跳过注册只服务）
+    // M4 T0a：gate 已过闸，此处必能取到设备 id（防御性 None 时跳过注册只服务）
     let device = super::gate::extract_device(&headers).unwrap_or_default();
-    let (conn_id, close_rx) = st.sse_registry.register(&device);
-    // 注册表句柄先行克隆：CloseCleanupStream 需要它
-    let registry = st.sse_registry.clone();
     // 快照走 spawn_blocking：ensure_fresh 内部可能等待补扫（上限 3s）并轮询，是同步
     // 阻塞调用；直接 await 会堵死 tokio worker——与 sessions handler 同一先例
     // （实机教训见 commands/session.rs 的 get_all_sessions 注释）。
@@ -230,6 +227,12 @@ pub async fn events(
         )
         .to_string()
     });
+    // M4 T0a：注册必须在快照完成**之后**——快照等待最长 3s，握手期客户端断开时
+    // hyper 会直接 drop 本 handler future；若先注册，CleanupStream 尚未构造，
+    // 反注册永不发生 → 连接计数恒真、节奏永远进不了 Away（Fix 3 回归点）。
+    let (conn_id, close_rx) = st.sse_registry.register(&device);
+    // 注册表句柄先行克隆：CloseCleanupStream 需要它
+    let registry = st.sse_registry.clone();
     let initial = futures::stream::once(async move {
         Ok(sse::Event::default().event("snapshot").data(snapshot_json))
     });
