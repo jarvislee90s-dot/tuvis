@@ -274,7 +274,7 @@ pub fn title_from_db(home: &Path, session_id: &str) -> Option<String> {
 /// 消除每会话每轮各开一次 SQLite 的开销
 fn title_from_conn(conn: &rusqlite::Connection, session_id: &str) -> Option<String> {
     conn.query_row(
-        "SELECT COALESCE(NULLIF(custom_title,''), title) FROM sessions WHERE id = ?1 AND deleted_at IS NULL",
+        "SELECT COALESCE(NULLIF(custom_title,''), title) FROM sessions WHERE id = ?1 AND (deleted_at IS NULL OR deleted_at <= 0)",
         [session_id],
         |row| row.get::<_, Option<String>>(0),
     )
@@ -313,6 +313,9 @@ pub struct WbDbSession {
     pub status: String,
     /// `MAX(last_activity_at, updated_at)`（epoch ms）
     pub activity_ms: i64,
+    /// `deleted_at > 0`：DB 明确标记删除（`NULL` 或 cloud 的 `-1` 视为未删）。
+    /// 心跳候选用它阻止“已删会话因心跳文件残留而复活”。
+    pub deleted: bool,
 }
 
 /// 读取 `workbuddy.db` 中 `since_ms` 之后活跃的会话（R2）。
@@ -326,8 +329,11 @@ pub struct WbDbSession {
 ///   「非 NULL 但已冻结」的场合仍取两者较大值，语义与 `MAX` 一致（SQLite 的标量
 ///   `max(a, NULL)` 会返回 NULL，直接写 `MAX` 会把 NULL 行整行滤掉）。
 pub fn recent_db_sessions(home: &Path, since_ms: i64) -> Vec<WbDbSession> {
-    let sql =
-        format!("SELECT * FROM ({WB_DB_SESSIONS_SQL}) WHERE activity >= ?1 ORDER BY activity DESC");
+    let sql = format!(
+        "SELECT * FROM ({WB_DB_SESSIONS_SQL}) \
+         WHERE (deleted_at IS NULL OR deleted_at <= 0) AND activity >= ?1 \
+         ORDER BY activity DESC"
+    );
     query_db_sessions(home, &sql, &[&since_ms])
 }
 
@@ -338,8 +344,9 @@ pub fn recent_db_sessions(home: &Path, since_ms: i64) -> Vec<WbDbSession> {
 /// `status` 仍是 `working`（子代理在写）时，用 `recent` 查不到行 → `working=false`
 /// → 卡片在子代理运行期掉线（正是 08:05–08:15 的现场）。
 ///
-/// 仍然遵守：`deleted_at IS NULL OR deleted_at <= 0`（-1 为 cloud 未删哨兵）、
-/// `MAX(last_activity_at, updated_at)` 的 NULL-safe 写法（见 [`WB_DB_SESSIONS_SQL`]）。
+/// 仍然遵守：`MAX(last_activity_at, updated_at)` 的 NULL-safe 写法（见
+/// [`WB_DB_SESSIONS_SQL`]）。**返回含 `deleted_at` 标记的行**（不过滤删除）：
+/// 心跳候选据此跳过已删会话；DB-only 候选仍由 [`recent_db_sessions`] 过滤。
 pub fn db_sessions_by_ids(home: &Path, ids: &[String]) -> HashMap<String, WbDbSession> {
     let mut out = HashMap::new();
     if ids.is_empty() {
@@ -364,16 +371,16 @@ pub fn db_sessions_by_ids(home: &Path, ids: &[String]) -> HashMap<String, WbDbSe
 /// * `activity` 必须是 `MAX(last_activity_at, updated_at)`。SQLite 的标量 `max(a, NULL)`
 ///   返回 NULL，直接写 `MAX(...)` 会把 `last_activity_at` 为 NULL 的新会话整行滤掉，
 ///   故只在 NULL 时退到 `updated_at`（语义仍是取较大活动时间，**不是** COALESCE 选优先级）；
-/// * `deleted_at <= 0`：cloud 形态以 **-1** 表示未删（打包代码 15 处实证）。
+/// * `deleted_at`：调用方自行判定（`> 0` = 已删；`NULL`/`-1` = 未删）。
 const WB_DB_SESSIONS_SQL: &str = "\
 SELECT id,
        cwd,
        COALESCE(NULLIF(custom_title,''), title) AS title,
        status,
        CASE WHEN last_activity_at IS NULL THEN updated_at
-            ELSE MAX(last_activity_at, updated_at) END AS activity
-FROM sessions
-WHERE (deleted_at IS NULL OR deleted_at <= 0)";
+            ELSE MAX(last_activity_at, updated_at) END AS activity,
+       deleted_at
+FROM sessions";
 
 fn map_db_session_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<WbDbSession> {
     Ok(WbDbSession {
@@ -382,6 +389,9 @@ fn map_db_session_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<WbDbSession> {
         title: r.get::<_, Option<String>>(2)?,
         status: r.get::<_, Option<String>>(3)?.unwrap_or_default(),
         activity_ms: r.get::<_, Option<i64>>(4)?.unwrap_or(0),
+        deleted: r
+            .get::<_, Option<i64>>(5)?
+            .is_some_and(|deleted_at| deleted_at > 0),
     })
 }
 
@@ -664,6 +674,11 @@ pub fn get_workbuddy_sessions_with(
     };
     for (sid, cwd, pid, last_heartbeat_ms) in heartbeat_hits {
         let db = by_id_rows.get(&sid);
+        // DB 明确标记删除（deleted_at > 0）→ 心跳文件残留也不得复活该卡。
+        // 行缺失（DB 打不开/尚未落库）仍保留心跳路径，避免把 DB 降级误判成删除。
+        if db.is_some_and(|d| d.deleted) {
+            continue;
+        }
         candidates.push(WbCandidate {
             sid,
             cwd,
@@ -1152,7 +1167,7 @@ pub fn compensate_vanished_heartbeats() {
 /// 补偿用：会话 cwd 反查（共享连接版，issue #35 nit：与标题查询同轮复用连接）
 fn workbuddy_cwd_from_conn(conn: &rusqlite::Connection, session_id: &str) -> Option<String> {
     conn.query_row(
-        "SELECT cwd FROM sessions WHERE id = ?1 AND deleted_at IS NULL",
+        "SELECT cwd FROM sessions WHERE id = ?1 AND (deleted_at IS NULL OR deleted_at <= 0)",
         [session_id],
         |row| row.get::<_, String>(0),
     )
@@ -2204,6 +2219,7 @@ mod tests {
                     title: None,
                     status: "working".into(),
                     activity_ms: 9_000,
+                    deleted: false,
                 },
             );
             let found = discover_workbuddy_processes_with(
@@ -2247,6 +2263,7 @@ mod tests {
                     title: None,
                     status: "working".into(),
                     activity_ms: 9_000,
+                    deleted: false,
                 },
             );
             let found = discover_workbuddy_processes_with(
@@ -2851,9 +2868,36 @@ mod board_tests {
             )],
         );
         assert!(recent_db_sessions(home.path(), now as i64 - SESSION_ACTIVE_WINDOW_MS).is_empty());
-        assert!(db_sessions_by_ids(home.path(), &[SID.to_string()]).is_empty());
+        // 按 id 查询**包含**已删行（供心跳候选判定 deleted）；DB-only 路径仍由 recent 过滤
+        assert!(
+            db_sessions_by_ids(home.path(), &[SID.to_string()])
+                .get(SID)
+                .is_some_and(|r| r.deleted),
+            "by-id 查询必须把 deleted_at>0 标记带回，供心跳候选拦截"
+        );
         let out = run_board(home.path(), &[sentinel(8084)], now);
         assert!(out.is_empty(), "已删会话不得复活");
+    }
+
+    /// P2：**心跳文件仍在**但 DB 已标记删除 → 心跳候选也必须被拦截（不能只测 DB-only）
+    #[test]
+    fn deleted_db_session_with_heartbeat_is_not_shown() {
+        let home = tempfile::tempdir().unwrap();
+        let now = now_ms();
+        write_heartbeat(home.path(), 11952, SID, now - 7_200_000);
+        write_jsonl(home.path(), SID, now - 30_000);
+        seed_db(
+            home.path(),
+            &[(
+                SID,
+                "working",
+                (now - 30_000) as i64,
+                (now - 30_000) as i64,
+                Some(1),
+            )],
+        );
+        let out = run_board(home.path(), &[process(11952)], now);
+        assert!(out.is_empty(), "已删会话的残留心跳不得复活卡片");
     }
 
     /// **AC9 状态上拉**：主 jsonl 尾部是 assistant 文本（Idle），但 DB 说 working →

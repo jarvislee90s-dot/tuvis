@@ -2072,10 +2072,37 @@ fn sync_unread_sessions(active: &mut Vec<Session>) {
 
     // 4) 未读池合并为卡（纯映射见 build_unread_cards；追加在末尾，最终顺序由 session_sort_cmp 决定）
     let final_unread = crate::database::dao::unread::list(now_ms);
+    // P1：WorkBuddy 的 DB-only completed 卡（pid=0）若池里已有未读行，不能继续以
+    // unread=false 的普通卡呈现（build_unread_cards 会因“已在 active”跳过池卡）。
+    // 在合并前把它标成 unread，保证“未读记录存在 ⇒ 卡面呈现未读”。
+    mark_active_unread_cards(active, &final_unread);
     let cards = build_unread_cards(&final_unread, active, &|id| {
         crate::database::dao::agent_tool::get_tool_enabled(id)
     });
     active.extend(cards);
+}
+
+/// P1：把「池里已有未读行」的 WorkBuddy DB-only completed 活跃卡标成 unread。
+///
+/// 只处理 `pid == 0`（无真实心跳、由 DB 兜底渲染的卡）且尾部为 Idle/Finished 的
+/// WorkBuddy 卡；有心跳 pid 的卡仍由进程/状态路径决定，不能被未读池提前染色。
+fn mark_active_unread_cards(
+    active: &mut [Session],
+    pool: &[crate::database::dao::unread::UnreadSessionRecord],
+) {
+    let keys: HashSet<(String, String)> = pool
+        .iter()
+        .map(|r| (r.tool_id.clone(), r.session_id.clone()))
+        .collect();
+    for s in active.iter_mut() {
+        if s.agent_type == AgentType::WorkBuddy
+            && s.pid == 0
+            && matches!(s.status, SessionStatus::Idle | SessionStatus::Finished)
+            && keys.contains(&(s.agent_type.tool_id().to_string(), s.id.clone()))
+        {
+            s.unread = true;
+        }
+    }
 }
 
 /// 未读池 → 未读卡（纯函数，spec §8 可测试；启用判定经参数注入，测试不触库）：
@@ -2587,7 +2614,7 @@ mod sort_tests {
 
 #[cfg(test)]
 mod unread_card_tests {
-    use super::build_unread_cards;
+    use super::{build_unread_cards, mark_active_unread_cards};
     use crate::database::dao::unread::UnreadSessionRecord;
     use crate::session::model::{AgentType, ProcessForm, Session, SessionStatus};
 
@@ -2625,6 +2652,28 @@ mod unread_card_tests {
             jump_supported: true,
             unread: false,
         }
+    }
+
+    /// P1：WorkBuddy DB-only completed 卡（pid=0）池里有未读行时，必须标 unread；
+    /// 有心跳 pid 的卡不能被池行提前染色。
+    #[test]
+    fn workbuddy_db_only_idle_card_with_pool_is_marked_unread() {
+        let mut active = vec![active_card(AgentType::WorkBuddy, "s1")];
+        active[0].pid = 0;
+        active[0].status = SessionStatus::Idle;
+        let pool = vec![record("workbuddy", "s1")];
+        mark_active_unread_cards(&mut active, &pool);
+        assert!(active[0].unread, "DB-only completed 卡必须呈现未读");
+        assert!(
+            build_unread_cards(&pool, &active, &|_| true).is_empty(),
+            "active 已标 unread 时不得再追加同会话池卡"
+        );
+
+        let mut heartbeat_card = vec![active_card(AgentType::WorkBuddy, "s1")];
+        heartbeat_card[0].pid = 42;
+        heartbeat_card[0].status = SessionStatus::Idle;
+        mark_active_unread_cards(&mut heartbeat_card, &pool);
+        assert!(!heartbeat_card[0].unread, "有心跳 pid 的卡不因池行提前染色");
     }
 
     #[test]

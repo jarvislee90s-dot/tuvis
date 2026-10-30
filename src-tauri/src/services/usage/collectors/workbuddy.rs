@@ -797,7 +797,7 @@ fn load_sessions(
     };
     let mut stmt = conn
         .prepare(
-            "SELECT id, cwd, COALESCE(NULLIF(custom_title,''), title) FROM sessions WHERE deleted_at IS NULL",
+            "SELECT id, cwd, COALESCE(NULLIF(custom_title,''), title) FROM sessions WHERE (deleted_at IS NULL OR deleted_at <= 0)",
         )
         .map_err(|e| io_err(&e))?;
     let rows = stmt
