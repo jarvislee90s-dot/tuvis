@@ -2766,7 +2766,7 @@ mod unread_card_tests {
         retain_read_completed_cards(&mut active, &|_| Some(read_at));
         assert!(active.is_empty(), "已读且无新工作 → 完成卡应消失");
 
-        card.last_activity_at = chrono::DateTime::from_timestamp_millis(read_at + 1_000)
+        card.last_activity_at = chrono::DateTime::from_timestamp_millis(read_at + 1)
             .unwrap()
             .to_rfc3339();
         let mut active = vec![card.clone()];

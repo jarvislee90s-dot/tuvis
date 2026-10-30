@@ -578,6 +578,18 @@ fn collect_file(
             continue; // 坏行单行丢弃，不影响同文件其余行
         };
         b.new_records += 1;
+        // **P2.2**：本行若首次携带模型，先建立模型上下文再重放 pending——
+        // 否则「function_call(无模型) → function_call_result(首带模型)」会先 finish
+        // 后 start，工具耗时配不上。process_line 稍后仍会按同一值设置/继承。
+        if state.last_model.is_empty() {
+            if let Some(model) = v
+                .pointer("/providerData/model")
+                .and_then(|m| m.as_str())
+                .filter(|m| !m.is_empty())
+            {
+                state.last_model = model.to_string();
+            }
+        }
         // 模型已就绪 → 先把缓存行按**原序**重放（它们都排在本行之前）
         if !pending.is_empty() && !state.last_model.is_empty() {
             let left = replay_pending(
@@ -729,13 +741,18 @@ fn collect_subagents(
     };
     let mut files: Vec<std::path::PathBuf> = Vec::new();
     for entry in entries {
-        // 条目级错误不得静默（枚举到一半失败 = 这个目录读不了）
-        let entry = entry.map_err(|e| {
-            UsageError::new(
-                "usage-source-io",
-                format!("read_dir {} failed: {e}", sub_dir.display()),
-            )
-        })?;
+        // 条目级错误不得静默（枚举到一半失败 = 这个目录读不了）；
+        // 仅 NotFound（目录在枚举中被清理/轮转）按预期竞态跳过。
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                return Err(UsageError::new(
+                    "usage-source-io",
+                    format!("read_dir {} failed: {e}", sub_dir.display()),
+                ))
+            }
+        };
         let path = entry.path();
         // 只读**直接子文件**的 `*.jsonl`（不递归；`tool-results/` 等目录不进）；
         // 文件名**不限定 `agent-` 前缀**，防上游命名演进。
@@ -748,7 +765,19 @@ fn collect_subagents(
         {
             continue;
         }
-        if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+        // file_type 失败不得当成“非文件”静默跳过：仅 NotFound（文件消失）
+        // 按轮转竞态跳过，其余 I/O 错误整源报错（W-06/D-24 同口径）。
+        let is_file = match entry.file_type() {
+            Ok(t) => t.is_file(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                return Err(UsageError::new(
+                    "usage-source-io",
+                    format!("file_type {} failed: {e}", path.display()),
+                ))
+            }
+        };
+        if !is_file {
             continue;
         }
         files.push(path);
@@ -1764,6 +1793,39 @@ mod tests {
         assert_eq!(d.request_total, 15);
         assert_eq!(d.counters.tool_calls, 1);
         assert_eq!(d.counters.tool_ms, 500, "①② 按原序重放 → 回执照样配上");
+    }
+
+    /// **P2.2**：首条带模型的行本身就是工具回执时，必须先建立模型上下文并重放
+    /// 之前的 function_call，再处理回执；否则 finish 先于 start，tool_ms 少算。
+    #[test]
+    fn first_model_on_tool_result_replays_call_before_finishing() {
+        let dir = tempfile::tempdir().unwrap();
+        make_db(dir.path(), &[("s1", "/p/A")]);
+        write_jsonl(
+            dir.path(),
+            "p-A",
+            "s1",
+            &[
+                json!({"type":"function_call","name":"Bash","timestamp":1000,"id":"r1",
+                       "callId":"call_1","cwd":"/p/A","sessionId":"s1",
+                       "providerData":{"agent":"cli"}}),
+                json!({"type":"function_call_result","id":"r2","callId":"call_1","timestamp":1700,
+                       "cwd":"/p/A","sessionId":"s1",
+                       "message":{"usage":{"input_tokens":10,"output_tokens":1,"total_tokens":11}},
+                       "providerData":{"model":"deepseek-v4.1-flash","agent":"cli"}}),
+            ],
+        );
+        let no_cursors = HashMap::new();
+        let (delta, _) = run(dir.path(), &no_cursors);
+        assert_eq!(delta.details.len(), 1);
+        let d = &delta.details[0];
+        assert_eq!(d.key.model, "deepseek-v4.1-flash");
+        assert_eq!(d.counters.tool_calls, 1);
+        assert_eq!(
+            d.counters.tool_ms, 700,
+            "回执先于重放时 finish 匹配不到 start → tool_ms 会少算"
+        );
+        assert_eq!(d.requests, 1);
     }
 
     /// **裁决 C：整轮拿不到模型 → 丢弃 + 计数**（绝不写 `model=""` 行）。

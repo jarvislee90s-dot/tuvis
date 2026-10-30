@@ -25,6 +25,16 @@ struct WorkBuddyTailDigest {
     /// 尾部语义条目（纯内容产物，随摘要缓存；完成防抖判定依据）
     tail_kind: Option<AppEntryKind>,
     last_message: Option<String>,
+    /// 尾部**行内时间戳**的最大值（epoch ms）。用于“已读后是否有新工作”的判据：
+    /// 只 touch 文件 mtime 不会改变它；同秒新工作保留毫秒精度。
+    last_work_ms: Option<u64>,
+}
+
+fn line_timestamp_ms(line: &str) -> Option<u64> {
+    serde_json::from_str::<serde_json::Value>(line)
+        .ok()?
+        .get("timestamp")?
+        .as_u64()
 }
 
 fn read_workbuddy_tail_digest(jsonl: &Path) -> WorkBuddyTailDigest {
@@ -34,6 +44,7 @@ fn read_workbuddy_tail_digest(jsonl: &Path) -> WorkBuddyTailDigest {
         status_core,
         tail_kind,
         last_message: lines.iter().rev().find_map(|l| extract_message_text(l)),
+        last_work_ms: lines.iter().filter_map(|l| line_timestamp_ms(l)).max(),
     }
 }
 
@@ -786,6 +797,14 @@ pub fn get_workbuddy_sessions_with(
         .flatten()
         .max();
         let eff_age_ms = eff_activity_ms.map_or(0, |a| now.saturating_sub(a));
+        // 已读生命周期用的“新工作”时间：尾部行内时间戳（或 DB 活动）优先；
+        // **不以 jsonl mtime 覆盖**（touch 不算新工作）。都缺失才退回 mtime。
+        let session_activity_ms = [d.last_work_ms, c.db_activity_ms.map(|a| a.max(0) as u64)]
+            .into_iter()
+            .flatten()
+            .max()
+            .or(jsonl_mtime_ms)
+            .or(c.last_heartbeat_ms);
         let status = if working {
             // AC9：DB 说在干活 → 上拉 Processing（不因父会话静默而掉卡/误绿）
             SessionStatus::Processing
@@ -828,9 +847,10 @@ pub fn get_workbuddy_sessions_with(
             last_message_role: None,
             last_message_subagent_report: false,
             flap_from_subagent_activity: false,
-            last_activity_at: eff_activity_ms
+            last_activity_at: session_activity_ms
                 .map(|ms| {
-                    chrono::DateTime::from_timestamp((ms / 1000) as i64, 0)
+                    // 保留毫秒：同秒内的新工作不能被截断成“旧活动”
+                    chrono::DateTime::from_timestamp_millis(ms as i64)
                         .map(|dt| dt.to_rfc3339())
                         .unwrap_or_default()
                 })
@@ -3028,6 +3048,48 @@ mod board_tests {
         );
         let out = run_board(home.path(), &[process(11952)], now);
         assert!(out.is_empty(), "已删会话的残留心跳不得复活卡片");
+    }
+
+    /// **P2.1**：已读完成卡的“新工作”时间取行内 timestamp（或 DB 活动），
+    /// 只 touch mtime 不得把它推新；并保留毫秒精度。
+    #[test]
+    fn db_only_completed_last_activity_ignores_mtime_touch() {
+        let home = tempfile::tempdir().unwrap();
+        let now = now_ms();
+        let line_ts = now - 60_000;
+        let dir = home
+            .path()
+            .join(".workbuddy/projects")
+            .join(mangle_project_path(CWD));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join(format!("{SID}.jsonl"));
+        std::fs::write(
+            &p,
+            format!(
+                "{{\"type\":\"message\",\"role\":\"assistant\",\"timestamp\":{line_ts},\"content\":[{{\"type\":\"output_text\",\"text\":\"完成\"}}]}}\n"
+            ),
+        )
+        .unwrap();
+        // mtime 很新（模拟只 touch 文件），但行内 timestamp 是 60s 前
+        let f = std::fs::OpenOptions::new().write(true).open(&p).unwrap();
+        f.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_millis(now - 1_000))
+            .unwrap();
+        seed_db(
+            home.path(),
+            &[(
+                SID,
+                "completed",
+                (now - 90_000) as i64,
+                (now - 90_000) as i64,
+                None,
+            )],
+        );
+        let out = run_board(home.path(), &[sentinel(8084)], now);
+        assert_eq!(out.len(), 1);
+        let got = chrono::DateTime::parse_from_rfc3339(&out[0].last_activity_at)
+            .unwrap()
+            .timestamp_millis();
+        assert_eq!(got, line_ts as i64, "last_activity 不得被 mtime touch 推新");
     }
 
     /// **AC9 状态上拉**：主 jsonl 尾部是 assistant 文本（Idle），但 DB 说 working →
