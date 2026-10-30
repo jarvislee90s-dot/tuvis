@@ -696,7 +696,10 @@ fn get_all_sessions_inner() -> SessionsResponse {
     }
 
     // W4：APP 类未读卡合并 + 未读池维护（宿主存活检查 / 变黄删除 / 过期清理）
-    sync_unread_sessions(&mut all_sessions);
+    // 删除状态必须贯穿未读池：先解析“池里 WorkBuddy 行对应 DB 明确删除”的 id，
+    // DB 打不开时为空集（不误清）。合并阶段同时过滤/删除这些行。
+    let deleted_workbuddy = deleted_workbuddy_unread_ids();
+    sync_unread_sessions(&mut all_sessions, &deleted_workbuddy);
 
     // Hook 事件集成：用新鲜事件（<30s）更新会话状态；T3 起审批等待持久化（DB
     // approval_wait_marks）——进入事件（PermissionRequest/Notification[注册侧已
@@ -1983,6 +1986,35 @@ fn insert_allowed(prev_status: Option<&str>, was_read_recently: bool) -> bool {
     !(prev_status.is_none() && was_read_recently)
 }
 
+/// WorkBuddy 未读池行中，DB 已明确删除（`deleted_at > 0`）的 sessionId。
+/// DB 打不开/查询失败 → 空集（宁可保留一行，也不把临时不可读误判为删除）。
+fn deleted_workbuddy_unread_ids() -> HashSet<String> {
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let ids: Vec<String> = crate::database::dao::unread::list(now_ms)
+        .into_iter()
+        .filter(|r| r.tool_id == "workbuddy")
+        .map(|r| r.session_id)
+        .collect();
+    if ids.is_empty() {
+        return HashSet::new();
+    }
+    let Some(home) = dirs::home_dir() else {
+        return HashSet::new();
+    };
+    crate::monitor::workbuddy_parser::deleted_workbuddy_session_ids(&home, &ids).unwrap_or_default()
+}
+
+/// 未读池合并前的删除过滤（纯函数，可测）：
+/// 只丢弃 `deleted` 集合中命中的 WorkBuddy 行；其他工具同 id 不受影响。
+fn filter_deleted_unread(
+    pool: Vec<crate::database::dao::unread::UnreadSessionRecord>,
+    deleted: &HashSet<String>,
+) -> Vec<crate::database::dao::unread::UnreadSessionRecord> {
+    pool.into_iter()
+        .filter(|r| !(r.tool_id == "workbuddy" && deleted.contains(&r.session_id)))
+        .collect()
+}
+
 /// W4 未读机制核心：把 DB 中的未读会话合并为 Session 卡，并维护未读池
 /// - 会话当前非空闲（黄/红）→ 删未读行（活跃卡可见，防同会话双卡）
 /// - 转绿（Idle/Finished）→ upsert 未读行（未在池中时）
@@ -1991,8 +2023,14 @@ fn insert_allowed(prev_status: Option<&str>, was_read_recently: bool) -> bool {
 /// - 数据驱动持久绿卡工具（Codex APP / ZCode，P1-3 通用化）：聚合卡即该会话的
 ///   「未读卡」形态——池有行时标记 unread=true（徽标/「未读卡排后」生效），
 ///   已读删行后由 get_all_sessions 的前置过滤剔除，闭环「被已读信号清除」
-fn sync_unread_sessions(active: &mut Vec<Session>) {
+fn sync_unread_sessions(active: &mut Vec<Session>, deleted_workbuddy: &HashSet<String>) {
     let now_ms = chrono::Utc::now().timestamp_millis();
+
+    // 0) 删除状态贯穿未读池：先物理删除已删会话的池行，再做本轮合并。
+    //    deleted_workbuddy 为空（DB 不可读/无删除）时不动任何行。
+    for sid in deleted_workbuddy {
+        crate::database::dao::unread::delete("workbuddy", sid);
+    }
 
     // 1) 活跃会话驱动未读池变更
     for s in active.iter_mut() {
@@ -2071,7 +2109,11 @@ fn sync_unread_sessions(active: &mut Vec<Session>) {
     }
 
     // 4) 未读池合并为卡（纯映射见 build_unread_cards；追加在末尾，最终顺序由 session_sort_cmp 决定）
-    let final_unread = crate::database::dao::unread::list(now_ms);
+    //    已删会话的池行即使因清理失败残留，也不得合并成卡（P1：删除状态贯穿最终渲染）。
+    let final_unread = filter_deleted_unread(
+        crate::database::dao::unread::list(now_ms),
+        deleted_workbuddy,
+    );
     // P1：WorkBuddy 的 DB-only completed 卡（pid=0）若池里已有未读行，不能继续以
     // unread=false 的普通卡呈现（build_unread_cards 会因“已在 active”跳过池卡）。
     // 在合并前把它标成 unread，保证“未读记录存在 ⇒ 卡面呈现未读”。
@@ -2614,7 +2656,7 @@ mod sort_tests {
 
 #[cfg(test)]
 mod unread_card_tests {
-    use super::{build_unread_cards, mark_active_unread_cards};
+    use super::{build_unread_cards, filter_deleted_unread, mark_active_unread_cards};
     use crate::database::dao::unread::UnreadSessionRecord;
     use crate::session::model::{AgentType, ProcessForm, Session, SessionStatus};
 
@@ -2652,6 +2694,16 @@ mod unread_card_tests {
             jump_supported: true,
             unread: false,
         }
+    }
+
+    /// P1：已删会话的未读池行不得合并为卡；其他工具同 id 不受影响。
+    #[test]
+    fn deleted_workbuddy_pool_rows_are_not_merged_to_cards() {
+        let pool = vec![record("workbuddy", "s1"), record("codex", "s1")];
+        let deleted: std::collections::HashSet<String> = ["s1".to_string()].into_iter().collect();
+        let filtered = filter_deleted_unread(pool, &deleted);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].tool_id, "codex");
     }
 
     /// P1：WorkBuddy DB-only completed 卡（pid=0）池里有未读行时，必须标 unread；

@@ -366,6 +366,40 @@ pub fn db_sessions_by_ids(home: &Path, ids: &[String]) -> HashMap<String, WbDbSe
     out
 }
 
+/// 按 sessionId 查询**明确删除**的 WorkBuddy 会话（`deleted_at > 0`）。
+///
+/// 返回 `None` = DB 打不开/查询失败（**不可据此清理**，避免把临时不可读误判为删除）；
+/// `Some(set)` = DB 可读，set 是确认删除的 id。供未读池合并与心跳补偿共用。
+pub fn deleted_workbuddy_session_ids(
+    home: &Path,
+    ids: &[String],
+) -> Option<std::collections::HashSet<String>> {
+    if ids.is_empty() {
+        return Some(std::collections::HashSet::new());
+    }
+    let db = home.join(".workbuddy").join("workbuddy.db");
+    let conn = super::sqlite::open_readonly_with_timeout(&db)?;
+    let mut uniq: Vec<&String> = ids.iter().collect();
+    uniq.sort();
+    uniq.dedup();
+    let placeholders = vec!["?"; uniq.len()].join(",");
+    let sql = format!("SELECT id FROM sessions WHERE id IN ({placeholders}) AND deleted_at > 0");
+    let mut stmt = conn.prepare(&sql).ok()?; // 列缺失/版本漂移 → None，不清理
+    let rows = stmt
+        .query_map(
+            rusqlite::params_from_iter(uniq.iter().map(|s| s.as_str())),
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .ok()?;
+    let mut out = std::collections::HashSet::new();
+    for row in rows {
+        if let Ok(Some(id)) = row {
+            out.insert(id);
+        }
+    }
+    Some(out)
+}
+
 /// 会话行的**唯一 SELECT 定义**（两个查询入口共用，杜绝漂移）：
 /// * `title` 的 `COALESCE` 是标题回退，**不受**「禁止 COALESCE 取活动时间」的裁决影响；
 /// * `activity` 必须是 `MAX(last_activity_at, updated_at)`。SQLite 的标量 `max(a, NULL)`
@@ -848,6 +882,26 @@ fn first_user_text(lines: &[String]) -> Option<String> {
         .next()
 }
 
+/// 兼容旧调用：无 deleted 过滤（既有单测/旧调用）。
+pub fn compensate_vanished_heartbeats_in(
+    home: &Path,
+    now_ms: u64,
+    last_seen: &Mutex<HashMap<u32, (String, String)>>,
+    status_of: &dyn Fn(&str) -> Option<String>,
+    was_read: &dyn Fn(&str) -> bool,
+    is_live: &dyn Fn(&str) -> bool,
+) -> Vec<crate::database::dao::unread::UnreadSessionRecord> {
+    compensate_vanished_heartbeats_in_with_deleted(
+        home,
+        now_ms,
+        last_seen,
+        status_of,
+        was_read,
+        is_live,
+        &std::collections::HashSet::new(),
+    )
+}
+
 /// 补偿核心（spec W4 / §8 可测试）：判定 last_seen 中心跳已消失的 pid（文件缺失或过期），
 /// 读其 JSONL 终态——完成 → 产出待插入的未读记录；运行中被杀 → 不产出。
 /// 返回补偿产物并由调用方落库（DAO 注入点，测试可断言产物而不触库）；
@@ -858,13 +912,14 @@ fn first_user_text(lines: &[String]) -> Option<String> {
 /// 卡片刚修好就被补偿逻辑插进未读池。因此消失 = `心跳缺失/过期 ∧ !is_live(session_id)`，
 /// 其中 `is_live`（生产实现）= `runtime_present`（心跳文件存在 + pid 存活 + sessionId 匹配）
 /// ∨ DB `MAX(last_activity_at, updated_at)` 在 300s 内 ∨ 主 jsonl mtime 在 300s 内。
-pub fn compensate_vanished_heartbeats_in(
+pub fn compensate_vanished_heartbeats_in_with_deleted(
     home: &Path,
     now_ms: u64,
     last_seen: &Mutex<HashMap<u32, (String, String)>>,
     status_of: &dyn Fn(&str) -> Option<String>,
     was_read: &dyn Fn(&str) -> bool,
     is_live: &dyn Fn(&str) -> bool,
+    deleted_ids: &std::collections::HashSet<String>,
 ) -> Vec<crate::database::dao::unread::UnreadSessionRecord> {
     let mut compensated = Vec::new();
 
@@ -888,7 +943,7 @@ pub fn compensate_vanished_heartbeats_in(
                 Some(hb) => !heartbeat_is_alive(&hb, now_ms),
                 None => true,
             };
-            heartbeat_gone && !is_live(sid)
+            heartbeat_gone && !is_live(sid) && !deleted_ids.contains(sid)
         })
         .collect();
     // issue #35 nit：单轮复用一条只读连接（cwd 反查 + 标题查询共用；
@@ -1149,7 +1204,27 @@ pub fn compensate_vanished_heartbeats() {
             sid,
         )
     };
-    for record in compensate_vanished_heartbeats_in(
+    // 删除状态必须贯穿补偿：DB 明确标记删除的会话不得因残留 LAST_SEEN/心跳再插未读。
+    // 先按 LAST_SEEN 的 workbuddy id 一次查询；DB 打不开 → 空集（不清、不误判删除）。
+    let last_seen_ids: Vec<String> = {
+        let last_seen = LAST_SEEN_SESSIONS.lock().unwrap();
+        last_seen
+            .values()
+            .filter(|(tool, _)| tool == "workbuddy")
+            .map(|(_, sid)| sid.clone())
+            .collect()
+    };
+    let deleted_ids = deleted_workbuddy_session_ids(&home, &last_seen_ids).unwrap_or_default();
+    if !deleted_ids.is_empty() {
+        LAST_SEEN_SESSIONS
+            .lock()
+            .unwrap()
+            .retain(|_, (tool, sid)| !(tool == "workbuddy" && deleted_ids.contains(sid)));
+        for sid in &deleted_ids {
+            crate::database::dao::unread::delete("workbuddy", sid);
+        }
+    }
+    for record in compensate_vanished_heartbeats_in_with_deleted(
         &home,
         now,
         &LAST_SEEN_SESSIONS,
@@ -1157,6 +1232,7 @@ pub fn compensate_vanished_heartbeats() {
         // issue #35-1：已读墓碑判据（不依赖状态缓存的存活期）
         &|sid| crate::database::dao::unread::was_read_recently("workbuddy", sid, now as i64),
         &is_live,
+        &deleted_ids,
     ) {
         crate::database::dao::unread::upsert(&record);
     }
@@ -1998,6 +2074,30 @@ mod tests {
             );
             assert_eq!(out2.len(), 1, "窗口过后照常补一次未读");
             assert_eq!(out2[0].session_id, SID);
+        }
+
+        /// P1：DB 已删除的会话即使 LAST_SEEN 残留、心跳消失，也不得补偿未读。
+        #[test]
+        fn deleted_session_with_stale_last_seen_is_not_compensated() {
+            let home = tempfile::tempdir().unwrap();
+            let now = now_ms();
+            write_jsonl(home.path(), SID, ASSISTANT_TAIL);
+            let last_seen = Mutex::new(HashMap::from([(
+                11952u32,
+                ("workbuddy".to_string(), SID.to_string()),
+            )]));
+            let deleted: std::collections::HashSet<String> =
+                [SID.to_string()].into_iter().collect();
+            let out = compensate_vanished_heartbeats_in_with_deleted(
+                home.path(),
+                now,
+                &last_seen,
+                &|_| None,
+                &|_| false,
+                &|_| false,
+                &deleted,
+            );
+            assert!(out.is_empty(), "已删会话不得因残留 LAST_SEEN 复活未读");
         }
 
         /// P2-3 按工具隔离：观测表条目携带工具归属，非 workbuddy 条目不代偿
@@ -2877,6 +2977,31 @@ mod board_tests {
         );
         let out = run_board(home.path(), &[sentinel(8084)], now);
         assert!(out.is_empty(), "已删会话不得复活");
+    }
+
+    /// P1/P2 根因：删除状态查询要能区分“确认删除”与“DB 不可读”，供补偿/未读池共用。
+    #[test]
+    fn deleted_session_ids_query_distinguishes_deleted_and_unreadable() {
+        let home = tempfile::tempdir().unwrap();
+        let now = now_ms();
+        seed_db(
+            home.path(),
+            &[
+                (SID, "working", now as i64, now as i64, Some(1)),
+                (SID2, "working", now as i64, now as i64, None),
+            ],
+        );
+        let deleted =
+            deleted_workbuddy_session_ids(home.path(), &[SID.to_string(), SID2.to_string()])
+                .expect("DB 可读 → Some");
+        assert!(deleted.contains(SID));
+        assert!(!deleted.contains(SID2), "deleted_at IS NULL 不算删除");
+
+        let missing = tempfile::tempdir().unwrap();
+        assert!(
+            deleted_workbuddy_session_ids(missing.path(), &[SID.to_string()]).is_none(),
+            "DB 不存在/不可读 → None（调用方不得据此清理）"
+        );
     }
 
     /// P2：**心跳文件仍在**但 DB 已标记删除 → 心跳候选也必须被拦截（不能只测 DB-only）
