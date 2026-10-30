@@ -209,6 +209,9 @@ pub fn run() {
             crate::services::usage::collect::spawn_initial_collection();
             // 会话扫描总线：常驻线程 + 共享快照（所有消费方读快照，冷启动首扫立即执行）
             crate::adapter::scan_bus::start(app.handle().clone());
+            // 事件唤醒：1s mtime 轮询（hook 事件目录 / 活跃事件文件 / facts / 会话库），
+            // 有变化即请求一次 Event 补扫——低频档位只作兜底
+            crate::adapter::wakeup::spawn_runtime();
             // TPS 短时抽样（2026-10-24 计划 Task 7）：调度/接收随 usage.enabled 总授权
             // 启停——关闭时每拍只读一行 settings（惯性，不改旧 usage 采集的启动时序）
             crate::services::tps::collector::spawn_runtime();

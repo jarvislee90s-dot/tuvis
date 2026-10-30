@@ -9,6 +9,7 @@ pub mod kimi;
 pub mod openclaw;
 pub mod opencode;
 pub mod scan_bus;
+pub mod wakeup;
 pub mod workbuddy;
 pub mod zcode;
 
