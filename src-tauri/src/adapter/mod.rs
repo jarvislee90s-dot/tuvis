@@ -399,6 +399,30 @@ fn retry_insert_allowed(pending_since_ms: i64, read_at: Option<i64>) -> bool {
     read_at.is_none_or(|t| t < pending_since_ms)
 }
 
+fn session_activity_ms(s: &Session) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(&s.last_activity_at)
+        .ok()
+        .map(|dt| dt.timestamp_millis())
+}
+
+/// 首次转绿 INSERT 是否应因“本回合已读”而跳过：
+/// * 有待重试标记：墓碑 >= since（本次转绿后）→ 跳过；
+/// * 无标记（含重启后标记丢失）：墓碑 >= 卡片最后活动 → 视为本回合已读，跳过；
+///   旧回合墓碑 < 当前回合活动 → 允许插入。
+fn insert_should_skip_for_read(
+    pending_since_ms: Option<i64>,
+    read_at: Option<i64>,
+    activity_ms: Option<i64>,
+) -> bool {
+    match pending_since_ms {
+        Some(since) => !retry_insert_allowed(since, read_at),
+        None => match (read_at, activity_ms) {
+            (Some(read), Some(activity)) => read >= activity,
+            _ => false,
+        },
+    }
+}
+
 /// 数据驱动绿卡预过滤的保留判据：待重试优先，否则沿用“上一轮绿 + 池无行 ⇒ 剔除”。
 fn keep_green_card(was_green_prev: bool, pool_has_row: bool, retry_pending: bool) -> bool {
     retry_pending || !codex_green_card_should_drop(was_green_prev, pool_has_row)
@@ -2154,7 +2178,11 @@ fn sync_unread_sessions(active: &mut Vec<Session>, deleted_workbuddy: &HashSet<S
                 UnreadPoolAction::Insert => {
                     let was_read =
                         crate::database::dao::unread::was_read_recently(&tool, &s.id, now_ms);
-                    if insert_allowed(prev.as_deref(), was_read) {
+                    let read_at = crate::database::dao::unread::read_tombstone_at(&tool, &s.id);
+                    let pending_since = unread_retry_pending_since(&tool, &s.id);
+                    let skip_for_read =
+                        insert_should_skip_for_read(pending_since, read_at, session_activity_ms(s));
+                    if !skip_for_read && insert_allowed(prev.as_deref(), was_read) {
                         if crate::database::dao::unread::try_upsert(&record) {
                             clear_unread_retry(&tool, &s.id);
                         } else {
@@ -2778,8 +2806,8 @@ mod sort_tests {
 #[cfg(test)]
 mod unread_card_tests {
     use super::{
-        build_unread_cards, clear_unread_retry, filter_deleted_unread, keep_green_card,
-        mark_active_unread_cards, mark_unread_retry, retain_read_completed_cards,
+        build_unread_cards, clear_unread_retry, filter_deleted_unread, insert_should_skip_for_read,
+        keep_green_card, mark_active_unread_cards, mark_unread_retry, retain_read_completed_cards,
         retry_insert_allowed, unread_retry_pending, unread_retry_pending_since,
     };
     use crate::database::dao::unread::UnreadSessionRecord;
@@ -2845,6 +2873,20 @@ mod unread_card_tests {
         assert!(retry_insert_allowed(2_000, Some(1_000)));
         assert!(!retry_insert_allowed(2_000, Some(2_000)));
         assert!(retry_insert_allowed(2_000, None));
+        // Insert 分支：待重试带 since；重启无标记时用卡片活动时间兜底
+        assert!(!insert_should_skip_for_read(
+            Some(2_000),
+            Some(1_000),
+            Some(1_500)
+        ));
+        assert!(insert_should_skip_for_read(
+            Some(2_000),
+            Some(2_000),
+            Some(1_500)
+        ));
+        assert!(!insert_should_skip_for_read(None, Some(1_000), Some(1_500)));
+        assert!(insert_should_skip_for_read(None, Some(2_000), Some(1_500)));
+        assert!(!insert_should_skip_for_read(None, None, Some(1_500)));
         clear_unread_retry("codex", "retry-test");
         assert!(!unread_retry_pending("codex", "retry-test"));
     }
