@@ -1,6 +1,10 @@
 import { useTranslation } from "react-i18next";
 import { useQueryClient } from "@tanstack/react-query";
-import { hideSessionOptimistically } from "@/lib/query/optimisticSessions";
+import {
+  SESSIONS_QUERY_KEY,
+  clearPendingSessions,
+  hideSessionOptimistically,
+} from "@/lib/query/optimisticSessions";
 import { Cpu, Clock, Bot, ChevronRight, X, ArrowLeftRight, ExternalLink } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { cn } from "@/lib/utils";
@@ -69,11 +73,11 @@ export function SessionCard({
   // ≤1s），命令内部的补扫等待不阻塞感知；成功后回取权威快照，失败即回滚。
   const handleClose = async (e: React.MouseEvent) => {
     e.stopPropagation(); // 不触发卡片跳转
-    hideSessionOptimistically(queryClient, {
-      id: session.id,
-      agentType: session.agentType,
-      unread: session.unread,
-    });
+    const target = { id: session.id, agentType: session.agentType };
+    // G1：先取消在飞轮询，避免旧快照在乐观更新后回写；pending 集合在命令期间
+    // 继续拦截轮询回写（会话卡/未读态都不复活）
+    void queryClient.cancelQueries({ queryKey: SESSIONS_QUERY_KEY });
+    hideSessionOptimistically(queryClient, session);
     try {
       const outcome = session.unread
         ? await invoke<{ applied: boolean; version: number }>("mark_session_read", {
@@ -92,7 +96,10 @@ export function SessionCard({
       // 失败：finally 的 invalidate 会把权威快照取回（乐观隐藏回滚）
       console.error("session card close failed:", err);
     } finally {
-      void queryClient.invalidateQueries({ queryKey: ["sessions"] });
+      // 命令结束（成功/失败）回取权威快照；快照落地后再清 pending，失败即回滚
+      void Promise.resolve(queryClient.invalidateQueries({ queryKey: SESSIONS_QUERY_KEY }))
+        .catch(() => {})
+        .finally(() => clearPendingSessions([target]));
     }
   };
 
