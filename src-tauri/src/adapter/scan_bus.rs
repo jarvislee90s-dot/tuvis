@@ -154,6 +154,11 @@ pub fn scan_after_mutation(wait: Duration) -> MutationScan {
                 "scan_bus: 变更后等待在飞扫描超时（{:?}），返回旧快照（applied=false）",
                 wait
             );
+            // R8：超时不能让变更「丢掉」——在飞扫描可能早于变更启动，它发布的是
+            // 旧快照；补排一次 Action，让扫描线程在下一圈立刻补扫（否则要等档位
+            // 周期 10–30s，F5 降级路径失守）。同时进入 degraded 30s 诊断窗口。
+            note_timeout();
+            request_scan(ScanReason::Action);
             let snapshot = snapshot().unwrap_or_else(empty_snapshot);
             return MutationScan {
                 snapshot,
@@ -1064,6 +1069,43 @@ mod tests {
         assert_eq!(v["total"].as_u64(), Some(2));
         assert_eq!(v["last_reason"].as_str(), Some("Periodic"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// R8：变更补扫等待在飞超时后，必须补排一次 Action——
+    /// 否则在飞扫描早于变更，旧快照发布后卡片要等 10–30s 才收敛。
+    #[test]
+    fn mutation_timeout_requests_followup_action_scan() {
+        let _guard = test_guard();
+        reset_for_test();
+        let _ = publish_for_test(|| resp(SessionStatus::Idle));
+        let (tx, rx) = mpsc::channel();
+        set_test_tx_for_test(Some(tx));
+        set_in_flight_for_test(true); // 占位：模拟早于变更启动的在飞扫描
+        let before_scans = scan_total();
+        let result = scan_after_mutation(Duration::from_millis(100));
+        assert!(!result.applied, "在飞超时必须 applied=false");
+        assert!(is_degraded(), "超时必须进入 degraded 30s 窗口");
+
+        // 模拟扫描线程消费补排的 Action 并完成一次新扫描
+        let consumer = std::thread::spawn(move || {
+            let reason = rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("超时后必须补排 Action");
+            scan_once(reason)
+        });
+        set_in_flight_for_test(false); // 释放在飞占位
+        let snap = consumer.join().expect("补扫线程失败");
+        assert!(
+            scan_total() > before_scans,
+            "超时后必须发生一次后续扫描（计数未增长）"
+        );
+        assert!(
+            snap.version > result.snapshot.version,
+            "后续扫描必须发布更新版本（{} -> {}）",
+            result.snapshot.version,
+            snap.version
+        );
+        set_test_tx_for_test(None);
     }
 
     #[test]
