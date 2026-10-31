@@ -49,24 +49,25 @@ pub fn scan_bus_status() -> serde_json::Value {
 }
 
 /// 前端可见性心跳（主窗可见且聚焦 / 浮窗展开）：置「有人在看」，TTL 内节奏降档到 idle。
-/// 上升沿（**总体**未在看 → 在看）立即请求一次事件补扫——窗口重新聚焦时数据立刻新鲜，
-/// 不必等下一个档位周期（最坏 30s）。
+/// **窗口级**上升沿（某窗口 false→true 或新窗口首次 true）立即请求一次 Action 补扫——
+/// 窗口重新聚焦时数据立刻新鲜，不必等下一个档位周期（最坏 30s）；桌宠已展开时
+/// 主窗重新聚焦同样能刷新（旧口径按总体状态判定，会被宠物浮窗吞掉）。
 ///
-/// `source` 区分心跳来源：主窗 "main"（缺省）、宠物浮窗 "pet"。两个 WebView 共用同一后端
-/// 状态，按源记账才能让单源退出（浮窗收起 / 主窗失焦）不清掉另一源的「在看」
+/// `window` 区分心跳来源窗口：Tauri WebView label（主窗 "main"、宠物 "pet"）。
+/// 旧前端只传 `watching`（无 window）→ 归入 "global" 键，语义仍兼容。
 #[tauri::command]
-pub fn scan_bus_watch(watching: bool, source: Option<String>) {
-    let source = normalize_watch_source(source);
-    if crate::adapter::scan_bus::set_user_watching(&source, watching) {
-        crate::adapter::scan_bus::request_scan(crate::adapter::scan_bus::ScanReason::Event);
+pub fn scan_bus_watch(window: Option<String>, watching: bool) {
+    let window = normalize_watch_window(window);
+    if crate::adapter::scan_bus::set_user_watching(&window, watching) {
+        crate::adapter::scan_bus::request_scan(crate::adapter::scan_bus::ScanReason::Action);
     }
 }
 
-/// 心跳源归一：缺省（老前端 / 远端调用）一律记到主窗；空白串同缺省，避免造出无名源
-fn normalize_watch_source(source: Option<String>) -> String {
-    match source.map(|s| s.trim().to_string()) {
+/// 心跳窗口归一：缺省（老前端 / 远端调用）记到 "global"；空白串同缺省，避免造出无名窗口
+fn normalize_watch_window(window: Option<String>) -> String {
+    match window.map(|s| s.trim().to_string()) {
         Some(s) if !s.is_empty() => s,
-        _ => "main".to_string(),
+        _ => "global".to_string(),
     }
 }
 
@@ -833,18 +834,61 @@ mod on_demand_tests {
 }
 
 #[cfg(test)]
-mod scan_watch_source_tests {
-    use super::normalize_watch_source;
+mod scan_watch_window_tests {
+    use super::normalize_watch_window;
 
-    /// 心跳源契约（Task 9）：缺省/空白 → "main"（老前端不带 source 也落主窗源，
-    /// 不会造出无名源干扰按源记账）；显式 source 原样保留（宠物浮窗报 "pet"）
+    /// 心跳窗口契约（Task 2）：缺省/空白 → "global"（老前端不带 window 仍兼容）；
+    /// 显式窗口标签原样保留（主窗 "main"、宠物浮窗 "pet"）
     #[test]
-    fn defaults_to_main_and_trims_explicit_source() {
-        assert_eq!(normalize_watch_source(None), "main");
-        assert_eq!(normalize_watch_source(Some(String::new())), "main");
-        assert_eq!(normalize_watch_source(Some("   ".to_string())), "main");
-        assert_eq!(normalize_watch_source(Some("pet".to_string())), "pet");
-        assert_eq!(normalize_watch_source(Some(" pet ".to_string())), "pet");
+    fn defaults_to_global_and_trims_explicit_window() {
+        assert_eq!(normalize_watch_window(None), "global");
+        assert_eq!(normalize_watch_window(Some(String::new())), "global");
+        assert_eq!(normalize_watch_window(Some("   ".to_string())), "global");
+        assert_eq!(normalize_watch_window(Some("pet".to_string())), "pet");
+        assert_eq!(normalize_watch_window(Some(" main ".to_string())), "main");
+    }
+
+    /// Task 2：窗口级上升沿 → 恰好一次 Action 补扫（不得叠加周期扫描）；
+    /// 续期 / 单窗退出 / 下降沿都不得补扫
+    #[test]
+    fn watch_requests_action_scan_once_per_window_rising_edge() {
+        use crate::adapter::scan_bus::{self, ScanReason};
+        let _guard = scan_bus::test_guard();
+        scan_bus::reset_for_test();
+        let (tx, rx) = std::sync::mpsc::channel();
+        scan_bus::set_test_tx_for_test(Some(tx));
+
+        super::scan_bus_watch(Some("main".to_string()), true);
+        assert!(
+            matches!(rx.try_recv(), Ok(ScanReason::Action)),
+            "首次在看 → Action 补扫"
+        );
+        super::scan_bus_watch(Some("main".to_string()), true);
+        assert!(rx.try_recv().is_err(), "续期不得重复补扫");
+
+        super::scan_bus_watch(Some("pet".to_string()), true);
+        assert!(
+            matches!(rx.try_recv(), Ok(ScanReason::Action)),
+            "桌宠已展开时主窗聚焦 = 该窗口上升沿，也要补扫"
+        );
+
+        super::scan_bus_watch(Some("pet".to_string()), false);
+        assert!(rx.try_recv().is_err(), "退出不是上升沿");
+        super::scan_bus_watch(Some("pet".to_string()), true);
+        assert!(
+            matches!(rx.try_recv(), Ok(ScanReason::Action)),
+            "重新可见 = 该窗口上升沿"
+        );
+
+        super::scan_bus_watch(None, true);
+        assert!(
+            matches!(rx.try_recv(), Ok(ScanReason::Action)),
+            "老前端（无窗口标签）归入 global 源，首次在看同样补扫"
+        );
+        super::scan_bus_watch(None, true);
+        assert!(rx.try_recv().is_err(), "global 源续期不补扫");
+
+        scan_bus::set_test_tx_for_test(None);
     }
 }
 

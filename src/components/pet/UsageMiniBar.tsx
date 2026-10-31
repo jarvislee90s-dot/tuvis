@@ -33,7 +33,7 @@ import {
   useUsageDashboardQuery,
   useUsageSettingsQuery,
 } from "@/lib/query/queries/usage";
-import { HEARTBEAT_INTERVAL_MS } from "@/lib/query/queries/scanBus";
+import { HEARTBEAT_INTERVAL_MS, currentScanWindowLabel } from "@/lib/query/queries/scanBus";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { EM_DASH, fmtPct, fmtTokens, usageAgentLabel } from "@/lib/usage/format";
@@ -257,9 +257,9 @@ export interface UsageMiniBarProps {
 export function UsageMiniBar({ scale, mode, onDetail, t }: UsageMiniBarProps) {
   const settings = useUsageSettingsQuery();
   useUsageCollect();
-  // 扫描档位（Task 9）：浮窗**展开期间**＝有人在看 → 以 source="pet" 报心跳。
-  // 与主窗心跳分开记账（后端按源并集判定）：本窗卸载只收回自己那份，不清主窗的；
-  // 反向亦然（主窗失焦心跳报 false 也不会把浮窗这份清掉）。
+  // 扫描档位（Task 9）：浮窗**展开期间**＝有人在看 → 以当前 WebView label 报心跳
+  // （Task 2：宠物窗口 label = "pet"）。与主窗心跳分开记账（后端按窗口并集判定）：
+  // 本窗卸载只收回自己那份，不清主窗的；反向亦然（主窗失焦心跳报 false 也不会把浮窗这份清掉）。
   //
   // 可见性判据（评审 Fix 1）：**不能只按「浮窗挂着」报 true**。托盘/菜单把宠物窗口隐藏后，
   // 本 WebView 仍然活着（浮窗不会卸载）⇒ 若无条件续报 true，pet 源永不收回，后端档位
@@ -268,8 +268,10 @@ export function UsageMiniBar({ scale, mode, onDetail, t }: UsageMiniBarProps) {
   //  * `pet-visibility-changed`（`FoxbellPet` / 托盘 emit，pet.tsx 同款消费），载荷 `{visible}`。
   // 30s 续期始终按**当前** visible 报：隐藏期间续报 false，档位才能落到 away。
   useEffect(() => {
+    // Task 2：窗口标签按当前 WebView 取（宠物窗口 "pet"），后端按窗口独立记账
+    const windowLabel = currentScanWindowLabel();
     const send = (watching: boolean) => {
-      void invoke("scan_bus_watch", { watching, source: "pet" }).catch(() => {});
+      void invoke("scan_bus_watch", { window: windowLabel, watching }).catch(() => {});
     };
     let visible = document.visibilityState === "visible";
     let alive = true;

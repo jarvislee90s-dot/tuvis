@@ -15,6 +15,9 @@ use crate::session::{SessionStatus, SessionsResponse};
 pub struct Snapshot {
     /// 单调递增的发布版本（每次成功扫描 +1）
     pub version: u64,
+    /// 单调递增的**扫描纪元**（每次扫描**启动**时 +1，覆盖未发布/失败的扫描）。
+    /// F5：变更命令返回当时的 epoch，前端保留 pending 直到收到 epoch 更大的快照
+    pub epoch: u64,
     /// 扫描完成时刻（用于动作路径的新鲜度判定）
     pub scanned_at: Instant,
     /// 降级产物（空快照 / 补扫超时）：不得当作「新鲜扫描」使用，诊断口可查
@@ -37,11 +40,21 @@ pub enum ScanReason {
 
 static LAST: Lazy<Mutex<Option<Arc<Snapshot>>>> = Lazy::new(|| Mutex::new(None));
 static VERSION: AtomicU64 = AtomicU64::new(0);
+/// 扫描纪元：只在**扫描启动**时自增（不是发布时），供 F5 判定「某次扫描是否晚于变更」
+static SCAN_EPOCH: AtomicU64 = AtomicU64::new(0);
 static MODE: Lazy<Mutex<Mode>> = Lazy::new(|| Mutex::new(Mode::Idle));
-/// 「有人在看」按**源**记账：source → 心跳到期时刻（毫秒）。
-/// 主窗与宠物浮窗是两个 WebView，却共用同一个后端状态：单源退出（浮窗收起 / 主窗失焦）
-/// 不得清掉另一源的在看状态，故不能用一个布尔/时间戳表示
-static WATCH_UNTIL: Lazy<Mutex<std::collections::HashMap<String, i64>>> =
+
+/// 单个窗口的可见性心跳状态：是否在看 + 最近一次心跳时刻（毫秒）
+#[derive(Debug, Clone, Copy)]
+struct WatchState {
+    watching: bool,
+    last_seen_ms: i64,
+}
+
+/// 「有人在看」按**窗口**记账：window label → (watching, last_seen_ms)。
+/// 主窗与宠物浮窗是两个 WebView，却共用同一个后端状态：单窗退出（浮窗收起 / 主窗失焦）
+/// 不得清掉另一窗的在看状态，也不能用一个布尔/时间戳表示
+static WATCH_STATE: Lazy<Mutex<std::collections::HashMap<String, WatchState>>> =
     Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
 static TX: OnceLock<mpsc::Sender<ScanReason>> = OnceLock::new();
 static IN_FLIGHT: AtomicBool = AtomicBool::new(false);
@@ -80,6 +93,12 @@ const TRAY_REFRESH: Duration = Duration::from_secs(30);
 
 pub fn version() -> u64 {
     VERSION.load(Ordering::SeqCst)
+}
+
+/// 当前扫描纪元（最近一次**启动**的扫描序号；无扫描为 0）。
+/// 与 `version()` 的区别：epoch 覆盖失败/未发布的扫描，且先于发布可见。
+pub fn scan_epoch() -> u64 {
+    SCAN_EPOCH.load(Ordering::SeqCst)
 }
 
 /// 进程内真实扫描次数（每次真正启动的 scan_once 计一次）
@@ -203,39 +222,42 @@ fn note_timeout() {
     LAST_TIMEOUT_MS.store(now_ms(), Ordering::SeqCst);
 }
 
-/// 前端可见性心跳："有人在看" = 主窗可见且聚焦 / 浮窗展开；**逐源**记账，TTL 90s。
-/// 返回本次调用是否构成「总体开始观察」的上升沿（任一源在看 → 有源在看）：
-/// 命令层据此立即请求一次补扫，窗口重新聚焦时数据不必等下一个档位周期。
+/// 前端可见性心跳（窗口级）："有人在看" = 任一窗口可见且聚焦 / 浮窗展开；TTL 90s。
+/// 返回本次调用是否构成**该窗口**的上升沿（false/过期/新窗口 → 在看）：
+/// 命令层据此立即请求一次 Action 补扫——窗口重新聚焦时数据不必等下一个档位周期。
 ///
-/// 多源语义（主窗 "main" 与宠物浮窗 "pet" 各记一份）：
-/// * 已有任一生效源时新增/续期另一源 → 不是上升沿（总体状态没变）；
-/// * 单源退订只删自己那份，其他源仍生效 → 总体仍在看，不是上升沿；
-/// * 最后一个源退出后再有源回来 → 上升沿；过期源（心跳断供 > 90s）视同已退出。
+/// 窗口级语义（主窗 "main" 与宠物浮窗 "pet" 各记一份）：
+/// * 同一窗口续期 → 不是上升沿；
+/// * 某窗口首次在看 / 退出后重新在看 → 是上升沿（即使另一窗口一直在看：
+///   「桌宠已展开时主窗重新聚焦」也必须刷新，旧口径会被宠物浮窗吞掉）；
+/// * 单窗退订只删自己那份，其他窗口仍生效 → 总体仍在看；
+/// * 过期窗口（心跳断供 > 90s）视同已退出，其重新上报算上升沿。
 ///
 /// 判定在锁内「先算前值、改完再算后值」，并发心跳不会各自拿到一次边沿。
-pub fn set_user_watching(source: &str, watching: bool) -> bool {
+pub fn set_user_watching(window: &str, watching: bool) -> bool {
     let now = now_ms();
-    let mut map = WATCH_UNTIL.lock().unwrap_or_else(|e| e.into_inner());
-    let before = map.values().any(|until| *until > now);
-    // 每次写入顺手修剪过期项：源数量固定（main/pet），但断供的源不该长期占着 map
-    map.retain(|_, until| *until > now);
-    if watching {
-        map.insert(source.to_string(), now + WATCH_TTL_MS);
-    } else {
-        map.remove(source);
-    }
-    let after = map.values().any(|until| *until > now);
-    !before && after
+    let mut map = WATCH_STATE.lock().unwrap_or_else(|e| e.into_inner());
+    // 每次写入顺手修剪过期项：窗口数量固定（main/pet），但断供的窗口不该长期占着 map
+    map.retain(|_, st| now.saturating_sub(st.last_seen_ms) < WATCH_TTL_MS);
+    let before = map.get(window).map(|st| st.watching).unwrap_or(false);
+    map.insert(
+        window.to_string(),
+        WatchState {
+            watching,
+            last_seen_ms: now,
+        },
+    );
+    !before && watching
 }
 
-/// 总体「有人在看」= 任一源的心跳未过期
+/// 总体「有人在看」= 任一未过期窗口的心跳为 watching
 fn user_watching() -> bool {
     let now = now_ms();
-    WATCH_UNTIL
+    WATCH_STATE
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .values()
-        .any(|until| *until > now)
+        .any(|st| st.watching && now.saturating_sub(st.last_seen_ms) < WATCH_TTL_MS)
 }
 
 fn now_ms() -> i64 {
@@ -332,6 +354,11 @@ fn scan_once_with_limit(reason: ScanReason, wait_limit: Duration) -> Arc<Snapsho
     let started_ms = now_ms();
     SCAN_STARTED_MS.store(started_ms, Ordering::SeqCst);
     SCANS_TOTAL.fetch_add(1, Ordering::SeqCst);
+    // F5：epoch 在**扫描启动**时递增（不是发布时）——变更命令返回的 epoch 与
+    // 「随后启动的扫描」可直接比较；失败/未发布的扫描也占一个序号，语义仍单调
+    let epoch = SCAN_EPOCH.fetch_add(1, Ordering::SeqCst) + 1;
+    #[cfg(test)]
+    fire_scan_start_probe(epoch);
     struct Clear;
     impl Drop for Clear {
         fn drop(&mut self) {
@@ -344,7 +371,10 @@ fn scan_once_with_limit(reason: ScanReason, wait_limit: Duration) -> Arc<Snapsho
     let started = Instant::now();
     let data = super::get_all_sessions_inner();
     let duration = started.elapsed();
-    let snap = publish(data, started_ms);
+    let snap = publish(data, started_ms, epoch);
+    // 快照更新通知（F4/F6）：所有真实发布路径（ColdStart/Periodic/Event/Action）都经
+    // scan_once → 此处统一 emit，前端据此直接回写 Query 缓存；档位未变化也照常通知
+    emit_snapshot_event(&snap, reason);
     // R4：每轮扫描只写一行 stats（覆盖写）；日志不再逐轮打 INFO（F9 ≤1MB/天）
     write_stats(reason, &snap, duration);
     snap
@@ -358,6 +388,45 @@ fn reason_name(reason: ScanReason) -> &'static str {
         ScanReason::Action => "Action",
         ScanReason::ColdStart => "ColdStart",
     }
+}
+
+/// 快照事件里 reason 的线名（`scan-bus-snapshot.reason`，小写下划线）
+fn reason_event_label(reason: ScanReason) -> &'static str {
+    match reason {
+        ScanReason::Periodic => "periodic",
+        ScanReason::Event => "event",
+        ScanReason::Action => "action",
+        ScanReason::ColdStart => "cold_start",
+    }
+}
+
+/// `scan-bus-snapshot` 载荷（纯函数，可单测）：version/epoch/reason/时间/档位/降级态
+/// + 完整 SessionsResponse（camelCase）。前端收到新版本即直接 `setQueryData`，
+///   不再为同步数据额外打一次 IPC。
+///
+/// `scanned_at_ms` 是墙上时间，仅用于展示/排查，不参与任何时效判定（时效用 Instant）。
+fn snapshot_payload(
+    snap: &Snapshot,
+    reason: ScanReason,
+    mode: Mode,
+    scanned_at_ms: i64,
+) -> serde_json::Value {
+    serde_json::json!({
+        "version": snap.version,
+        "epoch": snap.epoch,
+        "reason": reason_event_label(reason),
+        "scannedAtMs": scanned_at_ms,
+        "mode": mode,
+        "degraded": snap.degraded,
+        "data": snap.data,
+    })
+}
+
+/// 快照发布后的统一事件出口（唯一调用点在 scan_once，覆盖全部真实发布路径）。
+/// emit 失败只 warn：前端仍有档位轮询兜底，通知本身是加速通道。
+fn emit_snapshot_event(snap: &Snapshot, reason: ScanReason) {
+    let payload = snapshot_payload(snap, reason, mode(), now_ms());
+    crate::remote::events::emit_ui("scan-bus-snapshot", payload);
 }
 
 /// stats 单行 JSON（纯函数，可测）：计数 + 最近一轮元数据 + F8 进程刷新耗时
@@ -419,6 +488,8 @@ fn write_stats(reason: ScanReason, snap: &Snapshot, duration: Duration) {
 fn empty_snapshot() -> Arc<Snapshot> {
     Arc::new(Snapshot {
         version: VERSION.load(Ordering::SeqCst),
+        // 未发布的降级产物不得冒领纪元：沿用当前值（不 +1），仅作展示占位
+        epoch: SCAN_EPOCH.load(Ordering::SeqCst),
         scanned_at: Instant::now(),
         degraded: true,
         data: SessionsResponse {
@@ -435,6 +506,7 @@ fn degraded_snapshot() -> Arc<Snapshot> {
         Some(s) if s.degraded => s,
         Some(s) => Arc::new(Snapshot {
             version: s.version,
+            epoch: s.epoch,
             scanned_at: s.scanned_at,
             degraded: true,
             data: s.data.clone(),
@@ -485,11 +557,12 @@ fn hang_alert_age(in_flight: bool, started_ms: i64, now: i64, last_alert_ms: i64
 /// 取锁必然发生在发布之后，一定能看到新快照；因此 `version()` 最多短暂滞后，
 /// **绝不会领先** `snapshot().version`（否则「读版本→读快照→标记已见」的
 /// 消费方会漏掉一次跃迁）。
-fn publish(data: SessionsResponse, started_ms: i64) -> Arc<Snapshot> {
+fn publish(data: SessionsResponse, started_ms: i64, epoch: u64) -> Arc<Snapshot> {
     let mut guard = LAST.lock().unwrap_or_else(|e| e.into_inner());
     let version = guard.as_ref().map(|s| s.version + 1).unwrap_or(1);
     let snap = Arc::new(Snapshot {
         version,
+        epoch,
         scanned_at: Instant::now(),
         degraded: false,
         data,
@@ -728,8 +801,9 @@ fn uncovered_tool_active(running_tools: &[String], resp: &SessionsResponse) -> b
 pub fn reset_for_test() {
     *LAST.lock().unwrap_or_else(|e| e.into_inner()) = None;
     VERSION.store(0, Ordering::SeqCst);
+    SCAN_EPOCH.store(0, Ordering::SeqCst);
     *MODE.lock().unwrap_or_else(|e| e.into_inner()) = Mode::Idle;
-    WATCH_UNTIL
+    WATCH_STATE
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clear();
@@ -741,6 +815,8 @@ pub fn reset_for_test() {
     super::record_running_tools(std::iter::empty());
     // R11：一并清测试通道，防止某用例中途 panic 留下死通道影响后续用例
     *TEST_TX.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    // 扫描启动探针同理：用例 panic 时不得残留到下一个用例
+    *SCAN_START_PROBE.lock().unwrap_or_else(|e| e.into_inner()) = None;
 }
 
 /// 单测用：注入扫描唤醒发送端（让 ensure_fresh 走「有扫描线程」的等待路径）
@@ -760,10 +836,11 @@ pub(crate) fn set_in_flight_for_test(on: bool) {
     }
 }
 
-/// 单测用：发布一份由闭包产出的快照
+/// 单测用：发布一份由闭包产出的快照（epoch 随发布自增，模拟真实发布路径）
 #[cfg(test)]
 pub fn publish_for_test(f: impl FnOnce() -> SessionsResponse) -> Arc<Snapshot> {
-    publish(f(), now_ms())
+    let epoch = SCAN_EPOCH.fetch_add(1, Ordering::SeqCst) + 1;
+    publish(f(), now_ms(), epoch)
 }
 
 /// 单测用：以指定启动时刻发布（验证 R10 的超时窗口复位条件）
@@ -772,7 +849,8 @@ pub(crate) fn publish_at_for_test(
     started_ms: i64,
     f: impl FnOnce() -> SessionsResponse,
 ) -> Arc<Snapshot> {
-    publish(f(), started_ms)
+    let epoch = SCAN_EPOCH.fetch_add(1, Ordering::SeqCst) + 1;
+    publish(f(), started_ms, epoch)
 }
 
 /// 单测用：直接设置最近一次超时时刻（R10 复位条件用例）
@@ -791,6 +869,30 @@ static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// 「扫描线程已启动」，见 `scan_tx`）。测试结束须置回 None，避免影响未启动线程的用例。
 #[cfg(test)]
 static TEST_TX: Lazy<Mutex<Option<mpsc::Sender<ScanReason>>>> = Lazy::new(|| Mutex::new(None));
+
+/// 单测用：扫描启动探针——`scan_once` 赢得单飞、`SCAN_EPOCH` 自增后、真正扫描前调用，
+/// 入参为本次扫描的 epoch。用于断言「epoch 先于发布递增」与「快照携带启动时 epoch」。
+#[cfg(test)]
+type ScanStartProbe = Box<dyn FnOnce(u64) + Send>;
+
+#[cfg(test)]
+static SCAN_START_PROBE: Lazy<Mutex<Option<ScanStartProbe>>> = Lazy::new(|| Mutex::new(None));
+
+#[cfg(test)]
+fn set_scan_start_probe_for_test(probe: ScanStartProbe) {
+    *SCAN_START_PROBE.lock().unwrap_or_else(|e| e.into_inner()) = Some(probe);
+}
+
+#[cfg(test)]
+fn fire_scan_start_probe(epoch: u64) {
+    let probe = SCAN_START_PROBE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take();
+    if let Some(probe) = probe {
+        probe(epoch);
+    }
+}
 
 /// 单测用：获取全局测试锁（本模块测试与 `remote::server` SSE 测试共用同一把，
 /// 避免任一侧的 reset/seed 插进另一侧「种子 → 断言」窗口，见 test_guard 使用方）
@@ -873,56 +975,146 @@ mod tests {
         assert!(s.version >= 1);
     }
 
-    /// F4 回归锁：只有「未在看 → 在看」的**总体**上升沿返回 true（命令层据此补扫）；
-    /// 心跳续期、单源退出、停止观察都不得触发额外扫描。
-    /// 多源（main / pet）是 Task 9 的口径：两个 WebView 共用一个后端状态，单源退出
-    /// 不得清掉另一源的「在看」，也不得凭空造出一次上升沿
+    /// Task 2（F4/F6）：窗口级 watching——每个 WebView 独立记账。
+    /// 某窗口 false→true（或新窗口首次 true）就是该窗口的上升沿，命令层据此补扫：
+    /// 「桌宠已展开时主窗重新聚焦」也必须能刷新（旧的全局上升沿会吞掉这一情形）。
     #[test]
-    fn set_user_watching_reports_rising_edge_only() {
+    fn per_window_watching_reports_rising_edge_for_each_window() {
         let _guard = test_guard();
         reset_for_test();
         assert!(set_user_watching("main", true), "首次开始观察 = 上升沿");
         assert!(!set_user_watching("main", true), "心跳续期不是上升沿");
         assert!(
-            !set_user_watching("pet", true),
-            "已有源在场时新增另一源不是上升沿"
+            set_user_watching("pet", true),
+            "另一窗口首次在看也是上升沿（桌宠在场不吞主窗聚焦）"
         );
-        assert!(
-            !set_user_watching("main", false),
-            "主窗退出但 pet 仍在看 → 总体仍在看，不是上升沿"
-        );
-        assert!(user_watching(), "pet 源不因 main 退出而失效");
-        assert!(!set_user_watching("pet", true), "pet 续期仍不是上升沿");
-        assert!(
-            !set_user_watching("pet", false),
-            "最后一个源退出不是上升沿（是下降沿）"
-        );
-        assert!(!user_watching(), "全部源退出后不再是在看");
+        assert!(!set_user_watching("pet", true), "pet 续期不是上升沿");
+        assert!(user_watching(), "任一窗口在看 = 总体在看");
+        assert!(!set_user_watching("pet", false), "单窗退出不是上升沿");
+        assert!(user_watching(), "main 仍在看");
+        assert!(!set_user_watching("main", false), "最后一个窗口退出是下降沿");
+        assert!(!user_watching(), "全部窗口退出后不再是在看");
         assert!(
             set_user_watching("main", true),
             "全部退出后重新观察 = 上升沿"
         );
-        assert!(!set_user_watching("main", false));
     }
 
-    /// TTL 按源判定：心跳断供超过 90s 的源不再算「在看」，
-    /// 也不该把另一源的首次心跳误判成续期（否则窗口重新聚焦不补扫）
+    /// Task 2：TTL 按窗口判定——心跳断供超过 90s 的窗口不再算「在看」，
+    /// 它重新上报时算该窗口的上升沿（窗口从不可见→可见允许一次即时刷新）
     #[test]
-    fn expired_source_does_not_count_as_watching() {
+    fn expired_window_does_not_count_as_watching_and_reentry_is_rising_edge() {
         let _guard = test_guard();
         reset_for_test();
         {
-            let mut map = WATCH_UNTIL.lock().unwrap_or_else(|e| e.into_inner());
-            map.insert("pet".to_string(), now_ms() - 1);
+            let mut map = WATCH_STATE.lock().unwrap_or_else(|e| e.into_inner());
+            map.insert(
+                "pet".to_string(),
+                WatchState {
+                    watching: true,
+                    last_seen_ms: now_ms() - WATCH_TTL_MS - 1,
+                },
+            );
+            map.insert(
+                "main".to_string(),
+                WatchState {
+                    watching: true,
+                    last_seen_ms: now_ms(),
+                },
+            );
         }
-        assert!(!user_watching(), "过期源不算在看");
+        assert!(user_watching(), "未过期的 main 仍算在看");
         assert!(
-            set_user_watching("main", true),
-            "过期源在场时首个有效心跳也算上升沿"
+            set_user_watching("pet", true),
+            "过期窗口重新上报 = 该窗口上升沿"
         );
         // 过期项在写入时被修剪，不会长期占着 map
-        let map_len = WATCH_UNTIL.lock().unwrap_or_else(|e| e.into_inner()).len();
-        assert_eq!(map_len, 1, "过期源应被修剪，只留 main");
+        let map_len = WATCH_STATE.lock().unwrap_or_else(|e| e.into_inner()).len();
+        assert_eq!(map_len, 2, "只剩 main 与刚续期的 pet");
+
+        {
+            let mut map = WATCH_STATE.lock().unwrap_or_else(|e| e.into_inner());
+            for st in map.values_mut() {
+                st.last_seen_ms = now_ms() - WATCH_TTL_MS - 1;
+            }
+        }
+        assert!(!user_watching(), "全部窗口过期后不再是在看");
+    }
+
+    /// Task 2：`scan_epoch` 在扫描**启动**时 +1（不是发布时）——F5 据此判定
+    /// 「某次扫描是否晚于变更」。探测钩子在启动点断言：此刻已可见新 epoch，
+    /// 而共享快照仍是上一份（发布尚未发生）。
+    #[test]
+    fn epoch_increments_at_scan_start_and_is_written_into_snapshot() {
+        let _guard = test_guard();
+        reset_for_test();
+        let seeded = publish_for_test(|| resp(SessionStatus::Idle));
+        let observed = Arc::new(Mutex::new(None::<(u64, Option<u64>)>));
+        let sink = observed.clone();
+        set_scan_start_probe_for_test(Box::new(move |epoch| {
+            *sink.lock().unwrap_or_else(|e| e.into_inner()) =
+                Some((epoch, snapshot().map(|s| s.epoch)));
+        }));
+        let snap = scan_once_with_limit(ScanReason::Periodic, Duration::from_millis(50));
+        let (epoch_at_start, published_before) = observed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+            .expect("扫描启动钩子必须被调用");
+        assert_eq!(
+            epoch_at_start, snap.epoch,
+            "快照 epoch 必须来自扫描启动时递增的值"
+        );
+        assert!(
+            snap.epoch > seeded.epoch,
+            "epoch 必须单调递增（{} -> {}）",
+            seeded.epoch,
+            snap.epoch
+        );
+        assert_eq!(
+            published_before,
+            Some(seeded.epoch),
+            "启动点共享快照仍是上一份：证明 epoch 先于发布递增"
+        );
+        assert_eq!(scan_epoch(), snap.epoch);
+        let next = publish_for_test(|| resp(SessionStatus::Idle));
+        assert!(next.epoch > snap.epoch, "后续发布 epoch 继续单调");
+    }
+
+    /// Task 2：`scan-bus-snapshot` 载荷纯函数——字段齐全、reason/mode 用小写线名、
+    /// data 随响应走 camelCase（前端直接 setQueryData，无需再拉 IPC）。
+    #[test]
+    fn snapshot_payload_contains_full_snapshot_fields() {
+        let _guard = test_guard();
+        reset_for_test();
+        let snap = publish_for_test(|| SessionsResponse {
+            sessions: vec![session("s1", AgentType::Claude, SessionStatus::Waiting)],
+            total_count: 1,
+            waiting_count: 1,
+        });
+        let payload = snapshot_payload(&snap, ScanReason::Event, Mode::Away, 1_700_000_000_123);
+        assert_eq!(payload["version"].as_u64(), Some(snap.version));
+        assert_eq!(payload["epoch"].as_u64(), Some(snap.epoch));
+        assert_eq!(payload["reason"].as_str(), Some("event"));
+        assert_eq!(payload["scannedAtMs"].as_i64(), Some(1_700_000_000_123));
+        assert_eq!(payload["mode"].as_str(), Some("away"));
+        assert_eq!(payload["degraded"].as_bool(), Some(false));
+        assert_eq!(payload["data"]["totalCount"].as_u64(), Some(1));
+        assert_eq!(payload["data"]["waitingCount"].as_u64(), Some(1));
+        assert!(payload["data"]["sessions"].is_array());
+        assert!(
+            payload["data"].get("total_count").is_none(),
+            "data 必须 camelCase（与 get_all_sessions 契约一致）"
+        );
+    }
+
+    /// Task 2：事件 reason 标签覆盖全部真实发布路径（ColdStart/Periodic/Event/Action）
+    #[test]
+    fn reason_event_labels_cover_all_publish_paths() {
+        assert_eq!(reason_event_label(ScanReason::ColdStart), "cold_start");
+        assert_eq!(reason_event_label(ScanReason::Periodic), "periodic");
+        assert_eq!(reason_event_label(ScanReason::Event), "event");
+        assert_eq!(reason_event_label(ScanReason::Action), "action");
     }
 
     /// Fix 1：事件扫描的最小间隔跟随时长档位，但硬顶 5s。
