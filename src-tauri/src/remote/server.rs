@@ -174,7 +174,8 @@ fn release_connections(n: usize) {
 /// SSE 连接注册表（M4 T0a）：device_id → 活跃连接句柄表。
 /// 断连语义：吊销/停止时对目标设备的全部连接发 oneshot 关闭信号，
 /// SSE 流的 `take_until` 收到信号即终止 → axum 关闭该 HTTP 连接；
-/// 自然断开（客户端关页）由 CleanupStream 的 Drop 反注册。
+/// 自然断开（客户端关页）由 [`SseConnGuard`] 的 Drop 反注册
+/// （R6 起 CleanupStream 只持有守卫，不再自带 Drop 反注册）。
 /// 锁粒度：单 Mutex 短临界区（register/unregister/disconnect 均无 IO），
 /// 不与 store/pairing 锁嵌套（锁序红线：registry 永远最后进最先出）。
 #[derive(Default)]
@@ -1886,11 +1887,17 @@ mod tests {
             "吊销必须能命中等待中的连接"
         );
         assert!(!any_connection(), "吊销后连接计数应立即归零");
+        let disconnected_at = std::time::Instant::now();
         let resp = tokio::time::timeout(std::time::Duration::from_secs(8), handle)
             .await
             .expect("handler 超时")
             .expect("handler panic")
             .expect("oneshot 失败");
+        assert!(
+            disconnected_at.elapsed() < std::time::Duration::from_secs(2),
+            "R9：吊销必须在快照等待中被中断（实际 {:?}；未 select 时会等满 5s 补扫上限）",
+            disconnected_at.elapsed()
+        );
         let mut body = resp.into_body();
         let frame = tokio::time::timeout(std::time::Duration::from_secs(2), body.frame())
             .await

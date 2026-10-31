@@ -121,6 +121,10 @@ mod r1_mutation_scan_tests {
             !dismiss.contains(concat!("scan_now_", "blocking")),
             "dismiss_session_card 不得同步跑完整扫描"
         );
+        assert!(
+            dismiss.contains("apply_dismissals"),
+            "R9：单卡 dismiss 必须复用批量 apply_dismissals（未读池权威口径一致）"
+        );
 
         let settings_src = include_str!("settings.rs");
         let mark = function_body(settings_src, concat!("pub async fn mark_session", "_read("));
@@ -582,22 +586,29 @@ fn apply_dismissals(
 /// 放进阻塞线程池；同步命令在主线程跑扫描会冻结全部窗口 IPC。
 #[tauri::command]
 pub async fn dismiss_session_card(
+    app: tauri::AppHandle,
     agent_type: String,
     session_id: String,
     status: String,
 ) -> MutationOutcome {
-    {
-        let mut set = crate::monitor::SESSION_DISMISALS
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        set.insert((agent_type.to_lowercase(), session_id, status.to_lowercase()));
-    }
+    // R9：单卡与批量共用 apply_dismissals（未读池权威分流 + 一次补扫），
+    // 避免两条路径对「未读卡 X = 已读」的判定漂移
+    let item = DismissItem {
+        agent_type,
+        session_id,
+        status,
+    };
     // R1：完整扫描（可能等在飞 2s）放进阻塞线程池，命令本身不跑扫描
-    match tauri::async_runtime::spawn_blocking(|| {
-        crate::adapter::scan_bus::scan_after_mutation(std::time::Duration::from_secs(2))
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        apply_dismissals(vec![item], |agent_type, session_id| {
+            let _ = app.emit(
+                "session-read",
+                serde_json::json!({ "agentType": agent_type, "sessionId": session_id }),
+            );
+        })
     })
-    .await
-    {
+    .await;
+    match result {
         Ok(result) => MutationOutcome {
             applied: result.applied,
             version: result.snapshot.version,

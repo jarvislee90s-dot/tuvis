@@ -252,8 +252,21 @@ fn event_wait_plan(elapsed: Duration, interval: Duration) -> Option<Duration> {
     (elapsed < gap).then(|| gap - elapsed)
 }
 
-/// 事件延后等待（R2，可测）：在最小间隔内用 `recv_timeout` 等**新的唤醒**——
-/// 收到 Event 继续合并等待；收到 Action/ColdStart 等非 Event 原因立即中断并以该
+/// burst 合并后的扫描原因（R9）：通道里积压的唤醒一并吞掉时，若其中含 Action，
+/// 本轮必须记 Action（stats 对账不再误标 Event）；其次取第一个非 Event 原因；
+/// 纯 Event 或空 burst 保持原原因。
+fn burst_scan_reason(primary: ScanReason, burst: &[ScanReason]) -> ScanReason {
+    if burst.iter().any(|r| matches!(r, ScanReason::Action)) {
+        return ScanReason::Action;
+    }
+    burst
+        .iter()
+        .find(|r| !matches!(r, ScanReason::Event))
+        .copied()
+        .unwrap_or(primary)
+}
+
+/// 事件延后等待（R2，可测）：在最小间隔内用 `recv_timeout` 等**新的唤醒**——/// 收到 Event 继续合并等待；收到 Action/ColdStart 等非 Event 原因立即中断并以该
 /// 原因扫描；超时以原 Event 原因照常扫描；通道断开同样按当前原因继续（外层下一圈退出）。
 ///
 /// 不得改回裸 `sleep`：睡在扫描线程里会让 Action 排队，而动作路径等待上限 3s
@@ -471,6 +484,9 @@ fn publish(data: SessionsResponse) -> Arc<Snapshot> {
     });
     *guard = Some(snap.clone());
     VERSION.store(version, Ordering::SeqCst);
+    // R9：成功发布即复位补扫超时窗口——degraded 30s 从「最后一次超时」起算，
+    // 后续成功扫描说明扫描链已恢复，不应继续报 degraded。
+    LAST_TIMEOUT_MS.store(0, Ordering::SeqCst);
     drop(guard);
     snap
 }
@@ -506,26 +522,26 @@ pub fn start(app: tauri::AppHandle) {
             };
             // 突发合并：一次 recv 之后把通道里积压的原因全部吞掉（移动端详情页并发
             // 挂载多端点会连发多条 Action）——一批突发只换一次扫描。纯 Event 突发仍
-            // 走既有合并节流（窗口内一次扫描，不会被放大）；积压里含非 Event 原因时
-            // 必须扫：否则与被节流的 Event 同批的 Action 会被一起丢掉。
-            let mut burst_has_job = false;
+            // 走既有合并节流（窗口内一次扫描，不会被放大）；积压里含 Action 时本轮
+            // **原因记 Action**（R9：stats 不再误标 Event）。
+            let mut burst = Vec::new();
             while let Ok(r) = rx.try_recv() {
-                if !matches!(r, ScanReason::Event) {
-                    burst_has_job = true;
-                }
+                burst.push(r);
             }
+            reason = burst_scan_reason(reason, &burst);
             // F1 自愈：每轮工作（扫描 / 托盘 / 信号 / 档位 / emit）整体 catch_unwind。
             // 命令层已改为只读快照，唯一的扫描线程一旦被 panic 展开掉，看板与托盘就会
             // 冻结到重启——此处捕获后继续循环，最坏一个档位间隔（≤30s）内必有下一扫。
             // scan_once 内的 Drop 守卫会在展开时清 IN_FLIGHT，下一圈不会自锁。
             let round = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 // 事件合并节流：仅压**孤立** Event；Action 补扫与冷启动不得被丢弃，
-                // 与 Event 同批的积压原因（burst_has_job）也不得被这条节流吞掉。
+                // 与 Event 同批的积压 Action/ColdStart 已并入 reason（burst_scan_reason），
+                // 不会被这条节流吞掉。
                 // 节流动作是「延后」而非「丢弃」：Away 档下一次周期扫描要等 30s，
                 // hook 事件文件 30s TTL 会先过期——孤立事件必须在最小间隔处补扫。
                 // R2：等待期间用 recv_timeout 监听新唤醒——Event 合并继续等，
                 // Action/ColdStart 立即中断（不得裸睡阻塞动作路径）
-                if matches!(reason, ScanReason::Event) && !burst_has_job {
+                if matches!(reason, ScanReason::Event) {
                     reason = wait_event_defer(
                         &rx,
                         reason,
@@ -1106,6 +1122,35 @@ mod tests {
             snap.version
         );
         set_test_tx_for_test(None);
+    }
+
+    /// R9：burst 中混有 Action 时，本轮扫描原因必须记 Action（而不是 Event），
+    /// 保证 stats 可对账；纯 Event burst 仍记 Event。
+    #[test]
+    fn burst_with_action_reports_action_not_event() {
+        use ScanReason::{Action, ColdStart, Event, Periodic};
+        assert!(matches!(burst_scan_reason(Event, &[Event]), Event));
+        assert!(matches!(
+            burst_scan_reason(Event, &[Event, Action, Event]),
+            Action
+        ));
+        assert!(matches!(
+            burst_scan_reason(Event, &[Event, ColdStart]),
+            ColdStart
+        ));
+        assert!(matches!(burst_scan_reason(Periodic, &[Event]), Periodic));
+        assert!(matches!(burst_scan_reason(Action, &[]), Action));
+    }
+
+    /// R9：成功发布新快照必须复位补扫超时窗口（degraded 30s 从最后一次超时起算）。
+    #[test]
+    fn publish_resets_degraded_timeout_window() {
+        let _guard = test_guard();
+        reset_for_test();
+        note_timeout();
+        assert!(is_degraded(), "刚超时后应处于 degraded 窗口");
+        let _ = publish_for_test(|| resp(SessionStatus::Idle));
+        assert!(!is_degraded(), "成功发布后 degraded 窗口必须复位");
     }
 
     #[test]

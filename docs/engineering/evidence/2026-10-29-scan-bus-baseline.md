@@ -120,8 +120,9 @@ powershell -NoProfile -File scripts/measure-scan-bus.ps1 -ProcessId 1234 -Second
 
 ## 7. 扫描计数口径与已知限制
 
-- **现行计数源（Fix 轮起）**：日志行 **`scan_bus: scan reason=`**（INFO，每轮扫描一行，含 reason/version/duration_ms/sessions）。Fix 1 起常驻，`RUST_LOG=info`（默认）即可见，脚本已改用此行；`-Seconds ≥ 60` 时若计数为 0 会**直接抛错**，不允许静默假通过。
-- **已退役计数源**：`adapter] OpenCode:`。Task 12 已把它由 INFO 降为 DEBUG（F9），默认 info 下不再输出，故脚本不再使用；保留此条仅说明历史数据的口径。
+- **现行计数源（R4 起）**：`~/.tuvis/logs/scan_bus_stats.json` 单行覆盖写（`total` + 最近一轮元数据）。脚本取前后 `total` 差值计扫描次数；`-Seconds ≥ 60` 且 `total` 未增长会**直接抛错**，计数回退（应用重启）同样抛错。
+- **已退役计数源**：Fix 1–R3 的每轮 INFO `scan_bus: scan reason=…`（R4 为满足 F9 日志体积已删除，档位切换 INFO 保留）；§10.9 的历史原始输出仍按当时口径记录。最老的 `adapter] OpenCode:` 计数早已废弃。
+- 历史口径说明：Task 12 曾把 `adapter] OpenCode:` 降为 DEBUG；更早的基线计数用它，仅用于理解旧数据。
 - 只回看日志尾部 20,000 行（显式按 **UTF-8** 解码读取）。PS 5.1 默认按 ANSI（GB2312）读会把多字节中文行合并：整文件计数仅 **23,534** 条 vs 物理 **26,152** 行；尾读窗口也会位移——同样 20,000 条在 ANSI 下覆盖 **2,229** 条 OpenCode 行，UTF-8 下为 **2,006** 条。当前日志量级下 20,000 行窗口覆盖约 **30+ 分钟**，5 分钟复测不会截断。
 - 时间过滤按日志 UTC 前缀 `[yyyy-MM-ddTHH:mm:ss` 做字符串比较，要求日志时间戳为 UTC 且以 `[` 开头（当前格式满足）。
 - 脚本统计的是「全量扫描轮数」，不区分发起方；改造后由扫描总线单一来源产出（含 Event/Action 补扫）。
@@ -224,7 +225,7 @@ two-stage: 481 processes, 18 candidates, full refresh 64.1178ms vs two-stage 35.
 
 ### 10.6 门禁表（改造后；2026-10-30 Fix 轮口径修订）
 
-> 口径修订（2026-10-30 评审 Fix 轮）：① 用量不可见滞后按 F7 裁决改为「≤ 设置间隔 + 2 分钟（默认 12 分钟）」；② F3 的验收口径是**诊断字段**（`scan_bus_status.degraded` / `snapshotAgeMs`，Fix 2 已提供），不扩展动作回执；③ 扫描计数改用 `scan_bus: scan reason=` INFO 行（§7），复测原始输出见 §10.9；④ F8 的 ≤25ms 目标按 debug 实测标注，release 未测。
+> 口径修订（2026-10-30 评审 Fix 轮）：① 用量不可见滞后按 F7 裁决改为「≤ 设置间隔 + 2 分钟（默认 12 分钟）」；② F3 的验收口径是**诊断字段**（`scan_bus_status.degraded` / `snapshotAgeMs`，Fix 2 已提供），不扩展动作回执；③ 扫描计数改用 stats 文件 `total` 差值（R4，§7），复测原始输出见 §10.9/§10.10；④ F8 的 ≤25ms 目标按 debug 实测标注，release 未测。
 
 | 门禁项 | 目标 | 结果 | 依据 / 备注 |
 | --- | --- | --- | --- |
@@ -236,7 +237,7 @@ two-stage: 481 processes, 18 candidates, full refresh 64.1178ms vs two-stage 35.
 | 活动档会话发现 | ≤2s | **未测**；代码路径 = Active 2s 档 + 1s 事件唤醒 | `scan_bus.rs` / `wakeup.rs` |
 | 用量可见 | ≤1s 看到最新数据 | **未测**；代码路径 = 激活边沿 `force` 采集 + 成功后失效整个用量域 | `src/lib/query/queries/usage.ts` |
 | 用量不可见 | 滞后 ≤ 设置间隔 + 2 分钟（默认 12 分钟） | **设计达标（未活体测）**：`step_ms = 间隔 × 60s + 120s`，默认 12 分钟 | F7 2026-10-30 裁决；debug 默认关 ticker，活体验收须 release 或 `TUVIS_USAGE_TICKER=1` |
-| 日志体积 | ≤1MB/天 | **未测**（每轮 adapter 日志已降为 DEBUG；`scan_bus: scan reason=` 每轮一行 INFO） | §10.8 第 7 条 |
+| 日志体积 | 扫描总线新增日志 ≤1MB/天（dsh 告警归 F9） | **未测（R4 已删除逐轮 INFO）** | §10.8 第 7 条 / §10.11 |
 | 兼容性 | IPC 契约不变，旧前端可继续工作 | **达标**（静态核对：新增命令为增量；`scan_bus_status` 仅追加字段；`scan_bus_watch` 仅新增可选 `source`） | `commands/session.rs` / `lib.rs` |
 | 单轮进程刷新 | ≤25ms（5 次取中位） | **未达标（debug）**；release 未测 | §10.3；Fix 轮 Active 窗口单轮扫描 35–44ms（含解析，非纯进程刷新） |
 | 动作回执 p95 | 不劣于基线 | **未测** | 无活体压测 |
@@ -278,7 +279,7 @@ two-stage: 481 processes, 18 candidates, full refresh 64.1178ms vs two-stage 35.
 4. **F5 残余窗口（Fix 4 已收口）**：`dismiss_session_card` / `mark_session_read` 改为**同步补扫后再返回**（`scan_bus::scan_now_blocking`），前端关闭成功后 `invalidateQueries(["sessions"])`；即发即忘的一帧残留窗口已消除。活体 UI 点击未测（本机无 UI 自动化），由后端源码锁与前端用例覆盖。
 5. **看门狗退避 500ms**：panic 后 `sleep(500ms)` 再按当前档位 `recv_timeout`，最坏恢复 = 档位间隔 + 0.5s；Away 档即 **30.5s，略超 F1 的「≤30s 自动恢复」**（超 0.5s，可接受但需记账）。
 6. **`POLL_INTERVAL` 已删除（Fix 7）**：`src/config/constants.ts` 的孤儿常量已移除，前端热路径源码锁改为只按 `refetchInterval` 内容发现（`commands/usage.rs`）。
-7. **日志降噪的副作用（口径变更）**：旧计数源 `adapter] OpenCode:` 是 DEBUG 级；**Fix 1 起改用每轮 INFO `scan_bus: scan reason=`**（脚本 §7 已切换，且 `-Seconds ≥60` 零计数会抛错）。`RUST_LOG=info`（默认）即可计数。
+7. **日志降噪与计数口径（R4 已收口）**：每轮 INFO 已删除，计数改读 `scan_bus_stats.json`（§7）；`RUST_LOG` 不再影响扫描计数。R4 前的 §10.9 历史输出仍按当时的 INFO 行口径记录。
 8. **热路径耗时（已观测，未达标）**：`scan: process refresh（两段式）耗时` DEBUG 行在 §10.2 的 300s 运行中共 215 拍；Active 窗口中位 29.6ms（p95 65.9ms），末 100 拍中位 42.9ms。debug 构建下 F8 的 ≤25ms **未达标**；release 未测（release 无法用影子目录，跑真实账本不在授权内）。Fix 轮 Active（WorkBuddy 单会话）整轮扫描 `duration_ms` 35–44ms（含解析，非纯进程刷新），量级一致。
 9. **启动采集的影响（Fix 轮新增）**：debug 构建即使 ticker 默认关闭，启动时仍会跑一次 `spawn_initial_collection`（本次 7 源 / 966 条 / 47.5s）。复测时若采样窗口与它重叠，CPU 会明显偏高（本轮两次首轮离群即此因）；正式验收应在启动采集完成后再开始计时。
 10. **dsh 解析成本（F9 延后项）**：本机 DeepSeek Harness 桌面宿主在场时，dsh 适配器每轮解析 2 个会话（「未知代际 v4」降级卡），单轮扫描中位 220ms、max 916ms，Active CPU 被推到 ~19%。该项属 F9 第二刀（dsh 代际路径缓存，计划明确延后），本轮以影子库禁用 dsh 隔离；不代表扫描总线退化。
@@ -289,7 +290,7 @@ two-stage: 481 processes, 18 candidates, full refresh 64.1178ms vs two-stage 35.
 
 #### 10.9.1 目的与口径
 
-- **计数源已更换**：Fix 1 起每轮扫描打一行 INFO `scan_bus: scan reason=…`；脚本 §7 已改用该行，`-Seconds ≥ 60` 且 scans=0 时直接抛错（本次 60s 零计数守卫生效：`THREW: 窗口内未计到任何扫描…`）。
+> 历史口径说明（R4 后已退役）：本节记录 Fix 轮当时用每轮 INFO `scan_bus: scan reason=…` 计数；R4 起改为 stats 文件 `total` 差值（见 §10.10 / §10.11），INFO 行已删除。
 - **构建**：debug（`CARGO_PROFILE_DEV_DEBUG=0 cargo build --bin tuvis -j 1`，49.3s），源码快照 = Fix 5 提交 `3a8d9de7`（Fix 6 只改脚本与本文档）。
 - **UI 条件（与 §10.2 不同）**：§10.2 的 debug 二进制指向 `http://localhost:1420` 但当时没有 Vite 服务，前端实际未加载（后端-only）。本轮先启动 `pnpm dev`（仅 Vite，非 `pnpm tauri:dev`）再启动应用，主窗与桌宠均真实加载；测量仍只计 `tuvis.exe` 主进程（WebView2 子进程不在内）。
 - **影子账本**：`TUVIS_HOME=C:\Users\bunny\AppData\Local\Temp\tuvis-measure-20261030`；真实 `~/.tuvis/tuvis.db` 由安装版维护（复测前后 mtime 17:46 → 18:29 均来自安装版，debug 实例未写）。

@@ -195,7 +195,7 @@ pub async fn events(
     // R6：订阅之后、快照 await **之前**注册——注册守卫 Drop 即反注册：
     // ① 握手期断开（handler future 被 drop）不泄漏计数；② 快照等待期间
     // disconnect_all/吊销能关断本连接（旧实现在快照后才注册，有吊销窗口）
-    let (conn_guard, close_rx) = SseConnGuard::register(&st.sse_registry, &device);
+    let (conn_guard, mut close_rx) = SseConnGuard::register(&st.sse_registry, &device);
     // 快照走 spawn_blocking：ensure_fresh 内部可能等待补扫（上限 3s）并轮询，是同步
     // 阻塞调用；直接 await 会堵死 tokio worker——与 sessions handler 同一先例
     // （实机教训见 commands/session.rs 的 get_all_sessions 注释）。
@@ -205,33 +205,57 @@ pub async fn events(
     // 长事务 DB 写者阻塞（2026-10-29 线程卫生回归点）。同过 apply_board_hidden
     // （与 GET /sessions 同函数）：软归档隐藏卡片不得经 SSE snapshot 通道诈尸
     let st_snap = st.clone();
-    let snapshot_json = tokio::task::spawn_blocking(move || {
-        let snap = crate::adapter::scan_bus::ensure_fresh(
-            std::time::Duration::from_secs(2),
-            std::time::Duration::from_secs(3),
-        );
-        let value = apply_board_hidden(&st_snap, snap.data.clone());
-        let frame = snapshot_frame_for_test(value, snap.version);
-        serde_json::to_string(&frame).unwrap_or_else(|e| {
-            log::warn!("SSE 快照序列化失败，降级为空快照: {e}");
-            EMPTY_SESSIONS_JSON.to_string()
-        })
-    })
-    .await
-    .unwrap_or_else(|e| {
-        // JoinError（任务 panic/取消）降级为空快照：移动端拿到 0 会话而非断流
-        log::error!("SSE 快照等待异常: {e}");
-        // 降级帧同样带 version(=0)，客户端对账口径一致
-        snapshot_frame_for_test(
-            crate::session::SessionsResponse {
-                sessions: Vec::new(),
-                total_count: 0,
-                waiting_count: 0,
-            },
-            0,
-        )
-        .to_string()
-    });
+    // R9：等待快照期间同时监听吊销/停服信号——收到即以空快照帧收尾并立即结束握手，
+    // 不再有「吊销要等补扫上限（≤3s）结束才生效」的窗口
+    type SseStream =
+        std::pin::Pin<Box<dyn futures::Stream<Item = Result<sse::Event, Infallible>> + Send>>;
+    let (snapshot_json, handshake_closed) = tokio::select! {
+        res = tokio::task::spawn_blocking(move || {
+            let snap = crate::adapter::scan_bus::ensure_fresh(
+                std::time::Duration::from_secs(2),
+                std::time::Duration::from_secs(3),
+            );
+            let value = apply_board_hidden(&st_snap, snap.data.clone());
+            let frame = snapshot_frame_for_test(value, snap.version);
+            serde_json::to_string(&frame).unwrap_or_else(|e| {
+                log::warn!("SSE 快照序列化失败，降级为空快照: {e}");
+                EMPTY_SESSIONS_JSON.to_string()
+            })
+        }) => (
+            res.unwrap_or_else(|e| {
+                // JoinError（任务 panic/取消）降级为空快照：移动端拿到 0 会话而非断流
+                log::error!("SSE 快照等待异常: {e}");
+                // 降级帧同样带 version(=0)，客户端对账口径一致
+                snapshot_frame_for_test(
+                    crate::session::SessionsResponse {
+                        sessions: Vec::new(),
+                        total_count: 0,
+                        waiting_count: 0,
+                    },
+                    0,
+                )
+                .to_string()
+            }),
+            false,
+        ),
+        _ = &mut close_rx => {
+            // R9：吊销/停服在快照等待中被中断——close_rx 已完成，**不得**再交给
+            // take_until 轮询（oneshot poll-after-complete 会 panic）；直接返回空流
+            log::info!("SSE 快照等待期间收到吊销/停服，立即结束握手");
+            (
+                snapshot_frame_for_test(
+                    crate::session::SessionsResponse {
+                        sessions: Vec::new(),
+                        total_count: 0,
+                        waiting_count: 0,
+                    },
+                    0,
+                )
+                .to_string(),
+                true,
+            )
+        }
+    };
     let initial = futures::stream::once(async move {
         Ok(sse::Event::default().event("snapshot").data(snapshot_json))
     });
@@ -248,11 +272,15 @@ pub async fn events(
             }
         }
     });
-    let base = initial.chain(transitions);
-    // 吊销/停止信号到达即终止流（take_until：close_rx 被 send 或 Sender drop 均触发）
-    let guarded = base.take_until(close_rx);
+    // 正常握手：take_until 在吊销/停止信号到达或 Sender drop 时终止流；
+    // 握手中途已吊销：返回空流（不轮询已完成的 close_rx）
+    let inner: SseStream = if handshake_closed {
+        Box::pin(futures::stream::empty())
+    } else {
+        Box::pin(initial.chain(transitions).take_until(close_rx))
+    };
     let cleaned = CleanupStream {
-        inner: guarded,
+        inner,
         _conn: conn_guard,
     };
     Sse::new(cleaned).keep_alive(sse::KeepAlive::default())
