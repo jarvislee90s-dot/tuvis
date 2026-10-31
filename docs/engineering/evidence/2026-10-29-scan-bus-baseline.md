@@ -556,29 +556,17 @@ release 运行窗口 03:00:50Z–03:23:02Z（约 22.2 分钟）：
 
 #### 10.12.3 F5-opt 活体验收（release + Active，真实点击）
 
-```json
-{
-  "uiClick": {
-    "gone": true,
-    "elapsedMs": 12,
-    "appliedFalseWarnings": [],
-    "status": { "mode": "away", "version": 83, "degraded": false, "snapshotAgeMs": 2494 }
-  },
-  "commandContract": { "cmd": "dismiss_session_card", "applied": true, "version": 73 },
-  "statusAfterContract": { "mode": "idle", "version": 73, "degraded": false, "snapshotAgeMs": 2 },
-  "note": "__TAURI_INTERNALS__.invoke 是 own-prop 且前端模块缓存了引用，UI 回执无法截获；applied 由点击后同一桥、同一命令调用取得（applied=true）；UI 点击以卡片 DOM 脱离计时（两次 11ms / 12ms），applied=false 警告为空"
-}
-```
+> **本条作废（2026-10-31 第六轮）**：原 JSON 混用了两次运行的数据——点击时 `status.mode=away/version=83`，命令契约却返回 `version=73`，两次观测不属同一 run；`applied` 也在点击后重复调用命令才取得。不得据此引用版本单调性或 mode 一致性。**单 run 重录见 §10.13.3**（同一 run 内 before → 点击 → after → 契约，version 单调、mode 与环境一致）。原 JSON 已从本节移除，避免被再次误引。
 
-- 两次点击 **11ms / 12ms**（≤1s 达标）；卡片在命令返回前即消失（乐观隐藏）；命令结束后 invalidate 回取权威快照。
-- 组件测试：invoke 未 resolve 前卡片已不可见；失败后 invalidate 回滚（`tests/session/optimisticHide.test.tsx` 2 passed）。
+- 旧记录（保留备查）：两次点击 11ms / 12ms；卡片在命令返回前即消失；组件测试 2 条（`tests/session/optimisticHide.test.tsx`）。该节仅说明乐观隐藏方向可行，数值与状态字段不再作为门禁依据。
 
 #### 10.12.4 E6：会话发现重测（t0 = 会话落库，终稿口径）
 
 - 方法：t0 = `session_v2.time_created`（新 rowid 首次出现，50ms 轮询）；t1 = `GET /m/api/v1/sessions`（显示路径读同一快照）返回该 session id；Active 档由 `opencode run -c` 循环维持。
-- 原始样本（ms）：`2019 / 816 / 898 / 1515 / 267` → 排序 `267/816/898/1515/2019`，**中位 898ms ≤2s 达标**。
-- **上一轮 20s 超时归因**：token 5 对应 `session_v2` rowid=5，`time_created=03:03:56.663Z`，会话正常落库；超时是因为 opencode 自动标题未保留 token（实际标题 "Database indexing basics"），探测标记失效，**不是事件漏唤醒**，无需修复扫描链。
-- 偏差：t0 取 DB 行写入时刻；REST 快照轮询 50ms 粒度；样本 0 的 2019ms 为边界样本（中位达标）。
+- 原始样本（ms）：`2019 / 816 / 898 / 1515 / 267` → 排序 `267/816/898/1515/2019`。
+- **统计口径（09b95a3c：中位 + 最大值）**：中位 **898ms ≤2s 达标**；**最大值 2019ms（超线 19ms）**须如实申报——按「中位 ≤2s」门禁达标，按最大值看越线；该样本为边界样本（opencode CLI 启动/落库波动），本批未见扫描链异常证据。
+- **上一轮 20s 超时归因（推断，非已证伪）**：已证部分——token 5 对应 `session_v2` rowid=5，`time_created=03:03:56.663Z`，会话正常落库；当时自动标题为 "Database indexing basics"（未保留 token），探测标记失效。**推断部分**——「探测标记失效导致 20s 超时、而非事件漏唤醒」：`mam.log.old` 同期只有档位切换行（03:01:02Z Away / 03:02:30Z、03:02:46Z Active / 03:22:42Z Away），每轮扫描明细已按降噪纪律移除，stats 仅保留最后一轮——**没有逐轮时间线能证明超时当时卡片已在板上**，无法排除其他链路因素，只能记为推断。
+- 偏差：t0 取 DB 行写入时刻；REST 快照轮询 50ms 粒度；样本 0 的 2019ms 为边界样本（中位达标、最大值越线）。
 
 #### 10.12.5 R11 清理
 
@@ -595,7 +583,7 @@ release 运行窗口 03:00:50Z–03:23:02Z（约 22.2 分钟）：
 - `pnpm check`：**EXIT 0**（3 条既有 mobile warning）。
 - 既有 tps 4 条失败不变（§10.11.5）。
 
-#### 10.12.7 最终门禁表（终稿 e4320c1c）
+#### 10.12.7 最终门禁表（终稿 e4320c1c；2026-10-31 按 09b95a3c 修订 F5 与发现口径）
 
 | 门禁项 | 目标 | 结果 | 依据 |
 | --- | --- | --- | --- |
@@ -604,11 +592,100 @@ release 运行窗口 03:00:50Z–03:23:02Z（约 22.2 分钟）：
 | 远控空闲 CPU（main/tree） | ≤6% / 不劣于基线 | **达标 0.86% / 3.86%**（基线 16.55% / 20.64%） | §10.10 |
 | 扫描频次（Active） | ≤30 次/分 | **达标 29.1**（29.1/29.0/29.2） | §10.11.3 |
 | 扫描频次（Idle / Away） | ≤10 / ≤6 | **达标 6.0 / 2.0** | §10.10 |
-| 活动档会话发现 | ≤2s（t0=会话落库） | **达标 898ms 中位**（5 样本 267–2019ms） | §10.12.4 |
+| 活动档会话发现 | ≤2s（t0=会话落库；统计口径 = 中位，同时报最大值） | **中位 898ms 达标**；最大值 **2019ms（超线 19ms）** | §10.12.4 |
 | F6 事件唤醒 | ≤5s | **达标 1369ms** | §10.11 |
 | F7 用量不可见 / 可见 | ≤12 分钟 / ≤1s | **达标 12m01s / 317ms** | §10.10 |
 | F8 进程刷新 | ≤25ms | **达标 17.5ms**（6 样本中位） | §10.11.4 |
-| F5 卡片消失 | 点击后 ≤1s（乐观隐藏） | **达标 11/12ms** | §10.12.3 |
-| F3 degraded 诊断窗口 | 超时后 30s 可观测 | **达标（单测）**：启动早于超时的发布不再清零 | §10.12.2 |
+| F5 未读态消失（普通未读卡标已读） | 点击后 ≤1s，卡面保留 | **达标（组件测试）**；无 App 形态工具在线，未做活体 | `tests/session/optimisticHide.test.tsx`（G1，5 用例） |
+| F5 整卡消失（数据驱动聚合绿卡标已读 / 隐藏 / 归档） | 点击后 ≤1s | **达标**：组件测试 + 单 run 活体 **11ms**（opencode 隐藏路径） | 组件测试同上；活体 §10.13.3；codex/zcode/dsh App idle/finished 镜像后端 `green_card_is_data_driven` |
+| F3 degraded 诊断窗口 | 超时后 30s 可观测 | **达标（单测）**：启动早于超时的发布不再清零 | §10.12.2 / §10.13.2（CAS 冲突用例） |
 | 日志（扫描总线新增） | ≤1MB/天 | **达标 ≈30KB/天**；dsh 告警归 F9 | §10.11.6 |
-| 工程门禁 | 全绿（既有环境失败除外） | **达标** | §10.12.6 |
+| 工程门禁 | 全绿（既有环境失败除外） | **达标** | §10.12.6 / §10.13.4 |
+
+---
+
+### 10.13 第六轮最终微修（G1 / G2 / G3，2026-10-31 14:00–15:00 +0800）
+
+#### 10.13.1 构建与环境
+
+- 源码：HEAD `ea88833f`（G1 `b0289e0d` + G3 `ea88833f`；代码已在两提交入库，本节仅新增文档）。
+- release：`pnpm build` + `CARGO_BUILD_JOBS=2 pnpm exec tauri build --no-bundle --features marker-helper`；编译 **9m29s**，产物 `src-tauri/target/release/tuvis.exe` 48,315,904 B，sha256 `e7d459a0f3ac98a1d140ea576225e8c90933bc83aeea0f01d22b77e4a29e4fb3`。
+- 运行：真实 HOME；测量期间停掉安装版、以本产物启动（`WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port=9223`），CDP 选主窗 `http://tauri.localhost/`（排除宠物窗 `#/pet`）；测后已重启安装版（pid 30296）。
+- 夹具：opencode CLI 会话 `ses_e6f64023affexAVw5UW7XCTCQV`（项目 `E:/LLMproject/f5-fixture`，`form=cli`，`status=idle`，`unread=false`）；本机无 codex/zcode/dsh/claude 等 App 形态工具进程，无远控客户端在线。
+
+#### 10.13.2 G3：R10 CAS 冲突用例（单测）
+
+- 把条件复位抽成可测的 `clear_timeout_after(started_ms, load, cas)`（publish 传入真实原子操作），新增 3 条用例：
+  - `clear_timeout_keeps_newer_timeout_on_cas_conflict` → **ok**（CAS `Err(150)`：发布期间并发记录更新的超时，按最新值重判并停止写入，新 30s 窗口保留）；
+  - `clear_timeout_stops_when_concurrent_publish_already_cleared` → **ok**（CAS `Err(0)`：并发发布已清零，收敛退出）；
+  - `clear_timeout_clears_once_when_cas_succeeds` → **ok**（`Ok` 只清一次；窗口为 0 时一次 CAS 都不发）。
+- `cargo test --lib scan_bus`：**26 passed / 0 failed**（含既有 R10 `publish_keeps_timeout_window_when_scan_started_before_it` / `publish_resets_degraded_timeout_window`）。
+
+#### 10.13.3 F5 单 run 重录（release，真实点击，无跨 run 混用）
+
+同一进程、同一 run 内依次采集：`scan_bus_status` → 点击 X（DOM 脱离计时）→ `scan_bus_status` → 同 run 直接调用同一命令取契约 → `scan_bus_status`。
+
+```json
+{
+  "statusBefore": { "mode": "away", "version": 8, "degraded": false, "snapshotAgeMs": 17055 },
+  "cardsBefore": [
+    { "projectName": "f5-fixture", "unread": false, "xLabel": "暂不显示（会话状态变化后恢复）" }
+  ],
+  "session": {
+    "id": "ses_e6f64023affexAVw5UW7XCTCQV",
+    "agentType": "opencode",
+    "status": "idle",
+    "unread": false,
+    "form": "cli",
+    "projectName": "f5-fixture"
+  },
+  "action": {
+    "kind": "dismiss",
+    "expect": "gone",
+    "timing": { "elapsedMs": 11 },
+    "cardsAfterClick": [],
+    "statusAfterClick": { "mode": "away", "version": 10, "degraded": false, "snapshotAgeMs": 148 },
+    "contract": {
+      "cmd": "dismiss_session_card",
+      "args": {
+        "agentType": "opencode",
+        "sessionId": "ses_e6f64023affexAVw5UW7XCTCQV",
+        "status": "idle"
+      },
+      "result": { "applied": true, "version": 11 }
+    },
+    "statusAfterContract": { "mode": "away", "version": 11, "degraded": false, "snapshotAgeMs": 2 }
+  },
+  "versionSequence": [8, 10, 11, 11],
+  "versionMonotonic": true,
+  "note": "single run: __TAURI_INTERNALS__.invoke is not interceptable for the UI's own call; applied/version come from a same-run direct call of the same command after the click (contract inference), never from another run."
+}
+```
+
+- **整卡口径**：点击到卡片 DOM 脱离 **11ms**（≤1s 达标）；命令返回前卡片已消失（乐观隐藏），命令结束后 invalidate 回取权威快照。
+- **version 单调**：`8 → 10 → 11 → 11`（点击的补扫把 8 推到 10，契约补扫推到 11；后读状态与契约同版或更新）。
+- **mode 与运行状态一致**：全部样本 `away`——运行中无活跃会话（唯一 opencode 会话 `idle`）、无远控客户端在线，符合 Away 档定义；同一启动内的前置探测中，opencode 回合处理期间 `mode=active`、回合结束后 `mode=away`，档位跟随会话状态。
+- **applied 为同 run 命令契约推断**：`__TAURI_INTERNALS__.invoke` 是 own-prop 且前端模块缓存引用，无法截获 UI 自身调用的回执；`applied=true/version=11` 来自点击后在同一页面、同一 run 直接调用 `dismiss_session_card` 的返回，**未跨 run 拼接**。
+- **未读态口径未做活体**：`sync_unread_sessions` 仅 App 形态参与未读池；本机无 App 形态工具进程，无法产生普通未读卡（数据驱动绿卡同缺）。该口径以 G1 组件测试为准（§10.13.4），如实申报。
+- 原 §10.12.3（11/12ms 混用两次运行）已标记作废。
+
+#### 10.13.4 G1 组件验收与工程门禁
+
+- 组件测试 `tests/session/optimisticHide.test.tsx`（5 passed）；Harness 与 home 同构（`useSyncExternalStore` 订阅 pending → `applyPendingSessions` → 卡片）：
+  - codex App idle 未读卡：invoke 挂起时整卡 **≤1s 消失**（waitFor timeout=1000），无 invalidate；
+  - claude 普通未读卡：invoke 挂起时卡面保留、`Unread` 标记消失；
+  - 轮询回写旧快照（`setQueryData` 旧数据）：整卡不复活 / 普通未读卡未读态不复活；
+  - 命令失败：invalidate 回取权威快照后卡片**回滚可见**。
+- 单元测试 `tests/scanBus/optimisticSessions.test.ts`（7 passed）：数据驱动规则（codex/zcode/dsh + App + idle/finished）、非未读整卡移除、普通未读仅置 `unread=false`、pending hidden/read 防回写、批量移除、缓存缺失空操作。
+- 门禁：
+  - `pnpm test`：**204 文件 / 2527 passed / 5 skipped**；
+  - `pnpm check`：**EXIT 0**（既有 mobile chunk warning 不变）；
+  - `cargo test --lib scan_bus`：**26 passed**；
+  - `cargo clippy --all-targets -j 2 -- -D warnings`：**0 告警**。
+
+#### 10.13.5 偏差与剩余未测
+
+- 普通未读卡（未读态口径）与数据驱动绿卡（codex/zcode/dsh）**未做 release 活体**：本机无 App 形态工具进程，无法构造对应未读卡；以组件测试覆盖（§10.13.4）。
+- F5 活体覆盖的是 **隐藏（dismiss）路径**；`applied` 为同 run 契约推断（理由见 §10.13.3）；一键清除批量路径未做活体（单测覆盖批量乐观移除）。
+- 会话发现最大值 2019ms 超 2s 线 19ms（终稿门禁按中位判定，最大值如实申报，§10.12.4）。
+- 20s 超时归因降级为「推断」（§10.12.4）：已有证据仅证明标题未保留 token 与会话已落库，无逐轮扫描时间线。
