@@ -1,7 +1,11 @@
 //! 扫描总线：进程内唯一的会话扫描者。
 //! 产出 Arc<Snapshot>（版本单调），所有消费方读快照；事件唤醒与动作路径补扫共用同一把单飞。
+//!
+//! 生命周期（6.1）：工作线程单轮 panic 由 `catch_unwind` 隔离（线程不死）；线程**整体退出**
+//! 由 supervisor 发现（心跳过期且无在飞扫描）→ 重建唤醒通道并重启工作线程。扫描 **hang**
+//! （在飞超过 120s）**不重启、不清在飞位**，只记 degraded/日志——否则第二个扫描器进场。
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -74,7 +78,21 @@ struct WatchState {
 /// 不得清掉另一窗的在看状态，也不能用一个布尔/时间戳表示
 static WATCH_STATE: Lazy<Mutex<std::collections::HashMap<String, WatchState>>> =
     Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
-static TX: OnceLock<mpsc::Sender<ScanReason>> = OnceLock::new();
+
+/// 唤醒通道发送端。**不再是 `OnceLock`**（6.1）：工作线程重启必须能换 sender，
+/// 因此用「可替换槽」——取用时短暂加锁后克隆，发送不持锁；重启时旧 sender 取出即丢弃，
+/// 旧 worker（若还活着）的 `recv` 立刻返回 Disconnected 并自行退出。
+static WORKER_TX: Lazy<Mutex<Option<mpsc::Sender<ScanReason>>>> = Lazy::new(|| Mutex::new(None));
+/// 工作线程代次（每次 spawn +1）：心跳只有**当前代次**能续期——僵尸线程不得为接管者续命
+static WORKER_GEN: AtomicU64 = AtomicU64::new(0);
+/// 工作线程心跳（**单调**毫秒）：每圈与每次等待切片刷新；0 = 尚无心跳（视为已过期）
+static WORKER_HEARTBEAT_MS: AtomicU64 = AtomicU64::new(0);
+/// 仍存活的工作线程数（线程体进出记账）：不变式 ≤1（由 supervisor 判定保证）
+static WORKERS_ALIVE: AtomicUsize = AtomicUsize::new(0);
+/// supervisor 累计重启次数（诊断/单测）
+static WORKER_RESTARTS: AtomicU64 = AtomicU64::new(0);
+/// `start()` 幂等闩（原先靠 `TX.set` 判重；通道可替换后改用独立闩）
+static STARTED: AtomicBool = AtomicBool::new(false);
 static IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 /// 在飞扫描的起始时刻（**单调**毫秒）；0 = 无在飞扫描。看门狗据此判定疑似 hang
 static SCAN_STARTED_MS: AtomicU64 = AtomicU64::new(0);
@@ -102,8 +120,14 @@ const HANG_THRESHOLD_MS: u64 = 120_000;
 const HANG_ALERT_INTERVAL_MS: u64 = 120_000;
 /// 补扫超时后的 degraded 诊断窗口（R3：超时后 30s 内 status.degraded 恒真）
 const TIMEOUT_DEGRADED_WINDOW_MS: u64 = 30_000;
-/// 看门狗巡检周期
-const WATCHDOG_PERIOD: Duration = Duration::from_secs(5);
+/// 工作线程心跳过期阈值（6.1）：超过该时长没刷新即视为线程已退出/僵死。
+/// 必须显著大于单圈最长的**正常**阻塞——等待切片（[`HEARTBEAT_SLICE`]）保证按档位
+/// 等待（Away 30s）期间心跳照常刷新，故「睡觉」不会被误判为死亡。
+const WORKER_HEARTBEAT_STALE_MS: u64 = 10_000;
+/// 工作线程等待唤醒的分片长度：每片前刷新心跳（1s 一次的代价只是一次原子写 + 一次 park）
+const HEARTBEAT_SLICE: Duration = Duration::from_secs(1);
+/// supervisor 巡检周期
+const SUPERVISOR_PERIOD: Duration = Duration::from_secs(5);
 /// 「有人在看」心跳的有效期（单调时钟判定）
 const WATCH_TTL: Duration = Duration::from_secs(90);
 /// 扫描轮次 panic 后的固定退避：连续 panic 时每轮至少间隔这么久（防 panic 风暴）
@@ -233,21 +257,30 @@ pub fn scan_after_mutation(wait: Duration, request_epoch: u64) -> MutationScan {
     }
 }
 
-/// 事件唤醒（节流策略在扫描线程内统一处理）
+/// 事件唤醒（节流策略在扫描线程内统一处理）。
+///
+/// 6.1：工作线程重启期间旧通道可能已断开——发送失败**只 warn**（唤醒是可丢的加速信号，
+/// 档位周期兜底），绝不阻塞调用方（事件轮询线程 / 命令线程）。
 pub fn request_scan(reason: ScanReason) {
     if let Some(tx) = scan_tx() {
-        let _ = tx.send(reason);
+        if tx.send(reason).is_err() {
+            log::warn!(
+                "scan_bus: 唤醒通道已断开（工作线程重建中），本次唤醒丢弃: {:?}",
+                reason
+            );
+        }
     }
 }
 
-/// 扫描唤醒发送端：生产 = `TX`；测试可注入 `TEST_TX`（验证 ensure_fresh 等待路径，
-/// 而无需真的启动扫描线程）。`mpsc::Sender` 是 Clone 的。
+/// 扫描唤醒发送端：生产 = 当前工作线程的通道（[`WORKER_TX`] 槽，可被 supervisor 替换）；
+/// 测试可注入 `TEST_TX`（验证 ensure_fresh 等待路径，而无需真的启动扫描线程）。
+/// `mpsc::Sender` 是 Clone 的：克隆后即脱离槽锁，发送不阻塞重启。
 fn scan_tx() -> Option<mpsc::Sender<ScanReason>> {
     #[cfg(test)]
     if let Some(tx) = TEST_TX.lock().unwrap_or_else(|e| e.into_inner()).clone() {
         return Some(tx);
     }
-    TX.get().cloned()
+    WORKER_TX.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
 /// 记录一次补扫超时（R3：30s 内 status.degraded 为真）。
@@ -678,40 +711,95 @@ fn next_scan_wait(panicked: bool, interval: Duration) -> Duration {
     }
 }
 
-/// 生产启动：常驻线程（首个扫描立即执行，之后按档位）
-pub fn start(app: tauri::AppHandle) {
-    let (tx, rx) = mpsc::channel::<ScanReason>();
-    if TX.set(tx).is_err() {
-        return; // 幂等：已启动则直接返回
+// ─────────────────────── 工作线程生命周期（supervisor，6.1） ───────────────────────
+
+/// 工作线程单圈行为（注入点）：生产 = 真实扫描 + 托盘 + 档位观测（[`scan_worker_round`]）；
+/// 单测注入假行为，在不真扫本机的前提下验证心跳 / 断开退出 / 重启接管语义。
+///
+/// 参数：档位状态（由**循环**持有——panic 后仍要沿用同一节奏）、唤醒通道
+/// （事件延后等待需要监听新唤醒）、本轮扫描原因。
+type WorkerRound = Box<dyn FnMut(&mut Cadence, &mpsc::Receiver<ScanReason>, ScanReason) + Send>;
+
+/// 工作线程存活计数守卫：线程体进入 +1、退出（含 panic 展开）-1，
+/// 供 supervisor 判定与单测断言「同一时刻最多一个有效 worker」。
+struct AliveGuard;
+
+impl Drop for AliveGuard {
+    fn drop(&mut self) {
+        WORKERS_ALIVE.fetch_sub(1, Ordering::SeqCst);
     }
+}
+
+/// 工作线程心跳续期：**只有当前代次**能写（`gen` 为 spawn 时分配）。
+/// 僵尸线程（旧代次）不得给接管者续命，否则 supervisor 会误以为新线程活着。
+fn heartbeat(gen: u64) {
+    if WORKER_GEN.load(Ordering::SeqCst) == gen {
+        WORKER_HEARTBEAT_MS.store(mono_now_ms(), Ordering::SeqCst);
+    }
+}
+
+/// 分片等待唤醒：总时长 `wait`，每片不超过 [`HEARTBEAT_SLICE`]，**每片前刷新心跳**。
+/// 直接 `recv_timeout(30s)`（Away 档）会让心跳停更 30s，被 supervisor 误判成线程已死。
+fn recv_reason(
+    rx: &mpsc::Receiver<ScanReason>,
+    wait: Duration,
+    gen: u64,
+) -> Result<ScanReason, mpsc::RecvTimeoutError> {
+    let deadline = Instant::now() + wait;
+    loop {
+        heartbeat(gen);
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(mpsc::RecvTimeoutError::Timeout);
+        }
+        let slice = remaining.min(HEARTBEAT_SLICE);
+        match rx.recv_timeout(slice) {
+            Ok(reason) => return Ok(reason),
+            Err(mpsc::RecvTimeoutError::Timeout) if slice < remaining => continue,
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// 工作线程启动内核：分配代次 → 立即刷新心跳（supervisor 不得把「刚启动」误判为死）
+/// → 起线程。单轮 panic 仍在 `catch_unwind` 内隔离；只有**通道断开**（重启接管）或
+/// 线程体 panic 展开才会退出循环。
+fn spawn_worker(
+    rx: mpsc::Receiver<ScanReason>,
+    first_reason: ScanReason,
+    mut round: WorkerRound,
+) -> u64 {
+    let gen = WORKER_GEN.fetch_add(1, Ordering::SeqCst) + 1;
+    heartbeat(gen);
     std::thread::spawn(move || {
+        WORKERS_ALIVE.fetch_add(1, Ordering::SeqCst);
+        let _alive = AliveGuard;
         let mut cadence = Cadence::new(mono_now());
-        let mut last_scan = Instant::now()
-            .checked_sub(Duration::from_secs(60))
-            .unwrap_or_else(Instant::now);
-        let mut last_tray = last_scan;
-        let mut last_waiting = usize::MAX;
-        let mut last_processing = false;
-        let mut first = true;
+        // 首个扫描原因：冷启动 / supervisor 重启后立即补一次，保证恢复即新鲜
+        let mut first = Some(first_reason);
         // F1：上一轮 panic 后已完成退避，本圈必须**立即**恢复扫描（不等档位间隔）
         let mut recovering = false;
         loop {
+            heartbeat(gen);
             // 取因必须留在 catch_unwind 之外：本轮无论是否 panic，下一圈都要回到
-            // recv_timeout 继续接收唤醒——线程自杀式退出等于看板永久冻结
+            // 等待继续接收唤醒——线程自杀式退出等于看板永久冻结
             // mut：事件延后等待可能被 Action 中断并以新原因扫描（R2）
-            let mut reason = if first {
-                first = false;
-                ScanReason::ColdStart
-            } else if recovering {
-                recovering = false;
-                // 恢复扫描：500ms 退避已在上一圈结束时完成，这里不再等档位间隔；
-                // 期间排队的唤醒由下方 burst 合并（含 Action 时按 Action 记账）
-                ScanReason::Periodic
-            } else {
-                match rx.recv_timeout(next_scan_wait(false, cadence.mode().interval())) {
-                    Ok(reason) => reason,
-                    Err(mpsc::RecvTimeoutError::Timeout) => ScanReason::Periodic,
-                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            let mut reason = match first.take() {
+                Some(reason) => reason,
+                None if recovering => {
+                    recovering = false;
+                    // 恢复扫描：500ms 退避已在上一圈结束时完成，这里不再等档位间隔；
+                    // 期间排队的唤醒由下方 burst 合并（含 Action 时按 Action 记账）
+                    ScanReason::Periodic
+                }
+                None => {
+                    // 分片等待：长档位等待期间心跳照常刷新（见 recv_reason）
+                    match recv_reason(&rx, next_scan_wait(false, cadence.mode().interval()), gen) {
+                        Ok(reason) => reason,
+                        Err(mpsc::RecvTimeoutError::Timeout) => ScanReason::Periodic,
+                        // 通道断开 = supervisor 已重建通道（本线程被接管）：退出
+                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    }
                 }
             };
             // 突发合并：一次 recv 之后把通道里积压的原因全部吞掉（移动端详情页并发
@@ -728,91 +816,238 @@ pub fn start(app: tauri::AppHandle) {
             // 冻结到重启——此处捕获后继续循环，并在退避 500ms 后**立即**恢复扫描
             // （不叠加档位间隔，见 next_scan_wait）。
             // scan_once 内的 Drop 守卫会在展开时清 IN_FLIGHT，下一圈不会自锁。
-            let round = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                // 事件合并节流：仅压**孤立** Event；Action 补扫与冷启动不得被丢弃，
-                // 与 Event 同批的积压 Action/ColdStart 已并入 reason（burst_scan_reason），
-                // 不会被这条节流吞掉。
-                // 节流动作是「延后」而非「丢弃」：Away 档下一次周期扫描要等 30s，
-                // hook 事件文件 30s TTL 会先过期——孤立事件必须在最小间隔处补扫。
-                // R2：等待期间用 recv_timeout 监听新唤醒——Event 合并继续等，
-                // Action/ColdStart 立即中断（不得裸睡阻塞动作路径）
-                if matches!(reason, ScanReason::Event) {
-                    reason = wait_event_defer(
-                        &rx,
-                        reason,
-                        || last_scan.elapsed(),
-                        cadence.mode().interval(),
-                    );
-                }
-                // R4：每轮扫描的 reason/version/耗时写入 scan_bus_stats.json（覆盖写），
-                // 不再逐轮打 INFO（F9 日志体积 ≤1MB/天；档位切换 INFO 保留）
-                let snap = scan_once(reason);
-                last_scan = Instant::now();
-                update_tray(
-                    &app,
-                    &snap,
-                    &mut last_tray,
-                    &mut last_waiting,
-                    &mut last_processing,
-                );
-                let signals = Signals {
-                    active_sessions: has_active_sessions(&snap.data),
-                    remote_online: remote_online(),
-                    user_watching: user_watching(),
-                    // 扫描 Phase 1 刚记录的在跑工具（不另起进程扫描）+ 快照里的
-                    // 活跃会话兜底：dsh/openclaw 无事件覆盖，节奏下限 Idle 10s
-                    uncovered_tool_running: uncovered_tool_active(
-                        &super::running_tool_ids(),
-                        &snap.data,
-                    ),
-                };
-                if let Some(mode) = cadence.observe(signals, mono_now()) {
-                    *MODE.lock().unwrap_or_else(|e| e.into_inner()) = mode;
-                    log::info!("scan_bus: mode → {:?}", mode);
-                    crate::remote::events::emit_ui(
-                        "scan-bus-mode",
-                        serde_json::json!({ "mode": mode }),
-                    );
-                }
+            let round_ref = &mut round;
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                round_ref(&mut cadence, &rx, reason)
             }));
-            let panicked = round.is_err();
-            if let Err(e) = round {
+            let panicked = outcome.is_err();
+            if let Err(e) = outcome {
                 log::error!("scan_bus: 扫描轮次 panic，已捕获并继续（{:?}）", e);
             }
             // 6.2：panic 后只退避 500ms 就立即恢复扫描（不叠加档位间隔）；连续 panic
             // 时每轮仍隔 500ms，保留防风暴能力。恢复路径最坏 ≤30s 的论证见 next_scan_wait。
             if panicked {
+                heartbeat(gen);
                 std::thread::sleep(next_scan_wait(true, cadence.mode().interval()));
                 recovering = true;
             }
         }
+        log::warn!("scan_bus: 工作线程退出（代次 {gen}）");
     });
-    // 看门狗：扫描线程被卡死（非 panic）时 IN_FLIGHT 永真、档位与托盘停摆。
-    // 只告警不干预：清在飞位会让等待方抢到单飞、并发第二份扫描（双份快照/双倍 IO）。
+    gen
+}
+
+/// 生产单圈行为：事件节流 → 扫描 → 托盘 → 档位观测（原连线在此整体收拢）。
+fn scan_worker_round(app: tauri::AppHandle) -> WorkerRound {
+    let mut last_scan = Instant::now()
+        .checked_sub(Duration::from_secs(60))
+        .unwrap_or_else(Instant::now);
+    let mut last_tray = last_scan;
+    let mut last_waiting = usize::MAX;
+    let mut last_processing = false;
+    Box::new(
+        move |cadence: &mut Cadence, rx: &mpsc::Receiver<ScanReason>, mut reason| {
+            // 事件合并节流：仅压**孤立** Event；Action 补扫与冷启动不得被丢弃，
+            // 与 Event 同批的积压 Action/ColdStart 已并入 reason（burst_scan_reason），
+            // 不会被这条节流吞掉。
+            // 节流动作是「延后」而非「丢弃」：Away 档下一次周期扫描要等 30s，
+            // hook 事件文件 30s TTL 会先过期——孤立事件必须在最小间隔处补扫。
+            // R2：等待期间用 recv_timeout 监听新唤醒——Event 合并继续等，
+            // Action/ColdStart 立即中断（不得裸睡阻塞动作路径）
+            if matches!(reason, ScanReason::Event) {
+                reason = wait_event_defer(
+                    rx,
+                    reason,
+                    || last_scan.elapsed(),
+                    cadence.mode().interval(),
+                );
+            }
+            // R4：每轮扫描的 reason/version/耗时写入 scan_bus_stats.json（覆盖写），
+            // 不再逐轮打 INFO（F9 日志体积 ≤1MB/天；档位切换 INFO 保留）
+            let snap = scan_once(reason);
+            last_scan = Instant::now();
+            update_tray(
+                &app,
+                &snap,
+                &mut last_tray,
+                &mut last_waiting,
+                &mut last_processing,
+            );
+            let signals = Signals {
+                active_sessions: has_active_sessions(&snap.data),
+                remote_online: remote_online(),
+                user_watching: user_watching(),
+                // 扫描 Phase 1 刚记录的在跑工具（不另起进程扫描）+ 快照里的
+                // 活跃会话兜底：dsh/openclaw 无事件覆盖，节奏下限 Idle 10s
+                uncovered_tool_running: uncovered_tool_active(
+                    &super::running_tool_ids(),
+                    &snap.data,
+                ),
+            };
+            if let Some(mode) = cadence.observe(signals, mono_now()) {
+                *MODE.lock().unwrap_or_else(|e| e.into_inner()) = mode;
+                log::info!("scan_bus: mode → {:?}", mode);
+                crate::remote::events::emit_ui(
+                    "scan-bus-mode",
+                    serde_json::json!({ "mode": mode }),
+                );
+            }
+        },
+    )
+}
+
+/// supervisor 本拍动作（纯判定）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SupervisorAction {
+    /// 线程存活（或长扫描未到 hang 阈值）：什么都不做
+    Keep,
+    /// 线程已退出/僵死且无在飞扫描：重建通道 + 重启
+    Respawn,
+    /// 在飞扫描超 hang 阈值：只告警，**不重启、不清在飞位**
+    Degraded { scan_age_ms: u64 },
+}
+
+/// supervisor 判定（纯函数，全部入参为**单调**毫秒）：
+///
+/// * 心跳新鲜（< [`WORKER_HEARTBEAT_STALE_MS`]）→ Keep；
+/// * 心跳过期且**无在飞扫描** → Respawn（线程确已不在工作，重建不会与扫描并发）；
+/// * 心跳过期但**有在飞扫描**：扫描龄 > [`HANG_THRESHOLD_MS`] → Degraded；
+///   否则 Keep——长扫描本身就会让心跳停更，不能据此重启，也不能清在飞位
+///   （清位会放进第二份并发扫描，双份快照/双倍 IO）。
+///
+/// `heartbeat_age_ms = u64::MAX` 表示「从未有心跳」（0 哨兵），一律按过期处理。
+fn supervisor_action(heartbeat_age_ms: u64, in_flight: bool, scan_age_ms: u64) -> SupervisorAction {
+    if heartbeat_age_ms < WORKER_HEARTBEAT_STALE_MS {
+        return SupervisorAction::Keep;
+    }
+    if !in_flight {
+        return SupervisorAction::Respawn;
+    }
+    if scan_age_ms > HANG_THRESHOLD_MS {
+        SupervisorAction::Degraded { scan_age_ms }
+    } else {
+        SupervisorAction::Keep
+    }
+}
+
+/// supervisor 单拍内核（判定 + 注入的「重启 / 告警」动作，时钟全由调用方给）：
+/// 便于在虚拟时间轴上验证「hang 只告警一次」「不重启」等语义，无需真等 120s。
+fn supervise_tick(
+    heartbeat_age_ms: u64,
+    in_flight: bool,
+    started_ms: u64,
+    now_ms: u64,
+    last_alert_ms: &mut u64,
+    respawn: impl FnOnce(),
+    mut alert: impl FnMut(u64),
+) -> SupervisorAction {
+    let scan_age_ms = if in_flight && started_ms > 0 {
+        now_ms.saturating_sub(started_ms)
+    } else {
+        0
+    };
+    let action = supervisor_action(heartbeat_age_ms, in_flight, scan_age_ms);
+    match action {
+        SupervisorAction::Respawn => respawn(),
+        SupervisorAction::Degraded { .. } => {
+            // 同一段 hang 每 [`HANG_ALERT_INTERVAL_MS`] 最多告警一次（沿用既有窗口）
+            if let Some(age) = hang_alert_age(in_flight, started_ms, now_ms, *last_alert_ms) {
+                *last_alert_ms = now_ms;
+                alert(age);
+            }
+        }
+        SupervisorAction::Keep => {}
+    }
+    action
+}
+
+/// 重建唤醒通道（可测内核）：新通道 sender 入槽，旧 sender 取出即丢弃——
+/// 旧 worker（若还活着）的 `recv` 立刻返回 Disconnected 并自行退出，
+/// 因此「同一时刻最多一个有效 worker」由通道所有权交接保证。
+/// 返回（新接收端，是否真的丢弃过旧 sender）。
+fn rebuild_channel(
+    slot: &Mutex<Option<mpsc::Sender<ScanReason>>>,
+) -> (mpsc::Receiver<ScanReason>, bool) {
+    let (tx, rx) = mpsc::channel();
+    let had_old = slot
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .replace(tx)
+        .is_some();
+    WORKER_RESTARTS.fetch_add(1, Ordering::SeqCst);
+    (rx, had_old)
+}
+
+/// 重启工作线程：换通道 → 起新 worker（立即 ColdStart 补扫）→ 记账。
+/// 只在 [`supervisor_action`] 判定 Respawn（无在飞扫描）时调用。
+fn respawn_worker(build_round: &mut dyn FnMut() -> WorkerRound) -> u64 {
+    let (rx, had_old) = rebuild_channel(&WORKER_TX);
+    let gen = spawn_worker(rx, ScanReason::ColdStart, build_round());
+    if !had_old {
+        log::warn!("scan_bus: 重启时槽内没有旧唤醒通道（异常装配）");
+    }
+    let restarts = WORKER_RESTARTS.load(Ordering::SeqCst);
+    log::warn!(
+        "scan_bus: 工作线程已重启（代次 {gen}，累计 {restarts} 次），重建期间丢失的唤醒按丢弃处理"
+    );
+    restarts
+}
+
+/// supervisor 常驻循环：每 [`SUPERVISOR_PERIOD`] 巡检一次心跳 / 在飞 / 扫描龄。
+/// 这是 degraded 诊断的**唯一**出口（原 worker 内看门狗已并入此处，避免重复 emit）。
+fn spawn_supervisor(mut build_round: impl FnMut() -> WorkerRound + Send + 'static) {
     std::thread::spawn(move || {
         let mut last_alert_ms = 0u64;
         loop {
-            std::thread::sleep(WATCHDOG_PERIOD);
-            // 看门狗只用单调毫秒：系统时间跳变不得误报/漏报 hang
+            std::thread::sleep(SUPERVISOR_PERIOD);
+            // 只用单调毫秒：系统时间跳变不得误报/漏报
             let now = mono_now_ms();
-            if let Some(age) = hang_alert_age(
-                IN_FLIGHT.load(Ordering::SeqCst),
-                SCAN_STARTED_MS.load(Ordering::SeqCst),
+            let heartbeat_ms = WORKER_HEARTBEAT_MS.load(Ordering::SeqCst);
+            let heartbeat_age_ms = if heartbeat_ms == 0 {
+                u64::MAX // 从未心跳：按过期处理
+            } else {
+                now.saturating_sub(heartbeat_ms)
+            };
+            let in_flight = IN_FLIGHT.load(Ordering::SeqCst);
+            let started_ms = SCAN_STARTED_MS.load(Ordering::SeqCst);
+            supervise_tick(
+                heartbeat_age_ms,
+                in_flight,
+                started_ms,
                 now,
-                last_alert_ms,
-            ) {
-                last_alert_ms = now;
-                log::error!(
-                    "scan_bus: 扫描疑似 hang（已 {}ms 未完成）——不强杀在飞扫描，需重启恢复",
-                    age
-                );
-                crate::remote::events::emit_ui(
-                    "scan-bus-degraded",
-                    serde_json::json!({ "ageMs": age }),
-                );
-            }
+                &mut last_alert_ms,
+                || {
+                    respawn_worker(&mut build_round);
+                },
+                |age| {
+                    log::error!(
+                        "scan_bus: 扫描疑似 hang（已 {age}ms 未完成）——不强杀在飞扫描、不清在飞位，需重启恢复"
+                    );
+                    crate::remote::events::emit_ui(
+                        "scan-bus-degraded",
+                        serde_json::json!({ "ageMs": age }),
+                    );
+                },
+            );
         }
     });
+}
+
+/// 生产启动：工作线程（首个扫描立即执行，之后按档位）+ supervisor 巡检。
+pub fn start(app: tauri::AppHandle) {
+    if STARTED.swap(true, Ordering::SeqCst) {
+        return; // 幂等：已启动则直接返回
+    }
+    let (tx, rx) = mpsc::channel::<ScanReason>();
+    *WORKER_TX.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx);
+    // 每个 worker 需要自己的单圈状态（托盘节流/档位），故用工厂：首次与重启各建一份
+    let build_round = {
+        let app = app.clone();
+        move || scan_worker_round(app.clone())
+    };
+    let first_round = build_round();
+    spawn_worker(rx, ScanReason::ColdStart, first_round);
+    spawn_supervisor(build_round);
 }
 
 /// 托盘状态：状态变化立即刷新，无变化时最多每 30s 刷一次
@@ -907,6 +1142,43 @@ pub fn reset_for_test() {
     *TEST_TX.lock().unwrap_or_else(|e| e.into_inner()) = None;
     // 扫描启动探针同理：用例 panic 时不得残留到下一个用例
     *SCAN_START_PROBE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    // 6.1：清工作线程记账。丢掉槽内 sender ⇒ 用例遗留的 worker 因通道断开而自行退出
+    // （`WORKERS_ALIVE` 是活体计数，不在此清零——由线程体自己减）
+    *WORKER_TX.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    WORKER_GEN.store(0, Ordering::SeqCst);
+    WORKER_HEARTBEAT_MS.store(0, Ordering::SeqCst);
+    WORKER_RESTARTS.store(0, Ordering::SeqCst);
+}
+
+/// 单测用：把工作线程心跳改成指定单调毫秒（0 = 从未心跳 → supervisor 视为过期）
+#[cfg(test)]
+fn set_worker_heartbeat_for_test(ms: u64) {
+    WORKER_HEARTBEAT_MS.store(ms, Ordering::SeqCst);
+}
+
+/// 单测用：往全局唤醒槽装一个 sender（模拟「已有工作线程通道」）
+#[cfg(test)]
+fn set_worker_tx_for_test(tx: Option<mpsc::Sender<ScanReason>>) {
+    *WORKER_TX.lock().unwrap_or_else(|e| e.into_inner()) = tx;
+}
+
+/// 单测用：读 supervisor 累计重启次数
+#[cfg(test)]
+fn worker_restarts_for_test() -> u64 {
+    WORKER_RESTARTS.load(Ordering::SeqCst)
+}
+
+/// 单测用：等待条件成立（有界，避免用例挂死）
+#[cfg(test)]
+fn wait_until_for_test(mut cond: impl FnMut() -> bool, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if cond() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    cond()
 }
 
 /// 单测用：注入扫描唤醒发送端（让 ensure_fresh 走「有扫描线程」的等待路径）
@@ -1893,5 +2165,368 @@ mod tests {
             waiting_count: 0,
         };
         assert!(!uncovered_tool_active(&[], &live_claude));
+    }
+
+    // ─────────────────── 6.1 工作线程生命周期（supervisor） ───────────────────
+
+    /// 假单圈：只计数，不真扫本机（工作线程循环本身是生产代码，跑真循环）
+    fn counting_round(scans: &Arc<AtomicUsize>) -> WorkerRound {
+        let scans = scans.clone();
+        Box::new(
+            move |_cadence: &mut Cadence, _rx: &mpsc::Receiver<ScanReason>, _reason: ScanReason| {
+                scans.fetch_add(1, Ordering::SeqCst);
+            },
+        )
+    }
+
+    /// 6.1 判定三态与阈值边界（纯函数）：
+    /// 心跳 10s 过期、hang 120s、在飞但无起点（scan_age=0）不得误判。
+    #[test]
+    fn supervisor_action_covers_three_states_at_exact_thresholds() {
+        // 心跳新鲜 → Keep（无论是否在飞）
+        assert_eq!(supervisor_action(0, false, 0), SupervisorAction::Keep);
+        assert_eq!(supervisor_action(9_999, false, 0), SupervisorAction::Keep);
+        assert_eq!(
+            supervisor_action(9_999, true, 200_000),
+            SupervisorAction::Keep
+        );
+
+        // 心跳过期（恰满 10s 即过期）+ 无在飞 → Respawn
+        assert_eq!(
+            supervisor_action(WORKER_HEARTBEAT_STALE_MS, false, 0),
+            SupervisorAction::Respawn
+        );
+        assert_eq!(
+            supervisor_action(60_000, false, 0),
+            SupervisorAction::Respawn
+        );
+        assert_eq!(
+            supervisor_action(u64::MAX, false, 0),
+            SupervisorAction::Respawn
+        );
+
+        // 心跳过期但**有在飞**：未到 hang 阈值 → Keep（长扫描不等于线程已死）
+        assert_eq!(
+            supervisor_action(WORKER_HEARTBEAT_STALE_MS, true, 0),
+            SupervisorAction::Keep,
+            "在飞但扫描起点未知（0）不得判 hang"
+        );
+        assert_eq!(
+            supervisor_action(60_000, true, HANG_THRESHOLD_MS),
+            SupervisorAction::Keep,
+            "恰在 120s 阈值上不算超"
+        );
+        // 超过 hang 阈值 → Degraded（不重启）
+        assert_eq!(
+            supervisor_action(60_000, true, HANG_THRESHOLD_MS + 1),
+            SupervisorAction::Degraded {
+                scan_age_ms: HANG_THRESHOLD_MS + 1
+            }
+        );
+        assert_eq!(
+            supervisor_action(u64::MAX, true, 300_000),
+            SupervisorAction::Degraded {
+                scan_age_ms: 300_000
+            }
+        );
+        // 阈值常量本身是契约（心跳 10s / hang 120s）
+        assert_eq!(WORKER_HEARTBEAT_STALE_MS, 10_000);
+        assert_eq!(HANG_THRESHOLD_MS, 120_000);
+    }
+
+    /// 6.1 在飞 hang：虚拟时间轴上跑 150s，一次都不重启，degraded 只发一次。
+    #[test]
+    fn in_flight_hang_degrades_exactly_once_without_respawn() {
+        let started = 1_000_000u64;
+        let mut last_alert = 0u64;
+        let mut respawns = 0u32;
+        let mut alerts: Vec<u64> = Vec::new();
+        let mut degraded_ticks = 0u32;
+        for tick in 1..=30u64 {
+            // 每 5s 一拍；心跳早已停更（模拟工作线程卡死），且有在飞扫描
+            let now = started + tick * 5_000;
+            let action = supervise_tick(
+                u64::MAX,
+                true,
+                started,
+                now,
+                &mut last_alert,
+                || respawns += 1,
+                |age| alerts.push(age),
+            );
+            let scan_age = now - started;
+            if scan_age <= HANG_THRESHOLD_MS {
+                assert_eq!(
+                    action,
+                    SupervisorAction::Keep,
+                    "未到 hang 阈值（{scan_age}ms）不得判降级"
+                );
+            } else {
+                assert!(
+                    matches!(action, SupervisorAction::Degraded { .. }),
+                    "超过 hang 阈值必须降级（{scan_age}ms）"
+                );
+                degraded_ticks += 1;
+            }
+        }
+        assert_eq!(respawns, 0, "在飞 hang 绝不允许重启（第二个扫描器会进场）");
+        assert_eq!(degraded_ticks, 6, "125s..150s 共 6 拍处于降级态");
+        assert_eq!(alerts.len(), 1, "同一段 hang 只告警一次（120s 节流）");
+        assert_eq!(alerts[0], HANG_THRESHOLD_MS + 5_000);
+    }
+
+    /// 6.1 supervisor 只判定不干预：源码级保证它**绝不**改写在飞位 / 扫描起点。
+    /// （清在飞位会放进第二份并发扫描，双份快照/双倍 IO。）
+    #[test]
+    fn supervisor_never_touches_in_flight_state() {
+        let src = include_str!("scan_bus.rs");
+        let at = src
+            .find("fn spawn_supervisor")
+            .expect("缺少 supervisor 循环");
+        // 只看 supervisor 函数体（到 `start` 为止；其后的单测辅助函数会故意改写这些原子量）
+        let end = src[at..]
+            .find("\n/// 生产启动")
+            .map(|i| at + i)
+            .expect("缺少 start 锚点");
+        let supervisor = &src[at..end];
+        assert!(
+            !supervisor.contains("IN_FLIGHT.store"),
+            "supervisor 不得清/置在飞位"
+        );
+        assert!(
+            !supervisor.contains("SCAN_STARTED_MS.store"),
+            "supervisor 不得改写扫描起点"
+        );
+        assert!(
+            supervisor.contains("supervise_tick"),
+            "supervisor 必须走可测判定内核"
+        );
+    }
+
+    /// 6.1 重建通道：旧 sender 取出即丢弃（旧 worker 见 disconnect 自行退出），
+    /// 新通道可用——「同一时刻最多一个有效 worker」由通道所有权交接保证。
+    #[test]
+    fn rebuild_channel_drops_old_sender_and_installs_new_one() {
+        let _guard = test_guard();
+        reset_for_test();
+        let slot: Mutex<Option<mpsc::Sender<ScanReason>>> = Mutex::new(None);
+        let (old_tx, old_rx) = mpsc::channel::<ScanReason>();
+        *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(old_tx.clone());
+        drop(old_tx); // 槽内是旧通道**唯一**的 sender（生产同款：调用方只做瞬时克隆）
+
+        let (new_rx, had_old) = rebuild_channel(&slot);
+        assert!(had_old, "重启必须看到旧 sender 并把它丢弃");
+        assert_eq!(worker_restarts_for_test(), 1);
+
+        assert!(
+            old_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "旧通道必须立即断开（旧 worker 据此退出）"
+        );
+        {
+            let tx = slot
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+                .expect("槽内必须是新 sender");
+            tx.send(ScanReason::Event).expect("新 sender 必须可用");
+        }
+        assert!(matches!(
+            new_rx.recv_timeout(Duration::from_millis(200)),
+            Ok(ScanReason::Event)
+        ));
+    }
+
+    /// 6.1 端到端重启：旧 worker 心跳停更 → supervisor 判定 Respawn → 重建通道并起新
+    /// worker（立即冷启动扫描）→ 旧 worker 因通道断开退出 → 只剩一个 worker →
+    /// 重启后 `request_scan` 仍能把新 worker 唤醒。
+    #[test]
+    fn respawn_rebuilds_channel_and_leaves_exactly_one_live_worker() {
+        let _guard = test_guard();
+        reset_for_test();
+        assert!(
+            wait_until_for_test(
+                || WORKERS_ALIVE.load(Ordering::SeqCst) == 0,
+                Duration::from_secs(3)
+            ),
+            "reset 后不得残留存活 worker"
+        );
+
+        let scans = Arc::new(AtomicUsize::new(0));
+        // 1) 旧 worker：真实工作线程循环 + 假单圈（不真扫本机）
+        let (old_tx, old_rx) = mpsc::channel::<ScanReason>();
+        set_worker_tx_for_test(Some(old_tx));
+        spawn_worker(old_rx, ScanReason::ColdStart, counting_round(&scans));
+        assert!(
+            wait_until_for_test(|| scans.load(Ordering::SeqCst) >= 1, Duration::from_secs(3)),
+            "工作线程启动后必须立即执行一次冷启动扫描"
+        );
+        assert_eq!(WORKERS_ALIVE.load(Ordering::SeqCst), 1);
+
+        // 2) 旧 worker 异常退出：心跳停更（0 = 从未心跳，supervisor 视为过期）
+        set_worker_heartbeat_for_test(0);
+        let mut last_alert = 0u64;
+        let mut respawns = 0u32;
+        let mut alerts = 0u32;
+        let mut build = || counting_round(&scans);
+        let now = mono_now_ms();
+        let action = supervise_tick(
+            u64::MAX,
+            false,
+            0,
+            now,
+            &mut last_alert,
+            || {
+                respawns += 1;
+                respawn_worker(&mut build);
+            },
+            |_| alerts += 1,
+        );
+        assert_eq!(
+            action,
+            SupervisorAction::Respawn,
+            "心跳过期且无在飞扫描必须重启"
+        );
+        assert_eq!(respawns, 1);
+        assert_eq!(alerts, 0, "重启路径不得同时发 degraded");
+        assert_eq!(worker_restarts_for_test(), 1);
+        // 新 worker 立即冷启动扫描一次（保证恢复后状态新鲜）
+        assert!(
+            wait_until_for_test(|| scans.load(Ordering::SeqCst) >= 2, Duration::from_secs(3)),
+            "重启后的 worker 必须立即补一次扫描"
+        );
+
+        // 3) 旧通道被丢弃 → 旧 worker 自行退出：同一时刻最终只剩一个 worker
+        assert!(
+            wait_until_for_test(
+                || WORKERS_ALIVE.load(Ordering::SeqCst) == 1,
+                Duration::from_secs(3)
+            ),
+            "重启后必须只剩一个有效 worker（实际 {}）",
+            WORKERS_ALIVE.load(Ordering::SeqCst)
+        );
+
+        // 4) 重启后 request_scan 走新 sender：新 worker 被唤醒再扫一次
+        let before = scans.load(Ordering::SeqCst);
+        request_scan(ScanReason::Action);
+        assert!(
+            wait_until_for_test(
+                || scans.load(Ordering::SeqCst) > before,
+                Duration::from_secs(3)
+            ),
+            "重启后 request_scan 必须能唤醒新 worker"
+        );
+        assert_eq!(WORKERS_ALIVE.load(Ordering::SeqCst), 1, "始终单 worker");
+
+        // 收尾：断开通道让 worker 退出，不污染后续用例
+        set_worker_tx_for_test(None);
+        assert!(wait_until_for_test(
+            || WORKERS_ALIVE.load(Ordering::SeqCst) == 0,
+            Duration::from_secs(3)
+        ));
+    }
+
+    /// 6.1 等待期间的唤醒丢失只 warn、不阻塞：通道已断开时 `request_scan` 必须立即返回。
+    #[test]
+    fn request_scan_on_dead_channel_warns_without_blocking() {
+        let _guard = test_guard();
+        reset_for_test();
+        let (tx, rx) = mpsc::channel::<ScanReason>();
+        drop(rx); // 工作线程已退出：通道断开
+        set_worker_tx_for_test(Some(tx));
+        let started = Instant::now();
+        request_scan(ScanReason::Action);
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "唤醒丢弃不得阻塞调用方（实际 {:?}）",
+            started.elapsed()
+        );
+        // 槽内 sender 仍是活的（可重连），只是本次发送失败——不得 panic/自旋
+        set_worker_tx_for_test(None);
+    }
+
+    /// 6.1 心跳契约：按档位等待（最长 Away 30s）期间心跳必须持续刷新——
+    /// 否则 supervisor 会把「正常睡觉」误判成线程已死并重启（双 worker 风险）。
+    #[test]
+    fn waiting_worker_keeps_heartbeat_fresh_and_exits_on_disconnect() {
+        let _guard = test_guard();
+        reset_for_test();
+        assert!(wait_until_for_test(
+            || WORKERS_ALIVE.load(Ordering::SeqCst) == 0,
+            Duration::from_secs(3)
+        ));
+        let scans = Arc::new(AtomicUsize::new(0));
+        let (tx, rx) = mpsc::channel::<ScanReason>();
+        spawn_worker(rx, ScanReason::ColdStart, counting_round(&scans));
+        assert!(wait_until_for_test(
+            || WORKERS_ALIVE.load(Ordering::SeqCst) == 1,
+            Duration::from_secs(3)
+        ));
+
+        // 工人此刻应处于「档位等待」（Idle 10s）：跨过 2.5s 后心跳必须仍在一个切片
+        // 附近——裸 `recv_timeout(档位间隔)` 会让心跳停更到档位末尾（age≈2500ms），
+        // 判据收到 1.4s 才能把「整段等待」与「分片刷新（≤1s）」区分开。
+        std::thread::sleep(Duration::from_millis(2_500));
+        let hb = WORKER_HEARTBEAT_MS.load(Ordering::SeqCst);
+        assert!(hb > 0, "工作线程必须写出心跳");
+        let age = mono_now_ms().saturating_sub(hb);
+        assert!(
+            age < 1_400,
+            "等待唤醒期间心跳停更（age={age}ms）——会把正常睡觉误判为线程已死"
+        );
+        assert_eq!(WORKERS_ALIVE.load(Ordering::SeqCst), 1);
+
+        // 通道断开（= supervisor 重建通道接管）→ 旧 worker 自行退出
+        drop(tx);
+        assert!(
+            wait_until_for_test(
+                || WORKERS_ALIVE.load(Ordering::SeqCst) == 0,
+                Duration::from_secs(3)
+            ),
+            "通道断开后工作线程必须退出（否则重启会出现两个 worker）"
+        );
+    }
+
+    /// 6.1 分片等待语义：长等待被切成 ≤1s 的片（每片刷新心跳），
+    /// 收到唤醒立即返回、无唤醒则整段超时。
+    #[test]
+    fn recv_reason_slices_long_wait_and_returns_promptly_on_wakeup() {
+        let _guard = test_guard();
+        reset_for_test();
+        let gen = WORKER_GEN.load(Ordering::SeqCst);
+        let (tx, rx) = mpsc::channel::<ScanReason>();
+
+        // 等待进行中探查心跳：2.5s 的等待在 1.5s 处必须已有新心跳
+        // （裸 `recv_timeout(整段)` 会让心跳停在起点，age≈1.5s）
+        let waiter =
+            std::thread::spawn(move || recv_reason(&rx, Duration::from_millis(2_500), gen));
+        std::thread::sleep(Duration::from_millis(1_500));
+        let hb = WORKER_HEARTBEAT_MS.load(Ordering::SeqCst);
+        assert!(hb > 0, "等待中必须写出心跳");
+        let age = mono_now_ms().saturating_sub(hb);
+        assert!(
+            age < 1_200,
+            "长等待必须按片刷新心跳（age={age}ms，整段等待则为 ~1500ms）"
+        );
+
+        // 无唤醒：整段等待后超时
+        assert!(matches!(
+            waiter.join().expect("等待线程不得 panic"),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+
+        // 有唤醒：立即返回原因（不继续等剩余时长）
+        drop(tx);
+        let (tx2, rx2) = mpsc::channel::<ScanReason>();
+        tx2.send(ScanReason::Action).expect("通道应可发送");
+        let began = Instant::now();
+        assert!(matches!(
+            recv_reason(&rx2, Duration::from_secs(5), gen),
+            Ok(ScanReason::Action)
+        ));
+        assert!(
+            began.elapsed() < Duration::from_secs(1),
+            "收到唤醒不得继续等"
+        );
+        assert_eq!(HEARTBEAT_SLICE, Duration::from_secs(1));
     }
 }
