@@ -45,37 +45,64 @@ pub fn is_host_process(exe_lower: &str, tool_id: &str) -> bool {
 /// adapter 的 SHARED_SYSTEM 每轮已带 exe/cmd 全量刷新，活跃卡过滤与未读池检查
 /// 都复用该快照，不另起扫描——issue #35-4）
 pub fn tool_host_alive_in(system: &sysinfo::System, tool_id: &str) -> bool {
-    system.processes().iter().any(|(_, p)| {
-        // 会话 sidecar 不判宿主（issue #35-5，spec §5 孤儿防线）：Windows 上 sidecar
-        // 与主进程 exe 同名（均为 WorkBuddy.exe），exe 路径判据区分不了，只能按
-        // cmdline 里的 cli/bin/codebuddy 脚本路径排除；macOS 该路径在 exe 内，
-        // is_host_process 已排除，此判据对结果无影响
-        if tool_id == "workbuddy" && is_session_runtime_cmdline(p.cmd()) {
-            return false;
-        }
-        // ZCode 同款孤儿防线（Windows 全部可执行体都是 ZCode.exe，exe 判据区分不了
-        // 主进程/Electron 辅助进程/会话运行时）：命令行带 --type= 或含 zcode.cjs
-        // 的进程不判宿主，仅裸命令行的主进程算「应用开着」。macOS 非宿主进程
-        // basename 不同名，is_host_process 已排除，此判据对结果无影响。
-        // cmd 读不到（提权进程）时按 exe 判定放行——漏判宿主会清空全部卡片，
-        // 代价高于误判（与 zcode_parser::process_is_host 同向）
-        if tool_id == "zcode"
-            && !p.cmd().is_empty()
-            && crate::monitor::zcode_parser::cmdline_is_non_host(p.cmd())
-        {
-            return false;
-        }
-        // dsh（M1 终审 C1）：宿主是前台终端启动的 node 进程，exe 判据不可用（exe=node），
-        // 照 zcode 先例走 cmdline 门——口径单源委托 dsh::cmdline_is_dsh_host（与
-        // find_dsh_processes 完全一致）。dsh 无「孤儿防线」需求：esbuild 等子进程
-        // cmdline 无 dsh+web 双令牌、天然排除，故任何含双令牌的 node 即视为宿主
-        if tool_id == "dsh" {
-            return crate::monitor::dsh::cmdline_is_dsh_host(p.cmd());
-        }
-        p.exe()
-            .map(|e| is_host_process(&e.to_string_lossy().to_lowercase(), tool_id))
-            .unwrap_or(false)
-    })
+    tool_host_pid(system, tool_id).is_some()
+}
+
+/// **宿主 pid**（R2 看板兜底用）：与 [`tool_host_alive_in`] **同一判据**，只是把
+/// 「活着吗」变成「哪一个」——WorkBuddy 5.9.3 心跳失效时，`find_processes` 需要一条
+/// 宿主哨兵进程来通过 L1 零进程门禁（`adapter/mod.rs` 对空进程列表不调 `find_sessions`）。
+///
+/// 判据逐条与 `tool_host_alive_in` 原先的内联实现**逐字同源**：
+/// 1. WorkBuddy：命令行含 `cli/bin/codebuddy` 的会话运行时**不是**宿主（孤儿防线，
+///    Windows 上 sidecar 与主进程 exe 同名，只能靠 cmdline 区分）；
+/// 2. ZCode：命令行带 `--type=` 或含 `zcode.cjs` 的进程不判宿主，仅裸命令行主进程算；
+/// 3. dsh：口径单源委托 `dsh::cmdline_is_dsh_host`；
+/// 4. 其余按 exe 路径（`is_host_process`）。
+///
+/// 多个宿主进程时取**进程表首个命中**（语义足够：只用于「宿主在不在 + 拿一个 pid」）。
+pub fn tool_host_pid(system: &sysinfo::System, tool_id: &str) -> Option<u32> {
+    system
+        .processes()
+        .iter()
+        .find(|(_, p)| process_is_tool_host(p.exe(), p.cmd(), tool_id))
+        .map(|(pid, _)| pid.as_u32())
+}
+
+/// 宿主判据的**纯核**（exe + cmdline 两路输入，可脱离 sysinfo 构造测试）：
+/// `tool_host_pid` 逐进程调它；单测直接喂伪造的 exe/cmdline（sysinfo 无法伪造进程）。
+pub(crate) fn process_is_tool_host(
+    exe: Option<&std::path::Path>,
+    cmd: &[std::ffi::OsString],
+    tool_id: &str,
+) -> bool {
+    // 会话 sidecar 不判宿主（issue #35-5，spec §5 孤儿防线）：Windows 上 sidecar
+    // 与主进程 exe 同名（均为 WorkBuddy.exe），exe 路径判据区分不了，只能按
+    // cmdline 里的 cli/bin/codebuddy 脚本路径排除；macOS 该路径在 exe 内，
+    // is_host_process 已排除，此判据对结果无影响
+    if tool_id == "workbuddy" && is_session_runtime_cmdline(cmd) {
+        return false;
+    }
+    // ZCode 同款孤儿防线（Windows 全部可执行体都是 ZCode.exe，exe 判据区分不了
+    // 主进程/Electron 辅助进程/会话运行时）：命令行带 --type= 或含 zcode.cjs
+    // 的进程不判宿主，仅裸命令行的主进程算「应用开着」。macOS 非宿主进程
+    // basename 不同名，is_host_process 已排除，此判据对结果无影响。
+    // cmd 读不到（提权进程）时按 exe 判定放行——漏判宿主会清空全部卡片，
+    // 代价高于误判（与 zcode_parser::process_is_host 同向）
+    if tool_id == "zcode"
+        && !cmd.is_empty()
+        && crate::monitor::zcode_parser::cmdline_is_non_host(cmd)
+    {
+        return false;
+    }
+    // dsh（M1 终审 C1）：宿主是前台终端启动的 node 进程，exe 判据不可用（exe=node），
+    // 照 zcode 先例走 cmdline 门——口径单源委托 dsh::cmdline_is_dsh_host（与
+    // find_dsh_processes 完全一致）。dsh 无「孤儿防线」需求：esbuild 等子进程
+    // cmdline 无 dsh+web 双令牌、天然排除，故任何含双令牌的 node 即视为宿主
+    if tool_id == "dsh" {
+        return crate::monitor::dsh::cmdline_is_dsh_host(cmd);
+    }
+    exe.map(|e| is_host_process(&e.to_string_lossy().to_lowercase(), tool_id))
+        .unwrap_or(false)
 }
 
 /// cmdline 是否为 WorkBuddy 会话运行时（Electron 以自身作 Node 运行 cli/bin/codebuddy）。
@@ -165,6 +192,58 @@ mod tests {
         assert!(!tool_host_alive_in(&system, "workbuddy"));
         assert!(!tool_host_alive_in(&system, "codex"));
         assert!(!tool_host_alive_in(&system, "dsh"));
+        // R2：pid 版同一条判据（空快照 → None，不是 panic）
+        assert!(tool_host_pid(&system, "workbuddy").is_none());
+        assert!(tool_host_pid(&system, "zcode").is_none());
+    }
+
+    /// **R2（B1）**：`tool_host_pid` 的纯核 `process_is_tool_host` 与
+    /// `tool_host_alive_in` 同源——Electron 宿主命中；`cli/bin/codebuddy` 会话运行时
+    /// （exe 与宿主同名）**必须排除**，否则 WorkBuddy 5.9.3 会给「孤儿会话进程」发哨兵，
+    /// 看板把宿主已死的卡片留着不消失。
+    #[test]
+    fn host_pid_helper_excludes_session_runtime() {
+        use std::ffi::OsString;
+        let os = |s: &str| OsString::from(s);
+        let electron =
+            std::path::PathBuf::from("/applications/workbuddy.app/contents/macos/electron");
+        assert!(process_is_tool_host(Some(&electron), &[], "workbuddy"));
+        // 会话运行时：exe 与主进程同名（Windows sidecar 形态），只有 cmdline 能区分
+        let same_exe = std::path::PathBuf::from(
+            "c:\\users\\u\\appdata\\local\\programs\\workbuddy\\workbuddy.exe",
+        );
+        assert!(!process_is_tool_host(
+            Some(&same_exe),
+            &[
+                os("c:\\users\\u\\appdata\\local\\programs\\workbuddy\\workbuddy.exe"),
+                os("c:\\users\\u\\appdata\\local\\programs\\workbuddy\\resources\\app.asar.unpacked\\cli\\bin\\codebuddy"),
+            ],
+            "workbuddy"
+        ));
+        // 主进程 electron 启动参数（不含 codebuddy 脚本）→ 宿主
+        assert!(process_is_tool_host(
+            Some(&same_exe),
+            &[os(
+                "--user-data-dir=C:\\Users\\u\\AppData\\Roaming\\WorkBuddy"
+            )],
+            "workbuddy"
+        ));
+        // 非宿主 exe
+        assert!(!process_is_tool_host(
+            Some(std::path::Path::new("/usr/local/bin/codebuddy")),
+            &[],
+            "workbuddy"
+        ));
+        // ZCode 命令行门（--type / zcode.cjs 不判宿主）与 dsh 命令行门保持同源
+        let zcode = std::path::PathBuf::from("d:\\programs\\zcode\\zcode.exe");
+        assert!(!process_is_tool_host(
+            Some(&zcode),
+            &[os("--type=renderer")],
+            "zcode"
+        ));
+        assert!(!process_is_tool_host(Some(&zcode), &[], "dsh"));
+        // 无 exe 且无命令行 → 不判宿主（防御）
+        assert!(!process_is_tool_host(None, &[], "workbuddy"));
     }
 
     /// issue #35-5：cmdline 级 sidecar 排除（Windows 上 sidecar exe 与主进程同名，

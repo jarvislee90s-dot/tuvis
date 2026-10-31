@@ -12,11 +12,15 @@
 
 - [项目宪法](MASTER-PLAN.md)：最高设计依据；未经用户明确同意不得修改。
 - [规格与设计](engineering/specs/)：需求、设计、行为与验收口径。
+- [WorkBuddy 5.9.3 子代理与看板 Spec](engineering/specs/2026-10-30-workbuddy-5.9.3-subagents-and-board-spec.md) / [设计](engineering/specs/2026-10-30-workbuddy-5.9.3-subagents-and-board-design.md)：5.9.3 子代理漏采与心跳冻结掉线。
 - [实施计划](engineering/plans/)：当前/历史执行计划；executor prompt 不入库。
+- [WorkBuddy 5.9.3 TDD 执行计划](engineering/plans/2026-10-30-workbuddy-5.9.3-subagents-and-board-tdd.md)：R1/R2 任务、停止点与回滚。
 - [人工裁决台账](engineering/decisions/)：用户裁决、推翻与边界；只记决定，不记 agent 返工过程。
 - [最终审查索引](engineering/reviews/)：审查范围、最终结论、未闭合风险。
 - [探测与取证](engineering/evidence/)：脱敏的 probe/复探证据。
+- [WorkBuddy 5.9.3 证据](engineering/evidence/2026-10-30-workbuddy-5.9.3/evidence.md)：真机核算、心跳/DB/TPS 探针。
 - [验收](engineering/acceptance/)：最终验收；`history/` 为历史验收材料。
+- [WorkBuddy 5.9.3 验收清单](engineering/acceptance/2026-10-30-workbuddy-5.9.3-acceptance.md)。
 - [架构](engineering/architecture/)：ADR、设计、线稿。
 - [参考](engineering/reference/)：实体对齐、并发评估等。
 - [归档](engineering/archive/)：仅明确被取代或有矛盾的文档；当前可为空。

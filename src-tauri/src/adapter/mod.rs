@@ -358,6 +358,477 @@ fn apply_question_entry_mark(
 /// grace_duration 按进程形态区分：App 形态更长（30s），CLI 形态更短（5s）
 static STOP_GRACE: Lazy<Mutex<HashMap<u32, (i64, i64)>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 
+/// 首次转绿/补插入池失败、等待下一轮重试的 (tool, session) 集合。
+/// 只用于数据驱动绿卡的预过滤：**池无行不等于用户已读**，可能是 INSERT 失败；
+/// 不能用“池无行”一概补插（会复活已读/过期卡）。
+static PENDING_UNREAD_RETRIES: Lazy<Mutex<HashMap<(String, String), i64>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+const PENDING_TTL_MS: i64 = 24 * 3600 * 1000;
+static PENDING_LOADED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// 持久化失败（含旧快照暂不可读）后置位；待加载恢复后自动补写一次。
+static PENDING_DIRTY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn pending_key(tool: &str, sid: &str) -> String {
+    format!("{tool}\u{1f}{sid}")
+}
+
+/// 独立于 SQLite 的小文件：SQLite 写失败时仍尽量保留跨重启恢复标记。
+/// 写入采用临时文件 + rename；失败只 warn（降级），内存标记仍保留供同进程重试。
+fn pending_store_path() -> std::path::PathBuf {
+    crate::database::connection::app_data_home()
+        .join(".tuvis")
+        .join("unread_pending_retries.json")
+}
+
+fn persist_pending_unread_retries_into(
+    path: &std::path::Path,
+    loaded: &std::sync::atomic::AtomicBool,
+    dirty: &std::sync::atomic::AtomicBool,
+    retries: &Mutex<HashMap<(String, String), i64>>,
+) -> bool {
+    use std::sync::atomic::Ordering;
+    // 启动恢复未完成时内存集合可能不含磁盘旧项：禁止覆盖，等加载成功合并后补写。
+    if !loaded.load(Ordering::Acquire) {
+        dirty.store(true, Ordering::Release);
+        log::debug!("unread: 待重试标记尚未完成加载，暂缓落盘");
+        return false;
+    }
+    let map: HashMap<String, i64> = retries
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|((tool, sid), since)| (pending_key(tool, sid), *since))
+        .collect();
+    let ok = persist_pending_map(path, &map);
+    dirty.store(!ok, Ordering::Release);
+    ok
+}
+
+fn persist_pending_unread_retries() -> bool {
+    persist_pending_unread_retries_into(
+        &pending_store_path(),
+        &PENDING_LOADED,
+        &PENDING_DIRTY,
+        &PENDING_UNREAD_RETRIES,
+    )
+}
+
+fn pending_backup_path(path: &std::path::Path) -> std::path::PathBuf {
+    path.with_extension("json.bak")
+}
+
+/// 平台原子替换：Unix `rename` 直接覆盖；Windows 用 `ReplaceFileW`（目标不存在时
+/// `MoveFileExW`）。返回 false 时调用方走“保留旧文件”的安全回退。
+#[cfg(windows)]
+fn replace_pending_file_atomic(tmp: &std::path::Path, path: &std::path::Path) -> bool {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::PCWSTR;
+    use windows::Win32::Storage::FileSystem::{
+        MoveFileExW, ReplaceFileW, MOVEFILE_WRITE_THROUGH, REPLACEFILE_IGNORE_MERGE_ERRORS,
+    };
+    let wide = |p: &std::path::Path| -> Vec<u16> {
+        p.as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
+    };
+    let dst = wide(path);
+    let src = wide(tmp);
+    unsafe {
+        let result = if path.exists() {
+            ReplaceFileW(
+                PCWSTR(dst.as_ptr()),
+                PCWSTR(src.as_ptr()),
+                PCWSTR::null(),
+                REPLACEFILE_IGNORE_MERGE_ERRORS,
+                None,
+                None,
+            )
+        } else {
+            MoveFileExW(
+                PCWSTR(src.as_ptr()),
+                PCWSTR(dst.as_ptr()),
+                MOVEFILE_WRITE_THROUGH,
+            )
+        };
+        result.is_ok()
+    }
+}
+
+#[cfg(not(windows))]
+fn replace_pending_file_atomic(tmp: &std::path::Path, path: &std::path::Path) -> bool {
+    std::fs::rename(tmp, path).is_ok()
+}
+
+#[derive(Debug)]
+enum PendingSnapshot {
+    Valid(HashMap<String, i64>),
+    Missing,
+    Invalid,
+    IoError,
+}
+
+#[derive(Debug)]
+enum PendingLoad {
+    Loaded(HashMap<String, i64>),
+    Absent,
+    Failed,
+}
+
+fn read_pending_snapshot(path: &std::path::Path) -> PendingSnapshot {
+    match std::fs::read_to_string(path) {
+        Ok(raw) => match serde_json::from_str::<HashMap<String, i64>>(&raw) {
+            Ok(map) => PendingSnapshot::Valid(map),
+            Err(_) => PendingSnapshot::Invalid,
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => PendingSnapshot::Missing,
+        Err(_) => PendingSnapshot::IoError,
+    }
+}
+
+/// 读取待重试快照：主文件缺失/损坏时回退 `.bak`（兼容替换过程中的崩溃窗口）。
+/// `Failed` 表示读取/解析暂时失败，调用方应保留“未加载”状态并在下一轮重试。
+fn load_pending_map(path: &std::path::Path) -> PendingLoad {
+    let backup = pending_backup_path(path);
+    match read_pending_snapshot(path) {
+        PendingSnapshot::Valid(map) => PendingLoad::Loaded(map),
+        PendingSnapshot::IoError => PendingLoad::Failed,
+        PendingSnapshot::Missing => match read_pending_snapshot(&backup) {
+            PendingSnapshot::Valid(map) => PendingLoad::Loaded(map),
+            PendingSnapshot::Missing => PendingLoad::Absent,
+            PendingSnapshot::Invalid | PendingSnapshot::IoError => PendingLoad::Failed,
+        },
+        PendingSnapshot::Invalid => match read_pending_snapshot(&backup) {
+            PendingSnapshot::Valid(map) => PendingLoad::Loaded(map),
+            PendingSnapshot::Missing | PendingSnapshot::Invalid | PendingSnapshot::IoError => {
+                PendingLoad::Failed
+            }
+        },
+    }
+}
+
+/// 写盘前确认权威快照可读：主文件 `IoError` 直接拒绝；主文件缺失/损坏时，
+/// 只有备份 `IoError` 才拒绝。Unix 的 rename 可覆盖不可读文件，因此这个检查
+/// 必须发生在**任何替换/写 tmp 之前**，不能只放在备用分支。
+fn pending_snapshots_readable(path: &std::path::Path) -> bool {
+    match read_pending_snapshot(path) {
+        PendingSnapshot::IoError => false,
+        // 主文件可读即为权威快照；损坏/缺失时备份才可能是唯一有效副本。
+        PendingSnapshot::Valid(_) => true,
+        PendingSnapshot::Missing | PendingSnapshot::Invalid => !matches!(
+            read_pending_snapshot(&pending_backup_path(path)),
+            PendingSnapshot::IoError
+        ),
+    }
+}
+
+/// 原子性优先的写盘：先写 tmp；直接 rename 成功（Unix）即完成。失败时**保留旧文件**
+/// 为 `.bak` 再换名；换名失败则恢复旧文件，绝不先删唯一有效快照。
+fn persist_pending_map(path: &std::path::Path, map: &HashMap<String, i64>) -> bool {
+    if !pending_snapshots_readable(path) {
+        log::warn!(
+            "unread: 待重试标记旧快照暂时不可读 {}（保留旧文件，跳过落盘）",
+            path.display()
+        );
+        return false;
+    }
+    let Ok(json) = serde_json::to_string(map) else {
+        return false;
+    };
+    let tmp = path.with_extension("json.tmp");
+    if let Err(e) = std::fs::write(&tmp, &json) {
+        log::warn!(
+            "unread: 待重试标记写入 {} 失败（降级为内存重试）: {e}",
+            tmp.display()
+        );
+        return false;
+    }
+    // 写完 tmp 后、换入前再确认一次，缩小“检查后被占用/权限变化”的竞态窗口。
+    if !pending_snapshots_readable(path) {
+        log::warn!(
+            "unread: 待重试标记换入前旧快照变为不可读 {}（保留旧文件，跳过落盘）",
+            path.display()
+        );
+        let _ = std::fs::remove_file(&tmp);
+        return false;
+    }
+    if replace_pending_file_atomic(&tmp, path) {
+        let _ = std::fs::remove_file(pending_backup_path(path));
+        return true;
+    }
+    replace_pending_file_with_backup(&tmp, path)
+}
+
+/// 直接 rename 失败（Windows 目标已存在）时的安全替换：先把旧文件挪为 `.bak`，
+/// 再换入 tmp；任一步失败都恢复/保留旧文件。崩溃窗口由 `load_pending_map` 的
+/// `.bak` 回退兜底。
+fn replace_pending_file_with_backup(tmp: &std::path::Path, path: &std::path::Path) -> bool {
+    let backup = pending_backup_path(path);
+    let primary_snapshot = read_pending_snapshot(path);
+    let backup_snapshot = read_pending_snapshot(&backup);
+    if matches!(&primary_snapshot, PendingSnapshot::IoError) {
+        // 主文件暂时不可读：可能只是占用/权限抖动；保留主文件与 .bak，下一轮再试。
+        log::warn!(
+            "unread: 待重试标记主文件暂时不可读 {}（保留现有文件，降级）",
+            path.display()
+        );
+        let _ = std::fs::remove_file(tmp);
+        return false;
+    }
+    let primary_valid = matches!(&primary_snapshot, PendingSnapshot::Valid(_));
+    let backup_valid = matches!(&backup_snapshot, PendingSnapshot::Valid(_));
+    let primary_exists = match path.try_exists() {
+        Ok(exists) => exists,
+        Err(e) => {
+            log::warn!(
+                "unread: 无法确认待重试标记主文件状态 {}（保留现有文件，降级）: {e}",
+                path.display()
+            );
+            let _ = std::fs::remove_file(tmp);
+            return false;
+        }
+    };
+
+    // 主文件已损坏/不可用，而 .bak 是唯一有效快照：只移除损坏主文件，绝不覆盖 .bak。
+    // 若 tmp 换入失败，.bak 仍可供下次启动恢复。
+    if !primary_valid && backup_valid {
+        if primary_exists {
+            if let Err(e) = std::fs::remove_file(path) {
+                log::warn!(
+                    "unread: 待重试标记损坏主文件无法移除 {}（保留 .bak，降级）: {e}",
+                    path.display()
+                );
+                let _ = std::fs::remove_file(tmp);
+                return false;
+            }
+        }
+        if let Err(e) = std::fs::rename(tmp, path) {
+            log::warn!("unread: 待重试标记换入失败（保留唯一有效 .bak 供恢复）: {e}");
+            let _ = std::fs::remove_file(tmp);
+            return false;
+        }
+        let _ = std::fs::remove_file(&backup);
+        return true;
+    }
+
+    // 无主文件且无有效备份：无旧快照可保；直接换入，失败则保持原状。
+    if !primary_exists {
+        if std::fs::rename(tmp, path).is_ok() {
+            let _ = std::fs::remove_file(&backup);
+            return true;
+        }
+        log::warn!(
+            "unread: 待重试标记无主文件时换入失败 {}（降级）",
+            path.display()
+        );
+        let _ = std::fs::remove_file(tmp);
+        return false;
+    }
+
+    // 主文件存在（有效，或双方都无效）：保留主文件为 .bak 后再换入。
+    let _ = std::fs::remove_file(&backup);
+    if let Err(e) = std::fs::rename(path, &backup) {
+        log::warn!(
+            "unread: 待重试标记替换前无法保留旧文件 {}（保留原文件，降级）: {e}",
+            path.display()
+        );
+        let _ = std::fs::remove_file(tmp);
+        return false;
+    }
+    if let Err(e) = std::fs::rename(tmp, path) {
+        if let Err(e2) = std::fs::rename(&backup, path) {
+            log::warn!(
+                "unread: 待重试标记替换失败且旧文件恢复失败（load 将回退 .bak）: {e} / {e2}"
+            );
+        }
+        let _ = std::fs::remove_file(tmp);
+        return false;
+    }
+    let _ = std::fs::remove_file(&backup);
+    true
+}
+
+/// 恢复持久化的待重试标记，并清理 24h 过期项。
+/// 只有成功读取或确认文件不存在才置位 `loaded`；临时 I/O/解析失败留给下一轮重试。
+fn load_pending_unread_retries_into(
+    path: &std::path::Path,
+    loaded: &std::sync::atomic::AtomicBool,
+    retries: &Mutex<HashMap<(String, String), i64>>,
+) {
+    use std::sync::atomic::Ordering;
+    if loaded.load(Ordering::Acquire) {
+        return;
+    }
+    match load_pending_map(path) {
+        PendingLoad::Loaded(map) => {
+            let now = chrono::Utc::now().timestamp_millis();
+            let mut guard = retries.lock().unwrap();
+            for (key, since) in map {
+                if now.saturating_sub(since) > PENDING_TTL_MS {
+                    continue;
+                }
+                if let Some((tool, sid)) = key.split_once('\u{1f}') {
+                    guard
+                        .entry((tool.to_string(), sid.to_string()))
+                        .or_insert(since);
+                }
+            }
+            loaded.store(true, Ordering::Release);
+        }
+        PendingLoad::Absent => loaded.store(true, Ordering::Release),
+        PendingLoad::Failed => {
+            log::debug!("unread: 待重试标记暂时不可读，下一轮扫描重试");
+        }
+    }
+}
+
+fn load_pending_unread_retries() {
+    load_pending_unread_retries_into(
+        &pending_store_path(),
+        &PENDING_LOADED,
+        &PENDING_UNREAD_RETRIES,
+    );
+    // 之前落盘被旧快照不可读拦下：恢复后把内存新增项与磁盘旧项合并，再补写一次。
+    if PENDING_LOADED.load(std::sync::atomic::Ordering::Acquire)
+        && PENDING_DIRTY.load(std::sync::atomic::Ordering::Acquire)
+    {
+        persist_pending_unread_retries();
+    }
+}
+
+/// 每轮清理内存中超过 24h 的待重试标记；有变化才落盘（避免每 3s 写放大）。
+fn prune_pending_unread_retries(now_ms: i64) {
+    let changed = {
+        let mut guard = PENDING_UNREAD_RETRIES.lock().unwrap();
+        let before = guard.len();
+        guard.retain(|_, since| now_ms.saturating_sub(*since) <= PENDING_TTL_MS);
+        guard.len() != before
+    };
+    if changed {
+        let _ = persist_pending_unread_retries();
+    }
+}
+
+fn mark_unread_retry(tool: &str, sid: &str, since_ms: i64, persist: bool) -> bool {
+    let changed = {
+        let mut guard = PENDING_UNREAD_RETRIES.lock().unwrap();
+        let key = (tool.to_string(), sid.to_string());
+        match guard.entry(key) {
+            std::collections::hash_map::Entry::Occupied(_) => false, // 重复失败且 since 未变：不重写
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(since_ms);
+                true
+            }
+        }
+    };
+    if persist && changed {
+        let _ = persist_pending_unread_retries();
+    }
+    changed
+}
+
+fn clear_unread_retry(tool: &str, sid: &str, persist: bool) -> bool {
+    let changed = PENDING_UNREAD_RETRIES
+        .lock()
+        .unwrap()
+        .remove(&(tool.to_string(), sid.to_string()))
+        .is_some();
+    if persist && changed {
+        let _ = persist_pending_unread_retries();
+    }
+    changed
+}
+
+fn unread_retry_pending(tool: &str, sid: &str) -> bool {
+    PENDING_UNREAD_RETRIES
+        .lock()
+        .unwrap()
+        .contains_key(&(tool.to_string(), sid.to_string()))
+}
+
+fn unread_retry_pending_since(tool: &str, sid: &str) -> Option<i64> {
+    PENDING_UNREAD_RETRIES
+        .lock()
+        .unwrap()
+        .get(&(tool.to_string(), sid.to_string()))
+        .copied()
+}
+
+/// 补插时，只有**本次转绿之后**发生的已读才取消重试；旧回合的墓碑不能阻止新回合。
+fn retry_insert_allowed(pending_since_ms: i64, read_at: Option<i64>) -> bool {
+    read_at.is_none_or(|t| t < pending_since_ms)
+}
+
+fn session_activity_ms(s: &Session) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(&s.last_activity_at)
+        .ok()
+        .map(|dt| dt.timestamp_millis())
+}
+
+/// 活动时间是否“可能是当前回合”（用于无待重试标记时的兜底）。
+/// Codex APP 的 `threads.updated_at` 是**秒级**：同一秒内的新回合不能因为
+/// 墓碑毫秒值更大就被判成已读；对秒级活动留 999ms 不确定性，宁可允许通知。
+fn activity_may_be_after(activity_ms: i64, read_at_ms: i64) -> bool {
+    if activity_ms % 1000 == 0 {
+        activity_ms.saturating_add(999) >= read_at_ms
+    } else {
+        activity_ms > read_at_ms
+    }
+}
+
+/// 墓碑是否覆盖了当前活动（本回合已读）：
+/// * 毫秒级活动：`read_at >= activity`；
+/// * 秒级活动：必须严格晚于该秒（`read_at > activity + 999`）才算已读。
+fn read_covers_activity(read_at_ms: i64, activity_ms: i64) -> bool {
+    if activity_ms % 1000 == 0 {
+        read_at_ms > activity_ms.saturating_add(999)
+    } else {
+        read_at_ms >= activity_ms
+    }
+}
+
+/// 首次转绿 INSERT 是否应因“本回合已读”而跳过：
+/// * 有待重试标记：墓碑 >= since（本次转绿后）→ 跳过；
+/// * 无标记（含重启后标记丢失）：墓碑 >= 卡片最后活动 → 视为本回合已读，跳过；
+///   旧回合墓碑 < 当前回合活动 → 允许插入。
+fn insert_should_skip_for_read(
+    pending_since_ms: Option<i64>,
+    read_at: Option<i64>,
+    activity_ms: Option<i64>,
+) -> bool {
+    match pending_since_ms {
+        Some(since) => !retry_insert_allowed(since, read_at),
+        None => match (read_at, activity_ms) {
+            (Some(read), Some(activity)) => read_covers_activity(read, activity),
+            _ => false,
+        },
+    }
+}
+
+/// 首次入池的统一判据：本回合已读 → 不插；prev=None + 墓碑 → 只有活动可能属于
+/// 当前回合才允许（旧卡不得复活）；其余沿用迁移触发规则。
+fn unread_insert_allowed(
+    prev: Option<&str>,
+    read_at: Option<i64>,
+    activity_ms: Option<i64>,
+    pending_since_ms: Option<i64>,
+) -> bool {
+    if insert_should_skip_for_read(pending_since_ms, read_at, activity_ms) {
+        return false;
+    }
+    if prev.is_none() {
+        if let Some(read) = read_at {
+            return activity_ms.is_some_and(|a| activity_may_be_after(a, read));
+        }
+    }
+    insert_allowed(prev, read_at.is_some())
+}
+
+/// 数据驱动绿卡预过滤的保留判据：待重试优先，否则沿用“上一轮绿 + 池无行 ⇒ 剔除”。
+fn keep_green_card(was_green_prev: bool, pool_has_row: bool, retry_pending: bool) -> bool {
+    retry_pending || !codex_green_card_should_drop(was_green_prev, pool_has_row)
+}
+
 /// 通用进程信息
 #[derive(Debug, Clone)]
 pub struct AgentProcess {
@@ -586,6 +1057,9 @@ fn event_payload(event: Option<&crate::monitor::hooks::HookEvent>) -> Option<&st
 
 /// 实际扫描（单飞壳内执行；成功路径与原实现一致）
 fn get_all_sessions_inner() -> SessionsResponse {
+    // 重启恢复 + 每轮 TTL 清理（有变化才落盘）
+    load_pending_unread_retries();
+    prune_pending_unread_retries(chrono::Utc::now().timestamp_millis());
     // W5：未勾选工具不参与会话扫描（看板卡/通知随之静默）
     let adapters: Vec<Box<dyn AgentAdapter>> = enabled_adapters();
 
@@ -618,6 +1092,14 @@ fn get_all_sessions_inner() -> SessionsResponse {
 
         adapters.iter().map(|a| a.find_processes(system)).collect()
     }; // 释放 System 锁 — 下方文件 I/O 无需持锁
+
+    // 已知取舍（2026-10-30 评审 Minor）：上面这一行在 **SHARED_SYSTEM 锁内**执行
+    // `find_processes`，而 WorkBuddy 的发现逻辑在「没有可用心跳、要发宿主哨兵」时会做一次
+    // `workbuddy.db` 只读查询（`recent_db_sessions`，17 行的库、实测 0.03ms；打开有
+    // 1000ms busy_timeout 上限）。有心跳进程时该查询根本不发生（惰性闭包）。
+    // 未把 DB I/O 移出锁：`AgentAdapter::find_processes(&System)` 的签名不接受外部连接，
+    // 搬家要动 trait 与全部适配器；收益（微秒级）与风险不匹配。若将来该库变大或出现
+    // 写锁长持有，再按「发现阶段只做纯 os 查询」重构。
 
     // Phase 2: 解析会话（文件 I/O）
     let mut all_sessions: Vec<Session> = Vec::new();
@@ -683,12 +1165,22 @@ fn get_all_sessions_inner() -> SessionsResponse {
                 Some("Idle") | Some("Finished")
             );
             let tool = s.agent_type.tool_id().to_string();
-            !codex_green_card_should_drop(was_green_prev, pool.contains(&(tool, s.id.clone())))
+            keep_green_card(
+                was_green_prev,
+                pool.contains(&(tool.clone(), s.id.clone())),
+                unread_retry_pending(&tool, &s.id),
+            )
         });
     }
 
     // W4：APP 类未读卡合并 + 未读池维护（宿主存活检查 / 变黄删除 / 过期清理）
-    sync_unread_sessions(&mut all_sessions);
+    // 删除状态必须贯穿未读池：先解析“池里 WorkBuddy 行对应 DB 明确删除”的 id，
+    // DB 打不开时为空集（不误清）。合并阶段同时过滤/删除这些行。
+    let deleted_workbuddy = deleted_workbuddy_unread_ids();
+    sync_unread_sessions(&mut all_sessions, &deleted_workbuddy);
+    // 已读生命周期：DB-only completed 卡在用户已读（墓碑）且没有新工作后，不应继续
+    // 以普通 Idle 卡出现——否则“已读”只是去掉未读标记，卡仍在。
+    drop_read_completed_workbuddy_cards(&mut all_sessions);
 
     // Hook 事件集成：用新鲜事件（<30s）更新会话状态；T3 起审批等待持久化（DB
     // approval_wait_marks）——进入事件（PermissionRequest/Notification[注册侧已
@@ -838,8 +1330,14 @@ fn get_all_sessions_inner() -> SessionsResponse {
         .filter(|s| matches!(s.status, SessionStatus::Waiting))
         .count();
 
-    // 更新会话状态缓存（通知去重用）
+    // 更新会话状态缓存（通知去重用）。
+    // **写库失败待重试的会话不得提前写成 Idle**：否则重启后标记丢失，
+    // 预过滤会把“池无行 + 上一轮绿”当已读，重试永久失效。
     for session in &all_sessions {
+        let tool = session.agent_type.tool_id();
+        if unread_retry_pending(tool, &session.id) {
+            continue;
+        }
         let _ = crate::database::update_session_status(
             &session.id,
             &format!("{:?}", session.agent_type),
@@ -1975,6 +2473,73 @@ fn insert_allowed(prev_status: Option<&str>, was_read_recently: bool) -> bool {
     !(prev_status.is_none() && was_read_recently)
 }
 
+/// WorkBuddy 未读池行中，DB 已明确删除（`deleted_at > 0`）的 sessionId。
+/// DB 打不开/查询失败 → 空集（宁可保留一行，也不把临时不可读误判为删除）。
+fn deleted_workbuddy_unread_ids() -> HashSet<String> {
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let ids: Vec<String> = crate::database::dao::unread::list(now_ms)
+        .into_iter()
+        .filter(|r| r.tool_id == "workbuddy")
+        .map(|r| r.session_id)
+        .collect();
+    if ids.is_empty() {
+        return HashSet::new();
+    }
+    let Some(home) = dirs::home_dir() else {
+        return HashSet::new();
+    };
+    crate::monitor::workbuddy_parser::deleted_workbuddy_session_ids(&home, &ids).unwrap_or_default()
+}
+
+/// DB-only completed WorkBuddy 卡的“已读后消失”判据：
+/// 必须同时满足 pid=0（没有真实心跳/进程）、Idle/Finished、存在已读墓碑，
+/// 且最后活动时间不晚于墓碑时间（没有新工作回合）。有新活动则保留。
+fn read_completed_card_should_drop(s: &Session, read_at: Option<i64>) -> bool {
+    if s.agent_type != AgentType::WorkBuddy
+        || s.pid != 0
+        || !matches!(s.status, SessionStatus::Idle | SessionStatus::Finished)
+    {
+        return false;
+    }
+    let Some(read_at) = read_at else {
+        return false;
+    };
+    chrono::DateTime::parse_from_rfc3339(&s.last_activity_at)
+        .map(|dt| dt.timestamp_millis() <= read_at)
+        .unwrap_or(true)
+}
+
+/// 纯核：按注入的墓碑查询剔除“已读且无新工作”的 DB-only completed 卡（可测）。
+fn retain_read_completed_cards(
+    active: &mut Vec<Session>,
+    read_at_of: &dyn Fn(&str) -> Option<i64>,
+) {
+    active.retain(|s| {
+        let is_candidate = s.agent_type == AgentType::WorkBuddy
+            && s.pid == 0
+            && matches!(s.status, SessionStatus::Idle | SessionStatus::Finished);
+        !(is_candidate && read_completed_card_should_drop(s, read_at_of(&s.id)))
+    });
+}
+
+/// 生产入口：墓碑来自 unread DAO。
+fn drop_read_completed_workbuddy_cards(active: &mut Vec<Session>) {
+    retain_read_completed_cards(active, &|sid| {
+        crate::database::dao::unread::read_tombstone_at("workbuddy", sid)
+    });
+}
+
+/// 未读池合并前的删除过滤（纯函数，可测）：
+/// 只丢弃 `deleted` 集合中命中的 WorkBuddy 行；其他工具同 id 不受影响。
+fn filter_deleted_unread(
+    pool: Vec<crate::database::dao::unread::UnreadSessionRecord>,
+    deleted: &HashSet<String>,
+) -> Vec<crate::database::dao::unread::UnreadSessionRecord> {
+    pool.into_iter()
+        .filter(|r| !(r.tool_id == "workbuddy" && deleted.contains(&r.session_id)))
+        .collect()
+}
+
 /// W4 未读机制核心：把 DB 中的未读会话合并为 Session 卡，并维护未读池
 /// - 会话当前非空闲（黄/红）→ 删未读行（活跃卡可见，防同会话双卡）
 /// - 转绿（Idle/Finished）→ upsert 未读行（未在池中时）
@@ -1983,8 +2548,14 @@ fn insert_allowed(prev_status: Option<&str>, was_read_recently: bool) -> bool {
 /// - 数据驱动持久绿卡工具（Codex APP / ZCode，P1-3 通用化）：聚合卡即该会话的
 ///   「未读卡」形态——池有行时标记 unread=true（徽标/「未读卡排后」生效），
 ///   已读删行后由 get_all_sessions 的前置过滤剔除，闭环「被已读信号清除」
-fn sync_unread_sessions(active: &mut Vec<Session>) {
+fn sync_unread_sessions(active: &mut Vec<Session>, deleted_workbuddy: &HashSet<String>) {
     let now_ms = chrono::Utc::now().timestamp_millis();
+
+    // 0) 删除状态贯穿未读池：先物理删除已删会话的池行，再做本轮合并。
+    //    deleted_workbuddy 为空（DB 不可读/无删除）时不动任何行。
+    for sid in deleted_workbuddy {
+        crate::database::dao::unread::delete("workbuddy", sid);
+    }
 
     // 1) 活跃会话驱动未读池变更
     for s in active.iter_mut() {
@@ -2009,14 +2580,42 @@ fn sync_unread_sessions(active: &mut Vec<Session>) {
             };
             match unread_pool_action(prev.as_deref(), true) {
                 UnreadPoolAction::Insert => {
-                    let was_read =
-                        crate::database::dao::unread::was_read_recently(&tool, &s.id, now_ms);
-                    if insert_allowed(prev.as_deref(), was_read) {
-                        crate::database::dao::unread::upsert(&record);
+                    let read_at = crate::database::dao::unread::read_tombstone_at(&tool, &s.id);
+                    let pending_since = unread_retry_pending_since(&tool, &s.id);
+                    if unread_insert_allowed(
+                        prev.as_deref(),
+                        read_at,
+                        session_activity_ms(s),
+                        pending_since,
+                    ) {
+                        if crate::database::dao::unread::try_upsert(&record) {
+                            clear_unread_retry(&tool, &s.id, true);
+                        } else {
+                            mark_unread_retry(&tool, &s.id, now_ms, true);
+                            log::warn!("unread: 首次转绿入池失败（{} {}），下轮重试", tool, s.id);
+                        }
+                    } else {
+                        clear_unread_retry(&tool, &s.id, true);
                     }
                 }
                 UnreadPoolAction::RefreshDisplay => {
-                    crate::database::dao::unread::refresh_display(&record)
+                    // 只有显式“待重试”才补插；池无行但没有标记 = 已读/过期，不得复活。
+                    if let Some(since) = unread_retry_pending_since(&tool, &s.id) {
+                        let read_at = crate::database::dao::unread::read_tombstone_at(&tool, &s.id);
+                        if !retry_insert_allowed(since, read_at)
+                            || crate::database::dao::unread::exists(&tool, &s.id)
+                        {
+                            // 本次转绿之后已读，或池行已存在 → 取消重试
+                            clear_unread_retry(&tool, &s.id, true);
+                        } else if crate::database::dao::unread::try_upsert(&record) {
+                            clear_unread_retry(&tool, &s.id, true);
+                        } else {
+                            mark_unread_retry(&tool, &s.id, since, true);
+                            log::warn!("unread: 转绿补插失败（{} {}），下轮重试", tool, s.id);
+                        }
+                    } else if crate::database::dao::unread::exists(&tool, &s.id) {
+                        crate::database::dao::unread::refresh_display(&record);
+                    }
                 }
                 UnreadPoolAction::None => {}
             }
@@ -2027,7 +2626,8 @@ fn sync_unread_sessions(active: &mut Vec<Session>) {
                 s.unread = true;
             }
         } else {
-            // 变黄/红：删未读（状态迁移，非重置机制）
+            // 变黄/红：删未读（状态迁移，非重置机制）；新工作开始，清待重试标记
+            clear_unread_retry(&tool, &s.id, true);
             crate::database::dao::unread::delete(&tool, &s.id);
         }
     }
@@ -2063,11 +2663,42 @@ fn sync_unread_sessions(active: &mut Vec<Session>) {
     }
 
     // 4) 未读池合并为卡（纯映射见 build_unread_cards；追加在末尾，最终顺序由 session_sort_cmp 决定）
-    let final_unread = crate::database::dao::unread::list(now_ms);
+    //    已删会话的池行即使因清理失败残留，也不得合并成卡（P1：删除状态贯穿最终渲染）。
+    let final_unread = filter_deleted_unread(
+        crate::database::dao::unread::list(now_ms),
+        deleted_workbuddy,
+    );
+    // P1：WorkBuddy 的 DB-only completed 卡（pid=0）若池里已有未读行，不能继续以
+    // unread=false 的普通卡呈现（build_unread_cards 会因“已在 active”跳过池卡）。
+    // 在合并前把它标成 unread，保证“未读记录存在 ⇒ 卡面呈现未读”。
+    mark_active_unread_cards(active, &final_unread);
     let cards = build_unread_cards(&final_unread, active, &|id| {
         crate::database::dao::agent_tool::get_tool_enabled(id)
     });
     active.extend(cards);
+}
+
+/// P1：把「池里已有未读行」的 WorkBuddy DB-only completed 活跃卡标成 unread。
+///
+/// 只处理 `pid == 0`（无真实心跳、由 DB 兜底渲染的卡）且尾部为 Idle/Finished 的
+/// WorkBuddy 卡；有心跳 pid 的卡仍由进程/状态路径决定，不能被未读池提前染色。
+fn mark_active_unread_cards(
+    active: &mut [Session],
+    pool: &[crate::database::dao::unread::UnreadSessionRecord],
+) {
+    let keys: HashSet<(String, String)> = pool
+        .iter()
+        .map(|r| (r.tool_id.clone(), r.session_id.clone()))
+        .collect();
+    for s in active.iter_mut() {
+        if s.agent_type == AgentType::WorkBuddy
+            && s.pid == 0
+            && matches!(s.status, SessionStatus::Idle | SessionStatus::Finished)
+            && keys.contains(&(s.agent_type.tool_id().to_string(), s.id.clone()))
+        {
+            s.unread = true;
+        }
+    }
 }
 
 /// 未读池 → 未读卡（纯函数，spec §8 可测试；启用判定经参数注入，测试不触库）：
@@ -2579,9 +3210,26 @@ mod sort_tests {
 
 #[cfg(test)]
 mod unread_card_tests {
-    use super::build_unread_cards;
+    use super::{
+        build_unread_cards, clear_unread_retry, filter_deleted_unread, insert_should_skip_for_read,
+        keep_green_card, load_pending_map, load_pending_unread_retries_into,
+        mark_active_unread_cards, mark_unread_retry, pending_backup_path, pending_key,
+        persist_pending_map, persist_pending_unread_retries_into, replace_pending_file_with_backup,
+        retain_read_completed_cards, retry_insert_allowed, unread_insert_allowed,
+        unread_retry_pending, unread_retry_pending_since, PendingLoad,
+    };
     use crate::database::dao::unread::UnreadSessionRecord;
     use crate::session::model::{AgentType, ProcessForm, Session, SessionStatus};
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Mutex;
+
+    fn loaded_map(path: &std::path::Path) -> Option<HashMap<String, i64>> {
+        match load_pending_map(path) {
+            PendingLoad::Loaded(map) => Some(map),
+            PendingLoad::Absent | PendingLoad::Failed => None,
+        }
+    }
 
     fn record(tool: &str, sid: &str) -> UnreadSessionRecord {
         UnreadSessionRecord {
@@ -2617,6 +3265,409 @@ mod unread_card_tests {
             jump_supported: true,
             unread: false,
         }
+    }
+
+    /// P2：数据驱动绿卡的预过滤必须让“待重试”卡通过；不能把池无行一概当已读。
+    #[test]
+    fn pending_unread_retry_keeps_green_card_through_prefilter() {
+        assert!(
+            keep_green_card(true, false, true),
+            "上一轮绿 + 池无行 + 待重试 → 保留卡进入 sync 重试"
+        );
+        assert!(
+            !keep_green_card(true, false, false),
+            "上一轮绿 + 池无行 + 无待重试 → 按已读/过期剔除"
+        );
+        assert!(keep_green_card(false, false, false), "首次转绿保留");
+        assert!(keep_green_card(true, true, false), "池有行保留");
+
+        assert!(mark_unread_retry("codex", "retry-test", 2_000, false));
+        assert!(
+            !mark_unread_retry("codex", "retry-test", 2_000, false),
+            "重复失败且 since 未变不得再次写入"
+        );
+        assert!(unread_retry_pending("codex", "retry-test"));
+        assert_eq!(
+            unread_retry_pending_since("codex", "retry-test"),
+            Some(2_000)
+        );
+        // 旧回合墓碑（< since）不得取消新回合补插；本次转绿后的已读才取消
+        assert!(retry_insert_allowed(2_000, Some(1_000)));
+        assert!(!retry_insert_allowed(2_000, Some(2_000)));
+        assert!(retry_insert_allowed(2_000, None));
+        // Insert 分支：待重试带 since；重启无标记时用卡片活动时间兜底
+        assert!(!insert_should_skip_for_read(
+            Some(2_000),
+            Some(1_000),
+            Some(1_500)
+        ));
+        assert!(insert_should_skip_for_read(
+            Some(2_000),
+            Some(2_000),
+            Some(1_500)
+        ));
+        assert!(!insert_should_skip_for_read(None, Some(1_000), Some(1_500)));
+        assert!(insert_should_skip_for_read(None, Some(2_000), Some(1_500)));
+        assert!(!insert_should_skip_for_read(None, None, Some(1_500)));
+
+        // P2-1：缓存失忆 + 旧墓碑 + 新活动 → 允许；墓碑覆盖活动/无活动 → 不插
+        assert!(unread_insert_allowed(None, Some(1_000), Some(1_500), None));
+        assert!(!unread_insert_allowed(None, Some(2_000), Some(1_500), None));
+        assert!(!unread_insert_allowed(None, Some(1_000), None, None));
+        assert!(unread_insert_allowed(
+            Some("Processing"),
+            Some(1_000),
+            Some(1_500),
+            None
+        ));
+        // P2-2：秒级活动与毫秒墓碑同秒 → 不判已读；毫秒级照常
+        assert!(!insert_should_skip_for_read(
+            None,
+            Some(10_000_300),
+            Some(10_000_000)
+        ));
+        assert!(insert_should_skip_for_read(
+            None,
+            Some(11_000_100),
+            Some(10_000_000)
+        ));
+        assert!(insert_should_skip_for_read(
+            None,
+            Some(10_000_900),
+            Some(10_000_800)
+        ));
+        assert!(unread_insert_allowed(
+            None,
+            Some(10_000_300),
+            Some(10_000_000),
+            None
+        ));
+        // 持久化 pending since 后，重启同秒已读也必须按精确 since 拦截
+        assert!(insert_should_skip_for_read(
+            Some(10_000_100),
+            Some(10_000_300),
+            Some(10_000_000)
+        ));
+        assert!(clear_unread_retry("codex", "retry-test", false));
+        assert!(!clear_unread_retry("codex", "retry-test", false));
+        assert!(!unread_retry_pending("codex", "retry-test"));
+    }
+
+    /// 文件持久化：正常替换 + 主文件缺失时回退 .bak，保证替换崩溃窗口可恢复。
+    #[test]
+    fn pending_retry_file_roundtrip_and_backup_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("unread_pending_retries.json");
+        let mut first = HashMap::new();
+        first.insert("workbuddy\u{1f}s1".to_string(), 1_000);
+        assert!(persist_pending_map(&path, &first));
+        assert_eq!(loaded_map(&path), Some(first.clone()));
+
+        let mut second = HashMap::new();
+        second.insert("codex\u{1f}s2".to_string(), 2_000);
+        assert!(persist_pending_map(&path, &second));
+        assert_eq!(loaded_map(&path), Some(second));
+
+        // 模拟“旧文件已备份、新文件尚未换入”的崩溃窗口
+        std::fs::remove_file(&path).unwrap();
+        let backup = pending_backup_path(&path);
+        std::fs::write(&backup, serde_json::to_string(&first).unwrap()).unwrap();
+        assert_eq!(loaded_map(&path), Some(first));
+    }
+
+    /// 替换链路失败时必须保留旧快照，不得出现“旧文件已删、新文件未入”的空窗。
+    #[test]
+    fn pending_retry_persist_failure_preserves_primary_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("unread_pending_retries.json");
+        let mut old = HashMap::new();
+        old.insert("workbuddy\u{1f}s1".to_string(), 1_000);
+        assert!(persist_pending_map(&path, &old));
+
+        // 备份目标被目录占位 → 无法保留旧文件；函数应放弃替换并保留主文件。
+        let backup = pending_backup_path(&path);
+        std::fs::create_dir(&backup).unwrap();
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, "{}").unwrap();
+        assert!(!replace_pending_file_with_backup(&tmp, &path));
+        assert_eq!(loaded_map(&path), Some(old));
+        assert!(!tmp.exists());
+    }
+
+    /// 主文件损坏 + .bak 有效 + 第二次换名失败：不得覆盖唯一有效 .bak。
+    #[test]
+    fn pending_retry_corrupt_primary_keeps_valid_backup_on_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("unread_pending_retries.json");
+        let backup = pending_backup_path(&path);
+        let mut old = HashMap::new();
+        old.insert("workbuddy\u{1f}s1".to_string(), 1_000);
+        std::fs::write(&path, "{corrupt").unwrap();
+        std::fs::write(&backup, serde_json::to_string(&old).unwrap()).unwrap();
+
+        // tmp 不存在 → 第二次 rename 必然失败
+        let tmp = path.with_extension("json.tmp");
+        assert!(!replace_pending_file_with_backup(&tmp, &path));
+        assert!(backup.exists());
+        assert_eq!(loaded_map(&path), Some(old));
+    }
+
+    /// 主文件损坏 + .bak 有效：换入成功后清理备份，主文件恢复为有效快照。
+    #[test]
+    fn pending_retry_corrupt_primary_replaced_from_valid_tmp() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("unread_pending_retries.json");
+        let backup = pending_backup_path(&path);
+        let mut old = HashMap::new();
+        old.insert("workbuddy\u{1f}s1".to_string(), 1_000);
+        let mut new = HashMap::new();
+        new.insert("codex\u{1f}s2".to_string(), 2_000);
+        std::fs::write(&path, "{corrupt").unwrap();
+        std::fs::write(&backup, serde_json::to_string(&old).unwrap()).unwrap();
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, serde_json::to_string(&new).unwrap()).unwrap();
+
+        assert!(replace_pending_file_with_backup(&tmp, &path));
+        assert_eq!(loaded_map(&path), Some(new));
+        assert!(!backup.exists());
+        assert!(!tmp.exists());
+    }
+
+    /// 主文件有效 + 第二次换名失败：恢复主文件，不留空窗。
+    #[test]
+    fn pending_retry_second_rename_failure_restores_primary() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("unread_pending_retries.json");
+        let mut old = HashMap::new();
+        old.insert("workbuddy\u{1f}s1".to_string(), 1_000);
+        assert!(persist_pending_map(&path, &old));
+
+        let tmp = path.with_extension("json.tmp");
+        assert!(!replace_pending_file_with_backup(&tmp, &path));
+        assert!(path.exists());
+        assert_eq!(loaded_map(&path), Some(old));
+    }
+
+    /// P3：临时读取/解析失败不消耗加载机会；下一轮成功读取后正常置位。
+    #[test]
+    fn pending_retry_load_retries_after_transient_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("unread_pending_retries.json");
+        std::fs::write(&path, "{corrupt").unwrap();
+        let loaded = AtomicBool::new(false);
+        let retries = Mutex::new(HashMap::new());
+        load_pending_unread_retries_into(&path, &loaded, &retries);
+        assert!(!loaded.load(Ordering::Acquire));
+        assert!(retries.lock().unwrap().is_empty());
+
+        let now = chrono::Utc::now().timestamp_millis();
+        let mut map = HashMap::new();
+        map.insert("codex\u{1f}s2".to_string(), now);
+        std::fs::write(&path, serde_json::to_string(&map).unwrap()).unwrap();
+        load_pending_unread_retries_into(&path, &loaded, &retries);
+        assert!(loaded.load(Ordering::Acquire));
+        assert_eq!(
+            retries
+                .lock()
+                .unwrap()
+                .get(&("codex".to_string(), "s2".to_string())),
+            Some(&now)
+        );
+    }
+
+    /// P3：文件确实不存在视为加载完成，不反复重试。
+    #[test]
+    fn pending_retry_load_absent_marks_loaded() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("unread_pending_retries.json");
+        let loaded = AtomicBool::new(false);
+        let retries = Mutex::new(HashMap::new());
+        load_pending_unread_retries_into(&path, &loaded, &retries);
+        assert!(loaded.load(Ordering::Acquire));
+    }
+
+    /// 入口级保护：加载未完成时即使文件可读也不得覆盖；加载合并后再补写。
+    #[test]
+    fn pending_retry_persist_gate_waits_for_load_and_merges() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("unread_pending_retries.json");
+        let now = chrono::Utc::now().timestamp_millis();
+        let mut a = HashMap::new();
+        a.insert("workbuddy\u{1f}s1".to_string(), now);
+        std::fs::write(&path, serde_json::to_string(&a).unwrap()).unwrap();
+
+        let loaded = AtomicBool::new(false);
+        let dirty = AtomicBool::new(false);
+        let retries = Mutex::new(HashMap::from([(
+            ("codex".to_string(), "s2".to_string()),
+            now,
+        )]));
+        assert!(!persist_pending_unread_retries_into(
+            &path, &loaded, &dirty, &retries
+        ));
+        assert!(dirty.load(Ordering::Acquire));
+        assert_eq!(loaded_map(&path), Some(a)); // 磁盘旧项未被覆盖
+
+        load_pending_unread_retries_into(&path, &loaded, &retries);
+        assert!(loaded.load(Ordering::Acquire));
+        assert!(persist_pending_unread_retries_into(
+            &path, &loaded, &dirty, &retries
+        ));
+        assert!(!dirty.load(Ordering::Acquire));
+        let stored = loaded_map(&path).unwrap();
+        assert!(stored.contains_key("workbuddy\u{1f}s1"));
+        assert!(stored.contains_key("codex\u{1f}s2"));
+    }
+
+    /// 入口级保护：主文件暂时不可读（用目录模拟 I/O 错误）时，
+    /// `persist_pending_map` 必须拒绝覆盖；恢复可读后合并磁盘旧项与内存新增项再落盘。
+    #[test]
+    fn pending_retry_persist_blocks_when_primary_unreadable_and_merges_after_restore() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("unread_pending_retries.json");
+        std::fs::create_dir(&path).unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        let mut new_mark = HashMap::new();
+        new_mark.insert("codex\u{1f}s2".to_string(), now);
+
+        assert!(!persist_pending_map(&path, &new_mark));
+        assert!(path.is_dir());
+        assert!(!path.with_extension("json.tmp").exists());
+
+        // 恢复旧快照（A），内存里已有新标记（B）；加载后应合并再写回。
+        std::fs::remove_dir(&path).unwrap();
+        let mut old_mark = HashMap::new();
+        old_mark.insert("workbuddy\u{1f}s1".to_string(), now);
+        std::fs::write(&path, serde_json::to_string(&old_mark).unwrap()).unwrap();
+        let loaded = AtomicBool::new(false);
+        let retries = Mutex::new(HashMap::from([(
+            ("codex".to_string(), "s2".to_string()),
+            now,
+        )]));
+        load_pending_unread_retries_into(&path, &loaded, &retries);
+        assert!(loaded.load(Ordering::Acquire));
+        let merged: HashMap<String, i64> = retries
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|((tool, sid), since)| (pending_key(tool, sid), *since))
+            .collect();
+        assert_eq!(merged.len(), 2);
+        assert!(persist_pending_map(&path, &merged));
+        let stored = loaded_map(&path).unwrap();
+        assert!(stored.contains_key("workbuddy\u{1f}s1"));
+        assert!(stored.contains_key("codex\u{1f}s2"));
+    }
+
+    /// 入口级保护（真实权限故障）：主文件不可读时，B 的持久化不得覆盖含 A 的旧文件；
+    /// 权限恢复后 A 与内存 B 合并写回。
+    #[cfg(unix)]
+    #[test]
+    fn pending_retry_persist_does_not_overwrite_unreadable_primary() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("unread_pending_retries.json");
+        let now = chrono::Utc::now().timestamp_millis();
+        let mut a = HashMap::new();
+        a.insert("workbuddy\u{1f}s1".to_string(), now);
+        std::fs::write(&path, serde_json::to_string(&a).unwrap()).unwrap();
+
+        let original = std::fs::metadata(&path).unwrap().permissions();
+        let mut locked = original.clone();
+        locked.set_mode(0o000);
+        std::fs::set_permissions(&path, locked).unwrap();
+        if std::fs::read_to_string(&path).is_ok() {
+            // root/ACL 环境无法用权限模拟读取失败，跳过本用例。
+            std::fs::set_permissions(&path, original).unwrap();
+            return;
+        }
+
+        let mut b = HashMap::new();
+        b.insert("codex\u{1f}s2".to_string(), now);
+        assert!(!persist_pending_map(&path, &b));
+        assert!(!path.with_extension("json.tmp").exists());
+
+        std::fs::set_permissions(&path, original).unwrap();
+        assert_eq!(loaded_map(&path), Some(a));
+
+        let loaded = AtomicBool::new(false);
+        let retries = Mutex::new(HashMap::from([(
+            ("codex".to_string(), "s2".to_string()),
+            now,
+        )]));
+        load_pending_unread_retries_into(&path, &loaded, &retries);
+        let merged: HashMap<String, i64> = retries
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|((tool, sid), since)| (pending_key(tool, sid), *since))
+            .collect();
+        assert_eq!(merged.len(), 2);
+        assert!(persist_pending_map(&path, &merged));
+        let stored = loaded_map(&path).unwrap();
+        assert!(stored.contains_key("workbuddy\u{1f}s1"));
+        assert!(stored.contains_key("codex\u{1f}s2"));
+    }
+
+    /// P1：已删会话的未读池行不得合并为卡；其他工具同 id 不受影响。
+    #[test]
+    fn deleted_workbuddy_pool_rows_are_not_merged_to_cards() {
+        let pool = vec![record("workbuddy", "s1"), record("codex", "s1")];
+        let deleted: std::collections::HashSet<String> = ["s1".to_string()].into_iter().collect();
+        let filtered = filter_deleted_unread(pool, &deleted);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].tool_id, "codex");
+    }
+
+    /// 第三轮 P1：DB-only completed → 已读墓碑 → 下一轮扫描不得再出普通卡；
+    /// 有新活动（last_activity 晚于墓碑）时必须保留。
+    #[test]
+    fn read_completed_db_only_card_is_dropped_until_new_activity() {
+        let read_at = 1_793_000_000_000i64;
+        let mut card = active_card(AgentType::WorkBuddy, "s1");
+        card.pid = 0;
+        card.status = SessionStatus::Idle;
+        card.last_activity_at = chrono::DateTime::from_timestamp_millis(read_at - 1_000)
+            .unwrap()
+            .to_rfc3339();
+
+        let mut active = vec![card.clone()];
+        retain_read_completed_cards(&mut active, &|_| Some(read_at));
+        assert!(active.is_empty(), "已读且无新工作 → 完成卡应消失");
+
+        card.last_activity_at = chrono::DateTime::from_timestamp_millis(read_at + 1)
+            .unwrap()
+            .to_rfc3339();
+        let mut active = vec![card.clone()];
+        retain_read_completed_cards(&mut active, &|_| Some(read_at));
+        assert_eq!(active.len(), 1, "墓碑之后有新工作 → 保留卡片");
+
+        card.pid = 42;
+        let mut active = vec![card];
+        retain_read_completed_cards(&mut active, &|_| Some(read_at));
+        assert_eq!(active.len(), 1, "有真实心跳 pid 的卡不按 DB-only 规则剔除");
+    }
+
+    /// P1：WorkBuddy DB-only completed 卡（pid=0）池里有未读行时，必须标 unread；
+    /// 有心跳 pid 的卡不能被池行提前染色。
+    #[test]
+    fn workbuddy_db_only_idle_card_with_pool_is_marked_unread() {
+        let mut active = vec![active_card(AgentType::WorkBuddy, "s1")];
+        active[0].pid = 0;
+        active[0].status = SessionStatus::Idle;
+        let pool = vec![record("workbuddy", "s1")];
+        mark_active_unread_cards(&mut active, &pool);
+        assert!(active[0].unread, "DB-only completed 卡必须呈现未读");
+        assert!(
+            build_unread_cards(&pool, &active, &|_| true).is_empty(),
+            "active 已标 unread 时不得再追加同会话池卡"
+        );
+
+        let mut heartbeat_card = vec![active_card(AgentType::WorkBuddy, "s1")];
+        heartbeat_card[0].pid = 42;
+        heartbeat_card[0].status = SessionStatus::Idle;
+        mark_active_unread_cards(&mut heartbeat_card, &pool);
+        assert!(!heartbeat_card[0].unread, "有心跳 pid 的卡不因池行提前染色");
     }
 
     #[test]

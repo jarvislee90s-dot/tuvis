@@ -16,6 +16,15 @@ pub(crate) fn read_recent_lines(path: &Path, max_lines: usize) -> Vec<String> {
     read_recent_lines_with_budget(path, max_lines, TAIL_BYTES).0
 }
 
+/// 尾部读取的**可失败**版本：文件缺失/不可读/行读取失败都返回 Err。
+/// 补偿用它区分“空文件/非完成态”与“读失败”，读失败时保留观测重试。
+pub(crate) fn read_recent_lines_result(
+    path: &Path,
+    max_lines: usize,
+) -> std::io::Result<Vec<String>> {
+    read_tail_lines(path, max_lines, TAIL_BYTES).map(|(lines, _)| lines)
+}
+
 /// 带字节预算的尾部读取（Bug 1，M3 验收）：返回 (行集, 头部是否被截断)。
 /// 内容层按需单会话读取以 `512KB×⌈limit/200⌉` 放大窗，据此向移动端发 truncated
 /// 信号（「加载更早消息」可达性）；轮询路径解析器仍走 read_recent_lines（512KB
@@ -25,23 +34,38 @@ pub(crate) fn read_recent_lines_with_budget(
     max_lines: usize,
     max_bytes: u64,
 ) -> (Vec<String>, bool) {
-    let Ok(file) = File::open(path) else {
-        return (Vec::new(), false);
-    };
-    let Ok(file_size) = file.metadata().map(|m| m.len()) else {
-        return (Vec::new(), false);
-    };
+    read_tail_lines(path, max_lines, max_bytes).unwrap_or_default()
+}
+
+/// 字节级尾部读取：截断点可能落在多字节 UTF-8 字符中间，**不能用
+/// `read_line(&mut String)`**（会因无效 UTF-8 拒绝整个合法文件）。
+/// 先用 `read_until(b'\n')` 按字节丢弃截断残行，再把完整行做 lossy 解码。
+fn read_tail_lines(
+    path: &Path,
+    max_lines: usize,
+    max_bytes: u64,
+) -> std::io::Result<(Vec<String>, bool)> {
+    let file = File::open(path)?;
+    let file_size = file.metadata()?.len();
     let truncated = file_size > max_bytes;
     let mut reader = BufReader::new(file);
     if truncated {
-        let _ = reader.seek(SeekFrom::End(-(max_bytes as i64)));
-        let mut partial = String::new();
-        let _ = reader.read_line(&mut partial);
+        reader.seek(SeekFrom::End(-(max_bytes as i64)))?;
+        let mut discard = Vec::new();
+        reader.read_until(b'\n', &mut discard)?;
     }
-
-    let lines: Vec<String> = reader.lines().map_while(Result::ok).collect();
+    let mut lines = Vec::new();
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        if reader.read_until(b'\n', &mut buf)? == 0 {
+            break;
+        }
+        let text = String::from_utf8_lossy(&buf);
+        lines.push(text.trim_end_matches(['\n', '\r']).to_string());
+    }
     let start = lines.len().saturating_sub(max_lines);
-    (lines[start..].to_vec(), truncated)
+    Ok((lines[start..].to_vec(), truncated))
 }
 
 /// 读取 JSONL 文件头部最多 max_lines 行（按文件顺序返回）。
@@ -147,5 +171,38 @@ mod tests {
         assert_eq!(read_first_lines(&path, 10).len(), 4);
         // 文件缺失 → 空集（不 panic）
         assert!(read_first_lines(&dir.path().join("missing.jsonl"), 5).is_empty());
+    }
+
+    /// 512KB 尾部窗口起点落在多字节 UTF-8 字符中间时，合法长 JSONL 仍必须可读。
+    #[test]
+    fn tail_reader_tolerates_utf8_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("session.jsonl");
+        let head = "{\"type\":\"reasoning\",\"content\":\"";
+        let tail_line =
+            "{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"完成\"}]}\n";
+        let mut chosen = None;
+        for pad in 0..3 {
+            let mut content = String::new();
+            content.push_str(head);
+            content.push_str(&"中".repeat(220_000));
+            content.push_str(&"a".repeat(pad));
+            content.push_str("\"}\n");
+            let line1_end = content.len();
+            content.push_str(tail_line);
+            let start = content.len() - TAIL_BYTES as usize;
+            if start < line1_end && content.as_bytes()[start] & 0xC0 == 0x80 {
+                chosen = Some(content);
+                break;
+            }
+        }
+        let content = chosen.expect("应能构造出 UTF-8 字符中间的截断点");
+        fs::write(&p, content).unwrap();
+
+        let lines = read_recent_lines_result(&p, 500).unwrap();
+        assert!(
+            lines.iter().any(|l| l.contains("完成")),
+            "截断点落在 UTF-8 中间时仍应读出最后的完成行: {lines:?}"
+        );
     }
 }

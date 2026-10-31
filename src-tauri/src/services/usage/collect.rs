@@ -2067,6 +2067,18 @@ mod tests {
     ///     新增 `v2/time_price.rs`（窗口校验/时区换算/峰谷判定，含测试排除区）；
     ///     其余变化来自 `v2/pricing.rs` 的自定义规则/精选精简、`v2/cost_query.rs` 的
     ///     小时取数与分时费用字段、`v2/model.rs` 的新 wire 类型。
+    ///
+    /// **第 49 轮同步（2026-10-30 WorkBuddy 5.9.3 子代理入账 + 看板在场判据）**：
+    /// 13936/312799 → **14195/317323**（首次 14176/316773；评审修复 I4 后 +18/+423；
+    /// 评审后简化/心跳扫描合并再 +1 行 / +127 字符；P2 兼容性修复再 +17 字符；第四轮 P2.1/P2.2/P2.3 再 +23 行 / +413 字符）。
+    /// **扫描面只含 `services/usage/**`**（`USAGE_SOURCES` 决定），
+    /// `monitor/workbuddy_parser.rs` / `monitor/host.rs` 的看板改动**不在面内**；本轮的
+    /// 全部增量来自生产半边：
+    ///   * `services/usage/collectors/workbuddy.rs`：`collect_file` 抽取、子代理目录枚举、
+    ///     身份解析（`resolve_subagent_session_id`）与 `WbState.subagent_session_id`、
+    ///     rescan 可观测 warn（I4）、`row_cwd_first` 显式化；
+    ///   * `services/usage/caps.rs`：仅注释（5.9.3 子代理独立入账不改口径）。
+    ///     新增测试全部落在 BEGIN..END 排除区内 ⇒ 不进面；文件数仍为 37、分类与排除区标记均未动。
     #[test]
     fn scan_face_size_is_pinned() {
         let (mut lines, mut chars) = (0usize, 0usize);
@@ -2077,7 +2089,7 @@ mod tests {
         }
         assert_eq!(
             (lines, chars),
-            (13936, 312799),
+            (14218, 317753),
             "判据面尺寸变了（实测 {lines} 行 / {chars} 字符）：本用例是**声明 = 实际**的钉子——\
              先弄清面为什么变（新增文件？改了排除区标记？动了生产代码？），再同步本常量、\
              `no_source_timezone_is_fed_into_any_key_function` 的锁注释、`KNOWN-PLAN-DEFECTS.md` \

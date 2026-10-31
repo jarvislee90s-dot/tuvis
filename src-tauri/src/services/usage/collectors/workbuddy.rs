@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::{file_key_of, file_read_failure_is_benign, DeltaBuilder, PendingTools};
-use crate::monitor::workbuddy_parser::find_session_jsonl;
+use crate::monitor::workbuddy_parser::{find_session_jsonl, is_strict_uuid_form};
 use crate::services::usage::collect::{CollectContext, UsageCollector};
 use crate::services::usage::delta::{DetailKey, SourceDelta};
 use crate::services::usage::error::UsageError;
@@ -115,6 +115,7 @@ fn process_line(
     v: &Value,
     session_id: &str,
     cwd: &str,
+    row_cwd_first: bool,
     now_ms: i64,
 ) -> bool {
     let ts = v
@@ -147,9 +148,20 @@ fn process_line(
         session_id: session_id.to_string(),
         hour_key: hour.clone(),
         day_key: hour.chars().take(10).collect(),
-        // 记录级项目键：workbuddy 的归属来自 DB `sessions.cwd`（精确；目录名不可反解）。
-        // 真机复核：266/266 行的行内 `cwd` 与 `sessions.cwd` 逐字相等 → 两者取值等价。
-        project_key: project_key_of(Some(cwd)),
+        // 记录级项目键：父会话的归属来自 DB `sessions.cwd`（精确；目录名不可反解）。
+        // 真机复核：266/266 行的行内 `cwd` 与 `sessions.cwd` 逐字相等 → 两者取值等价，
+        // 因此**父会话维持 DB cwd**（零行为变化，R3 主会话数值不变）。
+        // 子代理文件（`row_cwd_first = true`）优先取**行内** `cwd`：子代理可能跑在别的项目下，
+        // 归属必须按行走；行内缺失时回退父会话 cwd（设计 §2.6）。
+        project_key: project_key_of(Some(if row_cwd_first {
+            v.get("cwd")
+                .and_then(|c| c.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or(cwd)
+        } else {
+            cwd
+        })),
         model,
         provider,
     };
@@ -252,6 +264,7 @@ fn replay_pending(
     state: &mut WbState,
     session_id: &str,
     cwd: &str,
+    row_cwd_first: bool,
     now_ms: i64,
 ) -> i64 {
     let mut unattributed = 0i64;
@@ -259,7 +272,7 @@ fn replay_pending(
         // 进缓存的行一定在主循环解析成功过 → 这里的 Err 理论上不可达（真发生即计数，不静默）
         match serde_json::from_str::<Value>(&line) {
             Ok(v) => {
-                if !process_line(b, state, &v, session_id, cwd, now_ms) {
+                if !process_line(b, state, &v, session_id, cwd, row_cwd_first, now_ms) {
                     unattributed += 1;
                 }
             }
@@ -306,149 +319,491 @@ pub fn collect_with_home(
     let rules = ctx.provider_rules();
     let mut b = DeltaBuilder::new(UsageSourceId::WorkBuddy, rules);
     let root = home.join(".workbuddy");
+    // **自指/串号防线（设计 §2.3 第 4 条 + 风险表）**：子代理身份解析结果不得等于**任何**
+    // DB 主会话 id（不只父 id）——一旦解析成另一个主会话，`usage_session.is_subagent` 会被
+    // `MAX()` 不可逆地写成 1，那个主会话就从会话数/turn 层消失。只含 id、只在首次读某子代理
+    // 文件时比较一次（HashSet，O(1)），不构成热路径开销。
+    let main_session_ids: std::collections::HashSet<String> =
+        sessions.iter().map(|(id, _, _)| id.clone()).collect();
     for (id, cwd, title) in sessions {
         let Some(jsonl) = find_session_jsonl(home, &cwd, &id) else {
             continue;
         };
         // 游标键 = **相对 `~/.workbuddy` 的路径**（B5：唯一性由路径给，不由文件名给）
         let file_key = file_key_of(&root, &jsonl);
-        let read = match ctx.read_incremental(&jsonl, &file_key) {
-            Ok(r) => r,
-            Err(e) => {
-                // **W-06 / D-24**：只有「枚举与读取之间的轮转竞态」（文件已消失）才允许跳过；
-                // 其余读失败（权限 / IO / mtime 不可得）必须整源响亮失败 → `UsageSourceStatus.errorCode`，
-                // 不得只 `log::warn!` 然后静默少算。
-                if file_read_failure_is_benign(&jsonl, &e) {
-                    log::warn!(
-                        "usage/workbuddy: 读取 {} 失败（文件已消失，跳过本轮）: {}",
-                        jsonl.display(),
-                        e
-                    );
-                    continue;
-                }
-                return Err(UsageError::new(
-                    "usage-source-io",
-                    format!("read {} failed: {e}", jsonl.display()),
-                ));
-            }
+        // 父会话维度：`is_subagent = false`、`parent = None`、`title = DB 标题`（与改动前逐字一致）
+        collect_file(
+            ctx,
+            &mut b,
+            &jsonl,
+            &file_key,
+            &id,
+            &cwd,
+            title,
+            false,
+            None,
+            &main_session_ids,
+        )?;
+        // R1：同一会话目录下的子代理转写（5.9.3 起为 `<parent>/subagents/*.jsonl`），
+        // 独立游标、独立会话维度（`is_subagent = 1` + `parent_session_id`）。
+        // 父会话游标完全不动 → 不重读父文件。
+        collect_subagents(ctx, &mut b, &root, &jsonl, &id, &cwd, &main_session_ids)?;
+    }
+    Ok(b.finish())
+}
+
+/// 子代理文件头部扫描上限（身份解析）：**64 KiB 或 200 行，取先到者**。
+/// 真机 5.9.3 的 `sessionId` 出现在首条 message 行，远在上限之内；上限只为防「异常文件
+/// 无 sessionId」时把整个 25.9 MB 前缀读一遍。
+const SUBAGENT_HEAD_BYTES: u64 = 64 * 1024;
+const SUBAGENT_HEAD_LINES: usize = 200;
+
+/// 读文件头部若干完整行（`max_bytes` 或 `max_lines`，先到者）。
+/// 截断点可能切在行中间 → 只在最后一个 `\n` 处切；整文件读完时按原样切行。
+/// 读失败 → 空表（身份解析随即走 stem 兜底；真正的读失败由 `read_incremental` 响亮上报，
+/// 这里不再重复报错——否则同一故障会被报两次、且此处无法区分是「消失」还是「读不了」）。
+fn read_head_lines(path: &std::path::Path, max_bytes: u64, max_lines: usize) -> Vec<String> {
+    use std::io::Read;
+    let Ok(file) = std::fs::File::open(path) else {
+        return Vec::new();
+    };
+    let mut buf = Vec::new();
+    if file.take(max_bytes).read_to_end(&mut buf).is_err() {
+        return Vec::new();
+    }
+    let truncated = buf.len() as u64 >= max_bytes;
+    let end = if truncated {
+        buf.iter().rposition(|b| *b == b'\n').map_or(0, |p| p + 1)
+    } else {
+        buf.len()
+    };
+    String::from_utf8_lossy(&buf[..end])
+        .lines()
+        .filter(|l| !l.is_empty())
+        .take(max_lines)
+        .map(str::to_string)
+        .collect()
+}
+
+/// 解析子代理会话身份（设计 §2.3）：返回 `(会话 id, 是否降级)`。
+///
+/// 判据顺序：
+/// 1. **优先**「`providerData.isSubAgent == true` 且 `sessionId` 通过严格 UUID」的第一行
+///    ——真机 5.9.3 的 assistant / function_call 行带这个标记，首条 user 行可能没有；
+/// 2. 否则取任何通过严格 UUID 的第一行 `sessionId`；
+/// 3. **自指/串号拒绝**：结果等于父会话 id，或等于**任何** DB 主会话 id → 拒绝，回退文件名
+///    stem（`agent-<agentId>`）并 warn。`usage_session.is_subagent` 是 `MAX()` 只升不降，
+///    误标一次就永远改不回来，宁可降级也不能串号；
+/// 4. 完全没有 UUID → 文件名 stem + warn（stem 仍是稳定唯一键，**不丢用量**）。
+fn resolve_subagent_session_id(
+    path: &std::path::Path,
+    parent_id: &str,
+    main_session_ids: &std::collections::HashSet<String>,
+) -> (String, bool) {
+    let mut preferred: Option<String> = None;
+    let mut fallback: Option<String> = None;
+    for line in read_head_lines(path, SUBAGENT_HEAD_BYTES, SUBAGENT_HEAD_LINES) {
+        let Ok(v) = serde_json::from_str::<Value>(&line) else {
+            continue; // 坏行单行跳过（与行循环同口径）
         };
-        if read.lines.is_empty() && !read.rescan {
-            // 未变文件（L2 快速路）：游标原样推回，**不计 parsed_files**（W-50：本字段的口径是
-            // 「本轮**真读到**的文件数」——与 claude / codex / kimi 一致，未变更文件在读之前就退出了）
-            b.push_cursor(read.next);
+        let Some(sid) = v.get("sessionId").and_then(|s| s.as_str()) else {
+            continue;
+        };
+        if !is_strict_uuid_form(sid) {
             continue;
         }
-        let mut state: WbState = if read.rescan {
-            // 截断/重写：续读状态随文件代际一起重置（旧状态里的未配对调用指向的行已经不在了）
-            WbState::default()
-        } else {
-            // **游标必须被读**：增量读从文件中段开始时，上一轮发起的工具调用还在等回执，
-            // 只写不读 → 第二轮的 `open` 是空表 → 跨轮回执永远配不上（静默少算）。
-            // **解析失败不得静默重置**（形状演进时旧游标会连 `tools` / `last_model` 一起丢：
-            // 表现为 `tool_ms` 少算 + 模型继承失效，且没有任何信号）→ warn + 按 rescan 语义处理
-            // （重置本身语义等价，但它现在**可见**了）。
-            match ctx.cursor_of(&file_key) {
-                Some(p) => match serde_json::from_str::<WbState>(&p.state_json) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        log::warn!(
+        let is_sub = v
+            .pointer("/providerData/isSubAgent")
+            .and_then(|b| b.as_bool())
+            .unwrap_or(false);
+        if is_sub {
+            preferred = Some(sid.to_string());
+            break;
+        }
+        if fallback.is_none() {
+            fallback = Some(sid.to_string());
+        }
+    }
+    let stem = || {
+        path.file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "unknown-subagent".to_string())
+    };
+    match preferred.or(fallback) {
+        Some(id) if id == parent_id || main_session_ids.contains(&id) => {
+            log::warn!(
+                "usage/workbuddy: 子代理文件 {} 的 sessionId {id} 命中主会话 id（父 {parent_id}）\
+                 ——拒绝该身份，回退文件名 stem「{}」（否则会把主会话不可逆地标成子代理）",
+                path.display(),
+                stem()
+            );
+            (stem(), true)
+        }
+        Some(id) => (id, false),
+        None => (
+            // 降级本身由调用方 warn（这里返回标志位，保持「一处日志」）
+            stem(),
+            true,
+        ),
+    }
+}
+
+/// **单文件采集（唯一实现）**：父会话 jsonl 与子代理 jsonl 走同一遍扫描。
+/// 抽出来的目的（R1）：子代理文件与父会话同形（用量在 `message.usage`、模型在
+/// `providerData.model`、工具配对靠 `callId`），**口径必须逐字同源**——各写一份必然漂移。
+///
+/// 参数语义（与设计 §2.5 的表格对齐）：
+/// * 父会话：`session_id` = DB 主会话 id、`title` = DB 标题、`is_subagent = false`、`parent = None`
+/// * 子代理：`session_id` = 自身会话 id（A2 起由文件头解析）、`title = None`、
+///   `is_subagent = true`、`parent = Some(父会话 id)`
+///
+/// 本轮真读了该文件时 `parsed_files` 已在内部累加；未变更文件（L2 快速路）直接返回。
+#[allow(clippy::too_many_arguments)]
+fn collect_file(
+    ctx: &CollectContext<'_>,
+    b: &mut DeltaBuilder,
+    jsonl: &std::path::Path,
+    file_key: &str,
+    session_id: &str,
+    cwd: &str,
+    title: Option<String>,
+    is_subagent: bool,
+    parent_session_id: Option<String>,
+    main_session_ids: &std::collections::HashSet<String>,
+) -> Result<(), UsageError> {
+    let read = match ctx.read_incremental(jsonl, file_key) {
+        Ok(r) => r,
+        Err(e) => {
+            // **W-06 / D-24**：只有「枚举与读取之间的轮转竞态」（文件已消失）才允许跳过；
+            // 其余读失败（权限 / IO / mtime 不可得）必须整源响亮失败 → `UsageSourceStatus.errorCode`，
+            // 不得只 `log::warn!` 然后静默少算。
+            if file_read_failure_is_benign(jsonl, &e) {
+                log::warn!(
+                    "usage/workbuddy: 读取 {} 失败（文件已消失，跳过本轮）: {}",
+                    jsonl.display(),
+                    e
+                );
+                return Ok(());
+            }
+            return Err(UsageError::new(
+                "usage-source-io",
+                format!("read {} failed: {e}", jsonl.display()),
+            ));
+        }
+    };
+    if read.lines.is_empty() && !read.rescan {
+        // 未变文件（L2 快速路）：游标原样推回，**不计 parsed_files**（W-50：本字段的口径是
+        // 「本轮**真读到**的文件数」——与 claude / codex / kimi 一致，未变更文件在读之前就退出了）
+        b.push_cursor(read.next);
+        return Ok(());
+    }
+    let mut state: WbState = if read.rescan {
+        // 截断/重写：续读状态随文件代际一起重置（旧状态里的未配对调用指向的行已经不在了）
+        //
+        // **可观测性（评审 I4）**：`usage_detail` / `usage_daily` 是**加法账本**，
+        // 已被计过账的前缀从 0 重读会**重复计入**（子代理文件截断/重写即此风险；
+        // 不写成“UPSERT 幂等”）。行为不变，但必须留下运行期信号：
+        // 有旧游标 = 真的截断/重写（warn）；无旧游标 = 首读/回填（debug，预期路径）。
+        match ctx.cursor_of(file_key) {
+            Some(prev) => log::warn!(
+                "usage/workbuddy: {} 触发 rescan（截断/重写）：prev_byte_offset={} prev_file_size={} \
+                 new_file_size={} is_subagent={} —— 该文件已入账的用量会被**重复计入**（加法账本）",
+                jsonl.display(),
+                prev.byte_offset,
+                prev.file_size,
+                read.next.file_size,
+                is_subagent
+            ),
+            None => log::debug!(
+                "usage/workbuddy: {} 首次读取（从字节 0 回填）：file_size={} is_subagent={}",
+                jsonl.display(),
+                read.next.file_size,
+                is_subagent
+            ),
+        }
+        WbState::default()
+    } else {
+        // **游标必须被读**：增量读从文件中段开始时，上一轮发起的工具调用还在等回执，
+        // 只写不读 → 第二轮的 `open` 是空表 → 跨轮回执永远配不上（静默少算）。
+        // **解析失败不得静默重置**（形状演进时旧游标会连 `tools` / `last_model` 一起丢：
+        // 表现为 `tool_ms` 少算 + 模型继承失效，且没有任何信号）→ warn + 按 rescan 语义处理
+        // （重置本身语义等价，但它现在**可见**了）。
+        match ctx.cursor_of(file_key) {
+            Some(p) => match serde_json::from_str::<WbState>(&p.state_json) {
+                Ok(s) => s,
+                Err(e) => {
+                    log::warn!(
                             "usage/workbuddy: {} 的游标状态反序列化失败（按 rescan 语义重置该文件续读状态）: {e}（state_json={:?}）",
                             jsonl.display(),
                             p.state_json
                         );
-                        WbState::default()
-                    }
-                },
-                None => WbState::default(),
-            }
-        };
-        // 「模型未知期间」的原始行（**按行缓存**，见 `process_line` 的文档；D-32 同款）
-        let mut pending: Vec<String> = Vec::new();
-        let mut dropped_no_model: i64 = 0;
-        // ---- 一遍扫描：四桶 + 工具 + 报错 全在这一轮里 ----
-        for line in &read.lines {
-            let Ok(v) = serde_json::from_str::<Value>(line) else {
-                continue; // 坏行单行丢弃，不影响同文件其余行
-            };
-            b.new_records += 1;
-            // 模型已就绪 → 先把缓存行按**原序**重放（它们都排在本行之前）
-            if !pending.is_empty() && !state.last_model.is_empty() {
-                let left = replay_pending(&mut pending, &mut b, &mut state, &id, &cwd, ctx.now_ms);
-                warn_unattributed(&jsonl, left);
-            }
-            if !process_line(&mut b, &mut state, &v, &id, &cwd, ctx.now_ms) {
-                if pending.len() < PENDING_LINES_CAP {
-                    pending.push(line.clone());
-                } else {
-                    if dropped_no_model == 0 {
-                        log::warn!(
-                            "usage/workbuddy: {} 的「模型未知」缓存超上限 {PENDING_LINES_CAP} 行，\
-                             超出部分丢弃（这些记录不入账）",
-                            jsonl.display()
-                        );
-                    }
-                    dropped_no_model += 1;
+                    WbState::default()
                 }
-            }
+            },
+            None => WbState::default(),
         }
-        // 收尾结算缓存行（**D-32 同款**，顺序不许颠倒：本文件解析出的模型 → 丢弃）：
-        // `state.last_model` 此刻可能已非空 —— 若本文件首条（也是唯一一条）带模型的行恰好落在
-        // **最后一行**，缓存就没机会在行循环里 inline 重放；漏掉这一步会把整段记录静默丢掉。
-        if !pending.is_empty() {
-            if state.last_model.is_empty() {
-                log::warn!(
-                    "usage/workbuddy: {} 有 {} 行产明细行的记录出现在任何带模型的行之前，且**整轮**\
-                     都拿不到模型 → 丢弃（不写 model=\"\" 行；B2 缺陷③ / D-32 同族）",
-                    jsonl.display(),
-                    pending.len()
-                );
-                state.dropped_no_model += pending.len() as i64;
-                pending.clear();
-            } else {
-                let left = replay_pending(&mut pending, &mut b, &mut state, &id, &cwd, ctx.now_ms);
-                warn_unattributed(&jsonl, left);
-            }
-        }
-        if dropped_no_model > 0 {
-            // 丢弃计数要有**可观测面**（不能只用来抑制重复 warn）：仓内无日志捕获设施（W-37），
-            // 故同时落进 `state_json`（有界、可断言、跨轮累计）。
-            state.dropped_no_model += dropped_no_model;
+    };
+    // **子代理身份解析放在这里**（设计 §2.5/§2.3）：必须在游标/WbState 加载**之后**——
+    // 命中 `state.subagent_session_id` 就零文件头重读，否则每轮都要扫 64 KiB 前缀。
+    // `rescan`（截断/重写）时 state 是 `default()`（该字段为空）→ 自动按新代际重新解析。
+    // **项目归属用哪个 cwd**：父/子共用 `process_line`，但归属口径不同——父会话沿用
+    // DB `sessions.cwd`（R3：主会话数值零变化），子代理优先取**行内** `cwd`（子代理可能
+    // 跑在别的项目下）。用独立布尔表达这个意图，别让 `is_subagent` 直接冒充 `row_cwd_first`
+    //（两者今天取值相同，但语义不是同一个概念）。
+    let row_cwd_first = is_subagent;
+    let resolved_id: String = if !is_subagent {
+        session_id.to_string()
+    } else if state.subagent_session_id.is_empty() {
+        let parent_id = parent_session_id.as_deref().unwrap_or_default();
+        let (sid, degraded) = resolve_subagent_session_id(jsonl, parent_id, main_session_ids);
+        if degraded {
             log::warn!(
+                "usage/workbuddy: 子代理文件 {} 的身份已降级为文件名 stem「{}」（父会话 {}）",
+                jsonl.display(),
+                sid,
+                parent_id
+            );
+        }
+        state.subagent_session_id = sid.clone();
+        sid
+    } else {
+        state.subagent_session_id.clone()
+    };
+    // 「模型未知期间」的原始行（**按行缓存**，见 `process_line` 的文档；D-32 同款）
+    let mut pending: Vec<String> = Vec::new();
+    let mut dropped_no_model: i64 = 0;
+    // ---- 一遍扫描：四桶 + 工具 + 报错 全在这一轮里 ----
+    for line in &read.lines {
+        let Ok(v) = serde_json::from_str::<Value>(line) else {
+            continue; // 坏行单行丢弃，不影响同文件其余行
+        };
+        b.new_records += 1;
+        // **P2.2**：本行若首次携带模型，先建立模型上下文再重放 pending——
+        // 否则「function_call(无模型) → function_call_result(首带模型)」会先 finish
+        // 后 start，工具耗时配不上。process_line 稍后仍会按同一值设置/继承。
+        if state.last_model.is_empty() {
+            if let Some(model) = v
+                .pointer("/providerData/model")
+                .and_then(|m| m.as_str())
+                .filter(|m| !m.is_empty())
+            {
+                state.last_model = model.to_string();
+            }
+        }
+        // 模型已就绪 → 先把缓存行按**原序**重放（它们都排在本行之前）
+        if !pending.is_empty() && !state.last_model.is_empty() {
+            let left = replay_pending(
+                &mut pending,
+                b,
+                &mut state,
+                &resolved_id,
+                cwd,
+                row_cwd_first,
+                ctx.now_ms,
+            );
+            warn_unattributed(jsonl, left);
+        }
+        if !process_line(
+            b,
+            &mut state,
+            &v,
+            &resolved_id,
+            cwd,
+            is_subagent,
+            ctx.now_ms,
+        ) {
+            if pending.len() < PENDING_LINES_CAP {
+                pending.push(line.clone());
+            } else {
+                if dropped_no_model == 0 {
+                    log::warn!(
+                        "usage/workbuddy: {} 的「模型未知」缓存超上限 {PENDING_LINES_CAP} 行，\
+                             超出部分丢弃（这些记录不入账）",
+                        jsonl.display()
+                    );
+                }
+                dropped_no_model += 1;
+            }
+        }
+    }
+    // 收尾结算缓存行（**D-32 同款**，顺序不许颠倒：本文件解析出的模型 → 丢弃）：
+    // `state.last_model` 此刻可能已非空 —— 若本文件首条（也是唯一一条）带模型的行恰好落在
+    // **最后一行**，缓存就没机会在行循环里 inline 重放；漏掉这一步会把整段记录静默丢掉。
+    if !pending.is_empty() {
+        if state.last_model.is_empty() {
+            log::warn!(
+                "usage/workbuddy: {} 有 {} 行产明细行的记录出现在任何带模型的行之前，且**整轮**\
+                     都拿不到模型 → 丢弃（不写 model=\"\" 行；B2 缺陷③ / D-32 同族）",
+                jsonl.display(),
+                pending.len()
+            );
+            state.dropped_no_model += pending.len() as i64;
+            pending.clear();
+        } else {
+            let left = replay_pending(
+                &mut pending,
+                b,
+                &mut state,
+                &resolved_id,
+                cwd,
+                is_subagent,
+                ctx.now_ms,
+            );
+            warn_unattributed(jsonl, left);
+        }
+    }
+    if dropped_no_model > 0 {
+        // 丢弃计数要有**可观测面**（不能只用来抑制重复 warn）：仓内无日志捕获设施（W-37），
+        // 故同时落进 `state_json`（有界、可断言、跨轮累计）。
+        state.dropped_no_model += dropped_no_model;
+        log::warn!(
                 "usage/workbuddy: {} 本轮因「模型未知」缓存超上限共丢弃 {dropped_no_model} 行（累计 {}）",
                 jsonl.display(),
                 state.dropped_no_model
             );
-        }
-        // **W-13 调用纪律**：`b.session(...)` 每会话**只调一次**（就在此处，循环之外）→
-        // `DeltaBuilder::session` 里那次 `record_project_for`（内含 `canonicalize`，本域唯一的
-        // 非纯函数）也就每会话一次；逐记录一律只走**零 FS** 的 `project_key_of(cwd)`（上面建 key 处）。
-        // 机械锁在共用层：`collectors::tests::record_project_is_called_once_per_session_not_per_record`。
-        // **本调用点拿不到独立的机械锁**（已用变异实证、如实登记）：`RECORD_PROJECT_CALLS` 只在
-        // `record_project_for` 里自增，采集器即使**逐记录直连** `project::record_project` 也数不着
-        // （mod.rs 的 W-13 注记已声明这半是「部分覆盖」），所以此处只做读码级核对——
-        // 评审请核这一行是否仍在循环外（真机 266 行，挂进循环就是 266 次 syscall）。
-        b.session(&id, Some(&cwd), title, false, None, None, ctx.now_ms);
-        // **W-50 口径**：`parsed_files` = 本轮**真读到**的文件数（走到了这里 = 真的读了）。
-        // 循环开头的 `find_session_jsonl(...) else { continue }`（没有 jsonl 的会话）与
-        // `read.lines.is_empty() && !read.rescan`（未变更文件）都在计数**之前**退出 →
-        // 未变更文件的第二轮计 0，与 claude / codex / kimi 同口径（不得改成逐会话累加）。
-        b.parsed_files += 1;
-        let mut next = read.next;
-        // 序列化失败**不得静默**：写空的 `state_json` 会让下一轮反序列化失败并重置续读状态
-        // （跨轮未配对调用与模型继承一起丢）→ warn（下一轮的 warn 会再报一次，两处都可见）
-        next.state_json = match serde_json::to_string(&state) {
-            Ok(s) => s,
-            Err(e) => {
-                log::warn!(
+    }
+    // **W-13 调用纪律**：`b.session(...)` 每会话**只调一次**（就在此处，循环之外）→
+    // `DeltaBuilder::session` 里那次 `record_project_for`（内含 `canonicalize`，本域唯一的
+    // 非纯函数）也就每会话一次；逐记录一律只走**零 FS** 的 `project_key_of(cwd)`（上面建 key 处）。
+    // 机械锁在共用层：`collectors::tests::record_project_is_called_once_per_session_not_per_record`。
+    // **本调用点拿不到独立的机械锁**（已用变异实证、如实登记）：`RECORD_PROJECT_CALLS` 只在
+    // `record_project_for` 里自增，采集器即使**逐记录直连** `project::record_project` 也数不着
+    // （mod.rs 的 W-13 注记已声明这半是「部分覆盖」），所以此处只做读码级核对——
+    // 评审请核这一行是否仍在循环外（真机 266 行，挂进循环就是 266 次 syscall）。
+    b.session(
+        &resolved_id,
+        Some(cwd),
+        title,
+        is_subagent,
+        parent_session_id,
+        None,
+        ctx.now_ms,
+    );
+    // **W-50 口径**：`parsed_files` = 本轮**真读到**的文件数（走到了这里 = 真的读了）。
+    // 调用方的 `find_session_jsonl(...) else { continue }`（没有 jsonl 的会话）与
+    // `read.lines.is_empty() && !read.rescan`（未变更文件）都在计数**之前**退出 →
+    // 未变更文件的第二轮计 0，与 claude / codex / kimi 同口径（不得改成逐会话累加）。
+    b.parsed_files += 1;
+    let mut next = read.next;
+    // 序列化失败**不得静默**：写空的 `state_json` 会让下一轮反序列化失败并重置续读状态
+    // （跨轮未配对调用与模型继承一起丢）→ warn（下一轮的 warn 会再报一次，两处都可见）
+    next.state_json = match serde_json::to_string(&state) {
+        Ok(s) => s,
+        Err(e) => {
+            log::warn!(
                     "usage/workbuddy: {} 的游标状态序列化失败（下一轮会按 rescan 语义重置该文件续读状态）: {e}",
                     jsonl.display()
                 );
-                String::new()
+            String::new()
+        }
+    };
+    b.push_cursor(next);
+    Ok(())
+}
+
+/// 枚举并采集父会话目录下的子代理转写（设计 §2.2）。
+///
+/// 路径只用**父 jsonl 的实际父目录**推导（不用 `mangle(cwd)` 重算）：`find_session_jsonl`
+/// 可能走目录扫描兜底，实际项目目录名与 `mangle(cwd)` 不同。
+///
+/// 错误语义（W-06 / D-24）：`NotFound` / `NotADirectory`（旧会话没有 `subagents/`，或该路径
+/// 被一个普通文件占住）→ 跳过；其余（权限 / IO）→ **整源 `usage-source-io`**，不得静默少算。
+fn collect_subagents(
+    ctx: &CollectContext<'_>,
+    b: &mut DeltaBuilder,
+    root: &std::path::Path,
+    main_jsonl: &std::path::Path,
+    parent_id: &str,
+    cwd: &str,
+    main_session_ids: &std::collections::HashSet<String>,
+) -> Result<(), UsageError> {
+    let Some(project_dir) = main_jsonl.parent() else {
+        return Ok(());
+    };
+    let sub_dir = project_dir.join(parent_id).join("subagents");
+    let entries = match std::fs::read_dir(&sub_dir) {
+        Ok(e) => e,
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            // 5.9.3 之前的会话目录里没有 subagents/（真机 10/24 及更早）
+            return Ok(());
+        }
+        Err(e) => {
+            return Err(UsageError::new(
+                "usage-source-io",
+                format!("read_dir {} failed: {e}", sub_dir.display()),
+            ))
+        }
+    };
+    let mut files: Vec<std::path::PathBuf> = Vec::new();
+    for entry in entries {
+        // 条目级错误不得静默（枚举到一半失败 = 这个目录读不了）；
+        // 仅 NotFound（目录在枚举中被清理/轮转）按预期竞态跳过。
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                return Err(UsageError::new(
+                    "usage-source-io",
+                    format!("read_dir {} failed: {e}", sub_dir.display()),
+                ))
             }
         };
-        b.push_cursor(next);
+        let path = entry.path();
+        // 只读**直接子文件**的 `*.jsonl`（不递归；`tool-results/` 等目录不进）；
+        // 文件名**不限定 `agent-` 前缀**，防上游命名演进。
+        // 先做便宜的扩展名判断，再用 read_dir 已缓存的 file_type（Unix 免费），避免
+        // 对每个非 jsonl 目录项额外 stat。
+        if !path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("jsonl"))
+        {
+            continue;
+        }
+        // file_type 失败不得当成“非文件”静默跳过：仅 NotFound（文件消失）
+        // 按轮转竞态跳过，其余 I/O 错误整源报错（W-06/D-24 同口径）。
+        let is_file = match entry.file_type() {
+            Ok(t) => t.is_file(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                return Err(UsageError::new(
+                    "usage-source-io",
+                    format!("file_type {} failed: {e}", path.display()),
+                ))
+            }
+        };
+        if !is_file {
+            continue;
+        }
+        files.push(path);
     }
-    Ok(b.finish())
+    // 稳定顺序：目录枚举顺序依文件系统而变，排序让「同一批数据两轮跑出同一份游标/明细序」
+    files.sort();
+    for file in files {
+        // 游标键与父 jsonl 同一规则（相对 `~/.workbuddy` 的路径）→ 与主会话游标互不覆盖
+        let file_key = file_key_of(root, &file);
+        // 首次出现（`ctx.cursor_of(file_key) == None`）→ `read_incremental` 从**字节 0** 读，
+        // 即 D1 裁决的历史回填；此后只读追加字节。
+        collect_file(
+            ctx,
+            b,
+            &file,
+            &file_key,
+            // 身份占位：真正的子代理 sessionId 在 collect_file 加载 WbState 之后解析（A2）
+            "",
+            cwd,
+            None,
+            true,
+            Some(parent_id.to_string()),
+            main_session_ids,
+        )?;
+    }
+    Ok(())
 }
 
 /// 会话枚举。**失败必须整源响亮失败**（评审裁决 A / plan-mandated）：`open_usage_db` 的探针
@@ -471,7 +826,7 @@ fn load_sessions(
     };
     let mut stmt = conn
         .prepare(
-            "SELECT id, cwd, COALESCE(NULLIF(custom_title,''), title) FROM sessions WHERE deleted_at IS NULL",
+            "SELECT id, cwd, COALESCE(NULLIF(custom_title,''), title) FROM sessions WHERE (deleted_at IS NULL OR deleted_at <= 0)",
         )
         .map_err(|e| io_err(&e))?;
     let rows = stmt
@@ -519,6 +874,10 @@ struct WbState {
     last_model: String,
     #[serde(default)]
     dropped_no_model: i64,
+    /// 子代理文件的会话身份（设计 §2.3 第 6 条）：首次解析后跨轮缓存，避免每轮重读头部 64 KiB。
+    /// 父会话文件恒为空串；`serde(default)` 让 5.9.3 之前写下的旧 `state_json` 仍可反序列化。
+    #[serde(default)]
+    subagent_session_id: String,
 }
 
 // ==== usage 自省锁：以下为排除区（测试代码），勿删勿复制 ====
@@ -1167,23 +1526,48 @@ mod tests {
         );
     }
 
-    /// **M1 就地锁（R3 / D17 计数分层）**：workbuddy 本机无子代理会话、也无子代理概念
-    /// → `is_subagent` 必须是 `false`。置真的后果**不可逆**：① Task 18 按 R3 **硬过滤**该位
-    /// → 整个源从会话数 / turn 层消失；② DAO 是 `MAX(is_subagent, excluded)` **只升不降**（W-31）。
+    /// **M1 就地锁（R3 / D17 计数分层），5.9.3 起修订为「父不是、子代理是」**：
+    /// 父会话 `is_subagent` 必须为 `false`（置真的后果**不可逆**：① Task 18 按 R3 **硬过滤**
+    /// 该位 → 父会话从会话数 / turn 层消失；② DAO 是 `MAX(is_subagent, excluded)` 只升不降）；
+    /// 子代理文件必须为 `true` 且带 `parent_session_id`（token 计入、会话数不计）。
     /// （peer 都有就地锁：`kimi.rs` / `codex.rs` / `claude.rs`。）
     #[test]
-    fn session_is_never_marked_as_a_subagent() {
+    fn parent_session_is_not_subagent_while_subagent_files_are() {
         let dir = tempfile::tempdir().unwrap();
         fixture(dir.path());
+        write_subagent_jsonl(
+            dir.path(),
+            "p-A",
+            "s1",
+            &format!("agent-{OTHER_UUID}.jsonl"),
+            &[
+                json!({"type":"function_call","name":"Read","timestamp":2000,"callId":"sc1",
+                     "cwd":"/p/A","sessionId":SUBAGENT_ID,
+                     "message":{"usage":{"input_tokens":10,"output_tokens":1,"total_tokens":11}},
+                     "providerData":{"model":"deepseek-v4.1-flash","isSubAgent":true}}),
+            ],
+        );
         let no_cursors = HashMap::new();
         let (delta, _) = run(dir.path(), &no_cursors);
-        assert_eq!(delta.sessions.len(), 1);
+        assert_eq!(delta.sessions.len(), 2, "父 + 1 子");
+        let parent = delta
+            .sessions
+            .iter()
+            .find(|s| s.session_id == "s1")
+            .unwrap();
         assert!(
-            !delta.sessions[0].is_subagent,
-            "workbuddy 无子代理会话：is_subagent 必须为 false（置真会被 Task 18 硬过滤且不可逆）"
+            !parent.is_subagent,
+            "父会话不得被子代理文件连坐：置真会被 Task 18 硬过滤且不可逆"
         );
         // 前提断言（防假绿）：会话维度真的产出了（否则上面那条恒真）
-        assert_eq!(delta.sessions[0].project_key, "a");
+        assert_eq!(parent.project_key, "a");
+        let child = delta
+            .sessions
+            .iter()
+            .find(|s| s.session_id == SUBAGENT_ID)
+            .expect("子代理会话维度必须在场");
+        assert!(child.is_subagent);
+        assert_eq!(child.parent_session_id.as_deref(), Some("s1"));
     }
 
     /// **裁决 A（plan-mandated）**：`sessions` 表不在（版本漂移 / 库损坏）→ 必须**整源 Err**。
@@ -1411,6 +1795,39 @@ mod tests {
         assert_eq!(d.counters.tool_ms, 500, "①② 按原序重放 → 回执照样配上");
     }
 
+    /// **P2.2**：首条带模型的行本身就是工具回执时，必须先建立模型上下文并重放
+    /// 之前的 function_call，再处理回执；否则 finish 先于 start，tool_ms 少算。
+    #[test]
+    fn first_model_on_tool_result_replays_call_before_finishing() {
+        let dir = tempfile::tempdir().unwrap();
+        make_db(dir.path(), &[("s1", "/p/A")]);
+        write_jsonl(
+            dir.path(),
+            "p-A",
+            "s1",
+            &[
+                json!({"type":"function_call","name":"Bash","timestamp":1000,"id":"r1",
+                       "callId":"call_1","cwd":"/p/A","sessionId":"s1",
+                       "providerData":{"agent":"cli"}}),
+                json!({"type":"function_call_result","id":"r2","callId":"call_1","timestamp":1700,
+                       "cwd":"/p/A","sessionId":"s1",
+                       "message":{"usage":{"input_tokens":10,"output_tokens":1,"total_tokens":11}},
+                       "providerData":{"model":"deepseek-v4.1-flash","agent":"cli"}}),
+            ],
+        );
+        let no_cursors = HashMap::new();
+        let (delta, _) = run(dir.path(), &no_cursors);
+        assert_eq!(delta.details.len(), 1);
+        let d = &delta.details[0];
+        assert_eq!(d.key.model, "deepseek-v4.1-flash");
+        assert_eq!(d.counters.tool_calls, 1);
+        assert_eq!(
+            d.counters.tool_ms, 700,
+            "回执先于重放时 finish 匹配不到 start → tool_ms 会少算"
+        );
+        assert_eq!(d.requests, 1);
+    }
+
     /// **裁决 C：整轮拿不到模型 → 丢弃 + 计数**（绝不写 `model=""` 行）。
     /// 计数要有可断言面：仓内无日志捕获设施（W-37），故 `dropped_no_model` 落进 `state_json`。
     #[test]
@@ -1443,6 +1860,710 @@ mod tests {
         assert!(
             state.contains("\"dropped_no_model\":2"),
             "丢弃必须**计数**且可断言：{state}"
+        );
+    }
+
+    // ---- A2：子代理身份解析（真机 5.9.3 形态：文件名 agent-<agentId> ≠ 行内 sessionId）----
+
+    /// 真机 5.9.3 样本的父/子会话 id（两者都是 UUID，但不同）
+    const PARENT_ID: &str = "d0de8a03-21a4-4782-a24f-f923a3dcaff5";
+    const SUBAGENT_ID: &str = "01a18a39-174c-7065-9d83-be2a4e76a0a0";
+    /// 行内另一个 UUID（首条 user 行可能带的是**别的** id——偏好判据必须能分辨出来）
+    const OTHER_UUID: &str = "9bf48a4f-6b1a-4f3c-9f27-1c5d2a7e8b90";
+
+    fn write_head_file(dir: &std::path::Path, name: &str, lines: &[Value]) -> std::path::PathBuf {
+        std::fs::create_dir_all(dir).unwrap();
+        let p = dir.join(name);
+        let body: String = lines
+            .iter()
+            .map(|l| format!("{}\n", serde_json::to_string(l).unwrap()))
+            .collect();
+        std::fs::write(&p, body).unwrap();
+        p
+    }
+
+    /// 真机 5.9.3 形态：文件名 `agent-<agentId>.jsonl`，行内 `sessionId` 是另一个 UUID；
+    /// 首条 user 行**没有** `isSubAgent`，assistant / function_call 行有 `isSubAgent: true`
+    #[test]
+    fn subagent_identity_prefers_inline_uuid_over_file_stem() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write_head_file(
+            dir.path(),
+            &format!("agent-{}.jsonl", OTHER_UUID),
+            &[
+                json!({"type":"message","role":"user","sessionId":OTHER_UUID,
+                       "cwd":"/p/A","timestamp":1}),
+                json!({"type":"message","role":"assistant","sessionId":SUBAGENT_ID,
+                       "providerData":{"isSubAgent":true,"model":"deepseek-v4.1-flash"}}),
+            ],
+        );
+        let (id, degraded) =
+            resolve_subagent_session_id(&p, PARENT_ID, &std::collections::HashSet::new());
+        assert_eq!(id, SUBAGENT_ID, "身份必须取行内 sessionId，不是文件名");
+        assert!(!degraded, "行内 UUID 可用 → 不得降级");
+        assert!(!id.contains("agent-"), "不得回退文件名 stem：{id}");
+    }
+
+    /// 整文件没有严格 UUID 的 `sessionId` → 文件名 stem 兜底（稳定唯一键），**仍入账**
+    #[test]
+    fn subagent_identity_falls_back_to_file_stem() {
+        let dir = tempfile::tempdir().unwrap();
+        let stem = format!("agent-{OTHER_UUID}");
+        let p = write_head_file(
+            dir.path(),
+            &format!("{stem}.jsonl"),
+            &[
+                json!({"type":"message","role":"user","sessionId":"not-a-uuid","timestamp":1}),
+                json!({"type":"function_call","name":"Bash","sessionId":"",
+                       "providerData":{"isSubAgent":true}}),
+            ],
+        );
+        let (id, degraded) =
+            resolve_subagent_session_id(&p, PARENT_ID, &std::collections::HashSet::new());
+        assert_eq!(id, stem, "没有 UUID → 回退文件名 stem");
+        assert!(degraded, "降级必须可见（调用方据此 warn）");
+    }
+
+    /// **防自指**：解析结果 == 父会话 id → 拒绝并回退 stem。
+    /// 放任的后果不可逆：父会话被 `MAX(is_subagent)` 永久标成子代理 → 从会话数/turn 层消失。
+    #[test]
+    fn subagent_identity_equal_to_parent_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let stem = format!("agent-{OTHER_UUID}");
+        let p = write_head_file(
+            dir.path(),
+            &format!("{stem}.jsonl"),
+            &[
+                json!({"type":"message","role":"assistant","sessionId":PARENT_ID,
+                     "providerData":{"isSubAgent":true}}),
+            ],
+        );
+        let (id, degraded) =
+            resolve_subagent_session_id(&p, PARENT_ID, &std::collections::HashSet::new());
+        assert_ne!(id, PARENT_ID, "不得把父会话 id 当成子代理身份");
+        assert_eq!(id, stem);
+        assert!(degraded);
+    }
+
+    /// **防串号**：结果不得等于**任何** DB 主会话 id（不只父 id）
+    #[test]
+    fn subagent_identity_equal_to_another_main_session_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let stem = format!("agent-{OTHER_UUID}");
+        let p = write_head_file(
+            dir.path(),
+            &format!("{stem}.jsonl"),
+            &[
+                json!({"type":"message","role":"assistant","sessionId":OTHER_UUID,
+                     "providerData":{"isSubAgent":true}}),
+            ],
+        );
+        let mains: std::collections::HashSet<String> =
+            [PARENT_ID.to_string(), OTHER_UUID.to_string()]
+                .into_iter()
+                .collect();
+        let (id, degraded) = resolve_subagent_session_id(&p, PARENT_ID, &mains);
+        assert_eq!(id, stem, "命中任一主会话 id 都必须拒绝");
+        assert!(degraded);
+    }
+
+    // ---- A3：子代理目录枚举与独立入账（真机 5.9.3 形态）----
+
+    /// 真机路径形态：`~/.workbuddy/projects/<mangled-cwd>/<parentSessionId>/subagents/<name>.jsonl`
+    fn write_subagent_jsonl(
+        home: &std::path::Path,
+        project_dir: &str,
+        parent_id: &str,
+        file_name: &str,
+        lines: &[Value],
+    ) -> std::path::PathBuf {
+        let dir = home
+            .join(".workbuddy/projects")
+            .join(project_dir)
+            .join(parent_id)
+            .join("subagents");
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join(file_name);
+        let body: String = lines
+            .iter()
+            .map(|l| format!("{}\n", serde_json::to_string(l).unwrap()))
+            .collect();
+        std::fs::write(&p, body).unwrap();
+        p
+    }
+
+    /// 父 + 2 个子代理文件：token 总量 = 三者之和；会话维度 = 1 父(false) + 2 子(true，父 id 正确)
+    #[test]
+    fn subagent_files_are_collected_as_separate_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        make_db(dir.path(), &[("s1", "/p/A")]);
+        write_jsonl(
+            dir.path(),
+            "p-A",
+            "s1",
+            &[
+                json!({"type":"function_call","name":"Bash","timestamp":1000,"callId":"c1",
+                     "cwd":"/p/A","sessionId":"s1",
+                     "message":{"usage":{"input_tokens":100,"output_tokens":10,"total_tokens":110}},
+                     "providerData":{"model":"deepseek-v4.1-flash"}}),
+            ],
+        );
+        write_subagent_jsonl(
+            dir.path(),
+            "p-A",
+            "s1",
+            &format!("agent-{OTHER_UUID}.jsonl"),
+            &[
+                json!({"type":"message","role":"user","timestamp":1500,"cwd":"/p/A",
+                       "sessionId":SUBAGENT_ID}),
+                json!({"type":"function_call","name":"Read","timestamp":2000,"callId":"sc1",
+                       "cwd":"/p/A","sessionId":SUBAGENT_ID,
+                       "message":{"usage":{"input_tokens":1000,"output_tokens":100,"total_tokens":1100}},
+                       "providerData":{"model":"deepseek-v4.1-flash","isSubAgent":true}}),
+            ],
+        );
+        write_subagent_jsonl(
+            dir.path(),
+            "p-A",
+            "s1",
+            "agent-second.jsonl",
+            &[
+                json!({"type":"function_call","name":"Bash","timestamp":2500,"callId":"sc2",
+                       "cwd":"/p/A","sessionId":OTHER_UUID,
+                       "message":{"usage":{"input_tokens":2000,"output_tokens":200,"total_tokens":2200}},
+                       "providerData":{"model":"deepseek-v4.1-flash","isSubAgent":true}}),
+            ],
+        );
+        let no_cursors = HashMap::new();
+        let (delta, _) = run(dir.path(), &no_cursors);
+
+        // token 总量 = 父 + 两个子代理
+        assert_eq!(
+            delta
+                .details
+                .iter()
+                .map(|d| d.buckets.input_fresh)
+                .sum::<i64>(),
+            3100,
+            "100(父) + 1000(子1) + 2000(子2)"
+        );
+        assert_eq!(
+            delta.details.iter().map(|d| d.buckets.output).sum::<i64>(),
+            310
+        );
+        assert_eq!(
+            delta.details.iter().map(|d| d.requests).sum::<i64>(),
+            3,
+            "一次 message.usage = 一次请求，父/子互不重复"
+        );
+        // 会话维度：1 父 + 2 子，归属正确
+        assert_eq!(delta.sessions.len(), 3, "父 + 2 子各一行会话维度");
+        let parent = delta
+            .sessions
+            .iter()
+            .find(|s| s.session_id == "s1")
+            .unwrap();
+        assert!(!parent.is_subagent, "父会话不得被子代理文件连坐");
+        assert!(parent.parent_session_id.is_none());
+        for sub in [SUBAGENT_ID, OTHER_UUID] {
+            let s = delta
+                .sessions
+                .iter()
+                .find(|s| s.session_id == sub)
+                .unwrap_or_else(|| panic!("缺少子代理会话维度 {sub}"));
+            assert!(s.is_subagent, "子代理会话必须 is_subagent=true");
+            assert_eq!(
+                s.parent_session_id.as_deref(),
+                Some("s1"),
+                "parent_session_id = 父会话 UUID"
+            );
+            assert!(s.title.is_none(), "子代理会话没有 DB 标题");
+        }
+        // 文件计数：父 + 2 子（W-50「本轮真读到的文件数」）
+        assert_eq!(delta.parsed_files, 3);
+        assert_eq!(delta.new_records, 1 + 2 + 1);
+    }
+
+    /// **旧会话（5.9.3 之前）没有 subagents 目录** → 跳过，不报错、零子代理产物
+    #[test]
+    fn missing_subagent_dir_is_not_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        make_db(dir.path(), &[("s1", "/p/A")]);
+        write_jsonl(
+            dir.path(),
+            "p-A",
+            "s1",
+            &[
+                json!({"type":"message","role":"assistant","timestamp":1000,"cwd":"/p/A",
+                     "sessionId":"s1","content":[{"type":"output_text","text":"ok"}],
+                     "message":{"usage":{"input_tokens":10,"output_tokens":1,"total_tokens":11}},
+                     "providerData":{"model":"deepseek-v4.1-flash"}}),
+            ],
+        );
+        let no_cursors = HashMap::new();
+        let (delta, _) = run(dir.path(), &no_cursors);
+        assert_eq!(delta.sessions.len(), 1);
+        assert_eq!(delta.parsed_files, 1);
+        assert_eq!(delta.details.iter().map(|d| d.requests).sum::<i64>(), 1);
+    }
+
+    /// `subagents` 路径被一个**普通文件**占住（真机证据：macOS `read_dir` 返回
+    /// `NotADirectory`，raw_os_error=20）→ 与「目录不存在」同族，跳过而非整源失败
+    #[test]
+    fn subagent_path_that_is_a_file_is_not_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        make_db(dir.path(), &[("s1", "/p/A")]);
+        write_jsonl(
+            dir.path(),
+            "p-A",
+            "s1",
+            &[
+                json!({"type":"message","role":"assistant","timestamp":1000,"cwd":"/p/A",
+                     "sessionId":"s1","content":[{"type":"output_text","text":"ok"}],
+                     "message":{"usage":{"input_tokens":10,"output_tokens":1,"total_tokens":11}},
+                     "providerData":{"model":"deepseek-v4.1-flash"}}),
+            ],
+        );
+        let blocked = dir.path().join(".workbuddy/projects/p-A/s1/subagents");
+        std::fs::create_dir_all(blocked.parent().unwrap()).unwrap();
+        std::fs::write(&blocked, "not a dir").unwrap();
+        let no_cursors = HashMap::new();
+        let (delta, _) = run(dir.path(), &no_cursors);
+        assert_eq!(delta.sessions.len(), 1);
+        assert_eq!(delta.parsed_files, 1);
+    }
+
+    // ---- A5：错误与边界（W-06 / D-24：只有「读前消失」可跳过）----
+
+    /// 子代理目录**不可读**（权限）→ 整源 `usage-source-io`，不得静默少算。
+    /// 构造：`chmod 000`（非 root 下 `read_dir` 必然 EACCES）。跨平台不可伪：Windows 无该语义，
+    /// 故只在 unix 跑。
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_subagent_dir_fails_loudly() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        make_db(dir.path(), &[("s1", "/p/A")]);
+        write_jsonl(
+            dir.path(),
+            "p-A",
+            "s1",
+            &[
+                json!({"type":"message","role":"assistant","timestamp":1000,"cwd":"/p/A",
+                     "sessionId":"s1","content":[{"type":"output_text","text":"ok"}],
+                     "message":{"usage":{"input_tokens":10,"output_tokens":1,"total_tokens":11}},
+                     "providerData":{"model":"deepseek-v4.1-flash"}}),
+            ],
+        );
+        let sub_dir = dir.path().join(".workbuddy/projects/p-A/s1/subagents");
+        std::fs::create_dir_all(&sub_dir).unwrap();
+        std::fs::set_permissions(&sub_dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let no_cursors = HashMap::new();
+        let ctx = CollectContext::new(dir.path(), 1_700_000_000_000, &no_cursors);
+        let err = collect_with_home(&ctx, dir.path())
+            .expect_err("子代理目录不可读 → 整源报错（W-06：不得静默少算）");
+        // 复原权限，否则 tempdir 清理失败
+        std::fs::set_permissions(&sub_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(err.code, "usage-source-io");
+        assert!(
+            err.detail.contains("subagents"),
+            "错误里要能定位到目录：{}",
+            err.detail
+        );
+    }
+
+    /// 单个子代理文件**不可读**（权限）→ 整源 `usage-source-io`（只有「读前消失」才可跳过）
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_subagent_file_fails_loudly() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        make_db(dir.path(), &[("s1", "/p/A")]);
+        write_jsonl(
+            dir.path(),
+            "p-A",
+            "s1",
+            &[
+                json!({"type":"message","role":"assistant","timestamp":1000,"cwd":"/p/A",
+                     "sessionId":"s1","content":[{"type":"output_text","text":"ok"}],
+                     "message":{"usage":{"input_tokens":10,"output_tokens":1,"total_tokens":11}},
+                     "providerData":{"model":"deepseek-v4.1-flash"}}),
+            ],
+        );
+        let p = write_subagent_jsonl(
+            dir.path(),
+            "p-A",
+            "s1",
+            &format!("agent-{OTHER_UUID}.jsonl"),
+            &[
+                json!({"type":"function_call","name":"Bash","timestamp":2000,"callId":"sc1",
+                     "cwd":"/p/A","sessionId":SUBAGENT_ID,
+                     "message":{"usage":{"input_tokens":10,"output_tokens":1,"total_tokens":11}},
+                     "providerData":{"model":"deepseek-v4.1-flash","isSubAgent":true}}),
+            ],
+        );
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let no_cursors = HashMap::new();
+        let ctx = CollectContext::new(dir.path(), 1_700_000_000_000, &no_cursors);
+        let err =
+            collect_with_home(&ctx, dir.path()).expect_err("子代理文件不可读 → 整源报错（W-06）");
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(err.code, "usage-source-io");
+        assert!(err.detail.contains("agent-"), "{}", err.detail);
+    }
+
+    /// **旧 `state_json` 兼容**：5.9.3 之前的游标里没有 `subagent_session_id` 字段 →
+    /// 必须可反序列化且不丢 `tools` / `last_model`（否则跨轮配对与模型继承一起丢）
+    #[test]
+    fn old_cursor_state_without_subagent_field_still_parses() {
+        let legacy = r#"{"tools":{"open":{"c1":[1000,"Bash"]},"dropped":0},
+                          "last_model":"hy4-preview","dropped_no_model":1}"#;
+        let st: WbState = serde_json::from_str(legacy).expect("旧 state_json 必须仍可反序列化");
+        assert_eq!(st.last_model, "hy4-preview");
+        assert_eq!(st.dropped_no_model, 1);
+        assert_eq!(st.tools.open.len(), 1, "不得丢 tools（跨轮配对依赖它）");
+        assert!(st.subagent_session_id.is_empty());
+    }
+
+    /// **I4 的可观测面**：子代理文件被截断/重写（`rescan`）时，续读状态（含缓存的身份）
+    /// 必须随之重置并**重新解析**——否则截断后的新代际会沿用旧 sessionId 入账（串号）。
+    ///
+    /// ⚠️ 双计风险本身**没有**被解决：`usage_detail`/`usage_daily` 是加法账本，重读的用量
+    /// 会重复计入；实现只在 rescan 分支打 warn（有旧游标 = 真实截断/重写；无游标 = 首读）。
+    /// 仓内无日志捕获设施（W-37），故这里断言**行为面**：重置 + 重解析。
+    #[test]
+    fn subagent_rescan_resets_the_cached_identity() {
+        const SID2: &str = "01a18b3a-d9f7-78f2-bc3a-3425a34f54db";
+        let dir = tempfile::tempdir().unwrap();
+        make_db(dir.path(), &[("s1", "/p/A")]);
+        write_jsonl(
+            dir.path(),
+            "p-A",
+            "s1",
+            &[
+                json!({"type":"message","role":"assistant","timestamp":1000,"cwd":"/p/A",
+                     "sessionId":"s1","content":[{"type":"output_text","text":"ok"}],
+                     "message":{"usage":{"input_tokens":10,"output_tokens":1,"total_tokens":11}},
+                     "providerData":{"model":"deepseek-v4.1-flash"}}),
+            ],
+        );
+        let sub = write_subagent_jsonl(
+            dir.path(),
+            "p-A",
+            "s1",
+            &format!("agent-{OTHER_UUID}.jsonl"),
+            &[
+                json!({"type":"message","role":"user","timestamp":1500,"cwd":"/p/A",
+                       "sessionId":SUBAGENT_ID}),
+                json!({"type":"function_call","name":"Read","timestamp":2000,"callId":"sc1",
+                       "cwd":"/p/A","sessionId":SUBAGENT_ID,
+                       "message":{"usage":{"input_tokens":100,"output_tokens":10,"total_tokens":110}},
+                       "providerData":{"model":"deepseek-v4.1-flash","isSubAgent":true}}),
+            ],
+        );
+        let no_cursors = HashMap::new();
+        let (d1, _) = run(dir.path(), &no_cursors);
+        assert!(
+            d1.sessions.iter().any(|s| s.session_id == SUBAGENT_ID),
+            "前提：第一代文件以 SUBAGENT_ID 入账"
+        );
+
+        // 截断重写：内容更短（必然 rescan）+ 行内 sessionId 换成另一个 UUID
+        std::fs::write(
+            &sub,
+            format!(
+                "{}\n",
+                serde_json::to_string(&json!({"type":"function_call","name":"Bash",
+                    "timestamp":2500,"callId":"sc2","cwd":"/p/A","sessionId":SID2,
+                    "message":{"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}},
+                    "providerData":{"model":"deepseek-v4.1-flash","isSubAgent":true}}))
+                .unwrap()
+            ),
+        )
+        .unwrap();
+        let cursors: HashMap<_, _> = d1
+            .cursors
+            .iter()
+            .map(|c| (c.session_id.clone(), c.clone()))
+            .collect();
+        let (d2, _) = run(dir.path(), &cursors);
+        assert!(
+            d2.sessions.iter().any(|s| s.session_id == SID2),
+            "rescan 后必须按新代际重新解析身份（沿用旧缓存 = 串号）：{:?}",
+            d2.sessions
+                .iter()
+                .map(|s| s.session_id.as_str())
+                .collect::<Vec<_>>()
+        );
+        let sub_cursor = d2
+            .cursors
+            .iter()
+            .find(|c| c.session_id.contains("subagents"))
+            .unwrap();
+        assert!(
+            sub_cursor.state_json.contains(SID2),
+            "游标状态里缓存的身份必须刷新：{}",
+            sub_cursor.state_json
+        );
+    }
+
+    /// 子代理文件的**整文件无模型** → 丢弃 + 计数进该文件自己的 `state_json`（不写 `model=""`）
+    #[test]
+    fn subagent_file_without_any_model_is_dropped_with_a_count() {
+        let dir = tempfile::tempdir().unwrap();
+        make_db(dir.path(), &[("s1", "/p/A")]);
+        write_jsonl(
+            dir.path(),
+            "p-A",
+            "s1",
+            &[
+                json!({"type":"message","role":"assistant","timestamp":1000,"cwd":"/p/A",
+                     "sessionId":"s1","content":[{"type":"output_text","text":"ok"}],
+                     "message":{"usage":{"input_tokens":10,"output_tokens":1,"total_tokens":11}},
+                     "providerData":{"model":"deepseek-v4.1-flash"}}),
+            ],
+        );
+        write_subagent_jsonl(
+            dir.path(),
+            "p-A",
+            "s1",
+            &format!("agent-{OTHER_UUID}.jsonl"),
+            &[
+                json!({"type":"function_call","name":"Bash","timestamp":2000,"callId":"sc1",
+                     "cwd":"/p/A","sessionId":SUBAGENT_ID,
+                     "message":{"usage":{"input_tokens":10,"output_tokens":1,"total_tokens":11}},
+                     "providerData":{"isSubAgent":true}}),
+            ],
+        );
+        let no_cursors = HashMap::new();
+        let (delta, _) = run(dir.path(), &no_cursors);
+        assert_eq!(
+            delta
+                .details
+                .iter()
+                .filter(|d| d.key.model.is_empty())
+                .count(),
+            0,
+            "不得写 model=\"\" 幽灵行"
+        );
+        let sub_cursor = delta
+            .cursors
+            .iter()
+            .find(|c| c.session_id.contains("subagents"))
+            .expect("子代理文件必须有自己的游标");
+        assert!(
+            sub_cursor.state_json.contains("\"dropped_no_model\":1"),
+            "丢弃必须计数且可断言：{}",
+            sub_cursor.state_json
+        );
+        // 该子代理会话维度仍登记（身份在轮次里解析出来了）——只是明细不入账
+        assert!(delta.sessions.iter().any(|s| s.session_id == SUBAGENT_ID));
+    }
+
+    // ---- A6：真机形态与增量/回归 ----
+
+    /// **真机 5.9.3 形态**：子代理文件的用量挂在 `function_call` 行的 `message.usage` 上，
+    /// 首条 user 行没有 `isSubAgent` / 没有模型（模型由后续行给出）
+    #[test]
+    fn subagent_usage_on_function_call_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        make_db(dir.path(), &[("s1", "/p/A")]);
+        write_jsonl(
+            dir.path(),
+            "p-A",
+            "s1",
+            &[
+                json!({"type":"message","role":"user","timestamp":1,"cwd":"/p/A","sessionId":"s1",
+                     "content":[{"type":"input_text","text":"hi"}]}),
+            ],
+        );
+        write_subagent_jsonl(
+            dir.path(),
+            "p-A",
+            "s1",
+            &format!("agent-{OTHER_UUID}.jsonl"),
+            &[
+                json!({"type":"message","role":"user","timestamp":1793320359773i64,
+                       "sessionId":SUBAGENT_ID,"cwd":"/p/A"}),
+                json!({"type":"function_call","name":"Bash","timestamp":1793320359800i64,
+                       "callId":"call_real","sessionId":SUBAGENT_ID,"cwd":"/p/A",
+                       "message":{"usage":{"input_tokens":22125,"output_tokens":162,
+                                           "total_tokens":22287,"cache_read_input_tokens":20096}},
+                       "providerData":{"model":"deepseek-v4.1-flash","isSubAgent":true,
+                                       "agent":"general-purpose"}}),
+            ],
+        );
+        let no_cursors = HashMap::new();
+        let (delta, _) = run(dir.path(), &no_cursors);
+        let sub: Vec<_> = delta
+            .details
+            .iter()
+            .filter(|d| d.key.session_id == SUBAGENT_ID)
+            .collect();
+        assert_eq!(sub.len(), 1, "子代理用量必须成为一行明细");
+        assert_eq!(
+            sub[0].requests, 1,
+            "function_call 行上的 usage 也算一次请求"
+        );
+        assert_eq!(sub[0].buckets.cache_read, 20096);
+        assert_eq!(sub[0].buckets.input_fresh, 22125 - 20096);
+        assert_eq!(sub[0].buckets.output, 162);
+        assert_eq!(sub[0].key.model, "deepseek-v4.1-flash");
+        assert_eq!(sub[0].counters.tool_calls, 1);
+        assert_eq!(sub[0].key.project_key, "a", "cwd 归属与父会话一致");
+    }
+
+    /// 两轮增量：第二轮只计**追加**的那一行，不得把已入账的重复计入
+    /// （`usage_detail` / `usage_daily` 是加法账本——重读即双计）
+    #[test]
+    fn subagent_incremental_append_is_not_double_counted() {
+        let dir = tempfile::tempdir().unwrap();
+        make_db(dir.path(), &[("s1", "/p/A")]);
+        write_jsonl(
+            dir.path(),
+            "p-A",
+            "s1",
+            &[
+                json!({"type":"function_call","name":"Bash","timestamp":1000,"callId":"c1",
+                     "cwd":"/p/A","sessionId":"s1",
+                     "message":{"usage":{"input_tokens":100,"output_tokens":10,"total_tokens":110}},
+                     "providerData":{"model":"deepseek-v4.1-flash"}}),
+            ],
+        );
+        let sub_path = write_subagent_jsonl(
+            dir.path(),
+            "p-A",
+            "s1",
+            &format!("agent-{OTHER_UUID}.jsonl"),
+            &[
+                json!({"type":"function_call","name":"Read","timestamp":2000,"callId":"sc1",
+                     "cwd":"/p/A","sessionId":SUBAGENT_ID,
+                     "message":{"usage":{"input_tokens":1000,"output_tokens":100,"total_tokens":1100}},
+                     "providerData":{"model":"deepseek-v4.1-flash","isSubAgent":true}}),
+            ],
+        );
+        let no_cursors = HashMap::new();
+        let (d1, _) = run(dir.path(), &no_cursors);
+        assert_eq!(d1.details.iter().map(|d| d.requests).sum::<i64>(), 2);
+
+        // 第二轮：子代理文件追加一行新的 usage（父文件不动 → L2 快速路）
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&sub_path)
+                .unwrap();
+            writeln!(
+                f,
+                "{}",
+                serde_json::to_string(&json!({"type":"function_call","name":"Bash",
+                    "timestamp":3000,"callId":"sc2","cwd":"/p/A","sessionId":SUBAGENT_ID,
+                    "message":{"usage":{"input_tokens":500,"output_tokens":50,"total_tokens":550}},
+                    "providerData":{"model":"deepseek-v4.1-flash","isSubAgent":true}}))
+                .unwrap()
+            )
+            .unwrap();
+        }
+        let cursors: HashMap<_, _> = d1
+            .cursors
+            .iter()
+            .map(|c| (c.session_id.clone(), c.clone()))
+            .collect();
+        let (d2, _) = run(dir.path(), &cursors);
+        assert_eq!(
+            d2.details.iter().map(|d| d.requests).sum::<i64>(),
+            1,
+            "第二轮只计追加的那一行（重读已入账部分 = 双计）"
+        );
+        assert_eq!(
+            d2.details
+                .iter()
+                .map(|d| d.buckets.input_fresh)
+                .sum::<i64>(),
+            500
+        );
+        assert_eq!(d2.parsed_files, 1, "只有子代理文件真读了（父文件未变）");
+        // 身份跨轮复用（缓存进 state_json，不必每轮重读文件头）
+        let sub_cursor = d2
+            .cursors
+            .iter()
+            .find(|c| c.session_id.contains("subagents"))
+            .unwrap();
+        assert!(
+            sub_cursor.state_json.contains(SUBAGENT_ID),
+            "子代理身份必须缓存在游标状态里：{}",
+            sub_cursor.state_json
+        );
+    }
+
+    /// **主会话零变化（R3 / AC1）**：同一父文件在「无子代理」与「有子代理」两种情形下，
+    /// 父会话的明细逐项相等
+    #[test]
+    fn main_session_numbers_unchanged_with_subagents_present() {
+        let dir = tempfile::tempdir().unwrap();
+        make_db(dir.path(), &[("s1", "/p/A")]);
+        write_jsonl(
+            dir.path(),
+            "p-A",
+            "s1",
+            &[
+                json!({"type":"function_call","name":"Bash","timestamp":1000,"callId":"c1",
+                       "cwd":"/p/A","sessionId":"s1",
+                       "message":{"usage":{"input_tokens":100,"output_tokens":10,"total_tokens":110,
+                                           "cache_read_input_tokens":40}},
+                       "providerData":{"model":"deepseek-v4.1-flash"}}),
+                json!({"type":"function_call_result","name":"Bash","callId":"c1",
+                       "timestamp":1700,"cwd":"/p/A","sessionId":"s1",
+                       "providerData":{"model":"deepseek-v4.1-flash"}}),
+            ],
+        );
+        let no_cursors = HashMap::new();
+        let (before, _) = run(dir.path(), &no_cursors);
+        // 追加一个子代理文件后**重跑一遍**（新游标 → 两文件都从头读）
+        write_subagent_jsonl(
+            dir.path(),
+            "p-A",
+            "s1",
+            &format!("agent-{OTHER_UUID}.jsonl"),
+            &[
+                json!({"type":"function_call","name":"Read","timestamp":2000,"callId":"sc1",
+                     "cwd":"/p/A","sessionId":SUBAGENT_ID,
+                     "message":{"usage":{"input_tokens":999999,"output_tokens":99999,
+                                         "total_tokens":1099998}},
+                     "providerData":{"model":"deepseek-v4.1-flash","isSubAgent":true}}),
+            ],
+        );
+        let (after, _) = run(dir.path(), &no_cursors);
+        let parent_of = |d: &SourceDelta| {
+            let rows: Vec<_> = d
+                .details
+                .iter()
+                .filter(|x| x.key.session_id == "s1")
+                .collect();
+            assert_eq!(rows.len(), 1, "父会话明细行");
+            (
+                rows[0].buckets.input_fresh,
+                rows[0].buckets.cache_read,
+                rows[0].buckets.cache_write,
+                rows[0].buckets.output,
+                rows[0].request_total,
+                rows[0].requests,
+                rows[0].counters.tool_calls,
+                rows[0].counters.tool_ms,
+                rows[0].key.model.clone(),
+                rows[0].key.project_key.clone(),
+            )
+        };
+        assert_eq!(
+            parent_of(&before),
+            parent_of(&after),
+            "子代理文件不得改变父会话的任何数值（R3 / AC1）"
+        );
+        // 总量确实变了（防「子代理其实没采」的假绿）
+        assert_eq!(
+            after.details.iter().map(|d| d.buckets.output).sum::<i64>()
+                - before.details.iter().map(|d| d.buckets.output).sum::<i64>(),
+            99999
         );
     }
 
