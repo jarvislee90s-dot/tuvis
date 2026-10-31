@@ -266,7 +266,8 @@ fn burst_scan_reason(primary: ScanReason, burst: &[ScanReason]) -> ScanReason {
         .unwrap_or(primary)
 }
 
-/// 事件延后等待（R2，可测）：在最小间隔内用 `recv_timeout` 等**新的唤醒**——/// 收到 Event 继续合并等待；收到 Action/ColdStart 等非 Event 原因立即中断并以该
+/// 事件延后等待（R2，可测）：在最小间隔内用 `recv_timeout` 等**新的唤醒**——
+/// 收到 Event 继续合并等待；收到 Action/ColdStart 等非 Event 原因立即中断并以该
 /// 原因扫描；超时以原 Event 原因照常扫描；通道断开同样按当前原因继续（外层下一圈退出）。
 ///
 /// 不得改回裸 `sleep`：睡在扫描线程里会让 Action 排队，而动作路径等待上限 3s
@@ -318,7 +319,10 @@ fn scan_once_with_limit(reason: ScanReason, wait_limit: Duration) -> Arc<Snapsho
             None => scan_once_with_limit(reason, wait_limit),
         };
     }
-    SCAN_STARTED_MS.store(now_ms(), Ordering::SeqCst);
+    // R10：本次扫描的启动时刻（本地变量）——publish 时只允许「启动晚于超时」的
+    // 扫描复位 degraded 窗口；启动早于超时的扫描发布的是旧视图，不得抹掉超时告警
+    let started_ms = now_ms();
+    SCAN_STARTED_MS.store(started_ms, Ordering::SeqCst);
     SCANS_TOTAL.fetch_add(1, Ordering::SeqCst);
     struct Clear;
     impl Drop for Clear {
@@ -332,7 +336,7 @@ fn scan_once_with_limit(reason: ScanReason, wait_limit: Duration) -> Arc<Snapsho
     let started = Instant::now();
     let data = super::get_all_sessions_inner();
     let duration = started.elapsed();
-    let snap = publish(data);
+    let snap = publish(data, started_ms);
     // R4：每轮扫描只写一行 stats（覆盖写）；日志不再逐轮打 INFO（F9 ≤1MB/天）
     write_stats(reason, &snap, duration);
     snap
@@ -473,7 +477,7 @@ fn hang_alert_age(in_flight: bool, started_ms: i64, now: i64, last_alert_ms: i64
 /// 取锁必然发生在发布之后，一定能看到新快照；因此 `version()` 最多短暂滞后，
 /// **绝不会领先** `snapshot().version`（否则「读版本→读快照→标记已见」的
 /// 消费方会漏掉一次跃迁）。
-fn publish(data: SessionsResponse) -> Arc<Snapshot> {
+fn publish(data: SessionsResponse, started_ms: i64) -> Arc<Snapshot> {
     let mut guard = LAST.lock().unwrap_or_else(|e| e.into_inner());
     let version = guard.as_ref().map(|s| s.version + 1).unwrap_or(1);
     let snap = Arc::new(Snapshot {
@@ -484,9 +488,17 @@ fn publish(data: SessionsResponse) -> Arc<Snapshot> {
     });
     *guard = Some(snap.clone());
     VERSION.store(version, Ordering::SeqCst);
-    // R9：成功发布即复位补扫超时窗口——degraded 30s 从「最后一次超时」起算，
-    // 后续成功扫描说明扫描链已恢复，不应继续报 degraded。
-    LAST_TIMEOUT_MS.store(0, Ordering::SeqCst);
+    // R10：只有**启动晚于超时**的扫描成功才能复位 degraded 窗口。启动早于超时的
+    // 扫描（典型：动作补扫超时后，之前那轮在飞扫描才发布）发布的是旧视图，
+    // 无条件清零会让 F3 的 30s 诊断窗口毫秒级不可观测。
+    let mut last_timeout = LAST_TIMEOUT_MS.load(Ordering::SeqCst);
+    while started_ms > last_timeout && last_timeout != 0 {
+        match LAST_TIMEOUT_MS.compare_exchange(last_timeout, 0, Ordering::SeqCst, Ordering::SeqCst)
+        {
+            Ok(_) => break,
+            Err(current) => last_timeout = current,
+        }
+    }
     drop(guard);
     snap
 }
@@ -667,6 +679,8 @@ pub fn reset_for_test() {
     SCAN_STARTED_MS.store(0, Ordering::SeqCst);
     SCANS_TOTAL.store(0, Ordering::SeqCst);
     LAST_TIMEOUT_MS.store(0, Ordering::SeqCst);
+    // R11：一并清测试通道，防止某用例中途 panic 留下死通道影响后续用例
+    *TEST_TX.lock().unwrap_or_else(|e| e.into_inner()) = None;
 }
 
 /// 单测用：注入扫描唤醒发送端（让 ensure_fresh 走「有扫描线程」的等待路径）
@@ -689,7 +703,22 @@ pub(crate) fn set_in_flight_for_test(on: bool) {
 /// 单测用：发布一份由闭包产出的快照
 #[cfg(test)]
 pub fn publish_for_test(f: impl FnOnce() -> SessionsResponse) -> Arc<Snapshot> {
-    publish(f())
+    publish(f(), now_ms())
+}
+
+/// 单测用：以指定启动时刻发布（验证 R10 的超时窗口复位条件）
+#[cfg(test)]
+pub(crate) fn publish_at_for_test(
+    started_ms: i64,
+    f: impl FnOnce() -> SessionsResponse,
+) -> Arc<Snapshot> {
+    publish(f(), started_ms)
+}
+
+/// 单测用：直接设置最近一次超时时刻（R10 复位条件用例）
+#[cfg(test)]
+pub(crate) fn set_last_timeout_for_test(ms: i64) {
+    LAST_TIMEOUT_MS.store(ms, Ordering::SeqCst);
 }
 
 /// 全局测试锁：本模块的进程共享状态（LAST / VERSION / MODE / WATCH_UNTIL /
@@ -1107,6 +1136,11 @@ mod tests {
             let reason = rx
                 .recv_timeout(Duration::from_secs(2))
                 .expect("超时后必须补排 Action");
+            // R11：只允许补排一条 Action（不得重复排队放大扫描）
+            assert!(
+                rx.try_recv().is_err(),
+                "补排 Action 只能有一条，实际通道仍有积压"
+            );
             scan_once(reason)
         });
         set_in_flight_for_test(false); // 释放在飞占位
@@ -1142,15 +1176,34 @@ mod tests {
         assert!(matches!(burst_scan_reason(Action, &[]), Action));
     }
 
-    /// R9：成功发布新快照必须复位补扫超时窗口（degraded 30s 从最后一次超时起算）。
+    /// R9/R10：成功发布新快照复位补扫超时窗口——但只允许**启动晚于超时**的扫描复位。
     #[test]
     fn publish_resets_degraded_timeout_window() {
         let _guard = test_guard();
         reset_for_test();
         note_timeout();
         assert!(is_degraded(), "刚超时后应处于 degraded 窗口");
-        let _ = publish_for_test(|| resp(SessionStatus::Idle));
-        assert!(!is_degraded(), "成功发布后 degraded 窗口必须复位");
+        let now = now_ms();
+        set_last_timeout_for_test(now);
+        let _ = publish_at_for_test(now + 1, || resp(SessionStatus::Idle));
+        assert!(!is_degraded(), "启动晚于超时的成功发布应复位窗口");
+    }
+
+    /// R10：启动早于超时的扫描发布的是旧视图，不得抹掉刚记的超时窗口。
+    #[test]
+    fn publish_keeps_timeout_window_when_scan_started_before_it() {
+        let _guard = test_guard();
+        reset_for_test();
+        let now = now_ms();
+        set_last_timeout_for_test(now);
+        assert!(is_degraded());
+        let _ = publish_at_for_test(now - 1, || resp(SessionStatus::Idle));
+        assert!(
+            is_degraded(),
+            "started<timeout 的发布必须保留 degraded 窗口（F3 可观测性）"
+        );
+        let _ = publish_at_for_test(now + 1, || resp(SessionStatus::Idle));
+        assert!(!is_degraded(), "下一次启动晚于超时的扫描发布后复位");
     }
 
     #[test]

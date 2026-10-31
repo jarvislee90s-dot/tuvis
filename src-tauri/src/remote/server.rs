@@ -2008,11 +2008,10 @@ mod tests {
         assert!(end.is_none());
     }
 
-    /// Fix 3 回归：**握手期断开**（快照未就绪时客户端已走）不得泄漏连接计数。
-    /// 注册必须后置于快照完成——旧实现先注册，客户端在 ensure_fresh 等待期间断开时
-    /// CleanupStream 尚未构造就被 drop，反注册永不发生 → `any_connection()` 恒真、
-    /// 节奏永远进不了 Away。此处用「在飞占位」制造慢快照（无缓存 + 单飞等待），
-    /// 100ms 后丢弃 handler future 模拟连接关闭，断言计数在 2s 内回到 false。
+    /// Fix 3/R6 回归：**握手期断开**（快照未就绪时客户端已走）不得泄漏连接计数。
+    /// R6 起用 `SseConnGuard` 在快照 await 之前注册、Drop 即反注册；handler future
+    /// 在慢快照等待期被丢弃时守卫随之释放。此处用「在飞占位 + 注入扫描通道」制造
+    /// 确定性的慢快照，100ms 后丢弃 handler future 模拟连接关闭，断言计数 2s 内归零。
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn sse_handshake_aborted_before_snapshot_does_not_leak_connection() {
