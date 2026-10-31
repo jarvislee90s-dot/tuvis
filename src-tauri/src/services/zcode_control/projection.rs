@@ -20,8 +20,8 @@ use serde_json::{Map, Value};
 
 use super::pending::PendingBook;
 use super::types::{
-    codes, BoundTarget, CapabilityView, InputRoutingView, ModelChoice, QueueItemView, QueueView,
-    SelectionView, SessionView, ZResult, ZcodeError,
+    codes, BoundTarget, CapabilityView, InputRoutingView, ModelChoice, QueueActionAvailability,
+    QueueItemView, QueueView, SelectionView, SessionView, ZResult, ZcodeError,
 };
 
 /// conversation topic 前缀（`transport.ts:113,205`）。
@@ -286,7 +286,13 @@ impl Projection {
         self.selection = object.get("config").and_then(parse_selection);
         // 快照是整份权威状态：`queue` 缺席 = 本宿主不宣告队列（`known=false`），
         // 绝不沿用上一份快照的旧队列（旧代际/旧订阅的项不得复活）。
-        self.queue = object.get("queue").map(parse_queue).unwrap_or_default();
+        let mut queue = object.get("queue").map(parse_queue).unwrap_or_default();
+        // `availability` 位于**状态根**（`state.availability`），与 `queue` 平级；
+        // 只有队列已宣告时才附带资格，否则它挂在「未知队列」上毫无意义。
+        if queue.known {
+            queue.availability = parse_queue_availability(snapshot);
+        }
+        self.queue = queue;
         // 快照是整份权威状态：缺 `inputRouting` = 未知（`None`），绝不沿用上一份快照。
         self.input_routing = object.get("inputRouting").and_then(parse_input_routing);
         Ok(())
@@ -303,7 +309,20 @@ impl Projection {
         }
         // 同规则：patch 带 queue 就整体换（含解析失败 → 未宣告）；缺席 = 本帧不动队列。
         if let Some(queue) = object.get("queue") {
-            self.queue = parse_queue(queue);
+            let mut parsed = parse_queue(queue);
+            if parsed.known {
+                // 增量纪律：本帧带 `availability` 就按本帧重算；不带则**保持旧值**
+                // （缺字段 ≠ 收回资格，也 ≠ 维持一份更旧的声明——见下一分支）。
+                parsed.availability = if object.contains_key("availability") {
+                    parse_queue_availability(patch)
+                } else {
+                    self.queue.availability.clone()
+                };
+            }
+            self.queue = parsed;
+        } else if object.contains_key("availability") && self.queue.known {
+            // 队列项本帧未变、但资格声明变了：只更新资格，不动 items/暂停态。
+            self.queue.availability = parse_queue_availability(patch);
         }
         // 增量 patch 缺 `inputRouting` 保持旧值；带坏形状 → 未知（绝不猜 choice）。
         if object.contains_key("inputRouting") {
@@ -323,7 +342,11 @@ impl Projection {
 ///   `position`；不按正文/数组下标重算身份；
 /// - 暂停原因是官方枚举 `stopped|manual|error` 的**原样**透传；非枚举/缺席一律
 ///   `None`（绝不把未知值映射成某一种原因）；
-/// - 数组顺序即官方展示顺序（宿主已按 `order.queuePosition` 排好），本层不重排。
+/// - 数组顺序即官方展示顺序（宿主已按 `order.queuePosition` 排好），本层不重排；
+/// - `kind` / `dispatch.state` 只按证据白名单投影（未知值 = `None`，绝不透传任意
+///   字符串）；`has_attachments` 只回答「有没有」，不下发附件对象；
+/// - `availability` 位于状态根，不在这里解析（调用方用 [`parse_queue_availability`]
+///   补齐）；本函数产出的 `availability` 恒为默认（未知/全关）。
 fn parse_queue(value: &Value) -> QueueView {
     let Some(object) = value.as_object() else {
         return QueueView::default();
@@ -362,10 +385,36 @@ fn parse_queue(value: &Value) -> QueueView {
             .and_then(|order| order.get("queuePosition"))
             .and_then(Value::as_u64)
             .and_then(|position| u32::try_from(position).ok());
+        // 证据白名单（R0 §3 `Ax` schema）：只认这三种；其余取值一律 `None`
+        // （前端据此禁用「修改」，绝不对未知 kind 猜语义）。
+        let kind = record
+            .get("kind")
+            .and_then(Value::as_str)
+            .filter(|kind| matches!(*kind, "sendText" | "sendGoalCommand" | "compact"))
+            .map(str::to_owned);
+        let dispatch_state = record
+            .get("dispatch")
+            .and_then(Value::as_object)
+            .and_then(|dispatch| dispatch.get("state"))
+            .and_then(Value::as_str)
+            .filter(|state| {
+                matches!(
+                    *state,
+                    "admitted" | "queued" | "reserved" | "promoting" | "drained"
+                )
+            })
+            .map(str::to_owned);
+        let has_attachments = record
+            .get("attachments")
+            .and_then(Value::as_array)
+            .is_some_and(|list| !list.is_empty());
         queue_items.push(QueueItemView {
             input_id: input_id.to_owned(),
             text: text.to_owned(),
             position,
+            kind,
+            dispatch_state,
+            has_attachments,
         });
     }
     QueueView {
@@ -373,6 +422,35 @@ fn parse_queue(value: &Value) -> QueueView {
         paused: Some(!auto_drain),
         pause_reason,
         items: queue_items,
+        availability: QueueActionAvailability::default(),
+    }
+}
+
+/// 解析官方 `state.availability`（入参是**状态对象**（snapshot/patch 根），不是裸
+/// `availability`）。
+///
+/// 证据（R0 §3）：`state.availability.{queueEdit,sendQueuedNow,…} = {allowed:true} |
+/// {allowed:false,reasonCode}`。纪律：
+/// - 根上 `availability` 不是对象 → `known=false`（未知，绝不猜 allowed）；
+/// - 对象在但缺 `queueEdit`/`sendQueuedNow` → 对应位 `false`（宿主未宣告该项 = 不放行）；
+/// - `allowed` 必须**恰好**是 `true` 才放行（`"true"`/`1`/缺省一律 false）；
+/// - 官方没有 `setAutoDrain` 的 availability 字段，因此**不虚构**恢复资格。
+fn parse_queue_availability(state: &Value) -> QueueActionAvailability {
+    let Some(available) = state.get("availability").and_then(Value::as_object) else {
+        return QueueActionAvailability::default();
+    };
+    let allow = |name: &str| {
+        available
+            .get(name)
+            .and_then(Value::as_object)
+            .and_then(|entry| entry.get("allowed"))
+            .and_then(Value::as_bool)
+            == Some(true)
+    };
+    QueueActionAvailability {
+        known: true,
+        queue_edit_allowed: allow("queueEdit"),
+        send_queued_now_allowed: allow("sendQueuedNow"),
     }
 }
 
@@ -879,6 +957,160 @@ mod tests {
         projection.deactivate();
         assert!(!projection.queue().known);
         assert!(projection.queue().items.is_empty());
+    }
+
+    /// W2 主用例：官方 ID 原样保留；新白名单字段与运行时资格**只**按证据形状投影；
+    /// 缺 `queue` ≠ 空队列；`paused=true + []` 仍是可恢复的暂停态。
+    #[test]
+    fn queue_snapshot_and_delta_keep_official_item_ids() {
+        let mut projection = Projection::new(target(1));
+        projection.activate(SUB);
+        // 快照前：未宣告 → 未知且资格全关。
+        assert!(!projection.queue().known);
+        assert!(!projection.queue().availability.known);
+
+        let mut snapshot = base_snapshot();
+        snapshot["queue"] = queue_state(
+            true,
+            json!([
+                queue_item("queue_cmd-keep-1", "first queued", 0),
+                queue_item("queue_cmd-keep-2", "second queued", 1),
+            ]),
+        );
+        // 官方资格在**状态根**：`state.availability.queueEdit/sendQueuedNow = {allowed}`。
+        snapshot["availability"] = json!({
+            "queueEdit": {"allowed": true},
+            "sendQueuedNow": {"allowed": false, "reasonCode": "busy"},
+        });
+        projection
+            .apply(1, snapshot_frame(SUB, snapshot, 0, 1))
+            .expect("snapshot with queue availability");
+
+        let queue = projection.queue().clone();
+        assert!(queue.known);
+        // 身份：仍是宿主原值，不重算、不按下标替换。
+        assert_eq!(queue.items[0].input_id, "queue_cmd-keep-1");
+        assert_eq!(queue.items[1].input_id, "queue_cmd-keep-2");
+        // 白名单字段：kind / dispatch.state / 附件有无。
+        assert_eq!(queue.items[0].kind.as_deref(), Some("sendText"));
+        assert_eq!(queue.items[0].dispatch_state.as_deref(), Some("queued"));
+        assert!(!queue.items[0].has_attachments);
+        // 资格：只有明确 allowed=true 的项放行。
+        assert!(queue.availability.known);
+        assert!(queue.availability.queue_edit_allowed);
+        assert!(!queue.availability.send_queued_now_allowed);
+
+        // 增量只换 queue、**不带** availability → 资格保持旧值（缺字段 ≠ 收回）。
+        projection
+            .apply(
+                1,
+                delta_frame(
+                    SUB,
+                    json!({
+                        "revision": 5,
+                        "queue": queue_state(
+                            false,
+                            json!([queue_item("queue_cmd-keep-2", "second queued", 0)])
+                        )
+                    }),
+                    1,
+                    2,
+                ),
+            )
+            .expect("queue delta without availability");
+        let queue = projection.queue().clone();
+        assert_eq!(queue.items.len(), 1);
+        assert_eq!(
+            queue.items[0].input_id, "queue_cmd-keep-2",
+            "消费一项后仍保留剩余项的原 ID"
+        );
+        assert!(
+            queue.availability.queue_edit_allowed,
+            "增量缺 availability 时保持旧资格"
+        );
+
+        // 只带 availability、不动 queue：只更新资格，队列项/暂停态原样。
+        projection
+            .apply(
+                1,
+                delta_frame(
+                    SUB,
+                    json!({"revision": 6, "availability": {"queueEdit": {"allowed": false}}}),
+                    2,
+                    3,
+                ),
+            )
+            .expect("availability-only delta");
+        let queue = projection.queue().clone();
+        assert_eq!(queue.items.len(), 1, "资格帧不得改动队列项");
+        assert_eq!(queue.paused, Some(false));
+        assert!(
+            !queue.availability.queue_edit_allowed,
+            "官方收回资格必须立刻反映"
+        );
+
+        // 官方明确暂停且队列已空：仍是「可恢复」的暂停事实（known=true + paused=true）。
+        projection
+            .apply(
+                1,
+                delta_frame(
+                    SUB,
+                    json!({"revision": 7, "queue": queue_state(true, json!([]))}),
+                    3,
+                    4,
+                ),
+            )
+            .expect("paused empty queue delta");
+        let queue = projection.queue().clone();
+        assert!(queue.known && queue.paused == Some(true));
+        assert!(queue.items.is_empty());
+        assert!(
+            queue.availability.known && !queue.availability.queue_edit_allowed,
+            "本帧没带 availability → 保持上一帧（已被收回）的资格"
+        );
+
+        // 投影降级（缺口）必须连资格一起清空：失效视图不得残留「可写」。
+        assert!(projection
+            .apply(1, delta_frame(SUB, json!({"revision": 8}), 9, 10))
+            .is_err());
+        assert!(!projection.view().ready);
+        assert!(!projection.queue().known);
+        assert!(!projection.queue().availability.known);
+        assert!(!projection.queue().availability.queue_edit_allowed);
+    }
+
+    /// 队列项的 `kind`/`dispatch.state` 只认证据白名单；未知值一律 `None`
+    /// （不把宿主新枚举透传给手机，也不让 W4 对未知 kind 猜「可修改」）。
+    #[test]
+    fn queue_item_kind_and_dispatch_state_are_whitelisted() {
+        let queue = super::parse_queue(&json!({
+            "items": [
+                {
+                    "queueItemId": "queue_unknown_kind",
+                    "text": "unknown kind",
+                    "kind": "someFutureCommand",
+                    "dispatch": {"state": "someFutureState"}
+                },
+                {
+                    "queueItemId": "queue_compact",
+                    "text": "compact",
+                    "kind": "compact",
+                    "dispatch": {"state": "reserved"},
+                    "attachments": [{"kind": "file", "path": "/tmp/secret"}]
+                }
+            ],
+            "autoDrain": true
+        }));
+        assert!(queue.known);
+        assert_eq!(queue.items[0].kind, None, "白名单外 kind → None");
+        assert_eq!(queue.items[0].dispatch_state, None, "白名单外态 → None");
+        assert!(!queue.items[0].has_attachments);
+        assert_eq!(queue.items[1].kind.as_deref(), Some("compact"));
+        assert_eq!(queue.items[1].dispatch_state.as_deref(), Some("reserved"));
+        assert!(queue.items[1].has_attachments, "只告知有无附件");
+        // 附件内容（路径等）绝不进入 DTO。
+        let wire = serde_json::to_string(&queue.items[1]).expect("可序列化");
+        assert!(!wire.contains("/tmp/secret"), "附件路径不得下发：{wire}");
     }
 
     #[test]

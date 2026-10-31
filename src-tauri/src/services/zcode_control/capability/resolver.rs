@@ -13,9 +13,15 @@
 //! （无 pending 不显示问答/审批、无目录不显示模型、无运行回合不显示打断）；
 //! degraded / unsupported 是实机判决，与形状无关，持有到 key 变化。
 //!
-//! reasonCode（UI 只见可用/不可用）：可用 = `None`；不可用 = `needs_evidence`
-//! （缺证据/缺形状）、`unsupported`（静态知识/账本明确不可用）或账本 degraded 的
-//! 冻结原因码。异常兜底（spec §6.6）：解析路径任何 panic →
+//! 队列三写（`queue_edit`/`queue_now`/`queue_resume`）的「形状」不是运行时接口
+//! 布尔（接口面对队列恒 `false`），而是**已知 build 的官方命令条目**（R0 §3，
+//! 见 `key::build_declares_queue_command`）：条目命中即候选档
+//! （`enabled=true` + [`CANDIDATE_REASON`]），`queue_now` 无条目 → 恒关闭。
+//!
+//! reasonCode（UI 只见可用/不可用）：确认档 = `None`；**候选档**（仅队列写）=
+//! `interface_matched`（复用账本 state 列的既有冻结词，不是新造错误码）；不可用 =
+//! `needs_evidence`（缺证据/缺形状）、`unsupported`（静态知识/账本明确不可用）或
+//! 账本 degraded 的冻结原因码。异常兜底（spec §6.6）：解析路径任何 panic →
 //! [`CapabilityPolicy::production_unverified`] 全关；账本读失败已由实现折成空
 //! Vec（退化为 shipped + 接口候选，不阻塞连接）。
 
@@ -28,8 +34,13 @@ use crate::services::zcode_control::types::{
     codes, CapabilityFlag, CapabilityPolicy, CapabilityView,
 };
 
-/// 八项能力的固定清单（声明序无语义；逐项独立解析）。
-const ALL_CAPABILITIES: [Capability; 8] = [
+/// 十一项能力的固定清单（声明序无语义；逐项独立解析）。
+///
+/// 队列三项（`queue_edit`/`queue_now`/`queue_resume`）同样逐项解析，但判据是
+/// **build 命令条目**而不是接口形状：`queue_edit`/`queue_resume` 在已知 build 的
+/// 命令表命中时进候选档，`queue_now` 无条目 → 恒 `needs_evidence`。三者都不得借
+/// `send`/`approval_reply` 的结论开闸。
+const ALL_CAPABILITIES: [Capability; 11] = [
     Capability::Send,
     Capability::SingleSelect,
     Capability::MultiSelect,
@@ -38,6 +49,9 @@ const ALL_CAPABILITIES: [Capability; 8] = [
     Capability::ApprovalReply,
     Capability::Model,
     Capability::ThoughtLevel,
+    Capability::QueueEdit,
+    Capability::QueueNow,
+    Capability::QueueResume,
 ];
 
 /// 解析八项能力矩阵（spec §6.4；生产装配点 = `PartsBackend` 的能力现算源）。
@@ -70,21 +84,38 @@ fn resolve_all(
         let record = records
             .iter()
             .find(|candidate| candidate.capability == capability);
-        let flag = flag_for(
-            record,
-            shipped_state(key, capability),
-            interface.get(&capability) == Some(&true),
-        );
+        let shipped = shipped_state(key, capability);
+        // 队列写：接口形状位恒 `false`（`interface_capabilities` 不认队列），
+        // 「形状在场」改由 **build 命令条目**提供——shipped 表命中候选/确认条目
+        // 即视为判据在场；否则永远落不到候选档。
+        let evidence_ok = if is_queue_write(capability) {
+            matches!(
+                shipped,
+                Some(CapabilityState::Confirmed | CapabilityState::InterfaceMatched)
+            )
+        } else {
+            interface.get(&capability) == Some(&true)
+        };
+        let flag = flag_for(capability, record, shipped, evidence_ok);
         assign(&mut view, capability, flag);
     }
     view
 }
 
+/// 队列三写（撤回/重排、立即执行、恢复）。
+fn is_queue_write(capability: Capability) -> bool {
+    matches!(
+        capability,
+        Capability::QueueEdit | Capability::QueueNow | Capability::QueueResume
+    )
+}
+
 /// 单项能力解析（spec R2 优先级 + R3 形状叠加）。
 fn flag_for(
+    capability: Capability,
     record: Option<&CapabilityRecord>,
     shipped: Option<CapabilityState>,
-    interface_ok: bool,
+    evidence_ok: bool,
 ) -> CapabilityFlag {
     if let Some(record) = record {
         return match record.state {
@@ -92,8 +123,8 @@ fn flag_for(
             CapabilityState::Confirmed
             | CapabilityState::InterfaceMatched
             | CapabilityState::Inconclusive => {
-                if interface_ok {
-                    open()
+                if evidence_ok {
+                    open_with(capability, record.state)
                 } else {
                     closed(codes::NEEDS_EVIDENCE)
                 }
@@ -115,9 +146,9 @@ fn flag_for(
     }
     match shipped {
         // shipped 精确命中优先于接口候选；候选/确认仍要求形状在场。
-        Some(CapabilityState::Confirmed) | Some(CapabilityState::InterfaceMatched) => {
-            if interface_ok {
-                open()
+        Some(state @ (CapabilityState::Confirmed | CapabilityState::InterfaceMatched)) => {
+            if evidence_ok {
+                open_with(capability, state)
             } else {
                 closed(codes::NEEDS_EVIDENCE)
             }
@@ -129,9 +160,10 @@ fn flag_for(
             closed(codes::NEEDS_EVIDENCE)
         }
         // 未知 build（无账本记录）：接口匹配即候选可用（spec §6.4 A 策略）。
+        // 队列写走不到这里：其 evidence_ok 恒 false（shipped 为 None）。
         None => {
-            if interface_ok {
-                open()
+            if evidence_ok {
+                open_with(capability, CapabilityState::Confirmed)
             } else {
                 closed(codes::NEEDS_EVIDENCE)
             }
@@ -139,11 +171,39 @@ fn flag_for(
     }
 }
 
-/// 可用：无原因码（UI 只见可用/不可用，不区分候选/确认）。
+/// 可用：按证据等级分档——非队列能力只有「可用」一档（无原因码）；队列写在
+/// `Confirmed` 之外的候选态带 [`CANDIDATE_REASON`]，让 W4 能区分「候选可点」与
+/// 「实机确认」。
+fn open_with(capability: Capability, state: CapabilityState) -> CapabilityFlag {
+    if is_queue_write(capability) && state != CapabilityState::Confirmed {
+        candidate()
+    } else {
+        open()
+    }
+}
+
+/// 候选档原因码：复用账本 `state` 列的**既有冻结词** `interface_matched`
+/// （`database/dao/zcode_capability.rs` 的 `state_to_str`、`database/schema.rs`
+/// 词表、`hub.rs` 的 `state_word` 同词），不是 `codes` 词表里的新错误码
+/// ——`codes` 保持冻结、不新增。
+const CANDIDATE_REASON: &str = "interface_matched";
+
+/// 可用（确认档）：无原因码（UI 只见可用/不可用，不区分候选/确认）。
 fn open() -> CapabilityFlag {
     CapabilityFlag {
         enabled: true,
         reason_code: None,
+    }
+}
+
+/// 可用（候选档）：`enabled=true` + 候选原因码。
+///
+/// **候选 ≠ 实机验证**：它只表示静态证据（build 命令条目 / 接口形状）匹配，
+/// 写命令是否被宿主接受由运行时新鲜 `availability` 与真实 ACK 回答。
+fn candidate() -> CapabilityFlag {
+    CapabilityFlag {
+        enabled: true,
+        reason_code: Some(CANDIDATE_REASON.to_owned()),
     }
 }
 
@@ -155,7 +215,7 @@ fn closed(reason: &str) -> CapabilityFlag {
     }
 }
 
-/// 按能力枚举写回矩阵字段（八项一一对应，漏项即编译期 match 报错）。
+/// 按能力枚举写回矩阵字段（十一项一一对应，漏项即编译期 match 报错）。
 fn assign(view: &mut CapabilityView, capability: Capability, flag: CapabilityFlag) {
     match capability {
         Capability::Send => view.send = flag,
@@ -166,6 +226,9 @@ fn assign(view: &mut CapabilityView, capability: Capability, flag: CapabilityFla
         Capability::ApprovalReply => view.approval_reply = flag,
         Capability::Model => view.model = flag,
         Capability::ThoughtLevel => view.thought_level = flag,
+        Capability::QueueEdit => view.queue_edit = flag,
+        Capability::QueueNow => view.queue_now = flag,
+        Capability::QueueResume => view.queue_resume = flag,
     }
 }
 
@@ -446,6 +509,146 @@ mod tests {
                 assert!(view.single_select.enabled && view.multi_select.enabled);
             }
         }
+    }
+
+    /// 命令形状全齐（八项接口都可用）时，命中证据表的 build 上 `queue_edit` /
+    /// `queue_resume` 解析为**候选档**：`enabled=true` + 候选原因码。
+    ///
+    /// 依据：`key.rs` 的 `shipped_state` 对已知 build 的队列条目返回
+    /// `InterfaceMatched`（命令名 `deleteQueueItem`/`reorderQueueItem`/`setAutoDrain`
+    /// 在 R0 §3 命令表内）。**候选 ≠ 实机验证**——运行时仍由新鲜 `availability`
+    /// 二次校验（`command::execute_queue_write`）。
+    #[test]
+    fn queue_edit_is_candidate_on_evidenced_build() {
+        let key = known_build_key();
+        let view = resolve_capabilities(
+            &key,
+            &ZcodeInterfaceEvidence::default(),
+            &MemoryLedger::default(),
+        );
+        assert!(view.queue_edit.enabled, "命令条目命中 → 撤回/修改候选可点");
+        assert_eq!(
+            view.queue_edit.reason_code.as_deref(),
+            Some(CANDIDATE_REASON),
+            "候选档必须带 interface_matched 原因码（区别于实机确认）"
+        );
+        assert!(
+            view.queue_resume.enabled,
+            "setAutoDrain 命中 → 恢复候选可点"
+        );
+        assert_eq!(
+            view.queue_resume.reason_code.as_deref(),
+            Some(CANDIDATE_REASON)
+        );
+    }
+
+    /// 同一 build、同一命令表下 `queue_now` 仍关闭：`sendQueuedNow` 的「立即执行」
+    /// 与「引导当前回合」是否等价没有实机证据 → 不给候选。
+    #[test]
+    fn queue_now_stays_needs_evidence() {
+        let key = known_build_key();
+        let full = ZcodeInterfaceEvidence {
+            method_send: true,
+            has_active_work: true,
+            ..Default::default()
+        };
+        let view = resolve_capabilities(&key, &full, &MemoryLedger::default());
+        assert!(view.send.enabled, "前提：send 在方法在场时可用");
+        assert!(!view.queue_now.enabled, "queue_now 不得进入候选层");
+        assert_eq!(
+            view.queue_now.reason_code.as_deref(),
+            Some(codes::NEEDS_EVIDENCE),
+            "queue_now 关闭原因码必须是 needs_evidence"
+        );
+    }
+
+    /// 未知 build / 非取证平台：三写能力**全部**关闭（命令条目只认已知 build，
+    /// 不因接口形状齐备而放宽）。
+    #[test]
+    fn queue_candidates_require_evidenced_build() {
+        let full = ZcodeInterfaceEvidence {
+            method_send: true,
+            method_resolve_interaction: true,
+            method_stop: true,
+            method_selection_get: true,
+            method_selection_switch: true,
+            has_user_input_pending: true,
+            has_multi_select: true,
+            has_free_text: true,
+            has_permission_pending: true,
+            has_active_work: true,
+            has_model_catalog: true,
+            has_thought_levels: true,
+        };
+        for key in [
+            CapabilityKey::new("macos", "9.9.9.9999", 3, "shape", 1),
+            CapabilityKey::new("linux", "3.16.2.8769", 3, "shape", 1),
+            CapabilityKey::new("macos", "3.16.2.8769", 4, "shape", 1),
+        ] {
+            let view = resolve_capabilities(&key, &full, &MemoryLedger::default());
+            for (name, flag) in [
+                ("queue_edit", &view.queue_edit),
+                ("queue_now", &view.queue_now),
+                ("queue_resume", &view.queue_resume),
+            ] {
+                assert!(!flag.enabled, "{name} 不得在未知 build 上开闸");
+                assert_eq!(
+                    flag.reason_code.as_deref(),
+                    Some(codes::NEEDS_EVIDENCE),
+                    "{name} 关闭原因码必须是 needs_evidence"
+                );
+            }
+        }
+    }
+
+    /// send 开 ≠ 队列开：已知 build 上队列候选来自命令条目，不来自 `send`；未知
+    /// build 上 `send` 即使可用，三写能力仍全关（不借授权）。
+    #[test]
+    fn queue_write_capabilities_never_borrow_send() {
+        let full = ZcodeInterfaceEvidence {
+            method_send: true,
+            ..Default::default()
+        };
+        let unknown = CapabilityKey::new("macos", "9.9.9.9999", 3, "shape", 1);
+        let view = resolve_capabilities(&unknown, &full, &MemoryLedger::default());
+        assert!(view.send.enabled, "前提：send 可用");
+        for (name, flag) in [
+            ("queue_edit", &view.queue_edit),
+            ("queue_now", &view.queue_now),
+            ("queue_resume", &view.queue_resume),
+        ] {
+            assert!(!flag.enabled, "{name} 不得借 send 开闸");
+            assert_eq!(
+                flag.reason_code.as_deref(),
+                Some(codes::NEEDS_EVIDENCE),
+                "{name} 关闭原因码必须是 needs_evidence"
+            );
+        }
+
+        // 已知 build：队列候选与 send 的可用性完全独立（只命令条目在场即可）。
+        let known = resolve_capabilities(
+            &known_build_key(),
+            &ZcodeInterfaceEvidence::default(),
+            &MemoryLedger::default(),
+        );
+        assert!(!known.send.enabled, "前提：无方法时 send 不可用");
+        assert!(known.queue_edit.enabled && known.queue_resume.enabled);
+        assert!(!known.queue_now.enabled);
+    }
+
+    /// 账本 `confirmed`（首次真实动作有界观察的落账结果）把队列三写升到确认档：
+    /// `enabled=true` 且**无原因码**（候选档的原因码随之消失）。
+    #[test]
+    fn ledger_confirmed_promotes_queue_candidate_to_confirmed() {
+        let key = known_build_key();
+        let ledger = MemoryLedger::default();
+        ledger.records.lock().unwrap().push((
+            key.clone(),
+            CapabilityRecord::confirmed(Capability::QueueEdit),
+        ));
+        let view = resolve_capabilities(&key, &ZcodeInterfaceEvidence::default(), &ledger);
+        assert!(view.queue_edit.enabled);
+        assert_eq!(view.queue_edit.reason_code, None, "确认档无原因码");
     }
 
     /// 账本 confirmed 覆盖 shipped：single_select 从候选升级为确认可用；

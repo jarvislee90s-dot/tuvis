@@ -8,7 +8,13 @@
 // - 回执如实：accepted=已受理（≠ 已生效），confirmed 才显示已生效，unknown 保持中性；
 //   send_failed/rejected/unknown 保留草稿、不自动重发。就地原因只展示本地化文案，
 //   `data-reason-code` 才是冻结错误码本身。
-import { useEffect, useRef, useState, type ClipboardEvent as ReactClipboardEvent } from "react";
+import {
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  type ClipboardEvent as ReactClipboardEvent,
+} from "react";
 import i18n from "@/i18n";
 import {
   isZcodeErrorCode,
@@ -17,13 +23,14 @@ import {
   type ControlAction,
   type HeldQueueChoice,
   type HeldQueueDisposition,
+  type QueueView,
   type SessionView,
   type ZcodeErrorCode,
   ZcodeControlApiError,
 } from "@/lib/api/zcodeControl";
 import useZcodeControl from "./useZcodeControl";
 import ZcodePendingCard, { STATUS_KEYS, pendingDomId, zcodeReasonText } from "./ZcodePendingCard";
-import ZcodeQueuePanel from "./ZcodeQueuePanel";
+import ZcodeQueuePanel, { dispatchWritable } from "./ZcodeQueuePanel";
 import { deriveZcodePrimaryAction } from "./zcode-primary-action";
 import {
   attachmentMarkup,
@@ -40,6 +47,36 @@ interface ZcodeControlPanelProps {
 
 /** 附件存储说明段落的 DOM id（aria-controls 的锚点；面板内唯一）。 */
 const ATTACH_HINT_ID = "zcode-attach-hint";
+
+/**
+ * 队列事务的「新鲜证据」预算（计划 §5.3）：`accepted` 只是**已受理**，撤回是否真的
+ * 生效只能靠随后的权威 GET 判定。4s 内拿不到新鲜投影 → `uncertain`（不回填、不重发），
+ * 这是刻意选的「宁可让用户人工核对，也不把可能已执行的消息再编辑一遍」。
+ */
+const QUEUE_CONFIRM_TIMEOUT_MS = 4000;
+const QUEUE_CONFIRM_POLL_MS = 200;
+
+/** 队列动作的可见结果（文案按 state 取键，错误态另挂冻结码）。 */
+type QueueNotice =
+  | { state: "deleted" }
+  | { state: "stale" }
+  | { state: "unchanged" }
+  | { state: "uncertain"; original?: string }
+  /** 原项已撤回，但用户选择不回填（输入框里的新草稿必须保住）。 */
+  | { state: "kept"; original: string }
+  | { state: "error"; reason: string };
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** 传输/回执异常 → 冻结原因码（与 hook 同口径：网络层 offline，其余 unknown）。 */
+function queueErrorCode(error: unknown): ZcodeErrorCode | "unknown" {
+  if (error instanceof ZcodeControlApiError) {
+    return error.code ?? (error.status === null ? "offline" : "unknown");
+  }
+  return "unknown";
+}
 
 /**
  * 冻结原因码 → 本地化文案键。词表随待处理卡一起下沉到
@@ -109,6 +146,56 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
    */
   const [pendingTabId, setPendingTabId] = useState<string | null>(null);
 
+  // ==== W4：队列动作的共享在途槽与草稿事务 ====
+  /** 当前在途的队列项（单写槽：与 `inFlightRef` 同源，一次只允许一个写命令）。 */
+  const [queueBusyItemId, setQueueBusyItemId] = useState<string | null>(null);
+  /** 「恢复运行」在途。 */
+  const [queueBusyResume, setQueueBusyResume] = useState(false);
+  /** 队列动作的可见结果（撤回完成/结果不确定/失败原因）。 */
+  const [queueNotice, setQueueNotice] = useState<QueueNotice | null>(null);
+  /** 只有**新鲜**队列 `paused=false` 才为 true（此前绝不说「已恢复」）。 */
+  const [resumeConfirmed, setResumeConfirmed] = useState(false);
+  /**
+   * 「修改」的草稿冲突三选：`deleted` 表示原项**已撤回**（此时改选只影响回填内容，
+   * 绝不二次删除）。默认焦点在「取消」，绝不静默覆盖已有草稿。
+   */
+  const [draftConflict, setDraftConflict] = useState<{
+    itemId: string;
+    original: string;
+    existing: string;
+    deleted: boolean;
+  } | null>(null);
+  /** 剪贴板不可用时的原文兜底（只读文本框，供人工复制）。 */
+  const [copyFallback, setCopyFallback] = useState<string | null>(null);
+  const [copyDone, setCopyDone] = useState(false);
+  const draftInputRef = useRef<HTMLTextAreaElement | null>(null);
+  const conflictCancelRef = useRef<HTMLButtonElement | null>(null);
+  /** 最近一次落地的会话投影（effect 同步）：队列事务要读**最新**代际，不吃渲染闭包。 */
+  const sessionRef = useRef<SessionView | null>(null);
+  useEffect(() => {
+    sessionRef.current = session;
+  }, [session]);
+
+  /**
+   * 草稿的**唯一**写入口（计划 §5.6）：手动输入、回填、发送后清空、切会话共用，
+   * 保证 `draftRef.current` 与 state 永远同值，消除两处各写一半的竞态。
+   */
+  const updateDraft = useCallback((text: string) => {
+    draftRef.current = text;
+    setDraft(text);
+  }, []);
+
+  // 冲突对话框打开时默认焦点在「取消」（破坏性/覆盖性选项绝不默认聚焦）。
+  useEffect(() => {
+    if (draftConflict !== null) conflictCancelRef.current?.focus();
+  }, [draftConflict]);
+
+  // 「已恢复」只对**本次**恢复有效：队列再次被暂停（回合停止/出错）→ 立即收回这句话，
+  // 免得「已暂停」和「已恢复」并排出现。
+  useEffect(() => {
+    if (session?.queue?.paused === true) setResumeConfirmed(false);
+  }, [session?.queue?.paused]);
+
   // 仅 send 的 accepted 允许清本次草稿（hook 语义）；失败/拒绝/未知一律保留。
   // 迟到回执竞态：accepted 到达时若草稿已被续写成别的内容，那是**新**输入，必须保留——
   // 只有草稿仍等于本次提交原文才清空（连点两次发送的场景由 hook 复位标记兜底）。
@@ -118,8 +205,7 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
     // 竞态守卫：草稿被续写 → 那是新输入，草稿保留。
     const unchanged = submitted !== null && draftRef.current === submitted;
     if (unchanged) {
-      draftRef.current = "";
-      setDraft("");
+      updateDraft("");
     }
     // 三轮评审 P2-2：附件清理**独立于草稿**——已上传并引用进已发送正文的附件属
     // 本次提交，accepted 即按提交批次 id 清除（续加的新附件保留）；文字才按是否
@@ -129,7 +215,7 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
       submittedAttachmentIdsRef.current = null;
       setAttachments((prev) => prev.filter((a) => !sentIds.includes(a.id)));
     }
-  }, [draftCleared]);
+  }, [draftCleared, updateDraft]);
 
   /** choice 选择器打开时默认焦点在「保留旧队列」（破坏性选项绝不默认聚焦）。 */
   useEffect(() => {
@@ -139,11 +225,18 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
   // 换会话清旧回执与旧草稿：上一次会话的受理状态不得贴到新会话。
   useEffect(() => {
     setReceipt(null);
-    setDraft("");
-    draftRef.current = "";
+    updateDraft("");
     submittedDraftRef.current = null;
     // 切会话：旧会话的 choice 选择器不得留下（期望 IDs 属于旧队列）。
     setHeldQueuePrompt(false);
+    // W4：队列动作的在途标识/结果/恢复确认/冲突对话/剪贴板兜底都不跨会话。
+    setQueueBusyItemId(null);
+    setQueueBusyResume(false);
+    setQueueNotice(null);
+    setResumeConfirmed(false);
+    setDraftConflict(null);
+    setCopyFallback(null);
+    setCopyDone(false);
     // 三轮 C：附件与在途上传不跨会话残留。
     setAttachments([]);
     submittedAttachmentIdsRef.current = null;
@@ -163,7 +256,7 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
       for (const ctrl of uploadCtrlsRef.current.values()) ctrl.abort();
       uploadCtrlsRef.current.clear();
     };
-  }, [sessionId]);
+  }, [sessionId, updateDraft]);
 
   // A5 基线「打开官方页面」的显式辅助入口：只读已保存链接（不自动打开、不代理点击）。
   useEffect(() => {
@@ -234,21 +327,35 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
     pendings[0]?.interactionId ??
     null;
 
+  /**
+   * 统一写入口（计划 §5.6）：返回**typed 回执**，供队列事务 `await` 判断命运。
+   * 单在途槽仍是 `inFlightRef`——第二次调用直接抛（绝不产生第二个 actionId）；
+   * 回执落地与清零原因面的语义与原 `runOnce` 完全一致（既有主按钮行为不变）。
+   */
+  const runAction = useCallback(
+    async (action: ControlAction): Promise<ActionReceipt> => {
+      if (inFlightRef.current) throw new Error("zcode_action_busy");
+      inFlightRef.current = true;
+      // 新提交开始即清旧回执（C2）：上一次的「已受理」绝不得贴到在途/失败/未知的
+      // 新动作上——accepted 越级正是本面板要防的失真。
+      setReceipt(null);
+      try {
+        const next = await submit(action);
+        setReceipt(next);
+        return next;
+      } finally {
+        inFlightRef.current = false;
+      }
+    },
+    [submit]
+  );
+
   /** 一次动作一个在途槽：同帧重入直接丢弃，回执只认第一次提交。 */
   const runOnce = (action: ControlAction) => {
     if (inFlightRef.current) return;
-    inFlightRef.current = true;
-    // 新提交开始即清旧回执（C2）：上一次的「已受理」绝不得贴到在途/失败/未知的
-    // 新动作上——accepted 越级正是本面板要防的失真。
-    setReceipt(null);
-    void submit(action)
-      .then(setReceipt)
-      .catch(() => {
-        // 传输层失败：hook 已置冻结原因码；草稿保留，绝不自动重发。
-      })
-      .finally(() => {
-        inFlightRef.current = false;
-      });
+    void runAction(action).catch(() => {
+      // 传输层失败：hook 已置冻结原因码；草稿保留，绝不自动重发。
+    });
   };
 
   // ==== R5/U3：发送／打断共用主按钮 ====
@@ -293,8 +400,8 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
     stopTarget !== null &&
     !attachmentBlocked &&
     !staleGeneration;
-  /** 在途（任一动作 POST 未回）→ 主按钮禁用：零第二个动作。 */
-  const busy = submitting;
+  /** 在途（任一动作 POST 未回，**含队列动作**）→ 主按钮禁用：零第二个动作。 */
+  const busy = submitting || queueBusyItemId !== null || queueBusyResume;
   /** 主按钮唯一动作（纯函数推导，见 zcode-primary-action.ts）。 */
   const primaryAction = deriveZcodePrimaryAction({
     hasContent,
@@ -478,6 +585,364 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
     }
   };
 
+  // ==== W4：官方队列动作（撤回 / 修改回填 / 重排 / 恢复运行）====
+  /** 队列写面：与主按钮同一硬门（配对 + 就绪 + 代际新鲜）。 */
+  const queueWritable = gateReason === null && !staleGeneration;
+  /** 官方 `availability.queueEdit.allowed`（撤回/重排资格；未知 = 关）。 */
+  const queueEditAllowed = session?.queue?.availability?.queueEditAllowed === true;
+  /** 恢复自动处理的独立能力槽位（与「撤回」分开授权；未知 = 关）。 */
+  const queueResumeAllowed = session?.capabilities.queueResume?.enabled === true;
+  /** 队列动作单写槽（与主按钮的 `busy` 同源，这里只用于队列入口的早退判断）。 */
+  const queueBusy = queueBusyItemId !== null || queueBusyResume;
+
+  /**
+   * 轮询**权威 GET** 直到判定成立（超时 → null）。
+   *
+   * 只认「同会话 + 同代际 + ready + 队列已知」的**落地**投影：本地 state 可能是
+   * 动作之前的快照，绝不能拿它当「已经撤回/已经恢复」的证据。`refresh()` 的返回值
+   * 由 `useZcodeControl` 保证是本次真正落地的那一份。
+   */
+  const waitFreshQueue = async (
+    generation: number,
+    judge: (queue: QueueView) => boolean
+  ): Promise<QueueView | null> => {
+    const deadline = Date.now() + QUEUE_CONFIRM_TIMEOUT_MS;
+    for (;;) {
+      const view = await refresh();
+      if (
+        view !== null &&
+        view.sessionId === sessionId &&
+        view.generation === generation &&
+        view.ready &&
+        view.queue?.known === true &&
+        judge(view.queue)
+      ) {
+        return view.queue;
+      }
+      if (Date.now() >= deadline) return null;
+      await sleep(QUEUE_CONFIRM_POLL_MS);
+    }
+  };
+
+  /**
+   * 等「新鲜队列里该项消失」——撤回是否真的生效的**唯一**可判定证据。
+   *
+   * `still` = 新鲜投影里该项仍在（可能是另一端操作/服务端还没落地）；`unknown` =
+   * 连一份新鲜投影都没拿到。两者都**不回填**。
+   */
+  const confirmRemoved = async (
+    generation: number,
+    itemId: string
+  ): Promise<"removed" | "still" | "unknown"> => {
+    const deadline = Date.now() + QUEUE_CONFIRM_TIMEOUT_MS;
+    let seen = false;
+    for (;;) {
+      const view = await refresh();
+      if (
+        view !== null &&
+        view.sessionId === sessionId &&
+        view.generation === generation &&
+        view.ready &&
+        view.queue?.known === true
+      ) {
+        seen = true;
+        if (!view.queue.items.some((item) => item.inputId === itemId)) return "removed";
+      }
+      if (Date.now() >= deadline) return seen ? "still" : "unknown";
+      await sleep(QUEUE_CONFIRM_POLL_MS);
+    }
+  };
+
+  /** 回填草稿（唯一入口）：只改输入框，**绝不自动发送、绝不自动重发**。 */
+  const applyRestoredDraft = (policy: "merge" | "replace", original: string, existing: string) => {
+    const next = policy === "merge" && existing.length > 0 ? `${existing}\n${original}` : original;
+    updateDraft(next);
+    draftInputRef.current?.focus();
+  };
+
+  /**
+   * 「修改」的事务主体（计划 §5.3）：撤回 → 拿到「确实撤回了未消费原项」的证据 →
+   * 回填**完整原文**。任何一步不确定都不回填、不重发，只给人工兜底。
+   */
+  const deleteAndRestore = async (args: {
+    itemId: string;
+    original: string;
+    existing: string;
+    generation: number;
+    policy: "merge" | "replace";
+  }) => {
+    setQueueBusyItemId(args.itemId);
+    try {
+      const receipt = await runAction({
+        kind: "queueDelete",
+        sessionId,
+        generation: args.generation,
+        queueItemId: args.itemId,
+      });
+      if (receipt.state === "unknown") {
+        // 结果不确定：不回填、不重发；原文留在「复制原文」兜底里。
+        setQueueNotice({ state: "uncertain", original: args.original });
+        void refresh();
+        return;
+      }
+      if (receipt.state === "rejected" || receipt.state === "send_failed") {
+        setQueueNotice({ state: "error", reason: receipt.reasonCode ?? "unknown" });
+        void refresh();
+        return;
+      }
+      if (receipt.state === "noop") {
+        setQueueNotice({ state: "unchanged" });
+        void refresh();
+        return;
+      }
+      const outcome = await confirmRemoved(args.generation, args.itemId);
+      if (outcome !== "removed") {
+        setQueueNotice(
+          outcome === "still" ? { state: "stale" } : { state: "uncertain", original: args.original }
+        );
+        void refresh();
+        return;
+      }
+      // 核对仍是原会话/原代际（切会话/换代后回填会把旧内容写进新会话）。
+      const latest = sessionRef.current;
+      if (
+        latest === null ||
+        latest.sessionId !== sessionId ||
+        latest.generation !== args.generation
+      ) {
+        setQueueNotice({ state: "uncertain", original: args.original });
+        return;
+      }
+      // 等待期间用户又输入了：绝不静默覆盖，重新要求选择（此时原项已撤回，不再二次删除）。
+      if (draftRef.current !== args.existing) {
+        setDraftConflict({
+          itemId: args.itemId,
+          original: args.original,
+          existing: draftRef.current,
+          deleted: true,
+        });
+        return;
+      }
+      applyRestoredDraft(args.policy, args.original, args.existing);
+    } catch (error) {
+      setQueueNotice({ state: "error", reason: queueErrorCode(error) });
+      void refresh();
+    } finally {
+      setQueueBusyItemId(null);
+    }
+  };
+
+  /** 「撤回」：只删除，不回填（撤回与修改共享同一删除事务，但不共享回填）。 */
+  const handleQueueDelete = (itemId: string) => {
+    if (queueBusy || inFlightRef.current) return;
+    const view = sessionRef.current;
+    const item = view?.queue?.items.find((candidate) => candidate.inputId === itemId);
+    if (view === null || item === undefined || !queueWritable || !queueEditAllowed) return;
+    if (item.kind !== "sendText" || !dispatchWritable(item)) return;
+    setQueueNotice(null);
+    setCopyFallback(null);
+    setCopyDone(false);
+    setQueueBusyItemId(itemId);
+    void (async () => {
+      try {
+        const receipt = await runAction({
+          kind: "queueDelete",
+          sessionId,
+          generation: view.generation,
+          queueItemId: itemId,
+        });
+        if (receipt.state === "unknown") {
+          setQueueNotice({ state: "uncertain" });
+          void refresh();
+          return;
+        }
+        if (receipt.state === "rejected" || receipt.state === "send_failed") {
+          setQueueNotice({ state: "error", reason: receipt.reasonCode ?? "unknown" });
+          void refresh();
+          return;
+        }
+        if (receipt.state === "noop") {
+          setQueueNotice({ state: "unchanged" });
+          void refresh();
+          return;
+        }
+        // ACK 只到「撤回中」：完成只能由新鲜队列确认（项消失）。
+        const outcome = await confirmRemoved(view.generation, itemId);
+        if (outcome === "removed") setQueueNotice({ state: "deleted" });
+        else setQueueNotice(outcome === "still" ? { state: "stale" } : { state: "uncertain" });
+        void refresh();
+      } catch (error) {
+        setQueueNotice({ state: "error", reason: queueErrorCode(error) });
+        void refresh();
+      } finally {
+        setQueueBusyItemId(null);
+      }
+    })();
+  };
+
+  /**
+   * 「修改」：先取**完整原文** `item.text`（预览只用于展示，绝不进载荷/回填后仍以
+   * 原文为准）。已有草稿 → 先让用户选「合并/替换/取消」，默认取消。
+   */
+  const handleQueueEdit = (itemId: string) => {
+    if (queueBusy || inFlightRef.current) return;
+    const view = sessionRef.current;
+    const item = view?.queue?.items.find((candidate) => candidate.inputId === itemId);
+    if (view === null || item === undefined || !queueWritable || !queueEditAllowed) return;
+    if (item.kind !== "sendText" || item.hasAttachments || !dispatchWritable(item)) return;
+    const original = item.text; // 完整原文（绝不用 queuePreview 的截断结果）
+    const existing = draftRef.current;
+    setQueueNotice(null);
+    setCopyFallback(null);
+    setCopyDone(false);
+    if (existing.length > 0) {
+      setDraftConflict({ itemId, original, existing, deleted: false });
+      return;
+    }
+    void deleteAndRestore({
+      itemId,
+      original,
+      existing,
+      generation: view.generation,
+      policy: "replace",
+    });
+  };
+
+  /** 冲突三选：合并 / 替换 / 取消（默认取消；`deleted` 后不再二次删除）。 */
+  const resolveDraftConflict = (choice: "merge" | "replace" | "cancel") => {
+    const conflict = draftConflict;
+    if (conflict === null) return;
+    if (choice === "cancel") {
+      setDraftConflict(null);
+      // 原项已经撤回：不回填可以，但原文必须留一条人工可取回的路径。
+      if (conflict.deleted) setQueueNotice({ state: "kept", original: conflict.original });
+      return;
+    }
+    if (conflict.deleted) {
+      // 再核对一次：用户在这段时间又改了输入框 → 重新问，绝不覆盖。
+      if (draftRef.current !== conflict.existing) {
+        setDraftConflict({ ...conflict, existing: draftRef.current });
+        return;
+      }
+      setDraftConflict(null);
+      applyRestoredDraft(choice, conflict.original, conflict.existing);
+      return;
+    }
+    setDraftConflict(null);
+    const view = sessionRef.current;
+    if (view === null || view.sessionId !== sessionId) return;
+    void deleteAndRestore({
+      itemId: conflict.itemId,
+      original: conflict.original,
+      existing: conflict.existing,
+      generation: view.generation,
+      policy: choice,
+    });
+  };
+
+  /** 「移到最前/上移/下移」：目标一律是**显式**官方项 ID（绝不传 null / 不猜下标）。 */
+  const handleQueueMove = (itemId: string, beforeQueueItemId: string) => {
+    if (queueBusy || inFlightRef.current) return;
+    const view = sessionRef.current;
+    if (view === null || !queueWritable || !queueEditAllowed) return;
+    // 队列已变（目标项消失）→ 不提交：服务端也会拒，这里先收手等下一次刷新。
+    if (!view.queue?.items.some((item) => item.inputId === beforeQueueItemId)) return;
+    setQueueNotice(null);
+    setQueueBusyItemId(itemId);
+    void (async () => {
+      try {
+        const receipt = await runAction({
+          kind: "queueReorder",
+          sessionId,
+          generation: view.generation,
+          queueItemId: itemId,
+          beforeQueueItemId,
+        });
+        if (receipt.state === "accepted" || receipt.state === "confirmed") {
+          void refresh();
+          return;
+        }
+        setQueueNotice(
+          receipt.state === "unknown"
+            ? { state: "uncertain" }
+            : { state: "error", reason: receipt.reasonCode ?? "unknown" }
+        );
+        void refresh();
+      } catch (error) {
+        setQueueNotice({ state: "error", reason: queueErrorCode(error) });
+        void refresh();
+      } finally {
+        setQueueBusyItemId(null);
+      }
+    })();
+  };
+
+  /**
+   * 「恢复运行」：只发 `queueResume`（绝不自动发送/自动点第二条）。只有新鲜队列
+   * `paused=false` 才显示「已恢复」——那不代表被打断的回合会重启，也不代表下一条
+   * 已经在跑（文案不暗示）。
+   */
+  const handleQueueResume = () => {
+    if (queueBusy || inFlightRef.current) return;
+    const view = sessionRef.current;
+    if (view === null || !queueWritable || !queueResumeAllowed) return;
+    if (view.queue?.paused !== true) return;
+    setQueueNotice(null);
+    setResumeConfirmed(false);
+    setQueueBusyResume(true);
+    void (async () => {
+      try {
+        const receipt = await runAction({
+          kind: "queueResume",
+          sessionId,
+          generation: view.generation,
+        });
+        if (receipt.state === "unknown") {
+          setQueueNotice({ state: "uncertain" });
+          void refresh();
+          return;
+        }
+        if (receipt.state === "rejected" || receipt.state === "send_failed") {
+          setQueueNotice({ state: "error", reason: receipt.reasonCode ?? "unknown" });
+          void refresh();
+          return;
+        }
+        if (receipt.state === "noop") {
+          setQueueNotice({ state: "unchanged" });
+          void refresh();
+          return;
+        }
+        const queue = await waitFreshQueue(view.generation, (fresh) => fresh.paused === false);
+        if (queue === null) {
+          setQueueNotice({ state: "uncertain" });
+          void refresh();
+          return;
+        }
+        setResumeConfirmed(true);
+      } catch (error) {
+        setQueueNotice({ state: "error", reason: queueErrorCode(error) });
+        void refresh();
+      } finally {
+        setQueueBusyResume(false);
+      }
+    })();
+  };
+
+  /** 「复制原文」人工兜底：剪贴板不可用（非安全上下文/jsdom）→ 只读文本框给全文。 */
+  const copyOriginal = async (text: string) => {
+    setCopyDone(false);
+    try {
+      if (navigator.clipboard?.writeText !== undefined) {
+        await navigator.clipboard.writeText(text);
+        setCopyDone(true);
+        return;
+      }
+    } catch {
+      // 权限/非安全上下文：落到只读文本框。
+    }
+    setCopyFallback(text);
+  };
+
   // 模型/档位：目录只来自 session.selection（当前 provider）；写面硬门 + 能力两闸
   // 同开才可提交，任一关闭 → 两个控件都禁用并显示可见原因。
   const selection = session?.selection ?? null;
@@ -657,10 +1122,121 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
             />
           </div>
         ))}
-      {/* 官方输入队列（只读）：默认一行（数量 + 暂停），点开才列正文。
-          放在 pending 卡之后、工具栏之前——运行中发送的排队事实比档位更贴近
-          用户此刻的疑问（「我刚发的那条去哪了」）。未知/空队列不占位。 */}
-      <ZcodeQueuePanel queue={session?.queue} />
+      {/* 官方输入队列（W4）：默认一行（数量 + 暂停 + 恢复运行），点开才列条目。
+          每行「序号 → 20 字素预览 → 引导/修改/撤回」；所有写动作只传官方 inputId，
+          由本面板负责生成信封、验证新鲜队列与草稿事务。未知/空队列不占位。 */}
+      <ZcodeQueuePanel
+        queue={session?.queue}
+        canWrite={queueWritable}
+        queueEditAllowed={queueEditAllowed}
+        queueResumeAllowed={queueResumeAllowed}
+        busyItemId={queueBusyItemId}
+        busyResume={queueBusyResume}
+        resumeConfirmed={resumeConfirmed}
+        onEditToDraft={handleQueueEdit}
+        onDelete={handleQueueDelete}
+        onMove={handleQueueMove}
+        onResume={handleQueueResume}
+      />
+      {/* 队列动作结果：撤回完成必须等新鲜队列确认；不确定态只给人工兜底。 */}
+      {queueNotice !== null && (
+        <p
+          data-testid="zcode-queue-notice"
+          data-state={queueNotice.state}
+          data-reason-code={queueNotice.state === "error" ? queueNotice.reason : undefined}
+          className="mb-2 text-xs text-[var(--mut)]"
+        >
+          {queueNotice.state === "error"
+            ? zcodeReasonText(queueNotice.reason)
+            : i18n.t(
+                queueNotice.state === "deleted"
+                  ? "mobile.zcodeControl.queueDeleted"
+                  : queueNotice.state === "stale"
+                    ? "mobile.zcodeControl.queueItemStillQueued"
+                    : queueNotice.state === "unchanged"
+                      ? "mobile.zcodeControl.queueUnchanged"
+                      : queueNotice.state === "kept"
+                        ? "mobile.zcodeControl.queueEditCancelledKept"
+                        : "mobile.zcodeControl.queueResultUncertain"
+              )}
+        </p>
+      )}
+      {(queueNotice?.state === "uncertain" || queueNotice?.state === "kept") && (
+        <div className="mb-2 flex flex-wrap items-center gap-2">
+          <button
+            type="button"
+            data-testid="zcode-queue-copy-original"
+            onClick={() => void copyOriginal(queueNotice.original ?? "")}
+            className="rounded-full border border-[var(--cb)] px-3 py-1 text-xs text-[var(--tx)]"
+          >
+            {i18n.t("mobile.zcodeControl.queueCopyOriginal")}
+          </button>
+          {copyDone && (
+            <span data-testid="zcode-queue-copied" className="text-xs text-[var(--mut)]">
+              {i18n.t("mobile.zcodeControl.queueCopied")}
+            </span>
+          )}
+        </div>
+      )}
+      {/* 剪贴板不可用时的人工兜底：全文只读，供手动选择复制（不自动发送）。 */}
+      {copyFallback !== null && (
+        <textarea
+          data-testid="zcode-queue-copy-fallback"
+          aria-label={i18n.t("mobile.zcodeControl.queueCopyOriginal")}
+          readOnly
+          value={copyFallback}
+          rows={3}
+          className="mb-2 w-full resize-none rounded-lg border border-[var(--cb)] px-2 py-1 text-xs text-[var(--tx)]"
+        />
+      )}
+      {/* 草稿冲突三选（默认焦点在「取消」）：绝不静默覆盖用户已经写下的内容。 */}
+      {draftConflict !== null && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="zcode-draft-conflict-title"
+          data-testid="zcode-draft-conflict"
+          className="mb-2 rounded-lg border border-[var(--cb)] bg-[var(--cbg)] p-2"
+        >
+          <p id="zcode-draft-conflict-title" className="text-xs font-medium text-[var(--tx)]">
+            {i18n.t("mobile.zcodeControl.queueEditConflictTitle")}
+          </p>
+          <p className="mt-1 text-[11px] leading-4 text-[var(--mut)]">
+            {i18n.t(
+              draftConflict.deleted
+                ? "mobile.zcodeControl.queueEditConflictChanged"
+                : "mobile.zcodeControl.queueEditConflictHint"
+            )}
+          </p>
+          <div className="mt-2 flex flex-wrap gap-2">
+            <button
+              type="button"
+              data-testid="zcode-draft-conflict-merge"
+              onClick={() => resolveDraftConflict("merge")}
+              className="rounded-lg border border-[var(--cb)] px-3 py-1.5 text-xs text-[var(--tx)]"
+            >
+              {i18n.t("mobile.zcodeControl.queueEditConflictMerge")}
+            </button>
+            <button
+              type="button"
+              data-testid="zcode-draft-conflict-replace"
+              onClick={() => resolveDraftConflict("replace")}
+              className="rounded-lg border border-[var(--cb)] px-3 py-1.5 text-xs text-[var(--tx)]"
+            >
+              {i18n.t("mobile.zcodeControl.queueEditConflictReplace")}
+            </button>
+            <button
+              ref={conflictCancelRef}
+              type="button"
+              data-testid="zcode-draft-conflict-cancel"
+              onClick={() => resolveDraftConflict("cancel")}
+              className="rounded-lg px-3 py-1.5 text-xs text-[var(--mut)]"
+            >
+              {i18n.t("mobile.zcodeControl.queueEditConflictCancel")}
+            </button>
+          </div>
+        </div>
+      )}
       {/* ==== 单行紧凑工具栏（R4/U2）====
           「打开官方页面」+ 模型 + 思考强度 三者同一容器、同一行；行为与协议
           零变化（openOfficial 只开已保存链接，模型/档位仍发同形状 selection）。
@@ -823,14 +1399,12 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
           </button>
         </span>
         <textarea
+          ref={draftInputRef}
           data-testid="zcode-draft"
           aria-label={i18n.t("mobile.zcodeControl.draftAria")}
           value={draft}
           rows={2}
-          onChange={(e) => {
-            draftRef.current = e.target.value;
-            setDraft(e.target.value);
-          }}
+          onChange={(e) => updateDraft(e.target.value)}
           onPaste={handleZcodePaste}
           placeholder={i18n.t("mobile.zcodeControl.draftPlaceholder")}
           className="min-h-0 flex-1 resize-none rounded-lg border border-[var(--cb)] px-3 py-2 text-sm text-[var(--tx)] placeholder:text-[var(--mut)] focus:ring-2 focus:ring-[var(--btnp)] focus:outline-none"

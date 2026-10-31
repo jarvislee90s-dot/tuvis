@@ -97,6 +97,19 @@
 //! [`SELECTION_CONFIRM_TIMEOUT`] 内观察到 revision 前进**且** provider/model/thought
 //! 精确等于目标才 `confirmed`。产品保留用户选择，**绝不**回带恢复原值/原模型的写帧，
 //! 也绝无 sendText 或第二帧。
+//!
+//! # 队列写（W3）
+//!
+//! 四个官方命令（`deleteQueueItem`/`reorderQueueItem`/`sendQueuedNow`/`setAutoDrain`）
+//! 走「只读幂等预检 → **队列专属**能力闸（`queue_edit`/`queue_now`/`queue_resume`，
+//! 默认关闭 → `needs_evidence`，**不借 send/approval_reply、不接受验收许可放宽**）→
+//! 写前新鲜官方队列（`StopPort::session` 一次只读）→ 按 `queueItemId` 复核
+//! （代际/就绪/项存在/`dispatch.state=="queued"`/`state.availability` 放行）→
+//! 写前预留 → 恰一帧」。`QueueResume` 只要求 `queue.known && paused==Some(true)`
+//! （items 为空也允许）且只发 `{autoDrain:true}`；`QueueReorder` 只接受显式目标 ID
+//! （`null`=移末尾未实机确认）。ACK accepted/duplicate 只算受理，**不宣布删除/重排/恢复
+//! 完成**；rejected/failed 如实反馈，stale/无法解释/超窗 → unknown 且不重放。
+//! 因缺实机写证据，生产三个槽位恒关闭（见 `capability::key::shipped_state`）。
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -138,6 +151,21 @@ pub const RESOLVE_INTERACTION_TYPE: &str = "resolveInteraction";
 /// 信封 `type`（打断；探针 `INTERACTION_COMMAND_TYPES.stop`，
 /// `command.ts:161-164`：payload `{expectedForegroundExecutionId}`，守卫 id 必带）。
 pub const STOP_TYPE: &str = "stop";
+
+/// 信封 `type`（撤回队列项；R0 §3 命令表 `deleteQueueItem{queueItemId}`）。
+pub const DELETE_QUEUE_ITEM_TYPE: &str = "deleteQueueItem";
+
+/// 信封 `type`（重排队列项；R0 §3 命令表
+/// `reorderQueueItem{queueItemId,beforeQueueItemId}`，`before` 可为 `null`=末尾）。
+pub const REORDER_QUEUE_ITEM_TYPE: &str = "reorderQueueItem";
+
+/// 信封 `type`（让队列项**立即执行**；R0 §3 `sendQueuedNow{queueItemId,…}`）。
+///
+/// 语义是「立即执行」，**不是**「引导当前回合」（两者是否等价尚无实机证据）。
+pub const SEND_QUEUED_NOW_TYPE: &str = "sendQueuedNow";
+
+/// 信封 `type`（暂停/恢复队列自动处理；R0 §3 `setAutoDrain{autoDrain}`）。
+pub const SET_AUTO_DRAIN_TYPE: &str = "setAutoDrain";
 
 /// ACK 等待窗（20s，与生产计划一致）：原样交给端口（桥的 RPC 待答条目按它收口
 /// 并清账），窗内无应答按保守 `unknown`，绝不重发。
@@ -470,6 +498,177 @@ fn classify_send_ack(
     (state, reason, None)
 }
 
+/// 队列写命令的 ACK 分类（**复用** [`classify_ack`]，只补一个官方状态语义）。
+///
+/// 官方 `CommandAck.status` 全值域是 `accepted|rejected|stale|duplicate|noop|failed`
+/// （R0 §4）。通用 `classify_ack` 把 `failed` 归 `unknown`（对 send 是保守正确的）；
+/// 队列写需要区分「宿主确证失败」与「结果未知」：`failed` 是命令失败的确证，按
+/// `rejected` 收口（手机可刷新后由用户重新发起），`stale`/其它仍按 `unknown`。
+///
+/// `accepted`/`duplicate` 只表示**已受理/确认中**：本函数不据此宣布删除/重排/恢复
+/// 已完成（因果终态只能由后续新鲜队列帧佐证，本批不做乐观更新）。
+fn classify_queue_ack(ack: &Value) -> (ActionState, Option<String>) {
+    if ack.get("status").and_then(Value::as_str) == Some("failed") {
+        return (ActionState::Rejected, None);
+    }
+    classify_ack(ack)
+}
+
+/// 队列写动作对应的**队列专属**能力槽位（绝不借 `send`/`approval_reply`）。
+///
+/// 只回答「能力矩阵是否放行」；候选档（`reason_code="interface_matched"`）同样
+/// 返回 true——它是**必要而非充分**条件，运行时资格见 [`queue_write_payload`]。
+fn queue_capability_open(capabilities: &CapabilityView, action: &ControlAction) -> bool {
+    match action {
+        ControlAction::QueueDelete { .. } | ControlAction::QueueReorder { .. } => {
+            capabilities.queue_edit_enabled()
+        }
+        ControlAction::QueueNow { .. } => capabilities.queue_now_enabled(),
+        ControlAction::QueueResume { .. } => capabilities.queue_resume_enabled(),
+        _ => false,
+    }
+}
+
+/// 队列写动作对应的官方信封 `type`（命令表键名）。
+fn queue_command_type(action: &ControlAction) -> Option<&'static str> {
+    match action {
+        ControlAction::QueueDelete { .. } => Some(DELETE_QUEUE_ITEM_TYPE),
+        ControlAction::QueueReorder { .. } => Some(REORDER_QUEUE_ITEM_TYPE),
+        ControlAction::QueueNow { .. } => Some(SEND_QUEUED_NOW_TYPE),
+        ControlAction::QueueResume { .. } => Some(SET_AUTO_DRAIN_TYPE),
+        _ => None,
+    }
+}
+
+/// 统一队列命令信封（`commandId/clientId/sessionId/type/payload/issuedAt`）。
+///
+/// 与 send/stop/resolve 同一条管线：走 [`CommandPort::call`]（生产 =
+/// `BridgeManager` 的 `sendConversationCommandV4`），**不新开通道**、不自行外套超时。
+fn make_queue_envelope(target: &BoundTarget, command_type: &str, payload: Value) -> Value {
+    serde_json::json!({
+        "commandId": new_command_id(),
+        // 协议身份与握手同源；device_id 不进协议信封（官方校验握手身份）。
+        "clientId": PROTOCOL_CLIENT_ID,
+        "sessionId": target.session_id,
+        "type": command_type,
+        "payload": payload,
+        "issuedAt": now_ms(),
+    })
+}
+
+/// 官方 `state.availability.queueEdit.allowed == true`（未知/收回一律拒绝）。
+fn require_queue_edit_allowed(view: &SessionView) -> ZResult<()> {
+    if view.queue.availability.known && view.queue.availability.queue_edit_allowed {
+        return Ok(());
+    }
+    // 冻结码：当前状态下该操作无效（宿主没放行），手机刷新后由用户重新决定。
+    Err(invalid_action())
+}
+
+/// 官方 `state.availability.sendQueuedNow.allowed == true`（未知/收回一律拒绝）。
+fn require_queue_now_allowed(view: &SessionView) -> ZResult<()> {
+    if view.queue.availability.known && view.queue.availability.send_queued_now_allowed {
+        return Ok(());
+    }
+    Err(invalid_action())
+}
+
+/// 在**新鲜**队列里按官方 `queueItemId` 定位可写项。
+///
+/// - 队列未宣告（`known=false`）→ `not_ready`（不可判定，刷新后重试）；
+/// - 项不存在 → `invalid_action`（已消费/已变化，绝不按位置猜目标）；
+/// - `dispatch.state != "queued"`（`reserved`/`promoting`/`drained`/未知）→
+///   `invalid_action`：这些项已在飞行中或已消费，写命令只会与宿主竞态。
+fn require_writable_queue_item(view: &SessionView, queue_item_id: &str) -> ZResult<()> {
+    if !view.queue.known {
+        return Err(ZcodeError::of(codes::NOT_READY));
+    }
+    let Some(item) = view
+        .queue
+        .items
+        .iter()
+        .find(|item| item.input_id == queue_item_id)
+    else {
+        return Err(invalid_action());
+    };
+    if item.dispatch_state.as_deref() != Some("queued") {
+        return Err(invalid_action());
+    }
+    Ok(())
+}
+
+/// 队列写动作的写前校验 + 官方 payload 构造（**纯函数**：零帧、零 I/O、零日志）。
+///
+/// 校验顺序（任一不过即 fail closed，返回既有冻结码，不新造码）：
+/// 1. 视图必须是精确目标（会话 id + 本代际）且 `ready=true`；
+/// 2. 撤回/重排/立即执行：队列已宣告 + 目标项存在 + `dispatch.state=="queued"`
+///    + 官方 availability 明确放行；
+/// 3. 重排：`beforeQueueItemId` 必须是新鲜队列里**另一个**已存在项——`null`
+///    （官方语义「移到末尾」）未经实机确认，本批一律拒绝；
+/// 4. 恢复：只要求 `queue.known && paused==Some(true)`，**items 为空也允许**
+///    （官方暂停是容器级状态），且只发 `autoDrain:true`。
+fn queue_write_payload(
+    view: &SessionView,
+    target: &BoundTarget,
+    action: &ControlAction,
+) -> ZResult<Value> {
+    if view.session_id != target.session_id {
+        return Err(ZcodeError::of(codes::NO_SESSION));
+    }
+    if view.generation != target.bridge_generation() {
+        return Err(ZcodeError::of(codes::STALE_GENERATION));
+    }
+    if !view.ready {
+        return Err(ZcodeError::of(codes::NOT_READY));
+    }
+    match action {
+        ControlAction::QueueDelete { queue_item_id, .. } => {
+            require_writable_queue_item(view, queue_item_id)?;
+            require_queue_edit_allowed(view)?;
+            Ok(serde_json::json!({ "queueItemId": queue_item_id }))
+        }
+        ControlAction::QueueReorder {
+            queue_item_id,
+            before_queue_item_id,
+            ..
+        } => {
+            require_writable_queue_item(view, queue_item_id)?;
+            require_queue_edit_allowed(view)?;
+            // `null` = 「移到末尾」：官方字段允许 null，但本环境没有实机证据证明
+            // 该语义，绝不猜——只接受显式目标 ID（W4 菜单因此只做上移/下移/最前）。
+            let Some(before) = before_queue_item_id.as_deref() else {
+                return Err(invalid_action());
+            };
+            if before == queue_item_id {
+                return Err(invalid_action());
+            }
+            if !view.queue.items.iter().any(|item| item.input_id == before) {
+                return Err(invalid_action());
+            }
+            Ok(serde_json::json!({
+                "queueItemId": queue_item_id,
+                "beforeQueueItemId": before,
+            }))
+        }
+        ControlAction::QueueNow { queue_item_id, .. } => {
+            require_writable_queue_item(view, queue_item_id)?;
+            require_queue_now_allowed(view)?;
+            Ok(serde_json::json!({ "queueItemId": queue_item_id }))
+        }
+        ControlAction::QueueResume { .. } => {
+            if !view.queue.known {
+                return Err(ZcodeError::of(codes::NOT_READY));
+            }
+            if view.queue.paused != Some(true) {
+                return Err(invalid_action());
+            }
+            // 只解除暂停：不重启被打断的回合、不重发任何队列项。
+            Ok(serde_json::json!({ "autoDrain": true }))
+        }
+        _ => Err(invalid_action()),
+    }
+}
+
 /// `switchModelConfig` 的 ACK 分类（官方 `CommandAck.status`；B4 源码口径）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SelectionAck {
@@ -658,10 +857,11 @@ impl CommandSender {
 
     /// 执行一次控制动作。
     ///
-    /// 已接入 `Send`/`Answer`/`Snooze`/`Stop`/`Permission`/`Selection`；其余变体一律
-    /// `invalid_action` 且零帧零行。Answer/Snooze/Stop/Permission/Selection 在未装配
-    /// 对应端口时一律 `not_ready`（零帧零行，生产接线在 T7.1）；`Permission` 与
-    /// `Selection` 各受能力闸（默认关闭 → `needs_evidence`）。
+    /// 已接入 `Send`/`Answer`/`Snooze`/`Stop`/`Permission`/`Selection` 与四个
+    /// `Queue*` 动作；其余变体一律 `invalid_action` 且零帧零行。
+    /// Answer/Snooze/Stop/Permission/Selection/Queue* 在未装配对应端口时一律
+    /// `not_ready`（零帧零行，生产接线在 T7.1）；`Permission`/`Selection` 与三个
+    /// 队列槽位各受能力闸（默认关闭 → `needs_evidence`）。
     pub async fn execute(
         &self,
         ctx: &ActionContext,
@@ -695,6 +895,18 @@ impl CommandSender {
             ControlAction::Selection { .. } => {
                 self.execute_selection(ctx, target, action, permits).await
             }
+            // 队列写：能力闸在 `execute_queue_write` 内按**队列专属槽位**判定，
+            // T8.2 验收许可不放宽它们（`permits` 与队列写无关）。
+            ControlAction::QueueDelete { .. } => {
+                self.execute_queue_delete(ctx, target, action).await
+            }
+            ControlAction::QueueReorder { .. } => {
+                self.execute_queue_reorder(ctx, target, action).await
+            }
+            ControlAction::QueueNow { .. } => self.execute_queue_now(ctx, target, action).await,
+            ControlAction::QueueResume { .. } => {
+                self.execute_queue_resume(ctx, target, action).await
+            }
         }
     }
 
@@ -713,6 +925,13 @@ impl CommandSender {
             ControlAction::Stop { .. } => Ok(vec!["interrupt"]),
             ControlAction::Permission { .. } => Ok(vec!["approval_reply"]),
             ControlAction::Selection { .. } => Ok(vec!["model", "thought_level"]),
+            // 队列写：每次只要求**一个**队列专属槽位（`queue_edit` 同时覆盖撤回与
+            // 重排）。它绝不复用 `send`/`approval_reply` 的授权。
+            ControlAction::QueueDelete { .. } | ControlAction::QueueReorder { .. } => {
+                Ok(vec!["queue_edit"])
+            }
+            ControlAction::QueueNow { .. } => Ok(vec!["queue_now"]),
+            ControlAction::QueueResume { .. } => Ok(vec!["queue_resume"]),
             ControlAction::Answer { interaction_id, .. }
             | ControlAction::Snooze { interaction_id, .. } => {
                 let Some(pending) = self.pending.as_ref() else {
@@ -1335,6 +1554,128 @@ impl CommandSender {
         }
         self.record(&receipt);
         Ok(receipt)
+    }
+
+    /// 撤回一条官方队列项（`deleteQueueItem`）。
+    async fn execute_queue_delete(
+        &self,
+        ctx: &ActionContext,
+        target: &BoundTarget,
+        action: &ControlAction,
+    ) -> ZResult<ActionReceipt> {
+        self.execute_queue_write(ctx, target, action).await
+    }
+
+    /// 重排一条官方队列项（`reorderQueueItem`；目标按 ID，不按位置）。
+    async fn execute_queue_reorder(
+        &self,
+        ctx: &ActionContext,
+        target: &BoundTarget,
+        action: &ControlAction,
+    ) -> ZResult<ActionReceipt> {
+        self.execute_queue_write(ctx, target, action).await
+    }
+
+    /// 让一条官方队列项**立即执行**（`sendQueuedNow`；不是「引导」）。
+    async fn execute_queue_now(
+        &self,
+        ctx: &ActionContext,
+        target: &BoundTarget,
+        action: &ControlAction,
+    ) -> ZResult<ActionReceipt> {
+        self.execute_queue_write(ctx, target, action).await
+    }
+
+    /// 恢复队列自动处理（`setAutoDrain{autoDrain:true}`；不重发任何队列项）。
+    async fn execute_queue_resume(
+        &self,
+        ctx: &ActionContext,
+        target: &BoundTarget,
+        action: &ControlAction,
+    ) -> ZResult<ActionReceipt> {
+        self.execute_queue_write(ctx, target, action).await
+    }
+
+    /// 队列写的统一派发：幂等预检 → 能力闸 → 新鲜队列校验 → 预留 → **恰一帧**。
+    ///
+    /// 纪律（与 send/stop/resolve 同款）：
+    /// - 同 actionId 同参数 → 既有回执，**零帧**（先于能力闸，闸收回也不吞回执）；
+    /// - 能力闸 closed → `needs_evidence`，零帧零行零队列读取；候选档放行后仍要
+    ///   过写前新鲜资格（`availability`/`paused`），不满足 → `invalid_action`
+    ///   （队列未宣告 → `not_ready`），同样零帧；
+    /// - 写前只读一次新鲜官方投影（[`Self::fresh_queue_view`]），目标必须来自本帧；
+    /// - ACK `accepted|duplicate` 只算受理；`rejected|failed` 如实回拒绝；`stale`/
+    ///   无法解释/超窗 → `unknown`，**绝不重放**、不做乐观更新；
+    /// - 不新开通道、不外包超时：一律 `CommandPort::call` + [`ACK_TIMEOUT`]。
+    async fn execute_queue_write(
+        &self,
+        ctx: &ActionContext,
+        target: &BoundTarget,
+        action: &ControlAction,
+    ) -> ZResult<ActionReceipt> {
+        let Some(command_type) = queue_command_type(action) else {
+            return Err(invalid_action());
+        };
+        // 只读幂等预检（零帧零写）。
+        if let Some(existing) = self.lookup_action(ctx, target, action)? {
+            return Ok(existing);
+        }
+        // 队列专属能力闸（closed → needs_evidence；候选档放行到运行时资格校验，
+        // 不接受 T8.2 许可放宽）。
+        let capabilities = self.current_capabilities();
+        if !queue_capability_open(&capabilities, action) {
+            return Err(ZcodeError::of(codes::NEEDS_EVIDENCE));
+        }
+        // 写前新鲜官方队列（端口未装配/不新鲜 → not_ready，零帧零行）。
+        let view = self.fresh_queue_view(target).await?;
+        let payload = queue_write_payload(&view, target, action)?;
+        // 写即将发生：此时才预留（指纹只含类别 + 会话 + 代际 + 项 ID，无正文）。
+        if let Some(existing) = self.reserve_action(ctx, target, action)? {
+            return Ok(existing);
+        }
+        let envelope = make_queue_envelope(target, command_type, payload);
+        let (state, reason_code) = match self
+            .bridge
+            .call(
+                target,
+                AGENT_CHANNEL,
+                AGENT_SEND_COMMAND_METHOD,
+                vec![envelope],
+                self.ack_timeout,
+            )
+            .await
+        {
+            Err(error) => classify_port_error(&error),
+            Ok(ack) => classify_queue_ack(&ack),
+        };
+        // `accepted` 只表示宿主受理/确认中：删除是否真的生效、重排后的顺序、恢复后的
+        // `paused` 都要由后续新鲜队列帧佐证，本层不升级 confirmed、不重试。
+        let receipt = self.make_receipt(ctx, target, state, reason_code);
+        self.record(&receipt);
+        Ok(receipt)
+    }
+
+    /// 队列写前的**新鲜**官方视图（只读，零写命令）。
+    ///
+    /// 复用 [`StopPort::session`]（同一精确目标读面，不再开第二条连接）；预算用
+    /// [`Self::initial_control_timeout`]，端口必须在预算内返回（内部只读重同步），
+    /// 到期 `not_ready`。本层只读**一次**、不轮询：队列项存在性必须来自本帧，
+    /// 拿不到就不写（绝不拿旧投影猜目标）。
+    async fn fresh_queue_view(&self, target: &BoundTarget) -> ZResult<SessionView> {
+        let Some(port) = self.stop.as_ref() else {
+            return Err(ZcodeError::of(codes::NOT_READY));
+        };
+        let view = port.session(target, self.initial_control_timeout).await?;
+        if view.session_id != target.session_id {
+            return Err(ZcodeError::of(codes::NO_SESSION));
+        }
+        if view.generation != target.bridge_generation() {
+            return Err(ZcodeError::of(codes::STALE_GENERATION));
+        }
+        if !view.ready {
+            return Err(ZcodeError::of(codes::NOT_READY));
+        }
+        Ok(view)
     }
 
     /// autoResolution 前置（答案与权限共用）：恰一帧 snooze，必须 Ok
@@ -5319,8 +5660,8 @@ mod tests {
         use super::*;
 
         use crate::services::zcode_control::types::{
-            CapabilityView, HeldQueueChoice, HeldQueueDisposition, InputRoutingView, QueueItemView,
-            QueueView, SessionView,
+            CapabilityView, HeldQueueChoice, HeldQueueDisposition, InputRoutingView,
+            QueueActionAvailability, QueueItemView, QueueView, SessionView,
         };
 
         struct FakeSessions {
@@ -5385,8 +5726,12 @@ mod tests {
                             input_id: (*id).to_owned(),
                             text: format!("queued {index}"),
                             position: Some(index as u32),
+                            kind: Some("sendText".to_owned()),
+                            dispatch_state: Some("queued".to_owned()),
+                            has_attachments: false,
                         })
                         .collect(),
+                    availability: QueueActionAvailability::default(),
                 },
                 input_routing: mode.map(|mode| InputRoutingView {
                     mode: mode.to_owned(),
@@ -7053,6 +7398,794 @@ mod tests {
             assert_eq!(replay, first, "闸收回不得把「做过」误报成「没做过」");
             assert_eq!(switch_frames(&fake).len(), 1);
             assert_eq!(row_count(&store), 1);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // W3：四个官方队列写动作
+    // -----------------------------------------------------------------------
+
+    /// 队列写用例组：fake `CommandPort`（记录出站帧）+ fake `StopPort`（只读队列投影）。
+    ///
+    /// 能力矩阵用 `CapabilityPolicy::verified_fixture()`（`#[cfg(test)]`，生产不存在）
+    /// 只是为了把「闸已开」这一前提摆到台面上；每个用例都另有一条**默认全关**的对照，
+    /// 证明队列写不会因为一次成功就被推断为可用。
+    mod queue_write {
+        use super::*;
+
+        use crate::services::zcode_control::types::{
+            CapabilityPolicy, QueueActionAvailability, QueueItemView, QueueView, SessionView,
+        };
+
+        /// 只读队列投影的 fake 端口（记录读次数，验证「闸关闭时零读取」）。
+        struct FakeQueuePort {
+            view: SessionView,
+            calls: AtomicUsize,
+        }
+
+        impl FakeQueuePort {
+            fn new(view: SessionView) -> Arc<Self> {
+                Arc::new(Self {
+                    view,
+                    calls: AtomicUsize::new(0),
+                })
+            }
+
+            fn calls(&self) -> usize {
+                self.calls.load(Ordering::SeqCst)
+            }
+        }
+
+        impl StopPort for FakeQueuePort {
+            fn session<'a>(
+                &'a self,
+                _target: &'a BoundTarget,
+                _timeout: Duration,
+            ) -> BoxFuture<'a, ZResult<SessionView>> {
+                Box::pin(async move {
+                    self.calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(self.view.clone())
+                })
+            }
+
+            fn wait_stop_cleared<'a>(
+                &'a self,
+                _target: &'a BoundTarget,
+                _execution_id: &'a str,
+                _baseline_revision: u64,
+                _timeout: Duration,
+            ) -> BoxFuture<'a, bool> {
+                Box::pin(async { false })
+            }
+        }
+
+        /// 官方队列项（`kind=sendText` + `dispatch.state` 白名单值）。
+        fn item(id: &str, position: u32, dispatch: &str) -> QueueItemView {
+            QueueItemView {
+                input_id: id.to_owned(),
+                text: format!("queued {id}"),
+                position: Some(position),
+                kind: Some("sendText".to_owned()),
+                dispatch_state: Some(dispatch.to_owned()),
+                has_attachments: false,
+            }
+        }
+
+        /// 官方 `state.availability` 的两种投影（放行 / 未知）。
+        fn availability(edit: bool, now: bool) -> QueueActionAvailability {
+            QueueActionAvailability {
+                known: true,
+                queue_edit_allowed: edit,
+                send_queued_now_allowed: now,
+            }
+        }
+
+        /// 会话视图（`paused=true` 表示 `autoDrain=false`）。
+        fn view(
+            items: Vec<QueueItemView>,
+            paused: bool,
+            availability: QueueActionAvailability,
+        ) -> SessionView {
+            SessionView {
+                session_id: SESSION.to_owned(),
+                generation: GEN,
+                revision: Some(11),
+                ready: true,
+                pending: Vec::new(),
+                control: None,
+                selection: None,
+                capabilities: CapabilityView::default(),
+                queue: QueueView {
+                    known: true,
+                    paused: Some(paused),
+                    pause_reason: paused.then(|| "stopped".to_owned()),
+                    items,
+                    availability,
+                },
+                input_routing: None,
+            }
+        }
+
+        /// 闸已开（测试夹具）+ 队列读面已装配的 sender。
+        fn open_sender(
+            fake: &Arc<FakeBridge>,
+            store: &DeviceStore,
+            port: &Arc<FakeQueuePort>,
+        ) -> CommandSender {
+            sender(fake, store)
+                .with_capabilities(CapabilityPolicy::verified_fixture())
+                .with_stop(port.clone())
+        }
+
+        fn delete_action(item_id: &str) -> ControlAction {
+            ControlAction::QueueDelete {
+                session_id: SESSION.to_owned(),
+                generation: GEN,
+                queue_item_id: item_id.to_owned(),
+            }
+        }
+
+        fn reorder_action(item_id: &str, before: Option<&str>) -> ControlAction {
+            ControlAction::QueueReorder {
+                session_id: SESSION.to_owned(),
+                generation: GEN,
+                queue_item_id: item_id.to_owned(),
+                before_queue_item_id: before.map(str::to_owned),
+            }
+        }
+
+        fn now_action(item_id: &str) -> ControlAction {
+            ControlAction::QueueNow {
+                session_id: SESSION.to_owned(),
+                generation: GEN,
+                queue_item_id: item_id.to_owned(),
+            }
+        }
+
+        fn resume_action() -> ControlAction {
+            ControlAction::QueueResume {
+                session_id: SESSION.to_owned(),
+                generation: GEN,
+            }
+        }
+
+        fn payload(fake: &FakeBridge, index: usize) -> Value {
+            fake.envelope(index)["payload"].clone()
+        }
+
+        /// 施工单 §10.2：同 actionId 同参数 → 零重派发；同 id 换参数 → 冲突。
+        #[tokio::test]
+        async fn queue_delete_replay_emits_one_official_command() {
+            let store = DeviceStore::memory();
+            let fake = FakeBridge::new(Reply::Body(serde_json::json!({"status": "accepted"})));
+            let port = FakeQueuePort::new(view(
+                vec![item("queue_a", 0, "queued"), item("queue_b", 1, "queued")],
+                false,
+                availability(true, true),
+            ));
+            let sender = open_sender(&fake, &store, &port);
+            let action = delete_action("queue_a");
+
+            let first = sender
+                .execute(&ctx("q-del-1"), &target(), &action)
+                .await
+                .unwrap();
+            let replay = sender
+                .execute(&ctx("q-del-1"), &target(), &action)
+                .await
+                .unwrap();
+
+            assert_eq!(first.state, ActionState::Accepted);
+            assert_eq!(replay, first, "重放必须原样回既有回执");
+            assert_eq!(fake.wire(), 1, "同 actionId 同参数只允许一帧");
+            assert_eq!(port.calls(), 1, "重放不得重读宿主队列");
+            assert_eq!(row_count(&store), 1);
+
+            let frame = &fake.frames()[0];
+            assert_eq!(frame.channel, AGENT_CHANNEL);
+            assert_eq!(frame.method, AGENT_SEND_COMMAND_METHOD, "复用既有命令管线");
+            let envelope = fake.envelope(0);
+            assert_eq!(envelope["type"], DELETE_QUEUE_ITEM_TYPE);
+            assert_eq!(envelope["sessionId"], SESSION);
+            assert_eq!(envelope["clientId"], PROTOCOL_CLIENT_ID);
+            assert!(envelope["commandId"]
+                .as_str()
+                .is_some_and(|id| !id.is_empty()));
+            assert!(envelope["issuedAt"].is_number());
+            assert_eq!(
+                payload(&fake, 0),
+                serde_json::json!({"queueItemId": "queue_a"}),
+                "撤回只发项 ID，不带正文/位置"
+            );
+
+            // 同 actionId 换目标项 = 换了动作 → 冲突，且仍然零新帧。
+            let conflict = sender
+                .execute(&ctx("q-del-1"), &target(), &delete_action("queue_b"))
+                .await
+                .unwrap_err();
+            assert_eq!(conflict.code, codes::ACTION_PAYLOAD_CONFLICT);
+            assert_eq!(fake.wire(), 1);
+            assert_eq!(row_count(&store), 1);
+        }
+
+        /// ACK 闭环：`accepted/duplicate` 只算受理；`rejected/failed` 如实拒绝；
+        /// `stale`/无法解释 → unknown（绝不乐观宣布删除完成）。
+        #[tokio::test]
+        async fn queue_ack_distinguishes_accepted_rejected_and_unknown() {
+            let cases = [
+                (
+                    serde_json::json!({"status": "accepted"}),
+                    ActionState::Accepted,
+                ),
+                (
+                    serde_json::json!({"status": "duplicate"}),
+                    ActionState::Accepted,
+                ),
+                (
+                    serde_json::json!({"status": "rejected"}),
+                    ActionState::Rejected,
+                ),
+                (
+                    serde_json::json!({"status": "failed"}),
+                    ActionState::Rejected,
+                ),
+                (serde_json::json!({"status": "stale"}), ActionState::Unknown),
+                (serde_json::json!({"status": "noop"}), ActionState::Noop),
+                (serde_json::json!({"weird": true}), ActionState::Unknown),
+            ];
+            for (ack, expected) in cases {
+                let store = DeviceStore::memory();
+                let fake = FakeBridge::new(Reply::Body(ack.clone()));
+                let port = FakeQueuePort::new(view(
+                    vec![item("queue_a", 0, "queued")],
+                    false,
+                    availability(true, true),
+                ));
+                let sender = open_sender(&fake, &store, &port);
+                let receipt = sender
+                    .execute(&ctx("q-ack"), &target(), &delete_action("queue_a"))
+                    .await
+                    .unwrap();
+                assert_eq!(receipt.state, expected, "ACK {ack} 的收口语义");
+                assert_eq!(fake.wire(), 1, "任何 ACK 都只发一帧，绝不重试");
+            }
+        }
+
+        /// ACK 超窗（端口 `not_ready`）：按保守 `unknown` 收口，不重放。
+        #[tokio::test]
+        async fn queue_ack_timeout_stays_unknown_without_replay() {
+            let store = DeviceStore::memory();
+            let fake = FakeBridge::new(Reply::Error(codes::NOT_READY));
+            let port = FakeQueuePort::new(view(
+                vec![item("queue_a", 0, "queued")],
+                false,
+                availability(true, true),
+            ));
+            let sender = open_sender(&fake, &store, &port);
+            let receipt = sender
+                .execute(&ctx("q-timeout"), &target(), &delete_action("queue_a"))
+                .await
+                .unwrap();
+            assert_eq!(receipt.state, ActionState::Unknown);
+            assert_eq!(receipt.reason_code.as_deref(), Some(codes::NOT_READY));
+            assert_eq!(fake.wire(), 1, "写后未知绝不自动重发");
+
+            // 同 actionId 重放：回既有 unknown 回执，仍零新帧。
+            let replay = sender
+                .execute(&ctx("q-timeout"), &target(), &delete_action("queue_a"))
+                .await
+                .unwrap();
+            assert_eq!(replay.state, ActionState::Unknown);
+            assert_eq!(fake.wire(), 1);
+        }
+
+        /// 施工单 §10.2：重排按 `queueItemId` & `beforeQueueItemId`（不是位置）；
+        /// 宿主队列变化后必须重新核验（旧目标 → 拒绝且零帧）。
+        #[tokio::test]
+        async fn queue_reorder_targets_ids_not_positions() {
+            let store = DeviceStore::memory();
+            let fake = FakeBridge::new(Reply::Body(serde_json::json!({"status": "accepted"})));
+            let queue = vec![
+                item("queue_a", 0, "queued"),
+                item("queue_b", 1, "queued"),
+                item("queue_c", 2, "queued"),
+            ];
+            let port = FakeQueuePort::new(view(queue.clone(), false, availability(true, true)));
+            let sender = open_sender(&fake, &store, &port);
+
+            // 把 #2 移到 #1 之前：目标全部是宿主 ID，载荷不含位置/下标。
+            let receipt = sender
+                .execute(
+                    &ctx("q-reorder-1"),
+                    &target(),
+                    &reorder_action("queue_b", Some("queue_a")),
+                )
+                .await
+                .unwrap();
+            assert_eq!(receipt.state, ActionState::Accepted);
+            assert_eq!(fake.wire(), 1);
+            let envelope = fake.envelope(0);
+            assert_eq!(envelope["type"], REORDER_QUEUE_ITEM_TYPE);
+            assert_eq!(
+                payload(&fake, 0),
+                serde_json::json!({"queueItemId": "queue_b", "beforeQueueItemId": "queue_a"})
+            );
+
+            // 宿主队列已变化（queue_b 已被消费）：用旧 ID 重排 → 拒绝且零帧。
+            let store2 = DeviceStore::memory();
+            let fake2 = FakeBridge::new(Reply::Body(serde_json::json!({"status": "accepted"})));
+            let changed = FakeQueuePort::new(view(
+                vec![item("queue_a", 0, "queued"), item("queue_c", 1, "queued")],
+                false,
+                availability(true, true),
+            ));
+            let sender2 = open_sender(&fake2, &store2, &changed);
+            let stale = sender2
+                .execute(
+                    &ctx("q-reorder-2"),
+                    &target(),
+                    &reorder_action("queue_b", Some("queue_a")),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(stale.code, codes::INVALID_ACTION, "目标已不在新鲜队列");
+            assert_eq!(fake2.wire(), 0);
+
+            // beforeQueueItemId = null（官方「移末尾」语义未经实机确认）：拒绝。
+            let null_before = sender
+                .execute(
+                    &ctx("q-reorder-3"),
+                    &target(),
+                    &reorder_action("queue_c", None),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(null_before.code, codes::INVALID_ACTION);
+            assert_eq!(fake.wire(), 1, "null 目标不得产生任何出站帧");
+
+            // before == 自身 / before 不在队列：同样拒绝。
+            let self_before = sender
+                .execute(
+                    &ctx("q-reorder-4"),
+                    &target(),
+                    &reorder_action("queue_a", Some("queue_a")),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(self_before.code, codes::INVALID_ACTION);
+            let missing_before = sender
+                .execute(
+                    &ctx("q-reorder-5"),
+                    &target(),
+                    &reorder_action("queue_a", Some("queue_missing")),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(missing_before.code, codes::INVALID_ACTION);
+            assert_eq!(fake.wire(), 1);
+        }
+
+        /// 施工单 §10.2：恢复只改 `autoDrain`（恰一帧），绝不顺带发送 B/C。
+        #[tokio::test]
+        async fn queue_resume_only_changes_auto_drain() {
+            let store = DeviceStore::memory();
+            let fake = FakeBridge::new(Reply::Body(serde_json::json!({"status": "accepted"})));
+            let port = FakeQueuePort::new(view(
+                vec![item("queue_b", 0, "queued"), item("queue_c", 1, "queued")],
+                true,
+                availability(false, false),
+            ));
+            let sender = open_sender(&fake, &store, &port);
+
+            let receipt = sender
+                .execute(&ctx("q-resume-1"), &target(), &resume_action())
+                .await
+                .unwrap();
+            assert_eq!(receipt.state, ActionState::Accepted);
+            assert_eq!(fake.wire(), 1, "恢复恰好一帧");
+            let frame = &fake.frames()[0];
+            assert_eq!(frame.method, AGENT_SEND_COMMAND_METHOD);
+            assert_eq!(fake.envelope(0)["type"], SET_AUTO_DRAIN_TYPE);
+            assert_eq!(
+                payload(&fake, 0),
+                serde_json::json!({"autoDrain": true}),
+                "只解除暂停：不带项 ID/正文/投递意向"
+            );
+            assert!(
+                fake.frames()
+                    .iter()
+                    .all(|frame| frame.args[0]["type"] != SEND_TEXT_TYPE),
+                "恢复绝不隐式重发队列项"
+            );
+            assert_eq!(row_count(&store), 1);
+
+            // 未暂停（paused=false）时恢复是无效动作：零帧。
+            let store2 = DeviceStore::memory();
+            let fake2 = FakeBridge::new(Reply::Body(serde_json::json!({"status": "accepted"})));
+            let running = FakeQueuePort::new(view(
+                vec![item("queue_b", 0, "queued")],
+                false,
+                availability(false, false),
+            ));
+            let sender2 = open_sender(&fake2, &store2, &running);
+            let err = sender2
+                .execute(&ctx("q-resume-2"), &target(), &resume_action())
+                .await
+                .unwrap_err();
+            assert_eq!(err.code, codes::INVALID_ACTION);
+            assert_eq!(fake2.wire(), 0);
+        }
+
+        /// 官方暂停是容器级状态：`paused=true` + **空队列**仍允许恢复。
+        #[tokio::test]
+        async fn queue_resume_allowed_with_empty_items() {
+            let store = DeviceStore::memory();
+            let fake = FakeBridge::new(Reply::Body(serde_json::json!({"status": "accepted"})));
+            let port = FakeQueuePort::new(view(Vec::new(), true, availability(false, false)));
+            let sender = open_sender(&fake, &store, &port);
+
+            let receipt = sender
+                .execute(&ctx("q-resume-empty"), &target(), &resume_action())
+                .await
+                .unwrap();
+            assert_eq!(receipt.state, ActionState::Accepted);
+            assert_eq!(fake.wire(), 1);
+            assert_eq!(payload(&fake, 0), serde_json::json!({"autoDrain": true}));
+        }
+
+        /// 施工单 §10.2：能力缺省全关、代际错误、无项、reserved/promoting、资格未放行
+        /// 一律零帧；**`send` 开闸不等于队列可写**。
+        #[tokio::test]
+        async fn queue_actions_refuse_unknown_or_unready_state() {
+            // 1) 能力默认全关：needs_evidence，零帧、零行、零队列读取。
+            let store = DeviceStore::memory();
+            let fake = FakeBridge::new(Reply::Body(serde_json::json!({"status": "accepted"})));
+            let port = FakeQueuePort::new(view(
+                vec![item("queue_a", 0, "queued")],
+                true,
+                availability(true, true),
+            ));
+            let closed = sender(&fake, &store).with_stop(port.clone());
+            let err = closed
+                .execute(&ctx("q-closed"), &target(), &delete_action("queue_a"))
+                .await
+                .unwrap_err();
+            assert_eq!(err.code, codes::NEEDS_EVIDENCE);
+            assert_eq!(fake.wire(), 0);
+            assert_eq!(row_count(&store), 0);
+            assert_eq!(port.calls(), 0, "闸关闭时连队列都不读");
+
+            // 2) 只有 `send` 开闸：队列写仍然不可用（不借 send 的授权）。
+            let store = DeviceStore::memory();
+            let fake = FakeBridge::new(Reply::Body(serde_json::json!({"status": "accepted"})));
+            let port = FakeQueuePort::new(view(
+                vec![item("queue_a", 0, "queued")],
+                true,
+                availability(true, true),
+            ));
+            let send_only = CapabilityView {
+                send: crate::services::zcode_control::types::CapabilityFlag {
+                    enabled: true,
+                    reason_code: None,
+                },
+                ..CapabilityView::default()
+            };
+            let send_sender = sender(&fake, &store)
+                .with_capabilities(send_only)
+                .with_stop(port.clone());
+            for action in [
+                delete_action("queue_a"),
+                reorder_action("queue_a", Some("queue_b")),
+                now_action("queue_a"),
+                resume_action(),
+            ] {
+                let err = send_sender
+                    .execute(&ctx("q-send-only"), &target(), &action)
+                    .await
+                    .unwrap_err();
+                assert_eq!(
+                    err.code,
+                    codes::NEEDS_EVIDENCE,
+                    "{} 不得借 send 放行",
+                    action.kind()
+                );
+            }
+            assert_eq!(fake.wire(), 0);
+            assert_eq!(row_count(&store), 0);
+            assert_eq!(port.calls(), 0);
+
+            // 3) 投影不新鲜 / 换代 / 队列未宣告 / 目标项不存在 / 状态不可写 / 资格未放行。
+            let cases: Vec<(&'static str, SessionView, &'static str)> = vec![
+                (
+                    "unready",
+                    {
+                        let mut v = view(
+                            vec![item("queue_a", 0, "queued")],
+                            false,
+                            availability(true, true),
+                        );
+                        v.ready = false;
+                        v
+                    },
+                    codes::NOT_READY,
+                ),
+                (
+                    "stale generation",
+                    {
+                        let mut v = view(
+                            vec![item("queue_a", 0, "queued")],
+                            false,
+                            availability(true, true),
+                        );
+                        v.generation = GEN + 1;
+                        v
+                    },
+                    codes::STALE_GENERATION,
+                ),
+                (
+                    "queue unknown",
+                    {
+                        let mut v = view(Vec::new(), false, availability(true, true));
+                        v.queue.known = false;
+                        v
+                    },
+                    codes::NOT_READY,
+                ),
+                (
+                    "item missing",
+                    view(Vec::new(), false, availability(true, true)),
+                    codes::INVALID_ACTION,
+                ),
+                (
+                    "item reserved",
+                    view(
+                        vec![item("queue_a", 0, "reserved")],
+                        false,
+                        availability(true, true),
+                    ),
+                    codes::INVALID_ACTION,
+                ),
+                (
+                    "item promoting",
+                    view(
+                        vec![item("queue_a", 0, "promoting")],
+                        false,
+                        availability(true, true),
+                    ),
+                    codes::INVALID_ACTION,
+                ),
+                (
+                    "item drained",
+                    view(
+                        vec![item("queue_a", 0, "drained")],
+                        false,
+                        availability(true, true),
+                    ),
+                    codes::INVALID_ACTION,
+                ),
+                (
+                    "dispatch unknown",
+                    view(
+                        vec![QueueItemView {
+                            input_id: "queue_a".to_owned(),
+                            text: "queued".to_owned(),
+                            position: Some(0),
+                            kind: Some("sendText".to_owned()),
+                            dispatch_state: None,
+                            has_attachments: false,
+                        }],
+                        false,
+                        availability(true, true),
+                    ),
+                    codes::INVALID_ACTION,
+                ),
+                (
+                    "availability revoked",
+                    view(
+                        vec![item("queue_a", 0, "queued")],
+                        false,
+                        availability(false, false),
+                    ),
+                    codes::INVALID_ACTION,
+                ),
+                (
+                    "availability unknown",
+                    view(
+                        vec![item("queue_a", 0, "queued")],
+                        false,
+                        QueueActionAvailability::default(),
+                    ),
+                    codes::INVALID_ACTION,
+                ),
+            ];
+            for (label, session, expected) in cases {
+                let store = DeviceStore::memory();
+                let fake = FakeBridge::new(Reply::Body(serde_json::json!({"status": "accepted"})));
+                let port = FakeQueuePort::new(session);
+                let sender = open_sender(&fake, &store, &port);
+                let err = sender
+                    .execute(&ctx("q-refuse"), &target(), &delete_action("queue_a"))
+                    .await
+                    .unwrap_err();
+                assert_eq!(err.code, expected, "{label} 必须零帧拒绝");
+                assert_eq!(fake.wire(), 0, "{label} 不得产生出站帧");
+                assert_eq!(row_count(&store), 0, "{label} 不得占用 actionId");
+            }
+        }
+
+        /// 候选档（`enabled=true` + `reasonCode="interface_matched"`）能力矩阵：
+        /// 与 resolver 对已知 build 的产出同形。`queue_now` 保持关闭（无候选）。
+        fn candidate_capabilities() -> CapabilityView {
+            let candidate = || crate::services::zcode_control::types::CapabilityFlag {
+                enabled: true,
+                reason_code: Some("interface_matched".to_owned()),
+            };
+            CapabilityView {
+                queue_edit: candidate(),
+                queue_resume: candidate(),
+                ..CapabilityView::default()
+            }
+        }
+
+        /// 候选层**不是**运行时放行：能力闸开了，但新鲜 `availability` / `paused`
+        /// 不满足时仍必须零帧拒绝，且只用既有冻结码。
+        #[tokio::test]
+        async fn queue_action_rejected_when_availability_disallows() {
+            // 1) 撤回/重排：宿主 `availability.queueEdit.allowed=false` → invalid_action。
+            for (label, action) in [
+                ("delete", delete_action("queue_a")),
+                ("reorder", reorder_action("queue_a", Some("queue_b"))),
+            ] {
+                let store = DeviceStore::memory();
+                let fake = FakeBridge::new(Reply::Body(serde_json::json!({"status": "accepted"})));
+                let port = FakeQueuePort::new(view(
+                    vec![item("queue_a", 0, "queued"), item("queue_b", 1, "queued")],
+                    false,
+                    availability(false, true),
+                ));
+                let queue_sender = sender(&fake, &store)
+                    .with_capabilities(candidate_capabilities())
+                    .with_stop(port.clone());
+                let err = queue_sender
+                    .execute(&ctx("q-cand-edit"), &target(), &action)
+                    .await
+                    .unwrap_err();
+                assert_eq!(
+                    err.code,
+                    codes::INVALID_ACTION,
+                    "{label}: 候选档必须被运行时资格拦下"
+                );
+                assert_eq!(fake.wire(), 0, "{label}: 不得产生出站帧");
+                assert_eq!(row_count(&store), 0, "{label}: 不得占用 actionId");
+                assert_eq!(port.calls(), 1, "{label}: 只能只读一次新鲜队列");
+            }
+
+            // 2) 恢复：`paused != Some(true)` → invalid_action（未暂停无需恢复）。
+            let store = DeviceStore::memory();
+            let fake = FakeBridge::new(Reply::Body(serde_json::json!({"status": "accepted"})));
+            let port = FakeQueuePort::new(view(
+                vec![item("queue_a", 0, "queued")],
+                false,
+                availability(true, true),
+            ));
+            let queue_sender = sender(&fake, &store)
+                .with_capabilities(candidate_capabilities())
+                .with_stop(port.clone());
+            let err = queue_sender
+                .execute(&ctx("q-cand-resume"), &target(), &resume_action())
+                .await
+                .unwrap_err();
+            assert_eq!(err.code, codes::INVALID_ACTION);
+            assert_eq!(fake.wire(), 0);
+            assert_eq!(row_count(&store), 0);
+
+            // 3) 恢复：队列未宣告（`known=false`）→ not_ready（无法判定是否暂停）。
+            let store = DeviceStore::memory();
+            let fake = FakeBridge::new(Reply::Body(serde_json::json!({"status": "accepted"})));
+            let mut session = view(Vec::new(), true, availability(true, true));
+            session.queue.known = false;
+            let port = FakeQueuePort::new(session);
+            let queue_sender = sender(&fake, &store)
+                .with_capabilities(candidate_capabilities())
+                .with_stop(port.clone());
+            let err = queue_sender
+                .execute(&ctx("q-cand-unknown"), &target(), &resume_action())
+                .await
+                .unwrap_err();
+            assert_eq!(err.code, codes::NOT_READY);
+            assert_eq!(fake.wire(), 0);
+            assert_eq!(row_count(&store), 0);
+        }
+
+        /// 候选档 + 运行时资格齐备：撤回恰一帧、恢复恰一帧（证明候选层确实打通
+        /// 了此前恒 `needs_evidence` 的链路）。
+        #[tokio::test]
+        async fn queue_candidate_passes_when_availability_allows() {
+            let store = DeviceStore::memory();
+            let fake = FakeBridge::new(Reply::Body(serde_json::json!({"status": "accepted"})));
+            let port = FakeQueuePort::new(view(
+                vec![item("queue_a", 0, "queued")],
+                true,
+                availability(true, true),
+            ));
+            let queue_sender = sender(&fake, &store)
+                .with_capabilities(candidate_capabilities())
+                .with_stop(port.clone());
+            let receipt = queue_sender
+                .execute(
+                    &ctx("q-cand-ok-delete"),
+                    &target(),
+                    &delete_action("queue_a"),
+                )
+                .await
+                .unwrap();
+            assert_eq!(receipt.state, ActionState::Accepted);
+            assert_eq!(fake.envelope(0)["type"], DELETE_QUEUE_ITEM_TYPE);
+
+            let receipt = queue_sender
+                .execute(&ctx("q-cand-ok-resume"), &target(), &resume_action())
+                .await
+                .unwrap();
+            assert_eq!(receipt.state, ActionState::Accepted);
+            assert_eq!(fake.envelope(1)["type"], SET_AUTO_DRAIN_TYPE);
+            assert_eq!(payload(&fake, 1), serde_json::json!({"autoDrain": true}));
+        }
+
+        /// `QueueNow` 是「立即执行」（`sendQueuedNow`），载荷只有项 ID；它必须要求
+        /// `sendQueuedNow.allowed`（不是 `queueEdit.allowed`）。
+        #[tokio::test]
+        async fn queue_now_uses_send_queued_now_capability_slot() {
+            // 只开 queueEdit、未开 sendQueuedNow → 拒绝（两个资格互不代替）。
+            let store = DeviceStore::memory();
+            let fake = FakeBridge::new(Reply::Body(serde_json::json!({"status": "accepted"})));
+            let port = FakeQueuePort::new(view(
+                vec![item("queue_a", 0, "queued")],
+                false,
+                availability(true, false),
+            ));
+            let sender = open_sender(&fake, &store, &port);
+            let err = sender
+                .execute(&ctx("q-now-1"), &target(), &now_action("queue_a"))
+                .await
+                .unwrap_err();
+            assert_eq!(err.code, codes::INVALID_ACTION);
+            assert_eq!(fake.wire(), 0);
+
+            // 放行后：恰一帧 sendQueuedNow，载荷只含项 ID（不叫 guide，不带投递意向）。
+            let store = DeviceStore::memory();
+            let fake = FakeBridge::new(Reply::Body(serde_json::json!({"status": "accepted"})));
+            let port = FakeQueuePort::new(view(
+                vec![item("queue_a", 0, "queued")],
+                false,
+                availability(true, true),
+            ));
+            let sender = open_sender(&fake, &store, &port);
+            let receipt = sender
+                .execute(&ctx("q-now-2"), &target(), &now_action("queue_a"))
+                .await
+                .unwrap();
+            assert_eq!(receipt.state, ActionState::Accepted);
+            assert_eq!(fake.envelope(0)["type"], SEND_QUEUED_NOW_TYPE);
+            assert_eq!(
+                payload(&fake, 0),
+                serde_json::json!({"queueItemId": "queue_a"})
+            );
+        }
+
+        /// 未装配队列读面（端口缺失）：`not_ready`，零帧零行（绝不盲写）。
+        #[tokio::test]
+        async fn queue_write_without_read_port_is_not_ready() {
+            let store = DeviceStore::memory();
+            let fake = FakeBridge::new(Reply::Body(serde_json::json!({"status": "accepted"})));
+            let sender =
+                sender(&fake, &store).with_capabilities(CapabilityPolicy::verified_fixture());
+            let err = sender
+                .execute(&ctx("q-no-port"), &target(), &delete_action("queue_a"))
+                .await
+                .unwrap_err();
+            assert_eq!(err.code, codes::NOT_READY);
+            assert_eq!(fake.wire(), 0);
+            assert_eq!(row_count(&store), 0);
         }
     }
 }

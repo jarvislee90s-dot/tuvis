@@ -7,7 +7,7 @@
 //! 边界纪律：`ZcodeInterfaceEvidence` 只记录方法存在性与 pending / control /
 //! selection 的**形状布尔**，绝不承载正文、题目、选项、答案、JWT、链接。
 
-/// 八项远程能力（与 `types::CapabilityView` 八字段一一对应；spec R2/§4.1）。
+/// 十一项远程能力（与 `types::CapabilityView` 十一字段一一对应；spec R2/§4.1）。
 ///
 /// 声明序即 `Ord` 序（仅用于 `BTreeMap` 键），**不是**解析优先级——优先级归
 /// T4 resolver（confirmed > interface_matched > inconclusive > unsupported）。
@@ -29,11 +29,17 @@ pub(crate) enum Capability {
     Model,
     /// 思考档位切换（selection.switch 的 thought 维度）。
     ThoughtLevel,
+    /// 队列撤回/重排（`deleteQueueItem` / `reorderQueueItem`）。
+    QueueEdit,
+    /// 队列「立即执行」（`sendQueuedNow`；不是「引导」）。
+    QueueNow,
+    /// 恢复队列自动处理（`setAutoDrain(true)`）。
+    QueueResume,
 }
 
 impl Capability {
     /// 固定字符串标识（spec R6 账本 `capability` 列与 resolver 的稳定键；
-    /// 八项取值冻结，不得随版本漂移）。
+    /// 取值冻结，不得随版本漂移）。
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Capability::Send => "send",
@@ -44,6 +50,9 @@ impl Capability {
             Capability::ApprovalReply => "approval_reply",
             Capability::Model => "model",
             Capability::ThoughtLevel => "thought_level",
+            Capability::QueueEdit => "queue_edit",
+            Capability::QueueNow => "queue_now",
+            Capability::QueueResume => "queue_resume",
         }
     }
 }
@@ -134,8 +143,8 @@ mod tests {
     use super::*;
     use crate::services::zcode_control::types::CapabilityView;
 
-    /// 八项固定字符串（spec R6 账本 `capability` 列的稳定键），且与
-    /// `types::CapabilityView` 八字段一一对应（解构即编译期核对字段存在）。
+    /// 固定字符串（spec R6 账本 `capability` 列的稳定键），且与
+    /// `types::CapabilityView` 十一字段一一对应（解构即编译期核对字段存在）。
     #[test]
     fn capability_strings_match_capability_view_fields() {
         let view = CapabilityView::default();
@@ -148,6 +157,9 @@ mod tests {
             approval_reply,
             model,
             thought_level,
+            queue_edit,
+            queue_now,
+            queue_resume,
         } = view;
         drop((
             send,
@@ -158,6 +170,9 @@ mod tests {
             approval_reply,
             model,
             thought_level,
+            queue_edit,
+            queue_now,
+            queue_resume,
         ));
 
         let strings: Vec<&str> = [
@@ -169,6 +184,9 @@ mod tests {
             Capability::ApprovalReply,
             Capability::Model,
             Capability::ThoughtLevel,
+            Capability::QueueEdit,
+            Capability::QueueNow,
+            Capability::QueueResume,
         ]
         .iter()
         .map(|capability| capability.as_str())
@@ -184,6 +202,9 @@ mod tests {
                 "approval_reply",
                 "model",
                 "thought_level",
+                "queue_edit",
+                "queue_now",
+                "queue_resume",
             ]
         );
     }

@@ -713,6 +713,11 @@ pub trait HubBackend: Send + Sync {
                 ControlAction::Stop { .. } => Ok(vec!["interrupt"]),
                 ControlAction::Permission { .. } => Ok(vec!["approval_reply"]),
                 ControlAction::Selection { .. } => Ok(vec!["model", "thought_level"]),
+                ControlAction::QueueDelete { .. } | ControlAction::QueueReorder { .. } => {
+                    Ok(vec!["queue_edit"])
+                }
+                ControlAction::QueueNow { .. } => Ok(vec!["queue_now"]),
+                ControlAction::QueueResume { .. } => Ok(vec!["queue_resume"]),
                 ControlAction::Answer { .. } | ControlAction::Snooze { .. } => {
                     Err(ZcodeError::of(codes::NOT_READY))
                 }
@@ -1196,6 +1201,10 @@ fn capability_flag<'a>(
         "approval_reply" => &policy.approval_reply,
         "model" => &policy.model,
         "thought_level" => &policy.thought_level,
+        // 队列专属槽位：与 send/approval_reply 物理隔离，绝不互相借用。
+        "queue_edit" => &policy.queue_edit,
+        "queue_now" => &policy.queue_now,
+        "queue_resume" => &policy.queue_resume,
         _ => return None,
     })
 }
@@ -1560,15 +1569,66 @@ impl Inner {
         Some(merged)
     }
 
+    /// **降级态**（`current.ready=false`）收到同会话同代**不更新**的快照（`revision <=`
+    /// 或 `None`）：不整份替换，只按「安全降级/恢复」语义更新 `ready` 与能力。
+    ///
+    /// 与手机侧 [`merge_recovered_view`]/`degrade` 对齐：
+    /// - `incoming.ready=true`（恢复）：内容（`pending/queue/control/selection`）与序号锚
+    ///   一概留 `current`，只把 `ready` 置 true、能力取 `incoming` 的权威现读值（允许由
+    ///   关变开）；否则降级后能力被清成全关，恢复视图又给不出序号时会永久停在关闭态。
+    /// - `incoming.ready=false`：内容仍留 `current`，`ready` 保持 false、能力保持全关
+    ///   （安全降级不得携带任何旧开闸矩阵）。
+    ///
+    /// 返回 `Some` = 需要发布合并视图；`None` = 不属于本场景（新序号/跨会话/换代/当前未
+    /// 降级，按原规则整份落地）。
+    fn merge_degraded_current(
+        current: &SessionView,
+        incoming: &SessionView,
+    ) -> Option<SessionView> {
+        if current.ready
+            || current.session_id != incoming.session_id
+            || current.generation != incoming.generation
+        {
+            return None;
+        }
+        let stale = match (current.revision, incoming.revision) {
+            (Some(current_revision), Some(incoming_revision)) => {
+                incoming_revision <= current_revision
+            }
+            (Some(_), None) => true,
+            // 当前无锚：没有任何可比较序号，一律按原规则整份落地。
+            (None, _) => false,
+        };
+        if !stale {
+            return None;
+        }
+        let mut merged = current.clone();
+        merged.ready = incoming.ready;
+        merged.capabilities = if incoming.ready {
+            incoming.capabilities.clone()
+        } else {
+            CapabilityView::default()
+        };
+        Some(merged)
+    }
+
     /// 写回一份已发布会话视图：同一会话同代的旧 revision 不得覆盖较新的视图。
     ///
     /// 返回 `(是否写入, 当前权威视图)`：拒绝时第二个值是既有更新的已发布视图，调用方
     /// 可据此回给手机（HTTP GET 不得回退），且不会广播一次倒退事件。
     ///
     /// 旧 revision 的 `ready=false` 仍会发布（安全降级必须能广播），但发布的是**合并
-    /// 视图**：内容用较新视图，`ready/capabilities` 取更严的一侧。
+    /// 视图**：内容用较新视图，`ready/capabilities` 取更严的一侧。已降级视图（`current`
+    /// `ready=false`）遇到**不更新**的快照（`revision <=` 或 `None`）同样合并（见
+    /// [`Inner::merge_degraded_current`]）：内容不倒回旧读，`ready` 与能力按「安全降级/
+    /// 恢复」语义更新——恢复能开机能力，降级保持全关。
     fn publish_session(&mut self, view: SessionView) -> (bool, SessionView) {
         if let Some(current) = self.tracked_sessions.get(&view.session_id) {
+            if let Some(merged) = Self::merge_degraded_current(current, &view) {
+                self.last_session = Some(merged.clone());
+                self.track_session(&merged);
+                return (true, merged);
+            }
             if !Self::should_replace_published(current, &view) {
                 return (false, current.clone());
             }
@@ -1578,6 +1638,13 @@ impl Inner {
                 return (true, merged);
             }
         } else if let Some(current) = self.last_session.as_ref() {
+            if current.session_id == view.session_id {
+                if let Some(merged) = Self::merge_degraded_current(current, &view) {
+                    self.last_session = Some(merged.clone());
+                    self.track_session(&merged);
+                    return (true, merged);
+                }
+            }
             if current.session_id == view.session_id
                 && !Self::should_replace_published(current, &view)
             {
@@ -3300,7 +3367,9 @@ impl ZcodeHub {
         }
         self.control_generation()?;
         // 能力闸分三段：
-        // - 静态动作（Send/Stop/Permission/Selection）在 bind 前按策略/许可检查；
+        // - 静态动作（Send/Stop/Permission/Selection/队列四动作）在 bind 前按
+        //   策略/许可检查；队列动作只走**队列专属**槽位（`queue_edit`/`queue_now`/
+        //   `queue_resume`），不因 `send` 开闸而放行；
         // - Answer/Snooze 在 bind 前先做**廉价否决**：四项问答/审批能力全关且无
         //   任何匹配许可 → needs_evidence（零 bind、零 I/O）；
         // - 否则绑定公开目标，再读宿主 pending 卡的题型推导**全部**所需能力
@@ -3357,6 +3426,13 @@ impl ZcodeHub {
             // 已宣告且目标守卫在场」收窄——无守卫可等待时不登记、不触发。
             ControlAction::Stop { .. } => vec![Capability::Interrupt],
             // Snooze 只暂停自动结束计时，不是作答/审批：零登记。
+            // 队列写：本批**不**登记任何能力确认（不冒充 send/interrupt 的能力
+            // 确认面）。将来若做队列确认，目标必须是「itemId + 观察到的状态迁移」，
+            // 绝不能因「队列项消失」就判定宿主命令因果执行。
+            ControlAction::QueueDelete { .. }
+            | ControlAction::QueueReorder { .. }
+            | ControlAction::QueueNow { .. }
+            | ControlAction::QueueResume { .. } => Vec::new(),
             _ => Vec::new(),
         };
         if !confirmation_capabilities.is_empty() {
@@ -3631,6 +3707,15 @@ impl ZcodeHub {
                 required.push(("model", &policy.model, None));
                 required.push(("thought_level", &policy.thought_level, None));
             }
+            // 队列写：**队列专属槽位**（默认关闭 → `needs_evidence`）。绝不借
+            // `send`/`approval_reply`——那会让「能发消息」自动升级成「能改队列」。
+            ControlAction::QueueDelete { .. } | ControlAction::QueueReorder { .. } => {
+                required.push(("queue_edit", &policy.queue_edit, None));
+            }
+            ControlAction::QueueNow { .. } => required.push(("queue_now", &policy.queue_now, None)),
+            ControlAction::QueueResume { .. } => {
+                required.push(("queue_resume", &policy.queue_resume, None));
+            }
             // Answer/Snooze 的所需能力只能来自宿主 pending 卡：必须先绑定目标再走
             // `check_required_policy`。走到这里说明调用顺序错误，保守零执行。
             ControlAction::Answer { .. } | ControlAction::Snooze { .. } => {
@@ -3821,7 +3906,8 @@ mod tests {
     };
     use crate::services::zcode_control::types::{
         ActionState, ActiveWork, AnswerEntry, CapabilityFlag, ControlView, PendingKind,
-        PendingView, QuestionOption, QuestionView, QueueItemView, QueueView, SelectionView,
+        PendingView, QuestionOption, QuestionView, QueueActionAvailability, QueueItemView,
+        QueueView, SelectionView,
     };
     use std::sync::atomic::{AtomicBool, AtomicUsize};
     use std::time::Duration;
@@ -4221,6 +4307,9 @@ mod tests {
             "approval_reply" => &mut view.approval_reply,
             "model" => &mut view.model,
             "thought_level" => &mut view.thought_level,
+            "queue_edit" => &mut view.queue_edit,
+            "queue_now" => &mut view.queue_now,
+            "queue_resume" => &mut view.queue_resume,
             other => panic!("unknown capability {other}"),
         };
         flag.enabled = true;
@@ -4233,6 +4322,59 @@ mod tests {
             open_capability(&mut view, name);
         }
         view
+    }
+
+    /// W3：队列动作在 Hub 侧只认**队列专属槽位**——`send` 开闸不会顺带放开队列写；
+    /// 三个槽位分别对应（撤回/重排共用 `queue_edit`）。
+    #[test]
+    fn queue_actions_require_queue_slots_not_send() {
+        let actions = [
+            ControlAction::QueueDelete {
+                session_id: "sess_synthetic_q".into(),
+                generation: 1,
+                queue_item_id: "queue_a".into(),
+            },
+            ControlAction::QueueReorder {
+                session_id: "sess_synthetic_q".into(),
+                generation: 1,
+                queue_item_id: "queue_b".into(),
+                before_queue_item_id: Some("queue_a".into()),
+            },
+            ControlAction::QueueNow {
+                session_id: "sess_synthetic_q".into(),
+                generation: 1,
+                queue_item_id: "queue_a".into(),
+            },
+            ControlAction::QueueResume {
+                session_id: "sess_synthetic_q".into(),
+                generation: 1,
+            },
+        ];
+
+        // 只有 send 开：四个动作全部 needs_evidence（零 bind / 零派发的闸门）。
+        let fake = Arc::new(FakeBackend::default());
+        let closed = ZcodeHub::with_parts(stored(URL), fake, policy_with(&["send"]));
+        for action in &actions {
+            let error = closed.check_policy(action).unwrap_err();
+            assert!(
+                error.is(codes::NEEDS_EVIDENCE),
+                "{} 不得借 send 放行",
+                action.kind()
+            );
+        }
+
+        // 打开三个队列槽位：撤回/重排走 queue_edit，立即执行走 queue_now，恢复走
+        // queue_resume，各自独立（不要求 send/approval_reply）。
+        let fake = Arc::new(FakeBackend::default());
+        let open = ZcodeHub::with_parts(
+            stored(URL),
+            fake,
+            policy_with(&["queue_edit", "queue_now", "queue_resume"]),
+        );
+        for action in &actions {
+            let permitted = open.check_policy(action).expect("槽位已开应过闸");
+            assert!(permitted.is_empty(), "普通构建无验收许可");
+        }
     }
 
     /// 可动态翻转的策略源 + 假后端（不依赖 static `with_parts` 的单份快照）。
@@ -6296,7 +6438,11 @@ mod tests {
                     input_id: "queue_new".into(),
                     text: "newer item".into(),
                     position: Some(0),
+                    kind: Some("sendText".into()),
+                    dispatch_state: Some("queued".into()),
+                    has_attachments: false,
                 }],
+                availability: QueueActionAvailability::default(),
             },
             input_routing: None,
         };
@@ -6353,13 +6499,20 @@ mod tests {
                         input_id: "queue_a".into(),
                         text: "first".into(),
                         position: Some(0),
+                        kind: Some("sendText".into()),
+                        dispatch_state: Some("queued".into()),
+                        has_attachments: false,
                     },
                     QueueItemView {
                         input_id: "queue_b".into(),
                         text: "second".into(),
                         position: Some(1),
+                        kind: Some("sendText".into()),
+                        dispatch_state: Some("queued".into()),
+                        has_attachments: false,
                     },
                 ],
+                availability: QueueActionAvailability::default(),
             },
             input_routing: None,
         };
@@ -6395,6 +6548,93 @@ mod tests {
             assert!(!last.ready);
             assert_eq!(last.queue.items.len(), 2);
         }
+    }
+
+    /// 降级态（`ready=false`）收到**更旧**的同代快照：不得整份替换。
+    ///
+    /// 内容（pending/queue/control/selection）留在较新视图，只按「安全降级/恢复」语义
+    /// 更新 `ready` 与能力：恢复用新读的能力（允许由关变开），降级保持全关。否则手机
+    /// 重开页面从 GET 拿到的仍是旧队列，降级后也可能永久停在关闭态。
+    #[test]
+    fn degraded_session_keeps_newer_content_when_older_read_arrives() {
+        let fake = Arc::new(FakeBackend::default());
+        let hub = Arc::new(ZcodeHub::with_parts(stored(URL), fake, send_policy()));
+        let generation = hub.lock().generation;
+        let session_id = "sess_degraded_recovery";
+        let queue_item = |input_id: &str, position: u32| QueueItemView {
+            input_id: input_id.into(),
+            text: input_id.into(),
+            position: Some(position),
+            kind: Some("sendText".into()),
+            dispatch_state: Some("queued".into()),
+            has_attachments: false,
+        };
+        let degraded = SessionView {
+            session_id: session_id.into(),
+            generation,
+            revision: Some(12),
+            ready: false,
+            pending: Vec::new(),
+            control: None,
+            selection: None,
+            capabilities: CapabilityView::default(),
+            queue: QueueView {
+                known: true,
+                paused: Some(false),
+                pause_reason: None,
+                items: vec![queue_item("queue_a", 0), queue_item("queue_b", 1)],
+                availability: QueueActionAvailability::default(),
+            },
+            input_routing: None,
+        };
+        let (applied, _) = hub.lock().publish_session(degraded);
+        assert!(applied, "降级视图必须发布");
+
+        // 更旧的现读（rev11、ready=true、只剩一条旧队列、能力开）：恢复语义。
+        let older = SessionView {
+            session_id: session_id.into(),
+            generation,
+            revision: Some(11),
+            ready: true,
+            pending: Vec::new(),
+            control: None,
+            selection: None,
+            capabilities: send_policy(),
+            queue: QueueView {
+                known: true,
+                paused: Some(false),
+                pause_reason: None,
+                items: vec![queue_item("queue_old", 0)],
+                availability: QueueActionAvailability::default(),
+            },
+            input_routing: None,
+        };
+        let (applied, published) = hub.lock().publish_session(older);
+        assert!(applied, "降级态的恢复视图必须发布（否则停在关闭态）");
+        assert!(published.ready, "恢复语义必须把 ready 开回来");
+        assert_eq!(
+            published.capabilities,
+            send_policy(),
+            "恢复用新读的权威能力矩阵（允许由关变开）"
+        );
+        assert_eq!(
+            published.queue.items.len(),
+            2,
+            "更旧的现读不得把较新的队列项冲掉"
+        );
+        assert_eq!(published.queue.items[0].input_id, "queue_a");
+        assert_eq!(published.revision, Some(12), "内容锚不得退回旧读序号");
+
+        let inner = hub.lock();
+        let last = inner.last_session.as_ref().expect("已发布会话");
+        assert!(last.ready);
+        assert_eq!(last.queue.items.len(), 2);
+        let tracked = inner
+            .tracked_sessions
+            .get(session_id)
+            .expect("合并视图仍须登记跟踪表");
+        assert!(tracked.ready);
+        assert_eq!(tracked.queue.items.len(), 2);
     }
 
     /// 同一动态策略源同时喂会话矩阵与执行闸：翻转开/关，两者同步变化。
@@ -7744,7 +7984,11 @@ mod tests {
                 input_id: "queue_cmd-stale-1".into(),
                 text: "stale queued text".into(),
                 position: Some(0),
+                kind: Some("sendText".into()),
+                dispatch_state: Some("queued".into()),
+                has_attachments: false,
             }],
+            availability: QueueActionAvailability::default(),
         };
         {
             let mut inner = hub.lock();

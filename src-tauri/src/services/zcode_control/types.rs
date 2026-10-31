@@ -441,6 +441,43 @@ pub enum ControlAction {
         model: String,
         thought: String,
     },
+    /// 撤回一条**官方队列项**（`deleteQueueItem{queueItemId}`）。
+    ///
+    /// 只认宿主原值 `queueItemId`；不重算 `queue_<commandId>`，也不接受数组下标。
+    /// 「修改」= 撤回 + 手机端业务回填（**绝不**把正文带进本动作）。
+    #[serde(rename_all = "camelCase")]
+    QueueDelete {
+        session_id: String,
+        generation: u64,
+        queue_item_id: String,
+    },
+    /// 重排一条官方队列项（`reorderQueueItem{queueItemId,beforeQueueItemId}`）。
+    ///
+    /// `before_queue_item_id` 必须是新鲜队列里**已存在**的另一项；`null`（官方语义为
+    /// 「移到末尾」，未实机确认）在本批**不接受**，一律 `invalid_action`。
+    #[serde(rename_all = "camelCase")]
+    QueueReorder {
+        session_id: String,
+        generation: u64,
+        queue_item_id: String,
+        before_queue_item_id: Option<String>,
+    },
+    /// 让一条官方队列项**立即执行**（`sendQueuedNow{queueItemId}`）。
+    ///
+    /// 语义严格是「立即执行」，**不是**「引导当前回合」：未取得两者等价的实机证据前，
+    /// 代码/注释/日志都不得把它称作 guide，UI 也不得绑定到「引导」按钮。
+    #[serde(rename_all = "camelCase")]
+    QueueNow {
+        session_id: String,
+        generation: u64,
+        queue_item_id: String,
+    },
+    /// 恢复队列自动处理（`setAutoDrain{autoDrain:true}`）。
+    ///
+    /// 只解除暂停，**不**重启被打断的回合、**不**重发队列项；`items` 为空也允许
+    /// （官方暂停是容器级状态）。
+    #[serde(rename_all = "camelCase")]
+    QueueResume { session_id: String, generation: u64 },
 }
 
 impl ControlAction {
@@ -453,6 +490,10 @@ impl ControlAction {
             Self::Permission { .. } => "permission",
             Self::Stop { .. } => "stop",
             Self::Selection { .. } => "selection",
+            Self::QueueDelete { .. } => "queue_delete",
+            Self::QueueReorder { .. } => "queue_reorder",
+            Self::QueueNow { .. } => "queue_now",
+            Self::QueueResume { .. } => "queue_resume",
         }
     }
 
@@ -464,7 +505,11 @@ impl ControlAction {
             | Self::Answer { session_id, .. }
             | Self::Permission { session_id, .. }
             | Self::Stop { session_id, .. }
-            | Self::Selection { session_id, .. } => session_id,
+            | Self::Selection { session_id, .. }
+            | Self::QueueDelete { session_id, .. }
+            | Self::QueueReorder { session_id, .. }
+            | Self::QueueNow { session_id, .. }
+            | Self::QueueResume { session_id, .. } => session_id,
         }
     }
 
@@ -476,7 +521,11 @@ impl ControlAction {
             | Self::Answer { generation, .. }
             | Self::Permission { generation, .. }
             | Self::Stop { generation, .. }
-            | Self::Selection { generation, .. } => *generation,
+            | Self::Selection { generation, .. }
+            | Self::QueueDelete { generation, .. }
+            | Self::QueueReorder { generation, .. }
+            | Self::QueueNow { generation, .. }
+            | Self::QueueResume { generation, .. } => *generation,
         }
     }
 }
@@ -861,7 +910,27 @@ pub struct CapabilityFlag {
     pub reason_code: Option<String>,
 }
 
-/// 本会话能力矩阵（八项固定字段；本任务默认全部关闭 = 未取得实机证据）。
+/// 本会话能力矩阵（十一项固定字段；默认全部关闭 = 未取得实机证据）。
+///
+/// 三项 `queue_*` 是**队列专属**槽位：它们绝不借 `send`/`approval_reply` 放行。
+/// 官方 `state.availability` 出现 `queueEdit`/`sendQueuedNow` 只说明宿主**宣告**了
+/// 资格，不构成 Tuvis 开闸证据——两者必须**同时**成立（build 证据表命中 + 运行时
+/// allowed）才可能写队列，且每帧仍以新鲜官方队列二次校验。
+///
+/// # 三档（UI 消费契约；W4 按此渲染，服务端不再二次解释）
+///
+/// - **closed**：`enabled=false` + `reasonCode ∈ {needs_evidence, unsupported,
+///   <degraded 原因码>}`。按钮禁用并展示原因（例如「引导」按钮在 `queue_now`
+///   closed 时禁用，原因是 `needs_evidence`）。
+/// - **candidate**：`enabled=true` + `reasonCode="interface_matched"`。只有静态证据
+///   匹配（build 命令条目 / 接口形状），**可点击**，但不是实机验证；派发前服务端
+///   仍要求新鲜 `queue.availability`（恢复则要求 `paused==Some(true)`），不满足即
+///   零帧拒绝。目前只有队列写会落在这档。
+/// - **confirmed**：`enabled=true` + `reasonCode=null`。已有本 key 的实机确认
+///   （shipped 出厂知识或账本 confirmed），可点击且不再需要额外确认。
+///
+/// 非队列能力沿用「可用/不可用」两档（可用恒无原因码），候选/确认的分档只为
+/// 队列写向手机表达「先小范围开、被宿主拒绝就收」。
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CapabilityView {
@@ -873,6 +942,20 @@ pub struct CapabilityView {
     pub approval_reply: CapabilityFlag,
     pub model: CapabilityFlag,
     pub thought_level: CapabilityFlag,
+    /// 队列撤回/重排（`deleteQueueItem` / `reorderQueueItem`）。
+    ///
+    /// candidate = 撤回/修改（撤回+回填）可点；运行时仍要新鲜
+    /// `availability.queueEdit.allowed`，否则 `invalid_action` 零帧。
+    pub queue_edit: CapabilityFlag,
+    /// 队列「立即执行」（`sendQueuedNow`；**不是**「引导」语义）。
+    ///
+    /// 恒为 closed（`needs_evidence`）：「立即执行 vs 引导」未实机证实，UI 的
+    /// 「引导」按钮据此禁用并展示原因。
+    pub queue_now: CapabilityFlag,
+    /// 恢复队列自动处理（`setAutoDrain(true)`）。
+    ///
+    /// candidate = 「恢复运行」可点；运行时仍要 `queue.known && paused==Some(true)`。
+    pub queue_resume: CapabilityFlag,
 }
 
 impl CapabilityView {
@@ -882,6 +965,23 @@ impl CapabilityView {
     /// `enabled=true`；本任务只交付受测实现，不据此宣称 guarded 保护。
     pub fn approval_reply_enabled(&self) -> bool {
         self.approval_reply.enabled
+    }
+
+    /// 队列撤回/重排闸：候选或确认档都返回 true（可点）；运行时另由新鲜
+    /// `availability.queueEdit.allowed` 判定，二者缺一即拒。
+    pub fn queue_edit_enabled(&self) -> bool {
+        self.queue_edit.enabled
+    }
+
+    /// 队列「立即执行」闸（恒关闭：无实机证据 → `needs_evidence`）。
+    pub fn queue_now_enabled(&self) -> bool {
+        self.queue_now.enabled
+    }
+
+    /// 队列恢复闸：候选或确认档都返回 true（可点）；运行时另要求
+    /// `queue.known && paused==Some(true)`。
+    pub fn queue_resume_enabled(&self) -> bool {
+        self.queue_resume.enabled
     }
 }
 
@@ -901,6 +1001,9 @@ impl Default for CapabilityView {
             approval_reply: flag(),
             model: flag(),
             thought_level: flag(),
+            queue_edit: flag(),
+            queue_now: flag(),
+            queue_resume: flag(),
         }
     }
 }
@@ -943,12 +1046,51 @@ pub struct ControlEvent {
 /// 身份只认宿主原值：`input_id` = 官方 `queueItemId`（`queue_<commandId>` 派生，
 /// 但 Tuvis **不重算**，直接透传），`position` = `order.queuePosition`（0 基，
 /// 缺席 = `None`，绝不按数组下标猜位置）。`text` 是官方队列项正文原文。
+///
+/// 新增字段全部 `#[serde(default)]`：旧载荷/旧手机不认识这些键时按「白名单缺省」
+/// 反序列化（`kind`/`dispatch_state` = `None`、`has_attachments` = `false`），
+/// 绝不因此丢掉既有 `input_id`/`text`/`position` 的解析结果。
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct QueueItemView {
+    /// 官方 `queueItemId`（永不重算；写命令的唯一目标身份）。
     pub input_id: String,
+    /// 完整正文原文（供手机展示/安全回填；**审计/日志绝不写入**）。
     pub text: String,
+    #[serde(default)]
     pub position: Option<u32>,
+    /// 官方 `kind`（证据白名单 `sendText|sendGoalCommand|compact`；其它值 = `None`）。
+    ///
+    /// 只有 `sendText` 才是「一条用户消息」：W4 的「修改」语义只对这种项开放。
+    #[serde(default)]
+    pub kind: Option<String>,
+    /// 官方 `dispatch.state`（证据白名单 `admitted|queued|reserved|promoting|drained`）。
+    ///
+    /// 只有 `queued` 才允许撤回/重排/立即执行；`None`（宿主未宣告/未知值）同样不可写。
+    #[serde(default)]
+    pub dispatch_state: Option<String>,
+    /// 该项是否带附件（**只告知有无**，绝不下发附件对象/路径）。
+    #[serde(default)]
+    pub has_attachments: bool,
+}
+
+/// 官方 `state.availability` 里与队列写操作有关的**只读资格**。
+///
+/// 证据（R0 §3）：`state.availability.{queueEdit,sendQueuedNow,…} = {allowed:true} |
+/// {allowed:false,reasonCode}`。这里只投影两个**已取证**的布尔位；官方没有
+/// `setAutoDrain` 的 availability 字段，因此**不虚构**「恢复」资格（恢复只看
+/// `queue.known && paused==Some(true)` + 能力闸）。
+///
+/// 全部 `false` = 未知/未宣告（`known=false`），调用方必须按「不可写」处理。
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QueueActionAvailability {
+    /// 宿主是否宣告了 `availability` 对象（读不到 = `false`，绝不猜）。
+    pub known: bool,
+    /// `availability.queueEdit.allowed == true`（撤回/重排）。
+    pub queue_edit_allowed: bool,
+    /// `availability.sendQueuedNow.allowed == true`（「立即执行」）。
+    pub send_queued_now_allowed: bool,
 }
 
 /// 官方输入队列视图（`state.queue`）。
@@ -973,6 +1115,12 @@ pub struct QueueView {
     #[serde(default)]
     pub pause_reason: Option<String>,
     pub items: Vec<QueueItemView>,
+    /// 队列写操作的运行时资格（官方 `state.availability` 的白名单投影）。
+    ///
+    /// 默认 `known=false`（全关）：旧载荷/坏形状/投影降级都落到这里，调用方必须
+    /// 当作「不可写」。它只是**必要条件之一**——写操作还要过能力闸与新鲜队列复核。
+    #[serde(default)]
+    pub availability: QueueActionAvailability,
 }
 
 /// 会话投影视图（手机唯一可见的会话状态面）。
@@ -1082,10 +1230,13 @@ impl CapabilityPolicy {
             approval_reply: flag(),
             model: flag(),
             thought_level: flag(),
+            queue_edit: flag(),
+            queue_now: flag(),
+            queue_resume: flag(),
         }
     }
 
-    /// **仅测试**：构造八项全部开闸的矩阵（`reasonCode=None`）。
+    /// **仅测试**：构造全部开闸的矩阵（`reasonCode=None`）。
     ///
     /// `#[cfg(test)]` 保证本函数不编入发布构建；它只供闸门/命令用例使用，
     /// 生产中不存在任何返回开闸矩阵的路径。
@@ -1104,6 +1255,9 @@ impl CapabilityPolicy {
             approval_reply: flag(),
             model: flag(),
             thought_level: flag(),
+            queue_edit: flag(),
+            queue_now: flag(),
+            queue_resume: flag(),
         }
     }
 }
@@ -1216,7 +1370,15 @@ mod tests {
                         input_id: "queue_cmd-1".to_owned(),
                         text: "queued text".to_owned(),
                         position: Some(0),
+                        kind: Some("sendText".to_owned()),
+                        dispatch_state: Some("queued".to_owned()),
+                        has_attachments: true,
                     }],
+                    availability: QueueActionAvailability {
+                        known: true,
+                        queue_edit_allowed: true,
+                        send_queued_now_allowed: false,
+                    },
                 },
                 input_routing: None,
             };
@@ -1230,14 +1392,54 @@ mod tests {
             assert_eq!(value["queue"]["items"][0]["inputId"], "queue_cmd-1");
             assert_eq!(value["queue"]["items"][0]["text"], "queued text");
             assert_eq!(value["queue"]["items"][0]["position"], 0);
+            assert_eq!(value["queue"]["items"][0]["kind"], "sendText");
+            assert_eq!(value["queue"]["items"][0]["dispatchState"], "queued");
+            assert_eq!(value["queue"]["items"][0]["hasAttachments"], true);
+            assert_eq!(value["queue"]["availability"]["known"], true);
+            assert_eq!(value["queue"]["availability"]["queueEditAllowed"], true);
+            assert_eq!(
+                value["queue"]["availability"]["sendQueuedNowAllowed"],
+                false
+            );
             // 位置缺席必须是 null（不是 0）：0 是合法位置，不能与「未知」混淆。
             let without_position = serde_json::to_value(QueueItemView {
                 input_id: "queue_cmd-2".to_owned(),
                 text: "no position".to_owned(),
                 position: None,
+                kind: None,
+                dispatch_state: None,
+                has_attachments: false,
             })
             .expect("队列项应可序列化");
             assert!(without_position["position"].is_null());
+            assert!(without_position["kind"].is_null());
+            assert!(without_position["dispatchState"].is_null());
+            assert_eq!(without_position["hasAttachments"], false);
+        }
+
+        /// 旧服务端载荷（没有 kind/dispatchState/hasAttachments/availability）必须仍可
+        /// 反序列化，且新增字段按「白名单缺省」：不可写、无附件结论。
+        #[test]
+        fn legacy_queue_item_fields_default_to_not_writable() {
+            let legacy = serde_json::json!({
+                "known": true,
+                "items": [{"inputId": "queue_old", "text": "old text", "position": 0}],
+                "paused": true,
+            });
+            let queue: QueueView =
+                serde_json::from_value(legacy).expect("旧队列载荷必须仍可反序列化");
+            assert!(queue.known);
+            assert_eq!(queue.items.len(), 1);
+            assert_eq!(queue.items[0].input_id, "queue_old");
+            assert_eq!(queue.items[0].kind, None);
+            assert_eq!(queue.items[0].dispatch_state, None);
+            assert!(!queue.items[0].has_attachments);
+            assert!(
+                !queue.availability.known,
+                "缺 availability = 未知，不是放行"
+            );
+            assert!(!queue.availability.queue_edit_allowed);
+            assert!(!queue.availability.send_queued_now_allowed);
         }
     }
 
@@ -1329,7 +1531,7 @@ mod tests {
         /// 已取证 v4 wire 协议版本。
         const KNOWN_PROTOCOL: u32 = 3;
 
-        fn flags(view: &CapabilityView) -> [(&'static str, &CapabilityFlag); 8] {
+        fn flags(view: &CapabilityView) -> [(&'static str, &CapabilityFlag); 11] {
             [
                 ("send", &view.send),
                 ("single_select", &view.single_select),
@@ -1339,6 +1541,9 @@ mod tests {
                 ("approval_reply", &view.approval_reply),
                 ("model", &view.model),
                 ("thought_level", &view.thought_level),
+                ("queue_edit", &view.queue_edit),
+                ("queue_now", &view.queue_now),
+                ("queue_resume", &view.queue_resume),
             ]
         }
 
@@ -1423,6 +1628,9 @@ mod tests {
                 &view.approval_reply,
                 &view.model,
                 &view.thought_level,
+                &view.queue_edit,
+                &view.queue_now,
+                &view.queue_resume,
             ] {
                 assert!(!flag.enabled, "宿主证据不得开启任何生产能力");
                 assert_eq!(flag.reason_code.as_deref(), Some(codes::NEEDS_EVIDENCE));

@@ -100,6 +100,10 @@ const goldenSession: SessionView = {
     approvalReply: flag(false),
     model: flag(true),
     thoughtLevel: flag(true),
+    // 队列写三槽位默认关闭：绝不因 send 开闸而放行。
+    queueEdit: flag(false),
+    queueNow: flag(false),
+    queueResume: flag(false),
   } satisfies CapabilityView,
 };
 
@@ -228,6 +232,9 @@ describe("zcodeControlApi：官方动作发送面", () => {
         "interrupt",
         "model",
         "multiSelect",
+        "queueEdit",
+        "queueNow",
+        "queueResume",
         "send",
         "singleSelect",
         "thoughtLevel",

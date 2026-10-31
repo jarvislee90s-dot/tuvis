@@ -4,12 +4,14 @@
 // 1. 慢 GET 的旧 revision 不得覆盖先到的 SSE 新 revision；
 // 2. 跨会话/换代不误挡；
 // 3. 更旧的 `ready=false` 只能**安全降级**（关写面），内容不得整份回退；
-// 4. 更旧的 `recovery` 只能**收窄能力**，不得开机能力、不得复活旧内容；
+// 4. 更旧的 `recovery`：降级态必须**恢复就绪与能力**（否则发送按钮永久灰着），
+//    已就绪时只允许**收窄能力**；两种情况都不得复活旧内容；
 // 5. 同 revision 允许完整落地（权威 GET 恢复能力矩阵），当前无锚（revision=null）不判旧。
 import { describe, expect, it } from "vitest";
 import {
   degradedCapabilities,
   mergeDegradedView,
+  mergeOlderSessionView,
   mergeRecoveredCaps,
   resolveSessionViewLanding,
   shouldApplySessionView,
@@ -43,6 +45,9 @@ function openCapabilities(): CapabilityView {
     approvalReply: openFlag,
     model: openFlag,
     thoughtLevel: openFlag,
+    queueEdit: openFlag,
+    queueNow: openFlag,
+    queueResume: openFlag,
   };
 }
 
@@ -56,6 +61,9 @@ function closedCapabilities(): CapabilityView {
     approvalReply: closedFlag(),
     model: closedFlag(),
     thoughtLevel: closedFlag(),
+    queueEdit: closedFlag(),
+    queueNow: closedFlag(),
+    queueResume: closedFlag(),
   };
 }
 
@@ -63,7 +71,15 @@ function queue(ids: string[]): QueueView {
   return {
     known: true,
     paused: false,
-    items: ids.map((id, position) => ({ inputId: id, text: id, position })),
+    items: ids.map((id, position) => ({
+      inputId: id,
+      text: id,
+      position,
+      kind: "sendText",
+      dispatchState: "queued",
+      hasAttachments: false,
+    })),
+    availability: { known: false, queueEditAllowed: false, sendQueuedNowAllowed: false },
   };
 }
 
@@ -123,16 +139,42 @@ describe("shouldApplySessionView：同代 revision 单调", () => {
     expect(shouldApplySessionView(applied(), applied({ revision: 11 }), "recovery")).toBe(true);
   });
 
-  it("degraded_current_view_does_not_accept_older_ready_content", () => {
-    // 当前已降级（ready=false）不等于放弃时序锚：更旧的 ready=true 快照仍不得
-    // 复活旧业务内容（原「降级中一律放行」会让 rev11 覆盖 rev12 的队列）。
+  it("degraded_current_view_accepts_recovery_even_with_lower_revision", () => {
+    // 降级态（ready=false，能力被清成基线全关）下，恢复 GET 即使 revision 更低，也
+    // 必须能把 `ready` 与能力矩阵恢复回来——否则降级后发送按钮永久灰着（Hub
+    // `apply_relay_session` 会复用这份全关矩阵）。内容仍取较新视图，旧队列不得复活。
+    const current = sessionView({
+      ready: false,
+      revision: 12,
+      capabilities: closedCapabilities(),
+    });
+    const older = sessionView({ revision: 11, ready: true, capabilities: openCapabilities() });
+
+    expect(
+      resolveSessionViewLanding(applied({ ready: false }), applied({ revision: 11 }), "recovery")
+    ).toBe("recover");
+
+    const merged = mergeOlderSessionView(current, older, "recovery");
+    expect(merged.ready).toBe(true);
+    expect(merged.capabilities.send.enabled).toBe(true);
+  });
+
+  it("degraded_current_view_drops_older_ready_get", () => {
+    // 普通 GET/SSE 的更旧 `ready=true` 快照仍一律丢弃：降级态不等于放弃时序锚，
+    // 否则 rev11 会整份覆盖 rev12 的队列（只有 `recovery` 来源的权威现读例外）。
+    expect(
+      resolveSessionViewLanding(applied({ ready: false }), applied({ revision: 11 }), "get")
+    ).toBe("drop");
     expect(
       shouldApplySessionView(applied({ ready: false }), applied({ revision: 11 }), "get")
+    ).toBe(false);
+    expect(
+      shouldApplySessionView(applied({ ready: false }), applied({ revision: 11 }), "sse")
     ).toBe(false);
   });
 });
 
-describe("resolveSessionViewLanding：三种落地语义分流", () => {
+describe("resolveSessionViewLanding：落地语义分流", () => {
   it("newer_or_equal_view_lands_whole", () => {
     expect(resolveSessionViewLanding(null, applied(), "get")).toBe("replace");
     expect(resolveSessionViewLanding(applied(), applied({ revision: 12 }), "sse")).toBe("replace");
@@ -175,6 +217,42 @@ describe("resolveSessionViewLanding：三种落地语义分流", () => {
     // 非 recovery 来源的更旧 ready=true 快照：直接丢弃（旧内容不得回归）。
     expect(resolveSessionViewLanding(applied(), applied({ revision: 11 }), "get")).toBe("drop");
     expect(resolveSessionViewLanding(applied(), applied({ revision: 11 }), "sse")).toBe("drop");
+  });
+
+  it("degraded_stale_recovery_lands_as_recover", () => {
+    // 降级态：更旧的 recovery 现读走 `recover`（恢复 ready + 能力），内容仍不替换。
+    expect(
+      resolveSessionViewLanding(applied({ ready: false }), applied({ revision: 11 }), "recovery")
+    ).toBe("recover");
+    // 恢复能力只在 recovery 来源开放：普通 get/sse 的更旧 ready=true 一律丢弃。
+    expect(
+      resolveSessionViewLanding(applied({ ready: false }), applied({ revision: 11 }), "get")
+    ).toBe("drop");
+    expect(
+      resolveSessionViewLanding(applied({ ready: false }), applied({ revision: 11 }), "sse")
+    ).toBe("drop");
+  });
+
+  it("ready_view_without_revision_is_dropped_only_against_a_ready_view", () => {
+    // 空序号 ≠ 更新，也不得借它覆盖已就绪视图/换锚（含 recovery 来源）。
+    expect(resolveSessionViewLanding(applied(), applied({ revision: null }), "recovery")).toBe(
+      "drop"
+    );
+    // 已降级（ready=false）：权威恢复必须放行，否则视图会永久停在关闭态；但只有
+    // `recovery` 来源例外——普通 get/sse 的空序号 ready=true 仍不得开关能力。
+    expect(
+      resolveSessionViewLanding(applied({ ready: false }), applied({ revision: null }), "recovery")
+    ).toBe("recover");
+    expect(
+      resolveSessionViewLanding(applied({ ready: false }), applied({ revision: null }), "get")
+    ).toBe("drop");
+    expect(
+      resolveSessionViewLanding(applied({ ready: false }), applied({ revision: null }), "sse")
+    ).toBe("drop");
+    // 但 `ready=false` 不受此限：没有序号也必须能关写面。
+    expect(
+      resolveSessionViewLanding(applied(), applied({ revision: null, ready: false }), "sse")
+    ).toBe("degrade");
   });
 
   it("older_generation_is_dropped", () => {

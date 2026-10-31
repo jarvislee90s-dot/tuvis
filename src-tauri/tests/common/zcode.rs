@@ -467,6 +467,12 @@ impl HubBackend for FakeOfficial {
                     ControlAction::Stop { .. } => Ok(vec!["interrupt"]),
                     ControlAction::Permission { .. } => Ok(vec!["approval_reply"]),
                     ControlAction::Selection { .. } => Ok(vec!["model", "thought_level"]),
+                    // 队列写：队列专属槽位（与生产 `CommandSender` 同口径）。
+                    ControlAction::QueueDelete { .. } | ControlAction::QueueReorder { .. } => {
+                        Ok(vec!["queue_edit"])
+                    }
+                    ControlAction::QueueNow { .. } => Ok(vec!["queue_now"]),
+                    ControlAction::QueueResume { .. } => Ok(vec!["queue_resume"]),
                     ControlAction::Answer { interaction_id, .. }
                     | ControlAction::Snooze { interaction_id, .. } => {
                         let Some(view) = inner.session.as_ref() else {
@@ -772,5 +778,9 @@ pub fn all_policy() -> CapabilityView {
         approval_reply: on(),
         model: on(),
         thought_level: on(),
+        // 队列写三槽位：夹具全开，便于将来的队列 e2e；生产默认仍全关。
+        queue_edit: on(),
+        queue_now: on(),
+        queue_resume: on(),
     }
 }

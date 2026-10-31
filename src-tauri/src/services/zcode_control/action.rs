@@ -222,10 +222,31 @@ pub fn action_params(action: &ControlAction) -> Value {
             "model": model,
             "thought": thought,
         }),
+        // 队列写动作：只取**身份类**参数（项 ID / 目标前驱 ID），绝不带队列正文。
+        ControlAction::QueueDelete { queue_item_id, .. } => {
+            serde_json::json!({ "queueItemId": queue_item_id })
+        }
+        ControlAction::QueueReorder {
+            queue_item_id,
+            before_queue_item_id,
+            ..
+        } => serde_json::json!({
+            "queueItemId": queue_item_id,
+            "beforeQueueItemId": before_queue_item_id,
+        }),
+        ControlAction::QueueNow { queue_item_id, .. } => {
+            serde_json::json!({ "queueItemId": queue_item_id })
+        }
+        // 恢复只有 `autoDrain=true` 一个固定意图：无参数（空对象仍参与指纹，
+        // 「同 id 换参数即冲突」的口径不变）。
+        ControlAction::QueueResume { .. } => serde_json::json!({}),
     }
 }
 
 /// 审计摘要：**只**含动作类别与字数/选项数量，绝不摘正文、答案、JWT、URL。
+///
+/// 队列写动作只写类别与「是否移动」，**不写**项 ID（ID 足以在宿主侧反查到具体
+/// 排队内容；审计面只需要「发生了哪种操作」）。
 pub fn audit_summary(kind: &str, params: &Value) -> String {
     if let Some(text) = params.get("text").and_then(Value::as_str) {
         return format!("{kind} chars={}", text.chars().count());
@@ -244,6 +265,13 @@ pub fn audit_summary(kind: &str, params: &Value) -> String {
     }
     if params.get("optionId").is_some() {
         return format!("{kind} options=1");
+    }
+    if params.get("queueItemId").is_some() {
+        // 有 beforeQueueItemId = 重排（是否移动），否则 = 单项目标操作。
+        return match params.get("beforeQueueItemId") {
+            Some(_) => format!("{kind} items=1 moved=true"),
+            None => format!("{kind} items=1"),
+        };
     }
     kind.to_string()
 }
@@ -1094,6 +1122,23 @@ mod tests {
                 model: "model-a".into(),
                 thought: "high".into(),
             },
+            // 队列写：项 ID / 目标前驱 ID 同样必须参与指纹（换目标 = 不同动作）。
+            ControlAction::QueueDelete {
+                session_id: SESSION.into(),
+                generation: GEN,
+                queue_item_id: "queue_a".into(),
+            },
+            ControlAction::QueueReorder {
+                session_id: SESSION.into(),
+                generation: GEN,
+                queue_item_id: "queue_b".into(),
+                before_queue_item_id: Some("queue_a".into()),
+            },
+            ControlAction::QueueNow {
+                session_id: SESSION.into(),
+                generation: GEN,
+                queue_item_id: "queue_a".into(),
+            },
         ];
         for action in &actions {
             let params = action_params(action);
@@ -1234,6 +1279,76 @@ mod tests {
             &serde_json::json!({ "model": "secret-model", "thought": "high" }),
         );
         assert!(!selection.contains("secret-model"));
+
+        // 队列写：只写类别（+ 是否移动），项 ID/目标 ID 一律不入摘要。
+        let delete = audit_summary(
+            "queue_delete",
+            &serde_json::json!({ "queueItemId": "queue_secret_item" }),
+        );
+        assert!(delete.contains("queue_delete"));
+        assert!(!delete.contains("queue_secret_item"), "项 ID 不得入摘要");
+        let reorder = audit_summary(
+            "queue_reorder",
+            &serde_json::json!({
+                "queueItemId": "queue_secret_item",
+                "beforeQueueItemId": "queue_secret_before",
+            }),
+        );
+        assert!(reorder.contains("moved=true"), "重排摘要写明是否移动");
+        assert!(!reorder.contains("queue_secret"));
+        let resume = audit_summary("queue_resume", &serde_json::json!({}));
+        assert_eq!(resume, "queue_resume");
+    }
+
+    /// 队列动作的指纹口径：同项 ID 的撤回/立即执行是**不同**动作；重排的目标前驱
+    /// 变化同样改变指纹（换目标绝不能被当成同一次重放）。
+    #[test]
+    fn queue_action_fingerprint_covers_item_and_target_ids() {
+        let hash = |action: &ControlAction| {
+            payload_hash(
+                action.kind(),
+                action.session_id(),
+                action.generation(),
+                &action_params(action),
+            )
+            .unwrap()
+        };
+        let delete = ControlAction::QueueDelete {
+            session_id: SESSION.into(),
+            generation: GEN,
+            queue_item_id: "queue_a".into(),
+        };
+        let now = ControlAction::QueueNow {
+            session_id: SESSION.into(),
+            generation: GEN,
+            queue_item_id: "queue_a".into(),
+        };
+        let reorder_before_a = ControlAction::QueueReorder {
+            session_id: SESSION.into(),
+            generation: GEN,
+            queue_item_id: "queue_b".into(),
+            before_queue_item_id: Some("queue_a".into()),
+        };
+        let reorder_before_c = ControlAction::QueueReorder {
+            session_id: SESSION.into(),
+            generation: GEN,
+            queue_item_id: "queue_b".into(),
+            before_queue_item_id: Some("queue_c".into()),
+        };
+        assert_ne!(hash(&delete), hash(&now), "撤回 ≠ 立即执行");
+        assert_ne!(hash(&reorder_before_a), hash(&reorder_before_c));
+        // 队列动作参数里**绝不**出现正文键（正文只在 send 的 params 里）。
+        for action in [&delete, &now, &reorder_before_a] {
+            let params = action_params(action);
+            assert!(params.get("text").is_none(), "队列动作不得携带正文");
+        }
+        // 恢复动作没有参数，但同 id 换动作（delete → resume）仍是不同指纹。
+        let resume = ControlAction::QueueResume {
+            session_id: SESSION.into(),
+            generation: GEN,
+        };
+        assert!(action_params(&resume).as_object().unwrap().is_empty());
+        assert_ne!(hash(&delete), hash(&resume));
     }
 
     /// schema 幂等：老库（无 zcode_actions）经 init/migrate 补建；重复 init 不炸；

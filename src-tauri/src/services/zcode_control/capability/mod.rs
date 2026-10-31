@@ -2,7 +2,7 @@
 //!
 //! 本子树零 I/O（无网络 / 无 DB / 无文件），只承载类型与纯函数：
 //! - `key`：能力 key 五元组与已知 build 的 shipped 表查询；
-//! - `state`：八项能力枚举、状态枚举、账本记录与接口形状证据（唯一定义处）；
+//! - `state`：十一项能力枚举、状态枚举、账本记录与接口形状证据（唯一定义处）；
 //! - `interface`：接口形状 → 候选能力的纯判定（spec §6.4）；
 //! - `confirm`：首次真实动作确认的纯判据与确认类型（spec R4；生产计划 T5/T6）。
 //!
@@ -46,7 +46,8 @@ mod tests {
         assert!(!ZcodeInterfaceEvidence::default().method_send);
         assert_eq!(
             interface_capabilities(&ZcodeInterfaceEvidence::default()).len(),
-            8
+            11,
+            "返回表恒含十一键（八项旧能力 + 三项队列写）"
         );
     }
 }

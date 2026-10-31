@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 
 use super::state::{Capability, ZcodeInterfaceEvidence};
 
-/// 判定接口形状支持哪些能力（spec §6.4；返回恒含八键的 `BTreeMap`）。
+/// 判定接口形状支持哪些能力（spec §6.4；返回恒含十一键的 `BTreeMap`）。
 ///
 /// 每项能力 = 对应方法存在 **AND** 形状存在：
 /// - `Send` = `method_send`；
@@ -19,7 +19,13 @@ use super::state::{Capability, ZcodeInterfaceEvidence};
 /// - `ApprovalReply` = `method_resolve_interaction` AND `has_permission_pending`；
 /// - `Model` = `method_selection_get` AND `method_selection_switch` AND
 ///   `has_model_catalog`；
-/// - `ThoughtLevel` = Model AND `has_thought_levels`。
+/// - `ThoughtLevel` = Model AND `has_thought_levels`；
+/// - `QueueEdit` / `QueueNow` / `QueueResume` = **恒 `false`**：队列写命令没有
+///   接口形状判据（R0 只取证了命令名与字段形状，没有「本 build 接受该命令」的
+///   证据位）。任何接口观测都不允许把队列写能力升级成候选——否则未知 build 会
+///   仅凭「方法在场」就放开队列写，与本轮 fail-closed 裁决冲突。队列写的候选
+///   判据在 T4 resolver 侧取自 **build 命令条目**（`key::build_declares_queue_command`），
+///   与本函数无关。
 ///
 /// 返回 `false` 表示「接口上不具备」（缺方法或缺形状），由 T4 统一落
 /// unsupported 语义；本函数不做 shipped/账本叠加。
@@ -55,6 +61,10 @@ pub(crate) fn interface_capabilities(
             Capability::ThoughtLevel,
             model && evidence.has_thought_levels,
         ),
+        // 队列写：无形状判据，永远不具备候选资格（见函数文档）。
+        (Capability::QueueEdit, false),
+        (Capability::QueueNow, false),
+        (Capability::QueueResume, false),
     ])
 }
 
@@ -83,7 +93,7 @@ mod tests {
         );
     }
 
-    /// 形状全量给齐 → 八项全开（返回表恒含八键）。
+    /// 形状全量给齐 → 八项全开；队列三项**恒关**（返回表恒含十一键）。
     #[test]
     fn interface_matrix_all_true_when_method_and_shape_present() {
         let full = ZcodeInterfaceEvidence {
@@ -101,7 +111,7 @@ mod tests {
             has_thought_levels: true,
         };
         let caps = interface_capabilities(&full);
-        assert_eq!(caps.len(), 8);
+        assert_eq!(caps.len(), 11);
         for capability in [
             Capability::Send,
             Capability::SingleSelect,
@@ -116,6 +126,18 @@ mod tests {
                 caps.get(&capability),
                 Some(&true),
                 "{capability:?} 应为 true"
+            );
+        }
+        // 队列写：接口面无判据，形状再齐也不得成为候选（fail closed）。
+        for capability in [
+            Capability::QueueEdit,
+            Capability::QueueNow,
+            Capability::QueueResume,
+        ] {
+            assert_eq!(
+                caps.get(&capability),
+                Some(&false),
+                "{capability:?} 不得凭接口形状开闸"
             );
         }
     }

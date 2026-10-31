@@ -21,6 +21,7 @@ import {
   type CapabilityView,
   type ConnectionView,
   type ControlAction,
+  type PendingView,
   type QueueView,
   type SessionView,
 } from "@/lib/api/zcodeControl";
@@ -1156,6 +1157,25 @@ describe("useZcodeControl：F1 同代 revision 单调", () => {
     };
   }
 
+  function pendingView(interactionId: string): PendingView {
+    return {
+      interactionId,
+      kind: "permission",
+      anchorRowId: 7,
+      toolCallId: `tc_${interactionId}`,
+      createdAt: null,
+      summary: "允许执行",
+      toolName: "Bash",
+      schemaInteraction: null,
+      sensitive: false,
+      autoResolution: false,
+      autoResolutionState: null,
+      questions: [],
+      options: [],
+      detail: null,
+    };
+  }
+
   it("old_get_cannot_rollback_newer_sse_queue", async () => {
     // 首拍 GET 仍在途时，SSE 已把同代视图推进到 revision=12（新队列）。
     const gate = deferred<Response>();
@@ -1307,7 +1327,9 @@ describe("useZcodeControl：F1 同代 revision 单调", () => {
 
   it("recovery_never_restores_older_content", async () => {
     // rev12 就绪（队列两条、能力全关）→ 更旧的降级帧关写面（内容不回退）→ 由它触发的
-    // 恢复 GET 返回更旧的 rev10 `ready=true` 且能力全开：只许收窄能力，旧队列不得复活。
+    // 恢复 GET 返回更旧的 rev10 `ready=true` 且能力全开：内容一律留在较新的 rev12
+    // （旧队列不得复活）；但降级态下**允许能力恢复**——能力取 incoming 的权威现算值，
+    // 否则降级后发送按钮会永久灰着（本表以「内容不回退」为准，能力单独放行）。
     let serverView = sessionView({
       revision: 12,
       queue: queueView(["queue_new1", "queue_new2"]),
@@ -1350,9 +1372,126 @@ describe("useZcodeControl：F1 同代 revision 单调", () => {
       "queue_new2",
     ]);
     expect(result.current.session?.revision).toBe(12);
-    // 能力不得由关变开：更旧的现读只能把开改关。
-    expect(result.current.session?.capabilities.send.enabled).toBe(false);
-    expect(result.current.session?.ready).toBe(false);
+    // 降级态下恢复：就绪与权威能力必须回来（内容仍不回退）。
+    expect(result.current.session?.ready).toBe(true);
+    expect(result.current.session?.capabilities.send.enabled).toBe(true);
+    expect(postedActions()).toHaveLength(0);
+  });
+
+  it("degraded_recovery_keeps_newer_queue_content", async () => {
+    // 同一场景（降级态 + 更旧的 recovery 现读），但这次锁**内容**：就绪与能力可以恢复，
+    // 队列/pending/control/selection 一律留在较新视图——旧快照的 `queue_old` 绝不复活。
+    let serverView = sessionView({
+      revision: 12,
+      queue: queueView(["queue_a", "queue_b"]),
+      pending: [pendingView("pi_new")],
+      control: { activeWorks: [{ kind: "exec", foregroundExecutionId: "exec_new" }] },
+      selection: { provider: "bigmodel", model: "glm-5", thought: null, models: [] },
+      capabilities: closedCapabilities(),
+    });
+    installFetch((url) => {
+      if (url === ZCODE_CONNECTION_PATH) return json(connection());
+      if (url.startsWith(`${ZCODE_SESSION_PATH}?`)) return json(serverView);
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+
+    const { result } = renderHook(() => useZcodeControl(SID));
+    await flush();
+    const sessionGets = () =>
+      calledUrls().filter((url) => url.startsWith(`${ZCODE_SESSION_PATH}?`)).length;
+    expect(result.current.session?.revision).toBe(12);
+
+    // 恢复 GET 返回更旧的 rev10（ready=true、能力开、内容全旧）：
+    serverView = sessionView({
+      revision: 10,
+      ready: true,
+      queue: queueView(["queue_old"]),
+      pending: [pendingView("pi_old")],
+      control: { activeWorks: [{ kind: "exec", foregroundExecutionId: "exec_old" }] },
+      selection: { provider: "bigmodel", model: "glm-4", thought: null, models: [] },
+      capabilities: capabilities(),
+    });
+    // 更旧的降级帧（rev11）：关写面但不回退内容，并触发恢复现读。
+    await emitSessionFrame(
+      sessionView({
+        revision: 11,
+        ready: false,
+        queue: queueView([]),
+        pending: [],
+        control: { activeWorks: [] },
+        selection: null,
+        capabilities: closedCapabilities(),
+      })
+    );
+    await flush();
+    expect(sessionGets()).toBe(2);
+
+    // 能力/就绪恢复……
+    expect(result.current.session?.ready).toBe(true);
+    expect(result.current.session?.capabilities.send.enabled).toBe(true);
+    // ……但内容仍是较新的那两条（以及较新的 pending/control/selection）。
+    expect(result.current.session?.queue?.items.map((item) => item.inputId)).toEqual([
+      "queue_a",
+      "queue_b",
+    ]);
+    expect(result.current.session?.pending.map((item) => item.interactionId)).toEqual(["pi_new"]);
+    expect(
+      result.current.session?.control?.activeWorks.map((work) => work.foregroundExecutionId)
+    ).toEqual(["exec_new"]);
+    expect(result.current.session?.selection?.model).toBe("glm-5");
+    expect(result.current.session?.revision).toBe(12);
+    expect(postedActions()).toHaveLength(0);
+  });
+
+  it("degraded_recovery_with_null_revision_restores_caps", async () => {
+    // 当前 rev12 已降级（队列两条、能力全关）→ 恢复现读带回 **revision=null** 的
+    // `ready=true`（宿主重启/投影刚恢复时给不出序号）：仍必须恢复就绪与能力，否则
+    // 视图永久停在关闭态；内容（队列两条）一律不得被旧读替换。
+    let serverView = sessionView({
+      revision: 12,
+      queue: queueView(["queue_a", "queue_b"]),
+    });
+    installFetch((url) => {
+      if (url === ZCODE_CONNECTION_PATH) return json(connection());
+      if (url.startsWith(`${ZCODE_SESSION_PATH}?`)) return json(serverView);
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+
+    const { result } = renderHook(() => useZcodeControl(SID));
+    await flush();
+    const sessionGets = () =>
+      calledUrls().filter((url) => url.startsWith(`${ZCODE_SESSION_PATH}?`)).length;
+    expect(result.current.session?.revision).toBe(12);
+    expect(result.current.session?.capabilities.send.enabled).toBe(true);
+
+    // 恢复现读的答案：ready=true、能力全开，但序号为空（旧队列也不再被声称）。
+    serverView = sessionView({
+      revision: null,
+      ready: true,
+      queue: queueView(["queue_old"]),
+      capabilities: capabilities(),
+    });
+    // 更旧的降级帧（rev11）：只关写面、不回退内容，并触发恢复现读。
+    await emitSessionFrame(
+      sessionView({
+        revision: 11,
+        ready: false,
+        queue: queueView([]),
+        capabilities: closedCapabilities(),
+      })
+    );
+    await flush();
+    expect(sessionGets()).toBe(2);
+
+    // 就绪与权威能力必须回来（空序号不得成为挡板）……
+    expect(result.current.session?.ready).toBe(true);
+    expect(result.current.session?.capabilities.send.enabled).toBe(true);
+    // ……内容仍是最新那两条，旧读的 `queue_old` 绝不复活。
+    expect(result.current.session?.queue?.items.map((item) => item.inputId)).toEqual([
+      "queue_a",
+      "queue_b",
+    ]);
+    expect(result.current.session?.revision).toBe(12);
     expect(postedActions()).toHaveLength(0);
   });
 

@@ -224,7 +224,10 @@ export interface CapabilityFlag {
   reasonCode: string | null;
 }
 
-/** 本会话能力矩阵（八项固定字段，不复制 contract 的宽泛 true）。 */
+/** 本会话能力矩阵（十一项固定字段，不复制 contract 的宽泛 true）。
+ *
+ *  三项 `queue*` 是**队列专属**槽位：默认关闭（`reasonCode=needs_evidence`），
+ *  绝不因 `send` 开闸而放行；即使开闸，服务端每帧仍用新鲜官方队列二次校验。 */
 export interface CapabilityView {
   send: CapabilityFlag;
   singleSelect: CapabilityFlag;
@@ -234,16 +237,40 @@ export interface CapabilityView {
   approvalReply: CapabilityFlag;
   model: CapabilityFlag;
   thoughtLevel: CapabilityFlag;
+  /** 队列撤回/重排（`deleteQueueItem` / `reorderQueueItem`）。 */
+  queueEdit: CapabilityFlag;
+  /** 队列「立即执行」（`sendQueuedNow`；**不是**「引导」）。 */
+  queueNow: CapabilityFlag;
+  /** 恢复队列自动处理（`setAutoDrain(true)`）。 */
+  queueResume: CapabilityFlag;
 }
 
 /** 官方输入队列里的一项（`state.queue.items[]` 的只读投影）。
  *  `inputId` = 官方 `queueItemId`（宿主派生 `queue_<commandId>`，Tuvis 原样透传、
  *  **不重算**）；`position` = `order.queuePosition`（0 基，缺席 = null，绝不按数组
- *  下标猜位置）；`text` 是官方队列项正文原文（与正文同等级，可下发、不落日志）。 */
+ *  下标猜位置）；`text` 是官方队列项正文原文（与正文同等级，可下发、不落日志）。
+ *  `kind`/`dispatchState` 是服务端按证据白名单投影的官方值，白名单外 = null；
+ *  `hasAttachments` 只告知**有没有**附件，绝不下发附件对象/路径。 */
 export interface QueueItemView {
   inputId: string;
   text: string;
   position: number | null;
+  /** 官方 `kind`（白名单 `sendText|sendGoalCommand|compact`；null = 未知）。 */
+  kind: string | null;
+  /** 官方 `dispatch.state`（白名单 `admitted|queued|reserved|promoting|drained`）。 */
+  dispatchState: string | null;
+  /** 是否带附件（只告知有无）。 */
+  hasAttachments: boolean;
+}
+
+/** 官方 `state.availability` 里与队列写有关的只读资格（`known=false` = 未知/全关）。
+ *
+ *  证据只覆盖 `queueEdit`/`sendQueuedNow` 两项；官方没有 `setAutoDrain` 的可用位，
+ *  因此「恢复」资格不由本对象表达（只看 `paused===true` + 能力闸）。 */
+export interface QueueActionAvailability {
+  known: boolean;
+  queueEditAllowed: boolean;
+  sendQueuedNowAllowed: boolean;
 }
 
 /** 官方输入队列视图（`state.queue`）。三态必须可区分：
@@ -257,6 +284,8 @@ export interface QueueView {
   paused: boolean | null;
   pauseReason?: string | null;
   items: QueueItemView[];
+  /** 队列写资格（默认全关；只是必要条件之一，不构成「可点」的充分条件）。 */
+  availability: QueueActionAvailability;
 }
 
 /** 官方 `state.inputRouting` 的最小投影（至少 `mode`；`reasonCode` 可缺省）。
@@ -330,7 +359,23 @@ export type ControlAction =
       generation: number;
       expectedForegroundExecutionId: string;
     }
-  | { kind: "selection"; sessionId: string; generation: number; model: string; thought: string };
+  | { kind: "selection"; sessionId: string; generation: number; model: string; thought: string }
+  // ---- 队列写（W3）：目标一律是官方 `queueItemId`，绝不是位置/下标/正文 ----
+  /** 撤回一条官方队列项。 */
+  | { kind: "queueDelete"; sessionId: string; generation: number; queueItemId: string }
+  /** 重排：把 `queueItemId` 移到 `beforeQueueItemId` 之前。
+   *  `null`（官方「移末尾」语义未经实机确认）当前会被服务端拒绝。 */
+  | {
+      kind: "queueReorder";
+      sessionId: string;
+      generation: number;
+      queueItemId: string;
+      beforeQueueItemId: string | null;
+    }
+  /** **立即执行**一条队列项（`sendQueuedNow`）；不是「引导」。 */
+  | { kind: "queueNow"; sessionId: string; generation: number; queueItemId: string }
+  /** 恢复队列自动处理（`setAutoDrain(true)`）；不重发任何队列项。 */
+  | { kind: "queueResume"; sessionId: string; generation: number };
 
 // ==== 端点 ====
 
