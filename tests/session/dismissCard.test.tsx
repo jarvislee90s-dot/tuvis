@@ -97,12 +97,13 @@ describe("App 卡 X 关闭（T2）", () => {
     await waitFor(() => expect(invalidate).toHaveBeenCalledWith({ queryKey: ["sessions"] }));
   });
 
-  it("关闭失败时不失效查询（不伪装成功）", async () => {
+  it("关闭失败也失效查询（回滚乐观隐藏）", async () => {
     invokeMock.mockRejectedValueOnce(new Error("ipc failed"));
     const invalidate = renderCard(mk({ status: "waiting", form: "app", unread: false }));
     fireEvent.click(screen.getByRole("button", { name: /Hide for now/i }));
     await waitFor(() => expect(invokeMock).toHaveBeenCalled());
-    expect(invalidate).not.toHaveBeenCalled();
+    // F5-opt：失败在 finally 中 invalidate，权威快照回滚乐观隐藏
+    await waitFor(() => expect(invalidate).toHaveBeenCalledWith({ queryKey: ["sessions"] }));
   });
 
   it("补扫降级（applied=false）仍失效缓存，但不按成功展示", async () => {

@@ -1,5 +1,6 @@
 import { useTranslation } from "react-i18next";
 import { useQueryClient } from "@tanstack/react-query";
+import { hideSessionOptimistically } from "@/lib/query/optimisticSessions";
 import { Cpu, Clock, Bot, ChevronRight, X, ArrowLeftRight, ExternalLink } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { cn } from "@/lib/utils";
@@ -64,11 +65,16 @@ export function SessionCard({
   // 未读卡 = 标记已读（mark_session_read，spec W4 已读信号 2）；
   // 非未读卡（黄/红/绿）= 暂离不提示（dismiss_session_card，T2）——写入进程内
   // dismiss 集合从看板与宠物隐藏，同一会话状态变化后自然重现。
-  // R1：命令为 async（补扫在阻塞池内），回执 applied=false 表示补扫降级——
-  // 仍要失效缓存，但不得按成功展示。
+  // F5 用户感知口径（2026-10-31 裁决）：点击后**先乐观隐藏**（缓存更新 → 卡面立即消失
+  // ≤1s），命令内部的补扫等待不阻塞感知；成功后回取权威快照，失败即回滚。
   const handleClose = async (e: React.MouseEvent) => {
     e.stopPropagation(); // 不触发卡片跳转
-    let outcome: { applied: boolean; version: number };
+    hideSessionOptimistically(queryClient, {
+      id: session.id,
+      agentType: session.agentType,
+      unread: session.unread,
+    });
+    let outcome: { applied: boolean; version: number } | null = null;
     try {
       outcome = session.unread
         ? await invoke<{ applied: boolean; version: number }>("mark_session_read", {
@@ -80,15 +86,15 @@ export function SessionCard({
             sessionId: session.id,
             status: session.status,
           });
+      if (!outcome?.applied) {
+        console.warn("[sessions] 关闭后补扫降级（applied=false），卡片可能短暂残留", outcome);
+      }
     } catch (err) {
+      // 失败：finally 的 invalidate 会把权威快照取回（乐观隐藏回滚）
       console.error("session card close failed:", err);
-      return;
+    } finally {
+      void queryClient.invalidateQueries({ queryKey: ["sessions"] });
     }
-    if (!outcome?.applied) {
-      console.warn("[sessions] 关闭后补扫降级（applied=false），卡片可能短暂残留", outcome);
-    }
-    // 失败（applied=false）也要失效：下一轮扫描会收敛，绝不假成功
-    void queryClient.invalidateQueries({ queryKey: ["sessions"] });
   };
 
   const handleClick = async () => {

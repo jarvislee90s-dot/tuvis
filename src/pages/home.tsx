@@ -26,6 +26,7 @@ import { UsageDashboardBody } from "@/components/usage/UsageDashboardBody";
 import { SpeedDashboard } from "@/components/speed/SpeedDashboard";
 import { CheckCheck, Activity, AlertCircle } from "lucide-react";
 import { useQueryClient } from "@tanstack/react-query";
+import { hideSessionsOptimistically } from "@/lib/query/optimisticSessions";
 import { useSessions } from "@/hooks/useSessions";
 import { useNotification } from "@/hooks/useNotification";
 import { useWorkspaceNavigation } from "@/hooks/useWorkspaceNavigation";
@@ -67,10 +68,15 @@ export default function HomePage() {
 
   // 一键清除已完成卡片（绿/空闲）：R1 起走后端**批量**命令——未读/非未读的分流
   // 由后端按未读池权威判定，全部变更完成后只补扫一次（N 张卡 ≠ N 次扫描）。
-  // 回执 applied=false 表示补扫降级：照常失效缓存，但 console.warn 不假成功。
+  // F5 用户感知口径（2026-10-31 裁决）：先一次 `setQueryData` 移除全部目标卡
+  // （用户感知 ≤1s），命令结束后无论成败都回取权威快照一次。
   const finishedCards = sessions.filter((s) => s.status === "idle" || s.status === "finished");
   const clearFinishedCards = async () => {
     if (finishedCards.length === 0) return;
+    hideSessionsOptimistically(
+      queryClient,
+      finishedCards.map((s) => ({ id: s.id, agentType: s.agentType }))
+    );
     try {
       const outcome = await invoke<{ applied: boolean; version: number }>("dismiss_session_cards", {
         items: finishedCards.map((s) => ({
