@@ -176,6 +176,21 @@ pub struct PackageIdentity {
     pub sha256: String,
 }
 
+/// C03：一次**已落账**的包内容 SHA 核验（按连接代际 + stat 指纹键控）。
+///
+/// 帧路径用 `(len, mtime)` 快筛是**必要非充分**条件（同 len/保留 mtime 的内容
+/// 替换可绕过）；本缓存记录「该代际、该 stat 形态下实际哈希出的内容 SHA」——
+/// 展示沿用只有在它等于被识别记录的 SHA 时才可当作已确认身份。每代际最多一次
+/// 整包哈希（帧路径零重读）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PackageShaVerification {
+    epoch: u64,
+    fingerprint: (u64, i64),
+    /// 当前包内容哈希；`None` = 哈希失败（stat 成功但读不了）——按「未通过」
+    /// 处理且不再自动重试（诚实保守，换代即失效）。
+    sha256: Option<String>,
+}
+
 pub type DeviceValidSource = std::sync::Arc<dyn Fn(&str) -> bool + Send + Sync>;
 
 struct AdapterInner {
@@ -365,6 +380,20 @@ struct AdapterInner {
     /// T02：**契约证据槽**（连接代际, 绑定目标, 证据）——只由
     /// [`Self::install_contract_evidence`] 在身份守卫下写入。
     contract_evidence: std::sync::Mutex<Option<ContractEvidenceSlot>>,
+    /// R07：最近一次**已完成识别**的展示记录（同一完整目标的 support 结论 +
+    /// 能力身份）。真实重连换代让 [`Self::contract_evidence`] 槽失配时，投影的
+    /// `support` 与 `capability_identity` 沿用本记录（**纯展示**，不进授权）；
+    /// 重新识别完成即覆盖；目标身份变化时因比对失败而不沿用。
+    display_support: std::sync::Mutex<Option<super::capability::DisplaySupport>>,
+    /// C03：最近一次落账的包内容 SHA 核验（单槽：只服务**当前代际 + 当前 stat**，
+    /// 键不匹配即视同未核验）。展示沿用前必须命中且等于记录 SHA。
+    package_sha_verify: std::sync::Mutex<Option<PackageShaVerification>>,
+    /// C03：在飞核验标记 `(epoch, fingerprint)`——防投影热路径每帧重复触发整包
+    /// 哈希；落账时清除。
+    package_sha_verify_inflight: std::sync::Mutex<Option<(u64, (u64, i64))>>,
+    /// C03：继承窗内自动触发后台核验（生产恒开；测试可关掉后手动驱动
+    /// [`Self::verify_package_sha_now`] 取确定性）。
+    package_sha_auto_verify: AtomicBool,
     /// T02：契约证据的**读取器**（生产 = 真实包只读解析；测试注入受控 reader，
     /// 绝不扫描/连接本机 App）。
     contract_reader: std::sync::Mutex<Option<Arc<dyn DesktopContractReader>>>,
@@ -607,6 +636,10 @@ impl DesktopIpcAdapter {
                 pause_reserve_gate: std::sync::Mutex::new(None),
                 pause_observe_gate: std::sync::Mutex::new(None),
                 contract_evidence: std::sync::Mutex::new(None),
+                display_support: std::sync::Mutex::new(None),
+                package_sha_verify: std::sync::Mutex::new(None),
+                package_sha_verify_inflight: std::sync::Mutex::new(None),
+                package_sha_auto_verify: std::sync::atomic::AtomicBool::new(true),
                 contract_reader: std::sync::Mutex::new(None),
                 contract_store: std::sync::Mutex::new(None),
                 contract_inflight: tokio::sync::Mutex::new(()),
@@ -2288,7 +2321,282 @@ impl DesktopIpcAdapter {
         queue_paused: bool,
     ) -> EffectiveOperations {
         let context = self.operation_context_from(runtime_status, blocking_pending, queue_paused);
-        OperationPolicy.evaluate(&context)
+        let mut operations = OperationPolicy.evaluate(&context);
+        // T03：能力身份在装配处填充（投影与详情端点同源——都经本函数）。
+        // None = 无目标/未识别；同目标短断链不变（展示保留的前提），换代即失效。
+        // R07：同一完整目标真实重连（代际更换）期间沿用上次识别的展示身份。
+        operations.capability_identity = self.capability_identity();
+        operations
+    }
+
+    /// T03：能力身份摘要（无路径）= 当前代际+目标下**已装载**契约证据的
+    /// `probe_key + 包 SHA + 规则版本` 摘要。判定与 [`Self::current_contract_facts`]
+    /// 同一条件（槽命中当前代际与目标）——identity 为 `Some` ⟺ 契约识别已完成。
+    ///
+    /// R07：槽因**真实重连换代**失配但目标身份（platform/build/探测键）未变时，
+    /// 沿用上次识别记录的展示身份（前端据此保留上次支持展示）；目标身份变化
+    /// （新 build/包 SHA/规则版本）→ `None`，不得沿用。
+    /// 无目标/未识别 → `None`。**不参与授权**，仅供前端区分展示目标。
+    fn capability_identity(&self) -> Option<String> {
+        let epoch = self.inner.epoch.load(Ordering::SeqCst);
+        let target = self.probe_target_snapshot();
+        let slot = self
+            .inner
+            .contract_evidence
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some((slot_epoch, slot_target, evidence)) = slot {
+            if slot_epoch == epoch && slot_target == target {
+                return Some(super::capability::capability_identity_of(
+                    &evidence.probe_key,
+                    &evidence.package_sha256,
+                    evidence.rule_version,
+                ));
+            }
+        }
+        // 同身份重连：沿用上次识别记录的展示身份（不参与授权，仅展示）。
+        // R07 修复轮 1：识别**失败**（本代际已有失败记录）时不沿用——否则展示身份
+        // 会与「识别未完成」的事实冲突，且失败持续会让旧身份无限存续。
+        let failed_now = self
+            .inner
+            .contract_failure
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .is_some_and(|(failure_epoch, _, _)| *failure_epoch == epoch);
+        if failed_now {
+            return None;
+        }
+        // C03：与 support 沿用同一道**内容门**——本代际 SHA 核验**通过**才发布展示
+        // 身份；未核验（待核对）或不通过一律 `None`（旧 SHA 不得冒充当前已确认身份）。
+        let record = self.display_record_for_current_target()?;
+        let fingerprint = record.package_fingerprint?;
+        match self.package_sha_verification_for(fingerprint) {
+            Some(Some(sha)) if sha == record.package_sha256 => Some(record.identity),
+            _ => None,
+        }
+    }
+
+    /// R07：真实重连期间（证据槽尚未重新装回）沿用上次识别结论的 support 展示。
+    ///
+    /// **只在"等识别／换代失配"窗生效**：`contract_identified` 为真 = 实时事实优先；
+    /// `contract_error` 在场 = **识别失败**，不得展示"已支持"（否则与原因码
+    /// `operation_contract_unmatched` 自相矛盾，且失败持续会让假"已支持"无限延续）。
+    /// 记录按**同一完整目标**（platform/build/探测键/包指纹）匹配，任一变化即不沿用。
+    fn reconnect_display_support(
+        &self,
+        contract_identified: bool,
+        contract_error: Option<&str>,
+    ) -> (
+        std::collections::BTreeMap<CodexOperation, super::capability::SupportState>,
+        bool,
+    ) {
+        if contract_identified || contract_error.is_some() {
+            return (std::collections::BTreeMap::new(), false);
+        }
+        // C03：stat 快筛相等 ≠ 内容相等。沿用前本代际必须完成一次**内容 SHA 核验**：
+        // * 通过（= 被识别那份）→ 沿用且身份已确认（`verified=true`）；
+        // * 不通过（内容不同 / 哈希失败）→ 记录对本代际失效，走真实识别中；
+        // * 尚未核验 → 「待核对」沿用展示（支持如实显示、身份不发布），同时触发
+        //   后台核验（每代际一次，帧路径零重读整包）。
+        let Some(record) = self.display_record_for_current_target() else {
+            return (std::collections::BTreeMap::new(), false);
+        };
+        let Some(fingerprint) = record.package_fingerprint else {
+            return (std::collections::BTreeMap::new(), false);
+        };
+        match self.package_sha_verification_for(fingerprint) {
+            Some(Some(sha)) if sha == record.package_sha256 => (record.support, true),
+            Some(_) => (std::collections::BTreeMap::new(), false),
+            None => {
+                self.kick_package_sha_verification(&record.probe_key, fingerprint);
+                (record.support, false)
+            }
+        }
+    }
+
+    /// R07：当前目标是否命中「上次识别记录」——判据四条缺一不可：
+    ///
+    /// 1. **代际已换代**（`record.epoch != 当前 epoch`）：同代际下证据槽为空 =
+    ///    "未识别/被清空"，不得用旧记录冒充展示事实；
+    /// 2. **同目标身份**（platform + build 相同；双方都解析出探测键时键必须一致——
+    ///    `cli_id` 变化 = 新目标）；
+    /// 3. **包内容指纹一致**（R17 的 `(len, mtime)`；stat 变化/读不到 → 新包，拒绝
+    ///    沿用——覆盖"同 build 换包 + 适配关闭时包内容永不复查"的死角）；
+    /// 4. 槽未命中当前代际（调用方已保证：实时事实优先）。
+    ///
+    /// 命中 → 可沿用展示事实；否则 `None`（走真实识别中）。
+    fn display_record_for_current_target(&self) -> Option<super::capability::DisplaySupport> {
+        let record = self
+            .inner
+            .display_support
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()?;
+        // ① 只有**真实重连**（代际前进）才沿用；同代际 = 未识别，不猜。
+        if record.epoch == self.inner.epoch.load(Ordering::SeqCst) {
+            return None;
+        }
+        // ② 目标身份必须相同。
+        let target = self.probe_target_snapshot()?;
+        if record.platform != target.platform || record.build != target.build {
+            return None;
+        }
+        if let (Some(record_key), Some(current_key)) =
+            (record.probe_key.as_deref(), target.key.as_deref())
+        {
+            if record_key != current_key {
+                return None;
+            }
+        }
+        // ③ 包内容指纹必须一致（记录时没取到指纹 → 保守不沿用）。
+        let recorded = record.package_fingerprint?;
+        if recorded != self.current_package_fingerprint(&record.probe_key)? {
+            return None;
+        }
+        Some(record)
+    }
+
+    /// R07：当前包文件的 `(len, mtime_ms)` 指纹（一次 stat；读不到 → `None`）。
+    ///
+    /// 与 R17 复用前核对同款口径；契约目标定位失败**不**回退成"无指纹"——一处失败
+    /// 即拒绝沿用（宁可显示识别中，不可拿旧结论冒充新包）。
+    fn current_package_fingerprint(&self, probe_key: &Option<String>) -> Option<(u64, i64)> {
+        self.current_package_stamp(probe_key)
+            .map(|(_, fingerprint)| fingerprint)
+    }
+
+    /// C03：当前包文件的**路径 + (len, mtime_ms)** stat（一次目标定位 + 一次 stat）。
+    /// 快筛与内容核验共用同一份观测；读不到 → `None`（拒绝沿用）。
+    fn current_package_stamp(
+        &self,
+        probe_key: &Option<String>,
+    ) -> Option<(std::path::PathBuf, (u64, i64))> {
+        let probe_key = probe_key.as_deref()?;
+        let epoch = self.inner.epoch.load(Ordering::SeqCst);
+        let target = self.contract_target_for(probe_key, epoch).ok()?;
+        let meta = std::fs::metadata(&target.package_path).ok()?;
+        let mtime = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as i64)?;
+        Some((target.package_path, (meta.len(), mtime)))
+    }
+
+    /// C03：本代际 + 该 stat 指纹下已落账的内容 SHA 核验结果。
+    /// `Some(Some(sha))` = 已核验（比对 `record.package_sha256` 定通过/不通过）；
+    /// `Some(None)` = 已核验但哈希失败（按不通过）；`None` = 本代际尚未核验。
+    fn package_sha_verification_for(&self, fingerprint: (u64, i64)) -> Option<Option<String>> {
+        let epoch = self.inner.epoch.load(Ordering::SeqCst);
+        self.inner
+            .package_sha_verify
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .filter(|entry| entry.epoch == epoch && entry.fingerprint == fingerprint)
+            .map(|entry| entry.sha256.clone())
+    }
+
+    /// C03：落账一次核验结果（并释放在飞标记）。同键重复落账以最后为准。
+    fn settle_package_sha_verification(
+        &self,
+        epoch: u64,
+        fingerprint: (u64, i64),
+        sha256: Option<String>,
+    ) {
+        *self
+            .inner
+            .package_sha_verify
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(PackageShaVerification {
+            epoch,
+            fingerprint,
+            sha256,
+        });
+        // 无条件释放在飞标记：标记只防重复触发，落账即代表本轮结束（包在核验期间
+        // 被替换的极端情形下，旧标记残留最多导致一次重复哈希，无正确性影响）。
+        *self
+            .inner
+            .package_sha_verify_inflight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    /// C03：对**当前代际 + 当前包**做一次内容 SHA 核验并落账。
+    ///
+    /// 生产路径由 [`Self::kick_package_sha_verification`] 在继承窗内自动触发（按
+    /// 代际 + stat 指纹单飞，帧路径零重读整包）；`#[doc(hidden)]` 供测试确定性
+    /// 驱动。返回哈希结果（`None` = stat/哈希失败）。
+    #[doc(hidden)]
+    pub async fn verify_package_sha_now(&self, probe_key: Option<&str>) -> Option<String> {
+        let (path, fingerprint) = self.current_package_stamp(&probe_key.map(str::to_string))?;
+        let epoch = self.inner.epoch.load(Ordering::SeqCst);
+        let sha = tokio::task::spawn_blocking(move || {
+            super::probe::desktop_contract::hash_package(&path).ok()
+        })
+        .await
+        .ok()
+        .flatten();
+        self.settle_package_sha_verification(epoch, fingerprint, sha.clone());
+        sha
+    }
+
+    /// C03：继承窗内（快筛相等、本代际未核验）触发一次**后台**内容 SHA 核验。
+    ///
+    /// 按代际 + stat 指纹单飞（在飞/已落账不再触发）；无 tokio runtime（纯同步
+    /// 上下文）或测试关闭自动核验时跳过——帧按「待核对」如实展示，下帧重试。
+    /// 核验落账后主动重发布：让「待核对 → 已核对/不沿用」的展示事实变化即时到达
+    /// 前端（不等下一轮 3s 轮询；重发布按 revision 去重，无变化则静默）。
+    fn kick_package_sha_verification(&self, probe_key: &Option<String>, fingerprint: (u64, i64)) {
+        if !self
+            .inner
+            .package_sha_auto_verify
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return;
+        }
+        let epoch = self.inner.epoch.load(Ordering::SeqCst);
+        {
+            let done = self
+                .inner
+                .package_sha_verify
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if done
+                .as_ref()
+                .is_some_and(|entry| entry.epoch == epoch && entry.fingerprint == fingerprint)
+            {
+                return;
+            }
+        }
+        {
+            let mut inflight = self
+                .inner
+                .package_sha_verify_inflight
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if inflight.as_ref() == Some(&(epoch, fingerprint)) {
+                return;
+            }
+            *inflight = Some((epoch, fingerprint));
+        }
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            // 无 runtime：放弃本次触发（清标记，帧按"待核对"展示，下帧重试）。
+            *self
+                .inner
+                .package_sha_verify_inflight
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = None;
+            return;
+        };
+        let this = self.clone();
+        let probe_key = probe_key.clone();
+        handle.spawn(async move {
+            this.verify_package_sha_now(probe_key.as_deref()).await;
+            this.republish_all_projections().await;
+        });
     }
 
     /// T04：按当前镜像事实求值策略（短锁读预览；不在锁内求值）。
@@ -2350,7 +2658,14 @@ impl DesktopIpcAdapter {
         schema.insert(CodexOperation::CommandApproval, schema_command);
         schema.insert(CodexOperation::FileChangeApproval, schema_file);
 
-        let (contract, contract_error) = self.current_contract_facts();
+        let (contract, contract_identified, contract_error) = self.current_contract_facts();
+        // R07：**仅展示**的「同身份上次已支持」事实——槽失配（真实重连换代）但
+        // 目标身份未变时，沿用上次识别结论的 support 展示面。不进 contract/
+        // evidence/allowed：`contract` 仍为空、`contract_identified` 仍为 false。
+        // 识别**失败**时（`contract_error` 在场）不沿用：否则与原因码
+        // `operation_contract_unmatched` 自相矛盾。
+        let (display_support, display_identity_verified) =
+            self.reconnect_display_support(contract_identified, contract_error.as_deref());
 
         // 目标新鲜度 = **连接在场**（内存事实；不 try_lock 造成抖动）。
         // 为什么不再要求 probe_target：shipped 证据档的会话本来就没有探测目标，把
@@ -2368,7 +2683,12 @@ impl DesktopIpcAdapter {
             observed,
             schema,
             contract,
+            contract_identified,
             contract_error,
+            display_support,
+            // C03：`true` = 本代际内容 SHA 核验通过（展示身份可当作已确认）；
+            // `false` = 待核对（支持可沿用、身份不发布）。
+            display_identity_verified,
         }
     }
 
@@ -2383,10 +2703,15 @@ impl DesktopIpcAdapter {
     }
 
     /// 当前契约事实（证据槽命中当前代际+目标才采纳；否则只可能给出失败码）。
+    /// 当前目标的契约事实：`(逐操作匹配, 识别已完成, 失败码)`。
+    ///
+    /// 识别已完成 = 当前代际／目标的证据槽已装载（包已读、规则已跑）——此时
+    /// `匹配` 里缺的操作是"规则未匹配"，不是"还没识别"；失败或未尝试都为 `false`。
     fn current_contract_facts(
         &self,
     ) -> (
         std::collections::BTreeMap<CodexOperation, super::capability::ContractMatch>,
+        bool,
         Option<String>,
     ) {
         let epoch = self.inner.epoch.load(Ordering::SeqCst);
@@ -2399,7 +2724,7 @@ impl DesktopIpcAdapter {
             .clone();
         if let Some((slot_epoch, slot_target, evidence)) = slot {
             if slot_epoch == epoch && slot_target == target {
-                return (evidence.matches, None);
+                return (evidence.matches, true, None);
             }
         }
         let failure = self
@@ -2410,9 +2735,9 @@ impl DesktopIpcAdapter {
             .clone();
         match failure {
             Some((failure_epoch, _key, code)) if failure_epoch == epoch => {
-                (std::collections::BTreeMap::new(), Some(code))
+                (std::collections::BTreeMap::new(), false, Some(code))
             }
-            _ => (std::collections::BTreeMap::new(), None),
+            _ => (std::collections::BTreeMap::new(), false, None),
         }
     }
 
@@ -2627,6 +2952,16 @@ impl DesktopIpcAdapter {
             .unwrap_or_else(|e| e.into_inner()) = gate;
     }
 
+    /// C03 测试缝：开关继承窗内的**自动**后台 SHA 核验（生产恒开）。测试关掉后
+    /// 手动驱动 [`Self::verify_package_sha_now`]，让「待核对 → 已核对」两相都可
+    /// 确定性断言。
+    #[doc(hidden)]
+    pub fn set_package_sha_auto_verify_enabled(&self, enabled: bool) {
+        self.inner
+            .package_sha_auto_verify
+            .store(enabled, std::sync::atomic::Ordering::SeqCst);
+    }
+
     /// T02 测试缝：固定契约目标（生产恒 None → 官方运行包定位）。
     #[doc(hidden)]
     pub fn set_contract_target_override(&self, target: Option<ContractTarget>) {
@@ -2651,12 +2986,37 @@ impl DesktopIpcAdapter {
 
     /// T02：把证据装进**读取发起时捕获的身份**（旧代际/旧目标的迟到结果不安装、
     /// 不落账）。返回是否安装。
+    ///
+    /// R07：安装成功即刷新**展示记录**（这次**实际展示**的 support 快照 + 能力身份）
+    /// ——后续真实重连换代导致槽失配时，投影沿用它与 [`Self::capability_identity`]
+    /// 的展示面（不参与授权）。
     fn install_contract_evidence(
         &self,
         captured: &ProbeTarget,
         probe_key: &str,
         evidence: DesktopContractEvidence,
     ) -> bool {
+        // 展示记录在锁外先算好（`with_current_probe_target` 闭包持 target 锁，
+        // 闭包内不取 profile 锁，避免锁序纠缠）。
+        let record = super::capability::DisplaySupport {
+            epoch: captured.epoch,
+            platform: captured.platform.clone(),
+            build: captured.build.clone(),
+            probe_key: captured.key.clone().or_else(|| Some(probe_key.to_string())),
+            // C03：包指纹 = **取证时**绑定——证据自带读前读后一致的 (len, mtime)
+            //（`read_desktop_contract` 的同一观测），与 `package_sha256` 同源；不是
+            // 安装时对盘上文件的另一次 stat（那会把 A 的结论配上 B 的指纹）。证据
+            // 未带指纹（老证据）→ None = 保守不沿用。
+            package_fingerprint: evidence.package_size.zip(evidence.package_mtime_ms),
+            // C03：取证时的内容 SHA 随记录走——重连沿用前按它核验当前包。
+            package_sha256: evidence.package_sha256.clone(),
+            identity: super::capability::capability_identity_of(
+                &evidence.probe_key,
+                &evidence.package_sha256,
+                evidence.rule_version,
+            ),
+            support: self.support_snapshot_for(&captured.key, probe_key, &evidence),
+        };
         // 注意：`with_current_probe_target` 内部持 `probe_target` 锁执行闭包——
         // 闭包内**不得**再调 `probe_target_snapshot()`（同锁重入 = 自锁死）。
         // 槽位里存发起时捕获的同一份目标（守卫已保证它仍是当前目标）。
@@ -2681,8 +3041,94 @@ impl DesktopIpcAdapter {
                 .contract_failure
                 .lock()
                 .unwrap_or_else(|e| e.into_inner()) = None;
+            *self
+                .inner
+                .display_support
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = Some(record.clone());
         })
         .is_some()
+    }
+
+    /// R07（Important-2）：安装时的逐操作 support **展示快照**——用同一
+    /// [`super::capability::OperationPolicy`] 在"无展示事实"的上下文上求一次值，
+    /// 因而天然覆盖 shipped / observed / contract / schema **全部**证据来源
+    /// （靠 schema 或真实成功放行、契约未匹配的操作——未知 build 审批是典型——
+    /// 记录里也是 `Supported`，不会在重连窗被降级成 `Unmatched`）。
+    ///
+    /// 上下文取 `idle` + 无 pending/pause：support **只**取决于证据与识别完成度，
+    /// 与运行态/暂停无关（T03 语义），故这些运行态字段取值不影响结果。
+    fn support_snapshot_for(
+        &self,
+        captured_key: &Option<String>,
+        probe_key: &str,
+        evidence: &DesktopContractEvidence,
+    ) -> std::collections::BTreeMap<CodexOperation, super::capability::SupportState> {
+        let caps = self.current_caps();
+        let mut shipped = std::collections::BTreeMap::new();
+        shipped.insert(CodexOperation::Send, caps.send);
+        shipped.insert(CodexOperation::CommandApproval, caps.command);
+        // 精确逐能力：file 审批没有独立 shipped 位（与投影路径同一口径）。
+        shipped.insert(CodexOperation::BlockingInput, caps.blocking_input);
+        shipped.insert(CodexOperation::Interrupt, caps.interrupt);
+
+        // 与投影同一份事实来源：observed 按**当前完整目标**（probe key + 包 SHA），
+        // schema 走当前审批策略（未知 build 的合法词来源）。
+        let observed_target = Some(super::capability::ObservedTarget {
+            probe_key: captured_key
+                .clone()
+                .unwrap_or_else(|| probe_key.to_string()),
+            package_sha256: evidence.package_sha256.clone(),
+        });
+        let observed = self
+            .inner
+            .observed_operations
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|source| source.observed(observed_target.as_ref()))
+            .unwrap_or_default();
+        let approval = self.approval_policy();
+        let mut schema = std::collections::BTreeMap::new();
+        for (kind, operation) in [
+            (
+                super::types::PendingKind::CommandApproval,
+                CodexOperation::CommandApproval,
+            ),
+            (
+                super::types::PendingKind::FileChangeApproval,
+                CodexOperation::FileChangeApproval,
+            ),
+        ] {
+            let on = approval
+                .for_kind(kind)
+                .iter()
+                .any(|word| word == super::pending::DECISION_ACCEPT);
+            schema.insert(operation, on);
+        }
+
+        let context = OperationContext {
+            target_fresh: true,
+            auto_adapt_enabled: true,
+            runtime_status: "idle".into(),
+            blocking_pending: false,
+            queue_paused: false,
+            read_evidence: false,
+            shipped,
+            observed,
+            schema,
+            contract: evidence.matches.clone(),
+            contract_identified: true,
+            contract_error: None,
+            display_support: std::collections::BTreeMap::new(),
+            display_identity_verified: false,
+        };
+        OperationPolicy
+            .evaluate(&context)
+            .operations
+            .into_iter()
+            .map(|(operation, status)| (operation, status.support))
+            .collect()
     }
 
     /// T02：逐操作有效集合（异步入口：先用已装载/持久证据，缺则只读识别一次）。
@@ -3923,6 +4369,10 @@ impl DesktopIpcAdapter {
                     owner_epoch: 0,
                     owner_generation: 0,
                     local_seq: sealed,
+                    // T02：版本束由远程层**发射点**盖章（adapter 不知道 hub 世系身份）。
+                    projection_version: None,
+                    // T03：无镜像 = 无同次观察的活动回合事实 → None（不猜）。
+                    active_turn_id: None,
                 },
             }
         };
@@ -4022,6 +4472,34 @@ impl DesktopIpcAdapter {
         mirrors
             .get(key)
             .is_some_and(|m| m.turn_has_client_message(turn_id, client_message_id))
+    }
+
+    /// P1 弱证据（2026-10-30）：ack 的 Turn 内正文 hash 与本次 wire 一致的
+    /// userMessage 条数（0/1/多）。只读；无镜像/锁不可得 → 0（保守）。
+    pub async fn count_turn_user_messages_with_text_hash(
+        &self,
+        key: &ThreadKey,
+        turn_id: &str,
+        text_hash: &str,
+    ) -> usize {
+        let mirrors = self.inner.mirrors.lock().await;
+        mirrors
+            .get(key)
+            .map(|m| m.count_user_messages_with_text_hash(turn_id, text_hash))
+            .unwrap_or(0)
+    }
+
+    /// P2 native 屏障核对（2026-10-30）：全镜像唯一正文 hash 匹配的 userMessage
+    /// 所在 Turn（0 条/多义/stale/无镜像 → None）。只读。
+    pub async fn unique_turn_of_user_message_text_hash(
+        &self,
+        key: &ThreadKey,
+        text_hash: &str,
+    ) -> Option<String> {
+        let mirrors = self.inner.mirrors.lock().await;
+        mirrors
+            .get(key)
+            .and_then(|m| m.unique_turn_of_user_message_text_hash(text_hash))
     }
 
     /// S4 只读核对补绑：在当前镜像全部 Turn 中查找承载本动作正式消息身份
@@ -4318,6 +4796,8 @@ impl DesktopIpcAdapter {
             pre_dispatch_turns,
             None,
             async_write_recheck,
+            // P1：随迟到槽位冻结本次 wire 文本（迟到回执弱证据核对的比对源）
+            Some(text.to_string()),
         )
         .await
     }
@@ -4345,7 +4825,11 @@ impl DesktopIpcAdapter {
     ///
     /// 打断后 Desktop 把该回合 status 置 `interrupted`——镜像终态门已认该状态
     /// （`mirror.rs turn_is_terminal`），屏障随之释放、队列接力下一条。
-    /// T06：打断当前是否允许（逐操作策略；含"有活动回合"门）。
+    /// T06：打断当前是否允许（逐操作策略）。**实际语义（2026-10-29 修正过时表述）**：
+    /// 策略对 Interrupt **不以运行态/「有无活动回合」作门**（镜像运行态滞后于桌面
+    /// 真实回合；spec §10）——门 = 证据（契约匹配/精确 shipped/真实成功）+ 自动适配
+    /// 活门 + 目标在场；「有没有可打断的回合」由 `expectedTurnId` 安全阀承载
+    /// （端点取不到阀值 → 409 拒发，adapter 对 None 阀值零 IPC 写入）。
     async fn interrupt_allowed(&self) -> bool {
         let queue_paused = false;
         // 无法从 key 侧取暂停事实时按 false（打断要求暂停**前置**建立，不是入参）。
@@ -4502,6 +4986,7 @@ impl DesktopIpcAdapter {
             false,
             Default::default(),
             Some(recheck),
+            None,
             None,
         )
         .await
@@ -5022,6 +5507,7 @@ impl DesktopIpcAdapter {
                 // 审批/问答有账本 claim，不再叠加无账本复核。
                 None,
                 None,
+                None,
             )
             .await;
         // T04：Accepted 之后按**更强证据**复核解决状态——响应条目
@@ -5076,6 +5562,9 @@ impl DesktopIpcAdapter {
         pre_dispatch_turns: std::collections::HashSet<String>,
         interaction_recheck: Option<super::types::InteractionRecheck>,
         async_write_recheck: Option<super::types::AsyncWriteRecheck>,
+        // P1（2026-10-30）：本次写出的已组装文本（仅 start-turn 携带；随迟到槽位
+        // 冻结，供迟到回执的正文 hash 弱证据核对）。
+        wire_text: Option<String>,
     ) -> RpcOutcome {
         let envelope_id = super::types::new_uuid();
         let conn = self.inner.conn.lock().await.clone();
@@ -5154,6 +5643,7 @@ impl DesktopIpcAdapter {
             pre_dispatch_turns,
             interaction_recheck,
             async_write_recheck,
+            wire_text,
         })
         .await
     }
@@ -6063,6 +6553,7 @@ async fn maybe_request_complete_history(adapter: &DesktopIpcAdapter, key: &Threa
                     pre_dispatch_turns: Default::default(),
                     interaction_recheck: None,
                     async_write_recheck: None,
+                    wire_text: None,
                 })
                 .await;
             let accepted = matches!(outcome.delivery, super::types::Delivery::Accepted);
@@ -6886,6 +7377,7 @@ mod dispatch_tests {
                 Default::default(),
                 None,
                 None,
+                None,
             )
             .await;
         assert_eq!(outcome.delivery, Delivery::NotSent, "未进表方法必须零投递");
@@ -6971,7 +7463,10 @@ mod blocking_answer_validation_tests {
             observed: Default::default(),
             schema: Default::default(),
             contract: Default::default(),
+            contract_identified: true,
             contract_error: None,
+            display_support: Default::default(),
+            display_identity_verified: false,
         };
         context.contract.insert(
             CodexOperation::BlockingInput,
@@ -7732,6 +8227,744 @@ mod contract_evidence_tests {
         assert!(t02_evidence_installed(&adapter));
     }
 
+    /// T03：能力身份在装配投影处填充——已识别目标恒携带（与契约证据槽同代同目标）；
+    /// 短断链（镜像 stale、无换代）identity 不变；换包 SHA 即变；未识别 → None。
+    #[tokio::test]
+    async fn t03_capability_identity_stamped_at_assembly_and_stable_across_short_disconnect() {
+        let adapter = t02_adapter("build-a");
+        adapter.set_contract_reader(Some(Arc::new(ScriptedReader::ok())));
+        adapter.ensure_contract_evidence().await;
+        assert!(t02_evidence_installed(&adapter));
+        let first = adapter.projection(&t02_key("t-id")).await;
+        let identity = first
+            .effective_operations
+            .capability_identity
+            .clone()
+            .expect("已识别目标必须携带能力身份");
+        assert_eq!(
+            identity,
+            super::super::capability::capability_identity_of(
+                "macos|build-a|cli-a|1",
+                &"a".repeat(64),
+                CONTRACT_RULE_VERSION,
+            ),
+            "identity = 完整目标指纹 + 包 SHA + 规则版本（无路径摘要）"
+        );
+
+        // 短断链（镜像 stale、代际未换代）：identity 不变——前端可据此保留上次
+        // 支持展示（展示信息，不装进授权证据）。
+        {
+            let mut mirrors = adapter.inner.mirrors.lock().await;
+            let mut mirror =
+                ThreadMirror::with_ledger(t02_key("t-id"), adapter.inner.mirror_ledger.clone());
+            mirror.mark_stale();
+            mirrors.insert(t02_key("t-id"), mirror);
+        }
+        let second = adapter.projection(&t02_key("t-id")).await;
+        assert!(second.stale, "前置：镜像已 stale");
+        assert_eq!(
+            second.effective_operations.capability_identity.as_deref(),
+            Some(identity.as_str()),
+            "同目标短断链 identity 不变"
+        );
+
+        // 换包 SHA（同 build 被替换包）：身份失效——旧展示不得装进新目标。
+        let target = adapter.probe_target_snapshot().unwrap();
+        let mut replaced = t02_evidence();
+        replaced.package_sha256 = "b".repeat(64);
+        assert!(adapter.install_contract_evidence(&target, "macos|build-a|cli-a|1", replaced));
+        let third = adapter.projection(&t02_key("t-id")).await;
+        assert_ne!(
+            third.effective_operations.capability_identity.as_deref(),
+            Some(identity.as_str()),
+            "包内容变了 → 身份变化"
+        );
+
+        // 未识别（无槽）→ None：不猜。
+        *adapter.inner.contract_evidence.lock().unwrap() = None;
+        let fourth = adapter.projection(&t02_key("t-id")).await;
+        assert!(fourth.effective_operations.capability_identity.is_none());
+    }
+
+    // ============================================================
+    // R07（D3）：真实重连的**展示稳定**——同一完整目标换 epoch 期间沿用上次
+    // 已支持事实（仅 support/identity 展示面），证据装回即回到实时事实；
+    // 身份变化（新 build/包 SHA/规则）一律不沿用。
+    // ============================================================
+
+    /// 真实重连（epoch 增、槽保留）→ `support` 不得回落到 identifying；
+    /// `capabilityIdentity` 沿用；`allowed`/`evidence` 一字不动（展示事实不授权）。
+    ///
+    /// 用**真实临时包**（R07 修复轮 1：沿用判据含包指纹 `(len, mtime)`，假路径无法
+    /// 核对 stat → 展开放弃沿用）。
+    #[tokio::test]
+    async fn d3_reconnect_keeps_display_support_for_same_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let package = dir.path().join("app.asar");
+        std::fs::write(&package, b"official-package-bytes").unwrap();
+        let adapter = t02_adapter_at("build-a", &package);
+        adapter.set_contract_reader(Some(Arc::new(ScriptedReader::ok_pinned_to(&package))));
+        adapter.ensure_contract_evidence().await;
+        assert!(t02_evidence_installed(&adapter));
+
+        let before = adapter.projection(&t02_key("t-d3")).await;
+        let identity = before
+            .effective_operations
+            .capability_identity
+            .clone()
+            .expect("已识别目标必须携带能力身份");
+        let blocked_before = before
+            .effective_operations
+            .get(CodexOperation::BlockingInput)
+            .expect("status")
+            .clone();
+        assert_eq!(
+            blocked_before.support,
+            crate::services::codex_desktop_ipc::capability::SupportState::Supported,
+            "前置：已识别目标"
+        );
+
+        // 真实重连：代际 +1，目标（platform/build）不变——旧证据槽随之失配。
+        {
+            let mut target = adapter.inner.probe_target.lock().unwrap();
+            let key = target.as_ref().and_then(|t| t.key.clone());
+            let epoch = adapter.inner.epoch.fetch_add(1, Ordering::SeqCst) + 1;
+            *target = Some(ProbeTarget {
+                epoch,
+                platform: "macos".into(),
+                build: "build-a".into(),
+                key,
+            });
+        }
+        // C03：展示身份/支持的发布前须完成本代际内容 SHA 核验（同一未变包 → 通过）。
+        adapter
+            .verify_package_sha_now(Some("macos|build-a|cli-a|1"))
+            .await;
+
+        let during = adapter.projection(&t02_key("t-d3")).await;
+        let blocked = during
+            .effective_operations
+            .get(CodexOperation::BlockingInput)
+            .expect("status");
+        assert_eq!(
+            blocked.support,
+            crate::services::codex_desktop_ipc::capability::SupportState::Supported,
+            "同身份重连期间不得把已支持闪成识别中"
+        );
+        assert_eq!(
+            during.effective_operations.capability_identity.as_deref(),
+            Some(identity.as_str()),
+            "同身份重连沿用展示身份（前端据此保留上次展示）"
+        );
+        // 展示事实**不改授权**：证据槽此代际未装载 → 无证据、不允许。
+        assert!(!blocked.allowed, "展示事实不得产生写资格");
+        assert_eq!(
+            blocked.evidence,
+            crate::services::codex_desktop_ipc::capability::EvidenceSource::None,
+            "展示事实不得冒充证据"
+        );
+
+        // 证据装回（真实恢复路径）→ 回到实时事实。
+        adapter.ensure_contract_evidence().await;
+        assert!(t02_evidence_installed(&adapter));
+        let after = adapter.projection(&t02_key("t-d3")).await;
+        let status = after
+            .effective_operations
+            .get(CodexOperation::BlockingInput)
+            .expect("status");
+        assert_eq!(
+            status.support,
+            crate::services::codex_desktop_ipc::capability::SupportState::Supported
+        );
+        assert_eq!(
+            status.evidence,
+            crate::services::codex_desktop_ipc::capability::EvidenceSource::ContractMatched,
+            "证据装回后 support 依据实时事实（不是展示回退）"
+        );
+    }
+
+    /// 适配关闭 + 同身份重连：取证函数直接退出不会重装证据 → 展示沿用上次支持，
+    /// 原因如实报「适配已关闭」（allowed 仍 false）。
+    #[tokio::test]
+    async fn d3_auto_adapt_off_same_identity_keeps_supported_display() {
+        let dir = tempfile::tempdir().unwrap();
+        let package = dir.path().join("app.asar");
+        std::fs::write(&package, b"official-package-bytes").unwrap();
+        let adapter = t02_adapter_at("build-a", &package);
+        let reader = Arc::new(ScriptedReader::ok_pinned_to(&package));
+        adapter.set_contract_reader(Some(reader.clone()));
+        adapter.ensure_contract_evidence().await;
+        assert!(t02_evidence_installed(&adapter));
+        let identity = adapter
+            .projection(&t02_key("t-d3-off"))
+            .await
+            .effective_operations
+            .capability_identity
+            .clone()
+            .expect("已识别目标必须携带能力身份");
+
+        // 关闭自动适配（活值门）→ 取证函数不再重取；再真实重连（epoch 增，槽保留）。
+        adapter.set_auto_adapt_gate(Some(Arc::new(|| false)));
+        {
+            let mut target = adapter.inner.probe_target.lock().unwrap();
+            let key = target.as_ref().and_then(|t| t.key.clone());
+            let epoch = adapter.inner.epoch.fetch_add(1, Ordering::SeqCst) + 1;
+            *target = Some(ProbeTarget {
+                epoch,
+                platform: "macos".into(),
+                build: "build-a".into(),
+                key,
+            });
+        }
+        adapter.ensure_contract_evidence().await;
+        assert_eq!(
+            reader.calls.load(Ordering::SeqCst),
+            1,
+            "适配关闭时不重取证据（既有语义不变）"
+        );
+        // C03：展示身份/支持的发布前须完成本代际内容 SHA 核验（同一未变包 → 通过）。
+        adapter
+            .verify_package_sha_now(Some("macos|build-a|cli-a|1"))
+            .await;
+
+        let during = adapter.projection(&t02_key("t-d3-off")).await;
+        let status = during
+            .effective_operations
+            .get(CodexOperation::AsyncAnswerIdle)
+            .expect("status");
+        assert_eq!(
+            status.support,
+            crate::services::codex_desktop_ipc::capability::SupportState::Supported,
+            "适配关闭 + 同身份重连不得长期显示识别中"
+        );
+        assert!(!status.allowed);
+        assert_eq!(
+            status.reason_code.as_deref(),
+            Some(crate::services::codex_desktop_ipc::reason_code::OPERATION_AUTO_ADAPT_OFF),
+            "原因如实报「适配已关闭」"
+        );
+        assert_eq!(
+            during.effective_operations.capability_identity.as_deref(),
+            Some(identity.as_str())
+        );
+        assert_eq!(
+            status.evidence,
+            crate::services::codex_desktop_ipc::capability::EvidenceSource::None,
+            "展示事实不得冒充证据（授权面保持无证据）"
+        );
+    }
+
+    /// A→B 换目标（build 变）→ 身份变 → 不沿用；同 build 换包 SHA 同理。
+    #[tokio::test]
+    async fn d3_identity_change_does_not_inherit_display_support() {
+        // (a) 换 build：新目标不得继承旧目标的支持展示与身份。
+        // 真实临时包（否则沿用判据先被包指纹拒绝，测不到 build 判据本身）。
+        let dir = tempfile::tempdir().unwrap();
+        let package = dir.path().join("app.asar");
+        std::fs::write(&package, b"official-package-bytes").unwrap();
+        let adapter = t02_adapter_at("build-a", &package);
+        adapter.set_contract_reader(Some(Arc::new(ScriptedReader::ok_pinned_to(&package))));
+        adapter.ensure_contract_evidence().await;
+        assert!(adapter
+            .projection(&t02_key("t-d3-ab"))
+            .await
+            .effective_operations
+            .capability_identity
+            .is_some());
+
+        {
+            let mut target = adapter.inner.probe_target.lock().unwrap();
+            let epoch = adapter.inner.epoch.fetch_add(1, Ordering::SeqCst) + 1;
+            *target = Some(ProbeTarget {
+                epoch,
+                platform: "macos".into(),
+                build: "build-b".into(),
+                key: Some("macos|build-b|cli-b|1".into()),
+            });
+        }
+        let changed = adapter.projection(&t02_key("t-d3-ab")).await;
+        assert!(
+            changed.effective_operations.capability_identity.is_none(),
+            "新目标不得沿用旧身份"
+        );
+        assert_ne!(
+            changed
+                .effective_operations
+                .get(CodexOperation::AsyncAnswerIdle)
+                .expect("status")
+                .support,
+            crate::services::codex_desktop_ipc::capability::SupportState::Supported,
+            "新目标不继承旧目标的支持展示"
+        );
+        assert!(!changed
+            .effective_operations
+            .allows(CodexOperation::AsyncAnswerIdle));
+
+        // (b) 同 build、包内容 SHA 变（且新证据未匹配异步答题）→ 身份变、展示不沿用。
+        let replaced_adapter = t02_adapter("build-a");
+        replaced_adapter.set_contract_reader(Some(Arc::new(ScriptedReader::ok())));
+        replaced_adapter.ensure_contract_evidence().await;
+        let old_identity = replaced_adapter
+            .projection(&t02_key("t-d3-sha"))
+            .await
+            .effective_operations
+            .capability_identity
+            .clone()
+            .expect("已识别目标必须携带能力身份");
+        let mut replaced = t02_evidence();
+        replaced.package_sha256 = "b".repeat(64);
+        replaced.matches.remove(&CodexOperation::AsyncAnswerIdle);
+        replaced_adapter.set_contract_evidence_snapshot(replaced);
+        let after = replaced_adapter.projection(&t02_key("t-d3-sha")).await;
+        assert_ne!(
+            after.effective_operations.capability_identity.as_deref(),
+            Some(old_identity.as_str()),
+            "包内容变了 → 身份变化"
+        );
+        assert_eq!(
+            after
+                .effective_operations
+                .get(CodexOperation::AsyncAnswerIdle)
+                .expect("status")
+                .support,
+            crate::services::codex_desktop_ipc::capability::SupportState::Unmatched,
+            "新身份按真实事实（识别完成但未匹配），不沿用旧支持"
+        );
+    }
+
+    // ============================================================
+    // R07 修复轮 1：审查 Important 1-4 的反例
+    // ============================================================
+
+    /// 便利：真实重连（代际 +1、目标保留）。
+    fn simulate_reconnect(adapter: &DesktopIpcAdapter, build: &str, key: Option<String>) {
+        let mut target = adapter.inner.probe_target.lock().unwrap();
+        let epoch = adapter.inner.epoch.fetch_add(1, Ordering::SeqCst) + 1;
+        *target = Some(ProbeTarget {
+            epoch,
+            platform: "macos".into(),
+            build: build.into(),
+            key,
+        });
+    }
+
+    /// Important-1：重连后**识别失败**（`contract_error` 在场）不得仍展示上次支持
+    /// ——否则用户看到「已支持 + 该版本未匹配」自相矛盾；失败持续则假"已支持"无限
+    /// 延续。展示沿用只覆盖"等识别/换代号失配"窗。
+    #[tokio::test]
+    async fn d3_r1_contract_failure_drops_display_support() {
+        let dir = tempfile::tempdir().unwrap();
+        let package = dir.path().join("app.asar");
+        std::fs::write(&package, b"official-package-bytes").unwrap();
+        let adapter = t02_adapter_at("build-a", &package);
+        adapter.set_contract_reader(Some(Arc::new(ScriptedReader::ok_pinned_to(&package))));
+        adapter.ensure_contract_evidence().await;
+        assert!(t02_evidence_installed(&adapter));
+        let before = adapter.projection(&t02_key("t-r1")).await;
+        assert_eq!(
+            before
+                .effective_operations
+                .get(CodexOperation::AsyncAnswerIdle)
+                .expect("status")
+                .support,
+            crate::services::codex_desktop_ipc::capability::SupportState::Supported
+        );
+
+        // 真实重连 + 识别失败（readers 换成会失败的）。
+        adapter.set_contract_reader(Some(Arc::new(ScriptedReader::failing())));
+        simulate_reconnect(&adapter, "build-a", Some("macos|build-a|cli-a|1".into()));
+        adapter.ensure_contract_evidence().await;
+
+        let during = adapter.projection(&t02_key("t-r1")).await;
+        let status = during
+            .effective_operations
+            .get(CodexOperation::AsyncAnswerIdle)
+            .expect("status");
+        assert_ne!(
+            status.support,
+            crate::services::codex_desktop_ipc::capability::SupportState::Supported,
+            "识别失败不得继续展示「已支持」（与原因码 operation_contract_unmatched 自相矛盾）"
+        );
+        assert_eq!(
+            status.support,
+            crate::services::codex_desktop_ipc::capability::SupportState::Identifying,
+            "失败窗按真实事实（未识别）"
+        );
+        assert_eq!(
+            status.reason_code.as_deref(),
+            Some(crate::services::codex_desktop_ipc::reason_code::OPERATION_CONTRACT_UNMATCHED),
+            "失败窗原因是「契约未匹配/识别失败」（与 support=identifying 不再矛盾）"
+        );
+        // 身份也不得沿用（展示记录整体失效）。
+        assert!(
+            during.effective_operations.capability_identity.is_none(),
+            "识别失败不得沿用展示身份"
+        );
+    }
+
+    /// Important-2：展示记录是**上次展示快照**，不是重新推导——靠 schema / 真实
+    /// 成功放行、契约未匹配的操作（未知 build 审批是典型）记录里必须是 Supported。
+    #[tokio::test]
+    async fn d3_r1_display_record_includes_schema_and_observed_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let package = dir.path().join("app.asar");
+        std::fs::write(&package, b"official-package-bytes").unwrap();
+        let adapter = t02_adapter_at("build-a", &package);
+        // 未知 build 的典型形态：契约识别完成但审批未匹配 + schema 已取到 accept 词。
+        adapter.set_contract_reader(Some(Arc::new(ScriptedReader::ok_pinned_to(&package))));
+        adapter.set_schema_evidence(Some(SchemaEvidence {
+            fingerprint: "fp".into(),
+            command_decisions: vec![
+                crate::services::codex_desktop_ipc::pending::DECISION_ACCEPT.into(),
+                crate::services::codex_desktop_ipc::pending::DECISION_DECLINE.into(),
+            ],
+            file_decisions: vec![
+                crate::services::codex_desktop_ipc::pending::DECISION_ACCEPT.into(),
+                crate::services::codex_desktop_ipc::pending::DECISION_CANCEL.into(),
+            ],
+        }));
+        adapter.ensure_contract_evidence().await;
+        assert!(t02_evidence_installed(&adapter));
+
+        // 前置：t02_evidence 不含命令审批 → 契约未匹配，但 schema 让它是 Supported。
+        let before = adapter.projection(&t02_key("t-r2")).await;
+        assert_eq!(
+            before
+                .effective_operations
+                .get(CodexOperation::CommandApproval)
+                .expect("status")
+                .support,
+            crate::services::codex_desktop_ipc::capability::SupportState::Supported,
+            "前置：schema 证据让命令审批显示已支持"
+        );
+
+        // 真实重连窗：不得把刚显示的「已支持」降级成「未匹配」。
+        simulate_reconnect(&adapter, "build-a", Some("macos|build-a|cli-a|1".into()));
+        let during = adapter.projection(&t02_key("t-r2")).await;
+        assert_eq!(
+            during
+                .effective_operations
+                .get(CodexOperation::CommandApproval)
+                .expect("status")
+                .support,
+            crate::services::codex_desktop_ipc::capability::SupportState::Supported,
+            "记录须是上次展示快照（含 schema 证据），不是重新推导的 unmatched"
+        );
+    }
+
+    /// Important-3：同 build 换包 + 适配关闭（取证函数首行退出、包内容永不复查）→
+    /// 旧 SHA 派生的展示不得无限沿用。展示记录带包指纹，stat 变化/读不到即拒绝。
+    #[tokio::test]
+    async fn d3_r1_package_replacement_under_auto_adapt_off_drops_display() {
+        let dir = tempfile::tempdir().unwrap();
+        let package = dir.path().join("app.asar");
+        std::fs::write(&package, b"official-package-bytes").unwrap();
+
+        let adapter = t02_adapter_at("build-a", &package);
+        adapter.set_contract_reader(Some(Arc::new(ScriptedReader::ok_pinned_to(&package))));
+        adapter.ensure_contract_evidence().await;
+        assert!(t02_evidence_installed(&adapter));
+        let identity = adapter
+            .projection(&t02_key("t-r3"))
+            .await
+            .effective_operations
+            .capability_identity
+            .clone()
+            .expect("已识别目标必须携带能力身份");
+
+        // 包被替换（内容+大小都变）；适配关闭 → 取证函数不再复查包内容。
+        std::fs::write(&package, b"REPLACED-package-bytes-longer").unwrap();
+        adapter.set_auto_adapt_gate(Some(Arc::new(|| false)));
+        simulate_reconnect(&adapter, "build-a", Some("macos|build-a|cli-a|1".into()));
+        adapter.ensure_contract_evidence().await;
+
+        let during = adapter.projection(&t02_key("t-r3")).await;
+        assert_ne!(
+            during.effective_operations.capability_identity.as_deref(),
+            Some(identity.as_str()),
+            "包指纹变了 → 不得沿用旧 SHA 派生的展示身份"
+        );
+        assert!(
+            during.effective_operations.capability_identity.is_none(),
+            "包指纹变了 → 展示身份为空（按识别中走真实路径）"
+        );
+        assert_ne!(
+            during
+                .effective_operations
+                .get(CodexOperation::AsyncAnswerIdle)
+                .expect("status")
+                .support,
+            crate::services::codex_desktop_ipc::capability::SupportState::Supported,
+            "包指纹变了 → 不得沿用旧包的「已支持」"
+        );
+        // 对照：未换包时同身份重连仍沿用（证明拒绝源于包指纹而非关适配）。
+        let intact_dir = tempfile::tempdir().unwrap();
+        let intact = intact_dir.path().join("app.asar");
+        std::fs::write(&intact, b"official-package-bytes").unwrap();
+        let intact_adapter = t02_adapter_at("build-a", &intact);
+        intact_adapter.set_contract_reader(Some(Arc::new(ScriptedReader::ok_pinned_to(&intact))));
+        intact_adapter.ensure_contract_evidence().await;
+        intact_adapter.set_auto_adapt_gate(Some(Arc::new(|| false)));
+        simulate_reconnect(
+            &intact_adapter,
+            "build-a",
+            Some("macos|build-a|cli-a|1".into()),
+        );
+        // C03：对照臂同一未变包 → 内容 SHA 核验通过 → 沿用 + 身份发布。
+        intact_adapter
+            .verify_package_sha_now(Some("macos|build-a|cli-a|1"))
+            .await;
+        let kept = intact_adapter.projection(&t02_key("t-r3b")).await;
+        assert_eq!(
+            kept.effective_operations
+                .get(CodexOperation::AsyncAnswerIdle)
+                .expect("status")
+                .support,
+            crate::services::codex_desktop_ipc::capability::SupportState::Supported,
+            "未换包时同身份重连仍沿用（对照）"
+        );
+        assert!(kept.effective_operations.capability_identity.is_some());
+    }
+
+    /// Important-4：展示沿用必须**可被前端识别**——`OperationStatus.supportInherited`
+    /// 只在沿用展示事实时置 true（生产路径可达的"连接恢复中"信号）。
+    #[tokio::test]
+    async fn d3_r1_support_inherited_flag_marks_display_retention() {
+        let dir = tempfile::tempdir().unwrap();
+        let package = dir.path().join("app.asar");
+        std::fs::write(&package, b"official-package-bytes").unwrap();
+        let adapter = t02_adapter_at("build-a", &package);
+        adapter.set_contract_reader(Some(Arc::new(ScriptedReader::ok_pinned_to(&package))));
+        adapter.ensure_contract_evidence().await;
+        let before = adapter.projection(&t02_key("t-r4")).await;
+        assert!(
+            !before
+                .effective_operations
+                .get(CodexOperation::AsyncAnswerIdle)
+                .expect("status")
+                .support_inherited,
+            "实时事实不标沿用"
+        );
+
+        simulate_reconnect(&adapter, "build-a", Some("macos|build-a|cli-a|1".into()));
+        let during = adapter.projection(&t02_key("t-r4")).await;
+        assert!(
+            during
+                .effective_operations
+                .get(CodexOperation::AsyncAnswerIdle)
+                .expect("status")
+                .support_inherited,
+            "重连窗沿用展示事实 → 置 supportInherited（前端据此显示「连接恢复中」）"
+        );
+        // 展示事实不授权：allowed 仍 false（无当前证据）。
+        assert!(
+            !during
+                .effective_operations
+                .get(CodexOperation::AsyncAnswerIdle)
+                .expect("status")
+                .allowed
+        );
+
+        // 证据装回 → 恢复实时事实，标记清除。
+        adapter.ensure_contract_evidence().await;
+        let after = adapter.projection(&t02_key("t-r4")).await;
+        assert!(
+            !after
+                .effective_operations
+                .get(CodexOperation::AsyncAnswerIdle)
+                .expect("status")
+                .support_inherited,
+            "恢复实时事实后标记清除"
+        );
+    }
+
+    // ============================================================
+    // C03（R07 残留）：展示身份的包归属——快筛 (len, mtime) 相等不证明内容相等。
+    // 记录绑定**取证时**指纹 + 内容 SHA；重连沿用前按代际完成一次内容 SHA 核验。
+    // ============================================================
+
+    /// 同长度、保留 mtime、内容不同的包替换（C03 缺口 1 的形态；h14 只改过长度）。
+    fn swap_same_stat(package: &std::path::Path, new_content: &[u8]) {
+        let meta = std::fs::metadata(package).expect("package stat");
+        let mtime = meta.modified().expect("package mtime");
+        assert_eq!(
+            meta.len(),
+            new_content.len() as u64,
+            "测试前提：替换内容与原包同长度"
+        );
+        std::fs::write(package, new_content).expect("rewrite package");
+        std::fs::File::options()
+            .write(true)
+            .open(package)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+        let after = std::fs::metadata(package).expect("replaced package stat");
+        assert_eq!(after.len(), meta.len(), "复核：长度未变");
+        assert_eq!(after.modified().unwrap(), mtime, "复核：mtime 保留");
+    }
+
+    /// C03 缺口 1 / 验收 1：已识别 A → 关适配 → **同长度、保留 mtime、内容不同**的
+    /// B 替换 → 同 build 重连。stat 快筛相等不再足以继承——本代际内容 SHA 核验
+    /// 未落账时只能如实展示「上次识别结果，当前包身份待核对」（支持沿用、身份不
+    /// 发布）；核验完成且**不同** → 一律不沿用（关适配下也成立：核验是展示完整性
+    /// 检查，不依赖自动适配开关）。
+    #[tokio::test]
+    async fn c03_same_stat_package_swap_under_auto_adapt_off_does_not_inherit() {
+        let dir = tempfile::tempdir().unwrap();
+        let package = dir.path().join("app.asar");
+        std::fs::write(&package, b"official-package-bytes").unwrap();
+        let adapter = t02_adapter_at("build-a", &package);
+        adapter.set_contract_reader(Some(Arc::new(ScriptedReader::ok_pinned_to(&package))));
+        adapter.ensure_contract_evidence().await;
+        assert!(t02_evidence_installed(&adapter));
+
+        // 关适配 + 同 len/保留 mtime 换内容（stat 完全相同）+ 真实重连。
+        adapter.set_auto_adapt_gate(Some(Arc::new(|| false)));
+        swap_same_stat(&package, b"REPLACED-package-bytes");
+        // 测试手动驱动核验（关掉自动后台触发取确定性；生产默认开）。
+        adapter.set_package_sha_auto_verify_enabled(false);
+        simulate_reconnect(&adapter, "build-a", Some("macos|build-a|cli-a|1".into()));
+        adapter.ensure_contract_evidence().await;
+
+        // 帧 1（本代际 SHA 核验未落账）：「待核对」态——支持沿用展示，但身份不发布、
+        // 核对标记未置位（与已确认能力明确区分）。
+        let pending = adapter.projection(&t02_key("t-c03a")).await;
+        let pending_status = pending
+            .effective_operations
+            .get(CodexOperation::AsyncAnswerIdle)
+            .expect("status")
+            .clone();
+        assert_eq!(
+            pending_status.support,
+            crate::services::codex_desktop_ipc::capability::SupportState::Supported,
+            "核验未完成：如实展示「上次识别结果」"
+        );
+        assert!(
+            pending_status.support_inherited,
+            "待核对沿用也是沿用（标记在）"
+        );
+        assert!(
+            !pending_status.support_identity_verified,
+            "待核对态必须与已确认能力区分（前端换「待核对」文案）"
+        );
+        assert!(
+            pending.effective_operations.capability_identity.is_none(),
+            "不能把旧 SHA 当作当前已确认身份（核验未通过前不发布展示身份）"
+        );
+
+        // 本代际内容 SHA 核验完成：当前包内容 ≠ 被识别的那份 → 一律不沿用。
+        let sha = adapter
+            .verify_package_sha_now(Some("macos|build-a|cli-a|1"))
+            .await;
+        assert!(sha.is_some(), "核验确实对当前包完成了内容哈希");
+        let settled = adapter.projection(&t02_key("t-c03a")).await;
+        let status = settled
+            .effective_operations
+            .get(CodexOperation::AsyncAnswerIdle)
+            .expect("status");
+        assert_ne!(
+            status.support,
+            crate::services::codex_desktop_ipc::capability::SupportState::Supported,
+            "同 len/mtime 不同 SHA：不继承当前支持（关适配下也成立）"
+        );
+        assert_eq!(
+            status.support,
+            crate::services::codex_desktop_ipc::capability::SupportState::Identifying,
+            "已核对且不同 → 按真实事实（未识别）"
+        );
+        assert!(!status.support_inherited, "核对不通过 → 沿用标记撤下");
+        assert!(
+            settled.effective_operations.capability_identity.is_none(),
+            "SHA 不同 → 不得发布 A 的身份"
+        );
+    }
+
+    /// C03 缺口 2 / 验收 2：异步读完 A、**安装前**包换成 B——展示记录必须绑定
+    /// **取证时**的 (len, mtime) 与 A 的内容 SHA，不得在安装时另一次 stat 把 A 的
+    /// 结论与 B 的文件指纹配对（B 无需保留 A 的 mtime）。此后普通重连不得命中
+    /// 该记录。
+    #[tokio::test]
+    async fn c03_package_swapped_between_read_and_install_binds_forensic_fingerprint() {
+        let dir = tempfile::tempdir().unwrap();
+        let package = dir.path().join("app.asar");
+        std::fs::write(&package, b"official-package-bytes").unwrap();
+        let stat_a = std::fs::metadata(&package).unwrap();
+        let mtime_a = stat_a
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let sha_a =
+            crate::services::codex_desktop_ipc::probe::desktop_contract::hash_package(&package)
+                .unwrap();
+
+        let adapter = t02_adapter_at("build-a", &package);
+        // reader 在构造时钉住 A 的内容 SHA 与 (len, mtime)（取证时绑定）。
+        adapter.set_contract_reader(Some(Arc::new(ScriptedReader::ok_pinned_to(&package))));
+        // 安装定序缝：读取返回后、安装前 → 包被换成 B（不同长度，mtime 自然变化）。
+        let swap_path = package.clone();
+        adapter.set_contract_install_gate(Some(Box::new(move || {
+            std::fs::write(&swap_path, b"package-swapped-during-install-window").unwrap();
+        })));
+        adapter.ensure_contract_evidence().await;
+        assert!(
+            t02_evidence_installed(&adapter),
+            "A 的证据在身份守卫下安装（C03 只约束展示记录的绑定，不动授权面）"
+        );
+
+        // 展示记录：指纹必须 = 取证时 A 的 (len, mtime)、SHA = A 的内容哈希——
+        // 绝不是安装时对盘上 B 另一次 stat 的结果。
+        let record = adapter
+            .inner
+            .display_support
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("安装成功必须刷新展示记录");
+        assert_eq!(
+            record.package_fingerprint,
+            Some((stat_a.len(), mtime_a)),
+            "记录指纹 = 取证时绑定并核验的 (len, mtime)，不是安装时的另一次 stat"
+        );
+        assert_eq!(record.package_sha256, sha_a, "记录 SHA = 取证时那份内容");
+        assert_ne!(
+            record.package_fingerprint,
+            std::fs::metadata(&package).ok().and_then(|meta| {
+                meta.modified()
+                    .ok()
+                    .and_then(|t| {
+                        t.duration_since(std::time::UNIX_EPOCH)
+                            .ok()
+                            .map(|d| d.as_millis() as i64)
+                    })
+                    .map(|mtime| (meta.len(), mtime))
+            }),
+            "安装时盘上已是 B（不同长度）——记录指纹不得是它"
+        );
+
+        // 此后普通重连（关适配，不重识别）：记录指纹（A）与当前包（B）不符 →
+        // 支持展示与身份一律不沿用。
+        adapter.set_auto_adapt_gate(Some(Arc::new(|| false)));
+        adapter.set_package_sha_auto_verify_enabled(false);
+        simulate_reconnect(&adapter, "build-a", Some("macos|build-a|cli-a|1".into()));
+        let during = adapter.projection(&t02_key("t-c03b")).await;
+        assert!(
+            during.effective_operations.capability_identity.is_none(),
+            "A 的结论不得借 B 的文件指纹沿用（B 未保留 A 的 mtime）"
+        );
+        assert_ne!(
+            during
+                .effective_operations
+                .get(CodexOperation::AsyncAnswerIdle)
+                .expect("status")
+                .support,
+            crate::services::codex_desktop_ipc::capability::SupportState::Supported,
+            "取证后安装前换包：A 的支持展示不得落到 B 上"
+        );
+    }
+
     /// 事实不变 → 同一策略 revision（静默期零新增投影）；无镜像时重发布静默；
     /// 证据命中不重读安装包。
     #[tokio::test]
@@ -7754,6 +8987,63 @@ mod contract_evidence_tests {
             reader.calls.load(Ordering::SeqCst),
             1,
             "证据命中后不得重读安装包"
+        );
+    }
+
+    /// C03 验收 3 / 正例对照：**同一未变包**重连——本代际内容 SHA 核验通过后，
+    /// 支持照常沿用且 `support_identity_verified` 置位（与「待核对」明确区分）；
+    /// 核验前不得提前置位。
+    #[tokio::test]
+    async fn c03_unchanged_package_inherits_only_after_sha_verification() {
+        let dir = tempfile::tempdir().unwrap();
+        let package = dir.path().join("app.asar");
+        std::fs::write(&package, b"official-package-bytes").unwrap();
+        let adapter = t02_adapter_at("build-a", &package);
+        adapter.set_contract_reader(Some(Arc::new(ScriptedReader::ok_pinned_to(&package))));
+        adapter.ensure_contract_evidence().await;
+        assert!(t02_evidence_installed(&adapter));
+
+        // 关适配 + 真实重连（包未变，stat 快筛相等；关掉自动核验取确定性）。
+        adapter.set_auto_adapt_gate(Some(Arc::new(|| false)));
+        adapter.set_package_sha_auto_verify_enabled(false);
+        simulate_reconnect(&adapter, "build-a", Some("macos|build-a|cli-a|1".into()));
+
+        // 核验前：「待核对」沿用——支持如实显示、沿用标记在、已确认标记不在。
+        let pending = adapter.projection(&t02_key("t-c03c")).await;
+        let pending_status = pending
+            .effective_operations
+            .get(CodexOperation::AsyncAnswerIdle)
+            .expect("status");
+        assert_eq!(
+            pending_status.support,
+            crate::services::codex_desktop_ipc::capability::SupportState::Supported,
+            "核验未完成：如实展示「上次识别结果」"
+        );
+        assert!(pending_status.support_inherited, "待核对沿用也是沿用");
+        assert!(
+            !pending_status.support_identity_verified,
+            "核验通过前不得置已确认位"
+        );
+
+        // 本代际内容 SHA 核验通过（同一份包）→ 已确认沿用。
+        let sha = adapter
+            .verify_package_sha_now(Some("macos|build-a|cli-a|1"))
+            .await;
+        assert!(sha.is_some(), "核验确实对当前包完成了内容哈希");
+        let verified = adapter.projection(&t02_key("t-c03c")).await;
+        let verified_status = verified
+            .effective_operations
+            .get(CodexOperation::AsyncAnswerIdle)
+            .expect("status");
+        assert_eq!(
+            verified_status.support,
+            crate::services::codex_desktop_ipc::capability::SupportState::Supported,
+            "同一未变包：核验通过后支持照常恢复展示"
+        );
+        assert!(verified_status.support_inherited);
+        assert!(
+            verified_status.support_identity_verified,
+            "核验通过 → 与「待核对」明确区分（已确认）"
         );
     }
 }
