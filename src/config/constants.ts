@@ -1,4 +1,3 @@
-export const POLL_INTERVAL = 3000;
 export const EVENT_FRESHNESS_THRESHOLD = 30;
 export const SESSION_STATUS = {
   RUNNING: "running",

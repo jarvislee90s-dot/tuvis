@@ -207,6 +207,14 @@ pub fn run() {
             commands::autostart::initialize_on_first_launch(app.handle());
             // 用量账本：应用启动采集一次（按需路径，绝不进 3 秒轮询）
             crate::services::usage::collect::spawn_initial_collection();
+            // 用量兜底 ticker：每「采集间隔 + 2 分钟」后台采一次，不依赖任何页面
+            // （debug 构建默认关闭，TUVIS_USAGE_TICKER=1 可开，见 ticker.rs 文档）
+            crate::services::usage::ticker::spawn_runtime();
+            // 会话扫描总线：常驻线程 + 共享快照（所有消费方读快照，冷启动首扫立即执行）
+            crate::adapter::scan_bus::start(app.handle().clone());
+            // 事件唤醒：1s mtime 轮询（hook 事件目录 / 活跃事件文件 / facts / 会话库），
+            // 有变化即请求一次 Event 补扫——低频档位只作兜底
+            crate::adapter::wakeup::spawn_runtime();
             // TPS 短时抽样（2026-10-24 计划 Task 7）：调度/接收随 usage.enabled 总授权
             // 启停——关闭时每拍只读一行 settings（惯性，不改旧 usage 采集的启动时序）
             crate::services::tps::collector::spawn_runtime();
@@ -241,10 +249,15 @@ pub fn run() {
         update_tray_menu,
         refresh_tray,
         commands::session::get_all_sessions,
+        // 扫描总线状态与「有人在看」心跳（前端档位跟随 / 可见性上报）
+        commands::session::scan_bus_status,
+        commands::session::scan_bus_watch,
         commands::session::focus_session,
         commands::session::focus_hwnd,
         commands::session::kill_session,
         commands::session::dismiss_session_card,
+        // R1：一键清除批量隐藏/已读（N 张卡只补扫一次）
+        commands::session::dismiss_session_cards,
         // M6R–M9R Task 11：R5 一键 resume（桌面卡「在电脑上打开」）
         commands::session::session_open,
         commands::notification::show_notification_window,
@@ -381,6 +394,7 @@ pub fn run() {
         inject::inject_list_audit,
         // 用量域（计划①）：采集 / 大看板 / 记录页 / CSV / 设置读写
         commands::usage::usage_collect,
+        commands::usage::usage_collect_visible,
         commands::usage::usage_dashboard,
         commands::usage::usage_records,
         commands::usage::usage_export_csv,

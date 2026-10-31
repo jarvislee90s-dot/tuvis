@@ -41,8 +41,18 @@ pub fn list_sub_agents(tool_id: String) -> Vec<SubAgentRecord> {
 /// 手动关闭未读卡（X 按钮）→ 标记已读（删除未读行）。
 /// T1：删行后广播 session-read——看板/宠物是独立 WebView，宠物窗口凭此事件
 /// 同步已读置位（否则宠物头顶卡在别处已读后仍滞留，与看板不一致）
+///
+/// R1：命令改为 async——变更本身轻量，补扫（可能等在飞 2s + 完整扫描）放进
+/// 阻塞线程池，不冻结主线程 IPC；applied=false 表示补扫降级，前端不得假成功。
 #[tauri::command]
-pub fn mark_session_read(app: tauri::AppHandle, agent_type: String, session_id: String) {
+pub async fn mark_session_read(
+    app: tauri::AppHandle,
+    agent_type: String,
+    session_id: String,
+) -> crate::commands::session::MutationOutcome {
+    // F5：请求纪元必须在任何变更之前捕获（applied=false 时前端以 epoch 更大的
+    // 快照事件作为已读已反映的凭据）
+    let request_epoch = crate::adapter::scan_bus::scan_epoch();
     crate::database::dao::unread::delete(&agent_type.to_lowercase(), &session_id);
     // issue #35-1：已读墓碑——缓存失忆（长间隙清缓存 / 兔维斯 重启）后
     // Insert 边沿与补偿据此不再复活已读未读卡
@@ -51,6 +61,29 @@ pub fn mark_session_read(app: tauri::AppHandle, agent_type: String, session_id: 
         "session-read",
         serde_json::json!({ "agentType": agent_type, "sessionId": session_id }),
     );
+    // R1：完整扫描（可能等在飞 2s）放进阻塞线程池，命令本身不跑扫描
+    match tauri::async_runtime::spawn_blocking(move || {
+        crate::adapter::scan_bus::scan_after_mutation(
+            std::time::Duration::from_secs(2),
+            request_epoch,
+        )
+    })
+    .await
+    {
+        Ok(result) => crate::commands::session::MutationOutcome {
+            applied: result.applied,
+            version: result.snapshot.version,
+            epoch: result.request_epoch,
+        },
+        Err(e) => {
+            ::log::error!("已读变更后补扫任务异常: {e}");
+            crate::commands::session::MutationOutcome {
+                applied: false,
+                version: crate::adapter::scan_bus::version(),
+                epoch: request_epoch,
+            }
+        }
+    }
 }
 
 /// 工具勾选列表（含 managed 标志：是否存在启用的分配）
@@ -142,8 +175,9 @@ pub fn list_enabled_tools() -> Vec<EnabledTool> {
 
 /// T5 信号健康度：per-tool hook 通道状态（设置页「信号健康度」分区按需查询；
 /// 无轮询——仅分区打开/手动刷新时调用）。数据链路全复用既有设施：注册状态读
-/// KV、事件读 30s TTL 事件目录、会话归属走 adapter::get_all_sessions（自带单飞
-/// 护栏，与看板轮询共用快照/复扫同一份）——零新增扫描预算
+/// KV、事件读 30s TTL 事件目录、会话归属走 scan_bus::ensure_fresh（动作路径取
+/// 新鲜快照：快照龄超窗才补扫一次并等待，与扫描总线共用同一把单飞，零额外扫描
+/// 预算）
 #[tauri::command]
 pub async fn hook_signal_health() -> Vec<crate::monitor::hooks::ToolSignalHealth> {
     // 会话扫描是重活（sysinfo 全进程刷新 + 文件解析），同步命令在主线程执行会
@@ -154,7 +188,14 @@ pub async fn hook_signal_health() -> Vec<crate::monitor::hooks::ToolSignalHealth
             .filter(|a| a.hook_supported())
             .map(|a| (a.agent_type().tool_id().to_string(), a.name().to_string()))
             .collect();
-        let response = crate::adapter::get_all_sessions();
+        // 会话归属属于动作路径：宁可等一次补扫，也不拿陈旧快照做归属判定
+        //（超时上限 3s，超时后按现有快照降级继续，不阻塞面板）
+        let response = crate::adapter::scan_bus::ensure_fresh(
+            std::time::Duration::from_secs(2),
+            std::time::Duration::from_secs(3),
+        )
+        .data
+        .clone();
         let registered_of = |tool_id: &str| {
             crate::database::get_setting(&format!("hooks_registered_{tool_id}")).as_deref()
                 == Some("true")
@@ -190,4 +231,63 @@ pub async fn hook_signal_health() -> Vec<crate::monitor::hooks::ToolSignalHealth
         ::log::error!("hook_signal_health 扫描任务异常: {e}");
         Vec::new()
     })
+}
+
+#[cfg(test)]
+mod action_path_snapshot_lock_tests {
+    /// 源码锁：设置页「信号健康度」的会话归属属于动作路径，必须经
+    /// `scan_bus::ensure_fresh` 取新鲜快照，不得回退到直调扫描。
+    /// 断言串用 `concat!` 拼接：`include_str!` 会把本文件（含本测试）一并纳入被检
+    /// 源码，整串字面量直接写在断言里会自我命中（同 commands/session.rs 先例）。
+    #[test]
+    fn session_attribution_uses_fresh_snapshot() {
+        let src = include_str!("settings.rs");
+        let fresh = concat!("scan_bus::", "ensure_fresh");
+        let direct_scan = concat!("adapter::", "get_all_sessions");
+        assert!(
+            src.contains(fresh),
+            "会话归属应经 scan_bus::ensure_fresh 取新鲜快照"
+        );
+        assert!(
+            !src.contains(direct_scan),
+            "不得直调 get_all_sessions（动作路径须保证快照新鲜）"
+        );
+    }
+
+    /// 取函数体源码（按花括号配对）
+    fn function_body<'a>(src: &'a str, signature: &str) -> &'a str {
+        let start = src.find(signature).expect("函数签名缺失");
+        let open = src[start..].find('{').expect("函数体缺失") + start;
+        let mut depth = 0usize;
+        for (i, c) in src[open..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &src[open..=open + i];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("函数体未闭合");
+    }
+
+    /// R1：mark_session_read 必须 async + spawn_blocking（补扫进阻塞池，
+    /// 不冻结主线程 IPC），且不再同步跑 scan_now_blocking。
+    #[test]
+    fn mark_session_read_is_async_non_blocking() {
+        // 签名用 concat! 拆分：include_str! 含本测试自身，整串字面量会先命中测试代码
+        let signature = concat!("pub async fn mark_session", "_read(");
+        let body = function_body(include_str!("settings.rs"), signature);
+        assert!(
+            body.contains("spawn_blocking"),
+            "mark_session_read 必须 async + spawn_blocking，实际: {body}"
+        );
+        assert!(
+            !body.contains(concat!("scan_now_", "blocking")),
+            "mark_session_read 不得同步跑完整扫描"
+        );
+    }
 }

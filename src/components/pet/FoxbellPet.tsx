@@ -8,6 +8,7 @@ import { useTranslation } from "react-i18next";
 import type { Session } from "@/types/session";
 import { useSessionJump } from "@/hooks/useSessionJump";
 import { useSessionsQuery } from "@/lib/query/queries/sessions";
+import { useScanSnapshotSync } from "@/lib/query/queries/scanBus";
 import { sessionTitleOrUndefined } from "@/lib/sessionTitle";
 import { setupSessionReadListener } from "@/lib/query/sessionReadSync";
 import { ANIM, frameStyle, FRAME_H, FRAME_W, type PetAnimKey } from "./petAnimations";
@@ -51,6 +52,9 @@ import "./pet-cursor.css";
 
 export function FoxbellPet() {
   const { t } = useTranslation();
+  // Task 2：宠物窗口也接快照事件（本窗有自己的 Query 缓存）——后端每次发布快照
+  // 直接 setQueryData，桌宠状态卡不必等档位轮询；档位轮询仍作兜底。
+  useScanSnapshotSync();
   // 当前主题（计划② Task 6 步骤 11）：看板窗口按它建窗（`system` → undefined，跟随系统；
   // 主题事实源是 DB settings KV，见 theme-provider 的模块级接线）
   const { theme } = useTheme();

@@ -72,6 +72,7 @@ const USAGE_METRICS: readonly UsageMetric[] = [
 ];
 const USAGE_COMMANDS = [
   "usage_collect",
+  "usage_collect_visible",
   "usage_dashboard",
   "usage_records",
   "usage_export_csv",
@@ -735,6 +736,7 @@ describe("usage 命令双端 mock 形状（同一份断言跑两端）", () => {
   it("两端样例逐字同形（仅时间戳可不同）", async () => {
     for (const [cmd, args] of [
       ["usage_collect", { force: true }],
+      ["usage_collect_visible", undefined],
       ["usage_dashboard", { range: { preset: "today" }, groupBy: "tool" }],
       ["usage_records", { range: { preset: "today" }, groupBy: "project", filters: {} }],
       ["usage_export_csv", today()],

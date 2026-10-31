@@ -4,8 +4,9 @@
 //    分工具汇总 1 行 / 本会话 / 详情 »）。行高按 `MINI_LINE_H` 给死、每行 nowrap + ellipsis，
 //    容器另加 `maxHeight` + `overflowY: auto` 兜底 ⇒ 窗口高度与纯层公式一致、不随文案抖动。
 //  * `UsageMiniBar`（数据容器）：三态与数据全部来自 `useUsageDashboardQuery`（档位取设置
-//    `miniBarRange`、分组恒 `tool`），并在**悬停那一刻**按需采集一次（`useUsageCollect`：
-//    `force=false`、最小间隔与单飞由后端保证；兜底 ticker 也在那个 hook 里，本文件不另起）。
+//    `miniBarRange`、分组恒 `tool`），并在**悬停展开那一刻**按需采集一次（`useUsageCollect`：
+//    挂载即可见边沿 → `force=true`，模块级 60s 去抖跨实例共享，故悬停/菜单反复重挂载不会
+//    反复强制扫描；兜底采集由后端 ticker 负责，本文件不另起）。
 //
 // 五条纪律（逐条都有出处）：
 //  ① **不可得一律空态、绝不填 0**（§3 第 5 条）：值取不到 → `EM_DASH`；`collectedAt === 0`
@@ -26,11 +27,15 @@
 //     挑「当前会话」。`title` 为 `null` → `usage.mini.untitled`（绝不印 `null` 字面量）。
 //     ⚠️ **日档（last7d / last30d / custom）后端恒给 `recentSession: null`**（日聚合行不带
 //     `session_id`，见契约 §2 与 `query.rs` 的口径）⇒ 该行必然空态，这是**预期行为不是 bug**。
+import { useEffect } from "react";
 import {
   useUsageCollect,
   useUsageDashboardQuery,
   useUsageSettingsQuery,
 } from "@/lib/query/queries/usage";
+import { HEARTBEAT_INTERVAL_MS, currentScanWindowLabel } from "@/lib/query/queries/scanBus";
+import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { EM_DASH, fmtPct, fmtTokens, usageAgentLabel } from "@/lib/usage/format";
 import {
   MINI_BAR_TOOL_LIMIT,
@@ -245,13 +250,56 @@ export interface UsageMiniBarProps {
  * * 档位只发**预设**（`miniBarRange` 的三值之一），窗口边界由后端裁定（契约 §3 要点 1）——
  *   本容器没有自定义区间，也不自行推算窗口；
  * * 分组恒 `tool`：第 3 行是分工具汇总（D20 的前提）；
- * * **悬停即按需采集**（spec §7.2 的触发清单：「打开大看板 / 悬停浮窗」）：`useUsageCollect` 挂载
- *   采一次（`force=false`）+ 沿用它的兜底 ticker。重复调用只拿上次结果（§3 第 16 条：最小间隔与
- *   单飞由后端保证，前端不做二次节流）；三个读查询**绝不**触发扫描（§3 第 15 条）。
+ * * **悬停即采**（spec §7.2 的触发清单：「打开大看板 / 悬停浮窗」）：`useUsageCollect()` 以挂载
+ *   为可见边沿强制采一次（`force=true`；模块级 60s 去抖跨实例共享，浮窗频繁重挂载不会反复强制
+ *   扫描）。兜底采集由后端 ticker 负责，本文件不另起；三个读查询**绝不**触发扫描（§3 第 15 条）。
  */
 export function UsageMiniBar({ scale, mode, onDetail, t }: UsageMiniBarProps) {
   const settings = useUsageSettingsQuery();
   useUsageCollect();
+  // 扫描档位（Task 9）：浮窗**展开期间**＝有人在看 → 以当前 WebView label 报心跳
+  // （Task 2：宠物窗口 label = "pet"）。与主窗心跳分开记账（后端按窗口并集判定）：
+  // 本窗卸载只收回自己那份，不清主窗的；反向亦然（主窗失焦心跳报 false 也不会把浮窗这份清掉）。
+  //
+  // 可见性判据（评审 Fix 1）：**不能只按「浮窗挂着」报 true**。托盘/菜单把宠物窗口隐藏后，
+  // 本 WebView 仍然活着（浮窗不会卸载）⇒ 若无条件续报 true，pet 源永不收回，后端档位
+  // 钉在 idle，Away 的 30s 空闲节奏永远进不去。故 `visible` 同时跟两个信号：
+  //  * `document.visibilityState`（窗口被隐藏/最小化时 WebView 会触发 visibilitychange）；
+  //  * `pet-visibility-changed`（`FoxbellPet` / 托盘 emit，pet.tsx 同款消费），载荷 `{visible}`。
+  // 30s 续期始终按**当前** visible 报：隐藏期间续报 false，档位才能落到 away。
+  useEffect(() => {
+    // Task 2：窗口标签按当前 WebView 取（宠物窗口 "pet"），后端按窗口独立记账
+    const windowLabel = currentScanWindowLabel();
+    const send = (watching: boolean) => {
+      void invoke("scan_bus_watch", { window: windowLabel, watching }).catch(() => {});
+    };
+    let visible = document.visibilityState === "visible";
+    let alive = true;
+    const update = (next: boolean) => {
+      if (!alive || next === visible) return;
+      visible = next;
+      send(visible);
+    };
+    // 挂载即报一次（浮窗展开 = 在看）；手动唤回的浮窗可长期停留，30s 续期必须
+    // 小于后端 90s TTL，否则驻留期间会静默掉出「在看」
+    send(visible);
+    const id = window.setInterval(() => send(visible), HEARTBEAT_INTERVAL_MS);
+    const onVisibilityChange = () => update(document.visibilityState === "visible");
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    // 载荷过类型守卫：非布尔值忽略（浏览器 mock 下 listen 只返回 undefined）
+    const un = listen<{ visible?: unknown }>("pet-visibility-changed", (e) => {
+      if (!alive) return;
+      const next = e.payload?.visible;
+      if (typeof next === "boolean") update(next);
+    }).catch(() => () => {});
+    return () => {
+      alive = false;
+      window.clearInterval(id);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+      void un.then((f) => f());
+      send(false); // 卸载收回本源的「在看」
+    };
+  }, []);
   const range: UsageRange = { preset: settings.data?.miniBarRange ?? "today" };
   const dashboard = useUsageDashboardQuery(range, "tool");
 

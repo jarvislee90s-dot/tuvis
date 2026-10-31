@@ -1,4 +1,4 @@
-// /m/api/v1/*：sessions（P8 数据同源直调 get_all_sessions）+ host（P8a/P8b 页头数据）
+// /m/api/v1/*：sessions（P8 数据同源，读扫描总线共享快照）+ host（P8a/P8b 页头数据）
 // + pair/pin（M5 A3 访问密码配对，唯一换 cookie 入口）+ events（M3 Task 6 SSE 实时通道）
 // + session-messages（Task 7）+ session-files / file（M3 Task 8 文件路径提取与安全读取）
 // + session-send / send-info / queue 系（M7 Task 6 注入三端点）
@@ -19,7 +19,7 @@ use std::convert::Infallible;
 use std::sync::Arc;
 use tokio_stream::wrappers::BroadcastStream;
 
-use super::server::{CleanupStream, RemoteState};
+use super::server::{CleanupStream, RemoteState, SseConnGuard};
 
 /// 看板隐藏过滤（APP 软归档=「叉」语义，2026-09-20 体验批二修订）：hidden →
 /// 一律从响应剔除（仅手机看板；桌面走 invoke 不经此端点）。**无自动回归**——
@@ -46,13 +46,14 @@ fn apply_board_hidden(
     resp
 }
 
-/// GET /m/api/v1/sessions：数据源注入（生产 = adapter::get_all_sessions），
+/// GET /m/api/v1/sessions：数据源注入（生产 = `scan_bus::current_or_scan`，读共享快照），
 /// `SessionsResponse` 已 camelCase 序列化（前端约定 totalCount）。
 ///
-/// 扫描必须在 `spawn_blocking` 里跑：生产源 `adapter::get_all_sessions` 是**同步阻塞**调用
-/// （sysinfo 全进程刷新 + 各工具会话解析，冷启动可达数秒），直接放在 async handler 里会
-/// 周期性堵死 tokio worker——移动端 3s 轮询下即为持续拖垮（桌面侧同一函数已按此包，
-/// 实机教训见 `commands/session.rs` 的 `get_all_sessions`）。
+/// 扫描必须在 `spawn_blocking` 里跑：生产源是**同步阻塞**调用
+/// （读快照通常即时；冷启动无快照时会同步首扫：sysinfo 全进程刷新 + 各工具会话解析，
+/// 可达数秒），直接放在 async handler 里会周期性堵死 tokio worker——移动端 3s 轮询下
+/// 即为持续拖垮（桌面侧同一函数已按此包，实机教训见 `commands/session.rs` 的
+/// `get_all_sessions`）。
 pub async fn sessions(State(st): State<Arc<RemoteState>>) -> impl IntoResponse {
     // 闭包捕获 state 的 Arc（Send + Sync + 'static）：`session_source` 是 Box<dyn Fn> 不可
     // clone，故整体 move 进阻塞线程池，在池内调用注入源
@@ -88,6 +89,24 @@ const EMPTY_SESSIONS_JSON: &str = r#"{"sessions":[],"totalCount":0,"waitingCount
 /// 前端拿到合法空载荷而非空串/Null（JSON.parse 不抛错、看板不卡死）
 fn empty_sessions_value() -> serde_json::Value {
     serde_json::json!({ "sessions": [], "totalCount": 0, "waitingCount": 0 })
+}
+
+/// SSE 首帧构造**单点**（handler 与测试共用，故虽名 `_for_test` 并非测试专用）：
+/// 快照 → Value 并附加 `version`（扫描总线发布版本）。**客户端据此做快照对账/纠偏**——
+/// 重连后拿 version 与本地已知版本比对，识别「首帧是否比本地记忆更新」。
+/// 序列化理论不可达失败（C 风格字段无 map 键/浮点 NaN）→ 空快照 Value 兜底。
+pub(crate) fn snapshot_frame_for_test(
+    resp: crate::session::SessionsResponse,
+    version: u64,
+) -> serde_json::Value {
+    let mut v = serde_json::to_value(resp).unwrap_or_else(|e| {
+        log::warn!("SSE 快照序列化失败，降级为空快照: {e}");
+        empty_sessions_value()
+    });
+    if let Some(obj) = v.as_object_mut() {
+        obj.insert("version".into(), serde_json::json!(version));
+    }
+    v
 }
 
 /// C7 配对键归一（与桌面跳转门 require_evidence 同判据）：工具小写；项目先走
@@ -153,13 +172,15 @@ fn tag_pairing_ambiguous(
 }
 
 /// GET /m/api/v1/events（M3 Task 6，C1 后半）：SSE 实时通道。
-/// - 首帧 = 全量会话快照（**直调注入源**，数据同源铁律 3），此后只推跃迁边沿
-///   （watcher 是唯一去重点，铁律 4——本层不独立去重、来一条推一条）；
+/// - 首帧 = 全量会话快照（走 `scan_bus::ensure_fresh`：快照龄 ≤ 2s，超龄则请求补扫并
+///   等待上限 3s，超时按现有快照降级），帧内携带 `version`（扫描总线发布版本，
+///   **供客户端快照对账/纠偏**）；此后只推跃迁边沿（watcher 是唯一去重点，铁律 4——
+///   本层不独立去重、来一条推一条）；
 /// - gate 由 nest 内层 layer 结构性覆盖（本端点注册在 api_router 内），无需另加 middleware；
 /// - 心跳用 `Sse::keep_alive(KeepAlive::default())`：axum 自带 15s 空注释帧
 ///   （简报的 `: ping` 等效物，无需自拼 interval 流——简报 Step 1 注释"心跳省略实现"即指此）；
-/// - 断流：客户端断开 → axum drop 本流 → BroadcastStream 释放 Receiver →
-///   receiver_count 归零 → watcher 零订阅者守卫跳过扫描（Task 5 闭环）；
+/// - 断流：客户端断开 → axum drop 本流 → BroadcastStream 释放 Receiver；扫描侧已改为
+///   订阅共享快照（watcher 不再自行扫描），本层只负责连接注册与清理；
 /// - 吊销/停止即时断连（M4 T0a）：连接注册进 sse_registry，信号经 take_until 终止流
 pub async fn events(
     State(st): State<Arc<RemoteState>>,
@@ -169,32 +190,72 @@ pub async fn events(
     // 落进 broadcast 缓冲（容量 64）并在快照帧之后依次送出；若反序，快照与订阅之间
     // 发生的跃迁会永久丢失（重连后的看板状态与真实脱节）
     let rx = st.watcher_tx.subscribe();
-    // M4 T0a：注册连接（gate 已过闸，此处必能取到设备 id；防御性 None 时跳过注册只服务）
+    // M4 T0a：gate 已过闸，此处必能取到设备 id（防御性 None 时跳过注册只服务）
     let device = super::gate::extract_device(&headers).unwrap_or_default();
-    let (conn_id, close_rx) = st.sse_registry.register(&device);
-    // 注册表句柄先行克隆：st 整体 move 进下方 spawn_blocking 闭包（既有代码不动）
-    let registry = st.sse_registry.clone();
-    // 快照走 spawn_blocking：session_source 是同步阻塞调用（sysinfo 全进程刷新 + 各工具
-    // 会话解析，冷启动可达数秒），直接 await 会周期性堵死 tokio worker——与 sessions
-    // handler 同一先例（实机教训见 commands/session.rs 的 get_all_sessions 注释）。
-    // 同过 apply_board_hidden 过滤（与 GET /sessions 同函数）：软归档隐藏卡片
-    // 不得经 SSE snapshot 通道诈尸
-    let snapshot =
-        tokio::task::spawn_blocking(move || apply_board_hidden(&st, (st.session_source)()))
-            .await
-            .unwrap_or_else(|e| {
+    // R6：订阅之后、快照 await **之前**注册——注册守卫 Drop 即反注册：
+    // ① 握手期断开（handler future 被 drop）不泄漏计数；② 快照等待期间
+    // disconnect_all/吊销能关断本连接（旧实现在快照后才注册，有吊销窗口）
+    let (conn_guard, mut close_rx) = SseConnGuard::register(&st.sse_registry, &device);
+    // 快照走 spawn_blocking：ensure_fresh 内部可能等待补扫（上限 3s）并轮询，是同步
+    // 阻塞调用；直接 await 会堵死 tokio worker——与 sessions handler 同一先例
+    // （实机教训见 commands/session.rs 的 get_all_sessions 注释）。
+    // 闭包整体 move 一份 RemoteState 的 Arc（st 之后不再使用）：ensure_fresh **与**
+    // apply_board_hidden 过滤**全部在阻塞线程池内**完成——后者经
+    // database/dao/board_hidden.rs 锁全局 SQLite 互斥量，留在 async worker 上会被
+    // 长事务 DB 写者阻塞（2026-10-29 线程卫生回归点）。同过 apply_board_hidden
+    // （与 GET /sessions 同函数）：软归档隐藏卡片不得经 SSE snapshot 通道诈尸
+    let st_snap = st.clone();
+    // R9：等待快照期间同时监听吊销/停服信号——收到即以空快照帧收尾并立即结束握手，
+    // 不再有「吊销要等补扫上限（≤3s）结束才生效」的窗口
+    type SseStream =
+        std::pin::Pin<Box<dyn futures::Stream<Item = Result<sse::Event, Infallible>> + Send>>;
+    let (snapshot_json, handshake_closed) = tokio::select! {
+        res = tokio::task::spawn_blocking(move || {
+            let snap = crate::adapter::scan_bus::ensure_fresh(
+                std::time::Duration::from_secs(2),
+                std::time::Duration::from_secs(3),
+            );
+            let value = apply_board_hidden(&st_snap, snap.data.clone());
+            let frame = snapshot_frame_for_test(value, snap.version);
+            serde_json::to_string(&frame).unwrap_or_else(|e| {
+                log::warn!("SSE 快照序列化失败，降级为空快照: {e}");
+                EMPTY_SESSIONS_JSON.to_string()
+            })
+        }) => (
+            res.unwrap_or_else(|e| {
                 // JoinError（任务 panic/取消）降级为空快照：移动端拿到 0 会话而非断流
-                log::error!("SSE 快照会话扫描任务异常: {e}");
-                crate::session::SessionsResponse {
-                    sessions: Vec::new(),
-                    total_count: 0,
-                    waiting_count: 0,
-                }
-            });
-    let snapshot_json = serde_json::to_string(&snapshot).unwrap_or_else(|e| {
-        log::warn!("SSE 快照序列化失败，降级为空快照: {e}");
-        EMPTY_SESSIONS_JSON.to_string()
-    });
+                log::error!("SSE 快照等待异常: {e}");
+                // 降级帧同样带 version(=0)，客户端对账口径一致
+                snapshot_frame_for_test(
+                    crate::session::SessionsResponse {
+                        sessions: Vec::new(),
+                        total_count: 0,
+                        waiting_count: 0,
+                    },
+                    0,
+                )
+                .to_string()
+            }),
+            false,
+        ),
+        _ = &mut close_rx => {
+            // R9：吊销/停服在快照等待中被中断——close_rx 已完成，**不得**再交给
+            // take_until 轮询（oneshot poll-after-complete 会 panic）；直接返回空流
+            log::info!("SSE 快照等待期间收到吊销/停服，立即结束握手");
+            (
+                snapshot_frame_for_test(
+                    crate::session::SessionsResponse {
+                        sessions: Vec::new(),
+                        total_count: 0,
+                        waiting_count: 0,
+                    },
+                    0,
+                )
+                .to_string(),
+                true,
+            )
+        }
+    };
     let initial = futures::stream::once(async move {
         Ok(sse::Event::default().event("snapshot").data(snapshot_json))
     });
@@ -211,14 +272,16 @@ pub async fn events(
             }
         }
     });
-    let base = initial.chain(transitions);
-    // 吊销/停止信号到达即终止流（take_until：close_rx 被 send 或 Sender drop 均触发）
-    let guarded = base.take_until(close_rx);
+    // 正常握手：take_until 在吊销/停止信号到达或 Sender drop 时终止流；
+    // 握手中途已吊销：返回空流（不轮询已完成的 close_rx）
+    let inner: SseStream = if handshake_closed {
+        Box::pin(futures::stream::empty())
+    } else {
+        Box::pin(initial.chain(transitions).take_until(close_rx))
+    };
     let cleaned = CleanupStream {
-        inner: guarded,
-        reg: registry,
-        device,
-        conn_id,
+        inner,
+        _conn: conn_guard,
     };
     Sse::new(cleaned).keep_alive(sse::KeepAlive::default())
 }
@@ -662,8 +725,11 @@ pub async fn session_files(
     let st = st.clone();
     let (files, truncated) = tokio::task::spawn_blocking(move || {
         let (mut files, truncated) = (st.path_source)(agent.as_str(), sid.as_str(), limit);
-        // 与 /file 预览端点使用同一份会话快照 cwd，而非消息流里的 pg.cwd。
-        let preview_cwd = (st.session_source)()
+        // 列表/preview 的 cwd 基准与 /file 读取**不同源**（如实申报，勿再声称同一份）：
+        // 本端点算 file_key 用动作路径的**新鲜**快照（cwd 变更后旧快照会把 file_key
+        // 算错），而 /file（api::read_file）仍用显示快照 session_source 定 cwd——
+        // 分歧已接受，待后续收敛；两者都不使用消息流里的 pg.cwd
+        let preview_cwd = (st.fresh_session_source)()
             .sessions
             .into_iter()
             .find(|s| s.id == sid)
@@ -864,7 +930,7 @@ pub async fn read_file(
     };
     let st = st.clone();
     let outcome = tokio::task::spawn_blocking(move || {
-        // 数据同源铁律 3：cwd 直调注入的会话源（生产 = adapter::get_all_sessions，
+        // 数据同源铁律 3：cwd 直调注入的会话源（生产 = scan_bus::current_or_scan，
         // 与看板同一份快照），不另立查找函数
         let resp = (st.session_source)();
         let Some(session) = resp.sessions.into_iter().find(|s| s.id == sid) else {
@@ -1130,9 +1196,11 @@ fn endpoint_audit(
 }
 
 /// 快照中按 session_id 找会话（spawn_blocking 内调用：session_source 是同步阻塞扫描）。
-/// 数据同源铁律：直调注入源（与看板/内容读取同一份快照），不另立查找函数
+/// 数据同源铁律：直调注入源（与看板/内容读取同一份快照），不另立查找函数。
+/// 动作路径口径（Task 4）：走 fresh_session_source——会话定位之后紧跟写终端动作，
+/// 不能按陈旧快照的 pid/cwd 动手
 fn find_session_sync(st: &Arc<RemoteState>, session_id: &str) -> Option<crate::session::Session> {
-    (st.session_source)()
+    (st.fresh_session_source)()
         .sessions
         .into_iter()
         .find(|s| s.id == session_id)
@@ -2597,7 +2665,8 @@ fn read_dialog_options_render_wait_with(
 /// 复合键说明（Task 5 教训）：本端点无 agent_type 入参，快照里按 id 找**第一个**匹配；
 /// id 跨工具撞名时取第一个匹配——契约如此。
 fn approve_options_scan(st: &Arc<RemoteState>, session_id: &str) -> Option<ApproveScanHit> {
-    let session = (st.session_source)()
+    // 动作路径：问答载荷组装前先取新鲜快照（按钮按下即写终端）
+    let session = (st.fresh_session_source)()
         .sessions
         .into_iter()
         .find(|s| s.id == session_id)?;
@@ -3276,8 +3345,8 @@ pub async fn session_approve(
     let probe_opt = option_id.clone();
     let lookup = match tokio::task::spawn_blocking(move || {
         // 复合键说明（Task 5 教训）：本端点无 agent_type 入参，快照里按 id 找第一个匹配；
-        // id 跨工具撞名时取第一个匹配——契约如此
-        let Some(session) = (probe_st.session_source)()
+        // id 跨工具撞名时取第一个匹配——契约如此。动作路径取新鲜快照（Task 4）
+        let Some(session) = (probe_st.fresh_session_source)()
             .sessions
             .into_iter()
             .find(|s| s.id == probe_sid)
@@ -3863,11 +3932,12 @@ pub async fn session_plan_feedback(
     if matches!(&op, PlanFeedbackOp::Type { text, submit: false } if text.trim().is_empty()) {
         return bad_request(); // 覆盖写入空文本无意义（前端已禁用，防御）
     }
-    // 会话查找（同 session_approve 的复合键契约：快照按 id 找第一个匹配）
+    // 会话查找（同 session_approve 的复合键契约：快照按 id 找第一个匹配）；
+    // 动作路径取新鲜快照（Task 4）
     let probe_st = st.clone();
     let probe_sid = sid.clone();
     let lookup = match tokio::task::spawn_blocking(move || {
-        let Some(session) = (probe_st.session_source)()
+        let Some(session) = (probe_st.fresh_session_source)()
             .sessions
             .into_iter()
             .find(|s| s.id == probe_sid)
@@ -4190,7 +4260,8 @@ pub async fn session_close(
     let sid2 = sid.clone(); // 移动副本进闭包，原值保留给审计（session-open 同一写法）
                             // Err 携带 (工具串, 原因)：工具串供审计（活快照命中才有，no_session 为空串）
     let outcome: Result<(String, ()), (String, String)> = tokio::task::spawn_blocking(move || {
-        let Some(s) = (st2.session_source)()
+        // 动作路径（远程杀进程前定位 pid）：取新鲜快照，绝不按旧 pid 杀进程
+        let Some(s) = (st2.fresh_session_source)()
             .sessions
             .into_iter()
             .find(|s| s.id == sid2)
@@ -4277,7 +4348,8 @@ pub async fn session_hide(
     };
     let st2 = st.clone();
     let outcome: Result<(), (String, String)> = tokio::task::spawn_blocking(move || {
-        let Some(s) = (st2.session_source)()
+        // 动作路径（软归档前确认 APP 会话在场）：取新鲜快照
+        let Some(s) = (st2.fresh_session_source)()
             .sessions
             .into_iter()
             .find(|s| s.id == sid)
@@ -7513,8 +7585,9 @@ pub async fn session_open(
     let outcome = match tokio::task::spawn_blocking(
         move || -> Result<(String, Result<(), String>, bool), String> {
             // 复合键口径（Task 5 教训）：快照里按 id 找第一个匹配——契约如此
-            // （mut：T3 信任归一在 spawn 前原地改写 project_path）
-            let mut session = match (probe_st.session_source)()
+            // （mut：T3 信任归一在 spawn 前原地改写 project_path）。
+            // 动作路径（远程 resume 开终端）：取新鲜快照，避免按已退出会话的旧记录开窗
+            let mut session = match (probe_st.fresh_session_source)()
                 .sessions
                 .into_iter()
                 .find(|s| s.id == probe_sid)
@@ -7675,7 +7748,8 @@ struct ModeScanHit {
 /// 权限组（codex 回执行 / kimi 底栏）不走这份快照——GET 组装处经
 /// [`read_axis_from_screen`] 单独读（权限组 current 见 `session_mode` 组载荷段）。
 fn mode_scan_sync(st: &Arc<RemoteState>, session_id: &str) -> Option<ModeScanHit> {
-    let session = (st.session_source)()
+    // 动作路径（模式/审批控制前定位会话）：取新鲜快照
+    let session = (st.fresh_session_source)()
         .sessions
         .into_iter()
         .find(|s| s.id == session_id)?;
@@ -8213,11 +8287,11 @@ pub async fn session_mode_menu(
     let Some((device_id, device_name)) = device_identity(&st, &headers) else {
         return forbidden_defense();
     };
-    // 会话查找（与 switch 端点同纪律：一个 spawn_blocking）
+    // 会话查找（与 switch 端点同纪律：一个 spawn_blocking；动作路径取新鲜快照）
     let probe_st = st.clone();
     let probe_sid = sid.clone();
     let found = tokio::task::spawn_blocking(move || {
-        (probe_st.session_source)()
+        (probe_st.fresh_session_source)()
             .sessions
             .into_iter()
             .find(|s| s.id == probe_sid)
@@ -8846,11 +8920,12 @@ pub async fn session_mode_switch(
     let Some((device_id, device_name)) = device_identity(&st, &headers) else {
         return forbidden_defense();
     };
-    // 会话查找 + 组推断 + 序列构造（一个 spawn_blocking；锁纪律同 approve）
+    // 会话查找 + 组推断 + 序列构造（一个 spawn_blocking；锁纪律同 approve）；
+    // 动作路径（写终端换模式）：取新鲜快照
     let probe_st = st.clone();
     let probe_sid = sid.clone();
     let lookup = match tokio::task::spawn_blocking(move || -> Result<_, String> {
-        let session = (probe_st.session_source)()
+        let session = (probe_st.fresh_session_source)()
             .sessions
             .into_iter()
             .find(|s| s.id == probe_sid)
@@ -9999,15 +10074,16 @@ fn tool_enabled(st: &Arc<RemoteState>, tool: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// 目标目录的活跃会话信号（黄字数据源，spec §3「不拦截」）：session_source 快照
-/// 中同工具 + 同目录（monitor::cwd 归一域，与 find_tui_pid 的 cwd 判据同款）≥1 条。
-/// spawn_blocking 内调用（session_source 是同步阻塞扫描）。
+/// 目标目录的活跃会话信号（黄字数据源，spec §3「不拦截」）：会话快照中同工具 +
+/// 同目录（monitor::cwd 归一域，与 find_tui_pid 的 cwd 判据同款）≥1 条。
+/// 动作路径（新建会话前的目录占用检查）：取新鲜快照，避免把刚退出的会话当活跃。
+/// spawn_blocking 内调用（fresh_session_source 是同步阻塞调用，可能等待补扫）
 fn has_active_session_for(st: &Arc<RemoteState>, tool: &str, dir: &str) -> bool {
     let want = crate::monitor::cwd::normalize_cwd_for_match(dir);
     if want.is_empty() {
         return false;
     }
-    (st.session_source)().sessions.iter().any(|s| {
+    (st.fresh_session_source)().sessions.iter().any(|s| {
         s.agent_type.tool_id() == tool
             && crate::monitor::cwd::normalize_cwd_for_match(&s.project_path) == want
     })
@@ -10659,6 +10735,21 @@ pub async fn create_projects(
 mod tests {
     use super::*;
     use crate::remote::content::SessionMessage;
+
+    /// Task 6 回归锁：SSE 首帧快照帧必须携带 `version`（客户端据此做快照对账/纠偏）。
+    /// 帧构造单点 = [`snapshot_frame_for_test`]（handler 与测试共用），本用例钉住字段在场。
+    #[tokio::test]
+    async fn sse_snapshot_frame_carries_version() {
+        let v = super::snapshot_frame_for_test(
+            crate::session::SessionsResponse {
+                sessions: vec![],
+                total_count: 0,
+                waiting_count: 0,
+            },
+            42,
+        );
+        assert_eq!(v.get("version").and_then(|x| x.as_u64()), Some(42));
+    }
 
     /// M4 回归锁：审计摘要文案**单点** [`mode_audit_content`]——成功臂与止血门拒绝臂
     /// 共用同一函数，本用例钉住两组各自的措辞（对账口径：账本正是拿它逐字对账，

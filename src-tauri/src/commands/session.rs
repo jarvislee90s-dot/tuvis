@@ -1,6 +1,5 @@
 // 会话相关命令
 
-use crate::adapter;
 use crate::session::SessionsResponse;
 // Manager 的导入在下方 macOS cfg 块内局部引入：get_webview_window 仅 macOS
 // 路径消费，顶层导入在 Linux/Windows CI 上是 unused import（-D warnings 即挂）
@@ -8,33 +7,20 @@ use tauri::Emitter;
 
 #[tauri::command]
 pub async fn get_all_sessions(app: tauri::AppHandle) -> SessionsResponse {
-    // 重扫描移出主线程（同步命令在主线程执行）：sysinfo 全进程刷新 + 各工具
-    // 会话文件解析（如 dsh 冷启动全量解析数秒）会冻结整个 UI——dev 模式整机
-    // 卡顿的第二根因。托盘/预设更新是轻量 UI 操作，await 后照常执行
-    let response = tauri::async_runtime::spawn_blocking(adapter::get_all_sessions)
+    // 读扫描总线的共享快照（常驻扫描线程见 adapter::scan_bus::start）；只有冷启动
+    // 尚无快照时才同步补扫一次兜底。spawn_blocking 仍保留：兜底扫描（sysinfo 全进程
+    // 刷新 + 各工具文件解析，dsh 冷启动数秒）不得占主线程。托盘状态已迁入扫描线程
+    // （常驻线程内部 update_tray），命令层只剩预设刷新这类轻量 UI 操作
+    let response = tauri::async_runtime::spawn_blocking(crate::adapter::scan_bus::current_or_scan)
         .await
         .unwrap_or_else(|e| {
-            ::log::error!("会话扫描任务异常: {e}");
+            ::log::error!("会话快照读取任务异常: {e}");
             SessionsResponse {
                 sessions: Vec::new(),
                 total_count: 0,
                 waiting_count: 0,
             }
         });
-    let has_processing = response.sessions.iter().any(|s| {
-        matches!(
-            s.status,
-            crate::session::SessionStatus::Processing
-                | crate::session::SessionStatus::Thinking
-                | crate::session::SessionStatus::Compacting
-        )
-    });
-    crate::plugins::system_tray::update_tray_status(
-        &app,
-        response.waiting_count,
-        response.total_count,
-        has_processing,
-    );
     let preset_count = crate::database::list_presets().len();
     let last_count = crate::database::get_setting("last_preset_count")
         .and_then(|s| s.parse::<usize>().ok())
@@ -44,6 +30,246 @@ pub async fn get_all_sessions(app: tauri::AppHandle) -> SessionsResponse {
         crate::database::set_setting("last_preset_count", &preset_count.to_string());
     }
     response
+}
+
+/// 扫描总线状态（前端档位跟随的观测口）：mode 为 active/idle/away（serde lowercase），
+/// version 为快照发布版本（单调递增，前端据此判断数据是否已刷新）。
+/// F3 裁决「诊断字段即可」：`degraded` = 扫描疑似 hang（在飞超 120s，需重启恢复）；
+/// `snapshotAgeMs` = 最近快照龄（毫秒；无快照为 null）——补扫超时降级时可查
+#[tauri::command]
+pub fn scan_bus_status() -> serde_json::Value {
+    let snapshot_age_ms =
+        crate::adapter::scan_bus::snapshot().map(|s| s.scanned_at.elapsed().as_millis() as u64);
+    serde_json::json!({
+        "mode": crate::adapter::scan_bus::mode(),
+        "version": crate::adapter::scan_bus::version(),
+        "degraded": crate::adapter::scan_bus::is_degraded(),
+        "snapshotAgeMs": snapshot_age_ms,
+    })
+}
+
+/// 前端可见性心跳（主窗可见且聚焦 / 浮窗展开）：置「有人在看」，TTL 内节奏降档到 idle。
+/// **窗口级**上升沿（某窗口 false→true 或新窗口首次 true）立即请求一次 Action 补扫——
+/// 窗口重新聚焦时数据立刻新鲜，不必等下一个档位周期（最坏 30s）；桌宠已展开时
+/// 主窗重新聚焦同样能刷新（旧口径按总体状态判定，会被宠物浮窗吞掉）。
+///
+/// `window` 区分心跳来源窗口：Tauri WebView label（主窗 "main"、宠物 "pet"）。
+/// 旧前端只传 `watching`（无 window）→ 归入 "global" 键，语义仍兼容。
+#[tauri::command]
+pub fn scan_bus_watch(window: Option<String>, watching: bool) {
+    let window = normalize_watch_window(window);
+    if crate::adapter::scan_bus::set_user_watching(&window, watching) {
+        crate::adapter::scan_bus::request_scan(crate::adapter::scan_bus::ScanReason::Action);
+    }
+}
+
+/// 心跳窗口归一：缺省（老前端 / 远端调用）记到 "global"；空白串同缺省，避免造出无名窗口
+fn normalize_watch_window(window: Option<String>) -> String {
+    match window.map(|s| s.trim().to_string()) {
+        Some(s) if !s.is_empty() => s,
+        _ => "global".to_string(),
+    }
+}
+
+/// 取函数体源码（按花括号配对；签名必须唯一命中实现处）。测试专用。
+#[cfg(test)]
+fn function_body<'a>(src: &'a str, signature: &str) -> &'a str {
+    let start = src.find(signature).expect("函数签名缺失");
+    let open = src[start..].find('{').expect("函数体缺失") + start;
+    let mut depth = 0usize;
+    for (i, c) in src[open..].char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return &src[open..=open + i];
+                }
+            }
+            _ => {}
+        }
+    }
+    panic!("函数体未闭合");
+}
+
+#[cfg(test)]
+mod r1_mutation_scan_tests {
+    use super::{apply_dismissals, function_body, DismissItem};
+    use crate::adapter::scan_bus;
+
+    fn empty_resp() -> crate::session::SessionsResponse {
+        crate::session::SessionsResponse {
+            sessions: Vec::new(),
+            total_count: 0,
+            waiting_count: 0,
+        }
+    }
+
+    /// R1：单卡命令必须**非阻塞**（async + spawn_blocking），不得再同步跑
+    /// scan_now_blocking（同步命令在主线程执行，扫描会冻结全部窗口 IPC）。
+    #[test]
+    fn single_card_commands_are_async_and_spawn_blocking() {
+        let session_src = include_str!("session.rs");
+        let dismiss = function_body(
+            session_src,
+            concat!("pub async fn dismiss_session", "_card("),
+        );
+        assert!(
+            dismiss.contains("spawn_blocking"),
+            "dismiss_session_card 必须 async + spawn_blocking，实际: {dismiss}"
+        );
+        assert!(
+            !dismiss.contains(concat!("scan_now_", "blocking")),
+            "dismiss_session_card 不得同步跑完整扫描"
+        );
+        assert!(
+            dismiss.contains("apply_dismissals"),
+            "R9：单卡 dismiss 必须复用批量 apply_dismissals（未读池权威口径一致）"
+        );
+
+        let settings_src = include_str!("settings.rs");
+        let mark = function_body(settings_src, concat!("pub async fn mark_session", "_read("));
+        assert!(
+            mark.contains("spawn_blocking"),
+            "mark_session_read 必须 async + spawn_blocking，实际: {mark}"
+        );
+        assert!(
+            !mark.contains(concat!("scan_now_", "blocking")),
+            "mark_session_read 不得同步跑完整扫描"
+        );
+    }
+
+    /// R1：一键清除 N 项只允许触发 **1 次**扫描，且返回版本必须晚于变更前版本。
+    #[test]
+    fn batch_dismissal_scans_once_and_advances_version() {
+        let _guard = scan_bus::test_guard();
+        scan_bus::reset_for_test();
+        crate::monitor::SESSION_DISMISALS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        let _ = scan_bus::publish_for_test(empty_resp);
+        let before_version = scan_bus::version();
+        let before_scans = scan_bus::scan_total();
+        let items: Vec<DismissItem> = (0..10)
+            .map(|i| DismissItem {
+                agent_type: "claude".to_string(),
+                session_id: format!("r1-batch-{i}"),
+                status: "idle".to_string(),
+            })
+            .collect();
+        let request_epoch = scan_bus::scan_epoch();
+        let result = apply_dismissals(items, |_, _| {});
+        assert_eq!(
+            scan_bus::scan_total() - before_scans,
+            1,
+            "批量 10 项只能触发 1 次扫描（N 张卡 ≠ N 次扫描）"
+        );
+        assert!(result.applied, "无在飞扫描时批量补扫必须视为已应用");
+        assert_eq!(result.request_epoch, request_epoch);
+        assert!(
+            result.snapshot.epoch > result.request_epoch,
+            "已应用快照必须来自晚于请求启动的扫描"
+        );
+        assert!(
+            result.snapshot.version > before_version,
+            "返回版本 {} 必须晚于变更前 {}",
+            result.snapshot.version,
+            before_version
+        );
+        let inserted = crate::monitor::SESSION_DISMISALS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len();
+        assert!(inserted >= 10, "10 项隐藏变更都应落进 dismiss 集合");
+        crate::monitor::SESSION_DISMISALS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+    }
+
+    /// F5：`request_epoch` 必须在**任何变更之前**捕获。用例在变更中途（emit_read
+    /// 回调内）启动一次新扫描把 epoch 推高：若实现把捕获放在变更之后，返回值会
+    /// 越过这次扫描，前端会在旧快照上提前收口（卡片复活）。
+    #[test]
+    fn request_epoch_is_captured_before_any_mutation() {
+        let _guard = scan_bus::test_guard();
+        scan_bus::reset_for_test();
+        let _ = scan_bus::publish_for_test(empty_resp);
+        let now = chrono::Utc::now().timestamp_millis();
+        crate::database::dao::unread::upsert(&crate::database::dao::unread::UnreadSessionRecord {
+            tool_id: "claude".to_string(),
+            session_id: "f5-epoch-order".to_string(),
+            project_name: "p".to_string(),
+            title: None,
+            last_message: None,
+            turned_green_at_ms: now,
+            expires_at_ms: now + 3_600_000,
+        });
+        let before = scan_bus::scan_epoch();
+        let mid_scan_epoch = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let sink = mid_scan_epoch.clone();
+        let result = apply_dismissals(
+            vec![DismissItem {
+                agent_type: "claude".to_string(),
+                session_id: "f5-epoch-order".to_string(),
+                status: "idle".to_string(),
+            }],
+            move |_, _| {
+                // 变更进行中另一轮扫描启动（emit_read 只在未读分支调用）
+                let snap = scan_bus::publish_for_test(empty_resp);
+                *sink.lock().unwrap_or_else(|e| e.into_inner()) = Some(snap.epoch);
+            },
+        );
+        let mid = mid_scan_epoch
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .expect("未读项必须走 emit_read 分支");
+        assert_eq!(
+            result.request_epoch, before,
+            "request_epoch 必须是入口（变更前）捕获的纪元"
+        );
+        assert!(
+            mid > result.request_epoch,
+            "变更中途的扫描 epoch（{mid}）必须晚于 request_epoch（{}）",
+            result.request_epoch
+        );
+        assert!(
+            result.snapshot.epoch > mid,
+            "变更后的补扫快照 epoch（{}）必须晚于变更中途的扫描（{mid}）",
+            result.snapshot.epoch
+        );
+        crate::database::dao::unread::delete("claude", "f5-epoch-order");
+    }
+}
+
+#[cfg(test)]
+mod scan_bus_status_tests {
+    use super::*;
+
+    /// Fix 2 诊断字段回归锁：`scan_bus_status` 必须给出降级标志与快照龄——
+    /// F3 裁决是「诊断字段即可」，前端/巡检据此区分「新鲜」与「补扫超时降级」。
+    #[test]
+    fn status_reports_degraded_flag_and_snapshot_age() {
+        let _guard = crate::adapter::scan_bus::test_guard();
+        crate::adapter::scan_bus::reset_for_test();
+        crate::adapter::scan_bus::publish_for_test(|| SessionsResponse {
+            sessions: Vec::new(),
+            total_count: 0,
+            waiting_count: 0,
+        });
+        let v = scan_bus_status();
+        assert_eq!(
+            v.get("degraded").and_then(|x| x.as_bool()),
+            Some(false),
+            "无在飞扫描时不得标记 degraded"
+        );
+        assert!(
+            v.get("snapshotAgeMs").and_then(|x| x.as_u64()).is_some(),
+            "有快照时必须给出 snapshotAgeMs"
+        );
+        assert_eq!(v.get("version").and_then(|x| x.as_u64()), Some(1));
+    }
 }
 
 /// 跳转成功 → 标记该会话已读（仅删除对应未读行；同工具其他未读卡保留，spec W4）。
@@ -62,6 +288,10 @@ fn mark_read_on_jump(
             "session-read",
             serde_json::json!({ "agentType": agent, "sessionId": sid }),
         );
+        // F5 即时重算：已读落库后请求一次动作补扫（Action 不吃事件合并节流），
+        // 前端已有的 invalidateQueries(["sessions"]) 下一帧即读到新快照，
+        // 不必等下一个档位周期（最坏 30s）
+        crate::adapter::scan_bus::request_scan(crate::adapter::scan_bus::ScanReason::Action);
     }
 }
 
@@ -354,28 +584,164 @@ pub fn focus_hwnd(hwnd: isize) -> Result<(), String> {
     }
 }
 
+/// 变更类命令的统一回执（R1）：`applied=false` = 变更后补扫等待超时（degraded），
+/// 前端不得按成功展示。`version` = 返回快照的发布版本。
+///
+/// F5（2026-10-31 定案）：`epoch` = 变更**请求时刻**的扫描纪元（命令入口、任何变更
+/// 之前捕获）。`applied=false` 时前端保留 pending，以 `epoch > 该值` 的
+/// `scan-bus-snapshot` 事件作为「变更已反映到权威快照」的凭据（有界 10s 超时收口）。
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+pub struct MutationOutcome {
+    pub applied: bool,
+    pub version: u64,
+    pub epoch: u64,
+}
+
+/// 批量隐藏项（R1 一键清除）：字段 camelCase 对齐前端 invoke 载荷
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DismissItem {
+    pub agent_type: String,
+    pub session_id: String,
+    pub status: String,
+}
+
+/// 批量变更内核（R1，测试可直调）：逐项按**未读池权威**分流——
+/// 未读卡走已读语义（与单卡 mark_session_read 同口径），其余写进程内 dismiss 集合；
+/// 全部变更完成后**只补扫一次**（N 张卡 ≠ N 次扫描）。
+///
+/// F5：`request_epoch` 必须在**任何变更之前**捕获（入口第一行）——`applied=false`
+/// 时前端以 epoch 更大的快照事件作为变更已反映的凭据；若在变更后才捕获，在飞旧快照
+/// 的 epoch 可能已越过捕获值，前端会提前清 pending 导致卡片复活。
+fn apply_dismissals(
+    items: Vec<DismissItem>,
+    emit_read: impl Fn(&str, &str),
+) -> crate::adapter::scan_bus::MutationScan {
+    let request_epoch = crate::adapter::scan_bus::scan_epoch();
+    let now = chrono::Utc::now().timestamp_millis();
+    let unread: std::collections::HashSet<(String, String)> =
+        crate::database::dao::unread::list(now)
+            .into_iter()
+            .map(|r| (r.tool_id, r.session_id))
+            .collect();
+    let mut to_dismiss = Vec::new();
+    for it in items {
+        let tool = it.agent_type.to_lowercase();
+        if unread.contains(&(tool.clone(), it.session_id.clone())) {
+            crate::database::dao::unread::delete(&tool, &it.session_id);
+            // issue #35-1：已读墓碑，防止缓存失忆后未读卡复活
+            crate::database::dao::unread::mark_read(&tool, &it.session_id);
+            emit_read(&it.agent_type, &it.session_id);
+        } else {
+            to_dismiss.push((tool, it.session_id, it.status.to_lowercase()));
+        }
+    }
+    if !to_dismiss.is_empty() {
+        let mut set = crate::monitor::SESSION_DISMISALS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for item in to_dismiss {
+            set.insert(item);
+        }
+    }
+    crate::adapter::scan_bus::scan_after_mutation(std::time::Duration::from_secs(2), request_epoch)
+}
+
 /// 手动关闭活跃 App 卡（T2 X 按钮，「暂离不提示」）：写入进程内 dismiss 集合，
 /// 从看板与宠物隐藏；同一会话状态变化后 key 不匹配自然重现。
 /// 不碰 unread_sessions 表（未读卡的 X 走 mark_session_read 已读语义）。
 /// status 用前端 SessionStatus 字符串（serde lowercase，如 "waiting"），
-/// 与 filter_dismissed_cards 的归一化（Debug 形态转小写）一致
+/// 与 filter_dismissed_cards 的归一化（Debug 形态转小写）一致。
+///
+/// R1：命令改为 async——变更本身是轻量内存写，**补扫**（可能等在飞 2s + 完整扫描）
+/// 放进阻塞线程池；同步命令在主线程跑扫描会冻结全部窗口 IPC。
 #[tauri::command]
-pub fn dismiss_session_card(agent_type: String, session_id: String, status: String) {
-    crate::monitor::SESSION_DISMISALS.lock().unwrap().insert((
-        agent_type.to_lowercase(),
+pub async fn dismiss_session_card(
+    app: tauri::AppHandle,
+    agent_type: String,
+    session_id: String,
+    status: String,
+) -> MutationOutcome {
+    // R9：单卡与批量共用 apply_dismissals（未读池权威分流 + 一次补扫），
+    // 避免两条路径对「未读卡 X = 已读」的判定漂移
+    let item = DismissItem {
+        agent_type,
         session_id,
-        status.to_lowercase(),
-    ));
+        status,
+    };
+    // F5：命令入口（任何变更之前）的纪元——阻塞任务异常时回执仍可被前端 epoch 门控
+    let request_epoch = crate::adapter::scan_bus::scan_epoch();
+    // R1：完整扫描（可能等在飞 2s）放进阻塞线程池，命令本身不跑扫描
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        apply_dismissals(vec![item], |agent_type, session_id| {
+            let _ = app.emit(
+                "session-read",
+                serde_json::json!({ "agentType": agent_type, "sessionId": session_id }),
+            );
+        })
+    })
+    .await;
+    match result {
+        Ok(result) => MutationOutcome {
+            applied: result.applied,
+            version: result.snapshot.version,
+            epoch: result.request_epoch,
+        },
+        Err(e) => {
+            ::log::error!("dismiss 变更后补扫任务异常: {e}");
+            MutationOutcome {
+                applied: false,
+                version: crate::adapter::scan_bus::version(),
+                epoch: request_epoch,
+            }
+        }
+    }
+}
+
+/// 一键清除（R1）：批量隐藏/标已读，全部变更完成后只补扫一次。
+/// 未读卡的「X」是已读语义（spec W4）——按未读池权威判定，与单卡命令同口径。
+#[tauri::command]
+pub async fn dismiss_session_cards(
+    app: tauri::AppHandle,
+    items: Vec<DismissItem>,
+) -> MutationOutcome {
+    // F5：命令入口（任何变更之前）的纪元（与单卡同口径）
+    let request_epoch = crate::adapter::scan_bus::scan_epoch();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        apply_dismissals(items, |agent_type, session_id| {
+            let _ = app.emit(
+                "session-read",
+                serde_json::json!({ "agentType": agent_type, "sessionId": session_id }),
+            );
+        })
+    })
+    .await;
+    match result {
+        Ok(r) => MutationOutcome {
+            applied: r.applied,
+            version: r.snapshot.version,
+            epoch: r.request_epoch,
+        },
+        Err(e) => {
+            ::log::error!("一键清除补扫任务异常: {e}");
+            MutationOutcome {
+                applied: false,
+                version: crate::adapter::scan_bus::version(),
+                epoch: request_epoch,
+            }
+        }
+    }
 }
 
 /// R5 一键 resume（桌面卡「在电脑上打开」）：按 session_id 在当前快照里找会话，
 /// 交 inject::resume 核心开终端恢复（Windows wt/conhost、macOS iTerm2/Terminal）。
-/// 数据同源：直调 adapter::get_all_sessions（与看板同一份快照）；id 跨工具撞名取
-/// 第一个匹配（远端 session-open 端点同口径）。命令表未收录的工具 / 无 cwd 由核心
-/// 返回哨兵串，转译为前端可展示的中文文案；本机路径不写审计（audit_write 需设备
-/// 身份，审计口径 = 远端设备动作留痕，见 inject::resume 模块注释）。
-/// 评审 M3：扫描 + 核心并进同一 spawn_blocking——核心内 `where wt` 首调探测是
-/// 同步进程等待，留在闭包里不占 tokio worker。
+/// 数据同源：动作路径经扫描总线的 ensure_fresh 取新鲜快照（龄超 2s 则补扫并等待，
+/// 上限 3s；超时按现有快照降级继续），与看板同一份数据；id 跨工具撞名取第一个
+/// 匹配（远端 session-open 端点同口径）。命令表未收录的
+/// 工具 / 无 cwd 由核心返回哨兵串，转译为前端可展示的中文文案；本机路径不写审计
+/// （audit_write 需设备身份，审计口径 = 远端设备动作留痕，见 inject::resume 模块注释）。
+/// 评审 M3：快照读取 + 核心并进同一 spawn_blocking——核心内 `where wt` 首调探测是
+/// 同步进程等待，留在闭包里不占 tokio worker（冷启动兜底扫描同样不进主线程）。
 #[tauri::command]
 pub async fn session_open(app: tauri::AppHandle, session_id: String) -> Result<(), String> {
     let sid = session_id.trim().to_string();
@@ -385,11 +751,16 @@ pub async fn session_open(app: tauri::AppHandle, session_id: String) -> Result<(
     tauri::async_runtime::spawn_blocking(move || {
         // mut：T3 信任归一在 spawn 前原地改写 project_path（claude 专属，只读
         // ~/.claude.json 永不写）
-        let mut session = crate::adapter::get_all_sessions()
-            .sessions
-            .into_iter()
-            .find(|s| s.id == sid)
-            .ok_or_else(|| "会话不在当前列表（可能已退出）".to_string())?;
+        let mut session = crate::adapter::scan_bus::ensure_fresh(
+            std::time::Duration::from_secs(2),
+            std::time::Duration::from_secs(3),
+        )
+        .data
+        .sessions
+        .iter()
+        .find(|s| s.id == sid)
+        .cloned()
+        .ok_or_else(|| "会话不在当前列表（可能已退出）".to_string())?;
         // T3 信任归一：命中已信任条款复用其精确 casing（防 claude 信任弹窗挂起）。
         // 桌面发起 → 桌面 surface：不冒用会话状态卡浮窗（NotificationPayload 形态
         // 是会话卡，信任提醒非会话卡）——走系统通知 toast（consume_codex_trust_notice
@@ -473,7 +844,13 @@ pub fn kill_pid(pid: u32) -> Result<(), String> {
 
 #[tauri::command]
 pub fn kill_session(pid: u32) -> Result<(), String> {
-    kill_pid(pid)
+    let r = kill_pid(pid);
+    if r.is_ok() {
+        // F5 即时重算：进程已杀 → 动作补扫让该会话卡随新快照立即消失；
+        // 失败（进程已不在）不改动数据，无需补扫
+        crate::adapter::scan_bus::request_scan(crate::adapter::scan_bus::ScanReason::Action);
+    }
+    r
 }
 
 #[cfg(test)]
@@ -531,6 +908,85 @@ mod on_demand_tests {
             Some("cli"),
             false
         ));
+    }
+}
+
+#[cfg(test)]
+mod scan_watch_window_tests {
+    use super::normalize_watch_window;
+
+    /// 心跳窗口契约（Task 2）：缺省/空白 → "global"（老前端不带 window 仍兼容）；
+    /// 显式窗口标签原样保留（主窗 "main"、宠物浮窗 "pet"）
+    #[test]
+    fn defaults_to_global_and_trims_explicit_window() {
+        assert_eq!(normalize_watch_window(None), "global");
+        assert_eq!(normalize_watch_window(Some(String::new())), "global");
+        assert_eq!(normalize_watch_window(Some("   ".to_string())), "global");
+        assert_eq!(normalize_watch_window(Some("pet".to_string())), "pet");
+        assert_eq!(normalize_watch_window(Some(" main ".to_string())), "main");
+    }
+
+    /// Task 2：窗口级上升沿 → 恰好一次 Action 补扫（不得叠加周期扫描）；
+    /// 续期 / 单窗退出 / 下降沿都不得补扫
+    #[test]
+    fn watch_requests_action_scan_once_per_window_rising_edge() {
+        use crate::adapter::scan_bus::{self, ScanReason};
+        let _guard = scan_bus::test_guard();
+        scan_bus::reset_for_test();
+        let (tx, rx) = std::sync::mpsc::channel();
+        scan_bus::set_test_tx_for_test(Some(tx));
+
+        super::scan_bus_watch(Some("main".to_string()), true);
+        assert!(
+            matches!(rx.try_recv(), Ok(ScanReason::Action)),
+            "首次在看 → Action 补扫"
+        );
+        super::scan_bus_watch(Some("main".to_string()), true);
+        assert!(rx.try_recv().is_err(), "续期不得重复补扫");
+
+        super::scan_bus_watch(Some("pet".to_string()), true);
+        assert!(
+            matches!(rx.try_recv(), Ok(ScanReason::Action)),
+            "桌宠已展开时主窗聚焦 = 该窗口上升沿，也要补扫"
+        );
+
+        super::scan_bus_watch(Some("pet".to_string()), false);
+        assert!(rx.try_recv().is_err(), "退出不是上升沿");
+        super::scan_bus_watch(Some("pet".to_string()), true);
+        assert!(
+            matches!(rx.try_recv(), Ok(ScanReason::Action)),
+            "重新可见 = 该窗口上升沿"
+        );
+
+        super::scan_bus_watch(None, true);
+        assert!(
+            matches!(rx.try_recv(), Ok(ScanReason::Action)),
+            "老前端（无窗口标签）归入 global 源，首次在看同样补扫"
+        );
+        super::scan_bus_watch(None, true);
+        assert!(rx.try_recv().is_err(), "global 源续期不补扫");
+
+        scan_bus::set_test_tx_for_test(None);
+    }
+}
+
+#[cfg(test)]
+mod session_snapshot_lock_tests {
+    /// 源码锁：命令层不得再直调扫描（每请求全量扫描 = 前端 3 秒轮询下的 CPU 抖动
+    /// 根因），一律读 scan_bus 共享快照。
+    /// 断言串用 `concat!` 拼接：`include_str!` 会把本文件（含本测试）一并纳入被检
+    /// 源码，整串字面量直接写在断言里会自我命中——负向断言永远失败、正向断言永远
+    /// 通过（恒真恒假两条废锁）
+    #[test]
+    fn sessions_command_reads_snapshot_instead_of_scanning() {
+        let src = include_str!("session.rs");
+        let direct_scan = concat!("adapter::", "get_all_sessions");
+        let snapshot_read = concat!("scan_bus::", "current_or_scan");
+        assert!(
+            !src.contains(direct_scan),
+            "命令层不得再直调扫描；只允许读 scan_bus 共享快照"
+        );
+        assert!(src.contains(snapshot_read), "命令层应经共享快照读取会话");
     }
 }
 

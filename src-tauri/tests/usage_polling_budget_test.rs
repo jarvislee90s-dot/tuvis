@@ -6,9 +6,10 @@
 //! `#[cfg(test)]`（lib 单测）构建里存在，集成构建拿不到。所以「字面上的 0」只有在
 //! **一个从不触发采集的二进制**里才成立：本文件不得出现任何采集入口（下半部分的自省用例锁住）。
 //!
-//! 热路径 = 前端每 3 秒 `invoke("get_all_sessions")` → `commands::session::get_all_sessions`
-//! → `spawn_blocking(adapter::get_all_sessions)`。本用例直接调它的内核
-//! （`commands::session::get_all_sessions` 需要 `tauri::AppHandle`，测试里造不出来）。
+//! 热路径 = 前端轮询 `invoke("get_all_sessions")` → `commands::session::get_all_sessions`
+//! → `scan_bus::current_or_scan`（生产读共享快照）。本用例直接调兼容入口
+//! `adapter::get_all_sessions`（已委托 scan_bus；冷启动无快照时同步首扫）——
+//! `commands::session::get_all_sessions` 需要 `tauri::AppHandle`，测试里造不出来。
 
 mod support;
 

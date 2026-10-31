@@ -1,4 +1,5 @@
-// SessionWatcher：2s 周期快照 diff → broadcast（跃迁判定唯一去重点）
+// SessionWatcher：500ms 轮询扫描总线版本，版本变化时对快照 diff → broadcast
+// （跃迁判定唯一去重点）。watcher 不自行扫描——扫描归 adapter::scan_bus 单线程
 // 消费者（SSE/推送/桌面通知）只收边沿事件，不独立去重
 
 use std::collections::HashMap;
@@ -14,8 +15,9 @@ use crate::session::{Session, SessionStatus};
 /// watcher 生产；SSE 首帧全量快照可校正状态）
 pub const EVENT_CHANNEL_CAPACITY: usize = 64;
 
-/// 扫描周期（A3：状态变化 2 秒级到达）
-const SCAN_INTERVAL: Duration = Duration::from_secs(2);
+/// 版本轮询周期：只读一次原子量，代价可忽略；实际出卡节奏由扫描总线的节拍决定
+/// （watcher 自身不再是扫描者，故此处不设扫描周期）
+const VERSION_POLL: Duration = Duration::from_millis(500);
 
 /// 跃迁事件（wire 形状 = 移动端契约，评审 Important 1 修复）：字段一律 camelCase
 /// 序列化（与 Session 同款 rename_all）——Task 6 前端按 ev.sessionId / ev.agentType /
@@ -63,9 +65,10 @@ fn channel_at(
 pub struct SessionWatcher;
 
 impl SessionWatcher {
-    /// 启动 2s 周期 watcher，返回事件 broadcast sender（与 event_sender 同一通道）。
+    /// 启动 watcher 循环（500ms 轮询扫描总线版本），返回事件 broadcast sender
+    /// （与 event_sender 同一通道）。
     /// 幂等：循环存活期间重复调用复用既有任务、不重复 spawn（见 LOOP_HANDLE）。
-    /// 调用点必须在**服务器实际监听成功后**（serve 内 bind 之后）；绑定失败不留后台扫描。
+    /// 调用点必须在**服务器实际监听成功后**（serve 内 bind 之后）；绑定失败不留后台循环。
     pub fn start() -> broadcast::Sender<TransitionEvent> {
         let mut h = LOOP_HANDLE.lock().unwrap();
         start_with(&EVENT_TX, &mut h, |tx| {
@@ -101,52 +104,41 @@ fn start_with(
     tx
 }
 
-/// 周期任务主体：sleep → 单轮内核。sleep 在 scan_tick 之外，保持「守卫判断在 sleep 之后、
-/// 扫描之前」的节奏（零订阅者也保持 2s 节拍醒来轻量自检，CPU 代价为一次原子读）
+/// 循环主体：纯消费者——500ms 读一次扫描总线版本号，版本变化才 diff 共享快照并广播。
+/// 不再自行扫描（扫描归 adapter::scan_bus），本循环里没有阻塞重活，无需 spawn_blocking。
 async fn watch_loop(tx: broadcast::Sender<TransitionEvent>) {
     let mut prev: Vec<Session> = Vec::new();
+    let mut last_version = 0u64;
     loop {
-        tokio::time::sleep(SCAN_INTERVAL).await;
-        scan_tick(&tx, &mut prev, crate::adapter::get_all_sessions, now_ms).await;
+        tokio::time::sleep(VERSION_POLL).await;
+        // 零订阅者：不 diff、不保留基线（恢复订阅后从当前快照重建，不再为历史
+        // 状态刷一轮伪跃迁）；版本号照常推进，避免恢复订阅后做无谓的重放
+        if tx.receiver_count() == 0 {
+            prev.clear();
+            last_version = crate::adapter::scan_bus::version();
+            continue;
+        }
+        let v = crate::adapter::scan_bus::version();
+        if v == last_version {
+            continue;
+        }
+        last_version = v;
+        // 版本已推进但快照缺失（理论窗口：首次发布前）：本轮无数据可比，基线保持，
+        // 下轮以 prev 为比较起点——不重复做同一版本的工作
+        let Some(snap) = crate::adapter::scan_bus::snapshot() else {
+            continue;
+        };
+        for e in diff_transitions(&prev, &snap.data.sessions, now_ms()) {
+            // 订阅者可能在两轮之间断开（send 返回 Err）：正常，忽略
+            let _ = tx.send(e);
+        }
+        prev = snap.data.sessions.clone();
     }
 }
 
-/// 生产时钟（毫秒）；单测注入固定值
+/// 生产时钟（毫秒）
 fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
-}
-
-/// 单轮内核（可测：扫描与时钟注入）。**零订阅者守卫**（评审 Important 2）：
-/// 无人订阅（远程已关闭 / 所有 SSE 连接断开）时跳过本轮扫描——否则 watcher 反成
-/// 常驻唯一轮询者（桌面窗口隐藏时前端停轮询，watcher 仍在 2s 扫），违反 NFR
-/// 「监控扫描不拖慢桌面现有体验」。守卫在 sleep 之后、扫描之前，是单次原子读的零成本检查。
-/// 扫描在阻塞线程池执行（与 api.rs 的 sessions handler 同先例）：get_all_sessions 是
-/// 同步重活（sysinfo 全进程刷新 + 各工具会话解析），直接 await 会周期性堵死 tokio worker。
-/// 返回本轮是否执行了扫描（测试断言点）
-async fn scan_tick(
-    tx: &broadcast::Sender<TransitionEvent>,
-    prev: &mut Vec<Session>,
-    scan: impl FnOnce() -> crate::session::SessionsResponse + Send + 'static,
-    now_ms: impl FnOnce() -> i64,
-) -> bool {
-    if tx.receiver_count() == 0 {
-        return false; // 零订阅者：跳过扫描，基线保持（下轮订阅恢复后立即照常比对）
-    }
-    let resp = match tokio::task::spawn_blocking(scan).await {
-        Ok(resp) => resp,
-        Err(e) => {
-            // 扫描任务 panic（如 DB 锁中毒）：保留旧基线，下轮重试，任务不退出
-            log::error!("SessionWatcher 会话扫描任务异常: {e}");
-            return true; // 已尝试扫描（失败），不因单轮失败改变节拍语义
-        }
-    };
-    let now = now_ms();
-    for e in diff_transitions(prev, &resp.sessions, now) {
-        // 订阅者可能在扫描期间断开（send 返回 Err）：正常，忽略
-        let _ = tx.send(e);
-    }
-    *prev = resp.sessions;
-    true
 }
 
 /// 纯函数：快照 diff → 边沿事件（可单测；去重唯一来源）。
@@ -472,87 +464,20 @@ mod tests {
         handle_slot.lock().unwrap().as_ref().unwrap().abort(); // 清理 pending 任务
     }
 
-    /// 零订阅者守卫（评审 Important 2）：无人订阅时（远程已关闭 / SSE 全断）单轮内核
-    /// 必须跳过扫描——否则 watcher 反成常驻唯一轮询者（违反 NFR「监控扫描不拖慢桌面
-    /// 现有体验」）。有订阅者时正常扫描且事件广播到订阅端
-    #[tokio::test]
-    async fn scan_tick_skips_scanning_without_subscribers() {
-        let (tx, _) = broadcast::channel(64);
-        let scans = Arc::new(AtomicUsize::new(0));
-        let mut prev: Vec<Session> = Vec::new();
-
-        // (1) 零订阅者：扫描函数零调用（计数闭包证明），基线不变
-        let scanned = scan_tick(
-            &tx,
-            &mut prev,
-            {
-                let scans = scans.clone();
-                move || {
-                    scans.fetch_add(1, Ordering::SeqCst);
-                    crate::session::SessionsResponse {
-                        sessions: vec![],
-                        total_count: 0,
-                        waiting_count: 0,
-                    }
-                }
-            },
-            || 1,
-        )
-        .await;
-        assert!(!scanned, "零订阅者时本轮必须报告未扫描");
-        assert_eq!(
-            scans.load(Ordering::SeqCst),
-            0,
-            "零订阅者时扫描函数不得被调用"
+    /// 源码锁（Task 5）：watcher 只消费扫描总线快照，不得再自行扫描——否则进程内
+    /// 出现第二个轮询扫描者，违反「扫描总线是唯一扫描者」契约。注释里提及历史可以，
+    /// 可执行调用一律禁止。`concat!` 拆开字面量：include_str! 会把本测试自身读进
+    /// `src`，整串字面量会自我命中（永久红）
+    #[test]
+    fn watcher_source_does_not_call_get_all_sessions() {
+        let src = include_str!("watcher.rs");
+        assert!(
+            !src.contains(concat!("crate::adapter::", "get_all_sessions,")),
+            "watcher 不得再调用会话扫描（扫描已归 adapter::scan_bus）"
         );
-
-        // (2) 有订阅者：正常扫描、基线刷新、状态变化广播到订阅端
-        let mut rx = tx.subscribe();
-        let mut prev = vec![session("a", SessionStatus::Idle, "p")];
-        let scanned = scan_tick(
-            &tx,
-            &mut prev,
-            || crate::session::SessionsResponse {
-                sessions: vec![session("a", SessionStatus::Waiting, "p")],
-                total_count: 1,
-                waiting_count: 1,
-            },
-            || 777,
-        )
-        .await;
-        assert!(scanned, "有订阅者时必须执行扫描");
-        assert_eq!(prev.len(), 1, "基线应刷新为最新快照");
-        assert_eq!(prev[0].status, SessionStatus::Waiting);
-        let e = rx.try_recv().expect("状态变化应广播给订阅者");
-        assert_eq!(e.session_id, "a");
-        assert_eq!(e.from, "idle");
-        assert_eq!(e.to, "waiting");
-        assert_eq!(e.ts, 777, "ts 采用注入时钟（确定性断言）");
-
-        // (3) 订阅者断开（模拟 toggle 关闭 / SSE 断线）→ 恢复零扫描
-        drop(rx);
-        let scanned = scan_tick(
-            &tx,
-            &mut prev,
-            {
-                let scans = scans.clone();
-                move || {
-                    scans.fetch_add(1, Ordering::SeqCst);
-                    crate::session::SessionsResponse {
-                        sessions: vec![],
-                        total_count: 0,
-                        waiting_count: 0,
-                    }
-                }
-            },
-            || 1,
-        )
-        .await;
-        assert!(!scanned, "订阅者断开后应回到零扫描");
-        assert_eq!(
-            scans.load(Ordering::SeqCst),
-            0,
-            "订阅者断开后扫描函数不得被调用"
+        assert!(
+            !src.contains(concat!("crate::adapter::", "get_all_sessions()")),
+            "watcher 不得再调用会话扫描（扫描已归 adapter::scan_bus）"
         );
     }
 }

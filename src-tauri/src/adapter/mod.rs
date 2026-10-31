@@ -1,12 +1,15 @@
 // AgentAdapter trait + 枚举 + 会话发现调度器
 // 移植自 agent-sessions agent/mod.rs，扩展支持 Codex CLI/APP 和 OpenCode
 
+pub mod cadence;
 pub mod claude;
 pub mod codex;
 pub mod dsh;
 pub mod kimi;
 pub mod openclaw;
 pub mod opencode;
+pub mod scan_bus;
+pub mod wakeup;
 pub mod workbuddy;
 pub mod zcode;
 
@@ -16,8 +19,9 @@ use crate::session::{
 };
 use once_cell::sync::Lazy;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
-use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
+use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
 
 /// 读取 CLI grace period（秒），默认 5
 fn get_cli_grace_secs() -> i64 {
@@ -395,7 +399,7 @@ pub trait AgentAdapter: Send + Sync {
 
     /// 解析该工具的会话。**会话扫描预算契约**（详见 `monitor::session_scan` 模块文档
     /// 与 AGENTS.md「Agent Adapter 模式」）：
-    /// - L1 零进程零解析：编排层（`get_all_sessions`）保证本工具进程为空时**不会调用**
+    /// - L1 零进程零解析：编排层（`scan_bus` 的每轮扫描）保证本工具进程为空时**不会调用**
     ///   本方法，且有遍历全部注册 adapter 的防回归测试；实现侧仍应自带空判早退作
     ///   纵深防御；
     /// - L2/L3 文件类解析必须走 `monitor::session_scan::SessionFileScan`
@@ -516,20 +520,36 @@ pub fn all_adapters_with_ids() -> Vec<(&'static str, Box<dyn AgentAdapter>)> {
 /// 共享 System 实例 — 每轮询周期刷新一次，所有 adapter 共用
 static SHARED_SYSTEM: Mutex<Option<System>> = Mutex::new(None);
 
-/// get_all_sessions 单飞护栏（评审 R3）：主窗口与桌宠各自 3s 轮询，相位接近时
-/// 两请求并发进入同一段多秒扫描——堆叠放大 CPU/IO 峰值。try_lock 抢扫描权，
-/// 抢不到的请求立即返回最近一次快照（0=尚无快照时返回空响应，首窗口可接受）。
-/// 扫描完成时刷新快照。不做去抖定时器，保持"谁抢到谁全量扫"的最简单飞语义
-struct ScanFlight {
-    /// 扫描进行中标志（try_lock 竞争点）
-    in_flight: std::sync::Mutex<bool>,
-    /// 最近一次完整扫描结果（快照返回用；含时间戳便于日志诊断陈旧度）
-    last_snapshot: std::sync::Mutex<Option<(std::time::Instant, SessionsResponse)>>,
+/// 最近一轮「进程刷新段」耗时（毫秒）：扫描总线把它写入 scan_bus_stats.json，
+/// 作为 F8（≤25ms）验收的数据源（R4）
+static LAST_PROCESS_REFRESH_MS: AtomicU64 = AtomicU64::new(0);
+
+/// 最近一轮扫描中「有进程在跑」的工具 id（升序去重）。
+/// **唯一写入点**是 `get_all_sessions_inner` Phase 1 的 `find_processes` 结果——
+/// 每轮扫描本就要发现进程，这里只把已知事实暴露给 `scan_bus` 的节奏判定；
+/// 禁止为「未覆盖工具是否在跑」另起第二套进程扫描器（2026-10-31 用户裁决）。
+static RUNNING_TOOL_IDS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// 最近一轮在跑工具 id（升序去重；未扫描时为空）
+pub(crate) fn running_tool_ids() -> Vec<String> {
+    RUNNING_TOOL_IDS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
 }
-static SCAN_FLIGHT: Lazy<ScanFlight> = Lazy::new(|| ScanFlight {
-    in_flight: std::sync::Mutex::new(false),
-    last_snapshot: std::sync::Mutex::new(None),
-});
+
+/// 记录在跑工具（调用方只传工具 id；排序去重在此统一完成）
+fn record_running_tools<'a>(ids: impl Iterator<Item = &'a str>) {
+    let mut v: Vec<String> = ids.map(str::to_string).collect();
+    v.sort();
+    v.dedup();
+    *RUNNING_TOOL_IDS.lock().unwrap_or_else(|e| e.into_inner()) = v;
+}
+
+/// 最近一轮进程刷新耗时（毫秒）
+pub(crate) fn last_process_refresh_ms() -> u64 {
+    LAST_PROCESS_REFRESH_MS.load(Ordering::Relaxed)
+}
 
 /// 会话级去重：同一 (工具, session id) 只保留首张卡。
 /// 全局防线：任何解析器的"文件级/进程级复制"型 bug（如 opencode 多进程同会话、
@@ -539,43 +559,11 @@ pub fn dedup_sessions(sessions: &mut Vec<Session>) {
     sessions.retain(|s| seen.insert((s.agent_type.tool_id().to_string(), s.id.clone())));
 }
 
-/// 获取所有注册 adapter 的会话（单飞：并发请求直接复用最近快照）
+/// 兼容入口：委托扫描总线读共享快照（冷启动无快照时同步首扫）。
+/// 生产路径已统一走 `scan_bus`（单飞/版本/看门狗都在那里）；保留本函数给
+/// 集成测试与外部调用方，**不得**在此另起第二套单飞或快照。
 pub fn get_all_sessions() -> SessionsResponse {
-    // R3 单飞护栏：抢不到扫描权 → 返回上次快照，不排队不堆叠
-    let mut flying = SCAN_FLIGHT.in_flight.lock().unwrap();
-    if *flying {
-        let snap = SCAN_FLIGHT.last_snapshot.lock().unwrap();
-        if let Some((at, resp)) = snap.as_ref() {
-            log::debug!(
-                "get_all_sessions 单飞命中快照（扫描进行中，快照龄 {:?}）",
-                at.elapsed()
-            );
-            return resp.clone();
-        }
-        return SessionsResponse {
-            sessions: Vec::new(),
-            total_count: 0,
-            waiting_count: 0,
-        };
-    }
-    *flying = true;
-    drop(flying); // 先放手上的 in_flight 锁：Drop guard 析构时要重新拿它清位，
-                  // 不 drop 即自锁自等（本测试挂起事故的根因）
-                  // Drop guard：内层扫描 panic（如 DB 锁中毒 unwrap）时飞行位自动释放——
-                  // 若靠扫描返回后手动清位，一次 panic 即永久卡死单飞（看板冻结到重启），
-                  // 且把原失败模式（单次报错下轮重试）恶化成永久故障
-    let _guard = ScanFlightGuard;
-    let result = get_all_sessions_inner();
-    *SCAN_FLIGHT.last_snapshot.lock().unwrap() = Some((std::time::Instant::now(), result.clone()));
-    result
-}
-
-/// 扫描飞行位的 Drop 释放护栏（作用域结束/panic unwind 均自动清位）
-struct ScanFlightGuard;
-impl Drop for ScanFlightGuard {
-    fn drop(&mut self) {
-        *SCAN_FLIGHT.in_flight.lock().unwrap() = false;
-    }
+    crate::adapter::scan_bus::current_or_scan()
 }
 
 /// T8：问题事件的 tool_input 载荷提取（QuestionEntry 写标记时随行落库——questions
@@ -584,29 +572,268 @@ fn event_payload(event: Option<&crate::monitor::hooks::HookEvent>) -> Option<&st
     event.and_then(|e| e.tool_input.as_deref())
 }
 
-/// 实际扫描（单飞壳内执行；成功路径与原实现一致）
-fn get_all_sessions_inner() -> SessionsResponse {
-    // W5：未勾选工具不参与会话扫描（看板卡/通知随之静默）
-    let adapters: Vec<Box<dyn AgentAdapter>> = enabled_adapters();
+/// 进程名归一：取 basename（兼容 `/`、`\` 两种分隔符）→ 小写 → 去 `.exe`。
+/// sysinfo 各平台 name 形态不一（Windows 实测带 `.exe`，macOS 多为裸名），
+/// 候选匹配与白名单构建统一走此口径，避免大小写/扩展名差异导致漏配
+pub(crate) fn bare_name(name: &str) -> String {
+    let base = name
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(name)
+        .to_lowercase();
+    base.strip_suffix(".exe").unwrap_or(&base).to_string()
+}
 
-    // Phase 1: 刷新共享 System 快照，发现所有进程
-    let all_processes: Vec<Vec<AgentProcess>> = {
-        let mut guard = SHARED_SYSTEM.lock().unwrap();
-        let system = guard.get_or_insert_with(|| {
-            log::debug!("Initializing shared System instance");
-            System::new_with_specifics(
-                RefreshKind::nothing().with_processes(
-                    ProcessRefreshKind::nothing()
-                        .with_cmd(sysinfo::UpdateKind::Always)
-                        .with_cwd(sysinfo::UpdateKind::Always)
-                        // exe 路径是 Windows MSIX 形态判定（classify_form）的关键输入：
-                        // 缺失时 ChatGPT 内嵌 codex.exe 会被误判为 CLI（提权进程 cmd 也读不到）
-                        .with_exe(sysinfo::UpdateKind::Always)
-                        .with_cpu(),
-                ),
-            )
-        });
-        system.refresh_processes_specifics(
+/// npm-shim 宿主解释器：工具实际进程名常是解释器（node/bun 等），
+/// 两段式第二段必须读其 cmd 才能判定，宿主判定也须放行这些名字
+pub(crate) const INTERPRETER_PROCESS_NAMES: &[&str] = &["node", "bun", "python", "python3", "deno"];
+
+/// 工具 id → 宿主进程名（小写裸名）。**单一事实源**：两段式候选白名单与
+/// `monitor::host::tool_host_alive_in` 的预滤共用本表——表里漏一个名字，
+/// 第二段就不读该进程的 exe/cmd，宿主判不出、该工具整批卡片被过滤。
+/// 条目来源以 `monitor/host.rs::is_host_process` 的现有判据为准：
+/// - workbuddy：Windows 安装形态 WorkBuddy.exe；macOS 主可执行体是 Electron；
+/// - codex：Windows MSIX 桌面端 ChatGPT.exe / macOS chatgpt.app 主进程 / codex.app 主进程；
+/// - zcode：Electron APP 主进程可执行名恰为 ZCode（macOS）/ ZCode.exe（Windows）；
+/// - dsh：桌面宿主 DeepSeek Harness(.exe)；web 宿主是 node（解释器表覆盖，靠 cmdline 判定）。
+pub(crate) const HOST_PROCESS_NAMES: &[(&str, &[&str])] = &[
+    ("workbuddy", &["workbuddy", "electron"]),
+    ("codex", &["chatgpt", "codex"]),
+    ("zcode", &["zcode"]),
+    ("dsh", &["deepseek harness"]),
+];
+
+/// 该工具的宿主进程名表（未登记工具返回空表）
+pub(crate) fn host_process_names(tool_id: &str) -> &'static [&'static str] {
+    HOST_PROCESS_NAMES
+        .iter()
+        .find(|(id, _)| *id == tool_id)
+        .map(|(_, names)| *names)
+        .unwrap_or(&[])
+}
+
+/// 该进程名是否可能承载该工具的宿主：命中宿主名表，或（npm-shim 场景）是解释器
+pub(crate) fn name_may_host_tool(name: &str, tool_id: &str) -> bool {
+    INTERPRETER_PROCESS_NAMES.contains(&name) || host_process_names(tool_id).contains(&name)
+}
+
+/// 扫描候选进程名白名单（全部小写归一、升序去重）。
+///
+/// 两段式进程刷新的第一段只读名字层，第二段仅对候选 PID 读 cmd/cwd/exe/cpu。
+/// 白名单 = 解释器表（npm-shim 宿主）+ **宿主名表**（单一事实源，见
+/// [`HOST_PROCESS_NAMES`]）+ 全部 adapter 声明的 `process_names()`（经 [`bare_name`] 归一）。
+/// 宿主名表与 `monitor::host::tool_host_alive_in` 的预滤同源：这张表漏一个名字，
+/// 第二段就不读该进程的 exe/cmd，宿主判不出、该工具整批卡片被过滤。
+/// 取舍：macOS 上全部 Electron 应用都会进候选集（多读若干进程的 cmd/cwd/exe），
+/// 仍是全部进程的极小子集（约数十个），换取 WorkBuddy 桌面端不被误杀。
+pub(crate) fn candidate_process_names(adapter_names: &[&[&str]]) -> Vec<String> {
+    let mut v: Vec<String> = INTERPRETER_PROCESS_NAMES
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    for (_, host_names) in HOST_PROCESS_NAMES {
+        for n in *host_names {
+            v.push(bare_name(n));
+        }
+    }
+    for names in adapter_names {
+        for n in *names {
+            v.push(bare_name(n));
+        }
+    }
+    v.sort();
+    v.dedup();
+    v
+}
+
+/// Phase 1 两段式刷新的候选白名单（生产入口）。
+///
+/// 刻意取自 **全部已注册 adapter**（`all_adapters()`），而非 `enabled_adapters()`：
+/// 宿主存活判定（`filter_host_dead_cards` / `dead_tools_from_pool` →
+/// `tool_host_alive_in`）复用同一 SHARED_SYSTEM 快照并按 exe/cmd 判宿主——若白名单
+/// 只含已勾选工具，「已禁用但仍在运行」的工具进程在第二段不读 exe/cmd，其宿主会被
+/// 误判死亡，未读池行被清空且重新启用后无法恢复。会话解析（Phase 2）仍只走
+/// `enabled_adapters()`，停用工具的卡/通知保持静默。
+fn refresh_candidate_process_names() -> Vec<String> {
+    let lists: Vec<&[&str]> = all_adapters().iter().map(|a| a.process_names()).collect();
+    candidate_process_names(&lists)
+}
+
+/// 两段式进程刷新（Phase 1 内核；抽为函数供活体回归测试直调，行为与内联版一致）：
+/// 第一段全量刷名字层，第二段只对候选 PID 读 cmd/cwd/exe/cpu。返回候选进程数
+fn refresh_processes_two_stage(system: &mut System, wanted_names: &[String]) -> usize {
+    // 第一段：全量刷新名字层（进程枚举本身即带名字，无需额外系统调用）
+    system.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::nothing());
+
+    // 候选集 = 名字命中「解释器 + adapter 声明名 + 特殊宿主名」白名单。
+    // 非候选进程的 cmd/cwd/exe 保持为空：所有 adapter 的发现入口要么按名字命中
+    // （白名单已全覆盖），要么按 exe/cmd 判定（特殊宿主名已补白，见
+    // candidate_process_names 文档）
+    let candidates: Vec<sysinfo::Pid> = system
+        .processes()
+        .iter()
+        .filter(|(_, p)| {
+            wanted_names
+                .binary_search(&bare_name(&p.name().to_string_lossy()))
+                .is_ok()
+        })
+        .map(|(pid, _)| *pid)
+        .collect();
+
+    // 第二段：只对候选 PID（约 20–40 个）读昂贵字段。cmd/cwd/exe 一律 Always：
+    // Windows 上 sysinfo 不保证 PID 复用时清空缓存字段，OnlyIfNotSet 会让复用后的
+    // 新进程沿用旧进程的 cmd/cwd/exe（旧的全量 Always 策略靠每轮重读自愈）；候选集
+    // 很小，每轮重读代价可忽略。cpu 需每轮刷新以维持使用率统计
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&candidates),
+        false,
+        ProcessRefreshKind::nothing()
+            .with_cmd(sysinfo::UpdateKind::Always)
+            .with_cwd(sysinfo::UpdateKind::Always)
+            // exe 路径是 Windows MSIX 形态判定（classify_form）的关键输入：
+            // 缺失时 ChatGPT 内嵌 codex.exe 会被误判为 CLI（提权进程 cmd 也读不到）
+            .with_exe(sysinfo::UpdateKind::Always)
+            .with_cpu(),
+    );
+
+    candidates.len()
+}
+
+#[cfg(test)]
+mod candidate_whitelist_tests {
+    use super::*;
+
+    #[test]
+    fn candidate_names_include_interpreters_for_shim_hosts() {
+        let names = candidate_process_names(&[&["kimi"][..]]);
+        assert!(names.contains(&"node".to_string()));
+        assert!(names.contains(&"bun".to_string()));
+        assert!(names.contains(&"kimi".to_string()));
+    }
+
+    #[test]
+    fn candidate_names_cover_all_adapters_and_special_hosts() {
+        // 生产白名单入口（get_all_sessions_inner Phase 1 实际调用）必须覆盖全部
+        // 已注册 adapter 的 process_names（大小写归一后）。
+        // 禁用状态存 DB、纯测试不触库：这里锁定可静态验证的超集性质——enabled 集
+        // 是 all 集的子集，全部 adapter 名字都在白名单 ⇒ 任意「已禁用但仍在运行」
+        // 的工具也必在白名单内，其 exe/cmd 照常刷新（宿主存活判定不误杀未读池）。
+        let names = refresh_candidate_process_names();
+        for (id, adapter) in all_adapters_with_ids() {
+            for n in adapter.process_names() {
+                assert!(
+                    names.contains(&bare_name(n)),
+                    "工具 {id} 的进程名 {n} 未进生产候选白名单"
+                );
+            }
+        }
+        // 审计补白：名字不在 process_names、但按 exe/cmd 发现的特殊宿主
+        for special in [
+            "zcode",
+            "workbuddy",
+            "chatgpt",
+            "deepseek harness",
+            "electron",
+        ] {
+            assert!(
+                names.contains(&special.to_string()),
+                "特殊宿主名 {special} 未进候选白名单"
+            );
+        }
+        // 确定性：升序且无重复（二分查找与稳定输出依赖此不变量）
+        assert!(
+            names.windows(2).all(|w| w[0] < w[1]),
+            "候选白名单须有序去重"
+        );
+    }
+
+    /// Fix 5：宿主名表是**单一事实源**——两段式候选白名单与宿主存活判定共用它。
+    /// 表驱动、零进程依赖：白名单漏一个宿主名 → 第二段不读其 exe/cmd → 该工具
+    /// 整批卡片被过滤（历史事故），本用例在无任何工具运行的机器上也必须通过。
+    #[test]
+    fn host_process_names_are_all_in_candidate_whitelist() {
+        let names = candidate_process_names(&[]);
+        for (tool, hosts) in HOST_PROCESS_NAMES {
+            assert!(!hosts.is_empty(), "{tool} 的宿主名表不得为空");
+            for host in *hosts {
+                let bare = bare_name(host);
+                assert_eq!(
+                    bare, *host,
+                    "宿主名表条目必须是已归一的小写裸名（{tool}/{host}）"
+                );
+                assert!(
+                    names.contains(&bare),
+                    "{tool} 的宿主名 {host} 未进候选白名单（两段式不会读其 exe/cmd，宿主判不出）"
+                );
+                assert!(
+                    name_may_host_tool(&bare, tool),
+                    "{tool} 的宿主名 {host} 必须通过宿主判定预滤"
+                );
+                assert!(
+                    host_process_names(tool).contains(host),
+                    "{tool} 的宿主判定必须取自同一张表"
+                );
+            }
+        }
+        // npm-shim 宿主：工具实际进程名是解释器，候选白名单与宿主判定都要放行
+        for interp in INTERPRETER_PROCESS_NAMES {
+            assert!(
+                names.contains(&interp.to_string()),
+                "解释器 {interp} 未进候选白名单"
+            );
+            assert!(
+                name_may_host_tool(interp, "dsh"),
+                "dsh web 宿主可能是解释器进程（{interp}）"
+            );
+            assert!(
+                name_may_host_tool(interp, "workbuddy"),
+                "npm-shim 工具的宿主可能是解释器进程（{interp}）"
+            );
+        }
+        // 负例：不相干的进程名不得被宿主预滤放行
+        assert!(!name_may_host_tool("codex", "workbuddy"));
+        assert!(!name_may_host_tool("explorer", "zcode"));
+        assert!(
+            host_process_names("unknown-tool").is_empty(),
+            "未登记工具不得凭空获得宿主名"
+        );
+    }
+
+    #[test]
+    fn candidate_names_are_normalized_to_bare_lowercase() {
+        let names = candidate_process_names(&[&["Codex", "Kimi.exe"][..]]);
+        assert!(names.contains(&"codex".to_string()));
+        assert!(names.contains(&"kimi".to_string()));
+        assert!(!names.contains(&"Codex".to_string()));
+        assert_eq!(bare_name("C:\\Program Files\\OpenAI\\Codex.EXE"), "codex");
+        assert_eq!(bare_name("/usr/local/bin/python3"), "python3");
+        // 特殊宿主名的生产形态必须归一成白名单口径（空格 + .exe / 包路径）
+        assert_eq!(
+            bare_name("D:\\Program Files\\Deepseek-Harness\\DeepSeek Harness.exe"),
+            "deepseek harness"
+        );
+        assert_eq!(
+            bare_name("/Applications/WorkBuddy.app/Contents/MacOS/Electron"),
+            "electron"
+        );
+    }
+
+    /// 活体回归（Task 11 核心验收）：全量刷新（旧路径）与两段式（新路径）
+    /// 在两个独立 System 上各跑一次，两段式的发现结果不得丢掉全量刷新已发现、
+    /// 且在两段式快照中仍然存活的进程——白名单漏名（如特殊宿主）会在此暴露。
+    ///
+    /// 机器相关：未运行的工具在两边均为 0，自然通过；只对「全量发现 ∧ 两段式
+    /// 快照仍存活」的 pid 断言覆盖，规避两次扫描间隙进程启停的抖动
+    #[test]
+    fn two_stage_refresh_preserves_all_adapter_discovery() {
+        let adapters = all_adapters();
+        // 直调生产白名单入口（全部注册 adapter），与 get_all_sessions_inner 同源
+        let wanted_names = refresh_candidate_process_names();
+
+        // 旧路径：一次全量刷新（cmd/cwd/exe/cpu 全读）
+        let mut full = System::new();
+        let full_started = std::time::Instant::now();
+        full.refresh_processes_specifics(
             ProcessesToUpdate::All,
             true,
             ProcessRefreshKind::nothing()
@@ -615,9 +842,116 @@ fn get_all_sessions_inner() -> SessionsResponse {
                 .with_exe(sysinfo::UpdateKind::Always)
                 .with_cpu(),
         );
+        let full_elapsed = full_started.elapsed();
+
+        // 新路径：两段式刷新（生产函数直调）
+        let mut two_stage = System::new();
+        let two_stage_started = std::time::Instant::now();
+        let candidate_count = refresh_processes_two_stage(&mut two_stage, &wanted_names);
+        let two_stage_elapsed = two_stage_started.elapsed();
+
+        eprintln!(
+            "two-stage: {} processes, {} candidates, full refresh {:?} vs two-stage {:?}",
+            two_stage.processes().len(),
+            candidate_count,
+            full_elapsed,
+            two_stage_elapsed
+        );
+
+        for adapter in &adapters {
+            let expected = adapter.find_processes(&full);
+            let actual = adapter.find_processes(&two_stage);
+            eprintln!(
+                "{}: two-stage={} full={}",
+                adapter.name(),
+                actual.len(),
+                expected.len()
+            );
+
+            // 发现的每个进程都必须仍在快照中且名字非空（发现链路未读到野 pid）
+            for p in &actual {
+                let proc = two_stage
+                    .process(sysinfo::Pid::from_u32(p.pid))
+                    .unwrap_or_else(|| panic!("{} 发现 pid {} 不在快照中", adapter.name(), p.pid));
+                assert!(
+                    !proc.name().is_empty(),
+                    "{} 发现 pid {} 名字为空",
+                    adapter.name(),
+                    p.pid
+                );
+            }
+
+            // 旧路径发现、且新快照仍存活的进程必须在新路径同样被覆盖；
+            // 同时其名字必须在白名单内（否则即白名单漏名——第二段不会读它的 exe/cmd）
+            let actual_pids: HashSet<u32> = actual.iter().map(|p| p.pid).collect();
+            for p in &expected {
+                let Some(proc) = two_stage.process(sysinfo::Pid::from_u32(p.pid)) else {
+                    continue; // 两次扫描间隙退出：不判定
+                };
+                let name = bare_name(&proc.name().to_string_lossy());
+                assert!(
+                    wanted_names.binary_search(&name).is_ok(),
+                    "{} 发现进程 {}（pid={}）不在候选白名单",
+                    adapter.name(),
+                    name,
+                    p.pid
+                );
+                assert!(
+                    actual_pids.contains(&p.pid),
+                    "{} 两段式丢失存活进程 pid={}",
+                    adapter.name(),
+                    p.pid
+                );
+            }
+        }
+    }
+}
+
+/// 实际扫描（单飞壳内执行；成功路径与原实现一致）
+pub(crate) fn get_all_sessions_inner() -> SessionsResponse {
+    // W5：未勾选工具不参与会话扫描（看板卡/通知随之静默）
+    let adapters: Vec<Box<dyn AgentAdapter>> = enabled_adapters();
+
+    // Phase 1: 两段式刷新共享 System 快照，发现所有进程。
+    // 全量进程（约 400+）逐个读 cmd/cwd/exe/cpu 是本轮扫描的主要 CPU 开销，
+    // 而 adapter 的发现入口只关心「名字命中白名单」的少量进程——先全量刷名字层，
+    // 再只对候选 PID 读昂贵字段（Task 11 第二刀）
+    let all_processes: Vec<Vec<AgentProcess>> = {
+        let mut guard = SHARED_SYSTEM.lock().unwrap();
+        // 首次初始化只建空 System（廉价）；字段由下面两段刷新填充
+        let system = guard.get_or_insert_with(System::new);
+        let refresh_started = std::time::Instant::now();
+
+        // 候选白名单取自**全部注册 adapter**（非 enabled_adapters）：停用但仍在运行
+        // 的工具也须刷新 exe/cmd，否则宿主存活判定误杀其未读池行
+        // （详见 refresh_candidate_process_names 文档）
+        let candidate_names = refresh_candidate_process_names();
+        let candidate_count = refresh_processes_two_stage(system, &candidate_names);
+
+        // Task 12 验收测量入口（≤25ms）：保持 DEBUG，不得升 INFO 逐轮刷屏。
+        // R4：同时写入 stats 原子量（scan_bus_stats.json 的 last_process_refresh_ms）
+        let refresh_elapsed = refresh_started.elapsed();
+        LAST_PROCESS_REFRESH_MS.store(refresh_elapsed.as_millis() as u64, Ordering::Relaxed);
+        log::debug!(
+            "scan: process refresh（两段式）耗时 {:?}，进程 {}，候选 {}",
+            refresh_elapsed,
+            system.processes().len(),
+            candidate_count
+        );
 
         adapters.iter().map(|a| a.find_processes(system)).collect()
     }; // 释放 System 锁 — 下方文件 I/O 无需持锁
+
+    // 记录「本轮在跑的工具」：dsh/openclaw 无事件唤醒覆盖，scan_bus 据本信号把
+    // 节奏下限锁在 Idle 10s（不进 Away 30s 盲区）。直接复用 Phase 1 已算出的
+    // 每 adapter 进程列表，不额外扫描进程（用户裁决 2026-10-31）。
+    record_running_tools(
+        adapters
+            .iter()
+            .zip(all_processes.iter())
+            .filter(|(_, processes)| !processes.is_empty())
+            .map(|(adapter, _)| adapter.agent_type().tool_id()),
+    );
 
     // Phase 2: 解析会话（文件 I/O）
     let mut all_sessions: Vec<Session> = Vec::new();
@@ -630,7 +964,9 @@ fn get_all_sessions_inner() -> SessionsResponse {
         } else {
             adapter.find_sessions(processes)
         };
-        log::info!(
+        // 每个 adapter 每轮一行，INFO 会按轮次无限刷屏（挂机档 30s/轮也照涨），降为 DEBUG；
+        // 人工排障所需的跃迁信息仍由 scan_bus 的 `mode →` INFO 承担
+        log::debug!(
             "{}: {} processes, {} sessions",
             adapter.name(),
             processes.len(),
@@ -862,70 +1198,35 @@ fn get_all_sessions_inner() -> SessionsResponse {
     }
 }
 
-/// R3 单飞护栏的测试互斥锁（跨模块共享）：直接操纵全局 SCAN_FLIGHT 的测试与
-/// 真实扫描类测试（会重置飞行位/快照，含 tests::test_get_all_sessions）互斥——
-/// cargo 默认并行测试下两个真实 get_all_sessions 同时起跑会互踩快照/飞行位
-/// （flight_released 断言 !in_flight 时另一测试的扫描仍在飞即红，评审 R6）
-#[cfg(test)]
-static SCAN_FLIGHT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-/// R3 单飞护栏测试：占住飞行位时第二请求返回快照而不进入扫描
-#[cfg(test)]
-mod scan_flight_tests {
-    use super::*;
-
-    #[test]
-    fn concurrent_request_reuses_snapshot_without_rescan() {
-        let _g = SCAN_FLIGHT_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        // 预置快照
-        let snapshot = SessionsResponse {
-            sessions: Vec::new(),
-            total_count: 7,
-            waiting_count: 0,
-        };
-        *SCAN_FLIGHT.last_snapshot.lock().unwrap() = Some((std::time::Instant::now(), snapshot));
-
-        // 占住飞行位（模拟另一请求正在扫描）
-        *SCAN_FLIGHT.in_flight.lock().unwrap() = true;
-
-        // 并发请求：应直接返回快照（total_count=7 来自快照而非真实扫描）
-        let resp = get_all_sessions();
-        assert_eq!(resp.total_count, 7, "单飞命中应返回最近快照");
-
-        // 清理：释放飞行位（真实扫描会重置快照，不影响其他测试）
-        *SCAN_FLIGHT.in_flight.lock().unwrap() = false;
-    }
-
-    #[test]
-    fn flight_released_after_scan_completes() {
-        let _g = SCAN_FLIGHT_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        // 正常调用：进入扫描并释放飞行位 + 刷新快照
-        let resp = get_all_sessions();
-        assert!(
-            !*SCAN_FLIGHT.in_flight.lock().unwrap(),
-            "扫描完成后飞行位应释放"
-        );
-        let snap = SCAN_FLIGHT.last_snapshot.lock().unwrap();
-        assert!(snap.is_some(), "扫描完成后应刷新快照");
-        assert_eq!(snap.as_ref().unwrap().1.total_count, resp.total_count);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// Fix 7 回归锁：旧入口 `adapter::get_all_sessions` 只允许**委托扫描总线**
+    /// （单飞/快照/panic 自愈由 scan_bus 统一负责），不得保留第二套单飞护栏。
+    /// 字面量用 concat! 拆分：include_str! 会把本测试自身纳入扫描面。
+    #[test]
+    fn get_all_sessions_is_a_thin_scan_bus_delegate() {
+        let src = include_str!("mod.rs");
+        let start = src
+            .find(concat!("pub fn get_all_", "sessions()"))
+            .expect("兼容入口缺失");
+        let body = &src[start..(start + 500).min(src.len())];
+        assert!(
+            body.contains(concat!("scan_bus::", "current_or_scan")),
+            "旧入口必须委托 scan_bus::current_or_scan，实际: {body}"
+        );
+        assert!(
+            !src.contains(concat!("SCAN_", "FLIGHT")),
+            "不得保留第二套单飞护栏（scan_bus 已是唯一扫描者）"
+        );
+    }
+
     #[test]
     fn test_get_all_sessions() {
-        // 与 scan_flight_tests 共用 SCAN_FLIGHT_TEST_LOCK：本测试触发真实
-        // get_all_sessions（刷新快照/飞行位），不互斥则并行起跑互踩（评审 R6）
-        let _g = SCAN_FLIGHT_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
+        // 委托入口会写 scan_bus 进程级快照：与 scan_bus 测试共用全局锁，
+        // 避免并行起跑时插进对方「种子 → 精确版本断言」窗口
+        let _g = crate::adapter::scan_bus::test_guard();
         let response = get_all_sessions();
         eprintln!("=== SESSION SCAN ===");
         eprintln!(
@@ -1953,7 +2254,7 @@ enum UnreadPoolAction {
 }
 
 /// 判定未读池动作。prev_status 为状态缓存中的上一轮状态
-/// （Debug 格式，与 get_all_sessions 末尾的统一更新一致）
+/// （Debug 格式，与扫描末尾的统一更新一致）
 fn unread_pool_action(prev_status: Option<&str>, idle: bool) -> UnreadPoolAction {
     if !idle {
         return UnreadPoolAction::None;
@@ -1982,7 +2283,7 @@ fn insert_allowed(prev_status: Option<&str>, was_read_recently: bool) -> bool {
 /// - 过期（24h）→ 清理
 /// - 数据驱动持久绿卡工具（Codex APP / ZCode，P1-3 通用化）：聚合卡即该会话的
 ///   「未读卡」形态——池有行时标记 unread=true（徽标/「未读卡排后」生效），
-///   已读删行后由 get_all_sessions 的前置过滤剔除，闭环「被已读信号清除」
+///   已读删行后由每轮扫描的前置过滤剔除，闭环「被已读信号清除」
 fn sync_unread_sessions(active: &mut Vec<Session>) {
     let now_ms = chrono::Utc::now().timestamp_millis();
 
@@ -2518,6 +2819,32 @@ mod dedup_tests {
         assert_eq!(sessions.len(), 2);
         assert_eq!(sessions[0].pid, 111); // 保留首张
         assert_eq!(sessions[1].id, "ses_B");
+    }
+}
+
+#[cfg(test)]
+mod running_tools_tests {
+    use super::*;
+
+    /// 在跑工具记录：排序去重、整体覆盖写（本轮无进程的工具必须消失，
+    /// 否则 dsh 退出后节奏仍被锁在 Idle）。持 scan_bus 全局锁，避免与
+    /// reset_for_test 的清理并发。
+    #[test]
+    fn running_tools_are_sorted_deduped_and_replaced() {
+        let _guard = crate::adapter::scan_bus::test_guard();
+        record_running_tools(["dsh", "claude", "dsh"].into_iter());
+        assert_eq!(
+            running_tool_ids(),
+            vec!["claude".to_string(), "dsh".to_string()]
+        );
+        record_running_tools(["openclaw"].into_iter());
+        assert_eq!(
+            running_tool_ids(),
+            vec!["openclaw".to_string()],
+            "每轮必须整体覆盖：上一轮在跑、本轮退出的工具不得残留"
+        );
+        record_running_tools(std::iter::empty());
+        assert!(running_tool_ids().is_empty());
     }
 }
 

@@ -145,10 +145,37 @@ async fn mobile_index() -> Response {
 /// 活跃连接句柄表（clippy::type_complexity 门禁适配：复杂类型抽别名，语义同原稿内联形）
 type DeviceConns = std::collections::HashMap<String, Vec<(u64, tokio::sync::oneshot::Sender<()>)>>;
 
+/// 活跃 SSE 连接计数（Task 4 评审修订）：扫描线程的「远控在线」口径只需一个全局布尔，
+/// **不得**为它解引用 `remote::STATE`——那会在扫描线程上首次触发 DeviceStore /
+/// CodexControlHub / CreateTaskHub 的惰性装配（Windows 上 `CodexControlHub::production`
+/// 还要做一次 sysinfo 枚举 + AppxManifest 读盘），且 STATE 初始化若 panic 会把 Lazy
+/// 永久污染，让在线判定此后每次调用都 panic。计数与 [`SseRegistry`] 的增删**一一对应**
+/// （register +1；仅实际移除的条目 -1），故恒不小于 0。
+static SSE_CONNS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// 是否存在任一活跃 SSE 连接（纯原子读：不加锁、不触任何 Lazy）。
+/// 在线口径的消费方见 `remote::is_online_now`（扫描线程每个档位读一次）
+pub fn any_connection() -> bool {
+    SSE_CONNS.load(std::sync::atomic::Ordering::SeqCst) > 0
+}
+
+/// 计数递减（**防下溢**）：只对真实移除的条数调用；即便将来出现配对失衡，
+/// `saturating_sub` 也只会把计数压在 0——回绕成巨值会让在线口径永久为真、节奏永不降档
+fn release_connections(n: usize) {
+    if n > 0 {
+        let _ = SSE_CONNS.fetch_update(
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+            |cur| Some(cur.saturating_sub(n)),
+        );
+    }
+}
+
 /// SSE 连接注册表（M4 T0a）：device_id → 活跃连接句柄表。
 /// 断连语义：吊销/停止时对目标设备的全部连接发 oneshot 关闭信号，
 /// SSE 流的 `take_until` 收到信号即终止 → axum 关闭该 HTTP 连接；
-/// 自然断开（客户端关页）由 CleanupStream 的 Drop 反注册。
+/// 自然断开（客户端关页）由 [`SseConnGuard`] 的 Drop 反注册
+/// （R6 起 CleanupStream 只持有守卫，不再自带 Drop 反注册）。
 /// 锁粒度：单 Mutex 短临界区（register/unregister/disconnect 均无 IO），
 /// 不与 store/pairing 锁嵌套（锁序红线：registry 永远最后进最先出）。
 #[derive(Default)]
@@ -165,28 +192,41 @@ impl SseRegistry {
             .next_id
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let (tx, rx) = tokio::sync::oneshot::channel();
-        self.inner
-            .lock()
-            .unwrap()
-            .entry(device.to_string())
-            .or_default()
-            .push((id, tx));
+        {
+            // 插入条目与在线计数 +1 必须在**同一临界区**内完成：若先释放注册表锁再计数，
+            // 并发的 disconnect_*（或紧随其后的自然断开）可能在计数还是 0 时就递减
+            // （saturating 到 0），随后本次 +1 把计数留在 1 而注册表里已无对应条目，
+            // unregister 无从修复 → any_connection() 永久为真、节奏永不降档。
+            let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            guard.entry(device.to_string()).or_default().push((id, tx));
+            // 在线计数 +1（与下表条目严格配对；读侧 server::any_connection）
+            SSE_CONNS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
         (id, rx)
     }
 
     /// 自然断开反注册（幂等：未知 id 静默忽略）。
-    /// 写法适配（clippy::option_map_unit_fn 门禁）：原稿 `.map(|v| …)` 改 `if let`，语义不变
+    /// 写法适配（clippy::option_map_unit_fn 门禁）：原稿 `.map(|v| …)` 改 `if let`，语义不变。
+    /// **只有真的摘掉了一条**才递减在线计数（重复 Drop / 未知 id 不得多减）
     pub fn unregister(&self, device: &str, id: u64) {
-        if let Some(v) = self.inner.lock().unwrap().get_mut(device) {
-            v.retain(|(i, _)| *i != id);
-        }
+        // 摘除与计数递减同持一把锁：先减后放锁会给并发 register 留下「条目已无、计数未减」的窗口
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let removed = match guard.get_mut(device) {
+            Some(v) => {
+                let before = v.len();
+                v.retain(|(i, _)| *i != id);
+                before - v.len()
+            }
+            None => 0,
+        };
+        release_connections(removed);
     }
 
     /// 断开指定设备的全部连接，返回断开数
     pub fn disconnect_device(&self, device: &str) -> usize {
-        self.inner
-            .lock()
-            .unwrap()
+        // 移除与计数递减同持一把锁（避免释放锁后、减计数前与 register 交错的计数漂移）
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let removed = guard
             .remove(device)
             .map(|v| {
                 // 编译适配（oneshot::Sender::send 消费 self，不能按引用迭代 send）：
@@ -197,12 +237,14 @@ impl SseRegistry {
                 }
                 n
             })
-            .unwrap_or(0)
+            .unwrap_or(0);
+        release_connections(removed);
+        removed
     }
 
     /// 断开全部设备连接（停止远程 / 全部吊销），返回断开数
     pub fn disconnect_all(&self) -> usize {
-        let mut map = self.inner.lock().unwrap();
+        let mut map = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let n: usize = map.values().map(Vec::len).sum();
         // 编译适配（send 消费 Sender，需持所有权迭代）：drain 等价于原稿的
         // 「逐个 send 后 map.clear()」
@@ -211,6 +253,8 @@ impl SseRegistry {
                 let _ = tx.send(());
             }
         }
+        // drain 与计数递减同持一把锁（guard 在本行之后才随函数返回释放）
+        release_connections(n);
         n
     }
 
@@ -218,19 +262,18 @@ impl SseRegistry {
     pub fn has(&self, device: &str) -> bool {
         self.inner
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .get(device)
             .is_some_and(|v| !v.is_empty())
     }
 }
 
 /// 自然断开清理包装：axum drop SSE 流时反注册注册表项（不留陈旧句柄泄漏）。
-/// pub(crate) + 字段同可见性（编译适配）：api.rs（兄弟模块）按简报原稿以字段字面量构造
+/// R6：反注册语义下沉到 [`SseConnGuard`]（Drop 即反注册），本包装只负责持有守卫。
 pub(crate) struct CleanupStream<S> {
     pub(crate) inner: S,
-    pub(crate) reg: std::sync::Arc<SseRegistry>,
-    pub(crate) device: String,
-    pub(crate) conn_id: u64,
+    /// Drop 即反注册；正常建流后由本流持有，连接结束才释放
+    pub(crate) _conn: SseConnGuard,
 }
 impl<S: futures::Stream> futures::Stream for CleanupStream<S> {
     type Item = S::Item;
@@ -244,9 +287,40 @@ impl<S: futures::Stream> futures::Stream for CleanupStream<S> {
         unsafe { self.map_unchecked_mut(|s| &mut s.inner).poll_next(cx) }
     }
 }
-impl<S> Drop for CleanupStream<S> {
+
+/// SSE 连接守卫（R6）：register 即持有，Drop 即反注册。
+///
+/// 在事件 handler 中应于 `watcher_tx.subscribe()` 之后、快照 await **之前**创建：
+/// - 握手期客户端断开 → handler future 被 drop → 守卫 Drop → 反注册（不泄漏计数）；
+/// - 快照等待期间 disconnect_all/吊销 → 守卫已在注册表里，能收到关闭信号（无吊销窗口）；
+/// - 正常建流后守卫移入 [`CleanupStream`]，连接生命周期结束才反注册。
+pub(crate) struct SseConnGuard {
+    registry: std::sync::Arc<SseRegistry>,
+    device: String,
+    id: u64,
+}
+
+impl SseConnGuard {
+    /// 注册一条连接：返回 (守卫, 关闭信号接收端)
+    pub(crate) fn register(
+        registry: &std::sync::Arc<SseRegistry>,
+        device: &str,
+    ) -> (Self, tokio::sync::oneshot::Receiver<()>) {
+        let (id, close_rx) = registry.register(device);
+        (
+            Self {
+                registry: registry.clone(),
+                device: device.to_string(),
+                id,
+            },
+            close_rx,
+        )
+    }
+}
+
+impl Drop for SseConnGuard {
     fn drop(&mut self) {
-        self.reg.unregister(&self.device, self.conn_id);
+        self.registry.unregister(&self.device, self.id);
     }
 }
 
@@ -479,8 +553,14 @@ pub type SubagentMessageSourceFn =
     dyn Fn(&str, &str, usize) -> Result<crate::remote::content::MessagesPage, String> + Send + Sync;
 
 pub struct RemoteState {
-    /// 会话数据源（P8 同源）：生产 = adapter::get_all_sessions；测试注入
+    /// 会话数据源（P8 同源）：生产 = scan_bus::current_or_scan（读共享快照）；
+    /// 测试注入。**显示路径**用本缝（不触发补扫，陈旧上限 = 扫描档位）
     pub session_source: Box<dyn Fn() -> crate::session::SessionsResponse + Send + Sync>,
+    /// 动作路径专用：保证快照新鲜（显示路径仍用 session_source 读旧快照）。
+    /// 生产 = scan_bus::ensure_fresh（龄超 2s 补扫并等待，上限 3s；超时降级用现有
+    /// 快照并告警）。发送/中断/问答/恢复/会话定位等**会写终端**的端点和注入队列
+    /// 只消费本缝——绝不拿陈旧快照定位会话后动手
+    pub fresh_session_source: Box<dyn Fn() -> crate::session::SessionsResponse + Send + Sync>,
     /// C7 配对不确定信号缝（spec §5）：运行进程的 (工具, 项目) 表——/sessions 打标
     /// `pairingAmbiguous`、session-send 成功回执附 `pairingHint`（**只提示不拦截**）。
     /// 生产 = sysinfo 全量快照 + 桌面跳转门同款 `running_projects_from_processes`
@@ -824,7 +904,7 @@ pub async fn serve(bind: &str, port: u16, state: Arc<RemoteState>) -> Result<(),
         .map_err(|e| format!("RSERVER_BIND_FAIL: 绑定 {bind}:{port} 失败: {e}"))?;
     // M3 Task 5：事件桥在**绑定成功后**启动（幂等——全局 Once 保证扫描循环全进程只
     // spawn 一次）。放在 bind 之后：端口被占等启动失败不遗留 2s 会话扫描（扫描是重活，
-    // 见 adapter::get_all_sessions 的单飞护栏注释）；watcher 生命周期随进程结束，
+    // 单飞与节奏见 adapter::scan_bus）；watcher 生命周期随进程结束，
     // stop_server 不显式停止（关闭远程后循环仍扫描，为已有取舍）
     super::watcher::SessionWatcher::start();
     // M7 Task 6：注入 flush 循环接线（Task 5 交付的循环体在此合入编译）——订阅同一
@@ -864,6 +944,11 @@ mod tests {
             subagent_message_source: std::collections::HashMap::new(),
             capability_table: crate::inject::capability::new_table(),
             session_source: Box::new(|| crate::session::SessionsResponse {
+                sessions: vec![],
+                total_count: 7,
+                waiting_count: 0,
+            }),
+            fresh_session_source: Box::new(|| crate::session::SessionsResponse {
                 sessions: vec![],
                 total_count: 7,
                 waiting_count: 0,
@@ -1524,6 +1609,14 @@ mod tests {
                     waiting_count: 0,
                 }
             }),
+            fresh_session_source: Box::new(|| {
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                crate::session::SessionsResponse {
+                    sessions: vec![],
+                    total_count: 42,
+                    waiting_count: 0,
+                }
+            }),
             store: crate::remote::pairing::DeviceStore::memory(),
             // M7 Task 5：注入器缝——端点测试不触 flush 路径，用生产占位（Windows 为 Err 桩）
             injector: std::sync::Arc::new(crate::inject::engine::RealInjector),
@@ -1613,7 +1706,8 @@ mod tests {
     }
 
     // ==== M3 Task 6：GET /m/api/v1/events（SSE 实时通道，C1 后半） ====
-    // 零污染：会话源经注入缝（假 SessionsResponse）、事件源经注入的空 broadcast 通道。
+    // 零污染：会话源自 Task 6 起改为 scan_bus 共享快照（不再读注入缝），故用
+    // [`seed_scan_bus_snapshot`] 预发布假快照；事件源经注入的空 broadcast 通道。
     // SSE 是长连接流式响应：**不能用 body_string（collect 会等流结束、永久挂起）**，
     // 只逐帧读（BodyExt::frame），够断言首帧快照与增量帧即可，读完即 drop（连接关闭）。
 
@@ -1628,6 +1722,22 @@ mod tests {
             .into_data()
             .unwrap_or_else(|_| panic!("SSE 应产生数据帧（非 trailers）"));
         String::from_utf8(bytes.to_vec()).expect("SSE 帧应为 UTF-8")
+    }
+
+    /// 预发布 scan_bus 共享快照（SSE 测试专用）：Task 6 起 /events 首帧走
+    /// `scan_bus::ensure_fresh`（不再直调 `session_source` 注入缝），测试无法再经
+    /// state 注入内容——预发布同一份快照即可①钉住首帧内容（totalCount=7）并验证
+    /// `version` 字段在场，②避免用例触发真实机器扫描（零 ~/.tuvis 接触、首帧无需等补扫）。
+    /// **调用方必须已持 `scan_bus::test_guard()`**：seed 写的是 scan_bus 进程级
+    /// `LAST`/`VERSION`，与 `scan_bus::tests` 的 `reset_for_test` 并发会互相插队
+    /// （reset 落在 seed 与 ensure_fresh 之间 → 用例落到真实补扫；seed 抬版本 →
+    /// 打断 reset 侧的精确版本断言）。本函数不自行加锁（否则持锁调用方死锁）。
+    fn seed_scan_bus_snapshot() {
+        crate::adapter::scan_bus::publish_for_test(|| crate::session::SessionsResponse {
+            sessions: vec![],
+            total_count: 7,
+            waiting_count: 0,
+        });
     }
 
     /// 预置有效设备（SSE 测试专用：复用 state_with_clock 的注入缝，零接触真实设备表）。
@@ -1668,11 +1778,22 @@ mod tests {
     }
 
     /// SSE 端点主链（控制者③）：认证后 200 + text/event-stream + 首帧 `event: snapshot`
-    /// 携带全量会话（注入源 totalCount=7 ⇒ 数据同源），随后 watcher_tx 上的事件以
-    /// `event: transition` + camelCase JSON 送达（wire 契约端到端锁定）
+    /// 携带全量会话（预发布 scan_bus 快照 totalCount=7 ⇒ 数据同源）与 `version`
+    /// （客户端对账用），随后 watcher_tx 上的事件以 `event: transition` + camelCase
+    /// JSON 送达（wire 契约端到端锁定）
     #[tokio::test]
+    // 刻意持「串行票据」跨 await（与 remote/tunnel.rs 测试同一先例）：本用例读写
+    // scan_bus 进程级 LAST/VERSION，必须与 scan_bus::tests 的 reset 互斥；tokio::test
+    // 是单线程 runtime，await 期间无任何路径重入 TEST_LOCK（生产代码不认识测试锁，
+    // ensure_fresh 落 scan_once 也不取它），不存在死锁。
+    #[allow(clippy::await_holding_lock)]
     async fn sse_events_streams_snapshot_then_transitions() {
+        // 持 scan_bus 全局测试锁覆盖「种子 → 首帧断言」全程：否则 scan_bus::tests 的
+        // reset_for_test 可能插在 seed 与 ensure_fresh 之间（首帧落到真实 scan_once、
+        // 触碰真实 ~/.tuvis），或本用例的 seed 抬高版本打断对方的精确版本断言。
+        let _guard = crate::adapter::scan_bus::test_guard();
         let state = test_state();
+        seed_scan_bus_snapshot();
         persist_device(&state, "ev");
         let app = router(state.clone());
         let r = app
@@ -1692,7 +1813,8 @@ mod tests {
         );
 
         let mut body = r.into_body();
-        // 首帧：全量快照（event: snapshot + SessionsResponse JSON，数据来自注入源）
+        // 首帧：全量快照（event: snapshot + SessionsResponse JSON，数据来自 scan_bus
+        // 共享快照，见 seed_scan_bus_snapshot）+ 扫描总线发布版本 version
         let first = next_frame(&mut body).await;
         assert!(
             first.starts_with("event: snapshot\n"),
@@ -1700,7 +1822,11 @@ mod tests {
         );
         assert!(
             first.contains("\"totalCount\":7"),
-            "首帧快照必须直调 session_source（注入源 totalCount=7），实际 {first:?}"
+            "首帧快照必须来自 scan_bus 共享快照（预发布 totalCount=7），实际 {first:?}"
+        );
+        assert!(
+            first.contains("\"version\":"),
+            "首帧快照必须携带 version（扫描总线发布版本，客户端对账/纠偏用），实际 {first:?}"
         );
 
         // 增量帧：watcher_tx 发一条跃迁 → transition 帧 + camelCase 键（前端按
@@ -1735,10 +1861,74 @@ mod tests {
         );
     }
 
+    /// R6：快照等待期间连接已注册（早注册 + RAII），吊销/停服必须能关断本连接。
+    /// 旧实现快照完成后才注册，等待窗口内 disconnect_all 对本连接无效。
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn sse_disconnect_during_snapshot_wait_closes_stream() {
+        let _sse = SSE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::adapter::scan_bus::test_guard();
+        crate::adapter::scan_bus::reset_for_test();
+        // 慢快照：无缓存 + 在飞占位（handler 内 ensure_fresh 等满 5s 上限）
+        crate::adapter::scan_bus::set_in_flight_for_test(true);
+        // 与握手用例同款：注入扫描通道，慢快照不依赖在飞位的并行状态
+        let (_tx, _rx) = std::sync::mpsc::channel();
+        crate::adapter::scan_bus::set_test_tx_for_test(Some(_tx));
+        let state = test_state();
+        persist_device(&state, "ev-hold");
+        let app = router(state.clone());
+        let handle = tokio::spawn(async move {
+            app.oneshot(req(
+                "GET",
+                "/m/api/v1/events",
+                Some("mam_device=ev-hold"),
+                None,
+            ))
+            .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            any_connection(),
+            "快照等待期间连接应已注册（否则吊销/停服对该连接无效）"
+        );
+        assert_eq!(
+            state.sse_registry.disconnect_device("ev-hold"),
+            1,
+            "吊销必须能命中等待中的连接"
+        );
+        assert!(!any_connection(), "吊销后连接计数应立即归零");
+        let disconnected_at = std::time::Instant::now();
+        let resp = tokio::time::timeout(std::time::Duration::from_secs(8), handle)
+            .await
+            .expect("handler 超时")
+            .expect("handler panic")
+            .expect("oneshot 失败");
+        assert!(
+            disconnected_at.elapsed() < std::time::Duration::from_secs(2),
+            "R9：吊销必须在快照等待中被中断（实际 {:?}；未 select 时会等满 5s 补扫上限）",
+            disconnected_at.elapsed()
+        );
+        let mut body = resp.into_body();
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(2), body.frame())
+            .await
+            .expect("吊销后流未在 2s 内结束");
+        assert!(
+            frame.is_none(),
+            "吊销信号已到，SSE 流必须立即结束（不得再出快照帧）"
+        );
+        crate::adapter::scan_bus::set_in_flight_for_test(false);
+        crate::adapter::scan_bus::set_test_tx_for_test(None);
+    }
+
     // ---- SseRegistry 单元（M4 T0a）----
+
+    /// Fix 3 测试互斥：`any_connection()` 读的是进程级计数，注册表单元用例与 SSE
+    /// 握手用例必须串行——否则断言窗口内会看到对方注册/反注册造成的计数抖动。
+    static SSE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn sse_registry_register_then_disconnect_device() {
+        let _sse = SSE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let reg = SseRegistry::default();
         let (id1, mut rx1) = reg.register("dev-a");
         let (_id2, rx2) = reg.register("dev-a");
@@ -1757,6 +1947,7 @@ mod tests {
 
     #[test]
     fn sse_registry_sender_dropped_when_entry_replaced_by_disconnect() {
+        let _sse = SSE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let reg = SseRegistry::default();
         // 编译适配（E0596）：try_recv 需 &mut self，原稿 rx 未加 mut
         let (_id, mut rx) = reg.register("dev");
@@ -1769,8 +1960,16 @@ mod tests {
     // ---- 吊销即时断流集成（SSE 流随 disconnect 终止）----
 
     #[tokio::test]
+    // 同上：跨 await 持测试锁是本用例的隔离手段，非死锁风险（单线程 runtime，
+    // 无重入 TEST_LOCK 的路径）
+    #[allow(clippy::await_holding_lock)]
     async fn sse_stream_ends_when_device_disconnected() {
+        // 同 sse_events_streams_snapshot_then_transitions：种子/首帧期间持 scan_bus
+        // 全局测试锁，禁止 scan_bus::tests 的 reset 并发插队（首帧不得落真实补扫）
+        let _guard = crate::adapter::scan_bus::test_guard();
         let state = test_state();
+        // 预发布共享快照：首帧不必等真实补扫（本用例 2s 首帧超时 < ensure_fresh 3s 等待上限）
+        seed_scan_bus_snapshot();
         // 直通配对拿有效 cookie（复用既有 pair 流程的简化版：直接 persist 一个设备）
         state.store.with(|c| {
             let _ = crate::remote::pairing::persist_device(
@@ -1814,6 +2013,48 @@ mod tests {
             .await
             .expect("断连后流未在 2s 内结束");
         assert!(end.is_none());
+    }
+
+    /// Fix 3/R6 回归：**握手期断开**（快照未就绪时客户端已走）不得泄漏连接计数。
+    /// R6 起用 `SseConnGuard` 在快照 await 之前注册、Drop 即反注册；handler future
+    /// 在慢快照等待期被丢弃时守卫随之释放。此处用「在飞占位 + 注入扫描通道」制造
+    /// 确定性的慢快照，100ms 后丢弃 handler future 模拟连接关闭，断言计数 2s 内归零。
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn sse_handshake_aborted_before_snapshot_does_not_leak_connection() {
+        let _sse = SSE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::adapter::scan_bus::test_guard();
+        crate::adapter::scan_bus::reset_for_test();
+        crate::adapter::scan_bus::set_in_flight_for_test(true);
+        // 同时注入扫描通道：ensure_fresh 走「等待补扫」路径（3s 上限），
+        // 不依赖在飞位是否被并行用例清掉——前提窗口确定性成立
+        let (_tx, _rx) = std::sync::mpsc::channel();
+        crate::adapter::scan_bus::set_test_tx_for_test(Some(_tx));
+        let state = test_state();
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("cookie", "mam_device=ev-slow".parse().unwrap());
+        let fut = crate::remote::api::events(axum::extract::State(state), headers);
+        // 前提：快照必须仍处于未就绪（在飞等待中），否则本用例测不到握手窗口
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), fut)
+                .await
+                .is_err(),
+            "前提：快照应仍在等待中（在飞占位未被提前释放）"
+        );
+        // 2s 内计数回到 0（容忍其他测试的瞬时连接，最多重试 2s）
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while any_connection() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(
+            !any_connection(),
+            "握手期断开不得泄漏 SSE 连接计数（注册必须后置于快照完成）"
+        );
+        // 收尾：先发布快照再释放在飞位——后台仍在等待的 spawn_blocking 会直接拿到
+        // 该快照，不会落到真实扫描（零 ~/.tuvis 接触）
+        seed_scan_bus_snapshot();
+        crate::adapter::scan_bus::set_in_flight_for_test(false);
+        crate::adapter::scan_bus::set_test_tx_for_test(None);
     }
 
     // ==== M5 A4：吊销收窄（gate 级回归） ====
@@ -1914,6 +2155,11 @@ mod tests {
             subagent_message_source: std::collections::HashMap::new(),
             capability_table: crate::inject::capability::new_table(),
             session_source: Box::new(|| crate::session::SessionsResponse {
+                sessions: vec![],
+                total_count: 0,
+                waiting_count: 0,
+            }),
+            fresh_session_source: Box::new(|| crate::session::SessionsResponse {
                 sessions: vec![],
                 total_count: 0,
                 waiting_count: 0,
@@ -2351,6 +2597,11 @@ mod tests {
                 total_count: 0,
                 waiting_count: 0,
             }),
+            fresh_session_source: Box::new(|| crate::session::SessionsResponse {
+                sessions: vec![],
+                total_count: 0,
+                waiting_count: 0,
+            }),
             store: crate::remote::pairing::DeviceStore::memory(),
             // M7 Task 5：注入器缝——端点测试不触 flush 路径，用生产占位（Windows 为 Err 桩）
             injector: std::sync::Arc::new(crate::inject::engine::RealInjector),
@@ -2572,7 +2823,15 @@ mod tests {
             subagent_source: std::collections::HashMap::new(),
             subagent_message_source: std::collections::HashMap::new(),
             capability_table: crate::inject::capability::new_table(),
-            session_source: Box::new(move || crate::session::SessionsResponse {
+            session_source: Box::new({
+                let session = session.clone();
+                move || crate::session::SessionsResponse {
+                    sessions: vec![session.clone()],
+                    total_count: 1,
+                    waiting_count: 0,
+                }
+            }),
+            fresh_session_source: Box::new(move || crate::session::SessionsResponse {
                 sessions: vec![session.clone()],
                 total_count: 1,
                 waiting_count: 0,
@@ -2883,7 +3142,15 @@ mod tests {
             subagent_source: std::collections::HashMap::new(),
             subagent_message_source: std::collections::HashMap::new(),
             capability_table: crate::inject::capability::new_table(),
-            session_source: Box::new(move || crate::session::SessionsResponse {
+            session_source: Box::new({
+                let session = session.clone();
+                move || crate::session::SessionsResponse {
+                    sessions: vec![session.clone()],
+                    total_count: 1,
+                    waiting_count: 0,
+                }
+            }),
+            fresh_session_source: Box::new(move || crate::session::SessionsResponse {
                 sessions: vec![session.clone()],
                 total_count: 1,
                 waiting_count: 0,
@@ -3070,6 +3337,11 @@ mod tests {
                 subagent_message_source: std::collections::HashMap::new(),
                 capability_table: crate::inject::capability::new_table(),
                 session_source: Box::new(|| crate::session::SessionsResponse {
+                    sessions: vec![],
+                    total_count: 7,
+                    waiting_count: 0,
+                }),
+                fresh_session_source: Box::new(|| crate::session::SessionsResponse {
                     sessions: vec![],
                     total_count: 7,
                     waiting_count: 0,
@@ -4291,6 +4563,11 @@ mod tests {
                         total_count: 0,
                         waiting_count: 0,
                     }),
+                    fresh_session_source: Box::new(|| crate::session::SessionsResponse {
+                        sessions: vec![],
+                        total_count: 0,
+                        waiting_count: 0,
+                    }),
                     store: crate::remote::pairing::DeviceStore::memory(),
                     // M7 Task 5：注入器缝——端点测试不触 flush 路径，用生产占位（Windows 为 Err 桩）
                     injector: std::sync::Arc::new(crate::inject::engine::RealInjector),
@@ -4645,7 +4922,15 @@ mod tests {
             subagent_source: std::collections::HashMap::new(),
             subagent_message_source: std::collections::HashMap::new(),
             capability_table: crate::inject::capability::new_table(),
-            session_source: Box::new(move || crate::session::SessionsResponse {
+            session_source: Box::new({
+                let sessions = sessions.clone();
+                move || crate::session::SessionsResponse {
+                    sessions: sessions.clone(),
+                    total_count: sessions.len(),
+                    waiting_count: 0,
+                }
+            }),
+            fresh_session_source: Box::new(move || crate::session::SessionsResponse {
                 sessions: sessions.clone(),
                 total_count: sessions.len(),
                 waiting_count: 0,
@@ -4884,7 +5169,15 @@ mod tests {
             subagent_source: std::collections::HashMap::new(),
             subagent_message_source: std::collections::HashMap::new(),
             capability_table: crate::inject::capability::new_table(),
-            session_source: Box::new(move || crate::session::SessionsResponse {
+            session_source: Box::new({
+                let sessions = sessions.clone();
+                move || crate::session::SessionsResponse {
+                    sessions: sessions.clone(),
+                    total_count: sessions.len(),
+                    waiting_count: 0,
+                }
+            }),
+            fresh_session_source: Box::new(move || crate::session::SessionsResponse {
                 sessions: sessions.clone(),
                 total_count: sessions.len(),
                 waiting_count: 0,
@@ -5056,7 +5349,16 @@ mod tests {
     ) -> Arc<RemoteState> {
         let mut st = test_state();
         let s = Arc::get_mut(&mut st).expect("test_state 独占引用");
-        s.session_source = Box::new(move || crate::session::SessionsResponse {
+        s.session_source = Box::new({
+            let sessions = sessions.clone();
+            move || crate::session::SessionsResponse {
+                sessions: sessions.clone(),
+                total_count: sessions.len(),
+                waiting_count: 0,
+            }
+        });
+        // 动作路径同源（Task 4）：镜像 session_source 的数据
+        s.fresh_session_source = Box::new(move || crate::session::SessionsResponse {
             sessions: sessions.clone(),
             total_count: sessions.len(),
             waiting_count: 0,
@@ -7062,7 +7364,15 @@ mod tests {
             subagent_source: std::collections::HashMap::new(),
             subagent_message_source: std::collections::HashMap::new(),
             capability_table: crate::inject::capability::new_table(),
-            session_source: Box::new(move || crate::session::SessionsResponse {
+            session_source: Box::new({
+                let sessions = sessions.clone();
+                move || crate::session::SessionsResponse {
+                    sessions: sessions.clone(),
+                    total_count: sessions.len(),
+                    waiting_count: 0,
+                }
+            }),
+            fresh_session_source: Box::new(move || crate::session::SessionsResponse {
                 sessions: sessions.clone(),
                 total_count: sessions.len(),
                 waiting_count: 0,
@@ -8103,7 +8413,15 @@ mod tests {
             subagent_source: std::collections::HashMap::new(),
             subagent_message_source: std::collections::HashMap::new(),
             capability_table: crate::inject::capability::new_table(),
-            session_source: Box::new(move || crate::session::SessionsResponse {
+            session_source: Box::new({
+                let session = session.clone();
+                move || crate::session::SessionsResponse {
+                    sessions: vec![session.clone()],
+                    total_count: 1,
+                    waiting_count: 0,
+                }
+            }),
+            fresh_session_source: Box::new(move || crate::session::SessionsResponse {
                 sessions: vec![session.clone()],
                 total_count: 1,
                 waiting_count: 0,
@@ -11317,7 +11635,15 @@ mod tests {
             subagent_source: std::collections::HashMap::new(),
             subagent_message_source: std::collections::HashMap::new(),
             capability_table: crate::inject::capability::new_table(),
-            session_source: Box::new(move || crate::session::SessionsResponse {
+            session_source: Box::new({
+                let sessions = sessions.clone();
+                move || crate::session::SessionsResponse {
+                    sessions: sessions.clone(),
+                    total_count: sessions.len(),
+                    waiting_count: 0,
+                }
+            }),
+            fresh_session_source: Box::new(move || crate::session::SessionsResponse {
                 sessions: sessions.clone(),
                 total_count: sessions.len(),
                 waiting_count: 0,
@@ -11847,6 +12173,17 @@ mod tests {
                 total_count: 1,
                 waiting_count: 0,
             });
+            // 动作路径同源（Task 4）：镜像 session_source 的数据
+            s.fresh_session_source = Box::new(|| crate::session::SessionsResponse {
+                sessions: vec![inj_sess(
+                    "live-1",
+                    crate::session::AgentType::Codex,
+                    1,
+                    crate::session::SessionStatus::Waiting,
+                )],
+                total_count: 1,
+                waiting_count: 0,
+            });
             persist_device(&st, "arch");
             let app = crate::remote::server::router(st);
             let r = app
@@ -11975,7 +12312,16 @@ mod tests {
         fn state_with_sessions(sessions: Vec<crate::session::Session>) -> Arc<RemoteState> {
             let mut st = test_state();
             let s = std::sync::Arc::get_mut(&mut st).expect("test_state 独占引用");
-            s.session_source = Box::new(move || crate::session::SessionsResponse {
+            s.session_source = Box::new({
+                let sessions = sessions.clone();
+                move || crate::session::SessionsResponse {
+                    total_count: sessions.len(),
+                    waiting_count: 0,
+                    sessions: sessions.clone(),
+                }
+            });
+            // 动作路径同源（Task 4）：镜像 session_source 的数据
+            s.fresh_session_source = Box::new(move || crate::session::SessionsResponse {
                 total_count: sessions.len(),
                 waiting_count: 0,
                 sessions: sessions.clone(),
@@ -12074,7 +12420,16 @@ mod tests {
             let mut st = test_state();
             {
                 let s = std::sync::Arc::get_mut(&mut st).expect("独占");
-                s.session_source = Box::new(move || crate::session::SessionsResponse {
+                s.session_source = Box::new({
+                    let sessions = sessions.clone();
+                    move || crate::session::SessionsResponse {
+                        total_count: 1,
+                        waiting_count: 0,
+                        sessions: sessions.clone(),
+                    }
+                });
+                // 动作路径同源（Task 4）：镜像 session_source 的数据
+                s.fresh_session_source = Box::new(move || crate::session::SessionsResponse {
                     total_count: 1,
                     waiting_count: 0,
                     sessions: sessions.clone(),
@@ -12442,7 +12797,15 @@ mod tests {
             subagent_source: std::collections::HashMap::new(),
             subagent_message_source: std::collections::HashMap::new(),
             capability_table: crate::inject::capability::new_table(),
-            session_source: Box::new(move || crate::session::SessionsResponse {
+            session_source: Box::new({
+                let session = session.clone();
+                move || crate::session::SessionsResponse {
+                    sessions: vec![session.clone()],
+                    total_count: 1,
+                    waiting_count: 0,
+                }
+            }),
+            fresh_session_source: Box::new(move || crate::session::SessionsResponse {
                 sessions: vec![session.clone()],
                 total_count: 1,
                 waiting_count: 0,
@@ -12727,6 +13090,14 @@ mod tests {
             subagent_message_source: std::collections::HashMap::new(),
             capability_table: crate::inject::capability::new_table(),
             session_source: {
+                let s = codex_sess.clone();
+                Box::new(move || crate::session::SessionsResponse {
+                    sessions: vec![s.clone()],
+                    total_count: 1,
+                    waiting_count: 0,
+                })
+            },
+            fresh_session_source: {
                 let s = codex_sess.clone();
                 Box::new(move || crate::session::SessionsResponse {
                     sessions: vec![s.clone()],
@@ -13220,7 +13591,15 @@ mod tests {
             subagent_source: std::collections::HashMap::new(),
             subagent_message_source: std::collections::HashMap::new(),
             capability_table: crate::inject::capability::new_table(),
-            session_source: Box::new(move || crate::session::SessionsResponse {
+            session_source: Box::new({
+                let session = session.clone();
+                move || crate::session::SessionsResponse {
+                    sessions: vec![session.clone()],
+                    total_count: 1,
+                    waiting_count: 0,
+                }
+            }),
+            fresh_session_source: Box::new(move || crate::session::SessionsResponse {
                 sessions: vec![session.clone()],
                 total_count: 1,
                 waiting_count: 0,
@@ -13278,7 +13657,15 @@ mod tests {
             subagent_source: std::collections::HashMap::new(),
             subagent_message_source: std::collections::HashMap::new(),
             capability_table: crate::inject::capability::new_table(),
-            session_source: Box::new(move || crate::session::SessionsResponse {
+            session_source: Box::new({
+                let session = session.clone();
+                move || crate::session::SessionsResponse {
+                    sessions: vec![session.clone()],
+                    total_count: 1,
+                    waiting_count: 0,
+                }
+            }),
+            fresh_session_source: Box::new(move || crate::session::SessionsResponse {
                 sessions: vec![session.clone()],
                 total_count: 1,
                 waiting_count: 0,
@@ -13366,7 +13753,15 @@ mod tests {
             subagent_source: std::collections::HashMap::new(),
             subagent_message_source: std::collections::HashMap::new(),
             capability_table: crate::inject::capability::new_table(),
-            session_source: Box::new(move || crate::session::SessionsResponse {
+            session_source: Box::new({
+                let session = session.clone();
+                move || crate::session::SessionsResponse {
+                    sessions: vec![session.clone()],
+                    total_count: 1,
+                    waiting_count: 0,
+                }
+            }),
+            fresh_session_source: Box::new(move || crate::session::SessionsResponse {
                 sessions: vec![session.clone()],
                 total_count: 1,
                 waiting_count: 0,
@@ -14686,7 +15081,15 @@ mod tests {
             std::sync::Arc::new(std::sync::Mutex::new(screens.into()));
         let q = queue.clone();
         Arc::new(RemoteState {
-            session_source: Box::new(move || crate::session::SessionsResponse {
+            session_source: Box::new({
+                let sessions = sessions.clone();
+                move || crate::session::SessionsResponse {
+                    sessions: sessions.clone(),
+                    total_count: sessions.len(),
+                    waiting_count: 0,
+                }
+            }),
+            fresh_session_source: Box::new(move || crate::session::SessionsResponse {
                 sessions: sessions.clone(),
                 total_count: sessions.len(),
                 waiting_count: 0,
@@ -15659,6 +16062,11 @@ mod tests {
                 total_count: 7,
                 waiting_count: 0,
             }),
+            fresh_session_source: Box::new(|| crate::session::SessionsResponse {
+                sessions: vec![],
+                total_count: 7,
+                waiting_count: 0,
+            }),
             store: crate::remote::pairing::DeviceStore::memory(),
             injector: std::sync::Arc::new(crate::inject::engine::RealInjector),
             resume_spawner: std::sync::Arc::new(|_: &crate::inject::resume::SpawnSpec| Ok(())),
@@ -15819,6 +16227,11 @@ mod tests {
             subagent_message_source: fakes,
             capability_table: crate::inject::capability::new_table(),
             session_source: Box::new(|| crate::session::SessionsResponse {
+                sessions: vec![],
+                total_count: 7,
+                waiting_count: 0,
+            }),
+            fresh_session_source: Box::new(|| crate::session::SessionsResponse {
                 sessions: vec![],
                 total_count: 7,
                 waiting_count: 0,
@@ -16002,7 +16415,16 @@ mod tests {
             std::sync::Arc::new(|_, _| None),
         );
         let st = std::sync::Arc::get_mut(&mut state).expect("建造器返回独占引用");
-        st.session_source = Box::new(move || crate::session::SessionsResponse {
+        st.session_source = Box::new({
+            let sessions = sessions.clone();
+            move || crate::session::SessionsResponse {
+                total_count: sessions.len(),
+                waiting_count: 0,
+                sessions: sessions.clone(),
+            }
+        });
+        // 动作路径同源（Task 4）：镜像 session_source 的数据
+        st.fresh_session_source = Box::new(move || crate::session::SessionsResponse {
             total_count: sessions.len(),
             waiting_count: 0,
             sessions: sessions.clone(),

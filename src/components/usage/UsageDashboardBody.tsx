@@ -11,9 +11,11 @@
 // 不丢**（真机滚动保留的实机验证归 Task 13），React 状态（范围/筛选/折叠）自然保留。
 // `active=false`（页面隐藏）时**全部**用量读查询停发——含主体直连（settings/dashboard/
 // channelOptions/distribution/trend）、子组件透传（D 卡 costs/pricing、记录面板
-// records/identities/aliases）、`useUsageCollect` 的 settings 与兜底 ticker——因为
+// records/identities/aliases）、`useUsageCollect` 的可见即采——因为
 // queryClient 未禁 `refetchOnWindowFocus`，只有 `enabled:false` 能挡住隐藏页重聚焦时的
-// 隐性重查。重新可见后按原样恢复；默认 `active=true`，旧独立窗口用法行为不变。
+// 隐性重查。重新可见（active 的 false→true 边沿）时强制采集一次（模块级 60s 去抖，见
+// `lib/query/queries/usage.ts`）；兜底采集由后端 ticker 负责，与本页活跃状态无关。
+// 默认 `active=true`，旧独立窗口用法行为不变。
 //
 // 编排原则（不变）：
 //  * A/E 用旧 `useUsageDashboardQuery`（固定 tool 口径，仅供总览与工作活动）；
@@ -132,8 +134,9 @@ export function UsageDashboardBody({ active = true }: { active?: boolean }) {
   const [trendSelection, setTrendSelection] = useState<TrendSelection>({ scope: "all" });
 
   const range = rangeOf(preset, custom);
-  // 采集触发与兜底 ticker 都吃 active 门控：页面隐藏期间零采集零轮询（无 UI 兜底），
-  // 重新可见后恢复原间隔（Task 7；旧独立窗口恒 active=true 行为不变）
+  // 采集触发吃 active 门控：页面激活的 false→true 边沿强制采集一次（模块级 60s 去抖），
+  // 页面隐藏期间零采集；兜底采集由后端 ticker 负责，与页面活跃状态无关
+  // （Task 7/8/10；旧独立窗口恒 active=true 行为不变）
   useUsageCollect(active);
   const settings = useUsageSettingsQuery({ enabled: active });
 
