@@ -211,7 +211,7 @@ two-stage: 481 processes, 18 candidates, full refresh 64.1178ms vs two-stage 35.
 
 - 档位间隔：**Active 2s / Idle 10s / Away 30s**（`src-tauri/src/adapter/cadence.rs::Mode::interval`）；升档立即生效，降档需候选档位稳定一个完整间隔才落地（`Cadence::observe`）。
 - 事件唤醒：**1s 级 mtime 轮询**（`src-tauri/src/adapter/wakeup.rs`，每拍数次 `stat`：事件目录 + 前 8 个活跃会话事件文件 + opencode facts + `opencode.db` / `-wal`），变化即 `request_scan(ScanReason::Event)`。
-- 合并节流：距上轮扫描 **<500ms** 的**孤立** Event 被吞（`scan_bus::EVENT_DEBOUNCE`）；Action 补扫、冷启动与「同批积压含非 Event」不受此节流限制。
+- 事件延后（Fix 1/R2 终态）：孤立 Event 距上轮扫描不足 `event_min_gap = min(档位间隔, 5s)` 时，扫描线程用 `recv_timeout(剩余)` **延后**等待（非丢弃）；期间收到 Event 继续合并、收到 Action/ColdStart 立即中断补扫；Action 补扫/冷启动不受限制。旧的 500ms `EVENT_DEBOUNCE` 已被取代。
 - 档位跃迁日志 `scan_bus: mode → {:?}` 为 INFO，**只在跃迁时打一行**，不能用来逐轮计数。
 - 实测（§10.2）：Active **29.2/min**（300s / 146 次）、Away **2.0/min**（300s / 10 次）；Idle 未启用远控未测（代码推定 6/min）。事件唤醒会叠加，实际次数取决于本机事件密度。
 - 扫描来源已单一化：命令层只读共享快照，托盘 / 看板 / 桌宠 / 远控 watcher 不再各自触发（对照基线 §3「扫描发起方」一行）。
@@ -242,7 +242,7 @@ two-stage: 481 processes, 18 candidates, full refresh 64.1178ms vs two-stage 35.
 | 单轮进程刷新 | ≤25ms（5 次取中位） | **未达标（debug）**；release 未测 | §10.3；Fix 轮 Active 窗口单轮扫描 35–44ms（含解析，非纯进程刷新） |
 | 动作回执 p95 | 不劣于基线 | **未测** | 无活体压测 |
 | F3 补扫降级可见性 | `scan_bus_status` 可查 `degraded`/`snapshotAgeMs` | **达标（Fix 2）** | 单测 `status_reports_degraded_flag_and_snapshot_age`；看门狗纯函数 120s 阈值/去重单测 |
-| F5 标已读/隐藏即时性 | 动作后 ≤1s 卡片不再出现 | **代码与单测达标；活体 UI 点击未测** | `scan_now_blocking` 同步补扫 + `invalidateQueries(["sessions"])`（Fix 4）；本机无 UI 自动化，未能点卡实测 |
+| F5 标已读/隐藏即时性 | 点击后 ≤1s 卡片消失（用户感知口径，2026-10-31 终稿） | **达标（F5-opt 活体 11/12ms）** | 前端乐观隐藏 `setQueryData`，命令后 finally `invalidateQueries` 回取（失败回滚）；命令内部等飞 ≤2s 不作为门禁；§10.12.3 |
 
 
 ### 10.7 工程门禁（本次实跑，原始结果）
@@ -276,7 +276,7 @@ two-stage: 481 processes, 18 candidates, full refresh 64.1178ms vs two-stage 35.
 1. **F9 的 dsh 代际路径缓存未做**：计划明确拆到后续计划（需改 `dsh.rs::scan_raw_logs` 内部缓存层，单独评审）；本轮只完成 F9 的日志部分。
 2. **F3 降级诊断（Fix 2 已收口）**：`ensure_fresh` 超时仍按陈旧快照继续并打告警；现在 `scan_bus_status` 返回 `degraded`（扫描在飞超 120s，需重启恢复）与 `snapshotAgeMs`（快照龄），符合 F3「诊断字段即可」的裁决。看门狗只告警不强杀（清在飞位会放进第二份并发扫描）。
 3. **F6 覆盖边界**：claude / codex / kimi 有 hook 事件；opencode 由 `opencode.db` + `-wal` 与 facts 文件覆盖；**openclaw 既无 hook 事件、也没有便宜的文件信号**（`wakeup.rs` 未覆盖），与 dsh 同理 → 二者仍靠档位兜底，Away 档下最坏 30s 才看到变化（`wakeup.rs` 模块文档已申报）。
-4. **F5 残余窗口（Fix 4 已收口）**：`dismiss_session_card` / `mark_session_read` 改为**同步补扫后再返回**（`scan_bus::scan_now_blocking`），前端关闭成功后 `invalidateQueries(["sessions"])`；即发即忘的一帧残留窗口已消除。活体 UI 点击未测（本机无 UI 自动化），由后端源码锁与前端用例覆盖。
+4. **F5 即时性（F5-opt 终稿）**：命令为 async（R1，补扫在阻塞池内，允许等飞 ≤2s）；用户感知由**前端乐观隐藏**保证——点击即 `setQueryData` 更新缓存，命令结束（成功/失败）后在 finally `invalidateQueries` 回取权威快照（失败回滚）。活体见 §10.12.3（11/12ms）。
 5. **看门狗退避 500ms**：panic 后 `sleep(500ms)` 再按当前档位 `recv_timeout`，最坏恢复 = 档位间隔 + 0.5s；Away 档即 **30.5s，略超 F1 的「≤30s 自动恢复」**（超 0.5s，可接受但需记账）。
 6. **`POLL_INTERVAL` 已删除（Fix 7）**：`src/config/constants.ts` 的孤儿常量已移除，前端热路径源码锁改为只按 `refetchInterval` 内容发现（`commands/usage.rs`）。
 7. **日志降噪与计数口径（R4 已收口）**：每轮 INFO 已删除，计数改读 `scan_bus_stats.json`（§7）；`RUST_LOG` 不再影响扫描计数。R4 前的 §10.9 历史输出仍按当时的 INFO 行口径记录。
@@ -468,7 +468,7 @@ pid=24072 wall=300.5s cpu=10.22s avgCPU=3.40% scans=146 scansPerMin=29.2 stats_l
 ```
 
 - 中位：main **3.40%** / tree **9.88%** / **29.1 次/分**（≤30 达标）。
-- **会话发现延迟（发起→卡片出现，CDP 轮询主窗 DOM 的唯一 token）**：`2455 / 448 / 3000 / 2935 / 2879` ms（另 1 次 20s 超时）；成功样本中位 **2879ms**。该值含 opencode CLI 启动+会话落库（约 0.5–1s）、1s 事件轮询与 Active 2s 档——**未达 ≤2s 门禁**，如实记未达标。
+- **会话发现延迟（旧口径，已被 §10.12.4 取代）**：`2455 / 448 / 3000 / 2935 / 2879` ms（另 1 次 20s 超时）；成功样本中位 **2879ms**。该口径 t0 含 opencode CLI 启动，且用自动标题里的 token 做探测（opencode 会重写标题，1 次超时即探测失效，非事件漏唤醒）——终稿改为 **t0=会话落库**，见 §10.12.4（中位 898ms ≤2s）。
 
 #### 10.11.4 E3：F8 原始样本与 F5 原始 JSON（当前构建）
 
@@ -479,7 +479,7 @@ pid=24072 wall=300.5s cpu=10.22s avgCPU=3.40% scans=146 scansPerMin=29.2 stats_l
 {"gone":true,"elapsedMs":2090,"polls":100,"button":"暂不显示（会话状态变化后恢复）"}
 ```
 
-  说明：此前两个 75/76ms 是 debug/空闲构建的值；本轮在当前 release 的 **Active 档**点击时，命令内 `scan_after_mutation` 需等待在飞扫描（2s 档），卡片 **2090ms** 后消失。F5 的 ≤1s 门禁在 Active 下**未达标**（空闲路径仍为 76ms）；R8 的降级补排保证「下一窗口最终消失」成立。
+  更正（E7）：§10.9.5 的 75ms 与 §10.10.4 的 76ms 均为 **Active 档**（合成 Processing 卡）的点击值，不是空闲值。2090ms 是 R1 设计下「命令 await 补扫后再失效缓存」在 Active 档的峰值。用户感知口径终稿（e4320c1c）要求前端乐观隐藏：F5-opt 后当前 release 两次活体点击 **11ms / 12ms**（§10.12.3）；命令内部等飞 ≤2s 不再计入门禁，R8 的降级补排保证最终收敛。
 
 #### 10.11.5 E4：稳定性与工程门禁（HEAD a459a969）
 
@@ -517,12 +517,12 @@ release 运行窗口 03:00:50Z–03:23:02Z（约 22.2 分钟）：
 | 远控空闲 CPU（main/tree） | ≤6%；tree 不劣于基线 | **main 0.86% 达标；tree 3.86% ≤6%，且远优于基线 20.64%** | §10.10 / §10.11.2 |
 | 扫描频次（Active） | ≤30 次/分 | **达标 29.1**（29.1/29.0/29.2） | §10.11.3 |
 | 扫描频次（Idle/Away） | ≤10 / ≤6 | **达标 6.0 / 2.0** | §10.10 |
-| 活动档会话发现 | ≤2s | **未达标（中位 2879ms；含 CLI 启动）** | §10.11.3 |
+| 活动档会话发现 | ≤2s（t0=会话落库，终稿） | **达标（中位 898ms，5 样本）** | §10.12.4（§10.11.3 旧口径已作废） |
 | F6 事件唤醒 | ≤5s | **达标 1369ms**（当前构建；上轮 966ms/377ms） | §10.11 |
 | F7 用量不可见 | ≤12 分钟 | **达标**：ticker 12m01s | §10.10 |
 | 用量可见刷新 | ≤1s | **达标 317ms** | §10.10 |
 | F8 进程刷新 | ≤25ms | **达标 17.5ms**（6 样本中位，当前构建） | §10.11.4 |
-| F5 卡片消失 | ≤1s | **Active 下未达标 2090ms**（在飞等待）；空闲路径 76ms | §10.11.4 |
+| F5 卡片消失 | 点击后 ≤1s（乐观隐藏终稿） | **达标 11/12ms**（F5-opt） | §10.12.3 |
 | 日志（扫描总线新增） | ≤1MB/天 | **达标 ≈30KB/天**；dsh 告警归 F9 | §10.11.6 |
 | 工程门禁 | 全绿（既有环境失败除外） | **达标**：clippy 0、pnpm test/check 绿、lib 5 连跑稳定 | §10.11.5 |
 | 同状态 3 次差异 | ≤10% | 扫描 0.3%；tree CPU 8.0%（Active 9.01/10.55/9.88）；基线本身波动更大 | §10.11.2/3 |
@@ -534,3 +534,81 @@ release 运行窗口 03:00:50Z–03:23:02Z（约 22.2 分钟）：
 3. **codex_ipc_remote 偶发**：整包并行+高负载下 1/10；单用例 30/30；判为既有并发时序抖动，非 R6/R9 确定性回归。
 4. **免费模型额度已耗尽**：Active 复测不可再重复（测量期间真实生成，额度在结束后耗尽）。
 5. dsh 日志告警（≈10.4MB/天）仍待 F9 第二刀。
+
+---
+
+### 10.12 第五轮收尾（R10 / R11 / F5-opt / E6 / E7，2026-10-31 12:00–12:35 +0800）
+
+#### 10.12.1 构建与环境
+
+- 源码：HEAD `b734a9700c5aad29dc5bd31bc5dc1bc2f2c32c8e`（R10/R11 + F5-opt；E7 仅文档）。
+- release：`pnpm build` + `CARGO_BUILD_JOBS=2 pnpm exec tauri build --no-bundle --features marker-helper`；产物 sha256 `20f139f25813ecd523664bbcea1f07ec46d4e9077ff8b495921ceddf88c099c9`。
+- 真实 HOME；远端在线口径设备复用已配对 `e6`（`mam_device=0d4ddc32…`；设备上限 10 已满，未再新建配对）。
+- 模型：`opencode/nemotron-3.5-lightning-free`（deepseek/glm/mimo 免费额度耗尽，minimax 不可用）。
+
+#### 10.12.2 R10：degraded 窗口条件复位（单测）
+
+- 实现：`scan_once` 在赢得单飞时捕获 `started_ms` 并传入 `publish`；`publish` 仅当 `started_ms > LAST_TIMEOUT_MS` 时用 CAS 清零。
+- 用例：
+  - `publish_keeps_timeout_window_when_scan_started_before_it` → **ok**（`set_last_timeout(now)` 后，`started=now-1` 发布仍 `degraded=true`；`started=now+1` 发布后复位 false）。
+  - `publish_resets_degraded_timeout_window`（R9 用例改造）→ **ok**。
+- 活体：release 无法注入慢扫描（无测试钩子），本项以单测为准；F3 的 30s 窗口不再被「启动早于超时的在飞扫描」毫秒级抹平。
+
+#### 10.12.3 F5-opt 活体验收（release + Active，真实点击）
+
+```json
+{
+  "uiClick": {
+    "gone": true,
+    "elapsedMs": 12,
+    "appliedFalseWarnings": [],
+    "status": { "mode": "away", "version": 83, "degraded": false, "snapshotAgeMs": 2494 }
+  },
+  "commandContract": { "cmd": "dismiss_session_card", "applied": true, "version": 73 },
+  "statusAfterContract": { "mode": "idle", "version": 73, "degraded": false, "snapshotAgeMs": 2 },
+  "note": "__TAURI_INTERNALS__.invoke 是 own-prop 且前端模块缓存了引用，UI 回执无法截获；applied 由点击后同一桥、同一命令调用取得（applied=true）；UI 点击以卡片 DOM 脱离计时（两次 11ms / 12ms），applied=false 警告为空"
+}
+```
+
+- 两次点击 **11ms / 12ms**（≤1s 达标）；卡片在命令返回前即消失（乐观隐藏）；命令结束后 invalidate 回取权威快照。
+- 组件测试：invoke 未 resolve 前卡片已不可见；失败后 invalidate 回滚（`tests/session/optimisticHide.test.tsx` 2 passed）。
+
+#### 10.12.4 E6：会话发现重测（t0 = 会话落库，终稿口径）
+
+- 方法：t0 = `session_v2.time_created`（新 rowid 首次出现，50ms 轮询）；t1 = `GET /m/api/v1/sessions`（显示路径读同一快照）返回该 session id；Active 档由 `opencode run -c` 循环维持。
+- 原始样本（ms）：`2019 / 816 / 898 / 1515 / 267` → 排序 `267/816/898/1515/2019`，**中位 898ms ≤2s 达标**。
+- **上一轮 20s 超时归因**：token 5 对应 `session_v2` rowid=5，`time_created=03:03:56.663Z`，会话正常落库；超时是因为 opencode 自动标题未保留 token（实际标题 "Database indexing basics"），探测标记失效，**不是事件漏唤醒**，无需修复扫描链。
+- 偏差：t0 取 DB 行写入时刻；REST 快照轮询 50ms 粒度；样本 0 的 2019ms 为边界样本（中位达标）。
+
+#### 10.12.5 R11 清理
+
+- R8 用例补 `try_recv` 空断言（补排只一条 Action）；
+- `reset_for_test` 一并清 `TEST_TX`；
+- 修复 `wait_event_defer` 拼断文档、握手用例 `CleanupStream` 旧注释；
+- §10.4 的 `EVENT_DEBOUNCE`、§10.6/§10.8 的 `scan_now_blocking` 描述、§10.11.3/§10.11.4 的旧 F5/发现口径已按终稿纠偏。
+
+#### 10.12.6 E7 工程门禁（HEAD b734a970）
+
+- `cargo test --lib`：**3170 passed / 6 failed**（与 §10.11.5 同名的既有环境性失败：claude 布局、codex/opencode 时间窗、Windows 路径大小写、subagent 目录 ×2）。
+- `cargo clippy --all-targets -j 2 -D warnings`：**0 告警**。
+- `pnpm test`：**204 文件 / 2521 passed / 5 skipped**。
+- `pnpm check`：**EXIT 0**（3 条既有 mobile warning）。
+- 既有 tps 4 条失败不变（§10.11.5）。
+
+#### 10.12.7 最终门禁表（终稿 e4320c1c）
+
+| 门禁项 | 目标 | 结果 | 依据 |
+| --- | --- | --- | --- |
+| 挂机 CPU（主进程） | ≤3% | **达标 0.48%**（基线 17.15%） | §10.10 / §10.11.2 |
+| 挂机 CPU（进程树含 WebView2） | **不劣于 0.6.3 基线** | **达标：3.52% vs 21.23%（-83.4%）**；绝对 ≤3% 列后续渲染优化项 | §10.11.2 |
+| 远控空闲 CPU（main/tree） | ≤6% / 不劣于基线 | **达标 0.86% / 3.86%**（基线 16.55% / 20.64%） | §10.10 |
+| 扫描频次（Active） | ≤30 次/分 | **达标 29.1**（29.1/29.0/29.2） | §10.11.3 |
+| 扫描频次（Idle / Away） | ≤10 / ≤6 | **达标 6.0 / 2.0** | §10.10 |
+| 活动档会话发现 | ≤2s（t0=会话落库） | **达标 898ms 中位**（5 样本 267–2019ms） | §10.12.4 |
+| F6 事件唤醒 | ≤5s | **达标 1369ms** | §10.11 |
+| F7 用量不可见 / 可见 | ≤12 分钟 / ≤1s | **达标 12m01s / 317ms** | §10.10 |
+| F8 进程刷新 | ≤25ms | **达标 17.5ms**（6 样本中位） | §10.11.4 |
+| F5 卡片消失 | 点击后 ≤1s（乐观隐藏） | **达标 11/12ms** | §10.12.3 |
+| F3 degraded 诊断窗口 | 超时后 30s 可观测 | **达标（单测）**：启动早于超时的发布不再清零 | §10.12.2 |
+| 日志（扫描总线新增） | ≤1MB/天 | **达标 ≈30KB/天**；dsh 告警归 F9 | §10.11.6 |
+| 工程门禁 | 全绿（既有环境失败除外） | **达标** | §10.12.6 |
