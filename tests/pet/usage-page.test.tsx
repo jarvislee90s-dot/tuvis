@@ -294,17 +294,18 @@ describe("usage-page（计划② Task 6：大看板首屏）", () => {
     one.unmount();
   });
 
-  it("7. 打开即可见即采恰一次（force=true）；切档重查不触发扫描", async () => {
-    // 可见即采的 60s 去抖记在模块作用域（跨实例共享）：前面的用例已记下时间戳，把 Date 拨过
-    // 窗口，模拟「新开窗口」的首次打开仍会强制采集；只伪造 Date，waitFor 仍走真实时钟。
+  it("7. 打开即可见即采恰一次（可见性命令）；切档重查不触发扫描", async () => {
+    // 可见即采的 60s 去抖：前端模块级时间戳跨实例共享（前面的用例已记下时间戳），把 Date 拨过
+    // 窗口，模拟「新开窗口」的首次打开仍会触发；真正的跨 WebView 去抖由后端门闩裁定。
     const at = vi.spyOn(Date, "now").mockReturnValue(Date.now() + 61_000);
     onTestFinished(() => at.mockRestore());
 
     renderPage();
     await screen.findByTestId("usage-hero");
 
-    expect(callsOf("usage_collect")).toHaveLength(1);
-    expect(callsOf("usage_collect")[0][1]).toEqual({ force: true });
+    expect(callsOf("usage_collect_visible")).toHaveLength(1);
+    // 可见性触发不走手动命令（手动 `force=true` 只由「立即采集」按钮发出）
+    expect(callsOf("usage_collect")).toHaveLength(0);
     // 三条读命令只读账本（§3 第 15 条）
     expect(callsOf("usage_dashboard").length).toBeGreaterThan(0);
     expect(callsOf("usage_get_settings").length).toBeGreaterThan(0);
@@ -317,6 +318,6 @@ describe("usage-page（计划② Task 6：大看板首屏）", () => {
         )
       ).toBe(true)
     );
-    expect(callsOf("usage_collect")).toHaveLength(1);
+    expect(callsOf("usage_collect_visible")).toHaveLength(1);
   });
 });

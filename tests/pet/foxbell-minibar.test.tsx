@@ -232,11 +232,11 @@ describe("foxbell-minibar（计划② Task 13 步骤 5/6：浮窗接线）", () 
     expect(dash.range).toEqual({ preset: "today" }); // 设置项 miniBarRange（预设档只发 preset）
     expect(dash.groupBy).toBe("tool"); // 第 3 行是分工具汇总
 
-    // 悬停浮窗是 spec §7.2 的采集触发点之一：挂载即可见即采、force=true
-    // （F7：模块级 60s 内只强制一次，跨实例 / 重挂载共享；最小间隔与单飞仍由后端保证）
-    const collect = calls("usage_collect");
+    // 悬停浮窗是 spec §7.2 的采集触发点之一：挂载即可见即采（F7 可见性命令）
+    // （模块级 60s 第一道去抖；跨 WebView 的 60s 门闩与单飞由后端裁定）
+    const collect = calls("usage_collect_visible");
     expect(collect).toHaveLength(1);
-    expect(collect[0][1]).toEqual({ force: true });
+    expect(collect[0][1]).toEqual(undefined);
     // 读查询**绝不**触发扫描：本次会话里没有别的 collect（三个读命令只读账本，§3 第 15 条）
     expect(calls("usage_dashboard").length).toBe(1);
 

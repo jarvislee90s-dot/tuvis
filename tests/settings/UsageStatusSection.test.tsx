@@ -1,10 +1,14 @@
 // tests/settings/UsageStatusSection.test.tsx — 计划① Task 24：设置页「用量采集状态」验收面。
-// 覆盖：采集按钮触发 usage_collect({force:true}) 且期间禁用 / 逐源状态渲染（含失败源错误码文案）/
-// 命中率一位小数 / 空态与错误态（可见可重试）/ 采集后自动刷新今日口径 /
+// F7 整改（2026-10-31）：分区可见即触发一次**可见性采集**（跨 WebView 60s 门闩在后端），
+// 并监听统一的 `usage-collected` 完成事件刷新今日口径。
+// 覆盖：分区打开触发可见性采集（未打开不采）/ 采集按钮触发手动采集({force:true}) 且期间禁用 /
+// 完成事件到达重读今日口径 / 逐源状态渲染（含失败源错误码文案）/ 命中率一位小数 /
+// 空态与错误态（可见可重试）/ 采集后自动刷新今日口径 /
 // 总开关关闭的空态（dashboard 早退）与「不可得 ≠ 0」（userEst 可空、collectedAt=0）/
 // 采集失败的错误码收敛（未知码 → usage.rpc.usage-internal）/
 // i18n zh-en 无缺键（settings.usageStatus 子树，对齐 SignalHealthSection.test.tsx 扫描）。
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { listen } from "@tauri-apps/api/event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { readFileSync } from "node:fs";
 import path from "node:path";
@@ -123,10 +127,11 @@ const disabledDashboard = () =>
 beforeEach(() => {
   invokeMock.mockReset();
   invokeMock.mockImplementation(async (cmd: string) => {
-    if (cmd === "usage_collect") return collectResult();
+    if (cmd === "usage_collect" || cmd === "usage_collect_visible") return collectResult();
     if (cmd === "usage_dashboard") return dashboard();
     return null;
   });
+  vi.mocked(listen).mockClear();
 });
 afterEach(() => vi.clearAllMocks());
 
@@ -222,7 +227,7 @@ describe("UsageStatusSection 验收面（Task 24）", () => {
 
 // 总开关关闭（dashboard 早退空态）与 GC 7「不可得 ≠ 0」——本验收面唯一的两种假数字来源。
 describe("UsageStatusSection 总开关关闭 / 不可得（Task 24）", () => {
-  it("总开关关闭 → 空态、不显示 0 值表格，且打开设置页本身不触发采集", async () => {
+  it("总开关关闭 → 空态、不显示 0 值表格；打开分区只发可见性采集（不触发手动采集）", async () => {
     invokeMock.mockImplementation(async (cmd: string) =>
       cmd === "usage_dashboard" ? disabledDashboard() : null
     );
@@ -233,8 +238,45 @@ describe("UsageStatusSection 总开关关闭 / 不可得（Task 24）", () => {
     const text = screen.getByTestId("usage-status-empty").textContent ?? "";
     expect(text).toMatch(/No usage data for today/);
     expect(text).not.toMatch(/everything stops|all stopped|halted/i);
-    // 打开设置页不扫描：只有点「立即采集」才调 usage_collect
+    // F7：打开分区 = 可见边沿 → 发一次**可见性**采集（是否真扫由后端 60s 门闩裁定）；
+    // 手动采集命令仍然只在点「立即采集」时发出。
+    expect(invokeMock.mock.calls.filter((c) => c[0] === "usage_collect_visible")).toHaveLength(1);
     expect(invokeMock.mock.calls.filter((c) => c[0] === "usage_collect")).toHaveLength(0);
+  });
+
+  it("F7：分区可见才触发一次可见性采集；切走（卸载）不产生新采集", async () => {
+    const view = render(<UsageStatusSection />);
+    await waitFor(() =>
+      expect(invokeMock.mock.calls.filter((c) => c[0] === "usage_collect_visible")).toHaveLength(1)
+    );
+    // 重新渲染不得重复触发（effect 只在挂载时跑一次）
+    view.rerender(<UsageStatusSection />);
+    expect(invokeMock.mock.calls.filter((c) => c[0] === "usage_collect_visible")).toHaveLength(1);
+    // 切到其他设置分区 = 本分区卸载：卸载后不得再有任何新的采集请求
+    view.unmount();
+    const before = invokeMock.mock.calls.length;
+    await Promise.resolve();
+    expect(invokeMock.mock.calls.length).toBe(before);
+  });
+
+  it("F7：统一的 usage-collected 完成事件到达 → 重读今日口径（与 newRecords 无关）", async () => {
+    render(<UsageStatusSection />);
+    await waitFor(() =>
+      expect(invokeMock.mock.calls.filter((c) => c[0] === "usage_dashboard").length).toBe(1)
+    );
+    const call = vi
+      .mocked(listen)
+      .mock.calls.filter(([eventName]) => eventName === "usage-collected")
+      .at(-1);
+    expect(call).toBeDefined();
+    const handler = call![1] as (event: { payload: unknown }) => void;
+    // 0 条新记录的成功采集也必须刷新（事件 = 采集完成，不是「有新记录」）
+    await act(async () => {
+      handler({ payload: { collectedAt: 1, success: true, newRecords: 0, sources: [] } });
+    });
+    await waitFor(() =>
+      expect(invokeMock.mock.calls.filter((c) => c[0] === "usage_dashboard").length).toBe(2)
+    );
   });
 
   it("不可得显示空态而非 0：userEst=null → 「—」且该行不出现任何数字；collectedAt=0 → 尚未采集", async () => {

@@ -158,7 +158,7 @@ describe("usage-records（计划② Task 9：页签壳 + 用量记录页）", ()
       filters: {},
     });
     expect(callsOf("usage_dashboard").length).toBeGreaterThan(0);
-    expect(callsOf("usage_collect")).toHaveLength(1);
+    expect(callsOf("usage_collect_visible")).toHaveLength(1);
   });
 
   it("2. 卡内行恒为「供应商 / 模型」原文 + 万/亿缩写（前端不拼、不随卡片维度变）", async () => {

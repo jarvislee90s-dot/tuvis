@@ -68,9 +68,9 @@ pub fn spawn_runtime() {
                     r.total_new_records,
                     r.duration_ms
                 );
-                if r.sources.iter().any(|s| s.new_records > 0) {
-                    crate::remote::events::emit_ui("usage-collected", serde_json::json!({}));
-                }
+                // `usage-collected` 已由 `collect_with` 在**真实扫描完成处**统一广播
+                // （0 条新记录也发；最小间隔内复用不发）——本线程**不得**再条件 emit，
+                // 否则同一轮会双发、且「0 条新记录」这一轮前端收不到刷新。
             }));
             if let Err(e) = round {
                 log::error!("usage: 兜底采集轮次 panic，已捕获并继续（{:?}）", e);

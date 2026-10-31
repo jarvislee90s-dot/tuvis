@@ -25,10 +25,12 @@
 import { SETTINGS_CARD_TITLE } from "@/components/settings/typography";
 import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { Activity, FolderOpen, RefreshCw } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { useAppTranslation } from "@/hooks/use-app-translation";
 import { usageErrMsg } from "@/components/usage/usageErrors";
+import { usageCollectVisible } from "@/lib/api/usage";
 import type {
   UsageBuckets,
   UsageCollectResult,
@@ -94,6 +96,32 @@ export function UsageStatusSection() {
 
   useEffect(() => {
     void loadToday();
+  }, [loadToday]);
+
+  // F7：分区**实际可见**（本组件只在 `visibleIds.has("usageStatus")` 时挂载）即触发一次
+  // 可见性采集——「设置页打开即采」，且未打开该分区时一个采集请求都不发。
+  //
+  // 不复用 `useUsageCollect`（它要求 React Query Provider，而本分区是纯 invoke 的验收面）：
+  // 去抖由**后端跨 WebView 的 60s 门闩**统一负责（切换其他分区 / 快速来回都不会触发二次
+  // 重型扫描），这里只负责「可见边沿 → 发一次可见性采集」。
+  // 手动按钮仍走强制手动命令（`force=true`，总是执行），两者语义互不替代。
+  useEffect(() => {
+    void usageCollectVisible().catch((e) => {
+      // 失败不阻塞本分区渲染：错误态由 dashboard 查询与手动按钮各自呈现（这里只记日志）
+      console.warn("[usage] 可见性采集失败：", e);
+    });
+  }, []);
+
+  // 后端任何**真实采集完成**（可见 / 手动 / ticker / 启动）都会发同一个完成事件：
+  // 到达即重读今日口径，让本分区数字与其它 WebView 同步（与 newRecords 无关）。
+  // `.catch(() => () => {})`：非 Tauri 环境（浏览器 / Playwright）里 `listen` 会 reject。
+  useEffect(() => {
+    const un = listen("usage-collected", () => {
+      void loadToday();
+    }).catch(() => () => {});
+    return () => {
+      void un.then((unlisten) => unlisten());
+    };
   }, [loadToday]);
 
   // 挂载时并发读总开关（第 5 条命令；只读设置，**不扫描**）

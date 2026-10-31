@@ -1,15 +1,16 @@
 //! 用量域 IPC（契约 §3）。纪律：
-//! * **只有 `usage_collect` 会扫描**，且它有单飞 + 最小间隔保护（Task 10）；三个查询命令
-//!   只读本地账本（零文件扫描）；
+//! * **只有两条采集命令会扫描**：`usage_collect`（手动，`force` 语义不变）与
+//!   `usage_collect_visible`（F7 可见性触发：跨 WebView 60s 门闩 + 单飞，窗口内复用缓存）。
+//!   三个查询命令只读本地账本（零文件扫描）；
 //! * 采集经 `spawn_blocking` 出主线程（同步命令在主线程执行，codex 全量可达 1–3 分钟）；
 //! * 错误一律结构化 `UsageError`（前端按 `usage.rpc.<code>` 翻译）。
 //!
 //! ## ⚠️ 锁序（W-26，本层最容易踩的一条）
 //! 本层**不得**自己取 `DB` 锁：三个查询命令把锁定留给 `query::dashboard` / `records` /
 //! `export_csv`（它们的安全形式是「先持 `DB` 锁、guard 存活期间只调 `collect::cached_result()`」），
-//! 而**持 `DB` 锁时绝不能再调采集入口**（`collect()` / `collect_with()` / `run_collection()`）——
-//! 那会与在飞扫描的「飞行锁 → DB」构成 ABBA 死锁，挂死**整个 app 的 DB 访问**。
-//! 采集入口在本文件里只有一处、且在**不持任何锁**的命令入口上（`usage_collect`）。
+//! 而**持 `DB` 锁时绝不能再调采集入口**（`collect()` / `collect_visible()` / `collect_with()` /
+//! `run_collection()`）——那会与在飞扫描的「飞行锁 → DB」构成 ABBA 死锁，挂死**整个 app
+//! 的 DB 访问**。采集入口在本文件里只有两处、且都在**不持任何锁**的命令入口上。
 //! 锁：本模块 `mod tests` 的 `command_layer_never_locks_db_or_calls_collection_entries`。
 //!
 //! ## ⚠️ GC 3 / AGENTS.md 扫描预算契约
@@ -24,6 +25,21 @@ use crate::services::usage::{collect, query, settings};
 #[tauri::command]
 pub async fn usage_collect(force: bool) -> Result<UsageCollectResult, UsageError> {
     tauri::async_runtime::spawn_blocking(move || collect::collect(force))
+        .await
+        .map_err(|e| UsageError::internal(format!("collect task failed: {e}")))
+}
+
+/// F7 可见性触发：设置分区 / 大看板 / 浮窗可见时调用。
+///
+/// 与 `usage_collect` 的区别（这正是拆成两条命令的原因）：
+/// * 跨 **所有 WebView** 共用同一把 60s 门闩（模块作用域的前端时间戳只覆盖单个 WebView）；
+/// * 60s 窗口内直接返回缓存结果（零扫描），同时到达的调用合并为一次重型采集；
+/// * **失败不会锁死**：全失败的扫描不写回窗口，下一次调用可立即重试。
+///
+/// 手动采集仍走 `usage_collect(force = true)`——**总是执行**，且完成后会刷新本门闩窗口。
+#[tauri::command]
+pub async fn usage_collect_visible() -> Result<UsageCollectResult, UsageError> {
+    tauri::async_runtime::spawn_blocking(collect::collect_visible)
         .await
         .map_err(|e| UsageError::internal(format!("collect task failed: {e}")))
 }
@@ -151,8 +167,9 @@ mod tests {
     /// `DB.lock()`）。契约 §3 冻结的是**命令名 + 入参 + 返回形状**（不含 sync/async），
     /// ⇒ 本改动**不违约**，属**计划级冻结签名的显式偏离**（plan:11659-11660），
     /// 已在 FINAL-FIX-report 的「偏离申报」点名；前端键名/参数/返回一字未动。
-    const FROZEN_SIGNATURES: [&str; 6] = [
+    const FROZEN_SIGNATURES: [&str; 7] = [
         "pub async fn usage_collect(force: bool) -> Result<UsageCollectResult, UsageError>",
+        "pub async fn usage_collect_visible() -> Result<UsageCollectResult, UsageError>",
         "pub async fn usage_dashboard(range: UsageRange, group_by: UsageGroupBy) -> Result<UsageDashboard, UsageError>",
         "pub async fn usage_records(range: UsageRange, group_by: UsageGroupBy, filters: UsageFilters) -> Result<UsageRecords, UsageError>",
         "pub async fn usage_export_csv(range: UsageRange, group_by: UsageGroupBy, filters: UsageFilters) -> Result<String, UsageError>",
@@ -160,8 +177,9 @@ mod tests {
         "pub async fn usage_set_settings(patch: UsageSettingsPatch) -> Result<UsageSettings, UsageError>",
     ];
 
-    const COMMAND_NAMES: [&str; 6] = [
+    const COMMAND_NAMES: [&str; 7] = [
         "usage_collect",
+        "usage_collect_visible",
         "usage_dashboard",
         "usage_records",
         "usage_export_csv",
@@ -169,9 +187,10 @@ mod tests {
         "usage_set_settings",
     ];
 
-    /// 契约 §3 的 6 条命令**逐字冻结**：少一条 / 改名 / 改参数名与类型 → 本用例真红。
+    /// 契约 §3 的 7 条命令**逐字冻结**：少一条 / 改名 / 改参数名与类型 → 本用例真红。
     /// （Tauri 命令名 = 函数名；参数名 = JS 侧 camelCase 键名。两者都不会有编译错，
     /// 只会在运行时静默 reject —— 所以必须用自省锁钉住。）
+    /// F7 新增 `usage_collect_visible`（可见性触发，跨 WebView 门闩），无入参。
     #[test]
     fn six_commands_keep_frozen_signatures() {
         let code = code_only(&prod_only(SELF_SRC));
@@ -180,8 +199,8 @@ mod tests {
         // 才是**独立承重**的第二道（否则计数断言先红，反锁形同虚设、永远到不了）。
         assert_eq!(
             code.matches("#[tauri::command").count(),
-            6,
-            "用量域必须恰好 6 条 `#[tauri::command]`（契约 §3）"
+            7,
+            "用量域必须恰好 7 条 `#[tauri::command]`（契约 §3 + F7 可见性采集）"
         );
         for sig in FROZEN_SIGNATURES {
             let want = code_only(sig);
@@ -253,7 +272,7 @@ mod tests {
         }
     }
 
-    /// 三处登记之一：`lib.rs` 的 `generate_handler!` 必须逐条登记 6 条命令**各一次**。
+    /// 三处登记之一：`lib.rs` 的 `generate_handler!` 必须逐条登记 7 条命令**各一次**。
     /// 漏登记 = 前端 `invoke` 静默 reject（mock 会掩盖），不是编译错。
     #[test]
     fn six_commands_are_registered_in_generate_handler_once() {
@@ -273,8 +292,8 @@ mod tests {
         // 反向：不得把用量命令登记到别处（例如误放进 setup 闭包）
         assert_eq!(
             lib.matches("commands::usage::").count(),
-            6,
-            "lib.rs 全文件只应有 6 处 `commands::usage::` 引用（逐条登记、无重复）"
+            7,
+            "lib.rs 全文件只应有 7 处 `commands::usage::` 引用（逐条登记、无重复）"
         );
     }
 
@@ -329,7 +348,14 @@ mod tests {
         assert_eq!(
             code.matches("collect::collect(").count(),
             1,
-            "`collect::collect(` 只允许出现在 `usage_collect` 一处（单飞 + 最小间隔的唯一入口）"
+            "`collect::collect(` 只允许出现在 `usage_collect` 一处（手动入口）"
+        );
+        // F7：可见性入口**只能**走带 60s 门闩的 `collect_visible`（不得退化成 `collect(true)`
+        // ——那会让每个 WebView 的可见边沿都直接触发一次重型采集，跨 WebView 去抖失效）
+        assert_eq!(
+            code.matches("collect::collect_visible").count(),
+            1,
+            "`collect::collect_visible` 只允许出现在 `usage_collect_visible` 一处"
         );
     }
 

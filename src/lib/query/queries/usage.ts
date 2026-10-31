@@ -3,12 +3,15 @@
 //
 //  * 读侧三条查询（dashboard / records / settings）**只读本地账本，绝不触发扫描**（§3.15；
 //    `tests/pet/usage-queries.test.tsx` 有「采集命令不出现在查询路径」的缺席断言）。
-//  * 扫描侧只有 `useUsageCollect`：active 的 false→true 边沿（含挂载即 active=true）以
-//    `force=true` 可见即采（F7：60s 内只强制一次，去抖时间戳记在**模块作用域**、同一 WebView
-//    的所有实例共享——宠物迷你条悬停/菜单会频繁挂载卸载，按实例记账等于每次重挂载都绕过
-//    后端最小间隔）；手动路径 `collect()` 仍 `force=false`（最小间隔与并发单飞由后端采集命令
-//    保证，前端**不做二次节流**）。前端周期 ticker 已删除，兜底采集由后端 ticker（Task 8）负责，
-//    其 `usage-collected` 事件到达时失效整个用量域。
+//  * 扫描侧只有 `useUsageCollect`：
+//    ① **可见即采**（active 的 false→true 边沿，含挂载即 active=true）走**可见性命令**
+//       （F7：后端 60s 门闩跨所有 WebView 统一去抖 + 单飞；窗口内直接返回缓存、不扫描）。
+//       前端仍保留模块级 60s 时间戳作为**第一道**去抖（同一 WebView 内连 IPC 都省掉；宠物
+//       迷你条悬停/菜单会频繁挂载卸载，按实例记账等于每次重挂载都发一次请求）。
+//    ② **手动**路径 `collect(force)` 仍走原采集命令：最小间隔与并发单飞由后端保证（§3.16）。
+//    ③ 后端**任何真实采集完成**（可见 / 手动 / ticker / 启动）都会 emit 同一个 `usage-collected`
+//       事件（0 条新记录也发）；事件到达即失效整个用量域，与 newRecords 无关。
+//    前端周期 ticker 已删除，兜底采集由后端 ticker（Task 8）负责。
 //    本文件不 import 任何会话查询，采集命令也从不进 3 秒会话轮询路径。
 //
 // 查询键一律 `["usage", <域>, ...参数]` 形状：写侧一次 `invalidateQueries({ queryKey: USAGE_KEY })`
@@ -23,7 +26,13 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { listen } from "@tauri-apps/api/event";
-import { usageCollect, usageDashboard, usageGetSettings, usageRecords } from "@/lib/api/usage";
+import {
+  usageCollect,
+  usageCollectVisible,
+  usageDashboard,
+  usageGetSettings,
+  usageRecords,
+} from "@/lib/api/usage";
 import type {
   UsageCollectResult,
   UsageDashboard,
@@ -96,14 +105,16 @@ let lastForcedCollectAt: number | null = null;
 /**
  * 采集触发：**可见即采**（active 的 false→true 边沿，含挂载即 active=true）+ 后端兜底 ticker。
  *
- * * 可见边沿以 `force=true` 立即扫描；F7 规定 60s 内只强制一次（模块级去抖只作用于可见边沿，
- *   不作用于手动 `collect()`）。首次激活必发（无历史 force 时间戳）。
+ * * 可见边沿走**可见性命令**：后端 60s 门闩跨所有 WebView 去抖、同时到达的调用合并为一次
+ *   重型采集；窗口内直接返回缓存（不扫描）。前端模块级时间戳只是**第一道**去抖（同一 WebView
+ *   内省掉 IPC），首次激活必发。
  * * 手动路径 `collect(force = false)` 保持原语义：前端**不做二次节流**，最小间隔与并发单飞由
  *   后端采集命令保证（§3.16）——重复调用只会拿到上次结果，代价可忽略。后端总开关关闭时在读
  *   游标（全局 DB 入口）之前就早退，零扫描零落库（`services/usage/collect.rs` 的
  *   `collect_sources`），故白调一次也不扫。
  * * 前端周期 ticker **已删除**：兜底采集移到后端 ticker（Task 8，不依赖任何页面）；
- *   它 emit 的 `usage-collected` 到达时失效整个用量域，让看板 / 记录页 / 设置重查。
+ *   它 emit 的 `usage-collected` 到达时失效整个用量域，让看板 / 记录页 / 设置重查
+ *   （与 `newRecords` 无关：0 条新记录的成功采集也会发）。
  * * 失败**不抛给 UI**（错误态由查询命令负责，看板三态读的是 `useUsageDashboardQuery`），只 `console.warn`。
  */
 export function useUsageCollect(active = true) {
@@ -111,10 +122,10 @@ export function useUsageCollect(active = true) {
   const [lastResult, setLastResult] = useState<UsageCollectResult | null>(null);
   const prevActive = useRef(false);
 
-  const collect = useCallback(
-    async (force = false): Promise<UsageCollectResult | null> => {
+  const runCollect = useCallback(
+    async (run: () => Promise<UsageCollectResult>): Promise<UsageCollectResult | null> => {
       try {
-        const result = await usageCollect(force);
+        const result = await run();
         setLastResult(result);
         // 采集写了账本 → 一次失效整个用量域，下一次渲染即重查（环比不需要第二个查询，§3.17）
         await queryClient.invalidateQueries({ queryKey: USAGE_KEY });
@@ -127,9 +138,17 @@ export function useUsageCollect(active = true) {
     [queryClient]
   );
 
+  const collect = useCallback(
+    (force = false) => runCollect(() => usageCollect(force)),
+    [runCollect]
+  );
+
+  /** 可见性触发（F7）：失败不抛给 UI；60s 去抖由前端模块时间戳 + 后端门闩双层保证 */
+  const collectVisible = useCallback(() => runCollect(usageCollectVisible), [runCollect]);
+
   // 可见边沿（含挂载即 active=true；prevActive 初值 false → 挂载算一次边沿）。
   // 去抖按**模块**记账（跨实例共享）：60s 内重复可见（快速切页 / 宠物浮窗反复重挂载）不重复
-  // 强制扫描；首次激活恒发。
+  // 发请求；首次激活恒发。真正「会不会重扫」由后端跨 WebView 的 60s 门闩裁定。
   useEffect(() => {
     const becameActive = active && !prevActive.current;
     prevActive.current = active;
@@ -138,12 +157,12 @@ export function useUsageCollect(active = true) {
     const now = Date.now();
     if (lastForcedCollectAt === null || now - lastForcedCollectAt >= 60_000) {
       lastForcedCollectAt = now;
-      void collect(true);
+      void collectVisible();
     }
-  }, [active, collect]);
+  }, [active, collectVisible]);
 
-  // 后端兜底 ticker（Task 8）采集成功 → 失效用量域。前后端两步必须同批合并，否则会出现
-  // 「没有任何周期采集」的中间态；前端不再自设 interval。
+  // 后端**真实采集完成**（可见 / 手动 / ticker / 启动）→ 失效用量域。
+  // 前后端两步必须同批合并，否则会出现「没有任何周期采集」的中间态；前端不再自设 interval。
   // `.catch(() => () => {})`：非 Tauri 环境（浏览器 / Playwright）里 `listen` 是 rejected
   // promise，吞掉并退回空解除函数，避免 unhandled rejection（同 `scanBus.ts`）。
   useEffect(() => {
@@ -155,5 +174,5 @@ export function useUsageCollect(active = true) {
     };
   }, [queryClient]);
 
-  return { collect, lastResult };
+  return { collect, collectVisible, lastResult };
 }

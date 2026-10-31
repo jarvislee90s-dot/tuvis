@@ -3,9 +3,9 @@
 // 纪律（契约 §3 / 计划② §3.15–3.17 / 扫描总线计划 Task 10）：
 //  * 三条读查询（dashboard / records / settings）**只读账本、绝不触发扫描**——每个查询用例都断言
 //    `invokedCommands()` 里没有 `usage_collect`（§3.15：扫描只此一条命令，且它不进 3 秒轮询路径）；
-//  * `useUsageCollect` 在 active 的 false→true 边沿（含挂载即 active=true）以 `force=true`
-//    可见即采（F7：模块级 60s 内只强制一次，跨实例 / 重挂载共享），成功后一次失效 `["usage"]`
-//    前缀（看板 / 记录页 / 设置全被覆盖），失败只 `console.warn` 记录、不抛给 UI；
+//  * `useUsageCollect` 在 active 的 false→true 边沿（含挂载即 active=true）走**可见性采集**
+//    （F7：后端跨 WebView 60s 门闩；前端模块级 60s 第一道去抖，跨实例 / 重挂载共享），成功后
+//    一次失效 `["usage"]` 前缀（看板 / 记录页 / 设置全被覆盖），失败只 `console.warn` 记录、不抛给 UI；
 //  * 前端兜底 ticker **已删除**（兜底移到后端 ticker，Task 8）：本文件断言不再按
 //    `settings.collectIntervalMin` 注册任何 interval。
 // 本文件**不自行 mock `@tauri-apps/api/core`**：`tests/setup.ts` 已把 invoke 接到
@@ -42,9 +42,9 @@ function invokedCommands(): string[] {
   return tauriInvokeMock.mock.calls.map((c) => c[0]);
 }
 
-/** `usage_collect` 的每次调用 = (命令名, 入参)——用于锁「挂载只可见即采一次且 force=true」 */
+/** 采集类命令（F7：可见性触发走独立命令；手动仍走原命令）——用于锁「挂载只可见即采一次」 */
 function collectCalls(): Array<[string, unknown]> {
-  return tauriInvokeMock.mock.calls.filter(([cmd]) => cmd === "usage_collect") as Array<
+  return tauriInvokeMock.mock.calls.filter(([cmd]) => cmd.startsWith("usage_collect")) as Array<
     [string, unknown]
   >;
 }
@@ -152,7 +152,7 @@ describe("用量数据层（src/lib/query/queries/usage.ts）", () => {
     expect(invokedCommands()).not.toContain("usage_collect");
   });
 
-  it('4. useUsageCollect：挂载（active=true）即可见即采一次（force=true）、成功后失效 ["usage"]、不再自设前端 ticker', async () => {
+  it('4. useUsageCollect：挂载（active=true）即可见即采一次（可见性命令）、成功后失效 ["usage"]、不再自设前端 ticker', async () => {
     const { client, wrapper } = createWrapper();
     // 预置看板缓存（staleTime 内 fresh）→ 挂载本身不发查询；只有「采集成功的失效」会让它重查。
     // 这同时锁住键形状：键写错则挂载即查、失效再查 = 2 次，断言 `1` 必红。
@@ -167,9 +167,9 @@ describe("用量数据层（src/lib/query/queries/usage.ts）", () => {
     );
 
     await waitFor(() => expect(result.current.collect.lastResult).not.toBeNull());
-    // 挂载 = active 的首次 false→true 边沿 → 可见即采 force=true
-    // （夹具 durationMs 分叉 force，反向验证参数确实传下去了）
-    expect(collectCalls()).toEqual([["usage_collect", { force: true }]]);
+    // 挂载 = active 的首次 false→true 边沿 → 可见性采集一次（F7：60s 门闩在后端，
+    // 所以这里不带 force 入参；夹具按「真扫」形状返回）
+    expect(collectCalls()).toEqual([["usage_collect_visible"]]);
     expect(result.current.collect.lastResult).toEqual(mockUsageCollect(true));
     // ticker 删除后采集 hook 与设置无关：设置查询只留给 UI 消费，本 hook 不得再发
     expect(invokedCommands()).not.toContain("usage_get_settings");
@@ -204,6 +204,6 @@ describe("用量数据层（src/lib/query/queries/usage.ts）", () => {
       detail: "mam-mock-usage=error",
     });
     expect(result.current.lastResult).toBeNull();
-    expect(collectCalls()).toEqual([["usage_collect", { force: true }]]);
+    expect(collectCalls()).toEqual([["usage_collect_visible"]]);
   });
 });

@@ -1036,6 +1036,11 @@ if (!isTauri) {
           : Promise.resolve(
               mockUsageCollect((args as { force?: boolean } | undefined)?.force ?? false)
             );
+      // F7：可见性触发采集（无入参）。60s 门闩在后端；mock 直接返回一次「真扫」形状。
+      case "usage_collect_visible":
+        return mockUsageMode() === "error"
+          ? Promise.reject({ code: "usage-db-failed", detail: "mam-mock-usage=error" })
+          : Promise.resolve(mockUsageCollect(true));
       case "usage_dashboard": {
         const range = (args as { range?: UsageRange } | undefined)?.range ?? { preset: "today" };
         const groupBy = (args as { groupBy?: UsageGroupBy } | undefined)?.groupBy ?? "tool";

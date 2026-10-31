@@ -21,11 +21,23 @@ import type {
 } from "@/types/usage";
 
 /**
- * 触发一次采集（**唯一会扫描的命令**）。`force=false` 且距上次采集小于 `collectIntervalMin`
- * 时后端直接返回上次结果（不扫描）；并发调用由后端单飞复用同一次结果——前端不做二次节流。
+ * 触发一次采集（手动路径，**总是执行**）。`force=true` 绕过最小间隔窗口；`force=false` 且距上次
+ * 采集小于 `collectIntervalMin` 时后端直接返回上次结果（不扫描）。并发调用由后端单飞复用同一次
+ * 结果——前端不做二次节流。
  */
 export async function usageCollect(force: boolean): Promise<UsageCollectResult> {
   return await invoke<UsageCollectResult>("usage_collect", { force });
+}
+
+/**
+ * **可见性触发采集**（F7）：设置分区 / 大看板 / 浮窗可见时调用。
+ *
+ * 与手动路径的区别：后端有一把**跨所有 WebView** 的 60s 门闩——窗口内直接返回缓存结果
+ * （零扫描），同时到达的调用合并为一次重型采集；全失败的扫描不写回窗口（下一次可立即重试）。
+ * 无入参（不需要 `force`：可见性路径的「总是尝试」由门闩判定，而不是无条件重扫）。
+ */
+export async function usageCollectVisible(): Promise<UsageCollectResult> {
+  return await invoke<UsageCollectResult>("usage_collect_visible");
 }
 
 /** 大看板数据（含 hero / 趋势 / 分组行 / 工作小结 / 可得性 / 环比）；只读账本，不扫描 */

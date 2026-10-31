@@ -332,7 +332,7 @@ describe("workspace-navigation（Task 7：四页宿主与可靠导航）", () =>
     // 访问用量页并等首屏数据齐（dashboard / collect / costs 都已发过）
     await switchTab("usage");
     expect(await screen.findByTestId("usage-hero")).toBeInTheDocument();
-    await waitFor(() => expect(callsOf("usage_collect")).toBeGreaterThan(0));
+    await waitFor(() => expect(callsOf("usage_collect_visible")).toBeGreaterThan(0));
     await waitFor(() => expect(callsOf("usage_costs")).toBeGreaterThan(0));
 
     // 切走（用量页隐藏 ⇒ 全部用量查询 enabled:false）并排空在飞微任务

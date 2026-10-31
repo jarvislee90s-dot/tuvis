@@ -394,6 +394,7 @@ pub fn run() {
         inject::inject_list_audit,
         // 用量域（计划①）：采集 / 大看板 / 记录页 / CSV / 设置读写
         commands::usage::usage_collect,
+        commands::usage::usage_collect_visible,
         commands::usage::usage_dashboard,
         commands::usage::usage_records,
         commands::usage::usage_export_csv,
