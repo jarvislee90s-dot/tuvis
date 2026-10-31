@@ -137,7 +137,7 @@
 | 功能点 | 输入 | 输出 |
 |---|---|---|
 | F2.1 注入 | `/m/api/session-send`（session_id、文本）；路由表解析宿主 | tmux send-keys / AppleScript write text / do script 执行；副作用=目标终端收到一行输入+回车 |
-| F2.2 队列 | 注入请求 + 会话当前状态（Watcher 提供） | 状态黄：入队（SQLite 队列表，含设备花名/时间戳）；回到可输入态：逐条 flush〔D19〕；移动端可查队列/撤回未发 |
+| F2.2 队列 | 注入请求 + 会话当前状态（Watcher 提供） | 状态黄：入队（SQLite 队列表，含设备花名/时间戳）；回到可输入态：逐条 flush〔D19〕；仅 Codex Desktop 同线程已排队的多条普通消息，按排队顺序、条目之间留一空行合成一次发送（2026-10-30 用户明确裁决），保留逐条账本与未知不重发；移动端可查队列/撤回未发 |
 | F2.3 ZCode 无头 | session_id + 文本；工作区在册校验 | spawn `zcode --resume <id> --prompt <text> --cwd <项目> --json`；stdout 的 sessionId/turn 结果回执；副作用=db.sqlite 追加消息（同会话，判定 A） |
 | F2.4 通用无头 | session_id + 文本 | 对应 CLI 无头进程一次 turn；回执=末条 assistant 消息 + token 用量；进程按 AionCore 骨架管理（挂起/重生） |
 | F2.5 路由表 | 会话的宿主形态（兔维斯 已区分 CLI/APP/终端类型） | 通道决策 + 有头可见性预期（实时/刷新后/不可见）返回给移动端展示 |

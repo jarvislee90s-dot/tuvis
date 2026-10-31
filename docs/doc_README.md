@@ -12,6 +12,7 @@
 
 - [项目宪法](MASTER-PLAN.md)：最高设计依据；未经用户明确同意不得修改。
 - [规格与设计](engineering/specs/)：需求、设计、行为与验收口径。
+- [DSH Desktop 远程连接统一 Spec](engineering/specs/2026-10-29-dsh-desktop-remote-design.md)：八类功能、支撑证据、逐操作版本兼容与验收条件。
 - [实施计划](engineering/plans/)：当前/历史执行计划；executor prompt 不入库。
 - [人工裁决台账](engineering/decisions/)：用户裁决、推翻与边界；只记决定，不记 agent 返工过程。
 - [最终审查索引](engineering/reviews/)：审查范围、最终结论、未闭合风险。

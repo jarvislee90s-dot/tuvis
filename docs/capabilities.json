@@ -1,6 +1,6 @@
 {
   "$comment": "Tuvis 多终端能力矩阵单一数据源。README「多终端能力矩阵（总表）」的结构化版本，两处随发版同步更新；tuvis-website 官网经 api.github.com 拉取本文件渲染兼容矩阵。",
-  "updated": "2026-10-28",
+  "updated": "2026-10-31",
   "legend": {
     "yes": "✅ 支持",
     "partial": "◐ 部分",
@@ -235,8 +235,8 @@
             "dsh": "no",
             "openclaw": "no"
           },
-          "note": "实验性；**0.6.3 重磅：Codex 桌面端自适应控制**。按操作契约证据放行（shipped / 当前包契约匹配 / 本机真实成功），不做整 build 白名单：普通消息、阻塞问答（多题多值/自由文本）、同组异步题（一张卡、一次提交、已答自动核销）、命令/文件审批（accept/decline/cancel，摘要不足移除批准）、定向打断（v4+expectedTurnId，前置暂停）与队列暂停/恢复。完美适配：契约匹配且本机实测通过的发送/问答/异步提交；兼容适配：未知 build 按目标/状态/协议守卫尝试发送，破坏性操作仍走证据门控；不支持：permissions、Plan 模式切换、无活动回合的打断。Desktop 会话永不自动转 headless，答案/命令正文不进日志。macOS 26.1021.31345 已探针取证；Windows 与 360/390 像素验收待逐项确认。",
-          "noteEn": "Experimental; **0.6.3 flagship: Codex Desktop adaptive control**. Gated per operation by contract evidence (shipped / current-package contract match / local observed success), not a whole-build allowlist: plain messages, blocking Q&A (multi-question, multi-value, free text), grouped async questions (one card, one submit, auto-close when answered), command/file approvals (accept/decline/cancel; approve is withdrawn without a sufficient summary), targeted interrupt (v4 + expectedTurnId behind a pre-inserted pause), and queue pause/resume. Fully verified: sends/Q&A/async submit matched by contract and observed locally. Compatible: unknown builds attempt sends under target/state/protocol guards, while destructive actions stay evidence-gated. Unsupported: permissions, Plan mode switching, and interrupt without an active turn. Desktop sessions never fall back to headless; answers and command bodies never enter logs. macOS 26.1021.31345 is probe-backed; Windows and 360/390 px acceptance remain per-item checks."
+          "note": "实验性；**0.6.3 重磅：Codex 桌面端自适应控制**。按操作契约证据放行（shipped / 当前包契约匹配 / 本机真实成功），不做整 build 白名单：普通消息、阻塞问答（多题多值/自由文本）、同组异步题（一张卡、一次提交、已答自动核销）、命令/文件审批（accept/decline/cancel，摘要不足移除批准）、定向打断（v4+expectedTurnId，前置暂停）以及队列暂停/恢复。**0.6.4 起**队列在被打断的回合确认结束后自动接力，不需要手动恢复；插队（先处理这条）会先停掉目标回合再发出这一条，不要求队列已暂停；自然空闲时同设备同会话连续排队的普通消息合成一次发送（避免发第一条就转入运行态）。完美适配：契约匹配且本机实测通过的发送/问答/异步提交；兼容适配：未知 build 按目标/状态/协议守卫尝试发送，破坏性操作仍走证据门控；不支持：permissions、Plan 模式切换、无活动回合的打断。Desktop 会话永不自动转 headless，答案/命令正文不进日志。macOS 26.1021.31345 已探针取证；Windows 与 360/390 像素验收待逐项确认。",
+          "noteEn": "Experimental; **0.6.3 flagship: Codex Desktop adaptive control**. Gated per operation by contract evidence (shipped / current-package contract match / local observed success), not a whole-build allowlist: plain messages, blocking Q&A (multi-question, multi-value, free text), grouped async questions (one card, one submit, auto-close when answered), command/file approvals (accept/decline/cancel; approve is withdrawn without a sufficient summary), targeted interrupt (v4 + expectedTurnId behind a pre-inserted pause), and queue pause/resume. **Since 0.6.4** the queue relays automatically once the interrupted turn is confirmed finished (no manual resume); prioritising a message stops the target turn first and then sends that one, without requiring a paused queue; and consecutive queued plain messages from the same device and conversation are combined into one send when idle. Fully verified: sends/Q&A/async submit matched by contract and observed locally. Compatible: unknown builds attempt sends under target/state/protocol guards, while destructive actions stay evidence-gated. Unsupported: permissions, Plan mode switching, and interrupt without an active turn. Desktop sessions never fall back to headless; answers and command bodies never enter logs. macOS 26.1021.31345 is probe-backed; Windows and 360/390 px acceptance remain per-item checks."
         },
         {
           "name": "输出速度（TPS 采样）",
