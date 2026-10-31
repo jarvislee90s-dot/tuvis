@@ -689,3 +689,115 @@ release 运行窗口 03:00:50Z–03:23:02Z（约 22.2 分钟）：
 - F5 活体覆盖的是 **隐藏（dismiss）路径**；`applied` 为同 run 契约推断（理由见 §10.13.3）；一键清除批量路径未做活体（单测覆盖批量乐观移除）。
 - 会话发现最大值 2019ms 超 2s 线 19ms（终稿门禁按中位判定，最大值如实申报，§10.12.4）。
 - 20s 超时归因降级为「推断」（§10.12.4）：已有证据仅证明标题未保留 token 与会话已落库，无逐轮扫描时间线。
+
+---
+
+### 10.14 审查整改轮（2026-10-31）
+
+对应整改计划 `docs/engineering/plans/2026-10-31-scan-bus-review-fix-round.md` Task 1–6；代码提交 `5400701d`（Task 1）→ `aa1cf663`（Task 6）。**本轮不做 release 测量**（未授权），真实运行数据沿用 §10.13，不重新采样；下文未特别注明的“通过/达标”均指代码与模拟层面。
+
+#### 10.14.1 三类验证的边界
+
+| 类别             | 本轮实际内容                                                                                                                                                                                             | 不能代表                            |
+| ---------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------- |
+| **代码验证**     | 全量 Rust lib、clippy、`pnpm test` / `pnpm check`、受影响模块定向复跑；Task 6 托盘变异回归                                                                                                               | 真机时序、release 构建行为          |
+| **模拟测试**     | 虚拟单调时钟推演 cadence/TTL/panic 恢复；假唤醒通道验证 supervisor 重启与“最多一个 worker”；per-window watching 单测；jsdom 多窗口事件分发与 epoch 等待器；30 分钟虚拟事件运行；用量 `VISIBLE_GATE` 并发 | 真实多窗口/多 WebView、真实事件密度 |
+| **真实运行测试** | **本轮未新增**。F5 11ms、CPU/扫描频次、事件唤醒 1369ms 等均沿用 §10.10/§10.11/§10.13，**未复测**                                                                                                         | 本轮代码在 release 上的表现         |
+
+#### 10.14.2 工程门禁（原始结果）
+
+命令均在 `src-tauri/`（Rust）或仓库根（pnpm）执行；Rust 侧设 `CARGO_PROFILE_TEST_DEBUG=0 CARGO_PROFILE_DEV_DEBUG=0` 降低 debuginfo 内存占用：
+
+| 命令                                             | 结果                                                                                                                               |
+| ------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------- |
+| `cargo test --lib -j 1`（默认并行）              | **EXIT 101**：`3210 passed; 15 failed; 46 ignored`（98.24s）。15 = 既有 6 条（下表 A）+ 9 条本机并行负载环境性失败（下表 B）       |
+| `cargo test --lib -j 1 -- --test-threads=1`      | **EXIT 101**：`3219 passed; 6 failed; 46 ignored`（177.49s）。失败集与 §10.11.5 的既有 6 条**逐名一致**                            |
+| `cargo clippy --all-targets -j 2 -- -D warnings` | **EXIT 0**：`Finished dev profile …`，0 告警                                                                                       |
+| `cargo fmt --check`                              | **EXIT 0**，无输出                                                                                                                 |
+| `pnpm test`                                      | **EXIT 0**：`206 passed (206)` 文件 / `2545 passed / 5 skipped`（本轮前 §10.13.4 为 204 / 2527）                                   |
+| `pnpm check`                                     | **EXIT 0**：ESLint 3 warnings / 0 errors（均为既有 `src/mobile` 告警）；i18n 2827 键对齐；错误码 338 码对账通过；`vite build` 成功 |
+
+**A. 既有 6 条失败（与 §10.11.5 同名，本机环境类）**
+
+| 用例                                                                                          | 现场                                                                       |
+| --------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------- |
+| `monitor::claude_parser::title_tests::get_claude_sessions_badge_end_to_end_new_layout`        | 进程 cwd `/work/demo` 未匹配 `-work-demo` 项目目录（Windows 路径语义差异） |
+| `monitor::codex_parser::report_flag_tests::report_flag_true_when_task_complete_within_window` | 子 rollout 距父末条 5s（<90s 窗）仍判定未打标（时间窗）                    |
+| `monitor::opencode_parser::v2_tests::report_flag_true_when_child_updated_within_window`       | 子会话 `time_updated` 距父末条 5s（<90s 窗）仍判定未打标（时间窗）         |
+| `remote::server::tests::file_endpoints_are_gated_and_safe`                                    | 文件池身份键 Windows 路径大小写（`c:/users/...` vs `C:\Users\...`）        |
+| `services::subagent_detection_tests::detect_subagents_existing_dir_lists_agents`              | 本机真实 subagent 目录列出 `chinese-dev*`，用例期望固定夹具名              |
+| `services::subagent_detection_tests::detect_subagents_missing_dir_is_supported_empty`         | 同上（本机真实目录非空）                                                   |
+
+**B. 仅默认并行跑出现的 9 条环境性失败（串行/单跑不复现）**
+
+| 用例                                                                                             | 并行现场                                            | 复跑                |
+| ------------------------------------------------------------------------------------------------ | --------------------------------------------------- | ------------------- |
+| `commands::manifest::uninstall_tests::agents_dangling_link_rejected`                             | `junction::create` → `PermissionDenied`（拒绝访问） | 串行通过            |
+| `commands::manifest::uninstall_tests::agents_direct_link_to_ssot_detected`                       | 同上                                                | **单跑 0.00s 通过** |
+| `commands::manifest::uninstall_tests::agents_unrelated_link_rejected`                            | 同上                                                | 串行通过            |
+| `commands::manifest::uninstall_tests::uninstall_rejects_builtin_native_skill_target`             | 同上                                                | 串行通过            |
+| `commands::resource::remove_target_tests::symlink_target_removed_directly`                       | 同上                                                | 串行通过            |
+| `linker::detector::has_native_content_tests::junction_verbatim_prefix_resolved_against_mam_root` | 同上                                                | 串行通过            |
+| `linker::detector::has_native_content_tests::link_outside_mam_root_is_native_content`            | 同上                                                | 串行通过            |
+| `linker::detector::has_native_content_tests::mam_skill_link_is_not_native_content`               | 同上                                                | 串行通过            |
+| `inject::approve::tests::probe_version_times_out_and_caches_none`                                | 并行高负载下超时判定耗时 **71.34s**（期望 ≤5s）     | **单跑 3.01s 通过** |
+
+- 结论：**无新增功能性失败**。串行全量失败集与既有 6 条逐名一致；9 条额外失败均落在 junction 建链权限与子进程超时，与扫描总线改动无调用链关系（本轮代码 diff 仅在 `adapter/scan_bus.rs` 托盘判重）。
+- 托盘回归采用**变异验证**：把 `tray_should_update` 临时改回旧逻辑（只比较 waiting/processing）→ `tray_updates_on_each_field_change_within_rate_limit` **FAILED**（`总会话数变化必须立即刷新（tooltip 依赖 total_count）`，0 passed / 1 failed）；恢复三字段比较后 **3 passed / 0 failed**。`adapter::scan_bus` 模块复跑 **46 passed**。
+
+**定向复跑**
+
+| 命令                                                      | 结果                                  |
+| --------------------------------------------------------- | ------------------------------------- |
+| `cargo test --lib adapter:: -- --test-threads=1`          | **157 passed / 0 failed**             |
+| `cargo test --lib services::usage -- --test-threads=1`    | **483 passed / 0 failed / 2 ignored** |
+| `cargo test --lib commands:: -- --test-threads=1`         | **88 passed / 0 failed / 2 ignored**  |
+| `cargo test --lib adapter::scan_bus -- --test-threads=1`  | **46 passed / 0 failed**              |
+| `pnpm vitest run tests/scanBus tests/session tests/usage` | **28 文件 / 336 passed**              |
+
+#### 10.14.3 按 Task 的测试清单与数量
+
+| Task              | Commit                  | 新增/改写测试                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    | 数量                           |
+| ----------------- | ----------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------ |
+| 1 F6 事件监控     | `5400701d`              | `ninth_active_session_file_change_triggers_scan`（改写）、`active_session_in_place_write_triggers_scan`、`inactive_session_file_change_does_not_trigger`、`session_exit_removes_id_from_monitored_set`、`monitored_set_changes_do_not_trigger`、`monitored_ids_are_sorted_and_deduped`、`events_within_half_second_merge_into_one_scan_round`、`thirty_minute_idle_virtual_run_never_exceeds_event_ttl`、`cleanup_removes_only_stale_json_files`、`cleanup_reset_swallows_deletion_as_event`、`uncovered_tool_active_detects_dsh_openclaw_process_or_live_session`、`uncovered_tool_running_blocks_away`、`uncovered_tool_running_degrades_active_to_idle_not_away`、`active_session_ids_is_the_single_source_for_has_active_sessions`、`running_tools_are_sorted_deduped_and_replaced`                                                                                          | 14 个新增 `#[test]` + 1 条改写 |
+| 2 F4/F6 快照通知  | `7829ffd3`              | `epoch_increments_at_scan_start_and_is_written_into_snapshot`、`snapshot_payload_contains_full_snapshot_fields`、`reason_event_labels_cover_all_publish_paths`、`per_window_watching_reports_rising_edge_for_each_window`、`expired_window_does_not_count_as_watching_and_reentry_is_rising_edge`、`watch_requests_action_scan_once_per_window_rising_edge`；前端 `tests/scanBus/snapshotSync.test.tsx`（新文件）与 `scanMode.test.tsx`（扩展）                                                                                                                                                                                                                                                                                                                                                                                                                                  | Rust 4 + 前端 11 个 `it()`     |
+| 3 F5 卡片生命周期 | `db352a94`              | Rust：`mutation_success_reports_request_epoch_and_newer_scan_epoch`、`mutation_timeout_still_reports_request_epoch`、`request_epoch_is_captured_before_any_mutation`；前端 `tests/scanBus/mutationSettlement.test.ts`（6 条）与 `optimisticSessions.test.ts` / `dismissCard.test.tsx`（扩展）                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    | Rust 3 + 前端 16 个 `it()`     |
+| 4 F7 用量采集     | `51546132`              | `visible_collect_scans_once_within_the_window_and_rescans_after_it`、`simultaneous_visible_calls_share_one_scan`、`a_real_manual_scan_suppresses_the_visible_trigger_for_60s`、`a_failed_visible_scan_is_not_cached_so_the_next_call_retries`、`a_panicking_visible_scan_releases_the_gate`、`collected_event_reports_completion_even_without_new_records`、`real_scans_emit_exactly_once_while_cached_reuse_emits_nothing`；前端 `collectTrigger.test.tsx` / `UsageStatusSection.test.tsx` / `usage-queries.test.tsx` 等                                                                                                                                                                                                                                                                                                                                                        | Rust 7 + 前端 9 个 `it()`      |
+| 5 F1/F2 稳定性    | `452e0894` + `989aff0f` | 单调时钟：`active_idle_away_cycle_requires_debounce_on_every_downgrade`、`constant_timeline_offset_does_not_change_decisions`、`cadence_has_no_wall_clock_inputs`、`watch_ttl_boundary_is_exact_on_monotonic_time`、`panic_recovery_backs_off_then_scans_immediately_within_30s`、`mono_now_is_monotonic_and_shared_across_calls`、`duration_decisions_read_only_the_monotonic_clock`；supervisor：`supervisor_action_covers_three_states_at_exact_thresholds`、`in_flight_hang_degrades_exactly_once_without_respawn`、`supervisor_never_touches_in_flight_state`、`rebuild_channel_drops_old_sender_and_installs_new_one`、`respawn_rebuilds_channel_and_leaves_exactly_one_live_worker`、`request_scan_on_dead_channel_warns_without_blocking`、`waiting_worker_keeps_heartbeat_fresh_and_exits_on_disconnect`、`recv_reason_slices_long_wait_and_returns_promptly_on_wakeup` | Rust 15                        |
+| 6 P3 托盘         | `aa1cf663`              | `tray_updates_on_each_field_change_within_rate_limit`、`tray_suppresses_unchanged_updates_until_refresh_window`、`tray_state_reads_all_three_fields_from_snapshot`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               | Rust 3                         |
+
+#### 10.14.4 F1–F10 完成度（如实申报）
+
+| 功能点                           | 状态                                    | 依据                                                                                                                                                 | 未完成 / 风险                                                                                               |
+| -------------------------------- | --------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------- |
+| F1 单一扫描器与共享快照          | **完成（代码/模拟）**                   | 单飞 + `Arc<Snapshot>` + 版本单调；supervisor 假通道重启、心跳分片、hang 只降级等 15 条单测；panic 恢复 ≤30s 由虚拟时钟断言（500ms + 5s 上限）       | 真实 panic/线程退出未做活体注入；release 未复测                                                             |
+| F2 自适应节奏                    | **完成（代码 + 既有 release 数据）**    | cadence 单测（升档立即、降档防抖、单调时钟）；§10.11 release：Active 29.1 / Idle 6.0 / Away 2.0 次/分                                                | 本轮未重采样；Idle/Away 真实数据来自旧构建                                                                  |
+| F3 ensure_fresh 与 degraded 诊断 | **完成（代码/单测）**                   | 单飞补扫、超时返回 `degraded`/`snapshotAgeMs`、CAS 窗口复位（§10.13.2）；本轮无改动                                                                  | 未做 release 注入慢扫描活体（无测试钩子）                                                                   |
+| F4 消费方改造                    | **完成（代码/模拟）**                   | `scan-bus-snapshot` 统一发布 + 前端版本去重/直写缓存；per-window watching（main/pet、90s TTL、上升沿）；主窗重新聚焦不再被桌宠吞掉                   | **真实多窗口运行未做**（仅单测 + jsdom）                                                                    |
+| F5 卡片生命周期                  | **完成（组件/单测）**                   | 单卡/批量统一分类；epoch 门控 pending（10s 有界）；失败回滚；`optimisticHide` 5 条、`optimisticSessions` 9 条、`mutationSettlement` 6 条             | 活体仅旧 release 隐藏路径 11ms（§10.13.3，**未复测**）；普通未读卡/批量清除无 App 形态活体                  |
+| F6 事件唤醒                      | **完成（代码/模拟；覆盖边界如实申报）** | `take(8)` 移除、全部活跃会话逐文件 mtime、集合变化不自我喂食、5 分钟清理、500ms 合并、30 分钟虚拟运行；事件唤醒 release 1369ms（§10.11，**未复测**） | dsh/openclaw **仍无 1s 级事件覆盖**，按裁决 Idle 10s 封顶，只消除 30s 盲区；真实事件密度未重测              |
+| F7 用量采集                      | **完成（代码/模拟）**                   | 设置页可见触发；`VISIBLE_GATE` 跨 WebView 60s 单飞；手动优先；`usage-collected` 完成即发（0 条也发）；组件与 Rust 门闩用例                           | **真实多 WebView 并发未做**；ticker 12 分钟沿用 §10.10 release 数据，未复测                                 |
+| F8 进程扫描两段式                | **完成（沿用既有 release 数据）**       | §10.10 release 6 样本中位 16.5ms；§10.11 17.5ms（≤25ms）                                                                                             | 本轮无 F8 代码改动、**未复测**；debug 构建仍为 29.6ms 量级（§10.3）                                         |
+| F9 解析器与日志                  | **部分**                                | 扫描总线逐轮 INFO 已删除，scan_bus 日志 ≈30KB/天（§10.11.6）；dsh 告警仍 ≈10.4MB/天                                                                  | **dsh 代际路径缓存未做**（计划明确延后，需改 `dsh.rs::scan_raw_logs`）；openclaw 无事件覆盖亦未新增廉价信号 |
+| F10 验收测量与可观测性           | **部分**                                | 脚本 `scripts/measure-scan-bus.ps1` 可复现；stats 单行 JSON（reason/version/duration/process_refresh）；§10.10 已有 3×300s release 样本              | **本轮未新增 release 样本**；**动作回执 p95 从未压测**；多窗口真实运行未做；三档 CPU 仅旧数据               |
+
+#### 10.14.5 本轮关键行为变化
+
+1. **`scan-bus-snapshot` 事件**：唯一发布点 `scan_once`，覆盖 ColdStart/Periodic/Event/Action；载荷含 `version / epoch / reason / scannedAtMs / mode / degraded / data`。前端同版本去重、直接 `setQueryData` 写缓存（不再额外 IPC），Away 档 Event 扫描也能即时更新 UI。
+2. **`scan_epoch`**：扫描**启动**时 +1（不是发布时），随快照与事件下发；变更命令返回请求 epoch，`applied=false` 时前端保留 pending，直到 `epoch > request_epoch` 的快照到达（10s 有界强制收口），避免旧快照让卡片复活。
+3. **per-window watching**：观察状态由全局布尔改为 `window label → (watching, last_seen)`；main/pet 独立记账、90s TTL；单窗 false→true（含桌宠已展开时主窗重新聚焦）触发一次 Action 补扫；全局仍只有一套 Scan Bus。
+4. **dsh/openclaw 的 Away 封顶**：`UNCOVERED_TOOLS` 进程在跑或有活跃会话时，节奏目标下限为 `Idle 10s`，不进 `Away 30s`；两者都不跑才允许 30s。这是对“无事件覆盖不得进 30s 盲区”的落地，不代表二者已有 1s 级唤醒。
+5. **用量可见性门闩**：后端 `VISIBLE_GATE`（60s 单飞、跨 WebView 共用）合并同时到达的可见性采集；手动采集不受可见性去抖限制；失败/panic 释放门闩，不永久锁死。`usage-collected` 统一在真实采集完成处广播，载荷含 `collectedAt / success / newRecords / sources`，0 条新记录也发。
+6. **supervisor**：5s 巡检；worker 每圈与每次等待切片刷新单调心跳；心跳过期且**无在飞扫描**才重建通道并重启（旧 sender 丢弃使旧 worker 自行退出，保证同一时刻最多一个有效 worker）；在飞 >120s 只记 degraded/告警，不强杀、不清在飞位。
+7. **单调时钟**：cadence 降档防抖、watching TTL、补扫超时、hang 判定全部改用 `mono_now` / `Instant`；墙上时间仅用于 `scannedAtMs`、stats 与日志，系统时间前后调整不影响持续时间判定。
+8. **托盘 total_count**：`TrayState { waiting, processing, total }` 三字段判重，任一变化立即刷新；三字段都没变才受 30s 限频。修复前 tooltip 依赖的 total 变化会被 waiting/processing 相同而拖到 30s。
+
+#### 10.14.6 未完成与偏差（本轮结论）
+
+- **F9 的 dsh 代际路径缓存未做**：本轮只完成日志与事件侧整改；dsh 告警仍约 10.4MB/天，需后续单独立项。
+- **多窗口真实运行未做**：per-window watching、`scan-bus-snapshot` 多窗口去重、桌宠 + 主窗同时聚焦仅有单测/jsdom 证据；未在真实双 WebView 上验收。
+- **动作回执 p95 未压测**：F10 的该项仍为“未测”。
+- **release 未复测**：本轮所有真实运行数字均来自 §10.10/§10.11/§10.13，早于本轮代码；不得当作本轮 release 验证。
+- **F5 活体覆盖有限**：仅隐藏（dismiss）路径有旧 release 11ms 记录；普通未读卡与一键清除批量路径只有组件测试。
+- **dsh/openclaw 仍无事件唤醒**：当前策略是 Idle 10s 封顶，而非 1s 级事件覆盖；如后续要求 F6 完全覆盖，需要为二者寻找廉价文件信号。
+- **默认并行测试的 9 条环境性失败**：串行全量与单跑均通过，已在 §10.14.2 逐名记录；不影响“无新增功能性失败”的结论，但说明本机并行跑不能直接作为零失败门禁。

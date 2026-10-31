@@ -662,3 +662,19 @@ Cadence 中用于持续时间计算的时间源应采用单调时钟。
 | `applied=false` 的"已反映"判定 | 新增单调 `scan_epoch`（扫描启动时 +1），随快照与 `scan-bus-snapshot` 事件下发；变更命令返回当时的 epoch，前端保留 pending 直到收到 epoch 更大的快照（有界 10s 后强制收口） |
 | dsh/openclaw 的 Away 策略 | 扫描时记录在跑工具；dsh/openclaw 进程在跑（或有活跃会话）时节奏下限 `Idle 10s`，不进 `Away`；两者都不跑时才允许 `Away 30s` |
 | 执行方式 | 按 Task 1→6 顺序执行；每个 Task 由子代理实现并提交，主评审逐组复核后再进入下一组 |
+
+---
+
+# 13. 执行状态（2026-10-31）
+
+> 本节为追加记账，未改动上文用户原文。验证口径与完整失败对照见
+> `docs/engineering/evidence/2026-10-29-scan-bus-baseline.md` §10.14。
+
+| Task | 内容               | Commit                  | 状态 | 未完成 / 偏差（关键点）                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| ---- | ------------------ | ----------------------- | ---- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| 1    | F6 事件监控修复    | `5400701d`              | 完成 | `monitored_ids()` 改为快照中**全部活跃会话**（移除 `take(8)`，与 `active_session_ids` / `has_active_sessions` 同源）；逐会话事件文件 mtime + 固定旁证文件，按路径比较不自我喂食；陈旧 hook 文件 5 分钟清理；dsh/openclaw 无事件覆盖，按 §12 裁决封顶 `Idle 10s`（`UNCOVERED_TOOLS`），不进 Away 30s。**偏差**：二者仍无 1s 级真实唤醒，只是消除 30s 盲区                                                                                   |
+| 2    | F4/F6 快照通知     | `7829ffd3`              | 完成 | 新增 `scan-bus-snapshot`（version/epoch/reason/scannedAtMs/mode/degraded/data），唯一发布点在 `scan_once`，覆盖 ColdStart/Periodic/Event/Action；前端同版本去重并直接写 Query Cache（不额外 IPC）；watching 改为 **per-window**（main/pet 独立记账、90s TTL、单窗上升沿触发一次 Action）；新增单调 `scan_epoch`（扫描启动 +1）。**偏差**：真实多窗口运行未做（单测 + jsdom 模拟）                                                          |
+| 3    | F5 卡片生命周期    | `db352a94`              | 完成 | 单卡/批量统一走 `getSessionDismissBehavior`：数据驱动绿卡 `markReadAndRemove`、普通未读 `markReadKeep`、其余 `dismiss`；`applied=false` 不清 pending，等待 `epoch > request_epoch` 的 `scan-bus-snapshot`，10s 有界强制收口；命令失败 invalidate + 清 pending 回滚。**偏差**：活体仅覆盖隐藏路径（沿用 §10.13.3 的 11ms），普通未读卡/批量清除只有组件测试                                                                                 |
+| 4    | F7 用量采集        | `51546132`              | 完成 | 设置页用量分区可见即触发 `collect_visible`；后端 `VISIBLE_GATE` 60s 单飞去抖（跨 WebView 共用，同时到达合并、失败/panic 不永久锁门），手动采集不受可见性去抖；`usage-collected` 统一在真实采集完成处广播（0 条新记录也发），前端按事件失效用量域。**偏差**：真实多 WebView 并发未做（Rust gate + jsdom 模拟）；ticker 沿用既有 release 数据未复测                                                                                          |
+| 5    | F1/F2 稳定性       | `452e0894` + `989aff0f` | 完成 | supervisor 5s 巡检心跳；心跳过期且**无在飞**才重建通道并重启（旧 sender 丢弃 → 旧 worker 自行退出，同一时刻最多一个有效 worker）；在飞 >120s 的 hang 只 degraded/告警，不强杀、不清在飞位；panic 后固定 500ms 退避、不叠加档位间隔，最坏 500ms + 5s 单飞等待 ≤30s；cadence/watching TTL/超时判定全部改单调时钟。**偏差**：真实线程故障注入未做（假通道 + 虚拟时间模拟）                                                                    |
+| 6    | P3 托盘 + 最终回归 | `aa1cf663`              | 完成 | 新增 `TrayState` 三字段判重（waiting/processing/**total**），任一变化立即刷新、30s 限频保留；`tray_should_update` 纯函数 + 3 条单测（含托盘变异验证）。全量门禁：串行 `cargo test --lib` = 既有 6 条失败、无新增；clippy 0 警告；`pnpm test` 206 文件 2545 passed；`pnpm check` EXIT 0。**偏差**：默认并行跑出现 9 条本机负载/junction 权限环境性失败（单跑与串行均通过）；本轮**未做 release 复测**；F9 dsh 缓存未做；动作回执 p95 未压测 |
