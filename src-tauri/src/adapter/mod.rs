@@ -363,66 +363,120 @@ static STOP_GRACE: Lazy<Mutex<HashMap<u32, (i64, i64)>>> = Lazy::new(|| Mutex::n
 /// 不能用“池无行”一概补插（会复活已读/过期卡）。
 static PENDING_UNREAD_RETRIES: Lazy<Mutex<HashMap<(String, String), i64>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
-const PENDING_UNREAD_KEY: &str = "unread.pending_retries.v1";
 const PENDING_TTL_MS: i64 = 24 * 3600 * 1000;
+static PENDING_LOADED: std::sync::Once = std::sync::Once::new();
 
 fn pending_key(tool: &str, sid: &str) -> String {
     format!("{tool}\u{1f}{sid}")
 }
 
-fn persist_pending_unread_retries() {
+/// 独立于 SQLite 的小文件：SQLite 写失败时仍尽量保留跨重启恢复标记。
+/// 写入采用临时文件 + rename；失败只 warn（降级），内存标记仍保留供同进程重试。
+fn pending_store_path() -> std::path::PathBuf {
+    crate::database::connection::app_data_home()
+        .join(".tuvis")
+        .join("unread_pending_retries.json")
+}
+
+fn persist_pending_unread_retries() -> bool {
     let map: HashMap<String, i64> = PENDING_UNREAD_RETRIES
         .lock()
         .unwrap()
         .iter()
         .map(|((tool, sid), since)| (pending_key(tool, sid), *since))
         .collect();
-    if let Ok(json) = serde_json::to_string(&map) {
-        crate::database::set_setting(PENDING_UNREAD_KEY, &json);
+    let Ok(json) = serde_json::to_string(&map) else {
+        return false;
+    };
+    let path = pending_store_path();
+    let tmp = path.with_extension("json.tmp");
+    if let Err(e) = std::fs::write(&tmp, &json) {
+        log::warn!(
+            "unread: 待重试标记写入 {} 失败（降级为内存重试）: {e}",
+            tmp.display()
+        );
+        return false;
     }
+    if let Err(e) = std::fs::rename(&tmp, &path) {
+        // Windows 目标存在时 rename 失败：删旧再改名；仍失败则降级
+        let _ = std::fs::remove_file(&path);
+        if let Err(e2) = std::fs::rename(&tmp, &path) {
+            log::warn!(
+                "unread: 待重试标记落盘 {} 失败（降级为内存重试）: {e} / {e2}",
+                path.display()
+            );
+            return false;
+        }
+    }
+    true
 }
 
-/// 恢复持久化的待重试标记（只合并缺失项，不覆盖本轮新值）；超过 24h 的丢弃。
+/// 恢复持久化的待重试标记（进程内只读一次），并清理 24h 过期项。
 fn load_pending_unread_retries() {
-    let Some(raw) = crate::database::get_setting(PENDING_UNREAD_KEY) else {
-        return;
-    };
-    let Ok(map) = serde_json::from_str::<HashMap<String, i64>>(&raw) else {
-        return;
-    };
-    let now = chrono::Utc::now().timestamp_millis();
-    let mut guard = PENDING_UNREAD_RETRIES.lock().unwrap();
-    for (key, since) in map {
-        if now.saturating_sub(since) > PENDING_TTL_MS {
-            continue;
+    PENDING_LOADED.call_once(|| {
+        let path = pending_store_path();
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            return;
+        };
+        let Ok(map) = serde_json::from_str::<HashMap<String, i64>>(&raw) else {
+            return;
+        };
+        let now = chrono::Utc::now().timestamp_millis();
+        let mut guard = PENDING_UNREAD_RETRIES.lock().unwrap();
+        for (key, since) in map {
+            if now.saturating_sub(since) > PENDING_TTL_MS {
+                continue;
+            }
+            if let Some((tool, sid)) = key.split_once('\u{1f}') {
+                guard
+                    .entry((tool.to_string(), sid.to_string()))
+                    .or_insert(since);
+            }
         }
-        if let Some((tool, sid)) = key.split_once('\u{1f}') {
-            guard
-                .entry((tool.to_string(), sid.to_string()))
-                .or_insert(since);
-        }
+    });
+}
+
+/// 每轮清理内存中超过 24h 的待重试标记；有变化才落盘（避免每 3s 写放大）。
+fn prune_pending_unread_retries(now_ms: i64) {
+    let changed = {
+        let mut guard = PENDING_UNREAD_RETRIES.lock().unwrap();
+        let before = guard.len();
+        guard.retain(|_, since| now_ms.saturating_sub(*since) <= PENDING_TTL_MS);
+        guard.len() != before
+    };
+    if changed {
+        let _ = persist_pending_unread_retries();
     }
 }
 
-fn mark_unread_retry(tool: &str, sid: &str, since_ms: i64, persist: bool) {
-    PENDING_UNREAD_RETRIES
-        .lock()
-        .unwrap()
-        .entry((tool.to_string(), sid.to_string()))
-        .or_insert(since_ms);
-    if persist {
-        persist_pending_unread_retries();
+fn mark_unread_retry(tool: &str, sid: &str, since_ms: i64, persist: bool) -> bool {
+    let changed = {
+        let mut guard = PENDING_UNREAD_RETRIES.lock().unwrap();
+        let key = (tool.to_string(), sid.to_string());
+        match guard.entry(key) {
+            std::collections::hash_map::Entry::Occupied(_) => false, // 重复失败且 since 未变：不重写
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(since_ms);
+                true
+            }
+        }
+    };
+    if persist && changed {
+        let _ = persist_pending_unread_retries();
     }
+    changed
 }
 
-fn clear_unread_retry(tool: &str, sid: &str, persist: bool) {
-    PENDING_UNREAD_RETRIES
+fn clear_unread_retry(tool: &str, sid: &str, persist: bool) -> bool {
+    let changed = PENDING_UNREAD_RETRIES
         .lock()
         .unwrap()
-        .remove(&(tool.to_string(), sid.to_string()));
-    if persist {
-        persist_pending_unread_retries();
+        .remove(&(tool.to_string(), sid.to_string()))
+        .is_some();
+    if persist && changed {
+        let _ = persist_pending_unread_retries();
     }
+    changed
 }
 
 fn unread_retry_pending(tool: &str, sid: &str) -> bool {
@@ -743,8 +797,9 @@ fn event_payload(event: Option<&crate::monitor::hooks::HookEvent>) -> Option<&st
 
 /// 实际扫描（单飞壳内执行；成功路径与原实现一致）
 fn get_all_sessions_inner() -> SessionsResponse {
-    // 重启恢复：载入上次进程持久化的待重试标记
+    // 重启恢复 + 每轮 TTL 清理（有变化才落盘）
     load_pending_unread_retries();
+    prune_pending_unread_retries(chrono::Utc::now().timestamp_millis());
     // W5：未勾选工具不参与会话扫描（看板卡/通知随之静默）
     let adapters: Vec<Box<dyn AgentAdapter>> = enabled_adapters();
 
@@ -2954,7 +3009,11 @@ mod unread_card_tests {
         assert!(keep_green_card(false, false, false), "首次转绿保留");
         assert!(keep_green_card(true, true, false), "池有行保留");
 
-        mark_unread_retry("codex", "retry-test", 2_000, false);
+        assert!(mark_unread_retry("codex", "retry-test", 2_000, false));
+        assert!(
+            !mark_unread_retry("codex", "retry-test", 2_000, false),
+            "重复失败且 since 未变不得再次写入"
+        );
         assert!(unread_retry_pending("codex", "retry-test"));
         assert_eq!(
             unread_retry_pending_since("codex", "retry-test"),
@@ -3017,7 +3076,8 @@ mod unread_card_tests {
             Some(10_000_300),
             Some(10_000_000)
         ));
-        clear_unread_retry("codex", "retry-test", false);
+        assert!(clear_unread_retry("codex", "retry-test", false));
+        assert!(!clear_unread_retry("codex", "retry-test", false));
         assert!(!unread_retry_pending("codex", "retry-test"));
     }
 
