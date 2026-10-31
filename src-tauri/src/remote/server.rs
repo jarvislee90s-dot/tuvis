@@ -2559,6 +2559,7 @@ mod tests {
             form: crate::session::ProcessForm::Cli,
             jump_supported: false,
             unread: false,
+            unread_turned_green_at_ms: None,
         };
         let state = Arc::new(RemoteState {
             ui_config_source: Box::new(|| None),
@@ -2868,6 +2869,7 @@ mod tests {
             form: crate::session::ProcessForm::Cli,
             jump_supported: false,
             unread: false,
+            unread_turned_green_at_ms: None,
         };
         let hit = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let h = hit.clone();
@@ -4510,6 +4512,7 @@ mod tests {
             form: crate::session::ProcessForm::Cli,
             jump_supported: false,
             unread: false,
+            unread_turned_green_at_ms: None,
         }
     }
 

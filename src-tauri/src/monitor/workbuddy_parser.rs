@@ -204,13 +204,86 @@ type FallbackHitKey = (PathBuf, String, String);
 static FALLBACK_JSONL_HITS: Lazy<Mutex<HashMap<FallbackHitKey, PathBuf>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
-/// 共享查找函数（P0-2）：定位会话 JSONL。
+fn optional_regular_file(path: &Path) -> std::io::Result<Option<PathBuf>> {
+    match std::fs::metadata(path) {
+        Ok(m) if m.is_file() => Ok(Some(path.to_path_buf())),
+        Ok(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} exists but is not a regular file", path.display()),
+        )),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// 严格查找（用量采集用）：只有**确认不存在**才返回 `Ok(None)`；权限/IO/枚举失败
+/// 一律向上传播，调用方映射为 `usage-source-io`，不得伪装成“没有用量”。
+pub fn find_session_jsonl_strict(
+    home: &Path,
+    cwd: &str,
+    session_id: &str,
+) -> std::io::Result<Option<PathBuf>> {
+    let primary = session_jsonl_path(home, cwd, session_id);
+    if let Some(p) = optional_regular_file(&primary)? {
+        return Ok(Some(p));
+    }
+
+    // issue #35-7：先查兜底命中缓存（键含 home，防单测多 tempdir 串路径）；
+    // 命中前校验文件仍在（会话目录可能被清理），失效则重扫
+    let key = (home.to_path_buf(), cwd.to_string(), session_id.to_string());
+    let cached = FALLBACK_JSONL_HITS.lock().unwrap().get(&key).cloned();
+    if let Some(p) = cached {
+        match optional_regular_file(&p)? {
+            Some(p) => return Ok(Some(p)),
+            None => {
+                FALLBACK_JSONL_HITS.lock().unwrap().remove(&key);
+            }
+        }
+    }
+
+    // 目录扫描兜底：projects 下任意子目录中的 <sessionId>.jsonl
+    let projects_dir = home.join(".workbuddy").join("projects");
+    let entries = match std::fs::read_dir(&projects_dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e),
+        };
+        let is_dir = match entry.file_type() {
+            Ok(t) => t.is_dir(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e),
+        };
+        if !is_dir {
+            continue;
+        }
+        let candidate = entry.path().join(format!("{}.jsonl", session_id));
+        let Some(p) = optional_regular_file(&candidate)? else {
+            continue;
+        };
+        let mut hits = FALLBACK_JSONL_HITS.lock().unwrap();
+        if hits.len() >= FALLBACK_HITS_CAP {
+            hits.clear();
+        }
+        hits.insert(key, p.clone());
+        return Ok(Some(p));
+    }
+    Ok(None)
+}
+
+/// 共享查找函数（P0-2，看板/补偿用）：定位会话 JSONL。
 /// 1. 先试 mangle(cwd)/<sessionId>.jsonl；
 /// 2. 未命中 → 扫描 ~/.workbuddy/projects/*/ 查找 <sessionId>.jsonl（会话可能换过项目目录，
 ///    或 cwd 属 UNC 等未实测形态，mangle 无法命中）；
 /// 3. 仍无 → None（调用方跳过该会话）。
 ///
-/// 与 W4 心跳消失补偿共用（compensate_vanished_heartbeats_in 内联扫描抽于此）
+/// 看板保留宽容降级：定位失败（权限/IO）按“未命中”处理，不改变既有看板行为。
+/// 用量采集必须用 `find_session_jsonl_strict`，不得复用本函数。
 pub fn find_session_jsonl(home: &Path, cwd: &str, session_id: &str) -> Option<PathBuf> {
     let primary = session_jsonl_path(home, cwd, session_id);
     if primary.exists() {
@@ -224,10 +297,11 @@ pub fn find_session_jsonl(home: &Path, cwd: &str, session_id: &str) -> Option<Pa
             return Some(p.clone());
         }
     }
-    // 目录扫描兜底：projects 下任意子目录中的 <sessionId>.jsonl
+    // 目录扫描兜底：projects 下任意子目录中的 <sessionId>.jsonl。
+    // 看板/补偿保持旧的宽容降级：目录不可读或条目枚举失败 → 按未命中处理。
     let projects_dir = home.join(".workbuddy").join("projects");
     let Ok(entries) = std::fs::read_dir(&projects_dir) else {
-        return None; // 目录缺失/不可读 → 防御性 None
+        return None;
     };
     let hit = entries.filter_map(|e| e.ok()).find_map(|dir| {
         let p = dir.path().join(format!("{}.jsonl", session_id));
@@ -897,6 +971,7 @@ pub fn get_workbuddy_sessions_with(
             form: ProcessForm::App,
             jump_supported: jump_supported_for(ProcessForm::App),
             unread: false, // 扫描出的活跃卡默认非未读；未读卡由 adapter 层合并
+            unread_turned_green_at_ms: None,
         });
 
         // 记录本轮 pid→(tool, session)（心跳消失补偿依据）。**只记有心跳文件的候选**：
@@ -1788,6 +1863,71 @@ mod tests {
     }
 
     // ---- 心跳消失竞态补偿（spec §8 测试策略：tempdir 驱动，注入 home/时钟/观测表）----
+
+    #[test]
+    fn strict_finder_returns_none_only_for_confirmed_missing() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join(".workbuddy/projects")).unwrap();
+        assert_eq!(
+            find_session_jsonl_strict(home.path(), "/p/A", "s1").unwrap(),
+            None
+        );
+    }
+
+    /// 主目录不可读 → 严格入口必须报错，不能返回 None 伪装“没有用量”。
+    #[cfg(unix)]
+    #[test]
+    fn strict_finder_propagates_unreadable_primary_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let dir = home
+            .path()
+            .join(".workbuddy/projects")
+            .join(mangle_project_path("/p/A"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let proc = dir.join("s1.jsonl");
+        std::fs::write(&proc, "{}\n").unwrap();
+        let original = std::fs::metadata(&dir).unwrap().permissions();
+        let mut locked = original.clone();
+        locked.set_mode(0o000);
+        std::fs::set_permissions(&dir, locked).unwrap();
+        if std::fs::metadata(&proc).is_ok() {
+            std::fs::set_permissions(&dir, original).unwrap();
+            return; // root/ACL 环境无法构造权限失败
+        }
+        let err = find_session_jsonl_strict(home.path(), "/p/A", "s1").unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        std::fs::set_permissions(&dir, original).unwrap();
+        assert!(
+            find_session_jsonl_strict(home.path(), "/p/A", "s1")
+                .unwrap()
+                .is_some(),
+            "权限恢复后必须能继续定位"
+        );
+    }
+
+    /// 兜底目录枚举/候选读取失败 → 严格入口报错。
+    #[cfg(unix)]
+    #[test]
+    fn strict_finder_propagates_unreadable_fallback_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let projects = home.path().join(".workbuddy/projects");
+        std::fs::create_dir_all(projects.join("p-A")).unwrap();
+        let other = projects.join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        let original = std::fs::metadata(&other).unwrap().permissions();
+        let mut locked = original.clone();
+        locked.set_mode(0o000);
+        std::fs::set_permissions(&other, locked).unwrap();
+        if std::fs::metadata(other.join("s1.jsonl")).is_ok() {
+            std::fs::set_permissions(&other, original).unwrap();
+            return;
+        }
+        let err = find_session_jsonl_strict(home.path(), "/p/A", "s1").unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        std::fs::set_permissions(&other, original).unwrap();
+    }
 
     /// 新工作判据只认业务条目；后台记账/标题/快照不得推进时间。
     #[test]

@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::{file_key_of, file_read_failure_is_benign, DeltaBuilder, PendingTools};
-use crate::monitor::workbuddy_parser::{find_session_jsonl, is_strict_uuid_form};
+use crate::monitor::workbuddy_parser::{find_session_jsonl_strict, is_strict_uuid_form};
 use crate::services::usage::collect::{CollectContext, UsageCollector};
 use crate::services::usage::delta::{DetailKey, SourceDelta};
 use crate::services::usage::error::UsageError;
@@ -305,13 +305,23 @@ pub fn collect_with_home(
         // （W-06 / D-24 同族）——否则 UI 上表现为「WorkBuddy 没有用量」，而且此后每轮都是 0。
         // （Task 14 在 `sqlite.rs:56-61` 有意选择的「BUSY 时静默降级到 immutable」那条取舍**不动**：
         //  它管的是「能打开」，这里管的是「两者都打不开」。）
-        if db.exists() {
-            return Err(UsageError::new(
-                "usage-source-io",
-                format!("open {} failed (db exists but unreadable)", db.display()),
-            ));
+        match std::fs::metadata(&db) {
+            Ok(_) => {
+                return Err(UsageError::new(
+                    "usage-source-io",
+                    format!("open {} failed (db exists but unreadable)", db.display()),
+                ))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(SourceDelta::default()); // 未安装 WorkBuddy：零产物不算失败
+            }
+            Err(e) => {
+                return Err(UsageError::new(
+                    "usage-source-io",
+                    format!("stat {} failed: {e}", db.display()),
+                ))
+            }
         }
-        return Ok(SourceDelta::default()); // 未安装 WorkBuddy：零产物不算失败
     };
     let sessions = load_sessions(&conn, &db)?;
     // **供应商规则从 ctx 注入**（GC 21 / §3.2.3 FIX-6）：lib 单测构建注入空规则 → 零 DB；
@@ -326,8 +336,15 @@ pub fn collect_with_home(
     let main_session_ids: std::collections::HashSet<String> =
         sessions.iter().map(|(id, _, _)| id.clone()).collect();
     for (id, cwd, title) in sessions {
-        let Some(jsonl) = find_session_jsonl(home, &cwd, &id) else {
-            continue;
+        let jsonl = match find_session_jsonl_strict(home, &cwd, &id) {
+            Ok(Some(p)) => p,
+            Ok(None) => continue,
+            Err(e) => {
+                return Err(UsageError::new(
+                    "usage-source-io",
+                    format!("locate session {} jsonl failed: {e}", id),
+                ))
+            }
         };
         // 游标键 = **相对 `~/.workbuddy` 的路径**（B5：唯一性由路径给，不由文件名给）
         let file_key = file_key_of(&root, &jsonl);
@@ -360,7 +377,7 @@ const SUBAGENT_HEAD_LINES: usize = 200;
 
 /// 读文件头部若干完整行（`max_bytes` 或 `max_lines`，先到者）。
 /// 截断点可能切在行中间 → 只在最后一个 `\n` 处切；整文件读完时按原样切行。
-/// 读失败 → 空表（身份解析随即走 stem 兜底；真正的读失败由 `read_incremental` 响亮上报，
+/// 读失败 → 空表（身份解析随即走命名空间文件键兜底；真正的读失败由 `read_incremental` 响亮上报，
 /// 这里不再重复报错——否则同一故障会被报两次、且此处无法区分是「消失」还是「读不了」）。
 fn read_head_lines(path: &std::path::Path, max_bytes: u64, max_lines: usize) -> Vec<String> {
     use std::io::Read;
@@ -385,18 +402,34 @@ fn read_head_lines(path: &std::path::Path, max_bytes: u64, max_lines: usize) -> 
         .collect()
 }
 
+/// 子代理身份与父会话/任一主会话冲突判定。`usage_session.is_subagent` 是 `MAX()`
+/// 只升不降，误标一次就不可逆，所以三条身份路径（行内、降级、缓存）共用此校验。
+fn subagent_id_conflicts(
+    id: &str,
+    parent_id: &str,
+    main_session_ids: &std::collections::HashSet<String>,
+) -> bool {
+    id == parent_id || main_session_ids.contains(id)
+}
+
+/// 降级身份的命名空间：包含相对文件键，既避开父/主会话 id，也避免不同父目录下
+/// 同名 `*.jsonl` 串号。
+fn degraded_subagent_id(file_key: &str) -> String {
+    format!("workbuddy-subagent:{file_key}")
+}
+
 /// 解析子代理会话身份（设计 §2.3）：返回 `(会话 id, 是否降级)`。
 ///
 /// 判据顺序：
 /// 1. **优先**「`providerData.isSubAgent == true` 且 `sessionId` 通过严格 UUID」的第一行
 ///    ——真机 5.9.3 的 assistant / function_call 行带这个标记，首条 user 行可能没有；
 /// 2. 否则取任何通过严格 UUID 的第一行 `sessionId`；
-/// 3. **自指/串号拒绝**：结果等于父会话 id，或等于**任何** DB 主会话 id → 拒绝，回退文件名
-///    stem（`agent-<agentId>`）并 warn。`usage_session.is_subagent` 是 `MAX()` 只升不降，
-///    误标一次就永远改不回来，宁可降级也不能串号；
-/// 4. 完全没有 UUID → 文件名 stem + warn（stem 仍是稳定唯一键，**不丢用量**）。
+/// 3. **自指/串号拒绝**：结果等于父会话 id，或等于**任何** DB 主会话 id → 拒绝，回退
+///    **命名空间文件键** `workbuddy-subagent:<file_key>` 并 warn；
+/// 4. 完全没有 UUID → 同一命名空间文件键 + warn（稳定唯一键，**不丢用量**）。
 fn resolve_subagent_session_id(
     path: &std::path::Path,
+    file_key: &str,
     parent_id: &str,
     main_session_ids: &std::collections::HashSet<String>,
 ) -> (String, bool) {
@@ -424,30 +457,20 @@ fn resolve_subagent_session_id(
             fallback = Some(sid.to_string());
         }
     }
-    let stem = || {
-        path.file_stem()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_else(|| "unknown-subagent".to_string())
-    };
     match preferred.or(fallback) {
-        Some(id) if id == parent_id || main_session_ids.contains(&id) => {
+        Some(id) if !subagent_id_conflicts(&id, parent_id, main_session_ids) => (id, false),
+        Some(id) => {
+            let degraded = degraded_subagent_id(file_key);
             log::warn!(
                 "usage/workbuddy: 子代理文件 {} 的 sessionId {id} 命中主会话 id（父 {parent_id}）\
-                 ——拒绝该身份，回退文件名 stem「{}」（否则会把主会话不可逆地标成子代理）",
-                path.display(),
-                stem()
+                 ——拒绝该身份，降级为命名空间文件键「{degraded}」（否则会把主会话不可逆地标成子代理）",
+                path.display()
             );
-            (stem(), true)
+            (degraded, true)
         }
-        Some(id) => (id, false),
-        None => (
-            // 降级本身由调用方 warn（这里返回标志位，保持「一处日志」）
-            stem(),
-            true,
-        ),
+        None => (degraded_subagent_id(file_key), true),
     }
 }
-
 /// **单文件采集（唯一实现）**：父会话 jsonl 与子代理 jsonl 走同一遍扫描。
 /// 抽出来的目的（R1）：子代理文件与父会话同形（用量在 `message.usage`、模型在
 /// `providerData.model`、工具配对靠 `callId`），**口径必须逐字同源**——各写一份必然漂移。
@@ -559,10 +582,21 @@ fn collect_file(
         session_id.to_string()
     } else if state.subagent_session_id.is_empty() {
         let parent_id = parent_session_id.as_deref().unwrap_or_default();
-        let (sid, degraded) = resolve_subagent_session_id(jsonl, parent_id, main_session_ids);
+        let (sid, degraded) =
+            resolve_subagent_session_id(jsonl, file_key, parent_id, main_session_ids);
+        if subagent_id_conflicts(&sid, parent_id, main_session_ids) {
+            return Err(UsageError::new(
+                "usage-source-io",
+                format!(
+                    "workbuddy subagent identity {sid} for {} conflicts with parent {parent_id} \
+                     or a DB main session; refusing to record",
+                    jsonl.display()
+                ),
+            ));
+        }
         if degraded {
             log::warn!(
-                "usage/workbuddy: 子代理文件 {} 的身份已降级为文件名 stem「{}」（父会话 {}）",
+                "usage/workbuddy: 子代理文件 {} 的身份已降级为命名空间文件键「{}」（父会话 {}）",
                 jsonl.display(),
                 sid,
                 parent_id
@@ -571,7 +605,19 @@ fn collect_file(
         state.subagent_session_id = sid.clone();
         sid
     } else {
-        state.subagent_session_id.clone()
+        let parent_id = parent_session_id.as_deref().unwrap_or_default();
+        let cached = state.subagent_session_id.clone();
+        if subagent_id_conflicts(&cached, parent_id, main_session_ids) {
+            return Err(UsageError::new(
+                "usage-source-io",
+                format!(
+                    "cached WorkBuddy subagent identity {cached} for {} conflicts with parent \
+                     {parent_id} or a DB main session; refusing to record (file-scoped rebuild required)",
+                    jsonl.display()
+                ),
+            ));
+        }
+        cached
     };
     // 「模型未知期间」的原始行（**按行缓存**，见 `process_line` 的文档；D-32 同款）
     let mut pending: Vec<String> = Vec::new();
@@ -1388,6 +1434,47 @@ mod tests {
         );
     }
 
+    /// 文件定位权限故障必须整源报错；权限恢复后同一目录应继续正常采集。
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_project_dir_fails_then_recovers() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        make_db(dir.path(), &[("s1", "/p/A")]);
+        write_jsonl(
+            dir.path(),
+            "p-A",
+            "s1",
+            &[json!({"type":"message","role":"assistant","timestamp":1000,
+                     "cwd":"/p/A","sessionId":"s1",
+                     "message":{"usage":{"input_tokens":10,"output_tokens":1,"total_tokens":11}},
+                     "providerData":{"model":"deepseek-v4.1-flash"}})],
+        );
+        let proj = dir.path().join(".workbuddy/projects/p-A");
+        let original = std::fs::metadata(&proj).unwrap().permissions();
+        let mut locked = original.clone();
+        locked.set_mode(0o000);
+        std::fs::set_permissions(&proj, locked).unwrap();
+        if std::fs::metadata(proj.join("s1.jsonl")).is_ok() {
+            std::fs::set_permissions(&proj, original).unwrap();
+            return;
+        }
+        let no_cursors = HashMap::new();
+        let ctx = CollectContext::new(dir.path(), 1_700_000_000_000, &no_cursors);
+        let err = collect_with_home(&ctx, dir.path())
+            .expect_err("projects 子目录不可读必须报 usage-source-io");
+        assert_eq!(err.code, "usage-source-io");
+        assert!(err.detail.contains("locate session"), "{}", err.detail);
+
+        std::fs::set_permissions(&proj, original).unwrap();
+        let (delta, _) = run(dir.path(), &no_cursors);
+        assert!(
+            delta.sessions.iter().any(|s| s.session_id == "s1"),
+            "权限恢复后必须继续采集：{:?}",
+            delta.sessions
+        );
+    }
+
     /// 已有游标的文件被截断 / 重写 → 拒绝写入加法账本，保留旧账本与旧游标。
     /// 不能像旧实现那样从 0 重读并继续累加（已入账前缀会重复计入）；需要按文件归属
     /// 做专用重建（另开任务），而不是整库清空重采。
@@ -1905,14 +1992,15 @@ mod tests {
                        "providerData":{"isSubAgent":true,"model":"deepseek-v4.1-flash"}}),
             ],
         );
+        let key = "projects/p-A/s1/subagents/agent-head.jsonl";
         let (id, degraded) =
-            resolve_subagent_session_id(&p, PARENT_ID, &std::collections::HashSet::new());
+            resolve_subagent_session_id(&p, key, PARENT_ID, &std::collections::HashSet::new());
         assert_eq!(id, SUBAGENT_ID, "身份必须取行内 sessionId，不是文件名");
         assert!(!degraded, "行内 UUID 可用 → 不得降级");
         assert!(!id.contains("agent-"), "不得回退文件名 stem：{id}");
     }
 
-    /// 整文件没有严格 UUID 的 `sessionId` → 文件名 stem 兜底（稳定唯一键），**仍入账**
+    /// 整文件没有严格 UUID 的 `sessionId` → 命名空间文件键兜底（稳定唯一键），**仍入账**
     #[test]
     fn subagent_identity_falls_back_to_file_stem() {
         let dir = tempfile::tempdir().unwrap();
@@ -1926,13 +2014,18 @@ mod tests {
                        "providerData":{"isSubAgent":true}}),
             ],
         );
+        let key = "projects/p-A/s1/subagents/fallback.jsonl";
         let (id, degraded) =
-            resolve_subagent_session_id(&p, PARENT_ID, &std::collections::HashSet::new());
-        assert_eq!(id, stem, "没有 UUID → 回退文件名 stem");
+            resolve_subagent_session_id(&p, key, PARENT_ID, &std::collections::HashSet::new());
+        assert_eq!(
+            id,
+            degraded_subagent_id(key),
+            "没有 UUID → 回退命名空间文件键"
+        );
         assert!(degraded, "降级必须可见（调用方据此 warn）");
     }
 
-    /// **防自指**：解析结果 == 父会话 id → 拒绝并回退 stem。
+    /// **防自指**：解析结果 == 父会话 id → 拒绝并回退命名空间文件键。
     /// 放任的后果不可逆：父会话被 `MAX(is_subagent)` 永久标成子代理 → 从会话数/turn 层消失。
     #[test]
     fn subagent_identity_equal_to_parent_is_rejected() {
@@ -1946,10 +2039,11 @@ mod tests {
                      "providerData":{"isSubAgent":true}}),
             ],
         );
+        let key = "projects/p-A/s1/subagents/parent-id.jsonl";
         let (id, degraded) =
-            resolve_subagent_session_id(&p, PARENT_ID, &std::collections::HashSet::new());
+            resolve_subagent_session_id(&p, key, PARENT_ID, &std::collections::HashSet::new());
         assert_ne!(id, PARENT_ID, "不得把父会话 id 当成子代理身份");
-        assert_eq!(id, stem);
+        assert_eq!(id, degraded_subagent_id(key));
         assert!(degraded);
     }
 
@@ -1970,9 +2064,127 @@ mod tests {
             [PARENT_ID.to_string(), OTHER_UUID.to_string()]
                 .into_iter()
                 .collect();
-        let (id, degraded) = resolve_subagent_session_id(&p, PARENT_ID, &mains);
-        assert_eq!(id, stem, "命中任一主会话 id 都必须拒绝");
+        let key = "projects/p-A/s1/subagents/other-main.jsonl";
+        let (id, degraded) = resolve_subagent_session_id(&p, key, PARENT_ID, &mains);
+        assert_eq!(
+            id,
+            degraded_subagent_id(key),
+            "命中任一主会话 id 都必须拒绝"
+        );
         assert!(degraded);
+    }
+
+    /// stem 等于父 ID（文件名就是父 UUID）→ 降级命名空间键，绝不能落成父会话 id。
+    #[test]
+    fn subagent_stem_equal_to_parent_is_namespaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write_head_file(
+            dir.path(),
+            &format!("{PARENT_ID}.jsonl"),
+            &[json!({"type":"message","role":"user","sessionId":"not-a-uuid","timestamp":1})],
+        );
+        let key = format!("projects/p-A/s1/subagents/{PARENT_ID}.jsonl");
+        let (id, degraded) =
+            resolve_subagent_session_id(&p, &key, PARENT_ID, &std::collections::HashSet::new());
+        assert_ne!(id, PARENT_ID);
+        assert_eq!(id, degraded_subagent_id(&key));
+        assert!(degraded);
+    }
+
+    /// 不同父目录下同名降级文件不得串号：命名空间键包含相对文件键。
+    #[test]
+    fn same_stem_in_different_dirs_gets_distinct_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let p1 = write_head_file(
+            &dir.path().join("a"),
+            "agent-same.jsonl",
+            &[json!({"type":"message","role":"user","timestamp":1})],
+        );
+        let p2 = write_head_file(
+            &dir.path().join("b"),
+            "agent-same.jsonl",
+            &[json!({"type":"message","role":"user","timestamp":1})],
+        );
+        let id1 = resolve_subagent_session_id(
+            &p1,
+            "projects/A/s1/subagents/agent-same.jsonl",
+            "s1",
+            &std::collections::HashSet::new(),
+        )
+        .0;
+        let id2 = resolve_subagent_session_id(
+            &p2,
+            "projects/B/s1/subagents/agent-same.jsonl",
+            "s1",
+            &std::collections::HashSet::new(),
+        )
+        .0;
+        assert_ne!(id1, id2);
+        assert!(id1.starts_with("workbuddy-subagent:"));
+        assert!(id2.starts_with("workbuddy-subagent:"));
+    }
+
+    /// 旧缓存里的冲突身份不得静默换 ID 重采：直接整源报错，等待文件级重建。
+    #[test]
+    fn cached_conflicting_subagent_identity_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        make_db(dir.path(), &[("s1", "/p/A")]);
+        write_jsonl(
+            dir.path(),
+            "p-A",
+            "s1",
+            &[
+                json!({"type":"message","role":"assistant","timestamp":1000,"cwd":"/p/A",
+                     "sessionId":"s1","message":{"usage":{"input_tokens":1,"output_tokens":1,
+                     "total_tokens":2}},"providerData":{"model":"deepseek-v4.1-flash"}}),
+            ],
+        );
+        let sub = write_subagent_jsonl(
+            dir.path(),
+            "p-A",
+            "s1",
+            "agent-other.jsonl",
+            &[
+                json!({"type":"message","role":"assistant","timestamp":1500,"cwd":"/p/A",
+                     "sessionId":SUBAGENT_ID,
+                     "message":{"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}},
+                     "providerData":{"model":"deepseek-v4.1-flash","isSubAgent":true}}),
+            ],
+        );
+        let no_cursors = HashMap::new();
+        let (d1, _) = run(dir.path(), &no_cursors);
+        let mut cursors: HashMap<_, _> = d1
+            .cursors
+            .iter()
+            .map(|c| (c.session_id.clone(), c.clone()))
+            .collect();
+        let sub_key = cursors
+            .keys()
+            .find(|k| k.contains("subagents"))
+            .cloned()
+            .unwrap();
+        let mut state: serde_json::Value =
+            serde_json::from_str(&cursors[&sub_key].state_json).unwrap();
+        state["subagent_session_id"] = json!("s1"); // 冲突：等于父会话 id
+        cursors.get_mut(&sub_key).unwrap().state_json = state.to_string();
+
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new().append(true).open(&sub).unwrap();
+        writeln!(
+            f,
+            "{}",
+            json!({"type":"message","role":"assistant","timestamp":1600,"cwd":"/p/A",
+                   "sessionId":SUBAGENT_ID,
+                   "message":{"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}},
+                   "providerData":{"model":"deepseek-v4.1-flash","isSubAgent":true}})
+        )
+        .unwrap();
+        let ctx = CollectContext::new(dir.path(), 1_700_000_000_000, &cursors);
+        let err =
+            collect_with_home(&ctx, dir.path()).expect_err("缓存身份冲突必须报错，不得静默换 ID");
+        assert_eq!(err.code, "usage-source-io");
+        assert!(err.detail.contains("cached"), "{}", err.detail);
+        assert!(err.detail.contains("conflicts"), "{}", err.detail);
     }
 
     // ---- A3：子代理目录枚举与独立入账（真机 5.9.3 形态）----

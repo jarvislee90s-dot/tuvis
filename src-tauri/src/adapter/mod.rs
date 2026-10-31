@@ -1590,6 +1590,7 @@ mod tests {
             form: crate::session::ProcessForm::Cli,
             jump_supported: false,
             unread: false,
+            unread_turned_green_at_ms: None,
         }
     }
 
@@ -2806,17 +2807,30 @@ fn mark_active_unread_cards(
     active: &mut [Session],
     pool: &[crate::database::dao::unread::UnreadSessionRecord],
 ) {
-    let keys: HashSet<(String, String)> = pool
+    let turned_green: HashMap<(String, String), i64> = pool
         .iter()
-        .map(|r| (r.tool_id.clone(), r.session_id.clone()))
+        .map(|r| {
+            (
+                (r.tool_id.clone(), r.session_id.clone()),
+                r.turned_green_at_ms,
+            )
+        })
         .collect();
     for s in active.iter_mut() {
+        let Some(green_at) = turned_green.get(&(s.agent_type.tool_id().to_string(), s.id.clone()))
+        else {
+            continue;
+        };
         if s.agent_type == AgentType::WorkBuddy
             && s.pid == 0
             && matches!(s.status, SessionStatus::Idle | SessionStatus::Finished)
-            && keys.contains(&(s.agent_type.tool_id().to_string(), s.id.clone()))
         {
             s.unread = true;
+        }
+        if s.unread {
+            // 业务活动时间保留给已读判断；通知新鲜度用独立转绿时间。
+            // 覆盖 WorkBuddy DB-only 卡与 Codex/ZCode 数据驱动绿卡。
+            s.unread_turned_green_at_ms = Some(*green_at);
         }
     }
 }
@@ -2870,6 +2884,7 @@ fn build_unread_cards(
             form: ProcessForm::App,
             jump_supported: jump_supported_for(ProcessForm::App),
             unread: true,
+            unread_turned_green_at_ms: Some(r.turned_green_at_ms),
         });
     }
     cards
@@ -2967,6 +2982,7 @@ mod host_liveness_filter_tests {
             form,
             jump_supported: true,
             unread,
+            unread_turned_green_at_ms: None,
         }
     }
 
@@ -3258,6 +3274,7 @@ mod dedup_tests {
             form: ProcessForm::Cli,
             jump_supported: true,
             unread: false,
+            unread_turned_green_at_ms: None,
         }
     }
 
@@ -3298,6 +3315,7 @@ mod sort_tests {
             form: ProcessForm::App,
             jump_supported: true,
             unread,
+            unread_turned_green_at_ms: None,
         }
     }
 
@@ -3385,6 +3403,7 @@ mod unread_card_tests {
             form: ProcessForm::App,
             jump_supported: true,
             unread: false,
+            unread_turned_green_at_ms: None,
         }
     }
 
@@ -3885,6 +3904,11 @@ mod unread_card_tests {
         let pool = vec![record("workbuddy", "s1")];
         mark_active_unread_cards(&mut active, &pool);
         assert!(active[0].unread, "DB-only completed 卡必须呈现未读");
+        assert_eq!(
+            active[0].unread_turned_green_at_ms,
+            Some(1000),
+            "未读卡必须复制池里的转绿时间，通知不能用旧业务活动时间"
+        );
         assert!(
             build_unread_cards(&pool, &active, &|_| true).is_empty(),
             "active 已标 unread 时不得再追加同会话池卡"
@@ -3895,6 +3919,13 @@ mod unread_card_tests {
         heartbeat_card[0].status = SessionStatus::Idle;
         mark_active_unread_cards(&mut heartbeat_card, &pool);
         assert!(!heartbeat_card[0].unread, "有心跳 pid 的卡不因池行提前染色");
+        assert_eq!(heartbeat_card[0].unread_turned_green_at_ms, None);
+
+        // 数据驱动绿卡（Codex/ZCode）已在 sync 标 unread；合并时同样复制转绿时间。
+        let mut codex_card = vec![active_card(AgentType::Codex, "c1")];
+        codex_card[0].unread = true;
+        mark_active_unread_cards(&mut codex_card, &[record("codex", "c1")]);
+        assert_eq!(codex_card[0].unread_turned_green_at_ms, Some(1000));
     }
 
     #[test]
@@ -3913,6 +3944,7 @@ mod unread_card_tests {
         assert_eq!(c.pid, 0);
         assert_eq!(c.form, ProcessForm::App);
         assert_eq!(c.status, SessionStatus::Idle);
+        assert_eq!(c.unread_turned_green_at_ms, Some(1000));
     }
 
     #[test]
@@ -4009,6 +4041,7 @@ mod stale_mark_expiry_tests {
             form: crate::session::ProcessForm::Cli,
             jump_supported: false,
             unread: false,
+            unread_turned_green_at_ms: None,
         }
     }
 

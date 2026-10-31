@@ -5,10 +5,16 @@ import { FIRST_SEEN_UNREAD_FRESH_MS, isFreshFirstSeenUnread } from "@/hooks/useN
 
 const NOW = 1_800_000_000_000;
 
-const mkSession = (overrides: { unread?: boolean; status?: string; lastActivityAt?: string }) => ({
+const mkSession = (overrides: {
+  unread?: boolean;
+  status?: string;
+  lastActivityAt?: string;
+  unreadTurnedGreenAtMs?: number | null;
+}) => ({
   unread: overrides.unread ?? true,
   status: overrides.status ?? "idle",
   lastActivityAt: overrides.lastActivityAt ?? new Date(NOW - 30_000).toISOString(),
+  unreadTurnedGreenAtMs: overrides.unreadTurnedGreenAtMs,
 });
 
 describe("isFreshFirstSeenUnread（review F5 新鲜度门控）", () => {
@@ -46,5 +52,35 @@ describe("isFreshFirstSeenUnread（review F5 新鲜度门控）", () => {
 
   it("lastActivityAt 无法解析（空串）→ 保守静默", () => {
     expect(isFreshFirstSeenUnread(mkSession({ lastActivityAt: "" }), NOW)).toBe(false);
+  });
+
+  it("业务活动十分钟前、转绿现在 → 用独立转绿时间通知一次", () => {
+    expect(
+      isFreshFirstSeenUnread(
+        mkSession({
+          lastActivityAt: new Date(NOW - 10 * 60_000).toISOString(),
+          unreadTurnedGreenAtMs: NOW,
+        }),
+        NOW
+      )
+    ).toBe(true);
+  });
+
+  it("转绿时间超过 2 分钟 → 即使业务时间较新也静默", () => {
+    expect(
+      isFreshFirstSeenUnread(
+        mkSession({
+          lastActivityAt: new Date(NOW - 10_000).toISOString(),
+          unreadTurnedGreenAtMs: NOW - 10 * 60_000,
+        }),
+        NOW
+      )
+    ).toBe(false);
+  });
+
+  it("已读后无新业务 → 不通知", () => {
+    expect(
+      isFreshFirstSeenUnread(mkSession({ unread: false, unreadTurnedGreenAtMs: NOW }), NOW)
+    ).toBe(false);
   });
 });

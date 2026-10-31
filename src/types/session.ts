@@ -34,6 +34,8 @@ export interface Session {
   jumpSupported: boolean;
   /** 未读标记（W4）：绿色已完成且用户未查看的持久未读卡（APP 类专用） */
   unread: boolean;
+  /** 未读池首次转绿时间（epoch ms）；通知新鲜度用它，不用业务 lastActivityAt */
+  unreadTurnedGreenAtMs?: number | null;
 }
 
 export interface SessionsResponse {
