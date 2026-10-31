@@ -364,7 +364,7 @@ static STOP_GRACE: Lazy<Mutex<HashMap<u32, (i64, i64)>>> = Lazy::new(|| Mutex::n
 static PENDING_UNREAD_RETRIES: Lazy<Mutex<HashMap<(String, String), i64>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 const PENDING_TTL_MS: i64 = 24 * 3600 * 1000;
-static PENDING_LOADED: std::sync::Once = std::sync::Once::new();
+static PENDING_LOADED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn pending_key(tool: &str, sid: &str) -> String {
     format!("{tool}\u{1f}{sid}")
@@ -435,18 +435,51 @@ fn replace_pending_file_atomic(tmp: &std::path::Path, path: &std::path::Path) ->
     std::fs::rename(tmp, path).is_ok()
 }
 
-/// 读取待重试快照：主文件缺失/损坏时回退 `.bak`（兼容替换过程中的崩溃窗口）。
-fn load_pending_map(path: &std::path::Path) -> Option<HashMap<String, i64>> {
-    let backup = pending_backup_path(path);
-    for candidate in [path, backup.as_path()] {
-        let Ok(raw) = std::fs::read_to_string(candidate) else {
-            continue;
-        };
-        if let Ok(map) = serde_json::from_str::<HashMap<String, i64>>(&raw) {
-            return Some(map);
-        }
+#[derive(Debug)]
+enum PendingSnapshot {
+    Valid(HashMap<String, i64>),
+    Missing,
+    Invalid,
+    IoError,
+}
+
+#[derive(Debug)]
+enum PendingLoad {
+    Loaded(HashMap<String, i64>),
+    Absent,
+    Failed,
+}
+
+fn read_pending_snapshot(path: &std::path::Path) -> PendingSnapshot {
+    match std::fs::read_to_string(path) {
+        Ok(raw) => match serde_json::from_str::<HashMap<String, i64>>(&raw) {
+            Ok(map) => PendingSnapshot::Valid(map),
+            Err(_) => PendingSnapshot::Invalid,
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => PendingSnapshot::Missing,
+        Err(_) => PendingSnapshot::IoError,
     }
-    None
+}
+
+/// 读取待重试快照：主文件缺失/损坏时回退 `.bak`（兼容替换过程中的崩溃窗口）。
+/// `Failed` 表示读取/解析暂时失败，调用方应保留“未加载”状态并在下一轮重试。
+fn load_pending_map(path: &std::path::Path) -> PendingLoad {
+    let backup = pending_backup_path(path);
+    match read_pending_snapshot(path) {
+        PendingSnapshot::Valid(map) => PendingLoad::Loaded(map),
+        PendingSnapshot::IoError => PendingLoad::Failed,
+        PendingSnapshot::Missing => match read_pending_snapshot(&backup) {
+            PendingSnapshot::Valid(map) => PendingLoad::Loaded(map),
+            PendingSnapshot::Missing => PendingLoad::Absent,
+            PendingSnapshot::Invalid | PendingSnapshot::IoError => PendingLoad::Failed,
+        },
+        PendingSnapshot::Invalid => match read_pending_snapshot(&backup) {
+            PendingSnapshot::Valid(map) => PendingLoad::Loaded(map),
+            PendingSnapshot::Missing | PendingSnapshot::Invalid | PendingSnapshot::IoError => {
+                PendingLoad::Failed
+            }
+        },
+    }
 }
 
 /// 原子性优先的写盘：先写 tmp；直接 rename 成功（Unix）即完成。失败时**保留旧文件**
@@ -475,10 +508,69 @@ fn persist_pending_map(path: &std::path::Path, map: &HashMap<String, i64>) -> bo
 /// `.bak` 回退兜底。
 fn replace_pending_file_with_backup(tmp: &std::path::Path, path: &std::path::Path) -> bool {
     let backup = pending_backup_path(path);
-    // 主文件缺失时 .bak 可能是唯一有效快照（上次替换中崩溃），不得先清掉。
-    if path.exists() {
-        let _ = std::fs::remove_file(&backup);
+    let primary_snapshot = read_pending_snapshot(path);
+    let backup_snapshot = read_pending_snapshot(&backup);
+    if matches!(&primary_snapshot, PendingSnapshot::IoError) {
+        // 主文件暂时不可读：可能只是占用/权限抖动；保留主文件与 .bak，下一轮再试。
+        log::warn!(
+            "unread: 待重试标记主文件暂时不可读 {}（保留现有文件，降级）",
+            path.display()
+        );
+        let _ = std::fs::remove_file(tmp);
+        return false;
     }
+    let primary_valid = matches!(&primary_snapshot, PendingSnapshot::Valid(_));
+    let backup_valid = matches!(&backup_snapshot, PendingSnapshot::Valid(_));
+    let primary_exists = match path.try_exists() {
+        Ok(exists) => exists,
+        Err(e) => {
+            log::warn!(
+                "unread: 无法确认待重试标记主文件状态 {}（保留现有文件，降级）: {e}",
+                path.display()
+            );
+            let _ = std::fs::remove_file(tmp);
+            return false;
+        }
+    };
+
+    // 主文件已损坏/不可用，而 .bak 是唯一有效快照：只移除损坏主文件，绝不覆盖 .bak。
+    // 若 tmp 换入失败，.bak 仍可供下次启动恢复。
+    if !primary_valid && backup_valid {
+        if primary_exists {
+            if let Err(e) = std::fs::remove_file(path) {
+                log::warn!(
+                    "unread: 待重试标记损坏主文件无法移除 {}（保留 .bak，降级）: {e}",
+                    path.display()
+                );
+                let _ = std::fs::remove_file(tmp);
+                return false;
+            }
+        }
+        if let Err(e) = std::fs::rename(tmp, path) {
+            log::warn!("unread: 待重试标记换入失败（保留唯一有效 .bak 供恢复）: {e}");
+            let _ = std::fs::remove_file(tmp);
+            return false;
+        }
+        let _ = std::fs::remove_file(&backup);
+        return true;
+    }
+
+    // 无主文件且无有效备份：无旧快照可保；直接换入，失败则保持原状。
+    if !primary_exists {
+        if std::fs::rename(tmp, path).is_ok() {
+            let _ = std::fs::remove_file(&backup);
+            return true;
+        }
+        log::warn!(
+            "unread: 待重试标记无主文件时换入失败 {}（降级）",
+            path.display()
+        );
+        let _ = std::fs::remove_file(tmp);
+        return false;
+    }
+
+    // 主文件存在（有效，或双方都无效）：保留主文件为 .bak 后再换入。
+    let _ = std::fs::remove_file(&backup);
     if let Err(e) = std::fs::rename(path, &backup) {
         log::warn!(
             "unread: 待重试标记替换前无法保留旧文件 {}（保留原文件，降级）: {e}",
@@ -500,26 +592,46 @@ fn replace_pending_file_with_backup(tmp: &std::path::Path, path: &std::path::Pat
     true
 }
 
-/// 恢复持久化的待重试标记（进程内只读一次），并清理 24h 过期项。
-fn load_pending_unread_retries() {
-    PENDING_LOADED.call_once(|| {
-        let path = pending_store_path();
-        let Some(map) = load_pending_map(&path) else {
-            return;
-        };
-        let now = chrono::Utc::now().timestamp_millis();
-        let mut guard = PENDING_UNREAD_RETRIES.lock().unwrap();
-        for (key, since) in map {
-            if now.saturating_sub(since) > PENDING_TTL_MS {
-                continue;
+/// 恢复持久化的待重试标记，并清理 24h 过期项。
+/// 只有成功读取或确认文件不存在才置位 `loaded`；临时 I/O/解析失败留给下一轮重试。
+fn load_pending_unread_retries_into(
+    path: &std::path::Path,
+    loaded: &std::sync::atomic::AtomicBool,
+    retries: &Mutex<HashMap<(String, String), i64>>,
+) {
+    use std::sync::atomic::Ordering;
+    if loaded.load(Ordering::Acquire) {
+        return;
+    }
+    match load_pending_map(path) {
+        PendingLoad::Loaded(map) => {
+            let now = chrono::Utc::now().timestamp_millis();
+            let mut guard = retries.lock().unwrap();
+            for (key, since) in map {
+                if now.saturating_sub(since) > PENDING_TTL_MS {
+                    continue;
+                }
+                if let Some((tool, sid)) = key.split_once('\u{1f}') {
+                    guard
+                        .entry((tool.to_string(), sid.to_string()))
+                        .or_insert(since);
+                }
             }
-            if let Some((tool, sid)) = key.split_once('\u{1f}') {
-                guard
-                    .entry((tool.to_string(), sid.to_string()))
-                    .or_insert(since);
-            }
+            loaded.store(true, Ordering::Release);
         }
-    });
+        PendingLoad::Absent => loaded.store(true, Ordering::Release),
+        PendingLoad::Failed => {
+            log::debug!("unread: 待重试标记暂时不可读，下一轮扫描重试");
+        }
+    }
+}
+
+fn load_pending_unread_retries() {
+    load_pending_unread_retries_into(
+        &pending_store_path(),
+        &PENDING_LOADED,
+        &PENDING_UNREAD_RETRIES,
+    );
 }
 
 /// 每轮清理内存中超过 24h 的待重试标记；有变化才落盘（避免每 3s 写放大）。
@@ -3038,14 +3150,23 @@ mod sort_tests {
 mod unread_card_tests {
     use super::{
         build_unread_cards, clear_unread_retry, filter_deleted_unread, insert_should_skip_for_read,
-        keep_green_card, load_pending_map, mark_active_unread_cards, mark_unread_retry,
-        pending_backup_path, persist_pending_map, replace_pending_file_with_backup,
-        retain_read_completed_cards, retry_insert_allowed, unread_insert_allowed,
-        unread_retry_pending, unread_retry_pending_since,
+        keep_green_card, load_pending_map, load_pending_unread_retries_into,
+        mark_active_unread_cards, mark_unread_retry, pending_backup_path, persist_pending_map,
+        replace_pending_file_with_backup, retain_read_completed_cards, retry_insert_allowed,
+        unread_insert_allowed, unread_retry_pending, unread_retry_pending_since, PendingLoad,
     };
     use crate::database::dao::unread::UnreadSessionRecord;
     use crate::session::model::{AgentType, ProcessForm, Session, SessionStatus};
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Mutex;
+
+    fn loaded_map(path: &std::path::Path) -> Option<HashMap<String, i64>> {
+        match load_pending_map(path) {
+            PendingLoad::Loaded(map) => Some(map),
+            PendingLoad::Absent | PendingLoad::Failed => None,
+        }
+    }
 
     fn record(tool: &str, sid: &str) -> UnreadSessionRecord {
         UnreadSessionRecord {
@@ -3177,18 +3298,18 @@ mod unread_card_tests {
         let mut first = HashMap::new();
         first.insert("workbuddy\u{1f}s1".to_string(), 1_000);
         assert!(persist_pending_map(&path, &first));
-        assert_eq!(load_pending_map(&path), Some(first.clone()));
+        assert_eq!(loaded_map(&path), Some(first.clone()));
 
         let mut second = HashMap::new();
         second.insert("codex\u{1f}s2".to_string(), 2_000);
         assert!(persist_pending_map(&path, &second));
-        assert_eq!(load_pending_map(&path), Some(second));
+        assert_eq!(loaded_map(&path), Some(second));
 
         // 模拟“旧文件已备份、新文件尚未换入”的崩溃窗口
         std::fs::remove_file(&path).unwrap();
         let backup = pending_backup_path(&path);
         std::fs::write(&backup, serde_json::to_string(&first).unwrap()).unwrap();
-        assert_eq!(load_pending_map(&path), Some(first));
+        assert_eq!(loaded_map(&path), Some(first));
     }
 
     /// 替换链路失败时必须保留旧快照，不得出现“旧文件已删、新文件未入”的空窗。
@@ -3206,8 +3327,100 @@ mod unread_card_tests {
         let tmp = path.with_extension("json.tmp");
         std::fs::write(&tmp, "{}").unwrap();
         assert!(!replace_pending_file_with_backup(&tmp, &path));
-        assert_eq!(load_pending_map(&path), Some(old));
+        assert_eq!(loaded_map(&path), Some(old));
         assert!(!tmp.exists());
+    }
+
+    /// 主文件损坏 + .bak 有效 + 第二次换名失败：不得覆盖唯一有效 .bak。
+    #[test]
+    fn pending_retry_corrupt_primary_keeps_valid_backup_on_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("unread_pending_retries.json");
+        let backup = pending_backup_path(&path);
+        let mut old = HashMap::new();
+        old.insert("workbuddy\u{1f}s1".to_string(), 1_000);
+        std::fs::write(&path, "{corrupt").unwrap();
+        std::fs::write(&backup, serde_json::to_string(&old).unwrap()).unwrap();
+
+        // tmp 不存在 → 第二次 rename 必然失败
+        let tmp = path.with_extension("json.tmp");
+        assert!(!replace_pending_file_with_backup(&tmp, &path));
+        assert!(backup.exists());
+        assert_eq!(loaded_map(&path), Some(old));
+    }
+
+    /// 主文件损坏 + .bak 有效：换入成功后清理备份，主文件恢复为有效快照。
+    #[test]
+    fn pending_retry_corrupt_primary_replaced_from_valid_tmp() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("unread_pending_retries.json");
+        let backup = pending_backup_path(&path);
+        let mut old = HashMap::new();
+        old.insert("workbuddy\u{1f}s1".to_string(), 1_000);
+        let mut new = HashMap::new();
+        new.insert("codex\u{1f}s2".to_string(), 2_000);
+        std::fs::write(&path, "{corrupt").unwrap();
+        std::fs::write(&backup, serde_json::to_string(&old).unwrap()).unwrap();
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, serde_json::to_string(&new).unwrap()).unwrap();
+
+        assert!(replace_pending_file_with_backup(&tmp, &path));
+        assert_eq!(loaded_map(&path), Some(new));
+        assert!(!backup.exists());
+        assert!(!tmp.exists());
+    }
+
+    /// 主文件有效 + 第二次换名失败：恢复主文件，不留空窗。
+    #[test]
+    fn pending_retry_second_rename_failure_restores_primary() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("unread_pending_retries.json");
+        let mut old = HashMap::new();
+        old.insert("workbuddy\u{1f}s1".to_string(), 1_000);
+        assert!(persist_pending_map(&path, &old));
+
+        let tmp = path.with_extension("json.tmp");
+        assert!(!replace_pending_file_with_backup(&tmp, &path));
+        assert!(path.exists());
+        assert_eq!(loaded_map(&path), Some(old));
+    }
+
+    /// P3：临时读取/解析失败不消耗加载机会；下一轮成功读取后正常置位。
+    #[test]
+    fn pending_retry_load_retries_after_transient_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("unread_pending_retries.json");
+        std::fs::write(&path, "{corrupt").unwrap();
+        let loaded = AtomicBool::new(false);
+        let retries = Mutex::new(HashMap::new());
+        load_pending_unread_retries_into(&path, &loaded, &retries);
+        assert!(!loaded.load(Ordering::Acquire));
+        assert!(retries.lock().unwrap().is_empty());
+
+        let now = chrono::Utc::now().timestamp_millis();
+        let mut map = HashMap::new();
+        map.insert("codex\u{1f}s2".to_string(), now);
+        std::fs::write(&path, serde_json::to_string(&map).unwrap()).unwrap();
+        load_pending_unread_retries_into(&path, &loaded, &retries);
+        assert!(loaded.load(Ordering::Acquire));
+        assert_eq!(
+            retries
+                .lock()
+                .unwrap()
+                .get(&("codex".to_string(), "s2".to_string())),
+            Some(&now)
+        );
+    }
+
+    /// P3：文件确实不存在视为加载完成，不反复重试。
+    #[test]
+    fn pending_retry_load_absent_marks_loaded() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("unread_pending_retries.json");
+        let loaded = AtomicBool::new(false);
+        let retries = Mutex::new(HashMap::new());
+        load_pending_unread_retries_into(&path, &loaded, &retries);
+        assert!(loaded.load(Ordering::Acquire));
     }
 
     /// P1：已删会话的未读池行不得合并为卡；其他工具同 id 不受影响。
