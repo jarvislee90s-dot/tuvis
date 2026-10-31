@@ -1864,6 +1864,9 @@ mod tests {
         crate::adapter::scan_bus::reset_for_test();
         // 慢快照：无缓存 + 在飞占位（handler 内 ensure_fresh 等满 5s 上限）
         crate::adapter::scan_bus::set_in_flight_for_test(true);
+        // 与握手用例同款：注入扫描通道，慢快照不依赖在飞位的并行状态
+        let (_tx, _rx) = std::sync::mpsc::channel();
+        crate::adapter::scan_bus::set_test_tx_for_test(Some(_tx));
         let state = test_state();
         persist_device(&state, "ev-hold");
         let app = router(state.clone());
@@ -1907,6 +1910,7 @@ mod tests {
             "吊销信号已到，SSE 流必须立即结束（不得再出快照帧）"
         );
         crate::adapter::scan_bus::set_in_flight_for_test(false);
+        crate::adapter::scan_bus::set_test_tx_for_test(None);
     }
 
     // ---- SseRegistry 单元（M4 T0a）----
@@ -2016,6 +2020,10 @@ mod tests {
         let _guard = crate::adapter::scan_bus::test_guard();
         crate::adapter::scan_bus::reset_for_test();
         crate::adapter::scan_bus::set_in_flight_for_test(true);
+        // 同时注入扫描通道：ensure_fresh 走「等待补扫」路径（3s 上限），
+        // 不依赖在飞位是否被并行用例清掉——前提窗口确定性成立
+        let (_tx, _rx) = std::sync::mpsc::channel();
+        crate::adapter::scan_bus::set_test_tx_for_test(Some(_tx));
         let state = test_state();
         let mut headers = axum::http::HeaderMap::new();
         headers.insert("cookie", "mam_device=ev-slow".parse().unwrap());
@@ -2040,6 +2048,7 @@ mod tests {
         // 该快照，不会落到真实扫描（零 ~/.tuvis 接触）
         seed_scan_bus_snapshot();
         crate::adapter::scan_bus::set_in_flight_for_test(false);
+        crate::adapter::scan_bus::set_test_tx_for_test(None);
     }
 
     // ==== M5 A4：吊销收窄（gate 级回归） ====

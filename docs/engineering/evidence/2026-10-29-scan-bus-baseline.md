@@ -425,3 +425,112 @@ pid=34412 wall=300.6s cpu=2.56s avgCPU=0.85% scans=30 scansPerMin=6.0 stats_last
 4. **日志体积 2.27MB/天**：主体是 dsh 解析告警（424/551 行），属 F9 第二刀（dsh 代际路径缓存/日志降噪）范围，本批未做；扫描总线每轮 INFO 已删除（全段仅 2 条档位跃迁）。
 5. **真实账本写入（授权内）**：release 用真实 HOME 运行，启动采集/兜底采集写入真实账本（0 条新记录）；SSE 模拟新增配对设备 `measure-idle`（正常配对流程，可在设置-远程设备中吊销）。
 6. **F5 活体在 debug 影子构建完成**：release 环境无会话卡可点；R1 代码路径与 release 相同（仅数据目录隔离不同），记录为 76ms。
+
+---
+
+### 10.11 第四轮收尾（R8/R9 + E1–E5，2026-10-31 10:50–11:25 +0800）
+
+#### 10.11.1 构建与样本
+
+- 源码：HEAD `a459a96901d3c1357950618b9db1639aaadbc607`（R9）；release 构建 `pnpm build` + `CARGO_BUILD_JOBS=2 pnpm exec tauri build --no-bundle --features marker-helper`。
+- 产物：`src-tauri/target/release/tuvis.exe`，48,315,904 B，sha256 `6a2e2f6ea4bc00f74dbd17dc98851ca8e5c57755351837837f4273236c7ecad0`。
+- 基线：安装版 **0.6.3**（`D:\Program Files\Tuvis\tuvis.exe`），同机、同窗口状态（主窗最小化）；0.6.3 无 stats 文件，用脚本新增的 `-CpuOnly` 只测 CPU。
+- 分支：真实 HOME + release；opencode 会话来自免费模型 `opencode/deepseek-v4.1-flash-free`（已配置，零成本）；测量期间真实生成，额度在测量结束后耗尽（`Free usage limit reached`）。
+
+#### 10.11.2 E1：0.6.3 进程树基线（300s/次）
+
+Away（无远控、主窗最小化）：
+
+```text
+pid=35748 wall=300.6s cpu=17.06s avgCPU=5.68% mode=cpu_only cpu_tree=27.20s avgCPU_tree=9.05% tree_procs=9
+pid=35748 wall=300.8s cpu=51.59s avgCPU=17.15% mode=cpu_only cpu_tree=63.86s avgCPU_tree=21.23% tree_procs=9
+pid=35748 wall=300.5s cpu=55.16s avgCPU=18.35% mode=cpu_only cpu_tree=66.89s avgCPU_tree=22.26% tree_procs=9
+```
+
+Idle（SSE 已连：`PAIR_STATUS 200` / `SSE_STATUS 200`，快照首帧正常）：
+
+```text
+pid=35748 wall=300.5s cpu=49.73s avgCPU=16.55% mode=cpu_only cpu_tree=62.03s avgCPU_tree=20.64% tree_procs=9
+pid=35748 wall=300.5s cpu=51.17s avgCPU=17.03% mode=cpu_only cpu_tree=63.67s avgCPU_tree=21.19% tree_procs=9
+pid=35748 wall=300.4s cpu=49.59s avgCPU=16.51% mode=cpu_only cpu_tree=61.16s avgCPU_tree=20.36% tree_procs=9
+```
+
+基线中位：Away main **17.15%** / tree **21.23%**；Idle main **16.55%** / tree **20.64%**。
+
+#### 10.11.3 E2：Active（release + 真实 opencode 会话）
+
+真实 opencode 会话（免费模型，连续短提示约 3.4s/轮）保持活动，3 次 300s：
+
+```text
+pid=24072 wall=300.6s cpu=10.16s avgCPU=3.38% scans=146 scansPerMin=29.1 stats_last_reason=Event stats_last_duration_ms=60 stats_process_refresh_ms=18 stats_updated_at=2026-10-31T03:08:19.106Z cpu_tree=27.08s avgCPU_tree=9.01% tree_procs=9
+pid=24072 wall=300.5s cpu=11.45s avgCPU=3.81% scans=145 scansPerMin=29.0 stats_last_reason=Event stats_last_duration_ms=56 stats_process_refresh_ms=20 stats_updated_at=2026-10-31T03:13:19.909Z cpu_tree=31.70s avgCPU_tree=10.55% tree_procs=9
+pid=24072 wall=300.5s cpu=10.22s avgCPU=3.40% scans=146 scansPerMin=29.2 stats_last_reason=Event stats_last_duration_ms=60 stats_process_refresh_ms=15 stats_updated_at=2026-10-31T03:18:21.860Z cpu_tree=29.67s avgCPU_tree=9.88% tree_procs=9
+```
+
+- 中位：main **3.40%** / tree **9.88%** / **29.1 次/分**（≤30 达标）。
+- **会话发现延迟（发起→卡片出现，CDP 轮询主窗 DOM 的唯一 token）**：`2455 / 448 / 3000 / 2935 / 2879` ms（另 1 次 20s 超时）；成功样本中位 **2879ms**。该值含 opencode CLI 启动+会话落库（约 0.5–1s）、1s 事件轮询与 Active 2s 档——**未达 ≤2s 门禁**，如实记未达标。
+
+#### 10.11.4 E3：F8 原始样本与 F5 原始 JSON（当前构建）
+
+- F8 `last_process_refresh_ms` 连续 6 次原值：`15, 17, 18, 12, 28, 18` → 排序 `12/15/17/18/18/28`，**中位 17.5ms**（≤25 达标）。
+- F5（release + Active，真实点击单卡 X）：
+
+```json
+{"gone":true,"elapsedMs":2090,"polls":100,"button":"暂不显示（会话状态变化后恢复）"}
+```
+
+  说明：此前两个 75/76ms 是 debug/空闲构建的值；本轮在当前 release 的 **Active 档**点击时，命令内 `scan_after_mutation` 需等待在飞扫描（2s 档），卡片 **2090ms** 后消失。F5 的 ≤1s 门禁在 Active 下**未达标**（空闲路径仍为 76ms）；R8 的降级补排保证「下一窗口最终消失」成立。
+
+#### 10.11.5 E4：稳定性与工程门禁（HEAD a459a969）
+
+- `cargo test --test codex_ipc_remote` 连跑 10 次：**9 通过 / 1 失败**；唯一失败 `t2_a_accepted_b_rejected_pause_survives`（本次），上一轮整包高负载下曾失败 `r3_concurrent_interrupts_each_withdraw_own_token_only`（不同用例）。该用例单独连跑 **30/30 通过**；失败仅出现在整包并行+机器负载下，属既有并发时序抖动，R6（SSE 注册守卫）不触及 pause/token 逻辑，未发现 R6 引入的确定性回归。
+- `cargo test --lib`（连续 5 次，加固 SSE 等待用例后）：**3168 passed / 6 failed**，5 次失败集完全一致：
+  1. `monitor::claude_parser::title_tests::get_claude_sessions_badge_end_to_end_new_layout`
+  2. `monitor::codex_parser::report_flag_tests::report_flag_true_when_task_complete_within_window`
+  3. `monitor::opencode_parser::v2_tests::report_flag_true_when_child_updated_within_window`
+  4. `remote::server::tests::file_endpoints_are_gated_and_safe`
+  5. `services::subagent_detection_tests::detect_subagents_existing_dir_lists_agents`
+  6. `services::subagent_detection_tests::detect_subagents_missing_dir_is_supported_empty`
+- 集成目标既有失败 4 条（tps）：`aged_fully_consumed_files_are_pruned_from_cursor`、`old_placeholder_cursor_starts_fresh_and_never_reinterpreted`、`stale_new_files_skipped_but_cursored_files_always_resume`、`live_serve_task_on_ephemeral_port_serves_one_request_and_releases_guard`。
+- 与改造前 13 条基线逐名对照：以上 10 条均为原 13 条的子集（3 条 dist-mobile 静态用例因本机已有 `dist` 产物转为通过）；**无新增失败**。
+- `cargo clippy --all-targets -j 2 -D warnings`：**0 告警**。
+- `pnpm test`：**202 文件 / 2515 passed / 5 skipped**；`pnpm check`：**EXIT 0**（3 条既有 mobile warning）。
+
+#### 10.11.6 E5：日志口径（scan_bus vs dsh）
+
+release 运行窗口 03:00:50Z–03:23:02Z（约 22.2 分钟）：
+
+| 来源 | 行数 | 字节 | 外推/天 | 口径 |
+| --- | --- | --- | --- | --- |
+| `scan_bus`（仅档位跃迁） | 5 | **479 B** | **≈30 KB/天** | 门禁 ≤1MB/天 → **达标** |
+| `dsh`（解析告警，F9 延后） | 1186 | 160,182 B | ≈10.4 MB/天 | 不计入本批 |
+| 全部日志 | 2358 | 308,982 B | ≈20.0 MB/天 | — |
+
+注：dsh 行数在本轮 Active 下显著升高（每轮扫描告警），属 F9 第二刀（dsh 代际路径缓存/日志降噪）范围。
+
+#### 10.11.7 最终门禁表（2026-10-31，第四轮）
+
+| 门禁项 | 目标 | 结果 | 依据 |
+| --- | --- | --- | --- |
+| 挂机 CPU（主进程） | ≤3% | **达标 0.48%** | §10.10（release）；基线 17.15% |
+| 挂机 CPU（进程树含 WebView2） | 不劣于 0.6.3 同口径基线 | **达标（不劣于基线）**：本批 3.52% vs 基线 21.23%（-83.4%）；绝对 ≤3% 仍差 0.52pp | §10.10 / §10.11.2 |
+| 远控空闲 CPU（main/tree） | ≤6%；tree 不劣于基线 | **main 0.86% 达标；tree 3.86% ≤6%，且远优于基线 20.64%** | §10.10 / §10.11.2 |
+| 扫描频次（Active） | ≤30 次/分 | **达标 29.1**（29.1/29.0/29.2） | §10.11.3 |
+| 扫描频次（Idle/Away） | ≤10 / ≤6 | **达标 6.0 / 2.0** | §10.10 |
+| 活动档会话发现 | ≤2s | **未达标（中位 2879ms；含 CLI 启动）** | §10.11.3 |
+| F6 事件唤醒 | ≤5s | **达标 1369ms**（当前构建；上轮 966ms/377ms） | §10.11 |
+| F7 用量不可见 | ≤12 分钟 | **达标**：ticker 12m01s | §10.10 |
+| 用量可见刷新 | ≤1s | **达标 317ms** | §10.10 |
+| F8 进程刷新 | ≤25ms | **达标 17.5ms**（6 样本中位，当前构建） | §10.11.4 |
+| F5 卡片消失 | ≤1s | **Active 下未达标 2090ms**（在飞等待）；空闲路径 76ms | §10.11.4 |
+| 日志（扫描总线新增） | ≤1MB/天 | **达标 ≈30KB/天**；dsh 告警归 F9 | §10.11.6 |
+| 工程门禁 | 全绿（既有环境失败除外） | **达标**：clippy 0、pnpm test/check 绿、lib 5 连跑稳定 | §10.11.5 |
+| 同状态 3 次差异 | ≤10% | 扫描 0.3%；tree CPU 8.0%（Active 9.01/10.55/9.88）；基线本身波动更大 | §10.11.2/3 |
+
+#### 10.11.8 偏差与剩余风险
+
+1. **F5 在 Active 档 2090ms**：命令等 `scan_after_mutation`（在飞+补扫）后才失效缓存；R8 只保证超时后补排、最终收敛。若要 ≤1s，需要前端乐观隐藏或版本门控失效（后续单独裁决）。
+2. **会话发现 2879ms**：含 opencode CLI 启动与会话落库，事件轮询 1s + Active 2s。若只看扫描侧应 ≤2s；按"发起→卡片"口径未达标。
+3. **codex_ipc_remote 偶发**：整包并行+高负载下 1/10；单用例 30/30；判为既有并发时序抖动，非 R6/R9 确定性回归。
+4. **免费模型额度已耗尽**：Active 复测不可再重复（测量期间真实生成，额度在结束后耗尽）。
+5. dsh 日志告警（≈10.4MB/天）仍待 F9 第二刀。

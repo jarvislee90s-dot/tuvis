@@ -7,13 +7,15 @@ param(
   [int]$ProcessId = 0,
   [ValidateRange(1, 86400)][int]$Seconds = 60,
   [string]$StatsPath = "$env:USERPROFILE\.tuvis\logs\scan_bus_stats.json",
-  [switch]$Tree
+  [switch]$Tree,
+  # 基线对比用：0.6.3 没有 stats 文件，只测 CPU（跳过扫描计数与零计数门禁）
+  [switch]$CpuOnly
 )
 $ErrorActionPreference = 'Stop'
 if ($ProcessId -eq 0) {
   $ProcessId = (Get-Process tuvis -ErrorAction Stop | Select-Object -First 1).Id
 }
-if (-not (Test-Path -LiteralPath $StatsPath)) {
+if (-not $CpuOnly -and -not (Test-Path -LiteralPath $StatsPath)) {
   throw "stats 文件不存在: $StatsPath（确认应用已运行并完成首扫；可用 -StatsPath 指定影子目录）"
 }
 
@@ -52,7 +54,7 @@ function Get-TreeCpuSeconds([int]$RootId) {
   return @{ Cpu = $cpu; Count = $ids.Count }
 }
 
-$before = Read-ScanStats
+if (-not $CpuOnly) { $before = Read-ScanStats }
 $p = Get-Process -Id $ProcessId -ErrorAction Stop
 $c1 = $p.TotalProcessorTime.TotalSeconds
 if ($Tree) { $t1 = Get-TreeCpuSeconds $ProcessId }
@@ -67,19 +69,24 @@ if ($null -eq $p) {
 $c2 = $p.TotalProcessorTime.TotalSeconds
 if ($Tree) { $t2 = Get-TreeCpuSeconds $ProcessId }
 $w2 = Get-Date
-$after = Read-ScanStats
 $wall = ($w2 - $w1).TotalSeconds
 $cpu = $c2 - $c1
-if ([int]$after.total -lt [int]$before.total) {
-  throw "stats.total 回退（$($before.total) → $($after.total)）：应用重启或文件被重置，样本无效"
+if ($CpuOnly) {
+  $line = ("pid={0} wall={1:N1}s cpu={2:N2}s avgCPU={3:N2}% mode=cpu_only" -f `
+    $ProcessId, $wall, $cpu, (100 * $cpu / $wall))
+} else {
+  $after = Read-ScanStats
+  if ([int]$after.total -lt [int]$before.total) {
+    throw "stats.total 回退（$($before.total) → $($after.total)）：应用重启或文件被重置，样本无效"
+  }
+  $scans = [int]$after.total - [int]$before.total
+  # 正向断言：长窗口零计数必须报错——路径配错/扫描停摆时不允许静默假通过
+  if ($Seconds -ge 60 -and $scans -eq 0) {
+    throw "窗口内未计到任何扫描（stats.total 未增长）：确认 -StatsPath 指向运行中应用的 $StatsPath"
+  }
+  $line = ("pid={0} wall={1:N1}s cpu={2:N2}s avgCPU={3:N2}% scans={4} scansPerMin={5:N1} stats_last_reason={6} stats_last_duration_ms={7} stats_process_refresh_ms={8} stats_updated_at={9}" -f `
+    $ProcessId, $wall, $cpu, (100 * $cpu / $wall), $scans, ($scans / ($wall / 60.0)), $after.last_reason, $after.last_duration_ms, $after.last_process_refresh_ms, $after.updated_at)
 }
-$scans = [int]$after.total - [int]$before.total
-# 正向断言：长窗口零计数必须报错——路径配错/扫描停摆时不允许静默假通过
-if ($Seconds -ge 60 -and $scans -eq 0) {
-  throw "窗口内未计到任何扫描（stats.total 未增长）：确认 -StatsPath 指向运行中应用的 $StatsPath"
-}
-$line = ("pid={0} wall={1:N1}s cpu={2:N2}s avgCPU={3:N2}% scans={4} scansPerMin={5:N1} stats_last_reason={6} stats_last_duration_ms={7} stats_process_refresh_ms={8} stats_updated_at={9}" -f `
-  $ProcessId, $wall, $cpu, (100 * $cpu / $wall), $scans, ($scans / ($wall / 60.0)), $after.last_reason, $after.last_duration_ms, $after.last_process_refresh_ms, $after.updated_at)
 if ($Tree) {
   $cpuTree = $t2.Cpu - $t1.Cpu
   $line += (" cpu_tree={0:N2}s avgCPU_tree={1:N2}% tree_procs={2}" -f `
