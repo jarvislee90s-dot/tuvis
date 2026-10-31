@@ -82,6 +82,8 @@ const goldenSession: SessionView = {
       ],
       options: [{ optionId: "opt-1", label: "允许一次", kind: "allowOnce" }],
       detail: "合成命令正文",
+      answerable: true,
+      detailTruncated: false,
     },
   ],
   control: { activeWorks: [{ kind: "execution", foregroundExecutionId: "exec-1" }] },
@@ -210,10 +212,12 @@ describe("zcodeControlApi：官方动作发送面", () => {
     expect(Object.keys(goldenSession.pending[0]).sort()).toEqual(
       [
         "anchorRowId",
+        "answerable",
         "autoResolution",
         "autoResolutionState",
         "createdAt",
         "detail",
+        "detailTruncated",
         "interactionId",
         "kind",
         "options",

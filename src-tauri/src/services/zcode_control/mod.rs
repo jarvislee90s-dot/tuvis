@@ -102,5 +102,5 @@ pub use types::{
     ModelChoice, PendingKind, PendingPort, PendingView, PermissionOptionView, QuestionOption,
     QuestionView, QueueItemView, QueueView, RelaySink, SelectionPort, SelectionView, SessionView,
     StopPort, StopRequest, TargetKey, ZResult, ZcodeError, PENDING_CLEARED_POLL, SELECTION_POLL,
-    STOP_CLEARED_POLL,
+    STOP_CLEARED_POLL, WRITABLE_DISPATCH_STATES,
 };

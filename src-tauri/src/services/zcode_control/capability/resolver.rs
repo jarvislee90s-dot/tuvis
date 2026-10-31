@@ -14,9 +14,10 @@
 //! degraded / unsupported 是实机判决，与形状无关，持有到 key 变化。
 //!
 //! 队列三写（`queue_edit`/`queue_now`/`queue_resume`）的「形状」不是运行时接口
-//! 布尔（接口面对队列恒 `false`），而是**已知 build 的官方命令条目**（R0 §3，
-//! 见 `key::build_declares_queue_command`）：条目命中即候选档
-//! （`enabled=true` + [`CANDIDATE_REASON`]），`queue_now` 无条目 → 恒关闭。
+//! 布尔（接口面对队列恒 `false`）。未完成 W0 实机取证前，普通构建一律关闭；只有
+//! `zcode-bridge-evidence` debug evidence/probe 构建可按已知 build 的命令条目
+//! （R0 §3，见 `key::build_declares_queue_command`）开放 queue_edit/queue_resume 候选。
+//! `queue_now` 语义未实测，所有构建恒关闭。
 //!
 //! reasonCode（UI 只见可用/不可用）：确认档 = `None`；**候选档**（仅队列写）=
 //! `interface_matched`（复用账本 state 列的既有冻结词，不是新造错误码）；不可用 =
@@ -36,10 +37,9 @@ use crate::services::zcode_control::types::{
 
 /// 十一项能力的固定清单（声明序无语义；逐项独立解析）。
 ///
-/// 队列三项（`queue_edit`/`queue_now`/`queue_resume`）同样逐项解析，但判据是
-/// **build 命令条目**而不是接口形状：`queue_edit`/`queue_resume` 在已知 build 的
-/// 命令表命中时进候选档，`queue_now` 无条目 → 恒 `needs_evidence`。三者都不得借
-/// `send`/`approval_reply` 的结论开闸。
+/// 队列三项（`queue_edit`/`queue_now`/`queue_resume`）同样逐项解析。普通构建下均关闭；
+/// 仅 `zcode-bridge-evidence` debug evidence/probe 构建可让已知 build 命中命令表的
+/// `queue_edit`/`queue_resume` 进入候选档。三者都不得借 `send`/`approval_reply` 的结论开闸。
 const ALL_CAPABILITIES: [Capability; 11] = [
     Capability::Send,
     Capability::SingleSelect,
@@ -518,6 +518,7 @@ mod tests {
     /// `InterfaceMatched`（命令名 `deleteQueueItem`/`reorderQueueItem`/`setAutoDrain`
     /// 在 R0 §3 命令表内）。**候选 ≠ 实机验证**——运行时仍由新鲜 `availability`
     /// 二次校验（`command::execute_queue_write`）。
+    #[cfg(feature = "zcode-bridge-evidence")]
     #[test]
     fn queue_edit_is_candidate_on_evidenced_build() {
         let key = known_build_key();
@@ -539,6 +540,26 @@ mod tests {
         assert_eq!(
             view.queue_resume.reason_code.as_deref(),
             Some(CANDIDATE_REASON)
+        );
+    }
+
+    #[cfg(not(feature = "zcode-bridge-evidence"))]
+    #[test]
+    fn queue_edit_and_resume_stay_closed_outside_w0_evidence_build() {
+        let view = resolve_capabilities(
+            &known_build_key(),
+            &ZcodeInterfaceEvidence::default(),
+            &MemoryLedger::default(),
+        );
+        assert!(!view.queue_edit.enabled);
+        assert_eq!(
+            view.queue_edit.reason_code.as_deref(),
+            Some(codes::NEEDS_EVIDENCE)
+        );
+        assert!(!view.queue_resume.enabled);
+        assert_eq!(
+            view.queue_resume.reason_code.as_deref(),
+            Some(codes::NEEDS_EVIDENCE)
         );
     }
 
@@ -625,19 +646,23 @@ mod tests {
             );
         }
 
-        // 已知 build：队列候选与 send 的可用性完全独立（只命令条目在场即可）。
+        // 已知 build：普通构建下 queueEdit/Resume 仍关闭；静态命令名不替代 W0 实机证据。
         let known = resolve_capabilities(
             &known_build_key(),
             &ZcodeInterfaceEvidence::default(),
             &MemoryLedger::default(),
         );
         assert!(!known.send.enabled, "前提：无方法时 send 不可用");
+        #[cfg(feature = "zcode-bridge-evidence")]
         assert!(known.queue_edit.enabled && known.queue_resume.enabled);
+        #[cfg(not(feature = "zcode-bridge-evidence"))]
+        assert!(!known.queue_edit.enabled && !known.queue_resume.enabled);
         assert!(!known.queue_now.enabled);
     }
 
     /// 账本 `confirmed`（首次真实动作有界观察的落账结果）把队列三写升到确认档：
     /// `enabled=true` 且**无原因码**（候选档的原因码随之消失）。
+    #[cfg(feature = "zcode-bridge-evidence")]
     #[test]
     fn ledger_confirmed_promotes_queue_candidate_to_confirmed() {
         let key = known_build_key();
@@ -649,6 +674,23 @@ mod tests {
         let view = resolve_capabilities(&key, &ZcodeInterfaceEvidence::default(), &ledger);
         assert!(view.queue_edit.enabled);
         assert_eq!(view.queue_edit.reason_code, None, "确认档无原因码");
+    }
+
+    #[cfg(not(feature = "zcode-bridge-evidence"))]
+    #[test]
+    fn queue_ledger_confirmation_stays_closed_without_w0_evidence_build() {
+        let key = known_build_key();
+        let ledger = MemoryLedger::default();
+        ledger.records.lock().unwrap().push((
+            key.clone(),
+            CapabilityRecord::confirmed(Capability::QueueEdit),
+        ));
+        let view = resolve_capabilities(&key, &ZcodeInterfaceEvidence::default(), &ledger);
+        assert!(!view.queue_edit.enabled);
+        assert_eq!(
+            view.queue_edit.reason_code.as_deref(),
+            Some(codes::NEEDS_EVIDENCE)
+        );
     }
 
     /// 账本 confirmed 覆盖 shipped：single_select 从候选升级为确认可用；

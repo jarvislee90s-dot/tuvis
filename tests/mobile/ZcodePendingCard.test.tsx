@@ -109,6 +109,9 @@ function pendingView(overrides: Partial<PendingView> = {}): PendingView {
     questions: [],
     options: [],
     detail: null,
+    // 支持子型（AskUserQuestion）可答；正文未截断。
+    answerable: true,
+    detailTruncated: false,
     ...overrides,
   };
 }
@@ -795,5 +798,216 @@ describe("ZCode 待处理卡：审批只放行一次性选项并展示命令正�
   it("missing_detail_renders_no_toggle", () => {
     render(<ZcodePendingCard {...baseProps({ pending: permissionPending(null) })} />);
     expect(screen.queryByTestId("zcode-pending-detail-toggle")).toBeNull();
+  });
+});
+
+describe("ZCode 待处理卡：answerable 三分语义（缺字段 ≠ 不可答）", () => {
+  /**
+   * 构造一张**没有 `answerable` 字段**的卡（字段缺失 = 服务端未声明）。
+   *
+   * 必须真的**删掉这个键**（而不是置 `undefined`）：要证明的是「字段不在载荷里」这条
+   * 路径，而不是「字段在但值是 undefined」。
+   */
+  function pendingWithoutAnswerable(overrides: Partial<PendingView> = {}): PendingView {
+    const pending = { ...pendingView(overrides) } as PendingView & { answerable?: boolean };
+    delete pending.answerable;
+    return pending as PendingView;
+  }
+
+  it("pending_without_answerable_field_keeps_legacy_answerable", async () => {
+    // 字段缺失 = 服务端**未声明**，不等于「不可答」：按旧口径（userInput ∧
+    // AskUserQuestion ∧ 合法 schemaInteraction）兼容回退 ⇒ 仍可作答。
+    // 这条正是 U7「同代 SSE 新卡无需刷新即可作答」被打破后的回归点。
+    const { fn, calls } = makeSubmit();
+    const pending = pendingWithoutAnswerable({ questions: [questionView()] });
+    expect("answerable" in pending).toBe(false);
+
+    render(<ZcodePendingCard {...baseProps({ pending, submit: fn })} />);
+
+    expect(screen.queryByTestId("zcode-pending-readonly-reason")).toBeNull();
+    expect(screen.getByTestId("zcode-answer-options")).toBeVisible();
+    fireEvent.click(screen.getByTestId("zcode-pending-option-0"));
+    fireEvent.click(screen.getByTestId("zcode-pending-next"));
+    fireEvent.click(screen.getByTestId("zcode-pending-submit"));
+    await waitFor(() => expect(calls).toHaveLength(1));
+    expect(calls[0].kind).toBe("answer");
+  });
+
+  it("pending_without_answerable_field_and_unsupported_shape_stays_readonly", () => {
+    // 缺字段时的回退**只**认旧口径：旧口径判不可答的子型（toolName 不是
+    // AskUserQuestion / schemaInteraction 不是 AskUserQuestion）仍必须只读——
+    // 回退绝不能把 F4 的安全目标放宽。
+    const { fn, calls } = makeSubmit();
+    const pending = pendingWithoutAnswerable({
+      toolName: "ExitPlanMode",
+      schemaInteraction: "plan_approval",
+      questions: [questionView()],
+    });
+    render(<ZcodePendingCard {...baseProps({ pending, submit: fn })} />);
+
+    expect(screen.getByTestId("zcode-pending-readonly-reason")).toBeVisible();
+    expect(screen.queryByTestId("zcode-answer-options")).toBeNull();
+    expect(screen.queryByTestId("zcode-pending-submit")).toBeNull();
+    expect(calls).toHaveLength(0);
+  });
+
+  it("explicit_false_is_readonly", () => {
+    // 服务端**显式**说不可答 ⇒ 只读卡（F4 的安全目标），与字段缺失无关。
+    const { fn, calls } = makeSubmit();
+    const pending = pendingView({
+      answerable: false,
+      toolName: "AskUserQuestion",
+      schemaInteraction: "AskUserQuestion",
+      questions: [questionView()],
+    });
+    render(<ZcodePendingCard {...baseProps({ pending, submit: fn })} />);
+
+    expect(screen.getByTestId("zcode-pending-readonly-reason")).toBeVisible();
+    expect(screen.queryByTestId("zcode-answer-options")).toBeNull();
+    expect(screen.queryByTestId("zcode-pending-submit")).toBeNull();
+    expect(calls).toHaveLength(0);
+  });
+
+  it("explicit_true_is_answerable", async () => {
+    // 服务端**显式**说可答 ⇒ 可答（显式值优先于任何回退）。
+    const { fn, calls } = makeSubmit();
+    const pending = pendingView({
+      answerable: true,
+      questions: [questionView()],
+    });
+    render(<ZcodePendingCard {...baseProps({ pending, submit: fn })} />);
+
+    expect(screen.queryByTestId("zcode-pending-readonly-reason")).toBeNull();
+    expect(screen.getByTestId("zcode-answer-options")).toBeVisible();
+    fireEvent.click(screen.getByTestId("zcode-pending-option-0"));
+    fireEvent.click(screen.getByTestId("zcode-pending-next"));
+    fireEvent.click(screen.getByTestId("zcode-pending-submit"));
+    await waitFor(() => expect(calls).toHaveLength(1));
+    expect(calls[0].kind).toBe("answer");
+  });
+});
+
+describe("ZCode 待处理卡：不可答子型只读 / 截断正文不盲批", () => {
+  /** 审批卡：正文与截断真值都由服务端投影给出（前端不按长度猜）。 */
+  function approval(truncated: boolean): PendingView {
+    return pendingView({
+      kind: "permission",
+      toolName: "Bash",
+      summary: "执行合成长命令",
+      questions: [],
+      detail: "npm run build --workspace @tuvis/mobile",
+      detailTruncated: truncated,
+      options: [
+        { optionId: "host-allow-once-9", label: "允许一次", kind: "allowOnce" },
+        { optionId: "host-deny-9", label: "拒绝", kind: "deny" },
+      ],
+    });
+  }
+
+  it("unsupported_pending_subtype_is_readonly", () => {
+    // plan_approval 也投影成 userInput，但服务端判定不可代答（answerable=false）。
+    // 卡片必须**从结构上**没有可提交面：选项/翻页/提交/输入框一律不渲染，
+    // 用户不会「选完才被 needs_evidence 拒」，也不产生任何 POST。
+    const { fn, calls } = makeSubmit();
+    const onOpenOfficial = vi.fn();
+    const pending = pendingView({
+      schemaInteraction: "plan_approval",
+      toolName: "ExitPlanMode",
+      answerable: false,
+      questions: [
+        questionView({
+          header: "Plan",
+          questionText: "要批准这份计划吗？",
+          options: [{ value: "approve", label: "批准", description: null, preview: null }],
+        }),
+      ],
+    });
+    render(<ZcodePendingCard {...baseProps({ pending, submit: fn, onOpenOfficial })} />);
+
+    // 只读原因 + 官方入口可见
+    expect(screen.getByTestId("zcode-pending-readonly-reason").textContent).toContain(
+      "暂不能远程作答"
+    );
+    expect(screen.getByTestId("zcode-pending-open-official")).toBeVisible();
+    // 可提交面一个都不存在
+    expect(screen.queryByTestId("zcode-answer-options")).toBeNull();
+    expect(screen.queryByTestId("zcode-pending-next")).toBeNull();
+    expect(screen.queryByTestId("zcode-pending-review-back")).toBeNull();
+    expect(screen.queryByTestId("zcode-pending-submit")).toBeNull();
+    expect(screen.queryByRole("textbox")).toBeNull();
+    expect(screen.queryByTestId("zcode-pending-confirm")).toBeNull();
+    // 阅读面仍在：题干只读列出，且没有任何按钮能被点成答案
+    expect(screen.getByTestId("zcode-pending-readonly-questions").textContent).toContain(
+      "要批准这份计划吗？"
+    );
+    const card = screen.getByTestId("zcode-pending-card");
+    expect(within(card).queryByText("批准")).toBeNull();
+    expect(calls).toHaveLength(0);
+
+    // 「打开官方页面」只走面板回调，不由卡片拼链接或代点
+    fireEvent.click(screen.getByTestId("zcode-pending-open-official"));
+    expect(onOpenOfficial).toHaveBeenCalledTimes(1);
+    expect(calls).toHaveLength(0);
+  });
+
+  it("支持子型仍可答（answerable=true 回归）", async () => {
+    // 同一个卡片组件、同样的能力矩阵：只要 answerable=true，选项与提交照常出现。
+    const { fn, calls } = makeSubmit();
+    const pending = pendingView({
+      answerable: true,
+      questions: [questionView()],
+    });
+    render(<ZcodePendingCard {...baseProps({ pending, submit: fn })} />);
+
+    expect(screen.queryByTestId("zcode-pending-readonly-reason")).toBeNull();
+    expect(screen.getByTestId("zcode-answer-options")).toBeVisible();
+    fireEvent.click(screen.getByTestId("zcode-pending-option-0"));
+    fireEvent.click(screen.getByTestId("zcode-pending-next"));
+    fireEvent.click(screen.getByTestId("zcode-pending-submit"));
+    await waitFor(() => expect(calls).toHaveLength(1));
+    expect(calls[0].kind).toBe("answer");
+  });
+
+  it("truncated_permission_does_not_offer_blind_allow", async () => {
+    const { fn, calls } = makeSubmit();
+    const onOpenOfficial = vi.fn();
+    const { unmount } = render(
+      <ZcodePendingCard {...baseProps({ pending: approval(true), submit: fn, onOpenOfficial })} />
+    );
+
+    // 提示不依赖展开正文：一进卡就说明「不是全貌」
+    expect(screen.getByTestId("zcode-pending-detail-truncated").textContent).toContain(
+      "内容未完全展示"
+    );
+    const allow = screen.getByTestId("zcode-permission-option-host-allow-once-9");
+    const deny = screen.getByTestId("zcode-permission-option-host-deny-9");
+    expect(allow).toBeDisabled();
+    expect(deny).toBeEnabled();
+    expect(screen.getByTestId("zcode-pending-open-official")).toBeVisible();
+
+    // 点禁用的「允许一次」：零 POST（结构 + 处理函数双保险）
+    fireEvent.click(allow);
+    expect(calls).toHaveLength(0);
+
+    // 「拒绝」仍可提交（截断只撤掉盲批，不给用户「无路可走」）
+    fireEvent.click(deny);
+    await waitFor(() => expect(calls).toHaveLength(1));
+    expect(calls[0]).toEqual({
+      kind: "permission",
+      sessionId: SID,
+      generation: GEN,
+      interactionId: INTERACTION,
+      optionId: "host-deny-9",
+    });
+
+    // 未截断：同一形状的卡恢复「允许一次」可用
+    unmount();
+    const intact = makeSubmit();
+    render(<ZcodePendingCard {...baseProps({ pending: approval(false), submit: intact.fn })} />);
+    expect(screen.queryByTestId("zcode-pending-detail-truncated")).toBeNull();
+    expect(screen.getByTestId("zcode-permission-option-host-allow-once-9")).toBeEnabled();
+    fireEvent.click(screen.getByTestId("zcode-permission-option-host-allow-once-9"));
+    await waitFor(() => expect(intact.calls).toHaveLength(1));
+    expect(intact.calls[0]).toMatchObject({ kind: "permission", optionId: "host-allow-once-9" });
   });
 });

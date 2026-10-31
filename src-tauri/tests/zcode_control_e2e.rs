@@ -48,11 +48,14 @@ use multi_agents_manager_lib::remote::pairing::{
 };
 use multi_agents_manager_lib::remote::server::{router, RemoteState};
 use multi_agents_manager_lib::services::zcode_control::command::INITIAL_CONTROL_TIMEOUT;
+use multi_agents_manager_lib::services::zcode_control::types::{
+    InputRoutingView, QueueActionAvailability,
+};
 use multi_agents_manager_lib::services::zcode_control::{
     codes, set_config, ActionContext, ActiveWork, CapabilityView, ConnectionState, ControlAction,
     ControlView, HubBackend, ModelChoice, OAuthProvider, PendingKind, PendingView,
-    PermissionOptionView, QuestionOption, QuestionView, SelectionView, SessionView, TargetKey,
-    ZcodeError, ZcodeHub,
+    PermissionOptionView, QuestionOption, QuestionView, QueueItemView, QueueView, SelectionView,
+    SessionView, TargetKey, ZcodeError, ZcodeHub,
 };
 use multi_agents_manager_lib::session::{ProcessForm, Session, SessionStatus, SessionsResponse};
 use rusqlite::Connection;
@@ -267,6 +270,151 @@ async fn two_devices_same_action_single_dispatch_across_disconnect() {
     );
     assert_eq!(official.send_text_frames(), 2, "跨设备冲突零第三帧");
     assert_eq!(ledger_rows(&store), 3);
+}
+
+/// W6 P0-1：四个队列动作与 `send.heldQueue` 必须通过生产 HTTP 白名单，且每个请求
+/// 只派发一帧到官方命令管线；不能只在 CommandSender 单测里证明载荷正确。
+#[tokio::test]
+async fn queue_actions_and_held_queue_send_cross_http_once_each() {
+    let conn = shared_conn();
+    seed(&conn);
+    let (_tmp, home) = read_fixture();
+    let state = read_state(&conn, &home);
+    let (hub, official) = paired_hub(&conn, all_policy()).await;
+    state.set_zcode_hub(hub.clone());
+    let app = router(state);
+    let generation = hub.connection().generation;
+
+    official.set_session(SessionView {
+        session_id: SESSION.to_owned(),
+        generation: 1,
+        revision: Some(1),
+        ready: true,
+        pending: Vec::new(),
+        control: Some(ControlView {
+            active_works: Vec::new(),
+        }),
+        selection: None,
+        capabilities: CapabilityView::default(),
+        queue: QueueView {
+            known: true,
+            paused: Some(true),
+            pause_reason: Some("stopped".to_owned()),
+            items: vec![
+                QueueItemView {
+                    input_id: "queue-a".to_owned(),
+                    text: "alpha".to_owned(),
+                    position: Some(0),
+                    kind: Some("sendText".to_owned()),
+                    dispatch_state: Some("queued".to_owned()),
+                    has_attachments: false,
+                },
+                QueueItemView {
+                    input_id: "queue-b".to_owned(),
+                    text: "beta".to_owned(),
+                    position: Some(1),
+                    kind: Some("sendText".to_owned()),
+                    dispatch_state: Some("queued".to_owned()),
+                    has_attachments: false,
+                },
+            ],
+            availability: QueueActionAvailability {
+                known: true,
+                queue_edit_allowed: true,
+                send_queued_now_allowed: true,
+            },
+        },
+        input_routing: Some(InputRoutingView {
+            mode: "choice".to_owned(),
+            reason_code: Some("heldQueueDispositionRequired".to_owned()),
+        }),
+    });
+
+    let actions = [
+        serde_json::json!({
+            "kind": "send", "sessionId": SESSION, "generation": generation,
+            "text": "new text",
+            "heldQueue": {
+                "disposition": "keepQueueAndSend",
+                "expectedQueueItemIds": ["queue-a", "queue-b"]
+            }
+        }),
+        serde_json::json!({
+            "kind": "queueDelete", "sessionId": SESSION, "generation": generation,
+            "queueItemId": "queue-a"
+        }),
+        serde_json::json!({
+            "kind": "queueReorder", "sessionId": SESSION, "generation": generation,
+            "queueItemId": "queue-b", "beforeQueueItemId": "queue-a"
+        }),
+        serde_json::json!({
+            "kind": "queueNow", "sessionId": SESSION, "generation": generation,
+            "queueItemId": "queue-a"
+        }),
+        serde_json::json!({
+            "kind": "queueResume", "sessionId": SESSION, "generation": generation
+        }),
+    ];
+
+    for (index, action) in actions.into_iter().enumerate() {
+        let body = serde_json::json!({
+            "actionId": format!("e2e-queue-http-{index}"),
+            "action": action,
+        });
+        let (status, receipt) = post_action(app.clone(), body).await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::OK,
+            "action {index}: {receipt}"
+        );
+        assert_eq!(receipt["state"], "accepted", "action {index}: {receipt}");
+        assert_eq!(
+            official.frames().len(),
+            index + 1,
+            "action {index} 恰派发一帧"
+        );
+    }
+
+    let frames = official.frames();
+    assert_eq!(frames.len(), 5);
+    assert_eq!(frames[0].envelope()["type"], "sendText");
+    assert_eq!(
+        frames[0].envelope()["payload"]["heldQueueDisposition"],
+        "keepQueueAndSend"
+    );
+    assert_eq!(
+        frames[0].envelope()["payload"]["expectedHeldQueueItemIds"],
+        serde_json::json!(["queue-a", "queue-b"])
+    );
+    assert_eq!(frames[1].envelope()["type"], "deleteQueueItem");
+    assert_eq!(frames[1].envelope()["payload"]["queueItemId"], "queue-a");
+    assert_eq!(frames[2].envelope()["type"], "reorderQueueItem");
+    assert_eq!(
+        frames[2].envelope()["payload"]["beforeQueueItemId"],
+        "queue-a"
+    );
+    assert_eq!(frames[3].envelope()["type"], "sendQueuedNow");
+    assert_eq!(frames[4].envelope()["type"], "setAutoDrain");
+    assert_eq!(frames[4].envelope()["payload"]["autoDrain"], true);
+
+    let bad_nested_field = serde_json::json!({
+        "actionId": "e2e-queue-http-bad-nested",
+        "action": {
+            "kind": "send",
+            "sessionId": SESSION,
+            "generation": generation,
+            "text": "must be rejected",
+            "heldQueue": {
+                "disposition": "keepQueueAndSend",
+                "expectedQueueItemIds": ["queue-a", "queue-b"],
+                "untrustedOverride": true,
+            },
+        },
+    });
+    let (status, error) = post_action(app, bad_nested_field).await;
+    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+    assert_eq!(error["error"], "invalid_action");
+    assert_eq!(official.frames().len(), 5, "嵌套契约外字段不得派发帧");
 }
 
 // ============================================================
@@ -1011,9 +1159,12 @@ fn question_card() -> PendingView {
             free_text_allowed: false,
         }],
         options: Vec::new(),
-        // 问答卡没有「将被执行的命令原文」：官方 AskUserQuestion 的 payload 不带
+        // 问答卡没有「将被执行的命令正文」：官方 AskUserQuestion 的 payload 不带
         // `detail`，投影结果就是 None（卡上不出现空的详情入口）。
         detail: None,
+        // AskUserQuestion 子型：与 build_user_answer 同一纯判定 → 可答。
+        answerable: true,
+        detail_truncated: false,
     }
 }
 
@@ -1040,6 +1191,9 @@ fn permission_card() -> PendingView {
         // 本用例断言的是「一帧 resolveInteraction 且 optionId 回传宿主原值」与撤卡后
         // confirmed，命令正文不参与任何应答载荷，也不得进审计摘要。
         detail: Some("ls -la /tmp/tuvis-e2e-scratch".to_owned()),
+        // 审批卡不是 userInput 子型：可答性由 approvalReply 能力与选项白名单决定。
+        answerable: false,
+        detail_truncated: false,
     }
 }
 
@@ -1281,6 +1435,9 @@ fn old_pending_card() -> PendingView {
         // 旧代际的问答卡没有工具调用（tool_call_id / tool_name 均缺省），
         // 也就没有官方 payload.detail 可投影 → None。
         detail: None,
+        // tool_name 缺省 → 不是已建模的 AskUserQuestion 子型 → 不可代答。
+        answerable: false,
+        detail_truncated: false,
     }
 }
 

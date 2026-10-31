@@ -1173,6 +1173,8 @@ describe("useZcodeControl：F1 同代 revision 单调", () => {
       questions: [],
       options: [],
       detail: null,
+      answerable: false,
+      detailTruncated: false,
     };
   }
 

@@ -1573,9 +1573,10 @@ impl Inner {
     /// 或 `None`）：不整份替换，只按「安全降级/恢复」语义更新 `ready` 与能力。
     ///
     /// 与手机侧 [`merge_recovered_view`]/`degrade` 对齐：
-    /// - `incoming.ready=true`（恢复）：内容（`pending/queue/control/selection`）与序号锚
-    ///   一概留 `current`，只把 `ready` 置 true、能力取 `incoming` 的权威现读值（允许由
-    ///   关变开）；否则降级后能力被清成全关，恢复视图又给不出序号时会永久停在关闭态。
+    /// - `incoming.ready=true`（恢复）：通常保留较新的 `pending/control/selection` 与序号锚，
+    ///   只把 `ready` 置 true、能力取 `incoming` 的权威现读值（允许由关变开）。但全链路
+    ///   降级会清空 `queue`；同 revision 的权威恢复快照若重新宣告了队列，必须恢复其
+    ///   `items/paused/availability`，否则“暂停且有排队项”的恢复入口会暂时消失。
     /// - `incoming.ready=false`：内容仍留 `current`，`ready` 保持 false、能力保持全关
     ///   （安全降级不得携带任何旧开闸矩阵）。
     ///
@@ -1603,6 +1604,11 @@ impl Inner {
             return None;
         }
         let mut merged = current.clone();
+        if incoming.ready && current.revision == incoming.revision && incoming.queue.known {
+            // `degrade_view` 为安全起见把队列整体清成 unknown；same-revision 的完整恢复
+            // 快照是队列/暂停态的权威重载，不能只恢复 ready 与能力而沿用空队列。
+            merged.queue = incoming.queue.clone();
+        }
         merged.ready = incoming.ready;
         merged.capabilities = if incoming.ready {
             incoming.capabilities.clone()
@@ -6637,6 +6643,63 @@ mod tests {
         assert_eq!(tracked.queue.items.len(), 2);
     }
 
+    /// 全链路降级会清空 queue；同 revision 的第一份权威恢复快照必须把队列与暂停态带回。
+    #[test]
+    fn same_revision_recovery_restores_cleared_queue_and_pause_state() {
+        let fake = Arc::new(FakeBackend::default());
+        let hub = Arc::new(ZcodeHub::with_parts(stored(URL), fake, send_policy()));
+        let generation = hub.lock().generation;
+        let session_id = "sess_same_revision_queue_recovery";
+        let ready = SessionView {
+            session_id: session_id.into(),
+            generation,
+            revision: Some(12),
+            ready: true,
+            pending: Vec::new(),
+            control: None,
+            selection: None,
+            capabilities: send_policy(),
+            queue: QueueView {
+                known: true,
+                paused: Some(true),
+                pause_reason: Some("stopped".into()),
+                items: vec![QueueItemView {
+                    input_id: "queue_paused_b".into(),
+                    text: "queued after stopped turn".into(),
+                    position: Some(0),
+                    kind: Some("sendText".into()),
+                    dispatch_state: Some("queued".into()),
+                    has_attachments: false,
+                }],
+                availability: QueueActionAvailability {
+                    known: true,
+                    queue_edit_allowed: true,
+                    send_queued_now_allowed: false,
+                },
+            },
+            input_routing: None,
+        };
+        hub.lock().publish_session(ready.clone());
+
+        let mut degraded = ready.clone();
+        Inner::degrade_view(&mut degraded, generation);
+        assert!(!degraded.ready);
+        assert!(!degraded.queue.known);
+        assert!(degraded.queue.items.is_empty());
+        hub.lock().publish_session(degraded);
+
+        // 重连后官方完整快照可与失效前同 revision；它仍是恢复队列和 paused=true 的
+        // 权威来源，不能只把 ready/capabilities 打开而留下已清空的降级 queue。
+        let (applied, recovered) = hub.lock().publish_session(ready);
+        assert!(applied);
+        assert!(recovered.ready);
+        assert!(recovered.queue.known);
+        assert_eq!(recovered.queue.paused, Some(true));
+        assert_eq!(recovered.queue.pause_reason.as_deref(), Some("stopped"));
+        assert_eq!(recovered.queue.items.len(), 1);
+        assert_eq!(recovered.queue.items[0].input_id, "queue_paused_b");
+    }
+
     /// 同一动态策略源同时喂会话矩阵与执行闸：翻转开/关，两者同步变化。
     #[tokio::test]
     async fn session_matrix_and_execute_gate_share_one_policy_source() {
@@ -7079,6 +7142,9 @@ mod tests {
             },
             options: Vec::new(),
             detail: None,
+            // 合成卡的 toolName 是 Bash：不属于可远程作答的 AskUserQuestion 子型。
+            answerable: false,
+            detail_truncated: false,
         }
     }
 
@@ -7493,6 +7559,8 @@ mod tests {
                     questions: Vec::new(),
                     options: Vec::new(),
                     detail: None,
+                    answerable: false,
+                    detail_truncated: false,
                 }],
                 control: Some(ControlView {
                     active_works: vec![ActiveWork {
@@ -10151,6 +10219,8 @@ mod tests {
             questions: Vec::new(),
             options: Vec::new(),
             detail: None,
+            answerable: false,
+            detail_truncated: false,
         }
     }
 

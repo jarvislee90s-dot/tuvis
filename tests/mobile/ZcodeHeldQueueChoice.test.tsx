@@ -7,6 +7,7 @@
 // 4. 清空是破坏性选择，绝不默认。
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import i18n from "@/i18n";
 import ZcodeControlPanel from "@/mobile/ZcodeControlPanel";
 import {
   ZCODE_ACTIONS_PATH,
@@ -187,6 +188,71 @@ describe("ZcodeControlPanel：choice 模式旧队列处置", () => {
     expect(screen.queryByTestId("zcode-held-queue-dialog")).toBeNull();
     expect(posts).toHaveLength(0);
     expect(textarea.value).toBe("保留中的草稿");
+  });
+
+  it("cas_mismatch_refreshes_queue_and_requires_a_new_choice", async () => {
+    let current = sessionView();
+    let postCount = 0;
+    posts = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        if (url === ZCODE_CONNECTION_PATH) return json(connection());
+        if (url.startsWith(`${ZCODE_SESSION_PATH}?`)) return json(current);
+        if (url.includes("/official-control")) return json({ configState: "missing", url: null });
+        if (url === ZCODE_ACTIONS_PATH && init?.method === "POST") {
+          const body = JSON.parse(String(init.body)) as PostBody;
+          posts.push(body);
+          postCount += 1;
+          if (postCount === 1) {
+            current = sessionView({
+              revision: 13,
+              queue: {
+                known: true,
+                paused: false,
+                items: [
+                  { inputId: "queue_a", text: "first queued", position: 0 },
+                  { inputId: "queue_c", text: "new from another device", position: 1 },
+                ],
+              },
+            });
+            return json({ error: "invalid_action" }, 400);
+          }
+          return json({
+            actionId: body.actionId,
+            sessionId: SID,
+            generation: GEN,
+            state: "accepted",
+            reasonCode: null,
+          } satisfies ActionReceipt);
+        }
+        throw new Error(`unexpected fetch: ${url}`);
+      })
+    );
+
+    render(<ZcodeControlPanel sessionId={SID} />);
+    const draft = (await typeDraft("send after recheck")) as HTMLTextAreaElement;
+    await waitFor(() => expect(screen.getByTestId("zcode-send")).toBeEnabled());
+    fireEvent.click(screen.getByTestId("zcode-send"));
+    fireEvent.click(await screen.findByTestId("zcode-held-queue-keep"));
+
+    const staleNotice = await screen.findByTestId("zcode-held-queue-stale");
+    expect(staleNotice.textContent).toBe(i18n.t("mobile.zcodeControl.heldQueueChanged"));
+    expect(draft.value).toBe("send after recheck");
+    expect(posts).toHaveLength(1);
+    expect(posts[0].action).toMatchObject({
+      kind: "send",
+      heldQueue: { expectedQueueItemIds: ["queue_a", "queue_b"] },
+    });
+
+    fireEvent.click(await screen.findByTestId("zcode-held-queue-keep"));
+    await waitFor(() => expect(posts).toHaveLength(2));
+    expect(posts[1].action).toMatchObject({
+      kind: "send",
+      heldQueue: { expectedQueueItemIds: ["queue_a", "queue_c"] },
+    });
+    expect(posts).toHaveLength(2);
   });
 
   it("choice_with_empty_queue_sends_without_prompt_or_held_queue", async () => {

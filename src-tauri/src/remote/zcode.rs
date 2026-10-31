@@ -372,7 +372,10 @@ const REQUEST_KEYS: &[&str] = &["actionId", "action"];
 /// 各动作允许的字段集（= [`ControlAction`] 的 wire 形态，唯一许可清单）。
 /// 未知 `kind` 与契约外多余字段一律拒绝（手机不能追加任何自报字段）。
 const ACTION_KEYS: &[(&str, &[&str])] = &[
-    ("send", &["kind", "sessionId", "generation", "text"]),
+    (
+        "send",
+        &["kind", "sessionId", "generation", "text", "heldQueue"],
+    ),
     (
         "snooze",
         &["kind", "sessionId", "generation", "interactionId"],
@@ -410,11 +413,32 @@ const ACTION_KEYS: &[(&str, &[&str])] = &[
         "selection",
         &["kind", "sessionId", "generation", "model", "thought"],
     ),
+    (
+        "queueDelete",
+        &["kind", "sessionId", "generation", "queueItemId"],
+    ),
+    (
+        "queueReorder",
+        &[
+            "kind",
+            "sessionId",
+            "generation",
+            "queueItemId",
+            "beforeQueueItemId",
+        ],
+    ),
+    (
+        "queueNow",
+        &["kind", "sessionId", "generation", "queueItemId"],
+    ),
+    ("queueResume", &["kind", "sessionId", "generation"]),
 ];
 
 /// 问答答案条目允许字段（[`AnswerEntry`](crate::services::zcode_control::AnswerEntry)
 /// 的 wire 形态）；条目内多余字段同样拒绝。
 const ANSWER_KEYS: &[&str] = &["questionText", "selectedValues", "freeText"];
+/// `Send.heldQueue` 的手机侧合同；嵌套字段也执行严格白名单。
+const HELD_QUEUE_KEYS: &[&str] = &["disposition", "expectedQueueItemIds"];
 
 /// POST /m/api/v1/zcode/actions：配对手机提交一次控制动作。
 ///
@@ -505,6 +529,17 @@ fn parse_action_request(raw: Value) -> Option<(String, ControlAction)> {
         for answer in action.get("answers")?.as_array()? {
             let entry = answer.as_object()?;
             if !entry.keys().all(|key| ANSWER_KEYS.contains(&key.as_str())) {
+                return None;
+            }
+        }
+    }
+    if kind == "send" {
+        if let Some(held_queue) = action.get("heldQueue") {
+            let choice = held_queue.as_object()?;
+            if !choice
+                .keys()
+                .all(|key| HELD_QUEUE_KEYS.contains(&key.as_str()))
+            {
                 return None;
             }
         }

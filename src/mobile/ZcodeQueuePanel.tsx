@@ -18,7 +18,7 @@
 // 按钮门（计划 §5.2/§5.3）：
 // - 「引导」**恒禁用**：官方侧没有「把已排队项转成 guide」的证据，绝不拿
 //   `sendQueuedNow`（= 立即执行）冒充；本组件连 `onGuide` 都不收，从结构上排除误接。
-// - 「修改」「撤回」= 写面硬门 + `availability.queueEditAllowed` + `kind==="sendText"`
+// - 「修改」「撤回」= 写面硬门 + Tuvis `queueEdit` 能力 + `availability.queueEditAllowed` + `kind==="sendText"`
 //   + `dispatch.state` 可写 + 非在途；带附件的项**只保留撤回**（修改会丢附件）。
 // - 在途是**单写槽**：任何一项在途时所有队列动作按钮一并禁用，但只有该项显示
 //   「撤回中…」；草稿与主按钮的在途语义由面板层（ZcodeControlPanel）负责。
@@ -36,13 +36,21 @@ const PAUSE_REASON_KEYS: Record<string, string> = {
 };
 
 /**
- * 官方 `dispatch.state` 白名单里**仍可撤回/修改**的值。
+ * 官方 `dispatch.state` 当前仍可撤回/修改的值。`reserved` 尚未通过 W0 实机验证，
+ * 因而与 `promoting`（正在提升执行）、`drained`（已消费）、未知和缺字段一样保守关闭。
  *
- * `promoting`（正在被提升执行）与 `drained`（已被消费）都不在其中：这两态下撤回
- * 可能撞上正在执行的回合，修改更会把「已执行」的内容当成「未发送」回填。
- * 未知（null）同样不可写——白名单外一律保守关闭。
+ * **与后端同一个集合**：Rust `services::zcode_control::types::WRITABLE_DISPATCH_STATES`
+ * （服务端写前复核用的是它）。两端一旦漂移，就会出现「手机端按钮可点、服务端拒收」的
+ * 静默不一致——修改本集合必须同步改那一侧。
  */
-const WRITABLE_DISPATCH_STATES: ReadonlySet<string> = new Set(["admitted", "queued", "reserved"]);
+const WRITABLE_DISPATCH_STATES: ReadonlySet<string> = new Set(["queued", "admitted"]);
+const KNOWN_DISPATCH_STATES: ReadonlySet<string> = new Set([
+  "queued",
+  "admitted",
+  "reserved",
+  "promoting",
+  "drained",
+]);
 
 /** 暂停态 → 根节点 `data-state`（测试与样式共用同一套词）。 */
 function queueState(queue: QueueView): "empty" | "paused" | "pause-unknown" | "active" {
@@ -76,7 +84,9 @@ export interface ZcodeQueuePanelProps {
   queue?: QueueView | null;
   /** 写面硬门（paired + ready + 代际新鲜）：关闭时所有队列动作禁用。 */
   canWrite?: boolean;
-  /** 服务端投影的官方 `availability.queueEdit.allowed`（撤回/重排资格）。 */
+  /** 面板内任一写动作在途（含审批/问答）：共享单写槽，禁用队列的其他入口。 */
+  writeBusy?: boolean;
+  /** 面板合并 Tuvis `queueEdit` 能力与官方 `availability.queueEdit.allowed` 后的双层资格。 */
   queueEditAllowed?: boolean;
   /** `capabilities.queueResume.enabled`（恢复队列自动处理的独立授权槽位）。 */
   queueResumeAllowed?: boolean;
@@ -102,6 +112,7 @@ export interface ZcodeQueuePanelProps {
 export default function ZcodeQueuePanel({
   queue,
   canWrite = false,
+  writeBusy = false,
   queueEditAllowed = false,
   queueResumeAllowed = false,
   busyItemId = null,
@@ -129,7 +140,7 @@ export default function ZcodeQueuePanel({
   const reasonKey = pauseReasonKey(queue);
   const items = queue.items;
   /** 单写槽：任何队列动作在途 → 所有动作按钮禁用（绝不产生第二个写命令）。 */
-  const busy = busyItemId !== null || busyResume;
+  const busy = writeBusy || busyItemId !== null || busyResume;
   const canResume = canWrite && queueResumeAllowed && !busy;
   /** 全局禁用原因（写面/资格）：与条目无关，只在列表上方说一次。 */
   const globalEditReason = !canWrite
@@ -140,10 +151,24 @@ export default function ZcodeQueuePanel({
   /** 引导恒禁用：官方没有「已排队项转引导」的证据，绝不接 `queueNow`。 */
   const guideReason = i18n.t("mobile.zcodeControl.queueGuideReason");
 
+  /** 未验证/未来状态不冒充已消费；reserved 在 W0 实机门通过前单独保守禁用。 */
+  const itemDispatchReason = (item: QueueItemView): string | null => {
+    if (
+      item.dispatchState === null ||
+      item.dispatchState === "reserved" ||
+      !KNOWN_DISPATCH_STATES.has(item.dispatchState)
+    ) {
+      return i18n.t("mobile.zcodeControl.queueItemStateUnverifiedReason");
+    }
+    if (!dispatchWritable(item)) return i18n.t("mobile.zcodeControl.queueItemConsumedReason");
+    return null;
+  };
+
   /** 条目级「修改」禁用原因（与全局原因二选一展示）。 */
   const itemEditReason = (item: QueueItemView): string | null => {
     if (item.kind !== "sendText") return i18n.t("mobile.zcodeControl.queueEditKindReason");
-    if (!dispatchWritable(item)) return i18n.t("mobile.zcodeControl.queueItemConsumedReason");
+    const dispatchReason = itemDispatchReason(item);
+    if (dispatchReason !== null) return dispatchReason;
     if (item.hasAttachments) return i18n.t("mobile.zcodeControl.queueEditAttachmentsReason");
     return null;
   };
@@ -151,8 +176,7 @@ export default function ZcodeQueuePanel({
   /** 条目级「撤回」禁用原因（带附件不影响撤回）。 */
   const itemDeleteReason = (item: QueueItemView): string | null => {
     if (item.kind !== "sendText") return i18n.t("mobile.zcodeControl.queueEditKindReason");
-    if (!dispatchWritable(item)) return i18n.t("mobile.zcodeControl.queueItemConsumedReason");
-    return null;
+    return itemDispatchReason(item);
   };
 
   const renderEditButton = (item: QueueItemView) => {

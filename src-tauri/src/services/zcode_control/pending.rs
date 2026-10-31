@@ -25,8 +25,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde_json::{Map, Value};
 
 use super::types::{
-    codes, project_pending_detail, ActiveWork, AnswerEntry, BoundTarget, ControlView, PendingKind,
-    PendingView, PermissionOptionView, QuestionOption, QuestionView, ZResult, ZcodeError,
+    codes, project_pending_detail_bounded, ActiveWork, AnswerEntry, BoundTarget, ControlView,
+    PendingKind, PendingView, PermissionOptionView, QuestionOption, QuestionView, ZResult,
+    ZcodeError,
 };
 
 /// 本册最多保留的 pending 卡数（防巨库/恶意帧撑爆内存；超出丢弃并计数）。
@@ -254,6 +255,31 @@ impl PendingBook {
     }
 }
 
+/// 问答卡的**唯一**可远程作答判定（纯函数，供投影与应答闸共用）。
+///
+/// 三条同时成立：`kind=userInput`、`toolName=AskUserQuestion`、`schema.interaction`
+/// 缺失或恰为 [`ASK_USER_QUESTION_INTERACTION`]。`plan_approval` / MCP elicitation
+/// 等子型虽然也投影成 `userInput`，但**不可代答**——卡片据此渲染只读面，用户不会
+/// 选完才吃到 `needs_evidence`。
+pub fn is_answerable_user_input(pending: &PendingView) -> bool {
+    answerable_parts(
+        pending.kind,
+        pending.tool_name.as_deref(),
+        pending.schema_interaction.as_deref(),
+    )
+}
+
+/// [`is_answerable_user_input`] 的字段级实现（投影期还拿不到完整的 `PendingView`）。
+fn answerable_parts(
+    kind: PendingKind,
+    tool_name: Option<&str>,
+    schema_interaction: Option<&str>,
+) -> bool {
+    kind == PendingKind::UserInput
+        && tool_name == Some(ASK_USER_QUESTION_TOOL)
+        && schema_interaction.is_none_or(|interaction| interaction == ASK_USER_QUESTION_INTERACTION)
+}
+
 /// 按宿主原值构造 `resolveInteraction.answer`（T4.1 Slice A；纯映射，不落盘）。
 ///
 /// 形状钉固定探针 `buildUserInputAnswer`（`interactionBridge.ts:536-590`；
@@ -277,12 +303,8 @@ pub fn build_user_answer(pending: &PendingView, answers: &[AnswerEntry]) -> ZRes
         return Err(invalid_answer());
     }
     // 计划审批/MCP elicitation 同样投影成 userInput：只认已建模的问答子类。
-    if let Some(interaction) = pending.schema_interaction.as_deref() {
-        if interaction != ASK_USER_QUESTION_INTERACTION {
-            return Err(needs_evidence());
-        }
-    }
-    if pending.tool_name.as_deref() != Some(ASK_USER_QUESTION_TOOL) {
+    // 与手机卡片的 `answerable` 共用同一个纯判定（绝不前端第二套规则）。
+    if !is_answerable_user_input(pending) {
         return Err(needs_evidence());
     }
     if answers.is_empty() || pending.questions.is_empty() {
@@ -507,13 +529,19 @@ fn parse_pending(card: &Value, skipped_options: &mut u64) -> Option<PendingView>
         .or_else(|| optional_string(payload, "prompt"))
         .filter(|text| !text.is_empty());
     // 官方投影的 schema 子类（plan_approval / MCP elicitation …）：只读原值，
-    // 是否可答由 build_user_answer 的冻结闸判定，绝不在投影期猜测。
+    // 是否可答由与 build_user_answer 共用的纯判定给出（`answerable`）。
     let schema_interaction = payload
         .get("schema")
         .and_then(Value::as_object)
         .and_then(|schema| schema.get("interaction"))
         .and_then(Value::as_str)
         .map(str::to_owned);
+    let tool_name = optional_string(payload, "toolName");
+    let answerable = answerable_parts(kind, tool_name.as_deref(), schema_interaction.as_deref());
+    // R0 复审遗留 I4：Bash 审批的命令正文只在 payload.detail，手机端此前看不到。
+    // 只做只读投影（截断有界），不写日志/账本，也不参与任何应答载荷。
+    // 截断真值与文本同一次算出：前端不按长度猜「是不是全貌」。
+    let detail = project_pending_detail_bounded(payload.get("detail"));
 
     Some(PendingView {
         interaction_id: interaction_id.to_owned(),
@@ -522,7 +550,7 @@ fn parse_pending(card: &Value, skipped_options: &mut u64) -> Option<PendingView>
         tool_call_id: optional_string(payload, "toolCallId"),
         created_at: record.get("createdAt").and_then(Value::as_u64),
         summary,
-        tool_name: optional_string(payload, "toolName"),
+        tool_name,
         schema_interaction,
         sensitive: payload
             .get("sensitive")
@@ -535,9 +563,9 @@ fn parse_pending(card: &Value, skipped_options: &mut u64) -> Option<PendingView>
             .map(str::to_owned),
         questions,
         options,
-        // R0 复审遗留 I4：Bash 审批的命令正文只在 payload.detail，手机端此前看不到。
-        // 只做只读投影（截断有界），不写日志/账本，也不参与任何应答载荷。
-        detail: project_pending_detail(payload.get("detail")),
+        detail: detail.text,
+        answerable,
+        detail_truncated: detail.truncated,
     })
 }
 
@@ -660,6 +688,7 @@ fn parse_permission_options(
 
 #[cfg(test)]
 mod tests {
+    use super::super::types::MAX_PENDING_DETAIL_CHARS;
     use super::*;
     use serde_json::json;
 
@@ -1578,6 +1607,8 @@ mod tests {
                 })
                 .collect(),
             detail: None,
+            answerable: false,
+            detail_truncated: false,
         }
     }
 
@@ -1737,6 +1768,97 @@ mod tests {
             .expect("payload")
             .remove("detail");
         let book = book_with(absent);
+        assert_eq!(book.pendings()[0].detail, None);
+    }
+
+    // -----------------------------------------------------------------------
+    // W5 / F4：不可答的 userInput 子型在**投影期**就标记只读
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn unsupported_pending_subtype_is_readonly() {
+        // 同一帧里放四种卡：支持子型、计划审批、MCP elicitation、权限审批。
+        // 「可答」必须由与 build_user_answer 共用的纯判定给出，前端不再猜。
+        let mut book = PendingBook::new(SESSION, 1);
+        book.accept_snapshot(&snapshot(
+            None,
+            json!([
+                single_question_card(),
+                plan_approval_card(),
+                elicitation_card(),
+                official_permission_card("perm-call_synthetic_9001"),
+            ]),
+        ))
+        .expect("snapshot shape");
+        let cards = book.pendings();
+        let by_id = |id: &str| {
+            cards
+                .iter()
+                .find(|card| card.interaction_id == id)
+                .expect("card present")
+        };
+
+        let supported = by_id("pi-synthetic-2001");
+        assert!(supported.answerable, "支持子型仍可答（回归）");
+        assert_eq!(
+            build_user_answer(supported, &[entry("原题？", &["原值 A"], None)])
+                .expect("supported subtype still maps"),
+            json!({
+                "action": "accept",
+                "content": {
+                    "answers": {"原题？": "原值 A"},
+                    "answer_0": "原值 A",
+                    "answer": "原值 A"
+                }
+            })
+        );
+
+        for (id, hint) in [
+            ("pi-synthetic-2005", "plan_approval"),
+            ("pi-synthetic-2006", "mcp_elicitation"),
+        ] {
+            let card = by_id(id);
+            assert!(!card.answerable, "{hint} 不得声称可答");
+            // 投影与应答闸同源：只读卡没有「选完才被拒」的窗口。
+            let error = build_user_answer(card, &[entry("Approve this plan?", &["approve"], None)])
+                .expect_err("unsupported subtype stays zero-value");
+            assert!(error.is(codes::NEEDS_EVIDENCE));
+        }
+
+        // 非 userInput 卡（审批）不看本字段：它的可答性由 approvalReply 与选项白名单决定。
+        let permission = by_id("perm-call_synthetic_9001");
+        assert!(!permission.answerable);
+        assert!(build_permission_answer(permission, "allowOnce").is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // W5 / F5：截断真值随投影给出（前端不得按字符串长度猜）
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn pending_detail_truncation_is_projected_from_the_same_cap() {
+        let long_command = "x".repeat(MAX_PENDING_DETAIL_CHARS + 512);
+        let mut card = official_permission_card("perm-call_synthetic_9002");
+        card["payload"]["detail"] = json!(long_command);
+        let book = book_with(card);
+        let projected = &book.pendings()[0];
+        assert!(projected.detail_truncated, "超长正文必须标记截断");
+        let detail = projected.detail.as_deref().expect("detail projected");
+        assert_eq!(detail.chars().count(), MAX_PENDING_DETAIL_CHARS + 1);
+        assert!(detail.ends_with('…'), "截断仍带显式省略标记");
+
+        // 未截断：同一上限内不标记，且文本一字不改。
+        let exact = "y".repeat(MAX_PENDING_DETAIL_CHARS);
+        let mut short = official_permission_card("perm-call_synthetic_9003");
+        short["payload"]["detail"] = json!(exact);
+        let book = book_with(short);
+        assert!(!book.pendings()[0].detail_truncated);
+        assert_eq!(book.pendings()[0].detail.as_deref(), Some(exact.as_str()));
+
+        // 无正文：不标记，也不产生空详情入口。
+        let absent = permission_card("pi-synthetic-9004");
+        let book = book_with(absent);
+        assert!(!book.pendings()[0].detail_truncated);
         assert_eq!(book.pendings()[0].detail, None);
     }
 }

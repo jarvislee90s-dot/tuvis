@@ -235,7 +235,7 @@ impl FakeOfficial {
         inner.selection = Some(selection);
     }
 
-    /// 注入 ACK 正文（缺省 `{"status":"accepted"}`）。
+    /// 注入 ACK 正文（发送命令缺省会生成符合 F2 的 `inputAccepted` 回执）。
     pub fn set_ack(&self, ack: Value) {
         lock(&self.inner).ack = ack;
     }
@@ -568,13 +568,38 @@ impl CommandPort for FakeOfficial {
         let outcome = {
             let mut inner = lock(&self.inner);
             if inner.link_up {
+                // F2 的生产发送 ACK 必须绑定本次 commandId；只有默认合成 ACK 才按
+                // 出站信封构造这一结果，显式 `set_ack` 仍可覆盖以测试坏 ACK。
+                let send_ack = args.first().and_then(|envelope| {
+                    (envelope.get("type").and_then(Value::as_str) == Some("sendText")
+                        && inner.ack == json!({ "status": "accepted" }))
+                    .then(|| {
+                        let command_id = envelope
+                            .get("commandId")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default();
+                        let delivery = if envelope["payload"]["requestedDelivery"] == "queue" {
+                            "queue"
+                        } else {
+                            "startNow"
+                        };
+                        json!({
+                            "status": "accepted",
+                            "result": {
+                                "type": "inputAccepted",
+                                "inputId": command_id,
+                                "delivery": delivery,
+                            }
+                        })
+                    })
+                });
                 inner.frames.push(Frame {
                     target: target.clone(),
                     channel: channel.to_owned(),
                     method: method.to_owned(),
                     args,
                 });
-                Ok(inner.ack.clone())
+                Ok(send_ack.unwrap_or_else(|| inner.ack.clone()))
             } else {
                 Err(ZcodeError::offline())
             }

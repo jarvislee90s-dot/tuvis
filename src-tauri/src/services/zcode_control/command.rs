@@ -104,7 +104,9 @@
 //! 走「只读幂等预检 → **队列专属**能力闸（`queue_edit`/`queue_now`/`queue_resume`，
 //! 默认关闭 → `needs_evidence`，**不借 send/approval_reply、不接受验收许可放宽**）→
 //! 写前新鲜官方队列（`StopPort::session` 一次只读）→ 按 `queueItemId` 复核
-//! （代际/就绪/项存在/`dispatch.state=="queued"`/`state.availability` 放行）→
+//! （代际/就绪/项存在/`dispatch.state` ∈ `WRITABLE_DISPATCH_STATES`（`queued`/`admitted`；
+//! `reserved` 未实机确认，不可写）/
+//! `state.availability` 放行）→
 //! 写前预留 → 恰一帧」。`QueueResume` 只要求 `queue.known && paused==Some(true)`
 //! （items 为空也允许）且只发 `{autoDrain:true}`；`QueueReorder` 只接受显式目标 ID
 //! （`null`=移末尾未实机确认）。ACK accepted/duplicate 只算受理，**不宣布删除/重排/恢复
@@ -129,6 +131,7 @@ use super::types::{
     codes, ActionContext, ActionReceipt, ActionState, ActiveWork, BoundTarget, CapabilitySource,
     CapabilityView, CommandPort, ControlAction, HeldQueueChoice, PendingPort, SelectionPort,
     SessionView, StopPort, StopRequest, ZResult, ZcodeError, PROTOCOL_CLIENT_ID,
+    WRITABLE_DISPATCH_STATES,
 };
 
 /// 官方发送方法名（`zcodeAgent.ts:937`、探针 `SendOnceLoop`）。
@@ -577,8 +580,13 @@ fn require_queue_now_allowed(view: &SessionView) -> ZResult<()> {
 ///
 /// - 队列未宣告（`known=false`）→ `not_ready`（不可判定，刷新后重试）；
 /// - 项不存在 → `invalid_action`（已消费/已变化，绝不按位置猜目标）；
-/// - `dispatch.state != "queued"`（`reserved`/`promoting`/`drained`/未知）→
-///   `invalid_action`：这些项已在飞行中或已消费，写命令只会与宿主竞态。
+/// - `dispatch.state` 不在 [`WRITABLE_DISPATCH_STATES`]（当前为 `queued`/`admitted`；
+///   `reserved` 尚未通过 W0 实机门）里（`reserved`/`promoting`/`drained`/未知/缺字段）
+///   → `invalid_action`，不冒险与宿主派发竞态。
+///
+/// 白名单与前端 `src/mobile/ZcodeQueuePanel.tsx` 的 `WRITABLE_DISPATCH_STATES` 是
+/// **同一个集合**（见 [`WRITABLE_DISPATCH_STATES`] 的注释）：两端漂移就会出现
+/// 「手机端按钮可点、服务端拒收」。
 fn require_writable_queue_item(view: &SessionView, queue_item_id: &str) -> ZResult<()> {
     if !view.queue.known {
         return Err(ZcodeError::of(codes::NOT_READY));
@@ -591,7 +599,11 @@ fn require_writable_queue_item(view: &SessionView, queue_item_id: &str) -> ZResu
     else {
         return Err(invalid_action());
     };
-    if item.dispatch_state.as_deref() != Some("queued") {
+    let writable = item
+        .dispatch_state
+        .as_deref()
+        .is_some_and(|state| WRITABLE_DISPATCH_STATES.contains(&state));
+    if !writable {
         return Err(invalid_action());
     }
     Ok(())
@@ -601,7 +613,8 @@ fn require_writable_queue_item(view: &SessionView, queue_item_id: &str) -> ZResu
 ///
 /// 校验顺序（任一不过即 fail closed，返回既有冻结码，不新造码）：
 /// 1. 视图必须是精确目标（会话 id + 本代际）且 `ready=true`；
-/// 2. 撤回/重排/立即执行：队列已宣告 + 目标项存在 + `dispatch.state=="queued"`
+/// 2. 撤回/重排/立即执行：队列已宣告 + 目标项存在 + `dispatch.state` ∈
+///    [`WRITABLE_DISPATCH_STATES`]（当前为 `queued`/`admitted`；`reserved` 未实机确认）
 ///    + 官方 availability 明确放行；
 /// 3. 重排：`beforeQueueItemId` 必须是新鲜队列里**另一个**已存在项——`null`
 ///    （官方语义「移到末尾」）未经实机确认，本批一律拒绝；
@@ -1959,6 +1972,10 @@ impl CommandSender {
             "payload": payload,
             "issuedAt": now_ms(),
         });
+        // F2：`delivery` 已被 `classify_send_ack` 校验（`startNow|queue|guide` 三值之一），
+        // 但**本轮不扩 `ActionReceipt`**（施工单最小方案），故此处**有意丢弃**。
+        // 手机端改由**新鲜队列**旁证投递结论（`src/mobile/zcode-send-delivery.ts`）：
+        // 出现与本次发送一致的新队列项 ⇒「已排队」，否则 ⇒ 中立的「已受理」。
         let (state, reason_code, _delivery) = match self
             .bridge
             .call(
@@ -3439,6 +3456,8 @@ mod tests {
                 questions,
                 options: Vec::new(),
                 detail: None,
+                answerable: true,
+                detail_truncated: false,
             }
         }
 
@@ -6059,6 +6078,8 @@ mod tests {
                 questions: Vec::new(),
                 options,
                 detail: None,
+                answerable: false,
+                detail_truncated: false,
             }
         }
 
@@ -7608,6 +7629,80 @@ mod tests {
             assert_eq!(row_count(&store), 1);
         }
 
+        /// `admitted` 仍允许撤回；`reserved` 的真实语义未过 W0 证据门，必须零帧拒绝：
+        /// 服务端写前复核必须与手机端按钮门用**同一个集合**
+        /// （[`WRITABLE_DISPATCH_STATES`]），否则会出现「手机端按钮可点、服务端拒收」。
+        ///
+        /// `promoting`/`drained` 和证据未确认的 `reserved` 均必须拒。
+        #[tokio::test]
+        async fn queue_delete_accepts_admitted_state() {
+            for state in ["admitted"] {
+                let store = DeviceStore::memory();
+                let fake = FakeBridge::new(Reply::Body(serde_json::json!({"status": "accepted"})));
+                let port = FakeQueuePort::new(view(
+                    vec![item("queue_a", 0, state)],
+                    false,
+                    availability(true, true),
+                ));
+                let sender = open_sender(&fake, &store, &port);
+
+                let receipt = sender
+                    .execute(&ctx("q-del-state"), &target(), &delete_action("queue_a"))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    receipt.state,
+                    ActionState::Accepted,
+                    "{state} 在已验证写集合内，必须允许撤回"
+                );
+                assert_eq!(fake.wire(), 1, "{state} 撤回恰好一帧");
+                assert_eq!(
+                    payload(&fake, 0),
+                    serde_json::json!({"queueItemId": "queue_a"}),
+                    "{state} 撤回只发项 ID"
+                );
+            }
+
+            let store = DeviceStore::memory();
+            let fake = FakeBridge::new(Reply::Body(serde_json::json!({"status": "accepted"})));
+            let port = FakeQueuePort::new(view(
+                vec![item("queue_a", 0, "reserved")],
+                false,
+                availability(true, true),
+            ));
+            let sender = open_sender(&fake, &store, &port);
+            let error = sender
+                .execute(&ctx("q-del-reserved"), &target(), &delete_action("queue_a"))
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, codes::INVALID_ACTION);
+            assert_eq!(fake.wire(), 0, "reserved 无实机证据，不得派发");
+            assert_eq!(row_count(&store), 0, "拒绝 reserved 不得预留 actionId");
+
+            // 反向：已在飞行中/已消费的态仍然拒（零帧）。
+            for state in ["promoting", "drained"] {
+                let store = DeviceStore::memory();
+                let fake = FakeBridge::new(Reply::Body(serde_json::json!({"status": "accepted"})));
+                let port = FakeQueuePort::new(view(
+                    vec![item("queue_a", 0, state)],
+                    false,
+                    availability(true, true),
+                ));
+                let sender = open_sender(&fake, &store, &port);
+
+                let error = sender
+                    .execute(&ctx("q-del-state"), &target(), &delete_action("queue_a"))
+                    .await
+                    .unwrap_err();
+                assert_eq!(
+                    error.code,
+                    codes::INVALID_ACTION,
+                    "{state} 已在飞行中/已消费，必须拒"
+                );
+                assert_eq!(fake.wire(), 0, "{state} 拒绝不得产生任何出站帧");
+            }
+        }
+
         /// ACK 闭环：`accepted/duplicate` 只算受理；`rejected/failed` 如实拒绝；
         /// `stale`/无法解释 → unknown（绝不乐观宣布删除完成）。
         #[tokio::test]
@@ -7937,7 +8032,7 @@ mod tests {
                     codes::INVALID_ACTION,
                 ),
                 (
-                    "item reserved",
+                    "reserved unverified",
                     view(
                         vec![item("queue_a", 0, "reserved")],
                         false,

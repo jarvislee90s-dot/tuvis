@@ -386,7 +386,7 @@ describe("ZCode 队列面板：按钮门（§5.2）", () => {
   });
 
   it("already_dispatched_items_are_not_writable", () => {
-    for (const dispatchState of ["promoting", "drained", null]) {
+    for (const dispatchState of ["promoting", "drained"]) {
       cleanup();
       renderPanel({
         queue: queue({
@@ -400,6 +400,58 @@ describe("ZCode 队列面板：按钮门（§5.2）", () => {
         i18n.t("mobile.zcodeControl.queueItemConsumedReason")
       );
     }
+
+    cleanup();
+    renderPanel({
+      queue: queue({
+        items: [item({ inputId: "queue_cmd-unknown", text: "状态未知", dispatchState: null })],
+      }),
+    });
+    expand();
+    expect(screen.getByTestId("zcode-queue-edit-queue_cmd-unknown")).toBeDisabled();
+    expect(screen.getByTestId("zcode-queue-delete-queue_cmd-unknown")).toBeDisabled();
+    expect(screen.getByTestId("zcode-queue-item-reason-queue_cmd-unknown").textContent).toBe(
+      i18n.t("mobile.zcodeControl.queueItemStateUnverifiedReason")
+    );
+  });
+
+  it("queued_item_with_admitted_state_is_actionable", () => {
+    const onDelete = vi.fn();
+    renderPanel({
+      queue: queue({
+        items: [item({ inputId: "queue_cmd-wait", text: "尚未派发", dispatchState: "admitted" })],
+      }),
+      onDelete,
+    });
+    expand();
+    const edit = screen.getByTestId("zcode-queue-edit-queue_cmd-wait");
+    const del = screen.getByTestId("zcode-queue-delete-queue_cmd-wait");
+    expect(edit).toBeEnabled();
+    expect(del).toBeEnabled();
+    fireEvent.click(del);
+    expect(onDelete).toHaveBeenCalledWith("queue_cmd-wait");
+  });
+
+  it("reserved_item_stays_disabled_without_host_evidence", () => {
+    const onDelete = vi.fn();
+    const onEdit = vi.fn();
+    renderPanel({
+      queue: queue({
+        items: [
+          item({ inputId: "queue_cmd-reserved", text: "reserved", dispatchState: "reserved" }),
+        ],
+      }),
+      onDelete,
+      onEdit,
+    });
+    expand();
+    expect(screen.getByTestId("zcode-queue-edit-queue_cmd-reserved")).toBeDisabled();
+    expect(screen.getByTestId("zcode-queue-delete-queue_cmd-reserved")).toBeDisabled();
+    expect(screen.getByTestId("zcode-queue-item-reason-queue_cmd-reserved").textContent).toBe(
+      i18n.t("mobile.zcodeControl.queueItemStateUnverifiedReason")
+    );
+    expect(onDelete).not.toHaveBeenCalled();
+    expect(onEdit).not.toHaveBeenCalled();
   });
 
   it("busy_item_shows_only_its_own_progress_and_blocks_other_rows", () => {

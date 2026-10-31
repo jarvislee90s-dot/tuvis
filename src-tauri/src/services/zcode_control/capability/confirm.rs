@@ -533,6 +533,8 @@ mod tests {
             questions: Vec::new(),
             options: Vec::new(),
             detail: None,
+            answerable: false,
+            detail_truncated: false,
         }
     }
 

@@ -819,6 +819,21 @@ pub struct PendingView {
     /// 也绝不回传进任何应答载荷。
     #[serde(default)]
     pub detail: Option<String>,
+    /// 本卡是否属于**已建模、可远程作答**的 `AskUserQuestion` 子型。
+    ///
+    /// 与 `pending::build_user_answer` 的冻结闸共用**同一个纯判定**
+    /// （`kind=userInput` ∧ `toolName=AskUserQuestion` ∧ 合法 `schema.interaction`）：
+    /// 前端只消费本字段，绝不另建一套「差不多」的规则，用户也就不必选完才吃到
+    /// `needs_evidence`。`kind=permission` 等其它卡恒为 `false`——审批的可答性由
+    /// `approvalReply` 能力与选项白名单决定，不看本字段。
+    #[serde(default)]
+    pub answerable: bool,
+    /// [`PendingView::detail`] 是否按 [`MAX_PENDING_DETAIL_CHARS`] **截断**过。
+    ///
+    /// 与 `detail` 在同一次投影里算出（不靠前端按长度猜）：截断意味着手机上看到
+    /// 的正文不是全貌，卡片必须说明并在审批面撤掉「允许一次」。
+    #[serde(default)]
+    pub detail_truncated: bool,
 }
 
 /// `payload.detail` 投影的长度上限（**字符**数，不是字节；截断按字符边界切，中文
@@ -842,21 +857,65 @@ pub const MAX_PENDING_DETAIL_CHARS: usize = 2000;
 /// 4. 不写日志（本函数不做任何日志/错误回显，`ZcodeError` 不携带 cause）。
 ///    若后续要加掩码，需产品重新裁决，并同步桌面端展示口径。
 pub fn project_pending_detail(detail: Option<&Value>) -> Option<String> {
-    let value = detail?;
+    project_pending_detail_bounded(detail).text
+}
+
+/// `detail` 投影的完整结果：手机可见文本 + **是否被截断**。
+///
+/// 截断真值只在这里算一次（与 [`project_pending_detail`] 同一上限），随
+/// [`PendingView::detail_truncated`] 上线；前端不得按字符串长度自行推断。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingDetailProjection {
+    /// 与 [`project_pending_detail`] 完全一致的可见文本。
+    pub text: Option<String>,
+    /// true = 原文超过上限、`text` 只是前缀（末尾带 `…`）。
+    pub truncated: bool,
+}
+
+/// 与 [`project_pending_detail`] 同源的有界投影，额外给出截断真值。
+pub fn project_pending_detail_bounded(detail: Option<&Value>) -> PendingDetailProjection {
+    let Some(value) = detail else {
+        return PendingDetailProjection {
+            text: None,
+            truncated: false,
+        };
+    };
     let text = match value {
-        Value::Null => return None,
+        Value::Null => {
+            return PendingDetailProjection {
+                text: None,
+                truncated: false,
+            }
+        }
         Value::String(text) => text.clone(),
-        other => serde_json::to_string(other).ok()?,
+        other => match serde_json::to_string(other) {
+            Ok(text) => text,
+            Err(_) => {
+                return PendingDetailProjection {
+                    text: None,
+                    truncated: false,
+                }
+            }
+        },
     };
     if text.is_empty() {
-        return None;
+        return PendingDetailProjection {
+            text: None,
+            truncated: false,
+        };
     }
     if text.chars().count() <= MAX_PENDING_DETAIL_CHARS {
-        return Some(text);
+        return PendingDetailProjection {
+            text: Some(text),
+            truncated: false,
+        };
     }
     let mut truncated: String = text.chars().take(MAX_PENDING_DETAIL_CHARS).collect();
     truncated.push('…');
-    Some(truncated)
+    PendingDetailProjection {
+        text: Some(truncated),
+        truncated: true,
+    }
 }
 
 /// control 里的一条活动（`foregroundExecutionId` = stop 守卫 id 的来源）。
@@ -1066,13 +1125,24 @@ pub struct QueueItemView {
     pub kind: Option<String>,
     /// 官方 `dispatch.state`（证据白名单 `admitted|queued|reserved|promoting|drained`）。
     ///
-    /// 只有 `queued` 才允许撤回/重排/立即执行；`None`（宿主未宣告/未知值）同样不可写。
+    /// 只有 [`WRITABLE_DISPATCH_STATES`] 里的状态才允许撤回/重排/立即执行；
+    /// `None`（宿主未宣告/未知值）同样不可写。
     #[serde(default)]
     pub dispatch_state: Option<String>,
     /// 该项是否带附件（**只告知有无**，绝不下发附件对象/路径）。
     #[serde(default)]
     pub has_attachments: bool,
 }
+
+/// 官方 `dispatch.state` 中目前允许写队列的状态（撤回/重排/立即执行）。
+///
+/// 目前只开放 `queued` 与 `admitted`。`reserved` 的撤回/重排语义未完成 W0 实机验证，
+/// 因而保守关闭；`promoting`、`drained`、未知值和缺字段也一律不可写。
+///
+/// **前端必须使用同一个集合**：手机端 `src/mobile/ZcodeQueuePanel.tsx` 的
+/// `WRITABLE_DISPATCH_STATES` 与本常量逐值一致（见该文件的同名注释）。两端一旦漂移，
+/// 就会出现「手机端按钮可点、服务端拒收」的静默不一致。
+pub const WRITABLE_DISPATCH_STATES: [&str; 2] = ["queued", "admitted"];
 
 /// 官方 `state.availability` 里与队列写操作有关的**只读资格**。
 ///
@@ -1517,9 +1587,36 @@ mod tests {
                 questions: Vec::new(),
                 options: Vec::new(),
                 detail: Some("npm test".to_owned()),
+                answerable: false,
+                detail_truncated: false,
             };
             let value = serde_json::to_value(&view).expect("pending 视图应可序列化");
             assert_eq!(value["detail"], "npm test");
+            // 两个安全字段必须在 wire 上始终出现（缺省只在**反序列化**旧载荷时生效）。
+            assert_eq!(value["answerable"], false);
+            assert_eq!(value["detailTruncated"], false);
+        }
+
+        /// 截断真值由同一次投影给出：越界 true、恰好等于上限 false、缺失 false。
+        #[test]
+        fn bounded_projection_reports_truncation_truth() {
+            let long = "命".repeat(MAX_PENDING_DETAIL_CHARS + 1);
+            let projected = project_pending_detail_bounded(Some(&Value::from(long.clone())));
+            assert!(projected.truncated, "超过上限必须标记截断");
+            assert_eq!(
+                projected.text.as_deref(),
+                project_pending_detail(Some(&Value::from(long))).as_deref(),
+                "可见文本仍与既有投影完全一致"
+            );
+
+            let exact = "x".repeat(MAX_PENDING_DETAIL_CHARS);
+            assert!(!project_pending_detail_bounded(Some(&Value::from(exact))).truncated);
+
+            for absent in [None, Some(&Value::Null), Some(&Value::from(""))] {
+                let projected = project_pending_detail_bounded(absent);
+                assert_eq!(projected.text, None);
+                assert!(!projected.truncated, "无正文绝不标记截断");
+            }
         }
     }
 

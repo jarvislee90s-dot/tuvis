@@ -283,6 +283,8 @@ describe("mergeDegradedView：内容不倒退，只关写面", () => {
           questions: [],
           options: [],
           detail: null,
+          answerable: false,
+          detailTruncated: false,
         },
       ],
       queue: queue(["queue_a", "queue_b"]),

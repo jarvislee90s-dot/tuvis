@@ -191,6 +191,29 @@ export interface PendingView {
    * 缺失/空/null → `null`。手机端只展示，**不**回传、不落任何存储。
    */
   detail: string | null;
+  /**
+   * 本卡是否属于**已建模、可远程作答**的 `AskUserQuestion` 子型。
+   *
+   * 由服务端用与应答闸**同一个**纯判定投影（`kind=userInput` ∧
+   * `toolName=AskUserQuestion` ∧ 合法 `schemaInteraction`）；前端只消费本字段，
+   * 不再另建一套「差不多」的规则。`false` 时卡片渲染只读面（不给选项/提交），
+   * 用户不会「选完才被 `needs_evidence` 拒」。`kind=permission` 恒为 `false`：
+   * 审批的可答性由 `approvalReply` 能力与选项白名单决定，不看本字段。
+   *
+   * **可选字段（缺字段 = 未声明 ⇒ 按旧口径兼容；显式 false = 不可答）**：
+   * 服务端（Rust `services::zcode_control::types::PendingView`）**总是**下发本字段，
+   * 但旧服务端载荷 / 增量 merge 的帧可能不带它。缺字段时前端按**旧口径**
+   * （`kind=userInput` ∧ `toolName=AskUserQuestion` ∧ 合法 `schemaInteraction`）
+   * 兼容回退，**不是**第二套权威规则；只有服务端**显式** `false` 才降级为只读卡。
+   */
+  answerable?: boolean;
+  /**
+   * `detail` 是否被服务端按同一上限**截断**过（与文本同一次投影算出，前端不按长度猜）。
+   *
+   * `true` → 卡片必须说明「内容未完全展示」并撤掉「允许一次」，只留「拒绝」与
+   * 「打开官方页面」：看不到全貌的审批绝不提供盲批。
+   */
+  detailTruncated: boolean;
 }
 
 /** control 里的一条活动（`foregroundExecutionId` 是 stop 守卫 id 的来源）。 */

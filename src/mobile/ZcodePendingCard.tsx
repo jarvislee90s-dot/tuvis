@@ -22,6 +22,12 @@
 //   不在本轮范围。
 // - `detail`（官方 `payload.detail`，Bash 即命令正文）默认折叠、展开只读；它不参与
 //   任何提交动作。
+// - 不可代答的 userInput 子型（服务端**显式** `answerable=false`，如 plan_approval /
+//   MCP elicitation）渲染**只读卡**：只有原因 +「打开官方页面」，不渲染选项与提交键——
+//   绝不「选完才被 `needs_evidence` 拒」。是否可答由服务端与应答闸共用的同一纯判定给出，
+//   前端不另判；字段**缺失**时按旧口径兼容回退（见 [`isPendingAnswerable`）。
+// - `detailTruncated=true`：正文不是全貌，卡片就地说明并**撤掉「允许一次」**（拒绝与
+//   官方页面保留）。截断真值由服务端投影给出，前端不按字符串长度猜。
 import { useEffect, useRef, useState } from "react";
 import i18n from "@/i18n";
 import {
@@ -102,6 +108,13 @@ export interface PendingCardProps {
    */
   revision: number | null;
   submit: (action: ControlAction) => Promise<ActionReceipt>;
+  /**
+   * 「打开官方页面」入口（可选）：只读卡与截断审批卡需要有地方去核对全貌。
+   *
+   * 由面板传入已保存的官方链接（链接未知时不传 → 不挂入口，绝不伪造 URL）；
+   * 卡片自己只调用回调，不拼链接、不代点官方页面。
+   */
+  onOpenOfficial?: () => void;
 }
 
 /**
@@ -132,6 +145,36 @@ function domIdHash(value: string): string {
   return hash.toString(36).padStart(7, "0").slice(-7);
 }
 
+/**
+ * 问答卡是否**可远程作答**（三分语义；不是第二套权威规则）。
+ *
+ * - `answerable === false` → 服务端**显式**说不可答（plan_approval / MCP elicitation 等
+ *   子型）→ 只读卡（F4 的安全目标：用户不会「选完才被 `needs_evidence` 拒」）。
+ * - `answerable === true` → 可答。
+ * - `answerable === undefined`（**字段缺失**：旧服务端 / 增量 merge 未带该字段）→
+ *   回退**旧口径**判定：`kind==="userInput"` ∧ `toolName==="AskUserQuestion"` ∧
+ *   `schemaInteraction` 合法（缺省或恰为 `AskUserQuestion`）⇒ 可答，否则只读。
+ *
+ * 兼容回退的理由：缺字段只说明服务端**未声明**，不等于「不可答」——若一律按不可答
+ * 处理，同代 SSE 新推来的可答卡会被误判成只读（U7 回归）。但回退**只**在字段缺失时
+ * 生效，服务端一旦**显式**给出 `false`，一律以服务端为准（绝不覆盖 F4 的安全目标）。
+ *
+ * 权威仍在服务端：Rust `pending::answerable_parts` 与应答闸共用同一纯判定，前端这里
+ * 只是「字段没到」时的兼容分支，不另建一套权威规则。
+ */
+export function isPendingAnswerable(pending: PendingView): boolean {
+  if (pending.answerable !== undefined) return pending.answerable;
+  // 旧服务端/增量 merge 的帧可能连 `schemaInteraction` 都没有 → 显式放宽可空性。
+  const schemaInteraction: string | null | undefined = pending.schemaInteraction;
+  return (
+    pending.kind === "userInput" &&
+    pending.toolName === "AskUserQuestion" &&
+    (schemaInteraction === null ||
+      schemaInteraction === undefined ||
+      schemaInteraction === "AskUserQuestion")
+  );
+}
+
 /** 单张 pending 卡：只读呈现 + 宿主原值回传；关闭的能力面禁用并说明原因。 */
 function ZcodePendingCard({
   pending,
@@ -141,6 +184,7 @@ function ZcodePendingCard({
   gateReason,
   submitting,
   submit,
+  onOpenOfficial,
 }: PendingCardProps) {
   /** 每题的宿主选项原值集合：单选恒 0/1 个，多选按点击顺序累加（toggle 增删）。 */
   const [picked, setPicked] = useState<Record<string, string[]>>({});
@@ -230,6 +274,15 @@ function ZcodePendingCard({
 
   const isPermission = pending.kind === "permission";
   const isUserInput = pending.kind === "userInput";
+  /**
+   * 只读问答卡：宿主把 `plan_approval` / MCP elicitation 等子型也投影成 `userInput`，
+   * 但它们**不可远程代答**（服务端用与 `build_user_answer` 同一个纯判定给出
+   * `answerable=false`）。此处绝不渲染选项/提交，从结构上消除「选完才被 needs_evidence 拒」。
+   * 字段**缺失**时按旧口径兼容回退（见 [`isPendingAnswerable`]），不把「未声明」当「不可答」。
+   */
+  const readOnlyInput = isUserInput && !isPendingAnswerable(pending);
+  /** 审批正文被服务端按上限截断：看不到全貌 → 不提供盲批（允许一次）。 */
+  const detailTruncated = isPermission && pending.detailTruncated;
   const flagFor = (question: QuestionView): CapabilityFlag =>
     question.multiSelect ? capabilities.multiSelect : capabilities.singleSelect;
   // 仅 allowOnce/deny 可回传；fullAccess 及其他永久/未知 kind 不渲染。
@@ -241,20 +294,23 @@ function ZcodePendingCard({
   // 写面硬门优先于能力矩阵：连接未配对 / 投影 ready=false → 全套作答面零写。
   // 审批卡过滤后无可选 option（宿主只给 fullAccess/未知 kind）→ 一样要就地说明，
   // 否则卡片只剩摘要、无按钮也无原因（用户只会以为卡坏了）。
-  const capabilityBlocked: CapabilityFlag | null = isPermission
-    ? capabilities.approvalReply.enabled
-      ? permissionOptions.length === 0
-        ? { enabled: false, reasonCode: "unsupported_protocol" }
-        : null
-      : capabilities.approvalReply
-    : isUserInput
-      ? (pending.questions
-          .flatMap((question) => [
-            flagFor(question),
-            ...(question.freeTextAllowed ? [capabilities.freeText] : []),
-          ])
-          .find((flag) => !flag.enabled) ?? null)
-      : { enabled: false, reasonCode: "unsupported_protocol" };
+  const capabilityBlocked: CapabilityFlag | null = readOnlyInput
+    ? // 只读卡不谈「能力缺失」：原因是类型本身不可代答，不是某一项旗标被关。
+      null
+    : isPermission
+      ? capabilities.approvalReply.enabled
+        ? permissionOptions.length === 0
+          ? { enabled: false, reasonCode: "unsupported_protocol" }
+          : null
+        : capabilities.approvalReply
+      : isUserInput
+        ? (pending.questions
+            .flatMap((question) => [
+              flagFor(question),
+              ...(question.freeTextAllowed ? [capabilities.freeText] : []),
+            ])
+            .find((flag) => !flag.enabled) ?? null)
+        : { enabled: false, reasonCode: "unsupported_protocol" };
   const blocked: CapabilityFlag | null =
     gateReason !== null ? { enabled: false, reasonCode: gateReason } : capabilityBlocked;
   // 按码如实呈现：每个冻结原因码都有独立 zh/en 文案（表外码才用中性兜底）；
@@ -351,9 +407,30 @@ function ZcodePendingCard({
   /** 命令详情锚点：同一页可能有多张卡，id 必须带 interaction 身份（且经 DOM 安全编码）。 */
   const detailId = pendingDomId("zcode-pending-detail", pending.interactionId);
 
+  /** 「打开官方页面」入口：只在面板提供了已保存链接时出现（绝不伪造 URL）。 */
+  const officialEntry =
+    onOpenOfficial === undefined ? null : (
+      <button
+        type="button"
+        data-testid="zcode-pending-open-official"
+        onClick={onOpenOfficial}
+        className="mt-1 rounded-full border border-[var(--cb)] px-3 py-1 text-xs text-[var(--mut)]"
+      >
+        {i18n.t("mobile.composer.zcodeOpenOfficial")}
+      </button>
+    );
+
   const footer = (
     <>
-      {blocked !== null && (
+      {readOnlyInput && (
+        <>
+          <p data-testid="zcode-pending-readonly-reason" className="mt-1 text-xs text-[var(--mut)]">
+            {i18n.t("mobile.zcodeControl.pendingReadonlyReason")}
+          </p>
+          {officialEntry}
+        </>
+      )}
+      {!readOnlyInput && blocked !== null && (
         <p
           data-testid="zcode-pending-reason"
           data-reason-code={blocked.reasonCode ?? "unknown"}
@@ -362,7 +439,7 @@ function ZcodePendingCard({
           {blockedText}
         </p>
       )}
-      {blocked === null && settledState !== null && (
+      {!readOnlyInput && blocked === null && settledState !== null && (
         <p
           data-testid="zcode-pending-notice"
           data-state={settledState}
@@ -371,7 +448,7 @@ function ZcodePendingCard({
           {i18n.t(STATUS_KEYS[settledState])}
         </p>
       )}
-      {blocked === null && settledState === null && snoozeInFlight && (
+      {!readOnlyInput && blocked === null && settledState === null && snoozeInFlight && (
         <p
           data-testid="zcode-pending-notice"
           data-state="snoozing"
@@ -380,7 +457,19 @@ function ZcodePendingCard({
           {i18n.t("mobile.zcodeControl.pendingSnoozing")}
         </p>
       )}
-      {isUserInput && confirming && missing.length > 0 && (
+      {/* 正文被截断：必须在选项上方就说清「不是全貌」，且只留拒绝/官方页面。 */}
+      {detailTruncated && (
+        <>
+          <p
+            data-testid="zcode-pending-detail-truncated"
+            className="mt-1 text-xs text-[var(--mut)]"
+          >
+            {i18n.t("mobile.zcodeControl.pendingDetailTruncated")}
+          </p>
+          {officialEntry}
+        </>
+      )}
+      {!readOnlyInput && isUserInput && confirming && missing.length > 0 && (
         <p data-testid="zcode-pending-missing" className="mt-1 text-xs text-[var(--mut)]">
           {i18n.t("mobile.zcodeControl.pendingMissing", {
             list: missing
@@ -391,7 +480,7 @@ function ZcodePendingCard({
           })}
         </p>
       )}
-      {isUserInput && (
+      {!readOnlyInput && isUserInput && (
         <div className="mt-2 flex items-center gap-2">
           {confirming ? (
             <button
@@ -507,9 +596,11 @@ function ZcodePendingCard({
                 key={option.optionId}
                 type="button"
                 data-testid={`zcode-permission-option-${option.optionId}`}
-                disabled={answerDisabled}
+                // 截断正文撤掉「允许一次」：看不到全貌就绝不提供盲批；「拒绝」仍可用。
+                disabled={answerDisabled || (detailTruncated && option.kind === "allowOnce")}
                 onClick={() => {
                   if (blocked !== null || submitting || settledRef.current) return;
+                  if (detailTruncated && option.kind === "allowOnce") return;
                   submitOnce({
                     kind: "permission",
                     sessionId,
@@ -525,7 +616,17 @@ function ZcodePendingCard({
             ))}
           </div>
         )}
-        {isUserInput && confirming && (
+        {isUserInput && readOnlyInput && pending.questions.length > 0 && (
+          // 只读问答子型：只展示问了什么，不给任何可提交控件。
+          <ul data-testid="zcode-pending-readonly-questions" className="mt-1 flex flex-col gap-1">
+            {pending.questions.map((item, index) => (
+              <li key={`${index}-${item.questionText}`} className="text-sm text-[var(--tx)]">
+                {item.questionText}
+              </li>
+            ))}
+          </ul>
+        )}
+        {isUserInput && !readOnlyInput && confirming && (
           <div data-testid="zcode-pending-confirm" className="mt-1">
             <p className="text-sm font-semibold text-[var(--tx)]">
               {i18n.t("mobile.zcodeControl.pendingReviewTitle")}
@@ -549,7 +650,7 @@ function ZcodePendingCard({
             </ol>
           </div>
         )}
-        {isUserInput && !confirming && question !== null && (
+        {isUserInput && !readOnlyInput && !confirming && question !== null && (
           <div className="mt-1">
             <p data-testid="zcode-pending-step" className="text-xs text-[var(--mut)]">
               {i18n.t("mobile.zcodeControl.pendingStep", {

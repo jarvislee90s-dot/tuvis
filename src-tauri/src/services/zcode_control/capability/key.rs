@@ -21,9 +21,13 @@ const KNOWN_BUILD: &str = "3.16.2.8769";
 const KNOWN_PROTOCOL_VERSION: u32 = 3;
 
 /// 队列候选层用到的官方命令名（R0 §3 命令表 `type` 取值，逐字）。
+#[cfg(any(test, feature = "zcode-bridge-evidence"))]
 const DELETE_QUEUE_ITEM: &str = "deleteQueueItem";
+#[cfg(any(test, feature = "zcode-bridge-evidence"))]
 const REORDER_QUEUE_ITEM: &str = "reorderQueueItem";
+#[cfg(any(test, feature = "zcode-bridge-evidence"))]
 const SEND_QUEUED_NOW: &str = "sendQueuedNow";
+#[cfg(any(test, feature = "zcode-bridge-evidence"))]
 const SET_AUTO_DRAIN: &str = "setAutoDrain";
 
 /// 已知 build 的**官方命令条目**（R0 §3 命令表，APP `3.16.2.8769`，只登记
@@ -31,6 +35,7 @@ const SET_AUTO_DRAIN: &str = "setAutoDrain";
 ///
 /// 它是队列候选层的唯一判据：命令名不在表内 = 本 build 未取证该命令，不得开闸。
 /// 新增命令必须先补 R0 取证，再进本表（不按「官方差不多应该有」猜）。
+#[cfg(any(test, feature = "zcode-bridge-evidence"))]
 const KNOWN_BUILD_QUEUE_COMMANDS: [&str; 4] = [
     DELETE_QUEUE_ITEM,
     REORDER_QUEUE_ITEM,
@@ -98,10 +103,9 @@ impl CapabilityKey {
 ///   multiSelect/freeText 形状）与编码（build_user_answer 多选/自由作答）均已
 ///   支持，故按接口形状开放为候选；无卡形状时接口闸仍关闭，首次真实动作的
 ///   确认/降级机制照常兜底。
-/// - `queue_edit` / `queue_resume` → **候选层**：仅当本 build 的命令条目
-///   （[`build_declares_queue_command`]，R0 §3）同时包含 `deleteQueueItem` +
-///   `reorderQueueItem`（编辑）或 `setAutoDrain`（恢复）时给
-///   `InterfaceMatched`；命令条目缺席仍是 `None`。
+/// - `queue_edit` / `queue_resume` → 只有 `zcode-bridge-evidence` debug 构建可进入**候选层**，
+///   且仅当本 build 命令条目（[`build_declares_queue_command`]，R0 §3）齐备；普通构建
+///   一律 `None`。静态命令名不等于 W0 实机取证，不可据此生产开闸。
 /// - `queue_now` → **`None`**：`sendQueuedNow` 命令名虽在证据表内，但「立即执行」
 ///   与「引导当前回合」是否等价没有实机证据，候选层不收录它。
 ///
@@ -116,7 +120,9 @@ pub(crate) fn shipped_state(
         return None;
     }
     match capability {
-        // 队列写候选层：只认本 build 取证过的官方命令条目（R0 §3）。
+        // W0 未确认的队列命令只能在显式 debug evidence/probe 构建参与候选判断。
+        // 普通 dev/release 不因静态命令表而开放产品写能力。
+        #[cfg(feature = "zcode-bridge-evidence")]
         Capability::QueueEdit => {
             let edit_commands = [DELETE_QUEUE_ITEM, REORDER_QUEUE_ITEM];
             edit_commands
@@ -124,10 +130,15 @@ pub(crate) fn shipped_state(
                 .all(|command| build_declares_queue_command(key, command))
                 .then_some(CapabilityState::InterfaceMatched)
         }
+        #[cfg(not(feature = "zcode-bridge-evidence"))]
+        Capability::QueueEdit => None,
         // 「立即执行 vs 引导」语义未实机证实：不进候选层，恒 `needs_evidence`。
         Capability::QueueNow => None,
+        #[cfg(feature = "zcode-bridge-evidence")]
         Capability::QueueResume => build_declares_queue_command(key, SET_AUTO_DRAIN)
             .then_some(CapabilityState::InterfaceMatched),
+        #[cfg(not(feature = "zcode-bridge-evidence"))]
+        Capability::QueueResume => None,
         Capability::Send
         | Capability::Model
         | Capability::ThoughtLevel
@@ -151,6 +162,7 @@ fn is_known_build(key: &CapabilityKey) -> bool {
 ///
 /// 只对精确命中的已知 build 生效；未知 build / 未取证命令名一律 `false`
 /// ——候选层不得凭「官方大概有这个命令」开闸。
+#[cfg(any(test, feature = "zcode-bridge-evidence"))]
 pub(crate) fn build_declares_queue_command(key: &CapabilityKey, command: &str) -> bool {
     is_known_build(key) && KNOWN_BUILD_QUEUE_COMMANDS.contains(&command)
 }
@@ -246,6 +258,7 @@ mod tests {
     /// 队列写的 shipped 条目 = **候选层**（不是确认）：已知 build 的命令条目命中
     /// `deleteQueueItem`+`reorderQueueItem` → `queue_edit` 候选；`setAutoDrain` →
     /// `queue_resume` 候选；`queue_now` **没有条目**（语义未实机证实）。
+    #[cfg(feature = "zcode-bridge-evidence")]
     #[test]
     fn shipped_table_queue_entries_are_candidates_only() {
         let known = CapabilityKey::new("macos", "3.16.2.8769", 3, "shape", 1);
@@ -263,6 +276,22 @@ mod tests {
             shipped_state(&known, Capability::QueueNow),
             None,
             "queue_now 不进候选层（立即执行 vs 引导未实测）"
+        );
+    }
+
+    #[cfg(not(feature = "zcode-bridge-evidence"))]
+    #[test]
+    fn queue_write_commands_stay_closed_without_w0_evidence_build() {
+        let known = CapabilityKey::new("macos", "3.16.2.8769", 3, "shape", 1);
+        assert_eq!(
+            shipped_state(&known, Capability::QueueEdit),
+            None,
+            "静态命令条目未完成 W0 实机取证，不得在普通构建开放 queue_edit"
+        );
+        assert_eq!(
+            shipped_state(&known, Capability::QueueResume),
+            None,
+            "静态命令条目未完成 W0 实机取证，不得在普通构建开放 queue_resume"
         );
     }
 

@@ -11,6 +11,7 @@
 //   冻结错误码（不是文案），文本是本地化原因。
 // - 回执状态 `zcode-action-status`（收到回执后渲染），`data-action-state` =
 //   ActionState；`accepted` 文案恰为「已受理」，`unknown` 不得出现「已生效」。
+//   没有与本次 commandId 关联的投递回执时不从正文/队列长度猜 `delivery`。
 //
 // pending 卡（问答 / 审批，Slice B1b 契约；数据只来自新 SessionView，不进旧终端
 // 按键 API）：
@@ -166,6 +167,8 @@ function pendingView(overrides: Partial<PendingView> = {}): PendingView {
     questions: [],
     options: [],
     detail: null,
+    answerable: true,
+    detailTruncated: false,
     ...overrides,
   };
 }
@@ -732,6 +735,57 @@ describe("ZCode 控制面板：敏感作答用密码框且不留草稿", () => {
 });
 
 describe("ZCode 控制面板：审批选项回传宿主原值", () => {
+  it("permission_and_queue_writes_share_the_same_in_flight_slot", async () => {
+    const permissionGate = deferred<void>();
+    const pending = pendingView({
+      kind: "permission",
+      toolName: "Bash",
+      summary: "执行合成命令",
+      questions: [],
+      options: [
+        { optionId: "host-allow-once-slot", label: "允许一次", kind: "allowOnce" },
+        { optionId: "host-deny-slot", label: "拒绝", kind: "deny" },
+      ],
+    });
+    installFetch((url, init) => {
+      if (url.includes("/official-control")) return json({ configState: "missing", url: null });
+      if (url === ZCODE_CONNECTION_PATH) return json(connection());
+      if (url.startsWith(`${ZCODE_SESSION_PATH}?`)) {
+        return json(
+          sessionView({
+            pending: [pending],
+            queue: queueView({
+              items: [queueItem({ inputId: "queue_cmd-lock", text: "排队正文" })],
+            }),
+          })
+        );
+      }
+      if (url === ZCODE_ACTIONS_PATH && init?.method === "POST") {
+        const body = JSON.parse(String(init.body)) as { actionId: string; action: ControlAction };
+        if (body.action.kind === "permission") {
+          return permissionGate.promise.then(() => json(receipt(body.actionId, "accepted")));
+        }
+        return json(receipt(body.actionId, "accepted"));
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+
+    render(<ZcodeControlPanel sessionId={SID} />);
+    await screen.findByText("允许一次");
+    openQueue();
+    fireEvent.click(cardIn().getByTestId("zcode-permission-option-host-allow-once-slot"));
+    await waitFor(() => expect(permissionActions()).toHaveLength(1));
+
+    const queueDelete = screen.getByTestId("zcode-queue-delete-queue_cmd-lock");
+    expect(queueDelete).toBeDisabled();
+    fireEvent.click(queueDelete);
+    expect(postedActions()).toHaveLength(1);
+    expect(postedActions()[0].action.kind).toBe("permission");
+
+    permissionGate.resolve();
+    await waitFor(() => expect(screen.getByTestId("zcode-action-status")).toBeInTheDocument());
+  });
+
   it("permission_options_use_host_values_and_hide_full_access", async () => {
     const pending = pendingView({
       kind: "permission",
@@ -2726,11 +2780,11 @@ describe("ZCode 控制面板：官方队列投影", () => {
   });
 });
 
-// ==== W4：队列动作（撤回 / 修改回填 / 恢复运行 / 引导禁用）====
+// ==== W4：队列动作（撤回 / 修改安全降级 / 恢复运行 / 引导禁用）====
 //
 // 这些用例锁的是**事务语义**，不是按钮存在性：
 // - 撤回：ACK 只到「撤回中」，必须等新鲜队列确认项消失才算完成；
-// - 修改：撤回成功且拿到新鲜证据后，才把**完整原文**写回输入框（绝不发送）；
+// - 修改：项目消失不证明删除因果，因此不自动回填；完整原文只供用户手动复制；
 // - 不确定：一律不回填、不重发，只给「复制原文」人工兜底；
 // - 恢复：只发一条 queueResume，新鲜队列 paused=false 才说「已恢复」；
 // - 引导：恒禁用，任何点击都不产生 POST（更不可能走 queueNow）。
@@ -2769,8 +2823,40 @@ function openQueue() {
   fireEvent.click(screen.getByTestId("zcode-queue-toggle"));
 }
 
-describe("ZCode 控制面板：队列修改（撤回 + 回填）", () => {
-  it("edit_restores_exact_full_text_and_never_sends", async () => {
+describe("ZCode 控制面板：队列修改（撤回 + 人工复制兜底）", () => {
+  it("queue_edit_actions_require_both_tuvis_capability_and_host_availability", async () => {
+    const caps = capabilities();
+    caps.queueEdit = flag(false);
+    installFetch((url) => {
+      if (url.includes("/official-control")) return json({ configState: "missing", url: null });
+      if (url === ZCODE_CONNECTION_PATH) return json(connection());
+      if (url.startsWith(`${ZCODE_SESSION_PATH}?`)) {
+        return json(
+          sessionView({
+            capabilities: caps,
+            queue: queueView({
+              items: [
+                queueItem({ inputId: "queue_cmd-a", text: "first", position: 0 }),
+                queueItem({ inputId: "queue_cmd-b", text: "second", position: 1 }),
+              ],
+            }),
+          })
+        );
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+    render(<ZcodeControlPanel sessionId={SID} />);
+    await screen.findByTestId("zcode-queue");
+    openQueue();
+
+    expect(screen.getByTestId("zcode-queue-edit-queue_cmd-a")).toBeDisabled();
+    expect(screen.getByTestId("zcode-queue-delete-queue_cmd-a")).toBeDisabled();
+    fireEvent.click(screen.getByTestId("zcode-queue-position-queue_cmd-b"));
+    expect(screen.getByTestId("zcode-queue-move-first-queue_cmd-b")).toBeDisabled();
+    expect(postedActions()).toHaveLength(0);
+  });
+
+  it("edit_does_not_restore_when_item_disappears_without_causal_delete_evidence", async () => {
     const full = "优先把登录的问题修复一下，然后补齐回归测试用例并且再跑一遍全量检查";
     installQueueScenario({
       before: queueView({
@@ -2786,9 +2872,17 @@ describe("ZCode 控制面板：队列修改（撤回 + 回填）", () => {
     fireEvent.click(screen.getByTestId("zcode-queue-edit-queue_cmd-a"));
 
     const draft = (await screen.findByTestId("zcode-draft")) as HTMLTextAreaElement;
-    await waitFor(() => expect(draft.value).toBe(full));
-    // 回填的是**完整原文**，绝不是 20 字素预览；且只发了一条 queueDelete（无 send）。
-    expect(draft.value.length).toBeGreaterThan(20);
+    const notice = await screen.findByTestId("zcode-queue-notice");
+    expect(notice.dataset.state).toBe("not-queued");
+    expect(notice.textContent).toBe(i18n.t("mobile.zcodeControl.queueEditRemovalUncertain"));
+    // 项消失不能证明是删除还是自然消费：不能自动把可能已执行的正文放回输入框。
+    expect(draft.value).toBe("");
+    fireEvent.click(screen.getByTestId("zcode-queue-copy-original"));
+    const fallback = (await screen.findByTestId(
+      "zcode-queue-copy-fallback"
+    )) as HTMLTextAreaElement;
+    expect(fallback.value).toBe(full);
+    expect(fallback.readOnly).toBe(true);
     const actions = postedActions().map(({ action }) => action);
     expect(actions).toHaveLength(1);
     expect(actions[0]).toEqual({
@@ -2833,7 +2927,7 @@ describe("ZCode 控制面板：队列修改（撤回 + 回填）", () => {
     expect(fallback.readOnly).toBe(true);
   });
 
-  it("existing_draft_forces_an_explicit_choice_and_cancel_is_zero_action", async () => {
+  it("edit_preserves_an_existing_draft_and_offers_original_for_manual_copy", async () => {
     const full = "排队里的完整原文";
     installQueueScenario({
       before: queueView({
@@ -2849,20 +2943,19 @@ describe("ZCode 控制面板：队列修改（撤回 + 回填）", () => {
     openQueue();
 
     fireEvent.click(screen.getByTestId("zcode-queue-edit-queue_cmd-c"));
-    // 已有草稿 → 先问（默认焦点在「取消」），此时绝不发任何动作。
-    const dialog = await screen.findByTestId("zcode-draft-conflict");
-    expect(dialog).toBeVisible();
-    expect(document.activeElement).toBe(screen.getByTestId("zcode-draft-conflict-cancel"));
-    expect(postedActions()).toHaveLength(0);
-
-    fireEvent.click(screen.getByTestId("zcode-draft-conflict-cancel"));
-    expect(screen.queryByTestId("zcode-draft-conflict")).toBeNull();
-    // 取消 = 零动作：不撤回、不覆盖草稿、不发消息。
-    expect(postedActions()).toHaveLength(0);
+    const notice = await screen.findByTestId("zcode-queue-notice");
+    expect(notice.dataset.state).toBe("not-queued");
+    // 即使已有草稿，消失也不能证明队列项是被撤回的；保留草稿并提供人工复制。
     expect(draft.value).toBe("我已经写了一半的草稿");
+    expect(postedActions().map(({ action }) => action.kind)).toEqual(["queueDelete"]);
+    fireEvent.click(screen.getByTestId("zcode-queue-copy-original"));
+    const fallback = (await screen.findByTestId(
+      "zcode-queue-copy-fallback"
+    )) as HTMLTextAreaElement;
+    expect(fallback.value).toBe(full);
   });
 
-  it("merge_keeps_the_existing_draft_and_appends_the_original", async () => {
+  it("edit_never_appends_the_original_to_an_existing_draft", async () => {
     const full = "排队里的完整原文";
     installQueueScenario({
       before: queueView({
@@ -2878,13 +2971,11 @@ describe("ZCode 控制面板：队列修改（撤回 + 回填）", () => {
     openQueue();
 
     fireEvent.click(screen.getByTestId("zcode-queue-edit-queue_cmd-d"));
-    fireEvent.click(await screen.findByTestId("zcode-draft-conflict-merge"));
-
-    await waitFor(() => expect(draft.value).toBe(`已有草稿\n${full}`));
-    // 只撤回、不发：动作集合仍是单条 queueDelete。
+    await screen.findByTestId("zcode-queue-notice");
+    expect(draft.value).toBe("已有草稿");
     expect(postedActions().map(({ action }) => action.kind)).toEqual(["queueDelete"]);
   });
-  it("draft_written_during_wait_is_never_overwritten_and_asks_again", async () => {
+  it("draft_written_during_wait_is_never_overwritten", async () => {
     const full = "排队里的完整原文";
     const gate = deferred<void>();
     installQueueScenario({
@@ -2906,14 +2997,11 @@ describe("ZCode 控制面板：队列修改（撤回 + 回填）", () => {
     fireEvent.change(draft, { target: { value: "等待中写的新草稿" } });
     gate.resolve();
 
-    const dialog = await screen.findByTestId("zcode-draft-conflict");
-    expect(dialog.textContent).toContain(i18n.t("mobile.zcodeControl.queueEditConflictChanged"));
-    fireEvent.click(screen.getByTestId("zcode-draft-conflict-cancel"));
-
-    // 取消：保住新草稿、不二次删除，原文改用「复制原文」取回。
+    const notice = await screen.findByTestId("zcode-queue-notice");
+    // 项目消失不触碰等待期间的新草稿；原文可由用户手动复制。
     expect(draft.value).toBe("等待中写的新草稿");
     expect(postedActions().map(({ action }) => action.kind)).toEqual(["queueDelete"]);
-    expect(screen.getByTestId("zcode-queue-notice").dataset.state).toBe("kept");
+    expect(notice.dataset.state).toBe("not-queued");
     fireEvent.click(screen.getByTestId("zcode-queue-copy-original"));
     const fallback = (await screen.findByTestId(
       "zcode-queue-copy-fallback"
@@ -2939,7 +3027,7 @@ describe("ZCode 控制面板：队列撤回与恢复", () => {
 
     fireEvent.click(screen.getByTestId("zcode-queue-delete-queue_cmd-e"));
     await waitFor(() => expect(postedActions()).toHaveLength(1));
-    // ACK 前：只有「撤回中」，绝不提前说「已撤回」；主按钮同时被在途槽禁用。
+    // ACK 前：只有「撤回中」，绝不提前称作队列已变化；主按钮同时被在途槽禁用。
     expect(screen.getByTestId("zcode-queue-delete-queue_cmd-e").textContent).toBe(
       i18n.t("mobile.zcodeControl.queueDeleting")
     );
@@ -2952,8 +3040,8 @@ describe("ZCode 控制面板：队列撤回与恢复", () => {
 
     gate.resolve();
     const notice = await screen.findByTestId("zcode-queue-notice");
-    expect(notice.dataset.state).toBe("deleted");
-    expect(notice.textContent).toBe(i18n.t("mobile.zcodeControl.queueDeleted"));
+    expect(notice.dataset.state).toBe("not-queued");
+    expect(notice.textContent).toBe(i18n.t("mobile.zcodeControl.queueEditRemovalUncertain"));
     expect(postedActions().map(({ action }) => action.kind)).toEqual(["queueDelete"]);
   });
 
@@ -3018,5 +3106,81 @@ describe("ZCode 控制面板：引导按钮恒禁用", () => {
     await act(async () => {});
     // 零 POST：既没有 queueNow，也没有任何 queue 动作。
     expect(postedActions()).toHaveLength(0);
+  });
+});
+
+// ==== F2：未与本次 commandId 关联的队列项不能证明本次发送已排队 ====
+describe("ZCode 控制面板：发送投递提示", () => {
+  const SENT = "本次发送的正文";
+
+  /** 发送场景：GET 按「是否已 POST」返回前后两份队列；POST 回 accepted。 */
+  function installSendQueueScenario(before: QueueView, after: QueueView) {
+    let posted = false;
+    installFetch((url, init) => {
+      if (url.includes("/official-control")) return json({ configState: "missing", url: null });
+      if (url === ZCODE_CONNECTION_PATH) return json(connection());
+      if (url.startsWith(`${ZCODE_SESSION_PATH}?`)) {
+        return json(sessionView({ revision: posted ? 13 : 12, queue: posted ? after : before }));
+      }
+      if (url === ZCODE_ACTIONS_PATH && init?.method === "POST") {
+        const body = JSON.parse(String(init.body)) as { actionId: string };
+        posted = true;
+        return json(receipt(body.actionId, "accepted"));
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+  }
+
+  it("accepted_send_stays_neutral_when_same_text_item_cannot_be_attributed", async () => {
+    // 另一设备可能同时排入相同正文；没有 inputId/commandId 关联时不能把它归给本次发送。
+    installSendQueueScenario(
+      queueView({
+        items: [queueItem({ inputId: "queue_cmd-old", text: "旧的一条", position: 0 })],
+      }),
+      queueView({
+        items: [
+          queueItem({ inputId: "queue_cmd-old", text: "旧的一条", position: 0 }),
+          queueItem({ inputId: "queue_cmd-new", text: SENT, position: 1 }),
+        ],
+      })
+    );
+    render(<ZcodeControlPanel sessionId={SID} />);
+    const draft = (await screen.findByTestId("zcode-draft")) as HTMLTextAreaElement;
+    const send = screen.getByTestId("zcode-send") as HTMLButtonElement;
+    await waitFor(() => expect(send).toBeEnabled());
+
+    fireEvent.change(draft, { target: { value: SENT } });
+    fireEvent.click(send);
+    await waitFor(() => expect(postedActions()).toHaveLength(1));
+
+    const status = await screen.findByTestId("zcode-action-status");
+    await waitFor(() =>
+      expect(status.textContent?.trim()).toBe(i18n.t("mobile.zcodeControl.statusAccepted"))
+    );
+    expect(status.getAttribute("data-delivery")).not.toBe("queued");
+    expect(status.getAttribute("data-action-state")).toBe("accepted");
+  });
+
+  it("accepted_send_keeps_neutral_status_when_queue_is_unchanged", async () => {
+    // 没有 inputId 与本次 commandId 的关联时，队列未变也不能推断实际投递方式。
+    const unchanged = queueView({
+      items: [queueItem({ inputId: "queue_cmd-old", text: "旧的一条", position: 0 })],
+    });
+    installSendQueueScenario(unchanged, unchanged);
+    render(<ZcodeControlPanel sessionId={SID} />);
+    const draft = (await screen.findByTestId("zcode-draft")) as HTMLTextAreaElement;
+    const send = screen.getByTestId("zcode-send") as HTMLButtonElement;
+    await waitFor(() => expect(send).toBeEnabled());
+
+    fireEvent.change(draft, { target: { value: SENT } });
+    fireEvent.click(send);
+    await waitFor(() => expect(postedActions()).toHaveLength(1));
+
+    const status = await screen.findByTestId("zcode-action-status");
+    expect(status.getAttribute("data-delivery")).toBeNull();
+    expect(status.textContent?.trim()).toBe(i18n.t("mobile.zcodeControl.statusAccepted"));
+    // 中立文案里绝不出现「已排队」或「已开始执行」这类越级断言。
+    expect(status.textContent).not.toContain("已排队");
+    expect(status.textContent).not.toContain("已开始执行");
   });
 });
