@@ -2063,6 +2063,9 @@
     "dbOpenFail": "打开数据库失败——详见日志",
     "migratePreviewLedgerFail": "重建预览版用量账本失败——详见日志",
     "migrateFail": "数据库迁移失败——详见日志",
+    "migrateCodexStopAttemptFail": "升级队列动作数据失败（补列 stop_attempt_reason）——详见日志",
+    "migrateCodexStopAttemptStateFail": "升级队列动作数据失败（补列 stop_attempt_state）——详见日志",
+    "migrateCodexBypassAttemptFail": "升级越队授权数据失败（补列 attempt）——详见日志",
     "migrateExtFieldsFail": "迁移扩展资源字段失败——详见日志",
     "migratePresetColFail": "迁移预设列失败——详见日志",
     "migrateSourceToolFail": "回填来源工具失败——详见日志",
@@ -2192,6 +2195,7 @@
     "codexInterruptPauseWriteFailed": "队列暂停保护写入失败，已放弃本次打断（未向桌面发送任何指令），请稍后重试",
     "migrateQueuePauseTokenFail": "队列暂停归属 token 迁移失败",
     "migrateQueuePauseMultiTokenFail": "队列暂停多行共存迁移失败",
+    "migrateQueuePauseTurnFail": "队列暂停回合绑定迁移失败",
     "migrateWriteRevokeTwoStateFail": "写撤销两态行迁移失败",
     "operationUnknownPolicy": "当前客户端还没有该会话的能力事实（投影缺字段）；请刷新后重试，兔维斯不会据此猜测可用能力",
     "operationNotImplemented": "该操作本阶段尚未接入（没有已核验的协议出口）；请到 Desktop 端处理",
@@ -2212,7 +2216,9 @@
     "migrateClaimEpochFail": "迁移同题占用代际列失败",
     "migrateClaimOwnerFail": "迁移同题占用世系列失败",
     "migrateClaimGroupFail": "迁移同组占用索引失败",
-    "migrateClaimOwnerTokenFail": "迁移占用调用令牌失败"
+    "migrateClaimOwnerTokenFail": "迁移占用调用令牌失败",
+    "codexBatchRequiresVerification": "此消息已合并发送，请先在桌面核对整批结果，不能按单条重发。",
+    "migrateBatchSignatureFail": "合并发送批次签名列迁移失败"
   },
   "mobile": {
     "common": {
@@ -2306,6 +2312,10 @@
       "placeholder": "输入消息发送到终端…",
       "sending": "发送中…",
       "send": "发送",
+      "stop": "停止",
+      "stopStopping": "停止中…",
+      "stopCompactAria": "停止桌面当前回合",
+      "stopUnavailable": "桌面回合运行中——暂无可用停止目标（目标不明或该版本不支持远程停止）",
       "attachHint": "附件将保存到用户项目目录 .tuvis-attachments/<会话>/（已在本地 git 排除，不会提交）；项目收尾时可整目录清理。"
     },
     "question": {
@@ -2512,6 +2522,14 @@
       },
       "queue": {
         "title": "待发队列",
+        "summaryCount": "排队 {{n}} 条",
+        "summaryPaused": "已暂停",
+        "summaryVerify": "待人工核对",
+        "summaryAwaitTurn": "等待回合完成",
+        "summaryQueued": "排队中",
+        "summaryIdle": "无待发",
+        "summaryView": "查看",
+        "summaryHide": "收起",
         "position": "第{{n}}位",
         "stateQueued": "待发送",
         "stateReserved": "派发中",
@@ -2541,12 +2559,37 @@
         "interruptUncertain": "停止指令已发出，但结果不确定（可能已生效）——请回桌面核对回合状态，不要连续重按",
         "interruptNoTurn": "桌面当前没有可停止的回合（可能刚好自己结束了）",
         "interruptFailed": "停止失败：{{message}}",
+        "interruptNoTarget": "没有可停止的目标——页面状态可能已过期，请刷新后重试（未发出任何请求）",
+        "interruptNotAllowed": "当前状态不可停止回合——请刷新核对桌面状态后重试（未发出任何请求）",
         "pausedBanner": "发送队列已暂停（打断后的保护）——恢复后按原顺序继续，或让本条先发送。",
         "pausedNote": "队列已暂停——按序派发已冻结，等待你的选择（先发送入口在发送区）。",
         "resume": "恢复队列",
         "bypass": "本条先发送",
         "bypassArmed": "本条将越过暂停的队列直接发送（一次性授权）。",
-        "resumeFailed": "恢复队列失败：{{message}}"
+        "resumeFailed": "恢复队列失败：{{message}}",
+        "prioritize": "插队",
+        "prioritizeYes": "先处理",
+        "prioritizeCancel": "取消",
+        "prioritizeRiskStop": "将停止桌面当前回合并让这条先发送：该回合未完成的工作会丢失，其余消息保持暂停。确定吗？",
+        "prioritizeRiskBypass": "让这条越过暂停的队列先发送？其余消息保持暂停，不会自动恢复。",
+        "prioritizeDone": "已优先发送这条；其余消息保持暂停。",
+        "prioritizeAlready": "这条已在派发或已处理（{{state}}），未重复发送。",
+        "prioritizeRefused": "暂未优先发送（{{reason}}），这条仍在队列。",
+        "prioritizeFailed": "优先发送失败：{{message}}",
+        "prioritizeUnknown": "结果未知：优先发送可能已生效，请稍后核对；不会自动重试。",
+        "prioritizeNeedsStopConfirm": "桌面回合正在运行：请确认「停止当前回合」后再优先发送",
+        "prioritizeNativePending": "桌面有待处理的原生请求（审批/提问），处理后可再优先发送",
+        "prioritizeStateUnknown": "桌面状态暂时无法确认，已保守取消本次优先发送",
+        "prioritizeStopNotEffective": "停止未生效：桌面回合仍在运行，这条未发送",
+        "prioritizeStopUncertain": "停止指令结果未知：为防双发已取消本次优先发送，请稍后核对",
+        "prioritizeBusy": "桌面正忙或仍有未完成的派发，这条暂时无法越队",
+        "prioritizeUnknownBarrier": "有一条消息的投递结果未知，队列正被它挡住；请核对队列中的该条，或回桌面核对后点「继续队列」。这条仍在队列里，还没有发出去。",
+        "edit": "重新编辑",
+        "editFailed": "重新编辑失败：{{message}}",
+        "editDraftConflict": "已有新草稿，选择如何放回已撤回的消息：",
+        "editDraftReplace": "替换草稿",
+        "editDraftAppend": "追加到草稿",
+        "lengthChars": "{{n}} 字"
       },
       "composer": {
         "codexAccepted": "已受理，Desktop 正在执行",
@@ -2558,7 +2601,7 @@
         "headless_cancelled": "兼容通道已取消：{{reason}}",
         "codexRetry": "重试",
         "retriedFrom": "已创建新发送（关联原动作 {{short}}）。",
-        "reasonQueuePaused": "发送队列已暂停——请先在下方选择「恢复队列」或「本条先发送」，再重试。",
+        "reasonQueuePaused": "发送队列已暂停，本条未派发——请到「待发队列」恢复整队，或对某一条点「先处理这条」后重试。",
         "reasonGrantConsumed": "越队授权已失效（此前的一次先发送可能已写出）——请重新选择发送方式，不要原样重试。",
         "reasonNativePending": "桌面端有未处理的请求——请先在上方卡片处理，或打断当前回合后再试。",
         "reasonCapabilityUnverified": "该版本暂不能远程发送（能力未确认且自动适配已关闭）——可在电脑端开启自动适配后重试。",
@@ -2649,7 +2692,8 @@
         "reasons": {
           "running": "当前回合正在运行，结束后可提交",
           "pendingNative": "当前有桌面审批／阻塞请求，需先处理",
-          "noContract": "当前版本该操作尚未匹配可用契约",
+          "noContract": "当前 Desktop 版本未匹配到异步答题契约，暂不能从手机提交；答案已保留，可到桌面端作答或查看适配详情",
+          "noEvidence": "当前 Desktop 版本的能力还在识别中，暂不能提交；答案已保留，稍后重试或到桌面端作答",
           "adaptOff": "自动适配已关闭，开启后可提交",
           "unsettled": "本组还有无法确认的题，暂不能提交"
         },
@@ -2660,7 +2704,11 @@
         "archiveGroup": "在 Tuvis 中收纳本组（不影响桌面）",
         "openGroup": "查看",
         "otherGroup": "另一组待回答 · {{count}} 题",
-        "verifyGroup": "待核对 · {{count}} 题"
+        "verifyGroup": "待核对 · {{count}} 题",
+        "otherGroupsCount": "另有 {{count}} 组",
+        "otherAnswers": "其他答案",
+        "expandTitle": "展开全文",
+        "collapseTitle": "收起题干"
       },
       "ops": {
         "more": "更多 {{count}}",
@@ -2686,8 +2734,24 @@
           "asyncAnswer": "异步答题",
           "stop": "停止本轮"
         },
+        "support": {
+          "supported": "已支持",
+          "identifying": "识别中",
+          "unmatched": "该版本未匹配",
+          "notImplemented": "未接入"
+        },
+        "reasons": {
+          "running": "回合运行中",
+          "pendingNative": "有待处理请求",
+          "queuePaused": "队列已暂停",
+          "adaptOff": "适配已关闭",
+          "stale": "连接恢复中",
+          "runtimeUnknown": "状态待核对"
+        },
         "connecting": "正在连接桌面会话…（连接后显示可用操作；不再回退终端屏读）",
         "noneAvailable": "暂无可用的新操作",
+        "reconnecting": "连接恢复中（沿用上次识别的能力展示）",
+        "identityPending": "上次识别结果 · 当前包身份核对中",
         "allowed": "可用",
         "blocked": "不可用"
       },

@@ -1,8 +1,11 @@
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { useEffect, useRef } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import i18n from "@/i18n";
 import CodexQueuePanel from "@/mobile/CodexQueuePanel";
-import type { CodexActionView, CodexQueueView } from "@/mobile/codexIpcApi";
+import type { CodexActionView, CodexQueueView, ThreadProjection } from "@/mobile/codexIpcApi";
+// T05：页面共享停止控制器（Harness 挂真实 hook）
+import { useCodexTurnControl } from "@/mobile/useCodexTurnControl";
 
 // Task 9：CodexQueuePanel（本设备待发队列）行为锁：
 // - 显示本设备待发与实际 FIFO 位置；撤回按钮；
@@ -30,9 +33,11 @@ function queueView(
   blockedReasonCode: string | null = null,
   blockedActionIds: string[] = [],
   /** 2026-10-22 复审 P2-2：canInterrupt 能力位（缺省 true = 已活体验证的 build） */
-  canInterrupt: boolean = true
+  canInterrupt: boolean = true,
+  /** T06：队列暂停位（S2 持久暂停；缺省 undefined = 未暂停） */
+  queuePaused?: boolean
 ): CodexQueueView {
-  return { actions, blockedReasonCode, blockedActionIds, canInterrupt };
+  return { actions, blockedReasonCode, blockedActionIds, canInterrupt, queuePaused };
 }
 
 interface Routes {
@@ -51,16 +56,34 @@ interface Routes {
   interruptErrorBody?: Record<string, unknown>;
   /** POST /codex/turn/interrupt 的回执体覆盖（null = 桌面无可打断回合） */
   interruptBody?: Record<string, unknown>;
+  /** T05：interrupt 挂起不响应（共享控制器 stopping 窗；_releaseInterrupt 放行） */
+  interruptHang?: boolean;
+  /** T06：POST /codex/queue/prioritize 的成功回执体（判别联合；缺省 prioritized） */
+  prioritizeBody?: Record<string, unknown>;
+  /** T06：prioritize 的失败状态码（缺省 200） */
+  prioritizeStatus?: number;
 }
 
 let routes: Routes;
 let fetchMock: ReturnType<typeof vi.fn>;
 /** queueHang 挂起请求的放行器（测试中手动 resolve 模拟旧会话迟到响应） */
 let releaseQueue: ((v: CodexQueueView) => void) | null = null;
+/** T05：interruptHang 挂起请求的放行器 */
+let _releaseInterrupt: ((r: Response) => void) | null = null;
+
+/** C04（队列展示收纳）：默认折叠成一行摘要——行级/操作断言先等面板挂载再点
+ *  「查看」展开。空面板（自隐）用例不适用本辅助（findBy 会超时），自行处理。 */
+async function renderAndExpand(jsx: React.ReactElement) {
+  const result = render(jsx);
+  await screen.findByTestId("codex-queue-toggle");
+  fireEvent.click(screen.getByTestId("codex-queue-toggle"));
+  return result;
+}
 
 beforeEach(() => {
   routes = {};
   releaseQueue = null;
+  _releaseInterrupt = null;
 });
 afterEach(() => {
   cleanup();
@@ -93,6 +116,11 @@ function installFetch() {
       );
     }
     if (url.includes("/codex/turn/interrupt")) {
+      if (routes.interruptHang) {
+        return new Promise<Response>((resolve) => {
+          _releaseInterrupt = resolve;
+        });
+      }
       if (routes.interruptStatus) {
         return new Response(
           JSON.stringify(routes.interruptErrorBody ?? { error: "capability_unavailable" }),
@@ -127,6 +155,31 @@ function installFetch() {
         { status: 200 }
       );
     }
+    if (url.includes("/codex/queue/prioritize")) {
+      if (routes.prioritizeStatus) {
+        return new Response(JSON.stringify({ error: "internal" }), {
+          status: routes.prioritizeStatus,
+        });
+      }
+      const body = JSON.parse(String(init?.body)) as { actionId: string };
+      return new Response(
+        JSON.stringify(
+          routes.prioritizeBody ?? {
+            result: "prioritized",
+            actionId: body.actionId,
+            receipt: {
+              actionId: body.actionId,
+              delivery: "accepted",
+              route: "desktop_ipc",
+              turnId: "turn-x",
+              envelopeId: null,
+              reasonCode: null,
+            },
+          }
+        ),
+        { status: 200 }
+      );
+    }
     if (url.includes("/codex/queue")) {
       if (routes.queueHang) {
         // 只挂起**第一发**（会话切换后新会话的拉取照常返回——迟到的只有旧会话那份）
@@ -149,8 +202,16 @@ function queueGetCalls(): number {
     ([u]) =>
       String(u).includes("/codex/queue") &&
       !String(u).includes("/retract") &&
-      !String(u).includes("/force-continue")
+      !String(u).includes("/force-continue") &&
+      !String(u).includes("/prioritize")
   ).length;
+}
+
+/** T06：优先处理请求体列表（载荷断言用） */
+function prioritizeBodies(): string[] {
+  return fetchMock.mock.calls
+    .filter(([u]) => String(u).includes("/codex/queue/prioritize"))
+    .map(([, init]) => String((init as RequestInit)?.body));
 }
 
 function forceContinueBodies(): string[] {
@@ -171,7 +232,7 @@ describe("CodexQueuePanel（Task 9）", () => {
     routes.queue = [
       queueView([action({ actionId: "a1", position: 1 }), action({ actionId: "a2", position: 2 })]),
     ];
-    render(<CodexQueuePanel sessionId="s1" />);
+    await renderAndExpand(<CodexQueuePanel sessionId="s1" />);
     const row1 = await screen.findByTestId("codex-queue-row-a1");
     expect(row1.textContent).toContain("第1位");
     expect(screen.getByTestId("codex-queue-row-a2").textContent).toContain("第2位");
@@ -180,7 +241,7 @@ describe("CodexQueuePanel（Task 9）", () => {
     expect(screen.getByTestId("codex-queue-retract-a2")).toBeTruthy();
     // **不提供插队**：立即发送/插队语义的按钮一律不存在
     expect(screen.queryByText("立即发送")).toBeNull();
-    expect(screen.queryByText("插队")).toBeNull();
+    expect(screen.getAllByText("插队")).toHaveLength(2);
     expect(screen.queryByTestId("codex-queue-jump")).toBeNull();
   });
 
@@ -190,7 +251,7 @@ describe("CodexQueuePanel（Task 9）", () => {
       queueView([action({ actionId: "a1", position: 1 })]),
       queueView([]), // 操作后重拉：已撤条目不在队
     ];
-    render(<CodexQueuePanel sessionId="s1" />);
+    await renderAndExpand(<CodexQueuePanel sessionId="s1" />);
     await screen.findByTestId("codex-queue-row-a1");
     fireEvent.click(screen.getByTestId("codex-queue-retract-a1"));
     await waitFor(() => expect(screen.queryByTestId("codex-queue-row-a1")).toBeNull());
@@ -210,7 +271,7 @@ describe("CodexQueuePanel（Task 9）", () => {
       queueView([action({ actionId: "a1", state: "reserved", position: null })]), // 重拉：已派发
     ];
     routes.retractStatus = 409;
-    render(<CodexQueuePanel sessionId="s1" />);
+    await renderAndExpand(<CodexQueuePanel sessionId="s1" />);
     await screen.findByTestId("codex-queue-row-a1");
     fireEvent.click(screen.getByTestId("codex-queue-retract-a1"));
     // 409 → 说明出现（不谎报撤回成功）
@@ -241,7 +302,7 @@ describe("CodexQueuePanel（Task 9）", () => {
         }),
       ]),
     ];
-    render(<CodexQueuePanel sessionId="s1" />);
+    await renderAndExpand(<CodexQueuePanel sessionId="s1" />);
     await screen.findByTestId("codex-queue-row-a3");
     expect(screen.getByTestId("codex-queue-row-a3").textContent).toContain("已取消");
     expect(screen.queryByTestId("codex-queue-retract-a3")).toBeNull();
@@ -251,7 +312,7 @@ describe("CodexQueuePanel（Task 9）", () => {
   it("compat_outstanding_banner：blockedReasonCode 非空 → 暂停派发说明条（compat_outstanding）", async () => {
     installFetch();
     routes.queue = [queueView([action({ actionId: "a1" })], "compat_outstanding")];
-    render(<CodexQueuePanel sessionId="s1" />);
+    await renderAndExpand(<CodexQueuePanel sessionId="s1" />);
     const banner = await screen.findByTestId("codex-queue-blocked");
     expect(banner.textContent).toContain("兼容");
     expect(banner.textContent).toContain("暂停");
@@ -260,7 +321,7 @@ describe("CodexQueuePanel（Task 9）", () => {
   it("native_delivery_unknown_banner：原生 Unknown 屏障 → 如实说无自动恢复（不得承诺自动继续）", async () => {
     installFetch();
     routes.queue = [queueView([action({ actionId: "a3" })], "native_delivery_unknown")];
-    render(<CodexQueuePanel sessionId="s1" />);
+    await renderAndExpand(<CodexQueuePanel sessionId="s1" />);
     const banner = await screen.findByTestId("codex-queue-blocked");
     expect(banner.getAttribute("data-reason")).toBe("native_delivery_unknown");
     expect(banner.textContent).toContain("未知");
@@ -271,12 +332,9 @@ describe("CodexQueuePanel（Task 9）", () => {
   it("native_turn_pending_banner：原生 Turn 屏障 → 分文案（不得说成兼容模式/回 Desktop 手工解除）", async () => {
     installFetch();
     routes.queue = [queueView([action({ actionId: "a2" })], "native_turn_pending")];
-    render(<CodexQueuePanel sessionId="s1" />);
-    const banner = await screen.findByTestId("codex-queue-blocked");
-    expect(banner.getAttribute("data-reason")).toBe("native_turn_pending");
-    expect(banner.textContent).toContain("原生回合");
-    expect(banner.textContent).toContain("自动继续");
-    expect(banner.textContent).not.toContain("兼容");
+    await renderAndExpand(<CodexQueuePanel sessionId="s1" />);
+    expect(screen.queryByTestId("codex-queue-blocked")).toBeNull();
+    expect(screen.queryByTestId("codex-queue-interrupt")).toBeNull();
   });
 
   it("empty_hidden：无条目且无 blocked → 面板不渲染（自隐惯例）", async () => {
@@ -291,12 +349,14 @@ describe("CodexQueuePanel（Task 9）", () => {
   it("external_refresh_signal_refetches：外部触发（投影跃迁/发送回执）→ 去抖重拉，新入队条目不离页可见", async () => {
     installFetch();
     routes.queue = [queueView([])];
+    // C04：空队列面板自隐（折叠摘要也不出）；条目到达后以折叠摘要出现，展开可见行
     const { rerender } = render(<CodexQueuePanel sessionId="s1" />);
     await act(async () => {});
     expect(screen.queryByTestId("codex-queue-panel")).toBeNull();
     // 发送入队回执/投影跃迁 → 父级 bump refreshSignal → 面板重拉到新条目
     routes.queue = [queueView([action({ actionId: "a9", position: 1 })])];
     rerender(<CodexQueuePanel sessionId="s1" refreshSignal={1} />);
+    fireEvent.click(await screen.findByTestId("codex-queue-toggle"));
     const row = await screen.findByTestId("codex-queue-row-a9", undefined, { timeout: 3000 });
     expect(row.textContent).toContain("第1位");
   });
@@ -304,6 +364,7 @@ describe("CodexQueuePanel（Task 9）", () => {
   it("stale_session_response_not_applied：旧会话在途响应迟到 → 不回灌新会话", async () => {
     installFetch();
     routes.queueHang = true; // s1 的拉取挂起（响应迟到）
+    // C04：挂起/空视图面板自隐——无 toggle 可点，普通渲染即可（断言本就是"不回灌"）。
     const { rerender } = render(<CodexQueuePanel sessionId="s1" />);
     await act(async () => {});
     expect(releaseQueue).toBeTruthy();
@@ -322,6 +383,7 @@ describe("CodexQueuePanel（Task 9）", () => {
   it("rapid_refresh_signals_coalesce：同会话密集触发去抖合并为一次重拉", async () => {
     installFetch();
     routes.queue = [queueView([]), queueView([action({ actionId: "a1", position: 1 })])];
+    // C04：首个视图为空 → 面板自隐；合并重拉到条目后以折叠摘要出现，展开可见行
     const { rerender } = render(<CodexQueuePanel sessionId="s1" />);
     await act(async () => {});
     expect(queueGetCalls()).toBe(1); // 挂载拉取
@@ -333,6 +395,7 @@ describe("CodexQueuePanel（Task 9）", () => {
     // 去抖窗口内不发请求：两次触发尚未合并落地
     expect(queueGetCalls()).toBe(1);
     // 窗口过后恰好一次合并重拉（去抖尾部定时器）
+    fireEvent.click(await screen.findByTestId("codex-queue-toggle"));
     const row = await screen.findByTestId("codex-queue-row-a1", undefined, { timeout: 3000 });
     expect(row.textContent).toContain("第1位");
     expect(queueGetCalls()).toBe(2);
@@ -342,6 +405,7 @@ describe("CodexQueuePanel（Task 9）", () => {
     vi.useFakeTimers();
     installFetch();
     routes.queue = [queueView([])];
+    // C04：空起步 → 面板自隐；条目落地后展开断言行可见
     const { rerender } = render(<CodexQueuePanel sessionId="s1" />);
     const advance = async (ms: number) => {
       await act(async () => {
@@ -359,6 +423,7 @@ describe("CodexQueuePanel（Task 9）", () => {
     }
     // 2.5s > maxWait(2s)：刷新必然已落地（条目可见可撤），不是等流式停歇
     expect(queueGetCalls()).toBeGreaterThanOrEqual(2);
+    fireEvent.click(screen.getByTestId("codex-queue-toggle"));
     expect(screen.getByTestId("codex-queue-row-a1")).toBeTruthy();
     vi.useRealTimers();
   });
@@ -369,23 +434,23 @@ describe("CodexQueuePanel（Task 9）", () => {
     installFetch();
     // native_delivery_unknown：按钮可见
     routes.queue = [queueView([action({ actionId: "a1" })], "native_delivery_unknown", ["u-1"])];
-    const { unmount } = render(<CodexQueuePanel sessionId="s1" />);
+    const { unmount } = await renderAndExpand(<CodexQueuePanel sessionId="s1" />);
     expect(await screen.findByTestId("codex-queue-force-continue")).toBeTruthy();
     unmount();
     // compat_outstanding：按钮同样可见
     routes.queue = [queueView([action({ actionId: "a2" })], "compat_outstanding", ["c-1"])];
-    const r2 = render(<CodexQueuePanel sessionId="s1" />);
+    const r2 = await renderAndExpand(<CodexQueuePanel sessionId="s1" />);
     expect(await screen.findByTestId("codex-queue-force-continue")).toBeTruthy();
     r2.unmount();
     // native_turn_pending（等待 Turn 完成**自动**继续）：不提供人工解除
     routes.queue = [queueView([action({ actionId: "a3" })], "native_turn_pending", ["t-1"])];
-    const r3 = render(<CodexQueuePanel sessionId="s1" />);
-    await screen.findByTestId("codex-queue-blocked");
+    const r3 = await renderAndExpand(<CodexQueuePanel sessionId="s1" />);
+    expect(screen.queryByTestId("codex-queue-blocked")).toBeNull();
     expect(screen.queryByTestId("codex-queue-force-continue")).toBeNull();
     r3.unmount();
     // 无靶向清单（旧后端/无在册屏障）：不显示
     routes.queue = [queueView([action({ actionId: "a4" })], "native_delivery_unknown")];
-    const r4 = render(<CodexQueuePanel sessionId="s1" />);
+    const r4 = await renderAndExpand(<CodexQueuePanel sessionId="s1" />);
     await screen.findByTestId("codex-queue-blocked");
     expect(screen.queryByTestId("codex-queue-force-continue")).toBeNull();
     r4.unmount();
@@ -394,7 +459,7 @@ describe("CodexQueuePanel（Task 9）", () => {
   it("force_continue_requires_confirmation：点击按钮先出确认条（含风险文案），确认前不发任何请求；取消不打请求", async () => {
     installFetch();
     routes.queue = [queueView([action({ actionId: "a1" })], "native_delivery_unknown", ["u-1"])];
-    render(<CodexQueuePanel sessionId="s1" />);
+    await renderAndExpand(<CodexQueuePanel sessionId="s1" />);
     fireEvent.click(await screen.findByTestId("codex-queue-force-continue"));
     // 确认条出现，风险文案如实（重复内容风险）
     const strip = screen.getByTestId("codex-queue-force-confirm");
@@ -414,7 +479,7 @@ describe("CodexQueuePanel（Task 9）", () => {
       queueView([action({ actionId: "a1" })], "native_delivery_unknown", ["u-1"]),
       queueView([]), // 解除后重拉：阻塞清空
     ];
-    render(<CodexQueuePanel sessionId="s1" />);
+    await renderAndExpand(<CodexQueuePanel sessionId="s1" />);
     fireEvent.click(await screen.findByTestId("codex-queue-force-continue"));
     fireEvent.click(screen.getByTestId("codex-queue-force-yes"));
     // 请求体只带 actionId
@@ -432,7 +497,7 @@ describe("CodexQueuePanel（Task 9）", () => {
       queueView([action({ actionId: "a1" })], "native_delivery_unknown", ["u-1"]),
       queueView([action({ actionId: "a1" })], "native_delivery_unknown", ["u-1"]),
     ];
-    render(<CodexQueuePanel sessionId="s1" />);
+    await renderAndExpand(<CodexQueuePanel sessionId="s1" />);
     fireEvent.click(await screen.findByTestId("codex-queue-force-continue"));
     fireEvent.click(screen.getByTestId("codex-queue-force-yes"));
     // 失败 → note 出现（不静默）
@@ -451,7 +516,7 @@ describe("CodexQueuePanel（Task 9）", () => {
       queueView([action({ actionId: "a1" })], "native_delivery_unknown", ["u-1", "u-2"]),
       queueView([action({ actionId: "a1" })], "native_delivery_unknown", ["u-1", "u-2"]),
     ];
-    render(<CodexQueuePanel sessionId="s1" />);
+    await renderAndExpand(<CodexQueuePanel sessionId="s1" />);
     fireEvent.click(await screen.findByTestId("codex-queue-force-continue"));
     fireEvent.click(screen.getByTestId("codex-queue-force-yes"));
     // 一败（no_barrier）不停：两个 id 都被逐个请求（面板保持可见，note 断言才有效）
@@ -479,7 +544,7 @@ describe("CodexQueuePanel（Task 9）", () => {
       queueView([action({ actionId: "a1" })], "native_delivery_unknown", ["u-1", "u-2"]),
       queueView([action({ actionId: "a1" })], "native_delivery_unknown", ["u-1", "u-2"]),
     ];
-    render(<CodexQueuePanel sessionId="s1" />);
+    await renderAndExpand(<CodexQueuePanel sessionId="s1" />);
     fireEvent.click(await screen.findByTestId("codex-queue-force-continue"));
     fireEvent.click(screen.getByTestId("codex-queue-force-yes"));
     // 一败（barrier_in_flight）不停：两个 id 都被逐个请求
@@ -501,7 +566,7 @@ describe("CodexQueuePanel（Task 9）", () => {
       queueView([action({ actionId: "a1" })], "native_delivery_unknown", ["u-1", "u-2", "u-3"]),
       queueView([action({ actionId: "a1" })], "native_delivery_unknown", ["u-1", "u-2", "u-3"]),
     ];
-    render(<CodexQueuePanel sessionId="s1" />);
+    await renderAndExpand(<CodexQueuePanel sessionId="s1" />);
     fireEvent.click(await screen.findByTestId("codex-queue-force-continue"));
     fireEvent.click(screen.getByTestId("codex-queue-force-yes"));
     await waitFor(() => expect(screen.getByTestId("codex-queue-note")).toBeTruthy());
@@ -529,7 +594,7 @@ describe("CodexQueuePanel（Task 9）", () => {
       queueView([action({ actionId: "a1" })], "compat_outstanding", ["u-1"]),
       queueView([action({ actionId: "a1" })], "compat_outstanding", ["u-1"]),
     ];
-    render(<CodexQueuePanel sessionId="s1" />);
+    await renderAndExpand(<CodexQueuePanel sessionId="s1" />);
     fireEvent.click(await screen.findByTestId("codex-queue-force-continue"));
     fireEvent.click(screen.getByTestId("codex-queue-force-yes"));
     await waitFor(() => expect(screen.getByTestId("codex-queue-note")).toBeTruthy());
@@ -548,7 +613,7 @@ describe("CodexQueuePanel（Task 9）", () => {
     routes.queue = [
       queueView([action({ actionId: "a1" })], "native_delivery_unknown", ["u-1", "t-1"]),
     ];
-    render(<CodexQueuePanel sessionId="s1" />);
+    await renderAndExpand(<CodexQueuePanel sessionId="s1" />);
     fireEvent.click(await screen.findByTestId("codex-queue-force-continue"));
     const strip = screen.getByTestId("codex-queue-force-confirm");
     expect(strip.textContent).toContain("Turn");
@@ -573,210 +638,527 @@ describe("CodexQueuePanel（Task 9）", () => {
 
   // ==== 打断桌面回合（2026-10-21 新增）====
 
-  it("interrupt_button_only_for_native_turn_pending：打断出口仅 native_turn_pending 可见（其余阻塞态走人工解除/无出口）", async () => {
+  it("c05_summary_waits_not_manual_verify_for_running_turn：已受理并绑定回合的正常屏障 → 摘要说「等待自动完成」而非「待人工核对」（复审 Q02）", async () => {
     installFetch();
-    routes.queue = [queueView([action({ actionId: "a1" })], "native_turn_pending", ["t-1"])];
-    const { unmount } = render(<CodexQueuePanel sessionId="s1" />);
-    expect(await screen.findByTestId("codex-queue-interrupt")).toBeTruthy();
-    unmount();
-    // native_delivery_unknown / compat_outstanding：不提供打断（那是人工解除的活）
-    routes.queue = [queueView([action({ actionId: "a2" })], "native_delivery_unknown", ["u-1"])];
-    const r2 = render(<CodexQueuePanel sessionId="s1" />);
-    await screen.findByTestId("codex-queue-blocked");
-    expect(screen.queryByTestId("codex-queue-interrupt")).toBeNull();
-    r2.unmount();
-    routes.queue = [queueView([action({ actionId: "a3" })], "compat_outstanding", ["c-1"])];
-    const r3 = render(<CodexQueuePanel sessionId="s1" />);
-    await screen.findByTestId("codex-queue-blocked");
-    expect(screen.queryByTestId("codex-queue-interrupt")).toBeNull();
-    r3.unmount();
-  });
-
-  it("native_turn_active_interrupt：桌面手打的原生回合（无屏障）→ 横幅分文案 + 打断按钮可见（2026-10-22 原生回合扩展）；空队列也出按钮；无能力 build 照旧隐藏", async () => {
-    installFetch();
-    // 空队列 + native_turn_active：面板不自隐（阻塞码在场），按钮出——
-    // 原生回合打断不要求有排队消息（用户诉求：桌面在跑就能停）
-    routes.queue = [queueView([], "native_turn_active")];
-    const { unmount } = render(<CodexQueuePanel sessionId="s1" />);
-    const banner = await screen.findByTestId("codex-queue-blocked");
-    expect(banner.getAttribute("data-reason")).toBe("native_turn_active");
-    expect(banner.textContent).toContain("正在运行");
-    expect(banner.textContent).toContain("未完成的工作会丢失");
-    expect(screen.getByTestId("codex-queue-interrupt")).toBeTruthy();
-    unmount();
-    // 无能力 build（canInterrupt=false）：按钮照旧源头隐藏（P2-2 纪律跨阻塞态一致）
-    routes.queue = [queueView([], "native_turn_active", [], false)];
-    const r2 = render(<CodexQueuePanel sessionId="s1" />);
-    await screen.findByTestId("codex-queue-blocked");
-    expect(screen.queryByTestId("codex-queue-interrupt")).toBeNull();
-    r2.unmount();
-  });
-
-  it("interrupt_button_hidden_when_capability_false：canInterrupt=false（或缺省的旧载荷）→ native_turn_pending 阻塞态也不渲染打断按钮，零请求（复审 P2-2：无能力 build 不给假出口）", async () => {
-    installFetch();
-    // canInterrupt=false：本 Desktop build 未活体验证打断能力
-    routes.queue = [queueView([action({ actionId: "a1" })], "native_turn_pending", ["t-1"], false)];
-    const { unmount } = render(<CodexQueuePanel sessionId="s1" />);
-    // 面板与阻塞说明条在（不是面板没渲染导致的假绿）
-    await screen.findByTestId("codex-queue-blocked");
-    expect(screen.queryByTestId("codex-queue-interrupt")).toBeNull();
-    // 确认条也不出现（按钮都无，确认臂无从进入）
-    expect(screen.queryByTestId("codex-queue-interrupt-confirm")).toBeNull();
-    // 零打断请求（无假出口 = 不会发出注定 503 的调用）
-    expect(interruptBodies()).toEqual([]);
-    unmount();
-    // 旧后端载荷缺省 canInterrupt 字段 → 同样视为无能力（保守方向）
+    // 普通发送被受理后的真实形状：accepted + turnId → native_turn_pending，
+    // blockedActionIds 非空（在册屏障清单包含它）——但它有自动恢复路径
     routes.queue = [
-      {
-        actions: [action({ actionId: "a2" })],
-        blockedReasonCode: "native_turn_pending",
-        blockedActionIds: ["t-1"],
-      },
-    ];
-    const r2 = render(<CodexQueuePanel sessionId="s1" />);
-    await screen.findByTestId("codex-queue-blocked");
-    expect(screen.queryByTestId("codex-queue-interrupt")).toBeNull();
-    expect(interruptBodies()).toEqual([]);
-    r2.unmount();
-  });
-
-  it("interrupt_requires_confirmation：点击先出确认条（含工作丢失风险披露），确认前零请求；取消零请求", async () => {
-    installFetch();
-    routes.queue = [queueView([action({ actionId: "a1" })], "native_turn_pending", ["t-1"])];
-    render(<CodexQueuePanel sessionId="s1" />);
-    fireEvent.click(await screen.findByTestId("codex-queue-interrupt"));
-    const strip = screen.getByTestId("codex-queue-interrupt-confirm");
-    // 破坏性动作的风险必须如实披露：回合未完成的工作会丢失
-    expect(strip.textContent).toContain("未完成的工作会丢失");
-    // 确认前零请求（两步确认纪律）
-    expect(interruptBodies()).toEqual([]);
-    // 取消：收起确认条，仍零请求
-    fireEvent.click(screen.getByTestId("codex-queue-interrupt-no"));
-    expect(screen.queryByTestId("codex-queue-interrupt-confirm")).toBeNull();
-    expect(interruptBodies()).toEqual([]);
-  });
-
-  it("interrupt_success_reports_and_refreshes：确认后调用打断端点（带 sessionId）→ 如实回报并重拉队列", async () => {
-    installFetch();
-    routes.queue = [
-      queueView([action({ actionId: "a1" })], "native_turn_pending", ["t-1"]),
-      queueView([action({ actionId: "a1" })], "native_turn_pending", ["t-1"]), // 操作后重拉
+      queueView([action({ actionId: "a1" })], "native_turn_pending", ["act-accepted"], true, false),
     ];
     render(<CodexQueuePanel sessionId="s1" />);
-    fireEvent.click(await screen.findByTestId("codex-queue-interrupt"));
-    fireEvent.click(screen.getByTestId("codex-queue-interrupt-yes"));
-    await waitFor(() => expect(interruptBodies()).toEqual(['{"sessionId":"s1"}']));
-    await waitFor(() => expect(screen.getByTestId("codex-queue-note")).toBeTruthy());
-    expect(screen.getByTestId("codex-queue-note").textContent).toContain("已发出停止指令");
-    expect(queueGetCalls()).toBe(2);
+    const summary = await screen.findByTestId("codex-queue-summary");
+    // 折叠行如实说「等待回合完成」——不能让用户以为有需要人工解除的东西
+    expect(summary.getAttribute("data-verify-pending")).toBeNull();
+    expect(summary.getAttribute("data-awaiting-turn")).toBe("true");
+    expect(summary.textContent).toContain("等待");
+    expect(summary.textContent).not.toContain("人工核对");
+    // 展开后同样不存在「人工核对/继续队列」出口（本来就无自动恢复路径之外的活）
+    fireEvent.click(screen.getByTestId("codex-queue-toggle"));
+    expect(screen.queryByTestId("codex-queue-force-continue")).toBeNull();
   });
 
-  it("interrupt_no_active_turn_is_not_faked_as_success：桌面无可打断回合 → 如实提示，不谎报成功", async () => {
+  it("c05_summary_manual_verify_for_true_unknown：真实 Unknown / 兼容屏障 → 摘要明示待人工核对（折叠可见可进入）", async () => {
     installFetch();
-    routes.interruptBody = { ok: true, interruptedTurnId: null, expectedTurnId: null };
-    routes.queue = [
-      queueView([action({ actionId: "a1" })], "native_turn_pending", ["t-1"]),
-      queueView([action({ actionId: "a1" })], "native_turn_pending", ["t-1"]),
-    ];
-    render(<CodexQueuePanel sessionId="s1" />);
-    fireEvent.click(await screen.findByTestId("codex-queue-interrupt"));
-    fireEvent.click(screen.getByTestId("codex-queue-interrupt-yes"));
-    await waitFor(() => expect(screen.getByTestId("codex-queue-note")).toBeTruthy());
-    expect(screen.getByTestId("codex-queue-note").textContent).toContain("没有可停止的回合");
-  });
-
-  it("interrupt_uncertain_reported_honestly：uncertain=true（指令已发出但结果未知）→ 如实说「不确定」并劝阻连续重按，不报失败也不谎报确定成功（复审 P2-3）", async () => {
-    installFetch();
-    // RPC 超时形态：200 但 uncertain=true、interruptedTurnId=null、reasonCode=timeout
-    routes.interruptBody = {
-      ok: true,
-      uncertain: true,
-      interruptedTurnId: null,
-      expectedTurnId: "t-1",
-      reasonCode: "timeout",
-    };
-    routes.queue = [
-      queueView([action({ actionId: "a1" })], "native_turn_pending", ["t-1"]),
-      queueView([action({ actionId: "a1" })], "native_turn_pending", ["t-1"]), // 操作后重拉
-    ];
-    render(<CodexQueuePanel sessionId="s1" />);
-    fireEvent.click(await screen.findByTestId("codex-queue-interrupt"));
-    fireEvent.click(screen.getByTestId("codex-queue-interrupt-yes"));
-    await waitFor(() => expect(interruptBodies()).toEqual(['{"sessionId":"s1"}']));
-    await waitFor(() => expect(screen.getByTestId("codex-queue-note")).toBeTruthy());
-    // 如实呈现「不确定」+ 明确劝阻连续重按（重按 = 双发破坏性指令）
-    expect(screen.getByTestId("codex-queue-note").textContent).toContain("不确定");
-    expect(screen.getByTestId("codex-queue-note").textContent).toContain("不要连续重按");
-    // 不是失败（不得诱导立刻重按），也不是「没有可停止的回合」
-    expect(screen.getByTestId("codex-queue-note").textContent).not.toContain("停止失败");
-    expect(screen.getByTestId("codex-queue-note").textContent).not.toContain("没有可停止的回合");
-    // 仍重拉权威列表（回合真实终态以服务端账本为准）
-    expect(queueGetCalls()).toBe(2);
-  });
-
-  it("interrupt_failure_shows_error：503 能力不可用（body 带打码中文 reason）→ note 显示按码映射的文案，不裸示机器码（仍重拉权威列表）", async () => {
-    installFetch();
-    routes.interruptStatus = 503;
-    routes.interruptErrorBody = {
-      error: "capability_unavailable",
-      reason:
-        "CODEX_INTERRUPT_CAPABILITY_UNVERIFIED: 当前桌面 Codex 版本未启用远程停止能力（未完成活体验证），无法远程打断回合",
-    };
-    routes.queue = [
-      queueView([action({ actionId: "a1" })], "native_turn_pending", ["t-1"]),
-      queueView([action({ actionId: "a1" })], "native_turn_pending", ["t-1"]),
-    ];
-    render(<CodexQueuePanel sessionId="s1" />);
-    fireEvent.click(await screen.findByTestId("codex-queue-interrupt"));
-    fireEvent.click(screen.getByTestId("codex-queue-interrupt-yes"));
-    await waitFor(() => expect(screen.getByTestId("codex-queue-note")).toBeTruthy());
-    expect(screen.getByTestId("codex-queue-note").textContent).toContain("停止失败");
-    // 带码 reason 过 formatInvokeError：按码映射 errors.* 文案，码前缀不裸示
-    const note = screen.getByTestId("codex-queue-note").textContent ?? "";
-    expect(note).toContain("当前桌面 Codex 版本未启用远程停止能力");
-    expect(note).not.toContain("CODEX_INTERRUPT_");
-    expect(screen.getByTestId("codex-queue-note").textContent).not.toContain(
-      "capability_unavailable"
-    );
-    expect(queueGetCalls()).toBe(2);
-  });
-
-  it("interrupt_failure_shows_backend_reason_desktop_rejected：409 desktop_rejected（桌面明确拒绝，打码 reason）→ note 显示映射文案，不裸示机器码", async () => {
-    installFetch();
-    routes.interruptStatus = 409;
-    routes.interruptErrorBody = {
-      error: "desktop_rejected",
-      reason: "CODEX_INTERRUPT_DESKTOP_REJECTED: 桌面 Codex 明确拒绝了本次打断指令，回合未被停止",
-    };
-    routes.queue = [
-      queueView([action({ actionId: "a1" })], "native_turn_pending", ["t-1"]),
-      queueView([action({ actionId: "a1" })], "native_turn_pending", ["t-1"]),
-    ];
-    render(<CodexQueuePanel sessionId="s1" />);
-    fireEvent.click(await screen.findByTestId("codex-queue-interrupt"));
-    fireEvent.click(screen.getByTestId("codex-queue-interrupt-yes"));
-    await waitFor(() => expect(screen.getByTestId("codex-queue-note")).toBeTruthy());
-    expect(screen.getByTestId("codex-queue-note").textContent).toContain("停止失败");
-    const note = screen.getByTestId("codex-queue-note").textContent ?? "";
-    expect(note).toContain("桌面 Codex 明确拒绝了本次打断指令");
-    expect(note).not.toContain("CODEX_INTERRUPT_");
-    expect(screen.getByTestId("codex-queue-note").textContent).not.toContain("desktop_rejected");
-  });
-
-  it("interrupt_i18n_keys_exist：新键两侧必须存在（键集对齐由 check:i18n 保证）", async () => {
-    for (const key of [
-      "interrupt",
-      "interruptRisk",
-      "interruptYes",
-      "interruptCancel",
-      "interruptDone",
-      "interruptUncertain",
-      "interruptNoTurn",
-      "interruptFailed",
-    ]) {
-      const v = i18n.t(`mobile.codex.queue.${key}`);
-      expect(v, `键 mobile.codex.queue.${key} 必须存在`).not.toBe(`mobile.codex.queue.${key}`);
-      expect(v.length).toBeGreaterThan(0);
+    for (const reason of ["native_delivery_unknown", "compat_outstanding"]) {
+      routes.queue = [queueView([action({ actionId: "a1" })], reason, ["u-1"], true, false)];
+      const { unmount } = render(<CodexQueuePanel sessionId="s1" />);
+      const summary = await screen.findByTestId("codex-queue-summary");
+      expect(summary.getAttribute("data-verify-pending"), reason).toBe("true");
+      expect(summary.getAttribute("data-awaiting-turn"), reason).toBeNull();
+      expect(summary.textContent, reason).toContain("人工核对");
+      // 折叠即可见状态 → 展开必有处理入口（不是只提示不给出口）
+      fireEvent.click(screen.getByTestId("codex-queue-toggle"));
+      expect(await screen.findByTestId("codex-queue-force-continue"), reason).toBeTruthy();
+      unmount();
     }
+  });
+
+  it("c05_summary_unknown_beats_plain_pause：Unknown 与普通暂停并存 → 摘要优先核对原因（同一暂停只解释一次）", async () => {
+    installFetch();
+    routes.queue = [
+      queueView([action({ actionId: "a1" })], "native_delivery_unknown", ["u-1"], true, true),
+    ];
+    render(<CodexQueuePanel sessionId="s1" />);
+    const summary = await screen.findByTestId("codex-queue-summary");
+    expect(summary.getAttribute("data-paused")).toBe("true");
+    expect(summary.getAttribute("data-verify-pending")).toBe("true");
+    expect(summary.textContent).toContain("人工核对");
+    expect(summary.textContent).not.toContain("已暂停");
+  });
+
+  it("c05_summary_blocked_list_read_failure_not_claimed_normal：阻塞码声称 Unknown 但清单读取降级为空 → 仍如实提示人工核对（不假称正常）", async () => {
+    installFetch();
+    // 后端 barrier_action_ids 读取失败时如实降级为空清单，而 blockedReasonCode
+    // 由另一路读取独立派生——此时清单为空不能反证「无需核对」
+    routes.queue = [queueView([action({ actionId: "a1" })], "native_delivery_unknown", [])];
+    render(<CodexQueuePanel sessionId="s1" />);
+    const summary = await screen.findByTestId("codex-queue-summary");
+    expect(summary.getAttribute("data-verify-pending")).toBe("true");
+    expect(summary.textContent).toContain("人工核对");
+  });
+
+  it("running_queue_has_no_duplicate_stop_or_long_banner", async () => {
+    installFetch();
+    routes.queue = [queueView([action()], "native_turn_pending", ["t-1"])];
+    await renderAndExpand(<CodexQueuePanel sessionId="s1" />);
+    expect(screen.queryByTestId("codex-queue-title")).toBeNull();
+    expect(screen.queryByTestId("codex-queue-blocked")).toBeNull();
+    expect(screen.queryByTestId("codex-queue-interrupt")).toBeNull();
+  });
+  it("empty_unknown_keeps_check_entry", async () => {
+    installFetch();
+    routes.queue = [queueView([], "native_delivery_unknown", ["u1"])];
+    await renderAndExpand(<CodexQueuePanel sessionId="s1" />);
+    expect(screen.getByTestId("codex-queue-force-continue")).toBeTruthy();
+  });
+});
+
+// ============================================================
+// T05：页面共享停止控制器（SessionDetail 单例）——队列面板打断确认经它发起：
+// 与 composer 停止入口共用 stopping 互斥闸；目标在点击时刻冻结；分诊/文案同源。
+// ============================================================
+
+/** 运行中投影夹具（与 MessageComposer.test 同款三元组） */
+function stopProjection(over: Record<string, unknown> = {}): ThreadProjection {
+  return {
+    threadId: "th-q",
+    revision: 7,
+    stale: false,
+    availability: "controllable",
+    capabilities: {
+      send: true,
+      state: true,
+      command: true,
+      permissions: false,
+      blockingInput: true,
+      interrupt: true,
+    },
+    runtimeStatus: "active",
+    contentState: "ready",
+    messages: [],
+    truncated: false,
+    pending: [],
+    effectiveOperations: {
+      policyRevision: 1,
+      operations: {
+        interrupt: {
+          implemented: true,
+          allowed: true,
+          requiresAutoAdapt: false,
+          evidence: "observed_success",
+          reasonCode: null,
+        },
+      },
+    },
+    activeTurnId: "turn-A",
+    ...over,
+  } as ThreadProjection;
+}
+
+/** 挂真实共享控制器的 Harness（SessionDetail 持有方式的组件级等价）。
+ *  C04：面板默认折叠——harness 用例要打打断/队列按钮，挂载后自动展开一次。 */
+function PanelHarness({
+  sessionId = "s1",
+  projection,
+}: {
+  sessionId?: string;
+  projection: ThreadProjection | null;
+}) {
+  const control = useCodexTurnControl(projection, sessionId);
+  const autoExpandedRef = useRef(false);
+  // 面板的 view 由子组件自己的 fetch 填充（父组件不因此重渲染）——轮询等 toggle
+  // 出现后自动展开一次（测试专用缝；真实页面由用户点「查看」）。
+  useEffect(() => {
+    if (autoExpandedRef.current) return;
+    const timer = window.setInterval(() => {
+      if (autoExpandedRef.current) {
+        window.clearInterval(timer);
+        return;
+      }
+      const toggle = document.querySelector<HTMLButtonElement>(
+        '[data-testid="codex-queue-toggle"]'
+      );
+      if (toggle !== null) {
+        autoExpandedRef.current = true;
+        window.clearInterval(timer);
+        toggle.click();
+      }
+    }, 25);
+    return () => window.clearInterval(timer);
+  }, []);
+  return (
+    <div>
+      <CodexQueuePanel sessionId={sessionId} turnControl={control} />
+      <span data-testid="hook-stopping">{control.stopping ? "1" : "0"}</span>
+      <span data-testid="hook-result">{control.result?.kind ?? ""}</span>
+    </div>
+  );
+}
+
+describe("CodexQueuePanel：T06 先处理这条", () => {
+  it("t06_entry_visibility：入队前不显示；入队后仅 queued 行显示；终态行没有入口", async () => {
+    installFetch();
+    // 入队前：面板自隐（无 queued 无阻塞）→ 入口自然不存在
+    routes.queue = [queueView([])];
+    const { unmount } = render(<CodexQueuePanel sessionId="s1" />);
+    await act(async () => {});
+    expect(screen.queryByTestId("codex-queue-panel")).toBeNull();
+    unmount();
+    // 入队后：queued 行有「先处理这条」；cancelled 终态行没有
+    routes.queue = [
+      queueView([
+        action({ actionId: "a1", position: 1 }),
+        action({ actionId: "a2", state: "cancelled", position: null }),
+      ]),
+    ];
+    await renderAndExpand(<CodexQueuePanel sessionId="s1" />);
+    expect(await screen.findByTestId("codex-queue-prioritize-a1")).toBeTruthy();
+    expect(screen.queryByTestId("codex-queue-prioritize-a2")).toBeNull();
+    // 入口是显式单条触发，不是 FIFO 拖动排序（无任何拖动/排序 UI）
+    expect(screen.queryByTestId("codex-queue-reorder")).toBeNull();
+  });
+
+  it("t06_confirm_before_request：确认前零请求；取消不打请求", async () => {
+    installFetch();
+    routes.queue = [queueView([action({ actionId: "a1", position: 1 })], null, [], true, true)];
+    await renderAndExpand(<CodexQueuePanel sessionId="s1" />);
+    fireEvent.click(await screen.findByTestId("codex-queue-prioritize-a1"));
+    // 确认臂出现；确认前零请求
+    expect(screen.getByTestId("codex-queue-prioritize-confirm-a1").textContent).toContain(
+      "越过暂停的队列"
+    );
+    expect(prioritizeBodies()).toEqual([]);
+    // 取消：收起确认臂，仍零请求
+    fireEvent.click(screen.getByTestId("codex-queue-prioritize-no-a1"));
+    expect(screen.queryByTestId("codex-queue-prioritize-confirm-a1")).toBeNull();
+    expect(prioritizeBodies()).toEqual([]);
+  });
+
+  it("t06_paused_idle_bypass：暂停空闲仅确认本条越队——载荷 confirmInterrupt:false、无 turnId；成功后状态推进且其余行不动", async () => {
+    installFetch();
+    const receipt = {
+      actionId: "a2",
+      delivery: "accepted",
+      route: "desktop_ipc",
+      turnId: "turn-x",
+      envelopeId: null,
+      reasonCode: null,
+    };
+    routes.prioritizeBody = { result: "prioritized", actionId: "a2", receipt };
+    routes.queue = [
+      queueView(
+        [action({ actionId: "a1", position: 1 }), action({ actionId: "a2", position: 2 })],
+        null,
+        [],
+        true,
+        true
+      ),
+      // 操作后重拉：a2 已派发终态；a1 原样 queued（位次不变）
+      queueView(
+        [
+          action({ actionId: "a1", position: 1 }),
+          action({ actionId: "a2", state: "accepted", position: null, receipt }),
+        ],
+        null,
+        [],
+        true,
+        true
+      ),
+    ];
+    await renderAndExpand(<CodexQueuePanel sessionId="s1" />);
+    fireEvent.click(await screen.findByTestId("codex-queue-prioritize-a2"));
+    // 暂停空闲：确认文案不含停止风险（仅越队确认）
+    expect(screen.getByTestId("codex-queue-prioritize-confirm-a2").textContent).toContain(
+      "越过暂停的队列"
+    );
+    expect(screen.getByTestId("codex-queue-prioritize-confirm-a2").textContent).not.toContain(
+      "停止桌面"
+    );
+    fireEvent.click(screen.getByTestId("codex-queue-prioritize-yes-a2"));
+    // 载荷：原 actionId + confirmInterrupt:false；**不接受正文副本**（无 text 字段）
+    await waitFor(() => expect(prioritizeBodies()).toHaveLength(1));
+    expect(JSON.parse(prioritizeBodies()[0])).toEqual({
+      sessionId: "s1",
+      actionId: "a2",
+      confirmInterrupt: false,
+    });
+    // 回执：已优先发送；重拉后 a2 状态推进为已接受，a1 原样在队
+    await waitFor(() =>
+      expect(screen.getByTestId("codex-queue-note").textContent).toContain("已优先发送")
+    );
+    await waitFor(() =>
+      expect(screen.getByTestId("codex-queue-position-a2").textContent).toContain("已接受")
+    );
+    expect(screen.getByTestId("codex-queue-position-a1").textContent).toContain("第1位");
+    // 零独立打断帧（单条编排请求；停止只会在编排内部按需发生）
+    expect(interruptBodies()).toEqual([]);
+  });
+
+  it("t06_active_stop_confirm：运行中先确认停止该回合——文案披露停止风险，载荷带冻结 turnId + confirmInterrupt:true，且零独立打断请求", async () => {
+    installFetch();
+    routes.queue = [
+      queueView([action({ actionId: "a1", position: 1 })]),
+      queueView([action({ actionId: "a1", position: 1 })]),
+    ];
+    render(<PanelHarness projection={stopProjection()} />);
+    fireEvent.click(await screen.findByTestId("codex-queue-prioritize-a1"));
+    // 运行中：确认文案如实披露停止风险
+    const strip = screen.getByTestId("codex-queue-prioritize-confirm-a1");
+    expect(strip.textContent).toContain("停止桌面当前回合");
+    expect(strip.textContent).toContain("会丢失");
+    fireEvent.click(screen.getByTestId("codex-queue-prioritize-yes-a1"));
+    // 载荷：expectedTurnId = 点击确认时刻冻结的活动回合 + confirmInterrupt:true
+    await waitFor(() => expect(prioritizeBodies()).toHaveLength(1));
+    expect(JSON.parse(prioritizeBodies()[0])).toEqual({
+      sessionId: "s1",
+      actionId: "a1",
+      expectedTurnId: "turn-A",
+      confirmInterrupt: true,
+    });
+    // 单条编排：不另发 /codex/turn/interrupt
+    expect(interruptBodies()).toEqual([]);
+    await waitFor(() =>
+      expect(screen.getByTestId("codex-queue-note").textContent).toContain("已优先发送")
+    );
+  });
+
+  it("t06_receipt_not_sent_keeps_entry：明确零投递（queued=true）→ 行保留 + 拒绝原因如实；队列不 cleared", async () => {
+    installFetch();
+    routes.prioritizeBody = {
+      result: "not_sent",
+      actionId: "a1",
+      reasonCode: "native_pending",
+      receipt: null,
+      queued: true,
+    };
+    routes.queue = [
+      queueView([action({ actionId: "a1", position: 1 })], null, [], true, true),
+      queueView([action({ actionId: "a1", position: 1 })], null, [], true, true),
+    ];
+    await renderAndExpand(<CodexQueuePanel sessionId="s1" />);
+    fireEvent.click(await screen.findByTestId("codex-queue-prioritize-a1"));
+    fireEvent.click(screen.getByTestId("codex-queue-prioritize-yes-a1"));
+    await waitFor(() =>
+      expect(screen.getByTestId("codex-queue-note").textContent).toContain("仍在队列")
+    );
+    // 拒绝原因可读化（native_pending → 原生请求文案，不裸示机器码）
+    expect(screen.getByTestId("codex-queue-note").textContent).toContain("原生请求");
+    // 行保留（入口仍在，可重试）；其他消息不受影响
+    expect(screen.getByTestId("codex-queue-prioritize-a1")).toBeTruthy();
+  });
+
+  it("t06_receipt_unknown_honest：unknown → 如实呈现不诱导重按；行与核对入口保留", async () => {
+    installFetch();
+    routes.prioritizeBody = { result: "unknown", actionId: "a1", reasonCode: "stop_timeout" };
+    routes.queue = [
+      queueView([action({ actionId: "a1", position: 1 })], null, [], true, true),
+      queueView([action({ actionId: "a1", position: 1 })], null, [], true, true),
+    ];
+    await renderAndExpand(<CodexQueuePanel sessionId="s1" />);
+    fireEvent.click(await screen.findByTestId("codex-queue-prioritize-a1"));
+    fireEvent.click(screen.getByTestId("codex-queue-prioritize-yes-a1"));
+    await waitFor(() =>
+      expect(screen.getByTestId("codex-queue-note").textContent).toContain("结果未知")
+    );
+    expect(screen.getByTestId("codex-queue-note").textContent).toContain("不会自动重试");
+    // 行保留：用户可稍后核对/重试（入口不清除）
+    expect(screen.getByTestId("codex-queue-row-a1")).toBeTruthy();
+  });
+
+  it("t06_receipt_already_dispatched：已派发 → 回实际状态且明确未重复发送", async () => {
+    installFetch();
+    routes.prioritizeBody = {
+      result: "already_dispatched",
+      actionId: "a1",
+      action: {
+        actionId: "a1",
+        state: "reserved",
+        position: null,
+        receipt: null,
+        stage: "dispatching",
+      },
+    };
+    routes.queue = [
+      queueView([action({ actionId: "a1", position: 1 })], null, [], true, true),
+      queueView(
+        [action({ actionId: "a1", state: "reserved", position: null })],
+        null,
+        [],
+        true,
+        true
+      ),
+    ];
+    await renderAndExpand(<CodexQueuePanel sessionId="s1" />);
+    fireEvent.click(await screen.findByTestId("codex-queue-prioritize-a1"));
+    fireEvent.click(screen.getByTestId("codex-queue-prioritize-yes-a1"));
+    await waitFor(() =>
+      expect(screen.getByTestId("codex-queue-note").textContent).toContain("未重复发送")
+    );
+    expect(screen.getByTestId("codex-queue-note").textContent).toContain("派发中");
+  });
+
+  // ============================================================
+  // P4：队列行正文预览（CodexActionView.textPreview，可选字段；旧后端缺省
+  // undefined → 不渲染预览行，前端必须正常工作）
+  // ============================================================
+
+  it("queue_row_text_preview：queued 行带 textPreview → 剥尾部移动端签名后渲染预览行", async () => {
+    installFetch();
+    routes.queue = [
+      queueView([
+        action({
+          actionId: "a1",
+          position: 1,
+          textPreview: "帮我看看这个报错 [mobile iPhone 15]",
+        }),
+      ]),
+    ];
+    await renderAndExpand(<CodexQueuePanel sessionId="s1" />);
+    const preview = await screen.findByTestId("codex-queue-preview-a1");
+    // 尾部 [mobile …] 签名剥离；预览是普通文本节点（不 aria-hidden，可被读屏读到）
+    expect(preview.textContent).toBe("帮我看看这个报错");
+    expect(preview.textContent).not.toContain("[mobile");
+    expect(preview.getAttribute("aria-hidden")).toBeNull();
+  });
+
+  it("queue_row_text_preview_absent：旧后端无 textPreview 或 accepted/unknown 行（契约不携带）→ 不渲染预览", async () => {
+    installFetch();
+    routes.queue = [
+      queueView([
+        action({ actionId: "a1", position: 1 }), // 旧后端：字段整体缺省
+        // 契约：只有 state=queued 的行携带 textPreview，accepted/unknown 行为 undefined
+        action({ actionId: "a2", state: "accepted", position: null }),
+        action({ actionId: "a3", state: "unknown", position: null }),
+        // 同屏混合：queued 行带预览 → 仅该行渲染（按字段存在性逐行分流）
+        action({
+          actionId: "a4",
+          position: 2,
+          textPreview: "只有 queued 行有预览 [mobile iPad]",
+        }),
+      ]),
+    ];
+    await renderAndExpand(<CodexQueuePanel sessionId="s1" />);
+    await screen.findByTestId("codex-queue-row-a1");
+    expect(screen.queryByTestId("codex-queue-preview-a1")).toBeNull();
+    expect(screen.queryByTestId("codex-queue-preview-a2")).toBeNull();
+    expect(screen.queryByTestId("codex-queue-preview-a3")).toBeNull();
+    expect(screen.getByTestId("codex-queue-preview-a4").textContent).toBe("只有 queued 行有预览");
+  });
+
+  it("queue_row_text_preview_truncate：剥签名后超过 40 字符 → 截前 40 字符 + 省略号（按字符数）", async () => {
+    installFetch();
+    routes.queue = [queueView([action({ actionId: "a1", textPreview: "字".repeat(50) })])];
+    await renderAndExpand(<CodexQueuePanel sessionId="s1" />);
+    const preview = await screen.findByTestId("codex-queue-preview-a1");
+    expect(preview.textContent).toBe("字".repeat(40) + "…");
+  });
+
+  it("queue_row_text_preview_single_line：换行折叠为空格归一单行，附件标记替换为可读占位", async () => {
+    installFetch();
+    routes.queue = [
+      queueView([
+        action({
+          actionId: "a1",
+          textPreview: '第一行\n第二行\n<image path="/tmp/a.png"> 看这张图 [mobile iPad]',
+        }),
+      ]),
+    ];
+    await renderAndExpand(<CodexQueuePanel sessionId="s1" />);
+    const preview = await screen.findByTestId("codex-queue-preview-a1");
+    // 单行归一（无换行）；<image …> → [附件]（mobile.composer.attachMark 同文案）；
+    // 尾部签名剥离
+    expect(preview.textContent).toBe("第一行 第二行 [附件] 看这张图");
+  });
+
+  // ============================================================
+  // P6（2026-10-31 用户要求）：队列行压成一行——位次 / 正文 / 长度 / 三个按钮
+  // 同排并列，不再用「位次独占一行 + 预览独占一行 + 按钮占第三行」的三行排版。
+  // ============================================================
+
+  it("queue_row_single_line_layout：位次、正文预览、长度和三个按钮在同一条 flex 行内（无 w-full 换行块）", async () => {
+    installFetch();
+    routes.queue = [
+      queueView([
+        action({
+          actionId: "a1",
+          position: 1,
+          textPreview: "sleep 300秒 然后计算3*5",
+        }),
+      ]),
+    ];
+    await renderAndExpand(<CodexQueuePanel sessionId="s1" />);
+    const row = await screen.findByTestId("codex-queue-row-a1");
+    // 行容器必须禁换行（nowrap）：单行排版的前提
+    expect(row.className).toContain("flex-nowrap");
+    expect(row.className).not.toContain("flex-wrap");
+    // 预览必须是行内元素（不再独占整行）——出现 w-full 就等于又变回多行
+    const preview = screen.getByTestId("codex-queue-preview-a1");
+    expect(preview.className).not.toContain("w-full");
+    // 预览元素带「剩余空间收缩」语义，避免把按钮挤出屏幕
+    expect(preview.className).toContain("truncate");
+    // 长度标识：同一行内显示该条正文的**真实字符数**（剥签名后、不按预览截断）
+    const length = screen.getByTestId("codex-queue-length-a1");
+    expect(length.textContent).toContain("18");
+    // 位次、预览、长度、按钮同一父节点（同一行），顺序为 位次→预览→长度→按钮
+    const children = Array.from(row.children).map((c) => c.getAttribute("data-testid"));
+    const posIdx = children.indexOf("codex-queue-position-a1");
+    const prevIdx = children.indexOf("codex-queue-preview-a1");
+    const lenIdx = children.indexOf("codex-queue-length-a1");
+    const prioIdx = children.indexOf("codex-queue-prioritize-a1");
+    expect(posIdx).toBeGreaterThanOrEqual(0);
+    expect(prevIdx).toBeGreaterThan(posIdx);
+    expect(lenIdx).toBeGreaterThan(prevIdx);
+    expect(prioIdx).toBeGreaterThan(lenIdx);
+  });
+
+  // ============================================================
+  // P2：插队拒绝文案按屏障分型——「某条消息投递结果未知」与「桌面正忙」语义
+  // 不同，不得共用同一句（后者对前者是误导）
+  // ============================================================
+
+  it("t06_receipt_not_sent_unknown_barrier：unknown_delivery_barrier → 「投递结果未知」文案，不说桌面正忙", async () => {
+    installFetch();
+    routes.prioritizeBody = {
+      result: "not_sent",
+      actionId: "a1",
+      reasonCode: "unknown_delivery_barrier",
+      receipt: null,
+      queued: true,
+    };
+    routes.queue = [
+      queueView([action({ actionId: "a1", position: 1 })], null, [], true, true),
+      queueView([action({ actionId: "a1", position: 1 })], null, [], true, true),
+    ];
+    await renderAndExpand(<CodexQueuePanel sessionId="s1" />);
+    fireEvent.click(await screen.findByTestId("codex-queue-prioritize-a1"));
+    fireEvent.click(screen.getByTestId("codex-queue-prioritize-yes-a1"));
+    await waitFor(() =>
+      expect(screen.getByTestId("codex-queue-note").textContent).toContain("投递结果未知")
+    );
+    const note = screen.getByTestId("codex-queue-note").textContent ?? "";
+    // 如实：这条仍在队列、没有被发出去；且不与「桌面正忙」混用
+    expect(note).toContain("仍在队列");
+    expect(note).not.toContain("桌面正忙");
+  });
+
+  it("t06_receipt_not_sent_busy_barrier：barrier_outstanding → 仍是原「桌面正忙」文案（两码不混同）", async () => {
+    installFetch();
+    routes.prioritizeBody = {
+      result: "not_sent",
+      actionId: "a1",
+      reasonCode: "barrier_outstanding",
+      receipt: null,
+      queued: true,
+    };
+    routes.queue = [
+      queueView([action({ actionId: "a1", position: 1 })], null, [], true, true),
+      queueView([action({ actionId: "a1", position: 1 })], null, [], true, true),
+    ];
+    await renderAndExpand(<CodexQueuePanel sessionId="s1" />);
+    fireEvent.click(await screen.findByTestId("codex-queue-prioritize-a1"));
+    fireEvent.click(screen.getByTestId("codex-queue-prioritize-yes-a1"));
+    await waitFor(() =>
+      expect(screen.getByTestId("codex-queue-note").textContent).toContain("桌面正忙")
+    );
   });
 });

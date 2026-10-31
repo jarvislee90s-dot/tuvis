@@ -2,6 +2,9 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testi
 import { afterEach, afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import MessageComposer from "@/mobile/MessageComposer";
 import type { QueueItemView, SendInfo } from "@/mobile/api";
+// T05：停止控制器（Harness 挂真实 hook——SessionDetail 持有单例的组件级等价）
+import { useCodexTurnControl } from "@/mobile/useCodexTurnControl";
+import type { ThreadProjection } from "@/mobile/codexIpcApi";
 
 // 文案走 mobile.* 双语键后按 zh 断言（Board.test 同款：显式引入并固定中文）。
 // 只 changeLanguage 不够：jsdom 默认 en-US 会在语言重评估时翻回 en——浏览器
@@ -104,6 +107,14 @@ interface Routes {
   channel?: { via: string; limited: boolean; est_mbps_down: number; est_mbps_up: number };
   /** 原始响应体（畸形载荷用：JSON.stringify(Infinity) 会变 null，测不到 1e999 解析） */
   channelRaw?: string;
+  /** T05：POST /codex/turn/interrupt 回执体（缺省 ok+interruptedTurnId=冻结目标） */
+  interrupt?: Record<string, unknown>;
+  /** T05：interrupt 非 2xx 状态码（停止失败分诊） */
+  interruptStatus?: number;
+  /** T05：interrupt 非 2xx 错误体（缺省 capability_unavailable） */
+  interruptErrorBody?: Record<string, unknown>;
+  /** T05：interrupt 挂起不响应（定序/30 秒预算场景；releaseInterrupt 放行） */
+  interruptHang?: boolean;
 }
 
 let routes: Routes;
@@ -114,12 +125,15 @@ let releaseSend: ((r: Response) => void) | null = null;
 let releaseAttach: ((r: Response) => void) | null = null;
 /** queueHang 挂起请求的放行器（在途 tick 快照时序窗测试用） */
 let releaseQueue: ((r: Response) => void) | null = null;
+/** T05：interruptHang 挂起请求的放行器（turn 冻结定序 / 30 秒预算用） */
+let releaseInterrupt: ((r: Response) => void) | null = null;
 
 beforeEach(() => {
   routes = {};
   releaseSend = null;
   releaseAttach = null;
   releaseQueue = null;
+  releaseInterrupt = null;
 });
 afterEach(() => {
   cleanup();
@@ -138,6 +152,26 @@ function installFetch() {
       return new Response(
         JSON.stringify(
           routes.channel ?? { via: "lan", limited: false, est_mbps_down: 0, est_mbps_up: 0 }
+        ),
+        { status: 200 }
+      );
+    }
+    // T05：定向打断端点（停止控制器；长路径独立，无前缀包含关系）
+    if (url.includes("/codex/turn/interrupt")) {
+      if (routes.interruptHang) {
+        return new Promise<Response>((resolve) => {
+          releaseInterrupt = resolve;
+        });
+      }
+      if (routes.interruptStatus) {
+        return new Response(
+          JSON.stringify(routes.interruptErrorBody ?? { error: "capability_unavailable" }),
+          { status: routes.interruptStatus }
+        );
+      }
+      return new Response(
+        JSON.stringify(
+          routes.interrupt ?? { ok: true, uncertain: false, interruptedTurnId: "turn-A" }
         ),
         { status: 200 }
       );
@@ -2167,4 +2201,531 @@ describe("MessageComposer：H12 App 形态零终端探针", () => {
     // 不因终端探针在场而拦截
     expect(screen.queryByTestId("send-receipt-blocked")).toBeNull();
   });
+});
+
+// ============================================================
+// T05：composer 主按钮按状态切换（spec §5 发送与停止）
+// 停止走页面共享控制器（Harness 挂真实 useCodexTurnControl）；
+// 「HTTP 投递中」（sending）与「模型回合运行」（turnRunning）是两个状态。
+// ============================================================
+
+/** 运行中投影夹具（T03 三元组齐备：新鲜 + runtime active + interrupt.allowed + 活动回合） */
+function activeStopProjection(over: Record<string, unknown> = {}): ThreadProjection {
+  return {
+    threadId: "th-stop",
+    revision: 7,
+    stale: false,
+    availability: "controllable",
+    capabilities: {
+      send: true,
+      state: true,
+      command: true,
+      permissions: false,
+      blockingInput: true,
+      interrupt: true,
+    },
+    runtimeStatus: "active",
+    contentState: "ready",
+    messages: [],
+    truncated: false,
+    pending: [],
+    effectiveOperations: {
+      policyRevision: 1,
+      operations: {
+        interrupt: {
+          implemented: true,
+          allowed: true,
+          requiresAutoAdapt: false,
+          evidence: "observed_success",
+          reasonCode: null,
+        },
+      },
+    },
+    activeTurnId: "turn-A",
+    ...over,
+  } as ThreadProjection;
+}
+
+/** 挂真实停止控制器的 Harness（SessionDetail 持有方式的组件级等价） */
+function StopHarness({
+  projection,
+  sessionId = "sess-stop",
+}: {
+  projection: ThreadProjection | null;
+  sessionId?: string;
+}) {
+  const control = useCodexTurnControl(projection, sessionId);
+  return (
+    <div>
+      <MessageComposer session={{ id: sessionId }} turnControl={control} />
+      <span data-testid="hook-stopping">{control.stopping ? "1" : "0"}</span>
+      <span data-testid="hook-result">{control.result?.kind ?? ""}</span>
+    </div>
+  );
+}
+
+/** POST /codex/turn/interrupt 请求体序列 */
+function interruptBodies(): string[] {
+  return fetchMock.mock.calls
+    .filter(([u]) => String(u).includes("/codex/turn/interrupt"))
+    .map(([, init]) => String((init as RequestInit | undefined)?.body ?? ""));
+}
+
+/** 上传一个就绪附件（走 + 钮同链路；FakeXHR 即时 respond） */
+async function attachReadyFile(name = "a.png") {
+  routes.attach = { path: `E:/proj/.tuvis-attachments/s/1-${name}`, size: 1 };
+  fireEvent.change(screen.getByTestId("attach-file-input"), {
+    target: { files: [new File(["x"], name, { type: "image/png" })] },
+  });
+  await screen.findByTestId("attachment-chips");
+}
+
+describe("MessageComposer：T05 主按钮按状态切换（停止/发送）", () => {
+  // ---- 表驱动反例（spec §5 状态表）----
+
+  it("table_active_empty_stop：active+空白文本+无附件+明确目标 → 主按钮=停止且 enabled；仅渲染绝不发停止", async () => {
+    installFetch();
+    routes.info = sendInfo();
+    const { rerender } = render(<StopHarness projection={activeStopProjection()} />);
+    const stop = await screen.findByTestId("composer-stop");
+    // 简报逐字断言：active、空稿、明确目标 → enabled；仅渲染绝不发停止
+    expect(screen.getByTestId("composer-stop")).toBeEnabled();
+    expect(interruptBodies()).toEqual([]);
+    expect(stop.textContent).toBe("停止");
+    // 主按钮切换：发送按钮不并存
+    expect(screen.queryByTestId("composer-send")).toBeNull();
+    // 回合转 idle → 主按钮回到发送（空闲+无内容 = 禁用的发送），停止面消失
+    rerender(
+      <StopHarness
+        projection={activeStopProjection({ runtimeStatus: "idle", activeTurnId: null })}
+      />
+    );
+    expect(screen.queryByTestId("composer-stop")).toBeNull();
+    expect(screen.getByTestId("composer-send")).toBeDisabled();
+    expect(interruptBodies()).toEqual([]);
+  });
+
+  it("table_active_text_send：active+有文字 → 主按钮=发送（不渲染停止主按钮）；发送仍走既有提交", async () => {
+    installFetch();
+    routes.info = sendInfo();
+    routes.send = { status: "delivered" };
+    render(<StopHarness projection={activeStopProjection()} />);
+    await screen.findByTestId("composer-input");
+    // 无草稿时主按钮是停止；输入文字即切回发送
+    expect(screen.queryByTestId("composer-send")).toBeNull();
+    fireEvent.change(screen.getByTestId("composer-input"), { target: { value: "排队新意见" } });
+    const send = screen.getByTestId("composer-send") as HTMLButtonElement;
+    expect(send.disabled).toBe(false);
+    expect(screen.queryByTestId("composer-stop")).toBeNull();
+    // 发送仍走既有提交规则（不是打断）
+    fireEvent.click(send);
+    await screen.findByTestId("send-receipt-delivered");
+    expect(sendCalls()).toHaveLength(1);
+    expect(interruptBodies()).toEqual([]);
+  });
+
+  it("table_active_attachment_send：active+仅附件（文字空）→ 不回落停止，主按钮=发送（沿用既有禁用规则）；有附件不误触停止", async () => {
+    installFetch();
+    routes.info = sendInfo();
+    render(<StopHarness projection={activeStopProjection()} />);
+    await screen.findByTestId("composer-input");
+    await attachReadyFile();
+    // 附件 = 草稿：绝不回落到停止主按钮
+    expect(screen.queryByTestId("composer-stop")).toBeNull();
+    // 主按钮是发送；附件单独发送沿用既有规则（正文必填 → 禁用，不因文字空改发停止）
+    const send = screen.getByTestId("composer-send") as HTMLButtonElement;
+    expect(send.disabled).toBe(true);
+    expect(interruptBodies()).toEqual([]);
+    // 紧凑停止入口在场（spec：已有草稿时另保留停止入口）
+    expect(screen.getByTestId("composer-stop-compact")).toBeEnabled();
+  });
+
+  it("table_idle_empty_disabled：idle+空内容 → 禁用的发送、无停止面（主表第四行）", async () => {
+    installFetch();
+    routes.info = sendInfo();
+    render(
+      <StopHarness
+        projection={activeStopProjection({ runtimeStatus: "idle", activeTurnId: null })}
+      />
+    );
+    await screen.findByTestId("composer-input");
+    expect(screen.getByTestId("composer-send")).toBeDisabled();
+    expect(screen.queryByTestId("composer-stop")).toBeNull();
+    expect(screen.queryByTestId("composer-stop-compact")).toBeNull();
+    expect(screen.queryByTestId("composer-stop-unavailable")).toBeNull();
+    expect(interruptBodies()).toEqual([]);
+  });
+
+  // ---- 不可执行停止的三种就近短状态（spec §5 最后行）----
+
+  it("table_unexecutable_no_stop：stale / 无 activeTurnId / interrupt 不允许 → 不提供可执行停止，就近显示短状态", async () => {
+    installFetch();
+    routes.info = sendInfo();
+    // ① stale：目标视为过期
+    const r1 = render(<StopHarness projection={activeStopProjection({ stale: true })} />);
+    await screen.findByTestId("composer-input");
+    expect(screen.queryByTestId("composer-stop")).toBeNull();
+    expect(screen.getByTestId("composer-stop-unavailable")).toBeTruthy();
+    expect(screen.getByTestId("composer-send")).toBeDisabled(); // 空稿 → 既有禁用规则
+    r1.unmount();
+    // ② 无目标（activeTurnId 缺失 = 目标不明）
+    const r2 = render(<StopHarness projection={activeStopProjection({ activeTurnId: null })} />);
+    await screen.findByTestId("composer-input");
+    expect(screen.queryByTestId("composer-stop")).toBeNull();
+    expect(screen.getByTestId("composer-stop-unavailable")).toBeTruthy();
+    r2.unmount();
+    // ③ 能力不足（interrupt.allowed=false：旧载荷/资格门关闭）
+    const r3 = render(
+      <StopHarness
+        projection={activeStopProjection({
+          effectiveOperations: {
+            policyRevision: 1,
+            operations: {
+              interrupt: {
+                implemented: true,
+                allowed: false,
+                requiresAutoAdapt: false,
+                evidence: "observed_success",
+                reasonCode: "operation_runtime_unknown",
+              },
+            },
+          },
+        })}
+      />
+    );
+    await screen.findByTestId("composer-input");
+    expect(screen.queryByTestId("composer-stop")).toBeNull();
+    expect(screen.getByTestId("composer-stop-unavailable")).toBeTruthy();
+    r3.unmount();
+    // 三种形态都零打断请求（不提供可执行的停止 = 连试探都不发）
+    expect(interruptBodies()).toEqual([]);
+  });
+
+  it("table_no_projection：投影未达（非 Codex App 形态/连接中）→ 无任何停止面，行为与既有版本一致", async () => {
+    installFetch();
+    routes.info = sendInfo();
+    render(<StopHarness projection={null} />);
+    const input = await screen.findByTestId("composer-input");
+    expect(screen.queryByTestId("composer-stop")).toBeNull();
+    expect(screen.queryByTestId("composer-stop-compact")).toBeNull();
+    expect(screen.queryByTestId("composer-stop-unavailable")).toBeNull();
+    // 发送路径零回归
+    fireEvent.change(input, { target: { value: "普通会话" } });
+    expect(screen.getByTestId("composer-send")).toBeEnabled();
+  });
+
+  // ---- 定序反例 ----
+
+  it("seq_frozen_turn：点停止冻结 turn A → 镜像出现 B → 在途请求载荷仍是 A（旧请求不能停止 B）", async () => {
+    installFetch();
+    routes.info = sendInfo();
+    routes.interruptHang = true;
+    const { rerender } = render(<StopHarness projection={activeStopProjection()} />);
+    fireEvent.click(await screen.findByTestId("composer-stop"));
+    // 挂起中：请求已带 turn-A
+    await waitFor(() =>
+      expect(interruptBodies()).toEqual(['{"sessionId":"sess-stop","turnId":"turn-A"}'])
+    );
+    expect(screen.getByTestId("hook-stopping").textContent).toBe("1");
+    // 停止在飞期间镜像出现新回合 B：目标不得被改写（请求早已定格 A）
+    rerender(
+      <StopHarness projection={activeStopProjection({ revision: 8, activeTurnId: "turn-B" })} />
+    );
+    await flushAsync();
+    expect(interruptBodies()).toEqual(['{"sessionId":"sess-stop","turnId":"turn-A"}']);
+    // 放行响应：成功打断 A → 结果如实
+    await act(async () => {
+      releaseInterrupt!(
+        new Response(JSON.stringify({ ok: true, uncertain: false, interruptedTurnId: "turn-A" }), {
+          status: 200,
+        })
+      );
+    });
+    await flushAsync();
+    expect(screen.getByTestId("hook-result").textContent).toBe("interrupted");
+    expect(interruptBodies()).toHaveLength(1);
+  });
+
+  it("seq_double_click_single_request：stopping 期间双击只发一次打断", async () => {
+    installFetch();
+    routes.info = sendInfo();
+    routes.interruptHang = true;
+    render(<StopHarness projection={activeStopProjection()} />);
+    const stop = await screen.findByTestId("composer-stop");
+    fireEvent.click(stop);
+    fireEvent.click(stop); // 双击第二下：stopping 闸 → no-op
+    await waitFor(() => expect(interruptBodies()).toHaveLength(1));
+    await flushAsync();
+    expect(interruptBodies()).toHaveLength(1);
+    // 在飞期间按钮禁用（30 秒预算内不诱导重按）
+    expect(screen.getByTestId("composer-stop")).toBeDisabled();
+    await act(async () => {
+      releaseInterrupt!(
+        new Response(JSON.stringify({ ok: true, uncertain: false, interruptedTurnId: "turn-A" }), {
+          status: 200,
+        })
+      );
+    });
+    await flushAsync();
+    expect(interruptBodies()).toHaveLength(1);
+  });
+
+  it("seq_old_session_receipt_discarded：旧会话停止回执迟到 → 不落新会话（结果状态与会话哨兵一致）", async () => {
+    installFetch();
+    routes.info = sendInfo();
+    routes.interruptHang = true;
+    const { rerender } = render(
+      <StopHarness projection={activeStopProjection()} sessionId="sess-old" />
+    );
+    fireEvent.click(await screen.findByTestId("composer-stop"));
+    await waitFor(() => expect(interruptBodies()).toHaveLength(1));
+    // 切换会话：控制器随 sessionId 重置（新会话现场干净）
+    rerender(
+      <StopHarness
+        projection={activeStopProjection({ activeTurnId: "turn-B" })}
+        sessionId="sess-new"
+      />
+    );
+    await flushAsync();
+    expect(screen.getByTestId("hook-stopping").textContent).toBe("0");
+    expect(screen.getByTestId("hook-result").textContent).toBe("");
+    // 旧会话的停止响应此刻才到：不得回灌新会话
+    await act(async () => {
+      releaseInterrupt!(
+        new Response(JSON.stringify({ ok: true, uncertain: false, interruptedTurnId: "turn-A" }), {
+          status: 200,
+        })
+      );
+    });
+    await flushAsync();
+    expect(screen.getByTestId("hook-result").textContent).toBe("");
+    expect(screen.queryByTestId("composer-stop-uncertain")).toBeNull();
+    expect(screen.queryByTestId("composer-stop-no-turn")).toBeNull();
+  });
+
+  it("seq_empty_enter_no_stop：空 Enter 不产生停止（Enter 仍只走既有发送路径，本就无 Enter 发送）", async () => {
+    installFetch();
+    routes.info = sendInfo();
+    render(<StopHarness projection={activeStopProjection()} />);
+    const input = await screen.findByTestId("composer-input");
+    // 主按钮此时是停止；但 Enter 绝不映射成打断
+    expect(screen.getByTestId("composer-stop")).toBeTruthy();
+    fireEvent.keyDown(input, { key: "Enter" });
+    await flushAsync();
+    expect(interruptBodies()).toEqual([]);
+    expect(sendCalls()).toHaveLength(0);
+  });
+
+  // ---- 结果分诊（与真实 API 语义一致；Unknown 不自动重试不自动发稿）----
+
+  it("result_uncertain_honest：uncertain=true → 如实呈现不确定 + 劝阻重按；不自动重试、不自动接着发稿", async () => {
+    installFetch();
+    routes.info = sendInfo();
+    routes.interrupt = {
+      ok: true,
+      uncertain: true,
+      interruptedTurnId: null,
+      reasonCode: "timeout",
+    };
+    render(<StopHarness projection={activeStopProjection()} />);
+    fireEvent.click(await screen.findByTestId("composer-stop"));
+    const note = await screen.findByTestId("composer-stop-uncertain");
+    expect(note.textContent).toContain("不确定");
+    expect(note.textContent).toContain("不要连续重按");
+    expect(screen.getByTestId("hook-result").textContent).toBe("uncertain");
+    // Unknown 纪律：零自动重试、零自动发送
+    await flushAsync();
+    expect(interruptBodies()).toHaveLength(1);
+    expect(sendCalls()).toHaveLength(0);
+  });
+
+  it("result_no_turn_not_faked：桌面无可打断回合 → 如实提示，不谎报成功也不报失败", async () => {
+    installFetch();
+    routes.info = sendInfo();
+    routes.interrupt = {
+      ok: true,
+      uncertain: false,
+      interruptedTurnId: null,
+      expectedTurnId: null,
+    };
+    render(<StopHarness projection={activeStopProjection()} />);
+    fireEvent.click(await screen.findByTestId("composer-stop"));
+    expect(await screen.findByTestId("composer-stop-no-turn")).toBeTruthy();
+    expect(screen.queryByTestId("composer-stop-uncertain")).toBeNull();
+    expect(screen.queryByTestId("composer-stop-failed")).toBeNull();
+  });
+
+  it("result_failed_readable：503 能力不可用 → 停止失败就近呈现，带码文案映射不裸示机器码", async () => {
+    installFetch();
+    routes.info = sendInfo();
+    routes.interruptStatus = 503;
+    routes.interruptErrorBody = {
+      error: "capability_unavailable",
+      reason:
+        "CODEX_INTERRUPT_CAPABILITY_UNVERIFIED: 当前桌面 Codex 版本未启用远程停止能力（未完成活体验证），无法远程打断回合",
+    };
+    render(<StopHarness projection={activeStopProjection()} />);
+    fireEvent.click(await screen.findByTestId("composer-stop"));
+    const note = await screen.findByTestId("composer-stop-failed");
+    expect(note.textContent).toContain("停止失败");
+    expect(note.textContent).toContain("未启用远程停止能力");
+    expect(note.textContent).not.toContain("CODEX_INTERRUPT_");
+    // 失败后不自动重试（重按是用户的决定）
+    await flushAsync();
+    expect(interruptBodies()).toHaveLength(1);
+  });
+
+  it("budget_30s：停止响应挂起 30 秒 → 前台预算到期按「不确定」收尾；迟到响应不覆盖", async () => {
+    vi.useFakeTimers();
+    installFetch();
+    routes.info = sendInfo();
+    routes.interruptHang = true;
+    render(<StopHarness projection={activeStopProjection()} />);
+    await flushAsync(); // fake timers 下不用 findBy（其内部 interval 会被冻结）
+    fireEvent.click(screen.getByTestId("composer-stop"));
+    await flushAsync();
+    expect(screen.getByTestId("hook-stopping").textContent).toBe("1");
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(30_000);
+    });
+    // 预算到期：转圈结束，按不确定呈现（不把「停止 HTTP 等待」冒充停止成功/失败）
+    expect(screen.getByTestId("hook-stopping").textContent).toBe("0");
+    expect(screen.getByTestId("composer-stop-uncertain")).toBeTruthy();
+    // 迟到的原始响应：不得覆盖已呈现的不确定
+    await act(async () => {
+      releaseInterrupt!(
+        new Response(JSON.stringify({ ok: true, uncertain: false, interruptedTurnId: "turn-A" }), {
+          status: 200,
+        })
+      );
+    });
+    await flushAsync();
+    expect(screen.getByTestId("composer-stop-uncertain")).toBeTruthy();
+    expect(screen.getByTestId("hook-result").textContent).toBe("uncertain");
+  });
+
+  // ---- 「HTTP 投递中」≠「模型回合运行」；草稿紧凑停止入口 ----
+
+  it("two_states_sending_not_busy_stop：HTTP 投递中（sending）不停用停止入口——停止可用性只看回合运行态+canStop", async () => {
+    installFetch();
+    routes.info = sendInfo();
+    routes.sendHang = true;
+    render(<StopHarness projection={activeStopProjection()} />);
+    const input = await screen.findByTestId("composer-input");
+    fireEvent.change(input, { target: { value: "投递中的消息" } });
+    fireEvent.click(screen.getByTestId("composer-send"));
+    await flushAsync();
+    // HTTP 投递中 chip 在场（sending=true 的呈现面）
+    expect(screen.getByTestId("send-receipt-delivering")).toBeTruthy();
+    // 草稿在 → 主按钮=发送（禁用=发送在飞），紧凑停止入口在场且**可用**（不看 sending busy）
+    expect(screen.getByTestId("composer-send")).toBeDisabled();
+    const compact = screen.getByTestId("composer-stop-compact") as HTMLButtonElement;
+    expect(compact.disabled).toBe(false);
+  });
+
+  it("compact_stop_entry：草稿在场时紧凑菜单保留停止入口；点击仍走共享控制器（冻结 turn）", async () => {
+    installFetch();
+    routes.info = sendInfo();
+    render(<StopHarness projection={activeStopProjection()} />);
+    const input = await screen.findByTestId("composer-input");
+    fireEvent.change(input, { target: { value: "有草稿的意见" } });
+    const compact = await screen.findByTestId("composer-stop-compact");
+    expect(screen.getByTestId("composer-send")).toBeEnabled(); // 主按钮=发送
+    fireEvent.click(compact);
+    await waitFor(() =>
+      expect(interruptBodies()).toEqual(['{"sessionId":"sess-stop","turnId":"turn-A"}'])
+    );
+    await flushAsync();
+    // 打断不动草稿（停止的是回合，不是用户输入）
+    expect((screen.getByTestId("composer-input") as HTMLTextAreaElement).value).toBe(
+      "有草稿的意见"
+    );
+    expect(sendCalls()).toHaveLength(0);
+  });
+});
+
+describe("Codex queue edit draft transfer", () => {
+  it("fills an empty draft and refuses stale-session transfer", async () => {
+    installFetch();
+    routes.info = sendInfo();
+    const { rerender } = render(
+      <MessageComposer
+        session={{ id: "sess-1" }}
+        editDraft={{ sessionId: "sess-1", actionId: "a1", text: "original" }}
+      />
+    );
+    const input = (await screen.findByTestId("composer-input")) as HTMLTextAreaElement;
+    expect(input.value).toBe("original");
+    rerender(
+      <MessageComposer
+        session={{ id: "sess-1" }}
+        editDraft={{ sessionId: "old", actionId: "a2", text: "stale" }}
+      />
+    );
+    expect(input.value).toBe("original");
+  });
+  it("preserves a new draft until an explicit append or replace choice", async () => {
+    installFetch();
+    routes.info = sendInfo();
+    const { rerender } = render(<MessageComposer session={{ id: "sess-1" }} />);
+    const input = (await screen.findByTestId("composer-input")) as HTMLTextAreaElement;
+    fireEvent.change(input, { target: { value: "new draft" } });
+    rerender(
+      <MessageComposer
+        session={{ id: "sess-1" }}
+        editDraft={{ sessionId: "sess-1", actionId: "a1", text: "original" }}
+      />
+    );
+    expect(input.value).toBe("new draft");
+    const choice = screen.getByTestId("composer-edit-choice");
+    fireEvent.click(within(choice).getAllByRole("button")[1]);
+    expect(input.value).toBe("new draft\n\noriginal");
+    rerender(
+      <MessageComposer
+        session={{ id: "sess-1" }}
+        editDraft={{ sessionId: "sess-1", actionId: "a2", text: "replace" }}
+      />
+    );
+    fireEvent.click(within(screen.getByTestId("composer-edit-choice")).getAllByRole("button")[0]);
+    expect(input.value).toBe("replace");
+  });
+});
+
+it("parent-owned edit queue survives composer remount and acknowledges consumed drafts", async () => {
+  installFetch();
+  routes.info = sendInfo();
+  const requests = [
+    { sessionId: "sess-1", actionId: "A", text: "alpha" },
+    { sessionId: "sess-1", actionId: "B", text: "beta" },
+  ];
+  let text = "new";
+  let pending = [...requests];
+  const props = () => ({
+    session: { id: "sess-1" },
+    draftText: text,
+    onDraftTextChange: (update: React.SetStateAction<string>) => {
+      text = typeof update === "function" ? update(text) : update;
+    },
+    editDraft: pending[0],
+    onEditDraftConsumed: (actionId: string) => {
+      pending = pending.filter((d) => d.actionId !== actionId);
+    },
+  });
+  const view = render(<MessageComposer {...props()} />);
+  await screen.findByTestId("composer-input");
+  expect((screen.getByTestId("composer-input") as HTMLTextAreaElement).value).toBe("new");
+  view.rerender(<MessageComposer key="split" {...props()} />);
+  await screen.findByTestId("composer-edit-choice");
+  fireEvent.click(within(screen.getByTestId("composer-edit-choice")).getAllByRole("button")[1]);
+  expect(text).toBe("new\n\nalpha");
+  expect(pending.map((d) => d.actionId)).toEqual(["B"]);
+  view.rerender(<MessageComposer key="normal" {...props()} />);
+  await screen.findByTestId("composer-edit-choice");
+  fireEvent.click(within(screen.getByTestId("composer-edit-choice")).getAllByRole("button")[1]);
+  expect(text).toBe("new\n\nalpha\n\nbeta");
+  expect(pending).toHaveLength(0);
+  text = "";
+  view.rerender(<MessageComposer key="sent" {...props()} />);
+  expect(((await screen.findByTestId("composer-input")) as HTMLTextAreaElement).value).toBe("");
+  expect(screen.queryByTestId("composer-edit-choice")).toBeNull();
 });

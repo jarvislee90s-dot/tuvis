@@ -1,4 +1,4 @@
-import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import i18n from "@/i18n";
 import AsyncQuestionGroupCard from "@/mobile/AsyncQuestionGroupCard";
@@ -123,6 +123,8 @@ describe("C03/C04 可见选中与实发答案一致", () => {
 
   it("last_option_click_overrides_old_free_text_in_submitted_answer", async () => {
     render(<AsyncQuestionGroupCard sessionId="s1" questions={[question(0)]} />);
+    // T04：自由填写默认收起——先展开再输入
+    fireEvent.click(screen.getByTestId("codex-async-free-toggle"));
     fireEvent.change(screen.getByTestId("codex-async-free"), {
       target: { value: "旧的自由答案" },
     });
@@ -139,6 +141,8 @@ describe("C03/C04 可见选中与实发答案一致", () => {
   it("free_text_after_option_click_wins_and_clears_visible_selection", async () => {
     render(<AsyncQuestionGroupCard sessionId="s1" questions={[question(0)]} />);
     fireEvent.click(screen.getByRole("button", { name: "甲" }));
+    // T04：自由填写默认收起——点「其他答案」展开后输入
+    fireEvent.click(screen.getByTestId("codex-async-free-toggle"));
     fireEvent.change(screen.getByTestId("codex-async-free"), {
       target: { value: "新的自由答案" },
     });
@@ -541,6 +545,8 @@ describe("J03—J09 核对/复核/草稿恢复", () => {
     fireEvent.click(screen.getByTestId("codex-async-stale-toggle"));
     fireEvent.click(screen.getByTestId("codex-async-stale-restore"));
     expect(screen.getByRole("button", { name: "乙" }).getAttribute("aria-pressed")).toBe("true");
+    // T04：恢复的是选项稿（无自由文本）→ 自由填写保持收起；展开后确认为空。
+    fireEvent.click(screen.getByTestId("codex-async-free-toggle"));
     expect((screen.getByTestId("codex-async-free") as HTMLInputElement).value).toBe("");
   });
 
@@ -549,6 +555,8 @@ describe("J03—J09 核对/复核/草稿恢复", () => {
     fireEvent.click(screen.getByTestId("codex-async-next")); // q0 未答，next 禁用
     fireEvent.click(screen.getByRole("button", { name: "甲" })); // q0
     fireEvent.click(screen.getByTestId("codex-async-next"));
+    // T04：自由填写默认收起——先展开再写稿
+    fireEvent.click(screen.getByTestId("codex-async-free-toggle"));
     fireEvent.change(screen.getByTestId("codex-async-free"), {
       target: { value: "第二题的旧长答案" },
     });
@@ -567,5 +575,122 @@ describe("J03—J09 核对/复核/草稿恢复", () => {
     expect((screen.getByTestId("codex-async-free") as HTMLTextAreaElement).value).toBe(
       "第二题的旧长答案"
     );
+  });
+});
+
+// ============================================================
+// T04：紧凑题卡（spec §3.4–§3.6）
+// - 没有回执不留空行；
+// - 自由填写默认收起、点「其他答案」展开、有自由稿自动展开；收起/展开不丢稿；
+// - 长题干默认三行可展开；长选项组内部滚动；单题不显示翻页说明；
+// - 题干/选项内容在字号档位作用域内（14px 基准 = text-sm 相对单位），
+//   主按钮不进入该作用域（稳定操作尺寸）。
+// ============================================================
+describe("T04 紧凑题卡", () => {
+  it("t04_no_receipt_renders_no_placeholder_note_line", () => {
+    render(<AsyncQuestionGroupCard sessionId="s1" questions={five()} />);
+    expect(screen.queryByTestId("codex-async-note")).toBeNull();
+  });
+
+  it("t04_free_answer_collapsed_by_default_toggle_keeps_draft_on_collapse", () => {
+    render(<AsyncQuestionGroupCard sessionId="s1" questions={[question(0)]} />);
+    // 默认收起
+    expect(screen.queryByTestId("codex-async-free")).toBeNull();
+    // 点「其他答案」展开
+    fireEvent.click(screen.getByTestId("codex-async-free-toggle"));
+    const input = screen.getByTestId("codex-async-free") as HTMLInputElement;
+    fireEvent.change(input, { target: { value: "自由草稿" } });
+    // 收起不丢稿
+    fireEvent.click(screen.getByTestId("codex-async-free-collapse"));
+    expect(screen.queryByTestId("codex-async-free")).toBeNull();
+    fireEvent.click(screen.getByTestId("codex-async-free-toggle"));
+    expect((screen.getByTestId("codex-async-free") as HTMLInputElement).value).toBe("自由草稿");
+  });
+
+  it("t04_long_title_clamped_three_lines_and_expandable", () => {
+    // 集中审查 D4 修订：展开入口改由**实测溢出**驱动（字符数判据废止）——
+    // jsdom 无布局引擎，按仓库惯例挂载前在 Element 原型注入几何
+    // （SessionDetail.test.tsx 同款；afterEach restoreAllMocks 自动还原）：
+    // scrollHeight 63 > clientHeight 42 = 三行装不下（mock 四行内容）。
+    vi.spyOn(Element.prototype, "scrollHeight", "get").mockReturnValue(63);
+    vi.spyOn(Element.prototype, "clientHeight", "get").mockReturnValue(42);
+    const longTitle = "这是一个特别长的题干".repeat(12);
+    render(
+      <AsyncQuestionGroupCard sessionId="s1" questions={[question(0, { title: longTitle })]} />
+    );
+    const title = screen.getByText(longTitle);
+    expect(title.className).toContain("line-clamp-3");
+    fireEvent.click(screen.getByTestId("codex-async-title-toggle"));
+    expect(screen.getByText(longTitle).className).not.toContain("line-clamp-3");
+    fireEvent.click(screen.getByTestId("codex-async-title-toggle"));
+    expect(screen.getByText(longTitle).className).toContain("line-clamp-3");
+  });
+
+  it("t04_short_title_with_measured_overflow_gets_expand_entry_no_post_no_draft_loss", () => {
+    // 审查点名场景：≤80 字符的题干在窄屏/125% 字号下也可能超过三行——入口必须由
+    // 实测溢出（scrollHeight > clientHeight）驱动，而不是字符数。短题干 + mock 溢出
+    // → 入口在场可展开；展开不触发任何 POST、不丢自由稿；收起回三行。
+    vi.spyOn(Element.prototype, "scrollHeight", "get").mockReturnValue(63);
+    vi.spyOn(Element.prototype, "clientHeight", "get").mockReturnValue(42);
+    const shortTitle = "这是一个不到八十字符但窄屏会超过三行的题干";
+    expect(shortTitle.length).toBeLessThanOrEqual(80);
+    render(
+      <AsyncQuestionGroupCard sessionId="s1" questions={[question(0, { title: shortTitle })]} />
+    );
+    // 恒三行收纳（展开前），实测溢出 → 展开入口在场
+    const title = screen.getByText(shortTitle);
+    expect(title.className).toContain("line-clamp-3");
+    fireEvent.click(screen.getByTestId("codex-async-title-toggle"));
+    expect(screen.getByText(shortTitle).className).not.toContain("line-clamp-3");
+    // 展开动作零 POST（纯本地显隐）
+    expect(posts()).toHaveLength(0);
+    // 展开不丢稿：写自由稿 → 收起回三行 → 稿仍在（有自由稿时输入区自动展开，
+    // 无需再点 free-toggle——T04 既有行为）
+    fireEvent.click(screen.getByTestId("codex-async-free-toggle"));
+    fireEvent.change(screen.getByTestId("codex-async-free"), { target: { value: "自由稿" } });
+    fireEvent.click(screen.getByTestId("codex-async-title-toggle"));
+    expect(screen.getByText(shortTitle).className).toContain("line-clamp-3");
+    expect((screen.getByTestId("codex-async-free") as HTMLInputElement).value).toBe("自由稿");
+    expect(posts()).toHaveLength(0);
+  });
+
+  it("t04_short_title_has_no_expand_toggle_and_options_area_scrollable", () => {
+    render(<AsyncQuestionGroupCard sessionId="s1" questions={[question(0)]} />);
+    expect(screen.queryByTestId("codex-async-title-toggle")).toBeNull();
+    // 长选项组内部滚动（spec §3.6）
+    const wrapper = screen.getByTestId("codex-async-current");
+    const optionsBox = wrapper.querySelector(".overflow-y-auto");
+    expect(optionsBox).not.toBeNull();
+  });
+
+  it("t04_single_question_hides_pagination_and_turn_hint", () => {
+    render(<AsyncQuestionGroupCard sessionId="s1" questions={[question(0)]} />);
+    expect(screen.queryByTestId("codex-async-progress")).toBeNull();
+    expect(screen.queryByTestId("codex-async-prev")).toBeNull();
+    expect(screen.queryByTestId("codex-async-next")).toBeNull();
+    expect(screen.getByTestId("codex-async-question").textContent).not.toContain("翻题");
+  });
+
+  it("t04_question_content_follows_font_scale_while_main_button_stays_fixed", () => {
+    // 单题组：提交主按钮直接在场（多题组此处是「下一题」，属动作钮同样不跟随）
+    render(<AsyncQuestionGroupCard sessionId="s1" questions={[question(0)]} fontScale={1.25} />);
+    const current = screen.getByTestId("codex-async-current");
+    // 内容作用域：题干/选项/自由输入在 [data-font-scale] 内（相对档位单位 text-sm）
+    const scope = current.querySelector("[data-font-scale]");
+    expect(scope?.getAttribute("data-font-scale")).toBe("1.25");
+    const title = within(current).getByText("问题1");
+    expect(scope!.contains(title)).toBe(true);
+    expect(title.className).toContain("text-sm");
+    expect(title.className).not.toMatch(/text-\[\d+px\]/);
+    const option = screen.getByRole("button", { name: "甲" });
+    // 选项在（同档位的）字号作用域内；选项文字缩放、按钮 padding 保持 px
+    expect(option.closest("[data-font-scale]")?.getAttribute("data-font-scale")).toBe("1.25");
+    // 主按钮不跟随字号档位（保持固定操作尺寸）
+    expect(screen.getByTestId("codex-async-submit").closest("[data-font-scale]")).toBeNull();
+    // 卡头（页头）不跟随
+    expect(
+      screen.getByTestId("codex-async-question").querySelector(".text-sm.font-semibold")
+    ).not.toBeNull();
+    expect(screen.getByText("待作答（异步）").closest("[data-font-scale]")).toBeNull();
   });
 });

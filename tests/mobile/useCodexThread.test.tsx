@@ -8,6 +8,7 @@ import { CODEX_HISTORY_MAX_BYTES, CODEX_HISTORY_MAX_PAGES } from "@/mobile/codex
 import type {
   CapabilitySet,
   MessagesPage,
+  ProjectionVersion,
   ProjectedMessage,
   ThreadProjection,
 } from "@/mobile/codexIpcApi";
@@ -45,6 +46,18 @@ function projection(over: Partial<ThreadProjection> = {}): ThreadProjection {
     messages: [],
     truncated: false,
     pending: [],
+    ...over,
+  };
+}
+
+/** T02 版本束缺省：instance/owner 全同，revision/localSeq = 12/30。 */
+function pv(over: Partial<ProjectionVersion> = {}): ProjectionVersion {
+  return {
+    instanceId: "inst-1",
+    ownerEpoch: 1,
+    ownerGeneration: 1,
+    revision: 12,
+    localSeq: 30,
     ...over,
   };
 }
@@ -1112,5 +1125,553 @@ describe("useCodexThread：R2 尾窗接缝保留（同 token 尾窗前移）", (
     );
     await act(async () => {});
     expect(ids(result.current.loadedMessages)).toEqual(["x1"]);
+  });
+});
+
+// ==== T02：投影落地守卫（GET／SSE／轮询／手动刷新同一套版本守卫） ====
+
+describe("useCodexThread：投影落地守卫（T02）", () => {
+  it("late_same_token_get_never_overwrites_newer_sse：同 token 旧 GET 挂起→新 SSE 落地→旧 GET 返回，不得覆盖", async () => {
+    installFetch();
+    const { result } = renderHook(() => useCodexThread("s1", true));
+    const es = MockEventSource.latest();
+    es.emit(
+      "snapshot",
+      projection({
+        revision: 12,
+        historyToken: "v1-tok1",
+        messages: [msg("m3")],
+        projectionVersion: pv({ revision: 12, localSeq: 31 }),
+      })
+    );
+    await act(async () => {});
+
+    // 手动刷新 GET 挂起（捕获旧世界）
+    routes.threadHang = true;
+    let pending!: Promise<void>;
+    await act(async () => {
+      pending = result.current.refresh();
+      await Promise.resolve();
+    });
+    // SSE 推进（同 token、同 revision、更高 localSeq——本地策略重发布）
+    es.emit(
+      "state",
+      projection({
+        revision: 12,
+        historyToken: "v1-tok1",
+        messages: [msg("m3"), msg("m4")],
+        projectionVersion: pv({ revision: 12, localSeq: 32 }),
+      })
+    );
+    await act(async () => {});
+
+    // 旧 GET 此刻才返回：同 token（token 守卫拦不住）、同 revision、更低 localSeq
+    routes.threadHang = false;
+    await act(async () => {
+      releaseThread!(
+        projection({
+          revision: 12,
+          historyToken: "v1-tok1",
+          messages: [msg("m3")],
+          projectionVersion: pv({ revision: 12, localSeq: 31 }),
+        })
+      );
+      await pending;
+    });
+    // 新 SSE 状态保持：旧响应不得覆盖
+    expect(result.current.state?.historyToken).toBe("v1-tok1");
+    expect(ids(result.current.state!.messages)).toEqual(["m3", "m4"]);
+    expect(result.current.state?.projectionVersion?.localSeq).toBe(32);
+  });
+
+  it("two_reversed_gets_do_not_regress：降级轮询两个 GET 逆序返回，晚到的旧响应不回退", async () => {
+    installFetch();
+    const { result } = renderHook(() => useCodexThread("s1", true));
+    const es = MockEventSource.latest();
+    es.emit(
+      "snapshot",
+      projection({
+        revision: 12,
+        historyToken: "v1-tok1",
+        messages: [msg("m0")],
+        projectionVersion: pv({ revision: 12, localSeq: 40 }),
+      })
+    );
+    await act(async () => {});
+
+    // SSE 三连失败 → 降级轮询；两次 GET 都挂起
+    routes.threadHang = true;
+    MockEventSource.latest().fail();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1000);
+    });
+    MockEventSource.latest().fail();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2000);
+    });
+    MockEventSource.latest().fail();
+    await flushMicro();
+    expect(result.current.transport).toBe("poll");
+    expect(threadGetCalls()).toBe(1);
+    const release1 = releaseThread!;
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(CODEX_THREAD_POLL_MS);
+    });
+    expect(threadGetCalls()).toBe(2);
+    const release2 = releaseThread!;
+
+    // 逆序返回：第二次 GET（localSeq 42）先落地
+    routes.threadHang = false;
+    await act(async () => {
+      release2(
+        projection({
+          revision: 12,
+          historyToken: "v1-tok1",
+          messages: [msg("m2")],
+          projectionVersion: pv({ revision: 12, localSeq: 42 }),
+        })
+      );
+    });
+    await flushMicro();
+    expect(result.current.state?.projectionVersion?.localSeq).toBe(42);
+    // 第一次 GET（localSeq 41）后到：同 token 同 revision、更低 localSeq → 不得回退
+    await act(async () => {
+      release1(
+        projection({
+          revision: 12,
+          historyToken: "v1-tok1",
+          messages: [msg("m1")],
+          projectionVersion: pv({ revision: 12, localSeq: 41 }),
+        })
+      );
+    });
+    await flushMicro();
+    expect(result.current.state?.projectionVersion?.localSeq).toBe(42);
+    expect(ids(result.current.state!.messages)).toEqual(["m2"]);
+  });
+
+  it("old_instance_get_cannot_reinstall_after_restart：服务重启（新 instance 快照落地）后，旧 instance 的 GET 返回不得装回", async () => {
+    installFetch();
+    const { result } = renderHook(() => useCodexThread("s1", true));
+    const es = MockEventSource.latest();
+    // 旧服务实例的基线
+    es.emit(
+      "snapshot",
+      projection({
+        revision: 3,
+        historyToken: "v1-tok1",
+        messages: [msg("b1")],
+        projectionVersion: pv({ instanceId: "inst-new", ownerEpoch: 1, revision: 3, localSeq: 2 }),
+      })
+    );
+    await act(async () => {});
+
+    // 旧 instance 的手动刷新挂起（重启前发出）
+    routes.threadHang = true;
+    let pending!: Promise<void>;
+    await act(async () => {
+      pending = result.current.refresh();
+      await Promise.resolve();
+    });
+    // 服务重启：新 instance 的 snapshot（握手）落地——revision 变小也是合法新世界
+    es.emit(
+      "snapshot",
+      projection({
+        revision: 2,
+        historyToken: "v1-tok1",
+        messages: [msg("c1")],
+        projectionVersion: pv({
+          instanceId: "inst-newer",
+          ownerEpoch: 1,
+          revision: 2,
+          localSeq: 1,
+        }),
+      })
+    );
+    await act(async () => {});
+
+    // 旧 GET 此刻才返回：同 token、revision 更高（20 > 2）——但属于旧 instance
+    routes.threadHang = false;
+    await act(async () => {
+      releaseThread!(
+        projection({
+          revision: 20,
+          historyToken: "v1-tok1",
+          messages: [msg("old-world")],
+          projectionVersion: pv({
+            instanceId: "inst-old",
+            ownerEpoch: 5,
+            revision: 20,
+            localSeq: 99,
+          }),
+        })
+      );
+      await pending;
+    });
+    // 跨 instance 不可比较：旧 GET 无权切回旧 instance（非握手响应）
+    expect(result.current.state?.projectionVersion?.instanceId).toBe("inst-newer");
+    expect(ids(result.current.state!.messages)).toEqual(["c1"]);
+  });
+
+  it("subscription_generation_invalidates_inflight_get：切订阅代际（重挂订阅）作废旧在途 GET", async () => {
+    installFetch();
+    const { result, rerender } = renderHook(
+      ({ enabled }: { enabled: boolean }) => useCodexThread("s1", enabled),
+      { initialProps: { enabled: true } }
+    );
+    const es = MockEventSource.latest();
+    es.emit(
+      "snapshot",
+      projection({
+        revision: 12,
+        historyToken: "v1-tok1",
+        messages: [msg("m1")],
+        projectionVersion: pv({ revision: 12, localSeq: 10 }),
+      })
+    );
+    await act(async () => {});
+
+    // 手动刷新挂起（旧订阅代际在途）
+    routes.threadHang = true;
+    let pending!: Promise<void>;
+    await act(async () => {
+      pending = result.current.refresh();
+      await Promise.resolve();
+    });
+    // 重挂订阅（禁用再启用）：订阅代际 +2，旧在途 GET 作废
+    rerender({ enabled: false });
+    await act(async () => {});
+    rerender({ enabled: true });
+    await act(async () => {});
+    // 新订阅重新建立基线（同 token）
+    MockEventSource.latest().emit(
+      "snapshot",
+      projection({
+        revision: 12,
+        historyToken: "v1-tok1",
+        messages: [msg("m1")],
+        projectionVersion: pv({ revision: 12, localSeq: 10 }),
+      })
+    );
+    await act(async () => {});
+
+    // 旧代际的在途 GET 此刻返回（token 相同、revision 更高）→ 不得落地
+    routes.threadHang = false;
+    await act(async () => {
+      releaseThread!(
+        projection({
+          revision: 99,
+          historyToken: "v1-tok1",
+          messages: [msg("dead-subscription")],
+          projectionVersion: pv({ revision: 99, localSeq: 99 }),
+        })
+      );
+      await pending;
+    });
+    expect(result.current.state?.projectionVersion?.localSeq).toBe(10);
+    expect(ids(result.current.state!.messages)).toEqual(["m1"]);
+  });
+
+  it("poll_degradation_rearms_instance_handshake：SSE 在线置位握手→降级 poll→重启后的新 instance GET 获准建立基线", async () => {
+    installFetch();
+    const { result } = renderHook(() => useCodexThread("s1", true));
+    const es = MockEventSource.latest();
+    // 旧服务实例的 SSE 基线落地（握手置位）
+    es.emit(
+      "snapshot",
+      projection({
+        revision: 3,
+        historyToken: "v1-tok1",
+        messages: [msg("b1")],
+        projectionVersion: pv({ instanceId: "inst-a", ownerEpoch: 1, revision: 3, localSeq: 2 }),
+      })
+    );
+    await act(async () => {});
+
+    // Desktop 退出：SSE 三连失败降级 poll；重启后的新 hub = 新 instance
+    routes.thread = projection({
+      revision: 2,
+      historyToken: "v1-tok1",
+      messages: [msg("c1")],
+      projectionVersion: pv({ instanceId: "inst-b", ownerEpoch: 1, revision: 2, localSeq: 1 }),
+    });
+    MockEventSource.latest().fail();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1000);
+    });
+    MockEventSource.latest().fail();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2000);
+    });
+    MockEventSource.latest().fail();
+    await flushMicro();
+    expect(result.current.transport).toBe("poll");
+    // 降级转换点再武装握手：降级后的首个成功 GET 有权确立新 instance（否则卡面
+    // 永久冻结在旧 instance 的 stale 视图，直到用户重进页面）
+    expect(result.current.state?.projectionVersion?.instanceId).toBe("inst-b");
+    expect(ids(result.current.state!.messages)).toEqual(["c1"]);
+  });
+
+  it("pre_degradation_inflight_get_stays_unauthorized：降级前已发出的挂起 GET 不得借降级再武装切换 instance", async () => {
+    installFetch();
+    const { result } = renderHook(() => useCodexThread("s1", true));
+    const es = MockEventSource.latest();
+    // 旧服务实例的 SSE 基线落地（握手置位）
+    es.emit(
+      "snapshot",
+      projection({
+        revision: 3,
+        historyToken: "v1-tok1",
+        messages: [msg("b1")],
+        projectionVersion: pv({ instanceId: "inst-a", ownerEpoch: 1, revision: 3, localSeq: 2 }),
+      })
+    );
+    await act(async () => {});
+
+    // 重启前发出手动刷新（挂起中）——它只能看见旧世界的握手状态
+    routes.threadHang = true;
+    let pending!: Promise<void>;
+    await act(async () => {
+      pending = result.current.refresh();
+      await Promise.resolve();
+    });
+    // refresh 的挂起放行器（降级后的 pollOnce GET 会覆写共享 releaseThread 槽）
+    const refreshRelease = releaseThread!;
+    // 挂起期间 SSE 降级（转换点再武装）+ 服务重启
+    MockEventSource.latest().fail();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1000);
+    });
+    MockEventSource.latest().fail();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2000);
+    });
+    MockEventSource.latest().fail();
+    await flushMicro();
+    expect(result.current.transport).toBe("poll");
+
+    // 降级前发出的 GET 此刻才返回新 instance → 不得借再武装越权
+    routes.threadHang = false;
+    await act(async () => {
+      refreshRelease(
+        projection({
+          revision: 2,
+          historyToken: "v1-tok1",
+          messages: [msg("c1")],
+          projectionVersion: pv({ instanceId: "inst-b", ownerEpoch: 1, revision: 2, localSeq: 1 }),
+        })
+      );
+      await pending;
+    });
+    expect(result.current.state?.projectionVersion?.instanceId).toBe("inst-a");
+    expect(ids(result.current.state!.messages)).toEqual(["b1"]);
+  });
+
+  // R03 反例 C：SSE→poll 降级只再武装一次——首个 poll 成功后握手置位，之后服务
+  // 再重启，新 instance 的 GET 永远被 instance 守卫拒绝（卡面冻结在旧 instance
+  // 视图直到重挂页面）。握手授权必须可更新：消费后仍能在有界拒绝内重新获得
+  // 建立权，让「轮询期间后续重启」可恢复。
+  it("poll_recovery_after_second_restart：poll 已确立新 instance 后服务再重启，新 instance 必须能恢复落地", async () => {
+    installFetch();
+    const { result } = renderHook(() => useCodexThread("s1", true));
+    const es = MockEventSource.latest();
+    // 旧服务实例的 SSE 基线落地
+    es.emit(
+      "snapshot",
+      projection({
+        revision: 3,
+        historyToken: "v1-tok1",
+        messages: [msg("b1")],
+        projectionVersion: pv({ instanceId: "inst-a", ownerEpoch: 1, revision: 3, localSeq: 2 }),
+      })
+    );
+    await act(async () => {});
+
+    // 第一次重启：SSE 三连失败降级 poll；首个成功 GET 确立 inst-b（握手消费）
+    routes.thread = projection({
+      revision: 2,
+      historyToken: "v1-tok1",
+      messages: [msg("c1")],
+      projectionVersion: pv({ instanceId: "inst-b", ownerEpoch: 1, revision: 2, localSeq: 1 }),
+    });
+    MockEventSource.latest().fail();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1000);
+    });
+    MockEventSource.latest().fail();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2000);
+    });
+    MockEventSource.latest().fail();
+    await flushMicro();
+    expect(result.current.transport).toBe("poll");
+    expect(result.current.state?.projectionVersion?.instanceId).toBe("inst-b");
+    expect(ids(result.current.state!.messages)).toEqual(["c1"]);
+
+    // 第二次重启（轮询期间服务再重启）：新 instance inst-c 的 GET
+    routes.thread = projection({
+      revision: 1,
+      historyToken: "v1-tok1",
+      messages: [msg("d1")],
+      projectionVersion: pv({ instanceId: "inst-c", ownerEpoch: 1, revision: 1, localSeq: 1 }),
+    });
+    // 第一拍：跨 instance 拒绝在先（有界再武装的计数拍），视图仍停在 inst-b
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(CODEX_THREAD_POLL_MS);
+    });
+    expect(result.current.state?.projectionVersion?.instanceId).toBe("inst-b");
+    // 第二拍：再武装补票后的 GET 必须确立新 instance（旧实现此处永远拒绝）
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(CODEX_THREAD_POLL_MS);
+    });
+    expect(result.current.state?.projectionVersion?.instanceId).toBe("inst-c");
+    expect(ids(result.current.state!.messages)).toEqual(["d1"]);
+  });
+
+  // C01（收口复审）：RTT 大于轮询周期时的稳定饥饿——旧实现里每个**过期在途请求**
+  // 的跨 instance 拒绝都会补一张新票，把正确在途请求持有的票作废；RTT 4.5s >
+  // 周期 3s 时流水线里永远有过期请求，新票永远被更新的票取代 → 永锁旧 instance。
+  // 修复后：存在**未消费有效票**时拒绝不再补票——补票后发出的请求必然能消费它。
+  it("c01_slow_poll_never_starves：RTT 4.5s > 周期 3s 的连续重叠请求仍能确立新 instance", async () => {
+    installFetch();
+    const { result } = renderHook(() => useCodexThread("s1", true));
+    const es = MockEventSource.latest();
+    // SSE 建立 inst-a
+    es.emit(
+      "snapshot",
+      projection({
+        revision: 3,
+        historyToken: "v1-tok1",
+        messages: [msg("b1")],
+        projectionVersion: pv({ instanceId: "inst-a", ownerEpoch: 1, revision: 3, localSeq: 2 }),
+      })
+    );
+    await act(async () => {});
+
+    // 降级 poll（发 T1）→ 首个 GET 确立 inst-b（消费 T1）
+    routes.thread = projection({
+      revision: 2,
+      historyToken: "v1-tok1",
+      messages: [msg("c1")],
+      projectionVersion: pv({ instanceId: "inst-b", ownerEpoch: 1, revision: 2, localSeq: 1 }),
+    });
+    MockEventSource.latest().fail();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1000);
+    });
+    MockEventSource.latest().fail();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2000);
+    });
+    MockEventSource.latest().fail();
+    await flushMicro();
+    expect(result.current.transport).toBe("poll");
+    expect(result.current.state?.projectionVersion?.instanceId).toBe("inst-b");
+
+    // 服务重启到 inst-c；把 fetch 换成 RTT=4500ms 的慢实现（> 周期 3000ms——
+    // 任意时刻流水线里都有过期在途请求）。复审复现窗口 48s：旧实现在此窗口内
+    // 10+ 个成功响应都无法落地，视图永锁 inst-b。
+    routes.thread = projection({
+      revision: 1,
+      historyToken: "v1-tok1",
+      messages: [msg("d1")],
+      projectionVersion: pv({ instanceId: "inst-c", ownerEpoch: 1, revision: 1, localSeq: 1 }),
+    });
+    fetchMock.mockImplementation(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 4500));
+      return new Response(JSON.stringify(routes.thread), { status: 200 });
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(48_000);
+    });
+    expect(result.current.state?.projectionVersion?.instanceId).toBe(
+      "inst-c",
+      "48s 内必须确立新 instance（过期拒绝不得作废未消费票）"
+    );
+    expect(ids(result.current.state!.messages)).toEqual(["d1"]);
+  });
+
+  // R03 反例 D：降级后重叠的两个 GET 都捕获到同一次握手授权——B 先到确立新
+  // instance（授权应随建立消费），A 迟到不得再借同一授权把旧 instance 装回
+  //（同 historyToken 时旧世界的更高 revision 会赢过新世界的低 revision）。
+  it("overlapping_handshake_gets_first_wins：两个握手 GET 同 token，B 先确立新 instance 后 A 迟到不得装回", async () => {
+    installFetch();
+    const { result } = renderHook(() => useCodexThread("s1", true));
+    const es = MockEventSource.latest();
+    // 旧服务实例 inst-a 的 SSE 基线落地
+    es.emit(
+      "snapshot",
+      projection({
+        revision: 3,
+        historyToken: "v1-tok1",
+        messages: [msg("b1")],
+        projectionVersion: pv({ instanceId: "inst-a", ownerEpoch: 1, revision: 3, localSeq: 2 }),
+      })
+    );
+    await act(async () => {});
+
+    // 降级：首个 poll GET（A，将迟到返回旧世界的更高 revision）挂起
+    routes.threadHang = true;
+    MockEventSource.latest().fail();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1000);
+    });
+    MockEventSource.latest().fail();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2000);
+    });
+    MockEventSource.latest().fail();
+    await flushMicro();
+    expect(result.current.transport).toBe("poll");
+    const releaseA = releaseThread!;
+
+    // 手动刷新（B，新 instance 响应）与 A 重叠发出
+    let pendingB!: Promise<void>;
+    await act(async () => {
+      pendingB = result.current.refresh();
+      await Promise.resolve();
+    });
+    const releaseB = releaseThread!;
+
+    // B 先到：确立新 instance inst-b
+    routes.threadHang = false;
+    await act(async () => {
+      releaseB(
+        projection({
+          revision: 2,
+          historyToken: "v1-tok1",
+          messages: [msg("c1")],
+          projectionVersion: pv({
+            instanceId: "inst-b",
+            ownerEpoch: 1,
+            revision: 2,
+            localSeq: 1,
+          }),
+        })
+      );
+      await pendingB;
+    });
+    expect(result.current.state?.projectionVersion?.instanceId).toBe("inst-b");
+
+    // A 迟到：同 token、revision 更高（20 > 2）但属于旧 instance inst-a
+    // → 不得借 B 消费前的握手授权装回（装回后会反过来拒绝 B 的新世界）
+    await act(async () => {
+      releaseA(
+        projection({
+          revision: 20,
+          historyToken: "v1-tok1",
+          messages: [msg("old-world")],
+          projectionVersion: pv({
+            instanceId: "inst-a",
+            ownerEpoch: 1,
+            revision: 20,
+            localSeq: 99,
+          }),
+        })
+      );
+    });
+    await flushMicro();
+    expect(result.current.state?.projectionVersion?.instanceId).toBe("inst-b");
+    expect(ids(result.current.state!.messages)).toEqual(["c1"]);
   });
 });
