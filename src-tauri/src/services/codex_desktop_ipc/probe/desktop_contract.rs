@@ -14,7 +14,8 @@
 //!
 //! 当前规则覆盖：start-turn v2、submit-user-input v1、command/file decision v1、
 //! interrupt v4 + expectedTurnId、异步 Question 信封（`questionItemId` 合成规则与
-//! 单条 min(1) 解析）。本阶段不识别 steer（明确不接入答题路径）。
+//! 单条 min(1) 解析；标记绑定／schema／守卫按**引用关系**核验，压缩器改局部名不失配，
+//! 见 [`async_answer_envelope_structure`]）。本阶段不识别 steer（明确不接入答题路径）。
 
 use std::collections::BTreeMap;
 use std::io::Read;
@@ -469,16 +470,26 @@ fn collect_entries(directory: &serde_json::Value) -> Vec<AsarEntry> {
 // 结构匹配器（有限词法，按操作独立）
 // ============================================================
 
-/// 单操作的识别规则：版本表项 + 若干必须同时出现的结构字面。
+/// 单操作的识别规则：版本表项 + 若干必须同时出现的结构字面 + 可选结构核验。
 struct OperationRule {
     operation: CodexOperation,
     method: &'static str,
     base_version: u32,
+    /// 必须逐字出现的片段：**只放协议常量与方法级形状**，不放压缩器产物。
     requires: &'static [&'static str],
+    /// 字面之外的引用关系核验（标识符可任意一致改名）；`None` = 只看字面。
+    structural: Option<fn(&str) -> bool>,
     request_rule: &'static str,
     response_rule: &'static str,
     semantic_rule: &'static str,
 }
+
+/// 异步答题信封的开/闭标记（协议常量）。`slice(34,-35)` 里的 34／35 就是二者长度：
+/// Desktop 用它们裁掉标记取 JSON 正文，所以切片数字与标记绑在一起核验。
+const ASYNC_OPEN_MARKER: &str = "<send_user_message_question_reply>";
+const ASYNC_CLOSE_MARKER: &str = "</send_user_message_question_reply>";
+/// `questionItemId` 合成的首元素（协议常量）。
+const ASYNC_QUESTION_ID_TAG: &str = "request_user_input_async";
 
 /// 当前规则版本下的全部识别规则。
 ///
@@ -494,6 +505,7 @@ const RULES: &[OperationRule] = &[
             "startTurn(t.params.conversationId,t.params.turnStart)",
             "{method:t.method,result:{result:",
         ],
+        structural: None,
         request_rule: "conversationId+turnStart",
         response_rule: "result.result",
         semantic_rule: "start-turn v2 承载普通消息",
@@ -507,6 +519,7 @@ const RULES: &[OperationRule] = &[
             "replyWithCommandExecutionApprovalDecision(t.params.conversationId,t.params.requestId,t.params.decision)",
             "{method:t.method,result:{ok:!0}}",
         ],
+        structural: None,
         request_rule: "conversationId+requestId+decision",
         response_rule: "ok",
         semantic_rule: "command decision v1",
@@ -520,6 +533,7 @@ const RULES: &[OperationRule] = &[
             "replyWithFileChangeApprovalDecision(t.params.conversationId,t.params.requestId,t.params.decision)",
             "{method:t.method,result:{ok:!0}}",
         ],
+        structural: None,
         request_rule: "conversationId+requestId+decision",
         response_rule: "ok",
         semantic_rule: "file decision v1",
@@ -533,6 +547,7 @@ const RULES: &[OperationRule] = &[
             "replyWithUserInputResponse(t.params.conversationId,t.params.requestId,t.params.response)",
             "{method:t.method,result:{ok:!0}}",
         ],
+        structural: None,
         request_rule: "conversationId+requestId+response",
         response_rule: "ok",
         semantic_rule: "blocking user-input v1",
@@ -541,21 +556,23 @@ const RULES: &[OperationRule] = &[
         operation: CodexOperation::AsyncAnswerIdle,
         method: "thread-follower-start-turn",
         base_version: 2,
+        // 2026-10-28：Desktop 26.1023.51421 只把压缩器局部名改了（`uxe/dxe/r.P` →
+        // `_Se/vSe/r.L`），旧规则把这些名字当契约而失配。这里只留协议常量；标记绑定、
+        // zod 访问器、守卫接收者、handler 形参由 [`async_answer_envelope_structure`]
+        // 按引用关系认。
         requires: &[
             "<send_user_message_question_reply>",
             "</send_user_message_question_reply>",
             "JSON.stringify([\"request_user_input_async\",",
             "questionItemId:",
-            "question:r.P(),answer:r.P()",
             ".min(1)",
-            "startsWith(uxe)",
-            "endsWith(dxe)",
             "slice(34,-35)",
-            "startTurn(t.params.conversationId,t.params.turnStart)",
+            "case\"thread-follower-start-turn\":",
         ],
+        structural: Some(async_answer_envelope_structure),
         request_rule: "conversationId+turnStart{text=envelope[questionItemId,question,answer]}",
         response_rule: "result.result",
-        semantic_rule: "questionItemId=JSON.stringify([\"request_user_input_async\",itemId,index]);answers=min(1)",
+        semantic_rule: "questionItemId=JSON.stringify([\"request_user_input_async\",item,index])（形参按序;第二元素=map源(<Q>.questions??[])同接收者的原条目.id;第三元素=map index）;answers=min(1)数组∪恒等transform;三字段同一字符串构造（字符串专有组合子证人）;守卫if(!…||!…)失败即返回+try{let <局部>=直接解析（同接收者）",
     },
     OperationRule {
         operation: CodexOperation::Interrupt,
@@ -567,20 +584,429 @@ const RULES: &[OperationRule] = &[
             "expectedTurnId",
             "interruptedTurnId:",
         ],
+        structural: None,
         request_rule: "conversationId+mode+expectedTurnId",
         response_rule: "interruptedTurnId+ok",
         semantic_rule: "interrupt v4 要求 expectedTurnId（不降级 v3）",
     },
 ];
 
-/// 归一化：去全部空白、模板反引号统一成双引号。
+/// 归一化：去空白、模板反引号统一成双引号；**相邻两个标识符字符之间的空白保留一个
+/// 空格**（`var _Se=` / `return null` 的词法边界不能被抹掉，否则向前读绑定名会把
+/// 关键字黏进来）。
 ///
 /// 让匹配对打包器的压缩/美化都不敏感；结构化规则本身要求**形状**而非"关键词出现"。
 fn normalize(js: &str) -> String {
-    js.chars()
-        .filter(|c| !c.is_whitespace())
-        .map(|c| if c == '`' { '"' } else { c })
-        .collect()
+    let mut out = String::with_capacity(js.len());
+    let mut pending_space = false;
+    for c in js.chars() {
+        if c.is_whitespace() {
+            pending_space = true;
+            continue;
+        }
+        if pending_space {
+            if is_ident_char(c) && out.chars().next_back().is_some_and(is_ident_char) {
+                out.push(' ');
+            }
+            pending_space = false;
+        }
+        out.push(if c == '`' { '"' } else { c });
+    }
+    out
+}
+
+// ---------- 有限词法：标识符与引用关系（只服务结构核验，不是 JS 解析器） ----------
+
+fn is_ident_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_' || c == '$'
+}
+
+fn is_ident_start(c: char) -> bool {
+    c.is_alphabetic() || c == '_' || c == '$'
+}
+
+/// 从 `at` 起读一个标识符，返回 `(标识符, 结束偏移)`。
+fn ident_at(hay: &str, at: usize) -> Option<(&str, usize)> {
+    let mut chars = hay[at..].char_indices();
+    let (_, first) = chars.next()?;
+    if !is_ident_start(first) {
+        return None;
+    }
+    let mut end = at + first.len_utf8();
+    for (offset, c) in chars {
+        if !is_ident_char(c) {
+            break;
+        }
+        end = at + offset + c.len_utf8();
+    }
+    Some((&hay[at..end], end))
+}
+
+/// 从 `at` 起读一条成员链 `a.b.c`，返回 `(链文本, 结束偏移)`。
+fn member_chain_at(hay: &str, at: usize) -> Option<(&str, usize)> {
+    let (_, mut end) = ident_at(hay, at)?;
+    while hay[end..].starts_with('.') {
+        match ident_at(hay, end + 1) {
+            Some((_, next)) => end = next,
+            None => break,
+        }
+    }
+    Some((&hay[at..end], end))
+}
+
+/// 从 `at` 起读 `a.b.c()`（成员链 + 空参调用），返回 `(调用文本, 结束偏移)`。
+fn nullary_call_at(hay: &str, at: usize) -> Option<(&str, usize)> {
+    let (_, end) = member_chain_at(hay, at)?;
+    hay[end..]
+        .starts_with("()")
+        .then(|| (&hay[at..end + 2], end + 2))
+}
+
+/// 向前读 `end` 之前的标识符（`end` 处是标识符后的第一个字符），返回其起始偏移。
+/// 起始处的词法边界由"再往前不是标识符字符"保证。
+fn ident_before(hay: &str, end: usize) -> Option<usize> {
+    let mut start = end;
+    for (offset, c) in hay[..end].char_indices().rev() {
+        if !is_ident_char(c) {
+            break;
+        }
+        start = offset;
+    }
+    (start < end && hay[start..].chars().next().is_some_and(is_ident_start)).then_some(start)
+}
+
+/// 向前读 `end` 之前的成员链 `a.b.c`，返回其起始偏移。
+fn member_chain_before(hay: &str, end: usize) -> Option<usize> {
+    let mut start = end;
+    for (offset, c) in hay[..end].char_indices().rev() {
+        if !(is_ident_char(c) || c == '.') {
+            break;
+        }
+        start = offset;
+    }
+    (start < end).then_some(start)
+}
+
+/// 从 `from` 起最多 `len` 字节的窗口（退到字符边界）。
+fn window(hay: &str, from: usize, len: usize) -> &str {
+    let mut end = (from + len).min(hay.len());
+    while !hay.is_char_boundary(end) {
+        end -= 1;
+    }
+    &hay[from..end]
+}
+
+/// 所有形如 `IDENT=<literal>` 的绑定名（`literal` 已含引号；IDENT 前必须是词法边界）。
+fn bindings_of_literal<'a>(hay: &'a str, literal: &str) -> Vec<&'a str> {
+    let needle = format!("={literal}");
+    let mut out: Vec<&str> = hay
+        .match_indices(&needle)
+        .filter_map(|(eq, _)| ident_before(hay, eq).map(|start| &hay[start..eq]))
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// zod 字符串 schema **专有**的组合子（数组／数字／对象 schema 上不存在）。用来证明三字段
+/// 共用的构造链确实是字符串构造，而不写死它的压缩名：同一条链在包内别处被这些组合子
+/// 修饰（`r.L().trim(`），改名时链与证人一起变。
+const STRING_ONLY_COMBINATORS: &[&str] = &[
+    "trim",
+    "regex",
+    "url",
+    "email",
+    "uuid",
+    "startsWith",
+    "endsWith",
+    "includes",
+    "datetime",
+    "toLowerCase",
+    "toUpperCase",
+];
+
+/// 守卫与解析必须是**同一条引用链**，且只接受已观测的分支形态：
+/// `if(!R.startsWith(O)||!R.endsWith(C))return null;`——负向检查失败即返回（两版观测
+/// 包都只有这一形态；不保留肯定形分支）。解析必须紧跟已观测的直接语法
+/// `;try{let <局部名>=E.safeParse(JSON.parse(R.slice(34,-35)))`：守卫到解析之间**只
+/// 允许这一段**（局部名可一致改名），不出现任何其他语句——嵌套/箭头函数、改道返回、
+/// 未调用包装全部无处容身。返回所有这样的信封 schema 名 `E`。
+fn guarded_parse_schemas<'a>(hay: &'a str, opens: &[&str], closes: &[&str]) -> Vec<&'a str> {
+    let slice = format!(
+        ".slice({},-{})))",
+        ASYNC_OPEN_MARKER.len(),
+        ASYNC_CLOSE_MARKER.len()
+    );
+    let mut out = Vec::new();
+    for open in opens {
+        let starts = format!(".startsWith({open})");
+        for (dot, _) in hay.match_indices(&starts) {
+            let Some(r_start) = ident_before(hay, dot) else {
+                continue;
+            };
+            // 已观测形态：守卫以 `if(!` 开头——负向检查，失败即返回。
+            if !hay[..r_start].ends_with("if(!") {
+                continue;
+            }
+            let receiver = &hay[r_start..dot];
+            let after = dot + starts.len();
+            let Some(guard_end) = closes.iter().find_map(|close| {
+                let tail = format!("||!{receiver}.endsWith({close}))return null;");
+                hay[after..]
+                    .starts_with(&tail)
+                    .then_some(after + tail.len())
+            }) else {
+                continue;
+            };
+            let scope = window(hay, guard_end, 256);
+            let parse = format!(".safeParse(JSON.parse({receiver}{slice}");
+            for (pos, _) in scope.match_indices(&parse) {
+                let Some(e_start) = ident_before(scope, pos) else {
+                    continue;
+                };
+                if observed_parse_gap(&scope[..e_start]) {
+                    out.push(&scope[e_start..pos]);
+                }
+            }
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// 守卫结束到解析之间必须是已观测的直接解析语句开头 `try{let <局部名>=`（守卫尾的
+/// `return null;` 已随守卫一并钉死）——局部名可一致改名；其它任何间隔
+/// （`let dead=r=>…`、`function dead(…)`、额外 `return`、直接裸调用等）都是未观测
+/// 形态，拒绝。
+fn observed_parse_gap(gap: &str) -> bool {
+    let Some(rest) = gap.strip_prefix("try{let ") else {
+        return false;
+    };
+    let Some((_, end)) = ident_at(rest, 0) else {
+        return false;
+    };
+    rest[end..].starts_with('=') && rest[end + 1..].is_empty()
+}
+
+/// 条目 schema：`I=<callee>({questionItemId:T,question:T,answer:T})`，三字段的空参
+/// 类型构造 `T` 必须**完全相同**。返回所有 `(I, T)`；`T` 是否为字符串构造由
+/// [`string_schema_witness`] 另证。
+fn item_schema_bindings(hay: &str) -> Vec<(&str, &str)> {
+    const HEAD: &str = "{questionItemId:";
+    let mut out = Vec::new();
+    for (brace, _) in hay.match_indices(HEAD) {
+        let Some((ty, after_first)) = nullary_call_at(hay, brace + HEAD.len()) else {
+            continue;
+        };
+        let tail = format!(",question:{ty},answer:{ty}}}");
+        if !hay[after_first..].starts_with(&tail) {
+            continue;
+        }
+        // `(` ← callee 链 ← `=` ← 绑定名
+        if !hay[..brace].ends_with('(') {
+            continue;
+        }
+        let Some(callee) = member_chain_before(hay, brace - 1) else {
+            continue;
+        };
+        if !hay[..callee].ends_with('=') {
+            continue;
+        }
+        if let Some(start) = ident_before(hay, callee - 1) {
+            out.push((&hay[start..callee - 1], ty));
+        }
+    }
+    out
+}
+
+/// 字符串类型证人：构造链 `T`（如 `r.L()`）在包内别处紧跟字符串专有组合子（`r.L().trim(`）。
+/// 没有证人 → 字段类型不可证 → 不匹配（不猜）。
+fn string_schema_witness(hay: &str, ty: &str) -> bool {
+    STRING_ONLY_COMBINATORS.iter().any(|combinator| {
+        let needle = format!("{ty}.{combinator}(");
+        hay.match_indices(&needle)
+            .any(|(idx, _)| idx == 0 || !hay[..idx].chars().next_back().is_some_and(is_ident_char))
+    })
+}
+
+/// 信封 schema：`E=<callee>([<callee>(I).min(1),I.transform(p=>[p])])`——数组至少一条，
+/// 或单条经**恒等包装**成唯一元素数组（回调 `p=>[p]`／`(p)=>[p]`，且是数组最后一个成员）。
+/// 返回所有 `E`。
+fn envelope_schema_bindings<'a>(hay: &'a str, item: &str) -> Vec<&'a str> {
+    let needle = format!("({item}).min(1),{item}.transform(");
+    let mut out = Vec::new();
+    for (paren, _) in hay.match_indices(&needle) {
+        if !identity_wrap_at(hay, paren + needle.len()) {
+            continue;
+        }
+        // `(` ← 内层 callee 链 ← `[` ← `(` ← 外层 callee 链 ← `=` ← 绑定名
+        let Some(inner) = member_chain_before(hay, paren) else {
+            continue;
+        };
+        if !hay[..inner].ends_with("([") {
+            continue;
+        }
+        let Some(outer) = member_chain_before(hay, inner - 2) else {
+            continue;
+        };
+        if !hay[..outer].ends_with('=') {
+            continue;
+        }
+        if let Some(start) = ident_before(hay, outer - 1) {
+            out.push(&hay[start..outer - 1]);
+        }
+    }
+    out
+}
+
+/// `p=>[p])])` 或 `(p)=>[p])])`：transform 回调把入参包成唯一元素数组，并结束信封数组。
+fn identity_wrap_at(hay: &str, at: usize) -> bool {
+    let callback = if hay[at..].starts_with('(') {
+        ident_at(hay, at + 1)
+            .filter(|(_, end)| hay[*end..].starts_with(')'))
+            .map(|(param, end)| (param, end + 1))
+    } else {
+        ident_at(hay, at)
+    };
+    callback.is_some_and(|(param, end)| hay[end..].starts_with(&format!("=>[{param}])])")))
+}
+
+/// 题目标识合成的**参数关系**（不止看 tag 与两个变量共现）：
+/// * 定义：`function F(P1,P2){return JSON.stringify(["request_user_input_async",P1,P2])`——
+///   数组第二／三元素必须按序就是两个形参，且 `P1≠P2`；
+/// * 调用：`.map((X,N)=>F(ARG,N))`——第三元素来自 map 回调的 index 形参 `N`，第二元素来自
+///   条目侧表达式（≠N、不派生于 N）。
+fn question_id_synthesis_bound(hay: &str) -> bool {
+    const RET: &str = "{return ";
+    let needle = format!("JSON.stringify([\"{ASYNC_QUESTION_ID_TAG}\",");
+    hay.match_indices(&needle).any(|(idx, _)| {
+        let Some((p1, e1)) = ident_at(hay, idx + needle.len()) else {
+            return false;
+        };
+        if !hay[e1..].starts_with(',') {
+            return false;
+        }
+        let Some((p2, e2)) = ident_at(hay, e1 + 1) else {
+            return false;
+        };
+        if p1 == p2 || !hay[e2..].starts_with("])") {
+            return false;
+        }
+        if !hay[..idx].ends_with(RET) {
+            return false;
+        }
+        let ret = idx - RET.len();
+        let params = format!("({p1},{p2})");
+        if !hay[..ret].ends_with(&params) {
+            return false;
+        }
+        let params_at = ret - params.len();
+        let Some(f_start) = ident_before(hay, params_at) else {
+            return false;
+        };
+        if !hay[..f_start].ends_with("function ") {
+            return false;
+        }
+        callsite_passes_index(hay, &hay[f_start..params_at])
+    })
+}
+
+/// `.map((X,N)=>F(ARG,N))`：第二实参正是 map 回调的 index 形参 `N`；第一实参必须是
+/// **本 `.map` 的源集合所属条目**的 `.id`——只支持已观测的 map 源形态
+/// `(<Q>.questions??[]).map(...)`，`Q` 与 `.id` 的接收者做**完整成员链比较**（形参名
+/// 无关）。`ge.questions` 含 `e.questions` 子串不算；窗口内别处出现的 `.questions`
+/// 也不算来源。`.type`／`.turnId`、map 子项自己的 `.id`、无关对象的 `.id` 一律拒绝。
+fn callsite_passes_index(hay: &str, f: &str) -> bool {
+    const HEAD: &str = ".map((";
+    hay.match_indices(HEAD).any(|(idx, _)| {
+        let Some((_, e_x)) = ident_at(hay, idx + HEAD.len()) else {
+            return false;
+        };
+        if !hay[e_x..].starts_with(',') {
+            return false;
+        }
+        let Some((index, e_n)) = ident_at(hay, e_x + 1) else {
+            return false;
+        };
+        let call = format!(")=>{f}(");
+        if !hay[e_n..].starts_with(&call) {
+            return false;
+        }
+        let Some((arg, e_arg)) = member_chain_at(hay, e_n + call.len()) else {
+            return false;
+        };
+        if arg == index || arg.starts_with(&format!("{index}.")) {
+            return false;
+        }
+        if !hay[e_arg..].starts_with(&format!(",{index}))")) {
+            return false;
+        }
+        // 第一实参 = 原条目 `.id`，且 map 源就是 `(<该条目>.questions??[])`（完整相等）。
+        let Some(item) = arg.strip_suffix(".id") else {
+            return false;
+        };
+        if item.is_empty() || !item.chars().next().is_some_and(is_ident_start) {
+            return false;
+        }
+        window_before(hay, idx, 64).ends_with(&format!("({item}.questions??[])"))
+    })
+}
+
+/// `end` 之前最多 `len` 字节的窗口（退到字符边界）。
+fn window_before(hay: &str, end: usize, len: usize) -> &str {
+    let mut start = end.saturating_sub(len);
+    while !hay.is_char_boundary(start) {
+        start -= 1;
+    }
+    &hay[start..end]
+}
+
+/// 承载 handler：`startTurn(<p>.params.conversationId,<p>.params.turnStart)`，形参名无关。
+fn start_turn_carrier_present(hay: &str) -> bool {
+    const HEAD: &str = "startTurn(";
+    hay.match_indices(HEAD).any(|(idx, _)| {
+        ident_at(hay, idx + HEAD.len()).is_some_and(|(param, end)| {
+            hay[end..].starts_with(&format!(".params.conversationId,{param}.params.turnStart)"))
+        })
+    })
+}
+
+/// 异步答题信封的结构核验（标识符可任意一致改名；结构或语义一变即拒绝）：
+///
+/// 1. 开/闭标记各绑定到某个标识符；只接受已观测的守卫分支 `if(!R.startsWith(O)||
+///    !R.endsWith(C))return null;`，其后只允许已观测的直接解析语句
+///    `try{let <局部名>=E.safeParse(JSON.parse(R.slice(34,-35)))`（同接收者；无任何
+///    其他间隔——嵌套/箭头函数、改道返回无处容身）；
+/// 2. 条目 schema 三字段同一空参构造，且该构造链有字符串专有组合子证人；
+/// 3. 信封 schema 由该条目 schema 组成（`min(1)` 数组 ∪ 恒等 transform `p=>[p]`），
+///    并且正是第 1 条解析链用的 schema；
+/// 4. `questionItemId` 由生成函数两个形参按序合成，调用点第二元素是 map 源
+///    `(<Q>.questions??[])` 同接收者原条目的 `.id`、第三元素是 map index；
+/// 5. 承载 handler 仍是 `startTurn(conversationId, turnStart)`。
+///
+/// 证据覆盖范围：以上全是有限词法上的引用关系，不是 JS 求值。数组／联合构造只核"接受
+/// 条目 schema 且 `.min(1)`"与两分支外形，同形的 tuple 等角色无法词法区分；字段顺序、
+/// 守卫写法（非观测形态）、生成函数改箭头或内联、调用点不走 `.map((x,i)=>…)` 都会被
+/// 拒绝而非放行，需复探后再登记。字符串证人是"有限规则下的佐证"，不承诺完整符号解析。
+fn async_answer_envelope_structure(hay: &str) -> bool {
+    let open = format!("\"{ASYNC_OPEN_MARKER}\"");
+    let close = format!("\"{ASYNC_CLOSE_MARKER}\"");
+    let opens = bindings_of_literal(hay, &open);
+    let closes = bindings_of_literal(hay, &close);
+    let parsers = guarded_parse_schemas(hay, &opens, &closes);
+    if parsers.is_empty() {
+        return false;
+    }
+    let envelope_ok = item_schema_bindings(hay)
+        .into_iter()
+        .filter(|(_, ty)| string_schema_witness(hay, ty))
+        .any(|(item, _)| {
+            envelope_schema_bindings(hay, item)
+                .iter()
+                .any(|envelope| parsers.contains(envelope))
+        });
+    envelope_ok && question_id_synthesis_bound(hay) && start_turn_carrier_present(hay)
 }
 
 /// 方法版本表里的值（要求唯一；出现 `"method":` 但值是其它形态的忽略）。
@@ -629,6 +1055,9 @@ fn match_operations(candidates: &[(String, String)]) -> BTreeMap<CodexOperation,
         if !rule.requires.iter().all(|needle| hay.contains(needle)) {
             continue;
         }
+        if rule.structural.is_some_and(|check| !check(&hay)) {
+            continue;
+        }
         matches.insert(
             rule.operation,
             ContractMatch {
@@ -668,9 +1097,18 @@ mod tests {
         "../../../../tests/fixtures/codex-desktop-ipc/observed/20261026-macos/contract-fragments/start-turn-request.js"
     );
 
+    /// 26.1021 包已不可得：题目标识调用点与字符串 schema 证人按 26.1023 观测形态合成
+    /// （见 `synthetic/20261026-macos-completions/README.md`），只用于旧夹具规则回归。
+    const SYNTHETIC_CALLSITE_20261026: &str = include_str!(
+        "../../../../tests/fixtures/codex-desktop-ipc/synthetic/20261026-macos-completions/question-id-callsite.synthetic.js"
+    );
+    const SYNTHETIC_STRING_WITNESS_20261026: &str = include_str!(
+        "../../../../tests/fixtures/codex-desktop-ipc/synthetic/20261026-macos-completions/string-schema-witness.synthetic.js"
+    );
+
     fn main_fixture_js() -> String {
         format!(
-            "{START_TURN_HANDLER}\n{DECISION_HANDLERS}\n{INTERRUPT_HANDLER}\n{ASYNC_ENVELOPE}\n{START_TURN_REQUEST}\n"
+            "{START_TURN_HANDLER}\n{DECISION_HANDLERS}\n{INTERRUPT_HANDLER}\n{ASYNC_ENVELOPE}\n{SYNTHETIC_CALLSITE_20261026}\n{SYNTHETIC_STRING_WITNESS_20261026}\n{START_TURN_REQUEST}\n"
         )
     }
 
@@ -1097,6 +1535,653 @@ mod tests {
                 matched.request_rule
             );
             assert!(!matched.semantic_rule.is_empty());
+        }
+    }
+
+    // ===== 2026-10-28 异步答题结构识别（重命名容忍）=====
+    //
+    // 现场：Desktop 26.1023.51421 只把压缩器局部名改了（uxe/dxe/r.P → _Se/vSe/r.L），
+    // 协议常量、字段名、题目标识合成、min(1)、slice(34,-35)、守卫引用关系全部未变，
+    // 旧规则却因为把局部名当契约而失配。下列用例只走 `read` 黑盒：一致重命名必须仍
+    // 匹配，真正的结构/语义漂移必须拒绝，且每个拒绝用例都用 CommandApproval 作对照
+    // （证明包被正常读取，只是本项被拒）。
+
+    const VERSION_TABLE_20261028: &str = include_str!(
+        "../../../../tests/fixtures/codex-desktop-ipc/observed/20261028-macos/contract-fragments/version-table.js"
+    );
+    const START_TURN_HANDLER_20261028: &str = include_str!(
+        "../../../../tests/fixtures/codex-desktop-ipc/observed/20261028-macos/contract-fragments/start-turn-handler.js"
+    );
+    const DECISION_HANDLERS_20261028: &str = include_str!(
+        "../../../../tests/fixtures/codex-desktop-ipc/observed/20261028-macos/contract-fragments/decision-and-user-input-handlers.js"
+    );
+    const INTERRUPT_HANDLER_20261028: &str = include_str!(
+        "../../../../tests/fixtures/codex-desktop-ipc/observed/20261028-macos/contract-fragments/interrupt-handler.js"
+    );
+    const ASYNC_ENVELOPE_20261028: &str = include_str!(
+        "../../../../tests/fixtures/codex-desktop-ipc/observed/20261028-macos/contract-fragments/async-envelope.js"
+    );
+    const START_TURN_REQUEST_20261028: &str = include_str!(
+        "../../../../tests/fixtures/codex-desktop-ipc/observed/20261028-macos/contract-fragments/start-turn-request.js"
+    );
+    /// 题目标识生成函数的调用点：`map((t,n)=>bSe(e.id,n))`——第三元素来自 index 形参。
+    const QUESTION_ID_CALLSITE_20261028: &str = include_str!(
+        "../../../../tests/fixtures/codex-desktop-ipc/observed/20261028-macos/contract-fragments/question-id-callsite.js"
+    );
+    /// 字符串 schema 证人：三字段共用的构造 `r.L()` 在包内别处被字符串专有组合子修饰。
+    const STRING_WITNESS_20261028: &str = include_str!(
+        "../../../../tests/fixtures/codex-desktop-ipc/observed/20261028-macos/contract-fragments/string-schema-witness.js"
+    );
+
+    /// 20261028 主进程片段拼接（可替换 start-turn handler 与异步信封做单点突变；
+    /// 调用点与证人取观测原文）。
+    fn main_js_20261028(handler: &str, envelope: &str) -> String {
+        main_js_20261028_with(
+            handler,
+            envelope,
+            QUESTION_ID_CALLSITE_20261028,
+            STRING_WITNESS_20261028,
+        )
+    }
+
+    fn main_js_20261028_with(
+        handler: &str,
+        envelope: &str,
+        callsite: &str,
+        witness: &str,
+    ) -> String {
+        format!(
+            "{handler}\n{DECISION_HANDLERS_20261028}\n{INTERRUPT_HANDLER_20261028}\n{envelope}\n{callsite}\n{witness}\n{START_TURN_REQUEST_20261028}\n"
+        )
+    }
+
+    fn evidence_20261028(
+        dir: &Path,
+        name: &str,
+        main_js: &str,
+        table_js: &str,
+    ) -> DesktopContractEvidence {
+        let package = dir.join(name);
+        write_asar(
+            &package,
+            &[
+                ("/.vite/build/main-fixture.js", main_js),
+                ("/.vite/build/src-fixture.js", table_js),
+            ],
+        );
+        read(&package, "26.1023.51421").expect("20261028 evidence")
+    }
+
+    /// 单点突变：锚点必须命中，否则用例是没改到东西的假阳性。
+    fn mutate(source: &str, from: &str, to: &str) -> String {
+        assert!(source.contains(from), "mutation anchor missing: {from}");
+        source.replace(from, to)
+    }
+
+    fn assert_async_rejected_but_package_read(evidence: &DesktopContractEvidence, what: &str) {
+        assert!(
+            !evidence.matched(CodexOperation::AsyncAnswerIdle),
+            "{what}: 真漂移必须拒绝 AsyncAnswerIdle"
+        );
+        assert!(
+            evidence.matched(CodexOperation::CommandApproval),
+            "{what}: 包应被正常读取（对照项 CommandApproval 仍匹配）"
+        );
+    }
+
+    /// 当前安装包（26.1023.51421）的片段必须识别出全部六项，异步答题仍走 start-turn v2。
+    #[test]
+    fn async_contract_current_build_26_1023_51421_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        let evidence = evidence_20261028(
+            dir.path(),
+            "current.asar",
+            &main_js_20261028(START_TURN_HANDLER_20261028, ASYNC_ENVELOPE_20261028),
+            VERSION_TABLE_20261028,
+        );
+        for op in [
+            CodexOperation::Send,
+            CodexOperation::CommandApproval,
+            CodexOperation::FileChangeApproval,
+            CodexOperation::BlockingInput,
+            CodexOperation::AsyncAnswerIdle,
+            CodexOperation::Interrupt,
+        ] {
+            assert!(evidence.matched(op), "26.1023.51421 missing {op:?}");
+        }
+        assert_eq!(
+            evidence.matches[&CodexOperation::AsyncAnswerIdle].base_version,
+            2
+        );
+    }
+
+    /// 压缩器把所有局部名再改一轮（含 zod 访问器、守卫接收者、handler 形参、生成函数名、
+    /// 证人里的同一构造链）→ 仍匹配。不断言 Send：它的字面规则不在本次范围，形参改名后可能失配。
+    #[test]
+    fn async_contract_consistent_identifier_renames_still_match() {
+        let renames: &[(&str, &str)] = &[
+            ("_Se", "openTag"),
+            ("vSe", "closeTag"),
+            (",ey=", ",itemSchema="),
+            ("(ey)", "(itemSchema)"),
+            ("ey.transform", "itemSchema.transform"),
+            (",ySe=", ",envelopeSchema="),
+            ("ySe.safeParse", "envelopeSchema.safeParse"),
+            ("r.M(", "zod.object("),
+            ("r.L()", "zod.str()"),
+            ("r.B(", "zod.union("),
+            ("r.v(", "zod.array("),
+            ("bSe", "makeQuestionItemId"),
+            ("xSe", "parseReplyEnvelope"),
+            ("r=(n===-1", "body=(n===-1"),
+            ("!r.startsWith", "!body.startsWith"),
+            ("!r.endsWith", "!body.endsWith"),
+            ("JSON.parse(r.slice", "JSON.parse(body.slice"),
+        ];
+        let mut envelope = ASYNC_ENVELOPE_20261028.to_string();
+        for (from, to) in renames {
+            envelope = mutate(&envelope, from, to);
+        }
+        assert_ne!(envelope, ASYNC_ENVELOPE_20261028);
+        // 调用点与证人跟着同一轮改名（生成函数名、对象/字符串构造链、map 形参）。
+        let callsite = mutate(
+            &mutate(QUESTION_ID_CALLSITE_20261028, "bSe", "makeQuestionItemId"),
+            "(t,n)=>",
+            "(item,idx)=>",
+        )
+        .replace("e.id,n)", "e.id,idx)");
+        assert!(callsite.contains("makeQuestionItemId(e.id,idx)"));
+        let witness = mutate(
+            &mutate(STRING_WITNESS_20261028, "r.M(", "zod.object("),
+            "r.L()",
+            "zod.str()",
+        );
+        let handler = mutate(
+            &mutate(START_TURN_HANDLER_20261028, "t.params.", "req.params."),
+            "t.method",
+            "req.method",
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let evidence = evidence_20261028(
+            dir.path(),
+            "renamed.asar",
+            &main_js_20261028_with(&handler, &envelope, &callsite, &witness),
+            VERSION_TABLE_20261028,
+        );
+        assert!(
+            evidence.matched(CodexOperation::AsyncAnswerIdle),
+            "一致重命名不得导致失配: {:?}",
+            evidence.matches.keys().collect::<Vec<_>>()
+        );
+        assert!(evidence.matched(CodexOperation::CommandApproval));
+    }
+
+    #[test]
+    fn async_contract_rejects_field_type_drift() {
+        let dir = tempfile::tempdir().unwrap();
+        let envelope = mutate(ASYNC_ENVELOPE_20261028, "answer:r.L()", "answer:r.N()");
+        let evidence = evidence_20261028(
+            dir.path(),
+            "a.asar",
+            &main_js_20261028(START_TURN_HANDLER_20261028, &envelope),
+            VERSION_TABLE_20261028,
+        );
+        assert_async_rejected_but_package_read(&evidence, "字段类型不一致");
+    }
+
+    #[test]
+    fn async_contract_rejects_field_name_drift() {
+        let dir = tempfile::tempdir().unwrap();
+        let envelope = mutate(ASYNC_ENVELOPE_20261028, "answer:r.L()", "reply:r.L()");
+        let evidence = evidence_20261028(
+            dir.path(),
+            "b.asar",
+            &main_js_20261028(START_TURN_HANDLER_20261028, &envelope),
+            VERSION_TABLE_20261028,
+        );
+        assert_async_rejected_but_package_read(&evidence, "字段名改变");
+    }
+
+    #[test]
+    fn async_contract_rejects_envelope_marker_drift() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            ASYNC_ENVELOPE_20261028
+                .matches("send_user_message_question_reply")
+                .count(),
+            2
+        );
+        let envelope = ASYNC_ENVELOPE_20261028.replace(
+            "send_user_message_question_reply",
+            "send_user_message_question_reply_v2",
+        );
+        let evidence = evidence_20261028(
+            dir.path(),
+            "c.asar",
+            &main_js_20261028(START_TURN_HANDLER_20261028, &envelope),
+            VERSION_TABLE_20261028,
+        );
+        assert_async_rejected_but_package_read(&evidence, "信封标记改变");
+    }
+
+    #[test]
+    fn async_contract_rejects_start_turn_version_drift() {
+        let dir = tempfile::tempdir().unwrap();
+        let table = mutate(
+            VERSION_TABLE_20261028,
+            "\"thread-follower-start-turn\":2",
+            "\"thread-follower-start-turn\":3",
+        );
+        let evidence = evidence_20261028(
+            dir.path(),
+            "d.asar",
+            &main_js_20261028(START_TURN_HANDLER_20261028, ASYNC_ENVELOPE_20261028),
+            &table,
+        );
+        assert_async_rejected_but_package_read(&evidence, "start-turn 方法版本改变");
+        assert!(!evidence.matched(CodexOperation::Send));
+    }
+
+    #[test]
+    fn async_contract_rejects_min_count_drift() {
+        let dir = tempfile::tempdir().unwrap();
+        let envelope = mutate(ASYNC_ENVELOPE_20261028, ".min(1)", ".min(0)");
+        let evidence = evidence_20261028(
+            dir.path(),
+            "e.asar",
+            &main_js_20261028(START_TURN_HANDLER_20261028, &envelope),
+            VERSION_TABLE_20261028,
+        );
+        assert_async_rejected_but_package_read(&evidence, "min(1) 改变");
+    }
+
+    #[test]
+    fn async_contract_rejects_question_id_tag_drift() {
+        let dir = tempfile::tempdir().unwrap();
+        let envelope = mutate(
+            ASYNC_ENVELOPE_20261028,
+            "request_user_input_async",
+            "request_user_input_async_v2",
+        );
+        let evidence = evidence_20261028(
+            dir.path(),
+            "f.asar",
+            &main_js_20261028(START_TURN_HANDLER_20261028, &envelope),
+            VERSION_TABLE_20261028,
+        );
+        assert_async_rejected_but_package_read(&evidence, "题目标识前缀改变");
+    }
+
+    /// 守卫引用的不是绑定了开标记的变量（引用关系断裂）→ 拒绝，即使 `startsWith(` 仍在。
+    #[test]
+    fn async_contract_rejects_unbound_guard_reference() {
+        let dir = tempfile::tempdir().unwrap();
+        let envelope = mutate(
+            ASYNC_ENVELOPE_20261028,
+            "startsWith(_Se)",
+            "startsWith(zSe)",
+        );
+        let evidence = evidence_20261028(
+            dir.path(),
+            "g.asar",
+            &main_js_20261028(START_TURN_HANDLER_20261028, &envelope),
+            VERSION_TABLE_20261028,
+        );
+        assert_async_rejected_but_package_read(&evidence, "守卫引用未绑定标记");
+    }
+
+    #[test]
+    fn async_contract_rejects_slice_drift() {
+        let dir = tempfile::tempdir().unwrap();
+        let envelope = mutate(ASYNC_ENVELOPE_20261028, "slice(34,-35)", "slice(35,-36)");
+        let evidence = evidence_20261028(
+            dir.path(),
+            "h.asar",
+            &main_js_20261028(START_TURN_HANDLER_20261028, &envelope),
+            VERSION_TABLE_20261028,
+        );
+        assert_async_rejected_but_package_read(&evidence, "载荷切片改变");
+    }
+
+    #[test]
+    fn async_contract_rejects_carrier_param_drift() {
+        let dir = tempfile::tempdir().unwrap();
+        let handler = mutate(
+            START_TURN_HANDLER_20261028,
+            "t.params.turnStart",
+            "t.params.input",
+        );
+        let evidence = evidence_20261028(
+            dir.path(),
+            "i.asar",
+            &main_js_20261028(&handler, ASYNC_ENVELOPE_20261028),
+            VERSION_TABLE_20261028,
+        );
+        assert_async_rejected_but_package_read(&evidence, "start-turn 承载参数改变");
+    }
+
+    /// 解析用的 schema 不是绑定了 `min(1)`/`transform` 的信封 schema → 拒绝。
+    #[test]
+    fn async_contract_rejects_envelope_schema_decoupled() {
+        let dir = tempfile::tempdir().unwrap();
+        let envelope = mutate(ASYNC_ENVELOPE_20261028, "ySe.safeParse", "qSe.safeParse");
+        let evidence = evidence_20261028(
+            dir.path(),
+            "j.asar",
+            &main_js_20261028(START_TURN_HANDLER_20261028, &envelope),
+            VERSION_TABLE_20261028,
+        );
+        assert_async_rejected_but_package_read(&evidence, "信封 schema 与解析脱钩");
+    }
+
+    // ===== 2026-10-28 复审收口（S01 守卫/解析同链 · S02 题目标识参数关系 · S03 schema 语义）=====
+
+    fn envelope_evidence(dir: &Path, name: &str, envelope: &str) -> DesktopContractEvidence {
+        evidence_20261028(
+            dir,
+            name,
+            &main_js_20261028(START_TURN_HANDLER_20261028, envelope),
+            VERSION_TABLE_20261028,
+        )
+    }
+
+    /// S01：守卫前半检查 `r`，后半却检查 `other` → 被验证的不是同一输入，拒绝。
+    #[test]
+    fn async_contract_rejects_guard_receiver_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let envelope = mutate(
+            ASYNC_ENVELOPE_20261028,
+            "!r.endsWith(vSe)",
+            "!other.endsWith(vSe)",
+        );
+        let evidence = envelope_evidence(dir.path(), "s01a.asar", &envelope);
+        assert_async_rejected_but_package_read(&evidence, "守卫两半接收者不同");
+    }
+
+    /// S01：守卫检查 `r`，解析却裁切 `other` → 被解析的不是被验证的内容，拒绝。
+    #[test]
+    fn async_contract_rejects_parse_input_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let envelope = mutate(
+            ASYNC_ENVELOPE_20261028,
+            "JSON.parse(r.slice(34,-35))",
+            "JSON.parse(other.slice(34,-35))",
+        );
+        let evidence = envelope_evidence(dir.path(), "s01b.asar", &envelope);
+        assert_async_rejected_but_package_read(&evidence, "解析输入与守卫输入不同");
+    }
+
+    /// S01：守卫在一个函数里结束，解析搬进另一个同名形参的函数 → 不是同一作用域，拒绝。
+    #[test]
+    fn async_contract_rejects_guard_and_parse_in_different_functions() {
+        let dir = tempfile::tempdir().unwrap();
+        let envelope = mutate(
+            ASYNC_ENVELOPE_20261028,
+            "return null;try{let e=ySe.safeParse(JSON.parse(r.slice(34,-35)));return e.success?e.data:null}catch{return null}}",
+            "return null}function qSe(r){try{let e=ySe.safeParse(JSON.parse(r.slice(34,-35)));return e.success?e.data:null}catch{return null}}",
+        );
+        let evidence = envelope_evidence(dir.path(), "s01c.asar", &envelope);
+        assert_async_rejected_but_package_read(&evidence, "守卫与解析跨函数拼接");
+    }
+
+    /// S02：生成函数 `bSe(e,t)` 的数组第二/三元素交换 → questionItemId 不再是 [tag,item,index]，拒绝。
+    #[test]
+    fn async_contract_rejects_question_id_swapped_params() {
+        let dir = tempfile::tempdir().unwrap();
+        let envelope = mutate(
+            ASYNC_ENVELOPE_20261028,
+            "`request_user_input_async`,e,t]",
+            "`request_user_input_async`,t,e]",
+        );
+        let evidence = envelope_evidence(dir.path(), "s02a.asar", &envelope);
+        assert_async_rejected_but_package_read(&evidence, "题目标识参数交换");
+    }
+
+    /// S02：同一形参重复出现 → index 丢失，拒绝。
+    #[test]
+    fn async_contract_rejects_question_id_duplicated_param() {
+        let dir = tempfile::tempdir().unwrap();
+        let envelope = mutate(
+            ASYNC_ENVELOPE_20261028,
+            "`request_user_input_async`,e,t]",
+            "`request_user_input_async`,e,e]",
+        );
+        let evidence = envelope_evidence(dir.path(), "s02b.asar", &envelope);
+        assert_async_rejected_but_package_read(&evidence, "题目标识参数重复");
+    }
+
+    /// S02：数组元素换成非形参变量 → 拒绝。
+    #[test]
+    fn async_contract_rejects_question_id_foreign_variable() {
+        let dir = tempfile::tempdir().unwrap();
+        let envelope = mutate(
+            ASYNC_ENVELOPE_20261028,
+            "`request_user_input_async`,e,t]",
+            "`request_user_input_async`,e,x]",
+        );
+        let evidence = envelope_evidence(dir.path(), "s02c.asar", &envelope);
+        assert_async_rejected_but_package_read(&evidence, "题目标识元素来自外来变量");
+    }
+
+    /// S02：调用点把 item 与 index 调换（`bSe(n,e.id)`）→ 第三元素不再是 map index，拒绝。
+    #[test]
+    fn async_contract_rejects_question_id_callsite_swapped() {
+        let dir = tempfile::tempdir().unwrap();
+        let callsite = mutate(QUESTION_ID_CALLSITE_20261028, "bSe(e.id,n)", "bSe(n,e.id)");
+        let evidence = evidence_20261028(
+            dir.path(),
+            "s02d.asar",
+            &main_js_20261028_with(
+                START_TURN_HANDLER_20261028,
+                ASYNC_ENVELOPE_20261028,
+                &callsite,
+                STRING_WITNESS_20261028,
+            ),
+            VERSION_TABLE_20261028,
+        );
+        assert_async_rejected_but_package_read(&evidence, "调用点 item/index 调换");
+    }
+
+    /// S02：没有任何调用点把 index 形参传到第三位 → 无法确认第三元素来源，拒绝。
+    #[test]
+    fn async_contract_rejects_missing_question_id_callsite() {
+        let dir = tempfile::tempdir().unwrap();
+        let evidence = evidence_20261028(
+            dir.path(),
+            "s02e.asar",
+            &main_js_20261028_with(
+                START_TURN_HANDLER_20261028,
+                ASYNC_ENVELOPE_20261028,
+                "",
+                STRING_WITNESS_20261028,
+            ),
+            VERSION_TABLE_20261028,
+        );
+        assert_async_rejected_but_package_read(&evidence, "缺少题目标识调用点");
+    }
+
+    /// S03：三字段**统一**换成非字符串构造（彼此仍一致）→ 没有字符串证人，拒绝。
+    #[test]
+    fn async_contract_rejects_uniform_non_string_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let envelope = mutate(
+            ASYNC_ENVELOPE_20261028,
+            "questionItemId:r.L(),question:r.L(),answer:r.L()",
+            "questionItemId:z.number(),question:z.number(),answer:z.number()",
+        );
+        let evidence = envelope_evidence(dir.path(), "s03a.asar", &envelope);
+        assert_async_rejected_but_package_read(&evidence, "三字段统一改为非字符串构造");
+    }
+
+    /// S03：包内没有该构造链的字符串专有组合子用法（证人缺失）→ 字段类型不可证，拒绝。
+    #[test]
+    fn async_contract_rejects_missing_string_witness() {
+        let dir = tempfile::tempdir().unwrap();
+        let evidence = evidence_20261028(
+            dir.path(),
+            "s03e.asar",
+            &main_js_20261028_with(
+                START_TURN_HANDLER_20261028,
+                ASYNC_ENVELOPE_20261028,
+                QUESTION_ID_CALLSITE_20261028,
+                "",
+            ),
+            VERSION_TABLE_20261028,
+        );
+        assert_async_rejected_but_package_read(&evidence, "缺少字符串 schema 证人");
+    }
+
+    /// S03：单条 transform 不再把原条目包成唯一元素数组（丢弃 / 不包 / 包别的变量）→ 拒绝。
+    #[test]
+    fn async_contract_rejects_transform_not_wrapping_item() {
+        for (idx, (to, what)) in [
+            ("ey.transform(e=>[])", "transform 丢弃条目"),
+            ("ey.transform(e=>e)", "transform 不包数组"),
+            ("ey.transform(e=>[t])", "transform 包了别的变量"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let envelope = mutate(ASYNC_ENVELOPE_20261028, "ey.transform(e=>[e])", to);
+            let evidence = envelope_evidence(dir.path(), &format!("s03t{idx}.asar"), &envelope);
+            assert_async_rejected_but_package_read(&evidence, what);
+        }
+    }
+
+    // ===== 2026-10-29 复审残留（S01 守卫分支作用/内层函数 · S02 itemId 来源未绑定）=====
+
+    /// S01：肯定形守卫 `if(R.startsWith(O)&&R.endsWith(C))return null;` ——合法信封被
+    /// 直接拒绝。已观测的两版包都只有"负向检查失败即返回"形态，肯定形必须拒绝。
+    #[test]
+    fn async_contract_rejects_positive_guard_form() {
+        let dir = tempfile::tempdir().unwrap();
+        let envelope = mutate(
+            ASYNC_ENVELOPE_20261028,
+            "if(!r.startsWith(_Se)||!r.endsWith(vSe))return null;",
+            "if(r.startsWith(_Se)&&r.endsWith(vSe))return null;",
+        );
+        let evidence = envelope_evidence(dir.path(), "r01a.asar", &envelope);
+        assert_async_rejected_but_package_read(&evidence, "肯定形守卫（合法信封直接返回失败）");
+    }
+
+    /// S01：真正的解析藏进守卫后声明、从不调用的内层函数，外层直接返回失败 → 拒绝。
+    #[test]
+    fn async_contract_rejects_dead_inner_function_parse() {
+        let dir = tempfile::tempdir().unwrap();
+        let envelope = mutate(
+            ASYNC_ENVELOPE_20261028,
+            ";try{let e=ySe.safeParse(JSON.parse(r.slice(34,-35)));return e.success?e.data:null}catch{return null}}",
+            ";function dead(r){try{let e=ySe.safeParse(JSON.parse(r.slice(34,-35)));return e.success?e.data:null}catch{return null}}return null}}",
+        );
+        let evidence = envelope_evidence(dir.path(), "r01b.asar", &envelope);
+        assert_async_rejected_but_package_read(&evidence, "解析藏在未调用的内层函数");
+    }
+
+    /// S02：第一实参换成原条目的 `.type` / `.turnId` → itemId 不再来自原条目 ID，拒绝。
+    #[test]
+    fn async_contract_rejects_question_id_source_not_id() {
+        for (idx, (to, what)) in [
+            ("bSe(e.type,n)", "第一实参是原条目 .type"),
+            ("bSe(e.turnId,n)", "第一实参是原条目 .turnId"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let callsite = mutate(QUESTION_ID_CALLSITE_20261028, "bSe(e.id,n)", to);
+            let evidence = evidence_20261028(
+                dir.path(),
+                &format!("r02a{idx}.asar"),
+                &main_js_20261028_with(
+                    START_TURN_HANDLER_20261028,
+                    ASYNC_ENVELOPE_20261028,
+                    &callsite,
+                    STRING_WITNESS_20261028,
+                ),
+                VERSION_TABLE_20261028,
+            );
+            assert_async_rejected_but_package_read(&evidence, what);
+        }
+    }
+
+    /// S02：第一实参换成 map 子项（题目自身）的 `.id` 或无关对象的 `.id` → 拒绝
+    ///（`.id` 形态成立，但接收者不是提供 `questions` 集合的原条目）。
+    #[test]
+    fn async_contract_rejects_question_id_source_foreign_id() {
+        for (idx, (to, what)) in [
+            ("bSe(t.id,n)", "第一实参是 map 子项自己的 .id"),
+            ("bSe(g.id,n)", "第一实参是无关对象的 .id"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let callsite = mutate(QUESTION_ID_CALLSITE_20261028, "bSe(e.id,n)", to);
+            let evidence = evidence_20261028(
+                dir.path(),
+                &format!("r02b{idx}.asar"),
+                &main_js_20261028_with(
+                    START_TURN_HANDLER_20261028,
+                    ASYNC_ENVELOPE_20261028,
+                    &callsite,
+                    STRING_WITNESS_20261028,
+                ),
+                VERSION_TABLE_20261028,
+            );
+            assert_async_rejected_but_package_read(&evidence, what);
+        }
+    }
+
+    // ===== 2026-10-29 合并审查残留（S01 表达式箭头 · S02 map 源接收者子串误判）=====
+
+    /// S01：解析藏进未调用的表达式箭头 `let dead=r=>schema.safeParse(...)`，入口直接
+    /// 返回失败 → 拒绝（守卫到解析之间只允许已观测的直接解析语法）。
+    #[test]
+    fn async_contract_rejects_expression_arrow_parse() {
+        let dir = tempfile::tempdir().unwrap();
+        let envelope = mutate(
+            ASYNC_ENVELOPE_20261028,
+            ";try{let e=ySe.safeParse(JSON.parse(r.slice(34,-35)));return e.success?e.data:null}catch{return null}}",
+            ";let dead=r=>ySe.safeParse(JSON.parse(r.slice(34,-35)));return null}}",
+        );
+        let evidence = envelope_evidence(dir.path(), "r03a.asar", &envelope);
+        assert_async_rejected_but_package_read(&evidence, "解析藏在未调用的表达式箭头内");
+    }
+
+    /// S02：map 源接收者与 `.id` 接收者不是同一条成员链 → 拒绝：
+    /// ① `(ge.questions??[]).map((t,n)=>bSe(e.id,n))`——`ge.questions` 含 `e.questions`
+    ///    子串，但遍历的是 ge 的题、用的是 e 的 ID；
+    /// ② 窗口内先出现 `e.questions`、实际 map 源是别的集合——附近出现不等于来源。
+    #[test]
+    fn async_contract_rejects_questions_source_receiver_mismatch() {
+        let variants = [
+            (
+                "(e.questions??[]).map(",
+                "(ge.questions??[]).map(",
+                "map 源接收者 ge 与 .id 接收者 e 不同",
+            ),
+            (
+                "(e.questions??[]).map(",
+                "(e.questions??[]).length>0&&(g.items??[]).map(",
+                "窗口内出现过 e.questions 但实际 map 源是别的集合",
+            ),
+        ];
+        for (idx, (from, to, what)) in variants.into_iter().enumerate() {
+            let dir = tempfile::tempdir().unwrap();
+            let callsite = mutate(QUESTION_ID_CALLSITE_20261028, from, to);
+            let evidence = evidence_20261028(
+                dir.path(),
+                &format!("r03b{idx}.asar"),
+                &main_js_20261028_with(
+                    START_TURN_HANDLER_20261028,
+                    ASYNC_ENVELOPE_20261028,
+                    &callsite,
+                    STRING_WITNESS_20261028,
+                ),
+                VERSION_TABLE_20261028,
+            );
+            assert_async_rejected_but_package_read(&evidence, what);
         }
     }
 }
