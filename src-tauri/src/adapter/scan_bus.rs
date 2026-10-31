@@ -843,8 +843,7 @@ fn scan_worker_round(app: tauri::AppHandle) -> WorkerRound {
         .checked_sub(Duration::from_secs(60))
         .unwrap_or_else(Instant::now);
     let mut last_tray = last_scan;
-    let mut last_waiting = usize::MAX;
-    let mut last_processing = false;
+    let mut last_tray_state = TrayState::UNKNOWN;
     Box::new(
         move |cadence: &mut Cadence, rx: &mpsc::Receiver<ScanReason>, mut reason| {
             // 事件合并节流：仅压**孤立** Event；Action 补扫与冷启动不得被丢弃，
@@ -866,13 +865,7 @@ fn scan_worker_round(app: tauri::AppHandle) -> WorkerRound {
             // 不再逐轮打 INFO（F9 日志体积 ≤1MB/天；档位切换 INFO 保留）
             let snap = scan_once(reason);
             last_scan = Instant::now();
-            update_tray(
-                &app,
-                &snap,
-                &mut last_tray,
-                &mut last_waiting,
-                &mut last_processing,
-            );
+            update_tray(&app, &snap, &mut last_tray, &mut last_tray_state);
             let signals = Signals {
                 active_sessions: has_active_sessions(&snap.data),
                 remote_online: remote_online(),
@@ -1050,33 +1043,58 @@ pub fn start(app: tauri::AppHandle) {
     spawn_supervisor(build_round);
 }
 
-/// 托盘状态：状态变化立即刷新，无变化时最多每 30s 刷一次
+/// 托盘判重状态：标题依赖 waiting / processing，tooltip 还依赖 total。
+/// 三者任一变化都必须立即刷新托盘——只比较前两项会让「会话总数变了但无等待、
+/// 无处理」的 tooltip 更新被 30s 限频拖住（P3 审查项）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TrayState {
+    waiting: usize,
+    processing: bool,
+    total: usize,
+}
+
+impl TrayState {
+    /// 首轮哨兵：与任何真实快照都不同（真实会话数不可能为 `usize::MAX`）
+    const UNKNOWN: Self = Self {
+        waiting: usize::MAX,
+        processing: false,
+        total: usize::MAX,
+    };
+
+    fn from_snapshot(snap: &Snapshot) -> Self {
+        Self {
+            waiting: snap.data.waiting_count,
+            processing: snap.data.sessions.iter().any(|s| {
+                matches!(
+                    s.status,
+                    SessionStatus::Processing | SessionStatus::Thinking | SessionStatus::Compacting
+                )
+            }),
+            total: snap.data.total_count,
+        }
+    }
+}
+
+/// 托盘是否需要刷新：三字段任一变化 → 立即刷新；三字段都没变 → 仅当
+/// 距上次刷新已满 [`TRAY_REFRESH`] 时兜底刷新一次。
+fn tray_should_update(prev: TrayState, next: TrayState, since_last: Duration) -> bool {
+    prev != next || since_last >= TRAY_REFRESH
+}
+
+/// 托盘状态：状态变化（含总会话数）立即刷新，无变化时最多每 30s 刷一次
 fn update_tray(
     app: &tauri::AppHandle,
     snap: &Snapshot,
     last_tray: &mut Instant,
-    last_waiting: &mut usize,
-    last_processing: &mut bool,
+    last_state: &mut TrayState,
 ) {
-    let has_processing = snap.data.sessions.iter().any(|s| {
-        matches!(
-            s.status,
-            SessionStatus::Processing | SessionStatus::Thinking | SessionStatus::Compacting
-        )
-    });
-    let changed = snap.data.waiting_count != *last_waiting || has_processing != *last_processing;
-    if !changed && last_tray.elapsed() < TRAY_REFRESH {
+    let next = TrayState::from_snapshot(snap);
+    if !tray_should_update(*last_state, next, last_tray.elapsed()) {
         return;
     }
     *last_tray = Instant::now();
-    *last_waiting = snap.data.waiting_count;
-    *last_processing = has_processing;
-    crate::plugins::system_tray::update_tray_status(
-        app,
-        snap.data.waiting_count,
-        snap.data.total_count,
-        has_processing,
-    );
+    *last_state = next;
+    crate::plugins::system_tray::update_tray_status(app, next.waiting, next.total, next.processing);
 }
 
 /// 活跃判定：处理中 / 思考中 / 压缩中 / 等待输入都算「需要盯」
@@ -2528,5 +2546,90 @@ mod tests {
             "收到唤醒不得继续等"
         );
         assert_eq!(HEARTBEAT_SLICE, Duration::from_secs(1));
+    }
+
+    /// Task 6（P3）：托盘三字段任一变化都必须立即刷新——tooltip 还依赖
+    /// `total_count`，只比较 waiting/processing 会让「总会话数变化但无等待、
+    /// 无处理」的更新被 30s 限频拖住。
+    #[test]
+    fn tray_updates_on_each_field_change_within_rate_limit() {
+        let base = TrayState {
+            waiting: 1,
+            processing: false,
+            total: 3,
+        };
+        let recent = Duration::from_secs(1); // 远未到 30s 限频窗口
+        assert!(
+            tray_should_update(base, TrayState { waiting: 2, ..base }, recent),
+            "等待数变化必须立即刷新"
+        );
+        assert!(
+            tray_should_update(
+                base,
+                TrayState {
+                    processing: true,
+                    ..base
+                },
+                recent
+            ),
+            "处理态变化必须立即刷新"
+        );
+        assert!(
+            tray_should_update(base, TrayState { total: 4, ..base }, recent),
+            "总会话数变化必须立即刷新（tooltip 依赖 total_count）"
+        );
+    }
+
+    /// Task 6（P3）：三字段都没变时 30s 限频仍生效；满窗口兜底刷新一次；
+    /// 首轮哨兵（[`TrayState::UNKNOWN`]）必须触发首次刷新。
+    #[test]
+    fn tray_suppresses_unchanged_updates_until_refresh_window() {
+        let state = TrayState {
+            waiting: 0,
+            processing: false,
+            total: 2,
+        };
+        assert!(!tray_should_update(state, state, Duration::from_millis(0)));
+        assert!(!tray_should_update(
+            state,
+            state,
+            TRAY_REFRESH - Duration::from_millis(1)
+        ));
+        assert!(
+            tray_should_update(state, state, TRAY_REFRESH),
+            "满 30s 必须兜底刷新"
+        );
+        assert!(
+            tray_should_update(TrayState::UNKNOWN, state, Duration::from_millis(0)),
+            "首轮哨兵必须触发首次刷新"
+        );
+    }
+
+    /// Task 6（P3）：`TrayState::from_snapshot` 映射三字段（processing 只认
+    /// Processing / Thinking / Compacting，Waiting 不算处理中）。
+    #[test]
+    fn tray_state_reads_all_three_fields_from_snapshot() {
+        let snap = Snapshot {
+            version: 1,
+            epoch: 1,
+            scanned_at: Instant::now(),
+            degraded: false,
+            data: SessionsResponse {
+                sessions: vec![
+                    session("s1", AgentType::Claude, SessionStatus::Thinking),
+                    session("s2", AgentType::Claude, SessionStatus::Waiting),
+                ],
+                total_count: 2,
+                waiting_count: 1,
+            },
+        };
+        assert_eq!(
+            TrayState::from_snapshot(&snap),
+            TrayState {
+                waiting: 1,
+                processing: true,
+                total: 2
+            }
+        );
     }
 }
