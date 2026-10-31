@@ -4077,7 +4077,10 @@ fn interrupt_not_sent_response(reason: &str) -> Response {
 /// - Accepted/Unknown → 保留暂停（前置档即正式档）；`queue_pause_set` 读**实际
 ///   持久行**（Gate C 留意项 b：并发 resume 晚于 pause_pre → 如实 false；读失败
 ///   保守 true，与 send/flush 门同口径）。
-#[allow(clippy::too_many_arguments)]
+// `Result<_, Response>` 的 Err 分支是 axum Response（128 字节以上）。这是
+// 既有 API 形状——调用方拿到 Err 就是「直接回这个响应」，Box 成指针只会在每一处
+// 解引用，反而更绕。clippy 1.99 起新增 result_large_err，本函数按既有形状保留。
+#[allow(clippy::too_many_arguments, clippy::result_large_err)]
 async fn stop_current_turn(
     st: &Arc<RemoteState>,
     key: &ThreadKey,
