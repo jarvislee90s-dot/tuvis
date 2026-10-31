@@ -54,6 +54,14 @@ static LAST_TIMEOUT_MS: AtomicI64 = AtomicI64::new(0);
 
 /// 事件触发扫描的最小间隔上限（Away 档 30s 的间隔会让 hook 事件在 TTL 内等不到扫描）
 const EVENT_MIN_GAP_CAP: Duration = Duration::from_secs(5);
+/// **无事件唤醒覆盖**的工具（F6 缺口，单一事实源）：既没有 hook 事件，也没有稳定的
+/// 廉价全局文件信号（dsh 会话/代际文件需逐目录解析；openclaw 会话库无固定单文件
+/// 信号），`wakeup` 不承诺 1s 级唤醒。它们在跑（或有活跃会话）时 cadence 目标档位
+/// 下限 Idle 10s，不允许进入 Away 30s 盲区（2026-10-31 用户裁决）。
+///
+/// 新增工具若既无 hook 又无 wakeup 监控面，必须登记到这里；反之若为其补了
+/// 事件信号（如 opencode 的 db/WAL），则不要加入。
+pub(crate) const UNCOVERED_TOOLS: &[&str] = &["dsh", "openclaw"];
 /// 等待在飞扫描的上限：超过后按最近快照降级返回，动作路径不被卡死的扫描拖住
 const SCAN_WAIT_LIMIT: Duration = Duration::from_secs(5);
 /// 看门狗阈值：在飞超过该时长视为疑似 hang（只告警，**不强杀**——清在飞位会放进
@@ -241,13 +249,13 @@ fn remote_online() -> bool {
 
 /// 事件扫描的最小间隔：跟随时长档位，但不超过 5s。
 /// Away 档 30s 的间隔太长——hook 事件 30s TTL 会过期，孤立事件必须把扫描提前。
-fn event_min_gap(interval: Duration) -> Duration {
+pub(crate) fn event_min_gap(interval: Duration) -> Duration {
     interval.min(EVENT_MIN_GAP_CAP)
 }
 
 /// 事件延后剩余时长（纯函数）：距上次扫描不足最小间隔 → Some(剩余)；
 /// 已过最小间隔 → None（立即扫描）。
-fn event_wait_plan(elapsed: Duration, interval: Duration) -> Option<Duration> {
+pub(crate) fn event_wait_plan(elapsed: Duration, interval: Duration) -> Option<Duration> {
     let gap = event_min_gap(interval);
     (elapsed < gap).then(|| gap - elapsed)
 }
@@ -272,7 +280,7 @@ fn burst_scan_reason(primary: ScanReason, burst: &[ScanReason]) -> ScanReason {
 ///
 /// 不得改回裸 `sleep`：睡在扫描线程里会让 Action 排队，而动作路径等待上限 3s
 /// 短于事件最小间隔上限 5s ⇒ 动作必然超时读到旧快照。
-fn wait_event_defer(
+pub(crate) fn wait_event_defer(
     rx: &mpsc::Receiver<ScanReason>,
     reason: ScanReason,
     elapsed: impl Fn() -> Duration,
@@ -593,6 +601,12 @@ pub fn start(app: tauri::AppHandle) {
                     active_sessions: has_active_sessions(&snap.data),
                     remote_online: remote_online(),
                     user_watching: user_watching(),
+                    // 扫描 Phase 1 刚记录的在跑工具（不另起进程扫描）+ 快照里的
+                    // 活跃会话兜底：dsh/openclaw 无事件覆盖，节奏下限 Idle 10s
+                    uncovered_tool_running: uncovered_tool_active(
+                        &super::running_tool_ids(),
+                        &snap.data,
+                    ),
                 };
                 if let Some(mode) = cadence.observe(signals, now_ms()) {
                     *MODE.lock().unwrap_or_else(|e| e.into_inner()) = mode;
@@ -678,8 +692,35 @@ fn status_is_active(status: &SessionStatus) -> bool {
     )
 }
 
+/// 活跃会话 id（字典序 + 去重）。**唯一活跃口径**：节奏判定
+/// （[`has_active_sessions`]）与事件唤醒的监控集合（`wakeup::monitored_ids`）
+/// 都经本函数，避免两套判断随状态枚举演进而漂移。
+pub(crate) fn active_session_ids(resp: &SessionsResponse) -> Vec<String> {
+    let mut ids: Vec<String> = resp
+        .sessions
+        .iter()
+        .filter(|s| status_is_active(&s.status))
+        .map(|s| s.id.clone())
+        .collect();
+    ids.sort();
+    ids.dedup();
+    ids
+}
+
 pub fn has_active_sessions(resp: &SessionsResponse) -> bool {
-    resp.sessions.iter().any(|s| status_is_active(&s.status))
+    !active_session_ids(resp).is_empty()
+}
+
+/// 未覆盖工具是否有「需要盯」的迹象：进程在跑，或存在活跃会话。
+/// `running_tools` 由调用方注入（生产来自扫描 Phase 1 的 `running_tool_ids()`），
+/// 纯函数便于单测，不会另起第二套进程扫描。
+fn uncovered_tool_active(running_tools: &[String], resp: &SessionsResponse) -> bool {
+    let uncovered = |tool: &str| UNCOVERED_TOOLS.contains(&tool);
+    running_tools.iter().any(|id| uncovered(id))
+        || resp
+            .sessions
+            .iter()
+            .any(|s| uncovered(s.agent_type.tool_id()) && status_is_active(&s.status))
 }
 
 /// 单测用：清空全部进程内状态（不含通道，测试不启动扫描线程）
@@ -696,6 +737,8 @@ pub fn reset_for_test() {
     SCAN_STARTED_MS.store(0, Ordering::SeqCst);
     SCANS_TOTAL.store(0, Ordering::SeqCst);
     LAST_TIMEOUT_MS.store(0, Ordering::SeqCst);
+    // 「在跑工具」是扫描 Phase 1 的进程事实，跨用例会互相污染（本机可能真在跑 dsh）
+    super::record_running_tools(std::iter::empty());
     // R11：一并清测试通道，防止某用例中途 panic 留下死通道影响后续用例
     *TEST_TX.lock().unwrap_or_else(|e| e.into_inner()) = None;
 }
@@ -759,6 +802,7 @@ pub(crate) fn test_guard() -> std::sync::MutexGuard<'static, ()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::{AgentType, ProcessForm, Session};
     use std::time::Duration;
 
     fn resp(status: SessionStatus) -> crate::session::SessionsResponse {
@@ -770,6 +814,30 @@ mod tests {
             } else {
                 0
             },
+        }
+    }
+
+    fn session(id: &str, tool: AgentType, status: SessionStatus) -> Session {
+        Session {
+            id: id.to_string(),
+            agent_type: tool,
+            project_name: "p".into(),
+            project_path: "p".into(),
+            title: None,
+            git_branch: None,
+            github_url: None,
+            status,
+            last_message: None,
+            last_message_role: None,
+            last_message_subagent_report: false,
+            flap_from_subagent_activity: false,
+            last_activity_at: String::new(),
+            pid: 1,
+            cpu_usage: 0.0,
+            active_subagent_count: 0,
+            form: ProcessForm::Cli,
+            jump_supported: true,
+            unread: false,
         }
     }
 
@@ -1291,5 +1359,83 @@ mod tests {
         }
         assert!(!has_active_sessions(&resp(SessionStatus::Idle)));
         assert!(!has_active_sessions(&resp(SessionStatus::Finished)));
+    }
+
+    /// 事件唤醒的监控集合与节奏判定的活跃口径必须同源：`active_session_ids`
+    /// 是 `has_active_sessions` 的唯一实现（Task 1 / F6）。
+    #[test]
+    fn active_session_ids_is_the_single_source_for_has_active_sessions() {
+        let mixed = SessionsResponse {
+            sessions: vec![
+                session("b", AgentType::Claude, SessionStatus::Thinking),
+                session("a", AgentType::Dsh, SessionStatus::Waiting),
+                session("a", AgentType::Dsh, SessionStatus::Processing), // 重复 id 去重
+                session("idle", AgentType::Claude, SessionStatus::Idle),
+                session("done", AgentType::Codex, SessionStatus::Finished),
+            ],
+            total_count: 5,
+            waiting_count: 1,
+        };
+        assert_eq!(
+            active_session_ids(&mixed),
+            vec!["a".to_string(), "b".to_string()]
+        );
+        assert!(has_active_sessions(&mixed));
+        assert_eq!(
+            has_active_sessions(&mixed),
+            !active_session_ids(&mixed).is_empty()
+        );
+
+        let idle = SessionsResponse {
+            sessions: vec![session("x", AgentType::Claude, SessionStatus::Finished)],
+            total_count: 1,
+            waiting_count: 0,
+        };
+        assert!(active_session_ids(&idle).is_empty());
+        assert!(!has_active_sessions(&idle));
+    }
+
+    /// 2026-10-31 裁决：dsh/openclaw 没有事件覆盖——进程在跑（Phase 1 记录）
+    /// 或存在活跃会话时，节奏下限必须锁在 Idle（Away 30s 是盲区）。
+    #[test]
+    fn uncovered_tool_active_detects_dsh_openclaw_process_or_live_session() {
+        // 单一事实源：缺口工具清单
+        assert_eq!(UNCOVERED_TOOLS, &["dsh", "openclaw"]);
+
+        let none = resp(SessionStatus::Idle);
+        // 进程在跑（不要求有会话）
+        assert!(uncovered_tool_active(&["dsh".to_string()], &none));
+        assert!(uncovered_tool_active(&["openclaw".to_string()], &none));
+        // 其他工具在跑不算缺口（claude 有 hook、opencode 有 db/facts 信号）
+        assert!(!uncovered_tool_active(&["claude".to_string()], &none));
+        assert!(!uncovered_tool_active(&["opencode".to_string()], &none));
+
+        // 进程探测缺失时用活跃会话兜底
+        let live_dsh = SessionsResponse {
+            sessions: vec![session("s", AgentType::Dsh, SessionStatus::Processing)],
+            total_count: 1,
+            waiting_count: 0,
+        };
+        assert!(uncovered_tool_active(&[], &live_dsh));
+        let live_openclaw = SessionsResponse {
+            sessions: vec![session("s", AgentType::OpenClaw, SessionStatus::Waiting)],
+            total_count: 1,
+            waiting_count: 1,
+        };
+        assert!(uncovered_tool_active(&[], &live_openclaw));
+
+        // 未覆盖工具的 Idle 会话不算「需要盯」；活跃的其他工具会话也不算缺口
+        let idle_dsh = SessionsResponse {
+            sessions: vec![session("s", AgentType::Dsh, SessionStatus::Idle)],
+            total_count: 1,
+            waiting_count: 0,
+        };
+        assert!(!uncovered_tool_active(&[], &idle_dsh));
+        let live_claude = SessionsResponse {
+            sessions: vec![session("s", AgentType::Claude, SessionStatus::Thinking)],
+            total_count: 1,
+            waiting_count: 0,
+        };
+        assert!(!uncovered_tool_active(&[], &live_claude));
     }
 }

@@ -524,6 +524,28 @@ static SHARED_SYSTEM: Mutex<Option<System>> = Mutex::new(None);
 /// 作为 F8（≤25ms）验收的数据源（R4）
 static LAST_PROCESS_REFRESH_MS: AtomicU64 = AtomicU64::new(0);
 
+/// 最近一轮扫描中「有进程在跑」的工具 id（升序去重）。
+/// **唯一写入点**是 `get_all_sessions_inner` Phase 1 的 `find_processes` 结果——
+/// 每轮扫描本就要发现进程，这里只把已知事实暴露给 `scan_bus` 的节奏判定；
+/// 禁止为「未覆盖工具是否在跑」另起第二套进程扫描器（2026-10-31 用户裁决）。
+static RUNNING_TOOL_IDS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// 最近一轮在跑工具 id（升序去重；未扫描时为空）
+pub(crate) fn running_tool_ids() -> Vec<String> {
+    RUNNING_TOOL_IDS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
+/// 记录在跑工具（调用方只传工具 id；排序去重在此统一完成）
+fn record_running_tools<'a>(ids: impl Iterator<Item = &'a str>) {
+    let mut v: Vec<String> = ids.map(str::to_string).collect();
+    v.sort();
+    v.dedup();
+    *RUNNING_TOOL_IDS.lock().unwrap_or_else(|e| e.into_inner()) = v;
+}
+
 /// 最近一轮进程刷新耗时（毫秒）
 pub(crate) fn last_process_refresh_ms() -> u64 {
     LAST_PROCESS_REFRESH_MS.load(Ordering::Relaxed)
@@ -919,6 +941,17 @@ pub(crate) fn get_all_sessions_inner() -> SessionsResponse {
 
         adapters.iter().map(|a| a.find_processes(system)).collect()
     }; // 释放 System 锁 — 下方文件 I/O 无需持锁
+
+    // 记录「本轮在跑的工具」：dsh/openclaw 无事件唤醒覆盖，scan_bus 据本信号把
+    // 节奏下限锁在 Idle 10s（不进 Away 30s 盲区）。直接复用 Phase 1 已算出的
+    // 每 adapter 进程列表，不额外扫描进程（用户裁决 2026-10-31）。
+    record_running_tools(
+        adapters
+            .iter()
+            .zip(all_processes.iter())
+            .filter(|(_, processes)| !processes.is_empty())
+            .map(|(adapter, _)| adapter.agent_type().tool_id()),
+    );
 
     // Phase 2: 解析会话（文件 I/O）
     let mut all_sessions: Vec<Session> = Vec::new();
@@ -2786,6 +2819,32 @@ mod dedup_tests {
         assert_eq!(sessions.len(), 2);
         assert_eq!(sessions[0].pid, 111); // 保留首张
         assert_eq!(sessions[1].id, "ses_B");
+    }
+}
+
+#[cfg(test)]
+mod running_tools_tests {
+    use super::*;
+
+    /// 在跑工具记录：排序去重、整体覆盖写（本轮无进程的工具必须消失，
+    /// 否则 dsh 退出后节奏仍被锁在 Idle）。持 scan_bus 全局锁，避免与
+    /// reset_for_test 的清理并发。
+    #[test]
+    fn running_tools_are_sorted_deduped_and_replaced() {
+        let _guard = crate::adapter::scan_bus::test_guard();
+        record_running_tools(["dsh", "claude", "dsh"].into_iter());
+        assert_eq!(
+            running_tool_ids(),
+            vec!["claude".to_string(), "dsh".to_string()]
+        );
+        record_running_tools(["openclaw"].into_iter());
+        assert_eq!(
+            running_tool_ids(),
+            vec!["openclaw".to_string()],
+            "每轮必须整体覆盖：上一轮在跑、本轮退出的工具不得残留"
+        );
+        record_running_tools(std::iter::empty());
+        assert!(running_tool_ids().is_empty());
     }
 }
 

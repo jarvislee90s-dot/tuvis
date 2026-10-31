@@ -1,8 +1,12 @@
 //! 扫描节奏状态机（纯函数，无 IO）。
-//! 输入三信号：活跃会话 / 远控在线 / 有人在看；输出 2s / 10s / 30s。
+//! 输入四信号：活跃会话 / 远控在线 / 有人在看 / 未覆盖工具在跑；输出 2s / 10s / 30s。
 //! 升档立即生效；降档需在候选状态稳定一个「当前档位间隔」后才切换（防抖）。
 //! 时钟约定：`now_ms` 必须单调（生产传入系统时钟纪元毫秒），时间回拨只会推迟降档确认而不会 panic。
 //! 采样语义：降档确认发生在越过边界的首次观测，观测间隔很长时下一次调用即按当时信号确认。
+//!
+//! Away 30s 的前提是「事件唤醒能兜住」：dsh/openclaw 没有事件覆盖（见
+//! `scan_bus::UNCOVERED_TOOLS`），它们有进程在跑或有活跃会话时必须把下限锁在
+//! Idle 10s，不允许进入 30s 无唤醒盲区（2026-10-31 用户裁决）。
 
 use std::time::Duration;
 
@@ -37,13 +41,17 @@ pub struct Signals {
     pub active_sessions: bool,
     pub remote_online: bool,
     pub user_watching: bool,
+    /// 无事件唤醒覆盖的工具（dsh/openclaw）有进程在跑或有活跃会话。
+    /// 它们没有 hook / 廉价文件信号兜底，进入 Away 30s 会形成发现盲区，
+    /// 故目标档位下限为 Idle 10s。
+    pub uncovered_tool_running: bool,
 }
 
 impl Signals {
     fn target(&self) -> Mode {
         if self.active_sessions {
             Mode::Active
-        } else if self.remote_online || self.user_watching {
+        } else if self.remote_online || self.user_watching || self.uncovered_tool_running {
             Mode::Idle
         } else {
             Mode::Away
@@ -114,6 +122,7 @@ mod tests {
                 active_sessions: true,
                 remote_online: false,
                 user_watching: false,
+                uncovered_tool_running: false,
             },
             1_000,
         );
@@ -130,6 +139,7 @@ mod tests {
                 active_sessions: true,
                 remote_online: false,
                 user_watching: false,
+                uncovered_tool_running: false,
             },
             0,
         );
@@ -139,6 +149,7 @@ mod tests {
                 active_sessions: false,
                 remote_online: true,
                 user_watching: false,
+                uncovered_tool_running: false,
             },
             2_000,
         );
@@ -150,6 +161,7 @@ mod tests {
                 active_sessions: false,
                 remote_online: true,
                 user_watching: false,
+                uncovered_tool_running: false,
             },
             3_999,
         );
@@ -161,6 +173,7 @@ mod tests {
                 active_sessions: false,
                 remote_online: true,
                 user_watching: false,
+                uncovered_tool_running: false,
             },
             4_000,
         );
@@ -176,6 +189,7 @@ mod tests {
                 active_sessions: false,
                 remote_online: true,
                 user_watching: false,
+                uncovered_tool_running: false,
             },
             0,
         );
@@ -184,6 +198,7 @@ mod tests {
                 active_sessions: false,
                 remote_online: false,
                 user_watching: false,
+                uncovered_tool_running: false,
             },
             10_000,
         );
@@ -192,6 +207,7 @@ mod tests {
                 active_sessions: false,
                 remote_online: false,
                 user_watching: false,
+                uncovered_tool_running: false,
             },
             20_000,
         );
@@ -203,6 +219,7 @@ mod tests {
                 active_sessions: false,
                 remote_online: true,
                 user_watching: false,
+                uncovered_tool_running: false,
             },
             20_001,
         );
@@ -218,6 +235,7 @@ mod tests {
                 active_sessions: false,
                 remote_online: true,
                 user_watching: false,
+                uncovered_tool_running: false,
             },
             0,
         );
@@ -226,6 +244,7 @@ mod tests {
                 active_sessions: false,
                 remote_online: false,
                 user_watching: false,
+                uncovered_tool_running: false,
             },
             10_000,
         );
@@ -235,6 +254,7 @@ mod tests {
                 active_sessions: false,
                 remote_online: true,
                 user_watching: false,
+                uncovered_tool_running: false,
             },
             11_000,
         );
@@ -246,6 +266,7 @@ mod tests {
                 active_sessions: false,
                 remote_online: false,
                 user_watching: false,
+                uncovered_tool_running: false,
             },
             20_000,
         );
@@ -257,6 +278,7 @@ mod tests {
                 active_sessions: false,
                 remote_online: false,
                 user_watching: false,
+                uncovered_tool_running: false,
             },
             21_000,
         );
@@ -267,9 +289,86 @@ mod tests {
                 active_sessions: false,
                 remote_online: false,
                 user_watching: false,
+                uncovered_tool_running: false,
             },
             30_000,
         );
         assert_eq!(m, Some(Mode::Away));
+    }
+
+    /// 2026-10-31 裁决：dsh/openclaw（无事件覆盖）在跑时不允许进入 Away 30s，
+    /// 目标档位下限 Idle 10s；两者都不跑（信号为 false）时才允许 Away。
+    #[test]
+    fn uncovered_tool_running_blocks_away() {
+        let mut c = Cadence::new(0);
+        // 先正常收敛到 Away（无远控、无人看、无活跃会话、无未覆盖工具）
+        c.observe(
+            Signals {
+                active_sessions: false,
+                remote_online: false,
+                user_watching: false,
+                uncovered_tool_running: false,
+            },
+            0,
+        );
+        let m = c.observe(
+            Signals {
+                active_sessions: false,
+                remote_online: false,
+                user_watching: false,
+                uncovered_tool_running: false,
+            },
+            10_000,
+        );
+        assert_eq!(m, Some(Mode::Away));
+
+        // dsh/openclaw 在跑 → Away 升回 Idle（升档立即生效）
+        let uncovered = Signals {
+            active_sessions: false,
+            remote_online: false,
+            user_watching: false,
+            uncovered_tool_running: true,
+        };
+        let m = c.observe(uncovered, 10_001);
+        assert_eq!(m, Some(Mode::Idle), "未覆盖工具在跑时不得停在 Away");
+        // 持续在跑：稳定 Idle，不再尝试降档
+        assert_eq!(c.observe(uncovered, 60_000), None);
+        assert_eq!(c.mode(), Mode::Idle);
+
+        // 两者都不跑 → 才允许重新降 Away（一个 Idle 间隔防抖后）
+        let idle = Signals {
+            active_sessions: false,
+            remote_online: false,
+            user_watching: false,
+            uncovered_tool_running: false,
+        };
+        assert_eq!(c.observe(idle, 70_000), None);
+        let m = c.observe(idle, 80_000);
+        assert_eq!(m, Some(Mode::Away), "未覆盖工具全部退出后才允许 Away");
+    }
+
+    /// 未覆盖工具在跑时，Active 的降档目标是 Idle 而非 Away（不得跨档跳进盲区）。
+    #[test]
+    fn uncovered_tool_running_degrades_active_to_idle_not_away() {
+        let mut c = Cadence::new(0);
+        let active = Signals {
+            active_sessions: true,
+            remote_online: false,
+            user_watching: false,
+            uncovered_tool_running: false,
+        };
+        assert_eq!(c.observe(active, 0), Some(Mode::Active));
+        let uncovered = Signals {
+            active_sessions: false,
+            remote_online: false,
+            user_watching: false,
+            uncovered_tool_running: true,
+        };
+        // 降档防抖：第一次只立项
+        assert_eq!(c.observe(uncovered, 1_000), None);
+        // 满一个 Active 间隔 → Idle（不是 Away）
+        assert_eq!(c.observe(uncovered, 3_000), Some(Mode::Idle));
+        assert_eq!(c.mode(), Mode::Idle);
+        assert_eq!(c.mode().interval().as_millis(), 10_000);
     }
 }
