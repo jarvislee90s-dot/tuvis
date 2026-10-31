@@ -74,9 +74,8 @@ export function SessionCard({
       agentType: session.agentType,
       unread: session.unread,
     });
-    let outcome: { applied: boolean; version: number } | null = null;
     try {
-      outcome = session.unread
+      const outcome = session.unread
         ? await invoke<{ applied: boolean; version: number }>("mark_session_read", {
             agentType: session.agentType,
             sessionId: session.id,
