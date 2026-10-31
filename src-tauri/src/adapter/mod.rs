@@ -358,6 +358,38 @@ fn apply_question_entry_mark(
 /// grace_duration 按进程形态区分：App 形态更长（30s），CLI 形态更短（5s）
 static STOP_GRACE: Lazy<Mutex<HashMap<u32, (i64, i64)>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 
+/// 首次转绿/补插入池失败、等待下一轮重试的 (tool, session) 集合。
+/// 只用于数据驱动绿卡的预过滤：**池无行不等于用户已读**，可能是 INSERT 失败；
+/// 不能用“池无行”一概补插（会复活已读/过期卡）。
+static PENDING_UNREAD_RETRIES: Lazy<Mutex<HashSet<(String, String)>>> =
+    Lazy::new(|| Mutex::new(HashSet::new()));
+
+fn mark_unread_retry(tool: &str, sid: &str) {
+    PENDING_UNREAD_RETRIES
+        .lock()
+        .unwrap()
+        .insert((tool.to_string(), sid.to_string()));
+}
+
+fn clear_unread_retry(tool: &str, sid: &str) {
+    PENDING_UNREAD_RETRIES
+        .lock()
+        .unwrap()
+        .remove(&(tool.to_string(), sid.to_string()));
+}
+
+fn unread_retry_pending(tool: &str, sid: &str) -> bool {
+    PENDING_UNREAD_RETRIES
+        .lock()
+        .unwrap()
+        .contains(&(tool.to_string(), sid.to_string()))
+}
+
+/// 数据驱动绿卡预过滤的保留判据：待重试优先，否则沿用“上一轮绿 + 池无行 ⇒ 剔除”。
+fn keep_green_card(was_green_prev: bool, pool_has_row: bool, retry_pending: bool) -> bool {
+    retry_pending || !codex_green_card_should_drop(was_green_prev, pool_has_row)
+}
+
 /// 通用进程信息
 #[derive(Debug, Clone)]
 pub struct AgentProcess {
@@ -691,7 +723,11 @@ fn get_all_sessions_inner() -> SessionsResponse {
                 Some("Idle") | Some("Finished")
             );
             let tool = s.agent_type.tool_id().to_string();
-            !codex_green_card_should_drop(was_green_prev, pool.contains(&(tool, s.id.clone())))
+            keep_green_card(
+                was_green_prev,
+                pool.contains(&(tool.clone(), s.id.clone())),
+                unread_retry_pending(&tool, &s.id),
+            )
         });
     }
 
@@ -2098,10 +2134,15 @@ fn sync_unread_sessions(active: &mut Vec<Session>, deleted_workbuddy: &HashSet<S
                 UnreadPoolAction::Insert => {
                     let was_read =
                         crate::database::dao::unread::was_read_recently(&tool, &s.id, now_ms);
-                    if insert_allowed(prev.as_deref(), was_read)
-                        && !crate::database::dao::unread::try_upsert(&record)
-                    {
-                        log::warn!("unread: 首次转绿入池失败（{} {}），下轮重试", tool, s.id);
+                    if insert_allowed(prev.as_deref(), was_read) {
+                        if crate::database::dao::unread::try_upsert(&record) {
+                            clear_unread_retry(&tool, &s.id);
+                        } else {
+                            mark_unread_retry(&tool, &s.id);
+                            log::warn!("unread: 首次转绿入池失败（{} {}），下轮重试", tool, s.id);
+                        }
+                    } else {
+                        clear_unread_retry(&tool, &s.id);
                     }
                 }
                 UnreadPoolAction::RefreshDisplay => {
@@ -2110,10 +2151,15 @@ fn sync_unread_sessions(active: &mut Vec<Session>, deleted_workbuddy: &HashSet<S
                     // 状态缓存已是绿但池行不存在（上一轮 INSERT 失败）→ 结合已读墓碑重试插入；
                     // 否则只刷新展示字段。修复“写失败 + 下轮 RefreshDisplay 永不 INSERT”的永久漏通知。
                     if !was_read && !crate::database::dao::unread::exists(&tool, &s.id) {
-                        if !crate::database::dao::unread::try_upsert(&record) {
+                        if crate::database::dao::unread::try_upsert(&record) {
+                            clear_unread_retry(&tool, &s.id);
+                        } else {
+                            mark_unread_retry(&tool, &s.id);
                             log::warn!("unread: 转绿补插失败（{} {}），下轮重试", tool, s.id);
                         }
                     } else {
+                        // 池行存在（正常）或用户已读 → 不再待重试，只刷新展示
+                        clear_unread_retry(&tool, &s.id);
                         crate::database::dao::unread::refresh_display(&record);
                     }
                 }
@@ -2126,7 +2172,8 @@ fn sync_unread_sessions(active: &mut Vec<Session>, deleted_workbuddy: &HashSet<S
                 s.unread = true;
             }
         } else {
-            // 变黄/红：删未读（状态迁移，非重置机制）
+            // 变黄/红：删未读（状态迁移，非重置机制）；新工作开始，清待重试标记
+            clear_unread_retry(&tool, &s.id);
             crate::database::dao::unread::delete(&tool, &s.id);
         }
     }
@@ -2710,8 +2757,9 @@ mod sort_tests {
 #[cfg(test)]
 mod unread_card_tests {
     use super::{
-        build_unread_cards, filter_deleted_unread, mark_active_unread_cards,
-        retain_read_completed_cards,
+        build_unread_cards, clear_unread_retry, filter_deleted_unread, keep_green_card,
+        mark_active_unread_cards, mark_unread_retry, retain_read_completed_cards,
+        unread_retry_pending,
     };
     use crate::database::dao::unread::UnreadSessionRecord;
     use crate::session::model::{AgentType, ProcessForm, Session, SessionStatus};
@@ -2750,6 +2798,26 @@ mod unread_card_tests {
             jump_supported: true,
             unread: false,
         }
+    }
+
+    /// P2：数据驱动绿卡的预过滤必须让“待重试”卡通过；不能把池无行一概当已读。
+    #[test]
+    fn pending_unread_retry_keeps_green_card_through_prefilter() {
+        assert!(
+            keep_green_card(true, false, true),
+            "上一轮绿 + 池无行 + 待重试 → 保留卡进入 sync 重试"
+        );
+        assert!(
+            !keep_green_card(true, false, false),
+            "上一轮绿 + 池无行 + 无待重试 → 按已读/过期剔除"
+        );
+        assert!(keep_green_card(false, false, false), "首次转绿保留");
+        assert!(keep_green_card(true, true, false), "池有行保留");
+
+        mark_unread_retry("codex", "retry-test");
+        assert!(unread_retry_pending("codex", "retry-test"));
+        clear_unread_retry("codex", "retry-test");
+        assert!(!unread_retry_pending("codex", "retry-test"));
     }
 
     /// P1：已删会话的未读池行不得合并为卡；其他工具同 id 不受影响。
