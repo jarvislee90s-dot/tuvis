@@ -137,6 +137,7 @@ fn simple_request(method: &str) -> RpcRequest {
         pre_dispatch_turns: Default::default(),
         interaction_recheck: None,
         async_write_recheck: None,
+        wire_text: None,
     }
 }
 
@@ -863,6 +864,7 @@ async fn owner_rebind_invalidates_old_lease_end_to_end() {
             pre_dispatch_turns: Default::default(),
             interaction_recheck: None,
             async_write_recheck: None,
+            wire_text: None,
         })
         .await;
     assert_eq!(outcome.delivery, Delivery::NotSent);

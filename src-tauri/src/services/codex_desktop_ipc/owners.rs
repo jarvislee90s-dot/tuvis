@@ -232,6 +232,7 @@ pub async fn discover_owner(
             pre_dispatch_turns: Default::default(),
             interaction_recheck: None,
             async_write_recheck: None,
+            wire_text: None,
         })
         .await;
     match outcome.delivery {

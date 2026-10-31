@@ -28,7 +28,14 @@ use super::types::ProtocolError;
 ///
 /// 规则一变（新增/收紧结构匹配、改变语义要求）就 **+1**：同一条包内容在不同规则版本
 /// 下的结论不能互相当成证据复用（`codex_ipc_contract_evidence` 主键含规则版本）。
-pub const CONTRACT_RULE_VERSION: u32 = 1;
+///
+/// 版本史：
+/// * 1 — F01/T01 初版有限字面规则；
+/// * 2 — 2026-10-28 异步答题信封改为引用关系核验（压缩器改局部名不失配；同日复审收口：
+///   守卫／解析同接收者同作用域、题目标识形参↔数组位置↔map index、字符串专有组合子
+///   证人、恒等 transform——收紧发生在 v2 落账前，不另 +1）。v1 下对 Desktop
+///   26.1023.51421 落账的证据行**不含** AsyncAnswerIdle，必须作废重识别。
+pub const CONTRACT_RULE_VERSION: u32 = 2;
 
 /// 逐操作键（spec §3.1：消息、命令审批、文件审批、阻塞答题、异步空闲答题、
 /// 请求级取消、回合打断、权限与模式分别判断）。
@@ -229,6 +236,55 @@ pub enum EvidenceSource {
     SchemaMatched,
 }
 
+/// T03：版本能力**支持状态**（稳定展示面）——与「当前允许执行资格」（`allowed`，
+/// 实时门）**分离**的两个并列输出。
+///
+/// 语义（spec：修复计划 T03）：`support` 回答"这个 Desktop 版本有没有这项能力"，
+/// 只随**识别/证据事实**变化；运行中、暂停、短暂断链等**当前资格**条件只改
+/// `allowed`/`reason_code`，**不得**把"已支持"闪成"该版本不可用"。
+/// `support` **不参与** `allowed` 计算（`evaluate_one` 的资格逻辑一字不动）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SupportState {
+    /// 有 shipped/observed/contract/schema 任一证据：该版本已支持（稳定展示，
+    /// 不随运行态/连接状态翻转）。
+    Supported,
+    /// 无任何证据且契约识别未完成（识别中/目标未知）。
+    Identifying,
+    /// 契约识别已完成（包已读、规则已跑）但该操作无匹配：该版本未匹配此项。
+    Unmatched,
+    /// 本阶段未接入该操作。
+    NotImplemented,
+}
+
+impl SupportState {
+    /// 线上/日志词（与 serde 值一致；单一来源，别处不另抄）。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Supported => "supported",
+            Self::Identifying => "identifying",
+            Self::Unmatched => "unmatched",
+            Self::NotImplemented => "not_implemented",
+        }
+    }
+}
+
+/// T03：能力身份摘要（**无路径**）：`SHA-256("probe_key|package_sha256|rule_version")`
+/// 前 16 hex。用于前端区分"这份支持结论属于哪个目标/包/规则版本"——同目标短断链
+/// 不变；包内容、规则版本或目标任一变化即失效（旧 identity 的展示信息不装进新
+/// 目标的授权/证据）。**绝不包含包路径等本机文件系统信息。**
+pub fn capability_identity_of(probe_key: &str, package_sha256: &str, rule_version: u32) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(probe_key.as_bytes());
+    hasher.update(b"|");
+    hasher.update(package_sha256.as_bytes());
+    hasher.update(b"|");
+    hasher.update(rule_version.to_string().as_bytes());
+    let digest = hasher.finalize();
+    digest[..8].iter().map(|b| format!("{b:02x}")).collect()
+}
+
 /// 单操作的统一状态（**后端唯一事实**；前端与 HTTP 写入口都只消费它）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -241,6 +297,19 @@ pub struct OperationStatus {
     pub requires_auto_adapt: bool,
     /// 证据来源。
     pub evidence: EvidenceSource,
+    /// T03：版本能力支持状态（稳定展示；与 `allowed` 并列，**不参与**资格计算）。
+    pub support: SupportState,
+    /// R07：本次 `support` 是否**沿用了上次识别结论的展示事实**（真实重连换代窗内、
+    /// 实时证据尚未装回）。`true` = 前端应如实标「连接恢复中」。**纯展示**：
+    /// 不参与 `allowed`/资格判定。
+    #[serde(default)]
+    pub support_inherited: bool,
+    /// C03：`support_inherited` 为 true 时的**包身份核对态**——`true` = 本代际已对
+    /// 当前包完成**内容 SHA 核验**且与上次识别一致（展示身份可当作已确认）；
+    /// `false`/缺省 = 仅 (len, mtime) 快筛通过，当前包身份待核对（前端必须以
+    /// 「待核对」文案与已确认能力明确区分）。**纯展示**，不参与资格判定。
+    #[serde(default)]
+    pub support_identity_verified: bool,
     /// 当前不允许的机器码（`reason_code` 词表；允许时为 `None`）。
     pub reason_code: Option<String>,
 }
@@ -254,12 +323,51 @@ pub struct OperationStatus {
 pub struct EffectiveOperations {
     pub policy_revision: u64,
     pub operations: BTreeMap<CodexOperation, OperationStatus>,
+    /// T03：能力身份摘要（[`capability_identity_of`]；无路径）。由 adapter 在装配
+    /// 投影处填充（策略层不持目标身份）——`None` = 无目标/未识别。仅用于前端区分
+    /// 展示目标（短断链保留上次支持展示的前提 = identity 不变），**不参与授权**。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability_identity: Option<String>,
 }
 
 impl Default for EffectiveOperations {
     fn default() -> Self {
         Self::unknown()
     }
+}
+
+/// R07：一次已完成识别的**展示记录**（同一完整目标的上次支持结论）。
+///
+/// 用途：真实重连（连接代际更换、证据槽因此失配）期间沿用上次识别的 support 展示
+/// 与能力身份，避免"已支持"在毫秒级重连里闪成"识别中"；证据重新装回即回到实时
+/// 事实。**纯展示**：不参与 `allowed`/`evidence`，不产生写资格。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DisplaySupport {
+    /// 记录时的**连接代际**。只有当前代际与它不同（= 真实重连换代过）才允许
+    /// 沿用：同代际下槽为空是"未识别"，不得拿旧记录冒充。
+    pub epoch: u64,
+    /// 记录时的目标身份（沿用判据第一段）。
+    pub platform: String,
+    /// 记录时的 Desktop build（沿用判据第一段）。
+    pub build: String,
+    /// 记录时的探测键（双方都解析出值时比对；不同 = 新目标，不沿用）。
+    pub probe_key: Option<String>,
+    /// R17 同款**包内容指纹** `(len, mtime_ms)`。同 build 换包（适配关闭时包内容
+    /// 永不复查）必须靠它拒绝沿用——stat 变化或读不到即视为新目标。
+    ///
+    /// C03：语义收严为**取证时**绑定并核验的那次 stat（证据自带 `package_size`/
+    /// `package_mtime_ms`，取证函数已保证读前读后一致），不是安装时对盘上文件的
+    /// 另一次 stat——消除「读 A、装前换 B、A 结论配 B 指纹」的窗口。
+    pub package_fingerprint: Option<(u64, i64)>,
+    /// C03：**取证时**的包内容 SHA-256（= 证据的 `package_sha256`）。重连沿用前
+    /// 对当前包重算内容哈希并与它核对——stat 快筛可被同 len/保留 mtime 的替换
+    /// 绕过，只有内容哈希能证明「还是被识别的那份包」。
+    pub package_sha256: String,
+    /// 该次识别的能力身份摘要（[`capability_identity_of`]）。
+    pub identity: String,
+    /// 逐操作支持结论——**上次展示的快照**（安装时用同一 `OperationPolicy` 求值，
+    /// 因此天然含 shipped/observed/contract/schema 全部证据来源；不另行推导）。
+    pub support: BTreeMap<CodexOperation, SupportState>,
 }
 
 impl EffectiveOperations {
@@ -278,6 +386,9 @@ impl EffectiveOperations {
                         allowed: false,
                         requires_auto_adapt: false,
                         evidence: EvidenceSource::None,
+                        support: SupportState::NotImplemented,
+                        support_inherited: false,
+                        support_identity_verified: false,
                         reason_code: Some(super::reason_code::OPERATION_UNKNOWN_POLICY.into()),
                     },
                 )
@@ -286,6 +397,7 @@ impl EffectiveOperations {
         Self {
             policy_revision: 0,
             operations,
+            capability_identity: None,
         }
     }
 
@@ -326,6 +438,23 @@ impl EffectiveOperations {
                 EvidenceSource::SchemaMatched => 4,
             };
             hash = hash.wrapping_mul(0x100_0000_01b3);
+            // T03：support 是序列化事实的一部分——进事实指纹（恒等派生自已有事实，
+            // 不引入额外抖动）。
+            hash ^= match status.support {
+                SupportState::Supported => 0,
+                SupportState::Identifying => 1,
+                SupportState::Unmatched => 2,
+                SupportState::NotImplemented => 3,
+            };
+            hash = hash.wrapping_mul(0x100_0000_01b3);
+            // R07：support_inherited 是**序列化事实**的一部分（前端据此显示
+            // 「连接恢复中」）——进事实指纹，否则"沿用↔实时"切换的投影不会重发布。
+            hash ^= u64::from(status.support_inherited);
+            hash = hash.wrapping_mul(0x100_0000_01b3);
+            // C03：support_identity_verified 同理——「待核对 ↔ 已核对」改变前端
+            // 标记文案，是序列化展示事实；不进指纹则核验落账后的升级不会重发布。
+            hash ^= u64::from(status.support_identity_verified);
+            hash = hash.wrapping_mul(0x100_0000_01b3);
             if let Some(code) = &status.reason_code {
                 for byte in code.bytes() {
                     hash ^= u64::from(byte);
@@ -360,8 +489,21 @@ pub struct OperationContext {
     pub schema: BTreeMap<CodexOperation, bool>,
     /// 当前运行包的契约匹配（逐操作；空 = 未匹配）。
     pub contract: BTreeMap<CodexOperation, ContractMatch>,
+    /// 当前目标的契约识别**已完成**（包已读、规则已跑；`contract` 里缺的操作 =
+    /// 规则未匹配，而不是"还没识别"）。`false` = 未尝试／读取失败／目标已换代。
+    pub contract_identified: bool,
     /// 契约识别失败的原因码（`None` = 未尝试或成功）。
     pub contract_error: Option<String>,
+    /// R07：**仅展示**的「同一完整目标上次的支持结论」（逐操作）——真实重连
+    /// （连接代际更换）期间沿用上次已识别结论的 support 展示；识别重新完成即回到
+    /// 实时事实。**不参与** `allowed`/`evidence`/`contract` 计算，不产生任何写资格
+    /// （`contract` 仍为空、`contract_identified` 仍为 `false`——识别事实不伪装）。
+    pub display_support: BTreeMap<CodexOperation, SupportState>,
+    /// C03：`display_support` 非空时，本代际是否已对当前包完成**内容 SHA 核验**
+    /// 且与记录一致。`true` = 展示身份可当作已确认（`supportIdentityVerified` 置位）；
+    /// `false` = 仅 stat 快筛通过（「待核对」态——支持可如实沿用，身份不发布）。
+    /// **纯展示**，不参与授权。
+    pub display_identity_verified: bool,
 }
 
 impl OperationContext {
@@ -377,8 +519,44 @@ impl OperationContext {
     fn contract_for(&self, operation: CodexOperation) -> Option<&ContractMatch> {
         self.contract.get(&operation)
     }
+    /// R07：该操作「同身份上次支持结论」的**展示**事实（不参与授权）。
+    fn display_support_for(&self, operation: CodexOperation) -> Option<SupportState> {
+        self.display_support.get(&operation).copied()
+    }
     fn runtime_is(&self, expected: &str) -> bool {
         self.runtime_status.eq_ignore_ascii_case(expected)
+    }
+}
+
+/// T03：支持态推导（唯一计算源 = [`OperationPolicy::evaluate_one`] 经本函数）。
+/// `!implemented` → 未接入；有 shipped/observed/contract/schema 任一证据 → 已支持；
+/// 无证据且契约识别已完成 → 未匹配；无证据且未识别 → 识别中。
+///
+/// R07：**无证据且未识别**时，若有同一完整目标上次识别结论的展示事实（真实重连
+/// 换代导致证据槽失配）→ 沿用它（`Unmatched` 也沿用，如实"该版本未匹配"）；
+/// 有实时证据/识别完成时实时事实优先。**只做并列输出，不参与 `allowed` 计算。**
+///
+/// 返回 `(支持态, 是否沿用了展示事实)` —— 后者进 `OperationStatus.support_inherited`，
+/// 让前端在生产路径上显示「连接恢复中」（纯展示，不参与资格）。
+fn support_of(
+    implemented: bool,
+    evidence: EvidenceSource,
+    contract_identified: bool,
+    display: Option<SupportState>,
+) -> (SupportState, bool) {
+    if !implemented {
+        return (SupportState::NotImplemented, false);
+    }
+    if evidence != EvidenceSource::None {
+        return (SupportState::Supported, false);
+    }
+    if contract_identified {
+        return (SupportState::Unmatched, false);
+    }
+    match display {
+        // 展示事实只表达「上次已识别到的结论」，不能凭空造出支持。
+        Some(carried @ (SupportState::Supported | SupportState::Unmatched)) => (carried, true),
+        _ => (SupportState::Identifying, false),
     }
 }
 
@@ -397,6 +575,8 @@ impl OperationPolicy {
         EffectiveOperations {
             policy_revision,
             operations,
+            // 身份由 adapter 装配投影处填充（策略层不持目标身份）。
+            capability_identity: None,
         }
     }
 
@@ -413,6 +593,9 @@ impl OperationPolicy {
                 allowed: false,
                 requires_auto_adapt: false,
                 evidence: EvidenceSource::None,
+                support: SupportState::NotImplemented,
+                support_inherited: false,
+                support_identity_verified: false,
                 reason_code: Some(codes::OPERATION_NOT_IMPLEMENTED.into()),
             };
         }
@@ -435,11 +618,20 @@ impl OperationPolicy {
 
         // 普通消息沿用既有发送门：不依赖新契约识别（T02 验收）。
         if operation == CodexOperation::Send {
+            let (support, support_inherited) = support_of(
+                true,
+                evidence,
+                context.contract_identified,
+                context.display_support_for(operation),
+            );
             return OperationStatus {
                 implemented: true,
                 allowed: context.target_fresh,
                 requires_auto_adapt: false,
                 evidence,
+                support,
+                support_inherited,
+                support_identity_verified: support_inherited && context.display_identity_verified,
                 reason_code: (!context.target_fresh)
                     .then(|| codes::OPERATION_TARGET_STALE.to_string()),
             };
@@ -452,21 +644,46 @@ impl OperationPolicy {
         // H01：observed 也必须受自动适配活门约束（真实成功 != 当前可写；关闭适配后
         // 新动作零帧），只有**精确 shipped** 不受开关影响。
         let gate_open = shipped || (context.auto_adapt_enabled && (observed || contract || schema));
+        // R07：**展示**事实只用于选「原因文案」（解释"为什么现在不能"），不参与
+        // 上面的 `gate_open`/`allowed`。同身份重连 + 适配关闭时，上次已支持 → 原因
+        // 如实报「适配已关闭」，而不是误报「无证据（等识别）」。
+        let display_supported = matches!(
+            context.display_support_for(operation),
+            Some(SupportState::Supported)
+        );
         if !gate_open {
-            let reason = if (contract || observed || schema) && !context.auto_adapt_enabled {
+            let reason = if (contract || observed || schema || display_supported)
+                && !context.auto_adapt_enabled
+            {
                 codes::OPERATION_AUTO_ADAPT_OFF
             } else if context.contract_error.is_some() {
                 codes::OPERATION_CONTRACT_UNMATCHED
             } else if evidence == EvidenceSource::None {
-                codes::OPERATION_NO_EVIDENCE
+                // 包已读、规则已跑而本项仍无匹配 = "规则未匹配"；只有还没识别过
+                // （未尝试／目标换代）才是"无证据"。两者给用户的动作不同：前者是
+                // 版本契约问题（到桌面端处理/等适配），后者是等识别完成。
+                if context.contract_identified {
+                    codes::OPERATION_CONTRACT_UNMATCHED
+                } else {
+                    codes::OPERATION_NO_EVIDENCE
+                }
             } else {
                 codes::OPERATION_CONTRACT_UNMATCHED
             };
+            let (support, support_inherited) = support_of(
+                true,
+                evidence,
+                context.contract_identified,
+                context.display_support_for(operation),
+            );
             return OperationStatus {
                 implemented: true,
                 allowed: false,
                 requires_auto_adapt,
                 evidence,
+                support,
+                support_inherited,
+                support_identity_verified: support_inherited && context.display_identity_verified,
                 reason_code: Some(reason.into()),
             };
         }
@@ -504,11 +721,20 @@ impl OperationPolicy {
             }
         };
 
+        let (support, support_inherited) = support_of(
+            true,
+            evidence,
+            context.contract_identified,
+            context.display_support_for(operation),
+        );
         OperationStatus {
             implemented: true,
             allowed: blocked_reason.is_none(),
             requires_auto_adapt,
             evidence,
+            support,
+            support_inherited,
+            support_identity_verified: support_inherited && context.display_identity_verified,
             reason_code: blocked_reason.map(str::to_string),
         }
     }
@@ -650,7 +876,10 @@ mod tests {
             observed: BTreeMap::new(),
             schema: BTreeMap::new(),
             contract: fresh_contract(),
+            contract_identified: true,
             contract_error: None,
+            display_support: Default::default(),
+            display_identity_verified: false,
         }
     }
 
@@ -659,6 +888,7 @@ mod tests {
     fn f08p_t02_readonly_evidence_does_not_unlock_write() {
         let mut context = idle_context();
         context.contract.clear();
+        context.contract_identified = false;
         context.read_evidence = true;
         context.shipped.insert(CodexOperation::Send, true);
         let ops = OperationPolicy.evaluate(&context);
@@ -683,7 +913,9 @@ mod tests {
     #[test]
     fn f08p_t02_command_success_does_not_evidence_file() {
         let mut context = idle_context();
+        // 场景 = 完全没有契约事实（未识别），不是"已识别但未匹配"。
         context.contract.clear();
+        context.contract_identified = false;
         context
             .observed
             .insert(CodexOperation::CommandApproval, true);
@@ -832,8 +1064,9 @@ mod tests {
                 "runtime={runtime} 不得成为打断门（阀值才是安全门）"
             );
         }
-        // 无任何证据 → 拒绝（关闭适配也不得凭空放行）。
+        // 无任何证据（未识别）→ 拒绝（关闭适配也不得凭空放行）。
         context.contract.clear();
+        context.contract_identified = false;
         context.auto_adapt_enabled = false;
         let denied = OperationPolicy.evaluate(&context);
         assert!(!denied.allows(CodexOperation::Interrupt));
@@ -892,6 +1125,62 @@ mod tests {
         let c = OperationPolicy.evaluate(&changed);
         assert_ne!(a.policy_revision, c.policy_revision);
     }
+
+    /// 2026-10-28：异步答题规则改为结构化识别（重命名容忍）。规则一变就 +1——
+    /// 已缓存的 v1 证据行对 26.1023.51421 **不含** AsyncAnswerIdle，若按旧版本号
+    /// 复用，修了规则也不生效。
+    #[test]
+    fn contract_rule_version_bumped_for_structural_async_rule() {
+        assert_eq!(CONTRACT_RULE_VERSION, 2);
+    }
+
+    /// 已识别（包已读、规则已跑）但本操作无匹配 → `operation_contract_unmatched`
+    /// （"规则未匹配"），不再与"尚未识别"的 `operation_no_evidence` 混用；
+    /// 识别失败（包不可读等）仍是契约未匹配码（既有行为）。
+    #[test]
+    fn identified_but_unmatched_operation_reports_contract_unmatched() {
+        let mut context = idle_context();
+        context.contract.remove(&CodexOperation::AsyncAnswerIdle);
+        context.contract_identified = true;
+        let ops = OperationPolicy.evaluate(&context);
+        let status = ops.get(CodexOperation::AsyncAnswerIdle).unwrap();
+        assert!(!status.allowed);
+        assert_eq!(status.evidence, EvidenceSource::None);
+        assert_eq!(
+            status.reason_code.as_deref(),
+            Some(codes::OPERATION_CONTRACT_UNMATCHED),
+            "已识别但本项未匹配 = 规则未匹配，不是无证据"
+        );
+        // 对照：其它已匹配操作不受影响。
+        assert!(ops.allows(CodexOperation::BlockingInput));
+
+        // 对照：尚未识别（未尝试、无失败码）→ 无证据码。
+        let mut pending = idle_context();
+        pending.contract.clear();
+        pending.contract_identified = false;
+        let ops = OperationPolicy.evaluate(&pending);
+        assert_eq!(
+            ops.get(CodexOperation::AsyncAnswerIdle)
+                .unwrap()
+                .reason_code
+                .as_deref(),
+            Some(codes::OPERATION_NO_EVIDENCE)
+        );
+
+        // 对照：识别失败（包不可读等）→ 契约未匹配码。
+        let mut failed = idle_context();
+        failed.contract.clear();
+        failed.contract_identified = false;
+        failed.contract_error = Some("contract_package_unavailable".into());
+        let ops = OperationPolicy.evaluate(&failed);
+        assert_eq!(
+            ops.get(CodexOperation::AsyncAnswerIdle)
+                .unwrap()
+                .reason_code
+                .as_deref(),
+            Some(codes::OPERATION_CONTRACT_UNMATCHED)
+        );
+    }
 }
 
 #[cfg(test)]
@@ -911,7 +1200,10 @@ mod h01_policy_tests {
             observed: BTreeMap::new(),
             schema: BTreeMap::new(),
             contract: BTreeMap::new(),
+            contract_identified: false,
             contract_error: None,
+            display_support: Default::default(),
+            display_identity_verified: false,
         }
     }
 
@@ -959,5 +1251,400 @@ mod h01_policy_tests {
         let status = ops.get(CodexOperation::AsyncAnswerIdle).expect("status");
         assert!(status.allowed);
         assert_eq!(status.evidence, EvidenceSource::ObservedSuccess);
+    }
+}
+
+#[cfg(test)]
+mod t03_support_identity_tests {
+    //! T03：「版本能力支持状态」（稳定展示）与「当前允许执行资格」（实时门）分离。
+    //! 核心断言：同目标已匹配时，运行中/暂停/短暂断链只改 allowed/reason，
+    //! **support 恒 supported**；身份摘要区分目标/包/规则版本且不含路径。
+
+    use super::*;
+    use crate::services::codex_desktop_ipc::reason_code as codes;
+
+    fn matched_idle_context() -> OperationContext {
+        OperationContext {
+            target_fresh: true,
+            auto_adapt_enabled: true,
+            runtime_status: "idle".into(),
+            blocking_pending: false,
+            queue_paused: false,
+            read_evidence: true,
+            shipped: BTreeMap::new(),
+            observed: BTreeMap::new(),
+            schema: BTreeMap::new(),
+            contract: (CodexOperation::ALL)
+                .into_iter()
+                .filter(|op| op.is_implemented_in_phase())
+                .map(|op| {
+                    (
+                        op,
+                        ContractMatch {
+                            method: "thread-follower-start-turn".into(),
+                            base_version: 2,
+                            request_rule: "conversationId".into(),
+                            response_rule: "ok".into(),
+                            semantic_rule: "rule".into(),
+                        },
+                    )
+                })
+                .collect(),
+            contract_identified: true,
+            contract_error: None,
+            display_support: Default::default(),
+            display_identity_verified: false,
+        }
+    }
+
+    /// T03 核心反例：同目标已匹配（contract 全量、auto_adapt on、idle）→
+    /// idle.allowed=true 且 support=supported；运行中 allowed=false 但
+    /// **support 仍 supported**（"已支持"不被当前资格条件闪成"该版本不可用"）。
+    #[test]
+    fn t03_support_stays_supported_while_eligibility_flips() {
+        let context = matched_idle_context();
+        let idle = OperationPolicy.evaluate(&context);
+        let idle_status = idle.get(CodexOperation::AsyncAnswerIdle).unwrap();
+        assert!(idle_status.allowed, "前置：空闲可答");
+        assert_eq!(idle_status.support, SupportState::Supported);
+
+        // 运行中：只改 allowed/reason。
+        let mut active_ctx = context.clone();
+        active_ctx.runtime_status = "active".into();
+        let active = OperationPolicy.evaluate(&active_ctx);
+        let status = active.get(CodexOperation::AsyncAnswerIdle).unwrap();
+        assert!(!status.allowed);
+        assert_eq!(
+            status.reason_code.as_deref(),
+            Some(codes::OPERATION_RUNTIME_ACTIVE)
+        );
+        assert_eq!(
+            status.support,
+            SupportState::Supported,
+            "运行中不得把已支持闪成未支持"
+        );
+
+        // 原生阻塞在场：同上。
+        let mut pending_ctx = context.clone();
+        pending_ctx.blocking_pending = true;
+        let status = OperationPolicy
+            .evaluate(&pending_ctx)
+            .get(CodexOperation::AsyncAnswerIdle)
+            .unwrap()
+            .clone();
+        assert!(!status.allowed);
+        assert_eq!(status.support, SupportState::Supported);
+
+        // 队列暂停：同上。
+        let mut paused_ctx = context.clone();
+        paused_ctx.queue_paused = true;
+        let status = OperationPolicy
+            .evaluate(&paused_ctx)
+            .get(CodexOperation::AsyncAnswerIdle)
+            .unwrap()
+            .clone();
+        assert!(!status.allowed);
+        assert_eq!(status.support, SupportState::Supported);
+
+        // 短暂断链（target_fresh=false）：同上（展示面稳定，资格撤回）。
+        let mut stale_ctx = context.clone();
+        stale_ctx.target_fresh = false;
+        let stale = OperationPolicy.evaluate(&stale_ctx);
+        let status = stale.get(CodexOperation::AsyncAnswerIdle).unwrap();
+        assert!(!status.allowed);
+        assert_eq!(
+            status.reason_code.as_deref(),
+            Some(codes::OPERATION_TARGET_STALE)
+        );
+        assert_eq!(status.support, SupportState::Supported);
+        // 断链对 Send 同样只撤资格不改支持。
+        let send = stale.get(CodexOperation::Send).unwrap();
+        assert!(!send.allowed);
+        assert_eq!(send.support, SupportState::Supported);
+    }
+
+    /// T03：支持态四档推导（唯一计算源 = OperationPolicy）。
+    /// 未实现 → not_implemented；无证据且未识别 → identifying；已识别但无匹配 →
+    /// unmatched；shipped/observed/contract/schema 任一 → supported。
+    #[test]
+    fn t03_support_states_follow_identification_stages() {
+        // 未接入操作 → not_implemented（不因"没有证据"误报未匹配）。
+        let ops = OperationPolicy.evaluate(&matched_idle_context());
+        assert_eq!(
+            ops.get(CodexOperation::RequestCancel).unwrap().support,
+            SupportState::NotImplemented
+        );
+        // 未知集合（老载荷缺字段缺省）全部 not_implemented 支持（implemented=false）。
+        let unknown = EffectiveOperations::unknown();
+        assert_eq!(
+            unknown.get(CodexOperation::Send).unwrap().support,
+            SupportState::NotImplemented
+        );
+
+        // 无任何证据且未识别 → identifying。
+        let mut ctx = matched_idle_context();
+        ctx.contract.clear();
+        ctx.contract_identified = false;
+        let ops = OperationPolicy.evaluate(&ctx);
+        assert_eq!(
+            ops.get(CodexOperation::AsyncAnswerIdle).unwrap().support,
+            SupportState::Identifying
+        );
+
+        // 已识别（包已读、规则已跑）但本项无匹配 → unmatched（如实"该版本未匹配"）。
+        let mut ctx = matched_idle_context();
+        ctx.contract.remove(&CodexOperation::AsyncAnswerIdle);
+        let ops = OperationPolicy.evaluate(&ctx);
+        let status = ops.get(CodexOperation::AsyncAnswerIdle).unwrap();
+        assert_eq!(status.support, SupportState::Unmatched);
+        assert!(!status.allowed, "推导 support 不得改资格：无证据仍不允许");
+
+        // shipped / observed / schema 任一证据 → supported（含适配关闭）。
+        for mut ctx in [
+            {
+                let mut c = matched_idle_context();
+                c.contract.clear();
+                c.contract_identified = true;
+                c.shipped.insert(CodexOperation::AsyncAnswerIdle, true);
+                c
+            },
+            {
+                let mut c = matched_idle_context();
+                c.contract.clear();
+                c.contract_identified = true;
+                c.observed.insert(CodexOperation::AsyncAnswerIdle, true);
+                c
+            },
+            {
+                let mut c = matched_idle_context();
+                c.contract.clear();
+                c.contract_identified = true;
+                c.schema.insert(CodexOperation::CommandApproval, true);
+                c
+            },
+        ] {
+            ctx.auto_adapt_enabled = false; // 关适配也不改变"有没有证据"这一事实
+            let op = if ctx.schema.is_empty() {
+                CodexOperation::AsyncAnswerIdle
+            } else {
+                CodexOperation::CommandApproval
+            };
+            let ops = OperationPolicy.evaluate(&ctx);
+            assert_eq!(
+                ops.get(op).unwrap().support,
+                SupportState::Supported,
+                "有证据即 supported（{op:?}）"
+            );
+        }
+    }
+
+    /// T03：适配关闭 → support 仍 supported，allowed=false + auto_adapt_off
+    /// （写入口零帧仍由既有资格门保证——support 只是并列输出）。
+    #[test]
+    fn t03_auto_adapt_off_keeps_support_but_retracts_eligibility() {
+        let mut ctx = matched_idle_context();
+        ctx.auto_adapt_enabled = false;
+        let ops = OperationPolicy.evaluate(&ctx);
+        let status = ops.get(CodexOperation::AsyncAnswerIdle).unwrap();
+        assert_eq!(status.support, SupportState::Supported);
+        assert!(!status.allowed);
+        assert_eq!(
+            status.reason_code.as_deref(),
+            Some(codes::OPERATION_AUTO_ADAPT_OFF)
+        );
+    }
+
+    /// R07：**展示事实不授权**——同一上下文加/不加 display_support，
+    /// `allowed`/`evidence`/`reason_code` 逐操作完全相同；只有 `support` 变。
+    /// 同时锁住展示事实的四档边界：只沿用 supported/unmatched，不伪造未接入。
+    #[test]
+    fn r07_display_support_never_grants_and_only_touches_support() {
+        // 无证据、未识别（真实重连窗内的策略上下文）。
+        let mut bare = matched_idle_context();
+        bare.contract.clear();
+        bare.contract_identified = false;
+        let without = OperationPolicy.evaluate(&bare);
+
+        let mut displayed = bare.clone();
+        displayed
+            .display_support
+            .insert(CodexOperation::AsyncAnswerIdle, SupportState::Supported);
+        displayed
+            .display_support
+            .insert(CodexOperation::BlockingInput, SupportState::Unmatched);
+        displayed
+            .display_support
+            .insert(CodexOperation::RequestCancel, SupportState::Supported);
+        let with = OperationPolicy.evaluate(&displayed);
+
+        for operation in CodexOperation::ALL {
+            let a = without.get(operation).expect("status");
+            let b = with.get(operation).expect("status");
+            assert_eq!(
+                a.allowed, b.allowed,
+                "展示事实不得改 allowed（{operation:?}）"
+            );
+            assert_eq!(
+                a.evidence, b.evidence,
+                "展示事实不得冒充证据（{operation:?}）"
+            );
+            assert_eq!(
+                a.reason_code, b.reason_code,
+                "展示事实不得改原因码（{operation:?}）"
+            );
+        }
+        // 只影响 support：上次已支持/未匹配如实沿用。
+        assert_eq!(
+            with.get(CodexOperation::AsyncAnswerIdle).unwrap().support,
+            SupportState::Supported
+        );
+        assert_eq!(
+            with.get(CodexOperation::BlockingInput).unwrap().support,
+            SupportState::Unmatched
+        );
+        // 未接入操作不因展示事实变成"已支持"。
+        assert_eq!(
+            with.get(CodexOperation::RequestCancel).unwrap().support,
+            SupportState::NotImplemented
+        );
+        // 未提供展示事实的操作仍是识别中。
+        assert_eq!(
+            with.get(CodexOperation::Interrupt).unwrap().support,
+            SupportState::Identifying
+        );
+        // 实时事实优先：识别已完成时展示事实不覆盖 unmatched/无证据结论。
+        let mut identified = matched_idle_context();
+        identified.contract.remove(&CodexOperation::AsyncAnswerIdle);
+        identified
+            .display_support
+            .insert(CodexOperation::AsyncAnswerIdle, SupportState::Supported);
+        assert_eq!(
+            OperationPolicy
+                .evaluate(&identified)
+                .get(CodexOperation::AsyncAnswerIdle)
+                .unwrap()
+                .support,
+            SupportState::Unmatched,
+            "识别完成后实时事实优先于展示事实"
+        );
+    }
+
+    /// R07 修复轮 1（偏差①接受条件②）：**适配关闭**下的反向行——有/无展示事实，
+    /// `allowed` 相同（`reason_code` 允许不同，那是"原因文案"的既定差异）；
+    /// `evidence` 相同。把「原因码是唯一允许差异」写死。
+    #[test]
+    fn r07_auto_adapt_off_display_only_may_change_reason_text() {
+        let mut bare = matched_idle_context();
+        bare.contract.clear();
+        bare.contract_identified = false;
+        bare.auto_adapt_enabled = false;
+        let without = OperationPolicy.evaluate(&bare);
+
+        let mut displayed = bare.clone();
+        displayed
+            .display_support
+            .insert(CodexOperation::AsyncAnswerIdle, SupportState::Supported);
+        displayed
+            .display_support
+            .insert(CodexOperation::CommandApproval, SupportState::Supported);
+        let with = OperationPolicy.evaluate(&displayed);
+
+        for operation in CodexOperation::ALL {
+            let a = without.get(operation).expect("status");
+            let b = with.get(operation).expect("status");
+            assert_eq!(
+                a.allowed, b.allowed,
+                "适配关闭：展示事实不得改 allowed（{operation:?}）"
+            );
+            assert_eq!(
+                a.evidence, b.evidence,
+                "适配关闭：展示事实不得冒充证据（{operation:?}）"
+            );
+            assert_eq!(
+                a.requires_auto_adapt, b.requires_auto_adapt,
+                "适配关闭：展示事实不得改活门依赖（{operation:?}）"
+            );
+        }
+        // 原因码是**唯一**允许的差异：从「等识别」纠正为「适配已关闭」。
+        assert_eq!(
+            without
+                .get(CodexOperation::AsyncAnswerIdle)
+                .unwrap()
+                .reason_code
+                .as_deref(),
+            Some(codes::OPERATION_NO_EVIDENCE)
+        );
+        assert_eq!(
+            with.get(CodexOperation::AsyncAnswerIdle)
+                .unwrap()
+                .reason_code
+                .as_deref(),
+            Some(codes::OPERATION_AUTO_ADAPT_OFF)
+        );
+        // 支持展示照旧沿用，但资格仍为 false。
+        assert_eq!(
+            with.get(CodexOperation::AsyncAnswerIdle).unwrap().support,
+            SupportState::Supported
+        );
+        assert!(!with.get(CodexOperation::AsyncAnswerIdle).unwrap().allowed);
+    }
+
+    /// T03：identity——不同包 SHA / 规则版本 / 目标互不相同；同输入恒等；
+    /// 摘要不含路径成分。
+    #[test]
+    fn t03_capability_identity_discriminates_targets_and_versions() {
+        let base = capability_identity_of("macos|build-a|cli-a|1", &"a".repeat(64), 2);
+        // 同输入恒等
+        assert_eq!(
+            base,
+            capability_identity_of("macos|build-a|cli-a|1", &"a".repeat(64), 2)
+        );
+        // 包 SHA 变 → 失效
+        assert_ne!(
+            base,
+            capability_identity_of("macos|build-a|cli-a|1", &"b".repeat(64), 2)
+        );
+        // 规则版本变 → 失效
+        assert_ne!(
+            base,
+            capability_identity_of("macos|build-a|cli-a|1", &"a".repeat(64), 3)
+        );
+        // 目标变（同 SHA 也不行——A 的支持不是 B 的支持）
+        assert_ne!(
+            base,
+            capability_identity_of("macos|build-b|cli-b|1", &"a".repeat(64), 2)
+        );
+        // 无路径：固定长度 hex 摘要，不含分隔符/盘符/扩展名等路径痕迹
+        assert_eq!(base.len(), 16);
+        assert!(base.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert!(!base.contains('/') && !base.contains('\\') && !base.contains('.'));
+    }
+
+    /// T03：serde 形状——support snake_case 小写；capabilityIdentity 为 None 时
+    /// 整个字段省略（旧载荷兼容面），Some 时 camelCase 键名。
+    #[test]
+    fn t03_support_and_identity_serialize_camel_snake() {
+        let mut context = matched_idle_context();
+        context.contract.remove(&CodexOperation::AsyncAnswerIdle);
+        let ops = OperationPolicy.evaluate(&context);
+        let raw = serde_json::to_value(&ops).unwrap();
+        assert_eq!(
+            raw["operations"]["async_answer_idle"]["support"],
+            serde_json::json!("unmatched")
+        );
+        assert_eq!(
+            raw["operations"]["blocking_input"]["support"],
+            serde_json::json!("supported")
+        );
+        // evaluate 不填身份 → 字段整个省略
+        assert!(raw.get("capabilityIdentity").is_none());
+        // adapter 填充后（此处直接模拟）随载荷下发
+        let mut ops = ops;
+        ops.capability_identity = Some(capability_identity_of("k", "s", 2));
+        let raw = serde_json::to_value(&ops).unwrap();
+        assert!(raw["capabilityIdentity"].is_string());
+        // 注：support 是 Rust 侧**必备**字段（新服务端恒输出）；「旧载荷缺 support」
+        // 的兼容在前端归一化层做（按 evidence 推导展示值，见 codexIpcApi.ts），
+        // Rust 侧不提供无上下文的缺省（缺上下文的猜测才是错误方向）。
     }
 }

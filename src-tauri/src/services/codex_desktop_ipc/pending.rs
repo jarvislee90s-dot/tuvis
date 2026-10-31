@@ -59,7 +59,10 @@ fn operations_from_caps_with_policy(
         observed: Default::default(),
         schema: Default::default(),
         contract: Default::default(),
+        contract_identified: false,
         contract_error: None,
+        display_support: Default::default(),
+        display_identity_verified: false,
     };
     let mut operations = super::capability::OperationPolicy.evaluate(&context);
     // 兼容入口（project_with_policy / 旧镜像直投影）：文件审批没有独立 shipped 位，
@@ -1753,6 +1756,9 @@ mod n09_canonical_unsafe_tests {
                 allowed: true,
                 requires_auto_adapt: true,
                 evidence: EvidenceSource::ContractMatched,
+                support: crate::services::codex_desktop_ipc::capability::SupportState::Supported,
+                support_inherited: false,
+                support_identity_verified: false,
                 reason_code: None,
             },
         );

@@ -215,8 +215,43 @@ pub fn init(conn: &Connection) {
             effect_rule_version   INTEGER,
             -- 签名开关的登记时冻结值（1 = 正文已带 `[mobile 花名]` 签名）。
             -- NULL = 本列上线前登记的旧行：按升级前语义（恒带签名）派发。
-            signature_applied       INTEGER
+            signature_applied       INTEGER,
+            -- C02（R05 残留收口）：优先处理「停止尝试」的持久占有状态机。占有在
+            -- **首次可能写出 interrupt 之前** CAS 落库（claim），覆盖「writer 已接收/
+            -- 写出帧后 handler 被取消/服务退出」的事后记录盲窗——同 actionId 重放读到
+            -- 占有/未知记录不得再次发停止帧。
+            -- stop_attempt_state：NULL（未占有，含 C02 前旧行）| 'claimed'（已占有、
+            -- 结果未知）| 'released'（首写前明确零投递，允许显式新尝试）。
+            stop_attempt_state     TEXT,
+            -- 停止尝试的未知结果 reason_code（C02 起由 claimed 占有的结果升级写入；
+            -- 旧行形态：state 为 NULL 且本列非 NULL = C02 前已记录的未知结果，读侧
+            -- 兼容识别为 Unknown——重放同样不再发停止帧）。
+            stop_attempt_reason     TEXT
         );
+        -- 一个 start-turn 的持久成员映射；正文逐成员冻结，回执归属保持原 action。
+        CREATE TABLE IF NOT EXISTS codex_send_batch_members (
+            member_id TEXT PRIMARY KEY,
+            leader_id TEXT NOT NULL,
+            wire_text TEXT NOT NULL,
+            signature_applied INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_codex_send_batch_leader
+            ON codex_send_batch_members(leader_id);
+        -- 原动作所有收敛路径（包括重启恢复、迟到回执）在同一 SQL 事务传播。
+        -- 只有 canonical action 持有 Turn 屏障，成员通过映射核对或解除屏障。
+        CREATE TRIGGER IF NOT EXISTS codex_send_batch_settle
+        AFTER UPDATE OF state, receipt_json ON codex_actions
+        WHEN NEW.state IN ('accepted', 'unknown', 'rejected')
+          AND EXISTS (SELECT 1 FROM codex_send_batch_members WHERE leader_id=NEW.action_id)
+        BEGIN
+            UPDATE codex_actions SET state=NEW.state, route=NEW.route,
+                receipt_json=CASE WHEN NEW.receipt_json IS NULL THEN NULL
+                    ELSE json_set(NEW.receipt_json, '$.actionId', action_id) END,
+                updated_at=NEW.updated_at
+            WHERE action_id IN (SELECT member_id FROM codex_send_batch_members
+                WHERE leader_id=NEW.action_id AND member_id<>NEW.action_id);
+        END;
+
         CREATE INDEX IF NOT EXISTS idx_codex_actions_thread_state_seq
             ON codex_actions(thread_id, state, seq);
         -- partial index 只收「调度/对账关心的行」，随 migrate 幂等重放补建到老库。
@@ -248,17 +283,26 @@ pub fn init(conn: &Connection) {
             -- 老库经 migrate 幂等补列 + 重建（旧行 NULL = 无归属，仅 resume/显式
             -- 清除可删；SQLite 复合主键允许 NULL 与 token 行共存）。
             pause_token  TEXT,
+            -- P3（2026-10-30 用户裁决）：停止类暂停等待的目标回合（打断/取消端点
+            -- 的 expectedTurnId 安全阀）。settle 路径按该 Turn 的**终态证据**自动
+            -- 清除停止类暂停行（「停止在途/结果未知」只是派发闸，不是永久冻结）；
+            -- NULL = 未绑定（旧行/取不到阀值）→ 保守保留，仅显式 resume 可清。
+            pause_turn_id TEXT,
             PRIMARY KEY (thread_id, pause_token)
         );
         -- ===== S2：一次性越队授权（设计 §4.2「不能全局绕过」）=====
         -- 绑定到具体新 action 的持久授权：授权跨 thread / 跨 action / 重复消费 /
         -- pending 在场全部无效。consumed_at 非 NULL = 已消费（写出前 CAS 消费恰好
         -- 一次）；行保留作审计（为什么这条先发了）。
+        -- R06：attempt = 尝试代际。**已消费行可被优先处理重铸为下一 attempt**
+        --（仅当动作仍 queued = 上一次明确零投递 busy 回队；真实写出的行必已离开
+        -- queued 不会走到重铸）——「下一次用户授权」独立可 CAS，旧 attempt 不复活。
         CREATE TABLE IF NOT EXISTS codex_bypass_grant (
             action_id   TEXT PRIMARY KEY,
             thread_id   TEXT NOT NULL,
             granted_at  INTEGER NOT NULL,
-            consumed_at INTEGER
+            consumed_at INTEGER,
+            attempt     INTEGER NOT NULL DEFAULT 1
         );
         -- ===== S4：人工继续的持久派发权撤销（设计 §6.2「撤销旧动作尚未取得的未来
         -- 首次写出权」）=====

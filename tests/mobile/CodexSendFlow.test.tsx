@@ -657,53 +657,32 @@ describe("CodexSendFlow：NotSent 重试关联与运输重试（S5）", () => {
 });
 
 // ============================================================
-// 队列暂停选择（S2：暂停不置灰——恢复 / 本条先发送 二选一）
+// 队列暂停展示收敛（C04：解释/恢复/先发送只在队列区；composer 只留入队回执）
 // ============================================================
-describe("CodexSendFlow：队列暂停选择（S2）", () => {
-  it("queue_paused_choice：send-info queuePaused=true → 出二选一；「本条先发送」→ 下一次发送带 bypassPausedQueue；grant_consumed → 引导重选而非重放", async () => {
+describe("CodexSendFlow：队列暂停展示收敛（C04）", () => {
+  it("c04_queue_paused_composer_clean：send-info queuePaused=true → composer 不渲染暂停二选一；正常发送只出简短入队回执", async () => {
     installFetch();
     routes.info = codexSendInfo({ queuePaused: true });
     render(<MessageComposer session={{ id: "sess-1" }} />);
-    await screen.findByTestId("send-queue-paused");
-    // 二选一之一：本条先发送（一次性越队授权）
-    fireEvent.click(screen.getByTestId("queue-bypass-arm"));
+    // 暂停解释/恢复/先发送三件全部不在 composer（归队列区 CodexQueuePanel）
     await flushAsync();
-    routes.sendQueue = [
-      {
-        status: "desktop_ipc",
-        receipt: ipcReceipt({
-          actionId: "act-b1",
-          delivery: "not_sent",
-          reasonCode: "grant_consumed",
-        }),
-      },
-    ];
-    await sendText("加急意见");
-    await waitFor(() => expect(sendBodies).toHaveLength(1));
-    const body = JSON.parse(sendBodies[0]) as Record<string, unknown>;
-    expect(body.bypassPausedQueue).toBe(true);
-    // 一次性：消费后不再携带（下一次发送回到普通语义）
-    await waitFor(() =>
-      expect(screen.getByTestId("send-receipt-codex-failed").textContent).toContain("授权已失效")
-    );
-    // 引导重选，不自动重放
-    expect(screen.getByTestId("send-queue-paused")).toBeTruthy();
+    expect(screen.queryByTestId("send-queue-paused")).toBeNull();
+    expect(screen.queryByTestId("queue-resume")).toBeNull();
+    expect(screen.queryByTestId("queue-bypass-arm")).toBeNull();
+    // 暂停不置灰：正常输入发送 → 服务端留队 → 简短入队回执
+    await sendText("排队意见");
+    await waitFor(() => expect(screen.getByTestId("send-receipt-codex-queued")).toBeTruthy());
+    // 回执不在 composer 触发任何越队参数（载荷无 bypassPausedQueue）
+    const queuedBody = sendBodies.map((b) => JSON.parse(b) as Record<string, unknown>);
+    expect(queuedBody.some((body) => body.bypassPausedQueue === true)).toBe(false);
   });
 
-  it("queue_resume_endpoint：点「恢复队列」→ POST /codex/queue/resume（唯一解除出口）并刷新 send-info", async () => {
+  it("c04_composer_has_no_resume：暂停下 composer 也无恢复按钮（唯一入口在队列区，见面板用例）", async () => {
     installFetch();
     routes.info = codexSendInfo({ queuePaused: true });
     render(<MessageComposer session={{ id: "sess-1" }} />);
     await flushAsync();
-    fireEvent.click(screen.getByTestId("queue-resume"));
-    await flushAsync();
-    expect(queueResumeBodies).toHaveLength(1);
-    expect(JSON.parse(queueResumeBodies[0])).toEqual({ sessionId: "sess-1" });
-    // 恢复后重新拉 send-info（刷新暂停态）
-    const infoCalls = fetchMock.mock.calls.filter(([u]) =>
-      String(u).includes("/session-send-info")
-    );
-    expect(infoCalls.length).toBeGreaterThanOrEqual(2);
+    expect(screen.queryByTestId("queue-resume")).toBeNull();
   });
 
   it("queue_panel_empty_pause：无排队条目也无屏障 → 只有陈旧暂停行时面板自隐", async () => {
@@ -720,7 +699,7 @@ describe("CodexSendFlow：队列暂停选择（S2）", () => {
     expect(screen.queryByTestId("codex-queue-paused")).toBeNull();
   });
 
-  it("queue_panel_paused：队列视图 queuePaused=true → 面板出暂停说明与恢复队列入口（同一解除出口）", async () => {
+  it("queue_panel_paused：队列视图 queuePaused=true → 展开后出暂停说明与唯一恢复队列入口（同一解除出口）", async () => {
     installFetch();
     routes.queueView = {
       actions: [
@@ -732,6 +711,8 @@ describe("CodexSendFlow：队列暂停选择（S2）", () => {
     };
     render(<CodexQueuePanel sessionId="sess-1" />);
     await waitFor(() => expect(screen.getByTestId("codex-queue-panel")).toBeTruthy());
+    // C04：默认折叠（摘要行）；展开后才出暂停说明与恢复入口
+    fireEvent.click(screen.getByTestId("codex-queue-toggle"));
     expect(screen.getByTestId("codex-queue-paused")).toBeTruthy();
     fireEvent.click(screen.getByTestId("codex-queue-resume"));
     await flushAsync();

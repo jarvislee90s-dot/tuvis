@@ -567,6 +567,22 @@ fn fixture_ipc_interrupt(sessions: Vec<Session>) -> Fixture {
     )
 }
 
+/// 打断能力 fixture（指定共享库）：R05 重放/重启测试用——同一 SQLite 上多阶段
+/// 重建 hub/store（内存态不共通，只有持久层共通），conn 须已完成 seed_device。
+fn fixture_ipc_interrupt_on(conn: SharedConn, sessions: Vec<Session>) -> Fixture {
+    let (io, peer) = ScriptedPeer::new();
+    let adapter = Arc::new(DesktopIpcAdapter::new(
+        Arc::new(StaticConnector::new_interrupt(io)),
+        caps_open_profile(),
+    ));
+    fixture_on(
+        conn,
+        sessions,
+        move |store| Arc::new(CodexControlHub::with_adapter(store, adapter, true)),
+        Some(peer),
+    )
+}
+
 /// hub 不可用 fixture（disabled：一切能力关闭）。R8 起普通消息仍经 router（登记→
 /// reserve→NotSent→兜底资格），故 hub 的 ActionStore 必须与 state.store 同库——
 /// 设备复核才能放行到「兜底拒发」臂。
@@ -871,6 +887,124 @@ async fn thread_state_returns_live_projection() {
     assert_eq!(v["runtimeStatus"], "idle");
 }
 
+/// T02：GET /codex/thread（轮询与手动刷新同源）的投影 JSON 必须携带
+/// `projectionVersion`（camelCase 子字段），`instanceId` 绑定本 hub 世系
+/// （`owner_boot`）且**不随 GET 变化**——前端据此把 GET／SSE／手动刷新收进
+/// 同一落地守卫；每次 GET 生成新身份会使跨响应比较失效（禁止）。
+#[tokio::test]
+async fn thread_state_projection_carries_boot_instance_version() {
+    let mut f = fixture_ipc(vec![codex_app_session(THREAD)]);
+    let mut peer = f.peer.take().unwrap();
+    let boot = f.state.codex_control.owner_boot().to_string();
+    let app = f.app.clone();
+    let task = tokio::spawn(async move {
+        app.oneshot(req(
+            "GET",
+            &format!("/m/api/v1/codex/thread?session_id={THREAD}"),
+            Some(COOKIE),
+            None,
+        ))
+        .await
+        .unwrap()
+    });
+    drive_ensure(&mut peer, THREAD, vec![], "idle").await;
+    let r = tokio::time::timeout(Duration::from_secs(15), task)
+        .await
+        .expect("thread_state in time")
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    let ver = v
+        .get("projectionVersion")
+        .unwrap_or_else(|| panic!("投影必须携带 projectionVersion：{v}"));
+    assert_eq!(ver["instanceId"], serde_json::json!(boot));
+    assert!(ver["ownerEpoch"].is_u64(), "ownerEpoch 必须是数字：{ver}");
+    assert!(
+        ver["ownerGeneration"].is_u64(),
+        "ownerGeneration 必须是数字：{ver}"
+    );
+    assert!(ver["localSeq"].is_u64(), "localSeq 必须是数字：{ver}");
+    // revision 与投影本体同源（可空）
+    assert_eq!(ver["revision"], v["revision"]);
+
+    // 第二次 GET：instanceId 不变（hub 世系身份，不是每次 GET 随机值）
+    let r2 = f
+        .app
+        .clone()
+        .oneshot(req(
+            "GET",
+            &format!("/m/api/v1/codex/thread?session_id={THREAD}"),
+            Some(COOKIE),
+            None,
+        ))
+        .await
+        .unwrap();
+    let v2: serde_json::Value = serde_json::from_str(&body_string(r2).await).unwrap();
+    assert_eq!(
+        v2["projectionVersion"]["instanceId"],
+        serde_json::json!(boot),
+        "instanceId 必须绑定 hub 世系，不得每次 GET 重新生成"
+    );
+    assert_eq!(v2["projectionVersion"]["instanceId"], ver["instanceId"]);
+}
+
+/// T02：SSE 首帧 `snapshot` 同样携带 `projectionVersion`（与 GET 同源下发）。
+#[tokio::test]
+async fn sse_snapshot_carries_boot_instance_version() {
+    let mut f = fixture_ipc(vec![codex_app_session(THREAD)]);
+    let mut peer = f.peer.take().unwrap();
+    let boot = f.state.codex_control.owner_boot().to_string();
+    let app = f.app.clone();
+    let task = tokio::spawn(async move {
+        app.oneshot(req(
+            "GET",
+            &format!("/m/api/v1/codex/thread/events?session_id={THREAD}"),
+            Some(COOKIE),
+            None,
+        ))
+        .await
+        .unwrap()
+    });
+    drive_ensure(&mut peer, THREAD, vec![], "idle").await;
+    let r = tokio::time::timeout(Duration::from_secs(15), task)
+        .await
+        .expect("sse in time")
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let mut body = r.into_body();
+    use http_body_util::BodyExt;
+    // SSE 分帧不保证一帧 = 一事件：读到含投影 JSON 的帧为止，再剥掉 `data:` 前缀
+    let mut text = String::new();
+    for _ in 0..10 {
+        let frame = tokio::time::timeout(Duration::from_secs(10), body.frame())
+            .await
+            .expect("first frame")
+            .unwrap()
+            .unwrap();
+        text.push_str(core::str::from_utf8(frame.data_ref().unwrap()).unwrap());
+        if text.contains("\"threadId\"") {
+            break;
+        }
+    }
+    assert!(
+        text.contains("\"threadId\""),
+        "首帧为 ThreadProjection 快照：{text}"
+    );
+    let data = text
+        .lines()
+        .find_map(|l| l.strip_prefix("data: "))
+        .unwrap_or_else(|| panic!("snapshot 事件缺 data 行：{text}"));
+    let v: serde_json::Value = serde_json::from_str(data).expect("snapshot data 是 JSON 投影");
+    let ver = v
+        .get("projectionVersion")
+        .unwrap_or_else(|| panic!("SSE snapshot 必须携带 projectionVersion：{text}"));
+    assert_eq!(
+        ver["instanceId"],
+        serde_json::json!(boot),
+        "SSE 与 GET 的 instanceId 必须同源（hub 世系）"
+    );
+}
+
 /// thread 不可解析（非 UUID 且无 rollout）→ 404。
 #[tokio::test]
 async fn thread_state_unresolvable_session_is_404() {
@@ -1167,6 +1301,173 @@ async fn delayed_client_identity_within_window_is_accepted() {
     let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
     assert_eq!(v["receipt"]["delivery"], "accepted");
     assert_eq!(v["receipt"]["turnId"], "turn-delayed");
+}
+
+/// P1 弱证据回退（2026-10-30 用户裁决批次）：ack 的 Turn 内没有本次 clientId
+///（桌面侧自有消息 id 的回显形态），但存在**唯一**一条正文与本次 wire 完全一致
+///（hash 相同）的 userMessage → Accepted（不再降级 unknown）。
+/// 强证据（clientId）仍为第一优先：本用例只补「回显形态不符但有唯一正文证据」。
+#[tokio::test]
+async fn p1_unique_body_hash_in_acked_turn_is_accepted() {
+    let mut f = fixture_ipc(vec![codex_app_session(THREAD)]);
+    let mut peer = f.peer.take().unwrap();
+    let app = f.app.clone();
+    let body = send_body("正文弱证据", Some("act-weak-1"), false);
+    let task = tokio::spawn(async move {
+        app.oneshot(req(
+            "POST",
+            "/m/api/v1/session-send",
+            Some(COOKIE),
+            Some(body),
+        ))
+        .await
+        .unwrap()
+    });
+    drive_ensure(&mut peer, THREAD, vec![], "idle").await;
+    let frame = peer.recv().await;
+    assert_eq!(frame["method"], "thread-follower-start-turn");
+    // ack 的 Turn 内 userMessage 的 clientId 不是本次 cmid，但正文与 wire 完全一致且唯一
+    peer.send(&snapshot_frame(
+        THREAD,
+        "owner-1",
+        8,
+        "active",
+        serde_json::json!({
+            "t-weak": { "id": "t-weak", "type": "turn", "status": "inProgress", "items": ["u-weak"] },
+            "u-weak": { "id": "u-weak", "type": "userMessage", "clientId": "desktop-own-id", "content": [{"type":"text","text":"正文弱证据"}], "ts": 2 }
+        }),
+        serde_json::json!(["t-weak"]),
+    ))
+    .await;
+    peer.send(&serde_json::json!({
+        "type": "response", "requestId": frame["requestId"],
+        "resultType": "success", "method": "thread-follower-start-turn",
+        "handledByClientId": "owner-1",
+        "result": { "turn": { "id": "t-weak", "status": "inProgress" } }
+    }))
+    .await;
+    let r = tokio::time::timeout(Duration::from_secs(20), task)
+        .await
+        .expect("send in time")
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    assert_eq!(v["receipt"]["delivery"], "accepted", "{v}");
+    assert_eq!(v["receipt"]["turnId"], "t-weak");
+    let view = f
+        .hub_store()
+        .get_for_device("act-weak-1", "dev-1")
+        .unwrap()
+        .unwrap();
+    assert_eq!(view.state, ActionState::Accepted, "弱证据不降级 unknown");
+}
+
+/// P1 反例①：ack 的 Turn 内有**两条**同 hash 用户消息（多义）→ 弱证据不采纳，
+/// 维持保守 unknown + 屏障在册。
+#[tokio::test]
+async fn p1_ambiguous_body_hash_in_acked_turn_stays_unknown() {
+    let mut f = fixture_ipc(vec![codex_app_session(THREAD)]);
+    let mut peer = f.peer.take().unwrap();
+    let app = f.app.clone();
+    let body = send_body("多义正文", Some("act-weak-2"), false);
+    let task = tokio::spawn(async move {
+        app.oneshot(req(
+            "POST",
+            "/m/api/v1/session-send",
+            Some(COOKIE),
+            Some(body),
+        ))
+        .await
+        .unwrap()
+    });
+    drive_ensure(&mut peer, THREAD, vec![], "idle").await;
+    let frame = peer.recv().await;
+    assert_eq!(frame["method"], "thread-follower-start-turn");
+    peer.send(&snapshot_frame(
+        THREAD,
+        "owner-1",
+        8,
+        "active",
+        serde_json::json!({
+            "t-amb": { "id": "t-amb", "type": "turn", "status": "inProgress", "items": ["u-amb-1", "u-amb-2"] },
+            "u-amb-1": { "id": "u-amb-1", "type": "userMessage", "clientId": "d-1", "content": [{"type":"text","text":"多义正文"}], "ts": 2 },
+            "u-amb-2": { "id": "u-amb-2", "type": "userMessage", "clientId": "d-2", "content": [{"type":"text","text":"多义正文"}], "ts": 3 }
+        }),
+        serde_json::json!(["t-amb"]),
+    ))
+    .await;
+    peer.send(&serde_json::json!({
+        "type": "response", "requestId": frame["requestId"],
+        "resultType": "success", "method": "thread-follower-start-turn",
+        "handledByClientId": "owner-1",
+        "result": { "turn": { "id": "t-amb", "status": "inProgress" } }
+    }))
+    .await;
+    let r = tokio::time::timeout(Duration::from_secs(20), task)
+        .await
+        .expect("send in time")
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    assert_eq!(v["receipt"]["delivery"], "unknown_delivery", "{v}");
+    assert_eq!(v["receipt"]["reasonCode"], "client_message_unverified");
+    assert!(
+        f.hub_store().has_compat_fence(&f.thread_key()).unwrap(),
+        "多义弱证据必须留保守屏障"
+    );
+}
+
+/// P1 反例②：同 hash 正文只在**别的 Turn**（非本次 ack 的 Turn）→ 跨 Turn 不采纳，
+/// 维持保守 unknown。判据只作用于已 ack 的同一 turnId 内。
+#[tokio::test]
+async fn p1_body_hash_in_other_turn_never_adopted() {
+    let mut f = fixture_ipc(vec![codex_app_session(THREAD)]);
+    let mut peer = f.peer.take().unwrap();
+    let app = f.app.clone();
+    let body = send_body("跨回合正文", Some("act-weak-3"), false);
+    let task = tokio::spawn(async move {
+        app.oneshot(req(
+            "POST",
+            "/m/api/v1/session-send",
+            Some(COOKIE),
+            Some(body),
+        ))
+        .await
+        .unwrap()
+    });
+    drive_ensure(&mut peer, THREAD, vec![], "idle").await;
+    let frame = peer.recv().await;
+    assert_eq!(frame["method"], "thread-follower-start-turn");
+    // t-old（别的回合）有同 hash 用户消息；本次 ack 的 t-new 里没有 userMessage
+    peer.send(&snapshot_frame(
+        THREAD,
+        "owner-1",
+        8,
+        "active",
+        serde_json::json!({
+            "t-old": { "id": "t-old", "type": "turn", "status": "completed", "items": ["u-old"] },
+            "u-old": { "id": "u-old", "type": "userMessage", "clientId": "d-old", "content": [{"type":"text","text":"跨回合正文"}], "ts": 1 },
+            "t-new": { "id": "t-new", "type": "turn", "status": "inProgress", "items": [] }
+        }),
+        serde_json::json!(["t-old", "t-new"]),
+    ))
+    .await;
+    peer.send(&serde_json::json!({
+        "type": "response", "requestId": frame["requestId"],
+        "resultType": "success", "method": "thread-follower-start-turn",
+        "handledByClientId": "owner-1",
+        "result": { "turn": { "id": "t-new", "status": "inProgress" } }
+    }))
+    .await;
+    let r = tokio::time::timeout(Duration::from_secs(20), task)
+        .await
+        .expect("send in time")
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    assert_eq!(v["receipt"]["delivery"], "unknown_delivery", "{v}");
+    assert_eq!(v["receipt"]["reasonCode"], "client_message_unverified");
+    assert!(
+        f.hub_store().has_compat_fence(&f.thread_key()).unwrap(),
+        "跨 Turn 同文不构成送达证据"
+    );
 }
 
 /// 忙 Thread（快照 active）→ codex_queued + position（宪法 R2.3 留队）。
@@ -2228,7 +2529,7 @@ async fn queue_view_never_deletes_pause_on_read() {
         .codex_control
         .router
         .store()
-        .set_queue_pause(&f.thread_key(), "interrupt_accepted", "stale-token")
+        .set_queue_pause(&f.thread_key(), "interrupt_accepted", "stale-token", None)
         .unwrap();
     let r = f
         .app
@@ -3964,6 +4265,537 @@ async fn multi_copy_ambiguous_turn_evidence_never_clears_barrier() {
     }))
     .await;
     f.state.codex_control.stop();
+}
+
+// ============================================================
+// P2（2026-10-30）：native unknown 保守屏障的核对解除与插队兜底
+// ============================================================
+
+/// P2 正例：native（route=desktop_ipc）unknown 保守屏障带 wire hash 证据，镜像中
+/// 唯一正文匹配的 Turn 以终态在场 → settle 只读核对通过 → 屏障清除、队列按 FIFO
+/// 自然接力（不需要人工 force-continue）。
+#[tokio::test]
+async fn p2_native_unknown_barrier_reconciles_via_mirror_evidence_and_relays() {
+    use multi_agents_manager_lib::services::codex_control::wire_text_hash;
+    let mut f = fixture_ipc(vec![codex_app_session(THREAD)]);
+    f.state
+        .codex_control
+        .set_reconcile_period_ms(std::time::Duration::from_millis(200).as_millis() as u64);
+    f.state.codex_control.start(f.state.clone());
+
+    // ① 种一条 native unknown 保守屏障（无 turnId 绑定；wire hash 证据在册）
+    let store = f.hub_store();
+    seed_unknown_barrier(&store, "act-p2-unk");
+    store
+        .set_native_wire_evidence("act-p2-unk", &wire_text_hash("未知投递"))
+        .unwrap();
+    assert!(store.has_compat_fence(&f.thread_key()).unwrap());
+    // ② 队列里排一条普通消息（屏障清除后由 flush 自然接力）
+    let ctx = ActionContext {
+        action_id: "act-p2-q".into(),
+        device_id: "dev-1".into(),
+        device_name: "iPhone".into(),
+        kind: ActionKind::Send,
+        key: f.thread_key(),
+    };
+    store
+        .register(&ctx, ActionKind::Send, None, None, "h2", Some("接力消息"))
+        .unwrap();
+    // ③ 启动调度循环；settle 对该 thread 主动 ensure（C2 断路器）——先应答握手
+    // 建立镜像（rev 7），再推终态快照
+    let mut peer = f.peer.take().unwrap();
+    f.state
+        .codex_control
+        .set_reconcile_period_ms(std::time::Duration::from_millis(200).as_millis() as u64);
+    f.state.codex_control.start(f.state.clone());
+    drive_ensure(&mut peer, THREAD, vec![], "idle").await;
+    wait_snapshot_applied(&f, 7, true).await;
+    // ④ 桌面推终态快照：唯一正文匹配的 Turn 以 completed 在场 + runtime idle
+    peer.send(&snapshot_frame(
+        THREAD,
+        "owner-1",
+        8,
+        "idle",
+        serde_json::json!({
+            "t-p2": { "id": "t-p2", "type": "turn", "status": "completed", "items": ["u-p2"] },
+            "u-p2": { "id": "u-p2", "type": "userMessage", "clientId": "whatever", "content": [{"type":"text","text":"未知投递"}], "ts": 1 }
+        }),
+        serde_json::json!(["t-p2"]),
+    ))
+    .await;
+    wait_snapshot_applied(&f, 8, true).await;
+    // ⑤ 直接驱动一次结算（不走后台循环——本用例要验的是**核对逻辑本身**，
+    // 不是调度循环的时序）。P11（2026-10-31）：队列不再等屏障，因此接力与屏障清除
+    // 不再有先后假设，只分别校验两件事都成立。
+    multi_agents_manager_lib::remote::codex_ipc::settle_thread_for_tests(
+        &f.state.codex_control,
+        &f.thread_key(),
+    )
+    .await;
+    assert!(
+        !store.has_compat_fence(&f.thread_key()).unwrap(),
+        "镜像证据齐备时屏障必须被核对清除（核对能力不能被削弱）"
+    );
+    // ⑥ FIFO 自然接力：flush 派出 act-p2-q（队列未被暂停，无 resume 参与）
+    let frame = recv_within(&mut peer, 10).await;
+    assert_eq!(frame["method"], "thread-follower-start-turn");
+    confirm_client_message_identity_for(
+        &mut peer,
+        THREAD,
+        &frame,
+        "turn-p2-q",
+        "接力消息",
+        9,
+        "owner-1",
+    )
+    .await;
+    peer.send(&serde_json::json!({
+        "type": "response", "requestId": frame["requestId"],
+        "resultType": "success", "method": "thread-follower-start-turn",
+        "handledByClientId": "owner-1",
+        "result": { "turn": { "id": "turn-p2-q", "status": "inProgress" } }
+    }))
+    .await;
+    wait_action_state(
+        &f,
+        "act-p2-q",
+        ActionState::Accepted,
+        Duration::from_secs(10),
+    )
+    .await;
+    f.state.codex_control.stop();
+}
+
+/// P2 反例：核对证据不足（镜像里没有正文匹配 / 唯一性不成立）→ 屏障保持、
+/// 队列不接力（纪律不因「到点了/idle 了」放宽）。
+#[tokio::test]
+async fn p2_native_unknown_without_evidence_stays_frozen() {
+    use multi_agents_manager_lib::services::codex_control::wire_text_hash;
+    let mut f = fixture_ipc(vec![codex_app_session(THREAD)]);
+    let store = f.hub_store();
+    seed_unknown_barrier(&store, "act-p2-keep");
+    store
+        .set_native_wire_evidence("act-p2-keep", &wire_text_hash("未知投递"))
+        .unwrap();
+    let ctx = ActionContext {
+        action_id: "act-p2-q2".into(),
+        device_id: "dev-1".into(),
+        device_name: "iPhone".into(),
+        kind: ActionKind::Send,
+        key: f.thread_key(),
+    };
+    store
+        .register(&ctx, ActionKind::Send, None, None, "h2", Some("排队消息"))
+        .unwrap();
+    // 启动调度循环并建立镜像（rev 7），再推「无证据」快照
+    let mut peer = f.peer.take().unwrap();
+    f.state
+        .codex_control
+        .set_reconcile_period_ms(std::time::Duration::from_millis(200).as_millis() as u64);
+    f.state.codex_control.start(f.state.clone());
+    drive_ensure(&mut peer, THREAD, vec![], "idle").await;
+    wait_snapshot_applied(&f, 7, true).await;
+    // 快照只有「别的文字」的终态 Turn + idle：无正文匹配 → 不构成证据
+    peer.send(&snapshot_frame(
+        THREAD,
+        "owner-1",
+        8,
+        "idle",
+        serde_json::json!({
+            "t-x": { "id": "t-x", "type": "turn", "status": "completed", "items": ["u-x"] },
+            "u-x": { "id": "u-x", "type": "userMessage", "clientId": "c1", "content": [{"type":"text","text":"别的文字"}], "ts": 1 }
+        }),
+        serde_json::json!(["t-x"]),
+    ))
+    .await;
+    wait_snapshot_applied(&f, 8, true).await;
+    // 给足若干个对账周期：屏障必须仍在、队列不接力
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(
+        store.has_compat_fence(&f.thread_key()).unwrap(),
+        "证据不足必须保持屏障（该条仍是未知、不被自动重发）"
+    );
+    // P11（2026-10-31 用户裁决：「不能卡我其他流程」）：屏障只保护它自己那一行。
+    // 队列里那条内容完全不同的「排队消息」必须能正常接力——旧断言要求「零接力帧」
+    // 正是实机上「空闲也不发、队列永久停摆」的来源。
+    assert!(
+        count_start_turn_frames(&mut peer).await > 0,
+        "屏障不得冻结队列里其它消息的接力"
+    );
+    f.state.codex_control.stop();
+}
+
+/// P2 兜底：无任何可用证据的 unknown 残留屏障（state=unknown 终态行）不得永久
+/// 堵死**显式用户插队**——prioritize 在队列已暂停时仍可越队派发（用户知情动作 =
+/// 明确告知风险的接受）；屏障本身保留（自动接力仍冻结，核对/人工解除才消失）。
+#[tokio::test]
+async fn p2_unknown_residue_allows_explicit_prioritize() {
+    let mut f = fixture_ipc(vec![codex_app_session(THREAD)]);
+    let store = f.hub_store();
+    // ① 无证据的 unknown 残留屏障（wire hash 也无——旧数据形态，无从核对）
+    seed_unknown_barrier(&store, "act-p2-residue");
+    assert!(store.has_compat_fence(&f.thread_key()).unwrap());
+    // ② 队列暂停行 + 待插队的 queued 行
+    store
+        .set_queue_pause(&f.thread_key(), "interrupt_accepted", "tok-p2", None)
+        .unwrap();
+    let ctx = ActionContext {
+        action_id: "act-p2-pr".into(),
+        device_id: "dev-1".into(),
+        device_name: "iPhone".into(),
+        kind: ActionKind::Send,
+        key: f.thread_key(),
+    };
+    store
+        .register(&ctx, ActionKind::Send, None, None, "h3", Some("插队消息"))
+        .unwrap();
+
+    // ③ 显式插队：空闲 + 已暂停 → 越队恰好一帧
+    let app = f.app.clone();
+    let body = serde_json::json!({
+        "sessionId": THREAD, "actionId": "act-p2-pr", "confirmInterrupt": false,
+    });
+    let mut peer = f.peer.take().unwrap();
+    let task = tokio::spawn(async move {
+        app.oneshot(req(
+            "POST",
+            "/m/api/v1/codex/queue/prioritize",
+            Some(COOKIE),
+            Some(body.to_string()),
+        ))
+        .await
+        .unwrap()
+    });
+    drive_ensure(&mut peer, THREAD, vec![], "idle").await;
+    let frame = recv_within(&mut peer, 15).await;
+    assert_eq!(frame["method"], "thread-follower-start-turn");
+    confirm_client_message_identity_for(
+        &mut peer,
+        THREAD,
+        &frame,
+        "turn-p2-pr",
+        "插队消息",
+        8,
+        "owner-1",
+    )
+    .await;
+    peer.send(&serde_json::json!({
+        "type": "response", "requestId": frame["requestId"],
+        "resultType": "success", "method": "thread-follower-start-turn",
+        "handledByClientId": "owner-1",
+        "result": { "turn": { "id": "turn-p2-pr", "status": "inProgress" } }
+    }))
+    .await;
+    let r = tokio::time::timeout(Duration::from_secs(20), task)
+        .await
+        .expect("prioritize in time")
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    assert_eq!(v["result"], "prioritized", "{v}");
+    wait_action_state(
+        &f,
+        "act-p2-pr",
+        ActionState::Accepted,
+        Duration::from_secs(10),
+    )
+    .await;
+    // ④ 残留屏障本身不因插队消失（自动接力仍冻结，等核对或人工解除）
+    assert!(
+        store.has_compat_fence(&f.thread_key()).unwrap(),
+        "插队不等于解除屏障"
+    );
+}
+
+// ============================================================
+// P3（2026-10-30 用户裁决）：停止类暂停的终态自动解除与队列自然接力
+// ============================================================
+
+/// P3 正例：打断受理（暂停行绑定目标回合）→ 该回合以终态在场（interrupted +
+/// runtime idle）→ settle 自动清除停止类暂停行并按 FIFO 自然接力（无需 resume）。
+#[tokio::test]
+async fn p3_stop_pause_auto_releases_on_turn_terminal_and_relays_fifo() {
+    let mut f = fixture_ipc_interrupt(vec![codex_app_session(THREAD)]);
+    let mut peer = f.peer.take().unwrap();
+    // SSE 持引用 + active 回合（打断阀值显式携带）
+    let (sse, _) = sse_hold_ensure(&f, &mut peer, THREAD, vec![], "active").await;
+    f.state
+        .codex_control
+        .set_reconcile_period_ms(std::time::Duration::from_millis(200).as_millis() as u64);
+    f.state.codex_control.start(f.state.clone());
+
+    // ① 两条旧消息入队（忙态 FIFO）
+    for (i, act) in ["act-p3-old-1", "act-p3-old-2"].iter().enumerate() {
+        let app = f.app.clone();
+        let body = send_body_for(&format!("P3旧消息{i}"), Some(act), false, THREAD);
+        let r = tokio::time::timeout(Duration::from_secs(15), async move {
+            app.oneshot(req(
+                "POST",
+                "/m/api/v1/session-send",
+                Some(COOKIE),
+                Some(body),
+            ))
+            .await
+            .unwrap()
+        })
+        .await
+        .expect("queue in time");
+        let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+        assert_eq!(v["status"], "codex_queued", "{v}");
+    }
+
+    // ② 打断受理 → 停止类暂停行落库且绑定目标回合 t-live
+    let body = serde_json::json!({ "sessionId": THREAD, "turnId": "t-live" });
+    let app = f.app.clone();
+    let task = tokio::spawn(async move {
+        app.oneshot(req(
+            "POST",
+            "/m/api/v1/codex/turn/interrupt",
+            Some(COOKIE),
+            Some(body.to_string()),
+        ))
+        .await
+        .unwrap()
+    });
+    let frame = recv_within(&mut peer, 10).await;
+    assert_eq!(frame["method"], "thread-follower-interrupt-turn");
+    peer.send(&serde_json::json!({
+        "type": "response", "requestId": frame["requestId"],
+        "resultType": "success", "method": "thread-follower-interrupt-turn",
+        "result": { "interruptedTurnId": "t-live", "ok": true }
+    }))
+    .await;
+    let r = tokio::time::timeout(Duration::from_secs(15), task)
+        .await
+        .expect("interrupt in time")
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    assert_eq!(v["ok"], true);
+    assert_eq!(v["queuePaused"], serde_json::json!(true), "{v}");
+    let rows = f.hub_store().stop_pause_rows(&f.thread_key()).unwrap();
+    assert_eq!(rows.len(), 1, "一条停止类暂停行");
+    assert_eq!(
+        rows[0].1.as_deref(),
+        Some("t-live"),
+        "暂停行必须绑定本次停止等待的目标回合"
+    );
+
+    // ③ 被停回合终态到场（interrupted + runtime idle）→ settle 自动解除 + FIFO 接力
+    peer.send(&serde_json::json!({
+        "type": "broadcast", "method": "thread-stream-state-changed", "version": 11,
+        "sourceClientId": "owner-1",
+        "params": {
+            "conversationId": THREAD, "hostId": "local",
+            "change": {
+                "type": "snapshot", "revision": 20,
+                "conversationState": {
+                    "turns": [], "requests": [],
+                    "threadRuntimeStatus": { "type": "idle" },
+                    "turnHistory": codex_fixture::canonical_turn_history(
+                        serde_json::json!({
+                            "t-live": { "id": "t-live", "type": "turn", "status": "interrupted", "items": ["u-live"] },
+                            "u-live": { "id": "u-live", "type": "user_message", "text": "seed", "ts": 1 }
+                        }),
+                        serde_json::json!([{ "entries": ["t-live"] }])
+                    )
+                }
+            }
+        }
+    }))
+    .await;
+    wait_snapshot_applied(&f, 20, true).await;
+    // 自动解除（有界等待周期对账）
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(6);
+    loop {
+        if f.hub_store()
+            .stop_pause_rows(&f.thread_key())
+            .unwrap()
+            .is_empty()
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "停止类暂停行应随回合终态自动解除"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        f.hub_store()
+            .queue_pause(&f.thread_key())
+            .unwrap()
+            .is_none(),
+        "全部暂停行已清除（queuePaused 翻 false，无 resume 参与）"
+    );
+    // ④ FIFO 自然接力：队首 act-p3-old-1 派发（无「恢复队列」调用）
+    let frame = recv_within(&mut peer, 10).await;
+    assert_eq!(frame["method"], "thread-follower-start-turn");
+    confirm_client_message_identity_for(
+        &mut peer,
+        THREAD,
+        &frame,
+        "turn-p3-old-1",
+        "P3旧消息0",
+        21,
+        "owner-1",
+    )
+    .await;
+    peer.send(&serde_json::json!({
+        "type": "response", "requestId": frame["requestId"],
+        "resultType": "success", "method": "thread-follower-start-turn",
+        "handledByClientId": "owner-1",
+        "result": { "turn": { "id": "turn-p3-old-1", "status": "inProgress" } }
+    }))
+    .await;
+    wait_action_state(
+        &f,
+        "act-p3-old-1",
+        ActionState::Accepted,
+        Duration::from_secs(10),
+    )
+    .await;
+    drop(sse);
+}
+
+/// P3 反例：回合未拿到终态（回合不在场 = 无法证明停止生效）→ 停止类暂停保持、
+/// 队列不接力（「停止未生效就不要放行」的保护保留）。
+#[tokio::test]
+async fn p3_stop_pause_holds_while_turn_not_terminal() {
+    let mut f = fixture_ipc_interrupt(vec![codex_app_session(THREAD)]);
+    let mut peer = f.peer.take().unwrap();
+    f.state
+        .codex_control
+        .set_reconcile_period_ms(std::time::Duration::from_millis(200).as_millis() as u64);
+    let (sse, _) = sse_hold_ensure(&f, &mut peer, THREAD, vec![], "active").await;
+    f.state.codex_control.start(f.state.clone());
+    // 旧消息入队 + 打断受理（暂停行绑定 t-live）
+    let app = f.app.clone();
+    let body = send_body_for("P3保持消息", Some("act-p3-hold"), false, THREAD);
+    let r = tokio::time::timeout(Duration::from_secs(15), async move {
+        app.oneshot(req(
+            "POST",
+            "/m/api/v1/session-send",
+            Some(COOKIE),
+            Some(body),
+        ))
+        .await
+        .unwrap()
+    })
+    .await
+    .expect("queue in time");
+    let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    assert_eq!(v["status"], "codex_queued", "{v}");
+    let body = serde_json::json!({ "sessionId": THREAD, "turnId": "t-live" });
+    let app = f.app.clone();
+    let task = tokio::spawn(async move {
+        app.oneshot(req(
+            "POST",
+            "/m/api/v1/codex/turn/interrupt",
+            Some(COOKIE),
+            Some(body.to_string()),
+        ))
+        .await
+        .unwrap()
+    });
+    let frame = recv_within(&mut peer, 10).await;
+    peer.send(&serde_json::json!({
+        "type": "response", "requestId": frame["requestId"],
+        "resultType": "success", "method": "thread-follower-interrupt-turn",
+        "result": { "interruptedTurnId": "t-live", "ok": true }
+    }))
+    .await;
+    let r = tokio::time::timeout(Duration::from_secs(15), task)
+        .await
+        .expect("interrupt in time")
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    assert_eq!(v["queuePaused"], serde_json::json!(true), "{v}");
+    // 快照：t-live **不在场**（空 Turn 表）+ idle——无该 Turn 的终态证据
+    push_snapshot(&mut peer, THREAD, 20, "idle", vec![]).await;
+    wait_snapshot_applied(&f, 20, true).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(
+        !f.hub_store()
+            .stop_pause_rows(&f.thread_key())
+            .unwrap()
+            .is_empty(),
+        "回合未终态：停止类暂停保持"
+    );
+    assert_eq!(
+        count_start_turn_frames(&mut peer).await,
+        0,
+        "暂停保持期间零接力帧"
+    );
+    drop(sse);
+}
+
+/// P3 反例②：只自动清**停止类**暂停——非停止来源的暂停行存在时线程仍视为暂停、
+/// 不接力（不被误清除）。
+#[tokio::test]
+async fn p3_auto_release_only_stop_class_pauses() {
+    let mut f = fixture_ipc_interrupt(vec![codex_app_session(THREAD)]);
+    let mut peer = f.peer.take().unwrap();
+    f.state
+        .codex_control
+        .set_reconcile_period_ms(std::time::Duration::from_millis(200).as_millis() as u64);
+    let (sse, _) = sse_hold_ensure(&f, &mut peer, THREAD, vec![], "active").await;
+    f.state.codex_control.start(f.state.clone());
+    // 停止类行（绑定 t-live）+ 非停止行（user_hold；不受自动解除影响）
+    let store = f.hub_store();
+    store
+        .set_queue_pause(
+            &f.thread_key(),
+            "interrupt_pending",
+            "tok-p3-stop",
+            Some("t-live"),
+        )
+        .unwrap();
+    store
+        .set_queue_pause(&f.thread_key(), "user_hold", "tok-p3-user", None)
+        .unwrap();
+    // 回合终态到场
+    peer.send(&serde_json::json!({
+        "type": "broadcast", "method": "thread-stream-state-changed", "version": 11,
+        "sourceClientId": "owner-1",
+        "params": {
+            "conversationId": THREAD, "hostId": "local",
+            "change": {
+                "type": "snapshot", "revision": 20,
+                "conversationState": {
+                    "turns": [], "requests": [],
+                    "threadRuntimeStatus": { "type": "idle" },
+                    "turnHistory": codex_fixture::canonical_turn_history(
+                        serde_json::json!({
+                            "t-live": { "id": "t-live", "type": "turn", "status": "interrupted", "items": ["u-live"] },
+                            "u-live": { "id": "u-live", "type": "user_message", "text": "seed", "ts": 1 }
+                        }),
+                        serde_json::json!([{ "entries": ["t-live"] }])
+                    )
+                }
+            }
+        }
+    }))
+    .await;
+    wait_snapshot_applied(&f, 20, true).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(6);
+    loop {
+        if store.stop_pause_rows(&f.thread_key()).unwrap().is_empty() {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "停止类暂停行应被自动清除"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // 非停止行仍在 → 线程仍视为暂停（queuePaused 不翻 false），不接力
+    let pause = store.queue_pause(&f.thread_key()).unwrap().expect("仍暂停");
+    assert_eq!(pause.pause_reason, "user_hold", "只清停止类暂停行");
+    assert_eq!(
+        count_start_turn_frames(&mut peer).await,
+        0,
+        "仍有非停止暂停行时不接力"
+    );
+    drop(sse);
 }
 
 /// 2026-10-19 复审 P2-3：结构错误（非法 entries）经 HTTP 投影必须 Unsupported，
@@ -7115,7 +7947,7 @@ async fn send_info_reports_native_pending_and_queue_paused() {
         .codex_control
         .router
         .store()
-        .set_queue_pause(&f.thread_key(), "interrupt_accepted", "test-token")
+        .set_queue_pause(&f.thread_key(), "interrupt_accepted", "test-token", None)
         .unwrap();
     let r = f
         .app
@@ -7269,11 +8101,13 @@ async fn interrupt_accepted_pauses_queue_resume_and_bypass_flow() {
     );
     assert_eq!(qv["actions"].as_array().unwrap().len(), 2, "{qv}");
 
-    // 打断闭环：被停回合置终态（快照 idle + t-live interrupted）——队列暂停不受影响
+    // 打断闭环预备：快照 idle + 空 Turn 表（t-live **不在场** = 无该回合的终态证据）
+    // ——P3 纪律：回合未拿到终态证据时停止类暂停保持（队列不受 idle 假象穿透）
     push_snapshot(&mut peer, THREAD, 11, "idle", vec![]).await;
     wait_snapshot_applied(&f, 11, true).await;
 
-    // ④ 打断后新意见（无授权）→ 拒绝入队 queue_paused（旧队列不被穿透）
+    // ④ 打断后新意见（无授权）→ **入队但不派发**（C05：真实 codex_queued、零帧；
+    //    旧队列暂停不被穿透——用户随后在队列区对它「先处理这条」或等恢复）
     let r = f
         .app
         .clone()
@@ -7286,8 +8120,36 @@ async fn interrupt_accepted_pauses_queue_resume_and_bypass_flow() {
         .await
         .unwrap();
     let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
-    assert_eq!(v["status"], "desktop_ipc", "{v}");
-    assert_eq!(v["receipt"]["reasonCode"], "queue_paused", "{v}");
+    assert_eq!(v["status"], "codex_queued", "{v}");
+    assert_eq!(v["actionId"], "act-new-1", "{v}");
+    assert_eq!(
+        f.hub_store()
+            .get_for_device("act-new-1", "dev-1")
+            .unwrap()
+            .unwrap()
+            .state,
+        ActionState::Queued,
+        "新意见留在队列等用户处置"
+    );
+    // 队列视图如实：三条在队（旧两条 + 新一条）、仍暂停
+    let r = f
+        .app
+        .clone()
+        .oneshot(req(
+            "GET",
+            &format!("/m/api/v1/codex/queue?session_id={THREAD}"),
+            Some(COOKIE),
+            None,
+        ))
+        .await
+        .unwrap();
+    let qv: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    assert_eq!(qv["queuePaused"], serde_json::json!(true), "{qv}");
+    assert_eq!(
+        qv["actions"].as_array().unwrap().len(),
+        3,
+        "新入队条目在视图里可见（可被「先处理这条」定位）：{qv}"
+    );
 
     // ⑤ 新意见带一次性越队授权 → 恰好派发一次；旧两条原样 queued
     {
@@ -7438,6 +8300,191 @@ async fn interrupt_accepted_pauses_queue_resume_and_bypass_flow() {
         ActionState::Accepted,
         "resume 后旧队列队首按 FIFO 接力"
     );
+    drop(sse);
+}
+
+/// C05（队列展示收纳复审 Q01）端到端验收：真实后端建立暂停的 Q1/Q2 后，composer
+/// 的普通发送 Q3 → 真实 `codex_queued`（零新 start-turn 帧）→ 队列视图里能定位到
+/// Q3 → 用户对 Q3 显式「先处理这条」→ **只**派 Q3，Q1/Q2 继续 queued、暂停仍在。
+/// 修复前 Q3 被 `queue_paused` 终态拒绝，队列区根本没有这一行可点（复审 P2）。
+#[tokio::test]
+async fn c05_paused_thread_accepts_new_message_into_queue_then_prioritizes_it() {
+    let mut f = fixture_ipc_interrupt(vec![codex_app_session(THREAD)]);
+    let mut peer = f.peer.take().unwrap();
+    // 旧队列两条（忙态 FIFO 入队：此时尚未暂停，入队合法）
+    let (sse, _) = sse_hold_ensure(&f, &mut peer, THREAD, vec![], "active").await;
+    {
+        let app = f.app.clone();
+        let _ = app;
+    }
+    for (i, act) in ["act-old-1", "act-old-2"].iter().enumerate() {
+        let app = f.app.clone();
+        let body = send_body_for(&format!("旧消息{i}"), Some(act), false, THREAD);
+        let task = tokio::spawn(async move {
+            app.oneshot(req(
+                "POST",
+                "/m/api/v1/session-send",
+                Some(COOKIE),
+                Some(body),
+            ))
+            .await
+            .unwrap()
+        });
+        let r = tokio::time::timeout(Duration::from_secs(15), task)
+            .await
+            .expect("queue in time")
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+        assert_eq!(v["status"], "codex_queued", "{v}");
+    }
+    // 打断受理 → 持久暂停（真实端点写入，不经直写 DB）
+    let body = serde_json::json!({ "sessionId": THREAD, "turnId": "t-live" });
+    let app = f.app.clone();
+    let task = tokio::spawn(async move {
+        app.oneshot(req(
+            "POST",
+            "/m/api/v1/codex/turn/interrupt",
+            Some(COOKIE),
+            Some(body.to_string()),
+        ))
+        .await
+        .unwrap()
+    });
+    let frame = recv_within(&mut peer, 10).await;
+    assert_eq!(frame["method"], "thread-follower-interrupt-turn");
+    peer.send(&serde_json::json!({
+        "type": "response", "requestId": frame["requestId"],
+        "resultType": "success", "method": "thread-follower-interrupt-turn",
+        "result": { "interruptedTurnId": "t-live", "ok": true }
+    }))
+    .await;
+    let r = tokio::time::timeout(Duration::from_secs(15), task)
+        .await
+        .expect("interrupt in time")
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    assert_eq!(v["queuePaused"], true, "前置：真实暂停成立: {v}");
+    push_snapshot(&mut peer, THREAD, 11, "idle", vec![]).await;
+    wait_snapshot_applied(&f, 11, true).await;
+    // 清空此刻的帧账（前面队列/打断的帧不属于本段断言面）
+    let _ = drain_frames(&mut peer).await;
+
+    // ① 暂停中的普通发送 Q3 → 真实入队、零新帧
+    let r = f
+        .app
+        .clone()
+        .oneshot(req(
+            "POST",
+            "/m/api/v1/session-send",
+            Some(COOKIE),
+            Some(send_body("暂停期新意见", Some("act-q3"), false)),
+        ))
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    assert_eq!(v["status"], "codex_queued", "暂停期新消息必须入队: {v}");
+    assert_eq!(v["actionId"], "act-q3", "{v}");
+    assert_eq!(
+        f.hub_store()
+            .get_for_device("act-q3", "dev-1")
+            .unwrap()
+            .unwrap()
+            .state,
+        ActionState::Queued,
+        "Q3 留在队列（不是终态拒绝）"
+    );
+    let frames = drain_frames(&mut peer).await;
+    assert!(
+        frames
+            .iter()
+            .all(|fr| fr["method"] != "thread-follower-start-turn"),
+        "暂停期入队零派发帧：{frames:?}"
+    );
+
+    // ② 队列视图能找到 Q3（前端「先处理这条」的定位依据）
+    let r = f
+        .app
+        .clone()
+        .oneshot(req(
+            "GET",
+            &format!("/m/api/v1/codex/queue?session_id={THREAD}"),
+            Some(COOKIE),
+            None,
+        ))
+        .await
+        .unwrap();
+    let qv: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    assert!(qv["queuePaused"] == serde_json::json!(true), "{qv}");
+    let ids: Vec<String> = qv["actions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a["actionId"].as_str().unwrap_or_default().to_string())
+        .collect();
+    assert!(ids.contains(&"act-q3".to_string()), "视图含 Q3: {qv}");
+
+    // ③ 对 Q3「先处理这条」（空闲 + 已暂停，无需停止）→ 只派 Q3
+    {
+        let body = prioritize_body("act-q3", None, false).await;
+        let app = f.app.clone();
+        let task = tokio::spawn(async move {
+            app.oneshot(req(
+                "POST",
+                "/m/api/v1/codex/queue/prioritize",
+                Some(COOKIE),
+                Some(body),
+            ))
+            .await
+            .unwrap()
+        });
+        let start = recv_within(&mut peer, 15).await;
+        assert_eq!(start["method"], "thread-follower-start-turn", "{start}");
+        assert_eq!(start_turn_text(&start), "暂停期新意见", "派的是 Q3 原文");
+        confirm_client_message_identity_for(
+            &mut peer,
+            THREAD,
+            &start,
+            "turn-q3",
+            "暂停期新意见",
+            12,
+            "owner-1",
+        )
+        .await;
+        peer.send(&serde_json::json!({
+            "type": "response", "requestId": start["requestId"],
+            "resultType": "success", "method": "thread-follower-start-turn",
+            "handledByClientId": "owner-1",
+            "result": { "turn": { "id": "turn-q3", "status": "inProgress" } }
+        }))
+        .await;
+        let r = tokio::time::timeout(Duration::from_secs(20), task)
+            .await
+            .expect("prioritize in time")
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+        assert_eq!(v["result"], "prioritized", "{v}");
+        assert_eq!(v["actionId"], "act-q3", "{v}");
+    }
+    // ④ Q1/Q2 仍 queued、暂停仍在（旧队列不被越队带走）
+    for id in ["act-old-1", "act-old-2"] {
+        assert_eq!(
+            f.hub_store()
+                .get_for_device(id, "dev-1")
+                .unwrap()
+                .unwrap()
+                .state,
+            ActionState::Queued,
+            "{id} 必须原样留队"
+        );
+    }
+    assert!(
+        f.hub_store()
+            .queue_pause(&f.thread_key())
+            .unwrap()
+            .is_some(),
+        "优先处理不解除暂停"
+    );
+    f.state.codex_control.adapter.shutdown().await;
     drop(sse);
 }
 
@@ -9073,7 +10120,12 @@ async fn f3_interrupt_terminal_before_receipt_must_not_flush_old_queue() {
     .await;
     // 等终态快照应用
     wait_snapshot_applied(&f, 20, true).await;
-    // 手动驱动一次 settle（调度循环同款：释放 + flush）
+    // 手动驱动一次 settle（调度循环同款：释放 + flush）。
+    // P3 边界（2026-10-30）：本调用刻意**不含** settle_thread 的停止类暂停自动
+    // 解除（auto_release_stop_pauses）——它钉住的是「release_turn_if_complete 与
+    // flush_thread 本体不绕过暂停行」这一闸纪律；回合终态后的自动解除走生产
+    // settle_thread（p3_stop_pause_auto_releases_on_turn_terminal_and_relays_fifo
+    // 钉新契约）。
     {
         let hub = f.state.codex_control.clone();
         let key = f.thread_key();
@@ -11695,7 +12747,7 @@ async fn v1_state_frame_republish_carries_queue_pause_fact() {
 
     // 暂停在场（打断前置档 = 正式档的账本事实；与端点落行同一 DAO 缝）
     f.hub_store()
-        .set_queue_pause(&f.thread_key(), "interrupt_pending", "tok-stamp")
+        .set_queue_pause(&f.thread_key(), "interrupt_pending", "tok-stamp", None)
         .unwrap();
 
     // Desktop 状态帧（revision 7 → 8）→ state-changed fresh 重发布
@@ -16003,7 +17055,7 @@ async fn f08p_r06_bypass_paused_queue_allows_exactly_one_answer() {
     let key = f.thread_key();
     // 建立持久暂停（与打断/cancel 同一通道）
     let (_token, _inserted) = hub
-        .prepare_turn_stop_pause(&key, "cancel_pending")
+        .prepare_turn_stop_pause(&key, "cancel_pending", None)
         .expect("pause");
     let p = hub.adapter.projection(&key).await;
     assert!(p.queue_paused, "投影必须看见暂停");
@@ -17066,7 +18118,7 @@ async fn f08p_h03_bypass_does_not_release_unknown_question() {
     let (_token, _) = f
         .state
         .codex_control
-        .prepare_turn_stop_pause(&f.thread_key(), "cancel_pending")
+        .prepare_turn_stop_pause(&f.thread_key(), "cancel_pending", None)
         .unwrap();
     f.state
         .codex_control
@@ -18424,7 +19476,7 @@ async fn b06_paused_queue_group_submit_sends_once_and_keeps_pause() {
     let mut peer = f.peer.take().unwrap();
     let questions = follow_with_async_group(&f, &mut peer, "idle", 2).await;
     f.hub_store()
-        .set_queue_pause(&f.thread_key(), "interrupt", "tok-b06")
+        .set_queue_pause(&f.thread_key(), "interrupt", "tok-b06", None)
         .unwrap();
     let body = group_body("act-b06", &questions, "甲");
     let app = f.app.clone();
@@ -19349,4 +20401,2181 @@ async fn c01_conflicting_group_cannot_overwrite_bound_owner() {
             .all(|frame| frame["method"] != "thread-follower-start-turn"),
         "A 最终检查必须使用 A 自己的绑定/最新事实：{frames:?}"
     );
+}
+
+// ============================================================
+// T06：已入队消息的显式优先处理（POST /codex/queue/prioritize）
+//
+// 契约：请求 {sessionId, actionId, expectedTurnId?, confirmInterrupt, frontBudgetMs?}
+//（camelCase、deny_unknown_fields；**不接受正文副本**——越队派发的是既有 queued 行）。
+// 响应判别联合：prioritized | already_dispatched | not_sent | unknown，携带原 actionId
+// 与既有动作回执。停止帧与消息帧分别计数：成功闭环 = 一次 interrupt + 一次 Q3
+// start-turn；旧队列保持暂停；无确认 → 零停止零越队。
+// ============================================================
+
+/// 忙态 FIFO 入队一条普通消息（断言 codex_queued）。
+async fn t06_enqueue_busy(f: &Fixture, text: &str, action_id: &str) {
+    let app = f.app.clone();
+    let body = send_body_for(text, Some(action_id), false, THREAD);
+    let task = tokio::spawn(async move {
+        app.oneshot(req(
+            "POST",
+            "/m/api/v1/session-send",
+            Some(COOKIE),
+            Some(body),
+        ))
+        .await
+        .unwrap()
+    });
+    let r = tokio::time::timeout(Duration::from_secs(15), task)
+        .await
+        .expect("queue in time")
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    assert_eq!(v["status"], "codex_queued", "{v}");
+}
+
+fn start_turn_text(frame: &serde_json::Value) -> String {
+    frame["params"]["turnStart"]["request"]["input"][0]["text"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
+}
+
+async fn prioritize_body(action_id: &str, turn_id: Option<&str>, confirm: bool) -> String {
+    let mut v = serde_json::json!({
+        "sessionId": THREAD,
+        "actionId": action_id,
+        "confirmInterrupt": confirm,
+    });
+    if let Some(t) = turn_id {
+        v["expectedTurnId"] = serde_json::json!(t);
+    }
+    v.to_string()
+}
+
+async fn post_prioritize(f: &Fixture, body: String) -> axum::http::Response<axum::body::Body> {
+    f.app
+        .clone()
+        .oneshot(req(
+            "POST",
+            "/m/api/v1/codex/queue/prioritize",
+            Some(COOKIE),
+            Some(body),
+        ))
+        .await
+        .unwrap()
+}
+
+/// 主闭环：旧队列 Q1、Q2 + 目标 Q3；确认优先 Q3 → 真实定向停止 t-live → 确认终态
+/// → Q3 恰好一帧；Q1/Q2 仍 queued 且暂停。无确认时零停止、零越队。
+#[tokio::test]
+async fn t06_prioritize_confirmed_sends_one_stop_and_one_frame_old_queue_stays_paused() {
+    let mut f = fixture_ipc_interrupt(vec![codex_app_session(THREAD)]);
+    let mut peer = f.peer.take().unwrap();
+    let (sse, _) = sse_hold_ensure(&f, &mut peer, THREAD, vec![], "active").await;
+    let _ = sse;
+
+    // ① 三条入队（忙态 FIFO）：Q1、Q2 旧队列 + Q3 目标
+    t06_enqueue_busy(&f, "队列消息甲", "act-q1").await;
+    t06_enqueue_busy(&f, "队列消息乙", "act-q2").await;
+    t06_enqueue_busy(&f, "队列消息丙", "act-q3").await;
+
+    // ② 无确认（confirmInterrupt=false，回合在跑）→ 零停止零越队
+    {
+        let body = prioritize_body("act-q3", None, false).await;
+        let r = post_prioritize(&f, body).await;
+        assert_eq!(r.status(), 200);
+        let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+        assert_eq!(v["result"], "not_sent", "{v}");
+        assert_eq!(v["actionId"], "act-q3", "{v}");
+        assert!(
+            !peer_has_traffic(&mut peer).await,
+            "无确认：零停止帧、零越队帧"
+        );
+        assert_eq!(
+            f.hub_store()
+                .get_for_device("act-q3", "dev-1")
+                .unwrap()
+                .unwrap()
+                .state,
+            ActionState::Queued,
+            "拒绝不落账作废：Q3 仍在队列"
+        );
+    }
+
+    // ③ 确认优先 Q3（expectedTurnId 安全阀）→ 一次 interrupt + Q3 恰好一帧
+    let mut frames: Vec<serde_json::Value> = Vec::new();
+    let body = prioritize_body("act-q3", Some("t-live"), true).await;
+    let app = f.app.clone();
+    let task = tokio::spawn(async move {
+        app.oneshot(req(
+            "POST",
+            "/m/api/v1/codex/queue/prioritize",
+            Some(COOKIE),
+            Some(body),
+        ))
+        .await
+        .unwrap()
+    });
+    // 第一帧：定向停止（expectedTurnId 安全阀必须在场）
+    let stop = recv_within(&mut peer, 10).await;
+    frames.push(stop.clone());
+    assert_eq!(stop["method"], "thread-follower-interrupt-turn", "{stop}");
+    assert_eq!(stop["params"]["expectedTurnId"], "t-live", "{stop}");
+    peer.send(&serde_json::json!({
+        "type": "response", "requestId": stop["requestId"],
+        "resultType": "success", "method": "thread-follower-interrupt-turn",
+        "result": { "interruptedTurnId": "t-live", "ok": true }
+    }))
+    .await;
+    // 回合终态确认：被停回合置终态（快照 idle）
+    push_snapshot(&mut peer, THREAD, 11, "idle", vec![]).await;
+    wait_snapshot_applied(&f, 11, true).await;
+    // 第二帧：Q3 恰好一帧 start-turn（原正文、原 actionId 的持久 cmid）
+    let start = recv_within(&mut peer, 15).await;
+    frames.push(start.clone());
+    assert_eq!(start["method"], "thread-follower-start-turn", "{start}");
+    assert_eq!(
+        start_turn_text(&start),
+        "队列消息丙",
+        "越队派发的是原 queued 行正文（不是正文副本重发）"
+    );
+    let q3_cmid = start["params"]["turnStart"]["request"]["clientUserMessageId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    confirm_client_message_identity_for(
+        &mut peer,
+        THREAD,
+        &start,
+        "turn-q3",
+        "队列消息丙",
+        12,
+        "owner-1",
+    )
+    .await;
+    peer.send(&serde_json::json!({
+        "type": "response", "requestId": start["requestId"],
+        "resultType": "success", "method": "thread-follower-start-turn",
+        "handledByClientId": "owner-1",
+        "result": { "turn": { "id": "turn-q3", "status": "inProgress" } }
+    }))
+    .await;
+    let r = tokio::time::timeout(Duration::from_secs(20), task)
+        .await
+        .expect("prioritize in time")
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    assert_eq!(v["result"], "prioritized", "{v}");
+    assert_eq!(v["actionId"], "act-q3", "{v}");
+    assert_eq!(v["receipt"]["delivery"], "accepted", "{v}");
+
+    // 帧分别计数：恰一次 interrupt + Q3 恰一帧；Q1/Q2 零帧
+    frames.extend(drain_frames(&mut peer).await);
+    let interrupt_frames = frames
+        .iter()
+        .filter(|f| f["method"] == "thread-follower-interrupt-turn")
+        .count();
+    let count_start_turn = |text: &str| -> usize {
+        frames
+            .iter()
+            .filter(|f| f["method"] == "thread-follower-start-turn" && start_turn_text(f) == text)
+            .count()
+    };
+    let q1_start_turn_frames = count_start_turn("队列消息甲");
+    let q2_start_turn_frames = count_start_turn("队列消息乙");
+    let q3_start_turn_frames = count_start_turn("队列消息丙");
+    assert_eq!(interrupt_frames, 1, "恰一次定向停止：{frames:?}");
+    assert_eq!(q3_start_turn_frames, 1);
+    assert_eq!(q1_start_turn_frames + q2_start_turn_frames, 0);
+    // 持久 cmid 沿用原动作（重试同 action 不换新 id 的账本约定）
+    let (_, stored_cmid) = f
+        .hub_store()
+        .action_thread_and_cmid("act-q3")
+        .expect("act-q3 在账");
+    assert_eq!(q3_cmid, stored_cmid, "越队沿用原 client_message_id");
+
+    // 旧队列：仍 queued 且暂停（持久行 + 队列视图双重断言）
+    assert_eq!(
+        f.hub_store()
+            .get_for_device("act-q1", "dev-1")
+            .unwrap()
+            .unwrap()
+            .state,
+        ActionState::Queued
+    );
+    assert_eq!(
+        f.hub_store()
+            .get_for_device("act-q2", "dev-1")
+            .unwrap()
+            .unwrap()
+            .state,
+        ActionState::Queued
+    );
+    let key = f.thread_key();
+    let queue_paused_after_priority = f.hub_store().queue_pause(&key).unwrap().is_some();
+    assert!(queue_paused_after_priority, "旧队列保持暂停");
+    let r = f
+        .app
+        .clone()
+        .oneshot(req(
+            "GET",
+            &format!("/m/api/v1/codex/queue?session_id={THREAD}"),
+            Some(COOKIE),
+            None,
+        ))
+        .await
+        .unwrap();
+    let qv: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    assert_eq!(qv["queuePaused"], serde_json::json!(true), "{qv}");
+    assert_eq!(
+        qv["actions"].as_array().unwrap().len(),
+        2,
+        "队列视图只剩 Q1/Q2：{qv}"
+    );
+    f.state.codex_control.adapter.shutdown().await;
+}
+
+/// 重放/撤回/第二设备：同请求重放 → 同 actionId 零新帧回实际状态；撤回后优先 →
+/// 不复活；他人动作 → 404。
+#[tokio::test]
+async fn t06_prioritize_replay_retract_and_foreign_device_never_second_frame() {
+    let mut f = fixture_ipc_interrupt(vec![codex_app_session(THREAD)]);
+    seed_device(&f.conn, "dev-2", "iPad");
+    let mut peer = f.peer.take().unwrap();
+    let (sse, _) = sse_hold_ensure(&f, &mut peer, THREAD, vec![], "active").await;
+    let _ = sse;
+    // 忙态 FIFO 入队（暂停后的新入队会被 queue_paused 拒绝——先入队后暂停）；
+    // 入队后转 idle = paused-idle（无需停止，仅确认本条越队）
+    t06_enqueue_busy(&f, "队列消息甲", "act-q1").await;
+    t06_enqueue_busy(&f, "队列消息丙", "act-q3").await;
+    let (_tok, _) = f
+        .state
+        .codex_control
+        .prepare_turn_stop_pause(&f.thread_key(), "interrupt_pending", None)
+        .unwrap();
+    push_snapshot(&mut peer, THREAD, 8, "idle", vec![]).await;
+    wait_snapshot_applied(&f, 8, true).await;
+
+    // ① 首次优先：恰好一帧 start-turn
+    let mut frames: Vec<serde_json::Value> = Vec::new();
+    {
+        let body = prioritize_body("act-q3", None, false).await;
+        let app = f.app.clone();
+        let task = tokio::spawn(async move {
+            app.oneshot(req(
+                "POST",
+                "/m/api/v1/codex/queue/prioritize",
+                Some(COOKIE),
+                Some(body),
+            ))
+            .await
+            .unwrap()
+        });
+        let start = recv_within(&mut peer, 15).await;
+        frames.push(start.clone());
+        assert_eq!(start["method"], "thread-follower-start-turn", "{start}");
+        confirm_client_message_identity_for(
+            &mut peer,
+            THREAD,
+            &start,
+            "turn-q3",
+            "队列消息丙",
+            9,
+            "owner-1",
+        )
+        .await;
+        peer.send(&serde_json::json!({
+            "type": "response", "requestId": start["requestId"],
+            "resultType": "success", "method": "thread-follower-start-turn",
+            "handledByClientId": "owner-1",
+            "result": { "turn": { "id": "turn-q3", "status": "inProgress" } }
+        }))
+        .await;
+        let r = tokio::time::timeout(Duration::from_secs(20), task)
+            .await
+            .expect("prioritize in time")
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+        assert_eq!(v["result"], "prioritized", "{v}");
+    }
+
+    // ② 同请求重放 → 同 actionId，回实际状态（already_dispatched），零新帧
+    {
+        let body = prioritize_body("act-q3", None, false).await;
+        let r = post_prioritize(&f, body).await;
+        assert_eq!(r.status(), 200);
+        let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+        assert_eq!(v["result"], "already_dispatched", "{v}");
+        assert_eq!(v["actionId"], "act-q3", "{v}");
+        assert_eq!(v["action"]["state"], "accepted", "返回账本实际状态：{v}");
+    }
+
+    // ③ 撤回竞态（撤回先赢）：优先处理已取消的动作 → 不复活、零帧
+    {
+        let ok = f.hub_store().retract("act-q1", "dev-1").unwrap();
+        assert!(ok);
+        let body = prioritize_body("act-q1", None, false).await;
+        let r = post_prioritize(&f, body).await;
+        assert_eq!(r.status(), 200);
+        let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+        assert_eq!(v["result"], "not_sent", "{v}");
+        assert_eq!(v["reasonCode"], "action_cancelled", "{v}");
+    }
+
+    // ④ 第二设备优先他人动作 → 404（属主隔离，无存在性预言机）
+    {
+        let body = prioritize_body("act-q3", None, false).await;
+        let r = f
+            .app
+            .clone()
+            .oneshot(req(
+                "POST",
+                "/m/api/v1/codex/queue/prioritize",
+                Some("mam_device=dev-2"),
+                Some(body),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 404, "非属主设备一律 404");
+    }
+
+    frames.extend(drain_frames(&mut peer).await);
+    let start_turns = frames
+        .iter()
+        .filter(|f| f["method"] == "thread-follower-start-turn")
+        .count();
+    assert_eq!(start_turns, 1, "全程恰一帧 start-turn：{frames:?}");
+    // 旧队列暂停保持；Q1 保持取消墓碑（不复活）
+    assert!(
+        f.hub_store()
+            .queue_pause(&f.thread_key())
+            .unwrap()
+            .is_some(),
+        "旧队列保持暂停"
+    );
+    assert_eq!(
+        f.hub_store()
+            .get_for_device("act-q1", "dev-1")
+            .unwrap()
+            .unwrap()
+            .state,
+        ActionState::Cancelled,
+        "撤回墓碑不被优先处理复活"
+    );
+    f.state.codex_control.adapter.shutdown().await;
+}
+
+/// 并发反例：同一 active 回合上两个并发的优先处理请求（重复提交/双击）→
+/// 至多一次定向停止 + Q3 至多一帧；输家明确零停止零越队（仍在队）。
+#[tokio::test]
+async fn t06_concurrent_prioritize_sends_single_stop_and_single_frame() {
+    let mut f = fixture_ipc_interrupt(vec![codex_app_session(THREAD)]);
+    let mut peer = f.peer.take().unwrap();
+    let (sse, _) = sse_hold_ensure(&f, &mut peer, THREAD, vec![], "active").await;
+    let _ = sse;
+    t06_enqueue_busy(&f, "队列消息甲", "act-q1").await;
+    t06_enqueue_busy(&f, "队列消息丙", "act-q3").await;
+
+    let body = prioritize_body("act-q3", Some("t-live"), true).await;
+    let app = f.app.clone();
+    let task_a = tokio::spawn(async move {
+        app.oneshot(req(
+            "POST",
+            "/m/api/v1/codex/queue/prioritize",
+            Some(COOKIE),
+            Some(body),
+        ))
+        .await
+        .unwrap()
+    });
+    let body = prioritize_body("act-q3", Some("t-live"), true).await;
+    let app = f.app.clone();
+    let task_b = tokio::spawn(async move {
+        app.oneshot(req(
+            "POST",
+            "/m/api/v1/codex/queue/prioritize",
+            Some(COOKIE),
+            Some(body),
+        ))
+        .await
+        .unwrap()
+    });
+
+    // 至多一帧定向停止（输家在全程线程锁处让路，零停止帧）
+    let stop = recv_within(&mut peer, 10).await;
+    assert_eq!(stop["method"], "thread-follower-interrupt-turn", "{stop}");
+    peer.send(&serde_json::json!({
+        "type": "response", "requestId": stop["requestId"],
+        "resultType": "success", "method": "thread-follower-interrupt-turn",
+        "result": { "interruptedTurnId": "t-live", "ok": true }
+    }))
+    .await;
+    push_snapshot(&mut peer, THREAD, 11, "idle", vec![]).await;
+    wait_snapshot_applied(&f, 11, true).await;
+    // 至多一帧 Q3 start-turn
+    let start = recv_within(&mut peer, 15).await;
+    assert_eq!(start["method"], "thread-follower-start-turn", "{start}");
+    assert_eq!(start_turn_text(&start), "队列消息丙", "{start}");
+    confirm_client_message_identity_for(
+        &mut peer,
+        THREAD,
+        &start,
+        "turn-q3",
+        "队列消息丙",
+        12,
+        "owner-1",
+    )
+    .await;
+    peer.send(&serde_json::json!({
+        "type": "response", "requestId": start["requestId"],
+        "resultType": "success", "method": "thread-follower-start-turn",
+        "handledByClientId": "owner-1",
+        "result": { "turn": { "id": "turn-q3", "status": "inProgress" } }
+    }))
+    .await;
+
+    let r_a = tokio::time::timeout(Duration::from_secs(20), task_a)
+        .await
+        .expect("a in time")
+        .unwrap();
+    let r_b = tokio::time::timeout(Duration::from_secs(20), task_b)
+        .await
+        .expect("b in time")
+        .unwrap();
+    let v_a: serde_json::Value = serde_json::from_str(&body_string(r_a).await).unwrap();
+    let v_b: serde_json::Value = serde_json::from_str(&body_string(r_b).await).unwrap();
+    let results = [
+        v_a["result"].as_str().unwrap_or(""),
+        v_b["result"].as_str().unwrap_or(""),
+    ];
+    assert!(
+        results.contains(&"prioritized"),
+        "恰有一个赢家：{results:?}"
+    );
+    for r in &results {
+        assert!(
+            *r == "prioritized" || *r == "not_sent" || *r == "already_dispatched",
+            "输家必须明确零停止零越队/实际状态：{results:?}"
+        );
+    }
+    let frames = drain_frames(&mut peer).await;
+    let interrupts = frames
+        .iter()
+        .filter(|f| f["method"] == "thread-follower-interrupt-turn")
+        .count();
+    let starts = frames
+        .iter()
+        .filter(|f| f["method"] == "thread-follower-start-turn")
+        .count();
+    assert_eq!(interrupts, 0, "重放不重复发停止帧：{frames:?}");
+    assert_eq!(starts, 0, "重放不重复派发：{frames:?}");
+    // Q1 仍 queued；队列仍暂停
+    assert_eq!(
+        f.hub_store()
+            .get_for_device("act-q1", "dev-1")
+            .unwrap()
+            .unwrap()
+            .state,
+        ActionState::Queued
+    );
+    assert!(
+        f.hub_store()
+            .queue_pause(&f.thread_key())
+            .unwrap()
+            .is_some(),
+        "旧队列保持暂停"
+    );
+    f.state.codex_control.adapter.shutdown().await;
+}
+
+/// 安全反例：停止 Unknown（桌面沉默超时）→ unknown、不派 Q3、不后台偷偷重发、
+/// 暂停保留。
+#[tokio::test]
+async fn t06_prioritize_stop_unknown_does_not_dispatch_q3() {
+    let mut f = fixture_ipc_interrupt(vec![codex_app_session(THREAD)]);
+    let mut peer = f.peer.take().unwrap();
+    let (sse, _) = sse_hold_ensure(&f, &mut peer, THREAD, vec![], "active").await;
+    let _ = sse;
+    t06_enqueue_busy(&f, "队列消息丙", "act-q3").await;
+
+    // 小前台预算：打断帧交 writer 后桌面沉默 → 结果未知（帧可能已写出）
+    let mut body = serde_json::json!({
+        "sessionId": THREAD, "actionId": "act-q3",
+        "expectedTurnId": "t-live", "confirmInterrupt": true,
+        "frontBudgetMs": 400,
+    });
+    let _ = &mut body;
+    let r = post_prioritize(&f, body.to_string()).await;
+    assert_eq!(r.status(), 200);
+    let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    assert_eq!(v["result"], "unknown", "{v}");
+    assert_eq!(v["actionId"], "act-q3", "{v}");
+    // Q3 仍 queued；暂停保留；零 start-turn
+    assert_eq!(
+        f.hub_store()
+            .get_for_device("act-q3", "dev-1")
+            .unwrap()
+            .unwrap()
+            .state,
+        ActionState::Queued,
+        "停止不确定 → 不派 Q3"
+    );
+    assert!(
+        f.hub_store()
+            .queue_pause(&f.thread_key())
+            .unwrap()
+            .is_some(),
+        "停止不确定 → 暂停保留（旧队列不自动解冻）"
+    );
+    // 不后台偷偷重发：静置一拍后零新帧
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let frames = drain_frames(&mut peer).await;
+    assert!(
+        frames
+            .iter()
+            .all(|f| f["method"] != "thread-follower-start-turn"),
+        "未知结果不自动重发：{frames:?}"
+    );
+    f.state.codex_control.adapter.shutdown().await;
+}
+
+/// 安全反例：目标换代（expectedTurnId 不匹配 → Desktop 静默 no-op，interruptedTurnId
+/// 为 null）→ 服务端不派 Q3；**不误删其他暂停 token**。
+#[tokio::test]
+async fn t06_prioritize_stale_target_never_dispatches_and_keeps_foreign_pause() {
+    let mut f = fixture_ipc_interrupt(vec![codex_app_session(THREAD)]);
+    let mut peer = f.peer.take().unwrap();
+    let (sse, _) = sse_hold_ensure(&f, &mut peer, THREAD, vec![], "active").await;
+    let _ = sse;
+    // 他人（上次打断）的暂停 token 在场——本次停止失败不得清掉它
+    f.state
+        .codex_control
+        .router
+        .store()
+        .set_queue_pause(&f.thread_key(), "interrupt_pending", "tok-foreign", None)
+        .unwrap();
+    t06_enqueue_busy(&f, "队列消息丙", "act-q3").await;
+
+    let body = prioritize_body("act-q3", Some("t-stale"), true).await;
+    let app = f.app.clone();
+    let task = tokio::spawn(async move {
+        app.oneshot(req(
+            "POST",
+            "/m/api/v1/codex/queue/prioritize",
+            Some(COOKIE),
+            Some(body),
+        ))
+        .await
+        .unwrap()
+    });
+    let stop = recv_within(&mut peer, 10).await;
+    assert_eq!(stop["method"], "thread-follower-interrupt-turn", "{stop}");
+    assert_eq!(stop["params"]["expectedTurnId"], "t-stale", "{stop}");
+    // Desktop 静默 no-op：成功回执但 interruptedTurnId=null（目标换代/无匹配回合）
+    peer.send(&serde_json::json!({
+        "type": "response", "requestId": stop["requestId"],
+        "resultType": "success", "method": "thread-follower-interrupt-turn",
+        "result": { "interruptedTurnId": serde_json::Value::Null, "ok": true }
+    }))
+    .await;
+    let r = tokio::time::timeout(Duration::from_secs(20), task)
+        .await
+        .expect("prioritize in time")
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    assert!(
+        v["result"] == "not_sent" || v["result"] == "unknown",
+        "换代 no-op 不派 Q3：{v}"
+    );
+    assert_eq!(
+        f.hub_store()
+            .get_for_device("act-q3", "dev-1")
+            .unwrap()
+            .unwrap()
+            .state,
+        ActionState::Queued,
+        "Q3 未被派出"
+    );
+    let frames = drain_frames(&mut peer).await;
+    assert!(
+        frames
+            .iter()
+            .all(|f| f["method"] != "thread-follower-start-turn"),
+        "换代后零越队帧：{frames:?}"
+    );
+    // 他人的暂停 token 未被误删（最早行保留：首次时间/原因不变）
+    let pause = f.hub_store().queue_pause(&f.thread_key()).unwrap();
+    assert!(pause.is_some(), "他人暂停行不得被清除");
+    let frames2 = drain_frames(&mut peer).await;
+    assert!(
+        frames2.is_empty()
+            || frames2
+                .iter()
+                .all(|f| f["method"] != "thread-follower-interrupt-turn")
+    );
+    f.state.codex_control.adapter.shutdown().await;
+}
+
+/// 安全反例：原生 pending / 未解 Unknown 屏障 / 设备失效 → 不派 Q3。
+#[tokio::test]
+async fn t06_prioritize_pending_barrier_and_revoked_device_do_not_dispatch() {
+    // ① 原生 pending：未处理审批在场 → not_sent(native_pending)，零帧
+    {
+        let mut f = fixture_ipc_interrupt(vec![codex_app_session(THREAD)]);
+        let mut peer = f.peer.take().unwrap();
+        let (sse, _) = sse_hold_ensure(&f, &mut peer, THREAD, vec![], "active").await;
+        let _ = sse;
+        t06_enqueue_busy(&f, "队列消息丙", "act-q3").await;
+        f.state
+            .codex_control
+            .prepare_turn_stop_pause(&f.thread_key(), "interrupt_pending", None)
+            .unwrap();
+        // 入队后转入「idle + 未处理审批」：gate = NativePending
+        push_snapshot(
+            &mut peer,
+            THREAD,
+            8,
+            "idle",
+            vec![serde_json::json!({
+                "id": 18, "method": "item/commandExecution/requestApproval",
+                "params": { "command": "pnpm test", "cwd": "/w", "reason": "r" }
+            })],
+        )
+        .await;
+        wait_snapshot_applied(&f, 8, false).await;
+        let body = prioritize_body("act-q3", None, false).await;
+        let r = post_prioritize(&f, body).await;
+        let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+        assert_eq!(v["result"], "not_sent", "{v}");
+        assert_eq!(v["reasonCode"], "native_pending", "{v}");
+        assert!(
+            !peer_has_traffic(&mut peer).await,
+            "授权不穿透 pending：零帧"
+        );
+        f.state.codex_control.adapter.shutdown().await;
+    }
+    // ② 未解 Unknown 屏障（compat fence 在册）→ 不派 Q3，动作留队
+    {
+        let mut f = fixture_ipc_interrupt(vec![codex_app_session(THREAD)]);
+        let mut peer = f.peer.take().unwrap();
+        let (sse, _) = sse_hold_ensure(&f, &mut peer, THREAD, vec![], "active").await;
+        let _ = sse;
+        f.state
+            .codex_control
+            .prepare_turn_stop_pause(&f.thread_key(), "interrupt_pending", None)
+            .unwrap();
+        t06_enqueue_busy(&f, "队列消息丙", "act-q3").await;
+        push_snapshot(&mut peer, THREAD, 8, "idle", vec![]).await;
+        wait_snapshot_applied(&f, 8, true).await;
+        // 在册屏障：unknown 行持有保守屏障（未解）
+        f.hub_store()
+            .set_compat_fence("act-q3", None, None)
+            .unwrap();
+        let body = prioritize_body("act-q3", None, false).await;
+        let r = post_prioritize(&f, body).await;
+        let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+        assert_eq!(v["result"], "not_sent", "{v}");
+        assert_eq!(
+            f.hub_store()
+                .get_for_device("act-q3", "dev-1")
+                .unwrap()
+                .unwrap()
+                .state,
+            ActionState::Queued,
+            "屏障未解：Q3 留队不作废"
+        );
+        let frames = drain_frames(&mut peer).await;
+        assert!(
+            frames
+                .iter()
+                .all(|f| f["method"] != "thread-follower-start-turn"),
+            "屏障未解零越队帧：{frames:?}"
+        );
+        f.state.codex_control.adapter.shutdown().await;
+    }
+    // ③ 设备失效（派发前复核吊销）→ 零越队帧；旧队列不受影响
+    {
+        let mut f = fixture_ipc_interrupt(vec![codex_app_session(THREAD)]);
+        let mut peer = f.peer.take().unwrap();
+        let (sse, _) = sse_hold_ensure(&f, &mut peer, THREAD, vec![], "active").await;
+        let _ = sse;
+        t06_enqueue_busy(&f, "队列消息甲", "act-q1").await;
+        t06_enqueue_busy(&f, "队列消息丙", "act-q3").await;
+        f.state
+            .codex_control
+            .prepare_turn_stop_pause(&f.thread_key(), "interrupt_pending", None)
+            .unwrap();
+        push_snapshot(&mut peer, THREAD, 8, "idle", vec![]).await;
+        wait_snapshot_applied(&f, 8, true).await;
+        f.state.store.with(|c| {
+            revoke_device(c, "dev-1").unwrap();
+        });
+        let body = prioritize_body("act-q3", None, false).await;
+        let r = post_prioritize(&f, body).await;
+        // 吊销设备在网关层即被拒（403；无正文）——若以明文回执到达也必须是
+        // not_sent/device_revoked。两个口径下都是「零越队帧、Q3 不被派出」。
+        if r.status() == axum::http::StatusCode::OK {
+            let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+            assert_eq!(v["result"], "not_sent", "{v}");
+            assert_eq!(v["reasonCode"], "device_revoked", "{v}");
+        } else {
+            assert_eq!(
+                r.status(),
+                axum::http::StatusCode::FORBIDDEN,
+                "吊销设备必须被拒"
+            );
+        }
+        let frames = drain_frames(&mut peer).await;
+        assert!(
+            frames
+                .iter()
+                .all(|f| f["method"] != "thread-follower-start-turn"),
+            "设备吊销零越队帧：{frames:?}"
+        );
+        assert_eq!(
+            f.hub_store()
+                .get_for_device("act-q1", "dev-1")
+                .unwrap()
+                .unwrap()
+                .state,
+            ActionState::Queued,
+            "旧队列不受影响"
+        );
+        f.state.codex_control.adapter.shutdown().await;
+    }
+}
+
+/// R01 安全反例：同设备跨会话交叉配对（A 会话的 queued 动作 + B 会话的 sessionId）
+/// ——修复前：端点只验设备归属，按 B 解析出的线程去停 B 的回合，再用 (A 的
+/// actionId, B 的线程) 建越队授权。契约：任何停止/暂停/授权/mutation 之前核对动作
+/// 完整线程归属，不一致 → 明确拒绝（404 属主隔离语义）、零帧、A 的动作原样留队、
+/// 授权表零写入。
+#[tokio::test]
+async fn t06_prioritize_cross_thread_pairing_never_stops_or_mutates() {
+    let thread_b = "0f1e2d3c-9999-4222-8333-444455556666";
+    let mut f = fixture_ipc_interrupt(vec![codex_app_session(THREAD), codex_app_session(thread_b)]);
+    let mut peer = f.peer.take().unwrap();
+    // A、B 都建立 owner 上下文：B 活跃（修复前会被真实定向停止）
+    let (sse_a, _) = sse_hold_ensure(&f, &mut peer, THREAD, vec![], "active").await;
+    let _ = sse_a;
+    // B 线程：同一连接上的第二次 ensure（连接已 initialize，只有 discovery/follow/snapshot）
+    {
+        let app = f.app.clone();
+        let sid = thread_b.to_string();
+        let sse_task = tokio::spawn(async move {
+            app.oneshot(req(
+                "GET",
+                &format!("/m/api/v1/codex/thread/events?session_id={sid}"),
+                Some(COOKIE),
+                None,
+            ))
+            .await
+            .unwrap()
+        });
+        let disc = peer.recv().await;
+        assert_eq!(disc["method"], "thread-owner-discovery", "{disc}");
+        peer.send(&discovery_response(
+            disc["requestId"].as_str().unwrap(),
+            "owner-1",
+        ))
+        .await;
+        let follow = peer.recv().await;
+        assert_eq!(
+            follow["method"], "thread-stream-following-changed",
+            "{follow}"
+        );
+        peer.send(&serde_json::json!({
+            "type": "broadcast", "method": "thread-stream-state-changed", "version": 11,
+            "sourceClientId": "owner-1",
+            "params": {
+                "conversationId": thread_b, "hostId": "local",
+                "change": {
+                    "type": "snapshot", "revision": 7,
+                    "conversationState": {
+                        "turns": [], "requests": [],
+                        "threadRuntimeStatus": { "type": "active" },
+                        "turnHistory": codex_fixture::canonical_turn_history(serde_json::json!({
+                                "t1": { "id": "t1", "type": "turn", "status": "completed", "items": ["u1"] },
+                                "u1": { "id": "u1", "type": "user_message", "text": "seed", "ts": 1 }
+                            }), serde_json::json!([{ "entries": ["t1"] }]))
+                    }
+                }
+            }
+        }))
+        .await;
+        let r = tokio::time::timeout(Duration::from_secs(15), sse_task)
+            .await
+            .expect("sse b in time")
+            .unwrap();
+        assert_eq!(r.status(), 200);
+    }
+    // A 会话忙态入队（动作归属 A 的线程）
+    t06_enqueue_busy(&f, "队列消息甲", "act-q1").await;
+
+    // 用 B 的 sessionId 配 A 的 actionId（同设备、跨线程交叉配对）
+    let body = serde_json::json!({
+        "sessionId": thread_b,
+        "actionId": "act-q1",
+        "expectedTurnId": "t-b",
+        "confirmInterrupt": true,
+    })
+    .to_string();
+    let app = f.app.clone();
+    let task = tokio::spawn(async move {
+        app.oneshot(req(
+            "POST",
+            "/m/api/v1/codex/queue/prioritize",
+            Some(COOKIE),
+            Some(body),
+        ))
+        .await
+        .unwrap()
+    });
+    match tokio::time::timeout(Duration::from_secs(5), task).await {
+        Ok(r) => {
+            // 修复后：进入停止编排之前即明确拒绝（属主隔离 404 语义）
+            let r = r.expect("prioritize response");
+            assert_eq!(
+                r.status(),
+                axum::http::StatusCode::NOT_FOUND,
+                "跨线程配对必须在任何 mutation 之前明确拒绝"
+            );
+            let frames = drain_frames(&mut peer).await;
+            assert!(
+                frames.iter().all(|f| {
+                    f["method"] != "thread-follower-interrupt-turn"
+                        && f["method"] != "thread-follower-start-turn"
+                }),
+                "跨线程配对零帧（不停止 B、不派发）：{frames:?}"
+            );
+        }
+        Err(_) => {
+            // 修复前：请求进入停止编排。推动 B 的 ensure 握手（discovery → follow →
+            // active 快照）让流程走到真实停止帧，取得 RED 证据后按失败收场。
+            let mut frames: Vec<serde_json::Value> = Vec::new();
+            for _ in 0..6 {
+                match tokio::time::timeout(Duration::from_secs(3), peer.recv()).await {
+                    Ok(frame) => {
+                        let method = frame["method"].as_str().unwrap_or_default().to_string();
+                        frames.push(frame.clone());
+                        if method == "thread-owner-discovery" {
+                            peer.send(&discovery_response(
+                                frame["requestId"].as_str().unwrap(),
+                                "owner-1",
+                            ))
+                            .await;
+                        } else if method == "thread-stream-following-changed" {
+                            peer.send(&serde_json::json!({
+                                "type": "broadcast", "method": "thread-stream-state-changed", "version": 11,
+                                "sourceClientId": "owner-1",
+                                "params": {
+                                    "conversationId": thread_b, "hostId": "local",
+                                    "change": {
+                                        "type": "snapshot", "revision": 8,
+                                        "conversationState": {
+                                            "turns": [], "requests": [],
+                                            "threadRuntimeStatus": { "type": "active" },
+                                            "turnHistory": codex_fixture::canonical_turn_history(serde_json::json!({
+                                                    "t1": { "id": "t1", "type": "turn", "status": "completed", "items": ["u1"] },
+                                                    "u1": { "id": "u1", "type": "user_message", "text": "seed", "ts": 1 }
+                                                }), serde_json::json!([{ "entries": ["t1"] }]))
+                                        }
+                                    }
+                                }
+                            }))
+                            .await;
+                        }
+                        if frames
+                            .iter()
+                            .any(|f| f["method"] == "thread-follower-interrupt-turn")
+                        {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            assert!(
+                frames
+                    .iter()
+                    .any(|f| f["method"] == "thread-follower-interrupt-turn"),
+                "此分支应出现对 B 的真实定向停止帧（反例证据）；frames={frames:?}"
+            );
+            panic!("RED：跨线程配对（A 的动作 × B 的会话）未核对线程归属，对 B 发出了真实停止帧");
+        }
+    }
+    // A 的动作原样留队；越队授权零写入
+    assert_eq!(
+        f.hub_store()
+            .get_for_device("act-q1", "dev-1")
+            .unwrap()
+            .unwrap()
+            .state,
+        ActionState::Queued,
+        "A 的动作不被跨线程请求波及"
+    );
+    let grant_count: i64 = {
+        let conn = f.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT COUNT(*) FROM codex_bypass_grant WHERE action_id = 'act-q1'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+    assert_eq!(grant_count, 0, "跨线程配对不得建立越队授权行");
+    f.state.codex_control.adapter.shutdown().await;
+}
+
+/// 插队不要求「队列已暂停」（2026-10-31 用户裁决：「插队的行为就是停止进程之后，
+/// 直接把这个消息打出去」）。本用例由旧 R04 反例（空闲且未暂停 → 拒绝越队）改写：
+/// 现在空闲时插队 Q3 **必须真的把 Q3 派出去**，而 Q1/Q2 原样留队、位置不动
+/// ——插队是单条显式意图，不是重排 FIFO。
+#[tokio::test]
+async fn t06_prioritize_clear_with_unpaused_queue_sends_selected_only() {
+    let mut f = fixture_ipc_interrupt(vec![codex_app_session(THREAD)]);
+    let mut peer = f.peer.take().unwrap();
+    let (sse, _) = sse_hold_ensure(&f, &mut peer, THREAD, vec![], "active").await;
+    // 持有 SSE 引用（镜像稳定在场；不用 `let _` 提前丢弃）
+    let _sse = sse;
+    // ① 忙态 FIFO 入队三条（此时接力门 Busy，调度器冻结）
+    t06_enqueue_busy(&f, "队列消息甲", "act-q1").await;
+    t06_enqueue_busy(&f, "队列消息乙", "act-q2").await;
+    t06_enqueue_busy(&f, "队列消息丙", "act-q3").await;
+    // ② 回合结束转 idle：**无暂停行**（队列未暂停）
+    push_snapshot(&mut peer, THREAD, 8, "idle", vec![]).await;
+    wait_snapshot_applied(&f, 8, true).await;
+    assert!(
+        !f.hub_store()
+            .queue_pause(&f.thread_key())
+            .unwrap()
+            .is_some(),
+        "前置：队列必须未暂停"
+    );
+
+    // ③ 插队 Q3（空闲 + 未暂停）→ 必须恰好派发 Q3 一帧
+    let body = prioritize_body("act-q3", None, false).await;
+    let app = f.app.clone();
+    let task = tokio::spawn(async move {
+        app.oneshot(req(
+            "POST",
+            "/m/api/v1/codex/queue/prioritize",
+            Some(COOKIE),
+            Some(body),
+        ))
+        .await
+        .unwrap()
+    });
+    let start = recv_within(&mut peer, 15).await;
+    assert_eq!(start["method"], "thread-follower-start-turn", "{start}");
+    assert_eq!(start_turn_text(&start), "队列消息丙", "派的是被点的那一条");
+    confirm_client_message_identity_for(
+        &mut peer,
+        THREAD,
+        &start,
+        "turn-q3",
+        "队列消息丙",
+        9,
+        "owner-1",
+    )
+    .await;
+    peer.send(&serde_json::json!({
+        "type": "response", "requestId": start["requestId"],
+        "resultType": "success", "method": "thread-follower-start-turn",
+        "handledByClientId": "owner-1",
+        "result": { "turn": { "id": "turn-q3", "status": "inProgress" } }
+    }))
+    .await;
+    let r = tokio::time::timeout(Duration::from_secs(20), task)
+        .await
+        .expect("prioritize in time")
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    assert_eq!(v["result"], "prioritized", "{v}");
+    assert_eq!(v["actionId"], "act-q3", "{v}");
+    // ④ Q1/Q2 原样 queued 且位置不变（插队不重排 FIFO，也不被借道派出）
+    let q1 = f
+        .hub_store()
+        .get_for_device("act-q1", "dev-1")
+        .unwrap()
+        .unwrap();
+    let q2 = f
+        .hub_store()
+        .get_for_device("act-q2", "dev-1")
+        .unwrap()
+        .unwrap();
+    assert_eq!(q1.state, ActionState::Queued, "Q1 留队");
+    assert_eq!(q2.state, ActionState::Queued, "Q2 留队");
+    assert_eq!(q1.position, Some(1), "Q1 仍是第 1 位");
+    assert_eq!(q2.position, Some(2), "Q2 仍是第 2 位");
+    let frames = drain_frames(&mut peer).await;
+    let q1_frames = frames
+        .iter()
+        .filter(|fr| {
+            fr["method"] == "thread-follower-start-turn" && start_turn_text(fr) == "队列消息甲"
+        })
+        .count();
+    assert_eq!(q1_frames, 0, "Q1 未被借道派发：{frames:?}");
+    f.state.codex_control.adapter.shutdown().await;
+}
+
+/// R05 安全反例：停止 Unknown 后**完全相同**的优先请求重放不得再次停止。
+/// 幂等归属按原 actionId 持久（SQLite，与动作行同生命周期）：首次编排已做过一次
+/// 停止尝试且结果未知 → 重放先读该记录直接按既有 unknown 语义返回；累计 interrupt
+/// 恰一帧、Q3 零帧；store 重建（重启等价：内存态不共通、只有持久层共通）后重放
+/// 也不得忘记、不得新建 Q3 副本。
+#[tokio::test]
+async fn t06_prioritize_stop_unknown_replay_never_resends_interrupt() {
+    let conn = shared_conn();
+    seed_device(&conn, "dev-1", "iPhone");
+    let sessions = vec![codex_app_session(THREAD)];
+    let body = serde_json::json!({
+        "sessionId": THREAD, "actionId": "act-q3",
+        "expectedTurnId": "t-live", "confirmInterrupt": true,
+        "frontBudgetMs": 400,
+    })
+    .to_string();
+
+    // ─── 阶段一：首次优先 → interrupt 交 writer 后桌面沉默 → Unknown ───
+    let first_reason = {
+        let mut f = fixture_ipc_interrupt_on(conn.clone(), sessions.clone());
+        let mut peer = f.peer.take().unwrap();
+        let (sse, _) = sse_hold_ensure(&f, &mut peer, THREAD, vec![], "active").await;
+        let _sse = sse;
+        t06_enqueue_busy(&f, "队列消息丙", "act-q3").await;
+        let r = post_prioritize(&f, body.clone()).await;
+        assert_eq!(r.status(), 200);
+        let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+        assert_eq!(v["result"], "unknown", "{v}");
+        assert_eq!(v["actionId"], "act-q3", "{v}");
+        assert_eq!(
+            f.hub_store()
+                .get_for_device("act-q3", "dev-1")
+                .unwrap()
+                .unwrap()
+                .state,
+            ActionState::Queued,
+            "停止不确定 → Q3 留队"
+        );
+        assert!(
+            f.hub_store()
+                .queue_pause(&f.thread_key())
+                .unwrap()
+                .is_some(),
+            "停止不确定 → 暂停保留"
+        );
+        let frames = drain_frames(&mut peer).await;
+        let interrupts = frames
+            .iter()
+            .filter(|f| f["method"] == "thread-follower-interrupt-turn")
+            .count();
+        assert_eq!(interrupts, 1, "首次编排恰一次 interrupt：{frames:?}");
+        f.state.codex_control.adapter.shutdown().await;
+        v["reasonCode"].as_str().expect("reasonCode").to_string()
+    };
+
+    // ─── 阶段二：同一 SQLite 上重建 store（重启等价）+ 完全相同请求重放 ───
+    {
+        let mut f = fixture_ipc_interrupt_on(conn.clone(), sessions);
+        let mut peer = f.peer.take().unwrap();
+        let (sse, _) = sse_hold_ensure(&f, &mut peer, THREAD, vec![], "active").await;
+        let _sse = sse;
+        let r = post_prioritize(&f, body).await;
+        assert_eq!(r.status(), 200);
+        let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+        assert_eq!(
+            v["result"], "unknown",
+            "重放按既有未知语义返回（不再发停止）：{v}"
+        );
+        assert_eq!(
+            v["reasonCode"], first_reason,
+            "重放返回与首次一致的未知原因（读持久记录）"
+        );
+        // 累计 interrupt 恰一帧：重放零停止帧；Q3 零帧（不新建副本）
+        let frames = drain_frames(&mut peer).await;
+        let interrupts = frames
+            .iter()
+            .filter(|f| f["method"] == "thread-follower-interrupt-turn")
+            .count();
+        assert_eq!(interrupts, 0, "重放不得再次发停止帧：{frames:?}");
+        assert!(
+            frames
+                .iter()
+                .all(|f| f["method"] != "thread-follower-start-turn"),
+            "未知结果重放不派 Q3：{frames:?}"
+        );
+        assert_eq!(
+            f.hub_store()
+                .get_for_device("act-q3", "dev-1")
+                .unwrap()
+                .unwrap()
+                .state,
+            ActionState::Queued,
+            "重放后 Q3 原样留队（不新建副本）"
+        );
+        f.state.codex_control.adapter.shutdown().await;
+    }
+}
+
+/// C02 验收①：真实 peer 已收到 interrupt 帧 → **取消 handler**（writer 已写出、
+/// 编排未收尾的取消窗）→ 重放同请求累计 interrupt 仍恰一帧、消息零帧；以同一
+/// SQLite 重建（store/hub/adapter/peer 全重建，重启等价）后重放仍只一帧。
+/// 取消窗内停止尝试的持久占有（claim）必须在**首次可能写出之前**落库——事后记录
+/// （Unknown/超时臂）覆盖不到这个窗口。
+#[tokio::test]
+async fn t06_prioritize_stop_cancelled_after_peer_receive_replay_never_resends() {
+    let conn = shared_conn();
+    seed_device(&conn, "dev-1", "iPhone");
+    let sessions = vec![codex_app_session(THREAD)];
+    let body = serde_json::json!({
+        "sessionId": THREAD, "actionId": "act-q3",
+        "expectedTurnId": "t-live", "confirmInterrupt": true,
+        "frontBudgetMs": 400,
+    })
+    .to_string();
+
+    // ─── 阶段一：peer 已收 interrupt 帧 → 立刻取消 handler（取消窗）───
+    {
+        let mut f = fixture_ipc_interrupt_on(conn.clone(), sessions.clone());
+        let mut peer = f.peer.take().unwrap();
+        let (sse, _) = sse_hold_ensure(&f, &mut peer, THREAD, vec![], "active").await;
+        let _sse = sse;
+        t06_enqueue_busy(&f, "队列消息丙", "act-q3").await;
+        let app = f.app.clone();
+        let task_body = body.clone();
+        let task = tokio::spawn(async move {
+            app.oneshot(req(
+                "POST",
+                "/m/api/v1/codex/queue/prioritize",
+                Some(COOKIE),
+                Some(task_body),
+            ))
+            .await
+            .unwrap()
+        });
+        // 同步点：peer 收到 interrupt 帧（写帧已发生），handler 还在等回执
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let frame = peer.recv().await;
+                if frame["method"] == "thread-follower-interrupt-turn" {
+                    break frame;
+                }
+            }
+        })
+        .await
+        .expect("interrupt 帧未在时限内发出");
+        // 取消 handler：编排的收尾（记录/响应）永不执行——正是 R05 事后记录的盲窗
+        task.abort();
+        let joined = task.await;
+        assert!(
+            matches!(&joined, Err(e) if e.is_cancelled()),
+            "handler 必须是在飞中被取消（取消窗构造成立）"
+        );
+
+        // ─── 阶段二：同一 fixture 内重放完全相同请求 ───
+        let r = post_prioritize(&f, body.clone()).await;
+        assert_eq!(r.status(), 200);
+        let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+        assert_eq!(v["result"], "unknown", "取消窗后重放按未知语义返回：{v}");
+        let frames = drain_frames(&mut peer).await;
+        let interrupts = frames
+            .iter()
+            .filter(|f| f["method"] == "thread-follower-interrupt-turn")
+            .count();
+        assert_eq!(
+            interrupts, 0,
+            "取消窗后重放不得再次发停止帧（累计必须仍是一帧）：{frames:?}"
+        );
+        assert!(
+            frames
+                .iter()
+                .all(|f| f["method"] != "thread-follower-start-turn"),
+            "取消窗后重放不派 Q3：{frames:?}"
+        );
+        assert_eq!(
+            f.hub_store()
+                .get_for_device("act-q3", "dev-1")
+                .unwrap()
+                .unwrap()
+                .state,
+            ActionState::Queued,
+            "取消窗后 Q3 留队（暂停保留，未做二次停止不得越队）"
+        );
+        f.state.codex_control.adapter.shutdown().await;
+    }
+
+    // ─── 阶段三：同一 SQLite 重建（store/hub/adapter/peer 全新）后重放 ───
+    {
+        let mut f = fixture_ipc_interrupt_on(conn.clone(), sessions.clone());
+        let mut peer = f.peer.take().unwrap();
+        let r = post_prioritize(&f, body).await;
+        assert_eq!(r.status(), 200);
+        let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+        assert_eq!(
+            v["result"], "unknown",
+            "重建后重放仍按未知语义返回（占有持久、重启不丢）：{v}"
+        );
+        let frames = drain_frames(&mut peer).await;
+        let interrupts = frames
+            .iter()
+            .filter(|f| f["method"] == "thread-follower-interrupt-turn")
+            .count();
+        assert_eq!(interrupts, 0, "重建后重放仍不得再次发停止帧：{frames:?}");
+        assert!(
+            frames
+                .iter()
+                .all(|f| f["method"] != "thread-follower-start-turn"),
+            "重建后重放不派 Q3：{frames:?}"
+        );
+        assert_eq!(
+            f.hub_store()
+                .get_for_device("act-q3", "dev-1")
+                .unwrap()
+                .unwrap()
+                .state,
+            ActionState::Queued,
+            "重建后 Q3 原样留队"
+        );
+        f.state.codex_control.adapter.shutdown().await;
+    }
+
+    // ─── 机制钉死：取消窗留下的持久占有（claim、结果未知）───
+    assert_eq!(
+        stop_attempt_columns_from(&conn, "act-q3"),
+        Some(("claimed".to_string(), None)),
+        "取消窗必须留下 claimed 占有（首帧可能写出前落库、无未知原因升级）"
+    );
+}
+
+/// C02 测试辅助：脱离 fixture 直读共享库的动作行停止尝试状态机列
+/// (stop_attempt_state, stop_attempt_reason)。列不存在（修复前库形态）→ None——
+/// RED 阶段先走到底层帧计数反例，不被 schema 差异截停；重建后仍可核验持久占有。
+fn stop_attempt_columns_from(
+    conn: &SharedConn,
+    action_id: &str,
+) -> Option<(String, Option<String>)> {
+    let conn = conn.lock().unwrap();
+    conn.query_row(
+        "SELECT stop_attempt_state, stop_attempt_reason FROM codex_actions WHERE action_id = ?1",
+        [action_id],
+        |r| {
+            Ok((
+                r.get::<_, Option<String>>(0)?,
+                r.get::<_, Option<String>>(1)?,
+            ))
+        },
+    )
+    .ok()
+    .map(|(s, r)| (s.unwrap_or_default(), r))
+}
+
+/// C02 验收②：**首写前明确零投递**（停止前置失败出口，这里用 409 no_expected_turn
+/// ——阀值缺失，零帧）→ 持久占有被释放 → 之后同 action 重试可再次走停止编排
+///（不因预登记永久封死未发送动作）。
+#[tokio::test]
+async fn t06_prioritize_stop_pre_write_failure_releases_claim_for_retry() {
+    let conn = shared_conn();
+    seed_device(&conn, "dev-1", "iPhone");
+    let mut f = fixture_ipc_interrupt_on(conn.clone(), vec![codex_app_session(THREAD)]);
+    let mut peer = f.peer.take().unwrap();
+    let (sse, _) = sse_hold_ensure(&f, &mut peer, THREAD, vec![], "active").await;
+    let _sse = sse;
+    t06_enqueue_busy(&f, "队列消息丙", "act-q3").await;
+
+    // ─── 尝试一：不带 expectedTurnId → 停止前置失败（409，零帧）───
+    let body_no_valve = serde_json::json!({
+        "sessionId": THREAD, "actionId": "act-q3",
+        "confirmInterrupt": true, "frontBudgetMs": 400,
+    })
+    .to_string();
+    let r = post_prioritize(&f, body_no_valve).await;
+    assert_eq!(r.status(), 409, "阀值缺失前置失败如实 409");
+    let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    assert_eq!(v["error"], "no_expected_turn", "{v}");
+    assert!(
+        !peer_has_traffic(&mut peer).await,
+        "前置失败零帧（零停止、零越队）"
+    );
+    assert_eq!(
+        stop_attempt_columns_from(&conn, "act-q3"),
+        Some(("released".to_string(), None)),
+        "首写前明确零投递 → 占有被释放"
+    );
+
+    // ─── 尝试二：同 action 重试（带阀值）→ 再次走完整停止编排 ───
+    let body_retry = serde_json::json!({
+        "sessionId": THREAD, "actionId": "act-q3",
+        "expectedTurnId": "t-live", "confirmInterrupt": true,
+        "frontBudgetMs": 400,
+    })
+    .to_string();
+    let r = post_prioritize(&f, body_retry).await;
+    assert_eq!(r.status(), 200);
+    let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    assert_eq!(
+        v["result"], "unknown",
+        "重试再次走停止编排（peer 沉默 → 未知）：{v}"
+    );
+    let retry_reason = v["reasonCode"].as_str().expect("reasonCode").to_string();
+    let frames = drain_frames(&mut peer).await;
+    let interrupts = frames
+        .iter()
+        .filter(|f| f["method"] == "thread-follower-interrupt-turn")
+        .count();
+    assert_eq!(
+        interrupts, 1,
+        "释放后重试必须真的再次发停止帧（未被预登记封死）：{frames:?}"
+    );
+    assert!(
+        frames
+            .iter()
+            .all(|f| f["method"] != "thread-follower-start-turn"),
+        "停止未知不派 Q3：{frames:?}"
+    );
+    assert_eq!(
+        f.hub_store()
+            .get_for_device("act-q3", "dev-1")
+            .unwrap()
+            .unwrap()
+            .state,
+        ActionState::Queued,
+        "停止未知 → Q3 留队"
+    );
+    assert_eq!(
+        stop_attempt_columns_from(&conn, "act-q3"),
+        Some(("claimed".to_string(), Some(retry_reason))),
+        "重试的未知结果升级进占有行（重放幂等与 R05 一致）"
+    );
+    assert!(
+        f.hub_store()
+            .queue_pause(&f.thread_key())
+            .unwrap()
+            .is_some(),
+        "停止不确定 → 暂停保留"
+    );
+    f.state.codex_control.adapter.shutdown().await;
+}
+
+/// C02 修复要求：读／写尝试归属失败时**不得继续向 Desktop 发新停止**。
+/// 这里注入 claim 写失败（BEFORE UPDATE 触发器 RAISE ABORT）：占有写不进去 →
+/// 保守拒绝——零帧、零暂停副作用、动作留队，明确告知未发送。
+#[tokio::test]
+async fn t06_prioritize_stop_claim_write_failure_never_sends_stop() {
+    let conn = shared_conn();
+    seed_device(&conn, "dev-1", "iPhone");
+    let mut f = fixture_ipc_interrupt_on(conn.clone(), vec![codex_app_session(THREAD)]);
+    let mut peer = f.peer.take().unwrap();
+    let (sse, _) = sse_hold_ensure(&f, &mut peer, THREAD, vec![], "active").await;
+    let _sse = sse;
+    t06_enqueue_busy(&f, "队列消息丙", "act-q3").await;
+    // 注入：claim 写失败（占有 CAS 从 未占有/已释放 → claimed 的 UPDATE 全部 ABORT）
+    {
+        let c = f.conn.lock().unwrap();
+        c.execute_batch(
+            "CREATE TRIGGER c02_fail_claim BEFORE UPDATE ON codex_actions \
+             WHEN NEW.stop_attempt_state = 'claimed' \
+               AND (OLD.stop_attempt_state IS NULL OR OLD.stop_attempt_state = 'released') \
+             BEGIN SELECT RAISE(ABORT, 'c02-injected-claim-failure'); END;",
+        )
+        .expect("注入 claim 写失败触发器");
+    }
+    let body = serde_json::json!({
+        "sessionId": THREAD, "actionId": "act-q3",
+        "expectedTurnId": "t-live", "confirmInterrupt": true,
+        "frontBudgetMs": 400,
+    })
+    .to_string();
+    let r = post_prioritize(&f, body).await;
+    assert_eq!(r.status(), 200);
+    let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    assert_eq!(v["result"], "not_sent", "归属写失败保守拒绝：{v}");
+    assert_eq!(v["reasonCode"], "stop_claim_unavailable", "{v}");
+    assert_eq!(v["queued"], serde_json::json!(true), "{v}");
+    assert!(
+        !peer_has_traffic(&mut peer).await,
+        "归属写失败不得向 Desktop 发新停止帧（零 interrupt、零 start-turn）"
+    );
+    assert_eq!(
+        f.hub_store()
+            .get_for_device("act-q3", "dev-1")
+            .unwrap()
+            .unwrap()
+            .state,
+        ActionState::Queued,
+        "保守拒绝 → Q3 留队"
+    );
+    assert!(
+        f.hub_store()
+            .queue_pause(&f.thread_key())
+            .unwrap()
+            .is_none(),
+        "claim 在停止前置暂停之前失败 → 零暂停副作用"
+    );
+    f.state.codex_control.adapter.shutdown().await;
+}
+
+#[tokio::test]
+async fn queue_edit_priority_phone_turn_reconciles_before_dispatch() {
+    let mut f = fixture_ipc_interrupt(vec![codex_app_session(THREAD)]);
+    let mut peer = f.peer.take().unwrap();
+    let (_sse, _) = sse_hold_ensure(&f, &mut peer, THREAD, vec![], "idle").await;
+    let app = f.app.clone();
+    let task = tokio::spawn(async move {
+        app.oneshot(req(
+            "POST",
+            "/m/api/v1/session-send",
+            Some(COOKIE),
+            Some(send_body("原回合", Some("act-original"), false)),
+        ))
+        .await
+        .unwrap()
+    });
+    let original = recv_within(&mut peer, 10).await;
+    assert_eq!(original["method"], "thread-follower-start-turn");
+    confirm_client_message_identity_for(
+        &mut peer,
+        THREAD,
+        &original,
+        "t-live",
+        "原回合",
+        11,
+        "owner-1",
+    )
+    .await;
+    peer.send(&serde_json::json!({"type":"response", "requestId":original["requestId"], "resultType":"success", "method":"thread-follower-start-turn", "handledByClientId":"owner-1", "result":{"turn":{"id":"t-live","status":"inProgress"}}})).await;
+    let response = tokio::time::timeout(Duration::from_secs(15), task)
+        .await
+        .unwrap()
+        .unwrap();
+    let accepted: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
+    assert_eq!(accepted["receipt"]["delivery"], "accepted", "{accepted}");
+    assert!(f
+        .state
+        .codex_control
+        .router
+        .is_turn_active_public(&f.thread_key()));
+
+    // ① 三条入队（忙态 FIFO）：Q1、Q2 旧队列 + Q3 目标
+    t06_enqueue_busy(&f, "队列消息甲", "act-q1").await;
+    t06_enqueue_busy(&f, "队列消息乙", "act-q2").await;
+    t06_enqueue_busy(&f, "队列消息丙", "act-q3").await;
+
+    // ② 无确认（confirmInterrupt=false，回合在跑）→ 零停止零越队
+    {
+        let body = prioritize_body("act-q3", None, false).await;
+        let r = post_prioritize(&f, body).await;
+        assert_eq!(r.status(), 200);
+        let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+        assert_eq!(v["result"], "not_sent", "{v}");
+        assert_eq!(v["actionId"], "act-q3", "{v}");
+        assert!(
+            !peer_has_traffic(&mut peer).await,
+            "无确认：零停止帧、零越队帧"
+        );
+        assert_eq!(
+            f.hub_store()
+                .get_for_device("act-q3", "dev-1")
+                .unwrap()
+                .unwrap()
+                .state,
+            ActionState::Queued,
+            "拒绝不落账作废：Q3 仍在队列"
+        );
+    }
+
+    // ③ 确认优先 Q3（expectedTurnId 安全阀）→ 一次 interrupt + Q3 恰好一帧
+    let mut frames: Vec<serde_json::Value> = Vec::new();
+    let body = prioritize_body("act-q3", Some("t-live"), true).await;
+    let app = f.app.clone();
+    let task = tokio::spawn(async move {
+        app.oneshot(req(
+            "POST",
+            "/m/api/v1/codex/queue/prioritize",
+            Some(COOKIE),
+            Some(body),
+        ))
+        .await
+        .unwrap()
+    });
+    // 第一帧：定向停止（expectedTurnId 安全阀必须在场）
+    let stop = recv_within(&mut peer, 10).await;
+    frames.push(stop.clone());
+    assert_eq!(stop["method"], "thread-follower-interrupt-turn", "{stop}");
+    assert_eq!(stop["params"]["expectedTurnId"], "t-live", "{stop}");
+    peer.send(&serde_json::json!({
+        "type": "response", "requestId": stop["requestId"],
+        "resultType": "success", "method": "thread-follower-interrupt-turn",
+        "result": { "interruptedTurnId": "t-live", "ok": true }
+    }))
+    .await;
+    // 回合终态确认：被停回合置终态（快照 idle）
+    peer.send(&serde_json::json!({"type":"broadcast","method":"thread-stream-state-changed","version":11,"sourceClientId":"owner-1","params":{"conversationId":THREAD,"hostId":"local","change":{"type":"snapshot","revision":13,"conversationState":{"turns":[],"requests":[],"threadRuntimeStatus":{"type":"idle"},"turnHistory":codex_fixture::canonical_turn_history(serde_json::json!({"t-live":{"id":"t-live","type":"turn","status":"completed","items":[]}}),serde_json::json!([{"entries":["t-live"]}]))}}}})).await;
+    wait_snapshot_applied(&f, 13, true).await;
+    // 第二帧：Q3 恰好一帧 start-turn（原正文、原 actionId 的持久 cmid）
+    let start = recv_within(&mut peer, 15).await;
+    frames.push(start.clone());
+    assert_eq!(start["method"], "thread-follower-start-turn", "{start}");
+    assert_eq!(
+        start_turn_text(&start),
+        "队列消息丙",
+        "越队派发的是原 queued 行正文（不是正文副本重发）"
+    );
+    let q3_cmid = start["params"]["turnStart"]["request"]["clientUserMessageId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    confirm_client_message_identity_for(
+        &mut peer,
+        THREAD,
+        &start,
+        "turn-q3",
+        "队列消息丙",
+        14,
+        "owner-1",
+    )
+    .await;
+    peer.send(&serde_json::json!({
+        "type": "response", "requestId": start["requestId"],
+        "resultType": "success", "method": "thread-follower-start-turn",
+        "handledByClientId": "owner-1",
+        "result": { "turn": { "id": "turn-q3", "status": "inProgress" } }
+    }))
+    .await;
+    let r = tokio::time::timeout(Duration::from_secs(20), task)
+        .await
+        .expect("prioritize in time")
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    assert_eq!(v["result"], "prioritized", "{v}");
+    assert_eq!(v["actionId"], "act-q3", "{v}");
+    assert_eq!(v["receipt"]["delivery"], "accepted", "{v}");
+
+    // 帧分别计数：恰一次 interrupt + Q3 恰一帧；Q1/Q2 零帧
+    frames.extend(drain_frames(&mut peer).await);
+    let interrupt_frames = frames
+        .iter()
+        .filter(|f| f["method"] == "thread-follower-interrupt-turn")
+        .count();
+    let count_start_turn = |text: &str| -> usize {
+        frames
+            .iter()
+            .filter(|f| f["method"] == "thread-follower-start-turn" && start_turn_text(f) == text)
+            .count()
+    };
+    let q1_start_turn_frames = count_start_turn("队列消息甲");
+    let q2_start_turn_frames = count_start_turn("队列消息乙");
+    let q3_start_turn_frames = count_start_turn("队列消息丙");
+    assert_eq!(interrupt_frames, 1, "恰一次定向停止：{frames:?}");
+    assert_eq!(q3_start_turn_frames, 1);
+    assert_eq!(q1_start_turn_frames + q2_start_turn_frames, 0);
+    // 持久 cmid 沿用原动作（重试同 action 不换新 id 的账本约定）
+    let (_, stored_cmid) = f
+        .hub_store()
+        .action_thread_and_cmid("act-q3")
+        .expect("act-q3 在账");
+    assert_eq!(q3_cmid, stored_cmid, "越队沿用原 client_message_id");
+
+    // 旧队列：仍 queued 且暂停（持久行 + 队列视图双重断言）
+    assert_eq!(
+        f.hub_store()
+            .get_for_device("act-q1", "dev-1")
+            .unwrap()
+            .unwrap()
+            .state,
+        ActionState::Queued
+    );
+    assert_eq!(
+        f.hub_store()
+            .get_for_device("act-q2", "dev-1")
+            .unwrap()
+            .unwrap()
+            .state,
+        ActionState::Queued
+    );
+    let key = f.thread_key();
+    let queue_paused_after_priority = f.hub_store().queue_pause(&key).unwrap().is_some();
+    assert!(queue_paused_after_priority, "旧队列保持暂停");
+    let r = f
+        .app
+        .clone()
+        .oneshot(req(
+            "GET",
+            &format!("/m/api/v1/codex/queue?session_id={THREAD}"),
+            Some(COOKIE),
+            None,
+        ))
+        .await
+        .unwrap();
+    let qv: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    assert_eq!(qv["queuePaused"], serde_json::json!(true), "{qv}");
+    assert_eq!(
+        qv["actions"].as_array().unwrap().len(),
+        2,
+        "队列视图只剩 Q1/Q2：{qv}"
+    );
+    f.state.codex_control.adapter.shutdown().await;
+}
+
+/// 重放/撤回/第二设备：同请求重放 → 同 actionId 零新帧回实际状态；撤回后优先 →
+/// 不复活；他人动作 → 404。
+#[tokio::test]
+async fn queue_edit_returns_text_only_after_cancel_and_replay_conflicts() {
+    let mut f = fixture_ipc_interrupt(vec![codex_app_session(THREAD)]);
+    seed_device(&f.conn, "dev-2", "iPad");
+    let mut peer = f.peer.take().unwrap();
+    let (_sse, _) = sse_hold_ensure(&f, &mut peer, THREAD, vec![], "active").await;
+    t06_enqueue_busy(&f, "正文 [mobile 自写]", "act-edit").await;
+    let body = serde_json::json!({"sessionId":THREAD,"actionId":"act-edit"}).to_string();
+    let r = f
+        .app
+        .clone()
+        .oneshot(req(
+            "POST",
+            "/m/api/v1/codex/queue/edit",
+            Some("mam_device=dev-2"),
+            Some(body.clone()),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 404);
+    let r = f
+        .app
+        .clone()
+        .oneshot(req(
+            "POST",
+            "/m/api/v1/codex/queue/edit",
+            Some(COOKIE),
+            Some(body.clone()),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    assert_eq!(v["text"], "正文 [mobile 自写]");
+    assert_eq!(
+        f.hub_store()
+            .get_for_device("act-edit", "dev-1")
+            .unwrap()
+            .unwrap()
+            .state,
+        ActionState::Cancelled
+    );
+    let r = f
+        .app
+        .clone()
+        .oneshot(req(
+            "POST",
+            "/m/api/v1/codex/queue/edit",
+            Some(COOKIE),
+            Some(body),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 409);
+    assert!(!peer_has_traffic(&mut peer).await);
+    f.state.codex_control.adapter.shutdown().await;
+}
+
+#[tokio::test]
+async fn combined_queue_manual_resume_never_resends_just_one_member() {
+    let f = fixture_ipc(vec![codex_app_session(THREAD)]);
+    let store = f.hub_store();
+    for (id, text) in [("batch-parent", "第一条"), ("batch-child", "第二条")] {
+        let ctx = ActionContext {
+            action_id: id.into(),
+            device_id: "dev-1".into(),
+            device_name: "iPhone".into(),
+            kind: ActionKind::Send,
+            key: f.thread_key(),
+        };
+        let hash = payload_hash(
+            ActionKind::Send,
+            &ctx.key,
+            None,
+            None,
+            &ActionPayload::Text(text.into()),
+        );
+        store
+            .register_signed(
+                &ctx,
+                ActionKind::Send,
+                None,
+                None,
+                &hash,
+                Some(text),
+                Some(false),
+            )
+            .unwrap();
+    }
+    assert_eq!(
+        store.reserve_send_batch("batch-parent").unwrap().as_deref(),
+        Some("第一条\n\n第二条")
+    );
+    for id in ["batch-parent", "batch-child"] {
+        let r = f.app.clone().oneshot(req("POST", "/m/api/v1/codex/action/manual-resume", Some(COOKIE), Some(serde_json::json!({"actionId": id, "newActionId": format!("retry-{id}"), "text":"第一条"}).to_string()))).await.unwrap();
+        assert_eq!(r.status(), 409);
+        let body: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+        assert_eq!(body["error"], "batch_requires_verification");
+        assert!(store
+            .get_for_device(&format!("retry-{id}"), "dev-1")
+            .unwrap()
+            .is_none());
+    }
+}
+
+/// P5 端到端（2026-10-31 用户实机反馈「明明没在运行却全部排队」）：真实 HTTP +
+/// 真实 router/store + ScriptedPeer，复现用户账本里的精确形态——
+/// ① 迁移前的停止类暂停行（pause_turn_id 为空）仍有 6 行残留在册；
+/// ② 一条历史 unknown 屏障（compat_outstanding=1、无 turnId、无核对证据）。
+/// 线程此刻**空闲**（桌面无运行回合）。契约：普通消息必须直发（accepted），
+/// 不得被这两条陈旧记录扣成 codex_queued。
+#[tokio::test]
+async fn p5_stale_pause_and_unknown_residue_do_not_queue_idle_sends() {
+    let mut f = fixture_ipc(vec![codex_app_session(THREAD)]);
+    let mut peer = f.peer.take().unwrap();
+    let (sse, _) = sse_hold_ensure(&f, &mut peer, THREAD, vec![], "idle").await;
+    let _sse = sse;
+    let key = f.thread_key();
+    // ① 陈旧停止暂停行（迁移前形态：无回合绑定）
+    f.state
+        .codex_control
+        .router
+        .store()
+        .set_queue_pause(&key, "interrupt_pending", "legacy-1", None)
+        .expect("seed legacy pause");
+    // ② 历史 unknown 屏障：reserved → 落 unknown，屏障在册且无 turnId
+    {
+        let store = f.state.codex_control.router.store();
+        let ctx = ActionContext {
+            action_id: "act-old-unknown".to_string(),
+            device_id: "dev-1".to_string(),
+            device_name: "iPhone".to_string(),
+            kind: ActionKind::Send,
+            key: key.clone(),
+        };
+        let hash = payload_hash(
+            ActionKind::Send,
+            &key,
+            None,
+            None,
+            &ActionPayload::Text("旧消息".into()),
+        );
+        store
+            .register_signed(
+                &ctx,
+                ActionKind::Send,
+                None,
+                None,
+                &hash,
+                Some("旧消息"),
+                Some(false),
+            )
+            .expect("register old");
+        assert!(store
+            .reserve("act-old-unknown", ControlRoute::DesktopIpc)
+            .unwrap());
+        store
+            .finish_with_turn_barrier(
+                &ActionReceipt {
+                    action_id: "act-old-unknown".to_string(),
+                    delivery: Delivery::UnknownDelivery,
+                    route: ControlRoute::DesktopIpc,
+                    turn_id: None,
+                    envelope_id: Some("env-old".into()),
+                    reason_code: Some("client_message_unverified".to_string()),
+                },
+                None,
+            )
+            .expect("finish unknown");
+    }
+    assert!(
+        f.hub_store().has_compat_fence(&key).unwrap(),
+        "前置：陈旧 unknown 屏障在册"
+    );
+
+    // 空闲线程的普通发送 → 必须直发
+    let app = f.app.clone();
+    let task = tokio::spawn(async move {
+        app.oneshot(req(
+            "POST",
+            "/m/api/v1/session-send",
+            Some(COOKIE),
+            Some(send_body("空闲时直接发", Some("act-fresh"), false)),
+        ))
+        .await
+        .unwrap()
+    });
+    let frame = recv_within(&mut peer, 15).await;
+    assert_eq!(
+        frame["method"], "thread-follower-start-turn",
+        "不得把空闲会话的发送扣在队列：{frame}"
+    );
+    confirm_client_message_identity_for(
+        &mut peer,
+        THREAD,
+        &frame,
+        "turn-fresh",
+        "空闲时直接发",
+        9,
+        "owner-1",
+    )
+    .await;
+    peer.send(&serde_json::json!({
+        "type": "response", "requestId": frame["requestId"],
+        "resultType": "success", "method": "thread-follower-start-turn",
+        "handledByClientId": "owner-1",
+        "result": { "turn": { "id": "turn-fresh", "status": "inProgress" } }
+    }))
+    .await;
+    let r = tokio::time::timeout(Duration::from_secs(20), task)
+        .await
+        .expect("send in time")
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    assert_ne!(v["status"], "codex_queued", "不得排队：{v}");
+    assert_eq!(v["receipt"]["delivery"], "accepted", "{v}");
+    f.state.codex_control.adapter.shutdown().await;
+}
+
+/// P7（2026-10-31 第三次实机：点插队被拒「桌面正忙」，只停了进程没发出消息）。
+///
+/// 用户的完整现场：两条 queued（第 1/2 位）、一条历史 unknown 屏障在册、
+/// **桌面空闲**、暂停行已被陈旧清理清空。
+///
+/// 死结：`POST /codex/queue/prioritize` 的 Clear 臂要求「空闲且**队列已暂停**」，
+/// 而陈旧暂停已被自动清理 → 队列未暂停 → 返回 `queue_not_paused`；同一时刻屏障
+/// 又挡住自动接力。结果：插队永久不可用、队列也发不出去。
+///
+/// 用户裁决（2026-10-31 第二次）：「插队的行为就是停止进程之后，直接把这个消息
+/// 打出去」。空闲时没有进程要停，插队必须仍然可用——它是用户对**具体一条**的显式
+/// 意图，不依赖暂停状态。
+#[tokio::test]
+async fn p7_prioritize_works_when_idle_and_queue_unpaused() {
+    let mut f = fixture_ipc_interrupt(vec![codex_app_session(THREAD)]);
+    let mut peer = f.peer.take().unwrap();
+    // 忙态入队（active）再转 idle —— 与用户现场一致：先排队，后桌面空闲
+    let (sse, _) = sse_hold_ensure(&f, &mut peer, THREAD, vec![], "active").await;
+    let _sse = sse;
+    t06_enqueue_busy(&f, "你好", "act-q1").await;
+    t06_enqueue_busy(&f, "测试一下有多少内容。", "act-q2").await;
+    push_snapshot(&mut peer, THREAD, 8, "idle", vec![]).await;
+    wait_snapshot_applied(&f, 8, true).await;
+    assert!(
+        f.hub_store()
+            .queue_pause(&f.thread_key())
+            .unwrap()
+            .is_none(),
+        "前置：队列未暂停（陈旧暂停已被清理，正是死结现场）"
+    );
+
+    // 插队第 1 条（空闲 + 未暂停）→ 必须真的派出去
+    let body = prioritize_body("act-q1", None, false).await;
+    let app = f.app.clone();
+    let task = tokio::spawn(async move {
+        app.oneshot(req(
+            "POST",
+            "/m/api/v1/codex/queue/prioritize",
+            Some(COOKIE),
+            Some(body),
+        ))
+        .await
+        .unwrap()
+    });
+    // 先拿 HTTP 响应（拒绝会立即返回，不会发帧）；无帧时把响应体打出来定位
+    let start = match tokio::time::timeout(Duration::from_secs(3), peer.recv()).await {
+        Ok(frame) => frame,
+        Err(_) => {
+            let r = tokio::time::timeout(Duration::from_secs(4), task)
+                .await
+                .expect("prioritize should return promptly when refusing")
+                .unwrap();
+            let status = r.status();
+            let body = body_string(r).await;
+            panic!("插队未发出任何帧。HTTP status={status} body={body}");
+        }
+    };
+    assert_eq!(
+        start["method"], "thread-follower-start-turn",
+        "插队必须把该条正文打出去（不能只返回拒绝）：{start}"
+    );
+    assert_eq!(start_turn_text(&start), "你好", "派的是被点的那一条");
+    confirm_client_message_identity_for(&mut peer, THREAD, &start, "turn-q1", "你好", 9, "owner-1")
+        .await;
+    peer.send(&serde_json::json!({
+        "type": "response", "requestId": start["requestId"],
+        "resultType": "success", "method": "thread-follower-start-turn",
+        "handledByClientId": "owner-1",
+        "result": { "turn": { "id": "turn-q1", "status": "inProgress" } }
+    }))
+    .await;
+    let r = tokio::time::timeout(Duration::from_secs(20), task)
+        .await
+        .expect("prioritize in time")
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    assert_eq!(v["result"], "prioritized", "{v}");
+    assert_eq!(v["actionId"], "act-q1", "{v}");
+    f.state.codex_control.adapter.shutdown().await;
+}
+
+/// P8（2026-10-31 第四次实机，用户判断：判断桌面是否终止的检查太快）：
+///
+/// 实机现象：第一次点插队 → 进程被打断但消息没发出去；等远端进程结束后**再点一次**
+/// 插队才成功。用户判断「打断后桌面有延迟，立刻检查会误判为还没断」。
+///
+/// 代码确认：`interruptedTurnId == null` 分支（目标换代/无可打断回合）只做**一次**
+/// `fresh_send_gate` 就决定拒绝（`stop_not_effective`），完全不等。当 Desktop 已受理
+/// 停止、但状态帧还在路上时（真机常态延迟），这一次检查必然看到 Busy → 误判。
+/// 契约：该分支也必须按预算**有界等待终态**（轮询到 Clear 或预算耗尽），
+/// 与 `interruptedTurnId != null` 分支同强度；真换代（永不转 Clear）仍以预算为界。
+#[tokio::test]
+async fn p8_null_interrupted_turn_id_waits_for_terminal_before_refusing() {
+    let mut f = fixture_ipc_interrupt(vec![codex_app_session(THREAD)]);
+    let mut peer = f.peer.take().unwrap();
+    let (sse, _) = sse_hold_ensure(&f, &mut peer, THREAD, vec![], "active").await;
+    let _sse = sse;
+    t06_enqueue_busy(&f, "等待中的消息", "act-w1").await;
+
+    let body = prioritize_body("act-w1", Some("t-live"), true).await;
+    let app = f.app.clone();
+    let task = tokio::spawn(async move {
+        app.oneshot(req(
+            "POST",
+            "/m/api/v1/codex/queue/prioritize",
+            Some(COOKIE),
+            Some(body),
+        ))
+        .await
+        .unwrap()
+    });
+    let stop = recv_within(&mut peer, 10).await;
+    assert_eq!(stop["method"], "thread-follower-interrupt-turn", "{stop}");
+    // Desktop 先回「无可打断回合」（null）——此时状态帧还没到，仍是 active
+    peer.send(&serde_json::json!({
+        "type": "response", "requestId": stop["requestId"],
+        "resultType": "success", "method": "thread-follower-interrupt-turn",
+        "result": { "interruptedTurnId": serde_json::Value::Null, "ok": true }
+    }))
+    .await;
+    // 延迟：桌面稍后才真正转为空闲（真机常态，用户描述的正是这一段）。
+    // 用独立任务在**同一个 peer**上延迟推送快照（不能把 peer 移走——适配器要读它）。
+    let snap_task = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(900)).await;
+    });
+    snap_task.await.ok();
+    push_snapshot(&mut peer, THREAD, 12, "idle", vec![]).await;
+    // 端点应在等待后**派发**这一条，而不是立刻回 stop_not_effective
+    let start = recv_within(&mut peer, 20).await;
+    assert_eq!(
+        start["method"], "thread-follower-start-turn",
+        "桌面稍后才转空闲时必须等待并派发，而不是立刻拒绝：{start}"
+    );
+    assert_eq!(start_turn_text(&start), "等待中的消息");
+    confirm_client_message_identity_for(
+        &mut peer,
+        THREAD,
+        &start,
+        "turn-w1",
+        "等待中的消息",
+        13,
+        "owner-1",
+    )
+    .await;
+    peer.send(&serde_json::json!({
+        "type": "response", "requestId": start["requestId"],
+        "resultType": "success", "method": "thread-follower-start-turn",
+        "handledByClientId": "owner-1",
+        "result": { "turn": { "id": "turn-w1", "status": "inProgress" } }
+    }))
+    .await;
+    let r = tokio::time::timeout(Duration::from_secs(20), task)
+        .await
+        .expect("prioritize in time")
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    assert_eq!(v["result"], "prioritized", "{v}");
+    f.state.codex_control.adapter.shutdown().await;
+}
+
+/// P9（2026-10-31 第五次实机）：插队成功后，它自己留下的 accepted 屏障把下一次插队锁死。
+///
+/// 用户现场：库里同时有 ①`unknown` 历史屏障 ②**上一次插队成功后留下的
+/// `accepted` + 有 turnId** 屏障。`barriers_all_unknown_residue` 要求**全部**是
+/// unknown 才放行 → 混进一条 accepted 就返回 false → 插队被 `barrier_outstanding`
+/// 拒绝（界面显示「桌面正忙」）。于是每插队成功一次就锁死一次，必须等
+/// 用户手动干预。契约：**accepted 且已绑定 turnId** 的屏障属于「等待该回合终态
+/// 自然收敛」的正常在途记录，不得阻止用户对**另一条**消息的显式插队；
+/// 未绑定回合的 accepted（保守屏障）仍按冻结处理。
+#[tokio::test]
+async fn p9_accepted_bound_barrier_does_not_block_prioritizing_another_message() {
+    let mut f = fixture_ipc_interrupt(vec![codex_app_session(THREAD)]);
+    let mut peer = f.peer.take().unwrap();
+    let (sse, _) = sse_hold_ensure(&f, &mut peer, THREAD, vec![], "active").await;
+    let _sse = sse;
+    // 上一次插队成功留下的 accepted + turnId 屏障（用户库 250b36a8 同形态）
+    {
+        let store = f.state.codex_control.router.store();
+        let key = f.thread_key();
+        let ctx = ActionContext {
+            action_id: "act-prev".to_string(),
+            device_id: "dev-1".to_string(),
+            device_name: "iPhone".to_string(),
+            kind: ActionKind::Send,
+            key: key.clone(),
+        };
+        let hash = payload_hash(
+            ActionKind::Send,
+            &key,
+            None,
+            None,
+            &ActionPayload::Text("上一次插队".into()),
+        );
+        store
+            .register_signed(
+                &ctx,
+                ActionKind::Send,
+                None,
+                None,
+                &hash,
+                Some("上一次插队"),
+                Some(false),
+            )
+            .expect("register prev");
+        assert!(store.reserve("act-prev", ControlRoute::DesktopIpc).unwrap());
+        store
+            .finish_with_turn_barrier(
+                &ActionReceipt {
+                    action_id: "act-prev".to_string(),
+                    delivery: Delivery::Accepted,
+                    route: ControlRoute::DesktopIpc,
+                    turn_id: Some("turn-prev".into()),
+                    envelope_id: Some("env-prev".into()),
+                    reason_code: None,
+                },
+                Some("turn-prev"),
+            )
+            .expect("finish accepted");
+    }
+    t06_enqueue_busy(&f, "这次要插队的", "act-next").await;
+    push_snapshot(&mut peer, THREAD, 8, "idle", vec![]).await;
+    wait_snapshot_applied(&f, 8, true).await;
+
+    let body = prioritize_body("act-next", None, false).await;
+    let app = f.app.clone();
+    let task = tokio::spawn(async move {
+        app.oneshot(req(
+            "POST",
+            "/m/api/v1/codex/queue/prioritize",
+            Some(COOKIE),
+            Some(body),
+        ))
+        .await
+        .unwrap()
+    });
+    let start = recv_within(&mut peer, 15).await;
+    assert_eq!(
+        start["method"], "thread-follower-start-turn",
+        "上一条 accepted 在等终态，不得阻止对另一条的显式插队：{start}"
+    );
+    assert_eq!(start_turn_text(&start), "这次要插队的");
+    confirm_client_message_identity_for(
+        &mut peer,
+        THREAD,
+        &start,
+        "turn-next",
+        "这次要插队的",
+        9,
+        "owner-1",
+    )
+    .await;
+    peer.send(&serde_json::json!({
+        "type": "response", "requestId": start["requestId"],
+        "resultType": "success", "method": "thread-follower-start-turn",
+        "handledByClientId": "owner-1",
+        "result": { "turn": { "id": "turn-next", "status": "inProgress" } }
+    }))
+    .await;
+    let r = tokio::time::timeout(Duration::from_secs(20), task)
+        .await
+        .expect("prioritize in time")
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    assert_eq!(v["result"], "prioritized", "{v}");
+    f.state.codex_control.adapter.shutdown().await;
+}
+
+/// P10（2026-10-31 用户追加要求）：「兜底 3 秒之后发现这个插队还是没发出去的话，
+/// 再补一个」。
+///
+/// 场景：Desktop 回 `interruptedTurnId:null`，且桌面**比第一段 3 秒窗更慢**才转空闲
+/// （第 4.5 秒）。第一段窗到期时仍 Busy；必须有第二段宽限继续等，最终把消息发出去，
+/// 而不是回 `stop_not_effective` 让用户再点一次。
+#[tokio::test]
+async fn p10_slow_terminal_beyond_first_window_still_dispatches() {
+    let mut f = fixture_ipc_interrupt(vec![codex_app_session(THREAD)]);
+    let mut peer = f.peer.take().unwrap();
+    let (sse, _) = sse_hold_ensure(&f, &mut peer, THREAD, vec![], "active").await;
+    let _sse = sse;
+    t06_enqueue_busy(&f, "慢停止的消息", "act-slow").await;
+
+    let body = prioritize_body("act-slow", Some("t-live"), true).await;
+    let app = f.app.clone();
+    let task = tokio::spawn(async move {
+        app.oneshot(req(
+            "POST",
+            "/m/api/v1/codex/queue/prioritize",
+            Some(COOKIE),
+            Some(body),
+        ))
+        .await
+        .unwrap()
+    });
+    let stop = recv_within(&mut peer, 10).await;
+    assert_eq!(stop["method"], "thread-follower-interrupt-turn", "{stop}");
+    peer.send(&serde_json::json!({
+        "type": "response", "requestId": stop["requestId"],
+        "resultType": "success", "method": "thread-follower-interrupt-turn",
+        "result": { "interruptedTurnId": serde_json::Value::Null, "ok": true }
+    }))
+    .await;
+    // 桌面在第 4.5 秒才转空闲 —— 超出第一段 3s 窗，落在第二段宽限内
+    tokio::time::sleep(Duration::from_millis(4_500)).await;
+    push_snapshot(&mut peer, THREAD, 12, "idle", vec![]).await;
+    wait_snapshot_applied(&f, 12, true).await;
+
+    let start = recv_within(&mut peer, 20).await;
+    assert_eq!(
+        start["method"], "thread-follower-start-turn",
+        "第一段 3s 窗过后仍应继续等待并发出去（不能回 stop_not_effective）：{start}"
+    );
+    assert_eq!(start_turn_text(&start), "慢停止的消息");
+    confirm_client_message_identity_for(
+        &mut peer,
+        THREAD,
+        &start,
+        "turn-slow",
+        "慢停止的消息",
+        13,
+        "owner-1",
+    )
+    .await;
+    peer.send(&serde_json::json!({
+        "type": "response", "requestId": start["requestId"],
+        "resultType": "success", "method": "thread-follower-start-turn",
+        "handledByClientId": "owner-1",
+        "result": { "turn": { "id": "turn-slow", "status": "inProgress" } }
+    }))
+    .await;
+    let r = tokio::time::timeout(Duration::from_secs(25), task)
+        .await
+        .expect("prioritize in time")
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    assert_eq!(v["result"], "prioritized", "{v}");
+    f.state.codex_control.adapter.shutdown().await;
 }

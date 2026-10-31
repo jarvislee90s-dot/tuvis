@@ -442,6 +442,7 @@ async fn run_decision_flow(
             pre_dispatch_turns: Default::default(),
             interaction_recheck: None,
             async_write_recheck: None,
+            wire_text: None,
         })
         .await;
     let receipt = match outcome.delivery {

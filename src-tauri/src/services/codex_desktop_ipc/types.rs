@@ -152,6 +152,15 @@ pub struct CodexActionView {
     /// 后台收尾中的「待确认」）/ `settled`（账本终态）。由 state 派生，不单独持久化。
     #[serde(default)]
     pub stage: DeliveryStage,
+    /// P4：排队正文的展示预览（原样取自账本 `queued_text`，服务端截前 120 个字符
+    /// ——按字符边界切，不剥签名、不改内容；前端自行剥移动端签名后缀再截显示长度）。
+    /// 仅仍有 queued_text 的行有值；reserved/终态行 queued_text 已清 → None（既有行为）。
+    #[serde(
+        default,
+        rename = "textPreview",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub text_preview: Option<String>,
 }
 
 /// S3 投递阶段枚举（`CodexActionView.stage`；serde snake_case）。
@@ -262,6 +271,28 @@ pub struct OwnerLease {
     pub generation: u64,
 }
 
+/// T02（投影落地守卫）：投影的**增量版本束**——SSE 快照/state、GET 读 DTO、轮询
+/// 同源下发，前端（`codex-projection-order.ts`）据此把 GET／SSE／手动刷新收进
+/// 同一落地守卫：迟到的旧响应不得覆盖新状态。
+///
+/// 字段与服务端 `supersedes`（`remote/codex_ipc.rs`）的事实模型一一对应
+/// （epoch > generation > stale/revision > local_seq）；`instance_id` 绑定本次
+/// hub 世系（`CodexControlHub::owner_boot`，同进程重建 hub 也换新）——跨服务
+/// 重启的随机 instanceId 之间不可直接比较，前端只在「当前代际最新握手」时允许
+/// 切换 instance。**不得**在每次 GET 生成新 instanceId（那会让跨响应比较失效）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectionVersion {
+    /// 本 hub 的启动/装配身份（N07 `owner_boot`；进程级世系，非每次请求随机值）。
+    pub instance_id: String,
+    pub owner_epoch: u64,
+    pub owner_generation: u64,
+    /// 与投影本体 `revision` 同源（可空：无 Desktop revision 的事件按 local_seq 竞争）。
+    pub revision: Option<u64>,
+    /// 与投影本体 `local_seq` 同源（终审 F5 的本地发布序号）。
+    pub local_seq: u64,
+}
+
 /// Thread 状态投影（spec 3.3：IPC 原始 state 不直接进入远程 API）。正文尾窗
 /// 1 MiB / 500 条，超出标 `truncated`。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -324,6 +355,31 @@ pub struct ThreadProjection {
     /// 手工构造（测试夹具/旧路径缺省）= 0：与既有「无序号」事件语义一致。
     #[serde(skip, default)]
     pub local_seq: u64,
+    /// T02：增量版本束（远程层**发射点**盖章；见 [`ProjectionVersion`]）。
+    /// `None` = 未盖章（内部值/旧路径）——序列化时整个字段省略，前端按旧载荷
+    /// 退化规则处理（不获得新写资格；写门本就不在前端）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projection_version: Option<ProjectionVersion>,
+    /// T03：**新鲜镜像同次观察**的活动回合 id（canonical 序最后一个 `inProgress`
+    /// Turn）。它只是前端「停止本轮」按钮的**目标**，**不替代后端 writer 校验**
+    /// （expectedTurnId 安全阀照旧）。idle（无活动回合）/unknown/stale/无镜像 →
+    /// `None`；旧载荷缺字段 → `None`。投影与该 id 在镜像临界区内同次观察产生，
+    /// 不存在"投影新、回合旧"的错位窗口。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_turn_id: Option<String>,
+}
+
+impl ThreadProjection {
+    /// 以给定 hub 世系身份现算版本束（发射点调用；只读既有字段，不改投影本身）。
+    pub fn projection_version_of(&self, instance_id: &str) -> ProjectionVersion {
+        ProjectionVersion {
+            instance_id: instance_id.to_string(),
+            owner_epoch: self.owner_epoch,
+            owner_generation: self.owner_generation,
+            revision: self.revision,
+            local_seq: self.local_seq,
+        }
+    }
 }
 
 /// 探测结论的**只读事实**（#172/T9a；随投影下发）。
@@ -929,6 +985,7 @@ mod tests {
                 position: Some(1),
                 receipt: None,
                 stage: DeliveryStage::Queued,
+                text_preview: None,
             }],
             blocked_reason_code: None,
             barrier_action_ids: Vec::new(),
@@ -941,5 +998,124 @@ mod tests {
         assert!(v["blockedReasonCode"].is_null());
         // 复审 P2-2：能力位恒序列化（camelCase），消费方据此隐藏打断按钮
         assert_eq!(v["canInterrupt"], serde_json::json!(false));
+    }
+
+    /// T03：`activeTurnId` 序列化形状锁——None 时整个字段省略（旧载荷兼容面）；
+    /// Some 时 camelCase 随投影下发；旧载荷（缺字段）反序列化 → None（不崩）。
+    #[test]
+    fn active_turn_id_omitted_when_none_and_camel_case_when_some() {
+        let base = || ThreadProjection {
+            thread_id: "th-1".into(),
+            revision: Some(1),
+            stale: false,
+            availability: ControlAvailability::Controllable,
+            capabilities: CapabilitySet {
+                send: true,
+                state: true,
+                command: false,
+                permissions: false,
+                blocking_input: false,
+                interrupt: false,
+            },
+            runtime_status: "active".into(),
+            content_state: ContentState::Ready,
+            messages: Vec::new(),
+            truncated: false,
+            history_token: String::new(),
+            pending: Vec::new(),
+            async_questions: Vec::new(),
+            effective_operations:
+                crate::services::codex_desktop_ipc::capability::EffectiveOperations::unknown(),
+            probe_status: ProbeStatus::idle(),
+            queue_paused: false,
+            owner_epoch: 0,
+            owner_generation: 0,
+            local_seq: 0,
+            projection_version: None,
+            active_turn_id: None,
+        };
+        // None：字段整个省略。
+        let raw = serde_json::to_value(base()).unwrap();
+        assert!(raw.get("activeTurnId").is_none());
+        // Some：camelCase 键名。
+        let mut with_turn = base();
+        with_turn.active_turn_id = Some("turn-9".into());
+        let v = serde_json::to_value(&with_turn).unwrap();
+        assert_eq!(v["activeTurnId"], serde_json::json!("turn-9"));
+        // 旧载荷（缺字段）→ None（不崩、不猜）。
+        let legacy: ThreadProjection = serde_json::from_value(raw).unwrap();
+        assert!(legacy.active_turn_id.is_none());
+    }
+
+    /// T02：`projectionVersion` 序列化形状锁——未盖章（None）整个字段省略
+    /// （旧客户端兼容面）；盖章后 camelCase 子字段与既有 skip 字段同源；
+    /// 旧载荷（缺字段）反序列化 → None。
+    #[test]
+    fn projection_version_serializes_camel_case_and_absent_when_none() {
+        let mut p = ThreadProjection {
+            thread_id: "th-1".into(),
+            revision: Some(50),
+            stale: false,
+            availability: ControlAvailability::Controllable,
+            capabilities: CapabilitySet {
+                send: true,
+                state: true,
+                command: true,
+                permissions: false,
+                blocking_input: true,
+                interrupt: false,
+            },
+            runtime_status: "idle".into(),
+            content_state: ContentState::Ready,
+            messages: Vec::new(),
+            truncated: false,
+            history_token: String::new(),
+            pending: Vec::new(),
+            async_questions: Vec::new(),
+            effective_operations:
+                crate::services::codex_desktop_ipc::capability::EffectiveOperations::unknown(),
+            probe_status: ProbeStatus::idle(),
+            queue_paused: false,
+            owner_epoch: 2,
+            owner_generation: 3,
+            local_seq: 7,
+            projection_version: None,
+            active_turn_id: None,
+        };
+        // 未盖章：字段整个省略（不给前端可误信的半截版本束）
+        let raw = serde_json::to_value(&p).unwrap();
+        assert!(
+            raw.get("projectionVersion").is_none(),
+            "未盖章投影不得输出 projectionVersion"
+        );
+        // 发射点盖章：camelCase 子字段逐一与既有 skip 字段同源
+        p.projection_version = Some(p.projection_version_of("boot-1"));
+        let v = serde_json::to_value(&p).unwrap();
+        let ver = v
+            .get("projectionVersion")
+            .expect("盖章后 projectionVersion 必须随投影下发");
+        assert_eq!(ver["instanceId"], serde_json::json!("boot-1"));
+        assert_eq!(ver["ownerEpoch"], serde_json::json!(2));
+        assert_eq!(ver["ownerGeneration"], serde_json::json!(3));
+        assert_eq!(ver["revision"], serde_json::json!(50));
+        assert_eq!(ver["localSeq"], serde_json::json!(7));
+        // 新载荷反序列化 round-trip；旧载荷（缺字段）→ None（不崩、按旧语义）
+        let round: ThreadProjection = serde_json::from_value(v).unwrap();
+        assert_eq!(
+            round.projection_version,
+            Some(ProjectionVersion {
+                instance_id: "boot-1".into(),
+                owner_epoch: 2,
+                owner_generation: 3,
+                revision: Some(50),
+                local_seq: 7,
+            })
+        );
+        let legacy: ThreadProjection = serde_json::from_value(raw).unwrap();
+        assert!(legacy.projection_version.is_none());
+        // skip 字段（owner_epoch 等）反序列化即缺省 0——这正是版本束必须随线上
+        // 载荷下发排序信息的原因（服务端内存值不经 serde 往返）。
+        assert_eq!(legacy.owner_epoch, 0);
+        assert_eq!(legacy.local_seq, 0);
     }
 }

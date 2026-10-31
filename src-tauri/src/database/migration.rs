@@ -5,6 +5,12 @@ fn column_exists(conn: &Connection, table: &str, column: &str) -> bool {
         .is_ok()
 }
 
+/// 表是否存在（老库形状探测用；避免对不存在的表做 ALTER）。
+fn table_exists(conn: &Connection, table: &str) -> bool {
+    conn.prepare(&format!("SELECT 1 FROM {} LIMIT 0", table))
+        .is_ok()
+}
+
 /// 列是否 NOT NULL（老库形状探测用）：表或列不存在 → None
 fn column_notnull(conn: &Connection, table: &str, column: &str) -> Option<bool> {
     conn.prepare(&format!("PRAGMA table_info({})", table))
@@ -174,6 +180,81 @@ pub fn migrate(conn: &Connection) -> Result<(), String> {
             )
         })?;
     }
+    // P3（2026-10-30）：停止类暂停绑定其等待的回合（打断/取消端点的 expectedTurnId
+    // 安全阀）——settle 路径按该 Turn 的终态证据自动清除停止类暂停行；旧行 NULL =
+    // 未绑定，保守保留（仅显式 resume 可清）。幂等可重入；必须在下方 R-T2 整表
+    // 重建之前执行（重建的 SELECT 携带本列）。
+    if !column_exists(conn, "codex_queue_pause", "pause_turn_id") {
+        conn.execute(
+            "ALTER TABLE codex_queue_pause ADD COLUMN pause_turn_id TEXT",
+            [],
+        )
+        .map_err(|e| {
+            format!(
+                "MIGRATE_QUEUE_PAUSE_TURN_FAIL: 老库补列 codex_queue_pause.pause_turn_id 失败: {e}"
+            )
+        })?;
+    }
+    // 合并发送：批次成员需冻结各自的签名状态（回队时按原样恢复正文，不能二次
+    // 签名/换正文）。schema 建表已含该列，但**早期建出的库只有 3 列**——补列幂等，
+    // 老行按 0（未签名）回填，命中时与旧行为一致。
+    if table_exists(conn, "codex_send_batch_members")
+        && !column_exists(conn, "codex_send_batch_members", "signature_applied")
+    {
+        conn.execute(
+            "ALTER TABLE codex_send_batch_members ADD COLUMN signature_applied INTEGER NOT NULL DEFAULT 0",
+            [],
+        )
+        .map_err(|e| {
+            format!(
+                "MIGRATE_BATCH_SIGNATURE_FAIL: 老库补列 codex_send_batch_members.signature_applied 失败: {e}"
+            )
+        })?;
+    }
+    // R05：优先处理「停止尝试未知结果」幂等归属列（旧行 NULL = 未做过停止尝试；
+    // 非 NULL = 同 actionId 重放先读本记录，不得再次发停止帧）。与动作行同生命周期，
+    // 重启不丢。
+    if !column_exists(conn, "codex_actions", "stop_attempt_reason") {
+        conn.execute(
+            "ALTER TABLE codex_actions ADD COLUMN stop_attempt_reason TEXT",
+            [],
+        )
+        .map_err(|e| {
+            format!(
+                "MIGRATE_CODEX_STOP_ATTEMPT_FAIL: 老库补列 codex_actions.stop_attempt_reason 失败: {e}"
+            )
+        })?;
+    }
+    // C02（R05 残留收口）：停止尝试的持久占有状态列——占有在首次可能写出 interrupt
+    // 之前 CAS 落库（'claimed'），覆盖「writer 已写出帧后 handler 被取消/服务退出」
+    // 的事后记录盲窗；首写前明确零投递才释放（'released'，允许显式新尝试）。
+    // 老库行恒 NULL：读侧兼容识别——NULL + stop_attempt_reason 非 NULL = C02 前已
+    // 记录的未知结果（重放同样不再发停止帧），NULL + NULL = 未占有（行为不变）。
+    if !column_exists(conn, "codex_actions", "stop_attempt_state") {
+        conn.execute(
+            "ALTER TABLE codex_actions ADD COLUMN stop_attempt_state TEXT",
+            [],
+        )
+        .map_err(|e| {
+            format!(
+                "MIGRATE_CODEX_STOP_ATTEMPT_STATE_FAIL: 老库补列 codex_actions.stop_attempt_state 失败: {e}"
+            )
+        })?;
+    }
+    // R06：越队授权补尝试代际列（旧行 = attempt 1，行为不变）。优先处理路径在
+    // 「上次明确零投递回队、动作仍 queued」时把已消费授权重铸为下一 attempt
+    //（下一次用户授权独立可 CAS）；老库行恒可被重铸，语义与旧行为兼容。
+    if !column_exists(conn, "codex_bypass_grant", "attempt") {
+        conn.execute(
+            "ALTER TABLE codex_bypass_grant ADD COLUMN attempt INTEGER NOT NULL DEFAULT 1",
+            [],
+        )
+        .map_err(|e| {
+            format!(
+                "MIGRATE_CODEX_BYPASS_ATTEMPT_FAIL: 老库补列 codex_bypass_grant.attempt 失败: {e}"
+            )
+        })?;
+    }
     // R17：契约证据缓存必须能核对**当前包内容**（同 build/CLI 但包被替换时，旧结论
     // 不得安装）。新增两列记录取证时的包文件大小与 mtime；老行 NULL = 未记录 →
     // 读侧按"未能核对"处理（重新识别，不猜）。
@@ -277,10 +358,11 @@ pub fn migrate(conn: &Connection) -> Result<(), String> {
                      paused_at    INTEGER NOT NULL,
                      pause_reason TEXT NOT NULL,
                      pause_token  TEXT,
+                     pause_turn_id TEXT,
                      PRIMARY KEY (thread_id, pause_token)
                  );
-                 INSERT INTO codex_queue_pause_migrated (thread_id, paused_at, pause_reason, pause_token)
-                     SELECT thread_id, paused_at, pause_reason, pause_token FROM codex_queue_pause;
+                 INSERT INTO codex_queue_pause_migrated (thread_id, paused_at, pause_reason, pause_token, pause_turn_id)
+                     SELECT thread_id, paused_at, pause_reason, pause_token, pause_turn_id FROM codex_queue_pause;
                  DROP TABLE codex_queue_pause;
                  ALTER TABLE codex_queue_pause_migrated RENAME TO codex_queue_pause;
                  COMMIT;",
@@ -1760,5 +1842,47 @@ mod tests {
             (Some(1_000), Some("P3".into())),
             "一次性清理完成后，新增真「成功→失败」证据必须跨迁移保留（R1 红 = 被清）"
         );
+    }
+}
+
+#[cfg(test)]
+mod batch_migration_tests {
+    use super::*;
+
+    /// 2026-10-31 实机：早期建出的 `codex_send_batch_members` 只有 3 列，
+    /// 而查询按 `member_id, wire_text, signature_applied` 取值 →
+    /// `no such column: signature_applied`，合并发送的回队路径直接失败。
+    /// 迁移必须把这一列补上（幂等、可重入、老行有确定默认值）。
+    #[test]
+    fn migrate_adds_batch_signature_column_to_legacy_table() {
+        let conn = Connection::open_in_memory().unwrap();
+        // 老库形状：只有 3 列
+        conn.execute_batch(
+            "CREATE TABLE codex_send_batch_members (
+                member_id TEXT PRIMARY KEY,
+                leader_id TEXT NOT NULL,
+                wire_text TEXT NOT NULL
+            );
+            INSERT INTO codex_send_batch_members (member_id, leader_id, wire_text)
+            VALUES ('m1', 'l1', '旧批次正文');",
+        )
+        .unwrap();
+        migrate(&conn).unwrap();
+        assert!(
+            conn.prepare("SELECT signature_applied FROM codex_send_batch_members LIMIT 0")
+                .is_ok(),
+            "迁移后必须有 signature_applied 列"
+        );
+        // 老行有确定默认值（未签名 = 0，与旧的行为一致）
+        let v: i64 = conn
+            .query_row(
+                "SELECT signature_applied FROM codex_send_batch_members WHERE member_id='m1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(v, 0, "老行回填 0（未签名）");
+        // 幂等：再跑一遍不报错
+        migrate(&conn).unwrap();
     }
 }

@@ -8,9 +8,14 @@
  * - 核对响应按 actionId+轮次+退休集合收敛，旧响应不能重新锁死已退休动作；
  * - 显式复核保存**具体已答 key 集合**，新增已答成员必须重新确认；
  * - 整组转 Unknown 时组件不被父层卸载（由 SessionDetail 选组保持挂载）；
- * - 暂停提示只在确有暂停事实时显示一次；正常可答组不误报。
+ * - 暂停提示只在确有暂停事实时显示一次；正常可答组不误报；
+ * - T04 紧凑口径（spec §3）：无回执不留空行；自由填写默认收起、显式收起不丢稿、
+ *   有自由稿自动展开；长题干按实际布局三行收纳（line-clamp-3 恒开），「展开全文」
+ *   入口由实测溢出驱动（scrollHeight > clientHeight，禁字符数判据）；题干/选项在
+ *   `[data-font-scale]` 作用域内跟随字号档位（100% 基准 14px），按钮与卡头保持
+ *   固定操作尺寸。
  */
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import i18n from "@/i18n";
 import {
   answerCodexAsyncGroup,
@@ -72,6 +77,12 @@ export interface AsyncQuestionGroupCardProps {
   onChanged?: () => void;
   /** J08：在 Tuvis 中按组收纳（不向 Desktop 发送答案/取消/打断）。 */
   onArchive?: () => void;
+  /**
+   * 字号档位（spec §3.3）：题干/选项/自由输入内容在 `[data-font-scale]` 作用域内
+   * 跟随档位（100% 基准 14px = text-sm 相对单位）；按钮与卡头**不在**作用域内，
+   * 保持稳定操作尺寸。默认 1（主题原值）。
+   */
+  fontScale?: number;
 }
 
 export default function AsyncQuestionGroupCard({
@@ -79,6 +90,7 @@ export default function AsyncQuestionGroupCard({
   questions,
   onChanged,
   onArchive,
+  fontScale = 1,
 }: AsyncQuestionGroupCardProps) {
   const members = useMemo(
     () => [...questions].sort((a, b) => a.questionIndex - b.questionIndex),
@@ -105,6 +117,17 @@ export default function AsyncQuestionGroupCard({
   const [drafts, setDrafts] = useState<Record<string, { selected: string | null; text: string }>>(
     {}
   );
+  // T04（spec §3.5）：自由填写默认收起；用户的显式展开/收起按题记忆，覆盖自动行为
+  // （undefined = 未显式操作 → 有自由稿自动展开）。显式收起**不丢稿**——稿在 drafts。
+  const [freeExplicit, setFreeExplicit] = useState<Record<string, boolean>>({});
+  // T04（spec §3.6，集中审查 D4 修订）：长题干三行收纳按**实测布局溢出**判定——
+  // line-clamp-3 恒开（展开态除外），「展开全文」入口只在量得 scrollHeight >
+  // clientHeight（三行装不下）时在场。窄屏/125% 字号下 80 字以内也可能超三行，
+  // 字符数启发式不等价于按实际三行收纳（审查点名必修，禁字符数判据）。
+  // 展开态仍按题记忆（titleExpanded）。
+  const titleRef = useRef<HTMLParagraphElement | null>(null);
+  const [titleOverflow, setTitleOverflow] = useState<Record<string, boolean>>({});
+  const [titleExpanded, setTitleExpanded] = useState<Record<string, boolean>>({});
   const [staleDrafts, setStaleDrafts] = useState<StaleDraft[]>([]);
   const [staleOpen, setStaleOpen] = useState(false);
   const [phase, setPhase] = useState<Phase>("idle");
@@ -260,6 +283,37 @@ export default function AsyncQuestionGroupCard({
   };
 
   const allLiveAnswered = live.length > 0 && live.every((q) => answerFor(q).length > 0);
+  /** T04：自由填写展开态——显式操作优先；未显式操作时，有自由稿自动展开。 */
+  const freeOpenFor = (question: CodexAsyncQuestionView): boolean => {
+    const explicit = freeExplicit[draftKey(question)];
+    if (explicit !== undefined) return explicit;
+    return draftFor(question).text.trim().length > 0;
+  };
+  const titleExpandedFor = (question: CodexAsyncQuestionView): boolean =>
+    titleExpanded[draftKey(question)] ?? false;
+  /** 三行收纳的实测重算：挂载/换题/展开收起/字号档位变化时量一次；ResizeObserver
+   *  覆盖分屏拖动、旋屏等元素盒宽变化（window 不动也触发），window resize 兜底
+   *  无 RO 环境（jsdom 测试亦经此或 deps 重跑触发重测）。 */
+  useLayoutEffect(() => {
+    const el = titleRef.current;
+    if (el === null || current === undefined) return;
+    const key = draftKey(current);
+    const measure = () => {
+      // 展开态不覆写溢出记忆：展开后 scrollHeight === clientHeight，照量会把
+      // 「收起」入口量没；溢出记忆只由收起态（line-clamp-3 在场）刷新。
+      if (titleExpanded[key]) return;
+      const overflow = el.scrollHeight > el.clientHeight;
+      setTitleOverflow((prev) => (prev[key] === overflow ? prev : { ...prev, [key]: overflow }));
+    };
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(el);
+    window.addEventListener("resize", measure);
+    return () => {
+      observer.disconnect();
+      window.removeEventListener("resize", measure);
+    };
+  }, [current, titleExpanded, fontScale]);
   const hasPause = live.some((q) => !q.actionable && q.disabledReasonCode === PAUSE_REASON);
   const submittable =
     live.length > 0 && live.every((q) => q.actionable || q.disabledReasonCode === PAUSE_REASON);
@@ -284,11 +338,14 @@ export default function AsyncQuestionGroupCard({
       operation_runtime_active: "mobile.codex.async.reasons.running",
       operation_blocking_pending: "mobile.codex.async.reasons.pendingNative",
       operation_contract_unmatched: "mobile.codex.async.reasons.noContract",
+      operation_no_evidence: "mobile.codex.async.reasons.noEvidence",
       operation_auto_adapt_off: "mobile.codex.async.reasons.adaptOff",
       question_unsettled: "mobile.codex.async.reasons.unsettled",
     };
     if (known[code]) return i18n.t(known[code]);
-    return code;
+    // 其余机器码走通用 errors.* 文案（与单题卡同源）；未知码原样显示，不猜。
+    const generic = `errors.${code.replace(/_([a-z0-9])/g, (_, c: string) => c.toUpperCase())}`;
+    return i18n.t(generic, { defaultValue: code });
   };
 
   /** J03/J04：单次 10s 有界 + 序号/退休/轮次守卫；旧响应一律丢弃。 */
@@ -649,10 +706,41 @@ export default function AsyncQuestionGroupCard({
           <p className="text-[var(--mut)]">{i18n.t("mobile.codex.async.fallbackBoundary")}</p>
         </div>
       ) : current !== undefined ? (
-        <div className="mt-3 space-y-3" data-testid="codex-async-current">
-          <p className="font-medium">{current.title}</p>
+        <div className="mt-2 space-y-2" data-testid="codex-async-current">
+          {/* T04（spec §3.3/§3.4，集中审查 D4 修订）：题干 100% 基准 14px（text-sm
+              相对档位单位），在字号作用域内跟随顶部字号设置；卡头与按钮不在作用域内。
+              三行收纳恒开（展开态除外），展开入口由下方实测溢出驱动。 */}
+          <div data-font-scale={fontScale}>
+            <p
+              ref={titleRef}
+              className={`text-sm font-medium ${titleExpandedFor(current) ? "" : "line-clamp-3"}`}
+            >
+              {current.title}
+            </p>
+          </div>
+          {titleOverflow[draftKey(current)] === true && (
+            <button
+              type="button"
+              data-testid="codex-async-title-toggle"
+              onClick={() =>
+                setTitleExpanded((prev) => ({
+                  ...prev,
+                  [draftKey(current)]: !titleExpandedFor(current),
+                }))
+              }
+              className="text-[11px] text-[var(--mut)] underline"
+            >
+              {titleExpandedFor(current)
+                ? i18n.t("mobile.codex.async.collapseTitle")
+                : i18n.t("mobile.codex.async.expandTitle")}
+            </button>
+          )}
           {current.options.length > 0 && (
-            <div className="flex flex-col gap-1">
+            // T04（spec §3.6）：长选项组内部滚动（30dvh 上限），题号与提交操作保持可达。
+            <div
+              data-font-scale={fontScale}
+              className="flex max-h-[30dvh] flex-col gap-1 overflow-y-auto"
+            >
               {current.options.map((option, optionIndex) => {
                 const draft = draftFor(current);
                 return (
@@ -673,21 +761,45 @@ export default function AsyncQuestionGroupCard({
               })}
             </div>
           )}
-          <label className="block text-xs text-[var(--mut)]">
-            {i18n.t("mobile.codex.async.freeLabel")}
-            <input
-              data-testid="codex-async-free"
-              type="text"
-              value={draftFor(current).text}
-              disabled={locked}
-              maxLength={10000}
-              onChange={(event) =>
-                // 输入自由答案即退出选项模式；可见选中与实发内容保持一致。
-                setDraft(current, { selected: null, text: event.target.value })
-              }
-              className="mt-1 w-full rounded-lg border border-[var(--cb)] px-2.5 py-1.5 text-sm text-[var(--tx)] placeholder:text-[var(--mut)] focus:ring-2 focus:ring-[var(--btnp)] focus:outline-none disabled:opacity-50"
-            />
-          </label>
+          {freeOpenFor(current) ? (
+            <>
+              {/* T04（spec §3.5）：自由填写区——输入文字与选项继续互斥；同一字号作用域 */}
+              <div data-font-scale={fontScale}>
+                <label className="block text-xs text-[var(--mut)]">
+                  {i18n.t("mobile.codex.async.freeLabel")}
+                  <input
+                    data-testid="codex-async-free"
+                    type="text"
+                    value={draftFor(current).text}
+                    disabled={locked}
+                    maxLength={10000}
+                    onChange={(event) =>
+                      // 输入自由答案即退出选项模式；可见选中与实发内容保持一致。
+                      setDraft(current, { selected: null, text: event.target.value })
+                    }
+                    className="mt-1 w-full rounded-lg border border-[var(--cb)] px-2.5 py-1.5 text-sm text-[var(--tx)] placeholder:text-[var(--mut)] focus:ring-2 focus:ring-[var(--btnp)] focus:outline-none disabled:opacity-50"
+                  />
+                </label>
+              </div>
+              <button
+                type="button"
+                data-testid="codex-async-free-collapse"
+                onClick={() => setFreeExplicit((prev) => ({ ...prev, [draftKey(current)]: false }))}
+                className="self-start text-[11px] text-[var(--mut)] underline"
+              >
+                {i18n.t("mobile.codex.async.dismiss")}
+              </button>
+            </>
+          ) : (
+            <button
+              type="button"
+              data-testid="codex-async-free-toggle"
+              onClick={() => setFreeExplicit((prev) => ({ ...prev, [draftKey(current)]: true }))}
+              className="self-start text-[11px] text-[var(--mut)] underline"
+            >
+              {i18n.t("mobile.codex.async.otherAnswers")}
+            </button>
+          )}
           {blockedReason && !current.actionable && (
             <p
               data-testid="codex-async-blocked-reason"
@@ -765,16 +877,23 @@ export default function AsyncQuestionGroupCard({
           </button>
         </div>
       )}
-      <p data-testid="codex-async-note" className="mt-2 min-h-4 text-xs text-[var(--mut)]">
-        {error ??
+      {/* T04（spec §3.4）：没有回执/错误不留占位空行——note 只在确有内容时渲染。 */}
+      {(() => {
+        const note =
+          error ??
           (phase === "unknown"
             ? timedOut
               ? i18n.t("mobile.codex.async.timedOut")
               : i18n.t("mobile.codex.async.unknown")
             : receipt?.delivery === "accepted"
               ? i18n.t("mobile.codex.async.submitted")
-              : "")}
-      </p>
+              : "");
+        return note ? (
+          <p data-testid="codex-async-note" className="mt-2 text-xs text-[var(--mut)]">
+            {note}
+          </p>
+        ) : null;
+      })()}
       {onArchive && (
         <button
           type="button"
@@ -785,7 +904,8 @@ export default function AsyncQuestionGroupCard({
           {i18n.t("mobile.codex.async.archiveGroup")}
         </button>
       )}
-      {live.length > 0 && (
+      {/* T04：翻页/翻题说明只对多题组有意义——单题不显示多余翻页说明（spec §3.1）。 */}
+      {live.length > 1 && (
         <p className="mt-2 text-[10px] text-[var(--mut)]">
           {i18n.t("mobile.codex.async.groupHint", { total: members.length })}
         </p>
