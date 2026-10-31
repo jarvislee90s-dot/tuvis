@@ -86,16 +86,29 @@ import {
   fetchCodexQueue,
   newActionId,
   reconcileCodexQueuedReceipt,
-  resumeCodexQueue,
   type ActionReceipt,
   type CodexSuccessorSend,
 } from "./codexIpcApi";
 // S5：发送结果待确认面板（30 秒截止后的接管呈现；核对/人工继续出口）
 import CodexSendRecoveryPanel from "./CodexSendRecovery";
+// T05：页面共享停止控制器的契约（实例由 SessionDetail 持有传入；本组件不自行创建）
+import type { CodexTurnControl } from "./useCodexTurnControl";
+// P4：正文预览共享词法（剥尾签名 + 附件占位）单源模块（队列面板行预览共用）
+import { previewBody, stripMobileSignature } from "./messagePreview";
 // S5：统一报告入口（R5 前身）——payload 只含安全引用
 import { reportIssue, reportIssueSummary, type ReportIssueRef } from "@/lib/reportIssue";
 
+export interface ComposerDraftRequest {
+  sessionId: string;
+  actionId: string;
+  text: string;
+}
+
 interface MessageComposerProps {
+  editDraft?: ComposerDraftRequest | null;
+  onEditDraftConsumed?: (actionId: string) => void;
+  draftText?: string;
+  onDraftTextChange?: (value: import("react").SetStateAction<string>) => void;
   /** 发送回执触发的队列刷新信号（2026-10-20 复审 P2）：本地队列可见性不依赖
    *  Desktop 必须产生新帧——queued / desktop_ipc 回执都会让队列视图变化。 */
   onQueueChanged?: () => void;
@@ -112,6 +125,10 @@ interface MessageComposerProps {
   session: { id: string };
   /** H12：Desktop(App) 形态禁用终端审批/问答探针（App 发送期间零 TUI 请求）。 */
   disableTerminalProbes?: boolean;
+  /** T05：页面共享停止控制器（SessionDetail 持有单例，composer/队列面板共用——
+   *  stopping 期间多入口互斥，不会各发一次打断）。未提供 = 非 Codex App 会话，
+   *  无停止面（行为与既有版本完全一致）。 */
+  turnControl?: CodexTurnControl;
 }
 
 /** 待发附件条目（组件内态）：status=uploading → ready/failed；
@@ -271,32 +288,12 @@ const APPROVE_PRESENT_RECEIPT = "mobile.composer.approvePresent";
  *  静默丢用户内容是坏体验（本仓「回执如实」纪律的同一面）。故拦截并说清去处。 */
 const FREETEXT_WITH_ATTACHMENT_RECEIPT = "mobile.composer.freetextWithAttachment";
 
-/** W1 来源标记（服务端 compose_injection 注入，非用户正文）：预览与「修改」放回正文
- *  时剥离——不剥则修改重发会二次叠加签名。
- *
- *  **丁T3 裁2 起签名在尾部**（原名在头部）：正则从 `^\[mobile…\]` 改为 `\s*\[mobile…\]$`
- *  ——尾部形态（`{正文} [mobile 设备名]`）。不改为尾部就会在预览里残留签名、在
- *  「修改」回填时把签名当正文带回输入框（重发即二次叠加）。
- *  容错：正文里偶然出现 `[mobile …]` 字样但**不在尾部**时不剥（与 Rust 侧
- *  `normalize::strip_mobile_signature` 同口径：只剥形态完整的尾签名）。 */
-const MOBILE_SIGNATURE_RE = /\s*\[mobile[^\]]*\]$/;
-/** 附件内联标记（文件池既有约定）：<image|file path="…"> → 预览中替换为 [附件]。
- *  展示标记文案走 i18n 键（M5；仅展示用，「修改」放回正文不受影响） */
-const ATTACH_MARKUP_RE = /<(?:image|file)\s+path="[^"]*">/g;
-
-/** 剥离尾部 `[mobile 设备名]` 签名（正则不命中则原样返回）：预览与修改放回共用。
- *  前后空白一并剥（服务端产出形态为 `{正文} [mobile X]`）。 */
-function stripMobileSignature(content: string): string {
-  return content.replace(MOBILE_SIGNATURE_RE, "");
-}
-
 /** 队列条目预览（D8）：剥尾部 [mobile …] 签名 → 附件标记替换 [附件] → 截前 12 字符
- *  （不足则全显）。仅用于展示；「修改」放回正文只剥签名、保留附件标记行 */
+ *  （不足则全显）。仅用于展示；「修改」放回正文只剥签名、保留附件标记行。
+ *  签名/附件正则与剥离占位逻辑单源于 ./messagePreview（P4 抽出，队列面板行预览
+ *  共用同一份正则，两处口径不得漂移）。 */
 function queueItemPreview(content: string): string {
-  const body = stripMobileSignature(content).replace(
-    ATTACH_MARKUP_RE,
-    i18n.t("mobile.composer.attachMark")
-  );
+  const body = previewBody(content);
   return body.length > PREVIEW_MAX_CHARS ? `${body.slice(0, PREVIEW_MAX_CHARS)}…` : body;
 }
 
@@ -337,11 +334,18 @@ export default function MessageComposer({
   onSendGate,
   refreshSendInfoSignal = 0,
   disableTerminalProbes = false,
+  turnControl,
+  editDraft,
+  onEditDraftConsumed,
+  draftText,
+  onDraftTextChange,
 }: MessageComposerProps) {
   // 可用性：sendInfo=null 且未就绪 → 不渲染（加载中 / 拉取失败 / 403）
   const [sendInfo, setSendInfo] = useState<SendInfo | null>(null);
   const [infoReady, setInfoReady] = useState(false);
-  const [text, setText] = useState("");
+  const [localText, setLocalText] = useState("");
+  const text = draftText ?? localText;
+  const setText = onDraftTextChange ?? setLocalText;
   /** 输入框 ref：「修改」确认出队后把正文放回输入框时聚焦（移动端直接可改） */
   const inputRef = useRef<HTMLTextAreaElement>(null);
   /** 在途上传的中断器（id → controller）：上传中移除 chip 时中断传输（XHR abort） */
@@ -417,9 +421,27 @@ export default function MessageComposer({
    *  只有「发起人工继续后未再编辑」的草稿（= 仍是实际提交的那份）才允许被
    *  成功/入队清理；在途编辑出的新草稿绝不代清。 */
   const draftVersionRef = useRef(0);
-  /** S5：「本条先发送」一次性越队标志（队列暂停时的二选一之一；arm 后下一次
-   *  发送携带 bypassPausedQueue=true，消费即清——授权失效重放会得 grant_consumed） */
-  const [bypassNext, setBypassNext] = useState(false);
+  const [pendingEdits, setPendingEdits] = useState<ComposerDraftRequest[]>([]);
+  const pendingEdit = onEditDraftConsumed
+    ? editDraft?.sessionId === session.id && text.length > 0
+      ? editDraft
+      : undefined
+    : pendingEdits.find((draft) => draft.sessionId === session.id);
+  const consumedEditRef = useRef<ComposerDraftRequest | null>(null);
+  useEffect(() => {
+    if (!editDraft || editDraft.sessionId !== session.id || consumedEditRef.current === editDraft)
+      return;
+    consumedEditRef.current = editDraft;
+    if (text.length > 0 || pendingEdits.some((draft) => draft.sessionId === session.id)) {
+      if (!onEditDraftConsumed) setPendingEdits((current) => [...current, editDraft]);
+    } else {
+      draftVersionRef.current += 1;
+      setText(editDraft.text);
+      onEditDraftConsumed?.(editDraft.actionId);
+      inputRef.current?.focus();
+    }
+  }, [editDraft, session.id, text, pendingEdits, onEditDraftConsumed, setText]);
+
   /** S5：重试关联——明确未送达后用户点「重试」时记录原动作 ID（安全引用，展示前 8 位） */
   const retriedFromRef = useRef<string | null>(null);
   /** S5：报告入口的「诊断服务未开启」展开态（未部署 = sink 恒 null → 如实呈现） */
@@ -429,8 +451,6 @@ export default function MessageComposer({
     errorCode: string | null;
     actionId: string | null;
   } | null>(null);
-  /** S5：恢复队列进行中（防连点） */
-  const [resumingQueue, setResumingQueue] = useState(false);
   /** D8 完整队列表（/session-queue 的 items）：逐条渲染的数据源——不限本端发送
    *  的条目（桌面端/他端排的队同样可见可操作）。乐观行（发送即时反馈/复核保守
    *  恢复）与权威列表（挂载拉取/3s 轮询）都收敛到这里 */
@@ -506,8 +526,7 @@ export default function MessageComposer({
     // 换会话即弃修改重发标志（D6）：queueOnlyNext 是上一个会话「修改」的遗愿，
     // 不得泄漏到新会话的首发（保守方向虽无害，语义上仍属错位）
     setQueueOnlyNext(false);
-    // S5：越队标志/报告展开态同属上一会话的遗愿，一并清
-    setBypassNext(false);
+    // C04：「本条先发送」越队标志已随按钮移除；报告展开态同属上一会话的遗愿，一并清
     setReportUnavailable(false);
     // actionId 同理——一次用户动作不跨会话，切换即清（下一条消息是新动作）
     codexActionIdRef.current = null;
@@ -724,26 +743,6 @@ export default function MessageComposer({
     }
   }, [lastReportRef, session.id]);
 
-  /** S5：恢复被打断暂停的发送队列（POST /codex/queue/resume = 唯一解除出口）；
-   *  成功后重拉 send-info 刷新暂停态。 */
-  const resumeQueue = useCallback(async () => {
-    if (resumingQueue) return;
-    setResumingQueue(true);
-    try {
-      await resumeCodexQueue(session.id);
-      const info = await fetchSendInfo(session.id);
-      setSendInfo(info);
-      if (info !== null) onSendGate?.(sendGateAttemptable(info));
-      // F8：恢复成功 → 队列视图必然变化（暂停解除、派发接力）——通知同页队列
-      // 面板刷新（不依赖 Desktop 必须产生新帧）
-      onQueueChanged?.();
-    } catch {
-      /* 恢复失败静默：暂停态以服务端为准（send-info 重挂/轮询自愈） */
-    } finally {
-      setResumingQueue(false);
-    }
-  }, [resumingQueue, session.id, onSendGate, onQueueChanged]);
-
   const handleSend = useCallback(async () => {
     const body = text.trim();
     if (!body || sending || busy || sendInfo === null || !sendInfo.injectable) return;
@@ -914,17 +913,9 @@ export default function MessageComposer({
       setQueueOnlyNext(false);
       // 多行原样上行（trim 只用于判空，不改写正文——归一在服务端）。
       // **actionId / fullText 已在点击时算定**（F6：预算与载荷键控见函数头）。
-      // S5：「本条先发送」一次性越队授权（队列暂停二选一之一）——arm 后消费即清；
-      // 授权失效重放会得 NotSent(grant_consumed)，前端引导重选而非原样重放。
-      const bypass = needsActionId && bypassNext ? true : undefined;
-      if (bypass) setBypassNext(false);
-      const res = await sessionSend(
-        session.id,
-        fullText,
-        forceQueue ? true : undefined,
-        actionId,
-        bypass
-      );
+      // C04：「本条先发送」的越队授权已收敛到队列区（T06 按行两步确认）——composer
+      // 发送不再携带 bypassPausedQueue。
+      const res = await sessionSend(session.id, fullText, forceQueue ? true : undefined, actionId);
       // S5：代际已前进（新发送已开）或本次预算已到期移交面板的，本响应一律
       // 作废不回写（计时器清理在 finally，按闭包归属——碰不到新动作的计时器）
       if (staleEpoch()) return;
@@ -1100,6 +1091,7 @@ export default function MessageComposer({
       if (!staleEpoch()) setSending(false);
     }
   }, [
+    setText,
     text,
     attachments,
     sending,
@@ -1107,7 +1099,6 @@ export default function MessageComposer({
     sendInfo,
     session.id,
     queueOnlyNext,
-    bypassNext,
     probeCardPresence,
     onQueueChanged,
   ]);
@@ -1206,7 +1197,7 @@ export default function MessageComposer({
       // accepted：面板保留「已重新发送」；send 无 receipt 且未排队：面板呈现
       // 「此前已创建后继…待查」——两种都不在此换回执
     },
-    [onQueueChanged]
+    [onQueueChanged, setText]
   );
 
   // S5/F6：卸载清理当前发送的 30 秒计时器（挂起 promise 的迟到回调经代际/闭包
@@ -1398,7 +1389,7 @@ export default function MessageComposer({
         inputRef.current?.focus();
       });
     },
-    [busy, retractWithOutcome]
+    [busy, retractWithOutcome, setText]
   );
 
   // 附件上传（2026-09-20）：逐个上传 → chips 状态机（uploading → ready/failed）。
@@ -1508,8 +1499,65 @@ export default function MessageComposer({
     text.trim().length > 0 &&
     !attachments.some((a) => a.status === "uploading");
 
+  // ===== T05：composer 主按钮按状态切换（spec §5 状态表）=====
+  // - 「模型回合运行中」（控制器的新鲜投影事实）与「HTTP 投递中」（sending）是
+  //   **两个状态**：停止按钮的可用性只看回合运行态 + canStop，**绝不看 sending/busy**；
+  // - 运行中 + 无文字且无附件 + 有可确认停止目标 → 主按钮 = 停止（`composer-stop`）；
+  // - 运行中 + 有文字或附件 → 主按钮 = 发送（沿用既有提交规则）；**附件也算草稿**，
+  //   有附件时绝不因文字为空回落到停止（spec：有附件不能误触停止）；已有草稿时另在
+  //   紧凑入口（`composer-stop-compact`）保留停止；
+  // - 空闲/无内容 → 既有发送按钮及其禁用规则不变；断链/目标不明/能力不足 → 不提供
+  //   可执行的停止，就近显示短状态（`composer-stop-unavailable`）。
+  // - Enter 不映射停止：textarea 无 Enter 处理（多行原样上行），空 Enter 零动作。
+  const stopReady = turnControl?.canStop === true && turnControl.turnRunning;
+  const hasDraft = text.trim().length > 0 || attachments.length > 0;
+  const stopAsPrimary = stopReady && !hasDraft;
+  const stopCompact = stopReady && hasDraft;
+
+  /** 停止（用户点击才发起；控制器内部冻结点击时刻目标 + 多入口互斥）。
+   *  普通函数而非 useCallback：组件在 send-info 就绪前有提前返回，此处理必须在
+   *  返回之后（hook 数量恒定纪律）；它只读 prop，无需引用稳定。 */
+  const handleStopTurn = () => {
+    if (!turnControl) return;
+    void turnControl.stop();
+  };
+
   return (
     <div data-testid="message-composer" className="shrink-0 border-t border-[var(--cb)] px-3 py-2">
+      {pendingEdit?.sessionId === session.id && (
+        <div
+          data-testid="composer-edit-choice"
+          className="mb-2 flex flex-wrap items-center gap-2 text-xs"
+        >
+          <span>{i18n.t("mobile.codex.queue.editDraftConflict")}</span>
+          <button
+            type="button"
+            onClick={() => {
+              draftVersionRef.current += 1;
+              setText(pendingEdit.text);
+              if (onEditDraftConsumed) onEditDraftConsumed(pendingEdit.actionId);
+              else setPendingEdits((current) => current.filter((draft) => draft !== pendingEdit));
+              inputRef.current?.focus();
+            }}
+          >
+            {i18n.t("mobile.codex.queue.editDraftReplace")}
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              draftVersionRef.current += 1;
+              setText((current) =>
+                current ? `${current}\n\n${pendingEdit.text}` : pendingEdit.text
+              );
+              if (onEditDraftConsumed) onEditDraftConsumed(pendingEdit.actionId);
+              else setPendingEdits((current) => current.filter((draft) => draft !== pendingEdit));
+              inputRef.current?.focus();
+            }}
+          >
+            {i18n.t("mobile.codex.queue.editDraftAppend")}
+          </button>
+        </div>
+      )}
       {/* 不可注入：输入区整体禁用，仅留 reason 展示（输入行保留占位但不可用） */}
       {!injectable && (
         <p data-testid="send-disabled-reason" className="mb-2 text-xs text-[var(--mut)]">
@@ -1538,44 +1586,10 @@ export default function MessageComposer({
             : i18n.t("mobile.composer.presenceQuestion")}
         </p>
       )}
-      {/* S5：队列暂停二选一（S2：暂停**不置灰**——用户仍可选恢复队列或本条先发送）。
-          恢复 = POST /codex/queue/resume（唯一解除出口）；先发送 = 一次性越队授权
-         （bypassPausedQueue，消费即失效；grant_consumed 引导重选而非原样重放）。 */}
-      {injectable && sendInfo?.queuePaused === true && (
-        <div
-          data-testid="send-queue-paused"
-          className="mb-2 rounded-lg bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:bg-amber-400/10 dark:text-amber-300"
-        >
-          <p>{i18n.t("mobile.codex.queue.pausedBanner")}</p>
-          {bypassNext && (
-            <p data-testid="queue-bypass-armed" className="mt-0.5">
-              {i18n.t("mobile.codex.queue.bypassArmed")}
-            </p>
-          )}
-          <div className="mt-1.5 flex flex-wrap gap-2">
-            <button
-              type="button"
-              data-testid="queue-resume"
-              disabled={resumingQueue || sending}
-              onClick={() => {
-                void resumeQueue();
-              }}
-              className="rounded-full bg-amber-500/20 px-2 py-0.5 disabled:opacity-40 dark:bg-amber-400/20"
-            >
-              {i18n.t("mobile.codex.queue.resume")}
-            </button>
-            <button
-              type="button"
-              data-testid="queue-bypass-arm"
-              disabled={sending}
-              onClick={() => setBypassNext((v) => !v)}
-              className="rounded-full bg-amber-500/20 px-2 py-0.5 disabled:opacity-40 dark:bg-amber-400/20"
-            >
-              {i18n.t("mobile.codex.queue.bypass")}
-            </button>
-          </div>
-        </div>
-      )}
+      {/* C04（队列展示收纳）：codex 队列暂停的解释与恢复入口**只在队列区**
+          （CodexQueuePanel）——composer 不再常驻暂停说明/恢复/「本条先发送」；
+          发送后只保留简短入队回执。C05：暂停期发送**入队但不派发**（服务端回
+          codex_queued），用户在队列区对它「先处理这条」/撤回，或恢复整队。 */}
       {/* 投递中（灰3）：send await 全程在场——慢消费者长文投递可达分钟级，
           期间不空白；与既有回执并存（排队态的撤回/插队按钮不因发送而失联），
           完成后被结果 chip 覆盖（sending 翻转 false 即消失） */}
@@ -2024,16 +2038,78 @@ export default function MessageComposer({
           }
           className="min-h-0 flex-1 resize-none rounded-lg border border-[var(--cb)] px-3 py-2 text-sm text-[var(--tx)] placeholder:text-[var(--mut)] focus:ring-2 focus:ring-[var(--btnp)] focus:outline-none disabled:opacity-50"
         />
-        <button
-          type="button"
-          data-testid="composer-send"
-          disabled={!canSend}
-          onClick={handleSend}
-          className="shrink-0 rounded-full bg-[var(--btnp)]/10 px-4 py-2 text-sm text-[var(--tx)] disabled:opacity-40"
-        >
-          {i18n.t(sending ? "mobile.composer.sending" : "mobile.composer.send")}
-        </button>
+        {stopAsPrimary ? (
+          // T05：运行中 + 空稿 + 有可确认停止目标 → 主按钮 = 停止（点击才调既有
+          // 定向打断；stopping 期间禁用——30 秒预算内不重按，双击 = 双发破坏性指令）
+          <button
+            type="button"
+            data-testid="composer-stop"
+            disabled={turnControl?.stopping === true}
+            onClick={handleStopTurn}
+            className="shrink-0 rounded-full bg-red-500/15 px-4 py-2 text-sm text-red-700 disabled:opacity-40 dark:text-red-300"
+          >
+            {i18n.t(
+              turnControl?.stopping ? "mobile.composer.stopStopping" : "mobile.composer.stop"
+            )}
+          </button>
+        ) : (
+          <button
+            type="button"
+            data-testid="composer-send"
+            disabled={!canSend}
+            onClick={handleSend}
+            className="shrink-0 rounded-full bg-[var(--btnp)]/10 px-4 py-2 text-sm text-[var(--tx)] disabled:opacity-40"
+          >
+            {i18n.t(sending ? "mobile.composer.sending" : "mobile.composer.send")}
+          </button>
+        )}
+        {stopCompact && (
+          // T05：已有草稿时主按钮保持发送，停止收进紧凑入口（spec §5：已有草稿时
+          // 另在紧凑菜单保留停止入口）——同一控制器，互斥闸防双发
+          <button
+            type="button"
+            data-testid="composer-stop-compact"
+            aria-label={i18n.t("mobile.composer.stopCompactAria")}
+            disabled={turnControl?.stopping === true}
+            onClick={handleStopTurn}
+            className="shrink-0 rounded-full border border-red-500/40 px-2 py-1 text-xs text-red-700 disabled:opacity-40 dark:text-red-300"
+          >
+            {i18n.t(
+              turnControl?.stopping ? "mobile.composer.stopStopping" : "mobile.composer.stop"
+            )}
+          </button>
+        )}
       </div>
+      {/* T05：就近短状态（spec §5 最后行）。仅运行中且不可执行停止时出现一次；
+          停止结果（不确定/无回合/失败）复用队列面板既有键，同一事实不两套措辞 */}
+      {turnControl?.turnRunning && !turnControl.canStop && (
+        <p data-testid="composer-stop-unavailable" className="mt-1 text-[11px] text-[var(--mut)]">
+          {i18n.t("mobile.composer.stopUnavailable")}
+        </p>
+      )}
+      {turnControl?.result?.kind === "uncertain" && (
+        <p
+          data-testid="composer-stop-uncertain"
+          className="mt-1 text-[11px] text-amber-700 dark:text-amber-400"
+        >
+          {i18n.t("mobile.codex.queue.interruptUncertain")}
+        </p>
+      )}
+      {turnControl?.result?.kind === "no_active_turn" && (
+        <p data-testid="composer-stop-no-turn" className="mt-1 text-[11px] text-[var(--mut)]">
+          {i18n.t("mobile.codex.queue.interruptNoTurn")}
+        </p>
+      )}
+      {turnControl?.result?.kind === "failed" && (
+        <p
+          data-testid="composer-stop-failed"
+          className="mt-1 text-[11px] text-rose-700 dark:text-rose-400"
+        >
+          {i18n.t("mobile.codex.queue.interruptFailed", {
+            message: turnControl.result.message,
+          })}
+        </p>
+      )}
       {/* 知情披露（2026-09-20 用户要求）：「?」点开才显示——附件落在用户项目目录，
           已本地 git 排除不会提交；项目收尾可整目录清理。看过即收、不平铺常驻 */}
       {attachHintOpen && (

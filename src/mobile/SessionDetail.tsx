@@ -47,6 +47,11 @@ import {
   updateCodexAdaptSettings,
   type CodexAsyncQuestionView,
 } from "./codexIpcApi";
+import {
+  retainCapabilityDisplay,
+  sameDisplayCache,
+  type CapabilityDisplayCache,
+} from "./codexCapabilityDisplay";
 import AnswerBubble from "./AnswerBubble";
 import ProjectedArtifacts, { buildArtifactMessageContexts } from "./ProjectedArtifacts";
 import useArtifactImages from "./useArtifactImages";
@@ -65,7 +70,9 @@ import { boundedCodexHistoryWindow } from "./codex-history";
 import BookmarkBar from "./BookmarkBar";
 import FilePanel, { type FilePanelEntry } from "./FilePanel";
 import FilePreview from "./FilePreview";
-import MessageComposer from "./MessageComposer";
+import MessageComposer, { type ComposerDraftRequest } from "./MessageComposer";
+// T05：页面共享停止控制器（composer 主按钮/紧凑入口与队列面板打断共用同一实例）
+import { useCodexTurnControl } from "./useCodexTurnControl";
 import PreviewModeSwitcher, { type PreviewMode } from "./PreviewModeSwitcher";
 import SplitHandle from "./SplitHandle";
 import {
@@ -409,6 +416,10 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
   /** 附件图片资源控制器（Task 6）：整页共用一份，保证同会话消费者共享请求与
    *  object URL、全局最多两个在途；换会话时 hook 内部销毁旧 store。 */
   const artifactImages = useArtifactImages(session.id);
+  // T05：页面共享停止控制器——**单例在本层持有**，composer 主按钮/紧凑入口与
+  // 队列面板打断确认共用（stopping 互斥闸防多按钮各发一次破坏性打断；结果分诊、
+  // 30 秒预算、Unknown 纪律都在 hook 内）。非 App 形态投影恒 null → 惰性控制器。
+  const codexTurnControl = useCodexTurnControl(codex.state, session.id);
   /** 每条消息的附件上下文（同回合提示词 / 每回合 12 图预算）：以 canonical 合并顺序
    *  的 loadedMessages 为准，翻页合并后仍只按真实回合取提示词，不借上一回合。 */
   const artifactContexts = useMemo(
@@ -420,6 +431,8 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
   const [queueTick, setQueueTick] = useState(0);
   /** 底部只展开一组；其余有效组收成一行切换（卡片仍挂载保草稿）。 */
   const [activeGroupKey, setActiveGroupKey] = useState<string | null>(null);
+  // T04（spec §3.2）：其余有效组收进唯一「另有 N 组」入口的展开态（切换组后自动收起）。
+  const [otherGroupsOpen, setOtherGroupsOpen] = useState(false);
   // F08：适配详情/开关（移动端页内 sheet；只读展示 + 与桌面同源开关）。
   const [codexAdaptOpen, setCodexAdaptOpen] = useState(false);
   // R16：首次进入 App 会话的**轻提示**（一次；不要求用户先打开详情）。
@@ -445,6 +458,30 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
   //    首个未处理触发起超过上限即立即重拉——与 CodexQueuePanel 的 refreshSignal
   //    同款节奏）。
   const [sendInfoTick, setSendInfoTick] = useState(0);
+  // 草稿正文和待回填队列归详情页持有，布局切换重挂 composer 不丢稿、不重放。
+  const [editDrafts, setEditDrafts] = useState<ComposerDraftRequest[]>([]);
+  const [composerDrafts, setComposerDrafts] = useState<Record<string, string>>({});
+  const editDraft = editDrafts.find((draft) => draft.sessionId === session.id);
+  const enqueueEditDraft = useCallback((draft: ComposerDraftRequest) => {
+    setEditDrafts((current) => [...current, draft]);
+  }, []);
+  const consumeEditDraft = useCallback(
+    (actionId: string) => {
+      setEditDrafts((current) =>
+        current.filter((draft) => draft.sessionId !== session.id || draft.actionId !== actionId)
+      );
+    },
+    [session.id]
+  );
+  const changeDraftText = useCallback(
+    (value: import("react").SetStateAction<string>) => {
+      setComposerDrafts((current) => ({
+        ...current,
+        [session.id]: typeof value === "function" ? value(current[session.id] ?? "") : value,
+      }));
+    },
+    [session.id]
+  );
   const bumpSendInfo = useCallback(() => setSendInfoTick((t) => t + 1), []);
   // R02：消息进入 codex 队列后也必须重拉 send-info——空暂停在发送前自隐，
   // 但新消息留队后暂停会冻结接力，必须立即显示“队列已暂停，恢复后发送”。
@@ -452,6 +489,12 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
     setQueueTick((t) => t + 1);
     bumpSendInfo();
   }, [bumpSendInfo]);
+  // T05 刷新通知：停止落地（任何结果——含不确定）→ 队列与 send-info 各刷新一次
+  // （回合终态、屏障释放、打断后的持久暂停都可能已变化；与队列面板 F8 同一链路）
+  useEffect(() => {
+    if (codexTurnControl.result === null) return;
+    bumpQueue();
+  }, [codexTurnControl.result, bumpQueue]);
   const codexAvailability = codex.state?.availability ?? null;
   const codexRuntime = codex.state?.runtimeStatus ?? null;
   const codexPendingCount = codex.state?.pending.length ?? -1;
@@ -566,6 +609,8 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
     inbox.groups.find((group) => group.live.length > 0) ??
     inbox.groups[0] ??
     null;
+  // T04（spec §3.2）：其余**有效**组（已答组已被 inbox 过滤，不计数）。
+  const otherGroups = inbox.groups.filter((group) => group.key !== activeGroup?.key);
   useEffect(() => {
     if (activeGroupKey !== null && !inbox.groups.some((group) => group.key === activeGroupKey)) {
       setActiveGroupKey(null);
@@ -587,6 +632,30 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
     (codexState.availability === "controllable" ||
       codexState.availability === "send_only" ||
       codexState.availability === "read_only");
+  // R07（能力事实同源 + 真实重连展示）：页面同版 `effectiveOperations` 是工具栏与
+  // 适配详情**共同**的事实源。展示缓存按 `capabilityIdentity` 键控——同一完整目标
+  // 在真实重连（stale、证据槽换代失配）期间沿用上次支持展示；identity 变化即清。
+  // 纪律：展示缓存只补 `support`，`allowed`/`evidence`/`reasonCode` 一字不动。
+  //
+  // 为什么用 state（而不是 ref）：React 19 的 react-hooks/refs 禁止渲染期读 ref。
+  // 缓存本身是"上一帧的结果"，用 state 承载 + 内容相等短路（避免自激重渲染）；
+  // 会话归属随缓存一起记，换会话即视为无缓存（上一目标的展示事实不跨会话沿用）。
+  const [codexDisplayCache, setCodexDisplayCache] = useState<{
+    sessionId: string;
+    cache: CapabilityDisplayCache;
+  } | null>(null);
+  const codexDisplay = useMemo(() => {
+    const usable = codexDisplayCache?.sessionId === session.id ? codexDisplayCache.cache : null;
+    return retainCapabilityDisplay(usable, codexState?.effectiveOperations, {
+      stale: codexState?.stale === true,
+    });
+  }, [codexDisplayCache, codexState?.effectiveOperations, codexState?.stale, session.id]);
+  useEffect(() => {
+    const next =
+      codexDisplay.cache === null ? null : { sessionId: session.id, cache: codexDisplay.cache };
+    if (sameDisplayCache(codexDisplayCache, next)) return;
+    setCodexDisplayCache(next);
+  }, [codexDisplay, codexDisplayCache, session.id]);
   // Task 7：瞬态 Unsupported 只延迟**前端错误提示**（后端 contentState 即时、禁写/
   // stale/屏障不去抖）——过渡 164–382ms 不闪烁，持续异常 500ms 后如实显示。
   const showUnsupported = useDelayedUnsupported(
@@ -1304,7 +1373,9 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
         setBookmarkJumpMiss(true);
       }
     },
-    [limit, scrollAnchorIntoView]
+    // setLimit 是 useState 稳定 setter（恒等），列入 deps 只为如实申报引用，
+    // 不改变本回调随 limit/scrollAnchorIntoView 变化的重建时机。
+    [limit, scrollAnchorIntoView, setLimit]
   );
 
   // 自动加载跳转的续查：**仅随 messages 变化重查**（deps 不含 limit）——
@@ -1524,7 +1595,7 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
   const cardDock = (
     <div
       data-testid="card-dock"
-      className="flex max-h-[55vh] shrink-0 flex-col gap-2 overflow-y-auto"
+      className="flex max-h-[35dvh] shrink-0 flex-col gap-2 overflow-y-auto"
     >
       {/* T09/T10：Desktop 会话的**原生卡优先**——投影里已有原生 pending（命令/文件/
           权限/问答）时不再挂旧 TUI 屏读卡，避免同一事件两张卡（一张永远读不到
@@ -1594,7 +1665,9 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
           )}
           <CodexOperationToolbar
             key={`codex-ops-${session.id}`}
-            operations={codexState.effectiveOperations}
+            operations={codexDisplay.operations}
+            reconnecting={codexDisplay.reconnecting}
+            identityPending={codexDisplay.identityPending}
             onOpenDetails={() => setCodexAdaptOpen(true)}
           />
           {codexAdaptOpen && (
@@ -1603,6 +1676,9 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
               sessionId={session.id}
               open={codexAdaptOpen}
               onClose={() => setCodexAdaptOpen(false)}
+              // R07：能力表消费**页面同版**事实（含展示缓存补过的 support），
+              // 不读独立 GET 的旧快照。
+              effectiveOperations={codexDisplay.operations}
             />
           )}
           {/* 2026-10-28 用户裁决：只展示当前有效交互卡——当前可答组，或本机
@@ -1617,29 +1693,58 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
                   writeLocked={codexState.stale}
                 />
               ))}
-              {inbox.groups
-                .filter((group) => group.key !== activeGroup?.key)
-                .map((group) => (
+              {/* T04（spec §3.2）：其余有效组收进**唯一**「另有 N 组」入口（不常驻 N 行）；
+                  展开后可切任意组；已答组不计数（inbox 已过滤）。组卡片仍全部挂载
+                  （hidden 控制），切组/收起/展开不卸载组件——草稿与在途状态不丢。 */}
+              {otherGroups.length > 0 && (
+                <div>
                   <button
-                    key={`codex-group-row-${session.id}-${group.key}`}
                     type="button"
-                    data-testid="codex-group-row"
-                    data-group-key={group.key}
-                    onClick={() => setActiveGroupKey(group.key)}
+                    data-testid="codex-other-groups"
+                    aria-expanded={otherGroupsOpen}
+                    onClick={() => setOtherGroupsOpen((open) => !open)}
                     className="flex w-full items-center justify-between rounded-xl border border-[var(--bd)] bg-[var(--cd)] px-3 py-1.5 text-left text-xs text-[var(--mut)]"
                   >
                     <span>
-                      {group.live.length > 0
-                        ? i18n.t("mobile.codex.async.otherGroup", {
-                            count: group.live.length,
-                          })
-                        : i18n.t("mobile.codex.async.verifyGroup", {
-                            count: group.members.length,
-                          })}
+                      {i18n.t("mobile.codex.async.otherGroupsCount", {
+                        count: otherGroups.length,
+                      })}
                     </span>
-                    <span className="underline">{i18n.t("mobile.codex.async.openGroup")}</span>
+                    <span className="underline">
+                      {i18n.t(
+                        otherGroupsOpen
+                          ? "mobile.codex.async.dismiss"
+                          : "mobile.codex.async.historyExpand"
+                      )}
+                    </span>
                   </button>
-                ))}
+                  {otherGroupsOpen &&
+                    otherGroups.map((group) => (
+                      <button
+                        key={`codex-group-item-${session.id}-${group.key}`}
+                        type="button"
+                        data-testid="codex-group-item"
+                        data-group-key={group.key}
+                        onClick={() => {
+                          setActiveGroupKey(group.key);
+                          setOtherGroupsOpen(false);
+                        }}
+                        className="mt-1 flex w-full items-center justify-between rounded-xl border border-[var(--bd)] bg-[var(--cd)] px-3 py-1.5 text-left text-xs text-[var(--mut)]"
+                      >
+                        <span>
+                          {group.live.length > 0
+                            ? i18n.t("mobile.codex.async.otherGroup", {
+                                count: group.live.length,
+                              })
+                            : i18n.t("mobile.codex.async.verifyGroup", {
+                                count: group.members.length,
+                              })}
+                        </span>
+                        <span className="underline">{i18n.t("mobile.codex.async.openGroup")}</span>
+                      </button>
+                    ))}
+                </div>
+              )}
               {inbox.groups.map((group) => (
                 <div
                   key={`codex-group-panel-${session.id}-${group.key}`}
@@ -1649,6 +1754,7 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
                   <AsyncQuestionGroupCard
                     sessionId={session.id}
                     questions={group.members}
+                    fontScale={fontScale}
                     onChanged={() => setQueueTick((tick) => tick + 1)}
                   />
                 </div>
@@ -1660,9 +1766,11 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
             sessionId={session.id}
             refreshSignal={queueTick}
             onQueueStateChanged={bumpSendInfo}
+            onEditDraft={enqueueEditDraft}
+            turnControl={appForm ? codexTurnControl : undefined}
           />
           {!codexProjectionActive && !isSummary && !appForm && (
-            <QuestionCard key={`question-${session.id}`} session={session} />
+            <QuestionCard key={`question-${session.id}`} session={session} fontScale={fontScale} />
           )}
         </>
       ) : appForm ? (
@@ -1674,7 +1782,9 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
           {i18n.t("mobile.codex.ops.connecting")}
         </p>
       ) : (
-        !isSummary && <QuestionCard key={`question-${session.id}`} session={session} />
+        !isSummary && (
+          <QuestionCard key={`question-${session.id}`} session={session} fontScale={fontScale} />
+        )
       )}
       {/* 2026-10-08 子 agent chip：与 ModeBar 同一行（flex-wrap 兄弟），生命周期
           解耦——mode 视图失败/unsupported 时 chip 仍活，反之亦然（spec §6）。
@@ -2210,12 +2320,17 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
             </MessageScrollArea>
             {cardDock}
             <MessageComposer
+              editDraft={editDraft}
+              onEditDraftConsumed={consumeEditDraft}
+              draftText={composerDrafts[session.id] ?? ""}
+              onDraftTextChange={changeDraftText}
               key={`composer-${session.id}`}
               session={session}
               onQueueChanged={bumpQueue}
               onSendGate={setCodexSendGate}
               refreshSendInfoSignal={sendInfoTick}
               disableTerminalProbes={appForm}
+              turnControl={appForm ? codexTurnControl : undefined}
             />
           </div>
           <SplitHandle
@@ -2288,12 +2403,17 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
               2026-09-19 用户裁决）——分屏时对话列同样可发消息；
               send-info 拉取失败时组件自静默，不影响对话渲染；钥匙口径同上 */}
           <MessageComposer
+            editDraft={editDraft}
+            onEditDraftConsumed={consumeEditDraft}
+            draftText={composerDrafts[session.id] ?? ""}
+            onDraftTextChange={changeDraftText}
             key={`composer-${session.id}`}
             session={session}
             onQueueChanged={bumpQueue}
             onSendGate={setCodexSendGate}
             refreshSendInfoSignal={sendInfoTick}
             disableTerminalProbes={appForm}
+            turnControl={appForm ? codexTurnControl : undefined}
           />
         </div>
       )}
