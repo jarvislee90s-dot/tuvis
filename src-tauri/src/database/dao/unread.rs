@@ -42,6 +42,16 @@ pub fn upsert_unread(conn: &Connection, r: &UnreadSessionRecord) -> bool {
     .is_ok()
 }
 
+/// 未读池是否已有该行（首次转绿写失败后的下一轮重试判据）。
+pub fn exists_unread_conn(conn: &Connection, tool_id: &str, session_id: &str) -> bool {
+    conn.query_row(
+        "SELECT 1 FROM unread_sessions WHERE tool_id = ?1 AND session_id = ?2 LIMIT 1",
+        params![tool_id, session_id],
+        |_| Ok(()),
+    )
+    .is_ok()
+}
+
 /// 单条物理删除（已读 / 手动关闭等终态直接删行）
 pub fn delete_unread(conn: &Connection, tool_id: &str, session_id: &str) {
     let _ = conn.execute(
@@ -184,6 +194,12 @@ pub fn delete(tool_id: &str, session_id: &str) {
     delete_unread(&conn, tool_id, session_id);
 }
 
+/// 未读池是否已有该行（全局连接包装）。
+pub fn exists(tool_id: &str, session_id: &str) -> bool {
+    let conn = DB.lock().unwrap();
+    exists_unread_conn(&conn, tool_id, session_id)
+}
+
 pub fn list(now_ms: i64) -> Vec<UnreadSessionRecord> {
     let conn = DB.lock().unwrap();
     list_unread(&conn, now_ms)
@@ -243,7 +259,9 @@ mod tests {
     #[test]
     fn upsert_then_list_and_dedupe() {
         let conn = mem();
-        upsert_unread(&conn, &rec("workbuddy", "s1", 1000));
+        assert!(!exists_unread_conn(&conn, "workbuddy", "s1"));
+        assert!(upsert_unread(&conn, &rec("workbuddy", "s1", 1000)));
+        assert!(exists_unread_conn(&conn, "workbuddy", "s1"));
         // 二次 upsert 仅刷新展示字段；turned_green_at/expires_at 保留首绿值
         // （spec §5：turned_green_at＝转绿时间，24h 兜底过期自首绿起算，禁止逐轮滑动）
         let mut updated = rec("workbuddy", "s1", 2000);

@@ -2098,12 +2098,24 @@ fn sync_unread_sessions(active: &mut Vec<Session>, deleted_workbuddy: &HashSet<S
                 UnreadPoolAction::Insert => {
                     let was_read =
                         crate::database::dao::unread::was_read_recently(&tool, &s.id, now_ms);
-                    if insert_allowed(prev.as_deref(), was_read) {
-                        crate::database::dao::unread::upsert(&record);
+                    if insert_allowed(prev.as_deref(), was_read)
+                        && !crate::database::dao::unread::try_upsert(&record)
+                    {
+                        log::warn!("unread: 首次转绿入池失败（{} {}），下轮重试", tool, s.id);
                     }
                 }
                 UnreadPoolAction::RefreshDisplay => {
-                    crate::database::dao::unread::refresh_display(&record)
+                    let was_read =
+                        crate::database::dao::unread::was_read_recently(&tool, &s.id, now_ms);
+                    // 状态缓存已是绿但池行不存在（上一轮 INSERT 失败）→ 结合已读墓碑重试插入；
+                    // 否则只刷新展示字段。修复“写失败 + 下轮 RefreshDisplay 永不 INSERT”的永久漏通知。
+                    if !was_read && !crate::database::dao::unread::exists(&tool, &s.id) {
+                        if !crate::database::dao::unread::try_upsert(&record) {
+                            log::warn!("unread: 转绿补插失败（{} {}），下轮重试", tool, s.id);
+                        }
+                    } else {
+                        crate::database::dao::unread::refresh_display(&record);
+                    }
                 }
                 UnreadPoolAction::None => {}
             }
