@@ -255,7 +255,13 @@ pub fn find_session_jsonl_strict(
             Err(e) => return Err(e),
         };
         let is_dir = match entry.file_type() {
-            Ok(t) => t.is_dir(),
+            Ok(t) if t.is_dir() => true,
+            Ok(t) if t.is_symlink() => match std::fs::metadata(entry.path()) {
+                Ok(m) => m.is_dir(),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e),
+            },
+            Ok(_) => false,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => return Err(e),
         };
@@ -1904,6 +1910,26 @@ mod tests {
                 .is_some(),
             "权限恢复后必须能继续定位"
         );
+    }
+
+    /// 兜底扫描必须跟随符号链接项目目录（旧编码/迁移目录常见）。
+    #[cfg(unix)]
+    #[test]
+    fn strict_finder_follows_symlinked_project_dir() {
+        let home = tempfile::tempdir().unwrap();
+        let projects = home.path().join(".workbuddy/projects");
+        let real = projects.join("real-project");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::write(real.join("s1.jsonl"), "{}\n").unwrap();
+        std::fs::create_dir_all(real.join("s1/subagents")).unwrap();
+        std::fs::write(real.join("s1/subagents/agent-x.jsonl"), "{}\n").unwrap();
+        std::os::unix::fs::symlink(&real, projects.join("linked-project")).unwrap();
+
+        let found = find_session_jsonl_strict(home.path(), "/p/A", "s1")
+            .unwrap()
+            .expect("must find through symlinked project dir");
+        assert_eq!(found.file_name().unwrap(), "s1.jsonl");
+        assert!(found.exists());
     }
 
     /// 兜底目录枚举/候选读取失败 → 严格入口报错。

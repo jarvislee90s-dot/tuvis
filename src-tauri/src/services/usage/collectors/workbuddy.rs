@@ -333,8 +333,9 @@ pub fn collect_with_home(
     // DB 主会话 id（不只父 id）——一旦解析成另一个主会话，`usage_session.is_subagent` 会被
     // `MAX()` 不可逆地写成 1，那个主会话就从会话数/turn 层消失。只含 id、只在首次读某子代理
     // 文件时比较一次（HashSet，O(1)），不构成热路径开销。
-    let main_session_ids: std::collections::HashSet<String> =
-        sessions.iter().map(|(id, _, _)| id.clone()).collect();
+    // 冲突校验必须覆盖**已删除历史主会话**：它们不再采集，但历史账本里的
+    // `is_subagent` 仍可能被子代理身份误标；采集列表本身继续过滤 deleted。
+    let main_session_ids = load_all_session_ids(&conn, &db)?;
     for (id, cwd, title) in sessions {
         let jsonl = match find_session_jsonl_strict(home, &cwd, &id) {
             Ok(Some(p)) => p,
@@ -864,6 +865,36 @@ fn collect_subagents(
 ///
 /// 行级错误同样**不得静默丢行**（旧实现 `flatten()` 把它吞了）：逐条 `log::warn!` + 计数，
 /// 然后整源 `Err` —— `SourceDelta` 形状是冻结的、没有「丢了几行」的字段，`Err` 是唯一**可见**的通道。
+/// 身份冲突校验用：**包含已删除历史主会话**的全部 DB 主会话 id。
+/// 采集列表仍走 `load_sessions`（过滤 deleted）；两者用途不同，不能复用集合。
+fn load_all_session_ids(
+    conn: &Connection,
+    db: &std::path::Path,
+) -> Result<std::collections::HashSet<String>, UsageError> {
+    let io_err = |e: &dyn std::fmt::Display| {
+        UsageError::new(
+            "usage-source-io",
+            format!("read all session ids from {} failed: {e}", db.display()),
+        )
+    };
+    let mut stmt = conn
+        .prepare("SELECT id FROM sessions")
+        .map_err(|e| io_err(&e))?;
+    let rows = stmt
+        .query_map([], |r| r.get::<_, String>(0))
+        .map_err(|e| io_err(&e))?;
+    let mut out = std::collections::HashSet::new();
+    for row in rows {
+        match row {
+            Ok(id) => {
+                out.insert(id);
+            }
+            Err(e) => return Err(io_err(&e)),
+        }
+    }
+    Ok(out)
+}
+
 fn load_sessions(
     conn: &Connection,
     db: &std::path::Path,
@@ -1431,6 +1462,50 @@ mod tests {
             err.detail.contains("s1.jsonl"),
             "错误里要能定位到文件（W-28 同族）：{}",
             err.detail
+        );
+    }
+
+    /// mangle 未命中时，严格查找跟随符号链接项目目录；父文件与子代理都要采集。
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_project_dir_collects_parent_and_subagents() {
+        let dir = tempfile::tempdir().unwrap();
+        make_db(dir.path(), &[("s1", "/p/A")]);
+        let projects = dir.path().join(".workbuddy/projects");
+        let real = projects.join("real-project");
+        std::fs::create_dir_all(real.join("s1/subagents")).unwrap();
+        std::fs::write(
+            real.join("s1.jsonl"),
+            format!(
+                "{}\n",
+                json!({"type":"message","role":"assistant","timestamp":1000,"cwd":"/p/A",
+                       "sessionId":"s1",
+                       "message":{"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}},
+                       "providerData":{"model":"deepseek-v4.1-flash"}})
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            real.join("s1/subagents/agent-x.jsonl"),
+            format!(
+                "{}\n",
+                json!({"type":"message","role":"assistant","timestamp":1500,"cwd":"/p/A",
+                       "sessionId":SUBAGENT_ID,
+                       "message":{"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}},
+                       "providerData":{"model":"deepseek-v4.1-flash","isSubAgent":true}})
+            ),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&real, projects.join("linked-project")).unwrap();
+        let no_cursors = HashMap::new();
+        let (delta, _) = run(dir.path(), &no_cursors);
+        assert!(
+            delta.sessions.iter().any(|s| s.session_id == "s1"),
+            "父文件应通过符号链接目录采集"
+        );
+        assert!(
+            delta.sessions.iter().any(|s| s.session_id == SUBAGENT_ID),
+            "子代理应通过符号链接目录采集"
         );
     }
 
@@ -2072,6 +2147,129 @@ mod tests {
             "命中任一主会话 id 都必须拒绝"
         );
         assert!(degraded);
+    }
+
+    fn mark_deleted(home: &std::path::Path, id: &str) {
+        let conn = Connection::open(home.join(".workbuddy/workbuddy.db")).unwrap();
+        conn.execute(
+            "UPDATE sessions SET deleted_at = 1 WHERE id = ?1",
+            rusqlite::params![id],
+        )
+        .unwrap();
+    }
+
+    /// 已删除历史主会话 B 仍必须参与身份冲突校验：子代理行内引用 B 时降级，
+    /// 不能把 B 的历史账本身份升成子代理。
+    #[test]
+    fn deleted_main_session_is_still_reserved_for_identity() {
+        const PARENT: &str = "a0000000-0000-4000-8000-000000000001";
+        const DELETED_MAIN: &str = "b0000000-0000-4000-8000-000000000002";
+        let dir = tempfile::tempdir().unwrap();
+        make_db(dir.path(), &[(PARENT, "/p/A"), (DELETED_MAIN, "/p/B")]);
+        mark_deleted(dir.path(), DELETED_MAIN);
+        write_jsonl(
+            dir.path(),
+            "p-A",
+            PARENT,
+            &[
+                json!({"type":"message","role":"assistant","timestamp":1000,"cwd":"/p/A",
+                     "sessionId":PARENT,"message":{"usage":{"input_tokens":1,"output_tokens":1,
+                     "total_tokens":2}},"providerData":{"model":"deepseek-v4.1-flash"}}),
+            ],
+        );
+        write_subagent_jsonl(
+            dir.path(),
+            "p-A",
+            PARENT,
+            "agent-history.jsonl",
+            &[
+                json!({"type":"message","role":"assistant","timestamp":1500,"cwd":"/p/A",
+                     "sessionId":DELETED_MAIN,
+                     "message":{"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}},
+                     "providerData":{"model":"deepseek-v4.1-flash","isSubAgent":true}}),
+            ],
+        );
+        let no_cursors = HashMap::new();
+        let (delta, _) = run(dir.path(), &no_cursors);
+        assert!(
+            !delta.sessions.iter().any(|s| s.session_id == DELETED_MAIN),
+            "已删主会话 B 不得被标成子代理：{:?}",
+            delta
+                .sessions
+                .iter()
+                .map(|s| &s.session_id)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            delta
+                .sessions
+                .iter()
+                .any(|s| s.session_id.starts_with("workbuddy-subagent:")),
+            "应降级到命名空间身份"
+        );
+    }
+
+    /// 旧缓存引用已删主会话 B → 直接报错，不静默换 ID 重采。
+    #[test]
+    fn cached_deleted_main_session_is_refused() {
+        const PARENT: &str = "a0000000-0000-4000-8000-000000000011";
+        const DELETED_MAIN: &str = "b0000000-0000-4000-8000-000000000012";
+        let dir = tempfile::tempdir().unwrap();
+        make_db(dir.path(), &[(PARENT, "/p/A"), (DELETED_MAIN, "/p/B")]);
+        mark_deleted(dir.path(), DELETED_MAIN);
+        write_jsonl(
+            dir.path(),
+            "p-A",
+            PARENT,
+            &[
+                json!({"type":"message","role":"assistant","timestamp":1000,"cwd":"/p/A",
+                     "sessionId":PARENT,"message":{"usage":{"input_tokens":1,"output_tokens":1,
+                     "total_tokens":2}},"providerData":{"model":"deepseek-v4.1-flash"}}),
+            ],
+        );
+        let sub = write_subagent_jsonl(
+            dir.path(),
+            "p-A",
+            PARENT,
+            "agent-cached-history.jsonl",
+            &[
+                json!({"type":"message","role":"assistant","timestamp":1500,"cwd":"/p/A",
+                     "sessionId":SUBAGENT_ID,
+                     "message":{"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}},
+                     "providerData":{"model":"deepseek-v4.1-flash","isSubAgent":true}}),
+            ],
+        );
+        let no_cursors = HashMap::new();
+        let (d1, _) = run(dir.path(), &no_cursors);
+        let mut cursors: HashMap<_, _> = d1
+            .cursors
+            .iter()
+            .map(|c| (c.session_id.clone(), c.clone()))
+            .collect();
+        let sub_key = cursors
+            .keys()
+            .find(|k| k.contains("subagents"))
+            .cloned()
+            .unwrap();
+        let mut state: serde_json::Value =
+            serde_json::from_str(&cursors[&sub_key].state_json).unwrap();
+        state["subagent_session_id"] = json!(DELETED_MAIN);
+        cursors.get_mut(&sub_key).unwrap().state_json = state.to_string();
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new().append(true).open(&sub).unwrap();
+        writeln!(
+            f,
+            "{}",
+            json!({"type":"message","role":"assistant","timestamp":1600,"cwd":"/p/A",
+                   "sessionId":SUBAGENT_ID,
+                   "message":{"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}},
+                   "providerData":{"model":"deepseek-v4.1-flash","isSubAgent":true}})
+        )
+        .unwrap();
+        let ctx = CollectContext::new(dir.path(), 1_700_000_000_000, &cursors);
+        let err = collect_with_home(&ctx, dir.path()).expect_err("缓存引用已删主会话必须报错");
+        assert_eq!(err.code, "usage-source-io");
+        assert!(err.detail.contains("cached"), "{}", err.detail);
     }
 
     /// stem 等于父 ID（文件名就是父 UUID）→ 降级命名空间键，绝不能落成父会话 id。

@@ -2089,7 +2089,7 @@ mod tests {
         }
         assert_eq!(
             (lines, chars),
-            (14269, 319012),
+            (14296, 319483),
             "判据面尺寸变了（实测 {lines} 行 / {chars} 字符）：本用例是**声明 = 实际**的钉子——\
              先弄清面为什么变（新增文件？改了排除区标记？动了生产代码？），再同步本常量、\
              `no_source_timezone_is_fed_into_any_key_function` 的锁注释、`KNOWN-PLAN-DEFECTS.md` \
