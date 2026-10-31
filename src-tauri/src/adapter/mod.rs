@@ -365,6 +365,8 @@ static PENDING_UNREAD_RETRIES: Lazy<Mutex<HashMap<(String, String), i64>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 const PENDING_TTL_MS: i64 = 24 * 3600 * 1000;
 static PENDING_LOADED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// 持久化失败（含旧快照暂不可读）后置位；待加载恢复后自动补写一次。
+static PENDING_DIRTY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn pending_key(tool: &str, sid: &str) -> String {
     format!("{tool}\u{1f}{sid}")
@@ -378,14 +380,37 @@ fn pending_store_path() -> std::path::PathBuf {
         .join("unread_pending_retries.json")
 }
 
-fn persist_pending_unread_retries() -> bool {
-    let map: HashMap<String, i64> = PENDING_UNREAD_RETRIES
+fn persist_pending_unread_retries_into(
+    path: &std::path::Path,
+    loaded: &std::sync::atomic::AtomicBool,
+    dirty: &std::sync::atomic::AtomicBool,
+    retries: &Mutex<HashMap<(String, String), i64>>,
+) -> bool {
+    use std::sync::atomic::Ordering;
+    // 启动恢复未完成时内存集合可能不含磁盘旧项：禁止覆盖，等加载成功合并后补写。
+    if !loaded.load(Ordering::Acquire) {
+        dirty.store(true, Ordering::Release);
+        log::debug!("unread: 待重试标记尚未完成加载，暂缓落盘");
+        return false;
+    }
+    let map: HashMap<String, i64> = retries
         .lock()
         .unwrap()
         .iter()
         .map(|((tool, sid), since)| (pending_key(tool, sid), *since))
         .collect();
-    persist_pending_map(&pending_store_path(), &map)
+    let ok = persist_pending_map(path, &map);
+    dirty.store(!ok, Ordering::Release);
+    ok
+}
+
+fn persist_pending_unread_retries() -> bool {
+    persist_pending_unread_retries_into(
+        &pending_store_path(),
+        &PENDING_LOADED,
+        &PENDING_DIRTY,
+        &PENDING_UNREAD_RETRIES,
+    )
 }
 
 fn pending_backup_path(path: &std::path::Path) -> std::path::PathBuf {
@@ -482,9 +507,31 @@ fn load_pending_map(path: &std::path::Path) -> PendingLoad {
     }
 }
 
+/// 写盘前确认权威快照可读：主文件 `IoError` 直接拒绝；主文件缺失/损坏时，
+/// 只有备份 `IoError` 才拒绝。Unix 的 rename 可覆盖不可读文件，因此这个检查
+/// 必须发生在**任何替换/写 tmp 之前**，不能只放在备用分支。
+fn pending_snapshots_readable(path: &std::path::Path) -> bool {
+    match read_pending_snapshot(path) {
+        PendingSnapshot::IoError => false,
+        // 主文件可读即为权威快照；损坏/缺失时备份才可能是唯一有效副本。
+        PendingSnapshot::Valid(_) => true,
+        PendingSnapshot::Missing | PendingSnapshot::Invalid => !matches!(
+            read_pending_snapshot(&pending_backup_path(path)),
+            PendingSnapshot::IoError
+        ),
+    }
+}
+
 /// 原子性优先的写盘：先写 tmp；直接 rename 成功（Unix）即完成。失败时**保留旧文件**
 /// 为 `.bak` 再换名；换名失败则恢复旧文件，绝不先删唯一有效快照。
 fn persist_pending_map(path: &std::path::Path, map: &HashMap<String, i64>) -> bool {
+    if !pending_snapshots_readable(path) {
+        log::warn!(
+            "unread: 待重试标记旧快照暂时不可读 {}（保留旧文件，跳过落盘）",
+            path.display()
+        );
+        return false;
+    }
     let Ok(json) = serde_json::to_string(map) else {
         return false;
     };
@@ -494,6 +541,15 @@ fn persist_pending_map(path: &std::path::Path, map: &HashMap<String, i64>) -> bo
             "unread: 待重试标记写入 {} 失败（降级为内存重试）: {e}",
             tmp.display()
         );
+        return false;
+    }
+    // 写完 tmp 后、换入前再确认一次，缩小“检查后被占用/权限变化”的竞态窗口。
+    if !pending_snapshots_readable(path) {
+        log::warn!(
+            "unread: 待重试标记换入前旧快照变为不可读 {}（保留旧文件，跳过落盘）",
+            path.display()
+        );
+        let _ = std::fs::remove_file(&tmp);
         return false;
     }
     if replace_pending_file_atomic(&tmp, path) {
@@ -632,6 +688,12 @@ fn load_pending_unread_retries() {
         &PENDING_LOADED,
         &PENDING_UNREAD_RETRIES,
     );
+    // 之前落盘被旧快照不可读拦下：恢复后把内存新增项与磁盘旧项合并，再补写一次。
+    if PENDING_LOADED.load(std::sync::atomic::Ordering::Acquire)
+        && PENDING_DIRTY.load(std::sync::atomic::Ordering::Acquire)
+    {
+        persist_pending_unread_retries();
+    }
 }
 
 /// 每轮清理内存中超过 24h 的待重试标记；有变化才落盘（避免每 3s 写放大）。
@@ -3151,9 +3213,10 @@ mod unread_card_tests {
     use super::{
         build_unread_cards, clear_unread_retry, filter_deleted_unread, insert_should_skip_for_read,
         keep_green_card, load_pending_map, load_pending_unread_retries_into,
-        mark_active_unread_cards, mark_unread_retry, pending_backup_path, persist_pending_map,
-        replace_pending_file_with_backup, retain_read_completed_cards, retry_insert_allowed,
-        unread_insert_allowed, unread_retry_pending, unread_retry_pending_since, PendingLoad,
+        mark_active_unread_cards, mark_unread_retry, pending_backup_path, pending_key,
+        persist_pending_map, persist_pending_unread_retries_into, replace_pending_file_with_backup,
+        retain_read_completed_cards, retry_insert_allowed, unread_insert_allowed,
+        unread_retry_pending, unread_retry_pending_since, PendingLoad,
     };
     use crate::database::dao::unread::UnreadSessionRecord;
     use crate::session::model::{AgentType, ProcessForm, Session, SessionStatus};
@@ -3421,6 +3484,129 @@ mod unread_card_tests {
         let retries = Mutex::new(HashMap::new());
         load_pending_unread_retries_into(&path, &loaded, &retries);
         assert!(loaded.load(Ordering::Acquire));
+    }
+
+    /// 入口级保护：加载未完成时即使文件可读也不得覆盖；加载合并后再补写。
+    #[test]
+    fn pending_retry_persist_gate_waits_for_load_and_merges() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("unread_pending_retries.json");
+        let now = chrono::Utc::now().timestamp_millis();
+        let mut a = HashMap::new();
+        a.insert("workbuddy\u{1f}s1".to_string(), now);
+        std::fs::write(&path, serde_json::to_string(&a).unwrap()).unwrap();
+
+        let loaded = AtomicBool::new(false);
+        let dirty = AtomicBool::new(false);
+        let retries = Mutex::new(HashMap::from([(
+            ("codex".to_string(), "s2".to_string()),
+            now,
+        )]));
+        assert!(!persist_pending_unread_retries_into(
+            &path, &loaded, &dirty, &retries
+        ));
+        assert!(dirty.load(Ordering::Acquire));
+        assert_eq!(loaded_map(&path), Some(a)); // 磁盘旧项未被覆盖
+
+        load_pending_unread_retries_into(&path, &loaded, &retries);
+        assert!(loaded.load(Ordering::Acquire));
+        assert!(persist_pending_unread_retries_into(
+            &path, &loaded, &dirty, &retries
+        ));
+        assert!(!dirty.load(Ordering::Acquire));
+        let stored = loaded_map(&path).unwrap();
+        assert!(stored.contains_key("workbuddy\u{1f}s1"));
+        assert!(stored.contains_key("codex\u{1f}s2"));
+    }
+
+    /// 入口级保护：主文件暂时不可读（用目录模拟 I/O 错误）时，
+    /// `persist_pending_map` 必须拒绝覆盖；恢复可读后合并磁盘旧项与内存新增项再落盘。
+    #[test]
+    fn pending_retry_persist_blocks_when_primary_unreadable_and_merges_after_restore() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("unread_pending_retries.json");
+        std::fs::create_dir(&path).unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        let mut new_mark = HashMap::new();
+        new_mark.insert("codex\u{1f}s2".to_string(), now);
+
+        assert!(!persist_pending_map(&path, &new_mark));
+        assert!(path.is_dir());
+        assert!(!path.with_extension("json.tmp").exists());
+
+        // 恢复旧快照（A），内存里已有新标记（B）；加载后应合并再写回。
+        std::fs::remove_dir(&path).unwrap();
+        let mut old_mark = HashMap::new();
+        old_mark.insert("workbuddy\u{1f}s1".to_string(), now);
+        std::fs::write(&path, serde_json::to_string(&old_mark).unwrap()).unwrap();
+        let loaded = AtomicBool::new(false);
+        let retries = Mutex::new(HashMap::from([(
+            ("codex".to_string(), "s2".to_string()),
+            now,
+        )]));
+        load_pending_unread_retries_into(&path, &loaded, &retries);
+        assert!(loaded.load(Ordering::Acquire));
+        let merged: HashMap<String, i64> = retries
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|((tool, sid), since)| (pending_key(tool, sid), *since))
+            .collect();
+        assert_eq!(merged.len(), 2);
+        assert!(persist_pending_map(&path, &merged));
+        let stored = loaded_map(&path).unwrap();
+        assert!(stored.contains_key("workbuddy\u{1f}s1"));
+        assert!(stored.contains_key("codex\u{1f}s2"));
+    }
+
+    /// 入口级保护（真实权限故障）：主文件不可读时，B 的持久化不得覆盖含 A 的旧文件；
+    /// 权限恢复后 A 与内存 B 合并写回。
+    #[cfg(unix)]
+    #[test]
+    fn pending_retry_persist_does_not_overwrite_unreadable_primary() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("unread_pending_retries.json");
+        let now = chrono::Utc::now().timestamp_millis();
+        let mut a = HashMap::new();
+        a.insert("workbuddy\u{1f}s1".to_string(), now);
+        std::fs::write(&path, serde_json::to_string(&a).unwrap()).unwrap();
+
+        let original = std::fs::metadata(&path).unwrap().permissions();
+        let mut locked = original.clone();
+        locked.set_mode(0o000);
+        std::fs::set_permissions(&path, locked).unwrap();
+        if std::fs::read_to_string(&path).is_ok() {
+            // root/ACL 环境无法用权限模拟读取失败，跳过本用例。
+            std::fs::set_permissions(&path, original).unwrap();
+            return;
+        }
+
+        let mut b = HashMap::new();
+        b.insert("codex\u{1f}s2".to_string(), now);
+        assert!(!persist_pending_map(&path, &b));
+        assert!(!path.with_extension("json.tmp").exists());
+
+        std::fs::set_permissions(&path, original).unwrap();
+        assert_eq!(loaded_map(&path), Some(a));
+
+        let loaded = AtomicBool::new(false);
+        let retries = Mutex::new(HashMap::from([(
+            ("codex".to_string(), "s2".to_string()),
+            now,
+        )]));
+        load_pending_unread_retries_into(&path, &loaded, &retries);
+        let merged: HashMap<String, i64> = retries
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|((tool, sid), since)| (pending_key(tool, sid), *since))
+            .collect();
+        assert_eq!(merged.len(), 2);
+        assert!(persist_pending_map(&path, &merged));
+        let stored = loaded_map(&path).unwrap();
+        assert!(stored.contains_key("workbuddy\u{1f}s1"));
+        assert!(stored.contains_key("codex\u{1f}s2"));
     }
 
     /// P1：已删会话的未读池行不得合并为卡；其他工具同 id 不受影响。
