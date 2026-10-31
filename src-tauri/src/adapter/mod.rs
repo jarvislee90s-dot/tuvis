@@ -385,10 +385,76 @@ fn persist_pending_unread_retries() -> bool {
         .iter()
         .map(|((tool, sid), since)| (pending_key(tool, sid), *since))
         .collect();
-    let Ok(json) = serde_json::to_string(&map) else {
+    persist_pending_map(&pending_store_path(), &map)
+}
+
+fn pending_backup_path(path: &std::path::Path) -> std::path::PathBuf {
+    path.with_extension("json.bak")
+}
+
+/// 平台原子替换：Unix `rename` 直接覆盖；Windows 用 `ReplaceFileW`（目标不存在时
+/// `MoveFileExW`）。返回 false 时调用方走“保留旧文件”的安全回退。
+#[cfg(windows)]
+fn replace_pending_file_atomic(tmp: &std::path::Path, path: &std::path::Path) -> bool {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::PCWSTR;
+    use windows::Win32::Storage::FileSystem::{
+        MoveFileExW, ReplaceFileW, MOVEFILE_WRITE_THROUGH, REPLACEFILE_IGNORE_MERGE_ERRORS,
+    };
+    let wide = |p: &std::path::Path| -> Vec<u16> {
+        p.as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
+    };
+    let dst = wide(path);
+    let src = wide(tmp);
+    unsafe {
+        let result = if path.exists() {
+            ReplaceFileW(
+                PCWSTR(dst.as_ptr()),
+                PCWSTR(src.as_ptr()),
+                PCWSTR::null(),
+                REPLACEFILE_IGNORE_MERGE_ERRORS,
+                None,
+                None,
+            )
+        } else {
+            MoveFileExW(
+                PCWSTR(src.as_ptr()),
+                PCWSTR(dst.as_ptr()),
+                MOVEFILE_WRITE_THROUGH,
+            )
+        };
+        result.is_ok()
+    }
+}
+
+#[cfg(not(windows))]
+fn replace_pending_file_atomic(tmp: &std::path::Path, path: &std::path::Path) -> bool {
+    std::fs::rename(tmp, path).is_ok()
+}
+
+/// 读取待重试快照：主文件缺失/损坏时回退 `.bak`（兼容替换过程中的崩溃窗口）。
+fn load_pending_map(path: &std::path::Path) -> Option<HashMap<String, i64>> {
+    let backup = pending_backup_path(path);
+    for candidate in [path, backup.as_path()] {
+        let Ok(raw) = std::fs::read_to_string(candidate) else {
+            continue;
+        };
+        if let Ok(map) = serde_json::from_str::<HashMap<String, i64>>(&raw) {
+            return Some(map);
+        }
+    }
+    None
+}
+
+/// 原子性优先的写盘：先写 tmp；直接 rename 成功（Unix）即完成。失败时**保留旧文件**
+/// 为 `.bak` 再换名；换名失败则恢复旧文件，绝不先删唯一有效快照。
+fn persist_pending_map(path: &std::path::Path, map: &HashMap<String, i64>) -> bool {
+    let Ok(json) = serde_json::to_string(map) else {
         return false;
     };
-    let path = pending_store_path();
     let tmp = path.with_extension("json.tmp");
     if let Err(e) = std::fs::write(&tmp, &json) {
         log::warn!(
@@ -397,17 +463,40 @@ fn persist_pending_unread_retries() -> bool {
         );
         return false;
     }
-    if let Err(e) = std::fs::rename(&tmp, &path) {
-        // Windows 目标存在时 rename 失败：删旧再改名；仍失败则降级
-        let _ = std::fs::remove_file(&path);
-        if let Err(e2) = std::fs::rename(&tmp, &path) {
-            log::warn!(
-                "unread: 待重试标记落盘 {} 失败（降级为内存重试）: {e} / {e2}",
-                path.display()
-            );
-            return false;
-        }
+    if replace_pending_file_atomic(&tmp, path) {
+        let _ = std::fs::remove_file(pending_backup_path(path));
+        return true;
     }
+    replace_pending_file_with_backup(&tmp, path)
+}
+
+/// 直接 rename 失败（Windows 目标已存在）时的安全替换：先把旧文件挪为 `.bak`，
+/// 再换入 tmp；任一步失败都恢复/保留旧文件。崩溃窗口由 `load_pending_map` 的
+/// `.bak` 回退兜底。
+fn replace_pending_file_with_backup(tmp: &std::path::Path, path: &std::path::Path) -> bool {
+    let backup = pending_backup_path(path);
+    // 主文件缺失时 .bak 可能是唯一有效快照（上次替换中崩溃），不得先清掉。
+    if path.exists() {
+        let _ = std::fs::remove_file(&backup);
+    }
+    if let Err(e) = std::fs::rename(path, &backup) {
+        log::warn!(
+            "unread: 待重试标记替换前无法保留旧文件 {}（保留原文件，降级）: {e}",
+            path.display()
+        );
+        let _ = std::fs::remove_file(tmp);
+        return false;
+    }
+    if let Err(e) = std::fs::rename(tmp, path) {
+        if let Err(e2) = std::fs::rename(&backup, path) {
+            log::warn!(
+                "unread: 待重试标记替换失败且旧文件恢复失败（load 将回退 .bak）: {e} / {e2}"
+            );
+        }
+        let _ = std::fs::remove_file(tmp);
+        return false;
+    }
+    let _ = std::fs::remove_file(&backup);
     true
 }
 
@@ -415,10 +504,7 @@ fn persist_pending_unread_retries() -> bool {
 fn load_pending_unread_retries() {
     PENDING_LOADED.call_once(|| {
         let path = pending_store_path();
-        let Ok(raw) = std::fs::read_to_string(&path) else {
-            return;
-        };
-        let Ok(map) = serde_json::from_str::<HashMap<String, i64>>(&raw) else {
+        let Some(map) = load_pending_map(&path) else {
             return;
         };
         let now = chrono::Utc::now().timestamp_millis();
@@ -2952,12 +3038,14 @@ mod sort_tests {
 mod unread_card_tests {
     use super::{
         build_unread_cards, clear_unread_retry, filter_deleted_unread, insert_should_skip_for_read,
-        keep_green_card, mark_active_unread_cards, mark_unread_retry, retain_read_completed_cards,
-        retry_insert_allowed, unread_insert_allowed, unread_retry_pending,
-        unread_retry_pending_since,
+        keep_green_card, load_pending_map, mark_active_unread_cards, mark_unread_retry,
+        pending_backup_path, persist_pending_map, replace_pending_file_with_backup,
+        retain_read_completed_cards, retry_insert_allowed, unread_insert_allowed,
+        unread_retry_pending, unread_retry_pending_since,
     };
     use crate::database::dao::unread::UnreadSessionRecord;
     use crate::session::model::{AgentType, ProcessForm, Session, SessionStatus};
+    use std::collections::HashMap;
 
     fn record(tool: &str, sid: &str) -> UnreadSessionRecord {
         UnreadSessionRecord {
@@ -3079,6 +3167,47 @@ mod unread_card_tests {
         assert!(clear_unread_retry("codex", "retry-test", false));
         assert!(!clear_unread_retry("codex", "retry-test", false));
         assert!(!unread_retry_pending("codex", "retry-test"));
+    }
+
+    /// 文件持久化：正常替换 + 主文件缺失时回退 .bak，保证替换崩溃窗口可恢复。
+    #[test]
+    fn pending_retry_file_roundtrip_and_backup_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("unread_pending_retries.json");
+        let mut first = HashMap::new();
+        first.insert("workbuddy\u{1f}s1".to_string(), 1_000);
+        assert!(persist_pending_map(&path, &first));
+        assert_eq!(load_pending_map(&path), Some(first.clone()));
+
+        let mut second = HashMap::new();
+        second.insert("codex\u{1f}s2".to_string(), 2_000);
+        assert!(persist_pending_map(&path, &second));
+        assert_eq!(load_pending_map(&path), Some(second));
+
+        // 模拟“旧文件已备份、新文件尚未换入”的崩溃窗口
+        std::fs::remove_file(&path).unwrap();
+        let backup = pending_backup_path(&path);
+        std::fs::write(&backup, serde_json::to_string(&first).unwrap()).unwrap();
+        assert_eq!(load_pending_map(&path), Some(first));
+    }
+
+    /// 替换链路失败时必须保留旧快照，不得出现“旧文件已删、新文件未入”的空窗。
+    #[test]
+    fn pending_retry_persist_failure_preserves_primary_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("unread_pending_retries.json");
+        let mut old = HashMap::new();
+        old.insert("workbuddy\u{1f}s1".to_string(), 1_000);
+        assert!(persist_pending_map(&path, &old));
+
+        // 备份目标被目录占位 → 无法保留旧文件；函数应放弃替换并保留主文件。
+        let backup = pending_backup_path(&path);
+        std::fs::create_dir(&backup).unwrap();
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, "{}").unwrap();
+        assert!(!replace_pending_file_with_backup(&tmp, &path));
+        assert_eq!(load_pending_map(&path), Some(old));
+        assert!(!tmp.exists());
     }
 
     /// P1：已删会话的未读池行不得合并为卡；其他工具同 id 不受影响。
