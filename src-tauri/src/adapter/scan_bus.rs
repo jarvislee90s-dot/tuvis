@@ -1,7 +1,7 @@
 //! 扫描总线：进程内唯一的会话扫描者。
 //! 产出 Arc<Snapshot>（版本单调），所有消费方读快照；事件唤醒与动作路径补扫共用同一把单飞。
 
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -44,26 +44,44 @@ static VERSION: AtomicU64 = AtomicU64::new(0);
 static SCAN_EPOCH: AtomicU64 = AtomicU64::new(0);
 static MODE: Lazy<Mutex<Mode>> = Lazy::new(|| Mutex::new(Mode::Idle));
 
-/// 单个窗口的可见性心跳状态：是否在看 + 最近一次心跳时刻（毫秒）
+/// 进程级单调时钟起点（6.3）：所有持续时间判定共用这一时间基。
+/// 只取一次起点，后续都用 `elapsed()`——不同 `Instant` 之间不能相减，统一基准后
+/// 才能把「单调毫秒」存进原子量、放进结构体做比较。
+static MONO_START: OnceLock<Instant> = OnceLock::new();
+
+/// 进程内单调时钟（自本进程首次调用起）。
+/// **持续时间判定只允许用它**：Cadence 降档防抖、在看心跳 TTL、补扫超时窗口、
+/// hang 看门狗。墙上时间（[`wall_ms`]）只用于日志与 UI 展示（`scannedAtMs`/stats）。
+pub(crate) fn mono_now() -> Duration {
+    MONO_START.get_or_init(Instant::now).elapsed()
+}
+
+/// 单调毫秒（原子量存储用）：0 预留给「未设置 / 无在飞扫描」哨兵，故下限为 1。
+/// 进程运行超过 u64 毫秒（约 5.8 亿年）才会截断，不在现实范围。
+fn mono_now_ms() -> u64 {
+    (mono_now().as_millis() as u64).max(1)
+}
+
+/// 单个窗口的可见性心跳状态：是否在看 + 最近一次心跳时刻（单调时钟）
 #[derive(Debug, Clone, Copy)]
 struct WatchState {
     watching: bool,
-    last_seen_ms: i64,
+    last_seen: Duration,
 }
 
-/// 「有人在看」按**窗口**记账：window label → (watching, last_seen_ms)。
+/// 「有人在看」按**窗口**记账：window label → (watching, last_seen)。
 /// 主窗与宠物浮窗是两个 WebView，却共用同一个后端状态：单窗退出（浮窗收起 / 主窗失焦）
 /// 不得清掉另一窗的在看状态，也不能用一个布尔/时间戳表示
 static WATCH_STATE: Lazy<Mutex<std::collections::HashMap<String, WatchState>>> =
     Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
 static TX: OnceLock<mpsc::Sender<ScanReason>> = OnceLock::new();
 static IN_FLIGHT: AtomicBool = AtomicBool::new(false);
-/// 在飞扫描的起始时刻（毫秒）；0 = 无在飞扫描。看门狗据此判定疑似 hang
-static SCAN_STARTED_MS: AtomicI64 = AtomicI64::new(0);
+/// 在飞扫描的起始时刻（**单调**毫秒）；0 = 无在飞扫描。看门狗据此判定疑似 hang
+static SCAN_STARTED_MS: AtomicU64 = AtomicU64::new(0);
 /// 进程内累计真实扫描次数（R1 断言「批量只扫一次」与 R4 stats.total 的数据源）
 static SCANS_TOTAL: AtomicU64 = AtomicU64::new(0);
-/// 最近一次补扫超时时刻（毫秒）；0 = 从未超时。30s 内 `scan_bus_status.degraded` 为真
-static LAST_TIMEOUT_MS: AtomicI64 = AtomicI64::new(0);
+/// 最近一次补扫超时时刻（**单调**毫秒）；0 = 从未超时。30s 内 `scan_bus_status.degraded` 为真
+static LAST_TIMEOUT_MS: AtomicU64 = AtomicU64::new(0);
 
 /// 事件触发扫描的最小间隔上限（Away 档 30s 的间隔会让 hook 事件在 TTL 内等不到扫描）
 const EVENT_MIN_GAP_CAP: Duration = Duration::from_secs(5);
@@ -79,15 +97,19 @@ pub(crate) const UNCOVERED_TOOLS: &[&str] = &["dsh", "openclaw"];
 const SCAN_WAIT_LIMIT: Duration = Duration::from_secs(5);
 /// 看门狗阈值：在飞超过该时长视为疑似 hang（只告警，**不强杀**——清在飞位会放进
 /// 第二份并发扫描，hang 需重启恢复，诊断口见 `scan_bus_status.degraded`）
-const HANG_THRESHOLD_MS: i64 = 120_000;
+const HANG_THRESHOLD_MS: u64 = 120_000;
 /// 同一段 hang 的告警最小间隔
-const HANG_ALERT_INTERVAL_MS: i64 = 120_000;
+const HANG_ALERT_INTERVAL_MS: u64 = 120_000;
 /// 补扫超时后的 degraded 诊断窗口（R3：超时后 30s 内 status.degraded 恒真）
-const TIMEOUT_DEGRADED_WINDOW_MS: i64 = 30_000;
+const TIMEOUT_DEGRADED_WINDOW_MS: u64 = 30_000;
 /// 看门狗巡检周期
 const WATCHDOG_PERIOD: Duration = Duration::from_secs(5);
-/// 「有人在看」心跳的有效期
-const WATCH_TTL_MS: i64 = 90_000;
+/// 「有人在看」心跳的有效期（单调时钟判定）
+const WATCH_TTL: Duration = Duration::from_secs(90);
+/// 扫描轮次 panic 后的固定退避：连续 panic 时每轮至少间隔这么久（防 panic 风暴）
+const PANIC_BACKOFF: Duration = Duration::from_millis(500);
+/// F1 门禁：panic 后最迟该时点必须已经发起下一次扫描
+const RECOVERY_BOUND: Duration = Duration::from_secs(30);
 /// 托盘无状态变化时的最长刷新间隔
 const TRAY_REFRESH: Duration = Duration::from_secs(30);
 
@@ -228,9 +250,10 @@ fn scan_tx() -> Option<mpsc::Sender<ScanReason>> {
     TX.get().cloned()
 }
 
-/// 记录一次补扫超时（R3：30s 内 status.degraded 为真）
+/// 记录一次补扫超时（R3：30s 内 status.degraded 为真）。
+/// 记账用单调毫秒：系统时间跳变不得拉长/缩短诊断窗口。
 fn note_timeout() {
-    LAST_TIMEOUT_MS.store(now_ms(), Ordering::SeqCst);
+    LAST_TIMEOUT_MS.store(mono_now_ms(), Ordering::SeqCst);
 }
 
 /// 前端可见性心跳（窗口级）："有人在看" = 任一窗口可见且聚焦 / 浮窗展开；TTL 90s。
@@ -246,16 +269,20 @@ fn note_timeout() {
 ///
 /// 判定在锁内「先算前值、改完再算后值」，并发心跳不会各自拿到一次边沿。
 pub fn set_user_watching(window: &str, watching: bool) -> bool {
-    let now = now_ms();
+    set_user_watching_at(window, watching, mono_now())
+}
+
+/// 心跳记账内核；`now` 注入单调时钟，便于用纯 Duration 验证 TTL 边界。
+fn set_user_watching_at(window: &str, watching: bool, now: Duration) -> bool {
     let mut map = WATCH_STATE.lock().unwrap_or_else(|e| e.into_inner());
     // 每次写入顺手修剪过期项：窗口数量固定（main/pet），但断供的窗口不该长期占着 map
-    map.retain(|_, st| now.saturating_sub(st.last_seen_ms) < WATCH_TTL_MS);
+    map.retain(|_, st| watch_fresh(st.last_seen, now));
     let before = map.get(window).map(|st| st.watching).unwrap_or(false);
     map.insert(
         window.to_string(),
         WatchState {
             watching,
-            last_seen_ms: now,
+            last_seen: now,
         },
     );
     !before && watching
@@ -263,15 +290,26 @@ pub fn set_user_watching(window: &str, watching: bool) -> bool {
 
 /// 总体「有人在看」= 任一未过期窗口的心跳为 watching
 fn user_watching() -> bool {
-    let now = now_ms();
+    user_watching_at(mono_now())
+}
+
+fn user_watching_at(now: Duration) -> bool {
     WATCH_STATE
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .values()
-        .any(|st| st.watching && now.saturating_sub(st.last_seen_ms) < WATCH_TTL_MS)
+        .any(|st| st.watching && watch_fresh(st.last_seen, now))
 }
 
-fn now_ms() -> i64 {
+/// 心跳是否仍在 TTL 内（纯函数，单调 Duration）：恰满 90s 即过期。
+/// 单调时钟下 `now >= last_seen`，saturating_sub 仅作纵深防御。
+fn watch_fresh(last_seen: Duration, now: Duration) -> bool {
+    now.saturating_sub(last_seen) < WATCH_TTL
+}
+
+/// 墙上时钟（毫秒）：**只**用于展示/排查（`scan-bus-snapshot.scannedAtMs`、stats 时间戳），
+/// 不得参与任何持续时间判定——那是 [`mono_now`] 的职责。
+fn wall_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
 
@@ -360,9 +398,9 @@ fn scan_once_with_limit(reason: ScanReason, wait_limit: Duration) -> Arc<Snapsho
             None => scan_once_with_limit(reason, wait_limit),
         };
     }
-    // R10：本次扫描的启动时刻（本地变量）——publish 时只允许「启动晚于超时」的
-    // 扫描复位 degraded 窗口；启动早于超时的扫描发布的是旧视图，不得抹掉超时告警
-    let started_ms = now_ms();
+    // R10：本次扫描的启动时刻（本地变量，单调毫秒）——publish 时只允许「启动晚于
+    // 超时」的扫描复位 degraded 窗口；启动早于超时的扫描发布的是旧视图，不得抹掉告警
+    let started_ms = mono_now_ms();
     SCAN_STARTED_MS.store(started_ms, Ordering::SeqCst);
     SCANS_TOTAL.fetch_add(1, Ordering::SeqCst);
     // F5：epoch 在**扫描启动**时递增（不是发布时）——变更命令返回的 epoch 与
@@ -436,7 +474,8 @@ fn snapshot_payload(
 /// 快照发布后的统一事件出口（唯一调用点在 scan_once，覆盖全部真实发布路径）。
 /// emit 失败只 warn：前端仍有档位轮询兜底，通知本身是加速通道。
 fn emit_snapshot_event(snap: &Snapshot, reason: ScanReason) {
-    let payload = snapshot_payload(snap, reason, mode(), now_ms());
+    // 展示面时间戳用墙上时钟（前端按真实日期展示），不参与任何时效判定
+    let payload = snapshot_payload(snap, reason, mode(), wall_ms());
     crate::remote::events::emit_ui("scan-bus-snapshot", payload);
 }
 
@@ -527,10 +566,11 @@ fn degraded_snapshot() -> Arc<Snapshot> {
 }
 
 /// degraded 判定（纯函数，R3）：在飞超 120s（hang）或最近 30s 内发生过补扫超时。
-fn status_degraded(in_flight: bool, started_ms: i64, last_timeout_ms: i64, now: i64) -> bool {
-    let hang = in_flight && started_ms > 0 && now - started_ms > HANG_THRESHOLD_MS;
+/// 四个入参都是**单调毫秒**（0 = 未设置），与墙上时间无关。
+fn status_degraded(in_flight: bool, started_ms: u64, last_timeout_ms: u64, now_ms: u64) -> bool {
+    let hang = in_flight && started_ms > 0 && now_ms.saturating_sub(started_ms) > HANG_THRESHOLD_MS;
     let timed_out =
-        last_timeout_ms > 0 && now.saturating_sub(last_timeout_ms) < TIMEOUT_DEGRADED_WINDOW_MS;
+        last_timeout_ms > 0 && now_ms.saturating_sub(last_timeout_ms) < TIMEOUT_DEGRADED_WINDOW_MS;
     hang || timed_out
 }
 
@@ -541,21 +581,26 @@ pub fn is_degraded() -> bool {
         IN_FLIGHT.load(Ordering::SeqCst),
         SCAN_STARTED_MS.load(Ordering::SeqCst),
         LAST_TIMEOUT_MS.load(Ordering::SeqCst),
-        now_ms(),
+        mono_now_ms(),
     )
 }
 
-/// 看门狗判定（纯函数）：返回应告警的扫描龄（毫秒），None = 本拍不告警。
+/// 看门狗判定（纯函数，单调毫秒）：返回应告警的扫描龄（毫秒），None = 本拍不告警。
 /// 同一段 hang 每 120s 最多告警一次（last_alert_ms = 上次告警时刻，0 = 尚未告警）。
-fn hang_alert_age(in_flight: bool, started_ms: i64, now: i64, last_alert_ms: i64) -> Option<i64> {
-    if !in_flight || started_ms <= 0 {
+fn hang_alert_age(
+    in_flight: bool,
+    started_ms: u64,
+    now_ms: u64,
+    last_alert_ms: u64,
+) -> Option<u64> {
+    if !in_flight || started_ms == 0 {
         return None;
     }
-    let age = now - started_ms;
+    let age = now_ms.saturating_sub(started_ms);
     if age <= HANG_THRESHOLD_MS {
         return None;
     }
-    if last_alert_ms > 0 && now - last_alert_ms < HANG_ALERT_INTERVAL_MS {
+    if last_alert_ms > 0 && now_ms.saturating_sub(last_alert_ms) < HANG_ALERT_INTERVAL_MS {
         return None;
     }
     Some(age)
@@ -568,7 +613,7 @@ fn hang_alert_age(in_flight: bool, started_ms: i64, now: i64, last_alert_ms: i64
 /// 取锁必然发生在发布之后，一定能看到新快照；因此 `version()` 最多短暂滞后，
 /// **绝不会领先** `snapshot().version`（否则「读版本→读快照→标记已见」的
 /// 消费方会漏掉一次跃迁）。
-fn publish(data: SessionsResponse, started_ms: i64, epoch: u64) -> Arc<Snapshot> {
+fn publish(data: SessionsResponse, started_ms: u64, epoch: u64) -> Arc<Snapshot> {
     let mut guard = LAST.lock().unwrap_or_else(|e| e.into_inner());
     let version = guard.as_ref().map(|s| s.version + 1).unwrap_or(1);
     let snap = Arc::new(Snapshot {
@@ -599,9 +644,9 @@ fn publish(data: SessionsResponse, started_ms: i64, epoch: u64) -> Arc<Snapshot>
 /// 发布期间可能有并发 `note_timeout` 写入更新的超时时刻——CAS `Err` 时按**最新值**
 /// 重判，绝不盲清：新一轮超时的 30s 窗口不会被本轮旧扫描的发布抹掉。
 fn clear_timeout_after(
-    started_ms: i64,
-    mut load: impl FnMut() -> i64,
-    mut cas: impl FnMut(i64, i64) -> Result<i64, i64>,
+    started_ms: u64,
+    mut load: impl FnMut() -> u64,
+    mut cas: impl FnMut(u64, u64) -> Result<u64, u64>,
 ) {
     let mut last_timeout = load();
     while started_ms > last_timeout && last_timeout != 0 {
@@ -612,6 +657,27 @@ fn clear_timeout_after(
     }
 }
 
+/// 下一圈扫描前的等待（纯函数，6.2「panic 恢复 ≤30s」的证明载体）：
+/// * 正常 → 当前档位间隔（下一圈 `recv_timeout` 阻塞等唤醒，超时即周期扫描）；
+/// * panic → 固定 [`PANIC_BACKOFF`]，**不叠加**档位间隔：退避结束即立即恢复扫描。
+///
+/// 旧实现先 `sleep(500ms)` 再按档位等待 ⇒ Away 档最坏 30s + 0.5s = 30.5s，突破
+/// F1 门禁。恢复路径的最坏时延 = `PANIC_BACKOFF` + 恢复扫描自身的单飞等待上限
+/// [`SCAN_WAIT_LIMIT`]（等待在飞超时后按降级快照返回，本轮仍会结束）
+/// ≤ [`RECOVERY_BOUND`] = 30s。连续 panic 时每轮仍退避 500ms，不会形成 panic 风暴。
+fn next_scan_wait(panicked: bool, interval: Duration) -> Duration {
+    if panicked {
+        // debug 构建每轮自检门禁不变式（release 下零成本；常量在两种构建都被引用）
+        debug_assert!(
+            PANIC_BACKOFF + SCAN_WAIT_LIMIT <= RECOVERY_BOUND,
+            "F1: panic 恢复最坏路径必须 ≤30s"
+        );
+        PANIC_BACKOFF
+    } else {
+        interval
+    }
+}
+
 /// 生产启动：常驻线程（首个扫描立即执行，之后按档位）
 pub fn start(app: tauri::AppHandle) {
     let (tx, rx) = mpsc::channel::<ScanReason>();
@@ -619,7 +685,7 @@ pub fn start(app: tauri::AppHandle) {
         return; // 幂等：已启动则直接返回
     }
     std::thread::spawn(move || {
-        let mut cadence = Cadence::new(now_ms());
+        let mut cadence = Cadence::new(mono_now());
         let mut last_scan = Instant::now()
             .checked_sub(Duration::from_secs(60))
             .unwrap_or_else(Instant::now);
@@ -627,6 +693,8 @@ pub fn start(app: tauri::AppHandle) {
         let mut last_waiting = usize::MAX;
         let mut last_processing = false;
         let mut first = true;
+        // F1：上一轮 panic 后已完成退避，本圈必须**立即**恢复扫描（不等档位间隔）
+        let mut recovering = false;
         loop {
             // 取因必须留在 catch_unwind 之外：本轮无论是否 panic，下一圈都要回到
             // recv_timeout 继续接收唤醒——线程自杀式退出等于看板永久冻结
@@ -634,8 +702,13 @@ pub fn start(app: tauri::AppHandle) {
             let mut reason = if first {
                 first = false;
                 ScanReason::ColdStart
+            } else if recovering {
+                recovering = false;
+                // 恢复扫描：500ms 退避已在上一圈结束时完成，这里不再等档位间隔；
+                // 期间排队的唤醒由下方 burst 合并（含 Action 时按 Action 记账）
+                ScanReason::Periodic
             } else {
-                match rx.recv_timeout(cadence.mode().interval()) {
+                match rx.recv_timeout(next_scan_wait(false, cadence.mode().interval())) {
                     Ok(reason) => reason,
                     Err(mpsc::RecvTimeoutError::Timeout) => ScanReason::Periodic,
                     Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -652,7 +725,8 @@ pub fn start(app: tauri::AppHandle) {
             reason = burst_scan_reason(reason, &burst);
             // F1 自愈：每轮工作（扫描 / 托盘 / 信号 / 档位 / emit）整体 catch_unwind。
             // 命令层已改为只读快照，唯一的扫描线程一旦被 panic 展开掉，看板与托盘就会
-            // 冻结到重启——此处捕获后继续循环，最坏一个档位间隔（≤30s）内必有下一扫。
+            // 冻结到重启——此处捕获后继续循环，并在退避 500ms 后**立即**恢复扫描
+            // （不叠加档位间隔，见 next_scan_wait）。
             // scan_once 内的 Drop 守卫会在展开时清 IN_FLIGHT，下一圈不会自锁。
             let round = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 // 事件合并节流：仅压**孤立** Event；Action 补扫与冷启动不得被丢弃，
@@ -692,7 +766,7 @@ pub fn start(app: tauri::AppHandle) {
                         &snap.data,
                     ),
                 };
-                if let Some(mode) = cadence.observe(signals, now_ms()) {
+                if let Some(mode) = cadence.observe(signals, mono_now()) {
                     *MODE.lock().unwrap_or_else(|e| e.into_inner()) = mode;
                     log::info!("scan_bus: mode → {:?}", mode);
                     crate::remote::events::emit_ui(
@@ -701,21 +775,26 @@ pub fn start(app: tauri::AppHandle) {
                     );
                 }
             }));
+            let panicked = round.is_err();
             if let Err(e) = round {
                 log::error!("scan_bus: 扫描轮次 panic，已捕获并继续（{:?}）", e);
-                // 退避 500ms：持续 panic 时不要以档位间隔空转（panic 风暴），
-                // 退避后下一圈仍按当前档位接收 → 满足 F1「≤30s 自动恢复」
-                std::thread::sleep(Duration::from_millis(500));
+            }
+            // 6.2：panic 后只退避 500ms 就立即恢复扫描（不叠加档位间隔）；连续 panic
+            // 时每轮仍隔 500ms，保留防风暴能力。恢复路径最坏 ≤30s 的论证见 next_scan_wait。
+            if panicked {
+                std::thread::sleep(next_scan_wait(true, cadence.mode().interval()));
+                recovering = true;
             }
         }
     });
     // 看门狗：扫描线程被卡死（非 panic）时 IN_FLIGHT 永真、档位与托盘停摆。
     // 只告警不干预：清在飞位会让等待方抢到单飞、并发第二份扫描（双份快照/双倍 IO）。
     std::thread::spawn(move || {
-        let mut last_alert_ms = 0i64;
+        let mut last_alert_ms = 0u64;
         loop {
             std::thread::sleep(WATCHDOG_PERIOD);
-            let now = now_ms();
+            // 看门狗只用单调毫秒：系统时间跳变不得误报/漏报 hang
+            let now = mono_now_ms();
             if let Some(age) = hang_alert_age(
                 IN_FLIGHT.load(Ordering::SeqCst),
                 SCAN_STARTED_MS.load(Ordering::SeqCst),
@@ -841,7 +920,7 @@ pub(crate) fn set_test_tx_for_test(tx: Option<mpsc::Sender<ScanReason>>) {
 pub(crate) fn set_in_flight_for_test(on: bool) {
     IN_FLIGHT.store(on, Ordering::SeqCst);
     if on {
-        SCAN_STARTED_MS.store(now_ms(), Ordering::SeqCst);
+        SCAN_STARTED_MS.store(mono_now_ms(), Ordering::SeqCst);
     } else {
         SCAN_STARTED_MS.store(0, Ordering::SeqCst);
     }
@@ -851,22 +930,22 @@ pub(crate) fn set_in_flight_for_test(on: bool) {
 #[cfg(test)]
 pub fn publish_for_test(f: impl FnOnce() -> SessionsResponse) -> Arc<Snapshot> {
     let epoch = SCAN_EPOCH.fetch_add(1, Ordering::SeqCst) + 1;
-    publish(f(), now_ms(), epoch)
+    publish(f(), mono_now_ms(), epoch)
 }
 
-/// 单测用：以指定启动时刻发布（验证 R10 的超时窗口复位条件）
+/// 单测用：以指定启动时刻（单调毫秒）发布（验证 R10 的超时窗口复位条件）
 #[cfg(test)]
 pub(crate) fn publish_at_for_test(
-    started_ms: i64,
+    started_ms: u64,
     f: impl FnOnce() -> SessionsResponse,
 ) -> Arc<Snapshot> {
     let epoch = SCAN_EPOCH.fetch_add(1, Ordering::SeqCst) + 1;
     publish(f(), started_ms, epoch)
 }
 
-/// 单测用：直接设置最近一次超时时刻（R10 复位条件用例）
+/// 单测用：直接设置最近一次超时时刻（单调毫秒，R10 复位条件用例）
 #[cfg(test)]
-pub(crate) fn set_last_timeout_for_test(ms: i64) {
+pub(crate) fn set_last_timeout_for_test(ms: u64) {
     LAST_TIMEOUT_MS.store(ms, Ordering::SeqCst);
 }
 
@@ -1015,31 +1094,33 @@ mod tests {
     }
 
     /// Task 2：TTL 按窗口判定——心跳断供超过 90s 的窗口不再算「在看」，
-    /// 它重新上报时算该窗口的上升沿（窗口从不可见→可见允许一次即时刷新）
+    /// 它重新上报时算该窗口的上升沿（窗口从不可见→可见允许一次即时刷新）。
+    /// 6.3：注入单调 Duration（不受进程启动时刻/墙上时间影响）。
     #[test]
     fn expired_window_does_not_count_as_watching_and_reentry_is_rising_edge() {
         let _guard = test_guard();
         reset_for_test();
+        let now = WATCH_TTL * 3;
         {
             let mut map = WATCH_STATE.lock().unwrap_or_else(|e| e.into_inner());
             map.insert(
                 "pet".to_string(),
                 WatchState {
                     watching: true,
-                    last_seen_ms: now_ms() - WATCH_TTL_MS - 1,
+                    last_seen: now - WATCH_TTL - Duration::from_millis(1),
                 },
             );
             map.insert(
                 "main".to_string(),
                 WatchState {
                     watching: true,
-                    last_seen_ms: now_ms(),
+                    last_seen: now,
                 },
             );
         }
-        assert!(user_watching(), "未过期的 main 仍算在看");
+        assert!(user_watching_at(now), "未过期的 main 仍算在看");
         assert!(
-            set_user_watching("pet", true),
+            set_user_watching_at("pet", true, now),
             "过期窗口重新上报 = 该窗口上升沿"
         );
         // 过期项在写入时被修剪，不会长期占着 map
@@ -1049,10 +1130,23 @@ mod tests {
         {
             let mut map = WATCH_STATE.lock().unwrap_or_else(|e| e.into_inner());
             for st in map.values_mut() {
-                st.last_seen_ms = now_ms() - WATCH_TTL_MS - 1;
+                st.last_seen = now - WATCH_TTL - Duration::from_millis(1);
             }
         }
-        assert!(!user_watching(), "全部窗口过期后不再是在看");
+        assert!(!user_watching_at(now), "全部窗口过期后不再是在看");
+    }
+
+    /// 6.3：心跳 TTL 边界（纯 Duration 单调时间）——恰满 90s 即过期，前 1ms 有效
+    #[test]
+    fn watch_ttl_boundary_is_exact_on_monotonic_time() {
+        let now = WATCH_TTL * 2;
+        assert!(watch_fresh(now, now), "刚上报的心跳必须有效");
+        assert!(watch_fresh(now - WATCH_TTL + Duration::from_millis(1), now));
+        assert!(!watch_fresh(now - WATCH_TTL, now), "恰满 TTL 即过期");
+        assert!(!watch_fresh(
+            now - WATCH_TTL - Duration::from_millis(1),
+            now
+        ));
     }
 
     /// Task 2：`scan_epoch` 在扫描**启动**时 +1（不是发布时）——F5 据此判定
@@ -1247,6 +1341,96 @@ mod tests {
             hang_alert_age(true, 10_000, alert_at + 120_000, alert_at),
             Some(alert_at + 120_000 - 10_000)
         );
+    }
+
+    /// 6.2：panic 恢复路径——退避 500ms 后**立即**恢复扫描，不叠加档位间隔。
+    /// 旧实现（sleep 500ms + 按档位等待）在 Away 档最坏 30.5s，突破 F1 ≤30s 门禁。
+    #[test]
+    fn panic_recovery_backs_off_then_scans_immediately_within_30s() {
+        // 正常路径等待档位间隔；恢复路径与档位无关（三种档位一律 500ms）
+        for interval in [
+            Mode::Active.interval(),
+            Mode::Idle.interval(),
+            Mode::Away.interval(),
+        ] {
+            assert_eq!(next_scan_wait(false, interval), interval);
+            assert_eq!(
+                next_scan_wait(true, interval),
+                PANIC_BACKOFF,
+                "panic 后的等待不得叠加档位间隔（Away 30.5s 即由此而来）"
+            );
+        }
+        // 最坏恢复时延 = 退避 + 恢复扫描自身的单飞等待上限（超时降级返回，本轮仍结束）
+        let worst = PANIC_BACKOFF + SCAN_WAIT_LIMIT;
+        assert!(
+            worst <= RECOVERY_BOUND,
+            "panic 恢复最坏 {worst:?} 必须 ≤ {RECOVERY_BOUND:?}"
+        );
+        assert_eq!(RECOVERY_BOUND, Duration::from_secs(30), "F1 门禁是 30s");
+        assert_eq!(PANIC_BACKOFF, Duration::from_millis(500));
+
+        // 虚拟时钟推演：连续 panic 时每次恢复扫描都在上一次退避后立即发起
+        // （间隔恰为 500ms，≥500ms 的防风暴下限），首次恢复远早于 30s。
+        let mut clock = Duration::ZERO;
+        let mut starts = Vec::new();
+        for _ in 0..10 {
+            clock += next_scan_wait(true, Mode::Away.interval());
+            starts.push(clock);
+        }
+        assert_eq!(starts[0], PANIC_BACKOFF);
+        assert!(starts[0] <= RECOVERY_BOUND, "首次恢复必须 ≤30s");
+        for pair in starts.windows(2) {
+            assert!(
+                pair[1] - pair[0] >= Duration::from_millis(500),
+                "连续 panic 必须保留 ≥500ms 退避（防风暴）"
+            );
+        }
+    }
+
+    /// 6.3：进程级单调时钟只前进；且与 `Instant` 同一基准（不同调用间可安全相减）
+    #[test]
+    fn mono_now_is_monotonic_and_shared_across_calls() {
+        let baseline = mono_now();
+        let instant = Instant::now();
+        std::thread::sleep(Duration::from_millis(5));
+        let later = mono_now();
+        assert!(later >= baseline, "单调时钟不得回退");
+        assert!(later > baseline, "跨 5ms 的两次采样必须前进");
+        // 每次调用都基于同一 OnceLock 起点：增量与 Instant 自测一致（允许调度抖动）
+        assert!(later - baseline >= Duration::from_millis(4));
+        assert!(instant.elapsed() >= Duration::from_millis(4));
+        assert!(mono_now_ms() >= 1, "0 是「未设置」哨兵，单调毫秒下限为 1");
+    }
+
+    /// 6.3 回归锁：节奏/心跳/超时/hang 判定全部读单调时钟；墙上时间只用于展示面。
+    #[test]
+    fn duration_decisions_read_only_the_monotonic_clock() {
+        let src = include_str!("scan_bus.rs");
+        let impl_end = src.find("mod tests").expect("测试模块标记缺失");
+        let body = &src[..impl_end];
+        assert!(body.contains("fn mono_now() -> Duration"));
+        assert!(body.contains("fn mono_now_ms() -> u64"));
+        assert!(
+            body.contains("Cadence::new(mono_now())"),
+            "Cadence 必须注入单调时钟"
+        );
+        assert!(
+            body.contains("cadence.observe(signals, mono_now())"),
+            "Cadence 观测必须注入单调时钟"
+        );
+        assert!(
+            body.contains("last_seen: Duration"),
+            "心跳时刻必须是单调 Duration"
+        );
+        assert!(body.contains("static SCAN_STARTED_MS: AtomicU64"));
+        assert!(body.contains("static LAST_TIMEOUT_MS: AtomicU64"));
+        // 墙上时间只允许出现在两个展示面：payload 的 scannedAtMs 与 stats 的 updated_at
+        assert_eq!(
+            body.matches("Utc::now").count(),
+            2,
+            "chrono 墙上时间只允许在 wall_ms / write_stats 两处（展示面）"
+        );
+        assert!(body.contains("fn wall_ms() -> i64"));
     }
 
     /// R2：事件延后期间不得裸睡——必须用 recv_timeout 等新唤醒：
@@ -1527,7 +1711,7 @@ mod tests {
         reset_for_test();
         note_timeout();
         assert!(is_degraded(), "刚超时后应处于 degraded 窗口");
-        let now = now_ms();
+        let now = mono_now_ms();
         set_last_timeout_for_test(now);
         let _ = publish_at_for_test(now + 1, || resp(SessionStatus::Idle));
         assert!(!is_degraded(), "启动晚于超时的成功发布应复位窗口");
@@ -1538,7 +1722,8 @@ mod tests {
     fn publish_keeps_timeout_window_when_scan_started_before_it() {
         let _guard = test_guard();
         reset_for_test();
-        let now = now_ms();
+        // 单调毫秒下限为 1，max(2) 保证 now-1 仍是合法的「早于超时」启动时刻
+        let now = mono_now_ms().max(2);
         set_last_timeout_for_test(now);
         assert!(is_degraded());
         let _ = publish_at_for_test(now - 1, || resp(SessionStatus::Idle));
