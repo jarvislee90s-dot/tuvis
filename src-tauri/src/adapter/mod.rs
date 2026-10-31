@@ -405,6 +405,28 @@ fn session_activity_ms(s: &Session) -> Option<i64> {
         .map(|dt| dt.timestamp_millis())
 }
 
+/// 活动时间是否“可能是当前回合”（用于无待重试标记时的兜底）。
+/// Codex APP 的 `threads.updated_at` 是**秒级**：同一秒内的新回合不能因为
+/// 墓碑毫秒值更大就被判成已读；对秒级活动留 999ms 不确定性，宁可允许通知。
+fn activity_may_be_after(activity_ms: i64, read_at_ms: i64) -> bool {
+    if activity_ms % 1000 == 0 {
+        activity_ms.saturating_add(999) >= read_at_ms
+    } else {
+        activity_ms > read_at_ms
+    }
+}
+
+/// 墓碑是否覆盖了当前活动（本回合已读）：
+/// * 毫秒级活动：`read_at >= activity`；
+/// * 秒级活动：必须严格晚于该秒（`read_at > activity + 999`）才算已读。
+fn read_covers_activity(read_at_ms: i64, activity_ms: i64) -> bool {
+    if activity_ms % 1000 == 0 {
+        read_at_ms > activity_ms.saturating_add(999)
+    } else {
+        read_at_ms >= activity_ms
+    }
+}
+
 /// 首次转绿 INSERT 是否应因“本回合已读”而跳过：
 /// * 有待重试标记：墓碑 >= since（本次转绿后）→ 跳过；
 /// * 无标记（含重启后标记丢失）：墓碑 >= 卡片最后活动 → 视为本回合已读，跳过；
@@ -417,10 +439,29 @@ fn insert_should_skip_for_read(
     match pending_since_ms {
         Some(since) => !retry_insert_allowed(since, read_at),
         None => match (read_at, activity_ms) {
-            (Some(read), Some(activity)) => read >= activity,
+            (Some(read), Some(activity)) => read_covers_activity(read, activity),
             _ => false,
         },
     }
+}
+
+/// 首次入池的统一判据：本回合已读 → 不插；prev=None + 墓碑 → 只有活动可能属于
+/// 当前回合才允许（旧卡不得复活）；其余沿用迁移触发规则。
+fn unread_insert_allowed(
+    prev: Option<&str>,
+    read_at: Option<i64>,
+    activity_ms: Option<i64>,
+    pending_since_ms: Option<i64>,
+) -> bool {
+    if insert_should_skip_for_read(pending_since_ms, read_at, activity_ms) {
+        return false;
+    }
+    if prev.is_none() {
+        if let Some(read) = read_at {
+            return activity_ms.is_some_and(|a| activity_may_be_after(a, read));
+        }
+    }
+    insert_allowed(prev, read_at.is_some())
 }
 
 /// 数据驱动绿卡预过滤的保留判据：待重试优先，否则沿用“上一轮绿 + 池无行 ⇒ 剔除”。
@@ -2176,13 +2217,14 @@ fn sync_unread_sessions(active: &mut Vec<Session>, deleted_workbuddy: &HashSet<S
             };
             match unread_pool_action(prev.as_deref(), true) {
                 UnreadPoolAction::Insert => {
-                    let was_read =
-                        crate::database::dao::unread::was_read_recently(&tool, &s.id, now_ms);
                     let read_at = crate::database::dao::unread::read_tombstone_at(&tool, &s.id);
                     let pending_since = unread_retry_pending_since(&tool, &s.id);
-                    let skip_for_read =
-                        insert_should_skip_for_read(pending_since, read_at, session_activity_ms(s));
-                    if !skip_for_read && insert_allowed(prev.as_deref(), was_read) {
+                    if unread_insert_allowed(
+                        prev.as_deref(),
+                        read_at,
+                        session_activity_ms(s),
+                        pending_since,
+                    ) {
                         if crate::database::dao::unread::try_upsert(&record) {
                             clear_unread_retry(&tool, &s.id);
                         } else {
@@ -2808,7 +2850,8 @@ mod unread_card_tests {
     use super::{
         build_unread_cards, clear_unread_retry, filter_deleted_unread, insert_should_skip_for_read,
         keep_green_card, mark_active_unread_cards, mark_unread_retry, retain_read_completed_cards,
-        retry_insert_allowed, unread_retry_pending, unread_retry_pending_since,
+        retry_insert_allowed, unread_insert_allowed, unread_retry_pending,
+        unread_retry_pending_since,
     };
     use crate::database::dao::unread::UnreadSessionRecord;
     use crate::session::model::{AgentType, ProcessForm, Session, SessionStatus};
@@ -2887,6 +2930,39 @@ mod unread_card_tests {
         assert!(!insert_should_skip_for_read(None, Some(1_000), Some(1_500)));
         assert!(insert_should_skip_for_read(None, Some(2_000), Some(1_500)));
         assert!(!insert_should_skip_for_read(None, None, Some(1_500)));
+
+        // P2-1：缓存失忆 + 旧墓碑 + 新活动 → 允许；墓碑覆盖活动/无活动 → 不插
+        assert!(unread_insert_allowed(None, Some(1_000), Some(1_500), None));
+        assert!(!unread_insert_allowed(None, Some(2_000), Some(1_500), None));
+        assert!(!unread_insert_allowed(None, Some(1_000), None, None));
+        assert!(unread_insert_allowed(
+            Some("Processing"),
+            Some(1_000),
+            Some(1_500),
+            None
+        ));
+        // P2-2：秒级活动与毫秒墓碑同秒 → 不判已读；毫秒级照常
+        assert!(!insert_should_skip_for_read(
+            None,
+            Some(10_000_300),
+            Some(10_000_000)
+        ));
+        assert!(insert_should_skip_for_read(
+            None,
+            Some(11_000_100),
+            Some(10_000_000)
+        ));
+        assert!(insert_should_skip_for_read(
+            None,
+            Some(10_000_900),
+            Some(10_000_800)
+        ));
+        assert!(unread_insert_allowed(
+            None,
+            Some(10_000_300),
+            Some(10_000_000),
+            None
+        ));
         clear_unread_retry("codex", "retry-test");
         assert!(!unread_retry_pending("codex", "retry-test"));
     }
