@@ -709,34 +709,155 @@ fn prune_pending_unread_retries(now_ms: i64) {
     }
 }
 
-fn mark_unread_retry(tool: &str, sid: &str, since_ms: i64, persist: bool) -> bool {
-    let changed = {
-        let mut guard = PENDING_UNREAD_RETRIES.lock().unwrap();
-        let key = (tool.to_string(), sid.to_string());
-        match guard.entry(key) {
-            std::collections::hash_map::Entry::Occupied(_) => false, // 重复失败且 since 未变：不重写
-            std::collections::hash_map::Entry::Vacant(e) => {
-                e.insert(since_ms);
-                true
-            }
+struct PendingRetryStore<'a> {
+    path: std::path::PathBuf,
+    loaded: &'a std::sync::atomic::AtomicBool,
+    dirty: &'a std::sync::atomic::AtomicBool,
+    retries: &'a Mutex<HashMap<(String, String), i64>>,
+}
+
+impl<'a> PendingRetryStore<'a> {
+    #[cfg(test)]
+    fn new(
+        path: std::path::PathBuf,
+        loaded: &'a std::sync::atomic::AtomicBool,
+        dirty: &'a std::sync::atomic::AtomicBool,
+        retries: &'a Mutex<HashMap<(String, String), i64>>,
+    ) -> Self {
+        Self {
+            path,
+            loaded,
+            dirty,
+            retries,
         }
-    };
-    if persist && changed {
-        let _ = persist_pending_unread_retries();
     }
-    changed
+
+    fn global() -> PendingRetryStore<'static> {
+        PendingRetryStore {
+            path: pending_store_path(),
+            loaded: &PENDING_LOADED,
+            dirty: &PENDING_DIRTY,
+            retries: &PENDING_UNREAD_RETRIES,
+        }
+    }
+
+    fn mark(&self, tool: &str, sid: &str, since_ms: i64, persist: bool) -> bool {
+        let changed = {
+            let mut guard = self.retries.lock().unwrap();
+            match guard.entry((tool.to_string(), sid.to_string())) {
+                std::collections::hash_map::Entry::Occupied(_) => false,
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    e.insert(since_ms);
+                    true
+                }
+            }
+        };
+        if persist && changed {
+            let _ = persist_pending_unread_retries_into(
+                &self.path,
+                self.loaded,
+                self.dirty,
+                self.retries,
+            );
+        }
+        changed
+    }
+
+    fn clear(&self, tool: &str, sid: &str, persist: bool) -> bool {
+        let changed = self
+            .retries
+            .lock()
+            .unwrap()
+            .remove(&(tool.to_string(), sid.to_string()))
+            .is_some();
+        if persist && changed {
+            let _ = persist_pending_unread_retries_into(
+                &self.path,
+                self.loaded,
+                self.dirty,
+                self.retries,
+            );
+        }
+        changed
+    }
+
+    fn since(&self, tool: &str, sid: &str) -> Option<i64> {
+        self.retries
+            .lock()
+            .unwrap()
+            .get(&(tool.to_string(), sid.to_string()))
+            .copied()
+    }
+}
+
+#[cfg(test)]
+fn mark_unread_retry(tool: &str, sid: &str, since_ms: i64, persist: bool) -> bool {
+    PendingRetryStore::global().mark(tool, sid, since_ms, persist)
 }
 
 fn clear_unread_retry(tool: &str, sid: &str, persist: bool) -> bool {
-    let changed = PENDING_UNREAD_RETRIES
-        .lock()
-        .unwrap()
-        .remove(&(tool.to_string(), sid.to_string()))
-        .is_some();
-    if persist && changed {
-        let _ = persist_pending_unread_retries();
+    PendingRetryStore::global().clear(tool, sid, persist)
+}
+
+/// 首次转绿入池（生产同步入口的可注入核心）：
+/// 允许插入 → 成功清 pending；失败登记 pending（自动落盘）；不允许插入 → 清 pending。
+#[allow(clippy::too_many_arguments)]
+fn insert_first_green_unread(
+    pending: &PendingRetryStore<'_>,
+    tool: &str,
+    sid: &str,
+    record: &crate::database::dao::unread::UnreadSessionRecord,
+    prev_status: Option<&str>,
+    read_at: Option<i64>,
+    activity: Option<i64>,
+    pending_since: Option<i64>,
+    now_ms: i64,
+    upsert: &dyn Fn(&crate::database::dao::unread::UnreadSessionRecord) -> bool,
+) -> bool {
+    if !unread_insert_allowed(prev_status, read_at, activity, pending_since) {
+        pending.clear(tool, sid, true);
+        return false;
     }
-    changed
+    if upsert(record) {
+        pending.clear(tool, sid, true);
+        true
+    } else {
+        pending.mark(tool, sid, now_ms, true);
+        false
+    }
+}
+
+/// 转绿补插（生产同步入口的可注入核心）：有 pending 才补插；本次已读或池行已存在
+/// → 清 pending；无 pending 且池行存在 → 仅刷新展示字段。
+#[allow(clippy::too_many_arguments)]
+fn retry_pending_unread(
+    pending: &PendingRetryStore<'_>,
+    tool: &str,
+    sid: &str,
+    record: &crate::database::dao::unread::UnreadSessionRecord,
+    read_at: Option<i64>,
+    upsert: &dyn Fn(&crate::database::dao::unread::UnreadSessionRecord) -> bool,
+    exists: &dyn Fn(&str, &str) -> bool,
+    refresh: &dyn Fn(&crate::database::dao::unread::UnreadSessionRecord),
+) -> bool {
+    if let Some(since) = pending.since(tool, sid) {
+        if !retry_insert_allowed(since, read_at) || exists(tool, sid) {
+            pending.clear(tool, sid, true);
+            return false;
+        }
+        if upsert(record) {
+            pending.clear(tool, sid, true);
+            true
+        } else {
+            pending.mark(tool, sid, since, true);
+            false
+        }
+    } else {
+        if exists(tool, sid) {
+            refresh(record);
+        }
+        false
+    }
 }
 
 fn unread_retry_pending(tool: &str, sid: &str) -> bool {
@@ -2550,6 +2671,7 @@ fn filter_deleted_unread(
 ///   已读删行后由 get_all_sessions 的前置过滤剔除，闭环「被已读信号清除」
 fn sync_unread_sessions(active: &mut Vec<Session>, deleted_workbuddy: &HashSet<String>) {
     let now_ms = chrono::Utc::now().timestamp_millis();
+    let pending = PendingRetryStore::global();
 
     // 0) 删除状态贯穿未读池：先物理删除已删会话的池行，再做本轮合并。
     //    deleted_workbuddy 为空（DB 不可读/无删除）时不动任何行。
@@ -2582,39 +2704,37 @@ fn sync_unread_sessions(active: &mut Vec<Session>, deleted_workbuddy: &HashSet<S
                 UnreadPoolAction::Insert => {
                     let read_at = crate::database::dao::unread::read_tombstone_at(&tool, &s.id);
                     let pending_since = unread_retry_pending_since(&tool, &s.id);
-                    if unread_insert_allowed(
+                    let inserted = insert_first_green_unread(
+                        &pending,
+                        &tool,
+                        &s.id,
+                        &record,
                         prev.as_deref(),
                         read_at,
                         session_activity_ms(s),
                         pending_since,
-                    ) {
-                        if crate::database::dao::unread::try_upsert(&record) {
-                            clear_unread_retry(&tool, &s.id, true);
-                        } else {
-                            mark_unread_retry(&tool, &s.id, now_ms, true);
-                            log::warn!("unread: 首次转绿入池失败（{} {}），下轮重试", tool, s.id);
-                        }
-                    } else {
-                        clear_unread_retry(&tool, &s.id, true);
+                        now_ms,
+                        &|r| crate::database::dao::unread::try_upsert(r),
+                    );
+                    if !inserted && pending.since(&tool, &s.id).is_some() {
+                        log::warn!("unread: 首次转绿入池失败（{} {}），下轮重试", tool, s.id);
                     }
                 }
                 UnreadPoolAction::RefreshDisplay => {
                     // 只有显式“待重试”才补插；池无行但没有标记 = 已读/过期，不得复活。
-                    if let Some(since) = unread_retry_pending_since(&tool, &s.id) {
-                        let read_at = crate::database::dao::unread::read_tombstone_at(&tool, &s.id);
-                        if !retry_insert_allowed(since, read_at)
-                            || crate::database::dao::unread::exists(&tool, &s.id)
-                        {
-                            // 本次转绿之后已读，或池行已存在 → 取消重试
-                            clear_unread_retry(&tool, &s.id, true);
-                        } else if crate::database::dao::unread::try_upsert(&record) {
-                            clear_unread_retry(&tool, &s.id, true);
-                        } else {
-                            mark_unread_retry(&tool, &s.id, since, true);
-                            log::warn!("unread: 转绿补插失败（{} {}），下轮重试", tool, s.id);
-                        }
-                    } else if crate::database::dao::unread::exists(&tool, &s.id) {
-                        crate::database::dao::unread::refresh_display(&record);
+                    let read_at = crate::database::dao::unread::read_tombstone_at(&tool, &s.id);
+                    let retried = retry_pending_unread(
+                        &pending,
+                        &tool,
+                        &s.id,
+                        &record,
+                        read_at,
+                        &|r| crate::database::dao::unread::try_upsert(r),
+                        &|t, sid| crate::database::dao::unread::exists(t, sid),
+                        &|r| crate::database::dao::unread::refresh_display(r),
+                    );
+                    if !retried && pending.since(&tool, &s.id).is_some() {
+                        log::warn!("unread: 转绿补插失败（{} {}），下轮重试", tool, s.id);
                     }
                 }
                 UnreadPoolAction::None => {}
@@ -3211,12 +3331,13 @@ mod sort_tests {
 #[cfg(test)]
 mod unread_card_tests {
     use super::{
-        build_unread_cards, clear_unread_retry, filter_deleted_unread, insert_should_skip_for_read,
-        keep_green_card, load_pending_map, load_pending_unread_retries_into,
-        mark_active_unread_cards, mark_unread_retry, pending_backup_path, pending_key,
-        persist_pending_map, persist_pending_unread_retries_into, replace_pending_file_with_backup,
-        retain_read_completed_cards, retry_insert_allowed, unread_insert_allowed,
-        unread_retry_pending, unread_retry_pending_since, PendingLoad,
+        build_unread_cards, clear_unread_retry, filter_deleted_unread, insert_first_green_unread,
+        insert_should_skip_for_read, keep_green_card, load_pending_map,
+        load_pending_unread_retries_into, mark_active_unread_cards, mark_unread_retry,
+        pending_backup_path, pending_key, persist_pending_map, persist_pending_unread_retries_into,
+        replace_pending_file_with_backup, retain_read_completed_cards, retry_insert_allowed,
+        retry_pending_unread, unread_insert_allowed, unread_retry_pending,
+        unread_retry_pending_since, PendingLoad, PendingRetryStore,
     };
     use crate::database::dao::unread::UnreadSessionRecord;
     use crate::session::model::{AgentType, ProcessForm, Session, SessionStatus};
@@ -3617,55 +3738,102 @@ mod unread_card_tests {
         use crate::database::dao::unread;
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("tuvis.db");
-        let since = chrono::Utc::now().timestamp_millis();
+        let path = dir.path().join("unread_pending_retries.json");
+        let now = chrono::Utc::now().timestamp_millis();
         let record = UnreadSessionRecord {
             tool_id: "workbuddy".into(),
             session_id: "s-restart".into(),
             project_name: "p".into(),
             title: None,
             last_message: None,
-            turned_green_at_ms: since,
-            expires_at_ms: since + 24 * 3600 * 1000,
+            turned_green_at_ms: now,
+            expires_at_ms: now + 24 * 3600 * 1000,
         };
 
-        // 真实 SQLite 失败：表尚未建立 → INSERT 返回 false
+        // 首次转绿：真实 SQLite 缺表 → upsert 失败 → 生产 helper 自动登记 pending 并落盘
         let conn = rusqlite::Connection::open(&db_path).unwrap();
-        assert!(
-            !unread::upsert_unread(&conn, &record),
-            "缺表时必须真实插入失败"
+        let loaded = AtomicBool::new(true); // 启动恢复已完成（文件不存在）
+        let dirty = AtomicBool::new(false);
+        let retries = Mutex::new(HashMap::new());
+        let store = PendingRetryStore::new(path.clone(), &loaded, &dirty, &retries);
+        let inserted = insert_first_green_unread(
+            &store,
+            "workbuddy",
+            "s-restart",
+            &record,
+            None,
+            None,
+            Some(now),
+            None,
+            now,
+            &|r| unread::upsert_unread(&conn, r),
+        );
+        assert!(!inserted, "缺表时必须真实插入失败");
+        assert_eq!(store.since("workbuddy", "s-restart"), Some(now));
+        assert_eq!(
+            loaded_map(&path).and_then(|m| m.get("workbuddy\u{1f}s-restart").copied()),
+            Some(now),
+            "pending 必须由生产 helper 自动落盘"
         );
         drop(conn);
-
-        let path = dir.path().join("unread_pending_retries.json");
-        let mut pending = HashMap::new();
-        pending.insert("workbuddy\u{1f}s-restart".to_string(), since);
-        assert!(persist_pending_map(&path, &pending));
 
         // 模拟重启：新连接 + 建表 + 新内存状态从 pending 文件恢复
         let conn = rusqlite::Connection::open(&db_path).unwrap();
         crate::database::schema::init(&conn);
-        let loaded = AtomicBool::new(false);
-        let retries = Mutex::new(HashMap::new());
-        load_pending_unread_retries_into(&path, &loaded, &retries);
-        assert!(loaded.load(Ordering::Acquire));
-        assert_eq!(
-            retries
-                .lock()
-                .unwrap()
-                .get(&("workbuddy".to_string(), "s-restart".to_string())),
-            Some(&since)
+        let loaded2 = AtomicBool::new(false);
+        let dirty2 = AtomicBool::new(false);
+        let retries2 = Mutex::new(HashMap::new());
+        load_pending_unread_retries_into(&path, &loaded2, &retries2);
+        assert!(loaded2.load(Ordering::Acquire));
+        let store2 = PendingRetryStore::new(path.clone(), &loaded2, &dirty2, &retries2);
+        let retried = retry_pending_unread(
+            &store2,
+            "workbuddy",
+            "s-restart",
+            &record,
+            None,
+            &|r| unread::upsert_unread(&conn, r),
+            &|t, sid| unread::exists_unread_conn(&conn, t, sid),
+            &|r| unread::refresh_display_unread(&conn, r),
         );
-        assert!(unread::upsert_unread(&conn, &record), "恢复后补插应成功");
+        assert!(retried, "恢复后补插应成功");
+        assert_eq!(store2.since("workbuddy", "s-restart"), None);
         assert!(unread::exists_unread_conn(&conn, "workbuddy", "s-restart"));
-        assert!(persist_pending_map(&path, &HashMap::new()));
+        assert_eq!(loaded_map(&path), Some(HashMap::new()));
 
-        // 失败后用户已读再重启：墓碑覆盖本回合 → 不补插
-        let read_at = since + 1;
-        unread::mark_read_tombstone_conn(&conn, "workbuddy", "s-restart", read_at);
-        assert!(
-            insert_should_skip_for_read(Some(since), Some(read_at), None),
-            "已读墓碑覆盖 pending since 时不得在重启后复活"
+        // 失败后用户已读再重启：墓碑覆盖本回合 → 生产 helper 清 pending 且不建行
+        let read_since = now + 1;
+        let record_read = UnreadSessionRecord {
+            session_id: "s-read".into(),
+            turned_green_at_ms: read_since,
+            expires_at_ms: read_since + 24 * 3600 * 1000,
+            ..record.clone()
+        };
+        assert!(store2.mark("workbuddy", "s-read", read_since, true));
+        unread::mark_read_tombstone_conn(&conn, "workbuddy", "s-read", read_since + 1);
+        drop(conn);
+
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        crate::database::schema::init(&conn);
+        let loaded3 = AtomicBool::new(false);
+        let dirty3 = AtomicBool::new(false);
+        let retries3 = Mutex::new(HashMap::new());
+        load_pending_unread_retries_into(&path, &loaded3, &retries3);
+        let store3 = PendingRetryStore::new(path.clone(), &loaded3, &dirty3, &retries3);
+        let retried_read = retry_pending_unread(
+            &store3,
+            "workbuddy",
+            "s-read",
+            &record_read,
+            Some(read_since + 1),
+            &|r| unread::upsert_unread(&conn, r),
+            &|t, sid| unread::exists_unread_conn(&conn, t, sid),
+            &|r| unread::refresh_display_unread(&conn, r),
         );
+        assert!(!retried_read, "已读覆盖 since 时不得补插");
+        assert_eq!(store3.since("workbuddy", "s-read"), None);
+        assert!(!unread::exists_unread_conn(&conn, "workbuddy", "s-read"));
+        assert_eq!(loaded_map(&path), Some(HashMap::new()));
     }
 
     /// P1：已删会话的未读池行不得合并为卡；其他工具同 id 不受影响。
