@@ -161,10 +161,16 @@ pub fn scan_now_blocking() -> Arc<Snapshot> {
 
 /// 变更后补扫的结果。`applied=false` = 等待在飞扫描超时，返回的是**变更前**的
 /// 旧快照：调用方不得按成功展示（R1），但可照常刷新缓存等下轮扫描。
+///
+/// F5（2026-10-31 定案）：`request_epoch` 是变更**请求时刻**的扫描纪元（调用方在
+/// 任何变更之前捕获）。`applied=false` 时前端保留 pending，直到收到
+/// `epoch > request_epoch` 的 `scan-bus-snapshot` 事件才收口——在飞扫描必然启动于
+/// 请求之前（epoch ≤ request_epoch），其旧快照回写不得让卡片复活。
 #[derive(Debug, Clone)]
 pub struct MutationScan {
     pub snapshot: Arc<Snapshot>,
     pub applied: bool,
+    pub request_epoch: u64,
 }
 
 /// 变更后的补扫（R1）：先**有界**等待当前在飞扫描结束，再执行一次在变更之后
@@ -173,7 +179,10 @@ pub struct MutationScan {
 /// 为什么必须等：在飞扫描可能在变更写入前就已读取隐藏集合/已读池，它发布的快照
 /// 不含本次变更；直接 scan_once 会等它并返回这份**旧**快照，命令报成功但卡片仍在。
 /// 等待期间若有别的线程抢先发起扫描，那次扫描同样在变更之后启动，结果可用。
-pub fn scan_after_mutation(wait: Duration) -> MutationScan {
+///
+/// `request_epoch` 由调用方在**变更之前**捕获（见 [`scan_epoch`]），原样随结果返回：
+/// 超时路径下前端以「epoch 更大的快照事件」作为变更已反映的凭据（F5 定案）。
+pub fn scan_after_mutation(wait: Duration, request_epoch: u64) -> MutationScan {
     let deadline = Instant::now() + wait;
     while IN_FLIGHT.load(Ordering::SeqCst) {
         if Instant::now() >= deadline {
@@ -190,6 +199,7 @@ pub fn scan_after_mutation(wait: Duration) -> MutationScan {
             return MutationScan {
                 snapshot,
                 applied: false,
+                request_epoch,
             };
         }
         std::thread::sleep(Duration::from_millis(10));
@@ -197,6 +207,7 @@ pub fn scan_after_mutation(wait: Duration) -> MutationScan {
     MutationScan {
         snapshot: scan_once(ScanReason::Action),
         applied: true,
+        request_epoch,
     }
 }
 
@@ -992,7 +1003,10 @@ mod tests {
         assert!(user_watching(), "任一窗口在看 = 总体在看");
         assert!(!set_user_watching("pet", false), "单窗退出不是上升沿");
         assert!(user_watching(), "main 仍在看");
-        assert!(!set_user_watching("main", false), "最后一个窗口退出是下降沿");
+        assert!(
+            !set_user_watching("main", false),
+            "最后一个窗口退出是下降沿"
+        );
         assert!(!user_watching(), "全部窗口退出后不再是在看");
         assert!(
             set_user_watching("main", true),
@@ -1393,6 +1407,57 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// F5：变更成功后返回的 `request_epoch` 原样回带，且补扫快照的 epoch（扫描启动
+    /// 序号）必须晚于它——applied=true 的 version 才可当作「变更已反映」的凭据。
+    #[test]
+    fn mutation_success_reports_request_epoch_and_newer_scan_epoch() {
+        let _guard = test_guard();
+        reset_for_test();
+        let seeded = publish_for_test(|| resp(SessionStatus::Idle));
+        let request_epoch = scan_epoch();
+        assert_eq!(request_epoch, seeded.epoch, "入口捕获的是当前已发布的纪元");
+        let result = scan_after_mutation(Duration::from_millis(100), request_epoch);
+        assert!(result.applied, "无在飞扫描时补扫必须成功");
+        assert_eq!(
+            result.request_epoch, request_epoch,
+            "请求纪元必须原样回带（前端以此做 epoch 门控）"
+        );
+        assert!(
+            result.snapshot.epoch > request_epoch,
+            "applied=true 的快照必须来自晚于请求启动的扫描（{} -> {}）",
+            request_epoch,
+            result.snapshot.epoch
+        );
+        assert_eq!(
+            result.snapshot.epoch,
+            scan_epoch(),
+            "返回快照携带的正是最近一次启动的扫描纪元"
+        );
+    }
+
+    /// F5：超时（applied=false）路径仍必须回带请求纪元——前端据此等待
+    /// `epoch > request_epoch` 的快照事件，而不是立刻清 pending。
+    #[test]
+    fn mutation_timeout_still_reports_request_epoch() {
+        let _guard = test_guard();
+        reset_for_test();
+        let seeded = publish_for_test(|| resp(SessionStatus::Idle));
+        let (tx, _rx) = mpsc::channel();
+        set_test_tx_for_test(Some(tx));
+        set_in_flight_for_test(true);
+        let request_epoch = scan_epoch();
+        let result = scan_after_mutation(Duration::from_millis(50), request_epoch);
+        assert!(!result.applied);
+        assert_eq!(result.request_epoch, request_epoch);
+        assert!(
+            result.snapshot.epoch <= request_epoch,
+            "超时返回的是变更前的旧快照（epoch 不得越过请求纪元）"
+        );
+        assert_eq!(result.snapshot.epoch, seeded.epoch);
+        set_test_tx_for_test(None);
+        set_in_flight_for_test(false);
+    }
+
     /// R8：变更补扫等待在飞超时后，必须补排一次 Action——
     /// 否则在飞扫描早于变更，旧快照发布后卡片要等 10–30s 才收敛。
     #[test]
@@ -1404,8 +1469,10 @@ mod tests {
         set_test_tx_for_test(Some(tx));
         set_in_flight_for_test(true); // 占位：模拟早于变更启动的在飞扫描
         let before_scans = scan_total();
-        let result = scan_after_mutation(Duration::from_millis(100));
+        let request_epoch = scan_epoch();
+        let result = scan_after_mutation(Duration::from_millis(100), request_epoch);
         assert!(!result.applied, "在飞超时必须 applied=false");
+        assert_eq!(result.request_epoch, request_epoch);
         assert!(is_degraded(), "超时必须进入 degraded 30s 窗口");
 
         // 模拟扫描线程消费补排的 Action 并完成一次新扫描
@@ -1488,11 +1555,15 @@ mod tests {
     #[test]
     fn clear_timeout_keeps_newer_timeout_on_cas_conflict() {
         let mut cas_calls = Vec::new();
-        clear_timeout_after(100, || 50, |expected, new| {
-            cas_calls.push((expected, new));
-            // 模拟并发 note_timeout 在 load 与 CAS 之间写入更新的超时时刻
-            Err(150)
-        });
+        clear_timeout_after(
+            100,
+            || 50,
+            |expected, new| {
+                cas_calls.push((expected, new));
+                // 模拟并发 note_timeout 在 load 与 CAS 之间写入更新的超时时刻
+                Err(150)
+            },
+        );
         assert_eq!(
             cas_calls,
             vec![(50, 0)],
@@ -1504,10 +1575,14 @@ mod tests {
     #[test]
     fn clear_timeout_stops_when_concurrent_publish_already_cleared() {
         let mut cas_calls = 0;
-        clear_timeout_after(100, || 50, |_, _| {
-            cas_calls += 1;
-            Err(0)
-        });
+        clear_timeout_after(
+            100,
+            || 50,
+            |_, _| {
+                cas_calls += 1;
+                Err(0)
+            },
+        );
         assert_eq!(cas_calls, 1, "读到最新值 0 后应退出重试循环");
     }
 
@@ -1515,10 +1590,14 @@ mod tests {
     #[test]
     fn clear_timeout_clears_once_when_cas_succeeds() {
         let mut cas_calls = Vec::new();
-        clear_timeout_after(100, || 50, |expected, new| {
-            cas_calls.push((expected, new));
-            Ok(expected)
-        });
+        clear_timeout_after(
+            100,
+            || 50,
+            |expected, new| {
+                cas_calls.push((expected, new));
+                Ok(expected)
+            },
+        );
         assert_eq!(cas_calls, vec![(50, 0)]);
 
         let mut cas_calls = 0;

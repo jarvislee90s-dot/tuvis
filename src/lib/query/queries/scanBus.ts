@@ -24,7 +24,7 @@ import { QueryClientContext } from "@tanstack/react-query";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
-import { SESSIONS_QUERY_KEY } from "@/lib/query/optimisticSessions";
+import { SESSIONS_QUERY_KEY, noteAppliedSnapshotEpoch } from "@/lib/query/optimisticSessions";
 import { queryClient as appQueryClient } from "@/lib/query/queryClient";
 import type { SessionsResponse } from "@/types/session";
 
@@ -118,6 +118,9 @@ export function useScanSnapshotSync(enabled = true): void {
       // 先记水位再写缓存：写入期间重入/并发事件不会重复应用同一版本
       snapshotVersionByWindow.set(windowLabel, version);
       queryClient.setQueryData(SESSIONS_QUERY_KEY, payload.data);
+      // F5（Task 3）：把已应用的 epoch 报给变更结算层——补扫超时路径的后续扫描
+      // 事件可能先于 applied=false 回执处理到达，结算据此立即收口而非空等 10s
+      if (typeof payload.epoch === "number") noteAppliedSnapshotEpoch(payload.epoch);
     }).catch(() => () => {});
     return () => {
       alive = false;

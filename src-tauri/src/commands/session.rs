@@ -158,6 +158,7 @@ mod r1_mutation_scan_tests {
                 status: "idle".to_string(),
             })
             .collect();
+        let request_epoch = scan_bus::scan_epoch();
         let result = apply_dismissals(items, |_, _| {});
         assert_eq!(
             scan_bus::scan_total() - before_scans,
@@ -165,6 +166,11 @@ mod r1_mutation_scan_tests {
             "批量 10 项只能触发 1 次扫描（N 张卡 ≠ N 次扫描）"
         );
         assert!(result.applied, "无在飞扫描时批量补扫必须视为已应用");
+        assert_eq!(result.request_epoch, request_epoch);
+        assert!(
+            result.snapshot.epoch > result.request_epoch,
+            "已应用快照必须来自晚于请求启动的扫描"
+        );
         assert!(
             result.snapshot.version > before_version,
             "返回版本 {} 必须晚于变更前 {}",
@@ -180,6 +186,60 @@ mod r1_mutation_scan_tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
+    }
+
+    /// F5：`request_epoch` 必须在**任何变更之前**捕获。用例在变更中途（emit_read
+    /// 回调内）启动一次新扫描把 epoch 推高：若实现把捕获放在变更之后，返回值会
+    /// 越过这次扫描，前端会在旧快照上提前收口（卡片复活）。
+    #[test]
+    fn request_epoch_is_captured_before_any_mutation() {
+        let _guard = scan_bus::test_guard();
+        scan_bus::reset_for_test();
+        let _ = scan_bus::publish_for_test(empty_resp);
+        let now = chrono::Utc::now().timestamp_millis();
+        crate::database::dao::unread::upsert(&crate::database::dao::unread::UnreadSessionRecord {
+            tool_id: "claude".to_string(),
+            session_id: "f5-epoch-order".to_string(),
+            project_name: "p".to_string(),
+            title: None,
+            last_message: None,
+            turned_green_at_ms: now,
+            expires_at_ms: now + 3_600_000,
+        });
+        let before = scan_bus::scan_epoch();
+        let mid_scan_epoch = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let sink = mid_scan_epoch.clone();
+        let result = apply_dismissals(
+            vec![DismissItem {
+                agent_type: "claude".to_string(),
+                session_id: "f5-epoch-order".to_string(),
+                status: "idle".to_string(),
+            }],
+            move |_, _| {
+                // 变更进行中另一轮扫描启动（emit_read 只在未读分支调用）
+                let snap = scan_bus::publish_for_test(empty_resp);
+                *sink.lock().unwrap_or_else(|e| e.into_inner()) = Some(snap.epoch);
+            },
+        );
+        let mid = mid_scan_epoch
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .expect("未读项必须走 emit_read 分支");
+        assert_eq!(
+            result.request_epoch, before,
+            "request_epoch 必须是入口（变更前）捕获的纪元"
+        );
+        assert!(
+            mid > result.request_epoch,
+            "变更中途的扫描 epoch（{mid}）必须晚于 request_epoch（{}）",
+            result.request_epoch
+        );
+        assert!(
+            result.snapshot.epoch > mid,
+            "变更后的补扫快照 epoch（{}）必须晚于变更中途的扫描（{mid}）",
+            result.snapshot.epoch
+        );
+        crate::database::dao::unread::delete("claude", "f5-epoch-order");
     }
 }
 
@@ -525,11 +585,16 @@ pub fn focus_hwnd(hwnd: isize) -> Result<(), String> {
 }
 
 /// 变更类命令的统一回执（R1）：`applied=false` = 变更后补扫等待超时（degraded），
-/// 前端必须照常失效缓存但不得按成功展示。`version` = 返回快照的发布版本。
+/// 前端不得按成功展示。`version` = 返回快照的发布版本。
+///
+/// F5（2026-10-31 定案）：`epoch` = 变更**请求时刻**的扫描纪元（命令入口、任何变更
+/// 之前捕获）。`applied=false` 时前端保留 pending，以 `epoch > 该值` 的
+/// `scan-bus-snapshot` 事件作为「变更已反映到权威快照」的凭据（有界 10s 超时收口）。
 #[derive(Debug, Clone, Copy, serde::Serialize)]
 pub struct MutationOutcome {
     pub applied: bool,
     pub version: u64,
+    pub epoch: u64,
 }
 
 /// 批量隐藏项（R1 一键清除）：字段 camelCase 对齐前端 invoke 载荷
@@ -544,10 +609,15 @@ pub struct DismissItem {
 /// 批量变更内核（R1，测试可直调）：逐项按**未读池权威**分流——
 /// 未读卡走已读语义（与单卡 mark_session_read 同口径），其余写进程内 dismiss 集合；
 /// 全部变更完成后**只补扫一次**（N 张卡 ≠ N 次扫描）。
+///
+/// F5：`request_epoch` 必须在**任何变更之前**捕获（入口第一行）——`applied=false`
+/// 时前端以 epoch 更大的快照事件作为变更已反映的凭据；若在变更后才捕获，在飞旧快照
+/// 的 epoch 可能已越过捕获值，前端会提前清 pending 导致卡片复活。
 fn apply_dismissals(
     items: Vec<DismissItem>,
     emit_read: impl Fn(&str, &str),
 ) -> crate::adapter::scan_bus::MutationScan {
+    let request_epoch = crate::adapter::scan_bus::scan_epoch();
     let now = chrono::Utc::now().timestamp_millis();
     let unread: std::collections::HashSet<(String, String)> =
         crate::database::dao::unread::list(now)
@@ -574,7 +644,7 @@ fn apply_dismissals(
             set.insert(item);
         }
     }
-    crate::adapter::scan_bus::scan_after_mutation(std::time::Duration::from_secs(2))
+    crate::adapter::scan_bus::scan_after_mutation(std::time::Duration::from_secs(2), request_epoch)
 }
 
 /// 手动关闭活跃 App 卡（T2 X 按钮，「暂离不提示」）：写入进程内 dismiss 集合，
@@ -599,6 +669,8 @@ pub async fn dismiss_session_card(
         session_id,
         status,
     };
+    // F5：命令入口（任何变更之前）的纪元——阻塞任务异常时回执仍可被前端 epoch 门控
+    let request_epoch = crate::adapter::scan_bus::scan_epoch();
     // R1：完整扫描（可能等在飞 2s）放进阻塞线程池，命令本身不跑扫描
     let result = tauri::async_runtime::spawn_blocking(move || {
         apply_dismissals(vec![item], |agent_type, session_id| {
@@ -613,12 +685,14 @@ pub async fn dismiss_session_card(
         Ok(result) => MutationOutcome {
             applied: result.applied,
             version: result.snapshot.version,
+            epoch: result.request_epoch,
         },
         Err(e) => {
             ::log::error!("dismiss 变更后补扫任务异常: {e}");
             MutationOutcome {
                 applied: false,
                 version: crate::adapter::scan_bus::version(),
+                epoch: request_epoch,
             }
         }
     }
@@ -631,6 +705,8 @@ pub async fn dismiss_session_cards(
     app: tauri::AppHandle,
     items: Vec<DismissItem>,
 ) -> MutationOutcome {
+    // F5：命令入口（任何变更之前）的纪元（与单卡同口径）
+    let request_epoch = crate::adapter::scan_bus::scan_epoch();
     let result = tauri::async_runtime::spawn_blocking(move || {
         apply_dismissals(items, |agent_type, session_id| {
             let _ = app.emit(
@@ -644,12 +720,14 @@ pub async fn dismiss_session_cards(
         Ok(r) => MutationOutcome {
             applied: r.applied,
             version: r.snapshot.version,
+            epoch: r.request_epoch,
         },
         Err(e) => {
             ::log::error!("一键清除补扫任务异常: {e}");
             MutationOutcome {
                 applied: false,
                 version: crate::adapter::scan_bus::version(),
+                epoch: request_epoch,
             }
         }
     }

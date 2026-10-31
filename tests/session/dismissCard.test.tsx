@@ -3,7 +3,7 @@
 // 未读卡点 X 维持已读语义（mark_session_read）；CLI 卡不显示 X。
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const { invokeMock } = vi.hoisted(() => ({ invokeMock: vi.fn() }));
 
@@ -13,6 +13,10 @@ vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn(async () => () => {}) })
 // tests/setup.ts 未初始化 i18n，显式引入（fallbackLng=en，与断言文案一致）
 import i18n from "@/i18n";
 import { SessionCard } from "@/components/sessions/SessionCard";
+import {
+  __resetSessionMutationWaitersForTest,
+  clearPendingSessions,
+} from "@/lib/query/optimisticSessions";
 import type { Session } from "@/types/session";
 
 void i18n;
@@ -40,7 +44,12 @@ const mk = (over: Partial<Session>): Session => ({
 
 beforeEach(() => {
   invokeMock.mockReset();
-  invokeMock.mockResolvedValue({ applied: true, version: 1 });
+  invokeMock.mockResolvedValue({ applied: true, version: 1, epoch: 1 });
+  clearPendingSessions([{ id: "s1", agentType: "workbuddy" }]);
+});
+
+afterEach(() => {
+  __resetSessionMutationWaitersForTest();
 });
 
 /** SessionCard 通过 useQueryClient 在关闭成功后失效 ["sessions"]，测试需真 Provider */
@@ -106,13 +115,17 @@ describe("App 卡 X 关闭（T2）", () => {
     await waitFor(() => expect(invalidate).toHaveBeenCalledWith({ queryKey: ["sessions"] }));
   });
 
-  it("补扫降级（applied=false）仍失效缓存，但不按成功展示", async () => {
-    invokeMock.mockResolvedValue({ applied: false, version: 3 });
+  it("补扫降级（applied=false）保留 pending 等待 epoch 更大的快照，不立即 invalidate", async () => {
+    invokeMock.mockResolvedValue({ applied: false, version: 3, epoch: 7 });
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     const invalidate = renderCard(mk({ status: "waiting", form: "app", unread: false }));
     fireEvent.click(screen.getByRole("button", { name: /Hide for now/i }));
-    await waitFor(() => expect(invalidate).toHaveBeenCalledWith({ queryKey: ["sessions"] }));
-    expect(warn).toHaveBeenCalled();
+    await waitFor(() => expect(invokeMock).toHaveBeenCalled());
+    await waitFor(() => expect(warn).toHaveBeenCalled());
+    // F5 定案：applied=false 不得立刻 invalidate + 清 pending（旧快照会让卡片复活），
+    // 等待器必须保留到 `epoch > outcome.epoch` 的快照事件（或 10s 超时）。
+    expect(invalidate).not.toHaveBeenCalled();
+    expect(warn.mock.calls[0]?.[0]).toContain("applied=false");
     warn.mockRestore();
   });
 });

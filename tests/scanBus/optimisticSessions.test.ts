@@ -1,12 +1,16 @@
-// G1：乐观隐藏生命周期单测——未读态 vs 整卡、数据驱动聚合绿卡、pending 防回写。
+// F5 卡片生命周期单测：单卡/批量共用同一套分类与乐观执行。
+//  - getSessionDismissBehavior：普通未读 → markReadKeep；数据驱动聚合绿卡（未读）→
+//    markReadAndRemove；其余 → dismiss；
+//  - applyOptimisticSessionMutation：一次 setQueryData，计数只按实际移除数扣减；
+//  - pending 拦截旧快照回写：read 保留卡面但未读不复活、hidden 整卡不复活。
 import { QueryClient } from "@tanstack/react-query";
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   SESSIONS_QUERY_KEY,
+  applyOptimisticSessionMutation,
   applyPendingSessions,
   clearPendingSessions,
-  hideSessionOptimistically,
-  hideSessionsOptimistically,
+  getSessionDismissBehavior,
   isDataDrivenGreenCard,
   markPendingSession,
 } from "@/lib/query/optimisticSessions";
@@ -43,60 +47,145 @@ const seed = (sessions: Session[]): SessionsResponse => ({
 
 const cache = (qc: QueryClient) => qc.getQueryData<SessionsResponse>(SESSIONS_QUERY_KEY)!;
 
+const ALL_TARGETS = [
+  { id: "s1", agentType: "workbuddy" },
+  { id: "s2", agentType: "workbuddy" },
+  { id: "t1", agentType: "workbuddy" },
+  { id: "g1", agentType: "codex" },
+  { id: "r1", agentType: "claude" },
+];
+
 beforeEach(() => {
-  // 清空模块级 pending（每个用例独立）
-  const qc = new QueryClient();
-  qc.setQueryData(
-    SESSIONS_QUERY_KEY,
-    seed([mk({ id: "s1" }), mk({ id: "s2" }), mk({ id: "t1" }), mk({ id: "t2" }), mk({ id: "t3" })])
-  );
-  clearPendingSessions(
-    ["s1", "s2", "t1", "t2", "t3"].map((id) => ({ id, agentType: "workbuddy" }))
-  );
+  clearPendingSessions(ALL_TARGETS);
 });
 
-describe("optimisticSessions / G1 生命周期", () => {
-  it("非未读卡：整卡从缓存移除并同步计数", () => {
-    const qc = new QueryClient();
-    qc.setQueryData(SESSIONS_QUERY_KEY, seed([mk({}), mk({ id: "s2", status: "idle" })]));
-    hideSessionOptimistically(qc, mk({}));
-    const next = cache(qc);
-    expect(next.sessions.map((s) => s.id)).toEqual(["s2"]);
-    expect(next.totalCount).toBe(1);
+describe("getSessionDismissBehavior（单卡/批量唯一分类）", () => {
+  it("普通未读卡 → markReadKeep", () => {
+    expect(
+      getSessionDismissBehavior(mk({ agentType: "claude", status: "idle", unread: true }))
+    ).toBe("markReadKeep");
   });
 
-  it("普通未读卡：只把 unread 置 false（卡面保留）", () => {
-    const qc = new QueryClient();
-    const session = mk({ agentType: "claude", status: "idle", unread: true });
-    qc.setQueryData(SESSIONS_QUERY_KEY, seed([session]));
-    hideSessionOptimistically(qc, session);
-    const next = cache(qc);
-    expect(next.sessions).toHaveLength(1);
-    expect(next.sessions[0].unread).toBe(false);
-    expect(applyPendingSessions(next.sessions)[0].unread).toBe(false);
-  });
-
-  it("数据驱动聚合绿卡（codex/zcode/dsh App idle/finished）已读 → 整卡移除", () => {
+  it("数据驱动聚合绿卡（codex/zcode/dsh App idle/finished）未读 → markReadAndRemove", () => {
     for (const agentType of ["codex", "zcode", "dsh"] as const) {
-      expect(isDataDrivenGreenCard(mk({ agentType, status: "finished", form: "app" }))).toBe(true);
-      const qc = new QueryClient();
-      const session = mk({ agentType, status: "finished", form: "app", unread: true });
-      qc.setQueryData(SESSIONS_QUERY_KEY, seed([session]));
-      hideSessionOptimistically(qc, session);
-      expect(cache(qc).sessions).toHaveLength(0);
-      clearPendingSessions([session]);
+      for (const status of ["idle", "finished"] as const) {
+        const s = mk({ agentType, form: "app", status, unread: true });
+        expect(isDataDrivenGreenCard(s)).toBe(true);
+        expect(getSessionDismissBehavior(s)).toBe("markReadAndRemove");
+      }
     }
-    // CLI 形态 / 非绿灯：不算数据驱动聚合卡
-    expect(isDataDrivenGreenCard(mk({ agentType: "codex", status: "idle", form: "cli" }))).toBe(
-      false
-    );
-    expect(isDataDrivenGreenCard(mk({ agentType: "codex", status: "waiting", form: "app" }))).toBe(
-      false
-    );
-    clearPendingSessions([{ id: "s1", agentType: "workbuddy" }]);
+    // CLI 形态 / 非绿态：数据驱动绿卡规则不成立（普通未读 → 保留）
+    expect(
+      getSessionDismissBehavior(
+        mk({ agentType: "codex", form: "cli", status: "idle", unread: true })
+      )
+    ).toBe("markReadKeep");
+    expect(
+      getSessionDismissBehavior(
+        mk({ agentType: "codex", form: "app", status: "waiting", unread: true })
+      )
+    ).toBe("markReadKeep");
   });
 
-  it("pending=read：轮询回写旧快照时未读态不复活", () => {
+  it("已读卡（含绿卡）→ dismiss（整卡移除）", () => {
+    expect(getSessionDismissBehavior(mk({ status: "waiting", unread: false }))).toBe("dismiss");
+    expect(
+      getSessionDismissBehavior(
+        mk({ agentType: "codex", form: "app", status: "finished", unread: false })
+      )
+    ).toBe("dismiss");
+  });
+});
+
+describe("applyOptimisticSessionMutation / 单卡", () => {
+  it("普通未读卡：卡面保留、未读消失，计数不变", () => {
+    const qc = new QueryClient();
+    const session = mk({ id: "c1", agentType: "claude", status: "idle", unread: true });
+    qc.setQueryData(SESSIONS_QUERY_KEY, seed([session, mk({ id: "w1", unread: false })]));
+    applyOptimisticSessionMutation(qc, [session]);
+    const next = cache(qc);
+    expect(next.sessions.map((s) => s.id)).toEqual(["c1", "w1"]);
+    expect(next.sessions[0].unread).toBe(false);
+    expect(next.totalCount).toBe(2);
+    expect(next.waitingCount).toBe(1); // w1 waiting 未被扣减
+    expect(applyPendingSessions(next.sessions)[0].unread).toBe(false);
+    clearPendingSessions([session]);
+  });
+
+  it("数据驱动聚合绿卡：整卡消失，计数按移除数扣减", () => {
+    const qc = new QueryClient();
+    const green = mk({
+      id: "g1",
+      agentType: "codex",
+      status: "finished",
+      form: "app",
+      unread: true,
+    });
+    qc.setQueryData(SESSIONS_QUERY_KEY, seed([green, mk({ id: "w1" })]));
+    applyOptimisticSessionMutation(qc, [green]);
+    const next = cache(qc);
+    expect(next.sessions.map((s) => s.id)).toEqual(["w1"]);
+    expect(next.totalCount).toBe(1);
+    expect(next.waitingCount).toBe(1);
+    expect(applyPendingSessions(next.sessions)).toHaveLength(1);
+    clearPendingSessions([green]);
+  });
+});
+
+describe("applyOptimisticSessionMutation / 批量混合", () => {
+  it("三类行为分别正确：普通未读保留已读、绿卡移除、已读卡移除", () => {
+    const qc = new QueryClient();
+    const ordinaryUnread = mk({
+      id: "r1",
+      agentType: "claude",
+      status: "idle",
+      unread: true,
+      projectName: "普通未读",
+    });
+    const greenUnread = mk({
+      id: "g1",
+      agentType: "codex",
+      status: "finished",
+      form: "app",
+      unread: true,
+      projectName: "绿卡",
+    });
+    const readCard = mk({
+      id: "d1",
+      agentType: "workbuddy",
+      status: "idle",
+      unread: false,
+      projectName: "已读",
+    });
+    qc.setQueryData(
+      SESSIONS_QUERY_KEY,
+      seed([ordinaryUnread, greenUnread, readCard, mk({ id: "keep", status: "waiting" })])
+    );
+    const write = vi.spyOn(qc, "setQueryData");
+
+    applyOptimisticSessionMutation(qc, [ordinaryUnread, greenUnread, readCard]);
+    // 批量按行为分组后只写一次缓存（N 张卡 ≠ N 次 setQueryData）
+    expect(write).toHaveBeenCalledTimes(1);
+
+    // 缓存：只剩普通未读（已读）+ 非目标卡；计数只扣实际移除的 2 张
+    const next = cache(qc);
+    expect(next.sessions.map((s) => s.id)).toEqual(["r1", "keep"]);
+    expect(next.sessions[0].unread).toBe(false);
+    expect(next.totalCount).toBe(2);
+    expect(next.waitingCount).toBe(1);
+
+    // 旧快照回写 + pending 派生：绿卡/已读卡不复活，普通未读未读态不复活
+    qc.setQueryData(SESSIONS_QUERY_KEY, seed([ordinaryUnread, greenUnread, readCard]));
+    const visible = applyPendingSessions(cache(qc).sessions);
+    expect(visible.map((s) => s.id)).toEqual(["r1"]);
+    expect(visible[0].unread).toBe(false);
+
+    clearPendingSessions([ordinaryUnread, greenUnread, readCard]);
+  });
+});
+
+describe("pending 防回写", () => {
+  it("markPendingSession(read)：轮询回写旧快照时未读态不复活", () => {
     const session = mk({ agentType: "claude", status: "idle", unread: true });
     markPendingSession(session, "read");
     const oldSnapshot = [mk({ agentType: "claude", status: "idle", unread: true })];
@@ -105,7 +194,7 @@ describe("optimisticSessions / G1 生命周期", () => {
     expect(applyPendingSessions(oldSnapshot)[0].unread).toBe(true);
   });
 
-  it("pending=hidden：轮询回写旧快照时整卡不复活", () => {
+  it("markPendingSession(hidden)：轮询回写旧快照时整卡不复活", () => {
     const session = mk({});
     markPendingSession(session, "hidden");
     expect(applyPendingSessions([session])).toHaveLength(0);
@@ -113,26 +202,12 @@ describe("optimisticSessions / G1 生命周期", () => {
     expect(applyPendingSessions([session])).toHaveLength(1);
   });
 
-  it("批量：一次移除全部目标卡", () => {
+  it("目标为空 / 缓存缺失时安全空操作", () => {
     const qc = new QueryClient();
-    qc.setQueryData(
-      SESSIONS_QUERY_KEY,
-      seed([mk({ id: "a" }), mk({ id: "b" }), mk({ id: "c", status: "idle" })])
-    );
-    hideSessionsOptimistically(qc, [
-      { id: "a", agentType: "workbuddy" },
-      { id: "b", agentType: "workbuddy" },
-    ]);
-    expect(cache(qc).sessions.map((s) => s.id)).toEqual(["c"]);
-    clearPendingSessions([
-      { id: "a", agentType: "workbuddy" },
-      { id: "b", agentType: "workbuddy" },
-    ]);
-  });
-
-  it("缓存缺失时安全空操作", () => {
-    const qc = new QueryClient();
-    expect(() => hideSessionOptimistically(qc, mk({ id: "x", agentType: "claude" }))).not.toThrow();
+    expect(applyOptimisticSessionMutation(qc, [])).toBeNull();
+    expect(() =>
+      applyOptimisticSessionMutation(qc, [mk({ id: "x", agentType: "claude" })])
+    ).not.toThrow();
     clearPendingSessions([{ id: "x", agentType: "claude" }]);
   });
 });

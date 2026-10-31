@@ -50,6 +50,9 @@ pub async fn mark_session_read(
     agent_type: String,
     session_id: String,
 ) -> crate::commands::session::MutationOutcome {
+    // F5：请求纪元必须在任何变更之前捕获（applied=false 时前端以 epoch 更大的
+    // 快照事件作为已读已反映的凭据）
+    let request_epoch = crate::adapter::scan_bus::scan_epoch();
     crate::database::dao::unread::delete(&agent_type.to_lowercase(), &session_id);
     // issue #35-1：已读墓碑——缓存失忆（长间隙清缓存 / 兔维斯 重启）后
     // Insert 边沿与补偿据此不再复活已读未读卡
@@ -59,20 +62,25 @@ pub async fn mark_session_read(
         serde_json::json!({ "agentType": agent_type, "sessionId": session_id }),
     );
     // R1：完整扫描（可能等在飞 2s）放进阻塞线程池，命令本身不跑扫描
-    match tauri::async_runtime::spawn_blocking(|| {
-        crate::adapter::scan_bus::scan_after_mutation(std::time::Duration::from_secs(2))
+    match tauri::async_runtime::spawn_blocking(move || {
+        crate::adapter::scan_bus::scan_after_mutation(
+            std::time::Duration::from_secs(2),
+            request_epoch,
+        )
     })
     .await
     {
         Ok(result) => crate::commands::session::MutationOutcome {
             applied: result.applied,
             version: result.snapshot.version,
+            epoch: result.request_epoch,
         },
         Err(e) => {
             ::log::error!("已读变更后补扫任务异常: {e}");
             crate::commands::session::MutationOutcome {
                 applied: false,
                 version: crate::adapter::scan_bus::version(),
+                epoch: request_epoch,
             }
         }
     }
