@@ -31,6 +31,7 @@ import {
   type ProjectedMessage,
   type ThreadProjection,
 } from "./codexIpcApi";
+import { shouldApplyProjection, type ProjectionApplyContext } from "./codex-projection-order";
 import {
   CODEX_HISTORY_PAGE_LIMIT,
   appendCodexHistoryPage,
@@ -42,6 +43,12 @@ import {
 
 /** 降级后的 GET 轮询周期（计划钉值：3s） */
 export const CODEX_THREAD_POLL_MS = 3000;
+
+/** R03 有界再武装阈值：连续跨 instance 拒绝达到该次数即补发一张新握手票。
+ *  取 1 = 一次拒绝即补票：恢复延迟一个轮询周期；安全性由「票只能被补票后新发出
+ *  的请求捕获」保证——单活 hub 下新请求只可能解析到在世 instance，旧世界响应
+ * （重启前挂起/同票迟到）捕获的是旧号或 null，结构性无法借补票装回。 */
+const CODEX_HANDSHAKE_REARM_REJECTS = 1;
 
 /** 传输通道：sse = 事件流在线；poll = SSE 三连失败后的 GET 轮询；off = 未启用 */
 export type CodexTransport = "sse" | "poll" | "off";
@@ -141,6 +148,46 @@ export default function useCodexThread(sessionId: string, enabled: boolean): Use
   /** 历史代际计数：每次失效 +1；在途页响应必须带回同代才可落地 */
   const generationRef = useRef(0);
   const enabledRef = useRef(enabled);
+  /** T02 订阅代际计数：每次订阅（重挂/切会话/启用翻转）+1；在途 GET 必须带回
+   *  同代才可落地（切订阅代际作废旧在途 GET——abort 之外的迟到响应兜底）。 */
+  const subscriptionGenerationRef = useRef(0);
+  /** R03 握手代际票：非 null = 当前持有一张**未消费**的跨 instance 建立权
+   * （SSE→poll 降级点发放；消费后由「连续跨 instance 拒绝」有界再武装补发）；
+   *  null = 无有效票（SSE 在线语义：GET 无权切换 instance）。GET 发出时捕获票号，
+   *  响应落地时仅当「捕获票号非空且仍是当前票」才有权确立新 instance——票随跨
+   *  instance 建立消费失效，同票的重叠/迟到在途响应一律按普通规则拒绝；重启前
+   *  发出的挂起 GET 捕获的是旧票号（或 null），结构性无法借后续再武装越权。 */
+  const handshakeTicketRef = useRef<{ seq: number; consumed: boolean } | null>(null);
+  /** 票号单调递增源：再武装只发新号，旧票号永不复用（捕获比较才可靠）。 */
+  const ticketSeqRef = useRef(0);
+  /** R03 有界再武装：连续跨 instance 拒绝计数，达到阈值补发一张新票——修复
+   *  「票已消费后服务再重启 → 新 instance 永久锁死」的死角。阈值 1：一次跨
+   *  instance 拒绝即补票（再武装只可能被**补票后新发出**的请求捕获，单活 hub
+   *  下它们只能解析到在世 instance，旧世界响应无法受益——见报告选型说明）。 */
+  const crossInstanceRejectStreakRef = useRef(0);
+
+  /** 发放一张新握手票（单调新号、未消费；旧票号随即失效）。
+   *  C01：仅在**没有未消费有效票**时发放——旧票请求的拒绝不得作废已有人在途
+   *  持有的票（RTT > 轮询周期时那会造成稳定饥饿：每次过期拒绝都换票，正确
+   *  在途请求永远追不上当前票号）。 */
+  const mintHandshakeTicket = useCallback(() => {
+    const current = handshakeTicketRef.current;
+    if (current !== null && !current.consumed) return;
+    ticketSeqRef.current += 1;
+    handshakeTicketRef.current = { seq: ticketSeqRef.current, consumed: false };
+  }, []);
+
+  /** 握手授权捕获 → 落地判定：请求发出时捕获的票号仍是当前**未消费**有效票才
+   *  拥有跨 instance 建立权（null 票 = 无权；已消费/被新票取代 = 无权）。 */
+  const ticketGrantsInstanceChange = useCallback((ticketAtRequest: number | null) => {
+    const current = handshakeTicketRef.current;
+    return (
+      ticketAtRequest !== null &&
+      current !== null &&
+      !current.consumed &&
+      ticketAtRequest === current.seq
+    );
+  }, []);
 
   /** 清空历史分页状态：页缓存 + 保留缓冲 + 游标链 + 在途请求。
    *  触发点：historyToken 换代/不匹配、线程重建、禁用订阅、切会话、卸载。 */
@@ -159,11 +206,50 @@ export default function useCodexThread(sessionId: string, enabled: boolean): Use
     if (hadRetained) setRetained([]);
   }, []);
 
-  /** 投影落地（SSE 帧 / 轮询 GET / 手动刷新唯一入口）：
+  /** 投影落地（SSE 帧 / 轮询 GET / 手动刷新唯一入口）。
+   *
+   *  T02 版本守卫：所有来源统一经 `shouldApplyProjection` 判定——迟到的旧响应
+   *  （旧订阅代际、旧 instance、更低的 revision/localSeq）不得覆盖新状态；
+   *  未获准落地时不触碰 token/页缓存/保留缓冲。
+   *
+   *  R03 握手票结算：跨 instance 建立消费当前票（同票的重叠/迟到在途响应随之
+   *  失去建立权——先到先得）；同 instance 落地不清票（票留给后续重启）。被拒
+   *  响应只统计「当前订阅代际的跨 instance 拒绝」，达到阈值有界再武装补票。
+   *
    *  token 变化（线程重建/代际换代）→ 旧页、保留缓冲与游标链整体失效；
    *  同 token（普通追加/尾窗前移）→ 把已滚出尾窗的消息按顺序接进保留缓冲。 */
   const applyProjection = useCallback(
-    (p: ThreadProjection) => {
+    (
+      p: ThreadProjection,
+      source: { allowInstanceChange: boolean; responseGeneration: number }
+    ): boolean => {
+      const context: ProjectionApplyContext = {
+        sessionId: sessionRef.current,
+        subscriptionGeneration: subscriptionGenerationRef.current,
+        responseSubscriptionGeneration: source.responseGeneration,
+        allowInstanceChange: source.allowInstanceChange,
+      };
+      if (!shouldApplyProjection(stateRef.current, p, context)) {
+        // R03 有界再武装：只统计**当前订阅代际**的跨 instance 拒绝（旧代际迟到
+        // 响应与本代际握手状态无关，不得计数也不得触发补票）；双方都带版本束且
+        // instanceId 不同才算跨 instance 拒绝（旧载荷退化路径与此无关）。
+        if (source.responseGeneration === subscriptionGenerationRef.current) {
+          const prevInstance = stateRef.current?.projectionVersion?.instanceId;
+          const incomingInstance = p.projectionVersion?.instanceId;
+          if (
+            prevInstance !== undefined &&
+            incomingInstance !== undefined &&
+            prevInstance !== incomingInstance
+          ) {
+            crossInstanceRejectStreakRef.current += 1;
+            if (crossInstanceRejectStreakRef.current >= CODEX_HANDSHAKE_REARM_REJECTS) {
+              crossInstanceRejectStreakRef.current = 0;
+              mintHandshakeTicket();
+            }
+          }
+        }
+        return false;
+      }
       const nextToken = p.historyToken ?? "";
       const previous = stateRef.current;
       if (nextToken !== tokenRef.current) {
@@ -184,12 +270,38 @@ export default function useCodexThread(sessionId: string, enabled: boolean): Use
       }
       stateRef.current = p;
       setState(p);
+      // R03 握手票结算：跨 instance 建立消费当前票（先到先得，同票重叠响应随后
+      // 全部失去建立权）；同 instance 落地保留未消费的票（它属于后续可能的重启）
+      // 并打断连续拒绝计数。SSE snapshot 的跨 instance 建立同样消费（票只属于
+      // 建立那一刻，落地后的世界由 revision/localSeq 规则接管）。
+      const previousInstance = previous?.projectionVersion?.instanceId;
+      const landedInstance = p.projectionVersion?.instanceId;
+      if (
+        previousInstance !== undefined &&
+        landedInstance !== undefined &&
+        previousInstance !== landedInstance
+      ) {
+        // C01：建立消费当前票——标 consumed 保留 seq（再次重启走「无未消费票 →
+        // 补票」重新武装）。
+        const current = handshakeTicketRef.current;
+        if (current !== null) handshakeTicketRef.current = { ...current, consumed: true };
+        crossInstanceRejectStreakRef.current = 0;
+      } else {
+        crossInstanceRejectStreakRef.current = 0;
+      }
+      return true;
     },
-    [invalidateHistory]
+    [invalidateHistory, mintHandshakeTicket]
   );
 
   useEffect(() => {
     enabledRef.current = enabled;
+    // T02：每次订阅重挂（切会话/启用翻转）换新订阅代际——旧代际的在途 GET 一律
+    // 作废（abort 之外的迟到响应兜底）；R03：握手票随代际清空（新订阅从 SSE
+    // 语义起步：GET 无权切换 instance，降级时再发新票）。
+    subscriptionGenerationRef.current += 1;
+    handshakeTicketRef.current = null;
+    crossInstanceRejectStreakRef.current = 0;
     if (!enabled) {
       // 禁用订阅：清历史分页状态（保留最后投影视图——现有 state 语义不变）
       setTransport("off");
@@ -213,19 +325,36 @@ export default function useCodexThread(sessionId: string, enabled: boolean): Use
 
     const isCurrent = () => alive && sessionRef.current === sid;
 
-    /** SSE 帧落地（非当前会话/已卸载一律丢弃） */
-    const applyFrame = (p: ThreadProjection | null) => {
+    /** SSE 帧落地（非当前会话/已卸载一律丢弃）。
+     *  T02：`snapshot` = 当前代际最新握手（连接建立/重连基线校正），有权确立新
+     *  instance；`state` 是普通增量，无权切换 instance。R03：snapshot 的跨
+     *  instance 建立同样消费当前握手票（经 applyProjection 票结算）。 */
+    const applyFrame = (p: ThreadProjection | null, event: "snapshot" | "state") => {
       if (!isCurrent() || p === null) return;
-      applyProjection(p);
+      applyProjection(p, {
+        allowInstanceChange: event === "snapshot",
+        responseGeneration: subscriptionGenerationRef.current,
+      });
     };
 
     const pollOnce = async () => {
       // 请求发出时的代际：若在途期间 SSE 已推进到新 token，旧 GET 响应作废
       const startedToken = tokenRef.current;
+      // T02：响应必须带回发出时的订阅代际才可落地
+      const requestGeneration = subscriptionGenerationRef.current;
+      // R03：握手票随**请求**捕获。响应期再读会被降级点的补票/再武装污染——
+      // 重启前已发出的挂起 GET 捕获的是旧票号（或 null），结构性无法借后续
+      // 补票获得跨 instance 建立权。
+      const ticketAtRequest = handshakeTicketRef.current?.seq ?? null;
       try {
         const p = await fetchCodexThread(sid, ctrl.signal);
         if (!isCurrent() || p === null || tokenRef.current !== startedToken) return;
-        applyProjection(p);
+        applyProjection(p, {
+          // 仅当捕获的票仍是当前有效票（未消费、未被新票取代）才有权确立新
+          // instance；此后的 GET 无权切换（含切回旧 instance）。
+          allowInstanceChange: ticketGrantsInstanceChange(ticketAtRequest),
+          responseGeneration: requestGeneration,
+        });
       } catch {
         /* 单次轮询失败忽略（保留最后视图），下一轮再试 */
       }
@@ -233,6 +362,12 @@ export default function useCodexThread(sessionId: string, enabled: boolean): Use
 
     const startPoll = () => {
       if (!alive || pollTimer !== null) return;
+      // R03：SSE→poll 降级点发放一张**新号**握手票。降级前发出的请求捕获的是
+      // 旧号/null，无法借这张票越权；降级后的首个跨 instance GET 用它确立新
+      // instance（票随建立消费）。消费后的再次重启由「连续跨 instance 拒绝 →
+      // 有界再武装」补票——不再像旧布尔握手那样一次性锁死在旧 instance 视图。
+      crossInstanceRejectStreakRef.current = 0;
+      mintHandshakeTicket();
       setTransport("poll");
       void pollOnce();
       pollTimer = setInterval(() => {
@@ -250,20 +385,37 @@ export default function useCodexThread(sessionId: string, enabled: boolean): Use
       ctrl.abort(); // 在途轮询 fetch 一并终止
       invalidateHistory();
     };
-  }, [sessionId, enabled, applyProjection, invalidateHistory]);
+  }, [
+    sessionId,
+    enabled,
+    applyProjection,
+    invalidateHistory,
+    mintHandshakeTicket,
+    ticketGrantsInstanceChange,
+  ]);
 
   const refresh = useCallback(async () => {
     const sid = sessionId;
     // 请求发出时的代际：在途期间已有更新帧落地则丢弃本次响应（旧 token 不覆盖新状态）
     const startedToken = tokenRef.current;
+    // T02：响应必须带回发出时的订阅代际才可落地
+    const requestGeneration = subscriptionGenerationRef.current;
+    // R03：握手票随请求捕获（与 pollOnce 同理——响应期读会被降级点的补票污染，
+    // 重启前已发出的挂起刷新不得借后续补票切换 instance）。
+    const ticketAtRequest = handshakeTicketRef.current?.seq ?? null;
     try {
       const p = await fetchCodexThread(sid);
       if (p === null || sessionRef.current !== sid || tokenRef.current !== startedToken) return;
-      applyProjection(p);
+      applyProjection(p, {
+        // 仅当捕获的票仍是当前有效票才可切换 instance（SSE 在线时票为 null：
+        // 手动刷新无权把旧服务实例装回——T02 既有纪律）。
+        allowInstanceChange: ticketGrantsInstanceChange(ticketAtRequest),
+        responseGeneration: requestGeneration,
+      });
     } catch {
       /* 手动刷新失败静默（详情页保留现有内容） */
     }
-  }, [sessionId, applyProjection]);
+  }, [sessionId, applyProjection, ticketGrantsInstanceChange]);
 
   const loadEarlier = useCallback<LoadEarlier>(
     async (before) => {

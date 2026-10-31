@@ -94,7 +94,10 @@ pub const OPERATION_QUEUE_PAUSED: &str = "operation_queue_paused";
 /// 异步题的相关答复范围（题目 → 当前）不完整/不可读：保持 Unknown，不清卡。
 pub const ASYNC_HISTORY_INCOMPLETE: &str = "async_answer_history_incomplete";
 
-/// 逐操作策略：没有可打断的活动回合。
+/// 预留码：没有可打断的活动回合。**实际语义（2026-10-29 修正过时表述）**：
+/// 逐操作策略对 Interrupt **不以「有无活动回合」作门**（门 = 证据/适配/目标在场；
+/// 安全阀是 `expectedTurnId`）——本码当前不出自策略词表；端点侧「无可打断回合」
+/// 以 HTTP 409 `no_expected_turn` 与审计词 `no_active_turn` 表达（`codex_ipc.rs`）。
 pub const OPERATION_NO_ACTIVE_TURN: &str = "operation_no_active_turn";
 
 /// 合法探测级（动态码 `probe_failed:<stage>` 的 stage 取值域）。

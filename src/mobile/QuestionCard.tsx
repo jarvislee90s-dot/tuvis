@@ -295,9 +295,15 @@ interface QuestionCardProps {
   /** 会话：只消费 id（请求键）与 status（重拉触发键，丁T1 复评 F-1）。
    *  结构化类型——完整 Session 可直接传入，测试可只给这两字段 */
   session: { id: string; status?: string };
+  /**
+   * 字号档位（T04，spec §3.3）：题干/选项文字在 `[data-font-scale]` 作用域内跟随
+   * 档位（与异步题卡同口径）；动作按钮与卡头不在作用域内，不整体缩放点击面积。
+   * 默认 1（主题原值）。
+   */
+  fontScale?: number;
 }
 
-export default function QuestionCard({ session }: QuestionCardProps) {
+export default function QuestionCard({ session, fontScale = 1 }: QuestionCardProps) {
   // 可用性：ready=false（加载中 / 拉取失败）→ 不渲染
   const [info, setInfo] = useState<QuestionInfoView | null>(null);
   const [ready, setReady] = useState(false);
@@ -920,22 +926,25 @@ export default function QuestionCard({ session }: QuestionCardProps) {
             {q0.header}
           </div>
         )}
-        <p data-testid="question-text" className="mt-1 text-sm text-[var(--tx)]">
-          {q0.question}
-        </p>
-        <ol className="mt-1.5 space-y-0.5">
-          {q0.options.map((o, i) => (
-            <li
-              key={`question-ro-opt-${i}`}
-              data-testid={`question-readonly-option-${i}`}
-              className="text-xs text-[var(--tx)]"
-            >
-              <span className="mr-1 font-mono text-[var(--mut)]">{i + 1}.</span>
-              {o.label}
-              {o.description && <span className="ml-1 text-[var(--mut)]">— {o.description}</span>}
-            </li>
-          ))}
-        </ol>
+        {/* T04（spec §3.3）：题干/选项文字跟随字号档位（与异步题卡同口径） */}
+        <div data-font-scale={fontScale}>
+          <p data-testid="question-text" className="mt-1 text-sm text-[var(--tx)]">
+            {q0.question}
+          </p>
+          <ol className="mt-1.5 space-y-0.5">
+            {q0.options.map((o, i) => (
+              <li
+                key={`question-ro-opt-${i}`}
+                data-testid={`question-readonly-option-${i}`}
+                className="text-xs text-[var(--tx)]"
+              >
+                <span className="mr-1 font-mono text-[var(--mut)]">{i + 1}.</span>
+                {o.label}
+                {o.description && <span className="ml-1 text-[var(--mut)]">— {o.description}</span>}
+              </li>
+            ))}
+          </ol>
+        </div>
         <p data-testid="question-tool-readonly-hint" className="mt-1.5 text-xs text-[var(--tx)]">
           {i18n.t("mobile.question.toolReadonlyHint")}
         </p>
@@ -955,24 +964,32 @@ export default function QuestionCard({ session }: QuestionCardProps) {
   //   （advance 回绕）/ 取消（esc dismiss）。
   const renderMultiFreeText = (qi: number) => (
     <div className="mt-2" data-testid="question-multi-freetext">
-      <label
-        htmlFor="question-multi-freetext-input"
-        className="mb-1 block text-xs text-[var(--mut)]"
-      >
-        {i18n.t("mobile.question.freeInputLabel")}
-      </label>
+      {/* T04（spec §3.3，控制器裁决 D4 追加）：label 与输入文字进入与题干/选项相同
+          的字号作用域（与单题自由输入、异步卡自由输入同口径）；发送/清空/覆盖等
+          操作按钮与已写入/未核验状态行在作用域外——按钮点击面积不缩放，状态行
+          与异步卡回执注记（codex-async-note）同口径不跟随档位。 */}
+      <div data-font-scale={fontScale}>
+        <label
+          htmlFor="question-multi-freetext-input"
+          className="mb-1 block text-xs text-[var(--mut)]"
+        >
+          {i18n.t("mobile.question.freeInputLabel")}
+        </label>
+      </div>
       <div className="flex gap-1.5">
-        <input
-          id="question-multi-freetext-input"
-          data-testid="question-multi-freetext-input"
-          value={freeText || (mqFreeText[qi] ?? "")}
-          maxLength={MAX_FREE_TEXT_CHARS}
-          disabled={busy}
-          readOnly={mqFreeText[qi] !== undefined && !editingFreeText}
-          onChange={(e) => setFreeText(e.target.value.slice(0, MAX_FREE_TEXT_CHARS))}
-          className="min-w-0 flex-1 rounded-lg border border-[var(--cb)] bg-[var(--cbg)] px-2 py-1.5 text-xs text-[var(--tx)] placeholder:text-[var(--mut)] focus:border-[var(--btnp)] focus:outline-none disabled:opacity-60"
-          placeholder={i18n.t("mobile.question.freeInputPlaceholder")}
-        />
+        <div data-font-scale={fontScale} className="min-w-0 flex-1">
+          <input
+            id="question-multi-freetext-input"
+            data-testid="question-multi-freetext-input"
+            value={freeText || (mqFreeText[qi] ?? "")}
+            maxLength={MAX_FREE_TEXT_CHARS}
+            disabled={busy}
+            readOnly={mqFreeText[qi] !== undefined && !editingFreeText}
+            onChange={(e) => setFreeText(e.target.value.slice(0, MAX_FREE_TEXT_CHARS))}
+            className="w-full rounded-lg border border-[var(--cb)] bg-[var(--cbg)] px-2 py-1.5 text-xs text-[var(--tx)] placeholder:text-[var(--mut)] focus:border-[var(--btnp)] focus:outline-none disabled:opacity-60"
+            placeholder={i18n.t("mobile.question.freeInputPlaceholder")}
+          />
+        </div>
         {/* codex 屏驱按钮面（2026-10-10 用户规格）：按钮跟随终端 note 行屏读——
             无字 → 「发送」（overwrite=false，tab→脚注核验→打字→上屏核验→回车）；
             有字 → 「清空」「覆盖写入」（tab 循环清空 ≤2 下每下读屏；覆盖 = 清空 +
@@ -1258,22 +1275,25 @@ export default function QuestionCard({ session }: QuestionCardProps) {
         title={i18n.t("mobile.question.countAt", { count: questions.length, index: mqIndex + 1 })}
         footer={multiFooter}
       >
-        <p data-testid="question-multi-current" className="mt-1 text-xs text-[var(--tx)]">
-          {q.header && (
-            <span className="mr-1 rounded bg-[var(--btnp)]/10 px-1 py-0.5 text-[10px] font-medium text-[var(--tx)]">
-              {q.header}
-            </span>
-          )}
-          {q.question}
-          {q.multiSelect && (
-            <span
-              data-testid="question-multi-multiselect-badge"
-              className="ml-1 rounded bg-[var(--btnp)]/10 px-1 py-0.5 text-[10px] font-medium text-[var(--tx)]"
-            >
-              {i18n.t("mobile.question.multiBadge")}
-            </span>
-          )}
-        </p>
+        {/* T04（spec §3.3）：题干文字跟随字号档位（与异步题卡同口径） */}
+        <div data-font-scale={fontScale}>
+          <p data-testid="question-multi-current" className="mt-1 text-xs text-[var(--tx)]">
+            {q.header && (
+              <span className="mr-1 rounded bg-[var(--btnp)]/10 px-1 py-0.5 text-[10px] font-medium text-[var(--tx)]">
+                {q.header}
+              </span>
+            )}
+            {q.question}
+            {q.multiSelect && (
+              <span
+                data-testid="question-multi-multiselect-badge"
+                className="ml-1 rounded bg-[var(--btnp)]/10 px-1 py-0.5 text-[10px] font-medium text-[var(--tx)]"
+              >
+                {i18n.t("mobile.question.multiBadge")}
+              </span>
+            )}
+          </p>
+        </div>
         {/* codex 未答进度提示（2026-10-09 设计 §3.1）：GET/回执快照的 unanswered
             直读——0/null 不显示（全答完不制造噪音）；非 codex 快照恒 null 不渲染 */}
         {unansweredHint !== null && unansweredHint > 0 && (
@@ -1284,7 +1304,8 @@ export default function QuestionCard({ session }: QuestionCardProps) {
             {i18n.t("mobile.question.unansweredCount", { count: unansweredHint })}
           </p>
         )}
-        <div className="mt-1.5 space-y-1">
+        {/* T04（spec §3.3）：选项文字跟随字号档位；按钮 padding 保持 px 不缩放点击面积 */}
+        <div data-font-scale={fontScale} className="mt-1.5 space-y-1">
           {q.options.map((o, i) => {
             // 多选题的勾选高亮：按题记忆（mqChecked），仅在 toggle 成功回执后变化；
             // **单选题的选中标记**（2026-10-06 活体定案）：终端 ✓ 经快照 checked
@@ -1412,9 +1433,12 @@ export default function QuestionCard({ session }: QuestionCardProps) {
         ) : null
       }
     >
-      <p data-testid="question-text" className="mt-1 text-sm text-[var(--tx)]">
-        {q.question}
-      </p>
+      {/* T04（spec §3.3）：题干文字跟随字号档位（与异步题卡同口径） */}
+      <div data-font-scale={fontScale}>
+        <p data-testid="question-text" className="mt-1 text-sm text-[var(--tx)]">
+          {q.question}
+        </p>
+      </div>
       {/* **进行中态**（丁T5 §2.3）——替代「已发送按键」：提交/自由作答的整条闭环是
           一次同步请求，期间显示「正在做什么」（段名文案），请求返回后本块消失。 */}
       {busy && inProgress !== null && (
@@ -1467,7 +1491,8 @@ export default function QuestionCard({ session }: QuestionCardProps) {
       )}
       {!sent && (
         <>
-          <div className="mt-2 space-y-1.5">
+          {/* T04（spec §3.3）：选项文字跟随字号档位；按钮 padding 保持 px 不缩放点击面积 */}
+          <div data-font-scale={fontScale} className="mt-2 space-y-1.5">
             {q.options.map((o, i) => (
               <QuestionChoiceRow
                 key={`question-option-${i}`}
@@ -1513,9 +1538,15 @@ export default function QuestionCard({ session }: QuestionCardProps) {
           )}
           {freeTextEnabled ? (
             <div className="mt-2" data-testid="question-freetext">
-              <p data-testid="question-freetext-label" className="mb-1 text-xs text-[var(--mut)]">
-                {i18n.t("mobile.question.freetextLabel")}
-              </p>
+              {/* T04（spec §3.3，集中审查 D4 补齐）：label 与输入文字进入与题干/选项
+                  相同的字号作用域（与异步卡自由输入同口径）；发送/清空/覆盖按钮在
+                  作用域外——点击面积不随档位缩放。label 与输入是同档位的两个作用域
+                  （值一致即可，不要求同一节点）。 */}
+              <div data-font-scale={fontScale}>
+                <p data-testid="question-freetext-label" className="mb-1 text-xs text-[var(--mut)]">
+                  {i18n.t("mobile.question.freetextLabel")}
+                </p>
+              </div>
               {(() => {
                 // **按钮面由终端 note 行屏读驱动**（2026-10-10 用户规格）：
                 // note 无字 → 只有「发送」（tab→脚注核验→打字→上屏核验→回车提交）；
@@ -1525,21 +1556,23 @@ export default function QuestionCard({ session }: QuestionCardProps) {
                 const hasNote = info.screen?.noteText != null && info.screen.noteText !== "";
                 return (
                   <div className="flex gap-1.5">
-                    <input
-                      data-testid="question-freetext-input"
-                      aria-label={i18n.t("mobile.question.freetextAria")}
-                      type="text"
-                      value={freeText}
-                      maxLength={MAX_FREE_TEXT_CHARS}
-                      disabled={busy}
-                      onChange={(e) => setFreeText(e.target.value.slice(0, MAX_FREE_TEXT_CHARS))}
-                      placeholder={i18n.t(
-                        hasNote
-                          ? "mobile.question.placeholderWithNote"
-                          : "mobile.question.placeholder"
-                      )}
-                      className="min-w-0 flex-1 rounded-lg border border-[var(--cb)] px-2.5 py-1.5 text-sm text-[var(--tx)] placeholder:text-[var(--mut)] focus:ring-2 focus:ring-[var(--btnp)] focus:outline-none disabled:opacity-50"
-                    />
+                    <div data-font-scale={fontScale} className="min-w-0 flex-1">
+                      <input
+                        data-testid="question-freetext-input"
+                        aria-label={i18n.t("mobile.question.freetextAria")}
+                        type="text"
+                        value={freeText}
+                        maxLength={MAX_FREE_TEXT_CHARS}
+                        disabled={busy}
+                        onChange={(e) => setFreeText(e.target.value.slice(0, MAX_FREE_TEXT_CHARS))}
+                        placeholder={i18n.t(
+                          hasNote
+                            ? "mobile.question.placeholderWithNote"
+                            : "mobile.question.placeholder"
+                        )}
+                        className="w-full rounded-lg border border-[var(--cb)] px-2.5 py-1.5 text-sm text-[var(--tx)] placeholder:text-[var(--mut)] focus:ring-2 focus:ring-[var(--btnp)] focus:outline-none disabled:opacity-50"
+                      />
+                    </div>
                     {hasNote ? (
                       <>
                         <button
