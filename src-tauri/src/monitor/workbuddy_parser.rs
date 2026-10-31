@@ -671,10 +671,10 @@ fn workbuddy_is_live(
 ) -> bool {
     let working = db_status == Some("working");
     let db_age_ms = db_activity_ms.map_or(u64::MAX, |a| now.saturating_sub(a.max(0) as u64));
-    let mtime_age_ms = mtime_ms.map_or(0, |m| now.saturating_sub(m));
-    working
-        || db_age_ms <= SESSION_ACTIVE_WINDOW_MS as u64
-        || mtime_age_ms <= SESSION_ACTIVE_WINDOW_MS as u64
+    // mtime 不可得 = **未知**，不是“刚刚活跃”：completed 卡不能靠 0 岁无限续命。
+    let mtime_recent =
+        mtime_ms.is_some_and(|m| now.saturating_sub(m) <= SESSION_ACTIVE_WINDOW_MS as u64);
+    working || db_age_ms <= SESSION_ACTIVE_WINDOW_MS as u64 || mtime_recent
 }
 
 /// 可测核心（R2）：home / 进程表 / 时钟 / DB 活跃会话注入。/// 可测核心（R2）：home / 进程表 / 时钟 / DB 活跃会话注入。
@@ -996,10 +996,9 @@ pub fn compensate_vanished_heartbeats_in_with_deleted(
     };
 
     for (pid, (tool_id, session_id)) in vanished {
-        // 逐个短暂重锁移除（不做额外清理，未消失条目保留供下轮参考）
-        last_seen.lock().unwrap().remove(&pid);
-        // 防御：观测条目不属于本工具（未来多工具接入）→ 跳过，不代他工具补偿
+        // 防御：观测条目不属于本工具（未来多工具接入）→ 移除并跳过，不代他工具补偿
         if tool_id != "workbuddy" {
+            last_seen.lock().unwrap().remove(&pid);
             continue;
         }
         // 找该会话的 JSONL（与主路径共用 find_session_jsonl）：
@@ -1010,11 +1009,15 @@ pub fn compensate_vanished_heartbeats_in_with_deleted(
             .and_then(|c| workbuddy_cwd_from_conn(c, &session_id))
             .unwrap_or_default();
         let Some(jsonl) = find_session_jsonl(home, &cwd, &session_id) else {
-            continue; // 全无 → 跳过该 pid，不中断其余补偿
+            // 文件暂缺（尚未落盘/被临时移走）→ **保留观测**，下一轮重试；
+            // 不在此消费，避免“本轮无产物 + 下一轮失去依据”的永久漏通知。
+            continue;
         };
         let lines = read_recent_lines(&jsonl, 500);
         if derive_status_from_tail(&lines) != SessionStatus::Idle {
-            continue; // 非完成态（运行中被杀等）→ 不补
+            // 非完成态（运行中被杀/仍在跑）→ 无完成通知可发，消费观测
+            last_seen.lock().unwrap().remove(&pid);
+            continue;
         }
         // review M1：状态缓存已记录「绿已被 sync 观测」（Idle/Finished）时，行缺席
         // 是因为用户已读删行——补偿不得复活（否则一次性复活未读卡）。
@@ -1025,6 +1028,8 @@ pub fn compensate_vanished_heartbeats_in_with_deleted(
             Some("Idle") | Some("Finished")
         ) || was_read(&session_id)
         {
+            // 已绿/已读：完成态已明确处理，消费观测
+            last_seen.lock().unwrap().remove(&pid);
             continue;
         }
         let last_message = lines.iter().rev().find_map(|l| extract_message_text(l));
@@ -1044,6 +1049,8 @@ pub fn compensate_vanished_heartbeats_in_with_deleted(
             turned_green_at_ms: now_ms as i64,
             expires_at_ms: now_ms as i64 + 24 * 3600 * 1000,
         });
+        // 已完成补偿 → 消费观测（下一轮不再重复）
+        last_seen.lock().unwrap().remove(&pid);
     }
     compensated
 }
@@ -2230,6 +2237,48 @@ mod tests {
             assert!(out.is_empty(), "已删会话不得因残留 LAST_SEEN 复活未读");
         }
 
+        /// P2：JSONL 暂缺时不得先消费 LAST_SEEN；文件出现后下一轮仍能补一次。
+        #[test]
+        fn missing_jsonl_keeps_observation_for_retry() {
+            let home = tempfile::tempdir().unwrap();
+            let now = now_ms();
+            let last_seen = Mutex::new(HashMap::from([(
+                11952u32,
+                ("workbuddy".to_string(), SID.to_string()),
+            )]));
+            let no_deleted: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let out = compensate_vanished_heartbeats_in_with_deleted(
+                home.path(),
+                now,
+                &last_seen,
+                &|_| None,
+                &|_| false,
+                &|_| false,
+                &no_deleted,
+            );
+            assert!(out.is_empty());
+            assert!(
+                last_seen.lock().unwrap().contains_key(&11952),
+                "JSONL 暂缺时观测必须保留，供下一轮重试"
+            );
+
+            write_jsonl(home.path(), SID, ASSISTANT_TAIL);
+            let out2 = compensate_vanished_heartbeats_in_with_deleted(
+                home.path(),
+                now,
+                &last_seen,
+                &|_| None,
+                &|_| false,
+                &|_| false,
+                &no_deleted,
+            );
+            assert_eq!(out2.len(), 1, "文件出现后应补一次");
+            assert!(
+                !last_seen.lock().unwrap().contains_key(&11952),
+                "补偿后消费观测"
+            );
+        }
+
         /// P2-3 按工具隔离：观测表条目携带工具归属，非 workbuddy 条目不代偿
         #[test]
         fn foreign_tool_entry_is_skipped_not_compensated() {
@@ -2718,6 +2767,26 @@ mod db_activity_tests {
     use super::*;
 
     const NOW: i64 = 1_793_343_808_404; // 真机快照时刻量级（ms）
+
+    /// P2：mtime 不可得 = 未知，不得当成“刚刚活跃”；completed 仍应按 DB 活动下板。
+    #[test]
+    fn live_requires_known_mtime_for_completed() {
+        let now = 1_793_000_000_000u64;
+        assert!(
+            !workbuddy_is_live(Some("completed"), Some((now - 400_000) as i64), None, now),
+            "mtime 未知 + DB 超窗 → 不 live"
+        );
+        assert!(workbuddy_is_live(
+            Some("completed"),
+            Some((now - 400_000) as i64),
+            Some(now - 1_000),
+            now
+        ));
+        assert!(
+            workbuddy_is_live(Some("working"), Some((now - 400_000) as i64), None, now),
+            "working 无条件在场"
+        );
+    }
 
     type SeedRow<'a> = (&'a str, &'a str, Option<i64>, i64, Option<i64>);
 
