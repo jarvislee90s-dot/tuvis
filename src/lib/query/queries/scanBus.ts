@@ -19,6 +19,7 @@ import { useEffect, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { SESSIONS_QUERY_KEY } from "@/lib/query/optimisticSessions";
 
 export type ScanMode = "active" | "idle" | "away";
 
@@ -66,7 +67,7 @@ export function useScanMode(): number {
       if (!alive || !isScanMode(e.payload?.mode)) return;
       sawEventRef.current = true;
       setMode(e.payload.mode);
-      void queryClient.invalidateQueries({ queryKey: ["sessions"] });
+      void queryClient.invalidateQueries({ queryKey: SESSIONS_QUERY_KEY });
     }).catch(() => () => {});
     return () => {
       alive = false;

@@ -491,16 +491,33 @@ fn publish(data: SessionsResponse, started_ms: i64) -> Arc<Snapshot> {
     // R10：只有**启动晚于超时**的扫描成功才能复位 degraded 窗口。启动早于超时的
     // 扫描（典型：动作补扫超时后，之前那轮在飞扫描才发布）发布的是旧视图，
     // 无条件清零会让 F3 的 30s 诊断窗口毫秒级不可观测。
-    let mut last_timeout = LAST_TIMEOUT_MS.load(Ordering::SeqCst);
+    clear_timeout_after(
+        started_ms,
+        || LAST_TIMEOUT_MS.load(Ordering::SeqCst),
+        |expected, new| {
+            LAST_TIMEOUT_MS.compare_exchange(expected, new, Ordering::SeqCst, Ordering::SeqCst)
+        },
+    );
+    drop(guard);
+    snap
+}
+
+/// R10 复位核心（可测）：仅当 `started_ms` 晚于最近一次超时才 CAS 清零。
+///
+/// 发布期间可能有并发 `note_timeout` 写入更新的超时时刻——CAS `Err` 时按**最新值**
+/// 重判，绝不盲清：新一轮超时的 30s 窗口不会被本轮旧扫描的发布抹掉。
+fn clear_timeout_after(
+    started_ms: i64,
+    mut load: impl FnMut() -> i64,
+    mut cas: impl FnMut(i64, i64) -> Result<i64, i64>,
+) {
+    let mut last_timeout = load();
     while started_ms > last_timeout && last_timeout != 0 {
-        match LAST_TIMEOUT_MS.compare_exchange(last_timeout, 0, Ordering::SeqCst, Ordering::SeqCst)
-        {
+        match cas(last_timeout, 0) {
             Ok(_) => break,
             Err(current) => last_timeout = current,
         }
     }
-    drop(guard);
-    snap
 }
 
 /// 生产启动：常驻线程（首个扫描立即执行，之后按档位）
@@ -1204,6 +1221,56 @@ mod tests {
         );
         let _ = publish_at_for_test(now + 1, || resp(SessionStatus::Idle));
         assert!(!is_degraded(), "下一次启动晚于超时的扫描发布后复位");
+    }
+
+    /// R10 CAS Err（扫描在飞期间并发记录新超时）：发布方按最新值重判，
+    /// 不盲清——新一轮超时的 30s 窗口保留。
+    #[test]
+    fn clear_timeout_keeps_newer_timeout_on_cas_conflict() {
+        let mut cas_calls = Vec::new();
+        clear_timeout_after(100, || 50, |expected, new| {
+            cas_calls.push((expected, new));
+            // 模拟并发 note_timeout 在 load 与 CAS 之间写入更新的超时时刻
+            Err(150)
+        });
+        assert_eq!(
+            cas_calls,
+            vec![(50, 0)],
+            "CAS 冲突后应停止写入，最新超时窗口不得被旧扫描抹掉"
+        );
+    }
+
+    /// R10 CAS Err（并发发布已清零窗口）：本轮无需再写，直接收敛。
+    #[test]
+    fn clear_timeout_stops_when_concurrent_publish_already_cleared() {
+        let mut cas_calls = 0;
+        clear_timeout_after(100, || 50, |_, _| {
+            cas_calls += 1;
+            Err(0)
+        });
+        assert_eq!(cas_calls, 1, "读到最新值 0 后应退出重试循环");
+    }
+
+    /// R10 CAS Ok：启动晚于超时的发布只清零一次；无超时窗口时一次 CAS 都不发。
+    #[test]
+    fn clear_timeout_clears_once_when_cas_succeeds() {
+        let mut cas_calls = Vec::new();
+        clear_timeout_after(100, || 50, |expected, new| {
+            cas_calls.push((expected, new));
+            Ok(expected)
+        });
+        assert_eq!(cas_calls, vec![(50, 0)]);
+
+        let mut cas_calls = 0;
+        clear_timeout_after(
+            100,
+            || 0,
+            |_, _| {
+                cas_calls += 1;
+                Ok(0)
+            },
+        );
+        assert_eq!(cas_calls, 0, "无窗口（0）时不得触发 CAS");
     }
 
     #[test]
