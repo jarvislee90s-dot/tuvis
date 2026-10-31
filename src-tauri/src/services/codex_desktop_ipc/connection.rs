@@ -114,6 +114,9 @@ pub struct RpcRequest {
     pub interaction_recheck: Option<std::sync::Arc<dyn Fn() -> Option<String> + Send + Sync>>,
     /// G04：账本动作的写边界异步复核（完整组投影）；写前调用。
     pub async_write_recheck: Option<crate::services::codex_desktop_ipc::types::AsyncWriteRecheck>,
+    /// P1（2026-10-30）：本次写出的已组装文本（仅 start-turn 携带）——随迟到槽位
+    /// 冻结，迟到回执的身份校验在 clientId 缺席时可作正文 hash 弱证据比对。
+    pub wire_text: Option<String>,
 }
 
 /// RPC 结果。`envelope_id` 恒为本次生成的 envelope UUID。
@@ -528,6 +531,7 @@ impl ConnectionHandle {
                     &req.method,
                     req.action_id.as_deref(),
                     req.pre_dispatch_turns.clone(),
+                    req.wire_text.clone(),
                 ) {
                     self.shared.budget.release(frame.len());
                     return RpcOutcome::not_sent(envelope_id, "late_slot_capacity");
