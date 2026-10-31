@@ -497,30 +497,34 @@ fn collect_file(
         b.push_cursor(read.next);
         return Ok(());
     }
-    let mut state: WbState = if read.rescan {
-        // 截断/重写：续读状态随文件代际一起重置（旧状态里的未配对调用指向的行已经不在了）
-        //
-        // **可观测性（评审 I4）**：`usage_detail` / `usage_daily` 是**加法账本**，
-        // 已被计过账的前缀从 0 重读会**重复计入**（子代理文件截断/重写即此风险；
-        // 不写成“UPSERT 幂等”）。行为不变，但必须留下运行期信号：
-        // 有旧游标 = 真的截断/重写（warn）；无旧游标 = 首读/回填（debug，预期路径）。
-        match ctx.cursor_of(file_key) {
-            Some(prev) => log::warn!(
-                "usage/workbuddy: {} 触发 rescan（截断/重写）：prev_byte_offset={} prev_file_size={} \
-                 new_file_size={} is_subagent={} —— 该文件已入账的用量会被**重复计入**（加法账本）",
-                jsonl.display(),
-                prev.byte_offset,
-                prev.file_size,
-                read.next.file_size,
-                is_subagent
-            ),
-            None => log::debug!(
-                "usage/workbuddy: {} 首次读取（从字节 0 回填）：file_size={} is_subagent={}",
-                jsonl.display(),
-                read.next.file_size,
-                is_subagent
-            ),
+    if read.rescan {
+        if let Some(prev) = ctx.cursor_of(file_key) {
+            // 已有游标的文件被截断/重写：`usage_detail`/`usage_daily` 是加法账本，从 0
+            // 重读会把已入账前缀再计一次。拒绝本轮该源写入，保留旧账本与旧游标；
+            // 后续需要按文件归属做专用重建（另开任务），不得用整库清空重采替代。
+            return Err(UsageError::new(
+                "usage-source-io",
+                format!(
+                    "workbuddy rescan detected for {} (prev byte_offset={}, prev file_size={}, \
+                     new file_size={}, is_subagent={}); refusing additive ledger write; \
+                     old ledger and cursor preserved; a file-scoped WorkBuddy rebuild is required \
+                     (do not clear the whole usage ledger)",
+                    jsonl.display(),
+                    prev.byte_offset,
+                    prev.file_size,
+                    read.next.file_size,
+                    is_subagent
+                ),
+            ));
         }
+        log::debug!(
+            "usage/workbuddy: {} 首次读取（从字节 0 回填）：file_size={} is_subagent={}",
+            jsonl.display(),
+            read.next.file_size,
+            is_subagent
+        );
+    }
+    let mut state: WbState = if read.rescan {
         WbState::default()
     } else {
         // **游标必须被读**：增量读从文件中段开始时，上一轮发起的工具调用还在等回执，
@@ -1384,11 +1388,11 @@ mod tests {
         );
     }
 
-    /// 截断 / 重写 → `rescan` → 本文件的**续读状态必须重置**（旧状态指向的行已经不在了）。
-    /// 沿用旧状态的后果：新文件里一条「无配对键的回执行」会配到**上一代文件**的调用上，
-    /// 凭空多出一个耗时（错算）。
+    /// 已有游标的文件被截断 / 重写 → 拒绝写入加法账本，保留旧账本与旧游标。
+    /// 不能像旧实现那样从 0 重读并继续累加（已入账前缀会重复计入）；需要按文件归属
+    /// 做专用重建（另开任务），而不是整库清空重采。
     #[test]
-    fn truncated_rewrite_resets_the_pending_tool_state() {
+    fn truncated_rewrite_with_cursor_is_refused_without_ledger_write() {
         let dir = tempfile::tempdir().unwrap();
         make_db(dir.path(), &[("s1", "/p/A")]);
         write_jsonl(
@@ -1425,14 +1429,18 @@ mod tests {
             .iter()
             .map(|c| (c.session_id.clone(), c.clone()))
             .collect();
-        let (d2, _) = run(dir.path(), &cursors);
+        let ctx = CollectContext::new(dir.path(), 1_700_000_000_000, &cursors);
+        let err = collect_with_home(&ctx, dir.path())
+            .expect_err("已有游标的重扫必须整源报错，不得继续追加加法账本");
+        assert_eq!(err.code, "usage-source-io");
         assert!(
-            d2.cursors[0].byte_offset < c1.byte_offset,
-            "前提：更短的重写必须触发 rescan（游标按新文件重算）"
+            err.detail.contains("rescan") && err.detail.contains("file-scoped"),
+            "错误必须说明重扫与专用重建：{}",
+            err.detail
         );
         assert!(
-            d2.details.is_empty(),
-            "状态必须随 rescan 重置：沿用旧状态会凭空配出 500ms 的假耗时"
+            c1.state_json.contains("call_1"),
+            "旧游标保持原样（由调用方保留，不得被本轮覆盖）"
         );
     }
 
@@ -2225,14 +2233,10 @@ mod tests {
         assert!(st.subagent_session_id.is_empty());
     }
 
-    /// **I4 的可观测面**：子代理文件被截断/重写（`rescan`）时，续读状态（含缓存的身份）
-    /// 必须随之重置并**重新解析**——否则截断后的新代际会沿用旧 sessionId 入账（串号）。
-    ///
-    /// ⚠️ 双计风险本身**没有**被解决：`usage_detail`/`usage_daily` 是加法账本，重读的用量
-    /// 会重复计入；实现只在 rescan 分支打 warn（有旧游标 = 真实截断/重写；无游标 = 首读）。
-    /// 仓内无日志捕获设施（W-37），故这里断言**行为面**：重置 + 重解析。
+    /// 子代理文件被截断/重写且已有游标 → 同样拒绝写入（不能再按新身份入账）；
+    /// 旧身份游标保留，等待专用重建。首次读取仍按原逻辑解析身份。
     #[test]
-    fn subagent_rescan_resets_the_cached_identity() {
+    fn subagent_rescan_with_cursor_is_refused() {
         const SID2: &str = "01a18b3a-d9f7-78f2-bc3a-3425a34f54db";
         let dir = tempfile::tempdir().unwrap();
         make_db(dir.path(), &[("s1", "/p/A")]);
@@ -2286,24 +2290,20 @@ mod tests {
             .iter()
             .map(|c| (c.session_id.clone(), c.clone()))
             .collect();
-        let (d2, _) = run(dir.path(), &cursors);
-        assert!(
-            d2.sessions.iter().any(|s| s.session_id == SID2),
-            "rescan 后必须按新代际重新解析身份（沿用旧缓存 = 串号）：{:?}",
-            d2.sessions
-                .iter()
-                .map(|s| s.session_id.as_str())
-                .collect::<Vec<_>>()
-        );
-        let sub_cursor = d2
+        let ctx = CollectContext::new(dir.path(), 1_700_000_000_000, &cursors);
+        let err = collect_with_home(&ctx, dir.path())
+            .expect_err("子代理文件重扫也必须拒绝追加，避免新身份/旧账本混合");
+        assert_eq!(err.code, "usage-source-io");
+        assert!(err.detail.contains("is_subagent=true"), "{}", err.detail);
+        let old_sub = d1
             .cursors
             .iter()
             .find(|c| c.session_id.contains("subagents"))
             .unwrap();
         assert!(
-            sub_cursor.state_json.contains(SID2),
-            "游标状态里缓存的身份必须刷新：{}",
-            sub_cursor.state_json
+            old_sub.state_json.contains(SUBAGENT_ID),
+            "旧游标身份保持原样，等待专用重建：{}",
+            old_sub.state_json
         );
     }
 

@@ -30,11 +30,36 @@ struct WorkBuddyTailDigest {
     last_work_ms: Option<u64>,
 }
 
-fn line_timestamp_ms(line: &str) -> Option<u64> {
-    serde_json::from_str::<serde_json::Value>(line)
-        .ok()?
-        .get("timestamp")?
-        .as_u64()
+/// 明确“产生新工作”的条目：用户消息、模型请求/回复、工具执行。
+/// 辅助记录（`credit-usage` / `ai-title` / `file-history-snapshot` / `reasoning` /
+/// 快照等）不得推进新工作时间，否则后台记账或标题更新会让已读卡复活。
+fn line_is_work_event(v: &serde_json::Value) -> bool {
+    if v.pointer("/message/usage")
+        .map(|u| u.is_object())
+        .unwrap_or(false)
+    {
+        return true; // 一次模型请求（真机 usage 在 message.usage）
+    }
+    match v["type"].as_str().unwrap_or_default() {
+        "function_call" | "function_call_result" => true,
+        "message" => matches!(
+            v["role"].as_str().unwrap_or_default(),
+            "user" | "assistant" | ""
+        ),
+        _ => false,
+    }
+}
+
+/// 只返回“新工作”条目的行内时间戳；辅助记录与 mtime/DB 更新不参与。
+fn line_work_timestamp_ms(line: &str) -> Option<u64> {
+    let v: serde_json::Value = serde_json::from_str(line).ok()?;
+    line_is_work_event(&v)
+        .then(|| v.get("timestamp").and_then(|t| t.as_u64()))
+        .flatten()
+}
+
+fn last_work_ms_from_lines(lines: &[String]) -> Option<u64> {
+    lines.iter().filter_map(|l| line_work_timestamp_ms(l)).max()
 }
 
 fn read_workbuddy_tail_digest(jsonl: &Path) -> WorkBuddyTailDigest {
@@ -44,7 +69,7 @@ fn read_workbuddy_tail_digest(jsonl: &Path) -> WorkBuddyTailDigest {
         status_core,
         tail_kind,
         last_message: lines.iter().rev().find_map(|l| extract_message_text(l)),
-        last_work_ms: lines.iter().filter_map(|l| line_timestamp_ms(l)).max(),
+        last_work_ms: last_work_ms_from_lines(&lines),
     }
 }
 
@@ -812,14 +837,10 @@ pub fn get_workbuddy_sessions_with(
         .flatten()
         .max();
         let eff_age_ms = eff_activity_ms.map_or(0, |a| now.saturating_sub(a));
-        // 已读生命周期用的“新工作”时间：尾部行内时间戳（或 DB 活动）优先；
-        // **不以 jsonl mtime 覆盖**（touch 不算新工作）。都缺失才退回 mtime。
-        let session_activity_ms = [d.last_work_ms, c.db_activity_ms.map(|a| a.max(0) as u64)]
-            .into_iter()
-            .flatten()
-            .max()
-            .or(jsonl_mtime_ms)
-            .or(c.last_heartbeat_ms);
+        // 已读生命周期专用“新工作”时间：只取明确的业务条目（用户消息 / 模型请求 /
+        // 工具执行），不混入 DB 活动、mtime 或心跳——那些只能证明“在场”，不能证明
+        // “产生了新回合”。没有业务条目时为 None，已读卡不会因普通后台更新复活。
+        let session_activity_ms = d.last_work_ms;
         let status = if working {
             // AC9：DB 说在干活 → 上拉 Processing（不因父会话静默而掉卡/误绿）
             SessionStatus::Processing
@@ -956,8 +977,32 @@ pub fn compensate_vanished_heartbeats_in_with_deleted(
     home: &Path,
     now_ms: u64,
     last_seen: &Mutex<HashMap<u32, (String, String)>>,
-    status_of: &dyn Fn(&str) -> Option<String>,
+    _status_of: &dyn Fn(&str) -> Option<String>,
     was_read: &dyn Fn(&str) -> bool,
+    is_live: &dyn Fn(&str) -> bool,
+    deleted_ids: &std::collections::HashSet<String>,
+) -> Vec<crate::database::dao::unread::UnreadSessionRecord> {
+    // 兼容旧调用：布尔已读没有时间，映射为“覆盖全部工作”（true 仍按旧语义跳过）；
+    // 生产入口走 `_with_read_at`，按“已读时间 vs 最后一次新工作”精确判定。
+    let read_at_of = |sid: &str| was_read(sid).then_some(i64::MAX);
+    compensate_vanished_heartbeats_in_with_read_at(
+        home,
+        now_ms,
+        last_seen,
+        &read_at_of,
+        is_live,
+        deleted_ids,
+    )
+}
+
+/// 补偿核心（携带已读时间）：心跳消失 ∧ 终态完成 ∧ 未被“已读时间覆盖最后一次新工作”
+/// → 产出未读记录。`status_of` 的 Idle 字符串不再单独作为阻断条件：状态缓存无法证明
+/// 它处理的是当前工作回合；只有已读墓碑时间与最后新工作时间的关系能证明。
+pub fn compensate_vanished_heartbeats_in_with_read_at(
+    home: &Path,
+    now_ms: u64,
+    last_seen: &Mutex<HashMap<u32, (String, String)>>,
+    read_at_of: &dyn Fn(&str) -> Option<i64>,
     is_live: &dyn Fn(&str) -> bool,
     deleted_ids: &std::collections::HashSet<String>,
 ) -> Vec<crate::database::dao::unread::UnreadSessionRecord> {
@@ -1030,18 +1075,14 @@ pub fn compensate_vanished_heartbeats_in_with_deleted(
             last_seen.lock().unwrap().remove(&pid);
             continue;
         }
-        // review M1：状态缓存已记录「绿已被 sync 观测」（Idle/Finished）时，行缺席
-        // 是因为用户已读删行——补偿不得复活（否则一次性复活未读卡）。
-        // issue #35-1：缓存可能已失忆（离板 TTL 清理 / 兔维斯 重启），近期已读墓碑
-        // 提供不依赖缓存的已读信号，同样不得复活
-        if matches!(
-            status_of(&session_id).as_deref(),
-            Some("Idle") | Some("Finished")
-        ) || was_read(&session_id)
-        {
-            // 已绿/已读：完成态已明确处理，消费观测
-            last_seen.lock().unwrap().remove(&pid);
-            continue;
+        // 已读归属：只有已读时间覆盖“最后一次明确新工作”时，才认为本轮完成已处理；
+        // 已读早于最后新工作 = 上一轮已读后又有新回合，必须允许补一次。
+        if let Some(read_at) = read_at_of(&session_id) {
+            let last_work = last_work_ms_from_lines(&lines).map(|t| t as i64);
+            if last_work.is_none_or(|work| read_at >= work) {
+                last_seen.lock().unwrap().remove(&pid);
+                continue;
+            }
         }
         let last_message = lines.iter().rev().find_map(|l| extract_message_text(l));
         compensated.push(crate::database::dao::unread::UnreadSessionRecord {
@@ -1284,13 +1325,12 @@ pub fn compensate_vanished_heartbeats() {
             crate::database::dao::unread::delete("workbuddy", sid);
         }
     }
-    for record in compensate_vanished_heartbeats_in_with_deleted(
+    for record in compensate_vanished_heartbeats_in_with_read_at(
         &home,
         now,
         &LAST_SEEN_SESSIONS,
-        &|sid| crate::database::find_status(sid),
-        // issue #35-1：已读墓碑判据（不依赖状态缓存的存活期）
-        &|sid| crate::database::dao::unread::was_read_recently("workbuddy", sid, now as i64),
+        // issue #35-1：已读墓碑时间（不依赖状态缓存）；补偿按“已读是否覆盖最后新工作”判定
+        &|sid| crate::database::dao::unread::read_tombstone_at("workbuddy", sid),
         &is_live,
         &deleted_ids,
     ) {
@@ -1749,6 +1789,33 @@ mod tests {
 
     // ---- 心跳消失竞态补偿（spec §8 测试策略：tempdir 驱动，注入 home/时钟/观测表）----
 
+    /// 新工作判据只认业务条目；后台记账/标题/快照不得推进时间。
+    #[test]
+    fn new_work_timestamp_ignores_auxiliary_records() {
+        let lines = vec![
+            r#"{"type":"message","role":"user","timestamp":1000}"#.to_string(),
+            r#"{"type":"credit-usage","timestamp":9000}"#.to_string(),
+            r#"{"type":"ai-title","timestamp":9100}"#.to_string(),
+            r#"{"type":"file-history-snapshot","timestamp":9200}"#.to_string(),
+            r#"{"type":"function_call","name":"Bash","timestamp":8500}"#.to_string(),
+        ];
+        assert_eq!(last_work_ms_from_lines(&lines), Some(8500));
+        assert_eq!(
+            line_work_timestamp_ms(r#"{"type":"credit-usage","timestamp":9000}"#),
+            None
+        );
+        assert_eq!(
+            line_work_timestamp_ms(r#"{"type":"message","role":"assistant","timestamp":7000}"#),
+            Some(7000)
+        );
+        assert_eq!(
+            line_work_timestamp_ms(
+                r#"{"type":"message","role":"assistant","timestamp":7200,"message":{"usage":{"input_tokens":1}}}"#
+            ),
+            Some(7200)
+        );
+    }
+
     mod compensation_tests {
         use super::*;
 
@@ -1869,10 +1936,33 @@ mod tests {
             assert_eq!(out.len(), 1); // 过期 = 视为消失，终态完成 → 补
         }
 
-        /// review M1 回归锁：用户已读删行后 prewarm 回池（心跳消失），
-        /// 状态缓存记录「绿已被观测」（Idle/Finished）→ 补偿不得复活未读行
+        /// review M1 回归锁：用户已读删行后 prewarm 回池（心跳消失）→ 补偿不得复活。
+        /// 新契约下阻断依据是已读墓碑，而不是 status 缓存里的 "Idle" 字符串。
         #[test]
         fn read_dismissed_green_session_is_not_resurrected() {
+            let home = tempfile::tempdir().unwrap();
+            write_jsonl(home.path(), SID, ASSISTANT_TAIL);
+            let last_seen = Mutex::new(HashMap::from([(
+                11952u32,
+                ("workbuddy".to_string(), SID.to_string()),
+            )]));
+            let status_of = |sid: &str| (sid == SID).then(|| "Idle".to_string());
+            let out = compensate_vanished_heartbeats_in(
+                home.path(),
+                10_000,
+                &last_seen,
+                &status_of,
+                &|sid| sid == SID, // 已读墓碑
+                &|_| false,
+            );
+            assert!(out.is_empty(), "已读会话不得经补偿复活未读行");
+            // 消失条目照常移除，不滞留
+            assert!(last_seen.lock().unwrap().is_empty());
+        }
+
+        /// 状态缓存 Idle 本身不能证明“用户已读”；没有墓碑时必须补一次。
+        #[test]
+        fn status_cache_idle_alone_does_not_block_compensation() {
             let home = tempfile::tempdir().unwrap();
             write_jsonl(home.path(), SID, ASSISTANT_TAIL);
             let last_seen = Mutex::new(HashMap::from([(
@@ -1888,9 +1978,45 @@ mod tests {
                 &|_| false,
                 &|_| false,
             );
-            assert!(out.is_empty(), "已观测绿的会话不得经补偿复活未读行");
-            // 消失条目照常移除，不滞留
-            assert!(last_seen.lock().unwrap().is_empty());
+            assert_eq!(out.len(), 1, "Idle 缓存不能单独阻断完成通知");
+        }
+
+        /// 上一轮已读 → 新一轮有明确新工作 → 允许补；已读时间覆盖最后新工作 → 跳过。
+        #[test]
+        fn compensation_uses_read_time_against_last_work() {
+            let home = tempfile::tempdir().unwrap();
+            write_jsonl(
+                home.path(),
+                SID,
+                r#"{"type":"message","role":"assistant","timestamp":5000,"content":[{"type":"output_text","text":"完成"}]}"#,
+            );
+            let last_seen = Mutex::new(HashMap::from([(
+                11952u32,
+                ("workbuddy".to_string(), SID.to_string()),
+            )]));
+            let out = compensate_vanished_heartbeats_in_with_read_at(
+                home.path(),
+                10_000,
+                &last_seen,
+                &|_| Some(4_000), // 已读早于最后新工作 → 新回合
+                &|_| false,
+                &std::collections::HashSet::new(),
+            );
+            assert_eq!(out.len(), 1, "已读后又有新工作，必须补一次");
+
+            last_seen
+                .lock()
+                .unwrap()
+                .insert(11952, ("workbuddy".to_string(), SID.to_string()));
+            let out2 = compensate_vanished_heartbeats_in_with_read_at(
+                home.path(),
+                10_000,
+                &last_seen,
+                &|_| Some(6_000), // 已读覆盖最后新工作
+                &|_| false,
+                &std::collections::HashSet::new(),
+            );
+            assert!(out2.is_empty(), "已读覆盖当前完成时不得重复补");
         }
 
         /// issue #35-1 回归锁：状态缓存失忆（status_of=None，跨过缓存 TTL / 兔维斯
@@ -3266,8 +3392,8 @@ mod board_tests {
         assert!(out.is_empty(), "已删会话的残留心跳不得复活卡片");
     }
 
-    /// **P2.1**：已读完成卡的“新工作”时间取行内 timestamp（或 DB 活动），
-    /// 只 touch mtime 不得把它推新；并保留毫秒精度。
+    /// **P2.1**：已读完成卡的“新工作”时间只取业务条目的行内 timestamp，
+    /// 不混入 DB 活动/mtime；只 touch 不得推新，并保留毫秒精度。
     #[test]
     fn db_only_completed_last_activity_ignores_mtime_touch() {
         let home = tempfile::tempdir().unwrap();

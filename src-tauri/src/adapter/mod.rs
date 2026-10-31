@@ -3609,6 +3609,65 @@ mod unread_card_tests {
         assert!(stored.contains_key("codex\u{1f}s2"));
     }
 
+    /// 跨重启模拟（真实 SQLite 文件）：首次 INSERT 失败 → pending 落盘 → 重开连接/建表
+    /// → 恢复标记并补插成功；另测失败后已读墓碑导致重启后不复活。
+    /// 注：单测在同一进程内以“丢弃连接 + 重新加载内存状态”模拟重启，不依赖真实应用进程。
+    #[test]
+    fn pending_retry_restart_after_real_insert_failure() {
+        use crate::database::dao::unread;
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("tuvis.db");
+        let since = chrono::Utc::now().timestamp_millis();
+        let record = UnreadSessionRecord {
+            tool_id: "workbuddy".into(),
+            session_id: "s-restart".into(),
+            project_name: "p".into(),
+            title: None,
+            last_message: None,
+            turned_green_at_ms: since,
+            expires_at_ms: since + 24 * 3600 * 1000,
+        };
+
+        // 真实 SQLite 失败：表尚未建立 → INSERT 返回 false
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        assert!(
+            !unread::upsert_unread(&conn, &record),
+            "缺表时必须真实插入失败"
+        );
+        drop(conn);
+
+        let path = dir.path().join("unread_pending_retries.json");
+        let mut pending = HashMap::new();
+        pending.insert("workbuddy\u{1f}s-restart".to_string(), since);
+        assert!(persist_pending_map(&path, &pending));
+
+        // 模拟重启：新连接 + 建表 + 新内存状态从 pending 文件恢复
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        crate::database::schema::init(&conn);
+        let loaded = AtomicBool::new(false);
+        let retries = Mutex::new(HashMap::new());
+        load_pending_unread_retries_into(&path, &loaded, &retries);
+        assert!(loaded.load(Ordering::Acquire));
+        assert_eq!(
+            retries
+                .lock()
+                .unwrap()
+                .get(&("workbuddy".to_string(), "s-restart".to_string())),
+            Some(&since)
+        );
+        assert!(unread::upsert_unread(&conn, &record), "恢复后补插应成功");
+        assert!(unread::exists_unread_conn(&conn, "workbuddy", "s-restart"));
+        assert!(persist_pending_map(&path, &HashMap::new()));
+
+        // 失败后用户已读再重启：墓碑覆盖本回合 → 不补插
+        let read_at = since + 1;
+        unread::mark_read_tombstone_conn(&conn, "workbuddy", "s-restart", read_at);
+        assert!(
+            insert_should_skip_for_read(Some(since), Some(read_at), None),
+            "已读墓碑覆盖 pending since 时不得在重启后复活"
+        );
+    }
+
     /// P1：已删会话的未读池行不得合并为卡；其他工具同 id 不受影响。
     #[test]
     fn deleted_workbuddy_pool_rows_are_not_merged_to_cards() {
