@@ -20,8 +20,8 @@ pub struct UnreadSessionRecord {
 /// 冲突时仅刷新展示快照（project_name/title/last_message）；
 /// turned_green_at/expires_at 保留首次转绿值——spec §5 口径：turned_green_at＝转绿时间、
 /// expires_at＝首绿 +24h 兜底，若随每轮轮询刷新会让 24h 窗口无限滑动、永不过期
-pub fn upsert_unread(conn: &Connection, r: &UnreadSessionRecord) {
-    let _ = conn.execute(
+pub fn upsert_unread(conn: &Connection, r: &UnreadSessionRecord) -> bool {
+    conn.execute(
         "INSERT INTO unread_sessions
             (tool_id, session_id, project_name, title, last_message, turned_green_at, expires_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
@@ -38,7 +38,8 @@ pub fn upsert_unread(conn: &Connection, r: &UnreadSessionRecord) {
             r.turned_green_at_ms,
             r.expires_at_ms
         ],
-    );
+    )
+    .is_ok()
 }
 
 /// 单条物理删除（已读 / 手动关闭等终态直接删行）
@@ -169,7 +170,13 @@ pub fn cleanup_expired_read_tombstones_conn(conn: &Connection, now_ms: i64) {
 
 pub fn upsert(r: &UnreadSessionRecord) {
     let conn = DB.lock().unwrap();
-    upsert_unread(&conn, r);
+    let _ = upsert_unread(&conn, r);
+}
+
+/// 落库是否成功（补偿事务：成功后才消费观测；失败保留重试）。
+pub fn try_upsert(r: &UnreadSessionRecord) -> bool {
+    let conn = DB.lock().unwrap();
+    upsert_unread(&conn, r)
 }
 
 pub fn delete(tool_id: &str, session_id: &str) {

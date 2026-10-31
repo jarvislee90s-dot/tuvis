@@ -16,6 +16,26 @@ pub(crate) fn read_recent_lines(path: &Path, max_lines: usize) -> Vec<String> {
     read_recent_lines_with_budget(path, max_lines, TAIL_BYTES).0
 }
 
+/// 尾部读取的**可失败**版本：文件缺失/不可读/行读取失败都返回 Err。
+/// 补偿用它区分“空文件/非完成态”与“读失败”，读失败时保留观测重试。
+pub(crate) fn read_recent_lines_result(
+    path: &Path,
+    max_lines: usize,
+) -> std::io::Result<Vec<String>> {
+    let file = File::open(path)?;
+    let file_size = file.metadata()?.len();
+    let truncated = file_size > TAIL_BYTES;
+    let mut reader = BufReader::new(file);
+    if truncated {
+        reader.seek(SeekFrom::End(-(TAIL_BYTES as i64)))?;
+        let mut partial = String::new();
+        reader.read_line(&mut partial)?;
+    }
+    let lines: Vec<String> = reader.lines().collect::<std::io::Result<Vec<_>>>()?;
+    let start = lines.len().saturating_sub(max_lines);
+    Ok(lines[start..].to_vec())
+}
+
 /// 带字节预算的尾部读取（Bug 1，M3 验收）：返回 (行集, 头部是否被截断)。
 /// 内容层按需单会话读取以 `512KB×⌈limit/200⌉` 放大窗，据此向移动端发 truncated
 /// 信号（「加载更早消息」可达性）；轮询路径解析器仍走 read_recent_lines（512KB

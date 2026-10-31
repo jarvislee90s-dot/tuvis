@@ -1013,7 +1013,18 @@ pub fn compensate_vanished_heartbeats_in_with_deleted(
             // 不在此消费，避免“本轮无产物 + 下一轮失去依据”的永久漏通知。
             continue;
         };
-        let lines = read_recent_lines(&jsonl, 500);
+        let lines = match crate::monitor::jsonl::read_recent_lines_result(&jsonl, 500) {
+            Ok(lines) => lines,
+            Err(e) => {
+                // 路径存在但读失败（权限/IO/IsADirectory）→ 终态未知，保留观测重试；
+                // 不能把空数组当 Waiting 消费掉观测（否则文件恢复后永久漏通知）。
+                log::warn!(
+                    "workbuddy: 补偿读取 {} 失败，保留观测重试: {e}",
+                    jsonl.display()
+                );
+                continue;
+            }
+        };
         if derive_status_from_tail(&lines) != SessionStatus::Idle {
             // 非完成态（运行中被杀/仍在跑）→ 无完成通知可发，消费观测
             last_seen.lock().unwrap().remove(&pid);
@@ -1049,8 +1060,8 @@ pub fn compensate_vanished_heartbeats_in_with_deleted(
             turned_green_at_ms: now_ms as i64,
             expires_at_ms: now_ms as i64 + 24 * 3600 * 1000,
         });
-        // 已完成补偿 → 消费观测（下一轮不再重复）
-        last_seen.lock().unwrap().remove(&pid);
+        // 记录产出后**不在此消费观测**：由调用方在 unread 落库成功后移除；
+        // 落库失败则保留，下一轮重试（补偿事务语义）。
     }
     compensated
 }
@@ -1283,7 +1294,18 @@ pub fn compensate_vanished_heartbeats() {
         &is_live,
         &deleted_ids,
     ) {
-        crate::database::dao::unread::upsert(&record);
+        // 补偿事务：落库成功后才消费观测；失败保留，下一轮重试（不丢完成通知）。
+        if crate::database::dao::unread::try_upsert(&record) {
+            LAST_SEEN_SESSIONS
+                .lock()
+                .unwrap()
+                .retain(|_, (tool, sid)| !(tool == "workbuddy" && sid == &record.session_id));
+        } else {
+            log::warn!(
+                "workbuddy: 补偿未读落库失败（session {}），保留观测下轮重试",
+                record.session_id
+            );
+        }
     }
     // issue #35-2：本轮终态落库（upsert 在场观测 + 删除已被补偿消费的 pid + 超龄清理）
     sync_observations_to_db(now);
@@ -1773,8 +1795,8 @@ mod tests {
             assert_eq!(out[0].session_id, SID);
             assert_eq!(out[0].tool_id, "workbuddy");
             assert_eq!(out[0].turned_green_at_ms, 10_000); // 以补偿时刻为转绿时间
-                                                           // 已消失条目从观测表移除，下轮不重复补偿
-            assert!(last_seen.lock().unwrap().is_empty());
+                                                           // 核心只产出记录、不消费观测；生产入口在 unread 落库成功后移除（事务语义）
+            assert!(last_seen.lock().unwrap().contains_key(&11952));
         }
 
         #[test]
@@ -2262,6 +2284,28 @@ mod tests {
                 "JSONL 暂缺时观测必须保留，供下一轮重试"
             );
 
+            // P2-1：路径存在但是目录/不可读 → 读失败也必须保留观测
+            let p = home
+                .path()
+                .join(".workbuddy/projects")
+                .join(mangle_project_path(CWD))
+                .join(format!("{SID}.jsonl"));
+            std::fs::create_dir_all(&p).unwrap();
+            let out_dir = compensate_vanished_heartbeats_in_with_deleted(
+                home.path(),
+                now,
+                &last_seen,
+                &|_| None,
+                &|_| false,
+                &|_| false,
+                &no_deleted,
+            );
+            assert!(out_dir.is_empty());
+            assert!(
+                last_seen.lock().unwrap().contains_key(&11952),
+                "JSONL 读取失败时观测必须保留，供下一轮重试"
+            );
+            std::fs::remove_dir_all(&p).unwrap();
             write_jsonl(home.path(), SID, ASSISTANT_TAIL);
             let out2 = compensate_vanished_heartbeats_in_with_deleted(
                 home.path(),
@@ -2273,10 +2317,8 @@ mod tests {
                 &no_deleted,
             );
             assert_eq!(out2.len(), 1, "文件出现后应补一次");
-            assert!(
-                !last_seen.lock().unwrap().contains_key(&11952),
-                "补偿后消费观测"
-            );
+            // 核心不消费；由生产入口在落库成功后移除，失败可重试
+            assert!(last_seen.lock().unwrap().contains_key(&11952));
         }
 
         /// P2-3 按工具隔离：观测表条目携带工具归属，非 workbuddy 条目不代偿
