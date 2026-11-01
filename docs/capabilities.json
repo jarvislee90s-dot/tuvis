@@ -1,6 +1,6 @@
 {
-  "$comment": "Tuvis 多终端能力矩阵单一数据源。README「多终端能力矩阵（总表）」的结构化版本，两处随发版同步更新；tuvis-website 官网经 api.github.com 拉取本文件渲染兼容矩阵。",
-  "updated": "2026-10-31",
+  "$comment": "能力矩阵唯一维护源。中英 README 由 pnpm sync:capabilities 生成；官网按同名应用 tag 同步此文件。支持状态、名称、备注和单元格说明只在此修改。",
+  "updated": "2026-11-02",
   "legend": {
     "yes": "✅ 支持",
     "partial": "◐ 部分",
@@ -74,7 +74,8 @@
             "zcode": "yes",
             "dsh": "partial"
           },
-          "note": "dsh 为只读"
+          "note": "dsh 为只读",
+          "noteEn": "dsh is read-only"
         },
         {
           "name": "MCP 管理",
@@ -90,7 +91,8 @@
             "zcode": "yes",
             "dsh": "no"
           },
-          "note": "ZCode 为 JSON 子树；dsh 暂不支持"
+          "note": "ZCode 为 JSON 子树；dsh 暂不支持",
+          "noteEn": "ZCode uses a JSON subtree; dsh is not supported yet"
         },
         {
           "name": "插件管理",
@@ -106,7 +108,8 @@
             "zcode": "no",
             "dsh": "no"
           },
-          "note": "Kimi 为文件型"
+          "note": "Kimi 为文件型",
+          "noteEn": "Kimi uses file-based plugins"
         },
         {
           "name": "状态 Hook",
@@ -174,7 +177,8 @@
             "zcode": "no",
             "dsh": "no"
           },
-          "note": "四家试验性：OpenClaw/WorkBuddy 黑盒无外部写通道，ZCode 预留无头通道，dsh 写通道另评"
+          "note": "四家试验性：OpenClaw/WorkBuddy 黑盒无外部写通道，ZCode 预留无头通道，dsh 写通道另评",
+          "noteEn": "Experimental for four CLI tools. OpenClaw and WorkBuddy have no external write channel; ZCode reserves a headless path, and dsh writing requires a separate review."
         },
         {
           "name": "手机 · 新建会话",
@@ -255,5 +259,79 @@
         }
       ]
     }
-  ]
+  ],
+  "toolNames": {
+    "claude": "Claude Code",
+    "codex": "Codex CLI / APP",
+    "opencode": "OpenCode",
+    "kimi": "Kimi Code",
+    "workbuddy": "WorkBuddy",
+    "zcode": "ZCode",
+    "dsh": "dsh",
+    "openclaw": "OpenClaw"
+  },
+  "cellDetails": {
+    "skill": {
+      "dsh": {
+        "zh": "只读",
+        "en": "read-only"
+      }
+    },
+    "mcp": {
+      "claude": {
+        "zh": "JSON",
+        "en": "JSON"
+      },
+      "codex": {
+        "zh": "TOML",
+        "en": "TOML"
+      },
+      "opencode": {
+        "zh": "JSONC",
+        "en": "JSONC"
+      },
+      "openclaw": {
+        "zh": "JSON",
+        "en": "JSON"
+      },
+      "kimi": {
+        "zh": "JSON",
+        "en": "JSON"
+      },
+      "workbuddy": {
+        "zh": "JSON",
+        "en": "JSON"
+      },
+      "zcode": {
+        "zh": "JSON 子树",
+        "en": "JSON subtree"
+      }
+    },
+    "plugin": {
+      "kimi": {
+        "zh": "文件型",
+        "en": "file-based"
+      }
+    },
+    "outputSpeed": {
+      "claude": {
+        "zh": "近似",
+        "en": "approximate"
+      },
+      "codex": {
+        "zh": "仅响应",
+        "en": "response only"
+      },
+      "opencode": {
+        "zh": "插件",
+        "en": "plugin"
+      }
+    }
+  },
+  "notes": {
+    "codex": {
+      "zh": "Codex 列同时涵盖 CLI 与 APP；桌面 APP 的远程控制见独立行，按操作契约证据开放。",
+      "en": "The Codex column covers both CLI and APP; Desktop APP control has its own row and is gated per operation by contract evidence."
+    }
+  }
 }

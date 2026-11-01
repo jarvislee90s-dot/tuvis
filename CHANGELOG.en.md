@@ -13,9 +13,14 @@ English · [中文](CHANGELOG.md)
 _Only versions translated so far are listed here; the full history lives in the
 [Chinese changelog](CHANGELOG.md)._
 
-## [0.6.4] - 2026-11-01
+## [0.6.4] - 2026-11-02
 
 ### Upgrade notes
+
+- **Legacy pause exception**: pause rows without a target-turn binding remain paused and require explicit resume. Automatic relay applies only when the target turn can be checked for terminal evidence.
+
+- **Adaptive session refresh**: active sessions use roughly 2-second scans, watched or remotely connected idle sessions roughly 10 seconds, and eligible away states roughly 30 seconds. Running tools without reliable event coverage retain the 10-second fallback. Existing settings need no migration.
+- **Background usage collection no longer depends on an open page**: visibility triggers collection with short-window deduplication; background deadlines use the configured interval plus a two-minute buffer (12 minutes by default). Manual collection remains available.
 
 - **The queue now relays automatically** — a queue frozen by an interrupt/cancel resumes in its original order as soon as the stopped turn is confirmed finished (matching Codex's own behaviour). It stays frozen only when that turn never reaches a confirmed end.
 - **"Send first" (prioritise) no longer requires a paused queue** — even on an unpaused queue it stops the running turn, then sends that one message; when the desktop is idle it sends straight away.
@@ -26,12 +31,20 @@ _Only versions translated so far are listed here; the full history lives in the
 
 ### Added
 
+- **Shared scan bus and adaptive refresh**: the main window, pet, tray and phone reuse one versioned session snapshot. Activity, visibility and remote connectivity set the cadence; file events can wake scans early, reducing duplicate process and session scans.
+
 - **Queue prioritise and re-edit**: each queue row shows position, a body preview, the character count, and Prioritise / Edit again / Retract. Prioritise (two-step confirm) stops the target turn when running, confirms its end, then sends that single message while the rest stay paused. Edit again restores the original text only after the server confirms retraction, and asks before replacing an existing draft.
 - **Combined sending when idle**: once the current turn ends naturally or the queue is explicitly resumed, consecutive queued messages from the same device and conversation are sent together in their original order separated by a blank line. Oversized content is split into batches; an unknown result asks you to verify the whole batch.
 - **Consolidated queue area**: pause explanation, resume entry and blocked reason now live in the queue area, collapsed to a one-line summary; the summary distinguishes "waiting for the turn to finish" from a genuine "needs manual check".
 - **Compact async question cards** with a single "other groups" entry.
 
 ### Fixed
+
+- **Cards returning after dismissal, reading or archiving**: single, batch, pet, jump and mobile actions share settlement. Post-write scan epochs and version arbitration reject stale snapshots; failures and timeouts restore authoritative state while preserving other pending actions.
+- **Missed multiwindow and usage refreshes**: main and pet visibility are tracked separately. Restoring visibility triggers collection; settings use receipt-backed refresh and reject older responses. Collection is coordinated across windows, and manual collection or interval changes reschedule background deadlines.
+- **Event coverage and safe cleanup**: all active session event files are monitored. Runtime hook availability determines fallback cadence. Startup reconciliation, batching and follow-up scans preserve events; stale files are quarantined and rechecked before deletion so concurrent new events are retained.
+- **CPU sampling and dsh hot scans**: expensive process fields are limited to candidate PIDs. Per-PID cumulative CPU and independent time windows separate status sampling from display updates; one exiting candidate does not discard other valid samples. dsh caches generation paths and deduplicates unchanged unknown-generation warnings.
+- **WorkBuddy deletion and read lifecycle**: deleted state is respected by the board, unread pool and compensation. Read DB-only completed cards remain absent until new activity; failed first-green writes retry within the current completion turn without duplicate notifications or stale read-state suppression.
 
 - **Async answering wrongly disabled on newer Desktop builds**: contract detection now verifies structure and reference relationships instead of minified variable names, so renames no longer disable it while real protocol changes are still refused.
 - **Formal answers with trailing whitespace kept questions pending**; they now reconcile correctly.
@@ -50,6 +63,10 @@ _Only versions translated so far are listed here; the full history lives in the
 - **WorkBuddy rescan duplicate accounting**: when a file with an existing cursor is truncated/rewritten, the round refuses additive writes and preserves the old ledger/cursor; the error points to a future file-scoped rebuild instead of silently re-reading from zero.
 
 ### Engineering
+
+- The scanner now owns single-flight admission, initial successful snapshot waiting, action refresh deadlines, panic recovery, poisoned process-snapshot rebuilding and worker-generation execution rights. In-flight slow scans are not forcibly restarted.
+- Added runtime identity, reason counters, failure backoff, restart and wait metrics, atomic stats files, and stable-process-tree measurement tools. Historical or simulated results are not presented as measurements of this release.
+- **One maintained capability matrix**: `docs/capabilities.json` generates both READMEs, and the website reads the matching application tag. Drift checks keep support states, cell details and the Codex CLI/APP note aligned.
 
 - WorkBuddy pending-unread retry snapshots now survive restarts with platform atomic replacement and `.bak` fallback; failed loads retry and cannot overwrite the old snapshot before loading completes. Windows uses `ReplaceFileW`/`MoveFileExW`.
 - Added WorkBuddy identity/lookup regressions: deleted main sessions stay reserved, symlinked directories are followed, permission recovery works, and cached conflicts are refused.

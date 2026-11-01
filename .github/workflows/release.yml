@@ -48,7 +48,7 @@ jobs:
       - name: Build mobile frontend
         # dist-mobile 产物不入库（.gitkeep 占位），rust-embed 构建期嵌入——
         # 每个 runner 都要先构建移动端，否则发布包里 /m 远程页为空
-        run: pnpm build:mobile
+        run: pnpm check:capabilities && pnpm build:mobile
 
       - name: Configure Tauri signing
         shell: bash

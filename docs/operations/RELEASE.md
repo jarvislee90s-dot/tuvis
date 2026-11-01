@@ -21,6 +21,8 @@ pnpm tauri signer generate -w ~/.tuvis/tauri.key   # 密码直接回车留空
 
 ## 每次发版步骤
 
+能力矩阵只维护 `docs/capabilities.json`，修改后运行 `pnpm sync:capabilities`，将生成的中英 README 一并提交；`pnpm check:capabilities` 校验产物漂移。官网按与自身 tag 对应的应用 tag 同步该 JSON，勿手改官网同步产物或 README 生成区。
+
 0. **发版文档两轮检查**：按 `AGENTS.md`「发版文档纪律」——先 diff 上一版 tag 做**变更覆盖
    检查**（CHANGELOG / release notes / README 是否全覆盖本版变更，梳理清单先交用户确认），
    再做**中英对照检查**（前端 locale、双语 README、用户手册 zh/en、更新日志
