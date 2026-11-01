@@ -2,7 +2,13 @@
 // header 必读（目录名 ~XXXX 转义不可反解 id，评审漏项 #3；header 兼得子 Agent 过滤字段）
 
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::decode::decode_zstd_frames;
 
@@ -37,6 +43,73 @@ pub struct DshEvent {
     pub data: serde_json::Value,
 }
 
+const GENERATION_PATH_CACHE_TTL: Duration = Duration::from_millis(2500);
+const GENERATION_PATH_CACHE_IDLE_RETENTION: Duration = Duration::from_secs(60);
+
+struct CachedGenerationPaths {
+    scanned_at: Instant,
+    last_used_at: Instant,
+    entries: Vec<(i64, PathBuf)>,
+}
+
+/// 会话目录到代际文件路径的短时索引；TTL 使用单调时间，不依赖目录 mtime。
+pub(super) struct GenerationPathCache {
+    ttl: Duration,
+    entries: Mutex<HashMap<PathBuf, CachedGenerationPaths>>,
+    #[cfg(test)]
+    enumerations: AtomicUsize,
+}
+
+impl Default for GenerationPathCache {
+    fn default() -> Self {
+        Self::new(GENERATION_PATH_CACHE_TTL)
+    }
+}
+
+impl GenerationPathCache {
+    fn new(ttl: Duration) -> Self {
+        Self {
+            ttl,
+            entries: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            enumerations: AtomicUsize::new(0),
+        }
+    }
+
+    pub(super) fn generation_logs_at(&self, dir: &Path, now: Instant) -> Vec<(i64, PathBuf)> {
+        let key = dir.to_path_buf();
+        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(cached) = entries.get_mut(&key) {
+            if now.saturating_duration_since(cached.scanned_at) < self.ttl {
+                cached.last_used_at = now;
+                return cached.entries.clone();
+            }
+        }
+
+        #[cfg(test)]
+        self.enumerations.fetch_add(1, Ordering::Relaxed);
+        let found = generation_logs(dir);
+        entries.insert(
+            key,
+            CachedGenerationPaths {
+                scanned_at: now,
+                last_used_at: now,
+                entries: found.clone(),
+            },
+        );
+        entries.retain(|_, cached| {
+            now.saturating_duration_since(cached.last_used_at)
+                <= GENERATION_PATH_CACHE_IDLE_RETENTION
+        });
+        found
+    }
+
+    #[cfg(test)]
+    pub(super) fn enumeration_count(&self) -> usize {
+        self.enumerations.load(Ordering::Relaxed)
+    }
+}
+
 /// 子 Agent 会话过滤（M0 F7：真实 home 33/76 是子 Agent，不出卡）
 pub fn is_subagent(h: &DshHeader) -> bool {
     h.origin.as_deref() == Some("subagent") || h.delegation_depth > 0
@@ -64,7 +137,11 @@ pub fn generation_logs(dir: &Path) -> Vec<(i64, PathBuf)> {
             parse_generation(&name).map(|v| (v, e.path()))
         })
         .collect();
-    out.sort_by_key(|(v, _)| *v);
+    out.sort_by(|(left_version, left_path), (right_version, right_path)| {
+        left_version
+            .cmp(right_version)
+            .then_with(|| left_path.file_name().cmp(&right_path.file_name()))
+    });
     out
 }
 
@@ -114,6 +191,7 @@ pub fn parse_events(text: &str) -> Vec<DshEvent> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, Instant};
 
     fn fixture(name: &str) -> String {
         let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -175,6 +253,68 @@ mod tests {
         assert_eq!(read.version, 3);
         let h = parse_header(&read.text).unwrap();
         assert_eq!(h.version, Some(3));
+    }
+
+    #[test]
+    fn generation_path_cache_rechecks_at_monotonic_ttl() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("session.v2.jsonl"), "v2").unwrap();
+        let cache = GenerationPathCache::new(Duration::from_millis(2500));
+        let t0 = Instant::now();
+
+        assert_eq!(
+            cache.generation_logs_at(dir.path(), t0),
+            vec![(2, dir.path().join("session.v2.jsonl"))]
+        );
+        std::fs::write(dir.path().join("session.v3.jsonl"), "v3").unwrap();
+        assert_eq!(
+            cache.generation_logs_at(dir.path(), t0 + Duration::from_millis(2499)),
+            vec![(2, dir.path().join("session.v2.jsonl"))],
+            "TTL 内允许旧路径列表命中"
+        );
+        assert_eq!(cache.enumeration_count(), 1);
+
+        assert_eq!(
+            cache.generation_logs_at(dir.path(), t0 + Duration::from_millis(2500)),
+            vec![
+                (2, dir.path().join("session.v2.jsonl")),
+                (3, dir.path().join("session.v3.jsonl")),
+            ],
+            "TTL 到期必须发现新增代际"
+        );
+        assert_eq!(cache.enumeration_count(), 2);
+    }
+
+    #[test]
+    fn generation_path_cache_refreshes_compressed_replacement_and_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        let plain = dir.path().join("session.v3.jsonl");
+        let compressed = dir.path().join("session.v3.jsonl.zstd");
+        std::fs::write(&plain, "plain").unwrap();
+        let cache = GenerationPathCache::new(Duration::from_millis(2500));
+        let t0 = Instant::now();
+        assert_eq!(
+            cache.generation_logs_at(dir.path(), t0),
+            vec![(3, plain.clone())]
+        );
+
+        std::fs::remove_file(&plain).unwrap();
+        std::fs::write(&compressed, b"compressed replacement").unwrap();
+        assert_eq!(
+            cache.generation_logs_at(dir.path(), t0 + Duration::from_secs(1)),
+            vec![(3, plain)],
+            "替换在 TTL 到期前不改变缓存列表"
+        );
+        assert_eq!(
+            cache.generation_logs_at(dir.path(), t0 + Duration::from_millis(2500)),
+            vec![(3, compressed.clone())],
+            "TTL 到期后切换到压缩代际文件"
+        );
+
+        std::fs::remove_file(&compressed).unwrap();
+        assert!(cache
+            .generation_logs_at(dir.path(), t0 + Duration::from_millis(5000))
+            .is_empty());
     }
 
     #[test]
