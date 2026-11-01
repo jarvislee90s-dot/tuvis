@@ -660,7 +660,7 @@ fn collect_file(
             &v,
             &resolved_id,
             cwd,
-            is_subagent,
+            row_cwd_first,
             ctx.now_ms,
         ) {
             if pending.len() < PENDING_LINES_CAP {
@@ -697,7 +697,7 @@ fn collect_file(
                 &mut state,
                 &resolved_id,
                 cwd,
-                is_subagent,
+                row_cwd_first,
                 ctx.now_ms,
             );
             warn_unattributed(jsonl, left);

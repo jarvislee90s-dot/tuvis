@@ -13,7 +13,7 @@ English · [中文](CHANGELOG.md)
 _Only versions translated so far are listed here; the full history lives in the
 [Chinese changelog](CHANGELOG.md)._
 
-## [0.6.4] - 2026-10-31
+## [0.6.4] - 2026-11-01
 
 ### Upgrade notes
 
@@ -21,6 +21,8 @@ _Only versions translated so far are listed here; the full history lives in the
 - **"Send first" (prioritise) no longer requires a paused queue** — even on an unpaused queue it stops the running turn, then sends that one message; when the desktop is idle it sends straight away.
 - **Messages sent while paused are queued instead of rejected** — no more "queue is paused, send failed". They join the queue with a position and can be prioritised or sent on resume.
 - **Legacy "delivery outcome unknown" records no longer freeze the whole queue** — such a record only protects itself from automatic resend.
+
+- **WorkBuddy subagent history is backfilled automatically** on first collection. If a JSONL with an existing cursor is truncated/rewritten, that round reports an error and preserves the old ledger for a future file-scoped rebuild; it never clears the whole ledger.
 
 ### Added
 
@@ -40,8 +42,17 @@ _Only versions translated so far are listed here; the full history lives in the
 - **Capability display flicker across reconnects**: the handshake ticket is now an updateable, consumable generation ticket, and inherited display is only trusted after verifying the package content SHA.
 - **Stop idempotency**: a stop attempt is persisted before the first possible write, so cancellation or crash windows cannot emit a second interrupt.
 
+- **WorkBuddy 5.9.3 subagent usage was under-collected**: enumerate and incrementally read `subagents/agent-*.jsonl` with a cursor per file; subagents are recorded as their own sessions (`is_subagent=1` + parent UUID), tokens count toward totals while session/turn counts stay parent-only; history is backfilled on first read and parent numbers remain unchanged.
+- **WorkBuddy cards disappeared when the heartbeat froze**: presence is now file + live pid + matching sessionId even when the heartbeat is written only once; `working` stays Processing, while completed / DB-only cards use the 300-second fallback. The old 90-second freshness filter is removed.
+- **WorkBuddy completion unread and notifications**: normal completion produces an unread row immediately; a stale leftover heartbeat waits 300 seconds. Notification freshness uses a dedicated turned-green time so a restart/compensation notice is not suppressed by old parent business activity.
+- **WorkBuddy file-lookup permission failures**: usage collection uses strict lookup; permission/IO/directory-enumeration failures surface as `usage-source-io` instead of "no usage"; fallback scanning follows symlinked project directories.
+- **WorkBuddy subagent identity collisions**: inline, degraded and cached identities are all validated, including deleted historical main sessions; degraded IDs use the `workbuddy-subagent:<file_key>` namespace so a parent or another main session is never marked as a subagent.
+- **WorkBuddy rescan duplicate accounting**: when a file with an existing cursor is truncated/rewritten, the round refuses additive writes and preserves the old ledger/cursor; the error points to a future file-scoped rebuild instead of silently re-reading from zero.
+
 ### Engineering
 
+- WorkBuddy pending-unread retry snapshots now survive restarts with platform atomic replacement and `.bak` fallback; failed loads retry and cannot overwrite the old snapshot before loading completes. Windows uses `ReplaceFileW`/`MoveFileExW`.
+- Added WorkBuddy identity/lookup regressions: deleted main sessions stay reserved, symlinked directories are followed, permission recovery works, and cached conflicts are refused.
 - Added the missing `signature_applied` column to `codex_send_batch_members` for libraries created before it existed (idempotent, legacy rows default to unsigned).
 - Queue pause rows gained `pause_turn_id`, binding the stopped turn so terminal evidence can release them automatically.
 - Merged two barrier predicates that had the same meaning but different criteria into one parameterised predicate.

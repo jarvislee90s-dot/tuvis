@@ -835,27 +835,32 @@ fn retry_pending_unread(
     tool: &str,
     sid: &str,
     record: &crate::database::dao::unread::UnreadSessionRecord,
-    read_at: Option<i64>,
+    read_at_of: &dyn Fn(&str) -> Option<i64>,
     upsert: &dyn Fn(&crate::database::dao::unread::UnreadSessionRecord) -> bool,
-    exists: &dyn Fn(&str, &str) -> bool,
-    refresh: &dyn Fn(&crate::database::dao::unread::UnreadSessionRecord),
+    refresh: &dyn Fn(&crate::database::dao::unread::UnreadSessionRecord) -> bool,
 ) -> bool {
-    if let Some(since) = pending.since(tool, sid) {
-        if !retry_insert_allowed(since, read_at) || exists(tool, sid) {
-            pending.clear(tool, sid, true);
-            return false;
-        }
-        if upsert(record) {
-            pending.clear(tool, sid, true);
-            true
-        } else {
-            pending.mark(tool, sid, since, true);
-            false
-        }
+    // 无 pending 时只做一次 UPDATE；有 pending 才读墓碑，避免常态绿卡多一次 DB 查询。
+    if pending.since(tool, sid).is_none() {
+        refresh(record);
+        return false;
+    }
+    let since = pending
+        .since(tool, sid)
+        .expect("pending existence checked above");
+    if !retry_insert_allowed(since, read_at_of(sid)) {
+        pending.clear(tool, sid, true);
+        return false;
+    }
+    // UPDATE 命中 = 池行已在；展示字段照常刷新，但不得重复插入。
+    if refresh(record) {
+        pending.clear(tool, sid, true);
+        return false;
+    }
+    if upsert(record) {
+        pending.clear(tool, sid, true);
+        true
     } else {
-        if exists(tool, sid) {
-            refresh(record);
-        }
+        pending.mark(tool, sid, since, true);
         false
     }
 }
@@ -881,9 +886,7 @@ fn retry_insert_allowed(pending_since_ms: i64, read_at: Option<i64>) -> bool {
 }
 
 fn session_activity_ms(s: &Session) -> Option<i64> {
-    chrono::DateTime::parse_from_rfc3339(&s.last_activity_at)
-        .ok()
-        .map(|dt| dt.timestamp_millis())
+    crate::monitor::subagents::iso_to_ms(&s.last_activity_at)
 }
 
 /// 活动时间是否“可能是当前回合”（用于无待重试标记时的兜底）。
@@ -901,11 +904,7 @@ fn activity_may_be_after(activity_ms: i64, read_at_ms: i64) -> bool {
 /// * 毫秒级活动：`read_at >= activity`；
 /// * 秒级活动：必须严格晚于该秒（`read_at > activity + 999`）才算已读。
 fn read_covers_activity(read_at_ms: i64, activity_ms: i64) -> bool {
-    if activity_ms % 1000 == 0 {
-        read_at_ms > activity_ms.saturating_add(999)
-    } else {
-        read_at_ms >= activity_ms
-    }
+    !activity_may_be_after(activity_ms, read_at_ms)
 }
 
 /// 首次转绿 INSERT 是否应因“本回合已读”而跳过：
@@ -2616,19 +2615,20 @@ fn deleted_workbuddy_unread_ids() -> HashSet<String> {
 /// DB-only completed WorkBuddy 卡的“已读后消失”判据：
 /// 必须同时满足 pid=0（没有真实心跳/进程）、Idle/Finished、存在已读墓碑，
 /// 且最后活动时间不晚于墓碑时间（没有新工作回合）。有新活动则保留。
+fn is_db_only_completed_workbuddy(s: &Session) -> bool {
+    s.agent_type == AgentType::WorkBuddy
+        && s.pid == 0
+        && matches!(s.status, SessionStatus::Idle | SessionStatus::Finished)
+}
+
 fn read_completed_card_should_drop(s: &Session, read_at: Option<i64>) -> bool {
-    if s.agent_type != AgentType::WorkBuddy
-        || s.pid != 0
-        || !matches!(s.status, SessionStatus::Idle | SessionStatus::Finished)
-    {
+    if !is_db_only_completed_workbuddy(s) {
         return false;
     }
     let Some(read_at) = read_at else {
         return false;
     };
-    chrono::DateTime::parse_from_rfc3339(&s.last_activity_at)
-        .map(|dt| dt.timestamp_millis() <= read_at)
-        .unwrap_or(true)
+    session_activity_ms(s).is_none_or(|activity| activity <= read_at)
 }
 
 /// 纯核：按注入的墓碑查询剔除“已读且无新工作”的 DB-only completed 卡（可测）。
@@ -2636,12 +2636,7 @@ fn retain_read_completed_cards(
     active: &mut Vec<Session>,
     read_at_of: &dyn Fn(&str) -> Option<i64>,
 ) {
-    active.retain(|s| {
-        let is_candidate = s.agent_type == AgentType::WorkBuddy
-            && s.pid == 0
-            && matches!(s.status, SessionStatus::Idle | SessionStatus::Finished);
-        !(is_candidate && read_completed_card_should_drop(s, read_at_of(&s.id)))
-    });
+    active.retain(|s| !read_completed_card_should_drop(s, read_at_of(&s.id)));
 }
 
 /// 生产入口：墓碑来自 unread DAO。
@@ -2722,16 +2717,14 @@ fn sync_unread_sessions(active: &mut Vec<Session>, deleted_workbuddy: &HashSet<S
                     }
                 }
                 UnreadPoolAction::RefreshDisplay => {
-                    // 只有显式“待重试”才补插；池无行但没有标记 = 已读/过期，不得复活。
-                    let read_at = crate::database::dao::unread::read_tombstone_at(&tool, &s.id);
+                    // 只有显式“待重试”才读墓碑/补插；池无行但没有标记 = 已读/过期，不得复活。
                     let retried = retry_pending_unread(
                         &pending,
                         &tool,
                         &s.id,
                         &record,
-                        read_at,
+                        &|sid| crate::database::dao::unread::read_tombstone_at(&tool, sid),
                         &|r| crate::database::dao::unread::try_upsert(r),
-                        &|t, sid| crate::database::dao::unread::exists(t, sid),
                         &|r| crate::database::dao::unread::refresh_display(r),
                     );
                     if !retried && pending.since(&tool, &s.id).is_some() {
@@ -2821,10 +2814,7 @@ fn mark_active_unread_cards(
         else {
             continue;
         };
-        if s.agent_type == AgentType::WorkBuddy
-            && s.pid == 0
-            && matches!(s.status, SessionStatus::Idle | SessionStatus::Finished)
-        {
+        if is_db_only_completed_workbuddy(s) {
             s.unread = true;
         }
         if s.unread {
@@ -3810,9 +3800,8 @@ mod unread_card_tests {
             "workbuddy",
             "s-restart",
             &record,
-            None,
+            &|_| None,
             &|r| unread::upsert_unread(&conn, r),
-            &|t, sid| unread::exists_unread_conn(&conn, t, sid),
             &|r| unread::refresh_display_unread(&conn, r),
         );
         assert!(retried, "恢复后补插应成功");
@@ -3844,9 +3833,8 @@ mod unread_card_tests {
             "workbuddy",
             "s-read",
             &record_read,
-            Some(read_since + 1),
+            &|_| Some(read_since + 1),
             &|r| unread::upsert_unread(&conn, r),
-            &|t, sid| unread::exists_unread_conn(&conn, t, sid),
             &|r| unread::refresh_display_unread(&conn, r),
         );
         assert!(!retried_read, "已读覆盖 since 时不得补插");

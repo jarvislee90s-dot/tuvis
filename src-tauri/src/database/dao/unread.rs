@@ -87,8 +87,8 @@ pub fn list_unread(conn: &Connection, now_ms: i64) -> Vec<UnreadSessionRecord> {
 /// 清空指定工具的全部未读（工具取消勾选等场景）
 /// review F1：仅刷新在场行的展示字段（UPDATE 无插入）——「跳转已读」删掉的行
 /// 不得复活，转绿时间不得滑动。「持续绿色」路径专用；插入路径走 upsert_unread
-pub fn refresh_display_unread(conn: &Connection, r: &UnreadSessionRecord) {
-    let _ = conn.execute(
+pub fn refresh_display_unread(conn: &Connection, r: &UnreadSessionRecord) -> bool {
+    conn.execute(
         "UPDATE unread_sessions
          SET project_name = ?3, title = ?4, last_message = ?5
          WHERE tool_id = ?1 AND session_id = ?2",
@@ -99,7 +99,8 @@ pub fn refresh_display_unread(conn: &Connection, r: &UnreadSessionRecord) {
             r.title,
             r.last_message
         ],
-    );
+    )
+    .is_ok_and(|rows| rows > 0)
 }
 
 pub fn clear_unread_for_tool(conn: &Connection, tool_id: &str) {
@@ -159,13 +160,8 @@ pub fn was_read_recently_conn(
     session_id: &str,
     now_ms: i64,
 ) -> bool {
-    conn.query_row(
-        "SELECT 1 FROM unread_read_tombstones
-         WHERE tool_id = ?1 AND session_id = ?2 AND read_at > ?3 LIMIT 1",
-        params![tool_id, session_id, now_ms - READ_TOMBSTONE_TTL_MS],
-        |_| Ok(()),
-    )
-    .is_ok()
+    read_tombstone_at_conn(conn, tool_id, session_id)
+        .is_some_and(|read_at| read_at > now_ms - READ_TOMBSTONE_TTL_MS)
 }
 
 /// 物理清理超龄墓碑（read_at <= now - TTL）
@@ -177,11 +173,6 @@ pub fn cleanup_expired_read_tombstones_conn(conn: &Connection, now_ms: i64) {
 }
 
 // ---- 全局连接包装（业务侧零锁代码） ----
-
-pub fn upsert(r: &UnreadSessionRecord) {
-    let conn = DB.lock().unwrap();
-    let _ = upsert_unread(&conn, r);
-}
 
 /// 落库是否成功（补偿事务：成功后才消费观测；失败保留重试）。
 pub fn try_upsert(r: &UnreadSessionRecord) -> bool {
@@ -205,9 +196,9 @@ pub fn list(now_ms: i64) -> Vec<UnreadSessionRecord> {
     list_unread(&conn, now_ms)
 }
 
-pub fn refresh_display(r: &UnreadSessionRecord) {
+pub fn refresh_display(r: &UnreadSessionRecord) -> bool {
     let conn = crate::database::connection::DB.lock().unwrap();
-    refresh_display_unread(&conn, r);
+    refresh_display_unread(&conn, r)
 }
 
 pub fn clear_tool(tool_id: &str) {
@@ -229,11 +220,6 @@ pub fn read_tombstone_at(tool_id: &str, session_id: &str) -> Option<i64> {
 }
 
 /// TTL 内是否已读过该会话（Insert 边沿的防复活判据）
-pub fn was_read_recently(tool_id: &str, session_id: &str, now_ms: i64) -> bool {
-    let conn = DB.lock().unwrap();
-    was_read_recently_conn(&conn, tool_id, session_id, now_ms)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

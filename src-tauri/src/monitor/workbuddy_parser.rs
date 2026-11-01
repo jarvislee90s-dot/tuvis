@@ -50,26 +50,14 @@ fn line_is_work_event(v: &serde_json::Value) -> bool {
     }
 }
 
-/// 只返回“新工作”条目的行内时间戳；辅助记录与 mtime/DB 更新不参与。
-fn line_work_timestamp_ms(line: &str) -> Option<u64> {
-    let v: serde_json::Value = serde_json::from_str(line).ok()?;
-    line_is_work_event(&v)
-        .then(|| v.get("timestamp").and_then(|t| t.as_u64()))
-        .flatten()
-}
-
-fn last_work_ms_from_lines(lines: &[String]) -> Option<u64> {
-    lines.iter().filter_map(|l| line_work_timestamp_ms(l)).max()
-}
-
 fn read_workbuddy_tail_digest(jsonl: &Path) -> WorkBuddyTailDigest {
     let lines = read_recent_lines(jsonl, 500);
-    let (status_core, tail_kind) = derive_status_with_tail(&lines);
+    let (status_core, tail_kind, last_work_ms) = derive_tail_facts(&lines);
     WorkBuddyTailDigest {
         status_core,
         tail_kind,
         last_message: lines.iter().rev().find_map(|l| extract_message_text(l)),
-        last_work_ms: last_work_ms_from_lines(&lines),
+        last_work_ms,
     }
 }
 
@@ -216,16 +204,20 @@ fn optional_regular_file(path: &Path) -> std::io::Result<Option<PathBuf>> {
     }
 }
 
-/// 严格查找（用量采集用）：只有**确认不存在**才返回 `Ok(None)`；权限/IO/枚举失败
-/// 一律向上传播，调用方映射为 `usage-source-io`，不得伪装成“没有用量”。
-pub fn find_session_jsonl_strict(
+fn find_session_jsonl_impl(
     home: &Path,
     cwd: &str,
     session_id: &str,
+    strict: bool,
 ) -> std::io::Result<Option<PathBuf>> {
+    // 宽容入口（看板/补偿）沿用旧降级：定位失败按未命中处理；严格入口把错误交给调用方。
+    let lenient_or = |e: std::io::Error| if strict { Err(e) } else { Ok(None) };
+
     let primary = session_jsonl_path(home, cwd, session_id);
-    if let Some(p) = optional_regular_file(&primary)? {
-        return Ok(Some(p));
+    match optional_regular_file(&primary) {
+        Ok(Some(p)) => return Ok(Some(p)),
+        Ok(None) => {}
+        Err(e) => return lenient_or(e),
     }
 
     // issue #35-7：先查兜底命中缓存（键含 home，防单测多 tempdir 串路径）；
@@ -233,9 +225,13 @@ pub fn find_session_jsonl_strict(
     let key = (home.to_path_buf(), cwd.to_string(), session_id.to_string());
     let cached = FALLBACK_JSONL_HITS.lock().unwrap().get(&key).cloned();
     if let Some(p) = cached {
-        match optional_regular_file(&p)? {
-            Some(p) => return Ok(Some(p)),
-            None => {
+        match optional_regular_file(&p) {
+            Ok(Some(p)) => return Ok(Some(p)),
+            Ok(None) => {
+                FALLBACK_JSONL_HITS.lock().unwrap().remove(&key);
+            }
+            Err(e) if strict => return Err(e),
+            Err(_) => {
                 FALLBACK_JSONL_HITS.lock().unwrap().remove(&key);
             }
         }
@@ -246,31 +242,37 @@ pub fn find_session_jsonl_strict(
     let entries = match std::fs::read_dir(&projects_dir) {
         Ok(entries) => entries,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e),
+        Err(e) => return lenient_or(e),
     };
     for entry in entries {
         let entry = match entry {
             Ok(entry) => entry,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(e) => return Err(e),
+            Err(e) if strict => return Err(e),
+            Err(_) => continue,
         };
         let is_dir = match entry.file_type() {
             Ok(t) if t.is_dir() => true,
             Ok(t) if t.is_symlink() => match std::fs::metadata(entry.path()) {
                 Ok(m) => m.is_dir(),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(e) => return Err(e),
+                Err(e) if strict => return Err(e),
+                Err(_) => continue,
             },
             Ok(_) => false,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(e) => return Err(e),
+            Err(e) if strict => return Err(e),
+            Err(_) => continue,
         };
         if !is_dir {
             continue;
         }
         let candidate = entry.path().join(format!("{}.jsonl", session_id));
-        let Some(p) = optional_regular_file(&candidate)? else {
-            continue;
+        let p = match optional_regular_file(&candidate) {
+            Ok(Some(p)) => p,
+            Ok(None) => continue,
+            Err(e) if strict => return Err(e),
+            Err(_) => continue,
         };
         let mut hits = FALLBACK_JSONL_HITS.lock().unwrap();
         if hits.len() >= FALLBACK_HITS_CAP {
@@ -282,45 +284,23 @@ pub fn find_session_jsonl_strict(
     Ok(None)
 }
 
+/// 严格查找（用量采集用）：只有**确认不存在**才返回 `Ok(None)`；权限/IO/枚举失败
+/// 一律向上传播，调用方映射为 `usage-source-io`，不得伪装成“没有用量”。
+pub fn find_session_jsonl_strict(
+    home: &Path,
+    cwd: &str,
+    session_id: &str,
+) -> std::io::Result<Option<PathBuf>> {
+    find_session_jsonl_impl(home, cwd, session_id, true)
+}
+
 /// 共享查找函数（P0-2，看板/补偿用）：定位会话 JSONL。
-/// 1. 先试 mangle(cwd)/<sessionId>.jsonl；
-/// 2. 未命中 → 扫描 ~/.workbuddy/projects/*/ 查找 <sessionId>.jsonl（会话可能换过项目目录，
-///    或 cwd 属 UNC 等未实测形态，mangle 无法命中）；
-/// 3. 仍无 → None（调用方跳过该会话）。
-///
-/// 看板保留宽容降级：定位失败（权限/IO）按“未命中”处理，不改变既有看板行为。
-/// 用量采集必须用 `find_session_jsonl_strict`，不得复用本函数。
+/// 与严格入口共用同一套 mangle → 缓存 → projects 扫描逻辑，只在错误策略上宽容：
+/// 定位失败（权限/IO）按“未命中”处理，不改变既有看板行为。
 pub fn find_session_jsonl(home: &Path, cwd: &str, session_id: &str) -> Option<PathBuf> {
-    let primary = session_jsonl_path(home, cwd, session_id);
-    if primary.exists() {
-        return Some(primary);
-    }
-    // issue #35-7：先查兜底命中缓存（键含 home，防单测多 tempdir 串路径）；
-    // 命中前校验文件仍在（会话目录可能被清理），失效则重扫
-    let key = (home.to_path_buf(), cwd.to_string(), session_id.to_string());
-    if let Some(p) = FALLBACK_JSONL_HITS.lock().unwrap().get(&key) {
-        if p.exists() {
-            return Some(p.clone());
-        }
-    }
-    // 目录扫描兜底：projects 下任意子目录中的 <sessionId>.jsonl。
-    // 看板/补偿保持旧的宽容降级：目录不可读或条目枚举失败 → 按未命中处理。
-    let projects_dir = home.join(".workbuddy").join("projects");
-    let Ok(entries) = std::fs::read_dir(&projects_dir) else {
-        return None;
-    };
-    let hit = entries.filter_map(|e| e.ok()).find_map(|dir| {
-        let p = dir.path().join(format!("{}.jsonl", session_id));
-        p.exists().then_some(p)
-    });
-    if let Some(ref p) = hit {
-        let mut hits = FALLBACK_JSONL_HITS.lock().unwrap();
-        if hits.len() >= FALLBACK_HITS_CAP {
-            hits.clear();
-        }
-        hits.insert(key, p.clone());
-    }
-    hit
+    find_session_jsonl_impl(home, cwd, session_id, false)
+        .ok()
+        .flatten()
 }
 
 /// 平铺 JSONL 条目 → 归一化 APP 条目（issue #6 格式翻译适配器）：
@@ -339,18 +319,35 @@ fn workbuddy_entry_kind(v: &serde_json::Value) -> AppEntryKind {
 
 /// 尾部状态 + 尾部语义条目（摘要缓存消费；tail_kind 供完成防抖判定「Idle 是否由
 /// assistant 尾导出」，纯内容产物可随 L2 缓存）
-fn derive_status_with_tail(lines: &[String]) -> (SessionStatus, Option<AppEntryKind>) {
+/// 一次解析尾部行，同时产出状态、防抖语义与最后业务时间；避免同一 500 行窗口
+/// 在看板/补偿里被反复 `serde_json::from_str`。
+fn derive_tail_facts(lines: &[String]) -> (SessionStatus, Option<AppEntryKind>, Option<u64>) {
     let mut kinds: Vec<AppEntryKind> = Vec::new();
+    let mut last_work_ms: Option<u64> = None;
     for line in lines {
-        match serde_json::from_str::<serde_json::Value>(line) {
-            Ok(v) if v.get("type").is_some() => kinds.push(workbuddy_entry_kind(&v)),
-            _ => continue,
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if v.get("type").is_none() {
+            continue;
         }
+        if line_is_work_event(&v) {
+            if let Some(ts) = v.get("timestamp").and_then(|t| t.as_u64()) {
+                last_work_ms = Some(last_work_ms.map_or(ts, |old| old.max(ts)));
+            }
+        }
+        kinds.push(workbuddy_entry_kind(&v));
     }
     (
         derive_app_status(&kinds).unwrap_or(SessionStatus::Waiting),
         tail_semantic_kind(&kinds),
+        last_work_ms,
     )
+}
+
+fn derive_status_with_tail(lines: &[String]) -> (SessionStatus, Option<AppEntryKind>) {
+    let (status, tail_kind, _) = derive_tail_facts(lines);
+    (status, tail_kind)
 }
 
 /// 完成防抖纯判定（§4.2，可测）：仅作用于「assistant 尾导出的 Idle + 新鲜」，
@@ -451,6 +448,13 @@ pub fn recent_db_sessions(home: &Path, since_ms: i64) -> Vec<WbDbSession> {
          ORDER BY activity DESC"
     );
     query_db_sessions(home, &sql, &[&since_ms])
+}
+
+fn recent_db_session_map(home: &Path, since_ms: i64) -> HashMap<String, WbDbSession> {
+    recent_db_sessions(home, since_ms)
+        .into_iter()
+        .map(|r| (r.id.clone(), r))
+        .collect()
 }
 
 /// **按 sessionId 精确读取会话行，不受任何活动窗口约束**（R2 修正 I1）。
@@ -694,12 +698,7 @@ pub fn discover_workbuddy_processes(system: &sysinfo::System) -> Vec<AgentProces
     };
     let now = now_ms();
     // DB 候选只用于决定「要不要发宿主哨兵」；真正的判活/出卡在 get_workbuddy_sessions
-    let recent = || {
-        recent_db_sessions(&home, now as i64 - SESSION_ACTIVE_WINDOW_MS)
-            .into_iter()
-            .map(|r| (r.id.clone(), r))
-            .collect::<HashMap<String, WbDbSession>>()
-    };
+    let recent = || recent_db_session_map(&home, now as i64 - SESSION_ACTIVE_WINDOW_MS);
     discover_workbuddy_processes_with(
         &home,
         &|pid| {
@@ -727,11 +726,7 @@ pub fn get_workbuddy_sessions(processes: &[AgentProcess]) -> Vec<Session> {
     };
     let now = now_ms();
     // 300s 窗口只用来选 **DB-only 候选**（没有心跳文件的兜底卡）
-    let recent: HashMap<String, WbDbSession> =
-        recent_db_sessions(&home, now as i64 - SESSION_ACTIVE_WINDOW_MS)
-            .into_iter()
-            .map(|r| (r.id.clone(), r))
-            .collect();
+    let recent = recent_db_session_map(&home, now as i64 - SESSION_ACTIVE_WINDOW_MS);
     // 心跳候选的 status/标题走**按 id 查询**（I1）：不受 300s 约束，
     // 否则 `working + 父静默 >300s` 会查不到行 → 卡片在子代理运行期掉线
     get_workbuddy_sessions_with(&home, processes, now, &recent, &|ids| {
@@ -782,7 +777,7 @@ fn workbuddy_is_live(
     working || db_age_ms <= SESSION_ACTIVE_WINDOW_MS as u64 || mtime_recent
 }
 
-/// 可测核心（R2）：home / 进程表 / 时钟 / DB 活跃会话注入。/// 可测核心（R2）：home / 进程表 / 时钟 / DB 活跃会话注入。
+/// 可测核心（R2）：home / 进程表 / 时钟 / DB 活跃会话注入。
 ///
 /// 在场判据（设计 §3.2，**唯一口径**）：
 /// ```text
@@ -966,9 +961,7 @@ pub fn get_workbuddy_sessions_with(
             last_activity_at: session_activity_ms
                 .map(|ms| {
                     // 保留毫秒：同秒内的新工作不能被截断成“旧活动”
-                    chrono::DateTime::from_timestamp_millis(ms as i64)
-                        .map(|dt| dt.to_rfc3339())
-                        .unwrap_or_default()
+                    crate::monitor::subagents::ms_to_iso(ms as i64).unwrap_or_default()
                 })
                 .unwrap_or_default(),
             pid: c.pid,
@@ -1151,7 +1144,8 @@ pub fn compensate_vanished_heartbeats_in_with_read_at(
                 continue;
             }
         };
-        if derive_status_from_tail(&lines) != SessionStatus::Idle {
+        let (status, _, last_work_ms) = derive_tail_facts(&lines);
+        if status != SessionStatus::Idle {
             // 非完成态（运行中被杀/仍在跑）→ 无完成通知可发，消费观测
             last_seen.lock().unwrap().remove(&pid);
             continue;
@@ -1159,7 +1153,7 @@ pub fn compensate_vanished_heartbeats_in_with_read_at(
         // 已读归属：只有已读时间覆盖“最后一次明确新工作”时，才认为本轮完成已处理；
         // 已读早于最后新工作 = 上一轮已读后又有新回合，必须允许补一次。
         if let Some(read_at) = read_at_of(&session_id) {
-            let last_work = last_work_ms_from_lines(&lines).map(|t| t as i64);
+            let last_work = last_work_ms.map(|t| t as i64);
             if last_work.is_none_or(|work| read_at >= work) {
                 last_seen.lock().unwrap().remove(&pid);
                 continue;
@@ -1383,9 +1377,7 @@ pub fn compensate_vanished_heartbeats() {
     };
     // 按 id 查询状态（**不受 300s 窗口限制**）：补偿必须像看板一样看到 working，
     // 否则 working+心跳消失+父静默会被误补；completed+残留心跳则必须能进入补偿。
-    let by_id: HashMap<String, WbDbSession> = db_sessions_by_ids(&home, &last_seen_ids)
-        .into_iter()
-        .collect();
+    let by_id: HashMap<String, WbDbSession> = db_sessions_by_ids(&home, &last_seen_ids);
     let is_live = |sid: &str| -> bool {
         session_is_live(
             &home,
@@ -1396,7 +1388,13 @@ pub fn compensate_vanished_heartbeats() {
             sid,
         )
     };
-    let deleted_ids = deleted_workbuddy_session_ids(&home, &last_seen_ids).unwrap_or_default();
+    // db_sessions_by_ids 已带 deleted 标记；直接推导，避免再次打开/查询 workbuddy.db。
+    // DB 不可读时 by_id 为空 ⇒ 空集，仍是保守“不清、不误判删除”。
+    let deleted_ids: std::collections::HashSet<String> = by_id
+        .values()
+        .filter(|row| row.deleted)
+        .map(|row| row.id.clone())
+        .collect();
     if !deleted_ids.is_empty() {
         LAST_SEEN_SESSIONS
             .lock()
@@ -1965,21 +1963,17 @@ mod tests {
             r#"{"type":"file-history-snapshot","timestamp":9200}"#.to_string(),
             r#"{"type":"function_call","name":"Bash","timestamp":8500}"#.to_string(),
         ];
-        assert_eq!(last_work_ms_from_lines(&lines), Some(8500));
-        assert_eq!(
-            line_work_timestamp_ms(r#"{"type":"credit-usage","timestamp":9000}"#),
-            None
-        );
-        assert_eq!(
-            line_work_timestamp_ms(r#"{"type":"message","role":"assistant","timestamp":7000}"#),
-            Some(7000)
-        );
-        assert_eq!(
-            line_work_timestamp_ms(
-                r#"{"type":"message","role":"assistant","timestamp":7200,"message":{"usage":{"input_tokens":1}}}"#
-            ),
-            Some(7200)
-        );
+        let (_, _, last_work_ms) = derive_tail_facts(&lines);
+        assert_eq!(last_work_ms, Some(8500));
+        assert!(!line_is_work_event(
+            &serde_json::json!({"type":"credit-usage","timestamp":9000})
+        ));
+        assert!(line_is_work_event(
+            &serde_json::json!({"type":"message","role":"assistant","timestamp":7000})
+        ));
+        assert!(line_is_work_event(&serde_json::json!(
+            {"type":"message","role":"assistant","timestamp":7200,"message":{"usage":{"input_tokens":1}}}
+        )));
     }
 
     mod compensation_tests {
@@ -3296,11 +3290,7 @@ mod board_tests {
 
     /// **生产数据通路**：与 `get_workbuddy_sessions` 完全相同的两条查询 + 同一个核心
     fn run_board(home: &Path, processes: &[AgentProcess], now: u64) -> Vec<Session> {
-        let recent: HashMap<String, WbDbSession> =
-            recent_db_sessions(home, now as i64 - SESSION_ACTIVE_WINDOW_MS)
-                .into_iter()
-                .map(|r| (r.id.clone(), r))
-                .collect();
+        let recent = recent_db_session_map(home, now as i64 - SESSION_ACTIVE_WINDOW_MS);
         get_workbuddy_sessions_with(home, processes, now, &recent, &|ids| {
             db_sessions_by_ids(home, ids)
         })
