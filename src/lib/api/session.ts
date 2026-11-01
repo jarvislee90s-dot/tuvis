@@ -4,6 +4,20 @@ import type { AgentType, SessionsResponse } from "@/types/session";
 export async function getAllSessions(): Promise<SessionsResponse> {
   return await invoke<SessionsResponse>("get_all_sessions");
 }
+
+export interface SessionsSnapshotRead {
+  version: number;
+  epoch: number;
+  mode: "active" | "idle" | "away";
+  degraded: boolean;
+  data: SessionsResponse;
+}
+
+/** 新前端读取带 version/epoch 的成功快照；旧 get_all_sessions IPC 仍保留兼容。 */
+export async function getSessionsSnapshot(): Promise<SessionsSnapshotRead> {
+  return await invoke<SessionsSnapshotRead>("get_sessions_snapshot");
+}
+
 export async function focusSession(pid: number): Promise<void> {
   return await invoke("focus_session", { pid });
 }

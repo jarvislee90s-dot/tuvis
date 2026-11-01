@@ -214,6 +214,10 @@ describe("foxbell-minibar（计划② Task 13 步骤 5/6：浮窗接线）", () 
   });
 
   it("6. 数据与几何：档位取设置（today）、分组恒 tool、悬停即按需采集一次；窗口高度 = 卡片 + 浮窗求和", async () => {
+    // 可见即采的 60s 去抖记在模块作用域（跨实例 / 重挂载共享）：前面的用例已强制采集并记下
+    // 时间戳，把假时钟拨过窗口，模拟「新打开浮窗」的可见边沿仍会采集一次。
+    vi.setSystemTime(Date.now() + 61_000);
+
     renderPet();
     await tick(20);
     await hoverUntilShown();
@@ -228,10 +232,11 @@ describe("foxbell-minibar（计划② Task 13 步骤 5/6：浮窗接线）", () 
     expect(dash.range).toEqual({ preset: "today" }); // 设置项 miniBarRange（预设档只发 preset）
     expect(dash.groupBy).toBe("tool"); // 第 3 行是分工具汇总
 
-    // 悬停浮窗是 spec §7.2 的采集触发点之一：挂载采一次、force 恒 false（最小间隔与单飞由后端保证）
-    const collect = calls("usage_collect");
+    // 悬停浮窗是 spec §7.2 的采集触发点之一：挂载即可见即采（F7 可见性命令）
+    // （模块级 60s 第一道去抖；跨 WebView 的 60s 门闩与单飞由后端裁定）
+    const collect = calls("usage_collect_visible");
     expect(collect).toHaveLength(1);
-    expect(collect[0][1]).toEqual({ force: false });
+    expect(collect[0][1]).toEqual(undefined);
     // 读查询**绝不**触发扫描：本次会话里没有别的 collect（三个读命令只读账本，§3 第 15 条）
     expect(calls("usage_dashboard").length).toBe(1);
 

@@ -1,4 +1,12 @@
 import { useTranslation } from "react-i18next";
+import { useQueryClient } from "@tanstack/react-query";
+import {
+  SESSIONS_QUERY_KEY,
+  applyOptimisticSessionMutation,
+  getSessionDismissBehavior,
+  settleSessionMutation,
+  type SessionMutationOutcome,
+} from "@/lib/query/optimisticSessions";
 import { Cpu, Clock, Bot, ChevronRight, X, ArrowLeftRight, ExternalLink } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { cn } from "@/lib/utils";
@@ -53,33 +61,51 @@ export function SessionCard({
   pairingAmbiguous?: boolean;
 }) {
   const { t } = useTranslation();
+  const queryClient = useQueryClient();
   const badge = AGENT_BADGE[session.agentType];
   const Icon = badge.Icon;
   // 跳转共享逻辑（歧义候选窗口由 hook 状态承载，命中多个窗口时弹出选择器）
   const { candidates, setCandidates, focus, focusHwnd } = useSessionJump();
 
   // 手动关闭卡（X）：不触发卡片跳转。全部形态（App/CLI）均可关闭。
-  // 未读卡 = 标记已读（mark_session_read，spec W4 已读信号 2）；
-  // 非未读卡（黄/红/绿）= 暂离不提示（dismiss_session_card，T2）——写入进程内
-  // dismiss 集合从看板与宠物隐藏，同一会话状态变化后自然重现
+  // 生命周期分类与批量共用（`getSessionDismissBehavior`）：
+  //  - 普通未读卡 = 标记已读（mark_session_read，spec W4）：卡面保留、未读态消失；
+  //  - 数据驱动聚合绿卡（未读）= 标记已读，后端已读即剔除 → 整卡移除；
+  //  - 非未读卡（黄/红/绿）= 暂离不提示（dismiss_session_card，T2）→ 整卡移除。
+  // F5（09b95a3c + 2026-10-31 定案）：点击后**先乐观更新**；命令内部补扫等待不阻塞
+  // 感知；applied=false 时 pending 保留到 epoch 更大的快照事件（有界 10s），
+  // 旧快照回写不得让卡片复活；命令失败立即 invalidate + 清 pending（回滚）。
   const handleClose = async (e: React.MouseEvent) => {
     e.stopPropagation(); // 不触发卡片跳转
+    const behavior = getSessionDismissBehavior(session);
+    // G1：先取消在飞轮询，避免旧快照在乐观更新后回写；pending 集合在命令期间
+    // 继续拦截轮询回写（会话卡/未读态都不复活）
+    void queryClient.cancelQueries({ queryKey: SESSIONS_QUERY_KEY });
+    const ticket = applyOptimisticSessionMutation(queryClient, [session]);
+    let outcome: SessionMutationOutcome | null = null;
     try {
-      if (session.unread) {
-        await invoke("mark_session_read", {
-          agentType: session.agentType,
-          sessionId: session.id,
-        });
-      } else {
-        await invoke("dismiss_session_card", {
-          agentType: session.agentType,
-          sessionId: session.id,
-          status: session.status,
-        });
+      outcome =
+        behavior === "dismiss"
+          ? await invoke<SessionMutationOutcome>("dismiss_session_card", {
+              agentType: session.agentType,
+              sessionId: session.id,
+              status: session.status,
+            })
+          : await invoke<SessionMutationOutcome>("mark_session_read", {
+              agentType: session.agentType,
+              sessionId: session.id,
+            });
+      if (!outcome?.applied) {
+        console.warn(
+          "[sessions] 关闭后补扫降级（applied=false），等待 epoch 更大的快照再收口",
+          outcome
+        );
       }
     } catch (err) {
+      // 失败：settle(null) 会 invalidate 权威快照并清 pending（乐观更新回滚）
       console.error("session card close failed:", err);
     }
+    await settleSessionMutation(queryClient, ticket, outcome);
   };
 
   const handleClick = async () => {

@@ -7,7 +7,7 @@ use log::{debug, info, warn};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::monitor::hook_listener;
 
@@ -33,7 +33,12 @@ LAST_EVENT_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 # （`session_<uuid>`，F8 实机取证）——helper 侧 session_id_allowed 同口径
 # 同会话覆盖=保留最新状态
 if printf '%s' "$SESSION_ID" | grep -qE '^[A-Za-z0-9_-]+$'; then
-  echo "{\"event\":\"$EVENT\",\"session_id\":\"$SESSION_ID\",\"cwd\":\"$CWD\",\"ts\":$TS,\"last_event_at\":\"$LAST_EVENT_AT\"}" > "$EVENTS_DIR/$SESSION_ID.json"
+  TMP_FILE=$(mktemp "$EVENTS_DIR/.${SESSION_ID}.XXXXXX") || exit 1
+  trap 'if [ -n "$TMP_FILE" ]; then rm -f "$TMP_FILE"; fi' EXIT
+  printf '%s\n' "{\"event\":\"$EVENT\",\"session_id\":\"$SESSION_ID\",\"cwd\":\"$CWD\",\"ts\":$TS,\"last_event_at\":\"$LAST_EVENT_AT\"}" > "$TMP_FILE" || exit 1
+  mv -f "$TMP_FILE" "$EVENTS_DIR/$SESSION_ID.json" || exit 1
+  TMP_FILE=""
+  trap - EXIT
 fi
 "#;
 
@@ -71,6 +76,12 @@ pub fn ensure_hook_script() -> PathBuf {
     // 注册侧检测不到即回落 bash 形态命令（零回归）
     install_hook_listener_helper();
     script_path
+}
+
+/// 现存文件只有与本轮托管脚本逐字节一致，才算当前 shell hook 可用。
+/// `ensure_hook_script` 的写入失败会保留旧文件；仅检查 exists 会把旧原地写脚本误报为覆盖。
+fn hook_script_is_current_at(script_path: &Path) -> bool {
+    fs::read_to_string(script_path).is_ok_and(|content| content == HOOK_SCRIPT)
 }
 
 /// helper 安装目标目录解析（纯函数）：home → `~/.tuvis/bin`
@@ -1139,12 +1150,16 @@ pub fn register_all_hooks() {
     use crate::adapter::{claude::ClaudeAdapter, codex::CodexAdapter, kimi::KimiAdapter};
     use crate::adapter::{AgentAdapter, HookEventCase};
 
+    // 每次启动都从未知覆盖状态开始；只由本轮实测的配置/依赖核验更新。
+    crate::adapter::wakeup_coverage::reset_runtime_hook_coverage();
+
     let adapters: Vec<Box<dyn AgentAdapter>> = vec![
         Box::new(ClaudeAdapter),
         Box::new(CodexAdapter),
         Box::new(KimiAdapter),
     ];
     let script_path = ensure_hook_script();
+    let script_current = hook_script_is_current_at(&script_path);
     // T1 原生 helper：随启动分发管道落盘（tuvis-hook-listener）；未构建/未随包分发
     // 是合法状态 → None → claude/codex 规格回落 bash 形态命令（零回归）；kimi 无
     // bash 兜底通道（T2 接入前本就无 hook）→ 跳过注册维持原状
@@ -1178,8 +1193,15 @@ pub fn register_all_hooks() {
             debug!("kimi helper 未随包分发，跳过 hooks 注册（维持无通道原状）");
             continue;
         }
+        let command_artifact_current = match tool_id {
+            "claude" if spec.helper_path.is_some() => helper_path.is_some(),
+            "codex" if spec.helper_path.is_some() => script_current && helper_path.is_some(),
+            "claude" | "codex" => script_current,
+            "kimi" => helper_path.is_some(),
+            _ => false,
+        };
         // 启动核验：配置文件实际引用**当前命令规格**（含 codex 的 commandWindows）、
-        // 脚本存在、**事件键形态在场**（F3 键形态核验，2026-09-20）、且**每个事件
+        // 实际执行依赖的脚本/ helper 在场、**事件键形态在场**（F3 键形态核验，2026-09-20）、且**每个事件
         // 的我方条目恰好一条**（2026-09-24 双注册残留核验——helper 与旧 bash 兜底
         // 并存会双写同一事件文件、后者覆盖前者的富载荷，claude AUQ 误判审批的根因）
         // 才跳过。kimi 走 TOML 核验（[[hooks]] 事件+命令逐条在场）
@@ -1199,8 +1221,17 @@ pub fn register_all_hooks() {
                 }
             })
             .unwrap_or(false)
-            && script_path.exists();
+            && command_artifact_current;
         if verified {
+            if crate::adapter::wakeup_coverage::hook_registration_covers(
+                tool_id,
+                script_current,
+                helper_path.is_some(),
+                spec.helper_path.is_some(),
+                true,
+            ) {
+                crate::adapter::wakeup_coverage::set_runtime_hook_coverage(tool_id, true);
+            }
             crate::database::set_setting(&tool_key, "true");
             debug!("{} Hook 已确认: {:?}", adapter.name(), config_path);
             continue;
@@ -1213,6 +1244,15 @@ pub fn register_all_hooks() {
         };
         match registered {
             Ok(()) => {
+                if crate::adapter::wakeup_coverage::hook_registration_covers(
+                    tool_id,
+                    script_current,
+                    helper_path.is_some(),
+                    spec.helper_path.is_some(),
+                    true,
+                ) {
+                    crate::adapter::wakeup_coverage::set_runtime_hook_coverage(tool_id, true);
+                }
                 info!("Hook 注册成功: {} → {:?}", adapter.name(), config_path);
                 crate::database::set_setting(&tool_key, "true");
                 // codex 信任门引导（T2，issue #74 调研 §5 不确定点 2 / C-8 根因③）：
@@ -1476,6 +1516,47 @@ mod event_channel_tests {
         assert!(!HOOK_SCRIPT.contains("MAM_MARKER"));
         assert!(!HOOK_SCRIPT.contains("tuvis-marker"));
         assert!(HOOK_SCRIPT.contains("^[A-Za-z0-9_-]+$")); // 白名单守卫在场（含 kimi 下划线）
+    }
+
+    #[test]
+    fn shell_hook_replaces_same_sid_through_same_directory_temp_file() {
+        assert!(HOOK_SCRIPT.contains("mktemp \"$EVENTS_DIR/.${SESSION_ID}.XXXXXX\""));
+        assert!(HOOK_SCRIPT.contains("printf '%s\\n'"));
+        assert!(HOOK_SCRIPT.contains("mv -f \"$TMP_FILE\" \"$EVENTS_DIR/$SESSION_ID.json\""));
+        assert!(HOOK_SCRIPT.contains("trap '"));
+        assert!(HOOK_SCRIPT.contains("rm -f \"$TMP_FILE\""));
+        assert!(HOOK_SCRIPT
+            .contains("TMP_FILE=$(mktemp \"$EVENTS_DIR/.${SESSION_ID}.XXXXXX\") || exit 1"));
+        assert!(HOOK_SCRIPT.contains("> \"$TMP_FILE\" || exit 1"));
+        assert!(
+            HOOK_SCRIPT.contains("mv -f \"$TMP_FILE\" \"$EVENTS_DIR/$SESSION_ID.json\" || exit 1")
+        );
+        assert!(!HOOK_SCRIPT.contains("> \"$EVENTS_DIR/$SESSION_ID.json\""));
+    }
+
+    #[test]
+    fn stale_shell_script_content_does_not_count_as_wakeup_coverage() {
+        let dir = tempfile::tempdir().unwrap();
+        let script_path = dir.path().join("status-hook.sh");
+        std::fs::write(&script_path, b"legacy in-place writer").unwrap();
+        assert!(!hook_script_is_current_at(&script_path));
+        assert!(!crate::adapter::wakeup_coverage::hook_registration_covers(
+            "claude",
+            hook_script_is_current_at(&script_path),
+            false,
+            false,
+            true,
+        ));
+
+        std::fs::write(&script_path, HOOK_SCRIPT).unwrap();
+        assert!(hook_script_is_current_at(&script_path));
+        assert!(crate::adapter::wakeup_coverage::hook_registration_covers(
+            "claude",
+            hook_script_is_current_at(&script_path),
+            false,
+            false,
+            true,
+        ));
     }
 }
 

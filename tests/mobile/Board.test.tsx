@@ -78,12 +78,14 @@ function okHost(enabledTools: string[]): Response {
   );
 }
 
-/** 安装脚本化 EventSource：首次连接自动送达给定快照（模拟服务端首帧） */
-function installSse(snapshot: SessionsResponse) {
+/** 安装脚本化 EventSource：每次连接自动送达对应快照（模拟初连与归档后重连首帧） */
+function installSse(snapshot: SessionsResponse | ((connection: number) => SessionsResponse)) {
+  let connections = 0;
   class ScriptedEventSource extends MockEventSource {
     constructor(url: string) {
       super(url);
-      setTimeout(() => this.emit("snapshot", snapshot), 0);
+      const initial = typeof snapshot === "function" ? snapshot(++connections) : snapshot;
+      setTimeout(() => this.emit("snapshot", initial), 0);
     }
   }
   vi.stubGlobal("EventSource", ScriptedEventSource);
@@ -141,6 +143,14 @@ async function advance(ms: number) {
   await act(async () => {
     await vi.advanceTimersByTimeAsync(ms);
   });
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
 }
 
 // Board 对外契约（App 状态机依赖这两个回调的方向与次数）：
@@ -1145,8 +1155,8 @@ describe("Board 卡片边框与阴影 Token（2026-10-05 改版）", () => {
 
 // ==== 卡片关闭/归档开关（体验批二）====
 describe("Board 卡片关闭/归档开关", () => {
-  function renderWithCard(s: Session) {
-    installSse(sessionsWith([s]));
+  function renderWithCard(s: Session, afterReconnect = sessionsWith([s])) {
+    installSse((connection) => (connection === 1 ? sessionsWith([s]) : afterReconnect));
     vi.stubGlobal(
       "fetch",
       vi.fn(async () => new Response("{}", { status: 404 }))
@@ -1187,7 +1197,8 @@ describe("Board 卡片关闭/归档开关", () => {
         lastActivityAt: "2026-09-20T10:00:00Z",
         form: "app",
         status: "idle",
-      })
+      }),
+      sessionsWith([])
     );
     const hideCalls: string[] = [];
     vi.stubGlobal(
@@ -1196,6 +1207,9 @@ describe("Board 卡片关闭/归档开关", () => {
         if (String(url).includes("/session-hide")) {
           hideCalls.push(String(url));
           return new Response(JSON.stringify({ ok: true }), { status: 200 });
+        }
+        if (String(url).includes("/m/api/v1/sessions")) {
+          return new Response(JSON.stringify(sessionsWith([])), { status: 200 });
         }
         return new Response("{}", { status: 404 });
       })
@@ -1216,7 +1230,8 @@ describe("Board 卡片关闭/归档开关", () => {
         lastActivityAt: "2026-09-20T10:00:00Z",
         form: "app",
         status: "processing",
-      })
+      }),
+      sessionsWith([])
     );
     const hideCalls: string[] = [];
     vi.stubGlobal(
@@ -1225,6 +1240,9 @@ describe("Board 卡片关闭/归档开关", () => {
         if (String(url).includes("/session-hide")) {
           hideCalls.push(String(url));
           return new Response(JSON.stringify({ ok: true }), { status: 200 });
+        }
+        if (String(url).includes("/m/api/v1/sessions")) {
+          return new Response(JSON.stringify(sessionsWith([])), { status: 200 });
         }
         return new Response("{}", { status: 404 });
       })
@@ -1235,6 +1253,173 @@ describe("Board 卡片关闭/归档开关", () => {
     await advance(0);
     expect(hideCalls).toHaveLength(1);
     expect(screen.queryByTestId("card-close-a2")).toBeNull();
+  });
+
+  it("归档立即隐藏并丢弃旧 REST 与归档前 SSE 连接的回调", async () => {
+    const session = chipSession({
+      id: "a3",
+      agentType: "codex",
+      lastActivityAt: "2026-09-20T10:00:00Z",
+      form: "app",
+      status: "idle",
+    });
+    installSse((connection) => (connection === 1 ? sessionsWith([session]) : sessionsWith([])));
+    const staleRest = deferred<Response>();
+    const hideRequest = deferred<Response>();
+    let sessionsCalls = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string) => {
+        if (String(url).includes("/session-hide")) return hideRequest.promise;
+        if (String(url).includes("/m/api/v1/sessions")) {
+          sessionsCalls += 1;
+          return sessionsCalls === 1
+            ? staleRest.promise
+            : Promise.resolve(new Response(JSON.stringify(sessionsWith([])), { status: 200 }));
+        }
+        return Promise.resolve(new Response("{}", { status: 404 }));
+      })
+    );
+    render(<Board onPaired={() => {}} onUnpaired={() => {}} />);
+    await advance(0);
+    const oldStream = sse();
+    await advance(RECONCILE_MS); // 开始一条归档前的旧 REST 请求
+    expect(sessionsCalls).toBe(1);
+
+    vi.spyOn(window, "confirm").mockReturnValueOnce(true);
+    fireEvent.click(screen.getByTestId("card-close-a3"));
+    await advance(0);
+    expect(screen.queryByTestId("card-close-a3")).toBeNull();
+    expect(oldStream.closed).toBe(true);
+
+    await act(async () => {
+      staleRest.resolve(new Response(JSON.stringify(sessionsWith([session])), { status: 200 }));
+    });
+    await advance(0);
+    expect(screen.queryByTestId("card-close-a3")).toBeNull();
+
+    await act(async () => {
+      hideRequest.resolve(new Response(JSON.stringify({ ok: true }), { status: 200 }));
+    });
+    await advance(0);
+    expect(sessionsCalls).toBe(2);
+    expect(MockEventSource.instances).toHaveLength(2);
+    await advance(0); // 新连接首帧是归档后的权威列表
+    act(() => oldStream.emitQueued("snapshot", sessionsWith([session])));
+    await advance(0); // close 前已经排队的旧 SSE 回调不能穿过连接代次闸
+    const callsBeforeStaleTransition = sessionsCalls;
+    act(() =>
+      oldStream.emitQueued(
+        "transition",
+        transitionEvent({ sessionId: session.id, agentType: session.agentType })
+      )
+    );
+    await advance(0);
+    expect(sessionsCalls).toBe(callsBeforeStaleTransition);
+    expect(screen.queryByTestId("card-close-a3")).toBeNull();
+  });
+
+  it("归档请求失败时撤销 pending 并恢复卡片", async () => {
+    const session = chipSession({
+      id: "a4",
+      agentType: "codex",
+      lastActivityAt: "2026-09-20T10:00:00Z",
+      form: "app",
+      status: "processing",
+    });
+    installSse((_connection) => sessionsWith([session]));
+    const hideRequest = deferred<Response>();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string) => {
+        if (String(url).includes("/session-hide")) return hideRequest.promise;
+        return Promise.resolve(new Response("{}", { status: 404 }));
+      })
+    );
+    render(<Board onPaired={() => {}} onUnpaired={() => {}} />);
+    await advance(0);
+
+    vi.spyOn(window, "confirm").mockReturnValueOnce(true);
+    fireEvent.click(screen.getByTestId("card-close-a4"));
+    await advance(0);
+    expect(screen.queryByTestId("card-close-a4")).toBeNull();
+
+    await act(async () => {
+      hideRequest.resolve(new Response(JSON.stringify({ error: "failed" }), { status: 500 }));
+    });
+    await advance(0);
+    expect(screen.getByTestId("card-close-a4")).toBeTruthy();
+    expect(MockEventSource.instances).toHaveLength(2);
+  });
+
+  it("并发归档保留各自 owner，最后一个请求完成前不重启 SSE", async () => {
+    const sessionA = chipSession({
+      id: "a5",
+      agentType: "codex",
+      lastActivityAt: "2026-09-20T10:00:00Z",
+      form: "app",
+      status: "idle",
+    });
+    const sessionB = chipSession({
+      id: "a6",
+      agentType: "claude",
+      lastActivityAt: "2026-09-20T09:00:00Z",
+      form: "app",
+      status: "processing",
+    });
+    installSse((connection) =>
+      connection === 1 ? sessionsWith([sessionA, sessionB]) : sessionsWith([])
+    );
+    const requests = new Map([
+      [sessionA.id, deferred<Response>()],
+      [sessionB.id, deferred<Response>()],
+    ]);
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string, init?: RequestInit) => {
+        if (String(url).includes("/session-hide")) {
+          const id = JSON.parse(String(init?.body)).sessionId as string;
+          return requests.get(id)!.promise;
+        }
+        if (String(url).includes("/m/api/v1/sessions")) {
+          return Promise.resolve(new Response(JSON.stringify(sessionsWith([])), { status: 200 }));
+        }
+        return Promise.resolve(new Response("{}", { status: 404 }));
+      })
+    );
+    render(<Board onPaired={() => {}} onUnpaired={() => {}} />);
+    await advance(0);
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+
+    fireEvent.click(screen.getByTestId("card-close-a5"));
+    await advance(0);
+    expect(screen.queryByTestId("card-close-a5")).toBeNull();
+    expect(screen.getByTestId("card-close-a6")).toBeTruthy();
+
+    fireEvent.click(screen.getByTestId("card-close-a6"));
+    await advance(0);
+    expect(screen.queryByTestId("card-close-a6")).toBeNull();
+    expect(MockEventSource.instances).toHaveLength(1);
+
+    await act(async () => {
+      requests
+        .get(sessionA.id)!
+        .resolve(new Response(JSON.stringify({ ok: true }), { status: 200 }));
+    });
+    await advance(0);
+    expect(MockEventSource.instances).toHaveLength(1);
+    expect(screen.queryByTestId("card-close-a6")).toBeNull();
+
+    await act(async () => {
+      requests
+        .get(sessionB.id)!
+        .resolve(new Response(JSON.stringify({ ok: true }), { status: 200 }));
+    });
+    await advance(0);
+    expect(MockEventSource.instances).toHaveLength(2);
+    await advance(0);
+    expect(screen.queryByTestId("card-close-a5")).toBeNull();
+    expect(screen.queryByTestId("card-close-a6")).toBeNull();
   });
 
   it("取消确认不发请求不移除卡片", async () => {

@@ -64,7 +64,11 @@ pub fn tool_host_pid(system: &sysinfo::System, tool_id: &str) -> Option<u32> {
     system
         .processes()
         .iter()
-        .find(|(_, p)| process_is_tool_host(p.exe(), p.cmd(), tool_id))
+        .find(|(_, p)| {
+            let name = crate::adapter::bare_name(&p.name().to_string_lossy());
+            crate::adapter::name_may_host_tool(&name, tool_id)
+                && process_is_tool_host(p.exe(), p.cmd(), tool_id)
+        })
         .map(|(pid, _)| pid.as_u32())
 }
 
@@ -330,5 +334,73 @@ mod tests {
             "/applications/zcode.app/contents/macos/zcode",
             "workbuddy"
         ));
+    }
+
+    /// Fix 5：宿主存活判定必须经**同一份宿主名表**预滤（与两段式候选白名单同源）——
+    /// 白名单漏名时第二段不读该进程的 exe/cmd，宿主判不出、该工具卡片整批消失。
+    /// 源码锁用 concat! 拆分，避免 include_str! 自我命中。
+    #[test]
+    fn host_alive_check_uses_shared_name_table() {
+        let src = include_str!("host.rs");
+        let needle = concat!("name_may_host", "_tool");
+        assert!(
+            src.contains(needle),
+            "tool_host_alive_in 必须经 name_may_host_tool 预滤（与候选白名单同源）"
+        );
+    }
+
+    /// R7 源码锁：`tool_host_alive_in` 的每个 `tool_id` 等值分支、以及
+    /// `is_host_process` 的每个 match arm，都必须在 `adapter::HOST_PROCESS_NAMES` 登表；
+    /// 否则两段式第二段不读该进程 exe/cmd，宿主判不出、卡片整批消失。
+    ///（`_ => false` 是显式默认：未登记工具无宿主判据，无需登表。）
+    #[test]
+    fn host_branches_are_registered_in_host_process_names() {
+        let src = include_str!("host.rs");
+        // tool_host_alive_in：`tool_id` 等值分支
+        let mut branches = Vec::new();
+        let mut rest = src;
+        while let Some(i) = rest.find("tool_id == \"") {
+            let after = &rest[i + "tool_id == \"".len()..];
+            let end = after.find('"').expect("分支工具 id 未闭合");
+            branches.push(after[..end].to_string());
+            rest = &after[end..];
+        }
+        assert!(
+            !branches.is_empty(),
+            "前提：必须解析到 tool_host_alive_in 的工具分支"
+        );
+        for tool in &branches {
+            assert!(
+                !crate::adapter::host_process_names(tool).is_empty(),
+                "tool_host_alive_in 分支 {tool} 未在 HOST_PROCESS_NAMES 登表"
+            );
+        }
+        // is_host_process：match arm（跳过 `_ => false` 默认臂）
+        let arms_start = src
+            .find("match tool_id {")
+            .expect("缺少 is_host_process 的 match");
+        let arms_end = src[arms_start..]
+            .find("_ => false,")
+            .map(|i| arms_start + i)
+            .expect("is_host_process 缺少显式 `_ => false` 默认臂");
+        let arms = &src[arms_start..arms_end];
+        let mut arm_tools = Vec::new();
+        let mut rest = arms;
+        while let Some(i) = rest.find('"') {
+            let after = &rest[i + 1..];
+            let Some(end) = after.find('"') else { break };
+            let literal = &after[..end];
+            if after[end + 1..].trim_start().starts_with("=>") {
+                arm_tools.push(literal.to_string());
+            }
+            rest = &after[end + 1..];
+        }
+        assert!(!arm_tools.is_empty(), "前提：必须解析到 match 分支");
+        for tool in &arm_tools {
+            assert!(
+                !crate::adapter::host_process_names(tool).is_empty(),
+                "is_host_process 分支 {tool} 未在 HOST_PROCESS_NAMES 登表"
+            );
+        }
     }
 }

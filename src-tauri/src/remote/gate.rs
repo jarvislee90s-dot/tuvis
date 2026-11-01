@@ -268,6 +268,12 @@ pub async fn gate(State(state): State<Arc<RemoteState>>, req: Request, next: Nex
         valid
     });
     if ok {
+        // 远控在线心跳（Task 4 评审修订）：**只记已认证请求**——本层原先挂在
+        // `api_router` 最外层（gate 之前），端口扫描 / 未知路径等未认证命中也会把
+        // 节奏升到 Idle 10s 档并持续 60s。移到过闸成功之后：鉴权判定与既有行为
+        // 完全不变，只是心跳不再采信未认证流量（/pair/pin 放行分支同样不记——
+        // 换 cookie 不算「有人在看」，与线上口径一致）
+        crate::remote::note_api_request();
         next.run(req).await
     } else {
         unauthorized()

@@ -71,6 +71,59 @@ interface TransitionBanner {
   text: string;
 }
 
+interface PendingArchive {
+  owner: symbol;
+  confirmed: boolean;
+}
+
+function boardSessionKey(session: Pick<Session, "agentType" | "id">): string {
+  return `${session.agentType}:${session.id}`;
+}
+
+function applyPendingArchives(
+  snapshot: SessionsResponse,
+  pending: Map<string, PendingArchive>
+): SessionsResponse {
+  if (pending.size === 0) return snapshot;
+  let removed = 0;
+  let removedWaiting = 0;
+  const sessions = snapshot.sessions.filter((session) => {
+    if (!pending.has(boardSessionKey(session))) return true;
+    removed += 1;
+    if (session.status === "waiting") removedWaiting += 1;
+    return false;
+  });
+  if (removed === 0) return snapshot;
+  return {
+    ...snapshot,
+    sessions,
+    totalCount: Math.max(0, snapshot.totalCount - removed),
+    waitingCount: Math.max(0, snapshot.waitingCount - removedWaiting),
+  };
+}
+
+function settleConfirmedArchives(
+  snapshot: SessionsResponse,
+  pending: Map<string, PendingArchive>
+): void {
+  const present = new Set(snapshot.sessions.map(boardSessionKey));
+  for (const [key, archive] of pending) {
+    if (archive.confirmed && !present.has(key)) pending.delete(key);
+  }
+}
+
+function restoreArchivedSession(snapshot: SessionsResponse, session: Session): SessionsResponse {
+  if (snapshot.sessions.some((item) => boardSessionKey(item) === boardSessionKey(session))) {
+    return snapshot;
+  }
+  return {
+    ...snapshot,
+    sessions: [session, ...snapshot.sessions],
+    totalCount: snapshot.totalCount + 1,
+    waitingCount: snapshot.waitingCount + (session.status === "waiting" ? 1 : 0),
+  };
+}
+
 // 提醒音（M3 Task 6 提醒三件套之二）：合成音实现与开关已抽到 ./sound.ts
 // （两音上行 + 包络；复用桌面 12 音效资产不可行——资产不在移动产物内，见该文件注释）。
 // 本组件只负责**何时响**：见 handleTransition 的转绿过滤 + 5 秒同色去重，
@@ -175,6 +228,17 @@ export default function Board({
   useEffect(() => {
     dataRef.current = data;
   }, [data]);
+  // 归档操作前启动的 REST 请求必须失效；每次接受新数据也推进 revision，拒绝较早快照压过 SSE。
+  const responseGenerationRef = useRef(0);
+  const dataRevisionRef = useRef(0);
+  // 归档时关闭旧 EventSource；闭包捕获旧代次的晚到回调直接丢弃。
+  const eventGenerationRef = useRef(0);
+  const eventStopRef = useRef<(() => void) | null>(null);
+  const startEventsRef = useRef<() => void>(() => {});
+  const stopEventsRef = useRef<() => void>(() => {});
+  const degradedRef = useRef(false);
+  const pendingArchivesRef = useRef(new Map<string, PendingArchive>());
+  const activeArchiveTokensRef = useRef(new Set<symbol>());
   // 横幅自动消失定时器（键 = 横幅 key）：同会话新跃迁覆盖旧横幅时须撤销旧定时器，
   // 否则旧定时器会提前清掉新横幅
   const bannerTimers = useRef(new Map<string, ReturnType<typeof setTimeout>>());
@@ -186,15 +250,28 @@ export default function Board({
     onPaired(); // 首拍成功（首拍 = 探测）：通知 App 配对仍有效，只发一次
   }, [onPaired]);
 
+  const commitData = useCallback((snapshot: SessionsResponse, clearError = false) => {
+    const visible = applyPendingArchives(snapshot, pendingArchivesRef.current);
+    dataRef.current = visible;
+    dataRevisionRef.current += 1;
+    setData(visible);
+    setNow(Date.now());
+    if (clearError) setLoadError(false);
+    return visible;
+  }, []);
+
+  const reconcileConfirmedArchives = useCallback((snapshot: SessionsResponse) => {
+    settleConfirmedArchives(snapshot, pendingArchivesRef.current);
+  }, []);
+
   /** SSE 首帧快照（也是断线重连后的基线校正）：全量替换看板数据 */
   const handleSnapshot = useCallback(
     (s: SessionsResponse) => {
       notifyPairedOnce();
-      setData(s);
-      setNow(Date.now());
-      setLoadError(false);
+      reconcileConfirmedArchives(s);
+      commitData(s, true);
     },
-    [notifyPairedOnce]
+    [commitData, notifyPairedOnce, reconcileConfirmedArchives]
   );
 
   /** 跃迁横幅入列（提醒三件套之一：横幅）。
@@ -244,22 +321,35 @@ export default function Board({
 
   const handleTransition = useCallback(
     (ev: TransitionEvent) => {
+      const eventKey = boardSessionKey({ id: ev.sessionId, agentType: ev.agentType });
+      if (pendingArchivesRef.current.has(eventKey)) {
+        setNow(Date.now());
+        return;
+      }
       // 命中会话才换数组引用；未命中（新会话 / 已消失 / 坏状态串）返回原引用，
       // setData 走引用相等短路零重渲染
-      setData((prev) => (prev ? { ...prev, sessions: applyTransition(prev.sessions, ev) } : prev));
+      const current = dataRef.current;
+      if (current) {
+        commitData({ ...current, sessions: applyTransition(current.sessions, ev) });
+      }
       // 未知会话的跃迁到达（体验批二）：新会话首拍（此前不在板上）或软归档隐藏
       // 会话的活动（隐藏卡片仍被 /sessions 过滤——无自动回归，重拉无害）——SSE
       // transition 只 patch 已知卡片（applyTransition 忽略未知 id），静默重拉一次
       // 全量把新卡片接进来。经 dataRef 读最新列表（handleTransition 稳定引用，
       // SSE 订阅不因 data 变化重连）
-      if (!(dataRef.current?.sessions.some((x) => x.id === ev.sessionId) ?? false)) {
+      if (!(dataRef.current?.sessions.some((x) => boardSessionKey(x) === eventKey) ?? false)) {
+        const requestGeneration = responseGenerationRef.current;
+        const dataRevision = dataRevisionRef.current;
         void (async () => {
           try {
             const s = await fetchSessions<SessionsResponse>();
-            if (s) {
-              dataRef.current = s;
-              setData(s);
-              setNow(Date.now());
+            if (
+              s &&
+              requestGeneration === responseGenerationRef.current &&
+              dataRevision === dataRevisionRef.current
+            ) {
+              reconcileConfirmedArchives(s);
+              commitData(s);
             }
           } catch {
             /* 静默：30s 对账 tick 兜底 */
@@ -292,61 +382,172 @@ export default function Board({
       // 振动（能力检测）：桌面浏览器与 iOS Safari 均无此 API，缺失即跳过
       navigator.vibrate?.(200);
     },
-    [pushBanner, maybeChime]
+    [commitData, maybeChime, pushBanner, reconcileConfirmedArchives]
   );
 
   /** 卡片关闭/归档开关（体验批二，状态点左侧）：CLI=关闭终端（硬杀，进历史归档）；
    *  APP=软归档（任意状态可归档——叉不挑颜色；等同桌面端叉掉：删未读池行 +
    *  看板隐藏，不自动回归，可从历史页移回）。二次确认防误触；确认后乐观移除
    *  本地卡片（扫描/过滤 3s 内对齐；失败则卡片保留，扫描真相为准） */
-  const handleCardClose = useCallback((s: Session) => {
-    const isCli = s.form === "cli";
-    const msg = isCli
-      ? i18n.t("mobile.board.confirmCloseCli")
-      : i18n.t("mobile.board.confirmArchiveApp");
-    if (!window.confirm(msg)) return;
-    void (isCli ? closeSession(s.id) : hideSession(s.id))
-      .then(() => {
-        setData((prev) =>
-          prev
-            ? {
-                ...prev,
-                sessions: prev.sessions.filter((x) => x.id !== s.id),
-                totalCount: Math.max(0, prev.totalCount - 1),
-              }
-            : prev
-        );
-      })
-      .catch(() => {}); // 失败静默：卡片保留，服务端扫描真相为准
-  }, []);
+  const refreshAfterArchiveActions = useCallback(() => {
+    const requestGeneration = ++responseGenerationRef.current;
+    const dataRevision = dataRevisionRef.current;
+    startEventsRef.current();
+    void (async () => {
+      try {
+        const snapshot = await fetchSessions<SessionsResponse>();
+        if (
+          requestGeneration !== responseGenerationRef.current ||
+          dataRevision !== dataRevisionRef.current
+        ) {
+          return;
+        }
+        if (snapshot === null) {
+          onUnpaired();
+          return;
+        }
+        notifyPairedOnce();
+        reconcileConfirmedArchives(snapshot);
+        commitData(snapshot, true);
+      } catch {
+        setLoadError(true);
+      }
+    })();
+  }, [commitData, notifyPairedOnce, onUnpaired, reconcileConfirmedArchives]);
+
+  const finishArchiveAction = useCallback(
+    (token: symbol) => {
+      activeArchiveTokensRef.current.delete(token);
+      if (activeArchiveTokensRef.current.size === 0) refreshAfterArchiveActions();
+    },
+    [refreshAfterArchiveActions]
+  );
+
+  const handleCardClose = useCallback(
+    (s: Session) => {
+      const isCli = s.form === "cli";
+      const msg = isCli
+        ? i18n.t("mobile.board.confirmCloseCli")
+        : i18n.t("mobile.board.confirmArchiveApp");
+      if (!window.confirm(msg)) return;
+      if (isCli) {
+        void closeSession(s.id)
+          .then(() => {
+            const current = dataRef.current;
+            if (!current) return;
+            const remaining = current.sessions.filter(
+              (item) => boardSessionKey(item) !== boardSessionKey(s)
+            );
+            commitData({
+              ...current,
+              sessions: remaining,
+              totalCount: Math.max(
+                0,
+                current.totalCount - (remaining.length < current.sessions.length ? 1 : 0)
+              ),
+              waitingCount: Math.max(
+                0,
+                current.waitingCount -
+                  (remaining.length < current.sessions.length && s.status === "waiting" ? 1 : 0)
+              ),
+            });
+          })
+          .catch(() => {});
+        return;
+      }
+
+      const key = boardSessionKey(s);
+      const token = Symbol("mobile-archive");
+      pendingArchivesRef.current.set(key, { owner: token, confirmed: false });
+      responseGenerationRef.current += 1;
+      activeArchiveTokensRef.current.add(token);
+      if (activeArchiveTokensRef.current.size === 1) stopEventsRef.current();
+      const current = dataRef.current;
+      if (current) commitData(current);
+
+      void (async () => {
+        try {
+          await hideSession(s.id);
+          const pending = pendingArchivesRef.current.get(key);
+          if (pending?.owner === token) pending.confirmed = true;
+        } catch {
+          const pending = pendingArchivesRef.current.get(key);
+          if (pending?.owner === token) {
+            pendingArchivesRef.current.delete(key);
+            responseGenerationRef.current += 1;
+            const latest = dataRef.current ?? current;
+            if (latest) commitData(restoreArchivedSession(latest, s));
+          }
+        } finally {
+          finishArchiveAction(token);
+        }
+      })();
+    },
+    [commitData, finishArchiveAction]
+  );
 
   const tick = useCallback(async () => {
     if (inFlightRef.current) return;
     inFlightRef.current = true;
+    const requestGeneration = responseGenerationRef.current;
+    const dataRevision = dataRevisionRef.current;
     try {
       const s = await fetchSessions<SessionsResponse>();
+      if (
+        requestGeneration !== responseGenerationRef.current ||
+        dataRevision !== dataRevisionRef.current
+      ) {
+        return;
+      }
       if (s === null) {
         onUnpaired(); // 设备失效 → 回配对页（**唯一判废通道**：SSE 断流不触发）
         return;
       }
       notifyPairedOnce();
-      setData(s);
-      setNow(Date.now());
-      setLoadError(false);
+      reconcileConfirmedArchives(s);
+      commitData(s, true);
     } catch {
       // 网络异常：保持上次数据与上次时钟，仅提示重试中
       setLoadError(true);
     } finally {
       inFlightRef.current = false; // 无论成败都放行下一拍
     }
-  }, [notifyPairedOnce, onUnpaired]);
+  }, [commitData, notifyPairedOnce, onUnpaired, reconcileConfirmedArchives]);
 
   // SSE 主通道（M3 Task 6）+ 30s 低频对账（评审修复 R1）：挂载即连，卸载即断（→ 服务端
   // Receiver 归零 → watcher 停扫，Task 5 守卫闭环）。connectEvents 的回调全部是稳定引用
   // （useCallback 空依赖链路 + setXxx），tick 亦稳定（App 侧 onPaired/onUnpaired 为
   // useCallback 常量），本 effect 只随组件生命周期跑一次
   useEffect(() => {
-    const stopEvents = connectEvents(handleSnapshot, handleTransition, () => setDegraded(true));
+    let alive = true;
+    const stopEvents = () => {
+      eventGenerationRef.current += 1;
+      eventStopRef.current?.();
+      eventStopRef.current = null;
+    };
+    const startEvents = () => {
+      if (!alive || degradedRef.current || activeArchiveTokensRef.current.size > 0) return;
+      if (eventStopRef.current) return;
+      const generation = ++eventGenerationRef.current;
+      eventStopRef.current = connectEvents(
+        (snapshot) => {
+          if (generation !== eventGenerationRef.current) return;
+          handleSnapshot(snapshot);
+        },
+        (event) => {
+          if (generation !== eventGenerationRef.current) return;
+          handleTransition(event);
+        },
+        () => {
+          if (generation !== eventGenerationRef.current) return;
+          degradedRef.current = true;
+          setDegraded(true);
+        }
+      );
+    };
+    stopEventsRef.current = stopEvents;
+    startEventsRef.current = startEvents;
+    startEvents();
     // 30s 低频对账（Critical 评审修复）：transition 只更新已存在卡（watcher 对**新增**
     // 会话不发事件），SSE 模式又无周期快照——新会话的成员资格（上卡/下卡）在事件流里
     // 是冻结的。低频 tick 全量拉取兜底；in-flight 守卫 / 403→onUnpaired / 错误横幅语义
@@ -354,8 +555,11 @@ export default function Board({
     // 防重叠），不为此引入 degraded 分支——那会让本 effect 重跑、SSE 重连，得不偿失
     const reconcile = setInterval(() => void tick(), RECONCILE_MS);
     return () => {
+      alive = false;
       clearInterval(reconcile);
       stopEvents(); // 既有 close 逻辑原样保留（stopped 闩 + 关连接 + 清重连定时器）
+      if (startEventsRef.current === startEvents) startEventsRef.current = () => {};
+      if (stopEventsRef.current === stopEvents) stopEventsRef.current = () => {};
     };
   }, [handleSnapshot, handleTransition, tick]);
 

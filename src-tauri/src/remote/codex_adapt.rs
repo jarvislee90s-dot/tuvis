@@ -23,7 +23,9 @@ use std::sync::Arc;
 use crate::session::ProcessForm;
 
 use super::api::json_no_store;
-use super::codex_ipc::{bad_request, find_session_sync, resolve_session_thread};
+use super::codex_ipc::{
+    bad_request, find_session_display_sync, find_session_sync, resolve_session_thread,
+};
 use super::server::RemoteState;
 
 /// `GET /codex/adapt-status` 查询参数。
@@ -48,7 +50,21 @@ fn desktop_only(session: &crate::session::Session) -> bool {
     session.agent_type.tool_id() == "codex" && matches!(session.form, ProcessForm::App)
 }
 
+/// 只读 GET /codex/adapt-status 的会话定位：读显示快照，不触发补扫。
 async fn load_session(st: &Arc<RemoteState>, session_id: &str) -> Option<crate::session::Session> {
+    let probe_st = st.clone();
+    let probe_sid = session_id.to_string();
+    tokio::task::spawn_blocking(move || find_session_display_sync(&probe_st, &probe_sid))
+        .await
+        .ok()
+        .flatten()
+}
+
+/// 动作 POST /codex/adapt-settings 的会话定位：写设置前取新鲜快照（Task 4 F3）。
+async fn load_session_fresh(
+    st: &Arc<RemoteState>,
+    session_id: &str,
+) -> Option<crate::session::Session> {
     let probe_st = st.clone();
     let probe_sid = session_id.to_string();
     tokio::task::spawn_blocking(move || find_session_sync(&probe_st, &probe_sid))
@@ -159,7 +175,7 @@ pub async fn codex_adapt_settings(
         ("set_enabled", None) | ("dismiss_hint", Some(_)) => return bad_request(),
         _ => return bad_request(),
     };
-    let Some(session) = load_session(&st, &session_id).await else {
+    let Some(session) = load_session_fresh(&st, &session_id).await else {
         return super::codex_ipc::not_found();
     };
     if !desktop_only(&session) {

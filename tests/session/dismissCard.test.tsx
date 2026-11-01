@@ -2,7 +2,8 @@
 // 活跃 App 卡（黄/红）点 X → invoke dismiss_session_card（传当前 status）；
 // 未读卡点 X 维持已读语义（mark_session_read）；CLI 卡不显示 X。
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const { invokeMock } = vi.hoisted(() => ({ invokeMock: vi.fn() }));
 
@@ -12,6 +13,10 @@ vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn(async () => () => {}) })
 // tests/setup.ts 未初始化 i18n，显式引入（fallbackLng=en，与断言文案一致）
 import i18n from "@/i18n";
 import { SessionCard } from "@/components/sessions/SessionCard";
+import {
+  __resetSessionMutationWaitersForTest,
+  clearPendingSessions,
+} from "@/lib/query/optimisticSessions";
 import type { Session } from "@/types/session";
 
 void i18n;
@@ -39,12 +44,28 @@ const mk = (over: Partial<Session>): Session => ({
 
 beforeEach(() => {
   invokeMock.mockReset();
-  invokeMock.mockResolvedValue(undefined);
+  invokeMock.mockResolvedValue({ applied: true, version: 1, epoch: 1 });
+  clearPendingSessions([{ id: "s1", agentType: "workbuddy" }]);
 });
+
+afterEach(() => {
+  __resetSessionMutationWaitersForTest();
+});
+
+/** SessionCard 通过 useQueryClient 在关闭成功后失效 ["sessions"]，测试需真 Provider */
+function renderCard(session: Session, client = new QueryClient()) {
+  const invalidate = vi.spyOn(client, "invalidateQueries");
+  render(
+    <QueryClientProvider client={client}>
+      <SessionCard session={session} />
+    </QueryClientProvider>
+  );
+  return invalidate;
+}
 
 describe("App 卡 X 关闭（T2）", () => {
   it("活跃 App 卡点 X → invoke dismiss_session_card 且传当前 status", async () => {
-    render(<SessionCard session={mk({ status: "waiting", form: "app", unread: false })} />);
+    renderCard(mk({ status: "waiting", form: "app", unread: false }));
     fireEvent.click(screen.getByRole("button", { name: /Hide for now/i }));
     await waitFor(() =>
       expect(invokeMock).toHaveBeenCalledWith("dismiss_session_card", {
@@ -56,7 +77,7 @@ describe("App 卡 X 关闭（T2）", () => {
   });
 
   it("未读卡点 X 维持已读语义（mark_session_read）", async () => {
-    render(<SessionCard session={mk({ status: "idle", form: "app", unread: true })} />);
+    renderCard(mk({ status: "idle", form: "app", unread: true }));
     fireEvent.click(screen.getByRole("button", { name: /Mark read/i }));
     await waitFor(() =>
       expect(invokeMock).toHaveBeenCalledWith("mark_session_read", {
@@ -68,7 +89,7 @@ describe("App 卡 X 关闭（T2）", () => {
   });
 
   it("CLI 活跃卡显示 X 且点击走 dismiss（2026-09-14：全形态接入 T2）", async () => {
-    render(<SessionCard session={mk({ status: "waiting", form: "cli", unread: false })} />);
+    renderCard(mk({ status: "waiting", form: "cli", unread: false }));
     fireEvent.click(screen.getByRole("button", { name: /Hide for now/i }));
     await waitFor(() =>
       expect(invokeMock).toHaveBeenCalledWith("dismiss_session_card", {
@@ -77,5 +98,34 @@ describe("App 卡 X 关闭（T2）", () => {
         status: "waiting",
       })
     );
+  });
+
+  it("关闭成功后失效会话查询，卡片立即按新快照重取（F5）", async () => {
+    const invalidate = renderCard(mk({ status: "waiting", form: "app", unread: false }));
+    fireEvent.click(screen.getByRole("button", { name: /Hide for now/i }));
+    await waitFor(() => expect(invalidate).toHaveBeenCalledWith({ queryKey: ["sessions"] }));
+  });
+
+  it("关闭失败也失效查询（回滚乐观隐藏）", async () => {
+    invokeMock.mockRejectedValueOnce(new Error("ipc failed"));
+    const invalidate = renderCard(mk({ status: "waiting", form: "app", unread: false }));
+    fireEvent.click(screen.getByRole("button", { name: /Hide for now/i }));
+    await waitFor(() => expect(invokeMock).toHaveBeenCalled());
+    // F5-opt：失败在 finally 中 invalidate，权威快照回滚乐观隐藏
+    await waitFor(() => expect(invalidate).toHaveBeenCalledWith({ queryKey: ["sessions"] }));
+  });
+
+  it("补扫降级（applied=false）保留 pending 等待 epoch 更大的快照，不立即 invalidate", async () => {
+    invokeMock.mockResolvedValue({ applied: false, version: 3, epoch: 7 });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const invalidate = renderCard(mk({ status: "waiting", form: "app", unread: false }));
+    fireEvent.click(screen.getByRole("button", { name: /Hide for now/i }));
+    await waitFor(() => expect(invokeMock).toHaveBeenCalled());
+    await waitFor(() => expect(warn).toHaveBeenCalled());
+    // F5 定案：applied=false 不得立刻 invalidate + 清 pending（旧快照会让卡片复活），
+    // 等待器必须保留到 `epoch > outcome.epoch` 的快照事件（或 10s 超时）。
+    expect(invalidate).not.toHaveBeenCalled();
+    expect(warn.mock.calls[0]?.[0]).toContain("applied=false");
+    warn.mockRestore();
   });
 });
