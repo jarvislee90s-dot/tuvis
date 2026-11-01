@@ -1,15 +1,27 @@
 // FoxbellPet — 桌宠本体（spec §7/§8/§9）。Task 8：精灵 + 帧步进 + look 环顾 + 缩放；
 // Task 9：指针交互（拖拽方向动画/松手物理/单击/双击）+ 语音字幕；Task 10：状态卡片 + 跳转/歧义候选；Task 12 追加事件接线。
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useCallback, useContext, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { QueryClientContext } from "@tanstack/react-query";
 import { invoke } from "@tauri-apps/api/core";
 import { emit, listen } from "@tauri-apps/api/event";
 import { toast } from "sonner";
 import { useTranslation } from "react-i18next";
-import type { Session } from "@/types/session";
+import type { Session, SessionsResponse } from "@/types/session";
 import { useSessionJump } from "@/hooks/useSessionJump";
 import { useSessionsQuery } from "@/lib/query/queries/sessions";
+import { useScanSnapshotSync } from "@/lib/query/queries/scanBus";
 import { sessionTitleOrUndefined } from "@/lib/sessionTitle";
 import { setupSessionReadListener } from "@/lib/query/sessionReadSync";
+import {
+  applyOptimisticSessionMutation,
+  applyPendingSessions,
+  getSessionDismissBehavior,
+  sessionKey,
+  SESSIONS_QUERY_KEY,
+  settleSessionMutation,
+  type SessionMutationOutcome,
+} from "@/lib/query/optimisticSessions";
+import { queryClient as appQueryClient } from "@/lib/query/queryClient";
 import { ANIM, frameStyle, FRAME_H, FRAME_W, type PetAnimKey } from "./petAnimations";
 import {
   DEFAULT_PET,
@@ -51,6 +63,9 @@ import "./pet-cursor.css";
 
 export function FoxbellPet() {
   const { t } = useTranslation();
+  // Task 2：宠物窗口也接快照事件（本窗有自己的 Query 缓存）——后端每次发布快照
+  // 直接 setQueryData，桌宠状态卡不必等档位轮询；档位轮询仍作兜底。
+  useScanSnapshotSync();
   // 当前主题（计划② Task 6 步骤 11）：看板窗口按它建窗（`system` → undefined，跟随系统；
   // 主题事实源是 DB settings KV，见 theme-provider 的模块级接线）
   const { theme } = useTheme();
@@ -275,6 +290,9 @@ export function FoxbellPet() {
   const sessionIndexRef = useRef<Map<string, Session>>(new Map());
   const cardsWrapRef = useRef<HTMLDivElement | null>(null);
   const pendingAckRef = useRef(""); // 歧义跳转：点击卡片时先记待 ack 的会话 id（spec D12）
+  const sessionActionOwnersRef = useRef(
+    new Map<string, { owner: symbol; readEventSeen: boolean }>()
+  );
   // 稳定回调引用作依赖（与精灵 effect 同款），避免依赖整个 pet 对象每次渲染导致反复注销/登记
   useEffect(() => registerInteractive(cardsWrapRef.current), [registerInteractive]);
   const jumpCandidatesRef = useRef<HTMLDivElement | null>(null); // 候选浮层实测高度并入窗口几何（Task 11 评审遗留）
@@ -286,7 +304,9 @@ export function FoxbellPet() {
   useEffect(() => {
     let unlisten: (() => void) | undefined;
     let disposed = false;
-    void setupSessionReadListener((_, sessionId) => {
+    void setupSessionReadListener((agentType, sessionId) => {
+      const action = sessionActionOwnersRef.current.get(sessionKey({ agentType, id: sessionId }));
+      if (action) action.readEventSeen = true;
       const state = statusStateRef.current;
       if (!state) return;
       ackDone(state, sessionId);
@@ -322,6 +342,7 @@ export function FoxbellPet() {
   }, [candidates]);
 
   const { data } = useSessionsQuery();
+  const queryClient = useContext(QueryClientContext) ?? appQueryClient;
   const lastApprovalAtRef = useRef(0); // approval 语音 10s 限频窗口起点（spec D3）
   const previewLoopRef = useRef<number | null>(null); // 动作绑定子页预览循环句柄（spec B4）
 
@@ -340,8 +361,9 @@ export function FoxbellPet() {
 
   useEffect(() => {
     if (!data) return;
-    sessionIndexRef.current = new Map(data.sessions.map((s) => [s.id, s]));
-    const r = computePetStatus(data.sessions, statusStateRef.current, Date.now());
+    const sessions = applyPendingSessions(data.sessions);
+    sessionIndexRef.current = new Map(sessions.map((s) => [s.id, s]));
+    const r = computePetStatus(sessions, statusStateRef.current, Date.now());
     statusStateRef.current = r.state;
     setCards(r.cards);
     setMoreCount(r.moreCount);
@@ -393,6 +415,72 @@ export function FoxbellPet() {
     }
     ackDone(statusStateRef.current ?? {}, card.id); // 点击已读即消（spec C2）
     setCards(cardsFromState(statusStateRef.current ?? {}));
+  };
+
+  /** 宠物 X 与看板 X 共用票根、pending 与结算，旧查询快照不能让状态卡复活。 */
+  const dismissPetCard = async (card: PetCard) => {
+    const session = sessionIndexRef.current.get(card.id);
+    if (!session) return;
+    const markRead = getSessionDismissBehavior(session) !== "dismiss";
+    const readKey = sessionKey(session);
+    const owner = Symbol("pet-session-action");
+    sessionActionOwnersRef.current.set(readKey, { owner, readEventSeen: false });
+    const previousEntry = statusStateRef.current?.[card.id];
+    const rollbackEntry = previousEntry
+      ? { ...previousEntry, lines: [...previousEntry.lines] }
+      : undefined;
+    void queryClient.cancelQueries({ queryKey: SESSIONS_QUERY_KEY });
+    const ticket = applyOptimisticSessionMutation(queryClient, [session]);
+
+    const state = statusStateRef.current;
+    if (state?.[card.id]) {
+      if (markRead) ackDone(state, card.id);
+      else state[card.id].light = null;
+      setCards(cardsFromState(state));
+    }
+
+    let outcome: SessionMutationOutcome | null = null;
+    let commandFailed = false;
+    try {
+      outcome = markRead
+        ? await invoke<SessionMutationOutcome>("mark_session_read", {
+            agentType: session.agentType,
+            sessionId: session.id,
+          })
+        : await invoke<SessionMutationOutcome>("dismiss_session_card", {
+            agentType: session.agentType,
+            sessionId: session.id,
+            status: session.status,
+          });
+    } catch (error) {
+      commandFailed = true;
+      console.error("pet session card dismissal failed:", error);
+    }
+    await settleSessionMutation(queryClient, ticket, outcome);
+    // 先让 invalidate/refetch 与 pending 收口完成，再恢复宠物本地条目；否则 refetch
+    // 若恰在 pending 清除前触发派生，会再次过滤目标并覆盖这次 rollback。
+    // session-read 只能证明 read 写入，不能替代失败 dismiss 的 rollback。
+    const action = sessionActionOwnersRef.current.get(readKey);
+    if (
+      commandFailed &&
+      rollbackEntry &&
+      action?.owner === owner &&
+      (!markRead || !action.readEventSeen)
+    ) {
+      const currentData = queryClient.getQueryData<SessionsResponse>(SESSIONS_QUERY_KEY);
+      const currentSession = currentData?.sessions.find(
+        (candidate) => candidate.id === card.id && candidate.agentType === session.agentType
+      );
+      // 结算后的缓存已叠加有效 pending；若会话不再可见，不要复活旧卡或过期进程索引。
+      if (!currentData || currentSession) {
+        const currentState = statusStateRef.current ?? {};
+        currentState[card.id] = rollbackEntry;
+        statusStateRef.current = currentState;
+        sessionIndexRef.current.set(card.id, currentSession ?? session);
+        setCards(cardsFromState(currentState));
+      }
+    }
+    if (action?.owner === owner) sessionActionOwnersRef.current.delete(readKey);
   };
 
   // ---- look 环顾：空闲 6s 触发，16 向 250ms/帧，任何状态打断（spec F2）----
@@ -951,31 +1039,11 @@ export function FoxbellPet() {
                 </div>
               ))}
             </div>
-            {/* T2：宠物卡 X——与看板同语义。未读绿卡走已读，其余走 dismiss
-               （status 取 sessionIndexRef 的精确状态传后端）；点击不触发跳转 */}
+            {/* T2：宠物卡 X 按共享 dismiss 分类走已读或 dismiss；点击不触发跳转 */}
             <span
               onClick={(e) => {
                 e.stopPropagation();
-                const s = sessionIndexRef.current.get(c.id);
-                if (!s) return;
-                if (c.light === "done" && c.unread) {
-                  invoke("mark_session_read", {
-                    agentType: s.agentType,
-                    sessionId: s.id,
-                  }).catch(() => {});
-                } else {
-                  invoke("dismiss_session_card", {
-                    agentType: s.agentType,
-                    sessionId: s.id,
-                    status: s.status,
-                  }).catch(() => {});
-                }
-                // 本地立即消卡（后端 dismiss 在下一轮扫描过滤生效，payload 随之不含该卡）
-                const state = statusStateRef.current;
-                if (state?.[c.id]) {
-                  state[c.id].light = null;
-                  setCards(cardsFromState(state));
-                }
+                void dismissPetCard(c);
               }}
               style={{
                 flex: "none",

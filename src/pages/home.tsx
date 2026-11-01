@@ -11,7 +11,7 @@
 //    速度页 dashboard 轮询与 TPS 视图租约），隐藏期间零 IPC（spec §2.7）。
 // 旧的「看板/资源」内部页签由四页顶层页签取代（会话摘要 / 工具 chips / 一键清除
 // 只属消息看板页）。
-import { useEffect, useState } from "react";
+import { useEffect, useState, useSyncExternalStore } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { WindowFrame } from "@/components/common/window-frame";
@@ -26,6 +26,14 @@ import { UsageDashboardBody } from "@/components/usage/UsageDashboardBody";
 import { SpeedDashboard } from "@/components/speed/SpeedDashboard";
 import { CheckCheck, Activity, AlertCircle } from "lucide-react";
 import { useQueryClient } from "@tanstack/react-query";
+import {
+  applyOptimisticSessionMutation,
+  applyPendingSessions,
+  getPendingSessionsVersion,
+  settleSessionMutation,
+  subscribePendingSessions,
+  type SessionMutationOutcome,
+} from "@/lib/query/optimisticSessions";
 import { useSessions } from "@/hooks/useSessions";
 import { useNotification } from "@/hooks/useNotification";
 import { useWorkspaceNavigation } from "@/hooks/useWorkspaceNavigation";
@@ -51,9 +59,16 @@ export default function HomePage() {
   const legacyMigration = useLegacySkillMigration();
   const activeTab = useWorkspaceStore((s) => s.activeTab);
   const visitedTabs = useWorkspaceStore((s) => s.visitedTabs);
-  const { sessions, totalCount, waitingCount, loading } = useSessionStore();
+  const { sessions, loading } = useSessionStore();
   const { t, i18n } = useAppTranslation();
   const queryClient = useQueryClient();
+  // G1：pending 集合（命令等在飞期间的乐观隐藏）——轮询回写旧快照也不复活卡片/未读态。
+  // useSyncExternalStore 只取订阅边沿：pending 变化 → 重渲染 → applyPendingSessions 重新过滤；
+  // 快照值本身不参与渲染（故不做 useMemo，列表长度仅个位数）
+  useSyncExternalStore(subscribePendingSessions, getPendingSessionsVersion);
+  const visibleSessions = applyPendingSessions(sessions);
+  const visibleTotalCount = visibleSessions.length;
+  const visibleWaitingCount = visibleSessions.filter((s) => s.status === "waiting").length;
 
   // 按工具筛选（2026-10-11）：单选 chips + localStorage 记忆（重启保持上次选择，
   // 首次默认「全部」）；纯筛选不动排序，计数条保持全量口径（与移动端 Board 一致）
@@ -62,26 +77,39 @@ export default function HomePage() {
     setToolFilterState(filter);
     saveToolFilter(filter);
   };
-  const filteredSessions = filterByAgent(sessions, toolFilter);
+  const filteredSessions = filterByAgent(visibleSessions, toolFilter);
   const filterToolLabel = toolFilter === "all" ? undefined : AGENT_BADGE[toolFilter]?.label;
 
-  // 一键清除已完成卡片（绿/空闲）：对每张绿卡复用单卡 X 的同款语义——
-  // 未读卡标已读（mark_session_read），其余 dismiss（dismiss_session_card）；
-  // 全部完成后立即失效轮询缓存，不等 3 秒轮询自然生效
-  const finishedCards = sessions.filter((s) => s.status === "idle" || s.status === "finished");
+  // 一键清除已完成卡片（绿/空闲）：R1 起走后端**批量**命令——未读/非未读的分流
+  // 由后端按未读池权威判定，全部变更完成后只补扫一次（N 张卡 ≠ N 次扫描）。
+  // F5（2026-10-31 定案）：与单卡共用 `applyOptimisticSessionMutation` 的同一套
+  // 生命周期——普通未读卡只标已读（卡面保留）、数据驱动绿卡/已读卡整卡移除；
+  // 命令结算走 `settleSessionMutation`（applied=false 由 epoch 门控，超时回滚）。
+  const finishedCards = visibleSessions.filter(
+    (s) => s.status === "idle" || s.status === "finished"
+  );
   const clearFinishedCards = async () => {
-    await Promise.allSettled(
-      finishedCards.map((s) =>
-        s.unread
-          ? invoke("mark_session_read", { agentType: s.agentType, sessionId: s.id })
-          : invoke("dismiss_session_card", {
-              agentType: s.agentType,
-              sessionId: s.id,
-              status: s.status,
-            })
-      )
-    );
-    queryClient.invalidateQueries({ queryKey: ["sessions"] });
+    if (finishedCards.length === 0) return;
+    const ticket = applyOptimisticSessionMutation(queryClient, finishedCards);
+    let outcome: SessionMutationOutcome | null = null;
+    try {
+      outcome = await invoke<SessionMutationOutcome>("dismiss_session_cards", {
+        items: finishedCards.map((s) => ({
+          agentType: s.agentType,
+          sessionId: s.id,
+          status: s.status,
+        })),
+      });
+      if (!outcome?.applied) {
+        console.warn(
+          "[sessions] 一键清除补扫降级（applied=false），等待 epoch 更大的快照再收口",
+          outcome
+        );
+      }
+    } catch (error) {
+      console.error("clear finished cards failed:", error);
+    }
+    await settleSessionMutation(queryClient, ticket, outcome);
   };
 
   // 桌宠开关状态：与 petConfig 双向同步（标题栏开关/设置页/托盘改动经订阅回流）；
@@ -167,14 +195,14 @@ export default function HomePage() {
               <>
                 <div className="flex items-center gap-2">
                   <Activity className="text-muted-foreground h-4 w-4" />
-                  <span className="text-sm font-semibold">{totalCount}</span>
+                  <span className="text-sm font-semibold">{visibleTotalCount}</span>
                   <span className="text-muted-foreground text-xs">{t("home.sessions")}</span>
                 </div>
-                {waitingCount > 0 && (
+                {visibleWaitingCount > 0 && (
                   <div className="flex items-center gap-2">
                     <AlertCircle className="h-4 w-4 text-red-600 dark:text-red-400" />
                     <span className="text-sm font-semibold text-red-600 dark:text-red-400">
-                      {waitingCount}
+                      {visibleWaitingCount}
                     </span>
                     <span className="text-muted-foreground text-xs">{t("home.waiting")}</span>
                   </div>

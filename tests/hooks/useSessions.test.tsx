@@ -3,6 +3,7 @@ import { describe, it, expect } from "vitest";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { ReactNode } from "react";
 import { useSessions } from "@/hooks/useSessions";
+import { tauriInvokeMock } from "../msw/tauriMocks";
 
 function createWrapper() {
   const queryClient = new QueryClient({
@@ -24,5 +25,6 @@ describe("useSessions", () => {
     expect(result.current.data?.sessions).toHaveLength(2);
     expect(result.current.data?.sessions[0].agentType).toBe("claude");
     expect(result.current.data?.totalCount).toBe(2);
+    expect(tauriInvokeMock).toHaveBeenCalledWith("get_sessions_snapshot");
   });
 });
