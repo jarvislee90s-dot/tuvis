@@ -12,6 +12,7 @@ use rusqlite::{Connection, OptionalExtension};
 use sha2::{Digest, Sha256};
 
 use crate::database::dao::codex_actions as dao;
+use crate::database::dao::codex_actions::StopPauseRow;
 use crate::inject::headless::codex::{production_queue_holds, QueueEvidence};
 use crate::inject::normalize::compose_injection_flagged;
 use crate::remote::pairing::{self, DeviceStore};
@@ -357,6 +358,28 @@ impl ActionStore {
         })
     }
 
+    /// P11（2026-10-31 用户裁决）：接力用的队首——**跳过自身带屏障的行**。
+    ///
+    /// 屏障标记的是「这条动作投递结果不明，别自动重发它」。它保护的始终是那一行；
+    /// 旧实现把「有未清屏障」当成整队停摆，导致一条历史 unknown 让整个会话队列
+    /// 永久冻结（实机：空闲也不发）。这里改为只跳过带屏障的那一条，队列其余消息
+    /// 照常接力。
+    ///
+    /// 注意：终态行（unknown/accepted）本就不在 `state='queued'` 里，天然被排除；
+    /// 本变体额外覆盖「queued 状态下被人工/异常置了屏障」的形态。
+    pub fn next_queued_skip_barriered(
+        &self,
+        key: &ThreadKey,
+    ) -> Result<Option<QueuedAction>, StoreError> {
+        self.with(|c| {
+            let Some(row) = dao::next_queued_unbarriered_conn(c, &key.thread_id).map_err(db_err)?
+            else {
+                return Ok(None);
+            };
+            Ok(Some(queued_action_of(row)?))
+        })
+    }
+
     /// 按 action_id 读取单条 queued 行（S2 一次性越队：绕过 FIFO 队首直接派发
     /// 授权动作时取得其发送输入）。非 queued / 不存在 → None（越队只对刚登记的
     /// queued 行有意义）。
@@ -376,6 +399,34 @@ impl ActionStore {
     /// （已撤/已派发），绝不覆盖既有状态。
     pub fn reserve(&self, action_id: &str, route: ControlRoute) -> Result<bool, StoreError> {
         self.with(|c| dao::reserve_conn(c, action_id, route, now_ms()).map_err(db_err))
+    }
+
+    /// 自然空闲/明确恢复时一次原子领取并冻结普通消息批次。
+    pub fn reserve_send_batch(&self, action_id: &str) -> Result<Option<String>, StoreError> {
+        self.with(|c| dao::reserve_send_batch_conn(c, action_id, now_ms()).map_err(db_err))
+    }
+
+    /// 核对/人工继续必须沿同一 start-turn 的 canonical action 操作。
+    pub fn canonical_batch_action_id(&self, action_id: &str) -> Result<String, StoreError> {
+        self.with(|c| {
+            c.query_row(
+                "SELECT leader_id FROM codex_send_batch_members WHERE member_id=?1",
+                [action_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map(|id| id.unwrap_or_else(|| action_id.to_string()))
+            .map_err(db_err)
+        })
+    }
+
+    /// 人工继续的正文校验使用整个冻结批次，不能只重投其中一员。
+    pub fn batch_wire_text(&self, action_id: &str) -> Result<Option<String>, StoreError> {
+        self.with(|c| {
+            let mut stmt = c.prepare("SELECT m.wire_text FROM codex_send_batch_members m JOIN codex_actions a ON a.action_id=m.member_id WHERE m.leader_id=?1 ORDER BY a.seq").map_err(db_err)?;
+            let texts = stmt.query_map([action_id], |r| r.get::<_, String>(0)).map_err(db_err)?.collect::<Result<Vec<_>,_>>().map_err(db_err)?;
+            Ok((!texts.is_empty()).then(|| texts.join("\n\n")))
+        })
     }
 
     /// S2：入队前拒绝落账（queued → rejected CAS；写尝试未开始）。false = 已离开
@@ -865,6 +916,43 @@ impl ActionStore {
         self.with(|c| dao::retract_conn(c, action_id, device_id, now_ms()).map_err(db_err))
     }
 
+    /// 同锁读取正文并撤回；派发 CAS 先赢则绝不返回正文。
+    pub fn retract_for_edit(
+        &self,
+        action_id: &str,
+        device_id: &str,
+        key: &ThreadKey,
+    ) -> Result<Option<String>, StoreError> {
+        self.with(|c| {
+            let Some(row) = dao::get_row(c, action_id).map_err(db_err)? else {
+                return Ok(None);
+            };
+            if row.device_id != device_id
+                || row.thread_id != key.thread_id
+                || row.kind != "send"
+                || row.state != ActionState::Queued
+            {
+                return Ok(None);
+            }
+            let mut text = row.queued_text.unwrap_or_default();
+            if row.signature_applied == Some(true)
+                && !crate::inject::normalize::is_slash_message(&text)
+            {
+                let suffix = format!(
+                    " [mobile {}]",
+                    crate::inject::normalize::normalize_newlines(&row.device_name)
+                );
+                if let Some(body) = text.strip_suffix(&suffix) {
+                    text = body.to_string();
+                }
+            }
+            if !dao::retract_conn(c, action_id, device_id, now_ms()).map_err(db_err)? {
+                return Ok(None);
+            }
+            Ok(Some(text))
+        })
+    }
+
     /// 「远程消息带设备签名」设置（缺省关）。登记动作时读一次并冻结，
     /// 之后排队/重启/重试都不再读——保证同一 actionId 的 wire 文本恒定。
     pub fn message_signature_enabled(&self) -> bool {
@@ -914,6 +1002,19 @@ impl ActionStore {
                 now_ms(),
             )
             .map_err(db_err)
+        })
+    }
+
+    /// P2（2026-10-30）：native 保守屏障的核对证据补录——只补 wire 文本 hash
+    /// （尚未登记时写入；幂等，不覆盖 compat bridge 的 rollout 证据）。settle
+    /// 路径的 native Unknown 屏障只读核对消费该字段。
+    pub fn set_native_wire_evidence(
+        &self,
+        action_id: &str,
+        wire_hash: &str,
+    ) -> Result<(), StoreError> {
+        self.with(|c| {
+            dao::set_native_wire_evidence_conn(c, action_id, wire_hash, now_ms()).map_err(db_err)
         })
     }
 
@@ -1000,16 +1101,33 @@ impl ActionStore {
     // ---- S2：打断后队列持久暂停 + 一次性越队授权 ----
 
     /// 置 Thread 队列暂停（打断受理/不确定时由打断端点调用；幂等，首次信息保留）。
+    /// P3：`pause_turn_id` = 本次停止等待的目标回合（expectedTurnId 安全阀）——
+    /// settle 路径按其终态证据自动清除停止类暂停行；None = 未绑定（保守保留）。
     pub fn set_queue_pause(
         &self,
         key: &ThreadKey,
         pause_reason: &str,
         pause_token: &str,
+        pause_turn_id: Option<&str>,
     ) -> Result<bool, StoreError> {
         self.with(|c| {
-            dao::set_queue_pause_conn(c, &key.thread_id, pause_reason, pause_token, now_ms())
-                .map_err(db_err)
+            dao::set_queue_pause_conn(
+                c,
+                &key.thread_id,
+                pause_reason,
+                pause_token,
+                pause_turn_id,
+                now_ms(),
+            )
+            .map_err(db_err)
         })
+    }
+
+    /// P3：该 Thread 的**停止类**暂停行 `(pause_token, pause_turn_id)`（按
+    /// paused_at 升序）。settle 路径的自动解除逐行消费；token 为 NULL 的旧行
+    /// 保守跳过（无法按 token 定向清除）。
+    pub fn stop_pause_rows(&self, key: &ThreadKey) -> Result<Vec<StopPauseRow>, StoreError> {
+        self.with(|c| dao::stop_pause_rows_conn(c, &key.thread_id).map_err(db_err))
     }
 
     /// 终审 R3：撤回本次打断拥有的暂停（token 不匹配/行不存在 → false，不动他人）。
@@ -1056,6 +1174,45 @@ impl ActionStore {
         self.with(|c| {
             dao::consume_bypass_grant_conn(c, action_id, &key.thread_id, now_ms()).map_err(db_err)
         })
+    }
+
+    /// R06：优先处理授权的「尝试」铸造（幂等 CAS）。无行 → attempt 1；未消费行
+    /// → 不动（同一次授权的重放）；已消费行 → 重铸为下一 attempt（代际 +1、清
+    /// 消费位）——调用前提是动作仍 queued（明确零投递回队后的下一次用户授权）。
+    /// 与 [`Self::create_bypass_grant`]（越队发送路径，消费后不重铸）语义分叉。
+    pub fn mint_bypass_grant(&self, action_id: &str, key: &ThreadKey) -> Result<(), StoreError> {
+        self.with(|c| {
+            dao::mint_bypass_grant_conn(c, action_id, &key.thread_id, now_ms()).map_err(db_err)
+        })
+    }
+
+    /// C02：读停止尝试的占有状态（SQLite 持久，与动作行同生命周期、重启不丢）。
+    /// 重放进入时先读：`Claimed | Unknown(_)` → 不得再发停止帧（既有 Unknown 语义）。
+    pub fn stop_attempt_phase(&self, action_id: &str) -> Result<dao::StopAttemptPhase, StoreError> {
+        self.with(|c| dao::stop_attempt_phase_conn(c, action_id).map_err(db_err))
+    }
+
+    /// C02：CAS 占有停止尝试（首帧可能写出之前调用）。false = 行不在账/已有活跃
+    /// 占有/旧行未知记录——调用方**不得**发起新停止。
+    pub fn claim_stop_attempt(&self, action_id: &str) -> Result<bool, StoreError> {
+        self.with(|c| dao::claim_stop_attempt_conn(c, action_id, now_ms()).map_err(db_err))
+    }
+
+    /// C02：升级占有的结果为未知原因（R05 语义保留：重放按记录返回）。
+    pub fn resolve_stop_attempt_unknown(
+        &self,
+        action_id: &str,
+        reason: &str,
+    ) -> Result<bool, StoreError> {
+        self.with(|c| {
+            dao::resolve_stop_attempt_unknown_conn(c, action_id, reason, now_ms()).map_err(db_err)
+        })
+    }
+
+    /// C02：CAS 释放占有（仅首写前明确零投递出口调用）——之后的同 action 显式
+    /// 重试可再次占有并发起停止。
+    pub fn release_stop_attempt(&self, action_id: &str) -> Result<bool, StoreError> {
+        self.with(|c| dao::release_stop_attempt_conn(c, action_id, now_ms()).map_err(db_err))
     }
 
     /// 读取该 Thread 全部在册 fence（seq 序；reconcile 迭代输入）。
@@ -1183,10 +1340,23 @@ impl ActionStore {
     }
 
     /// R6.3：全部 Turn 顺序绑定行（`Router::new` 重启重建内存限制的输入）。
+    ///
+    /// P6（2026-10-31 用户实机）：**跳过永远无法释放的行**——`state='unknown'` 且
+    /// `compat_turn_id` 为空。`release_turn_if_complete` 只在绑定 turnId 时才能取得
+    /// 终态证据（无 turnId 直接返回 false），因此这类行一旦重建进内存限制就**永久**
+    /// 冻结该线程：新普通消息一律排队，连空闲会话也发不出去（实机表现）。它不是
+    /// 「保守的进行中限制」而是「已收尾的未知投递」——持久屏障仍然保留（不自动重发、
+    /// 待核对/人工解除），只是不再冒充在飞回合。
+    ///
+    /// accepted 缺 turnId 的情形保持不变（有 `converge_with_ledger` 补绑路径）。
     pub fn turn_bindings(&self) -> Result<Vec<TurnBinding>, StoreError> {
         self.with(|c| {
             dao::turn_binding_rows_conn(c).map_err(db_err).map(|rows| {
                 rows.into_iter()
+                    .filter(|r| {
+                        // 只有「unknown 且无回合身份」是可证明永不可释放的形态
+                        !(r.state == ActionState::Unknown && r.compat_turn_id.is_none())
+                    })
                     .map(|r| TurnBinding {
                         action_id: r.action_id,
                         key: local_thread_key(&r.thread_id),
@@ -1231,14 +1401,25 @@ fn view_of(c: &Connection, row: dao::ActionRow) -> rusqlite::Result<CodexActionV
     } else {
         None
     };
+    // P4：正文预览原样取自账本 queued_text（不剥签名、不改内容），按字符边界截前
+    // 120 字符；queued_text 已清（reserved/终态）→ None。
+    let text_preview = row.queued_text.as_deref().map(|t| {
+        t.chars()
+            .take(ACTION_TEXT_PREVIEW_CHARS)
+            .collect::<String>()
+    });
     Ok(CodexActionView {
         action_id: row.action_id,
         state: row.state,
         position,
         receipt: row.receipt,
         stage: crate::services::codex_desktop_ipc::types::DeliveryStage::of_state(row.state),
+        text_preview,
     })
 }
+
+/// P4：正文预览截断长度（字符数；前端剥签名后自行决定显示长度）。
+const ACTION_TEXT_PREVIEW_CHARS: usize = 120;
 
 fn queued_action_of(row: dao::ActionRow) -> Result<QueuedAction, StoreError> {
     let kind = kind_from_str(&row.kind)
@@ -1587,6 +1768,57 @@ mod tests {
         assert_eq!(wire_text_hash("hi").len(), 64);
     }
 
+    /// P4：队列 DTO 正文预览——queued 行带 textPreview（按字符边界截前 120 字符，
+    /// 多字节不切坏）；非 queued 行（reserve 后 queued_text 已清）为 None。
+    #[test]
+    fn action_view_text_preview_truncates_on_char_boundary() {
+        let store = ActionStore::new(DeviceStore::memory());
+        let ctx = |id: &str| ActionContext {
+            action_id: id.into(),
+            device_id: "d".into(),
+            device_name: "n".into(),
+            kind: ActionKind::Send,
+            key: key(),
+        };
+        // 多字节长文：130 个字符（每字符 3 字节 UTF-8）
+        let long = "兔".repeat(130);
+        store
+            .register(
+                &ctx("p4-long"),
+                ActionKind::Send,
+                None,
+                None,
+                "h",
+                Some(&long),
+            )
+            .unwrap();
+        let view = store.get_for_device("p4-long", "d").unwrap().unwrap();
+        let preview = view.text_preview.expect("queued 行必须携带 textPreview");
+        assert_eq!(preview.chars().count(), 120, "恰好 120 字符");
+        assert_eq!(preview, long.chars().take(120).collect::<String>());
+        // 短文本原样给前端（不剥签名、不改内容）
+        store
+            .register(
+                &ctx("p4-short"),
+                ActionKind::Send,
+                None,
+                None,
+                "h",
+                Some("短正文"),
+            )
+            .unwrap();
+        let view = store.get_for_device("p4-short", "d").unwrap().unwrap();
+        assert_eq!(view.text_preview.as_deref(), Some("短正文"));
+        // reserve 后 queued_text 已清（既有行为）→ None
+        store.reserve("p4-short", ControlRoute::DesktopIpc).unwrap();
+        let view = store.get_for_device("p4-short", "d").unwrap().unwrap();
+        assert_eq!(view.state, ActionState::Reserved);
+        assert!(
+            view.text_preview.is_none(),
+            "非 queued 行 textPreview 为 None"
+        );
+    }
+
     /// 旧库升级安全：无 codex_actions 的旧库经 schema::init 幂等补建，既有表数据不丢
     #[test]
     fn schema_init_upgrades_old_db_idempotently() {
@@ -1643,5 +1875,67 @@ mod tests {
         let head = store.next_queued(&key()).unwrap().unwrap();
         assert_eq!(head.raw_text, "原文");
         assert!(!head.client_message_id.is_empty());
+    }
+    #[test]
+    fn edit_cas_preserves_body_and_removes_only_frozen_signature() {
+        let store = ActionStore::new(DeviceStore::memory());
+        for (id, signature, raw, expected) in [
+            (
+                "signed",
+                Some(true),
+                "正文 [mobile 自写] [mobile n]",
+                "正文 [mobile 自写]",
+            ),
+            (
+                "unsigned",
+                Some(false),
+                "正文 [mobile n]",
+                "正文 [mobile n]",
+            ),
+            ("legacy", None, "[mobile n] 正文 [1]", "[mobile n] 正文 [1]"),
+            ("slash", Some(true), "/cmd [mobile n]", "/cmd [mobile n]"),
+        ] {
+            let ctx = ActionContext {
+                action_id: id.into(),
+                device_id: "d".into(),
+                device_name: "n".into(),
+                kind: ActionKind::Send,
+                key: key(),
+            };
+            store
+                .register_signed(&ctx, ActionKind::Send, None, None, id, Some(raw), signature)
+                .unwrap();
+            assert!(store
+                .retract_for_edit(id, "other", &key())
+                .unwrap()
+                .is_none());
+            assert_eq!(
+                store.retract_for_edit(id, "d", &key()).unwrap().as_deref(),
+                Some(expected)
+            );
+            assert!(store.retract_for_edit(id, "d", &key()).unwrap().is_none());
+        }
+        let ctx = ActionContext {
+            action_id: "reserved".into(),
+            device_id: "d".into(),
+            device_name: "n".into(),
+            kind: ActionKind::Send,
+            key: key(),
+        };
+        store
+            .register(
+                &ctx,
+                ActionKind::Send,
+                None,
+                None,
+                "h",
+                Some("reserved text"),
+            )
+            .unwrap();
+        assert!(store.reserve("reserved", ControlRoute::DesktopIpc).unwrap());
+        assert!(store
+            .retract_for_edit("reserved", "d", &key())
+            .unwrap()
+            .is_none());
     }
 }

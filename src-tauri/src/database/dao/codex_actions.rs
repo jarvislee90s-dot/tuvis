@@ -280,6 +280,23 @@ pub(crate) fn next_queued_conn(
     conn.query_row(&sql, [thread_id], row_action).optional()
 }
 
+/// P11（2026-10-31 用户裁决）：接力用队首——**跳过自身带屏障的行**。
+///
+/// 与 [`next_queued_conn`] 的唯一差别是多一个 `compat_outstanding = 0` 谓词：
+/// 屏障只保护它自己那一行不被自动重发，不该让整条队列停摆。
+pub(crate) fn next_queued_unbarriered_conn(
+    conn: &Connection,
+    thread_id: &str,
+) -> rusqlite::Result<Option<ActionRow>> {
+    let sql = format!(
+        "SELECT {COLS} FROM codex_actions WHERE thread_id = ?1 AND state = 'queued' \
+ AND kind = 'send' \
+ AND (compat_outstanding IS NULL OR compat_outstanding = 0) \
+ ORDER BY seq ASC LIMIT 1"
+    );
+    conn.query_row(&sql, [thread_id], row_action).optional()
+}
+
 /// 某会话全部 queued **普通消息**（seq 升序；position 计算与 list_queued 共用本函数；
 /// R6.1 同 `next_queued_conn` 只收 `kind='send'`，队列位置视图与调度器同源）。
 pub(crate) fn queued_for_thread_conn(
@@ -314,7 +331,8 @@ pub(crate) fn mark_stale_reserved_unknown_conn(
  AND kind IN ('send', 'async_question')
  AND (compat_outstanding IS NULL OR compat_outstanding = 0)
  AND barrier_force_released_at IS NULL
- AND updated_at <= ?1",
+ AND updated_at <= ?1
+ AND NOT EXISTS (SELECT 1 FROM codex_send_batch_members m WHERE m.member_id=codex_actions.action_id AND m.leader_id<>m.member_id)",
     )?;
     let rows: Vec<(i64, String, String)> = stmt
         .query_map([cutoff], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
@@ -366,7 +384,7 @@ pub(crate) fn mark_stale_reserved_unknown_conn(
 pub(crate) fn recover_reserved_conn(conn: &Connection, now_ms: i64) -> rusqlite::Result<usize> {
     let reserved: Vec<String> = {
         let mut stmt = conn.prepare(
-            "SELECT action_id FROM codex_actions WHERE state = 'reserved' ORDER BY seq ASC",
+            "SELECT action_id FROM codex_actions WHERE state = 'reserved' AND NOT EXISTS (SELECT 1 FROM codex_send_batch_members m WHERE m.member_id=codex_actions.action_id AND m.leader_id<>m.member_id) ORDER BY seq ASC",
         )?;
         let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
         rows.collect::<rusqlite::Result<Vec<_>>>()?
@@ -465,6 +483,50 @@ pub(crate) fn requeue_after_busy_conn(
     now_ms: i64,
 ) -> rusqlite::Result<bool> {
     let tx = conn.unchecked_transaction()?;
+    let members = {
+        let mut stmt = tx.prepare(
+            "SELECT member_id, wire_text, signature_applied FROM codex_send_batch_members WHERE leader_id=?1",
+        )?;
+        let result = stmt
+            .query_map([action_id], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, bool>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        result
+    };
+    if !members.is_empty() {
+        // 写前明确零投递才能解散；每员恢复自己的冻结正文，不能把整批塞回队首。
+        for (member, text, signed) in &members {
+            let n = tx.execute("UPDATE codex_actions SET state='queued', route='none', queued_text=?2, signature_applied=?4, updated_at=?3 WHERE action_id=?1 AND state='reserved'", params![member, text, now_ms, signed])?;
+            if n != 1 {
+                return Err(rusqlite::Error::InvalidQuery);
+            }
+            let row = get_row(&tx, member)?.ok_or(rusqlite::Error::InvalidQuery)?;
+            super::write_audit::record_conn_checked(
+                &tx,
+                now_ms,
+                &row.device_id,
+                &row.device_name,
+                "codex",
+                &row.thread_id,
+                "codex_desktop_ipc",
+                "send",
+                &audit_summary(&row),
+                "requeued_busy",
+            )?;
+        }
+        tx.execute(
+            "DELETE FROM codex_send_batch_members WHERE leader_id=?1",
+            [action_id],
+        )?;
+        tx.commit()?;
+        return Ok(true);
+    }
+
     // `queued_text` 回填的是**已冻结的最终 wire**——必须同时把签名标志写成具体值，
     // 否则旧行（NULL）下次派发会再按「恒签名」组装，造成双签名/换正文
     // （2026-10-20 第三轮复审 Important）。
@@ -503,19 +565,50 @@ pub(crate) fn requeue_after_busy_conn(
 /// 置 Thread 队列暂停（打断端点 `interrupt_pending` 前置档调用）。复审 R-T2 起
 /// **按 token 多行共存**：每次打断落自己的行（复合主键 thread_id+pause_token，
 /// 同 token 重放幂等——返回 false）。「暂停中 = EXISTS 任意行」由读取侧承载。
+/// P3（2026-10-30）：`pause_turn_id` = 本次停止等待的目标回合（expectedTurnId
+/// 安全阀）——settle 路径按其终态证据自动清除停止类暂停行；None = 未绑定（保守
+/// 保留，仅显式 resume 可清）。
 pub(crate) fn set_queue_pause_conn(
     conn: &Connection,
     thread_id: &str,
     pause_reason: &str,
     pause_token: &str,
+    pause_turn_id: Option<&str>,
     now_ms: i64,
 ) -> rusqlite::Result<bool> {
     let n = conn.execute(
-        "INSERT INTO codex_queue_pause (thread_id, paused_at, pause_reason, pause_token) \
- VALUES (?1, ?2, ?3, ?4) ON CONFLICT(thread_id, pause_token) DO NOTHING",
-        params![thread_id, now_ms, pause_reason, pause_token],
+        "INSERT INTO codex_queue_pause (thread_id, paused_at, pause_reason, pause_token, pause_turn_id) \
+ VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(thread_id, pause_token) DO NOTHING",
+        params![thread_id, now_ms, pause_reason, pause_token, pause_turn_id],
     )?;
     Ok(n > 0)
+}
+
+/// P3（2026-10-30）：停止类暂停行 `(pause_token, pause_turn_id)`（见
+/// [`stop_pause_rows_conn`]）。
+pub(crate) type StopPauseRow = (Option<String>, Option<String>);
+
+/// P3（2026-10-30）：该 Thread 的**停止类**暂停行 `(pause_token, pause_turn_id)`，
+/// 按 paused_at 升序。停止类档位 = stop/cancel 端点写入的原因码；settle 路径对
+/// 每行按其绑定 Turn 的终态证据逐行自动清除（清仍走 [`clear_queue_pause_owned_conn`]
+/// ——只动本次核对的 token）。token 为 NULL 的旧行无法按 token 定向清除，保守跳过。
+pub(crate) fn stop_pause_rows_conn(
+    conn: &Connection,
+    thread_id: &str,
+) -> rusqlite::Result<Vec<StopPauseRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT pause_token, pause_turn_id FROM codex_queue_pause \
+ WHERE thread_id = ?1 AND pause_reason IN \
+ ('interrupt_pending','interrupt_accepted','interrupt_uncertain','cancel_pending') \
+ ORDER BY paused_at ASC, rowid ASC",
+    )?;
+    let rows = stmt.query_map([thread_id], |r| {
+        Ok((
+            r.get::<_, Option<String>>(0)?,
+            r.get::<_, Option<String>>(1)?,
+        ))
+    })?;
+    rows.collect()
 }
 
 /// 读 Thread 暂停状态（None = 无任何暂停行 = 未暂停；Some = **最早行**——首次
@@ -577,6 +670,31 @@ pub(crate) fn create_bypass_grant_conn(
     Ok(())
 }
 
+/// R06：优先处理授权的「尝试」铸造（幂等 CAS）——
+/// * 无行 → 新建 attempt 1（首次授权）；
+/// * 有行**未消费** → 不动（同一次授权的重放，不产生新 attempt、不清消费位）；
+/// * 有行**已消费** → 重铸为下一 attempt（代际 +1、清 consumed_at）——只有
+///   优先处理路径调用本函数，且调用前提是动作仍 queued（= 上一次明确零投递
+///   busy 回队；真实写出的行必已离开 queued，到不了这里），即「明确零投递后的
+///   下一次用户授权」。旧 attempt 不复活（单行覆盖，代际只进不退）。
+pub(crate) fn mint_bypass_grant_conn(
+    conn: &Connection,
+    action_id: &str,
+    thread_id: &str,
+    now_ms: i64,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO codex_bypass_grant (action_id, thread_id, granted_at, attempt) \
+ VALUES (?1, ?2, ?3, 1) \
+ ON CONFLICT(action_id) DO UPDATE SET \
+ thread_id = ?2, granted_at = ?3, consumed_at = NULL, \
+ attempt = codex_bypass_grant.attempt + 1 \
+ WHERE codex_bypass_grant.consumed_at IS NOT NULL",
+        params![action_id, thread_id, now_ms],
+    )?;
+    Ok(())
+}
+
 /// CAS 消费授权（写出前恰好一次）：action 与 thread **必须同时匹配**——授权跨
 /// thread / 跨 action 一律 false（不存在的授权）。已消费（consumed_at 非 NULL）
 /// 再取 = false（重复消费拒绝）。行保留作审计，不删除。
@@ -590,6 +708,112 @@ pub(crate) fn consume_bypass_grant_conn(
         "UPDATE codex_bypass_grant SET consumed_at = ?3 \
  WHERE action_id = ?1 AND thread_id = ?2 AND consumed_at IS NULL",
         params![action_id, thread_id, now_ms],
+    )?;
+    Ok(n > 0)
+}
+
+/// C02（R05 残留收口）：停止尝试的持久占有状态机（SQLite 持久，与动作行同生命
+/// 周期）。占有（claim）在**首次可能写出 interrupt 之前** CAS 落库，覆盖「writer
+/// 已接收/写出帧后 handler 被取消/服务退出」的事后记录盲窗；重放读到占有/未知
+/// 记录一律不再发停止帧。
+///
+/// 列形态（`stop_attempt_state` / `stop_attempt_reason` 两列联合判定）：
+/// * `(NULL, NULL)`                    → [`StopAttemptPhase::Fresh`]（未占有，可占有）；
+/// * `('claimed', NULL)`               → [`StopAttemptPhase::Claimed`]（已占有、结果未知）；
+/// * `('claimed', Some(reason))`       → [`StopAttemptPhase::Unknown`]（占有的结果升级为未知原因）；
+/// * `(NULL, Some(reason))`            → [`StopAttemptPhase::Unknown`]（C02 前旧行的兼容识别）；
+/// * `('released', _)`                 → [`StopAttemptPhase::Released`]（首写前明确零投递，
+///   允许显式新尝试；释放同时清 reason，`_` 仅为防御性容忍）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StopAttemptPhase {
+    /// 未占有（从未尝试，或上一次明确零投递已释放）——允许占有并发起新停止。
+    Fresh,
+    /// 已占有、结果未知——重放不得再发停止帧。
+    Claimed,
+    /// 停止尝试的结果未知（含 C02 前旧行），携带未知原因——重放不得再发停止帧。
+    Unknown(String),
+    /// 已释放（首写前明确零投递）——允许显式新尝试。
+    Released,
+}
+
+/// 读停止尝试的占有状态（行不存在 = [`StopAttemptPhase::Fresh`]）。
+pub(crate) fn stop_attempt_phase_conn(
+    conn: &Connection,
+    action_id: &str,
+) -> rusqlite::Result<StopAttemptPhase> {
+    conn.query_row(
+        "SELECT stop_attempt_state, stop_attempt_reason FROM codex_actions WHERE action_id = ?1",
+        [action_id],
+        |r| {
+            Ok(
+                match (
+                    r.get::<_, Option<String>>(0)?.as_deref(),
+                    r.get::<_, Option<String>>(1)?,
+                ) {
+                    (Some("released"), _) => StopAttemptPhase::Released,
+                    (Some("claimed"), None) => StopAttemptPhase::Claimed,
+                    (_, Some(reason)) => StopAttemptPhase::Unknown(reason),
+                    _ => StopAttemptPhase::Fresh,
+                },
+            )
+        },
+    )
+    .or_else(|e| match e {
+        rusqlite::Error::QueryReturnedNoRows => Ok(StopAttemptPhase::Fresh),
+        other => Err(other),
+    })
+}
+
+/// CAS 占有（C02：首帧可能写出之前调用）：`Fresh | Released → Claimed`（同时清
+/// 旧 reason——占有行在新尝试开始时不携带上一次的残留）。C02 前旧行（state 为
+/// NULL 且 reason 非 NULL = 已记录的未知结果）**不可被占有覆盖**——重放保护对
+/// 老数据不放宽。false = 行不在账（并发撤回赢者）/ 已有活跃占有 / 旧行未知记录
+/// ——调用方**不得**发起新停止。
+pub(crate) fn claim_stop_attempt_conn(
+    conn: &Connection,
+    action_id: &str,
+    now_ms: i64,
+) -> rusqlite::Result<bool> {
+    let n = conn.execute(
+        "UPDATE codex_actions SET stop_attempt_state = 'claimed', stop_attempt_reason = NULL, \
+         updated_at = ?2 \
+         WHERE action_id = ?1 \
+           AND ((stop_attempt_state IS NULL AND stop_attempt_reason IS NULL) \
+                OR stop_attempt_state = 'released')",
+        params![action_id, now_ms],
+    )?;
+    Ok(n > 0)
+}
+
+/// 升级占有的结果为未知原因（C02：仅占有者调用；R05 语义保留——重放按记录的
+/// 原因返回既有 Unknown 语义）。false = 占有已不在（不应发生，调用方留痕）。
+pub(crate) fn resolve_stop_attempt_unknown_conn(
+    conn: &Connection,
+    action_id: &str,
+    reason: &str,
+    now_ms: i64,
+) -> rusqlite::Result<bool> {
+    let n = conn.execute(
+        "UPDATE codex_actions SET stop_attempt_reason = ?2, updated_at = ?3 \
+         WHERE action_id = ?1 AND stop_attempt_state = 'claimed'",
+        params![action_id, reason, now_ms],
+    )?;
+    Ok(n > 0)
+}
+
+/// CAS 释放（C02：仅**首写前明确零投递**出口调用；占有者回 `Fresh`——之后的
+/// 同 action 显式重试可再次占有并发起停止）。释放同时清 reason（未知/零投递
+/// 原因的审计走 write_audit，不滞留占有行）。false = 占有已不在。
+pub(crate) fn release_stop_attempt_conn(
+    conn: &Connection,
+    action_id: &str,
+    now_ms: i64,
+) -> rusqlite::Result<bool> {
+    let n = conn.execute(
+        "UPDATE codex_actions SET stop_attempt_state = 'released', stop_attempt_reason = NULL, \
+         updated_at = ?2 \
+         WHERE action_id = ?1 AND stop_attempt_state = 'claimed'",
+        params![action_id, now_ms],
     )?;
     Ok(n > 0)
 }
@@ -815,6 +1039,23 @@ pub(crate) fn set_compat_evidence_conn(
             wire_hash,
             now_ms
         ],
+    )?;
+    Ok(())
+}
+
+/// P2（2026-10-30）：**native 保守屏障**的核对证据补录——只补 `compat_wire_hash`
+/// （本次写出的已组装文本 hash），且仅在尚未登记时写入（幂等，绝不覆盖/伪造
+/// compat bridge 的 rollout 证据）。供 settle 路径的 native Unknown 屏障只读核对。
+pub(crate) fn set_native_wire_evidence_conn(
+    conn: &Connection,
+    action_id: &str,
+    wire_hash: &str,
+    now_ms: i64,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE codex_actions SET compat_wire_hash = ?2, updated_at = ?3 \
+ WHERE action_id = ?1 AND compat_wire_hash IS NULL",
+        params![action_id, wire_hash, now_ms],
     )?;
     Ok(())
 }
@@ -1588,6 +1829,85 @@ pub(crate) fn finish_and_settle_claim_conn(
     Ok(())
 }
 
+/// 同线程 FIFO 原子冻结；只领取同一设备的连续普通消息，设备权限沿用 canonical 复核。
+pub(crate) fn reserve_send_batch_conn(
+    conn: &Connection,
+    action_id: &str,
+    now_ms: i64,
+) -> rusqlite::Result<Option<String>> {
+    let tx = conn.unchecked_transaction()?;
+    let Some(head) = get_row(&tx, action_id)? else {
+        return Ok(None);
+    };
+    if head.state != ActionState::Queued {
+        return Ok(None);
+    }
+    let ids = {
+        let mut stmt = tx.prepare("SELECT action_id FROM codex_actions WHERE thread_id=?1 AND state='queued' AND kind='send' ORDER BY seq")?;
+        let result = stmt
+            .query_map([&head.thread_id], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        result
+    };
+    if ids.first().map(String::as_str) != Some(action_id) {
+        return Ok(None);
+    }
+    let mut members = Vec::new();
+    let mut bytes = 0usize;
+    for id in ids {
+        let row = get_row(&tx, &id)?.ok_or(rusqlite::Error::InvalidQuery)?;
+        if row.kind != "send" || row.device_id != head.device_id {
+            break;
+        }
+        let raw = row
+            .queued_text
+            .as_deref()
+            .ok_or(rusqlite::Error::InvalidQuery)?;
+        let wire = if row.signature_applied.is_some() {
+            raw.to_string()
+        } else {
+            crate::inject::normalize::compose_injection_flagged(&row.device_name, raw, true)
+        };
+        // 保守限制批次大小；单条原有预算仍由原派发通道校验。
+        if !members.is_empty() && bytes + wire.len() + 2 > 64 * 1024 {
+            break;
+        }
+        bytes += wire.len() + 2;
+        members.push((row, wire));
+    }
+    if members.is_empty() {
+        return Ok(None);
+    }
+    let wire = members
+        .iter()
+        .map(|(_, w)| w.as_str())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    for (row, text) in &members {
+        let n = tx.execute("UPDATE codex_actions SET state='reserved', route='desktop_ipc', queued_text=NULL, updated_at=?2 WHERE action_id=?1 AND state='queued'", params![row.action_id, now_ms])?;
+        if n != 1 {
+            return Err(rusqlite::Error::InvalidQuery);
+        }
+        if members.len() > 1 {
+            tx.execute("INSERT INTO codex_send_batch_members(member_id,leader_id,wire_text,signature_applied) VALUES (?1,?2,?3,?4)", params![row.action_id, action_id, text, row.signature_applied.unwrap_or(true)])?;
+        }
+        super::write_audit::record_conn_checked(
+            &tx,
+            now_ms,
+            &row.device_id,
+            &row.device_name,
+            "codex",
+            &row.thread_id,
+            "codex_desktop_ipc",
+            "send",
+            &audit_summary(row),
+            "reserved",
+        )?;
+    }
+    tx.commit()?;
+    Ok(Some(wire))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1658,8 +1978,12 @@ mod tests {
     fn queue_pause_and_bypass_grant_semantics() {
         let c = mem();
         // 暂停：幂等，首次信息保留
-        assert!(set_queue_pause_conn(&c, THREAD, "interrupt_accepted", "tok-1", 1000).unwrap());
-        assert!(!set_queue_pause_conn(&c, THREAD, "interrupt_accepted", "tok-1", 2000).unwrap());
+        assert!(
+            set_queue_pause_conn(&c, THREAD, "interrupt_accepted", "tok-1", None, 1000).unwrap()
+        );
+        assert!(
+            !set_queue_pause_conn(&c, THREAD, "interrupt_accepted", "tok-1", None, 2000).unwrap()
+        );
         assert_eq!(
             queue_pause_conn(&c, THREAD).unwrap(),
             Some((1000, "interrupt_accepted".into())),
@@ -1694,6 +2018,169 @@ mod tests {
         );
     }
 
+    /// R06：优先处理授权的「尝试」铸造（幂等 CAS）——无行建 attempt 1；未消费行
+    /// 不动（同一次授权重放不清消费位、不加代际）；已消费行重铸为下一 attempt
+    ///（代际 +1、清 consumed_at、换 thread 时改绑）；跨 action 永不互借。
+    #[test]
+    fn mint_bypass_grant_attempt_cas_semantics() {
+        let c = mem();
+        // 无行 → attempt 1（未消费）；重复铸造未消费行 = 不动
+        mint_bypass_grant_conn(&c, "act-1", THREAD, 1000).unwrap();
+        mint_bypass_grant_conn(&c, "act-1", THREAD, 1001).unwrap();
+        let (attempt, consumed) = grant_attempt_and_consumed(&c, "act-1");
+        assert_eq!(
+            (attempt, consumed.is_some()),
+            (1, false),
+            "未消费行铸造不动"
+        );
+        // 消费后：create（越队发送路径语义）不再复活；mint 重铸为 attempt 2
+        assert!(consume_bypass_grant_conn(&c, "act-1", THREAD, 1100).unwrap());
+        create_bypass_grant_conn(&c, "act-1", THREAD, 1101).unwrap();
+        assert!(
+            !consume_bypass_grant_conn(&c, "act-1", THREAD, 1102).unwrap(),
+            "create 不复活已消费授权（越队发送路径语义不变）"
+        );
+        mint_bypass_grant_conn(&c, "act-1", THREAD, 1200).unwrap();
+        let (attempt, consumed) = grant_attempt_and_consumed(&c, "act-1");
+        assert_eq!(
+            (attempt, consumed.is_none()),
+            (2, true),
+            "已消费行重铸为下一 attempt（清消费位）"
+        );
+        assert!(consume_bypass_grant_conn(&c, "act-1", THREAD, 1201).unwrap());
+        // 重铸到 attempt 3 后，在未消费态重复铸造：代际不进、消费位不清
+        mint_bypass_grant_conn(&c, "act-1", THREAD, 1300).unwrap();
+        let (attempt, _) = grant_attempt_and_consumed(&c, "act-1");
+        assert_eq!(attempt, 3);
+        mint_bypass_grant_conn(&c, "act-1", THREAD, 1301).unwrap();
+        let (attempt, consumed) = grant_attempt_and_consumed(&c, "act-1");
+        assert_eq!(
+            (attempt, consumed.is_none()),
+            (3, true),
+            "未消费态重复铸造：代际不进、消费位不清"
+        );
+        // 跨 action 永不互借：act-2 铸造是自己的 attempt 1，与 act-1 无关
+        mint_bypass_grant_conn(&c, "act-2", THREAD, 1400).unwrap();
+        let (attempt, _) = grant_attempt_and_consumed(&c, "act-2");
+        assert_eq!(attempt, 1, "授权按 action 隔离（旧 attempt 不外借）");
+        // 未消费行跨 thread 铸造 = 不动（在飞授权不被重绑）；消费后再跨 thread
+        // 重铸才改绑，且消费 CAS 仍按 thread 核对
+        mint_bypass_grant_conn(&c, "act-2", "other-thread", 1450).unwrap();
+        let (attempt, consumed) = grant_attempt_and_consumed(&c, "act-2");
+        assert_eq!(
+            (attempt, consumed.is_none()),
+            (1, true),
+            "未消费授权不受跨 thread 铸造影响"
+        );
+        assert!(consume_bypass_grant_conn(&c, "act-2", THREAD, 1451).unwrap());
+        mint_bypass_grant_conn(&c, "act-2", "other-thread", 1500).unwrap();
+        assert!(
+            !consume_bypass_grant_conn(&c, "act-2", THREAD, 1501).unwrap(),
+            "重铸改绑后旧 thread 消费失败"
+        );
+        assert!(
+            consume_bypass_grant_conn(&c, "act-2", "other-thread", 1502).unwrap(),
+            "重铸改绑后新 thread 恰好消费一次"
+        );
+    }
+
+    /// R06 测试辅助：直读授权行的 attempt 代际与消费位。
+    fn grant_attempt_and_consumed(c: &Connection, action_id: &str) -> (i64, Option<i64>) {
+        c.query_row(
+            "SELECT attempt, consumed_at FROM codex_bypass_grant WHERE action_id = ?1",
+            [action_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap()
+    }
+
+    /// C02（R05 残留收口）：停止尝试占有状态机——Fresh→Claimed→Unknown 升级 /
+    /// Claimed→Released 释放→再占有；占有清残留 reason；行不在账 = 占有失败；
+    /// C02 前旧行（state NULL + reason 非 NULL）兼容识别为 Unknown。
+    #[test]
+    fn stop_attempt_state_machine_semantics() {
+        use StopAttemptPhase::{Claimed, Fresh, Released, Unknown};
+        let c = mem();
+        // 无行 = Fresh（未占有）；行在账但未占有也是 Fresh
+        assert_eq!(stop_attempt_phase_conn(&c, "act-x").unwrap(), Fresh);
+        insert(&c, "act-x", Some("丙"), 1000);
+        assert_eq!(stop_attempt_phase_conn(&c, "act-x").unwrap(), Fresh);
+        // 占有：Fresh → Claimed，并清掉残留（此时本无 reason）
+        assert!(claim_stop_attempt_conn(&c, "act-x", 1500).unwrap());
+        assert_eq!(stop_attempt_phase_conn(&c, "act-x").unwrap(), Claimed);
+        // 占有不可重入（重放/并发第二请求不得覆盖活跃占有）
+        assert!(
+            !claim_stop_attempt_conn(&c, "act-x", 1600).unwrap(),
+            "活跃占有不可被二次占有"
+        );
+        // 结果未知升级：Claimed → Unknown(reason)（R05 语义：重放按记录返回）
+        assert!(resolve_stop_attempt_unknown_conn(&c, "act-x", "stop_timeout", 2000).unwrap());
+        assert_eq!(
+            stop_attempt_phase_conn(&c, "act-x").unwrap(),
+            Unknown("stop_timeout".into())
+        );
+        // C02 前旧行兼容：state 为 NULL + reason 非 NULL = Unknown（重放不发停止帧）
+        c.execute(
+            "UPDATE codex_actions SET stop_attempt_state = NULL, stop_attempt_reason = 'stop_rpc_timeout' \
+             WHERE action_id = 'act-x'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            stop_attempt_phase_conn(&c, "act-x").unwrap(),
+            Unknown("stop_rpc_timeout".into()),
+            "旧库形态兼容识别为 Unknown"
+        );
+        // 旧行未知记录不可被占有覆盖（重放保护对老数据不放宽）
+        assert!(
+            !claim_stop_attempt_conn(&c, "act-x", 2100).unwrap(),
+            "旧行未知记录不可占有"
+        );
+        // 释放：Claimed → Released（清 reason）；行不在账 = 占有失败零写入
+        c.execute(
+            "UPDATE codex_actions SET stop_attempt_state = 'claimed' WHERE action_id = 'act-x'",
+            [],
+        )
+        .unwrap();
+        assert!(release_stop_attempt_conn(&c, "act-x", 2200).unwrap());
+        assert_eq!(
+            stop_attempt_phase_conn(&c, "act-x").unwrap(),
+            Released,
+            "首写前明确零投递 → 释放（允许显式新尝试）"
+        );
+        assert!(
+            !release_stop_attempt_conn(&c, "act-gone", 2300).unwrap(),
+            "行不在账 = 零写入"
+        );
+        // 释放后再占有：新尝试获得干净占有行（旧 reason 不滞留）
+        c.execute(
+            "UPDATE codex_actions SET stop_attempt_reason = 'stale' WHERE action_id = 'act-x'",
+            [],
+        )
+        .unwrap();
+        assert!(claim_stop_attempt_conn(&c, "act-x", 2400).unwrap());
+        assert_eq!(
+            stop_attempt_phase_conn(&c, "act-x").unwrap(),
+            Claimed,
+            "再占有 = 新尝试开始"
+        );
+        assert_eq!(
+            stop_attempt_phase_reason(&c, "act-x"),
+            None,
+            "占有行不携带上一次的残留 reason"
+        );
+    }
+
+    /// C02 测试辅助：直读占有行的 reason 列（验证占有清理）。
+    fn stop_attempt_phase_reason(c: &Connection, action_id: &str) -> Option<String> {
+        c.query_row(
+            "SELECT stop_attempt_reason FROM codex_actions WHERE action_id = ?1",
+            [action_id],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .unwrap()
+    }
+
     /// 终审 R3 + 复审 R-T2：暂停行**按 token 多行共存**——每次打断落自己的行；
     /// 撤回只清**本次 token 拥有**的行（他人 token 行 / 老库 NULL 行不动）；
     /// 「暂停中 = EXISTS 任意行」（读取取最早行，首次时间/原因保留）；
@@ -1703,10 +2190,16 @@ mod tests {
         let c = mem();
         // A 打断（token A）落自己的行；B 再次打断（token B）**也落自己的行**
         //（R-T2：不再因单行主键冲突而寄居在 A 的行上——B 的保护自己持有）
-        assert!(set_queue_pause_conn(&c, THREAD, "interrupt_pending", "tok-A", 1000).unwrap());
-        assert!(set_queue_pause_conn(&c, THREAD, "interrupt_pending", "tok-B", 1100).unwrap());
+        assert!(
+            set_queue_pause_conn(&c, THREAD, "interrupt_pending", "tok-A", None, 1000).unwrap()
+        );
+        assert!(
+            set_queue_pause_conn(&c, THREAD, "interrupt_pending", "tok-B", None, 1100).unwrap()
+        );
         // 同 token 重放幂等（不新写）
-        assert!(!set_queue_pause_conn(&c, THREAD, "interrupt_pending", "tok-B", 1200).unwrap());
+        assert!(
+            !set_queue_pause_conn(&c, THREAD, "interrupt_pending", "tok-B", None, 1200).unwrap()
+        );
         // 读取 = EXISTS 任意行，取**最早行**（首次时间与原因保留）
         assert_eq!(
             queue_pause_conn(&c, THREAD).unwrap(),
@@ -1729,7 +2222,9 @@ mod tests {
             [THREAD],
         )
         .unwrap();
-        assert!(set_queue_pause_conn(&c, THREAD, "interrupt_pending", "tok-C", 2100).unwrap());
+        assert!(
+            set_queue_pause_conn(&c, THREAD, "interrupt_pending", "tok-C", None, 2100).unwrap()
+        );
         assert_eq!(
             queue_pause_conn(&c, THREAD).unwrap(),
             Some((2000, "legacy".into())),
@@ -1744,6 +2239,85 @@ mod tests {
         // resume 清全部、无视归属
         assert!(clear_queue_pause_conn(&c, THREAD).unwrap());
         assert!(queue_pause_conn(&c, THREAD).unwrap().is_none());
+    }
+
+    /// P3（2026-10-30）：stop_pause_rows 只列**停止类**暂停行（含各自绑定的
+    /// pause_turn_id；NULL token 旧行排除在外），按 paused_at 升序；非停止类行
+    /// 不进清单。settle 的自动解除据此逐行核对并定向清除。
+    #[test]
+    fn stop_pause_rows_lists_only_stop_class_with_turn_binding() {
+        let c = mem();
+        set_queue_pause_conn(
+            &c,
+            THREAD,
+            "interrupt_pending",
+            "tok-1",
+            Some("t-live"),
+            1000,
+        )
+        .unwrap();
+        set_queue_pause_conn(&c, THREAD, "cancel_pending", "tok-2", None, 1100).unwrap();
+        set_queue_pause_conn(&c, THREAD, "user_hold", "tok-3", Some("t-other"), 1200).unwrap();
+        // 旧行：无 token（无法定向清除）→ 不进清单
+        c.execute(
+            "INSERT INTO codex_queue_pause (thread_id, paused_at, pause_reason) \
+             VALUES (?1, 900, 'legacy')",
+            [THREAD],
+        )
+        .unwrap();
+        let rows = stop_pause_rows_conn(&c, THREAD).unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                (Some("tok-1".into()), Some("t-live".into())),
+                (Some("tok-2".into()), None),
+            ],
+            "只列停止类且带 token 的行，升序；turn 绑定如实携带"
+        );
+        // 其他 thread 的停止行不串扰
+        set_queue_pause_conn(
+            &c,
+            "other-thread",
+            "interrupt_pending",
+            "tok-x",
+            Some("t-x"),
+            1300,
+        )
+        .unwrap();
+        assert_eq!(stop_pause_rows_conn(&c, THREAD).unwrap().len(), 2);
+    }
+
+    /// P2（2026-10-30）：set_native_wire_evidence 只补空（幂等），绝不覆盖既有
+    /// wire hash / rollout 证据（compat bridge 的原子登记不可被 native 补录冲掉）。
+    #[test]
+    fn native_wire_evidence_fills_only_when_absent() {
+        let c = mem();
+        insert(&c, "a", Some("甲"), 1000);
+        set_native_wire_evidence_conn(&c, "a", "hash-1", 2000).unwrap();
+        assert_eq!(
+            get_row(&c, "a")
+                .unwrap()
+                .unwrap()
+                .compat_wire_hash
+                .as_deref(),
+            Some("hash-1")
+        );
+        // 已有 wire hash → 不覆盖
+        set_native_wire_evidence_conn(&c, "a", "hash-2", 3000).unwrap();
+        assert_eq!(
+            get_row(&c, "a")
+                .unwrap()
+                .unwrap()
+                .compat_wire_hash
+                .as_deref(),
+            Some("hash-1"),
+            "幂等：已登记的核对证据不被覆盖"
+        );
+        // rollout 证据与 wire hash 独立：补录不动 rollout 列
+        set_compat_evidence_conn(&c, "a", Some("/rollout/path"), Some(42), None, 4000).unwrap();
+        let row = get_row(&c, "a").unwrap().unwrap();
+        assert_eq!(row.compat_rollout_path.as_deref(), Some("/rollout/path"));
+        assert_eq!(row.compat_rollout_baseline, Some(42));
     }
 
     /// S3 迟到证据归账 CAS：reserved/unknown → 真实终态**恰好一次**；已终态不覆盖

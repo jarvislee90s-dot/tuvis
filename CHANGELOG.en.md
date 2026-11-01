@@ -13,6 +13,39 @@ English · [中文](CHANGELOG.md)
 _Only versions translated so far are listed here; the full history lives in the
 [Chinese changelog](CHANGELOG.md)._
 
+## [0.6.4] - 2026-10-31
+
+### Upgrade notes
+
+- **The queue now relays automatically** — a queue frozen by an interrupt/cancel resumes in its original order as soon as the stopped turn is confirmed finished (matching Codex's own behaviour). It stays frozen only when that turn never reaches a confirmed end.
+- **"Send first" (prioritise) no longer requires a paused queue** — even on an unpaused queue it stops the running turn, then sends that one message; when the desktop is idle it sends straight away.
+- **Messages sent while paused are queued instead of rejected** — no more "queue is paused, send failed". They join the queue with a position and can be prioritised or sent on resume.
+- **Legacy "delivery outcome unknown" records no longer freeze the whole queue** — such a record only protects itself from automatic resend.
+
+### Added
+
+- **Queue prioritise and re-edit**: each queue row shows position, a body preview, the character count, and Prioritise / Edit again / Retract. Prioritise (two-step confirm) stops the target turn when running, confirms its end, then sends that single message while the rest stay paused. Edit again restores the original text only after the server confirms retraction, and asks before replacing an existing draft.
+- **Combined sending when idle**: once the current turn ends naturally or the queue is explicitly resumed, consecutive queued messages from the same device and conversation are sent together in their original order separated by a blank line. Oversized content is split into batches; an unknown result asks you to verify the whole batch.
+- **Consolidated queue area**: pause explanation, resume entry and blocked reason now live in the queue area, collapsed to a one-line summary; the summary distinguishes "waiting for the turn to finish" from a genuine "needs manual check".
+- **Compact async question cards** with a single "other groups" entry.
+
+### Fixed
+
+- **Async answering wrongly disabled on newer Desktop builds**: contract detection now verifies structure and reference relationships instead of minified variable names, so renames no longer disable it while real protocol changes are still refused.
+- **Formal answers with trailing whitespace kept questions pending**; they now reconcile correctly.
+- **A delivered message reported as "unknown"**: when the desktop echoes its own message id but the turn contains exactly one message whose body matches what was sent, it is treated as delivered (ambiguous or cross-turn matches remain unknown).
+- **The queue not resuming after a stop**: once the interrupted turn reaches a terminal state, the queue relays automatically.
+- **Stop/prioritise timing**: a stop that has been accepted but whose state frame has not arrived yet no longer fails immediately — a 3-second window followed by a 4-second grace period is applied first.
+- **Stale pause/barrier records accumulating**: terminal release now clears every barrier on the thread that has terminal evidence, and a successful prioritise no longer locks out the next one.
+- **Capability display flicker across reconnects**: the handshake ticket is now an updateable, consumable generation ticket, and inherited display is only trusted after verifying the package content SHA.
+- **Stop idempotency**: a stop attempt is persisted before the first possible write, so cancellation or crash windows cannot emit a second interrupt.
+
+### Engineering
+
+- Added the missing `signature_applied` column to `codex_send_batch_members` for libraries created before it existed (idempotent, legacy rows default to unsigned).
+- Queue pause rows gained `pause_turn_id`, binding the stopped turn so terminal evidence can release them automatically.
+- Merged two barrier predicates that had the same meaning but different criteria into one parameterised predicate.
+
 ## [0.6.3] - 2026-10-28
 
 ### Upgrade notes

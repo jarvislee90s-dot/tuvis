@@ -12,6 +12,7 @@
 
 - [项目宪法](MASTER-PLAN.md)：最高设计依据；未经用户明确同意不得修改。
 - [规格与设计](engineering/specs/)：需求、设计、行为与验收口径。
+- [DSH Desktop 远程连接统一 Spec](engineering/specs/2026-10-29-dsh-desktop-remote-design.md)：八类功能、支撑证据、逐操作版本兼容与验收条件。
 - [WorkBuddy 5.9.3 子代理与看板 Spec](engineering/specs/2026-10-30-workbuddy-5.9.3-subagents-and-board-spec.md) / [设计](engineering/specs/2026-10-30-workbuddy-5.9.3-subagents-and-board-design.md)：5.9.3 子代理漏采与心跳冻结掉线。
 - [实施计划](engineering/plans/)：当前/历史执行计划；executor prompt 不入库。
 - [WorkBuddy 5.9.3 TDD 执行计划](engineering/plans/2026-10-30-workbuddy-5.9.3-subagents-and-board-tdd.md)：R1/R2 任务、停止点与回滚。

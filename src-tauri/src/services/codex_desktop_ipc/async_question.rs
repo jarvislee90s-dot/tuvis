@@ -287,6 +287,11 @@ pub fn compose_async_answers(entries: &[(String, u32, String, String)]) -> Strin
 pub fn parse_answer_envelope(text: &str) -> Option<Vec<AnswerEnvelope>> {
     let open = text.rfind(ENVELOPE_OPEN)?;
     let body = &text[open + ENVELOPE_OPEN.len()..];
+    // T01：Desktop 回显的用户消息常在闭标签后带 `\n` / `\r\n` 尾随空白——
+    // 只放宽信封**外部**的尾部空白：先 trim_end 再剥闭标签。开标签前的前缀
+    // 规则不变（仍认任意来源前缀）；闭标签后非空白正文依旧不认；答案内部
+    // 空白由下方 `trim`（只作用于信封 JSON 体之外）保证不改写。
+    let body = body.trim_end();
     let body = body.strip_suffix(ENVELOPE_CLOSE)?;
     let body = body.trim();
     if body.len() > MAX_ENVELOPE_BYTES {
@@ -796,7 +801,10 @@ mod tests {
             observed: Default::default(),
             schema: Default::default(),
             contract: Default::default(),
+            contract_identified: true,
             contract_error: None,
+            display_support: Default::default(),
+            display_identity_verified: false,
         };
         for operation in [
             CodexOperation::BlockingInput,
@@ -1213,6 +1221,197 @@ mod tests {
             &[other],
         );
         assert_eq!(views[0].state, InteractionState::Pending);
+    }
+
+    /// T01：Desktop 回显的用户消息常在闭标签后带尾部空白（LF／CRLF／空格）——
+    /// 仍须得到相同题目键与答案；答案内部换行与前后空格逐字保留（不改写）。
+    #[test]
+    fn answer_envelope_accepts_trailing_whitespace_without_changing_answer() {
+        let text = compose_async_answer("item-a", 0, "问题", "  a\nb  ");
+        for tail in ["\n", "\r\n", " "] {
+            let parsed = parse_answer_envelope(&(text.clone() + tail))
+                .unwrap_or_else(|| panic!("尾随空白 {tail:?} 不得让正式答复失效"));
+            assert_eq!(parsed.len(), 1);
+            assert_eq!(parsed[0].answer, "  a\nb  ", "答案内部空白不得被改写");
+            assert_eq!(parsed[0].question_item_id, question_item_id("item-a", 0));
+        }
+        // 原样回显（无尾随空白）仍是基线。
+        let parsed = parse_answer_envelope(&text).expect("原样信封仍可解析");
+        assert_eq!(parsed[0].answer, "  a\nb  ");
+    }
+
+    /// T01 边界：闭标签后有非空正文（普通正文／中间引用／代码围栏）不认；
+    /// 错误大小写标签不认；答案字符超 `MAX_ANSWER_CHARS`、信封字节超
+    /// `MAX_ENVELOPE_BYTES` 不认（非法 JSON／空数组已有独立用例，不重复）。
+    #[test]
+    fn answer_envelope_rejects_trailing_body_wrong_case_and_over_budget() {
+        let envelope = compose_async_answer("item-a", 0, "问题", "答案");
+
+        // 闭标签后有非空正文（后续普通消息）。
+        let trailing_body = envelope.clone() + "\n这是后续正文";
+        assert!(parse_answer_envelope(&trailing_body).is_none());
+
+        // 文本中间出现信封、末尾还有正文（被引用的场景）。
+        let middle = format!("前缀 {envelope}\n后续消息");
+        assert!(parse_answer_envelope(&middle).is_none());
+
+        // 代码围栏包住的引用：围栏字符算非空正文。
+        let fenced = format!("```\n{envelope}\n```");
+        assert!(parse_answer_envelope(&fenced).is_none());
+
+        // 标签必须精确（含大小写）。
+        let body = envelope
+            .strip_prefix(ENVELOPE_OPEN)
+            .and_then(|rest| rest.strip_suffix(ENVELOPE_CLOSE))
+            .map(str::trim)
+            .expect("信封由固定标签构成");
+        let wrong_case = format!(
+            "<SEND_USER_MESSAGE_QUESTION_REPLY>\n{body}\n</SEND_USER_MESSAGE_QUESTION_REPLY>"
+        );
+        assert!(parse_answer_envelope(&wrong_case).is_none());
+
+        // 答案字符数超预算 → 不认；恰好在预算内仍认（上限语义钉死）。
+        let over_chars = "x".repeat(MAX_ANSWER_CHARS + 1);
+        assert!(
+            parse_answer_envelope(&compose_async_answer("item-a", 0, "问题", &over_chars))
+                .is_none()
+        );
+        let at_chars = "x".repeat(MAX_ANSWER_CHARS);
+        assert!(
+            parse_answer_envelope(&compose_async_answer("item-a", 0, "问题", &at_chars)).is_some()
+        );
+
+        // 信封字节超预算 → 不认（逐条答案都在字符预算内，只有总量超限）。
+        let many: Vec<(String, u32, String, String)> = (0..700)
+            .map(|i| {
+                (
+                    format!("item-{i}"),
+                    0,
+                    "问题".to_string(),
+                    "答案".to_string(),
+                )
+            })
+            .collect();
+        let huge = compose_async_answers(&many);
+        assert!(huge.len() > MAX_ENVELOPE_BYTES);
+        assert!(parse_answer_envelope(&huge).is_none());
+    }
+
+    /// T01 投影：7 个来源组的正式回显（闭标签后带换行）→ 7 个键全部已答；
+    /// 混入第 8 组真实未答 → 只余它未答；键不匹配（错 index）的回显不纠偏；
+    /// 旧 hint pending 被正式答复这一强证据纠偏为 Answered。
+    #[test]
+    fn formal_answers_retire_old_pending_groups() {
+        const GROUPS: usize = 7;
+        fn borrowed(turns: &[OwnedTurnSpec]) -> Vec<TurnSpec<'_>> {
+            turns
+                .iter()
+                .map(|(turn_id, status, items, view, pagination)| {
+                    (
+                        turn_id.as_str(),
+                        status.as_str(),
+                        items.clone(),
+                        *view,
+                        pagination.clone(),
+                    )
+                })
+                .collect()
+        }
+
+        let mut turns: Vec<OwnedTurnSpec> = Vec::new();
+        for index in 0..GROUPS {
+            let item_id = format!("call-{index}");
+            turns.push((
+                format!("turn-{index}q"),
+                "completed".to_string(),
+                vec![question_item(&item_id, "选一个", &["甲", "乙"])],
+                None,
+                None,
+            ));
+            // Desktop 回显形态：正式信封 + 尾随换行。
+            let echo = compose_async_answer(&item_id, 0, "选一个", &format!("答{index}")) + "\n";
+            turns.push((
+                format!("turn-{index}a"),
+                "completed".to_string(),
+                vec![user_item(&format!("u-{index}"), &echo)],
+                None,
+                None,
+            ));
+        }
+        let state = canonical(&borrowed(&turns), true);
+        let index = question_answer_index(&state);
+        assert_eq!(index.len(), GROUPS);
+        for (question_key, answer) in &index {
+            assert!(answer.is_some(), "正式回显后 {question_key} 必须已答");
+        }
+
+        // 混入第 8 组真实未答 → 只有它未答。
+        turns.push((
+            "turn-7q".to_string(),
+            "completed".to_string(),
+            vec![question_item("call-7", "选一个", &["甲", "乙"])],
+            None,
+            None,
+        ));
+        let state = canonical(&borrowed(&turns), true);
+        let index = question_answer_index(&state);
+        assert_eq!(index.len(), GROUPS + 1);
+        let unanswered: Vec<&String> = index
+            .iter()
+            .filter(|(_, answer)| answer.is_none())
+            .map(|(key, _)| key)
+            .collect();
+        assert_eq!(unanswered, vec![&question_item_id("call-7", 0)]);
+
+        // 键不匹配（错 index）的回显：call-7 的 index 3 ≠ 0 → 不配对、保持未答。
+        let mismatched = compose_async_answer("call-7", 3, "选一个", "错位") + "\n";
+        turns.push((
+            "turn-7wrong".to_string(),
+            "completed".to_string(),
+            vec![user_item("u-7wrong", &mismatched)],
+            None,
+            None,
+        ));
+        let state = canonical(&borrowed(&turns), true);
+        let index = question_answer_index(&state);
+        assert_eq!(index.get(&question_item_id("call-7", 0)), Some(&None));
+
+        // 旧 hint pending 被强证据纠偏：已答组 Answered，真实未答组保持 Pending。
+        let hints: Vec<InteractionHint> = (0..GROUPS)
+            .map(|i| InteractionHint {
+                thread_id: "thread-1".into(),
+                source_turn_id: format!("turn-{i}q"),
+                source_item_id: format!("call-{i}"),
+                question_index: 0,
+                last_fact: "pending".into(),
+            })
+            .collect();
+        let views = AsyncQuestionProjector.project_with_hints(
+            &key(),
+            None,
+            &state,
+            &ops_allowing_async(),
+            &hints,
+        );
+        assert_eq!(
+            views.len(),
+            GROUPS + 1,
+            "hint 不产生额外占位（组内题目都可见）"
+        );
+        for view in &views {
+            if view.question_key == question_item_id("call-7", 0) {
+                assert_eq!(view.state, InteractionState::Pending);
+                assert!(view.actionable);
+            } else {
+                assert_eq!(
+                    view.state,
+                    InteractionState::Answered,
+                    "旧 hint pending 被正式答复纠偏：{}",
+                    view.question_key
+                );
+                assert!(!view.actionable);
+            }
+        }
     }
 }
 

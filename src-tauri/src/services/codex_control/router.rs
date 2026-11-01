@@ -39,7 +39,9 @@ use crate::services::codex_desktop_ipc::types::{
 
 use crate::services::codex_desktop_ipc::capability::ObservedTarget;
 
-use super::queue::{payload_hash, ActionPayload, ActionStore, QueuedAction, StoreError};
+use super::queue::{
+    payload_hash, wire_text_hash, ActionPayload, ActionStore, QueuedAction, StoreError,
+};
 use super::ActionContext;
 
 /// 写前忙的机器原因码（adapter 在 ensure 后的最新状态仍 active/unknown 时返回）。
@@ -52,6 +54,10 @@ pub const NATIVE_PENDING_REASON: &str = "native_pending";
 /// S2 理由码：Thread 队列因打断暂停——新普通消息须显式选择（恢复队列 / 一次性
 /// 越队），拒绝静默入队。
 pub const QUEUE_PAUSED_REASON: &str = "queue_paused";
+/// R04 理由码：优先处理的越队只允许「空闲且队列已暂停」的单次越队——Clear 且
+/// 队列未暂停时明确拒绝（保持原 FIFO，零授权零派发零帧），语义 = 请走普通调度
+/// 或先暂停。
+pub const QUEUE_NOT_PAUSED_REASON: &str = "queue_not_paused";
 /// S2 理由码：一次性越队授权已被消费（重复提交 / 授权只对绑定 action 有效一次）。
 pub const GRANT_CONSUMED_REASON: &str = "grant_consumed";
 /// 终审 F4 + Gate C #4 理由码：写边界守卫的撤销标记**读取失败**（DB 故障）——
@@ -307,6 +313,19 @@ impl std::fmt::Debug for RouterOutcome {
     }
 }
 
+/// T06：优先处理编排结果（[`CodexControlRouter::prioritize_queued`] 返回；HTTP 层
+/// 映射为响应判别联合 `prioritized | already_dispatched | not_sent | unknown`）。
+#[derive(Debug)]
+pub enum PrioritizeOutcome {
+    /// 派发编排已走到写出边界之后（或明确零投递已落账）——携带最终回执。
+    Completed(ActionReceipt),
+    /// 授权未消费、动作仍在队（让路/冻结/守卫拒绝；**不落账**——已入队消息不因
+    /// 一次未执行的优先处理而作废，入口保留可重试）。
+    StillQueued(&'static str),
+    /// 行已离开 queued（并发撤回/并发派发赢者）——调用方按账本实际状态回应。
+    LeftQueue,
+}
+
 /// 本 Thread 在飞的 Turn 顺序限制（R6.3 + 第三轮复审 B1）：自 start-turn 派发起
 /// 生效，绑定本动作的 Turn 身份后才可能释放。`turn_id = None`（回执缺 turnId /
 /// 派发在途 / Unknown）→ **保守永不自动释放**（缺 turnId 不能视为完成）。
@@ -494,6 +513,89 @@ impl CodexControlRouter {
         }
     }
 
+    /// R04：暂停判定的对外只读口径（与 flush/越队同源单点；读失败保守按已暂停
+    /// ——「暂停状态不可判」不得放行越队）。优先处理端点在 Clear 臂用本判定限制
+    /// 「空闲且已暂停」的单次越队。
+    #[doc(hidden)]
+    pub fn queue_paused_conservative(&self, key: &ThreadKey) -> bool {
+        self.queue_paused_or_fallback(key)
+    }
+
+    /// P5（2026-10-31 用户实机反馈）：清理陈旧停止暂停行——迁移前的停止类暂停行
+    /// `pause_turn_id` 为空，P3 的自动解除对它们 `continue`（无绑定回合 → 证据无从
+    /// 核对），于是**永不解除**；叠加历史 queued 行后线程被永久判为「已暂停且有更早
+    /// 排队」，连空闲线程的新消息也一律进队列（「明明没在运行却全排队」）。
+    ///
+    /// 清理条件（同时成立）：① 停止类暂停行（interrupt_*/cancel_pending）；
+    /// ② 未绑定回合；③ 本线程无在飞回合。
+    ///
+    /// 方向说明：无绑定的停止行是**迁移前的历史形态**，携带不了任何可核对证据，
+    /// 永久保留等于让一次早已结束的过去操作永久冻结该会话的普通发送。而「停止
+    /// 在途」的可核对形态一律带绑定（P3 起写入即绑定），故清理不误伤真实保护。
+    fn clear_stale_stop_pauses(&self, key: &ThreadKey) {
+        if self.is_turn_active(key) {
+            return; // 有在飞回合：真实停止可能仍在途，交给 P3 证据门
+        }
+        let rows = match self.store.stop_pause_rows(key) {
+            Ok(v) => v,
+            Err(e) => {
+                log::warn!("codex_control: 停止类暂停行读取失败（不清理）: {e}");
+                return;
+            }
+        };
+        let mut cleared = 0usize;
+        for (token, turn_id) in rows {
+            let Some(token) = token.as_deref() else {
+                continue; // 无 token 无法定向清除（P3 同纪律）
+            };
+            if turn_id.is_some() {
+                continue; // 有绑定：可能是真实停止在途，交给终态证据门
+            }
+            match self.store.clear_queue_pause_owned(key, token) {
+                Ok(true) => cleared += 1,
+                Ok(false) => {}
+                Err(e) => {
+                    log::warn!("codex_control: 陈旧停止暂停行清除失败（保留）token={token} err={e}")
+                }
+            }
+        }
+        if cleared > 0 {
+            log::info!(
+                "codex_control: 清理 {cleared} 条无回合绑定的陈旧停止暂停行（空闲线程不得永久排队）"
+            );
+        }
+    }
+
+    /// 在册屏障是否**都不会阻塞**接下来要做的事（发新消息 / 插队）。
+    ///
+    /// 逐条判定，全部满足才算「不阻塞」：
+    /// * `unknown` 行——派发尝试已收尾、无在飞写者，只是核对证据不足；
+    /// * `accepted` **且绑定 turnId**——等该回合终态自然收敛的正常在途记录
+    ///   （2026-10-31 实机：这类行是上一次插队成功后自己留下的，旧实现把它也算
+    ///   阻塞，于是「成功一次锁死下一次」）；
+    /// * `accepted` **未绑定 turnId**——保守屏障（无法证明回合身份），仍算阻塞。
+    ///
+    /// `require_idle`：发送路径要求「本线程确实没有在飞回合」才放行（新消息要真的
+    /// 写出去，不能和在跑回合抢）；插队路径不要求（它本身就会先停掉目标回合）。
+    ///
+    /// 屏障本体一律保留（该条仍标记 Unknown、不自动重发、仍需核对/人工解除）。
+    fn barriers_do_not_block(&self, key: &ThreadKey, require_idle: bool) -> bool {
+        if require_idle && self.is_turn_active(key) {
+            return false;
+        }
+        let Ok(fences) = self.store.compat_fences(key) else {
+            return false;
+        };
+        !fences.is_empty()
+            && fences
+                .iter()
+                .all(|f| match self.store.action_terminal_state(&f.action_id) {
+                    Some((ActionState::Unknown, _)) => true,
+                    Some((ActionState::Accepted, _)) => f.turn_id.is_some(),
+                    _ => false,
+                })
+    }
+
     /// S3：收尾预算注参（受控时间测试；生产恒 120 秒常量）。
     #[doc(hidden)]
     pub fn set_wrap_up_ms(&self, ms: u64) {
@@ -650,6 +752,16 @@ impl CodexControlRouter {
     /// 大于」永久堵死。禁止退回「任意 idle 即放行」（证据门仍在）。
     /// 返回是否发生了释放（调用方据此接力 flush）。
     pub fn release_turn_if_complete(&self, key: &ThreadKey, p: &ThreadProjection) -> bool {
+        // P9b（2026-10-31 实机）：内存限制每线程只存一条（后写覆盖先写），旧实现
+        // 因此只清**最后一条**的持久屏障——前面那些已受理屏障再无清理路径，在账本
+        // 里越积越多，最终把插队/接力全部锁在 `barrier_outstanding` 上。
+        //
+        // 修法：先按内存记录判断本线程是否已到「可释放」状态（stale / runtime /
+        // revision 门不变），然后遍历该线程**全部在册屏障**，逐条按同一证据门
+        // （绑定 turnId 的 Turn 实体在镜像中以终态在场）清理；证据不足的行原样保留。
+        if p.stale {
+            return false;
+        }
         let Some(t) = self
             .active_turns
             .lock()
@@ -659,38 +771,46 @@ impl CodexControlRouter {
         else {
             return false;
         };
-        if p.stale {
-            return false;
-        }
-        let Some(turn_id) = t.turn_id.as_deref() else {
-            return false;
-        };
-        // C1.1：目标 Turn 的终态证据（镜像中该 turnId 实体以终态在场）——缺失即
-        // 保守保留
-        if !self.dispatch.turn_evidence_terminal(key, turn_id) {
-            return false;
-        }
-        let Some(_rev) = p.revision else {
-            return false;
-        };
         if !matches!(p.runtime_status.as_str(), "idle" | "failed") {
             return false;
         }
-        // 清持久屏障（Accepted 终态允许；失败保守保留限制）
-        if let Err(e) = self.store.clear_compat_fence(&t.action_id) {
-            log::error!(
-                "codex_control: Turn 完成后清屏障失败 action={} err={e}",
-                t.action_id
-            );
+        if p.revision.is_none() {
             return false;
         }
-        self.clear_active(key);
-        log::info!(
-            "codex_control: Turn 终态证据齐备，释放顺序限制 action={} turn={:?}",
-            t.action_id,
-            t.turn_id
-        );
-        true
+        // 内存里那条必须确有终态证据（保持既有语义：不因泛 idle 放行）
+        let memory_releasable = t
+            .turn_id
+            .as_deref()
+            .is_some_and(|turn_id| self.dispatch.turn_evidence_terminal(key, turn_id));
+        // 逐条清理：只清「有绑定 turnId 且该 Turn 终态在场」的屏障
+        let mut released = 0usize;
+        if let Ok(fences) = self.store.compat_fences(key) {
+            for f in fences {
+                let Some(turn_id) = f.turn_id.as_deref() else {
+                    continue; // 无身份保守保留
+                };
+                if !self.dispatch.turn_evidence_terminal(key, turn_id) {
+                    continue; // 该回合未终态：保留
+                }
+                match self.store.clear_compat_fence(&f.action_id) {
+                    Ok(()) => released += 1,
+                    Err(e) => log::error!(
+                        "codex_control: Turn 完成后清屏障失败 action={} err={e}",
+                        f.action_id
+                    ),
+                }
+            }
+        }
+        if released > 0 || memory_releasable {
+            self.clear_active(key);
+            log::info!(
+                "codex_control: Turn 终态证据齐备，释放顺序限制 action={} turn={:?}（本轮清理 {released} 条持久屏障）",
+                t.action_id,
+                t.turn_id
+            );
+            return true;
+        }
+        false
     }
 
     /// 普通消息。`queue_only` 持久排队不派发；`bypass_paused_queue` = 用户显式选择
@@ -778,34 +898,35 @@ impl CodexControlRouter {
         if !self.store.device_valid(&ctx.device_id) {
             return self.finish_not_sent(&ctx.action_id, "device_revoked").await;
         }
-        // S2 入队门 ②：Thread 暂停（打断后旧队列持久暂停）。旧队列仍有内容时新
-        // 普通消息必须显式选择——「先恢复队列」（走 /codex/queue/resume 后重发）或
-        // 「保留旧队列暂停，本条先发送」（bypass 授权，见下方越队路径）；无选择的
-        // 提交拒绝入队（保留草稿）。旧队列已空（无内容可越）→ 正常入队派发。
+        // S2 入队门 ②：Thread 暂停（打断后旧队列持久暂停）。旧队列仍有内容时：
+        // * 带越队授权（composer 已无此入口，保留给 async 题卡「仅本题先发」）→
+        //   走下方越队路径；
+        // * 其余合法普通消息 → **入队但不派发**（C05：停在暂停门之后，零帧、旧
+        //   暂停原样保留，用户在统一队列区对它「先处理这条」/撤回/恢复）。暂停是
+        //   派发保护闩，不是入队否决——把消息终态拒绝会让「先入队再优先处理」这条
+        //   已确认的产品链路无从下手（2026-10-30 复审 Q01）。
         // queue_only 与 bypass 互斥：只入队请求不携带先发送语义。
         // 终审 F3：暂停判定单点（持久行 ∨ 写失败兜底闸；读失败按已暂停保守）——
-        // 「暂停状态不可判」时放行会让打断竞态窗口重开；Err 保守面 = 拒绝入队
-        // （queue_paused 理由码如实提示），恢复出口 = 显式 resume / 修复 DB。
-        let paused = self.queue_paused_or_fallback(&ctx.key);
-        if paused {
-            let older = matches!(self.store.next_queued(&ctx.key), Ok(Some(h)) if h.ctx.action_id != ctx.action_id);
-            if older {
-                if !queue_only && bypass_paused_queue {
-                    return self.send_bypassing_paused_queue(&ctx, &view, front).await;
-                }
-                return self
-                    .finish_not_sent(&ctx.action_id, QUEUE_PAUSED_REASON)
-                    .await;
-            }
+        // 「暂停状态不可判」时放行会让打断竞态窗口重开；Err 保守面 = 不派发。
+        // P5（2026-10-31）：判定前先清「无回合绑定的陈旧停止暂停行」——这类行是
+        // 迁移前形态、携带不了任何在途证据，永久保留会让空闲线程的**每条**新消息
+        // 都进队列（用户实机「明明没在运行却全排队」）。真实停止保护一律带绑定。
+        self.clear_stale_stop_pauses(&ctx.key);
+        let paused_with_older = self.queue_paused_or_fallback(&ctx.key)
+            && matches!(self.store.next_queued(&ctx.key), Ok(Some(h)) if h.ctx.action_id != ctx.action_id);
+        if paused_with_older && !queue_only && bypass_paused_queue {
+            return self.send_bypassing_paused_queue(&ctx, &view, front).await;
         }
         // S2 入队门 ③：未处理原生请求（含不支持的审批/问答）——「待审批时新普通
         // 消息保留草稿，不自动入队」（设计 §1.3 审批行）。
         // * queue_only（显式只入队）：用**同步**快照判定——不触发 ensure/连接（离线
         //   排队是既有恢复语义，不能为判 pending 而强行建连）；无镜像 = 状态不可
         //   确认 → 放行入队（写出前的第二道门冻结，pending 硬保证不被穿透）。
+        // * 暂停期入队（C05）：同上——本条不会派发，没有可省下的等待；用新鲜判定
+        //   反而会让一次「本该静静排队」的提交撞上前台预算归零（假失败）。
         // * 正常发送：**新鲜判定**（ensure 等到 snapshot）；StateUnknown 不拒（离线
         //   排队同上）。Busy 不拒（既有忙态 FIFO：留队接力）。
-        let pending_gate = if queue_only {
+        let pending_gate = if queue_only || paused_with_older {
             self.dispatch.send_gate(&ctx.key)
         } else {
             // S3：校验/连接等待共用同一前台预算（子步骤不重置）；写前到期 = 明确
@@ -830,7 +951,9 @@ impl CodexControlRouter {
                 .finish_not_sent(&ctx.action_id, NATIVE_PENDING_REASON)
                 .await;
         }
-        if queue_only {
+        if queue_only || paused_with_older {
+            // 「只入队」与「暂停期入队」同一去向：持久在账、零派发，派发权仍归
+            // 用户（恢复队列按 FIFO 接力 / 队列区对单条「先处理这条」）。
             return queued_outcome(&ctx.action_id, &view);
         }
         // PR #165 复审 Important：新 send 撞上**在飞派发**（guard 由 A 路派发持至
@@ -843,8 +966,14 @@ impl CodexControlRouter {
             Ok(g) => g,
             Err(_) => return queued_outcome(&ctx.action_id, &view),
         };
-        // 兼容 fence 在册（R6.3 Turn 顺序绑定持久槽 / 旧版本遗留兜底 fence）→ 只排队
-        if self.store.has_compat_fence(&ctx.key).unwrap_or(true) {
+        // 兼容 fence 在册（R6.3 Turn 顺序绑定持久槽 / 旧版本遗留兜底 fence）→ 只排队。
+        // P5（2026-10-31）：**未绑定回合的 Unknown 残留**除外——它携带不了任何可核对
+        // 证据，却会把空闲线程的每条新消息扣在队列（用户实机「所有普通消息都排队」）。
+        // 放行的只是「新消息继续正常发送」，屏障本体保留待核对/人工解除；绑定回合的
+        // 屏障、accepted 屏障、有在飞回合时一律维持既有冻结。
+        if self.store.has_compat_fence(&ctx.key).unwrap_or(true)
+            && !self.barriers_do_not_block(&ctx.key, true)
+        {
             return queued_outcome(&ctx.action_id, &view);
         }
         // R6.3：在飞 Turn 顺序限制在册 → 只排队（释放只由完成证据驱动）
@@ -957,6 +1086,103 @@ impl CodexControlRouter {
             HeadOutcome::Refused(r) | HeadOutcome::Lost(r) => RouterOutcome::Completed(r),
             HeadOutcome::DbBlocked => not_sent_completed(&ctx.action_id, "store_error"),
             HeadOutcome::Busy => queued_outcome(&ctx.action_id, view),
+        }
+    }
+
+    /// T06：本 Thread 的派发锁句柄（端点编排侧用）——「先处理这条」需要跨
+    /// 「门判定 + 定向停止 + 终态等待 + 越队派发」持有**全程同一把锁**：并发的
+    /// 第二次优先处理在锁处让路，不重复发停止帧（同一逻辑动作的重放至多一次
+    /// interrupt）。与 send/flush 共用同一线程锁，互斥语义不变。
+    pub fn thread_dispatch_lock(&self, key: &ThreadKey) -> Arc<AsyncMutex<()>> {
+        self.lock_arc(key)
+    }
+
+    /// T06：已入队消息的显式优先处理——把**既有 queued 行**经一次性越队授权直接
+    /// 派发（原 wire 文本、原 client_message_id、原 actionId 全部保留；不重排 FIFO、
+    /// 不解除任何暂停行、无正文副本——「把正文再 POST 一次」是另一条新消息，与本
+    /// 路径无关）。
+    ///
+    /// 与 [`Self::send_bypassing_paused_queue`] 的差别：后者服务于「新提交的 send」
+    /// （register 之后进越队），本方法服务于「已在队列里的行」——无 register，幂等
+    /// 重放由账本状态承载（已离开 queued 的行由调用方按实际状态回应，不复活）。
+    /// 守卫链与越队纪律完全同源：授权**尝试铸造**（R06：幂等 CAS——无行建
+    /// attempt 1；未消费行不动；已消费行 = 明确零投递回队后的下一次用户授权，
+    /// 重铸下一 attempt）→ pending 新鲜守卫（拒绝时不消费授权）→ 屏障复核 →
+    /// dispatch_head（reserve → 设备复核 → 授权 CAS 消费写出前恰好一次 → compose
+    /// 恰好一次 → A 路独立任务自结算）。
+    ///
+    /// `_thread_lock` = 调用方已持有的本线程派发锁（[`Self::thread_dispatch_lock`]
+    /// 的 try_lock 产物；tokio Mutex 不可重入，本方法不再加锁——参数即持锁证明）。
+    pub async fn prioritize_queued(
+        &self,
+        action_id: &str,
+        key: &ThreadKey,
+        front: Deadline,
+        _thread_lock: tokio::sync::OwnedMutexGuard<()>,
+    ) -> PrioritizeOutcome {
+        let Some(head) = self.store.queued_action_by_id(action_id).ok().flatten() else {
+            // 并发撤回/并发派发赢者已处理：行不在 queued（调用方读账本实际状态）
+            return PrioritizeOutcome::LeftQueue;
+        };
+        // R01 接缝防御（不信任调用方）：行归属线程必须与请求线程一致——不一致
+        // 零 mutation（不建授权、不派发、不停任何回合），动作原样留队。
+        if head.ctx.key != *key {
+            return PrioritizeOutcome::StillQueued("thread_mismatch");
+        }
+        // 插队不要求「队列已暂停」（2026-10-31 用户裁决：「插队的行为就是停止进程
+        // 之后，直接把这个消息打出去」）。
+        //
+        // 旧规则（R04：空闲且已暂停才允许越队）与后来的「陈旧暂停自动清理」构成死结
+        // ——暂停被清 → 队列未暂停 → 插队恒被 `queue_not_paused` 拒绝，而同一时刻
+        // 屏障又挡住自动接力，于是插队永久不可用、队列也发不出去（实机现场）。
+        //
+        // 插队是用户对**具体一条**的显式意图，不依赖队列是否处于暂停态。FIFO 与安全
+        // 仍有别的守卫兜底，一律不动：授权 CAS 保证恰好一次写出、在飞派发由线程锁挡、
+        // 未解屏障由下方 `barrier_outstanding` 判定、原生 pending 由端点前置臂挡、
+        // 停止未知由 `stop_attempt_state` 状态机挡。
+        // R06：授权用「尝试铸造」（幂等 CAS）而非越队发送路径的 create——无行 =
+        // attempt 1；未消费行 = 同一次授权重放不动；已消费行 = 明确零投递回队后
+        // 的下一次用户授权，重铸为下一 attempt（代际 +1、清消费位）。调用前提是
+        // 行仍 queued（上方法第一步已核对），真实写出的行到不了这里——旧 attempt
+        // 不可能复活。越队发送路径（send_bypassing_paused_queue）语义不变：
+        // 消费后不重铸，重试须换新 actionId（Gate A 终审议题保留）。
+        if let Err(e) = self.store.mint_bypass_grant(action_id, key) {
+            log::error!("codex_control: 优先处理授权写入失败（零投递）action={action_id} err={e}");
+            return PrioritizeOutcome::StillQueued("store_error");
+        }
+        // pending 守卫：授权不穿透（与越队路径同源；拒绝时不消费授权，零落账——
+        // 已入队消息不因一次未执行的优先处理而作废）。
+        let gate_fut = self.dispatch.send_gate_fresh(key);
+        let gate_state = match front.within(gate_fut).await {
+            Ok(g) => g,
+            Err(_) => return PrioritizeOutcome::StillQueued(FRONT_BUDGET_ELAPSED_REASON),
+        };
+        if matches!(gate_state, SendGate::NativePending) {
+            return PrioritizeOutcome::StillQueued(NATIVE_PENDING_REASON);
+        }
+        // 屏障复核（未知结果屏障不因授权消失；冻结留队、授权保留）。
+        // P2 残留例外（2026-10-30 用户裁决批次）：在册屏障**全部**属于已终态
+        // unknown 行（派发尝试已收尾、无在飞写者，只是核对证据不足清不掉）时，
+        // 显式用户插队（对具体行的知情动作 = 明确告知风险的接受）仍可尝试——
+        // 「未知 ≠ 已知失败」，证据不足的保守屏障不得永久堵死插队。自动接力
+        //（flush / 新 send 派发）仍被屏障冻结；屏障本身保留到核对通过或人工解除。
+        if (self.store.has_compat_fence(key).unwrap_or(true) || self.is_turn_active(key))
+            && !self.barriers_do_not_block(key, false)
+        {
+            return PrioritizeOutcome::StillQueued("barrier_outstanding");
+        }
+        match self.dispatch_head(&head, true, front).await {
+            HeadOutcome::Terminal(RouterOutcome::Completed(receipt)) => {
+                PrioritizeOutcome::Completed(receipt)
+            }
+            HeadOutcome::Terminal(RouterOutcome::Queued { .. }) => {
+                PrioritizeOutcome::StillQueued("queued")
+            }
+            HeadOutcome::Refused(receipt) | HeadOutcome::Lost(receipt) => {
+                PrioritizeOutcome::Completed(receipt)
+            }
+            HeadOutcome::DbBlocked => PrioritizeOutcome::StillQueued("store_error"),
+            HeadOutcome::Busy => PrioritizeOutcome::StillQueued(BUSY_BEFORE_WRITE_REASON),
         }
     }
 
@@ -1198,8 +1424,17 @@ impl CodexControlRouter {
                 .is_ok();
             // R04：受理/未知 → 绑定（或保守保留）本线程回合限制，等对应 turn 终态
             // 证据释放；明确零投递/被拒 → 仅清本动作登记（不误清别人的回合）。
+            // P6（2026-10-31 用户实机）：**Unknown 且无 turnId 不绑定内存限制**——
+            // `release_turn_if_complete` 只在有 turnId 时才可能取得终态证据（无
+            // turnId 直接返回 false），绑了就是**永不可释放**的线程级冻结：此后该
+            // 线程的每条新普通消息都被 `is_turn_active` 留在队列（实机「空闲也全
+            // 排队」）。持久屏障仍然保留（不自动重发、待核对/人工解除），只是不再
+            // 冒充「进行中的回合」。Accepted 缺 turnId 保持原样（有 converge 补绑）。
             match receipt.delivery {
-                Delivery::Accepted | Delivery::UnknownDelivery => {
+                Delivery::Accepted => {
+                    book::bind(&active_turns, &key, &action_id, receipt.turn_id.as_deref())
+                }
+                Delivery::UnknownDelivery if receipt.turn_id.is_some() => {
                     book::bind(&active_turns, &key, &action_id, receipt.turn_id.as_deref())
                 }
                 _ => book::forget_if(&active_turns, &key, &action_id),
@@ -1487,6 +1722,10 @@ impl CodexControlRouter {
     pub async fn flush_thread(&self, key: &ThreadKey) -> Option<RouterOutcome> {
         // try-lock：在飞派发（guard 在外）时直接让路
         let _guard = self.lock_arc(key).try_lock_owned().ok()?;
+        // P6（2026-10-31 用户实机）：接力前同样先清「无回合绑定的陈旧停止暂停行」
+        // ——与 `send_inner` 同源。只改 send 不改 flush 会让队列**永远排不空**
+        //（新消息进不去、进去的也出不来），实机表现就是「全部排队」。
+        self.clear_stale_stop_pauses(key);
         // S2：打断后持久暂停 → 旧队列冻结（不接受 idle 假象/周期对账穿透）。
         // 终审 F3：暂停判定单点（持久行 ∨ 兜底闸；读失败保守冻结）——「暂停状态
         // 不可判」不得放行旧队列。
@@ -1497,15 +1736,22 @@ impl CodexControlRouter {
         if self.is_turn_active(key) {
             return None;
         }
-        if self.store.has_compat_fence(key).unwrap_or(true) {
-            return None;
-        }
+        // 屏障**只冻结它自己那一条**，不冻结别的消息（2026-10-31 用户裁决：
+        // 「哪怕它都发送出去了也无所谓，不能卡我其他流程」）。
+        //
+        // 语义：屏障标记的是「这条动作的投递结果不明，别自动重发它」——
+        // 它保护的始终是**那一行**。旧实现在这里无条件整队不接力，把一条历史
+        // unknown 的疑点放大成「整个会话队列永久停摆」（实机表现：空闲也不发）。
+        //
+        // 下面的队首循环里，队首若本身带屏障则跳过（保留双投保护）；其余消息照常
+        // 接力。真实安全另有 `send_gate`（实时读桌面忙/待审批）与 `is_turn_active`
+        // （有界、靠终态证据释放）两道门，一处不减。
         // S2：同步守卫（忙 / 未处理原生请求 / 状态不可确认）→ 冻结，零普通投递
         if self.dispatch.send_gate(key).blocks() {
             return None;
         }
         loop {
-            let head = match self.store.next_queued(key) {
+            let head = match self.store.next_queued_skip_barriered(key) {
                 Ok(Some(h)) => h,
                 Ok(None) => return None,
                 Err(e) => {
@@ -1513,7 +1759,10 @@ impl CodexControlRouter {
                     return None;
                 }
             };
-            match self.dispatch_head(&head, false, Deadline::none()).await {
+            match self
+                .dispatch_head_mode(&head, false, Deadline::none(), true)
+                .await
+            {
                 HeadOutcome::Terminal(o) => return Some(o),
                 // 明确拒发（零投递）解锁队列：继续看下一条（拒绝动作已落账 rejected）
                 HeadOutcome::Refused(_) => continue,
@@ -1545,6 +1794,17 @@ impl CodexControlRouter {
         grant_consume: bool,
         front: Deadline,
     ) -> HeadOutcome {
+        self.dispatch_head_mode(head, grant_consume, front, false)
+            .await
+    }
+
+    async fn dispatch_head_mode(
+        &self,
+        head: &QueuedAction,
+        grant_consume: bool,
+        front: Deadline,
+        batch: bool,
+    ) -> HeadOutcome {
         // S2 写出前门（设计 §4.2「真正写出前都须核验……无待处理原生请求」）：以
         // ensure 后的新鲜状态分类（不是旧快照）。Busy / NativePending / StateUnknown
         // 一律冻结（reserve 尚未发生，账本零残留）——pending 不被 idle 假象穿透，
@@ -1563,25 +1823,30 @@ impl CodexControlRouter {
         if gate_state.blocks() {
             return HeadOutcome::Busy;
         }
-        // reserve CAS（与审计起始行同事务；DB 失败零投递）
-        match self
-            .store
-            .reserve(&head.ctx.action_id, ControlRoute::DesktopIpc)
-        {
+        let mut batch_wire = None;
+        let reserved = if batch {
+            self.store
+                .reserve_send_batch(&head.ctx.action_id)
+                .map(|wire| {
+                    let ok = wire.is_some();
+                    batch_wire = wire;
+                    ok
+                })
+        } else {
+            self.store
+                .reserve(&head.ctx.action_id, ControlRoute::DesktopIpc)
+        };
+        match reserved {
             Ok(true) => {}
             Ok(false) => {
-                // CAS 失败 = 竞态撤回赢者已把动作置 cancelled：不重发
                 return HeadOutcome::Lost(not_sent_receipt(
                     &head.ctx.action_id,
                     ControlRoute::None,
                     "action_cancelled",
-                ));
+                ))
             }
             Err(e) => {
-                log::error!(
-                    "codex_control: reserve 失败（零投递）action={} err={e}",
-                    head.ctx.action_id
-                );
+                log::error!("codex_control: reserve 失败（零投递）err={e}");
                 return HeadOutcome::DbBlocked;
             }
         }
@@ -1613,10 +1878,10 @@ impl CodexControlRouter {
         // 最终 wire 文本：新行在登记时已冻结（`raw_text` 即 wire）；旧行按升级前
         // 语义（恒带签名）在此组装一次。两条路径都把同一份 wire 交给 A 路与
         // `wire_text_hash`，不在多个异步阶段各自重读设置或二次拼接。
-        let wire = match head.signature_applied {
+        let wire = batch_wire.unwrap_or_else(|| match head.signature_applied {
             Some(_) => head.raw_text.clone(),
             None => compose_injection_flagged(&head.ctx.device_name, &head.raw_text, true),
-        };
+        });
         // R6.3：顺序限制自派发起生效（turn 身份回执后补绑；此间 flush 不放行）
         book::mark(&self.active_turns, &head.ctx.key, &head.ctx.action_id);
         // S3：后台主动收尾预算——自**实际派发编排开始**起算（排队驻留不占）。
@@ -1858,6 +2123,9 @@ fn settle_dispatch_outcome_inner(
         // Accepted 补绑内存 Turn 限制（缺 turnId 保守不释放；持久屏障已随落账写入）；
         // Unknown = 结果未知——2026-10-17 复审 C1.2：**不是完成**，保守屏障持久
         //（重启仍受限），内存限制保留；不因对账/超时自动解除。
+        // P2（2026-10-30）：Unknown 屏障随落账补录**核对证据**（wire 文本 hash；
+        // rollout 证据在其可得的路径才补，此处不可得不伪造）——settle 路径的
+        // native 只读核对消费该字段（核对通过才清屏障；证据不足保持屏障不变）。
         Delivery::Accepted | Delivery::UnknownDelivery => {
             let persisted = store
                 .finish_with_turn_barrier(receipt, receipt.turn_id.as_deref())
@@ -1869,6 +2137,13 @@ fn settle_dispatch_outcome_inner(
                         &head.ctx.key,
                         &head.ctx.action_id,
                         receipt.turn_id.as_deref(),
+                    );
+                } else if let Err(e) =
+                    store.set_native_wire_evidence(&head.ctx.action_id, &wire_text_hash(wire))
+                {
+                    log::warn!(
+                        "codex_control: Unknown 屏障核对证据补录失败（屏障保留）action={} err={e}",
+                        head.ctx.action_id
                     );
                 }
                 SettleOutcome::Persisted

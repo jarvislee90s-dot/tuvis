@@ -482,6 +482,54 @@ impl ThreadMirror {
             )
     }
 
+    /// P1 弱证据：指定 Turn 内正文 hash 等于给定值的 userMessage 条数（0/1/多）。
+    /// 只看该 Turn 内的正式 userMessage 实体（`content` 文本块拼接，与投影同一
+    /// 判据）；无镜像 → 0。哈希在镜像侧现算（sha256，与调用方 `wire_text_hash`
+    /// 同为纯文本 sha256 hex）。
+    pub fn count_user_messages_with_text_hash(&self, turn_id: &str, text_hash: &str) -> usize {
+        let Some(state) = self.state.as_ref() else {
+            return 0;
+        };
+        HistoryView::new(state)
+            .turns()
+            .iter()
+            .filter(|t| t.turn_id == turn_id)
+            .flat_map(|t| t.items.iter())
+            .filter(|item| {
+                item.get("type").and_then(Value::as_str) == Some("userMessage")
+                    && user_message_text(item)
+                        .map(|text| sha256_hex_of(&text) == text_hash)
+                        .unwrap_or(false)
+            })
+            .count()
+    }
+
+    /// P2 native 屏障核对：**全镜像**中正文 hash 匹配的 userMessage 恰好一条时，
+    /// 返回其所在 Turn id；0 条或多义（≥2 条，任何 Turn）→ None（不猜）。
+    /// stale / 无镜像 → None。调用方再核该 Turn 终态（完成证据不在这里下结论）。
+    pub fn unique_turn_of_user_message_text_hash(&self, text_hash: &str) -> Option<String> {
+        if self.stale {
+            return None;
+        }
+        let state = self.state.as_ref()?;
+        let mut matched: Option<String> = None;
+        for t in HistoryView::new(state).turns() {
+            for item in t.items.iter() {
+                let is_match = item.get("type").and_then(Value::as_str) == Some("userMessage")
+                    && user_message_text(item)
+                        .map(|text| sha256_hex_of(&text) == text_hash)
+                        .unwrap_or(false);
+                if is_match {
+                    if matched.is_some() {
+                        return None; // 多义：无法确定对应哪次投递
+                    }
+                    matched = Some(t.turn_id.to_string());
+                }
+            }
+        }
+        matched
+    }
+
     /// 标记过期（连接断开/缺口/预算超限）。保留最后视图但禁写（adapter 侧门）。
     pub fn mark_stale(&mut self) {
         self.stale = true;
@@ -786,6 +834,10 @@ impl ThreadMirror {
             // 经发布点 CAS 预留（复审 round 5 W1；见 adapter 的
             // seal_snapshot_seq / reserve_publish_seq）。
             local_seq: 0,
+            // T02：版本束由远程层**发射点**盖章（镜像层不知道 hub 世系身份）。
+            projection_version: None,
+            // T03：与投影**同次观察**的活动回合 id（stale/无活动回合 → None）。
+            active_turn_id: self.active_turn_id(),
         }
     }
 
@@ -1726,6 +1778,15 @@ fn user_message_text(item: &Value) -> Option<String> {
     (!text.is_empty()).then_some(text)
 }
 
+/// 纯文本 sha256 hex（P1/P2 正文弱证据比对；与 codex_control::queue 的
+/// `wire_text_hash` 同为纯文本 sha256——镜像侧自算，避免反向依赖控制层）。
+fn sha256_hex_of(text: &str) -> String {
+    Sha256::digest(text.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
 /// error item 的系统摘要：`message` 为桌面侧给用户看的错误文案（截断到 240 字符，
 /// 不透传 errorInfo/additionalDetails 等内部结构）；缺 message → 固定占位。
 fn error_item_summary(item: &Value) -> String {
@@ -2331,6 +2392,61 @@ mod tests {
         let err = m.apply(&lease(), &change).unwrap_err();
         assert!(matches!(err, ProtocolError::Capacity(_)));
         assert!(m.is_stale());
+    }
+
+    /// T03：投影携带**同次观察**的活动回合 id（`activeTurnId`，停止按钮的目标，
+    /// 不替代后端 writer 校验）：无状态 → None；有 `inProgress` Turn → canonical
+    /// 序最新者；回合终态（无活动）→ None；stale → None（不猜）。
+    #[test]
+    fn t03_projection_carries_active_turn_id_from_same_observation() {
+        let mut m = ThreadMirror::new(key());
+        // 无镜像观察 → None。
+        assert_eq!(m.project(caps()).active_turn_id, None);
+
+        let change = serde_json::json!({
+            "type": "snapshot", "revision": 1,
+            "conversationState": {
+                "turns": [], "requests": [],
+                "threadRuntimeStatus": { "type": "active" },
+                "turnHistory": { "kind": "canonical",
+                    "history": { "isComplete": true,
+                    "entitiesByKey": {
+                        "turn:mine": { "turnId": "turn-mine",
+                                       "status": "inProgress", "items": [] },
+                        "turn:older": { "turnId": "turn-older",
+                                        "status": "completed", "items": [] }
+                    },
+                    "islands": [{ "entries": [
+                        { "key": "turn:mine", "value": "turn:mine" },
+                        { "key": "turn:older", "value": "turn:older" }
+                    ] }]
+                } }
+            }
+        });
+        m.apply(&lease(), &change).unwrap();
+        let p = m.project(caps());
+        assert_eq!(p.runtime_status, "active");
+        assert_eq!(
+            p.active_turn_id.as_deref(),
+            Some("turn-mine"),
+            "投影与活动回合 id 同次观察（无错位窗口）"
+        );
+
+        // 回合结束（无 inProgress）→ None：空闲没有可停目标。
+        let done = serde_json::json!({
+            "type": "patches", "baseRevision": 1, "revision": 2,
+            "patches": [
+                { "op": "replace",
+                  "path": ["turnHistory", "history", "entitiesByKey", "turn:mine", "status"],
+                  "value": "completed" }
+            ]
+        });
+        m.apply(&lease(), &done).unwrap();
+        assert_eq!(m.project(caps()).active_turn_id, None);
+
+        // stale → None：断链/换代后不给可能过期的目标。
+        m.mark_stale();
+        assert_eq!(m.project(caps()).active_turn_id, None);
     }
 
     #[test]

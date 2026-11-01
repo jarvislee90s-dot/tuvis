@@ -56,6 +56,9 @@ pub struct LateResult {
     /// 正式 userMessage 延后（P1 实测 +0.5s 常态时序）时，当前镜像已含新 Turn，
     /// 比对当前集合会把有效回执误判成旧 Turn 回显。
     pub pre_dispatch_turns: std::collections::HashSet<String>,
+    /// P1（2026-10-30）：本次写出的已组装文本（随槽位冻结）——迟到回执身份校验
+    /// 的 clientId 缺席时，正文 hash 弱证据的比对源。start-turn 才有，其余 None。
+    pub wire_text: Option<String>,
 }
 
 #[derive(Debug)]
@@ -65,6 +68,7 @@ struct LateSlot {
     method: String,
     action_id: Option<String>,
     pre_dispatch_turns: std::collections::HashSet<String>,
+    wire_text: Option<String>,
     created: tokio::time::Instant,
     outcome: Option<LateOutcome>,
 }
@@ -114,6 +118,7 @@ impl LateSlotRegistry {
         method: &str,
         action_id: Option<&str>,
         pre_dispatch_turns: std::collections::HashSet<String>,
+        wire_text: Option<String>,
     ) -> bool {
         let mut slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
         self.sweep(&mut slots);
@@ -128,6 +133,7 @@ impl LateSlotRegistry {
                 method: method.to_string(),
                 action_id: action_id.map(str::to_string),
                 pre_dispatch_turns,
+                wire_text,
                 created: tokio::time::Instant::now(),
                 outcome: None,
             },
@@ -178,6 +184,7 @@ impl LateSlotRegistry {
                 action_id: s.action_id,
                 outcome,
                 pre_dispatch_turns: s.pre_dispatch_turns,
+                wire_text: s.wire_text.clone(),
             });
         }
         None
@@ -207,6 +214,7 @@ impl LateSlotRegistry {
                         action_id: s.action_id,
                         outcome,
                         pre_dispatch_turns: s.pre_dispatch_turns,
+                        wire_text: s.wire_text.clone(),
                     });
                 }
             }
@@ -236,6 +244,7 @@ impl LateSlotRegistry {
                         action_id: s.action_id,
                         outcome,
                         pre_dispatch_turns: s.pre_dispatch_turns,
+                        wire_text: s.wire_text.clone(),
                     });
                 }
             }
@@ -280,21 +289,61 @@ mod tests {
     #[test]
     fn capacity_refuses_then_release_allows() {
         let r = LateSlotRegistry::new(2, Duration::from_secs(60));
-        assert!(r.try_reserve("e1", 1, Some("owner"), "m", Some("a1"), Default::default()));
-        assert!(r.try_reserve("e2", 1, Some("owner"), "m", Some("a2"), Default::default()));
+        assert!(r.try_reserve(
+            "e1",
+            1,
+            Some("owner"),
+            "m",
+            Some("a1"),
+            Default::default(),
+            None
+        ));
+        assert!(r.try_reserve(
+            "e2",
+            1,
+            Some("owner"),
+            "m",
+            Some("a2"),
+            Default::default(),
+            None
+        ));
         assert!(
-            !r.try_reserve("e3", 1, Some("owner"), "m", Some("a3"), Default::default()),
+            !r.try_reserve(
+                "e3",
+                1,
+                Some("owner"),
+                "m",
+                Some("a3"),
+                Default::default(),
+                None
+            ),
             "容量满必须写前拒绝"
         );
         assert!(r.release("e1"), "未成熟槽位可释放");
-        assert!(r.try_reserve("e3", 1, Some("owner"), "m", Some("a3"), Default::default()));
+        assert!(r.try_reserve(
+            "e3",
+            1,
+            Some("owner"),
+            "m",
+            Some("a3"),
+            Default::default(),
+            None
+        ));
     }
 
     /// 同一证据只收敛一次：fill 第二次失败；take 取走即删。
     #[test]
     fn fill_once_and_take_consumes() {
         let r = LateSlotRegistry::new(4, Duration::from_secs(60));
-        assert!(r.try_reserve("e1", 3, Some("owner"), "m", Some("a1"), Default::default()));
+        assert!(r.try_reserve(
+            "e1",
+            3,
+            Some("owner"),
+            "m",
+            Some("a1"),
+            Default::default(),
+            None
+        ));
         assert!(r.fill("e1", outcome(Delivery::Accepted)));
         assert!(
             !r.fill("e1", outcome(Delivery::Rejected)),
@@ -313,7 +362,7 @@ mod tests {
     #[test]
     fn take_result_keeps_unmatured_slot() {
         let r = LateSlotRegistry::new(4, Duration::from_secs(60));
-        assert!(r.try_reserve("e1", 1, None, "m", Some("a1"), Default::default()));
+        assert!(r.try_reserve("e1", 1, None, "m", Some("a1"), Default::default(), None));
         assert!(r.take_result("e1").is_none(), "无结论 = None");
         assert_eq!(r.len(), 1, "槽位必须保留");
         assert!(r.fill("e1", outcome(Delivery::Accepted)));
@@ -331,8 +380,8 @@ mod tests {
     #[tokio::test]
     async fn release_keeps_filled_and_ttl_sweeps_only_pending() {
         let r = LateSlotRegistry::new(4, Duration::from_millis(30));
-        assert!(r.try_reserve("kept", 1, None, "m", Some("a"), Default::default()));
-        assert!(r.try_reserve("gone", 1, None, "m", Some("b"), Default::default()));
+        assert!(r.try_reserve("kept", 1, None, "m", Some("a"), Default::default(), None));
+        assert!(r.try_reserve("gone", 1, None, "m", Some("b"), Default::default(), None));
         assert!(r.fill("kept", outcome(Delivery::Accepted)));
         assert!(!r.release("kept"), "已成熟槽位不随 release 丢失");
         tokio::time::sleep(Duration::from_millis(40)).await;
@@ -345,9 +394,9 @@ mod tests {
     #[test]
     fn take_ready_for_targets_single_action_and_keeps_others() {
         let r = LateSlotRegistry::new(8, Duration::from_secs(60));
-        assert!(r.try_reserve("a", 1, None, "m", Some("act-1"), Default::default()));
-        assert!(r.try_reserve("b", 1, None, "m", Some("act-2"), Default::default()));
-        assert!(r.try_reserve("c", 1, None, "m", Some("act-1"), Default::default()));
+        assert!(r.try_reserve("a", 1, None, "m", Some("act-1"), Default::default(), None));
+        assert!(r.try_reserve("b", 1, None, "m", Some("act-2"), Default::default(), None));
+        assert!(r.try_reserve("c", 1, None, "m", Some("act-1"), Default::default(), None));
         assert!(r.fill("a", outcome(Delivery::Accepted)));
         assert!(r.fill("b", outcome(Delivery::Accepted)));
         // c 未成熟
@@ -363,8 +412,8 @@ mod tests {
     #[test]
     fn take_ready_only_matured() {
         let r = LateSlotRegistry::new(4, Duration::from_secs(60));
-        assert!(r.try_reserve("a", 1, None, "m", Some("a1"), Default::default()));
-        assert!(r.try_reserve("b", 1, None, "m", Some("a2"), Default::default()));
+        assert!(r.try_reserve("a", 1, None, "m", Some("a1"), Default::default(), None));
+        assert!(r.try_reserve("b", 1, None, "m", Some("a2"), Default::default(), None));
         assert!(r.fill("b", outcome(Delivery::Rejected)));
         let ready = r.take_ready();
         assert_eq!(ready.len(), 1);

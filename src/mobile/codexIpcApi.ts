@@ -175,6 +175,12 @@ export interface CodexActionView {
    *  `queued` 排队/校验等待 / `dispatching` 派发中（含前台已结束、后台收尾中的
    *  「待确认」）/ `settled` 账本终态。 */
   stage?: CodexDeliveryStage;
+  /** P4 队列行正文预览（serde skip_serializing_if 向后兼容：旧后端缺省 →
+   *  undefined，前端不渲染预览行，不猜）。内容 = 该排队消息 queued_text 原文
+   *  （**未剥签名**，服务端已按字符边界截断 ≤120 字符）；仅 state=queued 的行
+   *  有值，accepted/unknown/cancelled 行为 undefined。剥签名/单行化/截断等
+   *  展示规约在 CodexQueuePanel.queueRowPreview。 */
+  textPreview?: string;
 }
 
 /** S3 投递阶段（`CodexActionView.stage`；serde snake_case）。 */
@@ -296,12 +302,43 @@ export type CodexOperation =
 /** T02：证据来源（三档可解释来源 + 无证据）。 */
 export type CodexEvidenceSource = "none" | "shipped" | "contract_matched" | "observed_success";
 
+/** T03：版本能力支持状态（serde snake_case；稳定展示面，与 `allowed` 实时门分离）。 */
+export type CodexSupportState = "supported" | "identifying" | "unmatched" | "not_implemented";
+
+const SUPPORT_STATES = new Set<CodexSupportState>([
+  "supported",
+  "identifying",
+  "unmatched",
+  "not_implemented",
+]);
+
+/**
+ * T03：支持态展示值。服务端 `support` 缺失/脏（旧载荷）时按 `evidence` 推导——
+ * **仅用于展示**：绝不参与 allowed/资格判断（资格字段原样透传），也不产生任何
+ * 新写资格（写门本就不在前端）。
+ */
+export function supportOf(status: CodexOperationStatus): CodexSupportState {
+  if (status.support && SUPPORT_STATES.has(status.support)) return status.support;
+  if (!status.implemented) return "not_implemented";
+  return status.evidence !== "none" ? "supported" : "identifying";
+}
+
 /** T02：单操作统一状态（后端唯一事实；前端不自行拼按钮）。 */
 export interface CodexOperationStatus {
   implemented: boolean;
   allowed: boolean;
   requiresAutoAdapt: boolean;
   evidence: CodexEvidenceSource;
+  /** T03：版本能力支持状态。旧载荷缺省 → undefined（消费端经 supportOf 推导展示）。 */
+  support?: CodexSupportState;
+  /** R07（修复轮 1）：`support` 是否**沿用了上次识别结论的展示事实**（真实重连换代窗
+   *  内、实时证据尚未装回）。`true` = 应如实显示「连接恢复中」。**纯展示**：不参与
+   *  allowed/资格判定。旧载荷缺省 → undefined（按 false 处理）。 */
+  supportInherited?: boolean;
+  /** C03：`supportInherited` 为 true 时的包身份核对态——`true` = 本代际已对当前包
+   *  完成**内容 SHA 核验**且一致（展示身份可当作已确认）；缺省 = 仅 stat 快筛通过
+   *  （「待核对」，前端必须与已确认能力明确区分）。**纯展示**。 */
+  supportIdentityVerified?: boolean;
   reasonCode: string | null;
 }
 
@@ -309,6 +346,9 @@ export interface CodexOperationStatus {
 export interface CodexEffectiveOperations {
   policyRevision: number;
   operations: Partial<Record<CodexOperation, CodexOperationStatus>>;
+  /** T03：能力身份摘要（无路径；完整目标指纹+包 SHA+规则版本）。旧载荷缺省 →
+   *  undefined。仅用于区分展示目标（短断链保留上次支持展示的前提），不参与授权。 */
+  capabilityIdentity?: string;
 }
 
 /** T03：交互生命周期（serde snake_case）。 */
@@ -394,6 +434,21 @@ export interface PendingView {
  *  ready 且真实 0 条才显示「暂无消息」。 */
 export type ContentState = "loading" | "ready" | "partial" | "unsupported";
 
+/**
+ * T02：投影的**增量版本束**（与 Rust `types.rs::ProjectionVersion` 逐字段对齐；
+ * SSE snapshot/state、GET 读 DTO、轮询同源下发）。`codex-projection-order.ts`
+ * 据此把 GET／SSE／手动刷新收进同一落地守卫（迟到的旧响应不得覆盖新状态）。
+ * `instanceId` 绑定服务端 hub 世系（服务重启即换新），不是每次请求随机值。
+ * **旧后端不下发 → undefined**（按旧载荷退化规则，不获得新写资格）。
+ */
+export interface ProjectionVersion {
+  instanceId: string;
+  ownerEpoch: number;
+  ownerGeneration: number;
+  revision: number | null;
+  localSeq: number;
+}
+
 /** Thread 状态投影（SSE / REST 同一 Tuvis 投影，IPC 原始 state 不出远程 API）。 */
 export interface ThreadProjection {
   threadId: string;
@@ -422,6 +477,12 @@ export interface ThreadProjection {
   effectiveOperations?: CodexEffectiveOperations;
   /** T03：异步题视图。旧后端缺字段 → undefined（不据此清卡）。 */
   asyncQuestions?: CodexAsyncQuestionView[];
+  /** T02：增量版本束（投影落地守卫的排序事实）。旧后端缺字段/脏形状 → undefined
+   *  （退化为既有 revision 规则；缺版本不获得新写资格）。 */
+  projectionVersion?: ProjectionVersion;
+  /** T03：新鲜镜像同次观察的活动回合 id（「停止本轮」按钮的目标；**不替代后端
+   *  writer 校验**）。idle/unknown/stale/旧载荷 → undefined/null（不猜）。 */
+  activeTurnId?: string | null;
 }
 
 /** 同代只读消息页状态（与 Rust `MessagesPageStatus` 逐字对齐；非正常状态不得
@@ -457,6 +518,8 @@ export const CODEX_QUEUE_RETRACT_PATH = "/m/api/v1/codex/queue/retract";
 /** S2：打断后持久暂停的唯一解除出口。 */
 export const CODEX_QUEUE_RESUME_PATH = "/m/api/v1/codex/queue/resume";
 export const CODEX_QUEUE_FORCE_CONTINUE_PATH = "/m/api/v1/codex/queue/force-continue";
+/** T06：已入队消息的显式优先处理（越队派发既有 queued 行；不接受正文副本）。 */
+export const CODEX_QUEUE_PRIORITIZE_PATH = "/m/api/v1/codex/queue/prioritize";
 export const CODEX_TURN_INTERRUPT_PATH = "/m/api/v1/codex/turn/interrupt";
 /** F03：异步题正式答题（独立动作；不进普通消息 FIFO）。 */
 export const CODEX_ASYNC_ANSWER_PATH = "/m/api/v1/codex/async-answer";
@@ -549,7 +612,11 @@ const INTERACTION_STATES = new Set([
  *  availability 或 capabilities 推导"全部可用"。未知操作键被忽略（前向兼容）。 */
 function asEffectiveOperations(raw: unknown): CodexEffectiveOperations | undefined {
   if (raw === null || typeof raw !== "object") return undefined;
-  const value = raw as { policyRevision?: unknown; operations?: unknown };
+  const value = raw as {
+    policyRevision?: unknown;
+    operations?: unknown;
+    capabilityIdentity?: unknown;
+  };
   if (typeof value.policyRevision !== "number") return undefined;
   if (value.operations === null || typeof value.operations !== "object") return undefined;
   const operations: Partial<Record<CodexOperation, CodexOperationStatus>> = {};
@@ -562,15 +629,32 @@ function asEffectiveOperations(raw: unknown): CodexEffectiveOperations | undefin
       typeof item.evidence === "string" && EVIDENCE_SOURCES.has(item.evidence)
         ? (item.evidence as CodexEvidenceSource)
         : "none";
+    // T03：support 归一——枚举内词原样透出；缺省/脏词按 evidence 推导**展示值**
+    // （仅展示，不参与 allowed/资格，也不产生新写资格）。allowed/reasonCode 原样透传。
+    const rawSupport =
+      typeof item.support === "string" && SUPPORT_STATES.has(item.support as CodexSupportState)
+        ? (item.support as CodexSupportState)
+        : undefined;
+    const support =
+      rawSupport ??
+      (!item.implemented ? "not_implemented" : evidence !== "none" ? "supported" : "identifying");
     operations[key as CodexOperation] = {
       implemented: item.implemented,
       allowed: item.allowed,
       requiresAutoAdapt: item.requiresAutoAdapt === true,
       evidence,
+      support,
+      // R07：沿用标记归一——严格 true 才算（旧载荷/脏值 → undefined）。
+      ...(item.supportInherited === true ? { supportInherited: true } : {}),
+      // C03：已核对标记归一——严格 true 才算（旧载荷/脏值 → undefined = 待核对）。
+      ...(item.supportIdentityVerified === true ? { supportIdentityVerified: true } : {}),
       reasonCode: typeof item.reasonCode === "string" ? item.reasonCode : null,
     };
   }
-  return { policyRevision: value.policyRevision, operations };
+  // T03：能力身份摘要（无路径）——非字符串（旧载荷缺省/脏值）→ undefined。
+  const capabilityIdentity =
+    typeof value.capabilityIdentity === "string" ? value.capabilityIdentity : undefined;
+  return { policyRevision: value.policyRevision, operations, capabilityIdentity };
 }
 
 /** T03：异步题归一化。缺字段 → undefined（不据此清卡）；脏条目丢弃不猜。 */
@@ -619,6 +703,32 @@ function asInteractionAnswer(raw: unknown): CodexInteractionAnswerSummary | null
   };
 }
 
+/**
+ * T02：增量版本束归一化（附加只读字段，与 probeStatus 同纪律）。缺字段或任一
+ * 子字段缺失/错型 → **undefined**（不透传半截版本束——排序事实必须完整才有意义，
+ * 脏束若被当真会让落地守卫做出错误的先后判定）。
+ */
+function asProjectionVersion(raw: unknown): ProjectionVersion | undefined {
+  if (raw === null || typeof raw !== "object") return undefined;
+  const v = raw as Record<string, unknown>;
+  if (
+    typeof v.instanceId !== "string" ||
+    typeof v.ownerEpoch !== "number" ||
+    typeof v.ownerGeneration !== "number" ||
+    typeof v.localSeq !== "number" ||
+    (v.revision !== null && typeof v.revision !== "number")
+  ) {
+    return undefined;
+  }
+  return {
+    instanceId: v.instanceId,
+    ownerEpoch: v.ownerEpoch,
+    ownerGeneration: v.ownerGeneration,
+    revision: v.revision,
+    localSeq: v.localSeq,
+  };
+}
+
 function asThreadProjection(v: unknown): ThreadProjection {
   const p = v as ThreadProjection | null;
   if (
@@ -659,6 +769,18 @@ function asThreadProjection(v: unknown): ThreadProjection {
     ...(() => {
       const questions = asAsyncQuestions((p as { asyncQuestions?: unknown }).asyncQuestions);
       return questions === undefined ? {} : { asyncQuestions: questions };
+    })(),
+    // T02：增量版本束（附加只读字段）。缺字段/脏形状 → undefined（旧载荷，
+    // 落地守卫退化为既有 revision 规则，不获得新写资格）。恒覆盖 `...p` 里
+    // 的原键：脏束不得原样透传。
+    projectionVersion: asProjectionVersion(
+      (p as { projectionVersion?: unknown }).projectionVersion
+    ),
+    // T03：活动回合 id（附加只读字段）——字符串才透出；缺省/脏值 → undefined
+    //（无目标，不猜；「停止本轮」按钮消费，写边界校验在后端）。
+    activeTurnId: (() => {
+      const v = (p as { activeTurnId?: unknown }).activeTurnId;
+      return typeof v === "string" && v.length > 0 ? v : undefined;
     })(),
   };
 }
@@ -783,7 +905,7 @@ export const CODEX_SSE_DEGRADE_AFTER = 3;
  */
 export function subscribeCodexThread(
   sessionId: string,
-  onState: (s: ThreadProjection) => void,
+  onState: (s: ThreadProjection, event: "snapshot" | "state") => void,
   onUnavailable: () => void
 ): () => void {
   const path = `${CODEX_THREAD_EVENTS_PATH}?${new URLSearchParams({ session_id: sessionId })}`;
@@ -804,12 +926,15 @@ export function subscribeCodexThread(
   /** 解析帧并转交回调；坏帧跳过（不断流），成功帧清零失败计数。
    *  形状守卫与 GET 同一（asThreadProjection）：合法 JSON 但残缺的帧（缺
    *  contentState / messages / pending 或枚举外取值）同样按坏帧跳过——
-   *  能收字节但解析不出完整投影不足以证明链路健康（不清零失败计数）。 */
-  function dispatch(e: Event) {
+   *  能收字节但解析不出完整投影不足以证明链路健康（不清零失败计数）。
+   *  T02：第二参数带出事件名（snapshot = 当前代际最新握手，消费方据此授予
+   *  instance 切换资格）。事件名由各自的 addEventListener 闭包显式传入，
+   *  不读 Event.type（测试替身/代理层不保证保留）。 */
+  function dispatch(e: Event, event: "snapshot" | "state") {
     try {
       const parsed = asThreadProjection(JSON.parse((e as MessageEvent).data));
       failures = 0;
-      onState(parsed);
+      onState(parsed, event);
     } catch {
       /* 坏帧：忽略（能收字节但解析不了不足以证明链路健康，不清零） */
     }
@@ -826,8 +951,8 @@ export function subscribeCodexThread(
       return;
     }
     es = next;
-    next.addEventListener("snapshot", dispatch);
-    next.addEventListener("state", dispatch);
+    next.addEventListener("snapshot", (e) => dispatch(e, "snapshot"));
+    next.addEventListener("state", (e) => dispatch(e, "state"));
     next.onerror = () => {
       if (stopped || degraded) return;
       next.close(); // 关掉内建重连（自管节奏才有可数失败语义）
@@ -1162,6 +1287,57 @@ export async function resumeCodexQueue(
   return (await r.json()) as { ok: boolean; paused: boolean };
 }
 
+// ==== T06：已入队消息的显式优先处理 ====
+
+/** 优先处理响应判别联合（后端 `PrioritizeResp`：`result` 判别，字段 camelCase）。
+ *  全部携带**原 actionId**；receipt/action 为既有动作回执或账本视图。 */
+export type CodexPrioritizeResult =
+  /** 越队派发已受理（一次性授权恰好消费一次；旧队列保持暂停）。 */
+  | { result: "prioritized"; actionId: string; receipt: ActionReceipt }
+  /** 原动作已离开队列（并发派发赢者/已终态）——`action` 是账本实际状态。 */
+  | { result: "already_dispatched"; actionId: string; action: CodexActionView }
+  /** 明确零投递。`queued`=动作是否仍在队列（true=入口保留可重试）；`receipt`=
+   *  已落账的最终回执（未落账为 null）。 */
+  | {
+      result: "not_sent";
+      actionId: string;
+      reasonCode: string;
+      receipt: ActionReceipt | null;
+      queued: boolean;
+    }
+  /** 结果未知（停止不确定/前台预算到期）——未派发、不自动重试，稍后核对。 */
+  | { result: "unknown"; actionId: string; reasonCode: string };
+
+/**
+ * 已入队消息的显式优先处理（T06「先处理这条」）：对具体 queued 消息发起越队——
+ * **不接受正文副本**（后端 deny_unknown_fields 拒 text 等多余键），派发的永远是
+ * 原 queued 行（原 actionId/原 wire 文本/原 client_message_id）；旧队列保持暂停。
+ *
+ * `confirmInterrupt`：桌面回合运行中必须 true（服务端才会定向停止当前回合）；
+ * false + 运行中 → 明确零停止零越队（not_sent/interrupt_confirmation_required）。
+ * `expectedTurnId` 由调用方在**确认点击时刻**冻结（与 T05 停止纪律同源）；缺省由
+ * 服务端取在册屏障/镜像活动回合作安全阀。`frontBudgetMs` 可选（缺省 30s）。
+ */
+export async function prioritizeCodexQueueMessage(body: {
+  sessionId: string;
+  actionId: string;
+  expectedTurnId?: string;
+  confirmInterrupt: boolean;
+}): Promise<CodexPrioritizeResult> {
+  let r: Response;
+  try {
+    r = await fetch(CODEX_QUEUE_PRIORITIZE_PATH, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+  } catch (e) {
+    throw networkFail("codex/queue/prioritize", e);
+  }
+  if (!r.ok) throw await toApiError("codex/queue/prioritize", r);
+  return (await r.json()) as CodexPrioritizeResult;
+}
+
 // ==== actionId 生成 ====
 
 /**
@@ -1363,4 +1539,23 @@ export async function answerCodexAsyncGroup(
     throw new ApiError(200, "codex/async-answer-group: malformed receipt payload");
   }
   return receipt;
+}
+
+/** queued→cancelled CAS 成功才返回可编辑正文；409 不得回填。 */
+export async function editCodexQueueMessage(
+  sessionId: string,
+  actionId: string
+): Promise<{ actionId: string; text: string }> {
+  let r: Response;
+  try {
+    r = await fetch("/m/api/v1/codex/queue/edit", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ sessionId, actionId }),
+    });
+  } catch (e) {
+    throw networkFail("codex/queue/edit", e);
+  }
+  if (!r.ok) throw await toApiError("codex/queue/edit", r);
+  return (await r.json()) as { actionId: string; text: string };
 }

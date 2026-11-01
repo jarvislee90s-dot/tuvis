@@ -570,6 +570,9 @@ fn projection_with_rev(thread_id: &str, status: &str, revision: u64) -> ThreadPr
         owner_epoch: 0,
         owner_generation: 0,
         local_seq: 0,
+        // T02：版本束由远程层发射点盖章（测试夹具不伪造）。
+        projection_version: None,
+        active_turn_id: None,
     }
 }
 
@@ -723,16 +726,27 @@ async fn restart_reserved_becomes_unknown() {
         !head.client_message_id.is_empty(),
         "恢复保留账本持久化的原 client_message_id"
     );
+    // P11（2026-10-31 用户裁决：「不能卡我其他流程」）：屏障**只保护它自己那一行**
+    // ——`act-a` 是终态 unknown，本就不在队列里，永不会被重发；`act-b` 内容完全不同，
+    // 必须能正常接力。
+    // 变更说明：旧断言要求「整队冻结」，那是把单条疑点放大成整个会话停摆（实机
+    // 表现为空闲也不发）。现改为验证真正要守的不变量：**act-a 不被重发**。
+    let relayed = h.router.flush_thread(&h.key).await;
     assert!(
-        h.router.flush_thread(&h.key).await.is_none(),
-        "保守屏障闸住接力（队列视图 blockedReason 如实说明）"
+        relayed.is_some(),
+        "历史 unknown 不得冻结队列接力（它自己不在队列、不可能被重发）"
     );
-    assert_eq!(h.dispatch.send_count(), 0, "屏障在册零派发");
+    assert_eq!(
+        h.state_of("act-a"),
+        ActionState::Unknown,
+        "act-a 仍是 unknown，绝不因接力被重发或改状态"
+    );
+    let sent = h.dispatch.recorded_composed();
+    assert_eq!(sent, vec!["第二条"], "派出的是队列里那条 act-b，不是 act-a");
 
-    // 多轮对账也不解锁（C1.2：Unknown 不是完成，对账不是定时器条件）
+    // 多轮对账仍不解锁"无 turn 身份"的保守屏障本身（C1.2 不变）
     for _ in 0..3 {
         h.router.converge_with_ledger();
-        assert!(h.router.flush_thread(&h.key).await.is_none());
     }
     assert!(
         !h.router
@@ -745,7 +759,7 @@ async fn restart_reserved_becomes_unknown() {
 // 计划场景 3：忙态 FIFO + 审批不堵
 // ============================================================
 
-/// active 时连续 a/b 两条消息落 SQLite FIFO，idle 后只发 a，等它终态再发 b；
+/// active 时连续 a/b 两条消息落 SQLite FIFO，idle 后按序合为一回合；
 /// 期间审批能取得短 action 锁响应原 Turn（不等待 Turn 结束）。
 #[tokio::test]
 async fn busy_fifo_allows_pending_response() {
@@ -772,7 +786,7 @@ async fn busy_fifo_allows_pending_response() {
     assert_eq!(rappr.delivery, Delivery::Accepted);
     assert_eq!(h.dispatch.respond_count(), 1, "审批不等待 Turn/队列");
 
-    // idle 后只发 a
+    // idle 后合并 a/b
     h.dispatch.set_busy(false);
     let out_a = h.router.flush_thread(&h.key).await.expect("a dispatchable");
     assert_eq!(completed(out_a).delivery, Delivery::Accepted);
@@ -781,15 +795,15 @@ async fn busy_fifo_allows_pending_response() {
         assert_eq!(sends.len(), 1);
         assert_eq!(sends[0].action_id, "fifo-a");
     }
-    // b 仍在队列（turn a 未终态）——R6.3：顺序限制在册，flush 不再无条件接力
-    assert_eq!(h.state_of("fifo-b"), ActionState::Queued);
+    // b 与 a 同批受理；批次 Turn 未终态时不再开启回合
+    assert_eq!(h.state_of("fifo-b"), ActionState::Accepted);
     assert!(
         h.router.flush_thread(&h.key).await.is_none(),
         "Turn 顺序限制未释放前不接力"
     );
 
     // turn a 终态（fresh idle 投影事件 + 绑定 turn 终态证据）→ 释放顺序限制 → flush
-    // 接力发 b（R6.3：释放由完成证据驱动，不再靠手工 flush 清位；C1：证据 = 绑定
+    // 本批次不再重复派发（R6.3：释放由完成证据驱动；C1：证据 = 绑定
     // turnId 本身以终态在场）
     h.dispatch.set_terminal_turn("turn-1");
     assert!(
@@ -797,11 +811,10 @@ async fn busy_fifo_allows_pending_response() {
             .release_turn_if_complete(&h.key, &minimal_projection(THREAD, "idle")),
         "fresh idle 投影 + 绑定 turn 终态证据应释放顺序限制"
     );
-    let out_b = h.router.flush_thread(&h.key).await.expect("b dispatchable");
-    assert_eq!(completed(out_b).delivery, Delivery::Accepted);
+    assert!(h.router.flush_thread(&h.key).await.is_none());
     let sends = h.dispatch.sends.lock().unwrap();
-    assert_eq!(sends.len(), 2);
-    assert_eq!(sends[1].action_id, "fifo-b", "FIFO 接力按序");
+    assert_eq!(sends.len(), 1);
+    assert_eq!(sends[0].composed, "消息甲\n\n消息乙");
 }
 
 // ============================================================
@@ -2541,7 +2554,12 @@ async fn queue_pause_blocks_flush_and_survives_restart() {
     // 打断受理 → 暂停（生产由打断端点写；此处直写同一持久层）
     assert!(h
         .store
-        .set_queue_pause(&h.key, "interrupt_accepted", "test-token")
+        .set_queue_pause(
+            &h.key,
+            "interrupt_accepted",
+            "test-token",
+            Some("turn-pause")
+        )
         .expect("pause"));
     // 未暂停前可接力；暂停后冻结
     assert!(h.store.queue_pause(&h.key).expect("query").is_some());
@@ -2566,11 +2584,16 @@ async fn queue_pause_blocks_flush_and_survives_restart() {
     assert!(h.store.clear_queue_pause(&h.key).expect("resume"));
     let out = h.router.flush_thread(&h.key).await.expect("resumed relay");
     assert_eq!(completed(out).action_id, a, "恢复后按 FIFO 派发队首");
-    assert_eq!(h.state_of(&b), ActionState::Queued, "第二条仍在队");
+    assert_eq!(
+        h.state_of(&b),
+        ActionState::Accepted,
+        "明确恢复合并发送第二条"
+    );
 }
 
 /// 暂停 + 旧队列有内容：带授权的新意见**恰好派发一次**，旧队列两条原样不动；
-/// 无授权的新意见拒绝入队（queue_paused）；暂停但旧队列已空 → 正常派发无需授权。
+/// 无授权的新意见**入队但不派发**（C05：暂停是派发保护闩，不是入队否决）；
+/// 暂停但旧队列已空 → 正常派发无需授权。
 #[tokio::test]
 async fn bypass_grant_sends_new_action_once_old_queue_untouched() {
     let h = harness();
@@ -2588,11 +2611,16 @@ async fn bypass_grant_sends_new_action_once_old_queue_untouched() {
     );
     h.dispatch.set_busy(false);
     h.store
-        .set_queue_pause(&h.key, "interrupt_accepted", "test-token")
+        .set_queue_pause(
+            &h.key,
+            "interrupt_accepted",
+            "test-token",
+            Some("turn-pause"),
+        )
         .unwrap();
 
-    // 新意见（无授权）→ 拒绝入队
-    let r = completed(
+    // 新意见（无授权）→ 入队但不派发（C05）：旧暂停不被穿透，派发权归用户
+    let (id, pos) = queued(
         h.router
             .send(
                 h.ctx("new-1", ActionKind::Send),
@@ -2602,10 +2630,10 @@ async fn bypass_grant_sends_new_action_once_old_queue_untouched() {
             )
             .await,
     );
-    assert_eq!(r.delivery, Delivery::NotSent);
-    assert_eq!(r.reason_code.as_deref(), Some("queue_paused"));
-    assert_eq!(h.state_of("new-1"), ActionState::Rejected, "拒绝入队即终态");
-    assert_eq!(h.dispatch.send_count(), 0);
+    assert_eq!(id, "new-1");
+    assert!(pos >= 3, "排在旧队列之后：{pos}");
+    assert_eq!(h.state_of("new-1"), ActionState::Queued, "留在排队态");
+    assert_eq!(h.dispatch.send_count(), 0, "暂停下零派发");
 
     // 新意见（带授权）→ 越队派发恰好一次；旧两条原样 queued
     let r = completed(
@@ -2643,8 +2671,8 @@ async fn bypass_grant_sends_new_action_once_old_queue_untouched() {
     assert_eq!(r.delivery, Delivery::Accepted, "重放返回账本既有回执");
     assert_eq!(h.dispatch.send_count(), 1, "重放零新增派发");
 
-    // queue_only（只入队）在暂停 + 旧队列有内容时同样拒绝
-    let r = completed(
+    // queue_only（只入队）在暂停 + 旧队列有内容时同样入队不派发
+    let (id, _pos) = queued(
         h.router
             .send(
                 h.ctx("new-3", ActionKind::Send),
@@ -2654,7 +2682,86 @@ async fn bypass_grant_sends_new_action_once_old_queue_untouched() {
             )
             .await,
     );
-    assert_eq!(r.reason_code.as_deref(), Some("queue_paused"));
+    assert_eq!(id, "new-3");
+    assert_eq!(h.state_of("new-3"), ActionState::Queued);
+    assert_eq!(h.dispatch.send_count(), 1, "只入队不再新增派发");
+}
+
+/// C05（队列展示收纳复审 Q01）：暂停 + 旧队列在场时的**普通新消息**必须能入队
+/// ——真实 `codex_queued`、零 start-turn、旧暂停原样保留，用户随后在统一队列区
+/// 对任一条显式「先处理这条」。修复前该路径 `finish_not_sent(queue_paused)` 把新
+/// 消息终态拒绝，队列里根本没有它，前端「先处理这条」无从点起（复审 P2）。
+#[tokio::test]
+async fn paused_send_enqueues_without_dispatch_then_prioritize_sends_only_it() {
+    use multi_agents_manager_lib::services::codex_control::{Deadline, PrioritizeOutcome};
+    let h = harness();
+    // 打断前已排队的旧消息（暂停的保护对象）
+    h.dispatch.set_busy(true);
+    queued(
+        h.router
+            .send(h.ctx("old-a", ActionKind::Send), "旧一".into(), true, false)
+            .await,
+    );
+    h.dispatch.set_busy(false);
+    h.store
+        .set_queue_pause(
+            &h.key,
+            "interrupt_accepted",
+            "test-token",
+            Some("turn-pause"),
+        )
+        .unwrap();
+
+    // ① 普通发送（无越队授权）→ 留在 queued，零派发
+    let (id, pos) = queued(
+        h.router
+            .send(
+                h.ctx("new-q", ActionKind::Send),
+                "新意见".into(),
+                false,
+                false,
+            )
+            .await,
+    );
+    assert_eq!(id, "new-q", "新消息进入队列（不是 not_sent 终态）");
+    assert!(pos >= 2, "排位在旧队列之后：{pos}");
+    assert_eq!(h.state_of("new-q"), ActionState::Queued, "账本留在排队态");
+    assert_eq!(h.dispatch.send_count(), 0, "暂停下零派发");
+    assert!(
+        h.router.flush_thread(&h.key).await.is_none(),
+        "调度循环不得穿透暂停自动接力"
+    );
+    assert_eq!(h.dispatch.send_count(), 0, "接力仍零派发");
+    assert!(
+        h.store.queue_pause(&h.key).unwrap().is_some(),
+        "旧队列暂停原样保留"
+    );
+
+    // ② 用户显式「先处理这条」→ 只派该条；旧队列继续暂停
+    let lock = h
+        .router
+        .thread_dispatch_lock(&h.key)
+        .try_lock_owned()
+        .unwrap();
+    let receipt = match h
+        .router
+        .prioritize_queued("new-q", &h.key, Deadline::none(), lock)
+        .await
+    {
+        PrioritizeOutcome::Completed(r) => r,
+        other => panic!("expected Completed, got {other:?}"),
+    };
+    assert_eq!(receipt.delivery, Delivery::Accepted, "{receipt:?}");
+    assert_eq!(
+        h.dispatch.recorded_composed(),
+        vec!["新意见"],
+        "只派出被点的那一条"
+    );
+    assert_eq!(h.state_of("old-a"), ActionState::Queued, "旧队列不动");
+    assert!(
+        h.store.queue_pause(&h.key).unwrap().is_some(),
+        "优先处理不解除暂停"
+    );
 }
 
 /// 越队授权不能穿透 pending（零投递明确拒绝）；已被消费的授权重复提交拒绝
@@ -2670,7 +2777,12 @@ async fn bypass_cannot_pierce_pending_or_replay() {
     );
     h.dispatch.set_busy(false);
     h.store
-        .set_queue_pause(&h.key, "interrupt_accepted", "test-token")
+        .set_queue_pause(
+            &h.key,
+            "interrupt_accepted",
+            "test-token",
+            Some("turn-pause"),
+        )
         .unwrap();
 
     // pending 在场：授权不穿透 → native_pending（零投递明确拒绝，动作终态）
@@ -2811,7 +2923,12 @@ async fn bypass_grant_consumed_then_busy_requeue_keeps_fifo_order() {
     }
     h.dispatch.set_busy(false);
     h.store
-        .set_queue_pause(&h.key, "interrupt_accepted", "test-token")
+        .set_queue_pause(
+            &h.key,
+            "interrupt_accepted",
+            "test-token",
+            Some("turn-pause"),
+        )
         .unwrap();
 
     // ② 写前忙在册：带授权新意见 → 越队入队 → 写出边界授权**真实消费** →
@@ -2872,32 +2989,114 @@ async fn bypass_grant_consumed_then_busy_requeue_keeps_fifo_order() {
     //    （byp-2 不凭「曾经越队」二次插队——一次授权只买一次插队）
     h.dispatch.set_busy_before_write(false);
     assert!(h.store.clear_queue_pause(&h.key).expect("resume"));
-    let mut dispatched: Vec<String> = Vec::new();
-    for _ in 0..3 {
+    let out = h.router.flush_thread(&h.key).await.expect("恢复后批次接力");
+    assert_eq!(completed(out).delivery, Delivery::Accepted);
+    assert_eq!(
+        h.dispatch.recorded_composed(),
+        vec!["旧一\n\n旧二\n\n第二条越队也撞写前忙"]
+    );
+    assert_eq!(h.state_of("byp-1"), ActionState::Rejected);
+    assert_eq!(h.state_of("byp-2"), ActionState::Accepted);
+}
+
+/// R06 反例：优先处理的授权在首次写出前被真实消费后遭遇写前忙（busy 回队、授权
+/// 不退还）→ **完全相同的重试**不得把原消息终态拒绝（修复前：重试 reserve 后命中
+/// `grant_consumed` → finish → 原消息 rejected、queued=false）。契约：busy 零投递
+/// 后的下一次用户授权 = 独立、可 CAS 的新 attempt；原消息最终最多投递一次；旧
+/// grant 永不复活（未重新铸造前，已消费授权授权不了任何写出）。
+#[tokio::test]
+async fn prioritize_retry_after_busy_requeue_mints_new_attempt_and_delivers_once() {
+    use multi_agents_manager_lib::services::codex_control::{
+        Deadline, PrioritizeOutcome, BUSY_BEFORE_WRITE_REASON,
+    };
+    let h = harness_with(FakeDispatch::accepted());
+    // ① 旧队列两条 + 目标一条（忙态 FIFO 入队——越队语义的对照面）
+    h.dispatch.set_busy(true);
+    for (id, text) in [("old-a", "旧一"), ("old-b", "旧二")] {
+        queued(
+            h.router
+                .send(h.ctx(id, ActionKind::Send), text.into(), true, false)
+                .await,
+        );
+    }
+    queued(
+        h.router
+            .send(h.ctx("q3", ActionKind::Send), "目标三".into(), true, false)
+            .await,
+    );
+    h.dispatch.set_busy(false);
+    // ② 队列已暂停（R04：越队只允许「空闲且已暂停」）
+    h.store
+        .set_queue_pause(
+            &h.key,
+            "interrupt_accepted",
+            "test-token",
+            Some("turn-pause"),
+        )
+        .unwrap();
+
+    // ③ 首次优先：授权在写出边界真实消费 → 写前忙 → 冻结回队（零 start-turn）
+    h.dispatch.set_busy_before_write(true);
+    {
+        let lock = h
+            .router
+            .thread_dispatch_lock(&h.key)
+            .try_lock_owned()
+            .unwrap();
         let out = h
             .router
-            .flush_thread(&h.key)
-            .await
-            .expect("恢复后旧队列按序接力");
-        let receipt = completed(out);
-        assert_eq!(receipt.delivery, Delivery::Accepted);
-        dispatched.push(h.dispatch.recorded_composed().last().unwrap().clone());
-        // Accepted 绑定顺序限制——释放之，让下一条接力（FIFO 定序的观测前提）
-        h.dispatch.set_terminal_turn("turn-1");
-        assert!(h
-            .router
-            .release_turn_if_complete(&h.key, &minimal_projection(THREAD, "idle")));
+            .prioritize_queued("q3", &h.key, Deadline::none(), lock)
+            .await;
+        match out {
+            PrioritizeOutcome::StillQueued(reason) => {
+                assert_eq!(reason, BUSY_BEFORE_WRITE_REASON, "首次 = 写前忙回队");
+            }
+            other => panic!("expected StillQueued(busy_before_write), got {other:?}"),
+        }
     }
+    assert_eq!(h.dispatch.send_count(), 0, "写前忙零 start-turn");
+    assert_eq!(h.state_of("q3"), ActionState::Queued, "冻结动作回队留队");
+    assert!(
+        !h.store.consume_bypass_grant("q3", &h.key).unwrap(),
+        "前置：授权已随首次派发在写出前真实消费（不退还）"
+    );
+
+    // ④ 完全相同的重试（同一 actionId、下一次用户授权）：不得 grant_consumed
+    //    终态拒绝；原消息最终最多投递一次；旧队列零帧
+    h.dispatch.set_busy_before_write(false);
+    let receipt = {
+        let lock = h
+            .router
+            .thread_dispatch_lock(&h.key)
+            .try_lock_owned()
+            .unwrap();
+        match h
+            .router
+            .prioritize_queued("q3", &h.key, Deadline::none(), lock)
+            .await
+        {
+            PrioritizeOutcome::Completed(r) => r,
+            other => panic!("retry should complete, got {other:?}"),
+        }
+    };
     assert_eq!(
-        dispatched,
-        vec!["旧一", "旧二", "第二条越队也撞写前忙"],
-        "定序：回队越队动作排在旧队列之后（不二次越队）"
+        receipt.delivery,
+        Delivery::Accepted,
+        "重试经新 attempt 恰好一次投递（不得 grant_consumed 终态拒绝）：{receipt:?}"
     );
     assert_eq!(
-        h.dispatch.recorded_composed().len(),
-        3,
-        "恰好三次真实写出（byp-1 已终态拒绝，不参与）"
+        h.state_of("q3"),
+        ActionState::Accepted,
+        "原消息不被旧授权已消费作废"
     );
+    assert_eq!(h.dispatch.writes(), 1, "原消息最终最多投递一次");
+    assert_eq!(
+        h.dispatch.recorded_composed(),
+        vec!["目标三"],
+        "只有目标被越队写出（旧队列零帧）"
+    );
+    assert_eq!(h.state_of("old-a"), ActionState::Queued, "旧队列不受影响");
+    assert_eq!(h.state_of("old-b"), ActionState::Queued, "旧队列不受影响");
 }
 
 /// 暂停期间回合终态证据照常释放顺序屏障（release_turn_if_complete = true），
@@ -2914,7 +3113,12 @@ async fn pause_never_auto_resumes_on_turn_completion() {
     assert_eq!(r.delivery, Delivery::Accepted);
     // 打断受理 → 暂停
     h.store
-        .set_queue_pause(&h.key, "interrupt_accepted", "test-token")
+        .set_queue_pause(
+            &h.key,
+            "interrupt_accepted",
+            "test-token",
+            Some("turn-pause"),
+        )
         .unwrap();
     // 回合完成证据齐备（终态 + idle 新鲜投影）→ 屏障释放
     h.dispatch.set_terminal_turn("turn-1");
@@ -3763,7 +3967,12 @@ async fn manual_resume_respects_queue_pause_choice() {
         )
         .await;
     h.store
-        .set_queue_pause(&h.key, "interrupt_accepted", "test-token")
+        .set_queue_pause(
+            &h.key,
+            "interrupt_accepted",
+            "test-token",
+            Some("turn-pause"),
+        )
         .unwrap();
 
     let r = h
@@ -3776,7 +3985,7 @@ async fn manual_resume_respects_queue_pause_choice() {
         h.store.queue_pause(&h.key).unwrap().is_some(),
         "人工继续不撤销队列暂停"
     );
-    // 后继经正常发送路径：暂停 + 旧队列有内容 → 拒绝入队（queue_paused），不越队
+    // 后继经正常发送路径：暂停 + 旧队列有内容 → 入队但不派发（C05），不越队
     h.router.force_clear_turn_limit(&h.key, "act-p");
     let out = h
         .router
@@ -3788,8 +3997,12 @@ async fn manual_resume_respects_queue_pause_choice() {
             S3Deadline::none(),
         )
         .await;
-    let receipt = completed(out);
-    assert_eq!(receipt.reason_code.as_deref(), Some("queue_paused"));
+    assert_eq!(
+        queued(out).0,
+        "succ-p",
+        "留在排队态等用户处置（不是终态拒绝）"
+    );
+    assert_eq!(h.state_of("succ-p"), ActionState::Queued);
     assert_eq!(h.dispatch.send_count(), 0, "暂停不因人工继续失效");
 }
 
@@ -3900,5 +4113,720 @@ async fn f08p_t04_zero_front_budget_means_zero_dispatch() {
     assert!(
         h2.dispatch.responds.lock().unwrap().is_empty(),
         "剩余预算为 0 时不得派发"
+    );
+}
+
+/// 自然空闲接力必须把冻结正文按 FIFO 合为一次 start-turn。
+#[tokio::test]
+async fn idle_flush_batches_frozen_fifo_texts() {
+    let h = harness();
+    for (id, text) in [
+        ("batch-a", "第一条"),
+        ("batch-b", "第二条"),
+        ("batch-c", "第三条"),
+    ] {
+        queued(
+            h.router
+                .send(h.ctx(id, ActionKind::Send), text.into(), true, false)
+                .await,
+        );
+    }
+    h.router
+        .flush_thread(&h.ctx("batch-a", ActionKind::Send).key)
+        .await
+        .unwrap();
+    let sends = h.dispatch.sends.lock().unwrap();
+    assert_eq!(sends.len(), 1);
+    assert_eq!(sends[0].composed, "第一条\n\n第二条\n\n第三条");
+}
+
+#[tokio::test]
+async fn idle_batch_members_settle_and_replay_without_second_turn() {
+    let mut h = harness();
+    for id in ["batch-a", "batch-b"] {
+        queued(
+            h.router
+                .send(h.ctx(id, ActionKind::Send), id.into(), true, false)
+                .await,
+        );
+    }
+    h.router.flush_thread(&h.key).await.unwrap();
+    for id in ["batch-a", "batch-b"] {
+        assert_eq!(h.state_of(id), ActionState::Accepted);
+        let receipt = completed(
+            h.router
+                .send(h.ctx(id, ActionKind::Send), id.into(), false, false)
+                .await,
+        );
+        assert_eq!(receipt.action_id, id);
+        assert_eq!(receipt.turn_id.as_deref(), Some("turn-1"));
+        assert!(!h.store.retract(id, "dev-1").unwrap());
+    }
+    assert_eq!(h.dispatch.send_count(), 1);
+    assert_eq!(
+        h.store.canonical_batch_action_id("batch-b").unwrap(),
+        "batch-a"
+    );
+    h.restart();
+    assert!(h.router.flush_thread(&h.key).await.is_none());
+    assert_eq!(h.dispatch.send_count(), 0);
+}
+
+#[tokio::test]
+async fn idle_batch_busy_restores_each_frozen_text_once() {
+    let h = harness();
+    for id in ["batch-a", "batch-b"] {
+        queued(
+            h.router
+                .send(h.ctx(id, ActionKind::Send), id.into(), true, false)
+                .await,
+        );
+    }
+    h.dispatch.set_busy_before_write(true);
+    assert!(h.router.flush_thread(&h.key).await.is_none());
+    for id in ["batch-a", "batch-b"] {
+        assert_eq!(h.state_of(id), ActionState::Queued);
+        assert_eq!(
+            h.store.queued_action_by_id(id).unwrap().unwrap().raw_text,
+            id
+        );
+    }
+    h.dispatch.set_busy_before_write(false);
+    h.router.flush_thread(&h.key).await.unwrap();
+    assert_eq!(
+        h.dispatch.sends.lock().unwrap()[0].composed,
+        "batch-a\n\nbatch-b"
+    );
+}
+
+#[tokio::test]
+async fn idle_batch_retracted_member_never_enters_wire() {
+    let h = harness();
+    for id in ["batch-a", "batch-b", "batch-c"] {
+        queued(
+            h.router
+                .send(h.ctx(id, ActionKind::Send), id.into(), true, false)
+                .await,
+        );
+    }
+    assert!(h.store.retract("batch-b", "dev-1").unwrap());
+    h.router.flush_thread(&h.key).await.unwrap();
+    assert_eq!(
+        h.dispatch.sends.lock().unwrap()[0].composed,
+        "batch-a\n\nbatch-c"
+    );
+    assert_eq!(h.state_of("batch-b"), ActionState::Cancelled);
+}
+
+#[tokio::test]
+async fn idle_batch_claim_failure_rolls_back_all_members() {
+    let h = harness();
+    for id in ["batch-a", "batch-b"] {
+        queued(
+            h.router
+                .send(h.ctx(id, ActionKind::Send), id.into(), true, false)
+                .await,
+        );
+    }
+    h.conn.lock().unwrap().execute_batch("CREATE TRIGGER fail_batch_claim BEFORE UPDATE ON codex_actions WHEN NEW.action_id='batch-b' AND NEW.state='reserved' BEGIN SELECT RAISE(ABORT, 'test claim failure'); END;").unwrap();
+    assert!(h.router.flush_thread(&h.key).await.is_none());
+    assert_eq!(h.dispatch.send_count(), 0);
+    assert_eq!(h.state_of("batch-a"), ActionState::Queued);
+    assert_eq!(h.state_of("batch-b"), ActionState::Queued);
+}
+
+#[tokio::test]
+async fn idle_batch_unknown_members_survive_restart_without_resend() {
+    let mut h = harness_with(FakeDispatch::new(DispatchOutcome {
+        delivery: Delivery::UnknownDelivery,
+        envelope_id: Some("batch-env".into()),
+        turn_id: None,
+        reason_code: Some("disconnected".into()),
+        revision: None,
+    }));
+    for id in ["batch-a", "batch-b"] {
+        queued(
+            h.router
+                .send(h.ctx(id, ActionKind::Send), id.into(), true, false)
+                .await,
+        );
+    }
+    h.router.flush_thread(&h.key).await.unwrap();
+    assert_eq!(h.state_of("batch-a"), ActionState::Unknown);
+    assert_eq!(h.state_of("batch-b"), ActionState::Unknown);
+    h.restart();
+    assert!(h.router.flush_thread(&h.key).await.is_none());
+    assert_eq!(h.dispatch.send_count(), 0);
+}
+
+#[tokio::test]
+async fn idle_batch_reserved_crash_and_late_result_keep_one_canonical_barrier() {
+    let mut h = harness();
+    for id in ["batch-a", "batch-b"] {
+        queued(
+            h.router
+                .send(h.ctx(id, ActionKind::Send), id.into(), true, false)
+                .await,
+        );
+    }
+    assert_eq!(
+        h.store.reserve_send_batch("batch-a").unwrap().unwrap(),
+        "batch-a\n\nbatch-b"
+    );
+    h.restart();
+    for id in ["batch-a", "batch-b"] {
+        assert_eq!(h.state_of(id), ActionState::Unknown);
+    }
+    let receipt = ActionReceipt {
+        action_id: "batch-a".into(),
+        delivery: Delivery::Accepted,
+        route: ControlRoute::DesktopIpc,
+        turn_id: Some("late-turn".into()),
+        envelope_id: Some("late-env".into()),
+        reason_code: None,
+    };
+    assert!(h.store.finish_late_result(&receipt).unwrap());
+    assert!(!h.store.finish_late_result(&receipt).unwrap());
+    for id in ["batch-a", "batch-b"] {
+        assert_eq!(h.state_of(id), ActionState::Accepted);
+    }
+    let barriers: i64 = h
+        .conn
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM codex_actions WHERE compat_outstanding=1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(barriers, 1);
+    assert!(h.router.flush_thread(&h.key).await.is_none());
+    assert_eq!(h.dispatch.send_count(), 0);
+}
+
+#[tokio::test]
+async fn idle_batch_busy_preserves_unsigned_literal_suffix_for_edit() {
+    let h = harness();
+    let text = "原文 [mobile iPhone]";
+    for id in ["batch-a", "batch-b"] {
+        queued(
+            h.router
+                .send(h.ctx(id, ActionKind::Send), text.into(), true, false)
+                .await,
+        );
+    }
+    h.dispatch.set_busy_before_write(true);
+    assert!(h.router.flush_thread(&h.key).await.is_none());
+    assert_eq!(
+        h.store
+            .retract_for_edit("batch-b", "dev-1", &h.key)
+            .unwrap()
+            .as_deref(),
+        Some(text)
+    );
+}
+
+#[tokio::test]
+async fn idle_batch_ignores_residual_non_fifo_action_without_mixing_body() {
+    let h = harness();
+    queued(
+        h.router
+            .send(
+                h.ctx("interaction", ActionKind::Send),
+                "不能进入普通正文".into(),
+                true,
+                false,
+            )
+            .await,
+    );
+    h.conn
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE codex_actions SET kind='user_input' WHERE action_id='interaction'",
+            [],
+        )
+        .unwrap();
+    for id in ["batch-a", "batch-b"] {
+        queued(
+            h.router
+                .send(h.ctx(id, ActionKind::Send), id.into(), true, false)
+                .await,
+        );
+    }
+    h.router.flush_thread(&h.key).await.unwrap();
+    assert_eq!(
+        h.dispatch.sends.lock().unwrap()[0].composed,
+        "batch-a\n\nbatch-b"
+    );
+    assert_eq!(h.state_of("interaction"), ActionState::Queued);
+}
+
+#[tokio::test]
+async fn idle_batch_size_budget_keeps_suffix_queued_for_next_turn() {
+    let h = harness();
+    let text = "x".repeat(30 * 1024);
+    for id in ["batch-a", "batch-b", "batch-c"] {
+        queued(
+            h.router
+                .send(h.ctx(id, ActionKind::Send), text.clone(), true, false)
+                .await,
+        );
+    }
+    h.router.flush_thread(&h.key).await.unwrap();
+    assert_eq!(
+        h.dispatch.sends.lock().unwrap()[0].composed,
+        format!("{text}\n\n{text}")
+    );
+    assert_eq!(h.state_of("batch-a"), ActionState::Accepted);
+    assert_eq!(h.state_of("batch-b"), ActionState::Accepted);
+    assert_eq!(h.state_of("batch-c"), ActionState::Queued);
+    assert!(h.router.flush_thread(&h.key).await.is_none());
+    h.dispatch.set_terminal_turn("turn-1");
+    assert!(h
+        .router
+        .release_turn_if_complete(&h.key, &minimal_projection(THREAD, "idle")));
+    h.router.flush_thread(&h.key).await.unwrap();
+    assert_eq!(h.dispatch.send_count(), 2);
+    assert_eq!(h.state_of("batch-c"), ActionState::Accepted);
+}
+
+// ============================================================
+// P5（2026-10-31）：陈旧停顿记录不得把普通发送变成排队
+// ============================================================
+
+/// 用户实机反馈：线程明明空闲，所有普通消息却一律进队列。
+///
+/// 根因 A：迁移前的停止类暂停行 `pause_turn_id` 为空——上一轮 P3 的自动解除
+/// 对这个形态明确 `continue`（无绑定回合 → 证据无从核对），于是**永不解除**。
+/// 叠加历史遗留的 queued 行后，`send_inner` 的 `paused_with_older` 恒真，线程被
+/// 永久判为「已暂停且有更早排队」，每条新消息都留在队列。
+/// 契约：会话空闲（无在飞回合、无原生 pending）时，**无回合绑定的陈旧停止暂停行**
+/// 必须自动清除并按正常路径派发；有绑定且回合未终态时才保持冻结。
+#[tokio::test]
+async fn stale_stop_pause_without_turn_binding_does_not_force_queueing() {
+    let h = harness(); // FakeDispatch: idle、send_gate Clear
+                       // 迁移前形态：停止类暂停行，无 pause_turn_id
+    h.store
+        .set_queue_pause(&h.key, "interrupt_pending", "legacy-token", None)
+        .unwrap();
+    // 历史遗留的排队行：直接写账本（不经 send——send 会先触发清理，掩盖本用例要
+    // 验证的「陈旧行把新消息扣住」现场；实机就是上轮卡住留下的这条）
+    h.store
+        .register(
+            &h.ctx("legacy-q", ActionKind::Send),
+            ActionKind::Send,
+            None,
+            None,
+            &payload_hash(
+                ActionKind::Send,
+                &h.key,
+                None,
+                None,
+                &ActionPayload::Text("上次卡住的".into()),
+            ),
+            Some("上次卡住的"),
+        )
+        .expect("register legacy");
+    assert!(
+        h.store.queue_pause(&h.key).unwrap().is_some(),
+        "前置：陈旧暂停行在册"
+    );
+
+    // 空闲线程发送普通消息 → 陈旧暂停必须被判定为可清除
+    let _out = h
+        .router
+        .send(
+            h.ctx("fresh-1", ActionKind::Send),
+            "直接发".into(),
+            false,
+            false,
+        )
+        .await;
+    assert!(
+        h.store.queue_pause(&h.key).unwrap().is_none(),
+        "无回合绑定的陈旧停止暂停行必须清除（否则空闲线程永远排队）"
+    );
+    // 清除后队列必须能接力（此前被暂停冻死；FIFO 先派遗留队首 legacy-q）
+    let relayed = h.router.flush_thread(&h.key).await;
+    assert!(
+        relayed.is_some(),
+        "陈旧暂停清除后队列必须开始派发（此前被它永久冻死）"
+    );
+    assert!(h.dispatch.send_count() > 0, "确实发生了真实派发");
+}
+
+/// 反例：停止类暂停行**有**回合绑定且该回合未终态 → 暂停保持，消息仍入队
+///（「停止在途」的保护不被上面的清理误伤）。
+#[tokio::test]
+async fn live_stop_pause_with_turn_binding_still_freezes() {
+    let h = harness();
+    h.dispatch.set_busy(true);
+    queued(
+        h.router
+            .send(
+                h.ctx("older", ActionKind::Send),
+                "更早的".into(),
+                true,
+                false,
+            )
+            .await,
+    );
+    h.store
+        .set_queue_pause(&h.key, "interrupt_pending", "live-token", Some("t-running"))
+        .unwrap();
+    let (id, _pos) = queued(
+        h.router
+            .send(
+                h.ctx("frozen-1", ActionKind::Send),
+                "先别发".into(),
+                false,
+                false,
+            )
+            .await,
+    );
+    assert_eq!(id, "frozen-1");
+    assert_eq!(
+        h.state_of("frozen-1"),
+        ActionState::Queued,
+        "停止在途：入队不派发"
+    );
+    assert_eq!(h.dispatch.send_count(), 0, "停止在途零派发");
+    assert!(
+        h.store.queue_pause(&h.key).unwrap().is_some(),
+        "有绑定且未终态 → 暂停保持（不被陈旧清理误伤）"
+    );
+    h.dispatch.set_busy(false);
+}
+
+/// 根因 B：陈旧 Unknown 屏障（无 turnId、无任何核对证据）让 `send_inner` 的
+/// `has_compat_fence` 门对**每一条**新消息生效，即使线程早已空闲。用户看到的
+/// 「所有普通消息都排队」正是它。契约：屏障存在但**本线程没有在飞回合**、
+/// 且该屏障是「无回合绑定的 Unknown 残留」时，新普通消息不得被它扣在队列里
+/// （屏障本身保留待核对，不影响自动派发新消息）。
+#[tokio::test]
+async fn unresolved_unknown_barrier_does_not_block_fresh_sends_on_idle_thread() {
+    let h = harness();
+    seed_unknown_with_text(&h, "old-unknown", "旧消息");
+    assert!(
+        h.store.has_compat_fence(&h.key).unwrap(),
+        "前置：Unknown 屏障在册"
+    );
+
+    let out = h
+        .router
+        .send(
+            h.ctx("fresh-2", ActionKind::Send),
+            "新消息".into(),
+            false,
+            false,
+        )
+        .await;
+    let receipt = completed(out);
+    assert_eq!(
+        receipt.delivery,
+        Delivery::Accepted,
+        "无在飞回合时，陈旧 Unknown 屏障不得把新消息扣在队列：{receipt:?}"
+    );
+    assert_eq!(h.dispatch.send_count(), 1);
+    assert!(
+        h.store.has_compat_fence(&h.key).unwrap(),
+        "屏障本身保留（不因放行新消息而假装核对通过）"
+    );
+}
+
+// ============================================================
+// P6（2026-10-31 第二次实机反馈）：重启重建的在飞限制也不得堵死空闲会话
+// ============================================================
+
+/// 用户第二次实机反馈：构建已更新，普通消息**仍然**进等待队列。
+///
+/// 上一轮只改了 `send_inner` 的暂停门与屏障门，漏了两处同源门：
+/// ① `router.new()` 从账本重建 `active_turns`——`compat_outstanding=1 ∧
+///    route=desktop_ipc ∧ state IN (accepted, unknown)` 的行（本机就是 fuz273390
+///    那条 unknown），即使 `compat_turn_id` 为空也照样入册；`send_inner` 与
+///    `dispatch_head` 的 `is_turn_active` 门随即对每条新消息生效。
+/// ② `dispatch_head` 自身还有一道 `has_compat_fence` 门（上一轮只改了 send_inner
+///    的那道），队首真正派发时仍会被拦成 Busy。
+///
+/// 契约：**未绑定回合**的 accepted/unknown 残留不得在重启后重建为在飞限制；
+/// 队首派发前的屏障门与 send 门同源判定（未被绑定的 Unknown 残留不拦派发）。
+#[tokio::test]
+async fn restart_rebuild_skips_unbound_turn_bindings() {
+    let mut h = harness();
+    // 造本机同形态：unknown 保守屏障，无 turnId（实机 fd273390）
+    seed_unknown_with_text(&h, "legacy-unknown", "旧消息");
+    // 重启：router.new() 从账本重建 active_turns
+    h.restart();
+
+    assert!(
+        !h.router.is_turn_active_public(&h.key),
+        "未绑定回合的 Unknown 残留不得在重启后重建为在飞限制（否则空闲会话永远排队）"
+    );
+
+    // 空闲会话发送 → 必须直发
+    let out = h
+        .router
+        .send(
+            h.ctx("fresh-3", ActionKind::Send),
+            "重启后直发".into(),
+            false,
+            false,
+        )
+        .await;
+    let receipt = completed(out);
+    assert_eq!(
+        receipt.delivery,
+        Delivery::Accepted,
+        "重启后空闲会话必须直发：{receipt:?}"
+    );
+    assert_eq!(h.dispatch.send_count(), 1);
+}
+
+/// 反例：**绑定回合**的 accepted 屏障必须在重启后仍重建为在飞限制（等待其 Turn
+/// 终态证据释放）——上面的跳过不能把真实顺序保护一起丢掉。
+#[tokio::test]
+async fn restart_rebuild_keeps_bound_turn_bindings() {
+    let mut h = harness_with(FakeDispatch::accepted_turn("turn-bound", None));
+    let r = completed(
+        h.router
+            .send(
+                h.ctx("bound-1", ActionKind::Send),
+                "已受理".into(),
+                false,
+                false,
+            )
+            .await,
+    );
+    assert_eq!(r.delivery, Delivery::Accepted);
+    h.restart_with(FakeDispatch::accepted_turn("turn-bound", None));
+    assert!(
+        h.router.is_turn_active_public(&h.key),
+        "绑定回合的屏障重启后必须保留为在飞限制"
+    );
+    // 该保护仍生效：新消息排队，直到终态证据释放
+    let (id, _) = queued(
+        h.router
+            .send(
+                h.ctx("after-bound", ActionKind::Send),
+                "受保护".into(),
+                false,
+                false,
+            )
+            .await,
+    );
+    assert_eq!(id, "after-bound");
+    assert_eq!(h.state_of("after-bound"), ActionState::Queued);
+}
+
+/// P7（2026-10-31 第三次实机：点插队仍被拒「桌面正忙」）：用户库里只剩一条
+/// `unknown` + 屏障在册 + **无 turnId** 的历史行，队列里两条 queued，桌面空闲。
+/// 插队必须放行这一条（先停止/或无需停止 → 再把该条正文打出去），不得以
+/// `barrier_outstanding` 拒绝——那道屏障是已收尾的未知投递，不是「进行中的派发」。
+#[tokio::test]
+async fn p7_prioritize_passes_through_unbound_unknown_barrier_residue() {
+    use multi_agents_manager_lib::services::codex_control::{Deadline, PrioritizeOutcome};
+    let h = harness();
+    // 用户库同形态：一条 unknown + 屏障在册 + 无 turnId
+    seed_unknown_with_text(&h, "legacy-unknown", "旧消息");
+    assert!(h.store.has_compat_fence(&h.key).unwrap(), "前置：屏障在册");
+    // 队列里两条（模拟用户截图里的第 1/2 位）
+    h.dispatch.set_busy(true);
+    queued(
+        h.router
+            .send(h.ctx("q1", ActionKind::Send), "你好".into(), true, false)
+            .await,
+    );
+    h.dispatch.set_busy(false);
+    // 队列已暂停（插队的前置：空闲 + 已暂停）
+    h.store
+        .set_queue_pause(&h.key, "interrupt_accepted", "tok", Some("t-past"))
+        .unwrap();
+
+    let lock = h
+        .router
+        .thread_dispatch_lock(&h.key)
+        .try_lock_owned()
+        .unwrap();
+    let out = h
+        .router
+        .prioritize_queued("q1", &h.key, Deadline::none(), lock)
+        .await;
+    match out {
+        PrioritizeOutcome::Completed(r) => {
+            assert_eq!(
+                r.delivery,
+                Delivery::Accepted,
+                "插队必须真的把这条打出去：{r:?}"
+            );
+        }
+        PrioritizeOutcome::StillQueued(reason) => {
+            panic!("插队不得被历史未知残留拒绝，收到 reason={reason}");
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+    assert_eq!(
+        h.dispatch.recorded_composed(),
+        vec!["你好"],
+        "只有目标被派出"
+    );
+    assert!(
+        h.store.has_compat_fence(&h.key).unwrap(),
+        "屏障本体保留（不假装核对通过）"
+    );
+}
+
+/// P9b（2026-10-31 第五次实机）：同线程多条已受理屏障时，终态释放只清内存里
+/// **最后一条**，其余永久残留并把后续插队/接力锁死。
+///
+/// `active_turns` 是 `HashMap<ThreadKey, ActiveTurn>`——一个线程只存一条。连续两次
+/// 受理后，第一条的身份被覆盖；`release_turn_if_complete` 只能清最后一条的屏障，
+/// 前面那条的持久屏障再无人清（实机账本里 accepted+turnId 的屏障越积越多）。
+/// 契约：投影驱动的终态释放必须清掉**该线程所有**满足终态证据的已受理屏障，
+/// 而不只是内存里的那一条。
+#[tokio::test]
+async fn p9b_release_clears_all_terminal_accepted_barriers_on_thread() {
+    let h = harness_with(FakeDispatch::accepted_turn("turn-a", None));
+    // 第一次受理 → 屏障 a
+    let r1 = completed(
+        h.router
+            .send(
+                h.ctx("act-a", ActionKind::Send),
+                "第一条".into(),
+                false,
+                false,
+            )
+            .await,
+    );
+    assert_eq!(r1.delivery, Delivery::Accepted);
+    // 第一条回合先终态 → 释放限制，第二条才能受理
+    h.dispatch.set_terminal_turn("turn-a");
+    assert!(h
+        .router
+        .release_turn_if_complete(&h.key, &projection_with_rev(THREAD, "idle", 5)));
+    assert!(
+        h.store.compat_fences(&h.key).unwrap().is_empty(),
+        "A 释放后无残留"
+    );
+    // 第二次受理（不同动作，同线程）→ 屏障 b；内存限制被 b 覆盖
+    h.dispatch.set_outcome(DispatchOutcome {
+        delivery: Delivery::Accepted,
+        envelope_id: Some("env-b".into()),
+        turn_id: Some("turn-b".into()),
+        reason_code: None,
+        revision: None,
+    });
+    let r2 = completed(
+        h.router
+            .send(
+                h.ctx("act-b", ActionKind::Send),
+                "第二条".into(),
+                false,
+                false,
+            )
+            .await,
+    );
+    assert_eq!(r2.delivery, Delivery::Accepted);
+    // 再造一条"更早的、已终态但未清"的屏障（模拟历史残留：旧实现只会清最后一条）
+    {
+        let hash = payload_hash(
+            ActionKind::Send,
+            &h.key,
+            None,
+            None,
+            &ActionPayload::Text("残留旧条".into()),
+        );
+        h.store
+            .register_signed(
+                &h.ctx("act-old", ActionKind::Send),
+                ActionKind::Send,
+                None,
+                None,
+                &hash,
+                Some("残留旧条"),
+                Some(false),
+            )
+            .expect("register old");
+        assert!(h
+            .store
+            .reserve("act-old", ControlRoute::DesktopIpc)
+            .unwrap());
+        h.store
+            .finish_with_turn_barrier(
+                &ActionReceipt {
+                    action_id: "act-old".into(),
+                    delivery: Delivery::Accepted,
+                    route: ControlRoute::DesktopIpc,
+                    turn_id: Some("turn-old".into()),
+                    envelope_id: Some("env-old".into()),
+                    reason_code: None,
+                },
+                Some("turn-old"),
+            )
+            .expect("finish old barrier");
+    }
+    assert_eq!(
+        h.store.compat_fences(&h.key).unwrap().len(),
+        2,
+        "前置：两条屏障在册（b + 旧残留）"
+    );
+
+    // 两个回合都以终态在场 + 投影 idle → 释放
+    h.dispatch.set_terminal_turn("turn-old");
+    h.dispatch.set_terminal_turn("turn-b");
+    let projection = projection_with_rev(THREAD, "idle", 9);
+    h.router.release_turn_if_complete(&h.key, &projection);
+
+    assert!(
+        h.store.compat_fences(&h.key).unwrap().is_empty(),
+        "所有回合都已终态的屏障必须全部释放（只剩最后一条 = 前面的永久残留并锁死后续操作）"
+    );
+}
+
+/// P11（2026-10-31 用户裁决）：「哪怕它都发送出去了也无所谓，不能卡我其他流程」。
+///
+/// 现状：`flush_thread` 只要发现有未清屏障就整队不接力。但屏障只可能挂在**终态**
+/// 动作上（unknown/accepted）——`next_queued` 只取 `state='queued'`，所以那条可疑
+/// 消息**永远不会**从队列里被重发。这道门防不住它（它不在队列），却冻结了队列里
+/// 所有**内容完全不同**的消息。
+///
+/// 契约：残留屏障不再冻结队列接力；真实安全由 `send_gate`（实时看桌面忙/待审批）
+/// 与 `is_turn_active`（有界、靠终态证据释放）承担。屏障本身保留在账本里，
+/// 该条仍标记为未知、不被重发。
+#[tokio::test]
+async fn p11_residual_barrier_does_not_freeze_queue_relay() {
+    let h = harness();
+    // 一条历史 unknown（终态、屏障在册、不在队列）
+    seed_unknown_with_text(&h, "legacy-unknown", "老消息");
+    assert!(h.store.has_compat_fence(&h.key).unwrap(), "前置：屏障在册");
+    // 队列里另有一条完全不同的消息
+    h.dispatch.set_busy(true);
+    queued(
+        h.router
+            .send(
+                h.ctx("q-fresh", ActionKind::Send),
+                "新消息".into(),
+                true,
+                false,
+            )
+            .await,
+    );
+    h.dispatch.set_busy(false);
+
+    let out = h.router.flush_thread(&h.key).await;
+    assert!(
+        out.is_some(),
+        "历史 unknown 不得冻结队列接力（它自己不在队列、永不会被重发）"
+    );
+    assert_eq!(
+        h.dispatch.recorded_composed(),
+        vec!["新消息"],
+        "接力的必须是队列里那条新消息"
+    );
+    assert_eq!(
+        h.state_of("legacy-unknown"),
+        ActionState::Unknown,
+        "那条老记录状态不变、不被重发"
     );
 }

@@ -677,6 +677,7 @@ fn api_router(state: Arc<RemoteState>) -> Router<Arc<RemoteState>> {
             post(super::codex_ipc::action_manual_resume),
         )
         .route("/codex/queue", get(super::codex_ipc::queue_view))
+        .route("/codex/queue/edit", post(super::codex_ipc::queue_edit))
         .route(
             "/codex/queue/retract",
             post(super::codex_ipc::queue_retract),
@@ -688,6 +689,12 @@ fn api_router(state: Arc<RemoteState>) -> Router<Arc<RemoteState>> {
         )
         // S2：打断后队列持久暂停的唯一恢复出口（用户显式「继续发送」）
         .route("/codex/queue/resume", post(super::codex_ipc::queue_resume))
+        // T06：已入队消息的显式优先处理闭环（确认停止 → 一次性越队授权恰好一帧；
+        // 旧队列保持暂停，不接受正文副本）
+        .route(
+            "/codex/queue/prioritize",
+            post(super::codex_ipc::queue_prioritize),
+        )
         // 原生审批/阻塞问答应答（绑定 thread + requestId + current owner）
         .route(
             "/codex/pending-response",

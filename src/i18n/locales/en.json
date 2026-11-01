@@ -2063,6 +2063,9 @@
     "dbOpenFail": "Failed to open the database — see logs",
     "migratePreviewLedgerFail": "Failed to rebuild the preview usage ledger — see logs",
     "migrateFail": "Database migration failed — see logs",
+    "migrateCodexStopAttemptFail": "Failed to migrate queue action data (adding stop_attempt_reason) — see logs",
+    "migrateCodexStopAttemptStateFail": "Failed to migrate queue action data (adding stop_attempt_state) — see logs",
+    "migrateCodexBypassAttemptFail": "Failed to migrate bypass grant data (adding attempt) — see logs",
     "migrateExtFieldsFail": "Failed to migrate extension resource fields — see logs",
     "migratePresetColFail": "Failed to migrate a preset column — see logs",
     "migrateSourceToolFail": "Failed to backfill source tools — see logs",
@@ -2192,6 +2195,7 @@
     "codexInterruptPauseWriteFailed": "Failed to record the queue-pause protection; the interrupt was abandoned (no command was sent to the desktop). Please retry later.",
     "migrateQueuePauseTokenFail": "Failed to migrate the queue-pause ownership token",
     "migrateQueuePauseMultiTokenFail": "Failed to migrate queue pauses to multi-row (per-token) coexistence",
+    "migrateQueuePauseTurnFail": "Failed to migrate the queue-pause turn binding",
     "migrateWriteRevokeTwoStateFail": "Failed to migrate the write-revoke ledger to two-state rows",
     "operationUnknownPolicy": "This client does not have capability facts for the session yet (projection is missing the field). Refresh and try again — Tuvis will not guess.",
     "operationNotImplemented": "This action is not wired up in this phase (no verified protocol path). Handle it on Desktop.",
@@ -2212,7 +2216,9 @@
     "migrateClaimEpochFail": "Failed to migrate question-claim epoch column",
     "migrateClaimOwnerFail": "Failed to migrate question-claim owner column",
     "migrateClaimGroupFail": "Failed to migrate grouped-claim index",
-    "migrateClaimOwnerTokenFail": "Failed to migrate claim-owner token column"
+    "migrateClaimOwnerTokenFail": "Failed to migrate claim-owner token column",
+    "codexBatchRequiresVerification": "This message was sent in a combined batch. Check the entire batch on Desktop before continuing; a single member cannot be resent separately.",
+    "migrateBatchSignatureFail": "Failed to migrate the batch signature column"
   },
   "mobile": {
     "common": {
@@ -2306,6 +2312,10 @@
       "placeholder": "Type a message to send to the terminal…",
       "sending": "Sending…",
       "send": "Send",
+      "stop": "Stop",
+      "stopStopping": "Stopping…",
+      "stopCompactAria": "Stop the current desktop turn",
+      "stopUnavailable": "Desktop turn running — no usable stop target (target unknown or remote stop unsupported in this version)",
       "attachHint": "Attachments are saved to the project directory .tuvis-attachments/<session>/ (excluded from local git, never committed); you can delete the whole folder when wrapping up."
     },
     "question": {
@@ -2512,6 +2522,14 @@
       },
       "queue": {
         "title": "Outgoing queue",
+        "summaryCount": "{{n}} queued",
+        "summaryPaused": "paused",
+        "summaryVerify": "needs manual check",
+        "summaryAwaitTurn": "waiting for the turn to finish",
+        "summaryQueued": "waiting",
+        "summaryIdle": "nothing queued",
+        "summaryView": "View",
+        "summaryHide": "Hide",
         "position": "#{{n}} in queue",
         "stateQueued": "Queued",
         "stateReserved": "Dispatching",
@@ -2541,12 +2559,37 @@
         "interruptUncertain": "Stop request sent, but the outcome is uncertain (it may have taken effect) — verify the turn state on the desktop instead of pressing repeatedly",
         "interruptNoTurn": "No running turn to stop on the desktop (it may have just finished on its own)",
         "interruptFailed": "Stop failed: {{message}}",
+        "interruptNoTarget": "No stoppable target — the page state may be stale; refresh and retry (no request was sent)",
+        "interruptNotAllowed": "Stopping is not allowed in the current state — refresh and verify the desktop state first (no request was sent)",
         "pausedBanner": "The send queue is paused (protection after an interruption) — resume to continue in order, or send this one first.",
         "pausedNote": "The queue is paused — ordered dispatch is frozen, waiting for your choice (the send-first option is in the send area).",
         "resume": "Resume queue",
         "bypass": "Send this one first",
         "bypassArmed": "This message will be sent past the paused queue (one-time grant).",
-        "resumeFailed": "Resume failed: {{message}}"
+        "resumeFailed": "Resume failed: {{message}}",
+        "prioritize": "Send next",
+        "prioritizeYes": "Send first",
+        "prioritizeCancel": "Cancel",
+        "prioritizeRiskStop": "This will stop the desktop's current turn and send this one first: unfinished work in that turn is lost, and other messages stay paused. Continue?",
+        "prioritizeRiskBypass": "Send this one ahead of the paused queue? Other messages stay paused and will not resume automatically.",
+        "prioritizeDone": "Sent this one first; other messages remain paused.",
+        "prioritizeAlready": "This message is already dispatching or settled ({{state}}); it was not sent again.",
+        "prioritizeRefused": "Not prioritized ({{reason}}); the message is still queued.",
+        "prioritizeFailed": "Prioritized send failed: {{message}}",
+        "prioritizeUnknown": "Unknown result: the prioritized send may have gone through. Check back later; no automatic retry.",
+        "prioritizeNeedsStopConfirm": "A desktop turn is running: confirm stopping it before prioritizing this message",
+        "prioritizeNativePending": "The desktop has an unanswered native request (approval/question); handle it before prioritizing",
+        "prioritizeStateUnknown": "Desktop state could not be confirmed; this prioritize attempt was cancelled conservatively",
+        "prioritizeStopNotEffective": "Stop did not take effect: the desktop turn is still running; this message was not sent",
+        "prioritizeStopUncertain": "Stop result unknown: this prioritize attempt was cancelled to avoid double sends; check back later",
+        "prioritizeBusy": "The desktop is busy or a dispatch is still in flight; this message cannot jump the queue right now",
+        "prioritizeUnknownBarrier": "A message's delivery result is unknown and it is blocking the queue; check that entry in the queue, or verify on the desktop and click \"Continue queue\". This message is still queued and has not been sent.",
+        "edit": "Edit again",
+        "editFailed": "Could not edit: {{message}}",
+        "editDraftConflict": "You have a draft. Choose how to restore the withdrawn message:",
+        "editDraftReplace": "Replace draft",
+        "editDraftAppend": "Append to draft",
+        "lengthChars": "{{n}} chars"
       },
       "composer": {
         "codexAccepted": "Accepted — Desktop is running it",
@@ -2558,7 +2601,7 @@
         "headless_cancelled": "Compatibility channel cancelled: {{reason}}",
         "codexRetry": "Retry",
         "retriedFrom": "New send created (linked to original action {{short}}).",
-        "reasonQueuePaused": "The send queue is paused — choose \"Resume queue\" or \"Send this one first\" below, then retry.",
+        "reasonQueuePaused": "The send queue is paused and this message was not dispatched — resume the queue in \"Outgoing queue\", or pick a message there and send it first, then retry.",
         "reasonGrantConsumed": "The bypass grant is already used (an earlier \"send first\" may have been written) — choose a send option again instead of retrying as-is.",
         "reasonNativePending": "The desktop has unprocessed requests — handle the card above or interrupt the current turn first.",
         "reasonCapabilityUnverified": "This build cannot be sent to remotely yet (capability unconfirmed and auto-adapt is off) — enable auto-adapt on the desktop and retry.",
@@ -2649,7 +2692,8 @@
         "reasons": {
           "running": "The turn is running; you can submit when it ends",
           "pendingNative": "A Desktop approval/blocking request is pending; handle it first",
-          "noContract": "This operation has no matched contract for the current build",
+          "noContract": "No async-answer contract matched this Desktop build, so it cannot be submitted from the phone; your answer is kept — answer on Desktop or check adapt details",
+          "noEvidence": "Capabilities of this Desktop build are still being identified; your answer is kept — retry later or answer on Desktop",
           "adaptOff": "Auto-adapt is off; enable it to submit",
           "unsettled": "This group has unconfirmed questions; submission is blocked"
         },
@@ -2660,7 +2704,11 @@
         "archiveGroup": "Archive in Tuvis (does not affect Desktop)",
         "openGroup": "View",
         "otherGroup": "Another group · {{count}} questions",
-        "verifyGroup": "Needs check · {{count}} questions"
+        "verifyGroup": "Needs check · {{count}} questions",
+        "otherGroupsCount": "{{count}} more group(s)",
+        "otherAnswers": "Other answer",
+        "expandTitle": "Show full question",
+        "collapseTitle": "Collapse question"
       },
       "ops": {
         "more": "More {{count}}",
@@ -2686,8 +2734,24 @@
           "asyncAnswer": "Async answer",
           "stop": "Stop turn"
         },
+        "support": {
+          "supported": "Supported",
+          "identifying": "Identifying",
+          "unmatched": "Not matched on this version",
+          "notImplemented": "Not available"
+        },
+        "reasons": {
+          "running": "Turn is running",
+          "pendingNative": "A request needs attention",
+          "queuePaused": "Queue is paused",
+          "adaptOff": "Auto-adapt is off",
+          "stale": "Reconnecting",
+          "runtimeUnknown": "Status pending"
+        },
         "connecting": "Connecting to the desktop session… (available actions appear once connected; no terminal screen-read fallback)",
         "noneAvailable": "No newly supported actions",
+        "reconnecting": "Reconnecting (showing last identified capabilities)",
+        "identityPending": "Last identified result · verifying package identity",
         "allowed": "available",
         "blocked": "unavailable"
       },

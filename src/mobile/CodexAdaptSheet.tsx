@@ -4,22 +4,39 @@
  * 只读展示系统/Tuvis/Desktop 版本、逐能力证据与最近失败；开关与桌面设置同源
  * （`/codex/adapt-settings`）。首次提示只在 `hintSeen=false` 时出现，用户点"知道了"
  * 后由服务端记住（不随 build 重置）。
+ *
+ * R07（能力事实同源）：**能力表只渲染页面同版的 `effectiveOperations`**（工具栏同一
+ * 份投影事实）——不读独立 GET 的 `effectiveOperations`。独立 GET
+ * （`fetchCodexAdaptStatus`）只补版本、自动适配开关、首次提示与诊断/最近失败，
+ * 因此能力表不会因为打开时那一瞬的旧快照而长期过期，也不受该 GET 失败影响。
  */
 import { useCallback, useEffect, useRef, useState } from "react";
 import i18n from "@/i18n";
 import {
   fetchCodexAdaptStatus,
+  supportOf,
   updateCodexAdaptSettings,
   type CodexAdaptDetails,
+  type CodexEffectiveOperations,
 } from "./codexIpcApi";
+import { codexReasonText, codexSupportText } from "./CodexOperationToolbar";
 
 export interface CodexAdaptSheetProps {
   sessionId: string;
   open: boolean;
   onClose: () => void;
+  /** 页面同版能力事实（工具栏消费的同一份投影 `effectiveOperations`）。
+   *  R07：能力表**只**渲染它；缺省 = 页面还没给出事实 → 不渲染能力表
+   *  （不用独立 GET 的旧快照冒充）。 */
+  effectiveOperations?: CodexEffectiveOperations;
 }
 
-export default function CodexAdaptSheet({ sessionId, open, onClose }: CodexAdaptSheetProps) {
+export default function CodexAdaptSheet({
+  sessionId,
+  open,
+  onClose,
+  effectiveOperations,
+}: CodexAdaptSheetProps) {
   const [details, setDetails] = useState<CodexAdaptDetails | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -127,13 +144,13 @@ export default function CodexAdaptSheet({ sessionId, open, onClose }: CodexAdapt
           </dd>
         </dl>
       )}
-      {details?.effectiveOperations && (
+      {effectiveOperations && (
         <ul data-testid="codex-adapt-ops" className="mt-2 space-y-1 text-xs">
           {(
-            Object.entries(details.effectiveOperations.operations) as [
+            Object.entries(effectiveOperations.operations) as [
               string,
               NonNullable<
-                (typeof details.effectiveOperations.operations)[keyof typeof details.effectiveOperations.operations]
+                CodexEffectiveOperations["operations"][keyof CodexEffectiveOperations["operations"]]
               >,
             ][]
           )
@@ -143,9 +160,12 @@ export default function CodexAdaptSheet({ sessionId, open, onClose }: CodexAdapt
                 key={operation}
                 data-testid={`codex-adapt-op-${operation}`}
                 data-allowed={status.allowed ? "true" : "false"}
+                data-support={supportOf(status)}
                 className="flex flex-wrap items-center gap-x-2 gap-y-0.5"
               >
                 <span className="font-medium">{operation}</span>
+                {/* T03：支持状态（稳定展示）与当前资格（allowed + 原因）分开说。 */}
+                <span className="text-[var(--mut)]">{codexSupportText(supportOf(status))}</span>
                 <span className={status.allowed ? "text-emerald-600" : "text-[var(--mut)]"}>
                   {status.allowed
                     ? i18n.t("mobile.codex.ops.allowed")
@@ -155,7 +175,7 @@ export default function CodexAdaptSheet({ sessionId, open, onClose }: CodexAdapt
                   {i18n.t("mobile.codex.ops.evidence")}: {status.evidence}
                 </span>
                 {status.reasonCode && (
-                  <span className="text-[var(--mut)]">{status.reasonCode}</span>
+                  <span className="text-[var(--mut)]">{codexReasonText(status.reasonCode)}</span>
                 )}
               </li>
             ))}
