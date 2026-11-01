@@ -236,6 +236,64 @@ pub fn init(conn: &Connection) {
         -- unknown）：崩溃/重启后重放只返回 unknown，不再派发；只有 reserved 行能被
         -- 第一次 finish 改写（CAS），终态行绝不被第二次 finish 覆盖。
         -- summary 只存审计摘要（类别 + 字数/选项数），同样不含正文。
+        CREATE TABLE IF NOT EXISTS zcode_send_queue (
+            seq INTEGER PRIMARY KEY AUTOINCREMENT,
+            request_id TEXT NOT NULL UNIQUE,
+            item_id TEXT NOT NULL UNIQUE,
+            payload_hash TEXT NOT NULL,
+            device_id TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            device_name TEXT NOT NULL,
+            workspace_path TEXT NOT NULL,
+            workspace_identity TEXT,
+            prepared TEXT NOT NULL,
+            receipt_queue_version INTEGER NOT NULL,
+            receipt_position INTEGER NOT NULL,
+            created_at INTEGER NOT NULL DEFAULT 0,
+            priority_request TEXT,
+            dispatch_action_id TEXT,
+            dispatch_target TEXT,
+            receipt TEXT,
+            draft TEXT,
+            state TEXT NOT NULL DEFAULT 'queued',
+            item_version INTEGER NOT NULL DEFAULT 1
+        );
+        CREATE TABLE IF NOT EXISTS zcode_queue_state (
+            session_id TEXT PRIMARY KEY,
+            version INTEGER NOT NULL DEFAULT 0,
+            auto_drain INTEGER NOT NULL DEFAULT 1,
+            pause_reason TEXT
+        );
+        CREATE TABLE IF NOT EXISTS zcode_queue_operations (
+            request_id TEXT PRIMARY KEY,
+            kind TEXT NOT NULL DEFAULT 'edit',
+            payload_hash TEXT,
+            stop_action_id TEXT,
+            send_action_id TEXT,
+            expected_execution_id TEXT,
+            confirm_stop INTEGER NOT NULL DEFAULT 0,
+            stop_claimed INTEGER NOT NULL DEFAULT 0,
+            stop_reviewed INTEGER NOT NULL DEFAULT 0,
+            stop_generation INTEGER,
+            result_version INTEGER,
+            operation_state TEXT NOT NULL DEFAULT 'in_flight',
+            operation_receipt TEXT,
+            device_name TEXT NOT NULL DEFAULT '',
+            device_id TEXT NOT NULL,
+            item_id TEXT NOT NULL,
+            expected_version INTEGER NOT NULL,
+            draft TEXT,
+            expires_at INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_zcode_send_queue_active ON zcode_send_queue(session_id,seq) WHERE state IN ('queued','dispatching','unknown');
+        CREATE INDEX IF NOT EXISTS idx_zcode_queue_edits_expiry ON zcode_queue_operations(expires_at) WHERE kind='edit' AND draft IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS idx_zcode_queue_priority ON zcode_queue_operations(item_id,operation_state) WHERE kind='priority';
+        CREATE TRIGGER IF NOT EXISTS zcode_queue_request_guard BEFORE INSERT ON zcode_send_queue
+        WHEN EXISTS (SELECT 1 FROM zcode_queue_operations WHERE request_id=NEW.request_id)
+        BEGIN SELECT RAISE(ABORT, 'queue request conflict'); END;
+        CREATE TRIGGER IF NOT EXISTS zcode_operation_request_guard BEFORE INSERT ON zcode_queue_operations
+        WHEN EXISTS (SELECT 1 FROM zcode_send_queue WHERE request_id=NEW.request_id)
+        BEGIN SELECT RAISE(ABORT, 'queue request conflict'); END;
         CREATE TABLE IF NOT EXISTS zcode_actions (
             action_id    TEXT PRIMARY KEY,
             device_id    TEXT NOT NULL,

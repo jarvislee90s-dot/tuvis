@@ -27,6 +27,8 @@
 //!
 //! 官方授权、适配器与写能力由生产计划逐任务装配；授权不塞进 config，也不进 IPC 大文件。
 
+pub(crate) mod local_queue;
+
 pub mod action;
 pub mod audit;
 pub mod auth;
