@@ -49,6 +49,14 @@ pub fn migrate(conn: &Connection) -> Result<(), String> {
     // 上面 DROP 掉的预览版账本四表，由这次 init 按新 DDL 重建为空表。
     crate::database::schema::init(conn);
 
+    if !column_exists(conn, "zcode_actions", "send_admission") {
+        conn.execute(
+            "ALTER TABLE zcode_actions ADD COLUMN send_admission TEXT",
+            [],
+        )
+        .map_err(|e| format!("MIGRATE_FAIL: {}", e))?;
+    }
+
     // 检查 extension 表是否有 manifest_path 列
     if !column_exists(conn, "extensions", "manifest_path") {
         conn.execute("ALTER TABLE extensions ADD COLUMN manifest_path TEXT", [])

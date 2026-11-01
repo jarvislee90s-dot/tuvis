@@ -117,6 +117,21 @@ const goldenReceipt: ActionReceipt = {
   reasonCode: null,
 };
 
+describe("send admission compatibility", () => {
+  it("preserves optional admission and accepts older receipts", async () => {
+    const admitted: ActionReceipt = {
+      ...goldenReceipt,
+      sendAdmission: { delivery: "queue", inputId: "synthetic-id" },
+    };
+    installFetch(() => json(admitted));
+    expect((await postZcodeAction("synthetic-action", sendAction)).sendAdmission).toEqual(
+      admitted.sendAdmission
+    );
+    installFetch(() => json(goldenReceipt));
+    expect((await postZcodeAction("synthetic-action", sendAction)).sendAdmission).toBeUndefined();
+  });
+});
+
 const sendAction: ControlAction = {
   kind: "send",
   sessionId: SID,

@@ -1,0 +1,9 @@
+{
+  "_notice": "全部 ID 与目录数据均为合成；仅表示静态已证字段形状，不代表真实供应商或实机结果。",
+  "source": {"build": "3.16.2.8769", "kind": "package-static", "liveVerified": false},
+  "modeLabels": {"plan": "计划模式", "build": "变更前确认", "guarded": "自主模式", "yolo": "完全访问", "edit": "自动编辑"},
+  "modeCommand": {"kind": "switchCollaborationMode", "baseRevision": 7, "payload": {"mode": "plan"}},
+  "config": {"provider": "synthetic-provider-a", "model": "synthetic-model-a", "thought": "synthetic-level", "thoughtLevels": ["synthetic-level"], "followupMode": "queue", "mode": "build", "planEnabled": true},
+  "control": {"activeWorks": [{"kind": "primaryTurn", "foregroundExecutionId": "synthetic-execution", "sourceCommandId": "synthetic-command", "startedAt": 1}]},
+  "unverified": ["model-selection.getView provider availability field and full response shape", "inputAccepted inputId to activeWorks correlation", "runtime mode switching and approval behavior"]
+}

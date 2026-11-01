@@ -4052,6 +4052,7 @@ mod tests {
                 generation: 0,
                 state,
                 reason_code: reason,
+                send_admission: None,
             };
             self.execute_receipt.lock().unwrap().replace(Ok(receipt));
         }
@@ -4238,6 +4239,7 @@ mod tests {
                     generation: target.generation,
                     state: ActionState::Accepted,
                     reason_code: None,
+                    send_admission: None,
                 })
             });
             Box::pin(async move {
@@ -5118,6 +5120,7 @@ mod tests {
             generation,
             state: ActionState::Accepted,
             reason_code: None,
+            send_admission: None,
         };
         fake.set_existing(Ok(Some(stored_receipt.clone())));
         let mut events = hub.subscribe();
@@ -5178,6 +5181,7 @@ mod tests {
             generation,
             state: ActionState::Accepted,
             reason_code: None,
+            send_admission: None,
         })));
 
         let err = hub

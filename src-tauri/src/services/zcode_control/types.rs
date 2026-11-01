@@ -297,6 +297,21 @@ impl ActionState {
 }
 
 /// 动作回执（发给手机；**不携带**正文/答案/官方原值）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SendDelivery {
+    StartNow,
+    Queue,
+    Guide,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SendAdmission {
+    pub delivery: SendDelivery,
+    pub input_id: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ActionReceipt {
@@ -305,6 +320,8 @@ pub struct ActionReceipt {
     pub generation: u64,
     pub state: ActionState,
     pub reason_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub send_admission: Option<SendAdmission>,
 }
 
 /// 动作调用方上下文：`device_id`/`device_name` 只能来自配对门／本机 DB，

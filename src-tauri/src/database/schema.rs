@@ -246,6 +246,7 @@ pub fn init(conn: &Connection) {
             payload_hash TEXT NOT NULL,
             state        TEXT NOT NULL,
             reason_code  TEXT,
+            send_admission TEXT,
             summary      TEXT NOT NULL,
             created_at   INTEGER NOT NULL,
             updated_at   INTEGER NOT NULL

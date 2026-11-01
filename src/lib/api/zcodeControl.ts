@@ -140,6 +140,7 @@ export interface ActionReceipt {
   generation: number;
   state: ActionState;
   reasonCode: string | null;
+  sendAdmission?: { delivery: "startNow" | "queue" | "guide"; inputId: string };
 }
 
 /** pending 卡种类（camelCase）。 */

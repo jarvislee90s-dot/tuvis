@@ -130,8 +130,8 @@ use super::selection::build_selection_command;
 use super::types::{
     codes, ActionContext, ActionReceipt, ActionState, ActiveWork, BoundTarget, CapabilitySource,
     CapabilityView, CommandPort, ControlAction, HeldQueueChoice, PendingPort, SelectionPort,
-    SessionView, StopPort, StopRequest, ZResult, ZcodeError, PROTOCOL_CLIENT_ID,
-    WRITABLE_DISPATCH_STATES,
+    SendAdmission, SendDelivery, SessionView, StopPort, StopRequest, ZResult, ZcodeError,
+    PROTOCOL_CLIENT_ID, WRITABLE_DISPATCH_STATES,
 };
 
 /// 官方发送方法名（`zcodeAgent.ts:937`、探针 `SendOnceLoop`）。
@@ -250,6 +250,30 @@ pub fn compose_official_text(device_name: &str, text: &str, signature_on: bool) 
         return Err(ZcodeError::of(codes::PAYLOAD_TOO_LARGE));
     }
     Ok(composed)
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PreparedSend(String);
+impl PreparedSend {
+    pub(crate) fn from_stored(wire_text: String) -> ZResult<Self> {
+        if wire_text.trim().is_empty() {
+            return Err(invalid_action());
+        }
+        if wire_text.len() > MAX_TEXT_BYTES {
+            return Err(ZcodeError::of(codes::PAYLOAD_TOO_LARGE));
+        }
+        Ok(Self(wire_text))
+    }
+    pub(crate) fn wire_text(&self) -> &str {
+        &self.0
+    }
+}
+pub(crate) fn freeze_send_text(
+    device_name: &str,
+    body: &str,
+    signature_on: bool,
+) -> ZResult<PreparedSend> {
+    PreparedSend::from_stored(compose_official_text(device_name, body, signature_on)?)
 }
 
 /// stop 唯一可接受的 `ActiveWork.kind`（探针 `interactionBridge.ts` 的
@@ -438,17 +462,6 @@ fn classify_ack(ack: &Value) -> (ActionState, Option<String>) {
         Some("rejected") => (ActionState::Rejected, None),
         _ => (ActionState::Unknown, Some(codes::UNKNOWN.to_owned())),
     }
-}
-
-/// 官方 `sendText` 受理回执里的投递结论（`result.delivery`）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SendDelivery {
-    /// 立即开始。
-    StartNow,
-    /// 已入官方队列。
-    Queue,
-    /// 作为当前回合的引导输入。
-    Guide,
 }
 
 impl SendDelivery {
@@ -1029,9 +1042,84 @@ impl CommandSender {
         }
 
         let receipt = self
-            .dispatch_send(ctx, target, composed, queue_delivery, held_queue.as_ref())
+            .dispatch_send(
+                ctx,
+                target,
+                composed,
+                queue_delivery,
+                false,
+                held_queue.as_ref(),
+            )
             .await;
         self.record(&receipt);
+        Ok(receipt)
+    }
+
+    pub(crate) async fn execute_prepared_send(
+        &self,
+        ctx: &ActionContext,
+        target: &BoundTarget,
+        prepared: &PreparedSend,
+        held_queue: Option<&HeldQueueChoice>,
+    ) -> ZResult<ActionReceipt> {
+        let action = ControlAction::Send {
+            session_id: target.session_id.clone(),
+            generation: target.generation,
+            text: prepared.wire_text().to_owned(),
+            held_queue: held_queue.cloned(),
+        };
+        self.check_action(ctx, target, &action)?;
+        let params = action_params(&action);
+        let hash = payload_hash(
+            action.kind(),
+            &target.session_id,
+            target.generation,
+            &params,
+        )?;
+        if let Some(existing) = self
+            .actions
+            .existing_receipt(ctx, target, action.kind(), &hash)?
+        {
+            return Ok(existing);
+        }
+        if !self.current_capabilities().send.enabled {
+            return Err(ZcodeError::of(codes::NEEDS_EVIDENCE));
+        }
+        let fresh = self
+            .fresh_session_view(target)
+            .await
+            .ok_or_else(|| ZcodeError::of(codes::NOT_READY))?;
+        if fresh.session_id != target.session_id
+            || fresh.generation != target.bridge_generation()
+            || !fresh.ready
+            || !fresh.pending.is_empty()
+            || fresh
+                .control
+                .as_ref()
+                .is_none_or(|c| !c.active_works.is_empty())
+        {
+            return Err(ZcodeError::of(codes::NOT_READY));
+        }
+        let held = resolve_held_queue(held_queue, Some(&fresh), target)?;
+        let summary = audit_summary(action.kind(), &params);
+        match self
+            .actions
+            .reserve_with_kind(ctx, target, action.kind(), &hash, &summary)?
+        {
+            Reservation::Existing(r) => return Ok(r),
+            Reservation::New => {}
+        }
+        let receipt = self
+            .dispatch_send(
+                ctx,
+                target,
+                prepared.wire_text().to_owned(),
+                false,
+                true,
+                held.as_ref(),
+            )
+            .await;
+        self.actions.record_result(&receipt)?;
         Ok(receipt)
     }
 
@@ -1925,6 +2013,7 @@ impl CommandSender {
             generation: target.generation,
             state,
             reason_code,
+            send_admission: None,
         }
     }
 
@@ -1951,11 +2040,14 @@ impl CommandSender {
         target: &BoundTarget,
         text: String,
         queue_delivery: bool,
+        start_now: bool,
         held_queue: Option<&HeldQueueChoice>,
     ) -> ActionReceipt {
         let mut payload = serde_json::json!({ "text": text });
         if queue_delivery {
             payload["requestedDelivery"] = Value::from(REQUESTED_DELIVERY_QUEUE);
+        } else if start_now {
+            payload["requestedDelivery"] = Value::from("startNow");
         }
         // 手机自定义的 `heldQueue` 形状必须展平为官方两个字段；未选择时一个都不带。
         if let Some(choice) = held_queue {
@@ -1972,11 +2064,8 @@ impl CommandSender {
             "payload": payload,
             "issuedAt": now_ms(),
         });
-        // F2：`delivery` 已被 `classify_send_ack` 校验（`startNow|queue|guide` 三值之一），
-        // 但**本轮不扩 `ActionReceipt`**（施工单最小方案），故此处**有意丢弃**。
-        // 手机端改由**新鲜队列**旁证投递结论（`src/mobile/zcode-send-delivery.ts`）：
-        // 出现与本次发送一致的新队列项 ⇒「已排队」，否则 ⇒ 中立的「已受理」。
-        let (state, reason_code, _delivery) = match self
+        // 完整 ACK 校验通过后才持久化宿主的实际投递结论。
+        let (state, reason_code, delivery) = match self
             .bridge
             .call(
                 target,
@@ -2001,6 +2090,10 @@ impl CommandSender {
             generation: target.generation,
             state,
             reason_code,
+            send_admission: delivery.map(|delivery| SendAdmission {
+                delivery,
+                input_id: command_id,
+            }),
         }
     }
 }
@@ -2419,6 +2512,7 @@ mod tests {
             generation: GEN,
             state: ActionState::Unknown,
             reason_code: Some(codes::OFFLINE.into()),
+            send_admission: None,
         };
         sender.actions.record_result(&unknown).unwrap();
 
@@ -5429,6 +5523,7 @@ mod tests {
     /// 在跑」时显式请求入队；判据不成立一律不带（交回宿主默认 startNow）。
     mod send_delivery {
         use super::*;
+        use crate::services::zcode_control::types::CapabilityPolicy;
 
         use crate::services::zcode_control::types::{
             ActiveWork, CapabilityView, ControlView, QueueView, SessionView,
@@ -5510,6 +5605,86 @@ mod tests {
                 queue: QueueView::default(),
                 input_routing: None,
             }
+        }
+
+        #[tokio::test]
+        async fn prepared_dispatch_replays_and_rejects_changed_frozen_text() {
+            let store = DeviceStore::memory();
+            let fake = FakeBridge::new(Reply::Body(accepted_body()));
+            let sessions = FakeSessions::new(Ok(view(Some(control(vec![])), true)));
+            let sender = sender(&fake, &store)
+                .with_stop(sessions)
+                .with_capabilities(CapabilityPolicy::verified_fixture());
+            let first = freeze_send_text("Phone", "hello", true).unwrap();
+            let receipt = sender
+                .execute_prepared_send(&ctx("frozen"), &target(), &first, None)
+                .await
+                .unwrap();
+            assert_eq!(
+                receipt.send_admission.as_ref().unwrap().delivery,
+                SendDelivery::StartNow
+            );
+            assert_eq!(fake.envelope(0)["payload"]["text"], first.wire_text());
+            assert_eq!(fake.envelope(0)["payload"]["requestedDelivery"], "startNow");
+            assert_eq!(
+                sender
+                    .execute_prepared_send(&ctx("frozen"), &target(), &first, None)
+                    .await
+                    .unwrap(),
+                receipt
+            );
+            let changed = freeze_send_text("Phone", "other", true).unwrap();
+            assert!(sender
+                .execute_prepared_send(&ctx("frozen"), &target(), &changed, None)
+                .await
+                .is_err());
+            assert_eq!(fake.wire(), 1);
+        }
+
+        #[tokio::test]
+        async fn prepared_send_requires_fresh_idle_and_enabled_capability() {
+            let store = DeviceStore::memory();
+            let fake = FakeBridge::new(Reply::Body(accepted_body()));
+            let prepared = freeze_send_text("Phone", "hello", true).unwrap();
+            let busy = FakeSessions::running();
+            let busy_sender = sender(&fake, &store)
+                .with_stop(busy)
+                .with_capabilities(CapabilityPolicy::verified_fixture());
+            assert!(busy_sender
+                .execute_prepared_send(&ctx("busy"), &target(), &prepared, None)
+                .await
+                .is_err());
+            let unavailable =
+                sender(&fake, &store).with_capabilities(CapabilityPolicy::verified_fixture());
+            assert!(unavailable
+                .execute_prepared_send(&ctx("unavailable"), &target(), &prepared, None)
+                .await
+                .is_err());
+            let idle = FakeSessions::new(Ok(view(Some(control(vec![])), true)));
+            let disabled = sender(&fake, &store).with_stop(idle);
+            assert!(disabled
+                .execute_prepared_send(&ctx("disabled"), &target(), &prepared, None)
+                .await
+                .is_err());
+            assert_eq!(fake.wire(), 0);
+            assert_eq!(row_count(&store), 0);
+        }
+
+        #[tokio::test]
+        async fn prepared_storage_failure_never_dispatches() {
+            let store = DeviceStore::memory();
+            store.with(|c| c.execute_batch("DROP TABLE write_audit").unwrap());
+            let fake = FakeBridge::new(Reply::Body(accepted_body()));
+            let sessions = FakeSessions::new(Ok(view(Some(control(vec![])), true)));
+            let sender = sender(&fake, &store)
+                .with_stop(sessions)
+                .with_capabilities(CapabilityPolicy::verified_fixture());
+            let first = freeze_send_text("Phone", "hello", true).unwrap();
+            assert!(sender
+                .execute_prepared_send(&ctx("failed"), &target(), &first, None)
+                .await
+                .is_err());
+            assert_eq!(fake.wire(), 0);
         }
 
         /// 出站信封里的 `payload.requestedDelivery`（缺席 = `None`）。
@@ -6023,7 +6198,7 @@ mod tests {
 
         /// 集成：`dispatch_send` 必须走专用分类——status=accepted 但缺受理对象 → unknown。
         #[tokio::test]
-        async fn send_accepted_without_input_accepted_is_unknown() {
+        async fn bare_accepted_stays_unknown() {
             let store = DeviceStore::memory();
             let fake = FakeBridge::new(Reply::Body(serde_json::json!({ "status": "accepted" })));
             let sender = sender(&fake, &store);
@@ -6037,6 +6212,14 @@ mod tests {
             assert_eq!(receipt.reason_code.as_deref(), Some(codes::UNKNOWN));
             assert_eq!(fake.frames().len(), 1, "仍恰一帧（写已发出，不重试）");
         }
+    }
+
+    #[test]
+    fn prepared_send_freezes_signature_once() {
+        let prepared = freeze_send_text("Phone", "hello", true).unwrap();
+        assert_eq!(prepared.wire_text().matches("[mobile ").count(), 1);
+        let restored = PreparedSend::from_stored(prepared.wire_text().to_owned()).unwrap();
+        assert_eq!(restored.wire_text(), prepared.wire_text());
     }
 
     // ============================================================

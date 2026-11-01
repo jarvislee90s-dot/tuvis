@@ -67,6 +67,7 @@ struct ActionRow {
     reason_code: Option<String>,
     /// 审计摘要（类别 + 计数，无正文）：终态审计沿用同一条。
     summary: String,
+    send_admission: Option<super::types::SendAdmission>,
 }
 
 impl ActionRow {
@@ -77,6 +78,7 @@ impl ActionRow {
             generation: self.generation,
             state: self.state,
             reason_code: self.reason_code.clone(),
+            send_admission: self.send_admission.clone(),
         }
     }
 }
@@ -281,7 +283,7 @@ pub fn audit_summary(kind: &str, params: &Value) -> String {
 // ============================================================
 
 const SELECT_COLS: &str = "action_id, device_id, device_name, session_id, generation, kind, \
-     payload_hash, state, reason_code, summary";
+     payload_hash, state, reason_code, summary, send_admission";
 
 fn row_of(row: &rusqlite::Row<'_>) -> rusqlite::Result<ActionRow> {
     let db_state: String = row.get(7)?;
@@ -299,6 +301,9 @@ fn row_of(row: &rusqlite::Row<'_>) -> rusqlite::Result<ActionRow> {
         db_state,
         reason_code: row.get(8)?,
         summary: row.get(9)?,
+        send_admission: row
+            .get::<_, Option<String>>(10)?
+            .and_then(|v| serde_json::from_str(&v).ok()),
     })
 }
 
@@ -319,6 +324,19 @@ impl ActionStore {
     /// 包装存储（不执行恢复：`zcode_actions` 的保守态在预留时即写入，重启无迁移动作）。
     pub fn new(store: DeviceStore) -> Self {
         Self { store }
+    }
+
+    pub fn receipt_for_device(
+        &self,
+        action_id: &str,
+        device_id: &str,
+    ) -> ZResult<Option<ActionReceipt>> {
+        self.store.with(|conn| {
+            Ok(get_row(conn, action_id)
+                .map_err(db_err)?
+                .filter(|row| row.device_id == device_id)
+                .map(|row| row.receipt()))
+        })
     }
 
     /// 只读幂等命中（**不写行、不写审计**）：在授权/映射等本地校验之前调用。
@@ -494,7 +512,7 @@ impl ActionStore {
             };
             let changed = tx
                 .execute(
-                    "UPDATE zcode_actions SET state = ?2, reason_code = ?3, updated_at = ?4
+                    "UPDATE zcode_actions SET state = ?2, reason_code = ?3, updated_at = ?4, send_admission = COALESCE(?8, send_admission)
                      WHERE action_id = ?1 AND session_id = ?5 AND generation = ?6 AND state = ?7",
                     params![
                         receipt.action_id,
@@ -503,7 +521,8 @@ impl ActionStore {
                         now,
                         receipt.session_id,
                         receipt.generation as i64,
-                        expected
+                        expected,
+                        receipt.send_admission.as_ref().map(serde_json::to_string).transpose().map_err(|_| storage_failed())?
                     ],
                 )
                 .map_err(db_err)?;
@@ -592,6 +611,7 @@ mod tests {
             generation: GEN,
             state,
             reason_code: reason.map(str::to_string),
+            send_admission: None,
         }
     }
 
@@ -615,6 +635,74 @@ mod tests {
             )
             .unwrap()
         })
+    }
+
+    #[test]
+    fn admission_survives_db_reopen_and_replay() {
+        use crate::services::zcode_control::types::{SendAdmission, SendDelivery};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.db");
+        let open = || {
+            let c = Connection::open(&path).unwrap();
+            schema::init(&c);
+            crate::database::migration::migrate(&c).unwrap();
+            DeviceStore::Owned(std::sync::Arc::new(std::sync::Mutex::new(c)))
+        };
+        let first = {
+            let actions = ActionStore::new(open());
+            actions
+                .reserve(&ctx("id", "owner"), &target(), "hash", "send chars=2")
+                .unwrap();
+            let mut first = receipt("id", ActionState::Accepted, None);
+            first.send_admission = Some(SendAdmission {
+                delivery: SendDelivery::Queue,
+                input_id: "synthetic-id".into(),
+            });
+            actions.record_result(&first).unwrap();
+            first
+        };
+        let reopened = ActionStore::new(open());
+        assert_eq!(
+            reopened
+                .receipt_for_device("id", "owner")
+                .unwrap()
+                .unwrap()
+                .send_admission,
+            first.send_admission
+        );
+        assert_eq!(
+            reopened
+                .existing_receipt(&ctx("id", "owner"), &target(), "send", "hash")
+                .unwrap()
+                .unwrap(),
+            first
+        );
+        assert!(reopened
+            .receipt_for_device("id", "other")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn old_action_row_has_no_admission() {
+        let store = DeviceStore::memory();
+        store.with(|conn| {
+            conn.execute_batch("ALTER TABLE zcode_actions DROP COLUMN send_admission;").unwrap();
+            conn.execute("INSERT INTO zcode_actions (action_id, device_id, device_name, session_id, generation, kind, payload_hash, state, summary, created_at, updated_at) VALUES ('old', 'dev-1', 'Phone', ?1, ?2, 'send', 'hash', 'accepted', 'send chars=2', 1, 1)", params![SESSION, GEN as i64]).unwrap();
+            crate::database::migration::migrate(conn).unwrap();
+            crate::database::migration::migrate(conn).unwrap();
+        });
+        let actions = ActionStore::new(store);
+        assert!(actions
+            .receipt_for_device("old", "dev-1")
+            .unwrap()
+            .unwrap()
+            .send_admission
+            .is_none());
+        assert!(actions
+            .receipt_for_device("old", "dev-2")
+            .unwrap()
+            .is_none());
     }
 
     /// 首次预留：`reserved` 行（对外映射 unknown）+ started 审计同事务落库。
@@ -1401,6 +1489,7 @@ mod tests {
                 "payload_hash",
                 "state",
                 "reason_code",
+                "send_admission",
                 "summary",
                 "created_at",
                 "updated_at",
