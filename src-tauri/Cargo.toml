@@ -69,13 +69,13 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order", "raw_value"] }
 # 0.33+ 移除了 RefreshKind::new()/ProcessRefreshKind::new()（改用 nothing()），
 # 0.32 没有 nothing()，故代码迁移必须与本次 bump 同批（见 PR 说明）。
-sysinfo = "0.39"
+sysinfo = "0.40"
 dirs = "7.0"
 log = "0.4"
 env_logger = "0.11"
 chrono = { version = "0.4", features = ["serde"] }
 once_cell = "1.19"
-rusqlite = { version = "0.40", features = ["bundled"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
 dashmap = "6"
 tokio = { version = "1", features = ["full"] }
 fs2 = "0.4"
@@ -91,7 +91,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 # M4 T1d：cloudflared 下载完整性校验（固定版本 + release 页 SHA256 表比对；
 # 0.10 本就存在于依赖树，升直依不新增传递项）
 sha2 = "0.11"
-zip = "8"
+zip = "9"
 # dsh 会话日志为多帧拼接的 zstd 容器（M0 F1），解码用
 zstd = "0.14"
 tauri-plugin-dialog = "2"
@@ -115,7 +115,7 @@ wait-timeout = "0.2"
 # `SourceTz::Named` 的生产消费点清零 ⇒ 依赖与变体一并删除（回到「新增依赖仅 base64」）。
 # 契约 §3 的 export_save_bytes 以 base64 字符串收 PNG（GC 13 允许的第二项新依赖）：
 # 上游 rust-lang 维护、零传递依赖；宽松解码（data URL 前缀 / 折行）由本仓包一层
-base64 = "0.22"
+base64 = "0.23"
 
 [target.'cfg(windows)'.dependencies]
 junction = "2.1"
@@ -125,7 +125,7 @@ junction = "2.1"
 # Win32_UI_WindowsAndMessaging：win32（窗口枚举）/ tuvis-marker（跳转 marker）/
 # deep_link（深链）
 windows = { version = "0.62", features = ["Win32_Security", "Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Accessibility", "Win32_UI_Shell", "Win32_System_Com", "Win32_System_Threading", "Win32_System_Console", "Win32_Storage_FileSystem", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Power", "Win32_System_Registry", "Win32_NetworkManagement_IpHelper", "Win32_Networking_WinSock", "Win32_System_JobObjects", "Win32_System_Pipes"] }
-winreg = "0.55"
+winreg = "0.56"
 
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 tauri-plugin-single-instance = "2"
