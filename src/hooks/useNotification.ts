@@ -47,8 +47,9 @@ function statusToColor(status: string): string {
   }
 }
 
-// 首见未读卡补发通知的新鲜度门控（review F5）：重启/补偿场景下，转绿时间
-// （lastActivityAt）距今超过 2 分钟的老卡静默显示，不重放历史通知。
+// 首见未读卡补发通知的新鲜度门控（review F5）：重启/补偿场景下，未读池的
+// turnedGreenAt 距今超过 2 分钟的老卡静默显示，不重放历史通知。
+// 不能再用 lastActivityAt：DB-only 卡保留的是业务活动时间，补偿完成时可能已很旧。
 // 时间无法解析（空串/异常）时保守静默
 export const FIRST_SEEN_UNREAD_FRESH_MS = 2 * 60 * 1000;
 
@@ -64,13 +65,17 @@ export const GREEN_STABLE_MS = 3000;
 // 都会弹浮窗/响铃——按方向分存记账（交替抖动的两个边各自压 60s），红/waiting 豁免
 
 export function isFreshFirstSeenUnread(
-  session: Pick<Session, "unread" | "status" | "lastActivityAt">,
+  session: Pick<Session, "unread" | "status" | "lastActivityAt" | "unreadTurnedGreenAtMs">,
   nowMs: number = Date.now()
 ): boolean {
   if (!session.unread || statusToColor(session.status) !== "green") {
     return false;
   }
-  const greenAt = Date.parse(session.lastActivityAt);
+  const greenAt =
+    typeof session.unreadTurnedGreenAtMs === "number" &&
+    Number.isFinite(session.unreadTurnedGreenAtMs)
+      ? session.unreadTurnedGreenAtMs
+      : Date.parse(session.lastActivityAt);
   if (Number.isNaN(greenAt)) {
     return false;
   }

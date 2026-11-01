@@ -321,6 +321,7 @@ fn codex_app_session(id: &str) -> Session {
         form: ProcessForm::App,
         jump_supported: false,
         unread: false,
+        unread_turned_green_at_ms: None,
     }
 }
 

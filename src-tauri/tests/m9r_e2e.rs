@@ -1021,6 +1021,7 @@ async fn e2e_http_full_chain() {
         form: multi_agents_manager_lib::session::ProcessForm::Cli,
         jump_supported: false,
         unread: false,
+        unread_turned_green_at_ms: None,
     };
     let sessions = vec![session];
     let total = sessions.len();

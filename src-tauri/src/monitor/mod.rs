@@ -78,6 +78,7 @@ mod dismissed_filter_tests {
             form,
             jump_supported: true,
             unread: false,
+            unread_turned_green_at_ms: None,
         }
     }
 

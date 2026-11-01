@@ -318,6 +318,7 @@ fn parse_claude_jsonl(
         form: process.form,
         jump_supported: jump_supported_for(process.form),
         unread: false, // 扫描出的活跃卡默认非未读；未读卡由 adapter 层合并
+        unread_turned_green_at_ms: None,
         title: Some(session_title),
     })
 }

@@ -305,6 +305,7 @@ fn scan_sessions(
                             form: ProcessForm::App,
                             jump_supported: crate::session::jump_supported_for(ProcessForm::App),
                             unread: false,
+                            unread_turned_green_at_ms: None,
                         },
                     ));
                     continue;
@@ -370,6 +371,7 @@ fn scan_sessions(
                     // 管线（W4）统一标记/清除——绿卡「池行在⇒未读、已读删行⇒P1-3 剔除」，
                     // 与 codex/zcode 数据驱动绿卡同一套出现周期
                     unread: false,
+                    unread_turned_green_at_ms: None,
                 },
             ));
         }
@@ -799,6 +801,7 @@ mod integration_tests {
             form: ProcessForm::App,
             jump_supported: true,
             unread: false,
+            unread_turned_green_at_ms: None,
         };
         let cards = vec![(100, mk("old")), (300, mk("new")), (200, mk("mid"))];
         let out = take_recent(cards, 2);

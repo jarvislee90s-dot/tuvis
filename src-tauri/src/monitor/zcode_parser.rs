@@ -535,6 +535,7 @@ fn build_one_session(
         form: ProcessForm::App,
         jump_supported: jump_supported_for(ProcessForm::App),
         unread: false, // 未读态由 adapter 层未读池管线统一标记
+        unread_turned_green_at_ms: None,
     })
 }
 
