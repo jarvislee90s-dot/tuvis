@@ -632,6 +632,70 @@ pub fn is_online(registry_hit: bool, last_seen_at: i64, now: i64) -> bool {
     registry_hit || now - last_seen_at < 30_000
 }
 
+/// 最近一次**已认证** API 请求时刻：进程内持续时间使用 Instant，系统墙钟调整不改变在线 TTL。
+static LAST_API_AT: Lazy<Mutex<Option<std::time::Instant>>> = Lazy::new(|| Mutex::new(None));
+const API_ONLINE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// API 在线边沿内核。锁内判断并续期，锁外只在离线→在线时执行一次唤醒。
+fn note_api_request_at(
+    last_api_at: &Mutex<Option<std::time::Instant>>,
+    sse: bool,
+    now: std::time::Instant,
+    on_rising_edge: impl FnOnce(),
+) -> bool {
+    let became_online = {
+        let mut last = last_api_at.lock().unwrap_or_else(|e| e.into_inner());
+        let now = match *last {
+            Some(previous) if previous > now => previous,
+            _ => now,
+        };
+        let was_online = online_from(sse, *last, now);
+        *last = Some(now);
+        !was_online
+    };
+    if became_online {
+        on_rising_edge();
+    }
+    became_online
+}
+
+/// API 请求心跳（**唯一调用点**：`remote/gate.rs` 过闸成功、转发之前——只记已认证
+/// 请求；未认证的端口扫描 / 未知路径不得把扫描节奏升档）。离线→在线时立即请求一次 Action；
+/// 后续在线窗口内的请求只续期，不重复补扫。
+pub fn note_api_request() {
+    note_api_request_at(
+        &LAST_API_AT,
+        crate::remote::server::any_connection(),
+        std::time::Instant::now(),
+        || {
+            crate::adapter::scan_bus::request_scan(crate::adapter::scan_bus::ScanReason::Action);
+        },
+    );
+}
+
+/// 在线窗口判定（纯函数）：任一 SSE 连接在场，或最近 60s 有已认证 API 请求。
+fn online_from(
+    sse: bool,
+    last_api_at: Option<std::time::Instant>,
+    now: std::time::Instant,
+) -> bool {
+    sse || last_api_at.is_some_and(|last| now.saturating_duration_since(last) < API_ONLINE_TTL)
+}
+
+/// 扫描节奏用「远控在线」口径：任一 SSE 连接在场，或最近 60s 有 API 请求。
+/// 消费方是扫描总线线程（remote_online）——**刻意不碰 `STATE`**：该单例的惰性初始化会
+/// 装配 DeviceStore / CodexControlHub / CreateTaskHub（Windows 上含 sysinfo 枚举 +
+/// AppxManifest 读盘），既不该发生在扫描线程上，且初始化一旦 panic 会永久污染 Lazy
+/// （此后本函数每次调用都 panic）。SSE 在场判据改读 `server.rs` 的独立原子计数
+/// （[`crate::remote::server::any_connection`]），与注册表增删严格配对
+pub fn is_online_now() -> bool {
+    online_from(
+        crate::remote::server::any_connection(),
+        *LAST_API_AT.lock().unwrap_or_else(|e| e.into_inner()),
+        std::time::Instant::now(),
+    )
+}
+
 /// 16 字节随机 hex（设备 id 生成器，M5 A3 起 /pair/pin 落行消费）：零参随机形态，
 /// 不可位置式（生成器消费后复用会让不同设备撞行）
 fn random_hex_16() -> String {
@@ -655,23 +719,72 @@ use std::sync::Mutex;
 static SERVER_HANDLE: Lazy<Mutex<Option<tauri::async_runtime::JoinHandle<()>>>> =
     Lazy::new(|| Mutex::new(None));
 
+/// C7 配对计数缓存条目：上一轮全进程扫描完成时刻（TTL 判定）+ 运行进程 (工具, 项目) 表。
+/// 用命名结构而非嵌套元组：静态量类型过深会触 `clippy::type_complexity`，且字段语义自解释。
+#[cfg(windows)]
+struct PairingProjectsCache {
+    at: std::time::Instant,
+    projects: Vec<(String, String)>,
+}
+
+/// C7 配对计数缓存（进程级，仅 Windows 有生产实现）：`System::new_all()` 全进程刷新是
+/// 重活，而 /sessions 3s 轮询 + SSE 接入都会消费本表，逐请求全刷会持续拖慢远程面。
+/// 10s TTL 内复用上一轮结果——配对歧义判据只需「粗粒度一致」，进程表在 10s 内的微变
+/// 不影响「同键 ≥2」结论（迟滞上限 10s，如实接受）。放在 STATE 之外：`#[cfg(not(windows))]`
+/// 下不定义静态量，不留 dead_code。
+#[cfg(windows)]
+static PAIRING_PROJECTS_CACHE: Lazy<Mutex<Option<PairingProjectsCache>>> =
+    Lazy::new(|| Mutex::new(None));
+
 /// 共享状态单例：服务器任务与 tauri 命令共用同一份 pairing / 会话源 / 设备存储
 static STATE: Lazy<std::sync::Arc<server::RemoteState>> = Lazy::new(|| {
     std::sync::Arc::new(server::RemoteState {
         // 远程端外观配置读源（2026-10-05 UI 改版）：生产 = settings KV 单行 JSON
         //（桌面外观配置器经 set_setting 命令写入）；未配置 → None → 端点回落默认值
         ui_config_source: Box::new(|| crate::database::get_setting("remote_ui_config")),
-        // P8 数据同源：直调唯一聚合口（R3 单飞护栏保护第三消费者），禁止复制聚合逻辑
-        session_source: Box::new(crate::adapter::get_all_sessions),
+        // P8 数据同源：显示路径读扫描总线的成功快照（初始化首扫未发布时等待；之后不触发
+        // 补扫，陈旧上限 = 档位）
+        session_source: Box::new(crate::adapter::scan_bus::current_or_scan),
+        // 动作路径专用：保证快照新鲜——龄超 2s 补扫并等待（上限 3s）；超时按现有
+        // 快照降级继续并告警（F3 degraded 标记：本任务只落日志，API 契约留待后续）
+        fresh_session_source: Box::new(|| {
+            let snap = crate::adapter::scan_bus::ensure_fresh(
+                std::time::Duration::from_secs(2),
+                std::time::Duration::from_secs(3),
+            );
+            if snap.scanned_at.elapsed() > std::time::Duration::from_secs(2) {
+                log::warn!(
+                    "remote: 动作路径快照补扫超时（龄 {:?}），按 degraded 继续",
+                    snap.scanned_at.elapsed()
+                );
+            }
+            snap.data.clone()
+        }),
         // C7 配对不确定信号缝（spec §5）：运行进程 (工具, 项目) 表 = sysinfo 全量
         // 快照 + 桌面跳转门同款收集函数（同一实现单点，桌面门零改动）。非 Windows
         // 无该收集实现（桌面配对不确定门本就仅 Windows 消费）→ 空表 = 不宣称歧义
         // （诚实缺省）。端点层据本表计同键 ≥2 判 pairingAmbiguous/pairingHint。
+        // 限频：10s 内复用缓存（见 PAIRING_PROJECTS_CACHE）——首调扫描，之后窗口内
+        // 直接克隆上轮结果；窗口外重扫。
         pairing_counter: Box::new(|| {
             #[cfg(windows)]
             {
+                let mut g = PAIRING_PROJECTS_CACHE
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                if let Some(cached) = g.as_ref() {
+                    if cached.at.elapsed() < std::time::Duration::from_secs(10) {
+                        return cached.projects.clone();
+                    }
+                }
+                // 持锁扫描：并发调用在此排队，拿到的仍是同一次扫描结果（不重复全刷）
                 let system = sysinfo::System::new_all();
-                crate::commands::session::running_projects_from_processes(&system)
+                let projects = crate::commands::session::running_projects_from_processes(&system);
+                *g = Some(PairingProjectsCache {
+                    at: std::time::Instant::now(),
+                    projects: projects.clone(),
+                });
+                projects
             }
             #[cfg(not(windows))]
             {
@@ -2282,6 +2395,159 @@ pub fn restore_on_launch() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 远控在线窗口的边界数学（纯函数，零全局态）：SSE 在场恒真；API 心跳的窗口
+    /// 是**严格小于** 60s——59_999ms 仍在线，整 60_000ms 已离线（扫描节奏据此降档）
+    #[test]
+    fn online_from_window_boundaries() {
+        let now = std::time::Instant::now();
+        assert!(
+            online_from(true, None, now),
+            "SSE 在场 → 在线（与心跳无关）"
+        );
+        assert!(
+            online_from(
+                false,
+                Some(now),
+                now + std::time::Duration::from_millis(59_999)
+            ),
+            "心跳 59_999ms 前 → 窗口内"
+        );
+        assert!(
+            !online_from(
+                false,
+                Some(now),
+                now + std::time::Duration::from_millis(60_000)
+            ),
+            "心跳整 60_000ms 前 → 出窗（严格小于）"
+        );
+        assert!(!online_from(false, None, now), "从未有已认证请求 → 不在线");
+    }
+
+    #[test]
+    fn note_api_request_wakes_scan_bus_once_per_online_edge() {
+        let _scan_guard = crate::adapter::scan_bus::test_guard();
+        crate::adapter::scan_bus::reset_for_test();
+        let (tx, rx) = std::sync::mpsc::channel();
+        crate::adapter::scan_bus::set_test_tx_for_test(Some(tx));
+        let last = std::sync::Mutex::new(None);
+        let start = std::time::Instant::now();
+        let wakes = std::sync::atomic::AtomicUsize::new(0);
+        let request = |at| {
+            note_api_request_at(&last, false, at, || {
+                wakes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                crate::adapter::scan_bus::request_scan(
+                    crate::adapter::scan_bus::ScanReason::Action,
+                );
+            })
+        };
+
+        assert!(request(start), "离线后的首个 REST 请求必须触发上升沿");
+        assert!(matches!(
+            rx.recv_timeout(std::time::Duration::from_millis(100)),
+            Ok(crate::adapter::scan_bus::ScanReason::Action)
+        ));
+        assert!(
+            online_from(
+                false,
+                *last.lock().unwrap_or_else(|e| e.into_inner()),
+                start
+            ),
+            "Action 唤醒后的在线信号必须立即可被 Scan Bus 读取"
+        );
+        let mut cadence = crate::adapter::cadence::Cadence::new(std::time::Duration::ZERO);
+        let away = crate::adapter::cadence::Signals::default();
+        cadence.observe(away, std::time::Duration::ZERO);
+        cadence.observe(away, std::time::Duration::from_secs(10));
+        assert_eq!(cadence.mode(), crate::adapter::cadence::Mode::Away);
+        let online = crate::adapter::cadence::Signals {
+            remote_online: online_from(
+                false,
+                *last.lock().unwrap_or_else(|e| e.into_inner()),
+                start,
+            ),
+            ..away
+        };
+        assert_eq!(
+            cadence.observe(online, std::time::Duration::from_secs(11)),
+            Some(crate::adapter::cadence::Mode::Idle),
+            "首次 REST 在线信号必须立即把 cadence 升到 Idle"
+        );
+        assert!(!request(start + std::time::Duration::from_secs(20)));
+        assert!(!request(start + std::time::Duration::from_millis(59_999)));
+        assert!(rx.try_recv().is_err(), "在线窗口内的连续请求不得重复补扫");
+        assert!(request(start + std::time::Duration::from_secs(120)));
+        assert!(matches!(
+            rx.recv_timeout(std::time::Duration::from_millis(100)),
+            Ok(crate::adapter::scan_bus::ScanReason::Action)
+        ));
+        assert_eq!(wakes.load(std::sync::atomic::Ordering::SeqCst), 2);
+        crate::adapter::scan_bus::set_test_tx_for_test(None);
+    }
+
+    #[test]
+    fn concurrent_api_requests_emit_one_rising_edge() {
+        let last = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let wakes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let workers: Vec<_> = (0..2)
+            .map(|_| {
+                let last = last.clone();
+                let wakes = wakes.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    note_api_request_at(&last, false, std::time::Instant::now(), || {
+                        wakes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    });
+                })
+            })
+            .collect();
+        barrier.wait();
+        for worker in workers {
+            worker.join().expect("API request worker must not panic");
+        }
+        assert_eq!(wakes.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn api_online_clock_uses_monotonic_instant_not_wall_time() {
+        let src = include_str!("mod.rs");
+        let start = src.find("pub fn note_api_request()").unwrap();
+        let end = src[start..].find("\n}\n").unwrap() + start + 2;
+        let note_body = &src[start..end];
+        assert!(note_body.contains("note_api_request_at"));
+        assert!(note_body.contains("Instant::now()"));
+        assert!(note_body.contains("scan_bus::request_scan"));
+        assert!(note_body.contains("ScanReason::Action"));
+        assert!(!note_body.contains("Utc::now"));
+
+        let start = src.find("pub fn is_online_now()").unwrap();
+        let end = src[start..].find("\n}\n").unwrap() + start + 2;
+        let online_body = &src[start..end];
+        assert!(online_body.contains("LAST_API_AT"));
+        assert!(online_body.contains("Instant::now()"));
+        assert!(!online_body.contains("Utc::now"));
+    }
+
+    #[test]
+    fn api_heartbeat_remains_inside_authenticated_gate() {
+        let src = include_str!("gate.rs");
+        let gate_start = src.find("pub async fn gate(").expect("缺少 remote gate");
+        let gate = &src[gate_start..];
+        let success = gate.find("if ok {").expect("缺少认证成功分支");
+        let note = gate
+            .find("crate::remote::note_api_request();")
+            .expect("认证 gate 必须记录 API 心跳");
+        let failure = gate[note..]
+            .find("} else {")
+            .map(|offset| note + offset)
+            .expect("缺少认证失败分支");
+        assert!(
+            success < note && note < failure,
+            "未认证请求不得续期在线 TTL"
+        );
+    }
 
     /// 敏感黑名单基准的生产接线探针（M5 P2-a 追记，独立复核暴露的盲区）：
     /// 端点侧有注入缝探针，但生产 `STATE` 的接线本身此前无任何测试压住——

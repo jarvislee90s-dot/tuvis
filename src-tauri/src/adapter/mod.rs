@@ -1,12 +1,16 @@
 // AgentAdapter trait + 枚举 + 会话发现调度器
 // 移植自 agent-sessions agent/mod.rs，扩展支持 Codex CLI/APP 和 OpenCode
 
+pub mod cadence;
 pub mod claude;
 pub mod codex;
 pub mod dsh;
 pub mod kimi;
 pub mod openclaw;
 pub mod opencode;
+pub mod scan_bus;
+pub mod wakeup;
+pub(crate) mod wakeup_coverage;
 pub mod workbuddy;
 pub mod zcode;
 
@@ -16,8 +20,10 @@ use crate::session::{
 };
 use once_cell::sync::Lazy;
 use std::collections::{HashMap, HashSet};
-use std::sync::Mutex;
-use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard};
+use std::time::{Duration, Instant};
+use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
 
 /// 读取 CLI grace period（秒），默认 5
 fn get_cli_grace_secs() -> i64 {
@@ -986,7 +992,7 @@ pub trait AgentAdapter: Send + Sync {
 
     /// 解析该工具的会话。**会话扫描预算契约**（详见 `monitor::session_scan` 模块文档
     /// 与 AGENTS.md「Agent Adapter 模式」）：
-    /// - L1 零进程零解析：编排层（`get_all_sessions`）保证本工具进程为空时**不会调用**
+    /// - L1 零进程零解析：编排层（`scan_bus` 的每轮扫描）保证本工具进程为空时**不会调用**
     ///   本方法，且有遍历全部注册 adapter 的防回归测试；实现侧仍应自带空判早退作
     ///   纵深防御；
     /// - L2/L3 文件类解析必须走 `monitor::session_scan::SessionFileScan`
@@ -1107,20 +1113,64 @@ pub fn all_adapters_with_ids() -> Vec<(&'static str, Box<dyn AgentAdapter>)> {
 /// 共享 System 实例 — 每轮询周期刷新一次，所有 adapter 共用
 static SHARED_SYSTEM: Mutex<Option<System>> = Mutex::new(None);
 
-/// get_all_sessions 单飞护栏（评审 R3）：主窗口与桌宠各自 3s 轮询，相位接近时
-/// 两请求并发进入同一段多秒扫描——堆叠放大 CPU/IO 峰值。try_lock 抢扫描权，
-/// 抢不到的请求立即返回最近一次快照（0=尚无快照时返回空响应，首窗口可接受）。
-/// 扫描完成时刷新快照。不做去抖定时器，保持"谁抢到谁全量扫"的最简单飞语义
-struct ScanFlight {
-    /// 扫描进行中标志（try_lock 竞争点）
-    in_flight: std::sync::Mutex<bool>,
-    /// 最近一次完整扫描结果（快照返回用；含时间戳便于日志诊断陈旧度）
-    last_snapshot: std::sync::Mutex<Option<(std::time::Instant, SessionsResponse)>>,
+/// 获取共享进程快照锁。锁内 panic 后旧 System 可能已不一致，丢弃并清除 poison，
+/// 让下一轮通过 `get_or_insert_with(System::new)` 重建，而不是每轮持续 panic。
+fn lock_shared_system(lock: &Mutex<Option<System>>) -> MutexGuard<'_, Option<System>> {
+    match lock.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            let mut guard = poisoned.into_inner();
+            *guard = None;
+            lock.clear_poison();
+            log::error!("adapter: 共享 System 锁已污染，丢弃旧状态并重建");
+            guard
+        }
+    }
 }
-static SCAN_FLIGHT: Lazy<ScanFlight> = Lazy::new(|| ScanFlight {
-    in_flight: std::sync::Mutex::new(false),
-    last_snapshot: std::sync::Mutex::new(None),
-});
+
+/// 最近一轮「进程刷新段」耗时（毫秒）：扫描总线把它写入 scan_bus_stats.json，
+/// 作为 F8（≤25ms）验收的数据源（R4）
+static LAST_PROCESS_REFRESH_MS: AtomicU64 = AtomicU64::new(0);
+
+/// 卡面 CPU 是展示值，低频采样；OpenClaw 的状态判定另走逐扫描刷新。
+const DISPLAY_CPU_SAMPLE_INTERVAL: Duration = Duration::from_secs(30);
+
+/// 最近一轮扫描中「有进程在跑」的工具 id（升序去重）。
+/// **唯一写入点**是 `get_all_sessions_inner` Phase 1：记录 `find_processes` 结果，并
+/// 对 WorkBuddy 合并同一轮共享 `System` 快照中的宿主判定。只复用本轮已刷新的进程事实；
+/// 禁止为「未覆盖工具是否在跑」另起第二套进程刷新器（2026-10-31 用户裁决）。
+static RUNNING_TOOL_IDS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// 最近一轮在跑工具 id（升序去重；未扫描时为空）
+pub(crate) fn running_tool_ids() -> Vec<String> {
+    RUNNING_TOOL_IDS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
+/// 记录在跑工具（调用方只传工具 id；排序去重在此统一完成）
+fn record_running_tools<'a>(ids: impl Iterator<Item = &'a str>) {
+    let mut v: Vec<String> = ids.map(str::to_string).collect();
+    v.sort();
+    v.dedup();
+    *RUNNING_TOOL_IDS.lock().unwrap_or_else(|e| e.into_inner()) = v;
+}
+
+/// WorkBuddy 的 adapter 进程集合由新鲜会话心跳驱动；额外并入同轮 System 快照中的
+/// WorkBuddy 宿主事实，避免「应用空闲、无心跳」时把无事件工具误判为未运行。
+fn record_running_tools_with_workbuddy_host<'a>(
+    ids: impl Iterator<Item = &'a str>,
+    workbuddy_host_alive: bool,
+) {
+    let host_id = workbuddy_host_alive.then_some("workbuddy");
+    record_running_tools(ids.chain(host_id));
+}
+
+/// 最近一轮进程刷新耗时（毫秒）
+pub(crate) fn last_process_refresh_ms() -> u64 {
+    LAST_PROCESS_REFRESH_MS.load(Ordering::Relaxed)
+}
 
 /// 会话级去重：同一 (工具, session id) 只保留首张卡。
 /// 全局防线：任何解析器的"文件级/进程级复制"型 bug（如 opencode 多进程同会话、
@@ -1130,43 +1180,11 @@ pub fn dedup_sessions(sessions: &mut Vec<Session>) {
     sessions.retain(|s| seen.insert((s.agent_type.tool_id().to_string(), s.id.clone())));
 }
 
-/// 获取所有注册 adapter 的会话（单飞：并发请求直接复用最近快照）
+/// 兼容入口：委托扫描总线读共享快照（冷启动无快照时同步首扫）。
+/// 生产路径已统一走 `scan_bus`（单飞/版本/看门狗都在那里）；保留本函数给
+/// 集成测试与外部调用方，**不得**在此另起第二套单飞或快照。
 pub fn get_all_sessions() -> SessionsResponse {
-    // R3 单飞护栏：抢不到扫描权 → 返回上次快照，不排队不堆叠
-    let mut flying = SCAN_FLIGHT.in_flight.lock().unwrap();
-    if *flying {
-        let snap = SCAN_FLIGHT.last_snapshot.lock().unwrap();
-        if let Some((at, resp)) = snap.as_ref() {
-            log::debug!(
-                "get_all_sessions 单飞命中快照（扫描进行中，快照龄 {:?}）",
-                at.elapsed()
-            );
-            return resp.clone();
-        }
-        return SessionsResponse {
-            sessions: Vec::new(),
-            total_count: 0,
-            waiting_count: 0,
-        };
-    }
-    *flying = true;
-    drop(flying); // 先放手上的 in_flight 锁：Drop guard 析构时要重新拿它清位，
-                  // 不 drop 即自锁自等（本测试挂起事故的根因）
-                  // Drop guard：内层扫描 panic（如 DB 锁中毒 unwrap）时飞行位自动释放——
-                  // 若靠扫描返回后手动清位，一次 panic 即永久卡死单飞（看板冻结到重启），
-                  // 且把原失败模式（单次报错下轮重试）恶化成永久故障
-    let _guard = ScanFlightGuard;
-    let result = get_all_sessions_inner();
-    *SCAN_FLIGHT.last_snapshot.lock().unwrap() = Some((std::time::Instant::now(), result.clone()));
-    result
-}
-
-/// 扫描飞行位的 Drop 释放护栏（作用域结束/panic unwind 均自动清位）
-struct ScanFlightGuard;
-impl Drop for ScanFlightGuard {
-    fn drop(&mut self) {
-        *SCAN_FLIGHT.in_flight.lock().unwrap() = false;
-    }
+    crate::adapter::scan_bus::current_or_scan()
 }
 
 /// T8：问题事件的 tool_input 载荷提取（QuestionEntry 写标记时随行落库——questions
@@ -1175,32 +1193,1014 @@ fn event_payload(event: Option<&crate::monitor::hooks::HookEvent>) -> Option<&st
     event.and_then(|e| e.tool_input.as_deref())
 }
 
-/// 实际扫描（单飞壳内执行；成功路径与原实现一致）
-fn get_all_sessions_inner() -> SessionsResponse {
-    // 重启恢复 + 每轮 TTL 清理（有变化才落盘）
-    load_pending_unread_retries();
-    prune_pending_unread_retries(chrono::Utc::now().timestamp_millis());
-    // W5：未勾选工具不参与会话扫描（看板卡/通知随之静默）
-    let adapters: Vec<Box<dyn AgentAdapter>> = enabled_adapters();
+/// 进程名归一：取 basename（兼容 `/`、`\` 两种分隔符）→ 小写 → 去 `.exe`。
+/// sysinfo 各平台 name 形态不一（Windows 实测带 `.exe`，macOS 多为裸名），
+/// 候选匹配与白名单构建统一走此口径，避免大小写/扩展名差异导致漏配
+pub(crate) fn bare_name(name: &str) -> String {
+    let base = name
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(name)
+        .to_lowercase();
+    base.strip_suffix(".exe").unwrap_or(&base).to_string()
+}
 
-    // Phase 1: 刷新共享 System 快照，发现所有进程
-    let all_processes: Vec<Vec<AgentProcess>> = {
-        let mut guard = SHARED_SYSTEM.lock().unwrap();
-        let system = guard.get_or_insert_with(|| {
-            log::debug!("Initializing shared System instance");
-            System::new_with_specifics(
-                RefreshKind::nothing().with_processes(
-                    ProcessRefreshKind::nothing()
-                        .with_cmd(sysinfo::UpdateKind::Always)
-                        .with_cwd(sysinfo::UpdateKind::Always)
-                        // exe 路径是 Windows MSIX 形态判定（classify_form）的关键输入：
-                        // 缺失时 ChatGPT 内嵌 codex.exe 会被误判为 CLI（提权进程 cmd 也读不到）
-                        .with_exe(sysinfo::UpdateKind::Always)
-                        .with_cpu(),
-                ),
-            )
+/// npm-shim 宿主解释器：工具实际进程名常是解释器（node/bun 等），
+/// 两段式第二段必须读其 cmd 才能判定，宿主判定也须放行这些名字
+pub(crate) const INTERPRETER_PROCESS_NAMES: &[&str] = &["node", "bun", "python", "python3", "deno"];
+
+/// 工具 id → 宿主进程名（小写裸名）。**单一事实源**：两段式候选白名单与
+/// `monitor::host::tool_host_alive_in` 的预滤共用本表——表里漏一个名字，
+/// 第二段就不读该进程的 exe/cmd，宿主判不出、该工具整批卡片被过滤。
+/// 条目来源以 `monitor/host.rs::is_host_process` 的现有判据为准：
+/// - workbuddy：Windows 安装形态 WorkBuddy.exe；macOS 主可执行体是 Electron；
+/// - codex：Windows MSIX 桌面端 ChatGPT.exe / macOS chatgpt.app 主进程 / codex.app 主进程；
+/// - zcode：Electron APP 主进程可执行名恰为 ZCode（macOS）/ ZCode.exe（Windows）；
+/// - dsh：桌面宿主 DeepSeek Harness(.exe)；web 宿主是 node（解释器表覆盖，靠 cmdline 判定）。
+pub(crate) const HOST_PROCESS_NAMES: &[(&str, &[&str])] = &[
+    ("workbuddy", &["workbuddy", "electron"]),
+    ("codex", &["chatgpt", "codex"]),
+    ("zcode", &["zcode"]),
+    ("dsh", &["deepseek harness"]),
+];
+
+/// 该工具的宿主进程名表（未登记工具返回空表）
+pub(crate) fn host_process_names(tool_id: &str) -> &'static [&'static str] {
+    HOST_PROCESS_NAMES
+        .iter()
+        .find(|(id, _)| *id == tool_id)
+        .map(|(_, names)| *names)
+        .unwrap_or(&[])
+}
+
+/// 该进程名是否可能承载该工具的宿主：命中宿主名表，或（npm-shim 场景）是解释器
+pub(crate) fn name_may_host_tool(name: &str, tool_id: &str) -> bool {
+    INTERPRETER_PROCESS_NAMES.contains(&name) || host_process_names(tool_id).contains(&name)
+}
+
+/// 扫描候选进程名白名单（全部小写归一、升序去重）。
+///
+/// 两段式进程刷新的第一段只读名字层，第二段仅对候选 PID 读 cmd/cwd/exe/cpu。
+/// 白名单 = 解释器表（npm-shim 宿主）+ **宿主名表**（单一事实源，见
+/// [`HOST_PROCESS_NAMES`]）+ 全部 adapter 声明的 `process_names()`（经 [`bare_name`] 归一）。
+/// 宿主名表与 `monitor::host::tool_host_alive_in` 的预滤同源：这张表漏一个名字，
+/// 第二段就不读该进程的 exe/cmd，宿主判不出、该工具整批卡片被过滤。
+/// 取舍：macOS 上全部 Electron 应用都会进候选集（多读若干进程的 cmd/cwd/exe），
+/// 仍是全部进程的极小子集（约数十个），换取 WorkBuddy 桌面端不被误杀。
+pub(crate) fn candidate_process_names(adapter_names: &[&[&str]]) -> Vec<String> {
+    let mut v: Vec<String> = INTERPRETER_PROCESS_NAMES
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    for (_, host_names) in HOST_PROCESS_NAMES {
+        for n in *host_names {
+            v.push(bare_name(n));
+        }
+    }
+    for names in adapter_names {
+        for n in *names {
+            v.push(bare_name(n));
+        }
+    }
+    v.sort();
+    v.dedup();
+    v
+}
+
+/// Phase 1 两段式刷新的候选白名单（生产入口）。
+///
+/// 刻意取自 **全部已注册 adapter**（`all_adapters()`），而非 `enabled_adapters()`：
+/// 宿主存活判定（`filter_host_dead_cards` / `dead_tools_from_pool` →
+/// `tool_host_alive_in`）复用同一 SHARED_SYSTEM 快照并按 exe/cmd 判宿主——若白名单
+/// 只含已勾选工具，「已禁用但仍在运行」的工具进程在第二段不读 exe/cmd，其宿主会被
+/// 误判死亡，未读池行被清空且重新启用后无法恢复。会话解析（Phase 2）仍只走
+/// `enabled_adapters()`，停用工具的卡/通知保持静默。
+fn refresh_candidate_process_names() -> Vec<String> {
+    let lists: Vec<&[&str]> = all_adapters().iter().map(|a| a.process_names()).collect();
+    candidate_process_names(&lists)
+}
+
+struct CpuRefreshPlan {
+    candidates: Vec<CpuProcessKey>,
+    targets: Vec<CpuProcessKey>,
+    display_due: bool,
+}
+
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
+struct CpuProcessKey {
+    pid: sysinfo::Pid,
+    start_time: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CpuSampleState {
+    last_cpu_time_ms: Option<u64>,
+    last_cpu_sample_at: Option<Instant>,
+    /// Per-process CPU percent computed from that PID's own cumulative-time delta and wall window.
+    cpu_usage: Option<f32>,
+    /// Last validated CPU value published to session cards.
+    display_cpu_usage: Option<f32>,
+}
+
+#[derive(Clone, Default)]
+struct CpuSamplingState {
+    last_display_sample_at: Option<Instant>,
+    processes: HashMap<CpuProcessKey, CpuSampleState>,
+}
+
+static CPU_SAMPLING_STATE: Lazy<Mutex<CpuSamplingState>> =
+    Lazy::new(|| Mutex::new(CpuSamplingState::default()));
+
+fn reset_cpu_sampling_state_if_system_rebuilt(
+    state: &mut CpuSamplingState,
+    system_was_initialized: bool,
+) {
+    if !system_was_initialized {
+        *state = CpuSamplingState::default();
+    }
+}
+
+/// 累计 CPU 毫秒的差值与同一 PID 两次读取间的墙钟时间配对，避免依赖 sysinfo
+/// 首次刷新时尚未建立的差分基线，也避免 macOS 共享 System 刷新时钟导致分母错窗。
+fn cpu_usage_from_delta(
+    previous_cpu_time_ms: u64,
+    previous_at: Instant,
+    current_cpu_time_ms: u64,
+    current_at: Instant,
+) -> Option<f32> {
+    let elapsed_ms = current_at
+        .saturating_duration_since(previous_at)
+        .as_secs_f64()
+        * 1000.0;
+    if elapsed_ms <= 0.0 {
+        return None;
+    }
+    let cpu_delta_ms = current_cpu_time_ms.checked_sub(previous_cpu_time_ms)? as f64;
+    let usage = (cpu_delta_ms / elapsed_ms * 100.0) as f32;
+    usage.is_finite().then_some(usage)
+}
+
+/// OpenClaw 状态采样按 sysinfo 最小间隔检查；卡面 CPU 使用各 PID 自己的累计时间窗口，
+/// 并只在展示截止发布。
+fn cpu_refresh_plan(
+    candidates: &[CpuProcessKey],
+    openclaw: &[CpuProcessKey],
+    state: &mut CpuSamplingState,
+    now: Instant,
+) -> CpuRefreshPlan {
+    let candidate_set: HashSet<_> = candidates.iter().copied().collect();
+    state.processes.retain(|key, _| candidate_set.contains(key));
+    let display_due = match state.last_display_sample_at {
+        None => true,
+        Some(last) => now.saturating_duration_since(last) >= DISPLAY_CPU_SAMPLE_INTERVAL,
+    };
+    let openclaw_set: HashSet<_> = openclaw.iter().copied().collect();
+    let targets: Vec<_> = candidates
+        .iter()
+        .copied()
+        .filter(|key| {
+            let sample = state.processes.get(key);
+            let sample_due = match sample {
+                None => true,
+                Some(s) if s.last_cpu_sample_at.is_none() => true,
+                Some(s) => {
+                    now.saturating_duration_since(s.last_cpu_sample_at.unwrap())
+                        >= sysinfo::MINIMUM_CPU_UPDATE_INTERVAL
+                }
+            };
+            let needs_baseline = match sample {
+                None => true,
+                Some(s) => s.cpu_usage.is_none(),
+            };
+            sample_due && (needs_baseline || openclaw_set.contains(key) || display_due)
+        })
+        .collect();
+    CpuRefreshPlan {
+        candidates: candidates.to_vec(),
+        targets,
+        display_due,
+    }
+}
+
+fn record_cpu_refresh_with_cpu_times(
+    state: &mut CpuSamplingState,
+    plan: &CpuRefreshPlan,
+    updated_count: usize,
+    cpu_times_ms: &HashMap<CpuProcessKey, u64>,
+    now: Instant,
+) -> Option<Instant> {
+    let complete_refresh = !plan.targets.is_empty()
+        && updated_count == plan.targets.len()
+        && plan
+            .targets
+            .iter()
+            .all(|key| cpu_times_ms.contains_key(key));
+    let previously_ready: HashSet<_> = plan
+        .targets
+        .iter()
+        .filter(|key| {
+            cpu_times_ms.contains_key(key)
+                && state
+                    .processes
+                    .get(key)
+                    .is_some_and(|sample| sample.cpu_usage.is_some())
+        })
+        .copied()
+        .collect();
+    for key in &plan.targets {
+        let Some(cpu_time_ms) = cpu_times_ms.get(key).copied() else {
+            continue;
+        };
+        let sample = state.processes.entry(*key).or_insert(CpuSampleState {
+            last_cpu_time_ms: None,
+            last_cpu_sample_at: None,
+            cpu_usage: None,
+            display_cpu_usage: None,
         });
+        if let (Some(previous_cpu_time_ms), Some(previous_at)) =
+            (sample.last_cpu_time_ms, sample.last_cpu_sample_at)
+        {
+            sample.cpu_usage =
+                cpu_usage_from_delta(previous_cpu_time_ms, previous_at, cpu_time_ms, now);
+        }
+        sample.last_cpu_time_ms = Some(cpu_time_ms);
+        sample.last_cpu_sample_at = Some(now);
+    }
+
+    let display_sample_is_complete = plan.display_due
+        && !plan.candidates.is_empty()
+        && plan.targets.len() == plan.candidates.len()
+        && complete_refresh
+        && plan.candidates.iter().all(|key| {
+            state
+                .processes
+                .get(key)
+                .is_some_and(|sample| sample.cpu_usage.is_some())
+        });
+    if display_sample_is_complete {
+        for key in &plan.candidates {
+            if let Some(sample) = state.processes.get_mut(key) {
+                sample.display_cpu_usage = sample.cpu_usage;
+            }
+        }
+        state.last_display_sample_at = Some(now);
+        Some(now)
+    } else {
+        // A new PID can become displayable between global display ticks; publish only that PID's
+        // first validated sample while keeping already displayed values on the agreed cadence.
+        for key in &plan.targets {
+            if !cpu_times_ms.contains_key(key) || previously_ready.contains(key) {
+                continue;
+            }
+            if let Some(sample) = state.processes.get_mut(key) {
+                if sample.cpu_usage.is_some() {
+                    sample.display_cpu_usage = sample.cpu_usage;
+                }
+            }
+        }
+        None
+    }
+}
+
+fn cpu_usage_by_pid(state: &CpuSamplingState) -> HashMap<u32, f32> {
+    state
+        .processes
+        .iter()
+        .map(|(key, sample)| (key.pid.as_u32(), sample.cpu_usage.unwrap_or(0.0)))
+        .collect()
+}
+
+fn cpu_display_by_pid(state: &CpuSamplingState) -> HashMap<u32, f32> {
+    state
+        .processes
+        .iter()
+        .map(|(key, sample)| (key.pid.as_u32(), sample.display_cpu_usage.unwrap_or(0.0)))
+        .collect()
+}
+
+#[cfg(test)]
+#[derive(Debug, PartialEq)]
+struct ProcessIdentity {
+    pid: u32,
+    cwd: Option<std::path::PathBuf>,
+    exe: Option<std::path::PathBuf>,
+    form: ProcessForm,
+}
+
+#[cfg(test)]
+fn process_identity(process: &AgentProcess) -> ProcessIdentity {
+    ProcessIdentity {
+        pid: process.pid,
+        cwd: process.cwd.clone(),
+        exe: process.exe.clone(),
+        form: process.form,
+    }
+}
+
+/// 两段式进程刷新（Phase 1 内核；抽为函数供活体回归测试直调，行为与内联版一致）：
+/// 第一段全量刷名字层，第二段候选 PID 读 cmd/cwd/exe；OpenClaw CPU 状态读取累计差分，
+/// 卡面 CPU 降频发布。
+/// 返回候选进程数与可写回的卡面 CPU 样本时刻。
+fn refresh_processes_two_stage(
+    system: &mut System,
+    wanted_names: &[String],
+    cpu_sampling_state: &mut CpuSamplingState,
+    now: Instant,
+) -> (usize, Option<Instant>) {
+    // 第一段：全量刷新名字层（进程枚举本身即带名字，无需额外系统调用）
+    system.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::nothing());
+
+    // 候选集 = 名字命中「解释器 + adapter 声明名 + 特殊宿主名」白名单。
+    // 非候选进程的 cmd/cwd/exe 保持为空：所有 adapter 的发现入口要么按名字命中
+    // （白名单已全覆盖），要么按 exe/cmd 判定（特殊宿主名已补白，见
+    // candidate_process_names 文档）
+    let candidates: Vec<CpuProcessKey> = system
+        .processes()
+        .iter()
+        .filter(|(_, process)| {
+            wanted_names
+                .binary_search(&bare_name(&process.name().to_string_lossy()))
+                .is_ok()
+        })
+        .map(|(pid, process)| CpuProcessKey {
+            pid: *pid,
+            start_time: process.start_time(),
+        })
+        .collect();
+    let candidate_pids: Vec<sysinfo::Pid> = candidates.iter().map(|key| key.pid).collect();
+
+    let openclaw_names = openclaw::OpenClawAdapter.process_names();
+    let openclaw_pids: Vec<CpuProcessKey> = system
+        .processes()
+        .iter()
+        .filter(|(_, process)| {
+            let name = bare_name(&process.name().to_string_lossy());
+            openclaw_names.iter().any(|expected| name == *expected)
+        })
+        .map(|(pid, process)| CpuProcessKey {
+            pid: *pid,
+            start_time: process.start_time(),
+        })
+        .collect();
+
+    // 第二段：只对候选 PID（约 20–40 个）读昂贵字段。cmd/cwd/exe 一律 Always：
+    // Windows 上 sysinfo 不保证 PID 复用时清空缓存字段，OnlyIfNotSet 会让复用后的
+    // 新进程沿用旧进程的 cmd/cwd/exe（旧的全量 Always 策略靠每轮重读自愈）；候选集
+    // 很小，每轮重读代价可忽略。CPU 在下方独立按「OpenClaw 状态 / 卡面展示」分频刷新
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&candidate_pids),
+        false,
+        ProcessRefreshKind::nothing()
+            .with_cmd(sysinfo::UpdateKind::Always)
+            .with_cwd(sysinfo::UpdateKind::Always)
+            // exe 路径是 Windows MSIX 形态判定（classify_form）的关键输入：
+            // 缺失时 ChatGPT 内嵌 codex.exe 会被误判为 CLI（提权进程 cmd 也读不到）
+            .with_exe(sysinfo::UpdateKind::Always),
+    );
+
+    let cpu_plan = cpu_refresh_plan(&candidates, &openclaw_pids, cpu_sampling_state, now);
+    let cpu_pids: Vec<sysinfo::Pid> = cpu_plan.targets.iter().map(|key| key.pid).collect();
+    let cpu_updated_count = if !cpu_pids.is_empty() {
         system.refresh_processes_specifics(
+            ProcessesToUpdate::Some(&cpu_pids),
+            false,
+            ProcessRefreshKind::nothing().with_cpu(),
+        )
+    } else {
+        0
+    };
+
+    let cpu_times_ms: HashMap<_, _> = cpu_plan
+        .targets
+        .iter()
+        .filter_map(|key| {
+            let process = system.process(key.pid)?;
+            if !process.exists() || process.start_time() != key.start_time {
+                return None;
+            }
+            Some((*key, process.accumulated_cpu_time()))
+        })
+        .collect();
+    let sampled_at = Instant::now();
+    (
+        candidates.len(),
+        record_cpu_refresh_with_cpu_times(
+            cpu_sampling_state,
+            &cpu_plan,
+            cpu_updated_count,
+            &cpu_times_ms,
+            sampled_at,
+        ),
+    )
+}
+
+#[cfg(test)]
+mod candidate_whitelist_tests {
+    use super::*;
+
+    #[test]
+    fn candidate_names_include_interpreters_for_shim_hosts() {
+        let names = candidate_process_names(&[&["kimi"][..]]);
+        assert!(names.contains(&"node".to_string()));
+        assert!(names.contains(&"bun".to_string()));
+        assert!(names.contains(&"kimi".to_string()));
+    }
+
+    #[test]
+    fn cpu_refresh_plan_keeps_openclaw_fresh_and_throttles_display() {
+        let all = [cpu_key(11, 1), cpu_key(22, 2), cpu_key(33, 3)];
+        let openclaw = [all[1]];
+        let t0 = Instant::now();
+        let mut state = CpuSamplingState::default();
+        let times = |samples: [u64; 3]| {
+            HashMap::from([
+                (all[0], samples[0]),
+                (all[1], samples[1]),
+                (all[2], samples[2]),
+            ])
+        };
+
+        let first = cpu_refresh_plan(&all, &openclaw, &mut state, t0);
+        assert!(first.display_due);
+        assert_eq!(first.targets, all);
+        assert_eq!(
+            record_cpu_refresh_with_cpu_times(
+                &mut state,
+                &first,
+                all.len(),
+                &times([1_000, 2_000, 3_000]),
+                t0
+            ),
+            None,
+            "first cumulative CPU-time read establishes per-PID baselines only"
+        );
+
+        let baseline_at = t0 + sysinfo::MINIMUM_CPU_UPDATE_INTERVAL;
+        let baseline = cpu_refresh_plan(&all, &openclaw, &mut state, baseline_at);
+        assert_eq!(
+            record_cpu_refresh_with_cpu_times(
+                &mut state,
+                &baseline,
+                all.len(),
+                &times([1_020, 2_040, 3_060]),
+                baseline_at
+            ),
+            Some(baseline_at),
+            "a real per-process cumulative delta paired with elapsed wall time is ready"
+        );
+        assert_eq!(
+            [11, 22, 33].map(|pid| cpu_display_by_pid(&state).get(&pid).copied().unwrap()),
+            [10.0, 20.0, 30.0]
+        );
+
+        let status_refresh_at = baseline_at + DISPLAY_CPU_SAMPLE_INTERVAL / 2;
+        let status_refresh = cpu_refresh_plan(&all, &openclaw, &mut state, status_refresh_at);
+        assert!(!status_refresh.display_due);
+        assert_eq!(status_refresh.targets, openclaw);
+        let status_times = HashMap::from([(all[1], 3_540)]);
+        assert_eq!(
+            record_cpu_refresh_with_cpu_times(
+                &mut state,
+                &status_refresh,
+                status_refresh.targets.len(),
+                &status_times,
+                status_refresh_at,
+            ),
+            None
+        );
+        assert_eq!(
+            [11, 22, 33].map(|pid| cpu_display_by_pid(&state).get(&pid).copied().unwrap()),
+            [10.0, 20.0, 30.0],
+            "fresh OpenClaw status samples must not update card CPU between display ticks"
+        );
+
+        let display_due_at = baseline_at + DISPLAY_CPU_SAMPLE_INTERVAL;
+        let display_refresh = cpu_refresh_plan(&all, &openclaw, &mut state, display_due_at);
+        assert!(display_refresh.display_due);
+        assert_eq!(display_refresh.targets, all);
+        assert_eq!(
+            record_cpu_refresh_with_cpu_times(
+                &mut state,
+                &display_refresh,
+                all.len(),
+                // PID 22 was sampled halfway through the display window; each PID uses its own
+                // accumulated-time and wall-clock delta instead of a shared System denominator.
+                &times([4_020, 4_140, 4_560]),
+                display_due_at,
+            ),
+            Some(display_due_at)
+        );
+        assert_eq!(
+            [11, 22, 33].map(|pid| cpu_display_by_pid(&state).get(&pid).copied().unwrap()),
+            [10.0, 4.0, 5.0]
+        );
+    }
+
+    #[test]
+    fn partial_cpu_refresh_updates_live_openclaw_but_keeps_display_deadline() {
+        let openclaw = cpu_key(11, 1);
+        let other = cpu_key(22, 2);
+        let candidates = [openclaw, other];
+        let t0 = Instant::now();
+        let mut state = CpuSamplingState::default();
+
+        let initial = cpu_refresh_plan(&candidates, &[openclaw], &mut state, t0);
+        assert_eq!(
+            record_cpu_refresh_with_cpu_times(
+                &mut state,
+                &initial,
+                2,
+                &HashMap::from([(openclaw, 1_000), (other, 2_000)]),
+                t0
+            ),
+            None
+        );
+
+        let busy_at = t0 + Duration::from_secs(10);
+        let busy = cpu_refresh_plan(&candidates, &[openclaw], &mut state, busy_at);
+        assert_eq!(
+            record_cpu_refresh_with_cpu_times(
+                &mut state,
+                &busy,
+                2,
+                &HashMap::from([(openclaw, 10_541), (other, 3_000)]),
+                busy_at
+            ),
+            Some(busy_at)
+        );
+        assert!((cpu_usage_by_pid(&state)[&11] - 95.41).abs() < 0.001);
+
+        let idle_at = busy_at + DISPLAY_CPU_SAMPLE_INTERVAL;
+        let partial = cpu_refresh_plan(&candidates, &[openclaw], &mut state, idle_at);
+        assert_eq!(partial.targets, candidates);
+        assert_eq!(
+            record_cpu_refresh_with_cpu_times(
+                &mut state,
+                &partial,
+                1,
+                &HashMap::from([(openclaw, 11_015)]),
+                idle_at
+            ),
+            None,
+            "one exited candidate must not advance the complete display deadline"
+        );
+        assert!(
+            (cpu_usage_by_pid(&state)[&11] - 1.58).abs() < 0.001,
+            "the live OpenClaw PID must update from busy to idle despite a partial batch"
+        );
+        assert_eq!(cpu_usage_by_pid(&state)[&22], 10.0);
+        assert_eq!(state.last_display_sample_at, Some(busy_at));
+        assert!((cpu_display_by_pid(&state)[&11] - 95.41).abs() < 0.001);
+    }
+
+    #[test]
+    fn new_pid_and_rebuilt_system_wait_for_real_cumulative_cpu_delta() {
+        let first = cpu_key(11, 1);
+        let second = cpu_key(22, 2);
+        let candidates = [first, second];
+        let mut state = CpuSamplingState::default();
+        let t0 = Instant::now();
+        let min_sample_interval = sysinfo::MINIMUM_CPU_UPDATE_INTERVAL;
+
+        let first_sample = cpu_refresh_plan(&candidates, &[], &mut state, t0);
+        assert_eq!(first_sample.targets, candidates);
+        assert_eq!(
+            record_cpu_refresh_with_cpu_times(
+                &mut state,
+                &first_sample,
+                2,
+                &HashMap::from([(first, 1_000), (second, 2_000)]),
+                t0
+            ),
+            None
+        );
+        assert_eq!(state.last_display_sample_at, None);
+
+        let too_soon = cpu_refresh_plan(&candidates, &[], &mut state, t0 + min_sample_interval / 2);
+        assert!(
+            too_soon.targets.is_empty(),
+            "per-PID CPU counters must not be sampled more frequently than their minimum window"
+        );
+
+        let valid_sample = cpu_refresh_plan(&candidates, &[], &mut state, t0 + min_sample_interval);
+        assert_eq!(valid_sample.targets, candidates);
+        let second_sample_at = t0 + min_sample_interval;
+        assert_eq!(
+            record_cpu_refresh_with_cpu_times(
+                &mut state,
+                &valid_sample,
+                2,
+                &HashMap::from([(first, 1_020), (second, 2_050)]),
+                second_sample_at
+            ),
+            Some(second_sample_at),
+            "a real accumulated CPU-time delta forms the sample; no refresh-count guess"
+        );
+        assert_eq!(
+            [11, 22].map(|pid| cpu_display_by_pid(&state).get(&pid).copied().unwrap()),
+            [10.0, 25.0]
+        );
+
+        let mut rebuilt_state = state.clone();
+        reset_cpu_sampling_state_if_system_rebuilt(&mut rebuilt_state, false);
+        assert!(rebuilt_state.processes.is_empty());
+        let rebuilt_t0 = second_sample_at + min_sample_interval;
+        let rebuilt_baseline = cpu_refresh_plan(&candidates, &[], &mut rebuilt_state, rebuilt_t0);
+        assert_eq!(rebuilt_baseline.targets, candidates);
+        assert_eq!(
+            record_cpu_refresh_with_cpu_times(
+                &mut rebuilt_state,
+                &rebuilt_baseline,
+                2,
+                &HashMap::from([(first, 5_000), (second, 8_000)]),
+                rebuilt_t0
+            ),
+            None,
+            "rebuilding System requires new per-PID cumulative CPU baselines"
+        );
+        let rebuilt_sample_at = rebuilt_t0 + min_sample_interval;
+        let rebuilt_sample =
+            cpu_refresh_plan(&candidates, &[], &mut rebuilt_state, rebuilt_sample_at);
+        assert_eq!(
+            record_cpu_refresh_with_cpu_times(
+                &mut rebuilt_state,
+                &rebuilt_sample,
+                2,
+                &HashMap::from([(first, 5_020), (second, 8_050)]),
+                rebuilt_sample_at
+            ),
+            Some(rebuilt_sample_at)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_sysinfo_cumulative_cpu_time_establishes_new_and_rebuilt_baselines() {
+        fn burn_cpu_for(duration: Duration) {
+            let until = Instant::now() + duration;
+            let mut value = 1_u64;
+            while Instant::now() < until {
+                value = value.wrapping_mul(16_777_619).wrapping_add(1);
+                std::hint::black_box(value);
+            }
+        }
+
+        fn refresh_current_process(
+            system: &mut System,
+            state: &mut CpuSamplingState,
+            key: CpuProcessKey,
+        ) -> Option<Instant> {
+            let now = Instant::now();
+            let plan = cpu_refresh_plan(&[key], &[], state, now);
+            assert_eq!(plan.targets, vec![key]);
+            let updated = system.refresh_processes_specifics(
+                ProcessesToUpdate::Some(&[key.pid]),
+                false,
+                ProcessRefreshKind::nothing().with_cpu(),
+            );
+            assert_eq!(updated, 1, "sysinfo 必须实际读取当前进程 CPU");
+            let cpu_time_ms = system
+                .process(key.pid)
+                .expect("当前测试 PID 必须存在于 sysinfo")
+                .accumulated_cpu_time();
+            record_cpu_refresh_with_cpu_times(
+                state,
+                &plan,
+                updated,
+                &HashMap::from([(key, cpu_time_ms)]),
+                now,
+            )
+        }
+
+        let pid = sysinfo::get_current_pid().expect("当前测试进程 PID");
+        let mut system = System::new();
+        system.refresh_processes_specifics(
+            ProcessesToUpdate::All,
+            true,
+            ProcessRefreshKind::nothing(),
+        );
+        let key = CpuProcessKey {
+            pid,
+            start_time: system.process(pid).expect("进程列表已刷新").start_time(),
+        };
+        let mut state = CpuSamplingState::default();
+
+        assert_eq!(refresh_current_process(&mut system, &mut state, key), None);
+        assert!(state.processes.get(&key).unwrap().cpu_usage.is_none());
+        std::thread::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL + Duration::from_millis(25));
+        burn_cpu_for(Duration::from_millis(100));
+        assert!(refresh_current_process(&mut system, &mut state, key).is_some());
+        assert!(state.processes.get(&key).unwrap().cpu_usage.unwrap() > 0.0);
+        assert!(cpu_display_by_pid(&state)[&pid.as_u32()] > 0.0);
+
+        // SHARED_SYSTEM 重建后，同一 PID 也必须从新的真实累计时间读数建立基线。
+        let mut rebuilt_state = state.clone();
+        let mut rebuilt_system = System::new();
+        rebuilt_system.refresh_processes_specifics(
+            ProcessesToUpdate::All,
+            true,
+            ProcessRefreshKind::nothing(),
+        );
+        let rebuilt_key = CpuProcessKey {
+            pid,
+            start_time: rebuilt_system
+                .process(pid)
+                .expect("重建后的 System 重新枚举当前进程")
+                .start_time(),
+        };
+        reset_cpu_sampling_state_if_system_rebuilt(&mut rebuilt_state, false);
+        assert_eq!(rebuilt_key, key, "测试期间同一 PID 的创建身份不应改变");
+        assert!(rebuilt_state.processes.is_empty());
+        assert_eq!(
+            refresh_current_process(&mut rebuilt_system, &mut rebuilt_state, rebuilt_key),
+            None
+        );
+        assert!(rebuilt_state
+            .processes
+            .get(&rebuilt_key)
+            .unwrap()
+            .cpu_usage
+            .is_none());
+        std::thread::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL + Duration::from_millis(25));
+        burn_cpu_for(Duration::from_millis(100));
+        assert!(
+            refresh_current_process(&mut rebuilt_system, &mut rebuilt_state, rebuilt_key).is_some(),
+            "新 System 的真实累计 CPU 增量必须形成新样本"
+        );
+        assert!(
+            rebuilt_state
+                .processes
+                .get(&rebuilt_key)
+                .unwrap()
+                .cpu_usage
+                .unwrap()
+                > 0.0
+        );
+    }
+
+    #[test]
+    fn cpu_percent_uses_each_pids_matching_accumulated_and_wall_window() {
+        let t0 = Instant::now();
+        let one_second = cpu_usage_from_delta(1_000, t0, 1_010, t0 + Duration::from_secs(1));
+        let two_hundred_ms =
+            cpu_usage_from_delta(1_000, t0, 1_050, t0 + Duration::from_millis(200));
+        assert_eq!(one_second, Some(1.0));
+        assert_eq!(two_hundred_ms, Some(25.0));
+        assert_eq!(
+            cpu_usage_from_delta(100, t0, 90, t0 + Duration::from_secs(1)),
+            None,
+            "counter reset must re-establish a baseline instead of publishing a false zero"
+        );
+        assert_eq!(
+            cpu_usage_from_delta(100, t0, 110, t0),
+            None,
+            "zero elapsed time cannot form a valid sample"
+        );
+    }
+
+    #[test]
+    fn empty_or_partial_cpu_refresh_does_not_advance_display_deadline() {
+        let t0 = std::time::Instant::now();
+        let mut state = CpuSamplingState::default();
+        let empty = cpu_refresh_plan(&[], &[], &mut state, t0);
+        assert_eq!(
+            record_cpu_refresh_with_cpu_times(&mut state, &empty, 0, &HashMap::new(), t0),
+            None
+        );
+        assert_eq!(state.last_display_sample_at, None);
+
+        let candidates = [cpu_key(11, 1), cpu_key(22, 2)];
+        let first = cpu_refresh_plan(&candidates, &[], &mut state, t0);
+        assert_eq!(
+            record_cpu_refresh_with_cpu_times(&mut state, &first, 0, &HashMap::new(), t0),
+            None
+        );
+        let next = t0 + sysinfo::MINIMUM_CPU_UPDATE_INTERVAL;
+        let partial = cpu_refresh_plan(&candidates, &[], &mut state, next);
+        assert_eq!(
+            record_cpu_refresh_with_cpu_times(
+                &mut state,
+                &partial,
+                1,
+                &HashMap::from([(candidates[0], 1_000)]),
+                next,
+            ),
+            None,
+            "CPU 更新返回部分候选时不得推进展示 deadline"
+        );
+        assert_eq!(state.last_display_sample_at, None);
+    }
+
+    #[test]
+    fn pid_reuse_starts_a_new_cpu_time_baseline() {
+        let old = cpu_key(11, 1);
+        let new = cpu_key(11, 2);
+        let t0 = Instant::now();
+        let mut state = CpuSamplingState::default();
+        let old_plan = cpu_refresh_plan(&[old], &[], &mut state, t0);
+        record_cpu_refresh_with_cpu_times(
+            &mut state,
+            &old_plan,
+            1,
+            &HashMap::from([(old, 100)]),
+            t0,
+        );
+        let old_second_at = t0 + sysinfo::MINIMUM_CPU_UPDATE_INTERVAL;
+        let old_second = cpu_refresh_plan(&[old], &[], &mut state, old_second_at);
+        record_cpu_refresh_with_cpu_times(
+            &mut state,
+            &old_second,
+            1,
+            &HashMap::from([(old, 110)]),
+            old_second_at,
+        );
+        let new_plan = cpu_refresh_plan(
+            &[new],
+            &[],
+            &mut state,
+            old_second_at + std::time::Duration::from_secs(1),
+        );
+
+        assert_eq!(
+            new_plan.targets,
+            vec![new],
+            "同 PID 新创建时刻必须重新建样本"
+        );
+        let new_sample_at = old_second_at + std::time::Duration::from_secs(1);
+        assert_eq!(
+            record_cpu_refresh_with_cpu_times(
+                &mut state,
+                &new_plan,
+                1,
+                &HashMap::from([(new, 500)]),
+                new_sample_at,
+            ),
+            None
+        );
+        assert_eq!(state.processes.len(), 1);
+        assert_eq!(
+            state.processes.get(&new).unwrap().last_cpu_time_ms,
+            Some(500)
+        );
+        assert_eq!(state.processes.get(&new).unwrap().cpu_usage, None);
+    }
+
+    fn cpu_key(pid: u32, start_time: u64) -> CpuProcessKey {
+        CpuProcessKey {
+            pid: sysinfo::Pid::from_u32(pid),
+            start_time,
+        }
+    }
+
+    #[test]
+    fn process_identity_includes_pid_cwd_exe_and_form() {
+        let base = AgentProcess {
+            pid: 7,
+            cpu_usage: 0.0,
+            cwd: Some(std::path::PathBuf::from("C:/project")),
+            exe: Some(std::path::PathBuf::from("C:/tools/agent.exe")),
+            form: ProcessForm::App,
+        };
+        let expected = process_identity(&base);
+
+        let mut changed = base.clone();
+        changed.pid += 1;
+        assert_ne!(process_identity(&changed), expected);
+        changed = base.clone();
+        changed.cwd = Some(std::path::PathBuf::from("C:/other"));
+        assert_ne!(process_identity(&changed), expected);
+        changed = base.clone();
+        changed.exe = Some(std::path::PathBuf::from("C:/other/agent.exe"));
+        assert_ne!(process_identity(&changed), expected);
+        changed = base;
+        changed.form = ProcessForm::Cli;
+        assert_ne!(process_identity(&changed), expected);
+    }
+
+    #[test]
+    fn candidate_names_cover_all_adapters_and_special_hosts() {
+        // 生产白名单入口（get_all_sessions_inner Phase 1 实际调用）必须覆盖全部
+        // 已注册 adapter 的 process_names（大小写归一后）。
+        // 禁用状态存 DB、纯测试不触库：这里锁定可静态验证的超集性质——enabled 集
+        // 是 all 集的子集，全部 adapter 名字都在白名单 ⇒ 任意「已禁用但仍在运行」
+        // 的工具也必在白名单内，其 exe/cmd 照常刷新（宿主存活判定不误杀未读池）。
+        let names = refresh_candidate_process_names();
+        for (id, adapter) in all_adapters_with_ids() {
+            for n in adapter.process_names() {
+                assert!(
+                    names.contains(&bare_name(n)),
+                    "工具 {id} 的进程名 {n} 未进生产候选白名单"
+                );
+            }
+        }
+        // 审计补白：名字不在 process_names、但按 exe/cmd 发现的特殊宿主
+        for special in [
+            "zcode",
+            "workbuddy",
+            "chatgpt",
+            "deepseek harness",
+            "electron",
+        ] {
+            assert!(
+                names.contains(&special.to_string()),
+                "特殊宿主名 {special} 未进候选白名单"
+            );
+        }
+        // 确定性：升序且无重复（二分查找与稳定输出依赖此不变量）
+        assert!(
+            names.windows(2).all(|w| w[0] < w[1]),
+            "候选白名单须有序去重"
+        );
+    }
+
+    /// Fix 5：宿主名表是**单一事实源**——两段式候选白名单与宿主存活判定共用它。
+    /// 表驱动、零进程依赖：白名单漏一个宿主名 → 第二段不读其 exe/cmd → 该工具
+    /// 整批卡片被过滤（历史事故），本用例在无任何工具运行的机器上也必须通过。
+    #[test]
+    fn host_process_names_are_all_in_candidate_whitelist() {
+        let names = candidate_process_names(&[]);
+        for (tool, hosts) in HOST_PROCESS_NAMES {
+            assert!(!hosts.is_empty(), "{tool} 的宿主名表不得为空");
+            for host in *hosts {
+                let bare = bare_name(host);
+                assert_eq!(
+                    bare, *host,
+                    "宿主名表条目必须是已归一的小写裸名（{tool}/{host}）"
+                );
+                assert!(
+                    names.contains(&bare),
+                    "{tool} 的宿主名 {host} 未进候选白名单（两段式不会读其 exe/cmd，宿主判不出）"
+                );
+                assert!(
+                    name_may_host_tool(&bare, tool),
+                    "{tool} 的宿主名 {host} 必须通过宿主判定预滤"
+                );
+                assert!(
+                    host_process_names(tool).contains(host),
+                    "{tool} 的宿主判定必须取自同一张表"
+                );
+            }
+        }
+        // npm-shim 宿主：工具实际进程名是解释器，候选白名单与宿主判定都要放行
+        for interp in INTERPRETER_PROCESS_NAMES {
+            assert!(
+                names.contains(&interp.to_string()),
+                "解释器 {interp} 未进候选白名单"
+            );
+            assert!(
+                name_may_host_tool(interp, "dsh"),
+                "dsh web 宿主可能是解释器进程（{interp}）"
+            );
+            assert!(
+                name_may_host_tool(interp, "workbuddy"),
+                "npm-shim 工具的宿主可能是解释器进程（{interp}）"
+            );
+        }
+        // 负例：不相干的进程名不得被宿主预滤放行
+        assert!(!name_may_host_tool("codex", "workbuddy"));
+        assert!(!name_may_host_tool("explorer", "zcode"));
+        assert!(
+            host_process_names("unknown-tool").is_empty(),
+            "未登记工具不得凭空获得宿主名"
+        );
+    }
+
+    #[test]
+    fn candidate_names_are_normalized_to_bare_lowercase() {
+        let names = candidate_process_names(&[&["Codex", "Kimi.exe"][..]]);
+        assert!(names.contains(&"codex".to_string()));
+        assert!(names.contains(&"kimi".to_string()));
+        assert!(!names.contains(&"Codex".to_string()));
+        assert_eq!(bare_name("C:\\Program Files\\OpenAI\\Codex.EXE"), "codex");
+        assert_eq!(bare_name("/usr/local/bin/python3"), "python3");
+        // 特殊宿主名的生产形态必须归一成白名单口径（空格 + .exe / 包路径）
+        assert_eq!(
+            bare_name("D:\\Program Files\\Deepseek-Harness\\DeepSeek Harness.exe"),
+            "deepseek harness"
+        );
+        assert_eq!(
+            bare_name("/Applications/WorkBuddy.app/Contents/MacOS/Electron"),
+            "electron"
+        );
+    }
+
+    /// 活体回归（Task 11 核心验收）：全量刷新（旧路径）与两段式（新路径）
+    /// 在两个独立 System 上各跑一次，两段式的发现结果不得丢掉全量刷新已发现、
+    /// 且在两段式快照中仍然存活的进程——白名单漏名（如特殊宿主）会在此暴露。
+    ///
+    /// 机器相关：只对「全量发现 ∧ 两段式快照仍存活、且进程创建时刻未变化」的 pid
+    /// 逐项比较 PID/cwd/exe/form，规避两次扫描间隙进程启停或 PID 复用的抖动。若没有活体
+    /// 工具进程，明确记录「未覆盖」；空集合不作为兼容通过证据。
+    #[test]
+    fn two_stage_refresh_preserves_all_adapter_discovery() {
+        let adapters = all_adapters();
+        // 直调生产白名单入口（全部注册 adapter），与 get_all_sessions_inner 同源
+        let wanted_names = refresh_candidate_process_names();
+
+        // 旧路径：一次全量刷新（cmd/cwd/exe/cpu 全读）
+        let mut full = System::new();
+        let full_started = std::time::Instant::now();
+        full.refresh_processes_specifics(
             ProcessesToUpdate::All,
             true,
             ProcessRefreshKind::nothing()
@@ -1209,10 +2209,174 @@ fn get_all_sessions_inner() -> SessionsResponse {
                 .with_exe(sysinfo::UpdateKind::Always)
                 .with_cpu(),
         );
+        let full_elapsed = full_started.elapsed();
 
-        adapters.iter().map(|a| a.find_processes(system)).collect()
+        // 新路径：两段式刷新（生产函数直调）
+        let mut two_stage = System::new();
+        let two_stage_started = std::time::Instant::now();
+        let mut cpu_sampling_state = CpuSamplingState::default();
+        let (candidate_count, _) = refresh_processes_two_stage(
+            &mut two_stage,
+            &wanted_names,
+            &mut cpu_sampling_state,
+            Instant::now(),
+        );
+        let two_stage_elapsed = two_stage_started.elapsed();
+
+        eprintln!(
+            "two-stage: {} processes, {} candidates, full refresh {:?} vs two-stage {:?}",
+            two_stage.processes().len(),
+            candidate_count,
+            full_elapsed,
+            two_stage_elapsed
+        );
+
+        let mut identity_comparisons = 0usize;
+        for adapter in &adapters {
+            let expected = adapter.find_processes(&full);
+            let actual = adapter.find_processes(&two_stage);
+            eprintln!(
+                "{}: two-stage={} full={}",
+                adapter.name(),
+                actual.len(),
+                expected.len()
+            );
+
+            // 发现的每个进程都必须仍在快照中且名字非空（发现链路未读到野 pid）
+            for p in &actual {
+                let proc = two_stage
+                    .process(sysinfo::Pid::from_u32(p.pid))
+                    .unwrap_or_else(|| panic!("{} 发现 pid {} 不在快照中", adapter.name(), p.pid));
+                assert!(
+                    !proc.name().is_empty(),
+                    "{} 发现 pid {} 名字为空",
+                    adapter.name(),
+                    p.pid
+                );
+            }
+
+            // 旧路径发现、且新快照仍存活的进程必须在新路径同样被覆盖；
+            // 同时其名字必须在白名单内（否则即白名单漏名——第二段不会读它的 exe/cmd）。
+            // 对稳定存活的同一个进程逐字段比较身份，不只比较 PID。
+            let actual_pids: HashSet<u32> = actual.iter().map(|p| p.pid).collect();
+            for p in &expected {
+                let Some(proc) = two_stage.process(sysinfo::Pid::from_u32(p.pid)) else {
+                    continue; // 两次扫描间隙退出：不判定
+                };
+                let Some(old_proc) = full.process(sysinfo::Pid::from_u32(p.pid)) else {
+                    continue;
+                };
+                if old_proc.start_time() != proc.start_time() {
+                    continue; // 同 PID 已复用：全量快照与新快照不是同一进程
+                }
+                let name = bare_name(&proc.name().to_string_lossy());
+                assert!(
+                    wanted_names.binary_search(&name).is_ok(),
+                    "{} 发现进程 {}（pid={}）不在候选白名单",
+                    adapter.name(),
+                    name,
+                    p.pid
+                );
+                assert!(
+                    actual_pids.contains(&p.pid),
+                    "{} 两段式丢失存活进程 pid={}",
+                    adapter.name(),
+                    p.pid
+                );
+                let new_process = actual
+                    .iter()
+                    .find(|candidate| candidate.pid == p.pid)
+                    .expect("稳定存活的旧路径进程必须出现在两段式结果");
+                assert_eq!(
+                    process_identity(p),
+                    process_identity(new_process),
+                    "{} 两段式进程身份字段不匹配 pid={}",
+                    adapter.name(),
+                    p.pid
+                );
+                identity_comparisons += 1;
+            }
+        }
+        if identity_comparisons == 0 {
+            eprintln!("process identity comparison: NOT EXERCISED (no stable adapter process)");
+        } else {
+            eprintln!("process identity comparison: {identity_comparisons} stable process(es)");
+        }
+    }
+}
+
+/// 实际扫描（单飞壳内执行；成功路径与原实现一致）
+pub(crate) fn get_all_sessions_inner() -> SessionsResponse {
+    load_pending_unread_retries();
+    prune_pending_unread_retries(chrono::Utc::now().timestamp_millis());
+    // W5：未勾选工具不参与会话扫描（看板卡/通知随之静默）
+    let adapters: Vec<Box<dyn AgentAdapter>> = enabled_adapters();
+
+    // Phase 1: 两段式刷新共享 System 快照，发现所有进程。
+    // 全量进程（约 400+）只刷新名字层；候选 PID 每轮读 cmd/cwd/exe，CPU 状态/展示
+    // 按 OpenClaw 与卡面两档采样（F8）。adapter 的发现入口只关心名字命中白名单的少量进程。
+    let (all_processes, workbuddy_host_alive, display_cpu_by_pid) = {
+        let mut guard = lock_shared_system(&SHARED_SYSTEM);
+        let system_was_initialized = guard.is_some();
+        // 首次初始化只建空 System（廉价）；字段由下面两段刷新填充
+        let system = guard.get_or_insert_with(System::new);
+        let refresh_started = std::time::Instant::now();
+
+        // 候选白名单取自**全部注册 adapter**（非 enabled_adapters）：停用但仍在运行
+        // 的工具也须刷新 exe/cmd，否则宿主存活判定误杀其未读池行
+        // （详见 refresh_candidate_process_names 文档）
+        let candidate_names = refresh_candidate_process_names();
+        let mut cpu_sampling_state = CPU_SAMPLING_STATE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        reset_cpu_sampling_state_if_system_rebuilt(&mut cpu_sampling_state, system_was_initialized);
+        let now = Instant::now();
+        let (candidate_count, _display_sample_at) =
+            refresh_processes_two_stage(system, &candidate_names, &mut cpu_sampling_state, now);
+        let current_cpu_by_pid = cpu_usage_by_pid(&cpu_sampling_state);
+        let display_cpu_by_pid = cpu_display_by_pid(&cpu_sampling_state);
+        *CPU_SAMPLING_STATE.lock().unwrap_or_else(|e| e.into_inner()) = cpu_sampling_state;
+
+        // Task 12 验收测量入口（≤25ms）：保持 DEBUG，不得升 INFO 逐轮刷屏。
+        // R4：同时写入 stats 原子量（scan_bus_stats.json 的 last_process_refresh_ms）
+        let refresh_elapsed = refresh_started.elapsed();
+        LAST_PROCESS_REFRESH_MS.store(refresh_elapsed.as_millis() as u64, Ordering::Relaxed);
+        log::debug!(
+            "scan: process refresh（两段式）耗时 {:?}，进程 {}，候选 {}",
+            refresh_elapsed,
+            system.processes().len(),
+            candidate_count
+        );
+
+        // WorkBuddy 的会话进程列表只包含新鲜心跳，空闲宿主不会出现在其中。复用本轮
+        // 刚刷新的共享 System 判宿主一次，后续节奏仍使用同一批进程事实，不起第二个刷新器。
+        let workbuddy_enabled = adapters
+            .iter()
+            .any(|adapter| adapter.agent_type().tool_id() == "workbuddy");
+        let workbuddy_host_alive =
+            workbuddy_enabled && crate::monitor::host::tool_host_alive_in(system, "workbuddy");
+        let mut all_processes: Vec<Vec<AgentProcess>> =
+            adapters.iter().map(|a| a.find_processes(system)).collect();
+        for process in all_processes.iter_mut().flatten() {
+            if let Some(cpu) = current_cpu_by_pid.get(&process.pid) {
+                process.cpu_usage = *cpu;
+            }
+        }
+        (all_processes, workbuddy_host_alive, display_cpu_by_pid)
     }; // 释放 System 锁 — 下方文件 I/O 无需持锁
 
+    // 记录「本轮在跑的工具」：覆盖表中的无事件工具据本信号把节奏下限锁在 Idle 10s
+    //（不进 Away 30s 盲区）。直接复用 Phase 1 的 adapter 进程结果与 WorkBuddy 宿主
+    // 判定，不额外刷新进程快照（用户裁决 2026-10-31）。
+    record_running_tools_with_workbuddy_host(
+        adapters
+            .iter()
+            .zip(all_processes.iter())
+            .filter(|(_, processes)| !processes.is_empty())
+            .map(|(adapter, _)| adapter.agent_type().tool_id()),
+        workbuddy_host_alive,
+    );
     // 已知取舍（2026-10-30 评审 Minor）：上面这一行在 **SHARED_SYSTEM 锁内**执行
     // `find_processes`，而 WorkBuddy 的发现逻辑在「没有可用心跳、要发宿主哨兵」时会做一次
     // `workbuddy.db` 只读查询（`recent_db_sessions`，17 行的库、实测 0.03ms；打开有
@@ -1232,7 +2396,9 @@ fn get_all_sessions_inner() -> SessionsResponse {
         } else {
             adapter.find_sessions(processes)
         };
-        log::info!(
+        // 每个 adapter 每轮一行，INFO 会按轮次无限刷屏（挂机档 30s/轮也照涨），降为 DEBUG；
+        // 人工排障所需的跃迁信息仍由 scan_bus 的 `mode →` INFO 承担
+        log::debug!(
             "{}: {} processes, {} sessions",
             adapter.name(),
             processes.len(),
@@ -1247,15 +2413,27 @@ fn get_all_sessions_inner() -> SessionsResponse {
     // 会话级去重（见 dedup_sessions 注释）
     dedup_sessions(&mut all_sessions);
 
+    // F8：状态判定在 adapter 解析时使用每 PID 的累计 CPU 差分；卡面字段则读取独立的
+    // 30 秒展示缓存，避免状态判定与展示发布互相降频。
+    for session in &mut all_sessions {
+        if let Some(cpu) = display_cpu_by_pid.get(&session.pid) {
+            session.cpu_usage = *cpu;
+        }
+    }
+
     // review F2：宿主 APP 已死的孤儿会话进程不得产出活跃卡。
     // 复用 SHARED_SYSTEM 快照（Phase 1 已带 exe 刷新），不另起全量扫描
     {
-        let guard = SHARED_SYSTEM.lock().unwrap();
+        let guard = lock_shared_system(&SHARED_SYSTEM);
         filter_host_dead_cards(&mut all_sessions, &|tool_id| {
-            guard
-                .as_ref()
-                .map(|system| crate::monitor::host::tool_host_alive_in(system, tool_id))
-                .unwrap_or(true) // 快照不可用时防御性放行（与旧行为一致）
+            if tool_id == "workbuddy" {
+                workbuddy_host_alive
+            } else {
+                guard
+                    .as_ref()
+                    .map(|system| crate::monitor::host::tool_host_alive_in(system, tool_id))
+                    .unwrap_or(true) // 快照不可用时防御性放行（与旧行为一致）
+            }
         });
     }
 
@@ -1480,70 +2658,72 @@ fn get_all_sessions_inner() -> SessionsResponse {
     }
 }
 
-/// R3 单飞护栏的测试互斥锁（跨模块共享）：直接操纵全局 SCAN_FLIGHT 的测试与
-/// 真实扫描类测试（会重置飞行位/快照，含 tests::test_get_all_sessions）互斥——
-/// cargo 默认并行测试下两个真实 get_all_sessions 同时起跑会互踩快照/飞行位
-/// （flight_released 断言 !in_flight 时另一测试的扫描仍在飞即红，评审 R6）
-#[cfg(test)]
-static SCAN_FLIGHT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-/// R3 单飞护栏测试：占住飞行位时第二请求返回快照而不进入扫描
-#[cfg(test)]
-mod scan_flight_tests {
-    use super::*;
-
-    #[test]
-    fn concurrent_request_reuses_snapshot_without_rescan() {
-        let _g = SCAN_FLIGHT_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        // 预置快照
-        let snapshot = SessionsResponse {
-            sessions: Vec::new(),
-            total_count: 7,
-            waiting_count: 0,
-        };
-        *SCAN_FLIGHT.last_snapshot.lock().unwrap() = Some((std::time::Instant::now(), snapshot));
-
-        // 占住飞行位（模拟另一请求正在扫描）
-        *SCAN_FLIGHT.in_flight.lock().unwrap() = true;
-
-        // 并发请求：应直接返回快照（total_count=7 来自快照而非真实扫描）
-        let resp = get_all_sessions();
-        assert_eq!(resp.total_count, 7, "单飞命中应返回最近快照");
-
-        // 清理：释放飞行位（真实扫描会重置快照，不影响其他测试）
-        *SCAN_FLIGHT.in_flight.lock().unwrap() = false;
-    }
-
-    #[test]
-    fn flight_released_after_scan_completes() {
-        let _g = SCAN_FLIGHT_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        // 正常调用：进入扫描并释放飞行位 + 刷新快照
-        let resp = get_all_sessions();
-        assert!(
-            !*SCAN_FLIGHT.in_flight.lock().unwrap(),
-            "扫描完成后飞行位应释放"
-        );
-        let snap = SCAN_FLIGHT.last_snapshot.lock().unwrap();
-        assert!(snap.is_some(), "扫描完成后应刷新快照");
-        assert_eq!(snap.as_ref().unwrap().1.total_count, resp.total_count);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
+    fn poisoned_shared_system_lock_discards_state_and_is_reusable() {
+        let _bus_guard = crate::adapter::scan_bus::test_guard();
+        crate::adapter::scan_bus::reset_for_test();
+        let join = std::thread::spawn(move || {
+            let mut guard = SHARED_SYSTEM.lock().unwrap();
+            *guard = Some(System::new());
+            panic!("force SHARED_SYSTEM poison for regression test");
+        });
+
+        assert!(join.join().is_err(), "the injected panic must be captured");
+        assert!(
+            SHARED_SYSTEM.is_poisoned(),
+            "the panic must poison SHARED_SYSTEM"
+        );
+
+        let guard = lock_shared_system(&SHARED_SYSTEM);
+        assert!(guard.is_none(), "recovery must discard the old System");
+        drop(guard);
+        assert!(
+            !SHARED_SYSTEM.is_poisoned(),
+            "recovery must allow the next scan to acquire this lock"
+        );
+
+        let first = crate::adapter::scan_bus::publish_for_test(|| SessionsResponse {
+            sessions: Vec::new(),
+            total_count: 0,
+            waiting_count: 0,
+        });
+        let next = crate::adapter::scan_bus::publish_for_test(|| SessionsResponse {
+            sessions: Vec::new(),
+            total_count: 0,
+            waiting_count: 0,
+        });
+        assert_eq!(next.version, first.version + 1);
+    }
+
+    /// Fix 7 回归锁：旧入口 `adapter::get_all_sessions` 只允许**委托扫描总线**
+    /// （单飞/快照/panic 自愈由 scan_bus 统一负责），不得保留第二套单飞护栏。
+    /// 字面量用 concat! 拆分：include_str! 会把本测试自身纳入扫描面。
+    #[test]
+    fn get_all_sessions_is_a_thin_scan_bus_delegate() {
+        let src = include_str!("mod.rs");
+        let start = src
+            .find(concat!("pub fn get_all_", "sessions()"))
+            .expect("兼容入口缺失");
+        let body = &src[start..(start + 500).min(src.len())];
+        assert!(
+            body.contains(concat!("scan_bus::", "current_or_scan")),
+            "旧入口必须委托 scan_bus::current_or_scan，实际: {body}"
+        );
+        assert!(
+            !src.contains(concat!("SCAN_", "FLIGHT")),
+            "不得保留第二套单飞护栏（scan_bus 已是唯一扫描者）"
+        );
+    }
+
+    #[test]
     fn test_get_all_sessions() {
-        // 与 scan_flight_tests 共用 SCAN_FLIGHT_TEST_LOCK：本测试触发真实
-        // get_all_sessions（刷新快照/飞行位），不互斥则并行起跑互踩（评审 R6）
-        let _g = SCAN_FLIGHT_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
+        // 委托入口会写 scan_bus 进程级快照：与 scan_bus 测试共用全局锁，
+        // 避免并行起跑时插进对方「种子 → 精确版本断言」窗口
+        let _g = crate::adapter::scan_bus::test_guard();
         let response = get_all_sessions();
         eprintln!("=== SESSION SCAN ===");
         eprintln!(
@@ -2572,7 +3752,7 @@ enum UnreadPoolAction {
 }
 
 /// 判定未读池动作。prev_status 为状态缓存中的上一轮状态
-/// （Debug 格式，与 get_all_sessions 末尾的统一更新一致）
+/// （Debug 格式，与扫描末尾的统一更新一致）
 fn unread_pool_action(prev_status: Option<&str>, idle: bool) -> UnreadPoolAction {
     if !idle {
         return UnreadPoolAction::None;
@@ -2664,7 +3844,7 @@ fn filter_deleted_unread(
 /// - 过期（24h）→ 清理
 /// - 数据驱动持久绿卡工具（Codex APP / ZCode，P1-3 通用化）：聚合卡即该会话的
 ///   「未读卡」形态——池有行时标记 unread=true（徽标/「未读卡排后」生效），
-///   已读删行后由 get_all_sessions 的前置过滤剔除，闭环「被已读信号清除」
+///   已读删行后由 每轮扫描 的前置过滤剔除，闭环「被已读信号清除」
 fn sync_unread_sessions(active: &mut Vec<Session>, deleted_workbuddy: &HashSet<String>) {
     let now_ms = chrono::Utc::now().timestamp_millis();
     let pending = PendingRetryStore::global();
@@ -2761,7 +3941,7 @@ fn sync_unread_sessions(active: &mut Vec<Session>, deleted_workbuddy: &HashSet<S
             .collect()
     };
     let dead_tools = {
-        let guard = SHARED_SYSTEM.lock().unwrap();
+        let guard = lock_shared_system(&SHARED_SYSTEM);
         dead_tools_from_pool(&pool_tools, guard.as_ref())
     };
     for t in &dead_tools {
@@ -3276,6 +4456,44 @@ mod dedup_tests {
         assert_eq!(sessions.len(), 2);
         assert_eq!(sessions[0].pid, 111); // 保留首张
         assert_eq!(sessions[1].id, "ses_B");
+    }
+}
+
+#[cfg(test)]
+mod running_tools_tests {
+    use super::*;
+
+    /// 在跑工具记录：排序去重、整体覆盖写（本轮无进程的工具必须消失，
+    /// 否则 dsh 退出后节奏仍被锁在 Idle）。持 scan_bus 全局锁，避免与
+    /// reset_for_test 的清理并发。
+    #[test]
+    fn running_tools_are_sorted_deduped_and_replaced() {
+        let _guard = crate::adapter::scan_bus::test_guard();
+        record_running_tools(["dsh", "claude", "dsh"].into_iter());
+        assert_eq!(
+            running_tool_ids(),
+            vec!["claude".to_string(), "dsh".to_string()]
+        );
+        record_running_tools(["openclaw"].into_iter());
+        assert_eq!(
+            running_tool_ids(),
+            vec!["openclaw".to_string()],
+            "每轮必须整体覆盖：上一轮在跑、本轮退出的工具不得残留"
+        );
+        record_running_tools(std::iter::empty());
+        assert!(running_tool_ids().is_empty());
+    }
+
+    #[test]
+    fn workbuddy_host_without_fresh_heartbeat_is_still_running() {
+        let _guard = crate::adapter::scan_bus::test_guard();
+        record_running_tools_with_workbuddy_host(std::iter::empty::<&'static str>(), true);
+        assert_eq!(
+            running_tool_ids(),
+            vec!["workbuddy".to_string()],
+            "空闲 WorkBuddy 宿主没有新鲜会话心跳时仍须保持 Idle 兜底"
+        );
+        record_running_tools(std::iter::empty());
     }
 }
 
