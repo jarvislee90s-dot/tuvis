@@ -252,6 +252,19 @@ pub fn compose_official_text(device_name: &str, text: &str, signature_on: bool) 
     Ok(composed)
 }
 
+/// 已组装发送的错误阶段：只有明确写前失败才可安全保留待发。
+#[derive(Debug, Clone)]
+pub(crate) enum PreparedDispatchError {
+    BeforeWrite(ZcodeError),
+    MayHaveWritten(ZcodeError),
+}
+impl From<ZcodeError> for PreparedDispatchError {
+    fn from(error: ZcodeError) -> Self {
+        Self::BeforeWrite(error)
+    }
+}
+pub(crate) type PreparedResult<T> = Result<T, PreparedDispatchError>;
+
 #[derive(Debug, Clone)]
 pub(crate) struct PreparedSend(String);
 impl PreparedSend {
@@ -1061,7 +1074,7 @@ impl CommandSender {
         target: &BoundTarget,
         prepared: &PreparedSend,
         held_queue: Option<&HeldQueueChoice>,
-    ) -> ZResult<ActionReceipt> {
+    ) -> PreparedResult<ActionReceipt> {
         let action = ControlAction::Send {
             session_id: target.session_id.clone(),
             generation: target.generation,
@@ -1083,7 +1096,7 @@ impl CommandSender {
             return Ok(existing);
         }
         if !self.current_capabilities().send.enabled {
-            return Err(ZcodeError::of(codes::NEEDS_EVIDENCE));
+            return Err(ZcodeError::of(codes::NEEDS_EVIDENCE).into());
         }
         let fresh = self
             .fresh_session_view(target)
@@ -1098,7 +1111,7 @@ impl CommandSender {
                 .as_ref()
                 .is_none_or(|c| !c.active_works.is_empty())
         {
-            return Err(ZcodeError::of(codes::NOT_READY));
+            return Err(ZcodeError::of(codes::NOT_READY).into());
         }
         let held = resolve_held_queue(held_queue, Some(&fresh), target)?;
         let summary = audit_summary(action.kind(), &params);
@@ -1119,7 +1132,9 @@ impl CommandSender {
                 held.as_ref(),
             )
             .await;
-        self.actions.record_result(&receipt)?;
+        self.actions
+            .record_result(&receipt)
+            .map_err(PreparedDispatchError::MayHaveWritten)?;
         Ok(receipt)
     }
 
@@ -4510,6 +4525,7 @@ mod tests {
 
         fn work(kind: &str, execution_id: Option<&str>) -> ActiveWork {
             ActiveWork {
+                source_command_id: None,
                 kind: kind.to_owned(),
                 foreground_execution_id: execution_id.map(str::to_owned),
             }
@@ -4541,6 +4557,7 @@ mod tests {
                 selection: None,
                 capabilities: CapabilityView::default(),
                 queue: QueueView::default(),
+                execution_terminal: None,
                 input_routing: None,
             }
         }
@@ -5581,6 +5598,7 @@ mod tests {
 
         fn work(kind: &str, execution_id: Option<&str>) -> ActiveWork {
             ActiveWork {
+                source_command_id: None,
                 kind: kind.to_owned(),
                 foreground_execution_id: execution_id.map(str::to_owned),
             }
@@ -5603,6 +5621,7 @@ mod tests {
                 selection: None,
                 capabilities: CapabilityView::default(),
                 queue: QueueView::default(),
+                execution_terminal: None,
                 input_routing: None,
             }
         }
@@ -5670,6 +5689,27 @@ mod tests {
             assert_eq!(row_count(&store), 0);
         }
 
+        #[tokio::test]
+        async fn prepared_dispatch_exposes_prewrite_and_postwrite_failure_stages() {
+            let store = DeviceStore::memory();
+            let fake = FakeBridge::new(Reply::Body(accepted_body()));
+            let prepared = freeze_send_text("Phone", "hello", true).unwrap();
+            let idle = FakeSessions::new(Ok(view(Some(control(vec![])), true)));
+            let disabled = sender(&fake, &store).with_stop(idle);
+            assert!(
+                matches!(disabled.execute_prepared_send(&ctx("before"),&target(),&prepared,None).await, Err(PreparedDispatchError::BeforeWrite(error)) if error.is(codes::NEEDS_EVIDENCE))
+            );
+            assert_eq!(fake.wire(), 0);
+            store.with(|c|c.execute_batch("CREATE TRIGGER synthetic_fail_result BEFORE UPDATE ON zcode_actions BEGIN SELECT RAISE(ABORT,'synthetic'); END;").unwrap());
+            let idle = FakeSessions::new(Ok(view(Some(control(vec![])), true)));
+            let enabled = sender(&fake, &store)
+                .with_stop(idle)
+                .with_capabilities(CapabilityPolicy::verified_fixture());
+            assert!(
+                matches!(enabled.execute_prepared_send(&ctx("after"),&target(),&prepared,None).await, Err(PreparedDispatchError::MayHaveWritten(error)) if error.is(codes::STORAGE_FAILED))
+            );
+            assert_eq!(fake.wire(), 1);
+        }
         #[tokio::test]
         async fn prepared_storage_failure_never_dispatches() {
             let store = DeviceStore::memory();
@@ -5927,6 +5967,7 @@ mod tests {
                         .collect(),
                     availability: QueueActionAvailability::default(),
                 },
+                execution_terminal: None,
                 input_routing: mode.map(|mode| InputRoutingView {
                     mode: mode.to_owned(),
                     reason_code: None,
@@ -7145,6 +7186,7 @@ mod tests {
                 selection: Some(selection),
                 capabilities: CapabilityView::default(),
                 queue: QueueView::default(),
+                execution_terminal: None,
                 input_routing: None,
             }
         }
@@ -7706,6 +7748,7 @@ mod tests {
                     items,
                     availability,
                 },
+                execution_terminal: None,
                 input_routing: None,
             }
         }

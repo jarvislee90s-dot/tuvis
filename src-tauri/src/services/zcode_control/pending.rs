@@ -472,7 +472,12 @@ fn parse_control(control: &Value) -> Option<ControlView> {
             None => None,
             Some(value) => Some(value.as_str().filter(|text| !text.is_empty())?.to_owned()),
         };
+        let source_command_id = match work.get("sourceCommandId") {
+            None => None,
+            Some(value) => Some(value.as_str().filter(|text| !text.is_empty())?.to_owned()),
+        };
         active_works.push(ActiveWork {
+            source_command_id,
             kind: kind.to_owned(),
             foreground_execution_id,
         });
@@ -688,6 +693,12 @@ fn parse_permission_options(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn control_projects_source_command_id() {
+        let control = super::parse_control(&serde_json::json!({"activeWorks": [{"kind":"primaryTurn", "foregroundExecutionId":"E", "sourceCommandId":"input"}]})).unwrap();
+        let value = serde_json::to_value(control).unwrap();
+        assert_eq!(value["activeWorks"][0]["sourceCommandId"], "input");
+    }
     use super::super::types::MAX_PENDING_DETAIL_CHARS;
     use super::*;
     use serde_json::json;

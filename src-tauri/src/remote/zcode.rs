@@ -564,6 +564,7 @@ fn action_error(code: &str) -> Response {
         | codes::NOT_READY
         | codes::NEEDS_EVIDENCE
         | codes::ACTION_PAYLOAD_CONFLICT
+        | codes::QUEUE_REFRESH_REQUIRED
         | codes::STALE_PENDING
         | codes::STOP_TARGET_CHANGED => StatusCode::CONFLICT,
         codes::INVALID_ACTION
@@ -574,4 +575,15 @@ fn action_error(code: &str) -> Response {
         _ => StatusCode::SERVICE_UNAVAILABLE,
     };
     json_no_store(status, serde_json::json!({ "error": code }))
+}
+
+#[cfg(test)]
+mod queue_refresh_tests {
+    #[test]
+    fn queue_refresh_required_is_http_conflict() {
+        let response = super::action_error(
+            crate::services::zcode_control::types::codes::QUEUE_REFRESH_REQUIRED,
+        );
+        assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
+    }
 }

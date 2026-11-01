@@ -1356,6 +1356,9 @@ fn toggle_core(
 fn wake_zcode_hub_auto_connect() {
     if let Some(hub) = STATE.zcode_hub() {
         hub.wake_auto_connect();
+        if let Some(queue) = hub.queue_service() {
+            queue.wake_all();
+        }
     }
 }
 
@@ -1366,11 +1369,62 @@ fn wake_zcode_hub_auto_connect() {
 ///
 /// P2-7：这里那次恢复即「启动恢复」——worker 复用内存快照，**不再第二次读原生存储**；
 /// 用户显式 connect 仍可重试恢复。
+pub(crate) async fn run_queue_listener(
+    listener: std::sync::Arc<
+        crate::services::zcode_control::local_queue::service::ZcodeQueueService,
+    >,
+    mut events: tokio::sync::broadcast::Receiver<
+        crate::services::zcode_control::types::ControlEvent,
+    >,
+    initial_paired: bool,
+) {
+    use crate::services::zcode_control::types::ControlEventKind;
+    if initial_paired {
+        let activation = listener.clone();
+        tokio::spawn(async move {
+            activation.on_connected().await;
+        });
+    }
+    loop {
+        tokio::select! {
+            _ = listener.wait_shutdown() => break,
+            event = events.recv() => match event {
+                Ok(event) => {
+                    if event.kind == ControlEventKind::Session {
+                        if let Ok(view) = serde_json::from_value(event.data) { listener.on_session(&view); }
+                    } else if event.kind == ControlEventKind::Connection && event.data.get("state").and_then(serde_json::Value::as_str) == Some("paired") { let activation = listener.clone(); tokio::spawn(async move { activation.on_connected().await; }); } else { listener.wake_all(); }
+                },
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => listener.wake_all(),
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    }
+}
+
 pub(crate) fn start_zcode_auto_connect_after_restore(
     hub: std::sync::Arc<crate::services::zcode_control::ZcodeHub>,
 ) {
     tauri::async_runtime::spawn(async move {
+        let (queue, first) = hub.install_queue();
+        if first {
+            queue.start_cleanup();
+        }
         hub.restore_authorization().await;
+        if first {
+            let events = hub.subscribe();
+            if queue.recover().await.is_ok() {
+                queue.start();
+                let initial_paired = hub.connection().state
+                    == crate::services::zcode_control::types::ConnectionState::Paired;
+                tauri::async_runtime::spawn(run_queue_listener(
+                    queue.clone(),
+                    events,
+                    initial_paired,
+                ));
+            } else {
+                log::warn!("zcode local queue recovery failed; dispatch remains stopped");
+            }
+        }
         hub.start_auto_connect();
     });
 }
@@ -5031,6 +5085,17 @@ mod zcode_wiring_tests {
 
     /// C4 启动接线：先恢复系统存储授权（不打开浏览器），再启动自动连接 worker；
     /// 已记住授权 → 一次恢复、一次连接即 paired，零 OAuth。
+    #[tokio::test]
+    async fn startup_installs_queue_after_restore_and_shutdown_stops_it() {
+        let fake = Arc::new(FakeBackend::default());
+        let hub = fake_hub(fake.clone(), DeviceStore::memory());
+        start_zcode_auto_connect_after_restore(hub.clone());
+        wait_until(|| hub.queue_service().is_some(), "启动必须安装队列服务").await;
+        assert_eq!(fake.restore_calls.load(Ordering::SeqCst), 1);
+        let service = hub.queue_service().unwrap();
+        hub.begin_shutdown();
+        assert!(service.is_stopped());
+    }
     #[tokio::test]
     async fn startup_wiring_restores_and_auto_connects_once() {
         let fake = Arc::new(FakeBackend::default());

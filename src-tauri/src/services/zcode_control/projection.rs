@@ -47,6 +47,7 @@ pub struct Projection {
     queue: QueueView,
     /// 官方 `state.inputRouting` 的最小投影（未宣告 = `None`）。
     input_routing: Option<InputRoutingView>,
+    execution_terminal: Option<super::types::ExecutionTerminal>,
     capabilities: CapabilityView,
     applied_frames: usize,
     /// 单帧字节上限（超限 = `payload_too_large`，绝不让单帧撑爆投影）。
@@ -72,6 +73,7 @@ impl Projection {
             selection: None,
             queue: QueueView::default(),
             input_routing: None,
+            execution_terminal: None,
             capabilities: CapabilityView::default(),
             applied_frames: 0,
             byte_limit,
@@ -132,6 +134,7 @@ impl Projection {
     /// 「已失效投影 + 仍在排队」的自相矛盾状态）。
     fn mark_unready(&mut self) {
         self.ready = false;
+        self.execution_terminal = None;
         self.queue = QueueView::default();
         // 失效视图不得继续携带发送路由：手机只能按新鲜 ready 的状态判断 choice。
         self.input_routing = None;
@@ -230,7 +233,31 @@ impl Projection {
                     self.mark_unready();
                     return Err(ZcodeError::of(codes::NOT_READY));
                 }
+                let prior_revision = self.revision;
+                self.execution_terminal = None;
+                let mut terminals = Vec::new();
                 for delta in deltas {
+                    if let Some(row) = delta
+                        .get("row")
+                        .filter(|_| delta.get("op").and_then(Value::as_str) == Some("row.upserted"))
+                    {
+                        if row.get("kind").and_then(Value::as_str) == Some("turnHeader") {
+                            let result = match row.get("state").and_then(Value::as_str) {
+                                Some("completedSuccess") => Some("success"),
+                                Some("completedInterrupted") => Some("cancelled"),
+                                Some("failed") => Some("failed"),
+                                _ => None,
+                            };
+                            if let (Some(input), Some(result)) = (
+                                row.get("sourceCommandId")
+                                    .and_then(Value::as_str)
+                                    .filter(|v| !v.is_empty()),
+                                result,
+                            ) {
+                                terminals.push((input.to_owned(), result.to_owned()));
+                            }
+                        }
+                    }
                     let Some(record) = delta.as_object() else {
                         continue;
                     };
@@ -245,6 +272,18 @@ impl Projection {
                         return Err(unsupported());
                     }
                     self.apply_patch(patch)?;
+                }
+                if terminals.len() == 1
+                    && self
+                        .revision
+                        .is_some_and(|r| prior_revision.is_some_and(|old| r > old))
+                {
+                    let (input_id, result_type) = terminals.remove(0);
+                    self.execution_terminal = Some(super::types::ExecutionTerminal {
+                        input_id,
+                        result_type,
+                        revision: self.revision.unwrap(),
+                    });
                 }
                 self.last_to_seq = Some(to_seq);
                 self.applied_frames = self.applied_frames.saturating_add(1);
@@ -275,12 +314,14 @@ impl Projection {
             capabilities: self.capabilities.clone(),
             // 队列随投影一起走：GET 与 SSE 帧共用本视图，手机刷新/重进即从宿主重建。
             queue: self.queue.clone(),
+            execution_terminal: self.execution_terminal.clone(),
             input_routing: self.input_routing.clone(),
         }
     }
 
     fn apply_snapshot(&mut self, snapshot: &Value) -> ZResult<()> {
         let object = snapshot.as_object().ok_or_else(unsupported)?;
+        self.execution_terminal = None;
         self.book.accept_snapshot(snapshot)?;
         self.revision = object.get("revision").and_then(Value::as_u64);
         self.selection = object.get("config").and_then(parse_selection);
@@ -667,6 +708,21 @@ mod tests {
         assert_eq!(projection.view().revision, Some(4));
     }
 
+    #[test]
+    fn terminal_turn_row_projects_only_correlated_minimal_fact() {
+        let mut p = Projection::new(target(1));
+        p.activate(SUB);
+        p.apply(1, snapshot_frame(SUB, base_snapshot(), 0, 1))
+            .unwrap();
+        let mut frame = delta_frame(SUB, json!({"revision": 5}), 1, 2);
+        frame["payload"]["deltas"].as_array_mut().unwrap().push(json!({"op":"row.upserted", "row":{"kind":"turnHeader", "sourceCommandId":"input", "state":"completedSuccess", "text":"do not propagate"}}));
+        p.apply(1, frame).unwrap();
+        let v = serde_json::to_value(p.view()).unwrap();
+        assert_eq!(v["executionTerminal"]["inputId"], "input");
+        assert_eq!(v["executionTerminal"]["resultType"], "success");
+        assert_eq!(v["executionTerminal"]["revision"], 5);
+        assert!(v["executionTerminal"].get("text").is_none());
+    }
     #[test]
     fn snapshot_then_deltas_project_pending_control_and_selection() {
         let mut projection = Projection::new(target(1));

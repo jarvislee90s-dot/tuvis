@@ -2290,6 +2290,264 @@ mod tests {
     ///    accepted 各一行且摘要不含正文；SSE 收到真实 `action` 帧；
     /// 4. 假体侧断链后同 actionId 重放：逐字段相同回执、零新帧/零新审计/零新行。
     #[tokio::test]
+    async fn offline_queue_activates_existing_relay_after_pairing() {
+        use crate::services::zcode_control::local_queue::{
+            service::{QueueRuntimeGate, ZcodeQueueService},
+            store::SqlLocalQueueStore,
+            types::{EnqueueCommand, QueueActor, QueueDraft},
+        };
+        use std::sync::atomic::AtomicBool;
+        struct Gate(AtomicBool);
+        impl QueueRuntimeGate for Gate {
+            fn remote_enabled(&self) -> bool {
+                self.0.load(Ordering::SeqCst)
+            }
+            fn device_valid(&self, _: &str) -> bool {
+                true
+            }
+            fn shutting_down(&self) -> bool {
+                false
+            }
+        }
+        let chain = full_chain(send_policy()).await;
+        chain
+            .store
+            .with(|c| try_set_setting_conn(c, KEY_ENABLED, "true").unwrap());
+        let gate = Arc::new(Gate(AtomicBool::new(false)));
+        let svc = Arc::new(ZcodeQueueService::new(
+            SqlLocalQueueStore::new(chain.store.clone()),
+            chain.hub.clone(),
+            gate.clone(),
+        ));
+        let listing_before = chain
+            .ws
+            .log()
+            .iter()
+            .filter(|entry| entry.as_str() == WORKSPACE_LIST_REQUEST)
+            .count();
+        let connections_before = chain.ws.accepted();
+        svc.enqueue(EnqueueCommand {
+            request_id: "offline-B".into(),
+            actor: QueueActor {
+                device_id: DEVICE_ID.into(),
+                device_name: "iPhone".into(),
+            },
+            session_id: SYNTHETIC_TASK_ID.into(),
+            workspace_path: SYNTHETIC_WORKSPACE_PATH.into(),
+            workspace_identity: None,
+            draft: QueueDraft {
+                text: "B".into(),
+                attachments: vec![],
+            },
+            prepared: super::super::command::PreparedSend::from_stored("B".into()).unwrap(),
+            edited_from: None,
+        })
+        .await
+        .unwrap();
+        svc.start();
+        assert!(chain.ws.commands().is_empty());
+        assert_eq!(
+            chain
+                .ws
+                .log()
+                .iter()
+                .filter(|entry| entry.as_str() == WORKSPACE_LIST_REQUEST)
+                .count(),
+            listing_before
+        );
+        gate.0.store(true, Ordering::SeqCst);
+        assert!(
+            svc.flush_one(&synthetic_target()).await.is_err(),
+            "unbound cached read must wait for activation"
+        );
+        assert_eq!(
+            chain
+                .ws
+                .log()
+                .iter()
+                .filter(|entry| entry.as_str() == WORKSPACE_LIST_REQUEST)
+                .count(),
+            listing_before
+        );
+        svc.on_connected().await;
+        assert!(
+            chain
+                .ws
+                .log()
+                .iter()
+                .filter(|entry| entry.as_str() == WORKSPACE_LIST_REQUEST)
+                .count()
+                > listing_before,
+            "paired activation must establish the existing relay subscription"
+        );
+        let app = router(remote_state(
+            &chain.conn,
+            chain.hub.clone(),
+            chain.injector.clone(),
+        ));
+        bind_and_wait_ready(&app, SYNTHETIC_TASK_ID).await;
+        chain
+            .ws
+            .push_queue(Some(serde_json::json!({"items":[],"autoDrain":true})));
+        let view = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let Ok(v) = chain.hub.session(&synthetic_target()).await {
+                    if v.ready && v.queue.known && v.queue.paused == Some(false) {
+                        break v;
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("synthetic subscription must be ready");
+        svc.on_session(&view);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if !chain.ws.commands().is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("offline item must dispatch after activation");
+        assert_eq!(chain.ws.commands().len(), 1);
+        assert_eq!(chain.ws.commands()[0]["envelope"]["payload"]["text"], "B");
+        assert_eq!(
+            chain.ws.accepted(),
+            connections_before,
+            "activation must reuse existing relay"
+        );
+        svc.shutdown();
+    }
+    #[tokio::test]
+    async fn local_queue_uses_frozen_wire_once_and_waits_after_ack() {
+        use crate::services::zcode_control::local_queue::{
+            service::{QueueRuntimeGate, ZcodeQueueService},
+            store::SqlLocalQueueStore,
+            types::{EnqueueCommand, QueueActor, QueueDraft},
+        };
+        struct Gate;
+        impl QueueRuntimeGate for Gate {
+            fn remote_enabled(&self) -> bool {
+                true
+            }
+            fn device_valid(&self, _: &str) -> bool {
+                true
+            }
+            fn shutting_down(&self) -> bool {
+                false
+            }
+        }
+        let chain = full_chain(send_policy()).await;
+        chain
+            .store
+            .with(|c| try_set_setting_conn(c, KEY_ENABLED, "true").unwrap());
+        let app = router(remote_state(
+            &chain.conn,
+            chain.hub.clone(),
+            chain.injector.clone(),
+        ));
+        bind_and_wait_ready(&app, SYNTHETIC_TASK_ID).await;
+        chain.ws.begin_running("A-execution");
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if chain.hub.session(&synthetic_target()).await.is_ok_and(|v| {
+                    v.control
+                        .as_ref()
+                        .is_some_and(|c| !c.active_works.is_empty())
+                }) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("synthetic A running");
+        let listing_before = chain
+            .ws
+            .log()
+            .iter()
+            .filter(|entry| entry.as_str() == WORKSPACE_LIST_REQUEST)
+            .count();
+        let svc = ZcodeQueueService::new(
+            SqlLocalQueueStore::new(chain.store.clone()),
+            chain.hub.clone(),
+            Arc::new(Gate),
+        );
+        for text in ["B", "C"] {
+            svc.enqueue(EnqueueCommand {
+                request_id: format!("queue-{text}"),
+                actor: QueueActor {
+                    device_id: DEVICE_ID.into(),
+                    device_name: "iPhone".into(),
+                },
+                session_id: SYNTHETIC_TASK_ID.into(),
+                workspace_path: SYNTHETIC_WORKSPACE_PATH.into(),
+                workspace_identity: None,
+                draft: QueueDraft {
+                    text: text.into(),
+                    attachments: vec![],
+                },
+                prepared: super::super::command::PreparedSend::from_stored(text.into()).unwrap(),
+                edited_from: None,
+            })
+            .await
+            .unwrap();
+        }
+        svc.flush_one(&synthetic_target()).await.unwrap();
+        assert!(
+            chain.ws.commands().is_empty(),
+            "busy A must emit zero upstream frames"
+        );
+        assert_eq!(
+            chain
+                .ws
+                .log()
+                .iter()
+                .filter(|entry| entry.as_str() == WORKSPACE_LIST_REQUEST)
+                .count(),
+            listing_before,
+            "busy enqueue must not request workspace listing"
+        );
+        *chain.ws.running.lock().unwrap() = None;
+        chain
+            .ws
+            .push_queue(Some(serde_json::json!({"items":[],"autoDrain":true})));
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if chain.hub.session(&synthetic_target()).await.is_ok_and(|v| {
+                    v.queue.known
+                        && v.queue.paused == Some(false)
+                        && v.control
+                            .as_ref()
+                            .is_some_and(|c| c.active_works.is_empty())
+                }) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("synthetic A ended");
+        svc.flush_one(&synthetic_target()).await.unwrap();
+        svc.flush_one(&synthetic_target()).await.unwrap();
+        assert!(
+            chain
+                .ws
+                .log()
+                .iter()
+                .filter(|entry| entry.as_str() == WORKSPACE_LIST_REQUEST)
+                .count()
+                > listing_before,
+            "idle dispatch must refresh workspace listing"
+        );
+        let commands = chain.ws.commands();
+        assert_eq!(commands.len(), 1, "only B may reach synthetic wire");
+        assert_eq!(commands[0]["envelope"]["payload"]["text"], "B");
+    }
+    #[tokio::test]
     async fn full_chain_send_receipt_audit_and_sse() {
         let chain = full_chain(send_policy()).await;
         let app = router(remote_state(

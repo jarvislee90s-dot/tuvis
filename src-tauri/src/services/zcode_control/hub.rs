@@ -658,8 +658,25 @@ pub trait HubBackend: Send + Sync {
         Box::pin(async { self.auth_status() })
     }
 
+    fn bridge_epoch(&self) -> Option<u64> {
+        None
+    }
+
     /// 按 Tuvis sessionId 精确绑定当前代际的官方会话。
     fn bind_session<'a>(&'a self, key: &'a TargetKey) -> BoxFuture<'a, ZResult<BoundTarget>>;
+
+    fn cached_session_target<'a>(
+        &'a self,
+        key: &'a TargetKey,
+    ) -> BoxFuture<'a, ZResult<BoundTarget>> {
+        self.bind_session(key)
+    }
+    fn refresh_session_target<'a>(
+        &'a self,
+        key: &'a TargetKey,
+    ) -> BoxFuture<'a, ZResult<BoundTarget>> {
+        self.bind_session(key)
+    }
 
     /// 读取精确目标的只读投影。
     fn session<'a>(&'a self, target: &'a BoundTarget) -> BoxFuture<'a, ZResult<SessionView>>;
@@ -677,6 +694,17 @@ pub trait HubBackend: Send + Sync {
         target: &'a BoundTarget,
         action: &'a ControlAction,
     ) -> BoxFuture<'a, ZResult<ActionReceipt>>;
+
+    #[allow(private_interfaces)]
+    fn execute_prepared<'a>(
+        &'a self,
+        _ctx: &'a ActionContext,
+        _target: &'a BoundTarget,
+        _body: &'a super::command::PreparedSend,
+        _held: Option<&'a super::types::HeldQueueChoice>,
+    ) -> BoxFuture<'a, super::command::PreparedResult<ActionReceipt>> {
+        Box::pin(async { Err(ZcodeError::of(codes::NOT_READY).into()) })
+    }
 
     /// 只读查询持久账本里的既有回执（**先于**连接/能力闸与目标绑定）。
     ///
@@ -1001,6 +1029,9 @@ fn bridge_with_host_build(
 }
 
 impl HubBackend for PartsBackend {
+    fn bridge_epoch(&self) -> Option<u64> {
+        Some(self.projection_generation.load(Ordering::SeqCst))
+    }
     fn authorize<'a>(
         &'a self,
         provider: OAuthProvider,
@@ -1055,6 +1086,19 @@ impl HubBackend for PartsBackend {
         Box::pin(async move { self.bridge.bind(key).await })
     }
 
+    fn cached_session_target<'a>(
+        &'a self,
+        key: &'a TargetKey,
+    ) -> BoxFuture<'a, ZResult<BoundTarget>> {
+        Box::pin(async move { self.bridge.cached_target(key) })
+    }
+    fn refresh_session_target<'a>(
+        &'a self,
+        key: &'a TargetKey,
+    ) -> BoxFuture<'a, ZResult<BoundTarget>> {
+        Box::pin(async move { self.bridge.bind_current(key).await })
+    }
+
     fn session<'a>(&'a self, target: &'a BoundTarget) -> BoxFuture<'a, ZResult<SessionView>> {
         Box::pin(async move {
             // 外部评审 C1：读路径先惰性补一次目录（单飞、每 revision 一次、不经能力
@@ -1078,6 +1122,21 @@ impl HubBackend for PartsBackend {
         action: &'a ControlAction,
     ) -> BoxFuture<'a, ZResult<ActionReceipt>> {
         Box::pin(async move { self.sender.execute(ctx, target, action).await })
+    }
+
+    #[allow(private_interfaces)]
+    fn execute_prepared<'a>(
+        &'a self,
+        ctx: &'a ActionContext,
+        target: &'a BoundTarget,
+        body: &'a super::command::PreparedSend,
+        held: Option<&'a super::types::HeldQueueChoice>,
+    ) -> BoxFuture<'a, super::command::PreparedResult<ActionReceipt>> {
+        Box::pin(async move {
+            self.sender
+                .execute_prepared_send(ctx, target, body, held)
+                .await
+        })
     }
 
     fn existing_receipt<'a>(
@@ -1826,6 +1885,8 @@ impl KickedIntentProbe {
 
 /// 单实例 ZCode 控制 Hub（桌面与手机共享）。
 pub struct ZcodeHub {
+    session_write_locks: Mutex<BTreeMap<String, std::sync::Weak<AsyncMutex<()>>>>,
+    queue_service_ref: Mutex<std::sync::Weak<super::local_queue::service::ZcodeQueueService>>,
     store: DeviceStore,
     backend: Arc<dyn HubBackend>,
     /// 与 [`PartsBackend`] 共用的能力策略现算源：会话矩阵与执行闸同源。
@@ -1888,7 +1949,203 @@ pub struct ZcodeHub {
     confirmation_timeout: Duration,
 }
 
+impl super::local_queue::service::QueueRuntimeGate for ZcodeHub {
+    fn remote_enabled(&self) -> bool {
+        self.store.with(|conn| {
+            crate::database::dao::settings::try_get_setting_conn(conn, crate::remote::KEY_ENABLED)
+                .ok()
+                .flatten()
+                .as_deref()
+                == Some("true")
+        })
+    }
+    fn device_valid(&self, device_id: &str) -> bool {
+        self.store.with(|conn| {
+            crate::remote::pairing::device_valid(
+                conn,
+                device_id,
+                chrono::Utc::now().timestamp_millis(),
+            )
+        })
+    }
+    fn shutting_down(&self) -> bool {
+        ZcodeHub::shutting_down(self)
+    }
+}
+
 impl ZcodeHub {
+    fn queue_runtime_check(&self, ctx: &ActionContext) -> ZResult<()> {
+        use super::local_queue::service::QueueRuntimeGate;
+        if self.shutting_down() || !QueueRuntimeGate::remote_enabled(self) {
+            return Err(ZcodeError::of(codes::NOT_READY));
+        }
+        if !QueueRuntimeGate::device_valid(self, &ctx.device_id) {
+            return Err(ZcodeError::of(codes::NO_SESSION));
+        }
+        Ok(())
+    }
+    pub(crate) fn queue_receipt(
+        &self,
+        action_id: &str,
+        device_id: &str,
+    ) -> ZResult<Option<ActionReceipt>> {
+        super::action::ActionStore::new(self.store.clone()).receipt_for_device(action_id, device_id)
+    }
+    fn notify_queue_connection_ready(&self) {
+        if let Some(queue) = self.queue_service() {
+            queue.request_connection_ready();
+        }
+    }
+    pub(crate) fn queue_bridge_epoch(&self) -> Option<u64> {
+        self.backend.bridge_epoch()
+    }
+    pub(crate) fn queue_service(
+        &self,
+    ) -> Option<Arc<super::local_queue::service::ZcodeQueueService>> {
+        self.queue_service_ref
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .upgrade()
+    }
+    pub(crate) fn install_queue(
+        self: &Arc<Self>,
+    ) -> (Arc<super::local_queue::service::ZcodeQueueService>, bool) {
+        let mut slot = self
+            .queue_service_ref
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(service) = slot.upgrade() {
+            return (service, false);
+        }
+        let service = Arc::new(super::local_queue::service::ZcodeQueueService::new(
+            super::local_queue::store::SqlLocalQueueStore::new(self.store.clone()),
+            self.clone(),
+            self.clone(),
+        ));
+        *slot = Arc::downgrade(&service);
+        (service, true)
+    }
+    pub(crate) async fn queue_stop(
+        &self,
+        ctx: &ActionContext,
+        target: &BoundTarget,
+        execution_id: &str,
+    ) -> ZResult<ActionReceipt> {
+        self.queue_runtime_check(ctx)?;
+        let generation = self.control_generation()?;
+        if generation != target.generation {
+            return Err(ZcodeError::of(codes::STALE_GENERATION));
+        }
+        let action = ControlAction::Stop {
+            session_id: target.session_id.clone(),
+            generation,
+            expected_foreground_execution_id: execution_id.to_owned(),
+        };
+        self.check_policy(&action)?;
+        let key = TargetKey {
+            session_id: target.session_id.clone(),
+        };
+        let current = public_target(self.backend.refresh_session_target(&key).await?, generation);
+        self.queue_runtime_check(ctx)?;
+        if self.control_generation()? != generation {
+            return Err(ZcodeError::of(codes::STALE_GENERATION));
+        }
+        if current != *target {
+            return Err(ZcodeError::of(codes::NO_SESSION));
+        }
+        self.backend.execute(ctx, &current, &action).await
+    }
+    pub(crate) async fn queue_send_prepared(
+        &self,
+        ctx: &ActionContext,
+        target: &BoundTarget,
+        body: &super::command::PreparedSend,
+        held: Option<&super::types::HeldQueueChoice>,
+    ) -> super::command::PreparedResult<ActionReceipt> {
+        self.queue_runtime_check(ctx)?;
+        let generation = self.control_generation()?;
+        if generation != target.generation {
+            return Err(ZcodeError::of(codes::STALE_GENERATION).into());
+        }
+        let action = ControlAction::Send {
+            session_id: target.session_id.clone(),
+            generation,
+            text: body.wire_text().to_owned(),
+            held_queue: held.cloned(),
+        };
+        self.check_policy(&action)?;
+        let key = TargetKey {
+            session_id: target.session_id.clone(),
+        };
+        let current = public_target(self.backend.refresh_session_target(&key).await?, generation);
+        self.queue_runtime_check(ctx)?;
+        if self.control_generation()? != generation {
+            return Err(ZcodeError::of(codes::STALE_GENERATION).into());
+        }
+        if current != *target {
+            return Err(ZcodeError::of(codes::NO_SESSION).into());
+        }
+        self.backend
+            .execute_prepared(ctx, &current, body, held)
+            .await
+    }
+    pub(crate) async fn queue_refresh_target(&self, key: &TargetKey) -> ZResult<BoundTarget> {
+        let generation = self.control_generation()?;
+        let target = public_target(self.backend.refresh_session_target(key).await?, generation);
+        if self.control_generation()? != generation {
+            return Err(ZcodeError::of(codes::STALE_GENERATION));
+        }
+        Ok(target)
+    }
+
+    pub(crate) async fn queue_read(
+        &self,
+        key: &TargetKey,
+    ) -> ZResult<super::local_queue::host::BoundQueueSession> {
+        let generation = self.control_generation()?;
+        let target = public_target(self.backend.cached_session_target(key).await?, generation);
+        if self.control_generation()? != generation {
+            return Err(ZcodeError::of(codes::STALE_GENERATION));
+        }
+        let mut view = self.backend.session(&target).await?;
+        if self.control_generation()? != generation {
+            return Err(ZcodeError::of(codes::STALE_GENERATION));
+        }
+        if view.session_id != target.session_id {
+            return Err(ZcodeError::of(codes::NO_SESSION));
+        }
+        view.generation = generation;
+        view.capabilities = if view.ready {
+            self.session_capabilities(&view.session_id, generation)
+        } else {
+            CapabilityView::default()
+        };
+        {
+            let mut inner = self.lock();
+            if inner.generation != generation || inner.state != ConnectionState::Paired {
+                return Err(ZcodeError::of(codes::STALE_GENERATION));
+            }
+            let (applied, published) = inner.publish_session(view);
+            if !applied {
+                return Err(ZcodeError::of(codes::NOT_READY));
+            }
+            view = published;
+        }
+        Ok(super::local_queue::host::BoundQueueSession { target, view })
+    }
+    pub(crate) fn session_write_lock(&self, session_id: &str) -> Arc<AsyncMutex<()>> {
+        let mut locks = self
+            .session_write_locks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(lock) = locks.get(session_id).and_then(std::sync::Weak::upgrade) {
+            return lock;
+        }
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        let lock = Arc::new(AsyncMutex::new(()));
+        locks.insert(session_id.to_owned(), Arc::downgrade(&lock));
+        lock
+    }
     /// 生产构造：固定官方端点，不自动 OAuth、不自动连接；策略默认全关（`needs_evidence`）。
     ///
     /// 构造即启动一条 relay 事件泵（`Weak` 持有 Hub 状态：Hub 释放或事件通道关闭即退出），
@@ -2092,6 +2349,8 @@ impl ZcodeHub {
             })
         };
         let hub = Self {
+            session_write_locks: Mutex::new(BTreeMap::new()),
+            queue_service_ref: Mutex::new(std::sync::Weak::new()),
             store,
             backend,
             policy_source,
@@ -2864,6 +3123,9 @@ impl ZcodeHub {
     /// 即便关闭窗口随后清位，既有轮次也绝不自行重连。
     pub(crate) fn begin_shutdown(&self) {
         self.shutting_down.store(true, Ordering::SeqCst);
+        if let Some(queue) = self.queue_service() {
+            queue.shutdown();
+        }
         self.pause_auto_connect();
     }
 
@@ -3009,6 +3271,9 @@ impl ZcodeHub {
                 if inner.state_epoch != attempt {
                     let current = inner.view();
                     drop(inner);
+                    if current.state == ConnectionState::Paired {
+                        self.notify_queue_connection_ready();
+                    }
                     return match current.state {
                         ConnectionState::Paired => Ok(current),
                         state => Err(Self::state_error(state)),
@@ -3025,6 +3290,9 @@ impl ZcodeHub {
                 };
                 drop(inner);
                 self.emit_connection(&out);
+                if out.state == ConnectionState::Paired {
+                    self.notify_queue_connection_ready();
+                }
                 for stale in &stale {
                     self.emit_session(stale);
                 }
@@ -3370,6 +3638,59 @@ impl ZcodeHub {
         // 重放命中不 emit 新的 Action 事件（否则手机会看到重复回执）。
         if let Some(existing) = self.backend.existing_receipt(&ctx, &action).await? {
             return Ok(existing);
+        }
+        let queue_store = self
+            .queue_service()
+            .map(|service| service.store())
+            .unwrap_or_else(|| {
+                super::local_queue::store::SqlLocalQueueStore::new(self.store.clone())
+            });
+        let queue_key = TargetKey {
+            session_id: action.session_id().to_owned(),
+        };
+        let mut stop_paused = false;
+        if matches!(&action, ControlAction::Stop { .. })
+            && queue_store.blocks_legacy_send(&queue_key)?
+        {
+            self.control_generation()?;
+            self.check_policy(&action)?;
+            queue_store.pause(
+                &queue_key,
+                "external_stop",
+                &format!("external-stop:{}", ctx.action_id),
+            )?;
+            stop_paused = true;
+        }
+        let write_lock = if matches!(
+            &action,
+            ControlAction::Send { .. } | ControlAction::Stop { .. }
+        ) {
+            Some(self.session_write_lock(action.session_id()))
+        } else {
+            None
+        };
+        let _write_guard = match &write_lock {
+            Some(lock) => Some(lock.lock().await),
+            None => None,
+        };
+        if self.lock().generation != generation {
+            return Err(ZcodeError::of(codes::STALE_GENERATION));
+        }
+        if matches!(&action, ControlAction::Stop { .. })
+            && !stop_paused
+            && queue_store.blocks_legacy_send(&queue_key)?
+        {
+            self.check_policy(&action)?;
+            queue_store.pause(
+                &queue_key,
+                "external_stop",
+                &format!("external-stop:{}", ctx.action_id),
+            )?;
+        }
+        if matches!(&action, ControlAction::Send { .. }) {
+            if queue_store.blocks_legacy_send(&queue_key)? {
+                return Err(ZcodeError::of(codes::QUEUE_REFRESH_REQUIRED));
+            }
         }
         self.control_generation()?;
         // 能力闸分三段：
@@ -3897,6 +4218,514 @@ impl ZcodeHub {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn queue_host_receipt_reads_original_action_without_frames() {
+        use crate::services::zcode_control::local_queue::host::QueueHostPort;
+        let fake = Arc::new(FakeBackend::default());
+        let hub = paired_hub(fake.clone()).await;
+        let key = TargetKey {
+            session_id: "sess_synthetic0000".into(),
+        };
+        let bound = QueueHostPort::read(hub.as_ref(), &key, Duration::ZERO)
+            .await
+            .unwrap();
+        let actions = super::super::action::ActionStore::new(hub.store.clone());
+        actions
+            .reserve(&ctx("original"), &bound.target, "hash", "synthetic")
+            .unwrap();
+        let expected = ActionReceipt {
+            action_id: "original".into(),
+            session_id: key.session_id.clone(),
+            generation: bound.target.generation,
+            state: ActionState::Accepted,
+            reason_code: None,
+            send_admission: None,
+        };
+        actions.record_result(&expected).unwrap();
+        assert_eq!(
+            QueueHostPort::receipt(hub.as_ref(), "original", "synthetic-device")
+                .await
+                .unwrap(),
+            Some(expected)
+        );
+        assert!(QueueHostPort::receipt(hub.as_ref(), "original", "other")
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(fake.execute_calls.load(Ordering::SeqCst), 0);
+    }
+    #[tokio::test]
+    async fn queue_host_stop_delegates_only_with_current_target() {
+        use crate::services::zcode_control::local_queue::host::QueueHostPort;
+        let fake = Arc::new(FakeBackend::default());
+        let hub = Arc::new(ZcodeHub::with_parts(
+            stored(URL),
+            fake.clone(),
+            policy_with(&["send", "interrupt"]),
+        ));
+        hub.authorize(OAuthProvider::Bigmodel, noop_open())
+            .await
+            .unwrap();
+        hub.connect().await.unwrap();
+        enable_queue_test_device(&hub);
+        let key = TargetKey {
+            session_id: "sess_synthetic0000".into(),
+        };
+        let bound = QueueHostPort::read(hub.as_ref(), &key, Duration::ZERO)
+            .await
+            .unwrap();
+        let mut stale = bound.target.clone();
+        stale.generation += 1;
+        assert!(
+            QueueHostPort::stop(hub.as_ref(), &ctx("stale"), &stale, "E")
+                .await
+                .is_err()
+        );
+        assert_eq!(fake.execute_calls.load(Ordering::SeqCst), 0);
+        QueueHostPort::stop(hub.as_ref(), &ctx("stop"), &bound.target, "E")
+            .await
+            .unwrap();
+        assert_eq!(fake.execute_calls.load(Ordering::SeqCst), 1);
+    }
+    #[tokio::test]
+    async fn old_stop_pauses_queue_before_waiting_for_session_lock() {
+        use crate::services::zcode_control::local_queue::{
+            store::SqlLocalQueueStore,
+            types::{EnqueueCommand, QueueActor, QueueDraft},
+        };
+        let fake = Arc::new(FakeBackend::default());
+        let hub = Arc::new(ZcodeHub::with_parts(
+            stored(URL),
+            fake.clone(),
+            policy_with(&["send", "interrupt"]),
+        ));
+        hub.authorize(OAuthProvider::Bigmodel, noop_open())
+            .await
+            .unwrap();
+        hub.connect().await.unwrap();
+        let actor = QueueActor {
+            device_id: "synthetic-device".into(),
+            device_name: "Synthetic".into(),
+        };
+        let key = TargetKey {
+            session_id: "sess_synthetic0000".into(),
+        };
+        let store = SqlLocalQueueStore::new(hub.store.clone());
+        store
+            .enqueue(
+                &EnqueueCommand {
+                    request_id: "queued".into(),
+                    actor: actor.clone(),
+                    session_id: key.session_id.clone(),
+                    workspace_path: "/synthetic".into(),
+                    workspace_identity: None,
+                    draft: QueueDraft {
+                        text: "B".into(),
+                        attachments: vec![],
+                    },
+                    prepared: super::super::command::PreparedSend::from_stored("B".into()).unwrap(),
+                    edited_from: None,
+                },
+                1,
+            )
+            .unwrap();
+        let lock = hub.session_write_lock(&key.session_id);
+        let guard = lock.lock().await;
+        let generation = hub.connection().generation;
+        let worker = hub.clone();
+        let action = ControlAction::Stop {
+            session_id: key.session_id.clone(),
+            generation,
+            expected_foreground_execution_id: "E".into(),
+        };
+        let task = tokio::spawn(async move { worker.execute(ctx("stop-old"), action).await });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if !store.view(&actor, &key).unwrap().auto_drain {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("queue must pause before waiting for write lock");
+        assert_eq!(fake.execute_calls.load(Ordering::SeqCst), 0);
+        drop(guard);
+        task.await.unwrap().unwrap();
+        assert_eq!(fake.execute_calls.load(Ordering::SeqCst), 1);
+    }
+    #[tokio::test]
+    async fn old_send_serializes_with_enqueue_and_cannot_bypass_it() {
+        use crate::services::zcode_control::local_queue::{
+            store::SqlLocalQueueStore,
+            types::{EnqueueCommand, QueueActor, QueueDraft},
+        };
+        let fake = Arc::new(FakeBackend::default());
+        let hub = paired_hub(fake.clone()).await;
+        let session = "sess_synthetic0000";
+        let lock = hub.session_write_lock(session);
+        let guard = lock.lock().await;
+        let entered = Arc::new(Notify::new());
+        let signal = entered.clone();
+        let worker = hub.clone();
+        let generation = hub.connection().generation;
+        let mut task = tokio::spawn(async move {
+            signal.notify_one();
+            worker
+                .execute(ctx("old-send"), send_action(generation))
+                .await
+        });
+        entered.notified().await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut task)
+                .await
+                .is_err(),
+            "old send must use the session lock"
+        );
+        let store = SqlLocalQueueStore::new(hub.store.clone());
+        store
+            .enqueue(
+                &EnqueueCommand {
+                    request_id: "queued".into(),
+                    actor: QueueActor {
+                        device_id: "synthetic-device".into(),
+                        device_name: "Synthetic".into(),
+                    },
+                    session_id: session.into(),
+                    workspace_path: "/synthetic".into(),
+                    workspace_identity: None,
+                    draft: QueueDraft {
+                        text: "B".into(),
+                        attachments: vec![],
+                    },
+                    prepared: super::super::command::PreparedSend::from_stored("B".into()).unwrap(),
+                    edited_from: None,
+                },
+                1,
+            )
+            .unwrap();
+        drop(guard);
+        assert!(task
+            .await
+            .unwrap()
+            .unwrap_err()
+            .is(codes::QUEUE_REFRESH_REQUIRED));
+        assert_eq!(fake.execute_calls.load(Ordering::SeqCst), 0);
+    }
+    fn enable_queue_test_device(hub: &ZcodeHub) {
+        hub.store.with(|c| {
+            try_set_setting_conn(c, crate::remote::KEY_ENABLED, "true").unwrap();
+            crate::remote::pairing::persist_device(
+                c,
+                &crate::remote::pairing::NewDevice {
+                    id: "synthetic-device".into(),
+                    name: "Synthetic".into(),
+                    ua: "synthetic".into(),
+                    origin_ip: "127.0.0.1".into(),
+                    via: "lan".into(),
+                    paired_at: chrono::Utc::now().timestamp_millis(),
+                },
+            )
+            .unwrap();
+        });
+    }
+    async fn queue_host_gate_race(revoke: bool) {
+        use crate::services::zcode_control::local_queue::host::QueueHostPort;
+        let fake = Arc::new(FakeBackend::default());
+        let hub = paired_hub(fake.clone()).await;
+        enable_queue_test_device(&hub);
+        let key = TargetKey {
+            session_id: "sess_synthetic0000".into(),
+        };
+        let bound = QueueHostPort::read(hub.as_ref(), &key, Duration::ZERO)
+            .await
+            .unwrap();
+        let gate = Arc::new(Notify::new());
+        *fake.bind_gate.lock().unwrap() = Some(gate.clone());
+        let baseline = fake.bind_calls.load(Ordering::SeqCst);
+        let worker = hub.clone();
+        let task = tokio::spawn(async move {
+            let body = super::super::command::PreparedSend::from_stored("B".into()).unwrap();
+            QueueHostPort::send_prepared(
+                worker.as_ref(),
+                &ctx("gate-race"),
+                &bound.target,
+                &body,
+                None,
+            )
+            .await
+        });
+        wait_until(|| fake.bind_calls.load(Ordering::SeqCst) > baseline).await;
+        hub.store.with(|c| {
+            if revoke {
+                crate::remote::pairing::revoke_device(c, "synthetic-device").unwrap();
+            } else {
+                try_set_setting_conn(c, crate::remote::KEY_ENABLED, "false").unwrap();
+            }
+        });
+        gate.notify_one();
+        assert!(task.await.unwrap().is_err());
+        assert!(fake.prepared_texts.lock().unwrap().is_empty());
+    }
+    #[tokio::test]
+    async fn queue_host_gate_disabled_during_bind_never_dispatches() {
+        queue_host_gate_race(false).await;
+    }
+    #[tokio::test]
+    async fn queue_host_gate_revoked_during_bind_never_dispatches() {
+        queue_host_gate_race(true).await;
+    }
+    #[tokio::test]
+    async fn queue_service_preserves_prewrite_gate_reason_during_final_binding() {
+        use crate::services::zcode_control::local_queue::{
+            service::ZcodeQueueService,
+            store::SqlLocalQueueStore,
+            types::{EnqueueCommand, QueueActor, QueueDraft, QueueItemState},
+        };
+        for scenario in 0..3 {
+            let fake = Arc::new(FakeBackend::default());
+            fake.queue_ready.store(true, Ordering::SeqCst);
+            let hub = paired_hub(fake.clone()).await;
+            enable_queue_test_device(&hub);
+            let store = SqlLocalQueueStore::new(hub.store.clone());
+            let svc = Arc::new(ZcodeQueueService::new(
+                store.clone(),
+                hub.clone(),
+                hub.clone(),
+            ));
+            let actor = QueueActor {
+                device_id: "synthetic-device".into(),
+                device_name: "Synthetic".into(),
+            };
+            let key = TargetKey {
+                session_id: "sess_synthetic0000".into(),
+            };
+            svc.enqueue(EnqueueCommand {
+                request_id: "B".into(),
+                actor: actor.clone(),
+                session_id: key.session_id.clone(),
+                workspace_path: "/synthetic/workspace".into(),
+                workspace_identity: None,
+                draft: QueueDraft {
+                    text: "B".into(),
+                    attachments: vec![],
+                },
+                prepared: super::super::command::PreparedSend::from_stored("B".into()).unwrap(),
+                edited_from: None,
+            })
+            .await
+            .unwrap();
+            let gate = Arc::new(Notify::new());
+            *fake.bind_gate.lock().unwrap() = Some(gate.clone());
+            let at = fake.bind_calls.load(Ordering::SeqCst) + 3;
+            fake.bind_gate_at.store(at, Ordering::SeqCst);
+            let worker = svc.clone();
+            let worker_key = key.clone();
+            let task = tokio::spawn(async move { worker.flush_one(&worker_key).await });
+            wait_until(|| fake.bind_calls.load(Ordering::SeqCst) >= at).await;
+            assert_eq!(
+                store.view(&actor, &key).unwrap().items[0].state,
+                QueueItemState::Dispatching
+            );
+            hub.store.with(|c| {
+                if scenario == 1 {
+                    crate::remote::pairing::revoke_device(c, "synthetic-device").unwrap();
+                } else if scenario == 0 {
+                    try_set_setting_conn(c, crate::remote::KEY_ENABLED, "false").unwrap();
+                }
+            });
+            if scenario == 2 {
+                fake.bound_path_changed.store(true, Ordering::SeqCst);
+            }
+            gate.notify_one();
+            task.await.unwrap().unwrap();
+            let view = store.view(&actor, &key).unwrap();
+            assert_eq!(view.items[0].state, QueueItemState::Queued);
+            assert!(!view.auto_drain);
+            assert_eq!(
+                view.pause_reason.as_deref(),
+                Some(if scenario != 0 {
+                    codes::NO_SESSION
+                } else {
+                    codes::NOT_READY
+                })
+            );
+            assert!(fake.prepared_texts.lock().unwrap().is_empty());
+        }
+    }
+    #[tokio::test]
+    async fn queue_host_shutdown_during_bind_never_dispatches() {
+        use crate::services::zcode_control::local_queue::host::QueueHostPort;
+        let fake = Arc::new(FakeBackend::default());
+        let hub = paired_hub(fake.clone()).await;
+        enable_queue_test_device(&hub);
+        let key = TargetKey {
+            session_id: "sess_synthetic0000".into(),
+        };
+        let bound = QueueHostPort::read(hub.as_ref(), &key, Duration::ZERO)
+            .await
+            .unwrap();
+        let gate = Arc::new(Notify::new());
+        *fake.bind_gate.lock().unwrap() = Some(gate.clone());
+        let baseline = fake.bind_calls.load(Ordering::SeqCst);
+        let worker = hub.clone();
+        let task = tokio::spawn(async move {
+            let body = super::super::command::PreparedSend::from_stored("B".into()).unwrap();
+            QueueHostPort::send_prepared(
+                worker.as_ref(),
+                &ctx("shutdown"),
+                &bound.target,
+                &body,
+                None,
+            )
+            .await
+        });
+        wait_until(|| fake.bind_calls.load(Ordering::SeqCst) > baseline).await;
+        hub.begin_shutdown();
+        gate.notify_one();
+        assert!(task.await.unwrap().is_err());
+        assert!(fake.prepared_texts.lock().unwrap().is_empty());
+    }
+    #[tokio::test]
+    async fn queue_host_sends_frozen_body_once_and_rejects_stale_target() {
+        use crate::services::zcode_control::local_queue::host::QueueHostPort;
+        let fake = Arc::new(FakeBackend::default());
+        let hub = paired_hub(fake.clone()).await;
+        enable_queue_test_device(&hub);
+        let key = TargetKey {
+            session_id: "sess_synthetic0000".into(),
+        };
+        let bound = QueueHostPort::read(hub.as_ref(), &key, Duration::ZERO)
+            .await
+            .unwrap();
+        let body = super::super::command::PreparedSend::from_stored("frozen".into()).unwrap();
+        let mut stale = bound.target.clone();
+        stale.generation += 1;
+        assert!(
+            QueueHostPort::send_prepared(hub.as_ref(), &ctx("bad"), &stale, &body, None)
+                .await
+                .is_err()
+        );
+        assert!(fake.prepared_texts.lock().unwrap().is_empty());
+        QueueHostPort::send_prepared(hub.as_ref(), &ctx("ok"), &bound.target, &body, None)
+            .await
+            .unwrap();
+        assert_eq!(*fake.prepared_texts.lock().unwrap(), vec!["frozen"]);
+        assert_eq!(fake.execute_calls.load(Ordering::SeqCst), 0);
+    }
+    #[tokio::test]
+    async fn queue_host_rejects_backend_revision_older_than_published_view() {
+        use crate::services::zcode_control::local_queue::host::QueueHostPort;
+        let fake = Arc::new(FakeBackend::default());
+        let hub = paired_hub(fake).await;
+        let key = TargetKey {
+            session_id: "sess_synthetic0000".into(),
+        };
+        let bound = QueueHostPort::read(hub.as_ref(), &key, Duration::ZERO)
+            .await
+            .unwrap();
+        let mut newer = bound.view;
+        newer.revision = Some(2);
+        hub.lock().publish_session(newer);
+        assert!(
+            QueueHostPort::read(hub.as_ref(), &key, Duration::ZERO)
+                .await
+                .is_err(),
+            "old backend data must not be presented as a fresh bound view"
+        );
+    }
+    #[tokio::test]
+    async fn paired_before_connect_finishes_requests_activation_again_after_bridge_epoch_advance() {
+        let fake = Arc::new(FakeBackend::default());
+        let hub = Arc::new(ZcodeHub::with_parts(
+            stored(URL),
+            fake.clone(),
+            send_policy(),
+        ));
+        hub.authorize(OAuthProvider::Bigmodel, noop_open())
+            .await
+            .unwrap();
+        enable_queue_test_device(&hub);
+        let (queue, _) = hub.install_queue();
+        let (tx, rx) = tokio::sync::broadcast::channel(64);
+        let listener = tokio::spawn(crate::remote::run_queue_listener(queue.clone(), rx, false));
+        let gate = Arc::new(Notify::new());
+        *fake.gate.lock().unwrap() = Some(gate.clone());
+        let worker = hub.clone();
+        let task = tokio::spawn(async move { worker.connect().await });
+        wait_until(|| fake.connect_calls.load(Ordering::SeqCst) > 0).await;
+        tx.send(ControlEvent {
+            seq: 1,
+            generation: hub.connection().generation,
+            session_id: None,
+            kind: ControlEventKind::Connection,
+            data: serde_json::json!({"state":"paired"}),
+            device_id: None,
+        })
+        .unwrap();
+        wait_until(|| queue.activation_call_count() >= 1).await;
+        assert_eq!(hub.queue_bridge_epoch(), Some(0));
+        gate.notify_one();
+        task.await.unwrap().unwrap();
+        assert_eq!(hub.queue_bridge_epoch(), Some(1));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while queue.activation_call_count() < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("completed connect must notify after bridge invalidate");
+        assert_eq!(fake.connect_calls.load(Ordering::SeqCst), 1);
+        queue.shutdown();
+        listener.await.unwrap();
+    }
+    #[tokio::test]
+    async fn failed_connect_does_not_request_queue_activation() {
+        let fake = Arc::new(FakeBackend::default());
+        *fake.connect_result.lock().unwrap() = Some(Err(ZcodeError::offline()));
+        let hub = Arc::new(ZcodeHub::with_parts(
+            stored(URL),
+            fake.clone(),
+            send_policy(),
+        ));
+        hub.authorize(OAuthProvider::Bigmodel, noop_open())
+            .await
+            .unwrap();
+        let (queue, _) = hub.install_queue();
+        assert!(hub.connect().await.is_err());
+        tokio::task::yield_now().await;
+        assert_eq!(queue.activation_call_count(), 0);
+        assert_eq!(fake.connect_calls.load(Ordering::SeqCst), 1);
+        queue.shutdown();
+    }
+    #[tokio::test]
+    async fn queue_host_read_uses_existing_backend_and_binding() {
+        use crate::services::zcode_control::local_queue::host::QueueHostPort;
+        let fake = Arc::new(FakeBackend::default());
+        let hub = paired_hub(fake.clone()).await;
+        let key = TargetKey {
+            session_id: "sess_synthetic0000".into(),
+        };
+        let bound = QueueHostPort::read(hub.as_ref(), &key, Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(bound.target.session_id, key.session_id);
+        assert_eq!(bound.view.generation, bound.target.generation);
+        assert_eq!(fake.execute_calls.load(Ordering::SeqCst), 0);
+    }
+    #[tokio::test]
+    async fn session_write_lock_shares_by_target() {
+        let hub = super::ZcodeHub::with_parts(
+            crate::remote::pairing::DeviceStore::memory(),
+            std::sync::Arc::new(FakeBackend::default()),
+            send_policy(),
+        );
+        let a = hub.session_write_lock("a");
+        let same = hub.session_write_lock("a");
+        let other = hub.session_write_lock("b");
+        assert!(std::sync::Arc::ptr_eq(&a, &same));
+        assert!(!std::sync::Arc::ptr_eq(&a, &other));
+    }
     use super::*;
     use crate::database::dao::settings::{try_get_setting_conn, try_set_setting_conn};
     use crate::database::dao::zcode_capability::{CapabilityLedger, DbCapabilityLedger};
@@ -3941,7 +4770,12 @@ mod tests {
         disconnect_gate: Mutex<Option<Arc<Notify>>>,
         reset_calls: AtomicUsize,
         bind_calls: AtomicUsize,
+        bind_gate: Mutex<Option<Arc<Notify>>>,
+        bind_gate_at: AtomicUsize,
+        queue_ready: AtomicBool,
+        bound_path_changed: AtomicBool,
         execute_calls: AtomicUsize,
+        prepared_texts: Mutex<Vec<String>>,
         /// 在途 connect 的闸（迟到结果测试用）。
         gate: Mutex<Option<Arc<Notify>>>,
         /// 在途 `session()` 的闸（GET 在途掉线测试用）。
@@ -3961,6 +4795,7 @@ mod tests {
         /// 持久幂等查询被调用次数（证明查询先于连接/许可闸）。
         existing_calls: AtomicUsize,
         bind_generation: AtomicU64,
+        connect_epoch: AtomicU64,
         /// 每次 connect 收到的目标（`sid` + `mid`），用于证明只从保存链接解析。
         routes: Mutex<Vec<(String, Option<String>)>>,
         /// 每次 reset 收到的目标代际。
@@ -4067,6 +4902,9 @@ mod tests {
     }
 
     impl HubBackend for FakeBackend {
+        fn bridge_epoch(&self) -> Option<u64> {
+            Some(self.connect_epoch.load(Ordering::SeqCst))
+        }
         fn authorize<'a>(
             &'a self,
             provider: OAuthProvider,
@@ -4147,6 +4985,7 @@ mod tests {
                     .unwrap_or_else(|| Ok(Self::paired_view()));
                 // 替身 relay：握手成功 = 一条 live 连接（关闭清理必须把它关掉）。
                 if matches!(&result, Ok(view) if view.state == ConnectionState::Paired) {
+                    self.connect_epoch.fetch_add(1, Ordering::SeqCst);
                     self.live.store(true, Ordering::SeqCst);
                 }
                 result
@@ -4183,15 +5022,29 @@ mod tests {
         }
 
         fn bind_session<'a>(&'a self, key: &'a TargetKey) -> BoxFuture<'a, ZResult<BoundTarget>> {
-            self.bind_calls.fetch_add(1, Ordering::SeqCst);
+            let call = self.bind_calls.fetch_add(1, Ordering::SeqCst) + 1;
             let session_id = key.session_id.clone();
             let generation = self.bind_generation.load(Ordering::SeqCst);
+            let at = self.bind_gate_at.load(Ordering::SeqCst);
+            let gate = if at == 0 || at == call {
+                self.bind_gate.lock().unwrap().take()
+            } else {
+                None
+            };
             Box::pin(async move {
+                if let Some(gate) = gate {
+                    gate.notified().await;
+                }
+                let path = if self.bound_path_changed.load(Ordering::SeqCst) {
+                    "/synthetic/changed"
+                } else {
+                    "/synthetic/workspace"
+                };
                 Ok(BoundTarget {
                     session_id,
-                    workspace_path: "/synthetic/workspace".into(),
+                    workspace_path: path.into(),
                     workspace_identity: None,
-                    workspace_key: "/synthetic/workspace".into(),
+                    workspace_key: path.into(),
                     generation,
                     bridge_generation: None,
                 })
@@ -4201,6 +5054,7 @@ mod tests {
         fn session<'a>(&'a self, target: &'a BoundTarget) -> BoxFuture<'a, ZResult<SessionView>> {
             self.session_calls.fetch_add(1, Ordering::SeqCst);
             let ready = !self.session_unready.load(Ordering::SeqCst);
+            let queue_ready = self.queue_ready.load(Ordering::SeqCst);
             Box::pin(async move {
                 let gate = self.session_gate.lock().unwrap().clone();
                 if let Some(gate) = gate {
@@ -4212,11 +5066,49 @@ mod tests {
                     revision: Some(1),
                     ready,
                     pending: Vec::new(),
-                    control: None,
+                    control: if queue_ready {
+                        Some(ControlView {
+                            active_works: vec![],
+                        })
+                    } else {
+                        None
+                    },
                     selection: None,
                     capabilities: CapabilityView::default(),
-                    queue: QueueView::default(),
+                    queue: if queue_ready {
+                        QueueView {
+                            known: true,
+                            paused: Some(false),
+                            ..Default::default()
+                        }
+                    } else {
+                        QueueView::default()
+                    },
+                    execution_terminal: None,
                     input_routing: None,
+                })
+            })
+        }
+
+        fn execute_prepared<'a>(
+            &'a self,
+            ctx: &'a ActionContext,
+            target: &'a BoundTarget,
+            body: &'a super::super::command::PreparedSend,
+            _held: Option<&'a super::super::types::HeldQueueChoice>,
+        ) -> BoxFuture<'a, super::super::command::PreparedResult<ActionReceipt>> {
+            self.prepared_texts
+                .lock()
+                .unwrap()
+                .push(body.wire_text().to_owned());
+            Box::pin(async move {
+                Ok(ActionReceipt {
+                    action_id: ctx.action_id.clone(),
+                    session_id: target.session_id.clone(),
+                    generation: target.generation,
+                    state: ActionState::Accepted,
+                    reason_code: None,
+                    send_admission: None,
                 })
             })
         }
@@ -6370,6 +7262,7 @@ mod tests {
                 selection: None,
                 capabilities: CapabilityView::default(),
                 queue: QueueView::default(),
+                execution_terminal: None,
                 input_routing: None,
             }
         }
@@ -6454,6 +7347,7 @@ mod tests {
                 }],
                 availability: QueueActionAvailability::default(),
             },
+            execution_terminal: None,
             input_routing: None,
         };
         hub.lock().publish_session(published.clone());
@@ -6524,6 +7418,7 @@ mod tests {
                 ],
                 availability: QueueActionAvailability::default(),
             },
+            execution_terminal: None,
             input_routing: None,
         };
         hub.lock().publish_session(published.clone());
@@ -6595,6 +7490,7 @@ mod tests {
                 items: vec![queue_item("queue_a", 0), queue_item("queue_b", 1)],
                 availability: QueueActionAvailability::default(),
             },
+            execution_terminal: None,
             input_routing: None,
         };
         let (applied, _) = hub.lock().publish_session(degraded);
@@ -6617,6 +7513,7 @@ mod tests {
                 items: vec![queue_item("queue_old", 0)],
                 availability: QueueActionAvailability::default(),
             },
+            execution_terminal: None,
             input_routing: None,
         };
         let (applied, published) = hub.lock().publish_session(older);
@@ -6681,6 +7578,7 @@ mod tests {
                     send_queued_now_allowed: false,
                 },
             },
+            execution_terminal: None,
             input_routing: None,
         };
         hub.lock().publish_session(ready.clone());
@@ -7163,6 +8061,7 @@ mod tests {
             selection: None,
             capabilities: CapabilityView::default(),
             queue: QueueView::default(),
+            execution_terminal: None,
             input_routing: None,
         }
     }
@@ -7568,6 +8467,7 @@ mod tests {
                 }],
                 control: Some(ControlView {
                     active_works: vec![ActiveWork {
+                        source_command_id: None,
                         kind: "primaryTurn".into(),
                         foreground_execution_id: Some("E-synthetic-pump-change".into()),
                     }],
@@ -7575,6 +8475,7 @@ mod tests {
                 selection: None,
                 capabilities,
                 queue: QueueView::default(),
+                execution_terminal: None,
                 input_routing: None,
             };
         // ① 未 GET 过的会话：能力矩阵回基线全关，代际/会话/卡面全部按视图落事件。
@@ -7692,6 +8593,7 @@ mod tests {
             selection: None,
             capabilities: send_policy(),
             queue: QueueView::default(),
+            execution_terminal: None,
             input_routing: None,
         };
         pump.push_outcome(
@@ -7743,6 +8645,7 @@ mod tests {
             selection: None,
             capabilities: CapabilityView::default(),
             queue: QueueView::default(),
+            execution_terminal: None,
             input_routing: None,
         };
         pump.push_outcome(Ok(()), vec![recovered]);
@@ -7819,6 +8722,7 @@ mod tests {
             selection: None,
             capabilities: CapabilityView::default(),
             queue: QueueView::default(),
+            execution_terminal: None,
             input_routing: None,
         };
         pump.push_outcome(Ok(()), vec![alive]);
@@ -9464,6 +10368,7 @@ mod tests {
             selection: None,
             capabilities: CapabilityView::default(),
             queue: QueueView::default(),
+            execution_terminal: None,
             input_routing: None,
         }
     }
@@ -10784,6 +11689,7 @@ mod tests {
             active_works: guards
                 .into_iter()
                 .map(|guard_id| ActiveWork {
+                    source_command_id: None,
                     kind: "primaryTurn".to_owned(),
                     foreground_execution_id: Some(guard_id.to_owned()),
                 })

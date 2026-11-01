@@ -57,6 +57,8 @@ pub mod codes {
     pub const STALE_PENDING: &str = "stale_pending";
     /// 动作载荷无效。
     pub const INVALID_ACTION: &str = "invalid_action";
+    /// 本地队列正在接管发送，客户端需要刷新。
+    pub const QUEUE_REFRESH_REQUIRED: &str = "queue_refresh_required";
     /// 答案载荷无效。
     pub const INVALID_ANSWER: &str = "invalid_answer";
     /// 选项被策略拒绝（如 fullAccess/未知 kind）。
@@ -939,6 +941,8 @@ pub fn project_pending_detail_bounded(detail: Option<&Value>) -> PendingDetailPr
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ActiveWork {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_command_id: Option<String>,
     pub kind: String,
     pub foreground_execution_id: Option<String>,
 }
@@ -1210,6 +1214,15 @@ pub struct QueueView {
     pub availability: QueueActionAvailability,
 }
 
+/// 同一订阅中经关联标识确认的最小回合终态。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExecutionTerminal {
+    pub input_id: String,
+    pub result_type: String,
+    pub revision: u64,
+}
+
 /// 会话投影视图（手机唯一可见的会话状态面）。
 ///
 /// 只包含**已按本会话 topic + 当前 subscriptionId + 当前代际**过滤后的数据；
@@ -1217,6 +1230,8 @@ pub struct QueueView {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionView {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_terminal: Option<ExecutionTerminal>,
     pub session_id: String,
     pub generation: u64,
     pub revision: Option<u64>,
@@ -1441,6 +1456,7 @@ mod tests {
         #[test]
         fn queue_serializes_camel_case_and_keeps_host_identity() {
             let view = SessionView {
+                execution_terminal: None,
                 session_id: "sess_queue".to_owned(),
                 generation: 2,
                 revision: Some(5),

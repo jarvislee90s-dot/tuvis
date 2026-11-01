@@ -324,6 +324,7 @@ async fn queue_actions_and_held_queue_send_cross_http_once_each() {
                 send_queued_now_allowed: true,
             },
         },
+        execution_terminal: None,
         input_routing: Some(InputRoutingView {
             mode: "choice".to_owned(),
             reason_code: Some("heldQueueDispositionRequired".to_owned()),
@@ -1218,6 +1219,7 @@ fn session_with_cards() -> SessionView {
         pending: vec![question_card(), permission_card()],
         control: Some(ControlView {
             active_works: vec![ActiveWork {
+                source_command_id: None,
                 kind: "primaryTurn".to_owned(),
                 foreground_execution_id: Some(STOP_EXECUTION.to_owned()),
             }],
@@ -1225,6 +1227,7 @@ fn session_with_cards() -> SessionView {
         selection: None,
         capabilities: all_policy(),
         queue: Default::default(),
+        execution_terminal: None,
         input_routing: None,
     }
 }
@@ -1483,6 +1486,7 @@ async fn link_change_invalidates_old_pending_and_actions() {
         selection: None,
         capabilities: Default::default(),
         queue: Default::default(),
+        execution_terminal: None,
         input_routing: None,
     });
     let (status, session) = get_json(
@@ -1605,6 +1609,7 @@ async fn link_change_invalidates_old_pending_and_actions() {
         selection: None,
         capabilities: Default::default(),
         queue: Default::default(),
+        execution_terminal: None,
         input_routing: None,
     });
     let (status, body) = post_action(

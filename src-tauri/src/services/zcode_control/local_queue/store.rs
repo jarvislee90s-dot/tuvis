@@ -29,13 +29,48 @@ fn check_operation_identity(
     }
     Ok(())
 }
+fn mark_restart_unconfirmed_conn(conn: &rusqlite::Connection, now: i64) -> ZResult<()> {
+    let err = || super::super::types::ZcodeError::of(super::super::types::codes::STORAGE_FAILED);
+    let filter = "state='accepted' AND coalesce(json_extract(receipt,'$.sendAdmission.delivery'),'')='startNow' AND coalesce(json_extract(receipt,'$._queueTerminal'),0)=0 AND coalesce(json_extract(receipt,'$._queueUnconfirmed'),0)=0 AND coalesce(json_extract(receipt,'$._queueRestartUnconfirmed'),0)=0";
+    let sessions: Vec<String> = {
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT DISTINCT session_id FROM zcode_send_queue WHERE {filter}"
+            ))
+            .map_err(|_| err())?;
+        let rows = stmt.query_map([], |r| r.get(0)).map_err(|_| err())?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(|_| err())?
+    };
+    for session in &sessions {
+        conn.execute("INSERT INTO zcode_queue_state(session_id,version,auto_drain,pause_reason) VALUES (?1,1,0,'unconfirmed') ON CONFLICT(session_id) DO UPDATE SET version=version+1,auto_drain=0,pause_reason='unconfirmed'",[session]).map_err(|_| err())?;
+        super::super::audit::record_start_conn(
+            conn,
+            now,
+            "",
+            "Tuvis",
+            session,
+            "queue_restart_review",
+            "unconfirmed",
+        )
+        .map_err(|_| err())?;
+    }
+    conn.execute(&format!("UPDATE zcode_send_queue SET receipt=json_set(receipt,'$._queueRestartUnconfirmed',1) WHERE {filter}"),[]).map_err(|_| err())?;
+    Ok(())
+}
 #[derive(Clone)]
 pub(crate) struct SqlLocalQueueStore {
     store: DeviceStore,
+    expiry_changed: std::sync::Arc<tokio::sync::Notify>,
 }
 impl SqlLocalQueueStore {
     pub(crate) fn new(store: DeviceStore) -> Self {
-        Self { store }
+        Self {
+            store,
+            expiry_changed: std::sync::Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+    pub(crate) fn expiry_changed(&self) -> &tokio::sync::Notify {
+        &self.expiry_changed
     }
     pub(crate) fn enqueue(&self, cmd: &EnqueueCommand, now: i64) -> ZResult<EnqueueReceipt> {
         let hash = super::super::action::payload_hash(
@@ -48,7 +83,7 @@ impl SqlLocalQueueStore {
                 "draft": cmd.draft, "prepared": cmd.prepared.wire_text(), "editedFrom": cmd.edited_from
             }),
         )?;
-        self.store.with(|c| {
+        let result = self.store.with(|c| {
             use rusqlite::OptionalExtension;
             let err = || super::super::types::ZcodeError::of(super::super::types::codes::STORAGE_FAILED);
             let tx = c.unchecked_transaction().map_err(|_| err())?;
@@ -76,13 +111,18 @@ impl SqlLocalQueueStore {
             super::super::audit::record_start_conn(&tx, now, &cmd.actor.device_id, &cmd.actor.device_name, &cmd.session_id, "queue", "enqueue").map_err(|_| err())?;
             tx.commit().map_err(|_| err())?;
             Ok(EnqueueReceipt { item_id, item_version: 1, queue_version: queue_version as u64, position: position as u32 })
-        })
+        });
+        if result.is_ok() {
+            self.expiry_changed.notify_one();
+        }
+        result
     }
     pub(crate) fn recover(&self, now: i64) -> ZResult<Vec<RecoveryClaim>> {
         let err =
             || super::super::types::ZcodeError::of(super::super::types::codes::STORAGE_FAILED);
         self.store.with(|c| {
             let tx = c.unchecked_transaction().map_err(|_| err())?;
+            mark_restart_unconfirmed_conn(&tx, now)?;
             let rows: Vec<(String,String,String,String,String,String,String,Option<String>)> = {
                 let mut stmt = tx.prepare("SELECT q.item_id,q.device_id,q.device_name,q.prepared,q.dispatch_action_id,q.dispatch_target,q.session_id,o.stop_action_id FROM zcode_send_queue q LEFT JOIN zcode_queue_operations o ON o.request_id=q.priority_request AND o.stop_claimed=1 WHERE q.state IN ('dispatching','unknown') AND q.dispatch_action_id IS NOT NULL ORDER BY q.seq").map_err(|_| err())?;
                 let iter = stmt.query_map([], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?))).map_err(|_| err())?;
@@ -109,6 +149,25 @@ impl SqlLocalQueueStore {
             tx.commit().map_err(|_| err())?;
             Ok(result)
         })
+    }
+    pub(crate) fn mark_restart_unconfirmed(&self, now: i64) -> ZResult<()> {
+        let err =
+            || super::super::types::ZcodeError::of(super::super::types::codes::STORAGE_FAILED);
+        self.store.with(|c| {
+            let tx = c.unchecked_transaction().map_err(|_| err())?;
+            mark_restart_unconfirmed_conn(&tx, now)?;
+            tx.commit().map_err(|_| err())
+        })
+    }
+    pub(crate) fn unconfirmed_action(
+        &self,
+        actor: &QueueActor,
+        key: &TargetKey,
+    ) -> ZResult<Option<String>> {
+        use rusqlite::OptionalExtension;
+        let err =
+            || super::super::types::ZcodeError::of(super::super::types::codes::STORAGE_FAILED);
+        self.store.with(|c| c.query_row("SELECT dispatch_action_id FROM zcode_send_queue WHERE session_id=?1 AND device_id=?2 AND state='accepted' AND coalesce(json_extract(receipt,'$.sendAdmission.delivery'),'')='startNow' AND coalesce(json_extract(receipt,'$._queueTerminal'),0)=0 AND coalesce(json_extract(receipt,'$._queueUnconfirmed'),0)=0 ORDER BY seq LIMIT 1",rusqlite::params![key.session_id,actor.device_id],|r|r.get(0)).optional()).map_err(|_| err())
     }
     pub(crate) fn finish_priority_safe(
         &self,
@@ -220,6 +279,15 @@ impl SqlLocalQueueStore {
             let count = tx.execute("UPDATE zcode_queue_operations SET draft=NULL WHERE kind='edit' AND draft IS NOT NULL AND expires_at<=?1",[now]).map_err(|_| err())?;
             tx.commit().map_err(|_| err())?; Ok(count)
         })
+    }
+    pub(crate) fn blocks_legacy_send(&self, key: &TargetKey) -> ZResult<bool> {
+        let err =
+            || super::super::types::ZcodeError::of(super::super::types::codes::STORAGE_FAILED);
+        self.store.with(|c| c.query_row("SELECT EXISTS(SELECT 1 FROM zcode_queue_state WHERE session_id=?1 AND auto_drain=0) OR EXISTS(SELECT 1 FROM zcode_send_queue WHERE session_id=?1 AND (state IN ('queued','dispatching','unknown') OR (state='accepted' AND coalesce(json_extract(receipt,'$.sendAdmission.delivery'),'startNow')='startNow' AND coalesce(json_extract(receipt,'$._queueTerminal'),0)=0 AND coalesce(json_extract(receipt,'$._queueUnconfirmed'),0)=0)))", [&key.session_id], |r| r.get(0))).map_err(|_| err())
+    }
+    pub(crate) fn head_device(&self, key: &TargetKey) -> ZResult<Option<String>> {
+        use rusqlite::OptionalExtension;
+        self.store.with(|c| c.query_row("SELECT device_id FROM zcode_send_queue WHERE session_id=?1 AND state='queued' ORDER BY seq LIMIT 1", [&key.session_id], |r| r.get(0)).optional()).map_err(|_| super::super::types::ZcodeError::of(super::super::types::codes::STORAGE_FAILED))
     }
     pub(crate) fn pending_targets(&self) -> ZResult<Vec<TargetKey>> {
         let err =
@@ -406,7 +474,11 @@ impl SqlLocalQueueStore {
             ));
         }
         let (state, pause, clear) = match (receipt.state, &receipt.send_admission) {
-            (ActionState::SendFailed, _) => ("queued", Some("send_failed"), false),
+            (ActionState::SendFailed, _) => (
+                "queued",
+                Some(receipt.reason_code.as_deref().unwrap_or("send_failed")),
+                false,
+            ),
             (ActionState::Unknown, _) | (ActionState::Accepted, None) => {
                 ("unknown", Some("unknown"), false)
             }
@@ -432,7 +504,7 @@ impl SqlLocalQueueStore {
         self.store.with(|c| {
             let tx = c.unchecked_transaction().map_err(|_| err())?;
             let prior: Option<String> = tx.query_row("SELECT receipt FROM zcode_send_queue WHERE item_id=?1 AND dispatch_action_id=?2", rusqlite::params![claim.item_id,claim.ctx.action_id], |r| r.get(0)).map_err(|_| err())?;
-            if prior.as_deref() == Some(json.as_str()) { return Ok(()); }
+            if prior.as_deref().and_then(|s| serde_json::from_str::<super::super::types::ActionReceipt>(s).ok()).as_ref() == Some(receipt) { return Ok(()); }
             let changed = tx.execute("UPDATE zcode_send_queue SET state=?1,item_version=item_version+1,receipt=?2,draft=CASE WHEN ?3 THEN NULL ELSE draft END,prepared=CASE WHEN ?3 THEN '' ELSE prepared END,priority_request=CASE WHEN ?1='queued' THEN NULL ELSE priority_request END WHERE item_id=?4 AND state IN ('dispatching','unknown') AND dispatch_action_id=?5", rusqlite::params![state,json,clear,claim.item_id,claim.ctx.action_id]).map_err(|_| err())?;
             if changed != 1 { return Err(super::super::types::ZcodeError::of(super::super::types::codes::INVALID_ACTION)); }
             let operation_state = if state == "accepted" { "completed" } else if state == "unknown" { "unknown" } else { "failed" };
@@ -443,6 +515,150 @@ impl SqlLocalQueueStore {
                 tx.execute("UPDATE zcode_queue_state SET version=version+1 WHERE session_id=?1", [&claim.target.session_id]).map_err(|_| err())?;
             }
             super::super::audit::record_terminal_conn(&tx, now, &claim.ctx.device_id, &claim.ctx.device_name, &claim.target.session_id, "queue_dispatch", "dispatch", receipt.state.as_str()).map_err(|_| err())?;
+            tx.commit().map_err(|_| err())?;
+            Ok(())
+        })
+    }
+    pub(crate) fn head_matches_target(
+        &self,
+        key: &TargetKey,
+        target: &super::super::types::BoundTarget,
+    ) -> ZResult<bool> {
+        use rusqlite::OptionalExtension;
+        let err =
+            || super::super::types::ZcodeError::of(super::super::types::codes::STORAGE_FAILED);
+        self.store.with(|c| {
+            let row: Option<(String,Option<String>)> = c.query_row("SELECT workspace_path,workspace_identity FROM zcode_send_queue WHERE session_id=?1 AND state='queued' ORDER BY seq LIMIT 1",[&key.session_id],|r|Ok((r.get(0)?,r.get(1)?))).optional().map_err(|_|err())?;
+            Ok(row.is_none_or(|(path,identity)| target.session_id == key.session_id && path == target.workspace_path && (identity.is_none() || identity == target.workspace_identity)))
+        })
+    }
+    pub(crate) fn pause_target_mismatch(&self, key: &TargetKey, now: i64) -> ZResult<()> {
+        let err =
+            || super::super::types::ZcodeError::of(super::super::types::codes::STORAGE_FAILED);
+        self.store.with(|c| {
+            let tx = c.unchecked_transaction().map_err(|_|err())?;
+            let changed=tx.execute("UPDATE zcode_queue_state SET version=version+1,auto_drain=0,pause_reason='target_changed' WHERE session_id=?1 AND auto_drain<>0",[&key.session_id]).map_err(|_|err())?;
+            if changed != 0 { super::super::audit::record_start_conn(&tx,now,"","Tuvis",&key.session_id,"queue_target_changed","paused").map_err(|_|err())?; }
+            tx.commit().map_err(|_|err())
+        })
+    }
+    pub(crate) fn mark_unprovable_execution_target(
+        &self,
+        key: &TargetKey,
+        now: i64,
+    ) -> ZResult<()> {
+        let err =
+            || super::super::types::ZcodeError::of(super::super::types::codes::STORAGE_FAILED);
+        self.store.with(|c| {
+            let tx=c.unchecked_transaction().map_err(|_|err())?;
+            let changed=tx.execute("UPDATE zcode_send_queue SET receipt=json_set(receipt,'$._queueTargetUnconfirmed',1) WHERE session_id=?1 AND state='accepted' AND coalesce(json_extract(receipt,'$.sendAdmission.delivery'),'')='startNow' AND coalesce(json_extract(receipt,'$._queueTerminal'),0)=0 AND coalesce(json_extract(receipt,'$._queueUnconfirmed'),0)=0 AND coalesce(json_extract(receipt,'$._queueTargetUnconfirmed'),0)=0",[&key.session_id]).map_err(|_|err())?;
+            if changed != 0 { tx.execute("UPDATE zcode_queue_state SET version=version+1,auto_drain=0,pause_reason='target_changed' WHERE session_id=?1",[&key.session_id]).map_err(|_|err())?; super::super::audit::record_start_conn(&tx,now,"","Tuvis",&key.session_id,"queue_target_changed","unconfirmed").map_err(|_|err())?; }
+            tx.commit().map_err(|_|err())
+        })
+    }
+    pub(crate) fn mark_changed_execution_target(
+        &self,
+        key: &TargetKey,
+        target: &super::super::types::BoundTarget,
+        now: i64,
+    ) -> ZResult<()> {
+        use rusqlite::OptionalExtension;
+        let err =
+            || super::super::types::ZcodeError::of(super::super::types::codes::STORAGE_FAILED);
+        self.store.with(|c| {
+            let tx=c.unchecked_transaction().map_err(|_|err())?;
+            let row:Option<(String,String)>=tx.query_row("SELECT item_id,dispatch_target FROM zcode_send_queue WHERE session_id=?1 AND state='accepted' AND coalesce(json_extract(receipt,'$.sendAdmission.delivery'),'')='startNow' AND coalesce(json_extract(receipt,'$._queueTerminal'),0)=0 AND coalesce(json_extract(receipt,'$._queueUnconfirmed'),0)=0 AND coalesce(json_extract(receipt,'$._queueTargetUnconfirmed'),0)=0 ORDER BY seq LIMIT 1",[&key.session_id],|r|Ok((r.get(0)?,r.get(1)?))).optional().map_err(|_|err())?;
+            if let Some((item,json))=row {
+                let (mut original,bridge):(super::super::types::BoundTarget,Option<u64>)=serde_json::from_str(&json).map_err(|_|err())?; original.bridge_generation=bridge;
+                if original != *target {
+                    tx.execute("UPDATE zcode_send_queue SET receipt=json_set(receipt,'$._queueTargetUnconfirmed',1) WHERE item_id=?1",[item]).map_err(|_|err())?;
+                    tx.execute("UPDATE zcode_queue_state SET version=version+1,auto_drain=0,pause_reason='target_changed' WHERE session_id=?1",[&key.session_id]).map_err(|_|err())?;
+                    super::super::audit::record_start_conn(&tx,now,"","Tuvis",&key.session_id,"queue_target_changed","unconfirmed").map_err(|_|err())?;
+                }
+            }
+            tx.commit().map_err(|_|err())
+        })
+    }
+    pub(crate) fn matches_execution_target(
+        &self,
+        key: &TargetKey,
+        target: &super::super::types::BoundTarget,
+    ) -> ZResult<bool> {
+        use rusqlite::OptionalExtension;
+        let err =
+            || super::super::types::ZcodeError::of(super::super::types::codes::STORAGE_FAILED);
+        self.store.with(|c| {
+            let json: Option<String> = c.query_row("SELECT dispatch_target FROM zcode_send_queue WHERE session_id=?1 AND state='accepted' AND coalesce(json_extract(receipt,'$.sendAdmission.delivery'),'startNow')='startNow' AND coalesce(json_extract(receipt,'$._queueTerminal'),0)=0 AND coalesce(json_extract(receipt,'$._queueUnconfirmed'),0)=0 AND coalesce(json_extract(receipt,'$._queueRestartUnconfirmed'),0)=0 AND coalesce(json_extract(receipt,'$._queueTargetUnconfirmed'),0)=0 ORDER BY seq LIMIT 1", [&key.session_id], |r| r.get(0)).optional().map_err(|_| err())?;
+            let Some(json) = json else { return Ok(false); };
+            let (mut original, bridge): (super::super::types::BoundTarget, Option<u64>) = serde_json::from_str(&json).map_err(|_| err())?;
+            original.bridge_generation = bridge;
+            Ok(original == *target && target.session_id == key.session_id)
+        })
+    }
+    pub(crate) fn observe_execution(
+        &self,
+        key: &TargetKey,
+        observation: &ExecutionObservation,
+    ) -> ZResult<bool> {
+        use rusqlite::OptionalExtension;
+        let err =
+            || super::super::types::ZcodeError::of(super::super::types::codes::STORAGE_FAILED);
+        self.store.with(|c| {
+            let tx = c.unchecked_transaction().map_err(|_| err())?;
+            let row: Option<(String, String)> = tx.query_row(
+                "SELECT item_id,receipt FROM zcode_send_queue WHERE session_id=?1 AND state='accepted' AND coalesce(json_extract(receipt,'$.sendAdmission.delivery'),'startNow')='startNow' AND coalesce(json_extract(receipt,'$._queueTerminal'),0)=0 AND coalesce(json_extract(receipt,'$._queueUnconfirmed'),0)=0 AND coalesce(json_extract(receipt,'$._queueRestartUnconfirmed'),0)=0 AND coalesce(json_extract(receipt,'$._queueTargetUnconfirmed'),0)=0 ORDER BY seq LIMIT 1",
+                [&key.session_id], |r| Ok((r.get(0)?,r.get(1)?)),
+            ).optional().map_err(|_| err())?;
+            let Some((item, json)) = row else { return Ok(false); };
+            let mut value: serde_json::Value = serde_json::from_str(&json).map_err(|_| err())?;
+            let receipt: super::super::types::ActionReceipt = serde_json::from_value(value.clone()).map_err(|_| err())?;
+            let matches = receipt.generation == observation.generation && receipt.session_id == key.session_id
+                && receipt.send_admission.as_ref().is_some_and(|a| a.delivery == super::super::types::SendDelivery::StartNow && a.input_id == observation.input_id)
+                && value.get("_queueRevision").and_then(|v| v.as_u64()).is_none_or(|revision| observation.revision > revision)
+                && value.get("_queueExecution").and_then(|v| v.as_str()).is_none_or(|execution| observation.execution_id.as_deref().is_none_or(|id| id == execution));
+            if !matches { return Ok(false); }
+            let object = value.as_object_mut().ok_or_else(err)?;
+            object.insert("_queueRevision".into(), observation.revision.into());
+            if let Some(execution) = &observation.execution_id { object.insert("_queueExecution".into(), execution.clone().into()); }
+            if observation.terminal { object.insert("_queueTerminal".into(), true.into()); }
+            tx.execute("UPDATE zcode_send_queue SET receipt=?1 WHERE item_id=?2", rusqlite::params![value.to_string(), item]).map_err(|_| err())?;
+            tx.commit().map_err(|_| err())?;
+            Ok(observation.terminal)
+        })
+    }
+    pub(crate) fn acknowledge_unconfirmed(
+        &self,
+        actor: &QueueActor,
+        key: &TargetKey,
+        action_id: &str,
+        request_id: &str,
+        now: i64,
+    ) -> ZResult<()> {
+        use super::super::types::{codes, ZcodeError};
+        use rusqlite::OptionalExtension;
+        let err = || ZcodeError::of(codes::STORAGE_FAILED);
+        let invalid = || ZcodeError::of(codes::INVALID_ACTION);
+        let hidden = || ZcodeError::of(codes::NO_SESSION);
+        let hash = super::super::action::payload_hash(
+            "barrier_review",
+            &key.session_id,
+            0,
+            &serde_json::json!({"device":actor.device_id,"name":actor.device_name,"actionId":action_id}),
+        )?;
+        self.store.with(|c| {
+            let tx = c.unchecked_transaction().map_err(|_| err())?;
+            check_operation_identity(&tx, request_id, Some(&actor.device_id), "barrier_review")?;
+            let prior: Option<(String,String)> = tx.query_row("SELECT device_id,payload_hash FROM zcode_queue_operations WHERE request_id=?1", [request_id], |r| Ok((r.get(0)?,r.get(1)?))).optional().map_err(|_| err())?;
+            if let Some((owner, old_hash)) = prior { return if owner != actor.device_id { Err(hidden()) } else if old_hash == hash { Ok(()) } else { Err(invalid()) }; }
+            let enq_owner: Option<String> = tx.query_row("SELECT device_id FROM zcode_send_queue WHERE request_id=?1", [request_id], |r| r.get(0)).optional().map_err(|_| err())?;
+            if let Some(owner) = enq_owner { return Err(if owner == actor.device_id { invalid() } else { hidden() }); }
+            let row: Option<(String,String)> = tx.query_row("SELECT item_id,device_id FROM zcode_send_queue WHERE session_id=?1 AND dispatch_action_id=?2 AND state='accepted' AND coalesce(json_extract(receipt,'$.sendAdmission.delivery'),'')='startNow' AND coalesce(json_extract(receipt,'$._queueTerminal'),0)=0 AND coalesce(json_extract(receipt,'$._queueUnconfirmed'),0)=0", rusqlite::params![key.session_id,action_id], |r| Ok((r.get(0)?,r.get(1)?))).optional().map_err(|_| err())?;
+            let (item,owner)=row.ok_or_else(hidden)?;
+            if owner != actor.device_id { return Err(hidden()); }
+            tx.execute("UPDATE zcode_send_queue SET receipt=json_set(receipt,'$._queueUnconfirmed',1) WHERE item_id=?1", [&item]).map_err(|_| err())?;
+            tx.execute("UPDATE zcode_queue_state SET version=version+1,auto_drain=0,pause_reason='unconfirmed' WHERE session_id=?1", [&key.session_id]).map_err(|_| err())?;
+            tx.execute("INSERT INTO zcode_queue_operations(request_id,kind,payload_hash,device_id,device_name,item_id,expected_version,operation_state,expires_at) VALUES (?1,'barrier_review',?2,?3,?4,?5,0,'completed',9223372036854775807)", rusqlite::params![request_id,hash,actor.device_id,actor.device_name,item]).map_err(|_| err())?;
+            super::super::audit::record_start_conn(&tx,now,&actor.device_id,&actor.device_name,&key.session_id,"queue_barrier_review","unconfirmed").map_err(|_| err())?;
             tx.commit().map_err(|_| err())?;
             Ok(())
         })
@@ -503,7 +719,7 @@ impl SqlLocalQueueStore {
             let tx = c.unchecked_transaction().map_err(|_| err())?;
             let paused: Option<i64> = tx.query_row("SELECT auto_drain FROM zcode_queue_state WHERE session_id=?1", [&key.session_id], |r| r.get(0)).optional().map_err(|_| err())?;
             if paused == Some(0) { return Ok(None); }
-            let in_flight: i64 = tx.query_row("SELECT count(*) FROM zcode_send_queue WHERE session_id=?1 AND state='dispatching'", [&key.session_id], |r| r.get(0)).map_err(|_| err())?;
+            let in_flight: i64 = tx.query_row("SELECT count(*) FROM zcode_send_queue WHERE session_id=?1 AND (state='dispatching' OR (state='accepted' AND coalesce(json_extract(receipt,'$.sendAdmission.delivery'),'startNow')='startNow' AND coalesce(json_extract(receipt,'$._queueTerminal'),0)=0 AND coalesce(json_extract(receipt,'$._queueUnconfirmed'),0)=0))", [&key.session_id], |r| r.get(0)).map_err(|_| err())?;
             if in_flight != 0 { return Ok(None); }
             let priority: i64 = tx.query_row("SELECT count(*) FROM zcode_send_queue q JOIN zcode_queue_operations o ON o.request_id=q.priority_request WHERE q.session_id=?1 AND o.kind='priority' AND o.operation_state IN ('in_flight','unknown')", [&key.session_id], |r| r.get(0)).map_err(|_| err())?;
             if priority != 0 { return Ok(None); }
@@ -564,7 +780,7 @@ impl SqlLocalQueueStore {
     pub(crate) fn finish_edit(&self, actor: &QueueActor, request_id: &str) -> ZResult<()> {
         let err =
             || super::super::types::ZcodeError::of(super::super::types::codes::STORAGE_FAILED);
-        self.store.with(|c| {
+        let result = self.store.with(|c| {
             let tx = c.unchecked_transaction().map_err(|_| err())?;
             let (session, draft): (String,Option<String>) = tx.query_row("SELECT q.session_id,o.draft FROM zcode_queue_operations o JOIN zcode_send_queue q ON q.item_id=o.item_id WHERE o.request_id=?1 AND o.device_id=?2 AND o.kind='edit'", rusqlite::params![request_id,actor.device_id], |r| Ok((r.get(0)?,r.get(1)?))).map_err(|e| if matches!(e,rusqlite::Error::QueryReturnedNoRows) { super::super::types::ZcodeError::of(super::super::types::codes::NO_SESSION) } else { err() })?;
             if draft.is_none() { return Ok(()); }
@@ -573,7 +789,11 @@ impl SqlLocalQueueStore {
             super::super::audit::record_start_conn(&tx, chrono::Utc::now().timestamp_millis(), &actor.device_id, &actor.device_name, &session, "queue_edit_finish", "edit_finish").map_err(|_| err())?;
             tx.commit().map_err(|_| err())?;
             Ok(())
-        })
+        });
+        if result.is_ok() {
+            self.expiry_changed.notify_one();
+        }
+        result
     }
     pub(crate) fn edit(
         &self,
@@ -581,7 +801,7 @@ impl SqlLocalQueueStore {
         cmd: &ItemCommand,
         now: i64,
     ) -> ZResult<EditResult> {
-        self.store.with(|c| {
+        let result = self.store.with(|c| {
             use rusqlite::OptionalExtension;
             let err = || super::super::types::ZcodeError::of(super::super::types::codes::STORAGE_FAILED);
             let invalid = || super::super::types::ZcodeError::of(super::super::types::codes::INVALID_ACTION);
@@ -610,7 +830,11 @@ impl SqlLocalQueueStore {
             super::super::audit::record_start_conn(&tx, now, &actor.device_id, &actor.device_name, &session, "queue_edit", "edit").map_err(|_| err())?;
             tx.commit().map_err(|_| err())?;
             Ok(result)
-        })
+        });
+        if result.is_ok() {
+            self.expiry_changed.notify_one();
+        }
+        result
     }
     pub(crate) fn view(&self, actor: &QueueActor, key: &TargetKey) -> ZResult<LocalQueueView> {
         self.view_at(actor, key, chrono::Utc::now().timestamp_millis())
@@ -2575,6 +2799,387 @@ mod tests {
             store.operation(&actor, "priority").unwrap().unwrap().state,
             QueueOperationState::Unknown
         );
+    }
+    #[test]
+    fn restart_generation_collision_requires_explicit_review() {
+        use super::super::super::types::{
+            ActionReceipt, ActionState, BoundTarget, SendAdmission, SendDelivery,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("queue.sqlite");
+        let open = || {
+            let c = rusqlite::Connection::open(&path).unwrap();
+            crate::database::schema::init(&c);
+            crate::database::migration::migrate(&c).unwrap();
+            DeviceStore::Owned(std::sync::Arc::new(std::sync::Mutex::new(c)))
+        };
+        let actor = QueueActor {
+            device_id: "device".into(),
+            device_name: "phone".into(),
+        };
+        let key = TargetKey {
+            session_id: "session".into(),
+        };
+        let target = BoundTarget {
+            session_id: key.session_id.clone(),
+            workspace_path: "/synthetic".into(),
+            workspace_identity: None,
+            workspace_key: "/synthetic".into(),
+            generation: 0,
+            bridge_generation: None,
+        };
+        let action_id = {
+            let store = SqlLocalQueueStore::new(open());
+            for text in ["B", "C"] {
+                store
+                    .enqueue(
+                        &EnqueueCommand {
+                            request_id: text.into(),
+                            actor: actor.clone(),
+                            session_id: key.session_id.clone(),
+                            workspace_path: "/synthetic".into(),
+                            workspace_identity: None,
+                            draft: QueueDraft {
+                                text: text.into(),
+                                attachments: vec![],
+                            },
+                            prepared: PreparedSend::from_stored(text.into()).unwrap(),
+                            edited_from: None,
+                        },
+                        1,
+                    )
+                    .unwrap();
+            }
+            let b = store.claim_next(&key, &target, 2).unwrap().unwrap();
+            store
+                .settle_dispatch(
+                    &b,
+                    &ActionReceipt {
+                        action_id: b.ctx.action_id.clone(),
+                        session_id: key.session_id.clone(),
+                        generation: 0,
+                        state: ActionState::Accepted,
+                        reason_code: None,
+                        send_admission: Some(SendAdmission {
+                            delivery: SendDelivery::StartNow,
+                            input_id: "input".into(),
+                        }),
+                    },
+                    3,
+                )
+                .unwrap();
+            b.ctx.action_id
+        };
+        let store = SqlLocalQueueStore::new(open());
+        store.recover(4).unwrap();
+        assert!(
+            !store
+                .observe_execution(
+                    &key,
+                    &ExecutionObservation {
+                        input_id: "input".into(),
+                        execution_id: None,
+                        terminal: true,
+                        revision: 100,
+                        generation: 0
+                    }
+                )
+                .unwrap(),
+            "numeric generation collision must not release the old barrier"
+        );
+        assert!(store.claim_next(&key, &target, 5).unwrap().is_none());
+        let view = store.view(&actor, &key).unwrap();
+        assert!(!view.auto_drain);
+        assert_eq!(
+            store.unconfirmed_action(&actor, &key).unwrap(),
+            Some(action_id.clone())
+        );
+        assert_eq!(
+            store
+                .unconfirmed_action(
+                    &QueueActor {
+                        device_id: "other".into(),
+                        device_name: "phone".into()
+                    },
+                    &key
+                )
+                .unwrap(),
+            None
+        );
+        store
+            .acknowledge_unconfirmed(&actor, &key, &action_id, "review", 6)
+            .unwrap();
+        let view = store.view(&actor, &key).unwrap();
+        assert!(!view.auto_drain);
+        store.resume(&actor, &key, "resume", view.version).unwrap();
+        assert_eq!(
+            store
+                .claim_next(&key, &target, 7)
+                .unwrap()
+                .unwrap()
+                .prepared
+                .wire_text(),
+            "C"
+        );
+    }
+    #[test]
+    fn explicitly_reviewed_unconfirmed_never_resends_and_stays_paused() {
+        use super::super::super::types::{ActionReceipt, ActionState, SendAdmission, SendDelivery};
+        let store = SqlLocalQueueStore::new(DeviceStore::memory());
+        let actor = QueueActor {
+            device_id: "device".into(),
+            device_name: "phone".into(),
+        };
+        let other = QueueActor {
+            device_id: "other".into(),
+            device_name: "phone".into(),
+        };
+        let key = TargetKey {
+            session_id: "session".into(),
+        };
+        let target = super::super::super::types::BoundTarget {
+            session_id: key.session_id.clone(),
+            workspace_path: "/synthetic".into(),
+            workspace_identity: None,
+            workspace_key: "/synthetic".into(),
+            generation: 1,
+            bridge_generation: None,
+        };
+        for id in ["B", "C"] {
+            store
+                .enqueue(
+                    &EnqueueCommand {
+                        request_id: id.into(),
+                        actor: actor.clone(),
+                        session_id: key.session_id.clone(),
+                        workspace_path: "/synthetic".into(),
+                        workspace_identity: None,
+                        draft: QueueDraft {
+                            text: id.into(),
+                            attachments: vec![],
+                        },
+                        prepared: PreparedSend::from_stored(id.into()).unwrap(),
+                        edited_from: None,
+                    },
+                    1,
+                )
+                .unwrap();
+        }
+        let b = store.claim_next(&key, &target, 2).unwrap().unwrap();
+        store
+            .settle_dispatch(
+                &b,
+                &ActionReceipt {
+                    action_id: b.ctx.action_id.clone(),
+                    session_id: key.session_id.clone(),
+                    generation: 1,
+                    state: ActionState::Accepted,
+                    reason_code: None,
+                    send_admission: Some(SendAdmission {
+                        delivery: SendDelivery::StartNow,
+                        input_id: "input".into(),
+                    }),
+                },
+                3,
+            )
+            .unwrap();
+        assert!(store
+            .acknowledge_unconfirmed(&other, &key, &b.ctx.action_id, "review-other", 4)
+            .is_err());
+        assert!(store
+            .acknowledge_unconfirmed(
+                &actor,
+                &TargetKey {
+                    session_id: "other".into()
+                },
+                &b.ctx.action_id,
+                "review-wrong",
+                4
+            )
+            .is_err());
+        let renamed = QueueActor {
+            device_id: "device".into(),
+            device_name: "renamed phone".into(),
+        };
+        store
+            .acknowledge_unconfirmed(&renamed, &key, &b.ctx.action_id, "review", 4)
+            .unwrap();
+        let paused = store.view(&actor, &key).unwrap();
+        assert!(!paused.auto_drain);
+        assert!(store.claim_next(&key, &target, 5).unwrap().is_none());
+        store
+            .resume(&actor, &key, "resume", paused.version)
+            .unwrap();
+        store
+            .acknowledge_unconfirmed(&renamed, &key, &b.ctx.action_id, "review", 6)
+            .unwrap();
+        assert!(store.view(&actor, &key).unwrap().auto_drain);
+        let c = store.claim_next(&key, &target, 7).unwrap().unwrap();
+        assert_ne!(b.item_id, c.item_id);
+    }
+    #[test]
+    fn unexpected_official_queue_admission_never_resends() {
+        use super::super::super::types::{ActionReceipt, ActionState, SendAdmission, SendDelivery};
+        let store = SqlLocalQueueStore::new(DeviceStore::memory());
+        let actor = QueueActor {
+            device_id: "device".into(),
+            device_name: "phone".into(),
+        };
+        let key = TargetKey {
+            session_id: "session".into(),
+        };
+        let target = super::super::super::types::BoundTarget {
+            session_id: "session".into(),
+            workspace_path: "/synthetic".into(),
+            workspace_identity: None,
+            workspace_key: "/synthetic".into(),
+            generation: 1,
+            bridge_generation: None,
+        };
+        for request in ["B", "C"] {
+            store
+                .enqueue(
+                    &EnqueueCommand {
+                        request_id: request.into(),
+                        actor: actor.clone(),
+                        session_id: key.session_id.clone(),
+                        workspace_path: "/synthetic".into(),
+                        workspace_identity: None,
+                        draft: QueueDraft {
+                            text: request.into(),
+                            attachments: vec![],
+                        },
+                        prepared: PreparedSend::from_stored(request.into()).unwrap(),
+                        edited_from: None,
+                    },
+                    1,
+                )
+                .unwrap();
+        }
+        let b = store.claim_next(&key, &target, 2).unwrap().unwrap();
+        store
+            .settle_dispatch(
+                &b,
+                &ActionReceipt {
+                    action_id: b.ctx.action_id.clone(),
+                    session_id: key.session_id.clone(),
+                    generation: 1,
+                    state: ActionState::Accepted,
+                    reason_code: None,
+                    send_admission: Some(SendAdmission {
+                        delivery: SendDelivery::Queue,
+                        input_id: "B-input".into(),
+                    }),
+                },
+                3,
+            )
+            .unwrap();
+        assert!(store.claim_next(&key, &target, 4).unwrap().is_none());
+        let paused = store.view(&actor, &key).unwrap();
+        assert!(!paused.auto_drain);
+        store
+            .resume(&actor, &key, "resume", paused.version)
+            .unwrap();
+        let c = store
+            .claim_next(&key, &target, 5)
+            .unwrap()
+            .expect("explicit resume permits later queue item");
+        assert_ne!(c.item_id, b.item_id);
+    }
+    #[test]
+    fn accepted_before_execution_start_keeps_barrier() {
+        use super::super::super::types::{ActionReceipt, ActionState, SendAdmission, SendDelivery};
+        let store = SqlLocalQueueStore::new(DeviceStore::memory());
+        let key = TargetKey {
+            session_id: "session".into(),
+        };
+        let target = super::super::super::types::BoundTarget {
+            session_id: "session".into(),
+            workspace_path: "/synthetic".into(),
+            workspace_identity: None,
+            workspace_key: "/synthetic".into(),
+            generation: 1,
+            bridge_generation: None,
+        };
+        for request in ["B", "C"] {
+            store
+                .enqueue(
+                    &EnqueueCommand {
+                        request_id: request.into(),
+                        actor: QueueActor {
+                            device_id: "device".into(),
+                            device_name: "phone".into(),
+                        },
+                        session_id: "session".into(),
+                        workspace_path: "/synthetic".into(),
+                        workspace_identity: None,
+                        draft: QueueDraft {
+                            text: request.into(),
+                            attachments: vec![],
+                        },
+                        prepared: PreparedSend::from_stored(request.into()).unwrap(),
+                        edited_from: None,
+                    },
+                    1,
+                )
+                .unwrap();
+        }
+        let claim = store.claim_next(&key, &target, 2).unwrap().unwrap();
+        let receipt = ActionReceipt {
+            action_id: claim.ctx.action_id.clone(),
+            session_id: "session".into(),
+            generation: 1,
+            state: ActionState::Accepted,
+            reason_code: None,
+            send_admission: Some(SendAdmission {
+                delivery: SendDelivery::StartNow,
+                input_id: "input".into(),
+            }),
+        };
+        store.settle_dispatch(&claim, &receipt, 3).unwrap();
+        assert!(
+            store.claim_next(&key, &target, 4).unwrap().is_none(),
+            "ACK alone must not release the next item"
+        );
+        let wrong = ExecutionObservation {
+            input_id: "other".into(),
+            execution_id: Some("E-other".into()),
+            terminal: true,
+            revision: 3,
+            generation: 1,
+        };
+        assert!(!store.observe_execution(&key, &wrong).unwrap());
+        assert!(store.claim_next(&key, &target, 5).unwrap().is_none());
+        let started = ExecutionObservation {
+            input_id: "input".into(),
+            execution_id: Some("E".into()),
+            terminal: false,
+            revision: 4,
+            generation: 1,
+        };
+        assert!(!store.observe_execution(&key, &started).unwrap());
+        let wrong_generation = ExecutionObservation {
+            terminal: true,
+            revision: 5,
+            generation: 2,
+            ..started.clone()
+        };
+        assert!(!store.observe_execution(&key, &wrong_generation).unwrap());
+        let wrong_execution = ExecutionObservation {
+            execution_id: Some("E-other".into()),
+            terminal: true,
+            revision: 5,
+            ..started.clone()
+        };
+        assert!(!store.observe_execution(&key, &wrong_execution).unwrap());
+        assert!(store.claim_next(&key, &target, 5).unwrap().is_none());
+        let done = ExecutionObservation {
+            terminal: true,
+            revision: 6,
+            ..started
+        };
+        assert!(store.observe_execution(&key, &done).unwrap());
+        assert!(store.claim_next(&key, &target, 7).unwrap().is_some());
     }
     #[test]
     fn recovered_dispatch_can_settle_original_receipt_without_resend() {

@@ -1257,6 +1257,88 @@ impl BridgeManager {
     }
 
     /// 精确绑定一个会话（bootstrap → 枚举 → 精确 taskId → 会话桥 → 会话订阅）。
+    pub(crate) fn cached_target(&self, key: &TargetKey) -> ZResult<BoundTarget> {
+        let inner = lock(&self.shared.state);
+        inner
+            .sessions
+            .get(&key.session_id)
+            .filter(|entry| entry.target.bridge_generation() == inner.generation)
+            .map(|entry| entry.target.clone())
+            .ok_or_else(|| ZcodeError::of(codes::NOT_READY))
+    }
+
+    pub(crate) async fn bind_current(&self, key: &TargetKey) -> ZResult<BoundTarget> {
+        let target = self.cached_target(key)?;
+        let generation = target.bridge_generation();
+        let listing = self
+            .shared
+            .app_request(WORKSPACE_LIST_REQUEST, None, generation)
+            .await?;
+        let entries = listing
+            .get("result")
+            .and_then(|v| v.get("workspaces"))
+            .and_then(Value::as_array)
+            .ok_or_else(|| ZcodeError::of(codes::NOT_READY))?;
+        let mut matches = entries
+            .iter()
+            .filter_map(parse_workspace_entry)
+            .filter(|entry| entry.workspace_path == target.workspace_path);
+        let entry = matches
+            .next()
+            .ok_or_else(|| ZcodeError::of(codes::NO_SESSION))?;
+        if matches.any(|other| other.workspace_identity != entry.workspace_identity) {
+            return Err(ZcodeError::of(codes::TARGET_AMBIGUOUS));
+        }
+        self.shared.load_tasks(generation).await?;
+        let inner = lock(&self.shared.state);
+        if inner.generation != generation {
+            return Err(stale());
+        }
+        if !inner
+            .sessions
+            .get(&key.session_id)
+            .is_some_and(|entry| entry.target.same_binding(&target))
+        {
+            return Err(ZcodeError::of(codes::NOT_READY));
+        }
+        let cache = inner
+            .workspaces
+            .as_ref()
+            .filter(|cache| cache.generation == generation && cache.rows_ready())
+            .ok_or_else(|| ZcodeError::of(codes::NOT_READY))?;
+        let mut rows = cache
+            .rows
+            .values()
+            .filter(|row| row.task_id == key.session_id);
+        let row = rows
+            .next()
+            .ok_or_else(|| ZcodeError::of(codes::NO_SESSION))?;
+        if rows.next().is_some() {
+            return Err(ZcodeError::of(codes::TARGET_AMBIGUOUS));
+        }
+        if row
+            .workspace_identity
+            .as_ref()
+            .zip(entry.workspace_identity.as_ref())
+            .is_some_and(|(row_id, entry_id)| row_id != entry_id)
+        {
+            return Err(ZcodeError::of(codes::TARGET_AMBIGUOUS));
+        }
+        let identity = row.workspace_identity.clone().or(entry.workspace_identity);
+        let workspace_key = identity
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .unwrap_or(&row.workspace_path);
+        if row.workspace_path != target.workspace_path
+            || identity != target.workspace_identity
+            || workspace_key != target.workspace_key
+        {
+            return Err(ZcodeError::of(codes::NO_SESSION));
+        }
+        Ok(target)
+    }
+
     pub async fn bind(&self, key: &TargetKey) -> ZResult<BoundTarget> {
         let session_id = key.session_id.as_str();
         // 原样匹配：空/首尾空白/任何归一化都不接受。
@@ -4246,6 +4328,7 @@ mod tests {
 
     struct Peer {
         config: PeerConfig,
+        listing_override: StdMutex<Option<Vec<Value>>>,
         inner: StdMutex<PeerInner>,
         manager: StdMutex<Weak<BridgeManager>>,
         /// 下一次 `send_data` 的写闩（模拟半开 socket / actor 被占住）。
@@ -4257,6 +4340,7 @@ mod tests {
         fn new(config: PeerConfig) -> Arc<Self> {
             Arc::new(Self {
                 config,
+                listing_override: StdMutex::new(None),
                 inner: StdMutex::new(PeerInner::default()),
                 manager: StdMutex::new(Weak::new()),
                 gate: StdMutex::new(None),
@@ -4407,7 +4491,7 @@ mod tests {
                     "zcode_type": "workspace-list-response",
                     "requestId": payload.get("requestId").cloned().unwrap_or(Value::Null),
                     "result": {
-                        "workspaces": self.config.workspaces,
+                        "workspaces": self.listing_override.lock().unwrap().clone().unwrap_or_else(|| self.config.workspaces.clone()),
                         "activeWorkspaceKey": self.config.active_workspace_key
                     }
                 })),
@@ -5055,6 +5139,100 @@ mod tests {
         assert_eq!(task_ids, vec![SESSION_A, SESSION_HEX]);
     }
 
+    #[tokio::test]
+    async fn fresh_workspace_listing_identity_change_rejects_old_binding() {
+        let (manager, peer) = manager_with(basic_config()).await;
+        manager.bind(&key(SESSION_A)).await.unwrap();
+        let opens = app_payloads(&peer, WORKSPACE_BRIDGE_OPEN).len();
+        *peer.listing_override.lock().unwrap() = Some(vec![
+            workspace_entry(WS_A, Some("changed-identity"), "A"),
+            workspace_entry(WS_B, Some("ws-b-identity"), "B"),
+        ]);
+        assert!(manager.bind_current(&key(SESSION_A)).await.is_err());
+        assert_eq!(app_payloads(&peer, WORKSPACE_BRIDGE_OPEN).len(), opens);
+    }
+    #[tokio::test]
+    async fn queue_binding_rejects_session_rebind_during_fresh_listing() {
+        let (manager, peer) = manager_with(basic_config()).await;
+        manager.bind(&key(SESSION_A)).await.unwrap();
+        let gate = peer.hold_next_send();
+        let worker = manager.clone();
+        let task = tokio::spawn(async move { worker.bind_current(&key(SESSION_A)).await });
+        wait_until(|| peer.stalled(), "fresh listing stalled").await;
+        {
+            let mut inner = lock(&manager.shared.state);
+            inner
+                .sessions
+                .get_mut(SESSION_A)
+                .unwrap()
+                .target
+                .workspace_identity = Some("other-identity".into());
+        }
+        gate.add_permits(1);
+        assert!(
+            task.await.unwrap().is_err(),
+            "a changed session binding cannot reuse old listing"
+        );
+    }
+    #[tokio::test]
+    async fn cached_queue_binding_rechecks_live_controller_identity_and_removal() {
+        let (manager, peer) = manager_with(basic_config()).await;
+        let original = manager.bind(&key(SESSION_A)).await.unwrap();
+        let before = app_payloads(&peer, WORKSPACE_BRIDGE_OPEN).len();
+        let (bridge, sub) = {
+            let inner = lock(&manager.shared.state);
+            let entry = inner
+                .workspaces
+                .as_ref()
+                .unwrap()
+                .enum_bridges
+                .values()
+                .find(|b| b.workspace_path == WS_A)
+                .unwrap();
+            (
+                entry.bridge_id.clone(),
+                entry.controller_subscription.clone().unwrap(),
+            )
+        };
+        let update = |delta: Value| json!({"topic":CONTROLLER_TASKS_INDEX_TOPIC,"subscriptionId":sub,"payload":{"kind":"deltas","deltas":[delta]}});
+        {
+            let mut inner = lock(&manager.shared.state);
+            let mut changed = task_row(WS_A, SESSION_A, "changed");
+            changed["address"]["workspaceIdentity"] = json!("new-identity");
+            inner.handle_controller_frame(
+                &bridge,
+                &update(json!({"op":"task.upserted","task":changed})),
+            );
+        }
+        assert!(
+            manager.bind_current(&key(SESSION_A)).await.is_err(),
+            "changed identity must reject cached target"
+        );
+        {
+            let mut inner = lock(&manager.shared.state);
+            inner.handle_controller_frame(
+                &bridge,
+                &update(json!({"op":"task.upserted","task":task_row(WS_A,SESSION_A,"restored")})),
+            );
+        }
+        assert_eq!(
+            manager.bind_current(&key(SESSION_A)).await.unwrap(),
+            original
+        );
+        {
+            let mut inner = lock(&manager.shared.state);
+            inner.handle_controller_frame(&bridge,&update(json!({"op":"task.removed","address":{"workspacePath":WS_A,"taskId":SESSION_A}})));
+        }
+        assert!(
+            manager.bind_current(&key(SESSION_A)).await.is_err(),
+            "removed target must reject cached binding"
+        );
+        assert_eq!(
+            app_payloads(&peer, WORKSPACE_BRIDGE_OPEN).len(),
+            before,
+            "rechecking must not open another bridge"
+        );
+    }
     #[tokio::test]
     async fn bind_sequence_uses_bootstrap_then_listing_then_exact_task_id() {
         let (manager, peer) = manager_with(basic_config()).await;

@@ -511,6 +511,7 @@ mod tests {
             selection: None,
             capabilities: CapabilityView::default(),
             queue: QueueView::default(),
+            execution_terminal: None,
             input_routing: None,
         }
     }

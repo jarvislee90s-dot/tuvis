@@ -395,6 +395,7 @@ impl HubBackend for FakeHubBackend {
             selection: None,
             capabilities: CapabilityView::default(),
             queue: QueueView::default(),
+            execution_terminal: None,
             input_routing: None,
         };
         Box::pin(async move { Ok(view) })

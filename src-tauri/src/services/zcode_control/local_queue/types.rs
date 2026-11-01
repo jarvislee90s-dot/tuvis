@@ -147,3 +147,12 @@ pub(crate) struct PriorityRecovery {
     pub generation: u64,
     pub execution_id: String,
 }
+
+#[derive(Clone)]
+pub(crate) struct ExecutionObservation {
+    pub input_id: String,
+    pub execution_id: Option<String>,
+    pub terminal: bool,
+    pub revision: u64,
+    pub generation: u64,
+}
