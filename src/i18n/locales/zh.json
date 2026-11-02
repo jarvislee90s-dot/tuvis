@@ -2266,6 +2266,8 @@
       "reasonStaleGeneration": "会话已换代，请刷新后重试",
       "reasonStalePending": "该待办已失效，请刷新后查看最新状态",
       "reasonInvalidAction": "该操作在当前状态下无效，请刷新后重试",
+      "reasonQueueRefreshRequired": "控制方式已更新，请刷新页面后重试",
+      "reasonAttachmentMissing": "待发附件已不存在或无法访问，请重新添加附件",
       "reasonInvalidAnswer": "作答内容未通过校验，请检查后重试",
       "reasonForbiddenOption": "该选项不可用，请选择其他项",
       "reasonActionPayloadConflict": "与另一条在途操作冲突，请稍后重试",

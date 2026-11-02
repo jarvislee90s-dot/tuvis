@@ -67,6 +67,8 @@ export const ZCODE_REASON_KEYS: Record<ZcodeErrorCode, string> = {
   stale_generation: "mobile.zcodeControl.reasonStaleGeneration",
   stale_pending: "mobile.zcodeControl.reasonStalePending",
   invalid_action: "mobile.zcodeControl.reasonInvalidAction",
+  queue_refresh_required: "mobile.zcodeControl.reasonQueueRefreshRequired",
+  attachment_missing: "mobile.zcodeControl.reasonAttachmentMissing",
   invalid_answer: "mobile.zcodeControl.reasonInvalidAnswer",
   forbidden_option: "mobile.zcodeControl.reasonForbiddenOption",
   action_payload_conflict: "mobile.zcodeControl.reasonActionPayloadConflict",

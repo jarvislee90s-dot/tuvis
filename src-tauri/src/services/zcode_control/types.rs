@@ -59,6 +59,8 @@ pub mod codes {
     pub const INVALID_ACTION: &str = "invalid_action";
     /// 本地队列正在接管发送，客户端需要刷新。
     pub const QUEUE_REFRESH_REQUIRED: &str = "queue_refresh_required";
+    /// 待发附件已不存在或不再属于原会话目录。
+    pub const ATTACHMENT_MISSING: &str = "attachment_missing";
     /// 答案载荷无效。
     pub const INVALID_ANSWER: &str = "invalid_answer";
     /// 选项被策略拒绝（如 fullAccess/未知 kind）。
@@ -1098,12 +1100,15 @@ pub enum ControlEventKind {
     Session,
     /// 动作回执（`data` = `ActionReceipt`）。
     Action,
+    /// 本地队列已变化；各设备的内容由 SSE 层分别读取。
+    LocalQueue,
 }
 
 /// Hub 对外广播的一条控制事件（`{seq,generation,sessionId,kind,data}`）。
 ///
-/// `data` 只承载对应 Tuvis DTO（[`ConnectionView`]／[`SessionView`]／
-/// [`ActionReceipt`]），**绝无** JWT/token/官方原文；`seq` 在单个 Hub 生命周期内
+/// `data` 承载对应 Tuvis DTO（[`ConnectionView`]／[`SessionView`]／
+/// [`ActionReceipt`]）；本地队列事件仅为 null 标记，由 SSE 按设备读取视图。
+/// **绝无** JWT/token/官方原文；`seq` 在单个 Hub 生命周期内
 /// 单调递增，消费方据它发现缺口（缺口后重 GET，不重放动作）。
 ///
 /// `device_id` 是**进程内**字段：SSE 据此只转发本设备动作，绝不序列化给手机

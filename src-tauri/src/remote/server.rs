@@ -637,6 +637,51 @@ fn api_router(state: Arc<RemoteState>) -> Router<Arc<RemoteState>> {
         // 内层 gate 结构性覆盖——未配对在 handler 之前 403。
         .route("/zcode/connection", get(super::zcode::connection))
         .route("/zcode/session", get(super::zcode::session))
+        .route("/zcode/local-queue", get(super::zcode::local_queue))
+        .route(
+            "/zcode/local-queue/enqueue",
+            post(super::zcode::local_queue_enqueue),
+        )
+        .route(
+            "/zcode/local-queue/edit",
+            post(super::zcode::local_queue_edit),
+        )
+        .route(
+            "/zcode/local-queue/edit/finish",
+            post(super::zcode::local_queue_finish_edit),
+        )
+        .route(
+            "/zcode/local-queue/retract",
+            post(super::zcode::local_queue_retract),
+        )
+        .route(
+            "/zcode/local-queue/prioritize",
+            post(super::zcode::local_queue_prioritize),
+        )
+        .route(
+            "/zcode/local-queue/resume",
+            post(super::zcode::local_queue_resume),
+        )
+        .route(
+            "/zcode/local-queue/stop",
+            post(super::zcode::local_queue_stop),
+        )
+        .route(
+            "/zcode/local-queue/operations",
+            get(super::zcode::local_queue_operation),
+        )
+        .route(
+            "/zcode/local-queue/recovery",
+            get(super::zcode::local_queue_recovery),
+        )
+        .route(
+            "/zcode/local-queue/recovery/ack",
+            post(super::zcode::local_queue_recovery_ack),
+        )
+        .route(
+            "/zcode/local-queue/edits",
+            get(super::zcode::local_queue_edit_snapshot),
+        )
         // ZCode 官方控制写动作（T7.1 B2b）：`{actionId, action}` → ActionReceipt。
         // 设备身份只取 cookie/DB（请求体多字段即 400 `invalid_action`）；回执一律
         // no-store，accepted/confirmed/noop/unknown 均 200 并按 state 区分。

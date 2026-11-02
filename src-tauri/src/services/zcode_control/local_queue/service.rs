@@ -15,6 +15,7 @@ pub(crate) trait QueueRuntimeGate: Send + Sync {
     fn device_valid(&self, device_id: &str) -> bool;
     fn shutting_down(&self) -> bool;
 }
+#[allow(dead_code)]
 enum FlushFailure {
     Preflight(super::super::types::ZcodeError),
     Other(super::super::types::ZcodeError),
@@ -25,6 +26,7 @@ impl From<super::super::types::ZcodeError> for FlushFailure {
     }
 }
 impl FlushFailure {
+    #[cfg(test)]
     fn into_error(self) -> super::super::types::ZcodeError {
         match self {
             Self::Preflight(e) | Self::Other(e) => e,
@@ -40,6 +42,9 @@ fn preflight_failure(error: super::super::types::ZcodeError) -> FlushFailure {
         FlushFailure::Other(error)
     }
 }
+#[cfg(test)]
+type BeforePriorityHook = Arc<dyn Fn(&str) + Send + Sync>;
+
 pub(crate) struct ZcodeQueueService {
     store: SqlLocalQueueStore,
     host: Arc<dyn QueueHostPort>,
@@ -48,6 +53,8 @@ pub(crate) struct ZcodeQueueService {
     cleanup_started: AtomicBool,
     stopped: AtomicBool,
     wake: Notify,
+    #[cfg(test)]
+    queue_events: tokio::sync::broadcast::Sender<String>,
     cleanup_wake: Notify,
     shutdown_wake: Notify,
     activation_wake: Notify,
@@ -57,10 +64,28 @@ pub(crate) struct ZcodeQueueService {
     activation_force_requests: std::sync::atomic::AtomicU64,
     #[cfg(test)]
     activation_invocations: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    before_priority_port: std::sync::Mutex<Option<BeforePriorityHook>>,
     observations: std::sync::Mutex<
         std::collections::BTreeMap<String, Vec<super::types::ExecutionObservation>>,
     >,
+    manual_claim_failures:
+        std::sync::Mutex<std::collections::BTreeMap<String, super::types::StopFailure>>,
     recovered: tokio::sync::Mutex<bool>,
+}
+
+struct QueueEventGuard {
+    #[cfg(test)]
+    sender: tokio::sync::broadcast::Sender<String>,
+    host: Arc<dyn QueueHostPort>,
+    session_id: String,
+}
+impl Drop for QueueEventGuard {
+    fn drop(&mut self) {
+        #[cfg(test)]
+        let _ = self.sender.send(self.session_id.clone());
+        self.host.publish_queue_change(&self.session_id);
+    }
 }
 impl ZcodeQueueService {
     pub(crate) fn new(
@@ -76,6 +101,8 @@ impl ZcodeQueueService {
             cleanup_started: AtomicBool::new(false),
             stopped: AtomicBool::new(false),
             wake: Notify::new(),
+            #[cfg(test)]
+            queue_events: tokio::sync::broadcast::channel(64).0,
             cleanup_wake: Notify::new(),
             shutdown_wake: Notify::new(),
             activation_wake: Notify::new(),
@@ -85,9 +112,23 @@ impl ZcodeQueueService {
             activation_force_requests: std::sync::atomic::AtomicU64::new(0),
             #[cfg(test)]
             activation_invocations: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            before_priority_port: std::sync::Mutex::new(None),
             observations: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+            manual_claim_failures: std::sync::Mutex::new(std::collections::BTreeMap::new()),
             recovered: tokio::sync::Mutex::new(false),
         }
+    }
+    fn remember_manual_claim_failure(&self, request_id: &str, failure: super::types::StopFailure) {
+        const MAX_PENDING_FAILURES: usize = 128;
+        let mut pending = self
+            .manual_claim_failures
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if !pending.contains_key(request_id) && pending.len() >= MAX_PENDING_FAILURES {
+            return;
+        }
+        pending.insert(request_id.to_owned(), failure);
     }
     pub(crate) fn store(&self) -> SqlLocalQueueStore {
         self.store.clone()
@@ -124,6 +165,13 @@ impl ZcodeQueueService {
                 }
             }
         }
+        // 只读原停止动作回执；恢复永不使用旧目标重新发帧，也不凭回执自动解除人工核对。
+        for pending in self.store.pending_priority_recovery()? {
+            let _ = self
+                .host
+                .receipt(&pending.stop_action_id, &pending.device_id)
+                .await?;
+        }
         self.store
             .mark_restart_unconfirmed(chrono::Utc::now().timestamp_millis())?;
         *recovered = true;
@@ -141,11 +189,14 @@ impl ZcodeQueueService {
                     break;
                 }
                 let now = chrono::Utc::now().timestamp_millis();
-                let deadline = match cleaner
-                    .store
-                    .cleanup_expired_edits(now)
-                    .and_then(|_| cleaner.store.next_edit_expiry())
-                {
+                let deadline = match cleaner.store.cleanup_expired_edits(now).and_then(|count| {
+                    if count > 0 {
+                        #[cfg(test)]
+                        let _ = cleaner.queue_events.send(String::new());
+                        cleaner.host.publish_queue_change("");
+                    }
+                    cleaner.store.next_edit_expiry()
+                }) {
                     Ok(deadline) => deadline,
                     Err(_) => {
                         log::warn!("queue edit snapshot cleanup failed");
@@ -185,7 +236,11 @@ impl ZcodeQueueService {
                             if service.stopped.load(Ordering::SeqCst) {
                                 break;
                             }
-                            match service.flush_one_inner(&key).await {
+                            let result = service.flush_one_inner(&key).await;
+                            #[cfg(test)]
+                            let _ = service.queue_events.send(key.session_id.clone());
+                            service.host.publish_queue_change(&key.session_id);
+                            match result {
                                 Ok(()) => {}
                                 Err(FlushFailure::Preflight(_)) => retry = true,
                                 Err(FlushFailure::Other(_)) => {
@@ -240,9 +295,766 @@ impl ZcodeQueueService {
         self.cleanup_wake.notify_one();
         self.activation_wake.notify_one();
     }
-    pub(crate) fn notify(&self, _key: &TargetKey) {
+    #[cfg(test)]
+    pub(crate) fn subscribe_queue(&self) -> tokio::sync::broadcast::Receiver<String> {
+        self.queue_events.subscribe()
+    }
+    pub(crate) fn notify(&self, key: &TargetKey) {
+        #[cfg(test)]
+        let _ = self.queue_events.send(key.session_id.clone());
+        self.host.publish_queue_change(&key.session_id);
         self.wake.notify_one();
         self.cleanup_wake.notify_one();
+    }
+    pub(crate) async fn prioritize(
+        self: &Arc<Self>,
+        actor: &super::types::QueueActor,
+        cmd: super::types::PriorityCommand,
+    ) -> ZResult<super::types::QueueOperationView> {
+        let actor = actor.clone();
+        let request_id = cmd.request_id.clone();
+        let worker = self.clone();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+        let task_actor = actor.clone();
+        let mut task =
+            tokio::spawn(async move { worker.prioritize_inner(&task_actor, cmd, deadline).await });
+        match tokio::time::timeout_at(deadline, &mut task).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err(super::super::types::ZcodeError::of(
+                super::super::types::codes::NOT_READY,
+            )),
+            Err(_) => self.store.operation(&actor, &request_id)?.ok_or_else(|| {
+                super::super::types::ZcodeError::of(super::super::types::codes::NOT_READY)
+            }),
+        }
+    }
+    async fn prioritize_inner(
+        &self,
+        actor: &super::types::QueueActor,
+        cmd: super::types::PriorityCommand,
+        deadline: tokio::time::Instant,
+    ) -> ZResult<super::types::QueueOperationView> {
+        use super::super::types::{codes, ActionContext, ActionReceipt, ActionState, ZcodeError};
+        use super::types::{ItemCommand, PriorityEnd};
+        let key = self.store.item_key(actor, &cmd.item_id)?;
+        let lock = self.host.session_lock(&key);
+        let _guard = lock.lock().await;
+        if tokio::time::Instant::now() >= deadline {
+            return Err(ZcodeError::of(codes::NOT_READY));
+        }
+        let now = || chrono::Utc::now().timestamp_millis();
+        let owner = self.store.begin_priority(actor, &cmd, now())?;
+        let _event_guard = QueueEventGuard {
+            #[cfg(test)]
+            sender: self.queue_events.clone(),
+            host: self.host.clone(),
+            session_id: key.session_id.clone(),
+        };
+        #[cfg(test)]
+        let _ = self.queue_events.send(key.session_id.clone());
+        self.host.publish_queue_change(&key.session_id);
+        if !owner.is_owner {
+            if owner.operation.state == super::types::QueueOperationState::InFlight {
+                match self.store.finish_priority_safe(
+                    actor,
+                    &cmd.request_id,
+                    PriorityEnd::BeforeStop,
+                    now(),
+                ) {
+                    Ok(()) => return Ok(self.store.operation(actor, &cmd.request_id)?.unwrap()),
+                    Err(error) if error.is(codes::INVALID_ACTION) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            return Ok(owner.operation);
+        }
+        let before = async {
+            if self.stopped.load(Ordering::SeqCst)
+                || self.gate.shutting_down()
+                || !self.gate.remote_enabled()
+                || !self.gate.device_valid(&actor.device_id)
+            {
+                return Err(ZcodeError::of(codes::NOT_READY));
+            }
+            let bound = self
+                .host
+                .read(&key, std::time::Duration::from_secs(2))
+                .await?;
+            let fresh = self
+                .host
+                .refresh_target(&key, std::time::Duration::from_secs(2))
+                .await?;
+            if fresh != bound.target
+                || !bound.view.ready
+                || !bound.view.pending.is_empty()
+                || bound.view.control.is_none()
+            {
+                return Err(ZcodeError::of(codes::NOT_READY));
+            }
+            Ok(bound)
+        }
+        .await;
+        let bound = match before {
+            Ok(v) => v,
+            Err(e) => {
+                self.store.finish_priority_safe(
+                    actor,
+                    &cmd.request_id,
+                    PriorityEnd::BeforeStopFailure {
+                        code: e.code.clone(),
+                    },
+                    now(),
+                )?;
+                return Err(e);
+            }
+        };
+        let matches = match self
+            .store
+            .priority_item_matches_target(actor, &cmd, &bound.target)
+        {
+            Ok(matches) => matches,
+            Err(error) => {
+                let _ = self.store.finish_priority_safe(
+                    actor,
+                    &cmd.request_id,
+                    PriorityEnd::BeforeStopFailure {
+                        code: error.code.clone(),
+                    },
+                    now(),
+                );
+                return Err(error);
+            }
+        };
+        if !matches {
+            self.store.finish_priority_safe(
+                actor,
+                &cmd.request_id,
+                PriorityEnd::BeforeStopFailure {
+                    code: codes::NO_SESSION.into(),
+                },
+                now(),
+            )?;
+            return Err(ZcodeError::of(codes::NO_SESSION));
+        }
+        match self
+            .store
+            .attachments_valid(&key, Some(&cmd.item_id), &bound.target.workspace_path)
+        {
+            Ok(true) => {}
+            result => {
+                let error = match result {
+                    Ok(false) => ZcodeError::of(codes::ATTACHMENT_MISSING),
+                    Err(error) => error,
+                    Ok(true) => unreachable!(),
+                };
+                let _ = self.store.finish_priority_safe(
+                    actor,
+                    &cmd.request_id,
+                    PriorityEnd::BeforeStopFailure {
+                        code: error.code.clone(),
+                    },
+                    now(),
+                );
+                return Err(error);
+            }
+        }
+        self.observe_bound(&key, &bound)?;
+        let works = &bound.view.control.as_ref().unwrap().active_works;
+        if works.is_empty() && self.store.has_delivery_barrier(&key)? {
+            self.store.finish_priority_safe(
+                actor,
+                &cmd.request_id,
+                PriorityEnd::BeforeStop,
+                now(),
+            )?;
+            return Ok(self.store.operation(actor, &cmd.request_id)?.unwrap());
+        }
+        if !works.is_empty() {
+            let expected = match (&cmd.expected_execution_id, cmd.confirm_stop) {
+                (Some(id), true)
+                    if works.len() == 1
+                        && works[0].foreground_execution_id.as_ref() == Some(id) =>
+                {
+                    id
+                }
+                _ => {
+                    self.store.finish_priority_safe(
+                        actor,
+                        &cmd.request_id,
+                        PriorityEnd::BeforeStop,
+                        now(),
+                    )?;
+                    return Err(ZcodeError::of(codes::INVALID_ACTION));
+                }
+            };
+            if tokio::time::Instant::now() >= deadline {
+                self.store.finish_priority_safe(
+                    actor,
+                    &cmd.request_id,
+                    PriorityEnd::BeforeStop,
+                    now(),
+                )?;
+                return Ok(self.store.operation(actor, &cmd.request_id)?.unwrap());
+            }
+            match self.store.mark_stop_claimed(
+                actor,
+                &cmd.request_id,
+                bound.target.generation,
+                expected,
+            ) {
+                Ok(true) => {}
+                Ok(false) => return Ok(owner.operation),
+                Err(error) => {
+                    // 未调用停止端口；仅当事务确实未认领时才能安全释放。
+                    let _ = self.store.finish_priority_safe(
+                        actor,
+                        &cmd.request_id,
+                        PriorityEnd::BeforeStopFailure {
+                            code: error.code.clone(),
+                        },
+                        now(),
+                    );
+                    return Err(error);
+                }
+            }
+            let ctx = ActionContext {
+                action_id: owner.stop_action_id,
+                device_id: actor.device_id.clone(),
+                device_name: actor.device_name.clone(),
+            };
+            #[cfg(test)]
+            if let Some(hook) = self.before_priority_port.lock().unwrap().as_ref() {
+                hook("stop");
+            }
+            let attachment_error = match self.store.attachments_valid(
+                &key,
+                Some(&cmd.item_id),
+                &bound.target.workspace_path,
+            ) {
+                Ok(true) => None,
+                Ok(false) => Some(codes::ATTACHMENT_MISSING.to_owned()),
+                Err(error) => Some(error.code),
+            };
+            if let Some(code) = attachment_error {
+                self.store.finish_priority_safe(
+                    actor,
+                    &cmd.request_id,
+                    PriorityEnd::StopBeforeWriteFailure {
+                        action_id: ctx.action_id.clone(),
+                        generation: bound.target.generation,
+                        code,
+                    },
+                    now(),
+                )?;
+                return Ok(self.store.operation(actor, &cmd.request_id)?.unwrap());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                self.store.finish_priority_safe(
+                    actor,
+                    &cmd.request_id,
+                    PriorityEnd::StopBeforeWrite {
+                        action_id: ctx.action_id.clone(),
+                        generation: bound.target.generation,
+                    },
+                    now(),
+                )?;
+                return Ok(self.store.operation(actor, &cmd.request_id)?.unwrap());
+            }
+            let receipt = match self.host.stop(&ctx, &bound.target, expected).await {
+                Ok(r) => r,
+                Err(super::super::command::PreparedDispatchError::BeforeWrite(error)) => {
+                    self.store.finish_priority_safe(
+                        actor,
+                        &cmd.request_id,
+                        PriorityEnd::StopBeforeWriteFailure {
+                            action_id: ctx.action_id.clone(),
+                            generation: bound.target.generation,
+                            code: error.code,
+                        },
+                        now(),
+                    )?;
+                    return Ok(self.store.operation(actor, &cmd.request_id)?.unwrap());
+                }
+                Err(super::super::command::PreparedDispatchError::MayHaveWritten(error)) => {
+                    self.store.mark_priority_unknown_with_failure(
+                        actor,
+                        &cmd.request_id,
+                        Some(super::types::StopFailure {
+                            phase: "may_have_written".into(),
+                            code: error.code,
+                        }),
+                        now(),
+                    )?;
+                    return Ok(self.store.operation(actor, &cmd.request_id)?.unwrap());
+                }
+            };
+            if matches!(
+                receipt.state,
+                ActionState::Rejected | ActionState::Noop | ActionState::SendFailed
+            ) {
+                self.store.finish_priority_safe(
+                    actor,
+                    &cmd.request_id,
+                    PriorityEnd::StopRejected(receipt),
+                    now(),
+                )?;
+                return Ok(self.store.operation(actor, &cmd.request_id)?.unwrap());
+            }
+            if receipt.state != ActionState::Confirmed
+                || receipt.action_id != ctx.action_id
+                || receipt.session_id != key.session_id
+                || receipt.generation != bound.target.generation
+            {
+                self.store
+                    .mark_priority_unknown(actor, &cmd.request_id, now())?;
+                return Ok(self.store.operation(actor, &cmd.request_id)?.unwrap());
+            }
+        }
+        let after = self
+            .host
+            .read(&key, std::time::Duration::from_secs(2))
+            .await;
+        let fresh = self
+            .host
+            .refresh_target(&key, std::time::Duration::from_secs(2))
+            .await;
+        let valid = match (after, fresh) {
+            (Ok(v), Ok(t)) => {
+                let valid = v.target == bound.target
+                    && t == bound.target
+                    && v.view.ready
+                    && v.view.pending.is_empty()
+                    && v.view.capabilities.send.enabled
+                    && v.view
+                        .control
+                        .as_ref()
+                        .is_some_and(|c| c.active_works.is_empty());
+                if valid {
+                    self.observe_bound(&key, &v)?;
+                }
+                valid
+            }
+            _ => false,
+        };
+        let valid = valid && !self.store.has_delivery_barrier(&key)?;
+        if !valid
+            || tokio::time::Instant::now() >= deadline
+            || self.stopped.load(Ordering::SeqCst)
+            || self.gate.shutting_down()
+            || !self.gate.remote_enabled()
+            || !self.gate.device_valid(&actor.device_id)
+        {
+            if works.is_empty() {
+                self.store.finish_priority_safe(
+                    actor,
+                    &cmd.request_id,
+                    PriorityEnd::BeforeStop,
+                    now(),
+                )?;
+            } else {
+                self.store
+                    .mark_priority_unknown(actor, &cmd.request_id, now())?;
+            }
+            return Ok(self.store.operation(actor, &cmd.request_id)?.unwrap());
+        }
+        let item = ItemCommand {
+            request_id: cmd.request_id.clone(),
+            item_id: cmd.item_id.clone(),
+            expected_version: cmd.expected_version,
+        };
+        let claim = match self
+            .store
+            .claim_item(actor, &item, &bound.target, &cmd.request_id, now())
+        {
+            Ok(claim) => claim,
+            Err(error) => {
+                if works.is_empty() {
+                    let _ = self.store.finish_priority_safe(
+                        actor,
+                        &cmd.request_id,
+                        PriorityEnd::BeforeStop,
+                        now(),
+                    );
+                } else {
+                    let _ = self
+                        .store
+                        .mark_priority_unknown(actor, &cmd.request_id, now());
+                }
+                return Err(error);
+            }
+        };
+        #[cfg(test)]
+        let _ = self.queue_events.send(key.session_id.clone());
+        self.host.publish_queue_change(&key.session_id);
+        #[cfg(test)]
+        if let Some(hook) = self.before_priority_port.lock().unwrap().as_ref() {
+            hook("send");
+        }
+        let attachment_error = match self.store.attachments_valid(
+            &key,
+            Some(&claim.item_id),
+            &claim.target.workspace_path,
+        ) {
+            Ok(true) => None,
+            Ok(false) => Some("attachment_missing".to_owned()),
+            Err(error) => Some(error.code),
+        };
+        let receipt = if attachment_error.is_some()
+            || tokio::time::Instant::now() >= deadline
+            || self.stopped.load(Ordering::SeqCst)
+            || self.gate.shutting_down()
+            || !self.gate.remote_enabled()
+            || !self.gate.device_valid(&actor.device_id)
+        {
+            ActionReceipt {
+                action_id: claim.ctx.action_id.clone(),
+                session_id: claim.target.session_id.clone(),
+                generation: claim.target.generation,
+                state: ActionState::SendFailed,
+                reason_code: Some(attachment_error.unwrap_or_else(|| codes::NOT_READY.to_owned())),
+                send_admission: None,
+            }
+        } else {
+            match self
+                .host
+                .send_prepared(
+                    &claim.ctx,
+                    &claim.target,
+                    &claim.prepared,
+                    cmd.held_queue.as_ref(),
+                )
+                .await
+            {
+                Ok(r) => r,
+                Err(error) => {
+                    let (state, reason) = match error {
+                        super::super::command::PreparedDispatchError::BeforeWrite(e) => {
+                            (ActionState::SendFailed, e.code)
+                        }
+                        super::super::command::PreparedDispatchError::MayHaveWritten(e) => {
+                            (ActionState::Unknown, e.code)
+                        }
+                    };
+                    ActionReceipt {
+                        action_id: claim.ctx.action_id.clone(),
+                        session_id: claim.target.session_id.clone(),
+                        generation: claim.target.generation,
+                        state,
+                        reason_code: Some(reason),
+                        send_admission: None,
+                    }
+                }
+            }
+        };
+        self.store.settle_dispatch(&claim, &receipt, now())?;
+        Ok(self.store.operation(actor, &cmd.request_id)?.unwrap())
+    }
+    pub(crate) async fn stop_current(
+        self: &Arc<Self>,
+        actor: &super::types::QueueActor,
+        key: &TargetKey,
+        request_id: &str,
+        execution: &str,
+    ) -> ZResult<super::types::QueueOperationView> {
+        let worker = self.clone();
+        let actor = actor.clone();
+        let key = key.clone();
+        let request = request_id.to_owned();
+        let execution = execution.to_owned();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+        let actor_for_task = actor.clone();
+        let request_for_task = request.clone();
+        let mut task = tokio::spawn(async move {
+            worker
+                .stop_current_inner(
+                    &actor_for_task,
+                    &key,
+                    &request_for_task,
+                    &execution,
+                    deadline,
+                )
+                .await
+        });
+        match tokio::time::timeout_at(deadline, &mut task).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err(super::super::types::ZcodeError::of(
+                super::super::types::codes::NOT_READY,
+            )),
+            Err(_) => self.store.operation(&actor, &request)?.ok_or_else(|| {
+                super::super::types::ZcodeError::of(super::super::types::codes::NOT_READY)
+            }),
+        }
+    }
+    async fn stop_current_inner(
+        &self,
+        actor: &super::types::QueueActor,
+        key: &TargetKey,
+        request_id: &str,
+        execution: &str,
+        deadline: tokio::time::Instant,
+    ) -> ZResult<super::types::QueueOperationView> {
+        use super::super::types::{codes, ActionContext, ActionState, ZcodeError};
+        use super::types::QueueOperationState;
+        let lock = self.host.session_lock(key);
+        let _guard = lock.lock().await;
+        if tokio::time::Instant::now() >= deadline {
+            return Err(ZcodeError::of(codes::NOT_READY));
+        }
+        let now = chrono::Utc::now().timestamp_millis();
+        let (operation, owner, action_id) = self
+            .store
+            .begin_stop(actor, key, request_id, execution, now)?;
+        let _event_guard = QueueEventGuard {
+            #[cfg(test)]
+            sender: self.queue_events.clone(),
+            host: self.host.clone(),
+            session_id: key.session_id.clone(),
+        };
+        #[cfg(test)]
+        let _ = self.queue_events.send(key.session_id.clone());
+        self.host.publish_queue_change(&key.session_id);
+        if !owner {
+            if operation.state == QueueOperationState::InFlight {
+                let failure = self
+                    .manual_claim_failures
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(request_id)
+                    .cloned();
+                if self
+                    .store
+                    .finish_unclaimed_manual_stop(actor, request_id, failure.as_ref())?
+                {
+                    self.manual_claim_failures
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(request_id);
+                    return Ok(self.store.operation(actor, request_id)?.unwrap());
+                }
+            }
+            return Ok(operation);
+        }
+        let preflight = async {
+            if self.stopped.load(Ordering::SeqCst)
+                || self.gate.shutting_down()
+                || !self.gate.remote_enabled()
+                || !self.gate.device_valid(&actor.device_id)
+            {
+                return Err(ZcodeError::of(codes::NOT_READY));
+            }
+            let bound = self
+                .host
+                .read(key, std::time::Duration::from_secs(2))
+                .await?;
+            let fresh = self
+                .host
+                .refresh_target(key, std::time::Duration::from_secs(2))
+                .await?;
+            if fresh != bound.target
+                || !bound.view.ready
+                || bound.view.control.as_ref().is_none_or(|c| {
+                    !c.active_works.iter().any(|w| {
+                        w.kind == "primaryTurn"
+                            && w.foreground_execution_id.as_deref() == Some(execution)
+                    })
+                })
+            {
+                return Err(ZcodeError::of(codes::INVALID_ACTION));
+            }
+            Ok(bound)
+        }
+        .await;
+        let bound = match preflight {
+            Ok(v) => v,
+            Err(e) => {
+                self.store.finish_manual_stop_with_failure(
+                    actor,
+                    request_id,
+                    QueueOperationState::Failed,
+                    None,
+                    Some(super::types::StopFailure {
+                        phase: "before_write".into(),
+                        code: e.code.clone(),
+                    }),
+                )?;
+                return Err(e);
+            }
+        };
+        if tokio::time::Instant::now() >= deadline {
+            self.store
+                .finish_manual_stop(actor, request_id, QueueOperationState::Failed, None)?;
+            return Ok(self.store.operation(actor, request_id)?.unwrap());
+        }
+        if let Err(error) = self
+            .store
+            .claim_manual_stop(actor, request_id, bound.target.generation)
+        {
+            let failure = super::types::StopFailure {
+                phase: "before_write".into(),
+                code: error.code.clone(),
+            };
+            self.remember_manual_claim_failure(request_id, failure.clone());
+            if self
+                .store
+                .finish_unclaimed_manual_stop(actor, request_id, Some(&failure))
+                .unwrap_or(false)
+            {
+                self.manual_claim_failures
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(request_id);
+            }
+            return Err(error);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            self.store
+                .finish_manual_stop(actor, request_id, QueueOperationState::Failed, None)?;
+            return Ok(self.store.operation(actor, request_id)?.unwrap());
+        }
+        let ctx = ActionContext {
+            action_id,
+            device_id: actor.device_id.clone(),
+            device_name: actor.device_name.clone(),
+        };
+        let result = self.host.stop(&ctx, &bound.target, execution).await;
+        let (state, receipt, failure) = match result {
+            Err(super::super::command::PreparedDispatchError::BeforeWrite(error)) => (
+                QueueOperationState::Failed,
+                None,
+                Some(super::types::StopFailure {
+                    phase: "before_write".into(),
+                    code: error.code,
+                }),
+            ),
+            Err(super::super::command::PreparedDispatchError::MayHaveWritten(error)) => (
+                QueueOperationState::Unknown,
+                None,
+                Some(super::types::StopFailure {
+                    phase: "may_have_written".into(),
+                    code: error.code,
+                }),
+            ),
+            Ok(r)
+                if r.action_id != ctx.action_id
+                    || r.session_id != key.session_id
+                    || r.generation != bound.target.generation =>
+            {
+                (QueueOperationState::Unknown, None, None)
+            }
+            Ok(r) => {
+                let state = match r.state {
+                    ActionState::Confirmed => QueueOperationState::Completed,
+                    ActionState::Rejected | ActionState::Noop | ActionState::SendFailed => {
+                        QueueOperationState::Failed
+                    }
+                    _ => QueueOperationState::Unknown,
+                };
+                (state, Some(r), None)
+            }
+        };
+        self.store.finish_manual_stop_with_failure(
+            actor,
+            request_id,
+            state,
+            receipt.as_ref(),
+            failure,
+        )?;
+        Ok(self.store.operation(actor, request_id)?.unwrap())
+    }
+    pub(crate) fn pending_priority_recovery(
+        &self,
+        actor: &super::types::QueueActor,
+        key: &TargetKey,
+    ) -> ZResult<Vec<super::types::PriorityRecovery>> {
+        Ok(self
+            .store
+            .pending_priority_recovery()?
+            .into_iter()
+            .filter(|r| r.device_id == actor.device_id && r.session_id == key.session_id)
+            .collect())
+    }
+    pub(crate) async fn acknowledge_priority_unknown(
+        &self,
+        actor: &super::types::QueueActor,
+        key: &TargetKey,
+        request_id: &str,
+    ) -> ZResult<()> {
+        let lock = self.host.session_lock(key);
+        let _guard = lock.lock().await;
+        if self.store.priority_key(actor, request_id)?.session_id != key.session_id {
+            return Err(super::super::types::ZcodeError::of(
+                super::super::types::codes::NO_SESSION,
+            ));
+        }
+        self.store.acknowledge_priority_unknown(
+            actor,
+            request_id,
+            chrono::Utc::now().timestamp_millis(),
+        )
+    }
+    pub(crate) async fn acknowledge_dispatched_unknown(
+        &self,
+        actor: &super::types::QueueActor,
+        key: &TargetKey,
+        action_id: &str,
+        request_id: &str,
+    ) -> ZResult<()> {
+        let lock = self.host.session_lock(key);
+        let _guard = lock.lock().await;
+        self.store.acknowledge_dispatched_unknown(
+            actor,
+            key,
+            action_id,
+            request_id,
+            chrono::Utc::now().timestamp_millis(),
+        )
+    }
+    pub(crate) async fn acknowledge_manual_stop_unknown(
+        &self,
+        actor: &super::types::QueueActor,
+        key: &TargetKey,
+        stop_request: &str,
+        review_request: &str,
+    ) -> ZResult<()> {
+        let lock = self.host.session_lock(key);
+        let _guard = lock.lock().await;
+        self.store.acknowledge_manual_stop_unknown(
+            actor,
+            key,
+            stop_request,
+            review_request,
+            chrono::Utc::now().timestamp_millis(),
+        )
+    }
+    pub(crate) async fn acknowledge_unconfirmed(
+        &self,
+        actor: &super::types::QueueActor,
+        key: &TargetKey,
+        action_id: &str,
+        request_id: &str,
+    ) -> ZResult<()> {
+        let lock = self.host.session_lock(key);
+        let _guard = lock.lock().await;
+        self.store.acknowledge_unconfirmed(
+            actor,
+            key,
+            action_id,
+            request_id,
+            chrono::Utc::now().timestamp_millis(),
+        )
+    }
+    pub(crate) async fn resume(
+        &self,
+        actor: &super::types::QueueActor,
+        key: &TargetKey,
+        request_id: &str,
+        version: u64,
+    ) -> ZResult<super::types::LocalQueueView> {
+        let lock = self.host.session_lock(key);
+        let _guard = lock.lock().await;
+        let view = self.store.resume(actor, key, request_id, version)?;
+        self.notify(key);
+        Ok(view)
     }
     pub(crate) async fn enqueue(&self, cmd: EnqueueCommand) -> ZResult<EnqueueReceipt> {
         let key = TargetKey {
@@ -512,6 +1324,7 @@ impl ZcodeQueueService {
         }
         Ok(())
     }
+    #[cfg(test)]
     pub(crate) async fn flush_one(&self, key: &TargetKey) -> ZResult<()> {
         self.flush_one_inner(key)
             .await
@@ -599,17 +1412,37 @@ impl ZcodeQueueService {
                 .pause_target_mismatch(key, chrono::Utc::now().timestamp_millis())?;
             return Ok(());
         }
+        if !self
+            .store
+            .attachments_valid(key, None, &bound.target.workspace_path)?
+        {
+            self.store
+                .pause_attachment_missing(key, chrono::Utc::now().timestamp_millis())?;
+            return Ok(());
+        }
         let Some(claim) =
             self.store
                 .claim_next(key, &bound.target, chrono::Utc::now().timestamp_millis())?
         else {
             return Ok(());
         };
+        #[cfg(test)]
+        let _ = self.queue_events.send(key.session_id.clone());
+        self.host.publish_queue_change(&key.session_id);
         let stopping = self.stopped.load(Ordering::SeqCst) || self.gate.shutting_down();
         let remote_enabled = self.gate.remote_enabled();
         let device_valid =
             claim.ctx.device_id == device && self.gate.device_valid(&claim.ctx.device_id);
-        let receipt = if !stopping && remote_enabled && device_valid {
+        let attachment_error = match self.store.attachments_valid(
+            key,
+            Some(&claim.item_id),
+            &claim.target.workspace_path,
+        ) {
+            Ok(true) => None,
+            Ok(false) => Some("attachment_missing".to_owned()),
+            Err(error) => Some(error.code),
+        };
+        let receipt = if !stopping && remote_enabled && device_valid && attachment_error.is_none() {
             match self
                 .host
                 .send_prepared(&claim.ctx, &claim.target, &claim.prepared, None)
@@ -641,14 +1474,14 @@ impl ZcodeQueueService {
                 session_id: claim.target.session_id.clone(),
                 generation: claim.target.generation,
                 state: super::super::types::ActionState::SendFailed,
-                reason_code: Some(
+                reason_code: Some(attachment_error.unwrap_or_else(|| {
                     if stopping || !remote_enabled {
                         super::super::types::codes::NOT_READY
                     } else {
                         super::super::types::codes::NO_SESSION
                     }
-                    .to_owned(),
-                ),
+                    .to_owned()
+                })),
                 send_admission: None,
             }
         };
@@ -862,11 +1695,28 @@ mod tests {
         }
         fn stop<'a>(
             &'a self,
-            _: &'a ActionContext,
-            _: &'a BoundTarget,
-            _: &'a str,
-        ) -> BoxFuture<'a, ZResult<ActionReceipt>> {
-            Box::pin(async { unreachable!() })
+            ctx: &'a ActionContext,
+            target: &'a BoundTarget,
+            execution: &'a str,
+        ) -> BoxFuture<'a, super::super::super::command::PreparedResult<ActionReceipt>> {
+            Box::pin(async move {
+                assert_eq!(execution, "A");
+                assert!(*self.busy.lock().unwrap());
+                *self.busy.lock().unwrap() = false;
+                let receipt = ActionReceipt {
+                    action_id: ctx.action_id.clone(),
+                    session_id: target.session_id.clone(),
+                    generation: target.generation,
+                    state: ActionState::Confirmed,
+                    reason_code: None,
+                    send_admission: None,
+                };
+                self.receipts
+                    .lock()
+                    .unwrap()
+                    .insert("stopped:A".into(), receipt.clone());
+                Ok(receipt)
+            })
         }
         fn receipt<'a>(
             &'a self,
@@ -1699,7 +2549,8 @@ mod tests {
                 _: &'a ActionContext,
                 _: &'a BoundTarget,
                 _: &'a str,
-            ) -> BoxFuture<'a, ZResult<ActionReceipt>> {
+            ) -> BoxFuture<'a, super::super::super::command::PreparedResult<ActionReceipt>>
+            {
                 Box::pin(async { unreachable!() })
             }
             fn receipt<'a>(
@@ -1943,7 +2794,8 @@ mod tests {
                 _: &'a ActionContext,
                 _: &'a BoundTarget,
                 _: &'a str,
-            ) -> BoxFuture<'a, ZResult<ActionReceipt>> {
+            ) -> BoxFuture<'a, super::super::super::command::PreparedResult<ActionReceipt>>
+            {
                 Box::pin(async { unreachable!() })
             }
             fn receipt<'a>(
@@ -2667,6 +3519,3211 @@ mod tests {
             "old observation must not revive after workspace returns"
         );
     }
+    struct FailedPriorityStop {
+        inner: Arc<Fake>,
+        written: bool,
+        code: &'static str,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+    impl QueueHostPort for FailedPriorityStop {
+        fn session_lock(&self, key: &TargetKey) -> Arc<tokio::sync::Mutex<()>> {
+            self.inner.session_lock(key)
+        }
+        fn read<'a>(
+            &'a self,
+            key: &'a TargetKey,
+            timeout: Duration,
+        ) -> BoxFuture<'a, ZResult<BoundQueueSession>> {
+            self.inner.read(key, timeout)
+        }
+        fn refresh_target<'a>(
+            &'a self,
+            key: &'a TargetKey,
+            timeout: Duration,
+        ) -> BoxFuture<'a, ZResult<BoundTarget>> {
+            self.inner.refresh_target(key, timeout)
+        }
+        fn send_prepared<'a>(
+            &'a self,
+            ctx: &'a ActionContext,
+            target: &'a BoundTarget,
+            body: &'a PreparedSend,
+            held: Option<&'a HeldQueueChoice>,
+        ) -> BoxFuture<'a, super::super::super::command::PreparedResult<ActionReceipt>> {
+            self.inner.send_prepared(ctx, target, body, held)
+        }
+        fn stop<'a>(
+            &'a self,
+            _ctx: &'a ActionContext,
+            _target: &'a BoundTarget,
+            _execution: &'a str,
+        ) -> BoxFuture<'a, super::super::super::command::PreparedResult<ActionReceipt>> {
+            Box::pin(async move {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                let e = ZcodeError::of(self.code);
+                Err(if self.written {
+                    super::super::super::command::PreparedDispatchError::MayHaveWritten(e)
+                } else {
+                    super::super::super::command::PreparedDispatchError::BeforeWrite(e)
+                })
+            })
+        }
+        fn receipt<'a>(
+            &'a self,
+            action: &'a str,
+            device: &'a str,
+        ) -> BoxFuture<'a, ZResult<Option<ActionReceipt>>> {
+            self.inner.receipt(action, device)
+        }
+    }
+    struct BlockingPriorityStop {
+        inner: Arc<Fake>,
+        entered: Notify,
+        release: Notify,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+    impl QueueHostPort for BlockingPriorityStop {
+        fn session_lock(&self, key: &TargetKey) -> Arc<tokio::sync::Mutex<()>> {
+            self.inner.session_lock(key)
+        }
+        fn read<'a>(
+            &'a self,
+            key: &'a TargetKey,
+            timeout: Duration,
+        ) -> BoxFuture<'a, ZResult<BoundQueueSession>> {
+            self.inner.read(key, timeout)
+        }
+        fn refresh_target<'a>(
+            &'a self,
+            key: &'a TargetKey,
+            timeout: Duration,
+        ) -> BoxFuture<'a, ZResult<BoundTarget>> {
+            self.inner.refresh_target(key, timeout)
+        }
+        fn send_prepared<'a>(
+            &'a self,
+            ctx: &'a ActionContext,
+            target: &'a BoundTarget,
+            body: &'a PreparedSend,
+            held: Option<&'a HeldQueueChoice>,
+        ) -> BoxFuture<'a, super::super::super::command::PreparedResult<ActionReceipt>> {
+            self.inner.send_prepared(ctx, target, body, held)
+        }
+        fn stop<'a>(
+            &'a self,
+            ctx: &'a ActionContext,
+            target: &'a BoundTarget,
+            execution: &'a str,
+        ) -> BoxFuture<'a, super::super::super::command::PreparedResult<ActionReceipt>> {
+            Box::pin(async move {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                self.entered.notify_one();
+                self.release.notified().await;
+                self.inner.stop(ctx, target, execution).await
+            })
+        }
+        fn receipt<'a>(
+            &'a self,
+            action: &'a str,
+            device: &'a str,
+        ) -> BoxFuture<'a, ZResult<Option<ActionReceipt>>> {
+            self.inner.receipt(action, device)
+        }
+    }
+    #[tokio::test]
+    async fn cancelled_prioritize_does_not_repeat_stop() {
+        let fake = Arc::new(Fake {
+            sent: Mutex::new(vec![]),
+            busy: Mutex::new(true),
+            lock: Arc::new(tokio::sync::Mutex::new(())),
+            receipts: Mutex::new(std::collections::BTreeMap::new()),
+            terminal_after_send: AtomicBool::new(false),
+            delivery: SendDelivery::Queue,
+            changed_path_after_send: AtomicBool::new(false),
+            revision: std::sync::atomic::AtomicU64::new(1),
+            bound: AtomicBool::new(true),
+            refresh_calls: std::sync::atomic::AtomicUsize::new(0),
+            activate_calls: std::sync::atomic::AtomicUsize::new(0),
+            activate_failures: std::sync::atomic::AtomicUsize::new(0),
+            identity: None,
+            blocked_session: AtomicBool::new(false),
+            read_calls: std::sync::atomic::AtomicUsize::new(0),
+            read_failures: std::sync::atomic::AtomicUsize::new(0),
+            refresh_failures: std::sync::atomic::AtomicUsize::new(0),
+            send_failure: Mutex::new(None),
+        });
+        let host = Arc::new(BlockingPriorityStop {
+            inner: fake.clone(),
+            entered: Notify::new(),
+            release: Notify::new(),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let store = SqlLocalQueueStore::new(DeviceStore::memory());
+        let svc = Arc::new(ZcodeQueueService::new(
+            store.clone(),
+            host.clone(),
+            Arc::new(Gate),
+        ));
+        let actor = QueueActor {
+            device_id: "d".into(),
+            device_name: "phone".into(),
+        };
+        let key = TargetKey {
+            session_id: "session".into(),
+        };
+        let item = svc
+            .enqueue(EnqueueCommand {
+                request_id: "C".into(),
+                actor: actor.clone(),
+                session_id: key.session_id,
+                workspace_path: "/synthetic".into(),
+                workspace_identity: None,
+                draft: QueueDraft {
+                    text: "C".into(),
+                    attachments: vec![],
+                },
+                prepared: PreparedSend::from_stored("C".into()).unwrap(),
+                edited_from: None,
+            })
+            .await
+            .unwrap();
+        let cmd = super::super::types::PriorityCommand {
+            request_id: "p".into(),
+            item_id: item.item_id,
+            expected_version: item.item_version,
+            confirm_stop: true,
+            expected_execution_id: Some("A".into()),
+            held_queue: None,
+        };
+        let worker = svc.clone();
+        let a = actor.clone();
+        let c = cmd.clone();
+        let task = tokio::spawn(async move { worker.prioritize(&a, c).await });
+        host.entered.notified().await;
+        task.abort();
+        host.release.notify_one();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if !fake.sent.lock().unwrap().is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("后台编排应完成");
+        svc.prioritize(&actor, cmd).await.unwrap();
+        assert_eq!(host.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(*fake.sent.lock().unwrap(), vec!["C"]);
+    }
+    #[tokio::test]
+    async fn stop_before_write_releases_queued_item_without_send() {
+        let fake = Arc::new(Fake {
+            sent: Mutex::new(vec![]),
+            busy: Mutex::new(true),
+            lock: Arc::new(tokio::sync::Mutex::new(())),
+            receipts: Mutex::new(std::collections::BTreeMap::new()),
+            terminal_after_send: AtomicBool::new(false),
+            delivery: SendDelivery::Queue,
+            changed_path_after_send: AtomicBool::new(false),
+            revision: std::sync::atomic::AtomicU64::new(1),
+            bound: AtomicBool::new(true),
+            refresh_calls: std::sync::atomic::AtomicUsize::new(0),
+            activate_calls: std::sync::atomic::AtomicUsize::new(0),
+            activate_failures: std::sync::atomic::AtomicUsize::new(0),
+            identity: None,
+            blocked_session: AtomicBool::new(false),
+            read_calls: std::sync::atomic::AtomicUsize::new(0),
+            read_failures: std::sync::atomic::AtomicUsize::new(0),
+            refresh_failures: std::sync::atomic::AtomicUsize::new(0),
+            send_failure: Mutex::new(None),
+        });
+        let host = Arc::new(FailedPriorityStop {
+            inner: fake.clone(),
+            written: false,
+            code: codes::NO_SESSION,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let store = SqlLocalQueueStore::new(DeviceStore::memory());
+        let svc = Arc::new(ZcodeQueueService::new(
+            store.clone(),
+            host.clone(),
+            Arc::new(Gate),
+        ));
+        let actor = QueueActor {
+            device_id: "d".into(),
+            device_name: "phone".into(),
+        };
+        let key = TargetKey {
+            session_id: "session".into(),
+        };
+        let item = svc
+            .enqueue(EnqueueCommand {
+                request_id: "C".into(),
+                actor: actor.clone(),
+                session_id: key.session_id.clone(),
+                workspace_path: "/synthetic".into(),
+                workspace_identity: None,
+                draft: QueueDraft {
+                    text: "C".into(),
+                    attachments: vec![],
+                },
+                prepared: PreparedSend::from_stored("C".into()).unwrap(),
+                edited_from: None,
+            })
+            .await
+            .unwrap();
+        let result = svc
+            .prioritize(
+                &actor,
+                super::super::types::PriorityCommand {
+                    request_id: "p".into(),
+                    item_id: item.item_id,
+                    expected_version: item.item_version,
+                    confirm_stop: true,
+                    expected_execution_id: Some("A".into()),
+                    held_queue: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            result.state,
+            super::super::types::QueueOperationState::Failed
+        );
+        let view = store.view(&actor, &key).unwrap();
+        assert!(!view.auto_drain);
+        assert_eq!(
+            view.items[0].state,
+            super::super::types::QueueItemState::Queued
+        );
+        assert!(fake.sent.lock().unwrap().is_empty());
+        assert_eq!(host.calls.load(Ordering::SeqCst), 1);
+    }
+    #[tokio::test]
+    async fn stop_unknown_is_zero_send_even_after_restart() {
+        let fake = Arc::new(Fake {
+            sent: Mutex::new(vec![]),
+            busy: Mutex::new(true),
+            lock: Arc::new(tokio::sync::Mutex::new(())),
+            receipts: Mutex::new(std::collections::BTreeMap::new()),
+            terminal_after_send: AtomicBool::new(false),
+            delivery: SendDelivery::Queue,
+            changed_path_after_send: AtomicBool::new(false),
+            revision: std::sync::atomic::AtomicU64::new(1),
+            bound: AtomicBool::new(true),
+            refresh_calls: std::sync::atomic::AtomicUsize::new(0),
+            activate_calls: std::sync::atomic::AtomicUsize::new(0),
+            activate_failures: std::sync::atomic::AtomicUsize::new(0),
+            identity: None,
+            blocked_session: AtomicBool::new(false),
+            read_calls: std::sync::atomic::AtomicUsize::new(0),
+            read_failures: std::sync::atomic::AtomicUsize::new(0),
+            refresh_failures: std::sync::atomic::AtomicUsize::new(0),
+            send_failure: Mutex::new(None),
+        });
+        let host = Arc::new(FailedPriorityStop {
+            inner: fake.clone(),
+            written: true,
+            code: codes::NO_SESSION,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let store = SqlLocalQueueStore::new(DeviceStore::memory());
+        let svc = Arc::new(ZcodeQueueService::new(
+            store.clone(),
+            host.clone(),
+            Arc::new(Gate),
+        ));
+        let actor = QueueActor {
+            device_id: "d".into(),
+            device_name: "phone".into(),
+        };
+        let key = TargetKey {
+            session_id: "session".into(),
+        };
+        let item = svc
+            .enqueue(EnqueueCommand {
+                request_id: "C".into(),
+                actor: actor.clone(),
+                session_id: key.session_id.clone(),
+                workspace_path: "/synthetic".into(),
+                workspace_identity: None,
+                draft: QueueDraft {
+                    text: "C".into(),
+                    attachments: vec![],
+                },
+                prepared: PreparedSend::from_stored("C".into()).unwrap(),
+                edited_from: None,
+            })
+            .await
+            .unwrap();
+        let result = svc
+            .prioritize(
+                &actor,
+                super::super::types::PriorityCommand {
+                    request_id: "p".into(),
+                    item_id: item.item_id.clone(),
+                    expected_version: item.item_version,
+                    confirm_stop: true,
+                    expected_execution_id: Some("A".into()),
+                    held_queue: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            result.state,
+            super::super::types::QueueOperationState::Unknown
+        );
+        store
+            .recover(chrono::Utc::now().timestamp_millis())
+            .unwrap();
+        let recovery = store.pending_priority_recovery().unwrap();
+        assert_eq!(recovery.len(), 1);
+        assert_eq!(recovery[0].execution_id, "A");
+        assert!(svc
+            .prioritize(
+                &actor,
+                super::super::types::PriorityCommand {
+                    request_id: "new".into(),
+                    item_id: item.item_id.clone(),
+                    expected_version: item.item_version,
+                    confirm_stop: true,
+                    expected_execution_id: Some("A".into()),
+                    held_queue: None
+                }
+            )
+            .await
+            .is_err());
+        let view = store.view(&actor, &key).unwrap();
+        assert!(!view.auto_drain);
+        assert_eq!(
+            view.items[0].state,
+            super::super::types::QueueItemState::Queued
+        );
+        assert!(fake.sent.lock().unwrap().is_empty());
+        assert_eq!(host.calls.load(Ordering::SeqCst), 1);
+        let other_key = TargetKey {
+            session_id: "other".into(),
+        };
+        assert!(svc
+            .acknowledge_priority_unknown(&actor, &other_key, "p")
+            .await
+            .is_err());
+        assert_eq!(
+            svc.pending_priority_recovery(&actor, &key).unwrap().len(),
+            1
+        );
+        svc.acknowledge_priority_unknown(&actor, &key, "p")
+            .await
+            .unwrap();
+        let reviewed = store.view(&actor, &key).unwrap();
+        assert!(!reviewed.auto_drain);
+        *fake.busy.lock().unwrap() = false;
+        svc.flush_one(&key).await.unwrap();
+        assert!(fake.sent.lock().unwrap().is_empty());
+        svc.resume(&actor, &key, "resume-after-review", reviewed.version)
+            .await
+            .unwrap();
+        svc.flush_one(&key).await.unwrap();
+        assert_eq!(*fake.sent.lock().unwrap(), vec!["C"]);
+        assert_eq!(host.calls.load(Ordering::SeqCst), 1);
+    }
+    struct NewExecutionStop {
+        inner: Arc<Fake>,
+        switched: AtomicBool,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+    impl QueueHostPort for NewExecutionStop {
+        fn session_lock(&self, key: &TargetKey) -> Arc<tokio::sync::Mutex<()>> {
+            self.inner.session_lock(key)
+        }
+        fn read<'a>(
+            &'a self,
+            key: &'a TargetKey,
+            timeout: Duration,
+        ) -> BoxFuture<'a, ZResult<BoundQueueSession>> {
+            Box::pin(async move {
+                let mut b = self.inner.read(key, timeout).await?;
+                if self.switched.load(Ordering::SeqCst) {
+                    b.view.control.as_mut().unwrap().active_works[0].foreground_execution_id =
+                        Some("new-execution".into());
+                }
+                Ok(b)
+            })
+        }
+        fn refresh_target<'a>(
+            &'a self,
+            key: &'a TargetKey,
+            timeout: Duration,
+        ) -> BoxFuture<'a, ZResult<BoundTarget>> {
+            self.inner.refresh_target(key, timeout)
+        }
+        fn send_prepared<'a>(
+            &'a self,
+            ctx: &'a ActionContext,
+            target: &'a BoundTarget,
+            body: &'a PreparedSend,
+            held: Option<&'a HeldQueueChoice>,
+        ) -> BoxFuture<'a, super::super::super::command::PreparedResult<ActionReceipt>> {
+            self.inner.send_prepared(ctx, target, body, held)
+        }
+        fn stop<'a>(
+            &'a self,
+            ctx: &'a ActionContext,
+            target: &'a BoundTarget,
+            execution: &'a str,
+        ) -> BoxFuture<'a, super::super::super::command::PreparedResult<ActionReceipt>> {
+            Box::pin(async move {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                let result = self.inner.stop(ctx, target, execution).await;
+                *self.inner.busy.lock().unwrap() = true;
+                self.switched.store(true, Ordering::SeqCst);
+                result
+            })
+        }
+        fn receipt<'a>(
+            &'a self,
+            action: &'a str,
+            device: &'a str,
+        ) -> BoxFuture<'a, ZResult<Option<ActionReceipt>>> {
+            self.inner.receipt(action, device)
+        }
+    }
+    struct PauseInspectStop {
+        inner: Arc<Fake>,
+        store: SqlLocalQueueStore,
+        actor: QueueActor,
+        key: TargetKey,
+    }
+    impl QueueHostPort for PauseInspectStop {
+        fn session_lock(&self, key: &TargetKey) -> Arc<tokio::sync::Mutex<()>> {
+            self.inner.session_lock(key)
+        }
+        fn read<'a>(
+            &'a self,
+            key: &'a TargetKey,
+            timeout: Duration,
+        ) -> BoxFuture<'a, ZResult<BoundQueueSession>> {
+            self.inner.read(key, timeout)
+        }
+        fn refresh_target<'a>(
+            &'a self,
+            key: &'a TargetKey,
+            timeout: Duration,
+        ) -> BoxFuture<'a, ZResult<BoundTarget>> {
+            self.inner.refresh_target(key, timeout)
+        }
+        fn send_prepared<'a>(
+            &'a self,
+            ctx: &'a ActionContext,
+            target: &'a BoundTarget,
+            body: &'a PreparedSend,
+            held: Option<&'a HeldQueueChoice>,
+        ) -> BoxFuture<'a, super::super::super::command::PreparedResult<ActionReceipt>> {
+            self.inner.send_prepared(ctx, target, body, held)
+        }
+        fn stop<'a>(
+            &'a self,
+            ctx: &'a ActionContext,
+            target: &'a BoundTarget,
+            execution: &'a str,
+        ) -> BoxFuture<'a, super::super::super::command::PreparedResult<ActionReceipt>> {
+            Box::pin(async move {
+                assert!(!self.store.view(&self.actor, &self.key).unwrap().auto_drain);
+                self.inner.stop(ctx, target, execution).await
+            })
+        }
+        fn receipt<'a>(
+            &'a self,
+            action: &'a str,
+            device: &'a str,
+        ) -> BoxFuture<'a, ZResult<Option<ActionReceipt>>> {
+            self.inner.receipt(action, device)
+        }
+    }
+    #[tokio::test]
+    async fn resume_uses_queue_version_and_preserves_fifo() {
+        let fake = Arc::new(Fake {
+            sent: Mutex::new(vec![]),
+            busy: Mutex::new(true),
+            lock: Arc::new(tokio::sync::Mutex::new(())),
+            receipts: Mutex::new(std::collections::BTreeMap::new()),
+            terminal_after_send: AtomicBool::new(false),
+            delivery: SendDelivery::Queue,
+            changed_path_after_send: AtomicBool::new(false),
+            revision: std::sync::atomic::AtomicU64::new(1),
+            bound: AtomicBool::new(true),
+            refresh_calls: std::sync::atomic::AtomicUsize::new(0),
+            activate_calls: std::sync::atomic::AtomicUsize::new(0),
+            activate_failures: std::sync::atomic::AtomicUsize::new(0),
+            identity: None,
+            blocked_session: AtomicBool::new(false),
+            read_calls: std::sync::atomic::AtomicUsize::new(0),
+            read_failures: std::sync::atomic::AtomicUsize::new(0),
+            refresh_failures: std::sync::atomic::AtomicUsize::new(0),
+            send_failure: Mutex::new(None),
+        });
+        let store = SqlLocalQueueStore::new(DeviceStore::memory());
+        let actor = QueueActor {
+            device_id: "d".into(),
+            device_name: "phone".into(),
+        };
+        let key = TargetKey {
+            session_id: "session".into(),
+        };
+        let svc = Arc::new(ZcodeQueueService::new(
+            store.clone(),
+            fake.clone(),
+            Arc::new(Gate),
+        ));
+        for text in ["B", "C"] {
+            svc.enqueue(EnqueueCommand {
+                request_id: text.into(),
+                actor: actor.clone(),
+                session_id: key.session_id.clone(),
+                workspace_path: "/synthetic".into(),
+                workspace_identity: None,
+                draft: QueueDraft {
+                    text: text.into(),
+                    attachments: vec![],
+                },
+                prepared: PreparedSend::from_stored(text.into()).unwrap(),
+                edited_from: None,
+            })
+            .await
+            .unwrap();
+        }
+        svc.stop_current(&actor, &key, "stop-request", "A")
+            .await
+            .unwrap();
+        let paused = store.view(&actor, &key).unwrap();
+        assert!(svc
+            .resume(&actor, &key, "stale", paused.version - 1)
+            .await
+            .is_err());
+        let resumed = svc
+            .resume(&actor, &key, "resume", paused.version)
+            .await
+            .unwrap();
+        assert!(resumed.auto_drain);
+        svc.flush_one(&key).await.unwrap();
+        assert_eq!(*fake.sent.lock().unwrap(), vec!["B"]);
+        assert_eq!(store.view(&actor, &key).unwrap().items[0].text_preview, "C");
+    }
+    #[tokio::test]
+    async fn manual_stop_pauses_before_fifo_can_flush() {
+        let fake = Arc::new(Fake {
+            sent: Mutex::new(vec![]),
+            busy: Mutex::new(true),
+            lock: Arc::new(tokio::sync::Mutex::new(())),
+            receipts: Mutex::new(std::collections::BTreeMap::new()),
+            terminal_after_send: AtomicBool::new(false),
+            delivery: SendDelivery::Queue,
+            changed_path_after_send: AtomicBool::new(false),
+            revision: std::sync::atomic::AtomicU64::new(1),
+            bound: AtomicBool::new(true),
+            refresh_calls: std::sync::atomic::AtomicUsize::new(0),
+            activate_calls: std::sync::atomic::AtomicUsize::new(0),
+            activate_failures: std::sync::atomic::AtomicUsize::new(0),
+            identity: None,
+            blocked_session: AtomicBool::new(false),
+            read_calls: std::sync::atomic::AtomicUsize::new(0),
+            read_failures: std::sync::atomic::AtomicUsize::new(0),
+            refresh_failures: std::sync::atomic::AtomicUsize::new(0),
+            send_failure: Mutex::new(None),
+        });
+        let store = SqlLocalQueueStore::new(DeviceStore::memory());
+        let actor = QueueActor {
+            device_id: "d".into(),
+            device_name: "phone".into(),
+        };
+        let key = TargetKey {
+            session_id: "session".into(),
+        };
+        let host = Arc::new(PauseInspectStop {
+            inner: fake.clone(),
+            store: store.clone(),
+            actor: actor.clone(),
+            key: key.clone(),
+        });
+        let svc = Arc::new(ZcodeQueueService::new(store.clone(), host, Arc::new(Gate)));
+        svc.enqueue(EnqueueCommand {
+            request_id: "B".into(),
+            actor: actor.clone(),
+            session_id: key.session_id.clone(),
+            workspace_path: "/synthetic".into(),
+            workspace_identity: None,
+            draft: QueueDraft {
+                text: "B".into(),
+                attachments: vec![],
+            },
+            prepared: PreparedSend::from_stored("B".into()).unwrap(),
+            edited_from: None,
+        })
+        .await
+        .unwrap();
+        svc.stop_current(&actor, &key, "stop-request", "A")
+            .await
+            .unwrap();
+        svc.flush_one(&key).await.unwrap();
+        assert!(fake.receipts.lock().unwrap().contains_key("stopped:A"));
+        assert!(fake.sent.lock().unwrap().is_empty());
+        assert!(!store.view(&actor, &key).unwrap().auto_drain);
+    }
+    #[tokio::test]
+    async fn manual_unknown_survives_recovery_and_blocks_new_stop_and_flush() {
+        let fake = Arc::new(Fake {
+            sent: Mutex::new(vec![]),
+            busy: Mutex::new(true),
+            lock: Arc::new(tokio::sync::Mutex::new(())),
+            receipts: Mutex::new(std::collections::BTreeMap::new()),
+            terminal_after_send: AtomicBool::new(false),
+            delivery: SendDelivery::Queue,
+            changed_path_after_send: AtomicBool::new(false),
+            revision: std::sync::atomic::AtomicU64::new(1),
+            bound: AtomicBool::new(true),
+            refresh_calls: std::sync::atomic::AtomicUsize::new(0),
+            activate_calls: std::sync::atomic::AtomicUsize::new(0),
+            activate_failures: std::sync::atomic::AtomicUsize::new(0),
+            identity: None,
+            blocked_session: AtomicBool::new(false),
+            read_calls: std::sync::atomic::AtomicUsize::new(0),
+            read_failures: std::sync::atomic::AtomicUsize::new(0),
+            refresh_failures: std::sync::atomic::AtomicUsize::new(0),
+            send_failure: Mutex::new(None),
+        });
+        let host = Arc::new(FailedPriorityStop {
+            inner: fake.clone(),
+            written: true,
+            code: codes::NO_SESSION,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let store = SqlLocalQueueStore::new(DeviceStore::memory());
+        let svc = Arc::new(ZcodeQueueService::new(
+            store.clone(),
+            host.clone(),
+            Arc::new(Gate),
+        ));
+        let actor = QueueActor {
+            device_id: "d".into(),
+            device_name: "phone".into(),
+        };
+        let key = TargetKey {
+            session_id: "session".into(),
+        };
+        svc.enqueue(EnqueueCommand {
+            request_id: "B".into(),
+            actor: actor.clone(),
+            session_id: key.session_id.clone(),
+            workspace_path: "/synthetic".into(),
+            workspace_identity: None,
+            draft: QueueDraft {
+                text: "B".into(),
+                attachments: vec![],
+            },
+            prepared: PreparedSend::from_stored("B".into()).unwrap(),
+            edited_from: None,
+        })
+        .await
+        .unwrap();
+        let result = svc.stop_current(&actor, &key, "stop-1", "A").await.unwrap();
+        assert_eq!(
+            result.state,
+            super::super::types::QueueOperationState::Unknown
+        );
+        store
+            .recover(chrono::Utc::now().timestamp_millis())
+            .unwrap();
+        let view = store.view(&actor, &key).unwrap();
+        svc.resume(&actor, &key, "resume", view.version)
+            .await
+            .unwrap();
+        *fake.busy.lock().unwrap() = false;
+        svc.flush_one(&key).await.unwrap();
+        assert!(fake.sent.lock().unwrap().is_empty());
+        assert!(svc.stop_current(&actor, &key, "stop-2", "A").await.is_err());
+        assert_eq!(host.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            store
+                .unreviewed_manual_stop(&actor, &key)
+                .unwrap()
+                .as_deref(),
+            Some("stop-1")
+        );
+        svc.acknowledge_manual_stop_unknown(&actor, &key, "stop-1", "review")
+            .await
+            .unwrap();
+        let reviewed = store.view(&actor, &key).unwrap();
+        assert!(!reviewed.auto_drain);
+        svc.flush_one(&key).await.unwrap();
+        assert!(fake.sent.lock().unwrap().is_empty());
+        svc.resume(&actor, &key, "resume-after-review", reviewed.version)
+            .await
+            .unwrap();
+        svc.flush_one(&key).await.unwrap();
+        assert_eq!(*fake.sent.lock().unwrap(), vec!["B"]);
+        assert!(store
+            .unreviewed_manual_stop(&actor, &key)
+            .unwrap()
+            .is_none());
+    }
+    #[tokio::test]
+    async fn expired_priority_does_not_begin_any_new_write() {
+        let fake = Arc::new(Fake {
+            sent: Mutex::new(vec![]),
+            busy: Mutex::new(true),
+            lock: Arc::new(tokio::sync::Mutex::new(())),
+            receipts: Mutex::new(std::collections::BTreeMap::new()),
+            terminal_after_send: AtomicBool::new(false),
+            delivery: SendDelivery::Queue,
+            changed_path_after_send: AtomicBool::new(false),
+            revision: std::sync::atomic::AtomicU64::new(1),
+            bound: AtomicBool::new(true),
+            refresh_calls: std::sync::atomic::AtomicUsize::new(0),
+            activate_calls: std::sync::atomic::AtomicUsize::new(0),
+            activate_failures: std::sync::atomic::AtomicUsize::new(0),
+            identity: None,
+            blocked_session: AtomicBool::new(false),
+            read_calls: std::sync::atomic::AtomicUsize::new(0),
+            read_failures: std::sync::atomic::AtomicUsize::new(0),
+            refresh_failures: std::sync::atomic::AtomicUsize::new(0),
+            send_failure: Mutex::new(None),
+        });
+        let store = SqlLocalQueueStore::new(DeviceStore::memory());
+        let svc = ZcodeQueueService::new(store.clone(), fake.clone(), Arc::new(Gate));
+        let actor = QueueActor {
+            device_id: "d".into(),
+            device_name: "phone".into(),
+        };
+        let key = TargetKey {
+            session_id: "session".into(),
+        };
+        let item = svc
+            .enqueue(EnqueueCommand {
+                request_id: "C".into(),
+                actor: actor.clone(),
+                session_id: key.session_id,
+                workspace_path: "/synthetic".into(),
+                workspace_identity: None,
+                draft: QueueDraft {
+                    text: "C".into(),
+                    attachments: vec![],
+                },
+                prepared: PreparedSend::from_stored("C".into()).unwrap(),
+                edited_from: None,
+            })
+            .await
+            .unwrap();
+        let cmd = super::super::types::PriorityCommand {
+            request_id: "p".into(),
+            item_id: item.item_id,
+            expected_version: item.item_version,
+            confirm_stop: true,
+            expected_execution_id: Some("A".into()),
+            held_queue: None,
+        };
+        assert!(svc
+            .prioritize_inner(
+                &actor,
+                cmd,
+                tokio::time::Instant::now() - Duration::from_millis(1)
+            )
+            .await
+            .is_err());
+        assert!(store.operation(&actor, "p").unwrap().is_none());
+        assert!(fake.sent.lock().unwrap().is_empty());
+        assert!(!fake.receipts.lock().unwrap().contains_key("stopped:A"));
+    }
+    #[tokio::test]
+    async fn deadline_after_stop_claim_emits_zero_stop() {
+        let fake = Arc::new(Fake {
+            sent: Mutex::new(vec![]),
+            busy: Mutex::new(true),
+            lock: Arc::new(tokio::sync::Mutex::new(())),
+            receipts: Mutex::new(std::collections::BTreeMap::new()),
+            terminal_after_send: AtomicBool::new(false),
+            delivery: SendDelivery::Queue,
+            changed_path_after_send: AtomicBool::new(false),
+            revision: std::sync::atomic::AtomicU64::new(1),
+            bound: AtomicBool::new(true),
+            refresh_calls: std::sync::atomic::AtomicUsize::new(0),
+            activate_calls: std::sync::atomic::AtomicUsize::new(0),
+            activate_failures: std::sync::atomic::AtomicUsize::new(0),
+            identity: None,
+            blocked_session: AtomicBool::new(false),
+            read_calls: std::sync::atomic::AtomicUsize::new(0),
+            read_failures: std::sync::atomic::AtomicUsize::new(0),
+            refresh_failures: std::sync::atomic::AtomicUsize::new(0),
+            send_failure: Mutex::new(None),
+        });
+        let store = SqlLocalQueueStore::new(DeviceStore::memory());
+        let svc = ZcodeQueueService::new(store.clone(), fake.clone(), Arc::new(Gate));
+        *svc.before_priority_port.lock().unwrap() = Some(Arc::new(|stage| {
+            if stage == "stop" {
+                std::thread::sleep(Duration::from_millis(650));
+            }
+        }));
+        let actor = QueueActor {
+            device_id: "d".into(),
+            device_name: "phone".into(),
+        };
+        let key = TargetKey {
+            session_id: "session".into(),
+        };
+        let item = svc
+            .enqueue(EnqueueCommand {
+                request_id: "C".into(),
+                actor: actor.clone(),
+                session_id: key.session_id.clone(),
+                workspace_path: "/synthetic".into(),
+                workspace_identity: None,
+                draft: QueueDraft {
+                    text: "C".into(),
+                    attachments: vec![],
+                },
+                prepared: PreparedSend::from_stored("C".into()).unwrap(),
+                edited_from: None,
+            })
+            .await
+            .unwrap();
+        let cmd = super::super::types::PriorityCommand {
+            request_id: "p".into(),
+            item_id: item.item_id,
+            expected_version: item.item_version,
+            confirm_stop: true,
+            expected_execution_id: Some("A".into()),
+            held_queue: None,
+        };
+        let result = svc
+            .prioritize_inner(
+                &actor,
+                cmd,
+                tokio::time::Instant::now() + Duration::from_millis(500),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            result.state,
+            super::super::types::QueueOperationState::Failed
+        );
+        let view = store.view(&actor, &key).unwrap();
+        assert!(!view.auto_drain);
+        assert_eq!(
+            view.items[0].state,
+            super::super::types::QueueItemState::Queued
+        );
+        assert!(fake.sent.lock().unwrap().is_empty());
+        assert!(!fake.receipts.lock().unwrap().contains_key("stopped:A"));
+    }
+    #[tokio::test]
+    async fn deadline_after_send_claim_emits_zero_message() {
+        let fake = Arc::new(Fake {
+            sent: Mutex::new(vec![]),
+            busy: Mutex::new(false),
+            lock: Arc::new(tokio::sync::Mutex::new(())),
+            receipts: Mutex::new(std::collections::BTreeMap::new()),
+            terminal_after_send: AtomicBool::new(false),
+            delivery: SendDelivery::Queue,
+            changed_path_after_send: AtomicBool::new(false),
+            revision: std::sync::atomic::AtomicU64::new(1),
+            bound: AtomicBool::new(true),
+            refresh_calls: std::sync::atomic::AtomicUsize::new(0),
+            activate_calls: std::sync::atomic::AtomicUsize::new(0),
+            activate_failures: std::sync::atomic::AtomicUsize::new(0),
+            identity: None,
+            blocked_session: AtomicBool::new(false),
+            read_calls: std::sync::atomic::AtomicUsize::new(0),
+            read_failures: std::sync::atomic::AtomicUsize::new(0),
+            refresh_failures: std::sync::atomic::AtomicUsize::new(0),
+            send_failure: Mutex::new(None),
+        });
+        let store = SqlLocalQueueStore::new(DeviceStore::memory());
+        let svc = ZcodeQueueService::new(store.clone(), fake.clone(), Arc::new(Gate));
+        *svc.before_priority_port.lock().unwrap() = Some(Arc::new(|stage| {
+            if stage == "send" {
+                std::thread::sleep(Duration::from_millis(650));
+            }
+        }));
+        let actor = QueueActor {
+            device_id: "d".into(),
+            device_name: "phone".into(),
+        };
+        let key = TargetKey {
+            session_id: "session".into(),
+        };
+        let item = svc
+            .enqueue(EnqueueCommand {
+                request_id: "C".into(),
+                actor: actor.clone(),
+                session_id: key.session_id.clone(),
+                workspace_path: "/synthetic".into(),
+                workspace_identity: None,
+                draft: QueueDraft {
+                    text: "C".into(),
+                    attachments: vec![],
+                },
+                prepared: PreparedSend::from_stored("C".into()).unwrap(),
+                edited_from: None,
+            })
+            .await
+            .unwrap();
+        let cmd = super::super::types::PriorityCommand {
+            request_id: "p".into(),
+            item_id: item.item_id,
+            expected_version: item.item_version,
+            confirm_stop: true,
+            expected_execution_id: Some("A".into()),
+            held_queue: None,
+        };
+        let result = svc
+            .prioritize_inner(
+                &actor,
+                cmd,
+                tokio::time::Instant::now() + Duration::from_millis(500),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            result.state,
+            super::super::types::QueueOperationState::Failed
+        );
+        let view = store.view(&actor, &key).unwrap();
+        assert!(!view.auto_drain);
+        assert_eq!(
+            view.items[0].state,
+            super::super::types::QueueItemState::Queued
+        );
+        assert!(fake.sent.lock().unwrap().is_empty());
+        assert!(!fake.receipts.lock().unwrap().contains_key("stopped:A"));
+    }
+    #[tokio::test]
+    async fn priority_waits_for_matching_terminal_and_leaves_queue_paused() {
+        let fake = Arc::new(Fake {
+            sent: Mutex::new(vec![]),
+            busy: Mutex::new(false),
+            lock: Arc::new(tokio::sync::Mutex::new(())),
+            receipts: Mutex::new(std::collections::BTreeMap::new()),
+            terminal_after_send: AtomicBool::new(false),
+            delivery: SendDelivery::StartNow,
+            changed_path_after_send: AtomicBool::new(false),
+            revision: std::sync::atomic::AtomicU64::new(1),
+            bound: AtomicBool::new(true),
+            refresh_calls: std::sync::atomic::AtomicUsize::new(0),
+            activate_calls: std::sync::atomic::AtomicUsize::new(0),
+            activate_failures: std::sync::atomic::AtomicUsize::new(0),
+            identity: None,
+            blocked_session: AtomicBool::new(false),
+            read_calls: std::sync::atomic::AtomicUsize::new(0),
+            read_failures: std::sync::atomic::AtomicUsize::new(0),
+            refresh_failures: std::sync::atomic::AtomicUsize::new(0),
+            send_failure: Mutex::new(None),
+        });
+        let store = SqlLocalQueueStore::new(DeviceStore::memory());
+        let svc = Arc::new(ZcodeQueueService::new(
+            store.clone(),
+            fake.clone(),
+            Arc::new(Gate),
+        ));
+        let actor = QueueActor {
+            device_id: "d".into(),
+            device_name: "phone".into(),
+        };
+        let key = TargetKey {
+            session_id: "session".into(),
+        };
+        let mut items = Vec::new();
+        for text in ["B", "C"] {
+            items.push(
+                svc.enqueue(EnqueueCommand {
+                    request_id: text.into(),
+                    actor: actor.clone(),
+                    session_id: key.session_id.clone(),
+                    workspace_path: "/synthetic".into(),
+                    workspace_identity: None,
+                    draft: QueueDraft {
+                        text: text.into(),
+                        attachments: vec![],
+                    },
+                    prepared: PreparedSend::from_stored(text.into()).unwrap(),
+                    edited_from: None,
+                })
+                .await
+                .unwrap(),
+            );
+        }
+        svc.flush_one(&key).await.unwrap();
+        fake.revision.store(2, Ordering::SeqCst);
+        let mut wrong = fake.read(&key, Duration::ZERO).await.unwrap().view;
+        wrong.execution_terminal = Some(ExecutionTerminal {
+            input_id: "other-input".into(),
+            result_type: "success".into(),
+            revision: 2,
+        });
+        svc.on_session(&wrong);
+        let cmd = |id: &str| super::super::types::PriorityCommand {
+            request_id: id.into(),
+            item_id: items[1].item_id.clone(),
+            expected_version: items[1].item_version,
+            confirm_stop: false,
+            expected_execution_id: None,
+            held_queue: None,
+        };
+        let result = svc.prioritize(&actor, cmd("wrong-terminal")).await;
+        assert!(
+            result.is_err()
+                || result.unwrap().state == super::super::types::QueueOperationState::Failed
+        );
+        assert_eq!(*fake.sent.lock().unwrap(), vec!["B"]);
+        fake.terminal_after_send.store(true, Ordering::SeqCst);
+        svc.prioritize(&actor, cmd("correct-terminal"))
+            .await
+            .unwrap();
+        assert_eq!(*fake.sent.lock().unwrap(), vec!["B", "C"]);
+        assert!(!store.view(&actor, &key).unwrap().auto_drain);
+    }
+    #[tokio::test]
+    async fn dispatched_unknown_requires_review_then_resume_without_resend() {
+        let fake = Arc::new(Fake {
+            sent: Mutex::new(vec![]),
+            busy: Mutex::new(false),
+            lock: Arc::new(tokio::sync::Mutex::new(())),
+            receipts: Mutex::new(std::collections::BTreeMap::new()),
+            terminal_after_send: AtomicBool::new(false),
+            delivery: SendDelivery::StartNow,
+            changed_path_after_send: AtomicBool::new(false),
+            revision: std::sync::atomic::AtomicU64::new(1),
+            bound: AtomicBool::new(true),
+            refresh_calls: std::sync::atomic::AtomicUsize::new(0),
+            activate_calls: std::sync::atomic::AtomicUsize::new(0),
+            activate_failures: std::sync::atomic::AtomicUsize::new(0),
+            identity: None,
+            blocked_session: AtomicBool::new(false),
+            read_calls: std::sync::atomic::AtomicUsize::new(0),
+            read_failures: std::sync::atomic::AtomicUsize::new(0),
+            refresh_failures: std::sync::atomic::AtomicUsize::new(0),
+            send_failure: Mutex::new(Some((true, codes::NOT_READY))),
+        });
+        let db = DeviceStore::memory();
+        let store = SqlLocalQueueStore::new(db.clone());
+        let svc = Arc::new(ZcodeQueueService::new(
+            store.clone(),
+            fake.clone(),
+            Arc::new(Gate),
+        ));
+        let actor = QueueActor {
+            device_id: "d".into(),
+            device_name: "phone".into(),
+        };
+        let key = TargetKey {
+            session_id: "session".into(),
+        };
+        let mut items = Vec::new();
+        for text in ["B", "C"] {
+            items.push(
+                svc.enqueue(EnqueueCommand {
+                    request_id: text.into(),
+                    actor: actor.clone(),
+                    session_id: key.session_id.clone(),
+                    workspace_path: "/synthetic".into(),
+                    workspace_identity: None,
+                    draft: QueueDraft {
+                        text: text.into(),
+                        attachments: vec![],
+                    },
+                    prepared: PreparedSend::from_stored(text.into()).unwrap(),
+                    edited_from: None,
+                })
+                .await
+                .unwrap(),
+            );
+        }
+        svc.flush_one(&key).await.unwrap();
+        let action: String = db.with(|c| {
+            c.query_row(
+                "SELECT dispatch_action_id FROM zcode_send_queue WHERE request_id='B'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        });
+        let paused = store.view(&actor, &key).unwrap();
+        svc.resume(&actor, &key, "early", paused.version)
+            .await
+            .unwrap();
+        svc.flush_one(&key).await.unwrap();
+        assert_eq!(*fake.sent.lock().unwrap(), vec!["B"]);
+        assert!(svc
+            .prioritize(
+                &actor,
+                super::super::types::PriorityCommand {
+                    request_id: "p".into(),
+                    item_id: items[1].item_id.clone(),
+                    expected_version: items[1].item_version,
+                    confirm_stop: false,
+                    expected_execution_id: None,
+                    held_queue: None
+                }
+            )
+            .await
+            .is_err());
+        let foreign = QueueActor {
+            device_id: "other".into(),
+            device_name: "other".into(),
+        };
+        assert!(svc
+            .acknowledge_dispatched_unknown(&foreign, &key, &action, "review-foreign")
+            .await
+            .is_err());
+        assert_eq!(
+            store
+                .unreviewed_dispatch_unknown(&actor, &key)
+                .unwrap()
+                .as_deref(),
+            Some(action.as_str())
+        );
+        db.with(|c| c.execute_batch("CREATE TRIGGER fail_unknown_review BEFORE INSERT ON write_audit WHEN NEW.action='zcode_queue_unknown_review' BEGIN SELECT RAISE(ABORT,'synthetic'); END;").unwrap());
+        assert!(svc
+            .acknowledge_dispatched_unknown(&actor, &key, &action, "review")
+            .await
+            .is_err());
+        assert_eq!(
+            store
+                .unreviewed_dispatch_unknown(&actor, &key)
+                .unwrap()
+                .as_deref(),
+            Some(action.as_str())
+        );
+        db.with(|c| c.execute_batch("DROP TRIGGER fail_unknown_review").unwrap());
+        svc.acknowledge_dispatched_unknown(&actor, &key, &action, "review")
+            .await
+            .unwrap();
+        let paused = store.view(&actor, &key).unwrap();
+        assert!(!paused.auto_drain);
+        svc.flush_one(&key).await.unwrap();
+        assert_eq!(*fake.sent.lock().unwrap(), vec!["B"]);
+        svc.resume(&actor, &key, "resume", paused.version)
+            .await
+            .unwrap();
+        svc.acknowledge_dispatched_unknown(&actor, &key, &action, "review")
+            .await
+            .unwrap();
+        assert!(store.view(&actor, &key).unwrap().auto_drain);
+        svc.flush_one(&key).await.unwrap();
+        assert_eq!(*fake.sent.lock().unwrap(), vec!["B", "C"]);
+        let state: String = db.with(|c| {
+            c.query_row(
+                "SELECT state FROM zcode_send_queue WHERE request_id='B'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        });
+        assert_eq!(state, "unknown");
+    }
+    #[tokio::test]
+    async fn priority_unknown_review_unblocks_next_after_resume() {
+        let fake = Arc::new(Fake {
+            sent: Mutex::new(vec![]),
+            busy: Mutex::new(false),
+            lock: Arc::new(tokio::sync::Mutex::new(())),
+            receipts: Mutex::new(std::collections::BTreeMap::new()),
+            terminal_after_send: AtomicBool::new(false),
+            delivery: SendDelivery::StartNow,
+            changed_path_after_send: AtomicBool::new(false),
+            revision: std::sync::atomic::AtomicU64::new(1),
+            bound: AtomicBool::new(true),
+            refresh_calls: std::sync::atomic::AtomicUsize::new(0),
+            activate_calls: std::sync::atomic::AtomicUsize::new(0),
+            activate_failures: std::sync::atomic::AtomicUsize::new(0),
+            identity: None,
+            blocked_session: AtomicBool::new(false),
+            read_calls: std::sync::atomic::AtomicUsize::new(0),
+            read_failures: std::sync::atomic::AtomicUsize::new(0),
+            refresh_failures: std::sync::atomic::AtomicUsize::new(0),
+            send_failure: Mutex::new(Some((true, codes::NOT_READY))),
+        });
+        let db = DeviceStore::memory();
+        let store = SqlLocalQueueStore::new(db.clone());
+        let svc = Arc::new(ZcodeQueueService::new(
+            store.clone(),
+            fake.clone(),
+            Arc::new(Gate),
+        ));
+        let actor = QueueActor {
+            device_id: "d".into(),
+            device_name: "phone".into(),
+        };
+        let key = TargetKey {
+            session_id: "session".into(),
+        };
+        let mut items = Vec::new();
+        for text in ["B", "C"] {
+            items.push(
+                svc.enqueue(EnqueueCommand {
+                    request_id: text.into(),
+                    actor: actor.clone(),
+                    session_id: key.session_id.clone(),
+                    workspace_path: "/synthetic".into(),
+                    workspace_identity: None,
+                    draft: QueueDraft {
+                        text: text.into(),
+                        attachments: vec![],
+                    },
+                    prepared: PreparedSend::from_stored(text.into()).unwrap(),
+                    edited_from: None,
+                })
+                .await
+                .unwrap(),
+            );
+        }
+        let result = svc
+            .prioritize(
+                &actor,
+                super::super::types::PriorityCommand {
+                    request_id: "priority".into(),
+                    item_id: items[0].item_id.clone(),
+                    expected_version: items[0].item_version,
+                    confirm_stop: false,
+                    expected_execution_id: None,
+                    held_queue: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            result.state,
+            super::super::types::QueueOperationState::Unknown
+        );
+        let action: String = db.with(|c| {
+            c.query_row(
+                "SELECT dispatch_action_id FROM zcode_send_queue WHERE request_id='B'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        });
+        svc.acknowledge_dispatched_unknown(&actor, &key, &action, "review")
+            .await
+            .unwrap();
+        let paused = store.view(&actor, &key).unwrap();
+        assert!(!paused.auto_drain);
+        svc.resume(&actor, &key, "resume", paused.version)
+            .await
+            .unwrap();
+        svc.flush_one(&key).await.unwrap();
+        assert_eq!(*fake.sent.lock().unwrap(), vec!["B", "C"]);
+        assert_eq!(
+            store.operation(&actor, "priority").unwrap().unwrap().state,
+            super::super::types::QueueOperationState::Unknown
+        );
+    }
+    #[tokio::test]
+    async fn priority_and_auto_flush_have_one_winner() {
+        let fake = Arc::new(Fake {
+            sent: Mutex::new(vec![]),
+            busy: Mutex::new(false),
+            lock: Arc::new(tokio::sync::Mutex::new(())),
+            receipts: Mutex::new(std::collections::BTreeMap::new()),
+            terminal_after_send: AtomicBool::new(false),
+            delivery: SendDelivery::StartNow,
+            changed_path_after_send: AtomicBool::new(false),
+            revision: std::sync::atomic::AtomicU64::new(1),
+            bound: AtomicBool::new(true),
+            refresh_calls: std::sync::atomic::AtomicUsize::new(0),
+            activate_calls: std::sync::atomic::AtomicUsize::new(0),
+            activate_failures: std::sync::atomic::AtomicUsize::new(0),
+            identity: None,
+            blocked_session: AtomicBool::new(false),
+            read_calls: std::sync::atomic::AtomicUsize::new(0),
+            read_failures: std::sync::atomic::AtomicUsize::new(0),
+            refresh_failures: std::sync::atomic::AtomicUsize::new(0),
+            send_failure: Mutex::new(None),
+        });
+        let store = SqlLocalQueueStore::new(DeviceStore::memory());
+        let svc = Arc::new(ZcodeQueueService::new(
+            store.clone(),
+            fake.clone(),
+            Arc::new(Gate),
+        ));
+        let actor = QueueActor {
+            device_id: "d".into(),
+            device_name: "phone".into(),
+        };
+        let key = TargetKey {
+            session_id: "session".into(),
+        };
+        let mut items = Vec::new();
+        for text in ["B", "C"] {
+            items.push(
+                svc.enqueue(EnqueueCommand {
+                    request_id: text.into(),
+                    actor: actor.clone(),
+                    session_id: key.session_id.clone(),
+                    workspace_path: "/synthetic".into(),
+                    workspace_identity: None,
+                    draft: QueueDraft {
+                        text: text.into(),
+                        attachments: vec![],
+                    },
+                    prepared: PreparedSend::from_stored(text.into()).unwrap(),
+                    edited_from: None,
+                })
+                .await
+                .unwrap(),
+            );
+        }
+        let lock = fake.lock.clone();
+        let guard = lock.lock().await;
+        let flush_svc = svc.clone();
+        let flush_key = key.clone();
+        let flush = tokio::spawn(async move { flush_svc.flush_one(&flush_key).await });
+        let priority_svc = svc.clone();
+        let priority_actor = actor.clone();
+        let c_id = items[1].item_id.clone();
+        let c_version = items[1].item_version;
+        let priority = tokio::spawn(async move {
+            priority_svc
+                .prioritize(
+                    &priority_actor,
+                    super::super::types::PriorityCommand {
+                        request_id: "priority".into(),
+                        item_id: c_id,
+                        expected_version: c_version,
+                        confirm_stop: false,
+                        expected_execution_id: None,
+                        held_queue: None,
+                    },
+                )
+                .await
+        });
+        tokio::task::yield_now().await;
+        drop(guard);
+        let _ = flush.await.unwrap();
+        let _ = priority.await.unwrap();
+        assert_eq!(fake.sent.lock().unwrap().len(), 1);
+        assert!(!store.view(&actor, &key).unwrap().auto_drain);
+        assert!(!fake.receipts.lock().unwrap().contains_key("stopped:A"));
+    }
+    #[tokio::test]
+    async fn fifo_accepted_without_terminal_blocks_priority() {
+        let fake = Arc::new(Fake {
+            sent: Mutex::new(vec![]),
+            busy: Mutex::new(false),
+            lock: Arc::new(tokio::sync::Mutex::new(())),
+            receipts: Mutex::new(std::collections::BTreeMap::new()),
+            terminal_after_send: AtomicBool::new(false),
+            delivery: SendDelivery::StartNow,
+            changed_path_after_send: AtomicBool::new(false),
+            revision: std::sync::atomic::AtomicU64::new(1),
+            bound: AtomicBool::new(true),
+            refresh_calls: std::sync::atomic::AtomicUsize::new(0),
+            activate_calls: std::sync::atomic::AtomicUsize::new(0),
+            activate_failures: std::sync::atomic::AtomicUsize::new(0),
+            identity: None,
+            blocked_session: AtomicBool::new(false),
+            read_calls: std::sync::atomic::AtomicUsize::new(0),
+            read_failures: std::sync::atomic::AtomicUsize::new(0),
+            refresh_failures: std::sync::atomic::AtomicUsize::new(0),
+            send_failure: Mutex::new(None),
+        });
+        let store = SqlLocalQueueStore::new(DeviceStore::memory());
+        let svc = Arc::new(ZcodeQueueService::new(
+            store.clone(),
+            fake.clone(),
+            Arc::new(Gate),
+        ));
+        let actor = QueueActor {
+            device_id: "d".into(),
+            device_name: "phone".into(),
+        };
+        let key = TargetKey {
+            session_id: "session".into(),
+        };
+        let mut items = Vec::new();
+        for text in ["B", "C"] {
+            items.push(
+                svc.enqueue(EnqueueCommand {
+                    request_id: text.into(),
+                    actor: actor.clone(),
+                    session_id: key.session_id.clone(),
+                    workspace_path: "/synthetic".into(),
+                    workspace_identity: None,
+                    draft: QueueDraft {
+                        text: text.into(),
+                        attachments: vec![],
+                    },
+                    prepared: PreparedSend::from_stored(text.into()).unwrap(),
+                    edited_from: None,
+                })
+                .await
+                .unwrap(),
+            );
+        }
+        svc.flush_one(&key).await.unwrap();
+        assert_eq!(*fake.sent.lock().unwrap(), vec!["B"]);
+        let result = svc
+            .prioritize(
+                &actor,
+                super::super::types::PriorityCommand {
+                    request_id: "p".into(),
+                    item_id: items[1].item_id.clone(),
+                    expected_version: items[1].item_version,
+                    confirm_stop: false,
+                    expected_execution_id: None,
+                    held_queue: None,
+                },
+            )
+            .await;
+        assert!(
+            result.is_err()
+                || result.unwrap().state == super::super::types::QueueOperationState::Failed
+        );
+        assert_eq!(*fake.sent.lock().unwrap(), vec!["B"]);
+        let view = store.view(&actor, &key).unwrap();
+        assert!(!view.auto_drain);
+        assert_eq!(view.items[0].item_id, items[1].item_id);
+    }
+    #[tokio::test]
+    async fn new_execution_after_stop_is_not_stopped_again() {
+        let fake = Arc::new(Fake {
+            sent: Mutex::new(vec![]),
+            busy: Mutex::new(true),
+            lock: Arc::new(tokio::sync::Mutex::new(())),
+            receipts: Mutex::new(std::collections::BTreeMap::new()),
+            terminal_after_send: AtomicBool::new(false),
+            delivery: SendDelivery::Queue,
+            changed_path_after_send: AtomicBool::new(false),
+            revision: std::sync::atomic::AtomicU64::new(1),
+            bound: AtomicBool::new(true),
+            refresh_calls: std::sync::atomic::AtomicUsize::new(0),
+            activate_calls: std::sync::atomic::AtomicUsize::new(0),
+            activate_failures: std::sync::atomic::AtomicUsize::new(0),
+            identity: None,
+            blocked_session: AtomicBool::new(false),
+            read_calls: std::sync::atomic::AtomicUsize::new(0),
+            read_failures: std::sync::atomic::AtomicUsize::new(0),
+            refresh_failures: std::sync::atomic::AtomicUsize::new(0),
+            send_failure: Mutex::new(None),
+        });
+        let host = Arc::new(NewExecutionStop {
+            inner: fake.clone(),
+            switched: AtomicBool::new(false),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let store = SqlLocalQueueStore::new(DeviceStore::memory());
+        let svc = Arc::new(ZcodeQueueService::new(
+            store.clone(),
+            host.clone(),
+            Arc::new(Gate),
+        ));
+        let actor = QueueActor {
+            device_id: "d".into(),
+            device_name: "phone".into(),
+        };
+        let key = TargetKey {
+            session_id: "session".into(),
+        };
+        let item = svc
+            .enqueue(EnqueueCommand {
+                request_id: "C".into(),
+                actor: actor.clone(),
+                session_id: key.session_id.clone(),
+                workspace_path: "/synthetic".into(),
+                workspace_identity: None,
+                draft: QueueDraft {
+                    text: "C".into(),
+                    attachments: vec![],
+                },
+                prepared: PreparedSend::from_stored("C".into()).unwrap(),
+                edited_from: None,
+            })
+            .await
+            .unwrap();
+        let result = svc
+            .prioritize(
+                &actor,
+                super::super::types::PriorityCommand {
+                    request_id: "p".into(),
+                    item_id: item.item_id,
+                    expected_version: item.item_version,
+                    confirm_stop: true,
+                    expected_execution_id: Some("A".into()),
+                    held_queue: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            result.state,
+            super::super::types::QueueOperationState::Unknown
+        );
+        assert_eq!(host.calls.load(Ordering::SeqCst), 1);
+        assert!(fake.sent.lock().unwrap().is_empty());
+        assert!(!store.view(&actor, &key).unwrap().auto_drain);
+    }
+    struct PriorityTraceHost {
+        inner: Arc<Fake>,
+        db: DeviceStore,
+        events: Mutex<Vec<String>>,
+    }
+    impl QueueHostPort for PriorityTraceHost {
+        fn session_lock(&self, key: &TargetKey) -> Arc<tokio::sync::Mutex<()>> {
+            self.inner.session_lock(key)
+        }
+        fn read<'a>(
+            &'a self,
+            key: &'a TargetKey,
+            timeout: Duration,
+        ) -> BoxFuture<'a, ZResult<BoundQueueSession>> {
+            self.inner.read(key, timeout)
+        }
+        fn refresh_target<'a>(
+            &'a self,
+            key: &'a TargetKey,
+            timeout: Duration,
+        ) -> BoxFuture<'a, ZResult<BoundTarget>> {
+            self.inner.refresh_target(key, timeout)
+        }
+        fn send_prepared<'a>(
+            &'a self,
+            ctx: &'a ActionContext,
+            target: &'a BoundTarget,
+            body: &'a PreparedSend,
+            held: Option<&'a HeldQueueChoice>,
+        ) -> BoxFuture<'a, super::super::super::command::PreparedResult<ActionReceipt>> {
+            Box::pin(async move {
+                self.events
+                    .lock()
+                    .unwrap()
+                    .push(format!("send:{}", body.wire_text()));
+                self.inner.send_prepared(ctx, target, body, held).await
+            })
+        }
+        fn stop<'a>(
+            &'a self,
+            ctx: &'a ActionContext,
+            target: &'a BoundTarget,
+            execution: &'a str,
+        ) -> BoxFuture<'a, super::super::super::command::PreparedResult<ActionReceipt>> {
+            Box::pin(async move {
+                self.db.with(|c| { let paused: i64=c.query_row("SELECT auto_drain FROM zcode_queue_state WHERE session_id=?1",[&target.session_id],|r|r.get(0)).unwrap(); assert_eq!(paused,0); let (claimed,action):(i64,String)=c.query_row("SELECT stop_claimed,stop_action_id FROM zcode_queue_operations WHERE request_id='priority'",[],|r|Ok((r.get(0)?,r.get(1)?))).unwrap(); assert_eq!(claimed,1); assert_eq!(action,ctx.action_id); let mut stmt=c.prepare("SELECT action FROM write_audit WHERE session_id=?1 AND action IN ('zcode_queue_priority','zcode_queue_stop') ORDER BY id").unwrap(); let actions=stmt.query_map([&target.session_id],|r|r.get::<_,String>(0)).unwrap().collect::<Result<Vec<_>,_>>().unwrap(); assert_eq!(actions,vec!["zcode_queue_priority","zcode_queue_stop"]); });
+                {
+                    let mut events = self.events.lock().unwrap();
+                    events.push("pause_persisted".into());
+                    events.push("stop_claimed".into());
+                    events.push(format!("stop:{execution}"));
+                }
+                let receipt = self.inner.stop(ctx, target, execution).await?;
+                assert_eq!(receipt.state, ActionState::Confirmed);
+                self.events
+                    .lock()
+                    .unwrap()
+                    .push(format!("terminal:{execution}"));
+                Ok(receipt)
+            })
+        }
+        fn receipt<'a>(
+            &'a self,
+            action: &'a str,
+            device: &'a str,
+        ) -> BoxFuture<'a, ZResult<Option<ActionReceipt>>> {
+            self.inner.receipt(action, device)
+        }
+    }
+    #[tokio::test]
+    async fn priority_persists_pause_and_claim_before_one_stop_and_one_send() {
+        let fake = Arc::new(Fake {
+            sent: Mutex::new(vec![]),
+            busy: Mutex::new(true),
+            lock: Arc::new(tokio::sync::Mutex::new(())),
+            receipts: Mutex::new(std::collections::BTreeMap::new()),
+            terminal_after_send: AtomicBool::new(false),
+            delivery: SendDelivery::Queue,
+            changed_path_after_send: AtomicBool::new(false),
+            revision: std::sync::atomic::AtomicU64::new(1),
+            bound: AtomicBool::new(true),
+            refresh_calls: std::sync::atomic::AtomicUsize::new(0),
+            activate_calls: std::sync::atomic::AtomicUsize::new(0),
+            activate_failures: std::sync::atomic::AtomicUsize::new(0),
+            identity: None,
+            blocked_session: AtomicBool::new(false),
+            read_calls: std::sync::atomic::AtomicUsize::new(0),
+            read_failures: std::sync::atomic::AtomicUsize::new(0),
+            refresh_failures: std::sync::atomic::AtomicUsize::new(0),
+            send_failure: Mutex::new(None),
+        });
+        let db = DeviceStore::memory();
+        let store = SqlLocalQueueStore::new(db.clone());
+        let host = Arc::new(PriorityTraceHost {
+            inner: fake.clone(),
+            db,
+            events: Mutex::new(vec![]),
+        });
+        let svc = Arc::new(ZcodeQueueService::new(
+            store.clone(),
+            host.clone(),
+            Arc::new(Gate),
+        ));
+        let actor = QueueActor {
+            device_id: "d".into(),
+            device_name: "phone".into(),
+        };
+        let key = TargetKey {
+            session_id: "session".into(),
+        };
+        let mut items = Vec::new();
+        for text in ["B", "C"] {
+            items.push(
+                svc.enqueue(EnqueueCommand {
+                    request_id: text.into(),
+                    actor: actor.clone(),
+                    session_id: key.session_id.clone(),
+                    workspace_path: "/synthetic".into(),
+                    workspace_identity: None,
+                    draft: QueueDraft {
+                        text: text.into(),
+                        attachments: vec![],
+                    },
+                    prepared: PreparedSend::from_stored(text.into()).unwrap(),
+                    edited_from: None,
+                })
+                .await
+                .unwrap(),
+            );
+        }
+        svc.prioritize(
+            &actor,
+            super::super::types::PriorityCommand {
+                request_id: "priority".into(),
+                item_id: items[1].item_id.clone(),
+                expected_version: items[1].item_version,
+                confirm_stop: true,
+                expected_execution_id: Some("A".into()),
+                held_queue: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            *host.events.lock().unwrap(),
+            vec![
+                "pause_persisted",
+                "stop_claimed",
+                "stop:A",
+                "terminal:A",
+                "send:C"
+            ]
+        );
+        assert_eq!(
+            host.events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|s| s.starts_with("stop:"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            host.events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|s| s.starts_with("send:"))
+                .count(),
+            1
+        );
+        let view = store.view(&actor, &key).unwrap();
+        assert!(!view.auto_drain);
+        assert_eq!(view.items[0].item_id, items[0].item_id);
+    }
+    #[tokio::test]
+    async fn cancelled_manual_stop_finishes_without_repeating_frame() {
+        let fake = Arc::new(Fake {
+            sent: Mutex::new(vec![]),
+            busy: Mutex::new(true),
+            lock: Arc::new(tokio::sync::Mutex::new(())),
+            receipts: Mutex::new(std::collections::BTreeMap::new()),
+            terminal_after_send: AtomicBool::new(false),
+            delivery: SendDelivery::Queue,
+            changed_path_after_send: AtomicBool::new(false),
+            revision: std::sync::atomic::AtomicU64::new(1),
+            bound: AtomicBool::new(true),
+            refresh_calls: std::sync::atomic::AtomicUsize::new(0),
+            activate_calls: std::sync::atomic::AtomicUsize::new(0),
+            activate_failures: std::sync::atomic::AtomicUsize::new(0),
+            identity: None,
+            blocked_session: AtomicBool::new(false),
+            read_calls: std::sync::atomic::AtomicUsize::new(0),
+            read_failures: std::sync::atomic::AtomicUsize::new(0),
+            refresh_failures: std::sync::atomic::AtomicUsize::new(0),
+            send_failure: Mutex::new(None),
+        });
+        let host = Arc::new(BlockingPriorityStop {
+            inner: fake.clone(),
+            entered: Notify::new(),
+            release: Notify::new(),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let store = SqlLocalQueueStore::new(DeviceStore::memory());
+        let svc = Arc::new(ZcodeQueueService::new(
+            store.clone(),
+            host.clone(),
+            Arc::new(Gate),
+        ));
+        let actor = QueueActor {
+            device_id: "d".into(),
+            device_name: "phone".into(),
+        };
+        let key = TargetKey {
+            session_id: "session".into(),
+        };
+        let task_svc = svc.clone();
+        let task_actor = actor.clone();
+        let task_key = key.clone();
+        let task = tokio::spawn(async move {
+            task_svc
+                .stop_current(&task_actor, &task_key, "stop", "A")
+                .await
+        });
+        host.entered.notified().await;
+        task.abort();
+        host.release.notify_one();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if store
+                    .operation(&actor, "stop")
+                    .unwrap()
+                    .is_some_and(|o| o.state == super::super::types::QueueOperationState::Completed)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let replay = svc.stop_current(&actor, &key, "stop", "A").await.unwrap();
+        assert_eq!(
+            replay.state,
+            super::super::types::QueueOperationState::Completed
+        );
+        assert_eq!(host.calls.load(Ordering::SeqCst), 1);
+        assert!(fake.sent.lock().unwrap().is_empty());
+        assert!(!store.view(&actor, &key).unwrap().auto_drain);
+    }
+    #[tokio::test]
+    async fn priority_claim_reopen_never_repeats_stop_or_sends() {
+        let fake = Arc::new(Fake {
+            sent: Mutex::new(vec![]),
+            busy: Mutex::new(true),
+            lock: Arc::new(tokio::sync::Mutex::new(())),
+            receipts: Mutex::new(std::collections::BTreeMap::new()),
+            terminal_after_send: AtomicBool::new(false),
+            delivery: SendDelivery::Queue,
+            changed_path_after_send: AtomicBool::new(false),
+            revision: std::sync::atomic::AtomicU64::new(1),
+            bound: AtomicBool::new(true),
+            refresh_calls: std::sync::atomic::AtomicUsize::new(0),
+            activate_calls: std::sync::atomic::AtomicUsize::new(0),
+            activate_failures: std::sync::atomic::AtomicUsize::new(0),
+            identity: None,
+            blocked_session: AtomicBool::new(false),
+            read_calls: std::sync::atomic::AtomicUsize::new(0),
+            read_failures: std::sync::atomic::AtomicUsize::new(0),
+            refresh_failures: std::sync::atomic::AtomicUsize::new(0),
+            send_failure: Mutex::new(None),
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("queue.sqlite");
+        let open = || {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            crate::database::schema::init(&conn);
+            crate::database::migration::migrate(&conn).unwrap();
+            SqlLocalQueueStore::new(DeviceStore::Owned(Arc::new(std::sync::Mutex::new(conn))))
+        };
+        let actor = QueueActor {
+            device_id: "d".into(),
+            device_name: "phone".into(),
+        };
+        let key = TargetKey {
+            session_id: "session".into(),
+        };
+        let item;
+        let action;
+        {
+            let store = open();
+            item = store
+                .enqueue(
+                    &EnqueueCommand {
+                        request_id: "C".into(),
+                        actor: actor.clone(),
+                        session_id: key.session_id.clone(),
+                        workspace_path: "/synthetic".into(),
+                        workspace_identity: None,
+                        draft: QueueDraft {
+                            text: "C".into(),
+                            attachments: vec![],
+                        },
+                        prepared: PreparedSend::from_stored("C".into()).unwrap(),
+                        edited_from: None,
+                    },
+                    1,
+                )
+                .unwrap();
+            let owner = store
+                .begin_priority(
+                    &actor,
+                    &super::super::types::PriorityCommand {
+                        request_id: "p".into(),
+                        item_id: item.item_id.clone(),
+                        expected_version: item.item_version,
+                        confirm_stop: true,
+                        expected_execution_id: Some("A".into()),
+                        held_queue: None,
+                    },
+                    2,
+                )
+                .unwrap();
+            action = owner.stop_action_id;
+            assert!(store.mark_stop_claimed(&actor, "p", 1, "A").unwrap());
+        }
+        let store = open();
+        store.recover(3).unwrap();
+        let recovery = store.pending_priority_recovery().unwrap();
+        assert_eq!(recovery.len(), 1);
+        assert_eq!(recovery[0].stop_action_id, action);
+        let svc = Arc::new(ZcodeQueueService::new(
+            store.clone(),
+            fake.clone(),
+            Arc::new(Gate),
+        ));
+        let cmd = super::super::types::PriorityCommand {
+            request_id: "p".into(),
+            item_id: item.item_id,
+            expected_version: item.item_version,
+            confirm_stop: true,
+            expected_execution_id: Some("A".into()),
+            held_queue: None,
+        };
+        assert_eq!(
+            svc.prioritize(&actor, cmd.clone()).await.unwrap().state,
+            super::super::types::QueueOperationState::Unknown
+        );
+        let mut changed = cmd;
+        changed.request_id = "new".into();
+        assert!(svc.prioritize(&actor, changed).await.is_err());
+        assert!(fake.sent.lock().unwrap().is_empty());
+        assert!(!fake.receipts.lock().unwrap().contains_key("stopped:A"));
+        assert!(!store.view(&actor, &key).unwrap().auto_drain);
+    }
+    struct RecoveryReceiptHost {
+        inner: Arc<Fake>,
+        reads: Mutex<Vec<(String, String)>>,
+    }
+    impl QueueHostPort for RecoveryReceiptHost {
+        fn session_lock(&self, key: &TargetKey) -> Arc<tokio::sync::Mutex<()>> {
+            self.inner.session_lock(key)
+        }
+        fn read<'a>(
+            &'a self,
+            key: &'a TargetKey,
+            timeout: Duration,
+        ) -> BoxFuture<'a, ZResult<BoundQueueSession>> {
+            self.inner.read(key, timeout)
+        }
+        fn refresh_target<'a>(
+            &'a self,
+            key: &'a TargetKey,
+            timeout: Duration,
+        ) -> BoxFuture<'a, ZResult<BoundTarget>> {
+            self.inner.refresh_target(key, timeout)
+        }
+        fn send_prepared<'a>(
+            &'a self,
+            ctx: &'a ActionContext,
+            target: &'a BoundTarget,
+            body: &'a PreparedSend,
+            held: Option<&'a HeldQueueChoice>,
+        ) -> BoxFuture<'a, super::super::super::command::PreparedResult<ActionReceipt>> {
+            self.inner.send_prepared(ctx, target, body, held)
+        }
+        fn stop<'a>(
+            &'a self,
+            ctx: &'a ActionContext,
+            target: &'a BoundTarget,
+            execution: &'a str,
+        ) -> BoxFuture<'a, super::super::super::command::PreparedResult<ActionReceipt>> {
+            self.inner.stop(ctx, target, execution)
+        }
+        fn receipt<'a>(
+            &'a self,
+            action: &'a str,
+            device: &'a str,
+        ) -> BoxFuture<'a, ZResult<Option<ActionReceipt>>> {
+            Box::pin(async move {
+                self.reads
+                    .lock()
+                    .unwrap()
+                    .push((action.into(), device.into()));
+                self.inner.receipt(action, device).await
+            })
+        }
+    }
+    #[tokio::test]
+    async fn priority_recovery_reads_original_stop_receipt_without_writes() {
+        let fake = Arc::new(Fake {
+            sent: Mutex::new(vec![]),
+            busy: Mutex::new(true),
+            lock: Arc::new(tokio::sync::Mutex::new(())),
+            receipts: Mutex::new(std::collections::BTreeMap::new()),
+            terminal_after_send: AtomicBool::new(false),
+            delivery: SendDelivery::Queue,
+            changed_path_after_send: AtomicBool::new(false),
+            revision: std::sync::atomic::AtomicU64::new(1),
+            bound: AtomicBool::new(true),
+            refresh_calls: std::sync::atomic::AtomicUsize::new(0),
+            activate_calls: std::sync::atomic::AtomicUsize::new(0),
+            activate_failures: std::sync::atomic::AtomicUsize::new(0),
+            identity: None,
+            blocked_session: AtomicBool::new(false),
+            read_calls: std::sync::atomic::AtomicUsize::new(0),
+            read_failures: std::sync::atomic::AtomicUsize::new(0),
+            refresh_failures: std::sync::atomic::AtomicUsize::new(0),
+            send_failure: Mutex::new(None),
+        });
+        let store = SqlLocalQueueStore::new(DeviceStore::memory());
+        let actor = QueueActor {
+            device_id: "d".into(),
+            device_name: "phone".into(),
+        };
+        let key = TargetKey {
+            session_id: "session".into(),
+        };
+        let item = store
+            .enqueue(
+                &EnqueueCommand {
+                    request_id: "C".into(),
+                    actor: actor.clone(),
+                    session_id: key.session_id.clone(),
+                    workspace_path: "/synthetic".into(),
+                    workspace_identity: None,
+                    draft: QueueDraft {
+                        text: "C".into(),
+                        attachments: vec![],
+                    },
+                    prepared: PreparedSend::from_stored("C".into()).unwrap(),
+                    edited_from: None,
+                },
+                1,
+            )
+            .unwrap();
+        let owner = store
+            .begin_priority(
+                &actor,
+                &super::super::types::PriorityCommand {
+                    request_id: "p".into(),
+                    item_id: item.item_id,
+                    expected_version: item.item_version,
+                    confirm_stop: true,
+                    expected_execution_id: Some("A".into()),
+                    held_queue: None,
+                },
+                2,
+            )
+            .unwrap();
+        store.mark_stop_claimed(&actor, "p", 1, "A").unwrap();
+        let host = Arc::new(RecoveryReceiptHost {
+            inner: fake.clone(),
+            reads: Mutex::new(vec![]),
+        });
+        let svc = ZcodeQueueService::new(store.clone(), host.clone(), Arc::new(Gate));
+        svc.recover().await.unwrap();
+        assert_eq!(
+            *host.reads.lock().unwrap(),
+            vec![(owner.stop_action_id, "d".into())]
+        );
+        assert_eq!(
+            store.operation(&actor, "p").unwrap().unwrap().state,
+            super::super::types::QueueOperationState::Unknown
+        );
+        assert!(fake.sent.lock().unwrap().is_empty());
+        assert!(!fake.receipts.lock().unwrap().contains_key("stopped:A"));
+    }
+    #[tokio::test]
+    async fn idle_prioritize_does_not_require_preexisting_pause() {
+        let fake = Arc::new(Fake {
+            sent: Mutex::new(vec![]),
+            busy: Mutex::new(false),
+            lock: Arc::new(tokio::sync::Mutex::new(())),
+            receipts: Mutex::new(std::collections::BTreeMap::new()),
+            terminal_after_send: AtomicBool::new(false),
+            delivery: SendDelivery::Queue,
+            changed_path_after_send: AtomicBool::new(false),
+            revision: std::sync::atomic::AtomicU64::new(1),
+            bound: AtomicBool::new(true),
+            refresh_calls: std::sync::atomic::AtomicUsize::new(0),
+            activate_calls: std::sync::atomic::AtomicUsize::new(0),
+            activate_failures: std::sync::atomic::AtomicUsize::new(0),
+            identity: None,
+            blocked_session: AtomicBool::new(false),
+            read_calls: std::sync::atomic::AtomicUsize::new(0),
+            read_failures: std::sync::atomic::AtomicUsize::new(0),
+            refresh_failures: std::sync::atomic::AtomicUsize::new(0),
+            send_failure: Mutex::new(None),
+        });
+        let store = SqlLocalQueueStore::new(DeviceStore::memory());
+        let svc = Arc::new(ZcodeQueueService::new(
+            store.clone(),
+            fake.clone(),
+            Arc::new(Gate),
+        ));
+        let actor = QueueActor {
+            device_id: "d".into(),
+            device_name: "phone".into(),
+        };
+        let key = TargetKey {
+            session_id: "session".into(),
+        };
+        let item = svc
+            .enqueue(EnqueueCommand {
+                request_id: "C".into(),
+                actor: actor.clone(),
+                session_id: key.session_id.clone(),
+                workspace_path: "/synthetic".into(),
+                workspace_identity: None,
+                draft: QueueDraft {
+                    text: "C".into(),
+                    attachments: vec![],
+                },
+                prepared: PreparedSend::from_stored("C".into()).unwrap(),
+                edited_from: None,
+            })
+            .await
+            .unwrap();
+        assert!(store.view(&actor, &key).unwrap().auto_drain);
+        let cmd = super::super::types::PriorityCommand {
+            request_id: "p".into(),
+            item_id: item.item_id,
+            expected_version: item.item_version,
+            confirm_stop: false,
+            expected_execution_id: None,
+            held_queue: None,
+        };
+        svc.prioritize(&actor, cmd.clone()).await.unwrap();
+        svc.prioritize(&actor, cmd).await.unwrap();
+        assert_eq!(*fake.sent.lock().unwrap(), vec!["C"]);
+        assert!(!fake.receipts.lock().unwrap().contains_key("stopped:A"));
+        assert!(!store.view(&actor, &key).unwrap().auto_drain);
+    }
+    #[tokio::test]
+    async fn unconfirmed_or_stale_execution_never_sends_stop_or_message() {
+        let fake = Arc::new(Fake {
+            sent: Mutex::new(vec![]),
+            busy: Mutex::new(true),
+            lock: Arc::new(tokio::sync::Mutex::new(())),
+            receipts: Mutex::new(std::collections::BTreeMap::new()),
+            terminal_after_send: AtomicBool::new(false),
+            delivery: SendDelivery::Queue,
+            changed_path_after_send: AtomicBool::new(false),
+            revision: std::sync::atomic::AtomicU64::new(1),
+            bound: AtomicBool::new(true),
+            refresh_calls: std::sync::atomic::AtomicUsize::new(0),
+            activate_calls: std::sync::atomic::AtomicUsize::new(0),
+            activate_failures: std::sync::atomic::AtomicUsize::new(0),
+            identity: None,
+            blocked_session: AtomicBool::new(false),
+            read_calls: std::sync::atomic::AtomicUsize::new(0),
+            read_failures: std::sync::atomic::AtomicUsize::new(0),
+            refresh_failures: std::sync::atomic::AtomicUsize::new(0),
+            send_failure: Mutex::new(None),
+        });
+        let store = SqlLocalQueueStore::new(DeviceStore::memory());
+        let svc = Arc::new(ZcodeQueueService::new(
+            store.clone(),
+            fake.clone(),
+            Arc::new(Gate),
+        ));
+        let actor = QueueActor {
+            device_id: "d".into(),
+            device_name: "phone".into(),
+        };
+        let key = TargetKey {
+            session_id: "session".into(),
+        };
+        let item = svc
+            .enqueue(EnqueueCommand {
+                request_id: "C".into(),
+                actor: actor.clone(),
+                session_id: key.session_id.clone(),
+                workspace_path: "/synthetic".into(),
+                workspace_identity: None,
+                draft: QueueDraft {
+                    text: "C".into(),
+                    attachments: vec![],
+                },
+                prepared: PreparedSend::from_stored("C".into()).unwrap(),
+                edited_from: None,
+            })
+            .await
+            .unwrap();
+        for (request, confirm, expected) in [("unconfirmed", false, "A"), ("stale", true, "old-A")]
+        {
+            let result = svc
+                .prioritize(
+                    &actor,
+                    super::super::types::PriorityCommand {
+                        request_id: request.into(),
+                        item_id: item.item_id.clone(),
+                        expected_version: item.item_version,
+                        confirm_stop: confirm,
+                        expected_execution_id: Some(expected.into()),
+                        held_queue: None,
+                    },
+                )
+                .await;
+            assert!(result.is_err());
+        }
+        assert!(fake.sent.lock().unwrap().is_empty());
+        assert!(!fake.receipts.lock().unwrap().contains_key("stopped:A"));
+        let view = store.view(&actor, &key).unwrap();
+        assert!(!view.auto_drain);
+        assert_eq!(view.items[0].item_id, item.item_id);
+    }
+    #[tokio::test]
+    async fn priority_stop_claim_failure_releases_unwritten_item() {
+        let fake = Arc::new(Fake {
+            sent: Mutex::new(vec![]),
+            busy: Mutex::new(true),
+            lock: Arc::new(tokio::sync::Mutex::new(())),
+            receipts: Mutex::new(std::collections::BTreeMap::new()),
+            terminal_after_send: AtomicBool::new(false),
+            delivery: SendDelivery::Queue,
+            changed_path_after_send: AtomicBool::new(false),
+            revision: std::sync::atomic::AtomicU64::new(1),
+            bound: AtomicBool::new(true),
+            refresh_calls: std::sync::atomic::AtomicUsize::new(0),
+            activate_calls: std::sync::atomic::AtomicUsize::new(0),
+            activate_failures: std::sync::atomic::AtomicUsize::new(0),
+            identity: None,
+            blocked_session: AtomicBool::new(false),
+            read_calls: std::sync::atomic::AtomicUsize::new(0),
+            read_failures: std::sync::atomic::AtomicUsize::new(0),
+            refresh_failures: std::sync::atomic::AtomicUsize::new(0),
+            send_failure: Mutex::new(None),
+        });
+        let db = DeviceStore::memory();
+        let store = SqlLocalQueueStore::new(db.clone());
+        let svc = Arc::new(ZcodeQueueService::new(
+            store.clone(),
+            fake.clone(),
+            Arc::new(Gate),
+        ));
+        let actor = QueueActor {
+            device_id: "d".into(),
+            device_name: "phone".into(),
+        };
+        let key = TargetKey {
+            session_id: "session".into(),
+        };
+        let item = svc
+            .enqueue(EnqueueCommand {
+                request_id: "C".into(),
+                actor: actor.clone(),
+                session_id: key.session_id.clone(),
+                workspace_path: "/synthetic".into(),
+                workspace_identity: None,
+                draft: QueueDraft {
+                    text: "C".into(),
+                    attachments: vec![],
+                },
+                prepared: PreparedSend::from_stored("C".into()).unwrap(),
+                edited_from: None,
+            })
+            .await
+            .unwrap();
+        db.with(|c| c.execute_batch("CREATE TRIGGER fail_priority_claim BEFORE INSERT ON write_audit WHEN NEW.action='zcode_queue_stop' BEGIN SELECT RAISE(ABORT,'synthetic'); END;").unwrap());
+        assert!(svc
+            .prioritize(
+                &actor,
+                super::super::types::PriorityCommand {
+                    request_id: "p".into(),
+                    item_id: item.item_id.clone(),
+                    expected_version: item.item_version,
+                    confirm_stop: true,
+                    expected_execution_id: Some("A".into()),
+                    held_queue: None
+                }
+            )
+            .await
+            .is_err());
+        assert_eq!(
+            store.operation(&actor, "p").unwrap().unwrap().state,
+            super::super::types::QueueOperationState::Failed
+        );
+        let operation = store.operation(&actor, "p").unwrap().unwrap();
+        let json = serde_json::to_value(&operation).unwrap();
+        assert_eq!(json["stopFailure"]["phase"], "before_write");
+        assert_eq!(json["stopFailure"]["code"], codes::STORAGE_FAILED);
+        let replay = svc
+            .prioritize(
+                &actor,
+                super::super::types::PriorityCommand {
+                    request_id: "p".into(),
+                    item_id: item.item_id.clone(),
+                    expected_version: item.item_version,
+                    confirm_stop: true,
+                    expected_execution_id: Some("A".into()),
+                    held_queue: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(serde_json::to_value(replay).unwrap(), json);
+        assert!(store
+            .edit(
+                &actor,
+                &super::super::types::ItemCommand {
+                    request_id: "edit".into(),
+                    item_id: item.item_id,
+                    expected_version: item.item_version
+                },
+                3
+            )
+            .is_ok());
+        assert!(fake.sent.lock().unwrap().is_empty());
+        assert!(!fake.receipts.lock().unwrap().contains_key("stopped:A"));
+    }
+    #[tokio::test]
+    async fn priority_dispatch_claim_failure_after_stop_is_unknown_not_resend() {
+        let fake = Arc::new(Fake {
+            sent: Mutex::new(vec![]),
+            busy: Mutex::new(true),
+            lock: Arc::new(tokio::sync::Mutex::new(())),
+            receipts: Mutex::new(std::collections::BTreeMap::new()),
+            terminal_after_send: AtomicBool::new(false),
+            delivery: SendDelivery::Queue,
+            changed_path_after_send: AtomicBool::new(false),
+            revision: std::sync::atomic::AtomicU64::new(1),
+            bound: AtomicBool::new(true),
+            refresh_calls: std::sync::atomic::AtomicUsize::new(0),
+            activate_calls: std::sync::atomic::AtomicUsize::new(0),
+            activate_failures: std::sync::atomic::AtomicUsize::new(0),
+            identity: None,
+            blocked_session: AtomicBool::new(false),
+            read_calls: std::sync::atomic::AtomicUsize::new(0),
+            read_failures: std::sync::atomic::AtomicUsize::new(0),
+            refresh_failures: std::sync::atomic::AtomicUsize::new(0),
+            send_failure: Mutex::new(None),
+        });
+        let db = DeviceStore::memory();
+        let store = SqlLocalQueueStore::new(db.clone());
+        let svc = Arc::new(ZcodeQueueService::new(
+            store.clone(),
+            fake.clone(),
+            Arc::new(Gate),
+        ));
+        let actor = QueueActor {
+            device_id: "d".into(),
+            device_name: "phone".into(),
+        };
+        let key = TargetKey {
+            session_id: "session".into(),
+        };
+        let item = svc
+            .enqueue(EnqueueCommand {
+                request_id: "C".into(),
+                actor: actor.clone(),
+                session_id: key.session_id.clone(),
+                workspace_path: "/synthetic".into(),
+                workspace_identity: None,
+                draft: QueueDraft {
+                    text: "C".into(),
+                    attachments: vec![],
+                },
+                prepared: PreparedSend::from_stored("C".into()).unwrap(),
+                edited_from: None,
+            })
+            .await
+            .unwrap();
+        db.with(|c| c.execute_batch("CREATE TRIGGER fail_dispatch_claim BEFORE INSERT ON write_audit WHEN NEW.action='zcode_queue_dispatch' BEGIN SELECT RAISE(ABORT,'synthetic'); END;").unwrap());
+        assert!(svc
+            .prioritize(
+                &actor,
+                super::super::types::PriorityCommand {
+                    request_id: "p".into(),
+                    item_id: item.item_id,
+                    expected_version: item.item_version,
+                    confirm_stop: true,
+                    expected_execution_id: Some("A".into()),
+                    held_queue: None
+                }
+            )
+            .await
+            .is_err());
+        assert_eq!(
+            store.operation(&actor, "p").unwrap().unwrap().state,
+            super::super::types::QueueOperationState::Unknown
+        );
+        assert!(fake.receipts.lock().unwrap().contains_key("stopped:A"));
+        assert!(fake.sent.lock().unwrap().is_empty());
+        assert!(!store.view(&actor, &key).unwrap().auto_drain);
+    }
+    #[tokio::test(start_paused = true)]
+    async fn foreground_timeout_keeps_started_stop_alive_and_blocks_next_write() {
+        let fake = Arc::new(Fake {
+            sent: Mutex::new(vec![]),
+            busy: Mutex::new(true),
+            lock: Arc::new(tokio::sync::Mutex::new(())),
+            receipts: Mutex::new(std::collections::BTreeMap::new()),
+            terminal_after_send: AtomicBool::new(false),
+            delivery: SendDelivery::Queue,
+            changed_path_after_send: AtomicBool::new(false),
+            revision: std::sync::atomic::AtomicU64::new(1),
+            bound: AtomicBool::new(true),
+            refresh_calls: std::sync::atomic::AtomicUsize::new(0),
+            activate_calls: std::sync::atomic::AtomicUsize::new(0),
+            activate_failures: std::sync::atomic::AtomicUsize::new(0),
+            identity: None,
+            blocked_session: AtomicBool::new(false),
+            read_calls: std::sync::atomic::AtomicUsize::new(0),
+            read_failures: std::sync::atomic::AtomicUsize::new(0),
+            refresh_failures: std::sync::atomic::AtomicUsize::new(0),
+            send_failure: Mutex::new(None),
+        });
+        let host = Arc::new(BlockingPriorityStop {
+            inner: fake.clone(),
+            entered: Notify::new(),
+            release: Notify::new(),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let store = SqlLocalQueueStore::new(DeviceStore::memory());
+        let svc = Arc::new(ZcodeQueueService::new(
+            store.clone(),
+            host.clone(),
+            Arc::new(Gate),
+        ));
+        let actor = QueueActor {
+            device_id: "d".into(),
+            device_name: "phone".into(),
+        };
+        let key = TargetKey {
+            session_id: "session".into(),
+        };
+        let item = svc
+            .enqueue(EnqueueCommand {
+                request_id: "C".into(),
+                actor: actor.clone(),
+                session_id: key.session_id.clone(),
+                workspace_path: "/synthetic".into(),
+                workspace_identity: None,
+                draft: QueueDraft {
+                    text: "C".into(),
+                    attachments: vec![],
+                },
+                prepared: PreparedSend::from_stored("C".into()).unwrap(),
+                edited_from: None,
+            })
+            .await
+            .unwrap();
+        let task_svc = svc.clone();
+        let task_actor = actor.clone();
+        let task = tokio::spawn(async move {
+            task_svc
+                .prioritize(
+                    &task_actor,
+                    super::super::types::PriorityCommand {
+                        request_id: "p".into(),
+                        item_id: item.item_id,
+                        expected_version: item.item_version,
+                        confirm_stop: true,
+                        expected_execution_id: Some("A".into()),
+                        held_queue: None,
+                    },
+                )
+                .await
+        });
+        host.entered.notified().await;
+        tokio::time::advance(Duration::from_secs(60)).await;
+        let foreground = task.await.unwrap().unwrap();
+        assert_eq!(
+            foreground.state,
+            super::super::types::QueueOperationState::InFlight
+        );
+        host.release.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if store
+                    .operation(&actor, "p")
+                    .unwrap()
+                    .is_some_and(|o| o.state == super::super::types::QueueOperationState::Unknown)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(fake.receipts.lock().unwrap().contains_key("stopped:A"));
+        assert_eq!(host.calls.load(Ordering::SeqCst), 1);
+        assert!(fake.sent.lock().unwrap().is_empty());
+        assert!(!store.view(&actor, &key).unwrap().auto_drain);
+    }
+    #[tokio::test]
+    async fn priority_changed_path_never_stops() {
+        priority_mismatched_selected_workspace_never_stops("/old", Some("new-id")).await;
+    }
+    #[tokio::test]
+    async fn priority_changed_identity_never_stops() {
+        priority_mismatched_selected_workspace_never_stops("/synthetic", Some("old-id")).await;
+    }
+    async fn priority_mismatched_selected_workspace_never_stops(
+        path: &str,
+        identity: Option<&str>,
+    ) {
+        {
+            let fake = Arc::new(Fake {
+                sent: Mutex::new(vec![]),
+                busy: Mutex::new(true),
+                lock: Arc::new(tokio::sync::Mutex::new(())),
+                receipts: Mutex::new(std::collections::BTreeMap::new()),
+                terminal_after_send: AtomicBool::new(false),
+                delivery: SendDelivery::Queue,
+                changed_path_after_send: AtomicBool::new(false),
+                revision: std::sync::atomic::AtomicU64::new(1),
+                bound: AtomicBool::new(true),
+                refresh_calls: std::sync::atomic::AtomicUsize::new(0),
+                activate_calls: std::sync::atomic::AtomicUsize::new(0),
+                activate_failures: std::sync::atomic::AtomicUsize::new(0),
+                identity: Some("new-id".into()),
+                blocked_session: AtomicBool::new(false),
+                read_calls: std::sync::atomic::AtomicUsize::new(0),
+                read_failures: std::sync::atomic::AtomicUsize::new(0),
+                refresh_failures: std::sync::atomic::AtomicUsize::new(0),
+                send_failure: Mutex::new(None),
+            });
+            let store = SqlLocalQueueStore::new(DeviceStore::memory());
+            let svc = Arc::new(ZcodeQueueService::new(
+                store.clone(),
+                fake.clone(),
+                Arc::new(Gate),
+            ));
+            let actor = QueueActor {
+                device_id: "d".into(),
+                device_name: "phone".into(),
+            };
+            let key = TargetKey {
+                session_id: "session".into(),
+            };
+            let mut selected = None;
+            for (text, p, id) in [("B", "/synthetic", Some("new-id")), ("C", path, identity)] {
+                let item = svc
+                    .enqueue(EnqueueCommand {
+                        request_id: text.into(),
+                        actor: actor.clone(),
+                        session_id: key.session_id.clone(),
+                        workspace_path: p.into(),
+                        workspace_identity: id.map(str::to_owned),
+                        draft: QueueDraft {
+                            text: text.into(),
+                            attachments: vec![],
+                        },
+                        prepared: PreparedSend::from_stored(text.into()).unwrap(),
+                        edited_from: None,
+                    })
+                    .await
+                    .unwrap();
+                if text == "C" {
+                    selected = Some(item);
+                }
+            }
+            let item = selected.unwrap();
+            let result = svc
+                .prioritize(
+                    &actor,
+                    super::super::types::PriorityCommand {
+                        request_id: "p".into(),
+                        item_id: item.item_id.clone(),
+                        expected_version: item.item_version,
+                        confirm_stop: true,
+                        expected_execution_id: Some("A".into()),
+                        held_queue: None,
+                    },
+                )
+                .await;
+            assert!(
+                result.is_err()
+                    || result.unwrap().state == super::super::types::QueueOperationState::Failed
+            );
+            let operation = store.operation(&actor, "p").unwrap().unwrap();
+            let json = serde_json::to_value(operation).unwrap();
+            assert_eq!(json["stopFailure"]["code"], codes::NO_SESSION);
+            assert_eq!(json["stopFailure"]["phase"], "before_write");
+            assert!(!fake.receipts.lock().unwrap().contains_key("stopped:A"));
+            assert!(fake.sent.lock().unwrap().is_empty());
+            assert!(store
+                .edit(
+                    &actor,
+                    &super::super::types::ItemCommand {
+                        request_id: "edit".into(),
+                        item_id: item.item_id,
+                        expected_version: item.item_version
+                    },
+                    3
+                )
+                .is_ok());
+        }
+    }
+    #[tokio::test]
+    async fn manual_claim_failure_safely_closes() {
+        manual_claim_failure_case(false).await;
+    }
+    #[tokio::test]
+    async fn manual_claim_and_closure_failure_can_retry() {
+        manual_claim_failure_case(true).await;
+    }
+    async fn manual_claim_failure_case(fail_close: bool) {
+        let fake = Arc::new(Fake {
+            sent: Mutex::new(vec![]),
+            busy: Mutex::new(true),
+            lock: Arc::new(tokio::sync::Mutex::new(())),
+            receipts: Mutex::new(std::collections::BTreeMap::new()),
+            terminal_after_send: AtomicBool::new(false),
+            delivery: SendDelivery::Queue,
+            changed_path_after_send: AtomicBool::new(false),
+            revision: std::sync::atomic::AtomicU64::new(1),
+            bound: AtomicBool::new(true),
+            refresh_calls: std::sync::atomic::AtomicUsize::new(0),
+            activate_calls: std::sync::atomic::AtomicUsize::new(0),
+            activate_failures: std::sync::atomic::AtomicUsize::new(0),
+            identity: None,
+            blocked_session: AtomicBool::new(false),
+            read_calls: std::sync::atomic::AtomicUsize::new(0),
+            read_failures: std::sync::atomic::AtomicUsize::new(0),
+            refresh_failures: std::sync::atomic::AtomicUsize::new(0),
+            send_failure: Mutex::new(None),
+        });
+        let db = DeviceStore::memory();
+        let store = SqlLocalQueueStore::new(db.clone());
+        let svc = Arc::new(ZcodeQueueService::new(
+            store.clone(),
+            fake.clone(),
+            Arc::new(Gate),
+        ));
+        let actor = QueueActor {
+            device_id: "d".into(),
+            device_name: "phone".into(),
+        };
+        let key = TargetKey {
+            session_id: "session".into(),
+        };
+        svc.enqueue(EnqueueCommand {
+            request_id: "B".into(),
+            actor: actor.clone(),
+            session_id: key.session_id.clone(),
+            workspace_path: "/synthetic".into(),
+            workspace_identity: None,
+            draft: QueueDraft {
+                text: "B".into(),
+                attachments: vec![],
+            },
+            prepared: PreparedSend::from_stored("B".into()).unwrap(),
+            edited_from: None,
+        })
+        .await
+        .unwrap();
+        db.with(|c| { c.execute_batch("CREATE TRIGGER fail_manual_claim BEFORE INSERT ON write_audit WHEN NEW.action='zcode_queue_stop_claim' BEGIN SELECT RAISE(ABORT,'synthetic'); END;").unwrap(); if fail_close { c.execute_batch("CREATE TRIGGER fail_manual_close BEFORE INSERT ON write_audit WHEN NEW.action='zcode_queue_stop_end' BEGIN SELECT RAISE(ABORT,'synthetic'); END;").unwrap(); }});
+        assert!(svc.stop_current(&actor, &key, "stop", "A").await.is_err());
+        if !fail_close {
+            assert_eq!(
+                store.operation(&actor, "stop").unwrap().unwrap().state,
+                super::super::types::QueueOperationState::Failed
+            );
+        }
+        db.with(|c| {
+            c.execute_batch(
+                "DROP TRIGGER fail_manual_claim; DROP TRIGGER IF EXISTS fail_manual_close;",
+            )
+            .unwrap();
+        });
+        let replay = svc.stop_current(&actor, &key, "stop", "A").await.unwrap();
+        assert_eq!(
+            replay.state,
+            super::super::types::QueueOperationState::Failed
+        );
+        let json = serde_json::to_value(&replay).unwrap();
+        assert_eq!(json["stopFailure"]["code"], codes::STORAGE_FAILED);
+        assert_eq!(json["stopFailure"]["phase"], "before_write");
+        assert!(!fake.receipts.lock().unwrap().contains_key("stopped:A"));
+        assert!(fake.sent.lock().unwrap().is_empty());
+        let paused = store.view(&actor, &key).unwrap();
+        assert!(!paused.auto_drain);
+        *fake.busy.lock().unwrap() = false;
+        svc.resume(&actor, &key, "resume", paused.version)
+            .await
+            .unwrap();
+        svc.flush_one(&key).await.unwrap();
+        assert_eq!(*fake.sent.lock().unwrap(), vec!["B"]);
+    }
+    #[tokio::test]
+    async fn manual_reason_needs_evidence() {
+        manual_reason_case(codes::NEEDS_EVIDENCE, false).await;
+    }
+    #[tokio::test]
+    async fn manual_reason_stale_generation() {
+        manual_reason_case(codes::STALE_GENERATION, false).await;
+    }
+    #[tokio::test]
+    async fn manual_reason_storage_failed() {
+        manual_reason_case(codes::STORAGE_FAILED, false).await;
+    }
+    #[tokio::test]
+    async fn manual_reason_may_have_written() {
+        manual_reason_case(codes::NO_SESSION, true).await;
+    }
+    async fn manual_reason_case(code: &'static str, written: bool) {
+        let fake = Arc::new(Fake {
+            sent: Mutex::new(vec![]),
+            busy: Mutex::new(true),
+            lock: Arc::new(tokio::sync::Mutex::new(())),
+            receipts: Mutex::new(std::collections::BTreeMap::new()),
+            terminal_after_send: AtomicBool::new(false),
+            delivery: SendDelivery::Queue,
+            changed_path_after_send: AtomicBool::new(false),
+            revision: std::sync::atomic::AtomicU64::new(1),
+            bound: AtomicBool::new(true),
+            refresh_calls: std::sync::atomic::AtomicUsize::new(0),
+            activate_calls: std::sync::atomic::AtomicUsize::new(0),
+            activate_failures: std::sync::atomic::AtomicUsize::new(0),
+            identity: None,
+            blocked_session: AtomicBool::new(false),
+            read_calls: std::sync::atomic::AtomicUsize::new(0),
+            read_failures: std::sync::atomic::AtomicUsize::new(0),
+            refresh_failures: std::sync::atomic::AtomicUsize::new(0),
+            send_failure: Mutex::new(None),
+        });
+        let host = Arc::new(FailedPriorityStop {
+            inner: fake.clone(),
+            written,
+            code,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let store = SqlLocalQueueStore::new(DeviceStore::memory());
+        let svc = Arc::new(ZcodeQueueService::new(
+            store.clone(),
+            host.clone(),
+            Arc::new(Gate),
+        ));
+        let actor = QueueActor {
+            device_id: "d".into(),
+            device_name: "phone".into(),
+        };
+        let key = TargetKey {
+            session_id: "session".into(),
+        };
+        let operation = svc.stop_current(&actor, &key, "stop", "A").await.unwrap();
+        let json = serde_json::to_value(&operation).unwrap();
+        assert_eq!(json["stopFailure"]["code"], code);
+        assert_eq!(
+            json["stopFailure"]["phase"],
+            if written {
+                "may_have_written"
+            } else {
+                "before_write"
+            }
+        );
+        assert_eq!(
+            serde_json::to_value(svc.stop_current(&actor, &key, "stop", "A").await.unwrap())
+                .unwrap(),
+            json
+        );
+        assert_eq!(
+            serde_json::to_value(store.operation(&actor, "stop").unwrap().unwrap()).unwrap(),
+            json
+        );
+        assert_eq!(host.calls.load(Ordering::SeqCst), 1);
+        assert!(fake.sent.lock().unwrap().is_empty());
+    }
+    #[tokio::test]
+    async fn stop_reason_needs_evidence() {
+        stop_reason_case(codes::NEEDS_EVIDENCE, false).await;
+    }
+    #[tokio::test]
+    async fn stop_reason_stale_generation() {
+        stop_reason_case(codes::STALE_GENERATION, false).await;
+    }
+    #[tokio::test]
+    async fn stop_reason_storage_failed() {
+        stop_reason_case(codes::STORAGE_FAILED, false).await;
+    }
+    #[tokio::test]
+    async fn stop_reason_may_have_written() {
+        stop_reason_case(codes::NO_SESSION, true).await;
+    }
+    async fn stop_reason_case(code: &'static str, written: bool) {
+        let fake = Arc::new(Fake {
+            sent: Mutex::new(vec![]),
+            busy: Mutex::new(true),
+            lock: Arc::new(tokio::sync::Mutex::new(())),
+            receipts: Mutex::new(std::collections::BTreeMap::new()),
+            terminal_after_send: AtomicBool::new(false),
+            delivery: SendDelivery::Queue,
+            changed_path_after_send: AtomicBool::new(false),
+            revision: std::sync::atomic::AtomicU64::new(1),
+            bound: AtomicBool::new(true),
+            refresh_calls: std::sync::atomic::AtomicUsize::new(0),
+            activate_calls: std::sync::atomic::AtomicUsize::new(0),
+            activate_failures: std::sync::atomic::AtomicUsize::new(0),
+            identity: None,
+            blocked_session: AtomicBool::new(false),
+            read_calls: std::sync::atomic::AtomicUsize::new(0),
+            read_failures: std::sync::atomic::AtomicUsize::new(0),
+            refresh_failures: std::sync::atomic::AtomicUsize::new(0),
+            send_failure: Mutex::new(None),
+        });
+        let host = Arc::new(FailedPriorityStop {
+            inner: fake.clone(),
+            written,
+            code,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let store = SqlLocalQueueStore::new(DeviceStore::memory());
+        let svc = Arc::new(ZcodeQueueService::new(
+            store.clone(),
+            host.clone(),
+            Arc::new(Gate),
+        ));
+        let actor = QueueActor {
+            device_id: "d".into(),
+            device_name: "phone".into(),
+        };
+        let key = TargetKey {
+            session_id: "session".into(),
+        };
+        let item = svc
+            .enqueue(EnqueueCommand {
+                request_id: "C".into(),
+                actor: actor.clone(),
+                session_id: key.session_id.clone(),
+                workspace_path: "/synthetic".into(),
+                workspace_identity: None,
+                draft: QueueDraft {
+                    text: "C".into(),
+                    attachments: vec![],
+                },
+                prepared: PreparedSend::from_stored("C".into()).unwrap(),
+                edited_from: None,
+            })
+            .await
+            .unwrap();
+        let cmd = super::super::types::PriorityCommand {
+            request_id: "p".into(),
+            item_id: item.item_id,
+            expected_version: item.item_version,
+            confirm_stop: true,
+            expected_execution_id: Some("A".into()),
+            held_queue: None,
+        };
+        let operation = svc.prioritize(&actor, cmd.clone()).await.unwrap();
+        let json = serde_json::to_value(&operation).unwrap();
+        assert_eq!(json["stopFailure"]["code"], code);
+        assert_eq!(
+            json["stopFailure"]["phase"],
+            if written {
+                "may_have_written"
+            } else {
+                "before_write"
+            }
+        );
+        assert_eq!(
+            serde_json::to_value(svc.prioritize(&actor, cmd).await.unwrap()).unwrap(),
+            json
+        );
+        assert_eq!(
+            serde_json::to_value(store.operation(&actor, "p").unwrap().unwrap()).unwrap(),
+            json
+        );
+        assert_eq!(host.calls.load(Ordering::SeqCst), 1);
+        assert!(fake.sent.lock().unwrap().is_empty());
+    }
+    struct BreakTargetReadHost {
+        inner: Arc<Fake>,
+        db: DeviceStore,
+        broken: AtomicBool,
+    }
+    impl QueueHostPort for BreakTargetReadHost {
+        fn session_lock(&self, key: &TargetKey) -> Arc<tokio::sync::Mutex<()>> {
+            self.inner.session_lock(key)
+        }
+        fn read<'a>(
+            &'a self,
+            key: &'a TargetKey,
+            timeout: Duration,
+        ) -> BoxFuture<'a, ZResult<BoundQueueSession>> {
+            self.inner.read(key, timeout)
+        }
+        fn refresh_target<'a>(
+            &'a self,
+            key: &'a TargetKey,
+            timeout: Duration,
+        ) -> BoxFuture<'a, ZResult<BoundTarget>> {
+            Box::pin(async move {
+                let target = self.inner.refresh_target(key, timeout).await?;
+                if !self.broken.swap(true, Ordering::SeqCst) {
+                    self.db.with(|c| {
+                        c.execute_batch(
+                            "ALTER TABLE zcode_send_queue RENAME TO synthetic_hidden_queue",
+                        )
+                        .unwrap()
+                    });
+                }
+                Ok(target)
+            })
+        }
+        fn send_prepared<'a>(
+            &'a self,
+            ctx: &'a ActionContext,
+            target: &'a BoundTarget,
+            body: &'a PreparedSend,
+            held: Option<&'a HeldQueueChoice>,
+        ) -> BoxFuture<'a, super::super::super::command::PreparedResult<ActionReceipt>> {
+            self.inner.send_prepared(ctx, target, body, held)
+        }
+        fn stop<'a>(
+            &'a self,
+            ctx: &'a ActionContext,
+            target: &'a BoundTarget,
+            execution: &'a str,
+        ) -> BoxFuture<'a, super::super::super::command::PreparedResult<ActionReceipt>> {
+            self.inner.stop(ctx, target, execution)
+        }
+        fn receipt<'a>(
+            &'a self,
+            action: &'a str,
+            device: &'a str,
+        ) -> BoxFuture<'a, ZResult<Option<ActionReceipt>>> {
+            self.inner.receipt(action, device)
+        }
+    }
+    #[tokio::test]
+    async fn target_lookup_storage_failure_recovers_without_stop() {
+        let fake = Arc::new(Fake {
+            sent: Mutex::new(vec![]),
+            busy: Mutex::new(true),
+            lock: Arc::new(tokio::sync::Mutex::new(())),
+            receipts: Mutex::new(std::collections::BTreeMap::new()),
+            terminal_after_send: AtomicBool::new(false),
+            delivery: SendDelivery::Queue,
+            changed_path_after_send: AtomicBool::new(false),
+            revision: std::sync::atomic::AtomicU64::new(1),
+            bound: AtomicBool::new(true),
+            refresh_calls: std::sync::atomic::AtomicUsize::new(0),
+            activate_calls: std::sync::atomic::AtomicUsize::new(0),
+            activate_failures: std::sync::atomic::AtomicUsize::new(0),
+            identity: None,
+            blocked_session: AtomicBool::new(false),
+            read_calls: std::sync::atomic::AtomicUsize::new(0),
+            read_failures: std::sync::atomic::AtomicUsize::new(0),
+            refresh_failures: std::sync::atomic::AtomicUsize::new(0),
+            send_failure: Mutex::new(None),
+        });
+        let db = DeviceStore::memory();
+        let store = SqlLocalQueueStore::new(db.clone());
+        let host = Arc::new(BreakTargetReadHost {
+            inner: fake.clone(),
+            db: db.clone(),
+            broken: AtomicBool::new(false),
+        });
+        let svc = Arc::new(ZcodeQueueService::new(store.clone(), host, Arc::new(Gate)));
+        let actor = QueueActor {
+            device_id: "d".into(),
+            device_name: "phone".into(),
+        };
+        let key = TargetKey {
+            session_id: "session".into(),
+        };
+        let item = svc
+            .enqueue(EnqueueCommand {
+                request_id: "C".into(),
+                actor: actor.clone(),
+                session_id: key.session_id.clone(),
+                workspace_path: "/synthetic".into(),
+                workspace_identity: None,
+                draft: QueueDraft {
+                    text: "C".into(),
+                    attachments: vec![],
+                },
+                prepared: PreparedSend::from_stored("C".into()).unwrap(),
+                edited_from: None,
+            })
+            .await
+            .unwrap();
+        let cmd = super::super::types::PriorityCommand {
+            request_id: "p".into(),
+            item_id: item.item_id.clone(),
+            expected_version: item.item_version,
+            confirm_stop: true,
+            expected_execution_id: Some("A".into()),
+            held_queue: None,
+        };
+        assert!(svc.prioritize(&actor, cmd.clone()).await.is_err());
+        db.with(|c| {
+            c.execute_batch("ALTER TABLE synthetic_hidden_queue RENAME TO zcode_send_queue")
+                .unwrap()
+        });
+        let replay = svc.prioritize(&actor, cmd.clone()).await.unwrap();
+        assert_eq!(
+            replay.state,
+            super::super::types::QueueOperationState::Failed
+        );
+        let replay_json = serde_json::to_value(&replay).unwrap();
+        assert!(replay_json.get("stopFailure").is_none());
+        assert_eq!(
+            serde_json::to_value(store.operation(&actor, "p").unwrap().unwrap()).unwrap(),
+            replay_json
+        );
+        assert_eq!(
+            serde_json::to_value(svc.prioritize(&actor, cmd).await.unwrap()).unwrap(),
+            replay_json
+        );
+        assert!(store
+            .edit(
+                &actor,
+                &super::super::types::ItemCommand {
+                    request_id: "edit".into(),
+                    item_id: item.item_id,
+                    expected_version: item.item_version
+                },
+                3
+            )
+            .is_ok());
+        assert!(!fake.receipts.lock().unwrap().contains_key("stopped:A"));
+        assert!(fake.sent.lock().unwrap().is_empty());
+    }
+    #[tokio::test]
+    async fn manual_preflight_failure_preserves_reason_for_replay() {
+        let fake = Arc::new(Fake {
+            sent: Mutex::new(vec![]),
+            busy: Mutex::new(true),
+            lock: Arc::new(tokio::sync::Mutex::new(())),
+            receipts: Mutex::new(std::collections::BTreeMap::new()),
+            terminal_after_send: AtomicBool::new(false),
+            delivery: SendDelivery::Queue,
+            changed_path_after_send: AtomicBool::new(false),
+            revision: std::sync::atomic::AtomicU64::new(1),
+            bound: AtomicBool::new(true),
+            refresh_calls: std::sync::atomic::AtomicUsize::new(0),
+            activate_calls: std::sync::atomic::AtomicUsize::new(0),
+            activate_failures: std::sync::atomic::AtomicUsize::new(0),
+            identity: None,
+            blocked_session: AtomicBool::new(false),
+            read_calls: std::sync::atomic::AtomicUsize::new(0),
+            read_failures: std::sync::atomic::AtomicUsize::new(1),
+            refresh_failures: std::sync::atomic::AtomicUsize::new(0),
+            send_failure: Mutex::new(None),
+        });
+        let store = SqlLocalQueueStore::new(DeviceStore::memory());
+        let svc = Arc::new(ZcodeQueueService::new(
+            store.clone(),
+            fake.clone(),
+            Arc::new(Gate),
+        ));
+        let actor = QueueActor {
+            device_id: "d".into(),
+            device_name: "phone".into(),
+        };
+        let key = TargetKey {
+            session_id: "session".into(),
+        };
+        assert!(svc.stop_current(&actor, &key, "stop", "A").await.is_err());
+        let operation = store.operation(&actor, "stop").unwrap().unwrap();
+        let json = serde_json::to_value(operation).unwrap();
+        assert_eq!(json["stopFailure"]["code"], codes::NOT_READY);
+        assert_eq!(json["stopFailure"]["phase"], "before_write");
+        assert_eq!(
+            serde_json::to_value(svc.stop_current(&actor, &key, "stop", "A").await.unwrap())
+                .unwrap(),
+            json
+        );
+        assert!(!fake.receipts.lock().unwrap().contains_key("stopped:A"));
+        assert!(fake.sent.lock().unwrap().is_empty());
+    }
+    #[tokio::test]
+    async fn manual_claim_and_close_fail_then_file_restart_never_forges_reason() {
+        let fake = Arc::new(Fake {
+            sent: Mutex::new(vec![]),
+            busy: Mutex::new(true),
+            lock: Arc::new(tokio::sync::Mutex::new(())),
+            receipts: Mutex::new(std::collections::BTreeMap::new()),
+            terminal_after_send: AtomicBool::new(false),
+            delivery: SendDelivery::Queue,
+            changed_path_after_send: AtomicBool::new(false),
+            revision: std::sync::atomic::AtomicU64::new(1),
+            bound: AtomicBool::new(true),
+            refresh_calls: std::sync::atomic::AtomicUsize::new(0),
+            activate_calls: std::sync::atomic::AtomicUsize::new(0),
+            activate_failures: std::sync::atomic::AtomicUsize::new(0),
+            identity: None,
+            blocked_session: AtomicBool::new(false),
+            read_calls: std::sync::atomic::AtomicUsize::new(0),
+            read_failures: std::sync::atomic::AtomicUsize::new(0),
+            refresh_failures: std::sync::atomic::AtomicUsize::new(0),
+            send_failure: Mutex::new(None),
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("queue.sqlite");
+        let open = || {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            crate::database::schema::init(&conn);
+            crate::database::migration::migrate(&conn).unwrap();
+            DeviceStore::Owned(Arc::new(std::sync::Mutex::new(conn)))
+        };
+        let actor = QueueActor {
+            device_id: "d".into(),
+            device_name: "phone".into(),
+        };
+        let key = TargetKey {
+            session_id: "session".into(),
+        };
+        {
+            let db = open();
+            let store = SqlLocalQueueStore::new(db.clone());
+            let svc = Arc::new(ZcodeQueueService::new(store, fake.clone(), Arc::new(Gate)));
+            db.with(|c|c.execute_batch("CREATE TRIGGER fail_claim BEFORE INSERT ON write_audit WHEN NEW.action='zcode_queue_stop_claim' BEGIN SELECT RAISE(ABORT,'synthetic'); END; CREATE TRIGGER fail_end BEFORE INSERT ON write_audit WHEN NEW.action='zcode_queue_stop_end' BEGIN SELECT RAISE(ABORT,'synthetic'); END;").unwrap());
+            assert!(svc.stop_current(&actor, &key, "stop", "A").await.is_err());
+            db.with(|c| {
+                c.execute_batch("DROP TRIGGER fail_claim; DROP TRIGGER fail_end;")
+                    .unwrap()
+            });
+        }
+        let store = SqlLocalQueueStore::new(open());
+        store.recover(1).unwrap();
+        let operation = store.operation(&actor, "stop").unwrap().unwrap();
+        assert_eq!(
+            operation.state,
+            super::super::types::QueueOperationState::Failed
+        );
+        assert!(operation.stop_failure.is_none());
+        assert!(!store.view(&actor, &key).unwrap().auto_drain);
+        assert!(!fake.receipts.lock().unwrap().contains_key("stopped:A"));
+        assert!(fake.sent.lock().unwrap().is_empty());
+    }
+    #[tokio::test]
+    async fn pending_manual_failure_cache_is_bounded_and_keyed_by_request() {
+        let fake = Arc::new(Fake {
+            sent: Mutex::new(vec![]),
+            busy: Mutex::new(true),
+            lock: Arc::new(tokio::sync::Mutex::new(())),
+            receipts: Mutex::new(std::collections::BTreeMap::new()),
+            terminal_after_send: AtomicBool::new(false),
+            delivery: SendDelivery::Queue,
+            changed_path_after_send: AtomicBool::new(false),
+            revision: std::sync::atomic::AtomicU64::new(1),
+            bound: AtomicBool::new(true),
+            refresh_calls: std::sync::atomic::AtomicUsize::new(0),
+            activate_calls: std::sync::atomic::AtomicUsize::new(0),
+            activate_failures: std::sync::atomic::AtomicUsize::new(0),
+            identity: None,
+            blocked_session: AtomicBool::new(false),
+            read_calls: std::sync::atomic::AtomicUsize::new(0),
+            read_failures: std::sync::atomic::AtomicUsize::new(0),
+            refresh_failures: std::sync::atomic::AtomicUsize::new(0),
+            send_failure: Mutex::new(None),
+        });
+        let svc = ZcodeQueueService::new(
+            SqlLocalQueueStore::new(DeviceStore::memory()),
+            fake,
+            Arc::new(Gate),
+        );
+        for i in 0..200 {
+            svc.remember_manual_claim_failure(
+                &format!("req-{i}"),
+                super::super::types::StopFailure {
+                    phase: "before_write".into(),
+                    code: format!("code-{i}"),
+                },
+            );
+        }
+        let pending = svc.manual_claim_failures.lock().unwrap();
+        assert_eq!(pending.len(), 128);
+        assert_eq!(pending.get("req-0").unwrap().code, "code-0");
+        assert!(!pending.contains_key("req-199"));
+    }
+    #[tokio::test]
+    async fn prioritize_c_stops_a_then_sends_only_c() {
+        let fake = Arc::new(Fake {
+            sent: Mutex::new(vec![]),
+            busy: Mutex::new(true),
+            lock: Arc::new(tokio::sync::Mutex::new(())),
+            receipts: Mutex::new(std::collections::BTreeMap::new()),
+            terminal_after_send: AtomicBool::new(false),
+            delivery: SendDelivery::Queue,
+            changed_path_after_send: AtomicBool::new(false),
+            revision: std::sync::atomic::AtomicU64::new(1),
+            bound: AtomicBool::new(true),
+            refresh_calls: std::sync::atomic::AtomicUsize::new(0),
+            activate_calls: std::sync::atomic::AtomicUsize::new(0),
+            activate_failures: std::sync::atomic::AtomicUsize::new(0),
+            identity: None,
+            blocked_session: AtomicBool::new(false),
+            read_calls: std::sync::atomic::AtomicUsize::new(0),
+            read_failures: std::sync::atomic::AtomicUsize::new(0),
+            refresh_failures: std::sync::atomic::AtomicUsize::new(0),
+            send_failure: Mutex::new(None),
+        });
+        let store = SqlLocalQueueStore::new(DeviceStore::memory());
+        let svc = Arc::new(ZcodeQueueService::new(
+            store.clone(),
+            fake.clone(),
+            Arc::new(Gate),
+        ));
+        let actor = QueueActor {
+            device_id: "d".into(),
+            device_name: "phone".into(),
+        };
+        let key = TargetKey {
+            session_id: "session".into(),
+        };
+        let mut ids = Vec::new();
+        for text in ["B", "C"] {
+            ids.push(
+                svc.enqueue(EnqueueCommand {
+                    request_id: text.into(),
+                    actor: actor.clone(),
+                    session_id: key.session_id.clone(),
+                    workspace_path: "/synthetic".into(),
+                    workspace_identity: None,
+                    draft: QueueDraft {
+                        text: text.into(),
+                        attachments: vec![],
+                    },
+                    prepared: PreparedSend::from_stored(text.into()).unwrap(),
+                    edited_from: None,
+                })
+                .await
+                .unwrap(),
+            );
+        }
+        svc.prioritize(
+            &actor,
+            super::super::types::PriorityCommand {
+                request_id: "priority".into(),
+                item_id: ids[1].item_id.clone(),
+                expected_version: ids[1].item_version,
+                confirm_stop: true,
+                expected_execution_id: Some("A".into()),
+                held_queue: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(fake.receipts.lock().unwrap().contains_key("stopped:A"));
+        assert_eq!(*fake.sent.lock().unwrap(), vec!["C"]);
+        let view = store.view(&actor, &key).unwrap();
+        assert!(!view.auto_drain);
+        assert_eq!(view.items[0].item_id, ids[0].item_id);
+    }
     #[tokio::test]
     async fn unexpected_official_queue_admission_never_resends() {
         let fake = Arc::new(Fake {
@@ -2847,6 +6904,466 @@ mod tests {
         .expect("worker must dispatch");
         assert_eq!(*fake.sent.lock().unwrap(), vec!["B"]);
         svc.shutdown();
+    }
+    struct BlockingSend {
+        inner: Arc<Fake>,
+        entered: Notify,
+        release: Notify,
+    }
+    impl QueueHostPort for BlockingSend {
+        fn session_lock(&self, key: &TargetKey) -> Arc<tokio::sync::Mutex<()>> {
+            self.inner.session_lock(key)
+        }
+        fn read<'a>(
+            &'a self,
+            key: &'a TargetKey,
+            timeout: Duration,
+        ) -> BoxFuture<'a, ZResult<BoundQueueSession>> {
+            self.inner.read(key, timeout)
+        }
+        fn refresh_target<'a>(
+            &'a self,
+            key: &'a TargetKey,
+            timeout: Duration,
+        ) -> BoxFuture<'a, ZResult<BoundTarget>> {
+            self.inner.refresh_target(key, timeout)
+        }
+        fn send_prepared<'a>(
+            &'a self,
+            ctx: &'a ActionContext,
+            target: &'a BoundTarget,
+            body: &'a PreparedSend,
+            held: Option<&'a HeldQueueChoice>,
+        ) -> BoxFuture<'a, super::super::super::command::PreparedResult<ActionReceipt>> {
+            Box::pin(async move {
+                self.entered.notify_one();
+                self.release.notified().await;
+                self.inner.send_prepared(ctx, target, body, held).await
+            })
+        }
+        fn stop<'a>(
+            &'a self,
+            ctx: &'a ActionContext,
+            target: &'a BoundTarget,
+            execution: &'a str,
+        ) -> BoxFuture<'a, super::super::super::command::PreparedResult<ActionReceipt>> {
+            self.inner.stop(ctx, target, execution)
+        }
+        fn receipt<'a>(
+            &'a self,
+            action: &'a str,
+            device: &'a str,
+        ) -> BoxFuture<'a, ZResult<Option<ActionReceipt>>> {
+            self.inner.receipt(action, device)
+        }
+    }
+    #[tokio::test]
+    async fn dispatch_claim_notifies_before_send_ack() {
+        let fake = Arc::new(Fake {
+            sent: Mutex::new(vec![]),
+            busy: Mutex::new(false),
+            lock: Arc::new(tokio::sync::Mutex::new(())),
+            receipts: Mutex::new(std::collections::BTreeMap::new()),
+            terminal_after_send: AtomicBool::new(false),
+            delivery: SendDelivery::StartNow,
+            changed_path_after_send: AtomicBool::new(false),
+            revision: std::sync::atomic::AtomicU64::new(1),
+            bound: AtomicBool::new(true),
+            refresh_calls: std::sync::atomic::AtomicUsize::new(0),
+            activate_calls: std::sync::atomic::AtomicUsize::new(0),
+            activate_failures: std::sync::atomic::AtomicUsize::new(0),
+            identity: None,
+            blocked_session: AtomicBool::new(false),
+            read_calls: std::sync::atomic::AtomicUsize::new(0),
+            read_failures: std::sync::atomic::AtomicUsize::new(0),
+            refresh_failures: std::sync::atomic::AtomicUsize::new(0),
+            send_failure: Mutex::new(None),
+        });
+        let host = Arc::new(BlockingSend {
+            inner: fake,
+            entered: Notify::new(),
+            release: Notify::new(),
+        });
+        let store = SqlLocalQueueStore::new(DeviceStore::memory());
+        let svc = Arc::new(ZcodeQueueService::new(
+            store.clone(),
+            host.clone(),
+            Arc::new(Gate),
+        ));
+        let actor = QueueActor {
+            device_id: "d".into(),
+            device_name: "phone".into(),
+        };
+        let key = TargetKey {
+            session_id: "session".into(),
+        };
+        svc.enqueue(EnqueueCommand {
+            request_id: "B".into(),
+            actor: actor.clone(),
+            session_id: key.session_id.clone(),
+            workspace_path: "/synthetic".into(),
+            workspace_identity: None,
+            draft: QueueDraft {
+                text: "B".into(),
+                attachments: vec![],
+            },
+            prepared: PreparedSend::from_stored("B".into()).unwrap(),
+            edited_from: None,
+        })
+        .await
+        .unwrap();
+        let mut events = svc.subscribe_queue();
+        let worker = svc.clone();
+        let worker_key = key.clone();
+        let task = tokio::spawn(async move { worker.flush_one(&worker_key).await });
+        host.entered.notified().await;
+        assert_eq!(
+            tokio::time::timeout(Duration::from_millis(100), events.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            key.session_id
+        );
+        assert_eq!(
+            serde_json::to_value(store.view(&actor, &key).unwrap()).unwrap()["items"][0]["state"],
+            "dispatching"
+        );
+        host.release.notify_one();
+        task.await.unwrap().unwrap();
+        let other = TargetKey {
+            session_id: "second-session".into(),
+        };
+        let item = svc
+            .enqueue(EnqueueCommand {
+                request_id: "C".into(),
+                actor: actor.clone(),
+                session_id: other.session_id.clone(),
+                workspace_path: "/synthetic".into(),
+                workspace_identity: None,
+                draft: QueueDraft {
+                    text: "C".into(),
+                    attachments: vec![],
+                },
+                prepared: PreparedSend::from_stored("C".into()).unwrap(),
+                edited_from: None,
+            })
+            .await
+            .unwrap();
+        let mut priority_events = svc.subscribe_queue();
+        let worker = svc.clone();
+        let worker_actor = actor.clone();
+        let task = tokio::spawn(async move {
+            worker
+                .prioritize(
+                    &worker_actor,
+                    super::super::types::PriorityCommand {
+                        request_id: "priority-C".into(),
+                        item_id: item.item_id,
+                        expected_version: item.item_version,
+                        confirm_stop: false,
+                        expected_execution_id: None,
+                        held_queue: None,
+                    },
+                )
+                .await
+        });
+        host.entered.notified().await;
+        assert_eq!(priority_events.recv().await.unwrap(), other.session_id);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_millis(100), priority_events.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            other.session_id
+        );
+        assert_eq!(
+            serde_json::to_value(store.view(&actor, &other).unwrap()).unwrap()["items"][0]["state"],
+            "dispatching"
+        );
+        host.release.notify_one();
+        task.await.unwrap().unwrap();
+        // 队列自身事件只能通知订阅端，不能反过来唤醒 worker 形成循环。
+        let _ = tokio::time::timeout(Duration::from_millis(10), svc.wake.notified()).await;
+        let (tx, rx) = tokio::sync::broadcast::channel(8);
+        let listener = tokio::spawn(crate::remote::run_queue_listener(svc.clone(), rx, false));
+        tx.send(ControlEvent {
+            seq: 1,
+            generation: 1,
+            session_id: Some(other.session_id.clone()),
+            kind: ControlEventKind::LocalQueue,
+            data: serde_json::Value::Null,
+            device_id: None,
+        })
+        .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), svc.wake.notified())
+                .await
+                .is_err()
+        );
+        svc.shutdown();
+        listener.await.unwrap();
+    }
+    struct TempPathHost {
+        inner: Arc<Fake>,
+        path: String,
+    }
+    impl QueueHostPort for TempPathHost {
+        fn session_lock(&self, key: &TargetKey) -> Arc<tokio::sync::Mutex<()>> {
+            self.inner.session_lock(key)
+        }
+        fn read<'a>(
+            &'a self,
+            key: &'a TargetKey,
+            timeout: Duration,
+        ) -> BoxFuture<'a, ZResult<BoundQueueSession>> {
+            Box::pin(async move {
+                let mut bound = self.inner.read(key, timeout).await?;
+                bound.target.workspace_path = self.path.clone();
+                bound.target.workspace_key = self.path.clone();
+                Ok(bound)
+            })
+        }
+        fn refresh_target<'a>(
+            &'a self,
+            key: &'a TargetKey,
+            timeout: Duration,
+        ) -> BoxFuture<'a, ZResult<BoundTarget>> {
+            Box::pin(async move { Ok(self.read(key, timeout).await?.target) })
+        }
+        fn send_prepared<'a>(
+            &'a self,
+            ctx: &'a ActionContext,
+            target: &'a BoundTarget,
+            body: &'a PreparedSend,
+            held: Option<&'a HeldQueueChoice>,
+        ) -> BoxFuture<'a, super::super::super::command::PreparedResult<ActionReceipt>> {
+            self.inner.send_prepared(ctx, target, body, held)
+        }
+        fn stop<'a>(
+            &'a self,
+            ctx: &'a ActionContext,
+            target: &'a BoundTarget,
+            execution: &'a str,
+        ) -> BoxFuture<'a, super::super::super::command::PreparedResult<ActionReceipt>> {
+            self.inner.stop(ctx, target, execution)
+        }
+        fn receipt<'a>(
+            &'a self,
+            action: &'a str,
+            device: &'a str,
+        ) -> BoxFuture<'a, ZResult<Option<ActionReceipt>>> {
+            self.inner.receipt(action, device)
+        }
+    }
+    #[tokio::test]
+    async fn deleted_attachment_never_dispatches() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = crate::remote::attachments::attachment_dir(tmp.path(), "session");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("sample.txt");
+        std::fs::write(&path, b"synthetic").unwrap();
+        let fake = Arc::new(Fake {
+            sent: Mutex::new(vec![]),
+            busy: Mutex::new(false),
+            lock: Arc::new(tokio::sync::Mutex::new(())),
+            receipts: Mutex::new(std::collections::BTreeMap::new()),
+            terminal_after_send: AtomicBool::new(false),
+            delivery: SendDelivery::StartNow,
+            changed_path_after_send: AtomicBool::new(false),
+            revision: std::sync::atomic::AtomicU64::new(1),
+            bound: AtomicBool::new(true),
+            refresh_calls: std::sync::atomic::AtomicUsize::new(0),
+            activate_calls: std::sync::atomic::AtomicUsize::new(0),
+            activate_failures: std::sync::atomic::AtomicUsize::new(0),
+            identity: None,
+            blocked_session: AtomicBool::new(false),
+            read_calls: std::sync::atomic::AtomicUsize::new(0),
+            read_failures: std::sync::atomic::AtomicUsize::new(0),
+            refresh_failures: std::sync::atomic::AtomicUsize::new(0),
+            send_failure: Mutex::new(None),
+        });
+        let store = SqlLocalQueueStore::new(DeviceStore::memory());
+        let svc = Arc::new(ZcodeQueueService::new(
+            store.clone(),
+            Arc::new(TempPathHost {
+                inner: fake.clone(),
+                path: tmp.path().to_string_lossy().into_owned(),
+            }),
+            Arc::new(Gate),
+        ));
+        let actor = QueueActor {
+            device_id: "d".into(),
+            device_name: "phone".into(),
+        };
+        let key = TargetKey {
+            session_id: "session".into(),
+        };
+        svc.enqueue(EnqueueCommand {
+            request_id: "attachment".into(),
+            actor: actor.clone(),
+            session_id: key.session_id.clone(),
+            workspace_path: tmp.path().to_string_lossy().into_owned(),
+            workspace_identity: None,
+            draft: QueueDraft {
+                text: "synthetic".into(),
+                attachments: vec![super::super::types::QueuedAttachment {
+                    name: "sample.txt".into(),
+                    path: path.to_string_lossy().into_owned(),
+                    is_image: false,
+                }],
+            },
+            prepared: PreparedSend::from_stored("synthetic attachment".into()).unwrap(),
+            edited_from: None,
+        })
+        .await
+        .unwrap();
+        std::fs::remove_file(path).unwrap();
+        svc.flush_one(&key).await.unwrap();
+        assert!(fake.sent.lock().unwrap().is_empty());
+        let view = store.view(&actor, &key).unwrap();
+        assert!(!view.auto_drain);
+        assert_eq!(
+            view.items[0].state,
+            super::super::types::QueueItemState::Queued
+        );
+        let second_path = dir.join("second.txt");
+        std::fs::write(&second_path, b"synthetic").unwrap();
+        let second = svc
+            .enqueue(EnqueueCommand {
+                request_id: "attachment-C".into(),
+                actor: actor.clone(),
+                session_id: key.session_id.clone(),
+                workspace_path: tmp.path().to_string_lossy().into_owned(),
+                workspace_identity: None,
+                draft: QueueDraft {
+                    text: "C".into(),
+                    attachments: vec![super::super::types::QueuedAttachment {
+                        name: "second.txt".into(),
+                        path: second_path.to_string_lossy().into_owned(),
+                        is_image: false,
+                    }],
+                },
+                prepared: PreparedSend::from_stored("synthetic C".into()).unwrap(),
+                edited_from: None,
+            })
+            .await
+            .unwrap();
+        std::fs::remove_file(second_path).unwrap();
+        *fake.busy.lock().unwrap() = true;
+        let result = svc
+            .prioritize(
+                &actor,
+                super::super::types::PriorityCommand {
+                    request_id: "priority-C".into(),
+                    item_id: second.item_id,
+                    expected_version: second.item_version,
+                    confirm_stop: true,
+                    expected_execution_id: Some("A".into()),
+                    held_queue: None,
+                },
+            )
+            .await;
+        assert!(result.is_err());
+        assert!(!fake.receipts.lock().unwrap().contains_key("stopped:A"));
+        assert!(fake.sent.lock().unwrap().is_empty());
+        let third_path = dir.join("third.txt");
+        std::fs::write(&third_path, b"synthetic").unwrap();
+        let third = svc
+            .enqueue(EnqueueCommand {
+                request_id: "attachment-D".into(),
+                actor: actor.clone(),
+                session_id: key.session_id.clone(),
+                workspace_path: tmp.path().to_string_lossy().into_owned(),
+                workspace_identity: None,
+                draft: QueueDraft {
+                    text: "D".into(),
+                    attachments: vec![super::super::types::QueuedAttachment {
+                        name: "third.txt".into(),
+                        path: third_path.to_string_lossy().into_owned(),
+                        is_image: false,
+                    }],
+                },
+                prepared: PreparedSend::from_stored("synthetic D".into()).unwrap(),
+                edited_from: None,
+            })
+            .await
+            .unwrap();
+        *fake.busy.lock().unwrap() = false;
+        *svc.before_priority_port.lock().unwrap() = Some(Arc::new(move |stage| {
+            if stage == "send" {
+                std::fs::remove_file(&third_path).unwrap();
+            }
+        }));
+        let operation = svc
+            .prioritize(
+                &actor,
+                super::super::types::PriorityCommand {
+                    request_id: "priority-D".into(),
+                    item_id: third.item_id.clone(),
+                    expected_version: third.item_version,
+                    confirm_stop: false,
+                    expected_execution_id: None,
+                    held_queue: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            operation.state,
+            super::super::types::QueueOperationState::Failed
+        );
+        assert!(fake.sent.lock().unwrap().is_empty());
+        let view = store.view(&actor, &key).unwrap();
+        assert!(view.items.iter().any(|item| item.item_id == third.item_id
+            && item.state == super::super::types::QueueItemState::Queued));
+        let fourth_path = dir.join("fourth.txt");
+        std::fs::write(&fourth_path, b"synthetic").unwrap();
+        let fourth = svc
+            .enqueue(EnqueueCommand {
+                request_id: "attachment-E".into(),
+                actor: actor.clone(),
+                session_id: key.session_id.clone(),
+                workspace_path: tmp.path().to_string_lossy().into_owned(),
+                workspace_identity: None,
+                draft: QueueDraft {
+                    text: "E".into(),
+                    attachments: vec![super::super::types::QueuedAttachment {
+                        name: "fourth.txt".into(),
+                        path: fourth_path.to_string_lossy().into_owned(),
+                        is_image: false,
+                    }],
+                },
+                prepared: PreparedSend::from_stored("synthetic E".into()).unwrap(),
+                edited_from: None,
+            })
+            .await
+            .unwrap();
+        *fake.busy.lock().unwrap() = true;
+        *svc.before_priority_port.lock().unwrap() = Some(Arc::new(move |stage| {
+            if stage == "stop" {
+                std::fs::remove_file(&fourth_path).unwrap();
+            }
+        }));
+        let operation = svc
+            .prioritize(
+                &actor,
+                super::super::types::PriorityCommand {
+                    request_id: "priority-E".into(),
+                    item_id: fourth.item_id,
+                    expected_version: fourth.item_version,
+                    confirm_stop: true,
+                    expected_execution_id: Some("A".into()),
+                    held_queue: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            operation.state,
+            super::super::types::QueueOperationState::Failed
+        );
+        assert!(!fake.receipts.lock().unwrap().contains_key("stopped:A"));
+        assert!(fake.sent.lock().unwrap().is_empty());
     }
     #[tokio::test]
     async fn busy_enqueue_emits_zero_upstream_frames_and_idle_fifo_waits() {

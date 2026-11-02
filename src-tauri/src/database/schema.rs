@@ -241,6 +241,7 @@ pub fn init(conn: &Connection) {
             request_id TEXT NOT NULL UNIQUE,
             item_id TEXT NOT NULL UNIQUE,
             payload_hash TEXT NOT NULL,
+            request_input_hash TEXT,
             device_id TEXT NOT NULL,
             session_id TEXT NOT NULL,
             device_name TEXT NOT NULL,

@@ -58,6 +58,44 @@ pub fn attachment_dir(cwd: &Path, session_id: &str) -> PathBuf {
     cwd.join(ATTACHMENT_DIR_NAME).join(session_id)
 }
 
+/// 只接受当前会话附件目录内的现存普通文件。
+pub(crate) fn valid_attachment_path(workspace: &Path, session_id: &str, raw_path: &str) -> bool {
+    use std::path::Component;
+    let mut components = Path::new(session_id).components();
+    if !matches!(components.next(), Some(Component::Normal(_)))
+        || components.next().is_some()
+        || raw_path.chars().any(|c| c == '"' || c.is_control())
+    {
+        return false;
+    }
+    let Ok(root) = workspace.canonicalize() else {
+        return false;
+    };
+    let attachment_root = root.join(ATTACHMENT_DIR_NAME);
+    let session_dir = attachment_root.join(session_id);
+    if [
+        &attachment_root,
+        &session_dir,
+        &Path::new(raw_path).to_path_buf(),
+    ]
+    .iter()
+    .any(|path| std::fs::symlink_metadata(path).map_or(true, |m| m.file_type().is_symlink()))
+    {
+        return false;
+    }
+    let Ok(dir) = session_dir.canonicalize() else {
+        return false;
+    };
+    let Ok(path) = Path::new(raw_path).canonicalize() else {
+        return false;
+    };
+    dir.starts_with(&root)
+        && path.parent() == Some(dir.as_path())
+        && path
+            .metadata()
+            .is_ok_and(|m| m.is_file() && m.len() <= MAX_ATTACHMENT_BYTES as u64)
+}
+
 /// 待追加的本地排除文件路径：None = 非 git 仓库（无 .git，整步跳过）或
 /// exclude 已含该行（幂等——重复上传不重复追加）。纯函数（只读）。
 pub fn pending_git_exclude(cwd: &Path, line: &str) -> Option<PathBuf> {

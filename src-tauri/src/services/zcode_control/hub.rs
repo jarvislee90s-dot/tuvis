@@ -696,6 +696,20 @@ pub trait HubBackend: Send + Sync {
     ) -> BoxFuture<'a, ZResult<ActionReceipt>>;
 
     #[allow(private_interfaces)]
+    fn execute_stop_staged<'a>(
+        &'a self,
+        _ctx: &'a ActionContext,
+        _target: &'a BoundTarget,
+        _action: &'a ControlAction,
+    ) -> BoxFuture<'a, super::command::PreparedResult<ActionReceipt>> {
+        Box::pin(async {
+            Err(super::command::PreparedDispatchError::MayHaveWritten(
+                ZcodeError::of(codes::NOT_READY),
+            ))
+        })
+    }
+
+    #[allow(private_interfaces)]
     fn execute_prepared<'a>(
         &'a self,
         _ctx: &'a ActionContext,
@@ -1122,6 +1136,16 @@ impl HubBackend for PartsBackend {
         action: &'a ControlAction,
     ) -> BoxFuture<'a, ZResult<ActionReceipt>> {
         Box::pin(async move { self.sender.execute(ctx, target, action).await })
+    }
+
+    #[allow(private_interfaces)]
+    fn execute_stop_staged<'a>(
+        &'a self,
+        ctx: &'a ActionContext,
+        target: &'a BoundTarget,
+        action: &'a ControlAction,
+    ) -> BoxFuture<'a, super::command::PreparedResult<ActionReceipt>> {
+        Box::pin(async move { self.sender.execute_stop_staged(ctx, target, action).await })
     }
 
     #[allow(private_interfaces)]
@@ -2007,6 +2031,21 @@ impl ZcodeHub {
             .unwrap_or_else(|e| e.into_inner())
             .upgrade()
     }
+    pub(crate) fn queue_publish_change(&self, session_id: &str) {
+        emit_event(
+            &self.inner,
+            &self.events,
+            ControlEventKind::LocalQueue,
+            self.connection().generation,
+            if session_id.is_empty() {
+                None
+            } else {
+                Some(session_id.to_owned())
+            },
+            None,
+            Value::Null,
+        );
+    }
     pub(crate) fn install_queue(
         self: &Arc<Self>,
     ) -> (Arc<super::local_queue::service::ZcodeQueueService>, bool) {
@@ -2025,16 +2064,41 @@ impl ZcodeHub {
         *slot = Arc::downgrade(&service);
         (service, true)
     }
+
+    /// 假宿主集成测试持有同一队列实例，不启动派发 worker。
+    #[cfg(feature = "zcode-bridge-evidence")]
+    pub async fn evidence_install_queue(self: &Arc<Self>) -> impl Send + Sync {
+        let (queue, _) = self.install_queue();
+        queue.recover().await.expect("synthetic queue recovery");
+        queue
+    }
+
+    /// 假宿主集成测试启动生产队列 worker，不触发授权或连接。
+    #[cfg(feature = "zcode-bridge-evidence")]
+    pub async fn evidence_start_queue(self: &Arc<Self>) -> impl Send + Sync {
+        let (queue, _) = self.install_queue();
+        queue.recover().await.expect("synthetic queue recovery");
+        queue.start();
+        queue
+    }
+    #[cfg(feature = "zcode-bridge-evidence")]
+    pub fn evidence_notify_queue(&self, session_id: &str) {
+        if let Some(queue) = self.queue_service() {
+            queue.notify(&TargetKey {
+                session_id: session_id.to_owned(),
+            });
+        }
+    }
     pub(crate) async fn queue_stop(
         &self,
         ctx: &ActionContext,
         target: &BoundTarget,
         execution_id: &str,
-    ) -> ZResult<ActionReceipt> {
+    ) -> super::command::PreparedResult<ActionReceipt> {
         self.queue_runtime_check(ctx)?;
         let generation = self.control_generation()?;
         if generation != target.generation {
-            return Err(ZcodeError::of(codes::STALE_GENERATION));
+            return Err(ZcodeError::of(codes::STALE_GENERATION).into());
         }
         let action = ControlAction::Stop {
             session_id: target.session_id.clone(),
@@ -2048,12 +2112,25 @@ impl ZcodeHub {
         let current = public_target(self.backend.refresh_session_target(&key).await?, generation);
         self.queue_runtime_check(ctx)?;
         if self.control_generation()? != generation {
-            return Err(ZcodeError::of(codes::STALE_GENERATION));
+            return Err(ZcodeError::of(codes::STALE_GENERATION).into());
         }
         if current != *target {
-            return Err(ZcodeError::of(codes::NO_SESSION));
+            return Err(ZcodeError::of(codes::NO_SESSION).into());
         }
-        self.backend.execute(ctx, &current, &action).await
+        let store = super::local_queue::store::SqlLocalQueueStore::new(self.store.clone());
+        if !store.priority_stop_attachments_valid(
+            &key,
+            &ctx.device_id,
+            &ctx.action_id,
+            &current.workspace_path,
+            current.generation,
+            execution_id,
+        )? {
+            return Err(ZcodeError::of(codes::ATTACHMENT_MISSING).into());
+        }
+        self.backend
+            .execute_stop_staged(ctx, &current, &action)
+            .await
     }
     pub(crate) async fn queue_send_prepared(
         &self,
@@ -2084,6 +2161,15 @@ impl ZcodeHub {
         }
         if current != *target {
             return Err(ZcodeError::of(codes::NO_SESSION).into());
+        }
+        let store = super::local_queue::store::SqlLocalQueueStore::new(self.store.clone());
+        if !store.dispatch_attachments_valid(
+            &key,
+            &ctx.device_id,
+            &ctx.action_id,
+            &current.workspace_path,
+        )? {
+            return Err(ZcodeError::of(codes::ATTACHMENT_MISSING).into());
         }
         self.backend
             .execute_prepared(ctx, &current, body, held)
@@ -3687,10 +3773,18 @@ impl ZcodeHub {
                 &format!("external-stop:{}", ctx.action_id),
             )?;
         }
-        if matches!(&action, ControlAction::Send { .. }) {
-            if queue_store.blocks_legacy_send(&queue_key)? {
-                return Err(ZcodeError::of(codes::QUEUE_REFRESH_REQUIRED));
+        if matches!(&action, ControlAction::Stop { .. }) {
+            if queue_store.has_unresolved_stop(&queue_key)? {
+                return Err(ZcodeError::of(codes::INVALID_ACTION));
             }
+            if queue_store.blocks_legacy_send(&queue_key)? {
+                queue_store.ensure_stop_paused(&queue_key, &ctx.device_id, &ctx.device_name)?;
+            }
+        }
+        if matches!(&action, ControlAction::Send { .. })
+            && queue_store.blocks_legacy_send(&queue_key)?
+        {
+            return Err(ZcodeError::of(codes::QUEUE_REFRESH_REQUIRED));
         }
         self.control_generation()?;
         // 能力闸分三段：
@@ -4282,10 +4376,177 @@ mod tests {
                 .is_err()
         );
         assert_eq!(fake.execute_calls.load(Ordering::SeqCst), 0);
+        hub.store.with(|c| c.execute("INSERT INTO zcode_queue_operations(request_id,kind,device_id,device_name,item_id,expected_version,stop_action_id,stop_claimed,stop_generation,expected_execution_id,operation_state,expires_at) VALUES('synthetic-stop-request','stop','synthetic-device','Synthetic','sess_synthetic0000',0,'stop',1,?1,'E','in_flight',9223372036854775807)", [bound.target.generation as i64]).unwrap());
+        assert!(
+            QueueHostPort::stop(hub.as_ref(), &ctx("stop"), &bound.target, "different")
+                .await
+                .is_err()
+        );
+        assert_eq!(fake.execute_calls.load(Ordering::SeqCst), 0);
         QueueHostPort::stop(hub.as_ref(), &ctx("stop"), &bound.target, "E")
             .await
             .unwrap();
         assert_eq!(fake.execute_calls.load(Ordering::SeqCst), 1);
+    }
+    #[tokio::test]
+    async fn old_stop_repauses_after_resume_queued_before_it() {
+        use crate::services::zcode_control::local_queue::{
+            store::SqlLocalQueueStore,
+            types::{EnqueueCommand, QueueActor, QueueDraft},
+        };
+        let fake = Arc::new(FakeBackend::default());
+        let hub = Arc::new(ZcodeHub::with_parts(
+            stored(URL),
+            fake.clone(),
+            policy_with(&["send", "interrupt"]),
+        ));
+        hub.authorize(OAuthProvider::Bigmodel, noop_open())
+            .await
+            .unwrap();
+        hub.connect().await.unwrap();
+        let actor = QueueActor {
+            device_id: "synthetic-device".into(),
+            device_name: "Synthetic".into(),
+        };
+        let key = TargetKey {
+            session_id: "sess_synthetic0000".into(),
+        };
+        let store = SqlLocalQueueStore::new(hub.store.clone());
+        store
+            .enqueue(
+                &EnqueueCommand {
+                    request_id: "queued".into(),
+                    actor: actor.clone(),
+                    session_id: key.session_id.clone(),
+                    workspace_path: "/synthetic".into(),
+                    workspace_identity: None,
+                    draft: QueueDraft {
+                        text: "B".into(),
+                        attachments: vec![],
+                    },
+                    prepared: super::super::command::PreparedSend::from_stored("B".into()).unwrap(),
+                    edited_from: None,
+                },
+                1,
+            )
+            .unwrap();
+        let lock = hub.session_write_lock(&key.session_id);
+        let guard = lock.lock().await;
+        let expected = store.view(&actor, &key).unwrap().version + 1;
+        let (service, _) = hub.install_queue();
+        let started = Arc::new(Notify::new());
+        let started_task = started.clone();
+        let resume_actor = actor.clone();
+        let resume_key = key.clone();
+        let resume_task = tokio::spawn(async move {
+            started_task.notify_one();
+            service
+                .resume(&resume_actor, &resume_key, "resume-before-stop", expected)
+                .await
+        });
+        started.notified().await;
+        let generation = hub.connection().generation;
+        let worker = hub.clone();
+        let action = ControlAction::Stop {
+            session_id: key.session_id.clone(),
+            generation,
+            expected_foreground_execution_id: "E".into(),
+        };
+        let stop_task = tokio::spawn(async move { worker.execute(ctx("stop-race"), action).await });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if !store.view(&actor, &key).unwrap().auto_drain {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        drop(guard);
+        assert!(resume_task.await.unwrap().unwrap().auto_drain);
+        stop_task.await.unwrap().unwrap();
+        assert!(
+            !store.view(&actor, &key).unwrap().auto_drain,
+            "stop 必须在锁内重新暂停"
+        );
+        assert_eq!(fake.execute_calls.load(Ordering::SeqCst), 1);
+    }
+    #[tokio::test]
+    async fn old_stop_replay_survives_but_new_id_cannot_bypass_unknown() {
+        use crate::services::zcode_control::local_queue::{
+            store::SqlLocalQueueStore,
+            types::{EnqueueCommand, QueueActor, QueueDraft},
+        };
+        let fake = Arc::new(FakeBackend::default());
+        let hub = Arc::new(ZcodeHub::with_parts(
+            stored(URL),
+            fake.clone(),
+            policy_with(&["send", "interrupt"]),
+        ));
+        hub.authorize(OAuthProvider::Bigmodel, noop_open())
+            .await
+            .unwrap();
+        hub.connect().await.unwrap();
+        let actor = QueueActor {
+            device_id: "synthetic-device".into(),
+            device_name: "Synthetic".into(),
+        };
+        let key = TargetKey {
+            session_id: "sess_synthetic0000".into(),
+        };
+        let store = SqlLocalQueueStore::new(hub.store.clone());
+        store
+            .enqueue(
+                &EnqueueCommand {
+                    request_id: "queued".into(),
+                    actor: actor.clone(),
+                    session_id: key.session_id.clone(),
+                    workspace_path: "/synthetic".into(),
+                    workspace_identity: None,
+                    draft: QueueDraft {
+                        text: "B".into(),
+                        attachments: vec![],
+                    },
+                    prepared: super::super::command::PreparedSend::from_stored("B".into()).unwrap(),
+                    edited_from: None,
+                },
+                1,
+            )
+            .unwrap();
+        use crate::services::zcode_control::local_queue::types::QueueOperationState;
+        store
+            .begin_stop(&actor, &key, "manual-unknown", "E", 1)
+            .unwrap();
+        store
+            .claim_manual_stop(&actor, "manual-unknown", hub.connection().generation)
+            .unwrap();
+        store
+            .finish_manual_stop(&actor, "manual-unknown", QueueOperationState::Unknown, None)
+            .unwrap();
+        let generation = hub.connection().generation;
+        let action = ControlAction::Stop {
+            session_id: key.session_id.clone(),
+            generation,
+            expected_foreground_execution_id: "E".into(),
+        };
+        let receipt = ActionReceipt {
+            action_id: "old-stop".into(),
+            session_id: key.session_id.clone(),
+            generation,
+            state: ActionState::Unknown,
+            reason_code: None,
+            send_admission: None,
+        };
+        fake.set_existing(Ok(Some(receipt.clone())));
+        assert_eq!(
+            hub.execute(ctx("old-stop"), action.clone()).await.unwrap(),
+            receipt
+        );
+        assert_eq!(fake.execute_calls.load(Ordering::SeqCst), 0);
+        fake.set_existing(Ok(None));
+        assert!(hub.execute(ctx("new-stop"), action).await.is_err());
+        assert_eq!(fake.execute_calls.load(Ordering::SeqCst), 0);
     }
     #[tokio::test]
     async fn old_stop_pauses_queue_before_waiting_for_session_lock() {
@@ -4554,6 +4815,171 @@ mod tests {
         }
     }
     #[tokio::test]
+    async fn deleted_attachment_during_final_binding_never_reaches_sender() {
+        use crate::services::zcode_control::local_queue::{
+            service::ZcodeQueueService,
+            store::SqlLocalQueueStore,
+            types::{EnqueueCommand, QueueActor, QueueDraft, QueueItemState, QueuedAttachment},
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let session = "sess_synthetic0000";
+        let dir = crate::remote::attachments::attachment_dir(tmp.path(), session);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("sample.txt");
+        std::fs::write(&path, b"synthetic").unwrap();
+        let fake = Arc::new(FakeBackend::default());
+        fake.queue_ready.store(true, Ordering::SeqCst);
+        *fake.bound_path_override.lock().unwrap() = Some(tmp.path().to_string_lossy().into_owned());
+        let hub = paired_hub(fake.clone()).await;
+        enable_queue_test_device(&hub);
+        let store = SqlLocalQueueStore::new(hub.store.clone());
+        let svc = Arc::new(ZcodeQueueService::new(
+            store.clone(),
+            hub.clone(),
+            hub.clone(),
+        ));
+        let actor = QueueActor {
+            device_id: "synthetic-device".into(),
+            device_name: "Synthetic".into(),
+        };
+        let key = TargetKey {
+            session_id: session.into(),
+        };
+        svc.enqueue(EnqueueCommand {
+            request_id: "B".into(),
+            actor: actor.clone(),
+            session_id: session.into(),
+            workspace_path: tmp.path().to_string_lossy().into_owned(),
+            workspace_identity: None,
+            draft: QueueDraft {
+                text: "synthetic".into(),
+                attachments: vec![QueuedAttachment {
+                    name: "sample.txt".into(),
+                    path: path.to_string_lossy().into_owned(),
+                    is_image: false,
+                }],
+            },
+            prepared: super::super::command::PreparedSend::from_stored(
+                "synthetic attachment".into(),
+            )
+            .unwrap(),
+            edited_from: None,
+        })
+        .await
+        .unwrap();
+        let gate = Arc::new(Notify::new());
+        *fake.bind_gate.lock().unwrap() = Some(gate.clone());
+        let at = fake.bind_calls.load(Ordering::SeqCst) + 3;
+        fake.bind_gate_at.store(at, Ordering::SeqCst);
+        let worker = svc.clone();
+        let worker_key = key.clone();
+        let task = tokio::spawn(async move { worker.flush_one(&worker_key).await });
+        wait_until(|| fake.bind_calls.load(Ordering::SeqCst) >= at).await;
+        assert_eq!(
+            store.view(&actor, &key).unwrap().items[0].state,
+            QueueItemState::Dispatching
+        );
+        std::fs::remove_file(path).unwrap();
+        gate.notify_one();
+        task.await.unwrap().unwrap();
+        assert!(fake.prepared_texts.lock().unwrap().is_empty());
+        let view = store.view(&actor, &key).unwrap();
+        assert_eq!(view.items[0].state, QueueItemState::Queued);
+        assert!(!view.auto_drain);
+    }
+    #[tokio::test]
+    async fn deleted_attachment_during_stop_binding_never_reaches_stop_sender() {
+        use crate::services::zcode_control::local_queue::{
+            host::QueueHostPort,
+            store::SqlLocalQueueStore,
+            types::{EnqueueCommand, PriorityCommand, QueueActor, QueueDraft, QueuedAttachment},
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let session = "sess_synthetic0000";
+        let dir = crate::remote::attachments::attachment_dir(tmp.path(), session);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("sample.txt");
+        std::fs::write(&path, b"synthetic").unwrap();
+        let fake = Arc::new(FakeBackend::default());
+        fake.queue_ready.store(true, Ordering::SeqCst);
+        *fake.bound_path_override.lock().unwrap() = Some(tmp.path().to_string_lossy().into_owned());
+        let hub = Arc::new(ZcodeHub::with_parts(
+            stored(URL),
+            fake.clone(),
+            policy_with(&["interrupt"]),
+        ));
+        hub.authorize(OAuthProvider::Bigmodel, noop_open())
+            .await
+            .unwrap();
+        hub.connect().await.unwrap();
+        enable_queue_test_device(&hub);
+        let key = TargetKey {
+            session_id: session.into(),
+        };
+        let bound = QueueHostPort::read(hub.as_ref(), &key, Duration::ZERO)
+            .await
+            .unwrap();
+        let store = SqlLocalQueueStore::new(hub.store.clone());
+        let actor = QueueActor {
+            device_id: "synthetic-device".into(),
+            device_name: "Synthetic".into(),
+        };
+        let item = store
+            .enqueue(
+                &EnqueueCommand {
+                    request_id: "B".into(),
+                    actor: actor.clone(),
+                    session_id: session.into(),
+                    workspace_path: tmp.path().to_string_lossy().into_owned(),
+                    workspace_identity: None,
+                    draft: QueueDraft {
+                        text: "synthetic".into(),
+                        attachments: vec![QueuedAttachment {
+                            name: "sample.txt".into(),
+                            path: path.to_string_lossy().into_owned(),
+                            is_image: false,
+                        }],
+                    },
+                    prepared: super::super::command::PreparedSend::from_stored("synthetic".into())
+                        .unwrap(),
+                    edited_from: None,
+                },
+                1,
+            )
+            .unwrap();
+        let cmd = PriorityCommand {
+            request_id: "priority".into(),
+            item_id: item.item_id,
+            expected_version: item.item_version,
+            confirm_stop: true,
+            expected_execution_id: Some("A".into()),
+            held_queue: None,
+        };
+        let claim = store.begin_priority(&actor, &cmd, 2).unwrap();
+        assert!(store
+            .mark_stop_claimed(&actor, &cmd.request_id, bound.target.generation, "A")
+            .unwrap());
+        let gate = Arc::new(Notify::new());
+        *fake.bind_gate.lock().unwrap() = Some(gate.clone());
+        let baseline = fake.bind_calls.load(Ordering::SeqCst);
+        let target = bound.target;
+        let worker = hub.clone();
+        let ctx = ActionContext {
+            action_id: claim.stop_action_id,
+            device_id: actor.device_id,
+            device_name: actor.device_name,
+        };
+        let task =
+            tokio::spawn(
+                async move { QueueHostPort::stop(worker.as_ref(), &ctx, &target, "A").await },
+            );
+        wait_until(|| fake.bind_calls.load(Ordering::SeqCst) > baseline).await;
+        std::fs::remove_file(path).unwrap();
+        gate.notify_one();
+        assert!(task.await.unwrap().is_err());
+        assert_eq!(fake.execute_calls.load(Ordering::SeqCst), 0);
+    }
+    #[tokio::test]
     async fn queue_host_shutdown_during_bind_never_dispatches() {
         use crate::services::zcode_control::local_queue::host::QueueHostPort;
         let fake = Arc::new(FakeBackend::default());
@@ -4607,6 +5033,7 @@ mod tests {
                 .is_err()
         );
         assert!(fake.prepared_texts.lock().unwrap().is_empty());
+        hub.store.with(|c| c.execute("INSERT INTO zcode_send_queue(request_id,item_id,payload_hash,device_id,session_id,device_name,workspace_path,prepared,receipt_queue_version,receipt_position,draft,state,dispatch_action_id) VALUES ('synthetic-request','synthetic-item','hash','synthetic-device','sess_synthetic0000','Synthetic','/synthetic/workspace','frozen',1,1,?1,'dispatching','ok')", [r#"{"text":"synthetic","attachments":[]}"#]).unwrap());
         QueueHostPort::send_prepared(hub.as_ref(), &ctx("ok"), &bound.target, &body, None)
             .await
             .unwrap();
@@ -4774,6 +5201,7 @@ mod tests {
         bind_gate_at: AtomicUsize,
         queue_ready: AtomicBool,
         bound_path_changed: AtomicBool,
+        bound_path_override: Mutex<Option<String>>,
         execute_calls: AtomicUsize,
         prepared_texts: Mutex<Vec<String>>,
         /// 在途 connect 的闸（迟到结果测试用）。
@@ -5036,15 +5464,19 @@ mod tests {
                     gate.notified().await;
                 }
                 let path = if self.bound_path_changed.load(Ordering::SeqCst) {
-                    "/synthetic/changed"
+                    "/synthetic/changed".to_string()
                 } else {
-                    "/synthetic/workspace"
+                    self.bound_path_override
+                        .lock()
+                        .unwrap()
+                        .clone()
+                        .unwrap_or_else(|| "/synthetic/workspace".into())
                 };
                 Ok(BoundTarget {
                     session_id,
-                    workspace_path: path.into(),
+                    workspace_path: path.clone(),
                     workspace_identity: None,
-                    workspace_key: path.into(),
+                    workspace_key: path,
                     generation,
                     bridge_generation: None,
                 })
@@ -5110,6 +5542,19 @@ mod tests {
                     reason_code: None,
                     send_admission: None,
                 })
+            })
+        }
+
+        fn execute_stop_staged<'a>(
+            &'a self,
+            ctx: &'a ActionContext,
+            target: &'a BoundTarget,
+            action: &'a ControlAction,
+        ) -> BoxFuture<'a, super::super::command::PreparedResult<ActionReceipt>> {
+            Box::pin(async move {
+                self.execute(ctx, target, action)
+                    .await
+                    .map_err(super::super::command::PreparedDispatchError::MayHaveWritten)
             })
         }
 
@@ -6351,7 +6796,7 @@ mod tests {
                 ControlEventKind::Session => {
                     assert_eq!(event.data["ready"], false, "旧投影只能降级广播")
                 }
-                ControlEventKind::Action => {}
+                ControlEventKind::Action | ControlEventKind::LocalQueue => {}
             }
         }
 

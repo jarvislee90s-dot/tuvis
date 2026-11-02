@@ -13,6 +13,7 @@ pub(crate) struct BoundQueueSession {
     pub view: SessionView,
 }
 pub(crate) trait QueueHostPort: Send + Sync {
+    fn publish_queue_change(&self, _session_id: &str) {}
     fn session_lock(&self, key: &TargetKey) -> Arc<Mutex<()>>;
     fn activation_epoch(&self) -> Option<u64> {
         None
@@ -56,7 +57,7 @@ pub(crate) trait QueueHostPort: Send + Sync {
         ctx: &'a ActionContext,
         target: &'a BoundTarget,
         execution_id: &'a str,
-    ) -> BoxFuture<'a, ZResult<ActionReceipt>>;
+    ) -> BoxFuture<'a, PreparedResult<ActionReceipt>>;
     fn receipt<'a>(
         &'a self,
         action_id: &'a str,
@@ -65,6 +66,9 @@ pub(crate) trait QueueHostPort: Send + Sync {
 }
 
 impl QueueHostPort for super::super::hub::ZcodeHub {
+    fn publish_queue_change(&self, session_id: &str) {
+        self.queue_publish_change(session_id);
+    }
     fn activation_epoch(&self) -> Option<u64> {
         self.queue_bridge_epoch()
     }
@@ -125,7 +129,7 @@ impl QueueHostPort for super::super::hub::ZcodeHub {
         ctx: &'a ActionContext,
         target: &'a BoundTarget,
         execution_id: &'a str,
-    ) -> BoxFuture<'a, ZResult<ActionReceipt>> {
+    ) -> BoxFuture<'a, PreparedResult<ActionReceipt>> {
         Box::pin(async move { self.queue_stop(ctx, target, execution_id).await })
     }
     fn receipt<'a>(

@@ -264,6 +264,9 @@ async fn send_info_advertises_official_control_without_connected() {
 /// （"403 先于 hub 调用"与"workspacePath 不参与绑定"的证据面）。
 #[derive(Default)]
 struct FakeHubBackend {
+    workspace: Mutex<Option<String>>,
+    busy: AtomicBool,
+    session_calls: AtomicUsize,
     connect_calls: AtomicUsize,
     /// T8 抢回观察：`disconnect` 被调次数（quiesce 两段语义与 hub 单测同口径）。
     disconnect_calls: AtomicUsize,
@@ -369,12 +372,18 @@ impl HubBackend for FakeHubBackend {
     ) -> futures::future::BoxFuture<'a, ZResult<BoundTarget>> {
         self.bind_calls.lock().unwrap().push(key.clone());
         let session_id = key.session_id.clone();
+        let workspace = self
+            .workspace
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| "/synthetic/workspace".into());
         Box::pin(async move {
             Ok(BoundTarget {
                 session_id,
-                workspace_path: "/synthetic/workspace".into(),
+                workspace_path: workspace.clone(),
                 workspace_identity: None,
-                workspace_key: "/synthetic/workspace".into(),
+                workspace_key: workspace,
                 generation: 1,
                 bridge_generation: None,
             })
@@ -385,16 +394,39 @@ impl HubBackend for FakeHubBackend {
         &'a self,
         target: &'a BoundTarget,
     ) -> futures::future::BoxFuture<'a, ZResult<SessionView>> {
+        self.session_calls.fetch_add(1, Ordering::SeqCst);
         let view = SessionView {
             session_id: target.session_id.clone(),
             generation: target.generation,
             revision: Some(1),
             ready: true,
             pending: Vec::new(),
-            control: None,
+            control: if self.busy.load(Ordering::SeqCst) {
+                Some(
+                    multi_agents_manager_lib::services::zcode_control::ControlView {
+                        active_works: vec![
+                            multi_agents_manager_lib::services::zcode_control::ActiveWork {
+                                kind: "primaryTurn".into(),
+                                foreground_execution_id: Some("synthetic-running".into()),
+                                source_command_id: None,
+                            },
+                        ],
+                    },
+                )
+            } else {
+                None
+            },
             selection: None,
             capabilities: CapabilityView::default(),
-            queue: QueueView::default(),
+            queue: if self.busy.load(Ordering::SeqCst) {
+                QueueView {
+                    known: true,
+                    paused: Some(false),
+                    ..QueueView::default()
+                }
+            } else {
+                QueueView::default()
+            },
             execution_terminal: None,
             input_routing: None,
         };
@@ -503,6 +535,27 @@ fn send_body(action_id: &str, generation: u64) -> serde_json::Value {
     })
 }
 
+#[tokio::test]
+async fn legacy_stop_requires_durable_queue_endpoint() {
+    let conn = shared_conn();
+    seed_device(&conn);
+    let injector = Arc::new(RecordingInjector::default());
+    let backend = Arc::new(FakeHubBackend::default());
+    let hub = paired_hub(&conn, backend.clone()).await;
+    let generation = hub.connection().generation;
+    let st = state(&conn, injector.clone());
+    st.set_zcode_hub(hub);
+    let body = serde_json::json!({"actionId":"synthetic-stop", "action":{
+        "kind":"stop", "sessionId":ZCODE_SESSION, "generation":generation,
+        "expectedForegroundExecutionId":"synthetic-execution"
+    }});
+    let response = router(st).oneshot(action_req(&body, true)).await.unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
+    assert_eq!(body_json(response).await["error"], "queue_refresh_required");
+    assert_eq!(backend.execute_calls(), 0);
+    assert_eq!(injector.calls(), 0);
+}
+
 fn get_req_without_cookie(uri: &str) -> axum::http::Request<axum::body::Body> {
     axum::http::Request::builder()
         .method("GET")
@@ -532,6 +585,7 @@ async fn unpaired_zcode_endpoints_return_403() {
     for route in [
         "/m/api/v1/zcode/connection".to_string(),
         format!("/m/api/v1/zcode/session?sessionId={ZCODE_SESSION}"),
+        format!("/m/api/v1/zcode/local-queue?sessionId={ZCODE_SESSION}"),
         format!("{EVENTS_ROUTE}?sessionId={ZCODE_SESSION}"),
     ] {
         let resp = app
@@ -556,6 +610,842 @@ async fn unpaired_zcode_endpoints_return_403() {
     assert_eq!(backend.connect_calls(), 1, "未配对请求不得新增连接");
     assert_eq!(backend.disconnect_calls(), 0, "未配对请求不得触发断开");
     assert_eq!(injector.calls(), 0, "零终端注入");
+}
+
+#[tokio::test]
+async fn paired_local_queue_without_service_reports_not_ready() {
+    let conn = shared_conn();
+    seed_device(&conn);
+    let injector = Arc::new(RecordingInjector::default());
+    let app = router(state(&conn, injector.clone()));
+    let response = app
+        .oneshot(get_req(&format!(
+            "/m/api/v1/zcode/local-queue?sessionId={ZCODE_SESSION}"
+        )))
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        axum::http::StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert_eq!(injector.calls(), 0);
+}
+
+#[tokio::test]
+async fn local_queue_rejects_invisible_session_before_service_lookup() {
+    let conn = shared_conn();
+    seed_device(&conn);
+    let injector = Arc::new(RecordingInjector::default());
+    let app = router(state_with_hidden(
+        &conn,
+        injector.clone(),
+        vec![zcode_session()],
+        vec![ZCODE_SESSION.into()],
+    ));
+    let response = app
+        .oneshot(get_req(&format!(
+            "/m/api/v1/zcode/local-queue?sessionId={ZCODE_SESSION}"
+        )))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::NOT_FOUND);
+    assert_eq!(injector.calls(), 0);
+}
+
+#[tokio::test]
+async fn local_queue_enqueue_rejects_client_workspace() {
+    let conn = shared_conn();
+    seed_device(&conn);
+    let injector = Arc::new(RecordingInjector::default());
+    let app = router(state(&conn, injector.clone()));
+    let request = axum::http::Request::builder()
+        .method("POST")
+        .uri("/m/api/v1/zcode/local-queue/enqueue")
+        .header("cookie", COOKIE)
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(
+            serde_json::json!({
+                "requestId": "synthetic-request", "sessionId": ZCODE_SESSION,
+                "draft": {"text": "synthetic", "attachments": []},
+                "workspacePath": "/synthetic/untrusted"
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+    assert_eq!(injector.calls(), 0);
+}
+
+#[tokio::test]
+async fn local_queue_enqueue_rejects_extra_attachment_fields() {
+    let conn = shared_conn();
+    seed_device(&conn);
+    let injector = Arc::new(RecordingInjector::default());
+    let request = axum::http::Request::builder()
+        .method("POST")
+        .uri("/m/api/v1/zcode/local-queue/enqueue")
+        .header("cookie", COOKIE)
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(
+            serde_json::json!({
+                "requestId": "synthetic-request", "sessionId": ZCODE_SESSION,
+                "draft": {"text": "synthetic", "attachments": [{
+                    "name": "sample", "path": "/synthetic/sample", "isImage": false,
+                    "deviceId": "untrusted"
+                }]}
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let response = router(state(&conn, injector.clone()))
+        .oneshot(request)
+        .await
+        .unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+    assert_eq!(injector.calls(), 0);
+}
+
+#[tokio::test]
+async fn local_queue_enqueue_rejects_invisible_session() {
+    let conn = shared_conn();
+    seed_device(&conn);
+    let injector = Arc::new(RecordingInjector::default());
+    let st = state_with_hidden(
+        &conn,
+        injector.clone(),
+        vec![zcode_session()],
+        vec![ZCODE_SESSION.into()],
+    );
+    let request = axum::http::Request::builder()
+        .method("POST")
+        .uri("/m/api/v1/zcode/local-queue/enqueue")
+        .header("cookie", COOKIE)
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(
+            serde_json::json!({
+                "requestId": "synthetic-request", "sessionId": ZCODE_SESSION,
+                "draft": {"text": "synthetic", "attachments": []}
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let response = router(st).oneshot(request).await.unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::NOT_FOUND);
+    assert_eq!(injector.calls(), 0);
+}
+
+#[tokio::test]
+async fn local_queue_prioritize_rejects_extra_text() {
+    let conn = shared_conn();
+    seed_device(&conn);
+    let injector = Arc::new(RecordingInjector::default());
+    let request = axum::http::Request::builder()
+        .method("POST")
+        .uri("/m/api/v1/zcode/local-queue/prioritize")
+        .header("cookie", COOKIE)
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(
+            serde_json::json!({
+                "requestId":"synthetic-priority", "itemId":"synthetic-item", "expectedVersion":1,
+                "confirmStop":true, "expectedExecutionId":"synthetic-execution", "text":"untrusted"
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let response = router(state(&conn, injector.clone()))
+        .oneshot(request)
+        .await
+        .unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+    assert_eq!(injector.calls(), 0);
+}
+
+#[cfg(feature = "zcode-bridge-evidence")]
+#[tokio::test]
+async fn queue_edit_snapshot_preserves_attachment_and_rejects_outside_path() {
+    let conn = shared_conn();
+    seed_device(&conn);
+    let tmp = tempfile::tempdir().unwrap();
+    let dir =
+        multi_agents_manager_lib::remote::attachments::attachment_dir(tmp.path(), ZCODE_SESSION);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("sample.txt");
+    std::fs::write(&path, b"synthetic").unwrap();
+    let outside = tmp.path().join("outside.txt");
+    std::fs::write(&outside, b"synthetic").unwrap();
+    let injector = Arc::new(RecordingInjector::default());
+    let backend = Arc::new(FakeHubBackend::default());
+    *backend.workspace.lock().unwrap() = Some(tmp.path().to_string_lossy().into_owned());
+    let hub = paired_hub(&conn, backend.clone()).await;
+    let _queue = hub.evidence_install_queue().await;
+    let mut session = zcode_session();
+    session.project_path = tmp.path().to_string_lossy().into_owned();
+    let st = state_with_sessions(&conn, injector.clone(), vec![session]);
+    st.set_zcode_hub(hub);
+    let app = router(st);
+    let enqueue = |request_id: &str, file: &std::path::Path| {
+        axum::http::Request::builder().method("POST")
+        .uri("/m/api/v1/zcode/local-queue/enqueue").header("cookie", COOKIE)
+        .header("content-type", "application/json").body(axum::body::Body::from(serde_json::json!({
+            "requestId":request_id, "sessionId":ZCODE_SESSION,
+            "draft":{"text":"synthetic", "attachments":[{"name":"sample.txt", "path":file.to_string_lossy(), "isImage":false}]}
+        }).to_string())).unwrap()
+    };
+    let invalid = app
+        .clone()
+        .oneshot(enqueue("outside", &outside))
+        .await
+        .unwrap();
+    assert_eq!(invalid.status(), axum::http::StatusCode::BAD_REQUEST);
+    let accepted = app
+        .clone()
+        .oneshot(enqueue("with-file", &path))
+        .await
+        .unwrap();
+    assert_eq!(accepted.status(), axum::http::StatusCode::OK);
+    let item = body_json(accepted).await;
+    let edit = axum::http::Request::builder().method("POST").uri("/m/api/v1/zcode/local-queue/edit")
+        .header("cookie", COOKIE).header("content-type", "application/json")
+        .body(axum::body::Body::from(serde_json::json!({"requestId":"file-edit", "itemId":item["itemId"], "expectedVersion":1}).to_string())).unwrap();
+    let response = app.clone().oneshot(edit).await.unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let snapshot = app
+        .oneshot(get_req(
+            "/m/api/v1/zcode/local-queue/edits?requestId=file-edit",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(snapshot.status(), axum::http::StatusCode::OK);
+    assert_eq!(
+        body_json(snapshot).await["draft"]["attachments"],
+        serde_json::json!([{"name":"sample.txt", "path":path.to_string_lossy(), "isImage":false}])
+    );
+    assert_eq!(backend.execute_calls(), 0);
+    assert_eq!(injector.calls(), 0);
+}
+
+#[cfg(feature = "zcode-bridge-evidence")]
+#[tokio::test]
+async fn local_queue_running_host_persists_without_sending() {
+    let conn = shared_conn();
+    seed_device(&conn);
+    conn.lock()
+        .unwrap()
+        .execute(
+            "INSERT OR REPLACE INTO settings(key,value) VALUES('remote.enabled','true')",
+            [],
+        )
+        .unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let injector = Arc::new(RecordingInjector::default());
+    let backend = Arc::new(FakeHubBackend::default());
+    backend.busy.store(true, Ordering::SeqCst);
+    *backend.workspace.lock().unwrap() = Some(tmp.path().to_string_lossy().into_owned());
+    let hub = paired_hub_open(&conn, backend.clone()).await;
+    let _queue = hub.evidence_start_queue().await;
+    let observed = hub
+        .session(&TargetKey {
+            session_id: ZCODE_SESSION.into(),
+        })
+        .await
+        .unwrap();
+    assert!(
+        observed.capabilities.send.enabled,
+        "假宿主须具备发送资格才能验证忙态门控"
+    );
+    assert_eq!(observed.control.as_ref().unwrap().active_works.len(), 1);
+    assert!(observed.queue.known && observed.queue.paused == Some(false));
+    let mut session = zcode_session();
+    session.project_path = tmp.path().to_string_lossy().into_owned();
+    let st = state_with_sessions(&conn, injector.clone(), vec![session]);
+    st.set_zcode_hub(hub.clone());
+    let app = router(st);
+    for text in ["B", "C"] {
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/m/api/v1/zcode/local-queue/enqueue")
+            .header("cookie", COOKIE)
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(
+                serde_json::json!({
+                    "requestId":format!("busy-{text}"), "sessionId":ZCODE_SESSION,
+                    "draft":{"text":text,"attachments":[]}
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(request).await.unwrap().status(),
+            axum::http::StatusCode::OK
+        );
+    }
+    let before = backend.session_calls.load(Ordering::SeqCst);
+    let mut events = hub.subscribe();
+    hub.evidence_notify_queue(ZCODE_SESSION);
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while backend.session_calls.load(Ordering::SeqCst) <= before {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("worker 必须观察忙态");
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        let mut queue_events = 0;
+        while queue_events < 2 {
+            if events.recv().await.unwrap().kind == ControlEventKind::LocalQueue {
+                queue_events += 1;
+            }
+        }
+    })
+    .await
+    .expect("worker 必须完成一次忙态检查");
+    let view = app
+        .oneshot(get_req(&format!(
+            "/m/api/v1/zcode/local-queue?sessionId={ZCODE_SESSION}"
+        )))
+        .await
+        .unwrap();
+    let view = body_json(view).await;
+    assert_eq!(view["items"].as_array().unwrap().len(), 2);
+    assert!(view["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|item| item["state"] == "queued"));
+    assert_eq!(view["autoDrain"], true);
+    assert!(view["pauseReason"].is_null());
+    assert_eq!(backend.execute_calls(), 0);
+    assert_eq!(injector.calls(), 0);
+}
+
+#[cfg(feature = "zcode-bridge-evidence")]
+#[tokio::test]
+async fn queue_sse_observes_service_installed_after_subscribe() {
+    let conn = shared_conn();
+    seed_device(&conn);
+    let tmp = tempfile::tempdir().unwrap();
+    let injector = Arc::new(RecordingInjector::default());
+    let backend = Arc::new(FakeHubBackend::default());
+    *backend.workspace.lock().unwrap() = Some(tmp.path().to_string_lossy().into_owned());
+    let hub = paired_hub(&conn, backend).await;
+    let mut session = zcode_session();
+    session.project_path = tmp.path().to_string_lossy().into_owned();
+    let st = state_with_sessions(&conn, injector, vec![session]);
+    st.set_zcode_hub(hub.clone());
+    let app = router(st);
+    let response = app.clone().oneshot(sse_req(ZCODE_SESSION)).await.unwrap();
+    let mut stream = response.into_body().into_data_stream();
+    let _ = next_frame(&mut stream).await.unwrap();
+    let _queue = hub.evidence_install_queue().await;
+    let request = axum::http::Request::builder()
+        .method("POST")
+        .uri("/m/api/v1/zcode/local-queue/enqueue")
+        .header("cookie", COOKIE)
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(
+            serde_json::json!({
+                "requestId":"late-service", "sessionId":ZCODE_SESSION,
+                "draft":{"text":"synthetic late","attachments":[]}
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    assert_eq!(
+        app.oneshot(request).await.unwrap().status(),
+        axum::http::StatusCode::OK
+    );
+    let frame = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let frame = next_frame(&mut stream).await.unwrap();
+            if frame.starts_with("event: local_queue\n") {
+                break frame;
+            }
+        }
+    })
+    .await
+    .expect("队列服务装配后应收到事件");
+    assert!(frame.contains("synthetic late"));
+}
+
+#[cfg(feature = "zcode-bridge-evidence")]
+#[tokio::test]
+async fn local_queue_enqueue_is_visible_without_worker_or_upstream_write() {
+    let conn = shared_conn();
+    seed_device(&conn);
+    DeviceStore::Owned(conn.clone()).with(|c| {
+        persist_device(
+            c,
+            &NewDevice {
+                id: "dev-z2".into(),
+                name: "Other".into(),
+                ua: "synthetic".into(),
+                origin_ip: "127.0.0.1#z2".into(),
+                via: "lan".into(),
+                paired_at: chrono::Utc::now().timestamp_millis(),
+            },
+        )
+        .unwrap()
+    });
+    let tmp = tempfile::tempdir().unwrap();
+    let injector = Arc::new(RecordingInjector::default());
+    let backend = Arc::new(FakeHubBackend::default());
+    *backend.workspace.lock().unwrap() = Some(tmp.path().to_string_lossy().into_owned());
+    let hub = paired_hub(&conn, backend.clone()).await;
+    let _queue = hub.evidence_install_queue().await;
+    let mut hub_events = hub.subscribe();
+    let mut session = zcode_session();
+    session.project_path = tmp.path().to_string_lossy().into_owned();
+    let st = state_with_sessions(&conn, injector.clone(), vec![session]);
+    st.set_zcode_hub(hub);
+    let app = router(st);
+    let unpaired = axum::http::Request::builder()
+        .method("POST")
+        .uri("/m/api/v1/zcode/local-queue/enqueue")
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(
+            serde_json::json!({
+                "requestId":"unpaired", "sessionId":ZCODE_SESSION,
+                "draft":{"text":"synthetic","attachments":[]}
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let binds_before = backend.bind_calls().len();
+    assert_eq!(
+        app.clone().oneshot(unpaired).await.unwrap().status(),
+        axum::http::StatusCode::FORBIDDEN
+    );
+    assert_eq!(backend.bind_calls().len(), binds_before);
+    assert_eq!(
+        conn.lock()
+            .unwrap()
+            .query_row("SELECT count(*) FROM zcode_send_queue", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    let request = axum::http::Request::builder()
+        .method("POST")
+        .uri("/m/api/v1/zcode/local-queue/enqueue")
+        .header("cookie", COOKIE)
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(
+            serde_json::json!({
+                "requestId":"synthetic-enqueue", "sessionId":ZCODE_SESSION,
+                "draft":{"text":"synthetic message","attachments":[]}
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let mut saw_queue_event = false;
+    while let Ok(event) = hub_events.try_recv() {
+        if event.kind == ControlEventKind::LocalQueue {
+            saw_queue_event = true;
+        }
+    }
+    assert!(saw_queue_event, "队列变更必须进入同一 Hub 事件总线");
+    let item = body_json(response).await;
+    let item_id = item["itemId"].as_str().unwrap().to_owned();
+    conn.lock()
+        .unwrap()
+        .execute(
+            "INSERT OR REPLACE INTO settings(key,value) VALUES('remote_message_signature','on')",
+            [],
+        )
+        .unwrap();
+    let replay = axum::http::Request::builder()
+        .method("POST")
+        .uri("/m/api/v1/zcode/local-queue/enqueue")
+        .header("cookie", COOKIE)
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(
+            serde_json::json!({
+                "requestId":"synthetic-enqueue", "sessionId":ZCODE_SESSION,
+                "draft":{"text":"synthetic message","attachments":[]}
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let replay = app.clone().oneshot(replay).await.unwrap();
+    assert_eq!(replay.status(), axum::http::StatusCode::OK);
+    assert_eq!(body_json(replay).await["itemId"], item_id);
+    let persisted: String = conn
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT prepared FROM zcode_send_queue WHERE request_id='synthetic-enqueue'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(persisted, "synthetic message");
+    let conflict = axum::http::Request::builder()
+        .method("POST")
+        .uri("/m/api/v1/zcode/local-queue/enqueue")
+        .header("cookie", COOKIE)
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(
+            serde_json::json!({
+                "requestId":"synthetic-enqueue", "sessionId":ZCODE_SESSION,
+                "draft":{"text":"different","attachments":[]}
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(conflict).await.unwrap().status(),
+        axum::http::StatusCode::BAD_REQUEST
+    );
+    let foreign_priority = axum::http::Request::builder()
+        .method("POST")
+        .uri("/m/api/v1/zcode/local-queue/prioritize")
+        .header("cookie", "mam_device=dev-z2")
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(
+            serde_json::json!({
+                "requestId":"foreign-priority", "itemId":item_id, "expectedVersion":1,
+                "confirmStop":false, "expectedExecutionId":null
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    assert_eq!(
+        app.clone()
+            .oneshot(foreign_priority)
+            .await
+            .unwrap()
+            .status(),
+        axum::http::StatusCode::NOT_FOUND
+    );
+    let view = app
+        .clone()
+        .oneshot(get_req(&format!(
+            "/m/api/v1/zcode/local-queue?sessionId={ZCODE_SESSION}"
+        )))
+        .await
+        .unwrap();
+    assert_eq!(body_json(view).await["items"].as_array().unwrap().len(), 1);
+    let sse = app.clone().oneshot(sse_req(ZCODE_SESSION)).await.unwrap();
+    let mut stream = sse.into_body().into_data_stream();
+    let frame = next_frame(&mut stream).await.unwrap();
+    assert!(frame.contains("\"localQueue\""));
+    assert!(frame.contains("synthetic message"));
+    let foreign_sse = axum::http::Request::builder()
+        .method("GET")
+        .uri(format!("/m/api/v1/zcode/events?sessionId={ZCODE_SESSION}"))
+        .header("cookie", "mam_device=dev-z2")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let foreign_sse = app.clone().oneshot(foreign_sse).await.unwrap();
+    let mut foreign_stream = foreign_sse.into_body().into_data_stream();
+    let foreign_snapshot = next_frame(&mut foreign_stream).await.unwrap();
+    assert!(!foreign_snapshot.contains("synthetic message"));
+    let resume = axum::http::Request::builder()
+        .method("POST")
+        .uri("/m/api/v1/zcode/local-queue/resume")
+        .header("cookie", COOKIE)
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(
+            serde_json::json!({
+                "requestId":"synthetic-resume", "sessionId":ZCODE_SESSION,
+                "expectedQueueVersion": item["queueVersion"]
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(resume).await.unwrap().status(),
+        axum::http::StatusCode::OK
+    );
+    conn.lock()
+        .unwrap()
+        .execute_batch("ALTER TABLE zcode_send_queue RENAME TO synthetic_hidden_queue")
+        .unwrap();
+    let failed_read = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let frame = next_frame(&mut stream).await.unwrap();
+            if frame.starts_with("event: resync\n") {
+                break frame;
+            }
+        }
+    })
+    .await
+    .expect("队列读取失败必须要求重拉");
+    assert!(failed_read.contains("queue_read_failed"));
+    conn.lock()
+        .unwrap()
+        .execute_batch("ALTER TABLE synthetic_hidden_queue RENAME TO zcode_send_queue")
+        .unwrap();
+    let stop = axum::http::Request::builder()
+        .method("POST")
+        .uri("/m/api/v1/zcode/local-queue/stop")
+        .header("cookie", COOKIE)
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(
+            serde_json::json!({
+                "requestId":"synthetic-stop-request", "sessionId":ZCODE_SESSION,
+                "expectedExecutionId":"synthetic-execution"
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let response = app.clone().oneshot(stop).await.unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
+    assert_eq!(body_json(response).await["error"], "not_ready");
+    let operation = app
+        .clone()
+        .oneshot(get_req(
+            "/m/api/v1/zcode/local-queue/operations?requestId=synthetic-stop-request",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(operation.status(), axum::http::StatusCode::OK);
+    assert_eq!(body_json(operation).await["state"], "failed");
+    conn.lock().unwrap().execute("UPDATE zcode_queue_operations SET operation_state='unknown',stop_claimed=1,stop_reviewed=0 WHERE request_id='synthetic-stop-request'", []).unwrap();
+    let recovery = app
+        .clone()
+        .oneshot(get_req(&format!(
+            "/m/api/v1/zcode/local-queue/recovery?sessionId={ZCODE_SESSION}"
+        )))
+        .await
+        .unwrap();
+    assert_eq!(recovery.status(), axum::http::StatusCode::OK);
+    assert_eq!(
+        body_json(recovery).await["manualStopRequestId"],
+        "synthetic-stop-request"
+    );
+    let foreign_review = axum::http::Request::builder()
+        .method("POST")
+        .uri("/m/api/v1/zcode/local-queue/recovery/ack")
+        .header("cookie", "mam_device=dev-z2")
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(
+            serde_json::json!({
+                "requestId":"foreign-review", "sessionId":ZCODE_SESSION,
+                "kind":"manual_stop", "subjectId":"synthetic-stop-request"
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(foreign_review).await.unwrap().status(),
+        axum::http::StatusCode::NOT_FOUND
+    );
+    let review = axum::http::Request::builder()
+        .method("POST")
+        .uri("/m/api/v1/zcode/local-queue/recovery/ack")
+        .header("cookie", COOKIE)
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(
+            serde_json::json!({
+                "requestId":"synthetic-review", "sessionId":ZCODE_SESSION,
+                "kind":"manual_stop", "subjectId":"synthetic-stop-request"
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let reviewed = app.clone().oneshot(review).await.unwrap();
+    assert_eq!(reviewed.status(), axum::http::StatusCode::OK);
+    let view = app
+        .clone()
+        .oneshot(get_req(&format!(
+            "/m/api/v1/zcode/local-queue?sessionId={ZCODE_SESSION}"
+        )))
+        .await
+        .unwrap();
+    assert_eq!(body_json(view).await["autoDrain"], false);
+    assert_eq!(backend.execute_calls(), 0);
+    let invalid = axum::http::Request::builder()
+        .method("POST")
+        .uri("/m/api/v1/zcode/local-queue/enqueue")
+        .header("cookie", COOKIE)
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(
+            serde_json::json!({
+                "requestId":"", "sessionId":ZCODE_SESSION,
+                "draft":{"text":"synthetic message","attachments":[]}
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(invalid).await.unwrap().status(),
+        axum::http::StatusCode::BAD_REQUEST
+    );
+    let edit = axum::http::Request::builder()
+        .method("POST")
+        .uri("/m/api/v1/zcode/local-queue/edit")
+        .header("cookie", COOKIE)
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(
+            serde_json::json!({
+                "requestId":"synthetic-edit", "itemId":item_id, "expectedVersion":1
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let response = app.clone().oneshot(edit).await.unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    assert_eq!(
+        body_json(response).await["draft"]["text"],
+        "synthetic message"
+    );
+    let event = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let frame = next_frame(&mut stream).await.expect("SSE 活跃");
+            if frame.starts_with("event: local_queue\n") {
+                break frame;
+            }
+        }
+    })
+    .await
+    .expect("编辑后应收到队列事件");
+    assert!(event.contains("synthetic-edit"));
+    let foreign_event = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let frame = next_frame(&mut foreign_stream).await.expect("SSE 活跃");
+            if frame.starts_with("event: local_queue\n") {
+                break frame;
+            }
+        }
+    })
+    .await
+    .expect("其他设备应收到过滤后的队列事件");
+    assert!(!foreign_event.contains("synthetic-edit"));
+    assert!(!foreign_event.contains("synthetic message"));
+    // 未消费的队列广播超过容量时，SSE 只要求客户端重拉，不重放写动作。
+    for n in 0..70 {
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/m/api/v1/zcode/local-queue/enqueue")
+            .header("cookie", COOKIE)
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(
+                serde_json::json!({
+                    "requestId":format!("lag-{n}"), "sessionId":ZCODE_SESSION,
+                    "draft":{"text":"synthetic","attachments":[]}
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(request).await.unwrap().status(),
+            axum::http::StatusCode::OK
+        );
+    }
+    let resync = next_frame(&mut stream).await.unwrap();
+    assert!(resync.starts_with("event: resync\n"), "{resync}");
+    let snapshot = app
+        .clone()
+        .oneshot(get_req(&format!(
+            "/m/api/v1/zcode/local-queue/edits?sessionId={ZCODE_SESSION}&requestId=synthetic-edit"
+        )))
+        .await
+        .unwrap();
+    assert_eq!(snapshot.status(), axum::http::StatusCode::OK);
+    assert_eq!(
+        body_json(snapshot).await["draft"]["text"],
+        "synthetic message"
+    );
+    let snapshot_by_request = app
+        .clone()
+        .oneshot(get_req(
+            "/m/api/v1/zcode/local-queue/edits?requestId=synthetic-edit",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(snapshot_by_request.status(), axum::http::StatusCode::OK);
+    assert_eq!(
+        body_json(snapshot_by_request).await["draft"]["text"],
+        "synthetic message"
+    );
+    let foreign = axum::http::Request::builder()
+        .method("GET")
+        .uri(format!(
+            "/m/api/v1/zcode/local-queue/edits?sessionId={ZCODE_SESSION}&requestId=synthetic-edit"
+        ))
+        .header("cookie", "mam_device=dev-z2")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(foreign).await.unwrap().status(),
+        axum::http::StatusCode::NOT_FOUND
+    );
+    let finish_body = serde_json::json!({"requestId":"synthetic-edit"}).to_string();
+    for _ in 0..2 {
+        let finish = axum::http::Request::builder()
+            .method("POST")
+            .uri("/m/api/v1/zcode/local-queue/edit/finish")
+            .header("cookie", COOKIE)
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(finish_body.clone()))
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(finish).await.unwrap().status(),
+            axum::http::StatusCode::OK
+        );
+    }
+    let removed = app
+        .clone()
+        .oneshot(get_req(&format!(
+            "/m/api/v1/zcode/local-queue/edits?sessionId={ZCODE_SESSION}&requestId=synthetic-edit"
+        )))
+        .await
+        .unwrap();
+    assert_eq!(removed.status(), axum::http::StatusCode::NOT_FOUND);
+    let replay_after_cleanup = axum::http::Request::builder()
+        .method("POST")
+        .uri("/m/api/v1/zcode/local-queue/enqueue")
+        .header("cookie", COOKIE)
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(
+            serde_json::json!({
+                "requestId":"synthetic-enqueue", "sessionId":ZCODE_SESSION,
+                "draft":{"text":"synthetic message","attachments":[]}
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let replay_after_cleanup = app.clone().oneshot(replay_after_cleanup).await.unwrap();
+    assert_eq!(replay_after_cleanup.status(), axum::http::StatusCode::OK);
+    assert_eq!(body_json(replay_after_cleanup).await["itemId"], item_id);
+    let second = axum::http::Request::builder()
+        .method("POST")
+        .uri("/m/api/v1/zcode/local-queue/enqueue")
+        .header("cookie", COOKIE)
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(
+            serde_json::json!({
+                "requestId":"synthetic-enqueue-2", "sessionId":ZCODE_SESSION,
+                "draft":{"text":"second","attachments":[]}
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let second = body_json(app.clone().oneshot(second).await.unwrap()).await;
+    let retract = axum::http::Request::builder()
+        .method("POST")
+        .uri("/m/api/v1/zcode/local-queue/retract")
+        .header("cookie", COOKIE)
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(
+            serde_json::json!({
+                "requestId":"synthetic-retract", "itemId":second["itemId"], "expectedVersion":1
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let response = app.oneshot(retract).await.unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    assert_eq!(
+        body_json(response).await["items"].as_array().unwrap().len(),
+        70
+    );
+    assert_eq!(backend.execute_calls(), 0);
+    assert_eq!(injector.calls(), 0);
 }
 
 /// 已配对连接视图：200 + no-store + camelCase 四字段，正文无任何凭据形态。

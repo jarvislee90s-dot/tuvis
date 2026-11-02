@@ -1343,6 +1343,95 @@ impl CommandSender {
     /// 同一目标并复核 session/generation/id → 预留 → 恰一帧 `type=stop`。
     /// 授权失败一律冻结码上抛（零帧零行）；**永不**先合成 `sendText`，无第二帧、
     /// 无重试、无 CLI 降级。
+    pub(crate) async fn execute_stop_staged(
+        &self,
+        ctx: &ActionContext,
+        target: &BoundTarget,
+        action: &ControlAction,
+    ) -> PreparedResult<ActionReceipt> {
+        self.check_action(ctx, target, action)?;
+        let ControlAction::Stop {
+            expected_foreground_execution_id,
+            ..
+        } = action
+        else {
+            return Err(invalid_action().into());
+        };
+        let Some(stop) = self.stop.as_ref() else {
+            // 未装配 stop 端口：不能证明既有执行在场，零帧零行。
+            return Err(ZcodeError::of(codes::NOT_READY).into());
+        };
+        // 幂等重放（同 actionId 同载荷）：只回既有回执，零新行、零帧、零重取 control。
+        if let Some(existing) = self.lookup_action(ctx, target, action)? {
+            return Ok(existing);
+        }
+        let request = StopRequest {
+            expected_foreground_execution_id: Some(expected_foreground_execution_id.clone()),
+        };
+        // 新鲜 control（精确目标，必要时由端口只读重同步）：拿不到**已确认**
+        // control（`activeWorks` 是数组）时最多等 [`INITIAL_CONTROL_TIMEOUT`]；
+        // 超时零帧零行。授权失败同样零帧零行。
+        let view = self.wait_for_stop_control(stop.as_ref(), target).await?;
+        authorize_stop_on(&view, target, &request)?;
+        // 写前立即复核同一目标的 control：按钮已过时（执行换了/空闲/换代）→ 零 stop。
+        // 复核读同样有界（端口自持预算，不做取消式超时）。
+        let confirm_view = stop.session(target, self.initial_control_timeout).await?;
+        let execution_id = authorize_stop_on(&confirm_view, target, &request)?;
+        // 确认基线只取写前复核视图的**已知** revision：没有水位就没有因果证据，
+        // 绝不把 0 当基线（否则后续任一 revision 都会被误当成「前进」）。
+        let baseline_revision = confirm_view.revision;
+        // 写即将发生：此时才预留（审计只记类别与计数，守卫 id 不进审计）。
+        match self.reserve_action(ctx, target, action)? {
+            None => {}
+            Some(existing) => return Ok(existing),
+        }
+        let envelope = serde_json::json!({
+            "commandId": new_command_id(), "clientId": PROTOCOL_CLIENT_ID,
+            "sessionId": target.session_id, "type": STOP_TYPE,
+            "payload": { "expectedForegroundExecutionId": execution_id }, "issuedAt": now_ms(),
+        });
+        let ack = self
+            .bridge
+            .call(
+                target,
+                AGENT_CHANNEL,
+                AGENT_SEND_COMMAND_METHOD,
+                vec![envelope],
+                self.ack_timeout,
+            )
+            .await
+            .map_err(PreparedDispatchError::MayHaveWritten)?;
+        let (state, reason_code) = classify_ack(&ack);
+        let mut receipt = self.make_receipt(ctx, target, state, reason_code);
+        if receipt.state == ActionState::Accepted {
+            // 已受理 ≠ 已停止：先落 accepted，再等宿主自己的停止终态（有界 10s）。
+            // 基线未知时**不做**确认观察，如实停在 accepted。
+            self.actions
+                .record_result(&receipt)
+                .map_err(PreparedDispatchError::MayHaveWritten)?;
+            if let Some(baseline_revision) = baseline_revision {
+                if stop
+                    .wait_stop_cleared(
+                        target,
+                        &execution_id,
+                        baseline_revision,
+                        self.confirm_timeout,
+                    )
+                    .await
+                {
+                    // 只有「control revision 前进 + 目标缺席」才是停止终态；新执行单独出现
+                    // 不算（端口保证），超时停在 accepted。
+                    receipt.state = ActionState::Confirmed;
+                    receipt.reason_code = None;
+                }
+            }
+        }
+        self.actions
+            .record_result(&receipt)
+            .map_err(PreparedDispatchError::MayHaveWritten)?;
+        Ok(receipt)
+    }
+
     async fn execute_stop(
         &self,
         ctx: &ActionContext,
@@ -4763,6 +4852,41 @@ mod tests {
                 )
                 .ok()
             })
+        }
+
+        #[tokio::test]
+        async fn stop_stage_transport_error_after_frame_is_uncertain() {
+            let store = DeviceStore::memory();
+            let fake = FakeBridge::new(Reply::Error(codes::NO_SESSION));
+            let stop = FakeStop::observed(&["E-existing"]);
+            let result = stop_sender(&fake, &stop, &store)
+                .execute_stop_staged(
+                    &ctx("stop-transport"),
+                    &target(),
+                    &stop_action("E-existing"),
+                )
+                .await;
+            assert!(matches!(
+                result,
+                Err(PreparedDispatchError::MayHaveWritten(_))
+            ));
+            assert_eq!(envelopes_of_type(&fake, "stop").len(), 1);
+            assert!(stored_state(&store, "stop-transport").is_some());
+        }
+
+        #[tokio::test]
+        async fn stop_stage_reports_postwrite_record_failure() {
+            let store = DeviceStore::memory();
+            let fake = FakeBridge::new(Reply::Body(accepted_body()));
+            let stop = FakeStop::observed(&["E-existing"]);
+            store.with(|c| c.execute_batch("CREATE TRIGGER synthetic_stop_fail BEFORE UPDATE ON zcode_actions BEGIN SELECT RAISE(ABORT,'synthetic'); END;").unwrap());
+            let result = stop_sender(&fake, &stop, &store)
+                .execute_stop_staged(&ctx("stop-stage"), &target(), &stop_action("E-existing"))
+                .await;
+            assert!(
+                matches!(result, Err(PreparedDispatchError::MayHaveWritten(error)) if error.is(codes::STORAGE_FAILED))
+            );
+            assert_eq!(envelopes_of_type(&fake, "stop").len(), 1);
         }
 
         /// 精确命中的请求返回**宿主观察到的原值**（不挑第一个、不改写）。

@@ -85,6 +85,759 @@ fn json_no_store(status: StatusCode, body: serde_json::Value) -> Response {
     (status, [(CACHE_CONTROL, "no-store")], Json(body)).into_response()
 }
 
+/// 只读取配对设备可见的本地待发队列，不建立连接。
+pub async fn local_queue(
+    State(st): State<Arc<RemoteState>>,
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    let Some(session_id) = params
+        .get("sessionId")
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+    else {
+        return json_no_store(
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({ "error": "bad_request" }),
+        );
+    };
+    if current_zcode_session(&st, session_id).await.is_none() {
+        return action_error(codes::NO_SESSION);
+    }
+    let Some(device_id) = super::gate::extract_device(&headers) else {
+        return StatusCode::FORBIDDEN.into_response();
+    };
+    let Some(queue) = st.zcode_hub().and_then(|hub| hub.queue_service()) else {
+        return json_no_store(
+            StatusCode::SERVICE_UNAVAILABLE,
+            serde_json::json!({ "error": codes::NOT_READY }),
+        );
+    };
+    let actor = crate::services::zcode_control::local_queue::types::QueueActor {
+        device_name: st
+            .store
+            .with(|conn| super::pairing::device_name(conn, &device_id)),
+        device_id,
+    };
+    match queue.store().view(
+        &actor,
+        &TargetKey {
+            session_id: session_id.to_owned(),
+        },
+    ) {
+        Ok(view) => ([(CACHE_CONTROL, "no-store")], Json(view)).into_response(),
+        Err(error) => action_error(&error.code),
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LocalEnqueueRequest {
+    request_id: String,
+    session_id: String,
+    draft: LocalEnqueueDraft,
+    edited_from: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LocalEnqueueDraft {
+    text: String,
+    attachments: Vec<LocalEnqueueAttachment>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LocalEnqueueAttachment {
+    name: String,
+    path: String,
+    is_image: bool,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LocalItemRequest {
+    request_id: String,
+    item_id: String,
+    expected_version: u64,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LocalPriorityRequest {
+    request_id: String,
+    item_id: String,
+    expected_version: u64,
+    confirm_stop: bool,
+    expected_execution_id: Option<String>,
+    held_queue: Option<serde_json::Value>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LocalResumeRequest {
+    request_id: String,
+    session_id: String,
+    expected_queue_version: u64,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LocalStopRequest {
+    request_id: String,
+    session_id: String,
+    expected_execution_id: String,
+}
+
+pub async fn local_queue_operation(
+    State(st): State<Arc<RemoteState>>,
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    let Some(request_id) = params
+        .get("requestId")
+        .filter(|s| !s.trim().is_empty() && s.len() <= 128)
+    else {
+        return action_error(codes::INVALID_ACTION);
+    };
+    let Some(actor) = queue_actor(&st, &headers) else {
+        return StatusCode::FORBIDDEN.into_response();
+    };
+    let Some(queue) = st.zcode_hub().and_then(|hub| hub.queue_service()) else {
+        return action_error(codes::NOT_READY);
+    };
+    let store = queue.store();
+    let key = match store.operation_key(&actor, request_id) {
+        Ok(key) => key,
+        Err(error) => return action_error(&error.code),
+    };
+    if current_zcode_session(&st, &key.session_id).await.is_none() {
+        return action_error(codes::NO_SESSION);
+    }
+    match store.operation(&actor, request_id) {
+        Ok(Some(operation)) => ([(CACHE_CONTROL, "no-store")], Json(operation)).into_response(),
+        Ok(None) => action_error(codes::NO_SESSION),
+        Err(error) => action_error(&error.code),
+    }
+}
+
+pub async fn local_queue_recovery(
+    State(st): State<Arc<RemoteState>>,
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    let Some(session_id) = params.get("sessionId").filter(|s| !s.trim().is_empty()) else {
+        return action_error(codes::INVALID_ACTION);
+    };
+    if current_zcode_session(&st, session_id).await.is_none() {
+        return action_error(codes::NO_SESSION);
+    }
+    let Some(actor) = queue_actor(&st, &headers) else {
+        return StatusCode::FORBIDDEN.into_response();
+    };
+    let Some(queue) = st.zcode_hub().and_then(|hub| hub.queue_service()) else {
+        return action_error(codes::NOT_READY);
+    };
+    let key = TargetKey {
+        session_id: session_id.clone(),
+    };
+    let store = queue.store();
+    let result = (|| -> crate::services::zcode_control::ZResult<serde_json::Value> {
+        let priority = queue
+            .pending_priority_recovery(&actor, &key)?
+            .into_iter()
+            .map(|p| serde_json::json!({"requestId":p.request_id,"itemId":p.item_id}))
+            .collect::<Vec<_>>();
+        Ok(serde_json::json!({
+            "priority": priority,
+            "manualStopRequestId": store.unreviewed_manual_stop(&actor, &key)?,
+            "dispatchActionId": store.unreviewed_dispatch_unknown(&actor, &key)?,
+            "unconfirmedActionId": store.unconfirmed_action(&actor, &key)?,
+        }))
+    })();
+    match result {
+        Ok(value) => json_no_store(StatusCode::OK, value),
+        Err(error) => action_error(&error.code),
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LocalRecoveryAck {
+    request_id: String,
+    session_id: String,
+    kind: String,
+    subject_id: String,
+}
+
+pub async fn local_queue_recovery_ack(
+    State(st): State<Arc<RemoteState>>,
+    headers: HeaderMap,
+    payload: Result<Json<serde_json::Value>, JsonRejection>,
+) -> Response {
+    let Ok(Json(value)) = payload else {
+        return action_error(codes::INVALID_ACTION);
+    };
+    let Ok(input) = serde_json::from_value::<LocalRecoveryAck>(value) else {
+        return action_error(codes::INVALID_ACTION);
+    };
+    if input.request_id.trim().is_empty()
+        || input.request_id.len() > 128
+        || input.subject_id.trim().is_empty()
+    {
+        return action_error(codes::INVALID_ACTION);
+    }
+    if current_zcode_session(&st, &input.session_id)
+        .await
+        .is_none()
+    {
+        return action_error(codes::NO_SESSION);
+    }
+    let Some(actor) = queue_actor(&st, &headers) else {
+        return StatusCode::FORBIDDEN.into_response();
+    };
+    let Some(queue) = st.zcode_hub().and_then(|hub| hub.queue_service()) else {
+        return action_error(codes::NOT_READY);
+    };
+    let key = TargetKey {
+        session_id: input.session_id,
+    };
+    let result = match input.kind.as_str() {
+        "priority_stop" => {
+            queue
+                .acknowledge_priority_unknown(&actor, &key, &input.subject_id)
+                .await
+        }
+        "manual_stop" => {
+            queue
+                .acknowledge_manual_stop_unknown(&actor, &key, &input.subject_id, &input.request_id)
+                .await
+        }
+        "dispatch" => {
+            queue
+                .acknowledge_dispatched_unknown(&actor, &key, &input.subject_id, &input.request_id)
+                .await
+        }
+        "unconfirmed" => {
+            queue
+                .acknowledge_unconfirmed(&actor, &key, &input.subject_id, &input.request_id)
+                .await
+        }
+        _ => return action_error(codes::INVALID_ACTION),
+    };
+    match result {
+        Ok(()) => {
+            queue.notify(&key);
+            json_no_store(StatusCode::OK, serde_json::json!({"ok":true}))
+        }
+        Err(error) => action_error(&error.code),
+    }
+}
+
+pub async fn local_queue_stop(
+    State(st): State<Arc<RemoteState>>,
+    headers: HeaderMap,
+    payload: Result<Json<serde_json::Value>, JsonRejection>,
+) -> Response {
+    let Ok(Json(value)) = payload else {
+        return action_error(codes::INVALID_ACTION);
+    };
+    let Ok(input) = serde_json::from_value::<LocalStopRequest>(value) else {
+        return action_error(codes::INVALID_ACTION);
+    };
+    if input.request_id.trim().is_empty()
+        || input.request_id.len() > 128
+        || input.expected_execution_id.trim().is_empty()
+    {
+        return action_error(codes::INVALID_ACTION);
+    }
+    if current_zcode_session(&st, &input.session_id)
+        .await
+        .is_none()
+    {
+        return action_error(codes::NO_SESSION);
+    }
+    let Some(actor) = queue_actor(&st, &headers) else {
+        return StatusCode::FORBIDDEN.into_response();
+    };
+    let Some(queue) = st.zcode_hub().and_then(|hub| hub.queue_service()) else {
+        return action_error(codes::NOT_READY);
+    };
+    if !matches!(
+        tokio::time::timeout(std::time::Duration::from_secs(2), queue.recovery_ready()).await,
+        Ok(true)
+    ) {
+        return action_error(codes::NOT_READY);
+    }
+    let key = TargetKey {
+        session_id: input.session_id,
+    };
+    match queue
+        .stop_current(
+            &actor,
+            &key,
+            &input.request_id,
+            &input.expected_execution_id,
+        )
+        .await
+    {
+        Ok(operation) => ([(CACHE_CONTROL, "no-store")], Json(operation)).into_response(),
+        Err(error) => action_error(&error.code),
+    }
+}
+
+pub async fn local_queue_resume(
+    State(st): State<Arc<RemoteState>>,
+    headers: HeaderMap,
+    payload: Result<Json<serde_json::Value>, JsonRejection>,
+) -> Response {
+    let Ok(Json(value)) = payload else {
+        return action_error(codes::INVALID_ACTION);
+    };
+    let Ok(input) = serde_json::from_value::<LocalResumeRequest>(value) else {
+        return action_error(codes::INVALID_ACTION);
+    };
+    if input.request_id.trim().is_empty() || input.request_id.len() > 128 {
+        return action_error(codes::INVALID_ACTION);
+    }
+    if current_zcode_session(&st, &input.session_id)
+        .await
+        .is_none()
+    {
+        return action_error(codes::NO_SESSION);
+    }
+    let Some(actor) = queue_actor(&st, &headers) else {
+        return StatusCode::FORBIDDEN.into_response();
+    };
+    let Some(queue) = st.zcode_hub().and_then(|hub| hub.queue_service()) else {
+        return action_error(codes::NOT_READY);
+    };
+    let key = TargetKey {
+        session_id: input.session_id,
+    };
+    match queue
+        .resume(
+            &actor,
+            &key,
+            &input.request_id,
+            input.expected_queue_version,
+        )
+        .await
+    {
+        Ok(view) => ([(CACHE_CONTROL, "no-store")], Json(view)).into_response(),
+        Err(error) => action_error(&error.code),
+    }
+}
+
+pub async fn local_queue_prioritize(
+    State(st): State<Arc<RemoteState>>,
+    headers: HeaderMap,
+    payload: Result<Json<serde_json::Value>, JsonRejection>,
+) -> Response {
+    let Ok(Json(value)) = payload else {
+        return action_error(codes::INVALID_ACTION);
+    };
+    let Ok(input) = serde_json::from_value::<LocalPriorityRequest>(value) else {
+        return action_error(codes::INVALID_ACTION);
+    };
+    if input.request_id.trim().is_empty()
+        || input.request_id.len() > 128
+        || input.item_id.trim().is_empty()
+    {
+        return action_error(codes::INVALID_ACTION);
+    }
+    let held_queue = match input.held_queue {
+        None => None,
+        Some(value) => {
+            let Some(object) = value.as_object() else {
+                return action_error(codes::INVALID_ACTION);
+            };
+            if object
+                .keys()
+                .any(|k| k != "disposition" && k != "expectedQueueItemIds")
+            {
+                return action_error(codes::INVALID_ACTION);
+            }
+            match serde_json::from_value(value) {
+                Ok(held) => Some(held),
+                Err(_) => return action_error(codes::INVALID_ACTION),
+            }
+        }
+    };
+    let Some(actor) = queue_actor(&st, &headers) else {
+        return StatusCode::FORBIDDEN.into_response();
+    };
+    let Some(queue) = st.zcode_hub().and_then(|hub| hub.queue_service()) else {
+        return action_error(codes::NOT_READY);
+    };
+    let key = match queue.store().item_key(&actor, &input.item_id) {
+        Ok(key) => key,
+        Err(error) => return action_error(&error.code),
+    };
+    if current_zcode_session(&st, &key.session_id).await.is_none() {
+        return action_error(codes::NO_SESSION);
+    }
+    let command = crate::services::zcode_control::local_queue::types::PriorityCommand {
+        request_id: input.request_id,
+        item_id: input.item_id,
+        expected_version: input.expected_version,
+        confirm_stop: input.confirm_stop,
+        expected_execution_id: input.expected_execution_id,
+        held_queue,
+    };
+    match queue.prioritize(&actor, command).await {
+        Ok(operation) => ([(CACHE_CONTROL, "no-store")], Json(operation)).into_response(),
+        Err(error) => action_error(&error.code),
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LocalSessionRequest {
+    request_id: String,
+    session_id: Option<String>,
+}
+
+pub async fn local_queue_finish_edit(
+    State(st): State<Arc<RemoteState>>,
+    headers: HeaderMap,
+    payload: Result<Json<serde_json::Value>, JsonRejection>,
+) -> Response {
+    let Ok(Json(value)) = payload else {
+        return action_error(codes::INVALID_ACTION);
+    };
+    let Ok(input) = serde_json::from_value::<LocalSessionRequest>(value) else {
+        return action_error(codes::INVALID_ACTION);
+    };
+    if input.request_id.trim().is_empty() || input.request_id.len() > 128 {
+        return action_error(codes::INVALID_ACTION);
+    }
+    let Some(actor) = queue_actor(&st, &headers) else {
+        return StatusCode::FORBIDDEN.into_response();
+    };
+    let Some(queue) = st.zcode_hub().and_then(|hub| hub.queue_service()) else {
+        return action_error(codes::NOT_READY);
+    };
+    let store = queue.store();
+    let key = match store.edit_request_key(&actor, &input.request_id) {
+        Ok(key)
+            if input
+                .session_id
+                .as_ref()
+                .is_none_or(|id| id == &key.session_id) =>
+        {
+            key
+        }
+        Ok(_) => return action_error(codes::NO_SESSION),
+        Err(error) => return action_error(&error.code),
+    };
+    if current_zcode_session(&st, &key.session_id).await.is_none() {
+        return action_error(codes::NO_SESSION);
+    }
+    match store.finish_edit(&actor, &input.request_id) {
+        Ok(()) => {
+            queue.notify(&key);
+            json_no_store(StatusCode::OK, serde_json::json!({"ok": true}))
+        }
+        Err(error) => action_error(&error.code),
+    }
+}
+
+fn queue_actor(
+    st: &RemoteState,
+    headers: &HeaderMap,
+) -> Option<crate::services::zcode_control::local_queue::types::QueueActor> {
+    let device_id = super::gate::extract_device(headers)?;
+    let device_name = st
+        .store
+        .with(|conn| super::pairing::device_name(conn, &device_id));
+    Some(
+        crate::services::zcode_control::local_queue::types::QueueActor {
+            device_id,
+            device_name,
+        },
+    )
+}
+
+pub async fn local_queue_edit(
+    State(st): State<Arc<RemoteState>>,
+    headers: HeaderMap,
+    payload: Result<Json<serde_json::Value>, JsonRejection>,
+) -> Response {
+    let Ok(Json(value)) = payload else {
+        return action_error(codes::INVALID_ACTION);
+    };
+    let Ok(input) = serde_json::from_value::<LocalItemRequest>(value) else {
+        return action_error(codes::INVALID_ACTION);
+    };
+    if input.request_id.trim().is_empty()
+        || input.request_id.len() > 128
+        || input.item_id.trim().is_empty()
+    {
+        return action_error(codes::INVALID_ACTION);
+    }
+    let Some(actor) = queue_actor(&st, &headers) else {
+        return StatusCode::FORBIDDEN.into_response();
+    };
+    let Some(queue) = st.zcode_hub().and_then(|hub| hub.queue_service()) else {
+        return action_error(codes::NOT_READY);
+    };
+    let store = queue.store();
+    let key = match store.item_key(&actor, &input.item_id) {
+        Ok(key) => key,
+        Err(error) => return action_error(&error.code),
+    };
+    if current_zcode_session(&st, &key.session_id).await.is_none() {
+        return action_error(codes::NO_SESSION);
+    }
+    let command = crate::services::zcode_control::local_queue::types::ItemCommand {
+        request_id: input.request_id,
+        item_id: input.item_id,
+        expected_version: input.expected_version,
+    };
+    match store.edit(&actor, &command, chrono::Utc::now().timestamp_millis()) {
+        Ok(result) => {
+            queue.notify(&key);
+            ([(CACHE_CONTROL, "no-store")], Json(result)).into_response()
+        }
+        Err(error) => action_error(&error.code),
+    }
+}
+
+pub async fn local_queue_edit_snapshot(
+    State(st): State<Arc<RemoteState>>,
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    let Some(request_id) = params
+        .get("requestId")
+        .filter(|id| !id.trim().is_empty() && id.len() <= 128)
+    else {
+        return action_error(codes::INVALID_ACTION);
+    };
+    let Some(actor) = queue_actor(&st, &headers) else {
+        return StatusCode::FORBIDDEN.into_response();
+    };
+    let Some(queue) = st.zcode_hub().and_then(|hub| hub.queue_service()) else {
+        return action_error(codes::NOT_READY);
+    };
+    let store = queue.store();
+    let key = match store.edit_request_key(&actor, request_id) {
+        Ok(key) => key,
+        Err(error) => return action_error(&error.code),
+    };
+    if params
+        .get("sessionId")
+        .is_some_and(|id| id != &key.session_id)
+        || current_zcode_session(&st, &key.session_id).await.is_none()
+    {
+        return action_error(codes::NO_SESSION);
+    }
+    match store.edit_snapshot(
+        &actor,
+        &key,
+        request_id,
+        chrono::Utc::now().timestamp_millis(),
+    ) {
+        Ok(Some(result)) => ([(CACHE_CONTROL, "no-store")], Json(result)).into_response(),
+        Ok(None) => action_error(codes::NO_SESSION),
+        Err(error) => action_error(&error.code),
+    }
+}
+
+pub async fn local_queue_retract(
+    State(st): State<Arc<RemoteState>>,
+    headers: HeaderMap,
+    payload: Result<Json<serde_json::Value>, JsonRejection>,
+) -> Response {
+    let Ok(Json(value)) = payload else {
+        return action_error(codes::INVALID_ACTION);
+    };
+    let Ok(input) = serde_json::from_value::<LocalItemRequest>(value) else {
+        return action_error(codes::INVALID_ACTION);
+    };
+    if input.request_id.trim().is_empty()
+        || input.request_id.len() > 128
+        || input.item_id.trim().is_empty()
+    {
+        return action_error(codes::INVALID_ACTION);
+    }
+    let Some(actor) = queue_actor(&st, &headers) else {
+        return StatusCode::FORBIDDEN.into_response();
+    };
+    let Some(queue) = st.zcode_hub().and_then(|hub| hub.queue_service()) else {
+        return action_error(codes::NOT_READY);
+    };
+    let store = queue.store();
+    let key = match store.item_key(&actor, &input.item_id) {
+        Ok(key) => key,
+        Err(error) => return action_error(&error.code),
+    };
+    if current_zcode_session(&st, &key.session_id).await.is_none() {
+        return action_error(codes::NO_SESSION);
+    }
+    let command = crate::services::zcode_control::local_queue::types::ItemCommand {
+        request_id: input.request_id,
+        item_id: input.item_id,
+        expected_version: input.expected_version,
+    };
+    match store.retract(&actor, &command) {
+        Ok(view) => {
+            queue.notify(&key);
+            ([(CACHE_CONTROL, "no-store")], Json(view)).into_response()
+        }
+        Err(error) => action_error(&error.code),
+    }
+}
+
+fn valid_local_attachment(
+    workspace: &std::path::Path,
+    session_id: &str,
+    attachment: &LocalEnqueueAttachment,
+) -> bool {
+    crate::remote::attachments::valid_attachment_path(workspace, session_id, &attachment.path)
+}
+
+/// 入队接线施工中，未通过校验的载荷不会进入服务。
+pub async fn local_queue_enqueue(
+    State(st): State<Arc<RemoteState>>,
+    headers: HeaderMap,
+    payload: Result<Json<serde_json::Value>, JsonRejection>,
+) -> Response {
+    let Ok(Json(value)) = payload else {
+        return action_error(codes::INVALID_ACTION);
+    };
+    let Ok(input) = serde_json::from_value::<LocalEnqueueRequest>(value) else {
+        return action_error(codes::INVALID_ACTION);
+    };
+    if input.request_id.trim().is_empty()
+        || input.request_id.len() > 128
+        || input.request_id.chars().any(char::is_control)
+    {
+        return action_error(codes::INVALID_ACTION);
+    }
+    let Some(session) = current_zcode_session(&st, &input.session_id).await else {
+        return action_error(codes::NO_SESSION);
+    };
+    let Some(device_id) = super::gate::extract_device(&headers) else {
+        return StatusCode::FORBIDDEN.into_response();
+    };
+    let Some(hub) = st.zcode_hub() else {
+        return action_error(codes::NOT_READY);
+    };
+    let Some(queue) = hub.queue_service() else {
+        return action_error(codes::NOT_READY);
+    };
+    if !matches!(
+        tokio::time::timeout(std::time::Duration::from_secs(2), queue.recovery_ready()).await,
+        Ok(true)
+    ) {
+        return action_error(codes::NOT_READY);
+    }
+    use crate::services::zcode_control::local_queue::types::{
+        EnqueueCommand, QueueActor, QueueDraft, QueuedAttachment,
+    };
+    let device_name = st
+        .store
+        .with(|conn| super::pairing::device_name(conn, &device_id));
+    let actor = QueueActor {
+        device_id,
+        device_name,
+    };
+    let draft = QueueDraft {
+        text: input.draft.text.clone(),
+        attachments: input
+            .draft
+            .attachments
+            .iter()
+            .map(|a| QueuedAttachment {
+                name: a.name.clone(),
+                path: a.path.clone(),
+                is_image: a.is_image,
+            })
+            .collect(),
+    };
+    match queue.store().enqueue_replay(
+        &actor,
+        &input.request_id,
+        &input.session_id,
+        &draft,
+        input.edited_from.as_deref(),
+    ) {
+        Ok(Some(receipt)) => return ([(CACHE_CONTROL, "no-store")], Json(receipt)).into_response(),
+        Ok(None) => {}
+        Err(error) => return action_error(&error.code),
+    }
+    let Ok(workspace) = std::path::Path::new(&session.project_path).canonicalize() else {
+        return action_error(codes::NO_SESSION);
+    };
+    let key = TargetKey {
+        session_id: input.session_id.clone(),
+    };
+    let mut identity = None;
+    if hub.connection().state == crate::services::zcode_control::ConnectionState::Paired {
+        match hub.session(&key).await {
+            Ok(view) if view.ready => {}
+            Ok(_) => return action_error(codes::NOT_READY),
+            Err(error) => return action_error(&error.code),
+        }
+        let bound = match hub.queue_read(&key).await {
+            Ok(bound) => bound,
+            Err(error) => return action_error(&error.code),
+        };
+        if std::path::Path::new(&bound.target.workspace_path)
+            .canonicalize()
+            .ok()
+            .as_ref()
+            != Some(&workspace)
+        {
+            return action_error(codes::NO_SESSION);
+        }
+        identity = bound.target.workspace_identity;
+    }
+    if input
+        .draft
+        .attachments
+        .iter()
+        .any(|a| !valid_local_attachment(&workspace, &input.session_id, a))
+    {
+        return action_error(codes::INVALID_ACTION);
+    }
+    let mut wire = input.draft.text.clone();
+    for attachment in &input.draft.attachments {
+        if !wire.is_empty() {
+            wire.push('\n');
+        }
+        let kind = if attachment.is_image { "image" } else { "file" };
+        wire.push_str(&format!("<{kind} path=\"{}\">", attachment.path));
+    }
+    let signature = st
+        .store
+        .with(crate::inject::normalize::message_signature_enabled_conn);
+    let prepared = match crate::services::zcode_control::command::freeze_send_text(
+        &actor.device_name,
+        &wire,
+        signature,
+    ) {
+        Ok(prepared) => prepared,
+        Err(error) => return action_error(&error.code),
+    };
+    let command = EnqueueCommand {
+        request_id: input.request_id,
+        actor,
+        session_id: input.session_id,
+        workspace_path: workspace.to_string_lossy().into_owned(),
+        workspace_identity: identity,
+        draft,
+        prepared,
+        edited_from: input.edited_from,
+    };
+    match queue.enqueue(command).await {
+        Ok(receipt) => ([(CACHE_CONTROL, "no-store")], Json(receipt)).into_response(),
+        Err(error) => action_error(&error.code),
+    }
+}
+
 /// GET /m/api/v1/zcode/connection：当前连接视图（wire camelCase）。
 ///
 /// Hub 未装配（生产接线前 / 本机未启用）→ 503 `{error:"not_ready"}`：如实申报，
@@ -266,6 +1019,7 @@ pub fn control_frame(
             }
             "action"
         }
+        ControlEventKind::LocalQueue => return None,
     };
     serde_json::to_string(event).ok().map(|data| (name, data))
 }
@@ -317,8 +1071,21 @@ pub async fn events(
     // 先订阅、后取首帧（顺序刻意，勿换）：订阅与首帧之间产生的跃迁落进广播缓冲，
     // 在首帧之后依次送出；反序会永久漏掉窗口内的更新。
     let rx = hub.subscribe();
+    let queue = hub.queue_service();
+    let local_queue = queue.as_ref().and_then(|queue| {
+        let actor = queue_actor(&st, &headers)?;
+        let key = TargetKey {
+            session_id: session_id.clone(),
+        };
+        queue
+            .store()
+            .view(&actor, &key)
+            .ok()
+            .and_then(|view| serde_json::to_value(view).ok())
+    });
     let initial = serde_json::json!({
         "connection": hub.connection(),
+        "localQueue": local_queue,
         "session": hub
             .session(&TargetKey {
                 session_id: session_id.clone(),
@@ -332,11 +1099,38 @@ pub async fn events(
     });
     let wanted = session_id.clone();
     let wanted_device = device.clone();
+    let stream_hub = hub.clone();
+    let stream_actor = queue_actor(&st, &headers);
     let updates = BroadcastStream::new(rx).filter_map(move |msg| {
         let wanted = wanted.clone();
         let wanted_device = wanted_device.clone();
+        let stream_hub = stream_hub.clone();
+        let stream_actor = stream_actor.clone();
         async move {
             match msg {
+                Ok(event) if event.kind == ControlEventKind::LocalQueue => {
+                    if event.session_id.as_deref().is_some_and(|id| id != wanted) {
+                        return None;
+                    }
+                    let (Some(queue), Some(actor)) = (stream_hub.queue_service(), stream_actor)
+                    else {
+                        return None;
+                    };
+                    let key = TargetKey { session_id: wanted };
+                    match queue
+                        .store()
+                        .view(&actor, &key)
+                        .ok()
+                        .and_then(|view| serde_json::to_string(&view).ok())
+                    {
+                        Some(data) => {
+                            Some(Ok(sse::Event::default().event("local_queue").data(data)))
+                        }
+                        None => Some(Ok(sse::Event::default()
+                            .event("resync")
+                            .data(r#"{"reason":"queue_read_failed"}"#))),
+                    }
+                }
                 Ok(event) => control_frame(&event, &wanted, &wanted_device)
                     .map(|(name, data)| Ok(sse::Event::default().event(name).data(data))),
                 // lag = 中间事件已丢：只报 resync，由客户端重 GET 自愈；不重放动作。
@@ -477,6 +1271,10 @@ pub async fn actions(
     {
         return action_error(codes::NO_SESSION);
     }
+    // 旧 Stop 信封无法表达持久停止操作；要求客户端切换到队列入口。
+    if matches!(&action, ControlAction::Stop { .. }) {
+        return action_error(codes::QUEUE_REFRESH_REQUIRED);
+    }
     // 设备身份的可信源：配对 gate 已验过 cookie；这里只取 id + 花名（DB）。
     let Some(device_id) = super::gate::extract_device(&headers) else {
         // gate 已拦设备，理论不可达——兜底与 gate 同形（空体 403，不泄露区分）。
@@ -565,6 +1363,7 @@ fn action_error(code: &str) -> Response {
         | codes::NEEDS_EVIDENCE
         | codes::ACTION_PAYLOAD_CONFLICT
         | codes::QUEUE_REFRESH_REQUIRED
+        | codes::ATTACHMENT_MISSING
         | codes::STALE_PENDING
         | codes::STOP_TARGET_CHANGED => StatusCode::CONFLICT,
         codes::INVALID_ACTION
@@ -585,5 +1384,55 @@ mod queue_refresh_tests {
             crate::services::zcode_control::types::codes::QUEUE_REFRESH_REQUIRED,
         );
         assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
+    }
+
+    #[test]
+    fn attachment_must_be_a_real_file_in_the_session_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = crate::remote::attachments::attachment_dir(tmp.path(), "synthetic-session");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("sample.txt");
+        std::fs::write(&path, b"synthetic").unwrap();
+        let attachment = super::LocalEnqueueAttachment {
+            name: "sample.txt".into(),
+            path: path.to_string_lossy().into_owned(),
+            is_image: false,
+        };
+        assert!(super::valid_local_attachment(
+            tmp.path(),
+            "synthetic-session",
+            &attachment
+        ));
+        assert!(!super::valid_local_attachment(
+            tmp.path(),
+            "other-session",
+            &attachment
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn attachment_directory_symlink_cannot_authorize_arbitrary_workspace_file() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().unwrap();
+        let unrelated = tmp.path().join("unrelated");
+        std::fs::create_dir(&unrelated).unwrap();
+        let path = unrelated.join("sample.txt");
+        std::fs::write(&path, b"synthetic").unwrap();
+        let root = tmp
+            .path()
+            .join(crate::remote::attachments::ATTACHMENT_DIR_NAME);
+        std::fs::create_dir(&root).unwrap();
+        symlink(&unrelated, root.join("synthetic-session")).unwrap();
+        let attachment = super::LocalEnqueueAttachment {
+            name: "sample.txt".into(),
+            path: path.to_string_lossy().into_owned(),
+            is_image: false,
+        };
+        assert!(!super::valid_local_attachment(
+            tmp.path(),
+            "synthetic-session",
+            &attachment
+        ));
     }
 }

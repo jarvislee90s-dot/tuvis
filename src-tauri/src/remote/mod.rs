@@ -1392,7 +1392,7 @@ pub(crate) async fn run_queue_listener(
                 Ok(event) => {
                     if event.kind == ControlEventKind::Session {
                         if let Ok(view) = serde_json::from_value(event.data) { listener.on_session(&view); }
-                    } else if event.kind == ControlEventKind::Connection && event.data.get("state").and_then(serde_json::Value::as_str) == Some("paired") { let activation = listener.clone(); tokio::spawn(async move { activation.on_connected().await; }); } else { listener.wake_all(); }
+                    } else if event.kind == ControlEventKind::Connection && event.data.get("state").and_then(serde_json::Value::as_str) == Some("paired") { let activation = listener.clone(); tokio::spawn(async move { activation.on_connected().await; }); } else if event.kind != ControlEventKind::LocalQueue { listener.wake_all(); }
                 },
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => listener.wake_all(),
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,

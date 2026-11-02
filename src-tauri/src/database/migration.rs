@@ -56,6 +56,13 @@ pub fn migrate(conn: &Connection) -> Result<(), String> {
         )
         .map_err(|e| format!("MIGRATE_FAIL: {}", e))?;
     }
+    if !column_exists(conn, "zcode_send_queue", "request_input_hash") {
+        conn.execute(
+            "ALTER TABLE zcode_send_queue ADD COLUMN request_input_hash TEXT",
+            [],
+        )
+        .map_err(|e| format!("MIGRATE_FAIL: {}", e))?;
+    }
 
     // 检查 extension 表是否有 manifest_path 列
     if !column_exists(conn, "extensions", "manifest_path") {

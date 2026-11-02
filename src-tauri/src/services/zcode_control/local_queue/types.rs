@@ -99,6 +99,8 @@ pub(crate) struct DispatchClaim {
 
 pub(crate) struct RecoveryClaim {
     pub dispatch: DispatchClaim,
+    /// 保留原停止动作供恢复核对；恢复路径不据此自动解除人工确认。
+    #[allow(dead_code)]
     pub stop_action_id: Option<String>,
 }
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -125,16 +127,38 @@ pub(crate) struct QueueOperationView {
     pub request_id: String,
     pub state: QueueOperationState,
     pub receipt: Option<super::super::types::ActionReceipt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_failure: Option<StopFailure>,
+}
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct StopFailure {
+    pub phase: String,
+    pub code: String,
 }
 pub(crate) struct PriorityClaim {
     pub operation: QueueOperationView,
     pub is_owner: bool,
     pub stop_action_id: String,
+    /// 持久发送动作证据；由 store 用来恢复派发，调用方不必读取。
+    #[allow(dead_code)]
     pub send_action_id: String,
 }
 
 pub(crate) enum PriorityEnd {
     BeforeStop,
+    BeforeStopFailure {
+        code: String,
+    },
+    StopBeforeWrite {
+        action_id: String,
+        generation: u64,
+    },
+    StopBeforeWriteFailure {
+        action_id: String,
+        generation: u64,
+        code: String,
+    },
     StopRejected(super::super::types::ActionReceipt),
 }
 #[derive(Debug)]
@@ -144,7 +168,10 @@ pub(crate) struct PriorityRecovery {
     pub session_id: String,
     pub item_id: String,
     pub stop_action_id: String,
+    /// 仅用于恢复核对证据，不对手机下发。
+    #[allow(dead_code)]
     pub generation: u64,
+    #[allow(dead_code)]
     pub execution_id: String,
 }
 

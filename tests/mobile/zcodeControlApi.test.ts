@@ -11,6 +11,19 @@ import {
   ZcodeControlApiError,
   getZcodeConnection,
   getZcodeSession,
+  getZcodeLocalQueue,
+  enqueueZcodeMessage,
+  getZcodeEditSnapshot,
+  finishZcodeEdit,
+  prioritizeZcodeMessage,
+  editZcodeQueuedMessage,
+  retractZcodeQueuedMessage,
+  resumeZcodeLocalQueue,
+  getZcodeQueueOperation,
+  isZcodeErrorCode,
+  stopZcodeCurrent,
+  getZcodeQueueRecovery,
+  acknowledgeZcodeQueueRecovery,
   postZcodeAction,
   zcodeEventsUrl,
   type ActionReceipt,
@@ -39,6 +52,78 @@ const calledUrls = () => fetchMock.mock.calls.map(([input]) => String(input));
 
 afterEach(() => {
   vi.unstubAllGlobals();
+});
+
+it("附件失效有可识别的冻结原因", () => {
+  expect(isZcodeErrorCode("attachment_missing")).toBe(true);
+});
+
+it("本地队列 API 使用冻结的路径与请求字段", async () => {
+  installFetch(() => json({ itemId: "item", itemVersion: 1, queueVersion: 1, position: 1 }));
+  await getZcodeLocalQueue(SID);
+  await enqueueZcodeMessage({
+    requestId: "req",
+    sessionId: SID,
+    draft: { text: "合成", attachments: [] },
+  });
+  await getZcodeEditSnapshot("edit");
+  await finishZcodeEdit("edit");
+  expect(calledUrls()).toEqual([
+    `/m/api/v1/zcode/local-queue?sessionId=${SID}`,
+    "/m/api/v1/zcode/local-queue/enqueue",
+    "/m/api/v1/zcode/local-queue/edits?requestId=edit",
+    "/m/api/v1/zcode/local-queue/edit/finish",
+  ]);
+  expect(JSON.parse(String(fetchMock.mock.calls[1][1]?.body))).toEqual({
+    requestId: "req",
+    sessionId: SID,
+    draft: { text: "合成", attachments: [] },
+  });
+});
+
+it("队列操作只发送标识与版本，并可查询原操作", async () => {
+  installFetch(() => json({}));
+  const item = { requestId: "req", itemId: "item", expectedVersion: 2 };
+  await editZcodeQueuedMessage(item);
+  await retractZcodeQueuedMessage(item);
+  await prioritizeZcodeMessage({ ...item, confirmStop: false, expectedExecutionId: null });
+  await resumeZcodeLocalQueue({ requestId: "resume", sessionId: SID, expectedQueueVersion: 4 });
+  await getZcodeQueueOperation("req");
+  expect(calledUrls()).toEqual([
+    "/m/api/v1/zcode/local-queue/edit",
+    "/m/api/v1/zcode/local-queue/retract",
+    "/m/api/v1/zcode/local-queue/prioritize",
+    "/m/api/v1/zcode/local-queue/resume",
+    "/m/api/v1/zcode/local-queue/operations?requestId=req",
+  ]);
+  expect(JSON.parse(String(fetchMock.mock.calls[2][1]?.body))).toEqual({
+    ...item,
+    confirmStop: false,
+    expectedExecutionId: null,
+  });
+});
+
+it("停止和未知结果核对使用独立请求", async () => {
+  installFetch(() => json({}));
+  await stopZcodeCurrent({ requestId: "stop", sessionId: SID, expectedExecutionId: "exec" });
+  await getZcodeQueueRecovery(SID);
+  await acknowledgeZcodeQueueRecovery({
+    requestId: "review",
+    sessionId: SID,
+    kind: "manual_stop",
+    subjectId: "stop",
+  });
+  expect(calledUrls()).toEqual([
+    "/m/api/v1/zcode/local-queue/stop",
+    `/m/api/v1/zcode/local-queue/recovery?sessionId=${SID}`,
+    "/m/api/v1/zcode/local-queue/recovery/ack",
+  ]);
+  expect(JSON.parse(String(fetchMock.mock.calls[2][1]?.body))).toEqual({
+    requestId: "review",
+    sessionId: SID,
+    kind: "manual_stop",
+    subjectId: "stop",
+  });
 });
 
 const flag = (enabled: boolean): { enabled: boolean; reasonCode: string | null } => ({

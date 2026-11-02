@@ -29,6 +29,69 @@ fn check_operation_identity(
     }
     Ok(())
 }
+#[cfg(test)]
+#[test]
+fn stop_requires_current_claim_even_without_priority_item() {
+    let store = SqlLocalQueueStore::new(DeviceStore::memory());
+    let actor = QueueActor {
+        device_id: "device".into(),
+        device_name: "phone".into(),
+    };
+    let key = TargetKey {
+        session_id: "session".into(),
+    };
+    assert!(store
+        .priority_stop_attachments_valid(
+            &key,
+            &actor.device_id,
+            "missing",
+            "/synthetic",
+            1,
+            "execution"
+        )
+        .is_err());
+    let (_, _, action) = store
+        .begin_stop(&actor, &key, "stop", "execution", 1)
+        .unwrap();
+    store.claim_manual_stop(&actor, "stop", 1).unwrap();
+    assert!(store
+        .priority_stop_attachments_valid(
+            &key,
+            &actor.device_id,
+            &action,
+            "/synthetic",
+            1,
+            "execution"
+        )
+        .unwrap());
+    assert!(store
+        .priority_stop_attachments_valid(
+            &key,
+            &actor.device_id,
+            &action,
+            "/synthetic",
+            2,
+            "execution"
+        )
+        .is_err());
+    store.store.with(|conn| {
+        conn.execute(
+            "UPDATE zcode_queue_operations SET operation_state='unknown' WHERE request_id='stop'",
+            [],
+        )
+        .unwrap()
+    });
+    assert!(store
+        .priority_stop_attachments_valid(
+            &key,
+            &actor.device_id,
+            &action,
+            "/synthetic",
+            1,
+            "execution"
+        )
+        .is_err());
+}
 fn mark_restart_unconfirmed_conn(conn: &rusqlite::Connection, now: i64) -> ZResult<()> {
     let err = || super::super::types::ZcodeError::of(super::super::types::codes::STORAGE_FAILED);
     let filter = "state='accepted' AND coalesce(json_extract(receipt,'$.sendAdmission.delivery'),'')='startNow' AND coalesce(json_extract(receipt,'$._queueTerminal'),0)=0 AND coalesce(json_extract(receipt,'$._queueUnconfirmed'),0)=0 AND coalesce(json_extract(receipt,'$._queueRestartUnconfirmed'),0)=0";
@@ -63,6 +126,42 @@ pub(crate) struct SqlLocalQueueStore {
     expiry_changed: std::sync::Arc<tokio::sync::Notify>,
 }
 impl SqlLocalQueueStore {
+    fn input_hash(
+        actor: &QueueActor,
+        session_id: &str,
+        draft: &QueueDraft,
+        edited_from: Option<&str>,
+    ) -> ZResult<String> {
+        super::super::action::payload_hash(
+            "enqueue_input",
+            session_id,
+            0,
+            &serde_json::json!({"deviceId": actor.device_id, "draft": draft, "editedFrom": edited_from}),
+        )
+    }
+
+    pub(crate) fn enqueue_replay(
+        &self,
+        actor: &QueueActor,
+        request_id: &str,
+        session_id: &str,
+        draft: &QueueDraft,
+        edited_from: Option<&str>,
+    ) -> ZResult<Option<EnqueueReceipt>> {
+        use rusqlite::OptionalExtension;
+        let hash = Self::input_hash(actor, session_id, draft, edited_from)?;
+        self.store.with(|conn| {
+            let row: Option<(String,String,Option<String>,i64,i64)> = conn.query_row(
+                "SELECT item_id,device_id,request_input_hash,receipt_queue_version,receipt_position FROM zcode_send_queue WHERE request_id=?1",
+                [request_id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)))
+                .optional().map_err(|_| super::super::types::ZcodeError::of(super::super::types::codes::STORAGE_FAILED))?;
+            let Some((item_id, owner, old_hash, version, position)) = row else { return Ok(None); };
+            if owner != actor.device_id { return Err(super::super::types::ZcodeError::of(super::super::types::codes::NO_SESSION)); }
+            let Some(old_hash) = old_hash else { return Ok(None); };
+            if old_hash != hash { return Err(super::super::types::ZcodeError::of(super::super::types::codes::INVALID_ACTION)); }
+            Ok(Some(EnqueueReceipt { item_id, item_version: 1, queue_version: version as u64, position: position as u32 }))
+        })
+    }
     pub(crate) fn new(store: DeviceStore) -> Self {
         Self {
             store,
@@ -73,6 +172,12 @@ impl SqlLocalQueueStore {
         &self.expiry_changed
     }
     pub(crate) fn enqueue(&self, cmd: &EnqueueCommand, now: i64) -> ZResult<EnqueueReceipt> {
+        let input_hash = Self::input_hash(
+            &cmd.actor,
+            &cmd.session_id,
+            &cmd.draft,
+            cmd.edited_from.as_deref(),
+        )?;
         let hash = super::super::action::payload_hash(
             "enqueue",
             &cmd.session_id,
@@ -87,10 +192,10 @@ impl SqlLocalQueueStore {
             use rusqlite::OptionalExtension;
             let err = || super::super::types::ZcodeError::of(super::super::types::codes::STORAGE_FAILED);
             let tx = c.unchecked_transaction().map_err(|_| err())?;
-            let existing: Option<(String,String,i64,i64,String)> = tx.query_row("SELECT item_id,payload_hash,receipt_queue_version,receipt_position,device_id FROM zcode_send_queue WHERE request_id=?1", [&cmd.request_id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional().map_err(|_| err())?;
-            if let Some((item_id, old_hash, queue_version, position, device)) = existing {
+            let existing: Option<(String,String,i64,i64,String,Option<String>)> = tx.query_row("SELECT item_id,payload_hash,receipt_queue_version,receipt_position,device_id,request_input_hash FROM zcode_send_queue WHERE request_id=?1", [&cmd.request_id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?))).optional().map_err(|_| err())?;
+            if let Some((item_id, old_hash, queue_version, position, device, old_input_hash)) = existing {
                 if device != cmd.actor.device_id { return Err(super::super::types::ZcodeError::of(super::super::types::codes::NO_SESSION)); }
-                if old_hash != hash { return Err(super::super::types::ZcodeError::of(super::super::types::codes::INVALID_ACTION)); }
+                if old_input_hash.as_ref().map_or(old_hash != hash, |old| old != &input_hash) { return Err(super::super::types::ZcodeError::of(super::super::types::codes::INVALID_ACTION)); }
                 return Ok(EnqueueReceipt { item_id, item_version: 1, queue_version: queue_version as u64, position: position as u32 });
             }
             let operation_owner: Option<String> = tx.query_row("SELECT device_id FROM zcode_queue_operations WHERE request_id=?1",[&cmd.request_id],|r| r.get(0)).optional().map_err(|_| err())?;
@@ -107,7 +212,7 @@ impl SqlLocalQueueStore {
             let queue_version: i64 = tx.query_row("SELECT version FROM zcode_queue_state WHERE session_id=?1", [&cmd.session_id], |r| r.get(0)).map_err(|_| err())?;
             let position: i64 = tx.query_row("SELECT count(*)+1 FROM zcode_send_queue WHERE session_id=?1 AND state='queued'", [&cmd.session_id], |r| r.get(0)).map_err(|_| err())?;
             let item_id = super::super::command::new_command_id();
-            tx.execute("INSERT INTO zcode_send_queue(request_id,item_id,payload_hash,device_id,session_id,draft,device_name,workspace_path,workspace_identity,prepared,receipt_queue_version,receipt_position,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)", rusqlite::params![cmd.request_id,item_id,hash,cmd.actor.device_id,cmd.session_id,serde_json::to_string(&cmd.draft).map_err(|_| err())?,cmd.actor.device_name,cmd.workspace_path,cmd.workspace_identity,cmd.prepared.wire_text(),queue_version,position,now]).map_err(|_| err())?;
+            tx.execute("INSERT INTO zcode_send_queue(request_id,item_id,payload_hash,device_id,session_id,draft,device_name,workspace_path,workspace_identity,prepared,receipt_queue_version,receipt_position,created_at,request_input_hash) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)", rusqlite::params![cmd.request_id,item_id,hash,cmd.actor.device_id,cmd.session_id,serde_json::to_string(&cmd.draft).map_err(|_| err())?,cmd.actor.device_name,cmd.workspace_path,cmd.workspace_identity,cmd.prepared.wire_text(),queue_version,position,now,input_hash]).map_err(|_| err())?;
             super::super::audit::record_start_conn(&tx, now, &cmd.actor.device_id, &cmd.actor.device_name, &cmd.session_id, "queue", "enqueue").map_err(|_| err())?;
             tx.commit().map_err(|_| err())?;
             Ok(EnqueueReceipt { item_id, item_version: 1, queue_version: queue_version as u64, position: position as u32 })
@@ -123,7 +228,8 @@ impl SqlLocalQueueStore {
         self.store.with(|c| {
             let tx = c.unchecked_transaction().map_err(|_| err())?;
             mark_restart_unconfirmed_conn(&tx, now)?;
-            let rows: Vec<(String,String,String,String,String,String,String,Option<String>)> = {
+            type RecoveryRow = (String, String, String, String, String, String, String, Option<String>);
+            let rows: Vec<RecoveryRow> = {
                 let mut stmt = tx.prepare("SELECT q.item_id,q.device_id,q.device_name,q.prepared,q.dispatch_action_id,q.dispatch_target,q.session_id,o.stop_action_id FROM zcode_send_queue q LEFT JOIN zcode_queue_operations o ON o.request_id=q.priority_request AND o.stop_claimed=1 WHERE q.state IN ('dispatching','unknown') AND q.dispatch_action_id IS NOT NULL ORDER BY q.seq").map_err(|_| err())?;
                 let iter = stmt.query_map([], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?))).map_err(|_| err())?;
                 iter.collect::<Result<_,_>>().map_err(|_| err())?
@@ -144,6 +250,8 @@ impl SqlLocalQueueStore {
             tx.execute("UPDATE zcode_queue_operations SET operation_state='failed' WHERE kind='priority' AND operation_state='in_flight' AND stop_claimed=0 AND request_id IN (SELECT priority_request FROM zcode_send_queue WHERE state='queued')", []).map_err(|_| err())?;
             tx.execute("UPDATE zcode_send_queue SET priority_request=NULL WHERE state='queued' AND priority_request IN (SELECT request_id FROM zcode_queue_operations WHERE kind='priority' AND operation_state='failed')", []).map_err(|_| err())?;
             tx.execute("UPDATE zcode_queue_operations SET operation_state='unknown' WHERE kind='priority' AND stop_claimed=1 AND operation_state='in_flight'", []).map_err(|_| err())?;
+            tx.execute("UPDATE zcode_queue_state SET version=version+1,auto_drain=0,pause_reason='manual_stop' WHERE session_id IN (SELECT item_id FROM zcode_queue_operations WHERE kind='stop' AND operation_state='in_flight')",[]).map_err(|_|err())?;
+            tx.execute("UPDATE zcode_queue_operations SET operation_state=CASE WHEN stop_claimed=1 THEN 'unknown' ELSE 'failed' END WHERE kind='stop' AND operation_state='in_flight'",[]).map_err(|_|err())?;
             tx.execute("UPDATE zcode_queue_state SET version=version+1 WHERE session_id IN (SELECT q.session_id FROM zcode_queue_operations o JOIN zcode_send_queue q ON q.item_id=o.item_id WHERE o.kind='edit' AND o.draft IS NOT NULL AND o.expires_at<=?1)", [now]).map_err(|_| err())?;
             tx.execute("UPDATE zcode_queue_operations SET draft=NULL WHERE kind='edit' AND expires_at<=?1", [now]).map_err(|_| err())?;
             tx.commit().map_err(|_| err())?;
@@ -185,14 +293,24 @@ impl SqlLocalQueueStore {
             let tx = c.unchecked_transaction().map_err(|_| err())?;
             let visible: i64 = tx.query_row("SELECT count(*) FROM zcode_queue_operations WHERE request_id=?1 AND kind='priority' AND device_id=?2",rusqlite::params![request_id,actor.device_id],|r| r.get(0)).map_err(|_| err())?;
             if visible == 0 { return Err(hidden()); }
+            if let PriorityEnd::StopBeforeWrite { action_id, generation } = &end {
+                let generation = i64::try_from(*generation).map_err(|_| invalid())?;
+                let replay: i64 = tx.query_row("SELECT count(*) FROM zcode_queue_operations WHERE request_id=?1 AND kind='priority' AND device_id=?2 AND device_name=?3 AND operation_state='failed' AND stop_claimed=1 AND stop_reviewed=2 AND stop_action_id=?4 AND stop_generation=?5", rusqlite::params![request_id,actor.device_id,actor.device_name,action_id,generation], |r| r.get(0)).map_err(|_| err())?;
+                if replay == 1 { return Ok(()); }
+            }
             let (item,session,claimed,stop,state,generation): (String,String,i64,String,String,Option<i64>) = tx.query_row("SELECT q.item_id,q.session_id,o.stop_claimed,o.stop_action_id,o.operation_state,o.stop_generation FROM zcode_queue_operations o JOIN zcode_send_queue q ON q.item_id=o.item_id WHERE o.request_id=?1 AND o.kind='priority' AND o.device_id=?2 AND o.device_name=?3 AND q.priority_request=o.request_id AND q.state='queued'",rusqlite::params![request_id,actor.device_id,actor.device_name],|r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?))).map_err(|e| if matches!(e,rusqlite::Error::QueryReturnedNoRows) { invalid() } else { err() })?;
             if state != "in_flight" { return Err(invalid()); }
+            let failure = match &end { PriorityEnd::StopBeforeWriteFailure { code, .. } | PriorityEnd::BeforeStopFailure { code } => Some(serde_json::json!({"stopFailure":{"phase":"before_write","code":code}}).to_string()), PriorityEnd::StopRejected(receipt) => Some(serde_json::to_string(receipt).map_err(|_|err())?), _ => None };
+            let before_write = matches!(&end, PriorityEnd::StopBeforeWrite { .. } | PriorityEnd::StopBeforeWriteFailure { .. });
             match end {
                 PriorityEnd::BeforeStop if claimed == 0 => {},
+                PriorityEnd::BeforeStopFailure { .. } if claimed == 0 => {},
+                PriorityEnd::StopBeforeWrite { action_id, generation: proof_generation } if claimed == 1 && action_id == stop && i64::try_from(proof_generation).ok() == generation => {},
+                PriorityEnd::StopBeforeWriteFailure { action_id, generation: proof_generation, .. } if claimed == 1 && action_id == stop && i64::try_from(proof_generation).ok() == generation => {},
                 PriorityEnd::StopRejected(receipt) if claimed == 1 && receipt.action_id == stop && receipt.session_id == session && i64::try_from(receipt.generation).ok() == generation && matches!(receipt.state, super::super::types::ActionState::Rejected | super::super::types::ActionState::SendFailed | super::super::types::ActionState::Noop) => {},
                 _ => return Err(invalid()),
             }
-            tx.execute("UPDATE zcode_queue_operations SET operation_state='failed' WHERE request_id=?1",[request_id]).map_err(|_| err())?;
+            tx.execute("UPDATE zcode_queue_operations SET operation_state='failed',stop_reviewed=CASE WHEN ?2 THEN 2 ELSE stop_reviewed END,operation_receipt=?3 WHERE request_id=?1",rusqlite::params![request_id,before_write,failure]).map_err(|_| err())?;
             tx.execute("UPDATE zcode_send_queue SET priority_request=NULL WHERE item_id=?1 AND priority_request=?2",rusqlite::params![item,request_id]).map_err(|_| err())?;
             tx.execute("UPDATE zcode_queue_state SET version=version+1,auto_drain=0,pause_reason='priority_closed' WHERE session_id=?1",[&session]).map_err(|_| err())?;
             super::super::audit::record_start_conn(&tx,now,&actor.device_id,&actor.device_name,&session,"queue_priority_end","priority_failed").map_err(|_| err())?;
@@ -230,6 +348,16 @@ impl SqlLocalQueueStore {
         request_id: &str,
         now: i64,
     ) -> ZResult<()> {
+        self.mark_priority_unknown_with_failure(actor, request_id, None, now)
+    }
+    pub(crate) fn mark_priority_unknown_with_failure(
+        &self,
+        actor: &QueueActor,
+        request_id: &str,
+        failure: Option<StopFailure>,
+        now: i64,
+    ) -> ZResult<()> {
+        let encoded = failure.map(|failure| serde_json::json!({"stopFailure":failure}).to_string());
         let err =
             || super::super::types::ZcodeError::of(super::super::types::codes::STORAGE_FAILED);
         self.store.with(|c| {
@@ -237,7 +365,7 @@ impl SqlLocalQueueStore {
             let visible: i64 = tx.query_row("SELECT count(*) FROM zcode_queue_operations WHERE request_id=?1 AND kind='priority' AND device_id=?2",rusqlite::params![request_id,actor.device_id],|r| r.get(0)).map_err(|_| err())?;
             if visible == 0 { return Err(super::super::types::ZcodeError::of(super::super::types::codes::NO_SESSION)); }
             let session: String = tx.query_row("SELECT q.session_id FROM zcode_send_queue q JOIN zcode_queue_operations o ON q.priority_request=o.request_id WHERE o.request_id=?1 AND o.kind='priority' AND o.device_id=?2 AND o.device_name=?3 AND o.stop_claimed=1 AND o.operation_state='in_flight' AND q.state='queued'",rusqlite::params![request_id,actor.device_id,actor.device_name],|r| r.get(0)).map_err(|e| if matches!(e,rusqlite::Error::QueryReturnedNoRows) { super::super::types::ZcodeError::of(super::super::types::codes::INVALID_ACTION) } else { err() })?;
-            tx.execute("UPDATE zcode_queue_operations SET operation_state='unknown' WHERE request_id=?1",[request_id]).map_err(|_| err())?;
+            tx.execute("UPDATE zcode_queue_operations SET operation_state='unknown',operation_receipt=?2 WHERE request_id=?1",rusqlite::params![request_id,encoded]).map_err(|_| err())?;
             tx.execute("UPDATE zcode_queue_state SET version=version+1,auto_drain=0,pause_reason='unknown' WHERE session_id=?1",[&session]).map_err(|_| err())?;
             super::super::audit::record_start_conn(&tx,now,&actor.device_id,&actor.device_name,&session,"queue_priority_unknown","priority_unknown").map_err(|_| err())?;
             tx.commit().map_err(|_| err())?; Ok(())
@@ -307,11 +435,118 @@ impl SqlLocalQueueStore {
         let err =
             || super::super::types::ZcodeError::of(super::super::types::codes::STORAGE_FAILED);
         self.store.with(|c| {
-            let row: Option<(String,Option<String>)> = c.query_row("SELECT operation_state,operation_receipt FROM zcode_queue_operations WHERE request_id=?1 AND device_id=?2 AND kind='priority'", rusqlite::params![request_id,actor.device_id], |r| Ok((r.get(0)?,r.get(1)?))).optional().map_err(|_| err())?;
+            let row: Option<(String,Option<String>)> = c.query_row("SELECT operation_state,operation_receipt FROM zcode_queue_operations WHERE request_id=?1 AND device_id=?2 AND kind IN ('priority','stop')", rusqlite::params![request_id,actor.device_id], |r| Ok((r.get(0)?,r.get(1)?))).optional().map_err(|_| err())?;
             row.map(|(state,receipt)| {
                 let state = match state.as_str() { "in_flight" => QueueOperationState::InFlight, "completed" => QueueOperationState::Completed, "unknown" => QueueOperationState::Unknown, "failed" => QueueOperationState::Failed, _ => return Err(err()) };
-                Ok(QueueOperationView { request_id: request_id.to_owned(),state,receipt: receipt.map(|r| serde_json::from_str(&r)).transpose().map_err(|_| err())? })
+                let (receipt,stop_failure) = match receipt { None => (None,None), Some(json) => { let value: serde_json::Value=serde_json::from_str(&json).map_err(|_|err())?; if let Some(failure)=value.get("stopFailure") { (None,Some(serde_json::from_value(failure.clone()).map_err(|_|err())?)) } else { (Some(serde_json::from_value(value).map_err(|_|err())?),None) } } };
+                Ok(QueueOperationView { request_id: request_id.to_owned(),state,receipt,stop_failure })
             }).transpose()
+        })
+    }
+    pub(crate) fn operation_key(&self, actor: &QueueActor, request_id: &str) -> ZResult<TargetKey> {
+        use rusqlite::OptionalExtension;
+        let session: Option<String> = self.store.with(|c| c.query_row(
+            "SELECT CASE WHEN o.kind='stop' THEN o.item_id ELSE q.session_id END FROM zcode_queue_operations o LEFT JOIN zcode_send_queue q ON q.item_id=o.item_id WHERE o.request_id=?1 AND o.device_id=?2 AND o.kind IN ('stop','priority')",
+            rusqlite::params![request_id, actor.device_id], |r| r.get(0),
+        ).optional()).map_err(|_| super::super::types::ZcodeError::of(super::super::types::codes::STORAGE_FAILED))?;
+        Ok(TargetKey {
+            session_id: session.ok_or_else(|| {
+                super::super::types::ZcodeError::of(super::super::types::codes::NO_SESSION)
+            })?,
+        })
+    }
+    pub(crate) fn unreviewed_manual_stop(
+        &self,
+        actor: &QueueActor,
+        key: &TargetKey,
+    ) -> ZResult<Option<String>> {
+        use rusqlite::OptionalExtension;
+        let err =
+            || super::super::types::ZcodeError::of(super::super::types::codes::STORAGE_FAILED);
+        self.store.with(|c| c.query_row("SELECT request_id FROM zcode_queue_operations WHERE kind='stop' AND item_id=?1 AND device_id=?2 AND operation_state='unknown' AND stop_reviewed=0 ORDER BY rowid LIMIT 1",rusqlite::params![key.session_id,actor.device_id],|r|r.get(0)).optional()).map_err(|_|err())
+    }
+    pub(crate) fn priority_key(&self, actor: &QueueActor, request_id: &str) -> ZResult<TargetKey> {
+        use rusqlite::OptionalExtension;
+        let err =
+            || super::super::types::ZcodeError::of(super::super::types::codes::STORAGE_FAILED);
+        let hidden = || super::super::types::ZcodeError::of(super::super::types::codes::NO_SESSION);
+        self.store.with(|c| {
+            let session: Option<String> = c.query_row("SELECT q.session_id FROM zcode_queue_operations o JOIN zcode_send_queue q ON q.item_id=o.item_id WHERE o.kind='priority' AND o.request_id=?1 AND o.device_id=?2",rusqlite::params![request_id,actor.device_id],|r|r.get(0)).optional().map_err(|_|err())?;
+            Ok(TargetKey { session_id: session.ok_or_else(hidden)? })
+        })
+    }
+    pub(crate) fn unreviewed_dispatch_unknown(
+        &self,
+        actor: &QueueActor,
+        key: &TargetKey,
+    ) -> ZResult<Option<String>> {
+        use rusqlite::OptionalExtension;
+        let err =
+            || super::super::types::ZcodeError::of(super::super::types::codes::STORAGE_FAILED);
+        self.store.with(|c| c.query_row("SELECT q.dispatch_action_id FROM zcode_send_queue q WHERE q.session_id=?1 AND q.device_id=?2 AND q.state='unknown' AND q.dispatch_action_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM zcode_queue_operations r WHERE r.kind='unknown_review' AND r.item_id=q.item_id) ORDER BY q.seq LIMIT 1",rusqlite::params![key.session_id,actor.device_id],|r|r.get(0)).optional()).map_err(|_|err())
+    }
+    pub(crate) fn acknowledge_dispatched_unknown(
+        &self,
+        actor: &QueueActor,
+        key: &TargetKey,
+        action: &str,
+        request_id: &str,
+        now: i64,
+    ) -> ZResult<()> {
+        use rusqlite::OptionalExtension;
+        let err =
+            || super::super::types::ZcodeError::of(super::super::types::codes::STORAGE_FAILED);
+        let invalid =
+            || super::super::types::ZcodeError::of(super::super::types::codes::INVALID_ACTION);
+        let hidden = || super::super::types::ZcodeError::of(super::super::types::codes::NO_SESSION);
+        let hash = super::super::action::payload_hash(
+            "unknown_review",
+            &key.session_id,
+            0,
+            &serde_json::json!({"device":actor.device_id,"name":actor.device_name,"action":action}),
+        )?;
+        self.store.with(|c| { let tx = c.unchecked_transaction().map_err(|_|err())?;
+            check_operation_identity(&tx,request_id,Some(&actor.device_id),"unknown_review")?;
+            let previous: Option<String> = tx.query_row("SELECT payload_hash FROM zcode_queue_operations WHERE request_id=?1",[request_id],|r|r.get(0)).optional().map_err(|_|err())?;
+            if let Some(old) = previous { return if old == hash { Ok(()) } else { Err(invalid()) }; }
+            let collision: i64 = tx.query_row("SELECT count(*) FROM zcode_send_queue WHERE request_id=?1",[request_id],|r|r.get(0)).map_err(|_|err())?;
+            if collision != 0 { return Err(invalid()); }
+            let row: Option<String> = tx.query_row("SELECT q.item_id FROM zcode_send_queue q WHERE q.session_id=?1 AND q.device_id=?2 AND q.dispatch_action_id=?3 AND q.state='unknown' AND NOT EXISTS (SELECT 1 FROM zcode_queue_operations r WHERE r.kind='unknown_review' AND r.item_id=q.item_id)",rusqlite::params![key.session_id,actor.device_id,action],|r|r.get(0)).optional().map_err(|_|err())?;
+            let item = row.ok_or_else(hidden)?;
+            tx.execute("UPDATE zcode_queue_state SET version=version+1,auto_drain=0,pause_reason='unknown_reviewed' WHERE session_id=?1",[&key.session_id]).map_err(|_|err())?;
+            tx.execute("INSERT INTO zcode_queue_operations(request_id,kind,payload_hash,device_id,device_name,item_id,expected_version,operation_state,expires_at) VALUES (?1,'unknown_review',?2,?3,?4,?5,0,'completed',9223372036854775807)",rusqlite::params![request_id,hash,actor.device_id,actor.device_name,item]).map_err(|_|err())?;
+            super::super::audit::record_start_conn(&tx,now,&actor.device_id,&actor.device_name,&key.session_id,"queue_unknown_review","reviewed").map_err(|_|err())?;
+            tx.commit().map_err(|_|err())?; Ok(()) })
+    }
+    pub(crate) fn has_delivery_barrier(&self, key: &TargetKey) -> ZResult<bool> {
+        let err =
+            || super::super::types::ZcodeError::of(super::super::types::codes::STORAGE_FAILED);
+        self.store.with(|c| {
+            let count: i64 = c.query_row("SELECT count(*) FROM zcode_send_queue q WHERE q.session_id=?1 AND (q.state='dispatching' OR (q.state='unknown' AND NOT EXISTS (SELECT 1 FROM zcode_queue_operations r WHERE r.kind='unknown_review' AND r.item_id=q.item_id)) OR (q.state='accepted' AND coalesce(json_extract(q.receipt,'$.sendAdmission.delivery'),'startNow')='startNow' AND coalesce(json_extract(q.receipt,'$._queueTerminal'),0)=0 AND coalesce(json_extract(q.receipt,'$._queueUnconfirmed'),0)=0))",[&key.session_id],|r|r.get(0)).map_err(|_|err())?;
+            Ok(count != 0)
+        })
+    }
+    pub(crate) fn has_unresolved_stop(&self, key: &TargetKey) -> ZResult<bool> {
+        let err =
+            || super::super::types::ZcodeError::of(super::super::types::codes::STORAGE_FAILED);
+        self.store.with(|c| {
+            let count: i64 = c.query_row("SELECT (SELECT count(*) FROM zcode_queue_operations WHERE kind='stop' AND item_id=?1 AND (operation_state='in_flight' OR (operation_state='unknown' AND stop_reviewed=0))) + (SELECT count(*) FROM zcode_send_queue q JOIN zcode_queue_operations o ON o.request_id=q.priority_request WHERE q.session_id=?1 AND o.kind='priority' AND o.stop_claimed=1 AND o.operation_state IN ('in_flight','unknown') AND NOT (q.state='unknown' AND EXISTS (SELECT 1 FROM zcode_queue_operations r WHERE r.kind='unknown_review' AND r.item_id=q.item_id)))",[&key.session_id],|r|r.get(0)).map_err(|_|err())?;
+            Ok(count != 0)
+        })
+    }
+    pub(crate) fn ensure_stop_paused(
+        &self,
+        key: &TargetKey,
+        device_id: &str,
+        device_name: &str,
+    ) -> ZResult<()> {
+        let err =
+            || super::super::types::ZcodeError::of(super::super::types::codes::STORAGE_FAILED);
+        self.store.with(|c| {
+            let tx = c.unchecked_transaction().map_err(|_|err())?;
+            let changed = tx.execute("INSERT INTO zcode_queue_state(session_id,version,auto_drain,pause_reason) VALUES (?1,1,0,'external_stop') ON CONFLICT(session_id) DO UPDATE SET version=version+1,auto_drain=0,pause_reason='external_stop' WHERE auto_drain!=0",[&key.session_id]).map_err(|_|err())?;
+            if changed != 0 { super::super::audit::record_start_conn(&tx,chrono::Utc::now().timestamp_millis(),device_id,device_name,&key.session_id,"queue_pause","external_stop").map_err(|_|err())?; }
+            tx.commit().map_err(|_|err())?; Ok(())
         })
     }
     pub(crate) fn pause(&self, key: &TargetKey, reason: &str, request_id: &str) -> ZResult<u64> {
@@ -377,6 +612,205 @@ impl SqlLocalQueueStore {
         })?;
         self.view(actor, key)
     }
+    pub(crate) fn acknowledge_manual_stop_unknown(
+        &self,
+        actor: &QueueActor,
+        key: &TargetKey,
+        stop_request: &str,
+        review_request: &str,
+        now: i64,
+    ) -> ZResult<()> {
+        use rusqlite::OptionalExtension;
+        let err =
+            || super::super::types::ZcodeError::of(super::super::types::codes::STORAGE_FAILED);
+        let invalid =
+            || super::super::types::ZcodeError::of(super::super::types::codes::INVALID_ACTION);
+        let hidden = || super::super::types::ZcodeError::of(super::super::types::codes::NO_SESSION);
+        let hash = super::super::action::payload_hash(
+            "stop_review",
+            &key.session_id,
+            0,
+            &serde_json::json!({"device":actor.device_id,"name":actor.device_name,"stop":stop_request}),
+        )?;
+        self.store.with(|c| { let tx = c.unchecked_transaction().map_err(|_|err())?;
+            check_operation_identity(&tx,review_request,Some(&actor.device_id),"stop_review")?;
+            let collision: i64 = tx.query_row("SELECT count(*) FROM zcode_send_queue WHERE request_id=?1",[review_request],|r|r.get(0)).map_err(|_|err())?;
+            if collision != 0 { return Err(invalid()); }
+            let old: Option<String> = tx.query_row("SELECT payload_hash FROM zcode_queue_operations WHERE request_id=?1",[review_request],|r|r.get(0)).optional().map_err(|_|err())?;
+            if let Some(old) = old { return if old == hash { Ok(()) } else { Err(invalid()) }; }
+            let visible: i64 = tx.query_row("SELECT count(*) FROM zcode_queue_operations WHERE request_id=?1 AND kind='stop' AND device_id=?2 AND item_id=?3",rusqlite::params![stop_request,actor.device_id,key.session_id],|r|r.get(0)).map_err(|_|err())?;
+            if visible == 0 { return Err(hidden()); }
+            let changed = tx.execute("UPDATE zcode_queue_operations SET stop_reviewed=1 WHERE request_id=?1 AND kind='stop' AND device_id=?2 AND device_name=?3 AND item_id=?4 AND operation_state='unknown' AND stop_claimed=1 AND stop_reviewed=0",rusqlite::params![stop_request,actor.device_id,actor.device_name,key.session_id]).map_err(|_|err())?;
+            if changed != 1 { return Err(invalid()); }
+            tx.execute("UPDATE zcode_queue_state SET version=version+1,auto_drain=0,pause_reason='manual_stop_reviewed' WHERE session_id=?1",[&key.session_id]).map_err(|_|err())?;
+            tx.execute("INSERT INTO zcode_queue_operations(request_id,kind,payload_hash,device_id,device_name,item_id,expected_version,operation_state,expires_at) VALUES (?1,'stop_review',?2,?3,?4,?5,0,'completed',9223372036854775807)",rusqlite::params![review_request,hash,actor.device_id,actor.device_name,key.session_id]).map_err(|_|err())?;
+            super::super::audit::record_start_conn(&tx,now,&actor.device_id,&actor.device_name,&key.session_id,"queue_stop_review","reviewed").map_err(|_|err())?;
+            tx.commit().map_err(|_|err())?; Ok(()) })
+    }
+    pub(crate) fn begin_stop(
+        &self,
+        actor: &QueueActor,
+        key: &TargetKey,
+        request_id: &str,
+        execution: &str,
+        now: i64,
+    ) -> ZResult<(QueueOperationView, bool, String)> {
+        use rusqlite::OptionalExtension;
+        let err =
+            || super::super::types::ZcodeError::of(super::super::types::codes::STORAGE_FAILED);
+        let invalid =
+            || super::super::types::ZcodeError::of(super::super::types::codes::INVALID_ACTION);
+        let hidden = || super::super::types::ZcodeError::of(super::super::types::codes::NO_SESSION);
+        let hash = super::super::action::payload_hash(
+            "stop",
+            &key.session_id,
+            0,
+            &serde_json::json!({"device":actor.device_id,"name":actor.device_name,"execution":execution}),
+        )?;
+        let (owner, action) = self.store.with(|c| {
+            let tx = c.unchecked_transaction().map_err(|_| err())?;
+            check_operation_identity(&tx,request_id,Some(&actor.device_id),"stop")?;
+            let existing: Option<(String,String,String)> = tx.query_row("SELECT device_id,payload_hash,stop_action_id FROM zcode_queue_operations WHERE request_id=?1",[request_id],|r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional().map_err(|_| err())?;
+            if let Some((device, old_hash, action)) = existing {
+                if device != actor.device_id {
+                    return Err(hidden());
+                }
+                if old_hash != hash {
+                    return Err(invalid());
+                }
+                return Ok((false, action));
+            }
+            let collision: i64 = tx.query_row("SELECT count(*) FROM zcode_send_queue WHERE request_id=?1",[request_id],|r|r.get(0)).map_err(|_|err())?;
+            if collision != 0 { return Err(invalid()); }
+            let busy: i64 = tx.query_row("SELECT (SELECT count(*) FROM zcode_queue_operations WHERE kind='stop' AND item_id=?1 AND (operation_state='in_flight' OR (operation_state='unknown' AND stop_reviewed=0))) + (SELECT count(*) FROM zcode_send_queue q JOIN zcode_queue_operations o ON o.request_id=q.priority_request WHERE q.session_id=?1 AND o.operation_state IN ('in_flight','unknown') AND NOT (q.state='unknown' AND EXISTS (SELECT 1 FROM zcode_queue_operations r WHERE r.kind='unknown_review' AND r.item_id=q.item_id)))",[&key.session_id],|r|r.get(0)).map_err(|_|err())?;
+            if busy != 0 { return Err(invalid()); }
+            let action = super::super::command::new_command_id();
+            tx.execute("INSERT INTO zcode_queue_operations(request_id,kind,payload_hash,device_id,device_name,item_id,expected_version,stop_action_id,expected_execution_id,expires_at) VALUES (?1,'stop',?2,?3,?4,?5,0,?6,?7,9223372036854775807)",rusqlite::params![request_id,hash,actor.device_id,actor.device_name,key.session_id,action,execution]).map_err(|_|err())?;
+            tx.execute("INSERT INTO zcode_queue_state(session_id,version,auto_drain,pause_reason) VALUES (?1,1,0,'manual_stop') ON CONFLICT(session_id) DO UPDATE SET version=version+1,auto_drain=0,pause_reason='manual_stop'",[&key.session_id]).map_err(|_|err())?;
+            super::super::audit::record_start_conn(&tx,now,&actor.device_id,&actor.device_name,&key.session_id,"queue_stop_begin","stop").map_err(|_|err())?;
+            tx.commit().map_err(|_|err())?; Ok((true,action))
+        })?;
+        Ok((
+            self.operation(actor, request_id)?.ok_or_else(err)?,
+            owner,
+            action,
+        ))
+    }
+    pub(crate) fn finish_unclaimed_manual_stop(
+        &self,
+        actor: &QueueActor,
+        request_id: &str,
+        failure: Option<&StopFailure>,
+    ) -> ZResult<bool> {
+        let err =
+            || super::super::types::ZcodeError::of(super::super::types::codes::STORAGE_FAILED);
+        let encoded = failure.map(|f| serde_json::json!({"stopFailure":f}).to_string());
+        self.store.with(|c| { let tx=c.unchecked_transaction().map_err(|_|err())?;
+            let changed=tx.execute("UPDATE zcode_queue_operations SET operation_state='failed',operation_receipt=?4 WHERE request_id=?1 AND kind='stop' AND device_id=?2 AND device_name=?3 AND stop_claimed=0 AND operation_state='in_flight'",rusqlite::params![request_id,actor.device_id,actor.device_name,encoded]).map_err(|_|err())?;
+            if changed == 0 { return Ok(false); }
+            let session:String=tx.query_row("SELECT item_id FROM zcode_queue_operations WHERE request_id=?1",[request_id],|r|r.get(0)).map_err(|_|err())?;
+            tx.execute("UPDATE zcode_queue_state SET version=version+1,auto_drain=0,pause_reason='manual_stop' WHERE session_id=?1",[&session]).map_err(|_|err())?;
+            super::super::audit::record_start_conn(&tx,chrono::Utc::now().timestamp_millis(),&actor.device_id,&actor.device_name,&session,"queue_stop_end","failed").map_err(|_|err())?;
+            tx.commit().map_err(|_|err())?; Ok(true) })
+    }
+    pub(crate) fn claim_manual_stop(
+        &self,
+        actor: &QueueActor,
+        request_id: &str,
+        generation: u64,
+    ) -> ZResult<()> {
+        let err =
+            || super::super::types::ZcodeError::of(super::super::types::codes::STORAGE_FAILED);
+        let generation = i64::try_from(generation).map_err(|_| err())?;
+        self.store.with(|c| { let tx = c.unchecked_transaction().map_err(|_|err())?;
+            let changed = tx.execute("UPDATE zcode_queue_operations SET stop_claimed=1,stop_generation=?1 WHERE request_id=?2 AND kind='stop' AND device_id=?3 AND device_name=?4 AND stop_claimed=0 AND operation_state='in_flight'",rusqlite::params![generation,request_id,actor.device_id,actor.device_name]).map_err(|_|err())?;
+            if changed != 1 { return Err(super::super::types::ZcodeError::of(super::super::types::codes::INVALID_ACTION)); }
+            let session: String = tx.query_row("SELECT item_id FROM zcode_queue_operations WHERE request_id=?1",[request_id],|r|r.get(0)).map_err(|_|err())?;
+            super::super::audit::record_start_conn(&tx,chrono::Utc::now().timestamp_millis(),&actor.device_id,&actor.device_name,&session,"queue_stop_claim","stop").map_err(|_|err())?;
+            tx.commit().map_err(|_|err())?; Ok(()) })
+    }
+    pub(crate) fn finish_manual_stop(
+        &self,
+        actor: &QueueActor,
+        request_id: &str,
+        state: QueueOperationState,
+        receipt: Option<&super::super::types::ActionReceipt>,
+    ) -> ZResult<()> {
+        self.finish_manual_stop_with_failure(actor, request_id, state, receipt, None)
+    }
+    pub(crate) fn finish_manual_stop_with_failure(
+        &self,
+        actor: &QueueActor,
+        request_id: &str,
+        state: QueueOperationState,
+        receipt: Option<&super::super::types::ActionReceipt>,
+        failure: Option<StopFailure>,
+    ) -> ZResult<()> {
+        let err =
+            || super::super::types::ZcodeError::of(super::super::types::codes::STORAGE_FAILED);
+        let value = match state {
+            QueueOperationState::Completed => "completed",
+            QueueOperationState::Failed => "failed",
+            QueueOperationState::Unknown => "unknown",
+            _ => {
+                return Err(super::super::types::ZcodeError::of(
+                    super::super::types::codes::INVALID_ACTION,
+                ))
+            }
+        };
+        let receipt = match failure {
+            Some(failure) => Some(serde_json::json!({"stopFailure":failure}).to_string()),
+            None => receipt
+                .map(serde_json::to_string)
+                .transpose()
+                .map_err(|_| err())?,
+        };
+        self.store.with(|c| { let tx = c.unchecked_transaction().map_err(|_|err())?;
+            let changed = tx.execute("UPDATE zcode_queue_operations SET operation_state=?1,operation_receipt=?2 WHERE request_id=?3 AND kind='stop' AND device_id=?4 AND device_name=?5 AND operation_state='in_flight'",rusqlite::params![value,receipt,request_id,actor.device_id,actor.device_name]).map_err(|_|err())?;
+            if changed != 1 { return Err(super::super::types::ZcodeError::of(super::super::types::codes::INVALID_ACTION)); }
+            let session: String = tx.query_row("SELECT item_id FROM zcode_queue_operations WHERE request_id=?1",[request_id],|r|r.get(0)).map_err(|_|err())?;
+            tx.execute("UPDATE zcode_queue_state SET version=version+1,auto_drain=0,pause_reason='manual_stop' WHERE session_id=?1",[&session]).map_err(|_|err())?;
+            super::super::audit::record_start_conn(&tx,chrono::Utc::now().timestamp_millis(),&actor.device_id,&actor.device_name,&session,"queue_stop_end",value).map_err(|_|err())?;
+            tx.commit().map_err(|_|err())?; Ok(()) })
+    }
+    pub(crate) fn priority_item_matches_target(
+        &self,
+        actor: &QueueActor,
+        cmd: &PriorityCommand,
+        target: &super::super::types::BoundTarget,
+    ) -> ZResult<bool> {
+        use rusqlite::OptionalExtension;
+        let err =
+            || super::super::types::ZcodeError::of(super::super::types::codes::STORAGE_FAILED);
+        self.store.with(|c| {
+            let row: Option<(String,String,Option<String>)> = c.query_row("SELECT session_id,workspace_path,workspace_identity FROM zcode_send_queue WHERE item_id=?1 AND device_id=?2 AND state='queued' AND priority_request=?3",rusqlite::params![cmd.item_id,actor.device_id,cmd.request_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional().map_err(|_|err())?;
+            Ok(row.is_some_and(|(session,path,identity)| session == target.session_id && path == target.workspace_path && (identity.is_none() || identity == target.workspace_identity)))
+        })
+    }
+    pub(crate) fn item_key(
+        &self,
+        actor: &QueueActor,
+        item_id: &str,
+    ) -> ZResult<super::super::types::TargetKey> {
+        use rusqlite::OptionalExtension;
+        self.store.with(|c| {
+            let session: Option<String> = c
+                .query_row(
+                    "SELECT session_id FROM zcode_send_queue WHERE item_id=?1 AND device_id=?2",
+                    rusqlite::params![item_id, actor.device_id],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(|_| {
+                    super::super::types::ZcodeError::of(super::super::types::codes::STORAGE_FAILED)
+                })?;
+            Ok(super::super::types::TargetKey {
+                session_id: session.ok_or_else(|| {
+                    super::super::types::ZcodeError::of(super::super::types::codes::NO_SESSION)
+                })?,
+            })
+        })
+    }
     pub(crate) fn begin_priority(
         &self,
         actor: &QueueActor,
@@ -405,14 +839,23 @@ impl SqlLocalQueueStore {
             if let Some(owner) = enqueue_owner { return Err(if owner == actor.device_id { invalid() } else { hidden() }); }
             let existing: Option<(String,String,String,String)> = tx.query_row("SELECT device_id,payload_hash,stop_action_id,send_action_id FROM zcode_queue_operations WHERE request_id=?1", [&cmd.request_id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional().map_err(|_| err())?;
             let (owner, stop_action_id, send_action_id) = if let Some((device, old_hash, stop, send)) = existing {
-                if device != actor.device_id { return Err(hidden()); } if old_hash != hash { return Err(invalid()); }
+                if device != actor.device_id {
+                    return Err(hidden());
+                }
+                if old_hash != hash {
+                    return Err(invalid());
+                }
                 (false,stop,send)
             } else {
                 let row: Option<(String,String,i64,Option<String>)> = tx.query_row("SELECT session_id,state,item_version,priority_request FROM zcode_send_queue WHERE item_id=?1 AND device_id=?2", rusqlite::params![cmd.item_id,actor.device_id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional().map_err(|_| err())?;
                 let (session,state,current,reservation)=row.ok_or_else(hidden)?;
                 if state != "queued" || current != version || reservation.is_some() { return Err(invalid()); }
-                let busy: i64 = tx.query_row("SELECT count(*) FROM zcode_send_queue q LEFT JOIN zcode_queue_operations o ON o.request_id=q.priority_request WHERE q.session_id=?1 AND (q.state='dispatching' OR (o.kind='priority' AND o.operation_state IN ('in_flight','unknown')))", [&session], |r| r.get(0)).map_err(|_| err())?;
+                let busy: i64 = tx.query_row("SELECT count(*) FROM zcode_send_queue q LEFT JOIN zcode_queue_operations o ON o.request_id=q.priority_request WHERE q.session_id=?1 AND (q.state='dispatching' OR (o.kind='priority' AND o.operation_state IN ('in_flight','unknown') AND NOT (q.state='unknown' AND EXISTS (SELECT 1 FROM zcode_queue_operations r WHERE r.kind='unknown_review' AND r.item_id=q.item_id))))", [&session], |r| r.get(0)).map_err(|_| err())?;
                 if busy != 0 { return Err(invalid()); }
+                let blocked: i64 = tx.query_row("SELECT (SELECT count(*) FROM zcode_send_queue q WHERE q.session_id=?1 AND q.state='unknown' AND NOT EXISTS (SELECT 1 FROM zcode_queue_operations r WHERE r.kind='unknown_review' AND r.item_id=q.item_id)) + (SELECT count(*) FROM zcode_queue_state WHERE session_id=?1 AND auto_drain=0 AND pause_reason IN ('unconfirmed','unknown_reviewed'))",[&session],|r|r.get(0)).map_err(|_|err())?;
+                if blocked != 0 { return Err(invalid()); }
+                let stopping: i64 = tx.query_row("SELECT count(*) FROM zcode_queue_operations WHERE kind='stop' AND item_id=?1 AND (operation_state='in_flight' OR (operation_state='unknown' AND stop_reviewed=0))",[&session],|r|r.get(0)).map_err(|_|err())?;
+                if stopping != 0 { return Err(invalid()); }
                 let changed = tx.execute("UPDATE zcode_send_queue SET priority_request=?1 WHERE item_id=?2 AND state='queued' AND item_version=?3 AND priority_request IS NULL", rusqlite::params![cmd.request_id,cmd.item_id,version]).map_err(|_| err())?;
                 if changed != 1 { return Err(invalid()); }
                 let stop = super::super::command::new_command_id();
@@ -423,7 +866,7 @@ impl SqlLocalQueueStore {
                 (true,stop,send)
             };
             tx.commit().map_err(|_| err())?;
-            Ok(PriorityClaim { operation: QueueOperationView { request_id: cmd.request_id.clone(),state: QueueOperationState::InFlight,receipt: None },is_owner: owner,stop_action_id,send_action_id })
+            Ok(PriorityClaim { operation: QueueOperationView { request_id: cmd.request_id.clone(),state: QueueOperationState::InFlight,receipt: None,stop_failure: None },is_owner: owner,stop_action_id,send_action_id })
         })?;
         claim.operation = self.operation(actor, &cmd.request_id)?.ok_or_else(err)?;
         Ok(claim)
@@ -530,6 +973,90 @@ impl SqlLocalQueueStore {
         self.store.with(|c| {
             let row: Option<(String,Option<String>)> = c.query_row("SELECT workspace_path,workspace_identity FROM zcode_send_queue WHERE session_id=?1 AND state='queued' ORDER BY seq LIMIT 1",[&key.session_id],|r|Ok((r.get(0)?,r.get(1)?))).optional().map_err(|_|err())?;
             Ok(row.is_none_or(|(path,identity)| target.session_id == key.session_id && path == target.workspace_path && (identity.is_none() || identity == target.workspace_identity)))
+        })
+    }
+    pub(crate) fn attachments_valid(
+        &self,
+        key: &TargetKey,
+        item_id: Option<&str>,
+        workspace: &str,
+    ) -> ZResult<bool> {
+        use rusqlite::OptionalExtension;
+        let raw: Option<String> = self.store.with(|c| {
+            let sql = if item_id.is_some() {
+                "SELECT draft FROM zcode_send_queue WHERE session_id=?1 AND item_id=?2 AND state IN ('queued','dispatching')"
+            } else {
+                "SELECT draft FROM zcode_send_queue WHERE session_id=?1 AND state='queued' ORDER BY seq LIMIT 1"
+            };
+            if let Some(id) = item_id { c.query_row(sql, rusqlite::params![key.session_id,id], |r| r.get(0)).optional() }
+            else { c.query_row(sql, [&key.session_id], |r| r.get(0)).optional() }
+        }).map_err(|_| super::super::types::ZcodeError::of(super::super::types::codes::STORAGE_FAILED))?;
+        let Some(raw) = raw else {
+            return Ok(false);
+        };
+        let draft: QueueDraft = serde_json::from_str(&raw).map_err(|_| {
+            super::super::types::ZcodeError::of(super::super::types::codes::STORAGE_FAILED)
+        })?;
+        Ok(draft.attachments.iter().all(|a| {
+            crate::remote::attachments::valid_attachment_path(
+                std::path::Path::new(workspace),
+                &key.session_id,
+                &a.path,
+            )
+        }))
+    }
+    pub(crate) fn dispatch_attachments_valid(
+        &self,
+        key: &TargetKey,
+        device_id: &str,
+        action_id: &str,
+        workspace: &str,
+    ) -> ZResult<bool> {
+        use rusqlite::OptionalExtension;
+        let item: Option<String> = self.store.with(|c| c.query_row(
+            "SELECT item_id FROM zcode_send_queue WHERE session_id=?1 AND device_id=?2 AND dispatch_action_id=?3 AND state='dispatching'",
+            rusqlite::params![key.session_id, device_id, action_id], |r| r.get(0),
+        ).optional()).map_err(|_| super::super::types::ZcodeError::of(super::super::types::codes::STORAGE_FAILED))?;
+        match item {
+            Some(item) => self.attachments_valid(key, Some(&item), workspace),
+            None => Ok(false),
+        }
+    }
+    pub(crate) fn priority_stop_attachments_valid(
+        &self,
+        key: &TargetKey,
+        device_id: &str,
+        action_id: &str,
+        workspace: &str,
+        generation: u64,
+        execution_id: &str,
+    ) -> ZResult<bool> {
+        use rusqlite::OptionalExtension;
+        let generation = i64::try_from(generation).map_err(|_| {
+            super::super::types::ZcodeError::of(super::super::types::codes::INVALID_ACTION)
+        })?;
+        let row: Option<(String,String)> = self.store.with(|c| c.query_row(
+            "SELECT o.kind,o.item_id FROM zcode_queue_operations o LEFT JOIN zcode_send_queue q ON q.item_id=o.item_id WHERE o.stop_action_id=?1 AND o.device_id=?2 AND o.stop_claimed=1 AND o.operation_state='in_flight' AND o.stop_generation=?4 AND o.expected_execution_id=?5 AND ((o.kind='priority' AND q.session_id=?3 AND q.priority_request=o.request_id AND q.state='queued') OR (o.kind='stop' AND o.item_id=?3))",
+            rusqlite::params![action_id, device_id, key.session_id, generation, execution_id], |r| Ok((r.get(0)?,r.get(1)?)),
+        ).optional()).map_err(|_| super::super::types::ZcodeError::of(super::super::types::codes::STORAGE_FAILED))?;
+        match row {
+            Some((kind, item)) if kind == "priority" => {
+                self.attachments_valid(key, Some(&item), workspace)
+            }
+            Some((kind, _)) if kind == "stop" => Ok(true),
+            _ => Err(super::super::types::ZcodeError::of(
+                super::super::types::codes::NO_SESSION,
+            )),
+        }
+    }
+    pub(crate) fn pause_attachment_missing(&self, key: &TargetKey, now: i64) -> ZResult<()> {
+        let err =
+            || super::super::types::ZcodeError::of(super::super::types::codes::STORAGE_FAILED);
+        self.store.with(|c| {
+            let tx = c.unchecked_transaction().map_err(|_| err())?;
+            let changed = tx.execute("UPDATE zcode_queue_state SET version=version+1,auto_drain=0,pause_reason='attachment_missing' WHERE session_id=?1 AND auto_drain<>0", [&key.session_id]).map_err(|_| err())?;
+            if changed != 0 { super::super::audit::record_start_conn(&tx, now, "", "Tuvis", &key.session_id, "queue_attachment_missing", "paused").map_err(|_| err())?; }
+            tx.commit().map_err(|_| err())
         })
     }
     pub(crate) fn pause_target_mismatch(&self, key: &TargetKey, now: i64) -> ZResult<()> {
@@ -687,6 +1214,8 @@ impl SqlLocalQueueStore {
             let visible: i64 = tx.query_row("SELECT count(*) FROM zcode_send_queue WHERE item_id=?1 AND device_id=?2",rusqlite::params![cmd.item_id,actor.device_id],|r| r.get(0)).map_err(|_| err())?;
             if visible == 0 { return Err(hidden()); }
             let (session,device_name,text,path,identity,action_id): (String,String,String,String,Option<String>,String) = tx.query_row("SELECT q.session_id,q.device_name,q.prepared,q.workspace_path,q.workspace_identity,o.send_action_id FROM zcode_send_queue q JOIN zcode_queue_operations o ON o.request_id=q.priority_request WHERE q.item_id=?1 AND q.device_id=?2 AND q.item_version=?3 AND q.state='queued' AND q.priority_request=?4 AND o.kind='priority' AND o.device_id=?2 AND o.device_name=?5 AND o.operation_state='in_flight'", rusqlite::params![cmd.item_id,actor.device_id,version,operation_id,actor.device_name], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?))).map_err(|e| if matches!(e,rusqlite::Error::QueryReturnedNoRows) { invalid() } else { err() })?;
+            let blocked: i64 = tx.query_row("SELECT count(*) FROM zcode_send_queue q WHERE q.session_id=?1 AND (q.state='dispatching' OR (q.state='unknown' AND NOT EXISTS (SELECT 1 FROM zcode_queue_operations r WHERE r.kind='unknown_review' AND r.item_id=q.item_id)) OR (q.state='accepted' AND coalesce(json_extract(q.receipt,'$.sendAdmission.delivery'),'startNow')='startNow' AND coalesce(json_extract(q.receipt,'$._queueTerminal'),0)=0 AND coalesce(json_extract(q.receipt,'$._queueUnconfirmed'),0)=0))",[&session],|r|r.get(0)).map_err(|_|err())?;
+            if blocked != 0 { return Err(invalid()); }
             if session != target.session_id || path != target.workspace_path || (identity.is_some() && identity != target.workspace_identity) { return Err(invalid()); }
             if identity.is_none() && target.workspace_identity.is_some() {
                 tx.execute("UPDATE zcode_send_queue SET workspace_identity=?1 WHERE item_id=?2 AND workspace_identity IS NULL", rusqlite::params![target.workspace_identity,cmd.item_id]).map_err(|_| err())?;
@@ -719,10 +1248,12 @@ impl SqlLocalQueueStore {
             let tx = c.unchecked_transaction().map_err(|_| err())?;
             let paused: Option<i64> = tx.query_row("SELECT auto_drain FROM zcode_queue_state WHERE session_id=?1", [&key.session_id], |r| r.get(0)).optional().map_err(|_| err())?;
             if paused == Some(0) { return Ok(None); }
-            let in_flight: i64 = tx.query_row("SELECT count(*) FROM zcode_send_queue WHERE session_id=?1 AND (state='dispatching' OR (state='accepted' AND coalesce(json_extract(receipt,'$.sendAdmission.delivery'),'startNow')='startNow' AND coalesce(json_extract(receipt,'$._queueTerminal'),0)=0 AND coalesce(json_extract(receipt,'$._queueUnconfirmed'),0)=0))", [&key.session_id], |r| r.get(0)).map_err(|_| err())?;
+            let in_flight: i64 = tx.query_row("SELECT count(*) FROM zcode_send_queue WHERE session_id=?1 AND (state='dispatching' OR (state='unknown' AND NOT EXISTS (SELECT 1 FROM zcode_queue_operations r WHERE r.kind='unknown_review' AND r.item_id=zcode_send_queue.item_id)) OR (state='accepted' AND coalesce(json_extract(receipt,'$.sendAdmission.delivery'),'startNow')='startNow' AND coalesce(json_extract(receipt,'$._queueTerminal'),0)=0 AND coalesce(json_extract(receipt,'$._queueUnconfirmed'),0)=0))", [&key.session_id], |r| r.get(0)).map_err(|_| err())?;
             if in_flight != 0 { return Ok(None); }
-            let priority: i64 = tx.query_row("SELECT count(*) FROM zcode_send_queue q JOIN zcode_queue_operations o ON o.request_id=q.priority_request WHERE q.session_id=?1 AND o.kind='priority' AND o.operation_state IN ('in_flight','unknown')", [&key.session_id], |r| r.get(0)).map_err(|_| err())?;
+            let priority: i64 = tx.query_row("SELECT count(*) FROM zcode_send_queue q JOIN zcode_queue_operations o ON o.request_id=q.priority_request WHERE q.session_id=?1 AND o.kind='priority' AND o.operation_state IN ('in_flight','unknown') AND NOT (q.state='unknown' AND EXISTS (SELECT 1 FROM zcode_queue_operations r WHERE r.kind='unknown_review' AND r.item_id=q.item_id))", [&key.session_id], |r| r.get(0)).map_err(|_| err())?;
             if priority != 0 { return Ok(None); }
+            let stopping: i64 = tx.query_row("SELECT count(*) FROM zcode_queue_operations WHERE kind='stop' AND item_id=?1 AND (operation_state='in_flight' OR (operation_state='unknown' AND stop_reviewed=0))",[&key.session_id],|r|r.get(0)).map_err(|_|err())?;
+            if stopping != 0 { return Ok(None); }
             let row: Option<(String,String,String,String,String,Option<String>)> = tx.query_row("SELECT item_id,device_id,device_name,prepared,workspace_path,workspace_identity FROM zcode_send_queue WHERE session_id=?1 AND state='queued' ORDER BY seq LIMIT 1", [&key.session_id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?))).optional().map_err(|_| err())?;
             let Some((item_id, device_id, device_name, text, path, identity)) = row else { return Ok(None); };
             if path != target.workspace_path || (identity.is_some() && identity != target.workspace_identity) { return Err(super::super::types::ZcodeError::of(super::super::types::codes::INVALID_ACTION)); }
@@ -795,6 +1326,21 @@ impl SqlLocalQueueStore {
         }
         result
     }
+
+    pub(crate) fn edit_request_key(
+        &self,
+        actor: &QueueActor,
+        request_id: &str,
+    ) -> ZResult<TargetKey> {
+        use rusqlite::OptionalExtension;
+        self.store.with(|conn| {
+            let session: Option<String> = conn.query_row(
+                "SELECT q.session_id FROM zcode_queue_operations o JOIN zcode_send_queue q ON q.item_id=o.item_id WHERE o.request_id=?1 AND o.device_id=?2 AND o.kind='edit'",
+                rusqlite::params![request_id, actor.device_id], |row| row.get(0),
+            ).optional().map_err(|_| super::super::types::ZcodeError::of(super::super::types::codes::STORAGE_FAILED))?;
+            Ok(TargetKey { session_id: session.ok_or_else(|| super::super::types::ZcodeError::of(super::super::types::codes::NO_SESSION))? })
+        })
+    }
     pub(crate) fn edit(
         &self,
         actor: &QueueActor,
@@ -818,7 +1364,8 @@ impl SqlLocalQueueStore {
                 let draft = draft.ok_or_else(invalid)?;
                 return Ok(EditResult { request_id: cmd.request_id.clone(), item_id: cmd.item_id.clone(), expires_at_ms: expiry, draft: serde_json::from_str(&draft).map_err(|_| err())? });
             }
-            let row: Option<(Option<String>,String,String,i64,Option<String>)> = tx.query_row("SELECT draft,session_id,state,item_version,priority_request FROM zcode_send_queue WHERE item_id=?1 AND device_id=?2", rusqlite::params![cmd.item_id,actor.device_id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional().map_err(|_| err())?;
+            type EditQueueRow = (Option<String>, String, String, i64, Option<String>);
+            let row: Option<EditQueueRow> = tx.query_row("SELECT draft,session_id,state,item_version,priority_request FROM zcode_send_queue WHERE item_id=?1 AND device_id=?2", rusqlite::params![cmd.item_id,actor.device_id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional().map_err(|_| err())?;
             let (draft,session,state,current,reservation) = row.ok_or_else(hidden)?;
             if state != "queued" || current != version || reservation.is_some() { return Err(invalid()); }
             let draft = draft.ok_or_else(err)?;
@@ -1247,6 +1794,221 @@ mod tests {
         store.finish_edit(&actor, "edit").unwrap();
         assert_eq!(store.view(&actor, &key).unwrap().version, before + 1);
         assert!(store.edit(&actor, &edit, 4).is_err());
+    }
+    #[test]
+    fn stop_before_write_replay_does_not_alias_rejected_receipt() {
+        let store = SqlLocalQueueStore::new(DeviceStore::memory());
+        let actor = QueueActor {
+            device_id: "device".into(),
+            device_name: "phone".into(),
+        };
+        let cmd = EnqueueCommand {
+            request_id: "enq".into(),
+            actor: actor.clone(),
+            session_id: "session".into(),
+            workspace_path: "/synthetic".into(),
+            workspace_identity: None,
+            draft: QueueDraft {
+                text: "sample".into(),
+                attachments: vec![],
+            },
+            prepared: PreparedSend::from_stored("sample".into()).unwrap(),
+            edited_from: None,
+        };
+        let item = store.enqueue(&cmd, 1).unwrap();
+        let priority = PriorityCommand {
+            request_id: "priority".into(),
+            item_id: item.item_id.clone(),
+            expected_version: 1,
+            confirm_stop: true,
+            expected_execution_id: Some("execution".into()),
+            held_queue: None,
+        };
+        let first = store.begin_priority(&actor, &priority, 2).unwrap();
+        assert!(store
+            .mark_stop_claimed(&actor, "priority", 1, "execution")
+            .unwrap());
+        let receipt = super::super::super::types::ActionReceipt {
+            action_id: first.stop_action_id.clone(),
+            session_id: "session".into(),
+            generation: 1,
+            state: super::super::super::types::ActionState::Rejected,
+            reason_code: None,
+            send_admission: None,
+        };
+        store
+            .finish_priority_safe(&actor, "priority", PriorityEnd::StopRejected(receipt), 4)
+            .unwrap();
+        assert!(store
+            .finish_priority_safe(
+                &actor,
+                "priority",
+                PriorityEnd::StopBeforeWrite {
+                    action_id: first.stop_action_id,
+                    generation: 1
+                },
+                5
+            )
+            .is_err());
+    }
+    #[test]
+    fn claimed_stop_before_write_safely_releases_only_matching_attempt() {
+        let store = SqlLocalQueueStore::new(DeviceStore::memory());
+        let actor = QueueActor {
+            device_id: "device".into(),
+            device_name: "phone".into(),
+        };
+        let cmd = EnqueueCommand {
+            request_id: "enq".into(),
+            actor: actor.clone(),
+            session_id: "session".into(),
+            workspace_path: "/synthetic".into(),
+            workspace_identity: None,
+            draft: QueueDraft {
+                text: "sample".into(),
+                attachments: vec![],
+            },
+            prepared: PreparedSend::from_stored("sample".into()).unwrap(),
+            edited_from: None,
+        };
+        let item = store.enqueue(&cmd, 1).unwrap();
+        let priority = PriorityCommand {
+            request_id: "priority".into(),
+            item_id: item.item_id.clone(),
+            expected_version: 1,
+            confirm_stop: true,
+            expected_execution_id: Some("execution".into()),
+            held_queue: None,
+        };
+        let first = store.begin_priority(&actor, &priority, 2).unwrap();
+        assert!(store
+            .mark_stop_claimed(&actor, "priority", 1, "execution")
+            .unwrap());
+        assert!(store
+            .finish_priority_safe(
+                &actor,
+                "priority",
+                PriorityEnd::StopBeforeWrite {
+                    action_id: "wrong".into(),
+                    generation: 1
+                },
+                4
+            )
+            .is_err());
+        assert!(store
+            .finish_priority_safe(
+                &actor,
+                "priority",
+                PriorityEnd::StopBeforeWrite {
+                    action_id: first.stop_action_id.clone(),
+                    generation: 2
+                },
+                4
+            )
+            .is_err());
+        store
+            .finish_priority_safe(
+                &actor,
+                "priority",
+                PriorityEnd::StopBeforeWrite {
+                    action_id: first.stop_action_id.clone(),
+                    generation: 1,
+                },
+                4,
+            )
+            .unwrap();
+        store
+            .finish_priority_safe(
+                &actor,
+                "priority",
+                PriorityEnd::StopBeforeWrite {
+                    action_id: first.stop_action_id,
+                    generation: 1,
+                },
+                5,
+            )
+            .unwrap();
+        let key = TargetKey {
+            session_id: "session".into(),
+        };
+        let view = store.view(&actor, &key).unwrap();
+        assert!(!view.auto_drain);
+        assert_eq!(view.items[0].state, QueueItemState::Queued);
+        assert_eq!(
+            store.operation(&actor, "priority").unwrap().unwrap().state,
+            QueueOperationState::Failed
+        );
+    }
+    #[test]
+    fn stop_operation_reads_legacy_null_and_formal_rejection() {
+        let store = SqlLocalQueueStore::new(DeviceStore::memory());
+        let actor = QueueActor {
+            device_id: "device".into(),
+            device_name: "phone".into(),
+        };
+        let cmd = EnqueueCommand {
+            request_id: "enq".into(),
+            actor: actor.clone(),
+            session_id: "session".into(),
+            workspace_path: "/synthetic".into(),
+            workspace_identity: None,
+            draft: QueueDraft {
+                text: "sample".into(),
+                attachments: vec![],
+            },
+            prepared: PreparedSend::from_stored("sample".into()).unwrap(),
+            edited_from: None,
+        };
+        let item = store.enqueue(&cmd, 1).unwrap();
+        let priority = PriorityCommand {
+            request_id: "priority".into(),
+            item_id: item.item_id.clone(),
+            expected_version: 1,
+            confirm_stop: true,
+            expected_execution_id: Some("execution".into()),
+            held_queue: None,
+        };
+        let first = store.begin_priority(&actor, &priority, 2).unwrap();
+        let legacy = store.operation(&actor, "priority").unwrap().unwrap();
+        assert!(legacy.receipt.is_none());
+        assert!(legacy.stop_failure.is_none());
+        assert!(serde_json::to_value(&legacy)
+            .unwrap()
+            .get("stopFailure")
+            .is_none());
+        assert!(store
+            .mark_stop_claimed(&actor, "priority", 1, "execution")
+            .unwrap());
+        let receipt = super::super::super::types::ActionReceipt {
+            action_id: first.stop_action_id,
+            session_id: "session".into(),
+            generation: 1,
+            state: super::super::super::types::ActionState::Rejected,
+            reason_code: Some("needs_evidence".into()),
+            send_admission: None,
+        };
+        store
+            .finish_priority_safe(
+                &actor,
+                "priority",
+                PriorityEnd::StopRejected(receipt.clone()),
+                4,
+            )
+            .unwrap();
+        let operation = store.operation(&actor, "priority").unwrap().unwrap();
+        assert_eq!(operation.receipt, Some(receipt));
+        assert!(operation.stop_failure.is_none());
+        let replay = store
+            .begin_priority(&actor, &priority, 5)
+            .unwrap()
+            .operation;
+        assert_eq!(
+            serde_json::to_value(&operation).unwrap(),
+            serde_json::to_value(replay).unwrap()
+        );
+        let old_json = serde_json::json!({"requestId":"legacy","state":"failed","receipt":null});
+        let decoded: QueueOperationView = serde_json::from_value(old_json).unwrap();
+        assert!(decoded.stop_failure.is_none());
     }
     #[test]
     fn priority_has_one_owner_and_stop_is_claimed_once() {
@@ -2157,6 +2919,133 @@ mod tests {
         assert!(view.auto_drain);
         assert_eq!(view.items.len(), 1);
         assert!(store.operation(&actor, "priority").unwrap().is_none());
+    }
+    #[test]
+    fn manual_stop_claim_audit_failure_rolls_back_claim() {
+        let db = DeviceStore::memory();
+        let store = SqlLocalQueueStore::new(db.clone());
+        let actor = QueueActor {
+            device_id: "device".into(),
+            device_name: "phone".into(),
+        };
+        let key = TargetKey {
+            session_id: "session".into(),
+        };
+        store
+            .begin_stop(&actor, &key, "stop", "execution", 1)
+            .unwrap();
+        db.with(|c| c.execute_batch("DROP TABLE write_audit").unwrap());
+        assert!(store.claim_manual_stop(&actor, "stop", 1).is_err());
+        db.with(|c| {
+            let claimed: i64 = c
+                .query_row(
+                    "SELECT stop_claimed FROM zcode_queue_operations WHERE request_id='stop'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(claimed, 0);
+        });
+    }
+    #[test]
+    fn manual_stop_review_keeps_tombstone_and_requires_new_resume() {
+        let store = SqlLocalQueueStore::new(DeviceStore::memory());
+        let actor = QueueActor {
+            device_id: "device".into(),
+            device_name: "phone".into(),
+        };
+        let key = TargetKey {
+            session_id: "session".into(),
+        };
+        store
+            .begin_stop(&actor, &key, "stop", "execution", 1)
+            .unwrap();
+        store.claim_manual_stop(&actor, "stop", 1).unwrap();
+        store
+            .finish_manual_stop(&actor, "stop", QueueOperationState::Unknown, None)
+            .unwrap();
+        let version = store.view(&actor, &key).unwrap().version;
+        store.resume(&actor, &key, "early", version).unwrap();
+        let other = QueueActor {
+            device_id: "other".into(),
+            device_name: "other".into(),
+        };
+        assert!(store
+            .acknowledge_manual_stop_unknown(&other, &key, "stop", "review", 2)
+            .is_err());
+        store
+            .acknowledge_manual_stop_unknown(&actor, &key, "stop", "review", 2)
+            .unwrap();
+        let paused = store.view(&actor, &key).unwrap();
+        assert!(!paused.auto_drain);
+        assert_eq!(
+            store.operation(&actor, "stop").unwrap().unwrap().state,
+            QueueOperationState::Unknown
+        );
+        store
+            .resume(&actor, &key, "resume", paused.version)
+            .unwrap();
+        store
+            .acknowledge_manual_stop_unknown(&actor, &key, "stop", "review", 3)
+            .unwrap();
+        assert!(store.view(&actor, &key).unwrap().auto_drain);
+        assert!(store
+            .begin_stop(&actor, &key, "new-stop", "execution", 4)
+            .is_ok());
+    }
+    #[test]
+    fn claimed_manual_stop_reopen_repauses_after_early_resume() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("queue.sqlite");
+        let open = || {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            crate::database::schema::init(&conn);
+            crate::database::migration::migrate(&conn).unwrap();
+            SqlLocalQueueStore::new(DeviceStore::Owned(std::sync::Arc::new(
+                std::sync::Mutex::new(conn),
+            )))
+        };
+        let actor = QueueActor {
+            device_id: "device".into(),
+            device_name: "phone".into(),
+        };
+        let key = TargetKey {
+            session_id: "session".into(),
+        };
+        let action;
+        {
+            let store = open();
+            let (_, owner, id) = store
+                .begin_stop(&actor, &key, "stop", "execution", 1)
+                .unwrap();
+            assert!(owner);
+            action = id;
+            store.claim_manual_stop(&actor, "stop", 7).unwrap();
+            let version = store.view(&actor, &key).unwrap().version;
+            assert!(
+                store
+                    .resume(&actor, &key, "early-resume", version)
+                    .unwrap()
+                    .auto_drain
+            );
+        }
+        let store = open();
+        store.recover(2).unwrap();
+        let view = store.view(&actor, &key).unwrap();
+        assert!(!view.auto_drain);
+        assert_eq!(
+            store.operation(&actor, "stop").unwrap().unwrap().state,
+            QueueOperationState::Unknown
+        );
+        let (operation, owner, replayed_action) = store
+            .begin_stop(&actor, &key, "stop", "execution", 3)
+            .unwrap();
+        assert!(!owner);
+        assert_eq!(replayed_action, action);
+        assert_eq!(operation.state, QueueOperationState::Unknown);
+        assert!(store
+            .begin_stop(&actor, &key, "new-stop", "execution", 3)
+            .is_err());
     }
     #[test]
     fn dispatching_recovery_survives_file_close() {
@@ -3390,6 +4279,25 @@ mod tests {
                 .unwrap(),
             1
         );
+    }
+
+    #[test]
+    fn migration_adds_input_hash_without_erasing_legacy_queue() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::database::schema::init(&conn);
+        conn.execute_batch("ALTER TABLE zcode_send_queue DROP COLUMN request_input_hash;")
+            .unwrap();
+        conn.execute("INSERT INTO zcode_send_queue(request_id,item_id,payload_hash,device_id,session_id,device_name,workspace_path,prepared,receipt_queue_version,receipt_position) VALUES ('old','item','hash','device','session','name','/synthetic','synthetic',1,1)", []).unwrap();
+        crate::database::migration::migrate(&conn).unwrap();
+        crate::database::migration::migrate(&conn).unwrap();
+        let row: (String, Option<String>) = conn
+            .query_row(
+                "SELECT item_id,request_input_hash FROM zcode_send_queue WHERE request_id='old'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(row, ("item".into(), None));
     }
     #[test]
     fn separate_connections_claim_and_edit_have_one_winner() {

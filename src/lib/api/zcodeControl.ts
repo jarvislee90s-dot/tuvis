@@ -20,6 +20,61 @@ export const ZCODE_SESSION_PATH = "/m/api/v1/zcode/session";
 export const ZCODE_ACTIONS_PATH = "/m/api/v1/zcode/actions";
 /** GET 配对 SSE 事件流（`?sessionId=<原 ID>`；URL 由 [`zcodeEventsUrl`] 生成） */
 export const ZCODE_EVENTS_PATH = "/m/api/v1/zcode/events";
+export const ZCODE_LOCAL_QUEUE_PATH = "/m/api/v1/zcode/local-queue";
+
+export interface QueuedAttachment {
+  name: string;
+  path: string;
+  isImage: boolean;
+}
+export interface QueueDraft {
+  text: string;
+  attachments: QueuedAttachment[];
+}
+export interface LocalQueueView {
+  sessionId: string;
+  version: number;
+  autoDrain: boolean;
+  pauseReason: string | null;
+  items: Array<{
+    itemId: string;
+    itemVersion: number;
+    state: "queued" | "dispatching" | "accepted" | "unknown" | "failed" | "cancelled";
+    position: number;
+    textPreview: string;
+    hasAttachments: boolean;
+  }>;
+  recoverableEdits: Array<{ requestId: string; itemId: string; expiresAtMs: number }>;
+}
+export interface EnqueueReceipt {
+  itemId: string;
+  itemVersion: number;
+  queueVersion: number;
+  position: number;
+}
+export interface EditResult {
+  requestId: string;
+  itemId: string;
+  draft: QueueDraft;
+  expiresAtMs: number;
+}
+export interface QueueOperationView {
+  requestId: string;
+  state: "in_flight" | "completed" | "unknown" | "failed";
+  receipt: ActionReceipt | null;
+  stopFailure?: { phase: "before_write" | "may_have_written"; code: string };
+}
+export interface QueueItemCommand {
+  requestId: string;
+  itemId: string;
+  expectedVersion: number;
+}
+export interface QueueRecoveryView {
+  priority: Array<{ requestId: string; itemId: string }>;
+  manualStopRequestId: string | null;
+  dispatchActionId: string | null;
+  unconfirmedActionId: string | null;
+}
 
 // ==== 冻结错误码（与 Rust `zcode_control::codes` 逐字对应，不得增删/本地化）====
 
@@ -39,6 +94,8 @@ export const ZCODE_ERROR_CODES = [
   "stale_generation",
   "stale_pending",
   "invalid_action",
+  "queue_refresh_required",
+  "attachment_missing",
   "invalid_answer",
   "forbidden_option",
   "action_payload_conflict",
@@ -402,6 +459,93 @@ export type ControlAction =
   | { kind: "queueResume"; sessionId: string; generation: number };
 
 // ==== 端点 ====
+
+export async function getZcodeLocalQueue(sessionId: string): Promise<LocalQueueView> {
+  return await request(`${ZCODE_LOCAL_QUEUE_PATH}?sessionId=${encodeURIComponent(sessionId)}`);
+}
+
+export async function enqueueZcodeMessage(input: {
+  requestId: string;
+  sessionId: string;
+  draft: QueueDraft;
+  editedFrom?: string;
+}): Promise<EnqueueReceipt> {
+  return await request(`${ZCODE_LOCAL_QUEUE_PATH}/enqueue`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(input),
+  });
+}
+
+export async function getZcodeEditSnapshot(requestId: string): Promise<EditResult> {
+  return await request(
+    `${ZCODE_LOCAL_QUEUE_PATH}/edits?requestId=${encodeURIComponent(requestId)}`
+  );
+}
+
+export async function finishZcodeEdit(requestId: string): Promise<void> {
+  await request(`${ZCODE_LOCAL_QUEUE_PATH}/edit/finish`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ requestId }),
+  });
+}
+
+async function postLocalQueue<T>(action: string, input: unknown): Promise<T> {
+  return await request(`${ZCODE_LOCAL_QUEUE_PATH}/${action}`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(input),
+  });
+}
+
+export async function editZcodeQueuedMessage(input: QueueItemCommand): Promise<EditResult> {
+  return await postLocalQueue("edit", input);
+}
+export async function retractZcodeQueuedMessage(input: QueueItemCommand): Promise<LocalQueueView> {
+  return await postLocalQueue("retract", input);
+}
+export async function prioritizeZcodeMessage(
+  input: QueueItemCommand & {
+    confirmStop: boolean;
+    expectedExecutionId: string | null;
+    heldQueue?: HeldQueueChoice;
+  }
+): Promise<QueueOperationView> {
+  return await postLocalQueue("prioritize", input);
+}
+export async function resumeZcodeLocalQueue(input: {
+  requestId: string;
+  sessionId: string;
+  expectedQueueVersion: number;
+}): Promise<LocalQueueView> {
+  return await postLocalQueue("resume", input);
+}
+export async function getZcodeQueueOperation(requestId: string): Promise<QueueOperationView> {
+  return await request(
+    `${ZCODE_LOCAL_QUEUE_PATH}/operations?requestId=${encodeURIComponent(requestId)}`
+  );
+}
+export async function stopZcodeCurrent(input: {
+  requestId: string;
+  sessionId: string;
+  expectedExecutionId: string;
+}): Promise<QueueOperationView> {
+  return await postLocalQueue("stop", input);
+}
+export async function getZcodeQueueRecovery(sessionId: string): Promise<QueueRecoveryView> {
+  return await request(
+    `${ZCODE_LOCAL_QUEUE_PATH}/recovery?sessionId=${encodeURIComponent(sessionId)}`
+  );
+}
+export async function acknowledgeZcodeQueueRecovery(input: {
+  requestId: string;
+  sessionId: string;
+  kind: "priority_stop" | "manual_stop" | "dispatch" | "unconfirmed";
+  subjectId: string;
+}): Promise<void> {
+  await postLocalQueue("recovery/ack", input);
+}
 
 /** 当前连接视图。GET 只读：不触发 OAuth、不隐式新建 relay。 */
 export async function getZcodeConnection(): Promise<ConnectionView> {

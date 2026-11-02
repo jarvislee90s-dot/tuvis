@@ -2266,6 +2266,8 @@
       "reasonStaleGeneration": "The session has changed generation — refresh and retry",
       "reasonStalePending": "This pending interaction is stale — refresh to see the latest state",
       "reasonInvalidAction": "This action is not valid in the current state — refresh and retry",
+      "reasonQueueRefreshRequired": "The controls have changed. Refresh the page and try again.",
+      "reasonAttachmentMissing": "A queued attachment is missing or inaccessible. Add it again.",
       "reasonInvalidAnswer": "The answer did not pass validation — check it and retry",
       "reasonForbiddenOption": "That option is not allowed — choose another one",
       "reasonActionPayloadConflict": "Conflicts with another action in flight — retry shortly",
