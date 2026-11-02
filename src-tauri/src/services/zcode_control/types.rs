@@ -22,7 +22,8 @@ use crate::services::zcode_control::capability::state::ZcodeInterfaceEvidence;
 /// 身份校验命令（不一致回 `fault.command.clientMismatch`）。
 pub(crate) const PROTOCOL_CLIENT_ID: &str = "tuvis-remote";
 
-/// 对外错误码（冻结：不得新增、改写或本地化；HTTP error 与 capability reasonCode 共用）。
+/// 对外错误码（冻结：不得改写或本地化；如任务文档明确要求新增，须同步 HTTP 映射、
+/// 手机端错误码词表与中英文案；HTTP error 与 capability reasonCode 共用）。
 pub mod codes {
     /// 未保存官方链接/配置不可用。
     pub const NEEDS_CONFIG: &str = "needs_config";
@@ -59,6 +60,12 @@ pub mod codes {
     pub const INVALID_ACTION: &str = "invalid_action";
     /// 本地队列正在接管发送，客户端需要刷新。
     pub const QUEUE_REFRESH_REQUIRED: &str = "queue_refresh_required";
+    /// 本地队列仍有未人工核对的投递结果（重启 `unconfirmed`、unknown 发送/停止、
+    /// 优先级停止等）：先核对再继续/插队，绝不假成功。
+    ///
+    /// 2026-11-03 手机可用性修补（Task A）新增；核对动作（`recovery/ack`）只清屏障，
+    /// 不自动补发旧消息，恢复派发仍需显式 `resume`。
+    pub const QUEUE_REVIEW_REQUIRED: &str = "queue_review_required";
     /// 待发附件已不存在或不再属于原会话目录。
     pub const ATTACHMENT_MISSING: &str = "attachment_missing";
     /// 答案载荷无效。
@@ -464,6 +471,12 @@ pub enum ControlAction {
         provider: Option<String>,
         model: String,
         thought: String,
+        /// 目标供应商可用性未知时，用户已在手机端完成二次确认。
+        ///
+        /// 缺省 false = 旧客户端/未确认：目标 provider 若「缺 available 字段」
+        /// 必须拒绝；显式 `available=false` 则无论本标志如何都拒绝。
+        #[serde(default)]
+        confirm_unknown_provider: bool,
     },
     /// 协作模式切换（R10）：payload 只含 `{mode}`，必须带 baseRevision。
     #[serde(rename_all = "camelCase")]
@@ -996,9 +1009,22 @@ pub struct ProviderChoice {
     pub provider_id: String,
     pub label: String,
     pub models: Vec<ModelChoice>,
+    /// 官方显式宣告的可用性；缺字段时为 false（见 `availability_known`）。
     pub available: bool,
+    /// 可用性是否**由宿主显式声明**：
+    /// - 显式 `available: true/false` → true；
+    /// - 缺字段 → false（可用性未知；当前 provider 单独放成 available=true，
+    ///   但仍不得宣称已知）；
+    /// - 旧载荷反序列化缺本字段 → 默认 true，保持既有 `available` 语义。
+    #[serde(default = "default_availability_known")]
+    pub availability_known: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason_code: Option<String>,
+}
+
+/// 旧 `ProviderChoice` 载荷没有 `availabilityKnown`：按「已知」兼容。
+fn default_availability_known() -> bool {
+    true
 }
 
 /// 协作模式（官方 `switchCollaborationMode` 值域；`edit` 只读兼容）。

@@ -109,6 +109,42 @@ fn stop_requires_current_claim_even_without_priority_item() {
         )
         .is_err());
 }
+/// 是否仍有**需要人工核对**的投递/停止结果（Task A）。
+///
+/// 只统计“未核对”的屏障，**不含**正在派发的条目（`dispatching` 是进行中的工作，
+/// 不是待核对结果，会自动收口）：旧的 `has_delivery_barrier` 仍负责派发互斥。
+///
+/// `include_flagged_accepted`：
+/// - true（完整口径，`resume` / prioritize 用）：`accepted + startNow` 无终态且
+///   带 `_queueRestartUnconfirmed` / `_queueTargetUnconfirmed` 标记才算（重启恢复、
+///   执行目标不可证）；**普通运行中的 accepted 不算**，确认后 `_queueUnconfirmed=1`
+///   解除；
+/// - false（硬口径，`begin_priority` 的新操作入口用）：`unknown` 发送且无
+///   `unknown_review`、优先级停止结果 unknown 且已认领、手动停止结果 unknown 且
+///   未核对。accepted 项例外，因为同一次 prioritize 的新鲜 `read` 可能带回终态并
+///   先收口（见 service）。
+fn has_review_barrier_conn(
+    conn: &rusqlite::Connection,
+    session: &str,
+    include_flagged_accepted: bool,
+) -> ZResult<bool> {
+    let accepted = if include_flagged_accepted {
+        // 普通 running accepted（刚受理、回合运行中）不算人工核对屏障：它由
+        // has_delivery_barrier 管自动派发互斥，但不得阻止“插队=停当前回合再发”。
+        // 只有显式标记过的人工核对项（重启恢复 / 执行目标不可证）才需要先核对。
+        " OR (q.state='accepted' AND coalesce(json_extract(q.receipt,'$.sendAdmission.delivery'),'')='startNow' AND coalesce(json_extract(q.receipt,'$._queueTerminal'),0)=0 AND coalesce(json_extract(q.receipt,'$._queueUnconfirmed'),0)=0 AND (coalesce(json_extract(q.receipt,'$._queueRestartUnconfirmed'),0)=1 OR coalesce(json_extract(q.receipt,'$._queueTargetUnconfirmed'),0)=1))"
+    } else {
+        ""
+    };
+    let sql = format!(
+        "SELECT (SELECT count(*) FROM zcode_send_queue q WHERE q.session_id=?1 AND (q.state='unknown' AND NOT EXISTS (SELECT 1 FROM zcode_queue_operations r WHERE r.kind='unknown_review' AND r.item_id=q.item_id){accepted})) + (SELECT count(*) FROM zcode_queue_operations o JOIN zcode_send_queue q ON q.priority_request=o.request_id WHERE o.kind='priority' AND o.operation_state='unknown' AND o.stop_claimed=1 AND q.state='queued' AND q.session_id=?1) + (SELECT count(*) FROM zcode_queue_operations WHERE kind='stop' AND item_id=?1 AND operation_state='unknown' AND stop_reviewed=0)"
+    );
+    let count: i64 = conn.query_row(&sql, [session], |r| r.get(0)).map_err(|_| {
+        super::super::types::ZcodeError::of(super::super::types::codes::STORAGE_FAILED)
+    })?;
+    Ok(count != 0)
+}
+
 fn mark_restart_unconfirmed_conn(conn: &rusqlite::Connection, now: i64) -> ZResult<()> {
     let err = || super::super::types::ZcodeError::of(super::super::types::codes::STORAGE_FAILED);
     let filter = "state='accepted' AND coalesce(json_extract(receipt,'$.sendAdmission.delivery'),'')='startNow' AND coalesce(json_extract(receipt,'$._queueTerminal'),0)=0 AND coalesce(json_extract(receipt,'$._queueUnconfirmed'),0)=0 AND coalesce(json_extract(receipt,'$._queueRestartUnconfirmed'),0)=0";
@@ -292,7 +328,7 @@ impl SqlLocalQueueStore {
         use rusqlite::OptionalExtension;
         let err =
             || super::super::types::ZcodeError::of(super::super::types::codes::STORAGE_FAILED);
-        self.store.with(|c| c.query_row("SELECT dispatch_action_id FROM zcode_send_queue WHERE session_id=?1 AND device_id=?2 AND state='accepted' AND coalesce(json_extract(receipt,'$.sendAdmission.delivery'),'')='startNow' AND coalesce(json_extract(receipt,'$._queueTerminal'),0)=0 AND coalesce(json_extract(receipt,'$._queueUnconfirmed'),0)=0 ORDER BY seq LIMIT 1",rusqlite::params![key.session_id,actor.device_id],|r|r.get(0)).optional()).map_err(|_| err())
+        self.store.with(|c| c.query_row("SELECT dispatch_action_id FROM zcode_send_queue WHERE session_id=?1 AND device_id=?2 AND state='accepted' AND coalesce(json_extract(receipt,'$.sendAdmission.delivery'),'')='startNow' AND coalesce(json_extract(receipt,'$._queueTerminal'),0)=0 AND coalesce(json_extract(receipt,'$._queueUnconfirmed'),0)=0 AND (coalesce(json_extract(receipt,'$._queueRestartUnconfirmed'),0)=1 OR coalesce(json_extract(receipt,'$._queueTargetUnconfirmed'),0)=1) ORDER BY seq LIMIT 1",rusqlite::params![key.session_id,actor.device_id],|r|r.get(0)).optional()).map_err(|_| err())
     }
     pub(crate) fn finish_priority_safe(
         &self,
@@ -543,6 +579,11 @@ impl SqlLocalQueueStore {
             Ok(count != 0)
         })
     }
+    /// 完整未核对 barrier（resume / prioritize 用；含显式重启/目标核对标记的 accepted）。
+    pub(crate) fn has_review_barrier(&self, key: &TargetKey) -> ZResult<bool> {
+        self.store
+            .with(|c| has_review_barrier_conn(c, &key.session_id, true))
+    }
     pub(crate) fn has_unresolved_stop(&self, key: &TargetKey) -> ZResult<bool> {
         let err =
             || super::super::types::ZcodeError::of(super::super::types::codes::STORAGE_FAILED);
@@ -619,6 +660,10 @@ impl SqlLocalQueueStore {
             if let Some((kind,old_hash,device)) = existing {
                 if !device.is_empty() && device != actor.device_id { return Err(super::super::types::ZcodeError::of(super::super::types::codes::NO_SESSION)); }
                 return if kind == "resume" && old_hash == hash { Ok(()) } else { Err(invalid()) };
+            }
+            // 未核对 barrier：继续队列不得静默成功（不改 version / auto_drain）。
+            if has_review_barrier_conn(&tx, &key.session_id, true)? {
+                return Err(super::super::types::ZcodeError::of(super::super::types::codes::QUEUE_REVIEW_REQUIRED));
             }
             let changed = tx.execute("UPDATE zcode_queue_state SET version=version+1,auto_drain=1,pause_reason=NULL WHERE session_id=?1 AND version=?2", rusqlite::params![key.session_id,version]).map_err(|_| err())?;
             if changed != 1 { return Err(invalid()); }
@@ -867,9 +912,17 @@ impl SqlLocalQueueStore {
                 let row: Option<(String,String,i64,Option<String>)> = tx.query_row("SELECT session_id,state,item_version,priority_request FROM zcode_send_queue WHERE item_id=?1 AND device_id=?2", rusqlite::params![cmd.item_id,actor.device_id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional().map_err(|_| err())?;
                 let (session,state,current,reservation)=row.ok_or_else(hidden)?;
                 if state != "queued" || current != version || reservation.is_some() { return Err(invalid()); }
+                // 硬未核对 barrier（unknown / 优先级停止 / 手动停止）：新插队在创建操作前
+                // 明确拒绝，保证零 stop / 零 send；已存在操作的重放仍走上分支原样回放。
+                if has_review_barrier_conn(&tx, &session, false)? {
+                    return Err(super::super::types::ZcodeError::of(super::super::types::codes::QUEUE_REVIEW_REQUIRED));
+                }
                 let busy: i64 = tx.query_row("SELECT count(*) FROM zcode_send_queue q LEFT JOIN zcode_queue_operations o ON o.request_id=q.priority_request WHERE q.session_id=?1 AND (q.state='dispatching' OR (o.kind='priority' AND o.operation_state IN ('in_flight','unknown') AND NOT (q.state='unknown' AND EXISTS (SELECT 1 FROM zcode_queue_operations r WHERE r.kind='unknown_review' AND r.item_id=q.item_id))))", [&session], |r| r.get(0)).map_err(|_| err())?;
                 if busy != 0 { return Err(invalid()); }
-                let blocked: i64 = tx.query_row("SELECT (SELECT count(*) FROM zcode_send_queue q WHERE q.session_id=?1 AND q.state='unknown' AND NOT EXISTS (SELECT 1 FROM zcode_queue_operations r WHERE r.kind='unknown_review' AND r.item_id=q.item_id)) + (SELECT count(*) FROM zcode_queue_state WHERE session_id=?1 AND auto_drain=0 AND pause_reason IN ('unconfirmed','unknown_reviewed'))",[&session],|r|r.get(0)).map_err(|_|err())?;
+                // 已核对但尚未 resume 的 unknown 暂停仍按 invalid_action 拒绝；
+                // 未核对 barrier 由 service 层在 observe_bound 之后判定并返回
+                // queue_review_required（同帧的新鲜终态可先解除 accepted 屏障）。
+                let blocked: i64 = tx.query_row("SELECT count(*) FROM zcode_queue_state WHERE session_id=?1 AND auto_drain=0 AND pause_reason='unknown_reviewed'",[&session],|r|r.get(0)).map_err(|_|err())?;
                 if blocked != 0 { return Err(invalid()); }
                 let stopping: i64 = tx.query_row("SELECT count(*) FROM zcode_queue_operations WHERE kind='stop' AND item_id=?1 AND (operation_state='in_flight' OR (operation_state='unknown' AND stop_reviewed=0))",[&session],|r|r.get(0)).map_err(|_|err())?;
                 if stopping != 0 { return Err(invalid()); }
@@ -1196,7 +1249,7 @@ impl SqlLocalQueueStore {
             if let Some((owner, old_hash)) = prior { return if owner != actor.device_id { Err(hidden()) } else if old_hash == hash { Ok(()) } else { Err(invalid()) }; }
             let enq_owner: Option<String> = tx.query_row("SELECT device_id FROM zcode_send_queue WHERE request_id=?1", [request_id], |r| r.get(0)).optional().map_err(|_| err())?;
             if let Some(owner) = enq_owner { return Err(if owner == actor.device_id { invalid() } else { hidden() }); }
-            let row: Option<(String,String)> = tx.query_row("SELECT item_id,device_id FROM zcode_send_queue WHERE session_id=?1 AND dispatch_action_id=?2 AND state='accepted' AND coalesce(json_extract(receipt,'$.sendAdmission.delivery'),'')='startNow' AND coalesce(json_extract(receipt,'$._queueTerminal'),0)=0 AND coalesce(json_extract(receipt,'$._queueUnconfirmed'),0)=0", rusqlite::params![key.session_id,action_id], |r| Ok((r.get(0)?,r.get(1)?))).optional().map_err(|_| err())?;
+            let row: Option<(String,String)> = tx.query_row("SELECT item_id,device_id FROM zcode_send_queue WHERE session_id=?1 AND dispatch_action_id=?2 AND state='accepted' AND coalesce(json_extract(receipt,'$.sendAdmission.delivery'),'')='startNow' AND coalesce(json_extract(receipt,'$._queueTerminal'),0)=0 AND coalesce(json_extract(receipt,'$._queueUnconfirmed'),0)=0 AND (coalesce(json_extract(receipt,'$._queueRestartUnconfirmed'),0)=1 OR coalesce(json_extract(receipt,'$._queueTargetUnconfirmed'),0)=1)", rusqlite::params![key.session_id,action_id], |r| Ok((r.get(0)?,r.get(1)?))).optional().map_err(|_| err())?;
             let (item,owner)=row.ok_or_else(hidden)?;
             if owner != actor.device_id { return Err(hidden()); }
             tx.execute("UPDATE zcode_send_queue SET receipt=json_set(receipt,'$._queueUnconfirmed',1) WHERE item_id=?1", [&item]).map_err(|_| err())?;
@@ -1433,6 +1486,7 @@ mod tests {
     use super::*;
     use crate::remote::pairing::DeviceStore;
     use crate::services::zcode_control::command::PreparedSend;
+    use crate::services::zcode_control::types::codes;
     use crate::services::zcode_control::types::TargetKey;
 
     #[test]
@@ -2982,7 +3036,15 @@ mod tests {
             .finish_manual_stop(&actor, "stop", QueueOperationState::Unknown, None)
             .unwrap();
         let version = store.view(&actor, &key).unwrap().version;
-        store.resume(&actor, &key, "early", version).unwrap();
+        // 未核对手动停止结果：resume 必须明确拒绝（旧行为是静默成功但零派发）。
+        assert_eq!(
+            store
+                .resume(&actor, &key, "early", version)
+                .err()
+                .unwrap()
+                .code,
+            codes::QUEUE_REVIEW_REQUIRED
+        );
         let other = QueueActor {
             device_id: "other".into(),
             device_name: "other".into(),
@@ -3889,6 +3951,9 @@ mod tests {
                 3,
             )
             .unwrap();
+        // 只有显式的人工核对标记（重启恢复）才允许 acknowledge_unconfirmed；
+        // 普通运行中的 accepted 不得被“确认”掉（否则会在回合未结束时放行下一条）。
+        store.mark_restart_unconfirmed(4).unwrap();
         assert!(store
             .acknowledge_unconfirmed(&other, &key, &b.ctx.action_id, "review-other", 4)
             .is_err());
@@ -5608,6 +5673,144 @@ mod tests {
         assert_eq!(store.next_edit_expiry().unwrap(), None);
     }
     #[test]
+    fn resume_before_unconfirmed_review_is_rejected_without_send() {
+        let store = SqlLocalQueueStore::new(DeviceStore::memory());
+        let actor = QueueActor {
+            device_id: "device".into(),
+            device_name: "phone".into(),
+        };
+        let key = TargetKey {
+            session_id: "session".into(),
+        };
+        let target = super::super::super::types::BoundTarget {
+            session_id: key.session_id.clone(),
+            workspace_path: "/synthetic".into(),
+            workspace_identity: None,
+            workspace_key: "/synthetic".into(),
+            generation: 1,
+            bridge_generation: None,
+        };
+        let make = |id: &str| EnqueueCommand {
+            request_id: id.into(),
+            actor: actor.clone(),
+            session_id: key.session_id.clone(),
+            workspace_path: "/synthetic".into(),
+            workspace_identity: None,
+            draft: QueueDraft {
+                text: id.into(),
+                attachments: vec![],
+            },
+            prepared: PreparedSend::from_stored(id.into()).unwrap(),
+            edited_from: None,
+        };
+        store.enqueue(&make("A"), 1).unwrap();
+        store.enqueue(&make("B"), 2).unwrap();
+        // 重启前 A 已被宿主受理（startNow），但没有终态；B 仍在本地排队。
+        let claim = store.claim_next(&key, &target, 3).unwrap().unwrap();
+        store
+            .settle_dispatch(
+                &claim,
+                &super::super::super::types::ActionReceipt {
+                    action_id: claim.ctx.action_id.clone(),
+                    session_id: key.session_id.clone(),
+                    generation: 1,
+                    state: super::super::super::types::ActionState::Accepted,
+                    reason_code: None,
+                    send_admission: Some(super::super::super::types::SendAdmission {
+                        delivery: super::super::super::types::SendDelivery::StartNow,
+                        input_id: "A-input".into(),
+                    }),
+                },
+                4,
+            )
+            .unwrap();
+        store.recover(5).unwrap();
+        let before = store.view(&actor, &key).unwrap();
+        assert!(!before.auto_drain);
+        assert_eq!(before.pause_reason.as_deref(), Some("unconfirmed"));
+
+        let error = store
+            .resume(&actor, &key, "resume-before-review", before.version)
+            .err()
+            .unwrap();
+        assert_eq!(error.code, codes::QUEUE_REVIEW_REQUIRED);
+        let after = store.view(&actor, &key).unwrap();
+        assert_eq!(after.version, before.version);
+        assert!(!after.auto_drain);
+        assert_eq!(after.pause_reason.as_deref(), Some("unconfirmed"));
+        // 零发送：barrier 未核对前 claim_next 不得派发任何条目。
+        assert!(store.claim_next(&key, &target, 6).unwrap().is_none());
+    }
+
+    #[test]
+    fn live_accepted_without_review_flag_is_not_a_review_barrier() {
+        let store = SqlLocalQueueStore::new(DeviceStore::memory());
+        let actor = QueueActor {
+            device_id: "device".into(),
+            device_name: "phone".into(),
+        };
+        let key = TargetKey {
+            session_id: "session".into(),
+        };
+        let target = super::super::super::types::BoundTarget {
+            session_id: key.session_id.clone(),
+            workspace_path: "/synthetic".into(),
+            workspace_identity: None,
+            workspace_key: "/synthetic".into(),
+            generation: 1,
+            bridge_generation: None,
+        };
+        let make = |id: &str| EnqueueCommand {
+            request_id: id.into(),
+            actor: actor.clone(),
+            session_id: key.session_id.clone(),
+            workspace_path: "/synthetic".into(),
+            workspace_identity: None,
+            draft: QueueDraft {
+                text: id.into(),
+                attachments: vec![],
+            },
+            prepared: PreparedSend::from_stored(id.into()).unwrap(),
+            edited_from: None,
+        };
+        store.enqueue(&make("A"), 1).unwrap();
+        store.enqueue(&make("B"), 2).unwrap();
+        // 正常发送：accepted/startNow、无终态，但**没有**重启/目标核对标记。
+        let claim = store.claim_next(&key, &target, 3).unwrap().unwrap();
+        store
+            .settle_dispatch(
+                &claim,
+                &super::super::super::types::ActionReceipt {
+                    action_id: claim.ctx.action_id.clone(),
+                    session_id: key.session_id.clone(),
+                    generation: 1,
+                    state: super::super::super::types::ActionState::Accepted,
+                    reason_code: None,
+                    send_admission: Some(super::super::super::types::SendAdmission {
+                        delivery: super::super::super::types::SendDelivery::StartNow,
+                        input_id: "A-input".into(),
+                    }),
+                },
+                4,
+            )
+            .unwrap();
+        // 运行中的 accepted 不是人工核对项：恢复卡不出现，也不允许被 ack 掉。
+        assert_eq!(store.unconfirmed_action(&actor, &key).unwrap(), None);
+        assert!(store
+            .acknowledge_unconfirmed(&actor, &key, &claim.ctx.action_id, "live-review", 5)
+            .is_err());
+        // 用户暂停后再继续：resume 不应被误判为“未核对 barrier”。
+        store.pause(&key, "manual", "pause").unwrap();
+        let paused = store.view(&actor, &key).unwrap();
+        let resumed = store
+            .resume(&actor, &key, "resume-live", paused.version)
+            .unwrap();
+        assert!(resumed.auto_drain);
+        // 但派发仍由 has_delivery_barrier 管：该发送未收终态前不派发 B。
+        assert!(store.claim_next(&key, &target, 6).unwrap().is_none());
+    }
+
+    #[test]
     fn resume_before_review_does_not_arm_auto_drain() {
         for restart in [false, true] {
             let store = SqlLocalQueueStore::new(DeviceStore::memory());
@@ -5651,7 +5854,14 @@ mod tests {
                 store.mark_priority_unknown(&actor, "priority", 4).unwrap();
             }
             let version = store.view(&actor, &key).unwrap().version;
-            store.resume(&actor, &key, "early", version).unwrap();
+            assert_eq!(
+                store
+                    .resume(&actor, &key, "early", version)
+                    .err()
+                    .unwrap()
+                    .code,
+                codes::QUEUE_REVIEW_REQUIRED
+            );
             let target = super::super::super::types::BoundTarget {
                 session_id: key.session_id.clone(),
                 workspace_path: "/synthetic".into(),

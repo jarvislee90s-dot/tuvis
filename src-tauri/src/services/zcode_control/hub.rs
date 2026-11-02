@@ -850,6 +850,19 @@ pub(crate) trait BridgePump: Send + Sync {
         let _ = session_id;
         None
     }
+
+    /// 目录刷新任务：必须是**独立、单飞**的调用，绝不能从收帧路径 await（目录 RPC
+    /// 的应答由同一条 Data 消费循环处理，同步等待会自等待超时）。返回是否安装成功。
+    fn refresh_catalog<'a>(&'a self, session_id: &'a str) -> BoxFuture<'a, bool> {
+        let _ = session_id;
+        Box::pin(async { false })
+    }
+
+    /// 目录刷新完成后的最新合并视图（供泵发布第二帧；失败/会话消失 = None）。
+    fn session_view<'a>(&'a self, session_id: &'a str) -> BoxFuture<'a, Option<SessionView>> {
+        let _ = session_id;
+        Box::pin(async { None })
+    }
 }
 
 /// 事件泵装配口：relay 事件接收端 + 泵桥 + 可选 Data 溢出观察口（测试可缺省）。
@@ -881,6 +894,16 @@ impl BridgePump for ProjectionBridge {
 
     fn host_pending_ids(&self, session_id: &str) -> Option<Vec<String>> {
         self.bridge.host_pending_ids(session_id)
+    }
+
+    fn refresh_catalog<'a>(&'a self, session_id: &'a str) -> BoxFuture<'a, bool> {
+        Box::pin(
+            async move { BridgeManager::ensure_selection_catalog(&self.bridge, session_id).await },
+        )
+    }
+
+    fn session_view<'a>(&'a self, session_id: &'a str) -> BoxFuture<'a, Option<SessionView>> {
+        Box::pin(async move { BridgeManager::session_view(&self.bridge, session_id) })
     }
 }
 
@@ -1554,6 +1577,42 @@ fn apply_relay_session(
         published
     };
     emit_session_event(inner, events, &view);
+}
+
+/// 发布一条 Data 变化视图（含确认观察与能力现算）；目录刷新任务也复用它。
+fn publish_data_view(
+    inner: &Arc<Mutex<Inner>>,
+    out: &broadcast::Sender<ControlEvent>,
+    bridge: &Arc<dyn BridgePump>,
+    confirmations: &ConfirmationTracker,
+    hub_generation: u64,
+    view: SessionView,
+) {
+    // T5 确认观察：本会话有未决确认才取日志头指纹并克隆视图
+    // （快速路径零克隆、零桥查询）。外部评审 C2：pending 判据的撤卡证据只认宿主
+    // 集合，慢路径一并取宿主 pending ids。
+    let observed = confirmations.has_pending(&view.session_id).then(|| {
+        let fingerprint = bridge.log_fingerprint(&view.session_id);
+        let host_pending = bridge.host_pending_ids(&view.session_id);
+        (view.clone(), fingerprint, host_pending)
+    });
+    // R1：能力矩阵按**本帧**现算，且在 Hub 状态锁**外**执行（resolver 会读 DB，
+    // 绝不持锁做阻塞读）。锁内只取 `Arc`；ready=false 的帧最终清成全关，不读库。
+    let capabilities = if view.ready {
+        let capabilities_for = lock_inner(inner).capabilities_for.clone();
+        capabilities_for(&view.session_id, hub_generation)
+    } else {
+        CapabilityView::default()
+    };
+    apply_relay_session(inner.as_ref(), out, hub_generation, view, capabilities);
+    if let Some((observed_view, fingerprint, host_pending)) = observed {
+        confirmations.observe_session(
+            &observed_view,
+            hub_generation,
+            fingerprint,
+            host_pending.as_deref(),
+        );
+    }
 }
 
 /// Hub 内部状态（全部字段由同一把 std 锁保护，锁外不做网络 await）。
@@ -2562,42 +2621,71 @@ impl ZcodeHub {
                     RelayEvent::Data(payload) => {
                         // 本帧进入桥之前的 Hub 代际：桥处理在途若发生换代，视图作废。
                         let hub_generation = lock_inner(&inner).generation;
-                        let outcome = bridge.on_data(payload).await;
+                        let DataOutcome {
+                            result,
+                            changed,
+                            catalog_refresh,
+                        } = bridge.on_data(payload).await;
                         // 先发布本帧造成的变化（含错误帧把会话标成不新鲜的降级视图）；
                         // 代际/配对闸在 apply_relay_session 内复核。
-                        for view in outcome.changed {
-                            // T5 确认观察：本会话有未决确认才取日志头指纹并克隆视图
-                            // （快速路径零克隆、零桥查询）。外部评审 C2：pending 判据
-                            // 的撤卡证据只认宿主集合，慢路径一并取宿主 pending ids。
-                            let observed = confirmations.has_pending(&view.session_id).then(|| {
-                                let fingerprint = bridge.log_fingerprint(&view.session_id);
-                                let host_pending = bridge.host_pending_ids(&view.session_id);
-                                (view.clone(), fingerprint, host_pending)
-                            });
-                            // R1：能力矩阵按**本帧**现算，且在 Hub 状态锁**外**执行
-                            // （resolver 会读 DB，绝不持锁做阻塞读）。锁内只取 `Arc`。
-                            //
-                            // 复审 I3：`ready=false` 的帧在 `apply_relay_session` 里恒
-                            // 被清成全关，现算结果一定被丢弃——不为此读库。
-                            let capabilities = if view.ready {
-                                let capabilities_for = lock_inner(&inner).capabilities_for.clone();
-                                capabilities_for(&view.session_id, hub_generation)
-                            } else {
-                                CapabilityView::default()
-                            };
-                            apply_relay_session(&inner, &out, hub_generation, view, capabilities);
-                            if let Some((view, fingerprint, host_pending)) = observed {
-                                confirmations.observe_session(
-                                    &view,
+                        for view in changed {
+                            publish_data_view(
+                                &inner,
+                                &out,
+                                &bridge,
+                                &confirmations,
+                                hub_generation,
+                                view,
+                            );
+                        }
+                        // 目录刷新绝不 await 在收帧循环里：目录 RPC 的应答也由本循环
+                        // 消费，同步等待会自等待到约 10s 超时并阻塞后续帧/ACK。
+                        // 独立任务有界重试，完成后重新核对代际并发布最新视图。
+                        for session_id in catalog_refresh {
+                            let refresh_inner = Arc::downgrade(&inner);
+                            let refresh_out = out.clone();
+                            let refresh_bridge = bridge.clone();
+                            let refresh_confirmations = confirmations.clone();
+                            tokio::spawn(async move {
+                                let Some(refresh_inner) = refresh_inner.upgrade() else {
+                                    return;
+                                };
+                                if lock_inner(&refresh_inner).generation != hub_generation {
+                                    return;
+                                }
+                                let mut refreshed = false;
+                                for attempt in 0..2 {
+                                    if attempt > 0 {
+                                        tokio::time::sleep(Duration::from_millis(100)).await;
+                                    }
+                                    if refresh_bridge.refresh_catalog(&session_id).await {
+                                        refreshed = true;
+                                        break;
+                                    }
+                                    if lock_inner(&refresh_inner).generation != hub_generation {
+                                        return;
+                                    }
+                                }
+                                if !refreshed {
+                                    return;
+                                }
+                                let Some(view) = refresh_bridge.session_view(&session_id).await
+                                else {
+                                    return;
+                                };
+                                publish_data_view(
+                                    &refresh_inner,
+                                    &refresh_out,
+                                    &refresh_bridge,
+                                    &refresh_confirmations,
                                     hub_generation,
-                                    fingerprint,
-                                    host_pending.as_deref(),
+                                    view,
                                 );
-                            }
+                            });
                         }
                         // 错误只代表本帧未吸收：不改变连接终态、不拆泵（ACK 已尽力发出）。
                         // 降级视图已在上一步发布，下一次 GET 走重新 bind/现读自愈。
-                        let _ = outcome.result;
+                        let _ = result;
                     }
                     RelayEvent::State(view) => {
                         // P2-6：KICKED 的意图代际在**事件到达时**（应用状态之前）预占，
@@ -5201,8 +5289,8 @@ mod tests {
     };
     use crate::services::zcode_control::types::{
         ActionState, ActiveWork, AnswerEntry, CapabilityFlag, ControlView, ModeView, PendingKind,
-        PendingView, QuestionOption, QuestionView, QueueActionAvailability, QueueItemView,
-        QueueView, SelectionView,
+        PendingView, ProviderChoice, QuestionOption, QuestionView, QueueActionAvailability,
+        QueueItemView, QueueView, SelectionView,
     };
     use crate::services::zcode_control::CollaborationMode;
     use std::sync::atomic::{AtomicBool, AtomicUsize};
@@ -8379,15 +8467,20 @@ mod tests {
         /// 判据保守不确认）；`Some(vec![])` 才是「宿主宣告卡已撤」——与生产
         /// ProjectionBridge 的语义一致，测试必须显式声明宿主状态。
         host_pendings: Mutex<BTreeMap<String, Vec<String>>>,
+        /// 目录刷新任务：调用次数 + 刷新后要发布的视图。
+        catalog_refresh_calls: AtomicUsize,
+        catalog_refresh_failures: AtomicUsize,
+        catalog_views: Mutex<BTreeMap<String, SessionView>>,
     }
 
     impl FakePump {
         /// 排入下一帧的桥结果（错误与变化同时携带，模拟坏帧已降级投影）。
         fn push_outcome(&self, result: ZResult<()>, changed: Vec<SessionView>) {
-            self.outcomes
-                .lock()
-                .unwrap()
-                .push_back(DataOutcome { result, changed });
+            self.outcomes.lock().unwrap().push_back(DataOutcome {
+                result,
+                changed,
+                catalog_refresh: Vec::new(),
+            });
         }
 
         /// 注入某会话的日志头指纹（T5 send 确认观察面）。
@@ -8405,6 +8498,28 @@ mod tests {
                 .unwrap()
                 .insert(session_id.to_owned(), ids);
         }
+
+        /// 排入一帧「provider 变化、需异步补目录」的桥结果。
+        fn push_catalog_outcome(&self, session_id: &str, changed: Vec<SessionView>) {
+            self.outcomes.lock().unwrap().push_back(DataOutcome {
+                result: Ok(()),
+                changed,
+                catalog_refresh: vec![session_id.to_owned()],
+            });
+        }
+
+        /// 让目录刷新失败指定次数（测试有界重试）。
+        fn fail_catalog_refresh(&self, times: usize) {
+            self.catalog_refresh_failures.store(times, Ordering::SeqCst);
+        }
+
+        /// 刷新任务完成后要拿到的视图。
+        fn set_catalog_view(&self, session_id: &str, view: SessionView) {
+            self.catalog_views
+                .lock()
+                .unwrap()
+                .insert(session_id.to_owned(), view);
+        }
     }
 
     impl BridgePump for FakePump {
@@ -8418,6 +8533,7 @@ mod tests {
                 .unwrap_or(DataOutcome {
                     result: Ok(()),
                     changed: Vec::new(),
+                    catalog_refresh: Vec::new(),
                 });
             Box::pin(async move { outcome })
         }
@@ -8433,6 +8549,22 @@ mod tests {
 
         fn host_pending_ids(&self, session_id: &str) -> Option<Vec<String>> {
             self.host_pendings.lock().unwrap().get(session_id).cloned()
+        }
+
+        fn refresh_catalog<'a>(&'a self, _session_id: &'a str) -> BoxFuture<'a, bool> {
+            self.catalog_refresh_calls.fetch_add(1, Ordering::SeqCst);
+            let fail = self
+                .catalog_refresh_failures
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok();
+            Box::pin(async move { !fail })
+        }
+
+        fn session_view<'a>(&'a self, session_id: &'a str) -> BoxFuture<'a, Option<SessionView>> {
+            let view = self.catalog_views.lock().unwrap().get(session_id).cloned();
+            Box::pin(async move { view })
         }
     }
 
@@ -10834,6 +10966,7 @@ mod tests {
             provider: None,
             model: model.into(),
             thought: thought.into(),
+            confirm_unknown_provider: false,
         }
     }
 
@@ -12257,6 +12390,111 @@ mod tests {
         assert_eq!(rows[0].capability, Capability::Mode);
         assert_eq!(rows[0].state, CapabilityState::Degraded);
         assert_eq!(rows[0].reason_code.as_deref(), Some("host_rejected"));
+    }
+
+    /// 生产泵路径：provider 切换帧先发布，目录刷新由独立任务完成并发布第二帧；
+    /// 收帧循环不得等待目录 RPC（fake 刷新立即返回，真实桥的 RPC 由调用方负责）。
+    #[tokio::test]
+    async fn provider_switch_catalog_refresh_is_async_and_publishes_latest_view() {
+        let store = stored(URL);
+        let ledger: Arc<dyn CapabilityLedger> = Arc::new(DbCapabilityLedger::new(store));
+        let fake = Arc::new(FakeBackend::default());
+        let (hub, events, pump) = confirmation_hub(fake, ledger, policy_with(&[])).await;
+        let mut rx = hub.subscribe();
+        let mut stale = changed_view("sess_synthetic0000", 11);
+        stale.selection = Some(SelectionView {
+            provider: "provider-b".to_owned(),
+            model: "model-b".to_owned(),
+            thought: None,
+            models: Vec::new(),
+            providers: Vec::new(),
+            mode: None,
+        });
+        let mut refreshed = stale.clone();
+        refreshed.selection.as_mut().unwrap().providers = vec![
+            ProviderChoice {
+                provider_id: "provider-a".to_owned(),
+                label: "A".to_owned(),
+                models: Vec::new(),
+                available: true,
+                availability_known: true,
+                reason_code: None,
+            },
+            ProviderChoice {
+                provider_id: "provider-b".to_owned(),
+                label: "B".to_owned(),
+                models: Vec::new(),
+                available: true,
+                availability_known: true,
+                reason_code: None,
+            },
+        ];
+        pump.set_catalog_view("sess_synthetic0000", refreshed);
+        pump.push_catalog_outcome("sess_synthetic0000", vec![stale]);
+        events
+            .send(RelayEvent::Data(serde_json::json!({"seq": 1})))
+            .await
+            .unwrap();
+
+        let published = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let event = rx.recv().await.expect("event stream");
+                if event.kind == ControlEventKind::Session {
+                    let Ok(session) = serde_json::from_value::<SessionView>(event.data.clone())
+                    else {
+                        continue;
+                    };
+                    if session
+                        .selection
+                        .as_ref()
+                        .is_some_and(|selection| selection.providers.len() == 2)
+                    {
+                        return session;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("目录刷新任务应在 1s 内发布第二帧");
+        assert_eq!(
+            published.selection.map(|selection| selection.provider),
+            Some("provider-b".to_owned())
+        );
+        assert!(pump.catalog_refresh_calls.load(Ordering::SeqCst) >= 1);
+    }
+
+    /// 目录刷新失败有界重试：只重试一次，仍失败即停，不进入无限循环。
+    #[tokio::test]
+    async fn provider_catalog_refresh_retries_once_then_stops() {
+        let store = stored(URL);
+        let ledger: Arc<dyn CapabilityLedger> = Arc::new(DbCapabilityLedger::new(store));
+        let fake = Arc::new(FakeBackend::default());
+        let (hub, events, pump) = confirmation_hub(fake, ledger, policy_with(&[])).await;
+        let mut rx = hub.subscribe();
+        pump.fail_catalog_refresh(3);
+        pump.push_catalog_outcome(
+            "sess_synthetic0000",
+            vec![changed_view("sess_synthetic0000", 11)],
+        );
+        events
+            .send(RelayEvent::Data(serde_json::json!({"seq": 1})))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(350)).await;
+        assert_eq!(
+            pump.catalog_refresh_calls.load(Ordering::SeqCst),
+            2,
+            "首次 + 一次重试后必须停止"
+        );
+        // 没有刷新成功的视图，不得发布 providers 分组。
+        let event = rx.try_recv();
+        assert!(
+            event.is_err()
+                || serde_json::from_value::<SessionView>(event.unwrap().data)
+                    .ok()
+                    .and_then(|session| session.selection)
+                    .is_none_or(|selection| selection.providers.is_empty())
+        );
     }
 
     // ====================================================================

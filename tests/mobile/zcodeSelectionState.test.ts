@@ -12,19 +12,30 @@ const view: SelectionView = {
       providerId: "a",
       label: "A",
       available: true,
+      availabilityKnown: true,
       models: [{ modelId: "same", thoughtLevels: ["low"] }],
     },
     {
       providerId: "b",
       label: "B",
       available: true,
+      availabilityKnown: true,
       models: [{ modelId: "same", thoughtLevels: ["high"] }],
     },
     {
       providerId: "off",
       label: "Off",
       available: false,
+      availabilityKnown: true,
       models: [{ modelId: "x", thoughtLevels: ["low"] }],
+    },
+    {
+      // 缺 available 字段：可用性未知，UI 仍可选（提交前必须二次确认）。
+      providerId: "u",
+      label: "Unknown",
+      available: false,
+      availabilityKnown: false,
+      models: [{ modelId: "um", thoughtLevels: ["low"] }],
     },
   ],
 };
@@ -54,6 +65,7 @@ describe("zcode selection state", () => {
               providerId: "b",
               label: "B",
               available: true,
+              availabilityKnown: true,
               models: [{ modelId: "m", thoughtLevels: [] }],
             },
           ],
@@ -62,6 +74,15 @@ describe("zcode selection state", () => {
         "m"
       )
     ).toBeNull();
+  });
+
+  it("unknown availability is selectable but explicit unavailable is not", () => {
+    expect(resolveModelChoice(view, "u", "um")).toEqual({
+      provider: "u",
+      model: "um",
+      thought: "low",
+    });
+    expect(resolveModelChoice(view, "off", "x")).toBeNull();
   });
 
   it("legacy view without providers keeps current provider scope", () => {

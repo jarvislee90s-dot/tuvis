@@ -778,6 +778,9 @@ struct SessionEntry {
     /// 最近一次目录读尝试对应的投影 revision（成功/失败都记；同 revision 不重试，
     /// revision 前进才允许再读——有界、不打爆宿主）。`None` = 本代际尚未尝试。
     catalog_attempted_at: Option<u64>,
+    /// 最近一次因 provider 切换而等待异步刷新的 provider。缓存已清空时仍要记住它，
+    /// 否则 A→B→C 的 C 帧看到 `catalog=None` 就不再排队刷新。
+    catalog_refresh_provider: Option<String>,
     staged: Vec<StagedFrame>,
     staged_bytes: usize,
     /// 暂存帧/在途分片的总字节预算（来自 [`BridgeLimits::staged_bytes`]）。
@@ -805,6 +808,7 @@ impl SessionEntry {
             log_fingerprint: None,
             catalog: None,
             catalog_attempted_at: None,
+            catalog_refresh_provider: None,
             staged: Vec::new(),
             staged_bytes: 0,
             staged_budget,
@@ -1063,6 +1067,9 @@ pub struct DataOutcome {
     pub result: ZResult<()>,
     /// 本帧造成的会话视图变化（无变化 = 空）。
     pub changed: Vec<SessionView>,
+    /// provider 切换后需要异步补读目录的会话。**绝不在收帧路径 await**：
+    /// 目录 RPC 的应答也由同一条 Data 消费循环处理，同步等待会自等待超时。
+    pub catalog_refresh: Vec<String>,
 }
 
 /// 管理器与 actor 共享的部分（状态锁 + sender 通道）。
@@ -1141,8 +1148,12 @@ impl BridgeManager {
     /// （`Ok(changed)` / `Err(error)`）。既有调用方/测试可继续只关心错误；需要「错误
     /// 帧也要发布降级视图」的调用方（Hub 事件泵）必须走 `on_data_outcome`。
     pub async fn on_data(&self, payload: Value) -> ZResult<Vec<SessionView>> {
-        let DataOutcome { result, changed } = self.on_data_outcome(payload).await;
-        result.map(|()| changed)
+        let DataOutcome {
+            result,
+            mut changed,
+            ..
+        } = self.on_data_outcome(payload).await;
+        result.map(|()| std::mem::take(&mut changed))
     }
 
     /// relay 事件泵入口（完整结果）：一条已配对的 `data` payload。
@@ -1155,7 +1166,7 @@ impl BridgeManager {
     /// 错误帧同样可能已经改写了投影（例如把会话标成不新鲜），这些变化必须原样上报，
     /// 否则上层无法广播降级。ACK/退订仍照常尽力发出。
     pub async fn on_data_outcome(&self, payload: Value) -> DataOutcome {
-        let (result, acks, releases, mut changed, stale_catalogs) = {
+        let (result, acks, releases, changed, stale_catalogs) = {
             let mut inner = lock(&self.shared.state);
             // 前/后快照与 `handle_data` 在同一把状态锁内：视图差异就是「本帧」
             // 的效果，不会混入锁外其它调用者的读写。
@@ -1185,45 +1196,32 @@ impl BridgeManager {
                 let Some(entry) = inner.sessions.get_mut(&view.session_id) else {
                     continue;
                 };
-                let provider_changed = entry.catalog.as_ref().is_some_and(|catalog| {
+                let current_provider = entry
+                    .projection
+                    .view()
+                    .selection
+                    .as_ref()
+                    .map(|current| current.provider.clone());
+                let provider_changed = current_provider.as_ref().is_some_and(|current| {
                     entry
-                        .projection
-                        .view()
-                        .selection
+                        .catalog
                         .as_ref()
-                        .is_some_and(|current| current.provider != catalog.provider)
+                        .is_some_and(|catalog| catalog.provider != *current)
+                        || (entry.catalog.is_none()
+                            && entry
+                                .catalog_refresh_provider
+                                .as_deref()
+                                .is_some_and(|provider| provider != current))
                 });
                 if provider_changed {
                     entry.catalog = None;
                     entry.catalog_attempted_at = None;
+                    entry.catalog_refresh_provider = current_provider;
                     stale_catalogs.push(view.session_id.clone());
                 }
             }
             (result, acks, releases, changed, stale_catalogs)
         };
-        for session_id in &stale_catalogs {
-            // 单飞、有界；失败只保留空目录，下一次读路径/帧再补，不借用旧 provider。
-            self.ensure_selection_catalog(session_id).await;
-        }
-        if !stale_catalogs.is_empty() {
-            let refreshed: HashMap<String, SessionView> = {
-                let inner = lock(&self.shared.state);
-                stale_catalogs
-                    .iter()
-                    .filter_map(|session_id| {
-                        inner
-                            .sessions
-                            .get(session_id)
-                            .map(|entry| (session_id.clone(), entry.view_with_catalog()))
-                    })
-                    .collect()
-            };
-            for view in &mut changed {
-                if let Some(next) = refreshed.get(&view.session_id) {
-                    *view = next.clone();
-                }
-            }
-        }
         for ack in acks {
             let _ = self.shared.commands.try_send(Command::SendFrame {
                 payload: ack,
@@ -1233,7 +1231,11 @@ impl BridgeManager {
         for release in releases {
             let _ = self.shared.commands.try_send(release);
         }
-        DataOutcome { result, changed }
+        DataOutcome {
+            result,
+            changed,
+            catalog_refresh: stale_catalogs,
+        }
     }
 
     /// 连接代际变化：丢弃旧代际的全部桥/投影/临时绑定。
@@ -1503,45 +1505,47 @@ impl BridgeManager {
     /// （有界、不打爆宿主）；失败只记位不报错（读失败 = 本 revision 无目录证据，
     /// resolver 侧按缺形状保守关闭）。`invalidate` 随 `sessions` 整体清空。
     /// 会话未在册/未就绪/代际不符 → 零 RPC。
-    pub(crate) async fn ensure_selection_catalog(&self, session_id: &str) {
-        let Some((target, config)) = ({
+    pub(crate) async fn ensure_selection_catalog(&self, session_id: &str) -> bool {
+        let Some((target, config, provider, revision)) = ({
             let mut inner = lock(&self.shared.state);
             let Some(entry) = inner.sessions.get_mut(session_id) else {
-                return;
+                return false;
             };
             if !entry.projection.is_ready() {
-                return;
+                return false;
             }
             let view = entry.projection.view();
             let Some(revision) = view.revision else {
-                return;
+                return false;
             };
             if entry.catalog_attempted_at == Some(revision) {
-                return;
+                return false;
             }
             // 占位记尝试（单飞：并发第二个调用方看到同 revision 已记位即退出）。
             entry.catalog_attempted_at = Some(revision);
             let current = view.selection.as_ref();
-            let config = current.map(|current| {
-                let levels = current
-                    .models
-                    .iter()
-                    .find(|choice| choice.model_id == current.model)
-                    .map(|choice| choice.thought_levels.clone())
-                    .unwrap_or_default();
-                serde_json::json!({
-                    "provider": current.provider,
-                    "model": current.model,
-                    "thought": current.thought,
-                    "thoughtLevels": levels,
-                })
+            let Some(current) = current else {
+                return false;
+            };
+            let provider = current.provider.clone();
+            let levels = current
+                .models
+                .iter()
+                .find(|choice| choice.model_id == current.model)
+                .map(|choice| choice.thought_levels.clone())
+                .unwrap_or_default();
+            let config = serde_json::json!({
+                "provider": current.provider,
+                "model": current.model,
+                "thought": current.thought,
+                "thoughtLevels": levels,
             });
-            config.map(|config| (entry.target.clone(), config))
+            Some((entry.target.clone(), config, provider, revision))
         }) else {
-            return;
+            return false;
         };
         let budget = self.shared.timing.rpc;
-        let Ok(body) = self
+        let body = match self
             .call_with_timeout(
                 &target,
                 MODEL_SELECTION_CHANNEL,
@@ -1550,8 +1554,12 @@ impl BridgeManager {
                 budget,
             )
             .await
-        else {
-            return;
+        {
+            Ok(body) => body,
+            Err(_) => {
+                self.clear_catalog_attempt(session_id, revision);
+                return false;
+            }
         };
         let mut raw = if body.is_object() {
             body
@@ -1562,22 +1570,56 @@ impl BridgeManager {
             object.insert("config".to_owned(), config);
         }
         let Ok(selection) = parse_selection_view(&raw) else {
-            return;
+            self.clear_catalog_attempt(session_id, revision);
+            return false;
         };
         let mut inner = lock(&self.shared.state);
         let Some(entry) = inner.sessions.get_mut(session_id) else {
-            return;
+            return false;
         };
-        if !entry.target.same_binding(&target) {
-            // 等 RPC 期间会话换代/重绑：旧目录不入新账。
-            return;
+        // RPC 期间 provider 已再次切换/重绑/换代：迟到结果不得写回当前缓存。
+        // 同时清掉本 revision 的尝试位，让当前 provider 的下一轮可重试。
+        let current = entry.projection.view();
+        let still_current = entry.target.same_binding(&target)
+            && current.revision == Some(revision)
+            && current
+                .selection
+                .as_ref()
+                .is_some_and(|selection| selection.provider == provider);
+        if !still_current {
+            if entry.catalog_attempted_at == Some(revision) {
+                entry.catalog_attempted_at = None;
+            }
+            return false;
         }
         // T3：目录解析成功即采集目录/档位形状（只认当前 provider；失败不观察）。
         inner.interface.observe_selection_catalog(&raw);
         let Some(entry) = inner.sessions.get_mut(session_id) else {
-            return;
+            return false;
         };
         entry.catalog = Some(selection);
+        entry.catalog_refresh_provider = None;
+        true
+    }
+
+    /// 刷新失败/结果过期后清尝试位；只清仍属于本次 revision 的占位，
+    /// 不踩掉更新 revision 的并发尝试。
+    fn clear_catalog_attempt(&self, session_id: &str, revision: u64) {
+        let mut inner = lock(&self.shared.state);
+        if let Some(entry) = inner.sessions.get_mut(session_id) {
+            if entry.catalog_attempted_at == Some(revision) {
+                entry.catalog_attempted_at = None;
+            }
+        }
+    }
+
+    /// 当前会话的合并视图（供目录刷新任务在 RPC 完成后发布最新帧）。
+    pub(crate) fn session_view(&self, session_id: &str) -> Option<SessionView> {
+        let inner = lock(&self.shared.state);
+        inner
+            .sessions
+            .get(session_id)
+            .map(|entry| entry.view_with_catalog())
     }
 
     /// 在绑定会话的桥上发一次 RPC（读调用；T3 起才用于写命令）。
@@ -4514,15 +4556,24 @@ mod tests {
 
         /// 注入一条带新物理 seq 的入站帧（模拟迟到应答）；返回本次变化的会话视图。
         async fn inject_frame(&self, bridge: &str, bytes: Vec<u8>) -> Vec<SessionView> {
+            self.inject_outcome(bridge, bytes).await.changed
+        }
+
+        /// 同上，但保留完整 [`DataOutcome`]（目录刷新信号测试用）。
+        async fn inject_outcome(&self, bridge: &str, bytes: Vec<u8>) -> DataOutcome {
             let frame = {
                 let mut inner = self.inner.lock().expect("peer lock");
                 self.frame(&mut inner, bridge, bytes)
             };
             let manager = self.manager.lock().expect("peer lock").upgrade();
             if let Some(manager) = manager {
-                manager.on_data(frame).await.unwrap_or_default()
+                manager.on_data_outcome(frame).await
             } else {
-                Vec::new()
+                DataOutcome {
+                    result: Err(ZcodeError::offline()),
+                    changed: Vec::new(),
+                    catalog_refresh: Vec::new(),
+                }
             }
         }
 
@@ -8036,7 +8087,7 @@ mod tests {
 
     /// 注入一条选择增量（config 键级整体替换 + revision 前进）；返回变化的会话视图。
     #[allow(clippy::too_many_arguments)]
-    async fn push_selection_delta_on(
+    async fn push_selection_delta_outcome_on(
         peer: &Peer,
         session_id: &str,
         subscription: &str,
@@ -8046,7 +8097,7 @@ mod tests {
         provider: &str,
         model: &str,
         thought: &str,
-    ) -> Vec<SessionView> {
+    ) -> DataOutcome {
         let bridge = peer.session_bridge_id(session_id);
         let listen = peer.listen_id(&bridge);
         let topic = format!("{CONVERSATION_TOPIC_PREFIX}{session_id}");
@@ -8074,11 +8125,39 @@ mod tests {
                 }
             }
         });
-        peer.inject_frame(
+        peer.inject_outcome(
             &bridge,
             channel_message(json!([RESPONSE_TYPE_EVENT_FIRE, listen]), &wire),
         )
         .await
+    }
+
+    /// 兼容旧测试：只取变化视图的包装。
+    #[allow(clippy::too_many_arguments)]
+    async fn push_selection_delta_on(
+        peer: &Peer,
+        session_id: &str,
+        subscription: &str,
+        from: u64,
+        to: u64,
+        revision: u64,
+        provider: &str,
+        model: &str,
+        thought: &str,
+    ) -> Vec<SessionView> {
+        push_selection_delta_outcome_on(
+            peer,
+            session_id,
+            subscription,
+            from,
+            to,
+            revision,
+            provider,
+            model,
+            thought,
+        )
+        .await
+        .changed
     }
 
     /// stop 端口的会话视图必须按**精确目标**取：兄弟会话的 control 绝不冒充本目标，
@@ -8616,7 +8695,16 @@ mod tests {
             .expect("initial catalog");
         assert_eq!(initial.providers.len(), 2, "初始目录两组");
 
-        let changed = push_selection_delta_on(
+        let get_views = || {
+            channel_frames(&peer)
+                .into_iter()
+                .filter(|message| {
+                    message.method.as_deref() == Some(MODEL_SELECTION_GET_VIEW_METHOD)
+                })
+                .count()
+        };
+        let before = get_views();
+        let outcome = push_selection_delta_outcome_on(
             &peer,
             SESSION_A,
             "conv-sub-synthetic-1",
@@ -8628,14 +8716,27 @@ mod tests {
             "high",
         )
         .await;
-        let view = changed
+        assert_eq!(get_views(), before, "收帧路径绝不能同步等待目录 RPC");
+        assert_eq!(outcome.catalog_refresh, vec![SESSION_A.to_owned()]);
+        let stale = outcome
+            .changed
             .iter()
             .find(|view| view.session_id == SESSION_A)
             .expect("切换帧必须发布会话");
+        assert!(
+            stale
+                .selection
+                .as_ref()
+                .is_some_and(|selection| selection.providers.is_empty()),
+            "旧 A 目录不得随 B 投影借出"
+        );
+
+        assert!(manager.ensure_selection_catalog(SESSION_A).await);
+        let view = manager.session_view(SESSION_A).expect("refreshed view");
         let selection = view.selection.as_ref().expect("selection");
         assert_eq!(selection.provider, PROVIDER_B);
         assert_eq!(selection.model, "b-only");
-        assert_eq!(selection.providers.len(), 2, "切换后实时帧不得丢分组");
+        assert_eq!(selection.providers.len(), 2, "异步刷新后不得丢分组");
         let b = selection
             .providers
             .iter()
@@ -8653,6 +8754,119 @@ mod tests {
                         .any(|model| model.model_id == "b-only")),
             "A 不得借用 B 的模型"
         );
+    }
+
+    /// C1 迟到结果：A→B→C 期间 B 的目录 RPC 迟到，绝不能把 C 的缓存覆盖回 B；
+    /// 失败/过期后仍可在当前 revision 重试 C。
+    #[tokio::test]
+    async fn late_provider_catalog_result_does_not_overwrite_newer_provider() {
+        const PROVIDER_A: &str = "synthetic-provider-a";
+        const PROVIDER_B: &str = "synthetic-provider-b";
+        const PROVIDER_C: &str = "synthetic-provider-c";
+        let config = PeerConfig {
+            workspaces: vec![workspace_entry(WS_A, Some("ws-a-identity"), "A")],
+            tasks: vec![task_row(WS_A, SESSION_A, "hi")],
+            conversation_snapshot: Some(selection_snapshot(
+                SESSION_A,
+                2,
+                PROVIDER_A,
+                "a-only",
+                Some("low"),
+                &["low"],
+            )),
+            model_selection_view: Some(json!({
+                "providers": [
+                    {"providerId": PROVIDER_A, "models": [
+                        {"modelId": "a-only", "config": {"optionSpecs": {"reasoningLevel": {"values": ["low"]}}}}
+                    ]},
+                    {"providerId": PROVIDER_B, "available": true, "models": [
+                        {"modelId": "b-only", "config": {"optionSpecs": {"reasoningLevel": {"values": ["high"]}}}}
+                    ]},
+                    {"providerId": PROVIDER_C, "available": true, "models": [
+                        {"modelId": "c-only", "config": {"optionSpecs": {"reasoningLevel": {"values": ["medium"]}}}}
+                    ]}
+                ]
+            })),
+            ..PeerConfig::default()
+        };
+        let (manager, peer) = manager_with(config).await;
+        let target = manager.bind(&key(SESSION_A)).await.expect("bind");
+        SelectionPort::load(manager.as_ref(), &target)
+            .await
+            .expect("initial catalog");
+        push_selection_delta_outcome_on(
+            &peer,
+            SESSION_A,
+            "conv-sub-synthetic-1",
+            1,
+            2,
+            3,
+            PROVIDER_B,
+            "b-only",
+            "high",
+        )
+        .await;
+
+        let gate = peer.hold_next_send();
+        let worker = manager.clone();
+        let late_b = tokio::spawn(async move { worker.ensure_selection_catalog(SESSION_A).await });
+        wait_until(|| peer.stalled(), "B 的目录 RPC 应停在 actor").await;
+        let c_outcome = push_selection_delta_outcome_on(
+            &peer,
+            SESSION_A,
+            "conv-sub-synthetic-1",
+            2,
+            3,
+            4,
+            PROVIDER_C,
+            "c-only",
+            "medium",
+        )
+        .await;
+        assert_eq!(c_outcome.catalog_refresh, vec![SESSION_A.to_owned()]);
+        gate.add_permits(1);
+        assert!(!late_b.await.expect("late B task"), "迟到的 B 结果必须丢弃");
+
+        assert!(manager.ensure_selection_catalog(SESSION_A).await);
+        let view = manager.session_view(SESSION_A).expect("C view");
+        let selection = view.selection.as_ref().expect("selection");
+        assert_eq!(selection.provider, PROVIDER_C);
+        assert_eq!(selection.model, "c-only");
+        assert_eq!(selection.providers.len(), 3);
+        assert!(selection
+            .providers
+            .iter()
+            .find(|provider| provider.provider_id == PROVIDER_C)
+            .is_some_and(|provider| provider.models[0].model_id == "c-only"));
+    }
+
+    /// 目录读失败必须清尝试位：同一 revision 的第二次调用仍会重试（有界重试的桥侧前提）。
+    #[tokio::test]
+    async fn failed_catalog_read_clears_attempt_for_same_revision_retry() {
+        const PROVIDER: &str = "synthetic-provider";
+        let config = PeerConfig {
+            workspaces: vec![workspace_entry(WS_A, Some("ws-a-identity"), "A")],
+            tasks: vec![task_row(WS_A, SESSION_A, "hi")],
+            conversation_snapshot: Some(selection_snapshot(
+                SESSION_A,
+                2,
+                PROVIDER,
+                "model-a",
+                Some("low"),
+                &["low"],
+            )),
+            model_selection_view: Some(json!({"providers": "not-an-array"})),
+            ..PeerConfig::default()
+        };
+        let (manager, peer) = manager_with(config).await;
+        manager.bind(&key(SESSION_A)).await.expect("bind");
+        assert!(!manager.ensure_selection_catalog(SESSION_A).await);
+        assert!(!manager.ensure_selection_catalog(SESSION_A).await);
+        let get_views = channel_frames(&peer)
+            .into_iter()
+            .filter(|message| message.method.as_deref() == Some(MODEL_SELECTION_GET_VIEW_METHOD))
+            .count();
+        assert_eq!(get_views, 2, "失败后同 revision 必须允许再试");
     }
 
     /// 快照扁平 `config.thoughtLevels` 必须经**生产** `BridgeManager::load` 回退到

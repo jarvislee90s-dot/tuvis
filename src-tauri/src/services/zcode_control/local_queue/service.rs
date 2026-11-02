@@ -460,6 +460,16 @@ impl ZcodeQueueService {
         }
         self.observe_bound(&key, &bound)?;
         let works = &bound.view.control.as_ref().unwrap().active_works;
+        // 同帧新鲜终态已在 observe_bound 收口；仍有的未核对屏障一律拒绝（零 stop/send）。
+        if self.store.has_review_barrier(&key)? {
+            self.store.finish_priority_safe(
+                actor,
+                &cmd.request_id,
+                PriorityEnd::BeforeStop,
+                now(),
+            )?;
+            return Err(ZcodeError::of(codes::QUEUE_REVIEW_REQUIRED));
+        }
         if works.is_empty() && self.store.has_delivery_barrier(&key)? {
             self.store.finish_priority_safe(
                 actor,
@@ -3245,6 +3255,145 @@ mod tests {
         assert!(fake.sent.lock().unwrap().is_empty());
     }
     #[tokio::test]
+    async fn resume_and_prioritize_before_unconfirmed_review_are_rejected_without_side_effects() {
+        let fake = Arc::new(Fake {
+            sent: Mutex::new(vec![]),
+            busy: Mutex::new(false),
+            lock: Arc::new(tokio::sync::Mutex::new(())),
+            receipts: Mutex::new(std::collections::BTreeMap::new()),
+            terminal_after_send: AtomicBool::new(false),
+            delivery: SendDelivery::StartNow,
+            changed_path_after_send: AtomicBool::new(false),
+            revision: std::sync::atomic::AtomicU64::new(1),
+            bound: AtomicBool::new(true),
+            refresh_calls: std::sync::atomic::AtomicUsize::new(0),
+            activate_calls: std::sync::atomic::AtomicUsize::new(0),
+            activate_failures: std::sync::atomic::AtomicUsize::new(0),
+            identity: None,
+            blocked_session: AtomicBool::new(false),
+            read_calls: std::sync::atomic::AtomicUsize::new(0),
+            read_failures: std::sync::atomic::AtomicUsize::new(0),
+            refresh_failures: std::sync::atomic::AtomicUsize::new(0),
+            send_failure: Mutex::new(None),
+        });
+        let store = SqlLocalQueueStore::new(DeviceStore::memory());
+        let svc = Arc::new(ZcodeQueueService::new(
+            store.clone(),
+            fake.clone(),
+            Arc::new(Gate),
+        ));
+        let actor = QueueActor {
+            device_id: "d".into(),
+            device_name: "phone".into(),
+        };
+        let key = TargetKey {
+            session_id: "session".into(),
+        };
+        for text in ["A", "B"] {
+            svc.enqueue(EnqueueCommand {
+                request_id: text.into(),
+                actor: actor.clone(),
+                session_id: key.session_id.clone(),
+                workspace_path: "/synthetic".into(),
+                workspace_identity: None,
+                draft: QueueDraft {
+                    text: text.into(),
+                    attachments: vec![],
+                },
+                prepared: PreparedSend::from_stored(text.into()).unwrap(),
+                edited_from: None,
+            })
+            .await
+            .unwrap();
+        }
+        // 重启恢复：A accepted/startNow 无终态，B queued。
+        let target = fake.read(&key, Duration::ZERO).await.unwrap().target;
+        let claim = store.claim_next(&key, &target, 2).unwrap().unwrap();
+        fake.receipts.lock().unwrap().insert(
+            claim.ctx.action_id.clone(),
+            ActionReceipt {
+                action_id: claim.ctx.action_id.clone(),
+                session_id: key.session_id.clone(),
+                generation: 1,
+                state: ActionState::Accepted,
+                reason_code: None,
+                send_admission: Some(SendAdmission {
+                    delivery: SendDelivery::StartNow,
+                    input_id: "A-input".into(),
+                }),
+            },
+        );
+        svc.recover().await.unwrap();
+        let before = store.view(&actor, &key).unwrap();
+        assert!(!before.auto_drain);
+        assert_eq!(before.pause_reason.as_deref(), Some("unconfirmed"));
+
+        let error = svc
+            .resume(&actor, &key, "resume-before-review", before.version)
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(error.code, codes::QUEUE_REVIEW_REQUIRED);
+        let after = store.view(&actor, &key).unwrap();
+        assert_eq!(after.version, before.version);
+        assert!(!after.auto_drain);
+
+        let b = after
+            .items
+            .iter()
+            .find(|item| item.text_preview == "B")
+            .unwrap();
+        let error = svc
+            .prioritize(
+                &actor,
+                super::super::types::PriorityCommand {
+                    request_id: "priority-before-review".into(),
+                    item_id: b.item_id.clone(),
+                    expected_version: b.item_version,
+                    confirm_stop: false,
+                    expected_execution_id: None,
+                    held_queue: None,
+                },
+            )
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(error.code, codes::QUEUE_REVIEW_REQUIRED);
+        assert!(fake.sent.lock().unwrap().is_empty());
+        assert!(!fake.receipts.lock().unwrap().contains_key("stopped:A"));
+        // 新 priority 操作已落账但被明确判失败；关键是零 stop / 零 send，绝不静默成功。
+        assert_eq!(
+            store
+                .operation(&actor, "priority-before-review")
+                .unwrap()
+                .unwrap()
+                .state,
+            super::super::types::QueueOperationState::Failed
+        );
+
+        // 核对只清屏障、不重发；确认并继续只发 B 一次，重复请求幂等。
+        svc.acknowledge_unconfirmed(&actor, &key, &claim.ctx.action_id, "review-ack")
+            .await
+            .unwrap();
+        let reviewed = store.view(&actor, &key).unwrap();
+        assert!(!reviewed.auto_drain);
+        let resumed = svc
+            .resume(&actor, &key, "continue", reviewed.version)
+            .await
+            .unwrap();
+        assert!(resumed.auto_drain);
+        assert!(
+            svc.resume(&actor, &key, "continue", reviewed.version)
+                .await
+                .unwrap()
+                .auto_drain
+        );
+        svc.flush_one(&key).await.unwrap();
+        svc.flush_one(&key).await.unwrap();
+        assert_eq!(*fake.sent.lock().unwrap(), vec!["B"]);
+    }
+
+    #[tokio::test]
     async fn older_terminal_cannot_override_newer_running_observation() {
         let fake = Arc::new(Fake {
             sent: Mutex::new(vec![]),
@@ -4236,9 +4385,14 @@ mod tests {
             .recover(chrono::Utc::now().timestamp_millis())
             .unwrap();
         let view = store.view(&actor, &key).unwrap();
-        svc.resume(&actor, &key, "resume", view.version)
-            .await
-            .unwrap();
+        assert_eq!(
+            svc.resume(&actor, &key, "resume", view.version)
+                .await
+                .err()
+                .unwrap()
+                .code,
+            codes::QUEUE_REVIEW_REQUIRED
+        );
         *fake.busy.lock().unwrap() = false;
         svc.flush_one(&key).await.unwrap();
         assert!(fake.sent.lock().unwrap().is_empty());
@@ -4648,9 +4802,14 @@ mod tests {
             .unwrap()
         });
         let paused = store.view(&actor, &key).unwrap();
-        svc.resume(&actor, &key, "early", paused.version)
-            .await
-            .unwrap();
+        assert_eq!(
+            svc.resume(&actor, &key, "early", paused.version)
+                .await
+                .err()
+                .unwrap()
+                .code,
+            codes::QUEUE_REVIEW_REQUIRED
+        );
         svc.flush_one(&key).await.unwrap();
         assert_eq!(*fake.sent.lock().unwrap(), vec!["B"]);
         assert!(svc
@@ -6650,6 +6809,156 @@ mod tests {
         assert_eq!(pending.get("req-0").unwrap().code, "code-0");
         assert!(!pending.contains_key("req-199"));
     }
+    /// 正常回合运行中：本地有一条 accepted/startNow 且无终态的发送（**无重启标记**）。
+    /// 此时“插队”必须能先停止当前回合、再发指定项，不能把普通运行中的 accepted
+    /// 误判成重启待核对屏障。停止后宿主给出该次发送的终态（真实宿主行为）。
+    struct TerminalAfterStop {
+        inner: Arc<Fake>,
+        stopped: AtomicBool,
+    }
+    impl QueueHostPort for TerminalAfterStop {
+        fn session_lock(&self, key: &TargetKey) -> Arc<tokio::sync::Mutex<()>> {
+            self.inner.session_lock(key)
+        }
+        fn read<'a>(
+            &'a self,
+            key: &'a TargetKey,
+            timeout: Duration,
+        ) -> BoxFuture<'a, ZResult<BoundQueueSession>> {
+            Box::pin(async move {
+                let mut bound = self.inner.read(key, timeout).await?;
+                if self.stopped.load(Ordering::SeqCst) {
+                    bound.view.revision = Some(2);
+                    bound.view.execution_terminal = Some(ExecutionTerminal {
+                        input_id: "B-input".into(),
+                        result_type: "success".into(),
+                        revision: 2,
+                    });
+                }
+                Ok(bound)
+            })
+        }
+        fn refresh_target<'a>(
+            &'a self,
+            key: &'a TargetKey,
+            timeout: Duration,
+        ) -> BoxFuture<'a, ZResult<BoundTarget>> {
+            self.inner.refresh_target(key, timeout)
+        }
+        fn activate<'a>(
+            &'a self,
+            key: &'a TargetKey,
+            timeout: Duration,
+        ) -> BoxFuture<'a, ZResult<()>> {
+            self.inner.activate(key, timeout)
+        }
+        fn send_prepared<'a>(
+            &'a self,
+            ctx: &'a ActionContext,
+            target: &'a BoundTarget,
+            body: &'a PreparedSend,
+            held: Option<&'a HeldQueueChoice>,
+        ) -> BoxFuture<'a, super::super::super::command::PreparedResult<ActionReceipt>> {
+            self.inner.send_prepared(ctx, target, body, held)
+        }
+        fn stop<'a>(
+            &'a self,
+            ctx: &'a ActionContext,
+            target: &'a BoundTarget,
+            execution: &'a str,
+        ) -> BoxFuture<'a, super::super::super::command::PreparedResult<ActionReceipt>> {
+            Box::pin(async move {
+                let receipt = self.inner.stop(ctx, target, execution).await?;
+                self.stopped.store(true, Ordering::SeqCst);
+                Ok(receipt)
+            })
+        }
+        fn receipt<'a>(
+            &'a self,
+            action: &'a str,
+            device: &'a str,
+        ) -> BoxFuture<'a, ZResult<Option<ActionReceipt>>> {
+            self.inner.receipt(action, device)
+        }
+    }
+    #[tokio::test]
+    async fn running_accepted_without_restart_flag_still_allows_priority_stop_and_send() {
+        let fake = Arc::new(Fake {
+            sent: Mutex::new(vec![]),
+            busy: Mutex::new(false),
+            lock: Arc::new(tokio::sync::Mutex::new(())),
+            receipts: Mutex::new(std::collections::BTreeMap::new()),
+            terminal_after_send: AtomicBool::new(false),
+            delivery: SendDelivery::StartNow,
+            changed_path_after_send: AtomicBool::new(false),
+            revision: std::sync::atomic::AtomicU64::new(1),
+            bound: AtomicBool::new(true),
+            refresh_calls: std::sync::atomic::AtomicUsize::new(0),
+            activate_calls: std::sync::atomic::AtomicUsize::new(0),
+            activate_failures: std::sync::atomic::AtomicUsize::new(0),
+            identity: None,
+            blocked_session: AtomicBool::new(false),
+            read_calls: std::sync::atomic::AtomicUsize::new(0),
+            read_failures: std::sync::atomic::AtomicUsize::new(0),
+            refresh_failures: std::sync::atomic::AtomicUsize::new(0),
+            send_failure: Mutex::new(None),
+        });
+        let host = Arc::new(TerminalAfterStop {
+            inner: fake.clone(),
+            stopped: AtomicBool::new(false),
+        });
+        let store = SqlLocalQueueStore::new(DeviceStore::memory());
+        let svc = Arc::new(ZcodeQueueService::new(store.clone(), host, Arc::new(Gate)));
+        let actor = QueueActor {
+            device_id: "d".into(),
+            device_name: "phone".into(),
+        };
+        let key = TargetKey {
+            session_id: "session".into(),
+        };
+        let enqueue = |text: &'static str| EnqueueCommand {
+            request_id: text.into(),
+            actor: actor.clone(),
+            session_id: key.session_id.clone(),
+            workspace_path: "/synthetic".into(),
+            workspace_identity: None,
+            draft: QueueDraft {
+                text: text.into(),
+                attachments: vec![],
+            },
+            prepared: PreparedSend::from_stored(text.into()).unwrap(),
+            edited_from: None,
+        };
+        svc.enqueue(enqueue("B")).await.unwrap();
+        svc.flush_one(&key).await.unwrap();
+        assert_eq!(*fake.sent.lock().unwrap(), vec!["B"]);
+        // B 已 accepted/startNow 且无终态；宿主此时把该发送视为运行中的回合。
+        *fake.busy.lock().unwrap() = true;
+        let c = svc.enqueue(enqueue("C")).await.unwrap();
+
+        let result = svc
+            .prioritize(
+                &actor,
+                super::super::types::PriorityCommand {
+                    request_id: "priority".into(),
+                    item_id: c.item_id.clone(),
+                    expected_version: c.item_version,
+                    confirm_stop: true,
+                    expected_execution_id: Some("A".into()),
+                    held_queue: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            result.state,
+            super::super::types::QueueOperationState::Completed
+        );
+        assert!(fake.receipts.lock().unwrap().contains_key("stopped:A"));
+        assert_eq!(*fake.sent.lock().unwrap(), vec!["B", "C"]);
+        assert!(!store.view(&actor, &key).unwrap().auto_drain);
+    }
+
     #[tokio::test]
     async fn prioritize_c_stops_a_then_sends_only_c() {
         let fake = Arc::new(Fake {

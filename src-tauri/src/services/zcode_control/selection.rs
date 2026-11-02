@@ -32,17 +32,25 @@ pub fn build_selection_command(view: &SessionView, model: &str, thought: &str) -
         .ok_or_else(|| ZcodeError::of(codes::NOT_READY))?
         .provider
         .clone();
-    build_selection_command_for_provider(view, &provider, model, thought)
+    build_selection_command_for_provider(view, &provider, model, thought, false)
 }
 
 /// 按**目标 provider** 构造 `switchModelConfig`：provider 必须出现在官方目录分组里
 /// （或旧载荷的空分组时退化为当前会话 provider），模型与档位必须属于该分组自己的
-/// 模型目录；不可用 provider / 他组模型 / 他组档位一律 `invalid_action`。
+/// 模型目录；他组模型 / 他组档位一律 `invalid_action`。
+///
+/// 可用性三态（`allow_unknown` = 用户已在手机端二次确认）：
+/// - 显式 `available=true`：直接允许；
+/// - 显式 `available=false`：**始终**拒绝（确认标志不能把已知不可用变成可尝试）；
+/// - 缺 `available` 字段（`availability_known=false`）：无论解析时 `available` 的
+///   默认值如何，`allow_unknown=false` 一律拒绝，`true` 才允许一次尝试；命令仍恰为
+///   一次完整 provider/model/thought 三元组。
 pub fn build_selection_command_for_provider(
     view: &SessionView,
     provider: &str,
     model: &str,
     thought: &str,
+    allow_unknown: bool,
 ) -> ZResult<Value> {
     let selection = view
         .selection
@@ -56,10 +64,17 @@ pub fn build_selection_command_for_provider(
         .iter()
         .find(|candidate| candidate.provider_id == provider);
     let models = match group {
-        Some(group) if !group.available => {
-            return Err(ZcodeError::of(codes::INVALID_ACTION));
+        Some(group) => {
+            // 显式不可用是已知事实：确认标志也不放行。
+            if group.availability_known && !group.available {
+                return Err(ZcodeError::of(codes::INVALID_ACTION));
+            }
+            // 缺 available = 未知：只有用户显式确认后才允许一次尝试。
+            if !group.availability_known && !allow_unknown {
+                return Err(ZcodeError::of(codes::INVALID_ACTION));
+            }
+            &group.models
         }
-        Some(group) => &group.models,
         None if provider == selection.provider && selection.providers.is_empty() => {
             &selection.models
         }
@@ -266,12 +281,14 @@ fn provider_from_record(record: &Value, config: &SessionConfig<'_>) -> ZResult<P
         });
     }
     // 目录成员本身只证明“当前工作区里有这个分组”，不证明其他供应商此刻可用。
-    // 当前 provider 缺省可用；非当前 provider 只有显式 available=true 才开放，
-    // 避免把未知资格当作可切换目标。显式 false 始终关闭。
-    let available = record
-        .get("available")
-        .and_then(Value::as_bool)
-        .unwrap_or(provider_id == config.provider);
+    // 三态解析：
+    // - 显式 available true/false → 已知（availability_known=true）；
+    // - 缺字段 → 可用性未知（known=false）：非当前 provider 保守置 available=false
+    //   （UI 仍可选中，但提交前必须二次确认）；当前 provider 置 available=true 以
+    //   保留既有「当前会话可继续切换模型/档位」能力，但**不**宣称可用性已知。
+    let declared_available = record.get("available").and_then(Value::as_bool);
+    let availability_known = declared_available.is_some();
+    let available = declared_available.unwrap_or(provider_id == config.provider);
     let reason_code = record
         .get("reasonCode")
         .and_then(Value::as_str)
@@ -282,6 +299,7 @@ fn provider_from_record(record: &Value, config: &SessionConfig<'_>) -> ZResult<P
         label,
         models: choices,
         available,
+        availability_known,
         reason_code,
     })
 }
@@ -759,7 +777,7 @@ mod provider_tests {
         serde_json::json!({
             "config": {"provider": "a", "model": "same", "thought": "low", "thoughtLevels": ["low"]},
             "providers": [
-                {"providerId": "a", "providerName": "A", "models": [
+                {"providerId": "a", "providerName": "A", "available": true, "models": [
                     {"modelId": "same", "config": {"optionSpecs": {"reasoningLevel": {"values": ["low"]}}}}
                 ]},
                 {"providerId": "b", "providerName": "B", "available": true, "models": [
@@ -785,8 +803,9 @@ mod provider_tests {
         assert_eq!(selection.providers[0].provider_id, "a");
         assert_eq!(selection.providers[1].provider_id, "b");
         let view = session_with(selection);
-        let cmd_a = build_selection_command_for_provider(&view, "a", "same", "low").unwrap();
-        let cmd_b = build_selection_command_for_provider(&view, "b", "same", "high").unwrap();
+        let cmd_a = build_selection_command_for_provider(&view, "a", "same", "low", false).unwrap();
+        let cmd_b =
+            build_selection_command_for_provider(&view, "b", "same", "high", false).unwrap();
         assert_eq!(cmd_a["payload"]["provider"], "a");
         assert_eq!(cmd_b["payload"]["provider"], "b");
         assert_ne!(cmd_a["payload"], cmd_b["payload"]);
@@ -796,8 +815,8 @@ mod provider_tests {
     fn cross_provider_switch_requires_its_own_levels() {
         let selection = parse_selection_view(&raw_two_providers()).unwrap();
         let view = session_with(selection);
-        assert!(build_selection_command_for_provider(&view, "b", "same", "low").is_err());
-        assert!(build_selection_command_for_provider(&view, "b", "same", "high").is_ok());
+        assert!(build_selection_command_for_provider(&view, "b", "same", "low", false).is_err());
+        assert!(build_selection_command_for_provider(&view, "b", "same", "high", false).is_ok());
     }
 
     #[test]
@@ -833,27 +852,87 @@ mod provider_tests {
             "B 未声明档位不得借用 A"
         );
     }
-    #[test]
-    fn provider_availability_defaults_only_for_current_provider() {
-        let raw = serde_json::json!({
+    fn raw_availability_three_states() -> Value {
+        serde_json::json!({
             "config": {"provider": "a", "model": "ma", "thought": "low", "thoughtLevels": ["low"]},
             "providers": [
+                // 当前 provider 缺字段：可继续用，但不宣称可用性已知。
                 {"providerId": "a", "models": [{"modelId": "ma", "config": {"optionSpecs": {"reasoningLevel": {"values": ["low"]}}}}]},
+                // 非当前 provider 缺字段：可用性未知，显式确认后才允许尝试。
                 {"providerId": "b", "models": [{"modelId": "mb", "config": {"optionSpecs": {"reasoningLevel": {"values": ["low"]}}}}]},
-                {"providerId": "c", "available": true, "models": [{"modelId": "mc", "config": {"optionSpecs": {"reasoningLevel": {"values": ["low"]}}}}]}
+                // 显式 false：任何情况都不允许。
+                {"providerId": "c", "available": false, "models": [{"modelId": "mc", "config": {"optionSpecs": {"reasoningLevel": {"values": ["low"]}}}}]},
+                // 显式 true：直接可选。
+                {"providerId": "d", "available": true, "models": [{"modelId": "md", "config": {"optionSpecs": {"reasoningLevel": {"values": ["low"]}}}}]}
             ]
-        });
-        let selection = parse_selection_view(&raw).unwrap();
-        let available = |id: &str| {
-            selection
-                .providers
-                .iter()
-                .find(|p| p.provider_id == id)
-                .unwrap()
-                .available
-        };
-        assert!(available("a"), "当前供应商缺省可用");
-        assert!(!available("b"), "非当前供应商缺字段必须保守关闭");
-        assert!(available("c"), "显式 true 才开放");
+        })
+    }
+
+    fn group<'a>(selection: &'a SelectionView, id: &str) -> &'a ProviderChoice {
+        selection
+            .providers
+            .iter()
+            .find(|provider| provider.provider_id == id)
+            .unwrap()
+    }
+
+    #[test]
+    fn provider_availability_defaults_only_for_current_provider() {
+        let selection = parse_selection_view(&raw_availability_three_states()).unwrap();
+        assert!(
+            group(&selection, "a").available,
+            "当前供应商缺字段仍可继续使用"
+        );
+        assert!(
+            !group(&selection, "a").availability_known,
+            "但绝不把缺字段宣称为已知可用"
+        );
+        assert!(
+            !group(&selection, "b").available,
+            "非当前供应商缺字段必须保守关闭"
+        );
+        assert!(!group(&selection, "b").availability_known);
+        assert!(
+            !group(&selection, "c").available && group(&selection, "c").availability_known,
+            "显式 false 是已知不可用"
+        );
+        assert!(
+            group(&selection, "d").available && group(&selection, "d").availability_known,
+            "显式 true 才开放"
+        );
+    }
+
+    #[test]
+    fn unknown_provider_requires_explicit_confirmation() {
+        let selection = parse_selection_view(&raw_availability_three_states()).unwrap();
+        let view = session_with(selection);
+        // 缺字段 B：不带确认 → 拒绝（零尝试）。
+        let rejected = build_selection_command_for_provider(&view, "b", "mb", "low", false)
+            .expect_err("unknown provider without confirmation must be rejected");
+        assert!(rejected.is(codes::INVALID_ACTION));
+        // 带显式确认 → 允许，且信封仍是一次完整三元组。
+        let command = build_selection_command_for_provider(&view, "b", "mb", "low", true).unwrap();
+        assert_eq!(
+            command["payload"],
+            serde_json::json!({"provider": "b", "model": "mb", "thought": "low"})
+        );
+        // 当前 provider 缺字段：同样不宣称已知，未确认仍拒绝；确认后才放行。
+        assert!(build_selection_command_for_provider(&view, "a", "ma", "low", false).is_err());
+        assert!(build_selection_command_for_provider(&view, "a", "ma", "low", true).is_ok());
+    }
+
+    #[test]
+    fn explicit_unavailable_provider_stays_disabled() {
+        let selection = parse_selection_view(&raw_availability_three_states()).unwrap();
+        let view = session_with(selection);
+        // 显式 false：确认标志也不能放行（不是「未知」，是已宣告不可用）。
+        for allow_unknown in [false, true] {
+            let rejected =
+                build_selection_command_for_provider(&view, "c", "mc", "low", allow_unknown)
+                    .expect_err("explicit unavailable provider must stay rejected");
+            assert!(rejected.is(codes::INVALID_ACTION));
+        }
+        // 显式 true 不受确认标志影响。
+        assert!(build_selection_command_for_provider(&view, "d", "md", "low", false).is_ok());
     }
 }

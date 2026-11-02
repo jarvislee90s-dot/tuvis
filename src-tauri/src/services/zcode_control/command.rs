@@ -1628,6 +1628,7 @@ impl CommandSender {
             provider,
             model,
             thought,
+            confirm_unknown_provider,
             ..
         } = action
         else {
@@ -1679,19 +1680,24 @@ impl CommandSender {
         // 选择视图随新鲜视图一起交给构造器：CAS revision 必填、模型/档位必须属于
         // **目标 provider 目录**（空档位/他模型档位/未知值 → invalid_action）。
         view.selection = Some(selection);
-        let command =
-            build_selection_command_for_provider(&view, &target_provider, model, thought)?;
+        // 可用性未知的 provider 只有用户显式确认后才允许一次完整三元组尝试；
+        // 显式不可用/未确认的未知都在构造器内 zero-frame 拒绝。
+        let command = build_selection_command_for_provider(
+            &view,
+            &target_provider,
+            model,
+            thought,
+            *confirm_unknown_provider,
+        )?;
         let base_revision = view
             .revision
             .ok_or_else(|| ZcodeError::of(codes::NOT_READY))?;
         // 写即将发生：此时才预留。指纹只覆盖稳定意图（kind + 会话 + 代际 +
-        // model/thought），与 `lookup_action`/`action_params` 同一口径：`baseRevision`
-        // 是 CAS 执行态（成功后必变），provider 是服务端派生的会话属性，二者都不参与
-        // 身份，否则同 actionId 重试会落成 `action_payload_conflict`。审计摘要只记类别。
-        let mut params = serde_json::json!({ "model": model, "thought": thought });
-        if let Some(provider) = provider {
-            params["provider"] = serde_json::Value::from(provider.clone());
-        }
+        // provider/model/thought，以及仅为 true 的 confirmUnknownProvider），与
+        // `lookup_action`/`action_params` 同一口径：`baseRevision` 是 CAS 执行态
+        //（成功后必变），不参与身份，否则同 actionId 重试会落成
+        // `action_payload_conflict`。审计摘要只记类别。
+        let params = action_params(action);
         let hash = payload_hash(
             action.kind(),
             &target.session_id,
@@ -3290,6 +3296,7 @@ mod tests {
                 provider: None,
                 model: "model-a".to_string(),
                 thought: "high".to_string(),
+                confirm_unknown_provider: false,
             },
         ];
         for action in &closed {
@@ -4039,6 +4046,7 @@ mod tests {
                         provider: None,
                         model: "synthetic-model".to_owned(),
                         thought: "high".to_owned(),
+                        confirm_unknown_provider: false,
                     },
                     vec!["model", "thought_level"],
                 ),
@@ -7610,6 +7618,7 @@ mod tests {
                 provider: None,
                 model: model.to_owned(),
                 thought: thought.to_owned(),
+                confirm_unknown_provider: false,
             }
         }
 
@@ -7626,6 +7635,7 @@ mod tests {
                         label: "A".to_owned(),
                         models: vec![choice("model-a", &["low", "high"])],
                         available: true,
+                        availability_known: true,
                         reason_code: None,
                     },
                     ProviderChoice {
@@ -7633,10 +7643,24 @@ mod tests {
                         label: "B".to_owned(),
                         models: vec![choice("model-b", &["low"])],
                         available: true,
+                        availability_known: true,
                         reason_code: None,
                     },
                 ],
             }
+        }
+
+        /// provider-b 缺 available 字段：目录可见但可用性未知（需显式确认）。
+        fn unknown_provider_catalog() -> SelectionView {
+            let mut catalog = provider_catalog();
+            let provider_b = catalog
+                .providers
+                .iter_mut()
+                .find(|provider| provider.provider_id == "provider-b")
+                .expect("provider-b");
+            provider_b.available = false;
+            provider_b.availability_known = false;
+            catalog
         }
 
         /// 选择端口 fake：脚本化的（视图, 目录）+ 脚本化的新鲜确认结果。
@@ -8142,6 +8166,7 @@ mod tests {
                 provider: Some("provider-b".to_owned()),
                 model: "model-b".to_owned(),
                 thought: "low".to_owned(),
+                confirm_unknown_provider: false,
             };
             let receipt = sender
                 .execute(&ctx("a-provider"), &target(), &action)
@@ -8156,6 +8181,60 @@ mod tests {
                 port.wait_calls()[0].0,
                 "provider-b",
                 "确认观察必须盯目标 provider"
+            );
+        }
+
+        /// 未知可用性 provider：不带确认 → 零帧零行；显式确认 → 恰一次完整三元组。
+        #[tokio::test]
+        async fn unknown_provider_selection_requires_confirmation_flag() {
+            let store = DeviceStore::memory();
+            let fake = FakeBridge::new(Reply::Body(accepted_body()));
+            let port = FakeSelection::new(
+                view(Some(REVISION), unknown_provider_catalog()),
+                unknown_provider_catalog(),
+            );
+            let sender = selection_sender(&fake, &port, &store);
+            let unconfirmed = ControlAction::Selection {
+                session_id: SESSION.to_owned(),
+                generation: GEN,
+                provider: Some("provider-b".to_owned()),
+                model: "model-b".to_owned(),
+                thought: "low".to_owned(),
+                confirm_unknown_provider: false,
+            };
+            let error = sender
+                .execute(&ctx("a-unknown"), &target(), &unconfirmed)
+                .await
+                .unwrap_err();
+            assert!(
+                error.is(codes::INVALID_ACTION),
+                "未确认的未知 provider 必须拒绝"
+            );
+            assert_eq!(fake.wire(), 0, "拒绝必须零帧");
+            assert_eq!(row_count(&store), 0, "拒绝必须零账本行");
+            assert!(port.wait_calls().is_empty());
+
+            // 用户确认后：仍只发一次完整 provider/model/thought 三元组。
+            port.set_wait_result(true);
+            let confirmed = ControlAction::Selection {
+                session_id: SESSION.to_owned(),
+                generation: GEN,
+                provider: Some("provider-b".to_owned()),
+                model: "model-b".to_owned(),
+                thought: "low".to_owned(),
+                confirm_unknown_provider: true,
+            };
+            let receipt = sender
+                .execute(&ctx("a-unknown-confirmed"), &target(), &confirmed)
+                .await
+                .unwrap();
+            assert_eq!(receipt.state, ActionState::Confirmed);
+            let frames = switch_frames(&fake);
+            assert_eq!(frames.len(), 1, "确认后恰一帧");
+            assert_eq!(
+                frames[0]["payload"],
+                json!({"provider": "provider-b", "model": "model-b", "thought": "low"}),
+                "命令载荷仍是一次完整三元组，确认标志不进入上游 payload"
             );
         }
     }

@@ -759,6 +759,7 @@ mod tests {
                 DataOutcome {
                     result: Ok(()),
                     changed: Vec::new(),
+                    catalog_refresh: Vec::new(),
                 }
             })
         }

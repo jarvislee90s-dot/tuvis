@@ -1212,6 +1212,7 @@ const ACTION_KEYS: &[(&str, &[&str])] = &[
             "provider",
             "model",
             "thought",
+            "confirmUnknownProvider",
         ],
     ),
     (
@@ -1380,6 +1381,7 @@ fn action_error(code: &str) -> Response {
         | codes::NEEDS_EVIDENCE
         | codes::ACTION_PAYLOAD_CONFLICT
         | codes::QUEUE_REFRESH_REQUIRED
+        | codes::QUEUE_REVIEW_REQUIRED
         | codes::ATTACHMENT_MISSING
         | codes::STALE_PENDING
         | codes::STOP_TARGET_CHANGED => StatusCode::CONFLICT,
@@ -1399,6 +1401,14 @@ mod queue_refresh_tests {
     fn queue_refresh_required_is_http_conflict() {
         let response = super::action_error(
             crate::services::zcode_control::types::codes::QUEUE_REFRESH_REQUIRED,
+        );
+        assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
+    }
+
+    #[test]
+    fn queue_review_required_is_http_conflict() {
+        let response = super::action_error(
+            crate::services::zcode_control::types::codes::QUEUE_REVIEW_REQUIRED,
         );
         assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
     }

@@ -42,7 +42,11 @@ import {
 import useZcodeControl from "./useZcodeControl";
 import ZcodeLocalQueuePanel from "./ZcodeLocalQueuePanel";
 import { zcodeQueuePreview } from "./zcode-local-queue-state";
-import { resolveModelChoice } from "./zcode-selection-state";
+import {
+  isAvailabilityKnown,
+  isProviderSelectable,
+  resolveModelChoice,
+} from "./zcode-selection-state";
 import { newActionId } from "./codexIpcApi";
 import ZcodePendingCard, { STATUS_KEYS, pendingDomId, zcodeReasonText } from "./ZcodePendingCard";
 import ZcodeQueuePanel, { dispatchWritable } from "./ZcodeQueuePanel";
@@ -1048,6 +1052,13 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
 
   // Unknown/停止/派发/重启屏障的人工核对入口：只在有本地队列时读取；失败不污染写面。
   const localQueueVersion = localQueue?.version ?? null;
+  // 四类待核对结果任一存在时，继续队列/插队都禁用并给出原因（Task A）。
+  const localQueueReviewRequired =
+    queueRecovery !== null &&
+    (queueRecovery.priority.length > 0 ||
+      queueRecovery.manualStopRequestId !== null ||
+      queueRecovery.dispatchActionId !== null ||
+      queueRecovery.unconfirmedActionId !== null);
   useEffect(() => {
     if (localQueueVersion === null) {
       setQueueRecovery(null);
@@ -1073,7 +1084,7 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
   };
 
   const runPriority = (itemId: string, version: number, executionId: string | null) => {
-    if (!localQueueWritable || inFlightRef.current) return;
+    if (!localQueueWritable || localQueueReviewRequired || inFlightRef.current) return;
     const view = sessionRef.current;
     if (view === null) return;
     const heldQueue =
@@ -1119,7 +1130,7 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
   };
 
   const handleLocalPrioritize = (itemId: string, version: number) => {
-    if (!localQueueWritable || inFlightRef.current) return;
+    if (!localQueueWritable || localQueueReviewRequired || inFlightRef.current) return;
     if (!running) {
       runPriority(itemId, version, null);
       return;
@@ -1277,7 +1288,14 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
   };
 
   const handleLocalResume = () => {
-    if (!localQueueWritable || inFlightRef.current || localQueue === null) return;
+    if (
+      !localQueueWritable ||
+      localQueueReviewRequired ||
+      inFlightRef.current ||
+      localQueue === null
+    ) {
+      return;
+    }
     setLocalQueueNotice(null);
     setLocalQueueError(null);
     inFlightRef.current = true;
@@ -1319,9 +1337,28 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
       .then(async () => {
         if (!aliveRef.current) return;
         setLocalQueueNotice("recovery_reviewed");
-        await refreshLocalView();
+        // 先取核对后的新鲜队列：resume 的 CAS 版本必须是 ack 之后的值。
+        const reviewed = await refreshLocalQueue();
+        void refresh();
         const view = await getZcodeQueueRecovery(sessionId).catch(() => null);
         if (aliveRef.current) setQueueRecovery(view);
+        // 「确认并继续队列」：仅重启屏障在确认后自动继续一次；其他核对仍保持暂停，
+        // 由用户显式点「继续队列」。队列为空/刷新失败都绝不伪造 resume 成功。
+        if (kind !== "unconfirmed" || reviewed === null || reviewed.autoDrain) return;
+        try {
+          await resumeZcodeLocalQueue({
+            requestId: newActionId(),
+            sessionId,
+            expectedQueueVersion: reviewed.version,
+          });
+          if (!aliveRef.current) return;
+          setLocalQueueNotice("resumed");
+          void refresh();
+          await refreshLocalQueue();
+        } catch (error) {
+          // 已确认状态保留（recovery_reviewed + 屏障已清），只如实显示 resume 失败原因。
+          if (aliveRef.current) setLocalQueueError(queueErrorCode(error));
+        }
       })
       .catch((error: unknown) => {
         if (aliveRef.current) setLocalQueueError(queueErrorCode(error));
@@ -1352,11 +1389,18 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
   const selection = session?.selection ?? null;
   const [pendingProvider, setPendingProvider] = useState<string | null>(null);
   const [pendingModel, setPendingModel] = useState<string | null>(null);
+  /** 可用性未知的目标组合：确认前零 selection POST。 */
+  const [unknownSelection, setUnknownSelection] = useState<{
+    provider?: string;
+    model: string;
+    thought: string;
+  } | null>(null);
   const providerGroups = selection?.providers ?? [];
   const activeProviderId = pendingProvider ?? selection?.provider ?? "";
+  // 显式 unavailable 才不可选；缺 available 字段 = 可用性未知，仍可选中。
   const activeProvider =
     providerGroups.find(
-      (candidate) => candidate.providerId === activeProviderId && candidate.available
+      (candidate) => candidate.providerId === activeProviderId && isProviderSelectable(candidate)
     ) ?? null;
   const activeModels =
     activeProvider?.models ??
@@ -1370,6 +1414,7 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
   useEffect(() => {
     setPendingProvider(null);
     setPendingModel(null);
+    setUnknownSelection(null);
   }, [selection?.provider, selection?.model, selection?.thought]);
 
   // ==== R10：协作模式（独立能力槽；ACK 不乐观改确认标签）====
@@ -1426,7 +1471,12 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
       ? selection.thought
       : (currentChoice?.thoughtLevels[0] ?? "");
 
-  const submitSelection = (model: string, thought: string, provider?: string) => {
+  const submitSelection = (
+    model: string,
+    thought: string,
+    provider?: string,
+    confirmUnknownProvider?: boolean
+  ) => {
     if (session === null || !selectionEnabled || thought === "") return;
     runOnce({
       kind: "selection",
@@ -1435,15 +1485,50 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
       ...(provider === undefined ? {} : { provider }),
       model,
       thought,
+      // 仅在用户完成二次确认时上行；旧已知 provider 保持旧载荷形状。
+      ...(confirmUnknownProvider === true ? { confirmUnknownProvider: true } : {}),
     });
+  };
+
+  /** 目标 provider 可用性未知 → 先弹二次确认（零 POST）；已知可用/显式不可用不走这里。 */
+  const requestSelection = (model: string, thought: string, provider?: string) => {
+    if (session === null || !selectionEnabled || thought === "") return;
+    const target =
+      provider === undefined
+        ? providerGroups.find((group) => group.providerId === activeProviderId)
+        : providerGroups.find((group) => group.providerId === provider);
+    if (target !== undefined && !isAvailabilityKnown(target)) {
+      setUnknownSelection({ provider, model, thought });
+      return;
+    }
+    submitSelection(model, thought, provider);
+  };
+
+  const confirmUnknownSelection = () => {
+    const pending = unknownSelection;
+    if (pending === null) return;
+    setUnknownSelection(null);
+    submitSelection(pending.model, pending.thought, pending.provider, true);
+  };
+
+  const cancelUnknownSelection = () => {
+    // 取消回到服务端当前组合（不留下 provider-only 或半套待选值）。
+    setUnknownSelection(null);
+    setPendingProvider(null);
+    setPendingModel(null);
   };
 
   const handleProviderChange = (providerId: string) => {
     if (selection === null || providerId === activeProviderId) return;
-    if (!providerGroups.some((group) => group.providerId === providerId && group.available)) {
+    if (
+      !providerGroups.some(
+        (group) => group.providerId === providerId && isProviderSelectable(group)
+      )
+    ) {
       return;
     }
-    // 只更新待选组合；不写 provider-only 中间态。
+    // 只更新待选组合；不写 provider-only 中间态。换 provider 即撤销未确认的切换。
+    setUnknownSelection(null);
     setPendingProvider(providerId);
     setPendingModel(null);
   };
@@ -1453,7 +1538,7 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
     const resolved = resolveModelChoice(selection, activeProviderId, modelId);
     if (resolved === null) return;
     setPendingModel(resolved.model);
-    submitSelection(
+    requestSelection(
       resolved.model,
       resolved.thought,
       providerGroups.length === 0 ? undefined : activeProviderId
@@ -1462,7 +1547,7 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
 
   const handleThoughtChange = (thought: string) => {
     if (selection === null || currentChoice?.thoughtLevels.includes(thought) !== true) return;
-    submitSelection(
+    requestSelection(
       currentChoice.modelId,
       thought,
       providerGroups.length === 0 ? undefined : activeProviderId
@@ -1683,6 +1768,7 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
       {/* Tuvis 本地待发（Q6）：与官方队列分开来源；默认展开，显示位次/摘要/三按钮。 */}
       <ZcodeLocalQueuePanel
         view={localQueue}
+        reviewRequired={localQueueReviewRequired}
         busy={
           busy ||
           !localQueueWritable ||
@@ -1985,9 +2071,13 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
                     <option
                       key={group.providerId}
                       value={group.providerId}
-                      disabled={!group.available}
+                      data-availability-known={isAvailabilityKnown(group) ? "true" : "false"}
+                      // 显式 unavailable 才禁用；缺字段 = 未知，可选（提交前二次确认）。
+                      disabled={!group.available && isAvailabilityKnown(group)}
                     >
-                      {group.label}
+                      {isAvailabilityKnown(group)
+                        ? group.label
+                        : `${group.label} · ${i18n.t("mobile.zcodeControl.providerUnknownTag")}`}
                     </option>
                   ))}
                 </select>
@@ -2030,6 +2120,11 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
             </>
           )}
         </div>
+      )}
+      {activeProvider !== null && !isAvailabilityKnown(activeProvider) && (
+        <p data-testid="zcode-selection-unknown-hint" className="mb-2 text-xs text-[var(--mut)]">
+          {i18n.t("mobile.zcodeControl.providerUnknownHint")}
+        </p>
       )}
       {selection !== null && !selectionEnabled && (
         <p
@@ -2129,6 +2224,50 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
               className="rounded-lg px-3 py-1.5 text-xs text-[var(--mut)]"
             >
               {i18n.t("mobile.zcodeControl.modeCancel")}
+            </button>
+          </div>
+        </div>
+      )}
+      {unknownSelection !== null && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="zcode-selection-confirm-title"
+          data-testid="zcode-selection-confirm-dialog"
+          className="mb-2 rounded-lg border border-[var(--cb)] bg-[var(--cbg)] p-2"
+        >
+          <p id="zcode-selection-confirm-title" className="text-xs font-medium text-[var(--tx)]">
+            {i18n.t("mobile.zcodeControl.providerUnknownConfirmTitle")}
+          </p>
+          <p className="mt-1 text-[11px] leading-4 text-[var(--mut)]">
+            {i18n.t("mobile.zcodeControl.providerUnknownConfirmHint")}
+          </p>
+          <p
+            data-testid="zcode-selection-confirm-target"
+            className="mt-1 text-[11px] break-all text-[var(--mut)]"
+          >
+            {[
+              unknownSelection.provider ?? selection?.provider ?? "",
+              unknownSelection.model,
+              unknownSelection.thought,
+            ].join(" / ")}
+          </p>
+          <div className="mt-2 flex flex-wrap gap-2">
+            <button
+              type="button"
+              data-testid="zcode-selection-confirm"
+              onClick={confirmUnknownSelection}
+              className="rounded-lg border border-[var(--cb)] px-3 py-1.5 text-xs text-[var(--tx)]"
+            >
+              {i18n.t("mobile.zcodeControl.providerUnknownConfirm")}
+            </button>
+            <button
+              type="button"
+              data-testid="zcode-selection-cancel"
+              onClick={cancelUnknownSelection}
+              className="rounded-lg px-3 py-1.5 text-xs text-[var(--mut)]"
+            >
+              {i18n.t("mobile.zcodeControl.providerUnknownCancel")}
             </button>
           </div>
         </div>

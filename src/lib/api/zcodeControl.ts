@@ -76,7 +76,7 @@ export interface QueueRecoveryView {
   unconfirmedActionId: string | null;
 }
 
-// ==== 冻结错误码（与 Rust `zcode_control::codes` 逐字对应，不得增删/本地化）====
+// ==== 冻结错误码（与 Rust `zcode_control::codes` 逐字对应；新增须同步两端与文案）====
 
 export const ZCODE_ERROR_CODES = [
   "needs_config",
@@ -95,6 +95,7 @@ export const ZCODE_ERROR_CODES = [
   "stale_pending",
   "invalid_action",
   "queue_refresh_required",
+  "queue_review_required",
   "attachment_missing",
   "invalid_answer",
   "forbidden_option",
@@ -296,7 +297,17 @@ export interface ProviderChoice {
   providerId: string;
   label: string;
   models: ModelChoice[];
+  /** 宿主显式宣告的可用性；缺字段时服务端置 false（见 `availabilityKnown`）。 */
   available: boolean;
+  /**
+   * 可用性是否由宿主显式声明：
+   * - 显式 `available: true/false` → true；
+   * - 缺 `available` 字段 → false（未知；当前 provider 仍可用但同样不宣称已知）；
+   * - 旧载荷缺本字段（服务端 serde 默认）→ true。
+   *
+   * 未知 ≠ 不可用：下拉可选中，但提交选择前必须二次确认。
+   */
+  availabilityKnown: boolean;
   reasonCode?: string | null;
 }
 
@@ -469,6 +480,8 @@ export type ControlAction =
       provider?: string;
       model: string;
       thought: string;
+      /** 目标 provider 可用性未知时，用户已显式确认；仅在 true 时上行。 */
+      confirmUnknownProvider?: boolean;
     }
   | {
       kind: "mode";

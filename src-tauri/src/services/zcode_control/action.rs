@@ -224,11 +224,18 @@ pub fn action_params(action: &ControlAction) -> Value {
             provider,
             model,
             thought,
+            confirm_unknown_provider,
             ..
         } => {
             let mut params = serde_json::json!({ "model": model, "thought": thought });
             if let Some(provider) = provider {
                 params["provider"] = serde_json::Value::from(provider.clone());
+            }
+            // 仅在 true 时进入指纹：旧客户端/未确认动作保持旧指纹形状；
+            // 同一 actionId 下「未知未确认」与「未知已确认」是不同安全意图，
+            // 必须落成 action_payload_conflict，绝不互相重放。
+            if *confirm_unknown_provider {
+                params["confirmUnknownProvider"] = serde_json::Value::from(true);
             }
             params
         }
@@ -1226,6 +1233,7 @@ mod tests {
                 provider: None,
                 model: "model-a".into(),
                 thought: "high".into(),
+                confirm_unknown_provider: false,
             },
             // 队列写：项 ID / 目标前驱 ID 同样必须参与指纹（换目标 = 不同动作）。
             ControlAction::QueueDelete {
@@ -1545,6 +1553,7 @@ mod tests {
             provider: None,
             model: "model-a".into(),
             thought: "high".into(),
+            confirm_unknown_provider: false,
         };
         let provider_a = ControlAction::Selection {
             session_id: SESSION.into(),
@@ -1552,6 +1561,7 @@ mod tests {
             provider: Some("provider-a".into()),
             model: "model-a".into(),
             thought: "high".into(),
+            confirm_unknown_provider: false,
         };
         let provider_b = ControlAction::Selection {
             session_id: SESSION.into(),
@@ -1559,6 +1569,7 @@ mod tests {
             provider: Some("provider-b".into()),
             model: "model-a".into(),
             thought: "high".into(),
+            confirm_unknown_provider: false,
         };
         let hash = |action: &ControlAction| {
             payload_hash(
@@ -1584,5 +1595,42 @@ mod tests {
             action_params(&base).get("provider").is_none(),
             "旧动作保持旧形状"
         );
+    }
+
+    #[test]
+    fn confirm_unknown_provider_flag_enters_fingerprint_only_when_true() {
+        let base = ControlAction::Selection {
+            session_id: SESSION.into(),
+            generation: GEN,
+            provider: Some("provider-b".into()),
+            model: "model-a".into(),
+            thought: "high".into(),
+            confirm_unknown_provider: false,
+        };
+        let confirmed = ControlAction::Selection {
+            session_id: SESSION.into(),
+            generation: GEN,
+            provider: Some("provider-b".into()),
+            model: "model-a".into(),
+            thought: "high".into(),
+            confirm_unknown_provider: true,
+        };
+        let hash = |action: &ControlAction| {
+            payload_hash(
+                action.kind(),
+                action.session_id(),
+                action.generation(),
+                &action_params(action),
+            )
+            .unwrap()
+        };
+        // 旧 false 载荷指纹保持旧形状（兼容既有 actionId 回执）。
+        assert!(action_params(&base).get("confirmUnknownProvider").is_none());
+        assert_eq!(
+            action_params(&confirmed)["confirmUnknownProvider"],
+            Value::from(true)
+        );
+        // 同一 actionId 下「未知未确认」与「未知已确认」是不同安全意图，必须冲突。
+        assert_ne!(hash(&base), hash(&confirmed));
     }
 }

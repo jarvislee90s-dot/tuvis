@@ -113,8 +113,8 @@ Q5/Q6 代码已提交；Q7、C1–C2、M1–M2、K1–K2 与 V0 的收口见下�
 
 ### V0 门禁与剩余缺口（2026-11-02）
 
-- 前端：`pnpm test` 207 files / **2538 passed**、5 skipped；`pnpm check`（Prettier、ESLint、i18n 2673 键、错误码 328 码、tsc、vite）通过；`pnpm build:mobile` 通过。ESLint 仅 1 条既有 `uploadCtrlsRef` warning，无 error。
-- Rust：`cargo check --locked`（src-tauri 下）通过；`cargo test --locked --features marker-helper` **4354 passed**、0 failed；`cargo test --locked --tests --features marker-helper,zcode-bridge-evidence` **4377 passed**、0 failed；`cargo test --locked --lib --features marker-helper,zcode-bridge-evidence` **3847 passed**、0 failed、38 ignored；两套 `cargo clippy --all-targets ... -D warnings` 与 `cargo fmt --check` 通过。
+- 前端：`pnpm test` 207 files / **2539 passed**、5 skipped；`pnpm check`（Prettier、ESLint、i18n 2673 键、错误码 328 码、tsc、vite）通过；`pnpm build:mobile` 通过。ESLint 仅 1 条既有 `uploadCtrlsRef` warning，无 error。
+- Rust：`cargo check --locked`（src-tauri 下）通过；`cargo test --locked --features marker-helper` **4359 passed**、0 failed；`cargo test --locked --tests --features marker-helper,zcode-bridge-evidence` **4382 passed**、0 failed；`cargo test --locked --lib --features marker-helper,zcode-bridge-evidence` **3852 passed**、0 failed、38 ignored；两套 `cargo clippy --all-targets ... -D warnings` 与 `cargo fmt --check` 通过。
 - 真实宿主/真实凭据/真实发送停止/审批模式效果/真实 Keychain 四类/两 provider 上下文/移动真机：全部 NOT RUN。自动假链只能证明接线与守卫，不证明 R09/R10 的宿主效果或平台提示次数。
 - 仍关闭/未证：非当前 provider 缺 `available` 时保守禁用（已按评审收紧）；Mode 已有确认账本接线但真实模式效果未跑；真实未知 build 的模型/thought 首用确认；真实附件删除窗口；官方队列 W0 写能力仍按原门；R02 证书条件。未发现新的持久秘密/正文/链接泄漏。
 - 报告复跑以最终 HEAD 为准；执行者不再自判“可合并”。以上为单会话执行与限定复审，最终仍需原聊天/独立 reviewer 复核。
@@ -134,7 +134,7 @@ Q5/Q6 代码已提交；Q7、C1–C2、M1–M2、K1–K2 与 V0 的收口见下�
 | R09 跨供应商两级选择     | C1 parser/command/route tests；C2 provider UI；同模型不同 provider 可分                             | 两 provider 真实切换/上下文 NOT RUN       | 代码与假链闭合，**可用性字段仍为候选假设** |
 | R10 四模式               | M1 `mode.rs` 3、命令 1、HTTP 1、resolver 1、DAO 1；M2 UI 2；四标签/planEnabled/yolo 确认/ACK 不乐观 | 四模式真实效果、原生 UI、实际审批 NOT RUN | 代码与假链闭合，**实机未跑**               |
 
-继承八能力、问答/审批/正文/附件回归由 4354 项普通测试与 4377 项 evidence 集成回归覆盖；没有用“全绿”替代上表的实机未跑结论。
+继承八能力、问答/审批/正文/附件回归由 4359 项普通测试与 4382 项 evidence 集成回归覆盖；没有用“全绿”替代上表的实机未跑结论。
 
 ## 2026-11-02 独立评审修正轮
 
@@ -147,4 +147,41 @@ Q5/Q6 代码已提交；Q7、C1–C2、M1–M2、K1–K2 与 V0 的收口见下�
 5. **P2 同名模型档位串组**：`provider_from_record` 的扁平档位回退增加 `provider_id == config.provider`；新增 A/B 同名模型的失败回归，B 未声明档位保持空。
 6. **P2 Mode 证据/账本**：未知 build 的 Mode 在 resolver 中保守关闭（`needs_evidence`），仅已知 build 静态判据可开；Mode 进入 Hub 首次确认集合，新增 `ConfirmationTarget::Mode`、`ModeObservation`、`confirm_mode`、`mode_matched` 证据词与回执 degraded 收口。新增纯判据、pump 确认、回执失败降级、动作级登记测试。另将“完全访问只有 UI 检查”的评审表述更正为：服务端 `execute_mode` 也会拒绝 `confirmFullAccess=false`。
 
-复跑（本轮修改后，最终计数）：普通 Rust **4354 passed / 0 failed**；evidence integration **4377 passed / 0 failed**；evidence lib **3847 passed / 38 ignored**（一次 `pong_write_is_bounded_on_half_open_socket` 在满载下偶发失败，单跑及重跑全绿，记录为已知 flaky，不记为产品修复）；移动端全量 **2538 passed / 5 skipped**；`pnpm check`、`build:mobile`、两套 clippy、`cargo fmt --check` 通过。
+复跑（本轮修改后，最终计数）：普通 Rust **4359 passed / 0 failed**；evidence integration **4382 passed / 0 failed**；evidence lib **3852 passed / 38 ignored**（一次 `pong_write_is_bounded_on_half_open_socket` 在满载下偶发失败，单跑及重跑全绿，记录为已知 flaky，不记为产品修复）；移动端全量 **2539 passed / 5 skipped**；`pnpm check`、`build:mobile`、两套 clippy、`cargo fmt --check` 通过。
+
+## 2026-11-02 第二轮评审修正
+
+独立复审又指出两项时序缺口；本轮均先做失败反例，再修根因。
+
+1. **P1 替换确认后的回执竞态**：原 `runLocalEdit("replace")` 只信 preflight 时刻的意图，请求期间用户继续输入会被回执覆盖。现在确认替换时记录**正文 + 附件版本戳**（id/status/path/name），回执到达时逐项比较；任一项变化即转 `editConflict` 再询问，不覆盖新草稿。新增 `replace_during_edit_waits_for_a_stable_draft_and_reasks`。
+2. **P2 A→B 实时帧丢目录**：原 `view_with_catalog` 只在 `catalog.provider == current.provider` 时复制 `providers`；桌面切到 B 而缓存仍是 A 时，实时帧的 providers 为空。现在 `on_data_outcome` 检测 provider 变化后**清空旧缓存**，锁外调用 `ensure_selection_catalog` 补读新目录，再重算并发布本帧视图。新增 `provider_switch_refreshes_catalog_before_publishing_live_frame`；修复前断言 `providers.len() == 2` 得到 0，修复后通过，且不借用 A 的模型列表。
+
+最终复跑：普通 Rust **4359 passed / 0 failed**；evidence integration **4382 passed / 0 failed**；evidence lib **3852 passed / 38 ignored**；移动端 **2539 passed / 5 skipped**；`pnpm check`、`build:mobile`、两套 clippy、`cargo fmt --check` 通过。真实宿主未验，不改变此前的实机 NOT RUN 结论。
+
+## 2026-11-02 第三轮评审修正
+
+### P1：收帧等待目录 RPC 的自等待
+
+根因：生产 Hub 串行消费 `Data` → `bridge.on_data_outcome` 内同步 `await ensure_selection_catalog`；目录 `getView` 的应答也必须由同一条 Data 循环处理。这不是锁问题，而是同一条串行泵等待自己的应答，生产约 10 秒超时。
+
+修正：
+
+- `on_data_outcome` 只完成投影、ACK、必要变化视图，**绝不 await 目录 RPC**；
+- 新增 `DataOutcome.catalog_refresh`，Hub 泵为每个切换会话启动独立任务；
+- 任务完成刷新后重新核对 Hub 代际、绑定、revision、当前 provider，再发布最新视图；
+- 刷新失败有界重试一次（首次 + 一次，100ms），不无限循环；
+- `BridgePump` 新增 `refresh_catalog`/`session_view`，生产 `ProjectionBridge` 委托 `BridgeManager`。
+
+回归：
+
+- `provider_switch_refreshes_catalog_before_publishing_live_frame`：断言收帧期间 `getView` 数量不增加，`catalog_refresh` 含会话；手动刷新后 B 两组目录在场。
+- `provider_switch_catalog_refresh_is_async_and_publishes_latest_view`：经生产 Hub 泵消费，先发布切换帧，再由独立任务发布 providers=2 的第二帧。
+- `late_provider_catalog_result_does_not_overwrite_newer_provider`：A→B→C 时 B 的迟到 RPC 结果被丢弃，C 仍可重试并安装。
+- `provider_catalog_refresh_retries_once_then_stops`：失败恒定时只调用两次，随后停止。
+- `failed_catalog_read_clears_attempt_for_same_revision_retry`：同一 revision 的失败尝试位被清除，下一次仍会读。
+
+### P2：失败重试承诺
+
+`ensure_selection_catalog` 现在返回是否安装，并在 RPC/解析失败或结果过期时清掉对应 revision 的 `catalog_attempted_at`；同时用 `catalog_refresh_provider` 记住缓存清空后的待刷新 provider，保证 A→B→C 的 C 帧仍会排队刷新，而不是被 `catalog=None` 跳过。刷新任务最多重试一次，之后由读路径按需再试。
+
+最终复跑：普通 Rust **4359 passed / 0 failed**；evidence integration **4382 passed / 0 failed**；evidence lib **3852 passed / 38 ignored**；移动端 **2539 passed / 5 skipped**；`pnpm check`、`build:mobile`、两套 clippy、`cargo fmt --check` 通过。真实宿主未验，不改变此前的实机 NOT RUN 结论。

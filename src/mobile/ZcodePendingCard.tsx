@@ -43,7 +43,7 @@ import {
 import InteractiveCard from "./InteractiveCard";
 
 /**
- * 冻结原因码 → 本地化文案键（21 码全覆盖；`Record<ZcodeErrorCode, string>` 保证漏码
+ * 冻结原因码 → 本地化文案键（全码覆盖；`Record<ZcodeErrorCode, string>` 保证漏码
  * 在编译期报错）。码本身只进 `data-reason-code`，用户只看到这里的本地化文案。
  *
  * 词表放在本模块而不是面板：面板反过来消费本卡（`ZcodeControlPanel` → 本模块），
@@ -68,6 +68,8 @@ export const ZCODE_REASON_KEYS: Record<ZcodeErrorCode, string> = {
   stale_pending: "mobile.zcodeControl.reasonStalePending",
   invalid_action: "mobile.zcodeControl.reasonInvalidAction",
   queue_refresh_required: "mobile.zcodeControl.reasonQueueRefreshRequired",
+  // 队列仍有未人工核对的结果：先核对再继续/插队（绝不假成功）。
+  queue_review_required: "mobile.zcodeControl.reasonQueueReviewRequired",
   attachment_missing: "mobile.zcodeControl.reasonAttachmentMissing",
   invalid_answer: "mobile.zcodeControl.reasonInvalidAnswer",
   forbidden_option: "mobile.zcodeControl.reasonForbiddenOption",

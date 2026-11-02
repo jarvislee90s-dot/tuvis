@@ -158,7 +158,7 @@ _Only versions translated so far are listed here; the full history lives in the
 ### Fixed
 
 - **ZCode review fixes (providers / recovery / mode guards)**: the production read
-  path now sends every provider group; editing with a known draft asks first, and
+  path now sends every provider group and refreshes the catalog on a live provider switch; editing with a known draft asks first, and
   cancelling no longer retracts the original item or deletes its recovery snapshot;
   Unknown / stop / dispatch / restart barriers get manual-review actions that never
   resend or re-stop and still require an explicit queue resume; Selection and Mode

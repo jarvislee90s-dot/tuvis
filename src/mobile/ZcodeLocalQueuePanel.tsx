@@ -7,6 +7,8 @@ import { zcodeQueuePreview } from "./zcode-local-queue-state";
 export interface ZcodeLocalQueuePanelProps {
   view: LocalQueueView | null;
   busy: boolean;
+  /** 仍有未人工核对的投递/停止结果：继续队列与插队都必须先核对（Task A）。 */
+  reviewRequired?: boolean;
   onPrioritize: (itemId: string, expectedVersion: number) => void;
   onEdit: (itemId: string, expectedVersion: number) => void;
   onRetract: (itemId: string, expectedVersion: number) => void;
@@ -17,6 +19,7 @@ export interface ZcodeLocalQueuePanelProps {
 export default function ZcodeLocalQueuePanel({
   view,
   busy,
+  reviewRequired = false,
   onPrioritize,
   onEdit,
   onRetract,
@@ -45,7 +48,10 @@ export default function ZcodeLocalQueuePanel({
           <button
             type="button"
             data-testid="zcode-local-queue-resume"
-            disabled={busy}
+            disabled={busy || reviewRequired}
+            title={
+              reviewRequired ? i18n.t("mobile.zcodeControl.localQueueReviewRequired") : undefined
+            }
             onClick={onResume}
             className="ml-auto rounded-full border border-[var(--cb)] px-2 py-0.5 text-[11px] text-[var(--tx)] disabled:opacity-40"
           >
@@ -53,6 +59,15 @@ export default function ZcodeLocalQueuePanel({
           </button>
         )}
       </div>
+      {reviewRequired && (
+        <p
+          data-testid="zcode-local-queue-review-required"
+          data-reason-code="queue_review_required"
+          className="mt-1 text-[11px] text-[var(--mut)]"
+        >
+          {i18n.t("mobile.zcodeControl.localQueueReviewRequired")}
+        </p>
+      )}
       {!view.autoDrain && (
         <p data-testid="zcode-local-queue-paused" className="mt-1 text-[11px] text-[var(--mut)]">
           {i18n.t("mobile.zcodeControl.localQueuePaused")}
@@ -62,6 +77,8 @@ export default function ZcodeLocalQueuePanel({
         <ul className="mt-1 divide-y divide-[var(--cb)]">
           {visible.map((item) => {
             const writable = !busy && item.state === "queued";
+            // 插队会改变派发顺序：未核对 barrier 存在时必须先在“待核对结果”里核对。
+            const canPrioritize = writable && !reviewRequired;
             return (
               <li
                 key={item.itemId}
@@ -105,7 +122,7 @@ export default function ZcodeLocalQueuePanel({
                 )}
                 <button
                   type="button"
-                  disabled={!writable}
+                  disabled={!canPrioritize}
                   onClick={() => onPrioritize(item.itemId, item.itemVersion)}
                   className="shrink-0 rounded-full border border-[var(--cb)] px-2 py-0.5 text-[11px] text-[var(--tx)] disabled:opacity-40"
                 >

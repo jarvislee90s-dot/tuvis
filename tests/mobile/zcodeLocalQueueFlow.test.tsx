@@ -454,7 +454,9 @@ it("unknown_recovery_buttons_review_each_barrier_without_resend", async () => {
   );
 
   render(<ZcodeControlPanel sessionId={SID} />);
-  await waitFor(() => expect(screen.getByTestId("zcode-local-recovery")).toBeVisible());
+  await waitFor(() => expect(screen.getByTestId("zcode-local-recovery")).toBeVisible(), {
+    timeout: 3000,
+  });
   expect(screen.getByTestId("zcode-recovery-priority")).toBeEnabled();
   expect(screen.getByTestId("zcode-recovery-manual-stop")).toBeEnabled();
   expect(screen.getByTestId("zcode-recovery-dispatch")).toBeEnabled();
@@ -544,4 +546,123 @@ it("replace_during_edit_waits_for_a_stable_draft_and_reasks", async () => {
   fireEvent.click(screen.getByTestId("zcode-edit-conflict-cancel"));
   await act(async () => {});
   expect(calls.filter((url) => url === `${ZCODE_LOCAL_QUEUE_PATH}/edit/finish`)).toHaveLength(0);
+});
+
+it("restart_unconfirmed_requires_review_and_confirm_continues_once", async () => {
+  let queue = queueWith({ autoDrain: false, pauseReason: "unconfirmed", version: 8 });
+  let reviewPending = true;
+  const acks: unknown[] = [];
+  const resumes: unknown[] = [];
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url === ZCODE_CONNECTION_PATH) return json(connection());
+      if (url.startsWith(`${ZCODE_SESSION_PATH}?`)) return json(session());
+      if (url.startsWith(`${ZCODE_LOCAL_QUEUE_PATH}?`)) return json(queue);
+      if (url === `${ZCODE_LOCAL_QUEUE_PATH}/recovery?sessionId=${SID}`) {
+        return json({
+          priority: [],
+          manualStopRequestId: null,
+          dispatchActionId: null,
+          unconfirmedActionId: reviewPending ? "restart-1" : null,
+        });
+      }
+      if (url === `${ZCODE_LOCAL_QUEUE_PATH}/recovery/ack`) {
+        acks.push(JSON.parse(String(init?.body)));
+        reviewPending = false;
+        // 核对只清屏障：版本推进，但仍保持暂停，等待显式 resume。
+        queue = queueWith({ autoDrain: false, pauseReason: "unconfirmed", version: 9 });
+        return json({ ok: true });
+      }
+      if (url === `${ZCODE_LOCAL_QUEUE_PATH}/resume`) {
+        resumes.push(JSON.parse(String(init?.body)));
+        queue = queueWith({ autoDrain: true, pauseReason: null, version: 10 });
+        return json(queue);
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    })
+  );
+
+  render(<ZcodeControlPanel sessionId={SID} />);
+  await waitFor(() => expect(screen.getByTestId("zcode-local-recovery")).toBeVisible(), {
+    timeout: 3000,
+  });
+  // 未核对时：继续队列/插队都禁用，且给出明确原因（不是只灰掉）。
+  expect(screen.getByTestId("zcode-local-queue-resume")).toBeDisabled();
+  const review = screen.getByTestId("zcode-local-queue-review-required");
+  expect(review).toHaveAttribute("data-reason-code", "queue_review_required");
+  expect(review.textContent ?? "").toMatch(/核对/);
+  const row = screen.getByTestId("zcode-local-item");
+  expect(within(row).getByRole("button", { name: "插队" })).toBeDisabled();
+
+  // 确认并继续：只 ack 一次 + resume 一次（用核对后的最新队列版本）。
+  fireEvent.click(screen.getByTestId("zcode-recovery-unconfirmed"));
+  await waitFor(() => expect(resumes).toHaveLength(1), { timeout: 3000 });
+  expect(acks).toEqual([expect.objectContaining({ kind: "unconfirmed", subjectId: "restart-1" })]);
+  expect(resumes).toEqual([expect.objectContaining({ expectedQueueVersion: 9 })]);
+  await waitFor(() =>
+    expect(screen.getByTestId("zcode-local-queue")).toHaveAttribute("data-auto-drain", "true")
+  );
+  expect(acks).toHaveLength(1);
+  expect(resumes).toHaveLength(1);
+});
+
+it("confirm_keeps_reviewed_state_and_shows_reason_when_resume_is_rejected", async () => {
+  let queue = queueWith({ autoDrain: false, pauseReason: "unconfirmed", version: 8 });
+  let reviewPending = true;
+  const acks: unknown[] = [];
+  const resumes: unknown[] = [];
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url === ZCODE_CONNECTION_PATH) return json(connection());
+      if (url.startsWith(`${ZCODE_SESSION_PATH}?`)) return json(session());
+      if (url.startsWith(`${ZCODE_LOCAL_QUEUE_PATH}?`)) return json(queue);
+      if (url === `${ZCODE_LOCAL_QUEUE_PATH}/recovery?sessionId=${SID}`) {
+        return json({
+          priority: [],
+          manualStopRequestId: null,
+          dispatchActionId: null,
+          unconfirmedActionId: reviewPending ? "restart-1" : null,
+        });
+      }
+      if (url === `${ZCODE_LOCAL_QUEUE_PATH}/recovery/ack`) {
+        acks.push(JSON.parse(String(init?.body)));
+        reviewPending = false;
+        queue = queueWith({ autoDrain: false, pauseReason: "unknown_reviewed", version: 9 });
+        return json({ ok: true });
+      }
+      if (url === `${ZCODE_LOCAL_QUEUE_PATH}/resume`) {
+        resumes.push(JSON.parse(String(init?.body)));
+        // 仍有别的未核对屏障：宿主拒绝，UI 必须如实显示且不伪造已恢复。
+        return new Response(JSON.stringify({ error: "queue_review_required" }), {
+          status: 409,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    })
+  );
+
+  render(<ZcodeControlPanel sessionId={SID} />);
+  await waitFor(() => expect(screen.getByTestId("zcode-local-recovery")).toBeVisible(), {
+    timeout: 3000,
+  });
+  fireEvent.click(screen.getByTestId("zcode-recovery-unconfirmed"));
+  await waitFor(() => expect(resumes).toHaveLength(1), { timeout: 3000 });
+  expect(acks).toHaveLength(1);
+  // 已确认状态保留（提示“已核对”），失败原因可见，且不自动重试。
+  expect(screen.getByTestId("zcode-local-queue-notice")).toHaveAttribute(
+    "data-state",
+    "recovery_reviewed"
+  );
+  expect(screen.getByTestId("zcode-local-queue-error")).toHaveAttribute(
+    "data-reason-code",
+    "queue_review_required"
+  );
+  await act(async () => {});
+  expect(acks).toHaveLength(1);
+  expect(resumes).toHaveLength(1);
 });

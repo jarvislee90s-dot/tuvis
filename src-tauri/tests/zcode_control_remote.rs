@@ -2563,6 +2563,7 @@ async fn selection_provider_reaches_backend_through_action_whitelist() {
                     "provider": "provider-b",
                     "model": "same-model",
                     "thought": "high",
+                    "confirmUnknownProvider": true,
                 },
             }),
             true,
@@ -2576,6 +2577,7 @@ async fn selection_provider_reaches_backend_through_action_whitelist() {
             provider: Some(provider),
             model,
             thought,
+            confirm_unknown_provider: true,
             ..
         }) if provider == "provider-b" && model == "same-model" && thought == "high"
     ));
