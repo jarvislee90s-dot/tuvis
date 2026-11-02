@@ -1,6 +1,23 @@
 use super::super::types::{TargetKey, ZResult};
 use super::types::*;
 use crate::remote::pairing::DeviceStore;
+
+/// 存储路径与当前绑定路径的等价比较：macOS `/tmp` → `/private/tmp` 等符号链接
+/// 不能因为字符串不同就把同一条目判成别的目标。两端都可 canonicalize 时比真实路径；
+/// 不可 canonicalize（测试合成路径/已删除目录）时只接受逐字相等。
+fn workspace_matches(stored: &str, target: &str) -> bool {
+    if stored == target {
+        return true;
+    }
+    match (
+        std::path::Path::new(stored).canonicalize(),
+        std::path::Path::new(target).canonicalize(),
+    ) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
 fn check_operation_identity(
     conn: &rusqlite::Connection,
     request_id: &str,
@@ -784,7 +801,7 @@ impl SqlLocalQueueStore {
             || super::super::types::ZcodeError::of(super::super::types::codes::STORAGE_FAILED);
         self.store.with(|c| {
             let row: Option<(String,String,Option<String>)> = c.query_row("SELECT session_id,workspace_path,workspace_identity FROM zcode_send_queue WHERE item_id=?1 AND device_id=?2 AND state='queued' AND priority_request=?3",rusqlite::params![cmd.item_id,actor.device_id,cmd.request_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional().map_err(|_|err())?;
-            Ok(row.is_some_and(|(session,path,identity)| session == target.session_id && path == target.workspace_path && (identity.is_none() || identity == target.workspace_identity)))
+            Ok(row.is_some_and(|(session,path,identity)| session == target.session_id && workspace_matches(&path, &target.workspace_path) && (identity.is_none() || identity == target.workspace_identity)))
         })
     }
     pub(crate) fn item_key(
@@ -972,7 +989,7 @@ impl SqlLocalQueueStore {
             || super::super::types::ZcodeError::of(super::super::types::codes::STORAGE_FAILED);
         self.store.with(|c| {
             let row: Option<(String,Option<String>)> = c.query_row("SELECT workspace_path,workspace_identity FROM zcode_send_queue WHERE session_id=?1 AND state='queued' ORDER BY seq LIMIT 1",[&key.session_id],|r|Ok((r.get(0)?,r.get(1)?))).optional().map_err(|_|err())?;
-            Ok(row.is_none_or(|(path,identity)| target.session_id == key.session_id && path == target.workspace_path && (identity.is_none() || identity == target.workspace_identity)))
+            Ok(row.is_none_or(|(path,identity)| target.session_id == key.session_id && workspace_matches(&path, &target.workspace_path) && (identity.is_none() || identity == target.workspace_identity)))
         })
     }
     pub(crate) fn attachments_valid(
@@ -1216,7 +1233,7 @@ impl SqlLocalQueueStore {
             let (session,device_name,text,path,identity,action_id): (String,String,String,String,Option<String>,String) = tx.query_row("SELECT q.session_id,q.device_name,q.prepared,q.workspace_path,q.workspace_identity,o.send_action_id FROM zcode_send_queue q JOIN zcode_queue_operations o ON o.request_id=q.priority_request WHERE q.item_id=?1 AND q.device_id=?2 AND q.item_version=?3 AND q.state='queued' AND q.priority_request=?4 AND o.kind='priority' AND o.device_id=?2 AND o.device_name=?5 AND o.operation_state='in_flight'", rusqlite::params![cmd.item_id,actor.device_id,version,operation_id,actor.device_name], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?))).map_err(|e| if matches!(e,rusqlite::Error::QueryReturnedNoRows) { invalid() } else { err() })?;
             let blocked: i64 = tx.query_row("SELECT count(*) FROM zcode_send_queue q WHERE q.session_id=?1 AND (q.state='dispatching' OR (q.state='unknown' AND NOT EXISTS (SELECT 1 FROM zcode_queue_operations r WHERE r.kind='unknown_review' AND r.item_id=q.item_id)) OR (q.state='accepted' AND coalesce(json_extract(q.receipt,'$.sendAdmission.delivery'),'startNow')='startNow' AND coalesce(json_extract(q.receipt,'$._queueTerminal'),0)=0 AND coalesce(json_extract(q.receipt,'$._queueUnconfirmed'),0)=0))",[&session],|r|r.get(0)).map_err(|_|err())?;
             if blocked != 0 { return Err(invalid()); }
-            if session != target.session_id || path != target.workspace_path || (identity.is_some() && identity != target.workspace_identity) { return Err(invalid()); }
+            if session != target.session_id || !workspace_matches(&path, &target.workspace_path) || (identity.is_some() && identity != target.workspace_identity) { return Err(invalid()); }
             if identity.is_none() && target.workspace_identity.is_some() {
                 tx.execute("UPDATE zcode_send_queue SET workspace_identity=?1 WHERE item_id=?2 AND workspace_identity IS NULL", rusqlite::params![target.workspace_identity,cmd.item_id]).map_err(|_| err())?;
             }
@@ -1256,7 +1273,7 @@ impl SqlLocalQueueStore {
             if stopping != 0 { return Ok(None); }
             let row: Option<(String,String,String,String,String,Option<String>)> = tx.query_row("SELECT item_id,device_id,device_name,prepared,workspace_path,workspace_identity FROM zcode_send_queue WHERE session_id=?1 AND state='queued' ORDER BY seq LIMIT 1", [&key.session_id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?))).optional().map_err(|_| err())?;
             let Some((item_id, device_id, device_name, text, path, identity)) = row else { return Ok(None); };
-            if path != target.workspace_path || (identity.is_some() && identity != target.workspace_identity) { return Err(super::super::types::ZcodeError::of(super::super::types::codes::INVALID_ACTION)); }
+            if !workspace_matches(&path, &target.workspace_path) || (identity.is_some() && identity != target.workspace_identity) { return Err(super::super::types::ZcodeError::of(super::super::types::codes::INVALID_ACTION)); }
             if identity.is_none() && target.workspace_identity.is_some() {
                 tx.execute("UPDATE zcode_send_queue SET workspace_identity=?1 WHERE item_id=?2 AND workspace_identity IS NULL", rusqlite::params![target.workspace_identity,item_id]).map_err(|_| err())?;
             }

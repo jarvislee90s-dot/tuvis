@@ -46,8 +46,8 @@ mod tests {
         assert!(!ZcodeInterfaceEvidence::default().method_send);
         assert_eq!(
             interface_capabilities(&ZcodeInterfaceEvidence::default()).len(),
-            11,
-            "返回表恒含十一键（八项旧能力 + 三项队列写）"
+            12,
+            "返回表恒含十二键（八项旧能力 + 三项队列写 + 模式）"
         );
     }
 }

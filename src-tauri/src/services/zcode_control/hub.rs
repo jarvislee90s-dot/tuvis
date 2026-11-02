@@ -755,6 +755,7 @@ pub trait HubBackend: Send + Sync {
                 ControlAction::Stop { .. } => Ok(vec!["interrupt"]),
                 ControlAction::Permission { .. } => Ok(vec!["approval_reply"]),
                 ControlAction::Selection { .. } => Ok(vec!["model", "thought_level"]),
+                ControlAction::Mode { .. } => Ok(vec!["mode"]),
                 ControlAction::QueueDelete { .. } | ControlAction::QueueReorder { .. } => {
                     Ok(vec!["queue_edit"])
                 }
@@ -3749,7 +3750,10 @@ impl ZcodeHub {
         }
         let write_lock = if matches!(
             &action,
-            ControlAction::Send { .. } | ControlAction::Stop { .. }
+            ControlAction::Send { .. }
+                | ControlAction::Stop { .. }
+                | ControlAction::Selection { .. }
+                | ControlAction::Mode { .. }
         ) {
             Some(self.session_write_lock(action.session_id()))
         } else {
@@ -3940,12 +3944,19 @@ impl ZcodeHub {
                     }
                 }
                 (
-                    ControlAction::Selection { model, thought, .. },
+                    ControlAction::Selection {
+                        provider,
+                        model,
+                        thought,
+                        ..
+                    },
                     Capability::Model | Capability::ThoughtLevel,
                 ) => ConfirmationTarget::Selection {
-                    // provider 不随模型切换变化：取登记时刻快照值（缺席 = 空串，
-                    // 三项精确相等判据自然不可能确认，保守不升级）。
-                    provider: baseline.observation.provider.clone().unwrap_or_default(),
+                    // 目标 provider 优先取动作字段；旧动作缺省取登记时刻快照值。
+                    provider: provider
+                        .clone()
+                        .or_else(|| baseline.observation.provider.clone())
+                        .unwrap_or_default(),
                     model: model.clone(),
                     thought: thought.clone(),
                 },
@@ -4128,6 +4139,7 @@ impl ZcodeHub {
                 required.push(("model", &policy.model, None));
                 required.push(("thought_level", &policy.thought_level, None));
             }
+            ControlAction::Mode { .. } => required.push(("mode", &policy.mode, None)),
             // 队列写：**队列专属槽位**（默认关闭 → `needs_evidence`）。绝不借
             // `send`/`approval_reply`——那会让「能发消息」自动升级成「能改队列」。
             ControlAction::QueueDelete { .. } | ControlAction::QueueReorder { .. } => {
@@ -10796,6 +10808,7 @@ mod tests {
         ControlAction::Selection {
             session_id: "sess_synthetic0000".into(),
             generation,
+            provider: None,
             model: model.into(),
             thought: thought.into(),
         }
@@ -11460,6 +11473,8 @@ mod tests {
             model: "GLM-5.3".into(),
             thought: Some("low".into()),
             models: Vec::new(),
+            providers: Vec::new(),
+            mode: None,
         });
         pump.push_outcome(Ok(()), vec![wrong]);
         events
@@ -11479,6 +11494,8 @@ mod tests {
             model: "GLM-5.3-Flash".into(),
             thought: Some("low".into()),
             models: Vec::new(),
+            providers: Vec::new(),
+            mode: None,
         });
         pump.push_outcome(Ok(()), vec![right]);
         events

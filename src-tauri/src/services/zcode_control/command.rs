@@ -125,13 +125,14 @@ use crate::services::codex_desktop_ipc::types::new_uuid;
 
 use super::action::{action_params, audit_summary, payload_hash, ActionStore, Reservation};
 use super::bridge::{BridgeManager, AGENT_CHANNEL};
+use super::mode::build_mode_command;
 use super::pending::{build_permission_answer, build_user_answer};
-use super::selection::build_selection_command;
+use super::selection::build_selection_command_for_provider;
 use super::types::{
     codes, ActionContext, ActionReceipt, ActionState, ActiveWork, BoundTarget, CapabilitySource,
-    CapabilityView, CommandPort, ControlAction, HeldQueueChoice, PendingPort, SelectionPort,
-    SendAdmission, SendDelivery, SessionView, StopPort, StopRequest, ZResult, ZcodeError,
-    PROTOCOL_CLIENT_ID, WRITABLE_DISPATCH_STATES,
+    CapabilityView, CollaborationMode, CommandPort, ControlAction, HeldQueueChoice, PendingPort,
+    SelectionPort, SendAdmission, SendDelivery, SessionView, StopPort, StopRequest, ZResult,
+    ZcodeError, PROTOCOL_CLIENT_ID, WRITABLE_DISPATCH_STATES,
 };
 
 /// 官方发送方法名（`zcodeAgent.ts:937`、探针 `SendOnceLoop`）。
@@ -934,6 +935,7 @@ impl CommandSender {
             ControlAction::Selection { .. } => {
                 self.execute_selection(ctx, target, action, permits).await
             }
+            ControlAction::Mode { .. } => self.execute_mode(ctx, target, action, permits).await,
             // 队列写：能力闸在 `execute_queue_write` 内按**队列专属槽位**判定，
             // T8.2 验收许可不放宽它们（`permits` 与队列写无关）。
             ControlAction::QueueDelete { .. } => {
@@ -964,6 +966,7 @@ impl CommandSender {
             ControlAction::Stop { .. } => Ok(vec!["interrupt"]),
             ControlAction::Permission { .. } => Ok(vec!["approval_reply"]),
             ControlAction::Selection { .. } => Ok(vec!["model", "thought_level"]),
+            ControlAction::Mode { .. } => Ok(vec!["mode"]),
             // 队列写：每次只要求**一个**队列专属槽位（`queue_edit` 同时覆盖撤回与
             // 重排）。它绝不复用 `send`/`approval_reply` 的授权。
             ControlAction::QueueDelete { .. } | ControlAction::QueueReorder { .. } => {
@@ -1621,7 +1624,13 @@ impl CommandSender {
         action: &ControlAction,
         permits: &[&str],
     ) -> ZResult<ActionReceipt> {
-        let ControlAction::Selection { model, thought, .. } = action else {
+        let ControlAction::Selection {
+            provider,
+            model,
+            thought,
+            ..
+        } = action
+        else {
             return Err(invalid_action());
         };
         // 幂等重放（同 actionId 同载荷）：只回既有回执，零新行、零帧、零目录读取。
@@ -1653,11 +1662,16 @@ impl CommandSender {
         if !view.ready {
             return Err(ZcodeError::of(codes::NOT_READY));
         }
-        let provider = selection.provider.clone();
+        // 目标 provider：旧动作缺省 = 当前会话 provider；新动作必须落在一个官方目录
+        // 分组里，模型/档位只取该组自己的列表（构造器复核）。
+        let target_provider = provider
+            .clone()
+            .unwrap_or_else(|| selection.provider.clone());
         // 选择视图随新鲜视图一起交给构造器：CAS revision 必填、模型/档位必须属于
-        // **当前 provider 目录**（空档位/他模型档位/未知值 → invalid_action）。
+        // **目标 provider 目录**（空档位/他模型档位/未知值 → invalid_action）。
         view.selection = Some(selection);
-        let command = build_selection_command(&view, model, thought)?;
+        let command =
+            build_selection_command_for_provider(&view, &target_provider, model, thought)?;
         let base_revision = view
             .revision
             .ok_or_else(|| ZcodeError::of(codes::NOT_READY))?;
@@ -1665,7 +1679,10 @@ impl CommandSender {
         // model/thought），与 `lookup_action`/`action_params` 同一口径：`baseRevision`
         // 是 CAS 执行态（成功后必变），provider 是服务端派生的会话属性，二者都不参与
         // 身份，否则同 actionId 重试会落成 `action_payload_conflict`。审计摘要只记类别。
-        let params = serde_json::json!({ "model": model, "thought": thought });
+        let mut params = serde_json::json!({ "model": model, "thought": thought });
+        if let Some(provider) = provider {
+            params["provider"] = serde_json::Value::from(provider.clone());
+        }
         let hash = payload_hash(
             action.kind(),
             &target.session_id,
@@ -1745,7 +1762,7 @@ impl CommandSender {
             if port
                 .wait_selection(
                     target,
-                    &provider,
+                    &target_provider,
                     model,
                     thought,
                     base_revision,
@@ -1759,6 +1776,175 @@ impl CommandSender {
         }
         self.record(&receipt);
         Ok(receipt)
+    }
+
+    /// 协作模式切换（R10）：fresh ready/idle/no pending → 恰一帧
+    /// `switchCollaborationMode{mode}` → 配置规范化后生效才 confirmed。
+    async fn execute_mode(
+        &self,
+        ctx: &ActionContext,
+        target: &BoundTarget,
+        action: &ControlAction,
+        permits: &[&str],
+    ) -> ZResult<ActionReceipt> {
+        let ControlAction::Mode {
+            mode,
+            confirm_full_access,
+            ..
+        } = action
+        else {
+            return Err(invalid_action());
+        };
+        if let Some(existing) = self.lookup_action(ctx, target, action)? {
+            return Ok(existing);
+        }
+        let capabilities = self.current_capabilities();
+        if !capabilities.mode.enabled && !permits.contains(&"mode") {
+            return Err(ZcodeError::of(codes::NEEDS_EVIDENCE));
+        }
+        if !mode.writable() {
+            return Err(ZcodeError::of(codes::INVALID_ACTION));
+        }
+        if *mode == CollaborationMode::Yolo && !confirm_full_access {
+            return Err(ZcodeError::of(codes::INVALID_ACTION));
+        }
+        let Some(port) = self.stop.as_ref() else {
+            return Err(ZcodeError::of(codes::NOT_READY));
+        };
+        let view = port.session(target, self.initial_control_timeout).await?;
+        if view.session_id != target.session_id {
+            return Err(ZcodeError::of(codes::NO_SESSION));
+        }
+        if view.generation != target.bridge_generation() {
+            return Err(ZcodeError::of(codes::STALE_GENERATION));
+        }
+        if !view.ready || !view.pending.is_empty() {
+            return Err(ZcodeError::of(codes::NOT_READY));
+        }
+        if view
+            .control
+            .as_ref()
+            .is_some_and(|control| !control.active_works.is_empty())
+        {
+            return Err(ZcodeError::of(codes::NOT_READY));
+        }
+        let base_revision = view
+            .revision
+            .ok_or_else(|| ZcodeError::of(codes::NOT_READY))?;
+        let command = build_mode_command(&view, *mode, *confirm_full_access)?;
+        let params = serde_json::json!({
+            "mode": mode,
+            "confirmFullAccess": confirm_full_access,
+        });
+        let hash = payload_hash(
+            action.kind(),
+            &target.session_id,
+            target.generation,
+            &params,
+        )?;
+        let summary = audit_summary(action.kind(), &params);
+        match self
+            .actions
+            .reserve_with_kind(ctx, target, action.kind(), &hash, &summary)?
+        {
+            Reservation::Existing(receipt) => return Ok(receipt),
+            Reservation::New => {}
+        }
+        let mut envelope = command;
+        if let Some(object) = envelope.as_object_mut() {
+            object.insert("commandId".to_owned(), Value::from(new_uuid()));
+            object.insert("clientId".to_owned(), Value::from(PROTOCOL_CLIENT_ID));
+            object.insert(
+                "sessionId".to_owned(),
+                Value::from(target.session_id.clone()),
+            );
+            object.insert(
+                "issuedAt".to_owned(),
+                Value::from(chrono::Utc::now().timestamp_millis()),
+            );
+        }
+        let mut receipt = match self
+            .bridge
+            .call(
+                target,
+                AGENT_CHANNEL,
+                AGENT_SEND_COMMAND_METHOD,
+                vec![envelope],
+                self.ack_timeout,
+            )
+            .await
+        {
+            Err(error) => {
+                let (state, reason) = classify_port_error(&error);
+                let receipt = self.make_receipt(ctx, target, state, reason);
+                self.record(&receipt);
+                return Ok(receipt);
+            }
+            Ok(ack) => match classify_ack(&ack) {
+                (ActionState::Accepted, _) => {
+                    self.make_receipt(ctx, target, ActionState::Accepted, None)
+                }
+                (ActionState::Rejected, reason) => {
+                    let receipt = self.make_receipt(
+                        ctx,
+                        target,
+                        ActionState::Rejected,
+                        reason.or_else(|| Some(codes::INVALID_ACTION.to_owned())),
+                    );
+                    self.record(&receipt);
+                    return Ok(receipt);
+                }
+                (state, reason) => self.make_receipt(ctx, target, state, reason),
+            },
+        };
+        if receipt.state == ActionState::Accepted {
+            self.record(&receipt);
+            if self
+                .wait_mode_cleared(port.as_ref(), target, *mode, base_revision)
+                .await
+            {
+                receipt.state = ActionState::Confirmed;
+                receipt.reason_code = None;
+            }
+        }
+        self.record(&receipt);
+        Ok(receipt)
+    }
+
+    async fn wait_mode_cleared(
+        &self,
+        port: &dyn StopPort,
+        target: &BoundTarget,
+        mode: CollaborationMode,
+        baseline_revision: u64,
+    ) -> bool {
+        let deadline = tokio::time::Instant::now()
+            .checked_add(self.selection_confirm_timeout)
+            .unwrap_or_else(tokio::time::Instant::now);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            if let Ok(view) = port.session(target, remaining).await {
+                if view.ready
+                    && view.session_id == target.session_id
+                    && view.generation == target.bridge_generation()
+                    && view
+                        .revision
+                        .is_some_and(|revision| revision > baseline_revision)
+                    && view
+                        .selection
+                        .as_ref()
+                        .and_then(|selection| selection.mode.as_ref())
+                        .and_then(|mode_view| mode_view.effective_mode)
+                        == Some(mode)
+                {
+                    return true;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 
     /// 撤回一条官方队列项（`deleteQueueItem`）。
@@ -3093,6 +3279,7 @@ mod tests {
             ControlAction::Selection {
                 session_id: SESSION.to_string(),
                 generation: GEN,
+                provider: None,
                 model: "model-a".to_string(),
                 thought: "high".to_string(),
             },
@@ -3841,6 +4028,7 @@ mod tests {
                     ControlAction::Selection {
                         session_id: SESSION.to_owned(),
                         generation: GEN,
+                        provider: None,
                         model: "synthetic-model".to_owned(),
                         thought: "high".to_owned(),
                     },
@@ -4609,7 +4797,8 @@ mod tests {
         use super::*;
 
         use crate::services::zcode_control::types::{
-            ActiveWork, CapabilityView, ControlView, QueueView, SessionView, StopRequest,
+            ActiveWork, CapabilityView, CollaborationMode, ControlView, ModeView, QueueView,
+            SelectionView, SessionView, StopRequest,
         };
 
         fn work(kind: &str, execution_id: Option<&str>) -> ActiveWork {
@@ -4817,6 +5006,67 @@ mod tests {
                     self.wait_result.load(Ordering::SeqCst)
                 })
             }
+        }
+
+        fn mode_view(mode: CollaborationMode, revision: u64) -> SessionView {
+            let mut view = view(Some(control(Vec::new())));
+            view.revision = Some(revision);
+            view.selection = Some(SelectionView {
+                provider: "p".into(),
+                model: "m".into(),
+                thought: None,
+                models: vec![],
+                providers: vec![],
+                mode: Some(ModeView {
+                    raw_mode: Some(mode),
+                    plan_enabled: Some(mode == CollaborationMode::Plan),
+                    effective_mode: Some(mode),
+                }),
+            });
+            view
+        }
+
+        #[tokio::test]
+        async fn mode_switch_sends_one_frame_and_confirms_only_fresh_config() {
+            let store = DeviceStore::memory();
+            let fake = FakeBridge::new(Reply::Body(accepted_body()));
+            let stop = FakeStop::sequence(vec![
+                mode_view(CollaborationMode::Build, 4),
+                mode_view(CollaborationMode::Plan, 5),
+            ]);
+            let mut caps = CapabilityView::default();
+            caps.mode.enabled = true;
+            caps.mode.reason_code = None;
+            let sender = stop_sender(&fake, &stop, &store)
+                .with_capabilities(caps)
+                .with_selection_confirm_timeout(Duration::from_millis(200));
+            let action = ControlAction::Mode {
+                session_id: SESSION.to_owned(),
+                generation: GEN,
+                mode: CollaborationMode::Plan,
+                confirm_full_access: false,
+            };
+            let receipt = sender
+                .execute(&ctx("m-1"), &target(), &action)
+                .await
+                .unwrap();
+            assert_eq!(receipt.state, ActionState::Confirmed);
+            let frames = envelopes_of_type(&fake, "switchCollaborationMode");
+            assert_eq!(frames.len(), 1, "恰一帧模式命令");
+            assert_eq!(frames[0]["payload"], serde_json::json!({"mode": "plan"}));
+            assert_eq!(frames[0]["baseRevision"], 4);
+
+            let denied = ControlAction::Mode {
+                session_id: SESSION.to_owned(),
+                generation: GEN,
+                mode: CollaborationMode::Yolo,
+                confirm_full_access: false,
+            };
+            assert!(sender
+                .execute(&ctx("m-2"), &target(), &denied)
+                .await
+                .is_err());
+            assert_eq!(envelopes_of_type(&fake, "switchCollaborationMode").len(), 1);
         }
 
         fn stop_sender(
@@ -7255,7 +7505,8 @@ mod tests {
 
         use crate::services::zcode_control::selection::SWITCH_MODEL_CONFIG_TYPE;
         use crate::services::zcode_control::types::{
-            CapabilityFlag, CapabilityView, ModelChoice, QueueView, SelectionView, SessionView,
+            CapabilityFlag, CapabilityView, ModelChoice, ProviderChoice, QueueView, SelectionView,
+            SessionView,
         };
 
         use super::answer::stored_state;
@@ -7284,6 +7535,8 @@ mod tests {
                 model: model.to_owned(),
                 thought: thought.map(str::to_owned),
                 models,
+                providers: Vec::new(),
+                mode: None,
             }
         }
 
@@ -7319,8 +7572,35 @@ mod tests {
             ControlAction::Selection {
                 session_id: SESSION.to_owned(),
                 generation: GEN,
+                provider: None,
                 model: model.to_owned(),
                 thought: thought.to_owned(),
+            }
+        }
+
+        fn provider_catalog() -> SelectionView {
+            SelectionView {
+                provider: PROVIDER.to_owned(),
+                model: "model-a".to_owned(),
+                thought: Some("low".to_owned()),
+                models: vec![choice("model-a", &["low", "high"])],
+                mode: None,
+                providers: vec![
+                    ProviderChoice {
+                        provider_id: PROVIDER.to_owned(),
+                        label: "A".to_owned(),
+                        models: vec![choice("model-a", &["low", "high"])],
+                        available: true,
+                        reason_code: None,
+                    },
+                    ProviderChoice {
+                        provider_id: "provider-b".to_owned(),
+                        label: "B".to_owned(),
+                        models: vec![choice("model-b", &["low"])],
+                        available: true,
+                        reason_code: None,
+                    },
+                ],
             }
         }
 
@@ -7768,6 +8048,38 @@ mod tests {
             assert_eq!(replay, first, "闸收回不得把「做过」误报成「没做过」");
             assert_eq!(switch_frames(&fake).len(), 1);
             assert_eq!(row_count(&store), 1);
+        }
+
+        /// 目标 provider B：命令 payload 与 wait_selection 都用 B，不拿 A 的目录冒充。
+        #[tokio::test]
+        async fn selection_uses_target_provider_and_waits_for_it() {
+            let store = DeviceStore::memory();
+            let fake = FakeBridge::new(Reply::Body(accepted_body()));
+            let port =
+                FakeSelection::new(view(Some(REVISION), provider_catalog()), provider_catalog());
+            port.set_wait_result(true);
+            let sender = selection_sender(&fake, &port, &store);
+            let action = ControlAction::Selection {
+                session_id: SESSION.to_owned(),
+                generation: GEN,
+                provider: Some("provider-b".to_owned()),
+                model: "model-b".to_owned(),
+                thought: "low".to_owned(),
+            };
+            let receipt = sender
+                .execute(&ctx("a-provider"), &target(), &action)
+                .await
+                .unwrap();
+            assert_eq!(receipt.state, ActionState::Confirmed);
+            let frames = switch_frames(&fake);
+            assert_eq!(frames.len(), 1);
+            assert_eq!(frames[0]["payload"]["provider"], "provider-b");
+            assert_eq!(frames[0]["payload"]["model"], "model-b");
+            assert_eq!(
+                port.wait_calls()[0].0,
+                "provider-b",
+                "确认观察必须盯目标 provider"
+            );
         }
     }
 

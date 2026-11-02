@@ -459,8 +459,20 @@ pub enum ControlAction {
     Selection {
         session_id: String,
         generation: u64,
+        /// 目标供应商；None = 旧客户端/旧动作，只允许当前会话 provider。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider: Option<String>,
         model: String,
         thought: String,
+    },
+    /// 协作模式切换（R10）：payload 只含 `{mode}`，必须带 baseRevision。
+    #[serde(rename_all = "camelCase")]
+    Mode {
+        session_id: String,
+        generation: u64,
+        mode: CollaborationMode,
+        #[serde(default)]
+        confirm_full_access: bool,
     },
     /// 撤回一条**官方队列项**（`deleteQueueItem{queueItemId}`）。
     ///
@@ -515,6 +527,7 @@ impl ControlAction {
             Self::QueueReorder { .. } => "queue_reorder",
             Self::QueueNow { .. } => "queue_now",
             Self::QueueResume { .. } => "queue_resume",
+            Self::Mode { .. } => "mode",
         }
     }
 
@@ -530,7 +543,8 @@ impl ControlAction {
             | Self::QueueDelete { session_id, .. }
             | Self::QueueReorder { session_id, .. }
             | Self::QueueNow { session_id, .. }
-            | Self::QueueResume { session_id, .. } => session_id,
+            | Self::QueueResume { session_id, .. }
+            | Self::Mode { session_id, .. } => session_id,
         }
     }
 
@@ -546,7 +560,8 @@ impl ControlAction {
             | Self::QueueDelete { generation, .. }
             | Self::QueueReorder { generation, .. }
             | Self::QueueNow { generation, .. }
-            | Self::QueueResume { generation, .. } => *generation,
+            | Self::QueueResume { generation, .. }
+            | Self::Mode { generation, .. } => *generation,
         }
     }
 }
@@ -974,6 +989,59 @@ pub struct ModelChoice {
     pub thought_levels: Vec<String>,
 }
 
+/// 官方目录里的一个 provider 分组（只含 id/显示名/该 provider 的模型；不含凭据）。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderChoice {
+    pub provider_id: String,
+    pub label: String,
+    pub models: Vec<ModelChoice>,
+    pub available: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason_code: Option<String>,
+}
+
+/// 协作模式（官方 `switchCollaborationMode` 值域；`edit` 只读兼容）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CollaborationMode {
+    Build,
+    Edit,
+    Plan,
+    Yolo,
+    Guarded,
+}
+
+impl CollaborationMode {
+    /// 首版允许写入的四项；`edit` 只读兼容。
+    pub fn writable(self) -> bool {
+        !matches!(self, Self::Edit)
+    }
+
+    /// 官方标签（与当前 build UI 映射一致；前端仍按 i18n 显示）。
+    pub fn ui_label(self) -> &'static str {
+        match self {
+            Self::Plan => "计划模式",
+            Self::Build => "变更前确认",
+            Self::Guarded => "自主模式",
+            Self::Yolo => "完全访问",
+            Self::Edit => "自动编辑",
+        }
+    }
+}
+
+/// 模式投影：原始值 + planEnabled + 规范化后的生效模式。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModeView {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_mode: Option<CollaborationMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_mode: Option<CollaborationMode>,
+}
+
 /// 当前模型/思考档位（snapshot.config 的只读投影）。
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -982,6 +1050,12 @@ pub struct SelectionView {
     pub model: String,
     pub thought: Option<String>,
     pub models: Vec<ModelChoice>,
+    /// 官方目录里的全部 provider 分组；空 = 旧载荷/目录未提供（仅当前 provider 可用）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub providers: Vec<ProviderChoice>,
+    /// 本会话协作模式投影（R10）；None = 旧载荷/宿主未宣告。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<ModeView>,
 }
 
 /// 单个能力开关（默认关闭并带原因码；不复制 contract 的宽泛 true）。
@@ -1038,6 +1112,8 @@ pub struct CapabilityView {
     ///
     /// candidate = 「恢复运行」可点；运行时仍要 `queue.known && paused==Some(true)`。
     pub queue_resume: CapabilityFlag,
+    /// 协作模式切换（R10；独立槽位，绝不借 send/approval/queue）。
+    pub mode: CapabilityFlag,
 }
 
 impl CapabilityView {
@@ -1086,6 +1162,7 @@ impl Default for CapabilityView {
             queue_edit: flag(),
             queue_now: flag(),
             queue_resume: flag(),
+            mode: flag(),
         }
     }
 }
@@ -1340,6 +1417,7 @@ impl CapabilityPolicy {
             queue_edit: flag(),
             queue_now: flag(),
             queue_resume: flag(),
+            mode: flag(),
         }
     }
 
@@ -1365,6 +1443,7 @@ impl CapabilityPolicy {
             queue_edit: flag(),
             queue_now: flag(),
             queue_resume: flag(),
+            mode: flag(),
         }
     }
 }

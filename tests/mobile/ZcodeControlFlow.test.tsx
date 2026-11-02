@@ -18,6 +18,7 @@ import ZcodeControlPanel from "@/mobile/ZcodeControlPanel";
 import {
   ZCODE_ACTIONS_PATH,
   ZCODE_CONNECTION_PATH,
+  ZCODE_LOCAL_QUEUE_PATH,
   ZCODE_SESSION_PATH,
   type ActionReceipt,
   type CapabilityView,
@@ -462,6 +463,22 @@ describe("ZCode 生产流：SSE lag 先纠偏 GET 再放写", () => {
         return json(sessionView({ ready, revision, control }));
       }
       if (url.includes("/official-control")) return json({ configState: "missing", url: null });
+      if (url.startsWith(`${ZCODE_LOCAL_QUEUE_PATH}?`)) {
+        return json({
+          sessionId: SID,
+          version: 1,
+          autoDrain: true,
+          pauseReason: null,
+          items: [],
+          recoverableEdits: [],
+        });
+      }
+      if (url === `${ZCODE_LOCAL_QUEUE_PATH}/enqueue`) {
+        if (!writesReleased) {
+          throw new Error("write must not be released before resync GET completes");
+        }
+        return json({ itemId: "synthetic-item", itemVersion: 1, queueVersion: 2, position: 1 });
+      }
       if (url === ZCODE_ACTIONS_PATH && init?.method === "POST") {
         if (!writesReleased) {
           throw new Error("write must not be released before resync GET completes");
@@ -523,8 +540,9 @@ describe("ZCode 生产流：SSE lag 先纠偏 GET 再放写", () => {
     });
 
     expect(postBodies()).toHaveLength(0);
-    expect(postBodies().filter(({ action }) => action.kind === "stop")).toHaveLength(0);
-    expect(postBodies().filter(({ action }) => action.kind === "send")).toHaveLength(0);
+    expect(calledUrls().filter((url) => url === `${ZCODE_LOCAL_QUEUE_PATH}/enqueue`)).toHaveLength(
+      0
+    );
     expect(legacySendCalls()).toBe(0);
     // 草稿不被吞：写面关闭不是清空用户输入。
     expect(screen.getByTestId("zcode-draft")).toHaveValue("lag 后草稿");
@@ -539,8 +557,12 @@ describe("ZCode 生产流：SSE lag 先纠偏 GET 再放写", () => {
     });
     await waitFor(() => expect(screen.getByTestId("zcode-send")).toBeEnabled());
     fireEvent.click(screen.getByTestId("zcode-send"));
-    await waitFor(() => expect(postBodies()).toHaveLength(1));
-    expect(postBodies()[0].action.kind).toBe("send");
+    await waitFor(() =>
+      expect(
+        calledUrls().filter((url) => url === `${ZCODE_LOCAL_QUEUE_PATH}/enqueue`)
+      ).toHaveLength(1)
+    );
+    expect(postBodies()).toHaveLength(0);
     expect(legacySendCalls()).toBe(0);
     view.unmount();
   });

@@ -589,6 +589,8 @@ fn parse_selection(config: &Value) -> Option<SelectionView> {
         model: model.to_owned(),
         thought,
         models,
+        providers: Vec::new(),
+        mode: super::mode::parse_mode_view(config),
     })
 }
 

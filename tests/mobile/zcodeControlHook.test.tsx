@@ -8,7 +8,7 @@
 //    重试是新提交 → 新 actionId；
 // 4. send_failed / rejected / 未知 / 网络失败一律保留草稿；只有 send 的 accepted
 //    允许清草稿。
-import { act, cleanup, renderHook } from "@testing-library/react";
+import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import useZcodeControl from "@/mobile/useZcodeControl";
 import {
@@ -1534,5 +1534,48 @@ describe("useZcodeControl：F1 同代 revision 单调", () => {
     expect(result.current.session?.capabilities.send.enabled).toBe(true);
     expect(result.current.session?.queue?.items.map((item) => item.inputId)).toEqual(["queue_b"]);
     expect(postedActions()).toHaveLength(0);
+  });
+});
+
+describe("useZcodeControl：本地待发队列", () => {
+  it("local_queue_snapshot_event_merges_by_version", async () => {
+    const local = (version: number) => ({
+      sessionId: SID,
+      version,
+      autoDrain: true,
+      pauseReason: null,
+      items: [
+        {
+          itemId: "item-1",
+          itemVersion: 1,
+          state: "queued",
+          position: 1,
+          textPreview: `第${version}版`,
+          hasAttachments: false,
+        },
+      ],
+      recoverableEdits: [],
+    });
+    installFetch((url) => {
+      if (url === ZCODE_CONNECTION_PATH) return json(connection());
+      if (url.startsWith(`${ZCODE_SESSION_PATH}?`)) return json(sessionView());
+      if (url.startsWith("/m/api/v1/zcode/local-queue?")) return json(local(2));
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+
+    const { result } = renderHook(() => useZcodeControl(SID));
+    await waitFor(() => expect(result.current.localQueue?.version).toBe(2));
+
+    const es = MockEventSource.latest();
+    await act(async () => {
+      es.emit("local_queue", local(3));
+    });
+    expect(result.current.localQueue?.version).toBe(3);
+    expect(result.current.localQueue?.items[0].textPreview).toBe("第3版");
+
+    await act(async () => {
+      es.emit("local_queue", local(1));
+    });
+    expect(result.current.localQueue?.version).toBe(3);
   });
 });

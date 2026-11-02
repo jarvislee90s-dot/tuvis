@@ -17,6 +17,25 @@ _Only versions translated so far are listed here; the full history lives in the
 
 ### Added
 
+- **ZCode phone outbox and single-item priority**: while a turn is running, sending stores the
+  message in the local Tuvis outbox first (expanded by default, position + 20-grapheme preview),
+  with edit, retract, "stop the current turn and send only this item", and explicit resume.
+  An enqueue is not an official acceptance; the official queue remains a separate read-only
+  view. Edit snapshots survive a lost response / refresh, and a non-empty draft is never
+  overwritten without choose replace / merge / cancel; an unknown stop result sends nothing and
+  never re-stops or resends under a new ID.
+- **ZCode provider-scoped model selection and R10 collaboration modes**: choose a provider,
+  then a model and a level that belongs to that provider, and submit the full triple once. Adds
+  Plan / Confirm before changes / Autonomous / Full access (Auto edit read-only compatibility),
+  with an extra confirmation for Full access; the confirmed label follows only a fresh,
+  normalized mode (`planEnabled=true` means Plan), and an ACK never upgrades the label
+  optimistically.
+- **ZCode stable signed debug build entry (R02 engineering item)**:
+  `pnpm build:macos:signed-dev` reads an existing certificate name from
+  `TUVIS_APPLE_SIGN_IDENTITY` and builds a same-identity debug `.app` through Tauri bundle
+  configuration. It never installs certificates, reads private keys, changes ACLs, or launches
+  the app. Real Keychain prompt counts still require four separate on-device scenarios.
+
 - **ZCode authorization restores automatically (credential reuse)**: after a successful
   ZCode authorization the account JWT is written to this machine's system credential vault
   (macOS Keychain / Windows Credential Manager / Linux Secret Service); startup restores it

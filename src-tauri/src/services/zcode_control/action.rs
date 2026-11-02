@@ -220,10 +220,18 @@ pub fn action_params(action: &ControlAction) -> Value {
         } => serde_json::json!({
             "expectedForegroundExecutionId": expected_foreground_execution_id,
         }),
-        ControlAction::Selection { model, thought, .. } => serde_json::json!({
-            "model": model,
-            "thought": thought,
-        }),
+        ControlAction::Selection {
+            provider,
+            model,
+            thought,
+            ..
+        } => {
+            let mut params = serde_json::json!({ "model": model, "thought": thought });
+            if let Some(provider) = provider {
+                params["provider"] = serde_json::Value::from(provider.clone());
+            }
+            params
+        }
         // 队列写动作：只取**身份类**参数（项 ID / 目标前驱 ID），绝不带队列正文。
         ControlAction::QueueDelete { queue_item_id, .. } => {
             serde_json::json!({ "queueItemId": queue_item_id })
@@ -242,6 +250,14 @@ pub fn action_params(action: &ControlAction) -> Value {
         // 恢复只有 `autoDrain=true` 一个固定意图：无参数（空对象仍参与指纹，
         // 「同 id 换参数即冲突」的口径不变）。
         ControlAction::QueueResume { .. } => serde_json::json!({}),
+        ControlAction::Mode {
+            mode,
+            confirm_full_access,
+            ..
+        } => serde_json::json!({
+            "mode": mode,
+            "confirmFullAccess": confirm_full_access,
+        }),
     }
 }
 
@@ -1207,6 +1223,7 @@ mod tests {
             ControlAction::Selection {
                 session_id: SESSION.into(),
                 generation: GEN,
+                provider: None,
                 model: "model-a".into(),
                 thought: "high".into(),
             },
@@ -1519,5 +1536,53 @@ mod tests {
             [],
         )
         .unwrap();
+    }
+    #[test]
+    fn provider_enters_selection_fingerprint() {
+        let base = ControlAction::Selection {
+            session_id: SESSION.into(),
+            generation: GEN,
+            provider: None,
+            model: "model-a".into(),
+            thought: "high".into(),
+        };
+        let provider_a = ControlAction::Selection {
+            session_id: SESSION.into(),
+            generation: GEN,
+            provider: Some("provider-a".into()),
+            model: "model-a".into(),
+            thought: "high".into(),
+        };
+        let provider_b = ControlAction::Selection {
+            session_id: SESSION.into(),
+            generation: GEN,
+            provider: Some("provider-b".into()),
+            model: "model-a".into(),
+            thought: "high".into(),
+        };
+        let hash = |action: &ControlAction| {
+            payload_hash(
+                action.kind(),
+                action.session_id(),
+                action.generation(),
+                &action_params(action),
+            )
+            .unwrap()
+        };
+        assert_ne!(
+            hash(&base),
+            hash(&provider_a),
+            "Some(provider) 必须改变指纹"
+        );
+        assert_ne!(
+            hash(&provider_a),
+            hash(&provider_b),
+            "同模型不同供应商必须可分"
+        );
+        assert_eq!(action_params(&provider_a)["provider"], "provider-a");
+        assert!(
+            action_params(&base).get("provider").is_none(),
+            "旧动作保持旧形状"
+        );
     }
 }

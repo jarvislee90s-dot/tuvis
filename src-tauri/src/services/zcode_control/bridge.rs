@@ -440,6 +440,8 @@ impl ZcodeInterfaceEvidence {
             self.method_stop = has(super::command::STOP_TYPE);
             self.method_selection_get = has(MODEL_SELECTION_GET_VIEW_METHOD);
             self.method_selection_switch = has(super::selection::SWITCH_MODEL_CONFIG_TYPE);
+            // switchCollaborationMode 复用同一 sendConversationCommandV4 方法；以方法表为准。
+            self.method_mode_switch = has(super::command::AGENT_SEND_COMMAND_METHOD);
             return;
         }
         if object.get("protocolVersion").and_then(Value::as_u64) == Some(V4_WIRE_PROTOCOL_VERSION) {
@@ -448,6 +450,7 @@ impl ZcodeInterfaceEvidence {
             self.method_stop = true;
             self.method_selection_get = true;
             self.method_selection_switch = true;
+            self.method_mode_switch = self.method_send;
         }
     }
 
@@ -596,6 +599,10 @@ impl ZcodeInterfaceEvidence {
                 .get("thoughtLevels")
                 .and_then(Value::as_array)
                 .is_some_and(|levels| !levels.is_empty());
+            self.has_mode_config |= config
+                .get("mode")
+                .and_then(Value::as_str)
+                .is_some_and(|mode| !mode.is_empty());
         }
     }
 

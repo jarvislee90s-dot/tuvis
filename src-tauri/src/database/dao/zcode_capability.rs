@@ -178,6 +178,10 @@ fn capability_from_str(raw: &str) -> Option<Capability> {
         "approval_reply" => Some(Capability::ApprovalReply),
         "model" => Some(Capability::Model),
         "thought_level" => Some(Capability::ThoughtLevel),
+        "queue_edit" => Some(Capability::QueueEdit),
+        "queue_now" => Some(Capability::QueueNow),
+        "queue_resume" => Some(Capability::QueueResume),
+        "mode" => Some(Capability::Mode),
         _ => None,
     }
 }
@@ -485,5 +489,30 @@ mod tests {
             })
             .unwrap();
         assert!(ledger.get(&key).is_empty(), "未知 state 词的行必须跳过");
+    }
+
+    #[test]
+    fn all_capability_words_roundtrip() {
+        for capability in [
+            Capability::Send,
+            Capability::SingleSelect,
+            Capability::MultiSelect,
+            Capability::FreeText,
+            Capability::Interrupt,
+            Capability::ApprovalReply,
+            Capability::Model,
+            Capability::ThoughtLevel,
+            Capability::QueueEdit,
+            Capability::QueueNow,
+            Capability::QueueResume,
+            Capability::Mode,
+        ] {
+            assert_eq!(
+                capability_from_str(capability.as_str()),
+                Some(capability),
+                "{} 必须可逆",
+                capability.as_str()
+            );
+        }
     }
 }

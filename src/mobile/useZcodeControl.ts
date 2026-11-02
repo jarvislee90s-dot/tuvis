@@ -34,6 +34,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import {
   ZcodeControlApiError,
   getZcodeConnection,
+  getZcodeLocalQueue,
   getZcodeSession,
   postZcodeAction,
   zcodeEventsUrl,
@@ -42,15 +43,19 @@ import {
   type CapabilityView,
   type ConnectionView,
   type ControlAction,
+  type LocalQueueView,
   type SessionView,
 } from "@/lib/api/zcodeControl";
 import { newActionId } from "./codexIpcApi";
+import { mergeLocalQueue } from "./zcode-local-queue-state";
 
 export interface UseZcodeControlResult {
   /** 服务端连接视图；null = 尚未确认（也是唯一「未知」表达，不猜 paired）。 */
   connection: ConnectionView | null;
   /** 会话投影（pending/control/selection/capabilities）；null = 未确认/读失败。 */
   session: SessionView | null;
+  /** 本设备可见的 Tuvis 待发队列；null = 尚未读到/服务未就绪（不是空队列）。 */
+  localQueue: LocalQueueView | null;
   /**
    * 当前就地原因（冻结错误码，不是用户文案；UI 按码取 zh/en）：
    * 连接未就绪时取连接态、提交失败时取回执 reasonCode；accepted/confirmed/noop
@@ -73,6 +78,8 @@ export interface UseZcodeControlResult {
    *  返回本次 **真正落地** 的会话投影（被旧的代次/序号守卫丢弃、或读失败 → null）：
    *  队列事务（撤回/恢复）要拿它当「新鲜队列」证据，绝不用本地缓存猜。 */
   refresh(): Promise<SessionView | null>;
+  /** 只重读本地待发队列；不触发 OAuth、不重放写动作。 */
+  refreshLocalQueue(): Promise<LocalQueueView | null>;
 }
 
 /** 连接态 → 就地原因码：paired/connecting 无错误；其余优先服务端 reasonCode，
@@ -108,6 +115,16 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 function isConnectionView(value: unknown): value is ConnectionView {
   return (
     isRecord(value) && typeof value.state === "string" && Number.isSafeInteger(value.generation)
+  );
+}
+
+function isLocalQueueView(value: unknown): value is LocalQueueView {
+  return (
+    isRecord(value) &&
+    typeof value.sessionId === "string" &&
+    Number.isSafeInteger(value.version) &&
+    Array.isArray(value.items) &&
+    Array.isArray(value.recoverableEdits)
   );
 }
 
@@ -248,6 +265,7 @@ export function degradedCapabilities(): CapabilityView {
     queueEdit: closedFlag(),
     queueNow: closedFlag(),
     queueResume: closedFlag(),
+    mode: closedFlag(),
   };
 }
 
@@ -263,6 +281,7 @@ const CAPABILITY_KEYS = [
   "queueEdit",
   "queueNow",
   "queueResume",
+  "mode",
 ] as const;
 
 /** 逐项取「更严」：只在两侧都开时才算开；关闭时保留关闭侧的原因码。 */
@@ -389,6 +408,7 @@ const MAX_RECOVERY_ATTEMPTS_PER_GENERATION = 2;
 export default function useZcodeControl(sessionId: string): UseZcodeControlResult {
   const [connection, setConnection] = useState<ConnectionView | null>(null);
   const [session, setSession] = useState<SessionView | null>(null);
+  const [localQueue, setLocalQueue] = useState<LocalQueueView | null>(null);
   const [reason, setReason] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [submitting, setSubmitting] = useState(false);
@@ -447,6 +467,26 @@ export default function useZcodeControl(sessionId: string): UseZcodeControlResul
   });
 
   /** 落地连接视图并推进代次；返回 false = 旧代次（不写 state）。 */
+  const applyLocalQueue = useCallback((view: LocalQueueView): boolean => {
+    if (view.sessionId !== sessionRef.current) return false;
+    setLocalQueue((prev) => mergeLocalQueue(prev, view));
+    return true;
+  }, []);
+
+  const refreshLocalQueue = useCallback(async (): Promise<LocalQueueView | null> => {
+    const sid = sessionRef.current;
+    if (sid === null) return null;
+    try {
+      const view = await getZcodeLocalQueue(sid);
+      if (sessionRef.current !== sid || !isLocalQueueView(view)) return null;
+      setLocalQueue((prev) => mergeLocalQueue(prev, view));
+      return view;
+    } catch {
+      // 本地队列读失败不污染连接/会话原因面；面板保持「未知」而不是伪造空队列。
+      return null;
+    }
+  }, []);
+
   const applyConnection = useCallback((view: ConnectionView): boolean => {
     if (view.generation < generationRef.current.connection) return false;
     generationRef.current.connection = view.generation;
@@ -589,9 +629,11 @@ export default function useZcodeControl(sessionId: string): UseZcodeControlResul
     // 换会话先清旧视图：旧连接/旧原因/旧草稿标记不得跨会话显示。
     setConnection(null);
     setSession(null);
+    setLocalQueue(null);
     setReason(null);
     setDraftCleared(false);
     setLoading(true);
+    void refreshLocalQueue();
     void applyRead(sessionId, run).then(() => {
       // 本轮读到过就收 loading（读失败也收：旧行为不变）；被新一轮顶掉的旧轮次不收。
       if (alive && readRunRef.current === run) setLoading(false);
@@ -600,7 +642,7 @@ export default function useZcodeControl(sessionId: string): UseZcodeControlResul
       alive = false;
       sessionRef.current = null;
     };
-  }, [sessionId, applyRead]);
+  }, [sessionId, applyRead, refreshLocalQueue]);
 
   /** 重读连接 + 会话；`recovery=true` 仅由失效/恢复守卫使用（事后权威现读）。 */
   const readSessions = useCallback(
@@ -691,6 +733,7 @@ export default function useZcodeControl(sessionId: string): UseZcodeControlResul
             ? applySessionView(sessionFrame, sessionFrame.ready ? "sse" : "safety-degrade")
             : false;
         const connectionApplied = connectionView !== null ? applyConnection(connectionView) : false;
+        if (isLocalQueueView(frame.localQueue)) applyLocalQueue(frame.localQueue);
         // 基线里的会话投影已失效（lag 后 ready=false）：与 session 帧同规，一次性自愈。
         if (sessionApplied && sessionFrame !== null) requestStaleRefresh(sessionFrame);
         // 基线说已配对，却没带本会话的有效会话投影（缺失/别的会话/旧代次）：补一次
@@ -703,6 +746,12 @@ export default function useZcodeControl(sessionId: string): UseZcodeControlResul
       if (name === "resync") {
         // lag = 中间事件已丢：只重 GET 自愈，**绝不重放动作**
         void refresh();
+        void refreshLocalQueue();
+        return;
+      }
+      if (name === "local_queue") {
+        // 本地队列帧是裸 LocalQueueView（没有 ControlEvent 信封），只按版本落地。
+        if (isLocalQueueView(frame)) applyLocalQueue(frame);
         return;
       }
 
@@ -786,12 +835,14 @@ export default function useZcodeControl(sessionId: string): UseZcodeControlResul
       next.addEventListener("connection", (e) => handle("connection", e));
       next.addEventListener("session", (e) => handle("session", e));
       next.addEventListener("action", (e) => handle("action", e));
+      next.addEventListener("local_queue", (e) => handle("local_queue", e));
       next.addEventListener("resync", (e) => handle("resync", e));
       next.onerror = () => {
         if (stopped || source !== next) return;
         next.close(); // 自管重连：同一次断流只算一次（关流后不再收 error）
         source = null;
         void refresh(); // 一次断流 = 一次纠偏 GET（connection + session 各一发）
+        void refreshLocalQueue();
         if (retryTimer) clearTimeout(retryTimer);
         const delay = retryDelay;
         retryDelay = Math.min(retryDelay * 2, SSE_RECONNECT_MAX_MS);
@@ -812,7 +863,15 @@ export default function useZcodeControl(sessionId: string): UseZcodeControlResul
         retryTimer = null;
       }
     };
-  }, [sessionId, applyConnection, applySessionView, refresh, requestStaleRefresh]);
+  }, [
+    sessionId,
+    applyConnection,
+    applyLocalQueue,
+    applySessionView,
+    refresh,
+    refreshLocalQueue,
+    requestStaleRefresh,
+  ]);
 
   const submit = useCallback(async (action: ControlAction): Promise<ActionReceipt> => {
     // 一次提交 = 一个 actionId：请求体与回执同一个；重试是新提交 → 新 ID。
@@ -839,5 +898,16 @@ export default function useZcodeControl(sessionId: string): UseZcodeControlResul
     }
   }, []);
 
-  return { connection, session, reason, loading, submitting, draftCleared, submit, refresh };
+  return {
+    connection,
+    session,
+    localQueue,
+    reason,
+    loading,
+    submitting,
+    draftCleared,
+    submit,
+    refresh,
+    refreshLocalQueue,
+  };
 }

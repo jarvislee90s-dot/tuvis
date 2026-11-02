@@ -48,6 +48,7 @@ function openCapabilities(): CapabilityView {
     queueEdit: openFlag,
     queueNow: openFlag,
     queueResume: openFlag,
+    mode: openFlag,
   };
 }
 
@@ -64,6 +65,7 @@ function closedCapabilities(): CapabilityView {
     queueEdit: closedFlag(),
     queueNow: closedFlag(),
     queueResume: closedFlag(),
+    mode: closedFlag(),
   };
 }
 

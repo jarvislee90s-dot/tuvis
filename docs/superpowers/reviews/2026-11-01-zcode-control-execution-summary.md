@@ -70,6 +70,67 @@
 - 指定项停止认领后、端口调用前删除附件 RED（错误停止）→ GREEN；Hub 假后端最终停止重绑定期间删除附件 RED（错误进入停止发送器）→ GREEN（零停止帧）。控制域 829 passed；当时无匹配 priority 记录按纯 stop 放行，后续收紧见下。末次文件检查之后仍存在外部删除窗口；未实机。一次在仓库根误运行 cargo 失败，随后在 src-tauri 执行通过。
 - 停止最终写前收紧为必须匹配当前设备、会话、actionId、代际和已认领 in-flight 的 priority 或纯 stop；缺失记录 RED（误放行）→ GREEN，纯 stop 有效认领可通过、错误代际及 unknown 状态拒绝。旧直接端口假测试补入持久认领记录；控制域 830 passed。末次文件检查后仍可能被外部删除；该收口及测试夹具变更仍待整体复审。
 
-Q6–Q7、C1–C2、M1–M2、K1–K2、V0 尚待执行；Q5 代码已提交，但完整生产路由到假 wire 归 Q7。R01–R10 的最终覆盖、逐任务 RED/GREEN 与独立复审将在施工中逐项记入。
-- 接手收口：`queue_host_stop_delegates_only_with_current_target` 定向 1 passed；复核 `hub.rs` 的最终停止写前查重与 `store.rs` 的 `priority_stop_attachments_valid`，确认错误 `expectedExecutionId`、错误代际、缺失/已判 unknown 的停止认领均在调用停止端口前拒绝，且不产生停止帧。该检查不把“已写停止”误当成可复用许可。
+Q5/Q6 代码已提交；Q7、C1–C2、M1–M2、K1–K2 与 V0 的收口见下。R01–R10 的最终覆盖与实机缺口另列。- 接手收口：`queue_host_stop_delegates_only_with_current_target` 定向 1 passed；复核 `hub.rs` 的最终停止写前查重与 `store.rs` 的 `priority_stop_attachments_valid`，确认错误 `expectedExecutionId`、错误代际、缺失/已判 unknown 的停止认领均在调用停止端口前拒绝，且不产生停止帧。该检查不把“已写停止”误当成可复用许可。
+
 - Q5 主会话整体复核：`request_input_hash` 只覆盖设备、会话、原始草稿/附件与 `editedFrom`，刻意排除服务端派生的 workspace/prepared/签名设置；同 ID 重放遇签名设置变化仍返回原回执，旧行无新指纹时回退原 `payload_hash`。HTTP 路由已覆盖未配对/隐藏会话/未就绪、设备与会话归属、旧 `/actions` Stop 拒绝、同 ID 重放与冲突、编辑快照、SSE 首帧/设备过滤/积压 resync/读库失败 resync；附件只接受当前会话附件目录内现存普通文件。`CARGO_INCREMENTAL=0 cargo test --locked --lib services::zcode_control:: --quiet` 830 passed；`cargo test --locked --test zcode_control_remote --features zcode-bridge-evidence --quiet` 38 passed；两套 `cargo clippy --all-targets ... -D warnings` 与 `cargo fmt --check` 通过。Q7 仍须补生产路由到假 wire 的完整忙态／取消链；真实宿主、真实附件删除窗口和手机端接线 NOT RUN。此复审为主会话限定检查，不冒充新上下文独立 reviewer。
+
+### Q6：手机即时列表、再编辑与统一写槽
+
+- 新增 `src/mobile/zcode-local-queue-state.ts`：20 字素摘要、按会话/版本单调合并、recoverableEdits 查找。严格 RED：模块缺失导致 `zcodeLocalQueueState.test.ts` 无法解析（0 test）→ GREEN 3 passed。
+- `useZcodeControl` 在同一 SSE 流消费裸 `local_queue` 帧及 `snapshot.localQueue`，`GET /local-queue` 首读失败不污染连接/会话原因面；版本旧帧不倒退。新增 hook 反例 RED（`localQueue` 为 undefined）→ GREEN；全 hook 26 passed。
+- 新增 `ZcodeLocalQueuePanel`：默认展开，位次 + 20 字素摘要 + 「插队/再编辑/撤回」，暂停显示继续队列，unknown 项保留并标注待核对，recoverableEdits 提供「恢复编辑」。组件缺失 RED → GREEN；面板 5 passed。
+- 主面板接线：运行中/本地已有待发/暂停时普通发送只 `POST /local-queue/enqueue`，不直接 `POST /actions send`；空闲且无待发仍走原直接发送兼容路径。入队回执只清本次提交的草稿/附件，回执期间续写保留；网络未知重试复用原 requestId。`enqueue` 前反例 RED（无本地行）→ GREEN，另补续写、network 重试、插队、撤回、编辑冲突、继续队列用例；本地队列 flow 6 passed。
+- 插队仅在运行中弹确认，确认后只发一个本地 `prioritize`（带唯一 `expectedExecutionId`、`confirmStop=true`）；空闲直接单条处理，不要求预先暂停。再编辑取回全文/附件，已有草稿时弹替换/合并/取消，默认取消；快照请求 ID 保留给新入队消费。所有本地写动作与主按钮共用 `inFlightRef` 单槽。
+- 门禁：`pnpm build`（tsc + vite）通过；`pnpm check:i18n` 2660 键通过；目标 ESLint 通过；ZCode 移动端 13 个相关文件 193 passed（含新增 5 + 6 + 3 + 1）。过程偏差：部分交互测试在对应实现后补写，未全部取得严格先行 RED，不冒充完整严格 TDD。
+- Q6 未实机；Q7 仍需生产路由→假 wire 的全链、取消/重建与旧官方队列 CAS；手册/变更账本在 Q7/V0 更新。
+
+### Q7：生产路由 → 生产队列 worker → 假 wire
+
+- 新增全链回归 `outbox_http_priority_stop_and_send_cross_production_wire`：真实 router（配对 gate）→ `POST /local-queue/enqueue` B/C → 生产 `ZcodeQueueService` worker → `POST /local-queue/prioritize` C → 生产 Hub/CommandSender → 回环假官方 WS。断言忙态入队零上游帧、C 插队只产生一次 stop + 一次 C、B 留队且 `autoDrain=false`、stop/send 各一次 ACK；同 requestId 重放逐字段相同且零第二停/发。
+- 首次运行 RED：priority 返回 `no_session`。定位为入队写入的 canonicalize 路径（macOS `/tmp` → `/private/tmp`）与绑定目标字符串不等；在 `local_queue/store.rs` 增加 `workspace_matches`（字符串相等或两端 canonicalize 相等），覆盖 priority/claim/head 四处比较。修复后同一用例 GREEN。
+- 假宿主只在收到 `type=stop` 时清 `running` 并推下一水位空 control，使生产停止终态判据可满足；不把 ACK 当终态。另把旧 `/actions` Stop 的 e2e 改为断言 409 `queue_refresh_required`、零上游帧、零审计、零动作行，避免旧测试与新安全拒绝策略冲突。
+- 结果：该用例 1 passed；evidence 路由套件 39 passed。仍未跑真实宿主、真实附件删除窗口、真实取消/重建；`prioritize` 的 HTTP 取消由 Q4 任务级有界收口覆盖，未在本用例重造。
+- 过程偏差：全链测试首轮因真实路径比较缺陷 RED，属生产缺陷；不是先写好测试再实现，但失败与修复均有实际命令证据。
+
+### C1 / C2：跨供应商目录与两级选择
+
+- C1 后端：`ProviderChoice`、`SelectionView.providers`、`ControlAction::Selection.provider`、`build_selection_command_for_provider`；目录解析保留全部合法 provider 分组，模型/档位只取目标组自己的列表，未知/他组/空档位拒绝；动作指纹对 `Some(provider)` 生效、`None` 保留旧形状；Hub 确认目标 provider 与 Session 写锁。新增 RED：provider 函数不存在（选择测试无法编译）→ 实现后 3 passed；命令级 `selection_uses_target_provider_and_waits_for_it` 1 passed；HTTP `selection_provider_reaches_backend_through_action_whitelist` 1 passed。
+- C2 前端：新增 `ProviderChoice`/`ModeView` 类型与 `resolveModelChoice` 纯函数；面板增加供应商下拉，切供应商零 POST，选模型后一次提交完整三元组。纯函数缺失 RED → GREEN 3 passed；UI `provider_change_alone_emits_zero_post_then_model_sends_one_full_triple` 1 passed。不可用 provider 禁用、旧载荷仅当前 provider 兼容。
+- **偏离/风险**：G0 明确 provider 可用性字段未证实；解析只在显式 `available=false` 时关闭，缺字段按可用，属于候选级乐观假设，不能称为“跨供应商实机通过”。真实两个已配置 provider、目录缓存联动、上下文保留均 NOT RUN。
+
+### M1 / M2：R10 协作模式
+
+- 后端新增 `CollaborationMode`/`ModeView`、`switchCollaborationMode` 纯构造（payload 只含 mode + baseRevision；`edit` 只读、yolo 必须显式确认）、`normalize_mode`（`planEnabled=true` → Plan，`auto` → Build，未知不猜）、`ControlAction::Mode` 与 HTTP 白名单；`Capability::Mode` 作为第 12 项独立能力，已知 build 走接口候选、未知 build 由 switch 方法 + config.mode 形状开放，绝不借 send/approval/queue。
+- `CommandSender::execute_mode`：新鲜 ready/idle/no pending 读 → 恰一帧 → ACK 只落 accepted → 有界等 revision 前进且规范化 effectiveMode 精确相等才 confirmed；复用既有 `StopPort` 的只读 session（未另造 ModePort，属实现偏离）；Hub 的同会话写锁覆盖 Selection/Mode。
+- 新增 `mode.rs` 3 tests、命令级模式测试 1 passed、HTTP mode 白名单正向/多余字段 400 1 passed、resolver 模式独立性 1 passed、DAO 12 能力词可逆 1 passed。M2 面板：四标签、应用/取消、完全访问额外确认、ACK 不乐观改标签；UI 2 passed。真实四模式效果、原生界面同步、`planEnabled` 实机序列化、手机发送实际审批策略 NOT RUN。
+- **偏离**：`ModeView` 放在 `SelectionView.mode`，而非计划写的 `SessionView.mode`；为避免 51 处 SessionView 字面量扩散而采取该形状，API 已随 selection 下发，前端消费一致。`Mode` 能力目前无独立首次确认账本行，候选来自接口形状；这与“扩权确认”只在 UI 的 yolo 二次确认层面成立，尚未有模式动作的实机 evidence 账本。
+
+### K1 / K2：签名入口与凭据回归
+
+- K1 新增 `scripts/zcode-signed-build.mjs` + `build:macos:signed-dev`：参数数组、`shell:false`、缺身份/非 macOS 抛错且零构建、单条 `tauri build --debug --bundles app --config`，JSON 仅含 `bundle.macOS.signingIdentity`；不装证书/不读私钥/不改 ACL/不启动 App。测试缺失脚本 RED → GREEN 4 passed；`pnpm exec tauri build --help` 确认 `--config/--debug/--bundles` 存在。未用真实证书。
+- K2：`auth` 51、`credential_store` 20、`auto_connect` 22 passed；未发现新缺陷，不伪造新 RED；手册中英补齐系统“允许/始终允许”、四类签名/重编译结果和“脚本单测不等于系统提示已过”。真实 Keychain 冷启动 3 次、同身份升级、开发热重载、Windows/Linux 均 NOT RUN，R02 仍是外部条件未闭合。
+
+### V0 门禁与剩余缺口（2026-11-02）
+
+- 前端：`pnpm test` 207 files / 2536 passed、5 skipped；`pnpm check`（Prettier、ESLint、i18n 2673 键、错误码 328 码、tsc、vite）通过；`pnpm build:mobile` 通过。ESLint 仅 1 条既有 `uploadCtrlsRef` warning，无 error。
+- Rust：`cargo check --locked`（src-tauri 下）通过；`cargo test --locked --features marker-helper` 4345 passed、0 failed；`cargo test --locked --tests --features marker-helper,zcode-bridge-evidence` 4368 passed、0 failed；`cargo test --locked --lib --features marker-helper,zcode-bridge-evidence` 3838 passed、0 failed、38 ignored；两套 `cargo clippy --all-targets ... -D warnings` 与 `cargo fmt --check` 通过。
+- 真实宿主/真实凭据/真实发送停止/审批模式效果/真实 Keychain 四类/两 provider 上下文/移动真机：全部 NOT RUN。自动假链只能证明接线与守卫，不证明 R09/R10 的宿主效果或平台提示次数。
+- 仍关闭/未证：provider 可用性字段（默认可用是候选假设）；Mode 独立 evidence 账本；真实未知 build 的模型/thought 首用确认；真实附件删除窗口；官方队列 W0 写能力仍按原门；R02 证书条件。未发现新的持久秘密/正文/链接泄漏。
+- 报告复跑以最终 HEAD 为准；执行者不再自判“可合并”。以上为单会话执行与限定复审，最终仍需原聊天/独立 reviewer 复核。
+
+## R01–R10 覆盖表（最终代码；真实宿主状态单列）
+
+| 需求                     | 代码/自动证据                                                                                       | 真实宿主                                  | 结论                                       |
+| ------------------------ | --------------------------------------------------------------------------------------------------- | ----------------------------------------- | ------------------------------------------ |
+| R01 授权复用             | auth 51、auto_connect 22、凭据存储 20 passed；启动只恢复不 OAuth                                    | 真实保险箱/真实重启 NOT RUN               | 代码与假体闭合，实机未跑                   |
+| R02 钥匙串提示           | K1 signed-build 4 tests；手册四类场景；未安装证书                                                   | 三次冷启动/同身份升级/开发重编译 NOT RUN  | **外部条件未闭合**，不得称已解决           |
+| R03 队列立即显示         | Q5 路由 39、Q6 UI/flow、Q7 全链；入队零上游，刷新/重启由业务表保留                                  | 真机忙态 B/C NOT RUN                      | 自动假链闭合，实机未跑                     |
+| R04 只暂存不先发         | Q2/Q3 FIFO、Q5/Q7 enqueue、附件失效与路径复核；忙态零上游帧                                         | 真实附件删除窗口 NOT RUN                  | 代码闭合，实机未跑                         |
+| R05 指定项停止后只发一条 | Q4 stop 编排、Q5/Q7 priority；全链断言 1 stop + 1 send，B 留队                                      | 真实停止/取消 NOT RUN                     | 自动假链闭合，实机未跑                     |
+| R06 再编辑/保护草稿      | Q6 edit 快照、冲突替换/合并/取消、24h 清理；Q5 路由                                                 | 响应丢失/刷新真机 NOT RUN                 | 代码闭合，实机未跑                         |
+| R07 撤回/暂停/显式恢复   | Q2/Q3/Q4 本地 CAS、Q6 resume、旧 Stop 409；不自动恢复整队                                           | 真机并发/重启 NOT RUN                     | 代码闭合，实机未跑                         |
+| R08 同供应商模型/档位    | 既有 selection tests + C1 回归；命令仍单帧 CAS                                                      | 原有实机认可保留                          | 保持，未重写                               |
+| R09 跨供应商两级选择     | C1 parser/command/route tests；C2 provider UI；同模型不同 provider 可分                             | 两 provider 真实切换/上下文 NOT RUN       | 代码与假链闭合，**可用性字段仍为候选假设** |
+| R10 四模式               | M1 `mode.rs` 3、命令 1、HTTP 1、resolver 1、DAO 1；M2 UI 2；四标签/planEnabled/yolo 确认/ACK 不乐观 | 四模式真实效果、原生 UI、实际审批 NOT RUN | 代码与假链闭合，**实机未跑**               |
+
+继承八能力、问答/审批/正文/附件回归由 4345 项普通测试与 4368 项 evidence 集成回归覆盖；没有用“全绿”替代上表的实机未跑结论。

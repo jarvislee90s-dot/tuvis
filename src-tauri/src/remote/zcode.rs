@@ -1205,7 +1205,24 @@ const ACTION_KEYS: &[(&str, &[&str])] = &[
     ),
     (
         "selection",
-        &["kind", "sessionId", "generation", "model", "thought"],
+        &[
+            "kind",
+            "sessionId",
+            "generation",
+            "provider",
+            "model",
+            "thought",
+        ],
+    ),
+    (
+        "mode",
+        &[
+            "kind",
+            "sessionId",
+            "generation",
+            "mode",
+            "confirmFullAccess",
+        ],
     ),
     (
         "queueDelete",

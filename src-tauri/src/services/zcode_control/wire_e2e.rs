@@ -41,7 +41,7 @@ mod tests {
         RpcIdentity, REQUEST_TYPE_EVENT_LISTEN, REQUEST_TYPE_PROMISE, RESPONSE_TYPE_EVENT_FIRE,
     };
     use super::super::command::{
-        AGENT_SEND_COMMAND_METHOD, RESOLVE_INTERACTION_TYPE, SEND_TEXT_TYPE,
+        AGENT_SEND_COMMAND_METHOD, RESOLVE_INTERACTION_TYPE, SEND_TEXT_TYPE, STOP_TYPE,
     };
     use super::super::config::set_config;
     use super::super::credential_store::MemoryCredentialStore;
@@ -795,6 +795,17 @@ mod tests {
                         send_data(socket, peer.frame(&bridge, reply)).await;
                         return;
                     }
+                }
+                // 假宿主对 stop 的真实语义：清掉前台执行，随后（ACK 后）用同一水位
+                // 前进的会话快照宣告 control 空。生产 StopPort 的终态判据因此可被满足。
+                if method == AGENT_SEND_COMMAND_METHOD
+                    && send_envelope
+                        .as_ref()
+                        .and_then(|envelope| envelope.get("type"))
+                        .and_then(serde_json::Value::as_str)
+                        == Some(STOP_TYPE)
+                {
+                    *running.lock().expect("运行态锁") = None;
                 }
                 let conversation_session = if method == AGENT_SUBSCRIBE_CONVERSATION_METHOD {
                     decode_channel(&bytes).ok().and_then(|message| {
@@ -1837,6 +1848,23 @@ mod tests {
             .oneshot(action_req(body))
             .await
             .expect("请求应完成");
+        let status = resp.status();
+        (status, body_json(resp).await)
+    }
+
+    async fn post_queue(
+        app: &axum::Router,
+        action: &str,
+        body: &serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/m/api/v1/zcode/local-queue/{action}"))
+            .header("cookie", COOKIE)
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(body.to_string()))
+            .expect("queue POST 请求");
+        let resp = app.clone().oneshot(req).await.expect("请求应完成");
         let status = resp.status();
         (status, body_json(resp).await)
     }
@@ -4067,5 +4095,154 @@ mod tests {
         assert_eq!(ledger_rows(&world.store()), 0, "自动连接不得起动作账");
         assert_eq!(audit_rows(&world.store(), "zcode_send", "started"), 0);
         assert_eq!(audit_rows(&world.store(), "zcode_send", "accepted"), 0);
+    }
+    /// Q7：真实 router → 生产队列服务/worker → 生产 Hub/CommandSender → 回环假 wire。
+    ///
+    /// 不是直接调用 service：B/C 经 `POST /local-queue/enqueue` 持久化，C 经
+    /// `POST /local-queue/prioritize` 触发一次 stop + 一次 send；假宿主清掉 A 后，
+    /// 生产 stop 终态判据满足，C 成为唯一到达 wire 的正文，B 留队且队列暂停。
+    #[tokio::test]
+    async fn outbox_http_priority_stop_and_send_cross_production_wire() {
+        use crate::services::zcode_control::command::STOP_TYPE;
+        let mut policy = send_policy();
+        policy.interrupt = CapabilityFlag {
+            enabled: true,
+            reason_code: None,
+        };
+        let chain = full_chain(policy).await;
+        chain
+            .store
+            .with(|c| try_set_setting_conn(c, KEY_ENABLED, "true").unwrap());
+        let (queue, _) = chain.hub.install_queue();
+        queue.recover().await.expect("queue recovery");
+        let app = router(remote_state(
+            &chain.conn,
+            chain.hub.clone(),
+            chain.injector.clone(),
+        ));
+        bind_and_wait_ready(&app, SYNTHETIC_TASK_ID).await;
+        queue.start();
+        chain.ws.begin_running("A-execution");
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if chain.hub.session(&synthetic_target()).await.is_ok_and(|v| {
+                    v.control
+                        .as_ref()
+                        .is_some_and(|c| !c.active_works.is_empty())
+                }) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("synthetic A running");
+
+        let enqueue = |text: &str| {
+            serde_json::json!({
+                "requestId": format!("http-{text}"),
+                "sessionId": SYNTHETIC_TASK_ID,
+                "draft": {"text": text, "attachments": []},
+            })
+        };
+        assert_eq!(
+            post_queue(&app, "enqueue", &enqueue("B")).await.0,
+            StatusCode::OK
+        );
+        assert_eq!(
+            post_queue(&app, "enqueue", &enqueue("C")).await.0,
+            StatusCode::OK
+        );
+        assert!(chain.ws.commands().is_empty(), "忙态入队必须零上游帧");
+
+        let (_, view) = get_json(
+            &app,
+            &format!("/m/api/v1/zcode/local-queue?sessionId={SYNTHETIC_TASK_ID}"),
+        )
+        .await;
+        let items = view["items"].as_array().expect("队列项数组");
+        assert_eq!(items.len(), 2, "B/C 必须立即可见：{view}");
+        let c = items
+            .iter()
+            .find(|item| item["textPreview"] == "C")
+            .expect("C 在队列中");
+        let c_id = c["itemId"].as_str().expect("C itemId").to_owned();
+        let c_version = c["itemVersion"].as_u64().expect("C itemVersion");
+        let (status, operation) = post_queue(
+            &app,
+            "prioritize",
+            &serde_json::json!({
+                "requestId": "http-priority-C",
+                "itemId": c_id,
+                "expectedVersion": c_version,
+                "confirmStop": true,
+                "expectedExecutionId": "A-execution",
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "priority 必须受理：{operation}");
+        assert_eq!(
+            operation["state"], "completed",
+            "stop 终态确认后只派 C，operation 必须 completed：{operation}"
+        );
+
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                if chain.ws.commands().len() >= 2 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("stop + C 应到达假 wire");
+        let commands = chain.ws.commands();
+        let stops = commands
+            .iter()
+            .filter(|command| command["envelope"]["type"] == STOP_TYPE)
+            .count();
+        let sends = commands
+            .iter()
+            .filter(|command| command["envelope"]["type"] == SEND_TEXT_TYPE)
+            .collect::<Vec<_>>();
+        assert_eq!(stops, 1, "只允许一次定向 stop：{commands:?}");
+        assert_eq!(sends.len(), 1, "只允许发送 C 一条：{commands:?}");
+        assert_eq!(sends[0]["envelope"]["payload"]["text"], "C");
+        assert_eq!(chain.ws.send_acks().len(), 2, "stop/send 各一次 ACK");
+
+        // 同 requestId 重放（客户端取消/重连后查询）只返回原操作，绝不再停/再发。
+        let (replay_status, replay) = post_queue(
+            &app,
+            "prioritize",
+            &serde_json::json!({
+                "requestId": "http-priority-C",
+                "itemId": c_id,
+                "expectedVersion": c_version,
+                "confirmStop": true,
+                "expectedExecutionId": "A-execution",
+            }),
+        )
+        .await;
+        assert_eq!(
+            replay_status,
+            StatusCode::OK,
+            "重放必须取回原操作：{replay}"
+        );
+        assert_eq!(replay, operation, "重放回执必须逐字段一致");
+        assert_eq!(chain.ws.commands().len(), 2, "重放不得产生第二停/第二发");
+
+        let (_, after) = get_json(
+            &app,
+            &format!("/m/api/v1/zcode/local-queue?sessionId={SYNTHETIC_TASK_ID}"),
+        )
+        .await;
+        assert_eq!(after["autoDrain"], false, "插队后其余项必须暂停");
+        assert!(
+            after["items"]
+                .as_array()
+                .is_some_and(|items| items.iter().any(|item| item["textPreview"] == "B")),
+            "B 必须留队：{after}"
+        );
+        queue.shutdown();
     }
 }

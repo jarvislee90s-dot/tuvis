@@ -44,6 +44,7 @@ pub mod config;
 pub(crate) mod credential_store;
 mod host;
 pub mod hub;
+pub mod mode;
 pub mod pending;
 pub mod projection;
 pub mod relay;
@@ -99,10 +100,10 @@ pub use relay::{
 pub use selection::{build_selection_command, parse_selection_view, SWITCH_MODEL_CONFIG_TYPE};
 pub use types::{
     codes, ActionContext, ActionReceipt, ActionState, ActiveWork, AnswerEntry, BoundTarget,
-    CapabilityFlag, CapabilitySource, CapabilityView, CommandPort, ConnectionState, ConnectionView,
-    ControlAction, ControlEvent, ControlEventKind, ControlView, HostBuildProbe, HostEvidence,
-    ModelChoice, PendingKind, PendingPort, PendingView, PermissionOptionView, QuestionOption,
-    QuestionView, QueueItemView, QueueView, RelaySink, SelectionPort, SelectionView, SessionView,
-    StopPort, StopRequest, TargetKey, ZResult, ZcodeError, PENDING_CLEARED_POLL, SELECTION_POLL,
-    STOP_CLEARED_POLL, WRITABLE_DISPATCH_STATES,
+    CapabilityFlag, CapabilitySource, CapabilityView, CollaborationMode, CommandPort,
+    ConnectionState, ConnectionView, ControlAction, ControlEvent, ControlEventKind, ControlView,
+    HostBuildProbe, HostEvidence, ModeView, ModelChoice, PendingKind, PendingPort, PendingView,
+    PermissionOptionView, QuestionOption, QuestionView, QueueItemView, QueueView, RelaySink,
+    SelectionPort, SelectionView, SessionView, StopPort, StopRequest, TargetKey, ZResult,
+    ZcodeError, PENDING_CLEARED_POLL, SELECTION_POLL, STOP_CLEARED_POLL, WRITABLE_DISPATCH_STATES,
 };

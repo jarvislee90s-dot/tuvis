@@ -26,7 +26,8 @@
     "check:i18n": "node scripts/check-i18n.mjs",
     "test": "vitest run",
     "test:watch": "vitest",
-    "test:coverage": "vitest run --coverage"
+    "test:coverage": "vitest run --coverage",
+    "build:macos:signed-dev": "node scripts/zcode-signed-build.mjs"
   },
   "dependencies": {
     "@tailwindcss/vite": "^4.3.3",

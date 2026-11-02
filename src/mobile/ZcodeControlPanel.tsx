@@ -18,6 +18,15 @@ import {
 import i18n from "@/i18n";
 import {
   isZcodeErrorCode,
+  enqueueZcodeMessage,
+  editZcodeQueuedMessage,
+  finishZcodeEdit,
+  getZcodeEditSnapshot,
+  prioritizeZcodeMessage,
+  resumeZcodeLocalQueue,
+  retractZcodeQueuedMessage,
+  type CollaborationMode,
+  type EditResult,
   type ActionReceipt,
   type ConnectionView,
   type ControlAction,
@@ -29,6 +38,10 @@ import {
   ZcodeControlApiError,
 } from "@/lib/api/zcodeControl";
 import useZcodeControl from "./useZcodeControl";
+import ZcodeLocalQueuePanel from "./ZcodeLocalQueuePanel";
+import { zcodeQueuePreview } from "./zcode-local-queue-state";
+import { resolveModelChoice } from "./zcode-selection-state";
+import { newActionId } from "./codexIpcApi";
 import ZcodePendingCard, { STATUS_KEYS, pendingDomId, zcodeReasonText } from "./ZcodePendingCard";
 import ZcodeQueuePanel, { dispatchWritable } from "./ZcodeQueuePanel";
 import { deriveZcodePrimaryAction } from "./zcode-primary-action";
@@ -103,8 +116,17 @@ function actionGateReason(
 }
 
 export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps) {
-  const { connection, session, reason, submitting, draftCleared, submit, refresh } =
-    useZcodeControl(sessionId);
+  const {
+    connection,
+    session,
+    localQueue,
+    reason,
+    submitting,
+    draftCleared,
+    submit,
+    refresh,
+    refreshLocalQueue,
+  } = useZcodeControl(sessionId);
   const [draft, setDraft] = useState("");
   /**
    * `inputRouting.mode="choice"` + 非空队列：发送前必须让用户显式选择旧队列处置
@@ -158,6 +180,25 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
   const [queueBusyItemId, setQueueBusyItemId] = useState<string | null>(null);
   /** 「恢复运行」在途。 */
   const [queueBusyResume, setQueueBusyResume] = useState(false);
+  /** 本地待发队列的入队/单条编排在途（与主按钮共用单写槽）。 */
+  const [localQueueBusy, setLocalQueueBusy] = useState(false);
+  const [localQueueNotice, setLocalQueueNotice] = useState<string | null>(null);
+  const [localQueueError, setLocalQueueError] = useState<ZcodeErrorCode | "unknown" | null>(null);
+  const [priorityPrompt, setPriorityPrompt] = useState<{ itemId: string; version: number } | null>(
+    null
+  );
+  const [editConflict, setEditConflict] = useState<{
+    requestId: string;
+    result: EditResult;
+  } | null>(null);
+  /** 最近一次“再编辑”的请求 ID：新入队时带给服务端消费快照。 */
+  const editedFromRef = useRef<string | null>(null);
+  /** 网络未知的入队请求：同草稿/同附件重试必须复用原 requestId，绝不换 ID 再登记一份。 */
+  const lastEnqueueRef = useRef<{
+    requestId: string;
+    text: string;
+    paths: string[];
+  } | null>(null);
   /** 队列动作的可见结果（撤回完成/结果不确定/失败原因）。 */
   const [queueNotice, setQueueNotice] = useState<QueueNotice | null>(null);
   /** 只有**新鲜**队列 `paused=false` 才为 true（此前绝不说「已恢复」）。 */
@@ -226,6 +267,12 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
     setQueueBusyResume(false);
     setQueueNotice(null);
     setResumeConfirmed(false);
+    setLocalQueueBusy(false);
+    setLocalQueueNotice(null);
+    setLocalQueueError(null);
+    setPriorityPrompt(null);
+    setEditConflict(null);
+    editedFromRef.current = null;
     setCopyFallback(null);
     setCopyDone(false);
     // 三轮 C：附件与在途上传不跨会话残留。
@@ -235,6 +282,8 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
     setAttachHintOpen(false);
     // 切组选择不跨会话残留（旧会话的 interaction id 在新会话没有意义）。
     setPendingTabId(null);
+    setPendingProvider(null);
+    setPendingModel(null);
     // 抢回面同样不跨会话残留（T8）。
     setTakeoverBusy(false);
     setTakeoverStillConflict(false);
@@ -358,6 +407,11 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
   const stopTarget = stopTargets.length === 1 ? stopTargets[0].foregroundExecutionId : null;
   /** 官方新鲜 control 判定「运行中」（不看看板颜色、不猜本地忙态）。 */
   const running = stopTargets.length > 0;
+  /** 运行时/本地已有待发/队列暂停：普通发送先进入 Tuvis 待发，不直接抢上游。 */
+  const sendUsesOutbox =
+    running ||
+    localQueue?.autoDrain === false ||
+    (localQueue?.items.some((item) => item.state === "queued") ?? false);
   /**
    * 附件闸：上传中/失败条目在列 → 此刻不可发送（沿用既有提示阻止发送）。附件在途
    * 时主按钮**留在发送位**、绝不翻成打断（用户正在组装消息，不能被静默换成打断）。
@@ -392,7 +446,7 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
     !attachmentBlocked &&
     !staleGeneration;
   /** 在途（任一动作 POST 未回，**含队列动作**）→ 主按钮禁用：零第二个动作。 */
-  const busy = submitting || queueBusyItemId !== null || queueBusyResume;
+  const busy = submitting || queueBusyItemId !== null || queueBusyResume || localQueueBusy;
   /** 主按钮唯一动作（纯函数推导，见 zcode-primary-action.ts）。 */
   const primaryAction = deriveZcodePrimaryAction({
     hasContent,
@@ -559,6 +613,70 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
     });
   };
 
+  /**
+   * 忙态入队（Q6）：只创建 Tuvis 待发项，绝不直接 POST `/zcode/actions send`。
+   * 成功回执不等于宿主受理；清的是**本次提交**的草稿/附件，续写的新内容保留。
+   */
+  const submitEnqueue = () => {
+    if (!sendAllowed || session === null || inFlightRef.current) return;
+    const current = attachmentsRef.current;
+    const ready = current.filter((a) => a.status === "ready" && a.path !== undefined);
+    if (draft.trim().length === 0 && ready.length === 0) return;
+    const submittedText = draft;
+    const submittedIds = ready.map((a) => a.id);
+    const submittedPaths = ready.map((a) => a.path as string);
+    const previous = lastEnqueueRef.current;
+    const requestId =
+      previous !== null &&
+      previous.text === submittedText &&
+      previous.paths.length === submittedPaths.length &&
+      previous.paths.every((path, index) => path === submittedPaths[index])
+        ? previous.requestId
+        : newActionId();
+    lastEnqueueRef.current = { requestId, text: submittedText, paths: submittedPaths };
+    const editedFrom = editedFromRef.current;
+    inFlightRef.current = true;
+    setLocalQueueBusy(true);
+    setLocalQueueNotice(null);
+    setLocalQueueError(null);
+    void enqueueZcodeMessage({
+      requestId,
+      sessionId,
+      draft: {
+        text: draft,
+        attachments: ready.map((a) => ({
+          name: a.name,
+          path: a.path as string,
+          isImage: a.isImage,
+        })),
+      },
+      ...(editedFrom === null ? {} : { editedFrom }),
+    })
+      .then(async () => {
+        if (!aliveRef.current) return;
+        await refreshLocalQueue();
+        if (!aliveRef.current) return;
+        if (draftRef.current === submittedText) {
+          updateDraft("");
+          editedFromRef.current = null;
+        }
+        setAttachments((prev) => prev.filter((a) => !submittedIds.includes(a.id)));
+        lastEnqueueRef.current = null;
+        setLocalQueueNotice("added");
+      })
+      .catch((error: unknown) => {
+        // 4xx 是确定拒绝（换 ID 才可能成功）；网络/5xx 保留 ID，用户重试时幂等复用。
+        if (error instanceof ZcodeControlApiError && error.status !== null && error.status < 500) {
+          lastEnqueueRef.current = null;
+        }
+        if (aliveRef.current) setLocalQueueError(queueErrorCode(error));
+      })
+      .finally(() => {
+        inFlightRef.current = false;
+        if (aliveRef.current) setLocalQueueBusy(false);
+      });
+  };
+
   const handleSend = () => {
     if (primaryAction !== "send") return;
     if (!sendAllowed || session === null || inFlightRef.current) return;
@@ -567,6 +685,11 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
     const text = draft.trim();
     // 空正文绝不 POST（按钮是控制通道占位，不是「发空消息」的许可）。
     if (text.length === 0 && markup.length === 0) return;
+    // 运行中/已有待发：先入队，绝不越过本地队列直接发上游。
+    if (sendUsesOutbox) {
+      submitEnqueue();
+      return;
+    }
     // 官方 `choice` + 非空队列：先让用户显式决定旧队列的处置（保留/清空/取消）。
     // 取消不发；确认后**一次** send（新 actionId）。UI 绝不默认清空。
     if (session.inputRouting?.mode === "choice" && (session.queue?.items.length ?? 0) > 0) {
@@ -864,6 +987,12 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
     if (view.queue?.paused !== true) return;
     setQueueNotice(null);
     setResumeConfirmed(false);
+    setLocalQueueBusy(false);
+    setLocalQueueNotice(null);
+    setLocalQueueError(null);
+    setPriorityPrompt(null);
+    setEditConflict(null);
+    editedFromRef.current = null;
     setQueueBusyResume(true);
     void (async () => {
       try {
@@ -903,6 +1032,210 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
     })();
   };
 
+  // ==== Q6：Tuvis 本地待发（入队/插队/再编辑/撤回/继续）====
+  const localQueueWritable = gateReason === null && !staleGeneration;
+
+  const refreshLocalView = async () => {
+    await refreshLocalQueue();
+    // 会话投影也重拉：官方运行态/队列可能在同一帧变化，单条编排的后续判断要新鲜。
+    void refresh();
+  };
+
+  const runPriority = (itemId: string, version: number, executionId: string | null) => {
+    if (!localQueueWritable || inFlightRef.current) return;
+    const view = sessionRef.current;
+    if (view === null) return;
+    const heldQueue =
+      view.inputRouting?.mode === "choice" && (view.queue?.items.length ?? 0) > 0
+        ? {
+            disposition: "keepQueueAndSend" as const,
+            expectedQueueItemIds: view.queue?.items.map((item) => item.inputId) ?? [],
+          }
+        : undefined;
+    setPriorityPrompt(null);
+    setLocalQueueNotice(null);
+    setLocalQueueError(null);
+    inFlightRef.current = true;
+    setLocalQueueBusy(true);
+    void prioritizeZcodeMessage({
+      requestId: newActionId(),
+      itemId,
+      expectedVersion: version,
+      confirmStop: executionId !== null,
+      expectedExecutionId: executionId,
+      ...(heldQueue === undefined ? {} : { heldQueue }),
+    })
+      .then(async (operation) => {
+        if (!aliveRef.current) return;
+        if (operation.state === "failed") {
+          const code = operation.receipt?.reasonCode ?? operation.stopFailure?.code ?? "unknown";
+          setLocalQueueError(isZcodeErrorCode(code) ? code : "unknown");
+        } else if (operation.state === "completed") {
+          setLocalQueueNotice("priority_done");
+        } else {
+          // in_flight/未知都不能显示成“已发送”；只提示待核对。
+          setLocalQueueNotice("priority_unknown");
+        }
+        await refreshLocalView();
+      })
+      .catch((error: unknown) => {
+        if (aliveRef.current) setLocalQueueError(queueErrorCode(error));
+      })
+      .finally(() => {
+        inFlightRef.current = false;
+        if (aliveRef.current) setLocalQueueBusy(false);
+      });
+  };
+
+  const handleLocalPrioritize = (itemId: string, version: number) => {
+    if (!localQueueWritable || inFlightRef.current) return;
+    if (!running) {
+      runPriority(itemId, version, null);
+      return;
+    }
+    if (stopTarget === null) {
+      setLocalQueueError("target_ambiguous");
+      return;
+    }
+    setLocalQueueError(null);
+    setLocalQueueNotice(null);
+    setPriorityPrompt({ itemId, version });
+  };
+
+  const applyEditResult = (result: EditResult, merge: boolean) => {
+    const restored = result.draft.attachments.map((attachment) => ({
+      id: newAttachmentId(),
+      name: attachment.name,
+      isImage: attachment.isImage,
+      status: "ready" as const,
+      path: attachment.path,
+    }));
+    if (merge) {
+      updateDraft(
+        draftRef.current.length === 0
+          ? result.draft.text
+          : `${draftRef.current}\n${result.draft.text}`
+      );
+      setAttachments((prev) => [...prev, ...restored]);
+    } else {
+      updateDraft(result.draft.text);
+      setAttachments(restored);
+    }
+    editedFromRef.current = result.requestId;
+    setEditConflict(null);
+    setLocalQueueNotice("edit_restored");
+    void refreshLocalView();
+  };
+
+  const handleLocalEdit = (itemId: string, version: number) => {
+    if (!localQueueWritable || inFlightRef.current) return;
+    setLocalQueueNotice(null);
+    setLocalQueueError(null);
+    inFlightRef.current = true;
+    setLocalQueueBusy(true);
+    void editZcodeQueuedMessage({ requestId: newActionId(), itemId, expectedVersion: version })
+      .then((result) => {
+        if (!aliveRef.current) return;
+        if (
+          draftRef.current.trim().length > 0 ||
+          attachmentsRef.current.some((a) => a.status === "ready")
+        ) {
+          setEditConflict({ requestId: result.requestId, result });
+        } else {
+          applyEditResult(result, false);
+        }
+      })
+      .catch((error: unknown) => {
+        if (aliveRef.current) setLocalQueueError(queueErrorCode(error));
+      })
+      .finally(() => {
+        inFlightRef.current = false;
+        if (aliveRef.current) setLocalQueueBusy(false);
+      });
+  };
+
+  const handleRecoverEdit = (requestId: string) => {
+    if (!localQueueWritable || inFlightRef.current) return;
+    setLocalQueueError(null);
+    inFlightRef.current = true;
+    setLocalQueueBusy(true);
+    void getZcodeEditSnapshot(requestId)
+      .then((result) => {
+        if (!aliveRef.current) return;
+        if (
+          draftRef.current.trim().length > 0 ||
+          attachmentsRef.current.some((a) => a.status === "ready")
+        ) {
+          setEditConflict({ requestId, result });
+        } else {
+          applyEditResult(result, false);
+        }
+      })
+      .catch((error: unknown) => {
+        if (aliveRef.current) setLocalQueueError(queueErrorCode(error));
+      })
+      .finally(() => {
+        inFlightRef.current = false;
+        if (aliveRef.current) setLocalQueueBusy(false);
+      });
+  };
+
+  const handleEditConflictCancel = () => {
+    const current = editConflict;
+    setEditConflict(null);
+    if (current !== null) {
+      void finishZcodeEdit(current.requestId)
+        .then(() => refreshLocalView())
+        .catch(() => {});
+    }
+  };
+
+  const handleLocalRetract = (itemId: string, version: number) => {
+    if (!localQueueWritable || inFlightRef.current) return;
+    setLocalQueueNotice(null);
+    setLocalQueueError(null);
+    inFlightRef.current = true;
+    setLocalQueueBusy(true);
+    void retractZcodeQueuedMessage({ requestId: newActionId(), itemId, expectedVersion: version })
+      .then(() => {
+        if (!aliveRef.current) return;
+        setLocalQueueNotice("retracted");
+        return refreshLocalView();
+      })
+      .catch((error: unknown) => {
+        if (aliveRef.current) setLocalQueueError(queueErrorCode(error));
+      })
+      .finally(() => {
+        inFlightRef.current = false;
+        if (aliveRef.current) setLocalQueueBusy(false);
+      });
+  };
+
+  const handleLocalResume = () => {
+    if (!localQueueWritable || inFlightRef.current || localQueue === null) return;
+    setLocalQueueNotice(null);
+    setLocalQueueError(null);
+    inFlightRef.current = true;
+    setLocalQueueBusy(true);
+    void resumeZcodeLocalQueue({
+      requestId: newActionId(),
+      sessionId,
+      expectedQueueVersion: localQueue.version,
+    })
+      .then(() => {
+        if (!aliveRef.current) return;
+        setLocalQueueNotice("resumed");
+        return refreshLocalView();
+      })
+      .catch((error: unknown) => {
+        if (aliveRef.current) setLocalQueueError(queueErrorCode(error));
+      })
+      .finally(() => {
+        inFlightRef.current = false;
+        if (aliveRef.current) setLocalQueueBusy(false);
+      });
+  };
+
   /** 「复制原文」人工兜底：剪贴板不可用（非安全上下文/jsdom）→ 只读文本框给全文。 */
   const copyOriginal = async (text: string) => {
     setCopyDone(false);
@@ -918,11 +1251,71 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
     setCopyFallback(text);
   };
 
-  // 模型/档位：目录只来自 session.selection（当前 provider）；写面硬门 + 能力两闸
-  // 同开才可提交，任一关闭 → 两个控件都禁用并显示可见原因。
+  // 模型/档位：目录只来自 session.selection；供应商分组来自官方目录。provider
+  // 只改变本地待选组合（零 POST），选定模型后才提交一次完整三元组。
   const selection = session?.selection ?? null;
+  const [pendingProvider, setPendingProvider] = useState<string | null>(null);
+  const [pendingModel, setPendingModel] = useState<string | null>(null);
+  const providerGroups = selection?.providers ?? [];
+  const activeProviderId = pendingProvider ?? selection?.provider ?? "";
+  const activeProvider =
+    providerGroups.find(
+      (candidate) => candidate.providerId === activeProviderId && candidate.available
+    ) ?? null;
+  const activeModels =
+    activeProvider?.models ??
+    (selection !== null && activeProviderId === selection.provider ? selection.models : []);
+  const preferredModel =
+    pendingModel ??
+    (selection !== null && activeProviderId === selection.provider ? selection.model : null);
   const currentChoice =
-    selection?.models.find((choice) => choice.modelId === selection.model) ?? null;
+    activeModels.find((choice) => choice.modelId === preferredModel) ?? activeModels[0] ?? null;
+  // 官方配置落地（或切会话清空）后回到服务端当前组合；失败/在途期间保留用户待选值。
+  useEffect(() => {
+    setPendingProvider(null);
+    setPendingModel(null);
+  }, [selection?.provider, selection?.model, selection?.thought]);
+
+  // ==== R10：协作模式（独立能力槽；ACK 不乐观改确认标签）====
+  const modeView = selection?.mode ?? null;
+  const effectiveMode = modeView?.effectiveMode ?? null;
+  const [pendingMode, setPendingMode] = useState<CollaborationMode | "">("");
+  const [modeConfirmOpen, setModeConfirmOpen] = useState(false);
+  useEffect(() => {
+    setPendingMode(effectiveMode ?? "");
+    setModeConfirmOpen(false);
+  }, [effectiveMode, sessionId]);
+  const modeLabels: Record<CollaborationMode, string> = {
+    plan: "mobile.zcodeControl.modePlan",
+    build: "mobile.zcodeControl.modeBuild",
+    guarded: "mobile.zcodeControl.modeGuarded",
+    yolo: "mobile.zcodeControl.modeYolo",
+    edit: "mobile.zcodeControl.modeEdit",
+  };
+  const modeEnabled =
+    gateReason === null &&
+    session !== null &&
+    session.capabilities.mode?.enabled === true &&
+    !staleGeneration &&
+    modeView !== null;
+  const submitMode = (mode: CollaborationMode) => {
+    if (session === null || !modeEnabled) return;
+    runOnce({
+      kind: "mode",
+      sessionId,
+      generation: session.generation,
+      mode,
+      confirmFullAccess: mode === "yolo",
+    });
+  };
+  const applyMode = () => {
+    if (pendingMode === "" || pendingMode === effectiveMode) return;
+    if (pendingMode === "yolo") {
+      setModeConfirmOpen(true);
+      return;
+    }
+    submitMode(pendingMode);
+  };
   const selectionEnabled =
     gateReason === null &&
     session?.capabilities.model.enabled === true &&
@@ -937,26 +1330,47 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
       ? selection.thought
       : (currentChoice?.thoughtLevels[0] ?? "");
 
-  const submitSelection = (model: string, thought: string) => {
+  const submitSelection = (model: string, thought: string, provider?: string) => {
     if (session === null || !selectionEnabled || thought === "") return;
-    runOnce({ kind: "selection", sessionId, generation: session.generation, model, thought });
+    runOnce({
+      kind: "selection",
+      sessionId,
+      generation: session.generation,
+      ...(provider === undefined ? {} : { provider }),
+      model,
+      thought,
+    });
+  };
+
+  const handleProviderChange = (providerId: string) => {
+    if (selection === null || providerId === activeProviderId) return;
+    if (!providerGroups.some((group) => group.providerId === providerId && group.available)) {
+      return;
+    }
+    // 只更新待选组合；不写 provider-only 中间态。
+    setPendingProvider(providerId);
+    setPendingModel(null);
   };
 
   const handleModelChange = (modelId: string) => {
-    const choice = selection?.models.find((candidate) => candidate.modelId === modelId);
-    if (choice === undefined) return;
-    // 换模型时档位落在新模型的合法值里：保持旧档位，否则取首档。
-    const thought = selection?.thought;
-    const kept =
-      thought != null && choice.thoughtLevels.includes(thought)
-        ? thought
-        : (choice.thoughtLevels[0] ?? "");
-    submitSelection(modelId, kept);
+    if (selection === null) return;
+    const resolved = resolveModelChoice(selection, activeProviderId, modelId);
+    if (resolved === null) return;
+    setPendingModel(resolved.model);
+    submitSelection(
+      resolved.model,
+      resolved.thought,
+      providerGroups.length === 0 ? undefined : activeProviderId
+    );
   };
 
   const handleThoughtChange = (thought: string) => {
     if (selection === null || currentChoice?.thoughtLevels.includes(thought) !== true) return;
-    submitSelection(selection.model, thought);
+    submitSelection(
+      currentChoice.modelId,
+      thought,
+      providerGroups.length === 0 ? undefined : activeProviderId
+    );
   };
 
   return (
@@ -1099,6 +1513,139 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
             />
           </div>
         ))}
+      {/* Tuvis 本地待发（Q6）：与官方队列分开来源；默认展开，显示位次/摘要/三按钮。 */}
+      <ZcodeLocalQueuePanel
+        view={localQueue}
+        busy={busy || !localQueueWritable || editConflict !== null || priorityPrompt !== null}
+        onPrioritize={handleLocalPrioritize}
+        onEdit={handleLocalEdit}
+        onRetract={handleLocalRetract}
+        onResume={handleLocalResume}
+        onRecoverEdit={handleRecoverEdit}
+      />
+      {localQueueNotice !== null && (
+        <p
+          data-testid="zcode-local-queue-notice"
+          data-state={localQueueNotice}
+          className="mb-2 text-xs text-[var(--mut)]"
+        >
+          {i18n.t(
+            localQueueNotice === "added"
+              ? "mobile.zcodeControl.localQueueAdded"
+              : localQueueNotice === "priority_unknown"
+                ? "mobile.zcodeControl.localQueuePriorityUnknown"
+                : localQueueNotice === "priority_done"
+                  ? "mobile.zcodeControl.localQueuePriorityDone"
+                  : localQueueNotice === "retracted"
+                    ? "mobile.zcodeControl.localQueueRetractDone"
+                    : localQueueNotice === "resumed"
+                      ? "mobile.zcodeControl.localQueueResumeDone"
+                      : localQueueNotice === "edit_restored"
+                        ? "mobile.zcodeControl.localQueueEditRestored"
+                        : "mobile.zcodeControl.localQueueEditConflict"
+          )}
+        </p>
+      )}
+      {localQueueError !== null && (
+        <p
+          data-testid="zcode-local-queue-error"
+          data-reason-code={localQueueError}
+          className="mb-2 text-xs text-[var(--mut)]"
+        >
+          {zcodeReasonText(localQueueError)}
+        </p>
+      )}
+      {priorityPrompt !== null && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="zcode-priority-title"
+          data-testid="zcode-priority-dialog"
+          className="mb-2 rounded-lg border border-[var(--cb)] bg-[var(--cbg)] p-2"
+        >
+          <p id="zcode-priority-title" className="text-xs font-medium text-[var(--tx)]">
+            {i18n.t("mobile.zcodeControl.localQueuePriorityTitle")}
+          </p>
+          <p className="mt-1 text-[11px] leading-4 text-[var(--mut)]">
+            {i18n.t("mobile.zcodeControl.localQueuePriorityHint")}
+          </p>
+          <div className="mt-2 flex flex-wrap gap-2">
+            <button
+              type="button"
+              data-testid="zcode-priority-confirm"
+              onClick={() => {
+                const current = sessionRef.current;
+                const execution = current?.control?.activeWorks.filter(
+                  (work) => work.kind === "primaryTurn" && work.foregroundExecutionId !== null
+                );
+                if (current === null || execution?.length !== 1) {
+                  setPriorityPrompt(null);
+                  setLocalQueueError("target_ambiguous");
+                  return;
+                }
+                runPriority(
+                  priorityPrompt.itemId,
+                  priorityPrompt.version,
+                  execution[0].foregroundExecutionId
+                );
+              }}
+              className="rounded-lg border border-[var(--cb)] px-3 py-1.5 text-xs text-[var(--tx)]"
+            >
+              {i18n.t("mobile.zcodeControl.localQueuePriorityConfirm")}
+            </button>
+            <button
+              type="button"
+              data-testid="zcode-priority-cancel"
+              onClick={() => setPriorityPrompt(null)}
+              className="rounded-lg px-3 py-1.5 text-xs text-[var(--mut)]"
+            >
+              {i18n.t("mobile.zcodeControl.localQueuePriorityCancel")}
+            </button>
+          </div>
+        </div>
+      )}
+      {editConflict !== null && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="zcode-edit-conflict-title"
+          data-testid="zcode-edit-conflict-dialog"
+          className="mb-2 rounded-lg border border-[var(--cb)] bg-[var(--cbg)] p-2"
+        >
+          <p id="zcode-edit-conflict-title" className="text-xs font-medium text-[var(--tx)]">
+            {i18n.t("mobile.zcodeControl.localQueueEditConflict")}
+          </p>
+          <p className="mt-1 text-[11px] leading-4 whitespace-pre-wrap text-[var(--mut)]">
+            {zcodeQueuePreview(editConflict.result.draft.text, 80)}
+          </p>
+          <div className="mt-2 flex flex-wrap gap-2">
+            <button
+              type="button"
+              data-testid="zcode-edit-conflict-replace"
+              onClick={() => applyEditResult(editConflict.result, false)}
+              className="rounded-lg border border-[var(--cb)] px-3 py-1.5 text-xs text-[var(--tx)]"
+            >
+              {i18n.t("mobile.zcodeControl.localQueueEditReplace")}
+            </button>
+            <button
+              type="button"
+              data-testid="zcode-edit-conflict-merge"
+              onClick={() => applyEditResult(editConflict.result, true)}
+              className="rounded-lg border border-[var(--cb)] px-3 py-1.5 text-xs text-[var(--tx)]"
+            >
+              {i18n.t("mobile.zcodeControl.localQueueEditMerge")}
+            </button>
+            <button
+              type="button"
+              data-testid="zcode-edit-conflict-cancel"
+              onClick={handleEditConflictCancel}
+              className="rounded-lg px-3 py-1.5 text-xs text-[var(--mut)]"
+            >
+              {i18n.t("mobile.zcodeControl.localQueueEditCancel")}
+            </button>
+          </div>
+        </div>
+      )}
       {/* 官方输入队列（W4）：默认一行（数量 + 暂停 + 恢复运行），点开才列条目。
           每行「序号 → 20 字素预览 → 引导/修改/撤回」；所有写动作只传官方 inputId，
           由本面板负责生成信封、验证新鲜队列与安全降级。未知/空队列不占位。 */}
@@ -1196,6 +1743,26 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
           )}
           {selection !== null && (
             <>
+              {providerGroups.length > 0 && (
+                <select
+                  data-testid="zcode-provider-select"
+                  aria-label={i18n.t("mobile.zcodeControl.providerAria")}
+                  value={activeProviderId}
+                  disabled={!selectionEnabled}
+                  onChange={(e) => handleProviderChange(e.target.value)}
+                  className="max-w-[45%] shrink-0 rounded-lg border border-[var(--cb)] px-2 py-1 text-sm text-[var(--tx)] disabled:opacity-40"
+                >
+                  {providerGroups.map((group) => (
+                    <option
+                      key={group.providerId}
+                      value={group.providerId}
+                      disabled={!group.available}
+                    >
+                      {group.label}
+                    </option>
+                  ))}
+                </select>
+              )}
               {/* 模型 select：可伸缩 + 省略显示长名；title 保留全名（可访问全名）。
                   不用 truncate 类：原生 select 上的 overflow-hidden 会连下拉箭头一起
                   裁掉（Chrome 实测），浏览器的文本裁剪已足够，长名靠 title + option
@@ -1203,13 +1770,13 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
               <select
                 data-testid="zcode-model-select"
                 aria-label={i18n.t("mobile.zcodeControl.modelAria")}
-                title={selection.model}
-                value={selection.model}
-                disabled={!selectionEnabled}
+                title={currentChoice?.modelId ?? selection.model}
+                value={currentChoice?.modelId ?? ""}
+                disabled={!selectionEnabled || activeModels.length === 0}
                 onChange={(e) => handleModelChange(e.target.value)}
                 className="max-w-full min-w-[4rem] flex-1 rounded-lg border border-[var(--cb)] px-2 py-1 text-sm text-[var(--tx)] disabled:opacity-40"
               >
-                {selection.models.map((choice) => (
+                {activeModels.map((choice) => (
                   <option key={choice.modelId} value={choice.modelId}>
                     {choice.modelId}
                   </option>
@@ -1243,6 +1810,99 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
         >
           {zcodeReasonText(selectionReason)}
         </p>
+      )}
+      {modeView !== null && (
+        <div
+          data-testid="zcode-mode-bar"
+          className="mb-2 flex flex-wrap items-center gap-2 text-xs text-[var(--tx)]"
+        >
+          <span className="text-[11px] text-[var(--mut)]">
+            {i18n.t("mobile.zcodeControl.modeAria")}
+          </span>
+          <span data-testid="zcode-mode-current" data-mode={effectiveMode ?? "unknown"}>
+            {effectiveMode === null
+              ? i18n.t("mobile.zcodeControl.modeReason")
+              : i18n.t(modeLabels[effectiveMode])}
+          </span>
+          <select
+            data-testid="zcode-mode-select"
+            aria-label={i18n.t("mobile.zcodeControl.modeAria")}
+            value={pendingMode}
+            disabled={!modeEnabled}
+            onChange={(e) => setPendingMode(e.target.value as CollaborationMode | "")}
+            className="rounded-lg border border-[var(--cb)] px-2 py-1 text-xs text-[var(--tx)] disabled:opacity-40"
+          >
+            {pendingMode === "" && <option value="">—</option>}
+            {(["plan", "build", "guarded", "yolo"] as const).map((mode) => (
+              <option key={mode} value={mode}>
+                {i18n.t(modeLabels[mode])}
+              </option>
+            ))}
+            {effectiveMode === "edit" && (
+              <option value="edit" disabled>
+                {i18n.t(modeLabels.edit)}
+              </option>
+            )}
+          </select>
+          <button
+            type="button"
+            data-testid="zcode-mode-apply"
+            disabled={!modeEnabled || pendingMode === "" || pendingMode === effectiveMode}
+            onClick={applyMode}
+            className="rounded-full border border-[var(--cb)] px-2 py-1 text-xs text-[var(--tx)] disabled:opacity-40"
+          >
+            {i18n.t("mobile.zcodeControl.modeApply")}
+          </button>
+          {!modeEnabled && modeView !== null && (
+            <span
+              data-testid="zcode-mode-reason"
+              data-reason-code={session?.capabilities.mode?.reasonCode ?? "not_ready"}
+              className="text-[11px] text-[var(--mut)]"
+            >
+              {zcodeReasonText(session?.capabilities.mode?.reasonCode ?? "not_ready")}
+            </span>
+          )}
+        </div>
+      )}
+      {modeConfirmOpen && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="zcode-mode-confirm-title"
+          data-testid="zcode-mode-confirm-dialog"
+          className="mb-2 rounded-lg border border-[var(--cb)] bg-[var(--cbg)] p-2"
+        >
+          <p id="zcode-mode-confirm-title" className="text-xs font-medium text-[var(--tx)]">
+            {i18n.t("mobile.zcodeControl.modeConfirmTitle")}
+          </p>
+          <p className="mt-1 text-[11px] leading-4 text-[var(--mut)]">
+            {i18n.t("mobile.zcodeControl.modeConfirmHint")}
+          </p>
+          <div className="mt-2 flex flex-wrap gap-2">
+            <button
+              type="button"
+              data-testid="zcode-mode-confirm"
+              onClick={() => {
+                setModeConfirmOpen(false);
+                submitMode("yolo");
+              }}
+              className="rounded-lg border border-[var(--cb)] px-3 py-1.5 text-xs text-[var(--tx)]"
+            >
+              {i18n.t("mobile.zcodeControl.modeConfirm")}
+            </button>
+            <button
+              type="button"
+              data-testid="zcode-mode-cancel"
+              onClick={() => {
+                setModeConfirmOpen(false);
+                setPendingMode(effectiveMode ?? "");
+              }}
+              className="rounded-lg px-3 py-1.5 text-xs text-[var(--mut)]"
+            >
+              {i18n.t("mobile.zcodeControl.modeCancel")}
+            </button>
+          </div>
+        </div>
       )}
       {attachments.length > 0 && (
         <div className="flex flex-wrap gap-2">

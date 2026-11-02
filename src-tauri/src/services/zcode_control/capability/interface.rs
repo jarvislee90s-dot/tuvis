@@ -65,6 +65,10 @@ pub(crate) fn interface_capabilities(
         (Capability::QueueEdit, false),
         (Capability::QueueNow, false),
         (Capability::QueueResume, false),
+        (
+            Capability::Mode,
+            evidence.method_mode_switch && evidence.has_mode_config,
+        ),
     ])
 }
 
@@ -102,6 +106,7 @@ mod tests {
             method_stop: true,
             method_selection_get: true,
             method_selection_switch: true,
+            method_mode_switch: true,
             has_user_input_pending: true,
             has_multi_select: true,
             has_free_text: true,
@@ -109,9 +114,10 @@ mod tests {
             has_active_work: true,
             has_model_catalog: true,
             has_thought_levels: true,
+            has_mode_config: true,
         };
         let caps = interface_capabilities(&full);
-        assert_eq!(caps.len(), 11);
+        assert_eq!(caps.len(), 12);
         for capability in [
             Capability::Send,
             Capability::SingleSelect,
@@ -121,6 +127,7 @@ mod tests {
             Capability::ApprovalReply,
             Capability::Model,
             Capability::ThoughtLevel,
+            Capability::Mode,
         ] {
             assert_eq!(
                 caps.get(&capability),
@@ -165,6 +172,7 @@ mod tests {
             Capability::ApprovalReply,
             Capability::Model,
             Capability::ThoughtLevel,
+            Capability::Mode,
         ] {
             assert_eq!(
                 caps.get(&capability),
@@ -183,6 +191,7 @@ mod tests {
             method_stop: true,
             method_selection_get: true,
             method_selection_switch: true,
+            method_mode_switch: true,
             has_user_input_pending: true,
             has_permission_pending: true,
             has_active_work: true,

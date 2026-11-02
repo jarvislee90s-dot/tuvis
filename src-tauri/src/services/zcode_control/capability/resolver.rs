@@ -40,7 +40,7 @@ use crate::services::zcode_control::types::{
 /// 队列三项（`queue_edit`/`queue_now`/`queue_resume`）同样逐项解析。普通构建下均关闭；
 /// 仅 `zcode-bridge-evidence` debug evidence/probe 构建可让已知 build 命中命令表的
 /// `queue_edit`/`queue_resume` 进入候选档。三者都不得借 `send`/`approval_reply` 的结论开闸。
-const ALL_CAPABILITIES: [Capability; 11] = [
+const ALL_CAPABILITIES: [Capability; 12] = [
     Capability::Send,
     Capability::SingleSelect,
     Capability::MultiSelect,
@@ -52,6 +52,7 @@ const ALL_CAPABILITIES: [Capability; 11] = [
     Capability::QueueEdit,
     Capability::QueueNow,
     Capability::QueueResume,
+    Capability::Mode,
 ];
 
 /// 解析八项能力矩阵（spec §6.4；生产装配点 = `PartsBackend` 的能力现算源）。
@@ -229,6 +230,7 @@ fn assign(view: &mut CapabilityView, capability: Capability, flag: CapabilityFla
         Capability::QueueEdit => view.queue_edit = flag,
         Capability::QueueNow => view.queue_now = flag,
         Capability::QueueResume => view.queue_resume = flag,
+        Capability::Mode => view.mode = flag,
     }
 }
 
@@ -385,6 +387,7 @@ mod tests {
             method_stop: true,
             method_selection_get: true,
             method_selection_switch: true,
+            method_mode_switch: true,
             has_user_input_pending: true,
             has_multi_select: true,
             has_free_text: true,
@@ -392,6 +395,7 @@ mod tests {
             has_active_work: true,
             has_model_catalog: true,
             has_thought_levels: true,
+            has_mode_config: true,
         };
         let unknown = CapabilityKey::new("macos", "9.9.9.9999", 3, "shape", 1);
         let known = known_build_key();
@@ -593,6 +597,7 @@ mod tests {
             method_stop: true,
             method_selection_get: true,
             method_selection_switch: true,
+            method_mode_switch: true,
             has_user_input_pending: true,
             has_multi_select: true,
             has_free_text: true,
@@ -600,6 +605,7 @@ mod tests {
             has_active_work: true,
             has_model_catalog: true,
             has_thought_levels: true,
+            has_mode_config: true,
         };
         for key in [
             CapabilityKey::new("macos", "9.9.9.9999", 3, "shape", 1),
@@ -774,5 +780,29 @@ mod tests {
         fn put(&self, _key: &CapabilityKey, _record: &CapabilityRecord) -> Result<(), String> {
             Ok(())
         }
+    }
+    /// R10：模式能力要求 switch 方法 + config.mode 形状；send 关不影响独立槽位。
+    #[test]
+    fn mode_capability_requires_switch_and_config_shape() {
+        let mut evidence = ZcodeInterfaceEvidence {
+            method_send: false,
+            method_mode_switch: true,
+            ..ZcodeInterfaceEvidence::default()
+        };
+        let known = known_build_key();
+        let mut view = resolve_capabilities(&known, &evidence, &MemoryLedger::default());
+        assert!(!view.mode.enabled, "缺 config.mode 形状不得开模式");
+        evidence.has_mode_config = true;
+        view = resolve_capabilities(&known, &evidence, &MemoryLedger::default());
+        assert!(view.mode.enabled, "shape + switch 应开候选：{view:?}");
+        assert!(
+            view.mode.reason_code.is_none(),
+            "非队列能力候选不另造原因码"
+        );
+        assert!(!view.send.enabled, "send 关闭不得被模式候选连带打开");
+
+        let unknown = CapabilityKey::new("macos", "9.9.9.9999", 3, "shape", 1);
+        let unknown_view = resolve_capabilities(&unknown, &evidence, &MemoryLedger::default());
+        assert!(unknown_view.mode.enabled, "未知 build 由接口候选开放");
     }
 }

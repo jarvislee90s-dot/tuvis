@@ -1207,6 +1207,8 @@ fn selection_view() -> SelectionView {
             model_id: SELECTION_MODEL.to_owned(),
             thought_levels: vec!["low".to_owned(), SELECTION_THOUGHT.to_owned()],
         }],
+        providers: Vec::new(),
+        mode: None,
     }
 }
 
@@ -1356,7 +1358,7 @@ async fn answer_permission_selection_confirm_and_audit_terminal_rows() {
 }
 
 #[tokio::test]
-async fn stop_confirms_after_host_clears_execution() {
+async fn legacy_actions_stop_is_rejected_before_any_dispatch() {
     let conn = shared_conn();
     seed(&conn);
     let (_tmp, home) = read_fixture();
@@ -1372,13 +1374,11 @@ async fn stop_confirms_after_host_clears_execution() {
         capabilities: stop_policy(),
         ..session_with_cards()
     });
-    // 宿主已撤掉目标执行（stop 终态证据）：等待端口返回 true → confirmed。
-    official.set_stop_cleared(true);
 
     let (status, body) = post_action(
         app,
         serde_json::json!({
-            "actionId": "e2e-stop-confirm",
+            "actionId": "e2e-stop-legacy-rejected",
             "action": {
                 "kind": "stop",
                 "sessionId": SESSION,
@@ -1388,31 +1388,22 @@ async fn stop_confirms_after_host_clears_execution() {
         }),
     )
     .await;
-    assert_eq!(status, axum::http::StatusCode::OK, "{body}");
-    assert_eq!(body["state"], "confirmed", "宿主撤掉执行后必须 confirmed");
-    assert_eq!(official.frame_count("stop"), 1, "恰一帧 stop");
-    assert_eq!(official.send_text_frames(), 0, "绝不合成 sendText");
-    let stop_frame = official.frames().remove(0);
+    assert_eq!(status, axum::http::StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"], "queue_refresh_required");
     assert_eq!(
-        stop_frame.envelope()["payload"]["expectedForegroundExecutionId"],
-        STOP_EXECUTION
+        official.frame_count("stop"),
+        0,
+        "旧 Stop 不得产生任何上游帧"
     );
-    assert_eq!(official.wait_stop_cleared_calls(), 1);
-
-    let rows = audit_detail(&store, "zcode_stop");
-    assert_eq!(rows.len(), 3, "started + accepted + confirmed：{rows:?}");
-    assert_eq!(
-        rows.iter().map(|row| row.4.as_str()).collect::<Vec<_>>(),
-        vec!["started", "accepted", "confirmed"]
+    assert_eq!(audit_detail(&store, "zcode_stop").len(), 0, "零帧零审计");
+    assert!(
+        store.with(|c| c
+            .query_row("SELECT COUNT(*) FROM zcode_actions", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap())
+            == 0
     );
-    for (device, agent, channel, summary, _) in &rows {
-        assert_eq!(device, DEVICE_ID);
-        assert_eq!(agent, "zcode");
-        assert_eq!(channel, "zcode_official");
-        assert!(!summary.contains(STOP_EXECUTION), "守卫 id 不得入摘要");
-    }
 }
-
 // ============================================================
 // 用例 6：换链接（代际推进）——旧 pending / 旧动作零帧，新代际可用
 // ============================================================

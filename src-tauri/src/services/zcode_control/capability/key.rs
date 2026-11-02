@@ -143,6 +143,7 @@ pub(crate) fn shipped_state(
         | Capability::Model
         | Capability::ThoughtLevel
         | Capability::ApprovalReply => Some(CapabilityState::Confirmed),
+        Capability::Mode => Some(CapabilityState::InterfaceMatched),
         Capability::SingleSelect
         | Capability::Interrupt
         | Capability::MultiSelect

@@ -35,6 +35,8 @@ pub(crate) enum Capability {
     QueueNow,
     /// 恢复队列自动处理（`setAutoDrain(true)`）。
     QueueResume,
+    /// 协作模式切换（`switchCollaborationMode`）。
+    Mode,
 }
 
 impl Capability {
@@ -53,6 +55,7 @@ impl Capability {
             Capability::QueueEdit => "queue_edit",
             Capability::QueueNow => "queue_now",
             Capability::QueueResume => "queue_resume",
+            Capability::Mode => "mode",
         }
     }
 }
@@ -88,6 +91,7 @@ pub(crate) struct ZcodeInterfaceEvidence {
     pub method_stop: bool,
     pub method_selection_get: bool,
     pub method_selection_switch: bool,
+    pub method_mode_switch: bool,
     pub has_user_input_pending: bool,
     pub has_multi_select: bool,
     pub has_free_text: bool,
@@ -95,6 +99,7 @@ pub(crate) struct ZcodeInterfaceEvidence {
     pub has_active_work: bool,
     pub has_model_catalog: bool,
     pub has_thought_levels: bool,
+    pub has_mode_config: bool,
 }
 
 /// 一条能力证据记录（T2 账本行 `zcode_capability_evidence` 的内存形态；spec R6）。
@@ -160,6 +165,7 @@ mod tests {
             queue_edit,
             queue_now,
             queue_resume,
+            mode,
         } = view;
         drop((
             send,
@@ -173,6 +179,7 @@ mod tests {
             queue_edit,
             queue_now,
             queue_resume,
+            mode,
         ));
 
         let strings: Vec<&str> = [
@@ -187,6 +194,7 @@ mod tests {
             Capability::QueueEdit,
             Capability::QueueNow,
             Capability::QueueResume,
+            Capability::Mode,
         ]
         .iter()
         .map(|capability| capability.as_str())
@@ -205,6 +213,7 @@ mod tests {
                 "queue_edit",
                 "queue_now",
                 "queue_resume",
+                "mode",
             ]
         );
     }
@@ -219,6 +228,7 @@ mod tests {
             e.method_stop,
             e.method_selection_get,
             e.method_selection_switch,
+            e.method_mode_switch,
             e.has_user_input_pending,
             e.has_multi_select,
             e.has_free_text,
@@ -226,6 +236,7 @@ mod tests {
             e.has_active_work,
             e.has_model_catalog,
             e.has_thought_levels,
+            e.has_mode_config,
         ];
         assert!(all.iter().all(|v| !v));
     }

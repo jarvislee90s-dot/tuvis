@@ -497,6 +497,30 @@ async fn paired_hub_open(conn: &SharedConn, backend: Arc<FakeHubBackend>) -> Arc
     paired_hub_with(conn, backend, send_policy()).await
 }
 
+fn selection_policy() -> CapabilityView {
+    CapabilityView {
+        model: CapabilityFlag {
+            enabled: true,
+            reason_code: None,
+        },
+        thought_level: CapabilityFlag {
+            enabled: true,
+            reason_code: None,
+        },
+        ..CapabilityView::default()
+    }
+}
+
+fn mode_policy() -> CapabilityView {
+    CapabilityView {
+        mode: CapabilityFlag {
+            enabled: true,
+            reason_code: None,
+        },
+        ..CapabilityView::default()
+    }
+}
+
 /// POST /m/api/v1/zcode/actions（cookie 可选：未配对用例去掉 cookie 走 gate 403）。
 fn action_req(body: &serde_json::Value, cookie: bool) -> axum::http::Request<axum::body::Body> {
     let mut builder = axum::http::Request::builder()
@@ -2480,4 +2504,79 @@ async fn stopped_remote_or_revoked_device_cannot_write_or_receive_events() {
         binds_before,
         "吊销后动作不得新增绑定"
     );
+}
+
+#[tokio::test]
+async fn mode_action_reaches_hub_once_and_rejects_extra_fields() {
+    let conn = shared_conn();
+    seed_device(&conn);
+    let backend = Arc::new(FakeHubBackend::default());
+    let hub = paired_hub_with(&conn, backend.clone(), mode_policy()).await;
+    let st = state(&conn, Arc::new(RecordingInjector::default()));
+    st.set_zcode_hub(hub.clone());
+    let app = router(st);
+    let body = serde_json::json!({
+        "actionId": "mode-1",
+        "action": {
+            "kind": "mode",
+            "sessionId": ZCODE_SESSION,
+            "generation": hub.connection().generation,
+            "mode": "plan",
+            "confirmFullAccess": false,
+        },
+    });
+    let response = app.clone().oneshot(action_req(&body, true)).await.unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    assert_eq!(backend.execute_calls(), 1);
+    assert!(matches!(
+        backend.actions.lock().unwrap().first(),
+        Some(ControlAction::Mode {
+            mode: multi_agents_manager_lib::services::zcode_control::CollaborationMode::Plan,
+            confirm_full_access: false,
+            ..
+        })
+    ));
+    let mut extra = body.clone();
+    extra["action"]["unexpected"] = serde_json::json!(true);
+    let response = app.oneshot(action_req(&extra, true)).await.unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn selection_provider_reaches_backend_through_action_whitelist() {
+    let conn = shared_conn();
+    seed_device(&conn);
+    let backend = Arc::new(FakeHubBackend::default());
+    let hub = paired_hub_with(&conn, backend.clone(), selection_policy()).await;
+    let generation = hub.connection().generation;
+    let st = state(&conn, Arc::new(RecordingInjector::default()));
+    st.set_zcode_hub(hub);
+    let app = router(st);
+    let response = app
+        .oneshot(action_req(
+            &serde_json::json!({
+                "actionId": "selection-provider-1",
+                "action": {
+                    "kind": "selection",
+                    "sessionId": ZCODE_SESSION,
+                    "generation": generation,
+                    "provider": "provider-b",
+                    "model": "same-model",
+                    "thought": "high",
+                },
+            }),
+            true,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    assert!(matches!(
+        backend.actions.lock().unwrap().first(),
+        Some(ControlAction::Selection {
+            provider: Some(provider),
+            model,
+            thought,
+            ..
+        }) if provider == "provider-b" && model == "same-model" && thought == "high"
+    ));
 }

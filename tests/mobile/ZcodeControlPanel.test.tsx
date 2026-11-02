@@ -53,6 +53,7 @@ import {
   ZCODE_ACTIONS_PATH,
   ZCODE_CONNECTION_PATH,
   ZCODE_ERROR_CODES,
+  ZCODE_LOCAL_QUEUE_PATH,
   ZCODE_SESSION_PATH,
   type ActionReceipt,
   type ActionState,
@@ -251,6 +252,15 @@ function postedActions(): { actionId: string; action: ControlAction }[] {
           action: ControlAction;
         }
     );
+}
+
+function localEnqueues(): Array<{
+  requestId: string;
+  draft: { text: string; attachments: unknown[] };
+}> {
+  return fetchMock.mock.calls
+    .filter(([input]) => String(input) === `${ZCODE_LOCAL_QUEUE_PATH}/enqueue`)
+    .map(([, init]) => JSON.parse(String((init as RequestInit).body)));
 }
 
 /** 旧发送/无头入口计数：本任务任何路径都不得回退它们。 */
@@ -942,6 +952,19 @@ describe("ZCode 控制面板：主按钮在发送与打断之间切换（R5/U3�
         const custom = onPost?.(body);
         return json(custom ?? receipt(body.actionId, "accepted"));
       }
+      if (url.startsWith(`${ZCODE_LOCAL_QUEUE_PATH}?`)) {
+        return json({
+          sessionId: SID,
+          version: 1,
+          autoDrain: true,
+          pauseReason: null,
+          items: [],
+          recoverableEdits: [],
+        });
+      }
+      if (url === `${ZCODE_LOCAL_QUEUE_PATH}/enqueue`) {
+        return json({ itemId: "synthetic-item", itemVersion: 1, queueVersion: 2, position: 1 });
+      }
       throw new Error(`unexpected fetch: ${url}`);
     });
   }
@@ -978,15 +1001,13 @@ describe("ZCode 控制面板：主按钮在发送与打断之间切换（R5/U3�
     await waitFor(() => expect(primary.getAttribute("data-primary-action")).toBe("send"));
     fireEvent.click(primary);
 
-    await waitFor(() => expect(postedActions()).toHaveLength(1));
-    expect(postedActions()[0].action).toEqual({
-      kind: "send",
-      sessionId: SID,
-      generation: GEN,
+    await waitFor(() => expect(localEnqueues()).toHaveLength(1));
+    expect(localEnqueues()[0].draft).toMatchObject({
       text: "运行中也要能发消息",
+      attachments: [],
     });
-    // 有内容发送不得先打断：一个 stop 都不许出现
-    expect(postedActions().filter(({ action }) => action.kind === "stop")).toHaveLength(0);
+    // 运行中普通发送只入 Tuvis 待发，不直接打官方 actions，也不先打断。
+    expect(postedActions()).toHaveLength(0);
   });
 
   it("运行中但无唯一守卫（多目标）→ 主按钮禁用并带可见原因", async () => {
@@ -1127,16 +1148,12 @@ describe("ZCode 控制面板：主按钮在发送与打断之间切换（R5/U3�
 
     fireEvent.click(primary);
 
-    await waitFor(() => expect(postedActions()).toHaveLength(1));
-    // 正文 = 附件引用（无文字时正文恰为 markup）
-    expect(postedActions()[0].action).toEqual({
-      kind: "send",
-      sessionId: SID,
-      generation: GEN,
-      text: '<image path="/tmp/synthetic/shot.png">',
+    await waitFor(() => expect(localEnqueues()).toHaveLength(1));
+    expect(localEnqueues()[0].draft).toMatchObject({
+      text: "",
+      attachments: [{ name: "shot.png", path: "/tmp/synthetic/shot.png", isImage: true }],
     });
-    // 有内容（就绪附件）发送不得先打断
-    expect(postedActions().filter(({ action }) => action.kind === "stop")).toHaveLength(0);
+    expect(postedActions()).toHaveLength(0);
   });
 
   it("failed 附件 + 有文字 → 主按钮禁用、零 POST，失败附件不被静默丢弃", async () => {
@@ -1233,14 +1250,12 @@ describe("ZCode 控制面板：主按钮在发送与打断之间切换（R5/U3�
     await waitFor(() => expect(primary.getAttribute("data-primary-action")).toBe("send"));
     fireEvent.click(primary);
 
-    await waitFor(() => expect(postedActions()).toHaveLength(1));
-    expect(postedActions()[0].action).toEqual({
-      kind: "send",
-      sessionId: SID,
-      generation: GEN,
-      text: '文字与附件一起发\n<image path="/tmp/synthetic/shot.png">',
+    await waitFor(() => expect(localEnqueues()).toHaveLength(1));
+    expect(localEnqueues()[0].draft).toMatchObject({
+      text: "文字与附件一起发",
+      attachments: [{ name: "shot.png", path: "/tmp/synthetic/shot.png", isImage: true }],
     });
-    expect(postedActions().filter(({ action }) => action.kind === "stop")).toHaveLength(0);
+    expect(postedActions()).toHaveLength(0);
   });
 
   it("打断回执 Unknown → 不自动重发、不假清草稿", async () => {

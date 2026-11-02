@@ -292,11 +292,31 @@ export interface ModelChoice {
 }
 
 /** 当前模型/思考档位。 */
+export interface ProviderChoice {
+  providerId: string;
+  label: string;
+  models: ModelChoice[];
+  available: boolean;
+  reasonCode?: string | null;
+}
+
+export type CollaborationMode = "build" | "edit" | "plan" | "yolo" | "guarded";
+
+export interface ModeView {
+  rawMode?: CollaborationMode;
+  planEnabled?: boolean | null;
+  effectiveMode?: CollaborationMode;
+}
+
 export interface SelectionView {
   provider: string;
   model: string;
   thought: string | null;
   models: ModelChoice[];
+  /** 官方目录的全部 provider 分组；缺省 = 旧载荷，仅当前 provider 可用。 */
+  providers?: ProviderChoice[];
+  /** 本会话模式投影；缺省 = 宿主未宣告。 */
+  mode?: ModeView;
 }
 
 /** 单个能力开关（默认关闭并带冻结原因码）。 */
@@ -324,6 +344,8 @@ export interface CapabilityView {
   queueNow: CapabilityFlag;
   /** 恢复队列自动处理（`setAutoDrain(true)`）。 */
   queueResume: CapabilityFlag;
+  /** 协作模式切换（R10）。 */
+  mode: CapabilityFlag;
 }
 
 /** 官方输入队列里的一项（`state.queue.items[]` 的只读投影）。
@@ -440,7 +462,21 @@ export type ControlAction =
       generation: number;
       expectedForegroundExecutionId: string;
     }
-  | { kind: "selection"; sessionId: string; generation: number; model: string; thought: string }
+  | {
+      kind: "selection";
+      sessionId: string;
+      generation: number;
+      provider?: string;
+      model: string;
+      thought: string;
+    }
+  | {
+      kind: "mode";
+      sessionId: string;
+      generation: number;
+      mode: CollaborationMode;
+      confirmFullAccess: boolean;
+    }
   // ---- 队列写（W3）：目标一律是官方 `queueItemId`，绝不是位置/下标/正文 ----
   /** 撤回一条官方队列项。 */
   | { kind: "queueDelete"; sessionId: string; generation: number; queueItemId: string }

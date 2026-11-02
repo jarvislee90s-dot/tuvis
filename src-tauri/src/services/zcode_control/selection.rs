@@ -13,7 +13,9 @@
 
 use serde_json::{json, Value};
 
-use super::types::{codes, ModelChoice, SelectionView, SessionView, ZResult, ZcodeError};
+use super::types::{
+    codes, ModelChoice, ProviderChoice, SelectionView, SessionView, ZResult, ZcodeError,
+};
 
 /// 官方模型配置切换命令类型（`command.ts:254`）。
 pub const SWITCH_MODEL_CONFIG_TYPE: &str = "switchModelConfig";
@@ -24,33 +26,58 @@ pub const SWITCH_MODEL_CONFIG_TYPE: &str = "switchModelConfig";
 /// - 选择视图缺失或 `revision` 缺失 → `not_ready`（投影尚无可用的 CAS 依据）；
 /// - 未知模型／空档位列表／目标档位不属于该模型 → `invalid_action`（零帧）。
 pub fn build_selection_command(view: &SessionView, model: &str, thought: &str) -> ZResult<Value> {
+    let provider = view
+        .selection
+        .as_ref()
+        .ok_or_else(|| ZcodeError::of(codes::NOT_READY))?
+        .provider
+        .clone();
+    build_selection_command_for_provider(view, &provider, model, thought)
+}
+
+/// 按**目标 provider** 构造 `switchModelConfig`：provider 必须出现在官方目录分组里
+/// （或旧载荷的空分组时退化为当前会话 provider），模型与档位必须属于该分组自己的
+/// 模型目录；不可用 provider / 他组模型 / 他组档位一律 `invalid_action`。
+pub fn build_selection_command_for_provider(
+    view: &SessionView,
+    provider: &str,
+    model: &str,
+    thought: &str,
+) -> ZResult<Value> {
     let selection = view
         .selection
         .as_ref()
         .ok_or_else(|| ZcodeError::of(codes::NOT_READY))?;
-    // CAS 依据：只认投影携带的最新 revision；缺失即无可信基线（零帧）。
     let revision = view
         .revision
         .ok_or_else(|| ZcodeError::of(codes::NOT_READY))?;
-    // provider 只取自会话视图（本类型只含当前 provider 目录），绝不接受客户端指定。
-    let choice = selection
-        .models
+    let group = selection
+        .providers
+        .iter()
+        .find(|candidate| candidate.provider_id == provider);
+    let models = match group {
+        Some(group) if !group.available => {
+            return Err(ZcodeError::of(codes::INVALID_ACTION));
+        }
+        Some(group) => &group.models,
+        None if provider == selection.provider && selection.providers.is_empty() => {
+            &selection.models
+        }
+        None => return Err(ZcodeError::of(codes::INVALID_ACTION)),
+    };
+    let choice = models
         .iter()
         .find(|choice| choice.model_id == model)
         .ok_or_else(|| ZcodeError::of(codes::INVALID_ACTION))?;
-    // 档位必须是**该模型自己**的合法显式值：空列表 = 宿主未宣告，一律拒绝；
-    // 其他模型的档位不在此列表里，因而天然无法放行。
     if choice.thought_levels.is_empty()
         || !choice.thought_levels.iter().any(|level| level == thought)
     {
         return Err(ZcodeError::of(codes::INVALID_ACTION));
     }
-    // 信封只含 type/payload/baseRevision；T3 负责补 commandId/clientId/sessionId/
-    // issuedAt。绝不带 baseLogEpoch，也不回带恢复原档位的写帧。
     Ok(json!({
         "type": SWITCH_MODEL_CONFIG_TYPE,
         "payload": {
-            "provider": selection.provider,
+            "provider": provider,
             "model": model,
             "thought": thought,
         },
@@ -88,12 +115,14 @@ pub fn parse_selection_view(raw: &Value) -> ZResult<SelectionView> {
         return Err(unsupported());
     }
     let config = parse_session_config(raw)?;
-    let models = catalog_models(raw, &config)?;
+    let (models, providers) = catalog_models(raw, &config)?;
     Ok(SelectionView {
         provider: config.provider.to_owned(),
         model: config.model.to_owned(),
         thought: config.thought.map(str::to_owned),
         models,
+        providers,
+        mode: super::mode::parse_mode_view(raw),
     })
 }
 
@@ -197,41 +226,20 @@ fn fallback_models(config: &SessionConfig<'_>) -> Vec<ModelChoice> {
     }]
 }
 
-fn catalog_models(raw: &Value, config: &SessionConfig<'_>) -> ZResult<Vec<ModelChoice>> {
-    let Some(providers) = providers_value(raw) else {
-        return Ok(fallback_models(config));
-    };
-    let providers = providers.as_array().ok_or_else(unsupported)?;
-    if providers.is_empty() {
-        return Ok(fallback_models(config));
-    }
-    // 只对**命中当前 provider** 的条目做严格校验：兄弟/其他账号 provider 的坏形状
-    // 不得否决当前会话可用的目录（它们本来就会被丢弃）。
-    let mut current_models: Option<&[Value]> = None;
-    for provider in providers.iter().take(MAX_PROVIDERS) {
-        let Some(record) = provider.as_object() else {
-            continue;
-        };
-        // 官方 ModelSelectionView：providers[].providerId / models[].modelId。
-        let Some(provider_id) = non_empty_id(record.get("providerId")) else {
-            continue;
-        };
-        if provider_id != config.provider {
-            continue;
-        }
-        let models = record
-            .get("models")
-            .and_then(Value::as_array)
-            .ok_or_else(needs_evidence)?;
-        current_models = Some(models);
-    }
-    let Some(models) = current_models else {
-        // 目录里没有当前会话 provider（可能只暴露了其他账号）：退化，绝不借用别家目录。
-        return Ok(fallback_models(config));
-    };
-    if models.is_empty() {
-        return Ok(fallback_models(config));
-    }
+fn provider_from_record(record: &Value, config: &SessionConfig<'_>) -> ZResult<ProviderChoice> {
+    let provider_id = non_empty_id(record.get("providerId"))
+        .ok_or_else(needs_evidence)?
+        .to_owned();
+    let label = record
+        .get("providerName")
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty() && text.chars().count() <= MAX_ID_CHARS)
+        .unwrap_or(&provider_id)
+        .to_owned();
+    let models = record
+        .get("models")
+        .and_then(Value::as_array)
+        .ok_or_else(needs_evidence)?;
     let mut choices: Vec<ModelChoice> = Vec::new();
     for model in models.iter().take(MAX_MODELS) {
         let record = model.as_object().ok_or_else(needs_evidence)?;
@@ -243,13 +251,11 @@ fn catalog_models(raw: &Value, config: &SessionConfig<'_>) -> ZResult<Vec<ModelC
                 .and_then(|specs| specs.get("reasoningLevel"))
                 .and_then(|level| level.get("values")),
         );
-        // 快照档位只回退给**当前模型**；其他模型保持空列表（命令构造会拒绝其任何档位）。
         let thought_levels = if declared.is_empty() && model_id == config.model {
             config.thought_levels.clone()
         } else {
             declared
         };
-        // 重复 id 保留首次出现，且不合并重复项的档位（合并即 provider 级并集）。
         if choices.iter().any(|choice| choice.model_id == model_id) {
             continue;
         }
@@ -258,7 +264,70 @@ fn catalog_models(raw: &Value, config: &SessionConfig<'_>) -> ZResult<Vec<ModelC
             thought_levels,
         });
     }
-    Ok(choices)
+    let available = record
+        .get("available")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let reason_code = record
+        .get("reasonCode")
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty() && text.chars().count() <= MAX_ID_CHARS)
+        .map(str::to_owned);
+    Ok(ProviderChoice {
+        provider_id,
+        label,
+        models: choices,
+        available,
+        reason_code,
+    })
+}
+
+fn catalog_models(
+    raw: &Value,
+    config: &SessionConfig<'_>,
+) -> ZResult<(Vec<ModelChoice>, Vec<ProviderChoice>)> {
+    let Some(providers) = providers_value(raw) else {
+        return Ok((fallback_models(config), Vec::new()));
+    };
+    let providers = providers.as_array().ok_or_else(unsupported)?;
+    if providers.is_empty() {
+        return Ok((fallback_models(config), Vec::new()));
+    }
+    let mut groups: Vec<ProviderChoice> = Vec::new();
+    let mut current_models: Option<Vec<ModelChoice>> = None;
+    for provider in providers.iter().take(MAX_PROVIDERS) {
+        let Some(record) = provider.as_object() else {
+            continue;
+        };
+        let Some(provider_id) = non_empty_id(record.get("providerId")) else {
+            continue;
+        };
+        let is_current = provider_id == config.provider;
+        let group = match provider_from_record(provider, config) {
+            Ok(group) => group,
+            Err(error) if is_current => return Err(error),
+            Err(_) => continue,
+        };
+        if is_current {
+            current_models = Some(group.models.clone());
+        }
+        if groups
+            .iter()
+            .any(|seen| seen.provider_id == group.provider_id)
+        {
+            continue;
+        }
+        groups.push(group);
+    }
+    let current_models = match current_models {
+        Some(models) if !models.is_empty() => models,
+        _ => {
+            // 目录没有当前 provider，或当前 provider 的模型为空：保留旧退化目录，
+            // 但绝不把别家 provider 的模型冒充当前 provider。
+            return Ok((fallback_models(config), groups));
+        }
+    };
+    Ok((current_models, groups))
 }
 
 #[cfg(test)]
@@ -283,6 +352,8 @@ mod tests {
             model: model.to_owned(),
             thought: thought.map(str::to_owned),
             models,
+            providers: Vec::new(),
+            mode: None,
         }
     }
 
@@ -672,5 +743,64 @@ mod tests {
         // thought 为空串 → None（官方空串 = 无显式档位）。
         let empty = raw_view(session_config("model-a", Some(""), &["low"]), None);
         assert_eq!(parse(&empty).expect("catalog").thought, None);
+    }
+}
+
+#[cfg(test)]
+mod provider_tests {
+    use super::*;
+    use crate::services::zcode_control::types::{CapabilityView, SessionView};
+
+    fn raw_two_providers() -> Value {
+        serde_json::json!({
+            "config": {"provider": "a", "model": "same", "thought": "low", "thoughtLevels": ["low"]},
+            "providers": [
+                {"providerId": "a", "providerName": "A", "models": [
+                    {"modelId": "same", "config": {"optionSpecs": {"reasoningLevel": {"values": ["low"]}}}}
+                ]},
+                {"providerId": "b", "providerName": "B", "models": [
+                    {"modelId": "same", "config": {"optionSpecs": {"reasoningLevel": {"values": ["high"]}}}}
+                ]}
+            ]
+        })
+    }
+
+    fn session_with(selection: SelectionView) -> SessionView {
+        serde_json::from_value(serde_json::json!({
+            "sessionId": "s", "generation": 1, "revision": 7, "ready": true,
+            "pending": [], "control": {"activeWorks": []}, "selection": selection,
+            "capabilities": CapabilityView::default()
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn two_providers_with_same_model_are_distinct_targets() {
+        let selection = parse_selection_view(&raw_two_providers()).unwrap();
+        assert_eq!(selection.providers.len(), 2);
+        assert_eq!(selection.providers[0].provider_id, "a");
+        assert_eq!(selection.providers[1].provider_id, "b");
+        let view = session_with(selection);
+        let cmd_a = build_selection_command_for_provider(&view, "a", "same", "low").unwrap();
+        let cmd_b = build_selection_command_for_provider(&view, "b", "same", "high").unwrap();
+        assert_eq!(cmd_a["payload"]["provider"], "a");
+        assert_eq!(cmd_b["payload"]["provider"], "b");
+        assert_ne!(cmd_a["payload"], cmd_b["payload"]);
+    }
+
+    #[test]
+    fn cross_provider_switch_requires_its_own_levels() {
+        let selection = parse_selection_view(&raw_two_providers()).unwrap();
+        let view = session_with(selection);
+        assert!(build_selection_command_for_provider(&view, "b", "same", "low").is_err());
+        assert!(build_selection_command_for_provider(&view, "b", "same", "high").is_ok());
+    }
+
+    #[test]
+    fn old_selection_without_provider_keeps_current_scope() {
+        let selection = parse_selection_view(&raw_two_providers()).unwrap();
+        let view = session_with(selection);
+        let legacy = build_selection_command(&view, "same", "low").unwrap();
+        assert_eq!(legacy["payload"]["provider"], "a");
     }
 }

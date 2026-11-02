@@ -469,6 +469,7 @@ impl HubBackend for FakeOfficial {
                     ControlAction::Stop { .. } => Ok(vec!["interrupt"]),
                     ControlAction::Permission { .. } => Ok(vec!["approval_reply"]),
                     ControlAction::Selection { .. } => Ok(vec!["model", "thought_level"]),
+                    ControlAction::Mode { .. } => Ok(vec!["mode"]),
                     // 队列写：队列专属槽位（与生产 `CommandSender` 同口径）。
                     ControlAction::QueueDelete { .. } | ControlAction::QueueReorder { .. } => {
                         Ok(vec!["queue_edit"])
@@ -809,5 +810,6 @@ pub fn all_policy() -> CapabilityView {
         queue_edit: on(),
         queue_now: on(),
         queue_resume: on(),
+        mode: on(),
     }
 }
