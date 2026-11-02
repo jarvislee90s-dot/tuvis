@@ -239,7 +239,7 @@ it("local_queue_prioritize_and_retract_only_use_local_api", async () => {
   expect(calls.filter((call) => call.url === ZCODE_ACTIONS_PATH)).toHaveLength(0);
 });
 
-it("edit_snapshot_never_overwrites_a_continued_draft_without_choice", async () => {
+it("edit_preflight_cancel_keeps_queue_item_and_creates_no_snapshot", async () => {
   const { calls } = installQueueServer({});
   render(<ZcodeControlPanel sessionId={SID} />);
   await waitFor(() => expect(screen.getByTestId("zcode-local-item")).toBeVisible());
@@ -247,15 +247,77 @@ it("edit_snapshot_never_overwrites_a_continued_draft_without_choice", async () =
   const draft = screen.getByTestId("zcode-draft") as HTMLTextAreaElement;
   fireEvent.change(draft, { target: { value: "续写内容" } });
   fireEvent.click(within(row).getByRole("button", { name: "再编辑" }));
-  await waitFor(() => expect(screen.getByTestId("zcode-edit-conflict-dialog")).toBeVisible());
+  await waitFor(() => expect(screen.getByTestId("zcode-edit-preflight-dialog")).toBeVisible());
   expect(draft).toHaveValue("续写内容");
-  fireEvent.click(screen.getByTestId("zcode-edit-conflict-cancel"));
-  await waitFor(() =>
-    expect(
-      calls.filter((call) => call.url === `${ZCODE_LOCAL_QUEUE_PATH}/edit/finish`)
-    ).toHaveLength(1)
+  expect(calls.filter((call) => call.url === `${ZCODE_LOCAL_QUEUE_PATH}/edit`)).toHaveLength(0);
+  fireEvent.click(screen.getByTestId("zcode-edit-preflight-cancel"));
+  await act(async () => {});
+  expect(calls.filter((call) => call.url === `${ZCODE_LOCAL_QUEUE_PATH}/edit`)).toHaveLength(0);
+  expect(calls.filter((call) => call.url === `${ZCODE_LOCAL_QUEUE_PATH}/edit/finish`)).toHaveLength(
+    0
   );
   expect(draft).toHaveValue("续写内容");
+});
+
+it("request_time_conflict_cancel_does_not_delete_recovery_snapshot", async () => {
+  let release!: (response: Response) => void;
+  const gate = new Promise<Response>((resolve) => {
+    release = resolve;
+  });
+  let queue = queueWith();
+  const calls: string[] = [];
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (input: RequestInfo | URL, _init?: RequestInit) => {
+      const url = String(input);
+      calls.push(url);
+      if (url === ZCODE_CONNECTION_PATH) return json(connection());
+      if (url.startsWith(`${ZCODE_SESSION_PATH}?`)) return json(session());
+      if (url.startsWith(`${ZCODE_LOCAL_QUEUE_PATH}?`)) return json(queue);
+      if (url === `${ZCODE_LOCAL_QUEUE_PATH}/edit`) {
+        await gate;
+        return json({
+          requestId: "edit-late",
+          itemId: "item-1",
+          draft: { text: "原待发", attachments: [] },
+          expiresAtMs: Date.now() + 60_000,
+        });
+      }
+      if (url === `${ZCODE_LOCAL_QUEUE_PATH}/edit/finish`) {
+        queue = queueWith({ recoverableEdits: [], version: 3 });
+        return json({ ok: true });
+      }
+      if (url === `${ZCODE_LOCAL_QUEUE_PATH}/retract`) {
+        queue = queueWith({ items: [], version: 3 });
+        return json(queue);
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    })
+  );
+
+  render(<ZcodeControlPanel sessionId={SID} />);
+  await waitFor(() => expect(screen.getByTestId("zcode-local-item")).toBeVisible());
+  fireEvent.click(
+    within(screen.getByTestId("zcode-local-item")).getByRole("button", { name: "再编辑" })
+  );
+  await waitFor(() => expect(calls).toContain(`${ZCODE_LOCAL_QUEUE_PATH}/edit`));
+  fireEvent.change(screen.getByTestId("zcode-draft"), { target: { value: "等待时续写" } });
+  await act(async () => {
+    release(
+      json({
+        requestId: "edit-late",
+        itemId: "item-1",
+        draft: { text: "原待发", attachments: [] },
+        expiresAtMs: Date.now() + 60_000,
+      })
+    );
+    await Promise.resolve();
+  });
+  await waitFor(() => expect(screen.getByTestId("zcode-edit-conflict-dialog")).toBeVisible());
+  fireEvent.click(screen.getByTestId("zcode-edit-conflict-cancel"));
+  await act(async () => {});
+  expect(calls.filter((url) => url === `${ZCODE_LOCAL_QUEUE_PATH}/edit/finish`)).toHaveLength(0);
+  expect(screen.getByTestId("zcode-draft")).toHaveValue("等待时续写");
 });
 
 it("resume_uses_current_local_queue_version", async () => {
@@ -346,4 +408,140 @@ it("unknown_enqueue_retry_reuses_request_id", async () => {
   const first = JSON.parse(bodies[0]) as { requestId: string };
   const second = JSON.parse(bodies[1]) as { requestId: string };
   expect(second.requestId).toBe(first.requestId);
+});
+
+it("unknown_recovery_buttons_review_each_barrier_without_resend", async () => {
+  let queue = queueWith({
+    items: [
+      {
+        itemId: "unknown-1",
+        itemVersion: 2,
+        state: "unknown",
+        position: 1,
+        textPreview: "待核对",
+        hasAttachments: false,
+      },
+    ],
+    version: 8,
+  });
+  const recovery = {
+    priority: [{ requestId: "priority-1", itemId: "unknown-1" }],
+    manualStopRequestId: "stop-1",
+    dispatchActionId: "dispatch-1",
+    unconfirmedActionId: "restart-1",
+  };
+  const acks: unknown[] = [];
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url === ZCODE_CONNECTION_PATH) return json(connection());
+      if (url.startsWith(`${ZCODE_SESSION_PATH}?`)) return json(session());
+      if (url.startsWith(`${ZCODE_LOCAL_QUEUE_PATH}?`)) return json(queue);
+      if (url === `${ZCODE_LOCAL_QUEUE_PATH}/recovery?sessionId=${SID}`) return json(recovery);
+      if (url === `${ZCODE_LOCAL_QUEUE_PATH}/recovery/ack`) {
+        acks.push(JSON.parse(String(init?.body)));
+        queue = queueWith({
+          autoDrain: false,
+          pauseReason: "unknown_reviewed",
+          version: 9,
+          items: queue.items,
+        });
+        return json({ ok: true });
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    })
+  );
+
+  render(<ZcodeControlPanel sessionId={SID} />);
+  await waitFor(() => expect(screen.getByTestId("zcode-local-recovery")).toBeVisible());
+  expect(screen.getByTestId("zcode-recovery-priority")).toBeEnabled();
+  expect(screen.getByTestId("zcode-recovery-manual-stop")).toBeEnabled();
+  expect(screen.getByTestId("zcode-recovery-dispatch")).toBeEnabled();
+  expect(screen.getByTestId("zcode-recovery-unconfirmed")).toBeEnabled();
+
+  fireEvent.click(screen.getByTestId("zcode-recovery-priority"));
+  await waitFor(() => expect(acks).toHaveLength(1));
+  await waitFor(() => expect(screen.getByTestId("zcode-local-queue-resume")).toBeVisible());
+  fireEvent.click(screen.getByTestId("zcode-recovery-manual-stop"));
+  await waitFor(() => expect(acks).toHaveLength(2));
+  fireEvent.click(screen.getByTestId("zcode-recovery-dispatch"));
+  await waitFor(() => expect(acks).toHaveLength(3));
+  fireEvent.click(screen.getByTestId("zcode-recovery-unconfirmed"));
+  await waitFor(() => expect(acks).toHaveLength(4));
+
+  expect(acks).toEqual([
+    expect.objectContaining({ kind: "priority_stop", subjectId: "priority-1" }),
+    expect.objectContaining({ kind: "manual_stop", subjectId: "stop-1" }),
+    expect.objectContaining({ kind: "dispatch", subjectId: "dispatch-1" }),
+    expect.objectContaining({ kind: "unconfirmed", subjectId: "restart-1" }),
+  ]);
+  expect(
+    (fetch as unknown as ReturnType<typeof vi.fn>).mock.calls.filter(
+      ([input]) => String(input) === ZCODE_ACTIONS_PATH
+    )
+  ).toHaveLength(0);
+});
+
+it("replace_during_edit_waits_for_a_stable_draft_and_reasks", async () => {
+  let release!: (response: Response) => void;
+  const gate = new Promise<Response>((resolve) => {
+    release = resolve;
+  });
+  let queue = queueWith();
+  const calls: string[] = [];
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (input: RequestInfo | URL, _init?: RequestInit) => {
+      const url = String(input);
+      calls.push(url);
+      if (url === ZCODE_CONNECTION_PATH) return json(connection());
+      if (url.startsWith(`${ZCODE_SESSION_PATH}?`)) return json(session());
+      if (url.startsWith(`${ZCODE_LOCAL_QUEUE_PATH}?`)) return json(queue);
+      if (url === `${ZCODE_LOCAL_QUEUE_PATH}/edit`) {
+        await gate;
+        return json({
+          requestId: "edit-replace",
+          itemId: "item-1",
+          draft: { text: "取回原文", attachments: [] },
+          expiresAtMs: Date.now() + 60_000,
+        });
+      }
+      if (url === `${ZCODE_LOCAL_QUEUE_PATH}/edit/finish`) {
+        queue = queueWith({ recoverableEdits: [], version: 3 });
+        return json({ ok: true });
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    })
+  );
+
+  render(<ZcodeControlPanel sessionId={SID} />);
+  await waitFor(() => expect(screen.getByTestId("zcode-local-item")).toBeVisible());
+  fireEvent.change(screen.getByTestId("zcode-draft"), { target: { value: "已有草稿" } });
+  fireEvent.click(
+    within(screen.getByTestId("zcode-local-item")).getByRole("button", { name: "再编辑" })
+  );
+  await waitFor(() => expect(screen.getByTestId("zcode-edit-preflight-dialog")).toBeVisible());
+  fireEvent.click(screen.getByTestId("zcode-edit-preflight-replace"));
+  await waitFor(() => expect(calls).toContain(`${ZCODE_LOCAL_QUEUE_PATH}/edit`));
+
+  // 用户确认“替换”后、回执到达前继续输入：回执不得覆盖新草稿。
+  fireEvent.change(screen.getByTestId("zcode-draft"), { target: { value: "替换期间的新草稿" } });
+  await act(async () => {
+    release(
+      json({
+        requestId: "edit-replace",
+        itemId: "item-1",
+        draft: { text: "取回原文", attachments: [] },
+        expiresAtMs: Date.now() + 60_000,
+      })
+    );
+    await Promise.resolve();
+  });
+  await waitFor(() => expect(screen.getByTestId("zcode-edit-conflict-dialog")).toBeVisible());
+  expect(screen.getByTestId("zcode-draft")).toHaveValue("替换期间的新草稿");
+
+  fireEvent.click(screen.getByTestId("zcode-edit-conflict-cancel"));
+  await act(async () => {});
+  expect(calls.filter((url) => url === `${ZCODE_LOCAL_QUEUE_PATH}/edit/finish`)).toHaveLength(0);
 });

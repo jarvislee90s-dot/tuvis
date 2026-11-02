@@ -96,14 +96,15 @@ Q5/Q6 代码已提交；Q7、C1–C2、M1–M2、K1–K2 与 V0 的收口见下�
 
 - C1 后端：`ProviderChoice`、`SelectionView.providers`、`ControlAction::Selection.provider`、`build_selection_command_for_provider`；目录解析保留全部合法 provider 分组，模型/档位只取目标组自己的列表，未知/他组/空档位拒绝；动作指纹对 `Some(provider)` 生效、`None` 保留旧形状；Hub 确认目标 provider 与 Session 写锁。新增 RED：provider 函数不存在（选择测试无法编译）→ 实现后 3 passed；命令级 `selection_uses_target_provider_and_waits_for_it` 1 passed；HTTP `selection_provider_reaches_backend_through_action_whitelist` 1 passed。
 - C2 前端：新增 `ProviderChoice`/`ModeView` 类型与 `resolveModelChoice` 纯函数；面板增加供应商下拉，切供应商零 POST，选模型后一次提交完整三元组。纯函数缺失 RED → GREEN 3 passed；UI `provider_change_alone_emits_zero_post_then_model_sends_one_full_triple` 1 passed。不可用 provider 禁用、旧载荷仅当前 provider 兼容。
-- **偏离/风险**：G0 明确 provider 可用性字段未证实；解析只在显式 `available=false` 时关闭，缺字段按可用，属于候选级乐观假设，不能称为“跨供应商实机通过”。真实两个已配置 provider、目录缓存联动、上下文保留均 NOT RUN。
+- **评审修正（2026-11-02）**：原实现只在显式 `available=false` 时关闭，缺字段按可用，属于候选级乐观假设；已收紧为**当前 provider 缺省 true、非当前 provider 仅显式 `available=true` 才开放**，并补 `provider_availability_defaults_only_for_current_provider`。生产合并出口原先只复制当前 `models`、不复制 `providers`，已补 `selection_load_exposes_provider_groups_through_session_view`（RED：生产读路径返回空数组 → GREEN）。真实两个已配置 provider、目录缓存联动、上下文保留仍 NOT RUN；目录成员本身仍不等于“当前工作区可用配置”的证据。
 
 ### M1 / M2：R10 协作模式
 
-- 后端新增 `CollaborationMode`/`ModeView`、`switchCollaborationMode` 纯构造（payload 只含 mode + baseRevision；`edit` 只读、yolo 必须显式确认）、`normalize_mode`（`planEnabled=true` → Plan，`auto` → Build，未知不猜）、`ControlAction::Mode` 与 HTTP 白名单；`Capability::Mode` 作为第 12 项独立能力，已知 build 走接口候选、未知 build 由 switch 方法 + config.mode 形状开放，绝不借 send/approval/queue。
+- 后端新增 `CollaborationMode`/`ModeView`、`switchCollaborationMode` 纯构造（payload 只含 mode + baseRevision；`edit` 只读、yolo 必须显式确认）、`normalize_mode`（`planEnabled=true` → Plan，`auto` → Build，未知不猜）、`ControlAction::Mode` 与 HTTP 白名单；`Capability::Mode` 作为第 12 项独立能力，已知 build 才走静态判据，未知 build 不再凭 switch 方法 + config.mode 形状开放，绝不借 send/approval/queue。
 - `CommandSender::execute_mode`：新鲜 ready/idle/no pending 读 → 恰一帧 → ACK 只落 accepted → 有界等 revision 前进且规范化 effectiveMode 精确相等才 confirmed；复用既有 `StopPort` 的只读 session（未另造 ModePort，属实现偏离）；Hub 的同会话写锁覆盖 Selection/Mode。
 - 新增 `mode.rs` 3 tests、命令级模式测试 1 passed、HTTP mode 白名单正向/多余字段 400 1 passed、resolver 模式独立性 1 passed、DAO 12 能力词可逆 1 passed。M2 面板：四标签、应用/取消、完全访问额外确认、ACK 不乐观改标签；UI 2 passed。真实四模式效果、原生界面同步、`planEnabled` 实机序列化、手机发送实际审批策略 NOT RUN。
-- **偏离**：`ModeView` 放在 `SelectionView.mode`，而非计划写的 `SessionView.mode`；为避免 51 处 SessionView 字面量扩散而采取该形状，API 已随 selection 下发，前端消费一致。`Mode` 能力目前无独立首次确认账本行，候选来自接口形状；这与“扩权确认”只在 UI 的 yolo 二次确认层面成立，尚未有模式动作的实机 evidence 账本。
+- **偏离**：`ModeView` 放在 `SelectionView.mode`，而非计划写的 `SessionView.mode`；为避免 51 处 SessionView 字面量扩散而采取该形状，API 已随 selection 下发，前端消费一致。
+- **评审修正（2026-11-02）**：Mode 已进入 Hub 确认能力集合，新增 `ConfirmationTarget::Mode`、`ModeObservation`、`confirm_mode`（规范化 effectiveMode + revision 前进）、回执 confirmed/degraded 收口与 `mode_matched` 证据词；未知 build 只凭共享方法/形状不再开放，已知 build 才走候选。新增纯判据、pump 落账、回执失败降级、动作级登记测试。仍无真实模式效果/实机 evidence 账本，不能据此声称 R10 实机通过。
 
 ### K1 / K2：签名入口与凭据回归
 
@@ -112,10 +113,10 @@ Q5/Q6 代码已提交；Q7、C1–C2、M1–M2、K1–K2 与 V0 的收口见下�
 
 ### V0 门禁与剩余缺口（2026-11-02）
 
-- 前端：`pnpm test` 207 files / 2536 passed、5 skipped；`pnpm check`（Prettier、ESLint、i18n 2673 键、错误码 328 码、tsc、vite）通过；`pnpm build:mobile` 通过。ESLint 仅 1 条既有 `uploadCtrlsRef` warning，无 error。
-- Rust：`cargo check --locked`（src-tauri 下）通过；`cargo test --locked --features marker-helper` 4345 passed、0 failed；`cargo test --locked --tests --features marker-helper,zcode-bridge-evidence` 4368 passed、0 failed；`cargo test --locked --lib --features marker-helper,zcode-bridge-evidence` 3838 passed、0 failed、38 ignored；两套 `cargo clippy --all-targets ... -D warnings` 与 `cargo fmt --check` 通过。
+- 前端：`pnpm test` 207 files / **2538 passed**、5 skipped；`pnpm check`（Prettier、ESLint、i18n 2673 键、错误码 328 码、tsc、vite）通过；`pnpm build:mobile` 通过。ESLint 仅 1 条既有 `uploadCtrlsRef` warning，无 error。
+- Rust：`cargo check --locked`（src-tauri 下）通过；`cargo test --locked --features marker-helper` **4354 passed**、0 failed；`cargo test --locked --tests --features marker-helper,zcode-bridge-evidence` **4377 passed**、0 failed；`cargo test --locked --lib --features marker-helper,zcode-bridge-evidence` **3847 passed**、0 failed、38 ignored；两套 `cargo clippy --all-targets ... -D warnings` 与 `cargo fmt --check` 通过。
 - 真实宿主/真实凭据/真实发送停止/审批模式效果/真实 Keychain 四类/两 provider 上下文/移动真机：全部 NOT RUN。自动假链只能证明接线与守卫，不证明 R09/R10 的宿主效果或平台提示次数。
-- 仍关闭/未证：provider 可用性字段（默认可用是候选假设）；Mode 独立 evidence 账本；真实未知 build 的模型/thought 首用确认；真实附件删除窗口；官方队列 W0 写能力仍按原门；R02 证书条件。未发现新的持久秘密/正文/链接泄漏。
+- 仍关闭/未证：非当前 provider 缺 `available` 时保守禁用（已按评审收紧）；Mode 已有确认账本接线但真实模式效果未跑；真实未知 build 的模型/thought 首用确认；真实附件删除窗口；官方队列 W0 写能力仍按原门；R02 证书条件。未发现新的持久秘密/正文/链接泄漏。
 - 报告复跑以最终 HEAD 为准；执行者不再自判“可合并”。以上为单会话执行与限定复审，最终仍需原聊天/独立 reviewer 复核。
 
 ## R01–R10 覆盖表（最终代码；真实宿主状态单列）
@@ -133,4 +134,17 @@ Q5/Q6 代码已提交；Q7、C1–C2、M1–M2、K1–K2 与 V0 的收口见下�
 | R09 跨供应商两级选择     | C1 parser/command/route tests；C2 provider UI；同模型不同 provider 可分                             | 两 provider 真实切换/上下文 NOT RUN       | 代码与假链闭合，**可用性字段仍为候选假设** |
 | R10 四模式               | M1 `mode.rs` 3、命令 1、HTTP 1、resolver 1、DAO 1；M2 UI 2；四标签/planEnabled/yolo 确认/ACK 不乐观 | 四模式真实效果、原生 UI、实际审批 NOT RUN | 代码与假链闭合，**实机未跑**               |
 
-继承八能力、问答/审批/正文/附件回归由 4345 项普通测试与 4368 项 evidence 集成回归覆盖；没有用“全绿”替代上表的实机未跑结论。
+继承八能力、问答/审批/正文/附件回归由 4354 项普通测试与 4377 项 evidence 集成回归覆盖；没有用“全绿”替代上表的实机未跑结论。
+
+## 2026-11-02 独立评审修正轮
+
+独立评审在 `b9708e8a` 上指出 6 项代码缺口；本轮逐项以失败回归/根因修复，未连接真实宿主。
+
+1. **P1 供应商目录未下发**：`view_with_catalog` 只复制 `models`，`providers` 保持投影空数组。新增生产读路径测试，RED 为 `left: [] / right: [A,B]`；修复为同一合并出口复制 `catalog.providers`。GET 与实时帧共用该出口（`on_data_outcome` 前后快照同函数）。
+2. **P1 再编辑取消误删快照**：原流程先 `POST /edit` 撤回、再询问冲突，取消调用 `finish`。改为**已知草稿先 preflight**，取消零 `POST /edit`；请求期间才出现的冲突，取消只关对话框、不调用 `finish`，保留 `recoverableEdits` 入口。新增两条 flow 测试（preflight 零 edit/零 finish；请求期冲突取消零 finish）。
+3. **P1 Unknown 人工核对未接线**：面板新增 `getZcodeQueueRecovery` + `acknowledgeZcodeQueueRecovery` 四类按钮（priority/manual stop/dispatch/unconfirmed），核对只解除屏障，不重发/重停；核对后独立“继续队列”。新增四按钮 API 断言与“核对后出现 resume”测试。
+4. **P2 运行态守卫**：Selection 现在要求 `ready && pending.empty && control=Some(empty activeWorks)`；Mode 的 `control=None` 不再当作空闲。新增零帧拒绝测试（Selection unknown/running、Mode unknown）。
+5. **P2 同名模型档位串组**：`provider_from_record` 的扁平档位回退增加 `provider_id == config.provider`；新增 A/B 同名模型的失败回归，B 未声明档位保持空。
+6. **P2 Mode 证据/账本**：未知 build 的 Mode 在 resolver 中保守关闭（`needs_evidence`），仅已知 build 静态判据可开；Mode 进入 Hub 首次确认集合，新增 `ConfirmationTarget::Mode`、`ModeObservation`、`confirm_mode`、`mode_matched` 证据词与回执 degraded 收口。新增纯判据、pump 确认、回执失败降级、动作级登记测试。另将“完全访问只有 UI 检查”的评审表述更正为：服务端 `execute_mode` 也会拒绝 `confirmFullAccess=false`。
+
+复跑（本轮修改后，最终计数）：普通 Rust **4354 passed / 0 failed**；evidence integration **4377 passed / 0 failed**；evidence lib **3847 passed / 38 ignored**（一次 `pong_write_is_bounded_on_half_open_socket` 在满载下偶发失败，单跑及重跑全绿，记录为已知 flaky，不记为产品修复）；移动端全量 **2538 passed / 5 skipped**；`pnpm check`、`build:mobile`、两套 clippy、`cargo fmt --check` 通过。

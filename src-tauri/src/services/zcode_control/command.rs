@@ -1659,7 +1659,16 @@ impl CommandSender {
         if view.generation != target.bridge_generation() {
             return Err(ZcodeError::of(codes::STALE_GENERATION));
         }
-        if !view.ready {
+        if !view.ready || !view.pending.is_empty() {
+            return Err(ZcodeError::of(codes::NOT_READY));
+        }
+        // 运行态必须**已确认空闲**：control 缺席 = 未知，不当作空闲；有前台回合
+        // 也不写配置（同一会话写锁之外再按新鲜投影守一次）。
+        if view
+            .control
+            .as_ref()
+            .is_none_or(|control| !control.active_works.is_empty())
+        {
             return Err(ZcodeError::of(codes::NOT_READY));
         }
         // 目标 provider：旧动作缺省 = 当前会话 provider；新动作必须落在一个官方目录
@@ -1821,11 +1830,10 @@ impl CommandSender {
         if !view.ready || !view.pending.is_empty() {
             return Err(ZcodeError::of(codes::NOT_READY));
         }
-        if view
-            .control
-            .as_ref()
-            .is_some_and(|control| !control.active_works.is_empty())
-        {
+        let Some(control) = view.control.as_ref() else {
+            return Err(ZcodeError::of(codes::NOT_READY));
+        };
+        if !control.active_works.is_empty() {
             return Err(ZcodeError::of(codes::NOT_READY));
         }
         let base_revision = view
@@ -5027,6 +5035,31 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn mode_requires_confirmed_idle_control() {
+            let store = DeviceStore::memory();
+            let fake = FakeBridge::new(Reply::Body(accepted_body()));
+            let mut no_control = mode_view(CollaborationMode::Build, 4);
+            no_control.control = None;
+            let stop = FakeStop::sequence(vec![no_control]);
+            let mut caps = CapabilityView::default();
+            caps.mode.enabled = true;
+            caps.mode.reason_code = None;
+            let sender = stop_sender(&fake, &stop, &store).with_capabilities(caps);
+            let action = ControlAction::Mode {
+                session_id: SESSION.to_owned(),
+                generation: GEN,
+                mode: CollaborationMode::Plan,
+                confirm_full_access: false,
+            };
+            let err = sender
+                .execute(&ctx("m-unknown"), &target(), &action)
+                .await
+                .unwrap_err();
+            assert_eq!(err.code, codes::NOT_READY);
+            assert!(envelopes_of_type(&fake, "switchCollaborationMode").is_empty());
+        }
+
+        #[tokio::test]
         async fn mode_switch_sends_one_frame_and_confirms_only_fresh_config() {
             let store = DeviceStore::memory();
             let fake = FakeBridge::new(Reply::Body(accepted_body()));
@@ -7505,8 +7538,8 @@ mod tests {
 
         use crate::services::zcode_control::selection::SWITCH_MODEL_CONFIG_TYPE;
         use crate::services::zcode_control::types::{
-            CapabilityFlag, CapabilityView, ModelChoice, ProviderChoice, QueueView, SelectionView,
-            SessionView,
+            ActiveWork, CapabilityFlag, CapabilityView, ControlView, ModelChoice, ProviderChoice,
+            QueueView, SelectionView, SessionView,
         };
 
         use super::answer::stored_state;
@@ -7559,7 +7592,9 @@ mod tests {
                 revision,
                 ready: true,
                 pending: Vec::new(),
-                control: None,
+                control: Some(ControlView {
+                    active_works: Vec::new(),
+                }),
                 selection: Some(selection),
                 capabilities: CapabilityView::default(),
                 queue: QueueView::default(),
@@ -8048,6 +8083,48 @@ mod tests {
             assert_eq!(replay, first, "闸收回不得把「做过」误报成「没做过」");
             assert_eq!(switch_frames(&fake).len(), 1);
             assert_eq!(row_count(&store), 1);
+        }
+
+        /// 运行态未知（control=None）或有前台回合：Selection 零帧拒绝。
+        #[tokio::test]
+        async fn selection_requires_confirmed_idle_control() {
+            let store = DeviceStore::memory();
+            let fake = FakeBridge::new(Reply::Body(accepted_body()));
+            let mut no_control = view(Some(REVISION), catalog());
+            no_control.control = None;
+            let port = FakeSelection::new(no_control, catalog());
+            let sender = selection_sender(&fake, &port, &store);
+            let err = sender
+                .execute(
+                    &ctx("s-unknown"),
+                    &target(),
+                    &selection_action("model-a", "high"),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(err.code, codes::NOT_READY);
+            assert!(switch_frames(&fake).is_empty(), "运行态未知必须零帧");
+
+            let mut running = view(Some(REVISION), catalog());
+            running.control = Some(ControlView {
+                active_works: vec![ActiveWork {
+                    source_command_id: None,
+                    kind: "primaryTurn".to_owned(),
+                    foreground_execution_id: Some("E1".to_owned()),
+                }],
+            });
+            let port = FakeSelection::new(running, catalog());
+            let sender = selection_sender(&fake, &port, &store);
+            let err = sender
+                .execute(
+                    &ctx("s-running"),
+                    &target(),
+                    &selection_action("model-a", "high"),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(err.code, codes::NOT_READY);
+            assert!(switch_frames(&fake).is_empty(), "运行中必须零帧");
         }
 
         /// 目标 provider B：命令 payload 与 wait_selection 都用 B，不拿 A 的目录冒充。

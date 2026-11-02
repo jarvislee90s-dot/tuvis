@@ -86,6 +86,12 @@ fn resolve_all(
             .iter()
             .find(|candidate| candidate.capability == capability);
         let shipped = shipped_state(key, capability);
+        // R10：模式不是“共享发送方法 + 形状”就能开放的通用能力；只认已知 build
+        // 的静态判据。未知 build 即使接口形状齐全也保守关闭，等待实机证据。
+        if capability == Capability::Mode && shipped.is_none() {
+            assign(&mut view, capability, closed(codes::NEEDS_EVIDENCE));
+            continue;
+        }
         // 队列写：接口形状位恒 `false`（`interface_capabilities` 不认队列），
         // 「形状在场」改由 **build 命令条目**提供——shipped 表命中候选/确认条目
         // 即视为判据在场；否则永远落不到候选档。
@@ -803,6 +809,13 @@ mod tests {
 
         let unknown = CapabilityKey::new("macos", "9.9.9.9999", 3, "shape", 1);
         let unknown_view = resolve_capabilities(&unknown, &evidence, &MemoryLedger::default());
-        assert!(unknown_view.mode.enabled, "未知 build 由接口候选开放");
+        assert!(
+            !unknown_view.mode.enabled,
+            "未知 build 不得只凭共享形状开放模式"
+        );
+        assert_eq!(
+            unknown_view.mode.reason_code.as_deref(),
+            Some(codes::NEEDS_EVIDENCE)
+        );
     }
 }

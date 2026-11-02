@@ -251,11 +251,12 @@ fn provider_from_record(record: &Value, config: &SessionConfig<'_>) -> ZResult<P
                 .and_then(|specs| specs.get("reasoningLevel"))
                 .and_then(|level| level.get("values")),
         );
-        let thought_levels = if declared.is_empty() && model_id == config.model {
-            config.thought_levels.clone()
-        } else {
-            declared
-        };
+        let thought_levels =
+            if declared.is_empty() && provider_id == config.provider && model_id == config.model {
+                config.thought_levels.clone()
+            } else {
+                declared
+            };
         if choices.iter().any(|choice| choice.model_id == model_id) {
             continue;
         }
@@ -264,10 +265,13 @@ fn provider_from_record(record: &Value, config: &SessionConfig<'_>) -> ZResult<P
             thought_levels,
         });
     }
+    // 目录成员本身只证明“当前工作区里有这个分组”，不证明其他供应商此刻可用。
+    // 当前 provider 缺省可用；非当前 provider 只有显式 available=true 才开放，
+    // 避免把未知资格当作可切换目标。显式 false 始终关闭。
     let available = record
         .get("available")
         .and_then(Value::as_bool)
-        .unwrap_or(true);
+        .unwrap_or(provider_id == config.provider);
     let reason_code = record
         .get("reasonCode")
         .and_then(Value::as_str)
@@ -758,7 +762,7 @@ mod provider_tests {
                 {"providerId": "a", "providerName": "A", "models": [
                     {"modelId": "same", "config": {"optionSpecs": {"reasoningLevel": {"values": ["low"]}}}}
                 ]},
-                {"providerId": "b", "providerName": "B", "models": [
+                {"providerId": "b", "providerName": "B", "available": true, "models": [
                     {"modelId": "same", "config": {"optionSpecs": {"reasoningLevel": {"values": ["high"]}}}}
                 ]}
             ]
@@ -802,5 +806,54 @@ mod provider_tests {
         let view = session_with(selection);
         let legacy = build_selection_command(&view, "same", "low").unwrap();
         assert_eq!(legacy["payload"]["provider"], "a");
+    }
+    #[test]
+    fn fallback_levels_are_scoped_to_current_provider_and_model() {
+        let raw = serde_json::json!({
+            "config": {"provider": "a", "model": "same", "thought": "low", "thoughtLevels": ["low"]},
+            "providers": [
+                {"providerId": "a", "models": [{"modelId": "same", "config": {"optionSpecs": {"reasoningLevel": {"values": ["low"]}}}}]},
+                {"providerId": "b", "models": [{"modelId": "same", "config": {}}]}
+            ]
+        });
+        let selection = parse_selection_view(&raw).unwrap();
+        let current = selection
+            .providers
+            .iter()
+            .find(|p| p.provider_id == "a")
+            .unwrap();
+        let other = selection
+            .providers
+            .iter()
+            .find(|p| p.provider_id == "b")
+            .unwrap();
+        assert_eq!(current.models[0].thought_levels, vec!["low"]);
+        assert!(
+            other.models[0].thought_levels.is_empty(),
+            "B 未声明档位不得借用 A"
+        );
+    }
+    #[test]
+    fn provider_availability_defaults_only_for_current_provider() {
+        let raw = serde_json::json!({
+            "config": {"provider": "a", "model": "ma", "thought": "low", "thoughtLevels": ["low"]},
+            "providers": [
+                {"providerId": "a", "models": [{"modelId": "ma", "config": {"optionSpecs": {"reasoningLevel": {"values": ["low"]}}}}]},
+                {"providerId": "b", "models": [{"modelId": "mb", "config": {"optionSpecs": {"reasoningLevel": {"values": ["low"]}}}}]},
+                {"providerId": "c", "available": true, "models": [{"modelId": "mc", "config": {"optionSpecs": {"reasoningLevel": {"values": ["low"]}}}}]}
+            ]
+        });
+        let selection = parse_selection_view(&raw).unwrap();
+        let available = |id: &str| {
+            selection
+                .providers
+                .iter()
+                .find(|p| p.provider_id == id)
+                .unwrap()
+                .available
+        };
+        assert!(available("a"), "当前供应商缺省可用");
+        assert!(!available("b"), "非当前供应商缺字段必须保守关闭");
+        assert!(available("c"), "显式 true 才开放");
     }
 }

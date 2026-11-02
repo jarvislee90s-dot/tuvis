@@ -1310,6 +1310,15 @@ async fn answer_permission_selection_confirm_and_audit_terminal_rows() {
     assert_eq!(audit_rows(&store, "zcode_permission", "confirmed"), 1);
 
     // ---- 档位切换：恰一帧 switchModelConfig，宿主生效后 confirmed ----
+    // 计划要求写前“已确认空闲、无 pending”；前两张卡已撤，这里给一个干净投影，
+    // 不让选择动作借用问答卡的运行态。
+    official.set_session(SessionView {
+        pending: Vec::new(),
+        control: Some(ControlView {
+            active_works: Vec::new(),
+        }),
+        ..session_with_cards()
+    });
     official.set_selection(selection_view());
     let (status, body) = post_action(
         app.clone(),

@@ -33,10 +33,11 @@ use super::auth::{AuthService, AuthStatus, OAuthProvider, OpenAuthorize};
 use super::auto_connect::{capture_auto_intent, write_auto_intent, AutoIntentClaim};
 use super::bridge::{BridgeManager, DataOutcome};
 use super::capability::{
-    confirm_interrupt, confirm_pending, confirm_selection, confirm_send, resolve_capabilities,
-    shipped_state, Capability, CapabilityKey, CapabilityRecord, CapabilityState,
-    ConfirmationBaseline, ConfirmationContext, ConfirmationObservation, ConfirmationOutcome,
-    ConfirmationTarget, InterruptObservation, SelectionObservation, SendObservation,
+    confirm_interrupt, confirm_mode, confirm_pending, confirm_selection, confirm_send,
+    resolve_capabilities, shipped_state, Capability, CapabilityKey, CapabilityRecord,
+    CapabilityState, ConfirmationBaseline, ConfirmationContext, ConfirmationObservation,
+    ConfirmationOutcome, ConfirmationTarget, InterruptObservation, ModeObservation,
+    SelectionObservation, SendObservation,
 };
 use super::command::CommandSender;
 use super::config::{get_config, ConfigState};
@@ -122,6 +123,8 @@ mod confirmation_words {
     pub(crate) const INTERRUPT_CLEARED: &str = "guard_cleared";
     /// interrupt 到点未决且最后观察里目标守卫仍在场。
     pub(crate) const INTERRUPT_STILL_ACTIVE: &str = "guard_still_active";
+    /// 模式确认：目标 effectiveMode 与新鲜规范化配置精确相等。
+    pub(crate) const MODE_CONFIRMED: &str = "mode_matched";
     /// 确认窗到点未取得证据（不重发，保持候选）。
     pub(crate) const TIMEOUT: &str = "timeout_5s";
     /// 动作回执显式失败（host rejected/noop）。
@@ -274,6 +277,18 @@ impl ConfirmationTracker {
                     continue;
                 }
                 let outcome = match &ctx.target {
+                    ConfirmationTarget::Mode { .. } => {
+                        let obs = ModeObservation {
+                            generation,
+                            revision: view.revision,
+                            effective_mode: view
+                                .selection
+                                .as_ref()
+                                .and_then(|selection| selection.mode.as_ref())
+                                .and_then(|mode| mode.effective_mode),
+                        };
+                        confirm_mode(&ctx, &obs)
+                    }
                     ConfirmationTarget::UserMessage { .. } => {
                         // 观察证据缺一半（revision 或指纹未取得）→ 不判定，等下一帧。
                         match (view.revision, fingerprint.as_ref()) {
@@ -560,6 +575,7 @@ fn confirmed_evidence(target: &ConfirmationTarget) -> &'static str {
         ConfirmationTarget::Selection { .. } => confirmation_words::SELECTION_CONFIRMED,
         ConfirmationTarget::Pending { .. } => confirmation_words::PENDING_CONFIRMED,
         ConfirmationTarget::Interrupt { .. } => confirmation_words::INTERRUPT_CONFIRMED,
+        ConfirmationTarget::Mode { .. } => confirmation_words::MODE_CONFIRMED,
     }
 }
 
@@ -572,6 +588,7 @@ fn confirmed_receipt_evidence(target: &ConfirmationTarget) -> &'static str {
     match target {
         ConfirmationTarget::Pending { .. } => confirmation_words::PENDING_CLEARED,
         ConfirmationTarget::Interrupt { .. } => confirmation_words::INTERRUPT_CLEARED,
+        ConfirmationTarget::Mode { .. } => confirmation_words::MODE_CONFIRMED,
         _ => confirmed_evidence(target),
     }
 }
@@ -3838,6 +3855,7 @@ impl ZcodeHub {
         let confirmation_capabilities: Vec<Capability> = match &action {
             ControlAction::Send { .. } => vec![Capability::Send],
             ControlAction::Selection { .. } => vec![Capability::Model, Capability::ThoughtLevel],
+            ControlAction::Mode { .. } => vec![Capability::Mode],
             // 问答作答：候选 = 宿主卡题型推导（客户端所选数量/freeText 内容不参与）。
             ControlAction::Answer { .. } => host_required
                 .iter()
@@ -3962,6 +3980,9 @@ impl ZcodeHub {
                 },
                 // 问答作答：目标 = 动作指向的宿主卡 requestKey（本实现取
                 // `PendingView.interaction_id`；只存 id 形状，绝不存题目/选项/答案）。
+                (ControlAction::Mode { mode, .. }, Capability::Mode) => {
+                    ConfirmationTarget::Mode { mode: *mode }
+                }
                 (
                     ControlAction::Answer { interaction_id, .. },
                     Capability::SingleSelect | Capability::MultiSelect | Capability::FreeText,
@@ -5179,10 +5200,11 @@ mod tests {
         MemoryCredentialStore, StoredCredential, SCHEMA_VERSION,
     };
     use crate::services::zcode_control::types::{
-        ActionState, ActiveWork, AnswerEntry, CapabilityFlag, ControlView, PendingKind,
+        ActionState, ActiveWork, AnswerEntry, CapabilityFlag, ControlView, ModeView, PendingKind,
         PendingView, QuestionOption, QuestionView, QueueActionAvailability, QueueItemView,
         QueueView, SelectionView,
     };
+    use crate::services::zcode_control::CollaborationMode;
     use std::sync::atomic::{AtomicBool, AtomicUsize};
     use std::time::Duration;
     use tokio::sync::Notify;
@@ -5667,6 +5689,7 @@ mod tests {
             "queue_edit" => &mut view.queue_edit,
             "queue_now" => &mut view.queue_now,
             "queue_resume" => &mut view.queue_resume,
+            "mode" => &mut view.mode,
             other => panic!("unknown capability {other}"),
         };
         flag.enabled = true;
@@ -12110,6 +12133,130 @@ mod tests {
             None,
         );
         assert!(ledger.get(&confirmation_key()).is_empty());
+    }
+
+    /// R10 接线：Mode 确认由事件泵按“规范化 effectiveMode + revision 前进”落账，
+    /// 未匹配时保持候选（与纯判据同一入口）。
+    #[tokio::test]
+    async fn mode_confirmation_confirms_via_pump_and_keeps_candidate_on_mismatch() {
+        let store = stored(URL);
+        let ledger: Arc<dyn CapabilityLedger> = Arc::new(DbCapabilityLedger::new(store));
+        let tracker = ConfirmationTracker::new(Some(ledger.clone()));
+        let generation = 7;
+        assert!(tracker.register(ConfirmationContext {
+            capability: Capability::Mode,
+            key: confirmation_key(),
+            session_id: "sess_synthetic0000".to_owned(),
+            generation,
+            baseline_revision: 10,
+            target: ConfirmationTarget::Mode {
+                mode: CollaborationMode::Plan,
+            },
+            deadline: Instant::now() + Duration::from_secs(5),
+        }));
+        let mut view = changed_view("sess_synthetic0000", 11);
+        view.selection = Some(SelectionView {
+            provider: "provider-a".to_owned(),
+            model: "model-a".to_owned(),
+            thought: None,
+            models: Vec::new(),
+            providers: Vec::new(),
+            mode: Some(ModeView {
+                raw_mode: Some(CollaborationMode::Build),
+                plan_enabled: None,
+                effective_mode: Some(CollaborationMode::Build),
+            }),
+        });
+        tracker.observe_session(&view, generation, None, None);
+        assert!(
+            ledger.get(&confirmation_key()).is_empty(),
+            "模式不匹配不得确认"
+        );
+
+        view.revision = Some(12);
+        view.selection.as_mut().unwrap().mode = Some(ModeView {
+            raw_mode: Some(CollaborationMode::Plan),
+            plan_enabled: Some(true),
+            effective_mode: Some(CollaborationMode::Plan),
+        });
+        tracker.observe_session(&view, generation, None, None);
+        let rows = ledger.get(&confirmation_key());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].capability, Capability::Mode);
+        assert_eq!(rows[0].state, CapabilityState::Confirmed);
+        assert_eq!(rows[0].evidence.as_deref(), Some("mode_matched"));
+    }
+
+    /// R10：Mode 回执显式失败按能力槽位 degraded，不误伤 send/selection。
+    #[tokio::test]
+    async fn mode_receipt_failure_degrades_mode_only() {
+        let store = stored(URL);
+        let ledger: Arc<dyn CapabilityLedger> = Arc::new(DbCapabilityLedger::new(store));
+        let tracker = ConfirmationTracker::new(Some(ledger.clone()));
+        let generation = 7;
+        assert!(tracker.register(ConfirmationContext {
+            capability: Capability::Mode,
+            key: confirmation_key(),
+            session_id: "sess_synthetic0000".to_owned(),
+            generation,
+            baseline_revision: 10,
+            target: ConfirmationTarget::Mode {
+                mode: CollaborationMode::Guarded,
+            },
+            deadline: Instant::now() + Duration::from_secs(5),
+        }));
+        tracker.settle_receipt(
+            "sess_synthetic0000",
+            &[Capability::Mode],
+            &ActionReceipt {
+                action_id: "mode-fail".to_owned(),
+                session_id: "sess_synthetic0000".to_owned(),
+                generation,
+                state: ActionState::Rejected,
+                reason_code: Some("host_rejected".to_owned()),
+                send_admission: None,
+            },
+            generation,
+        );
+        let rows = ledger.get(&confirmation_key());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].capability, Capability::Mode);
+        assert_eq!(rows[0].state, CapabilityState::Degraded);
+        assert_eq!(rows[0].evidence.as_deref(), Some("explicit_failure"));
+        assert_eq!(rows[0].reason_code.as_deref(), Some("host_rejected"));
+    }
+
+    /// R10 动作级接线：Mode 在 Hub 登记首次确认；回执显式失败立即 degraded，
+    /// 证明不是只有 UI 的确认框。
+    #[tokio::test]
+    async fn mode_action_registers_and_rejected_receipt_degrades() {
+        let store = stored(URL);
+        let ledger: Arc<dyn CapabilityLedger> = Arc::new(DbCapabilityLedger::new(store));
+        let fake = Arc::new(FakeBackend::default());
+        fake.queue_ready.store(true, Ordering::SeqCst);
+        fake.set_baseline(interrupt_baseline(Some(Vec::new())));
+        fake.set_execute_receipt(ActionState::Rejected, Some("host_rejected".to_owned()));
+        let (hub, _events, _pump) =
+            confirmation_hub(fake, ledger.clone(), policy_with(&["mode"])).await;
+        let generation = hub.connection().generation;
+        let receipt = hub
+            .execute(
+                ctx("mode-register"),
+                ControlAction::Mode {
+                    session_id: "sess_synthetic0000".to_owned(),
+                    generation,
+                    mode: CollaborationMode::Plan,
+                    confirm_full_access: false,
+                },
+            )
+            .await
+            .expect("Mode 回执应返回");
+        assert_eq!(receipt.state, ActionState::Rejected);
+        let rows = ledger.get(&confirmation_key());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].capability, Capability::Mode);
+        assert_eq!(rows[0].state, CapabilityState::Degraded);
+        assert_eq!(rows[0].reason_code.as_deref(), Some("host_rejected"));
     }
 
     // ====================================================================

@@ -29,7 +29,7 @@
 use std::time::Instant;
 
 use super::{Capability, CapabilityKey};
-use crate::services::zcode_control::types::SessionView;
+use crate::services::zcode_control::types::{CollaborationMode, SessionView};
 
 /// 确认目标（动作提交时登记；观察与之对拍）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,6 +58,8 @@ pub(crate) enum ConfirmationTarget {
         /// 登记时刻动作指向的守卫 id；观察侧它不在 activeWorks = 目标守卫消失。
         guard_id: String,
     },
+    /// 协作模式切换：目标模式；观察侧规范化 effectiveMode 精确相等才确认。
+    Mode { mode: CollaborationMode },
 }
 
 /// 一次待确认登记（tracker 持有；动作提交前捕获 baseline）。
@@ -118,6 +120,12 @@ pub(crate) struct SelectionObservation {
 /// revision 的安放处，而 interrupt 判据要求「generation 匹配 AND revision 前进
 /// AND 守卫消失」三合一；不改协议 DTO（不猜协议），判据输入用本快照。
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ModeObservation {
+    pub generation: u64,
+    pub revision: Option<u64>,
+    pub effective_mode: Option<CollaborationMode>,
+}
+
 pub(crate) struct InterruptObservation {
     /// 观察时刻的 Hub 代际（与 ctx.generation 对拍；旧代际一律不确认）。
     pub generation: u64,
@@ -250,6 +258,28 @@ pub(crate) fn confirm_pending(
     let revision_advanced = revision > ctx.baseline_revision;
     let target_cleared = !host_pending.iter().any(|id| id == request_key);
     if revision_advanced && target_cleared {
+        ConfirmationOutcome::Confirmed
+    } else {
+        ConfirmationOutcome::Inconclusive
+    }
+}
+
+/// 模式判据（R10）：代际匹配、revision 前进、规范化 effectiveMode 精确相等。
+/// `planEnabled=true` 的 build 在投影里已规范化为 Plan，不能用原始 mode 字符串比较。
+pub(crate) fn confirm_mode(
+    ctx: &ConfirmationContext,
+    obs: &ModeObservation,
+) -> ConfirmationOutcome {
+    if obs.generation != ctx.generation {
+        return ConfirmationOutcome::Inconclusive;
+    }
+    let ConfirmationTarget::Mode { mode } = &ctx.target else {
+        return ConfirmationOutcome::Inconclusive;
+    };
+    let revision_advanced = obs
+        .revision
+        .is_some_and(|revision| revision > ctx.baseline_revision);
+    if revision_advanced && obs.effective_mode == Some(*mode) {
         ConfirmationOutcome::Confirmed
     } else {
         ConfirmationOutcome::Inconclusive
@@ -787,6 +817,50 @@ mod tests {
         let after = control_with(3, vec![]);
         assert_eq!(
             confirm_interrupt(&ctx, &after),
+            ConfirmationOutcome::Inconclusive
+        );
+    }
+    // -----------------------------------------------------------------------
+    // R10：Mode 纯判据
+    // -----------------------------------------------------------------------
+
+    fn mode_ctx(mode: CollaborationMode, revision: u64) -> ConfirmationContext {
+        ConfirmationContext {
+            capability: Capability::Mode,
+            key: CapabilityKey::new("macos", "9.9.9.9999", 3, "shape", 1),
+            session_id: "sess_mode".to_owned(),
+            generation: 7,
+            baseline_revision: revision,
+            target: ConfirmationTarget::Mode { mode },
+            deadline: Instant::now() + std::time::Duration::from_secs(5),
+        }
+    }
+
+    fn mode_obs(revision: Option<u64>, effective: Option<CollaborationMode>) -> ModeObservation {
+        ModeObservation {
+            generation: 7,
+            revision,
+            effective_mode: effective,
+        }
+    }
+
+    #[test]
+    fn matching_normalized_mode_confirms_only_after_revision() {
+        let ctx = mode_ctx(CollaborationMode::Plan, 10);
+        assert_eq!(
+            confirm_mode(&ctx, &mode_obs(Some(11), Some(CollaborationMode::Plan))),
+            ConfirmationOutcome::Confirmed
+        );
+        assert_eq!(
+            confirm_mode(&ctx, &mode_obs(Some(10), Some(CollaborationMode::Plan))),
+            ConfirmationOutcome::Inconclusive
+        );
+        assert_eq!(
+            confirm_mode(&ctx, &mode_obs(Some(11), Some(CollaborationMode::Build))),
+            ConfirmationOutcome::Inconclusive
+        );
+        assert_eq!(
+            confirm_mode(&ctx, &mode_obs(None, Some(CollaborationMode::Plan))),
             ConfirmationOutcome::Inconclusive
         );
     }

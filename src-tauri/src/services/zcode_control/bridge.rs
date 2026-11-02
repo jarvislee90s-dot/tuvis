@@ -829,6 +829,10 @@ impl SessionEntry {
                     models.append(&mut current.models);
                 }
                 current.models = models;
+                // C1：目录分组是手机供应商选择器的唯一来源；只复制当前 provider 的
+                // models 会让 UI 永远没有第二组。写入资格仍由 build_selection_command
+                // 按目标组逐项校验，不因下发目录而放宽。
+                current.providers = catalog.providers.clone();
             }
         }
         view
@@ -1151,7 +1155,7 @@ impl BridgeManager {
     /// 错误帧同样可能已经改写了投影（例如把会话标成不新鲜），这些变化必须原样上报，
     /// 否则上层无法广播降级。ACK/退订仍照常尽力发出。
     pub async fn on_data_outcome(&self, payload: Value) -> DataOutcome {
-        let (result, acks, releases, changed) = {
+        let (result, acks, releases, mut changed, stale_catalogs) = {
             let mut inner = lock(&self.shared.state);
             // 前/后快照与 `handle_data` 在同一把状态锁内：视图差异就是「本帧」
             // 的效果，不会混入锁外其它调用者的读写。
@@ -1174,8 +1178,52 @@ impl BridgeManager {
             }
             // 稳定顺序（HashMap 迭代序随机）：同一批变化的事件顺序可复现。
             changed.sort_by(|left, right| left.session_id.cmp(&right.session_id));
-            (result, acks, releases, changed)
+            // C1 实时切换：目录缓存按 provider 失效。桌面从 A 切到 B 时，若缓存仍属于
+            // A，本帧不能下发空/旧分组；先清缓存，锁外补读 B 目录，再发布刷新后的视图。
+            let mut stale_catalogs = Vec::new();
+            for view in &changed {
+                let Some(entry) = inner.sessions.get_mut(&view.session_id) else {
+                    continue;
+                };
+                let provider_changed = entry.catalog.as_ref().is_some_and(|catalog| {
+                    entry
+                        .projection
+                        .view()
+                        .selection
+                        .as_ref()
+                        .is_some_and(|current| current.provider != catalog.provider)
+                });
+                if provider_changed {
+                    entry.catalog = None;
+                    entry.catalog_attempted_at = None;
+                    stale_catalogs.push(view.session_id.clone());
+                }
+            }
+            (result, acks, releases, changed, stale_catalogs)
         };
+        for session_id in &stale_catalogs {
+            // 单飞、有界；失败只保留空目录，下一次读路径/帧再补，不借用旧 provider。
+            self.ensure_selection_catalog(session_id).await;
+        }
+        if !stale_catalogs.is_empty() {
+            let refreshed: HashMap<String, SessionView> = {
+                let inner = lock(&self.shared.state);
+                stale_catalogs
+                    .iter()
+                    .filter_map(|session_id| {
+                        inner
+                            .sessions
+                            .get(session_id)
+                            .map(|entry| (session_id.clone(), entry.view_with_catalog()))
+                    })
+                    .collect()
+            };
+            for view in &mut changed {
+                if let Some(next) = refreshed.get(&view.session_id) {
+                    *view = next.clone();
+                }
+            }
+        }
         for ack in acks {
             let _ = self.shared.commands.try_send(Command::SendFrame {
                 payload: ack,
@@ -8476,6 +8524,135 @@ mod tests {
             Some(MODEL_SELECTION_CHANNEL)
         );
         assert_eq!(requests[0].body, json!([]), "getView 必须无参");
+    }
+
+    /// C1 回归：目录解析出的全部 provider 分组必须随生产读路径下发，不能只
+    /// 复制当前 provider 的 models。手写 DTO 测试不能替代本用例。
+    #[tokio::test]
+    async fn selection_load_exposes_provider_groups_through_session_view() {
+        const PROVIDER: &str = "synthetic-provider";
+        const OTHER: &str = "synthetic-provider-b";
+        let config = PeerConfig {
+            workspaces: vec![workspace_entry(WS_A, Some("ws-a-identity"), "A")],
+            tasks: vec![task_row(WS_A, SESSION_A, "hi")],
+            conversation_snapshot: Some(selection_snapshot(
+                SESSION_A,
+                2,
+                PROVIDER,
+                "same-model",
+                Some("low"),
+                &["low"],
+            )),
+            model_selection_view: Some(json!({
+                "providers": [
+                    {"providerId": PROVIDER, "providerName": "A", "models": [
+                        {"modelId": "same-model", "config": {"optionSpecs": {"reasoningLevel": {"values": ["low"]}}}}
+                    ]},
+                    {"providerId": OTHER, "providerName": "B", "models": [
+                        {"modelId": "same-model", "config": {"optionSpecs": {"reasoningLevel": {"values": ["high"]}}}}
+                    ]}
+                ]
+            })),
+            ..PeerConfig::default()
+        };
+        let (manager, _peer) = manager_with(config).await;
+        let target = manager.bind(&key(SESSION_A)).await.expect("bind");
+        let (_, selection) = SelectionPort::load(manager.as_ref(), &target)
+            .await
+            .expect("load");
+        assert_eq!(selection.providers.len(), 2, "解析层必须保留两组");
+        let view = StopPort::session(manager.as_ref(), &target, std::time::Duration::from_secs(1))
+            .await
+            .expect("session");
+        let providers = view
+            .selection
+            .as_ref()
+            .expect("selection")
+            .providers
+            .clone();
+        assert_eq!(
+            providers
+                .iter()
+                .map(|provider| provider.provider_id.as_str())
+                .collect::<Vec<_>>(),
+            [PROVIDER, OTHER],
+            "生产读路径必须下发两组，而不是空数组"
+        );
+    }
+
+    /// C1 实时切换：桌面从 A 切到 B 的投影帧到达时，缓存仍属于 A；必须在
+    /// 发布本帧前刷新 B 的目录，不能把手机已有分组清空等下一次手动 GET。
+    #[tokio::test]
+    async fn provider_switch_refreshes_catalog_before_publishing_live_frame() {
+        const PROVIDER_A: &str = "synthetic-provider-a";
+        const PROVIDER_B: &str = "synthetic-provider-b";
+        let config = PeerConfig {
+            workspaces: vec![workspace_entry(WS_A, Some("ws-a-identity"), "A")],
+            tasks: vec![task_row(WS_A, SESSION_A, "hi")],
+            conversation_snapshot: Some(selection_snapshot(
+                SESSION_A,
+                2,
+                PROVIDER_A,
+                "a-only",
+                Some("low"),
+                &["low"],
+            )),
+            model_selection_view: Some(json!({
+                "providers": [
+                    {"providerId": PROVIDER_A, "models": [
+                        {"modelId": "a-only", "config": {"optionSpecs": {"reasoningLevel": {"values": ["low"]}}}}
+                    ]},
+                    {"providerId": PROVIDER_B, "available": true, "models": [
+                        {"modelId": "b-only", "config": {"optionSpecs": {"reasoningLevel": {"values": ["high"]}}}}
+                    ]}
+                ]
+            })),
+            ..PeerConfig::default()
+        };
+        let (manager, peer) = manager_with(config).await;
+        let target = manager.bind(&key(SESSION_A)).await.expect("bind");
+        let (_, initial) = SelectionPort::load(manager.as_ref(), &target)
+            .await
+            .expect("initial catalog");
+        assert_eq!(initial.providers.len(), 2, "初始目录两组");
+
+        let changed = push_selection_delta_on(
+            &peer,
+            SESSION_A,
+            "conv-sub-synthetic-1",
+            1,
+            2,
+            3,
+            PROVIDER_B,
+            "b-only",
+            "high",
+        )
+        .await;
+        let view = changed
+            .iter()
+            .find(|view| view.session_id == SESSION_A)
+            .expect("切换帧必须发布会话");
+        let selection = view.selection.as_ref().expect("selection");
+        assert_eq!(selection.provider, PROVIDER_B);
+        assert_eq!(selection.model, "b-only");
+        assert_eq!(selection.providers.len(), 2, "切换后实时帧不得丢分组");
+        let b = selection
+            .providers
+            .iter()
+            .find(|provider| provider.provider_id == PROVIDER_B)
+            .expect("B 分组");
+        assert_eq!(b.models[0].model_id, "b-only");
+        assert!(
+            !selection
+                .providers
+                .iter()
+                .any(|provider| provider.provider_id == PROVIDER_A
+                    && provider
+                        .models
+                        .iter()
+                        .any(|model| model.model_id == "b-only")),
+            "A 不得借用 B 的模型"
+        );
     }
 
     /// 快照扁平 `config.thoughtLevels` 必须经**生产** `BridgeManager::load` 回退到

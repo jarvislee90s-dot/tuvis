@@ -1066,7 +1066,7 @@ pub struct CapabilityFlag {
     pub reason_code: Option<String>,
 }
 
-/// 本会话能力矩阵（十一项固定字段；默认全部关闭 = 未取得实机证据）。
+/// 本会话能力矩阵（十二项固定字段；默认全部关闭 = 未取得实机证据）。
 ///
 /// 三项 `queue_*` 是**队列专属**槽位：它们绝不借 `send`/`approval_reply` 放行。
 /// 官方 `state.availability` 出现 `queueEdit`/`sendQueuedNow` 只说明宿主**宣告**了

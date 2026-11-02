@@ -157,6 +157,15 @@ _Only versions translated so far are listed here; the full history lives in the
 
 ### Fixed
 
+- **ZCode review fixes (providers / recovery / mode guards)**: the production read
+  path now sends every provider group; editing with a known draft asks first, and
+  cancelling no longer retracts the original item or deletes its recovery snapshot;
+  Unknown / stop / dispatch / restart barriers get manual-review actions that never
+  resend or re-stop and still require an explicit queue resume; Selection and Mode
+  writes now require confirmed idle with no pending; a same model under another
+  provider no longer borrows the current provider's levels; Mode opens only for a
+  known build and is wired into first-use confirmation / failure degradation. A
+  non-current provider with no `available` field is conservatively disabled.
 - **Crash when toggling remote or hot-restarting a channel (Windows)**: turning the
   Remote Access master switch off or hot-restarting a channel could abort the whole
   process (0xc0000409 crashes, observed three times on 2026-10-23) — the stop path of

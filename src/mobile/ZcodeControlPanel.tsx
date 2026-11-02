@@ -20,13 +20,15 @@ import {
   isZcodeErrorCode,
   enqueueZcodeMessage,
   editZcodeQueuedMessage,
-  finishZcodeEdit,
+  getZcodeQueueRecovery,
+  acknowledgeZcodeQueueRecovery,
   getZcodeEditSnapshot,
   prioritizeZcodeMessage,
   resumeZcodeLocalQueue,
   retractZcodeQueuedMessage,
   type CollaborationMode,
   type EditResult,
+  type QueueRecoveryView,
   type ActionReceipt,
   type ConnectionView,
   type ControlAction,
@@ -191,6 +193,11 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
     requestId: string;
     result: EditResult;
   } | null>(null);
+  const [editPreflight, setEditPreflight] = useState<{
+    itemId: string;
+    version: number;
+  } | null>(null);
+  const [queueRecovery, setQueueRecovery] = useState<QueueRecoveryView | null>(null);
   /** 最近一次“再编辑”的请求 ID：新入队时带给服务端消费快照。 */
   const editedFromRef = useRef<string | null>(null);
   /** 网络未知的入队请求：同草稿/同附件重试必须复用原 requestId，绝不换 ID 再登记一份。 */
@@ -272,6 +279,8 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
     setLocalQueueError(null);
     setPriorityPrompt(null);
     setEditConflict(null);
+    setEditPreflight(null);
+    setQueueRecovery(null);
     editedFromRef.current = null;
     setCopyFallback(null);
     setCopyDone(false);
@@ -992,6 +1001,8 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
     setLocalQueueError(null);
     setPriorityPrompt(null);
     setEditConflict(null);
+    setEditPreflight(null);
+    setQueueRecovery(null);
     editedFromRef.current = null;
     setQueueBusyResume(true);
     void (async () => {
@@ -1034,6 +1045,26 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
 
   // ==== Q6：Tuvis 本地待发（入队/插队/再编辑/撤回/继续）====
   const localQueueWritable = gateReason === null && !staleGeneration;
+
+  // Unknown/停止/派发/重启屏障的人工核对入口：只在有本地队列时读取；失败不污染写面。
+  const localQueueVersion = localQueue?.version ?? null;
+  useEffect(() => {
+    if (localQueueVersion === null) {
+      setQueueRecovery(null);
+      return;
+    }
+    let alive = true;
+    void getZcodeQueueRecovery(sessionId)
+      .then((view) => {
+        if (alive) setQueueRecovery(view);
+      })
+      .catch(() => {
+        if (alive) setQueueRecovery(null);
+      });
+    return () => {
+      alive = false;
+    };
+  }, [sessionId, localQueueVersion]);
 
   const refreshLocalView = async () => {
     await refreshLocalQueue();
@@ -1127,7 +1158,21 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
     void refreshLocalView();
   };
 
-  const handleLocalEdit = (itemId: string, version: number) => {
+  /** 附件版本戳：正文/附件在请求期间任一变化，替换都必须重新确认。 */
+  const attachmentStamp = () =>
+    attachmentsRef.current
+      .map(
+        (attachment) =>
+          `${attachment.id}:${attachment.status}:${attachment.path}:${attachment.name}`
+      )
+      .join("\u0001");
+
+  const runLocalEdit = (
+    itemId: string,
+    version: number,
+    intent: "auto" | "replace" | "merge",
+    expectedReplace?: { text: string; attachments: string }
+  ) => {
     if (!localQueueWritable || inFlightRef.current) return;
     setLocalQueueNotice(null);
     setLocalQueueError(null);
@@ -1136,14 +1181,24 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
     void editZcodeQueuedMessage({ requestId: newActionId(), itemId, expectedVersion: version })
       .then((result) => {
         if (!aliveRef.current) return;
-        if (
-          draftRef.current.trim().length > 0 ||
-          attachmentsRef.current.some((a) => a.status === "ready")
-        ) {
-          setEditConflict({ requestId: result.requestId, result });
-        } else {
-          applyEditResult(result, false);
+        if (intent === "merge") {
+          applyEditResult(result, true);
+          return;
         }
+        if (
+          (intent === "auto" &&
+            (draftRef.current.trim().length > 0 ||
+              attachmentsRef.current.some((a) => a.status === "ready"))) ||
+          (intent === "replace" &&
+            expectedReplace !== undefined &&
+            (draftRef.current !== expectedReplace.text ||
+              attachmentStamp() !== expectedReplace.attachments))
+        ) {
+          // 请求期间草稿/附件变化：不覆盖，交给显式选择；取消不删快照。
+          setEditConflict({ requestId: result.requestId, result });
+          return;
+        }
+        applyEditResult(result, false);
       })
       .catch((error: unknown) => {
         if (aliveRef.current) setLocalQueueError(queueErrorCode(error));
@@ -1152,6 +1207,20 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
         inFlightRef.current = false;
         if (aliveRef.current) setLocalQueueBusy(false);
       });
+  };
+
+  const handleLocalEdit = (itemId: string, version: number) => {
+    if (!localQueueWritable || inFlightRef.current) return;
+    // 先处理已知草稿冲突：取消时零 edit POST，原排队项不被撤回、也不产生快照。
+    if (
+      draftRef.current.trim().length > 0 ||
+      attachmentsRef.current.some((a) => a.status === "ready")
+    ) {
+      setLocalQueueError(null);
+      setEditPreflight({ itemId, version });
+      return;
+    }
+    runLocalEdit(itemId, version, "auto");
   };
 
   const handleRecoverEdit = (requestId: string) => {
@@ -1181,13 +1250,9 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
   };
 
   const handleEditConflictCancel = () => {
-    const current = editConflict;
+    // 已经撤回的项其快照是唯一恢复入口：取消只关对话框，绝不 finish/删除。
     setEditConflict(null);
-    if (current !== null) {
-      void finishZcodeEdit(current.requestId)
-        .then(() => refreshLocalView())
-        .catch(() => {});
-    }
+    void refreshLocalView();
   };
 
   const handleLocalRetract = (itemId: string, version: number) => {
@@ -1226,6 +1291,37 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
         if (!aliveRef.current) return;
         setLocalQueueNotice("resumed");
         return refreshLocalView();
+      })
+      .catch((error: unknown) => {
+        if (aliveRef.current) setLocalQueueError(queueErrorCode(error));
+      })
+      .finally(() => {
+        inFlightRef.current = false;
+        if (aliveRef.current) setLocalQueueBusy(false);
+      });
+  };
+
+  const acknowledgeRecovery = (
+    kind: "priority_stop" | "manual_stop" | "dispatch" | "unconfirmed",
+    subjectId: string
+  ) => {
+    if (!localQueueWritable || inFlightRef.current) return;
+    setLocalQueueNotice(null);
+    setLocalQueueError(null);
+    inFlightRef.current = true;
+    setLocalQueueBusy(true);
+    void acknowledgeZcodeQueueRecovery({
+      requestId: newActionId(),
+      sessionId,
+      kind,
+      subjectId,
+    })
+      .then(async () => {
+        if (!aliveRef.current) return;
+        setLocalQueueNotice("recovery_reviewed");
+        await refreshLocalView();
+        const view = await getZcodeQueueRecovery(sessionId).catch(() => null);
+        if (aliveRef.current) setQueueRecovery(view);
       })
       .catch((error: unknown) => {
         if (aliveRef.current) setLocalQueueError(queueErrorCode(error));
@@ -1513,10 +1609,87 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
             />
           </div>
         ))}
+      {queueRecovery !== null &&
+        (queueRecovery.priority.length > 0 ||
+          queueRecovery.manualStopRequestId !== null ||
+          queueRecovery.dispatchActionId !== null ||
+          queueRecovery.unconfirmedActionId !== null) && (
+          <section
+            data-testid="zcode-local-recovery"
+            className="mb-2 rounded-lg border border-[var(--cb)] bg-[var(--cbg)] p-2"
+          >
+            <p className="text-xs font-medium text-[var(--tx)]">
+              {i18n.t("mobile.zcodeControl.localQueueRecoveryTitle")}
+            </p>
+            <p className="mt-1 text-[11px] leading-4 text-[var(--mut)]">
+              {i18n.t("mobile.zcodeControl.localQueueRecoveryHint")}
+            </p>
+            <div className="mt-2 flex flex-wrap gap-2">
+              {queueRecovery.priority.map((entry) => (
+                <button
+                  key={`priority-${entry.requestId}`}
+                  type="button"
+                  data-testid="zcode-recovery-priority"
+                  data-subject-id={entry.requestId}
+                  disabled={busy || !localQueueWritable}
+                  onClick={() => acknowledgeRecovery("priority_stop", entry.requestId)}
+                  className="rounded-full border border-[var(--cb)] px-2 py-1 text-[11px] text-[var(--tx)] disabled:opacity-40"
+                >
+                  {i18n.t("mobile.zcodeControl.localQueueRecoveryPriority")}
+                </button>
+              ))}
+              {queueRecovery.manualStopRequestId !== null && (
+                <button
+                  type="button"
+                  data-testid="zcode-recovery-manual-stop"
+                  disabled={busy || !localQueueWritable}
+                  onClick={() =>
+                    acknowledgeRecovery("manual_stop", queueRecovery.manualStopRequestId as string)
+                  }
+                  className="rounded-full border border-[var(--cb)] px-2 py-1 text-[11px] text-[var(--tx)] disabled:opacity-40"
+                >
+                  {i18n.t("mobile.zcodeControl.localQueueRecoveryStop")}
+                </button>
+              )}
+              {queueRecovery.dispatchActionId !== null && (
+                <button
+                  type="button"
+                  data-testid="zcode-recovery-dispatch"
+                  disabled={busy || !localQueueWritable}
+                  onClick={() =>
+                    acknowledgeRecovery("dispatch", queueRecovery.dispatchActionId as string)
+                  }
+                  className="rounded-full border border-[var(--cb)] px-2 py-1 text-[11px] text-[var(--tx)] disabled:opacity-40"
+                >
+                  {i18n.t("mobile.zcodeControl.localQueueRecoveryDispatch")}
+                </button>
+              )}
+              {queueRecovery.unconfirmedActionId !== null && (
+                <button
+                  type="button"
+                  data-testid="zcode-recovery-unconfirmed"
+                  disabled={busy || !localQueueWritable}
+                  onClick={() =>
+                    acknowledgeRecovery("unconfirmed", queueRecovery.unconfirmedActionId as string)
+                  }
+                  className="rounded-full border border-[var(--cb)] px-2 py-1 text-[11px] text-[var(--tx)] disabled:opacity-40"
+                >
+                  {i18n.t("mobile.zcodeControl.localQueueRecoveryRestart")}
+                </button>
+              )}
+            </div>
+          </section>
+        )}
       {/* Tuvis 本地待发（Q6）：与官方队列分开来源；默认展开，显示位次/摘要/三按钮。 */}
       <ZcodeLocalQueuePanel
         view={localQueue}
-        busy={busy || !localQueueWritable || editConflict !== null || priorityPrompt !== null}
+        busy={
+          busy ||
+          !localQueueWritable ||
+          editConflict !== null ||
+          editPreflight !== null ||
+          priorityPrompt !== null
+        }
         onPrioritize={handleLocalPrioritize}
         onEdit={handleLocalEdit}
         onRetract={handleLocalRetract}
@@ -1542,7 +1715,9 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
                       ? "mobile.zcodeControl.localQueueResumeDone"
                       : localQueueNotice === "edit_restored"
                         ? "mobile.zcodeControl.localQueueEditRestored"
-                        : "mobile.zcodeControl.localQueueEditConflict"
+                        : localQueueNotice === "recovery_reviewed"
+                          ? "mobile.zcodeControl.localQueueRecoveryReviewed"
+                          : "mobile.zcodeControl.localQueueEditConflict"
           )}
         </p>
       )}
@@ -1600,6 +1775,60 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
               className="rounded-lg px-3 py-1.5 text-xs text-[var(--mut)]"
             >
               {i18n.t("mobile.zcodeControl.localQueuePriorityCancel")}
+            </button>
+          </div>
+        </div>
+      )}
+      {editPreflight !== null && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="zcode-edit-preflight-title"
+          data-testid="zcode-edit-preflight-dialog"
+          className="mb-2 rounded-lg border border-[var(--cb)] bg-[var(--cbg)] p-2"
+        >
+          <p id="zcode-edit-preflight-title" className="text-xs font-medium text-[var(--tx)]">
+            {i18n.t("mobile.zcodeControl.localQueueEditConflict")}
+          </p>
+          <p className="mt-1 text-[11px] leading-4 text-[var(--mut)]">
+            {i18n.t("mobile.zcodeControl.localQueueEditPreflightHint")}
+          </p>
+          <div className="mt-2 flex flex-wrap gap-2">
+            <button
+              type="button"
+              data-testid="zcode-edit-preflight-replace"
+              onClick={() => {
+                const current = editPreflight;
+                setEditPreflight(null);
+                if (current !== null)
+                  runLocalEdit(current.itemId, current.version, "replace", {
+                    text: draftRef.current,
+                    attachments: attachmentStamp(),
+                  });
+              }}
+              className="rounded-lg border border-[var(--cb)] px-3 py-1.5 text-xs text-[var(--tx)]"
+            >
+              {i18n.t("mobile.zcodeControl.localQueueEditReplace")}
+            </button>
+            <button
+              type="button"
+              data-testid="zcode-edit-preflight-merge"
+              onClick={() => {
+                const current = editPreflight;
+                setEditPreflight(null);
+                if (current !== null) runLocalEdit(current.itemId, current.version, "merge");
+              }}
+              className="rounded-lg border border-[var(--cb)] px-3 py-1.5 text-xs text-[var(--tx)]"
+            >
+              {i18n.t("mobile.zcodeControl.localQueueEditMerge")}
+            </button>
+            <button
+              type="button"
+              data-testid="zcode-edit-preflight-cancel"
+              onClick={() => setEditPreflight(null)}
+              className="rounded-lg px-3 py-1.5 text-xs text-[var(--mut)]"
+            >
+              {i18n.t("mobile.zcodeControl.localQueueEditCancel")}
             </button>
           </div>
         </div>
