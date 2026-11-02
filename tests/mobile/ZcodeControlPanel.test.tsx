@@ -169,6 +169,7 @@ function pendingView(overrides: Partial<PendingView> = {}): PendingView {
     options: [],
     detail: null,
     answerable: true,
+    planApproval: false,
     detailTruncated: false,
     ...overrides,
   };
@@ -2389,6 +2390,84 @@ describe("ZCode 控制面板：多组待处理并存", () => {
 
     // 三张卡一张不少
     expect(screen.getAllByTestId("zcode-pending-card")).toHaveLength(3);
+  });
+
+  it("plan_approval_tab_uses_dedicated_label_and_approves_once", async () => {
+    const PLAN_ID = "int_00000000000000000000000000000002";
+    const SECOND_QUESTION_ID = "int_00000000000000000000000000000003";
+    const openSpy = vi.spyOn(window, "open").mockReturnValue(null);
+    // 计划卡：唯一宿主原值 approve；普通问答卡作为第二 tab，验证不误伤。
+    installFetch((url) => {
+      if (url === ZCODE_CONNECTION_PATH) return json(connection());
+      if (url.includes("/official-control")) {
+        return json({
+          configState: "saved",
+          url: "https://zcode.z.ai/remote/v4?sid=synthetic-plan-official",
+        });
+      }
+      if (url.startsWith(`${ZCODE_SESSION_PATH}?`)) {
+        return json(
+          sessionView({
+            pending: [
+              pendingView({
+                interactionId: PLAN_ID,
+                toolName: "ExitPlanMode",
+                schemaInteraction: "plan_approval",
+                planApproval: true,
+                answerable: false,
+                questions: [
+                  questionView({
+                    questionText: "Review this implementation plan.",
+                    options: [
+                      { value: "approve", label: "批准", description: null, preview: null },
+                    ],
+                  }),
+                ],
+              }),
+              pendingView({
+                interactionId: SECOND_QUESTION_ID,
+                questions: [questionView({ questionText: "普通问答？" })],
+              }),
+            ],
+          })
+        );
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+
+    render(<ZcodeControlPanel sessionId={SID} />);
+
+    const planTab = await screen.findByTestId(`zcode-pending-tab-${PLAN_ID}`);
+    expect(planTab.textContent).toBe("计划批准 1/2");
+    expect(screen.getByTestId(`zcode-pending-tab-${SECOND_QUESTION_ID}`).textContent).toBe(
+      "问答 2/2"
+    );
+
+    const slot = screen.getByTestId(`zcode-pending-slot-${PLAN_ID}`);
+    const scope = within(slot);
+    expect(scope.getByTestId("zcode-pending-card").getAttribute("data-plan-approval")).toBe("true");
+    expect(scope.getByText("计划批准")).toBeVisible();
+    expect(scope.queryByText("等待回答")).toBeNull();
+    expect(scope.queryByTestId("zcode-pending-submit")).toBeNull();
+    expect(scope.queryByTestId("zcode-answer-options")).toBeNull();
+    expect(postedActions()).toHaveLength(0);
+
+    fireEvent.click(scope.getByTestId("zcode-plan-approval-approve"));
+    await waitFor(() => expect(postedActions()).toHaveLength(1));
+    expect(postedActions()[0].action).toMatchObject({
+      kind: "planApproval",
+      interactionId: PLAN_ID,
+      decision: "approve",
+    });
+
+    // 官方入口仍只打开已保存链接，不额外 POST。
+    fireEvent.click(scope.getByTestId("zcode-pending-open-official"));
+    expect(openSpy).toHaveBeenCalledWith(
+      "https://zcode.z.ai/remote/v4?sid=synthetic-plan-official",
+      "_blank",
+      "noopener,noreferrer"
+    );
+    expect(postedActions()).toHaveLength(1);
   });
 
   it("two_question_cards_stay_addressable_per_slot_with_independent_drafts", async () => {

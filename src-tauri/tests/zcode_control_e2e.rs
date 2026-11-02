@@ -1165,6 +1165,7 @@ fn question_card() -> PendingView {
         detail: None,
         // AskUserQuestion 子型：与 build_user_answer 同一纯判定 → 可答。
         answerable: true,
+        plan_approval: false,
         detail_truncated: false,
     }
 }
@@ -1194,6 +1195,7 @@ fn permission_card() -> PendingView {
         detail: Some("ls -la /tmp/tuvis-e2e-scratch".to_owned()),
         // 审批卡不是 userInput 子型：可答性由 approvalReply 能力与选项白名单决定。
         answerable: false,
+        plan_approval: false,
         detail_truncated: false,
     }
 }
@@ -1440,6 +1442,7 @@ fn old_pending_card() -> PendingView {
         detail: None,
         // tool_name 缺省 → 不是已建模的 AskUserQuestion 子型 → 不可代答。
         answerable: false,
+        plan_approval: false,
         detail_truncated: false,
     }
 }

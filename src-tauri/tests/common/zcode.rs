@@ -468,6 +468,7 @@ impl HubBackend for FakeOfficial {
                     ControlAction::Send { .. } => Ok(vec!["send"]),
                     ControlAction::Stop { .. } => Ok(vec!["interrupt"]),
                     ControlAction::Permission { .. } => Ok(vec!["approval_reply"]),
+                    ControlAction::PlanApproval { .. } => Ok(vec!["single_select"]),
                     ControlAction::Selection { .. } => Ok(vec!["model", "thought_level"]),
                     ControlAction::Mode { .. } => Ok(vec!["mode"]),
                     // 队列写：队列专属槽位（与生产 `CommandSender` 同口径）。

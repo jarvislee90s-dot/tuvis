@@ -48,7 +48,12 @@ import {
   resolveModelChoice,
 } from "./zcode-selection-state";
 import { newActionId } from "./codexIpcApi";
-import ZcodePendingCard, { STATUS_KEYS, pendingDomId, zcodeReasonText } from "./ZcodePendingCard";
+import ZcodePendingCard, {
+  STATUS_KEYS,
+  isPendingPlanApproval,
+  pendingDomId,
+  zcodeReasonText,
+} from "./ZcodePendingCard";
 import ZcodeQueuePanel, { dispatchWritable } from "./ZcodeQueuePanel";
 import { deriveZcodePrimaryAction } from "./zcode-primary-action";
 import {
@@ -1647,7 +1652,9 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
                 {i18n.t(
                   pending.kind === "permission"
                     ? "mobile.zcodeControl.pendingTabPermission"
-                    : "mobile.zcodeControl.pendingTabQuestion",
+                    : isPendingPlanApproval(pending)
+                      ? "mobile.zcodeControl.pendingTabPlanApproval"
+                      : "mobile.zcodeControl.pendingTabQuestion",
                   { position: index + 1, total: pendings.length }
                 )}
               </button>

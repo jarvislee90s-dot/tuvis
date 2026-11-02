@@ -39,6 +39,12 @@ pub const ASK_USER_QUESTION_TOOL: &str = "AskUserQuestion";
 /// 已建模的问答 `schema.interaction` 值（其余子类一律只读、不代答）。
 pub const ASK_USER_QUESTION_INTERACTION: &str = "AskUserQuestion";
 
+/// 计划批准的工具名（C1 只读标识判据，官方 `ExitPlanMode`）。
+pub const EXIT_PLAN_MODE_TOOL: &str = "ExitPlanMode";
+
+/// 计划批准的 `payload.schema.interaction` 原值（C1 只读标识）。
+pub const PLAN_APPROVAL_INTERACTION: &str = "plan_approval";
+
 fn unsupported() -> ZcodeError {
     ZcodeError::of(codes::UNSUPPORTED_PROTOCOL)
 }
@@ -280,6 +286,59 @@ fn answerable_parts(
         && schema_interaction.is_none_or(|interaction| interaction == ASK_USER_QUESTION_INTERACTION)
 }
 
+/// 本卡是否为**计划批准**（纯函数；只用于 C1 的只读解释，**不参与**应答判定）。
+///
+/// 三条同时成立：`kind=userInput`、`toolName=ExitPlanMode`、
+/// `schema.interaction` 恰为 [`PLAN_APPROVAL_INTERACTION`]。相似形状（缺 schema、
+/// 工具名不符、MCP elicitation、`kind=permission`）一律不置位，走通用只读文案。
+///
+/// `build_user_answer` 仍拒绝计划批准；原生批准走独立的
+/// [`build_plan_approval_answer`]（C2），绝不把它当普通问答应答。
+pub fn is_plan_approval(pending: &PendingView) -> bool {
+    plan_approval_parts(
+        pending.kind,
+        pending.tool_name.as_deref(),
+        pending.schema_interaction.as_deref(),
+    )
+}
+
+/// [`is_plan_approval`] 的字段级实现（投影期还拿不到完整的 `PendingView`）。
+fn plan_approval_parts(
+    kind: PendingKind,
+    tool_name: Option<&str>,
+    schema_interaction: Option<&str>,
+) -> bool {
+    kind == PendingKind::UserInput
+        && tool_name == Some(EXIT_PLAN_MODE_TOOL)
+        && schema_interaction == Some(PLAN_APPROVAL_INTERACTION)
+}
+
+/// 按宿主原值构造计划批准的 `resolveInteraction.answer`（C2）。
+///
+/// 官方 `ExitPlanMode` 投影为唯一问题 + 唯一 option，option value 为
+/// `approve`（`createExitPlanModeApprovalQuestions`）。这里只接受这一种**精确**
+/// 形状：计划批准不是普通问答，不接受多题/多选项/其他 value，也不从 label 猜值。
+/// answer 形状取宿主 option 原值：`{optionId: "approve"}`；真实宿主若要求
+/// `action/content` 变体，必须先取得真实帧再改本函数，绝不在运行时猜。
+pub fn build_plan_approval_answer(pending: &PendingView) -> ZResult<Value> {
+    if !is_plan_approval(pending) || pending.answerable {
+        return Err(invalid_answer());
+    }
+    if pending.questions.len() != 1 {
+        return Err(invalid_answer());
+    }
+    let question = &pending.questions[0];
+    if question.options.len() != 1 {
+        return Err(invalid_answer());
+    }
+    let option = &question.options[0];
+    if option.value != "approve" {
+        return Err(forbidden_option());
+    }
+    Ok(serde_json::json!({ "optionId": option.value }))
+}
+
+/// 按宿主原值构造 `resolveInteraction.answer`（T4.1 Slice A；纯映射，不落盘）。
 /// 按宿主原值构造 `resolveInteraction.answer`（T4.1 Slice A；纯映射，不落盘）。
 ///
 /// 形状钉固定探针 `buildUserInputAnswer`（`interactionBridge.ts:536-590`；
@@ -543,6 +602,10 @@ fn parse_pending(card: &Value, skipped_options: &mut u64) -> Option<PendingView>
         .map(str::to_owned);
     let tool_name = optional_string(payload, "toolName");
     let answerable = answerable_parts(kind, tool_name.as_deref(), schema_interaction.as_deref());
+    // C1：计划批准是**只读**子型（`answerable` 仍为 false）。标识只供手机端换专用
+    // 文案与只读面，不进入任何应答载荷。
+    let plan_approval =
+        plan_approval_parts(kind, tool_name.as_deref(), schema_interaction.as_deref());
     // R0 复审遗留 I4：Bash 审批的命令正文只在 payload.detail，手机端此前看不到。
     // 只做只读投影（截断有界），不写日志/账本，也不参与任何应答载荷。
     // 截断真值与文本同一次算出：前端不按长度猜「是不是全貌」。
@@ -570,6 +633,7 @@ fn parse_pending(card: &Value, skipped_options: &mut u64) -> Option<PendingView>
         options,
         detail: detail.text,
         answerable,
+        plan_approval,
         detail_truncated: detail.truncated,
     })
 }
@@ -1619,6 +1683,7 @@ mod tests {
                 .collect(),
             detail: None,
             answerable: false,
+            plan_approval: false,
             detail_truncated: false,
         }
     }
@@ -1840,6 +1905,121 @@ mod tests {
         let permission = by_id("perm-call_synthetic_9001");
         assert!(!permission.answerable);
         assert!(build_permission_answer(permission, "allowOnce").is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // C1：计划批准只读标识（plan_approval）——只有确认形状才置位
+    // -----------------------------------------------------------------------
+
+    /// 投影后的 wire 形状（断言 `planApproval` 的 camelCase 与缺省语义）。
+    fn wire(card: &PendingView) -> Value {
+        serde_json::to_value(card).expect("pending 视图应可序列化")
+    }
+
+    #[test]
+    fn plan_approval_projection_sets_flag_and_stays_unanswerable() {
+        // C1 目标：ExitPlanMode/plan_approval 在投影期带上只读标识，供手机端换专用
+        // 文案（不是放开可答性）。本断言在实现前失败（字段尚不存在）。
+        let book = book_with(plan_approval_card());
+        let card = &book.pendings()[0];
+        assert_eq!(
+            wire(card)["planApproval"],
+            json!(true),
+            "ExitPlanMode/plan_approval 必须置只读标识"
+        );
+        assert_eq!(
+            wire(card)["answerable"],
+            json!(false),
+            "C1 只加解释，不放开计划批准的可答性"
+        );
+        // 零应答：标识存在与否都不改变冻结闸。
+        assert!(
+            build_user_answer(card, &[entry("Approve this plan?", &["approve"], None)])
+                .expect_err("plan_approval 永远不进普通 Answer 路径")
+                .is(codes::NEEDS_EVIDENCE)
+        );
+    }
+
+    #[test]
+    fn ask_user_question_projection_is_not_plan_approval() {
+        let book = book_with(single_question_card());
+        let card = &book.pendings()[0];
+        assert!(card.answerable, "普通 AskUserQuestion 可答性回归");
+        assert_eq!(
+            wire(card)["planApproval"],
+            json!(false),
+            "普通问答不得被打上计划批准标识"
+        );
+    }
+
+    #[test]
+    fn plan_approval_answer_uses_exact_host_approve_option() {
+        // C2：官方计划卡的唯一选项原值是 approve；批准必须原样回传该值，
+        // 不能把 label 当 value，也不能复用普通问答 content 形状。
+        let book = book_with(plan_approval_card());
+        let answer = build_plan_approval_answer(&book.pendings()[0]).expect("approve 形状");
+        assert_eq!(answer, json!({"optionId": "approve"}));
+    }
+
+    #[test]
+    fn plan_approval_answer_rejects_ambiguous_or_non_approve_shapes() {
+        let mut multiple = plan_approval_card();
+        multiple["payload"]["questions"][0]["options"] = json!([
+            {"value": "approve", "label": "Approve"},
+            {"value": "deny", "label": "Deny"}
+        ]);
+        let mut wrong_value = plan_approval_card();
+        wrong_value["payload"]["questions"][0]["options"][0]["value"] = json!("yes");
+        let mut two_questions = plan_approval_card();
+        two_questions["payload"]["questions"] = json!([
+            {"question": "Approve?", "header": "Plan", "options": [{"value": "approve", "label": "Approve"}]},
+            {"question": "Again?", "header": "Plan", "options": [{"value": "approve", "label": "Approve"}]}
+        ]);
+        for (hint, card) in [
+            ("多选项", multiple),
+            ("非 approve 原值", wrong_value),
+            ("多问题", two_questions),
+        ] {
+            let book = book_with(card);
+            let error =
+                build_plan_approval_answer(&book.pendings()[0]).expect_err("歧义计划卡必须拒绝");
+            assert!(
+                error.is(codes::INVALID_ANSWER) || error.is(codes::FORBIDDEN_OPTION),
+                "{hint} 必须落到明确错误码"
+            );
+        }
+    }
+
+    #[test]
+    fn other_user_input_plan_shapes_are_not_misflagged() {
+        // 判据必须三条同时成立（kind=userInput ∧ toolName=ExitPlanMode ∧
+        // schema.interaction=plan_approval）；相似形状一律不误标。
+        let mut no_schema = plan_approval_card();
+        no_schema["payload"]
+            .as_object_mut()
+            .expect("payload")
+            .remove("schema");
+        let mut wrong_tool = plan_approval_card();
+        wrong_tool["payload"]["toolName"] = json!("AskUserQuestion");
+        let mut permission_shape = plan_approval_card();
+        permission_shape["kind"] = json!("permission");
+        permission_shape["payload"]["kind"] = json!("permission");
+
+        for (hint, card) in [
+            ("ExitPlanMode 但缺 schema", no_schema),
+            ("plan_approval 但工具名不符", wrong_tool),
+            ("mcp_elicitation", elicitation_card()),
+            ("kind=permission 同形字段", permission_shape),
+        ] {
+            let book = book_with(card);
+            let parsed = &book.pendings()[0];
+            assert_eq!(
+                wire(parsed)["planApproval"],
+                json!(false),
+                "{hint} 不得误标为计划批准"
+            );
+            assert!(!parsed.answerable, "{hint} 仍不可代答");
+        }
     }
 
     // -----------------------------------------------------------------------

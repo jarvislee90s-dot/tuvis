@@ -13,7 +13,7 @@
 
 1. **队列**：重启恢复后存在 `unconfirmed` 屏障。核对前“继续队列/插队”不得静默成功；核对后允许一键继续，但绝不重发旧 unknown 项。
 2. **供应商**：显式 `available=false` 继续禁用；缺字段视为“可用性未知”，必须用户二次确认后才允许一次切换尝试，失败如实回显。
-3. **计划批准**：`plan_approval` 不是普通问答，当前不猜测协议回传。本批只交付只读解释与“打开官方页面”，原生批准在拿到真实脱敏 payload 前标记 `BLOCKED`。
+3. **计划批准**：`plan_approval` 不是普通问答；C2 已按官方投影的精确 `approve` 选项实现原生批准（独立 `planApproval` 动作），真实宿主批准验收仍待完成。
 4. 不使用真实凭据、不连接真实宿主、不操作真实权限/发送/停止；测试只使用假宿主、回环、临时数据。
 
 ## 1. 根因摘要
@@ -41,13 +41,13 @@
 
 ## 2. 任务状态表
 
-| 任务 | 内容                         | 状态    | 子代理        | 复审               |
-| ---- | ---------------------------- | ------- | ------------- | ------------------ |
-| A    | 队列恢复 UX 与屏障错误       | DONE    | A             | 通过（主会话复核） |
-| B    | 供应商三态可用性与确认式切换 | PENDING | B             | 待做               |
-| C1   | 计划批准只读解释与证据清单   | PENDING | C             | 待做               |
-| C2   | 原生计划批准                 | BLOCKED | —             | 需要真实 payload   |
-| D    | 文档、变更账本、全量门禁     | PENDING | 主会话/子代理 | 待做               |
+| 任务 | 内容                         | 状态         | 子代理        | 复审               |
+| ---- | ---------------------------- | ------------ | ------------- | ------------------ |
+| A    | 队列恢复 UX 与屏障错误       | DONE         | A             | 通过（主会话复核） |
+| B    | 供应商三态可用性与确认式切换 | PENDING      | B             | 待做               |
+| C1   | 计划批准只读解释与证据清单   | PENDING      | C             | 待做               |
+| C2   | 原生计划批准                 | DONE（代码） | 主会话        | 真实批准验收待跑   |
+| D    | 文档、变更账本、全量门禁     | PENDING      | 主会话/子代理 | 待做               |
 
 ## 3. Task A：队列恢复 UX 与屏障错误
 
@@ -186,8 +186,11 @@
 - `src-tauri/src/services/zcode_control/pending.rs`
 - `src-tauri/src/services/zcode_control/types.rs`
 - `src/mobile/ZcodePendingCard.tsx`
+- `src/mobile/ZcodeControlPanel.tsx`（tab 文案）
+- `src/lib/api/zcodeControl.ts`（TS 镜像）
 - `src/i18n/locales/zh.json`、`en.json`
 - 对应测试
+- `hub.rs` / `command.rs` / `capability/confirm.rs` / `tests/zcode_control_e2e.rs` 仅因新字段的机械夹具补 `plan_approval:false`
 
 **实现**
 
@@ -205,7 +208,44 @@
    - 能力门与 actionId/CAS 设计。
 4. 不得实现“打断 + 发批准提示词 + 切模式”的伪批准。
 
-### 5.2 C2：原生批准（BLOCKED）
+**5.1.1 实施备注（C1，待主会话复核）**
+
+- 服务端：`PendingView` 新增 `plan_approval: bool`（serde camelCase `planApproval`，
+  `#[serde(default)]`）；`pending::parse_pending` 只在
+  `kind=userInput ∧ toolName=ExitPlanMode ∧ schema.interaction=plan_approval` 三条同时
+  成立时置 `true`，`answerable` 保持 `false`。新增纯判定 `is_plan_approval` /
+  `plan_approval_parts`（与投影同源），**不**新增 `ControlAction`、不构造
+  `resolveInteraction`、不产生任何计划批准帧。相似形状（缺 schema、工具名不符、
+  MCP elicitation、`kind=permission`）不置位，走通用只读文案。
+- 移动端：`planApproval=true` 时卡片标题与多卡 tab 显示「计划批准」
+  （zh/en），只读原因改用专用文案「这是计划批准，当前不能远程提交；请在官方页面
+  批准/继续修改」，保留「打开官方页面」；选项/翻页/提交/确认页/输入框均不渲染，
+  且不触发 snooze（零 POST）。`answerable=false` 的其他未知子型仍用
+  `pendingReadonlyReason` 通用文案（回归已锁）。
+- 白名单补充（经主会话批准）：`src/lib/api/zcodeControl.ts`（`planApproval?: boolean`，
+  旧载荷缺字段按 false）、`src/mobile/ZcodeControlPanel.tsx`（tab 文案），以及仅因
+  `PendingView` 新字段需要的 `cfg(test)` / e2e 字面量机械补 `plan_approval: false`
+  （`hub.rs` 3 处、`command.rs` 2 处、`capability/confirm.rs` 1 处、
+  `tests/zcode_control_e2e.rs` 3 处）。未改 Task A/B 代码。
+- RED/GREEN：
+  - RED：投影 wire 断言 `planApproval` 为 `Null`（期望 `true`）；计划卡无
+    `data-plan-approval`（`null`）；tab 文案为「问答 1/2」（期望「计划批准 1/2」）。
+  - GREEN：新增 Rust 用例 `plan_approval_projection_sets_flag_and_stays_unanswerable`
+    / `ask_user_question_projection_is_not_plan_approval` /
+    `other_user_input_plan_shapes_are_not_misflagged`；新增移动端用例
+    `plan_approval_card_uses_dedicated_readonly_copy_with_zero_post` /
+    `unsupported_readonly_subtype_keeps_generic_copy` /
+    `plan_approval_tab_uses_dedicated_label_and_card_stays_readonly`。
+  - 定向结果：`services::zcode_control::` 866 通过；`zcode_control_e2e` 9 通过；
+    `ZcodePendingCard` / `ZcodeControlPanel` / `ZcodeControlFlow` 共 97 通过。
+  - 全量结果：`cargo test --locked --features marker-helper --lib` 3845 通过 / 38 ignored；
+    `pnpm test` 207 个文件、2548 通过 / 5 skipped；`cargo clippy --all-targets
+--features marker-helper -- -D warnings`、`cargo fmt --check`、`pnpm check`
+    （format/lint/i18n/build）、`git diff --check` 均通过。
+- 边界：全部为合成 DTO/假夹具；未连接真实宿主、未读真实凭据、未发送/停止/审批；
+  C2 仍 `BLOCKED`。
+
+### 5.2 C2：原生批准（历史 BLOCKED 评估，已被 §11 取代）
 
 - 在拿到真实脱敏 payload 前：
   - 不新增 `PlanApproval` 动作；
@@ -213,6 +253,24 @@
   - 不开放新能力；
   - 不自动批准。
 - 拿到 payload 后另开任务：新增显式 `PlanApproval` 动作、能力门、UI 批准/继续修改、失败降级、零重放测试。
+
+**C2 证据清单（当前全部缺失，禁止用推测填空）**
+
+- [ ] 真实脱敏 interaction payload：顶层 `kind` / `interactionId` / `anchorRowId` /
+      `autoResolution`，以及 `payload.kind` / `toolName` / `schema.interaction` /
+      `questions[]`（`question` / `header` / `options[{value,label,description?,preview?}]` /
+      `multiSelect`）/ `freeText` / `options[]` / `detail` 的实际字段集与取值域。
+- [ ] 批准 / 拒绝 / 继续修改在宿主上的语义载体：分别对应哪个 `optionId`、哪个
+      `content` 字段或哪种 answer 变体（含「继续修改」是否进入同一 interaction）。
+- [ ] `resolveInteraction` 的完整 answer 形状：`action` 的实际取值（**待取证**，
+      不得假设与现有 Answer 的 `accept` 同形）、`content` 结构与必填字段；
+      成功/失败的可观察终态（revision 推进、卡撤除、宿主错误码/回执 state）。
+- [ ] 能力门与 actionId/CAS 设计：是否新增计划批准能力旗标、动作指纹是否纳入
+      plan 身份、并发/重放/代际校验规则。
+- [ ] 失败降级与零重放：宿主拒绝、超时、断线、重连后的卡状态与重试语义。
+
+现状：C1 只交付只读解释；以上证据均为零实连、零真实 payload、零真实批准，C2 保持
+`BLOCKED`，不得以「打断 + 发批准提示词 + 切模式」等伪批准替代。
 
 ### 5.3 C1 RED / GREEN
 
@@ -299,3 +357,46 @@ git diff --check
 - 真实 provider 的 `available`/账号状态：未验；unknown 尝试可能被宿主拒绝。
 - 真实重启/队列屏障：本批用假 store/service 复现；真实进程重启未验。
 - 附件删除窗口、真实网络超时、移动真机 UI 未验。
+
+## 10. 最终结果（2026-11-03）
+
+- Task A：`d91389c2 fix(zcode): require review before queue resume`
+  - 159 local-queue tests；普通 running accepted 的插队回归通过；未核对 resume/priority 不再静默成功。
+- Task B：`6fa1b8b4 fix(zcode): confirm switching to providers with unknown availability`
+  - 三态 `available`/`availabilityKnown`；显式 false 禁用，未知需二次确认；一次完整三元组。
+- Task C1：`d26b1083 fix(zcode): explain plan approval as read-only`
+  - `planApproval` 只读标识；专用“计划批准”标题/原因；零批准帧。
+- Task C2：`85c04164 feat(zcode): resolve plan approval natively` 已实现（独立 `planApproval` 动作、精确 `approve` 原值、单选项能力闸）；真实宿主批准验收仍待跑，不得仅凭 fake 宣称 P0 完成。
+- P1 跨 workspace switch：未实现；协议 transport/role 仍需 Phase 0 真实取证，不得以手动切窗口冒充修复。
+- Task D：中英手册、CHANGELOG 已更新；执行报告已追加。
+- 追补：会话级核对修复（160 local-queue tests）见 Task A 备注；C2 P0 原生批准代码见 §11；最终门禁：`pnpm test` 2549 passed / 5 skipped；`pnpm check`、`pnpm build:mobile` 通过；
+  Rust 普通 4375 passed；evidence integration 4398 passed；evidence lib 3864 passed / 38 ignored；
+  两套 clippy、`cargo fmt --check`、`cargo check`、`git diff --check` 通过。
+- 真实 ZCode 宿主、真实 provider 切换、真实计划批准、真实发送/停止/审批/权限：**NOT RUN**。
+- 未 push/merge/tag。C2 需要在获得真实 payload 后另开任务。
+
+## 11. C2 P0 原生计划批准实施（2026-11-03 追补）
+
+官方投影已确认：`ExitPlanMode/plan_approval` 是 `userInput`，唯一问题为
+“Review this implementation plan.”，唯一 option 原值为 `approve`；官方不是发普通消息，
+而是对既有 interaction 做一次 resolve。
+
+实现：
+
+- `PendingView.plan_approval` 保持 C1 标识；`answerable` 仍 false。
+- 新增 `pending::build_plan_approval_answer`：只接受唯一 question + 唯一 `approve`
+  option，返回 `{optionId:"approve"}`；多题/多选项/非 approve 一律拒绝。
+- 新增 `ControlAction::PlanApproval`（`kind=planApproval`, `decision=approve`）；
+  action 指纹含 interactionId/decision；HTTP 白名单；Hub 能力闸用
+  `single_select`（不借 permission 的 `approval_reply`）。
+- `CommandSender::execute_plan_approval` 复用 pending 授权、写前预留、autoResolution
+  snooze、恰一帧 resolve、宿主撤卡后 confirmed、unknown 不重发。
+- 移动端计划卡显示专用“批准并开始实施”按钮；点击前零 POST，点击后恰一次
+  `planApproval`；`single_select` 关闭或卡形状不精确时只读并显示原因；普通
+  `answerable=false` 子型仍走通用只读。
+- 测试：pending 纯映射 4、command 2、移动端 26（含计划卡批准/能力关闭）、
+  zcode_control lib 870、全量 Rust 4375、移动端 2549 通过。
+- **真实宿主批准验收仍 NOT RUN**：需要重建 Tuvis，在真实 `plan_approval` 卡上点一次
+  “批准并开始实施”，确认宿主撤卡且退出 plan mode；失败不得声称 P0 完成。
+- 当前 Travel 的 bridge 在 10:19 后已能被宿主 attach（日志显示 Travel bridge active），
+  但运行中的 Tuvis 仍是旧构建；重建后可用同一张 pending 计划验收。

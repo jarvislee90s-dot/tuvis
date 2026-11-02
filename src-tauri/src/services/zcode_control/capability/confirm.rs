@@ -565,6 +565,7 @@ mod tests {
             options: Vec::new(),
             detail: None,
             answerable: false,
+            plan_approval: false,
             detail_truncated: false,
         }
     }

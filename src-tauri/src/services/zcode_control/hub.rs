@@ -771,6 +771,7 @@ pub trait HubBackend: Send + Sync {
                 ControlAction::Send { .. } => Ok(vec!["send"]),
                 ControlAction::Stop { .. } => Ok(vec!["interrupt"]),
                 ControlAction::Permission { .. } => Ok(vec!["approval_reply"]),
+                ControlAction::PlanApproval { .. } => Ok(vec!["single_select"]),
                 ControlAction::Selection { .. } => Ok(vec!["model", "thought_level"]),
                 ControlAction::Mode { .. } => Ok(vec!["mode"]),
                 ControlAction::QueueDelete { .. } | ControlAction::QueueReorder { .. } => {
@@ -4244,6 +4245,9 @@ impl ZcodeHub {
                 Some(interaction_id),
             )),
             ControlAction::Stop { .. } => required.push(("interrupt", &policy.interrupt, None)),
+            ControlAction::PlanApproval { .. } => {
+                required.push(("single_select", &policy.single_select, None));
+            }
             ControlAction::Selection { .. } => {
                 required.push(("model", &policy.model, None));
                 required.push(("thought_level", &policy.thought_level, None));
@@ -8658,6 +8662,7 @@ mod tests {
             detail: None,
             // 合成卡的 toolName 是 Bash：不属于可远程作答的 AskUserQuestion 子型。
             answerable: false,
+            plan_approval: false,
             detail_truncated: false,
         }
     }
@@ -9075,6 +9080,7 @@ mod tests {
                     options: Vec::new(),
                     detail: None,
                     answerable: false,
+                    plan_approval: false,
                     detail_truncated: false,
                 }],
                 control: Some(ControlView {
@@ -11747,6 +11753,7 @@ mod tests {
             options: Vec::new(),
             detail: None,
             answerable: false,
+            plan_approval: false,
             detail_truncated: false,
         }
     }

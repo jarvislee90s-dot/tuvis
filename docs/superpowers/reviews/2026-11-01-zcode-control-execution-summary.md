@@ -185,3 +185,60 @@ Q5/Q6 代码已提交；Q7、C1–C2、M1–M2、K1–K2 与 V0 的收口见下�
 `ensure_selection_catalog` 现在返回是否安装，并在 RPC/解析失败或结果过期时清掉对应 revision 的 `catalog_attempted_at`；同时用 `catalog_refresh_provider` 记住缓存清空后的待刷新 provider，保证 A→B→C 的 C 帧仍会排队刷新，而不是被 `catalog=None` 跳过。刷新任务最多重试一次，之后由读路径按需再试。
 
 最终复跑：普通 Rust **4359 passed / 0 failed**；evidence integration **4382 passed / 0 failed**；evidence lib **3852 passed / 38 ignored**；移动端 **2539 passed / 5 skipped**；`pnpm check`、`build:mobile`、两套 clippy、`cargo fmt --check` 通过。真实宿主未验，不改变此前的实机 NOT RUN 结论。
+
+## 2026-11-03 手机可用性修补（队列/供应商/计划批准）
+
+本轮针对用户实机反馈的四个问题，按修补文档
+`docs/superpowers/plans/2026-11-03-zcode-mobile-usability-patch.md` 执行，子代理 A/B/C 顺序实施，
+主会话逐项复审、提交并跑全量门禁。
+
+### 队列恢复
+
+- 根因：重启恢复 `accepted + startNow` 无终态被标 `restart unconfirmed` / `target unconfirmed`，
+  `auto_drain=0` 且有 `has_delivery_barrier`；旧 `resume` 只置 `auto_drain=1`，不清 barrier；
+  `prioritize` 在无前台回合时提前返回，造成“继续/插队成功但不派发”。
+- 修正：新增 `queue_review_required`（409）；`resume` 和 `prioritize` 在未核对 barrier 时拒绝且零
+  stop/send；普通 running accepted **不算** review barrier，仍由 `has_delivery_barrier` 管自动派发
+  互斥；“确认并继续队列”ack 后自动 resume，旧 unknown 不重发。
+- 回归：unconfirmed 下 resume/priority 拒绝、版本不变、零发送；核对后只发 B 一次；正常 running
+  accepted 的插队仍可 stop+send；移动端未核对禁用+原因、确认后一次 ack+一次 resume。
+- 提交 `d91389c2`。
+- 2026-11-03 实机追补：核对入口原先按设备过滤，旧设备留下的 unconfirmed 结果会让新设备
+  看到“已暂停”但没有核对按钮，`resume` 又因会话级屏障拒绝。已改为会话级可见/可核对
+  （只清屏障、不重发），新增跨设备回归；`local_queue` 160 tests 通过。
+
+### 供应商三态
+
+- `ProviderChoice.availabilityKnown`：显式 `available` 为 known；缺字段为未知；显式 false 恒禁用。
+- `Selection.confirmUnknownProvider`：unknown 未确认拒绝，确认后允许一次完整三元组；provider
+  继续入指纹，确认标志仅在 true 时入指纹。
+- UI：不可用仍禁用；unknown 可选中并显示原因，选模型/档位提交前二次确认；确认前零 selection
+  POST；失败不乐观改当前组合。
+- 回归：selection 21、action 21、command selection 11、移动端 8、HTTP 白名单 1；同名模型档位
+  与 provider 指纹不回归。
+- 提交 `6fa1b8b4`。真实 provider 切换/账号状态仍 NOT RUN。
+
+### 计划批准（C2 P0 代码完成，真实验收待跑）
+
+- `PendingView.planApproval` 仅在 `kind=userInput ∧ toolName=ExitPlanMode ∧
+schema=plan_approval` 时置位；`answerable` 仍 false，普通 `Answer` 仍拒绝。
+- C2 已按官方投影实现原生批准：官方唯一 option 原值为 `approve`；新增独立
+  `ControlAction::PlanApproval`、`build_plan_approval_answer`（唯一问题 + 唯一 approve
+  才返回 `{optionId:"approve"}`）、pending 授权/写前预留/snooze/恰一帧 resolve；
+  Hub 使用 `single_select` 能力闸，不借 permission 的 `approval_reply`。
+- 移动端计划卡提供“批准并开始实施”按钮；点击前零 POST，点击后恰一次；能力关闭/卡形状不精确
+  时只读并说明原因；普通不可答子型保持通用只读。
+- 回归：pending 4、command 2、计划卡/面板 93、zcode_control lib 870、全量 Rust 4375、
+  移动端 2549 通过。提交 `85c04164 feat(zcode): resolve plan approval natively`。
+- **真实宿主批准验收 NOT RUN**：需要重建 Tuvis 后，在真实 `plan_approval` 卡点击一次并观察
+  宿主撤卡/退出 plan mode；未过此前不得宣称 P0 完成，也不得用 fake 冒充真实验收。
+- 提交 `d26b1083` 是 C1；C2 代码待本批提交。
+
+### 最终门禁
+
+- 移动端：207 files，**2549 passed / 5 skipped**；`pnpm check`、`pnpm build:mobile` 通过。
+- Rust：普通 **4375 passed / 0 failed**；evidence integration **4398 passed / 0 failed**；
+  evidence lib **3864 passed / 38 ignored**；两套 clippy、`cargo fmt --check`、`cargo check`、
+  `git diff --check` 通过。
+- 真实 ZCode 宿主、真实凭据、真实发送/停止/审批/权限、真实 provider 切换、真实 Keychain：NOT RUN。
+- 未 push/merge/tag；C2 需真实 payload 后另开任务。

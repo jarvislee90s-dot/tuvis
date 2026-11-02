@@ -214,6 +214,14 @@ pub fn action_params(action: &ControlAction) -> Value {
             "interactionId": interaction_id,
             "optionId": option_id,
         }),
+        ControlAction::PlanApproval {
+            interaction_id,
+            decision,
+            ..
+        } => serde_json::json!({
+            "interactionId": interaction_id,
+            "decision": decision.as_wire(),
+        }),
         ControlAction::Stop {
             expected_foreground_execution_id,
             ..

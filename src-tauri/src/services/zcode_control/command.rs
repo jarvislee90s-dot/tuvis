@@ -126,7 +126,7 @@ use crate::services::codex_desktop_ipc::types::new_uuid;
 use super::action::{action_params, audit_summary, payload_hash, ActionStore, Reservation};
 use super::bridge::{BridgeManager, AGENT_CHANNEL};
 use super::mode::build_mode_command;
-use super::pending::{build_permission_answer, build_user_answer};
+use super::pending::{build_permission_answer, build_plan_approval_answer, build_user_answer};
 use super::selection::build_selection_command_for_provider;
 use super::types::{
     codes, ActionContext, ActionReceipt, ActionState, ActiveWork, BoundTarget, CapabilitySource,
@@ -932,6 +932,10 @@ impl CommandSender {
             ControlAction::Permission { .. } => {
                 self.execute_permission(ctx, target, action, permits).await
             }
+            ControlAction::PlanApproval { .. } => {
+                self.execute_plan_approval(ctx, target, action, permits)
+                    .await
+            }
             ControlAction::Selection { .. } => {
                 self.execute_selection(ctx, target, action, permits).await
             }
@@ -965,6 +969,7 @@ impl CommandSender {
             ControlAction::Send { .. } => Ok(vec!["send"]),
             ControlAction::Stop { .. } => Ok(vec!["interrupt"]),
             ControlAction::Permission { .. } => Ok(vec!["approval_reply"]),
+            ControlAction::PlanApproval { .. } => Ok(vec!["single_select"]),
             ControlAction::Selection { .. } => Ok(vec!["model", "thought_level"]),
             ControlAction::Mode { .. } => Ok(vec!["mode"]),
             // 队列写：每次只要求**一个**队列专属槽位（`queue_edit` 同时覆盖撤回与
@@ -1502,6 +1507,72 @@ impl CommandSender {
         Ok(receipt)
     }
 
+    /// 计划批准（C2 P0）：只读幂等预检 → 单选项能力闸 → 宿主授权 →
+    /// 精确 approve 映射 → **写前才预留** →（必要时 snooze）→ 恰一帧 resolve。
+    ///
+    /// 计划批准不是普通问答应答：不调用 `build_user_answer`，不读自由文本，
+    /// 不接受多题/多选项；answer 只含宿主唯一 option 的 `optionId`。
+    async fn execute_plan_approval(
+        &self,
+        ctx: &ActionContext,
+        target: &BoundTarget,
+        action: &ControlAction,
+        permits: &[&str],
+    ) -> ZResult<ActionReceipt> {
+        let ControlAction::PlanApproval { interaction_id, .. } = action else {
+            return Err(invalid_action());
+        };
+        if let Some(existing) = self.lookup_action(ctx, target, action)? {
+            return Ok(existing);
+        }
+        if !self.current_capabilities().single_select.enabled && !permits.contains(&"single_select")
+        {
+            return Err(ZcodeError::of(codes::NEEDS_EVIDENCE));
+        }
+        let Some(pending) = self.pending.as_ref() else {
+            return Err(ZcodeError::of(codes::NOT_READY));
+        };
+        let baseline = pending.host_pending_revision(target);
+        let card = pending.authorize_pending(target, interaction_id).await?;
+        let answer = match build_plan_approval_answer(&card) {
+            Ok(answer) => answer,
+            Err(error) => {
+                pending.clear_local_inflight(target, interaction_id);
+                return Err(error);
+            }
+        };
+        match self.reserve_action(ctx, target, action) {
+            Ok(None) => {}
+            Ok(Some(existing)) => {
+                pending.clear_local_inflight(target, interaction_id);
+                return Ok(existing);
+            }
+            Err(error) => {
+                pending.clear_local_inflight(target, interaction_id);
+                return Err(error);
+            }
+        }
+        if let Some(receipt) = self
+            .snooze_before_resolve(
+                ctx,
+                target,
+                pending.as_ref(),
+                interaction_id,
+                card.auto_resolution,
+            )
+            .await
+        {
+            return Ok(receipt);
+        }
+        let receipt = self
+            .dispatch_resolve(ctx, target, interaction_id, answer)
+            .await;
+        Ok(self
+            .finish_resolve(target, pending.as_ref(), interaction_id, baseline, receipt)
+            .await)
+    }
+
+    /// 审批既有卡的安全应答（T5）：只读幂等预检 → 能力闸 → 宿主授权 →
     /// 审批既有卡的安全应答（T5）：只读幂等预检 → 能力闸 → 宿主授权 →
     /// 原值白名单 → **写前才预留** →（必要时 snooze）→ 恰一帧 `resolveInteraction`。
     ///
@@ -3584,7 +3655,8 @@ mod tests {
         use serde_json::json;
 
         use crate::services::zcode_control::types::{
-            PendingKind, PendingView, QuestionOption, QuestionView,
+            CapabilityFlag, PendingKind, PendingView, PlanApprovalDecision, QuestionOption,
+            QuestionView,
         };
 
         /// 宿主 pending 侧的测试替身（与出站 `FakeBridge` 分开：授权/snooze/终态
@@ -3857,6 +3929,7 @@ mod tests {
                 options: Vec::new(),
                 detail: None,
                 answerable: true,
+                plan_approval: false,
                 detail_truncated: false,
             }
         }
@@ -4224,6 +4297,65 @@ mod tests {
             assert!(audits(&store).is_empty(), "本地拒绝不得写 started 审计");
         }
 
+        /// C2：计划批准必须走独立动作，且只对精确 plan_approval 卡发一帧
+        /// `resolveInteraction{answer:{optionId:"approve"}}`；普通问答仍不得代批。
+        #[tokio::test]
+        async fn plan_approval_action_resolves_exact_approve_once() {
+            let store = DeviceStore::memory();
+            let fake = FakeBridge::new(Reply::Body(accepted_body()));
+            let mut plan = card(
+                "ix-plan",
+                false,
+                vec![question(
+                    "Review this implementation plan.",
+                    &["approve"],
+                    false,
+                    false,
+                )],
+            );
+            plan.tool_name = Some("ExitPlanMode".to_owned());
+            plan.schema_interaction = Some("plan_approval".to_owned());
+            plan.plan_approval = true;
+            plan.answerable = false;
+            let pending = fake_pending(plan);
+            let sender = answer_sender(&fake, &pending, &store).with_capabilities(CapabilityView {
+                single_select: CapabilityFlag {
+                    enabled: true,
+                    reason_code: None,
+                },
+                ..CapabilityView::default()
+            });
+
+            let action = ControlAction::PlanApproval {
+                session_id: SESSION.to_owned(),
+                generation: GEN,
+                interaction_id: "ix-plan".to_owned(),
+                decision: PlanApprovalDecision::Approve,
+            };
+            let receipt = sender
+                .execute(&ctx("a-plan"), &target(), &action)
+                .await
+                .unwrap();
+            assert_eq!(receipt.state, ActionState::Accepted);
+            assert_eq!(resolve_frames(&fake).len(), 1, "恰一帧 resolve");
+            assert_eq!(
+                fake.envelope(0)["payload"]["answer"],
+                json!({"optionId": "approve"}),
+                "计划批准必须原样回传宿主 approve 原值"
+            );
+
+            // 同 actionId/同载荷重放零新帧、零新账本行。
+            let before = stored_state(&store, "a-plan");
+            let replay = sender
+                .execute(&ctx("a-plan"), &target(), &action)
+                .await
+                .unwrap();
+            assert_eq!(replay.state, ActionState::Accepted);
+            assert_eq!(resolve_frames(&fake).len(), 1, "重放不得再发帧");
+            assert_eq!(stored_state(&store, "a-plan"), before);
+        }
+
+        /// snooze 未证实（失败或卡已不在宿主集合）：零 resolve。
         /// snooze 未证实（失败或卡已不在宿主集合）：零 resolve。
         #[tokio::test]
         async fn snooze_unconfirmed_zero_resolve() {
@@ -6718,6 +6850,7 @@ mod tests {
                 options,
                 detail: None,
                 answerable: false,
+                plan_approval: false,
                 detail_truncated: false,
             }
         }

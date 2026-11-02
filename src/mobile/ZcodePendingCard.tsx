@@ -26,6 +26,9 @@
 //   MCP elicitation）渲染**只读卡**：只有原因 +「打开官方页面」，不渲染选项与提交键——
 //   绝不「选完才被 `needs_evidence` 拒」。是否可答由服务端与应答闸共用的同一纯判定给出，
 //   前端不另判；字段**缺失**时按旧口径兼容回退（见 [`isPendingAnswerable`）。
+// - C1 计划批准（服务端 `planApproval=true`）：标题/tab 用「计划批准」，只读原因用专用
+//   文案（说明这是计划批准、需去官方页面批准或继续修改），保留「打开官方页面」；
+//   其余只读面同上（零选项/零提交/零 snooze/零 resolve）。C2 原生批准仍 BLOCKED。
 // - `detailTruncated=true`：正文不是全貌，卡片就地说明并**撤掉「允许一次」**（拒绝与
 //   官方页面保留）。截断真值由服务端投影给出，前端不按字符串长度猜。
 import { useEffect, useRef, useState } from "react";
@@ -179,6 +182,20 @@ export function isPendingAnswerable(pending: PendingView): boolean {
   );
 }
 
+/**
+ * 本卡是否为**计划批准**（服务端 C1 只读标识；字段缺失 = 旧服务端/旧载荷 ⇒ false）。
+ *
+ * 为什么只消费字段、不在前端重推判据：计划批准的判据必须与服务端投影同源
+ * （Rust `pending::plan_approval_parts`），否则会出现「服务端说是普通子型、前端说是
+ * 计划批准」的文案漂移。这里**不**读 `toolName`/`schemaInteraction` 重推。
+ *
+ * `true` 时卡片显示“计划批准”专用面：服务端卡形状精确为唯一 `approve` 且
+ * `single_select` 能力开闸时，提供一次原生批准；否则只读并说明原因。
+ */
+export function isPendingPlanApproval(pending: PendingView): boolean {
+  return pending.planApproval === true;
+}
+
 /** 单张 pending 卡：只读呈现 + 宿主原值回传；关闭的能力面禁用并说明原因。 */
 function ZcodePendingCard({
   pending,
@@ -278,13 +295,18 @@ function ZcodePendingCard({
 
   const isPermission = pending.kind === "permission";
   const isUserInput = pending.kind === "userInput";
+  /** 服务端 C1 只读标识（字段缺失 = 旧服务端 ⇒ false，不按 toolName 猜）。 */
+  const planApproval = isPendingPlanApproval(pending);
+  /** 计划批准只读面：标识只在 userInput 卡上消费（标题/原因/只读分支同一判据）。 */
+  const planApprovalReadonly = isUserInput && planApproval;
   /**
    * 只读问答卡：宿主把 `plan_approval` / MCP elicitation 等子型也投影成 `userInput`，
    * 但它们**不可远程代答**（服务端用与 `build_user_answer` 同一个纯判定给出
    * `answerable=false`）。此处绝不渲染选项/提交，从结构上消除「选完才被 needs_evidence 拒」。
    * 字段**缺失**时按旧口径兼容回退（见 [`isPendingAnswerable`]），不把「未声明」当「不可答」。
+   * 计划批准标识 `true` 时恒为只读（C1 没有批准动作，即便载荷自相矛盾也不放开）。
    */
-  const readOnlyInput = isUserInput && !isPendingAnswerable(pending);
+  const readOnlyInput = isUserInput && (planApproval || !isPendingAnswerable(pending));
   /** 审批正文被服务端按上限截断：看不到全貌 → 不提供盲批（允许一次）。 */
   const detailTruncated = isPermission && pending.detailTruncated;
   const flagFor = (question: QuestionView): CapabilityFlag =>
@@ -317,6 +339,25 @@ function ZcodePendingCard({
         : { enabled: false, reasonCode: "unsupported_protocol" };
   const blocked: CapabilityFlag | null =
     gateReason !== null ? { enabled: false, reasonCode: gateReason } : capabilityBlocked;
+  /** 计划批准 C2：必须恰有一个 question + 一个宿主原值 approve 选项。 */
+  const planApprovalShapeOk =
+    pending.questions.length === 1 &&
+    pending.questions[0].options.length === 1 &&
+    pending.questions[0].options[0].value === "approve";
+  const planApprovalBlockedReason = planApprovalReadonly
+    ? gateReason !== null
+      ? gateReason
+      : !capabilities.singleSelect.enabled
+        ? (capabilities.singleSelect.reasonCode ?? "needs_evidence")
+        : !planApprovalShapeOk
+          ? "invalid_action"
+          : null
+    : null;
+  const canApprovePlan =
+    planApprovalReadonly &&
+    planApprovalBlockedReason === null &&
+    settledState === null &&
+    !submitting;
   // 按码如实呈现：每个冻结原因码都有独立 zh/en 文案（表外码才用中性兜底）；
   // 仅当服务端未给原因码时退回「该作答形态暂未开放」的上下文说明。
   const blockedText =
@@ -426,9 +467,56 @@ function ZcodePendingCard({
 
   const footer = (
     <>
-      {readOnlyInput && (
+      {readOnlyInput && planApprovalReadonly && (
         <>
-          <p data-testid="zcode-pending-readonly-reason" className="mt-1 text-xs text-[var(--mut)]">
+          {planApprovalBlockedReason !== null && (
+            <p
+              data-testid="zcode-pending-plan-approval-reason"
+              data-reason-code={planApprovalBlockedReason}
+              className="mt-1 text-xs text-[var(--mut)]"
+            >
+              {zcodeReasonText(planApprovalBlockedReason)}
+            </p>
+          )}
+          {canApprovePlan && (
+            <button
+              type="button"
+              data-testid="zcode-plan-approval-approve"
+              disabled={submitting}
+              onClick={() => {
+                if (planApprovalBlockedReason !== null || submitting || settledRef.current) return;
+                submitOnce({
+                  kind: "planApproval",
+                  sessionId,
+                  generation,
+                  interactionId: pending.interactionId,
+                  decision: "approve",
+                });
+              }}
+              className="mt-2 rounded-full bg-[var(--btnp)]/10 px-4 py-1 text-sm text-[var(--tx)] disabled:opacity-40"
+            >
+              {i18n.t("mobile.zcodeControl.pendingPlanApprovalApprove")}
+            </button>
+          )}
+          {settledState !== null && (
+            <p
+              data-testid="zcode-pending-plan-approval-notice"
+              data-state={settledState}
+              className="mt-1 text-xs text-[var(--mut)]"
+            >
+              {i18n.t(STATUS_KEYS[settledState])}
+            </p>
+          )}
+          {officialEntry}
+        </>
+      )}
+      {readOnlyInput && !planApprovalReadonly && (
+        <>
+          <p
+            data-testid="zcode-pending-readonly-reason"
+            data-readonly-kind="unsupported"
+            className="mt-1 text-xs text-[var(--mut)]"
+          >
             {i18n.t("mobile.zcodeControl.pendingReadonlyReason")}
           </p>
           {officialEntry}
@@ -542,6 +630,7 @@ function ZcodePendingCard({
       data-testid="zcode-pending-card"
       data-interaction-id={pending.interactionId}
       data-kind={pending.kind}
+      data-plan-approval={planApprovalReadonly ? "true" : "false"}
     >
       <InteractiveCard
         tone={isPermission ? "approve" : "question"}
@@ -550,7 +639,9 @@ function ZcodePendingCard({
         title={i18n.t(
           isPermission
             ? "mobile.zcodeControl.pendingPermissionTitle"
-            : "mobile.zcodeControl.pendingQuestionTitle"
+            : planApprovalReadonly
+              ? "mobile.zcodeControl.pendingPlanApprovalTitle"
+              : "mobile.zcodeControl.pendingQuestionTitle"
         )}
         footer={footer}
       >

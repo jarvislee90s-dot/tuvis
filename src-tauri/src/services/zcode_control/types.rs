@@ -404,6 +404,22 @@ pub struct InputRoutingView {
     pub reason_code: Option<String>,
 }
 
+/// 计划批准的显式决定（C2 P0 只开放 approve；拒绝/反馈待真实帧）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PlanApprovalDecision {
+    Approve,
+}
+
+impl PlanApprovalDecision {
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::Approve => "approve",
+        }
+    }
+}
+
+/// 统一控制动作（tagged `kind`；**全部**携 `sessionId,generation`）。
 /// 统一控制动作（tagged `kind`；**全部**携 `sessionId,generation`）。
 ///
 /// 已接入 `Send`/`Answer`/`Snooze`/`Stop`/`Permission`/`Selection`。
@@ -453,6 +469,15 @@ pub enum ControlAction {
         generation: u64,
         interaction_id: String,
         option_id: String,
+    },
+    /// 计划批准（C2 P0）：对既有 `ExitPlanMode/plan_approval` pending 的
+    /// 唯一 approve 选项做一次 resolve；不是普通问答应答。
+    #[serde(rename_all = "camelCase")]
+    PlanApproval {
+        session_id: String,
+        generation: u64,
+        interaction_id: String,
+        decision: PlanApprovalDecision,
     },
     /// 打断（T4）。
     #[serde(rename_all = "camelCase")]
@@ -534,6 +559,7 @@ impl ControlAction {
             Self::Snooze { .. } => "snooze",
             Self::Answer { .. } => "answer",
             Self::Permission { .. } => "permission",
+            Self::PlanApproval { .. } => "plan_approval",
             Self::Stop { .. } => "stop",
             Self::Selection { .. } => "selection",
             Self::QueueDelete { .. } => "queue_delete",
@@ -551,6 +577,7 @@ impl ControlAction {
             | Self::Snooze { session_id, .. }
             | Self::Answer { session_id, .. }
             | Self::Permission { session_id, .. }
+            | Self::PlanApproval { session_id, .. }
             | Self::Stop { session_id, .. }
             | Self::Selection { session_id, .. }
             | Self::QueueDelete { session_id, .. }
@@ -568,6 +595,7 @@ impl ControlAction {
             | Self::Snooze { generation, .. }
             | Self::Answer { generation, .. }
             | Self::Permission { generation, .. }
+            | Self::PlanApproval { generation, .. }
             | Self::Stop { generation, .. }
             | Self::Selection { generation, .. }
             | Self::QueueDelete { generation, .. }
@@ -877,6 +905,18 @@ pub struct PendingView {
     /// `approvalReply` 能力与选项白名单决定，不看本字段。
     #[serde(default)]
     pub answerable: bool,
+    /// 服务端投影：本卡是**计划批准**（`kind=userInput` ∧ `toolName=ExitPlanMode`
+    /// ∧ `schema.interaction=plan_approval`）。
+    ///
+    /// C1 的专用标识 + C2 的原生批准判据：手机端据此使用「计划批准」标题与专用卡，
+    /// 并只允许对精确 `approve` 选项发起一次 `planApproval` 动作。
+    /// `plan_approval=true` 与 `answerable=false` 同时成立——计划批准不走普通问答
+    /// `Answer` 路径；原生批准由 `pending::build_plan_approval_answer` 单独守卫。
+    ///
+    /// 只在**确认形状**置位：相似但缺字段的 `userInput`（如 ExitPlanMode 无
+    /// `schema.interaction`、MCP elicitation）保持 `false`，走现有通用只读文案。
+    #[serde(default)]
+    pub plan_approval: bool,
     /// [`PendingView::detail`] 是否按 [`MAX_PENDING_DETAIL_CHARS`] **截断**过。
     ///
     /// 与 `detail` 在同一次投影里算出（不靠前端按长度猜）：截断意味着手机上看到
@@ -1712,7 +1752,7 @@ mod tests {
             assert_eq!(project_pending_detail(Some(&Value::from(""))), None);
         }
 
-        /// wire 形状：`detail` 是 camelCase 且作为 `PendingView` 的唯一新增字段出现。
+        /// wire 形状：`detail` 是 camelCase 且与 `planApproval` 一样始终出现在线上。
         #[test]
         fn detail_serializes_on_pending_view() {
             let view = PendingView {
@@ -1731,12 +1771,14 @@ mod tests {
                 options: Vec::new(),
                 detail: Some("npm test".to_owned()),
                 answerable: false,
+                plan_approval: false,
                 detail_truncated: false,
             };
             let value = serde_json::to_value(&view).expect("pending 视图应可序列化");
             assert_eq!(value["detail"], "npm test");
-            // 两个安全字段必须在 wire 上始终出现（缺省只在**反序列化**旧载荷时生效）。
+            // 三个安全/只读字段必须在 wire 上始终出现（缺省只在**反序列化**旧载荷时生效）。
             assert_eq!(value["answerable"], false);
+            assert_eq!(value["planApproval"], false);
             assert_eq!(value["detailTruncated"], false);
         }
 

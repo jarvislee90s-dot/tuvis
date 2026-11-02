@@ -1195,6 +1195,16 @@ const ACTION_KEYS: &[(&str, &[&str])] = &[
         ],
     ),
     (
+        "planApproval",
+        &[
+            "kind",
+            "sessionId",
+            "generation",
+            "interactionId",
+            "decision",
+        ],
+    ),
+    (
         "stop",
         &[
             "kind",

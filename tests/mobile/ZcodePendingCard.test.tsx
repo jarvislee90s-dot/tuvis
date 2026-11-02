@@ -109,8 +109,9 @@ function pendingView(overrides: Partial<PendingView> = {}): PendingView {
     questions: [],
     options: [],
     detail: null,
-    // 支持子型（AskUserQuestion）可答；正文未截断。
+    // 支持子型（AskUserQuestion）可答；正文未截断；非计划批准。
     answerable: true,
+    planApproval: false,
     detailTruncated: false,
     ...overrides,
   };
@@ -947,6 +948,96 @@ describe("ZCode 待处理卡：不可答子型只读 / 截断正文不盲批", (
     // 「打开官方页面」只走面板回调，不由卡片拼链接或代点
     fireEvent.click(screen.getByTestId("zcode-pending-open-official"));
     expect(onOpenOfficial).toHaveBeenCalledTimes(1);
+    expect(calls).toHaveLength(0);
+  });
+
+  /** C1 计划批准卡：服务端显式 `planApproval=true`（`answerable` 仍为 false）。 */
+  function planApprovalCard(): PendingView {
+    return pendingView({
+      schemaInteraction: "plan_approval",
+      toolName: "ExitPlanMode",
+      planApproval: true,
+      answerable: false,
+      questions: [
+        questionView({
+          header: "Plan",
+          questionText: "要批准这份计划吗？",
+          options: [{ value: "approve", label: "批准", description: null, preview: null }],
+        }),
+      ],
+    });
+  }
+
+  it("plan_approval_card_approves_once_with_exact_approve", async () => {
+    // C2：计划批准是既有 pending 的精确 approve，不是普通问答应答。
+    // 点击前零 POST；点击后恰一次 planApproval；不渲染通用选项/提交。
+    const { fn, calls } = makeSubmit();
+    const onOpenOfficial = vi.fn();
+    render(
+      <ZcodePendingCard
+        {...baseProps({ pending: planApprovalCard(), submit: fn, onOpenOfficial })}
+      />
+    );
+
+    expect(screen.getByTestId("zcode-pending-card").getAttribute("data-plan-approval")).toBe(
+      "true"
+    );
+    const body = screen.getByTestId("zcode-pending-card-body");
+    expect(within(body).getByText("计划批准")).toBeVisible();
+    expect(within(body).queryByText("等待回答")).toBeNull();
+    expect(screen.getByTestId("zcode-pending-readonly-questions").textContent).toContain(
+      "要批准这份计划吗？"
+    );
+    expect(screen.queryByTestId("zcode-pending-submit")).toBeNull();
+    expect(screen.queryByTestId("zcode-answer-options")).toBeNull();
+    expect(calls).toHaveLength(0);
+
+    fireEvent.click(screen.getByTestId("zcode-plan-approval-approve"));
+    await waitFor(() => expect(calls).toHaveLength(1));
+    expect(calls[0]).toMatchObject({
+      kind: "planApproval",
+      sessionId: SID,
+      generation: GEN,
+      interactionId: INTERACTION,
+      decision: "approve",
+    });
+    expect(screen.getByTestId("zcode-pending-open-official")).toBeVisible();
+  });
+
+  it("plan_approval_card_is_disabled_when_single_select_is_closed", () => {
+    const { fn, calls } = makeSubmit();
+    const caps = capabilities();
+    caps.singleSelect = { enabled: false, reasonCode: "needs_evidence" };
+    render(
+      <ZcodePendingCard
+        {...baseProps({ pending: planApprovalCard(), submit: fn, capabilities: caps })}
+      />
+    );
+
+    expect(screen.queryByTestId("zcode-plan-approval-approve")).toBeNull();
+    expect(screen.getByTestId("zcode-pending-plan-approval-reason")).toHaveAttribute(
+      "data-reason-code",
+      "needs_evidence"
+    );
+    expect(calls).toHaveLength(0);
+  });
+
+  it("unsupported_readonly_subtype_keeps_generic_copy", () => {
+    // 非计划批准的 `answerable=false` 未知子型仍走现有通用只读文案（不回归）。
+    const { fn, calls } = makeSubmit();
+    const pending = pendingView({
+      schemaInteraction: "mcp_elicitation",
+      toolName: "mcp__synthetic__ask",
+      answerable: false,
+      questions: [questionView()],
+    });
+    render(<ZcodePendingCard {...baseProps({ pending, submit: fn })} />);
+
+    const reason = screen.getByTestId("zcode-pending-readonly-reason");
+    expect(reason.getAttribute("data-readonly-kind")).toBe("unsupported");
+    expect(reason.textContent).toContain("该类型暂不能远程作答");
+    expect(reason.textContent).not.toContain("这是计划批准");
+    expect(screen.queryByTestId("zcode-pending-submit")).toBeNull();
     expect(calls).toHaveLength(0);
   });
 

@@ -157,6 +157,17 @@ _Only versions translated so far are listed here; the full history lives in the
 
 ### Fixed
 
+- **ZCode phone outbox recovery and provider/plan-card usability**: after a restart, an
+  accepted send whose terminal state cannot be proven shows "Results to review" and pauses
+  the outbox; while unreviewed, "Resume queue / Send this one" are explicitly rejected, and
+  "Confirm and resume queue" only clears the barrier and continues items that have not been
+  sent — the old message is never resent. Provider availability is three-state: explicitly
+  unavailable providers stay disabled; a provider without an `available` field is marked
+  unknown, selectable only after a second confirmation before the full triple is submitted.
+  Plan approval (`ExitPlanMode`/`plan_approval`) now has a dedicated native approve
+  action for the exact host `approve` option; failures stay honest and never fabricate a
+  frame. Real-host plan-approval acceptance is still pending. Real hosts, real provider switching and real plan approval
+  remain unverified.
 - **ZCode review fixes (providers / recovery / mode guards)**: the production read
   path now sends every provider group and refreshes the catalog on a live provider switch; editing with a known draft asks first, and
   cancelling no longer retracts the original item or deletes its recovery snapshot;

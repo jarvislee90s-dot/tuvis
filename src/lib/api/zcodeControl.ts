@@ -267,6 +267,18 @@ export interface PendingView {
    */
   answerable?: boolean;
   /**
+   * 服务端 C1 投影：本卡是**计划批准**（`kind=userInput` ∧ `toolName=ExitPlanMode`
+   * ∧ `schemaInteraction=plan_approval`）。
+   *
+   * 仅用于**只读解释**：卡片据此显示「计划批准」标题 / 专用只读原因，tab 据此换文案；
+   * 绝不据此构造任何应答。`true` 时 `answerable` 仍为 `false`——原生计划批准
+   * （C2）在拿到真实脱敏 payload 前 **BLOCKED**，不猜 `resolveInteraction` 形状。
+   *
+   * **可选字段**：服务端（Rust `PendingView.plan_approval`，serde default）总是下发，
+   * 但旧服务端载荷 / 增量 merge 的帧可能不带它；缺字段按 `false`（通用只读文案）。
+   */
+  planApproval?: boolean;
+  /**
    * `detail` 是否被服务端按同一上限**截断**过（与文本同一次投影算出，前端不按长度猜）。
    *
    * `true` → 卡片必须说明「内容未完全展示」并撤掉「允许一次」，只留「拒绝」与
@@ -472,6 +484,13 @@ export type ControlAction =
       sessionId: string;
       generation: number;
       expectedForegroundExecutionId: string;
+    }
+  | {
+      kind: "planApproval";
+      sessionId: string;
+      generation: number;
+      interactionId: string;
+      decision: "approve";
     }
   | {
       kind: "selection";

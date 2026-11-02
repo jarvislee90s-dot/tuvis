@@ -322,13 +322,17 @@ impl SqlLocalQueueStore {
     }
     pub(crate) fn unconfirmed_action(
         &self,
-        actor: &QueueActor,
+        _actor: &QueueActor,
         key: &TargetKey,
     ) -> ZResult<Option<String>> {
         use rusqlite::OptionalExtension;
         let err =
             || super::super::types::ZcodeError::of(super::super::types::codes::STORAGE_FAILED);
-        self.store.with(|c| c.query_row("SELECT dispatch_action_id FROM zcode_send_queue WHERE session_id=?1 AND device_id=?2 AND state='accepted' AND coalesce(json_extract(receipt,'$.sendAdmission.delivery'),'')='startNow' AND coalesce(json_extract(receipt,'$._queueTerminal'),0)=0 AND coalesce(json_extract(receipt,'$._queueUnconfirmed'),0)=0 AND (coalesce(json_extract(receipt,'$._queueRestartUnconfirmed'),0)=1 OR coalesce(json_extract(receipt,'$._queueTargetUnconfirmed'),0)=1) ORDER BY seq LIMIT 1",rusqlite::params![key.session_id,actor.device_id],|r|r.get(0)).optional()).map_err(|_| err())
+        // barrier 是**会话级**的：某一设备留下的 unknown 结果会阻塞所有设备的
+        // continue/priority；因此核对入口也必须会话级可见，不能按 actor 的
+        // device_id 过滤。否则旧设备换机/重配对后，新设备会看到“已暂停”却永远
+        // 没有核对按钮，形成死锁（2026-11-03 实机 Travel 即此形态）。
+        self.store.with(|c| c.query_row("SELECT dispatch_action_id FROM zcode_send_queue WHERE session_id=?1 AND state='accepted' AND coalesce(json_extract(receipt,'$.sendAdmission.delivery'),'')='startNow' AND coalesce(json_extract(receipt,'$._queueTerminal'),0)=0 AND coalesce(json_extract(receipt,'$._queueUnconfirmed'),0)=0 AND (coalesce(json_extract(receipt,'$._queueRestartUnconfirmed'),0)=1 OR coalesce(json_extract(receipt,'$._queueTargetUnconfirmed'),0)=1) ORDER BY seq LIMIT 1",[&key.session_id],|r|r.get(0)).optional()).map_err(|_| err())
     }
     pub(crate) fn finish_priority_safe(
         &self,
@@ -1249,9 +1253,11 @@ impl SqlLocalQueueStore {
             if let Some((owner, old_hash)) = prior { return if owner != actor.device_id { Err(hidden()) } else if old_hash == hash { Ok(()) } else { Err(invalid()) }; }
             let enq_owner: Option<String> = tx.query_row("SELECT device_id FROM zcode_send_queue WHERE request_id=?1", [request_id], |r| r.get(0)).optional().map_err(|_| err())?;
             if let Some(owner) = enq_owner { return Err(if owner == actor.device_id { invalid() } else { hidden() }); }
-            let row: Option<(String,String)> = tx.query_row("SELECT item_id,device_id FROM zcode_send_queue WHERE session_id=?1 AND dispatch_action_id=?2 AND state='accepted' AND coalesce(json_extract(receipt,'$.sendAdmission.delivery'),'')='startNow' AND coalesce(json_extract(receipt,'$._queueTerminal'),0)=0 AND coalesce(json_extract(receipt,'$._queueUnconfirmed'),0)=0 AND (coalesce(json_extract(receipt,'$._queueRestartUnconfirmed'),0)=1 OR coalesce(json_extract(receipt,'$._queueTargetUnconfirmed'),0)=1)", rusqlite::params![key.session_id,action_id], |r| Ok((r.get(0)?,r.get(1)?))).optional().map_err(|_| err())?;
-            let (item,owner)=row.ok_or_else(hidden)?;
-            if owner != actor.device_id { return Err(hidden()); }
+            // barrier 是会话级，核对也允许当前任意已配对设备执行；这里仍以
+            // dispatch_action_id 精确锚定会话内那一条，绝不按“第一条 unknown”猜。
+            // 核对动作只清屏障、不重发/不重停，操作者记录在当前 actor 的审计里。
+            let row: Option<String> = tx.query_row("SELECT item_id FROM zcode_send_queue WHERE session_id=?1 AND dispatch_action_id=?2 AND state='accepted' AND coalesce(json_extract(receipt,'$.sendAdmission.delivery'),'')='startNow' AND coalesce(json_extract(receipt,'$._queueTerminal'),0)=0 AND coalesce(json_extract(receipt,'$._queueUnconfirmed'),0)=0 AND (coalesce(json_extract(receipt,'$._queueRestartUnconfirmed'),0)=1 OR coalesce(json_extract(receipt,'$._queueTargetUnconfirmed'),0)=1)", rusqlite::params![key.session_id,action_id], |r| r.get(0)).optional().map_err(|_| err())?;
+            let item = row.ok_or_else(hidden)?;
             tx.execute("UPDATE zcode_send_queue SET receipt=json_set(receipt,'$._queueUnconfirmed',1) WHERE item_id=?1", [&item]).map_err(|_| err())?;
             tx.execute("UPDATE zcode_queue_state SET version=version+1,auto_drain=0,pause_reason='unconfirmed' WHERE session_id=?1", [&key.session_id]).map_err(|_| err())?;
             tx.execute("INSERT INTO zcode_queue_operations(request_id,kind,payload_hash,device_id,device_name,item_id,expected_version,operation_state,expires_at) VALUES (?1,'barrier_review',?2,?3,?4,?5,0,'completed',9223372036854775807)", rusqlite::params![request_id,hash,actor.device_id,actor.device_name,item]).map_err(|_| err())?;
@@ -3862,20 +3868,17 @@ mod tests {
             store.unconfirmed_action(&actor, &key).unwrap(),
             Some(action_id.clone())
         );
+        // barrier 是会话级：另一台已配对设备也能看到并核对（旧设备离线时的唯一出路）。
+        let other = QueueActor {
+            device_id: "other".into(),
+            device_name: "phone".into(),
+        };
         assert_eq!(
-            store
-                .unconfirmed_action(
-                    &QueueActor {
-                        device_id: "other".into(),
-                        device_name: "phone".into()
-                    },
-                    &key
-                )
-                .unwrap(),
-            None
+            store.unconfirmed_action(&other, &key).unwrap(),
+            Some(action_id.clone())
         );
         store
-            .acknowledge_unconfirmed(&actor, &key, &action_id, "review", 6)
+            .acknowledge_unconfirmed(&other, &key, &action_id, "review", 6)
             .unwrap();
         let view = store.view(&actor, &key).unwrap();
         assert!(!view.auto_drain);
@@ -3896,10 +3899,6 @@ mod tests {
         let store = SqlLocalQueueStore::new(DeviceStore::memory());
         let actor = QueueActor {
             device_id: "device".into(),
-            device_name: "phone".into(),
-        };
-        let other = QueueActor {
-            device_id: "other".into(),
             device_name: "phone".into(),
         };
         let key = TargetKey {
@@ -3954,9 +3953,6 @@ mod tests {
         // 只有显式的人工核对标记（重启恢复）才允许 acknowledge_unconfirmed；
         // 普通运行中的 accepted 不得被“确认”掉（否则会在回合未结束时放行下一条）。
         store.mark_restart_unconfirmed(4).unwrap();
-        assert!(store
-            .acknowledge_unconfirmed(&other, &key, &b.ctx.action_id, "review-other", 4)
-            .is_err());
         assert!(store
             .acknowledge_unconfirmed(
                 &actor,
@@ -5740,6 +5736,89 @@ mod tests {
         assert_eq!(after.pause_reason.as_deref(), Some("unconfirmed"));
         // 零发送：barrier 未核对前 claim_next 不得派发任何条目。
         assert!(store.claim_next(&key, &target, 6).unwrap().is_none());
+    }
+
+    #[test]
+    fn another_paired_device_can_review_session_barrier() {
+        // 真实故障：旧设备留下 accepted/restart-unconfirmed，当前设备重新配对后
+        // 队列是会话级暂停，但核对查询按 device_id 过滤 -> 当前设备看不到按钮，
+        // resume 又因屏障拒绝，形成无法自愈的死锁。核对必须按会话可见。
+        let store = SqlLocalQueueStore::new(DeviceStore::memory());
+        let old = QueueActor {
+            device_id: "old-phone".into(),
+            device_name: "old".into(),
+        };
+        let current = QueueActor {
+            device_id: "current-phone".into(),
+            device_name: "current".into(),
+        };
+        let key = TargetKey {
+            session_id: "session".into(),
+        };
+        let target = super::super::super::types::BoundTarget {
+            session_id: key.session_id.clone(),
+            workspace_path: "/synthetic".into(),
+            workspace_identity: None,
+            workspace_key: "/synthetic".into(),
+            generation: 1,
+            bridge_generation: None,
+        };
+        let enqueue = EnqueueCommand {
+            request_id: "A".into(),
+            actor: old.clone(),
+            session_id: key.session_id.clone(),
+            workspace_path: "/synthetic".into(),
+            workspace_identity: None,
+            draft: QueueDraft {
+                text: "A".into(),
+                attachments: vec![],
+            },
+            prepared: PreparedSend::from_stored("A".into()).unwrap(),
+            edited_from: None,
+        };
+        store.enqueue(&enqueue, 1).unwrap();
+        let claim = store.claim_next(&key, &target, 2).unwrap().unwrap();
+        store
+            .settle_dispatch(
+                &claim,
+                &super::super::super::types::ActionReceipt {
+                    action_id: claim.ctx.action_id.clone(),
+                    session_id: key.session_id.clone(),
+                    generation: 1,
+                    state: super::super::super::types::ActionState::Accepted,
+                    reason_code: None,
+                    send_admission: Some(super::super::super::types::SendAdmission {
+                        delivery: super::super::super::types::SendDelivery::StartNow,
+                        input_id: "A-input".into(),
+                    }),
+                },
+                3,
+            )
+            .unwrap();
+        store.recover(4).unwrap();
+        let before = store.view(&current, &key).unwrap();
+        assert!(!before.auto_drain);
+        assert_eq!(before.pause_reason.as_deref(), Some("unconfirmed"));
+
+        // 当前设备（不是条目 owner）必须能看到并核对这条屏障。
+        assert_eq!(
+            store.unconfirmed_action(&current, &key).unwrap().as_deref(),
+            Some(claim.ctx.action_id.as_str())
+        );
+        store
+            .acknowledge_unconfirmed(&current, &key, &claim.ctx.action_id, "review-current", 5)
+            .unwrap();
+        let resumed = store
+            .resume(
+                &current,
+                &key,
+                "resume-current",
+                store.view(&current, &key).unwrap().version,
+            )
+            .unwrap();
+        assert!(resumed.auto_drain);
+        // 核对 + resume 不重发旧 A；队列没有其它条目，flush 不应产生发送。
+        assert!(store.claim_next(&key, &target, 5).unwrap().is_none());
     }
 
     #[test]
