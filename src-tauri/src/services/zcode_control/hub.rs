@@ -8533,6 +8533,25 @@ mod tests {
         }
     }
 
+    /// 原子扣减一个 test fake 的失败许可；为 0 时返回 false。
+    fn take_catalog_refresh_failure(counter: &std::sync::atomic::AtomicUsize) -> bool {
+        let mut current = counter.load(Ordering::SeqCst);
+        loop {
+            if current == 0 {
+                return false;
+            }
+            match counter.compare_exchange_weak(
+                current,
+                current - 1,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
     impl BridgePump for FakePump {
         fn on_data<'a>(&'a self, payload: Value) -> BoxFuture<'a, DataOutcome> {
             self.data.lock().unwrap().push(payload);
@@ -8564,12 +8583,7 @@ mod tests {
 
         fn refresh_catalog<'a>(&'a self, _session_id: &'a str) -> BoxFuture<'a, bool> {
             self.catalog_refresh_calls.fetch_add(1, Ordering::SeqCst);
-            let fail = self
-                .catalog_refresh_failures
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
-                    remaining.checked_sub(1)
-                })
-                .is_ok();
+            let fail = take_catalog_refresh_failure(&self.catalog_refresh_failures);
             Box::pin(async move { !fail })
         }
 

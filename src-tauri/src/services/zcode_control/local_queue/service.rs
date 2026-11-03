@@ -1537,6 +1537,26 @@ mod tests {
         refresh_failures: std::sync::atomic::AtomicUsize,
         send_failure: Mutex<Option<(bool, &'static str)>>,
     }
+    /// 原子扣减一个 test fake 的失败许可；为 0 时返回 false。避免依赖
+    /// 已被新 compiler 标记 deprecated 的 `fetch_update`。
+    fn take_failure(counter: &std::sync::atomic::AtomicUsize) -> bool {
+        let mut current = counter.load(Ordering::SeqCst);
+        loop {
+            if current == 0 {
+                return false;
+            }
+            match counter.compare_exchange_weak(
+                current,
+                current - 1,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
     impl QueueHostPort for Fake {
         fn session_lock(&self, _: &TargetKey) -> Arc<tokio::sync::Mutex<()>> {
             self.lock.clone()
@@ -1548,11 +1568,7 @@ mod tests {
         ) -> BoxFuture<'a, ZResult<BoundQueueSession>> {
             self.read_calls.fetch_add(1, Ordering::SeqCst);
             Box::pin(async move {
-                if self
-                    .read_failures
-                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
-                    .is_ok()
-                {
+                if take_failure(&self.read_failures) {
                     return Err(ZcodeError::of(codes::NOT_READY));
                 }
                 if self.blocked_session.load(Ordering::SeqCst) && key.session_id == "blocked" {
@@ -1629,11 +1645,7 @@ mod tests {
         ) -> BoxFuture<'a, ZResult<BoundTarget>> {
             self.refresh_calls.fetch_add(1, Ordering::SeqCst);
             Box::pin(async move {
-                if self
-                    .refresh_failures
-                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
-                    .is_ok()
-                {
+                if take_failure(&self.refresh_failures) {
                     return Err(ZcodeError::of(codes::NOT_READY));
                 }
                 Ok(self.read(key, timeout).await?.target)
@@ -1648,10 +1660,7 @@ mod tests {
             if self.blocked_session.load(Ordering::SeqCst) && key.session_id == "blocked" {
                 return Box::pin(async { Err(ZcodeError::of(codes::NOT_READY)) });
             }
-            let fail = self
-                .activate_failures
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
-                .is_ok();
+            let fail = take_failure(&self.activate_failures);
             if !fail {
                 self.bound.store(true, Ordering::SeqCst);
             }
