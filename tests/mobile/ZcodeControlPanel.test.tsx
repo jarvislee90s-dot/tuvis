@@ -1057,8 +1057,9 @@ describe("ZCode 控制面板：主按钮在发送与打断之间切换（R5/U3�
     const primary = (await screen.findByTestId("zcode-send")) as HTMLButtonElement;
     await waitFor(() => expect(primary).toBeDisabled());
     expect(primary.getAttribute("data-primary-action")).toBe("disabled");
-    // 原因就在主按钮旁（删除独立打断行后原因不消失）
-    const reason = screen.getByTestId("zcode-send-reason");
+    // 原因就在主按钮旁（删除独立打断行后原因不消失）。慢机先禁用后到原因：
+    // 必须等原因节点出现，不能把「加载中已禁用」误当成最终态。
+    const reason = await screen.findByTestId("zcode-send-reason");
     expect(reason.getAttribute("data-reason-code")).toBe("target_ambiguous");
     expect(reason.textContent?.trim().length ?? 0).toBeGreaterThan(0);
 
@@ -2173,7 +2174,7 @@ describe("ZCode 控制面板：原因码 zh/en 全覆盖", () => {
       "This action still needs confirmation in the terminal — continue there"
     );
     // R5/U3：独立打断行删除后，多目标歧义的原因并到主按钮旁（不再有第二行原因）。
-    const interruptReason = screen.getByTestId("zcode-send-reason");
+    const interruptReason = await screen.findByTestId("zcode-send-reason");
     expect(interruptReason.getAttribute("data-reason-code")).toBe("target_ambiguous");
     expect(interruptReason.textContent).toBe(
       "Multiple tasks can be interrupted — choose one in the terminal"
