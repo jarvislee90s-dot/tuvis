@@ -23276,6 +23276,8 @@ async fn remote_at_capacity_evicts_estimate_on_wire_and_old_ticket_is_harmless()
     });
     drive_additional_read_follow(&mut peer, &keys[0].thread_id).await;
     let new_lease = task.await.unwrap().unwrap();
+    assert!(!leases[0].is_current().await);
+    assert!(new_lease.is_current().await);
     leases[0].release().await;
     assert!(
         !peer_has_traffic(&mut peer).await,
@@ -23775,4 +23777,577 @@ async fn stopping_estimate_preserves_remote_message_dispatch() {
         .unwrap()
         .unwrap();
     assert_eq!(response.status(), 200);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn estimate_runs_with_remote_off_and_page_hidden() {
+    use multi_agents_manager_lib::services::{
+        tps::{body_runtime::CaptureService, estimate_store::CaptureGate},
+        usage::{model::UsageSettings, settings::save_to_conn_with_gate},
+    };
+    let (io, mut peer) = ScriptedPeer::new();
+    let adapter = Arc::new(DesktopIpcAdapter::new(
+        Arc::new(StaticConnector::new(io)),
+        caps_open_profile(),
+    ));
+    adapter.set_auto_adapt_gate(Some(Arc::new(|| false)));
+    assert!(adapter.begin_remote_shutdown());
+    let db = shared_conn();
+    let gate = CaptureGate::new(false);
+    let key = ThreadKey {
+        host_id: "local".into(),
+        thread_id: "00000000-0000-4000-8000-000000000025".into(),
+    };
+    let (_thread_tx, thread_rx) = tokio::sync::watch::channel(vec![key.clone()]);
+    let service = CaptureService::start_for_test(
+        adapter.clone(),
+        gate.clone(),
+        db.clone(),
+        thread_rx,
+        "fixture-build".into(),
+    );
+    assert!(
+        !peer_has_traffic(&mut peer).await,
+        "disabled capture must not connect"
+    );
+    {
+        let conn = db.lock().unwrap();
+        let settings = UsageSettings::default();
+        save_to_conn_with_gate(&conn, &settings, &gate).unwrap();
+    }
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        drive_ensure(&mut peer, &key.thread_id, vec![], "idle"),
+    )
+    .await
+    .expect("enabled capture must follow");
+    let patches = vec![
+        serde_json::json!([{ "op":"add", "path":["turnHistory","history","entitiesByKey","turn:new"], "value":{"turnId":"new","status":"inProgress","params":{"collaborationMode":{"settings":{"model":"test-model"}}},"items":[]} }, {"op":"add","path":["turnHistory","history","islands",0,"entries",1],"value":{"key":"turn:new","value":"turn:new"}}]),
+        serde_json::json!([{ "op":"add","path":["turnHistory","history","entitiesByKey","turn:new","items",0],"value":{"type":"agentMessage","id":"item","text":""}}]),
+        serde_json::json!([{ "op":"replace","path":["turnHistory","history","entitiesByKey","turn:new","items",0,"text"],"value":"hello"}]),
+        serde_json::json!([{ "op":"replace","path":["turnHistory","history","entitiesByKey","turn:new","items",0,"text"],"value":"hello world"}]),
+        serde_json::json!([{ "op":"replace","path":["turnHistory","history","entitiesByKey","turn:new","status"],"value":"completed"}]),
+    ];
+    for (i, patch) in patches.into_iter().enumerate() {
+        let base = 7 + i as u64;
+        peer.send(&serde_json::json!({"type":"broadcast","method":"thread-stream-state-changed","sourceClientId":"owner-1","params":{"conversationId":key.thread_id,"change":{"type":"patches","baseRevision":base,"revision":base+1,"patches":patch}}})).await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while adapter.projection(&key).await.revision != Some(base + 1) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("mirror progress");
+    }
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if db
+                .lock()
+                .unwrap()
+                .query_row("SELECT count(*) FROM tps_body_estimate", [], |r| {
+                    r.get::<_, i64>(0)
+                })
+                .unwrap()
+                == 1
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("estimate persisted without remote server or dashboard");
+    assert_eq!(
+        db.lock()
+            .unwrap()
+            .query_row("SELECT reference_tokens FROM tps_body_estimate", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .unwrap(),
+        2
+    );
+    let db2 = db.clone();
+    let gate2 = gate.clone();
+    let stopped = tokio::task::spawn_blocking(move || {
+        let conn = db2.lock().unwrap();
+        let mut settings = UsageSettings::default();
+        settings.enabled = false;
+        save_to_conn_with_gate(&conn, &settings, &gate2)
+    });
+    tokio::time::timeout(Duration::from_secs(3), stopped)
+        .await
+        .expect("disable must complete")
+        .unwrap()
+        .unwrap();
+    let off = recv_within(&mut peer, 2).await;
+    assert_eq!(off["method"], "thread-stream-following-changed");
+    assert_eq!(off["params"]["following"], false);
+    assert_eq!(
+        db.lock()
+            .unwrap()
+            .query_row("SELECT count(*) FROM tps_body_estimate", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    service.shutdown().await;
+    adapter.shutdown().await;
+}
+
+#[tokio::test]
+async fn build_metadata_is_bound_to_observed_connection_epoch() {
+    use multi_agents_manager_lib::services::codex_desktop_ipc::{
+        observation::BodyEvent, owners::FollowPurpose,
+    };
+    let (io, mut peer) = ScriptedPeer::new();
+    let adapter = Arc::new(DesktopIpcAdapter::new(
+        Arc::new(StaticConnector::new(io)),
+        caps_open_profile(),
+    ));
+    let mut events = adapter.subscribe_body_events();
+    let key = ThreadKey {
+        host_id: "local".into(),
+        thread_id: "00000000-0000-4000-8000-000000000026".into(),
+    };
+    let a = adapter.clone();
+    let k = key.clone();
+    let t = tokio::spawn(async move {
+        a.acquire_following(&k, FollowPurpose::TokenizerEstimate)
+            .await
+    });
+    drive_ensure(&mut peer, &key.thread_id, vec![], "idle").await;
+    let lease = t.await.unwrap().unwrap();
+    let event = tokio::time::timeout(Duration::from_secs(2), events.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let epoch = if let BodyEvent::Frame(f) = event {
+        f.scope.owner_epoch
+    } else {
+        panic!("expected baseline")
+    };
+    assert_eq!(
+        adapter.source_build_for_epoch(epoch).as_deref(),
+        Some(TEST_BUILD)
+    );
+    assert_eq!(adapter.source_build_for_epoch(epoch + 1), None);
+    lease.release().await;
+    adapter.shutdown().await;
+}
+
+#[test]
+fn cached_thread_source_only_selects_resolvable_codex_apps() {
+    use multi_agents_manager_lib::services::tps::body_runtime::cached_thread_keys;
+    let app = codex_app_session(THREAD);
+    let mut cli = app.clone();
+    cli.form = ProcessForm::Cli;
+    let mut other = app.clone();
+    other.agent_type = AgentType::Claude;
+    let mut invalid = app.clone();
+    invalid.id = "not-a-thread".into();
+    let ids = multi_agents_manager_lib::adapter::select_codex_app_ids(&[
+        app.clone(),
+        cli.clone(),
+        other.clone(),
+        invalid.clone(),
+        app.clone(),
+    ]);
+    assert_eq!(
+        ids,
+        vec![
+            THREAD.to_string(),
+            "not-a-thread".to_string(),
+            THREAD.to_string()
+        ]
+    );
+    let keys = cached_thread_keys(&[app.clone(), cli, other, invalid, app], |id| {
+        multi_agents_manager_lib::inject::headless::codex::is_uuid(id).then(|| id.to_string())
+    });
+    assert_eq!(keys.len(), 1);
+    assert_eq!(keys[0].thread_id, THREAD);
+    assert_eq!(keys[0].host_id, "local");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn disabling_capture_releases_live_candidate_before_save_returns() {
+    use multi_agents_manager_lib::services::{
+        tps::{body_runtime::CaptureService, estimate_store::CaptureGate},
+        usage::{model::UsageSettings, settings::save_to_conn_with_gate},
+    };
+    let (io, mut peer) = ScriptedPeer::new();
+    let adapter = Arc::new(DesktopIpcAdapter::new(
+        Arc::new(StaticConnector::new(io)),
+        caps_open_profile(),
+    ));
+    assert!(adapter.begin_remote_shutdown());
+    let db = shared_conn();
+    let gate = CaptureGate::new(true);
+    let key = ThreadKey {
+        host_id: "local".into(),
+        thread_id: "00000000-0000-4000-8000-000000000027".into(),
+    };
+    let (_tx, rx) = tokio::sync::watch::channel(vec![key.clone()]);
+    let service = CaptureService::start_for_test(
+        adapter.clone(),
+        gate.clone(),
+        db.clone(),
+        rx,
+        "fixture".into(),
+    );
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        drive_ensure(&mut peer, &key.thread_id, vec![], "idle"),
+    )
+    .await
+    .unwrap();
+    let patches = vec![
+        serde_json::json!([{"op":"add","path":["turnHistory","history","entitiesByKey","turn:live"],"value":{"turnId":"live","status":"inProgress","items":[]}},{"op":"add","path":["turnHistory","history","islands",0,"entries",1],"value":{"key":"turn:live","value":"turn:live"}}]),
+        serde_json::json!([{"op":"add","path":["turnHistory","history","entitiesByKey","turn:live","items",0],"value":{"type":"agentMessage","id":"item","text":""}}]),
+        serde_json::json!([{"op":"replace","path":["turnHistory","history","entitiesByKey","turn:live","items",0,"text"],"value":"live text"}]),
+    ];
+    for (i, patches) in patches.into_iter().enumerate() {
+        let base = 7 + i as u64;
+        peer.send(&serde_json::json!({"type":"broadcast","method":"thread-stream-state-changed","sourceClientId":"owner-1","params":{"conversationId":key.thread_id,"change":{"type":"patches","baseRevision":base,"revision":base+1,"patches":patches}}})).await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while adapter.projection(&key).await.revision != Some(base + 1) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while service.buffered_bytes_for_tests() == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("live candidate must hold accounted bytes");
+    let db2 = db.clone();
+    let gate2 = gate.clone();
+    let stopped = tokio::task::spawn_blocking(move || {
+        let conn = db2.lock().unwrap();
+        let mut settings = UsageSettings::default();
+        settings.enabled = false;
+        save_to_conn_with_gate(&conn, &settings, &gate2)
+    });
+    tokio::time::timeout(Duration::from_secs(3), stopped)
+        .await
+        .expect("disable must complete")
+        .unwrap()
+        .unwrap();
+    assert_eq!(service.buffered_bytes_for_tests(), 0);
+    assert_eq!(
+        db.lock()
+            .unwrap()
+            .query_row("SELECT count(*) FROM tps_body_estimate", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    service.shutdown().await;
+    adapter.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn disable_waits_for_inflight_body_producer_before_returning() {
+    use multi_agents_manager_lib::services::{
+        tps::{body_runtime::CaptureService, estimate_store::CaptureGate},
+        usage::{model::UsageSettings, settings::save_to_conn_with_gate},
+    };
+    let (io, mut peer) = ScriptedPeer::new();
+    let adapter = Arc::new(DesktopIpcAdapter::new(
+        Arc::new(StaticConnector::new(io)),
+        caps_open_profile(),
+    ));
+    assert!(adapter.begin_remote_shutdown());
+    let db = shared_conn();
+    let gate = CaptureGate::new(true);
+    let key = ThreadKey {
+        host_id: "local".into(),
+        thread_id: "00000000-0000-4000-8000-000000000028".into(),
+    };
+    let (_tx, rx) = tokio::sync::watch::channel(vec![key.clone()]);
+    let service = CaptureService::start_for_test(
+        adapter.clone(),
+        gate.clone(),
+        db.clone(),
+        rx,
+        "fixture".into(),
+    );
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        drive_ensure(&mut peer, &key.thread_id, vec![], "idle"),
+    )
+    .await
+    .unwrap();
+    let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    let resume_rx = Arc::new(StdMutex::new(resume_rx));
+    adapter.set_caps_observe_gate(Some(Arc::new(move |path| {
+        if path == "state_changed" {
+            let _ = entered_tx.send(());
+            let _ = resume_rx.lock().unwrap().recv();
+        }
+    })));
+    peer.send(&serde_json::json!({"type":"broadcast","method":"thread-stream-state-changed","sourceClientId":"owner-1","params":{"conversationId":key.thread_id,"change":{"type":"patches","baseRevision":7,"revision":8,"patches":[{"op":"add","path":["turnHistory","history","entitiesByKey","turn:late"],"value":{"turnId":"late","status":"inProgress","items":[{"type":"agentMessage","id":"i","text":"sensitive synthetic text"}]}}]}}})).await;
+    tokio::time::timeout(Duration::from_secs(2), entered_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let db2 = db.clone();
+    let gate2 = gate.clone();
+    let (db_locked_tx, db_locked_rx) = tokio::sync::oneshot::channel();
+    let mut stop = tokio::task::spawn_blocking(move || {
+        let conn = db2.lock().unwrap();
+        let _ = db_locked_tx.send(());
+        let mut settings = UsageSettings::default();
+        settings.enabled = false;
+        save_to_conn_with_gate(&conn, &settings, &gate2)
+    });
+    tokio::time::timeout(Duration::from_secs(2), db_locked_rx)
+        .await
+        .expect("settings must acquire DB lock")
+        .unwrap();
+    let early = tokio::time::timeout(Duration::from_millis(100), &mut stop).await;
+    let waited = early.is_err();
+    resume_tx.send(()).unwrap();
+    match early {
+        Ok(result) => result.unwrap().unwrap(),
+        Err(_) => tokio::time::timeout(Duration::from_secs(3), stop)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap(),
+    };
+    adapter.set_caps_observe_gate(None);
+    service.shutdown().await;
+    adapter.shutdown().await;
+    assert!(
+        waited,
+        "disable returned while a producer still held plaintext"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn capture_retries_evicted_thread_when_remote_releases_capacity() {
+    use multi_agents_manager_lib::services::{
+        codex_desktop_ipc::owners::MAX_FOLLOWINGS,
+        tps::{body_runtime::CaptureService, estimate_store::CaptureGate},
+    };
+    let (io, mut peer) = ScriptedPeer::new();
+    let adapter = Arc::new(DesktopIpcAdapter::new(
+        Arc::new(StaticConnector::new(io)),
+        caps_open_profile(),
+    ));
+    let keys: Vec<_> = (0..MAX_FOLLOWINGS)
+        .map(|i| ThreadKey {
+            host_id: "local".into(),
+            thread_id: format!("00000000-0000-4000-8000-{i:012}"),
+        })
+        .collect();
+    let (_tx, rx) = tokio::sync::watch::channel(keys);
+    let service = CaptureService::start_for_test(
+        adapter.clone(),
+        CaptureGate::new(true),
+        shared_conn(),
+        rx,
+        "fixture".into(),
+    );
+    tokio::time::timeout(Duration::from_secs(3), handshake(&mut peer, "owner-1"))
+        .await
+        .unwrap();
+    for _ in 0..MAX_FOLLOWINGS {
+        let disc = recv_within(&mut peer, 3).await;
+        assert_eq!(disc["method"], "thread-owner-discovery");
+        let thread = disc["params"]["conversationId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        peer.send(&discovery_response(
+            disc["requestId"].as_str().unwrap(),
+            "owner-1",
+        ))
+        .await;
+        let follow = recv_within(&mut peer, 2).await;
+        assert_eq!(follow["params"]["following"], true);
+        peer.send(&serde_json::json!({"type":"broadcast","method":"thread-stream-state-changed","sourceClientId":"owner-1","params":{"conversationId":thread,"change":{"type":"snapshot","revision":1,"conversationState":{"turns":[],"requests":[],"threadRuntimeStatus":{"type":"idle"},"turnHistory":codex_fixture::canonical_turn_history(serde_json::json!({}),serde_json::json!([]))}}}})).await;
+    }
+    let remote = ThreadKey {
+        host_id: "local".into(),
+        thread_id: "00000000-0000-4000-8000-999999999998".into(),
+    };
+    let a = adapter.clone();
+    let k = remote.clone();
+    let request = tokio::spawn(async move { a.ensure_thread(&k).await });
+    let eviction = recv_within(&mut peer, 3).await;
+    assert_eq!(eviction["params"]["following"], false);
+    let victim = eviction["params"]["conversationId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    drive_additional_read_follow(&mut peer, &remote.thread_id).await;
+    request.await.unwrap().unwrap();
+    adapter.unfollow(&remote).await;
+    let off = recv_within(&mut peer, 2).await;
+    assert_eq!(off["params"]["following"], false);
+    let disc = recv_within(&mut peer, 6).await;
+    assert_eq!(disc["method"], "thread-owner-discovery");
+    assert_eq!(disc["params"]["conversationId"], victim);
+    peer.send(&discovery_response(
+        disc["requestId"].as_str().unwrap(),
+        "owner-1",
+    ))
+    .await;
+    let follow = recv_within(&mut peer, 2).await;
+    assert_eq!(follow["params"]["following"], true);
+    peer.send(&serde_json::json!({"type":"broadcast","method":"thread-stream-state-changed","sourceClientId":"owner-1","params":{"conversationId":victim,"change":{"type":"snapshot","revision":1,"conversationState":{"turns":[],"requests":[],"threadRuntimeStatus":{"type":"idle"},"turnHistory":codex_fixture::canonical_turn_history(serde_json::json!({}),serde_json::json!([]))}}}})).await;
+    service.shutdown().await;
+    adapter.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn oversized_live_body_is_excluded_and_diagnosed() {
+    use multi_agents_manager_lib::services::tps::{
+        body_runtime::CaptureService, estimate_store::CaptureGate,
+    };
+    let (io, mut peer) = ScriptedPeer::new();
+    let adapter = Arc::new(DesktopIpcAdapter::new(
+        Arc::new(StaticConnector::new(io)),
+        caps_open_profile(),
+    ));
+    assert!(adapter.begin_remote_shutdown());
+    let db = shared_conn();
+    let gate = CaptureGate::new(true);
+    let key = ThreadKey {
+        host_id: "local".into(),
+        thread_id: "00000000-0000-4000-8000-000000000029".into(),
+    };
+    let (_tx, rx) = tokio::sync::watch::channel(vec![key.clone()]);
+    let service =
+        CaptureService::start_for_test(adapter.clone(), gate, db.clone(), rx, "fixture".into());
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        drive_ensure(&mut peer, &key.thread_id, vec![], "idle"),
+    )
+    .await
+    .unwrap();
+    let patches = vec![
+        serde_json::json!([{"op":"add","path":["turnHistory","history","entitiesByKey","turn:oversize"],"value":{"turnId":"oversize","status":"inProgress","items":[]}},{"op":"add","path":["turnHistory","history","islands",0,"entries",1],"value":{"key":"turn:oversize","value":"turn:oversize"}}]),
+        serde_json::json!([{"op":"add","path":["turnHistory","history","entitiesByKey","turn:oversize","items",0],"value":{"type":"agentMessage","id":"item","text":""}}]),
+        serde_json::json!([{"op":"replace","path":["turnHistory","history","entitiesByKey","turn:oversize","items",0,"text"],"value":"a".repeat(1024*1024+1)}]),
+    ];
+    for (i, patches) in patches.into_iter().enumerate() {
+        let base = 7 + i as u64;
+        peer.send(&serde_json::json!({"type":"broadcast","method":"thread-stream-state-changed","sourceClientId":"owner-1","params":{"conversationId":key.thread_id,"change":{"type":"patches","baseRevision":base,"revision":base+1,"patches":patches}}})).await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while adapter.projection(&key).await.revision != Some(base + 1) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while service.diagnostics().budget_drops == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("budget exclusion must be diagnosed");
+    assert_eq!(
+        db.lock()
+            .unwrap()
+            .query_row("SELECT count(*) FROM tps_body_estimate", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    service.shutdown().await;
+    adapter.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn contiguous_base_revision_can_advance_by_more_than_one() {
+    use multi_agents_manager_lib::services::tps::{
+        body_runtime::CaptureService, estimate_store::CaptureGate,
+    };
+    let (io, mut peer) = ScriptedPeer::new();
+    let adapter = Arc::new(DesktopIpcAdapter::new(
+        Arc::new(StaticConnector::new(io)),
+        caps_open_profile(),
+    ));
+    assert!(adapter.begin_remote_shutdown());
+    let db = shared_conn();
+    let gate = CaptureGate::new(true);
+    let key = ThreadKey {
+        host_id: "local".into(),
+        thread_id: "00000000-0000-4000-8000-000000000030".into(),
+    };
+    let (_tx, rx) = tokio::sync::watch::channel(vec![key.clone()]);
+    let service =
+        CaptureService::start_for_test(adapter.clone(), gate, db.clone(), rx, "fixture".into());
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        drive_ensure(&mut peer, &key.thread_id, vec![], "idle"),
+    )
+    .await
+    .unwrap();
+    let changes = vec![
+        (
+            7,
+            9,
+            serde_json::json!([{"op":"add","path":["turnHistory","history","entitiesByKey","turn:skip"],"value":{"turnId":"skip","status":"inProgress","items":[]}},{"op":"add","path":["turnHistory","history","islands",0,"entries",1],"value":{"key":"turn:skip","value":"turn:skip"}}]),
+        ),
+        (
+            9,
+            10,
+            serde_json::json!([{"op":"add","path":["turnHistory","history","entitiesByKey","turn:skip","items",0],"value":{"type":"agentMessage","id":"i","text":""}}]),
+        ),
+        (
+            10,
+            12,
+            serde_json::json!([{"op":"replace","path":["turnHistory","history","entitiesByKey","turn:skip","items",0,"text"],"value":"hello"}]),
+        ),
+        (
+            12,
+            13,
+            serde_json::json!([{"op":"replace","path":["turnHistory","history","entitiesByKey","turn:skip","items",0,"text"],"value":"hello world"}]),
+        ),
+        (
+            13,
+            14,
+            serde_json::json!([{"op":"replace","path":["turnHistory","history","entitiesByKey","turn:skip","status"],"value":"completed"}]),
+        ),
+    ];
+    for (base, rev, patches) in changes {
+        peer.send(&serde_json::json!({"type":"broadcast","method":"thread-stream-state-changed","sourceClientId":"owner-1","params":{"conversationId":key.thread_id,"change":{"type":"patches","baseRevision":base,"revision":rev,"patches":patches}}})).await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while adapter.projection(&key).await.revision != Some(rev) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+    let result = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if db
+                .lock()
+                .unwrap()
+                .query_row("SELECT count(*) FROM tps_body_estimate", [], |r| {
+                    r.get::<_, i64>(0)
+                })
+                .unwrap()
+                == 1
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    service.shutdown().await;
+    adapter.shutdown().await;
+    result.expect("verified base continuity must not require unit revision increments");
 }

@@ -1,6 +1,8 @@
 //! 连续 IPC 正文窗口观察；正文仅在内存保存。
 use super::reference::reference_profile;
-use crate::services::codex_desktop_ipc::observation::{BodyChange, BodyFrame, CaptureScope};
+use crate::services::codex_desktop_ipc::observation::{
+    BodyChange, BodyFrame, BodyReservation, CaptureScope, SharedBodyBudget,
+};
 use std::collections::{HashMap, HashSet};
 
 const ITEM_BUDGET: usize = 1024 * 1024;
@@ -19,6 +21,7 @@ pub struct FinishedBody {
     pub last_wall_ms: i64,
     pub reference_profile_id: String,
     pub short_window: bool,
+    _reservation: BodyReservation,
 }
 struct Candidate {
     text: String,
@@ -28,6 +31,7 @@ struct Candidate {
     last: u64,
     wall: i64,
     growths: usize,
+    reservation: BodyReservation,
 }
 #[derive(Default)]
 struct Stream {
@@ -36,12 +40,24 @@ struct Stream {
     invalid: HashSet<(String, String)>,
     terminal: HashSet<String>,
 }
-#[derive(Default)]
 pub struct BodyObserver {
     streams: HashMap<CaptureScope, Stream>,
     bytes: usize,
+    budget: std::sync::Arc<SharedBodyBudget>,
+}
+impl Default for BodyObserver {
+    fn default() -> Self {
+        Self::with_budget(std::sync::Arc::new(SharedBodyBudget::default()))
+    }
 }
 impl BodyObserver {
+    pub fn with_budget(budget: std::sync::Arc<SharedBodyBudget>) -> Self {
+        Self {
+            streams: HashMap::new(),
+            bytes: 0,
+            budget,
+        }
+    }
     pub fn invalidate(&mut self, scope: &CaptureScope) {
         if let Some(old) = self.streams.remove(scope) {
             self.bytes = self
@@ -50,6 +66,15 @@ impl BodyObserver {
         }
     }
     pub fn on_frame(&mut self, frame: BodyFrame) -> Vec<FinishedBody> {
+        self.apply_frame(frame, false)
+    }
+
+    /// 仅供已由 mirror 校验 baseRevision 且经过丢帧哨兵的事件使用。
+    pub(crate) fn on_verified_frame(&mut self, frame: BodyFrame) -> Vec<FinishedBody> {
+        self.apply_frame(frame, true)
+    }
+
+    fn apply_frame(&mut self, frame: BodyFrame, verified_base: bool) -> Vec<FinishedBody> {
         let incoming = (
             frame.scope.capture_generation,
             frame.scope.owner_epoch,
@@ -76,10 +101,9 @@ impl BodyObserver {
             self.invalidate(&scope);
         }
         let stream = self.streams.entry(frame.scope.clone()).or_default();
-        if stream
-            .revision
-            .is_some_and(|r| frame.revision != r.saturating_add(1))
-        {
+        if stream.revision.is_some_and(|r| {
+            frame.revision <= r || (!verified_base && frame.revision != r.saturating_add(1))
+        }) {
             self.bytes = self
                 .bytes
                 .saturating_sub(stream.items.values().map(|c| c.text.len()).sum::<usize>());
@@ -126,6 +150,7 @@ impl BodyObserver {
                             last: 0,
                             wall: 0,
                             growths: 0,
+                            reservation: BodyReservation::new(self.budget.clone()),
                         });
                     }
                 }
@@ -142,9 +167,12 @@ impl BodyObserver {
                         stream.invalid.insert(key);
                         continue;
                     };
-                    if candidate.text.len().saturating_add(text.len()) > ITEM_BUDGET
-                        || self.bytes.saturating_add(text.len()) > GLOBAL_BUDGET
-                    {
+                    let local_limit = candidate.text.len().saturating_add(text.len()) > ITEM_BUDGET
+                        || self.bytes.saturating_add(text.len()) > GLOBAL_BUDGET;
+                    if local_limit {
+                        self.budget.record_rejection();
+                    }
+                    if local_limit || !candidate.reservation.grow(text.len()) {
                         self.bytes = self.bytes.saturating_sub(candidate.text.len());
                         stream.items.remove(&key);
                         stream.invalid.insert(key);
@@ -207,6 +235,7 @@ impl BodyObserver {
                                     last_wall_ms: c.wall,
                                     reference_profile_id: reference_profile().id.clone(),
                                     short_window: duration_ns < 500_000_000,
+                                    _reservation: c.reservation,
                                 });
                             }
                         }

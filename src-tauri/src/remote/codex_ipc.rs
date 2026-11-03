@@ -231,6 +231,33 @@ fn production_resolver() -> Arc<dyn crate::services::codex_desktop_ipc::transpor
     }
 }
 
+/// 远程与测速共用同一只读连接；未启动远程时写门保持关闭。
+pub(crate) fn shared_production_adapter() -> Arc<DesktopIpcAdapter> {
+    static ADAPTER: std::sync::OnceLock<Arc<DesktopIpcAdapter>> = std::sync::OnceLock::new();
+    ADAPTER
+        .get_or_init(|| {
+            let resolver = production_resolver();
+            let profile = match resolver.resolve() {
+                Ok(ep) => profile_for(&ep.platform, &ep.build.clone().unwrap_or_default())
+                    .unwrap_or_else(|| {
+                        ProtocolProfile::unverified(&ep.platform, &ep.build.unwrap_or_default())
+                    }),
+                Err(_) => closed_profile(),
+            };
+            let adapter = Arc::new(DesktopIpcAdapter::new(
+                Arc::new(ProductionConnector { resolver }),
+                profile,
+            ));
+            let settings = DeviceStore::Global;
+            adapter.set_auto_adapt_gate(Some(Arc::new(move || {
+                settings.with(super::auto_adapt_enabled_conn)
+            })));
+            adapter.begin_remote_shutdown();
+            adapter
+        })
+        .clone()
+}
+
 /// #172/T8：**该 build 的读链是否已取证**（兼容发送开关的前置判据）。
 ///
 /// 口径（两档都算「已取证」）：
@@ -344,22 +371,7 @@ impl CodexControlHub {
     /// 装配时判定一次：未识别 build → closed profile → A 写能力关闭（不能伪装成已
     /// 验证版本；Desktop 后续才启动的场景保守按不可用，Tuvis 重启后重新判定）。
     pub fn production(store: DeviceStore) -> Self {
-        let resolver = production_resolver();
-        // #172：profile 从「准入白名单」降级为「证据缓存」——resolve 到 build 但不在
-        // shipped 表时用「尚无证据」档（可惰性探测），resolve 失败才是「明确不可用」。
-        let profile = match resolver.resolve() {
-            Ok(ep) => {
-                let platform = ep.platform.clone();
-                let build = ep.build.clone().unwrap_or_default();
-                profile_for(&platform, &build)
-                    .unwrap_or_else(|| ProtocolProfile::unverified(&platform, &build))
-            }
-            Err(_) => closed_profile(),
-        };
-        let adapter = Arc::new(DesktopIpcAdapter::new(
-            Arc::new(ProductionConnector { resolver }),
-            profile,
-        ));
+        let adapter = shared_production_adapter();
         // #172：能力探测账本（`codex_ipc_probe`）——程序自用的证据缓存，与 hub 的
         // ActionStore 同库（设备/动作/探测三类事实一处）。DeviceStore 只在内存库里
         // 需要共享（生产 Global 是零成本的单位变体）。

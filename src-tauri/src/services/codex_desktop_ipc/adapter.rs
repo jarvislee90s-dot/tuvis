@@ -639,6 +639,21 @@ pub struct FollowLease {
     released: std::sync::atomic::AtomicBool,
 }
 impl FollowLease {
+    pub async fn is_current(&self) -> bool {
+        if self.released.load(Ordering::SeqCst) {
+            return false;
+        }
+        let following = self.adapter.inner.followings.lock().await;
+        if self.released.load(Ordering::SeqCst) {
+            return false;
+        }
+        match self.purpose {
+            super::owners::FollowPurpose::Remote => following.is_remote_following(&self.key),
+            super::owners::FollowPurpose::TokenizerEstimate => self
+                .ticket
+                .is_some_and(|ticket| following.has_estimate_ticket(&self.key, ticket)),
+        }
+    }
     async fn cleanup(
         adapter: DesktopIpcAdapter,
         key: ThreadKey,
@@ -819,6 +834,20 @@ impl DesktopIpcAdapter {
         }
     }
 
+    /// 返回与已接收 owner 代际一致的来源 build。
+    pub fn source_build_for_epoch(&self, epoch: u64) -> Option<String> {
+        let before = self.inner.epoch.load(Ordering::SeqCst);
+        if before != epoch {
+            return None;
+        }
+        let profile = self.current_profile();
+        let after = self.inner.epoch.load(Ordering::SeqCst);
+        if before != after || profile.build.is_empty() {
+            return None;
+        }
+        Some(profile.build)
+    }
+
     pub fn subscribe_body_events(&self) -> super::observation::BodyEventReceiver {
         let (sender, receiver) = super::observation::body_event_channel(128);
         let mut trackers = self
@@ -833,6 +862,9 @@ impl DesktopIpcAdapter {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         self.inner.body_generation.fetch_add(1, Ordering::SeqCst);
+        if let Some(old) = slot.as_ref() {
+            old.close();
+        }
         *slot = Some(sender);
         receiver
     }
@@ -5008,7 +5040,9 @@ impl DesktopIpcAdapter {
                 .valid(self.inner.remote_write_generation.capture())
         {
             self.begin_shutdown();
-            self.shutdown().await;
+            if let Some(conn) = self.inner.conn.lock().await.clone() {
+                conn.shutdown_after_queued().await;
+            }
         }
     }
 
@@ -6744,18 +6778,24 @@ async fn handle_state_changed(
         .lock()
         .await
         .is_estimate_following(&key);
-    let capture_generation = if estimate_followed {
+    let (capture_generation, mut producer) = if estimate_followed {
         let slot = adapter
             .inner
             .body_events
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        slot.as_ref()
-            .map(|_| adapter.inner.body_generation.load(Ordering::SeqCst))
+        match slot.as_ref().and_then(|sender| sender.begin_producer()) {
+            Some(guard) => (
+                Some(adapter.inner.body_generation.load(Ordering::SeqCst)),
+                Some(guard),
+            ),
+            None => (None, None),
+        }
     } else {
-        None
+        (None, None)
     };
-    let change = frame["params"]["change"].clone();
+    // 直接借用接收帧，避免为测速再复制整帧正文。
+    let change = &frame["params"]["change"];
     // 复审 round 6（Q1）测试缝：「caps 观察窗」（修复后 caps 在临界区内读取，本缝
     // 退化为「先跑窗口动作再取快照」的无害定序——窗内完成的翻转/重发布随后被临界
     // 区内的最新观察吸收）。
@@ -6778,6 +6818,7 @@ async fn handle_state_changed(
                 mirror.mark_stale();
                 drop(mirrors);
                 adapter.invalidate_body_observation();
+                drop(producer.take());
                 publish_projection(adapter, &key).await;
                 spawn_stale_refollow(adapter.clone(), key.clone(), current_conn(adapter).await);
                 return;
@@ -6791,16 +6832,43 @@ async fn handle_state_changed(
             .body_trackers
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let identity =
-            capture_generation.map(|generation| (generation, lease.epoch, lease.generation));
-        let prepared = identity
+        let identity = capture_generation
+            .filter(|generation| {
+                adapter.inner.body_generation.load(Ordering::SeqCst) == *generation
+            })
+            .map(|generation| (generation, lease.epoch, lease.generation));
+        let mut temporary_reservation = None;
+        let mut budget_refused = false;
+        let mut prepared = identity
+            .filter(|_| change["type"] == "patches")
             .and_then(|id| trackers.get(&key).filter(|(g, e, n, _)| (*g, *e, *n) == id))
             .and_then(|(_, _, _, tracker)| {
-                mirror
-                    .observation_state()
-                    .map(|state| tracker.prepare(state, &change))
+                mirror.observation_state().and_then(|state| {
+                    let bytes = tracker.temporary_bytes(state, change);
+                    let slot = adapter
+                        .inner
+                        .body_events
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    temporary_reservation = slot.as_ref().and_then(|sender| {
+                        if tracker.exceeds_item_limit(state, change) {
+                            sender.reject_budget();
+                            None
+                        } else {
+                            sender.try_reserve_temporary(bytes)
+                        }
+                    });
+                    if temporary_reservation.is_none() {
+                        budget_refused = true;
+                        return None;
+                    }
+                    Some(tracker.prepare(state, change))
+                })
             });
-        match mirror.apply(&lease, &change) {
+        if budget_refused {
+            trackers.clear();
+        }
+        match mirror.apply(&lease, change) {
             Ok(eff) => {
                 if eff.changed {
                     if let (Some(id), Some(revision), Some(state)) = (
@@ -6814,7 +6882,7 @@ async fn handle_state_changed(
                             trackers.insert(key.clone(), (id.0, id.1, id.2, tracker));
                             vec![super::observation::BodyChange::Baseline]
                         } else if let (Some(prepared), Some((_, _, _, tracker))) =
-                            (prepared, trackers.get_mut(&key))
+                            (prepared.take(), trackers.get_mut(&key))
                         {
                             tracker.finish(state, prepared)
                         } else {
@@ -6848,6 +6916,9 @@ async fn handle_state_changed(
                             }
                         }
                     }
+                    drop(prepared);
+                    drop(temporary_reservation.take());
+                    drop(producer.take());
                     drop(owners);
                     // 复审 round 6（Q1）：caps 与盖章**同一临界区**——发布 payload
                     // 声称的观察版本（seal）必须与生成它的 caps 观察同一边界。旧
@@ -6873,12 +6944,20 @@ async fn handle_state_changed(
                     if mirror.needs_hydration() {
                         history_needed = true;
                     }
-                } else if eff.need_snapshot {
-                    // revision 缺口/未知 change 形态/缺 revision：stale + 重拉
-                    need_recover = true;
+                } else {
+                    drop(prepared);
+                    drop(temporary_reservation.take());
+                    drop(producer.take());
+                    if eff.need_snapshot {
+                        // revision 缺口/未知 change 形态/缺 revision：stale + 重拉
+                        need_recover = true;
+                    }
                 }
             }
             Err(_) => {
+                drop(prepared);
+                drop(temporary_reservation.take());
+                drop(producer.take());
                 // 非法/预算超限：apply 内已置 stale；同样触发有界重拉
                 need_recover = true;
             }

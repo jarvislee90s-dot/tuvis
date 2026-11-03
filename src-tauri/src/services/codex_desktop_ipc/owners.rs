@@ -272,6 +272,16 @@ impl FollowingSet {
             false
         }
     }
+    pub fn has_estimate_ticket(&self, key: &ThreadKey, ticket: u64) -> bool {
+        self.keys
+            .iter()
+            .any(|entry| &entry.key == key && entry.estimate_tickets.contains(&ticket))
+    }
+    pub fn is_remote_following(&self, key: &ThreadKey) -> bool {
+        self.keys
+            .iter()
+            .any(|entry| &entry.key == key && entry.remote)
+    }
     pub fn is_estimate_following(&self, key: &ThreadKey) -> bool {
         self.keys
             .iter()

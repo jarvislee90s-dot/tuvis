@@ -104,27 +104,95 @@ pub enum BodyEvent {
 }
 const QUEUED_BODY_LIMIT: usize = 16 * 1024 * 1024;
 const QUEUED_ITEM_LIMIT: usize = 1024 * 1024;
+/// 事件、候选和后台分词任务共用的字节账本。
+#[derive(Default)]
+pub struct SharedBodyBudget {
+    occupied: std::sync::atomic::AtomicUsize,
+    rejected: std::sync::atomic::AtomicU64,
+}
+impl SharedBodyBudget {
+    pub fn rejections(&self) -> u64 {
+        self.rejected.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    pub fn used_bytes(&self) -> usize {
+        self.occupied.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    pub(crate) fn record_rejection(&self) {
+        self.rejected
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    pub(crate) fn reserve(&self, bytes: usize) -> bool {
+        use std::sync::atomic::Ordering;
+        let ok = self
+            .occupied
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |used| {
+                used.checked_add(bytes)
+                    .filter(|next| *next <= QUEUED_BODY_LIMIT)
+            })
+            .is_ok();
+        if !ok {
+            self.record_rejection();
+        }
+        ok
+    }
+    pub(crate) fn release(&self, bytes: usize) {
+        self.occupied
+            .fetch_sub(bytes, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+pub(crate) struct BodyReservation {
+    budget: std::sync::Arc<SharedBodyBudget>,
+    bytes: usize,
+}
+impl BodyReservation {
+    pub(crate) fn new(budget: std::sync::Arc<SharedBodyBudget>) -> Self {
+        Self { budget, bytes: 0 }
+    }
+    pub(crate) fn grow(&mut self, bytes: usize) -> bool {
+        if self.budget.reserve(bytes) {
+            self.bytes += bytes;
+            true
+        } else {
+            false
+        }
+    }
+}
+impl Drop for BodyReservation {
+    fn drop(&mut self) {
+        self.budget.release(self.bytes);
+    }
+}
 struct QueuedBodyFrame {
     frame: Option<BodyFrame>,
-    bytes: usize,
-    occupied: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    _reservation: BodyReservation,
 }
 impl QueuedBodyFrame {
-    fn into_frame(mut self) -> BodyFrame {
+    fn take_frame(&mut self) -> BodyFrame {
         self.frame.take().expect("frame present")
     }
 }
-impl Drop for QueuedBodyFrame {
+struct ProducerState {
+    active: usize,
+    open: bool,
+    signal: tokio::sync::watch::Sender<u64>,
+    sequence: u64,
+}
+struct ProducerControl(std::sync::Mutex<ProducerState>);
+pub(crate) struct BodyProducerGuard(std::sync::Arc<ProducerControl>);
+impl Drop for BodyProducerGuard {
     fn drop(&mut self) {
-        self.occupied
-            .fetch_sub(self.bytes, std::sync::atomic::Ordering::SeqCst);
+        let mut state = self.0 .0.lock().unwrap_or_else(|e| e.into_inner());
+        state.active = state.active.saturating_sub(1);
+        state.sequence = state.sequence.wrapping_add(1);
+        state.signal.send_replace(state.sequence);
     }
 }
 struct BodyEventPublisher {
     tx: tokio::sync::mpsc::Sender<(u64, QueuedBodyFrame)>,
     loss: tokio::sync::watch::Sender<u64>,
     epoch: u64,
-    occupied: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    budget: std::sync::Arc<SharedBodyBudget>,
+    producers: std::sync::Arc<ProducerControl>,
 }
 #[derive(Clone)]
 pub struct BodyEventSender(std::sync::Arc<std::sync::Mutex<BodyEventPublisher>>);
@@ -133,18 +201,28 @@ pub struct BodyEventReceiver {
     loss: tokio::sync::watch::Receiver<u64>,
     seen: u64,
     pending: Option<(u64, QueuedBodyFrame)>,
+    delivered: Option<QueuedBodyFrame>,
+    budget: std::sync::Arc<SharedBodyBudget>,
+    producers: std::sync::Arc<ProducerControl>,
 }
 pub fn body_event_channel(capacity: usize) -> (BodyEventSender, BodyEventReceiver) {
     let (tx, rx) = tokio::sync::mpsc::channel(capacity);
     let (loss, loss_rx) = tokio::sync::watch::channel(0);
-    let occupied = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let budget = std::sync::Arc::new(SharedBodyBudget::default());
+    let producers = std::sync::Arc::new(ProducerControl(std::sync::Mutex::new(ProducerState {
+        active: 0,
+        open: true,
+        signal: tokio::sync::watch::channel(0).0,
+        sequence: 0,
+    })));
     (
         BodyEventSender(std::sync::Arc::new(std::sync::Mutex::new(
             BodyEventPublisher {
                 tx,
                 loss,
                 epoch: 0,
-                occupied,
+                budget: budget.clone(),
+                producers: producers.clone(),
             },
         ))),
         BodyEventReceiver {
@@ -152,6 +230,9 @@ pub fn body_event_channel(capacity: usize) -> (BodyEventSender, BodyEventReceive
             loss: loss_rx,
             seen: 0,
             pending: None,
+            delivered: None,
+            budget,
+            producers,
         },
     )
 }
@@ -162,6 +243,50 @@ impl BodyEventPublisher {
     }
 }
 impl BodyEventSender {
+    pub(crate) fn reject_budget(&self) {
+        let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        state.budget.record_rejection();
+        state.invalidate();
+    }
+    pub(crate) fn try_reserve_temporary(&self, bytes: usize) -> Option<BodyReservation> {
+        let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if !state
+            .producers
+            .0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .open
+        {
+            return None;
+        }
+        let mut reservation = BodyReservation::new(state.budget.clone());
+        if reservation.grow(bytes) {
+            Some(reservation)
+        } else {
+            state.invalidate();
+            None
+        }
+    }
+    pub(crate) fn begin_producer(&self) -> Option<BodyProducerGuard> {
+        let publisher = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let control = publisher.producers.clone();
+        let mut state = control.0.lock().unwrap_or_else(|e| e.into_inner());
+        if !state.open {
+            return None;
+        }
+        state.active = state.active.checked_add(1)?;
+        drop(state);
+        Some(BodyProducerGuard(control))
+    }
+    pub(crate) fn close(&self) {
+        let publisher = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = publisher
+            .producers
+            .0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        state.open = false;
+    }
     pub fn invalidate(&self) {
         self.0
             .lock()
@@ -169,27 +294,35 @@ impl BodyEventSender {
             .invalidate();
     }
     pub fn try_send(&self, frame: BodyFrame) -> bool {
-        use std::sync::atomic::Ordering;
         let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if !state
+            .producers
+            .0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .open
+        {
+            return false;
+        }
         let mut bytes = 0usize;
         for change in &frame.changes {
             if let BodyChange::Append { text, .. } = change {
                 if text.len() > QUEUED_ITEM_LIMIT {
+                    state.budget.record_rejection();
                     state.invalidate();
                     return false;
                 }
                 bytes = bytes.saturating_add(text.len());
             }
         }
-        if state.occupied.load(Ordering::SeqCst).saturating_add(bytes) > QUEUED_BODY_LIMIT {
+        let mut reservation = BodyReservation::new(state.budget.clone());
+        if !reservation.grow(bytes) {
             state.invalidate();
             return false;
         }
-        state.occupied.fetch_add(bytes, Ordering::SeqCst);
         let queued = QueuedBodyFrame {
             frame: Some(frame),
-            bytes,
-            occupied: state.occupied.clone(),
+            _reservation: reservation,
         };
         match state.tx.try_send((state.epoch, queued)) {
             Ok(()) => true,
@@ -202,7 +335,38 @@ impl BodyEventSender {
     }
 }
 impl BodyEventReceiver {
+    /// 禁止新的采集生产者并等待已有正文副本释放。
+    pub async fn close_and_wait(&mut self) {
+        let mut signal = {
+            let mut state = self.producers.0.lock().unwrap_or_else(|e| e.into_inner());
+            state.open = false;
+            state.signal.subscribe()
+        };
+        loop {
+            if self
+                .producers
+                .0
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .active
+                == 0
+            {
+                break;
+            }
+            if signal.changed().await.is_err() {
+                break;
+            }
+        }
+    }
+    pub fn memory_budget(&self) -> std::sync::Arc<SharedBodyBudget> {
+        self.budget.clone()
+    }
+    /// 已交付帧处理完成后释放其缓冲预留。
+    pub fn release_delivered(&mut self) {
+        self.delivered = None;
+    }
     pub async fn recv(&mut self) -> Option<BodyEvent> {
+        self.release_delivered();
         loop {
             let epoch = *self.loss.borrow_and_update();
             if epoch != self.seen {
@@ -229,7 +393,7 @@ impl BodyEventReceiver {
                     item=self.rx.recv()=>item,
                 }
             };
-            let (item_epoch, frame) = item?;
+            let (item_epoch, mut frame) = item?;
             let current = *self.loss.borrow();
             if current != self.seen {
                 if item_epoch == current {
@@ -238,7 +402,9 @@ impl BodyEventReceiver {
                 continue;
             }
             if item_epoch == self.seen {
-                return Some(BodyEvent::Frame(frame.into_frame()));
+                let body = frame.take_frame();
+                self.delivered = Some(frame);
+                return Some(BodyEvent::Frame(body));
             }
         }
     }
@@ -294,7 +460,13 @@ mod queue_tests {
             item_id: "i".into(),
             text: "a".repeat(1024 * 1024 + 1),
         });
+        let budget = rx.memory_budget();
         assert!(!tx.try_send(big));
+        assert_eq!(
+            budget.rejections(),
+            1,
+            "budget exclusion must be diagnosable"
+        );
         assert!(matches!(rx.recv().await, Some(BodyEvent::Lost)));
     }
     #[tokio::test]
@@ -325,6 +497,15 @@ mod queue_tests {
         });
         assert!(tx.try_send(next));
         assert!(matches!(rx.recv().await,Some(BodyEvent::Frame(f)) if f.revision==18));
+    }
+    #[tokio::test]
+    async fn patch_temporary_copies_share_global_budget() {
+        let (tx, mut rx) = body_event_channel(2);
+        let budget = rx.memory_budget();
+        let mut candidates = BodyReservation::new(budget);
+        assert!(candidates.grow(15 * 1024 * 1024));
+        assert!(tx.try_reserve_temporary(2 * 1024 * 1024).is_none());
+        assert!(matches!(rx.recv().await, Some(BodyEvent::Lost)));
     }
 }
 
@@ -405,6 +586,153 @@ impl BodyPatchTracker {
         self.active.clear();
         self.refresh_references(state);
     }
+    pub(crate) fn exceeds_item_limit(
+        &self,
+        state: &serde_json::Value,
+        change: &serde_json::Value,
+    ) -> bool {
+        let Some(ops) = change.get("patches").and_then(|v| v.as_array()) else {
+            return false;
+        };
+        ops.iter().any(|op| {
+            let Some(path) = op.get("path").and_then(|v| v.as_array()) else {
+                return false;
+            };
+            if path.first().and_then(|v| v.as_str()) != Some("turnHistory")
+                || path.get(1).and_then(|v| v.as_str()) != Some("history")
+                || path.get(2).and_then(|v| v.as_str()) != Some("entitiesByKey")
+                || path.get(4).and_then(|v| v.as_str()) != Some("items")
+            {
+                return false;
+            }
+            let (Some(entity), Some(index)) = (
+                path.get(3).and_then(|v| v.as_str()),
+                path.get(5)
+                    .and_then(|v| v.as_u64())
+                    .and_then(|v| usize::try_from(v).ok()),
+            ) else {
+                return false;
+            };
+            if !self.active.contains_key(entity) {
+                return false;
+            }
+            let value = op.get("value");
+            if path.len() == 6 {
+                return value.is_some_and(|v| {
+                    v.get("type").and_then(|t| t.as_str()) == Some("agentMessage")
+                        && v.get("text")
+                            .and_then(|t| t.as_str())
+                            .is_some_and(|text| text.len() > QUEUED_ITEM_LIMIT)
+                });
+            }
+            if path.len() != 7 || path[6].as_str() != Some("text") {
+                return false;
+            }
+            let agent = body_entities(state)
+                .and_then(|e| e.get(entity))
+                .and_then(|t| t.get("items"))
+                .and_then(|v| v.as_array())
+                .and_then(|items| items.get(index))
+                .is_some_and(|item| {
+                    item.get("type").and_then(|t| t.as_str()) == Some("agentMessage")
+                });
+            agent
+                && value
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|text| text.len() > QUEUED_ITEM_LIMIT)
+        })
+    }
+    /// 复制受影响正文前的保守预算；不复制正文，也不遍历整个历史。
+    pub(crate) fn temporary_bytes(
+        &self,
+        state: &serde_json::Value,
+        change: &serde_json::Value,
+    ) -> usize {
+        let Some(ops) = change.get("patches").and_then(|value| value.as_array()) else {
+            return 0;
+        };
+        // 同一 item 的多次修改只保留一份旧值和一份最新值；不得按操作数重复预留。
+        let mut items = std::collections::HashMap::<(&str, usize), (usize, usize, bool)>::new();
+        let mut structural = std::collections::HashMap::<&str, usize>::new();
+        for op in ops {
+            let Some(path) = op.get("path").and_then(|value| value.as_array()) else {
+                continue;
+            };
+            if path.first().and_then(|v| v.as_str()) != Some("turnHistory")
+                || path.get(1).and_then(|v| v.as_str()) != Some("history")
+                || path.get(2).and_then(|v| v.as_str()) != Some("entitiesByKey")
+                || path.get(4).and_then(|v| v.as_str()) != Some("items")
+            {
+                continue;
+            }
+            let (Some(entity), Some(index)) = (
+                path.get(3).and_then(|v| v.as_str()),
+                path.get(5)
+                    .and_then(|v| v.as_u64())
+                    .and_then(|v| usize::try_from(v).ok()),
+            ) else {
+                continue;
+            };
+            if !self.active.contains_key(entity) {
+                continue;
+            }
+            let old_item = body_entities(state)
+                .and_then(|entities| entities.get(entity))
+                .and_then(|turn| turn.get("items"))
+                .and_then(|items| items.as_array())
+                .and_then(|items| items.get(index));
+            let old_agent = old_item.is_some_and(|item| {
+                item.get("type").and_then(|kind| kind.as_str()) == Some("agentMessage")
+            });
+            if path.len() == 7 && !old_agent {
+                continue;
+            }
+            let op_name = op.get("op").and_then(|v| v.as_str()).unwrap_or("");
+            let old = if old_agent && !(path.len() == 6 && op_name == "add") {
+                old_item
+                    .and_then(|item| item.get("text"))
+                    .and_then(|text| text.as_str())
+                    .map_or(0, str::len)
+                    .min(QUEUED_ITEM_LIMIT)
+            } else {
+                0
+            };
+            let value = op.get("value");
+            let new = if path.len() == 7 {
+                value.and_then(|v| v.as_str()).map_or(0, str::len)
+            } else {
+                value
+                    .filter(|v| {
+                        v.get("type").and_then(|kind| kind.as_str()) == Some("agentMessage")
+                    })
+                    .and_then(|v| v.get("text"))
+                    .and_then(|v| v.as_str())
+                    .map_or(0, str::len)
+            }
+            .min(QUEUED_ITEM_LIMIT);
+            let is_structural = path.len() == 6;
+            if is_structural {
+                *structural.entry(entity).or_default() += 1;
+            }
+            let entry = items.entry((entity, index)).or_insert((old, 0, false));
+            entry.0 = entry.0.max(old);
+            entry.1 = entry.1.max(new);
+            entry.2 |= is_structural;
+        }
+        items
+            .into_iter()
+            .fold(0usize, |total, ((entity, _), (old, new, is_structural))| {
+                let new = if is_structural && structural.get(entity).copied().unwrap_or(0) > 1 {
+                    new.max(QUEUED_ITEM_LIMIT)
+                } else {
+                    new
+                };
+                total.saturating_add(
+                    old.saturating_add(new.saturating_mul(2))
+                        .saturating_add(new.saturating_sub(old)),
+                )
+            })
+    }
     pub(crate) fn prepare(
         &self,
         state: &serde_json::Value,
@@ -462,6 +790,9 @@ impl BodyPatchTracker {
                             p.turns.insert(entity.to_owned());
                         }
                         Some("items") => {
+                            if !self.active.contains_key(entity) {
+                                continue;
+                            }
                             let item_type = op
                                 .get("value")
                                 .and_then(|v| v.get("type"))
@@ -483,6 +814,19 @@ impl BodyPatchTracker {
                             {
                                 p.invalid.insert(entity.to_owned());
                                 continue;
+                            }
+                            if path.len() == 7 {
+                                let old_item = body_entities(state)
+                                    .and_then(|entities| entities.get(entity))
+                                    .and_then(|turn| turn.get("items"))
+                                    .and_then(|items| items.as_array())
+                                    .and_then(|items| items.get(index));
+                                if !old_item.is_some_and(|item| {
+                                    item.get("type").and_then(|kind| kind.as_str())
+                                        == Some("agentMessage")
+                                }) {
+                                    continue;
+                                }
                             }
                             let proposed = if path.len() == 7 && name == "replace" {
                                 op.get("value")
@@ -610,17 +954,51 @@ impl BodyPatchTracker {
             let Some(id) = turn.get("turnId").and_then(|v| v.as_str()) else {
                 continue;
             };
-            if turn
-                .get("items")
-                .and_then(|v| v.as_array())
-                .is_none_or(|items| !items.is_empty())
-            {
+            let Some(items) = turn.get("items").and_then(|v| v.as_array()) else {
                 continue;
-            }
-            if identities.get(id).copied() != Some(1)
+            };
+            let mut item_ids = std::collections::HashSet::new();
+            let ambiguous =
+                items
+                    .iter()
+                    .any(|item| match item.get("id").and_then(|v| v.as_str()) {
+                        Some(item_id) if !item_id.is_empty() => !item_ids.insert(item_id),
+                        _ => item.get("type").and_then(|v| v.as_str()) == Some("agentMessage"),
+                    });
+            if ambiguous
+                || items
+                    .iter()
+                    .any(|item| item.get("type").and_then(|v| v.as_str()) == Some("error"))
+                || identities.get(id).copied() != Some(1)
                 || self.active.values().any(|value| value == id)
             {
                 continue;
+            }
+            let model = turn
+                .pointer("/params/collaborationMode/settings/model")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned);
+            let channel = turn
+                .pointer("/params/modelProvider")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned);
+            for (index, item) in items.iter().enumerate() {
+                if item.get("type").and_then(|v| v.as_str()) == Some("agentMessage")
+                    && item.get("text").and_then(|v| v.as_str()) == Some("")
+                    && !p
+                        .items
+                        .iter()
+                        .any(|touch| touch.entity == entity && touch.index == index)
+                {
+                    if let Some(item_id) = item.get("id").and_then(|v| v.as_str()) {
+                        changes.push(BodyChange::EmptyItem {
+                            turn_id: id.to_owned(),
+                            item_id: item_id.to_owned(),
+                            model: model.clone(),
+                            channel: channel.clone(),
+                        });
+                    }
+                }
             }
             self.active.insert(entity, id.to_owned());
         }
@@ -674,6 +1052,15 @@ impl BodyPatchTracker {
                     turn_id,
                     item_id: None,
                 });
+                continue;
+            }
+            if touch.operation == "remove" {
+                if let Some(before) = touch.before {
+                    changes.push(BodyChange::InvalidatedItem {
+                        turn_id,
+                        item_id: Some(before.id),
+                    });
+                }
                 continue;
             }
             let after = body_item(state, &touch.entity, touch.index);
@@ -805,6 +1192,20 @@ mod patch_tests {
         ));
     }
     #[test]
+    fn new_turn_can_include_user_item_and_empty_agent_placeholder() {
+        let state = json!({"turnHistory":{"history":{"isComplete":true,"islands":[{"entries":[]}],"entitiesByKey":{}}}});
+        let mut tracker = BodyPatchTracker::default();
+        tracker.baseline(&state);
+        let turn = json!({"turnId":"x","status":"inProgress","items":[{"type":"userMessage","id":"u"},{"type":"agentMessage","id":"i","text":""}]});
+        let change = json!({"patches":[{"op":"add","path":["turnHistory","history","entitiesByKey","turn:x"],"value":turn},{"op":"add","path":["turnHistory","history","islands",0,"entries",0],"value":{"value":"turn:x"}}]});
+        let prepared = tracker.prepare(&state, &change);
+        let mut after = state.clone();
+        after["turnHistory"]["history"]["entitiesByKey"]["turn:x"] = turn;
+        after["turnHistory"]["history"]["islands"][0]["entries"] = json!([{"value":"turn:x"}]);
+        let events = tracker.finish(&after, prepared);
+        assert!(events.iter().any(|event| matches!(event, BodyChange::EmptyItem {turn_id,item_id,..} if turn_id == "x" && item_id == "i")));
+    }
+    #[test]
     fn duplicate_turn_identity_is_not_observable() {
         let state = json!({"turnHistory":{"history":{"isComplete":true,"islands":[{"entries":[{"value":"turn:old"}]}],"entitiesByKey":{"turn:old":{"turnId":"x","status":"completed","items":[]}}}}});
         let mut tracker = BodyPatchTracker::default();
@@ -838,5 +1239,37 @@ mod patch_tests {
         assert!(events.iter().any(
             |e| matches!(e,BodyChange::InvalidatedItem{turn_id,item_id:None} if turn_id=="x")
         ));
+    }
+    #[test]
+    fn temporary_budget_coalesces_repeated_changes_to_same_item() {
+        let state = json!({"turnHistory":{"history":{"isComplete":true,"islands":[{"entries":[{"value":"turn:x"}]}],"entitiesByKey":{"turn:x":{"turnId":"x","status":"inProgress","items":[{"type":"agentMessage","id":"i","text":"a"}]}}}}});
+        let mut tracker = BodyPatchTracker::default();
+        tracker.baseline(&state);
+        tracker.active.insert("turn:x".into(), "x".into());
+        let op = json!({"op":"replace","path":["turnHistory","history","entitiesByKey","turn:x","items",0,"text"],"value":"ab"});
+        let change = json!({"patches":vec![op;100]});
+        assert!(
+            tracker.temporary_bytes(&state, &change) < 100,
+            "same item must not reserve 100 full copies"
+        );
+    }
+    #[test]
+    fn tool_text_patch_never_enters_body_temporary_copies() {
+        let state = json!({"turnHistory":{"history":{"isComplete":true,"islands":[{"entries":[{"value":"turn:x"}]}],"entitiesByKey":{"turn:x":{"turnId":"x","status":"inProgress","items":[{"type":"commandExecution","id":"tool","text":"tool output"}]}}}}});
+        let mut tracker = BodyPatchTracker::default();
+        tracker.baseline(&state);
+        tracker.active.insert("turn:x".into(), "x".into());
+        let change = json!({"patches":[{"op":"replace","path":["turnHistory","history","entitiesByKey","turn:x","items",0,"text"],"value":"tool output changed"}]});
+        assert_eq!(tracker.temporary_bytes(&state, &change), 0);
+        assert!(tracker.prepare(&state, &change).items.is_empty());
+    }
+    #[test]
+    fn oversized_agent_patch_is_detected_before_copying() {
+        let state = json!({"turnHistory":{"history":{"isComplete":true,"islands":[{"entries":[{"value":"turn:x"}]}],"entitiesByKey":{"turn:x":{"turnId":"x","status":"inProgress","items":[{"type":"agentMessage","id":"i","text":""}]}}}}});
+        let mut tracker = BodyPatchTracker::default();
+        tracker.baseline(&state);
+        tracker.active.insert("turn:x".into(), "x".into());
+        let change = json!({"patches":[{"op":"replace","path":["turnHistory","history","entitiesByKey","turn:x","items",0,"text"],"value":"a".repeat(1024*1024+1)}]});
+        assert!(tracker.exceeds_item_limit(&state, &change));
     }
 }

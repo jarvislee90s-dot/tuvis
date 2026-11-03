@@ -624,6 +624,31 @@ impl ConnectionHandle {
         }
     }
 
+    /// 在普通队列尾部关闭，确保此前的 following:false 先被 writer 处理。
+    /// 超时或断链时回退既有的优先关闭；调用方须先撤销写权限。
+    pub async fn shutdown_after_queued(&self) {
+        let mut teardown = self.shared.teardown_rx.clone();
+        let graceful = async {
+            if self.shared.closed.load(Ordering::SeqCst) {
+                return;
+            }
+            if self.main_tx.send(FrameCmd::shutdown()).await.is_err() {
+                return;
+            }
+            while !*teardown.borrow_and_update() {
+                if teardown.changed().await.is_err() {
+                    break;
+                }
+            }
+        };
+        if tokio::time::timeout(std::time::Duration::from_secs(2), graceful)
+            .await
+            .is_err()
+        {
+            self.shutdown().await;
+        }
+    }
+
     /// 请求关闭（writer 收尾：排空未尝试帧 → NotSent，等待中的 → Unknown）。
     pub fn shutdown(&self) -> Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
         let main = self.main_tx.clone();

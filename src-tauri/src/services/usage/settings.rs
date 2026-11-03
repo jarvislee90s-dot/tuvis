@@ -3,7 +3,7 @@
 use super::error::UsageError;
 use super::model::{UsageSettings, UsageSettingsPatch};
 use super::provider::parse_provider_rules;
-use crate::database::{get_setting, set_setting};
+use crate::database::get_setting;
 
 pub const SETTINGS_KEY: &str = "usage.settings";
 
@@ -120,17 +120,46 @@ pub fn load_from_conn(conn: &rusqlite::Connection) -> UsageSettings {
 /// 锁：`usage_ipc_test::set_settings_reports_persist_failure_instead_of_success`
 /// （用 `settings` 表上的 RAISE(ABORT) 触发器造真实写失败）。
 pub fn save(s: &UsageSettings) -> Result<(), UsageError> {
-    let json = serde_json::to_string(s).map_err(|e| {
+    // 初始化捕获门时会读取设置，必须发生在取得全局 DB 锁之前。
+    let gate = crate::services::tps::estimate_store::global_capture_gate();
+    let conn = crate::database::connection::DB
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    save_to_conn_with_gate(&conn, s, gate)
+}
+
+/// 注入连接的设置保存接缝，与生产使用相同的写入与代际门。
+#[doc(hidden)]
+pub fn save_to_conn_with_gate(
+    conn: &rusqlite::Connection,
+    settings: &UsageSettings,
+    gate: &crate::services::tps::estimate_store::CaptureGate,
+) -> Result<(), UsageError> {
+    let json = serde_json::to_string(settings).map_err(|e| {
         UsageError::new("usage-db-failed", format!("usage settings serialize: {e}"))
     })?;
-    set_setting(SETTINGS_KEY, &json);
-    if get_setting(SETTINGS_KEY).as_deref() != Some(json.as_str()) {
-        return Err(UsageError::new(
-            "usage-db-failed",
-            format!("usage settings write did not persist (readback mismatch): key={SETTINGS_KEY}"),
-        ));
-    }
-    Ok(())
+    gate.save_master_with(settings.enabled, || {
+        conn.execute(
+            "INSERT OR REPLACE INTO settings(key,value) VALUES (?1,?2)",
+            rusqlite::params![SETTINGS_KEY, json],
+        )
+        .map_err(|e| {
+            UsageError::new(
+                "usage-db-failed",
+                format!("usage settings write failed: {e}"),
+            )
+        })?;
+        let actual = crate::database::dao::settings::get_setting_conn(conn, SETTINGS_KEY);
+        if actual.as_deref() != Some(json.as_str()) {
+            return Err(UsageError::new(
+                "usage-db-failed",
+                format!(
+                    "usage settings write did not persist (readback mismatch): key={SETTINGS_KEY}"
+                ),
+            ));
+        }
+        Ok(())
+    })
 }
 // ==== usage 自省锁：以下为排除区（测试代码），勿删勿复制 ====
 #[cfg(test)]

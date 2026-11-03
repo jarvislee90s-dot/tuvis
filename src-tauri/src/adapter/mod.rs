@@ -526,6 +526,38 @@ struct ScanFlight {
     /// 最近一次完整扫描结果（快照返回用；含时间戳便于日志诊断陈旧度）
     last_snapshot: std::sync::Mutex<Option<(std::time::Instant, SessionsResponse)>>,
 }
+static SESSION_SNAPSHOT_EPOCH: Lazy<tokio::sync::watch::Sender<u64>> =
+    Lazy::new(|| tokio::sync::watch::channel(0).0);
+
+/// 订阅已有会话扫描快照的变化；不触发新的扫描。
+pub fn subscribe_cached_sessions() -> tokio::sync::watch::Receiver<u64> {
+    SESSION_SNAPSHOT_EPOCH.subscribe()
+}
+/// 只提取可用于测速的会话身份，不复制消息正文或项目路径。
+#[doc(hidden)]
+pub fn select_codex_app_ids(sessions: &[crate::session::Session]) -> Vec<String> {
+    use crate::session::{AgentType, ProcessForm, SessionStatus};
+    sessions
+        .iter()
+        .filter(|session| {
+            session.agent_type == AgentType::Codex
+                && session.form == ProcessForm::App
+                && session.status != SessionStatus::Finished
+        })
+        .map(|session| session.id.clone())
+        .collect()
+}
+
+/// 仅读取现有快照的身份列，不复制消息正文或项目路径。
+pub fn cached_codex_app_ids() -> Option<Vec<String>> {
+    SCAN_FLIGHT
+        .last_snapshot
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .map(|(_, snapshot)| select_codex_app_ids(&snapshot.sessions))
+}
+
 static SCAN_FLIGHT: Lazy<ScanFlight> = Lazy::new(|| ScanFlight {
     in_flight: std::sync::Mutex::new(false),
     last_snapshot: std::sync::Mutex::new(None),
@@ -567,6 +599,7 @@ pub fn get_all_sessions() -> SessionsResponse {
     let _guard = ScanFlightGuard;
     let result = get_all_sessions_inner();
     *SCAN_FLIGHT.last_snapshot.lock().unwrap() = Some((std::time::Instant::now(), result.clone()));
+    SESSION_SNAPSHOT_EPOCH.send_modify(|epoch| *epoch = epoch.wrapping_add(1));
     result
 }
 

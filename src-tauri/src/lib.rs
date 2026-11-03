@@ -210,6 +210,7 @@ pub fn run() {
             // TPS 短时抽样（2026-10-24 计划 Task 7）：调度/接收随 usage.enabled 总授权
             // 启停——关闭时每拍只读一行 settings（惯性，不改旧 usage 采集的启动时序）
             crate::services::tps::collector::spawn_runtime();
+            crate::services::tps::body_runtime::spawn_production();
             // 公开价格：每 5 分钟检查一次 enabled && stale；未启用时零请求
             crate::services::usage::v2::pricing::spawn_pricing_refresh_loop();
             // 升级残留清理：Windows 升级流把安装包留在 %TEMP% 的
@@ -469,6 +470,7 @@ pub(crate) fn exit_cleanup() {
     crate::remote::tunnel::stop_all();
     // TPS 接收器随进程退出而停（Spec §5「Tuvis真正退出就停止接收，不增系统守护进程」）
     crate::services::tps::receiver::shutdown();
+    crate::services::tps::body_runtime::shutdown_production();
     // §C1 修复轮 1 Finding 2②：Funnel 无子进程可 kill_on_drop（守护 =
     // 轮询线程 + tailscaled 常驻配置），进程退出必须显式撤 + 收 DESIRED
     crate::remote::tailscale::stop_all();
