@@ -642,21 +642,16 @@ fn apply_qua_line(
                 None
             } else if g < MIN_STREAMING_WINDOW_MS {
                 burst_delivery = true;
+                // 文案与上方常量数值耦合（硬编码 50/3 是错误码棘轮的要求：CJK 诊断串
+                // 出现在 format! 上下文会计入未迁移错误串棘轮）；调阈值须同步改文案
                 diag(
                     tally,
-                    &format!(
-                        "突发交付：生成窗<{MIN_STREAMING_WINDOW_MS}ms（该量级窗实测仅见于整包突发）→ 无流式口径，首点不可观测"
-                    ),
+                    "突发交付：生成窗<50ms（该量级窗实测仅见于整包突发）→ 无流式口径，首点不可观测",
                 );
                 None
             } else if intervals_present && interval_total < MIN_MEASURABLE_INTERVALS {
                 burst_delivery = true;
-                diag(
-                    tally,
-                    &format!(
-                        "突发交付：可分间隔<{MIN_MEASURABLE_INTERVALS} → 无流式口径，首点不可观测"
-                    ),
-                );
+                diag(tally, "突发交付：可分间隔<3 → 无流式口径，首点不可观测");
                 None
             } else {
                 Some(g)

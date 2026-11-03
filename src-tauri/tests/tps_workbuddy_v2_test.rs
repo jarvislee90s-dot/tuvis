@@ -461,9 +461,9 @@ fn v1_eof_cursor_recovers_17_and_replay_idempotent() {
         .unwrap();
     assert_eq!(sample.response_elapsed_ms, Some(6711));
 
-    // 恢复完成后游标升 v2 且无残留恢复队列
+    // 恢复完成后游标升至当前版本 v4 且无残留恢复队列
     let next: Value = serde_json::from_str(&recovered.next_cursor.value).unwrap();
-    assert_eq!(next["format_version"], 2, "恢复完成必须写 format_version=2");
+    assert_eq!(next["format_version"], 4, "恢复完成必须写 format_version=4");
     assert!(next["recovery"].is_null(), "恢复队列必须清空");
     assert_eq!(
         v1_offset_of(&recovered.next_cursor, &log),
@@ -514,8 +514,8 @@ fn failed_commit_leaves_cursor_and_facts_uncommitted() {
     assert_eq!(baseline_rows, 17);
     assert_eq!(
         serde_json::from_str::<Value>(&baseline.value).unwrap()["format_version"],
-        2,
-        "前提：17 条一轮恢复完，基准游标已是 v2"
+        4,
+        "前提：17 条一轮恢复完，基准游标已是 v4"
     );
 
     // 制造一个失败的恢复批（epoch 非负 CHECK 是确定性注入缝）
@@ -625,7 +625,7 @@ fn recovery_checkpoint_resumes_across_passes() {
         "第二轮从检查点续跑，只补余量（不重启）"
     );
     let st2: Value = serde_json::from_str(&pass2.next_cursor.value).unwrap();
-    assert_eq!(st2["format_version"], 2, "恢复队列清空后升 v2");
+    assert_eq!(st2["format_version"], 4, "恢复队列清空后升 v4");
     assert!(st2["recovery"].is_null());
     store::commit_batch(&mut c, &pass2).unwrap();
     assert_eq!(
