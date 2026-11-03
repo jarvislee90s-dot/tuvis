@@ -15,8 +15,11 @@
 
 use super::state::{Capability, CapabilityState};
 
-/// 已知 build 的 `app_build` 字面值（spec §6.3：当前唯一已知 build）。
+/// 已知 build 的 `app_build` 字面值（spec §6.3：当前唯一完整 shipped build）。
 const KNOWN_BUILD: &str = "3.16.2.8769";
+/// 3.17.2 新 build：只额外承认**接口形状已经实机投影**的模式能力候选；
+/// 其余能力仍走未知 build 的接口候选/账本路径，不整表冒充 shipped 确认。
+const MODE_INTERFACE_BUILD: &str = "3.17.2.9661";
 /// 已知 build 的协议版本（spec §6.3：protocol 3）。
 const KNOWN_PROTOCOL_VERSION: u32 = 3;
 
@@ -116,6 +119,9 @@ pub(crate) fn shipped_state(
     key: &CapabilityKey,
     capability: Capability,
 ) -> Option<CapabilityState> {
+    if is_mode_interface_build(key) {
+        return (capability == Capability::Mode).then_some(CapabilityState::InterfaceMatched);
+    }
     if !is_known_build(key) {
         return None;
     }
@@ -156,6 +162,13 @@ pub(crate) fn shipped_state(
 fn is_known_build(key: &CapabilityKey) -> bool {
     (key.platform == "macos" || key.platform == "windows")
         && key.app_build == KNOWN_BUILD
+        && key.protocol_version == KNOWN_PROTOCOL_VERSION
+}
+
+/// 3.17.2 的模式接口候选：只对 macOS/Windows + protocol 3 生效；不进入队列命令表。
+fn is_mode_interface_build(key: &CapabilityKey) -> bool {
+    (key.platform == "macos" || key.platform == "windows")
+        && key.app_build == MODE_INTERFACE_BUILD
         && key.protocol_version == KNOWN_PROTOCOL_VERSION
 }
 
@@ -321,5 +334,31 @@ mod tests {
                 "{capability:?} 不得在未知 build 上继承命令条目"
             );
         }
+    }
+    /// 3.17.2 只新增模式接口候选：不得因版本升级把其他能力整表当成 shipped
+    /// confirmed，也不得让队列命令借用本分支。
+    #[test]
+    fn mode_interface_build_opens_only_mode_candidate() {
+        let new = CapabilityKey::new("macos", "3.17.2.9661", 3, "shape-new", 0);
+        assert_eq!(
+            shipped_state(&new, Capability::Mode),
+            Some(CapabilityState::InterfaceMatched)
+        );
+        for capability in [
+            Capability::Send,
+            Capability::Model,
+            Capability::ThoughtLevel,
+            Capability::ApprovalReply,
+            Capability::SingleSelect,
+            Capability::QueueEdit,
+            Capability::QueueResume,
+        ] {
+            assert_eq!(
+                shipped_state(&new, capability),
+                None,
+                "3.17.2 must not become a full shipped build: {capability:?}"
+            );
+        }
+        assert!(!build_declares_queue_command(&new, DELETE_QUEUE_ITEM));
     }
 }

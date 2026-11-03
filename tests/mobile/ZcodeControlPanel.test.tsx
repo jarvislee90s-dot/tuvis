@@ -991,6 +991,35 @@ describe("ZCode 控制面板：主按钮在发送与打断之间切换（R5/U3�
     expect(postedActions().filter(({ action }) => action.kind === "send")).toHaveLength(0);
   });
 
+  it("连接断开时旧投影仍带 primaryTurn，主按钮也必须回落为发送文案", async () => {
+    // 断线时 UI 可能保留最后一次 activeWorks；此时不能让用户看到可执行语义的「打断」。
+    installFetch((url) => {
+      if (url === ZCODE_CONNECTION_PATH)
+        return json(connection({ state: "offline", reasonCode: "offline" }));
+      if (url.startsWith(`${ZCODE_SESSION_PATH}?`)) return json(runningSession());
+      if (url.startsWith(`${ZCODE_LOCAL_QUEUE_PATH}?`))
+        return json({
+          sessionId: SID,
+          version: 1,
+          autoDrain: true,
+          pauseReason: null,
+          items: [],
+          recoverableEdits: [],
+        });
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+    render(<ZcodeControlPanel sessionId={SID} />);
+
+    const primary = (await screen.findByTestId("zcode-send")) as HTMLButtonElement;
+    await waitFor(() => expect(primary).toBeDisabled());
+    expect(primary.getAttribute("data-primary-action")).toBe("disabled");
+    expect(primary.getAttribute("data-primary-mode")).toBe("send");
+    expect(primary.textContent).toBe("发送");
+    expect(screen.getByTestId("zcode-send-reason").getAttribute("data-reason-code")).toBe(
+      "offline"
+    );
+  });
+
   it("运行中但有文字 → 主按钮是发送，绝不先打断", async () => {
     installRunning(runningSession());
     render(<ZcodeControlPanel sessionId={SID} />);

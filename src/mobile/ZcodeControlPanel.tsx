@@ -473,7 +473,8 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
    * 打断位：运行中 + 手上无可发内容 + 附件闸未闭 → 按钮代表「打断当前回合」。
    * 有内容（含就绪附件）时按钮留在发送位：有内容发送绝不先打断。
    */
-  const stopSlot = running && !hasContent && !attachmentBlocked;
+  const stopSlot =
+    running && !hasContent && !attachmentBlocked && gateReason === null && !staleGeneration;
   /**
    * 主按钮旁的原因（冻结码）：删除独立打断行后，原因必须仍在按钮旁可见。
    * 优先级：写面硬门 > 旧代际 > 打断位（能力关闭 / 目标歧义）> 发送位（能力关闭）。

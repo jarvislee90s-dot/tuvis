@@ -807,6 +807,13 @@ mod tests {
         );
         assert!(!view.send.enabled, "send 关闭不得被模式候选连带打开");
 
+        let mode_interface = CapabilityKey::new("macos", "3.17.2.9661", 3, "shape-new", 0);
+        let mode_view = resolve_capabilities(&mode_interface, &evidence, &MemoryLedger::default());
+        assert!(
+            mode_view.mode.enabled,
+            "3.17.2 模式接口候选应开：{mode_view:?}"
+        );
+
         let unknown = CapabilityKey::new("macos", "9.9.9.9999", 3, "shape", 1);
         let unknown_view = resolve_capabilities(&unknown, &evidence, &MemoryLedger::default());
         assert!(
