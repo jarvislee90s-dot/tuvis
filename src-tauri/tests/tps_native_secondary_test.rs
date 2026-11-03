@@ -634,6 +634,7 @@ fn wb_title_purpose_excluded_from_main_curve() {
         model: "hy3".into(),
         channel: None,
         method: TimingMethod::ClientNative,
+        reference_profile_id: None,
     };
     let point = points
         .iter()

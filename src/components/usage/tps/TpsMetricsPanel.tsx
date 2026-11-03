@@ -22,6 +22,7 @@ const OUTPUT_SCOPE_KEYS: Record<TpsMetrics["outputScope"], string> = {
   exclusiveOutput: "usage.tps.outputScope.exclusiveOutput",
   includesReasoning: "usage.tps.outputScope.includesReasoning",
   providerReported: "usage.tps.outputScope.providerReported",
+  visibleBody: "usage.tps.outputScope.visibleBody",
   unknown: "usage.tps.outputScope.unknown",
 };
 

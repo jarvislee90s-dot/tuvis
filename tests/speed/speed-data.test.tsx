@@ -667,6 +667,10 @@ describe("mock 夹具结构契约", () => {
     "stream",
     "response",
     "avgFirstTokenMs",
+    "tokenizerEstimate",
+    "bodyObservedMs",
+    "shortWindowCount",
+    "smallSampleCount",
     "ttftSampleCount",
     "modelMs",
     "toolMs",
@@ -695,8 +699,10 @@ describe("mock 夹具结构契约", () => {
     expect(Object.keys(m).sort()).toEqual([...METRICS_KEYS].sort());
     assertRate(m.stream, "stream");
     assertRate(m.response, "response");
+    assertRate(m.tokenizerEstimate, "tokenizerEstimate");
     for (const k of [
       "avgFirstTokenMs",
+      "bodyObservedMs",
       "modelMs",
       "toolMs",
       "latestStreamEndedAt",
@@ -706,6 +712,8 @@ describe("mock 夹具结构契约", () => {
     }
     for (const k of [
       "ttftSampleCount",
+      "shortWindowCount",
+      "smallSampleCount",
       "candidateCount",
       "failedCount",
       "cancelledCount",
@@ -714,9 +722,13 @@ describe("mock 夹具结构契约", () => {
     ] as const) {
       expect(typeof m[k]).toBe("number");
     }
-    expect(["exclusiveOutput", "includesReasoning", "providerReported", "unknown"]).toContain(
-      m.outputScope
-    );
+    expect([
+      "exclusiveOutput",
+      "includesReasoning",
+      "providerReported",
+      "visibleBody",
+      "unknown",
+    ]).toContain(m.outputScope);
     expect(typeof m.scopeMixed).toBe("boolean");
   }
 
@@ -739,7 +751,16 @@ describe("mock 夹具结构契约", () => {
     expect(typeof s.disabled).toBe("boolean");
     for (const src of s.sourceStates) {
       expect(Object.keys(src).sort()).toEqual(
-        ["source", "status", "installed", "capabilities", "lastRecordAt", "reason", "detail"].sort()
+        [
+          "source",
+          "status",
+          "installed",
+          "capabilities",
+          "estimateState",
+          "lastRecordAt",
+          "reason",
+          "detail",
+        ].sort()
       );
       expect(["ready", "unconfigured", "await-restart", "needs-check", "unsupported"]).toContain(
         src.status

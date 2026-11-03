@@ -244,6 +244,7 @@ fn read_sums(row: &rusqlite::Row<'_>, first: usize) -> rusqlite::Result<SpeedSum
         tool_ms_samples: row.get(first + 18)?,
         output_scope,
         scope_mixed: scope_kinds > 1,
+        ..SpeedSums::default()
     })
 }
 
@@ -289,6 +290,7 @@ pub fn series_sums_conn(
                     model: row.get(1)?,
                     channel: row.get(2)?,
                     method: enum_col(3, row.get(3)?, method_from_db)?,
+                    reference_profile_id: None,
                 },
                 sums: read_sums(row, 4)?,
             })

@@ -118,6 +118,7 @@ fn kimi_series() -> SeriesKey {
         model: "kimi-k2".into(),
         channel: None,
         method: TimingMethod::ClientNative,
+        reference_profile_id: None,
     }
 }
 
@@ -444,7 +445,7 @@ fn old_tps_point_rows_have_zero_effect_on_v2_sums() {
             m.stream.duration_ms,
             m.stream.sample_count
         ),
-        (100, 1_000, 1),
+        (100, 1_000.0, 1),
         "V2 只聚合 tps_observation，旧点不相加"
     );
 }
@@ -825,6 +826,7 @@ fn search_filter_sort_and_selection_fallback() {
         model: "gpt".into(),
         channel: None,
         method: TimingMethod::LogBoundaryApprox,
+        reference_profile_id: None,
     });
     let snap = query::dashboard(&c, &q, to).unwrap();
     assert_eq!(

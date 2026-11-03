@@ -1171,6 +1171,27 @@ fn record_running_tools_with_workbuddy_host<'a>(
 pub(crate) fn last_process_refresh_ms() -> u64 {
     LAST_PROCESS_REFRESH_MS.load(Ordering::Relaxed)
 }
+/// 只提取可用于测速的会话身份，不复制消息正文或项目路径。
+#[doc(hidden)]
+pub fn select_codex_app_ids(sessions: &[crate::session::Session]) -> Vec<String> {
+    use crate::session::{AgentType, ProcessForm, SessionStatus};
+    sessions
+        .iter()
+        .filter(|session| {
+            session.agent_type == AgentType::Codex
+                && session.form == ProcessForm::App
+                && session.status != SessionStatus::Finished
+        })
+        .map(|session| session.id.clone())
+        .collect()
+}
+
+/// 仅读取现有扫描总线快照的身份列，不复制消息正文或项目路径。
+pub fn cached_codex_app_ids() -> Option<Vec<String>> {
+    crate::adapter::scan_bus::snapshot()
+        .as_ref()
+        .map(|snapshot| select_codex_app_ids(&snapshot.data.sessions))
+}
 
 /// 会话级去重：同一 (工具, session id) 只保留首张卡。
 /// 全局防线：任何解析器的"文件级/进程级复制"型 bug（如 opencode 多进程同会话、

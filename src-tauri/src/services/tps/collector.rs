@@ -287,6 +287,7 @@ pub fn produce_point_with_cadence(
             model: o.model,
             channel: o.channel,
             method: o.method,
+            reference_profile_id: None,
         };
         known.entry(key.id()).or_insert(key);
     }

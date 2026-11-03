@@ -3,7 +3,7 @@
 use super::error::UsageError;
 use super::model::{UsageSettings, UsageSettingsPatch};
 use super::provider::parse_provider_rules;
-use crate::database::{get_setting, set_setting};
+use crate::database::get_setting;
 
 pub const SETTINGS_KEY: &str = "usage.settings";
 
@@ -120,11 +120,54 @@ pub fn load_from_conn(conn: &rusqlite::Connection) -> UsageSettings {
 /// 锁：`usage_ipc_test::set_settings_reports_persist_failure_instead_of_success`
 /// （用 `settings` 表上的 RAISE(ABORT) 触发器造真实写失败）。
 pub fn save(s: &UsageSettings) -> Result<(), UsageError> {
-    let json = serde_json::to_string(s).map_err(|e| {
+    // 初始化捕获门时会读取设置，必须发生在取得全局 DB 锁之前。
+    let gate = crate::services::tps::estimate_store::global_capture_gate();
+    save_with_gate_and_lock(&crate::database::connection::DB, s, gate)
+}
+
+/// 用于独占连接的测试接缝；共享数据库必须使用 `save_with_gate_and_lock`，
+/// 不能先持库锁等待捕获清理。
+#[doc(hidden)]
+pub fn save_to_conn_with_gate(
+    conn: &rusqlite::Connection,
+    settings: &UsageSettings,
+    gate: &crate::services::tps::estimate_store::CaptureGate,
+) -> Result<(), UsageError> {
+    gate.save_master_with(settings.enabled, || {
+        let json = serde_json::to_string(settings).map_err(|e| {
+            UsageError::new("usage-db-failed", format!("usage settings serialize: {e}"))
+        })?;
+        write_settings_conn(conn, &json)
+    })
+}
+
+pub fn save_with_gate_and_lock(
+    db: &std::sync::Mutex<rusqlite::Connection>,
+    settings: &UsageSettings,
+    gate: &crate::services::tps::estimate_store::CaptureGate,
+) -> Result<(), UsageError> {
+    let json = serde_json::to_string(settings).map_err(|e| {
         UsageError::new("usage-db-failed", format!("usage settings serialize: {e}"))
     })?;
-    set_setting(SETTINGS_KEY, &json);
-    if get_setting(SETTINGS_KEY).as_deref() != Some(json.as_str()) {
+    gate.save_master_with(settings.enabled, || {
+        let conn = db.lock().unwrap_or_else(|e| e.into_inner());
+        write_settings_conn(&conn, &json)
+    })
+}
+
+fn write_settings_conn(conn: &rusqlite::Connection, json: &str) -> Result<(), UsageError> {
+    conn.execute(
+        "INSERT OR REPLACE INTO settings(key,value) VALUES (?1,?2)",
+        rusqlite::params![SETTINGS_KEY, json],
+    )
+    .map_err(|e| {
+        UsageError::new(
+            "usage-db-failed",
+            format!("usage settings write failed: {e}"),
+        )
+    })?;
+    let actual = crate::database::dao::settings::get_setting_conn(conn, SETTINGS_KEY);
+    if actual.as_deref() != Some(json) {
         return Err(UsageError::new(
             "usage-db-failed",
             format!("usage settings write did not persist (readback mismatch): key={SETTINGS_KEY}"),

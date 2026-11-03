@@ -235,6 +235,16 @@ pub async fn tps_speed_dashboard(
     .map_err(|e| UsageError::internal(format!("tps speed dashboard task failed: {e}")))?
 }
 
+/// 单独控制正文分词估算，不影响原生速度来源和远程适配。
+#[tauri::command]
+pub async fn tps_tokenizer_estimate_set_enabled(enabled: bool) -> Result<(), UsageError> {
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::services::tps::estimate_store::set_estimate_enabled(enabled)
+    })
+    .await
+    .map_err(|e| UsageError::internal(format!("estimate settings task failed: {e}")))?
+}
+
 /// 手动刷新（立即读取 + manual 点；最小间隔 5 秒，限频/繁忙时 refreshed=false）
 #[tauri::command]
 pub async fn tps_refresh(selection: TpsSelection) -> Result<TpsRefreshResult, UsageError> {

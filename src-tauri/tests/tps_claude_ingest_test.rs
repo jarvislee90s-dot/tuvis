@@ -359,6 +359,7 @@ fn main_task_positive_sample_flows_into_point() {
             model: o.model.clone(),
             channel: o.channel.clone(),
             method: o.method,
+            reference_profile_id: None,
         };
         if !known.contains(&k) {
             known.push(k);

@@ -48,6 +48,7 @@ import {
   mockTpsSnapshotResult,
   mockTpsUninstall,
   mockSpeedDashboard,
+  setMockTokenizerEstimateEnabled,
 } from "@/lib/usage/mockFixtures";
 import type { SpeedDashboardQuery } from "@/types/speed";
 import type { TpsInstallChoice, TpsSelection, TpsViewRange } from "@/types/tps";
@@ -1275,6 +1276,10 @@ if (!isTauri) {
       }
       case "tps_uninstall":
         return mockTpsUninstall();
+      case "tps_tokenizer_estimate_set_enabled":
+        setMockTokenizerEstimateEnabled((args as { enabled: boolean }).enabled);
+        return Promise.resolve();
+
       case "tps_speed_dashboard":
         // V2 速度 dashboard（Task 9）：只读快照；mock 同源夹具，形状与 Rust camelCase 一致
         return Promise.resolve(

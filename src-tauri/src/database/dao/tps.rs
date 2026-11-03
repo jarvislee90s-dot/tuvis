@@ -33,6 +33,7 @@ impl DbStr for TimingMethod {
             "client-native" => Ok(TimingMethod::ClientNative),
             "native-event-approx" => Ok(TimingMethod::NativeEventApprox),
             "log-boundary-approx" => Ok(TimingMethod::LogBoundaryApprox),
+            "ipc-body-reference" => Ok(TimingMethod::IpcBodyReference),
             other => Err(UsageError::internal(format!(
                 "tps: unknown timing-method db string {other:?}"
             ))),
@@ -67,6 +68,7 @@ db_str_enum!(
     ExclusiveOutput => "exclusiveOutput",
     IncludesReasoning => "includesReasoning",
     ProviderReported => "providerReported",
+    VisibleBody => "visibleBody",
     Unknown => "unknown"
 );
 db_str_enum!(TpsQuality, Normal => "normal", SmallSample => "smallSample");
@@ -616,6 +618,7 @@ mod tests {
                 model: "m".into(),
                 channel: None,
                 method: TimingMethod::ClientNative,
+                reference_profile_id: None,
             },
             sampled_at: 100,
             window_ms: crate::services::tps::policy::TPS_WINDOW_MS,

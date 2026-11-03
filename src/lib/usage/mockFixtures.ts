@@ -1953,7 +1953,13 @@ export function mockUsageCostCsv(range: UsageRange): string {
 
 /** mock 系列：zcode + glm + stream-observed（channel 无 = null）。 */
 export function mockTpsSeriesKey(): TpsSeriesKey {
-  return { tool: "zcode", model: "glm-5.3-flash", channel: null, method: "stream-observed" };
+  return {
+    tool: "zcode",
+    model: "glm-5.3-flash",
+    channel: null,
+    method: "stream-observed",
+    referenceProfileId: null,
+  };
 }
 
 /** 七来源的真实状态样例（detail 带机器可读 `tps-status=` 前缀；codex 缺口单列）。 */
@@ -2174,6 +2180,7 @@ export async function mockTpsUninstall(): Promise<null> {
 /** 测试 / 页面初始化时复位（预览在册表清空）。 */
 export function resetTpsMockState(): void {
   tpsPreviews = [];
+  mockTokenizerEstimateEnabled = true;
 }
 
 // ── V2 速度 dashboard（2026-10-26 计划 Task 9）────────────────────────────────
@@ -2194,8 +2201,17 @@ export function mockSpeedCapabilities(source: string): SpeedCapabilities {
         response: true,
         streamReason: MOCK_SPEED_CODEX_STREAM_REASON,
         responseReason: null,
+        tokenizerEstimate: true,
+        tokenizerEstimateReason: null,
       }
-    : { stream: true, response: true, streamReason: null, responseReason: null };
+    : {
+        stream: true,
+        response: true,
+        streamReason: null,
+        responseReason: null,
+        tokenizerEstimate: false,
+        tokenizerEstimateReason: "unsupported-source",
+      };
 }
 
 /** 档位 → 窗长 ms（与 Rust SpeedRange::window_ms 逐字：15m/1h/5h/24h）。 */
@@ -2241,6 +2257,10 @@ export function emptySpeedMetrics(): SpeedMetrics {
   return {
     stream: none,
     response: none,
+    tokenizerEstimate: none,
+    bodyObservedMs: null,
+    shortWindowCount: 0,
+    smallSampleCount: 0,
     avgFirstTokenMs: null,
     ttftSampleCount: 0,
     modelMs: null,
@@ -2267,7 +2287,7 @@ export function mockSpeedSeries(now: number): SpeedSeriesSummary[] {
     method: SpeedSeriesSummary["seriesKey"]["method"],
     over: Partial<SpeedMetrics>
   ): SpeedSeriesSummary => ({
-    seriesKey: { tool, model, channel, method },
+    seriesKey: { tool, model, channel, method, referenceProfileId: null },
     metrics: {
       ...emptySpeedMetrics(),
       outputScope: "providerReported",
@@ -2365,9 +2385,39 @@ export function mockSpeedSeries(now: number): SpeedSeriesSummary[] {
   ];
 }
 
+let mockTokenizerEstimateEnabled = true;
+export function setMockTokenizerEstimateEnabled(enabled: boolean): void {
+  mockTokenizerEstimateEnabled = enabled;
+}
+
 /** 七来源视图：状态/安装/成因 token 各覆盖一态（与 Rust resolve_source_views 的折算矩阵对应）。 */
 export function mockSpeedSourceStates(now: number): SpeedSourceView[] {
-  const view = (v: SpeedSourceView): SpeedSourceView => v;
+  const view = (v: Omit<SpeedSourceView, "estimateState">): SpeedSourceView => ({
+    ...v,
+    estimateState: {
+      supported: v.source === "codex",
+      enabled: mockTokenizerEstimateEnabled,
+      observing: false,
+      reason:
+        v.source === "codex"
+          ? mockTokenizerEstimateEnabled
+            ? "not-observing"
+            : "source-disabled"
+          : "unsupported-source",
+      lastRecordAt: null,
+      referenceProfileId:
+        v.source === "codex"
+          ? "130715968c7e5a1800cc41cc56469ed47d2aa5d831044b582ad4bd1de95564c5"
+          : null,
+      encoding: v.source === "codex" ? "o200k_base" : null,
+      ruleVersion: v.source === "codex" ? 1 : null,
+      resourceSha256:
+        v.source === "codex"
+          ? "446a9538cb6c348e3516120d7c08b09f57c36495e2acfffe59a5bf8b0cfb1a2d"
+          : null,
+      modelSource: v.source === "codex" ? "turn-config-or-unknown" : null,
+    },
+  });
   return [
     view({
       source: "zcode",
@@ -2510,6 +2560,18 @@ export function mockSpeedDashboard(
   now: number = Date.now()
 ): SpeedDashboardSnapshot {
   const q = query ?? defaultSpeedQuery();
+  if (q.metricMode === "tokenizer-estimate") {
+    return {
+      asOf: now,
+      rangeFrom: now - mockSpeedWindowMs(q.range),
+      rangeTo: now,
+      disabled: false,
+      sourceStates: mockSpeedSourceStates(now),
+      series: [],
+      selectedSeries: q.selection,
+      buckets: [],
+    };
+  }
   const all = mockSpeedSeries(now);
   // 后端 search：source/model 的字面子串（LIKE 转义通配符、ASCII 大小写不敏感）
   const needle = q.search.trim().toLowerCase();

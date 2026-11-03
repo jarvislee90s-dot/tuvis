@@ -1814,12 +1814,14 @@
         "clientNative": "客户端原生",
         "nativeEventApprox": "原生事件近似",
         "logBoundaryApprox": "日志近似",
+        "ipcBodyReference": "IPC 正文参考",
         "approxBadge": "原生近似"
       },
       "outputScope": {
         "exclusiveOutput": "输出不含思考",
         "includesReasoning": "输出已含思考",
         "providerReported": "思考计数未单独声明",
+        "visibleBody": "可见正文",
         "unknown": "口径未知"
       },
       "age": {
@@ -3098,11 +3100,13 @@
   "speed": {
     "metric": {
       "stream": "流式输出速度",
-      "response": "响应吞吐（含等待）"
+      "response": "响应吞吐（含等待）",
+      "tokenizer-estimate": "分词器估算"
     },
     "unit": {
       "tps": "TPS",
-      "tokenPerSec": "Token/s"
+      "tokenPerSec": "Token/s",
+      "referenceTokenPerSec": "参考 Token/s"
     },
     "tile": {
       "currentRate": "当前模式速度",
@@ -3111,7 +3115,13 @@
       "responseMs": "响应累计用时",
       "toolMs": "工具累计用时",
       "approxMark": "日志近似",
-      "toolMsHint": "现有来源无法把工具执行时长可靠归属到单次模型调用，暂不计入（不填 0）；全工具统计见「模型用量 → 工作活动」。"
+      "toolMsHint": "现有来源无法把工具执行时长可靠归属到单次模型调用，暂不计入（不填 0）；全工具统计见「模型用量 → 工作活动」。",
+      "estimateMark": "估算",
+      "bodyObservedMs": "正文累计观测用时",
+      "estimateFirstHint": "当前正文观察未取得可靠请求起点",
+      "estimateToolHint": "本口径不观测工具耗时",
+      "shortWindowHint": "短窗口受 IPC 缓冲的相对影响可能较大，误差尚未校准。",
+      "qualityCounts": "短窗口 {{short}} · 小样本 {{small}}"
     },
     "chart": {
       "ariaLabel": "输出速度趋势图：{{metric}}，单位 {{unit}}",
@@ -3175,18 +3185,36 @@
       "capStream": "流式",
       "capResponse": "响应",
       "responseOnly": "仅响应",
-      "capUnavailable": "不可用"
+      "capUnavailable": "不可用",
+      "estimate": "正文估算",
+      "estimateUnsupported": "本平台尚未验证",
+      "estimateStopped": "已停止",
+      "estimateObserving": "观察中",
+      "estimateWaiting": "等待受管会话",
+      "estimateStop": "停止估算采集",
+      "estimateStart": "开启估算采集",
+      "estimateError": "操作失败，请重试。",
+      "referenceEncoding": "参考编码",
+      "referenceRule": "规则版本",
+      "referenceProfile": "参考配置身份",
+      "referenceResource": "资源 SHA-256",
+      "modelSource": "模型来源",
+      "modelSourceValue": "回合请求配置；缺失时归未知",
+      "boundary": "从首次至最后一次可见正文增长；不含工具输出。"
     },
     "mode": {
       "stream": "流式输出",
-      "response": "响应吞吐（含等待）"
+      "response": "响应吞吐（含等待）",
+      "tokenizerEstimate": "分词器估算"
     },
     "modeHint": {
-      "stream": "流式输出速度 = 输出 Token ÷ 首个有效输出到生成完成的秒数（不含首 Token 等待）",
-      "response": "响应吞吐（含等待）= 输出 Token ÷（首 Token 等待 + 生成）总秒数",
-      "line1": "流式输出速度 = 输出 Token ÷ 首个有效输出到生成完成的秒数（不含首 Token 等待）；",
-      "line2": "响应吞吐（含等待）= 输出 Token ÷（首 Token 等待 + 生成）总秒数；",
-      "line3": "同一记录响应值 ≤ 流式值，差额即等待；Codex 仅有响应口径（日志近似）"
+      "stream": "流式输出速度 = 输出 Token ÷ 首个有效输出至生成完成的秒数（不含首输出等待）",
+      "response": "响应吞吐（含等待）= 输出 Token ÷ 对应响应的含等待总秒数",
+      "tokenizerEstimate": "可见正文参考 Token 数除以首次至最后一次正文增长的秒数",
+      "line1": "流式输出速度 = 输出 Token ÷ 首个有效输出至生成完成的秒数（不含首输出等待）；",
+      "line2": "响应吞吐（含等待）= 输出 Token ÷ 对应响应的含等待总秒数；",
+      "line3": "分词器估算 = 正文参考 Token 数 ÷ 首次正文增长至最后一次正文增长的秒数；",
+      "line4": "分词器估算只统计可见正文，不含隐藏思考和工具输出；三种口径不混排，参考 Token/s 不与原生 Token/s 直接比较，估算误差尚未校准。"
     },
     "list": {
       "listLabel": "组合列表",
@@ -3198,7 +3226,9 @@
       "emptyAll": "暂无组合",
       "smallSample": "小样本",
       "sortHeaderTitle": "点击排序（再点翻转升降序）",
-      "seriesPicker": "选择组合"
+      "seriesPicker": "选择组合",
+      "referenceProfile": "参考配置",
+      "selectProfile": "选择参考配置"
     },
     "detail": {
       "empty": "暂无可展示的组合",

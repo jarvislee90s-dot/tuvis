@@ -675,6 +675,20 @@ pub fn init(conn: &Connection) {
         --    不入速度但有可靠起止仍进耗时详情），可空列 = 「不可得」，读回 None 不填 0。
         --    started/ended 的 epoch 非负 CHECK 既是数据哨兵，也是「批内中途失败」原子性
         --    验收的注入缝（tests/tps_store_test.rs 用 ended_at_ms=-1 的行让事务在批中段失败）。
+        -- 独立的可见正文参考分词事实；不包含正文，也不与原生 Token 表混用。
+        CREATE TABLE IF NOT EXISTS tps_body_estimate (
+            host_key TEXT NOT NULL, thread_key TEXT NOT NULL, turn_key TEXT NOT NULL, item_key TEXT NOT NULL,
+            reference_profile_id TEXT NOT NULL, model TEXT, channel TEXT, model_source TEXT NOT NULL,
+            reference_tokens INTEGER NOT NULL CHECK(reference_tokens >= 0),
+            duration_ns INTEGER NOT NULL CHECK(duration_ns > 0),
+            ended_at_ms INTEGER NOT NULL CHECK(ended_at_ms >= 0),
+            run_id TEXT NOT NULL, source_build TEXT NOT NULL,
+            short_window INTEGER NOT NULL CHECK(short_window IN (0,1)),
+            small_sample INTEGER NOT NULL CHECK(small_sample IN (0,1)),
+            PRIMARY KEY(host_key,thread_key,turn_key,item_key,reference_profile_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_tps_body_estimate_ended ON tps_body_estimate(ended_at_ms);
+        CREATE INDEX IF NOT EXISTS idx_tps_body_estimate_series ON tps_body_estimate(reference_profile_id,model,channel,ended_at_ms);
         CREATE TABLE IF NOT EXISTS tps_observation (
             source             TEXT NOT NULL,
             host_instance      TEXT NOT NULL,

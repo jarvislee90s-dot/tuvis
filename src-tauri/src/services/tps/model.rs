@@ -28,6 +28,7 @@ pub enum TimingMethod {
     /// V2 响应口径（含等待）：来源只有调用级起止（日志边界近似），无生成窗概念
     /// 也不伪造（如 Codex 仅 response，一级标「含等待 · 日志近似」）
     LogBoundaryApprox,
+    IpcBodyReference,
 }
 
 impl TimingMethod {
@@ -38,6 +39,7 @@ impl TimingMethod {
             TimingMethod::ClientNative => "client-native",
             TimingMethod::NativeEventApprox => "native-event-approx",
             TimingMethod::LogBoundaryApprox => "log-boundary-approx",
+            TimingMethod::IpcBodyReference => "ipc-body-reference",
         }
     }
 }
@@ -76,6 +78,8 @@ pub enum OutputScope {
     IncludesReasoning,
     /// provider-reported：思考计数未单独声明；不按字符估思考，不宣称测得隐藏思考
     ProviderReported,
+    /// 可见正文，不含隐藏思考。
+    VisibleBody,
     /// 无事实（gap 点等）
     Unknown,
 }
@@ -117,13 +121,33 @@ pub struct SeriesKey {
     pub model: String,
     pub channel: Option<String>,
     pub method: TimingMethod,
+    #[serde(default)]
+    pub reference_profile_id: Option<String>,
 }
 
 impl SeriesKey {
     /// 稳定串形态：serde_json 规范化序列化（结构体字段序固定 → 跨进程/跨重启逐字稳定，
     /// 且无分隔符歧义）。用作落库 series_key 列与 BTreeMap 键（迭代序确定）。
     pub fn id(&self) -> String {
-        serde_json::to_string(self).unwrap_or_default()
+        // 原生历史点使用四字段 JSON 作持久键；新增可空字段不能改变旧键。
+        #[derive(Serialize)]
+        struct LegacyKey<'a> {
+            tool: &'a str,
+            model: &'a str,
+            channel: &'a Option<String>,
+            method: TimingMethod,
+        }
+        if self.reference_profile_id.is_none() {
+            serde_json::to_string(&LegacyKey {
+                tool: &self.tool,
+                model: &self.model,
+                channel: &self.channel,
+                method: self.method,
+            })
+            .unwrap_or_default()
+        } else {
+            serde_json::to_string(self).unwrap_or_default()
+        }
     }
 }
 

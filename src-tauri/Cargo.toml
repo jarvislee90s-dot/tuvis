@@ -91,6 +91,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 # M4 T1d：cloudflared 下载完整性校验（固定版本 + release 页 SHA256 表比对；
 # 0.10 本就存在于依赖树，升直依不新增传递项）
 sha2 = "0.11"
+tiktoken-rs = "=0.12.1"
 zip = "8"
 # dsh 会话日志为多帧拼接的 zstd 容器（M0 F1），解码用
 zstd = "0.14"

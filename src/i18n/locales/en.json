@@ -1814,12 +1814,14 @@
         "clientNative": "Client-native",
         "nativeEventApprox": "Native-event-approx",
         "logBoundaryApprox": "Log approx",
+        "ipcBodyReference": "IPC body reference",
         "approxBadge": "approx"
       },
       "outputScope": {
         "exclusiveOutput": "Output excludes reasoning",
         "includesReasoning": "Output includes reasoning",
         "providerReported": "Reasoning count not declared separately",
+        "visibleBody": "Visible body",
         "unknown": "Scope unknown"
       },
       "age": {
@@ -3098,11 +3100,13 @@
   "speed": {
     "metric": {
       "stream": "Streaming output speed",
-      "response": "Response throughput (incl. waits)"
+      "response": "Response throughput (incl. waits)",
+      "tokenizer-estimate": "Tokenizer estimate"
     },
     "unit": {
       "tps": "TPS",
-      "tokenPerSec": "Token/s"
+      "tokenPerSec": "Token/s",
+      "referenceTokenPerSec": "reference tokens/s"
     },
     "tile": {
       "currentRate": "Current-mode speed",
@@ -3111,7 +3115,13 @@
       "responseMs": "Total response time",
       "toolMs": "Total tool time",
       "approxMark": "log-approx",
-      "toolMsHint": "No source can yet attribute tool-execution time to a single model call, so it stays out (never zero-filled); see Usage → Work activity for all-tool totals."
+      "toolMsHint": "No source can yet attribute tool-execution time to a single model call, so it stays out (never zero-filled); see Usage → Work activity for all-tool totals.",
+      "estimateMark": "estimate",
+      "bodyObservedMs": "Total observed text time",
+      "estimateFirstHint": "The text observation has no reliable request start",
+      "estimateToolHint": "Tool time is not observed for this metric",
+      "shortWindowHint": "IPC buffering may have a larger relative impact on short windows; error has not been calibrated.",
+      "qualityCounts": "Short windows {{short}} · small samples {{small}}"
     },
     "chart": {
       "ariaLabel": "Output speed trend: {{metric}}, unit {{unit}}",
@@ -3175,18 +3185,36 @@
       "capStream": "Stream",
       "capResponse": "Response",
       "responseOnly": "response only",
-      "capUnavailable": "unavailable"
+      "capUnavailable": "unavailable",
+      "estimate": "Text estimate",
+      "estimateUnsupported": "Not verified on this platform",
+      "estimateStopped": "Stopped",
+      "estimateObserving": "Observing",
+      "estimateWaiting": "Waiting for a managed chat",
+      "estimateStop": "Stop estimate collection",
+      "estimateStart": "Start estimate collection",
+      "estimateError": "Action failed. Try again.",
+      "referenceEncoding": "Reference encoding",
+      "referenceRule": "Rule version",
+      "referenceProfile": "Reference profile ID",
+      "referenceResource": "Resource SHA-256",
+      "modelSource": "Model source",
+      "modelSourceValue": "Turn request configuration; unknown if missing",
+      "boundary": "From first to last visible text growth; tool output excluded."
     },
     "mode": {
       "stream": "Streaming output",
-      "response": "Response throughput (incl. waits)"
+      "response": "Response throughput (incl. waits)",
+      "tokenizerEstimate": "Tokenizer estimate"
     },
     "modeHint": {
-      "stream": "Streaming output speed = output tokens ÷ seconds from first valid output to generation end (first-token wait excluded)",
-      "response": "Response throughput (incl. waits) = output tokens ÷ total seconds of first-token wait + generation",
-      "line1": "Streaming output speed = output tokens ÷ seconds from first valid output to generation end (first-token wait excluded);",
-      "line2": "Response throughput (incl. waits) = output tokens ÷ total seconds of first-token wait + generation",
-      "line3": "For the same record, response ≤ streaming — the difference is the wait; Codex carries the response metric only (log-approx)"
+      "stream": "Streaming output speed = output tokens ÷ seconds from first effective output to generation completion (excluding the initial wait)",
+      "response": "Response throughput (including wait) = output tokens ÷ elapsed seconds for the corresponding response, including the initial wait",
+      "tokenizerEstimate": "Reference tokens in visible text divided by time from first to last observed text growth",
+      "line1": "Streaming output speed = output tokens ÷ seconds from first effective output to generation completion (excluding the initial wait);",
+      "line2": "Response throughput (including wait) = output tokens ÷ elapsed seconds for the corresponding response, including the initial wait;",
+      "line3": "Tokenizer estimate = reference tokens in the visible text ÷ seconds from the first to the last observed text growth;",
+      "line4": "The tokenizer estimate covers visible text only, excluding hidden reasoning and tool output. Rankings are separate for each metric. Reference tokens/s should not be compared directly with native tokens/s. Estimation error has not been calibrated."
     },
     "list": {
       "listLabel": "Series list",
@@ -3198,7 +3226,9 @@
       "emptyAll": "No series yet",
       "smallSample": "small sample",
       "sortHeaderTitle": "Click to sort (click again to flip order)",
-      "seriesPicker": "Select series"
+      "seriesPicker": "Select series",
+      "referenceProfile": "Reference profile",
+      "selectProfile": "Select a reference profile"
     },
     "detail": {
       "empty": "Nothing to show yet",
