@@ -22579,3 +22579,1200 @@ async fn p10_slow_terminal_beyond_first_window_still_dispatches() {
     assert_eq!(v["result"], "prioritized", "{v}");
     f.state.codex_control.adapter.shutdown().await;
 }
+
+#[tokio::test]
+async fn following_release_preserves_other_purpose_on_wire() {
+    use multi_agents_manager_lib::services::codex_desktop_ipc::owners::FollowPurpose;
+    let (io, mut peer) = ScriptedPeer::new();
+    let adapter = Arc::new(DesktopIpcAdapter::new(
+        Arc::new(StaticConnector::new(io)),
+        caps_open_profile(),
+    ));
+    let key = ThreadKey {
+        host_id: "local".into(),
+        thread_id: "00000000-0000-4000-8000-000000000001".into(),
+    };
+    let other = adapter.clone();
+    let k = key.clone();
+    let ensuring = tokio::spawn(async move { other.ensure_thread(&k).await });
+    drive_ensure(&mut peer, &key.thread_id, vec![], "idle").await;
+    ensuring.await.unwrap().unwrap();
+    let lease = adapter
+        .acquire_following(&key, FollowPurpose::TokenizerEstimate)
+        .await
+        .unwrap();
+    adapter.unfollow(&key).await;
+    assert!(
+        !peer_has_traffic(&mut peer).await,
+        "remote release must not emit following:false"
+    );
+    lease.release().await;
+    let f = recv_within(&mut peer, 2).await;
+    assert_eq!(f["method"], "thread-stream-following-changed");
+    assert_eq!(f["params"]["following"], false);
+    adapter.shutdown().await;
+}
+
+#[tokio::test]
+async fn estimate_release_preserves_repeated_remote_ensure_on_wire() {
+    use multi_agents_manager_lib::services::codex_desktop_ipc::owners::FollowPurpose;
+    let (io, mut peer) = ScriptedPeer::new();
+    let adapter = Arc::new(DesktopIpcAdapter::new(
+        Arc::new(StaticConnector::new(io)),
+        caps_open_profile(),
+    ));
+    let key = ThreadKey {
+        host_id: "local".into(),
+        thread_id: "00000000-0000-4000-8000-000000000002".into(),
+    };
+    let other = adapter.clone();
+    let k = key.clone();
+    let task = tokio::spawn(async move {
+        other
+            .acquire_following(&k, FollowPurpose::TokenizerEstimate)
+            .await
+    });
+    drive_ensure(&mut peer, &key.thread_id, vec![], "idle").await;
+    let lease = task.await.unwrap().unwrap();
+    adapter.ensure_thread(&key).await.unwrap();
+    adapter.ensure_thread(&key).await.unwrap();
+    lease.release().await;
+    lease.release().await;
+    assert!(
+        !peer_has_traffic(&mut peer).await,
+        "estimate release must keep remote following"
+    );
+    adapter.unfollow(&key).await;
+    let f = recv_within(&mut peer, 2).await;
+    assert_eq!(f["method"], "thread-stream-following-changed");
+    assert_eq!(f["params"]["following"], false);
+    adapter.shutdown().await;
+}
+
+#[tokio::test]
+async fn remote_stop_preserves_estimate_connection() {
+    use multi_agents_manager_lib::services::codex_desktop_ipc::owners::FollowPurpose;
+    let (io, mut peer) = ScriptedPeer::new();
+    let adapter = Arc::new(DesktopIpcAdapter::new(
+        Arc::new(StaticConnector::new(io)),
+        caps_open_profile(),
+    ));
+    let hub =
+        CodexControlHub::with_adapter(DeviceStore::Owned(shared_conn()), adapter.clone(), true);
+    let key = ThreadKey {
+        host_id: "local".into(),
+        thread_id: "00000000-0000-4000-8000-000000000003".into(),
+    };
+    let other = adapter.clone();
+    let k = key.clone();
+    let task = tokio::spawn(async move {
+        other
+            .acquire_following(&k, FollowPurpose::TokenizerEstimate)
+            .await
+    });
+    drive_ensure(&mut peer, &key.thread_id, vec![], "idle").await;
+    let lease = task.await.unwrap().unwrap();
+    hub.stop();
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(2),
+        adapter.start_turn(&key, "stopped-action", "test", "message"),
+    )
+    .await
+    .expect("stopped write must resolve");
+    assert_eq!(outcome.delivery, Delivery::NotSent);
+    assert!(
+        !adapter.is_stopping(),
+        "remote stop must not stop active estimate connection"
+    );
+    assert!(!peer_has_traffic(&mut peer).await);
+    lease.release().await;
+    adapter.shutdown().await;
+}
+
+#[tokio::test]
+async fn stale_remote_write_stays_blocked_after_stop_and_resume() {
+    use multi_agents_manager_lib::services::codex_desktop_ipc::owners::FollowPurpose;
+    let (io, mut peer) = ScriptedPeer::new();
+    let adapter = Arc::new(DesktopIpcAdapter::new(
+        Arc::new(StaticConnector::new(io)),
+        caps_open_profile(),
+    ));
+    let hub =
+        CodexControlHub::with_adapter(DeviceStore::Owned(shared_conn()), adapter.clone(), true);
+    let key = ThreadKey {
+        host_id: "local".into(),
+        thread_id: "00000000-0000-4000-8000-000000000004".into(),
+    };
+    let other = adapter.clone();
+    let k = key.clone();
+    let task = tokio::spawn(async move {
+        other
+            .acquire_following(&k, FollowPurpose::TokenizerEstimate)
+            .await
+    });
+    drive_ensure(&mut peer, &key.thread_id, vec![], "idle").await;
+    let lease = task.await.unwrap().unwrap();
+    let gate = Arc::new(tokio::sync::Notify::new());
+    adapter.set_write_guard_gate(Some(gate.clone()));
+    let other = adapter.clone();
+    let k = key.clone();
+    let task = tokio::spawn(async move {
+        other
+            .start_turn(&k, "old-action", "test", "client-id")
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !adapter.write_guard_gate_reached() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("write gate not reached");
+    hub.stop();
+    adapter.resume();
+    gate.notify_one();
+    let outcome = tokio::time::timeout(Duration::from_secs(2), task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(outcome.delivery, Delivery::NotSent);
+    assert!(
+        !peer_has_traffic(&mut peer).await,
+        "stale write must not reach peer"
+    );
+    lease.release().await;
+    adapter.shutdown().await;
+}
+
+#[tokio::test]
+async fn cancelled_estimate_acquire_does_not_pin_connection() {
+    use multi_agents_manager_lib::services::codex_desktop_ipc::owners::FollowPurpose;
+    let (io, mut peer) = ScriptedPeer::new();
+    let adapter = Arc::new(DesktopIpcAdapter::new(
+        Arc::new(StaticConnector::new(io)),
+        caps_open_profile(),
+    ));
+    let key = ThreadKey {
+        host_id: "local".into(),
+        thread_id: "00000000-0000-4000-8000-000000000005".into(),
+    };
+    let other = adapter.clone();
+    let task = tokio::spawn(async move {
+        other
+            .acquire_following(&key, FollowPurpose::TokenizerEstimate)
+            .await
+    });
+    let init = recv_within(&mut peer, 2).await;
+    assert_eq!(init["method"], "initialize");
+    task.abort();
+    let _ = task.await;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !adapter.begin_remote_shutdown() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("cancelled acquisition must release the connection pin");
+    adapter.shutdown().await;
+}
+
+#[tokio::test]
+async fn dropped_estimate_lease_releases_wire_following() {
+    use multi_agents_manager_lib::services::codex_desktop_ipc::owners::FollowPurpose;
+    let (io, mut peer) = ScriptedPeer::new();
+    let adapter = Arc::new(DesktopIpcAdapter::new(
+        Arc::new(StaticConnector::new(io)),
+        caps_open_profile(),
+    ));
+    let key = ThreadKey {
+        host_id: "local".into(),
+        thread_id: "00000000-0000-4000-8000-000000000006".into(),
+    };
+    let other = adapter.clone();
+    let k = key.clone();
+    let task = tokio::spawn(async move {
+        other
+            .acquire_following(&k, FollowPurpose::TokenizerEstimate)
+            .await
+    });
+    drive_ensure(&mut peer, &key.thread_id, vec![], "idle").await;
+    drop(task.await.unwrap().unwrap());
+    let f = recv_within(&mut peer, 2).await;
+    assert_eq!(f["method"], "thread-stream-following-changed");
+    assert_eq!(f["params"]["following"], false);
+    adapter.shutdown().await;
+}
+
+#[tokio::test]
+async fn estimate_can_connect_after_remote_stopped() {
+    use multi_agents_manager_lib::services::codex_desktop_ipc::owners::FollowPurpose;
+    let (io, mut peer) = ScriptedPeer::new();
+    let adapter = Arc::new(DesktopIpcAdapter::new(
+        Arc::new(StaticConnector::new(io)),
+        caps_open_profile(),
+    ));
+    assert!(adapter.begin_remote_shutdown());
+    let key = ThreadKey {
+        host_id: "local".into(),
+        thread_id: "00000000-0000-4000-8000-000000000007".into(),
+    };
+    let other = adapter.clone();
+    let k = key.clone();
+    let mut task = tokio::spawn(async move {
+        other
+            .acquire_following(&k, FollowPurpose::TokenizerEstimate)
+            .await
+    });
+    tokio::select! {
+        result=&mut task => panic!("estimate acquire ended before handshake: {}",result.is_ok()),
+        _=drive_ensure(&mut peer,&key.thread_id,vec![],"idle") => {}
+    }
+    let lease = task.await.unwrap().unwrap();
+    let outcome = adapter.start_turn(&key, "action", "test", "id").await;
+    assert_eq!(outcome.delivery, Delivery::NotSent);
+    lease.release().await;
+}
+
+#[tokio::test]
+async fn stopped_remote_cannot_reacquire_shared_estimate_following() {
+    use multi_agents_manager_lib::services::codex_desktop_ipc::owners::FollowPurpose;
+    let (io, mut peer) = ScriptedPeer::new();
+    let adapter = Arc::new(DesktopIpcAdapter::new(
+        Arc::new(StaticConnector::new(io)),
+        caps_open_profile(),
+    ));
+    let hub =
+        CodexControlHub::with_adapter(DeviceStore::Owned(shared_conn()), adapter.clone(), true);
+    let key = ThreadKey {
+        host_id: "local".into(),
+        thread_id: "00000000-0000-4000-8000-000000000008".into(),
+    };
+    let other = adapter.clone();
+    let k = key.clone();
+    let task = tokio::spawn(async move {
+        other
+            .acquire_following(&k, FollowPurpose::TokenizerEstimate)
+            .await
+    });
+    drive_ensure(&mut peer, &key.thread_id, vec![], "idle").await;
+    let lease = task.await.unwrap().unwrap();
+    hub.stop();
+    assert!(adapter.ensure_thread(&key).await.is_err());
+    lease.release().await;
+}
+
+#[tokio::test]
+async fn remote_stop_releases_remote_only_threads_while_estimate_remains() {
+    use multi_agents_manager_lib::services::codex_desktop_ipc::owners::FollowPurpose;
+    let (io, mut peer) = ScriptedPeer::new();
+    let adapter = Arc::new(DesktopIpcAdapter::new(
+        Arc::new(StaticConnector::new(io)),
+        caps_open_profile(),
+    ));
+    let hub =
+        CodexControlHub::with_adapter(DeviceStore::Owned(shared_conn()), adapter.clone(), true);
+    let remote = ThreadKey {
+        host_id: "local".into(),
+        thread_id: "00000000-0000-4000-8000-000000000009".into(),
+    };
+    let estimate = ThreadKey {
+        host_id: "local".into(),
+        thread_id: "00000000-0000-4000-8000-000000000010".into(),
+    };
+    let a = adapter.clone();
+    let k = remote.clone();
+    let t = tokio::spawn(async move { a.ensure_thread(&k).await });
+    drive_ensure(&mut peer, &remote.thread_id, vec![], "idle").await;
+    t.await.unwrap().unwrap();
+    let a = adapter.clone();
+    let k = estimate.clone();
+    let t = tokio::spawn(async move {
+        a.acquire_following(&k, FollowPurpose::TokenizerEstimate)
+            .await
+    });
+    let disc = recv_within(&mut peer, 2).await;
+    assert_eq!(disc["method"], "thread-owner-discovery");
+    peer.send(&discovery_response(
+        disc["requestId"].as_str().unwrap(),
+        "owner-1",
+    ))
+    .await;
+    let follow = recv_within(&mut peer, 2).await;
+    assert_eq!(follow["params"]["following"], true);
+    peer.send(&serde_json::json!({"type":"broadcast","method":"thread-stream-state-changed","version":11,"sourceClientId":"owner-1","params":{"conversationId":estimate.thread_id,"hostId":"local","change":{"type":"snapshot","revision":7,"conversationState":{"turns":[],"requests":[],"threadRuntimeStatus":{"type":"idle"},"turnHistory":codex_fixture::canonical_turn_history(serde_json::json!({}),serde_json::json!([]))}}}})).await;
+    let lease = t.await.unwrap().unwrap();
+    hub.stop();
+    let release = recv_within(&mut peer, 2).await;
+    assert_eq!(release["params"]["conversationId"], remote.thread_id);
+    assert_eq!(release["params"]["following"], false);
+    assert!(!peer_has_traffic(&mut peer).await);
+    lease.release().await;
+}
+
+#[tokio::test]
+async fn body_subscription_receives_verified_snapshot_baseline() {
+    use multi_agents_manager_lib::services::codex_desktop_ipc::{
+        observation::{BodyChange, BodyEvent},
+        owners::FollowPurpose,
+    };
+    let (io, mut peer) = ScriptedPeer::new();
+    let adapter = Arc::new(DesktopIpcAdapter::new(
+        Arc::new(StaticConnector::new(io)),
+        caps_open_profile(),
+    ));
+    let mut events = adapter.subscribe_body_events();
+    let key = ThreadKey {
+        host_id: "local".into(),
+        thread_id: "00000000-0000-4000-8000-000000000011".into(),
+    };
+    let a = adapter.clone();
+    let k = key.clone();
+    let t = tokio::spawn(async move {
+        a.acquire_following(&k, FollowPurpose::TokenizerEstimate)
+            .await
+    });
+    drive_ensure(&mut peer, &key.thread_id, vec![], "idle").await;
+    let lease = t.await.unwrap().unwrap();
+    let event = tokio::time::timeout(Duration::from_secs(1), events.recv())
+        .await
+        .expect("baseline event missing");
+    assert!(
+        matches!(event,Some(BodyEvent::Frame(frame)) if frame.revision==7 && frame.changes.iter().any(|c|matches!(c,BodyChange::Baseline)))
+    );
+    lease.release().await;
+    adapter.shutdown().await;
+}
+
+#[tokio::test]
+async fn body_events_follow_verified_patch_and_completion() {
+    use multi_agents_manager_lib::services::{
+        codex_desktop_ipc::{observation::BodyEvent, owners::FollowPurpose},
+        tps::body_observer::BodyObserver,
+    };
+    let (io, mut peer) = ScriptedPeer::new();
+    let adapter = Arc::new(DesktopIpcAdapter::new(
+        Arc::new(StaticConnector::new(io)),
+        caps_open_profile(),
+    ));
+    let mut events = adapter.subscribe_body_events();
+    let key = ThreadKey {
+        host_id: "local".into(),
+        thread_id: "00000000-0000-4000-8000-000000000012".into(),
+    };
+    let a = adapter.clone();
+    let k = key.clone();
+    let t = tokio::spawn(async move {
+        a.acquire_following(&k, FollowPurpose::TokenizerEstimate)
+            .await
+    });
+    drive_ensure(&mut peer, &key.thread_id, vec![], "idle").await;
+    let lease = t.await.unwrap().unwrap();
+    let mut observer = BodyObserver::default();
+    let baseline = tokio::time::timeout(Duration::from_secs(2), events.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    if let BodyEvent::Frame(f) = baseline {
+        assert!(observer.on_frame(f).is_empty())
+    } else {
+        panic!("unexpected loss")
+    }
+    let turn = "turn:new";
+    let patches = vec![
+        serde_json::json!([{ "op":"add", "path":["turnHistory","history","entitiesByKey",turn], "value":{"turnId":"new","status":"inProgress","params":{"collaborationMode":{"settings":{"model":"test-model"}}},"items":[]} }, {"op":"add","path":["turnHistory","history","islands",0,"entries",1],"value":{"key":turn,"value":turn}}]),
+        serde_json::json!([{ "op":"add","path":["turnHistory","history","entitiesByKey",turn,"items",0],"value":{"type":"agentMessage","id":"item","text":""}}]),
+        serde_json::json!([{ "op":"replace","path":["turnHistory","history","entitiesByKey",turn,"items",0,"text"],"value":"hello"}]),
+        serde_json::json!([{ "op":"replace","path":["turnHistory","history","entitiesByKey",turn,"items",0,"text"],"value":"hello world"}]),
+        serde_json::json!([{ "op":"replace","path":["turnHistory","history","entitiesByKey",turn,"status"],"value":"completed"}]),
+    ];
+    let mut finished = Vec::new();
+    for (i, patch) in patches.into_iter().enumerate() {
+        let base = 7 + i as u64;
+        peer.send(&serde_json::json!({"type":"broadcast","method":"thread-stream-state-changed","version":11,"sourceClientId":"owner-1","params":{"conversationId":key.thread_id,"hostId":"local","change":{"type":"patches","baseRevision":base,"revision":base+1,"patches":patch}}})).await;
+        let event = tokio::time::timeout(Duration::from_secs(2), events.recv())
+            .await
+            .expect("patch event missing")
+            .unwrap();
+        if let BodyEvent::Frame(f) = event {
+            finished.extend(observer.on_frame(f));
+        } else {
+            panic!("unexpected loss")
+        }
+    }
+    assert_eq!(finished.len(), 1);
+    assert_eq!(finished[0].text, "hello world");
+    assert_eq!(finished[0].model.as_deref(), Some("test-model"));
+    lease.release().await;
+    adapter.shutdown().await;
+}
+
+#[tokio::test]
+async fn owner_disconnect_invalidates_pending_body_before_refollow() {
+    use multi_agents_manager_lib::services::codex_desktop_ipc::{
+        observation::BodyEvent, owners::FollowPurpose,
+    };
+    let (io, mut peer) = ScriptedPeer::new();
+    let adapter = Arc::new(DesktopIpcAdapter::new(
+        Arc::new(StaticConnector::new(io)),
+        caps_open_profile(),
+    ));
+    let mut events = adapter.subscribe_body_events();
+    let key = ThreadKey {
+        host_id: "local".into(),
+        thread_id: "00000000-0000-4000-8000-000000000013".into(),
+    };
+    let a = adapter.clone();
+    let k = key.clone();
+    let task = tokio::spawn(async move {
+        a.acquire_following(&k, FollowPurpose::TokenizerEstimate)
+            .await
+    });
+    drive_ensure(&mut peer, &key.thread_id, vec![], "idle").await;
+    let lease = task.await.unwrap().unwrap();
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(2), events.recv())
+            .await
+            .unwrap(),
+        Some(BodyEvent::Frame(_))
+    ));
+    peer.send(&serde_json::json!({"type":"broadcast","method":"client-status-changed","params":{"clientId":"owner-1","status":"disconnected"}})).await;
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(2), events.recv())
+            .await
+            .expect("owner loss notification missing"),
+        Some(BodyEvent::Lost)
+    ));
+    lease.release().await;
+    adapter.shutdown().await;
+}
+
+#[tokio::test]
+async fn estimate_join_and_release_rebase_shared_remote_mirror() {
+    use multi_agents_manager_lib::services::codex_desktop_ipc::{
+        observation::{BodyChange, BodyEvent},
+        owners::FollowPurpose,
+    };
+    let (io, mut peer) = ScriptedPeer::new();
+    let adapter = Arc::new(DesktopIpcAdapter::new(
+        Arc::new(StaticConnector::new(io)),
+        caps_open_profile(),
+    ));
+    let key = ThreadKey {
+        host_id: "local".into(),
+        thread_id: "00000000-0000-4000-8000-000000000014".into(),
+    };
+    let a = adapter.clone();
+    let k = key.clone();
+    let t = tokio::spawn(async move { a.ensure_thread(&k).await });
+    drive_ensure(&mut peer, &key.thread_id, vec![], "idle").await;
+    t.await.unwrap().unwrap();
+    let mut events = adapter.subscribe_body_events();
+    let lease = adapter
+        .acquire_following(&key, FollowPurpose::TokenizerEstimate)
+        .await
+        .unwrap();
+    let event = tokio::time::timeout(Duration::from_secs(1), events.recv())
+        .await
+        .expect("joining must emit baseline");
+    assert!(
+        matches!(event,Some(BodyEvent::Frame(f)) if f.changes.iter().any(|c|matches!(c,BodyChange::Baseline)))
+    );
+    lease.release().await;
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(1), events.recv())
+            .await
+            .expect("release must invalidate candidates"),
+        Some(BodyEvent::Lost)
+    ));
+    assert!(!peer_has_traffic(&mut peer).await);
+    adapter.unfollow(&key).await;
+    adapter.shutdown().await;
+}
+
+#[tokio::test]
+async fn body_event_overflow_invalidates_without_blocking_read_only_rpc() {
+    use multi_agents_manager_lib::services::{
+        codex_desktop_ipc::{observation::BodyEvent, owners::FollowPurpose},
+        tps::body_observer::BodyObserver,
+    };
+    let (io, mut peer) = ScriptedPeer::new();
+    let adapter = Arc::new(DesktopIpcAdapter::new(
+        Arc::new(StaticConnector::new(io)),
+        caps_open_profile(),
+    ));
+    let mut events = adapter.subscribe_body_events();
+    let key = ThreadKey {
+        host_id: "local".into(),
+        thread_id: "00000000-0000-4000-8000-000000000015".into(),
+    };
+    let a = adapter.clone();
+    let k = key.clone();
+    let t = tokio::spawn(async move {
+        a.acquire_following(&k, FollowPurpose::TokenizerEstimate)
+            .await
+    });
+    drive_ensure(&mut peer, &key.thread_id, vec![], "idle").await;
+    let lease = t.await.unwrap().unwrap();
+    let mut observer = BodyObserver::default();
+    let first = tokio::time::timeout(Duration::from_secs(2), events.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let scope = if let BodyEvent::Frame(f) = first {
+        let scope = f.scope.clone();
+        observer.on_frame(f);
+        scope
+    } else {
+        panic!("expected baseline")
+    };
+    let turn = "turn:overflow";
+    let changes = vec![
+        serde_json::json!([{"op":"add","path":["turnHistory","history","entitiesByKey",turn],"value":{"turnId":"overflow","status":"inProgress","items":[]}},{"op":"add","path":["turnHistory","history","islands",0,"entries",1],"value":{"key":turn,"value":turn}}]),
+        serde_json::json!([{"op":"add","path":["turnHistory","history","entitiesByKey",turn,"items",0],"value":{"type":"agentMessage","id":"i","text":""}}]),
+        serde_json::json!([{"op":"replace","path":["turnHistory","history","entitiesByKey",turn,"items",0,"text"],"value":"a"}]),
+        serde_json::json!([{"op":"replace","path":["turnHistory","history","entitiesByKey",turn,"items",0,"text"],"value":"ab"}]),
+    ];
+    for (i, patches) in changes.into_iter().enumerate() {
+        let base = 7 + i as u64;
+        peer.send(&serde_json::json!({"type":"broadcast","method":"thread-stream-state-changed","sourceClientId":"owner-1","params":{"conversationId":key.thread_id,"change":{"type":"patches","baseRevision":base,"revision":base+1,"patches":patches}}})).await;
+        let event = tokio::time::timeout(Duration::from_secs(2), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        if let BodyEvent::Frame(f) = event {
+            assert!(observer.on_frame(f).is_empty())
+        } else {
+            panic!("unexpected loss")
+        }
+    }
+    for base in 11..141_u64 {
+        peer.send(&serde_json::json!({"type":"broadcast","method":"thread-stream-state-changed","sourceClientId":"owner-1","params":{"conversationId":key.thread_id,"change":{"type":"patches","baseRevision":base,"revision":base+1,"patches":[{"op":"replace","path":["threadRuntimeStatus"],"value":{"type":"idle"}}]}}})).await;
+    }
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if adapter.projection(&key).await.revision == Some(141) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("full observation queue blocked mirror");
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(2), events.recv())
+            .await
+            .unwrap(),
+        Some(BodyEvent::Lost)
+    ));
+    observer.invalidate(&scope);
+    let second = ThreadKey {
+        host_id: "local".into(),
+        thread_id: "00000000-0000-4000-8000-000000000016".into(),
+    };
+    let a = adapter.clone();
+    let k = second.clone();
+    let rpc = tokio::spawn(async move { a.ensure_thread(&k).await });
+    let disc = recv_within(&mut peer, 2).await;
+    assert_eq!(disc["method"], "thread-owner-discovery");
+    peer.send(&discovery_response(
+        disc["requestId"].as_str().unwrap(),
+        "owner-1",
+    ))
+    .await;
+    let follow = recv_within(&mut peer, 2).await;
+    assert_eq!(follow["params"]["following"], true);
+    peer.send(&serde_json::json!({"type":"broadcast","method":"thread-stream-state-changed","sourceClientId":"owner-1","params":{"conversationId":second.thread_id,"change":{"type":"snapshot","revision":1,"conversationState":{"turns":[],"requests":[],"threadRuntimeStatus":{"type":"idle"},"turnHistory":codex_fixture::canonical_turn_history(serde_json::json!({}),serde_json::json!([]))}}}})).await;
+    tokio::time::timeout(Duration::from_secs(2), rpc)
+        .await
+        .expect("read-only RPC blocked")
+        .unwrap()
+        .unwrap();
+    peer.send(&serde_json::json!({"type":"broadcast","method":"thread-stream-state-changed","sourceClientId":"owner-1","params":{"conversationId":key.thread_id,"change":{"type":"patches","baseRevision":141,"revision":142,"patches":[{"op":"replace","path":["turnHistory","history","entitiesByKey",turn,"status"],"value":"completed"}]}}})).await;
+    let event = tokio::time::timeout(Duration::from_secs(2), events.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    if let BodyEvent::Frame(f) = event {
+        assert!(observer.on_frame(f).is_empty());
+    }
+    lease.release().await;
+    adapter.unfollow(&second).await;
+    adapter.shutdown().await;
+}
+
+async fn drive_additional_read_follow(peer: &mut ScriptedPeer, thread: &str) {
+    let disc = recv_within(peer, 2).await;
+    assert_eq!(disc["method"], "thread-owner-discovery");
+    peer.send(&discovery_response(
+        disc["requestId"].as_str().unwrap(),
+        "owner-1",
+    ))
+    .await;
+    let follow = recv_within(peer, 2).await;
+    assert_eq!(follow["params"]["following"], true);
+    peer.send(&serde_json::json!({"type":"broadcast","method":"thread-stream-state-changed","sourceClientId":"owner-1","params":{"conversationId":thread,"change":{"type":"snapshot","revision":1,"conversationState":{"turns":[],"requests":[],"threadRuntimeStatus":{"type":"idle"},"turnHistory":codex_fixture::canonical_turn_history(serde_json::json!({}),serde_json::json!([]))}}}})).await;
+}
+
+#[tokio::test]
+async fn remote_at_capacity_evicts_estimate_on_wire_and_old_ticket_is_harmless() {
+    use multi_agents_manager_lib::services::codex_desktop_ipc::{
+        observation::BodyEvent,
+        owners::{FollowPurpose, MAX_FOLLOWINGS},
+    };
+    let (io, mut peer) = ScriptedPeer::new();
+    let adapter = Arc::new(DesktopIpcAdapter::new(
+        Arc::new(StaticConnector::new(io)),
+        caps_open_profile(),
+    ));
+    let mut events = adapter.subscribe_body_events();
+    let mut leases = Vec::new();
+    let mut keys = Vec::new();
+    for i in 0..MAX_FOLLOWINGS {
+        let key = ThreadKey {
+            host_id: "local".into(),
+            thread_id: format!("00000000-0000-4000-8000-{i:012}"),
+        };
+        let a = adapter.clone();
+        let k = key.clone();
+        let task = tokio::spawn(async move {
+            a.acquire_following(&k, FollowPurpose::TokenizerEstimate)
+                .await
+        });
+        if i == 0 {
+            drive_ensure(&mut peer, &key.thread_id, vec![], "idle").await;
+        } else {
+            drive_additional_read_follow(&mut peer, &key.thread_id).await;
+        }
+        leases.push(task.await.unwrap().unwrap());
+        keys.push(key);
+    }
+    let remote = ThreadKey {
+        host_id: "local".into(),
+        thread_id: "00000000-0000-4000-8000-999999999999".into(),
+    };
+    let a = adapter.clone();
+    let k = remote.clone();
+    let task = tokio::spawn(async move { a.ensure_thread(&k).await });
+    let eviction = recv_within(&mut peer, 2).await;
+    assert_eq!(eviction["method"], "thread-stream-following-changed");
+    assert_eq!(eviction["params"]["conversationId"], keys[0].thread_id);
+    assert_eq!(eviction["params"]["following"], false);
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(2), events.recv())
+            .await
+            .unwrap(),
+        Some(BodyEvent::Lost)
+    ));
+    drive_additional_read_follow(&mut peer, &remote.thread_id).await;
+    task.await.unwrap().unwrap();
+    adapter.unfollow(&remote).await;
+    let gone = recv_within(&mut peer, 2).await;
+    assert_eq!(gone["params"]["following"], false);
+    let a = adapter.clone();
+    let k = keys[0].clone();
+    let task = tokio::spawn(async move {
+        a.acquire_following(&k, FollowPurpose::TokenizerEstimate)
+            .await
+    });
+    drive_additional_read_follow(&mut peer, &keys[0].thread_id).await;
+    let new_lease = task.await.unwrap().unwrap();
+    leases[0].release().await;
+    assert!(
+        !peer_has_traffic(&mut peer).await,
+        "old evicted ticket cannot cancel new following"
+    );
+    new_lease.release().await;
+    let gone = recv_within(&mut peer, 2).await;
+    assert_eq!(gone["params"]["following"], false);
+    drop(leases);
+    adapter.shutdown().await;
+}
+
+#[tokio::test]
+async fn concurrent_last_release_and_remote_acquire_never_cancel_new_follow() {
+    use multi_agents_manager_lib::services::codex_desktop_ipc::owners::FollowPurpose;
+    let (io, mut peer) = ScriptedPeer::new();
+    let adapter = Arc::new(DesktopIpcAdapter::new(
+        Arc::new(StaticConnector::new(io)),
+        caps_open_profile(),
+    ));
+    let key = ThreadKey {
+        host_id: "local".into(),
+        thread_id: "00000000-0000-4000-8000-000000000017".into(),
+    };
+    let a = adapter.clone();
+    let k = key.clone();
+    let t = tokio::spawn(async move {
+        a.acquire_following(&k, FollowPurpose::TokenizerEstimate)
+            .await
+    });
+    drive_ensure(&mut peer, &key.thread_id, vec![], "idle").await;
+    let lease = t.await.unwrap().unwrap();
+    let gate = Arc::new(tokio::sync::Notify::new());
+    adapter.set_release_follow_gate_for_tests(Some(gate.clone()));
+    let release = tokio::spawn(async move { lease.release().await });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !adapter.release_follow_gate_reached_for_tests() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("release gate");
+    let a = adapter.clone();
+    let k = key.clone();
+    let mut ensure = tokio::spawn(async move { a.ensure_thread(&k).await });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), &mut ensure)
+            .await
+            .is_err(),
+        "new acquisition must wait for prior release"
+    );
+    gate.notify_one();
+    let first = recv_within(&mut peer, 2).await;
+    if first["method"] == "thread-stream-following-changed" && first["params"]["following"] == false
+    {
+        drive_additional_read_follow(&mut peer, &key.thread_id).await;
+    } else {
+        panic!("old release did not finish before new follow");
+    }
+    ensure.await.unwrap().unwrap();
+    tokio::time::timeout(Duration::from_secs(2), release)
+        .await
+        .unwrap()
+        .unwrap();
+    adapter.set_release_follow_gate_for_tests(None);
+    adapter.unfollow(&key).await;
+    adapter.shutdown().await;
+}
+
+#[tokio::test]
+async fn stale_owner_patch_never_reaches_body_observer() {
+    use multi_agents_manager_lib::services::codex_desktop_ipc::{
+        observation::BodyEvent, owners::FollowPurpose,
+    };
+    let (io, mut peer) = ScriptedPeer::new();
+    let adapter = Arc::new(DesktopIpcAdapter::new(
+        Arc::new(StaticConnector::new(io)),
+        caps_open_profile(),
+    ));
+    let mut events = adapter.subscribe_body_events();
+    let key = ThreadKey {
+        host_id: "local".into(),
+        thread_id: "00000000-0000-4000-8000-000000000018".into(),
+    };
+    let a = adapter.clone();
+    let k = key.clone();
+    let t = tokio::spawn(async move {
+        a.acquire_following(&k, FollowPurpose::TokenizerEstimate)
+            .await
+    });
+    drive_ensure(&mut peer, &key.thread_id, vec![], "idle").await;
+    let lease = t.await.unwrap().unwrap();
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(2), events.recv())
+            .await
+            .unwrap(),
+        Some(BodyEvent::Frame(_))
+    ));
+    let patch = |owner: &str| serde_json::json!({"type":"broadcast","method":"thread-stream-state-changed","sourceClientId":owner,"params":{"conversationId":key.thread_id,"change":{"type":"patches","baseRevision":7,"revision":8,"patches":[{"op":"replace","path":["threadRuntimeStatus"],"value":{"type":"idle"}}]}}});
+    peer.send(&patch("stale-owner")).await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), events.recv())
+            .await
+            .is_err()
+    );
+    peer.send(&patch("owner-1")).await;
+    assert!(
+        matches!(tokio::time::timeout(Duration::from_secs(2),events.recv()).await.unwrap(),Some(BodyEvent::Frame(f)) if f.revision==8)
+    );
+    lease.release().await;
+    adapter.shutdown().await;
+}
+
+#[tokio::test]
+async fn initial_remote_unfollow_during_discovery_revokes_without_waiting_for_peer() {
+    let (io, mut peer) = ScriptedPeer::new();
+    let adapter = Arc::new(DesktopIpcAdapter::new(
+        Arc::new(StaticConnector::new(io)),
+        caps_open_profile(),
+    ));
+    let key = ThreadKey {
+        host_id: "local".into(),
+        thread_id: "00000000-0000-4000-8000-000000000019".into(),
+    };
+    let a = adapter.clone();
+    let k = key.clone();
+    let task = tokio::spawn(async move { a.ensure_thread(&k).await });
+    handshake(&mut peer, "owner-1").await;
+    let disc = recv_within(&mut peer, 2).await;
+    assert_eq!(disc["method"], "thread-owner-discovery");
+    tokio::time::timeout(Duration::from_millis(300), adapter.unfollow(&key))
+        .await
+        .expect("unfollow must not wait for discovery response");
+    peer.send(&discovery_response(
+        disc["requestId"].as_str().unwrap(),
+        "owner-1",
+    ))
+    .await;
+    let _ = tokio::time::timeout(Duration::from_secs(2), task)
+        .await
+        .unwrap();
+    assert!(
+        !peer_has_traffic(&mut peer).await,
+        "late discovery must not resurrect following"
+    );
+    adapter.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn body_arrival_time_precedes_delayed_mirror_processing() {
+    use multi_agents_manager_lib::services::codex_desktop_ipc::{
+        observation::BodyEvent, owners::FollowPurpose,
+    };
+    let (io, mut peer) = ScriptedPeer::new();
+    let adapter = Arc::new(DesktopIpcAdapter::new(
+        Arc::new(StaticConnector::new(io)),
+        caps_open_profile(),
+    ));
+    let mut events = adapter.subscribe_body_events();
+    let key = ThreadKey {
+        host_id: "local".into(),
+        thread_id: "00000000-0000-4000-8000-000000000020".into(),
+    };
+    let a = adapter.clone();
+    let k = key.clone();
+    let task = tokio::spawn(async move {
+        a.acquire_following(&k, FollowPurpose::TokenizerEstimate)
+            .await
+    });
+    drive_ensure(&mut peer, &key.thread_id, vec![], "idle").await;
+    let lease = task.await.unwrap().unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(2), events.recv())
+        .await
+        .unwrap();
+    let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    let resume_rx = Arc::new(StdMutex::new(resume_rx));
+    adapter.set_caps_observe_gate(Some(Arc::new(move |path| {
+        if path == "state_changed" {
+            let at = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as i64;
+            let _ = entered_tx.send(at);
+            let _ = resume_rx.lock().unwrap().recv();
+        }
+    })));
+    peer.send(&serde_json::json!({"type":"broadcast","method":"thread-stream-state-changed","sourceClientId":"owner-1","params":{"conversationId":key.thread_id,"change":{"type":"patches","baseRevision":7,"revision":8,"patches":[{"op":"replace","path":["threadRuntimeStatus"],"value":{"type":"idle"}}]}}})).await;
+    let gate_wall = tokio::time::timeout(Duration::from_secs(2), entered_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), events.recv())
+            .await
+            .is_err()
+    );
+    resume_tx.send(()).unwrap();
+    let event = tokio::time::timeout(Duration::from_secs(2), events.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(event,BodyEvent::Frame(f) if f.clock.wall_ms<=gate_wall));
+    adapter.set_caps_observe_gate(None);
+    lease.release().await;
+    adapter.shutdown().await;
+}
+
+#[tokio::test]
+async fn stop_reopen_at_writer_gate_rejects_stale_generation_without_wire_write() {
+    use multi_agents_manager_lib::services::codex_desktop_ipc::owners::FollowPurpose;
+    let (io, mut peer) = ScriptedPeer::new();
+    let adapter = Arc::new(DesktopIpcAdapter::new(
+        Arc::new(StaticConnector::new(io)),
+        caps_open_profile(),
+    ));
+    let key = ThreadKey {
+        host_id: "local".into(),
+        thread_id: "00000000-0000-4000-8000-000000000021".into(),
+    };
+    let a = adapter.clone();
+    let k = key.clone();
+    let t = tokio::spawn(async move {
+        a.acquire_following(&k, FollowPurpose::TokenizerEstimate)
+            .await
+    });
+    drive_ensure(&mut peer, &key.thread_id, vec![], "idle").await;
+    let lease = t.await.unwrap().unwrap();
+    let gate = Arc::new(tokio::sync::Notify::new());
+    adapter
+        .set_final_claim_gate_for_tests(Some(gate.clone()))
+        .await;
+    let a = adapter.clone();
+    let k = key.clone();
+    let task = tokio::spawn(async move { a.start_turn(&k, "old-action", "test", "id").await });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !adapter.final_claim_gate_reached().await {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("writer gate");
+    assert!(!adapter.begin_remote_shutdown());
+    adapter.resume();
+    gate.notify_one();
+    let outcome = tokio::time::timeout(Duration::from_secs(2), task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(outcome.delivery, Delivery::NotSent);
+    assert!(!peer_has_traffic(&mut peer).await);
+    adapter.set_final_claim_gate_for_tests(None).await;
+    lease.release().await;
+    adapter.shutdown().await;
+}
+
+#[tokio::test]
+async fn global_loss_rebaselines_other_observed_threads() {
+    use multi_agents_manager_lib::services::codex_desktop_ipc::{
+        observation::{BodyChange, BodyEvent},
+        owners::FollowPurpose,
+    };
+    let (io, mut peer) = ScriptedPeer::new();
+    let adapter = Arc::new(DesktopIpcAdapter::new(
+        Arc::new(StaticConnector::new(io)),
+        caps_open_profile(),
+    ));
+    let mut events = adapter.subscribe_body_events();
+    let b = ThreadKey {
+        host_id: "local".into(),
+        thread_id: "00000000-0000-4000-8000-000000000022".into(),
+    };
+    let a = ThreadKey {
+        host_id: "local".into(),
+        thread_id: "00000000-0000-4000-8000-000000000023".into(),
+    };
+    let work = adapter.clone();
+    let k = b.clone();
+    let t = tokio::spawn(async move {
+        work.acquire_following(&k, FollowPurpose::TokenizerEstimate)
+            .await
+    });
+    drive_ensure(&mut peer, &b.thread_id, vec![], "idle").await;
+    let lease_b = t.await.unwrap().unwrap();
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(2), events.recv())
+            .await
+            .unwrap(),
+        Some(BodyEvent::Frame(_))
+    ));
+    let work = adapter.clone();
+    let k = a.clone();
+    let t = tokio::spawn(async move {
+        work.acquire_following(&k, FollowPurpose::TokenizerEstimate)
+            .await
+    });
+    drive_additional_read_follow(&mut peer, &a.thread_id).await;
+    let lease_a = t.await.unwrap().unwrap();
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(2), events.recv())
+            .await
+            .unwrap(),
+        Some(BodyEvent::Frame(_))
+    ));
+    lease_a.release().await;
+    let _ = recv_within(&mut peer, 2).await;
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(2), events.recv())
+            .await
+            .unwrap(),
+        Some(BodyEvent::Lost)
+    ));
+    peer.send(&serde_json::json!({"type":"broadcast","method":"thread-stream-state-changed","sourceClientId":"owner-1","params":{"conversationId":b.thread_id,"change":{"type":"patches","baseRevision":7,"revision":8,"patches":[{"op":"replace","path":["threadRuntimeStatus"],"value":{"type":"idle"}}]}}})).await;
+    let event = tokio::time::timeout(Duration::from_secs(2), events.recv())
+        .await
+        .unwrap();
+    assert!(
+        matches!(event,Some(BodyEvent::Frame(f)) if f.changes.iter().any(|c|matches!(c,BodyChange::Baseline)))
+    );
+    lease_b.release().await;
+    adapter.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn old_owner_frame_paused_before_mirror_cannot_enter_new_owner_observation() {
+    use multi_agents_manager_lib::services::codex_desktop_ipc::{
+        observation::BodyEvent, owners::FollowPurpose,
+    };
+    let (io, mut peer) = ScriptedPeer::new();
+    let adapter = Arc::new(DesktopIpcAdapter::new(
+        Arc::new(StaticConnector::new(io)),
+        caps_open_profile(),
+    ));
+    let mut events = adapter.subscribe_body_events();
+    let key = ThreadKey {
+        host_id: "local".into(),
+        thread_id: "00000000-0000-4000-8000-000000000024".into(),
+    };
+    let a = adapter.clone();
+    let k = key.clone();
+    let task = tokio::spawn(async move {
+        a.acquire_following(&k, FollowPurpose::TokenizerEstimate)
+            .await
+    });
+    drive_ensure(&mut peer, &key.thread_id, vec![], "idle").await;
+    let old = task.await.unwrap().unwrap();
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(2), events.recv())
+            .await
+            .unwrap(),
+        Some(BodyEvent::Frame(_))
+    ));
+    let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    let resume_rx = Arc::new(StdMutex::new(resume_rx));
+    let fired = std::sync::atomic::AtomicBool::new(false);
+    adapter.set_caps_observe_gate(Some(Arc::new(move |path| {
+        if path == "state_changed" && !fired.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            let _ = entered_tx.send(());
+            let _ = resume_rx.lock().unwrap().recv();
+        }
+    })));
+    peer.send(&serde_json::json!({"type":"broadcast","method":"thread-stream-state-changed","sourceClientId":"owner-1","params":{"conversationId":key.thread_id,"change":{"type":"snapshot","revision":8,"conversationState":{"turns":[],"requests":[],"threadRuntimeStatus":{"type":"idle"},"turnHistory":codex_fixture::canonical_turn_history(serde_json::json!({}),serde_json::json!([]))}}}})).await;
+    tokio::time::timeout(Duration::from_secs(2), entered_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    old.release().await;
+    let off = recv_within(&mut peer, 2).await;
+    assert_eq!(off["params"]["following"], false);
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(2), events.recv())
+            .await
+            .unwrap(),
+        Some(BodyEvent::Lost)
+    ));
+    let a = adapter.clone();
+    let k = key.clone();
+    let next = tokio::spawn(async move {
+        a.acquire_following(&k, FollowPurpose::TokenizerEstimate)
+            .await
+    });
+    let disc = recv_within(&mut peer, 2).await;
+    assert_eq!(disc["method"], "thread-owner-discovery");
+    peer.send(&discovery_response(
+        disc["requestId"].as_str().unwrap(),
+        "owner-2",
+    ))
+    .await;
+    let follow = recv_within(&mut peer, 2).await;
+    assert_eq!(follow["params"]["following"], true);
+    resume_tx.send(()).unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(150), events.recv())
+            .await
+            .is_err(),
+        "old owner frame must be discarded"
+    );
+    peer.send(&serde_json::json!({"type":"broadcast","method":"thread-stream-state-changed","sourceClientId":"owner-2","params":{"conversationId":key.thread_id,"change":{"type":"snapshot","revision":1,"conversationState":{"turns":[],"requests":[],"threadRuntimeStatus":{"type":"idle"},"turnHistory":codex_fixture::canonical_turn_history(serde_json::json!({}),serde_json::json!([]))}}}})).await;
+    let new = tokio::time::timeout(Duration::from_secs(2), next)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(tokio::time::timeout(Duration::from_secs(2),events.recv()).await.unwrap(),Some(BodyEvent::Frame(f)) if f.scope.owner_generation>1)
+    );
+    adapter.set_caps_observe_gate(None);
+    new.release().await;
+    adapter.shutdown().await;
+}
+
+#[tokio::test]
+async fn stopping_estimate_preserves_remote_approval_dispatch() {
+    use multi_agents_manager_lib::services::codex_desktop_ipc::owners::FollowPurpose;
+    let mut f = fixture_ipc(vec![codex_app_session(THREAD)]);
+    let mut peer = f.peer.take().unwrap();
+    let (rk,tk)=follow_with_pending(&f,&mut peer,vec![serde_json::json!({"id":18,"method":"item/commandExecution/requestApproval","params":{"command":"test","cwd":"/test"}})]).await;
+    let key = ThreadKey {
+        host_id: "local".into(),
+        thread_id: THREAD.into(),
+    };
+    let lease = f
+        .state
+        .codex_control
+        .adapter
+        .acquire_following(&key, FollowPurpose::TokenizerEstimate)
+        .await
+        .unwrap();
+    lease.release().await;
+    assert!(!peer_has_traffic(&mut peer).await);
+    let body = serde_json::json!({"sessionId":THREAD,"actionId":"act-estimate-approval","requestKey":rk,"contextToken":tk,"action":"approve"});
+    let app = f.app.clone();
+    let task = tokio::spawn(async move {
+        app.oneshot(req(
+            "POST",
+            "/m/api/v1/codex/pending-response",
+            Some(COOKIE),
+            Some(body.to_string()),
+        ))
+        .await
+        .unwrap()
+    });
+    let frame = recv_within(&mut peer, 2).await;
+    assert_eq!(frame["method"], "thread-follower-command-approval-decision");
+    peer.send(&serde_json::json!({"type":"response","requestId":frame["requestId"],"resultType":"success","method":"thread-follower-command-approval-decision","result":{"ok":true}})).await;
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .status(),
+        200
+    );
+}
+
+#[tokio::test]
+async fn stopping_estimate_preserves_remote_message_dispatch() {
+    use multi_agents_manager_lib::services::codex_desktop_ipc::owners::FollowPurpose;
+    let mut f = fixture_ipc(vec![codex_app_session(THREAD)]);
+    let mut peer = f.peer.take().unwrap();
+    let key = ThreadKey {
+        host_id: "local".into(),
+        thread_id: THREAD.into(),
+    };
+    let adapter = f.state.codex_control.adapter.clone();
+    let a = adapter.clone();
+    let k = key.clone();
+    let ready = tokio::spawn(async move { a.ensure_thread(&k).await });
+    drive_ensure(&mut peer, THREAD, vec![], "idle").await;
+    ready.await.unwrap().unwrap();
+    let lease = adapter
+        .acquire_following(&key, FollowPurpose::TokenizerEstimate)
+        .await
+        .unwrap();
+    lease.release().await;
+    assert!(!peer_has_traffic(&mut peer).await);
+    let app = f.app.clone();
+    let body = send_body("隔离测试", Some("act-estimate-send"), false);
+    let task = tokio::spawn(async move {
+        app.oneshot(req(
+            "POST",
+            "/m/api/v1/session-send",
+            Some(COOKIE),
+            Some(body),
+        ))
+        .await
+        .unwrap()
+    });
+    let frame = recv_within(&mut peer, 2).await;
+    assert_eq!(frame["method"], "thread-follower-start-turn");
+    confirm_client_message_identity(&mut peer, &frame, "turn-estimate", "隔离测试", 8, "owner-1")
+        .await;
+    peer.send(&serde_json::json!({"type":"response","requestId":frame["requestId"],"resultType":"success","method":"thread-follower-start-turn","handledByClientId":"owner-1","result":{"turn":{"id":"turn-estimate","status":"inProgress"}}})).await;
+    let response = tokio::time::timeout(Duration::from_secs(10), task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(response.status(), 200);
+}

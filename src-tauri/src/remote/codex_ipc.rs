@@ -893,7 +893,8 @@ impl CodexControlHub {
         if !self.capable {
             return;
         }
-        self.adapter.begin_shutdown();
+        self.adapter.begin_remote_shutdown();
+        let generation = self.adapter.remote_generation();
         self.running.store(false, Ordering::SeqCst);
         if let Some(h) = self.sched.lock().unwrap_or_else(|e| e.into_inner()).take() {
             h.abort();
@@ -905,7 +906,9 @@ impl CodexControlHub {
         // IPC 回调边界不可 unwind → abort 整个进程（v0.6.1 三次切换开关闪退的根因，
         // WER 0xc0000409/FAST_FAIL=7 + mam.log panic 记录实证）
         let adapter = self.adapter.clone();
-        tauri::async_runtime::spawn(async move { adapter.shutdown().await });
+        tauri::async_runtime::spawn(
+            async move { adapter.finish_remote_shutdown(generation).await },
+        );
     }
 }
 

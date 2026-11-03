@@ -168,40 +168,134 @@ impl OwnerRegistry {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum FollowPurpose {
+    Remote,
+    TokenizerEstimate,
+}
+
 /// 跟随集合（有界 64；adapter 消费——看板/详情/有待发消息的 Thread 才跟随）。
 #[derive(Default)]
 pub struct FollowingSet {
-    keys: Vec<ThreadKey>,
+    keys: Vec<FollowingEntry>,
+    next_ticket: u64,
+}
+struct FollowingEntry {
+    key: ThreadKey,
+    remote: bool,
+    estimate_tickets: std::collections::HashSet<u64>,
 }
 
 impl FollowingSet {
-    pub fn is_following(&self, key: &ThreadKey) -> bool {
-        self.keys.contains(key)
+    pub fn acquire_estimate(&mut self, key: ThreadKey) -> Option<u64> {
+        let index = self.keys.iter().position(|entry| entry.key == key);
+        if index.is_none() && self.keys.len() >= MAX_FOLLOWINGS {
+            return None;
+        }
+        let ticket = self.next_ticket.checked_add(1)?;
+        self.next_ticket = ticket;
+        if let Some(index) = index {
+            self.keys[index].estimate_tickets.insert(ticket);
+        } else {
+            self.keys.push(FollowingEntry {
+                key,
+                remote: false,
+                estimate_tickets: [ticket].into_iter().collect(),
+            });
+        }
+        Some(ticket)
     }
-
-    /// 满员返回 false（不挤掉既有跟随）。
-    pub fn follow(&mut self, key: ThreadKey) -> bool {
-        if self.keys.contains(&key) {
+    /// 返回（票据存在，最后一个用途已释放）。旧票据绝不释放新跟随。
+    pub fn release_estimate(&mut self, key: &ThreadKey, ticket: u64) -> (bool, bool) {
+        let Some(index) = self.keys.iter().position(|entry| &entry.key == key) else {
+            return (false, false);
+        };
+        let entry = &mut self.keys[index];
+        if !entry.estimate_tickets.remove(&ticket) {
+            return (false, false);
+        }
+        if !entry.remote && entry.estimate_tickets.is_empty() {
+            self.keys.remove(index);
+            (true, true)
+        } else {
+            (true, false)
+        }
+    }
+    /// 满员时仅让测速独占的跟随让位，调用方负责撤销旧跟随并使候选失效。
+    pub fn reserve_remote(&mut self, key: ThreadKey) -> Option<Option<ThreadKey>> {
+        if self.is_following(&key) || self.keys.len() < MAX_FOLLOWINGS {
+            return self.follow(key).then_some(None);
+        }
+        let index = self
+            .keys
+            .iter()
+            .position(|entry| !entry.remote && !entry.estimate_tickets.is_empty())?;
+        let victim = self.keys.remove(index).key;
+        let reserved = self.follow(key);
+        debug_assert!(reserved);
+        Some(Some(victim))
+    }
+    pub fn acquire_purpose(&mut self, key: ThreadKey, purpose: FollowPurpose) -> bool {
+        if purpose == FollowPurpose::TokenizerEstimate {
+            return self.acquire_estimate(key).is_some();
+        }
+        if let Some(entry) = self.keys.iter_mut().find(|entry| entry.key == key) {
+            entry.remote = true;
             return true;
         }
         if self.keys.len() >= MAX_FOLLOWINGS {
             return false;
         }
-        self.keys.push(key);
+        self.keys.push(FollowingEntry {
+            key,
+            remote: true,
+            estimate_tickets: Default::default(),
+        });
         true
     }
-
-    /// 退出跟随（释放名额）。
-    pub fn unfollow(&mut self, key: &ThreadKey) -> bool {
-        let before = self.keys.len();
-        self.keys.retain(|k| k != key);
-        self.keys.len() != before
+    pub fn release_purpose(&mut self, key: &ThreadKey, purpose: FollowPurpose) -> bool {
+        let Some(index) = self.keys.iter().position(|entry| &entry.key == key) else {
+            return false;
+        };
+        if purpose == FollowPurpose::TokenizerEstimate {
+            let Some(ticket) = self.keys[index].estimate_tickets.iter().next().copied() else {
+                return false;
+            };
+            return self.release_estimate(key, ticket).1;
+        }
+        let entry = &mut self.keys[index];
+        entry.remote = false;
+        if entry.estimate_tickets.is_empty() {
+            self.keys.remove(index);
+            true
+        } else {
+            false
+        }
     }
-
+    pub fn is_estimate_following(&self, key: &ThreadKey) -> bool {
+        self.keys
+            .iter()
+            .any(|entry| &entry.key == key && !entry.estimate_tickets.is_empty())
+    }
+    pub fn remote_keys(&self) -> Vec<ThreadKey> {
+        self.keys
+            .iter()
+            .filter(|entry| entry.remote)
+            .map(|entry| entry.key.clone())
+            .collect()
+    }
+    pub fn is_following(&self, key: &ThreadKey) -> bool {
+        self.keys.iter().any(|entry| &entry.key == key)
+    }
+    pub fn follow(&mut self, key: ThreadKey) -> bool {
+        self.acquire_purpose(key, FollowPurpose::Remote)
+    }
+    pub fn unfollow(&mut self, key: &ThreadKey) -> bool {
+        self.release_purpose(key, FollowPurpose::Remote)
+    }
     pub fn len(&self) -> usize {
         self.keys.len()
     }
-
     pub fn is_empty(&self) -> bool {
         self.keys.is_empty()
     }
@@ -413,6 +507,61 @@ mod tests {
         // 佐证 registry epoch 仍停在 2：同 epoch 的后续绑定照常生效
         let other = r.bind(key("t2"), "owner-a".into(), 2);
         assert!(r.is_current(&other));
+    }
+
+    #[test]
+    fn evicted_old_estimate_lease_cannot_release_reacquired_following() {
+        let mut set = FollowingSet::default();
+        let target = key("target");
+        let old = set.acquire_estimate(target.clone()).unwrap();
+        for i in 1..MAX_FOLLOWINGS {
+            set.acquire_estimate(key(&format!("e{i}"))).unwrap();
+        }
+        assert_eq!(
+            set.reserve_remote(key("remote")).unwrap(),
+            Some(target.clone())
+        );
+        assert!(set.release_purpose(&key("remote"), FollowPurpose::Remote));
+        let new = set.acquire_estimate(target.clone()).unwrap();
+        assert_ne!(old, new);
+        assert_eq!(set.release_estimate(&target, old), (false, false));
+        assert!(set.is_estimate_following(&target));
+        assert_eq!(set.release_estimate(&target, new), (true, true));
+    }
+
+    #[test]
+    fn remote_reservation_evicts_estimate_only_at_capacity() {
+        let mut set = FollowingSet::default();
+        for i in 0..MAX_FOLLOWINGS {
+            assert!(set.acquire_purpose(key(&format!("e{i}")), FollowPurpose::TokenizerEstimate));
+        }
+        let victim = set
+            .reserve_remote(key("remote"))
+            .expect("remote must have priority")
+            .expect("estimate victim");
+        assert!(!set.is_following(&victim));
+        assert!(set.is_following(&key("remote")));
+        assert_eq!(set.len(), MAX_FOLLOWINGS);
+    }
+
+    #[test]
+    fn remote_and_estimate_followings_release_independently() {
+        for first in [FollowPurpose::Remote, FollowPurpose::TokenizerEstimate] {
+            let mut set = FollowingSet::default();
+            let k = key("shared");
+            assert!(set.acquire_purpose(k.clone(), FollowPurpose::Remote));
+            assert!(set.acquire_purpose(k.clone(), FollowPurpose::TokenizerEstimate));
+            assert!(!set.release_purpose(&k, first));
+            assert!(set.is_following(&k));
+            let other = if first == FollowPurpose::Remote {
+                FollowPurpose::TokenizerEstimate
+            } else {
+                FollowPurpose::Remote
+            };
+            assert!(set.release_purpose(&k, other));
+            assert!(!set.is_following(&k));
+            assert!(!set.release_purpose(&k, other));
+        }
     }
 
     #[test]

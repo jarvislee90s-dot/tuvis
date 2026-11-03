@@ -73,9 +73,18 @@ pub const CALLER_DROPPED_REASON: &str = "caller_dropped";
 /// 连接事件（owner/mirror/SSE 上层消费）。
 #[derive(Debug, Clone)]
 pub enum ConnectionEvent {
-    Initialized { client_id: String, epoch: u64 },
-    Broadcast { epoch: u64, frame: Value },
-    Disconnected { epoch: u64 },
+    Initialized {
+        client_id: String,
+        epoch: u64,
+    },
+    Broadcast {
+        epoch: u64,
+        frame: Value,
+        arrival: super::observation::CaptureClock,
+    },
+    Disconnected {
+        epoch: u64,
+    },
 }
 
 /// RPC 请求描述。`target` 携带当前 owner lease（服务端解析，spec S3）；
@@ -1079,6 +1088,25 @@ async fn release_pending_as_unknown(shared: &ConnectionShared) {
     }
 }
 
+pub(crate) fn capture_clock() -> super::observation::CaptureClock {
+    use std::sync::OnceLock;
+    use std::time::{Instant, SystemTime, UNIX_EPOCH};
+    static ORIGIN: OnceLock<Instant> = OnceLock::new();
+    let ns = ORIGIN
+        .get_or_init(Instant::now)
+        .elapsed()
+        .as_nanos()
+        .saturating_add(1);
+    let wall = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    super::observation::CaptureClock {
+        mono_ns: u64::try_from(ns).unwrap_or(u64::MAX),
+        wall_ms: i64::try_from(wall).unwrap_or(i64::MAX),
+    }
+}
+
 async fn reader_task<R: tokio::io::AsyncRead + Unpin + Send>(
     mut io: R,
     shared: Arc<ConnectionShared>,
@@ -1093,12 +1121,13 @@ async fn reader_task<R: tokio::io::AsyncRead + Unpin + Send>(
                 match read {
                     Ok(0) => break,
                     Ok(n) => {
+                        let arrival = capture_clock();
                         let frames = match decoder.push(&buf[..n]) {
                             Ok(f) => f,
                             Err(_) => break, // 帧违规：关闭连接（不重放）
                         };
                         for frame in frames {
-                            handle_frame(&shared, frame, &disc_tx).await;
+                            handle_frame(&shared, frame, &disc_tx, arrival).await;
                         }
                     }
                     Err(_) => break,
@@ -1120,6 +1149,7 @@ async fn handle_frame(
     shared: &Arc<ConnectionShared>,
     frame: Value,
     disc_tx: &mpsc::Sender<FrameCmd>,
+    arrival: super::observation::CaptureClock,
 ) {
     match frame.get("type").and_then(|t| t.as_str()) {
         Some("response") => {
@@ -1134,6 +1164,7 @@ async fn handle_frame(
             let _ = shared.events.send(ConnectionEvent::Broadcast {
                 epoch: shared.epoch,
                 frame,
+                arrival,
             });
         }
         Some("client-discovery-request") => {

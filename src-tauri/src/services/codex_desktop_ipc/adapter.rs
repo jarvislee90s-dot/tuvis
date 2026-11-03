@@ -243,6 +243,15 @@ struct AdapterInner {
     /// C4：全体镜像字节账本（生产 64MiB；所有镜像共用一份）
     mirror_ledger: Arc<std::sync::Mutex<super::mirror::MirrorLedger>>,
     followings: Mutex<FollowingSet>,
+    remote_write_generation: Arc<super::observation::RemoteWriteGeneration>,
+    estimate_pins: std::sync::atomic::AtomicUsize,
+    connection_lifecycle: tokio::sync::Mutex<()>,
+    release_follow_gate: std::sync::Mutex<Option<Arc<tokio::sync::Notify>>>,
+    release_follow_reached: AtomicBool,
+    body_events: std::sync::Mutex<Option<super::observation::BodyEventSender>>,
+    body_generation: AtomicU64,
+    body_trackers:
+        std::sync::Mutex<HashMap<ThreadKey, (u64, u64, u64, super::observation::BodyPatchTracker)>>,
     /// (thread_id, request_key) → 提交互斥（R4；独立短锁，不与 mirrors/owners 嵌套）。
     inflight: Mutex<HashMap<(String, String), InflightEntry>>,
     /// 只读 hydrate（load-complete-history）状态机（2026-10-18 形态适配，替代旧
@@ -574,7 +583,260 @@ pub struct DesktopIpcAdapter {
     inner: Arc<AdapterInner>,
 }
 
+struct PendingEstimate {
+    adapter: DesktopIpcAdapter,
+    key: ThreadKey,
+    ticket: Option<u64>,
+    transferred: bool,
+}
+impl Drop for PendingEstimate {
+    fn drop(&mut self) {
+        if self.transferred {
+            return;
+        }
+        if self.ticket.is_none() {
+            let remaining = self
+                .adapter
+                .inner
+                .estimate_pins
+                .fetch_sub(1, Ordering::SeqCst)
+                - 1;
+            if remaining == 0
+                && !self
+                    .adapter
+                    .inner
+                    .remote_write_generation
+                    .valid(self.adapter.inner.remote_write_generation.capture())
+            {
+                let adapter = self.adapter.clone();
+                tauri::async_runtime::spawn(async move {
+                    adapter.shutdown_if_unused().await;
+                });
+            }
+            return;
+        }
+        let adapter = self.adapter.clone();
+        let key = self.key.clone();
+        let ticket = self.ticket;
+        tauri::async_runtime::spawn(async move {
+            adapter
+                .release_following(
+                    &key,
+                    super::owners::FollowPurpose::TokenizerEstimate,
+                    ticket,
+                )
+                .await;
+            adapter.finish_estimate_pin().await;
+        });
+    }
+}
+
+pub struct FollowLease {
+    adapter: DesktopIpcAdapter,
+    key: ThreadKey,
+    purpose: super::owners::FollowPurpose,
+    ticket: Option<u64>,
+    released: std::sync::atomic::AtomicBool,
+}
+impl FollowLease {
+    async fn cleanup(
+        adapter: DesktopIpcAdapter,
+        key: ThreadKey,
+        purpose: super::owners::FollowPurpose,
+        ticket: Option<u64>,
+    ) {
+        adapter.release_following(&key, purpose, ticket).await;
+        if purpose == super::owners::FollowPurpose::TokenizerEstimate {
+            adapter.finish_estimate_pin().await;
+        }
+    }
+    pub async fn release(&self) {
+        if !self.released.swap(true, Ordering::SeqCst) {
+            let task = tokio::spawn(Self::cleanup(
+                self.adapter.clone(),
+                self.key.clone(),
+                self.purpose,
+                self.ticket,
+            ));
+            let _ = task.await;
+        }
+    }
+}
+impl Drop for FollowLease {
+    fn drop(&mut self) {
+        if !self.released.swap(true, Ordering::SeqCst) {
+            let work = Self::cleanup(
+                self.adapter.clone(),
+                self.key.clone(),
+                self.purpose,
+                self.ticket,
+            );
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(work);
+            } else {
+                tauri::async_runtime::spawn(work);
+            }
+        }
+    }
+}
+
 impl DesktopIpcAdapter {
+    pub async fn acquire_following(
+        &self,
+        key: &ThreadKey,
+        purpose: super::owners::FollowPurpose,
+    ) -> Result<FollowLease, ProtocolError> {
+        let generation = self.inner.remote_write_generation.capture();
+        if purpose == super::owners::FollowPurpose::Remote
+            && !self.inner.remote_write_generation.valid(generation)
+        {
+            return Err(ProtocolError::Disconnected("remote stopped".into()));
+        }
+        let mut pending = if purpose == super::owners::FollowPurpose::TokenizerEstimate {
+            self.inner.estimate_pins.fetch_add(1, Ordering::SeqCst);
+            self.inner.stopping.store(false, Ordering::SeqCst);
+            Some(PendingEstimate {
+                adapter: self.clone(),
+                key: key.clone(),
+                ticket: None,
+                transferred: false,
+            })
+        } else {
+            None
+        };
+        let _lifecycle = self.inner.connection_lifecycle.lock().await;
+        if purpose == super::owners::FollowPurpose::TokenizerEstimate {
+            self.inner.stopping.store(false, Ordering::SeqCst);
+        }
+        if purpose == super::owners::FollowPurpose::Remote
+            && !self.inner.remote_write_generation.valid(generation)
+        {
+            return Err(ProtocolError::Disconnected("remote stopped".into()));
+        }
+        self.ensure_for_purpose(key, purpose, pending.as_mut().map(|p| &mut p.ticket))
+            .await?;
+        if purpose == super::owners::FollowPurpose::Remote
+            && !self.inner.remote_write_generation.valid(generation)
+        {
+            self.release_following_locked(key, purpose, None).await;
+            return Err(ProtocolError::Disconnected("remote stopped".into()));
+        }
+        if purpose == super::owners::FollowPurpose::TokenizerEstimate {
+            self.seed_body_baseline(key).await;
+        }
+        let ticket = pending.as_ref().and_then(|p| p.ticket);
+        if let Some(pending) = &mut pending {
+            pending.transferred = true;
+        }
+        Ok(FollowLease {
+            adapter: self.clone(),
+            key: key.clone(),
+            purpose,
+            ticket,
+            released: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+
+    async fn seed_body_baseline(&self, key: &ThreadKey) {
+        let current = self.inner.owners.lock().await.current(key);
+        let Some(current) = current else { return };
+        let mirrors = self.inner.mirrors.lock().await;
+        let Some(mirror) = mirrors.get(key) else {
+            return;
+        };
+        if mirror.is_stale() || mirror.lease() != Some(&current) {
+            return;
+        }
+        let (Some(state), Some(revision)) = (mirror.observation_state(), mirror.revision()) else {
+            return;
+        };
+        let mut trackers = self
+            .inner
+            .body_trackers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let slot = self
+            .inner
+            .body_events
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let Some(sender) = slot.as_ref() else { return };
+        let generation = self.inner.body_generation.load(Ordering::SeqCst);
+        let identity = (generation, current.epoch, current.generation);
+        if trackers
+            .get(key)
+            .is_some_and(|(g, e, n, _)| (*g, *e, *n) == identity)
+        {
+            return;
+        }
+        let mut tracker = super::observation::BodyPatchTracker::default();
+        tracker.baseline(state);
+        let scope = super::observation::CaptureScope {
+            capture_generation: generation,
+            owner_epoch: current.epoch,
+            owner_generation: current.generation,
+            host_key: key.host_id.clone(),
+            thread_key: key.thread_id.clone(),
+        };
+        if sender.try_send(super::observation::BodyFrame {
+            scope,
+            revision,
+            clock: super::connection::capture_clock(),
+            changes: vec![super::observation::BodyChange::Baseline],
+        }) {
+            trackers.insert(key.clone(), (identity.0, identity.1, identity.2, tracker));
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn set_release_follow_gate_for_tests(&self, gate: Option<Arc<tokio::sync::Notify>>) {
+        *self
+            .inner
+            .release_follow_gate
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = gate;
+    }
+    #[doc(hidden)]
+    pub fn release_follow_gate_reached_for_tests(&self) -> bool {
+        self.inner.release_follow_reached.load(Ordering::SeqCst)
+    }
+
+    fn invalidate_body_observation(&self) {
+        let mut trackers = self
+            .inner
+            .body_trackers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        trackers.clear();
+        if let Some(sender) = self
+            .inner
+            .body_events
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
+            sender.invalidate();
+        }
+    }
+
+    pub fn subscribe_body_events(&self) -> super::observation::BodyEventReceiver {
+        let (sender, receiver) = super::observation::body_event_channel(128);
+        let mut trackers = self
+            .inner
+            .body_trackers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        trackers.clear();
+        let mut slot = self
+            .inner
+            .body_events
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        self.inner.body_generation.fetch_add(1, Ordering::SeqCst);
+        *slot = Some(sender);
+        receiver
+    }
+
     pub fn new(connector: Arc<dyn Connector>, profile: ProtocolProfile) -> Self {
         Self {
             inner: Arc::new(AdapterInner {
@@ -608,6 +870,14 @@ impl DesktopIpcAdapter {
                     super::mirror::MirrorLedger::global(),
                 )),
                 followings: Mutex::new(FollowingSet::default()),
+                remote_write_generation: Arc::default(),
+                estimate_pins: std::sync::atomic::AtomicUsize::new(0),
+                connection_lifecycle: tokio::sync::Mutex::new(()),
+                release_follow_gate: std::sync::Mutex::new(None),
+                release_follow_reached: AtomicBool::new(false),
+                body_events: std::sync::Mutex::new(None),
+                body_generation: AtomicU64::new(0),
+                body_trackers: std::sync::Mutex::new(HashMap::new()),
                 inflight: Mutex::new(HashMap::new()),
                 history_hydrations: Mutex::new(HashMap::new()),
                 forward_alive: AtomicBool::new(false),
@@ -4084,27 +4354,68 @@ impl DesktopIpcAdapter {
     /// C2：follow 段经 ensure_lock 串行化——settle 对账与派发路径并发 ensure 时，
     /// 后到者持锁后重查新鲜镜像即短路（不产生第二次 discovery/绑定）。
     pub async fn ensure_thread(&self, key: &ThreadKey) -> Result<ThreadProjection, ProtocolError> {
+        let generation = self.inner.remote_write_generation.capture();
+        if !self.inner.remote_write_generation.valid(generation) {
+            return Err(ProtocolError::Disconnected("remote stopped".into()));
+        }
+        let _lifecycle = self.inner.connection_lifecycle.lock().await;
+        if !self.inner.remote_write_generation.valid(generation) {
+            return Err(ProtocolError::Disconnected("remote stopped".into()));
+        }
+        let result = self
+            .ensure_for_purpose(key, super::owners::FollowPurpose::Remote, None)
+            .await;
+        if !self.inner.remote_write_generation.valid(generation) {
+            self.release_following_locked(key, super::owners::FollowPurpose::Remote, None)
+                .await;
+            return Err(ProtocolError::Disconnected("remote stopped".into()));
+        }
+        result
+    }
+
+    async fn ensure_for_purpose(
+        &self,
+        key: &ThreadKey,
+        purpose: super::owners::FollowPurpose,
+        mut registered: Option<&mut Option<u64>>,
+    ) -> Result<ThreadProjection, ProtocolError> {
         let conn = self.ensure_connection().await?;
-        // #172：首次 `state` 访问 → 惰性只读探测（账本优先；失败不阻断读路径——
-        // 读不通自有别的原因，探测只是给出「这台 build 的读能力有没有证据」）。
         self.ensure_read_evidence(key).await;
-        // 快路径：已跟随且新鲜（短锁）
+        let evicted = {
+            let mut f = self.inner.followings.lock().await;
+            match purpose {
+                super::owners::FollowPurpose::Remote => f
+                    .reserve_remote(key.clone())
+                    .ok_or_else(|| ProtocolError::Capacity("following set full (64)".into()))?,
+                super::owners::FollowPurpose::TokenizerEstimate => {
+                    let ticket = f
+                        .acquire_estimate(key.clone())
+                        .ok_or_else(|| ProtocolError::Capacity("following set full (64)".into()))?;
+                    if let Some(flag) = registered.as_mut() {
+                        **flag = Some(ticket);
+                    }
+                    None
+                }
+            }
+        };
+        if let Some(victim) = evicted {
+            self.invalidate_body_observation();
+            self.release_following_locked(&victim, super::owners::FollowPurpose::Remote, None)
+                .await;
+        }
         if let Some(p) = self.fresh_projection(key).await {
             return Ok(p);
         }
         let _ensure = self.inner.ensure_lock.lock().await;
-        // 持锁重查：并发 ensure 可能已完成 follow
         if let Some(p) = self.fresh_projection(key).await {
             return Ok(p);
         }
-        // 名额（短锁）
-        {
-            let mut f = self.inner.followings.lock().await;
-            if !f.follow(key.clone()) {
-                return Err(ProtocolError::Capacity("following set full (64)".into()));
+        if let Err(error) = self.follow_thread(&conn, key).await {
+            if registered.is_none() {
+                self.release_following_locked(key, purpose, None).await;
             }
+            return Err(error);
         }
-        self.follow_thread(&conn, key).await?;
         Ok(self.projection(key).await)
     }
 
@@ -4563,7 +4874,91 @@ impl DesktopIpcAdapter {
     /// 授权可套）、删除镜像（字节账本随 Drop 释放；卸载后的帧**不复活镜像**）。
     /// 未在跟随（幂等）→ 零副作用。
     pub async fn unfollow(&self, key: &ThreadKey) {
-        let was_following = self.inner.followings.lock().await.unfollow(key);
+        // 先撤回需求，不能等待在途 discovery；其回包前的复核会阻止复活。
+        let still_following = {
+            let mut following = self.inner.followings.lock().await;
+            following.release_purpose(key, super::owners::FollowPurpose::Remote);
+            following.is_following(key)
+        };
+        if still_following {
+            return;
+        }
+        if let Ok(_lifecycle) = self.inner.connection_lifecycle.try_lock() {
+            if !self.inner.followings.lock().await.is_following(key) {
+                self.release_following_locked(key, super::owners::FollowPurpose::Remote, None)
+                    .await;
+            }
+        } else {
+            let adapter = self.clone();
+            let key = key.clone();
+            tokio::spawn(async move {
+                let _lifecycle = adapter.inner.connection_lifecycle.lock().await;
+                if !adapter.inner.followings.lock().await.is_following(&key) {
+                    adapter
+                        .release_following_locked(&key, super::owners::FollowPurpose::Remote, None)
+                        .await;
+                }
+            });
+        }
+    }
+
+    async fn release_following(
+        &self,
+        key: &ThreadKey,
+        purpose: super::owners::FollowPurpose,
+        ticket: Option<u64>,
+    ) {
+        let _lifecycle = self.inner.connection_lifecycle.lock().await;
+        self.release_following_locked(key, purpose, ticket).await;
+    }
+
+    async fn release_following_locked(
+        &self,
+        key: &ThreadKey,
+        purpose: super::owners::FollowPurpose,
+        ticket: Option<u64>,
+    ) {
+        let (found, was_following, still_following, last_estimate) = {
+            let mut following = self.inner.followings.lock().await;
+            let had_estimate = following.is_estimate_following(key);
+            let (found, removed) = if purpose == super::owners::FollowPurpose::TokenizerEstimate {
+                ticket
+                    .map(|id| following.release_estimate(key, id))
+                    .unwrap_or((false, false))
+            } else {
+                (true, following.release_purpose(key, purpose))
+            };
+            (
+                found,
+                removed,
+                following.is_following(key),
+                had_estimate && !following.is_estimate_following(key),
+            )
+        };
+        if !found {
+            return;
+        }
+        if last_estimate {
+            self.invalidate_body_observation();
+        }
+        if still_following {
+            return;
+        }
+        let gate = self
+            .inner
+            .release_follow_gate
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some(gate) = gate {
+            self.inner
+                .release_follow_reached
+                .store(true, Ordering::SeqCst);
+            gate.notified().await;
+            self.inner
+                .release_follow_reached
+                .store(false, Ordering::SeqCst);
+        }
         // C4：只对**真正声明过 following**（有现行 lease）的 thread 发 following:false
         //——ensure 失败回滚（discovery 未成功、从未声明）只回收名额，不发噪声帧
         let had_lease = self.inner.owners.lock().await.current(key).is_some();
@@ -4598,12 +4993,69 @@ impl DesktopIpcAdapter {
 
     /// C4：进入停机——恢复循环/重拉/转发不再重启，ensure 不再新建连接；
     /// 已派发动作的独立落账任务不受影响（只经 store/conn 完成落账）。
+    async fn finish_estimate_pin(&self) {
+        self.inner.estimate_pins.fetch_sub(1, Ordering::SeqCst);
+        self.shutdown_if_unused().await;
+    }
+
+    /// 与新测速连接串行，避免迟到的远程关闭任务关掉新连接。
+    pub async fn shutdown_if_unused(&self) {
+        let _lifecycle = self.inner.connection_lifecycle.lock().await;
+        if self.inner.estimate_pins.load(Ordering::SeqCst) == 0
+            && !self
+                .inner
+                .remote_write_generation
+                .valid(self.inner.remote_write_generation.capture())
+        {
+            self.begin_shutdown();
+            self.shutdown().await;
+        }
+    }
+
+    pub fn remote_generation(&self) -> u64 {
+        self.inner.remote_write_generation.capture()
+    }
+
+    /// 收回远程用途；估算用途继续持有相同线程时不发送取消跟随。
+    pub async fn finish_remote_shutdown(&self, generation: u64) {
+        {
+            let _lifecycle = self.inner.connection_lifecycle.lock().await;
+            if self.inner.remote_write_generation.capture() != generation
+                || self.inner.remote_write_generation.valid(generation)
+            {
+                return;
+            }
+            let keys = self.inner.followings.lock().await.remote_keys();
+            for key in keys {
+                if self.inner.remote_write_generation.capture() != generation {
+                    return;
+                }
+                self.release_following_locked(&key, super::owners::FollowPurpose::Remote, None)
+                    .await;
+            }
+        }
+        self.shutdown_if_unused().await;
+    }
+
+    /// 关闭远程写权限；仍有测速租约时保留只读连接。
+    pub fn begin_remote_shutdown(&self) -> bool {
+        self.inner.remote_write_generation.stop();
+        if self.inner.estimate_pins.load(Ordering::SeqCst) == 0 {
+            self.begin_shutdown();
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn begin_shutdown(&self) {
+        self.inner.remote_write_generation.stop();
         self.inner.stopping.store(true, Ordering::SeqCst);
     }
 
     /// C4：从停机恢复（hub.start 热重启路径）——重新允许连接。
     pub fn resume(&self) {
+        self.inner.remote_write_generation.resume();
         self.inner.stopping.store(false, Ordering::SeqCst);
     }
 
@@ -4629,6 +5081,7 @@ impl DesktopIpcAdapter {
             false,
             None,
             Default::default(),
+            None,
             None,
         )
         .await
@@ -4657,6 +5110,7 @@ impl DesktopIpcAdapter {
             None,
             Default::default(),
             None,
+            None,
         )
         .await
     }
@@ -4680,6 +5134,7 @@ impl DesktopIpcAdapter {
             false,
             deadline,
             pre_dispatch_turns,
+            None,
             None,
         )
         .await
@@ -4706,6 +5161,7 @@ impl DesktopIpcAdapter {
             deadline,
             pre_dispatch_turns,
             Some(recheck),
+            None,
         )
         .await
     }
@@ -4729,6 +5185,7 @@ impl DesktopIpcAdapter {
             deadline,
             pre_dispatch_turns,
             None,
+            None,
         )
         .await
     }
@@ -4748,7 +5205,10 @@ impl DesktopIpcAdapter {
         deadline: Option<tokio::time::Instant>,
         pre_dispatch_turns: std::collections::HashSet<String>,
         async_write_recheck: Option<super::types::AsyncWriteRecheck>,
+        source_generation: Option<u64>,
     ) -> RpcOutcome {
+        let write_generation =
+            source_generation.unwrap_or_else(|| self.inner.remote_write_generation.capture());
         let envelope_id = super::types::new_uuid();
         // R3：能力读当前连接的动态 profile（无连接/未知 build → closed → 拒）
         // #172/T8：兼容发送许可只放开「写能力未取证」这一档；**已验证 build 的行为
@@ -4798,6 +5258,7 @@ impl DesktopIpcAdapter {
             async_write_recheck,
             // P1：随迟到槽位冻结本次 wire 文本（迟到回执弱证据核对的比对源）
             Some(text.to_string()),
+            write_generation,
         )
         .await
     }
@@ -4911,6 +5372,7 @@ impl DesktopIpcAdapter {
         deadline: super::budget::Deadline,
         device_id: Option<&str>,
     ) -> RpcOutcome {
+        let write_generation = self.inner.remote_write_generation.capture();
         let envelope_id = super::types::new_uuid();
         if deadline.is_expired() {
             return not_sent(&envelope_id, "front_budget_exhausted");
@@ -4988,6 +5450,7 @@ impl DesktopIpcAdapter {
             Some(recheck),
             None,
             None,
+            write_generation,
         )
         .await
     }
@@ -5035,6 +5498,7 @@ impl DesktopIpcAdapter {
         bypass_paused_queue: bool,
         deadline: super::budget::Deadline,
     ) -> RpcOutcome {
+        let write_generation = self.inner.remote_write_generation.capture();
         let envelope_id = super::types::new_uuid();
         if deadline.is_expired() {
             return not_sent(&envelope_id, "front_budget_exhausted");
@@ -5292,24 +5756,29 @@ impl DesktopIpcAdapter {
                 })
             });
             // 一次 canonical start-turn（信封作为正文；不是 steer、不进 FIFO）。
-            self.start_turn_group_bounded(
+            self.start_turn_with(
                 key,
                 action_id,
                 &envelope,
                 client_message_id,
+                false,
                 deadline.instant(),
                 Default::default(),
-                recheck,
+                Some(recheck),
+                Some(write_generation),
             )
             .await
         } else {
-            self.start_turn_bounded(
+            self.start_turn_with(
                 key,
                 action_id,
                 &envelope,
                 client_message_id,
+                false,
                 deadline.instant(),
                 Default::default(),
+                None,
+                Some(write_generation),
             )
             .await
         };
@@ -5376,6 +5845,7 @@ impl DesktopIpcAdapter {
         action_id: &str,
         deadline: super::budget::Deadline,
     ) -> RpcOutcome {
+        let write_generation = self.inner.remote_write_generation.capture();
         let envelope_id = super::types::new_uuid();
         let caps = self.current_caps();
         if deadline.is_expired() {
@@ -5508,6 +5978,7 @@ impl DesktopIpcAdapter {
                 None,
                 None,
                 None,
+                write_generation,
             )
             .await;
         // T04：Accepted 之后按**更强证据**复核解决状态——响应条目
@@ -5565,8 +6036,12 @@ impl DesktopIpcAdapter {
         // P1（2026-10-30）：本次写出的已组装文本（仅 start-turn 携带；随迟到槽位
         // 冻结，供迟到回执的正文 hash 弱证据核对）。
         wire_text: Option<String>,
+        write_generation: u64,
     ) -> RpcOutcome {
         let envelope_id = super::types::new_uuid();
+        if !self.inner.remote_write_generation.valid(write_generation) {
+            return not_sent(&envelope_id, "remote_stopped");
+        }
         let conn = self.inner.conn.lock().await.clone();
         let Some(conn) = conn else {
             return not_sent(&envelope_id, "disconnected");
@@ -5608,6 +6083,9 @@ impl DesktopIpcAdapter {
                     .write_guard_reached
                     .store(false, Ordering::SeqCst);
             }
+            if !self.inner.remote_write_generation.valid(write_generation) {
+                return not_sent(&envelope_id, "remote_stopped");
+            }
             match self.write_guard_verdict(action_id, compat_licensed) {
                 crate::services::codex_control::WriteGuardVerdict::Allow => {}
                 crate::services::codex_control::WriteGuardVerdict::RejectRevoked => {
@@ -5628,6 +6106,14 @@ impl DesktopIpcAdapter {
                 }
             }
         }
+        let gate = self.inner.remote_write_generation.clone();
+        let prior_recheck = interaction_recheck;
+        let interaction_recheck: super::types::InteractionRecheck = Arc::new(move || {
+            if let Some(reason) = prior_recheck.as_ref().and_then(|check| check()) {
+                return Some(reason);
+            }
+            (!gate.valid(write_generation)).then(|| "remote_stopped".to_string())
+        });
         conn.request(RpcRequest {
             method: method.to_string(),
             params,
@@ -5641,7 +6127,7 @@ impl DesktopIpcAdapter {
             compat_licensed,
             deadline,
             pre_dispatch_turns,
-            interaction_recheck,
+            interaction_recheck: Some(interaction_recheck),
             async_write_recheck,
             wire_text,
         })
@@ -6000,13 +6486,15 @@ async fn forward_events(adapter: DesktopIpcAdapter, conn: ConnectionHandle) {
     let mut rx = conn.subscribe();
     loop {
         match rx.recv().await {
-            Ok(ConnectionEvent::Broadcast { frame, .. }) => {
-                handle_broadcast(&adapter, &conn, frame).await;
+            Ok(ConnectionEvent::Broadcast { frame, arrival, .. }) => {
+                handle_broadcast(&adapter, &conn, frame, arrival).await;
             }
             Ok(ConnectionEvent::Initialized { .. }) => continue,
             Ok(ConnectionEvent::Disconnected { .. }) | Err(_) => break,
         }
     }
+    // 断链或广播接收丢帧均使测速候选失效。
+    adapter.invalidate_body_observation();
     // 连接断开：全体 mirror stale + 发布（保留视图只读）
     mark_all_mirrors_stale(&adapter, false).await;
     adapter.inner.forward_alive.store(false, Ordering::SeqCst);
@@ -6200,13 +6688,19 @@ async fn recovery_loop(adapter: &DesktopIpcAdapter) -> Option<ConnectionHandle> 
     }
 }
 
-async fn handle_broadcast(adapter: &DesktopIpcAdapter, conn: &ConnectionHandle, frame: Value) {
+async fn handle_broadcast(
+    adapter: &DesktopIpcAdapter,
+    conn: &ConnectionHandle,
+    frame: Value,
+    arrival: super::observation::CaptureClock,
+) {
     match frame.get("method").and_then(|m| m.as_str()) {
-        Some("thread-stream-state-changed") => handle_state_changed(adapter, frame).await,
+        Some("thread-stream-state-changed") => handle_state_changed(adapter, frame, arrival).await,
         Some("client-status-changed") => handle_client_status_changed(adapter, &frame).await,
         // 连接级信号：全体 stale + 发布，并**同 socket 重跟随**（C2：Desktop 侧要求
         // 重置状态时连接未断——只 stale 不重跟随会让视图永久停在旧世界）
         Some("ipc-connection-reset") => {
+            adapter.invalidate_body_observation();
             mark_all_mirrors_stale(adapter, false).await;
             let keys = followed_keys(adapter).await;
             spawn_same_socket_recovery(adapter.clone(), keys);
@@ -6220,7 +6714,11 @@ async fn handle_broadcast(adapter: &DesktopIpcAdapter, conn: &ConnectionHandle, 
 
 /// state-changed：来源核对（R2.4）→ 原子应用 → changed 发布 / need_snapshot 或
 /// 非法增量 → stale 发布 + 有界重拉（R1）→ 不完整历史 → 只读 load-complete-history。
-async fn handle_state_changed(adapter: &DesktopIpcAdapter, frame: Value) {
+async fn handle_state_changed(
+    adapter: &DesktopIpcAdapter,
+    frame: Value,
+    arrival: super::observation::CaptureClock,
+) {
     let conversation_id = frame["params"]["conversationId"].as_str().unwrap_or("");
     if conversation_id.is_empty() {
         return;
@@ -6240,6 +6738,23 @@ async fn handle_state_changed(adapter: &DesktopIpcAdapter, frame: Value) {
     if source != Some(lease.client_id.as_str()) {
         return;
     }
+    let estimate_followed = adapter
+        .inner
+        .followings
+        .lock()
+        .await
+        .is_estimate_following(&key);
+    let capture_generation = if estimate_followed {
+        let slot = adapter
+            .inner
+            .body_events
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        slot.as_ref()
+            .map(|_| adapter.inner.body_generation.load(Ordering::SeqCst))
+    } else {
+        None
+    };
     let change = frame["params"]["change"].clone();
     // 复审 round 6（Q1）测试缝：「caps 观察窗」（修复后 caps 在临界区内读取，本缝
     // 退化为「先跑窗口动作再取快照」的无害定序——窗内完成的翻转/重发布随后被临界
@@ -6255,9 +6770,85 @@ async fn handle_state_changed(adapter: &DesktopIpcAdapter, frame: Value) {
         let Some(mirror) = mirrors.get_mut(&key) else {
             return; // 未跟随的 thread 不建镜像、不投影
         };
+        // 在镜像应用的同一临界区复核 owner。只尝试锁，避免与其他路径形成反向等待。
+        // 无法取得锁时丢弃该帧并将镜像标 stale，不能把缺失增量当作连续状态。
+        let owners = match adapter.inner.owners.try_lock() {
+            Ok(owners) => owners,
+            Err(_) => {
+                mirror.mark_stale();
+                drop(mirrors);
+                adapter.invalidate_body_observation();
+                publish_projection(adapter, &key).await;
+                spawn_stale_refollow(adapter.clone(), key.clone(), current_conn(adapter).await);
+                return;
+            }
+        };
+        if !owners.is_current(&lease) {
+            return;
+        }
+        let mut trackers = adapter
+            .inner
+            .body_trackers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let identity =
+            capture_generation.map(|generation| (generation, lease.epoch, lease.generation));
+        let prepared = identity
+            .and_then(|id| trackers.get(&key).filter(|(g, e, n, _)| (*g, *e, *n) == id))
+            .and_then(|(_, _, _, tracker)| {
+                mirror
+                    .observation_state()
+                    .map(|state| tracker.prepare(state, &change))
+            });
         match mirror.apply(&lease, &change) {
             Ok(eff) => {
                 if eff.changed {
+                    if let (Some(id), Some(revision), Some(state)) = (
+                        identity,
+                        change["revision"].as_u64(),
+                        mirror.observation_state(),
+                    ) {
+                        let changes = if change["type"] == "snapshot" {
+                            let mut tracker = super::observation::BodyPatchTracker::default();
+                            tracker.baseline(state);
+                            trackers.insert(key.clone(), (id.0, id.1, id.2, tracker));
+                            vec![super::observation::BodyChange::Baseline]
+                        } else if let (Some(prepared), Some((_, _, _, tracker))) =
+                            (prepared, trackers.get_mut(&key))
+                        {
+                            tracker.finish(state, prepared)
+                        } else {
+                            let mut tracker = super::observation::BodyPatchTracker::default();
+                            tracker.baseline(state);
+                            trackers.insert(key.clone(), (id.0, id.1, id.2, tracker));
+                            vec![super::observation::BodyChange::Baseline]
+                        };
+                        let slot = adapter
+                            .inner
+                            .body_events
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
+                        if adapter.inner.body_generation.load(Ordering::SeqCst) == id.0 {
+                            if let Some(sender) = slot.as_ref() {
+                                let scope = super::observation::CaptureScope {
+                                    capture_generation: id.0,
+                                    owner_epoch: id.1,
+                                    owner_generation: id.2,
+                                    host_key: key.host_id.clone(),
+                                    thread_key: key.thread_id.clone(),
+                                };
+                                if !sender.try_send(super::observation::BodyFrame {
+                                    scope,
+                                    revision,
+                                    clock: arrival,
+                                    changes,
+                                }) {
+                                    trackers.clear();
+                                }
+                            }
+                        }
+                    }
+                    drop(owners);
                     // 复审 round 6（Q1）：caps 与盖章**同一临界区**——发布 payload
                     // 声称的观察版本（seal）必须与生成它的 caps 观察同一边界。旧
                     // 代码在锁外读 caps：窗内完成的「关闭设置 + 禁用发布（seq=N）」
@@ -6294,6 +6885,9 @@ async fn handle_state_changed(adapter: &DesktopIpcAdapter, frame: Value) {
         }
     }
     if need_recover {
+        if estimate_followed {
+            adapter.invalidate_body_observation();
+        }
         // 先发布 stale 投影（SSE 不能停在旧视图），再有界重拉
         publish_projection(adapter, &key).await;
         spawn_stale_refollow(adapter.clone(), key.clone(), current_conn(adapter).await);
@@ -6657,6 +7251,17 @@ async fn handle_client_status_changed(adapter: &DesktopIpcAdapter, frame: &Value
     };
     if affected.is_empty() {
         return;
+    }
+    let affected_observation = {
+        let trackers = adapter
+            .inner
+            .body_trackers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        affected.iter().any(|key| trackers.contains_key(key))
+    };
+    if affected_observation {
+        adapter.invalidate_body_observation();
     }
     // 短锁 C：mirror invalidate + 投影；顺带清该 thread 的提交互斥（owner 换代即新世界）
     // 复审 round 6（Q1）测试缝：「caps 观察窗」（修复后 caps 在临界区内读取，无害
@@ -7378,6 +7983,7 @@ mod dispatch_tests {
                 None,
                 None,
                 None,
+                adapter.inner.remote_write_generation.capture(),
             )
             .await;
         assert_eq!(outcome.delivery, Delivery::NotSent, "未进表方法必须零投递");

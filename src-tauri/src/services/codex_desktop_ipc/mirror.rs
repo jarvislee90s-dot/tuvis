@@ -530,6 +530,10 @@ impl ThreadMirror {
         matched
     }
 
+    pub(crate) fn observation_state(&self) -> Option<&Value> {
+        self.state.as_ref()
+    }
+
     /// 标记过期（连接断开/缺口/预算超限）。保留最后视图但禁写（adapter 侧门）。
     pub fn mark_stale(&mut self) {
         self.stale = true;

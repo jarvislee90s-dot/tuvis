@@ -1,0 +1,842 @@
+//! 只读正文观察事件；不序列化临时正文。
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct CaptureScope {
+    pub capture_generation: u64,
+    pub owner_epoch: u64,
+    pub owner_generation: u64,
+    pub host_key: String,
+    pub thread_key: String,
+}
+#[derive(Debug, Clone, Copy)]
+pub struct CaptureClock {
+    pub mono_ns: u64,
+    pub wall_ms: i64,
+}
+pub enum BodyChange {
+    Baseline,
+    EmptyItem {
+        turn_id: String,
+        item_id: String,
+        model: Option<String>,
+        channel: Option<String>,
+    },
+    Append {
+        turn_id: String,
+        item_id: String,
+        text: String,
+    },
+    InvalidatedItem {
+        turn_id: String,
+        item_id: Option<String>,
+    },
+    TurnTerminal {
+        turn_id: String,
+        completed: bool,
+    },
+}
+pub struct BodyFrame {
+    pub scope: CaptureScope,
+    pub revision: u64,
+    pub clock: CaptureClock,
+    pub changes: Vec<BodyChange>,
+}
+
+/// 远程写入权限代际；关闭后已捕获的许可不得在重开时复活。
+pub(crate) struct RemoteWriteGeneration(std::sync::atomic::AtomicU64);
+impl Default for RemoteWriteGeneration {
+    fn default() -> Self {
+        Self(std::sync::atomic::AtomicU64::new(1))
+    }
+}
+impl RemoteWriteGeneration {
+    pub fn capture(&self) -> u64 {
+        self.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    pub fn stop(&self) {
+        use std::sync::atomic::Ordering;
+        let _ = self
+            .0
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| {
+                if v % 2 == 1 {
+                    Some(v.wrapping_add(1))
+                } else {
+                    None
+                }
+            });
+    }
+    pub fn resume(&self) {
+        use std::sync::atomic::Ordering;
+        let _ = self
+            .0
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| {
+                if v != 0 && v % 2 == 0 {
+                    Some(v + 1)
+                } else {
+                    None
+                }
+            });
+    }
+    pub fn valid(&self, generation: u64) -> bool {
+        generation % 2 == 1 && self.capture() == generation
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RemoteWriteGeneration;
+    #[test]
+    fn stop_reopen_rejects_stale_write_generation() {
+        let gate = RemoteWriteGeneration::default();
+        let old = gate.capture();
+        assert!(gate.valid(old));
+        gate.stop();
+        assert!(!gate.valid(old));
+        gate.resume();
+        assert!(!gate.valid(old));
+        assert!(gate.valid(gate.capture()));
+    }
+}
+
+/// 限量观察事件，队列丢帧显式通知消费者撤销未结算候选。
+pub enum BodyEvent {
+    Frame(BodyFrame),
+    Lost,
+}
+const QUEUED_BODY_LIMIT: usize = 16 * 1024 * 1024;
+const QUEUED_ITEM_LIMIT: usize = 1024 * 1024;
+struct QueuedBodyFrame {
+    frame: Option<BodyFrame>,
+    bytes: usize,
+    occupied: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+impl QueuedBodyFrame {
+    fn into_frame(mut self) -> BodyFrame {
+        self.frame.take().expect("frame present")
+    }
+}
+impl Drop for QueuedBodyFrame {
+    fn drop(&mut self) {
+        self.occupied
+            .fetch_sub(self.bytes, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+struct BodyEventPublisher {
+    tx: tokio::sync::mpsc::Sender<(u64, QueuedBodyFrame)>,
+    loss: tokio::sync::watch::Sender<u64>,
+    epoch: u64,
+    occupied: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+#[derive(Clone)]
+pub struct BodyEventSender(std::sync::Arc<std::sync::Mutex<BodyEventPublisher>>);
+pub struct BodyEventReceiver {
+    rx: tokio::sync::mpsc::Receiver<(u64, QueuedBodyFrame)>,
+    loss: tokio::sync::watch::Receiver<u64>,
+    seen: u64,
+    pending: Option<(u64, QueuedBodyFrame)>,
+}
+pub fn body_event_channel(capacity: usize) -> (BodyEventSender, BodyEventReceiver) {
+    let (tx, rx) = tokio::sync::mpsc::channel(capacity);
+    let (loss, loss_rx) = tokio::sync::watch::channel(0);
+    let occupied = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    (
+        BodyEventSender(std::sync::Arc::new(std::sync::Mutex::new(
+            BodyEventPublisher {
+                tx,
+                loss,
+                epoch: 0,
+                occupied,
+            },
+        ))),
+        BodyEventReceiver {
+            rx,
+            loss: loss_rx,
+            seen: 0,
+            pending: None,
+        },
+    )
+}
+impl BodyEventPublisher {
+    fn invalidate(&mut self) {
+        self.epoch = self.epoch.wrapping_add(1);
+        self.loss.send_replace(self.epoch);
+    }
+}
+impl BodyEventSender {
+    pub fn invalidate(&self) {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .invalidate();
+    }
+    pub fn try_send(&self, frame: BodyFrame) -> bool {
+        use std::sync::atomic::Ordering;
+        let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let mut bytes = 0usize;
+        for change in &frame.changes {
+            if let BodyChange::Append { text, .. } = change {
+                if text.len() > QUEUED_ITEM_LIMIT {
+                    state.invalidate();
+                    return false;
+                }
+                bytes = bytes.saturating_add(text.len());
+            }
+        }
+        if state.occupied.load(Ordering::SeqCst).saturating_add(bytes) > QUEUED_BODY_LIMIT {
+            state.invalidate();
+            return false;
+        }
+        state.occupied.fetch_add(bytes, Ordering::SeqCst);
+        let queued = QueuedBodyFrame {
+            frame: Some(frame),
+            bytes,
+            occupied: state.occupied.clone(),
+        };
+        match state.tx.try_send((state.epoch, queued)) {
+            Ok(()) => true,
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                state.invalidate();
+                false
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => false,
+        }
+    }
+}
+impl BodyEventReceiver {
+    pub async fn recv(&mut self) -> Option<BodyEvent> {
+        loop {
+            let epoch = *self.loss.borrow_and_update();
+            if epoch != self.seen {
+                self.seen = epoch;
+                if self.pending.as_ref().is_some_and(|(v, _)| *v != epoch) {
+                    self.pending = None;
+                }
+                while self.pending.is_none() {
+                    match self.rx.try_recv() {
+                        Ok((item_epoch, frame)) if item_epoch == epoch => {
+                            self.pending = Some((item_epoch, frame));
+                        }
+                        Ok(_) => {}
+                        Err(_) => break,
+                    }
+                }
+                return Some(BodyEvent::Lost);
+            }
+            let item = if let Some(item) = self.pending.take() {
+                Some(item)
+            } else {
+                tokio::select! { biased;
+                    changed=self.loss.changed()=>{if changed.is_err(){return None;} continue;},
+                    item=self.rx.recv()=>item,
+                }
+            };
+            let (item_epoch, frame) = item?;
+            let current = *self.loss.borrow();
+            if current != self.seen {
+                if item_epoch == current {
+                    self.pending = Some((item_epoch, frame));
+                }
+                continue;
+            }
+            if item_epoch == self.seen {
+                return Some(BodyEvent::Frame(frame.into_frame()));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod queue_tests {
+    use super::*;
+    fn frame(revision: u64) -> BodyFrame {
+        BodyFrame {
+            scope: CaptureScope {
+                capture_generation: 1,
+                owner_epoch: 1,
+                owner_generation: 1,
+                host_key: "h".into(),
+                thread_key: "t".into(),
+            },
+            revision,
+            clock: CaptureClock {
+                mono_ns: revision,
+                wall_ms: revision as i64,
+            },
+            changes: vec![],
+        }
+    }
+    #[tokio::test]
+    async fn overflow_invalidates_before_any_old_frame_is_delivered() {
+        let (tx, mut rx) = body_event_channel(1);
+        assert!(tx.try_send(frame(1)));
+        assert!(!tx.try_send(frame(2)));
+        assert!(matches!(rx.recv().await, Some(BodyEvent::Lost)));
+        assert!(tx.try_send(frame(3)));
+        assert!(matches!(rx.recv().await,Some(BodyEvent::Frame(f)) if f.revision==3));
+    }
+    #[tokio::test]
+    async fn loss_wakes_waiting_receiver_without_followup_frame() {
+        let (tx, mut rx) = body_event_channel(1);
+        let waiting = tokio::spawn(async move { rx.recv().await });
+        tokio::task::yield_now().await;
+        tx.invalidate();
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), waiting)
+            .await
+            .expect("loss must wake receiver")
+            .unwrap();
+        assert!(matches!(event, Some(BodyEvent::Lost)));
+    }
+    #[tokio::test]
+    async fn oversize_body_event_is_dropped_and_invalidates() {
+        let (tx, mut rx) = body_event_channel(2);
+        let mut big = frame(1);
+        big.changes.push(BodyChange::Append {
+            turn_id: "t".into(),
+            item_id: "i".into(),
+            text: "a".repeat(1024 * 1024 + 1),
+        });
+        assert!(!tx.try_send(big));
+        assert!(matches!(rx.recv().await, Some(BodyEvent::Lost)));
+    }
+    #[tokio::test]
+    async fn queued_body_budget_is_global_and_reclaimed_on_loss() {
+        let (tx, mut rx) = body_event_channel(32);
+        for n in 0..16 {
+            let mut f = frame(n + 1);
+            f.changes.push(BodyChange::Append {
+                turn_id: "t".into(),
+                item_id: format!("{n}"),
+                text: "a".repeat(1024 * 1024),
+            });
+            assert!(tx.try_send(f));
+        }
+        let mut excess = frame(17);
+        excess.changes.push(BodyChange::Append {
+            turn_id: "t".into(),
+            item_id: "overflow".into(),
+            text: "x".into(),
+        });
+        assert!(!tx.try_send(excess));
+        assert!(matches!(rx.recv().await, Some(BodyEvent::Lost)));
+        let mut next = frame(18);
+        next.changes.push(BodyChange::Append {
+            turn_id: "t".into(),
+            item_id: "next".into(),
+            text: "a".repeat(1024 * 1024),
+        });
+        assert!(tx.try_send(next));
+        assert!(matches!(rx.recv().await,Some(BodyEvent::Frame(f)) if f.revision==18));
+    }
+}
+
+// 只在历史结构变化时重建 canonical 引用，正文补丁只访问被修改的 item。
+#[derive(Default)]
+pub(crate) struct BodyPatchTracker {
+    references: std::collections::HashSet<String>,
+    active: std::collections::HashMap<String, String>,
+    complete: bool,
+}
+struct ItemBefore {
+    id: String,
+    text: String,
+}
+struct ItemTouch {
+    entity: String,
+    index: usize,
+    operation: String,
+    before: Option<ItemBefore>,
+    last_proposed: Option<String>,
+    invalid: bool,
+    structural: bool,
+}
+pub(crate) struct PreparedBodyPatch {
+    items: Vec<ItemTouch>,
+    turns: std::collections::HashSet<String>,
+    added: std::collections::HashSet<String>,
+    invalid: std::collections::HashSet<String>,
+    structural: bool,
+    reset: bool,
+}
+fn body_entities(state: &serde_json::Value) -> Option<&serde_json::Map<String, serde_json::Value>> {
+    state
+        .pointer("/turnHistory/history/entitiesByKey")?
+        .as_object()
+}
+fn body_item(state: &serde_json::Value, entity: &str, index: usize) -> Option<ItemBefore> {
+    let item = body_entities(state)?
+        .get(entity)?
+        .get("items")?
+        .as_array()?
+        .get(index)?;
+    if item.get("type")?.as_str()? != "agentMessage" {
+        return None;
+    }
+    let text = item.get("text")?.as_str()?;
+    if text.len() > 1024 * 1024 {
+        return None;
+    }
+    Some(ItemBefore {
+        id: item.get("id")?.as_str()?.to_owned(),
+        text: text.to_owned(),
+    })
+}
+impl BodyPatchTracker {
+    fn refresh_references(&mut self, state: &serde_json::Value) {
+        self.references.clear();
+        if let Some(islands) = state
+            .pointer("/turnHistory/history/islands")
+            .and_then(|v| v.as_array())
+        {
+            for island in islands {
+                if let Some(entries) = island.get("entries").and_then(|v| v.as_array()) {
+                    for entry in entries {
+                        if let Some(value) = entry.get("value").and_then(|v| v.as_str()) {
+                            self.references.insert(value.to_owned());
+                        }
+                    }
+                }
+            }
+        }
+        self.complete = state
+            .pointer("/turnHistory/history/isComplete")
+            .and_then(|v| v.as_bool())
+            == Some(true);
+    }
+    pub(crate) fn baseline(&mut self, state: &serde_json::Value) {
+        self.active.clear();
+        self.refresh_references(state);
+    }
+    pub(crate) fn prepare(
+        &self,
+        state: &serde_json::Value,
+        change: &serde_json::Value,
+    ) -> PreparedBodyPatch {
+        let mut p = PreparedBodyPatch {
+            items: Vec::new(),
+            turns: Default::default(),
+            added: Default::default(),
+            invalid: Default::default(),
+            structural: false,
+            reset: false,
+        };
+        let Some(ops) = change.get("patches").and_then(|v| v.as_array()) else {
+            p.reset = true;
+            return p;
+        };
+        for op in ops {
+            let Some(path) = op.get("path").and_then(|v| v.as_array()) else {
+                p.reset = true;
+                continue;
+            };
+            if path.first().and_then(|v| v.as_str()) != Some("turnHistory") {
+                continue;
+            }
+            if path.get(1).and_then(|v| v.as_str()) != Some("history") {
+                p.reset = true;
+                continue;
+            }
+            match path.get(2).and_then(|v| v.as_str()) {
+                Some("islands") => {
+                    p.structural = true;
+                }
+                Some("isComplete") => {
+                    p.reset = true;
+                }
+                Some("entitiesByKey") => {
+                    let Some(entity) = path.get(3).and_then(|v| v.as_str()) else {
+                        p.reset = true;
+                        continue;
+                    };
+                    let name = op.get("op").and_then(|v| v.as_str()).unwrap_or("");
+                    if path.len() == 4 {
+                        if name == "add"
+                            && body_entities(state).and_then(|e| e.get(entity)).is_none()
+                        {
+                            p.added.insert(entity.to_owned());
+                        } else {
+                            p.invalid.insert(entity.to_owned());
+                        }
+                        continue;
+                    }
+                    match path.get(4).and_then(|v| v.as_str()) {
+                        Some("status") => {
+                            p.turns.insert(entity.to_owned());
+                        }
+                        Some("items") => {
+                            let item_type = op
+                                .get("value")
+                                .and_then(|v| v.get("type"))
+                                .and_then(|v| v.as_str());
+                            if matches!(item_type, Some("error" | "retry")) {
+                                p.invalid.insert(entity.to_owned());
+                                continue;
+                            }
+                            let Some(index) = path
+                                .get(5)
+                                .and_then(|v| v.as_u64())
+                                .and_then(|v| usize::try_from(v).ok())
+                            else {
+                                p.invalid.insert(entity.to_owned());
+                                continue;
+                            };
+                            if path.len() > 7
+                                || (path.len() == 7 && path[6].as_str() != Some("text"))
+                            {
+                                p.invalid.insert(entity.to_owned());
+                                continue;
+                            }
+                            let proposed = if path.len() == 7 && name == "replace" {
+                                op.get("value")
+                                    .and_then(|v| v.as_str())
+                                    .filter(|text| text.len() <= 1024 * 1024)
+                            } else {
+                                None
+                            };
+                            if let Some(existing) = p
+                                .items
+                                .iter_mut()
+                                .find(|item| item.entity == entity && item.index == index)
+                            {
+                                let prior = existing.last_proposed.as_deref();
+                                match (prior, proposed) {
+                                    (Some(old), Some(next)) if next.starts_with(old) => {
+                                        existing.last_proposed = Some(next.to_owned())
+                                    }
+                                    _ => existing.invalid = true,
+                                }
+                            } else {
+                                let before = if path.len() == 6 && name == "add" {
+                                    None
+                                } else {
+                                    body_item(state, entity, index)
+                                };
+                                let invalid = match (&before, proposed) {
+                                    (Some(old), Some(next)) => !next.starts_with(&old.text),
+                                    _ => false,
+                                };
+                                p.items.push(ItemTouch {
+                                    entity: entity.to_owned(),
+                                    index,
+                                    operation: name.to_owned(),
+                                    before,
+                                    last_proposed: proposed.map(str::to_owned),
+                                    invalid,
+                                    structural: path.len() == 6,
+                                });
+                            }
+                        }
+                        Some("params") => {}
+                        Some(_) | None => {
+                            p.invalid.insert(entity.to_owned());
+                        }
+                    }
+                }
+                Some(_) => {}
+                None => {
+                    p.reset = true;
+                }
+            }
+        }
+        p
+    }
+    pub(crate) fn finish(
+        &mut self,
+        state: &serde_json::Value,
+        p: PreparedBodyPatch,
+    ) -> Vec<BodyChange> {
+        if p.reset {
+            self.baseline(state);
+            return vec![BodyChange::Baseline];
+        }
+        if p.structural {
+            self.refresh_references(state);
+        }
+        if !self.complete {
+            self.baseline(state);
+            return vec![BodyChange::Baseline];
+        }
+        let Some(entities) = body_entities(state) else {
+            self.baseline(state);
+            return vec![BodyChange::Baseline];
+        };
+        let mut changes = Vec::new();
+        let mut identities = std::collections::HashMap::<&str, usize>::new();
+        if p.structural || !p.added.is_empty() {
+            for key in &self.references {
+                if let Some(id) = entities
+                    .get(key)
+                    .and_then(|turn| turn.get("turnId"))
+                    .and_then(|id| id.as_str())
+                {
+                    *identities.entry(id).or_default() += 1;
+                }
+            }
+        }
+        if p.structural || !p.added.is_empty() {
+            let removed: Vec<_> = self
+                .active
+                .iter()
+                .filter(|(key, id)| {
+                    !self.references.contains(*key)
+                        || identities.get(id.as_str()).copied() != Some(1)
+                })
+                .map(|(key, _)| key.clone())
+                .collect();
+            for entity in removed {
+                if let Some(turn_id) = self.active.remove(&entity) {
+                    changes.push(BodyChange::InvalidatedItem {
+                        turn_id,
+                        item_id: None,
+                    });
+                }
+            }
+        }
+        for entity in p.invalid {
+            if let Some(turn_id) = self.active.remove(&entity) {
+                changes.push(BodyChange::InvalidatedItem {
+                    turn_id,
+                    item_id: None,
+                });
+            }
+        }
+        for entity in p.added {
+            let Some(turn) = entities.get(&entity) else {
+                continue;
+            };
+            if !self.references.contains(&entity)
+                || turn.get("status").and_then(|v| v.as_str()) != Some("inProgress")
+            {
+                continue;
+            }
+            let Some(id) = turn.get("turnId").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            if turn
+                .get("items")
+                .and_then(|v| v.as_array())
+                .is_none_or(|items| !items.is_empty())
+            {
+                continue;
+            }
+            if identities.get(id).copied() != Some(1)
+                || self.active.values().any(|value| value == id)
+            {
+                continue;
+            }
+            self.active.insert(entity, id.to_owned());
+        }
+        let changed_items: std::collections::HashSet<_> = p
+            .items
+            .iter()
+            .filter(|touch| touch.structural)
+            .map(|touch| touch.entity.clone())
+            .collect();
+        for entity in changed_items {
+            let Some(turn_id) = self.active.get(&entity).cloned() else {
+                continue;
+            };
+            let Some(items) = entities
+                .get(&entity)
+                .and_then(|turn| turn.get("items"))
+                .and_then(|items| items.as_array())
+            else {
+                self.active.remove(&entity);
+                changes.push(BodyChange::InvalidatedItem {
+                    turn_id,
+                    item_id: None,
+                });
+                continue;
+            };
+            let mut seen = std::collections::HashSet::new();
+            let ambiguous =
+                items
+                    .iter()
+                    .any(|item| match item.get("id").and_then(|id| id.as_str()) {
+                        Some(id) if !id.is_empty() => !seen.insert(id),
+                        _ => {
+                            item.get("type").and_then(|kind| kind.as_str()) == Some("agentMessage")
+                        }
+                    });
+            if ambiguous {
+                self.active.remove(&entity);
+                changes.push(BodyChange::InvalidatedItem {
+                    turn_id,
+                    item_id: None,
+                });
+            }
+        }
+        for touch in p.items {
+            let Some(turn_id) = self.active.get(&touch.entity).cloned() else {
+                continue;
+            };
+            if !self.references.contains(&touch.entity) {
+                self.active.remove(&touch.entity);
+                changes.push(BodyChange::InvalidatedItem {
+                    turn_id,
+                    item_id: None,
+                });
+                continue;
+            }
+            let after = body_item(state, &touch.entity, touch.index);
+            if touch.invalid {
+                if let Some(before) = touch.before {
+                    changes.push(BodyChange::InvalidatedItem {
+                        turn_id,
+                        item_id: Some(before.id),
+                    });
+                }
+                continue;
+            }
+            match (touch.before, after) {
+                (None, Some(after)) if touch.operation == "add" && after.text.is_empty() => {
+                    let turn = &entities[&touch.entity];
+                    let model = turn
+                        .pointer("/params/collaborationMode/settings/model")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_owned);
+                    let channel = turn
+                        .pointer("/params/modelProvider")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_owned);
+                    changes.push(BodyChange::EmptyItem {
+                        turn_id,
+                        item_id: after.id,
+                        model,
+                        channel,
+                    });
+                }
+                (Some(before), Some(after))
+                    if before.id == after.id && touch.operation != "remove" =>
+                {
+                    if let Some(suffix) = after.text.strip_prefix(&before.text) {
+                        if !suffix.is_empty() {
+                            changes.push(BodyChange::Append {
+                                turn_id,
+                                item_id: after.id,
+                                text: suffix.to_owned(),
+                            });
+                        }
+                    } else {
+                        changes.push(BodyChange::InvalidatedItem {
+                            turn_id,
+                            item_id: Some(before.id),
+                        });
+                    }
+                }
+                (Some(before), _) => changes.push(BodyChange::InvalidatedItem {
+                    turn_id,
+                    item_id: Some(before.id),
+                }),
+                _ => {}
+            }
+        }
+        for entity in p.turns {
+            let Some(turn_id) = self.active.get(&entity).cloned() else {
+                continue;
+            };
+            let status = entities
+                .get(&entity)
+                .and_then(|v| v.get("status"))
+                .and_then(|v| v.as_str());
+            if matches!(
+                status,
+                Some("completed" | "failed" | "interrupted" | "cancelled")
+            ) {
+                changes.push(BodyChange::TurnTerminal {
+                    turn_id,
+                    completed: status == Some("completed"),
+                });
+                self.active.remove(&entity);
+            }
+        }
+        changes
+    }
+}
+
+#[cfg(test)]
+mod patch_tests {
+    use super::*;
+    use serde_json::json;
+    #[test]
+    fn multiple_text_ops_in_one_frame_append_once() {
+        let state = json!({"turnHistory":{"history":{"isComplete":true,"islands":[{"entries":[{"value":"turn:x"}]}],"entitiesByKey":{"turn:x":{"turnId":"x","status":"inProgress","items":[{"type":"agentMessage","id":"i","text":"a"}]}}}}});
+        let mut tracker = BodyPatchTracker::default();
+        tracker.baseline(&state);
+        tracker.active.insert("turn:x".into(), "x".into());
+        let change = json!({"patches":[{"op":"replace","path":["turnHistory","history","entitiesByKey","turn:x","items",0,"text"],"value":"ab"},{"op":"replace","path":["turnHistory","history","entitiesByKey","turn:x","items",0,"text"],"value":"abc"}]});
+        let prepared = tracker.prepare(&state, &change);
+        let mut after = state.clone();
+        after["turnHistory"]["history"]["entitiesByKey"]["turn:x"]["items"][0]["text"] =
+            json!("abc");
+        let events = tracker.finish(&after, prepared);
+        assert_eq!(events.len(), 1);
+        assert!(matches!(&events[0],BodyChange::Append {text,..} if text=="bc"));
+    }
+    #[test]
+    fn removed_canonical_reference_invalidates_active_turn() {
+        let state = json!({"turnHistory":{"history":{"isComplete":true,"islands":[{"entries":[{"value":"turn:x"}]}],"entitiesByKey":{"turn:x":{"turnId":"x","status":"inProgress","items":[]}}}}});
+        let mut tracker = BodyPatchTracker::default();
+        tracker.baseline(&state);
+        tracker.active.insert("turn:x".into(), "x".into());
+        let change = json!({"patches":[{"op":"remove","path":["turnHistory","history","islands",0,"entries",0]}]});
+        let prepared = tracker.prepare(&state, &change);
+        let mut after = state.clone();
+        after["turnHistory"]["history"]["islands"][0]["entries"] = json!([]);
+        let events = tracker.finish(&after, prepared);
+        assert!(events.iter().any(
+            |e| matches!(e,BodyChange::InvalidatedItem{turn_id,item_id:None} if turn_id=="x")
+        ));
+    }
+    #[test]
+    fn error_item_invalidates_active_turn() {
+        let state = json!({"turnHistory":{"history":{"isComplete":true,"islands":[{"entries":[{"value":"turn:x"}]}],"entitiesByKey":{"turn:x":{"turnId":"x","status":"inProgress","items":[{"type":"agentMessage","id":"i","text":"a"}]}}}}});
+        let mut tracker = BodyPatchTracker::default();
+        tracker.baseline(&state);
+        tracker.active.insert("turn:x".into(), "x".into());
+        let change = json!({"patches":[{"op":"add","path":["turnHistory","history","entitiesByKey","turn:x","items",1],"value":{"type":"error","id":"err"}}]});
+        let prepared = tracker.prepare(&state, &change);
+        let mut after = state.clone();
+        after["turnHistory"]["history"]["entitiesByKey"]["turn:x"]["items"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"type":"error","id":"err"}));
+        let events = tracker.finish(&after, prepared);
+        assert!(events.iter().any(
+            |e| matches!(e,BodyChange::InvalidatedItem{turn_id,item_id:None} if turn_id=="x")
+        ));
+    }
+    #[test]
+    fn duplicate_turn_identity_is_not_observable() {
+        let state = json!({"turnHistory":{"history":{"isComplete":true,"islands":[{"entries":[{"value":"turn:old"}]}],"entitiesByKey":{"turn:old":{"turnId":"x","status":"completed","items":[]}}}}});
+        let mut tracker = BodyPatchTracker::default();
+        tracker.baseline(&state);
+        let change = json!({"patches":[{"op":"add","path":["turnHistory","history","entitiesByKey","turn:new"],"value":{"turnId":"x","status":"inProgress","items":[]}},{"op":"add","path":["turnHistory","history","islands",0,"entries",1],"value":{"value":"turn:new"}}]});
+        let prepared = tracker.prepare(&state, &change);
+        let mut after = state.clone();
+        after["turnHistory"]["history"]["entitiesByKey"]["turn:new"] =
+            json!({"turnId":"x","status":"inProgress","items":[]});
+        after["turnHistory"]["history"]["islands"][0]["entries"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"value":"turn:new"}));
+        tracker.finish(&after, prepared);
+        assert!(!tracker.active.contains_key("turn:new"));
+    }
+    #[test]
+    fn duplicate_item_identity_invalidates_turn() {
+        let state = json!({"turnHistory":{"history":{"isComplete":true,"islands":[{"entries":[{"value":"turn:x"}]}],"entitiesByKey":{"turn:x":{"turnId":"x","status":"inProgress","items":[{"type":"agentMessage","id":"i","text":"a"}]}}}}});
+        let mut tracker = BodyPatchTracker::default();
+        tracker.baseline(&state);
+        tracker.active.insert("turn:x".into(), "x".into());
+        let change = json!({"patches":[{"op":"add","path":["turnHistory","history","entitiesByKey","turn:x","items",1],"value":{"type":"agentMessage","id":"i","text":""}}]});
+        let prepared = tracker.prepare(&state, &change);
+        let mut after = state.clone();
+        after["turnHistory"]["history"]["entitiesByKey"]["turn:x"]["items"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"type":"agentMessage","id":"i","text":""}));
+        let events = tracker.finish(&after, prepared);
+        assert!(events.iter().any(
+            |e| matches!(e,BodyChange::InvalidatedItem{turn_id,item_id:None} if turn_id=="x")
+        ));
+    }
+}
