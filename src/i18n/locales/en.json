@@ -256,7 +256,7 @@
       "hostName": "Machine name",
       "groupGeneral": "1. General",
       "groupChannels": "2. Channels (independent switches, can be on at the same time; click a card to expand its details below)",
-      "groupSecurity": "3. Access & security",
+      "groupSecurity": "4. Access & security",
       "chanLocal": "This machine",
       "chanLocalDesc": "Always on with remote access; the browser on this computer also needs the access password",
       "chanLocalLocked": "Always on while remote access is enabled",
@@ -484,7 +484,7 @@
       "tsClearedToast": "Revoked: {{count}} non-Tuvis entr(y/ies) were cleared along with it",
       "namedRunningHint": "Tunnel connected; the address is permanent",
       "namedOffHint": "Switch is off — the public address is unreachable; turn it on to restore it (the address never changes).",
-      "groupHeadless": "4. Headless injection (bypasses terminal confirmation)",
+      "groupHeadless": "General · Headless injection (bypasses terminal confirmation)",
       "headlessTitle": "Headless injection",
       "headlessHint": "Off by default. When off, the mobile client cannot send to Codex APP compatibility-channel sessions; terminal injection is unaffected.",
       "headlessLimitsSave": "Save headless settings",
@@ -496,7 +496,6 @@
       "compatSendHint": "Only applies to unverified Codex desktop builds; messages may be delivered to the wrong session — you accept the risk.",
       "compatSendNeedsProbe": "A read-only probe must complete first (the read chain of this Codex desktop build is not verified yet)",
       "groupCompatSend": "5. Compatibility send (unverified Codex desktop builds only)",
-      "groupCodexAdapt": "5. Codex auto-adapt",
       "codexAdaptTitle": "Auto-adapt",
       "codexAdaptHint": "When on, Tuvis connects to new Codex desktop builds based on their actual capabilities: tries first, remembers successes, reports failures honestly. When off, only verified capabilities are used.",
       "codexAdaptHintBody": "Auto-adapt is on: new builds connect based on their actual capabilities. If something goes wrong, see details in the send area.",
@@ -534,7 +533,7 @@
       "codexAdaptRefreshHint": "Read-only refresh of the current adapt status — no test send or approvals; a fresh probe runs automatically on the next connection.",
       "pinShow": "Show password",
       "pinHide": "Hide password",
-      "groupTools": "4. Tool-specific configuration",
+      "groupTools": "3. Tool-specific configuration",
       "zcode": {
         "title": "ZCode remote link",
         "desc": "One official ZCode remote link stored on this machine; paired phones read the same value",
@@ -720,6 +719,7 @@
     "tabResources": "Resources",
     "petToggle": "Show/hide pet",
     "clearFinishedCards": "Clear finished cards",
+    "clearFinishedCardsWithCount": "Clear finished cards ({{count}})",
     "filterAll": "All"
   },
   "status": {

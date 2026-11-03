@@ -22,9 +22,13 @@ export function WorkspacePageHeader({ title, description, actions }: WorkspacePa
           <p className="text-muted-foreground mt-0.5 text-xs leading-snug">{description}</p>
         ) : null}
       </div>
-      {/* 动作槽 min-w-0 + flex-wrap（同上）：超宽动作换到下一行，而不是挤标题 */}
+      {/* 动作槽 min-w-0 + flex-wrap（同上）：超宽动作换到下一行，而不是挤标题。
+          pt/pr 给动作按钮右上角的计数泡泡留出溢出空间：页头贴页顶，负偏移角标会被
+          外层 overflow-hidden 裁掉（红/绿泡泡只露下半个圆）。 */}
       {actions ? (
-        <div className="flex min-w-0 flex-wrap items-center justify-end gap-2">{actions}</div>
+        <div className="flex min-w-0 flex-wrap items-center justify-end gap-2 pt-2 pr-2">
+          {actions}
+        </div>
       ) : null}
     </header>
   );

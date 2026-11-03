@@ -2011,6 +2011,7 @@ describe("RemoteSection Codex 自动适配（S5 换装）", () => {
   it("换装：旧「兼容发送（实验）」开关不再渲染为可用开关；新「自动适配」开关按 remote_status 渲染", async () => {
     installAdaptInvoke({ enabled: true, explicit: null });
     render(<RemoteSection />);
+    fireEvent.click(screen.getByTestId("tool-config-header-codex"));
     const master = screen.getByRole("switch", { name: /enable remote access/i });
     await waitFor(() => expect(master).toBeEnabled());
     // 旧开关退出：兼容发送（实验）标题与其开关都不再出现
@@ -2025,6 +2026,7 @@ describe("RemoteSection Codex 自动适配（S5 换装）", () => {
   it("关闭后可再次开启：点关 → remote_toggle_codex_auto_adapt(false)；再点开 → true（同版本不重复弹首次提示）", async () => {
     installAdaptInvoke({ enabled: true, explicit: null });
     render(<RemoteSection />);
+    fireEvent.click(screen.getByTestId("tool-config-header-codex"));
     const master = screen.getByRole("switch", { name: /enable remote access/i });
     await waitFor(() => expect(master).toBeEnabled());
     // 首次提示在场（未读过）
@@ -2049,6 +2051,7 @@ describe("RemoteSection Codex 自动适配（S5 换装）", () => {
   it("首次轻提示一次语义：点「知道了」记录已读并消失；重新挂载不再出现", async () => {
     installAdaptInvoke({ hintSeen: null });
     const { unmount } = render(<RemoteSection />);
+    fireEvent.click(screen.getByTestId("tool-config-header-codex"));
     const master = screen.getByRole("switch", { name: /enable remote access/i });
     await waitFor(() => expect(master).toBeEnabled());
     // 本文件按默认英文断言（jsdom navigator.language=en）
@@ -2065,6 +2068,7 @@ describe("RemoteSection Codex 自动适配（S5 换装）", () => {
     // 已读过 → 再次进入（同版本、重新挂载）不重复弹
     installAdaptInvoke({ hintSeen: "true" });
     render(<RemoteSection />);
+    fireEvent.click(screen.getByTestId("tool-config-header-codex"));
     await waitFor(() => expect(screen.getByTestId("codex-adapt-switch")).toBeTruthy());
     expect(screen.queryByTestId("codex-adapt-hint")).toBeNull();
   });
@@ -2073,6 +2077,7 @@ describe("RemoteSection Codex 自动适配（S5 换装）", () => {
     // 已适配 = 有证据（evidenced.state）
     installAdaptInvoke({ adapt: { evidenced: { state: true, send: false, schema: false } } });
     render(<RemoteSection />);
+    fireEvent.click(screen.getByTestId("tool-config-header-codex"));
     await waitFor(() => expect(screen.getByTestId("codex-adapt-state")).toBeTruthy());
     expect(screen.getByTestId("codex-adapt-state").getAttribute("data-state")).toBe("adapted");
     cleanup();
@@ -2085,6 +2090,7 @@ describe("RemoteSection Codex 自动适配（S5 换装）", () => {
       },
     });
     render(<RemoteSection />);
+    fireEvent.click(screen.getByTestId("tool-config-header-codex"));
     await waitFor(() => expect(screen.getByTestId("codex-adapt-state")).toBeTruthy());
     expect(screen.getByTestId("codex-adapt-state").getAttribute("data-state")).toBe("probing");
     cleanup();
@@ -2097,6 +2103,7 @@ describe("RemoteSection Codex 自动适配（S5 换装）", () => {
       },
     });
     render(<RemoteSection />);
+    fireEvent.click(screen.getByTestId("tool-config-header-codex"));
     await waitFor(() => expect(screen.getByTestId("codex-adapt-state")).toBeTruthy());
     expect(screen.getByTestId("codex-adapt-state").getAttribute("data-state")).toBe("error");
     cleanup();
@@ -2108,6 +2115,7 @@ describe("RemoteSection Codex 自动适配（S5 换装）", () => {
       adapt: { autoAdaptExplicit: false, autoAdaptEnabled: false },
     });
     render(<RemoteSection />);
+    fireEvent.click(screen.getByTestId("tool-config-header-codex"));
     await waitFor(() => expect(screen.getByTestId("codex-adapt-state")).toBeTruthy());
     expect(screen.getByTestId("codex-adapt-state").getAttribute("data-state")).toBe("off");
   });
@@ -2115,10 +2123,38 @@ describe("RemoteSection Codex 自动适配（S5 换装）", () => {
   it("未知状态不显示 raw i18n 键：codex_adapt_status 失败 → 通用「状态暂不可用」文案", async () => {
     installAdaptInvoke({ adapt: "reject" });
     render(<RemoteSection />);
+    fireEvent.click(screen.getByTestId("tool-config-header-codex"));
     await waitFor(() => expect(screen.getByTestId("codex-adapt-state")).toBeTruthy());
     const state = screen.getByTestId("codex-adapt-state");
     expect(state.getAttribute("data-state")).toBe("unknown");
     expect(state.textContent).not.toMatch(/settings\.remote\./);
     expect(state.textContent).not.toMatch(/codexAdapt[A-Z]/);
+  });
+  it("分区顺序 1→2→3→4，工具卡默认折叠且点击才展开", async () => {
+    installAdaptInvoke();
+    const { container } = render(<RemoteSection />);
+
+    const groups = [...container.querySelectorAll("[data-group]")].map((node) =>
+      node.getAttribute("data-group")
+    );
+    expect(groups).toEqual(["general", "channels", "tools", "security"]);
+
+    const cards = [...container.querySelectorAll("[data-tool-card]")];
+    expect(cards.map((card) => card.getAttribute("data-tool-card"))).toEqual(["codex", "zcode"]);
+
+    const codexHeader = screen.getByTestId("tool-config-header-codex");
+    expect(codexHeader).toHaveAttribute("aria-expanded", "false");
+    expect(codexHeader).toHaveAttribute("aria-controls", "tool-config-panel-codex");
+    expect(screen.queryByTestId("codex-adapt-switch")).toBeNull();
+    fireEvent.click(codexHeader);
+    expect(codexHeader).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByTestId("codex-adapt-switch")).toBeTruthy();
+
+    const zcodeHeader = screen.getByTestId("zcode-card-header");
+    expect(zcodeHeader).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByTestId("zcode-card-panel")).toBeNull();
+    fireEvent.click(zcodeHeader);
+    expect(zcodeHeader).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByTestId("zcode-card-panel")).toBeTruthy();
   });
 });

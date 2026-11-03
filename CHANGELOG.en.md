@@ -52,7 +52,7 @@ _Only versions translated so far are listed here; the full history lives in the
   on-device acceptance has not run yet; see the acceptance report.
 - **ZCode unified control (official bridge)**: ZCode now drives sessions through the
   official bridge — the desktop completes **BigModel** authorization and connection in the
-  ZCode card under **Settings → Remote Access → ④ Tool-specific configuration** (official
+  ZCode card under **Settings → Remote Access → ③ Tool-specific configuration** (official
   credentials stay on this machine, **the JWT lives in memory only**, terminal tokens are
   fetched fresh each time, and the phone holds no credential or short-lived token), connects
   to the official host over a **single relay**, projects workspaces / sessions onto the board
@@ -96,7 +96,7 @@ _Only versions translated so far are listed here; the full history lives in the
   state is still conflict it only hints to close the official page first, and on failure
   shows the localized reason for the frozen error code in place. It never loops.
 - **ZCode official remote link configuration with per-state phone hints**: the remote
-  settings gained a "④ Tool-specific configuration" section whose first release is a
+  settings gained a "③ Tool-specific configuration" section whose first release is a
   single collapsed ZCode card — it stores the official remote-control link produced by
   the ZCode app's "mobile remote control" on this machine (strict format checks: only
   https on the official host with a versioned /remote/vN path and a non-empty sid;
@@ -130,11 +130,10 @@ _Only versions translated so far are listed here; the full history lives in the
   migration and no fabricated toggle audit; the existing timeout (600000 ms), concurrency
   cap (2) and the compatibility-send guards (read-chain verification / build / device /
   pending queue) are unchanged.
-- **Remote settings page rearranged into a fixed six-section order**: ① General →
-  ② Channels → ③ Access & security (including the device list) → ④ Tool-specific
-  configuration → ⑤ Headless injection (with compatibility send) → Injection audit;
-  the headless and compatibility-send controls were extracted into their own sub-section,
-  and the compatibility-send probe hint now only appears while the switch is off.
+- **Remote settings page rearranged into a fixed four-section order**: ① General
+  (including headless injection) → ② Channels → ③ Tool-specific configuration
+  (Codex APP / ZCode collapsible cards) → ④ Access & security (including the device list)
+  → Injection audit.
 - **Access PIN masked by default**: the 4-digit PIN box in settings starts masked, with
   an eye button toggling reveal / mask; leaving the block, switching settings blocks, or
   the window losing focus restores the mask automatically — display only; the PIN value,

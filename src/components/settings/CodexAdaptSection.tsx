@@ -21,7 +21,6 @@ import { cn } from "@/lib/utils";
 import { formatInvokeError } from "@/lib/invokeError";
 import { getSetting, setSetting } from "@/lib/api/settings";
 // 组标题档（线稿 .group-label 硬契约）：非豁免面不得写裸字号字面量（排版锁 ③）
-import { SETTINGS_REMOTE_GROUP_LABEL } from "@/components/settings/typography";
 import { adaptSummaryOf, codexAdaptStatus, type CodexAdaptStatus } from "@/lib/api/remote";
 import { reportIssue, reportIssueSummary } from "@/lib/reportIssue";
 
@@ -185,9 +184,6 @@ export function CodexAdaptSection({
 
   return (
     <>
-      <div className={`text-muted-foreground mt-4 ${SETTINGS_REMOTE_GROUP_LABEL} font-semibold`}>
-        {t("settings.remote.groupCodexAdapt")}
-      </div>
       {/* 首次轻提示（一次语义）：设计 §3.4 逐字口径，不宣称已解锁全部能力 */}
       {hintSeen === false && (
         <div

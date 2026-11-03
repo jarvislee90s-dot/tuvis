@@ -214,11 +214,20 @@ export default function HomePage() {
                 {finishedCards.length > 0 && (
                   <button
                     onClick={clearFinishedCards}
-                    className="text-muted-foreground hover:bg-muted hover:text-foreground rounded p-1.5 transition-colors"
+                    data-testid="clear-finished-cards"
+                    className="text-muted-foreground hover:bg-muted hover:text-foreground relative rounded p-1.5 transition-colors"
                     title={t("home.clearFinishedCards")}
-                    aria-label={t("home.clearFinishedCards")}
+                    aria-label={t("home.clearFinishedCardsWithCount", {
+                      count: finishedCards.length,
+                    })}
                   >
                     <CheckCheck className="h-4 w-4" />
+                    <span
+                      data-testid="clear-finished-count"
+                      className="absolute -top-1 -right-1 flex h-4 min-w-4 items-center justify-center rounded-full bg-green-500 px-1 text-[10px] leading-none font-semibold text-white"
+                    >
+                      {finishedCards.length}
+                    </span>
                   </button>
                 )}
                 <NotificationBell />

@@ -256,7 +256,7 @@
       "hostName": "本机名称",
       "groupGeneral": "① 通用",
       "groupChannels": "② 通道（开关各自独立，可同时开启；点卡片在下方展开详情）",
-      "groupSecurity": "③ 访问与安全",
+      "groupSecurity": "④ 访问与安全",
       "chanLocal": "本机",
       "chanLocalDesc": "随远程接入常驻；本机浏览器访问同样需要访问密码",
       "chanLocalLocked": "随「开启远程接入」常驻",
@@ -484,7 +484,7 @@
       "tsClearedToast": "已撤销：另有 {{count}} 条非 兔维斯 条目被一并清除",
       "namedRunningHint": "隧道已连接；地址永久有效",
       "namedOffHint": "开关未打开——公网地址暂不可达；打开开关后恢复（地址不变，无需重配）。",
-      "groupHeadless": "④ 无头注入（绕过终端可视确认）",
+      "groupHeadless": "通用 · 无头注入（绕过终端可视确认）",
       "headlessTitle": "无头注入",
       "headlessHint": "默认关闭。关闭时，手机端无法向 Codex APP 兼容通道会话发消息；终端注入不受影响。",
       "headlessLimitsSave": "保存无头配置",
@@ -496,7 +496,6 @@
       "compatSendHint": "仅对未验证的 Codex 桌面版本生效；消息可能被投递到错误会话，风险自负。",
       "compatSendNeedsProbe": "需先完成只读探测（该 Codex 桌面版本的读链尚未取证）",
       "groupCompatSend": "⑤ 兼容发送（仅未验证的 Codex 桌面版本）",
-      "groupCodexAdapt": "⑤ Codex 自动适配",
       "codexAdaptTitle": "自动适配",
       "codexAdaptHint": "开启后，兔维斯会按实际能力尝试连接新版 Codex 桌面端：先尝试、成功后记住、失败如实显示；关闭则只使用已验证的能力。",
       "codexAdaptHintBody": "已开启自动适配；新版本会按实际能力尝试连接，遇到问题可在发送区查看详情。",
@@ -534,7 +533,7 @@
       "codexAdaptRefreshHint": "只读刷新当前适配状态，不含测试发送或审批；重新探测会在下次连接时自动进行。",
       "pinShow": "显示密码",
       "pinHide": "隐藏密码",
-      "groupTools": "④ 工具特殊配置",
+      "groupTools": "③ 工具特殊配置",
       "zcode": {
         "title": "ZCode 远控链接",
         "desc": "本机保存一条 ZCode 官方远控链接，已配对的手机共享读取",
@@ -720,6 +719,7 @@
     "tabResources": "资源",
     "petToggle": "显示/隐藏桌宠",
     "clearFinishedCards": "一键清除已完成卡片",
+    "clearFinishedCardsWithCount": "一键清除已完成（{{count}} 张）",
     "filterAll": "全部"
   },
   "status": {

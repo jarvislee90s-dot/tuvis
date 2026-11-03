@@ -1,9 +1,9 @@
 // 设置页「远程接入」分区（§C4：按线稿 v6 重排为 4 张对外通道卡，UI 唯一契约 =
 // docs/engineering/architecture/wireframes/2026-09-17-remote-settings-redesign.html）。
-// 结构三段式：① 通用（总开关 / 电源保活 / 本机名称）② 通道四卡一排 + 唯一展开
-// 详情区（局域网连接 / 临时隧道 / 自有域名 / 外部域名——「本机」不是
-// 通道，是访问方式：走局域网卡地址，零豁免 §C4）③ 访问与安全（访问密码 / 重置设备
-// / 已接入设备列表）。状态唯一数据源 = remote_status 的 channels + pin 载荷（M5 A5）；
+// 结构四段式：① 通用（总开关 / 电源保活 / 本机名称；含无头注入子区）→ ② 通道四卡一排
+// + 唯一展开详情区（局域网连接 / 临时隧道 / 自有域名 / 外部域名——「本机」不是通道，
+// 是访问方式：走局域网卡地址，零豁免 §C4）→ ③ 工具特殊配置（Codex APP / ZCode 折叠卡）
+// → ④ 访问与安全（访问密码 / 重置设备 / 已接入设备列表）；注入审计由设置页紧随其后。状态唯一数据源 = remote_status 的 channels + pin 载荷（M5 A5）；
 // tailscale 卡相位数据源 = remote_ts_probe（§C2/§C3；相位枚举见 TsPhase）；命令统一走
 // src/lib/api/remote.ts；Token / 本机名 / 保活写通用 set_setting。
 // 排版层级统一走 components/settings/typography.ts 单一出处（2026-10-07 用户裁决 C1）：
@@ -56,6 +56,7 @@ import { ChannelQr } from "@/components/settings/ChannelQr";
 import { ProcessHint } from "@/components/settings/ProcessHint";
 // S5：Codex 自动适配卡（开关 + 状态详情 + 首次一次轻提示 + 报告入口）
 import { CodexAdaptSection } from "@/components/settings/CodexAdaptSection";
+import { ToolConfigCard } from "@/components/settings/ToolConfigCard";
 import { ToolRemoteSettingsSection } from "@/components/settings/ToolRemoteSettingsSection";
 
 // B1：撤销预览载荷（Rust 端 run_step("disable_preview") 的形状，见 wizard.rs 注释）
@@ -826,7 +827,10 @@ export function RemoteSection() {
         </div>
         <div className="p-3">
           {/* ① 通用 */}
-          <div className="text-muted-foreground mt-2 text-[12.5px] font-semibold">
+          <div
+            data-group="general"
+            className="text-muted-foreground mt-2 text-[12.5px] font-semibold"
+          >
             {t("settings.remote.groupGeneral")}
           </div>
           <div className="flex items-center justify-between gap-4 py-3">
@@ -883,7 +887,7 @@ export function RemoteSection() {
             />
           </div>
 
-          {/* ③b 无头注入（H3）：**单一总开关**，默认关；H4 的 watchdog 超时 /
+          {/* ①b 通用 · 无头注入（H3）：**单一总开关**，默认关；H4 的 watchdog 超时 /
               并发上限两件同住本分组。开关关闭时兼容发送入口一律 403/置灰。 */}
           <div className="text-muted-foreground mt-4 text-[12.5px] font-semibold">
             {t("settings.remote.groupHeadless")}
@@ -952,21 +956,11 @@ export function RemoteSection() {
             </Button>
           </div>
 
-          {/* ⑤ Codex 自动适配（S5 换装）：开关 = remote.codex_auto_adapt（S1 新设置键，
-              三态缺省开；命令 remote_toggle_codex_auto_adapt）。状态详情卡 =
-              codex_adapt_status DTO（attemptable/evidenced 两维度，前端只展示）。
-              旧「兼容发送（实验）」开关已随 S1 退出所有门，本批起不再渲染为可用开关
-              （键与命令保留至 S6 同步旧契约）。 */}
-          <CodexAdaptSection
-            enabled={status?.codexAutoAdaptEnabled ?? true}
-            explicit={status?.codexAutoAdaptExplicit ?? null}
-            loaded={status !== null}
-            busy={busy}
-            onToggle={(v) => void applyCodexAdapt(v)}
-          />
-
           {/* ② 通道（开关各自独立，可同时开启；点卡片在下方展开详情） */}
-          <div className="text-muted-foreground mt-4 text-[12.5px] font-semibold">
+          <div
+            data-group="channels"
+            className="text-muted-foreground mt-4 text-[12.5px] font-semibold"
+          >
             {t("settings.remote.groupChannels")}
           </div>
           <div className="mt-2 grid grid-cols-4 gap-2">
@@ -1337,8 +1331,28 @@ export function RemoteSection() {
             )}
           </div>
 
-          {/* ③ 访问与安全 */}
-          <div className="text-muted-foreground mt-4 text-[12.5px] font-semibold">
+          {/* ③ 工具特殊配置（Codex APP / ZCode 各一张折叠卡，默认收起） */}
+          <div
+            data-group="tools"
+            className="text-muted-foreground mt-4 text-[12.5px] font-semibold"
+          >
+            {t("settings.remote.groupTools")}
+          </div>
+          <ToolConfigCard toolId="codex" title="Codex APP">
+            <CodexAdaptSection
+              enabled={status?.codexAutoAdaptEnabled ?? true}
+              explicit={status?.codexAutoAdaptExplicit ?? null}
+              loaded={status !== null}
+              busy={busy}
+              onToggle={(v) => void applyCodexAdapt(v)}
+            />
+          </ToolConfigCard>
+          <ToolRemoteSettingsSection />
+          {/* ④ 访问与安全 */}
+          <div
+            data-group="security"
+            className="text-muted-foreground mt-4 text-[12.5px] font-semibold"
+          >
             {t("settings.remote.groupSecurity")}
           </div>
           <div className="flex items-center justify-between gap-4 py-3">
@@ -1533,13 +1547,6 @@ export function RemoteSection() {
           </DialogFooter>
         </DialogContent>
       </Dialog>
-
-      {/* ④ ZCode 工具特殊配置（本分支）：官方链接保存/校验与本地控制反馈；
-          卡内容独立，分组标题沿用既有 groupTools。 */}
-      <div data-group="tools" className="text-muted-foreground mt-4 text-[12.5px] font-semibold">
-        {t("settings.remote.groupTools")}
-      </div>
-      <ToolRemoteSettingsSection />
     </div>
   );
 }
