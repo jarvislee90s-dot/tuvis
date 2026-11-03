@@ -1202,6 +1202,7 @@ const ACTION_KEYS: &[(&str, &[&str])] = &[
             "generation",
             "interactionId",
             "decision",
+            "feedback",
         ],
     ),
     (

@@ -39,12 +39,9 @@ pub fn build_selection_command(view: &SessionView, model: &str, thought: &str) -
 /// （或旧载荷的空分组时退化为当前会话 provider），模型与档位必须属于该分组自己的
 /// 模型目录；他组模型 / 他组档位一律 `invalid_action`。
 ///
-/// 可用性三态（`allow_unknown` = 用户已在手机端二次确认）：
-/// - 显式 `available=true`：直接允许；
-/// - 显式 `available=false`：**始终**拒绝（确认标志不能把已知不可用变成可尝试）；
-/// - 缺 `available` 字段（`availability_known=false`）：无论解析时 `available` 的
-///   默认值如何，`allow_unknown=false` 一律拒绝，`true` 才允许一次尝试；命令仍恰为
-///   一次完整 provider/model/thought 三元组。
+/// 可用性只由宿主运行时判定：目录里的 `available`/`availability_known` 不再在发送前
+/// 拦截；只要 provider/model/thought 三元组属于目录，就发送一次完整切换命令，由宿主
+/// 返回真实错误。`allow_unknown` 仅保留旧调用签名，当前不参与判定。
 pub fn build_selection_command_for_provider(
     view: &SessionView,
     provider: &str,
@@ -63,18 +60,9 @@ pub fn build_selection_command_for_provider(
         .providers
         .iter()
         .find(|candidate| candidate.provider_id == provider);
+    let _ = allow_unknown;
     let models = match group {
-        Some(group) => {
-            // 显式不可用是已知事实：确认标志也不放行。
-            if group.availability_known && !group.available {
-                return Err(ZcodeError::of(codes::INVALID_ACTION));
-            }
-            // 缺 available = 未知：只有用户显式确认后才允许一次尝试。
-            if !group.availability_known && !allow_unknown {
-                return Err(ZcodeError::of(codes::INVALID_ACTION));
-            }
-            &group.models
-        }
+        Some(group) => &group.models,
         None if provider == selection.provider && selection.providers.is_empty() => {
             &selection.models
         }
@@ -903,36 +891,35 @@ mod provider_tests {
     }
 
     #[test]
-    fn unknown_provider_requires_explicit_confirmation() {
+    fn unknown_provider_selection_is_sent_without_confirmation() {
         let selection = parse_selection_view(&raw_availability_three_states()).unwrap();
         let view = session_with(selection);
-        // 缺字段 B：不带确认 → 拒绝（零尝试）。
-        let rejected = build_selection_command_for_provider(&view, "b", "mb", "low", false)
-            .expect_err("unknown provider without confirmation must be rejected");
-        assert!(rejected.is(codes::INVALID_ACTION));
-        // 带显式确认 → 允许，且信封仍是一次完整三元组。
-        let command = build_selection_command_for_provider(&view, "b", "mb", "low", true).unwrap();
-        assert_eq!(
-            command["payload"],
-            serde_json::json!({"provider": "b", "model": "mb", "thought": "low"})
-        );
-        // 当前 provider 缺字段：同样不宣称已知，未确认仍拒绝；确认后才放行。
-        assert!(build_selection_command_for_provider(&view, "a", "ma", "low", false).is_err());
+        for allow_unknown in [false, true] {
+            let command =
+                build_selection_command_for_provider(&view, "b", "mb", "low", allow_unknown)
+                    .expect("unknown provider is sent; host decides");
+            assert_eq!(
+                command["payload"],
+                serde_json::json!({"provider": "b", "model": "mb", "thought": "low"})
+            );
+        }
+        assert!(build_selection_command_for_provider(&view, "a", "ma", "low", false).is_ok());
         assert!(build_selection_command_for_provider(&view, "a", "ma", "low", true).is_ok());
     }
 
     #[test]
-    fn explicit_unavailable_provider_stays_disabled() {
+    fn explicit_unavailable_provider_is_still_selectable() {
         let selection = parse_selection_view(&raw_availability_three_states()).unwrap();
         let view = session_with(selection);
-        // 显式 false：确认标志也不能放行（不是「未知」，是已宣告不可用）。
         for allow_unknown in [false, true] {
-            let rejected =
+            let command =
                 build_selection_command_for_provider(&view, "c", "mc", "low", allow_unknown)
-                    .expect_err("explicit unavailable provider must stay rejected");
-            assert!(rejected.is(codes::INVALID_ACTION));
+                    .expect("explicit unavailable provider is sent; host decides");
+            assert_eq!(
+                command["payload"],
+                serde_json::json!({"provider": "c", "model": "mc", "thought": "low"})
+            );
         }
-        // 显式 true 不受确认标志影响。
         assert!(build_selection_command_for_provider(&view, "d", "md", "low", false).is_ok());
     }
 }

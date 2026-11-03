@@ -2396,7 +2396,6 @@ describe("ZCode 控制面板：多组待处理并存", () => {
   it("plan_approval_tab_uses_dedicated_label_and_approves_once", async () => {
     const PLAN_ID = "int_00000000000000000000000000000002";
     const SECOND_QUESTION_ID = "int_00000000000000000000000000000003";
-    const openSpy = vi.spyOn(window, "open").mockReturnValue(null);
     // 计划卡：唯一宿主原值 approve；普通问答卡作为第二 tab，验证不误伤。
     installFetch((url) => {
       if (url === ZCODE_CONNECTION_PATH) return json(connection());
@@ -2422,8 +2421,10 @@ describe("ZCode 控制面板：多组待处理并存", () => {
                     options: [
                       { value: "approve", label: "批准", description: null, preview: null },
                     ],
+                    freeTextAllowed: true,
                   }),
                 ],
+                detail: "# Synthetic plan",
               }),
               pendingView({
                 interactionId: SECOND_QUESTION_ID,
@@ -2447,10 +2448,16 @@ describe("ZCode 控制面板：多组待处理并存", () => {
     const slot = screen.getByTestId(`zcode-pending-slot-${PLAN_ID}`);
     const scope = within(slot);
     expect(scope.getByTestId("zcode-pending-card").getAttribute("data-plan-approval")).toBe("true");
-    expect(scope.getByText("计划批准")).toBeVisible();
+    expect(scope.queryByText("计划批准")).toBeNull();
     expect(scope.queryByText("等待回答")).toBeNull();
     expect(scope.queryByTestId("zcode-pending-submit")).toBeNull();
     expect(scope.queryByTestId("zcode-answer-options")).toBeNull();
+    expect(scope.queryByTestId("zcode-pending-open-official")).toBeNull();
+    expect(scope.getByTestId("zcode-plan-detail-toggle").textContent).toContain("查看计划详情");
+    expect(scope.getByTestId("zcode-plan-approval-approve").textContent).toContain("批准实施");
+    expect(scope.getByTestId("zcode-plan-approval-feedback-submit").textContent).toContain(
+      "提交修改"
+    );
     expect(postedActions()).toHaveLength(0);
 
     fireEvent.click(scope.getByTestId("zcode-plan-approval-approve"));
@@ -2461,13 +2468,6 @@ describe("ZCode 控制面板：多组待处理并存", () => {
       decision: "approve",
     });
 
-    // 官方入口仍只打开已保存链接，不额外 POST。
-    fireEvent.click(scope.getByTestId("zcode-pending-open-official"));
-    expect(openSpy).toHaveBeenCalledWith(
-      "https://zcode.z.ai/remote/v4?sid=synthetic-plan-official",
-      "_blank",
-      "noopener,noreferrer"
-    );
     expect(postedActions()).toHaveLength(1);
   });
 

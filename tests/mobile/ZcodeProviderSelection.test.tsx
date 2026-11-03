@@ -62,7 +62,7 @@ const providerB: ProviderChoice = {
   availabilityKnown: true,
   models: [{ modelId: "b-model", thoughtLevels: ["low"] }],
 };
-/** 缺 `available` 字段的服务端投影：可用性未知，UI 可选但提交前必须二次确认。 */
+/** 缺 `available` 字段的服务端投影：目录仍可选，由宿主运行时判定。 */
 const unknownProviderB: ProviderChoice = {
   providerId: "b",
   label: "Provider B",
@@ -70,7 +70,7 @@ const unknownProviderB: ProviderChoice = {
   availabilityKnown: false,
   models: [{ modelId: "b-model", thoughtLevels: ["low"] }],
 };
-/** 宿主显式宣告不可用：下拉项保持禁用。 */
+/** 宿主显式宣告不可用：不再发送前禁用，仍由宿主判定。 */
 const disabledProviderC: ProviderChoice = {
   providerId: "c",
   label: "Provider C",
@@ -157,39 +157,26 @@ describe("ZcodeProviderSelection", () => {
     });
   });
 
-  it("explicit_unavailable_provider_stays_disabled", async () => {
-    install(session([providerA, disabledProviderC]));
+  it("availability_fields_do_not_disable_provider_options", async () => {
+    install(session([providerA, disabledProviderC, unknownProviderB]));
     render(<ZcodeControlPanel sessionId={SID} />);
     await waitFor(() => expect(screen.getByTestId("zcode-provider-select")).toBeVisible());
-    const option = Array.from(providerSelect().options).find((item) => item.value === "c");
-    expect(option).toBeDefined();
-    expect(option?.disabled).toBe(true);
-    // 未知可用性的选项不因缺字段而禁用（与显式 false 区分）。
-    cleanup();
-    install(session([providerA, unknownProviderB]));
-    render(<ZcodeControlPanel sessionId={SID} />);
-    await waitFor(() => expect(screen.getByTestId("zcode-provider-select")).toBeVisible());
-    const unknown = Array.from(providerSelect().options).find((item) => item.value === "b");
-    expect(unknown?.disabled).toBe(false);
+    for (const id of ["b", "c"]) {
+      const option = Array.from(providerSelect().options).find((item) => item.value === id);
+      expect(option).toBeDefined();
+      expect(option?.disabled).toBe(false);
+    }
+    expect(screen.queryByTestId("zcode-selection-unknown-hint")).toBeNull();
   });
 
-  it("provider_switch_ui_confirms_before_post", async () => {
+  it("unknown_provider_switch_posts_directly_without_confirmation", async () => {
     const posts = install(session([providerA, unknownProviderB]));
     render(<ZcodeControlPanel sessionId={SID} />);
     await waitFor(() => expect(screen.getByTestId("zcode-provider-select")).toBeVisible());
 
-    // 选择未知可用性的 provider：只改本地待选组合，零 POST，并给出风险文案。
     fireEvent.change(providerSelect(), { target: { value: "b" } });
     await waitFor(() => expect(posts).toHaveLength(0));
-    expect(screen.getByTestId("zcode-selection-unknown-hint")).toBeVisible();
-
-    // 选择该 provider 的模型：弹出二次确认，确认前仍零 POST。
     fireEvent.change(modelSelect(), { target: { value: "b-model" } });
-    await waitFor(() => expect(screen.getByTestId("zcode-selection-confirm-dialog")).toBeVisible());
-    expect(posts).toHaveLength(0);
-
-    // 确认后恰一次完整 provider/model/thought，并携带显式确认标志。
-    fireEvent.click(screen.getByTestId("zcode-selection-confirm"));
     await waitFor(() => expect(posts).toHaveLength(1));
     expect(posts[0].action).toEqual({
       kind: "selection",
@@ -198,23 +185,7 @@ describe("ZcodeProviderSelection", () => {
       provider: "b",
       model: "b-model",
       thought: "low",
-      confirmUnknownProvider: true,
     });
-    await waitFor(() => expect(screen.queryByTestId("zcode-selection-confirm-dialog")).toBeNull());
-    expect(posts).toHaveLength(1);
-  });
-
-  it("provider_switch_ui_cancel_returns_to_current_combo_with_zero_post", async () => {
-    const posts = install(session([providerA, unknownProviderB]));
-    render(<ZcodeControlPanel sessionId={SID} />);
-    await waitFor(() => expect(screen.getByTestId("zcode-provider-select")).toBeVisible());
-    fireEvent.change(providerSelect(), { target: { value: "b" } });
-    fireEvent.change(modelSelect(), { target: { value: "b-model" } });
-    await waitFor(() => expect(screen.getByTestId("zcode-selection-confirm-dialog")).toBeVisible());
-    fireEvent.click(screen.getByTestId("zcode-selection-cancel"));
-    await waitFor(() => expect(screen.queryByTestId("zcode-selection-confirm-dialog")).toBeNull());
-    expect(posts).toHaveLength(0);
-    expect(providerSelect().value).toBe("a");
-    expect(modelSelect().value).toBe("a-model");
+    expect(screen.queryByTestId("zcode-selection-confirm-dialog")).toBeNull();
   });
 });

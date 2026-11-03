@@ -502,10 +502,8 @@ pub enum ControlAction {
         provider: Option<String>,
         model: String,
         thought: String,
-        /// 目标供应商可用性未知时，用户已在手机端完成二次确认。
-        ///
-        /// 缺省 false = 旧客户端/未确认：目标 provider 若「缺 available 字段」
-        /// 必须拒绝；显式 `available=false` 则无论本标志如何都拒绝。
+        /// 兼容旧客户端字段；当前选择动作不再因 `available` / `availabilityKnown`
+        /// 做发送前拦截，供应商可用性由宿主运行时判定。保留字段只为线上兼容。
         #[serde(default)]
         confirm_unknown_provider: bool,
     },

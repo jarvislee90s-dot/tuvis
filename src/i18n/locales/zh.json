@@ -2297,12 +2297,6 @@
       "modeCancel": "取消",
       "modeReason": "模式切换不可用",
       "providerAria": "供应商",
-      "providerUnknownTag": "可用性未知",
-      "providerUnknownHint": "宿主未声明该供应商的可用性，可能被拒绝。选择模型后会先请你确认，不会直接提交。",
-      "providerUnknownConfirmTitle": "供应商可用性未知，仍要尝试切换？",
-      "providerUnknownConfirmHint": "宿主未声明可用性，可能被拒绝。确认后只会发送一次完整的供应商/模型/思考档位请求；失败会如实显示宿主错误，不会改当前选择。",
-      "providerUnknownConfirm": "仍然尝试",
-      "providerUnknownCancel": "取消",
       "modelAria": "模型",
       "thoughtAria": "思考强度",
       "pendingBlocked": "该作答形态暂未开放，请在终端处理",
@@ -2311,7 +2305,7 @@
       "pendingPermissionTitle": "等待批准",
       "pendingPlanApprovalTitle": "计划批准",
       "pendingPlanApprovalReason": "这是计划批准，当前不能远程提交；请在官方页面批准/继续修改",
-      "pendingPlanApprovalApprove": "批准并开始实施",
+      "pendingPlanApprovalApprove": "批准实施",
       "pendingStep": "第 {{current}}/{{total}} 题",
       "pendingPrev": "上一题",
       "pendingNext": "下一题",
@@ -2414,8 +2408,10 @@
       "heldQueueKeep": "保留排队消息并发送",
       "heldQueueClear": "清空排队消息并发送",
       "heldQueueCancel": "取消",
+      "pendingPlanDetailShow": "查看计划详情",
+      "pendingPlanDetailHide": "收起计划详情",
       "pendingPlanApprovalFeedbackPlaceholder": "继续修改计划，填写你的意见…",
-      "pendingPlanApprovalFeedbackSubmit": "提交修改意见"
+      "pendingPlanApprovalFeedbackSubmit": "提交修改"
     },
     "question": {
       "cancelInterrupt": "中断回合（破坏性）",

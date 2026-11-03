@@ -490,20 +490,27 @@ function ZcodePendingCard({
     <>
       {readOnlyInput && planApprovalReadonly && (
         <>
-          {planApprovalBlockedReason !== null && (
-            <p
-              data-testid="zcode-pending-plan-approval-reason"
-              data-reason-code={planApprovalBlockedReason}
-              className="mt-1 text-xs text-[var(--mut)]"
-            >
-              {zcodeReasonText(planApprovalBlockedReason)}
-            </p>
-          )}
-          {canApprovePlan && (
+          <div className="mt-1 flex flex-wrap items-center gap-3">
+            {pending.detail !== null && (
+              <button
+                type="button"
+                data-testid="zcode-plan-detail-toggle"
+                aria-expanded={detailOpen}
+                aria-controls={detailOpen ? detailId : undefined}
+                onClick={() => setDetailOpen((open) => !open)}
+                className="text-xs text-[var(--mut)] underline underline-offset-2"
+              >
+                {i18n.t(
+                  detailOpen
+                    ? "mobile.zcodeControl.pendingPlanDetailHide"
+                    : "mobile.zcodeControl.pendingPlanDetailShow"
+                )}
+              </button>
+            )}
             <button
               type="button"
               data-testid="zcode-plan-approval-approve"
-              disabled={submitting}
+              disabled={!canApprovePlan}
               onClick={() => {
                 if (planApprovalBlockedReason !== null || submitting || settledRef.current) return;
                 submitOnce({
@@ -514,23 +521,11 @@ function ZcodePendingCard({
                   decision: "approve",
                 });
               }}
-              className="mt-2 rounded-full bg-[var(--btnp)]/10 px-4 py-1 text-sm text-[var(--tx)] disabled:opacity-40"
+              className="rounded-full bg-[var(--btnp)]/10 px-3 py-1 text-sm text-[var(--tx)] disabled:opacity-40"
             >
               {i18n.t("mobile.zcodeControl.pendingPlanApprovalApprove")}
             </button>
-          )}
-          {planApprovalReadonly && pending.questions[0]?.freeTextAllowed === true && (
-            <div className="mt-3">
-              <textarea
-                data-testid="zcode-plan-approval-feedback"
-                value={planFeedback}
-                maxLength={4096}
-                rows={2}
-                placeholder={i18n.t("mobile.zcodeControl.pendingPlanApprovalFeedbackPlaceholder")}
-                onChange={(event) => setPlanFeedback(event.target.value)}
-                disabled={submitting || settledState !== null}
-                className="w-full rounded-xl border border-[var(--cb)] bg-transparent px-3 py-2 text-sm text-[var(--tx)] disabled:opacity-40"
-              />
+            {pending.questions[0]?.freeTextAllowed === true && (
               <button
                 type="button"
                 data-testid="zcode-plan-approval-feedback-submit"
@@ -549,20 +544,52 @@ function ZcodePendingCard({
                     feedback: text,
                   });
                 }}
-                className="mt-2 rounded-full border border-[var(--cb)] px-4 py-1 text-sm text-[var(--tx)] disabled:opacity-40"
+                className="rounded-full border border-[var(--cb)] px-3 py-1 text-sm text-[var(--tx)] disabled:opacity-40"
               >
                 {i18n.t("mobile.zcodeControl.pendingPlanApprovalFeedbackSubmit")}
               </button>
-              {planFeedbackBlockedReason !== null && (
-                <p
-                  data-testid="zcode-pending-plan-feedback-reason"
-                  data-reason-code={planFeedbackBlockedReason}
-                  className="mt-1 text-xs text-[var(--mut)]"
-                >
-                  {zcodeReasonText(planFeedbackBlockedReason)}
-                </p>
-              )}
-            </div>
+            )}
+          </div>
+          {detailOpen && pending.detail !== null && (
+            <pre
+              id={detailId}
+              data-testid="zcode-plan-detail"
+              aria-label={i18n.t("mobile.zcodeControl.pendingDetailAria")}
+              className="mt-2 max-h-48 overflow-auto rounded-lg border border-[var(--cb)] px-2 py-1 text-xs break-all whitespace-pre-wrap text-[var(--tx)]"
+            >
+              {pending.detail}
+            </pre>
+          )}
+          {planApprovalBlockedReason !== null && (
+            <p
+              data-testid="zcode-pending-plan-approval-reason"
+              data-reason-code={planApprovalBlockedReason}
+              className="mt-1 text-xs text-[var(--mut)]"
+            >
+              {zcodeReasonText(planApprovalBlockedReason)}
+            </p>
+          )}
+          {planFeedbackBlockedReason !== null &&
+            planFeedbackBlockedReason !== planApprovalBlockedReason && (
+              <p
+                data-testid="zcode-pending-plan-feedback-reason"
+                data-reason-code={planFeedbackBlockedReason}
+                className="mt-1 text-xs text-[var(--mut)]"
+              >
+                {zcodeReasonText(planFeedbackBlockedReason)}
+              </p>
+            )}
+          {pending.questions[0]?.freeTextAllowed === true && (
+            <textarea
+              data-testid="zcode-plan-approval-feedback"
+              value={planFeedback}
+              maxLength={4096}
+              rows={2}
+              placeholder={i18n.t("mobile.zcodeControl.pendingPlanApprovalFeedbackPlaceholder")}
+              onChange={(event) => setPlanFeedback(event.target.value)}
+              disabled={submitting || settledState !== null}
+              className="mt-2 w-full rounded-xl border border-[var(--cb)] bg-transparent px-3 py-2 text-sm text-[var(--tx)] disabled:opacity-40"
+            />
           )}
           {settledState !== null && (
             <p
@@ -573,7 +600,6 @@ function ZcodePendingCard({
               {i18n.t(STATUS_KEYS[settledState])}
             </p>
           )}
-          {officialEntry}
         </>
       )}
       {readOnlyInput && !planApprovalReadonly && (
@@ -702,21 +728,25 @@ function ZcodePendingCard({
         tone={isPermission ? "approve" : "question"}
         mode={pending.kind}
         testId="zcode-pending-card-body"
-        title={i18n.t(
-          isPermission
-            ? "mobile.zcodeControl.pendingPermissionTitle"
-            : planApprovalReadonly
-              ? "mobile.zcodeControl.pendingPlanApprovalTitle"
-              : "mobile.zcodeControl.pendingQuestionTitle"
-        )}
+        title={
+          planApprovalReadonly
+            ? ""
+            : i18n.t(
+                isPermission
+                  ? "mobile.zcodeControl.pendingPermissionTitle"
+                  : "mobile.zcodeControl.pendingQuestionTitle"
+              )
+        }
         footer={footer}
       >
-        {pending.toolName !== null && (
+        {!planApprovalReadonly && pending.toolName !== null && (
           <p className="text-xs text-[var(--mut)]">{pending.toolName}</p>
         )}
-        {pending.summary !== null && <p className="text-sm text-[var(--tx)]">{pending.summary}</p>}
-        {/* 命令正文（官方 payload.detail）：默认折叠，展开只读，不参与提交。 */}
-        {(isPermission || planApprovalReadonly) && pending.detail !== null && (
+        {!planApprovalReadonly && pending.summary !== null && (
+          <p className="text-sm text-[var(--tx)]">{pending.summary}</p>
+        )}
+        {/* 命令正文（官方 payload.detail）：普通审批默认折叠；计划卡使用专用入口。 */}
+        {isPermission && pending.detail !== null && (
           <div className="mt-1">
             <button
               type="button"
@@ -777,7 +807,7 @@ function ZcodePendingCard({
             ))}
           </div>
         )}
-        {isUserInput && readOnlyInput && pending.questions.length > 0 && (
+        {isUserInput && readOnlyInput && !planApprovalReadonly && pending.questions.length > 0 && (
           // 只读问答子型：只展示问了什么，不给任何可提交控件。
           <ul data-testid="zcode-pending-readonly-questions" className="mt-1 flex flex-col gap-1">
             {pending.questions.map((item, index) => (

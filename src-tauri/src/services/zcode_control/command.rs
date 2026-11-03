@@ -8642,15 +8642,16 @@ mod tests {
 
         /// 未知可用性 provider：不带确认 → 零帧零行；显式确认 → 恰一次完整三元组。
         #[tokio::test]
-        async fn unknown_provider_selection_requires_confirmation_flag() {
+        async fn unknown_provider_selection_is_sent_without_confirmation_flag() {
             let store = DeviceStore::memory();
             let fake = FakeBridge::new(Reply::Body(accepted_body()));
             let port = FakeSelection::new(
                 view(Some(REVISION), unknown_provider_catalog()),
                 unknown_provider_catalog(),
             );
+            port.set_wait_result(true);
             let sender = selection_sender(&fake, &port, &store);
-            let unconfirmed = ControlAction::Selection {
+            let action = ControlAction::Selection {
                 session_id: SESSION.to_owned(),
                 generation: GEN,
                 provider: Some("provider-b".to_owned()),
@@ -8658,40 +8659,19 @@ mod tests {
                 thought: "low".to_owned(),
                 confirm_unknown_provider: false,
             };
-            let error = sender
-                .execute(&ctx("a-unknown"), &target(), &unconfirmed)
-                .await
-                .unwrap_err();
-            assert!(
-                error.is(codes::INVALID_ACTION),
-                "未确认的未知 provider 必须拒绝"
-            );
-            assert_eq!(fake.wire(), 0, "拒绝必须零帧");
-            assert_eq!(row_count(&store), 0, "拒绝必须零账本行");
-            assert!(port.wait_calls().is_empty());
-
-            // 用户确认后：仍只发一次完整 provider/model/thought 三元组。
-            port.set_wait_result(true);
-            let confirmed = ControlAction::Selection {
-                session_id: SESSION.to_owned(),
-                generation: GEN,
-                provider: Some("provider-b".to_owned()),
-                model: "model-b".to_owned(),
-                thought: "low".to_owned(),
-                confirm_unknown_provider: true,
-            };
             let receipt = sender
-                .execute(&ctx("a-unknown-confirmed"), &target(), &confirmed)
+                .execute(&ctx("a-unknown"), &target(), &action)
                 .await
                 .unwrap();
             assert_eq!(receipt.state, ActionState::Confirmed);
             let frames = switch_frames(&fake);
-            assert_eq!(frames.len(), 1, "确认后恰一帧");
+            assert_eq!(frames.len(), 1, "unknown provider must be sent directly");
             assert_eq!(
                 frames[0]["payload"],
                 json!({"provider": "provider-b", "model": "model-b", "thought": "low"}),
-                "命令载荷仍是一次完整三元组，确认标志不进入上游 payload"
+                "命令载荷仍是一次完整三元组"
             );
+            assert_eq!(row_count(&store), 1);
         }
     }
 

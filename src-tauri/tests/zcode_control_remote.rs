@@ -10,6 +10,7 @@ use multi_agents_manager_lib::remote::pairing::{
 };
 use multi_agents_manager_lib::remote::server::{router, RemoteState};
 use multi_agents_manager_lib::remote::zcode::control_frame;
+use multi_agents_manager_lib::services::zcode_control::types::PlanApprovalDecision;
 use multi_agents_manager_lib::services::zcode_control::{
     codes, set_config, ActionContext, ActionReceipt, ActionState, AuthStatus, BoundTarget,
     CapabilityFlag, CapabilityView, ConnectionState, ConnectionView, ControlAction, ControlEvent,
@@ -315,6 +316,10 @@ impl FakeHubBackend {
 
     fn contexts(&self) -> Vec<ActionContext> {
         self.contexts.lock().unwrap().clone()
+    }
+
+    fn actions(&self) -> Vec<ControlAction> {
+        self.actions.lock().unwrap().clone()
     }
 
     fn set_execute_result(&self, result: ZResult<ActionReceipt>) {
@@ -1891,6 +1896,60 @@ async fn action_body_cannot_override_device_identity() {
             device_name: "iPhone".into(),
         }],
         "ctx 身份只来自 cookie + 本机 DB"
+    );
+}
+
+/// 计划反馈：HTTP 白名单必须允许 `feedback` 字段，不能把反馈误判成 invalid_action。
+#[tokio::test]
+async fn plan_feedback_action_reaches_backend() {
+    let conn = shared_conn();
+    seed_device(&conn);
+    let injector = Arc::new(RecordingInjector::default());
+    let backend = Arc::new(FakeHubBackend::default());
+    let hub = paired_hub_with(
+        &conn,
+        backend.clone(),
+        CapabilityView {
+            single_select: CapabilityFlag {
+                enabled: true,
+                reason_code: None,
+            },
+            free_text: CapabilityFlag {
+                enabled: true,
+                reason_code: None,
+            },
+            ..CapabilityView::default()
+        },
+    )
+    .await;
+    let generation = hub.connection().generation;
+    let st = state(&conn, injector);
+    st.set_zcode_hub(hub);
+    let app = router(st);
+
+    let body = serde_json::json!({
+        "actionId": "action-plan-feedback",
+        "action": {
+            "kind": "planApproval",
+            "sessionId": ZCODE_SESSION,
+            "generation": generation,
+            "interactionId": "perm_synthetic",
+            "decision": "feedback",
+            "feedback": "把计划改成只读检查清单"
+        },
+    });
+    let resp = app.oneshot(action_req(&body, true)).await.unwrap();
+    assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    assert_eq!(backend.execute_calls(), 1);
+    assert_eq!(
+        backend.actions(),
+        vec![ControlAction::PlanApproval {
+            session_id: ZCODE_SESSION.to_owned(),
+            generation,
+            interaction_id: "perm_synthetic".to_owned(),
+            decision: PlanApprovalDecision::Feedback,
+            feedback: Some("把计划改成只读检查清单".to_owned()),
+        }]
     );
 }
 

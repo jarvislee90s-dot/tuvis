@@ -42,11 +42,7 @@ import {
 import useZcodeControl from "./useZcodeControl";
 import ZcodeLocalQueuePanel from "./ZcodeLocalQueuePanel";
 import { zcodeQueuePreview } from "./zcode-local-queue-state";
-import {
-  isAvailabilityKnown,
-  isProviderSelectable,
-  resolveModelChoice,
-} from "./zcode-selection-state";
+import { resolveModelChoice } from "./zcode-selection-state";
 import { newActionId } from "./codexIpcApi";
 import ZcodePendingCard, {
   STATUS_KEYS,
@@ -1396,19 +1392,12 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
   const [pendingModel, setPendingModel] = useState<string | null>(null);
   /** 思考档位的本地待选值：服务端旧 thought 要等回执落地，不能立刻把 select 拉回。 */
   const [pendingThought, setPendingThought] = useState<string | null>(null);
-  /** 可用性未知的目标组合：确认前零 selection POST。 */
-  const [unknownSelection, setUnknownSelection] = useState<{
-    provider?: string;
-    model: string;
-    thought: string;
-  } | null>(null);
+  /** 旧版本未知 provider 确认弹窗已移除：可用性由宿主运行时判定。 */
   const providerGroups = selection?.providers ?? [];
   const activeProviderId = pendingProvider ?? selection?.provider ?? "";
-  // 显式 unavailable 才不可选；缺 available 字段 = 可用性未知，仍可选中。
+  // 目录里的 available/availabilityKnown 只保留展示语义，不再阻止选择。
   const activeProvider =
-    providerGroups.find(
-      (candidate) => candidate.providerId === activeProviderId && isProviderSelectable(candidate)
-    ) ?? null;
+    providerGroups.find((candidate) => candidate.providerId === activeProviderId) ?? null;
   const activeModels =
     activeProvider?.models ??
     (selection !== null && activeProviderId === selection.provider ? selection.models : []);
@@ -1422,7 +1411,6 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
     setPendingProvider(null);
     setPendingModel(null);
     setPendingThought(null);
-    setUnknownSelection(null);
   }, [selection?.provider, selection?.model, selection?.thought]);
 
   // ==== R10：协作模式（独立能力槽；ACK 不乐观改确认标签）====
@@ -1480,12 +1468,7 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
       ? selection.thought
       : (currentChoice?.thoughtLevels[0] ?? ""));
 
-  const submitSelection = (
-    model: string,
-    thought: string,
-    provider?: string,
-    confirmUnknownProvider?: boolean
-  ) => {
+  const submitSelection = (model: string, thought: string, provider?: string) => {
     if (session === null || !selectionEnabled || thought === "") return;
     runOnce({
       kind: "selection",
@@ -1494,51 +1477,18 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
       ...(provider === undefined ? {} : { provider }),
       model,
       thought,
-      // 仅在用户完成二次确认时上行；旧已知 provider 保持旧载荷形状。
-      ...(confirmUnknownProvider === true ? { confirmUnknownProvider: true } : {}),
     });
   };
 
-  /** 目标 provider 可用性未知 → 先弹二次确认（零 POST）；已知可用/显式不可用不走这里。 */
+  /** 不做 provider 可用性预判：直接发送一次完整三元组，由宿主返回真实错误。 */
   const requestSelection = (model: string, thought: string, provider?: string) => {
     if (session === null || !selectionEnabled || thought === "") return;
-    const target =
-      provider === undefined
-        ? providerGroups.find((group) => group.providerId === activeProviderId)
-        : providerGroups.find((group) => group.providerId === provider);
-    if (target !== undefined && !isAvailabilityKnown(target)) {
-      setUnknownSelection({ provider, model, thought });
-      return;
-    }
     submitSelection(model, thought, provider);
-  };
-
-  const confirmUnknownSelection = () => {
-    const pending = unknownSelection;
-    if (pending === null) return;
-    setUnknownSelection(null);
-    submitSelection(pending.model, pending.thought, pending.provider, true);
-  };
-
-  const cancelUnknownSelection = () => {
-    // 取消回到服务端当前组合（不留下 provider-only 或半套待选值）。
-    setUnknownSelection(null);
-    setPendingProvider(null);
-    setPendingModel(null);
-    setPendingThought(null);
   };
 
   const handleProviderChange = (providerId: string) => {
     if (selection === null || providerId === activeProviderId) return;
-    if (
-      !providerGroups.some(
-        (group) => group.providerId === providerId && isProviderSelectable(group)
-      )
-    ) {
-      return;
-    }
-    // 只更新待选组合；不写 provider-only 中间态。换 provider 即撤销未确认的切换。
-    setUnknownSelection(null);
+    // 只更新待选组合；不写 provider-only 中间态。可用性不阻止选择。
     setPendingProvider(providerId);
     setPendingModel(null);
     setPendingThought(null);
@@ -1562,18 +1512,6 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
     setPendingThought(thought);
     // 同一 provider/model 只换思考档位，不是重新选择供应商；当前组合已经在使用中，
     // 不应再次弹出“未知 provider”确认，否则用户会看到档位被旧值拉回。
-    const sameTarget =
-      activeProviderId === selection.provider && currentChoice.modelId === selection.model;
-    if (sameTarget) {
-      const unknownProvider = activeProvider !== null && !isAvailabilityKnown(activeProvider);
-      submitSelection(
-        currentChoice.modelId,
-        thought,
-        providerGroups.length === 0 ? undefined : activeProviderId,
-        unknownProvider
-      );
-      return;
-    }
     requestSelection(
       currentChoice.modelId,
       thought,
@@ -2097,16 +2035,8 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
                   className="max-w-[45%] shrink-0 rounded-lg border border-[var(--cb)] px-2 py-1 text-sm text-[var(--tx)] disabled:opacity-40"
                 >
                   {providerGroups.map((group) => (
-                    <option
-                      key={group.providerId}
-                      value={group.providerId}
-                      data-availability-known={isAvailabilityKnown(group) ? "true" : "false"}
-                      // 显式 unavailable 才禁用；缺字段 = 未知，可选（提交前二次确认）。
-                      disabled={!group.available && isAvailabilityKnown(group)}
-                    >
-                      {isAvailabilityKnown(group)
-                        ? group.label
-                        : `${group.label} · ${i18n.t("mobile.zcodeControl.providerUnknownTag")}`}
+                    <option key={group.providerId} value={group.providerId}>
+                      {group.label}
                     </option>
                   ))}
                 </select>
@@ -2149,11 +2079,6 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
             </>
           )}
         </div>
-      )}
-      {activeProvider !== null && !isAvailabilityKnown(activeProvider) && (
-        <p data-testid="zcode-selection-unknown-hint" className="mb-2 text-xs text-[var(--mut)]">
-          {i18n.t("mobile.zcodeControl.providerUnknownHint")}
-        </p>
       )}
       {selection !== null && !selectionEnabled && (
         <p
@@ -2253,50 +2178,6 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
               className="rounded-lg px-3 py-1.5 text-xs text-[var(--mut)]"
             >
               {i18n.t("mobile.zcodeControl.modeCancel")}
-            </button>
-          </div>
-        </div>
-      )}
-      {unknownSelection !== null && (
-        <div
-          role="dialog"
-          aria-modal="true"
-          aria-labelledby="zcode-selection-confirm-title"
-          data-testid="zcode-selection-confirm-dialog"
-          className="mb-2 rounded-lg border border-[var(--cb)] bg-[var(--cbg)] p-2"
-        >
-          <p id="zcode-selection-confirm-title" className="text-xs font-medium text-[var(--tx)]">
-            {i18n.t("mobile.zcodeControl.providerUnknownConfirmTitle")}
-          </p>
-          <p className="mt-1 text-[11px] leading-4 text-[var(--mut)]">
-            {i18n.t("mobile.zcodeControl.providerUnknownConfirmHint")}
-          </p>
-          <p
-            data-testid="zcode-selection-confirm-target"
-            className="mt-1 text-[11px] break-all text-[var(--mut)]"
-          >
-            {[
-              unknownSelection.provider ?? selection?.provider ?? "",
-              unknownSelection.model,
-              unknownSelection.thought,
-            ].join(" / ")}
-          </p>
-          <div className="mt-2 flex flex-wrap gap-2">
-            <button
-              type="button"
-              data-testid="zcode-selection-confirm"
-              onClick={confirmUnknownSelection}
-              className="rounded-lg border border-[var(--cb)] px-3 py-1.5 text-xs text-[var(--tx)]"
-            >
-              {i18n.t("mobile.zcodeControl.providerUnknownConfirm")}
-            </button>
-            <button
-              type="button"
-              data-testid="zcode-selection-cancel"
-              onClick={cancelUnknownSelection}
-              className="rounded-lg px-3 py-1.5 text-xs text-[var(--mut)]"
-            >
-              {i18n.t("mobile.zcodeControl.providerUnknownCancel")}
             </button>
           </div>
         </div>

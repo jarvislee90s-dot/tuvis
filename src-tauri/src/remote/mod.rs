@@ -1362,13 +1362,7 @@ fn wake_zcode_hub_auto_connect() {
     }
 }
 
-/// C4 启动接线（非阻塞）：先恢复系统存储里的已保存授权（绝不打开浏览器），再启动
-/// 同一 Hub 的自动连接 worker。由 `lib.rs` 在 `restore_on_launch` 之后调用；本函数
-/// 立即返回，不等待保险箱、不阻塞 Tauri 主线程。Hub 未配置/远程未启用时 worker 按
-/// 现查前置条件 no-op（零连接）。
-///
-/// P2-7：这里那次恢复即「启动恢复」——worker 复用内存快照，**不再第二次读原生存储**；
-/// 用户显式 connect 仍可重试恢复。
+/// 队列事件监听（启动后由 `start_zcode_auto_connect_after_restore` 拉起）。
 pub(crate) async fn run_queue_listener(
     listener: std::sync::Arc<
         crate::services::zcode_control::local_queue::service::ZcodeQueueService,
@@ -1401,6 +1395,12 @@ pub(crate) async fn run_queue_listener(
     }
 }
 
+/// C4 启动接线（非阻塞）：安装本地队列/恢复队列，然后启动自动连接 worker。
+///
+/// **不再在启动时无条件读系统保险箱**：凭据恢复由 worker 在
+/// 「远程总开关 + 用户自动连接意图 + 已保存官方链接」gate 全部通过后执行；
+/// gate 未过时停在 `needs_auth`/`needs_config`，零 Keychain 读取、零连接、零 OAuth。
+/// 用户显式 connect 仍可随时触发恢复。
 pub(crate) fn start_zcode_auto_connect_after_restore(
     hub: std::sync::Arc<crate::services::zcode_control::ZcodeHub>,
 ) {
@@ -1409,7 +1409,8 @@ pub(crate) fn start_zcode_auto_connect_after_restore(
         if first {
             queue.start_cleanup();
         }
-        hub.restore_authorization().await;
+        // 凭据恢复延迟到 auto-connect worker 的 gate 之后（已保存链接 + 远程开启）；
+        // 启动时不再无条件读系统保险箱。
         if first {
             let events = hub.subscribe();
             if queue.recover().await.is_ok() {
@@ -5091,7 +5092,11 @@ mod zcode_wiring_tests {
         let hub = fake_hub(fake.clone(), DeviceStore::memory());
         start_zcode_auto_connect_after_restore(hub.clone());
         wait_until(|| hub.queue_service().is_some(), "启动必须安装队列服务").await;
-        assert_eq!(fake.restore_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            fake.restore_calls.load(Ordering::SeqCst),
+            0,
+            "未配置链接/远程关闭时启动不得读系统保险箱"
+        );
         let service = hub.queue_service().unwrap();
         hub.begin_shutdown();
         assert!(service.is_stopped());
@@ -5258,12 +5263,10 @@ mod zcode_wiring_tests {
         assert_eq!(fake.connect_calls.load(Ordering::SeqCst), 0);
     }
 
-    /// C4 启动顺序可证伪用例：远程关闭 + auto=false（worker gate 必不通过），
-    /// 但 fake 的 restore 返回 authorized/remembered——只有 `start_..._after_restore`
-    /// 里显式那次 `hub.restore_authorization().await` 能推进状态；worker 不会替它恢复。
-    /// 删掉那行恢复 → restore_calls=0、Hub 停在 NeedsAuth，本用例必红。
+    /// 新契约：未配置链接/远程关闭时，启动不得触碰系统保险箱；worker gate 不通过
+    /// 就不恢复，Hub 保持在 needs_auth/needs_config 的安全侧。
     #[tokio::test]
-    async fn startup_restore_runs_before_auto_connect_gate() {
+    async fn startup_skips_restore_when_auto_connect_gate_is_closed() {
         let fake = Arc::new(FakeBackend::default());
         fake.authorized.store(true, Ordering::SeqCst);
         fake.remembered.store(true, Ordering::SeqCst);
@@ -5275,35 +5278,24 @@ mod zcode_wiring_tests {
             })
             .unwrap();
         let hub = fake_hub(fake.clone(), store);
-        assert_eq!(
-            hub.connection().state,
-            ConnectionState::NeedsAuth,
-            "前置：构造后尚未恢复"
-        );
 
         start_zcode_auto_connect_after_restore(hub.clone());
         wait_until(
-            || fake.restore_calls.load(Ordering::SeqCst) >= 1,
-            "启动接线必须先恢复授权（worker gate 不通过不会替它恢复）",
+            || hub.auto_attempt_count() >= 1,
+            "worker 必须跑完一次尝试（gate 关闭即停）",
         )
         .await;
         for _ in 0..16 {
             tokio::task::yield_now().await;
         }
-        let status = hub.auth_status();
-        assert!(status.authorized, "显式 restore 必须对齐 Hub 授权缓存");
-        assert!(status.remembered, "fake 恢复的就是已记住授权");
         assert_eq!(
-            fake.connect_calls.load(Ordering::SeqCst),
+            fake.restore_calls.load(Ordering::SeqCst),
             0,
-            "remote.enabled=false + auto=false：恢复后也不得连接"
+            "gate 关闭时不得读取系统保险箱"
         );
+        assert_eq!(fake.connect_calls.load(Ordering::SeqCst), 0);
         assert_eq!(fake.authorize_calls.load(Ordering::SeqCst), 0);
-        assert_eq!(
-            hub.connection().state,
-            ConnectionState::Offline,
-            "恢复成功但远程关闭 = 已授权未连接（offline），不是 needs_auth"
-        );
+        assert_eq!(hub.connection().state, ConnectionState::NeedsAuth);
     }
 
     /// C4 生产唤醒接线可证伪用例：`remote_toggle` 唯一调用 `toggle_remote_and_wake`，

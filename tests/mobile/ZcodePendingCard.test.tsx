@@ -967,6 +967,7 @@ describe("ZCode 待处理卡：不可答子型只读 / 截断正文不盲批", (
           freeTextAllowed: true,
         }),
       ],
+      detail: "# Synthetic plan\n\nRead-only checklist",
     });
   }
 
@@ -985,13 +986,21 @@ describe("ZCode 待处理卡：不可答子型只读 / 截断正文不盲批", (
       "true"
     );
     const body = screen.getByTestId("zcode-pending-card-body");
-    expect(within(body).getByText("计划批准")).toBeVisible();
+    expect(within(body).queryByText("计划批准")).toBeNull();
+    expect(within(body).queryByText("ExitPlanMode")).toBeNull();
+    expect(within(body).queryByText("要批准这份计划吗？")).toBeNull();
     expect(within(body).queryByText("等待回答")).toBeNull();
-    expect(screen.getByTestId("zcode-pending-readonly-questions").textContent).toContain(
-      "要批准这份计划吗？"
-    );
     expect(screen.queryByTestId("zcode-pending-submit")).toBeNull();
     expect(screen.queryByTestId("zcode-answer-options")).toBeNull();
+    expect(screen.queryByTestId("zcode-pending-open-official")).toBeNull();
+    expect(screen.getByTestId("zcode-plan-approval-approve").textContent).toContain("批准实施");
+    expect(screen.getByTestId("zcode-plan-approval-feedback-submit").textContent).toContain(
+      "提交修改"
+    );
+    const detail = screen.getByTestId("zcode-plan-detail-toggle");
+    expect(detail.textContent).toContain("查看计划详情");
+    fireEvent.click(detail);
+    expect(screen.getByTestId("zcode-plan-detail").textContent).toContain("Read-only checklist");
     expect(calls).toHaveLength(0);
 
     fireEvent.click(screen.getByTestId("zcode-plan-approval-approve"));
@@ -1003,7 +1012,6 @@ describe("ZCode 待处理卡：不可答子型只读 / 截断正文不盲批", (
       interactionId: INTERACTION,
       decision: "approve",
     });
-    expect(screen.getByTestId("zcode-pending-open-official")).toBeVisible();
   });
 
   it("plan_approval_card_sends_feedback_once_without_approving", async () => {
@@ -1041,7 +1049,8 @@ describe("ZCode 待处理卡：不可答子型只读 / 截断正文不盲批", (
       />
     );
 
-    expect(screen.queryByTestId("zcode-plan-approval-approve")).toBeNull();
+    expect(screen.getByTestId("zcode-plan-approval-approve")).toBeDisabled();
+    expect(screen.getByTestId("zcode-plan-approval-feedback-submit")).toBeDisabled();
     expect(screen.getByTestId("zcode-pending-plan-approval-reason")).toHaveAttribute(
       "data-reason-code",
       "needs_evidence"

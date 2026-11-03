@@ -1,26 +1,11 @@
 // 供应商 / 模型 / 思考强度的纯选择规则（C2）：只从官方目录选合法组合。
 // provider 变更本身零写入；选定模型后才生成一次完整三元组。
-import type { ProviderChoice, SelectionView } from "@/lib/api/zcodeControl";
+import type { SelectionView } from "@/lib/api/zcodeControl";
 
 export interface PendingModelChoice {
   provider: string;
   model: string;
   thought: string;
-}
-
-/** 旧载荷/旧服务端缺 `availabilityKnown` 字段 → 按已知兼容（与 Rust serde 默认一致）。 */
-export function isAvailabilityKnown(group: ProviderChoice): boolean {
-  return group.availabilityKnown !== false;
-}
-
-/**
- * 三态可用性下的「能否被选中」：
- * - 显式 `available=true` → 可选；
- * - 显式 `available=false` 且 `availabilityKnown=true` → 禁用（宿主已宣告不可用）；
- * - 缺 `available` 字段（`availabilityKnown=false`）→ 可选，但提交前必须二次确认。
- */
-export function isProviderSelectable(group: ProviderChoice): boolean {
-  return group.available || !isAvailabilityKnown(group);
 }
 
 /**
@@ -47,9 +32,7 @@ export function resolveModelChoice(
             availabilityKnown: true,
           }
         : null
-      : groups.find(
-          (candidate) => candidate.providerId === provider && isProviderSelectable(candidate)
-        );
+      : groups.find((candidate) => candidate.providerId === provider);
   if (group === null || group === undefined || group.models.length === 0) return null;
   const choice =
     (model === undefined ? undefined : group.models.find((item) => item.modelId === model)) ??

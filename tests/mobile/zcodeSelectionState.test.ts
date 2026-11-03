@@ -54,8 +54,12 @@ describe("zcode selection state", () => {
     });
   });
 
-  it("unavailable provider and empty levels are not faked", () => {
-    expect(resolveModelChoice(view, "off", "x")).toBeNull();
+  it("availability no longer blocks resolution; empty levels are not faked", () => {
+    expect(resolveModelChoice(view, "off", "x")).toEqual({
+      provider: "off",
+      model: "x",
+      thought: "low",
+    });
     expect(
       resolveModelChoice(
         {
@@ -76,13 +80,17 @@ describe("zcode selection state", () => {
     ).toBeNull();
   });
 
-  it("unknown availability is selectable but explicit unavailable is not", () => {
+  it("unknown and explicitly unavailable providers both resolve; host decides at runtime", () => {
     expect(resolveModelChoice(view, "u", "um")).toEqual({
       provider: "u",
       model: "um",
       thought: "low",
     });
-    expect(resolveModelChoice(view, "off", "x")).toBeNull();
+    expect(resolveModelChoice(view, "off", "x")).toEqual({
+      provider: "off",
+      model: "x",
+      thought: "low",
+    });
   });
 
   it("legacy view without providers keeps current provider scope", () => {

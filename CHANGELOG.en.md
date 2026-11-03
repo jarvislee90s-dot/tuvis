@@ -161,14 +161,16 @@ _Only versions translated so far are listed here; the full history lives in the
   accepted send whose terminal state cannot be proven shows "Results to review" and pauses
   the outbox; while unreviewed, "Resume queue / Send this one" are explicitly rejected, and
   "Confirm and resume queue" only clears the barrier and continues items that have not been
-  sent — the old message is never resent. Provider availability is three-state: explicitly
-  unavailable providers stay disabled; a provider without an `available` field is marked
-  unknown, selectable only after a second confirmation before the full triple is submitted.
-  Plan approval (`ExitPlanMode`/`plan_approval`) now has a dedicated native approve
+  sent — the old message is never resent. Provider availability is no longer pre-judged by Tuvis:
+  the catalog's `available`/`availabilityKnown` fields do not block selection; Tuvis sends
+  the full triple and surfaces the host's real error. Plan approval (`ExitPlanMode`/`plan_approval`) now has a dedicated native approve
   action for the exact host `approve` option and a feedback box that keeps plan mode and
   sends text back to the agent; failures stay honest and never fabricate a frame. Both
-  desktop paths were verified; mobile remote acceptance is pending reconnect. Real hosts, real provider switching and real plan approval
-  remain unverified.
+  desktop paths were verified; mobile remote acceptance is pending reconnect.
+- ZCode credential restore no longer reads the OS keychain unconditionally at startup:
+  only a saved official link, enabled remote, and the auto-connect intent allow it;
+  otherwise the hub stays in needs_auth/needs_config, avoiding repeated Keychain prompts
+  from dev builds.
 - **ZCode review fixes (providers / recovery / mode guards)**: the production read
   path now sends every provider group and refreshes the catalog on a live provider switch; editing with a known draft asks first, and
   cancelling no longer retracts the original item or deletes its recovery snapshot;
