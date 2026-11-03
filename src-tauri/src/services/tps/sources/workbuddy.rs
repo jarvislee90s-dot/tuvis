@@ -23,10 +23,12 @@
 //!
 //! ## 游标版本与解析口径修复后的旧 EOF 恢复（Spec §9；迁移纪律）
 //!
-//! 旧实现把游标推进到 EOF 时可能**零事实**（v1：整数字符串数值行被归一拒绝而跳过；
-//! v2：zh-CN 区域的 qua 行前缀时刻解析不出而整行跳过——2026-11-02 实机缺口）。游标加
+//! 旧实现把游标推进到 EOF 时可能**零事实或劣质事实**（v1：整数字符串数值行被归一拒绝
+//! 而跳过；v2：zh-CN 区域的 qua 行前缀时刻解析不出而整行跳过——2026-11-02 实机缺口；
+//! v3：突发交付观察带退化生成窗入库——2026-11-03 实机缺口，需改写为无流式口径）。游标加
 //! `format_version`（serde 字段默认 1：旧游标缺字段反序列化即 v1；v2 = 数值归一修复、
-//! v3 = 行前缀区域形态修复；本实现新写/推进恒为 [`CURSOR_FORMAT_VERSION`]）。读到
+//! v3 = 行前缀区域形态修复、v4 = 突发交付闸；本实现新写/推进恒为
+//! [`CURSOR_FORMAT_VERSION`]）。读到
 //! **版本号低于当前的真实游标**（空游标 = 全新安装，直接当前版本起步无历史可恢复）→
 //! 触发**本来源一次性有界恢复**：枚举读取器已知的 qua 日志，**stat 预过滤**只留 mtime
 //! 在 24h 新鲜窗内的文件（超窗不打开——AGENTS 反模式禁令：窗口判定先于打开），从字节
@@ -63,6 +65,15 @@
 //!   桌面端 qua.end 与 Mac 同构（整数字符串数值，归一已兼容）；行前缀时刻形态随系统
 //!   区域变化（en-US 12h / zh-CN 24h），解析只认已证形态（见 `line_time_ms`），未证形态
 //!   跳过不猜。
+//! * **非流式（整包突发）交付 = 无流式口径**（probes/2026-11-03-workbuddy-qua-burst-delivery.md，
+//!   2026-11-03 实机）：第三方中转路线会把整段补全在末尾 1~2 个 chunk 一次性送达——
+//!   `ttft_ms ≈ total_cost_ms`、`total_chunks` 1~2、`interval_*` 分桶几乎全空（实测
+//!   custom-local 670 条中 349 条生成窗 <50ms，官方流式路线 0/59、最短 3761ms）。生成窗
+//!   退化到无法构成速率时（窗口 <50ms——该量级窗实测仅见于整包突发；或分桶字段在场而
+//!   可分间隔 <3——少于 3 个间隔无法构成速率估计），`generation_ms = None`（同 Codex
+//!   缺口语义）：观察仅保留响应口径与首 Token 等待，绝不把突发交付当流式速率入速；
+//!   分桶字段整体缺席的旧载荷只按窗口规则兜底。残余缺口：3~20 个可分间隔的短窗轻微
+//!   流式不在此闸，按遥测如实入账。
 //! * qua 行缺数值 `completion_tokens`（如只有 `hasUsage:true` 标志）：成功事实保留
 //!   （output=None 记缺失不报 0），绝不入速。
 //! * 输出语义：`completion_tokens` 为供应商总数（含思考与工具参数，supplement-macos §11.2
@@ -99,9 +110,31 @@ use crate::services::usage::error::UsageError;
 pub const SOURCE_ID: &str = "workbuddy";
 
 /// 游标格式版本：v1 = 旧实现（无数值归一，EOF 即终点）；v2 = 整数字符串归一修复后的
-/// 有界恢复起点；v3 = qua 行前缀区域形态（zh-CN `YYYY/M/D 24h`）修复后的有界恢复起点。
+/// 有界恢复起点；v3 = qua 行前缀区域形态（zh-CN `YYYY/M/D 24h`）修复后的有界恢复起点；
+/// v4 = 突发交付闸（退化生成窗改写为无流式口径）后的有界恢复起点。
 /// serde 字段缺省恒为 1（旧文件语义），结构体缺省跟随本常量（新起点语义）。
-const CURSOR_FORMAT_VERSION: u32 = 3;
+const CURSOR_FORMAT_VERSION: u32 = 4;
+
+/// 突发交付判定阈值（证据：probes/2026-11-03-workbuddy-qua-burst-delivery.md；依据是
+/// 经验分布而非机制断言——分桶记的是 chunk 间隔时长，与窗口总长无关）：
+/// 生成窗 <50ms 实测仅出现于整包突发（custom-local 349/670 条；官方流式路线 0/59、
+/// 最短 3761ms），该量级窗内至多 1~2 个 chunk、速率分母失真；可分间隔 <3 则覆盖
+/// 「窗口稍大但交付仍是整包突发」的形态（50~1000ms 桶 80 条中 34 条 chunks≤2）。
+/// 残余缺口：3~20 个可分间隔的短窗轻微流式不在此闸，按遥测如实入账。
+const MIN_STREAMING_WINDOW_MS: i64 = 50;
+const MIN_MEASURABLE_INTERVALS: i64 = 3;
+
+/// qua 载荷的 chunk 间隔分桶字段名（可分间隔总数 = 各桶 count 之和）
+const INTERVAL_BUCKETS: [&str; 8] = [
+    "0_50",
+    "50_100",
+    "100_500",
+    "500_1000",
+    "1000_3000",
+    "3000_10000",
+    "10000_60000",
+    "gt_60000",
+];
 
 /// 新鲜窗 = 事实保留窗（24h）
 const FRESH_WINDOW_MS: i64 = crate::services::tps::store::TPS_RETENTION_MS;
@@ -111,7 +144,7 @@ const BATCH_CAP: usize = TPS_BATCH_MAX_ROWS;
 
 /// 来源限制说明（sourceState.detail，如实申报；sdk 路线缺口逐字含
 /// insufficient-evidence，Spec §4「缺失时该路线返回 insufficient-evidence」）
-const SOURCE_LIMITS: &str = "insufficient-evidence: sdk/conversations 路线 usage_update 只有 hasUsage=true 无数值 usage，不入速，绝不借旧 CLI 样本凑值；qua 路线 Mac/Windows 均已证带数值（2026-11-02 zh-CN 实机），行前缀时刻仅认已证形态（RFC3339 / [M/D/YYYY, h:mm:ss AM|PM.mmm] / [YYYY/M/D H:MM:SS.mmm]），未证形态跳过不猜；tool_ms 恒空（无原生工具时长）";
+const SOURCE_LIMITS: &str = "insufficient-evidence: sdk/conversations 路线 usage_update 只有 hasUsage=true 无数值 usage，不入速，绝不借旧 CLI 样本凑值；qua 路线 Mac/Windows 均已证带数值（2026-11-02 zh-CN 实机），行前缀时刻仅认已证形态（RFC3339 / [M/D/YYYY, h:mm:ss AM|PM.mmm] / [YYYY/M/D H:MM:SS.mmm]），未证形态跳过不猜；突发交付（ttft≈total、chunks 1~2）生成窗退化时置 None 仅响应口径（2026-11-03 实机；生成窗<50ms 或分桶在场而可分间隔<3，3~20 间隔的轻微流式不在闸内）；tool_ms 恒空（无原生工具时长）";
 
 // ==== 游标状态（装在 SourceCursor.value；反序列化失败归零重读——重读的观察以稳定键
 //      UPSERT 幂等，不产生双计）====
@@ -571,15 +604,49 @@ fn apply_qua_line(
         }
     };
     let first_token_at_ms = ttft_ms.map(|t| started_at_ms + t);
-    // 生成窗 = total_cost_ms − ttft_ms（同请求两段；失败/取消不入速度）
+    // 突发交付证据（见模块头「非流式交付」节）：interval 分桶之和 = 可分间隔总数。
+    // 各桶是遥测不是身份字段，单个缺席/被拒按 0 计；字段整体缺席 = 旧载荷无法判定，
+    // 闸门只在窗口规则上兜底（intervals_present = false）。
+    let mut intervals_present = false;
+    let mut interval_total: i64 = 0;
+    for bucket in INTERVAL_BUCKETS {
+        if let Some(v) = payload.get(format!("interval_{bucket}_count").as_str()) {
+            intervals_present = true;
+            // 遥测字段与身份字段纪律不同：被拒不进 parse_errors（保 Task 6 契约）、
+            // 不阻断观察，但计一条 diag 让腐化可见，不静默归 0。
+            match parse_native_integer(v) {
+                Some(n) => interval_total = interval_total.saturating_add(n),
+                None => diag(
+                    tally,
+                    "qua.end interval 分桶值不可解析，该桶按 0 计（遥测）",
+                ),
+            }
+        }
+    }
+    // 生成窗 = total_cost_ms − ttft_ms（同请求两段；失败/取消不入速度）。
+    // 退化生成窗（整包突发交付）→ None，仅保留响应口径（同 Codex 缺口语义）。
     let generation_ms = match (outcome, ttft_ms) {
         (Outcome::Success, Some(ttft)) => {
             let g = total - ttft;
-            if g > 0 {
-                Some(g)
-            } else {
+            if g <= 0 {
                 diag(tally, "生成窗非正 → 不入速度");
                 None
+            } else if g < MIN_STREAMING_WINDOW_MS {
+                diag(
+                    tally,
+                    &format!(
+                        "突发交付：生成窗<{MIN_STREAMING_WINDOW_MS}ms（该量级窗实测仅见于整包突发）→ 无流式口径"
+                    ),
+                );
+                None
+            } else if intervals_present && interval_total < MIN_MEASURABLE_INTERVALS {
+                diag(
+                    tally,
+                    &format!("突发交付：可分间隔<{MIN_MEASURABLE_INTERVALS} → 无流式口径"),
+                );
+                None
+            } else {
+                Some(g)
             }
         }
         (Outcome::Success, None) => {
@@ -860,7 +927,9 @@ fn empty_batch(cursor: &SourceCursor) -> ReadBatch {
 // ==== 本模块贴身单测（主断言走 read_incremental 公开入口，与真实消费路径一致）====
 //
 // 覆盖面：行前缀时刻三形态（zh-CN / en-US / RFC3339）+ 无日期前缀跳过闸 +
-// v2 EOF 游标的有界恢复与 v3 升版 + 全新安装 v3 起步。
+// 旧版 EOF 游标（v1/v2/v3）的有界恢复与 v4 升版 + 全新安装 v4 起步 +
+// qua.end 突发交付闸门（单 chunk 窄窗 / 大窗少桶 → 生成窗 None；真流式 → 保留；
+// 旧载荷无分桶字段 → 只按窗口规则）。
 // 临时 home 用 std::env::temp_dir() 下的唯一子目录，绝不触真机 ~/.tuvis / ~/.workbuddy。
 #[cfg(test)]
 mod tests {
@@ -903,6 +972,78 @@ mod tests {
         format!(
             "{prefix} [Info] [pid=30436] [ModelProvider]  [SseMonitor#01a19b1b] qua.end: {payload}"
         )
+    }
+
+    /// 突发交付样例载荷基座（2026-11-03 实机取证：第三方中转路线 custom-local 的整包
+    /// 突发交付形态——ttft ≈ total、total_chunks 1~2、8 个 interval 分桶几乎全空；
+    /// 实测 670 条中 349 条生成窗 <50ms，官方流式路线 minimax 59 条 0 条如此）。
+    /// message_id 用 MSGIDUNIQUE 占位，由 burst_qua_line 按测试替换保证稳定键唯一
+    const BURST_BASE_PAYLOAD: &str = r#"{"conversation_id":"c0bb5964-d5c7-4b9d-9d45-264741ccc144","conversation_request_id":"01a19b1b800475aab1c452c34d30f7db","message_id":"MSGIDUNIQUE","model":"custom-local:glm-5.3-flash","request_type":"chat","finish_flag":"done","finish_reason":"tool_calls","model_error":"","completion_tokens":"659","total_cost_ms":"87962","ttft_ms":"87959"}"#;
+
+    /// qua 载荷的 8 个 interval 分桶字段名（流式间隔分桶，突发交付闸门的读取面）
+    const INTERVAL_KEYS: [&str; 8] = [
+        "interval_0_50_count",
+        "interval_50_100_count",
+        "interval_100_500_count",
+        "interval_500_1000_count",
+        "interval_1000_3000_count",
+        "interval_3000_10000_count",
+        "interval_10000_60000_count",
+        "interval_gt_60000_count",
+    ];
+
+    /// 8 桶字段段（前导逗号 + `"键":"值"` 对，值与 [`INTERVAL_KEYS`] 一一对应）
+    fn interval_fields(values: [&str; 8]) -> String {
+        let mut s = String::new();
+        for (k, v) in INTERVAL_KEYS.iter().zip(values.iter()) {
+            s.push_str(&format!(r#","{k}":"{v}""#));
+        }
+        s
+    }
+
+    /// 突发交付用例的 qua.end 行：BASE 基座替换 message_id（稳定键唯一），completion /
+    /// total / ttft 按用例覆写，载荷末尾追加 `extra_fields`（前导逗号的字段段；空串不加）
+    fn burst_qua_line(
+        prefix: &str,
+        message_id: &str,
+        completion_tokens: &str,
+        total_cost_ms: &str,
+        ttft_ms: &str,
+        extra_fields: &str,
+    ) -> String {
+        let mut payload = BURST_BASE_PAYLOAD
+            .replace("MSGIDUNIQUE", message_id)
+            .replace(
+                r#""completion_tokens":"659""#,
+                &format!(r#""completion_tokens":"{completion_tokens}""#),
+            )
+            .replace(
+                r#""total_cost_ms":"87962""#,
+                &format!(r#""total_cost_ms":"{total_cost_ms}""#),
+            )
+            .replace(r#""ttft_ms":"87959""#, &format!(r#""ttft_ms":"{ttft_ms}""#));
+        if !extra_fields.is_empty() {
+            // 去掉闭括号、追加字段段后补回（BASE 以 '}' 结尾）
+            let body = payload.trim_end_matches('}');
+            payload = format!("{body}{extra_fields}}}");
+        }
+        format!(
+            "{prefix} [Info] [pid=30436] [ModelProvider]  [SseMonitor#01a19b1b] qua.end: {payload}"
+        )
+    }
+
+    /// 本地时区毫秒时刻（与实现同式解释行前缀 naive 时刻，不硬编码 epoch）
+    fn local_ms(year: i32, month: u32, day: u32, hour: u32, min: u32, sec: u32, ms: u32) -> i64 {
+        use chrono::TimeZone;
+        let naive = chrono::NaiveDate::from_ymd_opt(year, month, day)
+            .unwrap()
+            .and_hms_milli_opt(hour, min, sec, ms)
+            .unwrap();
+        chrono::Local
+            .from_local_datetime(&naive)
+            .earliest()
+            .unwrap()
+            .timestamp_millis()
     }
 
     /// 公开入口读取（now_ms = 当前时刻；文件刚写 = 24h 新鲜窗内）
@@ -1055,9 +1196,9 @@ mod tests {
     }
 
     /// v2 EOF 游标（offset 已到文件尾）→ 触发一次有界恢复：字节 0 重读两条 zh-CN 行
-    /// 全部产出观察；恢复完成后游标升 v3 且 recovery 清空（复用 v1→v2 迁移机制）。
+    /// 全部产出观察；恢复完成后游标升 v4 且 recovery 清空（复用旧版迁移机制）。
     #[test]
-    fn v2_cursor_eof_triggers_bounded_rescan_and_upgrades_v3() {
+    fn v2_cursor_eof_triggers_bounded_rescan_and_upgrades_v4() {
         let home = temp_home("v2-rescan");
         let lines = [
             qua_end_line(
@@ -1090,18 +1231,18 @@ mod tests {
         let next: serde_json::Value = serde_json::from_str(&batch.next_cursor.value).unwrap();
         assert_eq!(
             next["format_version"].as_u64(),
-            Some(3),
-            "恢复完成后游标必须升 v3"
+            Some(4),
+            "恢复完成后游标必须升 v4"
         );
         assert!(next["recovery"].is_null(), "恢复完成后 recovery 必须清空");
         let _ = std::fs::remove_dir_all(&home);
     }
 
-    /// 全新安装（空游标）+ 一条 zh-CN 行 → 直接 v3 起步、无恢复（无历史可恢复）、
+    /// 全新安装（空游标）+ 一条 zh-CN 行 → 直接 v4 起步、无恢复（无历史可恢复）、
     /// 恰好 1 条观察。
     #[test]
-    fn fresh_install_starts_v3_without_recovery() {
-        let home = temp_home("fresh-v3");
+    fn fresh_install_starts_v4_without_recovery() {
+        let home = temp_home("fresh-v4");
         let line = qua_end_line(
             "[2026/11/2 15:14:12.917]",
             "07a19b1b88517505b26a0fde09620cad",
@@ -1112,19 +1253,19 @@ mod tests {
         let next: serde_json::Value = serde_json::from_str(&batch.next_cursor.value).unwrap();
         assert_eq!(
             next["format_version"].as_u64(),
-            Some(3),
-            "全新安装必须直接以 v3 游标起步"
+            Some(4),
+            "全新安装必须直接以 v4 游标起步"
         );
         assert!(next["recovery"].is_null(), "全新安装无历史，不得触发恢复");
         let _ = std::fs::remove_dir_all(&home);
     }
 
-    /// v3 游标第二轮 = append-only 稳定（恢复幂等）：v2 EOF 游标第一轮触发有界恢复
-    /// （两条 zh-CN 行全部产出、升 v3），返回的 v3 游标**原样**喂回第二轮——0 条观察
-    /// （不再全读）、返回游标与输入逐字节一致（版本不回退、状态无抖动）。
+    /// 旧版游标恢复后的第二轮 = append-only 稳定（恢复幂等）：v2 EOF 游标第一轮触发
+    /// 有界恢复（两条 zh-CN 行全部产出、升 v4），返回的 v4 游标**原样**喂回第二轮——
+    /// 0 条观察（不再全读）、返回游标与输入逐字节一致（版本不回退、状态无抖动）。
     #[test]
-    fn v3_cursor_second_round_is_append_only_and_stable() {
-        let home = temp_home("v3-stable");
+    fn recovery_second_round_is_append_only_and_stable() {
+        let home = temp_home("recovery-stable");
         let lines = [
             qua_end_line(
                 "[2026/11/2 15:14:12.917]",
@@ -1147,7 +1288,7 @@ mod tests {
             })
             .to_string(),
         };
-        // 第一轮：恢复 + 升 v3
+        // 第一轮：恢复 + 升 v4
         let batch1 = read(&home, &v2_cursor);
         assert_eq!(
             batch1.observations.len(),
@@ -1157,18 +1298,18 @@ mod tests {
         let recovered: serde_json::Value = serde_json::from_str(&batch1.next_cursor.value).unwrap();
         assert_eq!(
             recovered["format_version"].as_u64(),
-            Some(3),
-            "恢复完成后游标必须升 v3"
+            Some(4),
+            "恢复完成后游标必须升 v4"
         );
         assert!(
             recovered["recovery"].is_null(),
             "恢复完成后 recovery 必须清空"
         );
-        // 第二轮：v3 游标原样喂回 → 只消费追加字节（本文件无追加 = 0 条）
+        // 第二轮：v4 游标原样喂回 → 只消费追加字节（本文件无追加 = 0 条）
         let batch2 = read(&home, &batch1.next_cursor);
         assert!(
             batch2.observations.is_empty(),
-            "v3 游标第二轮不得再产出观察（append-only：不得反复全读）"
+            "v4 游标第二轮不得再产出观察（append-only：不得反复全读）"
         );
         assert_eq!(
             batch2.next_cursor.value, batch1.next_cursor.value,
@@ -1222,7 +1363,7 @@ mod tests {
     }
 
     /// v1 旧游标（无 format_version 字段 → serde 字段缺省 = 1）与 v2 同路触发有界恢复：
-    /// 两条 zh-CN 行全部产出观察，游标升至 v3。
+    /// 两条 zh-CN 行全部产出观察，游标升至 v4。
     #[test]
     fn legacy_v1_cursor_without_version_field_also_recovers() {
         let home = temp_home("v1-rescan");
@@ -1256,8 +1397,209 @@ mod tests {
         let next: serde_json::Value = serde_json::from_str(&batch.next_cursor.value).unwrap();
         assert_eq!(
             next["format_version"].as_u64(),
-            Some(3),
-            "恢复完成后游标必须升 v3"
+            Some(4),
+            "恢复完成后游标必须升 v4"
+        );
+        assert!(next["recovery"].is_null(), "恢复完成后 recovery 必须清空");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// 突发交付闸门·单 chunk 窄窗（整包突发形态，2026-11-03 实机取证）：生成窗仅 3ms
+    ///（< qua 最小分桶粒度 50ms，不可能有可分间隔）→ 生成窗置 None；观察照发，
+    /// 响应窗（= total）与首 Token 等待保留，outcome 不改判。
+    /// 修复前按流式速率口径给 Some(3)（预期红）。
+    #[test]
+    fn burst_delivery_single_chunk_has_no_stream_window() {
+        let home = temp_home("burst-single-chunk");
+        let mut extra = r#","total_chunks":"1""#.to_string();
+        extra.push_str(&interval_fields(["0"; 8]));
+        let line = burst_qua_line(
+            "[2026/11/3 12:12:22.000]",
+            "15a19b1b800475aab1c452c34d30f7db",
+            "659",
+            "87962",
+            "87959",
+            &extra,
+        );
+        write_log(&home, &[line]);
+        let batch = read(&home, &SourceCursor::empty(SOURCE_ID));
+        assert_eq!(
+            batch.observations.len(),
+            1,
+            "突发交付只禁生成窗，事实观察必须照发"
+        );
+        let obs = &batch.observations[0];
+        let started = local_ms(2026, 11, 3, 12, 12, 22, 0) - 87962;
+        assert_eq!(
+            obs.generation_ms, None,
+            "生成窗 3ms < 50ms 且单 chunk → 不得按流式速率给生成窗"
+        );
+        assert_eq!(
+            obs.response_elapsed_ms,
+            Some(87962),
+            "响应窗 = total（含等待），必须保留"
+        );
+        assert_eq!(
+            obs.first_token_at_ms,
+            Some(started + 87959),
+            "首 Token 等待（started + ttft）必须保留"
+        );
+        assert_eq!(obs.outcome, Outcome::Success, "突发交付不改判 outcome");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// 突发交付闸门·大窗少桶：生成窗 103ms（≥ 最小分桶粒度 50ms）但 8 桶可分间隔
+    /// 之和只有 1（< 3，无法构成速率）→ 生成窗置 None、响应窗保留。
+    /// 修复前按窗口规则给 Some(103)（预期红）。
+    #[test]
+    fn burst_delivery_few_intervals_over_larger_window_has_no_stream_window() {
+        let home = temp_home("burst-few-intervals");
+        let mut extra = r#","total_chunks":"2""#.to_string();
+        let mut buckets = ["0"; 8];
+        buckets[0] = "1"; // 仅 interval_0_50_count=1：可分间隔和 = 1 < 3
+        extra.push_str(&interval_fields(buckets));
+        let line = burst_qua_line(
+            "[2026/11/3 12:12:22.000]",
+            "16a19b1b800475aab1c452c34d30f7db",
+            "659",
+            "15409",
+            "15306",
+            &extra,
+        );
+        write_log(&home, &[line]);
+        let batch = read(&home, &SourceCursor::empty(SOURCE_ID));
+        assert_eq!(batch.observations.len(), 1, "观察照发");
+        assert_eq!(
+            batch.observations[0].generation_ms, None,
+            "可分间隔和 1 < 3 → 无法构成速率，生成窗必须置 None"
+        );
+        assert_eq!(
+            batch.observations[0].response_elapsed_ms,
+            Some(15409),
+            "响应窗 = total，必须保留"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// 护栏·真流式不得误伤：生成窗 10041ms（≥50）、8 桶可分间隔和 57（≥3）→
+    /// 生成窗照常 Some(10041)。修复前就该绿，修复后必须仍绿。
+    #[test]
+    fn streaming_delivery_keeps_generation_window() {
+        let home = temp_home("streaming-keep");
+        let mut extra = r#","total_chunks":"58""#.to_string();
+        let mut buckets = ["0"; 8];
+        buckets[0] = "21"; // interval_0_50_count
+        buckets[2] = "33"; // interval_100_500_count
+        buckets[3] = "3"; // interval_500_1000_count
+        extra.push_str(&interval_fields(buckets));
+        let line = burst_qua_line(
+            "[2026/11/3 12:12:22.000]",
+            "17a19b1b800475aab1c452c34d30f7db",
+            "1188",
+            "17541",
+            "7500",
+            &extra,
+        );
+        write_log(&home, &[line]);
+        let batch = read(&home, &SourceCursor::empty(SOURCE_ID));
+        assert_eq!(batch.observations.len(), 1, "真流式行观察照发");
+        assert_eq!(
+            batch.observations[0].generation_ms,
+            Some(17541 - 7500),
+            "真流式（间隔和 57 ≥ 3、窗 ≥ 50ms）生成窗必须保留"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// 旧载荷（无任何 interval/chunks 字段）不触发间隔闸，只按窗口规则：
+    /// 窗 10041ms ≥50 → 保留 Some(10041)（现在就该绿）；窗 10ms <50 → None
+    ///（修复前按 g>0 给 Some(10)，预期红）。
+    #[test]
+    fn legacy_payload_without_interval_fields_uses_window_rule_only() {
+        let home = temp_home("legacy-no-interval");
+        // 行 A：旧载荷形态（无 interval/chunks 字段）+ 健康窗（total=17541, ttft=7500）
+        let line_a = burst_qua_line(
+            "[2026/11/3 12:12:22.000]",
+            "18a19b1b800475aab1c452c34d30f7db",
+            "659",
+            "17541",
+            "7500",
+            "",
+        );
+        // 行 B：同样无 interval 字段，生成窗 10ms（total=2000, ttft=1990）→ 低于粒度
+        let line_b = burst_qua_line(
+            "[2026/11/3 12:12:30.000]",
+            "19a19b1b800475aab1c452c34d30f7db",
+            "659",
+            "2000",
+            "1990",
+            "",
+        );
+        write_log(&home, &[line_a, line_b]);
+        let batch = read(&home, &SourceCursor::empty(SOURCE_ID));
+        assert_eq!(batch.observations.len(), 2, "两条旧载荷行观察照发");
+        let key_a = "18a19b1b800475aab1c452c34d30f7db";
+        let key_b = "19a19b1b800475aab1c452c34d30f7db";
+        let a = batch
+            .observations
+            .iter()
+            .find(|o| o.stable_call_key == key_a)
+            .unwrap();
+        let b = batch
+            .observations
+            .iter()
+            .find(|o| o.stable_call_key == key_b)
+            .unwrap();
+        assert_eq!(
+            a.generation_ms,
+            Some(10041),
+            "旧载荷无分桶字段 → 只按窗口规则：窗 10041ms ≥ 50 保留"
+        );
+        assert_eq!(
+            b.generation_ms, None,
+            "旧载荷无分桶字段 → 只按窗口规则：窗 10ms < 50 置 None"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// v3 EOF 游标（v4 语义下的旧版游标）与 v2 同路触发有界恢复：两条 zh-CN 行全部
+    /// 产出观察，游标升 v4。修复前 v3 = 当前版本（不触发恢复：0 条且停在 v3，预期红）。
+    #[test]
+    fn v3_cursor_eof_triggers_rescan_upgrade_to_v4() {
+        let home = temp_home("v3-rescan");
+        let lines = [
+            qua_end_line(
+                "[2026/11/2 15:14:12.917]",
+                "20a19b1b88517505b26a0fde09620cad",
+            ),
+            qua_end_line(
+                "[2026/11/2 15:15:30.123]",
+                "21a19b1b88517505b26a0fde09620cad",
+            ),
+        ];
+        let path = write_log(&home, &lines);
+        let size = std::fs::metadata(&path).unwrap().len();
+        let file_key = path.to_string_lossy().to_string();
+        // v3 EOF 游标：offset = 文件字节数（全部历史已在旧版本消费过）
+        let cursor = SourceCursor {
+            source: SOURCE_ID.into(),
+            value: serde_json::json!({
+                "format_version": 3,
+                "files": { file_key: {"offset": size, "skip_lines": 0} }
+            })
+            .to_string(),
+        };
+        let batch = read(&home, &cursor);
+        assert_eq!(
+            batch.observations.len(),
+            2,
+            "EOF 的 v3 旧游标必须触发有界恢复（退回字节 0 重读）"
+        );
+        let next: serde_json::Value = serde_json::from_str(&batch.next_cursor.value).unwrap();
+        assert_eq!(
+            next["format_version"].as_u64(),
+            Some(4),
+            "恢复完成后游标必须升 v4"
         );
         assert!(next["recovery"].is_null(), "恢复完成后 recovery 必须清空");
         let _ = std::fs::remove_dir_all(&home);
