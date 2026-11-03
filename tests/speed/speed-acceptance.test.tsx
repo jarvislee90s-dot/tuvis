@@ -273,7 +273,8 @@ describe("speed-acceptance（Task 13：整链验收）", () => {
     expect(screen.getByTestId("speed-status-opencode")).toHaveTextContent("待重启");
     expect(screen.getByTestId("speed-status-claude")).toHaveTextContent("待配置");
     expect(screen.getByTestId("speed-status-codex")).toHaveTextContent("已接入");
-    expect(screen.getByTestId("speed-status-codex")).toHaveTextContent("仅响应");
+    expect(screen.getByTestId("speed-status-codex")).not.toHaveTextContent("仅响应");
+    expect(screen.getByTestId("speed-cap-estimate-codex")).toHaveTextContent("正文估算");
 
     // 接入预览：脱敏 chip + 原生设置路径；取消不动任何事实
     fireEvent.click(screen.getByTestId("speed-install-claude"));

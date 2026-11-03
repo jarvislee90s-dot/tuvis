@@ -176,5 +176,9 @@ export function formatDurationI18n(ms: number | null | undefined, t: TFunction):
 
 /** 当前模式的单位文案（stream=TPS / response=Token/s；文案在 locales 的 speed.unit.*）。 */
 export function unitForMode(mode: SpeedMetricMode, t: TFunction): string {
-  return mode === "stream" ? t("speed.unit.tps") : t("speed.unit.tokenPerSec");
+  return mode === "stream"
+    ? t("speed.unit.tps")
+    : mode === "response"
+      ? t("speed.unit.tokenPerSec")
+      : t("speed.unit.referenceTokenPerSec");
 }

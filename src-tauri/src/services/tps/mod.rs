@@ -22,12 +22,16 @@
 // 错误类型：本域复用 `crate::services::usage::UsageError`（码表登记纪律见 usage/error.rs），
 // 不另造错误类型。
 
+pub mod body_observer;
+pub mod body_runtime;
 pub mod collector;
+pub mod estimate_store;
 pub mod install;
 pub mod model;
 pub mod policy;
 pub mod query;
 pub mod receiver;
+pub mod reference;
 pub mod scheduler;
 pub mod sources;
 pub mod store;

@@ -116,10 +116,13 @@ pub fn load_points_since(conn: &Connection, since_ms: i64) -> Result<Vec<TpsPoin
 // ==== 保留清理 ====
 
 /// 24 小时保留清理：删 `ended_at < now-24h` 的事实与 `sampled_at < now-24h` 的点，
-/// 返回删除总行数。**只**删 tps 两张表——旧 usage_* 的保留设置一律不碰（spec §2）。
+/// 返回删除总行数。**只**删 tps 事实与点表——旧 usage_* 的保留设置一律不碰（spec §2）。
 /// 恰在 24h 边界的行保留（「最近 24 小时」含边界）。
 pub fn purge(conn: &Connection, now_ms: i64) -> Result<usize, UsageError> {
-    dao::purge_before_conn(conn, now_ms - TPS_RETENTION_MS)
+    let cutoff = now_ms.saturating_sub(TPS_RETENTION_MS);
+    let native = dao::purge_before_conn(conn, cutoff)?;
+    let estimates = crate::database::dao::tps_estimate::purge_before(conn, cutoff)?;
+    Ok(native + estimates)
 }
 
 // ==== tps_state 通用通道（安装记录 / 调度元数据 / 游标 / 来源状态共用）====

@@ -27,13 +27,15 @@ use std::collections::BTreeMap;
 use rusqlite::Connection;
 
 use crate::database::dao::speed as speed_dao;
+use crate::database::dao::tps_estimate as estimate_dao;
 use crate::services::tps::collector::REGISTERED_SOURCES;
 use crate::services::tps::install;
 use crate::services::tps::model::SeriesKey;
 use crate::services::tps::store;
+use crate::services::tps::v2::model::SpeedMetricMode;
 use crate::services::tps::v2::model::{
-    BucketSpan, SpeedBucket, SpeedCapabilities, SpeedDashboardQuery, SpeedDashboardSnapshot,
-    SpeedMetrics, SpeedSeriesSummary, SpeedSourceStatus, SpeedSourceView,
+    BucketSpan, EstimateSourceState, SpeedBucket, SpeedCapabilities, SpeedDashboardQuery,
+    SpeedDashboardSnapshot, SpeedMetrics, SpeedSeriesSummary, SpeedSourceStatus, SpeedSourceView,
 };
 use crate::services::tps::v2::sums::{derive_metrics, SpeedSums};
 use crate::services::usage::error::UsageError;
@@ -139,6 +141,7 @@ fn mode_value(
     match mode {
         Mode::Stream => m.stream.value,
         Mode::Response => m.response.value,
+        Mode::TokenizerEstimate => m.tokenizer_estimate.value,
     }
 }
 
@@ -206,6 +209,9 @@ fn static_capabilities(source: &str) -> SpeedCapabilities {
             response: true,
             stream_reason: Some(CODEX_STREAM_GAP_REASON.to_string()),
             response_reason: None,
+            tokenizer_estimate: cfg!(target_os = "macos"),
+            tokenizer_estimate_reason: (!cfg!(target_os = "macos"))
+                .then(|| "platform-unverified".to_owned()),
         }
     } else {
         // dsh / zcode / kimi / workbuddy / claude / opencode：双指标均具备计算路径
@@ -214,6 +220,8 @@ fn static_capabilities(source: &str) -> SpeedCapabilities {
             response: true,
             stream_reason: None,
             response_reason: None,
+            tokenizer_estimate: false,
+            tokenizer_estimate_reason: Some("unsupported-source".to_owned()),
         }
     }
 }
@@ -274,8 +282,54 @@ fn resolve_source_views(
         } else {
             (SpeedSourceStatus::Ready, None)
         };
+        let supported = *source == "codex" && cfg!(target_os = "macos");
+        let enabled = store::load_state(conn, crate::services::tps::estimate_store::ENABLED_KEY)?
+            .is_none_or(|value| value.as_bool().unwrap_or(false));
+        let last_estimate: Option<i64> = if *source == "codex" {
+            conn.query_row(
+                "SELECT MAX(ended_at_ms) FROM tps_body_estimate WHERE ended_at_ms <= ?1",
+                [to_ms],
+                |row| row.get(0),
+            )
+            .map_err(|e| UsageError::new("usage-db-failed", format!("estimate last record: {e}")))?
+        } else {
+            None
+        };
+        let observing = supported
+            && enabled
+            && crate::services::tps::body_runtime::production_diagnostics()
+                .is_some_and(|d| d.active_leases > 0);
+        let profile = (*source == "codex").then(crate::services::tps::reference::reference_profile);
+        let estimate_state = EstimateSourceState {
+            supported,
+            enabled,
+            observing,
+            reason: if !supported {
+                Some(
+                    if *source == "codex" {
+                        "platform-unverified"
+                    } else {
+                        "unsupported-source"
+                    }
+                    .into(),
+                )
+            } else if !enabled {
+                Some("source-disabled".into())
+            } else if !observing {
+                Some("not-observing".into())
+            } else {
+                None
+            },
+            last_record_at: last_estimate,
+            reference_profile_id: profile.map(|p| p.id.clone()),
+            encoding: profile.map(|p| p.encoding.to_owned()),
+            rule_version: profile.map(|p| p.rule_version),
+            resource_sha256: profile.map(|p| p.resource_sha256.to_owned()),
+            model_source: profile.map(|_| "turn-config-or-unknown".into()),
+        };
         out.push(SpeedSourceView {
             source: (*source).to_string(),
+            estimate_state,
             status,
             installed,
             capabilities: static_capabilities(source),
@@ -317,8 +371,17 @@ pub fn dashboard(
 
     // 区间 series 汇总（MainTask 候选在 SQL 内全保留、各口径 CASE 分算）
     let search = (!query.search.is_empty()).then_some(query.search.as_str());
-    let rows =
-        speed_dao::series_sums_conn(conn, range_from, range_to, query.tool_id.as_deref(), search)?;
+    let rows = if query.metric_mode == SpeedMetricMode::TokenizerEstimate {
+        estimate_dao::series_sums_conn(
+            conn,
+            range_from,
+            range_to,
+            query.tool_id.as_deref(),
+            search,
+        )?
+    } else {
+        speed_dao::series_sums_conn(conn, range_from, range_to, query.tool_id.as_deref(), search)?
+    };
     let mut entries: Vec<(SeriesKey, SpeedMetrics)> = rows
         .into_iter()
         .map(|r| (r.key, derive_metrics(&r.sums)))
@@ -328,6 +391,12 @@ pub fn dashboard(
     // 选择：只在筛选后的 series 集保留，否则排序第一，无匹配 None
     let selected_series = match &query.selection {
         Some(sel) if entries.iter().any(|(k, _)| k == sel) => Some(sel.clone()),
+        Some(sel) if query.metric_mode == SpeedMetricMode::TokenizerEstimate
+            && query.tool_id.as_ref().is_none_or(|tool| tool == &sel.tool)
+            && conn.query_row(
+                "SELECT ?1 = '' OR instr(lower(?2 || ' ' || ?3 || ' ' || COALESCE(?4,'')), lower(?1)) > 0",
+                rusqlite::params![query.search, sel.tool, sel.model, sel.channel], |row| row.get::<_, bool>(0)
+            ).map_err(|e| UsageError::new("usage-db-failed", format!("estimate selection filter: {e}")))? => Some(sel.clone()),
         _ => entries.first().map(|(k, _)| k.clone()),
     };
 
@@ -340,10 +409,12 @@ pub fn dashboard(
             let width = query.range.bucket_width_ms();
             let spans = bucket_spans(range_from, range_to, query.range);
             let anchor = align_down_ms(range_from, width, local_offset_seconds(now_ms));
-            let by_idx: BTreeMap<i64, SpeedSums> =
+            let rows = if query.metric_mode == SpeedMetricMode::TokenizerEstimate {
+                estimate_dao::bucket_sums_conn(conn, range_from, range_to, anchor, width, key)?
+            } else {
                 speed_dao::bucket_sums_conn(conn, range_from, range_to, anchor, width, key)?
-                    .into_iter()
-                    .collect();
+            };
+            let by_idx: BTreeMap<i64, SpeedSums> = rows.into_iter().collect();
             let empty = SpeedSums::default();
             spans
                 .into_iter()

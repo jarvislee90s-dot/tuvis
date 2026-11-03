@@ -180,6 +180,7 @@ describe("组合装配", () => {
         model: "doubao-seed-1.6",
         channel: null,
         method: "client-native",
+        referenceProfileId: null,
       } satisfies SeriesKey)
     );
     await waitFor(() => expect(detailTitle()).toContain("doubao-seed-1.6")); // 详情标题切换
@@ -308,14 +309,14 @@ describe("筛选与排序", () => {
     renderSpeed();
     const footnote = await screen.findByTestId("speed-chart-footnote");
     const text = footnote.textContent ?? "";
-    // 三行文案（i18n speed.modeHint.line1/2/3）
-    expect(text).toContain("首个有效输出到生成完成");
-    expect(text).toContain("不含首 Token 等待");
-    expect(text).toContain("首 Token 等待 + 生成");
-    expect(text).toContain("差额即等待");
-    expect(text).toContain("Codex 仅有响应口径");
-    // 三行各占一行 <p>
-    expect(footnote.querySelectorAll("p")).toHaveLength(3);
+    // 四行固定公式与范围说明。
+    expect(text).toContain("首个有效输出至生成完成");
+    expect(text).toContain("不含首输出等待");
+    expect(text).toContain("对应响应的含等待总秒数");
+    expect(text).toContain("首次正文增长至最后一次正文增长");
+    expect(text).toContain("估算误差尚未校准");
+    expect(text).not.toContain("差额即等待");
+    expect(footnote.querySelectorAll("p")).toHaveLength(4);
     // DOM 顺序：footnote 在图例（speed-chart-legend）之后（mock 桶中部含空桶 ⇒ 图例在场）
     const legend = screen.getByTestId("speed-chart-legend");
     expect(
@@ -325,7 +326,7 @@ describe("筛选与排序", () => {
     expect(screen.queryByTestId("speed-mode-hint")).toBeNull();
     // 模式按钮 title（口径定义 tooltip）保留
     expect(screen.getByTestId("speed-mode-stream").getAttribute("title") ?? "").toContain(
-      "不含首 Token 等待"
+      "不含首输出等待"
     );
     expect(screen.getByTestId("speed-mode-response").getAttribute("title") ?? "").toContain(
       "总秒数"

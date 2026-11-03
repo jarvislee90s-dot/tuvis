@@ -359,6 +359,7 @@ fn kimi_series() -> SeriesKey {
         model: "kimi-k2".into(),
         channel: None,
         method: TimingMethod::ClientNative,
+        reference_profile_id: None,
     }
 }
 

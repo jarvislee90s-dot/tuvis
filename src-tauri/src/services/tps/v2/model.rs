@@ -25,6 +25,8 @@ pub enum SpeedMetricMode {
     Stream,
     /// 响应吞吐·含等待（1000×Σ响应有效输出 / Σ响应毫秒）
     Response,
+    #[serde(rename = "tokenizer-estimate")]
+    TokenizerEstimate,
 }
 
 /// 区间档位（契约 `SpeedRange={Last15m,Last1h,Last5h,Last24h}` → `15m|1h|5h|24h`；
@@ -82,7 +84,7 @@ pub struct SpeedRate {
     /// 1000×Σ输出/Σ毫秒；无有效样本为 null
     pub value: Option<f64>,
     pub output_tokens: i64,
-    pub duration_ms: i64,
+    pub duration_ms: f64,
     pub sample_count: i64,
 }
 
@@ -93,6 +95,10 @@ pub struct SpeedRate {
 pub struct SpeedMetrics {
     pub stream: SpeedRate,
     pub response: SpeedRate,
+    pub tokenizer_estimate: SpeedRate,
+    pub body_observed_ms: Option<f64>,
+    pub short_window_count: i64,
+    pub small_sample_count: i64,
     /// 平均首点等待（分母 = ttft_sample_count，独立）；无可对齐样本为 null
     pub avg_first_token_ms: Option<f64>,
     pub ttft_sample_count: i64,
@@ -147,6 +153,8 @@ pub struct SpeedCapabilities {
     /// stream 缺失原因（如 Codex 流式缺口）；具备时为 null
     pub stream_reason: Option<String>,
     pub response_reason: Option<String>,
+    pub tokenizer_estimate: bool,
+    pub tokenizer_estimate_reason: Option<String>,
 }
 
 /// 来源接入状态（契约 `SpeedSourceStatus` 五值，kebab-case）。
@@ -168,6 +176,22 @@ pub enum SpeedSourceStatus {
     Unsupported,
 }
 
+/// 正文估算来源的独立状态与固定参考配置。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EstimateSourceState {
+    pub supported: bool,
+    pub enabled: bool,
+    pub observing: bool,
+    pub reason: Option<String>,
+    pub last_record_at: Option<i64>,
+    pub reference_profile_id: Option<String>,
+    pub encoding: Option<String>,
+    pub rule_version: Option<u32>,
+    pub resource_sha256: Option<String>,
+    pub model_source: Option<String>,
+}
+
 /// 来源视图（契约 `SpeedSourceView` 逐字段）：每注册来源一条；主界面只渲染
 /// 名称/状态/能力，`detail` 仅供详情面板（前端职责，后端只如实携带）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -178,6 +202,7 @@ pub struct SpeedSourceView {
     /// 安装事实（安装回执在册与否，与样本无关；无安装机制的来源恒 true）
     pub installed: bool,
     pub capabilities: SpeedCapabilities,
+    pub estimate_state: EstimateSourceState,
     /// 该源最近一次事实完成时刻（区间内；无事实为 null）
     pub last_record_at: Option<i64>,
     /// 状态成因的稳定机器 token（`not-installed` / `never-read` / `read-failed` /

@@ -96,6 +96,7 @@ export function SpeedMetrics({
   const rate = rateForMode(metrics, mode);
   const unit = unitForMode(mode, t);
   const isLogApprox = series?.method === "log-boundary-approx";
+  const isEstimate = mode === "tokenizer-estimate";
 
   // 上下文行（读数来源）：
   let contextText: string;
@@ -130,6 +131,13 @@ export function SpeedMetrics({
         <Tile
           testId="speed-tile-rate"
           label={t("speed.tile.currentRate")}
+          extraLabel={
+            isEstimate ? (
+              <span className="text-muted-foreground ml-1 text-[10px]">
+                {t("speed.tile.estimateMark")}
+              </span>
+            ) : undefined
+          }
           value={formatRateValue(rate.value)}
           valueTestId="speed-rate-value"
           suffix={
@@ -141,16 +149,23 @@ export function SpeedMetrics({
         <Tile
           testId="speed-tile-first-token"
           label={t("speed.tile.avgFirstToken")}
-          value={formatFirstTokenMs(metrics.avgFirstTokenMs)}
+          value={isEstimate ? EM_DASH : formatFirstTokenMs(metrics.avgFirstTokenMs)}
+          title={isEstimate ? t("speed.tile.estimateFirstHint") : undefined}
           valueTestId="speed-first-token"
         />
         <Tile
           testId="speed-tile-model"
-          label={isLogApprox ? t("speed.tile.responseMs") : t("speed.tile.modelMs")}
-          value={formatDurationI18n(metrics.modelMs, t)}
+          label={
+            isEstimate
+              ? t("speed.tile.bodyObservedMs")
+              : isLogApprox
+                ? t("speed.tile.responseMs")
+                : t("speed.tile.modelMs")
+          }
+          value={formatDurationI18n(isEstimate ? metrics.bodyObservedMs : metrics.modelMs, t)}
           valueTestId="speed-model-duration"
           extraLabel={
-            isLogApprox ? (
+            isLogApprox && !isEstimate ? (
               <span
                 data-testid="speed-approx-mark"
                 className="border-border/60 text-muted-foreground ml-1 rounded border px-1 text-[10px]"
@@ -163,12 +178,20 @@ export function SpeedMetrics({
         <Tile
           testId="speed-tile-tool"
           label={t("speed.tile.toolMs")}
-          value={formatDurationI18n(metrics.toolMs, t)}
+          value={isEstimate ? EM_DASH : formatDurationI18n(metrics.toolMs, t)}
           valueTestId="speed-tool-duration"
-          title={t("speed.tile.toolMsHint")}
+          title={t(isEstimate ? "speed.tile.estimateToolHint" : "speed.tile.toolMsHint")}
         />
       </div>
       <div className="text-muted-foreground mt-2 flex flex-wrap items-center gap-2 text-xs">
+        {isEstimate && (metrics.shortWindowCount > 0 || metrics.smallSampleCount > 0) ? (
+          <span title={t("speed.tile.shortWindowHint")} data-testid="speed-estimate-quality">
+            {t("speed.tile.qualityCounts", {
+              short: metrics.shortWindowCount,
+              small: metrics.smallSampleCount,
+            })}
+          </span>
+        ) : null}
         <span data-testid="speed-metrics-context">
           {contextText}
           {context.kind === "bucket" && noValue ? ` · ${t("speed.chart.noSample")}` : ""}

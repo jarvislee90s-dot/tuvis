@@ -18,6 +18,7 @@ pub mod speed;
 pub mod stash;
 pub mod tool_resident;
 pub mod tps;
+pub mod tps_estimate;
 pub mod unread;
 pub mod usage;
 pub mod usage_alias;

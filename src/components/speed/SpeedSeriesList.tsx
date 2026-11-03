@@ -40,6 +40,9 @@ export interface SpeedSeriesListProps {
   sortDirection: SortDirection;
   onSortKeyChange: (v: SpeedListSortKey) => void;
   onToggleSortDirection: () => void;
+  profiles?: string[];
+  profile?: string | null;
+  onProfileChange?: (profile: string) => void;
   /**
    * 追加到根元素的类（可选；二轮实机反馈 ③，2026-10-27）：父层栅格用它注入 `order` 类——
    * 窄窗（<lg）详情在上、列表在下（`order-2`），宽窗恢复左列表（`lg:order-1`）。
@@ -84,6 +87,9 @@ export function SpeedSeriesList({
   sortDirection,
   onSortKeyChange,
   onToggleSortDirection,
+  profiles = [],
+  profile = null,
+  onProfileChange,
   className,
 }: SpeedSeriesListProps): ReactElement {
   const { t } = useTranslation();
@@ -96,6 +102,27 @@ export function SpeedSeriesList({
       data-testid="speed-list-pane"
       aria-label={t("speed.list.listLabel")}
     >
+      {profiles.length > 1 ? (
+        <label className="text-muted-foreground flex flex-wrap items-center gap-2 text-xs">
+          {t("speed.list.referenceProfile")}
+          <select
+            className={SELECT_CLASS}
+            data-testid="speed-profile-filter"
+            value={profile ?? ""}
+            onChange={(event) => onProfileChange?.(event.target.value)}
+          >
+            <option value="" disabled>
+              {t("speed.list.selectProfile")}
+            </option>
+            {profiles.map((value) => (
+              <option key={value} value={value}>
+                {value.slice(0, 12)}
+              </option>
+            ))}
+          </select>
+        </label>
+      ) : null}
+
       {/* 筛选控件（宽窄布局都在）；排序改由表头点击驱动（三轮实机反馈 ③） */}
       <div className="flex flex-wrap items-center gap-1.5">
         <select

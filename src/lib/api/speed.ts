@@ -9,3 +9,8 @@ import type { SpeedDashboardQuery, SpeedDashboardSnapshot } from "@/types/speed"
 export async function speedDashboard(query: SpeedDashboardQuery): Promise<SpeedDashboardSnapshot> {
   return await invoke<SpeedDashboardSnapshot>("tps_speed_dashboard", { query });
 }
+
+/** 只控制正文分词估算来源。 */
+export async function setTokenizerEstimateEnabled(enabled: boolean): Promise<void> {
+  await invoke<void>("tps_tokenizer_estimate_set_enabled", { enabled });
+}

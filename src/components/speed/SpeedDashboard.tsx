@@ -66,6 +66,8 @@ const BOTH_CAPABILITIES: SpeedCapabilities = {
   response: true,
   streamReason: null,
   responseReason: null,
+  tokenizerEstimate: false,
+  tokenizerEstimateReason: "unsupported-source",
 };
 
 /** 选中来源的能力位（来源视图缺席 ⇒ 双能力兜底；不猜测、不按工具名硬编码）。 */
@@ -80,6 +82,12 @@ function capabilitiesOf(
 function sameSeriesKey(a: SeriesKey | null, b: SeriesKey | null): boolean {
   if (a === null || b === null) return a === b;
   return seriesKeyId(a) === seriesKeyId(b);
+}
+
+/// 跨口径切换的身份对位：参考 Token 与原生 Token 是不同 method 的 series，
+/// 切换口径时只按 tool/model/channel 找同身份曲线，不比 method。
+function sameSeriesIdentity(a: SeriesKey, b: SeriesKey): boolean {
+  return a.tool === b.tool && a.model === b.model && a.channel === b.channel;
 }
 
 export function SpeedDashboard({ active }: { active: boolean }) {
@@ -119,9 +127,28 @@ export function SpeedDashboard({ active }: { active: boolean }) {
   // 快照（数据陈旧但结构完整），避免列表/图表在切范围/排序/键入搜索时闪空。
   // 用「渲染期调整 state」（React 文档认可的模式；identity 守卫保证收敛）——不用 ref：
   // ref 在渲染期读写被 react-hooks/refs 禁止，且 effect 方案会晚一帧、闪空列表。
-  const [lastGood, setLastGood] = useState<SpeedDashboardSnapshot | null>(null);
-  if (snapshot !== null && snapshot !== lastGood) setLastGood(snapshot);
-  const shown = snapshot ?? lastGood;
+  const [lastGood, setLastGood] = useState<{
+    snapshot: SpeedDashboardSnapshot;
+    mode: SpeedMetricMode;
+    selected: string | null;
+  } | null>(null);
+  const selectedIdentity = selection ? seriesKeyId(selection) : null;
+  if (snapshot !== null && snapshot !== lastGood?.snapshot)
+    setLastGood({ snapshot, mode: preferredMode, selected: selectedIdentity });
+  const crossDataset =
+    lastGood !== null &&
+    (lastGood.mode === "tokenizer-estimate") !== (preferredMode === "tokenizer-estimate");
+  const selectionChanged = lastGood !== null && lastGood.selected !== selectedIdentity;
+  const shown =
+    snapshot ??
+    (lastGood && (crossDataset || selectionChanged)
+      ? {
+          ...lastGood.snapshot,
+          series: crossDataset ? [] : lastGood.snapshot.series,
+          buckets: [],
+          selectedSeries: selection ?? lastGood.snapshot.selectedSeries,
+        }
+      : (lastGood?.snapshot ?? null));
   const serverSelected = snapshot?.selectedSeries ?? null;
   /** 显示用的服务端选中：`shown` 已含「有快照用快照、换键 pending 退上一份」语义。 */
   const shownServerSelected = shown?.selectedSeries ?? null;
@@ -129,15 +156,47 @@ export function SpeedDashboard({ active }: { active: boolean }) {
   // 本地 selection 被筛掉 ⇒ 跟随服务端回退（后端 selected_series 同款回退是显示真值源）；
   // selection=null（未选择）不回写——保持「让服务端选默认」的语义，避免多余换键重查。
   useEffect(() => {
-    if (snapshot === null || selection === null || serverSelected === null) return;
+    if (snapshot === null || selection === null) return;
+    if (serverSelected === null) {
+      setSelection(null);
+      setPinned(null);
+      setHovered(null);
+      return;
+    }
+    if (preferredMode === "tokenizer-estimate") {
+      const compatible = snapshot.series.filter(({ seriesKey }) =>
+        sameSeriesIdentity(seriesKey, selection)
+      );
+      if (selection.method !== "ipc-body-reference" && compatible.length === 1)
+        setSelection(compatible[0]!.seriesKey);
+      return;
+    }
+    if (selection.method === "ipc-body-reference") {
+      const matching = snapshot.series.filter(({ seriesKey }) =>
+        sameSeriesIdentity(seriesKey, selection)
+      );
+      const candidate =
+        matching.find(
+          ({ metrics }) =>
+            (preferredMode === "stream" ? metrics.stream : metrics.response).sampleCount > 0
+        ) ?? matching[0];
+      setSelection(candidate?.seriesKey ?? serverSelected);
+      return;
+    }
     if (!sameSeriesKey(selection, serverSelected)) setSelection(serverSelected);
-  }, [snapshot, selection, serverSelected]);
+  }, [snapshot, selection, serverSelected, preferredMode]);
 
   /**
    * 展示真值源：本地 selection 优先（点击行 → 立即生效，不等新快照；Codex fallback
    * 因此瞬时翻转）；未选择时跟随服务端选中（含回退）。sync effect 保证二者最终一致。
    */
-  const displayKey = selection ?? shownServerSelected;
+  const displayKey =
+    snapshot &&
+    selection?.method === "ipc-body-reference" &&
+    preferredMode !== "tokenizer-estimate" &&
+    !snapshot.series.some(({ seriesKey }) => sameSeriesIdentity(seriesKey, selection))
+      ? serverSelected
+      : (selection ?? shownServerSelected);
 
   const selectedCapabilities = capabilitiesOf(displayKey, shown);
   const mode = effectiveMetric(preferredMode, selectedCapabilities);
@@ -152,15 +211,27 @@ export function SpeedDashboard({ active }: { active: boolean }) {
   // 「dependency may be modified later」导致整组件跳过优化）；直排计算绕开该分析——
   // 组合数量级的小数组排序逐渲染重算可忽略。
   const rawSeries = shown?.series ?? [];
-  const listSeries = sortSeries(rawSeries, listSort, mode, sortDir);
+  const profiles =
+    mode === "tokenizer-estimate"
+      ? [
+          ...new Set(
+            rawSeries
+              .map((item) => item.seriesKey.referenceProfileId)
+              .filter((value): value is string => typeof value === "string")
+          ),
+        ].sort()
+      : [];
+  const profile = displayKey?.referenceProfileId ?? (profiles.length === 1 ? profiles[0] : null);
+  const comparableSeries =
+    mode === "tokenizer-estimate"
+      ? rawSeries.filter((item) => item.seriesKey.referenceProfileId === profile)
+      : rawSeries;
+  const listSeries = sortSeries(comparableSeries, listSort, mode, sortDir);
 
-  const selectedSummary = useMemo(
-    () =>
-      displayKey && shown
-        ? (shown.series.find((s) => sameSeriesKey(s.seriesKey, displayKey)) ?? null)
-        : null,
-    [displayKey, shown]
-  );
+  const selectedSummary =
+    displayKey && shown
+      ? (shown.series.find((item) => sameSeriesKey(item.seriesKey, displayKey)) ?? null)
+      : null;
 
   // 滚动窗口裁决：固定/悬停自动解除只看 mode:range:series（from/to 随 asOf 前移不算切换）
   const clearSignalKey = `${mode}:${range}:${displayKey ? seriesKeyId(displayKey) : "none"}`;
@@ -173,6 +244,7 @@ export function SpeedDashboard({ active }: { active: boolean }) {
   };
   const switchMode = (m: SpeedMetricMode) => {
     if (m === preferredMode) return;
+    if (selection === null && displayKey) setSelection(displayKey);
     setPreferredMode(m);
     setPinned(null);
     setHovered(null);
@@ -194,9 +266,67 @@ export function SpeedDashboard({ active }: { active: boolean }) {
     setHovered(null);
   };
 
-  const toolOptions = useMemo(
-    () => (shown ? shown.sourceStates.map((st) => st.source) : []),
-    [shown]
+  const toolOptions = shown ? shown.sourceStates.map((state) => state.source) : [];
+
+  const modeControls = (
+    <>
+      {/* 口径行：模式切换（speed-mode 根 = 全界面同步的唯一驱动）+ 显著 fallback 提示 */}
+      <div className="flex flex-wrap items-center gap-2">
+        <div
+          data-testid="speed-mode"
+          data-mode={mode}
+          role="group"
+          className="flex flex-wrap gap-1.5"
+        >
+          <Button
+            size="sm"
+            variant={mode === "stream" ? "default" : "outline"}
+            aria-pressed={mode === "stream"}
+            data-testid="speed-mode-stream"
+            disabled={!selectedCapabilities.stream}
+            title={
+              selectedCapabilities.stream
+                ? t("speed.modeHint.stream") // 口径定义 tooltip（实机反馈 #4c）
+                : selectedCapabilities.streamReason
+                  ? translateSpeedReason(t, selectedCapabilities.streamReason)
+                  : t("speed.codexFallback")
+            }
+            onClick={() => switchMode("stream")}
+          >
+            {t("speed.mode.stream")}
+          </Button>
+          <Button
+            size="sm"
+            variant={mode === "response" ? "default" : "outline"}
+            aria-pressed={mode === "response"}
+            data-testid="speed-mode-response"
+            title={t("speed.modeHint.response")} // 口径定义 tooltip（实机反馈 #4c）
+            onClick={() => switchMode("response")}
+          >
+            {t("speed.mode.response")}
+          </Button>
+          <Button
+            size="sm"
+            variant={mode === "tokenizer-estimate" ? "default" : "outline"}
+            aria-pressed={mode === "tokenizer-estimate"}
+            data-testid="speed-mode-tokenizer-estimate"
+            title={t("speed.modeHint.tokenizerEstimate")}
+            onClick={() => switchMode("tokenizer-estimate")}
+          >
+            {t("speed.mode.tokenizerEstimate")}
+          </Button>
+        </div>
+        {fallbackActive ? (
+          <p
+            role="status"
+            data-testid="speed-fallback-notice"
+            className="border-border/60 bg-muted/40 text-foreground rounded-md border px-2 py-1 text-xs"
+          >
+            {t("speed.codexFallback")} · {t("speed.tile.approxMark")}
+          </p>
+        ) : null}
+      </div>
+    </>
   );
 
   // —— 详情区（右列）——
@@ -222,18 +352,48 @@ export function SpeedDashboard({ active }: { active: boolean }) {
         {t("speed.disabled")}
       </p>
     );
-  } else if (!displayKey || !selectedSummary || shown === null) {
+  } else if (!displayKey || shown === null) {
     detail = (
-      <p className="text-muted-foreground text-sm" data-testid="speed-detail-empty">
-        {t("speed.detail.empty")}
-      </p>
+      <div className="flex flex-col gap-3">
+        {modeControls}
+        <p className="text-muted-foreground text-sm" data-testid="speed-detail-empty">
+          {t("speed.detail.empty")}
+        </p>
+        <div className="text-muted-foreground text-xs" data-testid="speed-empty-formulas">
+          <p>{t("speed.modeHint.line1")}</p>
+          <p>{t("speed.modeHint.line2")}</p>
+          <p>{t("speed.modeHint.line3")}</p>
+          <p>{t("speed.modeHint.line4")}</p>
+        </div>
+      </div>
     );
   } else {
     // —— 四格读数：固定快照 > 悬停桶 > 区间汇总（Spec §8.3）——
     // 三路取数（固定深拷贝 / 悬停桶 / 区间汇总）类型层均不可空，读数恒非 null。
     // 只在本分支消费，故就地声明：selectedSummary 已被上方守卫收窄为非空。
     let metricsContext: SpeedMetricsContext = { kind: "range-summary" };
-    let displayedMetrics = selectedSummary.metrics;
+    const emptyRate = { value: null, outputTokens: 0, durationMs: 0, sampleCount: 0 };
+    let displayedMetrics = selectedSummary?.metrics ?? {
+      stream: emptyRate,
+      response: emptyRate,
+      tokenizerEstimate: emptyRate,
+      bodyObservedMs: null,
+      shortWindowCount: 0,
+      smallSampleCount: 0,
+      avgFirstTokenMs: null,
+      ttftSampleCount: 0,
+      modelMs: null,
+      toolMs: null,
+      candidateCount: 0,
+      failedCount: 0,
+      cancelledCount: 0,
+      missingTimingCount: 0,
+      sessionCount: 0,
+      latestStreamEndedAt: null,
+      latestResponseEndedAt: null,
+      outputScope: "unknown" as const,
+      scopeMixed: false,
+    };
     if (pinned) {
       metricsContext = {
         kind: "bucket",
@@ -288,47 +448,7 @@ export function SpeedDashboard({ active }: { active: boolean }) {
           ) : null}
         </div>
 
-        {/* 口径行：模式切换（speed-mode 根 = 全界面同步的唯一驱动）+ 显著 fallback 提示 */}
-        <div className="flex flex-wrap items-center gap-2">
-          <div data-testid="speed-mode" data-mode={mode} role="group" className="flex gap-1.5">
-            <Button
-              size="sm"
-              variant={mode === "stream" ? "default" : "outline"}
-              aria-pressed={mode === "stream"}
-              data-testid="speed-mode-stream"
-              disabled={!selectedCapabilities.stream}
-              title={
-                selectedCapabilities.stream
-                  ? t("speed.modeHint.stream") // 口径定义 tooltip（实机反馈 #4c）
-                  : selectedCapabilities.streamReason
-                    ? translateSpeedReason(t, selectedCapabilities.streamReason)
-                    : t("speed.codexFallback")
-              }
-              onClick={() => switchMode("stream")}
-            >
-              {t("speed.mode.stream")}
-            </Button>
-            <Button
-              size="sm"
-              variant={mode === "response" ? "default" : "outline"}
-              aria-pressed={mode === "response"}
-              data-testid="speed-mode-response"
-              title={t("speed.modeHint.response")} // 口径定义 tooltip（实机反馈 #4c）
-              onClick={() => switchMode("response")}
-            >
-              {t("speed.mode.response")}
-            </Button>
-          </div>
-          {fallbackActive ? (
-            <p
-              role="status"
-              data-testid="speed-fallback-notice"
-              className="border-border/60 bg-muted/40 text-foreground rounded-md border px-2 py-1 text-xs"
-            >
-              {t("speed.codexFallback")} · {t("speed.tile.approxMark")}
-            </p>
-          ) : null}
-        </div>
+        {modeControls}
         {/* 口径说明已整体迁入图表脚注（二轮实机反馈 ④）：SpeedChart 的 footnote 三行，
             渲染在图例下方——详情区不再有独立 speed-mode-hint 段落；按钮 title 保留 */}
 
@@ -378,7 +498,11 @@ export function SpeedDashboard({ active }: { active: boolean }) {
         {/* 整页唯一一张图（x 轴按服务端快照的完整 [rangeFrom, rangeTo] 铺满）；
             口径说明三行走 footnote（二轮实机反馈 ④：图例下方，替代原 speed-mode-hint 段落） */}
         <SpeedChart
-          buckets={shown.buckets}
+          buckets={
+            shownServerSelected && sameSeriesKey(displayKey, shownServerSelected)
+              ? shown.buckets
+              : []
+          }
           mode={mode}
           from={shown.rangeFrom}
           to={shown.rangeTo}
@@ -393,6 +517,7 @@ export function SpeedDashboard({ active }: { active: boolean }) {
               <p>{t("speed.modeHint.line1")}</p>
               <p>{t("speed.modeHint.line2")}</p>
               <p>{t("speed.modeHint.line3")}</p>
+              <p>{t("speed.modeHint.line4")}</p>
             </>
           }
         />
@@ -454,6 +579,21 @@ export function SpeedDashboard({ active }: { active: boolean }) {
           sortDirection={sortDir}
           onSortKeyChange={switchListSort}
           onToggleSortDirection={toggleSortDir}
+          profiles={profiles}
+          profile={profile}
+          onProfileChange={(selectedProfile) => {
+            const candidates = rawSeries.filter(
+              (item) => item.seriesKey.referenceProfileId === selectedProfile
+            );
+            const sameBase = candidates.find(
+              (item) =>
+                item.seriesKey.tool === displayKey?.tool &&
+                item.seriesKey.model === displayKey?.model &&
+                item.seriesKey.channel === displayKey?.channel
+            );
+            const target = sameBase ?? candidates[0];
+            if (target) selectSeries(target.seriesKey);
+          }}
         />
         <section className="order-1 lg:order-2" aria-label={t("workspace.page.speed")}>
           {detail}

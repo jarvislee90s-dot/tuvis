@@ -18,6 +18,11 @@ use crate::services::tps::v2::model::{SpeedMetrics, SpeedRate};
 /// 混合 → None 且 `scope_mixed = true`（派生面折算 Unknown，不猜单一口径）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct SpeedSums {
+    pub estimate_output_tokens: i64,
+    pub estimate_duration_ns: i64,
+    pub estimate_sample_count: i64,
+    pub short_window_count: i64,
+    pub small_sample_count: i64,
     // ---- stream 口径（成功 + 正输出 + 正生成窗）----
     pub stream_output_tokens: i64,
     pub stream_duration_ms: i64,
@@ -60,7 +65,7 @@ fn derive_rate(output_tokens: i64, duration_ms: i64, sample_count: i64) -> Speed
             Some(1000.0 * output_tokens as f64 / duration_ms as f64)
         },
         output_tokens,
-        duration_ms,
+        duration_ms: duration_ms as f64,
         sample_count,
     }
 }
@@ -78,6 +83,19 @@ pub fn derive_metrics(sums: &SpeedSums) -> SpeedMetrics {
             sums.response_duration_ms,
             sums.response_sample_count,
         ),
+        tokenizer_estimate: SpeedRate {
+            value: (sums.estimate_sample_count > 0).then(|| {
+                1_000_000_000.0 * sums.estimate_output_tokens as f64
+                    / sums.estimate_duration_ns as f64
+            }),
+            output_tokens: sums.estimate_output_tokens,
+            duration_ms: sums.estimate_duration_ns as f64 / 1_000_000.0,
+            sample_count: sums.estimate_sample_count,
+        },
+        body_observed_ms: (sums.estimate_sample_count > 0)
+            .then(|| sums.estimate_duration_ns as f64 / 1_000_000.0),
+        short_window_count: sums.short_window_count,
+        small_sample_count: sums.small_sample_count,
         avg_first_token_ms: if sums.ttft_sample_count == 0 {
             None
         } else {

@@ -27,6 +27,7 @@ import { Button } from "@/components/ui/button";
 import { useAppTranslation } from "@/hooks/use-app-translation";
 import { TpsInstallFlow, TPS_INSTALLABLE } from "@/components/usage/tps/TpsInstallFlow";
 import { TPS_KEY } from "@/lib/query/queries/tps";
+import { setTokenizerEstimateEnabled } from "@/lib/api/speed";
 import { translateSpeedReason } from "@/lib/speed/view";
 import { EM_DASH, usageAgentLabel } from "@/lib/usage/format";
 import type { SpeedSourceView } from "@/types/speed";
@@ -68,6 +69,7 @@ function SourceRow({
   receiptTool,
   expanded,
   onToggleDetails,
+  onEstimateChanged,
 }: {
   source: SpeedSourceView;
   busy: boolean;
@@ -76,12 +78,32 @@ function SourceRow({
   receiptTool: string | null;
   expanded: boolean;
   onToggleDetails: () => void;
+  onEstimateChanged: () => void;
 }) {
   const { t } = useAppTranslation();
+  const [estimateBusy, setEstimateBusy] = useState(false);
+  const [estimateError, setEstimateError] = useState(false);
   const { capabilities } = source;
+  const estimate = source.estimateState;
+  const toggleEstimate = async () => {
+    setEstimateBusy(true);
+    setEstimateError(false);
+    try {
+      await setTokenizerEstimateEnabled(!estimate.enabled);
+      onEstimateChanged();
+    } catch {
+      setEstimateError(true);
+    } finally {
+      setEstimateBusy(false);
+    }
+  };
   const installable = TPS_INSTALLABLE.has(source.source);
   // Codex（Ready + 仅响应）：整体状态不降级，缺口只以「仅响应」+ 流短原因呈现（Spec §8.6）
-  const responseOnly = source.status === "ready" && !capabilities.stream && capabilities.response;
+  const responseOnly =
+    source.status === "ready" &&
+    !capabilities.stream &&
+    capabilities.response &&
+    !capabilities.tokenizerEstimate;
   // 卸载入口跟随安装事实（Spec §8.6「已安装事实决定卸载入口」）：无安装机制的来源
   // （后端恒 installed=true）不给无意义的卸载；刚应用成功的回执作为安装事实回流前的过渡。
   const canUninstall = (source.installed && installable) || receiptTool === source.source;
@@ -119,6 +141,14 @@ function SourceRow({
               : null
           }
         />
+        {source.source === "codex" ? (
+          <CapChip
+            testId="speed-cap-estimate-codex"
+            label={t("speed.sources.estimate")}
+            ok={capabilities.tokenizerEstimate}
+            reason={null}
+          />
+        ) : null}
         {/* 状态成因的短原因（机器 token 已翻译；raw detail 只进 details 区） */}
         {reasonText ? <span className="text-muted-foreground">{reasonText}</span> : null}
         <span className="flex-1" />
@@ -154,6 +184,41 @@ function SourceRow({
           {t("speed.sources.actionDetails")}
         </Button>
       </div>
+      {source.source === "codex" && estimate ? (
+        <div
+          className="mt-1 flex flex-wrap items-center gap-2 text-xs"
+          data-testid="speed-estimate-state"
+        >
+          <span>
+            {t("speed.sources.estimate")}:{" "}
+            {t(
+              !estimate.supported
+                ? "speed.sources.estimateUnsupported"
+                : !estimate.enabled
+                  ? "speed.sources.estimateStopped"
+                  : estimate.observing
+                    ? "speed.sources.estimateObserving"
+                    : "speed.sources.estimateWaiting"
+            )}
+          </span>
+          {estimate.supported ? (
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={estimateBusy}
+              data-testid="speed-estimate-toggle"
+              onClick={() => void toggleEstimate()}
+            >
+              {t(estimate.enabled ? "speed.sources.estimateStop" : "speed.sources.estimateStart")}
+            </Button>
+          ) : null}
+          {estimateError ? (
+            <span role="alert" className="text-destructive">
+              {t("speed.sources.estimateError")}
+            </span>
+          ) : null}
+        </div>
+      ) : null}
       {/* 最近记录：中性提示（无记录 = —），数据空态不是采集故障 */}
       <div
         className="text-muted-foreground mt-1 text-[11px]"
@@ -185,6 +250,26 @@ function SourceRow({
               {t("speed.sources.capResponse")}：
               {translateSpeedReason(t, capabilities.responseReason)}
             </p>
+          ) : null}
+          {source.source === "codex" && estimate ? (
+            <div className="break-all" data-testid="speed-estimate-profile">
+              <p>
+                {t("speed.sources.referenceEncoding")}: {estimate.encoding ?? EM_DASH}
+              </p>
+              <p>
+                {t("speed.sources.referenceRule")}: {estimate.ruleVersion ?? EM_DASH}
+              </p>
+              <p>
+                {t("speed.sources.referenceProfile")}: {estimate.referenceProfileId ?? EM_DASH}
+              </p>
+              <p>
+                {t("speed.sources.referenceResource")}: {estimate.resourceSha256 ?? EM_DASH}
+              </p>
+              <p>
+                {t("speed.sources.modelSource")}: {t("speed.sources.modelSourceValue")}
+              </p>
+              <p>{t("speed.sources.boundary")}</p>
+            </div>
           ) : null}
           {source.detail ? (
             // 既有诊断原文（含 `parser-errors=` 等机器前缀）：只在此处原样透出，不翻译不加工
@@ -291,6 +376,7 @@ export function SpeedSourcesPanel({
                     uninstall={uninstall}
                     receiptTool={receiptTool}
                     expanded={detailsFor === s.source}
+                    onEstimateChanged={refreshFacts}
                     onToggleDetails={() =>
                       setDetailsFor((cur) => (cur === s.source ? null : s.source))
                     }

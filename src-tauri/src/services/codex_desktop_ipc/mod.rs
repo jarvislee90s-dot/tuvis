@@ -22,6 +22,7 @@ pub mod history_view;
 pub mod interaction_summary;
 pub mod late;
 pub mod mirror;
+pub mod observation;
 pub mod owners;
 pub mod pending;
 pub mod probe;
