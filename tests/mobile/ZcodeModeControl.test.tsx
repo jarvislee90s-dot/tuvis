@@ -108,8 +108,11 @@ describe("ZcodeModeControl", () => {
     const posts = install();
     render(<ZcodeControlPanel sessionId={SID} />);
     await waitFor(() => expect(screen.getByTestId("zcode-mode-select")).toBeVisible());
-    const modeSelect = screen.getByTestId("zcode-mode-select");
+    const modeSelect = screen.getByTestId("zcode-mode-select") as HTMLSelectElement;
     const apply = screen.getByTestId("zcode-mode-apply") as HTMLButtonElement;
+    // 初始投影到达后 pendingMode 会被 effect 同步到 build；必须先等这一次同步完成，
+    // 否则慢机上随后 fireEvent.change(yolo) 会被 late effect 覆盖回 build，apply 仍禁用。
+    await waitFor(() => expect(modeSelect.value).toBe("build"));
     fireEvent.change(modeSelect, { target: { value: "yolo" } });
     await waitFor(() => expect(apply).not.toBeDisabled());
     fireEvent.click(apply);
