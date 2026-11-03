@@ -473,10 +473,14 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
    * 打断位：运行中 + 手上无可发内容 + 附件闸未闭 → 按钮代表「打断当前回合」。
    * 有内容（含就绪附件）时按钮留在发送位：有内容发送绝不先打断。
    */
-  // 文案/语义位必须与纯函数最终动作一致：只有真的可 stop 才把主按钮显示成「打断」；
-  // 能力关闭/守卫缺失/断线时仍显示「发送」（禁用态），不能给用户一个不可执行的
-  // “打断”承诺。
-  const stopSlot = primaryAction === "stop";
+  // 运行中且无内容 = 用户以为要打断的位；但最终文案只在真的可执行 stop 时显示
+  // 「打断」，能力关闭/守卫缺失时仍显示「发送」（禁用态），不能给不可执行的承诺。
+  const stopIntent = running && !hasContent && !attachmentBlocked;
+  const stopSlot =
+    stopIntent &&
+    session?.capabilities.interrupt.enabled === true &&
+    gateReason === null &&
+    !staleGeneration;
   /**
    * 主按钮旁的原因（冻结码）：删除独立打断行后，原因必须仍在按钮旁可见。
    * 优先级：写面硬门 > 旧代际 > 打断位（能力关闭 / 目标歧义）> 发送位（能力关闭）。
@@ -488,7 +492,7 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
       : (gateReason ??
         (staleGeneration
           ? "stale_generation"
-          : stopSlot
+          : stopIntent
             ? session !== null && !session.capabilities.interrupt.enabled
               ? (session.capabilities.interrupt.reasonCode ?? "unknown")
               : stopTarget === null
