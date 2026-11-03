@@ -46,7 +46,8 @@ use super::relay::{DeviceRoute, RelayClient, RelayEvent, RelayLag};
 use super::types::{
     codes, ActionContext, ActionReceipt, ActionState, BoundTarget, CapabilitySource,
     CapabilityView, ConnectionState, ConnectionView, ControlAction, ControlEvent, ControlEventKind,
-    HostBuildProbe, HostEvidence, QueueView, SessionView, TargetKey, ZResult, ZcodeError,
+    HostBuildProbe, HostEvidence, PlanApprovalDecision, QueueView, SessionView, TargetKey, ZResult,
+    ZcodeError,
 };
 use crate::database::dao::zcode_capability::{
     validate_evidence_token, CapabilityLedger, DbCapabilityLedger,
@@ -771,7 +772,10 @@ pub trait HubBackend: Send + Sync {
                 ControlAction::Send { .. } => Ok(vec!["send"]),
                 ControlAction::Stop { .. } => Ok(vec!["interrupt"]),
                 ControlAction::Permission { .. } => Ok(vec!["approval_reply"]),
-                ControlAction::PlanApproval { .. } => Ok(vec!["single_select"]),
+                ControlAction::PlanApproval { decision, .. } => match decision {
+                    PlanApprovalDecision::Approve => Ok(vec!["single_select"]),
+                    PlanApprovalDecision::Feedback => Ok(vec!["single_select", "free_text"]),
+                },
                 ControlAction::Selection { .. } => Ok(vec!["model", "thought_level"]),
                 ControlAction::Mode { .. } => Ok(vec!["mode"]),
                 ControlAction::QueueDelete { .. } | ControlAction::QueueReorder { .. } => {
@@ -4245,8 +4249,11 @@ impl ZcodeHub {
                 Some(interaction_id),
             )),
             ControlAction::Stop { .. } => required.push(("interrupt", &policy.interrupt, None)),
-            ControlAction::PlanApproval { .. } => {
+            ControlAction::PlanApproval { decision, .. } => {
                 required.push(("single_select", &policy.single_select, None));
+                if *decision == PlanApprovalDecision::Feedback {
+                    required.push(("free_text", &policy.free_text, None));
+                }
             }
             ControlAction::Selection { .. } => {
                 required.push(("model", &policy.model, None));

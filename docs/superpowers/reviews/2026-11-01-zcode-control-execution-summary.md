@@ -224,20 +224,31 @@ Q5/Q6 代码已提交；Q7、C1–C2、M1–M2、K1–K2 与 V0 的收口见下�
 schema=plan_approval` 时置位；`answerable` 仍 false，普通 `Answer` 仍拒绝。
 - C2 已按官方投影实现原生批准：官方唯一 option 原值为 `approve`；新增独立
   `ControlAction::PlanApproval`、`build_plan_approval_answer`（唯一问题 + 唯一 approve
-  才返回 `{optionId:"approve"}`）、pending 授权/写前预留/snooze/恰一帧 resolve；
+  才返回 `{action:"accept"}`）、pending 授权/写前预留/snooze/恰一帧 resolve；
   Hub 使用 `single_select` 能力闸，不借 permission 的 `approval_reply`。
 - 移动端计划卡提供“批准并开始实施”按钮；点击前零 POST，点击后恰一次；能力关闭/卡形状不精确
   时只读并说明原因；普通不可答子型保持通用只读。
 - 回归：pending 4、command 2、计划卡/面板 93、zcode_control lib 870、全量 Rust 4375、
   移动端 2549 通过。提交 `85c04164 feat(zcode): resolve plan approval natively`。
-- **真实宿主批准验收 NOT RUN**：需要重建 Tuvis 后，在真实 `plan_approval` 卡点击一次并观察
-  宿主撤卡/退出 plan mode；未过此前不得宣称 P0 完成，也不得用 fake 冒充真实验收。
-- 提交 `d26b1083` 是 C1；C2 代码待本批提交。
+- **真实宿主验收：两条路径已验证，远程复测待连接**：
+  - 14:42/14:43 的 `{optionId:"approve"}` 被宿主判 `Permission denied`；
+  - 15:23 的 `{action:"accept"}` 缺 content，同样被当成无反馈拒绝并终止回合；
+  - 桌面官方批准（16:37）`ExitPlanMode status=completed`、`planEnabled=0`；
+  - 桌面官方 Custom answer（16:49）`ExitPlanMode status=error`，error 文本即反馈，
+    `modelContent="The plan was not approved by the user."`，agent 继续修改计划。
+- 实际 Tuvis pending 卡抓取：`kind=userInput`、`toolName=ExitPlanMode`、
+  `schemaInteraction=plan_approval`、唯一 option `approve`、`freeTextAllowed=true`、
+  `answerable=false`、`planApproval=true`；题目是 CLI 的通用
+  `Tool ExitPlanMode requires user interaction`，不是官方润色标题。
+- 代码已改为 `action=accept` + `content.answers/answer_0/answer`；新增反馈
+  `decision=feedback` 与文本框；approve 以 plan mode 退出确认，feedback 保持 accepted。
+- 手机远程复测尚未跑：dev 重启后 Tuvis `state=needs_auth`，需重新连接后点新卡。
+- 提交 `d26b1083` 是 C1；C2 本批代码待提交。
 
 ### 最终门禁
 
-- 移动端：207 files，**2549 passed / 5 skipped**；`pnpm check`、`pnpm build:mobile` 通过。
-- Rust：普通 **4375 passed / 0 failed**；evidence integration **4398 passed / 0 failed**；
+- 移动端：207 files，**2550 passed / 5 skipped**；`pnpm check`、`pnpm build:mobile` 通过。
+- Rust：普通 **4378 passed / 0 failed**；evidence integration **4401 passed / 0 failed**；
   evidence lib **3864 passed / 38 ignored**；两套 clippy、`cargo fmt --check`、`cargo check`、
   `git diff --check` 通过。
 - 真实 ZCode 宿主、真实凭据、真实发送/停止/审批/权限、真实 provider 切换、真实 Keychain：NOT RUN。

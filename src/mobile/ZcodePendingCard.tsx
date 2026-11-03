@@ -216,6 +216,8 @@ function ZcodePendingCard({
   const [confirming, setConfirming] = useState(false);
   /** 命令正文（`detail`）展开态：纯展示，不参与任何提交。 */
   const [detailOpen, setDetailOpen] = useState(false);
+  /** 计划批准的「继续修改」意见；只存在本卡内存，换卡即清空。 */
+  const [planFeedback, setPlanFeedback] = useState("");
   const snoozedRef = useRef(false);
   /** 同帧双击闸：一次用户动作只允许一个在途 POST（actionId 不重复生成）。 */
   const inFlightRef = useRef(false);
@@ -263,6 +265,7 @@ function ZcodePendingCard({
     setStep(0);
     setConfirming(false);
     setDetailOpen(false);
+    setPlanFeedback("");
   }, [identity]);
 
   /**
@@ -356,6 +359,24 @@ function ZcodePendingCard({
   const canApprovePlan =
     planApprovalReadonly &&
     planApprovalBlockedReason === null &&
+    settledState === null &&
+    !submitting;
+  /** 反馈与批准共享同一 interaction：只改 answer content，不另开动作。 */
+  const planFeedbackBlockedReason = planApprovalReadonly
+    ? gateReason !== null
+      ? gateReason
+      : !capabilities.singleSelect.enabled
+        ? (capabilities.singleSelect.reasonCode ?? "needs_evidence")
+        : !capabilities.freeText.enabled
+          ? (capabilities.freeText.reasonCode ?? "needs_evidence")
+          : !planApprovalShapeOk
+            ? "invalid_action"
+            : null
+    : null;
+  const canFeedbackPlan =
+    planApprovalReadonly &&
+    planFeedbackBlockedReason === null &&
+    planFeedback.trim().length > 0 &&
     settledState === null &&
     !submitting;
   // 按码如实呈现：每个冻结原因码都有独立 zh/en 文案（表外码才用中性兜底）；
@@ -497,6 +518,51 @@ function ZcodePendingCard({
             >
               {i18n.t("mobile.zcodeControl.pendingPlanApprovalApprove")}
             </button>
+          )}
+          {planApprovalReadonly && pending.questions[0]?.freeTextAllowed === true && (
+            <div className="mt-3">
+              <textarea
+                data-testid="zcode-plan-approval-feedback"
+                value={planFeedback}
+                maxLength={4096}
+                rows={2}
+                placeholder={i18n.t("mobile.zcodeControl.pendingPlanApprovalFeedbackPlaceholder")}
+                onChange={(event) => setPlanFeedback(event.target.value)}
+                disabled={submitting || settledState !== null}
+                className="w-full rounded-xl border border-[var(--cb)] bg-transparent px-3 py-2 text-sm text-[var(--tx)] disabled:opacity-40"
+              />
+              <button
+                type="button"
+                data-testid="zcode-plan-approval-feedback-submit"
+                disabled={!canFeedbackPlan}
+                onClick={() => {
+                  if (planFeedbackBlockedReason !== null || submitting || settledRef.current)
+                    return;
+                  const text = planFeedback.trim();
+                  if (!text) return;
+                  submitOnce({
+                    kind: "planApproval",
+                    sessionId,
+                    generation,
+                    interactionId: pending.interactionId,
+                    decision: "feedback",
+                    feedback: text,
+                  });
+                }}
+                className="mt-2 rounded-full border border-[var(--cb)] px-4 py-1 text-sm text-[var(--tx)] disabled:opacity-40"
+              >
+                {i18n.t("mobile.zcodeControl.pendingPlanApprovalFeedbackSubmit")}
+              </button>
+              {planFeedbackBlockedReason !== null && (
+                <p
+                  data-testid="zcode-pending-plan-feedback-reason"
+                  data-reason-code={planFeedbackBlockedReason}
+                  className="mt-1 text-xs text-[var(--mut)]"
+                >
+                  {zcodeReasonText(planFeedbackBlockedReason)}
+                </p>
+              )}
+            </div>
           )}
           {settledState !== null && (
             <p
@@ -650,7 +716,7 @@ function ZcodePendingCard({
         )}
         {pending.summary !== null && <p className="text-sm text-[var(--tx)]">{pending.summary}</p>}
         {/* 命令正文（官方 payload.detail）：默认折叠，展开只读，不参与提交。 */}
-        {isPermission && pending.detail !== null && (
+        {(isPermission || planApprovalReadonly) && pending.detail !== null && (
           <div className="mt-1">
             <button
               type="button"

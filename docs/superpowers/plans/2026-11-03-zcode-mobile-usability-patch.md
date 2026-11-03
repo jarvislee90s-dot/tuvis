@@ -13,7 +13,7 @@
 
 1. **队列**：重启恢复后存在 `unconfirmed` 屏障。核对前“继续队列/插队”不得静默成功；核对后允许一键继续，但绝不重发旧 unknown 项。
 2. **供应商**：显式 `available=false` 继续禁用；缺字段视为“可用性未知”，必须用户二次确认后才允许一次切换尝试，失败如实回显。
-3. **计划批准**：`plan_approval` 不是普通问答；C2 已按官方投影的精确 `approve` 选项实现原生批准（独立 `planApproval` 动作），真实宿主批准验收仍待完成。
+3. **计划批准**：`plan_approval` 不是普通问答；C2 已实现原生 approve（`action=accept` + answers content）和“继续修改”文本反馈；真实桌面宿主两条路径已验，手机端远程复测待连接恢复。
 4. 不使用真实凭据、不连接真实宿主、不操作真实权限/发送/停止；测试只使用假宿主、回环、临时数据。
 
 ## 1. 根因摘要
@@ -46,7 +46,7 @@
 | A    | 队列恢复 UX 与屏障错误       | DONE         | A             | 通过（主会话复核） |
 | B    | 供应商三态可用性与确认式切换 | PENDING      | B             | 待做               |
 | C1   | 计划批准只读解释与证据清单   | PENDING      | C             | 待做               |
-| C2   | 原生计划批准                 | DONE（代码） | 主会话        | 真实批准验收待跑   |
+| C2   | 原生计划批准/反馈            | DONE（代码） | 主会话        | 手机远程复测待跑   |
 | D    | 文档、变更账本、全量门禁     | PENDING      | 主会话/子代理 | 待做               |
 
 ## 3. Task A：队列恢复 UX 与屏障错误
@@ -369,7 +369,7 @@ git diff --check
 - Task C2：`85c04164 feat(zcode): resolve plan approval natively` 已实现（独立 `planApproval` 动作、精确 `approve` 原值、单选项能力闸）；真实宿主批准验收仍待跑，不得仅凭 fake 宣称 P0 完成。
 - P1 跨 workspace switch：未实现；协议 transport/role 仍需 Phase 0 真实取证，不得以手动切窗口冒充修复。
 - Task D：中英手册、CHANGELOG 已更新；执行报告已追加。
-- 追补：会话级核对修复（160 local-queue tests）见 Task A 备注；C2 P0 原生批准代码见 §11；最终门禁：`pnpm test` 2549 passed / 5 skipped；`pnpm check`、`pnpm build:mobile` 通过；
+- 追补：会话级核对修复（160 local-queue tests）见 Task A 备注；C2 P0 原生批准代码见 §11；最终门禁：`pnpm test` 2550 passed / 5 skipped；`pnpm check`、`pnpm build:mobile` 通过；
   Rust 普通 4375 passed；evidence integration 4398 passed；evidence lib 3864 passed / 38 ignored；
   两套 clippy、`cargo fmt --check`、`cargo check`、`git diff --check` 通过。
 - 真实 ZCode 宿主、真实 provider 切换、真实计划批准、真实发送/停止/审批/权限：**NOT RUN**。
@@ -384,19 +384,33 @@ git diff --check
 实现：
 
 - `PendingView.plan_approval` 保持 C1 标识；`answerable` 仍 false。
-- 新增 `pending::build_plan_approval_answer`：只接受唯一 question + 唯一 `approve`
-  option，返回 `{optionId:"approve"}`；多题/多选项/非 approve 一律拒绝。
+- `pending::build_plan_approval_answer`：只接受唯一 question + 唯一 `approve`
+  option；返回官方 elicitation content：
+  `{action:"accept", content:{answers:{<题干>:"approve"}, answer_0:"approve", answer:"approve"}}`。
+  2026-11-03 14:42/14:43 曾误用 `{optionId:"approve"}`，宿主返回
+  `Permission denied for ExitPlanMode`；15:23 又因 `{action:"accept"}` 缺 content 被当成
+  无反馈拒绝并终止回合，均已由桌面真机证据纠正。
+- 反馈路径：同一动作 `decision:"feedback"` + `feedback` 文本，content 三处 answer 写文本；
+  宿主保持 plan mode，返回 `Permission denied` 且 error 文本即反馈，agent 继续修改。
+- 真实桌面证据（2026-11-03）：批准后 `ExitPlanMode status=completed`、`planEnabled=0`；
+  反馈后 `ExitPlanMode status=error`、error 文本为反馈、`modelContent="The plan was not
+approved by the user."`，后续 agent 继续。手机远程复测尚未跑：dev 重启后 Tuvis
+  `state=needs_auth`，需用户重新连接。
 - 新增 `ControlAction::PlanApproval`（`kind=planApproval`, `decision=approve`）；
   action 指纹含 interactionId/decision；HTTP 白名单；Hub 能力闸用
   `single_select`（不借 permission 的 `approval_reply`）。
 - `CommandSender::execute_plan_approval` 复用 pending 授权、写前预留、autoResolution
-  snooze、恰一帧 resolve、宿主撤卡后 confirmed、unknown 不重发。
+  snooze、恰一帧 resolve；approve 只有观察到计划模式退出才 confirmed，反馈保持
+  accepted；两者都不重发。
 - 移动端计划卡显示专用“批准并开始实施”按钮；点击前零 POST，点击后恰一次
   `planApproval`；`single_select` 关闭或卡形状不精确时只读并显示原因；普通
   `answerable=false` 子型仍走通用只读。
 - 测试：pending 纯映射 4、command 2、移动端 26（含计划卡批准/能力关闭）、
   zcode_control lib 870、全量 Rust 4375、移动端 2549 通过。
-- **真实宿主批准验收仍 NOT RUN**：需要重建 Tuvis，在真实 `plan_approval` 卡上点一次
-  “批准并开始实施”，确认宿主撤卡且退出 plan mode；失败不得声称 P0 完成。
+- **真实宿主批准验收：第一次已实测失败**：2026-11-03 14:42:34 / 14:43:59 两次
+  `plan_approval` 动作被旧实现用 `{optionId:"approve"}` 发出，ZCode 的
+  `ExitPlanMode` 实际落成 `Permission denied for ExitPlanMode`（turn 终止），账本却因
+  “撤卡”误记 confirmed。已改为 `{action:"accept"}`，并新增计划模式退出校验；
+  仍需重建 Tuvis 后用新的真实计划卡复测。未过此前不得声称 P0 完成。
 - 当前 Travel 的 bridge 在 10:19 后已能被宿主 attach（日志显示 Travel bridge active），
   但运行中的 Tuvis 仍是旧构建；重建后可用同一张 pending 计划验收。

@@ -404,17 +404,20 @@ pub struct InputRoutingView {
     pub reason_code: Option<String>,
 }
 
-/// 计划批准的显式决定（C2 P0 只开放 approve；拒绝/反馈待真实帧）。
+/// 计划批准的显式决定：批准，或提交修改意见（宿主会保持 plan mode 并把文本
+/// 作为 `plan_approval_feedback` 送回 agent）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum PlanApprovalDecision {
     Approve,
+    Feedback,
 }
 
 impl PlanApprovalDecision {
     pub fn as_wire(self) -> &'static str {
         match self {
             Self::Approve => "approve",
+            Self::Feedback => "feedback",
         }
     }
 }
@@ -470,14 +473,17 @@ pub enum ControlAction {
         interaction_id: String,
         option_id: String,
     },
-    /// 计划批准（C2 P0）：对既有 `ExitPlanMode/plan_approval` pending 的
-    /// 唯一 approve 选项做一次 resolve；不是普通问答应答。
+    /// 计划批准/反馈（C2 P0）：对既有 `ExitPlanMode/plan_approval` pending 做一次
+    /// resolve；批准与“继续修改”共用同一 interaction，绝不并发发两帧。
     #[serde(rename_all = "camelCase")]
     PlanApproval {
         session_id: String,
         generation: u64,
         interaction_id: String,
         decision: PlanApprovalDecision,
+        /// 仅在 `decision=feedback` 时必填；是用户要继续修改计划的意见正文。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        feedback: Option<String>,
     },
     /// 打断（T4）。
     #[serde(rename_all = "camelCase")]

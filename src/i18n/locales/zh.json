@@ -2413,7 +2413,9 @@
       "heldQueueChanged": "旧队列在确认期间发生变化，已刷新。请重新选择如何处理后再发送。",
       "heldQueueKeep": "保留排队消息并发送",
       "heldQueueClear": "清空排队消息并发送",
-      "heldQueueCancel": "取消"
+      "heldQueueCancel": "取消",
+      "pendingPlanApprovalFeedbackPlaceholder": "继续修改计划，填写你的意见…",
+      "pendingPlanApprovalFeedbackSubmit": "提交修改意见"
     },
     "question": {
       "cancelInterrupt": "中断回合（破坏性）",

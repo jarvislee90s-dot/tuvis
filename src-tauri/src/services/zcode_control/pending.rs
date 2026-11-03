@@ -26,8 +26,8 @@ use serde_json::{Map, Value};
 
 use super::types::{
     codes, project_pending_detail_bounded, ActiveWork, AnswerEntry, BoundTarget, ControlView,
-    PendingKind, PendingView, PermissionOptionView, QuestionOption, QuestionView, ZResult,
-    ZcodeError,
+    PendingKind, PendingView, PermissionOptionView, PlanApprovalDecision, QuestionOption,
+    QuestionView, ZResult, ZcodeError,
 };
 
 /// 本册最多保留的 pending 卡数（防巨库/恶意帧撑爆内存；超出丢弃并计数）。
@@ -313,14 +313,25 @@ fn plan_approval_parts(
         && schema_interaction == Some(PLAN_APPROVAL_INTERACTION)
 }
 
+/// 计划批准/反馈意见的长度上限（字符数；正文只走 wire，不落账本/日志）。
+pub const MAX_PLAN_FEEDBACK_CHARS: usize = 4096;
+
 /// 按宿主原值构造计划批准的 `resolveInteraction.answer`（C2）。
 ///
 /// 官方 `ExitPlanMode` 投影为唯一问题 + 唯一 option，option value 为
 /// `approve`（`createExitPlanModeApprovalQuestions`）。这里只接受这一种**精确**
 /// 形状：计划批准不是普通问答，不接受多题/多选项/其他 value，也不从 label 猜值。
-/// answer 形状取宿主 option 原值：`{optionId: "approve"}`；真实宿主若要求
-/// `action/content` 变体，必须先取得真实帧再改本函数，绝不在运行时猜。
-pub fn build_plan_approval_answer(pending: &PendingView) -> ZResult<Value> {
+///
+/// 真实宿主（2026-11-03）已确认：
+/// - 批准：`action=accept` + `content.answers[question]="approve"`、
+///   `answer_0="approve"`、`answer="approve"`；缺 content 会被当成无反馈拒绝。
+/// - 反馈：同一形状，文本写入三个 answer 字段；宿主保持 plan mode，并把文本作为
+///   `plan_approval_feedback` 送回 agent。
+pub fn build_plan_approval_answer(
+    pending: &PendingView,
+    decision: PlanApprovalDecision,
+    feedback: Option<&str>,
+) -> ZResult<Value> {
     if !is_plan_approval(pending) || pending.answerable {
         return Err(invalid_answer());
     }
@@ -328,14 +339,37 @@ pub fn build_plan_approval_answer(pending: &PendingView) -> ZResult<Value> {
         return Err(invalid_answer());
     }
     let question = &pending.questions[0];
-    if question.options.len() != 1 {
-        return Err(invalid_answer());
-    }
-    let option = &question.options[0];
-    if option.value != "approve" {
+    if question.options.len() != 1 || question.options[0].value != "approve" {
         return Err(forbidden_option());
     }
-    Ok(serde_json::json!({ "optionId": option.value }))
+    let value = match decision {
+        PlanApprovalDecision::Approve => {
+            if feedback.is_some_and(|text| !text.trim().is_empty()) {
+                return Err(invalid_answer());
+            }
+            "approve".to_owned()
+        }
+        PlanApprovalDecision::Feedback => {
+            if !question.free_text_allowed {
+                return Err(forbidden_option());
+            }
+            let text = feedback.unwrap_or_default().trim();
+            if text.is_empty() || text.chars().count() > MAX_PLAN_FEEDBACK_CHARS {
+                return Err(invalid_answer());
+            }
+            text.to_owned()
+        }
+    };
+    let mut answers = Map::new();
+    answers.insert(question.question_text.clone(), Value::String(value.clone()));
+    Ok(serde_json::json!({
+        "action": "accept",
+        "content": {
+            "answers": answers,
+            "answer_0": value,
+            "answer": value,
+        }
+    }))
 }
 
 /// 按宿主原值构造 `resolveInteraction.answer`（T4.1 Slice A；纯映射，不落盘）。
@@ -609,7 +643,24 @@ fn parse_pending(card: &Value, skipped_options: &mut u64) -> Option<PendingView>
     // R0 复审遗留 I4：Bash 审批的命令正文只在 payload.detail，手机端此前看不到。
     // 只做只读投影（截断有界），不写日志/账本，也不参与任何应答载荷。
     // 截断真值与文本同一次算出：前端不按长度猜「是不是全貌」。
-    let detail = project_pending_detail_bounded(payload.get("detail"));
+    // 计划批准的实际文本可能只在工具 input/schema.plan 中（桥投影没有单独字段）；
+    // 复用只读 detail 通道展示，仍按同一上限截断，绝不进入任何应答载荷。
+    let detail_value = payload
+        .get("detail")
+        .or_else(|| {
+            payload
+                .get("input")
+                .and_then(Value::as_object)
+                .and_then(|input| input.get("plan"))
+        })
+        .or_else(|| {
+            payload
+                .get("schema")
+                .and_then(Value::as_object)
+                .and_then(|schema| schema.get("plan"))
+        })
+        .or_else(|| payload.get("plan"));
+    let detail = project_pending_detail_bounded(detail_value);
 
     Some(PendingView {
         interaction_id: interaction_id.to_owned(),
@@ -1355,9 +1406,10 @@ mod tests {
             "payload": {
                 "kind": "userInput",
                 "prompt": "synthetic: plan",
-                "freeText": false,
+                "freeText": true,
                 "toolName": "ExitPlanMode",
                 "schema": {"interaction": "plan_approval"},
+                "input": {"plan": "Synthetic plan body"},
                 "questions": [{
                     "question": "Approve this plan?",
                     "header": "Plan",
@@ -1957,8 +2009,48 @@ mod tests {
         // C2：官方计划卡的唯一选项原值是 approve；批准必须原样回传该值，
         // 不能把 label 当 value，也不能复用普通问答 content 形状。
         let book = book_with(plan_approval_card());
-        let answer = build_plan_approval_answer(&book.pendings()[0]).expect("approve 形状");
-        assert_eq!(answer, json!({"optionId": "approve"}));
+        let answer =
+            build_plan_approval_answer(&book.pendings()[0], PlanApprovalDecision::Approve, None)
+                .expect("approve 形状");
+        assert_eq!(
+            answer,
+            json!({
+                "action": "accept",
+                "content": {
+                    "answers": {"Approve this plan?": "approve"},
+                    "answer_0": "approve",
+                    "answer": "approve"
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn plan_approval_feedback_uses_same_question_content_without_option_id() {
+        let book = book_with(plan_approval_card());
+        let answer = build_plan_approval_answer(
+            &book.pendings()[0],
+            PlanApprovalDecision::Feedback,
+            Some("把 hello.py 放到 scripts/ 并加日期"),
+        )
+        .expect("反馈形状");
+        assert_eq!(
+            answer,
+            json!({
+                "action": "accept",
+                "content": {
+                    "answers": {"Approve this plan?": "把 hello.py 放到 scripts/ 并加日期"},
+                    "answer_0": "把 hello.py 放到 scripts/ 并加日期",
+                    "answer": "把 hello.py 放到 scripts/ 并加日期"
+                }
+            })
+        );
+        assert!(build_plan_approval_answer(
+            &book.pendings()[0],
+            PlanApprovalDecision::Feedback,
+            Some("  "),
+        )
+        .is_err());
     }
 
     #[test]
@@ -1981,8 +2073,12 @@ mod tests {
             ("多问题", two_questions),
         ] {
             let book = book_with(card);
-            let error =
-                build_plan_approval_answer(&book.pendings()[0]).expect_err("歧义计划卡必须拒绝");
+            let error = build_plan_approval_answer(
+                &book.pendings()[0],
+                PlanApprovalDecision::Approve,
+                None,
+            )
+            .expect_err("歧义计划卡必须拒绝");
             assert!(
                 error.is(codes::INVALID_ANSWER) || error.is(codes::FORBIDDEN_OPTION),
                 "{hint} 必须落到明确错误码"

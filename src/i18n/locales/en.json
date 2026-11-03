@@ -2413,7 +2413,9 @@
       "heldQueueChanged": "The queue changed while you were deciding and has been refreshed. Choose again before sending.",
       "heldQueueKeep": "Keep queued messages and send",
       "heldQueueClear": "Clear queued messages and send",
-      "heldQueueCancel": "Cancel"
+      "heldQueueCancel": "Cancel",
+      "pendingPlanApprovalFeedbackPlaceholder": "Continue editing the plan; describe your changes…",
+      "pendingPlanApprovalFeedbackSubmit": "Send feedback"
     },
     "question": {
       "cancelInterrupt": "Interrupt turn (destructive)",

@@ -920,6 +920,7 @@ describe("ZCode 待处理卡：不可答子型只读 / 截断正文不盲批", (
           header: "Plan",
           questionText: "要批准这份计划吗？",
           options: [{ value: "approve", label: "批准", description: null, preview: null }],
+          freeTextAllowed: true,
         }),
       ],
     });
@@ -963,6 +964,7 @@ describe("ZCode 待处理卡：不可答子型只读 / 截断正文不盲批", (
           header: "Plan",
           questionText: "要批准这份计划吗？",
           options: [{ value: "approve", label: "批准", description: null, preview: null }],
+          freeTextAllowed: true,
         }),
       ],
     });
@@ -1002,6 +1004,31 @@ describe("ZCode 待处理卡：不可答子型只读 / 截断正文不盲批", (
       decision: "approve",
     });
     expect(screen.getByTestId("zcode-pending-open-official")).toBeVisible();
+  });
+
+  it("plan_approval_card_sends_feedback_once_without_approving", async () => {
+    const { fn, calls } = makeSubmit();
+    render(<ZcodePendingCard {...baseProps({ pending: planApprovalCard(), submit: fn })} />);
+
+    const input = screen.getByTestId("zcode-plan-approval-feedback") as HTMLTextAreaElement;
+    const submit = screen.getByTestId("zcode-plan-approval-feedback-submit");
+    expect(submit).toBeDisabled();
+    fireEvent.change(input, { target: { value: "把 hello.py 放到 scripts/ 并加日期" } });
+    expect(submit).not.toBeDisabled();
+    fireEvent.click(submit);
+
+    await waitFor(() => expect(calls).toHaveLength(1));
+    expect(calls[0]).toMatchObject({
+      kind: "planApproval",
+      sessionId: SID,
+      generation: GEN,
+      interactionId: INTERACTION,
+      decision: "feedback",
+      feedback: "把 hello.py 放到 scripts/ 并加日期",
+    });
+    expect(calls.some((call) => call.kind === "planApproval" && call.decision === "approve")).toBe(
+      false
+    );
   });
 
   it("plan_approval_card_is_disabled_when_single_select_is_closed", () => {

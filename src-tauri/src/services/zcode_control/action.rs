@@ -217,11 +217,18 @@ pub fn action_params(action: &ControlAction) -> Value {
         ControlAction::PlanApproval {
             interaction_id,
             decision,
+            feedback,
             ..
-        } => serde_json::json!({
-            "interactionId": interaction_id,
-            "decision": decision.as_wire(),
-        }),
+        } => {
+            let mut params = serde_json::json!({
+                "interactionId": interaction_id,
+                "decision": decision.as_wire(),
+            });
+            if let Some(text) = feedback {
+                params["feedback"] = serde_json::Value::String(text.clone());
+            }
+            params
+        }
         ControlAction::Stop {
             expected_foreground_execution_id,
             ..

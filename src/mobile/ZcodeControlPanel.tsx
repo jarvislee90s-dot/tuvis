@@ -1394,6 +1394,8 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
   const selection = session?.selection ?? null;
   const [pendingProvider, setPendingProvider] = useState<string | null>(null);
   const [pendingModel, setPendingModel] = useState<string | null>(null);
+  /** 思考档位的本地待选值：服务端旧 thought 要等回执落地，不能立刻把 select 拉回。 */
+  const [pendingThought, setPendingThought] = useState<string | null>(null);
   /** 可用性未知的目标组合：确认前零 selection POST。 */
   const [unknownSelection, setUnknownSelection] = useState<{
     provider?: string;
@@ -1419,6 +1421,7 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
   useEffect(() => {
     setPendingProvider(null);
     setPendingModel(null);
+    setPendingThought(null);
     setUnknownSelection(null);
   }, [selection?.provider, selection?.model, selection?.thought]);
 
@@ -1472,9 +1475,10 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
     session?.capabilities.thoughtLevel.reasonCode ??
     "unknown";
   const currentThought =
-    selection?.thought != null && currentChoice?.thoughtLevels.includes(selection.thought)
+    pendingThought ??
+    (selection?.thought != null && currentChoice?.thoughtLevels.includes(selection.thought)
       ? selection.thought
-      : (currentChoice?.thoughtLevels[0] ?? "");
+      : (currentChoice?.thoughtLevels[0] ?? ""));
 
   const submitSelection = (
     model: string,
@@ -1521,6 +1525,7 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
     setUnknownSelection(null);
     setPendingProvider(null);
     setPendingModel(null);
+    setPendingThought(null);
   };
 
   const handleProviderChange = (providerId: string) => {
@@ -1536,6 +1541,7 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
     setUnknownSelection(null);
     setPendingProvider(providerId);
     setPendingModel(null);
+    setPendingThought(null);
   };
 
   const handleModelChange = (modelId: string) => {
@@ -1543,6 +1549,7 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
     const resolved = resolveModelChoice(selection, activeProviderId, modelId);
     if (resolved === null) return;
     setPendingModel(resolved.model);
+    setPendingThought(null);
     requestSelection(
       resolved.model,
       resolved.thought,
@@ -1552,6 +1559,21 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
 
   const handleThoughtChange = (thought: string) => {
     if (selection === null || currentChoice?.thoughtLevels.includes(thought) !== true) return;
+    setPendingThought(thought);
+    // 同一 provider/model 只换思考档位，不是重新选择供应商；当前组合已经在使用中，
+    // 不应再次弹出“未知 provider”确认，否则用户会看到档位被旧值拉回。
+    const sameTarget =
+      activeProviderId === selection.provider && currentChoice.modelId === selection.model;
+    if (sameTarget) {
+      const unknownProvider = activeProvider !== null && !isAvailabilityKnown(activeProvider);
+      submitSelection(
+        currentChoice.modelId,
+        thought,
+        providerGroups.length === 0 ? undefined : activeProviderId,
+        unknownProvider
+      );
+      return;
+    }
     requestSelection(
       currentChoice.modelId,
       thought,

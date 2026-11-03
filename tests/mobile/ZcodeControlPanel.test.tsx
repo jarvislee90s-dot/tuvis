@@ -1945,6 +1945,7 @@ describe("ZCode 控制面板：模型/档位按能力开放", () => {
     expect(thought.value).toBe("high");
 
     fireEvent.change(thought, { target: { value: "low" } });
+    await waitFor(() => expect(thought.value).toBe("low"));
     await waitFor(() => expect(postedActions()).toHaveLength(1));
     expect(postedActions()[0].action).toEqual({
       kind: "selection",

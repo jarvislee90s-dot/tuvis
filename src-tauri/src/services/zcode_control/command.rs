@@ -131,8 +131,8 @@ use super::selection::build_selection_command_for_provider;
 use super::types::{
     codes, ActionContext, ActionReceipt, ActionState, ActiveWork, BoundTarget, CapabilitySource,
     CapabilityView, CollaborationMode, CommandPort, ControlAction, HeldQueueChoice, PendingPort,
-    SelectionPort, SendAdmission, SendDelivery, SessionView, StopPort, StopRequest, ZResult,
-    ZcodeError, PROTOCOL_CLIENT_ID, WRITABLE_DISPATCH_STATES,
+    PlanApprovalDecision, SelectionPort, SendAdmission, SendDelivery, SessionView, StopPort,
+    StopRequest, ZResult, ZcodeError, PROTOCOL_CLIENT_ID, WRITABLE_DISPATCH_STATES,
 };
 
 /// 官方发送方法名（`zcodeAgent.ts:937`、探针 `SendOnceLoop`）。
@@ -178,6 +178,9 @@ pub const ACK_TIMEOUT: Duration = Duration::from_secs(20);
 /// 应答 ACK 后等待宿主撤卡的观察窗（10s，探针 `INTERACTION_TERMINAL_WAIT_MS`）：
 /// 只有宿主 pending 代数前进且该 id 消失才升级 `confirmed`，否则停在 `accepted`。
 pub const CONFIRM_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// 计划批准后等待计划模式退出的短窗（仅作正向确认；超时/未知不升级 confirmed）。
+pub const PLAN_APPROVAL_CONFIRM_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// 模型/档位切换 ACK 后等待**新鲜**选择的观察窗（10s，生产计划 T6）：ACK
 /// accepted/duplicate 只算受理，只有 revision 前进且 provider/model/thought 精确
@@ -969,7 +972,10 @@ impl CommandSender {
             ControlAction::Send { .. } => Ok(vec!["send"]),
             ControlAction::Stop { .. } => Ok(vec!["interrupt"]),
             ControlAction::Permission { .. } => Ok(vec!["approval_reply"]),
-            ControlAction::PlanApproval { .. } => Ok(vec!["single_select"]),
+            ControlAction::PlanApproval { decision, .. } => match decision {
+                PlanApprovalDecision::Approve => Ok(vec!["single_select"]),
+                PlanApprovalDecision::Feedback => Ok(vec!["single_select", "free_text"]),
+            },
             ControlAction::Selection { .. } => Ok(vec!["model", "thought_level"]),
             ControlAction::Mode { .. } => Ok(vec!["mode"]),
             // 队列写：每次只要求**一个**队列专属槽位（`queue_edit` 同时覆盖撤回与
@@ -1519,13 +1525,25 @@ impl CommandSender {
         action: &ControlAction,
         permits: &[&str],
     ) -> ZResult<ActionReceipt> {
-        let ControlAction::PlanApproval { interaction_id, .. } = action else {
+        let ControlAction::PlanApproval {
+            interaction_id,
+            decision,
+            feedback,
+            ..
+        } = action
+        else {
             return Err(invalid_action());
         };
         if let Some(existing) = self.lookup_action(ctx, target, action)? {
             return Ok(existing);
         }
-        if !self.current_capabilities().single_select.enabled && !permits.contains(&"single_select")
+        let capabilities = self.current_capabilities();
+        if !capabilities.single_select.enabled && !permits.contains(&"single_select") {
+            return Err(ZcodeError::of(codes::NEEDS_EVIDENCE));
+        }
+        if *decision == PlanApprovalDecision::Feedback
+            && !capabilities.free_text.enabled
+            && !permits.contains(&"free_text")
         {
             return Err(ZcodeError::of(codes::NEEDS_EVIDENCE));
         }
@@ -1534,7 +1552,7 @@ impl CommandSender {
         };
         let baseline = pending.host_pending_revision(target);
         let card = pending.authorize_pending(target, interaction_id).await?;
-        let answer = match build_plan_approval_answer(&card) {
+        let answer = match build_plan_approval_answer(&card, *decision, feedback.as_deref()) {
             Ok(answer) => answer,
             Err(error) => {
                 pending.clear_local_inflight(target, interaction_id);
@@ -1567,9 +1585,28 @@ impl CommandSender {
         let receipt = self
             .dispatch_resolve(ctx, target, interaction_id, answer)
             .await;
-        Ok(self
-            .finish_resolve(target, pending.as_ref(), interaction_id, baseline, receipt)
-            .await)
+        Ok(match decision {
+            PlanApprovalDecision::Approve => {
+                self.finish_plan_resolve(
+                    target,
+                    pending.as_ref(),
+                    interaction_id,
+                    baseline,
+                    receipt,
+                )
+                .await
+            }
+            PlanApprovalDecision::Feedback => {
+                self.finish_plan_feedback(
+                    target,
+                    pending.as_ref(),
+                    interaction_id,
+                    baseline,
+                    receipt,
+                )
+                .await
+            }
+        })
     }
 
     /// 审批既有卡的安全应答（T5）：只读幂等预检 → 能力闸 → 宿主授权 →
@@ -2204,6 +2241,125 @@ impl CommandSender {
     ///   `confirmed`，超时停在 `accepted`；
     /// - `send_failed`（桥保证零写）与 `rejected`/`noop`（可证明未生效）释放在途；
     ///   写后 `unknown`（含 ACK 超窗）保持在途闸，防重复审批。
+    ///
+    /// 计划反馈的收口：反馈被宿主受理即 `accepted`；它**不是批准**，不升级
+    /// `confirmed`。宿主撤卡/仍保留 pending 都不改变「意见已发送」的事实。
+    async fn finish_plan_feedback(
+        &self,
+        target: &BoundTarget,
+        pending: &dyn PendingPort,
+        interaction_id: &str,
+        baseline: u64,
+        mut receipt: ActionReceipt,
+    ) -> ActionReceipt {
+        if receipt.state != ActionState::Accepted
+            && !pending.host_has_pending(target, interaction_id)
+        {
+            receipt.state = ActionState::Unknown;
+            receipt.reason_code = Some(codes::STALE_PENDING.to_owned());
+        }
+        if receipt.state == ActionState::Accepted {
+            pending.mark_resolved_local(target, interaction_id);
+            self.record(&receipt);
+            // 只观察宿主是否撤卡，不把撤卡当成批准；超时仍保持 accepted。
+            let _ = pending
+                .wait_host_cleared(target, interaction_id, baseline, self.confirm_timeout)
+                .await;
+        } else if matches!(
+            receipt.state,
+            ActionState::SendFailed | ActionState::Rejected | ActionState::Noop
+        ) {
+            pending.clear_local_inflight(target, interaction_id);
+        }
+        self.record(&receipt);
+        receipt
+    }
+
+    /// 计划批准的终态收口：撤卡**不等于**获批（deny 也会撤卡）。
+    ///
+    /// 只有观察到计划模式退出（`planEnabled=false` 或 effective mode 非 plan）
+    /// 才升级 `confirmed`；撤卡但模式仍为 plan/不可读时停在 `unknown`，绝不把
+    /// “turn 终止”误报成批准。无 stop 端口 / 无模式证据时停在 `accepted`。
+    async fn finish_plan_resolve(
+        &self,
+        target: &BoundTarget,
+        pending: &dyn PendingPort,
+        interaction_id: &str,
+        baseline: u64,
+        mut receipt: ActionReceipt,
+    ) -> ActionReceipt {
+        if receipt.state != ActionState::Accepted
+            && !pending.host_has_pending(target, interaction_id)
+        {
+            receipt.state = ActionState::Unknown;
+            receipt.reason_code = Some(codes::STALE_PENDING.to_owned());
+        }
+        if receipt.state == ActionState::Accepted {
+            pending.mark_resolved_local(target, interaction_id);
+            self.record(&receipt);
+            if pending
+                .wait_host_cleared(target, interaction_id, baseline, self.confirm_timeout)
+                .await
+            {
+                match self.plan_mode_after(target).await {
+                    Some(true) => {
+                        receipt.state = ActionState::Confirmed;
+                        receipt.reason_code = None;
+                    }
+                    Some(false) => {
+                        // 撤卡但仍在 plan mode：deny/ended turn 等，不能假确认。
+                        receipt.state = ActionState::Unknown;
+                        receipt.reason_code = None;
+                    }
+                    None => {
+                        // 没有模式证据：只承认已受理，不升级 confirmed。
+                    }
+                }
+            }
+        } else if matches!(
+            receipt.state,
+            ActionState::SendFailed | ActionState::Rejected | ActionState::Noop
+        ) {
+            pending.clear_local_inflight(target, interaction_id);
+        }
+        self.record(&receipt);
+        receipt
+    }
+
+    /// 是否有证据表明计划模式已经退出；`None` = 无法读取/未宣告。
+    async fn plan_mode_after(&self, target: &BoundTarget) -> Option<bool> {
+        let stop = self.stop.as_ref()?;
+        let deadline = tokio::time::Instant::now() + PLAN_APPROVAL_CONFIRM_TIMEOUT;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return None;
+            }
+            if let Ok(view) = stop
+                .session(target, remaining.min(Duration::from_millis(200)))
+                .await
+            {
+                let Some(mode) = view
+                    .selection
+                    .as_ref()
+                    .and_then(|selection| selection.mode.as_ref())
+                else {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    continue;
+                };
+                if mode.plan_enabled == Some(false) {
+                    return Some(true);
+                }
+                if mode.plan_enabled == Some(true)
+                    || mode.effective_mode == Some(CollaborationMode::Plan)
+                {
+                    return Some(false);
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
     async fn finish_resolve(
         &self,
         target: &BoundTarget,
@@ -3655,8 +3811,8 @@ mod tests {
         use serde_json::json;
 
         use crate::services::zcode_control::types::{
-            CapabilityFlag, PendingKind, PendingView, PlanApprovalDecision, QuestionOption,
-            QuestionView,
+            CapabilityFlag, CollaborationMode, ModeView, PendingKind, PendingView, QuestionOption,
+            QuestionView, QueueView, SelectionView, SessionView, StopPort,
         };
 
         /// 宿主 pending 侧的测试替身（与出站 `FakeBridge` 分开：授权/snooze/终态
@@ -4298,7 +4454,7 @@ mod tests {
         }
 
         /// C2：计划批准必须走独立动作，且只对精确 plan_approval 卡发一帧
-        /// `resolveInteraction{answer:{optionId:"approve"}}`；普通问答仍不得代批。
+        /// `resolveInteraction`；普通问答仍不得代批。
         #[tokio::test]
         async fn plan_approval_action_resolves_exact_approve_once() {
             let store = DeviceStore::memory();
@@ -4331,6 +4487,7 @@ mod tests {
                 generation: GEN,
                 interaction_id: "ix-plan".to_owned(),
                 decision: PlanApprovalDecision::Approve,
+                feedback: None,
             };
             let receipt = sender
                 .execute(&ctx("a-plan"), &target(), &action)
@@ -4340,8 +4497,15 @@ mod tests {
             assert_eq!(resolve_frames(&fake).len(), 1, "恰一帧 resolve");
             assert_eq!(
                 fake.envelope(0)["payload"]["answer"],
-                json!({"optionId": "approve"}),
-                "计划批准必须原样回传宿主 approve 原值"
+                json!({
+                    "action": "accept",
+                    "content": {
+                        "answers": {"Review this implementation plan.": "approve"},
+                        "answer_0": "approve",
+                        "answer": "approve"
+                    }
+                }),
+                "计划批准必须走官方 action=accept，不得当权限 optionId"
             );
 
             // 同 actionId/同载荷重放零新帧、零新账本行。
@@ -4355,6 +4519,165 @@ mod tests {
             assert_eq!(stored_state(&store, "a-plan"), before);
         }
 
+        #[tokio::test]
+        async fn plan_feedback_sends_text_content_once_and_stays_unapproved() {
+            let store = DeviceStore::memory();
+            let fake = FakeBridge::new(Reply::Body(accepted_body()));
+            let mut plan = card(
+                "ix-plan-feedback",
+                false,
+                vec![question(
+                    "Review this implementation plan.",
+                    &["approve"],
+                    false,
+                    true,
+                )],
+            );
+            plan.tool_name = Some("ExitPlanMode".to_owned());
+            plan.schema_interaction = Some("plan_approval".to_owned());
+            plan.plan_approval = true;
+            plan.answerable = false;
+            let pending = fake_pending(plan);
+            let sender = answer_sender(&fake, &pending, &store).with_capabilities(CapabilityView {
+                single_select: CapabilityFlag {
+                    enabled: true,
+                    reason_code: None,
+                },
+                free_text: CapabilityFlag {
+                    enabled: true,
+                    reason_code: None,
+                },
+                ..CapabilityView::default()
+            });
+
+            let action = ControlAction::PlanApproval {
+                session_id: SESSION.to_owned(),
+                generation: GEN,
+                interaction_id: "ix-plan-feedback".to_owned(),
+                decision: PlanApprovalDecision::Feedback,
+                feedback: Some("把 hello.py 放到 scripts/".to_owned()),
+            };
+            let receipt = sender
+                .execute(&ctx("a-plan-feedback"), &target(), &action)
+                .await
+                .unwrap();
+            assert_eq!(receipt.state, ActionState::Accepted, "反馈不是批准");
+            assert_eq!(resolve_frames(&fake).len(), 1);
+            assert_eq!(
+                fake.envelope(0)["payload"]["answer"],
+                json!({
+                    "action": "accept",
+                    "content": {
+                        "answers": {"Review this implementation plan.": "把 hello.py 放到 scripts/"},
+                        "answer_0": "把 hello.py 放到 scripts/",
+                        "answer": "把 hello.py 放到 scripts/"
+                    }
+                })
+            );
+            assert_eq!(
+                stored_state(&store, "a-plan-feedback").as_deref(),
+                Some("accepted")
+            );
+        }
+
+        /// 计划批准不能把“撤卡 + turn 结束”误报成成功：模式仍在 plan 时收口 unknown。
+        struct PlanModeStop {
+            plan_enabled: Option<bool>,
+        }
+
+        impl StopPort for PlanModeStop {
+            fn session<'a>(
+                &'a self,
+                target: &'a BoundTarget,
+                _timeout: Duration,
+            ) -> BoxFuture<'a, ZResult<SessionView>> {
+                Box::pin(async move {
+                    Ok(SessionView {
+                        execution_terminal: None,
+                        session_id: target.session_id.clone(),
+                        generation: target.generation,
+                        revision: Some(1),
+                        ready: true,
+                        pending: Vec::new(),
+                        control: None,
+                        selection: Some(SelectionView {
+                            provider: "p".to_owned(),
+                            model: "m".to_owned(),
+                            thought: None,
+                            models: Vec::new(),
+                            providers: Vec::new(),
+                            mode: Some(ModeView {
+                                raw_mode: Some(CollaborationMode::Plan),
+                                plan_enabled: self.plan_enabled,
+                                effective_mode: Some(CollaborationMode::Plan),
+                            }),
+                        }),
+                        capabilities: CapabilityView::default(),
+                        queue: QueueView::default(),
+                        input_routing: None,
+                    })
+                })
+            }
+
+            fn wait_stop_cleared<'a>(
+                &'a self,
+                _target: &'a BoundTarget,
+                _execution_id: &'a str,
+                _baseline_revision: u64,
+                _timeout: Duration,
+            ) -> BoxFuture<'a, bool> {
+                Box::pin(async { false })
+            }
+        }
+
+        #[tokio::test]
+        async fn plan_approval_staying_in_plan_mode_is_unknown_not_confirmed() {
+            let store = DeviceStore::memory();
+            let fake = FakeBridge::new(Reply::Body(accepted_body()));
+            let mut plan = card(
+                "ix-plan-mode",
+                false,
+                vec![question(
+                    "Review this implementation plan.",
+                    &["approve"],
+                    false,
+                    false,
+                )],
+            );
+            plan.tool_name = Some("ExitPlanMode".to_owned());
+            plan.schema_interaction = Some("plan_approval".to_owned());
+            plan.plan_approval = true;
+            plan.answerable = false;
+            let pending = fake_pending(plan);
+            pending.clear_on_wait();
+            let sender = answer_sender(&fake, &pending, &store)
+                .with_capabilities(CapabilityView {
+                    single_select: CapabilityFlag {
+                        enabled: true,
+                        reason_code: None,
+                    },
+                    ..CapabilityView::default()
+                })
+                .with_stop(Arc::new(PlanModeStop {
+                    plan_enabled: Some(true),
+                }));
+            let action = ControlAction::PlanApproval {
+                session_id: SESSION.to_owned(),
+                generation: GEN,
+                interaction_id: "ix-plan-mode".to_owned(),
+                decision: PlanApprovalDecision::Approve,
+                feedback: None,
+            };
+
+            let receipt = sender
+                .execute(&ctx("a-plan-mode"), &target(), &action)
+                .await
+                .unwrap();
+            assert_eq!(receipt.state, ActionState::Unknown, "撤卡≠获批");
+            assert_eq!(resolve_frames(&fake).len(), 1);
+        }
+
+        /// snooze 未证实（失败或卡已不在宿主集合）：零 resolve。
         /// snooze 未证实（失败或卡已不在宿主集合）：零 resolve。
         /// snooze 未证实（失败或卡已不在宿主集合）：零 resolve。
         #[tokio::test]

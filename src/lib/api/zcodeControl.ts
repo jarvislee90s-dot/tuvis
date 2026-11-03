@@ -490,7 +490,8 @@ export type ControlAction =
       sessionId: string;
       generation: number;
       interactionId: string;
-      decision: "approve";
+      decision: "approve" | "feedback";
+      feedback?: string;
     }
   | {
       kind: "selection";
