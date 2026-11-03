@@ -228,6 +228,133 @@ describe("tokenizer estimate dashboard", () => {
       tauriInvokeMock.mockImplementation(original);
     }
   });
+  it("does not label native fallback buckets with an estimate-only model", async () => {
+    setMockSpeedDashboard((query) => {
+      const base = mockSpeedDashboard({ ...query!, metricMode: "response", selection: null });
+      const native = base.series[0]!;
+      if (query?.metricMode !== "tokenizer-estimate")
+        return { ...base, series: [native], selectedSeries: native.seriesKey };
+      const key = {
+        ...native.seriesKey,
+        model: "estimate-only-A",
+        method: "ipc-body-reference" as const,
+        referenceProfileId: "p1",
+      };
+      const metrics = {
+        ...native.metrics,
+        tokenizerEstimate: { value: 40, outputTokens: 400, durationMs: 10000, sampleCount: 2 },
+        bodyObservedMs: 10000,
+      };
+      return {
+        ...base,
+        series: [{ seriesKey: key, metrics }],
+        selectedSeries: key,
+        buckets: base.buckets.map((bucket) => ({ ...bucket, metrics })),
+      };
+    });
+    renderDashboard();
+    await screen.findByTestId("speed-mode-stream");
+    fireEvent.click(screen.getByTestId("speed-mode-tokenizer-estimate"));
+    await waitFor(() =>
+      expect(
+        screen
+          .getAllByTestId("speed-series-row")
+          .some((row) => row.textContent?.includes("estimate-only-A"))
+      ).toBe(true)
+    );
+    fireEvent.click(
+      screen
+        .getAllByTestId("speed-series-row")
+        .find((row) => row.textContent?.includes("estimate-only-A"))!
+    );
+    await waitFor(() =>
+      expect(
+        (screen.getByTestId("speed-detail-title") as HTMLSelectElement).selectedOptions[0]
+          ?.textContent
+      ).toContain("estimate-only-A")
+    );
+    fireEvent.click(screen.getByTestId("speed-mode-response"));
+    await waitFor(() =>
+      expect(
+        (screen.getByTestId("speed-detail-title") as HTMLSelectElement).selectedOptions[0]
+          ?.textContent
+      ).not.toContain("estimate-only-A")
+    );
+    const title = screen.getByTestId("speed-detail-title").textContent;
+    const hit = screen.queryAllByTestId("speed-chart-hit")[0];
+    if (hit) {
+      fireEvent.click(hit);
+      expect(screen.getByTestId("speed-detail-title").textContent).toBe(title);
+    }
+    fireEvent.click(screen.getByTestId("speed-mode-tokenizer-estimate"));
+    await waitFor(() =>
+      expect(
+        screen
+          .getAllByTestId("speed-series-row")
+          .some((row) => row.textContent?.includes("estimate-only-A"))
+      ).toBe(true)
+    );
+    fireEvent.click(
+      screen
+        .getAllByTestId("speed-series-row")
+        .find((row) => row.textContent?.includes("estimate-only-A"))!
+    );
+    await waitFor(() =>
+      expect(
+        (screen.getByTestId("speed-detail-title") as HTMLSelectElement).selectedOptions[0]
+          ?.textContent
+      ).toContain("estimate-only-A")
+    );
+    fireEvent.click(screen.getByTestId("speed-mode-stream"));
+    await waitFor(() =>
+      expect(
+        (screen.getByTestId("speed-detail-title") as HTMLSelectElement).selectedOptions[0]
+          ?.textContent
+      ).not.toContain("estimate-only-A")
+    );
+  });
+  it("clears an estimate selection excluded by the tool filter", async () => {
+    setMockSpeedDashboard((query) => {
+      const base = mockSpeedDashboard({ ...query!, metricMode: "stream", selection: null });
+      if (query?.metricMode !== "tokenizer-estimate") return base;
+      if (query.toolId === "claude")
+        return { ...base, series: [], selectedSeries: null, buckets: [] };
+      const native = base.series.find((item) => item.seriesKey.tool === "codex")!;
+      const key = {
+        ...native.seriesKey,
+        model: "estimate-A",
+        method: "ipc-body-reference" as const,
+        referenceProfileId: "p1",
+      };
+      const metrics = {
+        ...native.metrics,
+        tokenizerEstimate: { value: 40, outputTokens: 400, durationMs: 10000, sampleCount: 2 },
+      };
+      return {
+        ...base,
+        series: [{ seriesKey: key, metrics }],
+        selectedSeries: query.selection ?? key,
+        buckets: [],
+      };
+    });
+    renderDashboard();
+    await screen.findByTestId("speed-mode-stream");
+    fireEvent.click(screen.getByTestId("speed-mode-tokenizer-estimate"));
+    await waitFor(() =>
+      expect(
+        screen
+          .getAllByTestId("speed-series-row")
+          .some((row) => row.textContent?.includes("estimate-A"))
+      ).toBe(true)
+    );
+    fireEvent.click(
+      screen
+        .getAllByTestId("speed-series-row")
+        .find((row) => row.textContent?.includes("estimate-A"))!
+    );
+    fireEvent.change(screen.getByTestId("speed-tool-filter"), { target: { value: "claude" } });
+    await waitFor(() => expect(screen.queryByTestId("speed-detail-title")).toBeNull());
+  });
   it("exposes an independent estimate stop control and reference details", async () => {
     renderDashboard();
     await screen.findByTestId("speed-sources-open");

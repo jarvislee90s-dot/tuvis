@@ -46,6 +46,7 @@ struct GateState {
 struct GateShared {
     state: Mutex<GateState>,
     plaintext_zero: std::sync::Condvar,
+    transitions: Mutex<()>,
 }
 #[derive(Clone, Default)]
 pub struct CaptureGate(Arc<GateShared>);
@@ -105,6 +106,7 @@ impl CaptureGate {
                 plaintext_jobs: 0,
             }),
             plaintext_zero: std::sync::Condvar::new(),
+            transitions: Mutex::new(()),
         }))
     }
     pub fn permit(&self) -> Option<CapturePermit> {
@@ -163,39 +165,35 @@ impl CaptureGate {
         enabled: bool,
         persist: impl FnOnce() -> Result<(), UsageError>,
     ) -> Result<(), UsageError> {
-        let mut state = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
-        if !enabled && state.source_enabled {
-            Self::advance(&mut state);
-            state.source_enabled = false;
-        }
-        if !enabled {
-            while state.plaintext_jobs > 0 {
-                state = self
-                    .0
-                    .plaintext_zero
-                    .wait(state)
-                    .unwrap_or_else(|e| e.into_inner());
-            }
-        }
-        persist()?;
-        if enabled && !state.source_enabled && !state.exhausted {
-            Self::advance(&mut state);
-            if !state.exhausted {
-                state.source_enabled = true;
-            }
-        }
-        Ok(())
+        self.transition(enabled, false, persist)
     }
-    /// 调用方先持数据库连接，再进入捕获门；与事实提交的锁序一致。
     pub(crate) fn save_master_with(
         &self,
         enabled: bool,
         persist: impl FnOnce() -> Result<(), UsageError>,
     ) -> Result<(), UsageError> {
+        self.transition(enabled, true, persist)
+    }
+    fn transition(
+        &self,
+        enabled: bool,
+        master: bool,
+        persist: impl FnOnce() -> Result<(), UsageError>,
+    ) -> Result<(), UsageError> {
+        let _serial = self.0.transitions.lock().unwrap_or_else(|e| e.into_inner());
         let mut state = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
-        if !enabled && state.master_enabled {
+        let current = if master {
+            state.master_enabled
+        } else {
+            state.source_enabled
+        };
+        if !enabled && current {
             Self::advance(&mut state);
-            state.master_enabled = false;
+            if master {
+                state.master_enabled = false;
+            } else {
+                state.source_enabled = false;
+            }
         }
         if !enabled {
             while state.plaintext_jobs > 0 {
@@ -206,11 +204,24 @@ impl CaptureGate {
                     .unwrap_or_else(|e| e.into_inner());
             }
         }
+        drop(state);
         persist()?;
-        if enabled && !state.master_enabled && !state.exhausted {
-            Self::advance(&mut state);
-            if !state.exhausted {
-                state.master_enabled = true;
+        if enabled {
+            let mut state = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
+            let current = if master {
+                state.master_enabled
+            } else {
+                state.source_enabled
+            };
+            if !current && !state.exhausted {
+                Self::advance(&mut state);
+                if !state.exhausted {
+                    if master {
+                        state.master_enabled = true;
+                    } else {
+                        state.source_enabled = true;
+                    }
+                }
             }
         }
         Ok(())
@@ -285,6 +296,7 @@ pub fn commit_estimate(
 }
 
 pub const ENABLED_KEY: &str = "tokenizer-estimate:enabled";
+/// 仅用于独占连接测试；共享数据库应使用 `set_estimate_enabled_with_lock`。
 #[doc(hidden)]
 pub fn set_estimate_enabled_with_gate(
     conn: &Connection,
@@ -299,10 +311,19 @@ pub fn set_estimate_enabled_with_gate(
 /// 持久化单源开关；与总授权和事实提交共享同一代际门。
 pub fn set_estimate_enabled(enabled: bool) -> Result<(), UsageError> {
     let gate = global_capture_gate();
-    let conn = crate::database::connection::DB
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    set_estimate_enabled_with_gate(&conn, enabled, gate)
+    set_estimate_enabled_with_lock(&crate::database::connection::DB, enabled, gate)
+}
+
+#[doc(hidden)]
+pub fn set_estimate_enabled_with_lock(
+    db: &Mutex<Connection>,
+    enabled: bool,
+    gate: &CaptureGate,
+) -> Result<(), UsageError> {
+    gate.save_source_with(enabled, || {
+        let conn = db.lock().unwrap_or_else(|e| e.into_inner());
+        super::store::save_state(&conn, ENABLED_KEY, &serde_json::json!(enabled))
+    })
 }
 
 impl EstimateFact {

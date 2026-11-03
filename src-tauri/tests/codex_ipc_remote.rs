@@ -24672,11 +24672,31 @@ async fn stop_reconnect_and_late_worker_preserve_other_consumers() {
         }
     }
     peer2.send(&serde_json::json!({"type":"broadcast","method":"thread-stream-state-changed","version":11,"sourceClientId":"owner-1","params":{"conversationId":key.thread_id,"hostId":"local","change":{"type":"snapshot","revision":7,"conversationState":{"turns":[],"requests":[],"threadRuntimeStatus":{"type":"idle"},"turnHistory":codex_fixture::canonical_turn_history(serde_json::json!({"t1":{"id":"t1","type":"turn","status":"completed","items":["u1"]},"u1":{"id":"u1","type":"user_message","text":"seed","ts":1}}),serde_json::json!([{"entries":["t1"]}]))}}}})).await;
-    let lease2 = tokio::time::timeout(Duration::from_secs(3), follow)
+    let first_result = tokio::time::timeout(Duration::from_secs(3), follow)
         .await
         .expect("reconnected following")
-        .unwrap()
         .unwrap();
+    let lease2 = match first_result {
+        Ok(lease) => lease,
+        Err(multi_agents_manager_lib::services::codex_desktop_ipc::types::ProtocolError::StaleContext(_)) => {
+            // 并发 owner 发现可保守拒绝旧代际；运行协调器会重试，验证最终仍能跟随。
+            let a=adapter.clone(); let k=key.clone();
+            let mut retry=tokio::spawn(async move {a.acquire_following(&k,FollowPurpose::TokenizerEstimate).await});
+            tokio::time::timeout(Duration::from_secs(5),async {
+                loop {
+                    tokio::select! {
+                        result=&mut retry => break result.unwrap().unwrap(),
+                        request=peer2.recv()=> match request["method"].as_str() {
+                            Some("thread-owner-discovery") => peer2.send(&discovery_response(request["requestId"].as_str().unwrap(),"owner-1")).await,
+                            Some("thread-stream-following-changed") => assert_eq!(request["params"]["following"],true),
+                            method => panic!("unexpected retry request {method:?}"),
+                        }
+                    }
+                }
+            }).await.expect("stale owner retry succeeds")
+        }
+        Err(error)=>panic!("unexpected reconnect error: {error}"),
+    };
     let duplicate = runtime
         .try_submit(
             body(),
@@ -24717,4 +24737,368 @@ async fn stop_reconnect_and_late_worker_preserve_other_consumers() {
     lease2.release().await;
     runtime.shutdown().await;
     adapter.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn disable_drain_does_not_hold_database_lock() {
+    use multi_agents_manager_lib::services::{
+        tps::{body_runtime::CaptureService, estimate_store::CaptureGate},
+        usage::{model::UsageSettings, settings::save_with_gate_and_lock},
+    };
+    let (io, mut peer) = ScriptedPeer::new();
+    let adapter = Arc::new(DesktopIpcAdapter::new(
+        Arc::new(StaticConnector::new(io)),
+        caps_open_profile(),
+    ));
+    let db = shared_conn();
+    let gate = CaptureGate::new(true);
+    let key = ThreadKey {
+        host_id: "local".into(),
+        thread_id: "00000000-0000-4000-8000-000000000028".into(),
+    };
+    let (_tx, rx) = tokio::sync::watch::channel(vec![key.clone()]);
+    let service = CaptureService::start_for_test(
+        adapter.clone(),
+        gate.clone(),
+        db.clone(),
+        rx,
+        "fixture".into(),
+    );
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        drive_ensure(&mut peer, &key.thread_id, vec![], "idle"),
+    )
+    .await
+    .unwrap();
+    adapter.ensure_thread(&key).await.unwrap();
+    let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    let resume_rx = Arc::new(StdMutex::new(resume_rx));
+    adapter.set_caps_observe_gate(Some(Arc::new(move |path| {
+        if path == "state_changed" {
+            let _ = entered_tx.send(());
+            let _ = resume_rx.lock().unwrap().recv();
+        }
+    })));
+    peer.send(&serde_json::json!({"type":"broadcast","method":"thread-stream-state-changed","sourceClientId":"owner-1","params":{"conversationId":key.thread_id,"change":{"type":"patches","baseRevision":7,"revision":8,"patches":[{"op":"add","path":["turnHistory","history","entitiesByKey","turn:late"],"value":{"turnId":"late","status":"inProgress","items":[{"type":"agentMessage","id":"i","text":"sensitive synthetic text"}]}}]}}})).await;
+    tokio::time::timeout(Duration::from_secs(2), entered_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let db2 = db.clone();
+    let gate2 = gate.clone();
+    let mut stop = tokio::task::spawn_blocking(move || {
+        let settings = UsageSettings {
+            enabled: false,
+            ..UsageSettings::default()
+        };
+        save_with_gate_and_lock(&db2, &settings, &gate2)
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while gate.permit().is_some() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("capture generation must be invalidated");
+    let early = tokio::time::timeout(Duration::from_millis(100), &mut stop).await;
+    let waited = early.is_err();
+    let db_was_free = db.try_lock().is_ok();
+    resume_tx.send(()).unwrap();
+    match early {
+        Ok(result) => result.unwrap().unwrap(),
+        Err(_) => tokio::time::timeout(Duration::from_secs(3), stop)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap(),
+    };
+    adapter.set_caps_observe_gate(None);
+    assert_eq!(adapter.projection(&key).await.revision, Some(8));
+    assert!(
+        !peer_has_traffic(&mut peer).await,
+        "remote following must remain active"
+    );
+    service.shutdown().await;
+    adapter.shutdown().await;
+    assert!(
+        waited,
+        "disable returned while a producer still held plaintext"
+    );
+    assert!(
+        db_was_free,
+        "disable waited for a producer while holding the database lock"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn source_disable_drain_does_not_hold_database_lock() {
+    use multi_agents_manager_lib::services::tps::{
+        body_runtime::CaptureService,
+        estimate_store::{set_estimate_enabled_with_lock, CaptureGate},
+    };
+    let (io, mut peer) = ScriptedPeer::new();
+    let adapter = Arc::new(DesktopIpcAdapter::new(
+        Arc::new(StaticConnector::new(io)),
+        caps_open_profile(),
+    ));
+    let db = shared_conn();
+    let gate = CaptureGate::new(true);
+    let key = ThreadKey {
+        host_id: "local".into(),
+        thread_id: "00000000-0000-4000-8000-000000000028".into(),
+    };
+    let (_tx, rx) = tokio::sync::watch::channel(vec![key.clone()]);
+    let service = CaptureService::start_for_test(
+        adapter.clone(),
+        gate.clone(),
+        db.clone(),
+        rx,
+        "fixture".into(),
+    );
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        drive_ensure(&mut peer, &key.thread_id, vec![], "idle"),
+    )
+    .await
+    .unwrap();
+    adapter.ensure_thread(&key).await.unwrap();
+    let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    let resume_rx = Arc::new(StdMutex::new(resume_rx));
+    adapter.set_caps_observe_gate(Some(Arc::new(move |path| {
+        if path == "state_changed" {
+            let _ = entered_tx.send(());
+            let _ = resume_rx.lock().unwrap().recv();
+        }
+    })));
+    peer.send(&serde_json::json!({"type":"broadcast","method":"thread-stream-state-changed","sourceClientId":"owner-1","params":{"conversationId":key.thread_id,"change":{"type":"patches","baseRevision":7,"revision":8,"patches":[{"op":"add","path":["turnHistory","history","entitiesByKey","turn:late"],"value":{"turnId":"late","status":"inProgress","items":[{"type":"agentMessage","id":"i","text":"sensitive synthetic text"}]}}]}}})).await;
+    tokio::time::timeout(Duration::from_secs(2), entered_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let db2 = db.clone();
+    let gate2 = gate.clone();
+    let mut stop =
+        tokio::task::spawn_blocking(move || set_estimate_enabled_with_lock(&db2, false, &gate2));
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while gate.permit().is_some() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("capture generation must be invalidated");
+    let early = tokio::time::timeout(Duration::from_millis(100), &mut stop).await;
+    let waited = early.is_err();
+    let db_was_free = db.try_lock().is_ok();
+    resume_tx.send(()).unwrap();
+    match early {
+        Ok(result) => result.unwrap().unwrap(),
+        Err(_) => tokio::time::timeout(Duration::from_secs(3), stop)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap(),
+    };
+    adapter.set_caps_observe_gate(None);
+    assert_eq!(adapter.projection(&key).await.revision, Some(8));
+    assert!(
+        !peer_has_traffic(&mut peer).await,
+        "remote following must remain active"
+    );
+    service.shutdown().await;
+    adapter.shutdown().await;
+    assert!(
+        waited,
+        "disable returned while a producer still held plaintext"
+    );
+    assert!(
+        db_was_free,
+        "disable waited for a producer while holding the database lock"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn snapshot_with_running_turn_captures_new_message_only() {
+    use multi_agents_manager_lib::services::tps::{
+        body_runtime::CaptureService, estimate_store::CaptureGate, reference::count_reference,
+    };
+    let (io, mut peer) = ScriptedPeer::new();
+    let adapter = Arc::new(DesktopIpcAdapter::new(
+        Arc::new(StaticConnector::new(io)),
+        caps_open_profile(),
+    ));
+    let db = shared_conn();
+    let gate = CaptureGate::new(true);
+    let key = ThreadKey {
+        host_id: "local".into(),
+        thread_id: "00000000-0000-4000-8000-000000000031".into(),
+    };
+    let (_tx, rx) = tokio::sync::watch::channel(vec![key.clone()]);
+    let service =
+        CaptureService::start_for_test(adapter.clone(), gate, db.clone(), rx, "fixture".into());
+    let state = serde_json::json!({"turns":[],"requests":[],"threadRuntimeStatus":{"type":"active"},"turnHistory":{"history":{"isComplete":true,"islands":[{"entries":[{"value":"turn:x"}]}],"entitiesByKey":{"turn:x":{"turnId":"x","status":"inProgress","items":[{"type":"agentMessage","id":"old","text":"historical output"},{"type":"reasoning","id":"r","summary":[{"text":""}]}]}}}}});
+    drive_ensure_state(&mut peer, &key.thread_id, 7, state, true).await;
+    let patches = vec![
+        serde_json::json!([{"op":"replace","path":["turnHistory","history","entitiesByKey","turn:x","items",1,"summary",0,"text"],"value":"synthetic reasoning"}]),
+        serde_json::json!([{"op":"add","path":["turnHistory","history","entitiesByKey","turn:x","items",1],"value":{"type":"agentMessage","id":"new","text":""}}]),
+        serde_json::json!([{"op":"replace","path":["turnHistory","history","entitiesByKey","turn:x","items",1,"text"],"value":"hello"}]),
+        serde_json::json!([{"op":"replace","path":["turnHistory","history","entitiesByKey","turn:x","items",1,"text"],"value":"hello world"}]),
+        serde_json::json!([{"op":"add","path":["turnHistory","history","entitiesByKey","turn:x","items",1,"completedAtMs"],"value":1234},{"op":"add","path":["turnHistory","history","entitiesByKey","turn:x","durationMs"],"value":4000},{"op":"add","path":["turnHistory","history","entitiesByKey","turn:x","agentMessageCompletedAtMsById"],"value":{"new":1234}}]),
+        serde_json::json!([{"op":"replace","path":["turnHistory","history","entitiesByKey","turn:x","status"],"value":"completed"}]),
+    ];
+    for (i, patch) in patches.into_iter().enumerate() {
+        let base = 7 + i as u64;
+        peer.send(&serde_json::json!({"type":"broadcast","method":"thread-stream-state-changed","sourceClientId":"owner-1","params":{"conversationId":key.thread_id,"change":{"type":"patches","baseRevision":base,"revision":base+1,"patches":patch}}})).await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while adapter.projection(&key).await.revision != Some(base + 1) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if db
+                .lock()
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM tps_body_estimate", [], |r| {
+                    r.get::<_, i64>(0)
+                })
+                .unwrap()
+                == 1
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("new message captured");
+    assert_eq!(
+        db.lock()
+            .unwrap()
+            .query_row("SELECT reference_tokens FROM tps_body_estimate", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .unwrap(),
+        count_reference("hello world").unwrap() as i64
+    );
+    service.shutdown().await;
+    adapter.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn stopping_capture_does_not_deadlock_mirror_and_database() {
+    use multi_agents_manager_lib::services::{
+        tps::{
+            body_runtime::CaptureService,
+            estimate_store::{set_estimate_enabled_with_lock, CaptureGate},
+        },
+        usage::{model::UsageSettings, settings::save_with_gate_and_lock},
+    };
+    use std::sync::atomic::{AtomicBool, Ordering};
+    for master in [true, false] {
+        let (io, mut peer) = ScriptedPeer::new();
+        let adapter = Arc::new(DesktopIpcAdapter::new(
+            Arc::new(StaticConnector::new(io)),
+            caps_open_profile(),
+        ));
+        let db = shared_conn();
+        let gate = CaptureGate::new(true);
+        let key = ThreadKey {
+            host_id: "local".into(),
+            thread_id: "00000000-0000-4000-8000-000000000032".into(),
+        };
+        let (_tx, rx) = tokio::sync::watch::channel(vec![key.clone()]);
+        let service = CaptureService::start_for_test(
+            adapter.clone(),
+            gate.clone(),
+            db.clone(),
+            rx,
+            "fixture".into(),
+        );
+        drive_ensure(&mut peer, &key.thread_id, vec![], "idle").await;
+        adapter.ensure_thread(&key).await.unwrap();
+        let (project_entered_tx, project_entered_rx) = tokio::sync::oneshot::channel();
+        let entered = Arc::new(StdMutex::new(Some(project_entered_tx)));
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let resume = Arc::new(StdMutex::new(resume_rx));
+        let db_probe = db.clone();
+        let success = Arc::new(AtomicBool::new(false));
+        let success2 = success.clone();
+        adapter.set_auto_adapt_gate(Some(Arc::new(move || {
+            if let Some(tx) = entered.lock().unwrap().take() {
+                let _ = tx.send(());
+                let _ = resume.lock().unwrap().recv_timeout(Duration::from_secs(3));
+                success2.store(db_probe.try_lock().is_ok(), Ordering::SeqCst);
+            }
+            true
+        })));
+        let a = adapter.clone();
+        let k = key.clone();
+        let projection = tokio::spawn(async move { a.projection(&k).await });
+        tokio::time::timeout(Duration::from_secs(3), project_entered_rx)
+            .await
+            .expect("projection reaches policy under mirror lock")
+            .unwrap();
+        let (producer_tx, mut producer_rx) = tokio::sync::mpsc::unbounded_channel();
+        adapter.set_caps_observe_gate(Some(Arc::new(move |path| {
+            if path == "state_changed" {
+                let _ = producer_tx.send(());
+            }
+        })));
+        peer.send(&serde_json::json!({"type":"broadcast","method":"thread-stream-state-changed","sourceClientId":"owner-1","params":{"conversationId":key.thread_id,"change":{"type":"patches","baseRevision":7,"revision":8,"patches":[{"op":"add","path":["turnHistory","history","entitiesByKey","turn:new"],"value":{"turnId":"new","status":"inProgress","items":[]}}]}}})).await;
+        tokio::time::timeout(Duration::from_secs(3), producer_rx.recv())
+            .await
+            .expect("producer reached mirror wait")
+            .unwrap();
+        let db2 = db.clone();
+        let gate2 = gate.clone();
+        let stopped = tokio::task::spawn_blocking(move || {
+            if master {
+                save_with_gate_and_lock(
+                    &db2,
+                    &UsageSettings {
+                        enabled: false,
+                        ..Default::default()
+                    },
+                    &gate2,
+                )
+            } else {
+                set_estimate_enabled_with_lock(&db2, false, &gate2)
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while gate.permit().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("stop invalidates generation");
+        resume_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(3), projection)
+            .await
+            .expect("projection ends")
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), stopped)
+            .await
+            .expect("stop ends")
+            .unwrap()
+            .unwrap();
+        assert!(
+            success.load(Ordering::SeqCst),
+            "projection could not acquire database while capture drained"
+        );
+        adapter.set_auto_adapt_gate(None);
+        adapter.set_caps_observe_gate(None);
+        assert_eq!(adapter.projection(&key).await.revision, Some(8));
+        assert!(
+            !peer_has_traffic(&mut peer).await,
+            "remote follow remains in place"
+        );
+        service.shutdown().await;
+        adapter.shutdown().await;
+    }
 }

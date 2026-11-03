@@ -84,6 +84,12 @@ function sameSeriesKey(a: SeriesKey | null, b: SeriesKey | null): boolean {
   return seriesKeyId(a) === seriesKeyId(b);
 }
 
+/// 跨口径切换的身份对位：参考 Token 与原生 Token 是不同 method 的 series，
+/// 切换口径时只按 tool/model/channel 找同身份曲线，不比 method。
+function sameSeriesIdentity(a: SeriesKey, b: SeriesKey): boolean {
+  return a.tool === b.tool && a.model === b.model && a.channel === b.channel;
+}
+
 export function SpeedDashboard({ active }: { active: boolean }) {
   const { t } = useTranslation();
   const rootRef = useRef<HTMLDivElement | null>(null);
@@ -150,31 +156,31 @@ export function SpeedDashboard({ active }: { active: boolean }) {
   // 本地 selection 被筛掉 ⇒ 跟随服务端回退（后端 selected_series 同款回退是显示真值源）；
   // selection=null（未选择）不回写——保持「让服务端选默认」的语义，避免多余换键重查。
   useEffect(() => {
-    if (snapshot === null || selection === null || serverSelected === null) return;
+    if (snapshot === null || selection === null) return;
+    if (serverSelected === null) {
+      setSelection(null);
+      setPinned(null);
+      setHovered(null);
+      return;
+    }
     if (preferredMode === "tokenizer-estimate") {
-      const compatible = snapshot.series.filter(
-        ({ seriesKey }) =>
-          seriesKey.tool === selection.tool &&
-          seriesKey.model === selection.model &&
-          seriesKey.channel === selection.channel
+      const compatible = snapshot.series.filter(({ seriesKey }) =>
+        sameSeriesIdentity(seriesKey, selection)
       );
       if (selection.method !== "ipc-body-reference" && compatible.length === 1)
         setSelection(compatible[0]!.seriesKey);
       return;
     }
     if (selection.method === "ipc-body-reference") {
-      const matching = snapshot.series.filter(
-        ({ seriesKey }) =>
-          seriesKey.tool === selection.tool &&
-          seriesKey.model === selection.model &&
-          seriesKey.channel === selection.channel
+      const matching = snapshot.series.filter(({ seriesKey }) =>
+        sameSeriesIdentity(seriesKey, selection)
       );
       const candidate =
         matching.find(
           ({ metrics }) =>
             (preferredMode === "stream" ? metrics.stream : metrics.response).sampleCount > 0
         ) ?? matching[0];
-      if (candidate) setSelection(candidate.seriesKey);
+      setSelection(candidate?.seriesKey ?? serverSelected);
       return;
     }
     if (!sameSeriesKey(selection, serverSelected)) setSelection(serverSelected);
@@ -184,7 +190,13 @@ export function SpeedDashboard({ active }: { active: boolean }) {
    * 展示真值源：本地 selection 优先（点击行 → 立即生效，不等新快照；Codex fallback
    * 因此瞬时翻转）；未选择时跟随服务端选中（含回退）。sync effect 保证二者最终一致。
    */
-  const displayKey = selection ?? shownServerSelected;
+  const displayKey =
+    snapshot &&
+    selection?.method === "ipc-body-reference" &&
+    preferredMode !== "tokenizer-estimate" &&
+    !snapshot.series.some(({ seriesKey }) => sameSeriesIdentity(seriesKey, selection))
+      ? serverSelected
+      : (selection ?? shownServerSelected);
 
   const selectedCapabilities = capabilitiesOf(displayKey, shown);
   const mode = effectiveMetric(preferredMode, selectedCapabilities);
@@ -486,7 +498,11 @@ export function SpeedDashboard({ active }: { active: boolean }) {
         {/* 整页唯一一张图（x 轴按服务端快照的完整 [rangeFrom, rangeTo] 铺满）；
             口径说明三行走 footnote（二轮实机反馈 ④：图例下方，替代原 speed-mode-hint 段落） */}
         <SpeedChart
-          buckets={shown.buckets}
+          buckets={
+            shownServerSelected && sameSeriesKey(displayKey, shownServerSelected)
+              ? shown.buckets
+              : []
+          }
           mode={mode}
           from={shown.rangeFrom}
           to={shown.rangeTo}

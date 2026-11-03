@@ -989,3 +989,109 @@ async fn permanent_database_failure_is_bounded_and_diagnosed() {
     assert_eq!(attempts.load(Ordering::SeqCst), 3);
     assert_eq!(runtime.diagnostics().database_failures, 1);
 }
+
+#[test]
+fn concurrent_stop_and_restart_persist_in_transition_order() {
+    use multi_agents_manager_lib::services::{
+        tps::estimate_store::{set_estimate_enabled_with_lock, CaptureGate, ENABLED_KEY},
+        usage::{
+            model::UsageSettings,
+            settings::{load_from_conn, save_with_gate_and_lock},
+        },
+    };
+    use std::sync::{Arc, Mutex};
+    for master in [true, false] {
+        let conn = Connection::open_in_memory().unwrap();
+        schema::init(&conn);
+        migration::migrate(&conn).unwrap();
+        let db = Arc::new(Mutex::new(conn));
+        let gate = CaptureGate::new(true);
+        let old = gate.permit().unwrap();
+        let held = db.lock().unwrap();
+        let d = db.clone();
+        let g = gate.clone();
+        let stop = std::thread::spawn(move || {
+            if master {
+                save_with_gate_and_lock(
+                    &d,
+                    &UsageSettings {
+                        enabled: false,
+                        ..Default::default()
+                    },
+                    &g,
+                )
+            } else {
+                set_estimate_enabled_with_lock(&d, false, &g)
+            }
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while gate.permit().is_some() && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(
+            gate.permit().is_none(),
+            "stop must invalidate before waiting for the database"
+        );
+        let d = db.clone();
+        let g = gate.clone();
+        let start = std::thread::spawn(move || {
+            if master {
+                save_with_gate_and_lock(&d, &UsageSettings::default(), &g)
+            } else {
+                set_estimate_enabled_with_lock(&d, true, &g)
+            }
+        });
+        drop(held);
+        stop.join().unwrap().unwrap();
+        start.join().unwrap().unwrap();
+        assert!(!old.is_current());
+        assert!(gate.permit().is_some());
+        let conn = db.lock().unwrap();
+        if master {
+            assert!(load_from_conn(&conn).enabled);
+        } else {
+            assert_eq!(
+                multi_agents_manager_lib::services::tps::store::load_state(&conn, ENABLED_KEY)
+                    .unwrap(),
+                Some(serde_json::json!(true))
+            );
+        }
+    }
+}
+
+#[test]
+fn failed_stop_persistence_keeps_old_permit_invalid() {
+    use multi_agents_manager_lib::services::{
+        tps::estimate_store::{set_estimate_enabled_with_lock, CaptureGate},
+        usage::{model::UsageSettings, settings::save_with_gate_and_lock},
+    };
+    use std::sync::Mutex;
+    for master in [true, false] {
+        let conn = Connection::open_in_memory().unwrap();
+        schema::init(&conn);
+        migration::migrate(&conn).unwrap();
+        if master {
+            conn.execute_batch("CREATE TRIGGER reject_stop BEFORE INSERT ON settings BEGIN SELECT RAISE(ABORT, 'rejected'); END;").unwrap();
+        } else {
+            conn.execute_batch("CREATE TRIGGER reject_stop BEFORE INSERT ON tps_state BEGIN SELECT RAISE(ABORT, 'rejected'); END;").unwrap();
+        }
+        let db = Mutex::new(conn);
+        let gate = CaptureGate::new(true);
+        let old = gate.permit().unwrap();
+        let result = if master {
+            save_with_gate_and_lock(
+                &db,
+                &UsageSettings {
+                    enabled: false,
+                    ..Default::default()
+                },
+                &gate,
+            )
+        } else {
+            set_estimate_enabled_with_lock(&db, false, &gate)
+        };
+        assert!(result.is_err());
+        assert!(!old.is_current());
+        assert!(gate.permit().is_none());
+    }
+}

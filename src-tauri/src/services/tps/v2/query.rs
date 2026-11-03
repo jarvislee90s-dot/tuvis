@@ -391,7 +391,12 @@ pub fn dashboard(
     // 选择：只在筛选后的 series 集保留，否则排序第一，无匹配 None
     let selected_series = match &query.selection {
         Some(sel) if entries.iter().any(|(k, _)| k == sel) => Some(sel.clone()),
-        Some(sel) if query.metric_mode == SpeedMetricMode::TokenizerEstimate => Some(sel.clone()),
+        Some(sel) if query.metric_mode == SpeedMetricMode::TokenizerEstimate
+            && query.tool_id.as_ref().is_none_or(|tool| tool == &sel.tool)
+            && conn.query_row(
+                "SELECT ?1 = '' OR instr(lower(?2 || ' ' || ?3 || ' ' || COALESCE(?4,'')), lower(?1)) > 0",
+                rusqlite::params![query.search, sel.tool, sel.model, sel.channel], |row| row.get::<_, bool>(0)
+            ).map_err(|e| UsageError::new("usage-db-failed", format!("estimate selection filter: {e}")))? => Some(sel.clone()),
         _ => entries.first().map(|(k, _)| k.clone()),
     };
 

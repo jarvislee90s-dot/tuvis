@@ -54,27 +54,34 @@ impl RemoteWriteGeneration {
     }
     pub fn stop(&self) {
         use std::sync::atomic::Ordering;
-        let _ = self
-            .0
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| {
-                if v % 2 == 1 {
-                    Some(v.wrapping_add(1))
-                } else {
-                    None
-                }
-            });
+        // 不用 Atomic::fetch_update：新版 Rust 已把它标记为 deprecated，CI 的
+        // `-D warnings` 会直接失败。CAS 循环语义相同，且不依赖版本。
+        let mut current = self.0.load(Ordering::SeqCst);
+        while current % 2 == 1 {
+            match self.0.compare_exchange(
+                current,
+                current.wrapping_add(1),
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => return,
+                Err(actual) => current = actual,
+            }
+        }
     }
     pub fn resume(&self) {
         use std::sync::atomic::Ordering;
-        let _ = self
-            .0
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| {
-                if v != 0 && v % 2 == 0 {
-                    Some(v + 1)
-                } else {
-                    None
-                }
-            });
+        // 同 stop：CAS 循环替代已弃用的 fetch_update。
+        let mut current = self.0.load(Ordering::SeqCst);
+        while current != 0 && current.is_multiple_of(2) {
+            match self
+                .0
+                .compare_exchange(current, current + 1, Ordering::SeqCst, Ordering::SeqCst)
+            {
+                Ok(_) => return,
+                Err(actual) => current = actual,
+            }
+        }
     }
     pub fn valid(&self, generation: u64) -> bool {
         generation % 2 == 1 && self.capture() == generation
@@ -123,13 +130,23 @@ impl SharedBodyBudget {
     }
     pub(crate) fn reserve(&self, bytes: usize) -> bool {
         use std::sync::atomic::Ordering;
-        let ok = self
-            .occupied
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |used| {
-                used.checked_add(bytes)
-                    .filter(|next| *next <= QUEUED_BODY_LIMIT)
-            })
-            .is_ok();
+        // 同 connection.rs Budget：CAS 循环替代已弃用的 fetch_update。
+        let mut used = self.occupied.load(Ordering::SeqCst);
+        let ok = loop {
+            let Some(next) = used
+                .checked_add(bytes)
+                .filter(|next| *next <= QUEUED_BODY_LIMIT)
+            else {
+                break false;
+            };
+            match self
+                .occupied
+                .compare_exchange(used, next, Ordering::SeqCst, Ordering::SeqCst)
+            {
+                Ok(_) => break true,
+                Err(actual) => used = actual,
+            }
+        };
         if !ok {
             self.record_rejection();
         }
@@ -542,6 +559,22 @@ fn body_entities(state: &serde_json::Value) -> Option<&serde_json::Map<String, s
         .pointer("/turnHistory/history/entitiesByKey")?
         .as_object()
 }
+/// 识别指向 `items[<index>]` 的补丁路径；非该形状返回 None。
+fn item_patch_path(path: &[serde_json::Value]) -> Option<(&str, usize)> {
+    if path.first().and_then(|v| v.as_str()) != Some("turnHistory")
+        || path.get(1).and_then(|v| v.as_str()) != Some("history")
+        || path.get(2).and_then(|v| v.as_str()) != Some("entitiesByKey")
+        || path.get(4).and_then(|v| v.as_str()) != Some("items")
+    {
+        return None;
+    }
+    let entity = path.get(3).and_then(|v| v.as_str())?;
+    let index = path
+        .get(5)
+        .and_then(|v| v.as_u64())
+        .and_then(|v| usize::try_from(v).ok())?;
+    Some((entity, index))
+}
 fn body_item(state: &serde_json::Value, entity: &str, index: usize) -> Option<ItemBefore> {
     let item = body_entities(state)?
         .get(entity)?
@@ -585,6 +618,52 @@ impl BodyPatchTracker {
     pub(crate) fn baseline(&mut self, state: &serde_json::Value) {
         self.active.clear();
         self.refresh_references(state);
+        if !self.complete {
+            return;
+        }
+        let Some(entities) = body_entities(state) else {
+            return;
+        };
+        let mut counts = std::collections::HashMap::<&str, usize>::new();
+        for key in &self.references {
+            if let Some(id) = entities
+                .get(key)
+                .and_then(|turn| turn.get("turnId"))
+                .and_then(|id| id.as_str())
+            {
+                *counts.entry(id).or_default() += 1;
+            }
+        }
+        for key in &self.references {
+            let Some(turn) = entities.get(key) else {
+                continue;
+            };
+            let Some(id) = turn
+                .get("turnId")
+                .and_then(|value| value.as_str())
+                .filter(|id| !id.is_empty())
+            else {
+                continue;
+            };
+            if turn.get("status").and_then(|value| value.as_str()) != Some("inProgress")
+                || counts.get(id) != Some(&1)
+            {
+                continue;
+            }
+            let Some(items) = turn.get("items").and_then(|value| value.as_array()) else {
+                continue;
+            };
+            let mut ids = std::collections::HashSet::new();
+            if items.iter().any(
+                |item| match item.get("id").and_then(|value| value.as_str()) {
+                    Some(item_id) if !item_id.is_empty() => !ids.insert(item_id),
+                    _ => item.get("type").and_then(|value| value.as_str()) == Some("agentMessage"),
+                },
+            ) {
+                continue;
+            }
+            self.active.insert(key.clone(), id.to_owned());
+        }
     }
     pub(crate) fn exceeds_item_limit(
         &self,
@@ -598,19 +677,7 @@ impl BodyPatchTracker {
             let Some(path) = op.get("path").and_then(|v| v.as_array()) else {
                 return false;
             };
-            if path.first().and_then(|v| v.as_str()) != Some("turnHistory")
-                || path.get(1).and_then(|v| v.as_str()) != Some("history")
-                || path.get(2).and_then(|v| v.as_str()) != Some("entitiesByKey")
-                || path.get(4).and_then(|v| v.as_str()) != Some("items")
-            {
-                return false;
-            }
-            let (Some(entity), Some(index)) = (
-                path.get(3).and_then(|v| v.as_str()),
-                path.get(5)
-                    .and_then(|v| v.as_u64())
-                    .and_then(|v| usize::try_from(v).ok()),
-            ) else {
+            let Some((entity, index)) = item_patch_path(path) else {
                 return false;
             };
             if !self.active.contains_key(entity) {
@@ -658,19 +725,7 @@ impl BodyPatchTracker {
             let Some(path) = op.get("path").and_then(|value| value.as_array()) else {
                 continue;
             };
-            if path.first().and_then(|v| v.as_str()) != Some("turnHistory")
-                || path.get(1).and_then(|v| v.as_str()) != Some("history")
-                || path.get(2).and_then(|v| v.as_str()) != Some("entitiesByKey")
-                || path.get(4).and_then(|v| v.as_str()) != Some("items")
-            {
-                continue;
-            }
-            let (Some(entity), Some(index)) = (
-                path.get(3).and_then(|v| v.as_str()),
-                path.get(5)
-                    .and_then(|v| v.as_u64())
-                    .and_then(|v| usize::try_from(v).ok()),
-            ) else {
+            let Some((entity, index)) = item_patch_path(path) else {
                 continue;
             };
             if !self.active.contains_key(entity) {
@@ -809,9 +864,43 @@ impl BodyPatchTracker {
                                 p.invalid.insert(entity.to_owned());
                                 continue;
                             };
+                            // 思考摘要和工具状态不是正文。先按旧 item 类型区分，
+                            // 不能因其嵌套增量路径就撤销整个回合的正文观察。
+                            // id/type 改动仍交给下面的身份保护处理。
+                            if path.len() > 6 && !matches!(path[6].as_str(), Some("id" | "type")) {
+                                let kind = body_entities(state)
+                                    .and_then(|entities| entities.get(entity))
+                                    .and_then(|turn| turn.get("items"))
+                                    .and_then(|items| items.as_array())
+                                    .and_then(|items| items.get(index))
+                                    .and_then(|item| item.get("type"))
+                                    .and_then(|kind| kind.as_str());
+                                if matches!(kind, Some("error" | "retry")) {
+                                    p.invalid.insert(entity.to_owned());
+                                    continue;
+                                }
+                                if kind.is_some_and(|kind| kind != "agentMessage") {
+                                    continue;
+                                }
+                            }
                             if path.len() > 7
                                 || (path.len() == 7 && path[6].as_str() != Some("text"))
                             {
+                                if path.len() == 7
+                                    && matches!(
+                                        path[6].as_str(),
+                                        Some(
+                                            "startedAtMs"
+                                                | "completedAtMs"
+                                                | "phase"
+                                                | "memoryCitation"
+                                                | "delivery"
+                                                | "questions"
+                                        )
+                                    )
+                                {
+                                    continue;
+                                }
                                 p.invalid.insert(entity.to_owned());
                                 continue;
                             }
@@ -868,7 +957,26 @@ impl BodyPatchTracker {
                                 });
                             }
                         }
-                        Some("params") => {}
+                        // 实机观察到的完成标记、工具计时和 hook 元数据不改变正文。
+                        // 回合身份、状态和 items 仍由各自分支严格检查。
+                        Some(
+                            "params"
+                            | "completedItemIds"
+                            | "commandExecutionStartedAtMsById"
+                            | "hookRuns"
+                            | "durationMs"
+                            | "turnStartedAtMs"
+                            | "finalAssistantStartedAtMs"
+                            | "firstTurnWorkItemStartedAtMs"
+                            | "aeonAssistantMessageStartedAtMsById"
+                            | "agentMessageCompletedAtMsById"
+                            | "diff"
+                            | "localMetadata"
+                            | "requestedReasoningEffort"
+                            | "mcpAppModelContextAttachments"
+                            | "automationKind"
+                            | "automationNotificationDecision",
+                        ) => {}
                         Some(_) | None => {
                             p.invalid.insert(entity.to_owned());
                         }
@@ -1143,6 +1251,207 @@ impl BodyPatchTracker {
 mod patch_tests {
     use super::*;
     use serde_json::json;
+    #[test]
+    fn reasoning_and_tool_updates_do_not_retire_body_turn() {
+        let mut state = json!({"turnHistory":{"history":{"isComplete":true,"islands":[{"entries":[{"value":"turn:x"}]}],"entitiesByKey":{"turn:x":{"turnId":"x","status":"inProgress","items":[{"type":"reasoning","id":"r","summary":[{"text":""}]},{"type":"commandExecution","id":"c","status":"inProgress"}]}}}}});
+        let mut tracker = BodyPatchTracker::default();
+        tracker.baseline(&state);
+        for (index, tail, value) in [
+            (
+                0,
+                vec![json!("summary"), json!(0), json!("text")],
+                json!("synthetic reasoning"),
+            ),
+            (1, vec![json!("status")], json!("completed")),
+        ] {
+            let mut path = vec![
+                json!("turnHistory"),
+                json!("history"),
+                json!("entitiesByKey"),
+                json!("turn:x"),
+                json!("items"),
+                json!(index),
+            ];
+            path.extend(tail);
+            let prepared = tracker.prepare(
+                &state,
+                &json!({"patches":[{"op":"replace","path":path,"value":value}]}),
+            );
+            if index == 0 {
+                state["turnHistory"]["history"]["entitiesByKey"]["turn:x"]["items"][0]["summary"]
+                    [0]["text"] = value;
+            } else {
+                state["turnHistory"]["history"]["entitiesByKey"]["turn:x"]["items"][1]["status"] =
+                    value;
+            }
+            assert!(
+                tracker.finish(&state, prepared).is_empty(),
+                "non-body updates must not invalidate the turn"
+            );
+        }
+        for field in [
+            "completedItemIds",
+            "commandExecutionStartedAtMsById",
+            "hookRuns",
+            "durationMs",
+            "turnStartedAtMs",
+            "finalAssistantStartedAtMs",
+            "firstTurnWorkItemStartedAtMs",
+            "aeonAssistantMessageStartedAtMsById",
+            "agentMessageCompletedAtMsById",
+            "diff",
+            "localMetadata",
+            "requestedReasoningEffort",
+            "mcpAppModelContextAttachments",
+            "automationKind",
+            "automationNotificationDecision",
+        ] {
+            let change = json!({"patches":[{"op":"add","path":["turnHistory","history","entitiesByKey","turn:x",field],"value":{}}]});
+            let prepared = tracker.prepare(&state, &change);
+            state["turnHistory"]["history"]["entitiesByKey"]["turn:x"][field] = json!({});
+            assert!(
+                tracker.finish(&state, prepared).is_empty(),
+                "observed bookkeeping fields must not invalidate the turn"
+            );
+        }
+        let change = json!({"patches":[{"op":"add","path":["turnHistory","history","entitiesByKey","turn:x","items",2],"value":{"type":"agentMessage","id":"new","text":""}}]});
+        let prepared = tracker.prepare(&state, &change);
+        state["turnHistory"]["history"]["entitiesByKey"]["turn:x"]["items"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"type":"agentMessage","id":"new","text":""}));
+        assert!(tracker
+            .finish(&state, prepared)
+            .iter()
+            .any(|e| matches!(e,BodyChange::EmptyItem{item_id,..} if item_id=="new")));
+        for field in [
+            "startedAtMs",
+            "completedAtMs",
+            "phase",
+            "memoryCitation",
+            "delivery",
+            "questions",
+        ] {
+            let change = json!({"patches":[{"op":"add","path":["turnHistory","history","entitiesByKey","turn:x","items",2,field],"value":null}]});
+            let prepared = tracker.prepare(&state, &change);
+            state["turnHistory"]["history"]["entitiesByKey"]["turn:x"]["items"][2][field] =
+                json!(null);
+            assert!(
+                tracker.finish(&state, prepared).is_empty(),
+                "body metadata must not invalidate the turn"
+            );
+        }
+        let prepared=tracker.prepare(&state,&json!({"patches":[{"op":"replace","path":["turnHistory","history","entitiesByKey","turn:x","status"],"value":"completed"}]}));
+        state["turnHistory"]["history"]["entitiesByKey"]["turn:x"]["status"] = json!("completed");
+        assert!(
+            tracker.finish(&state, prepared).iter().any(|e| matches!(
+                e,
+                BodyChange::TurnTerminal {
+                    completed: true,
+                    ..
+                }
+            )),
+            "completion remains observable after metadata updates"
+        );
+    }
+    #[test]
+    fn baseline_existing_turn_observes_only_new_empty_item() {
+        let mut state = json!({"turnHistory":{"history":{"isComplete":true,"islands":[{"entries":[{"value":"turn:x"}]}],"entitiesByKey":{"turn:x":{"turnId":"x","status":"inProgress","items":[{"type":"agentMessage","id":"old","text":"existing"}]}}}}});
+        let mut tracker = BodyPatchTracker::default();
+        tracker.baseline(&state);
+        let change = json!({"patches":[{"op":"add","path":["turnHistory","history","entitiesByKey","turn:x","items",1],"value":{"type":"agentMessage","id":"new","text":""}}]});
+        let prepared = tracker.prepare(&state, &change);
+        state["turnHistory"]["history"]["entitiesByKey"]["turn:x"]["items"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"type":"agentMessage","id":"new","text":""}));
+        let events = tracker.finish(&state, prepared);
+        assert!(events.iter().any(|event|matches!(event,BodyChange::EmptyItem{turn_id,item_id,..} if turn_id=="x" && item_id=="new")));
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event,BodyChange::EmptyItem{item_id,..} if item_id=="old")));
+    }
+    #[test]
+    fn rebaseline_never_continues_old_item_but_finishes_new_item() {
+        use crate::services::tps::body_observer::BodyObserver;
+        for scenario in ["initial", "reconnect", "lost"] {
+            let mut state = json!({"turnHistory":{"history":{"isComplete":true,"islands":[{"entries":[{"value":"turn:x"}]}],"entitiesByKey":{"turn:x":{"turnId":"x","status":"inProgress","items":[{"type":"agentMessage","id":"old","text":"already present"}]}}}}});
+            let mut tracker = BodyPatchTracker::default();
+            tracker.baseline(&state);
+            let mut scope = CaptureScope {
+                capture_generation: 1,
+                owner_epoch: 1,
+                owner_generation: 1,
+                host_key: "h".into(),
+                thread_key: "t".into(),
+            };
+            let mut observer = BodyObserver::default();
+            if scenario != "initial" {
+                observer.on_frame(BodyFrame {
+                    scope: scope.clone(),
+                    revision: 1,
+                    clock: CaptureClock {
+                        mono_ns: 1,
+                        wall_ms: 1,
+                    },
+                    changes: vec![BodyChange::Baseline],
+                });
+                observer.on_frame(BodyFrame {
+                    scope: scope.clone(),
+                    revision: 2,
+                    clock: CaptureClock {
+                        mono_ns: 2,
+                        wall_ms: 2,
+                    },
+                    changes: vec![BodyChange::EmptyItem {
+                        turn_id: "x".into(),
+                        item_id: "old".into(),
+                        model: None,
+                        channel: None,
+                    }],
+                });
+                observer.on_frame(BodyFrame {
+                    scope: scope.clone(),
+                    revision: 3,
+                    clock: CaptureClock {
+                        mono_ns: 3,
+                        wall_ms: 3,
+                    },
+                    changes: vec![BodyChange::Append {
+                        turn_id: "x".into(),
+                        item_id: "old".into(),
+                        text: "already present".into(),
+                    }],
+                });
+                if scenario == "lost" {
+                    observer.invalidate(&scope);
+                } else {
+                    scope.owner_epoch += 1;
+                }
+            }
+            observer.on_frame(BodyFrame {
+                scope: scope.clone(),
+                revision: 1,
+                clock: CaptureClock {
+                    mono_ns: 1,
+                    wall_ms: 1,
+                },
+                changes: vec![BodyChange::Baseline],
+            });
+            for (step,patch) in [
+                json!({"op":"add","path":["turnHistory","history","entitiesByKey","turn:x","items",1],"value":{"type":"agentMessage","id":"new","text":""}}),
+                json!({"op":"replace","path":["turnHistory","history","entitiesByKey","turn:x","items",1,"text"],"value":"one"}),
+                json!({"op":"replace","path":["turnHistory","history","entitiesByKey","turn:x","items",1,"text"],"value":"one two"}),
+                json!({"op":"replace","path":["turnHistory","history","entitiesByKey","turn:x","status"],"value":"completed"}),
+            ].into_iter().enumerate() {
+                let prepared=tracker.prepare(&state,&json!({"patches":[patch]}));
+                match step { 0=>state["turnHistory"]["history"]["entitiesByKey"]["turn:x"]["items"].as_array_mut().unwrap().push(json!({"type":"agentMessage","id":"new","text":""})), 1=>state["turnHistory"]["history"]["entitiesByKey"]["turn:x"]["items"][1]["text"]=json!("one"), 2=>state["turnHistory"]["history"]["entitiesByKey"]["turn:x"]["items"][1]["text"]=json!("one two"), _=>state["turnHistory"]["history"]["entitiesByKey"]["turn:x"]["status"]=json!("completed") }
+                let changes=tracker.finish(&state,prepared);
+                let result=observer.on_frame(BodyFrame{scope:scope.clone(),revision:step as u64+2,clock:CaptureClock{mono_ns:(step as u64+2)*1000,wall_ms:step as i64+2},changes});
+                if step==3 {assert_eq!(result.len(),1);assert_eq!(result[0].item_id,"new");assert_eq!(result[0].text,"one two");} else {assert!(result.is_empty());}
+            }
+        }
+    }
     #[test]
     fn multiple_text_ops_in_one_frame_append_once() {
         let state = json!({"turnHistory":{"history":{"isComplete":true,"islands":[{"entries":[{"value":"turn:x"}]}],"entitiesByKey":{"turn:x":{"turnId":"x","status":"inProgress","items":[{"type":"agentMessage","id":"i","text":"a"}]}}}}});

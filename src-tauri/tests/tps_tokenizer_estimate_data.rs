@@ -187,3 +187,40 @@ fn single_body_demo_uses_last_growth_not_late_confirmation() {
     );
     assert!(bucket["endMs"].as_i64().unwrap() < confirmed_at);
 }
+
+#[test]
+fn estimate_selection_obeys_tool_and_search_filters() {
+    let c = support::open_ledger_db("estimate-selection-filter");
+    insert(&c, "a", "p1", 100, 4000, NOW - 1);
+    let mut q = query();
+    let initial = dashboard(&c, &q, NOW).unwrap();
+    let selected = initial.selected_series.unwrap();
+    q.selection = Some(selected.clone());
+    q.tool_id = Some("claude".into());
+    let filtered = dashboard(&c, &q, NOW).unwrap();
+    assert!(filtered.series.is_empty());
+    assert!(
+        filtered.selected_series.is_none(),
+        "tool filter excluded selected series"
+    );
+    assert!(filtered.buckets.is_empty());
+    q.tool_id = None;
+    q.search = "does-not-match".into();
+    let filtered = dashboard(&c, &q, NOW).unwrap();
+    assert!(filtered.series.is_empty());
+    assert!(
+        filtered.selected_series.is_none(),
+        "search excluded selected series"
+    );
+    assert!(filtered.buckets.is_empty());
+    q.search = "gpt-test".into();
+    let mut missing = selected;
+    missing.model = "gpt-test-missing".into();
+    q.selection = Some(missing.clone());
+    let allowed = dashboard(&c, &q, NOW).unwrap();
+    assert_eq!(allowed.selected_series, Some(missing));
+    assert!(allowed
+        .buckets
+        .iter()
+        .all(|b| b.metrics.tokenizer_estimate.sample_count == 0));
+}

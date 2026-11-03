@@ -58,11 +58,17 @@ impl BodyObserver {
             budget,
         }
     }
+    /// 丢弃候选正文并归还全局字节预算；revision 缺口与基线重建共用。
+    /// bytes 与 streams 是不相交字段，借用分离以在帧处理中途调用。
+    fn clear_stream(bytes: &mut usize, stream: &mut Stream) {
+        *bytes = bytes.saturating_sub(stream.items.values().map(|c| c.text.len()).sum::<usize>());
+        stream.items.clear();
+        stream.invalid.clear();
+        stream.terminal.clear();
+    }
     pub fn invalidate(&mut self, scope: &CaptureScope) {
-        if let Some(old) = self.streams.remove(scope) {
-            self.bytes = self
-                .bytes
-                .saturating_sub(old.items.values().map(|c| c.text.len()).sum::<usize>());
+        if let Some(mut old) = self.streams.remove(scope) {
+            Self::clear_stream(&mut self.bytes, &mut old);
         }
     }
     pub fn on_frame(&mut self, frame: BodyFrame) -> Vec<FinishedBody> {
@@ -104,12 +110,7 @@ impl BodyObserver {
         if stream.revision.is_some_and(|r| {
             frame.revision <= r || (!verified_base && frame.revision != r.saturating_add(1))
         }) {
-            self.bytes = self
-                .bytes
-                .saturating_sub(stream.items.values().map(|c| c.text.len()).sum::<usize>());
-            stream.items.clear();
-            stream.invalid.clear();
-            stream.terminal.clear();
+            Self::clear_stream(&mut self.bytes, stream);
             stream.revision = None;
         }
         let baseline = frame
@@ -117,12 +118,7 @@ impl BodyObserver {
             .iter()
             .any(|c| matches!(c, BodyChange::Baseline));
         if baseline {
-            self.bytes = self
-                .bytes
-                .saturating_sub(stream.items.values().map(|c| c.text.len()).sum::<usize>());
-            stream.items.clear();
-            stream.invalid.clear();
-            stream.terminal.clear();
+            Self::clear_stream(&mut self.bytes, stream);
             stream.revision = Some(frame.revision);
             return Vec::new();
         }

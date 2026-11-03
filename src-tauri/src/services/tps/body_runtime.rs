@@ -16,6 +16,13 @@ pub type BeforeCommitHook = Arc<dyn Fn() + Send + Sync>;
 pub type CommitSink =
     Arc<dyn Fn(&EstimateFact, &CapturePermit) -> Result<bool, UsageError> + Send + Sync>;
 type BuildSource = Arc<dyn Fn(u64) -> Option<String> + Send + Sync>;
+/// 把共享数据库连接包装成提交出口；三条构造路径共用同一提交语义。
+fn db_sink(db: Arc<Mutex<Connection>>) -> CommitSink {
+    Arc::new(move |fact, permit| {
+        let mut conn = db.lock().unwrap_or_else(|e| e.into_inner());
+        commit_estimate(&mut conn, fact, permit)
+    })
+}
 struct Job {
     body: FinishedBody,
     plaintext: super::estimate_store::PlaintextGuard,
@@ -90,14 +97,11 @@ impl BodyRuntime {
         before_tokenize: Option<BeforeCommitHook>,
         before_commit: Option<BeforeCommitHook>,
     ) -> Self {
-        let sink: CommitSink = Arc::new(move |fact, permit| {
-            let mut conn = db.lock().unwrap_or_else(|e| e.into_inner());
-            commit_estimate(&mut conn, fact, permit)
-        });
-        Self::with_sink(sink, gate, before_tokenize, before_commit)
+        Self::with_sink(db_sink(db), gate, before_tokenize, before_commit)
     }
     #[cfg(target_os = "macos")]
     fn production(gate: CaptureGate) -> Self {
+        // 全局 DB 是 Lazy 静态而非 Arc，锁来源与测试路径不同。
         let sink: CommitSink = Arc::new(|fact, permit| {
             let mut conn = crate::database::connection::DB
                 .lock()
@@ -111,11 +115,7 @@ impl BodyRuntime {
         gate: CaptureGate,
         hook: Option<BeforeCommitHook>,
     ) -> Self {
-        let sink: CommitSink = Arc::new(move |fact, permit| {
-            let mut conn = db.lock().unwrap_or_else(|e| e.into_inner());
-            commit_estimate(&mut conn, fact, permit)
-        });
-        Self::with_sink(sink, gate, None, hook)
+        Self::with_sink(db_sink(db), gate, None, hook)
     }
     fn with_sink(
         sink: CommitSink,
@@ -444,6 +444,18 @@ async fn capture_loop(
     worker.shutdown().await;
 }
 
+/// 把预算拒收的增量并入诊断计数，返回新的已记账水位。
+fn record_budget_drops(
+    counter: &std::sync::atomic::AtomicU64,
+    budget: &crate::services::codex_desktop_ipc::observation::SharedBodyBudget,
+    recorded: u64,
+) -> u64 {
+    use std::sync::atomic::Ordering;
+    let rejected = budget.rejections();
+    counter.fetch_add(rejected.saturating_sub(recorded), Ordering::Relaxed);
+    rejected
+}
+
 async fn capture_inner(
     context: &CaptureContext,
     worker: &BodyRuntime,
@@ -533,12 +545,11 @@ async fn capture_inner(
                     }
                 },
             }
-            let rejected = budget.rejections();
-            worker.counters.budget_drops.fetch_add(
-                rejected.saturating_sub(recorded_budget_rejections),
-                std::sync::atomic::Ordering::Relaxed,
+            recorded_budget_rejections = record_budget_drops(
+                &worker.counters.budget_drops,
+                &budget,
+                recorded_budget_rejections,
             );
-            recorded_budget_rejections = rejected;
             if source_closed || *stop.borrow() || !permit.is_current() {
                 break;
             }
@@ -597,10 +608,10 @@ async fn capture_inner(
         }
         joins.abort_all();
         events.close_and_wait().await;
-        let rejected = budget.rejections();
-        worker.counters.budget_drops.fetch_add(
-            rejected.saturating_sub(recorded_budget_rejections),
-            std::sync::atomic::Ordering::Relaxed,
+        record_budget_drops(
+            &worker.counters.budget_drops,
+            &budget,
+            recorded_budget_rejections,
         );
         drop(observer);
         drop(events);
