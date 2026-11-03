@@ -1,7 +1,9 @@
 //! WorkBuddy 原生 TPS 读取器（Spec §4 WorkBuddy 行；证据：
 //! probes/2026-10-24-model-speed-supplement-macos.md §4.4/§11.2 —— Mac 5.8.3 正常路线
 //! `qua.end` 单行全量载荷；probes/2026-10-24-model-speed-supplement-windows.md §7.5 ——
-//! Windows 正常路线 `usage_update` 只有 `hasUsage=true` 而无数值 usage）。
+//! Windows sdk/conversations 路线 `usage_update` 只有 `hasUsage=true` 而无数值 usage；
+//! probes/2026-11-02-workbuddy-qua-zhcn-prefix.md —— Windows qua 路线数值齐全、
+//! 行前缀时刻随系统区域变化（zh-CN 为 `YYYY/M/D 24h` 形态））。
 //!
 //! ## 数值归一与响应窗（Spec §9；V2 Task 2）
 //!
@@ -19,18 +21,20 @@
 //! 单独可用由 Task 1 谓词把关）。失败/取消照发事实（outcome 判定不变），两个速度
 //! 谓词天然判伪。
 //!
-//! ## 游标版本与旧 EOF 恢复（Spec §9；迁移纪律）
+//! ## 游标版本与解析口径修复后的旧 EOF 恢复（Spec §9；迁移纪律）
 //!
-//! 旧实现把 v1 游标推进到 EOF 时可能**零事实**（全部字符串数值行被跳过）。游标加
-//! `format_version`（serde 字段默认 1：旧游标缺字段反序列化即 v1；本实现新写/推进恒为
-//! 2）。读到**真实存在的 v1 游标**（空游标 = 全新安装，直接 v2 起步无历史可恢复）→
+//! 旧实现把游标推进到 EOF 时可能**零事实**（v1：整数字符串数值行被归一拒绝而跳过；
+//! v2：zh-CN 区域的 qua 行前缀时刻解析不出而整行跳过——2026-11-02 实机缺口）。游标加
+//! `format_version`（serde 字段默认 1：旧游标缺字段反序列化即 v1；v2 = 数值归一修复、
+//! v3 = 行前缀区域形态修复；本实现新写/推进恒为 [`CURSOR_FORMAT_VERSION`]）。读到
+//! **版本号低于当前的真实游标**（空游标 = 全新安装，直接当前版本起步无历史可恢复）→
 //! 触发**本来源一次性有界恢复**：枚举读取器已知的 qua 日志，**stat 预过滤**只留 mtime
 //! 在 24h 新鲜窗内的文件（超窗不打开——AGENTS 反模式禁令：窗口判定先于打开），从字节
 //! 0 重新经 `read_tail` 逐轮消费（单轮 ≤8MiB 字节、≤200 观察，残行不越过）；每轮把
 //! 「事实 + 恢复进度（待恢复队列 + 各文件字节界）」随 ReadBatch 交给调用方同事务提交
 //!（`store::commit_batch`），提交失败水位原样、下轮从检查点续跑；全部文件到 EOF 后
-//! 游标升 v2，此后只消费追加字节、绝不反复全读。稳定键 UPSERT 使重放幂等；只恢复 TPS
-//! 事实，不碰旧 Token/费用游标与其他来源游标。
+//! 游标升至 [`CURSOR_FORMAT_VERSION`]，此后只消费追加字节、绝不反复全读。稳定键 UPSERT
+//! 使重放幂等；只恢复 TPS 事实，不碰旧 Token/费用游标与其他来源游标。
 //!
 //! ## 读取对象与口径
 //!
@@ -43,7 +47,7 @@
 //!   request_type` 身份字段（supplement-macos §4.4 字段清单）。
 //!   生成窗 = `total_cost_ms − ttft_ms`（算式源码直读：ttft 以请求起点为锚、正文/思考窗
 //!   天生分开，Spec §4「同请求 completion_tokens/(total_cost_ms−ttft_ms)」）；
-//!   结束时刻 = 日志行前缀的 RFC3339 毫秒时刻（**绝不**拿文件 mtime 当事件时刻）；
+//!   结束时刻 = 日志行前缀时刻（已证形态见 `line_time_ms`；**绝不**拿文件 mtime 当事件时刻）；
 //!   `started = ended − total_cost_ms`；`first_token = started + ttft_ms`；
 //!   `native_duration = total_cost_ms`。
 //! * **入速核对**（Spec §4「核对成功 finish、model/request 身份一致」）：finish_reason
@@ -51,10 +55,14 @@
 //!   实测）；`finish_flag=canceled` → Cancelled；`model_error` 非空 → Failed；
 //!   未知 finish_reason → 跳过不猜。身份四元组（conversation_id / conversation_request_id /
 //!   message_id / model）缺一 → 不入速跳过 + 诊断。
-//! * **Windows 正常路线 = insufficient-evidence 缺口态**（supplement-windows §7.5 定论
-//!   「有时刻、无 token」）：sdk/conversations 日志的 `usage_update` 只含 `hasUsage=true`
-//!   标志、无任何数值 token → 该路线**不产观察、不入速**，来源状态明示缺口；
-//!   **绝不借旧 CLI 样本或任何别的路线数据凑值**（Spec §4 WorkBuddy 行）。
+//! * **Windows sdk 路线 = insufficient-evidence 缺口态**（supplement-windows §7.5 定论
+//!   「有时刻、无 token」，2026-11-02 复测仍成立）：sdk/conversations 日志的 `usage_update`
+//!   只含 `hasUsage=true` 标志、无任何数值 token → 该路线**不产观察、不入速**，来源状态
+//!   明示缺口；**绝不借旧 CLI 样本或任何别的路线数据凑值**（Spec §4 WorkBuddy 行）。
+//! * **Windows qua 路线 = 已证带数值**（probes/2026-11-02-workbuddy-qua-zhcn-prefix.md）：
+//!   桌面端 qua.end 与 Mac 同构（整数字符串数值，归一已兼容）；行前缀时刻形态随系统
+//!   区域变化（en-US 12h / zh-CN 24h），解析只认已证形态（见 `line_time_ms`），未证形态
+//!   跳过不猜。
 //! * qua 行缺数值 `completion_tokens`（如只有 `hasUsage:true` 标志）：成功事实保留
 //!   （output=None 记缺失不报 0），绝不入速。
 //! * 输出语义：`completion_tokens` 为供应商总数（含思考与工具参数，supplement-macos §11.2
@@ -70,8 +78,8 @@
 //! * 逐文件游标 = 已消费字节界 + 行检查点，装在 SourceCursor.value 随 ReadBatch 返回；
 //!   **残缺尾行不越过**；文件收缩重读；24h 新鲜窗内才打开无水位的日志；单批发射上限 200。
 //! * 日志行的行前缀为日志框架文本（真机 `[Info] [pid=…]` 形态）：本读取器按
-//!   `agent.sse.qua.end` 标记定位行、取行内 JSON 载荷、在前几个空白分隔 token 里解析
-//!   RFC3339 时刻——对前缀文案的具体形态保持宽容（载荷字段名以证据清单为准）。
+//!   `qua.end` 标记定位行、取行内 JSON 载荷、按已证区域形态解析行前缀时刻（见
+//!   `line_time_ms`；未证形态跳过并诊断，不做宽容猜测）。
 //! * `tool_ms` 恒空：qua 行无工具执行时长字段（工具等待在模型窗之外，无原生归属键）。
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -90,33 +98,39 @@ use crate::services::usage::error::UsageError;
 /// 来源 id（与 `UsageSourceId::WorkBuddy.db_id()` 同串）
 pub const SOURCE_ID: &str = "workbuddy";
 
+/// 游标格式版本：v1 = 旧实现（无数值归一，EOF 即终点）；v2 = 整数字符串归一修复后的
+/// 有界恢复起点；v3 = qua 行前缀区域形态（zh-CN `YYYY/M/D 24h`）修复后的有界恢复起点。
+/// serde 字段缺省恒为 1（旧文件语义），结构体缺省跟随本常量（新起点语义）。
+const CURSOR_FORMAT_VERSION: u32 = 3;
+
 /// 新鲜窗 = 事实保留窗（24h）
 const FRESH_WINDOW_MS: i64 = crate::services::tps::store::TPS_RETENTION_MS;
 
 /// 单批发射上限（与 commit_batch 的硬闸同源）
 const BATCH_CAP: usize = TPS_BATCH_MAX_ROWS;
 
-/// 来源限制说明（sourceState.detail，如实申报；Windows 路线缺口逐字含
+/// 来源限制说明（sourceState.detail，如实申报；sdk 路线缺口逐字含
 /// insufficient-evidence，Spec §4「缺失时该路线返回 insufficient-evidence」）
-const SOURCE_LIMITS: &str = "insufficient-evidence: Windows 正常桌面路线 usage_update 只有 hasUsage=true 而无数值 usage，该路线不入速，绝不借旧 CLI 样本凑值（需联到同请求数值 usage 后按新证据启用）；qua 路线覆盖 Mac 5.8.3 正常流式，tool_ms 恒空（无原生工具时长）";
+const SOURCE_LIMITS: &str = "insufficient-evidence: sdk/conversations 路线 usage_update 只有 hasUsage=true 无数值 usage，不入速，绝不借旧 CLI 样本凑值；qua 路线 Mac/Windows 均已证带数值（2026-11-02 zh-CN 实机），行前缀时刻仅认已证形态（RFC3339 / [M/D/YYYY, h:mm:ss AM|PM.mmm] / [YYYY/M/D H:MM:SS.mmm]），未证形态跳过不猜；tool_ms 恒空（无原生工具时长）";
 
 // ==== 游标状态（装在 SourceCursor.value；反序列化失败归零重读——重读的观察以稳定键
 //      UPSERT 幂等，不产生双计）====
 //
 // 版本语义（Spec §9 迁移纪律）：`format_version` 的 **serde 字段默认 = 1**——旧实现写下
-// 的游标没有这个字段，反序列化即 v1，读到 v1 触发一次有界 24h 恢复；本实现新写/推进的
-// 游标恒为 2。全新安装（空游标）走 [`WbCursorState::default`] 直接 v2 起步。两个默认值
-// 刻意不同：字段级缺省=1（旧文件语义）、结构体级缺省=2（新起点语义）。
+// 的游标没有这个字段，反序列化即 v1，版本号低于 [`CURSOR_FORMAT_VERSION`] 即触发一次
+// 有界 24h 恢复；本实现新写/推进的游标恒为 [`CURSOR_FORMAT_VERSION`]。全新安装（空游标）
+// 走 [`WbCursorState::default`] 直接当前版本起步。两个默认值刻意不同：字段级缺省=1（旧
+// 文件语义）、结构体级缺省=当前版本（新起点语义）。
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct WbCursorState {
-    /// 游标格式版本：旧游标缺字段 → 1（触发有界恢复）；本实现写入恒为 2
+    /// 游标格式版本：旧游标缺字段 → 1（触发有界恢复）；本实现写入恒为 [`CURSOR_FORMAT_VERSION`]
     #[serde(default = "legacy_format_version")]
     format_version: u32,
     /// 日志文件（绝对路径串）→ 已消费字节界与行检查点
     #[serde(default)]
     files: BTreeMap<String, FilePos>,
-    /// 恢复中（v1→v2 迁移）状态；恢复完成后置空并升 v2
+    /// 恢复中（旧版→当前版本迁移）状态；恢复完成后置空并升至当前版本
     #[serde(default)]
     recovery: Option<RecoveryState>,
 }
@@ -129,7 +143,7 @@ fn legacy_format_version() -> u32 {
 impl Default for WbCursorState {
     fn default() -> Self {
         Self {
-            format_version: 2,
+            format_version: CURSOR_FORMAT_VERSION,
             files: BTreeMap::new(),
             recovery: None,
         }
@@ -212,11 +226,11 @@ pub fn read_incremental(
     let mut parse_errors: BTreeMap<String, usize> = BTreeMap::new();
     let mut budget = BATCH_CAP;
 
-    // ==== v1→v2 一次性有界恢复（Spec §9；见模块头「游标版本与旧 EOF 恢复」）====
-    // 触发条件 = 输入是一份真实存在的旧版游标（非空、反序列化为 v1）。恢复集在本轮选定：
+    // ==== 旧版游标一次性有界恢复（Spec §9；见模块头「游标版本」）====
+    // 触发条件 = 输入是一份真实存在的旧版游标（非空、版本号低于当前）。恢复集在本轮选定：
     // 只取 qua 路线（sdk/conversations 本就不产观察），**stat mtime 24h 新鲜窗预过滤发生在
     // 打开内容之前**；选定文件的字节界归零（从字节 0 重读），之后每轮消费到哪、进度记到哪。
-    let recovering = !cursor.value.is_empty() && state.format_version < 2;
+    let recovering = !cursor.value.is_empty() && state.format_version < CURSOR_FORMAT_VERSION;
     if recovering && state.recovery.is_none() {
         let mut pending: Vec<String> = Vec::new();
         for c in &candidates {
@@ -267,14 +281,14 @@ pub fn read_incremental(
     if let Some(r) = state.recovery.as_mut() {
         r.pending.retain(|k| seen_files.contains(k));
     }
-    // 恢复完成 → 升 v2（此后 read_incremental 不再进恢复分支，只消费追加字节）
+    // 恢复完成 → 升至当前版本（此后 read_incremental 不再进恢复分支，只消费追加字节）
     if state
         .recovery
         .as_ref()
         .is_some_and(|r| r.pending.is_empty())
     {
         state.recovery = None;
-        state.format_version = 2;
+        state.format_version = CURSOR_FORMAT_VERSION;
     }
 
     let parse_error_total: usize = parse_errors.values().sum();
@@ -481,7 +495,7 @@ fn apply_qua_line(
         record_parse_error(parse_errors, "payload", "bad-json");
         return;
     };
-    // 结束时刻 = 日志行前缀时刻（真机 `[M/D/YYYY, h:mm:ss AM|PM.mmm]` 本地时间，RFC3339 兼容；
+    // 结束时刻 = 日志行前缀时刻（已证区域形态见 `line_time_ms` 文档；
     // 绝不拿文件 mtime 当事件时刻）
     let Some(ended_at_ms) = line_time_ms(line) else {
         diag(tally, "qua.end 行无可解析时刻前缀 → 跳过（不造时刻）");
@@ -703,20 +717,27 @@ fn line_json_payload(line: &str, marker: &str) -> Option<serde_json::Value> {
     serde_json::from_str(&rest[open..=close]).ok()
 }
 
-/// 行前缀时刻（独立复核 R4）：真机日志框架每行以 `[M/D/YYYY, h:mm:ss AM|PM.mmm]` 开头
-///（如 `[9/3/2026, 10:03:57 PM.945]`——12 小时制、毫秒缀在 AM/PM 之后、**无时区偏移**），
-/// 先按该形态解析并以**本地时区**解释（日志由本机进程按本地钟写入；DST 歧义取较早者）；
-/// 再回退 RFC3339 兼容。两者都解不出 → None，调用方诊断跳过——绝不拿文件 mtime 冒充事件时刻。
+/// 行前缀时刻（独立复核 R4）：真机日志框架每行以 `[…]` 开头，时刻形态随系统区域变化，
+/// 已证两种——en-US `[M/D/YYYY, h:mm:ss AM|PM.mmm]`（12 小时制、毫秒缀在 AM/PM 之后）、
+/// zh-CN `[YYYY/M/D H:MM:SS.mmm]`（24 小时制，2026-11-02 实机证据）。先按已证形态解析并以
+/// **本地时区**解释（日志由本机进程按本地钟写入；DST 歧义取较早者）；再回退 RFC3339 兼容。
+/// 全部解不出 → None，调用方诊断跳过——绝不拿文件 mtime 冒充事件时刻、绝不猜未证形态。
 fn line_time_ms(line: &str) -> Option<i64> {
     parse_bracketed_local_prefix(line).or_else(|| parse_rfc3339_prefix(line))
 }
 
-/// `[M/D/YYYY, h:mm:ss AM|PM.mmm]` → 本地时区毫秒时刻；任一字段形态不符 → None（不猜）
+/// `[…]` 内文本按已证区域形态解析（en-US 在前、zh-CN 兜底；两形态互斥不会误吸）
 fn parse_bracketed_local_prefix(line: &str) -> Option<i64> {
-    use chrono::TimeZone;
     let rest = line.strip_prefix('[')?;
     let close = rest.find(']')?;
-    let (date, time) = rest[..close].split_once(',')?;
+    let inner = &rest[..close];
+    parse_mdy_ampm_local(inner).or_else(|| parse_ymd24_local(inner))
+}
+
+/// `[M/D/YYYY, h:mm:ss AM|PM.mmm]` → 本地时区毫秒时刻；任一字段形态不符 → None（不猜）
+fn parse_mdy_ampm_local(inner: &str) -> Option<i64> {
+    use chrono::TimeZone;
+    let (date, time) = inner.split_once(',')?;
     let mut dp = date.trim().split('/');
     let month: u32 = dp.next()?.parse().ok()?;
     let day: u32 = dp.next()?.parse().ok()?;
@@ -742,6 +763,38 @@ fn parse_bracketed_local_prefix(line: &str) -> Option<i64> {
         "PM" => hour12 % 12 + 12,
         _ => return None,
     };
+    let naive = chrono::NaiveDate::from_ymd_opt(year, month, day)?
+        .and_hms_milli_opt(hour, minute, second, millis)?;
+    chrono::Local
+        .from_local_datetime(&naive)
+        .earliest()
+        .map(|d| d.timestamp_millis())
+}
+
+/// `[YYYY/M/D H:MM:SS.mmm]` → 本地时区毫秒时刻（zh-CN Windows 实机形态，2026-11-02
+/// 取证：24 小时制、毫秒必有）；任一字段形态不符 → None（不猜）
+fn parse_ymd24_local(inner: &str) -> Option<i64> {
+    use chrono::TimeZone;
+    let (date, clock_ms) = inner.split_once(' ')?;
+    let mut dp = date.split('/');
+    let year: i32 = dp.next()?.parse().ok()?;
+    let month: u32 = dp.next()?.parse().ok()?;
+    let day: u32 = dp.next()?.parse().ok()?;
+    if dp.next().is_some() {
+        return None;
+    }
+    let (clock, millis) = clock_ms.split_once('.')?;
+    let mut cp = clock.split(':');
+    let hour: u32 = cp.next()?.parse().ok()?;
+    let minute: u32 = cp.next()?.parse().ok()?;
+    let second: u32 = cp.next()?.parse().ok()?;
+    if cp.next().is_some() || hour > 23 {
+        return None;
+    }
+    let millis: u32 = millis.parse().ok()?;
+    if millis > 999 {
+        return None;
+    }
     let naive = chrono::NaiveDate::from_ymd_opt(year, month, day)?
         .and_hms_milli_opt(hour, minute, second, millis)?;
     chrono::Local
@@ -801,5 +854,412 @@ fn empty_batch(cursor: &SourceCursor) -> ReadBatch {
         },
         diagnostics: Vec::new(),
         next_cursor: cursor.clone(),
+    }
+}
+
+// ==== 本模块贴身单测（主断言走 read_incremental 公开入口，与真实消费路径一致）====
+//
+// 覆盖面：行前缀时刻三形态（zh-CN / en-US / RFC3339）+ 无日期前缀跳过闸 +
+// v2 EOF 游标的有界恢复与 v3 升版 + 全新安装 v3 起步。
+// 临时 home 用 std::env::temp_dir() 下的唯一子目录，绝不触真机 ~/.tuvis / ~/.workbuddy。
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 真机 qua.end 载荷字段清单（数值字段为整数字符串形态，证据见模块头）；
+    /// message_id 为占位值，由 qua_end_line 按测试替换，保证稳定键各用例唯一
+    const QUA_END_PAYLOAD: &str = r#"{"conversation_id":"c0bb5964-d5c7-4b9d-9d45-264741ccc144","conversation_request_id":"01a19b1b800475aab1c452c34d30f7db","prompt_request_id":"1a9b748ebc55426db1132dd0ce92b589","message_id":"01a19b1b88517505b26a0fde09620cad","model":"minimax-m3.1-flash","agent_name":"cli","scene":"craft","request_type":"chat","finish_flag":"done","finish_reason":"tool_calls","model_error":"","completion_tokens":"1188","total_cost_ms":"17541","ttft_ms":"7500","prompt_tokens":"3200"}"#;
+
+    /// 独立临时 home：std::env::temp_dir() 下按测试名 + 纳秒建唯一目录（并行不串扰）
+    fn temp_home(name: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let home = std::env::temp_dir().join(format!("workbuddy-tps-{name}-{nanos}"));
+        std::fs::create_dir_all(home.join(".workbuddy").join("logs").join("2026-11-02")).unwrap();
+        home
+    }
+
+    /// 写 cli_host 日志（每行以 '\n' 结尾 = 整行完整消费），返回文件路径
+    fn write_log(home: &Path, lines: &[String]) -> PathBuf {
+        let path = home
+            .join(".workbuddy")
+            .join("logs")
+            .join("2026-11-02")
+            .join("DM_test.log");
+        let mut data = String::new();
+        for l in lines {
+            data.push_str(l);
+            data.push('\n');
+        }
+        std::fs::write(&path, data.as_bytes()).unwrap();
+        path
+    }
+
+    /// 真机形态 qua.end 行：行前缀时刻 + 日志框架文本 + qua.end 标记 + JSON 载荷
+    fn qua_end_line(prefix: &str, message_id: &str) -> String {
+        let payload = QUA_END_PAYLOAD.replace("01a19b1b88517505b26a0fde09620cad", message_id);
+        format!(
+            "{prefix} [Info] [pid=30436] [ModelProvider]  [SseMonitor#01a19b1b] qua.end: {payload}"
+        )
+    }
+
+    /// 公开入口读取（now_ms = 当前时刻；文件刚写 = 24h 新鲜窗内）
+    fn read(home: &Path, cursor: &SourceCursor) -> ReadBatch {
+        read_incremental(home, cursor, chrono::Utc::now().timestamp_millis()).unwrap()
+    }
+
+    /// 单条观察完整事实面断言（三形态前缀用例共用同一口径）：
+    /// total=17541 / ttft=7500 / completion=1188 的算式逐字段对齐
+    fn assert_full_observation(obs: &TpsObservation, message_id: &str, ended_at_ms: i64) {
+        let started = ended_at_ms - 17541;
+        assert_eq!(obs.source, "workbuddy");
+        assert_eq!(obs.stable_call_key, message_id);
+        assert_eq!(obs.ended_at_ms, ended_at_ms);
+        assert_eq!(obs.started_at_ms, started);
+        assert_eq!(obs.first_token_at_ms, Some(started + 7500));
+        assert_eq!(obs.native_duration_ms, Some(17541));
+        assert_eq!(obs.generation_ms, Some(17541 - 7500)); // 生成窗 = total − ttft
+        assert_eq!(obs.response_elapsed_ms, Some(17541)); // 响应窗 = total
+        assert_eq!(obs.output_tokens, Some(1188));
+        assert_eq!(obs.output_scope, OutputScope::IncludesReasoning);
+        assert_eq!(obs.tool_ms, None);
+        assert_eq!(
+            obs.session_key.as_deref(),
+            Some("c0bb5964-d5c7-4b9d-9d45-264741ccc144")
+        );
+        assert_eq!(
+            obs.turn_key.as_deref(),
+            Some("01a19b1b800475aab1c452c34d30f7db")
+        );
+        assert_eq!(obs.model, "minimax-m3.1-flash");
+        assert_eq!(obs.purpose, Purpose::MainTask);
+        assert_eq!(obs.outcome, Outcome::Success);
+        assert_eq!(obs.method, TimingMethod::ClientNative);
+        assert_eq!(obs.failure_reason, None);
+    }
+
+    /// zh-CN 区域前缀（`[YYYY/M/D H:MM:SS.mmm]`：24 小时制、无逗号、毫秒必有）→
+    /// 产出恰好一条完整观察。真机 zh-CN Windows 的 qua.end 全部落此形态，
+    /// 修复前全部被「行无可解析时刻前缀 → 跳过」闸丢弃（速度观察 0 条）。
+    #[test]
+    fn zh_cn_prefix_line_produces_observation() {
+        use chrono::TimeZone;
+        let home = temp_home("zh-cn");
+        let line = qua_end_line(
+            "[2026/11/2 15:14:12.917]",
+            "01a19b1b88517505b26a0fde09620cad",
+        );
+        write_log(&home, &[line]);
+        let batch = read(&home, &SourceCursor::empty(SOURCE_ID));
+        assert_eq!(
+            batch.observations.len(),
+            1,
+            "zh-CN 前缀行必须产出观察，不得被时刻前缀闸丢弃"
+        );
+        // 期望结束时刻 = 行前缀 naive 时刻的本地时区解释（与实现同式，不依赖硬编码 epoch）
+        let naive = chrono::NaiveDate::from_ymd_opt(2026, 11, 2)
+            .unwrap()
+            .and_hms_milli_opt(15, 14, 12, 917)
+            .unwrap();
+        let ended = chrono::Local
+            .from_local_datetime(&naive)
+            .earliest()
+            .unwrap()
+            .timestamp_millis();
+        assert_full_observation(
+            &batch.observations[0],
+            "01a19b1b88517505b26a0fde09620cad",
+            ended,
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// en-US 区域前缀（`[M/D/YYYY, h:mm:ss AM|PM.mmm]` 12 小时制）回归护栏：
+    /// 修复前就该绿；引入 zh-CN 形态后必须仍绿（不得破坏既有解析）。
+    #[test]
+    fn en_us_prefix_line_produces_observation() {
+        use chrono::TimeZone;
+        let home = temp_home("en-us");
+        let line = qua_end_line(
+            "[11/2/2026, 3:14:12 PM.917]",
+            "02a19b1b88517505b26a0fde09620cad",
+        );
+        write_log(&home, &[line]);
+        let batch = read(&home, &SourceCursor::empty(SOURCE_ID));
+        assert_eq!(
+            batch.observations.len(),
+            1,
+            "en-US 前缀行（既有形态）必须产出观察"
+        );
+        // 3:14:12 PM = 15:14:12.917，与 zh-CN 用例同一本地时刻（期望值同式计算）
+        let naive = chrono::NaiveDate::from_ymd_opt(2026, 11, 2)
+            .unwrap()
+            .and_hms_milli_opt(15, 14, 12, 917)
+            .unwrap();
+        let ended = chrono::Local
+            .from_local_datetime(&naive)
+            .earliest()
+            .unwrap()
+            .timestamp_millis();
+        assert_full_observation(
+            &batch.observations[0],
+            "02a19b1b88517505b26a0fde09620cad",
+            ended,
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// RFC3339 前缀回归护栏：修复前就该绿；改后必须仍绿。
+    /// 期望结束时刻 = RFC3339 字符串的 epoch 毫秒（无时区假设，逐字解析）。
+    #[test]
+    fn rfc3339_prefix_line_produces_observation() {
+        let home = temp_home("rfc3339");
+        let line = qua_end_line(
+            "2026-11-02T07:14:12.917Z",
+            "03a19b1b88517505b26a0fde09620cad",
+        );
+        write_log(&home, &[line]);
+        let batch = read(&home, &SourceCursor::empty(SOURCE_ID));
+        assert_eq!(
+            batch.observations.len(),
+            1,
+            "RFC3339 前缀行（既有形态）必须产出观察"
+        );
+        let ended = chrono::DateTime::parse_from_rfc3339("2026-11-02T07:14:12.917Z")
+            .unwrap()
+            .timestamp_millis();
+        assert_full_observation(
+            &batch.observations[0],
+            "03a19b1b88517505b26a0fde09620cad",
+            ended,
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// 只有时刻没有日期的前缀（`[15:14:12.917]`）→ 无法定位事件时刻，行被跳过：
+    /// 0 条观察、来源状态 ok（正常跳过而非读取失败——绝不造时刻）。
+    #[test]
+    fn unparseable_prefix_line_skipped() {
+        let home = temp_home("no-date");
+        let line = qua_end_line("[15:14:12.917]", "04a19b1b88517505b26a0fde09620cad");
+        write_log(&home, &[line]);
+        let batch = read(&home, &SourceCursor::empty(SOURCE_ID));
+        assert!(
+            batch.observations.is_empty(),
+            "无日期前缀不得产出观察（不猜时刻）"
+        );
+        assert!(batch.source_state.ok, "跳过是正常空态，来源状态必须 ok");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// v2 EOF 游标（offset 已到文件尾）→ 触发一次有界恢复：字节 0 重读两条 zh-CN 行
+    /// 全部产出观察；恢复完成后游标升 v3 且 recovery 清空（复用 v1→v2 迁移机制）。
+    #[test]
+    fn v2_cursor_eof_triggers_bounded_rescan_and_upgrades_v3() {
+        let home = temp_home("v2-rescan");
+        let lines = [
+            qua_end_line(
+                "[2026/11/2 15:14:12.917]",
+                "05a19b1b88517505b26a0fde09620cad",
+            ),
+            qua_end_line(
+                "[2026/11/2 15:15:30.123]",
+                "06a19b1b88517505b26a0fde09620cad",
+            ),
+        ];
+        let path = write_log(&home, &lines);
+        let size = std::fs::metadata(&path).unwrap().len();
+        // v2 EOF 游标：offset = 文件字节数（全部历史已在旧版本消费过）
+        let file_key = path.to_string_lossy().to_string();
+        let cursor = SourceCursor {
+            source: SOURCE_ID.into(),
+            value: serde_json::json!({
+                "format_version": 2,
+                "files": { file_key: {"offset": size, "skip_lines": 0} }
+            })
+            .to_string(),
+        };
+        let batch = read(&home, &cursor);
+        assert_eq!(
+            batch.observations.len(),
+            2,
+            "EOF 的 v2 游标必须触发有界恢复（退回字节 0 重读），不得把事实锁死在旧版游标里"
+        );
+        let next: serde_json::Value = serde_json::from_str(&batch.next_cursor.value).unwrap();
+        assert_eq!(
+            next["format_version"].as_u64(),
+            Some(3),
+            "恢复完成后游标必须升 v3"
+        );
+        assert!(next["recovery"].is_null(), "恢复完成后 recovery 必须清空");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// 全新安装（空游标）+ 一条 zh-CN 行 → 直接 v3 起步、无恢复（无历史可恢复）、
+    /// 恰好 1 条观察。
+    #[test]
+    fn fresh_install_starts_v3_without_recovery() {
+        let home = temp_home("fresh-v3");
+        let line = qua_end_line(
+            "[2026/11/2 15:14:12.917]",
+            "07a19b1b88517505b26a0fde09620cad",
+        );
+        write_log(&home, &[line]);
+        let batch = read(&home, &SourceCursor::empty(SOURCE_ID));
+        assert_eq!(batch.observations.len(), 1, "全新安装首读必须产出观察");
+        let next: serde_json::Value = serde_json::from_str(&batch.next_cursor.value).unwrap();
+        assert_eq!(
+            next["format_version"].as_u64(),
+            Some(3),
+            "全新安装必须直接以 v3 游标起步"
+        );
+        assert!(next["recovery"].is_null(), "全新安装无历史，不得触发恢复");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// v3 游标第二轮 = append-only 稳定（恢复幂等）：v2 EOF 游标第一轮触发有界恢复
+    /// （两条 zh-CN 行全部产出、升 v3），返回的 v3 游标**原样**喂回第二轮——0 条观察
+    /// （不再全读）、返回游标与输入逐字节一致（版本不回退、状态无抖动）。
+    #[test]
+    fn v3_cursor_second_round_is_append_only_and_stable() {
+        let home = temp_home("v3-stable");
+        let lines = [
+            qua_end_line(
+                "[2026/11/2 15:14:12.917]",
+                "08a19b1b88517505b26a0fde09620cad",
+            ),
+            qua_end_line(
+                "[2026/11/2 15:15:30.123]",
+                "09a19b1b88517505b26a0fde09620cad",
+            ),
+        ];
+        let path = write_log(&home, &lines);
+        let size = std::fs::metadata(&path).unwrap().len();
+        let file_key = path.to_string_lossy().to_string();
+        // v2 EOF 游标：offset = 文件字节数（全部历史已在旧版本消费过）
+        let v2_cursor = SourceCursor {
+            source: SOURCE_ID.into(),
+            value: serde_json::json!({
+                "format_version": 2,
+                "files": { file_key: {"offset": size, "skip_lines": 0} }
+            })
+            .to_string(),
+        };
+        // 第一轮：恢复 + 升 v3
+        let batch1 = read(&home, &v2_cursor);
+        assert_eq!(
+            batch1.observations.len(),
+            2,
+            "v2 EOF 游标必须触发有界恢复并产出全部两条观察"
+        );
+        let recovered: serde_json::Value = serde_json::from_str(&batch1.next_cursor.value).unwrap();
+        assert_eq!(
+            recovered["format_version"].as_u64(),
+            Some(3),
+            "恢复完成后游标必须升 v3"
+        );
+        assert!(
+            recovered["recovery"].is_null(),
+            "恢复完成后 recovery 必须清空"
+        );
+        // 第二轮：v3 游标原样喂回 → 只消费追加字节（本文件无追加 = 0 条）
+        let batch2 = read(&home, &batch1.next_cursor);
+        assert!(
+            batch2.observations.is_empty(),
+            "v3 游标第二轮不得再产出观察（append-only：不得反复全读）"
+        );
+        assert_eq!(
+            batch2.next_cursor.value, batch1.next_cursor.value,
+            "第二轮返回游标必须与输入逐字节一致（版本不回退、状态无抖动）"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// zh-CN 形态三条越界/缺毫秒前缀（月 13 / 时 24 / 毫秒缺失）→ 各自被诊断跳过：
+    /// 0 条观察、来源 ok、诊断恰好聚合为一条 3x「无可解析时刻前缀」（不造时刻、
+    /// 毫秒缺失不得默认 0 放行）。诊断计数同时防负向用例假绿（因其他原因被跳过）。
+    #[test]
+    fn zh_cn_malformed_prefixes_are_skipped_without_guessing() {
+        let home = temp_home("zh-cn-bad");
+        let lines = [
+            // 月越界（13 月）：
+            qua_end_line(
+                "[2026/13/1 15:14:12.917]",
+                "10a19b1b88517505b26a0fde09620cad",
+            ),
+            // hour 越界（24 点）：
+            qua_end_line(
+                "[2026/11/2 24:14:12.917]",
+                "11a19b1b88517505b26a0fde09620cad",
+            ),
+            // 毫秒缺失（已证形态毫秒必有，不得默认 0 放行）：
+            qua_end_line("[2026/11/2 15:14:12]", "12a19b1b88517505b26a0fde09620cad"),
+        ];
+        write_log(&home, &lines);
+        let batch = read(&home, &SourceCursor::empty(SOURCE_ID));
+        assert!(
+            batch.observations.is_empty(),
+            "越界/缺毫秒前缀不得产出观察（不造值）"
+        );
+        assert!(
+            batch.source_state.ok,
+            "逐行诊断跳过是正常空态，来源状态必须 ok"
+        );
+        assert_eq!(
+            batch.diagnostics.len(),
+            1,
+            "三条行的跳过必须按同原因聚合为一条诊断，不得有其他诊断混入"
+        );
+        assert!(
+            batch.diagnostics[0].contains("3x")
+                && batch.diagnostics[0].contains("无可解析时刻前缀"),
+            "诊断必须计数 3（每行各自跳过）且原因落在时刻前缀闸上：{}",
+            batch.diagnostics[0]
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// v1 旧游标（无 format_version 字段 → serde 字段缺省 = 1）与 v2 同路触发有界恢复：
+    /// 两条 zh-CN 行全部产出观察，游标升至 v3。
+    #[test]
+    fn legacy_v1_cursor_without_version_field_also_recovers() {
+        let home = temp_home("v1-rescan");
+        let lines = [
+            qua_end_line(
+                "[2026/11/2 15:14:12.917]",
+                "13a19b1b88517505b26a0fde09620cad",
+            ),
+            qua_end_line(
+                "[2026/11/2 15:15:30.123]",
+                "14a19b1b88517505b26a0fde09620cad",
+            ),
+        ];
+        let path = write_log(&home, &lines);
+        let size = std::fs::metadata(&path).unwrap().len();
+        let file_key = path.to_string_lossy().to_string();
+        // 旧实现写下的游标没有 format_version 字段（字段缺省反序列化即 v1）
+        let cursor = SourceCursor {
+            source: SOURCE_ID.into(),
+            value: serde_json::json!({
+                "files": { file_key: {"offset": size, "skip_lines": 0} }
+            })
+            .to_string(),
+        };
+        let batch = read(&home, &cursor);
+        assert_eq!(
+            batch.observations.len(),
+            2,
+            "无版本字段的旧游标必须按 v1 处理并触发有界恢复，不得把事实锁死在旧游标里"
+        );
+        let next: serde_json::Value = serde_json::from_str(&batch.next_cursor.value).unwrap();
+        assert_eq!(
+            next["format_version"].as_u64(),
+            Some(3),
+            "恢复完成后游标必须升 v3"
+        );
+        assert!(next["recovery"].is_null(), "恢复完成后 recovery 必须清空");
+        let _ = std::fs::remove_dir_all(&home);
     }
 }
