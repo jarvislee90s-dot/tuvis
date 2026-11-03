@@ -31,6 +31,7 @@ fn series_key_of(o: &TpsObservation) -> SeriesKey {
         model: o.model.clone(),
         channel: o.channel.clone(),
         method: o.method,
+        reference_profile_id: None,
     }
 }
 
@@ -457,6 +458,7 @@ mod tests {
             model: "kimi-k2".into(),
             channel: None,
             method: TimingMethod::ClientNative,
+            reference_profile_id: None,
         }
     }
 

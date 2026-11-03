@@ -10,11 +10,15 @@ export type TpsViewRange = "2m" | "10m" | "1h" | "today";
  *  V2 响应窗事实 `responseElapsedMs` 目前只在后端事实层（TpsObservation，不进 IPC）；
  *  前端消费经 V2 速度查询类型（speed.ts，Task 6/9 引入），本文件暂无观察镜像。 */
 export type TpsTimingMethod =
-  "stream-observed" | "client-native" | "native-event-approx" | "log-boundary-approx";
+  | "stream-observed"
+  | "client-native"
+  | "native-event-approx"
+  | "log-boundary-approx"
+  | "ipc-body-reference";
 
 /** 输出与思考的包含关系（Spec §3/§6；unknown = 无事实，如空窗 gap）。 */
 export type TpsOutputScope =
-  "exclusiveOutput" | "includesReasoning" | "providerReported" | "unknown";
+  "exclusiveOutput" | "includesReasoning" | "providerReported" | "visibleBody" | "unknown";
 
 /** 样本质量标记（少量 Token 标小样本）。 */
 export type TpsQuality = "normal" | "smallSample";
@@ -50,6 +54,7 @@ export interface TpsSeriesKey {
   model: string;
   channel: string | null;
   method: TpsTimingMethod;
+  referenceProfileId: string | null;
 }
 
 /** 聚合指标（Spec §6 `TpsMetrics` 逐字段镜像）。

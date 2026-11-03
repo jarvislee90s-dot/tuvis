@@ -31,6 +31,7 @@ import {
   mockTpsSnapshotResult,
   mockTpsUninstall,
   mockSpeedDashboard,
+  setMockTokenizerEstimateEnabled,
   mockUsageCollect,
   mockUsageCostCsv,
   mockUsageCosts,
@@ -243,6 +244,9 @@ export function setMockSpeedDashboard(
 
 export const tauriInvokeMock = vi.fn((cmd: string, args?: unknown) => {
   switch (cmd) {
+    case "tps_tokenizer_estimate_set_enabled":
+      setMockTokenizerEstimateEnabled((args as { enabled: boolean }).enabled);
+      return Promise.resolve();
     case "pet_list_pets":
       return Promise.resolve([]);
     case "pet_list_codex_pets":

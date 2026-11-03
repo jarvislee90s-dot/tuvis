@@ -33,7 +33,11 @@ export function effectiveMetric(
 
 /** 当前模式的速率（含 null：无有效样本原样透出，不伪装 0 速度）。 */
 export function rateForMode(metrics: SpeedMetrics, mode: SpeedMetricMode): SpeedRate {
-  return mode === "stream" ? metrics.stream : metrics.response;
+  return mode === "stream"
+    ? metrics.stream
+    : mode === "response"
+      ? metrics.response
+      : metrics.tokenizerEstimate;
 }
 
 /**
@@ -47,6 +51,7 @@ export function seriesKeyId(key: SeriesKey): string {
     model: key.model,
     channel: key.channel ?? null,
     method: key.method,
+    ...(key.referenceProfileId == null ? {} : { referenceProfileId: key.referenceProfileId }),
   });
 }
 

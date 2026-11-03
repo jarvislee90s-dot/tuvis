@@ -33,7 +33,7 @@ A row of chips above the cards: "All" on the far left, then seven tools (Claude 
 
 > 💡 Chip icons and labels share one source with the card badges — recognize a face once and find it everywhere.
 
-> 💡 Usage and Output Speed have their own tabs — see Chapter 11 (Usage statistics) and the "Output speed" section.
+> 💡 Usage and Output Speed have their own tabs. Output Speed includes a separate Codex visible-text tokenizer estimate, with reference units kept apart from native metrics. See "Output speed" in Chapter 11 for operation and limitations.
 
 ## Click a card: jump to the terminal
 

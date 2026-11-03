@@ -84,8 +84,10 @@ fn saved_master_disable_reenable_rejects_old_capture_permit() {
     migration::migrate(&conn).unwrap();
     let gate = CaptureGate::new(true);
     let old = gate.permit().unwrap();
-    let mut settings = UsageSettings::default();
-    settings.enabled = false;
+    let mut settings = UsageSettings {
+        enabled: false,
+        ..UsageSettings::default()
+    };
     save_to_conn_with_gate(&conn, &settings, &gate).unwrap();
     settings.enabled = true;
     save_to_conn_with_gate(&conn, &settings, &gate).unwrap();
@@ -458,8 +460,10 @@ async fn late_tokenization_cannot_cross_saved_master_disable_reenable() {
         .unwrap();
     {
         let conn = db.lock().unwrap();
-        let mut settings = UsageSettings::default();
-        settings.enabled = false;
+        let mut settings = UsageSettings {
+            enabled: false,
+            ..UsageSettings::default()
+        };
         save_to_conn_with_gate(&conn, &settings, &gate).unwrap();
         settings.enabled = true;
         save_to_conn_with_gate(&conn, &settings, &gate).unwrap();

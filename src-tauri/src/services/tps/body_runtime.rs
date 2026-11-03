@@ -42,6 +42,7 @@ pub struct RuntimeDiagnostics {
     pub observation_gaps: u64,
     pub follow_failures: u64,
     pub budget_drops: u64,
+    pub active_leases: u64,
 }
 #[derive(Default)]
 struct RuntimeCounters {
@@ -51,6 +52,7 @@ struct RuntimeCounters {
     observation_gaps: std::sync::atomic::AtomicU64,
     follow_failures: std::sync::atomic::AtomicU64,
     budget_drops: std::sync::atomic::AtomicU64,
+    active_leases: std::sync::atomic::AtomicU64,
 }
 impl RuntimeCounters {
     fn snapshot(&self) -> RuntimeDiagnostics {
@@ -62,6 +64,7 @@ impl RuntimeCounters {
             observation_gaps: self.observation_gaps.load(Ordering::Relaxed),
             follow_failures: self.follow_failures.load(Ordering::Relaxed),
             budget_drops: self.budget_drops.load(Ordering::Relaxed),
+            active_leases: self.active_leases.load(Ordering::Relaxed),
         }
     }
 }
@@ -556,6 +559,10 @@ async fn capture_inner(
                 }
             }
             leases.retain(|key, _| desired.contains(key));
+            worker
+                .counters
+                .active_leases
+                .store(leases.len() as u64, std::sync::atomic::Ordering::Relaxed);
             retry_at.retain(|key, _| desired.contains(key));
             pending.retain(|key, abort: &mut tokio::task::AbortHandle| {
                 if desired.contains(key) {
@@ -598,6 +605,10 @@ async fn capture_inner(
         drop(observer);
         drop(events);
         drop(leases);
+        worker
+            .counters
+            .active_leases
+            .store(0, std::sync::atomic::Ordering::Relaxed);
         drop(plain_guard);
         if source_closed || *stop.borrow() {
             return;
@@ -645,6 +656,20 @@ static PRODUCTION_STARTED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 #[cfg(target_os = "macos")]
 static PRODUCTION_SERVICE: std::sync::Mutex<Option<CaptureService>> = std::sync::Mutex::new(None);
+
+/// 读取已运行服务的轻量状态；不初始化采集，也不访问磁盘。
+#[cfg(target_os = "macos")]
+pub fn production_diagnostics() -> Option<RuntimeDiagnostics> {
+    PRODUCTION_SERVICE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .map(CaptureService::diagnostics)
+}
+#[cfg(not(target_os = "macos"))]
+pub fn production_diagnostics() -> Option<RuntimeDiagnostics> {
+    None
+}
 
 /// 应用启动时只装配一次；不会启动远程服务或扫描历史目录。
 #[cfg(target_os = "macos")]

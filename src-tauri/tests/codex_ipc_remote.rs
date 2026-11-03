@@ -23870,8 +23870,10 @@ async fn estimate_runs_with_remote_off_and_page_hidden() {
     let gate2 = gate.clone();
     let stopped = tokio::task::spawn_blocking(move || {
         let conn = db2.lock().unwrap();
-        let mut settings = UsageSettings::default();
-        settings.enabled = false;
+        let settings = UsageSettings {
+            enabled: false,
+            ..UsageSettings::default()
+        };
         save_to_conn_with_gate(&conn, &settings, &gate2)
     });
     tokio::time::timeout(Duration::from_secs(3), stopped)
@@ -24027,8 +24029,10 @@ async fn disabling_capture_releases_live_candidate_before_save_returns() {
     let gate2 = gate.clone();
     let stopped = tokio::task::spawn_blocking(move || {
         let conn = db2.lock().unwrap();
-        let mut settings = UsageSettings::default();
-        settings.enabled = false;
+        let settings = UsageSettings {
+            enabled: false,
+            ..UsageSettings::default()
+        };
         save_to_conn_with_gate(&conn, &settings, &gate2)
     });
     tokio::time::timeout(Duration::from_secs(3), stopped)
@@ -24101,8 +24105,10 @@ async fn disable_waits_for_inflight_body_producer_before_returning() {
     let mut stop = tokio::task::spawn_blocking(move || {
         let conn = db2.lock().unwrap();
         let _ = db_locked_tx.send(());
-        let mut settings = UsageSettings::default();
-        settings.enabled = false;
+        let settings = UsageSettings {
+            enabled: false,
+            ..UsageSettings::default()
+        };
         save_to_conn_with_gate(&conn, &settings, &gate2)
     });
     tokio::time::timeout(Duration::from_secs(2), db_locked_rx)
@@ -24350,4 +24356,365 @@ async fn contiguous_base_revision_can_advance_by_more_than_one() {
     service.shutdown().await;
     adapter.shutdown().await;
     result.expect("verified base continuity must not require unit revision increments");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ipc_body_to_estimate_dashboard_roundtrip() {
+    use multi_agents_manager_lib::services::tps::{
+        body_runtime::CaptureService,
+        estimate_store::CaptureGate,
+        reference::{count_reference, reference_profile},
+        v2::{
+            model::{SpeedDashboardQuery, SpeedMetricMode, SpeedRange, SpeedSort},
+            query::dashboard,
+        },
+    };
+    let (io, mut peer) = ScriptedPeer::new();
+    let adapter = Arc::new(DesktopIpcAdapter::new(
+        Arc::new(StaticConnector::new(io)),
+        caps_open_profile(),
+    ));
+    let db = shared_conn();
+    let gate = CaptureGate::new(true);
+    let key = ThreadKey {
+        host_id: "local".into(),
+        thread_id: "00000000-0000-4000-8000-000000000029".into(),
+    };
+    let (_tx, rx) = tokio::sync::watch::channel(vec![key.clone()]);
+    let service = CaptureService::start_for_test(
+        adapter.clone(),
+        gate,
+        db.clone(),
+        rx,
+        "fixture-build".into(),
+    );
+    drive_ensure(&mut peer, &key.thread_id, vec![], "idle").await;
+    let patches = vec![
+        serde_json::json!([{ "op":"add", "path":["turnHistory","history","entitiesByKey","turn:new"], "value":{"turnId":"new","status":"inProgress","params":{"collaborationMode":{"settings":{"model":"gpt-test"}}},"items":[{"type":"agentMessage","id":"a","text":""}]} }, {"op":"add","path":["turnHistory","history","islands",0,"entries",1],"value":{"value":"turn:new"}}]),
+        serde_json::json!([{ "op":"replace","path":["turnHistory","history","entitiesByKey","turn:new","items",0,"text"],"value":"hello"}]),
+        serde_json::json!([{ "op":"replace","path":["turnHistory","history","entitiesByKey","turn:new","items",0,"text"],"value":"hello world"}]),
+        serde_json::json!([{ "op":"add","path":["turnHistory","history","entitiesByKey","turn:new","items",1],"value":{"type":"commandExecution","id":"tool","output":"ignored"}}]),
+        serde_json::json!([{ "op":"add","path":["turnHistory","history","entitiesByKey","turn:new","items",2],"value":{"type":"agentMessage","id":"b","text":""}}]),
+        serde_json::json!([{ "op":"replace","path":["turnHistory","history","entitiesByKey","turn:new","items",2,"text"],"value":"good"}]),
+        serde_json::json!([{ "op":"replace","path":["turnHistory","history","entitiesByKey","turn:new","items",2,"text"],"value":"good morning"}]),
+        serde_json::json!([{ "op":"replace","path":["turnHistory","history","entitiesByKey","turn:new","status"],"value":"completed"}]),
+    ];
+    for (i, patch) in patches.into_iter().enumerate() {
+        if i == 4 {
+            tokio::time::sleep(Duration::from_millis(600)).await;
+        }
+        if i == 2 || i == 6 {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let base = 7 + i as u64;
+        peer.send(&serde_json::json!({"type":"broadcast","method":"thread-stream-state-changed","sourceClientId":"owner-1","params":{"conversationId":key.thread_id,"change":{"type":"patches","baseRevision":base,"revision":base+1,"patches":patch}}})).await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while adapter.projection(&key).await.revision != Some(base + 1) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("contiguous mirror");
+    }
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if db
+                .lock()
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM tps_body_estimate", [], |r| {
+                    r.get::<_, i64>(0)
+                })
+                .unwrap()
+                == 2
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("both completed bodies persisted");
+    {
+        let conn = db.lock().unwrap();
+        let rows: Vec<(i64, i64)> = conn
+        .prepare(
+            "SELECT reference_tokens,duration_ns FROM tps_body_estimate ORDER BY reference_tokens",
+        )
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+        let expected =
+            count_reference("hello world").unwrap() + count_reference("good morning").unwrap();
+        assert_eq!(rows.iter().map(|row| row.0).sum::<i64>(), expected as i64);
+        assert!(
+            rows.iter().all(|row| row.1 > 0 && row.1 < 500_000_000),
+            "tool delay must not enter either body window"
+        );
+        let query = SpeedDashboardQuery {
+            range: SpeedRange::Last1h,
+            selection: None,
+            metric_mode: SpeedMetricMode::TokenizerEstimate,
+            tool_id: None,
+            search: String::new(),
+            sort: SpeedSort::Tool,
+        };
+        let snap = dashboard(
+            &conn,
+            &query,
+            multi_agents_manager_lib::services::usage::now_ms() + 1000,
+        )
+        .unwrap();
+        assert_eq!(snap.series.len(), 1);
+        assert_eq!(
+            snap.series[0].series_key.reference_profile_id.as_deref(),
+            Some(reference_profile().id.as_str())
+        );
+        assert_eq!(
+            snap.series[0].metrics.tokenizer_estimate.output_tokens,
+            expected as i64
+        );
+        assert_eq!(snap.series[0].metrics.tokenizer_estimate.sample_count, 2);
+        assert_eq!(snap.series[0].metrics.response.value, None);
+    }
+    assert!(
+        !peer_has_traffic(&mut peer).await,
+        "capture must not issue start, decision or interrupt commands"
+    );
+    service.shutdown().await;
+    adapter.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stop_reconnect_and_late_worker_preserve_other_consumers() {
+    use multi_agents_manager_lib::services::{
+        codex_desktop_ipc::{
+            observation::{BodyChange, BodyEvent, BodyFrame, CaptureClock, CaptureScope},
+            owners::FollowPurpose,
+        },
+        tps::{
+            body_observer::BodyObserver,
+            body_runtime::{BeforeCommitHook, BodyRuntime},
+            estimate_store::{set_estimate_enabled_with_gate, CaptureGate},
+        },
+    };
+    use std::sync::{Condvar, Mutex as SyncMutex};
+    let (io, mut peer) = ScriptedPeer::new();
+    let connector = Arc::new(StaticConnector::new(io));
+    let adapter = Arc::new(DesktopIpcAdapter::new(
+        connector.clone(),
+        caps_open_profile(),
+    ));
+    let mut events = adapter.subscribe_body_events();
+    let key = ThreadKey {
+        host_id: "local".into(),
+        thread_id: "00000000-0000-4000-8000-000000000030".into(),
+    };
+    let a = adapter.clone();
+    let k = key.clone();
+    let first = tokio::spawn(async move { a.ensure_thread(&k).await });
+    drive_ensure(&mut peer, &key.thread_id, vec![], "idle").await;
+    first.await.unwrap().unwrap();
+    let lease = adapter
+        .acquire_following(&key, FollowPurpose::TokenizerEstimate)
+        .await
+        .unwrap();
+    adapter.unfollow(&key).await;
+    assert!(
+        !peer_has_traffic(&mut peer).await,
+        "remote release must preserve estimate following"
+    );
+    adapter.ensure_thread(&key).await.unwrap();
+    lease.release().await;
+    assert!(
+        !peer_has_traffic(&mut peer).await,
+        "estimate release must preserve remote following"
+    );
+    let body = || {
+        let scope = CaptureScope {
+            capture_generation: 1,
+            owner_epoch: 1,
+            owner_generation: 1,
+            host_key: "fixture-host".into(),
+            thread_key: "fixture-thread".into(),
+        };
+        let frame = |revision, change| BodyFrame {
+            scope: scope.clone(),
+            revision,
+            clock: CaptureClock {
+                mono_ns: revision * 1_000_000_000,
+                wall_ms: revision as i64 * 1000,
+            },
+            changes: vec![change],
+        };
+        let mut observer = BodyObserver::default();
+        observer.on_frame(frame(1, BodyChange::Baseline));
+        observer.on_frame(frame(
+            2,
+            BodyChange::EmptyItem {
+                turn_id: "turn".into(),
+                item_id: "item".into(),
+                model: Some("gpt-test".into()),
+                channel: None,
+            },
+        ));
+        observer.on_frame(frame(
+            3,
+            BodyChange::Append {
+                turn_id: "turn".into(),
+                item_id: "item".into(),
+                text: "hello ".into(),
+            },
+        ));
+        observer.on_frame(frame(
+            4,
+            BodyChange::Append {
+                turn_id: "turn".into(),
+                item_id: "item".into(),
+                text: "world".into(),
+            },
+        ));
+        observer
+            .on_frame(frame(
+                5,
+                BodyChange::TurnTerminal {
+                    turn_id: "turn".into(),
+                    completed: true,
+                },
+            ))
+            .pop()
+            .unwrap()
+    };
+    let db = shared_conn();
+    let gate = CaptureGate::new(true);
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let entered = Arc::new(SyncMutex::new(Some(entered_tx)));
+    let latch = Arc::new((SyncMutex::new(false), Condvar::new()));
+    let hook: BeforeCommitHook = {
+        let entered = entered.clone();
+        let latch = latch.clone();
+        Arc::new(move || {
+            if let Some(tx) = entered.lock().unwrap().take() {
+                let _ = tx.send(());
+                let (lock, wake) = &*latch;
+                let mut go = lock.lock().unwrap();
+                while !*go {
+                    go = wake.wait(go).unwrap();
+                }
+            }
+        })
+    };
+    let runtime = BodyRuntime::new_with_gate(db.clone(), gate.clone(), Some(hook));
+    let old = runtime
+        .try_submit(body(), gate.permit().unwrap(), "run".into(), "build".into())
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(3), entered_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    {
+        let conn = db.lock().unwrap();
+        set_estimate_enabled_with_gate(&conn, false, &gate).unwrap();
+        set_estimate_enabled_with_gate(&conn, true, &gate).unwrap();
+    }
+    {
+        let (lock, wake) = &*latch;
+        *lock.lock().unwrap() = true;
+        wake.notify_all();
+    }
+    assert!(!tokio::time::timeout(Duration::from_secs(3), old)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap());
+    let valid = runtime
+        .try_submit(body(), gate.permit().unwrap(), "run".into(), "build".into())
+        .unwrap();
+    assert!(tokio::time::timeout(Duration::from_secs(3), valid)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap());
+    let (io2, mut peer2) = ScriptedPeer::new();
+    *connector.io.lock().unwrap() = Some(io2);
+    peer.eof();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !matches!(events.recv().await, Some(BodyEvent::Lost)) {}
+    })
+    .await
+    .expect("disconnect must invalidate observation");
+    let a = adapter.clone();
+    let k = key.clone();
+    let follow = tokio::spawn(async move {
+        a.acquire_following(&k, FollowPurpose::TokenizerEstimate)
+            .await
+    });
+    handshake(&mut peer2, "owner-1").await;
+    loop {
+        let request = tokio::time::timeout(Duration::from_secs(3), peer2.recv())
+            .await
+            .expect("reconnect discovery");
+        match request["method"].as_str() {
+            Some("thread-owner-discovery") => {
+                peer2
+                    .send(&discovery_response(
+                        request["requestId"].as_str().unwrap(),
+                        "owner-1",
+                    ))
+                    .await
+            }
+            Some("thread-stream-following-changed") => {
+                assert_eq!(request["params"]["following"], true);
+                break;
+            }
+            method => panic!("unexpected reconnect request {method:?}"),
+        }
+    }
+    peer2.send(&serde_json::json!({"type":"broadcast","method":"thread-stream-state-changed","version":11,"sourceClientId":"owner-1","params":{"conversationId":key.thread_id,"hostId":"local","change":{"type":"snapshot","revision":7,"conversationState":{"turns":[],"requests":[],"threadRuntimeStatus":{"type":"idle"},"turnHistory":codex_fixture::canonical_turn_history(serde_json::json!({"t1":{"id":"t1","type":"turn","status":"completed","items":["u1"]},"u1":{"id":"u1","type":"user_message","text":"seed","ts":1}}),serde_json::json!([{"entries":["t1"]}]))}}}})).await;
+    let lease2 = tokio::time::timeout(Duration::from_secs(3), follow)
+        .await
+        .expect("reconnected following")
+        .unwrap()
+        .unwrap();
+    let duplicate = runtime
+        .try_submit(
+            body(),
+            gate.permit().unwrap(),
+            "new-run".into(),
+            "build".into(),
+        )
+        .unwrap();
+    assert!(!tokio::time::timeout(Duration::from_secs(3), duplicate)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap());
+    assert_eq!(
+        db.lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM tps_body_estimate", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    while let Ok(request) = tokio::time::timeout(Duration::from_millis(300), peer2.recv()).await {
+        match request["method"].as_str() {
+            Some("thread-owner-discovery") => {
+                peer2
+                    .send(&discovery_response(
+                        request["requestId"].as_str().unwrap(),
+                        "owner-1",
+                    ))
+                    .await
+            }
+            Some("thread-stream-following-changed") => {
+                assert_eq!(request["params"]["following"], true)
+            }
+            method => panic!("unexpected write or control frame {method:?}"),
+        }
+    }
+    lease2.release().await;
+    runtime.shutdown().await;
+    adapter.shutdown().await;
 }

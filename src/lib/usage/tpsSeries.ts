@@ -133,6 +133,7 @@ export const TPS_METHOD_KEYS: Record<TpsTimingMethod, string> = {
   "client-native": "usage.tps.method.clientNative",
   "native-event-approx": "usage.tps.method.nativeEventApprox",
   "log-boundary-approx": "usage.tps.method.logBoundaryApprox",
+  "ipc-body-reference": "usage.tps.method.ipcBodyReference",
 };
 
 /** 原生事件近似须有「原生近似」标记（Spec §3）。 */

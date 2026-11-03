@@ -16,7 +16,7 @@ export type TimingMethod = TpsTimingMethod;
 export type OutputScope = TpsOutputScope;
 
 /** 指标模式：stream = 流式输出速度；response = 响应吞吐（含等待）。 */
-export type SpeedMetricMode = "stream" | "response";
+export type SpeedMetricMode = "stream" | "response" | "tokenizer-estimate";
 
 /** 区间档位（桶宽 1m/5m/10m/1h 与 Spec §7 档位表逐字）。 */
 export type SpeedRange = "15m" | "1h" | "5h" | "24h";
@@ -38,6 +38,10 @@ export interface SpeedRate {
 export interface SpeedMetrics {
   stream: SpeedRate;
   response: SpeedRate;
+  tokenizerEstimate: SpeedRate;
+  bodyObservedMs: number | null;
+  shortWindowCount: number;
+  smallSampleCount: number;
   /** 平均首点等待（分母 = ttftSampleCount，独立）；无可对齐样本为 null */
   avgFirstTokenMs: number | null;
   ttftSampleCount: number;
@@ -86,6 +90,8 @@ export interface SpeedCapabilities {
   /** stream 缺失原因（如 Codex `stream-gap:insufficient-generation-timing`）；具备时为 null */
   streamReason: string | null;
   responseReason: string | null;
+  tokenizerEstimate: boolean;
+  tokenizerEstimateReason: string | null;
 }
 
 /** reason / streamReason 的已知稳定 token（与 Rust `v2/query.rs` 当前 token 集逐字对齐；
@@ -105,12 +111,26 @@ export type SpeedSourceStatus =
 
 /** 来源视图（契约 SpeedSourceView 逐字段）：每注册来源一条；主界面只渲染名称/状态/能力，
  *  `detail` 仅供详情面板（主界面不直接渲染）。 */
+export interface EstimateSourceState {
+  supported: boolean;
+  enabled: boolean;
+  observing: boolean;
+  reason: string | null;
+  lastRecordAt: number | null;
+  referenceProfileId: string | null;
+  encoding: string | null;
+  ruleVersion: number | null;
+  resourceSha256: string | null;
+  modelSource: string | null;
+}
+
 export interface SpeedSourceView {
   source: string;
   status: SpeedSourceStatus;
   /** 安装事实（安装回执在册与否，与样本无关；无安装机制的来源恒 true） */
   installed: boolean;
   capabilities: SpeedCapabilities;
+  estimateState: EstimateSourceState;
   /** 该源最近一次事实完成时刻（区间内；无事实为 null） */
   lastRecordAt: number | null;
   /** 状态成因的稳定机器 token（not-installed / never-read / read-failed / parser-errors /

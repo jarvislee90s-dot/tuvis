@@ -425,6 +425,7 @@ pub fn run() {
         commands::tps::tps_refresh,
         // V2 速度 dashboard（2026-10-26 计划 Task 6）：只读区间/桶聚合
         commands::tps::tps_speed_dashboard,
+        commands::tps::tps_tokenizer_estimate_set_enabled,
         commands::tps::tps_view_heartbeat,
         commands::tps::tps_install_preview,
         commands::tps::tps_install_apply,
