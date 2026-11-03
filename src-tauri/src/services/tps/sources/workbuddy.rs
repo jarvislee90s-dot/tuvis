@@ -71,9 +71,11 @@
 //!   custom-local 670 条中 349 条生成窗 <50ms，官方流式路线 0/59、最短 3761ms）。生成窗
 //!   退化到无法构成速率时（窗口 <50ms——该量级窗实测仅见于整包突发；或分桶字段在场而
 //!   可分间隔 <3——少于 3 个间隔无法构成速率估计），`generation_ms = None`（同 Codex
-//!   缺口语义）：观察仅保留响应口径与首 Token 等待，绝不把突发交付当流式速率入速；
-//!   分桶字段整体缺席的旧载荷只按窗口规则兜底。残余缺口：3~20 个可分间隔的短窗轻微
-//!   流式不在此闸，按遥测如实入账。
+//!   缺口语义）：生成窗与首点同时置 None——首 token 与末包同时到达，TTFT 池只收真
+//!   流式请求（突发那段时间是全文生成/中转排队，总等待保留在响应窗 started→ended），
+//!   观察仅保留响应口径，绝不把突发交付当流式速率入速；分桶字段整体缺席的旧载荷只按
+//!   窗口规则兜底。残余缺口：13~20 个可分间隔压缩在短窗的切片式突发（实测仅数条、
+//!   TPS 数百）不在此闸，按遥测如实入账。
 //! * qua 行缺数值 `completion_tokens`（如只有 `hasUsage:true` 标志）：成功事实保留
 //!   （output=None 记缺失不报 0），绝不入速。
 //! * 输出语义：`completion_tokens` 为供应商总数（含思考与工具参数，supplement-macos §11.2
@@ -120,7 +122,8 @@ const CURSOR_FORMAT_VERSION: u32 = 4;
 /// 生成窗 <50ms 实测仅出现于整包突发（custom-local 349/670 条；官方流式路线 0/59、
 /// 最短 3761ms），该量级窗内至多 1~2 个 chunk、速率分母失真；可分间隔 <3 则覆盖
 /// 「窗口稍大但交付仍是整包突发」的形态（50~1000ms 桶 80 条中 34 条 chunks≤2）。
-/// 残余缺口：3~20 个可分间隔的短窗轻微流式不在此闸，按遥测如实入账。
+/// 残余缺口：13~20 个可分间隔压缩在短窗的切片式突发（实测仅数条、TPS 数百）不在此闸，
+/// 按遥测如实入账。
 const MIN_STREAMING_WINDOW_MS: i64 = 50;
 const MIN_MEASURABLE_INTERVALS: i64 = 3;
 
@@ -144,7 +147,7 @@ const BATCH_CAP: usize = TPS_BATCH_MAX_ROWS;
 
 /// 来源限制说明（sourceState.detail，如实申报；sdk 路线缺口逐字含
 /// insufficient-evidence，Spec §4「缺失时该路线返回 insufficient-evidence」）
-const SOURCE_LIMITS: &str = "insufficient-evidence: sdk/conversations 路线 usage_update 只有 hasUsage=true 无数值 usage，不入速，绝不借旧 CLI 样本凑值；qua 路线 Mac/Windows 均已证带数值（2026-11-02 zh-CN 实机），行前缀时刻仅认已证形态（RFC3339 / [M/D/YYYY, h:mm:ss AM|PM.mmm] / [YYYY/M/D H:MM:SS.mmm]），未证形态跳过不猜；突发交付（ttft≈total、chunks 1~2）生成窗退化时置 None 仅响应口径（2026-11-03 实机；生成窗<50ms 或分桶在场而可分间隔<3，3~20 间隔的轻微流式不在闸内）；tool_ms 恒空（无原生工具时长）";
+const SOURCE_LIMITS: &str = "insufficient-evidence: sdk/conversations 路线 usage_update 只有 hasUsage=true 无数值 usage，不入速，绝不借旧 CLI 样本凑值；qua 路线 Mac/Windows 均已证带数值（2026-11-02 zh-CN 实机），行前缀时刻仅认已证形态（RFC3339 / [M/D/YYYY, h:mm:ss AM|PM.mmm] / [YYYY/M/D H:MM:SS.mmm]），未证形态跳过不猜；突发交付（ttft≈total、chunks 1~2）生成窗与首点均置 None、仅保留响应口径（2026-11-03 实机；生成窗<50ms 或分桶在场而可分间隔<3，切片式突发残余不在闸内）；tool_ms 恒空（无原生工具时长）";
 
 // ==== 游标状态（装在 SourceCursor.value；反序列化失败归零重读——重读的观察以稳定键
 //      UPSERT 幂等，不产生双计）====
@@ -603,7 +606,7 @@ fn apply_qua_line(
             return;
         }
     };
-    let first_token_at_ms = ttft_ms.map(|t| started_at_ms + t);
+    let candidate_first_token = ttft_ms.map(|t| started_at_ms + t);
     // 突发交付证据（见模块头「非流式交付」节）：interval 分桶之和 = 可分间隔总数。
     // 各桶是遥测不是身份字段，单个缺席/被拒按 0 计；字段整体缺席 = 旧载荷无法判定，
     // 闸门只在窗口规则上兜底（intervals_present = false）。
@@ -624,25 +627,35 @@ fn apply_qua_line(
         }
     }
     // 生成窗 = total_cost_ms − ttft_ms（同请求两段；失败/取消不入速度）。
-    // 退化生成窗（整包突发交付）→ None，仅保留响应口径（同 Codex 缺口语义）。
+    // 退化生成窗（整包突发交付）→ 无流式口径：生成窗与首点同时置 None——首 token 与
+    // 末包同时到达，「首 Token 等待」的流式语义不存在（那段时间是全文生成/中转排队，
+    // 不是等首个输出），总等待仍完整保留在响应窗 started→ended 里。同 Codex 缺口语义。
+    let mut burst_delivery = false;
     let generation_ms = match (outcome, ttft_ms) {
         (Outcome::Success, Some(ttft)) => {
             let g = total - ttft;
             if g <= 0 {
+                // ttft >= total：首点在结束之后，流式首点同样不可观测（ttft_ok 无上界闸，
+                // 不置位会以 total 级 ttft 混进 TTFT 池）
+                burst_delivery = true;
                 diag(tally, "生成窗非正 → 不入速度");
                 None
             } else if g < MIN_STREAMING_WINDOW_MS {
+                burst_delivery = true;
                 diag(
                     tally,
                     &format!(
-                        "突发交付：生成窗<{MIN_STREAMING_WINDOW_MS}ms（该量级窗实测仅见于整包突发）→ 无流式口径"
+                        "突发交付：生成窗<{MIN_STREAMING_WINDOW_MS}ms（该量级窗实测仅见于整包突发）→ 无流式口径，首点不可观测"
                     ),
                 );
                 None
             } else if intervals_present && interval_total < MIN_MEASURABLE_INTERVALS {
+                burst_delivery = true;
                 diag(
                     tally,
-                    &format!("突发交付：可分间隔<{MIN_MEASURABLE_INTERVALS} → 无流式口径"),
+                    &format!(
+                        "突发交付：可分间隔<{MIN_MEASURABLE_INTERVALS} → 无流式口径，首点不可观测"
+                    ),
                 );
                 None
             } else {
@@ -654,6 +667,11 @@ fn apply_qua_line(
             None
         }
         _ => None,
+    };
+    let first_token_at_ms = if burst_delivery {
+        None
+    } else {
+        candidate_first_token
     };
 
     observations.push(TpsObservation {
@@ -928,8 +946,9 @@ fn empty_batch(cursor: &SourceCursor) -> ReadBatch {
 //
 // 覆盖面：行前缀时刻三形态（zh-CN / en-US / RFC3339）+ 无日期前缀跳过闸 +
 // 旧版 EOF 游标（v1/v2/v3）的有界恢复与 v4 升版 + 全新安装 v4 起步 +
-// qua.end 突发交付闸门（单 chunk 窄窗 / 大窗少桶 → 生成窗 None；真流式 → 保留；
-// 旧载荷无分桶字段 → 只按窗口规则）。
+// qua.end 突发交付闸门（单 chunk 窄窗 / 大窗少桶 / 生成窗非正 ttft≥total → 生成窗与
+// 首 Token 等待 None；真流式 → 两者保留；旧载荷无分桶字段 → 只按窗口规则，首点随
+// 窗口闸同进退）。
 // 临时 home 用 std::env::temp_dir() 下的唯一子目录，绝不触真机 ~/.tuvis / ~/.workbuddy。
 #[cfg(test)]
 mod tests {
@@ -1405,8 +1424,9 @@ mod tests {
     }
 
     /// 突发交付闸门·单 chunk 窄窗（整包突发形态，2026-11-03 实机取证）：生成窗仅 3ms
-    ///（< qua 最小分桶粒度 50ms，不可能有可分间隔）→ 生成窗置 None；观察照发，
-    /// 响应窗（= total）与首 Token 等待保留，outcome 不改判。
+    ///（< qua 最小分桶粒度 50ms，不可能有可分间隔）→ 生成窗与首 Token 等待同闸置 None
+    ///（ttft ≈ total 是全文生成/中转排队耗时，不是「等首个输出」，入 TTFT 池会污染
+    /// 首Token平均等待）；观察照发，响应窗（= total）保留，outcome 不改判。
     /// 修复前按流式速率口径给 Some(3)（预期红）。
     #[test]
     fn burst_delivery_single_chunk_has_no_stream_window() {
@@ -1429,7 +1449,6 @@ mod tests {
             "突发交付只禁生成窗，事实观察必须照发"
         );
         let obs = &batch.observations[0];
-        let started = local_ms(2026, 11, 3, 12, 12, 22, 0) - 87962;
         assert_eq!(
             obs.generation_ms, None,
             "生成窗 3ms < 50ms 且单 chunk → 不得按流式速率给生成窗"
@@ -1440,9 +1459,8 @@ mod tests {
             "响应窗 = total（含等待），必须保留"
         );
         assert_eq!(
-            obs.first_token_at_ms,
-            Some(started + 87959),
-            "首 Token 等待（started + ttft）必须保留"
+            obs.first_token_at_ms, None,
+            "突发交付首点同闸置 None：ttft ≈ total 不得入 TTFT 池"
         );
         assert_eq!(obs.outcome, Outcome::Success, "突发交付不改判 outcome");
         let _ = std::fs::remove_dir_all(&home);
@@ -1478,11 +1496,16 @@ mod tests {
             Some(15409),
             "响应窗 = total，必须保留"
         );
+        assert_eq!(
+            batch.observations[0].first_token_at_ms, None,
+            "间隔闸触发的突发交付首点同置 None，不得污染 TTFT 池"
+        );
         let _ = std::fs::remove_dir_all(&home);
     }
 
     /// 护栏·真流式不得误伤：生成窗 10041ms（≥50）、8 桶可分间隔和 57（≥3）→
-    /// 生成窗照常 Some(10041)。修复前就该绿，修复后必须仍绿。
+    /// 生成窗 Some(10041)、首点 Some(started + 7500) 全保留（突发交付置 None 的
+    /// 对照面）。修复前就该绿，修复后必须仍绿。
     #[test]
     fn streaming_delivery_keeps_generation_window() {
         let home = temp_home("streaming-keep");
@@ -1508,12 +1531,19 @@ mod tests {
             Some(17541 - 7500),
             "真流式（间隔和 57 ≥ 3、窗 ≥ 50ms）生成窗必须保留"
         );
+        let started = local_ms(2026, 11, 3, 12, 12, 22, 0) - 17541;
+        assert_eq!(
+            batch.observations[0].first_token_at_ms,
+            Some(started + 7500),
+            "真流式首点必须保留（突发交付置 None 的对照面）"
+        );
         let _ = std::fs::remove_dir_all(&home);
     }
 
-    /// 旧载荷（无任何 interval/chunks 字段）不触发间隔闸，只按窗口规则：
-    /// 窗 10041ms ≥50 → 保留 Some(10041)（现在就该绿）；窗 10ms <50 → None
-    ///（修复前按 g>0 给 Some(10)，预期红）。
+    /// 旧载荷（无任何 interval/chunks 字段）不触发间隔闸，只按窗口规则（首点随窗口
+    /// 闸同进退）：窗 10041ms ≥50 → 生成窗 Some(10041)、首点 Some（现在就该绿）；
+    /// 窗 10ms <50 → 生成窗 None、首点 None（修复前分别给 Some(10041)/Some(10)，
+    /// 首点断言预期红）。
     #[test]
     fn legacy_payload_without_interval_fields_uses_window_rule_only() {
         let home = temp_home("legacy-no-interval");
@@ -1555,9 +1585,19 @@ mod tests {
             Some(10041),
             "旧载荷无分桶字段 → 只按窗口规则：窗 10041ms ≥ 50 保留"
         );
+        // 行 A 健康窗非突发：首点 = started + ttft = (ended − 17541) + 7500，必须保留
+        assert_eq!(
+            a.first_token_at_ms,
+            Some(local_ms(2026, 11, 3, 12, 12, 22, 0) - 17541 + 7500),
+            "旧载荷健康窗（非突发）首点保留（started + ttft）"
+        );
         assert_eq!(
             b.generation_ms, None,
             "旧载荷无分桶字段 → 只按窗口规则：窗 10ms < 50 置 None"
+        );
+        assert_eq!(
+            b.first_token_at_ms, None,
+            "窗口规则（10ms < 50）同闸置 None 首点，不得污染 TTFT 池"
         );
         let _ = std::fs::remove_dir_all(&home);
     }
@@ -1602,6 +1642,43 @@ mod tests {
             "恢复完成后游标必须升 v4"
         );
         assert!(next["recovery"].is_null(), "恢复完成后 recovery 必须清空");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// 退化生成窗·g ≤ 0（ttft ≥ total，宿主坏数形态）与非正窗同闸：生成窗 None 且
+    /// 首点 None——ttft_ok 缺「首点 ≤ 结束」上界闸，不置位时该分支首点会以 total 级
+    /// ttft 混进 TTFT 池（与 87.96s 同形污染）；观察照发、响应窗保留、outcome 不改判。
+    #[test]
+    fn nonpositive_generation_window_also_clears_first_token() {
+        let home = temp_home("nonpositive-window");
+        // BASE 载荷改 total=10000 / ttft=10500（g = −500），不加 interval 字段
+        let line = burst_qua_line(
+            "[2026/11/3 12:12:22.000]",
+            "22a19b1b800475aab1c452c34d30f7db",
+            "659",
+            "10000",
+            "10500",
+            "",
+        );
+        write_log(&home, &[line]);
+        let batch = read(&home, &SourceCursor::empty(SOURCE_ID));
+        assert_eq!(
+            batch.observations.len(),
+            1,
+            "g ≤ 0 只是退化口径，事实观察必须照发"
+        );
+        let obs = &batch.observations[0];
+        assert_eq!(obs.generation_ms, None, "g = −500 → 无生成窗");
+        assert_eq!(
+            obs.first_token_at_ms, None,
+            "g ≤ 0 分支同置位突发交付：total 级 ttft 不得入 TTFT 池"
+        );
+        assert_eq!(
+            obs.response_elapsed_ms,
+            Some(10000),
+            "响应窗 = total（含等待），必须保留"
+        );
+        assert_eq!(obs.outcome, Outcome::Success, "g ≤ 0 不改判 outcome");
         let _ = std::fs::remove_dir_all(&home);
     }
 }
