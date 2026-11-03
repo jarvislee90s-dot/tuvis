@@ -316,11 +316,7 @@ fn render(value: ValueRef<'_>) -> String {
 
 fn snapshot_table(conn: &Connection, sql: &str) -> TableSnapshot {
     let mut stmt = conn.prepare(sql).expect("快照查询必须可准备");
-    let columns = stmt
-        .column_names()
-        .iter()
-        .map(|name| (*name).to_string())
-        .collect();
+    let columns: Vec<String> = stmt.column_names().map(|name| name.to_string()).collect();
     let rows = stmt
         .query_map([], |row| {
             let mut values = Vec::new();
