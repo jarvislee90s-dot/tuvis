@@ -1,4 +1,4 @@
-//! Codex Desktop IPC 客户端（spec：`docs/superpowers/specs/2026-10-16-codex-desktop-ipc-remote-control-design.md`）。
+//! Codex Desktop IPC 客户端（spec：`docs/engineering/specs/2026-10-16-codex-desktop-ipc-remote-control-design.md`）。
 //!
 //! 与 `inject/headless` 平行的**独立控制面**：直连官方 Codex Desktop 当前持有
 //! Thread 的本机 IPC（Windows Named Pipe / macOS Unix socket），控制的是已运行的
@@ -10,11 +10,17 @@
 //! 由服务端发现，原始 IPC 参数不落远程 API；远程边界在 Tuvis 设备门禁，IPC 自身
 //! 不提供认证。
 
+pub mod adapt_status;
 pub mod adapter;
 mod artifacts;
+pub mod async_question;
+pub mod budget;
+pub mod capability;
 pub mod codec;
 pub mod connection;
 pub mod history_view;
+pub mod interaction_summary;
+pub mod late;
 pub mod mirror;
 pub mod owners;
 pub mod pending;

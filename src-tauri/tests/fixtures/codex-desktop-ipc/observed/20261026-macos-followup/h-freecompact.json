@@ -1,0 +1,27 @@
+{
+  "method": "thread-follower-start-turn",
+  "version": 2,
+  "params": {
+    "conversationId": "<ID-9>#uuid",
+    "turnStart": {
+      "request": {
+        "threadId": "<ID-9>#uuid",
+        "input": [
+          {
+            "type": "text",
+            "text": "<str:226>#hasMarker",
+            "text_elements": []
+          }
+        ],
+        "clientUserMessageId": "<ID-277>#uuid"
+      },
+      "context": {}
+    }
+  },
+  "response": {
+    "type": "response",
+    "requestId": "<ID-278>#uuid",
+    "resultType": "error",
+    "error": "thread-follower-start-turn-timeout"
+  }
+}

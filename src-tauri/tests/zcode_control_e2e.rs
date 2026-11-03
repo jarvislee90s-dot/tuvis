@@ -590,9 +590,27 @@ fn read_fixture() -> (tempfile::TempDir, PathBuf) {
 fn read_state(conn: &SharedConn, home: &std::path::Path) -> Arc<RemoteState> {
     let roots = ZcodeRoots::from_home(home);
     let host = fake_host();
+    let roots_for_fresh = roots.clone();
+    let host_for_fresh = fake_host();
     let session_source = Box::new(move || {
         let sessions: Vec<Session> =
             build_sessions(&roots, &host, chrono::Utc::now().timestamp_millis());
+        let waiting_count = sessions
+            .iter()
+            .filter(|s| matches!(s.status, SessionStatus::Waiting))
+            .count();
+        SessionsResponse {
+            total_count: sessions.len(),
+            waiting_count,
+            sessions,
+        }
+    });
+    let fresh_session_source = Box::new(move || {
+        let sessions: Vec<Session> = build_sessions(
+            &roots_for_fresh,
+            &host_for_fresh,
+            chrono::Utc::now().timestamp_millis(),
+        );
         let waiting_count = sessions
             .iter()
             .filter(|s| matches!(s.status, SessionStatus::Waiting))
@@ -619,6 +637,7 @@ fn read_state(conn: &SharedConn, home: &std::path::Path) -> Arc<RemoteState> {
         subagent_message_source: std::collections::HashMap::new(),
         capability_table: multi_agents_manager_lib::inject::capability::new_table(),
         session_source,
+        fresh_session_source,
         pairing_counter: Box::new(Vec::new),
         board_hidden_ids: Box::new(Vec::new),
         board_hidden_hide: Arc::new(|_| 0usize),

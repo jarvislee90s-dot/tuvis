@@ -2,6 +2,7 @@ import { useEffect, useState, ReactNode } from "react";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { Minus, Maximize2, Minimize2, X } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { useGlassFallback } from "@/hooks/use-glass-fallback";
 
 interface TitleBarProps {
   title?: string;
@@ -23,6 +24,8 @@ export function TitleBar({
   onDoubleClick,
 }: TitleBarProps) {
   const [isMaximized, setIsMaximized] = useState(false);
+  // 标题栏属导航类 chrome（spec §3.2）：轻玻璃材质 + 实心回退
+  const glassFallback = useGlassFallback();
 
   useEffect(() => {
     if (!showMaximize) return;
@@ -92,8 +95,11 @@ export function TitleBar({
 
   return (
     <div
+      data-glass-fallback={glassFallback === "glass" ? undefined : glassFallback}
       className={cn(
-        "bg-background/95 supports-backdrop-filter:bg-background/60 border-border/40 flex h-8 items-center justify-between border-b backdrop-blur select-none",
+        // 轻玻璃（Task 8）：背景/模糊/内侧高光由 .workspace-glass 提供（可降级实心），
+        // 1px 下边界用边界 token
+        "workspace-glass flex h-8 items-center justify-between border-b select-none",
         showMaximize && isMaximized ? "" : "rounded-t-lg"
       )}
     >
@@ -103,7 +109,7 @@ export function TitleBar({
         onDoubleClick={handleDragRegionDoubleClick}
         className="flex grow items-center gap-2 pl-2"
       >
-        {title && <span className="text-sm font-medium text-slate-400">{title}</span>}
+        {title && <span className="text-muted-foreground text-sm font-medium">{title}</span>}
         {leftActions}
       </div>
 

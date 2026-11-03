@@ -37,6 +37,13 @@ export interface BillingProfilesManagerProps {
   onOpenChange?(open: boolean): void;
   /** 受控模式下可隐藏自带的触发按钮 */
   hideTrigger?: boolean;
+  /**
+   * active 门控（评审修复轮 2）：组件随记录面板在四页宿主里常驻挂载，页面隐藏期间传
+   * false——billing 读查询停发（含 focus refetch）。保持「弹窗关着也常驻查」的既有语义，
+   * 只叠加页签级门控；默认 true，旧调用者行为不变。第三/四轮评审 follow-up：弹窗内的
+   * identities / pricing / catalog 查询同样叠上 active 门控。
+   */
+  active?: boolean;
 }
 
 function identityKeyOf(rule: { identity: BillingRule["identity"] }): string {
@@ -155,9 +162,10 @@ export function BillingProfilesManager({
   open,
   onOpenChange,
   hideTrigger = false,
+  active = true,
 }: BillingProfilesManagerProps) {
   const queryClient = useQueryClient();
-  const billing = useUsageBillingQuery();
+  const billing = useUsageBillingQuery({ enabled: active });
   const [internalOpen, setInternalOpen] = useState(false);
   const [newName, setNewName] = useState("");
   const [undoTarget, setUndoTarget] = useState("0");
@@ -186,11 +194,15 @@ export function BillingProfilesManager({
   };
 
   /** 参考模型可选身份 = 账本观测身份（7 天窗口）+ 现有规则身份。
-   *  本组件被费用卡 / 记录页**恒挂载**，查询必须以「对话框打开」为门控，
+   *  本组件被费用卡 / 记录页**恒挂载**，查询以「对话框打开且页面 active」为门控，
    *  否则用户从不打开管理器也会常驻跑 7 天账本查询。 */
-  const observed = useUsageIdentitiesQuery({ preset: "last7d" }, {}, { enabled: dialogOpen });
-  // 目录搜索只在对话框打开且存在 active 快照时启用（无快照时后端必然返回空）。
-  const pricingStatus = useUsagePricingQuery({ enabled: dialogOpen });
+  const observed = useUsageIdentitiesQuery(
+    { preset: "last7d" },
+    {},
+    { enabled: dialogOpen && active }
+  );
+  // 目录搜索只在对话框打开、页面 active 且存在 active 快照时启用（无快照时后端必然返回空）。
+  const pricingStatus = useUsagePricingQuery({ enabled: dialogOpen && active });
   // 刷新成功/失败后失效 pricing：缓存（尤其是「无快照」）不再长期挡住目录搜索。
   useUsagePricingEvents();
   const refetchPricing = pricingStatus.refetch;
@@ -200,7 +212,7 @@ export function BillingProfilesManager({
   }, [dialogOpen, refetchPricing]);
   const hasPricingSnapshot = (pricingStatus.data?.snapshotId ?? null) !== null;
   const catalog = useUsagePricingCatalogQuery(catalogQuery, {
-    enabled: dialogOpen && hasPricingSnapshot,
+    enabled: dialogOpen && active && hasPricingSnapshot,
   });
   const catalogResults = (catalog.data ?? []).slice(0, 20);
 

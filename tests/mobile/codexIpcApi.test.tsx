@@ -5,7 +5,10 @@ import {
   CODEX_THREAD_EVENTS_PATH,
   CODEX_THREAD_MESSAGES_PATH,
   CODEX_THREAD_PATH,
+  answerCodexAsync,
   fetchCodexAction,
+  fetchCodexAdaptStatus,
+  updateCodexAdaptSettings,
   fetchCodexMessagesPage,
   fetchCodexQueue,
   fetchCodexThread,
@@ -13,6 +16,7 @@ import {
   reconcileCodexQueuedReceipt,
   respondCodexPending,
   retractCodexAction,
+  editCodexQueueMessage,
   subscribeCodexThread,
   type CapabilitySet,
   type CodexActionView,
@@ -585,6 +589,279 @@ function legacyMessage(id: string) {
   return { id, role: "user", kind: "user_input", text: id, ts: 1000 };
 }
 
+describe("codexIpcApi：T03 支持状态/能力身份/活动回合 增量字段", () => {
+  it("t03_support_capability_identity_active_turn_parsed：新字段逐字段透出", async () => {
+    installFetch();
+    routes.thread = projection({
+      activeTurnId: "turn-9",
+      effectiveOperations: {
+        policyRevision: 7,
+        capabilityIdentity: "cap-id-1",
+        operations: {
+          async_answer_idle: {
+            implemented: true,
+            allowed: false,
+            requiresAutoAdapt: true,
+            evidence: "contract_matched",
+            support: "supported",
+            reasonCode: "operation_runtime_active",
+          },
+        },
+      },
+    } as unknown as ThreadProjection);
+    const p = await fetchCodexThread("s1");
+    expect(p?.activeTurnId).toBe("turn-9");
+    expect(p?.effectiveOperations?.capabilityIdentity).toBe("cap-id-1");
+    const status = p?.effectiveOperations?.operations.async_answer_idle;
+    expect(status?.support).toBe("supported");
+    // 资格字段原样保留：support 只是并列输出，不改 allowed/reasonCode。
+    expect(status?.allowed).toBe(false);
+    expect(status?.reasonCode).toBe("operation_runtime_active");
+  });
+
+  it("t03_legacy_payload_support_derived_display_only：旧载荷缺新字段不报错；support 按 evidence 推导（仅展示）；缺字段不产生新写资格", async () => {
+    installFetch();
+    routes.thread = projection({
+      effectiveOperations: {
+        policyRevision: 7,
+        operations: {
+          async_answer_idle: {
+            implemented: true,
+            allowed: false,
+            requiresAutoAdapt: true,
+            evidence: "contract_matched",
+            reasonCode: "operation_runtime_active",
+          },
+          blocking_input: {
+            implemented: true,
+            allowed: false,
+            requiresAutoAdapt: true,
+            evidence: "none",
+            reasonCode: "operation_no_evidence",
+          },
+        },
+      },
+    } as unknown as ThreadProjection);
+    const p = await fetchCodexThread("s1");
+    // 旧载荷无 activeTurnId / capabilityIdentity → undefined（不崩、不猜）。
+    expect(p?.activeTurnId).toBeUndefined();
+    expect(p?.effectiveOperations?.capabilityIdentity).toBeUndefined();
+    // support 缺省 → 按 evidence 推导（展示值）：有证据即 supported。
+    expect(p?.effectiveOperations?.operations.async_answer_idle?.support).toBe("supported");
+    expect(p?.effectiveOperations?.operations.blocking_input?.support).toBe("identifying");
+    // 推导只改展示：allowed=false 原样保留，不得因"推导出 supported"而放行。
+    expect(p?.effectiveOperations?.operations.async_answer_idle?.allowed).toBe(false);
+  });
+
+  it("r1_support_inherited_parsed：展示沿用标记透出（仅 true；缺省/脏值 → undefined）", async () => {
+    installFetch();
+    routes.thread = projection({
+      effectiveOperations: {
+        policyRevision: 8,
+        capabilityIdentity: "cap-1",
+        operations: {
+          async_answer_idle: {
+            implemented: true,
+            allowed: false,
+            requiresAutoAdapt: true,
+            evidence: "none",
+            support: "supported",
+            supportInherited: true,
+            reasonCode: "operation_target_stale",
+          },
+          blocking_input: {
+            implemented: true,
+            allowed: false,
+            requiresAutoAdapt: true,
+            evidence: "none",
+            support: "identifying",
+            supportInherited: "yes",
+            reasonCode: "operation_no_evidence",
+          },
+        },
+      },
+    } as unknown as ThreadProjection);
+    const p = await fetchCodexThread("s1");
+    expect(p?.effectiveOperations?.operations.async_answer_idle?.supportInherited).toBe(true);
+    // 脏值不透出（严格 true 才认）。
+    expect(p?.effectiveOperations?.operations.blocking_input?.supportInherited).toBeUndefined();
+    // 展示标记不授权：allowed 原样 false。
+    expect(p?.effectiveOperations?.operations.async_answer_idle?.allowed).toBe(false);
+  });
+
+  it("c03_support_identity_verified_parsed：包身份已核对标记透出（仅 true；缺省/脏值 → undefined=待核对）", async () => {
+    installFetch();
+    routes.thread = projection({
+      effectiveOperations: {
+        policyRevision: 9,
+        capabilityIdentity: "cap-1",
+        operations: {
+          async_answer_idle: {
+            implemented: true,
+            allowed: false,
+            requiresAutoAdapt: true,
+            evidence: "none",
+            support: "supported",
+            supportInherited: true,
+            supportIdentityVerified: true,
+            reasonCode: "operation_target_stale",
+          },
+          blocking_input: {
+            implemented: true,
+            allowed: false,
+            requiresAutoAdapt: true,
+            evidence: "none",
+            support: "supported",
+            supportInherited: true,
+            supportIdentityVerified: "yes",
+            reasonCode: "operation_no_evidence",
+          },
+        },
+      },
+    } as unknown as ThreadProjection);
+    const p = await fetchCodexThread("s1");
+    expect(p?.effectiveOperations?.operations.async_answer_idle?.supportIdentityVerified).toBe(
+      true
+    );
+    // 脏值不透出（严格 true 才认）→ 前端按「待核对」展示。
+    expect(
+      p?.effectiveOperations?.operations.blocking_input?.supportIdentityVerified
+    ).toBeUndefined();
+    expect(p?.effectiveOperations?.operations.blocking_input?.allowed).toBe(false);
+  });
+
+  it("t03_dirty_support_and_turn_id_degrade：脏 support / 脏 activeTurnId 不透传", async () => {
+    installFetch();
+    routes.thread = projection({
+      activeTurnId: 42,
+      effectiveOperations: {
+        policyRevision: 7,
+        capabilityIdentity: 99,
+        operations: {
+          send: {
+            implemented: true,
+            allowed: true,
+            requiresAutoAdapt: false,
+            evidence: "shipped",
+            support: "supported_troll",
+            reasonCode: null,
+          },
+        },
+      },
+    } as unknown as ThreadProjection);
+    const p = await fetchCodexThread("s1");
+    expect(p?.activeTurnId).toBeUndefined();
+    expect(p?.effectiveOperations?.capabilityIdentity).toBeUndefined();
+    // 枚举外 support 词 → 按 evidence 推导兜底（shipped → supported）。
+    expect(p?.effectiveOperations?.operations.send?.support).toBe("supported");
+    expect(p?.effectiveOperations?.operations.send?.allowed).toBe(true);
+  });
+});
+
+describe("codexIpcApi：projectionVersion 增量版本束（T02）", () => {
+  it("projection_version_parsed_when_present：版本束逐字段透出（camelCase，与 Rust DTO 逐字段对齐）", async () => {
+    installFetch();
+    routes.thread = projection({
+      projectionVersion: {
+        instanceId: "boot-1",
+        ownerEpoch: 2,
+        ownerGeneration: 3,
+        revision: 50,
+        localSeq: 7,
+      },
+    });
+    const p = await fetchCodexThread("s1");
+    expect(p?.projectionVersion).toEqual({
+      instanceId: "boot-1",
+      ownerEpoch: 2,
+      ownerGeneration: 3,
+      revision: 50,
+      localSeq: 7,
+    });
+  });
+
+  it("projection_version_absent_or_dirty_degrades：旧载荷缺字段不报错（undefined）；脏形状不透传（缺版本不获新写资格）", async () => {
+    installFetch();
+    // 旧后端：无该字段 → undefined，不报错（按旧载荷退化）
+    routes.thread = projection();
+    expect((await fetchCodexThread("s1"))?.projectionVersion).toBeUndefined();
+    // 脏形状（子字段缺失/错型）：归一化丢弃，不得把半截版本束当真值
+    routes.thread = projection({
+      projectionVersion: {
+        instanceId: 7,
+        ownerEpoch: "x",
+      } as unknown as ThreadProjection["projectionVersion"],
+    });
+    expect((await fetchCodexThread("s1"))?.projectionVersion).toBeUndefined();
+    routes.thread = projection({
+      projectionVersion: {
+        instanceId: "boot-2",
+        ownerEpoch: 1,
+        // ownerGeneration 缺失 → 脏
+        revision: null,
+        localSeq: 0,
+      } as unknown as ThreadProjection["projectionVersion"],
+    });
+    expect((await fetchCodexThread("s1"))?.projectionVersion).toBeUndefined();
+    // revision=null 合法（无 Desktop revision 的事件按 localSeq 竞争）
+    routes.thread = projection({
+      projectionVersion: {
+        instanceId: "boot-2",
+        ownerEpoch: 1,
+        ownerGeneration: 1,
+        revision: null,
+        localSeq: 0,
+      },
+    });
+    expect((await fetchCodexThread("s1"))?.projectionVersion).toEqual({
+      instanceId: "boot-2",
+      ownerEpoch: 1,
+      ownerGeneration: 1,
+      revision: null,
+      localSeq: 0,
+    });
+  });
+
+  it("sse_frames_share_projection_version_normalization：SSE 首帧/增量帧同一归一化", () => {
+    MockEventSource.reset();
+    vi.useFakeTimers();
+    vi.stubGlobal("EventSource", MockEventSource);
+    installFetch();
+    const onState = vi.fn();
+    const onUnavailable = vi.fn();
+    const stop = subscribeCodexThread("s1", onState, onUnavailable);
+    MockEventSource.latest().emit(
+      "snapshot",
+      JSON.stringify({
+        ...projection(),
+        projectionVersion: {
+          instanceId: "boot-1",
+          ownerEpoch: 1,
+          ownerGeneration: 1,
+          revision: 12,
+          localSeq: 30,
+        },
+      })
+    );
+    expect(onState).toHaveBeenCalledTimes(1);
+    expect(onState.mock.calls[0][0].projectionVersion).toEqual({
+      instanceId: "boot-1",
+      ownerEpoch: 1,
+      ownerGeneration: 1,
+      revision: 12,
+      localSeq: 30,
+    });
+    // 脏版本束的帧照常落地（版本束归一化为 undefined），不炸流
+    MockEventSource.latest().emit(
+      "state",
+      JSON.stringify({ ...projection(), projectionVersion: { instanceId: null } })
+    );
+    expect(onState).toHaveBeenCalledTimes(2);
+    expect(onState.mock.calls[1][0].projectionVersion).toBeUndefined();
+    stop();
+  });
+});
+
 describe("codexIpcApi：historyToken 归一化（Task 5）", () => {
   it("thread_history_token_legacy_defaults_empty：旧载荷缺 historyToken → 空串（不得据此分页）", async () => {
     installFetch();
@@ -766,4 +1043,193 @@ describe("reconcileCodexQueuedReceipt", () => {
     const nullPos = view([queued("act-1", null)]);
     expect(reconcileCodexQueuedReceipt(prev, nullPos)).toBe(prev);
   });
+});
+
+// ============================================================
+// T08：移动端能力详情/开关/正式答题的**不可信载荷**处理
+// ============================================================
+
+describe("codexIpcApi：T08 能力详情与异步正式答题", () => {
+  function stubAdapt(payloads: {
+    thread?: unknown;
+    status?: unknown;
+    settings?: unknown;
+    answer?: unknown;
+  }) {
+    fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      const body = (value: unknown) =>
+        new Response(JSON.stringify(value), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      if (url.includes("/codex/adapt-status")) return body(payloads.status);
+      if (url.includes("/codex/adapt-settings")) return body(payloads.settings);
+      if (url.includes("/codex/async-answer")) return body(payloads.answer);
+      if (url.includes("/codex/thread")) return body(payloads.thread);
+      return new Response("no", { status: 404 });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+  }
+
+  it("T08 missing operations is unknown, not permission granted", async () => {
+    stubAdapt({
+      thread: {
+        threadId: "th-1",
+        revision: 1,
+        stale: false,
+        availability: "controllable",
+        capabilities: caps(),
+        runtimeStatus: "idle",
+        contentState: "ready",
+        messages: [],
+        truncated: false,
+        historyToken: "",
+        pending: [],
+      },
+    });
+    const parsed = await fetchCodexThread("s1");
+    // 缺字段 = 未知；绝不能从 availability/capabilities 推导"全部可用"。
+    expect(parsed?.effectiveOperations).toBeUndefined();
+    expect(parsed?.asyncQuestions).toBeUndefined();
+  });
+
+  it("T08 unknown operation keys are ignored and dirty statuses are not grants", async () => {
+    stubAdapt({
+      thread: {
+        ...projection(),
+        effectiveOperations: {
+          policyRevision: 7,
+          operations: {
+            blocking_input: {
+              implemented: true,
+              allowed: true,
+              requiresAutoAdapt: false,
+              evidence: "contract_matched",
+              reasonCode: null,
+            },
+            brand_new_operation: {
+              implemented: true,
+              allowed: true,
+              requiresAutoAdapt: false,
+              evidence: "shipped",
+              reasonCode: null,
+            },
+            send: { implemented: "yes" },
+          },
+        },
+        asyncQuestions: [
+          {
+            questionKey: '["request_user_input_async","call-a",0]',
+            contextToken: "ctx:1",
+            sourceTurnId: "t1",
+            sourceItemId: "call-a",
+            questionIndex: 0,
+            title: "选一个",
+            options: ["甲"],
+            state: "pending",
+            actionable: true,
+            disabledReasonCode: null,
+          },
+          { questionKey: "broken" },
+        ],
+      },
+    });
+    const parsed = await fetchCodexThread("s1");
+    expect(parsed?.effectiveOperations?.operations.blocking_input?.allowed).toBe(true);
+    expect(
+      (parsed?.effectiveOperations?.operations as Record<string, unknown>).brand_new_operation
+    ).toBeUndefined();
+    expect(parsed?.effectiveOperations?.operations.send).toBeUndefined();
+    expect(parsed?.asyncQuestions).toHaveLength(1);
+    expect(parsed?.asyncQuestions?.[0].state).toBe("pending");
+  });
+
+  it("T08 async answer body is strict (no raw/owner/method)", async () => {
+    stubAdapt({ answer: receipt("accepted") });
+    const result = await answerCodexAsync({
+      sessionId: "s1",
+      actionId: "act-1",
+      questionKey: '["request_user_input_async","call-a",0]',
+      contextToken: "ctx:1",
+      answer: "甲",
+    });
+    expect(result.delivery).toBe("accepted");
+    const call = fetchMock.mock.calls.find(([u]) => String(u).includes("/codex/async-answer"));
+    const body = JSON.parse(String((call![1] as RequestInit).body)) as Record<string, unknown>;
+    expect(Object.keys(body).sort()).toEqual([
+      "actionId",
+      "answer",
+      "contextToken",
+      "questionKey",
+      "sessionId",
+    ]);
+  });
+
+  it("T08 adapt details keep operations optional and never invent them", async () => {
+    stubAdapt({
+      status: {
+        sessionId: "s1",
+        systemVersion: "macos 27",
+        tuvisVersion: "0.6.1",
+        desktopBuild: "26.1021.31345",
+        autoAdaptEnabled: true,
+        hintSeen: false,
+        lastFailure: null,
+      },
+      settings: {
+        sessionId: "s1",
+        systemVersion: "macos 27",
+        tuvisVersion: "0.6.1",
+        desktopBuild: "26.1021.31345",
+        autoAdaptEnabled: false,
+        hintSeen: true,
+        effectiveOperations: {
+          policyRevision: 9,
+          operations: {
+            async_answer_idle: {
+              implemented: true,
+              allowed: false,
+              requiresAutoAdapt: true,
+              evidence: "contract_matched",
+              reasonCode: "operation_runtime_active",
+            },
+          },
+        },
+      },
+    });
+    const details = await fetchCodexAdaptStatus("s1");
+    expect(details.effectiveOperations).toBeUndefined();
+    const updated = await updateCodexAdaptSettings({
+      sessionId: "s1",
+      action: "set_enabled",
+      enabled: false,
+    });
+    expect(updated.autoAdaptEnabled).toBe(false);
+    expect(updated.effectiveOperations?.operations.async_answer_idle?.allowed).toBe(false);
+  });
+});
+
+it("queue edit posts session and action, and never returns text on a failed CAS", async () => {
+  const fetcher = vi
+    .fn()
+    .mockResolvedValueOnce(
+      new Response(JSON.stringify({ actionId: "a1", text: "original" }), { status: 200 })
+    )
+    .mockResolvedValueOnce(
+      new Response(JSON.stringify({ error: "already_dispatched" }), { status: 409 })
+    );
+  vi.stubGlobal("fetch", fetcher);
+  await expect(editCodexQueueMessage("s1", "a1")).resolves.toEqual({
+    actionId: "a1",
+    text: "original",
+  });
+  expect(fetcher).toHaveBeenCalledWith(
+    "/m/api/v1/codex/queue/edit",
+    expect.objectContaining({
+      method: "POST",
+      body: JSON.stringify({ sessionId: "s1", actionId: "a1" }),
+    })
+  );
+  await expect(editCodexQueueMessage("s1", "a1")).rejects.toMatchObject({ status: 409 });
 });

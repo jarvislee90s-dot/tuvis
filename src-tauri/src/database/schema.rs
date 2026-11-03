@@ -208,10 +208,50 @@ pub fn init(conn: &Connection) {
             compat_rollout_baseline INTEGER,
             compat_wire_hash        TEXT,
             barrier_force_released_at INTEGER,
+            -- H01：原动作捕获的效果归属（probe_key/包 SHA/规则）；只在准确效果确认
+            -- 后结算一次，结算即清空（不猜当前目标）。
+            effect_probe_key      TEXT,
+            effect_package_sha256 TEXT,
+            effect_rule_version   INTEGER,
             -- 签名开关的登记时冻结值（1 = 正文已带 `[mobile 花名]` 签名）。
             -- NULL = 本列上线前登记的旧行：按升级前语义（恒带签名）派发。
-            signature_applied       INTEGER
+            signature_applied       INTEGER,
+            -- C02（R05 残留收口）：优先处理「停止尝试」的持久占有状态机。占有在
+            -- **首次可能写出 interrupt 之前** CAS 落库（claim），覆盖「writer 已接收/
+            -- 写出帧后 handler 被取消/服务退出」的事后记录盲窗——同 actionId 重放读到
+            -- 占有/未知记录不得再次发停止帧。
+            -- stop_attempt_state：NULL（未占有，含 C02 前旧行）| 'claimed'（已占有、
+            -- 结果未知）| 'released'（首写前明确零投递，允许显式新尝试）。
+            stop_attempt_state     TEXT,
+            -- 停止尝试的未知结果 reason_code（C02 起由 claimed 占有的结果升级写入；
+            -- 旧行形态：state 为 NULL 且本列非 NULL = C02 前已记录的未知结果，读侧
+            -- 兼容识别为 Unknown——重放同样不再发停止帧）。
+            stop_attempt_reason     TEXT
         );
+        -- 一个 start-turn 的持久成员映射；正文逐成员冻结，回执归属保持原 action。
+        CREATE TABLE IF NOT EXISTS codex_send_batch_members (
+            member_id TEXT PRIMARY KEY,
+            leader_id TEXT NOT NULL,
+            wire_text TEXT NOT NULL,
+            signature_applied INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_codex_send_batch_leader
+            ON codex_send_batch_members(leader_id);
+        -- 原动作所有收敛路径（包括重启恢复、迟到回执）在同一 SQL 事务传播。
+        -- 只有 canonical action 持有 Turn 屏障，成员通过映射核对或解除屏障。
+        CREATE TRIGGER IF NOT EXISTS codex_send_batch_settle
+        AFTER UPDATE OF state, receipt_json ON codex_actions
+        WHEN NEW.state IN ('accepted', 'unknown', 'rejected')
+          AND EXISTS (SELECT 1 FROM codex_send_batch_members WHERE leader_id=NEW.action_id)
+        BEGIN
+            UPDATE codex_actions SET state=NEW.state, route=NEW.route,
+                receipt_json=CASE WHEN NEW.receipt_json IS NULL THEN NULL
+                    ELSE json_set(NEW.receipt_json, '$.actionId', action_id) END,
+                updated_at=NEW.updated_at
+            WHERE action_id IN (SELECT member_id FROM codex_send_batch_members
+                WHERE leader_id=NEW.action_id AND member_id<>NEW.action_id);
+        END;
+
         CREATE INDEX IF NOT EXISTS idx_codex_actions_thread_state_seq
             ON codex_actions(thread_id, state, seq);
         -- partial index 只收「调度/对账关心的行」，随 migrate 幂等重放补建到老库。
@@ -332,6 +372,71 @@ pub fn init(conn: &Connection) {
             evidence    TEXT,
             updated_at  INTEGER NOT NULL,
             PRIMARY KEY (key, capability)
+        );
+        -- ===== S2：打断后队列持久暂停（设计 §4.2/§4.3）=====
+        -- 复审 R-T2 起**按 token 多行共存**：每次打断（interrupt_pending 前置档）
+        -- 落**自己的行**，受理/不确定保留、Rejected/NotSent 只撤自己的行、显式
+        -- resume 清全部；「暂停中 = EXISTS 任意行」——并发/交错打断不再因「只有
+        -- 第一个 token 拥有行」而丢失后受理打断的保护。读取取**最早行**（首次
+        -- 暂停时间与原因保留，审计起点不漂移）。
+        CREATE TABLE IF NOT EXISTS codex_queue_pause (
+            thread_id    TEXT NOT NULL,
+            paused_at    INTEGER NOT NULL,
+            pause_reason TEXT NOT NULL,
+            -- 终审 R3：暂停归属 token（打断尝试标识）。撤回只清**本次 token 拥有**
+            -- 的行——重复打断失败/并发交错不得清除他人（上次受理）建立的暂停。
+            -- 老库经 migrate 幂等补列 + 重建（旧行 NULL = 无归属，仅 resume/显式
+            -- 清除可删；SQLite 复合主键允许 NULL 与 token 行共存）。
+            pause_token  TEXT,
+            -- P3（2026-10-30 用户裁决）：停止类暂停等待的目标回合（打断/取消端点
+            -- 的 expectedTurnId 安全阀）。settle 路径按该 Turn 的**终态证据**自动
+            -- 清除停止类暂停行（「停止在途/结果未知」只是派发闸，不是永久冻结）；
+            -- NULL = 未绑定（旧行/取不到阀值）→ 保守保留，仅显式 resume 可清。
+            pause_turn_id TEXT,
+            PRIMARY KEY (thread_id, pause_token)
+        );
+        -- ===== S2：一次性越队授权（设计 §4.2「不能全局绕过」）=====
+        -- 绑定到具体新 action 的持久授权：授权跨 thread / 跨 action / 重复消费 /
+        -- pending 在场全部无效。consumed_at 非 NULL = 已消费（写出前 CAS 消费恰好
+        -- 一次）；行保留作审计（为什么这条先发了）。
+        -- R06：attempt = 尝试代际。**已消费行可被优先处理重铸为下一 attempt**
+        --（仅当动作仍 queued = 上一次明确零投递 busy 回队；真实写出的行必已离开
+        -- queued 不会走到重铸）——「下一次用户授权」独立可 CAS，旧 attempt 不复活。
+        CREATE TABLE IF NOT EXISTS codex_bypass_grant (
+            action_id   TEXT PRIMARY KEY,
+            thread_id   TEXT NOT NULL,
+            granted_at  INTEGER NOT NULL,
+            consumed_at INTEGER,
+            attempt     INTEGER NOT NULL DEFAULT 1
+        );
+        -- ===== S4：人工继续的持久派发权撤销（设计 §6.2「撤销旧动作尚未取得的未来
+        -- 首次写出权」）=====
+        -- 行存在 = 该动作的**尚未发生的首次写出**已被撤销：旧派发任务、重启恢复、
+        -- 迟到 HTTP 在写出边界（真正 start-turn 之前）都必须查本表；已越过不可撤回
+        -- 写入点的旧动作不受追溯（只继续收尾取证）。单调标记（不删行）——撤销后
+        -- 任何路径不得重新取得首次写出权；迟到真实结果仍可补记（不动本表）。
+        -- 复审 R-T1（两态行）：同一行承载**两个互斥状态**——
+        --   * revoked_at 非 NULL = 写出权已撤销（人工继续胜出）；
+        --   * claimed_at 非 NULL（且 revoked_at NULL）= 首次写出权**已取得**（writer
+        --     在真正 write_all 前以单条 CAS 原子取得——这是「取得首次写出权」的
+        --     线性化点；此后人工继续的撤销 CAS 必输，按 §6.2 只收尾取证不建后继）。
+        -- 两态竞争靠同表单语句 UPSERT+WHERE 的 SQLite 写串行化保证原子（无中间窗口）。
+        CREATE TABLE IF NOT EXISTS codex_write_revoke (
+            action_id  TEXT PRIMARY KEY,
+            revoked_at INTEGER,
+            reason     TEXT,
+            claimed_at INTEGER
+        );
+        -- ===== S4：人工继续的唯一后继关联（设计 §6.2「服务端记录原 actionId、人工
+        -- 解除时间与原因、新 actionId 的关联；多设备并发也最多建立一个后继」）=====
+        -- old_action_id 主键 = 每个原动作至多一个后继（持久 CAS：并发第二台设备
+        -- INSERT 冲突 → 返回既有后继）。后继行本身在 codex_actions（同一事务内登记）。
+        CREATE TABLE IF NOT EXISTS codex_manual_resume (
+            old_action_id      TEXT PRIMARY KEY,
+            successor_action_id TEXT NOT NULL,
+            device_id          TEXT NOT NULL,
+            resumed_at         INTEGER NOT NULL,
+            reason             TEXT
         );
         CREATE TABLE IF NOT EXISTS write_audit (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -644,6 +749,11 @@ pub fn init(conn: &Connection) {
         --   fingerprint：官方 schema 探针的**内容指纹**（文件名+大小的 sha256）——只对
         --   capability='schema' 的行有意义；让「build × 能力」数据集能追到具体
         --   schema 版本（老库由 migration.rs 补列）。
+        --   S1（2026-10-23 设计 §3.2）：**成功证据与最近失败观测分离**——`state` 列降级为
+        --   「最近一次观测」，`evidence_at`/`evidence_stage` 记**最后一次成功取证**（NULL =
+        --   从未成功）。失败观测写入时两列原样保留（老库里 state∈probed|verified 的行由
+        --   读侧/写侧按旧值提升，migration 只补列不改行）。跨重启复用看证据列，不看
+        --   `state`——超时/断链不再把「该版本没能力」的错误结论盖掉成功证据。
         CREATE TABLE IF NOT EXISTS codex_ipc_probe (
             probe_key        TEXT NOT NULL,
             capability       TEXT NOT NULL,
@@ -656,7 +766,183 @@ pub fn init(conn: &Connection) {
             last_seen_at     INTEGER NOT NULL,
             next_retry_at    INTEGER,
             last_duration_ms INTEGER,
+            evidence_at      INTEGER,
+            evidence_stage   TEXT,
             PRIMARY KEY (probe_key, capability)
+        );
+        -- ===== TPS 短时抽样三表（2026-10-24 计划 Task 2 / spec §6 固定工程契约）=====
+        -- 与旧 usage_* 账本**完全解耦**：不共用表、不共用游标（usage_cursor 是旧用量域的，
+        -- 本域游标只落 tps_state）、保留期独立 24 小时（本域 purge 只删这三张表，绝不动
+        -- usage_* 的保留设置）。
+        -- ① 事实表：主键 = source+host_instance+stable_call_key（spec §6）；UPSERT =
+        --    后写整行覆盖（同一调用重复读取取更新鲜的值，spec §7「同调用重复读取不翻倍」
+        --    的存储半边；点入样仍由 policy 层按稳定键去重）。失败/取消也落表（spec §3：
+        --    不入速度但有可靠起止仍进耗时详情），可空列 = 「不可得」，读回 None 不填 0。
+        --    started/ended 的 epoch 非负 CHECK 既是数据哨兵，也是「批内中途失败」原子性
+        --    验收的注入缝（tests/tps_store_test.rs 用 ended_at_ms=-1 的行让事务在批中段失败）。
+        CREATE TABLE IF NOT EXISTS tps_observation (
+            source             TEXT NOT NULL,
+            host_instance      TEXT NOT NULL,
+            stable_call_key    TEXT NOT NULL,
+            started_at_ms      INTEGER NOT NULL CHECK(started_at_ms >= 0),
+            first_token_at_ms  INTEGER,
+            ended_at_ms        INTEGER NOT NULL CHECK(ended_at_ms >= 0),
+            native_duration_ms INTEGER,
+            generation_ms      INTEGER,
+            -- V2（桌面四页导航与输出速度 V2 Task 1）：含等待的响应时长 ms（开始→终态）。
+            -- 可空无默认：旧行 NULL = 旧记录无显式响应窗（读取层走旧流式有效性的兼容路径）；
+            -- 老库由 migration.rs ALTER 幂等补列
+            response_elapsed_ms INTEGER,
+            output_tokens      INTEGER,
+            output_scope       TEXT NOT NULL,
+            tool_ms            INTEGER,
+            model              TEXT NOT NULL,
+            channel            TEXT,
+            session_key        TEXT,
+            turn_key           TEXT,
+            purpose            TEXT NOT NULL,
+            outcome            TEXT NOT NULL,
+            method             TEXT NOT NULL,
+            failure_reason     TEXT,
+            PRIMARY KEY (source, host_instance, stable_call_key)
+        );
+        -- spec「三表与 source/ended_at、sampled_at/series 索引」：保留清理与按 series 取数都走这两列
+        CREATE INDEX IF NOT EXISTS idx_tps_observation_ended
+            ON tps_observation(ended_at_ms);
+        CREATE INDEX IF NOT EXISTS idx_tps_observation_series
+            ON tps_observation(source, model, method);
+        -- V2 dashboard（2026-10-26 计划 Task 6）：series 维过滤 + 完成窗范围扫描的复合索引
+        -- （source, model, channel, method, ended_at_ms）——桶查询/工具筛选都以此命中
+        -- （ channel 可空：SQLite 索引含 NULL，`channel IS ?` 仍可走该索引）
+        CREATE INDEX IF NOT EXISTS idx_tps_observation_series_ended
+            ON tps_observation(source, model, channel, method, ended_at_ms);
+        -- ② 采样点表：主键 = tick_id+series_key（spec §6）。tick_id 由 store 层取
+        --    TpsPoint.point_id（policy 层已按 {run_id}:{sampled_at}:{series_id} 确定性生成，
+        --    见 services/tps/store.rs），同点重存 = UPSERT 不重复。
+        --    列名与 spec §6 点列清单对齐：n = TpsPoint.sample_count（TPS 有效 n，≤20）；
+        --    ttft_count = ttft_sample_count（首点可对齐的独立分母）；ttft_sum_ms = ttft_sum_ms；
+        --    trigger_kind = trigger（避开 SQL 关键字）。其余列为 TpsMetrics 平铺镜像
+        --    （TpsPoint 承载全部指标面，读侧要还原整点）；age_ms 是「当时钟−结束」派生值，
+        --    **不落库**，读侧按 sampled_at 重算。status 钉 spec 逐字二值；window_ms 钉
+        --    spec 逐字 120000（与 policy::TPS_WINDOW_MS 同源常量）。
+        CREATE TABLE IF NOT EXISTS tps_point (
+            tick_id              TEXT NOT NULL,
+            series_key           TEXT NOT NULL,
+            sampled_at           INTEGER NOT NULL,
+            window_ms            INTEGER NOT NULL CHECK(window_ms = 120000),
+            run_id               TEXT NOT NULL,
+            trigger_kind         TEXT NOT NULL,
+            status               TEXT NOT NULL CHECK(status IN ('value','gap')),
+            -- 发点时生效的计划节奏 ms（可见 60000 / 后台 600000；独立复核 R11）；旧行 NULL
+            cadence_ms           INTEGER,
+            method               TEXT NOT NULL,
+            output_scope         TEXT NOT NULL,
+            quality              TEXT NOT NULL,
+            n                    INTEGER NOT NULL DEFAULT 0,
+            sum_output_tokens    INTEGER NOT NULL DEFAULT 0,
+            sum_generation_ms    INTEGER NOT NULL DEFAULT 0,
+            ttft_sum_ms          INTEGER,
+            ttft_count           INTEGER NOT NULL DEFAULT 0,
+            model_ms             INTEGER,
+            tool_ms              INTEGER,
+            avg_first_token_ms   INTEGER,
+            tps                  REAL,
+            candidate_count      INTEGER NOT NULL DEFAULT 0,
+            timed_model_count    INTEGER NOT NULL DEFAULT 0,
+            timed_tool_count     INTEGER NOT NULL DEFAULT 0,
+            failed_count         INTEGER NOT NULL DEFAULT 0,
+            cancelled_count      INTEGER NOT NULL DEFAULT 0,
+            missing_timing_count INTEGER NOT NULL DEFAULT 0,
+            latest_ended_at      INTEGER,
+            sampled_keys         TEXT NOT NULL DEFAULT '[]',
+            PRIMARY KEY (tick_id, series_key)
+        );
+        CREATE INDEX IF NOT EXISTS idx_tps_point_sampled
+            ON tps_point(sampled_at, series_key);
+        -- ③ 状态表：key+JSON（spec §6：源游标/安装记录/调度元数据）。键约定由
+        --    services/tps/store.rs 固定（cursor:<source> / source_state:<source>）；通用
+        --    key/JSON 通道供安装记录与调度元数据复用。游标**只**落本表，不借旧 usage_cursor。
+        CREATE TABLE IF NOT EXISTS tps_state (
+            key        TEXT PRIMARY KEY,
+            value_json TEXT NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
+        -- S1：**schema 决策词持久证据**（设计 §3.2：只存文件指纹不能重建决策词，须持久
+        -- 保存经过校验的 decision 枚举；仍在每个 pending 上求交集，缓存不直接批准）。
+        -- probe_key 主键与账本同键（platform|build|cli_id|probe_epoch）；新表无存量，
+        -- CREATE IF NOT EXISTS 即幂等迁移，无老用户数据要搬。
+        -- T03：**异步题持久提示**（只存无正文身份与最后事实；用于重启后"已知但
+        -- 未加载"保持保守 Unknown，不复活写资格——contextToken 每代重生成）。
+        CREATE TABLE IF NOT EXISTS codex_interaction_hints (
+            thread_id        TEXT NOT NULL,
+            source_turn_id   TEXT NOT NULL,
+            source_item_id   TEXT NOT NULL,
+            question_index   INTEGER NOT NULL,
+            last_fact        TEXT NOT NULL,
+            updated_at       INTEGER NOT NULL,
+            PRIMARY KEY (thread_id, source_turn_id, source_item_id, question_index)
+        );
+        -- H01：**按完整捕获目标的逐操作真实成功证据**（效果确认后才写入；跨 build/
+        -- 包内容/规则版本不通用）。旧台账 Accepted 行只保留审计，不推导成功证据。
+        CREATE TABLE IF NOT EXISTS codex_operation_success (
+            probe_key       TEXT NOT NULL,
+            package_sha256  TEXT NOT NULL,
+            operation       TEXT NOT NULL,
+            rule_version    INTEGER NOT NULL,
+            evidence_at     INTEGER NOT NULL,
+            PRIMARY KEY (probe_key, package_sha256, operation, rule_version)
+        );
+        -- R02：**异步题持久排他占用**（同题只允许一个在途/未知正式提交）。
+        -- 主键 = 题的持久身份（thread + 官方紧凑 question_key）；action_id 绑定占用者，
+        -- state ∈ in_flight / unknown / answered。明确零投递（NotSent/Rejected）删除行，
+        -- 受理/未知保留——跨设备、换 actionId、重启后都不会重复正式提交。
+        -- 不存答案或信封正文。
+        CREATE TABLE IF NOT EXISTS codex_interaction_claims (
+            thread_id     TEXT NOT NULL,
+            question_key  TEXT NOT NULL,
+            action_id     TEXT NOT NULL,
+            context_token TEXT,
+            state         TEXT NOT NULL,
+            -- H05：取得占用的工作代际（owner epoch）。只有**代际已变**（旧拥有者
+            -- 确定失去写权）才允许接管；年龄本身不是失效证据。
+            claimed_epoch INTEGER NOT NULL DEFAULT 0,
+            -- N07：占用者世系（boot:epoch:generation）；与真实启动身份 + owner
+            -- 世代绑定，只有世系已变才允许接管。
+            claimed_owner TEXT NOT NULL DEFAULT '',
+            -- J02：本次调用对占用的拥有令牌（并发同 actionId 不同调用不能接管）。
+            claim_owner   TEXT NOT NULL DEFAULT '',
+            created_at    INTEGER NOT NULL,
+            updated_at    INTEGER NOT NULL,
+            PRIMARY KEY (thread_id, question_key)
+        );
+        -- B05：同组多题共享同一 action_id（一次动作、多行占用），不能再对
+        -- action_id 建唯一索引；互斥由 (thread_id, question_key) 主键保证。
+        -- T02：**逐操作契约证据**（当前运行包的有限结构匹配结论；spec §3.2「成功证据
+        -- 按完整目标指纹、能力与契约规则版本持久复用」）。主键含 rule_version 与
+        -- package_sha256：规则收紧或包内容变化后，旧结论不得当新证据复用。
+        -- 只存结构性规则（方法/版本/请求响应/语义），不存会话正文、命令、路径或凭据。
+        CREATE TABLE IF NOT EXISTS codex_ipc_contract_evidence (
+            probe_key       TEXT NOT NULL,
+            operation       TEXT NOT NULL,
+            rule_version    INTEGER NOT NULL,
+            package_sha256  TEXT NOT NULL,
+            method          TEXT NOT NULL,
+            package_size    INTEGER,
+            package_mtime_ms INTEGER,
+            base_version    INTEGER NOT NULL,
+            request_rule    TEXT NOT NULL,
+            response_rule   TEXT NOT NULL,
+            semantic_rule   TEXT NOT NULL,
+            evidenced_at    INTEGER NOT NULL,
+            observed_at     INTEGER NOT NULL,
+            PRIMARY KEY (probe_key, operation, rule_version, package_sha256)
+        );
+        CREATE TABLE IF NOT EXISTS codex_ipc_schema_evidence (
+            probe_key         TEXT PRIMARY KEY,
+            fingerprint       TEXT NOT NULL,
+            command_decisions TEXT NOT NULL,
+            file_decisions    TEXT NOT NULL,
+            evidence_at       INTEGER NOT NULL
         );
         "#,
     )

@@ -27,18 +27,12 @@
               "command": "<synthetic command>"
             }
           ],
-          "proposedExecpolicyAmendment": [
-            "<synthetic command>",
-            "<synthetic command>"
-          ],
+          "proposedExecpolicyAmendment": ["<synthetic command>", "<synthetic command>"],
           "availableDecisions": [
             "accept",
             {
               "acceptWithExecpolicyAmendment": {
-                "execpolicy_amendment": [
-                  "<synthetic command>",
-                  "<synthetic command>"
-                ]
+                "execpolicy_amendment": ["<synthetic command>", "<synthetic command>"]
               }
             },
             "cancel"

@@ -1,0 +1,75 @@
+{
+  "case": "F02 多题 / 多值 / 自由文本（第二版，Plan 模式，19:3x）",
+  "pending": {
+    "method": "item/tool/requestUserInput",
+    "id": 187,
+    "idKind": "integer",
+    "isBlocking": true,
+    "autoResolutionMs": null,
+    "questionCount": 3,
+    "qids": ["m1", "m2", "m3"],
+    "allIsOther": true,
+    "allIsSecret": false,
+    "optionLabels": {
+      "m1": ["甲", "乙", "丙"],
+      "m2": ["是", "否"],
+      "m3": ["北京", "上海"]
+    },
+    "threadRuntimeStatusWhilePending": {
+      "type": "active",
+      "activeFlags": ["waitingOnUserInput"]
+    }
+  },
+  "submitted": {
+    "frames": 1,
+    "method": "thread-follower-submit-user-input",
+    "version": 1,
+    "answersSent": {
+      "m1": ["甲", "丙"],
+      "m2": ["是"],
+      "m3": "深圳（自填，走 isOther）"
+    },
+    "receipt": {
+      "delivery": "Accepted",
+      "resultType": "success",
+      "result": {
+        "ok": true
+      },
+      "handledByClientId": true
+    }
+  },
+  "resolved": {
+    "requestsAfter": [],
+    "runtime": {
+      "type": "idle"
+    },
+    "userInputResponse": {
+      "requestId": 187,
+      "completed": true,
+      "answersStored": {
+        "m1": {
+          "values": 2,
+          "eachChars": [1, 1]
+        },
+        "m2": {
+          "values": 1,
+          "eachChars": [1]
+        },
+        "m3": {
+          "values": 1,
+          "eachChars": [2]
+        }
+      }
+    }
+  },
+  "findings": [
+    "一次请求承载 3 题、一帧答完（不拆多条普通消息）——spec §F02 的『多题同属一个请求时按其响应契约统一提交』成立",
+    "多值被上游原样记账（m1 存 2 个值）⇒ 协议无 multiSelect 标志但**支持多值**；是否呈现为多选由适配器按题面/选项决定",
+    "自由文本经 isOther=true 通道被接受并存为普通字符串答案（m3 长度 2，不在选项内）",
+    "activeFlags 出现第二个值 **waitingOnUserInput**（审批场景是 waitingOnApproval）⇒ F08 的『待处理』一行可以直接用这个旗标区分类型",
+    "读回形状仍是 {qid:[字符串数组]}（发送形状 {qid:{answers:[…]}} 的少一层归因再次确认）"
+  ],
+  "stillNotTriggered": [
+    "无选项的纯自由作答题（模型自述要求每题≥1 选项；schema 里 options 非必填 ⇒ 工具侧约束，非协议禁止）"
+  ]
+}

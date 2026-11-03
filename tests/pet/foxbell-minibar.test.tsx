@@ -18,7 +18,7 @@ const { createWindowMock, setSizeMock } = vi.hoisted(() => ({
   createWindowMock: vi.fn(async () => {}),
   setSizeMock: vi.fn(async () => {}),
 }));
-// 「详情 »」→ `openUsageDashboard` → `createWindow`：mock 掉窗口层即可断言钻取真的到了看板窗口
+// 「详情 »」→ `openUsageDashboard`：Task 7 四页同窗后判据反转为「**不**建窗、走主窗导航」
 vi.mock("@/lib/window", () => ({ createWindow: createWindowMock }));
 // 宠物窗口 API（与 foxbell-interactions.test.tsx 同模式），setSize 单独提出来断言高度入参
 vi.mock("@tauri-apps/api/window", () => ({
@@ -132,10 +132,13 @@ describe("foxbell-minibar（计划② Task 13 步骤 5/6：浮窗接线）", () 
 
     fireEvent.click(screen.getByTestId("usage-mini-row-detail"));
     await tick(0);
-    expect(createWindowMock).toHaveBeenCalledTimes(1);
-    const [label, options] = createWindowMock.mock.calls[0] as [string, { title: string }];
-    expect(label).toBe("usage-dashboard"); // 与菜单/标题栏入口同一个窗口（spec P1）
-    expect(options.title).toBe(i18n.t("usage.title"));
+    // Task 7：唯一入口 = workspace_request_navigation（唤起主窗 + 切模型用量页签），零建窗
+    const navCalls = tauriInvokeMock.mock.calls.filter(
+      ([cmd]) => cmd === "workspace_request_navigation"
+    );
+    expect(navCalls).toHaveLength(1);
+    expect((navCalls[0] as [string, Record<string, unknown>])[1]).toEqual({ tab: "usage" });
+    expect(createWindowMock).not.toHaveBeenCalled();
     expect(screen.queryByTestId("usage-mini")).toBeNull(); // 钻取即关浮窗（spec P2 第 5 条）
   });
 
@@ -211,6 +214,10 @@ describe("foxbell-minibar（计划② Task 13 步骤 5/6：浮窗接线）", () 
   });
 
   it("6. 数据与几何：档位取设置（today）、分组恒 tool、悬停即按需采集一次；窗口高度 = 卡片 + 浮窗求和", async () => {
+    // 可见即采的 60s 去抖记在模块作用域（跨实例 / 重挂载共享）：前面的用例已强制采集并记下
+    // 时间戳，把假时钟拨过窗口，模拟「新打开浮窗」的可见边沿仍会采集一次。
+    vi.setSystemTime(Date.now() + 61_000);
+
     renderPet();
     await tick(20);
     await hoverUntilShown();
@@ -225,10 +232,11 @@ describe("foxbell-minibar（计划② Task 13 步骤 5/6：浮窗接线）", () 
     expect(dash.range).toEqual({ preset: "today" }); // 设置项 miniBarRange（预设档只发 preset）
     expect(dash.groupBy).toBe("tool"); // 第 3 行是分工具汇总
 
-    // 悬停浮窗是 spec §7.2 的采集触发点之一：挂载采一次、force 恒 false（最小间隔与单飞由后端保证）
-    const collect = calls("usage_collect");
+    // 悬停浮窗是 spec §7.2 的采集触发点之一：挂载即可见即采（F7 可见性命令）
+    // （模块级 60s 第一道去抖；跨 WebView 的 60s 门闩与单飞由后端裁定）
+    const collect = calls("usage_collect_visible");
     expect(collect).toHaveLength(1);
-    expect(collect[0][1]).toEqual({ force: false });
+    expect(collect[0][1]).toEqual(undefined);
     // 读查询**绝不**触发扫描：本次会话里没有别的 collect（三个读命令只读账本，§3 第 15 条）
     expect(calls("usage_dashboard").length).toBe(1);
 

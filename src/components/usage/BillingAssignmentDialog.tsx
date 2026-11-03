@@ -31,6 +31,11 @@ export interface BillingAssignmentDialogProps {
   identities: IdentityUsage[];
   range: UsageRange;
   t: TFn;
+  /**
+   * active 门控（第三/四轮评审登记的 follow-up）：四页宿主的隐藏页期间停发 billing
+   * 读查询（含 focus refetch）。默认 true，旧调用者行为不变。
+   */
+  active?: boolean;
 }
 
 /** 完整身份显示名：provider 非空 `${provider} / ${modelId}`，否则 modelId */
@@ -52,10 +57,12 @@ export function BillingAssignmentDialog({
   identities,
   range,
   t,
+  active = true,
 }: BillingAssignmentDialogProps) {
   const queryClient = useQueryClient();
   const lang = getLang();
-  const billing = useUsageBillingQuery();
+  // billing 读查询以「对话框打开 + 页面 active」为门控（页面隐藏期间停发，含 focus refetch）
+  const billing = useUsageBillingQuery({ enabled: open && active });
   const [selectedIndex, setSelectedIndex] = useState<number | null>(null);
   const [profileChoice, setProfileChoice] = useState("");
   /** 用户是否已手动选过渠道：手选后自动填充永不覆盖（即便 billing 随后台 refetch 变化） */

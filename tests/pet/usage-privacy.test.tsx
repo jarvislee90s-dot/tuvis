@@ -41,7 +41,7 @@ vi.mock("@tauri-apps/api/event", () => ({
 }));
 
 import i18n from "@/i18n";
-import UsageDashboardPage from "@/pages/usage-dashboard";
+import { UsageDashboardBody } from "@/components/usage/UsageDashboardBody";
 import { tauriInvokeMock } from "../msw/tauriMocks";
 
 /** 金丝雀：任何会话正文出现在用量面都算隐私白名单失守 */
@@ -102,7 +102,7 @@ describe("usage-privacy（计划② Task 11：隐私白名单渲染门禁）", (
     const wrapper = ({ children }: { children: ReactNode }) => (
       <QueryClientProvider client={client}>{children}</QueryClientProvider>
     );
-    render(<UsageDashboardPage />, { wrapper });
+    render(<UsageDashboardBody active />, { wrapper });
     fireEvent.click(screen.getByTestId("usage-tab-records"));
 
     // 先在**有内容**的 DOM 上断言：记录页确实把夹具卡片渲染出来了（不是在空 DOM 上"通过"的）

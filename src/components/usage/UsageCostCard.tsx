@@ -37,6 +37,11 @@ export interface UsageCostCardProps {
   open: boolean;
   onOpenChange(open: boolean): void;
   t: TFn;
+  /**
+   * active 门控（评审 Important 2）：卡片在四页宿主里常驻挂载，页面隐藏期间传 false——
+   * costs / pricing 两个读查询停发（含 focus refetch）。默认 true，旧调用者行为不变。
+   */
+  active?: boolean;
 }
 
 function i18nLabel(label: string, t: TFn): string {
@@ -44,10 +49,10 @@ function i18nLabel(label: string, t: TFn): string {
   return label.startsWith("usage.") ? t(label) : label;
 }
 
-export function UsageCostCard({ range, open, onOpenChange, t }: UsageCostCardProps) {
+export function UsageCostCard({ range, open, onOpenChange, t, active = true }: UsageCostCardProps) {
   const { currency, rate, setCurrency } = useDisplayCurrency();
-  const costs = useUsageCostsQuery(range, rate);
-  const pricing = useUsagePricingQuery();
+  const costs = useUsageCostsQuery(range, rate, { enabled: active });
+  const pricing = useUsagePricingQuery({ enabled: active });
   // 价格刷新完成/失败后失效 pricing 与 costs（不轮询）
   useUsagePricingEvents();
 

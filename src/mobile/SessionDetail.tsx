@@ -39,10 +39,26 @@ import QuestionCard from "./QuestionCard";
 // Codex Desktop IPC：原生投影接管内容源与交互卡（Codex APP 会话）
 import CodexQueuePanel from "./CodexQueuePanel";
 import PendingRequestCard, { CodexAvailabilityBanner } from "./PendingRequestCard";
+import AsyncQuestionGroupCard from "./AsyncQuestionGroupCard";
+import CodexOperationToolbar from "./CodexOperationToolbar";
+import CodexAdaptSheet from "./CodexAdaptSheet";
+import {
+  fetchCodexAdaptStatus,
+  updateCodexAdaptSettings,
+  type CodexAsyncQuestionView,
+} from "./codexIpcApi";
+import {
+  retainCapabilityDisplay,
+  sameDisplayCache,
+  type CapabilityDisplayCache,
+} from "./codexCapabilityDisplay";
+import AnswerBubble from "./AnswerBubble";
 import ProjectedArtifacts, { buildArtifactMessageContexts } from "./ProjectedArtifacts";
 import useArtifactImages from "./useArtifactImages";
 import useCodexThread from "./useCodexThread";
 import useDelayedUnsupported from "./useDelayedUnsupported";
+import { useViewportKind } from "./useViewportKind";
+import type { ViewportKind } from "./viewport";
 import useArtifactJump, {
   ARTIFACT_JUMP_MAX_PAGES,
   type ArtifactJumpFailure,
@@ -54,8 +70,10 @@ import { boundedCodexHistoryWindow } from "./codex-history";
 import BookmarkBar from "./BookmarkBar";
 import FilePanel, { type FilePanelEntry } from "./FilePanel";
 import FilePreview from "./FilePreview";
-import MessageComposer from "./MessageComposer";
+import MessageComposer, { type ComposerDraftRequest } from "./MessageComposer";
 import ZcodeControlPanel from "./ZcodeControlPanel";
+// T05：页面共享停止控制器（composer 主按钮/紧凑入口与队列面板打断共用同一实例）
+import { useCodexTurnControl } from "./useCodexTurnControl";
 import PreviewModeSwitcher, { type PreviewMode } from "./PreviewModeSwitcher";
 import SplitHandle from "./SplitHandle";
 import {
@@ -125,6 +143,22 @@ type PreviewState = {
    *  不是新的打开，不递增。 */
   openSeq: number;
 };
+
+/** 该方向的**默认布局**（2026-10-27 用户裁决 U2/U3）：
+ *  - 横屏（宽 > 高 × 1.2）→ 左消息 + 右文件窗格，即 files sheet 看板态 + 左右分屏；
+ *  - 竖屏 → 聊天框（null = 不渲染任何预览窗格，与既有默认一致）。
+ *  纯函数、每次返回新字面量：内部不发请求也不订阅，可在 useState 的 lazy initializer
+ *  里安全地跑两次（StrictMode 双调）。openSeq 归零——旋转不是「显式打开」。 */
+function defaultPreviewFor(kind: ViewportKind): PreviewState | null {
+  if (kind !== "landscape") return null;
+  return {
+    sheet: "files",
+    open: { kind: "none" },
+    mode: "split-h",
+    backToList: false,
+    openSeq: 0,
+  };
+}
 
 /** 面板默认追溯档位（首屏数据源，与详情页默认 limit 同标尺） */
 const FILE_DEFAULT_SCOPE = 200;
@@ -334,6 +368,37 @@ export function isPlanPending(
 // 组件
 // ============================================================
 
+type CodexQuestionGroup = {
+  key: string;
+  members: CodexAsyncQuestionView[];
+  live: CodexAsyncQuestionView[];
+  allAnswered: boolean;
+};
+
+/** 按来源 turn/item 分组，供停靠区与已答锚清理共用（去重 + 题号排序）。 */
+function groupCodexQuestions(questions: CodexAsyncQuestionView[]): CodexQuestionGroup[] {
+  const unique = questions.filter(
+    (question, index, all) =>
+      all.findIndex((other) => other.questionKey === question.questionKey) === index
+  );
+  const grouped = new Map<string, CodexAsyncQuestionView[]>();
+  for (const question of unique) {
+    const key = `${question.sourceTurnId}|${question.sourceItemId}`;
+    grouped.set(key, [...(grouped.get(key) ?? []), question]);
+  }
+  return [...grouped.entries()].map(([key, members]) => {
+    const sorted = [...members].sort((a, b) => a.questionIndex - b.questionIndex);
+    return {
+      key,
+      members: sorted,
+      live: sorted.filter(
+        (question) => question.state === "pending" || question.state === "temporarily_blocked"
+      ),
+      allAnswered: sorted.length > 0 && sorted.every((question) => question.state === "answered"),
+    };
+  });
+}
+
 export default function SessionDetail({ session, onBack }: SessionDetailProps) {
   const [messages, setMessages] = useState<SessionMessage[] | null>(null);
   // ===== Codex Desktop IPC 投影（A snapshot）=====
@@ -346,10 +411,16 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
   //   能力横幅仍按服务端档位诚实展示；
   // - state=null（无 IPC / 拉取中）：旧路径照旧，零回归。
   // stale：保留最后视图但禁写。
-  const codex = useCodexThread(session.id, session.agentType === "codex");
+  // H12：**来源随形态**——只有 Desktop(App) 形态的 codex 会话才订阅投影；
+  // CLI/TUI 同 thread 即使被 Desktop 认识，也必须走终端卡路径，不能取得投影。
+  const codex = useCodexThread(session.id, session.agentType === "codex" && session.form === "app");
   /** 附件图片资源控制器（Task 6）：整页共用一份，保证同会话消费者共享请求与
    *  object URL、全局最多两个在途；换会话时 hook 内部销毁旧 store。 */
   const artifactImages = useArtifactImages(session.id);
+  // T05：页面共享停止控制器——**单例在本层持有**，composer 主按钮/紧凑入口与
+  // 队列面板打断确认共用（stopping 互斥闸防多按钮各发一次破坏性打断；结果分诊、
+  // 30 秒预算、Unknown 纪律都在 hook 内）。非 App 形态投影恒 null → 惰性控制器。
+  const codexTurnControl = useCodexTurnControl(codex.state, session.id);
   /** 每条消息的附件上下文（同回合提示词 / 每回合 12 图预算）：以 canonical 合并顺序
    *  的 loadedMessages 为准，翻页合并后仍只按真实回合取提示词，不借上一回合。 */
   const artifactContexts = useMemo(
@@ -359,18 +430,233 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
   /** 队列刷新独立信号（2026-10-20 复审 P2）：不依赖 Desktop 必须产生新帧——
    *  投影 revision 变化与发送回执各推进一次；旧会话的回调随组件卸载丢弃。 */
   const [queueTick, setQueueTick] = useState(0);
-  const bumpQueue = useCallback(() => setQueueTick((t) => t + 1), []);
+  /** 底部只展开一组；其余有效组收成一行切换（卡片仍挂载保草稿）。 */
+  const [activeGroupKey, setActiveGroupKey] = useState<string | null>(null);
+  // T04（spec §3.2）：其余有效组收进唯一「另有 N 组」入口的展开态（切换组后自动收起）。
+  const [otherGroupsOpen, setOtherGroupsOpen] = useState(false);
+  // F08：适配详情/开关（移动端页内 sheet；只读展示 + 与桌面同源开关）。
+  const [codexAdaptOpen, setCodexAdaptOpen] = useState(false);
+  // R16：首次进入 App 会话的**轻提示**（一次；不要求用户先打开详情）。
+  const [adaptHintVisible, setAdaptHintVisible] = useState(false);
+  // S5：发送静态门「可尝试」结论（唯一来源 = MessageComposer 拉取的 send-info——
+  // send_gate_static 的展示面单点；本组件不另发请求不另判）。能力横幅据此在
+  // 可尝试时不再宣称「暂不能远程发送」（设计 §3.4）。换会话由 composer 重报。
+  const [codexSendGate, setCodexSendGate] = useState<boolean | undefined>(undefined);
+  useEffect(() => {
+    // 换会话即失效（等新 composer 的 send-info 重报；undefined = 不猜）
+    setCodexSendGate(undefined);
+  }, [session.id]);
+  // F8/R6：send-info 外部刷新信号——三类**后端真实状态变化**都推进此 tick，
+  // composer 据此事件驱动重拉（不做时刻轮询、不引 Tauri channel）：
+  // ① 同页打断受理/恢复队列（CodexQueuePanel 的 onQueueStateChanged）；
+  // ② 能力档位翻转（设置页关闭/重开自动适配——R6 后端 republish 生产帧，
+  //    availability 随 caps 活门翻转，SSE 下游真收到）；
+  // ③ 投影帧到达（跨设备起源）。R-T4 起投影帧自带 queuePaused，且暂停变化点
+  //    （打断前置落行/撤回/resume/settle）各自 republish——**只翻 queuePaused** 的
+  //    帧（revision 不动，Desktop 零新帧）正是 B 打断 RPC 超时 UnknownDelivery 时
+  //    A 能看到暂停的唯一通道；send-info 仍是暂停门的唯一权威读取口。③ 走去抖
+  //    合并（流式输出每 ~100ms 推进 revision，若每次都重拉会打爆 send-info；自
+  //    首个未处理触发起超过上限即立即重拉——与 CodexQueuePanel 的 refreshSignal
+  //    同款节奏）。
+  const [sendInfoTick, setSendInfoTick] = useState(0);
+  // 草稿正文和待回填队列归详情页持有，布局切换重挂 composer 不丢稿、不重放。
+  const [editDrafts, setEditDrafts] = useState<ComposerDraftRequest[]>([]);
+  const [composerDrafts, setComposerDrafts] = useState<Record<string, string>>({});
+  const editDraft = editDrafts.find((draft) => draft.sessionId === session.id);
+  const enqueueEditDraft = useCallback((draft: ComposerDraftRequest) => {
+    setEditDrafts((current) => [...current, draft]);
+  }, []);
+  const consumeEditDraft = useCallback(
+    (actionId: string) => {
+      setEditDrafts((current) =>
+        current.filter((draft) => draft.sessionId !== session.id || draft.actionId !== actionId)
+      );
+    },
+    [session.id]
+  );
+  const changeDraftText = useCallback(
+    (value: import("react").SetStateAction<string>) => {
+      setComposerDrafts((current) => ({
+        ...current,
+        [session.id]: typeof value === "function" ? value(current[session.id] ?? "") : value,
+      }));
+    },
+    [session.id]
+  );
+  const bumpSendInfo = useCallback(() => setSendInfoTick((t) => t + 1), []);
+  // R02：消息进入 codex 队列后也必须重拉 send-info——空暂停在发送前自隐，
+  // 但新消息留队后暂停会冻结接力，必须立即显示“队列已暂停，恢复后发送”。
+  const bumpQueue = useCallback(() => {
+    setQueueTick((t) => t + 1);
+    bumpSendInfo();
+  }, [bumpSendInfo]);
+  // T05 刷新通知：停止落地（任何结果——含不确定）→ 队列与 send-info 各刷新一次
+  // （回合终态、屏障释放、打断后的持久暂停都可能已变化；与队列面板 F8 同一链路）
+  useEffect(() => {
+    if (codexTurnControl.result === null) return;
+    bumpQueue();
+  }, [codexTurnControl.result, bumpQueue]);
+  const codexAvailability = codex.state?.availability ?? null;
+  const codexRuntime = codex.state?.runtimeStatus ?? null;
+  const codexPendingCount = codex.state?.pending.length ?? -1;
+  const codexRevisionNow = codex.state?.revision ?? null;
+  // R-T4：队列暂停事实（旧载荷缺省 undefined → 与 false 同签——只有真实翻转才触发）
+  const codexQueuePaused = codex.state?.queuePaused === true;
+  const prevFrameSigRef = useRef<string | null>(null);
+  const sendInfoDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const sendInfoFirstPendingAtRef = useRef<number | null>(null);
+  useEffect(() => {
+    // 帧签名：档位 / 运行态 / pending 数 / revision / 队列暂停任一变化 = 一帧事件。
+    // 首拍（null → 首帧）不触发——composer 挂载时本来就会拉一次。
+    // Gate F 修正：挂载渲染（codex.state=null）**不是帧**——不写哨兵。此前哨兵在
+    // 挂载即被写成 null 态签名字符串，导致首帧（snapshot）被误判为变化：去抖
+    // 250ms 后必然多拉一次 send-info（浪费请求；对照测试里会拉到过渡期响应）。
+    // availability=null ⇔ codex.state=null（投影未达），据此判定「非帧」。
+    const sig =
+      codexAvailability === null
+        ? null
+        : `${codexAvailability}|${codexRuntime}|${codexPendingCount}|${codexRevisionNow}|${codexQueuePaused ? "paused" : "resumed"}`;
+    if (sig === null) return;
+    const prev = prevFrameSigRef.current;
+    prevFrameSigRef.current = sig;
+    // 首帧（prev=null = 哨兵未置）只记录不触发——composer 挂载时本来就拉一次；
+    // 此后只有签名真变化（availability/runtimeStatus/pending 数/revision/queuePaused）
+    // 才触发。
+    if (prev === null || prev === sig) return;
+    // 去抖 + 上限等待（CodexQueuePanel 同款：合并流式帧、不被流式饿死）
+    if (sendInfoDebounceRef.current !== null) clearTimeout(sendInfoDebounceRef.current);
+    const now = Date.now();
+    if (sendInfoFirstPendingAtRef.current === null) sendInfoFirstPendingAtRef.current = now;
+    const elapsed = now - sendInfoFirstPendingAtRef.current;
+    const delay = Math.max(0, Math.min(250, 2000 - elapsed));
+    sendInfoDebounceRef.current = setTimeout(() => {
+      sendInfoDebounceRef.current = null;
+      sendInfoFirstPendingAtRef.current = null;
+      bumpSendInfo();
+    }, delay);
+  }, [
+    codexAvailability,
+    codexRuntime,
+    codexPendingCount,
+    codexRevisionNow,
+    codexQueuePaused,
+    bumpSendInfo,
+  ]);
+  useEffect(
+    () => () => {
+      if (sendInfoDebounceRef.current !== null) {
+        clearTimeout(sendInfoDebounceRef.current);
+        sendInfoDebounceRef.current = null;
+      }
+    },
+    []
+  );
+  // R16：**稳定来源路由**——Codex App 会话只走投影+新控件，断链也不回旧 TUI 卡；
+  // CLI 会话保持旧的终端卡路径。
+  const appForm = session.agentType === "codex" && session.form === "app";
+  useEffect(() => {
+    if (!appForm) return;
+    let alive = true;
+    void (async () => {
+      try {
+        const details = await fetchCodexAdaptStatus(session.id);
+        if (alive) setAdaptHintVisible(!details.hintSeen);
+      } catch {
+        // 读不到详情不打扰用户（提示只是辅助）。
+      }
+    })();
+    return () => {
+      alive = false;
+    };
+  }, [appForm, session.id]);
+  const dismissAdaptHint = useCallback(() => {
+    setAdaptHintVisible(false);
+    void updateCodexAdaptSettings({ sessionId: session.id, action: "dismiss_hint" }).catch(
+      () => undefined
+    );
+  }, [session.id]);
   const codexReady = codex.state !== null;
   const codexRevision = codex.state?.revision ?? null;
   useEffect(() => {
     if (codexReady) bumpQueue();
   }, [codexRevision, codexReady, bumpQueue]);
   const codexState = codex.state;
+  // 有效卡：当前可答组，或本机已发出过动作（sessionStorage 锚）的待核对组。
+  // 历史已答/无锚 unknown 一律不渲染（2026-10-28 用户裁决）。
+  const inbox = useMemo(() => {
+    const pending = (codexState?.pending ?? []).filter(
+      (item, index, all) => all.findIndex((other) => other.requestKey === item.requestKey) === index
+    );
+    const groups = groupCodexQuestions(codexState?.asyncQuestions ?? []).map((group) => ({
+      ...group,
+      hasAnchor: Boolean(
+        window.sessionStorage.getItem(
+          `codex:group:${session.id}:${group.members[0]?.sourceTurnId}:${group.members[0]?.sourceItemId}`
+        )
+      ),
+    }));
+    const visibleGroups = groups.filter(
+      (group) => group.live.length > 0 || (group.hasAnchor && !group.allAnswered)
+    );
+    return {
+      pending,
+      groups: visibleGroups,
+      count: pending.length + visibleGroups.length,
+    };
+  }, [codexState, session.id, queueTick]);
+
+  const activeGroup =
+    inbox.groups.find((group) => group.key === activeGroupKey) ??
+    inbox.groups.find((group) => group.live.length > 0) ??
+    inbox.groups[0] ??
+    null;
+  // T04（spec §3.2）：其余**有效**组（已答组已被 inbox 过滤，不计数）。
+  const otherGroups = inbox.groups.filter((group) => group.key !== activeGroup?.key);
+  useEffect(() => {
+    if (activeGroupKey !== null && !inbox.groups.some((group) => group.key === activeGroupKey)) {
+      setActiveGroupKey(null);
+    }
+  }, [activeGroupKey, inbox.groups]);
+
+  // 已答组的旧 sessionStorage 锚只用于核对，不应跨组留存；在数据更新后清理。
+  useEffect(() => {
+    for (const group of groupCodexQuestions(codexState?.asyncQuestions ?? [])) {
+      if (!group.allAnswered) continue;
+      const first = group.members[0];
+      window.sessionStorage.removeItem(
+        `codex:group:${session.id}:${first.sourceTurnId}:${first.sourceItemId}`
+      );
+    }
+  }, [codexState, session.id]);
   const codexProjectionActive =
     codexState !== null &&
     (codexState.availability === "controllable" ||
       codexState.availability === "send_only" ||
       codexState.availability === "read_only");
+  // R07（能力事实同源 + 真实重连展示）：页面同版 `effectiveOperations` 是工具栏与
+  // 适配详情**共同**的事实源。展示缓存按 `capabilityIdentity` 键控——同一完整目标
+  // 在真实重连（stale、证据槽换代失配）期间沿用上次支持展示；identity 变化即清。
+  // 纪律：展示缓存只补 `support`，`allowed`/`evidence`/`reasonCode` 一字不动。
+  //
+  // 为什么用 state（而不是 ref）：React 19 的 react-hooks/refs 禁止渲染期读 ref。
+  // 缓存本身是"上一帧的结果"，用 state 承载 + 内容相等短路（避免自激重渲染）；
+  // 会话归属随缓存一起记，换会话即视为无缓存（上一目标的展示事实不跨会话沿用）。
+  const [codexDisplayCache, setCodexDisplayCache] = useState<{
+    sessionId: string;
+    cache: CapabilityDisplayCache;
+  } | null>(null);
+  const codexDisplay = useMemo(() => {
+    const usable = codexDisplayCache?.sessionId === session.id ? codexDisplayCache.cache : null;
+    return retainCapabilityDisplay(usable, codexState?.effectiveOperations, {
+      stale: codexState?.stale === true,
+    });
+  }, [codexDisplayCache, codexState?.effectiveOperations, codexState?.stale, session.id]);
+  useEffect(() => {
+    const next =
+      codexDisplay.cache === null ? null : { sessionId: session.id, cache: codexDisplay.cache };
+    if (sameDisplayCache(codexDisplayCache, next)) return;
+    setCodexDisplayCache(next);
+  }, [codexDisplay, codexDisplayCache, session.id]);
   // Task 7：瞬态 Unsupported 只延迟**前端错误提示**（后端 contentState 即时、禁写/
   // stale/屏障不去抖）——过渡 164–382ms 不闪烁，持续异常 500ms 后如实显示。
   const showUnsupported = useDelayedUnsupported(
@@ -413,7 +699,11 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
   const subagentTick = session.status === "finished" ? 0 : refreshTick;
   // 追溯档位（M3+ 用户裁决 3）：面板三档 200/500/1000，切档重拉
   const [fileScope, setFileScope] = useState<number>(FILE_DEFAULT_SCOPE);
-  const [fileLoading, setFileLoading] = useState(false);
+  // 初值 true（2026-10-27 横竖屏自适应配套）：横屏进详情会**立即挂载文件看板**，
+  // 初值 false 会先闪一帧「该范围内未发现文件」（FilePanel 的 panel-empty 判据是
+  // entries 为空 ∧ 非 loading）。下方拉取 effect 挂载即置 true、finally 置 false，
+  // 改初值只消除首帧空态，不改变任何时序。顺带修掉手动开面板的同款闪帧。
+  const [fileLoading, setFileLoading] = useState(true);
   // ===== Task 7：文件池合并与五页反向定位 =====
   // 引用范围 = 当前显示窗口（尾窗 + 已滚出的保留缓冲）+ Task 5 预算内更早页：
   // `boundedCodexHistoryWindow` 在这里只做边界收敛的便利——保留缓冲必须并入，
@@ -450,7 +740,14 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
   const [bookmarks, setBookmarks] = useState<Bookmark[]>(() => listBookmarks(session.id));
   // 跳转失败提示（书签指向更早范围，当前窗口内找不到）
   const [bookmarkJumpMiss, setBookmarkJumpMiss] = useState(false);
-  const [preview, setPreview] = useState<PreviewState | null>(null);
+  // 方向判定（2026-10-27 用户裁决 U1：宽 > 高 × 1.2 = 横屏，其余竖屏）：默认布局与
+  // 分辨率变化时的重置都以它为唯一依据；变化监听见下方「方向变化」effect
+  const viewportKind = useViewportKind();
+  // 预览态初值按当前方向给默认（U2/U3）：横屏 = 右栏文件看板 + 左右分屏；竖屏 = null = 聊天框。
+  // 用 lazy initializer 而非「先 null 再 effect 补齐」——后者会先画一帧纯聊天再弹出右栏
+  const [preview, setPreview] = useState<PreviewState | null>(() =>
+    defaultPreviewFor(viewportKind)
+  );
   /** Task 7：定位动作在窄屏关闭的全屏预览快照——失败/结束后可原样返回；
    *  宽屏分屏下预览仍在，快照为 null（不需要返回入口）。 */
   const [jumpReturnPreview, setJumpReturnPreview] = useState<PreviewState | null>(null);
@@ -673,7 +970,9 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
     [isCollapsed]
   );
 
-  /** 宽屏判定（matchMedia 防御式访问；jsdom / 隐私模式可能缺失，theme.ts 同款口径） */
+  /** 宽屏判定（matchMedia 防御式访问；jsdom / 隐私模式可能缺失，theme.ts 同款口径）。
+   *  **仅作竖屏下「点文件默认布局」的回退口径**（2026-10-27 用户裁决 U5：竖屏手动点文件
+   *  的默认布局不改）——方向判定本身一律走 viewportKind（纯宽高比），不看这个阈值 */
   const isWideViewport = useCallback((): boolean => {
     try {
       return window.matchMedia?.("(min-width: 768px)")?.matches ?? false;
@@ -682,22 +981,30 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
     }
   }, []);
 
+  /** 打开预览时的默认布局：横屏恒 split-h（U3 的延伸——横屏点文件不该掉回全屏浮层）；
+   *  竖屏沿用既有 ≥768px 口径（U5 明确不改），与旋转默认互不干扰 */
+  const defaultPreviewMode = useCallback(
+    (): PreviewMode =>
+      viewportKind === "landscape" || isWideViewport() ? "split-h" : "fullscreen",
+    [viewportKind, isWideViewport]
+  );
+
   // 点文件链接（消息正文）→ 预览。Bug 2 顺手项（spec P9「按屏幕宽度自适应」）：
   // ≥768px 分屏（2026-09-20 裁决 + T2 决策 2 收口：宽屏默认 split-h = 左对话右文件）、
-  // <768px 全屏；手动切换随时覆盖该默认值。
+  // <768px 全屏；手动切换随时覆盖该默认值。2026-10-27 起横屏恒 split-h（见 defaultPreviewMode）。
   // 正文进入 → files sheet 选中该文件，backToList=false（无返回列表按钮，既有行为不变）
   const openFile = useCallback(
     (path: string) => {
       setPreview((p) => ({
         sheet: "files",
         open: { kind: "file", path },
-        mode: isWideViewport() ? "split-h" : "fullscreen",
+        mode: defaultPreviewMode(),
         backToList: false,
         // 每次显式打开都推进刷新键（同一路径再点一次也重读当前内容）
         openSeq: (p?.openSeq ?? 0) + 1,
       }));
     },
-    [isWideViewport]
+    [defaultPreviewMode]
   );
 
   // 从文件看板进入单文件预览（M3+）：backToList=true → 预览页头显示返回按钮；
@@ -722,12 +1029,12 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
       setPreview((p) => ({
         sheet: "subagents",
         open: { kind: "subagent", id },
-        mode: isWideViewport() ? "split-h" : "fullscreen",
+        mode: defaultPreviewMode(),
         backToList: true,
         openSeq: p?.openSeq ?? 0,
       }));
     },
-    [isWideViewport]
+    [defaultPreviewMode]
   );
 
   // 清单看板点卡进入（观察台 §二.5）：沿用当前 mode（往返保持，openFileFromList 同款）
@@ -751,8 +1058,8 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
     );
   }, []);
 
-  // 页头面板入口（M3+）：宽屏默认 split-h（列表是行集，右侧整列纵向空间大）、
-  // 窄屏 fullscreen（用户裁决：面板默认布局口径）。
+  // 页头面板入口（M3+）：默认布局见 defaultPreviewMode（横屏恒 split-h；竖屏沿用
+  // ≥768px 口径）。2026-10-27 起横屏进详情时面板本就开着，此钮即「收起右栏」。
   // 面板开启态 = files sheet 看板态（页头按钮高亮依据；文件预览/子 agent 详情
   // 不算——那是从看板或正文进入的下一层）；再点收回（ZCode 式排版，2026-09-16 用户裁决）
   const panelOpen = preview !== null && preview.sheet === "files" && preview.open.kind === "none";
@@ -763,12 +1070,12 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
         : {
             sheet: "files",
             open: { kind: "none" },
-            mode: isWideViewport() ? "split-h" : "fullscreen",
+            mode: defaultPreviewMode(),
             backToList: false,
             openSeq: p?.openSeq ?? 0,
           }
     );
-  }, [isWideViewport]);
+  }, [defaultPreviewMode]);
 
   const closePreview = useCallback(() => setPreview(null), []);
 
@@ -781,12 +1088,12 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
         : {
             sheet: "files",
             open: { kind: "none" },
-            mode: isWideViewport() ? "split-h" : "fullscreen",
+            mode: defaultPreviewMode(),
             backToList: false,
             openSeq: p?.openSeq ?? 0,
           }
     );
-  }, [isWideViewport]);
+  }, [defaultPreviewMode]);
 
   // 从二级内容（文件预览 / 子 agent 详情）返回所在 sheet 的看板态（保持当前布局 mode）
   const backToBoard = useCallback(() => {
@@ -927,6 +1234,33 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
     setJumpReturnPreview(null);
   }, [session.id, clearJumpHighlight]);
 
+  // 方向 / 分辨率变化（2026-10-27 用户裁决 U4：变化时检查一次，回到该方向默认；
+  // 2026-10-28 U7 追加例外：**全屏阅读文件时一律维持全屏**）。
+  // **只依赖 viewportKind**——若把 preview 读进 effect 或写进 deps，每次布局变动都会
+  // 重跑：横屏手切全屏被立刻拽回 split-h、竖屏手动打开预览被立刻关掉，切换器与页头
+  // 📁 钮全哑。故用函数式 updater 读旧值、用 prevKindRef 判首次（不用布尔门闩：
+  // StrictMode 双挂载会多跑一次重置）。
+  // 两向都清返回快照：竖屏「定位」留下的 fullscreen 快照若跨旋转存活，横屏点「返回
+  // 文件预览」会在横屏弹出竖屏时代的全屏浮层。清快照必须写在 updater 之外（updater
+  // 须是纯函数，StrictMode 下可能执行两次）。
+  const prevKindRef = useRef(viewportKind);
+  useEffect(() => {
+    if (prevKindRef.current === viewportKind) return;
+    prevKindRef.current = viewportKind;
+    setJumpReturnPreview(null);
+    setPreview((p) => {
+      // 例外（U7）：当前处于全屏阅读态时原样维持。判据是**此刻的状态**（mode），
+      // 不是「用户是否手动切过全屏」——竖屏窄屏点文件默认就是全屏，此刻同样算
+      // 「正在全屏阅读」，旋转一并豁免。左右分屏 / 上下分屏则照常按方向重排。
+      if (p?.mode === "fullscreen") return p;
+      if (viewportKind === "landscape") {
+        // 竖→横：聊天框状态下打开右栏看板；已有预览则保留内容、只改布局
+        return p === null ? defaultPreviewFor("landscape") : { ...p, mode: "split-h" };
+      }
+      return null; // 横→竖：回聊天框（U4 直译：不保留预览）
+    });
+  }, [viewportKind]);
+
   // 消息渲染器（观察台 T6 起迁至 ./message-render 共用）：renderBody 消费本页
   // 既有 openFile（正文路径点击 → 预览）与 files（链接化路径集）
   const { renderBody, renderMarkdown, renderLinkifiedText } = useMessageRenderers({
@@ -1046,7 +1380,9 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
         setBookmarkJumpMiss(true);
       }
     },
-    [limit, scrollAnchorIntoView]
+    // setLimit 是 useState 稳定 setter（恒等），列入 deps 只为如实申报引用，
+    // 不改变本回调随 limit/scrollAnchorIntoView 变化的重建时机。
+    [limit, scrollAnchorIntoView, setLimit]
   );
 
   // 自动加载跳转的续查：**仅随 messages 变化重查**（deps 不含 limit）——
@@ -1266,9 +1602,18 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
   const cardDock = (
     <div
       data-testid="card-dock"
-      className="flex max-h-[55vh] shrink-0 flex-col gap-2 overflow-y-auto"
+      className="flex max-h-[35dvh] shrink-0 flex-col gap-2 overflow-y-auto"
     >
+      {/* T09/T10：Desktop 会话的**原生卡优先**——投影里已有原生 pending（命令/文件/
+          权限/问答）时不再挂旧 TUI 屏读卡，避免同一事件两张卡（一张永远读不到
+          终端选项）。终端会话（codexState === null）保持原 ApproveCard 行为。 */}
       {approveMounted &&
+        !appForm &&
+        !(
+          codexState !== null &&
+          codexProjectionActive &&
+          (codexState.pending.length > 0 || (codexState.asyncQuestions?.length ?? 0) > 0)
+        ) &&
         (planFeedbackActive ? null : (
           <ApproveCard
             key={`approve-${session.id}`}
@@ -1288,35 +1633,168 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
           展示。QuestionCard 仍保持原总结态门（终端卡行为不变）。 */}
       {codexState !== null ? (
         <>
-          <CodexAvailabilityBanner
-            key={`codex-banner-${session.id}`}
-            availability={codexState.availability}
-            stale={codexState.stale}
-            probeStatus={codexState.probeStatus}
+          {/* R16：App 会话不再挂"总能力徽标"（逐操作工具栏已承担解释职责）；
+              CLI/兼容会话仍保留横幅（它承载 stale/探测骨架语义）。 */}
+          {!appForm ? (
+            <CodexAvailabilityBanner
+              key={`codex-banner-${session.id}`}
+              availability={codexState.availability}
+              stale={codexState.stale}
+              probeStatus={codexState.probeStatus}
+              sendAttemptable={codexSendGate}
+            />
+          ) : (
+            // R16：App 会话去掉"总能力徽标"，但**stale（断链/换代）必须如实显示**。
+            codexState.stale && (
+              <p
+                data-testid="codex-stale-note"
+                className="text-xs text-amber-700 dark:text-amber-400"
+              >
+                {i18n.t("mobile.codex.staleBanner")}
+              </p>
+            )
+          )}
+          {appForm && adaptHintVisible && (
+            <div
+              data-testid="codex-adapt-hint-inline"
+              className="rounded-xl border border-[var(--bd)] bg-[var(--cd)] px-3 py-2 text-xs text-[var(--mut)]"
+            >
+              <p>{i18n.t("mobile.codex.adapt.hint")}</p>
+              <button
+                type="button"
+                data-testid="codex-adapt-hint-dismiss"
+                onClick={dismissAdaptHint}
+                className="mt-1 underline"
+              >
+                {i18n.t("mobile.codex.adapt.hintOk")}
+              </button>
+            </div>
+          )}
+          <CodexOperationToolbar
+            key={`codex-ops-${session.id}`}
+            operations={codexDisplay.operations}
+            reconnecting={codexDisplay.reconnecting}
+            identityPending={codexDisplay.identityPending}
+            onOpenDetails={() => setCodexAdaptOpen(true)}
           />
-          {codexProjectionActive &&
-            codexState.pending.map((p) => (
-              <PendingRequestCard
-                key={`codex-pending-${session.id}-${p.requestKey}`}
-                sessionId={session.id}
-                request={p}
-                writeLocked={codexState.stale}
-              />
-            ))}
+          {codexAdaptOpen && (
+            <CodexAdaptSheet
+              key={`codex-adapt-${session.id}`}
+              sessionId={session.id}
+              open={codexAdaptOpen}
+              onClose={() => setCodexAdaptOpen(false)}
+              // R07：能力表消费**页面同版**事实（含展示缓存补过的 support），
+              // 不读独立 GET 的旧快照。
+              effectiveOperations={codexDisplay.operations}
+            />
+          )}
+          {/* 2026-10-28 用户裁决：只展示当前有效交互卡——当前可答组，或本机
+              已发出过动作的待核对组；已答/无锚 unknown 不再有历史入口。 */}
+          {codexProjectionActive && (
+            <div data-testid="codex-dock-cards" className="contents">
+              {inbox.pending.map((p) => (
+                <PendingRequestCard
+                  key={`codex-pending-${session.id}-${p.requestKey}`}
+                  sessionId={session.id}
+                  request={p}
+                  writeLocked={codexState.stale}
+                />
+              ))}
+              {/* T04（spec §3.2）：其余有效组收进**唯一**「另有 N 组」入口（不常驻 N 行）；
+                  展开后可切任意组；已答组不计数（inbox 已过滤）。组卡片仍全部挂载
+                  （hidden 控制），切组/收起/展开不卸载组件——草稿与在途状态不丢。 */}
+              {otherGroups.length > 0 && (
+                <div>
+                  <button
+                    type="button"
+                    data-testid="codex-other-groups"
+                    aria-expanded={otherGroupsOpen}
+                    onClick={() => setOtherGroupsOpen((open) => !open)}
+                    className="flex w-full items-center justify-between rounded-xl border border-[var(--bd)] bg-[var(--cd)] px-3 py-1.5 text-left text-xs text-[var(--mut)]"
+                  >
+                    <span>
+                      {i18n.t("mobile.codex.async.otherGroupsCount", {
+                        count: otherGroups.length,
+                      })}
+                    </span>
+                    <span className="underline">
+                      {i18n.t(
+                        otherGroupsOpen
+                          ? "mobile.codex.async.dismiss"
+                          : "mobile.codex.async.historyExpand"
+                      )}
+                    </span>
+                  </button>
+                  {otherGroupsOpen &&
+                    otherGroups.map((group) => (
+                      <button
+                        key={`codex-group-item-${session.id}-${group.key}`}
+                        type="button"
+                        data-testid="codex-group-item"
+                        data-group-key={group.key}
+                        onClick={() => {
+                          setActiveGroupKey(group.key);
+                          setOtherGroupsOpen(false);
+                        }}
+                        className="mt-1 flex w-full items-center justify-between rounded-xl border border-[var(--bd)] bg-[var(--cd)] px-3 py-1.5 text-left text-xs text-[var(--mut)]"
+                      >
+                        <span>
+                          {group.live.length > 0
+                            ? i18n.t("mobile.codex.async.otherGroup", {
+                                count: group.live.length,
+                              })
+                            : i18n.t("mobile.codex.async.verifyGroup", {
+                                count: group.members.length,
+                              })}
+                        </span>
+                        <span className="underline">{i18n.t("mobile.codex.async.openGroup")}</span>
+                      </button>
+                    ))}
+                </div>
+              )}
+              {inbox.groups.map((group) => (
+                <div
+                  key={`codex-group-panel-${session.id}-${group.key}`}
+                  data-testid={`codex-group-panel-${group.key}`}
+                  hidden={group.key !== activeGroup?.key}
+                >
+                  <AsyncQuestionGroupCard
+                    sessionId={session.id}
+                    questions={group.members}
+                    fontScale={fontScale}
+                    onChanged={() => setQueueTick((tick) => tick + 1)}
+                  />
+                </div>
+              ))}
+            </div>
+          )}
           <CodexQueuePanel
             key={`codex-queue-${session.id}`}
             sessionId={session.id}
             refreshSignal={queueTick}
+            onQueueStateChanged={bumpSendInfo}
+            onEditDraft={enqueueEditDraft}
+            turnControl={appForm ? codexTurnControl : undefined}
           />
-          {!codexProjectionActive && !isSummary && (
-            <QuestionCard key={`question-${session.id}`} session={session} />
+          {!codexProjectionActive && !isSummary && !appForm && (
+            <QuestionCard key={`question-${session.id}`} session={session} fontScale={fontScale} />
           )}
         </>
+      ) : appForm ? (
+        // App 会话尚无投影：如实显示"连接中"，**不回退终端屏读卡**。
+        <p
+          data-testid="codex-connecting"
+          className="rounded-xl border border-[var(--bd)] bg-[var(--cd)] px-3 py-2 text-xs text-[var(--mut)]"
+        >
+          {i18n.t("mobile.codex.ops.connecting")}
+        </p>
       ) : (
         // ZCode：原生 pending 只在 `ZcodeControlPanel` 里渲染（R1）；旧终端问答卡
         // 一律不挂载——它不是原生降级卡，残留只会与官方卡并存。
         !isSummary &&
-        !isZcodeSession && <QuestionCard key={`question-${session.id}`} session={session} />
+        !isZcodeSession && (
+          <QuestionCard key={`question-${session.id}`} session={session} fontScale={fontScale} />
+        )
       )}
       {/* 2026-10-08 子 agent chip：与 ModeBar 同一行（flex-wrap 兄弟），生命周期
           解耦——mode 视图失败/unsupported 时 chip 仍活，反之亦然（spec §6）。
@@ -1325,7 +1803,7 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
           观察台 T5：chip 改纯展示，名单由上方 subagentList 单一数据源下发
           （拉取不再自持），点击直达详情对话框（§二.4）。 */}
       <div data-testid="status-row" className="flex flex-wrap items-center gap-2">
-        <ModeBar key={`mode-${session.id}`} session={session} />
+        {!appForm && <ModeBar key={`mode-${session.id}`} session={session} />}
         {session.status !== "finished" && (
           <SubagentChips
             key={`subagents-${session.id}`}
@@ -1351,9 +1829,17 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
       <ZcodeControlPanel key={`zcode-composer-${session.id}`} sessionId={session.id} />
     ) : (
       <MessageComposer
+        editDraft={editDraft}
+        onEditDraftConsumed={consumeEditDraft}
+        draftText={composerDrafts[session.id] ?? ""}
+        onDraftTextChange={changeDraftText}
         key={`composer-${session.id}`}
         session={session}
         onQueueChanged={bumpQueue}
+        onSendGate={setCodexSendGate}
+        refreshSendInfoSignal={sendInfoTick}
+        disableTerminalProbes={appForm}
+        turnControl={appForm ? codexTurnControl : undefined}
       />
     );
 
@@ -1422,6 +1908,9 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
                       isUser ? "flex flex-col items-end" : "flex flex-col items-start"
                     } data-[jump-hit=true]:rounded-xl data-[jump-hit=true]:bg-amber-500/10 data-[jump-hit=true]:ring-2 data-[jump-hit=true]:ring-amber-500/70`}
                   >
+                    {m.interactionAnswer ? (
+                      <AnswerBubble answer={m.interactionAnswer} messageId={m.id} />
+                    ) : null}
                     {m.text !== "" && (
                       <div
                         className={
@@ -1748,7 +2237,10 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
   ) : null;
 
   return (
-    <div className="flex h-dvh flex-col bg-[var(--pg)] text-[var(--tx)]">
+    <div
+      data-viewport={viewportKind}
+      className="flex h-dvh flex-col bg-[var(--pg)] text-[var(--tx)]"
+    >
       <header className="flex shrink-0 items-center gap-2 border-b border-[var(--cb)] px-3 py-2">
         <button
           type="button"

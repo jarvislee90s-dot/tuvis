@@ -2,7 +2,7 @@
 //! 复制 base64／`fileId`。
 //!
 //! 字段证据：macOS `26.1013.40934` 静态映射（见
-//! `docs/superpowers/reviews/2026-10-20-codex-artifact-field-evidence.md`）。
+//! `docs/engineering/evidence/codex-desktop-ipc/2026-10-20-codex-artifact-field-evidence.md`）。
 //! 状态枚举、`change.kind` 取值与 Windows 附件形态均未实测，因此
 //! `sourceStatus`／`changeKind` 只保留原始字符串标量，不映射为「完成／成功」，
 //! 也绝不把缺失、失败或进行中状态描述成已写盘。

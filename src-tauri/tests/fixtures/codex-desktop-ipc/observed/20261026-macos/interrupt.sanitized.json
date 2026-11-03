@@ -1,0 +1,20 @@
+{
+  "case": "interrupt",
+  "request": {
+    "conversationId": "<ID-2>#uuid",
+    "mode": "user-stop",
+    "expectedTurnId": "01a177c7-ecb7-7de2-ab0a-cbc6b802ea7f"
+  },
+  "receipt": {
+    "method": "thread-follower-interrupt-turn",
+    "version": 4,
+    "delivery": "Accepted",
+    "resultType": "success",
+    "handledByPresent": true,
+    "reasonCode": null,
+    "result": {
+      "interruptedTurnId": "01a177c7-ecb7-7de2-ab0a-cbc6b802ea7f",
+      "ok": true
+    }
+  }
+}

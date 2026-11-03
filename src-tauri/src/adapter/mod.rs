@@ -1,12 +1,16 @@
 // AgentAdapter trait + 枚举 + 会话发现调度器
 // 移植自 agent-sessions agent/mod.rs，扩展支持 Codex CLI/APP 和 OpenCode
 
+pub mod cadence;
 pub mod claude;
 pub mod codex;
 pub mod dsh;
 pub mod kimi;
 pub mod openclaw;
 pub mod opencode;
+pub mod scan_bus;
+pub mod wakeup;
+pub(crate) mod wakeup_coverage;
 pub mod workbuddy;
 pub mod zcode;
 
@@ -16,8 +20,10 @@ use crate::session::{
 };
 use once_cell::sync::Lazy;
 use std::collections::{HashMap, HashSet};
-use std::sync::Mutex;
-use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard};
+use std::time::{Duration, Instant};
+use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
 
 /// 读取 CLI grace period（秒），默认 5
 fn get_cli_grace_secs() -> i64 {
@@ -358,6 +364,597 @@ fn apply_question_entry_mark(
 /// grace_duration 按进程形态区分：App 形态更长（30s），CLI 形态更短（5s）
 static STOP_GRACE: Lazy<Mutex<HashMap<u32, (i64, i64)>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 
+/// 首次转绿/补插入池失败、等待下一轮重试的 (tool, session) 集合。
+/// 只用于数据驱动绿卡的预过滤：**池无行不等于用户已读**，可能是 INSERT 失败；
+/// 不能用“池无行”一概补插（会复活已读/过期卡）。
+static PENDING_UNREAD_RETRIES: Lazy<Mutex<HashMap<(String, String), i64>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+const PENDING_TTL_MS: i64 = 24 * 3600 * 1000;
+static PENDING_LOADED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// 持久化失败（含旧快照暂不可读）后置位；待加载恢复后自动补写一次。
+static PENDING_DIRTY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn pending_key(tool: &str, sid: &str) -> String {
+    format!("{tool}\u{1f}{sid}")
+}
+
+/// 独立于 SQLite 的小文件：SQLite 写失败时仍尽量保留跨重启恢复标记。
+/// 写入采用临时文件 + rename；失败只 warn（降级），内存标记仍保留供同进程重试。
+fn pending_store_path() -> std::path::PathBuf {
+    crate::database::connection::app_data_home()
+        .join(".tuvis")
+        .join("unread_pending_retries.json")
+}
+
+fn persist_pending_unread_retries_into(
+    path: &std::path::Path,
+    loaded: &std::sync::atomic::AtomicBool,
+    dirty: &std::sync::atomic::AtomicBool,
+    retries: &Mutex<HashMap<(String, String), i64>>,
+) -> bool {
+    use std::sync::atomic::Ordering;
+    // 启动恢复未完成时内存集合可能不含磁盘旧项：禁止覆盖，等加载成功合并后补写。
+    if !loaded.load(Ordering::Acquire) {
+        dirty.store(true, Ordering::Release);
+        log::debug!("unread: 待重试标记尚未完成加载，暂缓落盘");
+        return false;
+    }
+    let map: HashMap<String, i64> = retries
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|((tool, sid), since)| (pending_key(tool, sid), *since))
+        .collect();
+    let ok = persist_pending_map(path, &map);
+    dirty.store(!ok, Ordering::Release);
+    ok
+}
+
+fn persist_pending_unread_retries() -> bool {
+    persist_pending_unread_retries_into(
+        &pending_store_path(),
+        &PENDING_LOADED,
+        &PENDING_DIRTY,
+        &PENDING_UNREAD_RETRIES,
+    )
+}
+
+fn pending_backup_path(path: &std::path::Path) -> std::path::PathBuf {
+    path.with_extension("json.bak")
+}
+
+/// 平台原子替换：Unix `rename` 直接覆盖；Windows 用 `ReplaceFileW`（目标不存在时
+/// `MoveFileExW`）。返回 false 时调用方走“保留旧文件”的安全回退。
+#[cfg(windows)]
+fn replace_pending_file_atomic(tmp: &std::path::Path, path: &std::path::Path) -> bool {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::PCWSTR;
+    use windows::Win32::Storage::FileSystem::{
+        MoveFileExW, ReplaceFileW, MOVEFILE_WRITE_THROUGH, REPLACEFILE_IGNORE_MERGE_ERRORS,
+    };
+    let wide = |p: &std::path::Path| -> Vec<u16> {
+        p.as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
+    };
+    let dst = wide(path);
+    let src = wide(tmp);
+    unsafe {
+        let result = if path.exists() {
+            ReplaceFileW(
+                PCWSTR(dst.as_ptr()),
+                PCWSTR(src.as_ptr()),
+                PCWSTR::null(),
+                REPLACEFILE_IGNORE_MERGE_ERRORS,
+                None,
+                None,
+            )
+        } else {
+            MoveFileExW(
+                PCWSTR(src.as_ptr()),
+                PCWSTR(dst.as_ptr()),
+                MOVEFILE_WRITE_THROUGH,
+            )
+        };
+        result.is_ok()
+    }
+}
+
+#[cfg(not(windows))]
+fn replace_pending_file_atomic(tmp: &std::path::Path, path: &std::path::Path) -> bool {
+    std::fs::rename(tmp, path).is_ok()
+}
+
+#[derive(Debug)]
+enum PendingSnapshot {
+    Valid(HashMap<String, i64>),
+    Missing,
+    Invalid,
+    IoError,
+}
+
+#[derive(Debug)]
+enum PendingLoad {
+    Loaded(HashMap<String, i64>),
+    Absent,
+    Failed,
+}
+
+fn read_pending_snapshot(path: &std::path::Path) -> PendingSnapshot {
+    match std::fs::read_to_string(path) {
+        Ok(raw) => match serde_json::from_str::<HashMap<String, i64>>(&raw) {
+            Ok(map) => PendingSnapshot::Valid(map),
+            Err(_) => PendingSnapshot::Invalid,
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => PendingSnapshot::Missing,
+        Err(_) => PendingSnapshot::IoError,
+    }
+}
+
+/// 读取待重试快照：主文件缺失/损坏时回退 `.bak`（兼容替换过程中的崩溃窗口）。
+/// `Failed` 表示读取/解析暂时失败，调用方应保留“未加载”状态并在下一轮重试。
+fn load_pending_map(path: &std::path::Path) -> PendingLoad {
+    let backup = pending_backup_path(path);
+    match read_pending_snapshot(path) {
+        PendingSnapshot::Valid(map) => PendingLoad::Loaded(map),
+        PendingSnapshot::IoError => PendingLoad::Failed,
+        PendingSnapshot::Missing => match read_pending_snapshot(&backup) {
+            PendingSnapshot::Valid(map) => PendingLoad::Loaded(map),
+            PendingSnapshot::Missing => PendingLoad::Absent,
+            PendingSnapshot::Invalid | PendingSnapshot::IoError => PendingLoad::Failed,
+        },
+        PendingSnapshot::Invalid => match read_pending_snapshot(&backup) {
+            PendingSnapshot::Valid(map) => PendingLoad::Loaded(map),
+            PendingSnapshot::Missing | PendingSnapshot::Invalid | PendingSnapshot::IoError => {
+                PendingLoad::Failed
+            }
+        },
+    }
+}
+
+/// 写盘前确认权威快照可读：主文件 `IoError` 直接拒绝；主文件缺失/损坏时，
+/// 只有备份 `IoError` 才拒绝。Unix 的 rename 可覆盖不可读文件，因此这个检查
+/// 必须发生在**任何替换/写 tmp 之前**，不能只放在备用分支。
+fn pending_snapshots_readable(path: &std::path::Path) -> bool {
+    match read_pending_snapshot(path) {
+        PendingSnapshot::IoError => false,
+        // 主文件可读即为权威快照；损坏/缺失时备份才可能是唯一有效副本。
+        PendingSnapshot::Valid(_) => true,
+        PendingSnapshot::Missing | PendingSnapshot::Invalid => !matches!(
+            read_pending_snapshot(&pending_backup_path(path)),
+            PendingSnapshot::IoError
+        ),
+    }
+}
+
+/// 原子性优先的写盘：先写 tmp；直接 rename 成功（Unix）即完成。失败时**保留旧文件**
+/// 为 `.bak` 再换名；换名失败则恢复旧文件，绝不先删唯一有效快照。
+fn persist_pending_map(path: &std::path::Path, map: &HashMap<String, i64>) -> bool {
+    if !pending_snapshots_readable(path) {
+        log::warn!(
+            "unread: 待重试标记旧快照暂时不可读 {}（保留旧文件，跳过落盘）",
+            path.display()
+        );
+        return false;
+    }
+    let Ok(json) = serde_json::to_string(map) else {
+        return false;
+    };
+    let tmp = path.with_extension("json.tmp");
+    if let Err(e) = std::fs::write(&tmp, &json) {
+        log::warn!(
+            "unread: 待重试标记写入 {} 失败（降级为内存重试）: {e}",
+            tmp.display()
+        );
+        return false;
+    }
+    // 写完 tmp 后、换入前再确认一次，缩小“检查后被占用/权限变化”的竞态窗口。
+    if !pending_snapshots_readable(path) {
+        log::warn!(
+            "unread: 待重试标记换入前旧快照变为不可读 {}（保留旧文件，跳过落盘）",
+            path.display()
+        );
+        let _ = std::fs::remove_file(&tmp);
+        return false;
+    }
+    if replace_pending_file_atomic(&tmp, path) {
+        let _ = std::fs::remove_file(pending_backup_path(path));
+        return true;
+    }
+    replace_pending_file_with_backup(&tmp, path)
+}
+
+/// 直接 rename 失败（Windows 目标已存在）时的安全替换：先把旧文件挪为 `.bak`，
+/// 再换入 tmp；任一步失败都恢复/保留旧文件。崩溃窗口由 `load_pending_map` 的
+/// `.bak` 回退兜底。
+fn replace_pending_file_with_backup(tmp: &std::path::Path, path: &std::path::Path) -> bool {
+    let backup = pending_backup_path(path);
+    let primary_snapshot = read_pending_snapshot(path);
+    let backup_snapshot = read_pending_snapshot(&backup);
+    if matches!(&primary_snapshot, PendingSnapshot::IoError) {
+        // 主文件暂时不可读：可能只是占用/权限抖动；保留主文件与 .bak，下一轮再试。
+        log::warn!(
+            "unread: 待重试标记主文件暂时不可读 {}（保留现有文件，降级）",
+            path.display()
+        );
+        let _ = std::fs::remove_file(tmp);
+        return false;
+    }
+    let primary_valid = matches!(&primary_snapshot, PendingSnapshot::Valid(_));
+    let backup_valid = matches!(&backup_snapshot, PendingSnapshot::Valid(_));
+    let primary_exists = match path.try_exists() {
+        Ok(exists) => exists,
+        Err(e) => {
+            log::warn!(
+                "unread: 无法确认待重试标记主文件状态 {}（保留现有文件，降级）: {e}",
+                path.display()
+            );
+            let _ = std::fs::remove_file(tmp);
+            return false;
+        }
+    };
+
+    // 主文件已损坏/不可用，而 .bak 是唯一有效快照：只移除损坏主文件，绝不覆盖 .bak。
+    // 若 tmp 换入失败，.bak 仍可供下次启动恢复。
+    if !primary_valid && backup_valid {
+        if primary_exists {
+            if let Err(e) = std::fs::remove_file(path) {
+                log::warn!(
+                    "unread: 待重试标记损坏主文件无法移除 {}（保留 .bak，降级）: {e}",
+                    path.display()
+                );
+                let _ = std::fs::remove_file(tmp);
+                return false;
+            }
+        }
+        if let Err(e) = std::fs::rename(tmp, path) {
+            log::warn!("unread: 待重试标记换入失败（保留唯一有效 .bak 供恢复）: {e}");
+            let _ = std::fs::remove_file(tmp);
+            return false;
+        }
+        let _ = std::fs::remove_file(&backup);
+        return true;
+    }
+
+    // 无主文件且无有效备份：无旧快照可保；直接换入，失败则保持原状。
+    if !primary_exists {
+        if std::fs::rename(tmp, path).is_ok() {
+            let _ = std::fs::remove_file(&backup);
+            return true;
+        }
+        log::warn!(
+            "unread: 待重试标记无主文件时换入失败 {}（降级）",
+            path.display()
+        );
+        let _ = std::fs::remove_file(tmp);
+        return false;
+    }
+
+    // 主文件存在（有效，或双方都无效）：保留主文件为 .bak 后再换入。
+    let _ = std::fs::remove_file(&backup);
+    if let Err(e) = std::fs::rename(path, &backup) {
+        log::warn!(
+            "unread: 待重试标记替换前无法保留旧文件 {}（保留原文件，降级）: {e}",
+            path.display()
+        );
+        let _ = std::fs::remove_file(tmp);
+        return false;
+    }
+    if let Err(e) = std::fs::rename(tmp, path) {
+        if let Err(e2) = std::fs::rename(&backup, path) {
+            log::warn!(
+                "unread: 待重试标记替换失败且旧文件恢复失败（load 将回退 .bak）: {e} / {e2}"
+            );
+        }
+        let _ = std::fs::remove_file(tmp);
+        return false;
+    }
+    let _ = std::fs::remove_file(&backup);
+    true
+}
+
+/// 恢复持久化的待重试标记，并清理 24h 过期项。
+/// 只有成功读取或确认文件不存在才置位 `loaded`；临时 I/O/解析失败留给下一轮重试。
+fn load_pending_unread_retries_into(
+    path: &std::path::Path,
+    loaded: &std::sync::atomic::AtomicBool,
+    retries: &Mutex<HashMap<(String, String), i64>>,
+) {
+    use std::sync::atomic::Ordering;
+    if loaded.load(Ordering::Acquire) {
+        return;
+    }
+    match load_pending_map(path) {
+        PendingLoad::Loaded(map) => {
+            let now = chrono::Utc::now().timestamp_millis();
+            let mut guard = retries.lock().unwrap();
+            for (key, since) in map {
+                if now.saturating_sub(since) > PENDING_TTL_MS {
+                    continue;
+                }
+                if let Some((tool, sid)) = key.split_once('\u{1f}') {
+                    guard
+                        .entry((tool.to_string(), sid.to_string()))
+                        .or_insert(since);
+                }
+            }
+            loaded.store(true, Ordering::Release);
+        }
+        PendingLoad::Absent => loaded.store(true, Ordering::Release),
+        PendingLoad::Failed => {
+            log::debug!("unread: 待重试标记暂时不可读，下一轮扫描重试");
+        }
+    }
+}
+
+fn load_pending_unread_retries() {
+    load_pending_unread_retries_into(
+        &pending_store_path(),
+        &PENDING_LOADED,
+        &PENDING_UNREAD_RETRIES,
+    );
+    // 之前落盘被旧快照不可读拦下：恢复后把内存新增项与磁盘旧项合并，再补写一次。
+    if PENDING_LOADED.load(std::sync::atomic::Ordering::Acquire)
+        && PENDING_DIRTY.load(std::sync::atomic::Ordering::Acquire)
+    {
+        persist_pending_unread_retries();
+    }
+}
+
+/// 每轮清理内存中超过 24h 的待重试标记；有变化才落盘（避免每 3s 写放大）。
+fn prune_pending_unread_retries(now_ms: i64) {
+    let changed = {
+        let mut guard = PENDING_UNREAD_RETRIES.lock().unwrap();
+        let before = guard.len();
+        guard.retain(|_, since| now_ms.saturating_sub(*since) <= PENDING_TTL_MS);
+        guard.len() != before
+    };
+    if changed {
+        let _ = persist_pending_unread_retries();
+    }
+}
+
+struct PendingRetryStore<'a> {
+    path: std::path::PathBuf,
+    loaded: &'a std::sync::atomic::AtomicBool,
+    dirty: &'a std::sync::atomic::AtomicBool,
+    retries: &'a Mutex<HashMap<(String, String), i64>>,
+}
+
+impl<'a> PendingRetryStore<'a> {
+    #[cfg(test)]
+    fn new(
+        path: std::path::PathBuf,
+        loaded: &'a std::sync::atomic::AtomicBool,
+        dirty: &'a std::sync::atomic::AtomicBool,
+        retries: &'a Mutex<HashMap<(String, String), i64>>,
+    ) -> Self {
+        Self {
+            path,
+            loaded,
+            dirty,
+            retries,
+        }
+    }
+
+    fn global() -> PendingRetryStore<'static> {
+        PendingRetryStore {
+            path: pending_store_path(),
+            loaded: &PENDING_LOADED,
+            dirty: &PENDING_DIRTY,
+            retries: &PENDING_UNREAD_RETRIES,
+        }
+    }
+
+    fn mark(&self, tool: &str, sid: &str, since_ms: i64, persist: bool) -> bool {
+        let changed = {
+            let mut guard = self.retries.lock().unwrap();
+            match guard.entry((tool.to_string(), sid.to_string())) {
+                std::collections::hash_map::Entry::Occupied(_) => false,
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    e.insert(since_ms);
+                    true
+                }
+            }
+        };
+        if persist && changed {
+            let _ = persist_pending_unread_retries_into(
+                &self.path,
+                self.loaded,
+                self.dirty,
+                self.retries,
+            );
+        }
+        changed
+    }
+
+    fn clear(&self, tool: &str, sid: &str, persist: bool) -> bool {
+        let changed = self
+            .retries
+            .lock()
+            .unwrap()
+            .remove(&(tool.to_string(), sid.to_string()))
+            .is_some();
+        if persist && changed {
+            let _ = persist_pending_unread_retries_into(
+                &self.path,
+                self.loaded,
+                self.dirty,
+                self.retries,
+            );
+        }
+        changed
+    }
+
+    fn since(&self, tool: &str, sid: &str) -> Option<i64> {
+        self.retries
+            .lock()
+            .unwrap()
+            .get(&(tool.to_string(), sid.to_string()))
+            .copied()
+    }
+}
+
+#[cfg(test)]
+fn mark_unread_retry(tool: &str, sid: &str, since_ms: i64, persist: bool) -> bool {
+    PendingRetryStore::global().mark(tool, sid, since_ms, persist)
+}
+
+fn clear_unread_retry(tool: &str, sid: &str, persist: bool) -> bool {
+    PendingRetryStore::global().clear(tool, sid, persist)
+}
+
+/// 首次转绿入池（生产同步入口的可注入核心）：
+/// 允许插入 → 成功清 pending；失败登记 pending（自动落盘）；不允许插入 → 清 pending。
+#[allow(clippy::too_many_arguments)]
+fn insert_first_green_unread(
+    pending: &PendingRetryStore<'_>,
+    tool: &str,
+    sid: &str,
+    record: &crate::database::dao::unread::UnreadSessionRecord,
+    prev_status: Option<&str>,
+    read_at: Option<i64>,
+    activity: Option<i64>,
+    pending_since: Option<i64>,
+    now_ms: i64,
+    upsert: &dyn Fn(&crate::database::dao::unread::UnreadSessionRecord) -> bool,
+) -> bool {
+    if !unread_insert_allowed(prev_status, read_at, activity, pending_since) {
+        pending.clear(tool, sid, true);
+        return false;
+    }
+    if upsert(record) {
+        pending.clear(tool, sid, true);
+        true
+    } else {
+        pending.mark(tool, sid, now_ms, true);
+        false
+    }
+}
+
+/// 转绿补插（生产同步入口的可注入核心）：有 pending 才补插；本次已读或池行已存在
+/// → 清 pending；无 pending 且池行存在 → 仅刷新展示字段。
+#[allow(clippy::too_many_arguments)]
+fn retry_pending_unread(
+    pending: &PendingRetryStore<'_>,
+    tool: &str,
+    sid: &str,
+    record: &crate::database::dao::unread::UnreadSessionRecord,
+    read_at_of: &dyn Fn(&str) -> Option<i64>,
+    upsert: &dyn Fn(&crate::database::dao::unread::UnreadSessionRecord) -> bool,
+    refresh: &dyn Fn(&crate::database::dao::unread::UnreadSessionRecord) -> bool,
+) -> bool {
+    // 无 pending 时只做一次 UPDATE；有 pending 才读墓碑，避免常态绿卡多一次 DB 查询。
+    if pending.since(tool, sid).is_none() {
+        refresh(record);
+        return false;
+    }
+    let since = pending
+        .since(tool, sid)
+        .expect("pending existence checked above");
+    if !retry_insert_allowed(since, read_at_of(sid)) {
+        pending.clear(tool, sid, true);
+        return false;
+    }
+    // UPDATE 命中 = 池行已在；展示字段照常刷新，但不得重复插入。
+    if refresh(record) {
+        pending.clear(tool, sid, true);
+        return false;
+    }
+    if upsert(record) {
+        pending.clear(tool, sid, true);
+        true
+    } else {
+        pending.mark(tool, sid, since, true);
+        false
+    }
+}
+
+fn unread_retry_pending(tool: &str, sid: &str) -> bool {
+    PENDING_UNREAD_RETRIES
+        .lock()
+        .unwrap()
+        .contains_key(&(tool.to_string(), sid.to_string()))
+}
+
+fn unread_retry_pending_since(tool: &str, sid: &str) -> Option<i64> {
+    PENDING_UNREAD_RETRIES
+        .lock()
+        .unwrap()
+        .get(&(tool.to_string(), sid.to_string()))
+        .copied()
+}
+
+/// 补插时，只有**本次转绿之后**发生的已读才取消重试；旧回合的墓碑不能阻止新回合。
+fn retry_insert_allowed(pending_since_ms: i64, read_at: Option<i64>) -> bool {
+    read_at.is_none_or(|t| t < pending_since_ms)
+}
+
+fn session_activity_ms(s: &Session) -> Option<i64> {
+    crate::monitor::subagents::iso_to_ms(&s.last_activity_at)
+}
+
+/// 活动时间是否“可能是当前回合”（用于无待重试标记时的兜底）。
+/// Codex APP 的 `threads.updated_at` 是**秒级**：同一秒内的新回合不能因为
+/// 墓碑毫秒值更大就被判成已读；对秒级活动留 999ms 不确定性，宁可允许通知。
+fn activity_may_be_after(activity_ms: i64, read_at_ms: i64) -> bool {
+    if activity_ms % 1000 == 0 {
+        activity_ms.saturating_add(999) >= read_at_ms
+    } else {
+        activity_ms > read_at_ms
+    }
+}
+
+/// 墓碑是否覆盖了当前活动（本回合已读）：
+/// * 毫秒级活动：`read_at >= activity`；
+/// * 秒级活动：必须严格晚于该秒（`read_at > activity + 999`）才算已读。
+fn read_covers_activity(read_at_ms: i64, activity_ms: i64) -> bool {
+    !activity_may_be_after(activity_ms, read_at_ms)
+}
+
+/// 首次转绿 INSERT 是否应因“本回合已读”而跳过：
+/// * 有待重试标记：墓碑 >= since（本次转绿后）→ 跳过；
+/// * 无标记（含重启后标记丢失）：墓碑 >= 卡片最后活动 → 视为本回合已读，跳过；
+///   旧回合墓碑 < 当前回合活动 → 允许插入。
+fn insert_should_skip_for_read(
+    pending_since_ms: Option<i64>,
+    read_at: Option<i64>,
+    activity_ms: Option<i64>,
+) -> bool {
+    match pending_since_ms {
+        Some(since) => !retry_insert_allowed(since, read_at),
+        None => match (read_at, activity_ms) {
+            (Some(read), Some(activity)) => read_covers_activity(read, activity),
+            _ => false,
+        },
+    }
+}
+
+/// 首次入池的统一判据：本回合已读 → 不插；prev=None + 墓碑 → 只有活动可能属于
+/// 当前回合才允许（旧卡不得复活）；其余沿用迁移触发规则。
+fn unread_insert_allowed(
+    prev: Option<&str>,
+    read_at: Option<i64>,
+    activity_ms: Option<i64>,
+    pending_since_ms: Option<i64>,
+) -> bool {
+    if insert_should_skip_for_read(pending_since_ms, read_at, activity_ms) {
+        return false;
+    }
+    if prev.is_none() {
+        if let Some(read) = read_at {
+            return activity_ms.is_some_and(|a| activity_may_be_after(a, read));
+        }
+    }
+    insert_allowed(prev, read_at.is_some())
+}
+
+/// 数据驱动绿卡预过滤的保留判据：待重试优先，否则沿用“上一轮绿 + 池无行 ⇒ 剔除”。
+fn keep_green_card(was_green_prev: bool, pool_has_row: bool, retry_pending: bool) -> bool {
+    retry_pending || !codex_green_card_should_drop(was_green_prev, pool_has_row)
+}
+
 /// 通用进程信息
 #[derive(Debug, Clone)]
 pub struct AgentProcess {
@@ -395,7 +992,7 @@ pub trait AgentAdapter: Send + Sync {
 
     /// 解析该工具的会话。**会话扫描预算契约**（详见 `monitor::session_scan` 模块文档
     /// 与 AGENTS.md「Agent Adapter 模式」）：
-    /// - L1 零进程零解析：编排层（`get_all_sessions`）保证本工具进程为空时**不会调用**
+    /// - L1 零进程零解析：编排层（`scan_bus` 的每轮扫描）保证本工具进程为空时**不会调用**
     ///   本方法，且有遍历全部注册 adapter 的防回归测试；实现侧仍应自带空判早退作
     ///   纵深防御；
     /// - L2/L3 文件类解析必须走 `monitor::session_scan::SessionFileScan`
@@ -516,20 +1113,64 @@ pub fn all_adapters_with_ids() -> Vec<(&'static str, Box<dyn AgentAdapter>)> {
 /// 共享 System 实例 — 每轮询周期刷新一次，所有 adapter 共用
 static SHARED_SYSTEM: Mutex<Option<System>> = Mutex::new(None);
 
-/// get_all_sessions 单飞护栏（评审 R3）：主窗口与桌宠各自 3s 轮询，相位接近时
-/// 两请求并发进入同一段多秒扫描——堆叠放大 CPU/IO 峰值。try_lock 抢扫描权，
-/// 抢不到的请求立即返回最近一次快照（0=尚无快照时返回空响应，首窗口可接受）。
-/// 扫描完成时刷新快照。不做去抖定时器，保持"谁抢到谁全量扫"的最简单飞语义
-struct ScanFlight {
-    /// 扫描进行中标志（try_lock 竞争点）
-    in_flight: std::sync::Mutex<bool>,
-    /// 最近一次完整扫描结果（快照返回用；含时间戳便于日志诊断陈旧度）
-    last_snapshot: std::sync::Mutex<Option<(std::time::Instant, SessionsResponse)>>,
+/// 获取共享进程快照锁。锁内 panic 后旧 System 可能已不一致，丢弃并清除 poison，
+/// 让下一轮通过 `get_or_insert_with(System::new)` 重建，而不是每轮持续 panic。
+fn lock_shared_system(lock: &Mutex<Option<System>>) -> MutexGuard<'_, Option<System>> {
+    match lock.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            let mut guard = poisoned.into_inner();
+            *guard = None;
+            lock.clear_poison();
+            log::error!("adapter: 共享 System 锁已污染，丢弃旧状态并重建");
+            guard
+        }
+    }
 }
-static SCAN_FLIGHT: Lazy<ScanFlight> = Lazy::new(|| ScanFlight {
-    in_flight: std::sync::Mutex::new(false),
-    last_snapshot: std::sync::Mutex::new(None),
-});
+
+/// 最近一轮「进程刷新段」耗时（毫秒）：扫描总线把它写入 scan_bus_stats.json，
+/// 作为 F8（≤25ms）验收的数据源（R4）
+static LAST_PROCESS_REFRESH_MS: AtomicU64 = AtomicU64::new(0);
+
+/// 卡面 CPU 是展示值，低频采样；OpenClaw 的状态判定另走逐扫描刷新。
+const DISPLAY_CPU_SAMPLE_INTERVAL: Duration = Duration::from_secs(30);
+
+/// 最近一轮扫描中「有进程在跑」的工具 id（升序去重）。
+/// **唯一写入点**是 `get_all_sessions_inner` Phase 1：记录 `find_processes` 结果，并
+/// 对 WorkBuddy 合并同一轮共享 `System` 快照中的宿主判定。只复用本轮已刷新的进程事实；
+/// 禁止为「未覆盖工具是否在跑」另起第二套进程刷新器（2026-10-31 用户裁决）。
+static RUNNING_TOOL_IDS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// 最近一轮在跑工具 id（升序去重；未扫描时为空）
+pub(crate) fn running_tool_ids() -> Vec<String> {
+    RUNNING_TOOL_IDS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
+/// 记录在跑工具（调用方只传工具 id；排序去重在此统一完成）
+fn record_running_tools<'a>(ids: impl Iterator<Item = &'a str>) {
+    let mut v: Vec<String> = ids.map(str::to_string).collect();
+    v.sort();
+    v.dedup();
+    *RUNNING_TOOL_IDS.lock().unwrap_or_else(|e| e.into_inner()) = v;
+}
+
+/// WorkBuddy 的 adapter 进程集合由新鲜会话心跳驱动；额外并入同轮 System 快照中的
+/// WorkBuddy 宿主事实，避免「应用空闲、无心跳」时把无事件工具误判为未运行。
+fn record_running_tools_with_workbuddy_host<'a>(
+    ids: impl Iterator<Item = &'a str>,
+    workbuddy_host_alive: bool,
+) {
+    let host_id = workbuddy_host_alive.then_some("workbuddy");
+    record_running_tools(ids.chain(host_id));
+}
+
+/// 最近一轮进程刷新耗时（毫秒）
+pub(crate) fn last_process_refresh_ms() -> u64 {
+    LAST_PROCESS_REFRESH_MS.load(Ordering::Relaxed)
+}
 
 /// 会话级去重：同一 (工具, session id) 只保留首张卡。
 /// 全局防线：任何解析器的"文件级/进程级复制"型 bug（如 opencode 多进程同会话、
@@ -539,43 +1180,11 @@ pub fn dedup_sessions(sessions: &mut Vec<Session>) {
     sessions.retain(|s| seen.insert((s.agent_type.tool_id().to_string(), s.id.clone())));
 }
 
-/// 获取所有注册 adapter 的会话（单飞：并发请求直接复用最近快照）
+/// 兼容入口：委托扫描总线读共享快照（冷启动无快照时同步首扫）。
+/// 生产路径已统一走 `scan_bus`（单飞/版本/看门狗都在那里）；保留本函数给
+/// 集成测试与外部调用方，**不得**在此另起第二套单飞或快照。
 pub fn get_all_sessions() -> SessionsResponse {
-    // R3 单飞护栏：抢不到扫描权 → 返回上次快照，不排队不堆叠
-    let mut flying = SCAN_FLIGHT.in_flight.lock().unwrap();
-    if *flying {
-        let snap = SCAN_FLIGHT.last_snapshot.lock().unwrap();
-        if let Some((at, resp)) = snap.as_ref() {
-            log::debug!(
-                "get_all_sessions 单飞命中快照（扫描进行中，快照龄 {:?}）",
-                at.elapsed()
-            );
-            return resp.clone();
-        }
-        return SessionsResponse {
-            sessions: Vec::new(),
-            total_count: 0,
-            waiting_count: 0,
-        };
-    }
-    *flying = true;
-    drop(flying); // 先放手上的 in_flight 锁：Drop guard 析构时要重新拿它清位，
-                  // 不 drop 即自锁自等（本测试挂起事故的根因）
-                  // Drop guard：内层扫描 panic（如 DB 锁中毒 unwrap）时飞行位自动释放——
-                  // 若靠扫描返回后手动清位，一次 panic 即永久卡死单飞（看板冻结到重启），
-                  // 且把原失败模式（单次报错下轮重试）恶化成永久故障
-    let _guard = ScanFlightGuard;
-    let result = get_all_sessions_inner();
-    *SCAN_FLIGHT.last_snapshot.lock().unwrap() = Some((std::time::Instant::now(), result.clone()));
-    result
-}
-
-/// 扫描飞行位的 Drop 释放护栏（作用域结束/panic unwind 均自动清位）
-struct ScanFlightGuard;
-impl Drop for ScanFlightGuard {
-    fn drop(&mut self) {
-        *SCAN_FLIGHT.in_flight.lock().unwrap() = false;
-    }
+    crate::adapter::scan_bus::current_or_scan()
 }
 
 /// T8：问题事件的 tool_input 载荷提取（QuestionEntry 写标记时随行落库——questions
@@ -584,29 +1193,1014 @@ fn event_payload(event: Option<&crate::monitor::hooks::HookEvent>) -> Option<&st
     event.and_then(|e| e.tool_input.as_deref())
 }
 
-/// 实际扫描（单飞壳内执行；成功路径与原实现一致）
-fn get_all_sessions_inner() -> SessionsResponse {
-    // W5：未勾选工具不参与会话扫描（看板卡/通知随之静默）
-    let adapters: Vec<Box<dyn AgentAdapter>> = enabled_adapters();
+/// 进程名归一：取 basename（兼容 `/`、`\` 两种分隔符）→ 小写 → 去 `.exe`。
+/// sysinfo 各平台 name 形态不一（Windows 实测带 `.exe`，macOS 多为裸名），
+/// 候选匹配与白名单构建统一走此口径，避免大小写/扩展名差异导致漏配
+pub(crate) fn bare_name(name: &str) -> String {
+    let base = name
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(name)
+        .to_lowercase();
+    base.strip_suffix(".exe").unwrap_or(&base).to_string()
+}
 
-    // Phase 1: 刷新共享 System 快照，发现所有进程
-    let all_processes: Vec<Vec<AgentProcess>> = {
-        let mut guard = SHARED_SYSTEM.lock().unwrap();
-        let system = guard.get_or_insert_with(|| {
-            log::debug!("Initializing shared System instance");
-            System::new_with_specifics(
-                RefreshKind::nothing().with_processes(
-                    ProcessRefreshKind::nothing()
-                        .with_cmd(sysinfo::UpdateKind::Always)
-                        .with_cwd(sysinfo::UpdateKind::Always)
-                        // exe 路径是 Windows MSIX 形态判定（classify_form）的关键输入：
-                        // 缺失时 ChatGPT 内嵌 codex.exe 会被误判为 CLI（提权进程 cmd 也读不到）
-                        .with_exe(sysinfo::UpdateKind::Always)
-                        .with_cpu(),
-                ),
-            )
+/// npm-shim 宿主解释器：工具实际进程名常是解释器（node/bun 等），
+/// 两段式第二段必须读其 cmd 才能判定，宿主判定也须放行这些名字
+pub(crate) const INTERPRETER_PROCESS_NAMES: &[&str] = &["node", "bun", "python", "python3", "deno"];
+
+/// 工具 id → 宿主进程名（小写裸名）。**单一事实源**：两段式候选白名单与
+/// `monitor::host::tool_host_alive_in` 的预滤共用本表——表里漏一个名字，
+/// 第二段就不读该进程的 exe/cmd，宿主判不出、该工具整批卡片被过滤。
+/// 条目来源以 `monitor/host.rs::is_host_process` 的现有判据为准：
+/// - workbuddy：Windows 安装形态 WorkBuddy.exe；macOS 主可执行体是 Electron；
+/// - codex：Windows MSIX 桌面端 ChatGPT.exe / macOS chatgpt.app 主进程 / codex.app 主进程；
+/// - zcode：Electron APP 主进程可执行名恰为 ZCode（macOS）/ ZCode.exe（Windows）；
+/// - dsh：桌面宿主 DeepSeek Harness(.exe)；web 宿主是 node（解释器表覆盖，靠 cmdline 判定）。
+pub(crate) const HOST_PROCESS_NAMES: &[(&str, &[&str])] = &[
+    ("workbuddy", &["workbuddy", "electron"]),
+    ("codex", &["chatgpt", "codex"]),
+    ("zcode", &["zcode"]),
+    ("dsh", &["deepseek harness"]),
+];
+
+/// 该工具的宿主进程名表（未登记工具返回空表）
+pub(crate) fn host_process_names(tool_id: &str) -> &'static [&'static str] {
+    HOST_PROCESS_NAMES
+        .iter()
+        .find(|(id, _)| *id == tool_id)
+        .map(|(_, names)| *names)
+        .unwrap_or(&[])
+}
+
+/// 该进程名是否可能承载该工具的宿主：命中宿主名表，或（npm-shim 场景）是解释器
+pub(crate) fn name_may_host_tool(name: &str, tool_id: &str) -> bool {
+    INTERPRETER_PROCESS_NAMES.contains(&name) || host_process_names(tool_id).contains(&name)
+}
+
+/// 扫描候选进程名白名单（全部小写归一、升序去重）。
+///
+/// 两段式进程刷新的第一段只读名字层，第二段仅对候选 PID 读 cmd/cwd/exe/cpu。
+/// 白名单 = 解释器表（npm-shim 宿主）+ **宿主名表**（单一事实源，见
+/// [`HOST_PROCESS_NAMES`]）+ 全部 adapter 声明的 `process_names()`（经 [`bare_name`] 归一）。
+/// 宿主名表与 `monitor::host::tool_host_alive_in` 的预滤同源：这张表漏一个名字，
+/// 第二段就不读该进程的 exe/cmd，宿主判不出、该工具整批卡片被过滤。
+/// 取舍：macOS 上全部 Electron 应用都会进候选集（多读若干进程的 cmd/cwd/exe），
+/// 仍是全部进程的极小子集（约数十个），换取 WorkBuddy 桌面端不被误杀。
+pub(crate) fn candidate_process_names(adapter_names: &[&[&str]]) -> Vec<String> {
+    let mut v: Vec<String> = INTERPRETER_PROCESS_NAMES
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    for (_, host_names) in HOST_PROCESS_NAMES {
+        for n in *host_names {
+            v.push(bare_name(n));
+        }
+    }
+    for names in adapter_names {
+        for n in *names {
+            v.push(bare_name(n));
+        }
+    }
+    v.sort();
+    v.dedup();
+    v
+}
+
+/// Phase 1 两段式刷新的候选白名单（生产入口）。
+///
+/// 刻意取自 **全部已注册 adapter**（`all_adapters()`），而非 `enabled_adapters()`：
+/// 宿主存活判定（`filter_host_dead_cards` / `dead_tools_from_pool` →
+/// `tool_host_alive_in`）复用同一 SHARED_SYSTEM 快照并按 exe/cmd 判宿主——若白名单
+/// 只含已勾选工具，「已禁用但仍在运行」的工具进程在第二段不读 exe/cmd，其宿主会被
+/// 误判死亡，未读池行被清空且重新启用后无法恢复。会话解析（Phase 2）仍只走
+/// `enabled_adapters()`，停用工具的卡/通知保持静默。
+fn refresh_candidate_process_names() -> Vec<String> {
+    let lists: Vec<&[&str]> = all_adapters().iter().map(|a| a.process_names()).collect();
+    candidate_process_names(&lists)
+}
+
+struct CpuRefreshPlan {
+    candidates: Vec<CpuProcessKey>,
+    targets: Vec<CpuProcessKey>,
+    display_due: bool,
+}
+
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
+struct CpuProcessKey {
+    pid: sysinfo::Pid,
+    start_time: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CpuSampleState {
+    last_cpu_time_ms: Option<u64>,
+    last_cpu_sample_at: Option<Instant>,
+    /// Per-process CPU percent computed from that PID's own cumulative-time delta and wall window.
+    cpu_usage: Option<f32>,
+    /// Last validated CPU value published to session cards.
+    display_cpu_usage: Option<f32>,
+}
+
+#[derive(Clone, Default)]
+struct CpuSamplingState {
+    last_display_sample_at: Option<Instant>,
+    processes: HashMap<CpuProcessKey, CpuSampleState>,
+}
+
+static CPU_SAMPLING_STATE: Lazy<Mutex<CpuSamplingState>> =
+    Lazy::new(|| Mutex::new(CpuSamplingState::default()));
+
+fn reset_cpu_sampling_state_if_system_rebuilt(
+    state: &mut CpuSamplingState,
+    system_was_initialized: bool,
+) {
+    if !system_was_initialized {
+        *state = CpuSamplingState::default();
+    }
+}
+
+/// 累计 CPU 毫秒的差值与同一 PID 两次读取间的墙钟时间配对，避免依赖 sysinfo
+/// 首次刷新时尚未建立的差分基线，也避免 macOS 共享 System 刷新时钟导致分母错窗。
+fn cpu_usage_from_delta(
+    previous_cpu_time_ms: u64,
+    previous_at: Instant,
+    current_cpu_time_ms: u64,
+    current_at: Instant,
+) -> Option<f32> {
+    let elapsed_ms = current_at
+        .saturating_duration_since(previous_at)
+        .as_secs_f64()
+        * 1000.0;
+    if elapsed_ms <= 0.0 {
+        return None;
+    }
+    let cpu_delta_ms = current_cpu_time_ms.checked_sub(previous_cpu_time_ms)? as f64;
+    let usage = (cpu_delta_ms / elapsed_ms * 100.0) as f32;
+    usage.is_finite().then_some(usage)
+}
+
+/// OpenClaw 状态采样按 sysinfo 最小间隔检查；卡面 CPU 使用各 PID 自己的累计时间窗口，
+/// 并只在展示截止发布。
+fn cpu_refresh_plan(
+    candidates: &[CpuProcessKey],
+    openclaw: &[CpuProcessKey],
+    state: &mut CpuSamplingState,
+    now: Instant,
+) -> CpuRefreshPlan {
+    let candidate_set: HashSet<_> = candidates.iter().copied().collect();
+    state.processes.retain(|key, _| candidate_set.contains(key));
+    let display_due = match state.last_display_sample_at {
+        None => true,
+        Some(last) => now.saturating_duration_since(last) >= DISPLAY_CPU_SAMPLE_INTERVAL,
+    };
+    let openclaw_set: HashSet<_> = openclaw.iter().copied().collect();
+    let targets: Vec<_> = candidates
+        .iter()
+        .copied()
+        .filter(|key| {
+            let sample = state.processes.get(key);
+            let sample_due = match sample {
+                None => true,
+                Some(s) if s.last_cpu_sample_at.is_none() => true,
+                Some(s) => {
+                    now.saturating_duration_since(s.last_cpu_sample_at.unwrap())
+                        >= sysinfo::MINIMUM_CPU_UPDATE_INTERVAL
+                }
+            };
+            let needs_baseline = match sample {
+                None => true,
+                Some(s) => s.cpu_usage.is_none(),
+            };
+            sample_due && (needs_baseline || openclaw_set.contains(key) || display_due)
+        })
+        .collect();
+    CpuRefreshPlan {
+        candidates: candidates.to_vec(),
+        targets,
+        display_due,
+    }
+}
+
+fn record_cpu_refresh_with_cpu_times(
+    state: &mut CpuSamplingState,
+    plan: &CpuRefreshPlan,
+    updated_count: usize,
+    cpu_times_ms: &HashMap<CpuProcessKey, u64>,
+    now: Instant,
+) -> Option<Instant> {
+    let complete_refresh = !plan.targets.is_empty()
+        && updated_count == plan.targets.len()
+        && plan
+            .targets
+            .iter()
+            .all(|key| cpu_times_ms.contains_key(key));
+    let previously_ready: HashSet<_> = plan
+        .targets
+        .iter()
+        .filter(|key| {
+            cpu_times_ms.contains_key(key)
+                && state
+                    .processes
+                    .get(key)
+                    .is_some_and(|sample| sample.cpu_usage.is_some())
+        })
+        .copied()
+        .collect();
+    for key in &plan.targets {
+        let Some(cpu_time_ms) = cpu_times_ms.get(key).copied() else {
+            continue;
+        };
+        let sample = state.processes.entry(*key).or_insert(CpuSampleState {
+            last_cpu_time_ms: None,
+            last_cpu_sample_at: None,
+            cpu_usage: None,
+            display_cpu_usage: None,
         });
+        if let (Some(previous_cpu_time_ms), Some(previous_at)) =
+            (sample.last_cpu_time_ms, sample.last_cpu_sample_at)
+        {
+            sample.cpu_usage =
+                cpu_usage_from_delta(previous_cpu_time_ms, previous_at, cpu_time_ms, now);
+        }
+        sample.last_cpu_time_ms = Some(cpu_time_ms);
+        sample.last_cpu_sample_at = Some(now);
+    }
+
+    let display_sample_is_complete = plan.display_due
+        && !plan.candidates.is_empty()
+        && plan.targets.len() == plan.candidates.len()
+        && complete_refresh
+        && plan.candidates.iter().all(|key| {
+            state
+                .processes
+                .get(key)
+                .is_some_and(|sample| sample.cpu_usage.is_some())
+        });
+    if display_sample_is_complete {
+        for key in &plan.candidates {
+            if let Some(sample) = state.processes.get_mut(key) {
+                sample.display_cpu_usage = sample.cpu_usage;
+            }
+        }
+        state.last_display_sample_at = Some(now);
+        Some(now)
+    } else {
+        // A new PID can become displayable between global display ticks; publish only that PID's
+        // first validated sample while keeping already displayed values on the agreed cadence.
+        for key in &plan.targets {
+            if !cpu_times_ms.contains_key(key) || previously_ready.contains(key) {
+                continue;
+            }
+            if let Some(sample) = state.processes.get_mut(key) {
+                if sample.cpu_usage.is_some() {
+                    sample.display_cpu_usage = sample.cpu_usage;
+                }
+            }
+        }
+        None
+    }
+}
+
+fn cpu_usage_by_pid(state: &CpuSamplingState) -> HashMap<u32, f32> {
+    state
+        .processes
+        .iter()
+        .map(|(key, sample)| (key.pid.as_u32(), sample.cpu_usage.unwrap_or(0.0)))
+        .collect()
+}
+
+fn cpu_display_by_pid(state: &CpuSamplingState) -> HashMap<u32, f32> {
+    state
+        .processes
+        .iter()
+        .map(|(key, sample)| (key.pid.as_u32(), sample.display_cpu_usage.unwrap_or(0.0)))
+        .collect()
+}
+
+#[cfg(test)]
+#[derive(Debug, PartialEq)]
+struct ProcessIdentity {
+    pid: u32,
+    cwd: Option<std::path::PathBuf>,
+    exe: Option<std::path::PathBuf>,
+    form: ProcessForm,
+}
+
+#[cfg(test)]
+fn process_identity(process: &AgentProcess) -> ProcessIdentity {
+    ProcessIdentity {
+        pid: process.pid,
+        cwd: process.cwd.clone(),
+        exe: process.exe.clone(),
+        form: process.form,
+    }
+}
+
+/// 两段式进程刷新（Phase 1 内核；抽为函数供活体回归测试直调，行为与内联版一致）：
+/// 第一段全量刷名字层，第二段候选 PID 读 cmd/cwd/exe；OpenClaw CPU 状态读取累计差分，
+/// 卡面 CPU 降频发布。
+/// 返回候选进程数与可写回的卡面 CPU 样本时刻。
+fn refresh_processes_two_stage(
+    system: &mut System,
+    wanted_names: &[String],
+    cpu_sampling_state: &mut CpuSamplingState,
+    now: Instant,
+) -> (usize, Option<Instant>) {
+    // 第一段：全量刷新名字层（进程枚举本身即带名字，无需额外系统调用）
+    system.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::nothing());
+
+    // 候选集 = 名字命中「解释器 + adapter 声明名 + 特殊宿主名」白名单。
+    // 非候选进程的 cmd/cwd/exe 保持为空：所有 adapter 的发现入口要么按名字命中
+    // （白名单已全覆盖），要么按 exe/cmd 判定（特殊宿主名已补白，见
+    // candidate_process_names 文档）
+    let candidates: Vec<CpuProcessKey> = system
+        .processes()
+        .iter()
+        .filter(|(_, process)| {
+            wanted_names
+                .binary_search(&bare_name(&process.name().to_string_lossy()))
+                .is_ok()
+        })
+        .map(|(pid, process)| CpuProcessKey {
+            pid: *pid,
+            start_time: process.start_time(),
+        })
+        .collect();
+    let candidate_pids: Vec<sysinfo::Pid> = candidates.iter().map(|key| key.pid).collect();
+
+    let openclaw_names = openclaw::OpenClawAdapter.process_names();
+    let openclaw_pids: Vec<CpuProcessKey> = system
+        .processes()
+        .iter()
+        .filter(|(_, process)| {
+            let name = bare_name(&process.name().to_string_lossy());
+            openclaw_names.iter().any(|expected| name == *expected)
+        })
+        .map(|(pid, process)| CpuProcessKey {
+            pid: *pid,
+            start_time: process.start_time(),
+        })
+        .collect();
+
+    // 第二段：只对候选 PID（约 20–40 个）读昂贵字段。cmd/cwd/exe 一律 Always：
+    // Windows 上 sysinfo 不保证 PID 复用时清空缓存字段，OnlyIfNotSet 会让复用后的
+    // 新进程沿用旧进程的 cmd/cwd/exe（旧的全量 Always 策略靠每轮重读自愈）；候选集
+    // 很小，每轮重读代价可忽略。CPU 在下方独立按「OpenClaw 状态 / 卡面展示」分频刷新
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&candidate_pids),
+        false,
+        ProcessRefreshKind::nothing()
+            .with_cmd(sysinfo::UpdateKind::Always)
+            .with_cwd(sysinfo::UpdateKind::Always)
+            // exe 路径是 Windows MSIX 形态判定（classify_form）的关键输入：
+            // 缺失时 ChatGPT 内嵌 codex.exe 会被误判为 CLI（提权进程 cmd 也读不到）
+            .with_exe(sysinfo::UpdateKind::Always),
+    );
+
+    let cpu_plan = cpu_refresh_plan(&candidates, &openclaw_pids, cpu_sampling_state, now);
+    let cpu_pids: Vec<sysinfo::Pid> = cpu_plan.targets.iter().map(|key| key.pid).collect();
+    let cpu_updated_count = if !cpu_pids.is_empty() {
         system.refresh_processes_specifics(
+            ProcessesToUpdate::Some(&cpu_pids),
+            false,
+            ProcessRefreshKind::nothing().with_cpu(),
+        )
+    } else {
+        0
+    };
+
+    let cpu_times_ms: HashMap<_, _> = cpu_plan
+        .targets
+        .iter()
+        .filter_map(|key| {
+            let process = system.process(key.pid)?;
+            if !process.exists() || process.start_time() != key.start_time {
+                return None;
+            }
+            Some((*key, process.accumulated_cpu_time()))
+        })
+        .collect();
+    let sampled_at = Instant::now();
+    (
+        candidates.len(),
+        record_cpu_refresh_with_cpu_times(
+            cpu_sampling_state,
+            &cpu_plan,
+            cpu_updated_count,
+            &cpu_times_ms,
+            sampled_at,
+        ),
+    )
+}
+
+#[cfg(test)]
+mod candidate_whitelist_tests {
+    use super::*;
+
+    #[test]
+    fn candidate_names_include_interpreters_for_shim_hosts() {
+        let names = candidate_process_names(&[&["kimi"][..]]);
+        assert!(names.contains(&"node".to_string()));
+        assert!(names.contains(&"bun".to_string()));
+        assert!(names.contains(&"kimi".to_string()));
+    }
+
+    #[test]
+    fn cpu_refresh_plan_keeps_openclaw_fresh_and_throttles_display() {
+        let all = [cpu_key(11, 1), cpu_key(22, 2), cpu_key(33, 3)];
+        let openclaw = [all[1]];
+        let t0 = Instant::now();
+        let mut state = CpuSamplingState::default();
+        let times = |samples: [u64; 3]| {
+            HashMap::from([
+                (all[0], samples[0]),
+                (all[1], samples[1]),
+                (all[2], samples[2]),
+            ])
+        };
+
+        let first = cpu_refresh_plan(&all, &openclaw, &mut state, t0);
+        assert!(first.display_due);
+        assert_eq!(first.targets, all);
+        assert_eq!(
+            record_cpu_refresh_with_cpu_times(
+                &mut state,
+                &first,
+                all.len(),
+                &times([1_000, 2_000, 3_000]),
+                t0
+            ),
+            None,
+            "first cumulative CPU-time read establishes per-PID baselines only"
+        );
+
+        let baseline_at = t0 + sysinfo::MINIMUM_CPU_UPDATE_INTERVAL;
+        let baseline = cpu_refresh_plan(&all, &openclaw, &mut state, baseline_at);
+        assert_eq!(
+            record_cpu_refresh_with_cpu_times(
+                &mut state,
+                &baseline,
+                all.len(),
+                &times([1_020, 2_040, 3_060]),
+                baseline_at
+            ),
+            Some(baseline_at),
+            "a real per-process cumulative delta paired with elapsed wall time is ready"
+        );
+        assert_eq!(
+            [11, 22, 33].map(|pid| cpu_display_by_pid(&state).get(&pid).copied().unwrap()),
+            [10.0, 20.0, 30.0]
+        );
+
+        let status_refresh_at = baseline_at + DISPLAY_CPU_SAMPLE_INTERVAL / 2;
+        let status_refresh = cpu_refresh_plan(&all, &openclaw, &mut state, status_refresh_at);
+        assert!(!status_refresh.display_due);
+        assert_eq!(status_refresh.targets, openclaw);
+        let status_times = HashMap::from([(all[1], 3_540)]);
+        assert_eq!(
+            record_cpu_refresh_with_cpu_times(
+                &mut state,
+                &status_refresh,
+                status_refresh.targets.len(),
+                &status_times,
+                status_refresh_at,
+            ),
+            None
+        );
+        assert_eq!(
+            [11, 22, 33].map(|pid| cpu_display_by_pid(&state).get(&pid).copied().unwrap()),
+            [10.0, 20.0, 30.0],
+            "fresh OpenClaw status samples must not update card CPU between display ticks"
+        );
+
+        let display_due_at = baseline_at + DISPLAY_CPU_SAMPLE_INTERVAL;
+        let display_refresh = cpu_refresh_plan(&all, &openclaw, &mut state, display_due_at);
+        assert!(display_refresh.display_due);
+        assert_eq!(display_refresh.targets, all);
+        assert_eq!(
+            record_cpu_refresh_with_cpu_times(
+                &mut state,
+                &display_refresh,
+                all.len(),
+                // PID 22 was sampled halfway through the display window; each PID uses its own
+                // accumulated-time and wall-clock delta instead of a shared System denominator.
+                &times([4_020, 4_140, 4_560]),
+                display_due_at,
+            ),
+            Some(display_due_at)
+        );
+        assert_eq!(
+            [11, 22, 33].map(|pid| cpu_display_by_pid(&state).get(&pid).copied().unwrap()),
+            [10.0, 4.0, 5.0]
+        );
+    }
+
+    #[test]
+    fn partial_cpu_refresh_updates_live_openclaw_but_keeps_display_deadline() {
+        let openclaw = cpu_key(11, 1);
+        let other = cpu_key(22, 2);
+        let candidates = [openclaw, other];
+        let t0 = Instant::now();
+        let mut state = CpuSamplingState::default();
+
+        let initial = cpu_refresh_plan(&candidates, &[openclaw], &mut state, t0);
+        assert_eq!(
+            record_cpu_refresh_with_cpu_times(
+                &mut state,
+                &initial,
+                2,
+                &HashMap::from([(openclaw, 1_000), (other, 2_000)]),
+                t0
+            ),
+            None
+        );
+
+        let busy_at = t0 + Duration::from_secs(10);
+        let busy = cpu_refresh_plan(&candidates, &[openclaw], &mut state, busy_at);
+        assert_eq!(
+            record_cpu_refresh_with_cpu_times(
+                &mut state,
+                &busy,
+                2,
+                &HashMap::from([(openclaw, 10_541), (other, 3_000)]),
+                busy_at
+            ),
+            Some(busy_at)
+        );
+        assert!((cpu_usage_by_pid(&state)[&11] - 95.41).abs() < 0.001);
+
+        let idle_at = busy_at + DISPLAY_CPU_SAMPLE_INTERVAL;
+        let partial = cpu_refresh_plan(&candidates, &[openclaw], &mut state, idle_at);
+        assert_eq!(partial.targets, candidates);
+        assert_eq!(
+            record_cpu_refresh_with_cpu_times(
+                &mut state,
+                &partial,
+                1,
+                &HashMap::from([(openclaw, 11_015)]),
+                idle_at
+            ),
+            None,
+            "one exited candidate must not advance the complete display deadline"
+        );
+        assert!(
+            (cpu_usage_by_pid(&state)[&11] - 1.58).abs() < 0.001,
+            "the live OpenClaw PID must update from busy to idle despite a partial batch"
+        );
+        assert_eq!(cpu_usage_by_pid(&state)[&22], 10.0);
+        assert_eq!(state.last_display_sample_at, Some(busy_at));
+        assert!((cpu_display_by_pid(&state)[&11] - 95.41).abs() < 0.001);
+    }
+
+    #[test]
+    fn new_pid_and_rebuilt_system_wait_for_real_cumulative_cpu_delta() {
+        let first = cpu_key(11, 1);
+        let second = cpu_key(22, 2);
+        let candidates = [first, second];
+        let mut state = CpuSamplingState::default();
+        let t0 = Instant::now();
+        let min_sample_interval = sysinfo::MINIMUM_CPU_UPDATE_INTERVAL;
+
+        let first_sample = cpu_refresh_plan(&candidates, &[], &mut state, t0);
+        assert_eq!(first_sample.targets, candidates);
+        assert_eq!(
+            record_cpu_refresh_with_cpu_times(
+                &mut state,
+                &first_sample,
+                2,
+                &HashMap::from([(first, 1_000), (second, 2_000)]),
+                t0
+            ),
+            None
+        );
+        assert_eq!(state.last_display_sample_at, None);
+
+        let too_soon = cpu_refresh_plan(&candidates, &[], &mut state, t0 + min_sample_interval / 2);
+        assert!(
+            too_soon.targets.is_empty(),
+            "per-PID CPU counters must not be sampled more frequently than their minimum window"
+        );
+
+        let valid_sample = cpu_refresh_plan(&candidates, &[], &mut state, t0 + min_sample_interval);
+        assert_eq!(valid_sample.targets, candidates);
+        let second_sample_at = t0 + min_sample_interval;
+        assert_eq!(
+            record_cpu_refresh_with_cpu_times(
+                &mut state,
+                &valid_sample,
+                2,
+                &HashMap::from([(first, 1_020), (second, 2_050)]),
+                second_sample_at
+            ),
+            Some(second_sample_at),
+            "a real accumulated CPU-time delta forms the sample; no refresh-count guess"
+        );
+        assert_eq!(
+            [11, 22].map(|pid| cpu_display_by_pid(&state).get(&pid).copied().unwrap()),
+            [10.0, 25.0]
+        );
+
+        let mut rebuilt_state = state.clone();
+        reset_cpu_sampling_state_if_system_rebuilt(&mut rebuilt_state, false);
+        assert!(rebuilt_state.processes.is_empty());
+        let rebuilt_t0 = second_sample_at + min_sample_interval;
+        let rebuilt_baseline = cpu_refresh_plan(&candidates, &[], &mut rebuilt_state, rebuilt_t0);
+        assert_eq!(rebuilt_baseline.targets, candidates);
+        assert_eq!(
+            record_cpu_refresh_with_cpu_times(
+                &mut rebuilt_state,
+                &rebuilt_baseline,
+                2,
+                &HashMap::from([(first, 5_000), (second, 8_000)]),
+                rebuilt_t0
+            ),
+            None,
+            "rebuilding System requires new per-PID cumulative CPU baselines"
+        );
+        let rebuilt_sample_at = rebuilt_t0 + min_sample_interval;
+        let rebuilt_sample =
+            cpu_refresh_plan(&candidates, &[], &mut rebuilt_state, rebuilt_sample_at);
+        assert_eq!(
+            record_cpu_refresh_with_cpu_times(
+                &mut rebuilt_state,
+                &rebuilt_sample,
+                2,
+                &HashMap::from([(first, 5_020), (second, 8_050)]),
+                rebuilt_sample_at
+            ),
+            Some(rebuilt_sample_at)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_sysinfo_cumulative_cpu_time_establishes_new_and_rebuilt_baselines() {
+        fn burn_cpu_for(duration: Duration) {
+            let until = Instant::now() + duration;
+            let mut value = 1_u64;
+            while Instant::now() < until {
+                value = value.wrapping_mul(16_777_619).wrapping_add(1);
+                std::hint::black_box(value);
+            }
+        }
+
+        fn refresh_current_process(
+            system: &mut System,
+            state: &mut CpuSamplingState,
+            key: CpuProcessKey,
+        ) -> Option<Instant> {
+            let now = Instant::now();
+            let plan = cpu_refresh_plan(&[key], &[], state, now);
+            assert_eq!(plan.targets, vec![key]);
+            let updated = system.refresh_processes_specifics(
+                ProcessesToUpdate::Some(&[key.pid]),
+                false,
+                ProcessRefreshKind::nothing().with_cpu(),
+            );
+            assert_eq!(updated, 1, "sysinfo 必须实际读取当前进程 CPU");
+            let cpu_time_ms = system
+                .process(key.pid)
+                .expect("当前测试 PID 必须存在于 sysinfo")
+                .accumulated_cpu_time();
+            record_cpu_refresh_with_cpu_times(
+                state,
+                &plan,
+                updated,
+                &HashMap::from([(key, cpu_time_ms)]),
+                now,
+            )
+        }
+
+        let pid = sysinfo::get_current_pid().expect("当前测试进程 PID");
+        let mut system = System::new();
+        system.refresh_processes_specifics(
+            ProcessesToUpdate::All,
+            true,
+            ProcessRefreshKind::nothing(),
+        );
+        let key = CpuProcessKey {
+            pid,
+            start_time: system.process(pid).expect("进程列表已刷新").start_time(),
+        };
+        let mut state = CpuSamplingState::default();
+
+        assert_eq!(refresh_current_process(&mut system, &mut state, key), None);
+        assert!(state.processes.get(&key).unwrap().cpu_usage.is_none());
+        std::thread::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL + Duration::from_millis(25));
+        burn_cpu_for(Duration::from_millis(100));
+        assert!(refresh_current_process(&mut system, &mut state, key).is_some());
+        assert!(state.processes.get(&key).unwrap().cpu_usage.unwrap() > 0.0);
+        assert!(cpu_display_by_pid(&state)[&pid.as_u32()] > 0.0);
+
+        // SHARED_SYSTEM 重建后，同一 PID 也必须从新的真实累计时间读数建立基线。
+        let mut rebuilt_state = state.clone();
+        let mut rebuilt_system = System::new();
+        rebuilt_system.refresh_processes_specifics(
+            ProcessesToUpdate::All,
+            true,
+            ProcessRefreshKind::nothing(),
+        );
+        let rebuilt_key = CpuProcessKey {
+            pid,
+            start_time: rebuilt_system
+                .process(pid)
+                .expect("重建后的 System 重新枚举当前进程")
+                .start_time(),
+        };
+        reset_cpu_sampling_state_if_system_rebuilt(&mut rebuilt_state, false);
+        assert_eq!(rebuilt_key, key, "测试期间同一 PID 的创建身份不应改变");
+        assert!(rebuilt_state.processes.is_empty());
+        assert_eq!(
+            refresh_current_process(&mut rebuilt_system, &mut rebuilt_state, rebuilt_key),
+            None
+        );
+        assert!(rebuilt_state
+            .processes
+            .get(&rebuilt_key)
+            .unwrap()
+            .cpu_usage
+            .is_none());
+        std::thread::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL + Duration::from_millis(25));
+        burn_cpu_for(Duration::from_millis(100));
+        assert!(
+            refresh_current_process(&mut rebuilt_system, &mut rebuilt_state, rebuilt_key).is_some(),
+            "新 System 的真实累计 CPU 增量必须形成新样本"
+        );
+        assert!(
+            rebuilt_state
+                .processes
+                .get(&rebuilt_key)
+                .unwrap()
+                .cpu_usage
+                .unwrap()
+                > 0.0
+        );
+    }
+
+    #[test]
+    fn cpu_percent_uses_each_pids_matching_accumulated_and_wall_window() {
+        let t0 = Instant::now();
+        let one_second = cpu_usage_from_delta(1_000, t0, 1_010, t0 + Duration::from_secs(1));
+        let two_hundred_ms =
+            cpu_usage_from_delta(1_000, t0, 1_050, t0 + Duration::from_millis(200));
+        assert_eq!(one_second, Some(1.0));
+        assert_eq!(two_hundred_ms, Some(25.0));
+        assert_eq!(
+            cpu_usage_from_delta(100, t0, 90, t0 + Duration::from_secs(1)),
+            None,
+            "counter reset must re-establish a baseline instead of publishing a false zero"
+        );
+        assert_eq!(
+            cpu_usage_from_delta(100, t0, 110, t0),
+            None,
+            "zero elapsed time cannot form a valid sample"
+        );
+    }
+
+    #[test]
+    fn empty_or_partial_cpu_refresh_does_not_advance_display_deadline() {
+        let t0 = std::time::Instant::now();
+        let mut state = CpuSamplingState::default();
+        let empty = cpu_refresh_plan(&[], &[], &mut state, t0);
+        assert_eq!(
+            record_cpu_refresh_with_cpu_times(&mut state, &empty, 0, &HashMap::new(), t0),
+            None
+        );
+        assert_eq!(state.last_display_sample_at, None);
+
+        let candidates = [cpu_key(11, 1), cpu_key(22, 2)];
+        let first = cpu_refresh_plan(&candidates, &[], &mut state, t0);
+        assert_eq!(
+            record_cpu_refresh_with_cpu_times(&mut state, &first, 0, &HashMap::new(), t0),
+            None
+        );
+        let next = t0 + sysinfo::MINIMUM_CPU_UPDATE_INTERVAL;
+        let partial = cpu_refresh_plan(&candidates, &[], &mut state, next);
+        assert_eq!(
+            record_cpu_refresh_with_cpu_times(
+                &mut state,
+                &partial,
+                1,
+                &HashMap::from([(candidates[0], 1_000)]),
+                next,
+            ),
+            None,
+            "CPU 更新返回部分候选时不得推进展示 deadline"
+        );
+        assert_eq!(state.last_display_sample_at, None);
+    }
+
+    #[test]
+    fn pid_reuse_starts_a_new_cpu_time_baseline() {
+        let old = cpu_key(11, 1);
+        let new = cpu_key(11, 2);
+        let t0 = Instant::now();
+        let mut state = CpuSamplingState::default();
+        let old_plan = cpu_refresh_plan(&[old], &[], &mut state, t0);
+        record_cpu_refresh_with_cpu_times(
+            &mut state,
+            &old_plan,
+            1,
+            &HashMap::from([(old, 100)]),
+            t0,
+        );
+        let old_second_at = t0 + sysinfo::MINIMUM_CPU_UPDATE_INTERVAL;
+        let old_second = cpu_refresh_plan(&[old], &[], &mut state, old_second_at);
+        record_cpu_refresh_with_cpu_times(
+            &mut state,
+            &old_second,
+            1,
+            &HashMap::from([(old, 110)]),
+            old_second_at,
+        );
+        let new_plan = cpu_refresh_plan(
+            &[new],
+            &[],
+            &mut state,
+            old_second_at + std::time::Duration::from_secs(1),
+        );
+
+        assert_eq!(
+            new_plan.targets,
+            vec![new],
+            "同 PID 新创建时刻必须重新建样本"
+        );
+        let new_sample_at = old_second_at + std::time::Duration::from_secs(1);
+        assert_eq!(
+            record_cpu_refresh_with_cpu_times(
+                &mut state,
+                &new_plan,
+                1,
+                &HashMap::from([(new, 500)]),
+                new_sample_at,
+            ),
+            None
+        );
+        assert_eq!(state.processes.len(), 1);
+        assert_eq!(
+            state.processes.get(&new).unwrap().last_cpu_time_ms,
+            Some(500)
+        );
+        assert_eq!(state.processes.get(&new).unwrap().cpu_usage, None);
+    }
+
+    fn cpu_key(pid: u32, start_time: u64) -> CpuProcessKey {
+        CpuProcessKey {
+            pid: sysinfo::Pid::from_u32(pid),
+            start_time,
+        }
+    }
+
+    #[test]
+    fn process_identity_includes_pid_cwd_exe_and_form() {
+        let base = AgentProcess {
+            pid: 7,
+            cpu_usage: 0.0,
+            cwd: Some(std::path::PathBuf::from("C:/project")),
+            exe: Some(std::path::PathBuf::from("C:/tools/agent.exe")),
+            form: ProcessForm::App,
+        };
+        let expected = process_identity(&base);
+
+        let mut changed = base.clone();
+        changed.pid += 1;
+        assert_ne!(process_identity(&changed), expected);
+        changed = base.clone();
+        changed.cwd = Some(std::path::PathBuf::from("C:/other"));
+        assert_ne!(process_identity(&changed), expected);
+        changed = base.clone();
+        changed.exe = Some(std::path::PathBuf::from("C:/other/agent.exe"));
+        assert_ne!(process_identity(&changed), expected);
+        changed = base;
+        changed.form = ProcessForm::Cli;
+        assert_ne!(process_identity(&changed), expected);
+    }
+
+    #[test]
+    fn candidate_names_cover_all_adapters_and_special_hosts() {
+        // 生产白名单入口（get_all_sessions_inner Phase 1 实际调用）必须覆盖全部
+        // 已注册 adapter 的 process_names（大小写归一后）。
+        // 禁用状态存 DB、纯测试不触库：这里锁定可静态验证的超集性质——enabled 集
+        // 是 all 集的子集，全部 adapter 名字都在白名单 ⇒ 任意「已禁用但仍在运行」
+        // 的工具也必在白名单内，其 exe/cmd 照常刷新（宿主存活判定不误杀未读池）。
+        let names = refresh_candidate_process_names();
+        for (id, adapter) in all_adapters_with_ids() {
+            for n in adapter.process_names() {
+                assert!(
+                    names.contains(&bare_name(n)),
+                    "工具 {id} 的进程名 {n} 未进生产候选白名单"
+                );
+            }
+        }
+        // 审计补白：名字不在 process_names、但按 exe/cmd 发现的特殊宿主
+        for special in [
+            "zcode",
+            "workbuddy",
+            "chatgpt",
+            "deepseek harness",
+            "electron",
+        ] {
+            assert!(
+                names.contains(&special.to_string()),
+                "特殊宿主名 {special} 未进候选白名单"
+            );
+        }
+        // 确定性：升序且无重复（二分查找与稳定输出依赖此不变量）
+        assert!(
+            names.windows(2).all(|w| w[0] < w[1]),
+            "候选白名单须有序去重"
+        );
+    }
+
+    /// Fix 5：宿主名表是**单一事实源**——两段式候选白名单与宿主存活判定共用它。
+    /// 表驱动、零进程依赖：白名单漏一个宿主名 → 第二段不读其 exe/cmd → 该工具
+    /// 整批卡片被过滤（历史事故），本用例在无任何工具运行的机器上也必须通过。
+    #[test]
+    fn host_process_names_are_all_in_candidate_whitelist() {
+        let names = candidate_process_names(&[]);
+        for (tool, hosts) in HOST_PROCESS_NAMES {
+            assert!(!hosts.is_empty(), "{tool} 的宿主名表不得为空");
+            for host in *hosts {
+                let bare = bare_name(host);
+                assert_eq!(
+                    bare, *host,
+                    "宿主名表条目必须是已归一的小写裸名（{tool}/{host}）"
+                );
+                assert!(
+                    names.contains(&bare),
+                    "{tool} 的宿主名 {host} 未进候选白名单（两段式不会读其 exe/cmd，宿主判不出）"
+                );
+                assert!(
+                    name_may_host_tool(&bare, tool),
+                    "{tool} 的宿主名 {host} 必须通过宿主判定预滤"
+                );
+                assert!(
+                    host_process_names(tool).contains(host),
+                    "{tool} 的宿主判定必须取自同一张表"
+                );
+            }
+        }
+        // npm-shim 宿主：工具实际进程名是解释器，候选白名单与宿主判定都要放行
+        for interp in INTERPRETER_PROCESS_NAMES {
+            assert!(
+                names.contains(&interp.to_string()),
+                "解释器 {interp} 未进候选白名单"
+            );
+            assert!(
+                name_may_host_tool(interp, "dsh"),
+                "dsh web 宿主可能是解释器进程（{interp}）"
+            );
+            assert!(
+                name_may_host_tool(interp, "workbuddy"),
+                "npm-shim 工具的宿主可能是解释器进程（{interp}）"
+            );
+        }
+        // 负例：不相干的进程名不得被宿主预滤放行
+        assert!(!name_may_host_tool("codex", "workbuddy"));
+        assert!(!name_may_host_tool("explorer", "zcode"));
+        assert!(
+            host_process_names("unknown-tool").is_empty(),
+            "未登记工具不得凭空获得宿主名"
+        );
+    }
+
+    #[test]
+    fn candidate_names_are_normalized_to_bare_lowercase() {
+        let names = candidate_process_names(&[&["Codex", "Kimi.exe"][..]]);
+        assert!(names.contains(&"codex".to_string()));
+        assert!(names.contains(&"kimi".to_string()));
+        assert!(!names.contains(&"Codex".to_string()));
+        assert_eq!(bare_name("C:\\Program Files\\OpenAI\\Codex.EXE"), "codex");
+        assert_eq!(bare_name("/usr/local/bin/python3"), "python3");
+        // 特殊宿主名的生产形态必须归一成白名单口径（空格 + .exe / 包路径）
+        assert_eq!(
+            bare_name("D:\\Program Files\\Deepseek-Harness\\DeepSeek Harness.exe"),
+            "deepseek harness"
+        );
+        assert_eq!(
+            bare_name("/Applications/WorkBuddy.app/Contents/MacOS/Electron"),
+            "electron"
+        );
+    }
+
+    /// 活体回归（Task 11 核心验收）：全量刷新（旧路径）与两段式（新路径）
+    /// 在两个独立 System 上各跑一次，两段式的发现结果不得丢掉全量刷新已发现、
+    /// 且在两段式快照中仍然存活的进程——白名单漏名（如特殊宿主）会在此暴露。
+    ///
+    /// 机器相关：只对「全量发现 ∧ 两段式快照仍存活、且进程创建时刻未变化」的 pid
+    /// 逐项比较 PID/cwd/exe/form，规避两次扫描间隙进程启停或 PID 复用的抖动。若没有活体
+    /// 工具进程，明确记录「未覆盖」；空集合不作为兼容通过证据。
+    #[test]
+    fn two_stage_refresh_preserves_all_adapter_discovery() {
+        let adapters = all_adapters();
+        // 直调生产白名单入口（全部注册 adapter），与 get_all_sessions_inner 同源
+        let wanted_names = refresh_candidate_process_names();
+
+        // 旧路径：一次全量刷新（cmd/cwd/exe/cpu 全读）
+        let mut full = System::new();
+        let full_started = std::time::Instant::now();
+        full.refresh_processes_specifics(
             ProcessesToUpdate::All,
             true,
             ProcessRefreshKind::nothing()
@@ -615,9 +2209,181 @@ fn get_all_sessions_inner() -> SessionsResponse {
                 .with_exe(sysinfo::UpdateKind::Always)
                 .with_cpu(),
         );
+        let full_elapsed = full_started.elapsed();
 
-        adapters.iter().map(|a| a.find_processes(system)).collect()
+        // 新路径：两段式刷新（生产函数直调）
+        let mut two_stage = System::new();
+        let two_stage_started = std::time::Instant::now();
+        let mut cpu_sampling_state = CpuSamplingState::default();
+        let (candidate_count, _) = refresh_processes_two_stage(
+            &mut two_stage,
+            &wanted_names,
+            &mut cpu_sampling_state,
+            Instant::now(),
+        );
+        let two_stage_elapsed = two_stage_started.elapsed();
+
+        eprintln!(
+            "two-stage: {} processes, {} candidates, full refresh {:?} vs two-stage {:?}",
+            two_stage.processes().len(),
+            candidate_count,
+            full_elapsed,
+            two_stage_elapsed
+        );
+
+        let mut identity_comparisons = 0usize;
+        for adapter in &adapters {
+            let expected = adapter.find_processes(&full);
+            let actual = adapter.find_processes(&two_stage);
+            eprintln!(
+                "{}: two-stage={} full={}",
+                adapter.name(),
+                actual.len(),
+                expected.len()
+            );
+
+            // 发现的每个进程都必须仍在快照中且名字非空（发现链路未读到野 pid）
+            for p in &actual {
+                let proc = two_stage
+                    .process(sysinfo::Pid::from_u32(p.pid))
+                    .unwrap_or_else(|| panic!("{} 发现 pid {} 不在快照中", adapter.name(), p.pid));
+                assert!(
+                    !proc.name().is_empty(),
+                    "{} 发现 pid {} 名字为空",
+                    adapter.name(),
+                    p.pid
+                );
+            }
+
+            // 旧路径发现、且新快照仍存活的进程必须在新路径同样被覆盖；
+            // 同时其名字必须在白名单内（否则即白名单漏名——第二段不会读它的 exe/cmd）。
+            // 对稳定存活的同一个进程逐字段比较身份，不只比较 PID。
+            let actual_pids: HashSet<u32> = actual.iter().map(|p| p.pid).collect();
+            for p in &expected {
+                let Some(proc) = two_stage.process(sysinfo::Pid::from_u32(p.pid)) else {
+                    continue; // 两次扫描间隙退出：不判定
+                };
+                let Some(old_proc) = full.process(sysinfo::Pid::from_u32(p.pid)) else {
+                    continue;
+                };
+                if old_proc.start_time() != proc.start_time() {
+                    continue; // 同 PID 已复用：全量快照与新快照不是同一进程
+                }
+                let name = bare_name(&proc.name().to_string_lossy());
+                assert!(
+                    wanted_names.binary_search(&name).is_ok(),
+                    "{} 发现进程 {}（pid={}）不在候选白名单",
+                    adapter.name(),
+                    name,
+                    p.pid
+                );
+                assert!(
+                    actual_pids.contains(&p.pid),
+                    "{} 两段式丢失存活进程 pid={}",
+                    adapter.name(),
+                    p.pid
+                );
+                let new_process = actual
+                    .iter()
+                    .find(|candidate| candidate.pid == p.pid)
+                    .expect("稳定存活的旧路径进程必须出现在两段式结果");
+                assert_eq!(
+                    process_identity(p),
+                    process_identity(new_process),
+                    "{} 两段式进程身份字段不匹配 pid={}",
+                    adapter.name(),
+                    p.pid
+                );
+                identity_comparisons += 1;
+            }
+        }
+        if identity_comparisons == 0 {
+            eprintln!("process identity comparison: NOT EXERCISED (no stable adapter process)");
+        } else {
+            eprintln!("process identity comparison: {identity_comparisons} stable process(es)");
+        }
+    }
+}
+
+/// 实际扫描（单飞壳内执行；成功路径与原实现一致）
+pub(crate) fn get_all_sessions_inner() -> SessionsResponse {
+    load_pending_unread_retries();
+    prune_pending_unread_retries(chrono::Utc::now().timestamp_millis());
+    // W5：未勾选工具不参与会话扫描（看板卡/通知随之静默）
+    let adapters: Vec<Box<dyn AgentAdapter>> = enabled_adapters();
+
+    // Phase 1: 两段式刷新共享 System 快照，发现所有进程。
+    // 全量进程（约 400+）只刷新名字层；候选 PID 每轮读 cmd/cwd/exe，CPU 状态/展示
+    // 按 OpenClaw 与卡面两档采样（F8）。adapter 的发现入口只关心名字命中白名单的少量进程。
+    let (all_processes, workbuddy_host_alive, display_cpu_by_pid) = {
+        let mut guard = lock_shared_system(&SHARED_SYSTEM);
+        let system_was_initialized = guard.is_some();
+        // 首次初始化只建空 System（廉价）；字段由下面两段刷新填充
+        let system = guard.get_or_insert_with(System::new);
+        let refresh_started = std::time::Instant::now();
+
+        // 候选白名单取自**全部注册 adapter**（非 enabled_adapters）：停用但仍在运行
+        // 的工具也须刷新 exe/cmd，否则宿主存活判定误杀其未读池行
+        // （详见 refresh_candidate_process_names 文档）
+        let candidate_names = refresh_candidate_process_names();
+        let mut cpu_sampling_state = CPU_SAMPLING_STATE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        reset_cpu_sampling_state_if_system_rebuilt(&mut cpu_sampling_state, system_was_initialized);
+        let now = Instant::now();
+        let (candidate_count, _display_sample_at) =
+            refresh_processes_two_stage(system, &candidate_names, &mut cpu_sampling_state, now);
+        let current_cpu_by_pid = cpu_usage_by_pid(&cpu_sampling_state);
+        let display_cpu_by_pid = cpu_display_by_pid(&cpu_sampling_state);
+        *CPU_SAMPLING_STATE.lock().unwrap_or_else(|e| e.into_inner()) = cpu_sampling_state;
+
+        // Task 12 验收测量入口（≤25ms）：保持 DEBUG，不得升 INFO 逐轮刷屏。
+        // R4：同时写入 stats 原子量（scan_bus_stats.json 的 last_process_refresh_ms）
+        let refresh_elapsed = refresh_started.elapsed();
+        LAST_PROCESS_REFRESH_MS.store(refresh_elapsed.as_millis() as u64, Ordering::Relaxed);
+        log::debug!(
+            "scan: process refresh（两段式）耗时 {:?}，进程 {}，候选 {}",
+            refresh_elapsed,
+            system.processes().len(),
+            candidate_count
+        );
+
+        // WorkBuddy 的会话进程列表只包含新鲜心跳，空闲宿主不会出现在其中。复用本轮
+        // 刚刷新的共享 System 判宿主一次，后续节奏仍使用同一批进程事实，不起第二个刷新器。
+        let workbuddy_enabled = adapters
+            .iter()
+            .any(|adapter| adapter.agent_type().tool_id() == "workbuddy");
+        let workbuddy_host_alive =
+            workbuddy_enabled && crate::monitor::host::tool_host_alive_in(system, "workbuddy");
+        let mut all_processes: Vec<Vec<AgentProcess>> =
+            adapters.iter().map(|a| a.find_processes(system)).collect();
+        for process in all_processes.iter_mut().flatten() {
+            if let Some(cpu) = current_cpu_by_pid.get(&process.pid) {
+                process.cpu_usage = *cpu;
+            }
+        }
+        (all_processes, workbuddy_host_alive, display_cpu_by_pid)
     }; // 释放 System 锁 — 下方文件 I/O 无需持锁
+
+    // 记录「本轮在跑的工具」：覆盖表中的无事件工具据本信号把节奏下限锁在 Idle 10s
+    //（不进 Away 30s 盲区）。直接复用 Phase 1 的 adapter 进程结果与 WorkBuddy 宿主
+    // 判定，不额外刷新进程快照（用户裁决 2026-10-31）。
+    record_running_tools_with_workbuddy_host(
+        adapters
+            .iter()
+            .zip(all_processes.iter())
+            .filter(|(_, processes)| !processes.is_empty())
+            .map(|(adapter, _)| adapter.agent_type().tool_id()),
+        workbuddy_host_alive,
+    );
+    // 已知取舍（2026-10-30 评审 Minor）：上面这一行在 **SHARED_SYSTEM 锁内**执行
+    // `find_processes`，而 WorkBuddy 的发现逻辑在「没有可用心跳、要发宿主哨兵」时会做一次
+    // `workbuddy.db` 只读查询（`recent_db_sessions`，17 行的库、实测 0.03ms；打开有
+    // 1000ms busy_timeout 上限）。有心跳进程时该查询根本不发生（惰性闭包）。
+    // 未把 DB I/O 移出锁：`AgentAdapter::find_processes(&System)` 的签名不接受外部连接，
+    // 搬家要动 trait 与全部适配器；收益（微秒级）与风险不匹配。若将来该库变大或出现
+    // 写锁长持有，再按「发现阶段只做纯 os 查询」重构。
 
     // Phase 2: 解析会话（文件 I/O）
     let mut all_sessions: Vec<Session> = Vec::new();
@@ -630,7 +2396,9 @@ fn get_all_sessions_inner() -> SessionsResponse {
         } else {
             adapter.find_sessions(processes)
         };
-        log::info!(
+        // 每个 adapter 每轮一行，INFO 会按轮次无限刷屏（挂机档 30s/轮也照涨），降为 DEBUG；
+        // 人工排障所需的跃迁信息仍由 scan_bus 的 `mode →` INFO 承担
+        log::debug!(
             "{}: {} processes, {} sessions",
             adapter.name(),
             processes.len(),
@@ -645,15 +2413,27 @@ fn get_all_sessions_inner() -> SessionsResponse {
     // 会话级去重（见 dedup_sessions 注释）
     dedup_sessions(&mut all_sessions);
 
+    // F8：状态判定在 adapter 解析时使用每 PID 的累计 CPU 差分；卡面字段则读取独立的
+    // 30 秒展示缓存，避免状态判定与展示发布互相降频。
+    for session in &mut all_sessions {
+        if let Some(cpu) = display_cpu_by_pid.get(&session.pid) {
+            session.cpu_usage = *cpu;
+        }
+    }
+
     // review F2：宿主 APP 已死的孤儿会话进程不得产出活跃卡。
     // 复用 SHARED_SYSTEM 快照（Phase 1 已带 exe 刷新），不另起全量扫描
     {
-        let guard = SHARED_SYSTEM.lock().unwrap();
+        let guard = lock_shared_system(&SHARED_SYSTEM);
         filter_host_dead_cards(&mut all_sessions, &|tool_id| {
-            guard
-                .as_ref()
-                .map(|system| crate::monitor::host::tool_host_alive_in(system, tool_id))
-                .unwrap_or(true) // 快照不可用时防御性放行（与旧行为一致）
+            if tool_id == "workbuddy" {
+                workbuddy_host_alive
+            } else {
+                guard
+                    .as_ref()
+                    .map(|system| crate::monitor::host::tool_host_alive_in(system, tool_id))
+                    .unwrap_or(true) // 快照不可用时防御性放行（与旧行为一致）
+            }
         });
     }
 
@@ -683,12 +2463,22 @@ fn get_all_sessions_inner() -> SessionsResponse {
                 Some("Idle") | Some("Finished")
             );
             let tool = s.agent_type.tool_id().to_string();
-            !codex_green_card_should_drop(was_green_prev, pool.contains(&(tool, s.id.clone())))
+            keep_green_card(
+                was_green_prev,
+                pool.contains(&(tool.clone(), s.id.clone())),
+                unread_retry_pending(&tool, &s.id),
+            )
         });
     }
 
     // W4：APP 类未读卡合并 + 未读池维护（宿主存活检查 / 变黄删除 / 过期清理）
-    sync_unread_sessions(&mut all_sessions);
+    // 删除状态必须贯穿未读池：先解析“池里 WorkBuddy 行对应 DB 明确删除”的 id，
+    // DB 打不开时为空集（不误清）。合并阶段同时过滤/删除这些行。
+    let deleted_workbuddy = deleted_workbuddy_unread_ids();
+    sync_unread_sessions(&mut all_sessions, &deleted_workbuddy);
+    // 已读生命周期：DB-only completed 卡在用户已读（墓碑）且没有新工作后，不应继续
+    // 以普通 Idle 卡出现——否则“已读”只是去掉未读标记，卡仍在。
+    drop_read_completed_workbuddy_cards(&mut all_sessions);
 
     // Hook 事件集成：用新鲜事件（<30s）更新会话状态；T3 起审批等待持久化（DB
     // approval_wait_marks）——进入事件（PermissionRequest/Notification[注册侧已
@@ -838,8 +2628,14 @@ fn get_all_sessions_inner() -> SessionsResponse {
         .filter(|s| matches!(s.status, SessionStatus::Waiting))
         .count();
 
-    // 更新会话状态缓存（通知去重用）
+    // 更新会话状态缓存（通知去重用）。
+    // **写库失败待重试的会话不得提前写成 Idle**：否则重启后标记丢失，
+    // 预过滤会把“池无行 + 上一轮绿”当已读，重试永久失效。
     for session in &all_sessions {
+        let tool = session.agent_type.tool_id();
+        if unread_retry_pending(tool, &session.id) {
+            continue;
+        }
         let _ = crate::database::update_session_status(
             &session.id,
             &format!("{:?}", session.agent_type),
@@ -862,70 +2658,72 @@ fn get_all_sessions_inner() -> SessionsResponse {
     }
 }
 
-/// R3 单飞护栏的测试互斥锁（跨模块共享）：直接操纵全局 SCAN_FLIGHT 的测试与
-/// 真实扫描类测试（会重置飞行位/快照，含 tests::test_get_all_sessions）互斥——
-/// cargo 默认并行测试下两个真实 get_all_sessions 同时起跑会互踩快照/飞行位
-/// （flight_released 断言 !in_flight 时另一测试的扫描仍在飞即红，评审 R6）
-#[cfg(test)]
-static SCAN_FLIGHT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-/// R3 单飞护栏测试：占住飞行位时第二请求返回快照而不进入扫描
-#[cfg(test)]
-mod scan_flight_tests {
-    use super::*;
-
-    #[test]
-    fn concurrent_request_reuses_snapshot_without_rescan() {
-        let _g = SCAN_FLIGHT_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        // 预置快照
-        let snapshot = SessionsResponse {
-            sessions: Vec::new(),
-            total_count: 7,
-            waiting_count: 0,
-        };
-        *SCAN_FLIGHT.last_snapshot.lock().unwrap() = Some((std::time::Instant::now(), snapshot));
-
-        // 占住飞行位（模拟另一请求正在扫描）
-        *SCAN_FLIGHT.in_flight.lock().unwrap() = true;
-
-        // 并发请求：应直接返回快照（total_count=7 来自快照而非真实扫描）
-        let resp = get_all_sessions();
-        assert_eq!(resp.total_count, 7, "单飞命中应返回最近快照");
-
-        // 清理：释放飞行位（真实扫描会重置快照，不影响其他测试）
-        *SCAN_FLIGHT.in_flight.lock().unwrap() = false;
-    }
-
-    #[test]
-    fn flight_released_after_scan_completes() {
-        let _g = SCAN_FLIGHT_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        // 正常调用：进入扫描并释放飞行位 + 刷新快照
-        let resp = get_all_sessions();
-        assert!(
-            !*SCAN_FLIGHT.in_flight.lock().unwrap(),
-            "扫描完成后飞行位应释放"
-        );
-        let snap = SCAN_FLIGHT.last_snapshot.lock().unwrap();
-        assert!(snap.is_some(), "扫描完成后应刷新快照");
-        assert_eq!(snap.as_ref().unwrap().1.total_count, resp.total_count);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
+    fn poisoned_shared_system_lock_discards_state_and_is_reusable() {
+        let _bus_guard = crate::adapter::scan_bus::test_guard();
+        crate::adapter::scan_bus::reset_for_test();
+        let join = std::thread::spawn(move || {
+            let mut guard = SHARED_SYSTEM.lock().unwrap();
+            *guard = Some(System::new());
+            panic!("force SHARED_SYSTEM poison for regression test");
+        });
+
+        assert!(join.join().is_err(), "the injected panic must be captured");
+        assert!(
+            SHARED_SYSTEM.is_poisoned(),
+            "the panic must poison SHARED_SYSTEM"
+        );
+
+        let guard = lock_shared_system(&SHARED_SYSTEM);
+        assert!(guard.is_none(), "recovery must discard the old System");
+        drop(guard);
+        assert!(
+            !SHARED_SYSTEM.is_poisoned(),
+            "recovery must allow the next scan to acquire this lock"
+        );
+
+        let first = crate::adapter::scan_bus::publish_for_test(|| SessionsResponse {
+            sessions: Vec::new(),
+            total_count: 0,
+            waiting_count: 0,
+        });
+        let next = crate::adapter::scan_bus::publish_for_test(|| SessionsResponse {
+            sessions: Vec::new(),
+            total_count: 0,
+            waiting_count: 0,
+        });
+        assert_eq!(next.version, first.version + 1);
+    }
+
+    /// Fix 7 回归锁：旧入口 `adapter::get_all_sessions` 只允许**委托扫描总线**
+    /// （单飞/快照/panic 自愈由 scan_bus 统一负责），不得保留第二套单飞护栏。
+    /// 字面量用 concat! 拆分：include_str! 会把本测试自身纳入扫描面。
+    #[test]
+    fn get_all_sessions_is_a_thin_scan_bus_delegate() {
+        let src = include_str!("mod.rs");
+        let start = src
+            .find(concat!("pub fn get_all_", "sessions()"))
+            .expect("兼容入口缺失");
+        let body = &src[start..(start + 500).min(src.len())];
+        assert!(
+            body.contains(concat!("scan_bus::", "current_or_scan")),
+            "旧入口必须委托 scan_bus::current_or_scan，实际: {body}"
+        );
+        assert!(
+            !src.contains(concat!("SCAN_", "FLIGHT")),
+            "不得保留第二套单飞护栏（scan_bus 已是唯一扫描者）"
+        );
+    }
+
+    #[test]
     fn test_get_all_sessions() {
-        // 与 scan_flight_tests 共用 SCAN_FLIGHT_TEST_LOCK：本测试触发真实
-        // get_all_sessions（刷新快照/飞行位），不互斥则并行起跑互踩（评审 R6）
-        let _g = SCAN_FLIGHT_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
+        // 委托入口会写 scan_bus 进程级快照：与 scan_bus 测试共用全局锁，
+        // 避免并行起跑时插进对方「种子 → 精确版本断言」窗口
+        let _g = crate::adapter::scan_bus::test_guard();
         let response = get_all_sessions();
         eprintln!("=== SESSION SCAN ===");
         eprintln!(
@@ -971,6 +2769,7 @@ mod tests {
             form: crate::session::ProcessForm::Cli,
             jump_supported: false,
             unread: false,
+            unread_turned_green_at_ms: None,
         }
     }
 
@@ -1953,7 +3752,7 @@ enum UnreadPoolAction {
 }
 
 /// 判定未读池动作。prev_status 为状态缓存中的上一轮状态
-/// （Debug 格式，与 get_all_sessions 末尾的统一更新一致）
+/// （Debug 格式，与扫描末尾的统一更新一致）
 fn unread_pool_action(prev_status: Option<&str>, idle: bool) -> UnreadPoolAction {
     if !idle {
         return UnreadPoolAction::None;
@@ -1975,6 +3774,69 @@ fn insert_allowed(prev_status: Option<&str>, was_read_recently: bool) -> bool {
     !(prev_status.is_none() && was_read_recently)
 }
 
+/// WorkBuddy 未读池行中，DB 已明确删除（`deleted_at > 0`）的 sessionId。
+/// DB 打不开/查询失败 → 空集（宁可保留一行，也不把临时不可读误判为删除）。
+fn deleted_workbuddy_unread_ids() -> HashSet<String> {
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let ids: Vec<String> = crate::database::dao::unread::list(now_ms)
+        .into_iter()
+        .filter(|r| r.tool_id == "workbuddy")
+        .map(|r| r.session_id)
+        .collect();
+    if ids.is_empty() {
+        return HashSet::new();
+    }
+    let Some(home) = dirs::home_dir() else {
+        return HashSet::new();
+    };
+    crate::monitor::workbuddy_parser::deleted_workbuddy_session_ids(&home, &ids).unwrap_or_default()
+}
+
+/// DB-only completed WorkBuddy 卡的“已读后消失”判据：
+/// 必须同时满足 pid=0（没有真实心跳/进程）、Idle/Finished、存在已读墓碑，
+/// 且最后活动时间不晚于墓碑时间（没有新工作回合）。有新活动则保留。
+fn is_db_only_completed_workbuddy(s: &Session) -> bool {
+    s.agent_type == AgentType::WorkBuddy
+        && s.pid == 0
+        && matches!(s.status, SessionStatus::Idle | SessionStatus::Finished)
+}
+
+fn read_completed_card_should_drop(s: &Session, read_at: Option<i64>) -> bool {
+    if !is_db_only_completed_workbuddy(s) {
+        return false;
+    }
+    let Some(read_at) = read_at else {
+        return false;
+    };
+    session_activity_ms(s).is_none_or(|activity| activity <= read_at)
+}
+
+/// 纯核：按注入的墓碑查询剔除“已读且无新工作”的 DB-only completed 卡（可测）。
+fn retain_read_completed_cards(
+    active: &mut Vec<Session>,
+    read_at_of: &dyn Fn(&str) -> Option<i64>,
+) {
+    active.retain(|s| !read_completed_card_should_drop(s, read_at_of(&s.id)));
+}
+
+/// 生产入口：墓碑来自 unread DAO。
+fn drop_read_completed_workbuddy_cards(active: &mut Vec<Session>) {
+    retain_read_completed_cards(active, &|sid| {
+        crate::database::dao::unread::read_tombstone_at("workbuddy", sid)
+    });
+}
+
+/// 未读池合并前的删除过滤（纯函数，可测）：
+/// 只丢弃 `deleted` 集合中命中的 WorkBuddy 行；其他工具同 id 不受影响。
+fn filter_deleted_unread(
+    pool: Vec<crate::database::dao::unread::UnreadSessionRecord>,
+    deleted: &HashSet<String>,
+) -> Vec<crate::database::dao::unread::UnreadSessionRecord> {
+    pool.into_iter()
+        .filter(|r| !(r.tool_id == "workbuddy" && deleted.contains(&r.session_id)))
+        .collect()
+}
+
 /// W4 未读机制核心：把 DB 中的未读会话合并为 Session 卡，并维护未读池
 /// - 会话当前非空闲（黄/红）→ 删未读行（活跃卡可见，防同会话双卡）
 /// - 转绿（Idle/Finished）→ upsert 未读行（未在池中时）
@@ -1982,9 +3844,16 @@ fn insert_allowed(prev_status: Option<&str>, was_read_recently: bool) -> bool {
 /// - 过期（24h）→ 清理
 /// - 数据驱动持久绿卡工具（Codex APP / ZCode，P1-3 通用化）：聚合卡即该会话的
 ///   「未读卡」形态——池有行时标记 unread=true（徽标/「未读卡排后」生效），
-///   已读删行后由 get_all_sessions 的前置过滤剔除，闭环「被已读信号清除」
-fn sync_unread_sessions(active: &mut Vec<Session>) {
+///   已读删行后由 每轮扫描 的前置过滤剔除，闭环「被已读信号清除」
+fn sync_unread_sessions(active: &mut Vec<Session>, deleted_workbuddy: &HashSet<String>) {
     let now_ms = chrono::Utc::now().timestamp_millis();
+    let pending = PendingRetryStore::global();
+
+    // 0) 删除状态贯穿未读池：先物理删除已删会话的池行，再做本轮合并。
+    //    deleted_workbuddy 为空（DB 不可读/无删除）时不动任何行。
+    for sid in deleted_workbuddy {
+        crate::database::dao::unread::delete("workbuddy", sid);
+    }
 
     // 1) 活跃会话驱动未读池变更
     for s in active.iter_mut() {
@@ -2009,14 +3878,38 @@ fn sync_unread_sessions(active: &mut Vec<Session>) {
             };
             match unread_pool_action(prev.as_deref(), true) {
                 UnreadPoolAction::Insert => {
-                    let was_read =
-                        crate::database::dao::unread::was_read_recently(&tool, &s.id, now_ms);
-                    if insert_allowed(prev.as_deref(), was_read) {
-                        crate::database::dao::unread::upsert(&record);
+                    let read_at = crate::database::dao::unread::read_tombstone_at(&tool, &s.id);
+                    let pending_since = unread_retry_pending_since(&tool, &s.id);
+                    let inserted = insert_first_green_unread(
+                        &pending,
+                        &tool,
+                        &s.id,
+                        &record,
+                        prev.as_deref(),
+                        read_at,
+                        session_activity_ms(s),
+                        pending_since,
+                        now_ms,
+                        &|r| crate::database::dao::unread::try_upsert(r),
+                    );
+                    if !inserted && pending.since(&tool, &s.id).is_some() {
+                        log::warn!("unread: 首次转绿入池失败（{} {}），下轮重试", tool, s.id);
                     }
                 }
                 UnreadPoolAction::RefreshDisplay => {
-                    crate::database::dao::unread::refresh_display(&record)
+                    // 只有显式“待重试”才读墓碑/补插；池无行但没有标记 = 已读/过期，不得复活。
+                    let retried = retry_pending_unread(
+                        &pending,
+                        &tool,
+                        &s.id,
+                        &record,
+                        &|sid| crate::database::dao::unread::read_tombstone_at(&tool, sid),
+                        &|r| crate::database::dao::unread::try_upsert(r),
+                        &|r| crate::database::dao::unread::refresh_display(r),
+                    );
+                    if !retried && pending.since(&tool, &s.id).is_some() {
+                        log::warn!("unread: 转绿补插失败（{} {}），下轮重试", tool, s.id);
+                    }
                 }
                 UnreadPoolAction::None => {}
             }
@@ -2027,7 +3920,8 @@ fn sync_unread_sessions(active: &mut Vec<Session>) {
                 s.unread = true;
             }
         } else {
-            // 变黄/红：删未读（状态迁移，非重置机制）
+            // 变黄/红：删未读（状态迁移，非重置机制）；新工作开始，清待重试标记
+            clear_unread_retry(&tool, &s.id, true);
             crate::database::dao::unread::delete(&tool, &s.id);
         }
     }
@@ -2047,7 +3941,7 @@ fn sync_unread_sessions(active: &mut Vec<Session>) {
             .collect()
     };
     let dead_tools = {
-        let guard = SHARED_SYSTEM.lock().unwrap();
+        let guard = lock_shared_system(&SHARED_SYSTEM);
         dead_tools_from_pool(&pool_tools, guard.as_ref())
     };
     for t in &dead_tools {
@@ -2063,11 +3957,52 @@ fn sync_unread_sessions(active: &mut Vec<Session>) {
     }
 
     // 4) 未读池合并为卡（纯映射见 build_unread_cards；追加在末尾，最终顺序由 session_sort_cmp 决定）
-    let final_unread = crate::database::dao::unread::list(now_ms);
+    //    已删会话的池行即使因清理失败残留，也不得合并成卡（P1：删除状态贯穿最终渲染）。
+    let final_unread = filter_deleted_unread(
+        crate::database::dao::unread::list(now_ms),
+        deleted_workbuddy,
+    );
+    // P1：WorkBuddy 的 DB-only completed 卡（pid=0）若池里已有未读行，不能继续以
+    // unread=false 的普通卡呈现（build_unread_cards 会因“已在 active”跳过池卡）。
+    // 在合并前把它标成 unread，保证“未读记录存在 ⇒ 卡面呈现未读”。
+    mark_active_unread_cards(active, &final_unread);
     let cards = build_unread_cards(&final_unread, active, &|id| {
         crate::database::dao::agent_tool::get_tool_enabled(id)
     });
     active.extend(cards);
+}
+
+/// P1：把「池里已有未读行」的 WorkBuddy DB-only completed 活跃卡标成 unread。
+///
+/// 只处理 `pid == 0`（无真实心跳、由 DB 兜底渲染的卡）且尾部为 Idle/Finished 的
+/// WorkBuddy 卡；有心跳 pid 的卡仍由进程/状态路径决定，不能被未读池提前染色。
+fn mark_active_unread_cards(
+    active: &mut [Session],
+    pool: &[crate::database::dao::unread::UnreadSessionRecord],
+) {
+    let turned_green: HashMap<(String, String), i64> = pool
+        .iter()
+        .map(|r| {
+            (
+                (r.tool_id.clone(), r.session_id.clone()),
+                r.turned_green_at_ms,
+            )
+        })
+        .collect();
+    for s in active.iter_mut() {
+        let Some(green_at) = turned_green.get(&(s.agent_type.tool_id().to_string(), s.id.clone()))
+        else {
+            continue;
+        };
+        if is_db_only_completed_workbuddy(s) {
+            s.unread = true;
+        }
+        if s.unread {
+            // 业务活动时间保留给已读判断；通知新鲜度用独立转绿时间。
+            // 覆盖 WorkBuddy DB-only 卡与 Codex/ZCode 数据驱动绿卡。
+            s.unread_turned_green_at_ms = Some(*green_at);
+        }
+    }
 }
 
 /// 未读池 → 未读卡（纯函数，spec §8 可测试；启用判定经参数注入，测试不触库）：
@@ -2119,6 +4054,7 @@ fn build_unread_cards(
             form: ProcessForm::App,
             jump_supported: jump_supported_for(ProcessForm::App),
             unread: true,
+            unread_turned_green_at_ms: Some(r.turned_green_at_ms),
         });
     }
     cards
@@ -2216,6 +4152,7 @@ mod host_liveness_filter_tests {
             form,
             jump_supported: true,
             unread,
+            unread_turned_green_at_ms: None,
         }
     }
 
@@ -2507,6 +4444,7 @@ mod dedup_tests {
             form: ProcessForm::Cli,
             jump_supported: true,
             unread: false,
+            unread_turned_green_at_ms: None,
         }
     }
 
@@ -2518,6 +4456,44 @@ mod dedup_tests {
         assert_eq!(sessions.len(), 2);
         assert_eq!(sessions[0].pid, 111); // 保留首张
         assert_eq!(sessions[1].id, "ses_B");
+    }
+}
+
+#[cfg(test)]
+mod running_tools_tests {
+    use super::*;
+
+    /// 在跑工具记录：排序去重、整体覆盖写（本轮无进程的工具必须消失，
+    /// 否则 dsh 退出后节奏仍被锁在 Idle）。持 scan_bus 全局锁，避免与
+    /// reset_for_test 的清理并发。
+    #[test]
+    fn running_tools_are_sorted_deduped_and_replaced() {
+        let _guard = crate::adapter::scan_bus::test_guard();
+        record_running_tools(["dsh", "claude", "dsh"].into_iter());
+        assert_eq!(
+            running_tool_ids(),
+            vec!["claude".to_string(), "dsh".to_string()]
+        );
+        record_running_tools(["openclaw"].into_iter());
+        assert_eq!(
+            running_tool_ids(),
+            vec!["openclaw".to_string()],
+            "每轮必须整体覆盖：上一轮在跑、本轮退出的工具不得残留"
+        );
+        record_running_tools(std::iter::empty());
+        assert!(running_tool_ids().is_empty());
+    }
+
+    #[test]
+    fn workbuddy_host_without_fresh_heartbeat_is_still_running() {
+        let _guard = crate::adapter::scan_bus::test_guard();
+        record_running_tools_with_workbuddy_host(std::iter::empty::<&'static str>(), true);
+        assert_eq!(
+            running_tool_ids(),
+            vec!["workbuddy".to_string()],
+            "空闲 WorkBuddy 宿主没有新鲜会话心跳时仍须保持 Idle 兜底"
+        );
+        record_running_tools(std::iter::empty());
     }
 }
 
@@ -2547,6 +4523,7 @@ mod sort_tests {
             form: ProcessForm::App,
             jump_supported: true,
             unread,
+            unread_turned_green_at_ms: None,
         }
     }
 
@@ -2579,9 +4556,27 @@ mod sort_tests {
 
 #[cfg(test)]
 mod unread_card_tests {
-    use super::build_unread_cards;
+    use super::{
+        build_unread_cards, clear_unread_retry, filter_deleted_unread, insert_first_green_unread,
+        insert_should_skip_for_read, keep_green_card, load_pending_map,
+        load_pending_unread_retries_into, mark_active_unread_cards, mark_unread_retry,
+        pending_backup_path, pending_key, persist_pending_map, persist_pending_unread_retries_into,
+        replace_pending_file_with_backup, retain_read_completed_cards, retry_insert_allowed,
+        retry_pending_unread, unread_insert_allowed, unread_retry_pending,
+        unread_retry_pending_since, PendingLoad, PendingRetryStore,
+    };
     use crate::database::dao::unread::UnreadSessionRecord;
     use crate::session::model::{AgentType, ProcessForm, Session, SessionStatus};
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Mutex;
+
+    fn loaded_map(path: &std::path::Path) -> Option<HashMap<String, i64>> {
+        match load_pending_map(path) {
+            PendingLoad::Loaded(map) => Some(map),
+            PendingLoad::Absent | PendingLoad::Failed => None,
+        }
+    }
 
     fn record(tool: &str, sid: &str) -> UnreadSessionRecord {
         UnreadSessionRecord {
@@ -2616,7 +4611,527 @@ mod unread_card_tests {
             form: ProcessForm::App,
             jump_supported: true,
             unread: false,
+            unread_turned_green_at_ms: None,
         }
+    }
+
+    /// P2：数据驱动绿卡的预过滤必须让“待重试”卡通过；不能把池无行一概当已读。
+    #[test]
+    fn pending_unread_retry_keeps_green_card_through_prefilter() {
+        assert!(
+            keep_green_card(true, false, true),
+            "上一轮绿 + 池无行 + 待重试 → 保留卡进入 sync 重试"
+        );
+        assert!(
+            !keep_green_card(true, false, false),
+            "上一轮绿 + 池无行 + 无待重试 → 按已读/过期剔除"
+        );
+        assert!(keep_green_card(false, false, false), "首次转绿保留");
+        assert!(keep_green_card(true, true, false), "池有行保留");
+
+        assert!(mark_unread_retry("codex", "retry-test", 2_000, false));
+        assert!(
+            !mark_unread_retry("codex", "retry-test", 2_000, false),
+            "重复失败且 since 未变不得再次写入"
+        );
+        assert!(unread_retry_pending("codex", "retry-test"));
+        assert_eq!(
+            unread_retry_pending_since("codex", "retry-test"),
+            Some(2_000)
+        );
+        // 旧回合墓碑（< since）不得取消新回合补插；本次转绿后的已读才取消
+        assert!(retry_insert_allowed(2_000, Some(1_000)));
+        assert!(!retry_insert_allowed(2_000, Some(2_000)));
+        assert!(retry_insert_allowed(2_000, None));
+        // Insert 分支：待重试带 since；重启无标记时用卡片活动时间兜底
+        assert!(!insert_should_skip_for_read(
+            Some(2_000),
+            Some(1_000),
+            Some(1_500)
+        ));
+        assert!(insert_should_skip_for_read(
+            Some(2_000),
+            Some(2_000),
+            Some(1_500)
+        ));
+        assert!(!insert_should_skip_for_read(None, Some(1_000), Some(1_500)));
+        assert!(insert_should_skip_for_read(None, Some(2_000), Some(1_500)));
+        assert!(!insert_should_skip_for_read(None, None, Some(1_500)));
+
+        // P2-1：缓存失忆 + 旧墓碑 + 新活动 → 允许；墓碑覆盖活动/无活动 → 不插
+        assert!(unread_insert_allowed(None, Some(1_000), Some(1_500), None));
+        assert!(!unread_insert_allowed(None, Some(2_000), Some(1_500), None));
+        assert!(!unread_insert_allowed(None, Some(1_000), None, None));
+        assert!(unread_insert_allowed(
+            Some("Processing"),
+            Some(1_000),
+            Some(1_500),
+            None
+        ));
+        // P2-2：秒级活动与毫秒墓碑同秒 → 不判已读；毫秒级照常
+        assert!(!insert_should_skip_for_read(
+            None,
+            Some(10_000_300),
+            Some(10_000_000)
+        ));
+        assert!(insert_should_skip_for_read(
+            None,
+            Some(11_000_100),
+            Some(10_000_000)
+        ));
+        assert!(insert_should_skip_for_read(
+            None,
+            Some(10_000_900),
+            Some(10_000_800)
+        ));
+        assert!(unread_insert_allowed(
+            None,
+            Some(10_000_300),
+            Some(10_000_000),
+            None
+        ));
+        // 持久化 pending since 后，重启同秒已读也必须按精确 since 拦截
+        assert!(insert_should_skip_for_read(
+            Some(10_000_100),
+            Some(10_000_300),
+            Some(10_000_000)
+        ));
+        assert!(clear_unread_retry("codex", "retry-test", false));
+        assert!(!clear_unread_retry("codex", "retry-test", false));
+        assert!(!unread_retry_pending("codex", "retry-test"));
+    }
+
+    /// 文件持久化：正常替换 + 主文件缺失时回退 .bak，保证替换崩溃窗口可恢复。
+    #[test]
+    fn pending_retry_file_roundtrip_and_backup_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("unread_pending_retries.json");
+        let mut first = HashMap::new();
+        first.insert("workbuddy\u{1f}s1".to_string(), 1_000);
+        assert!(persist_pending_map(&path, &first));
+        assert_eq!(loaded_map(&path), Some(first.clone()));
+
+        let mut second = HashMap::new();
+        second.insert("codex\u{1f}s2".to_string(), 2_000);
+        assert!(persist_pending_map(&path, &second));
+        assert_eq!(loaded_map(&path), Some(second));
+
+        // 模拟“旧文件已备份、新文件尚未换入”的崩溃窗口
+        std::fs::remove_file(&path).unwrap();
+        let backup = pending_backup_path(&path);
+        std::fs::write(&backup, serde_json::to_string(&first).unwrap()).unwrap();
+        assert_eq!(loaded_map(&path), Some(first));
+    }
+
+    /// 替换链路失败时必须保留旧快照，不得出现“旧文件已删、新文件未入”的空窗。
+    #[test]
+    fn pending_retry_persist_failure_preserves_primary_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("unread_pending_retries.json");
+        let mut old = HashMap::new();
+        old.insert("workbuddy\u{1f}s1".to_string(), 1_000);
+        assert!(persist_pending_map(&path, &old));
+
+        // 备份目标被目录占位 → 无法保留旧文件；函数应放弃替换并保留主文件。
+        let backup = pending_backup_path(&path);
+        std::fs::create_dir(&backup).unwrap();
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, "{}").unwrap();
+        assert!(!replace_pending_file_with_backup(&tmp, &path));
+        assert_eq!(loaded_map(&path), Some(old));
+        assert!(!tmp.exists());
+    }
+
+    /// 主文件损坏 + .bak 有效 + 第二次换名失败：不得覆盖唯一有效 .bak。
+    #[test]
+    fn pending_retry_corrupt_primary_keeps_valid_backup_on_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("unread_pending_retries.json");
+        let backup = pending_backup_path(&path);
+        let mut old = HashMap::new();
+        old.insert("workbuddy\u{1f}s1".to_string(), 1_000);
+        std::fs::write(&path, "{corrupt").unwrap();
+        std::fs::write(&backup, serde_json::to_string(&old).unwrap()).unwrap();
+
+        // tmp 不存在 → 第二次 rename 必然失败
+        let tmp = path.with_extension("json.tmp");
+        assert!(!replace_pending_file_with_backup(&tmp, &path));
+        assert!(backup.exists());
+        assert_eq!(loaded_map(&path), Some(old));
+    }
+
+    /// 主文件损坏 + .bak 有效：换入成功后清理备份，主文件恢复为有效快照。
+    #[test]
+    fn pending_retry_corrupt_primary_replaced_from_valid_tmp() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("unread_pending_retries.json");
+        let backup = pending_backup_path(&path);
+        let mut old = HashMap::new();
+        old.insert("workbuddy\u{1f}s1".to_string(), 1_000);
+        let mut new = HashMap::new();
+        new.insert("codex\u{1f}s2".to_string(), 2_000);
+        std::fs::write(&path, "{corrupt").unwrap();
+        std::fs::write(&backup, serde_json::to_string(&old).unwrap()).unwrap();
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, serde_json::to_string(&new).unwrap()).unwrap();
+
+        assert!(replace_pending_file_with_backup(&tmp, &path));
+        assert_eq!(loaded_map(&path), Some(new));
+        assert!(!backup.exists());
+        assert!(!tmp.exists());
+    }
+
+    /// 主文件有效 + 第二次换名失败：恢复主文件，不留空窗。
+    #[test]
+    fn pending_retry_second_rename_failure_restores_primary() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("unread_pending_retries.json");
+        let mut old = HashMap::new();
+        old.insert("workbuddy\u{1f}s1".to_string(), 1_000);
+        assert!(persist_pending_map(&path, &old));
+
+        let tmp = path.with_extension("json.tmp");
+        assert!(!replace_pending_file_with_backup(&tmp, &path));
+        assert!(path.exists());
+        assert_eq!(loaded_map(&path), Some(old));
+    }
+
+    /// P3：临时读取/解析失败不消耗加载机会；下一轮成功读取后正常置位。
+    #[test]
+    fn pending_retry_load_retries_after_transient_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("unread_pending_retries.json");
+        std::fs::write(&path, "{corrupt").unwrap();
+        let loaded = AtomicBool::new(false);
+        let retries = Mutex::new(HashMap::new());
+        load_pending_unread_retries_into(&path, &loaded, &retries);
+        assert!(!loaded.load(Ordering::Acquire));
+        assert!(retries.lock().unwrap().is_empty());
+
+        let now = chrono::Utc::now().timestamp_millis();
+        let mut map = HashMap::new();
+        map.insert("codex\u{1f}s2".to_string(), now);
+        std::fs::write(&path, serde_json::to_string(&map).unwrap()).unwrap();
+        load_pending_unread_retries_into(&path, &loaded, &retries);
+        assert!(loaded.load(Ordering::Acquire));
+        assert_eq!(
+            retries
+                .lock()
+                .unwrap()
+                .get(&("codex".to_string(), "s2".to_string())),
+            Some(&now)
+        );
+    }
+
+    /// P3：文件确实不存在视为加载完成，不反复重试。
+    #[test]
+    fn pending_retry_load_absent_marks_loaded() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("unread_pending_retries.json");
+        let loaded = AtomicBool::new(false);
+        let retries = Mutex::new(HashMap::new());
+        load_pending_unread_retries_into(&path, &loaded, &retries);
+        assert!(loaded.load(Ordering::Acquire));
+    }
+
+    /// 入口级保护：加载未完成时即使文件可读也不得覆盖；加载合并后再补写。
+    #[test]
+    fn pending_retry_persist_gate_waits_for_load_and_merges() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("unread_pending_retries.json");
+        let now = chrono::Utc::now().timestamp_millis();
+        let mut a = HashMap::new();
+        a.insert("workbuddy\u{1f}s1".to_string(), now);
+        std::fs::write(&path, serde_json::to_string(&a).unwrap()).unwrap();
+
+        let loaded = AtomicBool::new(false);
+        let dirty = AtomicBool::new(false);
+        let retries = Mutex::new(HashMap::from([(
+            ("codex".to_string(), "s2".to_string()),
+            now,
+        )]));
+        assert!(!persist_pending_unread_retries_into(
+            &path, &loaded, &dirty, &retries
+        ));
+        assert!(dirty.load(Ordering::Acquire));
+        assert_eq!(loaded_map(&path), Some(a)); // 磁盘旧项未被覆盖
+
+        load_pending_unread_retries_into(&path, &loaded, &retries);
+        assert!(loaded.load(Ordering::Acquire));
+        assert!(persist_pending_unread_retries_into(
+            &path, &loaded, &dirty, &retries
+        ));
+        assert!(!dirty.load(Ordering::Acquire));
+        let stored = loaded_map(&path).unwrap();
+        assert!(stored.contains_key("workbuddy\u{1f}s1"));
+        assert!(stored.contains_key("codex\u{1f}s2"));
+    }
+
+    /// 入口级保护：主文件暂时不可读（用目录模拟 I/O 错误）时，
+    /// `persist_pending_map` 必须拒绝覆盖；恢复可读后合并磁盘旧项与内存新增项再落盘。
+    #[test]
+    fn pending_retry_persist_blocks_when_primary_unreadable_and_merges_after_restore() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("unread_pending_retries.json");
+        std::fs::create_dir(&path).unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        let mut new_mark = HashMap::new();
+        new_mark.insert("codex\u{1f}s2".to_string(), now);
+
+        assert!(!persist_pending_map(&path, &new_mark));
+        assert!(path.is_dir());
+        assert!(!path.with_extension("json.tmp").exists());
+
+        // 恢复旧快照（A），内存里已有新标记（B）；加载后应合并再写回。
+        std::fs::remove_dir(&path).unwrap();
+        let mut old_mark = HashMap::new();
+        old_mark.insert("workbuddy\u{1f}s1".to_string(), now);
+        std::fs::write(&path, serde_json::to_string(&old_mark).unwrap()).unwrap();
+        let loaded = AtomicBool::new(false);
+        let retries = Mutex::new(HashMap::from([(
+            ("codex".to_string(), "s2".to_string()),
+            now,
+        )]));
+        load_pending_unread_retries_into(&path, &loaded, &retries);
+        assert!(loaded.load(Ordering::Acquire));
+        let merged: HashMap<String, i64> = retries
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|((tool, sid), since)| (pending_key(tool, sid), *since))
+            .collect();
+        assert_eq!(merged.len(), 2);
+        assert!(persist_pending_map(&path, &merged));
+        let stored = loaded_map(&path).unwrap();
+        assert!(stored.contains_key("workbuddy\u{1f}s1"));
+        assert!(stored.contains_key("codex\u{1f}s2"));
+    }
+
+    /// 入口级保护（真实权限故障）：主文件不可读时，B 的持久化不得覆盖含 A 的旧文件；
+    /// 权限恢复后 A 与内存 B 合并写回。
+    #[cfg(unix)]
+    #[test]
+    fn pending_retry_persist_does_not_overwrite_unreadable_primary() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("unread_pending_retries.json");
+        let now = chrono::Utc::now().timestamp_millis();
+        let mut a = HashMap::new();
+        a.insert("workbuddy\u{1f}s1".to_string(), now);
+        std::fs::write(&path, serde_json::to_string(&a).unwrap()).unwrap();
+
+        let original = std::fs::metadata(&path).unwrap().permissions();
+        let mut locked = original.clone();
+        locked.set_mode(0o000);
+        std::fs::set_permissions(&path, locked).unwrap();
+        if std::fs::read_to_string(&path).is_ok() {
+            // root/ACL 环境无法用权限模拟读取失败，跳过本用例。
+            std::fs::set_permissions(&path, original).unwrap();
+            return;
+        }
+
+        let mut b = HashMap::new();
+        b.insert("codex\u{1f}s2".to_string(), now);
+        assert!(!persist_pending_map(&path, &b));
+        assert!(!path.with_extension("json.tmp").exists());
+
+        std::fs::set_permissions(&path, original).unwrap();
+        assert_eq!(loaded_map(&path), Some(a));
+
+        let loaded = AtomicBool::new(false);
+        let retries = Mutex::new(HashMap::from([(
+            ("codex".to_string(), "s2".to_string()),
+            now,
+        )]));
+        load_pending_unread_retries_into(&path, &loaded, &retries);
+        let merged: HashMap<String, i64> = retries
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|((tool, sid), since)| (pending_key(tool, sid), *since))
+            .collect();
+        assert_eq!(merged.len(), 2);
+        assert!(persist_pending_map(&path, &merged));
+        let stored = loaded_map(&path).unwrap();
+        assert!(stored.contains_key("workbuddy\u{1f}s1"));
+        assert!(stored.contains_key("codex\u{1f}s2"));
+    }
+
+    /// 跨重启模拟（真实 SQLite 文件）：首次 INSERT 失败 → pending 落盘 → 重开连接/建表
+    /// → 恢复标记并补插成功；另测失败后已读墓碑导致重启后不复活。
+    /// 注：单测在同一进程内以“丢弃连接 + 重新加载内存状态”模拟重启，不依赖真实应用进程。
+    #[test]
+    fn pending_retry_restart_after_real_insert_failure() {
+        use crate::database::dao::unread;
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("tuvis.db");
+        let path = dir.path().join("unread_pending_retries.json");
+        let now = chrono::Utc::now().timestamp_millis();
+        let record = UnreadSessionRecord {
+            tool_id: "workbuddy".into(),
+            session_id: "s-restart".into(),
+            project_name: "p".into(),
+            title: None,
+            last_message: None,
+            turned_green_at_ms: now,
+            expires_at_ms: now + 24 * 3600 * 1000,
+        };
+
+        // 首次转绿：真实 SQLite 缺表 → upsert 失败 → 生产 helper 自动登记 pending 并落盘
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let loaded = AtomicBool::new(true); // 启动恢复已完成（文件不存在）
+        let dirty = AtomicBool::new(false);
+        let retries = Mutex::new(HashMap::new());
+        let store = PendingRetryStore::new(path.clone(), &loaded, &dirty, &retries);
+        let inserted = insert_first_green_unread(
+            &store,
+            "workbuddy",
+            "s-restart",
+            &record,
+            None,
+            None,
+            Some(now),
+            None,
+            now,
+            &|r| unread::upsert_unread(&conn, r),
+        );
+        assert!(!inserted, "缺表时必须真实插入失败");
+        assert_eq!(store.since("workbuddy", "s-restart"), Some(now));
+        assert_eq!(
+            loaded_map(&path).and_then(|m| m.get("workbuddy\u{1f}s-restart").copied()),
+            Some(now),
+            "pending 必须由生产 helper 自动落盘"
+        );
+        drop(conn);
+
+        // 模拟重启：新连接 + 建表 + 新内存状态从 pending 文件恢复
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        crate::database::schema::init(&conn);
+        let loaded2 = AtomicBool::new(false);
+        let dirty2 = AtomicBool::new(false);
+        let retries2 = Mutex::new(HashMap::new());
+        load_pending_unread_retries_into(&path, &loaded2, &retries2);
+        assert!(loaded2.load(Ordering::Acquire));
+        let store2 = PendingRetryStore::new(path.clone(), &loaded2, &dirty2, &retries2);
+        let retried = retry_pending_unread(
+            &store2,
+            "workbuddy",
+            "s-restart",
+            &record,
+            &|_| None,
+            &|r| unread::upsert_unread(&conn, r),
+            &|r| unread::refresh_display_unread(&conn, r),
+        );
+        assert!(retried, "恢复后补插应成功");
+        assert_eq!(store2.since("workbuddy", "s-restart"), None);
+        assert!(unread::exists_unread_conn(&conn, "workbuddy", "s-restart"));
+        assert_eq!(loaded_map(&path), Some(HashMap::new()));
+
+        // 失败后用户已读再重启：墓碑覆盖本回合 → 生产 helper 清 pending 且不建行
+        let read_since = now + 1;
+        let record_read = UnreadSessionRecord {
+            session_id: "s-read".into(),
+            turned_green_at_ms: read_since,
+            expires_at_ms: read_since + 24 * 3600 * 1000,
+            ..record.clone()
+        };
+        assert!(store2.mark("workbuddy", "s-read", read_since, true));
+        unread::mark_read_tombstone_conn(&conn, "workbuddy", "s-read", read_since + 1);
+        drop(conn);
+
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        crate::database::schema::init(&conn);
+        let loaded3 = AtomicBool::new(false);
+        let dirty3 = AtomicBool::new(false);
+        let retries3 = Mutex::new(HashMap::new());
+        load_pending_unread_retries_into(&path, &loaded3, &retries3);
+        let store3 = PendingRetryStore::new(path.clone(), &loaded3, &dirty3, &retries3);
+        let retried_read = retry_pending_unread(
+            &store3,
+            "workbuddy",
+            "s-read",
+            &record_read,
+            &|_| Some(read_since + 1),
+            &|r| unread::upsert_unread(&conn, r),
+            &|r| unread::refresh_display_unread(&conn, r),
+        );
+        assert!(!retried_read, "已读覆盖 since 时不得补插");
+        assert_eq!(store3.since("workbuddy", "s-read"), None);
+        assert!(!unread::exists_unread_conn(&conn, "workbuddy", "s-read"));
+        assert_eq!(loaded_map(&path), Some(HashMap::new()));
+    }
+
+    /// P1：已删会话的未读池行不得合并为卡；其他工具同 id 不受影响。
+    #[test]
+    fn deleted_workbuddy_pool_rows_are_not_merged_to_cards() {
+        let pool = vec![record("workbuddy", "s1"), record("codex", "s1")];
+        let deleted: std::collections::HashSet<String> = ["s1".to_string()].into_iter().collect();
+        let filtered = filter_deleted_unread(pool, &deleted);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].tool_id, "codex");
+    }
+
+    /// 第三轮 P1：DB-only completed → 已读墓碑 → 下一轮扫描不得再出普通卡；
+    /// 有新活动（last_activity 晚于墓碑）时必须保留。
+    #[test]
+    fn read_completed_db_only_card_is_dropped_until_new_activity() {
+        let read_at = 1_793_000_000_000i64;
+        let mut card = active_card(AgentType::WorkBuddy, "s1");
+        card.pid = 0;
+        card.status = SessionStatus::Idle;
+        card.last_activity_at = chrono::DateTime::from_timestamp_millis(read_at - 1_000)
+            .unwrap()
+            .to_rfc3339();
+
+        let mut active = vec![card.clone()];
+        retain_read_completed_cards(&mut active, &|_| Some(read_at));
+        assert!(active.is_empty(), "已读且无新工作 → 完成卡应消失");
+
+        card.last_activity_at = chrono::DateTime::from_timestamp_millis(read_at + 1)
+            .unwrap()
+            .to_rfc3339();
+        let mut active = vec![card.clone()];
+        retain_read_completed_cards(&mut active, &|_| Some(read_at));
+        assert_eq!(active.len(), 1, "墓碑之后有新工作 → 保留卡片");
+
+        card.pid = 42;
+        let mut active = vec![card];
+        retain_read_completed_cards(&mut active, &|_| Some(read_at));
+        assert_eq!(active.len(), 1, "有真实心跳 pid 的卡不按 DB-only 规则剔除");
+    }
+
+    /// P1：WorkBuddy DB-only completed 卡（pid=0）池里有未读行时，必须标 unread；
+    /// 有心跳 pid 的卡不能被池行提前染色。
+    #[test]
+    fn workbuddy_db_only_idle_card_with_pool_is_marked_unread() {
+        let mut active = vec![active_card(AgentType::WorkBuddy, "s1")];
+        active[0].pid = 0;
+        active[0].status = SessionStatus::Idle;
+        let pool = vec![record("workbuddy", "s1")];
+        mark_active_unread_cards(&mut active, &pool);
+        assert!(active[0].unread, "DB-only completed 卡必须呈现未读");
+        assert_eq!(
+            active[0].unread_turned_green_at_ms,
+            Some(1000),
+            "未读卡必须复制池里的转绿时间，通知不能用旧业务活动时间"
+        );
+        assert!(
+            build_unread_cards(&pool, &active, &|_| true).is_empty(),
+            "active 已标 unread 时不得再追加同会话池卡"
+        );
+
+        let mut heartbeat_card = vec![active_card(AgentType::WorkBuddy, "s1")];
+        heartbeat_card[0].pid = 42;
+        heartbeat_card[0].status = SessionStatus::Idle;
+        mark_active_unread_cards(&mut heartbeat_card, &pool);
+        assert!(!heartbeat_card[0].unread, "有心跳 pid 的卡不因池行提前染色");
+        assert_eq!(heartbeat_card[0].unread_turned_green_at_ms, None);
+
+        // 数据驱动绿卡（Codex/ZCode）已在 sync 标 unread；合并时同样复制转绿时间。
+        let mut codex_card = vec![active_card(AgentType::Codex, "c1")];
+        codex_card[0].unread = true;
+        mark_active_unread_cards(&mut codex_card, &[record("codex", "c1")]);
+        assert_eq!(codex_card[0].unread_turned_green_at_ms, Some(1000));
     }
 
     #[test]
@@ -2635,6 +5150,7 @@ mod unread_card_tests {
         assert_eq!(c.pid, 0);
         assert_eq!(c.form, ProcessForm::App);
         assert_eq!(c.status, SessionStatus::Idle);
+        assert_eq!(c.unread_turned_green_at_ms, Some(1000));
     }
 
     #[test]
@@ -2731,6 +5247,7 @@ mod stale_mark_expiry_tests {
             form: crate::session::ProcessForm::Cli,
             jump_supported: false,
             unread: false,
+            unread_turned_green_at_ms: None,
         }
     }
 

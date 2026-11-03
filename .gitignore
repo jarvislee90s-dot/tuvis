@@ -90,14 +90,14 @@ scripts/extract-registry-src.py
 # 用量功能（token 看板）的一次性过程文档 —— 保留在本地备查，不入库
 # 背景：plan 与执行提示词是调试过程的产物、不适合进 PR（plan 文件仍在本地；提示词已删，
 # 可从 tag `backup/pre-doccleanup` 恢复）。PR 合并后如需彻底清理，删掉这些路径即可。
-docs/superpowers/plans/2026-10-03-usage-collector-and-storage.md
-docs/superpowers/plans/2026-10-03-usage-surfaces-and-export.md
-docs/superpowers/plans/2026-10-03-usage-executor-prompt.md
-docs/superpowers/plans/2026-10-03-usage-surfaces-executor-prompt.md
-docs/superpowers/plans/2026-10-03-usage-collector-prompt-*.md
+docs/engineering/plans/2026-10-03-usage-collector-and-storage.md
+docs/engineering/plans/2026-10-03-usage-surfaces-and-export.md
+docs/engineering/plans/2026-10-03-usage-executor-prompt.md
+docs/engineering/plans/2026-10-03-usage-surfaces-executor-prompt.md
+docs/engineering/plans/2026-10-03-usage-collector-prompt-*.md
 
 # tuvis-3D 内置宠物的本地计划文档（过程产物不入库，同上节用量文档惯例）
-docs/superpowers/plans/2026-10-15-tuvis-3d-builtin.md
+docs/engineering/plans/2026-10-15-tuvis-3d-builtin.md
 
 # 内置宠物资产目录的说明文档（本地创作说明，不入库；正式说明走 docs/）
 public/pet/*/README.md

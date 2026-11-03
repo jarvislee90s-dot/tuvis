@@ -1,0 +1,51 @@
+{
+  "rule": "questionItemId 字符串精确相等（官方 JSON.stringify 紧凑形）",
+  "rows": [
+    {
+      "ph": "<ID-14>",
+      "exactCompact": false,
+      "spacedVariant": true
+    },
+    {
+      "ph": "<ID-196>",
+      "exactCompact": false,
+      "spacedVariant": false
+    },
+    {
+      "ph": "<ID-201>",
+      "exactCompact": false,
+      "spacedVariant": true
+    },
+    {
+      "ph": "<ID-207>",
+      "exactCompact": false,
+      "spacedVariant": false
+    },
+    {
+      "ph": "<ID-209>",
+      "exactCompact": false,
+      "spacedVariant": false
+    },
+    {
+      "ph": "<ID-254>",
+      "exactCompact": true,
+      "spacedVariant": false
+    },
+    {
+      "ph": "<ID-4>",
+      "exactCompact": false,
+      "spacedVariant": false
+    },
+    {
+      "ph": "<ID-6>",
+      "exactCompact": true,
+      "spacedVariant": false
+    },
+    {
+      "ph": "<ID-8>",
+      "exactCompact": true,
+      "spacedVariant": false
+    }
+  ],
+  "conclusion": "ID-254（本轮修正格式后提交）紧凑命中=True；ID-14/ID-201（带空格）=False ⇒ 字节格式是硬约束"
+}

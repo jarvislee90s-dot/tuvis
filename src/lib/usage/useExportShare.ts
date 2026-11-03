@@ -7,7 +7,8 @@
 //    `fetch → blob → createImageBitmap` 同时产出**几何与位图**（同源，不可能一处新一处旧）；
 //    位图**不进布局层**（`ExportInput.sheet` 只吃 `{ rows, geometry }`）——这是刻意分层。
 //  * 6 行指标取 `usage.grid.*`（`requestInput → cacheRead → cacheMiss → output → hitRate → requests`，
-//    与 A 总览同序），值用**精确千分位**（与 hero 同口径：摘要有列宽压力才缩写，图片没有）；
+//    与 A 总览同序），token 位用 `fmtTokens(…, getLang())` 与看板同口径的万/亿缩写
+//    （二轮实机反馈 ②，2026-10-27 用户指示「导出图与看板同口径」；请求次数仍 `fmtInt`）；
 //    `asOf` **不进**指标行——它归 `heroSub`（`collectedAt === 0` → `usage.notCollected`，§3 第 8 条）。
 //    V2 已删除「用户输入(估)」指标（不是 API Token）。
 //  * `heroLabel` 取 `usage.hero.label`（**不是** `usage.card.trend`：用了它全图会连着出现两次
@@ -18,19 +19,33 @@
 //    这里早先自产过一个 `fmtPctText`，理由是「免得把 `format.ts → agentBadge.tsx` 那条 React 链
 //    拖进导出面」——该理由在本文件 import `format.ts` 的那一刻即已作废（下方一行就取用了它的多个
 //    符号），留着副本只会多一处口径漂移点，故删副本、改用唯一出处。
+//  * 模块选择（2026-10-27 实机反馈轮 #3a）：出图前读 `loadExportModules()`（localStorage，不走
+//    Rust 设置）。每个选中的 groupBy 取一份看板数据：**当前看板的 groupBy 命中时直接复用 `dash`
+//    （零 IPC）**，否则走既有只读命令（`usageDashboard`，与 `useUsageDashboardQuery` 同一 API 函数
+//    ——**不新增命令**）；费用段与费用卡同源（`usageCosts`，币种/汇率走显示币种的 localStorage 读侧）。
+//    取数失败 → 该段**缺席**（不阻断导出、不出空盒）；`work = false` → 不取图集、评语/姿态不进图。
 import { trendPoints } from "@/components/usage/TrendChart";
-import { usageGetSettings } from "@/lib/api/usage";
+import { usageDashboard, usageGetSettings } from "@/lib/api/usage";
+import { usageCosts } from "@/lib/api/usageV2";
+import { formatNativeMoney, readDisplayCurrency } from "@/lib/usage/displayCurrency";
 import { distributionRows } from "@/lib/usage/distribution";
 import { defaultExportDeps, renderShareImage } from "@/lib/usage/exportImage";
-import { GROUPS_MAX, type ExportInput } from "@/lib/usage/exportLayout";
+import {
+  GROUPS_MAX,
+  type ExportCostSection,
+  type ExportGroupSection,
+  type ExportInput,
+} from "@/lib/usage/exportLayout";
+import { loadExportModules, type ExportModules } from "@/lib/usage/exportModules";
 import { labelOf, pngFilename } from "@/lib/usage/exportText";
-import { EM_DASH, fmtDur, fmtInt, fmtPct } from "@/lib/usage/format";
+import { EM_DASH, fmtDur, fmtInt, fmtPct, fmtTokens } from "@/lib/usage/format";
 import { getLang } from "@/lib/usage/lang";
 import { pickQuote, type QuoteVars } from "@/lib/usage/quotes";
 import type { QuoteAgg } from "@/lib/usage/quotePool";
 import { asOfText, rangeLabelOf, spanLabelOf, tokenUnmeasured, type TFn } from "@/lib/usage/range";
 import { copyImage as copyImageClipboard, saveBytes, type SaveOutcome } from "@/lib/usage/saveFile";
 import { activePetSheet, loadSheet, type SheetBitmap } from "@/lib/usage/sheet";
+import type { CostRow, UsageCosts } from "@/types/usageV2";
 import type { UsageDashboard, UsageSettings } from "@/types/usage";
 
 /**
@@ -50,8 +65,9 @@ function trendUpOf(points: readonly { value: number }[]): boolean | null {
 function metricRows(dash: UsageDashboard, t: TFn): [string, string][] {
   const label = (key: string) => t(`usage.grid.${key}`);
   // **没量到 token** 的窗口：由 token 桶派生的行一律 `—`、**绝不印 0**；请求次数出真值。
+  // token 位走 `fmtTokens`（二轮实机反馈 ②，2026-10-27 用户指示：导出图与看板同口径万/亿）
   const unmeasured = tokenUnmeasured(dash);
-  const token = (v: number) => (unmeasured ? EM_DASH : fmtInt(v));
+  const token = (v: number) => (unmeasured ? EM_DASH : fmtTokens(v, getLang()));
   return [
     [label("requestInput"), token(dash.totals.requestTotal)],
     [label("cacheRead"), token(dash.totalsBuckets.cacheRead)],
@@ -111,13 +127,89 @@ async function readSettings(): Promise<UsageSettings | null> {
 }
 
 /**
+ * 十进制字符串求和（费用总额用）：只收非负十进制串（与显示币种层同一正则口径），
+ * BigInt 缩放对齐小数位，无浮点误差。无可加项 → `null`（调用方显示 `—`，绝不假装 0）。
+ */
+function sumDecimalStrings(values: readonly (string | null)[]): string | null {
+  const parts = values.filter((v): v is string => v !== null && /^\d+(?:\.\d+)?$/.test(v));
+  if (parts.length === 0) return null;
+  const scale = Math.max(...parts.map((p) => (p.split(".")[1] ?? "").length));
+  let sum = 0n;
+  for (const p of parts) {
+    const [whole, frac = ""] = p.split(".");
+    sum += BigInt(whole + frac.padEnd(scale, "0"));
+  }
+  const digits = sum.toString().padStart(scale + 1, "0");
+  return scale > 0 ? `${digits.slice(0, -scale)}.${digits.slice(-scale)}` : digits;
+}
+
+/**
+ * 费用段装配（与费用卡同一条数据通路）：行 = Token 全局降序 Top 6（与费用卡 Top5 同一排序式），
+ * 行名 = 「显示渠道 / 模型」（平铺视图语法）；金额按显示币种取后端算好的原生值（不在此乘汇率）；
+ * `share` 按 Token 占比（费用卡的排序键，不是金额占比——未估价行也有 Token 可比）。
+ * 总额 = **全部行**估价求和（用户裁决「总额 + Top 行」；卡片「无全局总额」契约只约束卡片本身，
+ * 导出段的 `totalLabel` 写明「估价」口径）。全未估价 → 总额 `—`。
+ * `more`（评审 Important，X2 同类缺陷）：只画 Top 6 而总额是全部行的合计，可见行之和与总额
+ * 对不上**必须**说出来——超出 `GROUPS_MAX` 的行数译成「等 N」（与分组段 `groupsMore` 同一 i18n
+ * 键），为 0 ⇒ `null` 不出这行。**导出给测试**做「>6 ⇒ 非 null / ≤6 ⇒ null」回归
+ * （生产消费方纪律不变：`useExportShare` 这个 hook 仍只允许 `UsageExportActions` import）。
+ */
+export function buildCostSection(costs: UsageCosts, t: TFn): ExportCostSection {
+  const { currency } = readDisplayCurrency();
+  const sorted = [...costs.rows].sort(
+    (a, b) => b.tokenUsage - a.tokenUsage || a.key.localeCompare(b.key)
+  );
+  const maxTokens = sorted[0]?.tokenUsage ?? 0;
+  const nativeAmountOf = (row: CostRow): string | null =>
+    formatNativeMoney(currency === "cny" ? row.estimatedCny : row.estimatedUsd, currency);
+  const channelOf = (row: CostRow): string => {
+    // unassigned / ambiguous 的 label 是 i18n 键（与费用卡 `i18nLabel` 同规则）；已知渠道取显示名
+    if (row.channelKind === "unassigned") return t("usage.label.unassignedChannel");
+    if (row.channelKind === "ambiguous") return t("usage.label.ambiguousChannel");
+    return row.displayProvider ?? "";
+  };
+  const rows = sorted.slice(0, GROUPS_MAX).map((row) => {
+    const model =
+      row.displayModelName ??
+      (row.identity.modelId === "" ? t("usage.label.unknownModel") : row.identity.modelId);
+    const channel = channelOf(row);
+    const amount = nativeAmountOf(row);
+    return {
+      label: channel ? `${channel} / ${model}` : model,
+      value: amount ?? t("usage.cost.unpriced"),
+      share: maxTokens > 0 ? row.tokenUsage / maxTokens : undefined,
+    };
+  });
+  // 总额对**原始**十进制串求和（`nativeAmountOf` 的产物带 `$`/`¥` 符号与千分位，进不了求和正则）
+  const total =
+    formatNativeMoney(
+      sumDecimalStrings(
+        costs.rows.map((row) => (currency === "cny" ? row.estimatedCny : row.estimatedUsd))
+      ),
+      currency
+    ) ?? EM_DASH;
+  // 只画 6 行 ≠ 只有 6 行：超出部分必须披露（`total` 覆盖全部行，见上）
+  const more =
+    sorted.length > GROUPS_MAX ? t("usage.moreN", { n: sorted.length - GROUPS_MAX }) : null;
+  return {
+    title: t("usage.cost.title"),
+    totalLabel: t("usage.export.costTotal"),
+    total,
+    rows,
+    more,
+  };
+}
+
+/**
  * 看板数据 → 布局入参 + 位图（图集只取一次；几何与位图同源）。
  * `bitmap` 与 `input.sheet` 分开返回，就是为了让布局层拿不到位图。
+ * `modules` 由调用方在导出时刻读好（2026-10-27 #3a）：决定分组段数量、费用段与工作小结段。
  */
 async function buildShareInput(
   dash: UsageDashboard,
   t: TFn,
-  settings: UsageSettings | null
+  settings: UsageSettings | null,
+  modules: ExportModules
 ): Promise<{ input: ExportInput; bitmap: SheetBitmap | null }> {
   const chartPoints = trendPoints(dash.trend);
   const points = chartPoints.map((p) => ({ label: p.label, value: p.value }));
@@ -127,20 +219,59 @@ async function buildShareInput(
   /**
    * 分享图**没画出来**的分组行数（X2 缺陷修复）：本层最多画 `GROUPS_MAX`(6) 行，而屏上分布卡是
    * `DIST_MAX_ROWS`(10) 行 + 「等 N」。两项都要算：
-   *  * `dist.rows.length - min(dist.rows.length, GROUPS_MAX)` = 图比列表少画的那几行；
-   *  * `dist.moreCount` = 列表自己被 10 行上限折掉的余量（`distributionRows` 已经算好但旧实现丢掉了）。
+   *  * `rowsLength - min(rowsLength, GROUPS_MAX)` = 图比列表少画的那几行；
+   *  * `moreCount` = 列表自己被 10 行上限折掉的余量（`distributionRows` 已经算好但旧实现丢掉了）。
    * 两者相加才是「真实组数 − 图上画出来的行数」。为 0 ⇒ 不出这行（不印「等 0」）。
+   * （#3a 起每个分组段各算各的，公式仍是这一条。）
    */
-  const groupsMoreCount =
-    dist.rows.length - Math.min(dist.rows.length, GROUPS_MAX) + dist.moreCount;
+  const groupsMoreOf = (rowsLength: number, moreCount: number): string | null => {
+    const n = rowsLength - Math.min(rowsLength, GROUPS_MAX) + moreCount;
+    return n > 0 ? t("usage.moreN", { n }) : null;
+  };
+  /**
+   * 分组段 × N：每个选中的 groupBy 一段。**当前看板的 groupBy 命中时直接复用 `dash`**（零 IPC，
+   * 与屏幕上那份数据严格同源）；其余维度走既有只读命令（`usageDashboard`，与看板查询同一 API
+   * 函数，**不新增命令**）；失败 → 该段缺席（不阻断导出）。
+   * 段标题：单段保持旧版式逐字（`分组分布`，默认图与改造前逐字节一致）；多段才加维度后缀消歧义。
+   */
+  const groupSections: ExportGroupSection[] = [];
+  for (const groupBy of modules.distribution) {
+    const d: UsageDashboard | null =
+      groupBy === dash.groupBy ? dash : await usageDashboard(dash.range, groupBy).catch(() => null);
+    if (!d) continue;
+    const dd = distributionRows(d.rows);
+    groupSections.push({
+      groupBy,
+      title:
+        modules.distribution.length > 1
+          ? `${t("usage.card.distribution")} · ${t(`usage.group.${groupBy}`)}`
+          : t("usage.card.distribution"),
+      rows: dd.rows.map((row) => ({
+        // 行名分派与文本摘要同一实现（`exportText.ts::labelOf`），此处不另立副本
+        name: labelOf(row, groupBy, t),
+        // token 值与看板同口径（二轮实机反馈 ②：`fmtTokens` 万/亿，非完整千分位）
+        value: fmtTokens(row.value, getLang()),
+        share: row.share,
+      })),
+      groupsMore: groupsMoreOf(dd.rows.length, dd.moreCount),
+    });
+  }
+
+  // 费用段：与费用卡同一查询（`usageCosts`，只读账本不刷价）；失败 / 无行 → 整段缺席
+  const costs = modules.cost
+    ? await usageCosts(dash.range, readDisplayCurrency().rate).catch(() => null)
+    : null;
+  const cost = costs && costs.rows.length > 0 ? buildCostSection(costs, t) : null;
+
   // **没量到 token** 的窗口（2026-10-06 用户裁决）：token 位一律 `—`（头部 hero、指标行、评语的
   // `{tokens}`），**计数类照常**；趋势也**不画**（全零点会被画成一条贴底零线 = 假图，见
   // `UsageTrendCard` 的同款纪律）——交给布局层的空态分支（`points.length < 2` → `emptyLabel`）。
   // 跨度/范围名仍用**真实点**算（「近 7 天 · 09/27 – 10/03」是真实信息，不因没量到 token 而消失）。
   const unmeasured = tokenUnmeasured(dash);
 
-  // 图集：只取一次（几何与位图同源）；取不到 → sheet = null → **不画立绘也要出图**
-  const pet = await activePetSheet().catch(() => null);
+  // 图集：`work = false` 时**连 fetch 都不发**（立绘/气泡整段缺席，图集自然用不上）；
+  // 只取一次（几何与位图同源）；取不到 → sheet = null → **不画立绘也要出图**
+  const pet = modules.work ? await activePetSheet().catch(() => null) : null;
   const loaded = pet ? await loadSheet(pet.url, pet.rows) : null;
   const sheet = pet && loaded ? { rows: pet.rows, geometry: loaded.geometry } : null;
 
@@ -155,8 +286,10 @@ async function buildShareInput(
   };
   const vars: QuoteVars = {
     range: rangeName,
-    // 评语气泡里的 `{tokens}` 同样是 token 量 ⇒ 没量到时出 `—`（不印 0）
-    tokens: unmeasured ? EM_DASH : fmtInt(dash.hero),
+    // 评语气泡里的 `{tokens}` 同样是 token 量 ⇒ 没量到时出 `—`（不印 0）；
+    // 与 hero 同函数同 lang（Batch 5 补充，用户裁决「整张导出图 token 单位与看板一致」）：
+    // `fmtTokens` 万/亿，不再保留完整千分位
+    tokens: unmeasured ? EM_DASH : fmtTokens(dash.hero, getLang()),
     hitPct: unmeasured ? EM_DASH : fmtPct(dash.totals.cacheHitRate),
     models: String(dist.rows.length),
   };
@@ -167,26 +300,21 @@ async function buildShareInput(
       // 跨度算不出（点 < 2）时**不挂**那个分隔符，避免出现「近 7 天 · 」这种半截头
       rangeLabel: span ? `${rangeName} · ${span}` : rangeName,
       heroLabel: t("usage.hero.label", { range: rangeName }),
-      hero: unmeasured ? EM_DASH : fmtInt(dash.hero),
+      // hero 与看板同口径（二轮实机反馈 ②：`fmtTokens` 万/亿，非完整千分位）
+      hero: unmeasured ? EM_DASH : fmtTokens(dash.hero, getLang()),
       heroSub: `${t("usage.grid.asOf")}: ${asOfText(dash.collectedAt, t)}`,
       metrics: metricRows(dash, t),
       trendTitle: t("usage.card.trend"),
       emptyLabel: t("usage.empty"),
       // 没量到 token ⇒ 不把全零点交给画布（贴底零线 = 假图）；布局层按「点 < 2」走空态
       points: unmeasured ? [] : points,
-      groupTitle: t("usage.card.distribution"),
-      // 完整列表交给布局层，由它按 `GROUPS_MAX` 截断（**截断只此一处**；本层只负责把「少了多少」
-      // 算准，见上面的 `groupsMoreCount`）
-      groups: dist.rows.map((row) => ({
-        // 行名分派与文本摘要同一实现（`exportText.ts::labelOf`），此处不另立副本
-        name: labelOf(row, dash.groupBy, t),
-        value: fmtInt(row.value),
-        share: row.share,
-      })),
-      groupsMore: groupsMoreCount > 0 ? t("usage.moreN", { n: groupsMoreCount }) : null,
+      groups: groupSections,
+      cost,
+      work: modules.work,
       toolsTitle: t("usage.work.toolCalls"),
       tools2x2: toolCells(dash, t),
-      quote: pickQuote(agg, getLang(), settings?.exportQuote ?? "", vars),
+      // `work = false` ⇒ 立绘/气泡整段缺席：不取图集（`sheet: null`）、评语/姿态不进图
+      quote: modules.work ? pickQuote(agg, getLang(), settings?.exportQuote ?? "", vars) : "",
       footer: t("usage.footer.caliber"),
       pose: settings?.exportPose ?? "random",
       poseColIndex: 0,
@@ -216,7 +344,9 @@ export interface ShareExport {
  */
 export function useExportShare(t: TFn): ShareExport {
   const render = async (dash: UsageDashboard): Promise<Blob> => {
-    const { input, bitmap } = await buildShareInput(dash, t, await readSettings());
+    // 模块选择**导出时刻现读**（localStorage，同设置的「点击时一次性读」纪律，不留第二份缓存）
+    const modules = loadExportModules();
+    const { input, bitmap } = await buildShareInput(dash, t, await readSettings(), modules);
     return renderShareImage(input, defaultExportDeps(bitmap));
   };
 

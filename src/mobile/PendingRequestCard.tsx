@@ -21,15 +21,16 @@
 // isSecret 的问题用 password 输入（不回显）；提交成功后立即清草稿——投影刷新
 // 换卡之前秘密也不残留在 DOM。
 import { useEffect, useRef, useState } from "react";
-import InteractiveCard from "./InteractiveCard";
+import InteractiveCard, { toneTokens } from "./InteractiveCard";
 import i18n from "@/i18n";
 import {
   codexCapabilityTier,
-  fetchCodexAction,
+  isCodexPreDeliveryRefusal,
   newActionId,
   probeReasonErrorKey,
   probeReasonStage,
   respondCodexPending,
+  verifyCodexAction,
   type ActionReceipt,
   type CodexCapabilityTier,
   type ControlAvailability,
@@ -92,11 +93,20 @@ export function CodexAvailabilityBanner({
   availability,
   stale,
   probeStatus,
+  sendAttemptable,
 }: {
   availability: ControlAvailability;
   stale: boolean;
   /** #172/T9a：探测只读事实。老后端不下发 → undefined（按「无探测信息」处理）。 */
   probeStatus?: ProbeStatus | undefined;
+  /**
+   * S5：发送静态门（send-info 展示面单点，SessionDetail 经 MessageComposer 下发）
+   * 判定的「当前可尝试发送」。语义裁决（设计 §3.4）：底层 read_only 只代表已取证
+   * 能力，须与当前可尝试的产品操作区分——`true` 时横幅**不得**宣称「暂不能远程
+   * 发送」，改走自动适配尝试中文案（不宣称已解锁全部能力）；`false`/`undefined`
+   * （静态门拒绝 / 未取得——旧宿主或拉取失败）维持原文案，不猜。
+   */
+  sendAttemptable?: boolean | undefined;
 }) {
   const tier = codexCapabilityTier(availability);
   const probeState = probeStatus?.state ?? null;
@@ -147,7 +157,11 @@ export function CodexAvailabilityBanner({
       ) : (
         <>
           <span data-testid="codex-availability-label">
-            {i18n.t(`mobile.codex.availability.${availability}`)}
+            {/* S5：read_only + 静态门放行 → 不宣称「暂不能远程发送」（§3.4：底层
+                read_only 只代表已取证能力，与当前可尝试的操作区分）；其余维持原档位文案 */}
+            {availability === "read_only" && sendAttemptable === true
+              ? i18n.t("mobile.codex.availability.readOnlyAttemptable")
+              : i18n.t(`mobile.codex.availability.${availability}`)}
           </span>
           <span data-testid="codex-tier-badge" data-tier={tier} className={TIER_CLASS[tier]}>
             {i18n.t(`mobile.codex.tier.${tier}`)}
@@ -207,33 +221,6 @@ function receiptCopy(r: ActionReceipt): string {
  *  投递（底注「未发送」，按钮保留：再按 = 新 actionId，零投递上重试安全）；
  *  rejected = 明确拒绝（锁卡）。绝不按粗粒度 state 重造不同语义。
  *  cancelled/queued/reserved/unknown = 未终态或已撤 → null（保持「投递结果未知」）。 */
-function actionViewToReceipt(
-  actionId: string,
-  view: { state: string; receipt: ActionReceipt | null }
-): ActionReceipt | null {
-  if (view.state === "accepted") {
-    return {
-      actionId,
-      delivery: "accepted",
-      route: view.receipt?.route ?? "desktop_ipc",
-      turnId: view.receipt?.turnId ?? null,
-      envelopeId: view.receipt?.envelopeId ?? null,
-      reasonCode: view.receipt?.reasonCode ?? null,
-    };
-  }
-  if (view.state === "rejected") {
-    return {
-      actionId,
-      delivery: view.receipt?.delivery ?? "rejected",
-      route: view.receipt?.route ?? "desktop_ipc",
-      turnId: view.receipt?.turnId ?? null,
-      envelopeId: view.receipt?.envelopeId ?? null,
-      reasonCode: view.receipt?.reasonCode ?? null,
-    };
-  }
-  return null;
-}
-
 /** C5：**可靠的投递前拒绝**判定——只有我方机器码错误体能认定零投递、ID 让位
  *  解锁再按（新动作）；其余一切（5xx/代理错误/畸形响应体）与无响应同：提交结果
  *  未知，保留同 ID 只读核对（S5：代理可在服务端已处理后返回 504，新 ID 重按 =
@@ -256,35 +243,20 @@ function actionViewToReceipt(
  *  POST /codex/queue/force-continue（人工解除面，404 = 不存在/他人动作）都会发
  *  （2026-10-19 复审修正：原注释称「只有 GET 会发」已漂移）。留着防未来端点复用
  *  该码时静默漏进「结果未知」臂（多算一位只多一次解锁误判面，漏算才是锁卡事故）。 */
-const PRE_DELIVERY_ERROR_CODES = new Set([
-  "bad_request", // malformed / deny_unknown_fields（登记前拒绝）
-  "answers_mismatch", // 答案限额校验（登记前拒绝）
-  "answer_not_option",
-  "invalid_id",
-  "forbidden", // 设备门禁（gate 层，登记前拒绝）
-  "no_session", // 会话不在快照（无任何投递）
-  "no_action", // 防御位：pending-response 不发；查询/人工解除端点会发（见上方块注释）
-  "capability_unavailable", // IPC 能力关（503，登记前确定性零投递）
-  "empty_answers", // ↓ validate_answers 五码：答案限额（登记前拒绝）
-  "too_many_questions",
-  "too_many_answers",
-  "answer_too_long",
-  "answers_too_large",
-  "action_mismatch", // 动作词与 pending 类别不相容（409，登记前复核）
-]);
-
-function isPreDeliveryRefusal(e: ApiError): boolean {
-  if (e.status === null) return false;
-  const code = typeof e.data?.error === "string" ? e.data.error : null;
-  return code !== null && PRE_DELIVERY_ERROR_CODES.has(code);
+/** 该题的有效答策（缺省保守单值；旧载荷不多选）。 */
+function answerPolicyOf(q: QuestionView) {
+  return q.answerPolicy ?? { allowMultiple: false, maxAnswers: 1, allowFreeText: q.isOther };
 }
 
-/** 一题的已答标签：勾选的选项 + 「其他」自由文本（isOther 才有输入框） */
+/** 一题归一化后的答案数组（H13：单值下自由文本**替代**选项；多值下文本与选项
+ *  一起计入上限，前后端同一数量规则）。 */
 function answerLabels(q: QuestionView, picked: string[], free: string): string[] {
-  const labels = [...picked];
+  const policy = answerPolicyOf(q);
   const f = free.trim();
-  if (q.isOther && f) labels.push(f);
-  return labels;
+  if (!f) return [...picked];
+  const multi = policy.allowMultiple && policy.maxAnswers > 1;
+  if (!multi) return [f];
+  return [...picked, f];
 }
 
 export default function PendingRequestCard({
@@ -293,23 +265,58 @@ export default function PendingRequestCard({
   onReceipt,
   writeLocked = false,
 }: PendingRequestCardProps) {
+  /** N11：跨重挂的原动作锚（只读核对用；不恢复旧写资格）。 */
+  const anchorStorageKey = `codex:pending:${sessionId}:${request.requestKey}:${request.contextToken}`;
   const [busy, setBusy] = useState(false);
   const [receipt, setReceipt] = useState<ActionReceipt | null>(null);
   const [error, setError] = useState<string | null>(null);
+  /** B04：原生多题单卡逐题填写（同一次 pending 请求内）。 */
+  const [questionIndex, setQuestionIndex] = useState(0);
   /** 逐题作答态（qid → 已勾选项 / 自由文本草稿） */
   const [picked, setPicked] = useState<Record<string, string[]>>({});
   const [freeTexts, setFreeTexts] = useState<Record<string, string>>({});
+  /** N14：换上下文后旧非 secret 稿**不自动生效**，需用户显式恢复确认。 */
+  const [staleDraft, setStaleDraft] = useState<{
+    picked: Record<string, string[]>;
+    free: Record<string, string>;
+  } | null>(null);
+  const draftVersionRef = useRef(0);
+  const draftsRef = useRef<{
+    picked: Record<string, string[]>;
+    freeTexts: Record<string, string>;
+  }>({ picked: {}, freeTexts: {} });
+  /** 记录各题在编辑时的 secret 属性（防 qid 复用把旧 secret 变普通题后回显）。 */
+  const secretFlagsRef = useRef<Record<string, boolean>>({});
+
+  // N10/N14：草稿版本（提交时冻结；旧回执不得清掉版本已变的新稿）。
+  useEffect(() => {
+    draftsRef.current = { picked, freeTexts };
+    draftVersionRef.current += 1;
+  }, [picked, freeTexts]);
   /** R12：结果核对中（提交网络异常后的只读核对在途）——动作锁定，防借新 ID 双投 */
   const [verifying, setVerifying] = useState(false);
   /** R12：核对完成但结果未知（查不到/未终态）——保持锁定（S5：绝不自动重试），
    *  等新投影换代（token 轮换）重置 */
   const [outcomeUnknown, setOutcomeUnknown] = useState(false);
   /** R12：本次提交的 actionId——从「提交发出」保持到「结果核对完成」。网络异常
-   *  后不换 ID 不解锁重投，改用 fetchCodexAction 只读核对原 action。 */
+   *  后不换 ID 不解锁重投，改用 verifyCodexAction 只读核对原 action。 */
   const submitActionIdRef = useRef<string | null>(null);
+  /** 渲染用的"是否有可用原动作锚"（ref 不能参与渲染）。 */
+  const [hasActionAnchor, setHasActionAnchor] = useState(false);
   /** R12：上下文代际守卫——{requestKey, contextToken} 换代即 +1。旧代际的在途
    *  Promise（resolve/异常/核对结果）落地时比对代际，过期一律丢弃。 */
   const generationRef = useRef(0);
+  /** H11：本地截止（从点击起算；POST 挂起也在 30 秒结束转圈）。
+   *  每轮提交拥有自己的 timer（代际号）；旧轮 finalize 不得清新轮截止。 */
+  const deadlineRef = useRef<{ gen: number; timer: number } | null>(null);
+  const submitGenRef = useRef(0);
+  const DEADLINE_MS = 30_000;
+  const clearMyDeadline = (gen: number) => {
+    if (deadlineRef.current?.gen === gen) {
+      window.clearTimeout(deadlineRef.current.timer);
+      deadlineRef.current = null;
+    }
+  };
 
   // **上下文换代防线**：requestKey 不变但 contextToken 变化（owner 换代 / 请求
   // 消失重现）= 服务端判定旧上下文作废——旧草稿、旧回执、旧错误一律清空，
@@ -319,14 +326,57 @@ export default function PendingRequestCard({
   useEffect(() => {
     generationRef.current += 1;
     submitActionIdRef.current = null;
+    setHasActionAnchor(false);
+    // N11：本上下文持久化的原动作锚（离开重进仍可继续只读核对；不恢复写资格）。
+    const anchor = window.sessionStorage.getItem(anchorStorageKey);
+    if (anchor) {
+      submitActionIdRef.current = anchor;
+      setHasActionAnchor(true);
+      setOutcomeUnknown(true);
+    } else {
+      setOutcomeUnknown(false);
+    }
+    // N14：旧稿按原题 secret 属性隔离——secret 一律丢弃；非 secret 仅存为待确认。
+    const prev = draftsRef.current;
+    const secretIds = Object.keys(secretFlagsRef.current).filter(
+      (id) => secretFlagsRef.current[id]
+    );
+    const stalePicked: Record<string, string[]> = {};
+    const staleFree: Record<string, string> = {};
+    let hasStale = false;
+    for (const [id, labels] of Object.entries(prev.picked)) {
+      if (secretIds.includes(id)) continue;
+      if (labels.length > 0) {
+        stalePicked[id] = labels;
+        hasStale = true;
+      }
+    }
+    for (const [id, text] of Object.entries(prev.freeTexts)) {
+      if (secretIds.includes(id)) continue;
+      if (text.trim().length > 0) {
+        staleFree[id] = text;
+        hasStale = true;
+      }
+    }
+    setStaleDraft(hasStale ? { picked: stalePicked, free: staleFree } : null);
     setPicked({});
     setFreeTexts({});
     setReceipt(null);
     setError(null);
     setBusy(false);
     setVerifying(false);
-    setOutcomeUnknown(false);
-  }, [request.requestKey, request.contextToken]);
+    setQuestionIndex(0);
+    if (deadlineRef.current !== null) {
+      window.clearTimeout(deadlineRef.current.timer);
+      deadlineRef.current = null;
+    }
+  }, [request.requestKey, request.contextToken, anchorStorageKey]);
+
+  useEffect(() => {
+    return () => {
+      if (deadlineRef.current !== null) window.clearTimeout(deadlineRef.current.timer);
+    };
+  }, []);
 
   const isInput = request.kind === "user_input";
   const isApproval =
@@ -347,11 +397,23 @@ export default function PendingRequestCard({
 
   // 未答题面（防静默丢题第一道闸；第二道在服务端——空答案 400）
   const unanswered = isInput
-    ? request.questions.filter(
+    ? (request.questions ?? []).filter(
         (q) => answerLabels(q, picked[q.id] ?? [], freeTexts[q.id] ?? "").length === 0
       )
     : [];
   const canSubmit = isInput && unanswered.length === 0;
+  const questions = request.questions ?? [];
+  const multiQuestion = isInput && questions.length > 1;
+  const questionCount = questions.length;
+  const safeIndex = Math.min(questionIndex, Math.max(0, questionCount - 1));
+  const visibleQuestions = multiQuestion ? [questions[safeIndex]] : questions;
+  const currentAnswered =
+    !multiQuestion ||
+    answerLabels(
+      questions[safeIndex],
+      picked[questions[safeIndex]?.id] ?? [],
+      freeTexts[questions[safeIndex]?.id] ?? ""
+    ).length > 0;
 
   // 已回执锁定：unknown/accepted/rejected 后动作全部禁用（防双答——unknown 绝不
   // 重发原动作）。not_sent 是保守判定的零投递：保留按钮（再按 = 新 actionId，
@@ -360,7 +422,48 @@ export default function PendingRequestCard({
   const locked = receipt !== null && receipt.delivery !== "not_sent";
   const disabled = busy || locked || verifying || outcomeUnknown || writeLocked || !operable;
 
-  const respond = async (action: "approve" | "reject" | "answer") => {
+  /** H11：只清 secret 题稿（防泄漏）；非 secret 稿在结果未确认前保留待复核。 */
+  const clearSecretDrafts = () => {
+    const secretIds = new Set(request.questions.filter((q) => q.isSecret).map((q) => q.id));
+    if (secretIds.size === 0) return;
+    setPicked((prev) =>
+      Object.fromEntries(Object.entries(prev).filter(([id]) => !secretIds.has(id)))
+    );
+    setFreeTexts((prev) =>
+      Object.fromEntries(Object.entries(prev).filter(([id]) => !secretIds.has(id)))
+    );
+  };
+
+  /** N10/N11：按**提交拥有者**退休/清稿——旧轮回执不得动新轮锚、busy、deadline、稿。 */
+  const retireAnchor = (submit: number, gen: number) => {
+    if (submitGenRef.current !== submit || generationRef.current !== gen) return;
+    submitActionIdRef.current = null;
+    setHasActionAnchor(false);
+    window.sessionStorage.removeItem(anchorStorageKey);
+  };
+
+  const clearDraftsOwned = (
+    submit: number,
+    gen: number,
+    version: number,
+    mode: "all" | "secret"
+  ) => {
+    if (
+      submitGenRef.current !== submit ||
+      generationRef.current !== gen ||
+      draftVersionRef.current !== version
+    ) {
+      return; // 旧回执/稿已改：不清新稿
+    }
+    if (mode === "all") {
+      setPicked({});
+      setFreeTexts({});
+      return;
+    }
+    clearSecretDrafts();
+  };
+
+  const respond = async (action: "approve" | "reject" | "cancel" | "answer") => {
     // R12：核对中/结果未知/已回执锁定一律拦截（answer 也不例外——锁定就是锁定，
     // 提交按钮自身的 disabled 只剩 UX 层意义）
     if (busy || verifying || outcomeUnknown || locked) return;
@@ -368,10 +471,25 @@ export default function PendingRequestCard({
     setBusy(true);
     setError(null);
     const myGen = generationRef.current;
-    const stale = () => generationRef.current !== myGen;
+    const submitGen = ++submitGenRef.current;
+    const draftVersion = draftVersionRef.current;
+    if (deadlineRef.current !== null) window.clearTimeout(deadlineRef.current.timer);
+    deadlineRef.current = {
+      gen: submitGen,
+      timer: window.setTimeout(() => {
+        // H11：到点停止转圈并保持锁定（结果未知），绝不自动重发。
+        if (submitGenRef.current !== submitGen) return;
+        setBusy(false);
+        setOutcomeUnknown(true);
+      }, DEADLINE_MS),
+    };
+    const startedAt = Date.now();
+    const stale = () => generationRef.current !== myGen || submitGenRef.current !== submitGen;
     // R12：一次用户动作一个 ID；网络异常后**沿同 ID**核对（不换 ID 重发）
     if (submitActionIdRef.current === null) {
       submitActionIdRef.current = newActionId();
+      setHasActionAnchor(true);
+      window.sessionStorage.setItem(anchorStorageKey, submitActionIdRef.current);
     }
     const actionId = submitActionIdRef.current;
     try {
@@ -381,6 +499,8 @@ export default function PendingRequestCard({
         requestKey: request.requestKey,
         contextToken: request.contextToken,
         action,
+        // H11：如实透传剩余预算（客户端点击起算；服务端再夹上限）。
+        frontBudgetMs: Math.max(0, DEADLINE_MS - (Date.now() - startedAt)),
         // 白名单契约：仅 answer 携带 answers（approve/reject 多一个键都会 400）
         ...(action === "answer"
           ? {
@@ -393,13 +513,23 @@ export default function PendingRequestCard({
             }
           : {}),
       });
-      if (stale()) return; // 旧 token 的响应：不回写 receipt、不清新草稿、不上行
-      // 明确回执 = 结果核对完成 → ID 让位（下一次用户动作 = 新 ID）
-      submitActionIdRef.current = null;
+      if (stale()) return; // 旧轮/旧 token 的响应：不回写、不清新稿、不动新锚
+      clearMyDeadline(submitGen);
+      const unconfirmed =
+        r.delivery === "accepted" &&
+        (r.reasonCode === "decision_unconfirmed" || r.reasonCode === "accepted_unbound");
       setReceipt(r);
-      // 提交成功即清草稿：isSecret 的回答不残留在 DOM（换卡前也不残留）
-      setPicked({});
-      setFreeTexts({});
+      if (r.delivery === "rejected" || (r.delivery === "accepted" && !unconfirmed)) {
+        // N11：只有**权威解决**才退休原锚；受理未确认保留锚与核对入口。
+        retireAnchor(submitGen, myGen);
+      }
+      if (r.delivery === "unknown_delivery" || unconfirmed) setOutcomeUnknown(true);
+      // N10/N14：清稿须核冻结 draftVersion（旧回执不得清新稿）。
+      if (r.delivery === "rejected") {
+        clearDraftsOwned(submitGen, myGen, draftVersion, "all");
+      } else if (r.delivery === "accepted" && !unconfirmed) {
+        clearDraftsOwned(submitGen, myGen, draftVersion, "secret");
+      }
       onReceipt?.(r);
     } catch (e) {
       if (stale()) return; // 旧 token 的异常：不覆盖新卡状态
@@ -411,7 +541,8 @@ export default function PendingRequestCard({
         e.status === 409 &&
         (e.data?.error === "stale_context" || e.data?.error === "action_conflict")
       ) {
-        submitActionIdRef.current = null;
+        clearMyDeadline(submitGen);
+        retireAnchor(submitGen, myGen);
         setError(
           e.data?.error === "stale_context"
             ? i18n.t("mobile.codex.pending.staleContext")
@@ -419,10 +550,11 @@ export default function PendingRequestCard({
         );
         return;
       }
-      if (e instanceof ApiError && isPreDeliveryRefusal(e)) {
-        // C5：**可靠的投递前拒绝**（我方机器码错误体：400 校验 / 403 设备门 /
-        // 404 会话或动作不存在）——零投递可判，ID 让位，解锁可再按（新动作新 ID）。
-        submitActionIdRef.current = null;
+      if (e instanceof ApiError && isCodexPreDeliveryRefusal(e)) {
+        // C5/H10：**可靠的投递前拒绝**（按机器码，不只看状态码）——零投递可判，
+        // 结束本轮 timer、ID 让位，解锁可再按（新动作新 ID）。
+        clearMyDeadline(submitGen);
+        retireAnchor(submitGen, myGen);
         const reason = typeof e.data?.reason === "string" ? e.data.reason : e.message;
         setError(i18n.t("mobile.codex.pending.failed", { message: reason }));
         return;
@@ -431,32 +563,130 @@ export default function PendingRequestCard({
       // 处理后返回 504——不换 ID、不解锁重投（新 ID 重按 = 双投窗口，S5），改用
       // fetchCodexAction 只读核对原 action，按查询结果呈现（R12/C5）。
       setVerifying(true);
+      const controller = new AbortController();
+      const verifyTimer = window.setTimeout(() => controller.abort(), 10_000);
       try {
-        const view = await fetchCodexAction(actionId);
+        // H11：真正的只读核对端点（消费迟回执／保证投影新鲜；≤10s、零发送）。
+        const view = await verifyCodexAction(actionId, controller.signal);
         if (stale()) return;
-        const confirmed = actionViewToReceipt(actionId, view);
-        if (confirmed !== null) {
-          // 账本终态（accepted/rejected）= 结果核对完成：按查询结果呈现（与 200
-          // 回执同口径），ID 让位
-          submitActionIdRef.current = null;
+        if (view.outcome === "delivered") {
+          retireAnchor(submitGen, myGen);
+          const confirmed: ActionReceipt = {
+            actionId,
+            delivery: "accepted",
+            route: "desktop_ipc",
+            turnId: view.turnId,
+            envelopeId: null,
+            reasonCode: view.reasonCode,
+          };
           setReceipt(confirmed);
-          setPicked({});
-          setFreeTexts({});
+          clearDraftsOwned(submitGen, myGen, draftVersion, "secret");
+          onReceipt?.(confirmed);
+        } else if (view.outcome === "accepted_unbound") {
+          // N11：受理未确认——保留锚与核对入口，不清整表。
+          const confirmed: ActionReceipt = {
+            actionId,
+            delivery: "accepted",
+            route: "desktop_ipc",
+            turnId: view.turnId,
+            envelopeId: null,
+            reasonCode: view.reasonCode,
+          };
+          setReceipt(confirmed);
+          setOutcomeUnknown(true);
+          onReceipt?.(confirmed);
+        } else if (view.outcome === "not_delivered" && view.stage === "settled") {
+          retireAnchor(submitGen, myGen);
+          const confirmed: ActionReceipt = {
+            actionId,
+            delivery: "not_sent",
+            route: "none",
+            turnId: null,
+            envelopeId: null,
+            reasonCode: view.reasonCode,
+          };
+          setReceipt(confirmed);
           onReceipt?.(confirmed);
         } else {
-          // 未终态（queued/reserved/unknown）/已取消：结果未知——保持锁定（绝不
-          // 自动重试），等新投影换代重置
+          // unresolved / 仍在途：结果未知——保留 ID/草稿，可再次核对（不重发）。
           setOutcomeUnknown(true);
         }
       } catch {
         if (stale()) return;
-        // 查不到/核对查询自身失败：结果未知——保持锁定（ID 保留，核对未完成）
+        // 核对超时/失败：结果未知——保留 ID/草稿，可再次核对。
         setOutcomeUnknown(true);
       } finally {
+        window.clearTimeout(verifyTimer);
         if (!stale()) setVerifying(false);
+        clearMyDeadline(submitGen);
       }
     } finally {
       if (!stale()) setBusy(false);
+    }
+  };
+
+  /** H11：Unknown 后**再次只读核对**（不重发、不换 ID；≤10 秒有界）。 */
+  const reverify = async () => {
+    const actionId = submitActionIdRef.current;
+    if (!actionId || verifying) return;
+    setVerifying(true);
+    const myGen = generationRef.current;
+    const mySubmit = ++submitGenRef.current;
+    const draftVersion = draftVersionRef.current;
+    const stale = () => generationRef.current !== myGen || submitGenRef.current !== mySubmit;
+    const controller = new AbortController();
+    const timer = window.setTimeout(() => controller.abort(), 10_000);
+    try {
+      const view = await verifyCodexAction(actionId, controller.signal);
+      if (stale()) return;
+      if (view.outcome === "delivered") {
+        retireAnchor(mySubmit, myGen);
+        const confirmed: ActionReceipt = {
+          actionId,
+          delivery: "accepted",
+          route: "desktop_ipc",
+          turnId: view.turnId,
+          envelopeId: null,
+          reasonCode: view.reasonCode,
+        };
+        setReceipt(confirmed);
+        setOutcomeUnknown(false);
+        clearDraftsOwned(mySubmit, myGen, draftVersion, "secret");
+        onReceipt?.(confirmed);
+      } else if (view.outcome === "accepted_unbound") {
+        // N11：受理未确认 → 保留锚与核对入口（不宣称已解决、不清整表）。
+        const confirmed: ActionReceipt = {
+          actionId,
+          delivery: "accepted",
+          route: "desktop_ipc",
+          turnId: view.turnId,
+          envelopeId: null,
+          reasonCode: view.reasonCode,
+        };
+        setReceipt(confirmed);
+        setOutcomeUnknown(true);
+        onReceipt?.(confirmed);
+      } else if (view.outcome === "not_delivered" && view.stage === "settled") {
+        retireAnchor(mySubmit, myGen);
+        const confirmed: ActionReceipt = {
+          actionId,
+          delivery: "not_sent",
+          route: "none",
+          turnId: null,
+          envelopeId: null,
+          reasonCode: view.reasonCode,
+        };
+        setReceipt(confirmed);
+        setOutcomeUnknown(false);
+        onReceipt?.(confirmed);
+      } else {
+        setOutcomeUnknown(true);
+      }
+    } catch {
+      if (!stale()) setOutcomeUnknown(true);
+    } finally {
+      window.clearTimeout(timer);
+      if (!stale()) setVerifying(false);
     }
   };
 
@@ -472,6 +702,7 @@ export default function PendingRequestCard({
             ? "mobile.codex.pending.titleInput"
             : "mobile.codex.pending.titleUnsupported";
   const tone = request.kind === "user_input" ? "question" : operable ? "approve" : "neutral";
+  const toneStyle = toneTokens(tone);
 
   return (
     <InteractiveCard
@@ -511,6 +742,41 @@ export default function PendingRequestCard({
         </p>
       )}
       {request.reason && <p className="mt-1 text-xs text-[var(--mut)]">{request.reason}</p>}
+      {staleDraft && operable && !locked && (
+        <div
+          data-testid="codex-pending-stale-draft"
+          className="mt-1 flex items-center justify-between gap-2 rounded-lg bg-amber-500/10 px-2 py-1 text-xs text-amber-800 dark:text-amber-300"
+        >
+          <span>{i18n.t("mobile.codex.pending.staleDraft")}</span>
+          <button
+            type="button"
+            data-testid="codex-pending-restore-draft"
+            onClick={() => {
+              // N14：只恢复**当前仍存在且非 secret** 的题；旧 secret 永不回填。
+              const ids = new Set(request.questions.map((q) => q.id));
+              const secret = new Set(request.questions.filter((q) => q.isSecret).map((q) => q.id));
+              setPicked((prev) => {
+                const next = { ...prev };
+                for (const [id, labels] of Object.entries(staleDraft.picked)) {
+                  if (ids.has(id) && !secret.has(id)) next[id] = labels;
+                }
+                return next;
+              });
+              setFreeTexts((prev) => {
+                const next = { ...prev };
+                for (const [id, text] of Object.entries(staleDraft.free)) {
+                  if (ids.has(id) && !secret.has(id)) next[id] = text;
+                }
+                return next;
+              });
+              setStaleDraft(null);
+            }}
+            className="underline"
+          >
+            {i18n.t("mobile.codex.pending.restoreDraft")}
+          </button>
+        </div>
+      )}
 
       {!operable && (
         <p
@@ -521,10 +787,22 @@ export default function PendingRequestCard({
         </p>
       )}
 
+      {multiQuestion && operable && (
+        <p data-testid="codex-pending-progress" className="mt-2 text-xs text-[var(--mut)]">
+          {i18n.t("mobile.codex.pending.progress", {
+            current: safeIndex + 1,
+            total: questionCount,
+          })}
+        </p>
+      )}
       {isInput &&
         operable &&
-        request.questions.map((q) => {
+        visibleQuestions.map((q) => {
           const sel = picked[q.id] ?? [];
+          const policy = answerPolicyOf(q);
+          const multi = policy.allowMultiple && policy.maxAnswers > 1;
+          const hasText = (freeTexts[q.id] ?? "").trim().length > 0;
+          const atLimit = multi && sel.length + (hasText ? 1 : 0) >= policy.maxAnswers;
           return (
             <div key={q.id} data-testid={`codex-q-${q.id}`} className="mt-2">
               <p className="text-xs font-medium">
@@ -533,22 +811,40 @@ export default function PendingRequestCard({
               </p>
               <div className="mt-1 flex flex-col gap-1">
                 {q.options.map((o, i) => (
-                  <label key={`${o.label}-${i}`} className="flex items-start gap-1 text-xs">
+                  <label
+                    key={`${o.label}-${i}`}
+                    className={`flex items-start gap-2 rounded-lg px-2.5 py-1.5 text-xs ${toneStyle.action}`}
+                  >
+                    <span
+                      aria-hidden="true"
+                      className={`mt-0.5 inline-flex h-4 w-4 shrink-0 items-center justify-center rounded text-[10px] font-semibold ${toneStyle.badge} ${toneStyle.title}`}
+                    >
+                      {i + 1}
+                    </span>
                     <input
-                      type="checkbox"
+                      type={multi ? "checkbox" : "radio"}
+                      name={`codex-q-${q.id}`}
                       data-testid={`codex-q-${q.id}-opt-${i}`}
                       checked={sel.includes(o.label)}
                       disabled={disabled}
                       onChange={() => {
-                        // 选项点击即选（再点取消——answers 是标签数组，支持多项）
+                        // R14：单值策略 = 选中即替换；多值策略 = 切换且不超上限。
+                        secretFlagsRef.current[q.id] = q.isSecret;
                         setPicked((prev) => {
                           const cur = prev[q.id] ?? [];
-                          return {
-                            ...prev,
-                            [q.id]: cur.includes(o.label)
-                              ? cur.filter((x) => x !== o.label)
-                              : [...cur, o.label],
-                          };
+                          if (sel.includes(o.label)) {
+                            // 单值不允许"取消到空"（radio 语义）；多值可取消
+                            return multi
+                              ? { ...prev, [q.id]: cur.filter((x) => x !== o.label) }
+                              : { ...prev, [q.id]: cur };
+                          }
+                          if (!multi) {
+                            // H13：单值 = 选项与文本互斥（选项替换文本）。
+                            setFreeTexts((prev) => ({ ...prev, [q.id]: "" }));
+                            return { ...prev, [q.id]: [o.label] };
+                          }
+                          if (cur.length + (hasText ? 1 : 0) >= policy.maxAnswers) return prev;
+                          return { ...prev, [q.id]: [...cur, o.label] };
                         });
                       }}
                     />
@@ -562,7 +858,7 @@ export default function PendingRequestCard({
                 ))}
                 {/* isOther=true 才有自由作答；isSecret 用 password 不回显。
                     isOther=false 只能选项——绝不渲染自由文本入口（服务端同样拒绝） */}
-                {q.isOther && (
+                {policy.allowFreeText && (
                   <input
                     type={q.isSecret ? "password" : "text"}
                     data-testid={`codex-q-${q.id}-free`}
@@ -572,12 +868,25 @@ export default function PendingRequestCard({
                     disabled={disabled}
                     autoComplete={q.isSecret ? "new-password" : "off"}
                     maxLength={10000}
-                    onChange={(e) =>
-                      setFreeTexts((prev) => ({
-                        ...prev,
-                        [q.id]: e.target.value.slice(0, 10000),
-                      }))
-                    }
+                    onChange={(e) => {
+                      secretFlagsRef.current[q.id] = q.isSecret;
+                      const next = e.target.value.slice(0, 10000);
+                      setPicked((prev) => {
+                        // H13：单值下输入文本 = 替代已选选项；多值下已到上限时
+                        // 不允许再新增文本（空稿也不占用名额）。
+                        if (!multi) {
+                          return next.trim().length > 0 ? { ...prev, [q.id]: [] } : prev;
+                        }
+                        if (next.trim().length > 0 && !hasText && atLimit) return prev;
+                        return prev;
+                      });
+                      setFreeTexts((prev) => {
+                        if (multi && next.trim().length > 0 && !hasText && atLimit) {
+                          return prev;
+                        }
+                        return { ...prev, [q.id]: next };
+                      });
+                    }}
                     className="rounded border border-[var(--cb)] bg-transparent px-2 py-1 text-xs focus:ring-2 focus:ring-[var(--btnp)] focus:outline-none"
                   />
                 )}
@@ -587,14 +896,17 @@ export default function PendingRequestCard({
         })}
 
       {/* 未答全提示（isInput 且可操作时） */}
-      {isInput && operable && unanswered.length > 0 && (
-        <p
-          data-testid="codex-pending-incomplete"
-          className="mt-2 text-xs text-rose-700 dark:text-rose-300"
-        >
-          {i18n.t("mobile.codex.pending.incomplete", { n: unanswered.length })}
-        </p>
-      )}
+      {isInput &&
+        operable &&
+        unanswered.length > 0 &&
+        (!multiQuestion || safeIndex === questionCount - 1) && (
+          <p
+            data-testid="codex-pending-incomplete"
+            className="mt-2 text-xs text-rose-700 dark:text-rose-300"
+          >
+            {i18n.t("mobile.codex.pending.incomplete", { n: unanswered.length })}
+          </p>
+        )}
       {writeLocked && operable && (
         <p
           data-testid="codex-pending-writelocked"
@@ -608,17 +920,51 @@ export default function PendingRequestCard({
       {operable && (
         <div className="mt-2 flex flex-wrap items-center gap-2">
           {isInput ? (
-            <button
-              type="button"
-              data-testid="codex-pending-submit"
-              disabled={disabled || !canSubmit}
-              onClick={() => {
-                void respond("answer");
-              }}
-              className="rounded-full bg-emerald-500/15 px-3 py-0.5 text-xs text-emerald-800 disabled:opacity-40 dark:bg-emerald-400/15 dark:text-emerald-300"
-            >
-              {i18n.t("mobile.codex.pending.submit")}
-            </button>
+            <>
+              {multiQuestion && safeIndex > 0 && (
+                <button
+                  type="button"
+                  data-testid="codex-pending-prev"
+                  disabled={disabled || busy || verifying}
+                  onClick={() => setQuestionIndex((value) => Math.max(0, value - 1))}
+                  className="rounded-full border border-[var(--bd)] px-3 py-0.5 text-xs"
+                >
+                  {i18n.t("mobile.codex.pending.prev")}
+                </button>
+              )}
+              {multiQuestion && safeIndex < questionCount - 1 ? (
+                <button
+                  type="button"
+                  data-testid="codex-pending-next"
+                  disabled={disabled || !currentAnswered}
+                  onClick={() =>
+                    setQuestionIndex((value) => Math.min(questionCount - 1, value + 1))
+                  }
+                  className="rounded-full bg-[var(--ac)] px-3 py-0.5 text-xs text-white disabled:opacity-40"
+                >
+                  {i18n.t("mobile.codex.pending.next")}
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  data-testid="codex-pending-submit"
+                  disabled={disabled || !canSubmit}
+                  onClick={() => {
+                    void respond("answer");
+                  }}
+                  className="rounded-full bg-emerald-500/15 px-3 py-0.5 text-xs text-emerald-800 disabled:opacity-40 dark:bg-emerald-400/15 dark:text-emerald-300"
+                >
+                  {multiQuestion
+                    ? i18n.t("mobile.codex.pending.submitAll", { count: questionCount })
+                    : i18n.t("mobile.codex.pending.submit")}
+                </button>
+              )}
+              {multiQuestion && (
+                <span className="text-[10px] text-[var(--mut)]">
+                  {i18n.t("mobile.codex.pending.groupHint")}
+                </span>
+              )}
+            </>
           ) : (
             <>
               {showApprove && (
@@ -655,7 +1001,9 @@ export default function PendingRequestCard({
                   data-testid="codex-pending-cancel-turn"
                   disabled={disabled}
                   onClick={() => {
-                    void respond("reject");
+                    // R08：终止本轮必须发 cancel（后端 Reject→decline、Cancel→
+                    // interrupt 语义）；发 reject 只会拒绝请求、回合继续。
+                    void respond("cancel");
                   }}
                   className="rounded-full bg-rose-500/15 px-3 py-0.5 text-xs text-rose-800 disabled:opacity-40 dark:bg-rose-400/15 dark:text-rose-300"
                 >
@@ -689,6 +1037,16 @@ export default function PendingRequestCard({
                 ? i18n.t("mobile.codex.pending.verifying")
                 : i18n.t("mobile.codex.pending.unknownDelivery")}
         </p>
+      )}
+      {outcomeUnknown && !verifying && hasActionAnchor && (
+        <button
+          type="button"
+          data-testid="codex-pending-verify"
+          onClick={() => void reverify()}
+          className="mt-1 text-xs text-[var(--mut)] underline"
+        >
+          {i18n.t("mobile.codex.pending.verify")}
+        </button>
       )}
     </InteractiveCard>
   );

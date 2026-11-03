@@ -4,9 +4,9 @@
 
 ## 出处
 
-- 完整实验设计与判据：兔维斯 项目 `docs/superpowers/plans/2026-09-18-phase2-m6r-windows-probe.md`
-- 实测报告与定案：`research/refs/phase2-消息注入/2026-09-18-M6R-windows注入探测报告-v2.md` + 独立评审同目录
-- 语义与源码证据：`research/refs/phase2-消息注入/2026-09-18-Windows控制台写入语义与消费墙复核.md`
+- 完整实验设计与判据：兔维斯 项目 `docs/engineering/plans/2026-09-18-phase2-m6r-windows-probe.md`
+- 实测报告与定案：`docs/research/refs/phase2-消息注入/2026-09-18-M6R-windows注入探测报告-v2.md` + 独立评审同目录
+- 语义与源码证据：`docs/research/refs/phase2-消息注入/2026-09-18-Windows控制台写入语义与消费墙复核.md`
 （非 兔维斯 环境缺这些文件时，按下方清单自足执行）
 
 ## 实验全集（E1–E13，破案按需选取；确认性探测 = 快路径 P0–P7 的超集）

@@ -1,0 +1,44 @@
+{
+  "questionItemsAtFinalRevision": 3,
+  "requestsWhileQuestionPresent": 0,
+  "rounds": [
+    {
+      "tag": "q1-trigger / q1-answer",
+      "upstreamProduced": true,
+      "answerRoute": "envelope via thread-follower-start-turn v2",
+      "cardCleared": "用户目视确认：已不待答"
+    },
+    {
+      "tag": "q2-trigger",
+      "upstreamProduced": false,
+      "note": "要求无 options 的自由文本题，模型回正文 → NOT_TRIGGERED"
+    },
+    {
+      "tag": "q3-trigger",
+      "upstreamProduced": false
+    },
+    {
+      "tag": "q3b-trigger",
+      "upstreamProduced": true
+    },
+    {
+      "tag": "q3-control-plain",
+      "route": "普通正文",
+      "cardCleared": "用户目视确认：仍待答"
+    },
+    {
+      "tag": "preexisting-14:40",
+      "note": "3 选项旧题全程挂着，本轮未代答"
+    },
+    {
+      "tag": "old-question-answer（14:40 那道三选项历史题）",
+      "upstreamProduced": true,
+      "answerRoute": "同一信封，经 thread-follower-start-turn 一次提交（19:19）",
+      "cardCleared": "用户截图确认：桌面把它渲染成「问题 + 答案」气泡（你最近最想做什么？ / 去旅行），不再待答",
+      "screenshotEvidence": "raw/screenshots/2026-10-26T1919-old-question-cleared.png（含会话正文，私有）"
+    }
+  ],
+  "idSynthesis": "questionItemId = JSON.stringify(['request_user_input_async', <agentMessage itemId>, <questionIndex>])（STATIC: app.asar compose/parse；LIVE: 按式合成后原卡清）",
+  "noUpstreamAnsweredFlag": true,
+  "newFinding_rendering": "官方客户端把应答信封**渲染为「题干/答案」气泡**：链上仍是普通 userMessage 文本，视觉上却不再是原始标记 ⇒ Tuvis 的呈现可以照此派生，判据仍是 questionItemId 配对。"
+}

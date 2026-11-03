@@ -1,0 +1,86 @@
+{
+  "case": "③ command 审批的 decline（22:0x，pending id=75）+ ④ 网络升权走哪条 pending（22:1x，id=78）",
+  "declineTest": {
+    "pending": {
+      "method": "item/commandExecution/requestApproval",
+      "id": 75,
+      "idKind": "integer",
+      "offeredWords": ["accept", "OBJ:acceptWithExecpolicyAmendment", "cancel"],
+      "declineOffered": false
+    },
+    "sent": {
+      "method": "thread-follower-command-approval-decision",
+      "version": 1,
+      "decision": "decline",
+      "deliberate": "带 --allow-unoffered 旗标，本轮唯一一次故意发未提供词"
+    },
+    "receipt": {
+      "resultType": "success",
+      "error": null
+    },
+    "effect": {
+      "sentinelFileCreated": false,
+      "commandExecutionItem": {
+        "status": "declined",
+        "exitCode": null,
+        "durationMs": null
+      },
+      "turnAfter": {
+        "status": "completed",
+        "items": ["userMessage", "reasoning", "agentMessage", "commandExecution", "agentMessage"]
+      },
+      "requestsAfter": 0
+    },
+    "conclusion": [
+      "**decline 被上游接受**（尽管不在 availableDecisions 里）——与 Windows 26.1013.4894 先例一致，说明 availableDecisions 不是硬白名单",
+      "**decline 不中止回合**（回合继续到 completed），与 cancel（回合置 interrupted）语义不同 ⇒ F04 三种词三态：accept=执行 / decline=拒绝且继续 / cancel=拒绝并中止",
+      "新投影词汇：commandExecution 条目 `status:\"declined\"`（仓内 `codex_desktop_ipc` 全模块 grep `declined` = **0 命中**，终态集合只有 completed/failed/interrupted）⇒ Tuvis 现在会把 declined 当未知状态"
+    ]
+  },
+  "permissionsTest": {
+    "trigger": "只访问本机回环端口的 curl（沙箱 networkAccess:false ⇒ 需要网络升权）",
+    "observedPending": {
+      "method": "item/commandExecution/requestApproval",
+      "id": 78,
+      "idKind": "integer",
+      "keys": [
+        "availableDecisions",
+        "command",
+        "commandActions",
+        "cwd",
+        "environmentId",
+        "itemId",
+        "kind",
+        "proposedExecpolicyAmendment",
+        "reason",
+        "startedAtMs",
+        "threadId",
+        "turnId"
+      ],
+      "proposedExecpolicyAmendmentEntries": 9,
+      "commandActionsType": "unknown",
+      "offeredWords": ["accept", "OBJ:acceptWithExecpolicyAmendment", "cancel"]
+    },
+    "finding": "网络/执行策略升权在这代 Mac 上**仍然以 command 审批出现**（带 `proposedExecpolicyAmendment` 与对象形态决策词），**不是** `item/permissions/requestApproval` ⇒ 与 Windows 夹具自述『外部读取升权走 command approval』一致，Mac 侧首次实测到同一机制",
+    "itemPermissionsRequestApproval": "仍 NOT_TRIGGERED（Mac 与 Windows 都未产生过该 pending）⇒ 不能判不支持，只能判'未观测到触发场景'；对象形态词（acceptWithExecpolicyAmendment / applyNetworkPolicyAmendment）按纪律**永不自动发**",
+    "handling": "该 pending 由**用户在桌面亲手拒绝**（涉升权，本轮不代答）",
+    "resolution": {
+      "userAction": "用户在桌面点「拒绝」（22:2x）",
+      "observed": {
+        "requestsAfter": 0,
+        "runtime": {
+          "type": "idle"
+        },
+        "turnStatus": "completed",
+        "commandExecutionItemStatus": "declined",
+        "exitCode": null
+      },
+      "conclusion": [
+        "桌面「拒绝」按钮 → 条目终态 declined 且回合继续 completed ⇒ 该按钮映射的是 decline 语义（不是 cancel）；桌面这一帧没有暴露『拒绝并中止本轮』的按钮，而手机端把 cancel 渲染成「终止本轮」，两端措辞不同但语义可对应",
+        "上游自处理（用户桌面点击）与 follower 帧处理产生完全相同的终态 ⇒ F05 收敛判据可统一为「requests[] 消失 + 条目 declined/completed」，不需区分谁处理",
+        "本轮共两个 declined 样本（id=75 由 follower 发、id=78 由用户桌面点），互为交叉验证"
+      ],
+      "evidence": "raw/last-snapshot-k-after-user-decline.json、sanitized/k-after-user-decline.json"
+    }
+  }
+}

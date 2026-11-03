@@ -53,7 +53,7 @@
 //! explorer 一处；`inject/resume.rs` 的起窗（改动前同为「三路全继承 + `spawn()`」、完全
 //! 同形）是否也曾失败**未在 Windows 真机验证**（macOS 无法执行 release GUI，本机也没有
 //! Windows 主机 / wine）。故那处收敛是**同形加固**，不是「已验证的第二处缺陷」。定案
-//! 实验与摘门条件见 `docs/superpowers/specs/2026-10-12-codex-app-form-止血门底料与摘门条件.md`。
+//! 实验与摘门条件见 `docs/engineering/specs/2026-10-12-codex-app-form-止血门底料与摘门条件.md`。
 //!
 //! # 单点纪律
 //!

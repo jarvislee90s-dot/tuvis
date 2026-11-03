@@ -23,12 +23,14 @@
 //   并**没有**调 `reveal_dir`——导出侧首次接线在本任务）——**未新增命令、未新增权限/capability、
 //   未新增依赖**。定位与落盘**必须分开报错**（`export.rs` 明文：定位失败不代表导出失败）。
 import { SETTINGS_CARD_TITLE } from "@/components/settings/typography";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { Activity, FolderOpen, RefreshCw } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { useAppTranslation } from "@/hooks/use-app-translation";
 import { usageErrMsg } from "@/components/usage/usageErrors";
+import { usageCollectVisible } from "@/lib/api/usage";
 import type {
   UsageBuckets,
   UsageCollectResult,
@@ -72,29 +74,111 @@ export function UsageStatusSection() {
   // 关闭时 `usage_dashboard` 早退成空态，与「真的没数据」在数字上完全同形（GC 7 同族的伪装）。
   // 读不到就保持 `null`（**不**猜成「已关闭」：宁可不提示，也不误报用户关掉了）
   const [switchEnabled, setSwitchEnabled] = useState<boolean | null>(null);
+  const latestDashboardRequestRef = useRef(0);
 
   // 今日口径（range=today / groupBy=tool，与浮窗第 1–2 行同口径）
-  const loadToday = useCallback(async () => {
+  const loadToday = useCallback(async (): Promise<boolean> => {
+    const requestId = ++latestDashboardRequestRef.current;
     setLoading(true);
     try {
       const d = await invoke<UsageDashboard>("usage_dashboard", {
         range: { preset: "today" },
         groupBy: "tool",
       });
+      if (requestId !== latestDashboardRequestRef.current) return false;
       setToday(d);
       setLoadError(null);
+      return true;
     } catch (e) {
+      if (requestId !== latestDashboardRequestRef.current) return false;
       // 错误态可见可重试：**不得静默回落成空态**（说明书 §P8 状态三态）
       console.error("usage_dashboard failed:", e);
       setLoadError(e);
+      return false;
     } finally {
-      setLoading(false);
+      if (requestId === latestDashboardRequestRef.current) setLoading(false);
     }
   }, []);
+
+  // 可见采集回执与 usage-collected 事件可能描述同一轮；用 collectedAt 合并两路刷新，
+  // 同时保留「事件监听尚未注册」时回执主动 loadToday 的兜底。
+  const lastCollectionRefreshAt = useRef<number | null>(null);
+  const inFlightCollectionRefreshesRef = useRef(new Map<number, Promise<void>>());
+  const refreshAfterCollection = useCallback(
+    (collectedAt: number): Promise<void> => {
+      if (
+        lastCollectionRefreshAt.current !== null &&
+        collectedAt <= lastCollectionRefreshAt.current
+      ) {
+        return Promise.resolve();
+      }
+      const inFlight = inFlightCollectionRefreshesRef.current.get(collectedAt);
+      if (inFlight) return inFlight;
+
+      const refresh = loadToday()
+        .then((committed) => {
+          // 去重水位只代表已经提交的新 dashboard；失败/被更新请求取代时允许回执重试。
+          if (committed) {
+            lastCollectionRefreshAt.current = Math.max(
+              lastCollectionRefreshAt.current ?? collectedAt,
+              collectedAt
+            );
+          }
+        })
+        .finally(() => {
+          if (inFlightCollectionRefreshesRef.current.get(collectedAt) === refresh) {
+            inFlightCollectionRefreshesRef.current.delete(collectedAt);
+          }
+        });
+      inFlightCollectionRefreshesRef.current.set(collectedAt, refresh);
+      return refresh;
+    },
+    [loadToday]
+  );
 
   useEffect(() => {
     void loadToday();
   }, [loadToday]);
+
+  // F7：分区**实际可见**（本组件只在 `visibleIds.has("usageStatus")` 时挂载）即触发一次
+  // 可见性采集——「设置页打开即采」，且未打开该分区时一个采集请求都不发。
+  //
+  // 不复用 `useUsageCollect`（它要求 React Query Provider，而本分区是纯 invoke 的验收面）：
+  // 去抖由**后端跨 WebView 的 60s 门闩**统一负责（切换其他分区 / 快速来回都不会触发二次
+  // 重型扫描），这里只负责「可见边沿 → 发一次可见性采集」。
+  // 手动按钮仍走强制手动命令（`force=true`，总是执行），两者语义互不替代。
+  useEffect(() => {
+    let mounted = true;
+    void usageCollectVisible()
+      .then((result) => {
+        // 不依赖可能尚未注册的完成事件：设置分区首采回执本身就是刷新今日账本的兜底。
+        if (mounted) return refreshAfterCollection(result.collectedAt);
+      })
+      .catch((e) => {
+        // 失败不阻塞本分区渲染：错误态由 dashboard 查询与手动按钮各自呈现（这里只记日志）
+        console.warn("[usage] 可见性采集失败：", e);
+      });
+    return () => {
+      mounted = false;
+    };
+  }, [refreshAfterCollection]);
+
+  // 后端任何**真实采集完成**（可见 / 手动 / ticker / 启动）都会发同一个完成事件：
+  // 到达即重读今日口径，让本分区数字与其它 WebView 同步（与 newRecords 无关）。
+  // `.catch(() => () => {})`：非 Tauri 环境（浏览器 / Playwright）里 `listen` 会 reject。
+  useEffect(() => {
+    const un = listen<{ collectedAt?: unknown }>("usage-collected", (event) => {
+      const collectedAt = event.payload?.collectedAt;
+      if (typeof collectedAt === "number") {
+        void refreshAfterCollection(collectedAt);
+      } else {
+        void loadToday();
+      }
+    }).catch(() => () => {});
+    return () => {
+      void un.then((unlisten) => unlisten());
+    };
+  }, [loadToday, refreshAfterCollection]);
 
   // 挂载时并发读总开关（第 5 条命令；只读设置，**不扫描**）
   useEffect(() => {

@@ -1,22 +1,21 @@
-// Task 6（计划②）· 大看板窗口与两个入口（3 用例）。
-// 判据来源：计划② Task 6 步骤 2/3/8/9/10 与「关键坑」的两条 ACL 事实。
+// Task 6（计划②）· 大看板入口（3 用例）；Task 7（2026-10-26 计划）改判：四页同窗后
+// 「打开用量详情」= 主窗导航，**任何入口都不再创建 usage-dashboard 窗口**（spec §2.3）。
 //
 //  * 用例 1 是**静态锁**（jsdom 测不出、实机只有「点了没反应」这一种征兆）：
-//    `/usage` 漏注册 pageMap ⇒ 刷新后**静默回落首页**；新窗口不在任一 capability 的 `windows`
-//    白名单 ⇒ `core:window:*` / `core:event:*` 全被 ACL 拒（标题栏三键无反应、最大化态不跟随）；
-//    宠物窗口缺 `core:webview:allow-create-webview-window` ⇒ 两个宠物侧入口**静默失败**
-//    （`createWindow` 只 console.log）。
-//  * 用例 2 断言 `createWindow` 收到的**完整 options**（窗口常量是 Task 6 步骤 2 逐字钉死的；
-//    Task 13 的浮窗入口共用同一窗口，改这里等于改那个入口的窗口）。
+//    `/usage` 兼容路由仍在 pageMap（Task 7 起为跳转适配页）；`usage-dashboard` label
+//    留在 capability 白名单（兼容保留——没有代码路径再以它建窗）；宠物窗口保留
+//    `core:webview:allow-create-webview-window`（其余子窗创建仍依赖它）。
+//  * 用例 2 断言标题栏图表键 → `workspace_request_navigation(tab="usage")` 且
+//    **零** createWindow——旧独立窗口常量（1040×720 等）就此退役。
 //  * 用例 3 只验菜单项本身的两种行为（关菜单 + 开看板各一次）与它在第一个分隔线**之前**的位置；
 //    FoxbellPet 的主题接线由既有 foxbell-*.test.tsx 的渲染用例兜底。
 import { readFileSync } from "node:fs";
 import path from "node:path";
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 const { createWindowMock } = vi.hoisted(() => ({ createWindowMock: vi.fn(async () => {}) }));
-// 入口按钮经 `openUsageDashboard` → `createWindow` 才落地；mock 掉窗口层即可断言「带什么参数」
+// 窗口层替身保留：用例 2 的判据从「带什么参数建窗」反转为「**不**建窗」
 vi.mock("@/lib/window", () => ({ createWindow: createWindowMock }));
 
 // WindowFrame/TitleBar 依赖 Tauri 窗口 API，jsdom 下全 mock（与 petSettings/toolManagement 同模式）
@@ -37,6 +36,7 @@ vi.mock("@tauri-apps/api/event", () => ({
 import i18n from "@/i18n";
 import { MainTitleBar } from "@/components/common/main-title-bar";
 import { PetMenu } from "@/components/pet/PetMenu";
+import { tauriInvokeMock } from "../msw/tauriMocks";
 
 beforeAll(async () => {
   await i18n.changeLanguage("zh");
@@ -68,7 +68,7 @@ describe("usage-window（计划② Task 6：大看板窗口与两个入口）", 
     expect(pet?.json.permissions ?? []).toContain("core:webview:allow-create-webview-window");
   });
 
-  it("2. 标题栏入口：图表按钮在设置按钮之前，点开 1040×720 的 usage-dashboard", () => {
+  it("2. 标题栏入口：图表按钮在设置按钮之前，点击 → 主窗导航且不建窗（Task 7）", async () => {
     localStorage.setItem("tauri-ui-theme", "dark");
     render(<MainTitleBar />);
 
@@ -80,25 +80,16 @@ describe("usage-window（计划② Task 6：大看板窗口与两个入口）", 
     ).toBeTruthy();
 
     fireEvent.click(openBtn);
-    expect(createWindowMock).toHaveBeenCalledTimes(1);
-    const [label, options] = createWindowMock.mock.calls[0] as [string, Record<string, unknown>];
-    expect(label).toBe("usage-dashboard");
-    expect(options).toEqual({
-      title: "用量看板",
-      url: "/usage",
-      width: 1040,
-      height: 720,
-      minWidth: 840,
-      minHeight: 560,
-      resizable: true,
-      maximizable: true,
-      minimizable: false,
-      decorations: false,
-      transparent: true,
-      shadow: false,
-      parent: "main",
-      theme: "dark",
+    // Task 7：唯一入口 = workspace_request_navigation（Rust 唤醒主窗 + 切模型用量页签）
+    await waitFor(() => {
+      const navCalls = tauriInvokeMock.mock.calls.filter(
+        ([cmd]) => cmd === "workspace_request_navigation"
+      );
+      expect(navCalls).toHaveLength(1);
+      expect((navCalls[0] as [string, Record<string, unknown>])[1]).toEqual({ tab: "usage" });
     });
+    // 旧独立窗口彻底退役：零建窗
+    expect(createWindowMock).not.toHaveBeenCalled();
   });
 
   it("3. 宠物菜单项：点「📊 用量看板」先关菜单再开看板（各一次）", () => {

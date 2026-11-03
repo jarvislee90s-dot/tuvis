@@ -1,4 +1,4 @@
-# Changelog
+﻿# Changelog
 
 English · [中文](CHANGELOG.md)
 
@@ -7,7 +7,7 @@ English · [中文](CHANGELOG.md)
      ② 版本标题 `## [x.y.z] - YYYY-MM-DD`、分区顺序与条目顺序同中文版逐条对齐；
         分区名用英文（`Engineering` 对应中文版「工程」）；
      ③ 未译条目不留占位——直接不写（网站英文页按「仅列已译版本」展示）；
-     ④ 新增版本时两份文件同批更新（发版文档纪律见 docs/RELEASE.md）；
+     ④ 新增版本时两份文件同批更新（发版文档纪律见 docs/operations/RELEASE.md）；
      ⑤ 网站（tuvis-website）构建时按双源同步：本文件 → 英文站，CHANGELOG.md → 中文站。 -->
 
 _Only versions translated so far are listed here; the full history lives in the
@@ -215,7 +215,187 @@ _Only versions translated so far are listed here; the full history lives in the
   (`tests/remote/zcodeBridgeRelay.test.ts`), and the `scripts/zcode-bridge-probe` skeleton;
   all forensic/test assets, no product behavior change.
 
-## [0.6.2] - Unreleased
+## [0.6.4] - 2026-11-02
+
+### Upgrade notes
+
+- **Legacy pause exception**: pause rows without a target-turn binding remain paused and require explicit resume. Automatic relay applies only when the target turn can be checked for terminal evidence.
+
+- **Adaptive session refresh**: active sessions use roughly 2-second scans, watched or remotely connected idle sessions roughly 10 seconds, and eligible away states roughly 30 seconds. Running tools without reliable event coverage retain the 10-second fallback. Existing settings need no migration.
+- **Background usage collection no longer depends on an open page**: visibility triggers collection with short-window deduplication; background deadlines use the configured interval plus a two-minute buffer (12 minutes by default). Manual collection remains available.
+
+- **The queue now relays automatically** — a queue frozen by an interrupt/cancel resumes in its original order as soon as the stopped turn is confirmed finished (matching Codex's own behaviour). It stays frozen only when that turn never reaches a confirmed end.
+- **"Send first" (prioritise) no longer requires a paused queue** — even on an unpaused queue it stops the running turn, then sends that one message; when the desktop is idle it sends straight away.
+- **Messages sent while paused are queued instead of rejected** — no more "queue is paused, send failed". They join the queue with a position and can be prioritised or sent on resume.
+- **Legacy "delivery outcome unknown" records no longer freeze the whole queue** — such a record only protects itself from automatic resend.
+
+- **WorkBuddy subagent history is backfilled automatically** on first collection. If a JSONL with an existing cursor is truncated/rewritten, that round reports an error and preserves the old ledger for a future file-scoped rebuild; it never clears the whole ledger.
+
+### Added
+
+- **Shared scan bus and adaptive refresh**: the main window, pet, tray and phone reuse one versioned session snapshot. Activity, visibility and remote connectivity set the cadence; file events can wake scans early, reducing duplicate process and session scans.
+
+- **Queue prioritise and re-edit**: each queue row shows position, a body preview, the character count, and Prioritise / Edit again / Retract. Prioritise (two-step confirm) stops the target turn when running, confirms its end, then sends that single message while the rest stay paused. Edit again restores the original text only after the server confirms retraction, and asks before replacing an existing draft.
+- **Combined sending when idle**: once the current turn ends naturally or the queue is explicitly resumed, consecutive queued messages from the same device and conversation are sent together in their original order separated by a blank line. Oversized content is split into batches; an unknown result asks you to verify the whole batch.
+- **Consolidated queue area**: pause explanation, resume entry and blocked reason now live in the queue area, collapsed to a one-line summary; the summary distinguishes "waiting for the turn to finish" from a genuine "needs manual check".
+- **Compact async question cards** with a single "other groups" entry.
+
+### Fixed
+
+- **Cards returning after dismissal, reading or archiving**: single, batch, pet, jump and mobile actions share settlement. Post-write scan epochs and version arbitration reject stale snapshots; failures and timeouts restore authoritative state while preserving other pending actions.
+- **Missed multiwindow and usage refreshes**: main and pet visibility are tracked separately. Restoring visibility triggers collection; settings use receipt-backed refresh and reject older responses. Collection is coordinated across windows, and manual collection or interval changes reschedule background deadlines.
+- **Event coverage and safe cleanup**: all active session event files are monitored. Runtime hook availability determines fallback cadence. Startup reconciliation, batching and follow-up scans preserve events; stale files are quarantined and rechecked before deletion so concurrent new events are retained.
+- **CPU sampling and dsh hot scans**: expensive process fields are limited to candidate PIDs. Per-PID cumulative CPU and independent time windows separate status sampling from display updates; one exiting candidate does not discard other valid samples. dsh caches generation paths and deduplicates unchanged unknown-generation warnings.
+- **WorkBuddy deletion and read lifecycle**: deleted state is respected by the board, unread pool and compensation. Read DB-only completed cards remain absent until new activity; failed first-green writes retry within the current completion turn without duplicate notifications or stale read-state suppression.
+
+- **Async answering wrongly disabled on newer Desktop builds**: contract detection now verifies structure and reference relationships instead of minified variable names, so renames no longer disable it while real protocol changes are still refused.
+- **Formal answers with trailing whitespace kept questions pending**; they now reconcile correctly.
+- **A delivered message reported as "unknown"**: when the desktop echoes its own message id but the turn contains exactly one message whose body matches what was sent, it is treated as delivered (ambiguous or cross-turn matches remain unknown).
+- **The queue not resuming after a stop**: once the interrupted turn reaches a terminal state, the queue relays automatically.
+- **Stop/prioritise timing**: a stop that has been accepted but whose state frame has not arrived yet no longer fails immediately — a 3-second window followed by a 4-second grace period is applied first.
+- **Stale pause/barrier records accumulating**: terminal release now clears every barrier on the thread that has terminal evidence, and a successful prioritise no longer locks out the next one.
+- **Capability display flicker across reconnects**: the handshake ticket is now an updateable, consumable generation ticket, and inherited display is only trusted after verifying the package content SHA.
+- **Stop idempotency**: a stop attempt is persisted before the first possible write, so cancellation or crash windows cannot emit a second interrupt.
+
+- **WorkBuddy 5.9.3 subagent usage was under-collected**: enumerate and incrementally read `subagents/agent-*.jsonl` with a cursor per file; subagents are recorded as their own sessions (`is_subagent=1` + parent UUID), tokens count toward totals while session/turn counts stay parent-only; history is backfilled on first read and parent numbers remain unchanged.
+- **WorkBuddy cards disappeared when the heartbeat froze**: presence is now file + live pid + matching sessionId even when the heartbeat is written only once; `working` stays Processing, while completed / DB-only cards use the 300-second fallback. The old 90-second freshness filter is removed.
+- **WorkBuddy completion unread and notifications**: normal completion produces an unread row immediately; a stale leftover heartbeat waits 300 seconds. Notification freshness uses a dedicated turned-green time so a restart/compensation notice is not suppressed by old parent business activity.
+- **WorkBuddy file-lookup permission failures**: usage collection uses strict lookup; permission/IO/directory-enumeration failures surface as `usage-source-io` instead of "no usage"; fallback scanning follows symlinked project directories.
+- **WorkBuddy subagent identity collisions**: inline, degraded and cached identities are all validated, including deleted historical main sessions; degraded IDs use the `workbuddy-subagent:<file_key>` namespace so a parent or another main session is never marked as a subagent.
+- **WorkBuddy rescan duplicate accounting**: when a file with an existing cursor is truncated/rewritten, the round refuses additive writes and preserves the old ledger/cursor; the error points to a future file-scoped rebuild instead of silently re-reading from zero.
+
+### Engineering
+
+- The scanner now owns single-flight admission, initial successful snapshot waiting, action refresh deadlines, panic recovery, poisoned process-snapshot rebuilding and worker-generation execution rights. In-flight slow scans are not forcibly restarted.
+- Added runtime identity, reason counters, failure backoff, restart and wait metrics, atomic stats files, and stable-process-tree measurement tools. Historical or simulated results are not presented as measurements of this release.
+- **One maintained capability matrix**: `docs/capabilities.json` generates both READMEs, and the website reads the matching application tag. Drift checks keep support states, cell details and the Codex CLI/APP note aligned.
+
+- WorkBuddy pending-unread retry snapshots now survive restarts with platform atomic replacement and `.bak` fallback; failed loads retry and cannot overwrite the old snapshot before loading completes. Windows uses `ReplaceFileW`/`MoveFileExW`.
+- Added WorkBuddy identity/lookup regressions: deleted main sessions stay reserved, symlinked directories are followed, permission recovery works, and cached conflicts are refused.
+- Added the missing `signature_applied` column to `codex_send_batch_members` for libraries created before it existed (idempotent, legacy rows default to unsigned).
+- Queue pause rows gained `pause_turn_id`, binding the stopped turn so terminal evidence can release them automatically.
+- Merged two barrier predicates that had the same meaning but different criteria into one parameterised predicate.
+
+## [0.6.3] - 2026-10-28
+
+### Upgrade notes
+
+- **Codex Desktop adaptive control is now the main path**: Codex Desktop actions are gated **per operation by contract evidence**, not by a whole-build allowlist. Unknown Desktop builds enable auto-adapt by default and attempt plain sends under target/state/protocol guards; destructive actions (interrupt, approvals) remain behind a read-only probe and evidence gates. Desktop sessions never fall back to headless; unsupported actions stay closed with a stated reason.
+- **Queue pause is protection, not a fault**: after an interrupt/cancel the outgoing queue stays paused until you explicitly choose "Resume queue" or "Send this one first"; an ordinary refresh never deletes an old pause.
+
+### Added
+
+- **Codex Desktop adaptive control (0.6.3 flagship)**: plain messages, blocking Q&A (multi-question / multi-value / free text), command and file approvals (accept / decline / cancel the turn), targeted interrupt, and idle async answers are unlocked per operation. Uncertain contracts close the action with a reason — no guessing, no blind sends. The phone exposes adaptation details with evidence sources and an auto-adapt switch.
+- **Grouped async questions: one card, one submit**: questions from the same source share a card; previous/next keeps drafts and the last question submits the whole group once. Answered groups close automatically and do not return after refresh. Options and free text are mutually exclusive; a restored draft never submits an answer that is not visible.
+- **Red approvals / blue questions, effective-card dock, queue-pause notice**: approval and question cards are visually distinct; only currently answerable groups or groups with a local action stay docked, the rest collapse to one row; pause/resume entries and reasons are shown in place.
+
+- **Output Speed dual-metric page (same-window four tabs)**: the main window gains an "Output Speed"
+  tab — a combined "tool · model · channel" list on the left (search / filter by tool / sort by
+  name, speed or session count, ascending or descending) and a large chart plus four metric tiles on the right
+  (current-mode speed / avg first-token wait / total time / total tool time). Four switchable
+  ranges (15 min / 1 h / 5 h / 24 h — 5 h by default) bucket by the local wall clock with
+  completion attributed to `(from, to]` and clipped edge buckets; hover for a bucket reading,
+  click to pin a snapshot (rolling-window refreshes never wash out a pin or a hover), empty
+  buckets are never drawn as 0 or estimated, and broken measured lines get a gray dashed
+  connector only (legend: "dashed connects only, no samples"). **Two independent metrics**:
+  stream output speed (TPS, 1000 × Σ streamed output ÷ Σ generation ms) and response throughput
+  incl. waiting (tokens/s, 1000 × Σ response output ÷ Σ response ms including waiting), each
+  with independent validity and its own n, aggregated as Σ/Σ; the six native sources
+  (DSH / ZCode / Kimi / WorkBuddy Mac / Claude / OpenCode) each cover a valid subset of both,
+  with capabilities labeled honestly at the source level. **Codex joins with log-approx response
+  throughput** — log input/generation boundaries aligned by native response IDs (prominently
+  labeled "incl. waiting · log-approx"); its stream generation window and per-response
+  first-token latency stay unavailable (the matching tile shows "—", never a turn-level
+  stand-in). Total tool time counts only reliably attributed values (most sources currently
+  show "—"; the usage page's original work-activity statistics are unaffected). Ranges query and
+  aggregate raw facts from the last 24 hours with no early down-sampling; collection runs about
+  every 5 s while visible and about every 600 s in the background, and queries never trigger
+  source scans or benchmark requests. This entry **supersedes** the "Recent TPS short-window
+  sampling (standalone block)" entry below: the standalone block is replaced by this page, and
+  Codex changes from "no TPS in this version" to log-approx response throughput; the sampling
+  principles (not full coverage, gaps never drawn as 0, one-click setup with a natural restart)
+  carry over.
+
+- **WorkBuddy string-number compatibility and old-cursor recovery**: when the total/ttft/completion
+  fields of WorkBuddy Mac's qua.end records are integer strings, the old parser skipped the whole
+  source — they are now accepted through unified number normalization (empty / boolean /
+  non-integer / NaN / overflow are rejected and diagnosed per field, never defaulted to 0 and
+  never routed through floats); after the upgrade, an EOF cursor written by an older version
+  triggers one **bounded 24-hour recovery** (batched checkpoints, stable-key dedup, facts and
+  cursor committed in one transaction, failed batches advance nothing, and only new bytes are
+  read once recovery completes) — speed facts only; the old token/cost ledger and other sources
+  are untouched.
+
+- **Codex response observation**: Codex subscription-log records carrying a native `response_id`
+  and integer `output_tokens` are now parsed into waiting-inclusive response observations under
+  "same-response association" (deduplicated once per host across files / copied history;
+  interleaved tool and generation items, failures/cancellations and unattributable fragments
+  produce nothing, and whole-turn durations never fill holes); incremental reads advance a
+  per-file byte cursor plus pending boundaries in one transaction, at most 200 observations per
+  batch, with per-source read/parse budgets; auth is never read, model / API / gateway
+  configuration is never changed, and no model process is started to produce readings.
+
+- **Recent TPS short-window sampling (standalone block)**: the usage dashboard gains a standalone
+  "Recent TPS" block — a sampled-throughput curve for the last 2 min / 10 min / 1 h / today, plus
+  "Latest completed call" / "Latest turn" sample metrics (sample model time / tool-call time /
+  avg first token / TPS) and per-source states. Each point takes only valid calls **completed**
+  within the 120 seconds before it (at most 20 per curve), with point TPS =
+  1000 × Σ output tokens ÷ Σ generation ms; sampling is not full coverage, gaps are never drawn
+  as 0, nothing is interpolated, the x-axis is the actual sampling time, only the last 24 hours
+  are kept, and no multi-day TPS is offered. Everything is on-device sampling — **no benchmark
+  requests are ever sent** — and "Refresh" only reads existing facts; the TPS range is fully
+  independent of the token/cost ranges. First-version sources: ZCode / dsh / Kimi (native
+  read-only, following the usage master switch), Mac WorkBuddy, Claude (native-event-approx
+  after a one-time statistics setup) and OpenCode (observer plugin); **Codex has no TPS in this
+  version** (no reliable per-call generation window — honestly marked in the source states), and
+  the WorkBuddy Windows route produces no TPS yet (insufficient evidence). **Upgrade notes**:
+  Claude and OpenCode require a **one-click install** of the statistics config / observer plugin
+  inside the "Recent TPS" block and a **natural restart** of the respective tool (Tuvis never
+  restarts your Harness for you); installs never touch API/auth/provider configuration,
+  sensitive telemetry headers show masked values only, and uninstalling handles only Tuvis's own
+  entries while your later edits are kept and reported.
+
+- **Optional share-image modules**: the export settings dialog gains an "Image modules" block —
+  group distribution is a multi-select over the four dimensions (by tool / project / provider /
+  model, one Top-6 section per selected dimension); "API equivalent cost" (estimated total + top
+  rows) and "Work summary + pet speech bubble" (tools grid + portrait/bubble) toggle
+  independently; the overview + trend chart are **always included and cannot be turned off**.
+  Choices are saved as soon as checked, remembered in this device's browser localStorage only,
+  and affect the exported image only — the "Copy text" summary is unchanged.
+
+- **Orientation-aware default layout on the mobile page**: the remote session detail
+  now picks its default view by viewport aspect ratio — wider than 1.2× the height
+  (landscape) opens with messages on the left and the file pane on the right, while
+  portrait and near-square viewports default to the chat-only view. Rotating or
+  resizing re-evaluates once; the four layouts (messages only / file only /
+  side-by-side / stacked) stay manually switchable from the split bar. The default
+  layout when opening a file in portrait is unchanged, and while a file is open in
+  full-screen reading mode, rotating or resizing keeps it full-screen.
+
+### Changed
+
+- **Usage record cards gain a header and request counts**: each tool card on the Records tab now has a three-column header (provider display name / tokens / requests), shows the **request count** to the right of tokens on every row, and adds a totals row (token and request totals) at the bottom.
+- **Output speed page polish**: the detail series name became a dropdown that switches the selected series directly; hovering a list row shows the full series name **instantly** (no more native-title delay); the "Total tool time" tile explains on hover why it reads "—" (tool time cannot yet be attributed to a single model call, never zero-filled; all-tool totals live in Usage → Work activity).
+- **Main window default size is now 900×750** (minimum still 800×600): the landscape ratio keeps the speed page's list and chart side by side without squeezing, and the usage board scrolls vertically for browsing.
+- **Main-window four-tab navigation and unified desktop theme**: the main window is reorganized
+  into four top-level tabs — Messages / Resources / Usage / Output Speed (Messages by default;
+  Settings keeps its own standalone window and entry). Switching pages keeps each page's state
+  and never stops session monitoring or notifications; **the standalone usage-window entries are
+  folded into a tab** — the former title-bar usage button, the pet minibar's "Details »" and the
+  tray "Details" entry now wake the main window and select the Usage tab (no usage-dashboard
+  window is created anymore), and legacy entries such as `/usage` keep compatibility redirects;
+  the desktop theme is unified (light = pure-white base with the original blue-violet accent,
+  dark = cool-graphite base with indigo/violet accents — revised from flat fog-silver after
+  device feedback; restrained glass on navigation and dropdown overlays only, dialogs are now
+  solid cards, with solid fallbacks when the system asks for reduced transparency or the
+  engine lacks backdrop-filter; mobile, pet transparent surfaces and share-image layouts stay
+  independent). **Upgrade notes**:
+  after upgrading, reach Usage and Output Speed from the main window's tabs; the cross-window
+  detail entries change from "opens a new window" to "wakes the main window and selects the tab".
+
+- **Codex APP compatibility is evidence-per-operation**: shipped / current-package contract match / local observed success replace whole-build registration. Unknown builds still send only under target/state/protocol guards, and destructive actions do not turn on with auto-adapt by default.
+
+## [0.6.2] - 2026-10-26
 
 ### Upgrade Notes
 
@@ -226,6 +406,67 @@ _Only versions translated so far are listed here; the full history lives in the
   back to the system language once — pick your language again and it sticks
   (no longer overridden by system-language changes). Users who never switched
   manually will notice no difference.
+- **Compatibility path for unknown Codex desktop builds (experimental) is on by
+  default**: unknown Desktop builds used to be a flat "not unlocked". The mobile
+  app now defaults to "Compatibility sending (experimental)" for them and runs an
+  automatic **read-only probe** first (15-second server-side hard cap, evidence
+  via the bundled schema) before unlocking send/status — while the probe runs the
+  UI only shows a "probing" skeleton and never concludes "not unlocked" up front.
+  Disable "Compatibility sending" in Settings if you do not want it. Destructive
+  capabilities such as interrupt and approvals are not part of the default and
+  remain evidence-gated.
+
+### Added
+
+- **Compatibility path for unknown Codex desktop builds (experimental)**: mobile
+  capabilities are reported honestly via a three-state badge — **verified** (that
+  Desktop build has real-device evidence), **compatibility sending (experimental)**
+  (unknown builds: send/status on by default; destructive capabilities such as
+  interrupt and approvals remain evidence-gated), and **locked** (the server
+  explicitly states it is unavailable). The compatibility path ships with the
+  read-only probe and "probing" skeleton; Settings offers a "Compatibility sending
+  (experimental)" switch with the risk note (messages may be delivered to the
+  wrong session — use at your own risk).
+- **UI language auto-follow**: the desktop app follows the system language by
+  default and tracks system-language changes live; a manual choice always wins
+  and is no longer overridden. The phone's UI language is delivered from the
+  desktop and can be overridden on the phone (manual choice wins).
+- **Stop the Codex desktop turn from the phone**: while a desktop turn keeps running, the mobile outgoing-queue panel gains a "Stop the desktop turn & continue" action — it interrupts the turn currently running in desktop Codex, and **work that turn has not finished is lost** (the confirmation says so before anything is sent); once the turn stops, the queue continues on its own. Verified on macOS `26.1013.40934`; other Desktop builds are unverified and stay disabled.
+
+### Changed
+
+- **Default README switched to English**: `README.md` is now the English version
+  (content moved in from `README.en.md`); the Chinese source-of-truth moved to
+  `README.zh-CN.md`, with language-switcher links at the top of both files. The
+  `AGENTS.md` bilingual asset table, project tree, and the README pin in the
+  `usage-partial-coverage-lock` test were updated accordingly.
+- **README facade rewrite and dual community channels**: both READMEs were rebuilt as
+  facade pages (hero trio, feature table linking into the manual, a 2×3 screenshot
+  gallery, and a community section), with the former release-level details migrated
+  into 8 chapters of the 13-chapter user manual (16 files across zh/en,
+  `docs/user-manual/{zh,en}/`); two community channels went live — QQ group
+  `1131682176` and Discord (`discord.gg/2PBUDYuD5`) — with stable links and QR images
+  checked into `docs/images/` (expiring group-QR screenshots are never inlined);
+  `AGENTS.md` gained a "documentation division of labor" discipline (facade / manual /
+  ledger responsibilities are mutually exclusive).
+
+### Fixed
+
+- **Crash when toggling remote or hot-restarting a channel (Windows)**: turning the
+  Remote Access master switch off or hot-restarting a channel could abort the whole
+  process (0xc0000409 crashes, observed three times on 2026-10-23) — the stop path of
+  the Codex APP desktop IPC spawned its shutdown from a synchronous command thread
+  with no async runtime, and the panic crossed a no-unwind WebView2 callback boundary;
+  the shutdown is now spawned via the app runtime, so toggling no longer crashes the
+  app.
+- **Updater install network fallback and honest errors**: the install layer had no
+  network fallback (the discovery layer does) — when the system proxy broke
+  mid-install, the download timed out reaching GitHub directly and only reported a
+  manifest verification failure. Installation now runs two hops: the plugin's default
+  pipeline first (10s connect timeout), then on transport-class failures a retry
+  through a no-proxy client pinning DoH-resolved addresses for github.com and both
+  release asset hosts. Errors are flattened through the full source chain, so the
+  failure toast shows the actual cause.
 
 ## [0.6.1] - 2026-10-22
 
@@ -243,18 +484,6 @@ _Only versions translated so far are listed here; the full history lives in the
 - **Separate DNS waiting from repair**: confirmed missing public records show continuous elapsed time and an estimate of around ten minutes, with automatic read-only checks and no repeated retry action. Ordinary verification no longer resets Funnel; an explicitly confirmed re-enable performs repair. Enabled macOS extensions require no further action, and a stopped backend no longer implies missing approval.
 - **macOS Tailscale installation**: the install action opens the system installer and rechecks status when Tuvis regains focus. Cancellation stays incomplete; installer failures retain exit codes and stdout/stderr instead of showing a blank error.
 - **Re-verification process hint**: while the automatic re-check runs after a channel is re-enabled, the summary shows a spinner with the expected timing (usually within a minute); it clears itself once verification passes, letting users tell normal waiting from a fault.
-
-### Added
-
-- **Stop the Codex desktop turn from the phone**: while a desktop turn keeps running, the mobile outgoing-queue panel gains a "Stop the desktop turn & continue" action — it interrupts the turn currently running in desktop Codex, and **work that turn has not finished is lost** (the confirmation says so before anything is sent); once the turn stops, the queue continues on its own. Verified on macOS `26.1013.40934`; other Desktop builds are unverified and stay disabled.
-
-### Changed
-
-- **Default README switched to English**: `README.md` is now the English version
-  (content moved in from `README.en.md`); the Chinese source-of-truth moved to
-  `README.zh-CN.md`, with language-switcher links at the top of both files. The
-  `AGENTS.md` bilingual asset table, project tree, and the README pin in the
-  `usage-partial-coverage-lock` test were updated accordingly.
 
 ## [0.6.0] - 2026-10-21
 

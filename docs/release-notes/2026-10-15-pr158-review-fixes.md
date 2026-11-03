@@ -61,7 +61,7 @@ Rust cfg 剔除是词法扫描，不承诺完整宏展开或任意 Rust 语法�
 | 基线重算 | 修复后 `remote/attachment_fixtures.rs` 的 6 条测试夹具候选归零：50 文件/452 → **49 文件/446**；其余 49 个文件逐字不变（已与 `431f8da` 的基线逐项 diff，仅夹具一项变化），即**没有生产代码被误删出扫描面**。 |
 | Important-2：两条历史回归类别补自测 | 新增 6 条用例（33 → 39）：① 三例类型位逗号（`Result<(String,u32),String>`、`Result<String,String>`、多级嵌套泛型）；② `#[cfg(test)] mod x;` 无体声明之后的生产码必须留在面内；③ struct pattern arm 的后缀表达式（`Fixture {}.run("…")`）不结束条目；④ 真实夹具文件 `attachment_fixtures.rs` 内注码不得进生产面。 |
 | 自测判别力（变异验证） | 三个变异体逐个注入后立即还原（文件哈希校验一致）：禁用尖括号跳转 → **3 例红**；删除「`;` 先到」规则 → **1 例红**；删除 struct-pattern 后缀规则 → **1 例红**。三者此前均为存活变异体。 |
-| 文档 | `docs/I18N.zh-CN.md` 补：类型位尖括号/无体声明已入隔离用例；棘轮表述改为「**±3 行启发式命中时**请添加码」；边界段补 `concat!("码: ", "正文")` 与 JSX 文本节点两个未收集形态；注明仅入日志的中文诊断也会计入候选（口径偏保守）。 |
+| 文档 | `docs/operations/I18N.zh-CN.md` 补：类型位尖括号/无体声明已入隔离用例；棘轮表述改为「**±3 行启发式命中时**请添加码」；边界段补 `concat!("码: ", "正文")` 与 JSX 文本节点两个未收集形态；注明仅入日志的中文诊断也会计入候选（口径偏保守）。 |
 
 验证：`node scripts/check-error-codes.mjs` 绿（249 码 / 250 键 / 候选 446）；`check:i18n` 1348 键；
 `vitest run tests/lib/errorCodesGate.test.ts` **39 通过**；前端全量与 `tsc`/`lint`/`format:check` 结果见 PR 复评。

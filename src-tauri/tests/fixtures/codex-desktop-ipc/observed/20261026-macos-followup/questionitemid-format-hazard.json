@@ -1,0 +1,13 @@
+{
+  "officialSynthesis": "JSON.stringify(['request_user_input_async', itemId, questionIndex]) ⇒ 紧凑无空格",
+  "pairingRule": "客户端按 questionItemId **字符串精确相等**配对（answersByQuestionItemId），不做规范化",
+  "observedInWindow": {
+    "compactIds": 2,
+    "spacedIds": 2,
+    "note": "紧凑=上一轮 Rust 帧（桌面确认已清卡）；带空格=本轮 Python 帧（按官方算法不会命中）"
+  },
+  "example": {
+    "compact": ["[\"request_user_input_async\",\"call_8e53f56e78b9488d915ff38afadeb3d7\",0]"],
+    "spaced": ["[\"request_user_input_async\", \"call_7f0e6b0fa9e14fe588e1bc8c488e292b\", 0]"]
+  }
+}

@@ -1,0 +1,183 @@
+<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>02 · 远程端详情层定稿</title><style>body{margin:0;background:#EFEDE8;font-family:-apple-system,"PingFang SC",sans-serif}.wrap{max-width:860px;margin:0 auto;padding:28px 20px 60px}h2{font-size:20px;margin:0 0 4px;color:#1C1B18}.subtitle{font-size:13px;color:#8B897F;margin:0 0 8px}h3{font-size:15px;color:#26241F;margin:26px 0 4px}.note{font-size:12px;color:#666;line-height:1.7;margin:6px 0 0}.sec{margin-top:26px}.duo{display:flex;gap:14px;flex-wrap:wrap}</style></head><body><div class="wrap"><!-- 状态：已定稿 2026-10-05 · 底色等 Token 已对齐台账暖白纸感默认值 · 实现必须与本稿及 tool-color-ledger.md 一致 -->
+<h2>内层组件风格：对话流 / 审批卡 / 问答卡 / 文件面板</h2>
+<p class="subtitle">同一套设计语言延伸到看板以内：微暖白底、白卡细边、近黑主控、mono 代码块、语义色只做淡底徽标。分四段请逐段看。</p>
+
+<style>
+  .ph { width:100%; max-width:390px; margin:14px auto 6px; border-radius:26px; padding:14px 14px 16px; box-sizing:border-box;
+    font-family:-apple-system,"SF Pro Text","PingFang SC",sans-serif; font-size:13px; line-height:1.5;
+    background:#F8F3E9; border:1px solid #EAE2CF; }
+  .mono { font-family:ui-monospace,"SF Mono",Menlo,monospace; font-variant-numeric:tabular-nums; }
+  .sec { margin-top:34px; }
+
+  /* 详情页头部 */
+  .d-head { display:flex; align-items:center; gap:8px; padding:2px 0 10px; }
+  .d-back { width:30px; height:30px; border-radius:9px; background:#fff; border:1px solid #E4E2DC; display:inline-flex; align-items:center; justify-content:center; color:#57554D; flex:none; }
+  .d-title { font-size:15.5px; font-weight:700; color:#1C1B18; }
+  .d-sub { font-size:11.5px; color:#8F8D85; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .d-acts { margin-left:auto; display:flex; gap:6px; }
+  .d-badge { display:inline-flex; align-items:center; gap:5px; padding:3px 9px; border-radius:999px; font-size:11px; font-weight:600; background:#FEE9E5; color:#B3261E; flex:none; }
+  .d-dot { width:6px; height:6px; border-radius:50%; background:currentColor; }
+  .ibtn { width:28px; height:28px; border-radius:8px; border:1px solid #E4E2DC; background:#fff; color:#57554D; display:inline-flex; align-items:center; justify-content:center; font-size:12px; }
+  .ibtn svg { width:14px; height:14px; }
+
+  .bkm { display:flex; align-items:center; gap:8px; padding:7px 10px; border-top:1px solid #EAE2CF; border-bottom:1px solid #EAE2CF; font-size:12px; color:#6B695F; }
+  .bkm .sp { margin-left:auto; color:#A09E94; }
+
+  /* 消息流 */
+  .flow { display:flex; flex-direction:column; gap:10px; padding:12px 0; }
+  .m-user { align-self:flex-end; max-width:82%; background:#EDEBE4; border-radius:16px 16px 4px 16px; padding:8px 12px; color:#33312B; }
+  .m-asst { align-self:flex-start; max-width:92%; color:#2A2925; padding:0 2px; }
+  .m-row { align-self:stretch; display:flex; align-items:center; gap:7px; background:#fff; border:1px solid #EAE2CF; border-radius:10px; padding:7px 10px; font-size:12px; color:#55534B; }
+  .m-row .chev { color:#A09E94; font-size:10px; flex:none; }
+  .m-row .tag { flex:none; color:#8F8D85; }
+  .m-row .mono { color:#3B3A34; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .m-think { align-self:stretch; font-size:12px; color:#9B998F; display:flex; gap:7px; align-items:center; padding:0 2px; }
+
+  /* 计划卡 */
+  .plan { align-self:stretch; background:#fff; border:1px solid #E5E2D8; border-radius:12px; padding:10px 12px; }
+  .plan .lab { font-size:11px; font-weight:700; letter-spacing:.08em; color:#8F8D85; }
+  .plan p { margin:6px 0 0; font-size:12.5px; color:#2A2925; }
+  .plan .lnk { margin-top:7px; font-size:11.5px; color:#8A6D00; }
+
+  /* 审批红卡 */
+  .appr { background:#fff; border:1.5px solid #E5B9B2; border-radius:14px; padding:12px 13px; box-shadow:0 2px 10px rgba(179,38,30,.06); }
+  .appr-h { display:flex; align-items:center; gap:7px; font-weight:700; color:#B3261E; font-size:13.5px; }
+  .appr .cmd { margin-top:9px; background:#F7F6F2; border:1px solid #EAE2CF; border-radius:8px; padding:8px 10px; font-size:12px; color:#2A2925; }
+  .appr .opts { display:flex; gap:8px; margin-top:10px; }
+  .btn-p { flex:1; background:#1A1915; color:#fff; border-radius:10px; padding:9px 0; text-align:center; font-weight:600; font-size:13px; }
+  .btn-s { flex:1; background:#fff; color:#54524A; border:1px solid #DDD9CE; border-radius:10px; padding:9px 0; text-align:center; font-weight:500; font-size:13px; }
+  .appr .fn { margin-top:9px; font-size:11px; color:#B3261E; opacity:.75; }
+
+  /* 输入区 */
+  .comp { display:flex; align-items:center; gap:8px; border-top:1px solid #EAE2CF; padding-top:11px; margin-top:4px; }
+  .comp .plus { width:32px; height:32px; border-radius:50%; border:1px solid #E4E2DC; background:#fff; color:#57554D; display:flex; align-items:center; justify-content:center; flex:none; }
+  .comp .inp { flex:1; background:#fff; border:1px solid #E4E2DC; border-radius:12px; padding:8px 11px; font-size:13px; color:#B4B2A8; }
+  .comp .send { background:#1A1915; color:#fff; border-radius:11px; padding:9px 15px; font-weight:600; font-size:13px; flex:none; }
+
+  /* 问答卡 */
+  .qa { background:#fff; border:1px solid #E5E2D8; border-radius:14px; padding:13px; }
+  .qa .q { font-weight:600; color:#1C1B18; font-size:13.5px; }
+  .qa .opt { display:flex; align-items:flex-start; gap:9px; border:1px solid #E7E4DA; border-radius:10px; padding:9px 11px; margin-top:8px; font-size:12.5px; color:#3B3A34; }
+  .qa .opt.on { border-color:#1A1915; box-shadow:0 0 0 1px #1A1915; background:#FAF9F6; }
+  .qa .cb { width:15px; height:15px; border-radius:50%; border:1.5px solid #C9C6BA; flex:none; margin-top:1px; }
+  .qa .opt.on .cb { border-color:#1A1915; background:radial-gradient(circle at center,#1A1915 0 4.5px,#fff 5px); }
+  .qa .ta { margin-top:10px; border:1px solid #E4E2DC; border-radius:10px; background:#FAF9F6; padding:9px 11px; font-size:12.5px; color:#B4B2A8; }
+  .qa .hint { margin-top:8px; font-size:11px; color:#9B998F; display:flex; justify-content:space-between; align-items:center; }
+  .qa .hint b { color:#1A1915; font-weight:600; }
+
+  /* 文件面板 */
+  .fp { background:#fff; border:1px solid #EAE2CF; border-radius:14px; overflow:hidden; }
+  .fp-h { display:flex; gap:6px; padding:10px 11px; border-bottom:1px solid #F0EEE8; }
+  .seg { font-size:11.5px; padding:4px 10px; border-radius:999px; background:#F1F0EA; color:#6B695F; }
+  .seg.on { background:#1A1915; color:#fff; }
+  .fp .fr { display:flex; align-items:center; gap:8px; padding:9px 12px; border-bottom:1px solid #F4F2EC; font-size:12px; }
+  .fp .fr:last-child { border-bottom:none; }
+  .fp .path { font-family:ui-monospace,"SF Mono",Menlo,monospace; color:#2A2925; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .fp .mod { flex:none; font-size:10px; color:#B3261E; background:#FEE9E5; border-radius:5px; padding:1px 5px; }
+  .fp .ro { flex:none; font-size:10px; color:#8F8D85; background:#F1F0EA; border-radius:5px; padding:1px 5px; }
+  .fp .tm { margin-left:auto; flex:none; font-size:11px; color:#A5A29A; }
+
+  /* 双机并列 */
+  .duo { display:flex; gap:14px; justify-content:center; flex-wrap:wrap; }
+  .duo .ph { max-width:300px; margin:14px 0 0; }
+  .note { font-size:12px; color:#666; margin:8px 0 0; line-height:1.65; max-width:720px; }
+</style>
+
+<div class="sec">
+  <h3>A · 会话详情页整屏（头部 / 书签栏 / 消息流 / 审批红卡 / 输入区）</h3>
+  <p class="note">要点：用户消息改「暖灰气泡、右对齐」（现状的浅蓝与白色系打架，弃）；助手消息无气泡纯文本（对齐 Claude/Codex 阅读感）；工具调用与思考过程收成「白卡折叠行」；审批红卡是全页唯一红边卡（语义色大于品牌色——详情页内层卡不用品牌檐，品牌色只留在头部图标）；发送按钮近黑。</p>
+  <div class="ph">
+    <div class="d-head">
+      <span class="d-back"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 18l-6-6 6-6"/></svg></span>
+      <span style="min-width:0">
+        <div class="d-title">mam-worktree2</div>
+        <div class="d-sub">Codex · 修复 pet 导入路径</div>
+      </span>
+      <span class="d-acts">
+        <span class="d-badge"><span class="d-dot"></span>等待批准</span>
+        <span class="ibtn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="4" width="8" height="16" rx="2"/><rect x="13" y="4" width="8" height="16" rx="2"/></svg></span>
+        <span class="ibtn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12a9 9 0 1 1-2.6-6.4M21 3v6h-6"/></svg></span>
+      </span>
+    </div>
+    <div class="bkm">＋ 书签　·　⚙ 调试<span class="sp">过程展开 ▾</span></div>
+    <div class="flow">
+      <div class="m-user">帮我把远程看板的卡片重做一下，参考桌面端的风格</div>
+      <div class="m-asst">好的，我先看一下当前的 Board.tsx 实现。</div>
+      <div class="m-row"><span class="chev">▶</span><span class="tag">调用 Bash</span><span class="mono">grep -n "rounded" src/mobile/Board.tsx</span></div>
+      <div class="m-row"><span class="chev">▶</span><span class="tag">工具结果</span><span class="mono">12 行匹配</span></div>
+      <div class="m-think">▶ 思考过程 · 8 秒</div>
+      <div class="plan">
+        <div class="lab">计 划</div>
+        <p>1. 调整色板为微暖白 + 白卡分层　2. 重做 chips 为中性 pill　3. 状态升级为淡底徽标　4. 卡片左侧加品牌色檐。</p>
+        <div class="lnk">收起计划 ▴</div>
+      </div>
+      <div class="appr">
+        <div class="appr-h"><span class="d-dot" style="animation:pulse 1.5s infinite"></span>等待批准</div>
+        <div class="cmd mono">$ pnpm install</div>
+        <div class="opts"><span class="btn-p">允许</span><span class="btn-s">拒绝</span></div>
+        <div class="fn">未读到终端对话框选项——请再点一次「检查终端对话框」</div>
+      </div>
+    </div>
+    <div class="comp">
+      <span class="plus">＋</span>
+      <span class="inp">输入消息发送到终端…</span>
+      <span class="send">发送</span>
+    </div>
+  </div>
+</div>
+
+<div class="sec">
+  <h3>B · 问答卡（单选 / 多选 / 自由作答）</h3>
+  <p class="note">选项行即点即选（选中态 = 近黑描边 + 实心圆点，对齐终端 Review 语义）；自由作答折叠在下方，提示文案保留现有安全口径。</p>
+  <div class="ph">
+    <div class="qa">
+      <div class="q">是否启用新的配色台账管理后续新增工具？</div>
+      <div class="opt on"><span class="cb"></span><span>启用，全部工具入册管理</span></div>
+      <div class="opt"><span class="cb"></span><span>暂不启用，保持现状</span></div>
+      <div class="ta">输入你的回答…</div>
+      <div class="hint"><span>输入内容后点发送（勿在终端按回车）</span><b>发送 ↵</b></div>
+    </div>
+  </div>
+</div>
+
+<div class="sec">
+  <h3>C · 文件面板（分屏右栏 / 来源筛选 / 改写标识）</h3>
+  <p class="note">路径一律 mono；「改」徽标 = 被写类工具触达（现有 modified 字段），只读文件用中性灰标；来源筛选收成分段控件（全部 / 我上传 / 工具读取 / 工具写入）。</p>
+  <div class="ph">
+    <div class="fp">
+      <div class="fp-h"><span class="seg on">全部</span><span class="seg">我上传</span><span class="seg">工具读取</span><span class="seg">工具写入</span></div>
+      <div class="fr"><span class="path">src/mobile/Board.tsx</span><span class="mod">改</span><span class="tm mono">12:04</span></div>
+      <div class="fr"><span class="path">src/mobile/board-logic.ts</span><span class="mod">改</span><span class="tm mono">11:58</span></div>
+      <div class="fr"><span class="path">docs/engineering/architecture/design/tool-color-ledger.md</span><span class="mod">改</span><span class="tm mono">11:41</span></div>
+      <div class="fr"><span class="path">package.json</span><span class="ro">读</span><span class="tm mono">11:30</span></div>
+      <div class="fr"><span class="path">src/index.css</span><span class="ro">读</span><span class="tm mono">11:12</span></div>
+    </div>
+  </div>
+</div>
+
+<div class="sec">
+  <h3>D · 历史归档页 / 配对页（顺带对齐）</h3>
+  <div class="duo">
+    <div class="ph">
+      <div class="d-head">
+        <span class="d-back"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 18l-6-6 6-6"/></svg></span>
+        <span class="d-title">历史会话</span>
+        <span class="d-acts"><span class="ibtn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg></span></span>
+      </div>
+      <div class="flow" style="padding-top:4px">
+        <div class="m-row"><svg viewBox="0 0 20 20" style="width:17px;height:17px;flex:none"><rect width="19" height="19" x="0.5" y="0.5" rx="5" fill="#fff" stroke="#1a1a1a" stroke-width="1.3"/><path d="M5.5 12.5L9 9L5.5 5.5" stroke="#111" stroke-width="1.8" fill="none" stroke-linecap="round" stroke-linejoin="round"/><path d="M11 13H14.5" stroke="#10A37F" stroke-width="1.8" stroke-linecap="round"/></svg><span style="min-width:0;flex:1"><b style="color:#2A2925">修复 pet 导入路径</b><div class="d-sub">mam-worktree2 · 昨天 18:22</div></span><span class="btn-s" style="flex:none;padding:6px 10px;font-size:11.5px">移回</span></div>
+        <div class="m-row"><svg viewBox="0 0 20 20" style="width:17px;height:17px;flex:none"><rect width="20" height="20" rx="5" fill="#D97757"/><text x="10" y="14.5" text-anchor="middle" fill="#fff" font-size="12" font-weight="700" font-family="-apple-system">C</text></svg><span style="min-width:0;flex:1"><b style="color:#2A2925">远程看板 UI 改版</b><div class="d-sub">mam-worktree2 · 10-03 09:14</div></span><span class="btn-s" style="flex:none;padding:6px 10px;font-size:11.5px">移回</span></div>
+        <div class="m-row"><svg viewBox="0 0 20 20" style="width:17px;height:17px;flex:none"><rect width="20" height="20" rx="5" fill="#141413"/><path d="M5.5 5.5h9L6.5 14.5h9" stroke="#fff" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg><span style="min-width:0;flex:1"><b style="color:#2A2925">M4 外部全链路联调</b><div class="d-sub">MultiAgents-Manager · 10-01 22:40</div></span><span class="btn-s" style="flex:none;padding:6px 10px;font-size:11.5px">移回</span></div>
+      </div>
+    </div>
+    <div class="ph" style="text-align:center;padding-top:44px">
+      <div style="font-size:22px;font-weight:800;color:#1C1B18">兔维斯</div>
+      <div style="font-size:12px;color:#8F8D85;margin-top:4px">MultiAgents Manager · v0.9.2</div>
+      <p style="font-size:12.5px;color:#55534B;margin:18px 0 0">输入访问密码，绑定此设备（180 天免输入）</p>
+      <div style="margin:14px auto 0;width:82%;background:#fff;border:1px solid #E4E2DC;border-radius:12px;padding:11px 0;font-size:18px;letter-spacing:10px;color:#C9C6BA" class="mono">0000</div>
+      <div style="margin:14px auto 0;width:82%;background:#1A1915;color:#fff;border-radius:12px;padding:11px 0;font-weight:600;font-size:13.5px">进入看板</div>
+      <p style="font-size:11px;color:#9B998F;margin-top:26px">扫码进入时无需手动输入</p>
+    </div>
+  </div>
+</div>
+</div></body></html>

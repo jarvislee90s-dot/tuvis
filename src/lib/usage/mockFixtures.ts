@@ -11,6 +11,32 @@
 //   "unmeasured" → **没量到 token 态**（有行、计数类真值照常，四桶全零；见 zeroTokensOf）
 //   其他 / 无存档 → 正常态
 import type {
+  TpsInstallChoice,
+  TpsInstallPreview,
+  TpsInstallReceipt,
+  TpsPointsResult,
+  TpsSelection,
+  TpsSeriesKey,
+  TpsSnapshotResult,
+  TpsSourceState,
+  TpsViewRange,
+} from "@/types/tps";
+import type {
+  SpeedBucket,
+  SpeedCapabilities,
+  SpeedDashboardQuery,
+  SpeedDashboardSnapshot,
+  SpeedMetrics,
+  SpeedRate,
+  SpeedRange,
+  SpeedSeriesSummary,
+  SpeedSourceView,
+} from "@/types/speed";
+// 值导入仅限纯函数（node 上下文安全）：mock 的 series 顺序复用与后端 sort_series
+// 同语义的前端实现；selection 对位复用稳定键串。
+import { seriesKeyId, sortSeries } from "@/lib/speed/view";
+
+import type {
   UsageBuckets,
   UsageCard,
   UsageCollectResult,
@@ -1919,4 +1945,604 @@ export function mockUsageCostCsv(range: UsageRange): string {
     return cells.map(csvCell).join(",");
   });
   return [COST_CSV_HEADER, ...lines].join("\n") + "\n";
+}
+
+// ── TPS 短时抽样（2026-10-24 计划 Task 8）────────────────────────────────
+// 形状与 src/types/tps.ts / Rust 侧 commands/tps.rs 对齐；**停用态判定只认
+// snapshot.disabled**（refresh 的 reason 可能是 rate-limited，不用于停用渲染）。
+
+/** mock 系列：zcode + glm + stream-observed（channel 无 = null）。 */
+export function mockTpsSeriesKey(): TpsSeriesKey {
+  return { tool: "zcode", model: "glm-5.3-flash", channel: null, method: "stream-observed" };
+}
+
+/** 七来源的真实状态样例（detail 带机器可读 `tps-status=` 前缀；codex 缺口单列）。 */
+export function mockTpsSourceStates(): TpsSourceState[] {
+  const st = (source: string, detail: string): TpsSourceState => ({
+    source,
+    cursor: { source, value: "mock-cursor" },
+    ok: true,
+    detail,
+  });
+  return [
+    st("zcode", "tps-status=active"),
+    st("dsh", "tps-status=active"),
+    st("kimi", "tps-status=active; sdk-retry-not-visible"),
+    st("workbuddy", "tps-status=active"),
+    st("claude", "tps-status=unconfigured; tps-installed=false"),
+    st("opencode", "tps-status=unconfigured; tps-installed=false"),
+    st(
+      "codex",
+      "tps-status=insufficient-timing; insufficient-generation-timing: no reliable per-call generation window"
+    ),
+  ];
+}
+
+let tpsPreviews: TpsInstallPreview[] = [];
+
+/** 快照样例：单 series，lastCall 40 秒前（新鲜），当前回合有已采样完成部分。 */
+export function mockTpsSnapshotResult(_selection?: TpsSelection | null): TpsSnapshotResult {
+  const now = Date.now();
+  const base = {
+    modelMs: 45_200,
+    toolMs: 8_100,
+    avgFirstTokenMs: 1_230,
+    tps: 86.4,
+    sampleCount: 12,
+    ttftSampleCount: 9,
+    candidateCount: 15,
+    timedModelCount: 14,
+    timedToolCount: 6,
+    failedCount: 2,
+    cancelledCount: 1,
+    missingTimingCount: 0,
+    method: "stream-observed" as const,
+    outputScope: "providerReported" as const,
+    quality: "normal" as const,
+  };
+  return {
+    disabled: false,
+    snapshot: {
+      series: [
+        {
+          seriesKey: mockTpsSeriesKey(),
+          lastCall: {
+            ...base,
+            latestEndedAt: now - 40_000,
+            ageMs: 40_000,
+          },
+          currentTurn: {
+            ...base,
+            tps: 72.5,
+            sampleCount: 4,
+            ttftSampleCount: 3,
+            latestEndedAt: now - 12_000,
+            ageMs: 12_000,
+          },
+          latestEndedAt: now - 40_000,
+          ageMs: 40_000,
+          nullReason: null,
+        },
+      ],
+      sourceStates: mockTpsSourceStates(),
+    },
+  };
+}
+
+/** 曲线样例：近 1 小时 6 个实测点（10 分钟一颗）+ 1 个空窗 gap（不画 0）。 */
+export function mockTpsPointsResult(
+  _selection?: TpsSelection | null,
+  viewRange?: TpsViewRange | null
+): TpsPointsResult {
+  const now = Date.now();
+  const since =
+    viewRange === "2m"
+      ? now - 120_000
+      : viewRange === "10m"
+        ? now - 600_000
+        : viewRange === "today"
+          ? now - 12 * 3_600_000
+          : now - 3_600_000;
+  const base = {
+    modelMs: 45_200,
+    toolMs: 8_100,
+    avgFirstTokenMs: 1_230,
+    sampleCount: 12,
+    ttftSampleCount: 9,
+    candidateCount: 15,
+    timedModelCount: 14,
+    timedToolCount: 6,
+    failedCount: 2,
+    cancelledCount: 1,
+    missingTimingCount: 0,
+    method: "stream-observed" as const,
+    outputScope: "providerReported" as const,
+    quality: "normal" as const,
+    seriesKey: mockTpsSeriesKey(),
+    windowMs: 120_000,
+    runId: "mock-run-1",
+    trigger: "scheduled" as const,
+  };
+  const point = (minAgo: number, tps: number | null) => ({
+    ...base,
+    tps,
+    sumOutputTokens: tps === null ? 0 : 3_888,
+    sumGenerationMs: tps === null ? 0 : 45_000,
+    ttftSumMs: tps === null ? null : 11_070,
+    latestEndedAt: tps === null ? null : now - minAgo * 60_000,
+    ageMs: tps === null ? null : minAgo * 60_000,
+    pointId: `mock-${minAgo}`,
+    sampledAt: now - minAgo * 60_000,
+    status: (tps === null ? "gap" : "value") as "gap" | "value",
+    // mock 为可见态 60 秒节奏（独立复核 R11：前端按点自带节奏判缺计划点）
+    cadenceMs: 60_000,
+    sampledKeys: tps === null ? [] : ["mock-key-1", "mock-key-2"],
+  });
+  const all = [
+    point(55, 82.1),
+    point(44, 91.7),
+    point(33, null),
+    point(22, 78.4),
+    point(11, 88.9),
+    point(6, 84.2),
+    point(1, 86.4),
+  ];
+  return {
+    disabled: false,
+    knownSeries: [mockTpsSeriesKey()],
+    points: all.filter((p) => p.sampledAt > since),
+    rangeSinceMs: since,
+  };
+}
+
+export function mockTpsRefresh(): {
+  refreshed: boolean;
+  reason: string | null;
+  snapshot: TpsSnapshotResult;
+} {
+  return { refreshed: true, reason: null, snapshot: mockTpsSnapshotResult() };
+}
+
+export function mockTpsHeartbeat(args?: { visible?: boolean }): { mode: string } {
+  return { mode: args?.visible ? "foreground" : "background" };
+}
+
+/** 预览样例：一个普通键 + 一个敏感统计 header（脱敏/指纹）。 */
+export function mockTpsInstallPreview(tool?: string | null): TpsInstallPreview {
+  const resolved = tool ?? "claude";
+  const preview: TpsInstallPreview = {
+    previewId: `mock-preview-${resolved}`,
+    tool: resolved,
+    settingsPath: `/home/mock/.${resolved}/settings.json`,
+    expiresAtMs: Date.now() + 600_000,
+    entries: [
+      {
+        key: "env.TUVIS_TELEMETRY_ENDPOINT",
+        oldExists: false,
+        oldMasked: null,
+        oldFingerprint: null,
+        plannedMasked: "http://127.0.0.1:47181/v1/traces",
+        conflict: false,
+      },
+      {
+        key: "env.OTEL_EXPORTER_OTLP_HEADERS",
+        oldExists: true,
+        oldMasked: "[redacted ab12cd34ef56ab78]",
+        oldFingerprint: "ab12cd34ef56ab78",
+        plannedMasked: "[redacted 1122334455667788]",
+        conflict: false,
+      },
+    ],
+    conflictKeys: [],
+  };
+  tpsPreviews.push(preview);
+  return preview;
+}
+
+/** 应用：previewId 不在册 → 与真实现同码同 detail 前缀拒绝；回执敏感值为「已脱敏」标记。 */
+export async function mockTpsInstallApply(
+  previewId?: string,
+  choice?: TpsInstallChoice
+): Promise<TpsInstallReceipt> {
+  const hit = tpsPreviews.find((p) => p.previewId === previewId);
+  if (!hit) {
+    return Promise.reject({
+      code: "usage-settings-invalid",
+      detail: "tps-install-preview-not-found: mock preview not found",
+      reason: "preview-not-found",
+    });
+  }
+  return {
+    tool: hit.tool,
+    appliedAtMs: Date.now(),
+    choice: choice ?? "append-only",
+    entries: hit.entries.map((e) => ({
+      key: e.key,
+      oldExists: e.oldExists,
+      oldValue: null,
+      installedValue: e.key.includes("HEADERS") ? "[已脱敏]" : e.plannedMasked,
+      oldFingerprint: e.oldFingerprint,
+    })),
+    receiver: hit.tool === "claude" ? { port: 47181 } : null,
+  };
+}
+
+export async function mockTpsUninstall(): Promise<null> {
+  return null;
+}
+
+/** 测试 / 页面初始化时复位（预览在册表清空）。 */
+export function resetTpsMockState(): void {
+  tpsPreviews = [];
+}
+
+// ── V2 速度 dashboard（2026-10-26 计划 Task 9）────────────────────────────────
+// 形状与 src/types/speed.ts / Rust v2/model.rs（serde camelCase）对齐；可空字段显式 null。
+// 夹具同样遵守「未知不填 0」：n=0 ⇒ value=null，绝不冒充 0 速度；Codex 的 TTFT 不伪造。
+
+/** Codex stream 缺口 token（与 Rust v2/query.rs 的 CODEX_STREAM_GAP_REASON 逐字一致）。
+ *  注：该 token 含冒号，不能裸调 `t()` 消费（i18next 默认把 `:` 解析为命名空间分隔符）——
+ *  翻译一律走 `src/lib/speed/view.ts` 的 `translateSpeedReason`（契约层唯一合法出口，
+ *  内部已处理 nsSeparator 并对未知 token 原样降级；见 locales 的 speed.reason 节）。 */
+export const MOCK_SPEED_CODEX_STREAM_REASON = "stream-gap:insufficient-generation-timing";
+
+/** 静态能力表（与 Rust `static_capabilities` 同构：codex 是唯一 stream 缺失源）。 */
+export function mockSpeedCapabilities(source: string): SpeedCapabilities {
+  return source === "codex"
+    ? {
+        stream: false,
+        response: true,
+        streamReason: MOCK_SPEED_CODEX_STREAM_REASON,
+        responseReason: null,
+      }
+    : { stream: true, response: true, streamReason: null, responseReason: null };
+}
+
+/** 档位 → 窗长 ms（与 Rust SpeedRange::window_ms 逐字：15m/1h/5h/24h）。 */
+export function mockSpeedWindowMs(range: SpeedRange): number {
+  switch (range) {
+    case "15m":
+      return 15 * 60_000;
+    case "5h":
+      return 5 * 3_600_000;
+    case "24h":
+      return 24 * 3_600_000;
+    default:
+      return 3_600_000; // 1h（默认档）
+  }
+}
+
+/** 档位 → 桶宽 ms（与 Rust SpeedRange::bucket_width_ms 逐字：1m/5m/10m/1h）。 */
+function mockSpeedBucketWidthMs(range: SpeedRange): number {
+  switch (range) {
+    case "15m":
+      return 60_000;
+    case "5h":
+      return 10 * 60_000;
+    case "24h":
+      return 3_600_000;
+    default:
+      return 5 * 60_000; // 1h（默认档）
+  }
+}
+
+function speedRate(
+  value: number | null,
+  outputTokens: number,
+  durationMs: number,
+  sampleCount: number
+): SpeedRate {
+  return { value, outputTokens, durationMs, sampleCount };
+}
+
+/** 空指标（全零计数 + 可空位 null）：空桶不推算速度（Spec §8.3）。 */
+export function emptySpeedMetrics(): SpeedMetrics {
+  const none = speedRate(null, 0, 0, 0);
+  return {
+    stream: none,
+    response: none,
+    avgFirstTokenMs: null,
+    ttftSampleCount: 0,
+    modelMs: null,
+    toolMs: null,
+    candidateCount: 0,
+    failedCount: 0,
+    cancelledCount: 0,
+    missingTimingCount: 0,
+    sessionCount: 0,
+    latestStreamEndedAt: null,
+    latestResponseEndedAt: null,
+    outputScope: "unknown",
+    scopeMixed: false,
+  };
+}
+
+/** 七来源样本（六原生双值 + Codex 仅 response）：每条带上不同的边界形态——
+ *  kimi 混 scope、dsh 无工具时长、claude 带渠道、Codex 全套响应侧字段。 */
+export function mockSpeedSeries(now: number): SpeedSeriesSummary[] {
+  const s = (
+    tool: string,
+    model: string,
+    channel: string | null,
+    method: SpeedSeriesSummary["seriesKey"]["method"],
+    over: Partial<SpeedMetrics>
+  ): SpeedSeriesSummary => ({
+    seriesKey: { tool, model, channel, method },
+    metrics: {
+      ...emptySpeedMetrics(),
+      outputScope: "providerReported",
+      sessionCount: 3,
+      ...over,
+    },
+  });
+  return [
+    // 原生双值样板：流/响应两套独立 n + TTFT
+    s("zcode", "glm-5.3-flash", null, "stream-observed", {
+      stream: speedRate(86.4, 3_888, 45_000, 12),
+      response: speedRate(62.1, 3_888, 62_600, 10),
+      avgFirstTokenMs: 1_230,
+      ttftSampleCount: 9,
+      modelMs: 45_200,
+      toolMs: 8_100,
+      candidateCount: 15,
+      failedCount: 2,
+      cancelledCount: 1,
+      latestStreamEndedAt: now - 40_000,
+      latestResponseEndedAt: now - 52_000,
+    }),
+    // toolMs=null（工具归属不唯一 ⇒ null，不填 0）
+    s("dsh", "doubao-seed-1.6", null, "client-native", {
+      stream: speedRate(41.7, 2_100, 50_400, 6),
+      response: speedRate(33.2, 2_100, 63_200, 6),
+      avgFirstTokenMs: 2_870,
+      ttftSampleCount: 5,
+      modelMs: 50_400,
+      toolMs: null,
+      outputScope: "exclusiveOutput",
+      sessionCount: 2,
+      latestStreamEndedAt: now - 8 * 60_000,
+      latestResponseEndedAt: now - 8 * 60_000,
+    }),
+    // 混 scope：scopeMixed=true 且口径折算 unknown
+    s("kimi", "kimi-k2", null, "native-event-approx", {
+      stream: speedRate(74.9, 5_240, 69_900, 9),
+      response: speedRate(55.6, 5_240, 94_200, 9),
+      avgFirstTokenMs: 1_760,
+      ttftSampleCount: 7,
+      modelMs: 69_900,
+      toolMs: null,
+      outputScope: "unknown",
+      scopeMixed: true,
+      latestStreamEndedAt: now - 3 * 60_000,
+      latestResponseEndedAt: now - 3 * 60_000,
+    }),
+    s("workbuddy", "claude-sonnet-4-5", null, "client-native", {
+      stream: speedRate(58.3, 1_940, 33_300, 5),
+      response: speedRate(47.9, 1_940, 40_500, 5),
+      avgFirstTokenMs: 3_120,
+      ttftSampleCount: 4,
+      modelMs: 33_300,
+      toolMs: 6_400,
+      latestStreamEndedAt: now - 21 * 60_000,
+      latestResponseEndedAt: now - 21 * 60_000,
+    }),
+    // 带渠道的 series（channel 参与身份区分）
+    s("claude", "claude-sonnet-4-5", "console-proxy", "client-native", {
+      stream: speedRate(71.2, 2_730, 38_300, 7),
+      response: speedRate(58.8, 2_730, 46_400, 7),
+      avgFirstTokenMs: 2_010,
+      ttftSampleCount: 6,
+      modelMs: 38_300,
+      toolMs: 9_800,
+      latestStreamEndedAt: now - 12 * 60_000,
+      latestResponseEndedAt: now - 12 * 60_000,
+    }),
+    // 小样本（输出合计 < 50 → 前端标小样本）
+    s("opencode", "glm-4.7", null, "stream-observed", {
+      stream: speedRate(92.0, 31, 337, 1),
+      response: speedRate(61.3, 31, 506, 1),
+      avgFirstTokenMs: 980,
+      ttftSampleCount: 1,
+      modelMs: 337,
+      toolMs: null,
+      sessionCount: 1,
+      latestStreamEndedAt: now - 47 * 60_000,
+      latestResponseEndedAt: now - 47 * 60_000,
+    }),
+    // Codex：stream 无值（n=0 ⇒ null），response 有值；TTFT 不伪造（null/0）
+    s("codex", "gpt-5-codex", null, "log-boundary-approx", {
+      stream: speedRate(null, 0, 0, 0),
+      response: speedRate(41.3, 1_200, 29_000, 5),
+      avgFirstTokenMs: null,
+      ttftSampleCount: 0,
+      modelMs: 29_000, // 响应累计用时（日志近似）
+      toolMs: null,
+      outputScope: "includesReasoning",
+      sessionCount: 2,
+      latestStreamEndedAt: null,
+      latestResponseEndedAt: now - 70_000,
+    }),
+  ];
+}
+
+/** 七来源视图：状态/安装/成因 token 各覆盖一态（与 Rust resolve_source_views 的折算矩阵对应）。 */
+export function mockSpeedSourceStates(now: number): SpeedSourceView[] {
+  const view = (v: SpeedSourceView): SpeedSourceView => v;
+  return [
+    view({
+      source: "zcode",
+      status: "ready",
+      installed: true,
+      capabilities: mockSpeedCapabilities("zcode"),
+      lastRecordAt: now - 40_000,
+      reason: null,
+      detail: null,
+    }),
+    view({
+      source: "dsh",
+      status: "ready",
+      installed: true,
+      capabilities: mockSpeedCapabilities("dsh"),
+      lastRecordAt: now - 8 * 60_000,
+      reason: null,
+      detail: null,
+    }),
+    view({
+      source: "kimi",
+      status: "needs-check",
+      installed: true,
+      capabilities: mockSpeedCapabilities("kimi"),
+      lastRecordAt: now - 3 * 60_000,
+      reason: "parser-errors",
+      detail: "parser-errors=3; unparseable assistant blocks in batch",
+    }),
+    view({
+      source: "workbuddy",
+      status: "ready",
+      installed: true,
+      capabilities: mockSpeedCapabilities("workbuddy"),
+      lastRecordAt: now - 21 * 60_000,
+      reason: null,
+      detail: null,
+    }),
+    view({
+      source: "claude",
+      status: "unconfigured",
+      installed: false,
+      capabilities: mockSpeedCapabilities("claude"),
+      lastRecordAt: null,
+      reason: "not-installed",
+      detail: null,
+    }),
+    view({
+      source: "opencode",
+      status: "await-restart",
+      installed: true,
+      capabilities: mockSpeedCapabilities("opencode"),
+      lastRecordAt: null,
+      reason: "await-restart",
+      detail: null,
+    }),
+    view({
+      source: "codex",
+      status: "ready", // Codex = Ready + stream=false（能力位承载缺口，不降级整体状态）
+      installed: true,
+      capabilities: mockSpeedCapabilities("codex"),
+      lastRecordAt: now - 70_000,
+      reason: null,
+      detail: null,
+    }),
+  ];
+}
+
+/** 桶序列：满桶按本地墙钟对齐 + 首尾裁剪出部分桶；中间恰留一个全空桶（不推算速度）。 */
+function mockSpeedBuckets(range: SpeedRange, now: number, onlyResponse: boolean): SpeedBucket[] {
+  const width = mockSpeedBucketWidthMs(range);
+  const from = now - mockSpeedWindowMs(range);
+  const firstAligned = Math.floor(from / width) * width + width;
+  const spans: { startMs: number; endMs: number; isPartialBucket: boolean }[] = [];
+  if (firstAligned > from) {
+    spans.push({ startMs: from, endMs: firstAligned, isPartialBucket: true });
+  }
+  for (let start = firstAligned; start < now; start += width) {
+    const end = start + width;
+    spans.push({ startMs: start, endMs: Math.min(end, now), isPartialBucket: end > now });
+  }
+  const emptyAt = Math.floor(spans.length / 2);
+  return spans.map((span, i) => {
+    // 空桶：全零计数（value=null，Spec §8.3「空桶不推算速度」）
+    if (i === emptyAt) {
+      return { ...span, metrics: emptySpeedMetrics() };
+    }
+    // 末桶（部分桶）样本更少：边缘未满不代表覆盖缺失
+    const tail = span.isPartialBucket ? 1 : 2;
+    const step = i % 5;
+    const tokens = (480 + step * 40) * tail;
+    const response: SpeedRate = speedRate(
+      52 + step * 2.7,
+      tokens,
+      (18_000 + step * 1_000) * tail,
+      tail
+    );
+    const stream: SpeedRate = onlyResponse
+      ? speedRate(null, 0, 0, 0)
+      : speedRate(78 + step * 3.4, tokens, 15_000 * tail, tail);
+    return {
+      ...span,
+      metrics: {
+        ...emptySpeedMetrics(),
+        stream,
+        response,
+        avgFirstTokenMs: onlyResponse ? null : 1_400 + step * 90,
+        ttftSampleCount: onlyResponse ? 0 : tail,
+        modelMs: 15_000 * tail,
+        outputScope: "providerReported",
+        latestStreamEndedAt: onlyResponse ? null : span.endMs,
+        latestResponseEndedAt: span.endMs,
+      },
+    };
+  });
+}
+
+function defaultSpeedQuery(): SpeedDashboardQuery {
+  return {
+    range: "1h",
+    selection: null,
+    metricMode: "stream",
+    toolId: null,
+    search: "",
+    sort: "tool",
+  };
+}
+
+/** 速度 dashboard 样例（浏览器 mock 与 vitest 同源；`now` 可注入以便测试确定性）。
+ *  与后端 `v2/query.rs` 同口径（防 Task 10 从 mock 学到错误预期——**规格以后端为准**）：
+ *  - range 决定桶几何（1m/5m/10m/1h + 首尾部分桶）；
+ *  - toolId / search 过滤 series；search = 字面子串（后端为 SQLite LIKE：转义
+ *    `%`/`_`/`\` 后匹配、ASCII 大小写不敏感；mock 以 toLowerCase 近似，差异仅限非 ASCII）；
+ *  - **series 顺序由 sort + metricMode 决定**（复用 `view.sortSeries`，与后端 sort_series
+ *    同语义：rate 按当前模式降序、无数值排末；差异仅在并列回退的末位 method 位，后端
+ *    的回退元组不含 method）；快照**恒带双率**不裁剪——metricMode 只影响排序与前端显示；
+ *  - selection 只在筛选后的集合保留，否则回退排序第一（后端 selected_series 同款回退），
+ *    桶只为该选中 series 计算。 */
+export function mockSpeedDashboard(
+  query?: SpeedDashboardQuery,
+  now: number = Date.now()
+): SpeedDashboardSnapshot {
+  const q = query ?? defaultSpeedQuery();
+  const all = mockSpeedSeries(now);
+  // 后端 search：source/model 的字面子串（LIKE 转义通配符、ASCII 大小写不敏感）
+  const needle = q.search.trim().toLowerCase();
+  const list = all.filter((item) => {
+    if (q.toolId !== null && item.seriesKey.tool !== q.toolId) return false;
+    if (needle !== "") {
+      const hay = `${item.seriesKey.tool} ${item.seriesKey.model}`.toLowerCase();
+      if (!hay.includes(needle)) return false;
+    }
+    return true;
+  });
+  // 排序与后端 sort_series 同语义（sort + metricMode 服务端排序，前端按返回序直出）
+  const sorted = sortSeries(list, q.sort, q.metricMode);
+  // 选择：只在筛选后的 series 集保留，否则排序第一，无匹配 None（后端同款回退）
+  const selected = q.selection
+    ? sorted.find((item) => seriesKeyId(item.seriesKey) === seriesKeyId(q.selection!))
+    : undefined;
+  const bucketSource = selected ?? sorted[0];
+  const buckets: SpeedBucket[] = bucketSource
+    ? mockSpeedBuckets(
+        q.range ?? "1h",
+        now,
+        !bucketSource.metrics.stream.sampleCount && bucketSource.metrics.response.sampleCount > 0
+      )
+    : [];
+  return {
+    asOf: now,
+    rangeFrom: now - mockSpeedWindowMs(q.range ?? "1h"),
+    rangeTo: now,
+    disabled: false,
+    sourceStates: mockSpeedSourceStates(now),
+    series: sorted,
+    selectedSeries: bucketSource ? bucketSource.seriesKey : null,
+    buckets,
+  };
 }

@@ -13,6 +13,8 @@ import {
   ZCodeIcon,
 } from "@/components/icons/BrandIcons";
 
+/** chip 文字对比度纪律（Task 8，spec §3.1）：/15 品牌浅底上的文字浅色档用 -700
+ *  （≥4.5:1），深色档保持 -400/-300；图标色（iconClass）与 brandHex 语义不动。 */
 export interface AgentBadge {
   label: string;
   className: string;
@@ -41,14 +43,14 @@ export function getAgentLabel(agentType: string, form?: string): string {
 export const AGENT_BADGE: Record<string, AgentBadge> = {
   claude: {
     label: "Claude",
-    className: "border-orange-500/30 bg-orange-500/15 text-orange-400",
+    className: "border-orange-500/30 bg-orange-500/15 text-orange-800 dark:text-orange-400",
     iconClass: "text-orange-500 dark:text-orange-400",
     brandHex: "#F97316",
     Icon: ClaudeIcon,
   },
   codex: {
     label: "Codex",
-    className: "border-purple-500/30 bg-purple-500/15 text-purple-400",
+    className: "border-purple-500/30 bg-purple-500/15 text-purple-700 dark:text-purple-400",
     iconClass: "text-purple-500 dark:text-purple-400",
     brandHex: "#A855F7",
     Icon: OpenAIIcon,
@@ -64,14 +66,14 @@ export const AGENT_BADGE: Record<string, AgentBadge> = {
     label: "OpenClaw",
     // 猩红（2026-10-14 统一批：机器人图标随 ToolIcon 实物搬迁为红底，
     // 徽章 tint 由灰 harmonize 到同源红 #D2453C——台账/移动卡檐同色）
-    className: "border-red-500/30 bg-red-500/15 text-red-400",
+    className: "border-red-500/30 bg-red-500/15 text-red-700 dark:text-red-400",
     iconClass: "text-red-500 dark:text-red-400",
     brandHex: "#D2453C",
     Icon: OpenClawIcon,
   },
   kimi: {
     label: "Kimi Code",
-    className: "border-sky-500/30 bg-sky-500/15 text-sky-400",
+    className: "border-sky-500/30 bg-sky-500/15 text-sky-700 dark:text-sky-300",
     iconClass: "text-sky-500 dark:text-sky-300",
     brandHex: "#0EA5E9",
     Icon: KimiIcon,
@@ -79,7 +81,7 @@ export const AGENT_BADGE: Record<string, AgentBadge> = {
   workbuddy: {
     label: "WorkBuddy",
     // 品牌绿（官方图标参考图重绘 2026-10-14）
-    className: "border-emerald-500/30 bg-emerald-500/15 text-emerald-400",
+    className: "border-emerald-500/30 bg-emerald-500/15 text-emerald-700 dark:text-emerald-400",
     iconClass: "text-emerald-500 dark:text-emerald-400",
     brandHex: "#10B981",
     Icon: WorkBuddyIcon,
@@ -87,7 +89,7 @@ export const AGENT_BADGE: Record<string, AgentBadge> = {
   zcode: {
     label: "ZCode",
     // 品牌蓝紫（图标为官方炭灰方白 Z，tint 保留蓝紫识别色）
-    className: "border-indigo-500/30 bg-indigo-500/15 text-indigo-400",
+    className: "border-indigo-500/30 bg-indigo-500/15 text-indigo-700 dark:text-indigo-300",
     iconClass: "text-indigo-500 dark:text-indigo-400",
     brandHex: "#3B5BFD",
     Icon: ZCodeIcon,
@@ -95,7 +97,7 @@ export const AGENT_BADGE: Record<string, AgentBadge> = {
   dsh: {
     label: "DSH",
     // 品牌深蓝（DeepSeek #4D6BFE，与鲸标/移动卡檐同源；与 kimi 天蓝/zcode 蓝紫拉开）
-    className: "border-blue-500/30 bg-blue-500/15 text-blue-400",
+    className: "border-blue-500/30 bg-blue-500/15 text-blue-700 dark:text-blue-300",
     iconClass: "text-blue-500 dark:text-blue-400",
     brandHex: "#4D6BFE",
     Icon: DshIcon,

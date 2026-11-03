@@ -4,17 +4,17 @@
 `thread-stream-following-changed {following:true}` → 收 targeted snapshot → 只读
 `load-complete-history` → `following:false` → 关闭），未发送 Turn、未审批、未改设置。
 采集与脱敏由 2026-10-18 复审完成（复审报告与原始证据：
-主 checkout `docs/superpowers/reviews/evidence/2026-10-18-codex-ipc/`）。
+主 checkout `docs/engineering/reviews/evidence/2026-10-18-codex-ipc/`）。
 
 采集时安装包 `CFBundleShortVersionString=26.1013.40934`（运行主进程 2026-10-18 启动）。
 **与原缺陷报告实测的 `26.1013.31256` 不是同一 build**；两代 build 的实体级形态一致
 （原报告 2026-10-18 凌晨抓包：实体合成键 `tail:0:local:<uuid>`、turn 实体无 `type`、
 `islands.entries` 为 key/value 对象、`isComplete` 在 history 层）。
 
-| 文件 | 等级 | 说明 |
-| --- | --- | --- |
+| 文件                                   | 等级                               | 说明                                                                                                                                                                                                                                                                                                                                                                                         |
+| -------------------------------------- | ---------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `canonical-before-load.sanitized.json` | OBSERVED 形态 / SYNTHETIC 文本、ID | `thread-stream-state-changed` v11 snapshot（revision 3）：3 个 turn 实体（`turn:<uuid>` 与 `tail:0:local:<uuid>` 两种键并存；tail 键尾 UUID ≠ 实体 turnId）、11 个**内联 items**（`userMessage`/`agentMessage`/`reasoning`/`error`，camelCase）、`history.isComplete` 在 history 层、`islands.entries` 为 `{key,value}` 对象、`threadRuntimeStatus:{type:"idle"}`、`turns:[]`、`requests:[]` |
-| `canonical-after-load.sanitized.json` | OBSERVED 形态 / SYNTHETIC 文本、ID | 只读 `load-complete-history` 成功返回后的 snapshot（revision 4）；实体与正文与加载前一致。证明该 RPC 成功返回带目标 revision，**不**证明所有历史一开始就完整 |
+| `canonical-after-load.sanitized.json`  | OBSERVED 形态 / SYNTHETIC 文本、ID | 只读 `load-complete-history` 成功返回后的 snapshot（revision 4）；实体与正文与加载前一致。证明该 RPC 成功返回带目标 revision，**不**证明所有历史一开始就完整                                                                                                                                                                                                                                 |
 
 ## 金样钉死的事实（读者必须满足）
 
@@ -45,21 +45,21 @@ permissions/command/blocking_input 未实测保持 false。
 macOS 金样 5 条事实**同构**（T2 逐项核对全 ✓，含 `tail:0:local:` 键尾 UUID ≠ 实体 turnId
 的活体样本）。采集与脱敏报告：仓外 `tuvis-verify-logs/2026-10-19-4894/results.md`。
 
-| 文件 | 说明 |
-| --- | --- |
-| `windows-4894-snapshot.sanitized.json` | rev3 全量 snapshot：10 turn（`turn:` 键）/ 28 msg，item 含 userMessage/agentMessage/commandExecution/reasoning；`history.isComplete` 在 history 层、`itemsPagination` 逐 turn 在场 |
-| `windows-4894-start-turn.sanitized.json` | start-turn v2 请求 + success 回执（`turn.itemsView:"notLoaded"`）；请求侧 `input` 数组被接受，Desktop 侧补写 cwd/approvalPolicy/sandboxPolicy/collaborationMode/model 等 |
-| `windows-4894-command-approval-accept.sanitized.json` | `item/commandExecution/requestApproval` + decision `accept` + `{"ok":true}`；`availableDecisions` 不含 `decline` 字面量（decision:"decline" 仍被接受并生效） |
-| `windows-4894-command-approval-decline.sanitized.json` | decline 轮，同构 |
-| `windows-4894-plan-input.sanitized.json` | `/plan` 会话的 `item/tool/requestUserInput`（**整数 id**）+ `thread-follower-submit-user-input` 作答 + `{"ok":true}` |
-| `windows-4894-opening.derived.sanitized.json` | **DERIVED**（源：`raw/t4-1.jsonl` T4 rev3 snapshot）：删去某 Turn 的正式 userMessage，保留 `params.input`/`clientUserMessageId`——开场后备投影测试用；其余字节与原脱敏样本一致 |
-| `windows-4894-busy-negative.derived.sanitized.json` | **DERIVED**（源：`raw/t7-1.jsonl` 忙态负例）：某 Turn 的 `params.clientUserMessageId`/`input` 被替换为合成第二条 prompt（未落 Turn），`items` 保留第一条真实 userMessage——`opening_*` 幽灵气泡负例；只有这两处派生 |
-| `windows-4894-plan-request-implementation.sanitized.json` | **DERIVED**（源：2026-10-21 真机只读抓取 rev 146）：`conversationState.requests` 里的**计划实现审批** `item/plan/requestImplementation`（`params` = `planContent`；`id` 是 **string**，51 字符）——施工单 §3 明确不开放 plan，本夹具钉死「必须保持 `Unsupported`/到桌面处理」，并证明 string id 走 `s:` 前缀 |
-| `windows-6573-pending-command.sanitized.json` | **DERIVED**（源：2026-10-21 真机只读抓取，build **26.1016.6573.0**）：`conversationState.requests` 里的**命令审批** `item/commandExecution/requestApproval`——`id` 是**整数**，`params` = kind/threadId/turnId/itemId/startedAtMs/environmentId/reason/command/cwd/commandActions/proposedExecpolicyAmendment/**availableDecisions**。未知 build 的 pending 形状证据（无真机 decision 闭环，见 T10） |
-| `windows-6573-command-approval-accept.sanitized.json` | **OBSERVED**（源：2026-10-22 真机**受控决策闭环**探针 `tests/codex_ipc_live_decision.rs`，build **26.1016.6573.0**）：三段闭环——pending（`item/commandExecution/requestApproval`，整数 id 8）→ 决策请求（`thread-follower-command-approval-decision` v1，`params={conversationId,requestId,decision}`，信封带 `targetClientId`）→ 回执（`resultType=success`、`result={"ok":true}`、`handledByClientId` 存在）。**6573 上的 decision 应答已真机闭环**（accept）；`cancel` 轮未跑 |
-同批已知边界（如实登记）：permissions 请求在该 build 的读场景 NOT_TRIGGERED（外部读取升权
-走 command approval）；空会话不落 session（真空首帧无样本）；忙态 start-turn 返回 success
-但新 prompt 不落 Turn（生产忙态屏障必需，不能把写回执当投递成功）。
+| 文件                                                                                      | 说明                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| ----------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `windows-4894-snapshot.sanitized.json`                                                    | rev3 全量 snapshot：10 turn（`turn:` 键）/ 28 msg，item 含 userMessage/agentMessage/commandExecution/reasoning；`history.isComplete` 在 history 层、`itemsPagination` 逐 turn 在场                                                                                                                                                                                                                                                                                               |
+| `windows-4894-start-turn.sanitized.json`                                                  | start-turn v2 请求 + success 回执（`turn.itemsView:"notLoaded"`）；请求侧 `input` 数组被接受，Desktop 侧补写 cwd/approvalPolicy/sandboxPolicy/collaborationMode/model 等                                                                                                                                                                                                                                                                                                         |
+| `windows-4894-command-approval-accept.sanitized.json`                                     | `item/commandExecution/requestApproval` + decision `accept` + `{"ok":true}`；`availableDecisions` 不含 `decline` 字面量（decision:"decline" 仍被接受并生效）                                                                                                                                                                                                                                                                                                                     |
+| `windows-4894-command-approval-decline.sanitized.json`                                    | decline 轮，同构                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| `windows-4894-plan-input.sanitized.json`                                                  | `/plan` 会话的 `item/tool/requestUserInput`（**整数 id**）+ `thread-follower-submit-user-input` 作答 + `{"ok":true}`                                                                                                                                                                                                                                                                                                                                                             |
+| `windows-4894-opening.derived.sanitized.json`                                             | **DERIVED**（源：`raw/t4-1.jsonl` T4 rev3 snapshot）：删去某 Turn 的正式 userMessage，保留 `params.input`/`clientUserMessageId`——开场后备投影测试用；其余字节与原脱敏样本一致                                                                                                                                                                                                                                                                                                    |
+| `windows-4894-busy-negative.derived.sanitized.json`                                       | **DERIVED**（源：`raw/t7-1.jsonl` 忙态负例）：某 Turn 的 `params.clientUserMessageId`/`input` 被替换为合成第二条 prompt（未落 Turn），`items` 保留第一条真实 userMessage——`opening_*` 幽灵气泡负例；只有这两处派生                                                                                                                                                                                                                                                               |
+| `windows-4894-plan-request-implementation.sanitized.json`                                 | **DERIVED**（源：2026-10-21 真机只读抓取 rev 146）：`conversationState.requests` 里的**计划实现审批** `item/plan/requestImplementation`（`params` = `planContent`；`id` 是 **string**，51 字符）——施工单 §3 明确不开放 plan，本夹具钉死「必须保持 `Unsupported`/到桌面处理」，并证明 string id 走 `s:` 前缀                                                                                                                                                                      |
+| `windows-6573-pending-command.sanitized.json`                                             | **DERIVED**（源：2026-10-21 真机只读抓取，build **26.1016.6573.0**）：`conversationState.requests` 里的**命令审批** `item/commandExecution/requestApproval`——`id` 是**整数**，`params` = kind/threadId/turnId/itemId/startedAtMs/environmentId/reason/command/cwd/commandActions/proposedExecpolicyAmendment/**availableDecisions**。未知 build 的 pending 形状证据（无真机 decision 闭环，见 T10）                                                                              |
+| `windows-6573-command-approval-accept.sanitized.json`                                     | **OBSERVED**（源：2026-10-22 真机**受控决策闭环**探针 `tests/codex_ipc_live_decision.rs`，build **26.1016.6573.0**）：三段闭环——pending（`item/commandExecution/requestApproval`，整数 id 8）→ 决策请求（`thread-follower-command-approval-decision` v1，`params={conversationId,requestId,decision}`，信封带 `targetClientId`）→ 回执（`resultType=success`、`result={"ok":true}`、`handledByClientId` 存在）。**6573 上的 decision 应答已真机闭环**（accept）；`cancel` 轮未跑 |
+| 同批已知边界（如实登记）：permissions 请求在该 build 的读场景 NOT_TRIGGERED（外部读取升权 |
+| 走 command approval）；空会话不落 session（真空首帧无样本）；忙态 start-turn 返回 success |
+| 但新 prompt 不落 Turn（生产忙态屏障必需，不能把写回执当投递成功）。                       |
 
 ## Windows 26.1016.6573.0（2026-10-21 探测批，未知 build 兼容路径的真机样本）
 
@@ -79,28 +79,38 @@ macOS 金样 5 条事实**同构**（T2 逐项核对全 ✓，含 `tail:0:local:
    决策词以「字符串词」为准；`decline` 在 4894 真机已被接受并生效
    （`windows-4894-command-approval-decline.sanitized.json`）。
 
-
 ## Windows 26.1016.6573.0 提升登记（2026-10-22 取证批，四条证据齐备）
 
 该 build 已于 2026-10-22 完成取证并**登记进 shipped 表**（`profile.rs` 的
 `windows_6573_profile`）：`state` / `send` / `command` = true；`permissions` /
 `blocking_input`（Plan 阻塞问答）/ Plan / collaboration 模式切换**保持关闭**（无证据）。
 
-| 证据 | 取得方式 | 落点 |
-| --- | --- | --- |
-| 读链 P0–P3 | 生产 adapter `ensure_read_evidence`（owner discovery → 临时 following → 首个 snapshot 判据）真机通过 | `tests/codex_ipc_live_probe.rs` |
-| **send 闭环** | 生产 adapter `start_turn_compat` **只发一帧** → 回执 `Accepted`（674ms）+ 回执内 `turn.status="inProgress"`，事后核对**状态真的前进** | `tests/codex_ipc_live_send.rs`（显式同意闸 + 事后核对「受理≠生效」） |
-| command 审批 decision 闭环 | `thread-follower-command-approval-decision` v1 / `decision=accept` → `resultType=success`、`result.ok=true` | `windows-6573-command-approval-accept.sanitized.json` |
-| 官方方法表 | `app.asar` 与 `26.1013.4894.0` 逐项一致（`state-changed:11` / `start-turn:2` / 各 decision v1） | 上节「官方方法表与 4894 完全一致」 |
+| 证据                       | 取得方式                                                                                                                              | 落点                                                                 |
+| -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------- |
+| 读链 P0–P3                 | 生产 adapter `ensure_read_evidence`（owner discovery → 临时 following → 首个 snapshot 判据）真机通过                                  | `tests/codex_ipc_live_probe.rs`                                      |
+| **send 闭环**              | 生产 adapter `start_turn_compat` **只发一帧** → 回执 `Accepted`（674ms）+ 回执内 `turn.status="inProgress"`，事后核对**状态真的前进** | `tests/codex_ipc_live_send.rs`（显式同意闸 + 事后核对「受理≠生效」） |
+| command 审批 decision 闭环 | `thread-follower-command-approval-decision` v1 / `decision=accept` → `resultType=success`、`result.ok=true`                           | `windows-6573-command-approval-accept.sanitized.json`                |
+| 官方方法表                 | `app.asar` 与 `26.1013.4894.0` 逐项一致（`state-changed:11` / `start-turn:2` / 各 decision v1）                                       | 上节「官方方法表与 4894 完全一致」                                   |
 
 附带发现（如实登记）：本 build 的随包 CLI 是 **`0.163.0-alpha.11`**（4894 上是
 `0.163.0-alpha.10.2`）→ **CLI 随 Desktop 一起漂移**，这实证了账本键必须带 `cli_id`
 （只看 build 会把「同 build、不同 CLI」的证据混用）。
+
 ## 2026-10-21 附件任务取证状态
+
 现有 OBSERVED canonical 快照没有 `imageGeneration`、`localImage`、`mention`、
 `fileChange`、`imageView` 或用户图片 URL／fileId 分支。此次没有新增 OBSERVED
 附件文件：本机仅有已有私人会话可供 IPC 读取；在不读取私人对话且不触发真实
 会话动作的约束下，无法安全取得含附件的真实样本。字段名的 macOS 静态核验与
 未完成的 Windows 附件核验见
-`docs/superpowers/reviews/2026-10-20-codex-artifact-field-evidence.md`。
+`docs/engineering/evidence/codex-desktop-ipc/2026-10-20-codex-artifact-field-evidence.md`。
 独立合成回归输入位于同级 `artifacts/`，不得当作真实 canonical 形态。
+
+## 2026-10-26 Codex F01—F08 批次
+
+- `20261026-macos/`：Mac 主探测的契约结构片段（`app.asar` 静态片段，CODE）与行为样本
+  （OBSERVED 脱敏）；`contract-fragments/` 是 T01 有限结构匹配规则的唯一来源。
+- `20261026-macos-followup/`：Mac F03 追加探测（空闲异步答题、紧凑 `questionItemId`、
+  `declined` 终态）。
+- Windows：本批**无**可用脱敏归档（压缩包缺索引引用的样本）→ 不产出 Windows 契约
+  样本，实现侧按"当前契约未核对"保持关闭。

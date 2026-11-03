@@ -1,10 +1,12 @@
 // 远程接入层（M2）：axum 内嵌服务器 + 访问密码配对（M5）+ 移动看板 API
-// 范围与红线见 docs/superpowers/plans/2026-09-17-m5-access-pin-and-file-pool.md
+// 范围与红线见 docs/engineering/plans/2026-09-17-m5-access-pin-and-file-pool.md
 
 pub mod api;
 #[cfg(test)]
 pub mod attachment_fixtures;
 pub mod attachments;
+pub mod codex_adapt;
+pub mod codex_evidence;
 pub mod codex_ipc;
 pub mod content;
 pub mod events;
@@ -62,14 +64,21 @@ pub const KEY_ACCESS_PIN: &str = "remote.access_pin";
 pub const KEY_HEADLESS: &str = "remote.headless_enabled";
 /// H3 关闭态文案：移动端输入区置灰的原因——send-info 的 reason 原样透出
 pub const HEADLESS_DISABLED_REASON: &str = "无头通道未开启，请在电脑端 Tuvis 设置中开启";
-/// **兼容发送开关（#172/T8；实验）**：默认开（缺键 = 开；2026-10-24 用户裁决
-/// §7.1），只有显式 "false" 才保留用户关闭；空串/乱串等非法值仍判关。偏好开只
-/// 放开「写能力未取证」这一档尝试发送（消息可能被投递到错误会话，风险自负），
-/// 不绕过 build/设备/pending/投递证据等既有守卫。值口径与 KEY_HEADLESS 同：
-/// 写侧恒 "true"/"false" 显式两值，读侧只认 "true"（不认第二真值）。
-/// 消费方：发送门（`remote::codex_ipc` 的兼容发送分支）、`remote_status.compatSendEnabled`
-/// 下发、设置页「兼容发送（实验）」开关。
+/// **兼容发送开关（#172/T8；实验，S1 起**仅剩旧设置 UI 的记录值，不再参与任何门——
+/// 设计 §1.4「移除旧开关的冲突接线」：它的 false 不得被当成新「自动适配」的退出
+/// 选择）。键与命令保留至 S5 换装设置界面 / S6 同步旧契约。
 pub const KEY_COMPAT_SEND: &str = "remote.compat_send_enabled";
+/// **自动适配开关（S1 新设置）**：Codex Desktop 自动适配的总开关，**缺省开**。
+/// 值口径三态：缺键 = 未显式写过 → 生效值 true；"true"/"false" = 用户显式选择，
+/// 一律尊重；乱串 = 视同未写。**不借旧「兼容发送（实验）」开关的缺值/false 当
+/// 缺省来源**（2026-10-23 用户裁决）。消费方：未知 build 的可尝试发送门
+/// （`codex_ipc` 三处 send 门）、adapter 的自动探测门/审批档门（经
+/// `DesktopIpcAdapter::set_auto_adapt_gate` 注入）、`remote_status.codexAutoAdapt*`
+/// 下发、`codex_adapt_status` DTO。
+pub const KEY_AUTO_ADAPT: &str = "remote.codex_auto_adapt";
+/// T08：**首次提示已展示**（移动端轻提示只出现一次；与桌面设置同源，不随 build
+/// 重置）。值口径：`"true"` = 已展示；其余/缺键 = 未展示。
+pub const KEY_AUTO_ADAPT_HINT_SEEN: &str = "remote.codex_auto_adapt_hint_seen";
 /// 兼容发送前置未满足时的拒绝文案（前端置灰提示同源一句；后端是最终裁决）
 pub const COMPAT_SEND_NEEDS_PROBE_MSG: &str =
     "COMPAT_SEND_NEEDS_PROBE: 需先完成只读探测（该 Codex 桌面版本的读链尚未取证）";
@@ -166,11 +175,126 @@ pub fn remote_toggle_headless(enabled: bool) -> Result<(), String> {
     Ok(())
 }
 
-/// 兼容发送开关解析（纯函数）：**缺键 = 开**（新默认；未配置不是用户关闭）——
-/// 显式 `"true"` 为开，显式 `"false"` 保留用户关闭；空串/乱串等非法值仍判关
-/// （与 `headless_enabled_from` 同口径，不认第二真值，也不猜成用户允许）。
+/// 兼容发送开关解析（纯函数）：仅 `"true"` 为开——缺键（未设置 = 默认关）/
+/// `"false"` / 乱串一律判关（与 `headless_enabled_from` 同口径，不认第二真值）。
+/// S1 起该键不再参与任何门（见 [`KEY_COMPAT_SEND`]），仅供旧设置 UI 显示。
 pub fn compat_send_enabled_from(v: Option<&str>) -> bool {
     matches!(v, None | Some("true"))
+}
+
+/// **自动适配三态解析（纯函数，S1 单点）**：`None` = 未显式写过（缺键/乱串）→
+/// 生效值取缺省**开**；`Some(true/false)` = 用户显式选择，一律尊重。
+pub fn auto_adapt_setting_from(v: Option<&str>) -> Option<bool> {
+    match v.map(str::trim) {
+        Some("true") => Some(true),
+        Some("false") => Some(false),
+        _ => None,
+    }
+}
+
+/// 自动适配**生效值**读取（store 缝版本）：缺键 = 缺省开。发送门与状态装配共用
+/// 这一个读取点（与 adapter 注入门同源同语义）。
+pub fn auto_adapt_enabled_conn(conn: &rusqlite::Connection) -> bool {
+    auto_adapt_setting_from(
+        crate::database::dao::settings::get_setting_conn(conn, KEY_AUTO_ADAPT).as_deref(),
+    )
+    .unwrap_or(true)
+}
+
+/// **自动适配状态下发装配（可测缝）**：设置真值 + 是否显式写过两件事实进 status
+/// （设置页初值；完整适配状态 DTO 走 `codex_adapt_status` 命令）。
+pub fn apply_codex_auto_adapt_status(st: &mut serde_json::Value, conn: &rusqlite::Connection) {
+    let explicit = auto_adapt_setting_from(
+        crate::database::dao::settings::get_setting_conn(conn, KEY_AUTO_ADAPT).as_deref(),
+    );
+    st["codexAutoAdaptEnabled"] = serde_json::json!(explicit.unwrap_or(true));
+    st["codexAutoAdaptExplicit"] = serde_json::json!(explicit);
+}
+
+/// 自动适配开关翻转内核（**可测核**；conn、审计出口与开启通知以参数注入）：
+/// 恒写显式两值（"true"/"false"）——写过后即成为「显式选择」，永远被尊重。
+/// **终审 F9**：`enabled=true` 时写完设置即调用 `on_enabled`（生产 = 通知适配器
+/// 对已存活连接补触发 schema 按需取证——只写设置不触发的话，关闭态建立的活连接
+/// 不会重走连接期探针，必须断开/重启才恢复）；`enabled=false` 不调用。
+fn toggle_codex_auto_adapt_core(
+    conn: &rusqlite::Connection,
+    enabled: bool,
+    audit: impl FnOnce(&str, &str),
+    notify: impl FnOnce(bool),
+) {
+    crate::database::dao::settings::set_setting_conn(
+        conn,
+        KEY_AUTO_ADAPT,
+        if enabled { "true" } else { "false" },
+    );
+    audit("codex_auto_adapt_toggled", &format!("autoAdapt={enabled}"));
+    events::emit_ui(
+        "remote-changed",
+        serde_json::json!({ "codexAutoAdaptEnabled": enabled }),
+    );
+    // 终审 R4/R6：开/关都通知适配器（重开 = 补触发取证；关闭 = 重发布投影翻转
+    // availability）。适配器侧决定各方向的实际动作。
+    notify(enabled);
+}
+
+/// T08：**共用设置服务**——桌面命令与移动端点都走这里（同一 DB 写入、同一 UI 事件、
+/// 同一适配器通知），不出现"只改库不通知"的第二条路径。
+pub fn apply_codex_auto_adapt_toggle(conn: &rusqlite::Connection, enabled: bool) -> bool {
+    let in_async = tokio::runtime::Handle::try_current().is_ok();
+    toggle_codex_auto_adapt_core(conn, enabled, events::audit, |on| {
+        if in_async {
+            STATE
+                .codex_control
+                .adapter
+                .notify_auto_adapt_changed_async(on);
+        } else {
+            STATE.codex_control.adapter.notify_auto_adapt_changed(on);
+        }
+    });
+    enabled
+}
+
+/// T08：读首次提示事实（缺键/乱串 → 未展示）。
+pub fn codex_auto_adapt_hint_seen_conn(conn: &rusqlite::Connection) -> bool {
+    crate::database::dao::settings::get_setting_conn(conn, KEY_AUTO_ADAPT_HINT_SEEN)
+        .as_deref()
+        .map(str::trim)
+        == Some("true")
+}
+
+/// T08：写首次提示事实（幂等）。
+pub fn dismiss_codex_auto_adapt_hint_conn(conn: &rusqlite::Connection) {
+    // `set_setting_conn` 恒成功（内部 upsert），返回 ()；失败面由调用方的事务保证。
+    crate::database::dao::settings::set_setting_conn(conn, KEY_AUTO_ADAPT_HINT_SEEN, "true");
+}
+
+/// 自动适配开关翻转（S1：缺省开；显式选择被尊重；关闭 = 阻止新的未知 build 自动
+/// 探测/普通发送/兼容审批决策，已验证 build 与只读收尾核对不受影响，设计 §3.3）。
+#[tauri::command]
+pub fn remote_toggle_codex_auto_adapt(enabled: bool) -> Result<(), String> {
+    pairing::DeviceStore::global().with(|c| {
+        toggle_codex_auto_adapt_core(c, enabled, events::audit, |en| {
+            // 终审 R4/R6：开启 → 活连接补触发 schema 取证；关闭 → 重发布投影翻转。
+            // disabled hub 的 adapter 是 closed 档（无 probe 目标）——通知是安全 no-op。
+            STATE.codex_control.adapter.notify_auto_adapt_changed(en);
+        })
+    });
+    Ok(())
+}
+
+/// **适配状态 DTO**（S1 登记边界的调用入口）：桌面设置页/详情页读取「可尝试 ×
+/// 已取证 × schema 决策词 × 最近失败观测 × 探测事实」的单一来源；S5 直接消费本
+/// 命令，不另造第二套 DTO。失败语义：hub 不可用（测试态/装配失败）→ Err 字符串。
+#[tauri::command]
+pub async fn codex_adapt_status() -> Result<serde_json::Value, String> {
+    let hub = STATE.codex_control.clone();
+    let explicit = pairing::DeviceStore::global().with(|c| {
+        auto_adapt_setting_from(
+            crate::database::dao::settings::get_setting_conn(c, KEY_AUTO_ADAPT).as_deref(),
+        )
+    });
+    let status = hub.adapter.adapt_status(explicit).await;
+    serde_json::to_value(status).map_err(|e| format!("codex_adapt_status: {e}"))
 }
 
 /// 兼容发送开关读取（**store 缝版本**）：直用调用方传入的 conn（锁内只做这一条
@@ -181,13 +305,12 @@ pub fn compat_send_enabled_conn(conn: &rusqlite::Connection) -> bool {
     )
 }
 
-/// 兼容发送放行判据（纯函数，#172/T8）：**开关开**（缺键 = 新默认开）∧
-/// **本 build 写能力未取证**。
-///
-/// 为什么已验证 build 恒 false：shipped 证据里的 build 行为**完全不变**——兼容开关
-/// 对它零影响（既不放开也不收紧），避免「同一台机器换个 build 语义就变了」。
-pub fn compat_send_allowed(switch_on: bool, build_send_verified: bool) -> bool {
-    switch_on && !build_send_verified
+/// 兼容**尝试**放行判据（纯函数，#172/T8；S1 语义原样，S2 正名形参）：**自动适配
+/// 开** ∧ **本 build 档位不带写能力（快照）**。已取证档位恒 false（自动适配不放开
+/// 也不收紧已判明的证据边界——S0 §3.1 二分）。S2 起该判据只服务「未知 build 的
+/// 尝试门与发送记账」，与 headless 无关（Desktop 兜底臂已删）。
+pub fn compat_send_allowed(auto_adapt: bool, profile_send_capable: bool) -> bool {
+    auto_adapt && !profile_send_capable
 }
 
 /// **兼容发送状态下发装配（可测缝）**：从注入的连接读开关 + 写入「读链是否已取证」
@@ -516,6 +639,70 @@ pub fn is_online(registry_hit: bool, last_seen_at: i64, now: i64) -> bool {
     registry_hit || now - last_seen_at < 30_000
 }
 
+/// 最近一次**已认证** API 请求时刻：进程内持续时间使用 Instant，系统墙钟调整不改变在线 TTL。
+static LAST_API_AT: Lazy<Mutex<Option<std::time::Instant>>> = Lazy::new(|| Mutex::new(None));
+const API_ONLINE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// API 在线边沿内核。锁内判断并续期，锁外只在离线→在线时执行一次唤醒。
+fn note_api_request_at(
+    last_api_at: &Mutex<Option<std::time::Instant>>,
+    sse: bool,
+    now: std::time::Instant,
+    on_rising_edge: impl FnOnce(),
+) -> bool {
+    let became_online = {
+        let mut last = last_api_at.lock().unwrap_or_else(|e| e.into_inner());
+        let now = match *last {
+            Some(previous) if previous > now => previous,
+            _ => now,
+        };
+        let was_online = online_from(sse, *last, now);
+        *last = Some(now);
+        !was_online
+    };
+    if became_online {
+        on_rising_edge();
+    }
+    became_online
+}
+
+/// API 请求心跳（**唯一调用点**：`remote/gate.rs` 过闸成功、转发之前——只记已认证
+/// 请求；未认证的端口扫描 / 未知路径不得把扫描节奏升档）。离线→在线时立即请求一次 Action；
+/// 后续在线窗口内的请求只续期，不重复补扫。
+pub fn note_api_request() {
+    note_api_request_at(
+        &LAST_API_AT,
+        crate::remote::server::any_connection(),
+        std::time::Instant::now(),
+        || {
+            crate::adapter::scan_bus::request_scan(crate::adapter::scan_bus::ScanReason::Action);
+        },
+    );
+}
+
+/// 在线窗口判定（纯函数）：任一 SSE 连接在场，或最近 60s 有已认证 API 请求。
+fn online_from(
+    sse: bool,
+    last_api_at: Option<std::time::Instant>,
+    now: std::time::Instant,
+) -> bool {
+    sse || last_api_at.is_some_and(|last| now.saturating_duration_since(last) < API_ONLINE_TTL)
+}
+
+/// 扫描节奏用「远控在线」口径：任一 SSE 连接在场，或最近 60s 有 API 请求。
+/// 消费方是扫描总线线程（remote_online）——**刻意不碰 `STATE`**：该单例的惰性初始化会
+/// 装配 DeviceStore / CodexControlHub / CreateTaskHub（Windows 上含 sysinfo 枚举 +
+/// AppxManifest 读盘），既不该发生在扫描线程上，且初始化一旦 panic 会永久污染 Lazy
+/// （此后本函数每次调用都 panic）。SSE 在场判据改读 `server.rs` 的独立原子计数
+/// （[`crate::remote::server::any_connection`]），与注册表增删严格配对
+pub fn is_online_now() -> bool {
+    online_from(
+        crate::remote::server::any_connection(),
+        *LAST_API_AT.lock().unwrap_or_else(|e| e.into_inner()),
+        std::time::Instant::now(),
+    )
+}
+
 /// 16 字节随机 hex（设备 id 生成器，M5 A3 起 /pair/pin 落行消费）：零参随机形态，
 /// 不可位置式（生成器消费后复用会让不同设备撞行）
 fn random_hex_16() -> String {
@@ -539,23 +726,72 @@ use std::sync::Mutex;
 static SERVER_HANDLE: Lazy<Mutex<Option<tauri::async_runtime::JoinHandle<()>>>> =
     Lazy::new(|| Mutex::new(None));
 
+/// C7 配对计数缓存条目：上一轮全进程扫描完成时刻（TTL 判定）+ 运行进程 (工具, 项目) 表。
+/// 用命名结构而非嵌套元组：静态量类型过深会触 `clippy::type_complexity`，且字段语义自解释。
+#[cfg(windows)]
+struct PairingProjectsCache {
+    at: std::time::Instant,
+    projects: Vec<(String, String)>,
+}
+
+/// C7 配对计数缓存（进程级，仅 Windows 有生产实现）：`System::new_all()` 全进程刷新是
+/// 重活，而 /sessions 3s 轮询 + SSE 接入都会消费本表，逐请求全刷会持续拖慢远程面。
+/// 10s TTL 内复用上一轮结果——配对歧义判据只需「粗粒度一致」，进程表在 10s 内的微变
+/// 不影响「同键 ≥2」结论（迟滞上限 10s，如实接受）。放在 STATE 之外：`#[cfg(not(windows))]`
+/// 下不定义静态量，不留 dead_code。
+#[cfg(windows)]
+static PAIRING_PROJECTS_CACHE: Lazy<Mutex<Option<PairingProjectsCache>>> =
+    Lazy::new(|| Mutex::new(None));
+
 /// 共享状态单例：服务器任务与 tauri 命令共用同一份 pairing / 会话源 / 设备存储
 static STATE: Lazy<std::sync::Arc<server::RemoteState>> = Lazy::new(|| {
     std::sync::Arc::new(server::RemoteState {
         // 远程端外观配置读源（2026-10-05 UI 改版）：生产 = settings KV 单行 JSON
         //（桌面外观配置器经 set_setting 命令写入）；未配置 → None → 端点回落默认值
         ui_config_source: Box::new(|| crate::database::get_setting("remote_ui_config")),
-        // P8 数据同源：直调唯一聚合口（R3 单飞护栏保护第三消费者），禁止复制聚合逻辑
-        session_source: Box::new(crate::adapter::get_all_sessions),
+        // P8 数据同源：显示路径读扫描总线的成功快照（初始化首扫未发布时等待；之后不触发
+        // 补扫，陈旧上限 = 档位）
+        session_source: Box::new(crate::adapter::scan_bus::current_or_scan),
+        // 动作路径专用：保证快照新鲜——龄超 2s 补扫并等待（上限 3s）；超时按现有
+        // 快照降级继续并告警（F3 degraded 标记：本任务只落日志，API 契约留待后续）
+        fresh_session_source: Box::new(|| {
+            let snap = crate::adapter::scan_bus::ensure_fresh(
+                std::time::Duration::from_secs(2),
+                std::time::Duration::from_secs(3),
+            );
+            if snap.scanned_at.elapsed() > std::time::Duration::from_secs(2) {
+                log::warn!(
+                    "remote: 动作路径快照补扫超时（龄 {:?}），按 degraded 继续",
+                    snap.scanned_at.elapsed()
+                );
+            }
+            snap.data.clone()
+        }),
         // C7 配对不确定信号缝（spec §5）：运行进程 (工具, 项目) 表 = sysinfo 全量
         // 快照 + 桌面跳转门同款收集函数（同一实现单点，桌面门零改动）。非 Windows
         // 无该收集实现（桌面配对不确定门本就仅 Windows 消费）→ 空表 = 不宣称歧义
         // （诚实缺省）。端点层据本表计同键 ≥2 判 pairingAmbiguous/pairingHint。
+        // 限频：10s 内复用缓存（见 PAIRING_PROJECTS_CACHE）——首调扫描，之后窗口内
+        // 直接克隆上轮结果；窗口外重扫。
         pairing_counter: Box::new(|| {
             #[cfg(windows)]
             {
+                let mut g = PAIRING_PROJECTS_CACHE
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                if let Some(cached) = g.as_ref() {
+                    if cached.at.elapsed() < std::time::Duration::from_secs(10) {
+                        return cached.projects.clone();
+                    }
+                }
+                // 持锁扫描：并发调用在此排队，拿到的仍是同一次扫描结果（不重复全刷）
                 let system = sysinfo::System::new_all();
-                crate::commands::session::running_projects_from_processes(&system)
+                let projects = crate::commands::session::running_projects_from_processes(&system);
+                *g = Some(PairingProjectsCache {
+                    at: std::time::Instant::now(),
+                    projects: projects.clone(),
+                });
+                projects
             }
             #[cfg(not(windows))]
             {
@@ -1537,6 +1773,9 @@ pub fn remote_status() -> serde_json::Value {
         let eligible = codex_ipc::read_chain_verified(&store);
         store.with(|c| apply_compat_send_status(&mut st, c, eligible));
     }
+    // S1：自动适配（新设置）设置真值 + 显式标记（设置页初值；完整适配状态 DTO 走
+    // `codex_adapt_status` 命令——remote_status 轮询热路径不装配 hub 运行态）。
+    pairing::DeviceStore::global().with(|c| apply_codex_auto_adapt_status(&mut st, c));
     // M5 A5：通道开关（read_channels 含惰性迁移）+ 隧道双通道快照 + tailscale 快照
     let chans = read_channels();
     let tun = tunnel::snapshot();
@@ -2404,6 +2643,159 @@ pub fn restore_on_launch() {
 mod tests {
     use super::*;
 
+    /// 远控在线窗口的边界数学（纯函数，零全局态）：SSE 在场恒真；API 心跳的窗口
+    /// 是**严格小于** 60s——59_999ms 仍在线，整 60_000ms 已离线（扫描节奏据此降档）
+    #[test]
+    fn online_from_window_boundaries() {
+        let now = std::time::Instant::now();
+        assert!(
+            online_from(true, None, now),
+            "SSE 在场 → 在线（与心跳无关）"
+        );
+        assert!(
+            online_from(
+                false,
+                Some(now),
+                now + std::time::Duration::from_millis(59_999)
+            ),
+            "心跳 59_999ms 前 → 窗口内"
+        );
+        assert!(
+            !online_from(
+                false,
+                Some(now),
+                now + std::time::Duration::from_millis(60_000)
+            ),
+            "心跳整 60_000ms 前 → 出窗（严格小于）"
+        );
+        assert!(!online_from(false, None, now), "从未有已认证请求 → 不在线");
+    }
+
+    #[test]
+    fn note_api_request_wakes_scan_bus_once_per_online_edge() {
+        let _scan_guard = crate::adapter::scan_bus::test_guard();
+        crate::adapter::scan_bus::reset_for_test();
+        let (tx, rx) = std::sync::mpsc::channel();
+        crate::adapter::scan_bus::set_test_tx_for_test(Some(tx));
+        let last = std::sync::Mutex::new(None);
+        let start = std::time::Instant::now();
+        let wakes = std::sync::atomic::AtomicUsize::new(0);
+        let request = |at| {
+            note_api_request_at(&last, false, at, || {
+                wakes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                crate::adapter::scan_bus::request_scan(
+                    crate::adapter::scan_bus::ScanReason::Action,
+                );
+            })
+        };
+
+        assert!(request(start), "离线后的首个 REST 请求必须触发上升沿");
+        assert!(matches!(
+            rx.recv_timeout(std::time::Duration::from_millis(100)),
+            Ok(crate::adapter::scan_bus::ScanReason::Action)
+        ));
+        assert!(
+            online_from(
+                false,
+                *last.lock().unwrap_or_else(|e| e.into_inner()),
+                start
+            ),
+            "Action 唤醒后的在线信号必须立即可被 Scan Bus 读取"
+        );
+        let mut cadence = crate::adapter::cadence::Cadence::new(std::time::Duration::ZERO);
+        let away = crate::adapter::cadence::Signals::default();
+        cadence.observe(away, std::time::Duration::ZERO);
+        cadence.observe(away, std::time::Duration::from_secs(10));
+        assert_eq!(cadence.mode(), crate::adapter::cadence::Mode::Away);
+        let online = crate::adapter::cadence::Signals {
+            remote_online: online_from(
+                false,
+                *last.lock().unwrap_or_else(|e| e.into_inner()),
+                start,
+            ),
+            ..away
+        };
+        assert_eq!(
+            cadence.observe(online, std::time::Duration::from_secs(11)),
+            Some(crate::adapter::cadence::Mode::Idle),
+            "首次 REST 在线信号必须立即把 cadence 升到 Idle"
+        );
+        assert!(!request(start + std::time::Duration::from_secs(20)));
+        assert!(!request(start + std::time::Duration::from_millis(59_999)));
+        assert!(rx.try_recv().is_err(), "在线窗口内的连续请求不得重复补扫");
+        assert!(request(start + std::time::Duration::from_secs(120)));
+        assert!(matches!(
+            rx.recv_timeout(std::time::Duration::from_millis(100)),
+            Ok(crate::adapter::scan_bus::ScanReason::Action)
+        ));
+        assert_eq!(wakes.load(std::sync::atomic::Ordering::SeqCst), 2);
+        crate::adapter::scan_bus::set_test_tx_for_test(None);
+    }
+
+    #[test]
+    fn concurrent_api_requests_emit_one_rising_edge() {
+        let last = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let wakes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let workers: Vec<_> = (0..2)
+            .map(|_| {
+                let last = last.clone();
+                let wakes = wakes.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    note_api_request_at(&last, false, std::time::Instant::now(), || {
+                        wakes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    });
+                })
+            })
+            .collect();
+        barrier.wait();
+        for worker in workers {
+            worker.join().expect("API request worker must not panic");
+        }
+        assert_eq!(wakes.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn api_online_clock_uses_monotonic_instant_not_wall_time() {
+        let src = include_str!("mod.rs");
+        let start = src.find("pub fn note_api_request()").unwrap();
+        let end = src[start..].find("\n}\n").unwrap() + start + 2;
+        let note_body = &src[start..end];
+        assert!(note_body.contains("note_api_request_at"));
+        assert!(note_body.contains("Instant::now()"));
+        assert!(note_body.contains("scan_bus::request_scan"));
+        assert!(note_body.contains("ScanReason::Action"));
+        assert!(!note_body.contains("Utc::now"));
+
+        let start = src.find("pub fn is_online_now()").unwrap();
+        let end = src[start..].find("\n}\n").unwrap() + start + 2;
+        let online_body = &src[start..end];
+        assert!(online_body.contains("LAST_API_AT"));
+        assert!(online_body.contains("Instant::now()"));
+        assert!(!online_body.contains("Utc::now"));
+    }
+
+    #[test]
+    fn api_heartbeat_remains_inside_authenticated_gate() {
+        let src = include_str!("gate.rs");
+        let gate_start = src.find("pub async fn gate(").expect("缺少 remote gate");
+        let gate = &src[gate_start..];
+        let success = gate.find("if ok {").expect("缺少认证成功分支");
+        let note = gate
+            .find("crate::remote::note_api_request();")
+            .expect("认证 gate 必须记录 API 心跳");
+        let failure = gate[note..]
+            .find("} else {")
+            .map(|offset| note + offset)
+            .expect("缺少认证失败分支");
+        assert!(
+            success < note && note < failure,
+            "未认证请求不得续期在线 TTL"
+        );
+    }
+
     /// 敏感黑名单基准的生产接线探针（M5 P2-a 追记，独立复核暴露的盲区）：
     /// 端点侧有注入缝探针，但生产 `STATE` 的接线本身此前无任何测试压住——
     /// 把本文件的 `home_source` 改回 `|| None` 时全量 807 测试曾零告警全绿
@@ -2556,6 +2948,115 @@ mod tests {
         apply_compat_send_status(&mut st, &conn, true);
         assert_eq!(st["compatSendEnabled"], serde_json::json!(true));
         assert_eq!(st["compatSendEligible"], serde_json::json!(true));
+    }
+
+    /// S1：自动适配（新设置）的**三态**取值口径——缺键/乱串 = 未显式写过（生效值
+    /// 缺省**开**）；只有显式 "true"/"false" 被尊重。旧「兼容发送（实验）」键的
+    /// 缺值/false 不作为本设置的缺省来源（2026-10-23 用户裁决），故这里是独立键。
+    #[test]
+    fn auto_adapt_setting_tri_state_defaults_open() {
+        assert_eq!(KEY_AUTO_ADAPT, "remote.codex_auto_adapt");
+        // 三态解析
+        assert_eq!(auto_adapt_setting_from(None), None, "缺键 = 未显式写过");
+        assert_eq!(auto_adapt_setting_from(Some(" true ")), Some(true));
+        assert_eq!(auto_adapt_setting_from(Some("false")), Some(false));
+        assert_eq!(auto_adapt_setting_from(Some("1")), None, "乱串视同未写");
+        assert_eq!(auto_adapt_setting_from(Some("TRUE")), None, "只认小写真值");
+        assert_eq!(auto_adapt_setting_from(Some("")), None);
+        // 生效值：未写 → 开（缺省开的口径单点在 unwrap_or(true)）
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::database::schema::init(&conn);
+        assert!(
+            auto_adapt_enabled_conn(&conn),
+            "缺省开：旧实验开关的缺值/false 不迁怒到新设置"
+        );
+        // 旧「兼容发送（实验）」键对生效值零影响（冲突接线已移除）
+        crate::database::dao::settings::set_setting_conn(&conn, KEY_COMPAT_SEND, "false");
+        assert!(
+            auto_adapt_enabled_conn(&conn),
+            "旧开关 false ≠ 新设置的退出选择"
+        );
+        // 显式选择被尊重
+        crate::database::dao::settings::set_setting_conn(&conn, KEY_AUTO_ADAPT, "false");
+        assert!(!auto_adapt_enabled_conn(&conn));
+        crate::database::dao::settings::set_setting_conn(&conn, KEY_AUTO_ADAPT, "true");
+        assert!(auto_adapt_enabled_conn(&conn));
+    }
+
+    /// S1：自动适配状态装配（设置页初值）——enabled = 生效值；explicit = 显式标记。
+    #[test]
+    fn codex_auto_adapt_status_payload_shape() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::database::schema::init(&conn);
+        let mut st = serde_json::json!({});
+        apply_codex_auto_adapt_status(&mut st, &conn);
+        assert_eq!(
+            st["codexAutoAdaptEnabled"],
+            serde_json::json!(true),
+            "缺省开"
+        );
+        assert_eq!(st["codexAutoAdaptExplicit"], serde_json::json!(null));
+        crate::database::dao::settings::set_setting_conn(&conn, KEY_AUTO_ADAPT, "false");
+        let mut st = serde_json::json!({});
+        apply_codex_auto_adapt_status(&mut st, &conn);
+        assert_eq!(st["codexAutoAdaptEnabled"], serde_json::json!(false));
+        assert_eq!(st["codexAutoAdaptExplicit"], serde_json::json!(false));
+    }
+
+    /// S1：自动适配翻转内核——恒写显式两值（写过后即成为显式选择，永远被尊重）。
+    #[test]
+    fn toggle_codex_auto_adapt_writes_explicit_value_and_audits() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::database::schema::init(&conn);
+        let log = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
+        let log2 = log.clone();
+        toggle_codex_auto_adapt_core(
+            &conn,
+            false,
+            |action, _| log2.borrow_mut().push(action.to_string()),
+            |en| {
+                let _ = en;
+            },
+        );
+        assert_eq!(
+            crate::database::dao::settings::get_setting_conn(&conn, KEY_AUTO_ADAPT).as_deref(),
+            Some("false"),
+            "关 = 显式 false（不是删键回缺省）"
+        );
+        let log3 = log.clone();
+        toggle_codex_auto_adapt_core(
+            &conn,
+            true,
+            |action, _| log3.borrow_mut().push(action.to_string()),
+            |en| {
+                let _ = en;
+            },
+        );
+        assert_eq!(
+            crate::database::dao::settings::get_setting_conn(&conn, KEY_AUTO_ADAPT).as_deref(),
+            Some("true")
+        );
+        assert_eq!(log.borrow().len(), 2, "两次翻转都留审计");
+    }
+
+    /// 终审 F9/R4：翻转内核的**通知**（notify(bool)）——开启与关闭都通知适配器
+    ///（重开 = 补触发取证；关闭 = 重发布翻转），适配器侧按方向分支；本单测钉
+    ///「core 恰好通知一次、且 enabled 值如实传递」。适配器侧的实际动作由
+    /// codex_ipc_remote 的 r4/r6 集成用例钉住。
+    #[test]
+    fn toggle_core_notifies_adapter_with_true_value() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::database::schema::init(&conn);
+        let notified = std::rc::Rc::new(std::cell::RefCell::new(Vec::<bool>::new()));
+        let n1 = notified.clone();
+        toggle_codex_auto_adapt_core(&conn, false, |_, _| {}, |en| n1.borrow_mut().push(en));
+        let n2 = notified.clone();
+        toggle_codex_auto_adapt_core(&conn, true, |_, _| {}, |en| n2.borrow_mut().push(en));
+        assert_eq!(
+            *notified.borrow(),
+            vec![false, true],
+            "每次翻转恰好一次通知、enabled 值如实传递"
+        );
     }
 
     /// 三终端语言自适应（C-3）：推送命令的值集闸门——"zh"/"en" 之外一律 Err
@@ -2761,11 +3262,16 @@ mod tests {
         assert!(!status_enabled(false, false), "DB 关 + 句柄死 → OFF");
     }
 
-    /// (a-佐证) spawn 用法裁决的运行时证据：本测试线程**不进入任何 tokio runtime 上下文**，
-    /// 与 sync tauri 命令线程、lib.rs `.setup()` 主线程同境——裸 `tokio::spawn` 在此会
-    /// panic（no reactor running），而 `tauri::async_runtime::spawn`（内部先 enter 再
+    /// (a-佐证) spawn 用法裁决的运行时证据：本测试线程**不进入任何 tokio runtime
+    /// 上下文**，与 lib.rs `.setup()` 主线程同境——裸 `tokio::spawn` 在此会 panic
+    ///（no reactor running），而 `tauri::async_runtime::spawn`（内部先 enter 再
     /// spawn，tauri async_runtime.rs `Runtime::spawn`）必须正常工作。同时锁定句柄
-    /// `abort()` 能力（stop_server 依赖 SERVER_HANDLE 存此类型）
+    /// `abort()` 能力（stop_server 依赖 SERVER_HANDLE 存此类型）。
+    /// **终审 R4 更正**：sync tauri 命令线程的 runtime 语境**取决于执行路径**
+    ///（Blocking 池内不保证 enter——Gate D 复核指出旧注释「与 sync 命令线程同境/
+    /// 必无语境」与实现细节相悖）——因此**任何入口都不得依赖调用线程的 runtime
+    /// 语境**，一律用 `tauri::async_runtime::spawn`（见
+    /// `DesktopIpcAdapter::notify_auto_adapt_changed`）。
     #[test]
     fn async_runtime_spawn_works_without_runtime_context() {
         let h = tauri::async_runtime::spawn(async { 41 + 1 });

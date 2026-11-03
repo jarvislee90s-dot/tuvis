@@ -9,6 +9,7 @@
 //!
 //! 纪律：本模块**不发写帧**，也不解释「读不通」为「协议不存在」（见设计 §4.5）。
 
+pub mod desktop_contract;
 pub mod fingerprint;
 pub mod runner;
 pub mod schema_probe;
@@ -25,6 +26,10 @@ pub const CAP_STATE: &str = "state";
 /// 结论词沿用账本既有三态：`probed`（取到 decision 枚举）/ `inconclusive`
 /// （取不到，带错误码）——**不引入新状态词**（`capability` 是字符串列，无需改表结构）。
 pub const CAP_SCHEMA: &str = "schema";
+
+/// S1：账本 `capability` 列的**发送**能力词（兼容发送受理结论的落点；词与
+/// `codex_ipc_probe` 既有测试里的 "send" 一致，单一出处在此，remote 层只做别名）。
+pub const CAP_SEND: &str = "send";
 
 /// 探测账本接口（#172）：由 remote 层用 `DeviceStore` 实现注入 adapter；测试可注入
 /// 内存实现。语义 = `codex_ipc_probe` 表的读写（见 `database::dao::codex_ipc_probe`）。
@@ -45,12 +50,34 @@ pub trait ProbeLedger: Send + Sync {
         outcome: &runner::ProbeOutcome,
         fingerprint: Option<&str>,
     );
+    /// S1：读持久 **schema 决策词证据**（重启恢复零 CLI 重跑的来源；无 → `None`）。
+    /// 缺省 `None`：内存账本/老实现不必实现（生产 `StoreProbeLedger` 落
+    /// `codex_ipc_schema_evidence` 表）。
+    fn load_schema_evidence(&self, probe_key: &str) -> Option<PersistedSchemaEvidence> {
+        let _ = probe_key;
+        None
+    }
+    /// S1：写持久 **schema 决策词证据**（成功取证时与账本行一并落）。缺省空操作。
+    fn store_schema_evidence(
+        &self,
+        probe_key: &str,
+        evidence: &schema_probe::SchemaEvidence,
+        at_ms: i64,
+    ) {
+        let _ = (probe_key, evidence, at_ms);
+    }
 }
 
 /// 账本结论的精简视图（adapter 只关心「能否复用」与「退避到点没」）。
 ///
 /// #172/T9a 追加两个**只读**字段（探测事实要用）：`stage`（最后探测级 P0..P3）
 /// 与 `error_code`（账本里的错误码）——不改既有字段的语义。
+///
+/// S1（2026-10-23 设计 §3.2）追加三个**只读**字段（成功证据与失败观测分离）：
+/// * `evidenced`：该 (key, capability) 是否有过**成功取证**（证据列或旧数据兼容的
+///   `state∈probed|verified`）——跨重启复用看它，不看 `state`；
+/// * `evidenced_at` / `last_seen_at`：成功证据时间戳与最近观测时间戳（毫秒），
+///   DTO（适配状态）用它们表达「已取证」与「最近失败观测」两条线。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProbeLedgerEntry {
     pub state: ProbeState,
@@ -62,4 +89,19 @@ pub struct ProbeLedgerEntry {
     /// 证据指纹（只对 `capability = "schema"` 的行有值：官方 schema 探针的
     /// 内容指纹）；其余能力 → `None`。
     pub fingerprint: Option<String>,
+    /// S1：有过成功取证（不随后续失败观测消失）。
+    pub evidenced: bool,
+    /// S1：最后一次成功取证时间（毫秒；无 → `None`）。
+    pub evidenced_at: Option<i64>,
+    /// S1：最近一次观测时间（毫秒；无 → `None`）。
+    pub last_seen_at: Option<i64>,
+}
+
+/// S1：持久 **schema 决策词证据**（`codex_ipc_schema_evidence` 一行的精简视图）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersistedSchemaEvidence {
+    pub fingerprint: String,
+    pub command_decisions: Vec<String>,
+    pub file_decisions: Vec<String>,
+    pub evidenced_at: i64,
 }

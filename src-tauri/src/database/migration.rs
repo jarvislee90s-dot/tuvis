@@ -5,6 +5,12 @@ fn column_exists(conn: &Connection, table: &str, column: &str) -> bool {
         .is_ok()
 }
 
+/// 表是否存在（老库形状探测用；避免对不存在的表做 ALTER）。
+fn table_exists(conn: &Connection, table: &str) -> bool {
+    conn.prepare(&format!("SELECT 1 FROM {} LIMIT 0", table))
+        .is_ok()
+}
+
 /// 列是否 NOT NULL（老库形状探测用）：表或列不存在 → None
 fn column_notnull(conn: &Connection, table: &str, column: &str) -> Option<bool> {
     conn.prepare(&format!("PRAGMA table_info({})", table))
@@ -44,6 +50,56 @@ pub fn migrate(conn: &Connection) -> Result<(), String> {
         log::warn!("usage: 检测到预览版账本形状，已重建（四表清空，下次采集重算）");
     }
 
+    let claims_exists = conn
+        .prepare("SELECT 1 FROM codex_interaction_claims LIMIT 0")
+        .is_ok();
+    // B05：旧库的 action_id 唯一索引会阻止同组多题共享一个动作，必须撤掉。
+    if claims_exists {
+        conn.execute(
+            "DROP INDEX IF EXISTS idx_codex_interaction_claims_action",
+            [],
+        )
+        .map_err(|e| format!("MIGRATE_CLAIM_GROUP_FAIL: 迁移同组占用索引失败: {e}"))?;
+    }
+    if claims_exists && !column_exists(conn, "codex_interaction_claims", "claim_owner") {
+        conn.execute(
+            "ALTER TABLE codex_interaction_claims ADD COLUMN claim_owner TEXT NOT NULL DEFAULT ''",
+            [],
+        )
+        .map_err(|e| format!("MIGRATE_CLAIM_OWNER_TOKEN_FAIL: 迁移占用调用令牌失败: {e}"))?;
+    }
+    if claims_exists && !column_exists(conn, "codex_interaction_claims", "claimed_owner") {
+        conn.execute(
+            "ALTER TABLE codex_interaction_claims ADD COLUMN claimed_owner TEXT NOT NULL DEFAULT ''",
+            [],
+        )
+        .map_err(|e| format!("MIGRATE_CLAIM_OWNER_FAIL: 迁移同题占用世系列失败: {e}"))?;
+    }
+    if claims_exists && !column_exists(conn, "codex_interaction_claims", "claimed_epoch") {
+        conn.execute(
+            "ALTER TABLE codex_interaction_claims ADD COLUMN claimed_epoch INTEGER NOT NULL DEFAULT 0",
+            [],
+        )
+        .map_err(|e| format!("MIGRATE_CLAIM_EPOCH_FAIL: 迁移同题占用代际列失败: {e}"))?;
+    }
+
+    // H01：旧成功表缺包内容身份（无 package_sha256）→ 重建（成功证据是派生数据，
+    // 旧行本就无归因，不能猜归属）。重建后由紧随的 init 按新 DDL 建表。
+    if !column_exists(conn, "codex_operation_success", "package_sha256") {
+        conn.execute_batch(
+            "DROP TABLE IF EXISTS codex_operation_success;
+             CREATE TABLE codex_operation_success (
+                 probe_key       TEXT NOT NULL,
+                 package_sha256  TEXT NOT NULL,
+                 operation       TEXT NOT NULL,
+                 rule_version    INTEGER NOT NULL,
+                 evidence_at     INTEGER NOT NULL,
+                 PRIMARY KEY (probe_key, package_sha256, operation, rule_version)
+             );",
+        )
+        .map_err(|e| format!("MIGRATE_OPERATION_SUCCESS_REBUILD_FAIL: 重建成功证据表失败: {e}"))?;
+    }
+
     // 先幂等重放 schema.rs 全量 DDL（全部 IF NOT EXISTS）：老库/裸连接补建新表，
     // 已存在的表保持原样（缺列由下方 ALTER 迁移补齐），与生产启动顺序（schema::init → migrate）一致。
     // 上面 DROP 掉的预览版账本四表，由这次 init 按新 DDL 重建为空表。
@@ -62,6 +118,24 @@ pub fn migrate(conn: &Connection) -> Result<(), String> {
             [],
         )
         .map_err(|e| format!("MIGRATE_FAIL: {}", e))?;
+    }
+
+    // tps_point.cadence_ms（独立复核 R11）：老库的点表无此列 → 补加可空列（旧行 NULL = 无节奏信息，
+    // 前端不据此断线）；schema::init 的 CREATE IF NOT EXISTS 对已存在表不生效，须 ALTER 补齐
+    if !column_exists(conn, "tps_point", "cadence_ms") {
+        conn.execute("ALTER TABLE tps_point ADD COLUMN cadence_ms INTEGER", [])
+            .map_err(|e| format!("MIGRATE_FAIL: 迁移失败: {}", e))?;
+    }
+
+    // tps_observation.response_elapsed_ms（V2 Task 1）：老库的事实表无此列 → 补加可空列
+    // （旧行 NULL = 旧记录无显式响应窗，读取层走旧流式有效性的兼容路径，不回填不猜测）；
+    // 同上须 ALTER 幂等补齐。**只动 TPS 域三表，绝不触碰旧 usage_* 账本与游标**
+    if !column_exists(conn, "tps_observation", "response_elapsed_ms") {
+        conn.execute(
+            "ALTER TABLE tps_observation ADD COLUMN response_elapsed_ms INTEGER",
+            [],
+        )
+        .map_err(|e| format!("MIGRATE_FAIL: 迁移失败: {}", e))?;
     }
 
     // 检查 extension 表是否有 manifest_path 列
@@ -104,6 +178,272 @@ pub fn migrate(conn: &Connection) -> Result<(), String> {
             [],
         )
         .map_err(|e| format!("MIGRATE_FAIL: 迁移失败: {}", e))?;
+    }
+    // S1（2026-10-23 设计 §3.2）：成功证据与最近失败观测分离——补两列成功证据列。
+    // 幂等可重入；**不改任何旧行的既有列值**（「老数据」由读侧 has_evidence 按
+    // state∈probed|verified 兼容识别，写侧失败观测落账时按旧值提升，见 DAO）。
+    // 终审 R3：codex_queue_pause 补归属 token 列（旧行 NULL = 无归属，仅 resume
+    // /显式清除可删；新写入恒带 token——撤回只清本次拥有的行）。
+    if !column_exists(conn, "codex_queue_pause", "pause_token") {
+        conn.execute(
+            "ALTER TABLE codex_queue_pause ADD COLUMN pause_token TEXT",
+            [],
+        )
+        .map_err(|e| {
+            format!(
+                "MIGRATE_QUEUE_PAUSE_TOKEN_FAIL: 老库补列 codex_queue_pause.pause_token 失败: {e}"
+            )
+        })?;
+    }
+    // P3（2026-10-30）：停止类暂停绑定其等待的回合（打断/取消端点的 expectedTurnId
+    // 安全阀）——settle 路径按该 Turn 的终态证据自动清除停止类暂停行；旧行 NULL =
+    // 未绑定，保守保留（仅显式 resume 可清）。幂等可重入；必须在下方 R-T2 整表
+    // 重建之前执行（重建的 SELECT 携带本列）。
+    if !column_exists(conn, "codex_queue_pause", "pause_turn_id") {
+        conn.execute(
+            "ALTER TABLE codex_queue_pause ADD COLUMN pause_turn_id TEXT",
+            [],
+        )
+        .map_err(|e| {
+            format!(
+                "MIGRATE_QUEUE_PAUSE_TURN_FAIL: 老库补列 codex_queue_pause.pause_turn_id 失败: {e}"
+            )
+        })?;
+    }
+    // 合并发送：批次成员需冻结各自的签名状态（回队时按原样恢复正文，不能二次
+    // 签名/换正文）。schema 建表已含该列，但**早期建出的库只有 3 列**——补列幂等，
+    // 老行按 0（未签名）回填，命中时与旧行为一致。
+    if table_exists(conn, "codex_send_batch_members")
+        && !column_exists(conn, "codex_send_batch_members", "signature_applied")
+    {
+        conn.execute(
+            "ALTER TABLE codex_send_batch_members ADD COLUMN signature_applied INTEGER NOT NULL DEFAULT 0",
+            [],
+        )
+        .map_err(|e| {
+            format!(
+                "MIGRATE_BATCH_SIGNATURE_FAIL: 老库补列 codex_send_batch_members.signature_applied 失败: {e}"
+            )
+        })?;
+    }
+    // R05：优先处理「停止尝试未知结果」幂等归属列（旧行 NULL = 未做过停止尝试；
+    // 非 NULL = 同 actionId 重放先读本记录，不得再次发停止帧）。与动作行同生命周期，
+    // 重启不丢。
+    if !column_exists(conn, "codex_actions", "stop_attempt_reason") {
+        conn.execute(
+            "ALTER TABLE codex_actions ADD COLUMN stop_attempt_reason TEXT",
+            [],
+        )
+        .map_err(|e| {
+            format!(
+                "MIGRATE_CODEX_STOP_ATTEMPT_FAIL: 老库补列 codex_actions.stop_attempt_reason 失败: {e}"
+            )
+        })?;
+    }
+    // C02（R05 残留收口）：停止尝试的持久占有状态列——占有在首次可能写出 interrupt
+    // 之前 CAS 落库（'claimed'），覆盖「writer 已写出帧后 handler 被取消/服务退出」
+    // 的事后记录盲窗；首写前明确零投递才释放（'released'，允许显式新尝试）。
+    // 老库行恒 NULL：读侧兼容识别——NULL + stop_attempt_reason 非 NULL = C02 前已
+    // 记录的未知结果（重放同样不再发停止帧），NULL + NULL = 未占有（行为不变）。
+    if !column_exists(conn, "codex_actions", "stop_attempt_state") {
+        conn.execute(
+            "ALTER TABLE codex_actions ADD COLUMN stop_attempt_state TEXT",
+            [],
+        )
+        .map_err(|e| {
+            format!(
+                "MIGRATE_CODEX_STOP_ATTEMPT_STATE_FAIL: 老库补列 codex_actions.stop_attempt_state 失败: {e}"
+            )
+        })?;
+    }
+    // R06：越队授权补尝试代际列（旧行 = attempt 1，行为不变）。优先处理路径在
+    // 「上次明确零投递回队、动作仍 queued」时把已消费授权重铸为下一 attempt
+    //（下一次用户授权独立可 CAS）；老库行恒可被重铸，语义与旧行为兼容。
+    if !column_exists(conn, "codex_bypass_grant", "attempt") {
+        conn.execute(
+            "ALTER TABLE codex_bypass_grant ADD COLUMN attempt INTEGER NOT NULL DEFAULT 1",
+            [],
+        )
+        .map_err(|e| {
+            format!(
+                "MIGRATE_CODEX_BYPASS_ATTEMPT_FAIL: 老库补列 codex_bypass_grant.attempt 失败: {e}"
+            )
+        })?;
+    }
+    // R17：契约证据缓存必须能核对**当前包内容**（同 build/CLI 但包被替换时，旧结论
+    // 不得安装）。新增两列记录取证时的包文件大小与 mtime；老行 NULL = 未记录 →
+    // 读侧按"未能核对"处理（重新识别，不猜）。
+    for (column, ddl) in [
+        (
+            "package_size",
+            "ALTER TABLE codex_ipc_contract_evidence ADD COLUMN package_size INTEGER",
+        ),
+        (
+            "package_mtime_ms",
+            "ALTER TABLE codex_ipc_contract_evidence ADD COLUMN package_mtime_ms INTEGER",
+        ),
+    ] {
+        if !column_exists(conn, "codex_ipc_contract_evidence", column) {
+            conn.execute(ddl, []).map_err(|e| {
+                format!("MIGRATE_CONTRACT_EVIDENCE_PKG_FAIL: 老库补契约证据包指纹列失败: {e}")
+            })?;
+        }
+    }
+    if !column_exists(conn, "codex_ipc_probe", "evidence_at") {
+        conn.execute(
+            "ALTER TABLE codex_ipc_probe ADD COLUMN evidence_at INTEGER",
+            [],
+        )
+        .map_err(|e| format!("MIGRATE_FAIL: 迁移失败: {}", e))?;
+    }
+    if !column_exists(conn, "codex_ipc_probe", "evidence_stage") {
+        conn.execute(
+            "ALTER TABLE codex_ipc_probe ADD COLUMN evidence_stage TEXT",
+            [],
+        )
+        .map_err(|e| format!("MIGRATE_FAIL: 迁移失败: {}", e))?;
+    }
+    // 复审 R-T1：`codex_write_revoke` 升级为**两态行**（revoked_at 可空 + 新增
+    // claimed_at 列）——旧表 `revoked_at NOT NULL` 且无 claimed_at，SQLite 无法
+    // ALTER 列约束，只能整表重建。旧行全部是撤销行（revoked_at 原样保留，语义
+    // 不变）；重建幂等（新形状已有 claimed_at → 跳过）。无该表（全新库）时由
+    // schema::init 直接建新形状，本块跳过。
+    if !column_exists(conn, "codex_write_revoke", "claimed_at")
+        && conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='codex_write_revoke'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap_or(0)
+            > 0
+    {
+        conn.execute_batch(
+            "BEGIN IMMEDIATE;
+             CREATE TABLE codex_write_revoke_migrated (
+                 action_id  TEXT PRIMARY KEY,
+                 revoked_at INTEGER,
+                 reason     TEXT,
+                 claimed_at INTEGER
+             );
+             INSERT INTO codex_write_revoke_migrated (action_id, revoked_at, reason)
+                 SELECT action_id, revoked_at, reason FROM codex_write_revoke;
+             DROP TABLE codex_write_revoke;
+             ALTER TABLE codex_write_revoke_migrated RENAME TO codex_write_revoke;
+             COMMIT;",
+        )
+        .map_err(|e| {
+            format!("MIGRATE_WRITE_REVOKE_TWO_STATE_FAIL: codex_write_revoke 两态行重建失败: {e}")
+        })?;
+    }
+    // 复审 R-T2：`codex_queue_pause` 升级为**按 token 多行共存**（复合主键
+    // thread_id+pause_token）——旧表 `thread_id` 单列主键只容一行，第二个打断的
+    // 前置保护落不进（ON CONFLICT DO NOTHING），首个打断失败撤回后后受理打断
+    // 的暂停保护随之丢失（R-T2 反向定序）。SQLite 无法改主键，整表重建；旧行
+    // 原样保留（NULL token 行与 token 行共存，NULL 在复合主键中互异）。幂等：
+    // 新形状（pause_token 在主键中）跳过；全新库由 schema::init 直接建新形状。
+    // 顺序：必须在上方 pause_token 补列之后（最老库先补列再重建）。
+    {
+        let composite_pk = conn
+            .prepare("PRAGMA table_info(codex_queue_pause)")
+            .ok()
+            .map(|mut stmt| {
+                stmt.query_map([], |r| Ok((r.get::<_, String>(1)?, r.get::<_, i64>(5)?)))
+                    .ok()
+                    .map(|rows| {
+                        rows.filter_map(Result::ok)
+                            .any(|(name, pk)| name == "pause_token" && pk > 0)
+                    })
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false);
+        let table_present = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='codex_queue_pause'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap_or(0)
+            > 0;
+        if table_present && !composite_pk {
+            conn.execute_batch(
+                "BEGIN IMMEDIATE;
+                 CREATE TABLE codex_queue_pause_migrated (
+                     thread_id    TEXT NOT NULL,
+                     paused_at    INTEGER NOT NULL,
+                     pause_reason TEXT NOT NULL,
+                     pause_token  TEXT,
+                     pause_turn_id TEXT,
+                     PRIMARY KEY (thread_id, pause_token)
+                 );
+                 INSERT INTO codex_queue_pause_migrated (thread_id, paused_at, pause_reason, pause_token, pause_turn_id)
+                     SELECT thread_id, paused_at, pause_reason, pause_token, pause_turn_id FROM codex_queue_pause;
+                 DROP TABLE codex_queue_pause;
+                 ALTER TABLE codex_queue_pause_migrated RENAME TO codex_queue_pause;
+                 COMMIT;",
+            )
+            .map_err(|e| {
+                format!("MIGRATE_QUEUE_PAUSE_MULTI_TOKEN_FAIL: codex_queue_pause 多行共存重建失败: {e}")
+            })?;
+        }
+    }
+    // 终审 F1 + Gate C 裁决（方向 b）+ 复审 R1（一次性化）：清除 bug 时代的假
+    // 成功证据——**只跑一次**，持久完成标记与清理**同一事务原子执行**。
+    // 背景：S1 的 INSERT 臂曾无条件把 now/stage 写进证据列——首次 failed/inconclusive
+    // 的行带上「从未成功」的证据（复用门与 DTO 据此误报已取证、跳过重试）。bug 写出
+    // 的假证据经 ON CONFLICT 的 COALESCE 保留臂**跨重试/跨重启累积**（attempts 推到
+    // ≥2），行级与真「成功后失败」不可判别——裁决：清除全部 failed|inconclusive 行
+    // 的证据列（表未发版，代价 = 少数真「成功后失败」行重探一次，可接受）。
+    // R1（P1）：无版本的 UPDATE 会在**每次启动**重复执行——历史修复完成后，新产生
+    // 的真「成功→暂时失败」证据也会被清，直接违反成功跨重启保留。修法：专用完成
+    // 标记表（`codex_ipc_probe_fake_evidence_purge_done`）为持久凭据——标记表缺席时
+    // 进入本块：清理 UPDATE、建标记表、落标记行在**同一事务**内提交（原子；无待清
+    // 行也落标记）；标记在位则永久跳过（后续新增的真证据绝不复发被清）。
+    // 不触其他表。
+    {
+        let already_done = conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type='table' \
+                 AND name='codex_ipc_probe_fake_evidence_purge_done'",
+                [],
+                |_| Ok(()),
+            )
+            .is_ok();
+        if !already_done {
+            let tx = conn
+                .unchecked_transaction()
+                .map_err(|e| format!("MIGRATE_FAIL: 清理事务开启失败: {}", e))?;
+            let cleaned = tx
+                .execute(
+                    "UPDATE codex_ipc_probe
+                         SET evidence_at = NULL, evidence_stage = NULL
+                     WHERE state IN ('failed', 'inconclusive')
+                       AND evidence_at IS NOT NULL",
+                    [],
+                )
+                .map_err(|e| format!("MIGRATE_FAIL: 清除假证据失败: {}", e))?;
+            tx.execute(
+                "CREATE TABLE codex_ipc_probe_fake_evidence_purge_done (
+                     done_at INTEGER NOT NULL
+                 )",
+                [],
+            )
+            .map_err(|e| format!("MIGRATE_FAIL: 建清理标记表失败: {}", e))?;
+            tx.execute(
+                "INSERT INTO codex_ipc_probe_fake_evidence_purge_done (done_at) \
+                 VALUES (strftime('%s','now') * 1000)",
+                [],
+            )
+            .map_err(|e| format!("MIGRATE_FAIL: 落清理标记失败: {}", e))?;
+            tx.commit()
+                .map_err(|e| format!("MIGRATE_FAIL: 清理事务提交失败: {}", e))?;
+            if cleaned > 0 {
+                log::warn!(
+                    "codex_ipc: 已一次性清除 {cleaned} 行 bug 时代的假成功证据（表未发版；\
+                     含真「成功后失败」行的代价重探；完成标记已落，此后不再执行）"
+                );
+            }
+        }
     }
 
     // 预设 v2（spec §4）：presets 补描述/类型/绑定工具三列（新表由 schema.rs IF NOT EXISTS 覆盖）
@@ -268,6 +608,14 @@ pub fn migrate(conn: &Connection) -> Result<(), String> {
     // 签名开关冻结值（2026-10-20 复审）：登记时固定该动作的签名形态，排队期间
     // 改设置/重启/同 actionId 重试都不改变既定正文。旧行补列后保持 NULL = 升级前
     // 语义（恒带签名），不误改已完成动作。
+    if !column_exists(conn, "codex_actions", "effect_probe_key") {
+        conn.execute_batch(
+            "ALTER TABLE codex_actions ADD COLUMN effect_probe_key TEXT;
+             ALTER TABLE codex_actions ADD COLUMN effect_package_sha256 TEXT;
+             ALTER TABLE codex_actions ADD COLUMN effect_rule_version INTEGER;",
+        )
+        .map_err(|e| format!("MIGRATE_EFFECT_TARGET_FAIL: 迁移效果归属列失败: {e}"))?;
+    }
     if !column_exists(conn, "codex_actions", "signature_applied") {
         conn.execute(
             "ALTER TABLE codex_actions ADD COLUMN signature_applied INTEGER",
@@ -1025,6 +1373,102 @@ mod tests {
         }
     }
 
+    /// TPS 三表（2026-10-24 计划 Task 2）：老库形状（无三表）经 migrate 幂等补齐；
+    /// 重复迁移不报错、形状逐列与 spec §6 对齐（主键 tick_id+series_key / 三元组事实主键 /
+    /// window_ms 钉 120000）。新库由 schema.rs 直建，migrate 重放 init 全部短路。
+    #[test]
+    fn migrate_creates_tps_tables_idempotently() {
+        let conn = Connection::open_in_memory().unwrap();
+        // 老库形状：先建 extensions（migrate 前段 ALTER 依赖），不建 TPS 三表
+        conn.execute_batch(
+            "CREATE TABLE extensions (
+                id TEXT PRIMARY KEY, kind TEXT NOT NULL, name TEXT NOT NULL,
+                description TEXT, source_path TEXT NOT NULL, source_url TEXT,
+                version TEXT, tags TEXT, installed_at TEXT NOT NULL, updated_at TEXT NOT NULL
+            );",
+        )
+        .unwrap();
+        migrate(&conn).unwrap();
+        migrate(&conn).unwrap(); // 幂等：跑两遍不报错（IF NOT EXISTS 全部短路）
+        let cols = |table: &str| -> Vec<String> {
+            conn.prepare(&format!("PRAGMA table_info({})", table))
+                .unwrap()
+                .query_map([], |r| r.get::<_, String>(1))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        // 事实表：主键三元组逐字在场（spec §6：source+host_instance+stable_call_key）；
+        // V2 Task 1 补列 response_elapsed_ms（原先漏登记的本完备性清单，Task 6 补上）
+        let obs_cols = cols("tps_observation");
+        for c in [
+            "source",
+            "host_instance",
+            "stable_call_key",
+            "started_at_ms",
+            "first_token_at_ms",
+            "ended_at_ms",
+            "native_duration_ms",
+            "generation_ms",
+            "response_elapsed_ms",
+            "output_tokens",
+            "output_scope",
+            "tool_ms",
+            "model",
+            "channel",
+            "session_key",
+            "turn_key",
+            "purpose",
+            "outcome",
+            "method",
+            "failure_reason",
+        ] {
+            assert!(
+                obs_cols.contains(&c.to_string()),
+                "tps_observation 缺列 {c}"
+            );
+        }
+        // 点表：spec §6 点列清单（n/sum_output/sum_generation_ms/ttft_sum/count/
+        // latest_ended_at/quality/sampled_keys）+ window_ms 逐字钉 120000
+        let point_cols = cols("tps_point");
+        for c in [
+            "tick_id",
+            "series_key",
+            "sampled_at",
+            "window_ms",
+            "run_id",
+            "trigger_kind",
+            "status",
+            "quality",
+            "n",
+            "sum_output_tokens",
+            "sum_generation_ms",
+            "ttft_sum_ms",
+            "ttft_count",
+            "latest_ended_at",
+            "sampled_keys",
+            "cadence_ms",
+        ] {
+            assert!(point_cols.contains(&c.to_string()), "tps_point 缺列 {c}");
+        }
+        // 状态表：key+JSON
+        assert_eq!(
+            cols("tps_state"),
+            vec!["key", "value_json", "updated_at"],
+            "tps_state 列序 = key+JSON"
+        );
+        // V2 Task 6：dashboard 复合索引由 migrate 重放 init 幂等补齐（老库也拿到）
+        let idx: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' \
+                 AND name='idx_tps_observation_series_ended'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(idx, 1, "migrate 必须带出 idx_tps_observation_series_ended");
+    }
+
     /// Codex 动作账本：旧结构（**两列都不存在**）经迁移补列（barrier + signature）——
     /// `barrier_force_released_at` 与 `signature_applied` 都可空、存量行保留 NULL；
     /// 幂等两遍不报错。
@@ -1076,6 +1520,384 @@ mod tests {
             "存量行保留，两列均为 NULL（旧行签名语义 = 升级前恒签名）"
         );
         // 幂等：迁移两遍不报错
+        migrate(&conn).unwrap();
+    }
+
+    /// 独立复核 R11：老库 tps_point 无 cadence_ms 列 → migrate 以 ALTER 补加可空列（旧行 NULL），
+    /// 补后可按新列写读；重放幂等
+    #[test]
+    fn migrate_adds_cadence_ms_to_existing_tps_point() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE extensions (
+                id TEXT PRIMARY KEY, kind TEXT NOT NULL, name TEXT NOT NULL,
+                description TEXT, source_path TEXT NOT NULL, source_url TEXT,
+                version TEXT, tags TEXT, installed_at TEXT NOT NULL, updated_at TEXT NOT NULL
+            );
+            -- 修复前形状的点表（无 cadence_ms）
+            CREATE TABLE tps_point (
+                tick_id TEXT NOT NULL, series_key TEXT NOT NULL, sampled_at INTEGER NOT NULL,
+                window_ms INTEGER NOT NULL CHECK(window_ms = 120000), run_id TEXT NOT NULL,
+                trigger_kind TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('value','gap')),
+                method TEXT NOT NULL, output_scope TEXT NOT NULL, quality TEXT NOT NULL,
+                n INTEGER NOT NULL DEFAULT 0, sum_output_tokens INTEGER NOT NULL DEFAULT 0,
+                sum_generation_ms INTEGER NOT NULL DEFAULT 0, ttft_sum_ms INTEGER,
+                ttft_count INTEGER NOT NULL DEFAULT 0, model_ms INTEGER, tool_ms INTEGER,
+                avg_first_token_ms INTEGER, tps REAL, candidate_count INTEGER NOT NULL DEFAULT 0,
+                timed_model_count INTEGER NOT NULL DEFAULT 0, timed_tool_count INTEGER NOT NULL DEFAULT 0,
+                failed_count INTEGER NOT NULL DEFAULT 0, cancelled_count INTEGER NOT NULL DEFAULT 0,
+                missing_timing_count INTEGER NOT NULL DEFAULT 0, latest_ended_at INTEGER,
+                sampled_keys TEXT NOT NULL DEFAULT '[]',
+                PRIMARY KEY (tick_id, series_key)
+            );
+            INSERT INTO tps_point (tick_id, series_key, sampled_at, window_ms, run_id, trigger_kind,
+                status, method, output_scope, quality)
+            VALUES ('t1', 's1', 1, 120000, 'run', 'scheduled', 'gap', 'client-native', 'unknown', 'normal');",
+        )
+        .unwrap();
+        let cols = |t: &str| -> Vec<String> {
+            let mut st = conn.prepare(&format!("PRAGMA table_info({t})")).unwrap();
+            st.query_map([], |r| r.get::<_, String>(1))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        assert!(!cols("tps_point").contains(&"cadence_ms".to_string()));
+        migrate(&conn).unwrap();
+        assert!(
+            cols("tps_point").contains(&"cadence_ms".to_string()),
+            "ALTER 补列"
+        );
+        // 旧行 NULL；新行可写读
+        let old: Option<i64> = conn
+            .query_row(
+                "SELECT cadence_ms FROM tps_point WHERE tick_id='t1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(old, None);
+        conn.execute(
+            "UPDATE tps_point SET cadence_ms = 60000 WHERE tick_id='t1'",
+            [],
+        )
+        .unwrap();
+        let now: Option<i64> = conn
+            .query_row(
+                "SELECT cadence_ms FROM tps_point WHERE tick_id='t1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(now, Some(60000));
+        migrate(&conn).unwrap(); // 幂等
+    }
+
+    /// S1：`codex_ipc_probe` 老库（无证据列）迁移补 `evidence_at` / `evidence_stage`
+    /// 两列 + 建 `codex_ipc_schema_evidence` 决策词表。**不改旧行**：存量行两列为
+    /// NULL（旧成功由读侧 has_evidence 按旧值兼容识别，见 DAO 老数据回归）；
+    /// 幂等两遍不报错。
+    #[test]
+    fn migrate_codex_ipc_probe_adds_evidence_columns_keeps_legacy_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE codex_ipc_probe (
+                probe_key        TEXT NOT NULL,
+                capability       TEXT NOT NULL,
+                state            TEXT NOT NULL,
+                probe_stage      TEXT,
+                error_code       TEXT,
+                attempts         INTEGER NOT NULL DEFAULT 1,
+                first_seen_at    INTEGER NOT NULL,
+                last_seen_at     INTEGER NOT NULL,
+                next_retry_at    INTEGER,
+                last_duration_ms INTEGER,
+                PRIMARY KEY (probe_key, capability)
+            );
+            INSERT INTO codex_ipc_probe
+                (probe_key, capability, state, probe_stage, attempts, first_seen_at, last_seen_at)
+             VALUES ('windows|old|-|1', 'state', 'probed', 'P3', 2, 500, 900);",
+        )
+        .unwrap();
+        migrate(&conn).unwrap();
+        // 两列就位 + 决策词表就位
+        assert!(conn
+            .prepare("SELECT evidence_at, evidence_stage FROM codex_ipc_probe LIMIT 0")
+            .is_ok());
+        assert!(conn
+            .prepare("SELECT probe_key FROM codex_ipc_schema_evidence LIMIT 0")
+            .is_ok());
+        // 旧行原样保留（不删不改），证据列取 NULL 缺省
+        let (state, evidence_at): (String, Option<i64>) = conn
+            .query_row(
+                "SELECT state, evidence_at FROM codex_ipc_probe WHERE probe_key = 'windows|old|-|1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((state.as_str(), evidence_at), ("probed", None));
+        // 幂等：迁移两遍不报错
+        migrate(&conn).unwrap();
+    }
+
+    /// 终审 F1 + Gate C 裁决（方向 b）：bug 时代的假证据（含**重试累积形态**）被
+    /// 迁移清除；真成功证据保留；**「成功后失败」行按裁决一并清据、承担一次性
+    /// 重探代价**（表未发版；写路径的保留语义由 ON CONFLICT 臂继续保证）。
+    /// 形态覆盖：①首次失败假证据（attempts=1）；②假证据经退避重试累积到
+    /// attempts=2（COALESCE 保留臂——初版 attempts=1 判据漏掉的形态）；③真首次
+    /// 成功（保留）；④真成功后失败（清据 + 注明代价）。幂等两遍。
+    #[test]
+    fn migrate_codex_ipc_probe_clears_fake_evidence_keeps_real() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE codex_ipc_probe (
+                probe_key        TEXT NOT NULL,
+                capability       TEXT NOT NULL,
+                state            TEXT NOT NULL,
+                probe_stage      TEXT,
+                error_code       TEXT,
+                attempts         INTEGER NOT NULL DEFAULT 1,
+                first_seen_at    INTEGER NOT NULL,
+                last_seen_at     INTEGER NOT NULL,
+                next_retry_at    INTEGER,
+                last_duration_ms INTEGER,
+                fingerprint      TEXT,
+                evidence_at      INTEGER,
+                evidence_stage   TEXT,
+                PRIMARY KEY (probe_key, capability)
+            );
+            -- 假证据①：首次 inconclusive（bug INSERT 臂写的 now=1000）
+            INSERT INTO codex_ipc_probe
+                (probe_key, capability, state, probe_stage, error_code, attempts,
+                 first_seen_at, last_seen_at, evidence_at, evidence_stage)
+             VALUES ('windows|fake|-|1', 'state', 'inconclusive', 'P1', 'timeout', 1,
+                     1000, 1000, 1000, 'P1');
+            -- 假证据②：首次 failed
+            INSERT INTO codex_ipc_probe
+                (probe_key, capability, state, probe_stage, error_code, attempts,
+                 first_seen_at, last_seen_at, evidence_at, evidence_stage)
+             VALUES ('windows|fake|-|1', 'send', 'failed', NULL, 'method_not_found', 1,
+                     2000, 2000, 2000, NULL);
+            -- 真证据①：首次成功（attempts=1 ∧ probed）
+            INSERT INTO codex_ipc_probe
+                (probe_key, capability, state, probe_stage, attempts,
+                 first_seen_at, last_seen_at, evidence_at, evidence_stage)
+             VALUES ('windows|real|-|1', 'state', 'probed', 'P3', 1,
+                     3000, 3000, 3000, 'P3');
+            -- 假证据③（Gate C 补充形态）：假证据经退避重试累积（attempts=2）——
+            -- ON CONFLICT 的 COALESCE 保留臂把首写假证据带到 attempts≥2，
+            -- 行级与真「成功后失败」不可判别（evidence_at 都=首写时间）
+            INSERT INTO codex_ipc_probe
+                (probe_key, capability, state, probe_stage, error_code, attempts,
+                 first_seen_at, last_seen_at, evidence_at, evidence_stage)
+             VALUES ('windows|fake|-|2', 'state', 'inconclusive', 'P1', 'timeout', 2,
+                     1500, 6000, 1500, 'P1');
+            -- 真证据②：成功后失败（attempts=2）——**Gate C 裁决：一并清据**，
+            -- 承担一次性重探代价（表未发版；新数据的保留语义由写路径继续保证）
+            INSERT INTO codex_ipc_probe
+                (probe_key, capability, state, probe_stage, error_code, attempts,
+                 first_seen_at, last_seen_at, evidence_at, evidence_stage)
+             VALUES ('windows|real|-|1', 'send', 'failed', 'P1', 'cli_missing', 2,
+                     4000, 5000, 4000, 'P1');",
+        )
+        .unwrap();
+        migrate(&conn).unwrap();
+        // 假证据被清（含 Gate C 补充的重试累积形态）——读侧 has_evidence 随之
+        // 回落 false → 重探不再被短路
+        for (key, cap) in [
+            ("windows|fake|-|1", "state"),
+            ("windows|fake|-|1", "send"),
+            ("windows|fake|-|2", "state"),
+        ] {
+            let (evidence_at, evidence_stage): (Option<i64>, Option<String>) = conn
+                .query_row(
+                    "SELECT evidence_at, evidence_stage FROM codex_ipc_probe \
+                     WHERE probe_key = ?1 AND capability = ?2",
+                    [key, cap],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                (evidence_at, evidence_stage),
+                (None, None),
+                "假证据（首写 + 重试累积形态）必须被清除：{key}/{cap}"
+            );
+        }
+        // 真首次成功保留
+        let real_state: Option<i64> = conn
+            .query_row(
+                "SELECT evidence_at FROM codex_ipc_probe \
+                 WHERE probe_key = 'windows|real|-|1' AND capability = 'state'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(real_state, Some(3000), "首次成功的真证据保留");
+        // Gate C 裁决：「成功后失败」行在修复后证据为空（一次性代价——下次触发
+        // 重探一次；写路径的保留语义由 ON CONFLICT 臂继续保证，新数据不受影响）
+        let real_send: Option<i64> = conn
+            .query_row(
+                "SELECT evidence_at FROM codex_ipc_probe \
+                 WHERE probe_key = 'windows|real|-|1' AND capability = 'send'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            real_send, None,
+            "成功后失败行按裁决清据（一次性重探代价，表未发版）"
+        );
+        // 幂等：迁移两遍不再清任何行（真成功证据不被二遍误清）
+        migrate(&conn).unwrap();
+        let real_state2: Option<i64> = conn
+            .query_row(
+                "SELECT evidence_at FROM codex_ipc_probe \
+                 WHERE probe_key = 'windows|real|-|1' AND capability = 'state'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(real_state2, Some(3000), "幂等：真成功证据不被二遍迁移误清");
+        // 完成标记已落（一次性清理的持久凭据；首跑无待清行也要落——见下方空表用例）
+        assert!(
+            conn.query_row(
+                "SELECT 1 FROM sqlite_master WHERE type='table' \
+                 AND name='codex_ipc_probe_fake_evidence_purge_done'",
+                [],
+                |_| Ok(()),
+            )
+            .is_ok(),
+            "一次性清理必须留持久完成标记"
+        );
+    }
+
+    /// 复审 R1（P1）：一次性清理必须**真的只跑一次**——标记后新增的真「成功→
+    /// 失败」证据不得被后续迁移清除。序列 = 复审原文：migrate（清一次）→ 写真
+    /// 成功证据 → 记失败（证据保留）→ 再 migrate → **断言证据保留**（红 = 被清）。
+    #[test]
+    fn fake_evidence_purge_is_one_shot_new_evidence_survives_later_migrations() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE codex_ipc_probe (
+                probe_key        TEXT NOT NULL,
+                capability       TEXT NOT NULL,
+                state            TEXT NOT NULL,
+                probe_stage      TEXT,
+                error_code       TEXT,
+                attempts         INTEGER NOT NULL DEFAULT 1,
+                first_seen_at    INTEGER NOT NULL,
+                last_seen_at     INTEGER NOT NULL,
+                next_retry_at    INTEGER,
+                last_duration_ms INTEGER,
+                fingerprint      TEXT,
+                evidence_at      INTEGER,
+                evidence_stage   TEXT,
+                PRIMARY KEY (probe_key, capability)
+            );",
+        )
+        .unwrap();
+        // 第一次 migrate：无待清行也必须落完成标记
+        migrate(&conn).unwrap();
+        assert!(
+            conn.query_row(
+                "SELECT 1 FROM codex_ipc_probe_fake_evidence_purge_done",
+                [],
+                |_| Ok(()),
+            )
+            .is_ok(),
+            "无待清行也要记录完成"
+        );
+        // 修复后写路径：真成功证据 → 随后失败（证据由 ON CONFLICT 保留）
+        crate::database::dao::codex_ipc_probe::upsert_ok_conn(
+            &conn,
+            "windows|fresh|-|1",
+            "state",
+            Some("P3"),
+            None,
+            Some(100),
+            1_000,
+        )
+        .unwrap();
+        crate::database::dao::codex_ipc_probe::upsert_fail_conn(
+            &conn,
+            "windows|fresh|-|1",
+            "state",
+            Some("P1"),
+            "cli_missing",
+            None,
+            Some(80),
+            2_000,
+        )
+        .unwrap();
+        let before: (Option<i64>, String, i64) = conn
+            .query_row(
+                "SELECT evidence_at, state, attempts FROM codex_ipc_probe \
+                 WHERE probe_key = 'windows|fresh|-|1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            before,
+            (Some(1_000), "failed".into(), 2),
+            "前置：成功后失败保留证据（既有契约）"
+        );
+        // 再 migrate：**不得**清除标记之后新增的真证据（红 = 被清成 NULL）
+        migrate(&conn).unwrap();
+        let after: (Option<i64>, Option<String>) = conn
+            .query_row(
+                "SELECT evidence_at, evidence_stage FROM codex_ipc_probe \
+                 WHERE probe_key = 'windows|fresh|-|1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            after,
+            (Some(1_000), Some("P3".into())),
+            "一次性清理完成后，新增真「成功→失败」证据必须跨迁移保留（R1 红 = 被清）"
+        );
+    }
+}
+
+#[cfg(test)]
+mod batch_migration_tests {
+    use super::*;
+
+    /// 2026-10-31 实机：早期建出的 `codex_send_batch_members` 只有 3 列，
+    /// 而查询按 `member_id, wire_text, signature_applied` 取值 →
+    /// `no such column: signature_applied`，合并发送的回队路径直接失败。
+    /// 迁移必须把这一列补上（幂等、可重入、老行有确定默认值）。
+    #[test]
+    fn migrate_adds_batch_signature_column_to_legacy_table() {
+        let conn = Connection::open_in_memory().unwrap();
+        // 老库形状：只有 3 列
+        conn.execute_batch(
+            "CREATE TABLE codex_send_batch_members (
+                member_id TEXT PRIMARY KEY,
+                leader_id TEXT NOT NULL,
+                wire_text TEXT NOT NULL
+            );
+            INSERT INTO codex_send_batch_members (member_id, leader_id, wire_text)
+            VALUES ('m1', 'l1', '旧批次正文');",
+        )
+        .unwrap();
+        migrate(&conn).unwrap();
+        assert!(
+            conn.prepare("SELECT signature_applied FROM codex_send_batch_members LIMIT 0")
+                .is_ok(),
+            "迁移后必须有 signature_applied 列"
+        );
+        // 老行有确定默认值（未签名 = 0，与旧的行为一致）
+        let v: i64 = conn
+            .query_row(
+                "SELECT signature_applied FROM codex_send_batch_members WHERE member_id='m1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(v, 0, "老行回填 0（未签名）");
+        // 幂等：再跑一遍不报错
         migrate(&conn).unwrap();
     }
 }

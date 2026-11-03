@@ -1,0 +1,2152 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>兔维斯 · 双指标与中性材质讨论稿</title>
+    <link rel="icon" href="data:," />
+    <style>
+      :root {
+        --bg: #f5f6f8;
+        --paper: #fff;
+        --ink: #202735;
+        --muted: #696962;
+        --line: #e5e8ee;
+        --blue: #555555;
+        --tint: #eeeee8;
+        --green: #228569;
+        --shadow: 0 12px 48px #25334a0c;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        background: #e9ecf1;
+        color: var(--ink);
+        font:
+          14px -apple-system,
+          BlinkMacSystemFont,
+          "PingFang SC",
+          "Microsoft YaHei",
+          sans-serif;
+      }
+      button,
+      input,
+      select {
+        font: inherit;
+      }
+      button,
+      select {
+        cursor: pointer;
+      }
+      button {
+        border: 0;
+        background: none;
+        color: inherit;
+      }
+      button:focus-visible,
+      input:focus-visible,
+      select:focus-visible,
+      [tabindex]:focus-visible {
+        outline: 2px solid var(--blue);
+        outline-offset: 3px;
+      }
+      button:hover {
+        filter: brightness(0.98);
+      }
+      .lab {
+        max-width: 1240px;
+        margin: auto;
+        padding: 22px 24px 34px;
+      }
+      .labbar {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 16px;
+        margin-bottom: 14px;
+      }
+      .labtitle {
+        font-size: 13px;
+        font-weight: 650;
+      }
+      .labtitle span {
+        font-weight: 400;
+        color: #72726b;
+        margin-left: 10px;
+      }
+      .compare {
+        background: #dce1e9;
+        border-radius: 9px;
+        padding: 3px;
+        display: flex;
+        gap: 2px;
+      }
+      .compare button {
+        padding: 8px 13px;
+        border-radius: 7px;
+        font-size: 12px;
+      }
+      .compare button.on {
+        background: white;
+        box-shadow: 0 2px 5px #00000008;
+      }
+      .recommend {
+        color: var(--blue);
+        font-size: 10px;
+        margin-left: 5px;
+      }
+      .shell {
+        background: var(--paper);
+        border: 1px solid #d8dde6;
+        border-radius: 14px;
+        box-shadow: var(--shadow);
+        overflow: hidden;
+        position: relative;
+      }
+      .windowbar {
+        height: 46px;
+        display: flex;
+        align-items: center;
+        padding: 0 20px;
+        border-bottom: 1px solid var(--line);
+        gap: 18px;
+      }
+      .dots {
+        display: flex;
+        gap: 7px;
+      }
+      .dots i {
+        width: 10px;
+        height: 10px;
+        border-radius: 50%;
+        background: #fa716a;
+      }
+      .dots i:nth-child(2) {
+        background: #eab94b;
+      }
+      .dots i:nth-child(3) {
+        background: #60ba82;
+      }
+      .brand {
+        font-weight: 650;
+        font-size: 13px;
+      }
+      .windowbar .right {
+        margin-left: auto;
+        display: flex;
+        gap: 18px;
+        align-items: center;
+        color: var(--muted);
+        font-size: 12px;
+      }
+      .demo {
+        border: 1px solid var(--line);
+        border-radius: 5px;
+        padding: 3px 6px;
+        font-size: 10px;
+        color: #8b93a0;
+      }
+      .nav {
+        height: 59px;
+        display: flex;
+        align-items: stretch;
+        padding: 0 25px;
+        gap: 28px;
+        border-bottom: 1px solid var(--line);
+      }
+      .nav button {
+        font-size: 13px;
+        border-bottom: 2px solid transparent;
+        display: flex;
+        align-items: center;
+        gap: 7px;
+        color: var(--muted);
+        white-space: nowrap;
+      }
+      .nav button.on {
+        color: var(--blue);
+        border-color: var(--blue);
+        font-weight: 650;
+      }
+      .icon {
+        width: 16px;
+        height: 16px;
+        display: inline-block;
+        vertical-align: -3px;
+        fill: none;
+        stroke: currentColor;
+        stroke-width: 1.6;
+        stroke-linecap: round;
+        stroke-linejoin: round;
+      }
+      .workspace {
+        background: var(--bg);
+        padding: 25px 27px 27px;
+        min-height: 655px;
+      }
+      .pagehead {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 15px;
+        margin-bottom: 20px;
+      }
+      h1 {
+        font-size: 23px;
+        letter-spacing: -0.5px;
+        margin: 0 0 6px;
+        font-weight: 650;
+      }
+      h2 {
+        margin: 0;
+        font-size: 15px;
+        font-weight: 650;
+      }
+      p {
+        margin: 0;
+      }
+      .sub {
+        font-size: 12px;
+        color: var(--muted);
+        line-height: 1.7;
+      }
+      .headacts {
+        display: flex;
+        gap: 10px;
+        align-items: center;
+      }
+      .btn {
+        border: 1px solid #dce0e8;
+        border-radius: 8px;
+        padding: 9px 12px;
+        background: white;
+        font-size: 12px;
+        white-space: nowrap;
+      }
+      .btn.primary {
+        background: var(--blue);
+        color: white;
+        border-color: var(--blue);
+      }
+      .live {
+        font-size: 11px;
+        color: var(--green);
+        display: flex;
+        align-items: center;
+        gap: 6px;
+      }
+      .live:before {
+        content: "";
+        width: 6px;
+        height: 6px;
+        border-radius: 50%;
+        background: var(--green);
+      }
+      .speedgrid {
+        display: grid;
+        grid-template-columns: 255px minmax(0, 1fr);
+        gap: 17px;
+      }
+      .panel {
+        background: var(--paper);
+        border: 1px solid var(--line);
+        border-radius: 11px;
+      }
+      .listhead {
+        padding: 17px 15px 12px;
+      }
+      .listhead h2 {
+        font-size: 13px;
+        margin-bottom: 12px;
+      }
+      .search {
+        width: 100%;
+        border: 1px solid var(--line);
+        border-radius: 7px;
+        padding: 9px 10px;
+        background: #fafbfc;
+        font-size: 12px;
+        color: var(--ink);
+      }
+      .listfilters {
+        display: flex;
+        gap: 6px;
+        margin-top: 9px;
+      }
+      .listfilters select {
+        width: 50%;
+        font-size: 11px;
+        padding: 6px 4px;
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        background: white;
+        color: var(--muted);
+      }
+      .listlabels {
+        display: flex;
+        justify-content: space-between;
+        padding: 0 16px 9px;
+        font-size: 10px;
+        color: #8b8b85;
+      }
+      .series {
+        padding: 0 7px 10px;
+        min-height: 400px;
+      }
+      .series button {
+        width: 100%;
+        display: flex;
+        gap: 10px;
+        align-items: center;
+        text-align: left;
+        padding: 12px 10px;
+        border-radius: 8px;
+        margin: 2px 0;
+        border: 1px solid transparent;
+      }
+      .series button.selected {
+        background: var(--tint);
+        border-color: #dbdbd6;
+      }
+      .toolmark {
+        width: 29px;
+        height: 29px;
+        border-radius: 8px;
+        display: grid;
+        place-items: center;
+        background: #edf0f5;
+        color: #697489;
+        font-size: 12px;
+        font-weight: 700;
+        flex-shrink: 0;
+      }
+      .selected .toolmark {
+        background: #e8e8e3;
+        color: var(--blue);
+      }
+      .series .names {
+        min-width: 0;
+        flex: 1;
+      }
+      .series .names strong {
+        display: block;
+        font-size: 12px;
+        font-weight: 550;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      .series .names small {
+        display: block;
+        margin-top: 4px;
+        font-size: 10px;
+        color: var(--muted);
+      }
+      .series .rate {
+        font-variant-numeric: tabular-nums;
+        font-size: 13px;
+        font-weight: 600;
+      }
+      .emptylist {
+        padding: 30px 10px;
+        color: var(--muted);
+        font-size: 12px;
+      }
+      .mainpanel {
+        min-width: 0;
+      }
+      .rangetoolbar {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        margin-bottom: 12px;
+        gap: 10px;
+      }
+      .ranges {
+        display: flex;
+        gap: 4px;
+        background: #e8ebf1;
+        border-radius: 8px;
+        padding: 3px;
+      }
+      .ranges button {
+        padding: 7px 12px;
+        font-size: 11px;
+        border-radius: 6px;
+        white-space: nowrap;
+      }
+      .ranges .on {
+        background: white;
+        box-shadow: 0 1px 4px #27314f0b;
+        font-weight: 600;
+      }
+      .tiny {
+        font-size: 10px;
+        color: #797973;
+        line-height: 1.6;
+      }
+      .identity {
+        display: flex;
+        justify-content: space-between;
+        gap: 15px;
+        align-items: center;
+        margin-bottom: 15px;
+      }
+      .identity h2 {
+        font-size: 15px;
+      }
+      .identity .sub {
+        margin-top: 4px;
+      }
+      .textbutton {
+        font-size: 11px;
+        color: var(--blue);
+        padding: 3px;
+      }
+      .metricsbox {
+        padding: 18px 19px 15px;
+        margin-bottom: 14px;
+      }
+      .metriccontext {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        margin-bottom: 16px;
+        font-size: 11px;
+        color: var(--muted);
+        min-height: 19px;
+      }
+      .metriccontext strong {
+        color: #5a6475;
+        font-weight: 500;
+      }
+      .metrics {
+        display: grid;
+        grid-template-columns: 1.22fr 1fr 1fr 1fr;
+        gap: 16px;
+        align-items: end;
+      }
+      .metric:not(:first-child) {
+        border-left: 1px solid var(--line);
+        padding-left: 18px;
+      }
+      .metric label {
+        font-size: 10px;
+        color: var(--muted);
+        display: block;
+        margin-bottom: 9px;
+        white-space: nowrap;
+      }
+      .metric .value {
+        font-size: 23px;
+        line-height: 1;
+        font-weight: 600;
+        letter-spacing: -0.7px;
+        font-variant-numeric: tabular-nums;
+        white-space: nowrap;
+      }
+      .metric:first-child .value {
+        font-size: 34px;
+        color: var(--blue);
+        font-weight: 700;
+      }
+      .unit {
+        font-size: 10px;
+        font-weight: 400;
+        letter-spacing: 0;
+        margin-left: 3px;
+        color: var(--muted);
+      }
+      .chartbox {
+        padding: 17px 18px 12px;
+      }
+      .charthead {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 10px;
+        margin-bottom: 7px;
+      }
+      .charthead h2 {
+        font-size: 12px;
+      }
+      .gapmode {
+        display: flex;
+        gap: 7px;
+        align-items: center;
+        font-size: 10px;
+        color: var(--muted);
+      }
+      .gapmode select {
+        border: 0;
+        color: var(--muted);
+        background: #f5f6f9;
+        border-radius: 5px;
+        padding: 5px;
+        font-size: 10px;
+      }
+      .chartwrap {
+        position: relative;
+        touch-action: none;
+      }
+      .chartwrap svg {
+        display: block;
+        width: 100%;
+        height: auto;
+        overflow: visible;
+      }
+      .chartfoot {
+        display: flex;
+        justify-content: space-between;
+        font-size: 10px;
+        color: #8a93a3;
+        gap: 10px;
+        margin-top: 3px;
+        line-height: 1.7;
+      }
+      .charttip {
+        position: absolute;
+        pointer-events: none;
+        background: #222c40;
+        color: white;
+        border-radius: 7px;
+        padding: 8px 10px;
+        font-size: 10px;
+        line-height: 1.7;
+        box-shadow: 0 6px 20px #1e2b4820;
+        display: none;
+        white-space: nowrap;
+        z-index: 2;
+      }
+      .coverage {
+        margin-top: 14px;
+        display: flex;
+        align-items: center;
+        gap: 9px;
+      }
+      .coverage span {
+        font-size: 10px;
+        color: var(--muted);
+        white-space: nowrap;
+      }
+      .coverstrip {
+        height: 5px;
+        display: flex;
+        gap: 3px;
+        flex: 1;
+      }
+      .coverstrip i {
+        flex: 1;
+        border-radius: 2px;
+        background: #cecec6;
+      }
+      .coverstrip i.none {
+        background: repeating-linear-gradient(
+          135deg,
+          #e1e5ec,
+          #e1e5ec 2px,
+          #f7f8fa 2px,
+          #f7f8fa 4px
+        );
+      }
+      .footnote {
+        margin-top: 13px;
+        font-size: 11px;
+        line-height: 1.8;
+        color: #797972;
+      }
+      .drawerShade {
+        position: absolute;
+        inset: 46px 0 0;
+        background: #151d311c;
+        z-index: 4;
+        display: none;
+      }
+      .drawer {
+        position: absolute;
+        right: 0;
+        top: 46px;
+        bottom: 0;
+        width: 360px;
+        background: white;
+        border-left: 1px solid var(--line);
+        box-shadow: -15px 0 40px #25304b0c;
+        z-index: 5;
+        padding: 24px;
+        overflow: auto;
+        display: none;
+      }
+      .drawer h2 {
+        font-size: 18px;
+        margin-bottom: 7px;
+      }
+      .drawerclose {
+        position: absolute;
+        right: 18px;
+        top: 19px;
+        color: #929aaa;
+        font-size: 21px;
+      }
+      .sourcerow {
+        padding: 15px 0;
+        border-bottom: 1px solid var(--line);
+        display: flex;
+        gap: 10px;
+        align-items: center;
+        justify-content: space-between;
+      }
+      .sourcerow strong {
+        display: block;
+        font-size: 13px;
+        margin-bottom: 5px;
+      }
+      .sourcerow small {
+        font-size: 11px;
+        color: var(--muted);
+      }
+      .sourceinfo {
+        padding: 18px 0;
+        line-height: 1.9;
+        font-size: 12px;
+        color: #687487;
+      }
+      .sourceinfo summary {
+        cursor: pointer;
+        color: #475369;
+      }
+      .wizard {
+        padding: 16px;
+        background: #f5f5f1;
+        border: 1px solid #deded7;
+        border-radius: 9px;
+        margin-top: 18px;
+        font-size: 12px;
+        line-height: 1.9;
+      }
+      .wizard h3 {
+        margin: 0 0 10px;
+        font-size: 13px;
+      }
+      .wizard ol {
+        padding-left: 19px;
+        margin: 10px 0 14px;
+      }
+      .wiznotice {
+        color: var(--blue);
+        font-size: 11px;
+      }
+      .topbar2 {
+        display: none;
+        background: white;
+        border: 1px solid #d8dde6;
+        border-bottom: 0;
+        border-radius: 10px 10px 0 0;
+        padding: 10px 16px;
+        justify-content: space-between;
+        font-size: 11px;
+      }
+      .floating .workspace {
+        margin: 26px 30px 28px 100px;
+        border: 1px solid #d8dde6;
+        border-top: 0;
+        border-radius: 0 0 10px 10px;
+        box-shadow: 0 15px 40px #25334a20;
+        min-height: 620px;
+      }
+      .floating .topbar2 {
+        display: flex;
+        margin: 27px 30px -26px 100px;
+      }
+      .floating.shell {
+        background: #e8ebf0;
+      }
+      .floating .speedgrid {
+        grid-template-columns: 235px minmax(0, 1fr);
+      }
+      .floating .metrics {
+        gap: 8px;
+      }
+      .floating .metric:not(:first-child) {
+        padding-left: 10px;
+      }
+      .floating .metric .value {
+        font-size: 20px;
+      }
+      .floating .metric:first-child .value {
+        font-size: 29px;
+      }
+      .tiles {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: 16px;
+      }
+      .tile {
+        padding: 20px;
+        min-height: 170px;
+      }
+      .tile .tag {
+        font-size: 10px;
+        color: var(--green);
+        padding: 4px 6px;
+        background: #eef7f3;
+        border-radius: 5px;
+      }
+      .tile h3 {
+        font-size: 15px;
+        margin-top: 22px;
+        margin-bottom: 8px;
+      }
+      .resource {
+        width: 100%;
+        border-collapse: collapse;
+        font-size: 12px;
+      }
+      .resource th,
+      .resource td {
+        text-align: left;
+        padding: 16px;
+        border-bottom: 1px solid var(--line);
+      }
+      .resource th {
+        color: var(--muted);
+        font-size: 11px;
+        font-weight: 400;
+      }
+      .resource td small {
+        color: var(--muted);
+      }
+      .usagecards {
+        display: grid;
+        grid-template-columns: repeat(4, 1fr);
+        gap: 14px;
+        margin-bottom: 20px;
+      }
+      .usagecards .panel {
+        padding: 18px;
+      }
+      .usagecards .value {
+        font-size: 27px;
+        margin-top: 12px;
+        font-weight: 650;
+        letter-spacing: -0.7px;
+      }
+      .usagecards label {
+        font-size: 11px;
+        color: var(--muted);
+      }
+      .usagecontent {
+        max-width: 950px;
+        margin: auto;
+      }
+      .settingsgrid {
+        display: grid;
+        grid-template-columns: 165px 1fr;
+        gap: 24px;
+      }
+      .settingsside button {
+        display: block;
+        width: 100%;
+        text-align: left;
+        padding: 12px;
+        border-radius: 7px;
+        color: var(--muted);
+      }
+      .settingsside button.on {
+        background: var(--tint);
+        color: var(--blue);
+      }
+      .settingrow {
+        padding: 20px 0;
+        border-bottom: 1px solid var(--line);
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+      }
+      .switch {
+        width: 32px;
+        height: 19px;
+        background: var(--blue);
+        border-radius: 20px;
+        position: relative;
+      }
+      .switch:after {
+        content: "";
+        background: white;
+        width: 13px;
+        height: 13px;
+        position: absolute;
+        right: 3px;
+        top: 3px;
+        border-radius: 50%;
+      }
+      .toast {
+        position: fixed;
+        bottom: 24px;
+        left: 50%;
+        transform: translateX(-50%);
+        background: #263148;
+        color: white;
+        border-radius: 8px;
+        padding: 11px 18px;
+        font-size: 12px;
+        z-index: 20;
+        display: none;
+      }
+      .below {
+        display: flex;
+        justify-content: space-between;
+        gap: 20px;
+        padding: 15px 4px 0;
+        color: #6e788b;
+        font-size: 11px;
+        line-height: 1.8;
+      }
+      .below b {
+        font-weight: 500;
+        color: #4d5b74;
+      }
+      @media (max-width: 980px) {
+        .lab {
+          padding: 12px;
+        }
+        .speedgrid,
+        .floating .speedgrid {
+          grid-template-columns: 220px minmax(0, 1fr);
+        }
+        .workspace {
+          padding: 20px 16px;
+        }
+        .metrics {
+          gap: 9px;
+        }
+        .metric:not(:first-child) {
+          padding-left: 11px;
+        }
+        .metric .value {
+          font-size: 20px;
+        }
+        .metric:first-child .value {
+          font-size: 29px;
+        }
+        .floating .workspace,
+        .floating .topbar2 {
+          margin-left: 35px;
+          margin-right: 15px;
+        }
+        .nav {
+          gap: 22px;
+        }
+        .ranges button {
+          padding: 7px 8px;
+        }
+      }
+      @media (max-width: 740px) {
+        .labbar {
+          align-items: start;
+          flex-direction: column;
+          gap: 10px;
+        }
+        .labtitle span {
+          display: block;
+          margin: 5px 0 0;
+        }
+        .windowbar {
+          padding: 0 13px;
+        }
+        .nav {
+          padding: 0 15px;
+          gap: 18px;
+          overflow: auto;
+        }
+        .nav button {
+          font-size: 12px;
+        }
+        .nav .icon {
+          display: none;
+        }
+        .workspace {
+          padding: 20px 12px;
+        }
+        .speedgrid,
+        .floating .speedgrid {
+          grid-template-columns: 1fr;
+        }
+        .series {
+          display: flex;
+          overflow: auto;
+          min-height: 0;
+          padding: 0 7px 7px;
+        }
+        .series button {
+          min-width: 185px;
+        }
+        .listhead {
+          padding: 12px;
+        }
+        .listhead h2,
+        .listlabels {
+          display: none;
+        }
+        .listfilters {
+          margin: 0;
+          min-width: 45%;
+        }
+        .listhead {
+          display: flex;
+          gap: 8px;
+        }
+        .pagehead {
+          align-items: start;
+        }
+        .headacts {
+          gap: 6px;
+        }
+        .live {
+          display: none;
+        }
+        .metrics {
+          grid-template-columns: repeat(2, 1fr);
+          gap: 20px;
+        }
+        .metric:nth-child(3) {
+          padding-left: 0;
+          border-left: 0;
+        }
+        .metric:first-child .value {
+          font-size: 30px;
+        }
+        .metric label {
+          font-size: 11px;
+        }
+        .metric .value {
+          font-size: 24px;
+        }
+        .tiles {
+          grid-template-columns: 1fr;
+        }
+        .usagecards {
+          grid-template-columns: repeat(2, 1fr);
+        }
+        .drawer {
+          width: min(360px, 100%);
+        }
+        .below {
+          flex-direction: column;
+          gap: 8px;
+        }
+        .floating .workspace,
+        .floating .topbar2 {
+          margin-left: 15px;
+          margin-right: 15px;
+        }
+        .settingsgrid {
+          grid-template-columns: 1fr;
+        }
+        .settingsside {
+          display: flex;
+        }
+        .chartfoot {
+          flex-direction: column;
+          gap: 0;
+        }
+        .ranges button {
+          font-size: 11px;
+        }
+        .tiny {
+          font-size: 9px;
+        }
+        .resource th:nth-child(3),
+        .resource td:nth-child(3) {
+          display: none;
+        }
+      }
+      @media (prefers-reduced-motion: reduce) {
+        * {
+          transition: none !important;
+          animation: none !important;
+        }
+      }
+
+      :root {
+        --bg: #f1f1ee;
+        --paper: #ffffff;
+        --ink: #242423;
+        --muted: #696962;
+        --line: #deded7;
+        --blue: #555550;
+        --tint: #ecece6;
+        --green: #377a56;
+        --soft: #c9c9bc;
+        --shadow: 0 18px 60px #26262112;
+      }
+      body {
+        background: #e7e7e0;
+      }
+      .shell {
+        border-color: #d4d4ca;
+        box-shadow: var(--shadow);
+      }
+      .windowbar {
+        background: #fbfbf8;
+      }
+      .panel {
+        box-shadow: none;
+      }
+      .nav button.on {
+        color: var(--ink);
+        border-color: var(--ink);
+      }
+      .metric:first-child .value {
+        color: var(--ink);
+      }
+      .series button.selected {
+        background: var(--tint);
+        border-color: #d5d5cb;
+      }
+      .selected .toolmark {
+        background: #ddddd2;
+        color: #494940;
+      }
+      .toolmark {
+        background: #efefe8;
+        color: #73736a;
+      }
+      .btn.primary {
+        background: #30302d;
+        border-color: #30302d;
+        color: white;
+      }
+      .compare {
+        background: #dadad0;
+      }
+      .compare button.on {
+        background: white;
+        color: var(--ink);
+      }
+      .measurebadge {
+        display: inline-block;
+        vertical-align: middle;
+        border: 1px solid var(--line);
+        border-radius: 5px;
+        padding: 3px 6px;
+        margin-left: 5px;
+        font-size: 10px;
+        font-weight: 400;
+        color: var(--muted);
+      }
+      .metricmodes button {
+        padding: 8px 12px;
+      }
+      .metricmodes button:disabled {
+        opacity: 0.4;
+        cursor: not-allowed;
+      }
+      .materialCompare {
+        margin-left: auto;
+      }
+      .modebar {
+        margin-bottom: 9px !important;
+      }
+      .coverstrip i {
+        background: var(--soft);
+      }
+      svg text[fill="#929bac"] {
+        fill: var(--muted);
+      }
+      .oldmetrics {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: 10px 28px;
+        margin-top: 18px;
+      }
+      .oldmetrics > div {
+        display: flex;
+        justify-content: space-between;
+        gap: 10px;
+        font-size: 12px;
+      }
+      .oldmetrics span {
+        color: var(--muted);
+      }
+      .usagehero {
+        padding: 20px 22px;
+        margin-bottom: 16px;
+      }
+      .usagehero .hero {
+        font-size: 34px;
+        font-weight: 650;
+        letter-spacing: -1px;
+      }
+      .oldsection {
+        margin-top: 16px;
+        padding: 18px 20px;
+      }
+      .glassmock .shell {
+        background: var(--bg);
+        border-color: #ffffffe6;
+        box-shadow:
+          0 22px 65px #22221d1a,
+          inset 0 1px 0 #fff;
+      }
+      .glassmock .windowbar {
+        background: transparent;
+        border-bottom: 0;
+      }
+      .glassmock .nav {
+        height: 51px;
+        margin: 5px 15px 0;
+        padding: 0 16px;
+        border: 1px solid #fffffff0;
+        border-radius: 16px;
+        background: linear-gradient(130deg, #fffffff0, #ffffffae 55%, #ffffffe8);
+        backdrop-filter: blur(20px) saturate(1.02);
+        -webkit-backdrop-filter: blur(20px) saturate(1.02);
+        box-shadow:
+          0 6px 20px #32322b0b,
+          inset 0 1px 0 white;
+      }
+      .glassmock .nav button {
+        border: 0;
+        border-radius: 9px;
+        margin: 6px 0;
+        padding: 0 12px;
+      }
+      .glassmock .nav button.on {
+        background: #ffffffdc;
+        box-shadow:
+          0 1px 5px #29292213,
+          inset 0 1px 0 white;
+      }
+      .glassmock .workspace {
+        background: transparent;
+      }
+      .glassmock .drawer {
+        background: #ffffffee;
+        backdrop-filter: blur(22px);
+        -webkit-backdrop-filter: blur(22px);
+      }
+      .copper {
+        --bg: #f4f1eb;
+        --paper: #fffdf8;
+        --ink: #2b2620;
+        --muted: #71675b;
+        --line: #e4ddd2;
+        --blue: #a27443;
+        --tint: #eee5d8;
+        --soft: #c9ac8a;
+        background: #e7e1d5;
+      }
+      .copper .series button.selected {
+        border-color: #d4bfa4;
+        background: #f1e9dc;
+      }
+      .copper .selected .toolmark {
+        background: #e8d8bf;
+        color: #7f5b31;
+      }
+      .copper .btn.primary {
+        background: #55412c;
+        border-color: #55412c;
+      }
+      .copper .compare {
+        background: #dcd2c2;
+      }
+      .copper .windowbar {
+        background: #fcf9f2;
+      }
+      .copper .glassmock .nav {
+        background: #fffdf2dd;
+      }
+      .copper svg stop[stop-color="#757575"] {
+        stop-color: #ac865b;
+      }
+      body.darkmock {
+        --bg: #1d1d1d;
+        --paper: #292929;
+        --ink: #f0f0f0;
+        --muted: #b8b8b8;
+        --line: #454545;
+        --blue: #c7c7c7;
+        --tint: #363636;
+        --soft: #969696;
+        --green: #8cb79c;
+        background: #111111;
+      }
+      .darkmock .labtitle,
+      .darkmock .below b {
+        color: var(--ink);
+      }
+      .darkmock .labtitle span,
+      .darkmock .below,
+      .darkmock .footnote,
+      .darkmock .tiny,
+      .darkmock .chartfoot {
+        color: var(--muted);
+      }
+      .darkmock .shell,
+      .darkmock .windowbar,
+      .darkmock .nav {
+        border-color: var(--line);
+      }
+      .darkmock .windowbar {
+        background: #252524;
+      }
+      .darkmock .compare {
+        background: #303030;
+      }
+      .darkmock .compare button {
+        color: #c0c0b5;
+      }
+      .darkmock .compare button.on {
+        background: #515151;
+        color: white;
+      }
+      .darkmock .btn,
+      .darkmock .listfilters select {
+        background: #353535;
+        border-color: #535353;
+        color: var(--ink);
+      }
+      .darkmock .btn.primary {
+        background: #d5d5c5;
+        border-color: #d5d5c5;
+        color: #27271e;
+      }
+      .darkmock .search {
+        background: #222222;
+        border-color: #484848;
+        color: var(--ink);
+      }
+      .darkmock .search::placeholder {
+        color: #a4a494;
+      }
+      .darkmock .ranges {
+        background: #262621;
+      }
+      .darkmock .ranges .on {
+        background: #505050;
+        color: #f2f2e8;
+      }
+      .darkmock .toolmark {
+        background: #373737;
+        color: #d0d0bc;
+      }
+      .darkmock .selected .toolmark {
+        background: #565656;
+        color: #eeeeda;
+      }
+      .darkmock .series button.selected {
+        border-color: #717171;
+        background: var(--tint);
+      }
+      .darkmock .identity h2,
+      .darkmock .metricsbox strong {
+        color: var(--ink);
+      }
+      .darkmock .charthead select {
+        background: #373737;
+        color: #c9c9b8;
+      }
+      .darkmock .drawer {
+        background: var(--paper);
+        color: var(--ink);
+      }
+      .darkmock .sourceinfo {
+        color: var(--muted);
+      }
+      .darkmock .sourceinfo summary {
+        color: var(--ink);
+      }
+      .darkmock .wizard {
+        background: #35352b;
+        border-color: #575746;
+      }
+      .darkmock .demo {
+        border-color: var(--line);
+        color: #bcbca9;
+      }
+      .darkmock .coverstrip i.none {
+        background: repeating-linear-gradient(
+          135deg,
+          #464638,
+          #464638 2px,
+          #2b2b23 2px,
+          #2b2b23 4px
+        );
+      }
+      .darkmock svg line[stroke="#e8ecf2"] {
+        stroke: #494949;
+      }
+      .darkmock svg circle[fill="white"] {
+        fill: var(--paper);
+      }
+      .darkmock svg rect[fill="#f2f4f8"] {
+        fill: #363636;
+      }
+      .darkmock.glassmock .shell {
+        border-color: #e2e2c92a;
+        box-shadow:
+          0 25px 70px #0003,
+          inset 0 1px 0 #ffffed17;
+      }
+      .darkmock.glassmock .nav {
+        background: linear-gradient(130deg, #b0b09b18, #8b8b7910 50%, #c9c9a819);
+        border-color: #f1f1d921;
+        box-shadow:
+          0 6px 20px #0002,
+          inset 0 1px 0 #ffffec1a;
+      }
+      .darkmock.glassmock .nav button.on {
+        background: #d8d8bb24;
+        box-shadow:
+          inset 0 1px 0 #ffffe927,
+          0 1px 6px #0002;
+      }
+      .darkmock.glassmock .windowbar {
+        background: transparent;
+      }
+      .darkmock.glassmock .drawer {
+        background: #2b2b2bee;
+      }
+      body.darkmock.copper {
+        --bg: #211d18;
+        --paper: #2c2720;
+        --ink: #f1ede4;
+        --muted: #c2b6a4;
+        --line: #514737;
+        --blue: #d4b58c;
+        --tint: #433525;
+        --soft: #a98a62;
+        background: #15120e;
+      }
+      .darkmock.copper .series button.selected {
+        background: #433525;
+        border-color: #8a6d43;
+      }
+      .darkmock.copper .selected .toolmark {
+        background: #71522c;
+        color: #f1dfbf;
+      }
+      .darkmock.copper .toolmark {
+        background: #453522;
+        color: #d6bf99;
+      }
+      .darkmock.copper .ranges .on {
+        background: #695030;
+        color: #f3e5d0;
+      }
+      .darkmock.copper .btn,
+      .darkmock.copper .listfilters select {
+        background: #463825;
+        border-color: #6c5638;
+      }
+      .darkmock.copper .btn.primary {
+        background: #d6b88c;
+        color: #35230f;
+      }
+      .darkmock.copper .search {
+        background: #292115;
+        border-color: #5b4930;
+      }
+      .darkmock.copper .compare {
+        background: #382d1d;
+      }
+      .darkmock.copper .compare button.on {
+        background: #715734;
+      }
+      .darkmock.copper .glassmock .nav {
+        background: #5c49351c;
+      }
+      .darkmock.copper .charthead select {
+        background: #45351f;
+      }
+      .darkmock.copper .drawer {
+        background: #2d251bef;
+      }
+      .darkmock.copper svg line[stroke="#e8ecf2"] {
+        stroke: #594a34;
+      }
+      .darkmock.copper svg rect[fill="#f2f4f8"] {
+        fill: #3d3020;
+      }
+      .darkmock.copper svg stop[stop-color="#757575"] {
+        stop-color: #c3a06c;
+      }
+      dialog::backdrop {
+        background: #11110c50;
+      }
+      @media (max-width: 740px) {
+        .oldmetrics {
+          grid-template-columns: repeat(2, 1fr);
+        }
+        .labbar {
+          flex-wrap: wrap;
+          flex-direction: row;
+        }
+        .labtitle {
+          width: 100%;
+        }
+        .materialCompare {
+          margin-left: 0;
+        }
+      }
+      @media (prefers-reduced-transparency: reduce) {
+        .glassmock .nav,
+        .glassmock .drawer {
+          background: var(--paper);
+          backdrop-filter: none;
+        }
+      }
+      @supports not (backdrop-filter: blur(1px)) {
+        .glassmock .nav,
+        .glassmock .drawer {
+          background: var(--paper);
+        }
+      }
+      .ranges {
+        background: var(--tint);
+      }
+      .charthead select {
+        background: var(--bg);
+        color: var(--muted);
+      }
+      .search {
+        background: var(--paper);
+      }
+      .listfilters select {
+        color: var(--muted);
+      }
+      .footnote,
+      .tiny,
+      .chartfoot,
+      .below {
+        color: var(--muted);
+      }
+      svg line[stroke="#e8ecf2"] {
+        stroke: var(--line);
+      }
+      svg text[fill="#929bac"] {
+        fill: var(--muted);
+      }
+
+      :root {
+        --bg: #ffffff;
+        --paper: #ffffff;
+        --ink: #202735;
+        --muted: #626d80;
+        --line: #e3e6ed;
+        --blue: #4263dc;
+        --tint: #eef1ff;
+        --soft: #c7d0f4;
+        --green: #228569;
+      }
+      body {
+        background: #e9ebef;
+      }
+      .windowbar {
+        background: #ffffff;
+      }
+      .metric:first-child .value {
+        color: #4263dc;
+      }
+      .series button.selected {
+        background: #eef1ff;
+        border-color: #d4defa;
+      }
+      .selected .toolmark {
+        background: #dde5fc;
+        color: #4263dc;
+      }
+      .ranges {
+        background: #f0f2f7;
+      }
+      .ranges .on {
+        background: #ffffff;
+      }
+      .btn.primary {
+        background: #4263dc;
+        border-color: #4263dc;
+        color: white;
+      }
+      .glassmock .shell {
+        background: #ffffff;
+      }
+      .glassmock .nav {
+        background: linear-gradient(130deg, #ffffffed, #f8f9fbdc 55%, #fffffff2);
+        border-color: #ffffff;
+        box-shadow:
+          0 5px 18px #1c27300a,
+          inset 0 1px 0 white;
+      }
+      .glassmock .nav button.on {
+        color: #4263dc;
+        background: #ffffffd9;
+      }
+      .glassmock .workspace {
+        background: #ffffff;
+      }
+      .glassmock .drawer {
+        background: #fffffff0;
+      }
+      body.darkmock {
+        --bg: #1d1d1d;
+        --paper: #292929;
+        --ink: #f0f0f0;
+        --muted: #b8b8b8;
+        --line: #454545;
+        --blue: #c7c7c7;
+        --tint: #363636;
+        --soft: #969696;
+        --green: #8cb79c;
+        background: #111111;
+      }
+      .darkmock .metric:first-child .value {
+        color: #f0f0f0;
+      }
+      .darkmock .windowbar {
+        background: #252525;
+      }
+      .darkmock .series button.selected {
+        background: #363636;
+        border-color: #717171;
+      }
+      .darkmock .selected .toolmark {
+        background: #565656;
+        color: #eeeeee;
+      }
+      .darkmock .toolmark {
+        background: #373737;
+        color: #cfcfcf;
+      }
+      .darkmock .ranges {
+        background: #262626;
+      }
+      .darkmock .ranges .on {
+        background: #505050;
+        color: #f2f2f2;
+      }
+      .darkmock .compare {
+        background: #303030;
+      }
+      .darkmock .compare button.on {
+        background: #515151;
+        color: white;
+      }
+      .darkmock .compare button {
+        color: #c0c0c0;
+      }
+      .darkmock .btn,
+      .darkmock .listfilters select {
+        background: #353535;
+        border-color: #535353;
+        color: #f0f0f0;
+      }
+      .darkmock .btn.primary {
+        background: #d5d5d5;
+        color: #272727;
+      }
+      .darkmock .search {
+        background: #222222;
+        border-color: #484848;
+      }
+      .darkmock .search::placeholder {
+        color: #a4a4a4;
+      }
+      .darkmock .charthead select {
+        background: #373737;
+        color: #c9c9c9;
+      }
+      .darkmock .wizard {
+        background: #353535;
+        border-color: #575757;
+      }
+      .darkmock .coverstrip i.none {
+        background: repeating-linear-gradient(
+          135deg,
+          #464646,
+          #464646 2px,
+          #2b2b2b 2px,
+          #2b2b2b 4px
+        );
+      }
+      .darkmock.glassmock .shell {
+        background: #1d1d1d;
+        border-color: #e2e2e22a;
+      }
+      .darkmock.glassmock .nav {
+        background: linear-gradient(130deg, #b0b0b018, #8b8b8b10 50%, #c9c9c919);
+        border-color: #f1f1f121;
+      }
+      .darkmock.glassmock .nav button.on {
+        background: #d8d8d824;
+        color: #f0f0f0;
+      }
+      .darkmock.glassmock .workspace {
+        background: #1d1d1d;
+      }
+      .darkmock.glassmock .drawer {
+        background: #2b2b2bee;
+      }
+      .darkmock .labtitle,
+      .darkmock .below b {
+        color: #f0f0f0;
+      }
+      .darkmock .labtitle span,
+      .darkmock .below,
+      .darkmock .footnote,
+      .darkmock .tiny,
+      .darkmock .chartfoot {
+        color: #b8b8b8;
+      }
+    </style>
+  </head>
+  <body class="glassmock">
+    <div class="lab">
+      <div class="labbar">
+        <div class="labtitle">
+          兔维斯 / 下一阶段设计稿<span>定稿参考 · 浅色白底蓝紫 / 深色雾银 · 演示数据</span>
+        </div>
+        <span class="tiny" style="margin-left: auto">配色已定 · 轻玻璃</span>
+        <div class="compare">
+          <button id="themeLight" class="on" onclick="setMockTheme(false)">浅色</button
+          ><button id="themeDark" onclick="setMockTheme(true)">深色层次</button>
+        </div>
+      </div>
+      <div class="shell" id="shell">
+        <div class="windowbar">
+          <div class="dots"><i></i><i></i><i></i></div>
+          <div class="brand">兔维斯</div>
+          <div class="right">
+            <span class="demo">讨论草图</span><button onclick="openGlobalSettings()">⚙ 设置</button>
+          </div>
+        </div>
+        <nav class="nav" aria-label="主导航">
+          <button data-page="messages" onclick="navigate('messages')">
+            <svg class="icon" viewBox="0 0 24 24">
+              <rect x="3" y="4" width="18" height="14" rx="3" />
+              <path d="m7 21 4-3M7 9h10M7 13h6" /></svg
+            >消息看板</button
+          ><button data-page="resources" onclick="navigate('resources')">
+            <svg class="icon" viewBox="0 0 24 24">
+              <path d="m12 3 9 5-9 5-9-5 9-5ZM3 12l9 5 9-5M3 16l9 5 9-5" /></svg
+            >工具资源</button
+          ><button data-page="usage" onclick="navigate('usage')">
+            <svg class="icon" viewBox="0 0 24 24">
+              <path d="M4 20V5M4 20h17M8 16v-5M13 16V8M18 16V4" /></svg
+            >模型用量</button
+          ><button data-page="speed" class="on" onclick="navigate('speed')">
+            <svg class="icon" viewBox="0 0 24 24">
+              <path d="M4 18a9 9 0 1 1 16 0M12 13l5-5M8 18h8" />
+              <circle cx="12" cy="13" r="2" /></svg
+            >输出速度
+          </button>
+        </nav>
+        <div class="topbar2">
+          <span id="floatTitle">输出速度 · 独立窗口示意</span><span>−　□　×</span>
+        </div>
+        <main class="workspace" id="workspace"></main>
+        <div class="drawerShade" id="shade" onclick="closeDrawer()"></div>
+        <aside class="drawer" id="drawer" aria-label="采集管理"></aside>
+      </div>
+      <div class="below">
+        <span
+          ><b>可以试：</b
+          >切换四个主入口、时间范围与模型；悬停图表看四项读数，点击固定，再点“返回区间汇总”。</span
+        ><span
+          >已确定：四个主页面默认同窗切换。<br />内容区保持清晰平面，轻玻璃只用于导航与浮层。</span
+        >
+      </div>
+    </div>
+    <div class="toast" id="toast" role="status"></div>
+    <script>
+      function setMockTheme(v) {
+        document.body.classList.toggle("darkmock", v);
+        document.getElementById("themeLight").classList.toggle("on", !v);
+        document.getElementById("themeDark").classList.toggle("on", v);
+      }
+
+      function effectiveMode() {
+        return selected === "cx" ? "response" : preferredMode;
+      }
+      function chooseMetric(v) {
+        preferredMode = v;
+        pinned = null;
+        active = null;
+        renderSpeed();
+      }
+      function setSkin(v) {
+        document.body.classList.toggle("copper", v);
+        document.body.classList.add("glassmock");
+        document.getElementById("skinSilver").classList.toggle("on", !v);
+        document.getElementById("skinWarm").classList.toggle("on", v);
+      }
+      function groupRate(g) {
+        const b = createBuckets(g.id).filter((x) => !x.missing && x.tps != null);
+        const secs = b.reduce((a, x) => a + x.metricSeconds, 0);
+        return secs ? b.reduce((a, x) => a + x.out, 0) / secs : null;
+      }
+
+      const groups = [
+        { id: "zglm", tool: "ZCode", model: "GLM-5.3", rate: 58.7, windows: 3 },
+        { id: "zmini", tool: "ZCode", model: "GPT-6 Sol", rate: 46.2, windows: 2 },
+        { id: "ds", tool: "DSH", model: "DeepSeek V3.2", rate: 44.8, windows: 1 },
+        { id: "ki", tool: "Kimi", model: "Kimi K2", rate: 51.4, windows: 1 },
+        { id: "cl", tool: "Claude Code", model: "Sonnet 4.6", rate: 63.8, windows: 1 },
+        { id: "oc", tool: "OpenCode", model: "GLM-5.3", rate: 55.2, windows: 2 },
+        { id: "wb", tool: "WorkBuddy", model: "HY3", rate: 63.85, windows: 1 },
+        { id: "cx", tool: "Codex", model: "GPT-6 Astra", rate: 25.4, windows: 3 },
+      ];
+      const rangeDefs = {
+        "15m": { label: "近15分钟", minutes: 15, step: 1, n: 15 },
+        "1h": { label: "近1小时", minutes: 60, step: 5, n: 12 },
+        "5h": { label: "近5小时", minutes: 300, step: 10, n: 30 },
+        "24h": { label: "近24小时", minutes: 1440, step: 60, n: 24 },
+      };
+      let preferredMode = "stream";
+      let page = "speed",
+        range = "1h",
+        selected = "zglm",
+        q = "",
+        tool = "all",
+        sort = "tool",
+        gapStyle = "dash",
+        pinned = null,
+        active = null,
+        buckets = [],
+        floating = false,
+        sourceState = { Claude: "待配置", OpenCode: "待配置" };
+      const anchor = new Date("2026-10-26T10:00:00+08:00").getTime();
+      function time(t) {
+        return new Date(t).toLocaleTimeString("zh-CN", {
+          hour: "2-digit",
+          minute: "2-digit",
+          hour12: false,
+        });
+      }
+      function dur(ms) {
+        if (ms == null) return "—";
+        let s = Math.round(ms / 1000);
+        return s >= 60 ? `${Math.floor(s / 60)}m ${s % 60}s` : `${s}s`;
+      }
+      function showToast(s) {
+        let e = document.getElementById("toast");
+        e.textContent = s;
+        e.style.display = "block";
+        clearTimeout(window.toastTimer);
+        window.toastTimer = setTimeout(() => (e.style.display = "none"), 2600);
+      }
+      function setLayout(v) {
+        floating = v;
+        document.getElementById("shell").classList.toggle("floating", v);
+        document.getElementById("layoutA").classList.toggle("on", !v);
+        document.getElementById("layoutB").classList.toggle("on", v);
+        render();
+      }
+      function navigate(p) {
+        page = p;
+        closeDrawer();
+        pinned = null;
+        active = null;
+        render();
+      }
+      function render() {
+        document.querySelectorAll("[data-page]").forEach((e) => {
+          e.classList.toggle("on", e.dataset.page === page);
+          e.setAttribute("aria-current", e.dataset.page === page ? "page" : "false");
+        });
+        document.getElementById("floatTitle").textContent =
+          {
+            messages: "消息看板",
+            resources: "工具资源",
+            usage: "模型用量",
+            speed: "输出速度",
+            settings: "设置",
+          }[page] + " · 独立窗口示意";
+        if (page === "speed") renderSpeed();
+        else if (page === "usage") renderUsage();
+        else if (page === "messages") renderMessages();
+        else if (page === "resources") renderResources();
+        else renderSettings();
+      }
+      function createBuckets(groupId = selected) {
+        const d = rangeDefs[range],
+          g = groups.find((x) => x.id === groupId),
+          mode = effectiveMode();
+        return Array.from({ length: d.n }, (_, i) => {
+          const missing = i >= Math.floor(d.n * 0.36) && i <= Math.floor(d.n * 0.46);
+          const n = (3 + (i % 4)) * Math.max(1, Math.round(d.step / 5)),
+            base = (28 + (i % 5) * 9) * Math.max(1, d.step / 5),
+            ttft = g.id === "cx" ? null : 1.18 + (i % 5) * 0.13;
+          const gen = g.id === "cx" ? null : base;
+          const responseSeconds = g.id === "cx" ? base * 1.4 : base + n * ttft;
+          const out = Math.round(
+            (g.rate + 5 * Math.sin(i * 1.13) + 2.2 * Math.cos(i * 0.47)) *
+              (g.id === "cx" ? responseSeconds : gen)
+          );
+          const metricSeconds = mode === "response" ? responseSeconds : gen;
+          return {
+            missing,
+            start: anchor - (d.n - i) * d.step * 60000,
+            end: anchor - (d.n - i - 1) * d.step * 60000,
+            n,
+            gen,
+            out,
+            ttft,
+            responseSeconds,
+            metricSeconds,
+            model: responseSeconds * 1000,
+            tps: metricSeconds ? out / metricSeconds : null,
+          };
+        });
+      }
+      function aggregate() {
+        const b = buckets.filter((x) => !x.missing),
+          speed = b.filter((x) => x.tps != null),
+          n = speed.reduce((a, x) => a + x.n, 0),
+          seconds = speed.reduce((a, x) => a + x.metricSeconds, 0),
+          out = speed.reduce((a, x) => a + x.out, 0),
+          first = b.filter((x) => x.ttft != null),
+          firstN = first.reduce((a, x) => a + x.n, 0);
+        return {
+          n,
+          tps: seconds ? out / seconds : null,
+          ttft: firstN ? first.reduce((a, x) => a + x.ttft * x.n, 0) / firstN : null,
+          model: b.reduce((a, x) => a + x.model, 0),
+        };
+      }
+      function metricHTML(label, value, unit = "") {
+        return `<div class="metric"><label>${label}</label><div class="value">${value}<span class="unit">${unit}</span></div></div>`;
+      }
+      function renderSpeed() {
+        buckets = createBuckets();
+        let g = groups.find((x) => x.id === selected),
+          d = rangeDefs[range];
+        document.getElementById("workspace").innerHTML =
+          `<div class="pagehead"><div><h1>输出速度</h1><p class="sub">按有效完成调用观察模型表现</p></div><div class="headacts"><span class="live">采集运行中</span><button class="btn" onclick="openSources()">采集管理 <span style="color:var(--blue)">2 待接入</span></button><button class="btn" onclick="showToast('刷新现有记录，不发送测速请求')">↻ 刷新</button></div></div><div class="speedgrid"><aside class="panel"><div class="listhead"><h2>工具与模型</h2><input class="search" id="search" aria-label="搜索工具或模型" placeholder="搜索工具或模型" value="${q}" oninput="q=this.value;renderList()"><div class="listfilters"><select aria-label="筛选工具" onchange="tool=this.value;renderList()"><option value="all">全部工具</option>${[...new Set(groups.map((x) => x.tool))].map((t) => `<option ${t === tool ? "selected" : ""}>${t}</option>`).join("")}</select><select aria-label="排序" onchange="sort=this.value;renderList()"><option value="tool" ${sort === "tool" ? "selected" : ""}>按工具排序</option><option value="model" ${sort === "model" ? "selected" : ""}>按模型排序</option><option value="speed" ${sort === "speed" ? "selected" : ""}>按速度排序</option></select></div></div><div class="listlabels"><span>组合</span><span>${effectiveMode() === "response" ? "响应吞吐" : "流式 TPS"}</span></div><div class="series" id="series"></div></aside><section class="mainpanel"><div class="rangetoolbar modebar"><div class="ranges metricmodes"><button class="${effectiveMode() === "stream" ? "on" : ""}" ${g.id === "cx" ? 'disabled title="Codex 暂无逐响应首 Token 计时，只能显示含等待响应吞吐"' : ""} onclick="chooseMetric('stream')">流式输出</button><button class="${effectiveMode() === "response" ? "on" : ""}" onclick="chooseMetric('response')">响应吞吐（含等待）</button></div><span class="tiny">${g.id === "cx" ? "Codex · 日志近似" : effectiveMode() === "response" ? "包含首 Token 等待" : "排除首 Token 等待"}</span></div><div class="rangetoolbar"><div class="ranges">${Object.entries(
+            rangeDefs
+          )
+            .map(
+              ([k, v]) =>
+                `<button class="${k === range ? "on" : ""}" onclick="range='${k}';pinned=null;active=null;renderSpeed()">${v.label}</button>`
+            )
+            .join(
+              ""
+            )}</div><span class="tiny">${d.step} 分钟 / 点</span></div><div class="identity"><div><h2>${g.tool} <span style="color:#a5adbb;font-weight:400">/</span> ${g.model} ${g.id === "cx" ? '<span class="measurebadge">日志近似</span>' : ""}</h2><p class="sub">汇总 ${g.windows} 个会话的有效调用，按调用去重</p></div><button class="textbutton" onclick="openDetails()">统计说明 ⓘ</button></div><div class="metricsbox panel"><div class="metriccontext"><strong id="metricTitle"></strong><span id="metricRight"></span></div><div class="metrics" id="metrics"></div></div><div class="chartbox panel"><div class="charthead"><h2>${effectiveMode() === "response" ? "响应吞吐趋势（含等待）" : "流式输出趋势"}</h2><div class="gapmode">无样本区间<select aria-label="无样本样式" onchange="gapStyle=this.value;renderChart()"><option value="dash" ${gapStyle === "dash" ? "selected" : ""}>灰色虚线连接</option><option value="gap" ${gapStyle === "gap" ? "selected" : ""}>阴影断开</option></select></div></div><div class="chartwrap" id="chartwrap" tabindex="0" role="group" aria-label="输出速度趋势，左右键选择时间段，Esc返回汇总"><div id="chart"></div><div class="charttip" id="tip"></div></div><div class="chartfoot"><span>实线：有效样本　<span id="gapLegend">${gapStyle === "dash" ? "虚线：仅视觉连接，无样本" : "灰带：无有效样本"}</span></span><span>悬停查看 · 点击固定 · ← → 键选点</span></div><div class="coverage"><span>样本覆盖</span><div class="coverstrip">${buckets.map((x) => `<i class="${x.missing ? "none" : ""}"></i>`).join("")}</div></div></div><p class="footnote">${g.id === "cx" ? "Codex：响应吞吐包含等待及可见的响应准备开销，以日志边界近似计时；流式速度和逐响应首 Token 等待暂缺。" : "按已采集的有效调用加权汇总；空白时段不补零，历史记录不会因模型空闲而隐藏。"}</p></section></div>`;
+        renderList();
+        updateMetrics(null);
+        renderChart();
+      }
+      function renderList() {
+        let xs = groups.filter(
+          (g) =>
+            (tool === "all" || g.tool === tool) &&
+            `${g.tool} ${g.model}`.toLowerCase().includes(q.toLowerCase())
+        );
+        xs.sort((a, b) =>
+          sort === "speed"
+            ? (groupRate(b) ?? -1) - (groupRate(a) ?? -1)
+            : sort === "model"
+              ? a.model.localeCompare(b.model)
+              : a.tool.localeCompare(b.tool)
+        );
+        document.getElementById("series").innerHTML =
+          xs
+            .map(
+              (g) =>
+                `<button class="${g.id === selected ? "selected" : ""}" onclick="selected='${g.id}';pinned=null;active=null;renderSpeed()"><span class="toolmark">${g.tool.slice(0, 1)}</span><span class="names"><strong>${g.model}</strong><small>${g.tool} · ${g.windows} 个会话${g.id === "cx" ? " · 日志近似" : ""}</small></span><span class="rate">${groupRate(g) == null ? "—" : groupRate(g).toFixed(1)}</span></button>`
+            )
+            .join("") || '<p class="emptylist">没有匹配的工具或模型</p>';
+      }
+      function updateMetrics(idx) {
+        let d = rangeDefs[range],
+          b = idx === null ? aggregate() : buckets[idx],
+          no = b.missing;
+        let v = no ? { tps: null, ttft: null, model: null, n: 0 } : b;
+        document.getElementById("metricTitle").textContent =
+          idx === null
+            ? `${d.label}汇总 · ${v.n} 次有效调用`
+            : `${time(b.start)}–${time(b.end)} · ${d.step} 分钟${no ? " · 无有效样本" : ` · ${b.n} 次调用`}`;
+        document.getElementById("metricRight").innerHTML =
+          idx === null
+            ? '<span class="tiny">最近记录 3 分钟前</span>'
+            : `<button class="textbutton" onclick="pinned=null;active=null;updateMetrics(null);renderChart()">返回区间汇总 ${pinned !== null ? "· 已固定" : ""}</button>`;
+        document.getElementById("metrics").innerHTML =
+          metricHTML(
+            effectiveMode() === "response" ? "响应吞吐（含等待）" : "流式输出速度",
+            v.tps == null ? "—" : v.tps.toFixed(1),
+            effectiveMode() === "response" ? "Token/s" : "TPS"
+          ) +
+          metricHTML(
+            "首 Token 等待",
+            v.ttft == null ? "—" : v.ttft.toFixed(2),
+            v.ttft == null ? "" : "s"
+          ) +
+          metricHTML(selected === "cx" ? "响应累计用时" : "模型累计用时", dur(v.model)) +
+          metricHTML("工具累计用时 ⓘ", "—");
+        document.querySelector(".metrics .metric:last-child").title =
+          "演示来源未提供可归属到此模型的工具耗时，缺证据时不填零";
+      }
+      function renderChart() {
+        if (page === "usage") {
+          renderUsageChart();
+          return;
+        }
+        let W = 740,
+          H = 260,
+          L = 46,
+          R = 16,
+          T = 23,
+          B = 35,
+          iw = W - L - R,
+          ih = H - T - B,
+          d = rangeDefs[range],
+          n = buckets.length,
+          max = 90;
+        let x = (i) => L + ((i + 0.5) / n) * iw,
+          y = (v) => T + ih * (1 - v / max);
+        let s = `<svg viewBox="0 0 ${W} ${H}" aria-label="每${d.step}分钟的输出速度，单位TPS"><defs><pattern id="hatch" width="7" height="7" patternUnits="userSpaceOnUse"><path d="M0 7L7 0" stroke="#d7d7d1" stroke-width=".7"/></pattern><linearGradient id="area" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#757575" stop-opacity=".13"/><stop offset="1" stop-color="#757575" stop-opacity=".015"/></linearGradient></defs>`;
+        for (let v = 0; v <= 90; v += 30) {
+          s += `<line x1="${L}" x2="${W - R}" y1="${y(v)}" y2="${y(v)}" stroke="#e8ecf2" ${v ? 'stroke-dasharray="3 5"' : ""}/><text x="${L - 11}" y="${y(v) + 3}" fill="#929bac" text-anchor="end" font-size="10">${v}</text>`;
+        }
+        s += `<text x="${L}" y="11" fill="#929bac" font-size="9">${effectiveMode() === "response" ? "Token/s" : "TPS"}</text>`;
+        buckets.forEach((b, i) => {
+          if (b.missing)
+            s += `<rect x="${L + (i / n) * iw}" y="${T}" width="${iw / n}" height="${ih}" fill="#f2f4f8"/><rect x="${L + (i / n) * iw}" y="${T}" width="${iw / n}" height="${ih}" fill="url(#hatch)" opacity=".45"/>`;
+        });
+        let pieces = [],
+          cur = [];
+        buckets.forEach((b, i) => {
+          if (b.missing) {
+            if (cur.length) pieces.push(cur);
+            cur = [];
+          } else cur.push(i);
+        });
+        if (cur.length) pieces.push(cur);
+        pieces.forEach((a) => {
+          let p = a.map((i, j) => `${j ? "L" : "M"}${x(i)},${y(buckets[i].tps)}`).join(" ");
+          s += `<path d="${p} L${x(a[a.length - 1])},${T + ih} L${x(a[0])},${T + ih}Z" fill="url(#area)"/><path d="${p}" stroke="var(--blue)" stroke-width="2.4" stroke-linejoin="round" stroke-linecap="round" fill="none"/>`;
+        });
+        if (gapStyle === "dash")
+          for (let z = 0; z < pieces.length - 1; z++) {
+            let a = pieces[z].at(-1),
+              b = pieces[z + 1][0];
+            s += `<line x1="${x(a)}" y1="${y(buckets[a].tps)}" x2="${x(b)}" y2="${y(buckets[b].tps)}" stroke="#a1acbd" stroke-width="1.2" stroke-dasharray="4 5"/>`;
+          }
+        buckets.forEach((b, i) => {
+          if (!b.missing)
+            s += `<circle cx="${x(i)}" cy="${y(b.tps)}" r="2.5" fill="white" stroke="var(--blue)" stroke-width="1.5"/>`;
+        });
+        let gs = buckets.findIndex((b) => b.missing);
+        if (gs >= 0)
+          s += `<text x="${L + ((gs + 1) / n) * iw}" y="${T + ih - 12}" font-size="9" fill="#8a94a5" text-anchor="middle">无样本</text>`;
+        for (let k = 0; k < 5; k++) {
+          let ts = anchor - d.minutes * 60000 + (d.minutes * 60000 * k) / 4;
+          s += `<text x="${L + (iw * k) / 4}" y="${H - 9}" fill="#929bac" text-anchor="middle" font-size="10">${time(ts)}</text>`;
+        }
+        let a = pinned !== null ? pinned : active;
+        if (a !== null) {
+          let b = buckets[a];
+          s += `<line x1="${x(a)}" x2="${x(a)}" y1="${T}" y2="${T + ih}" stroke="#8492b1" stroke-width="1" stroke-dasharray="3 3"/>`;
+          if (!b.missing)
+            s += `<circle cx="${x(a)}" cy="${y(b.tps)}" r="5" fill="white" stroke="var(--blue)" stroke-width="2"/>`;
+        }
+        s += "</svg>";
+        document.getElementById("chart").innerHTML = s;
+        document.getElementById("gapLegend").textContent =
+          gapStyle === "dash" ? "虚线：仅视觉连接，无样本" : "灰带：无有效样本";
+        let wrap = document.getElementById("chartwrap");
+        wrap.onpointermove = (e) => {
+          if (pinned !== null) return;
+          let svg = wrap.querySelector("svg"),
+            r = svg.getBoundingClientRect(),
+            rel = ((e.clientX - r.left) / r.width) * W;
+          active = Math.max(0, Math.min(n - 1, Math.floor(((rel - L) / iw) * n)));
+          updateMetrics(active);
+          renderChart();
+          let tip = document.getElementById("tip"),
+            b = buckets[active];
+          tip.innerHTML = `${time(b.start)}–${time(b.end)}<br>${b.missing ? "无有效样本" : `${b.tps.toFixed(1)} ${effectiveMode() === "response" ? "Token/s" : "TPS"} · ${b.n} 次调用`}`;
+          tip.style.display = "block";
+          tip.style.left = Math.min(r.width - 120, Math.max(0, e.clientX - r.left + 10)) + "px";
+          tip.style.top = "18px";
+        };
+        wrap.onpointerleave = () => {
+          document.getElementById("tip").style.display = "none";
+          if (pinned === null) {
+            active = null;
+            updateMetrics(null);
+            renderChart();
+          }
+        };
+        wrap.onclick = () => {
+          pinned = pinned === null ? (active ?? Math.floor(n / 2)) : null;
+          updateMetrics(pinned);
+          renderChart();
+        };
+        wrap.onkeydown = (e) => {
+          if (e.key === "Escape") {
+            pinned = null;
+            active = null;
+            updateMetrics(null);
+            renderChart();
+          } else if (e.key === "ArrowLeft" || e.key === "ArrowRight") {
+            e.preventDefault();
+            active = Math.max(
+              0,
+              Math.min(n - 1, (active ?? 0) + (e.key === "ArrowRight" ? 1 : -1))
+            );
+            pinned = active;
+            updateMetrics(active);
+            renderChart();
+          }
+        };
+      }
+      function openSources() {
+        openDrawer(
+          `<h2>采集管理</h2><p class="sub">接入状态与指标能力分开显示</p>${[
+            ["ZCode", "已接入"],
+            ["DSH", "已接入"],
+            ["Kimi", "已接入"],
+            ["WorkBuddy", "待检查"],
+            ["Claude", sourceState.Claude],
+            ["OpenCode", sourceState.OpenCode],
+            ["Codex", "仅响应吞吐（日志近似）"],
+          ]
+            .map(
+              ([name, status]) =>
+                `<div class="sourcerow"><div><strong>${name}</strong><small style="color:${status === "已接入" ? "var(--green)" : "var(--muted)"}">${status}</small></div><button class="btn ${status === "待配置" ? "primary" : ""}" onclick="${status === "待配置" ? `showWizard('${name}')` : `showSourceInfo('${name}')`}">${status === "待配置" ? "接入" : "详情"}</button></div>`
+            )
+            .join(
+              ""
+            )}<details class="sourceinfo"><summary>诊断与数据口径</summary>工具版本、更新时间、缺失字段和计时方式放在这里。普通使用时无需阅读。</details>`
+        );
+      }
+      function openDrawer(html) {
+        document.getElementById("drawer").innerHTML =
+          `<button class="drawerclose" aria-label="关闭" onclick="closeDrawer()">×</button>${html}`;
+        document.getElementById("drawer").style.display = "block";
+        document.getElementById("shade").style.display = "block";
+      }
+      function closeDrawer() {
+        document.getElementById("drawer").style.display = "none";
+        document.getElementById("shade").style.display = "none";
+      }
+      function showWizard(name) {
+        openDrawer(
+          `<h2>接入 ${name}</h2><p class="sub">由兔维斯完成一次性统计设置</p><div class="wizard"><h3>三步完成</h3><ol><li>点击下方按钮启用采集。</li><li>若 ${name} 出现信任确认，点击同意。</li><li>下次启动 ${name} 后开始产生记录。</li></ol><button class="btn primary" onclick="sourceState['${name}']='待重启';showWizardDone('${name}')">启用 ${name} 采集</button></div><p class="sourceinfo">本草图只演示流程，不会安装插件或修改配置。正式流程会保留已有统计目标，发生冲突时先让你选择。</p>`
+        );
+      }
+      function showWizardDone(name) {
+        openDrawer(
+          `<h2>${name} 接入已设置</h2><div class="wizard"><h3>下次启动或重启 ${name} 后生效</h3><p>按你的工作节奏自行重启即可。</p><p class="wiznotice" style="margin-top:9px">状态：等待工具重新启动</p></div><button class="btn" style="margin-top:18px" onclick="openSources()">返回采集管理</button>`
+        );
+      }
+      function showSourceInfo(name) {
+        openDrawer(
+          `<h2>${name}</h2><p class="sub">采集详情</p><div class="sourceinfo">${name === "WorkBuddy" ? "已有日志中的数值被写成字符串，当前解析器未识别。此处应清楚显示“解析失败”，并提供检查入口。" : name === "Codex" ? "当前可用含等待的响应吞吐，来自本地日志的响应边界近似。未取得逐响应首 Token 计时，因此流式速度和该等待均值显示缺失。" : "这里显示最后接收时间、有效记录数量、计时方法，以及需要处理的问题。"}</div><details class="sourceinfo"><summary>高级诊断</summary>路径、字段与原始诊断仅在此展开。默认页面只保留状态和可执行操作。</details>`
+        );
+      }
+      function openDetails() {
+        openDrawer(
+          `<h2>两种速度口径</h2><div class="sourceinfo"><p><strong>流式输出</strong><br>输出 Token 总数 ÷ 生成时间总和，排除首 Token 等待。</p><p style="margin-top:16px"><strong>响应吞吐（含等待）</strong><br>输出 Token 总数 ÷ 对应响应时间总和，包含等待；不叠加响应后的工具执行时间。</p><p style="margin-top:16px">六个原生来源可显示两种口径。Codex 当前仅显示日志边界近似的响应吞吐，既不当作流速，也不替代逐响应首 Token 等待。</p><p style="margin-top:16px">区间与每个时间桶均按有效调用去重后加权；两种速度各有独立有效样本数。</p><p style="margin-top:16px">工具耗时无法归属到当前模型时显示“—”。灰虚线只是视觉连接，不产生推算值。</p></div>`
+        );
+      }
+      function renderMessages() {
+        document.getElementById("workspace").innerHTML =
+          `<div class="pagehead"><div><h1>消息看板</h1><p class="sub">正在进行的会话与需要你处理的消息</p></div><button class="btn" onclick="showToast('演示：会话筛选')">全部工具 ▾</button></div><div class="tiles">${[
+            ["ZCode", "GLM-5.3", "进行中", "项目检查", "正在整理变更与验证结果"],
+            ["Claude Code", "Sonnet 4.6", "等待确认", "文档更新", "有一项操作需要你确认"],
+            ["OpenCode", "GLM-5.3", "已完成", "界面调整", "本轮任务已完成"],
+          ]
+            .map(
+              (x) =>
+                `<div class="panel tile"><span class="tag">${x[2]}</span><h3>${x[3]}</h3><p class="sub">${x[4]}</p><p class="tiny" style="margin-top:20px">${x[0]}　/　${x[1]}</p></div>`
+            )
+            .join(
+              ""
+            )}</div><p class="footnote">消息看板保留原会话卡片能力；上方四个主入口始终在同一位置。</p>`;
+      }
+      function renderResources() {
+        document.getElementById("workspace").innerHTML =
+          `<div class="pagehead"><div><h1>工具资源</h1><p class="sub">管理工具可用的技能、MCP 与插件</p></div><button class="btn primary" onclick="showToast('演示：导入资源')">导入资源</button></div><div class="ranges" style="display:inline-flex;margin-bottom:18px"><button class="on">全部</button><button onclick="showToast('演示：筛选技能')">技能</button><button onclick="showToast('演示：筛选MCP')">MCP</button><button onclick="showToast('演示：筛选插件')">插件</button></div><div class="panel"><table class="resource"><thead><tr><th>资源名称</th><th>类型</th><th>已启用工具</th><th>状态</th></tr></thead><tbody>${[
+            ["代码审查", "技能", "ZCode · Claude Code", "已启用"],
+            ["文件系统", "MCP", "OpenCode · Claude Code", "已启用"],
+            ["项目规范", "技能", "全部工具", "已启用"],
+          ]
+            .map((x) => `<tr>${x.map((y) => `<td>${y}</td>`).join("")}</tr>`)
+            .join("")}</tbody></table></div>`;
+      }
+      function renderUsage() {
+        document.getElementById("workspace").innerHTML =
+          `<div class="usagecontent"><div class="pagehead"><div><h1>模型用量</h1><p class="sub">Token、费用和工作活动</p></div><button class="btn">导出</button></div><div class="rangetoolbar"><div class="ranges"><button class="on">今天</button><button>近7天</button><button>近30天</button><button>自定义</button></div><span class="tiny">原有范围与功能分区保留</span></div><div class="ranges" style="display:inline-flex;margin-bottom:16px"><button class="on">看板</button><button onclick="showToast('记录页沿用现有筛选、分页与导出')">记录</button></div><div class="panel usagehero"><div class="hero">1.28M</div><p class="sub">请求输入 + 产出 Token</p><div class="oldmetrics">${[
+            ["新增输入", "1.02M"],
+            ["缓存命中", "796K"],
+            ["未缓存命中", "224K"],
+            ["输出", "260K"],
+            ["缓存命中率", "78.0%"],
+            ["请求次数", "64"],
+            ["最近采集", "10:00"],
+          ]
+            .map((x) => `<div><span>${x[0]}</span><strong>${x[1]}</strong></div>`)
+            .join(
+              ""
+            )}</div></div><div class="chartbox panel"><div class="charthead"><h2>用量趋势</h2><span class="tiny">沿用折线 · 0 用量如实显示</span></div><div id="usagechart"></div></div><div class="oldsection panel"><div class="charthead"><h2>用量分布</h2><span class="tiny">按计费渠道 ▾</span></div><table class="resource"><tbody><tr><td>默认渠道</td><td>960K Token</td><td>75.0%</td></tr><tr><td>工作渠道</td><td>320K Token</td><td>25.0%</td></tr></tbody></table></div><div class="oldsection panel"><div class="charthead"><h2>API 等效费用</h2><span class="tiny">$3.42　▾</span></div><p class="sub">保留模型、渠道、价格配置与费用明细。</p></div><div class="oldsection panel"><div class="charthead"><h2>工作活动</h2><span class="tiny">7 个会话 · 31 次工具调用　▸</span></div></div><p class="footnote">统一主题、标题和共用控件；功能分区、折叠逻辑和统计口径沿用现有页面。</p></div>`;
+        renderUsageChart();
+      }
+      function renderUsageChart() {
+        let W = 940,
+          H = 240,
+          L = 48,
+          R = 18,
+          T = 24,
+          B = 32,
+          iw = W - L - R,
+          ih = H - T - B,
+          vals = [
+            21, 40, 32, 47, 56, 65, 33, 24, 48, 67, 52, 71, 60, 55, 73, 64, 55, 45, 28, 15, 10, 0,
+            0, 0,
+          ],
+          max = 80;
+        let s = `<svg viewBox="0 0 ${W} ${H}" style="width:100%"><defs><linearGradient id="usagefill" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#757575" stop-opacity=".18"/><stop offset="1" stop-color="#757575" stop-opacity=".01"/></linearGradient></defs>`;
+        [0, 20, 40, 60, 80].forEach(
+          (v) =>
+            (s += `<line x1="${L}" x2="${W - R}" y1="${T + ih * (1 - v / max)}" y2="${T + ih * (1 - v / max)}" stroke="#e8ecf2"/><text x="${L - 12}" y="${T + ih * (1 - v / max) + 3}" text-anchor="end" fill="#929bac" font-size="10">${v}K</text>`)
+        );
+        let p = vals
+          .map((v, i) => `${i ? "L" : "M"}${L + (i / 23) * iw},${T + ih * (1 - v / max)}`)
+          .join(" ");
+        s += `<path d="${p} L${W - R},${T + ih} L${L},${T + ih} Z" fill="url(#usagefill)"/><path d="${p}" stroke="var(--blue)" stroke-width="2.2" stroke-linejoin="round" fill="none"/>`;
+        vals.forEach(
+          (v, i) =>
+            (s += `<circle cx="${L + (i / 23) * iw}" cy="${T + ih * (1 - v / max)}" r="2.4" fill="var(--paper)" stroke="var(--blue)"><title>${i}:00：${v}K Token</title></circle>`)
+        );
+        [0, 6, 12, 18, 24].forEach(
+          (v) =>
+            (s += `<text x="${L + (v / 24) * iw}" y="${H - 8}" text-anchor="middle" fill="#929bac" font-size="10">${String(v).padStart(2, "0")}:00</text>`)
+        );
+        s += "</svg>";
+        document.getElementById("usagechart").innerHTML = s;
+      }
+      function renderSettings() {
+        document.getElementById("workspace").innerHTML =
+          `<div class="pagehead"><div><h1>设置</h1><p class="sub">管理应用行为、采集偏好与远程连接</p></div></div><div class="settingsgrid"><div class="settingsside"><button class="on">常规</button><button onclick="showToast('采集设置与页面快捷入口使用同一份配置')">数据与采集</button><button>远程连接</button><button>通知</button></div><div class="panel" style="padding:0 22px"><div class="settingrow"><div><h2>开机启动</h2><p class="sub">登录后启动兔维斯</p></div><button class="switch" aria-label="开机启动开关，演示" onclick="showToast('草图仅演示，不修改系统设置')"></button></div><div class="settingrow"><div><h2>外观</h2><p class="sub">跟随系统主题</p></div><span class="sub">跟随系统 ▾</span></div><div class="settingrow"><div><h2>数据与采集</h2><p class="sub">采集总开关、来源接入与数据保留</p></div><button class="btn" onclick="openSources()">采集管理 →</button></div><div class="settingrow"><div><h2>关于这套分工</h2><p class="sub">主页面看状态、用资源；设置管理长期偏好。页面中的快捷按钮直达同一配置。</p></div></div></div></div>`;
+      }
+      render();
+
+      function openGlobalSettings() {
+        let d = document.getElementById("globalSettingsDemo");
+        if (!d) {
+          d = document.createElement("dialog");
+          d.id = "globalSettingsDemo";
+          d.style.cssText =
+            "width:min(620px,90vw);background:var(--paper);color:var(--ink);border:1px solid var(--line);border-radius:12px;padding:24px;box-shadow:0 20px 70px #0004";
+          document.body.appendChild(d);
+        }
+        d.innerHTML = `<div class="pagehead"><div><h2>设置</h2><p class="sub">独立设置窗口示意 · 沿用现有设置入口</p></div><button aria-label="关闭设置" onclick="this.closest('dialog').close()">×</button></div><div class="settingrow"><div><h2>开机启动</h2><p class="sub">应用长期偏好</p></div><button class="switch" aria-label="演示开关" onclick="showToast('仅为草图，不修改系统设置')"></button></div><div class="settingrow"><div><h2>外观</h2><p class="sub">浅色、深色、跟随系统</p></div><span class="sub">跟随系统 ▾</span></div><div class="settingrow"><div><h2>数据与采集</h2><p class="sub">与速度页共用同一套采集配置</p></div><button class="btn" onclick="this.closest('dialog').close();openSources()">采集管理 →</button></div><p class="footnote">四个主功能在同窗切换；设置维持一个独立入口，功能内的快捷按钮直达同一配置。</p>`;
+        d.showModal();
+      }
+    </script>
+  </body>
+</html>

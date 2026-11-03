@@ -45,7 +45,7 @@ vi.mock("@tauri-apps/api/webviewWindow", () => ({
 }));
 
 import i18n from "@/i18n";
-import UsageDashboardPage from "@/pages/usage-dashboard";
+import { UsageDashboardBody } from "@/components/usage/UsageDashboardBody";
 import {
   mockProviderAliasesGet,
   mockProviderAliasUpsert,
@@ -124,7 +124,7 @@ function aliasConfig(aliases: ProviderAliasRule[]): ProviderAliasConfig {
 
 /** 记录页：渲染整页并切到「记录」页签（单卡夹具下即 codex 卡） */
 async function openRecords() {
-  render(wrap(<UsageDashboardPage />));
+  render(wrap(<UsageDashboardBody active />));
   fireEvent.click(await screen.findByTestId("usage-tab-records"));
   return await screen.findByTestId("usage-record-card-codex");
 }
@@ -252,7 +252,7 @@ describe("记录页 · 供应商别名浮窗", () => {
         ]),
     });
 
-    render(wrap(<UsageDashboardPage />));
+    render(wrap(<UsageDashboardBody active />));
     fireEvent.click(await screen.findByTestId("usage-tab-records"));
     fireEvent.click(screen.getByTestId("usage-records-dim-project"));
     const card = await screen.findByTestId("usage-record-card-multiagents-manager");

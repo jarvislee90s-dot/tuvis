@@ -565,9 +565,27 @@ async fn new_id_reaches_remote_reading() {
     // 零真实 ~/.zcode 接触
     let snap_roots = roots.clone();
     let host = fake_host();
+    let fresh_roots = roots.clone();
+    let fresh_host = fake_host();
     let session_source = Box::new(move || {
         let sessions: Vec<Session> =
             build_sessions(&snap_roots, &host, chrono::Utc::now().timestamp_millis());
+        let waiting_count = sessions
+            .iter()
+            .filter(|s| matches!(s.status, SessionStatus::Waiting))
+            .count();
+        SessionsResponse {
+            total_count: sessions.len(),
+            waiting_count,
+            sessions,
+        }
+    });
+    let fresh_session_source = Box::new(move || {
+        let sessions: Vec<Session> = build_sessions(
+            &fresh_roots,
+            &fresh_host,
+            chrono::Utc::now().timestamp_millis(),
+        );
         let waiting_count = sessions
             .iter()
             .filter(|s| matches!(s.status, SessionStatus::Waiting))
@@ -595,6 +613,7 @@ async fn new_id_reaches_remote_reading() {
         subagent_message_source: std::collections::HashMap::new(),
         capability_table: multi_agents_manager_lib::inject::capability::new_table(),
         session_source,
+        fresh_session_source,
         pairing_counter: Box::new(Vec::new),
         board_hidden_ids: Box::new(move || hidden_src.lock().unwrap().clone()),
         board_hidden_hide: Arc::new(|_| 0usize),

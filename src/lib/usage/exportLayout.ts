@@ -2,15 +2,20 @@
 // 消费方 = `exportImage.ts`（逐步执行）；两遍绘制（度量遍算高、绘制遍照步骤走）共用一个 `layoutExport`，
 // 高度由本层**一次算定**并返回 `height` ⇒ 两遍步进结构上不可能分歧。
 //
-// 版式（brief 步骤 4 的表格，逐条不得发挥）：
-//  * 段序：品牌 → 范围 → hero（小标题 + 大数字 + 说明）→ 指标行 → 趋势 mini → 分组 Top（≤6 行）→
-//    工具 2×2 → 评语（立绘 + 气泡）→ 页脚；每段一个 `anchors` 锚点，**y 严格递增**；
+// 版式（brief 步骤 4 的表格 + 2026-10-27 实机反馈轮 #3a 的模块化改造，逐条不得发挥）：
+//  * 段序：品牌 → 范围 → hero（小标题 + 大数字 + 说明）→ 指标行 → 趋势 mini →
+//    **分组 Top × N（每个选中的 groupBy 一段，≤6 行；`distribution: []` 则整段缺席）** →
+//    **API 等效费用（可选段）** → 工具 2×2 → 评语（立绘 + 气泡）→ 页脚；每段一个 `anchors` 锚点，
+//    **y 严格递增**。后三段（费用 / 工具格 / 立绘气泡）由装配层给的模块开关决定画不画：
+//    **没有段就不出标题、不出空盒**；
 //  * `bar.w` = **轨道宽恒为 `CW`**（608），`share` 是填充比（夹取 `max(0.04, min(1, share))`）；
 //    执行层画 `w * share`——把 `w` 定义成「填充宽」会让前景条被平方（缩成 4% 的 4%）；
 //  * 立绘固定高 360、`petW = round(360 × frameW / frameH)`、`petX = EXPORT_W - PAD - petW`，
 //    cut 框 `(col × frameW, row × frameH, frameW, frameH)`（列已按该动作帧数夹过）；
 //  * 气泡三式与「让位」照抄 brief：气泡高过立绘时页脚跟着下移；
 //  * `sheet === null` → **无 sprite 步骤**，其余版式与总高照常；趋势点 < 2 → 出空态占位而不是空图。
+//  * `work === false`（2026-10-27 #3a）→ **工具格与立绘/气泡整段缺席**（一个开关管两段），
+//    图在最后一个数据段后以正常底距收尾（页脚照常，不残留空的立绘区）。
 //
 // 色值纪律（§3 第 21 条）：本文件是**全仓唯一允许硬编码色值**的用量模块（分享图固定浅色版式），
 // **不读任何 CSS 变量**（`usage-theme-tokens.test.ts` 用例 4 对本文件做反向断言）；气泡底色 `#fffdf9`
@@ -19,6 +24,7 @@
 // 分层纪律：位图**不进本层**（`SheetGeometry` 只是几何），本层拿不到、也不该拿到 `ImageBitmap`。
 import { CHART_PAD } from "@/components/usage/TrendChart";
 import { poseCol, resolvePoseRow, type PetRows, type SheetGeometry } from "@/lib/usage/sheet";
+import type { UsageGroupBy } from "@/types/usage";
 
 // —— 钉死的版式常量 ——
 /** 竖版卡宽（固定，不随窗口） */
@@ -45,6 +51,21 @@ export const SUB = "#6b7280";
 export const FAINT = "#9ca3af";
 export const ACCENT_A = "#3b82f6";
 export const ACCENT_B = "#8b5cf6";
+
+/**
+ * 分组维度强调色（二轮实机反馈 ②，2026-10-27 用户指示）：分组占比条**随维度取色**
+ * （同族同样式实心圆角条，维度之间以色相区分，多段同图不再一片蓝）。
+ * 固定浅色调色板纪律不变（不读 CSS 变量，`usage-theme-tokens.test.ts` 反向断言）。
+ */
+export const GROUP_ACCENTS: Record<UsageGroupBy, string> = {
+  tool: "#3b82f6",
+  project: "#10b981",
+  provider: "#f59e0b",
+  model: "#8b5cf6",
+};
+/** 费用段占比条（描边样式，二轮实机反馈 ②）：淡紫填充 + 紫描边，与分组段实心条一眼区分 */
+export const COST_BAR_FILL = "rgba(139,92,246,0.18)";
+export const COST_BAR_STROKE = "#8b5cf6";
 
 /** 分隔线 / 占比条轨道（同一个浅灰，不另立第二档） */
 const LINE = "#eceef2";
@@ -105,6 +126,43 @@ export interface ExportGroupRow {
 }
 
 /**
+ * 一段分组分布（2026-10-27 #3a）：每个选中的 `UsageGroupBy` 一段。
+ * `groupsMore` 的语义与旧单段字段逐字相同（见 `ExportInput` 历史注释：本层最多画 `GROUPS_MAX`(6)
+ * 行，屏上分布卡是 `DIST_MAX_ROWS`(10) 行 + 「等 N」，少的行数**必须**说出来）——按本接口纪律，
+ * 这里收的是**成品字符串**（本层不做 i18n、不拼「等 N」的措辞）。
+ */
+export interface ExportGroupSection {
+  groupBy: UsageGroupBy;
+  title: string;
+  rows: readonly ExportGroupRow[];
+  groupsMore: string | null;
+}
+
+/** API 等效费用一行：`label` / `value` 是成品字符串；`share` 缺省 = 该行不画占比条 */
+export interface ExportCostRow {
+  label: string;
+  value: string;
+  share?: number;
+}
+
+/**
+ * API 等效费用段（2026-10-27 #3a，新增段）：总额 + ≤6 行（行语法与分组段同一套：
+ * 名称左、金额右、占比条在下）。数据与费用卡同源（`usage_costs`），币种跟随显示币种；
+ * 「无全局总额」是**费用卡**的契约，导出段按用户裁决要出总额（`totalLabel` 写明「估价」口径）。
+ *
+ * `more`（评审 Important，X2 同类缺陷）：本层只画 `GROUPS_MAX`(6) 行，而 `total` 是**全部行**
+ * 的合计——可见行之和与总额对不上时**必须**说出来（「等 N」已由装配层译好；`null` = 一行没少、
+ * 不出这行）。与分组段的 `groupsMore` 同构同款绘制。
+ */
+export interface ExportCostSection {
+  title: string;
+  totalLabel: string;
+  total: string;
+  rows: readonly ExportCostRow[];
+  more: string | null;
+}
+
+/**
  * 绘制步骤：执行层逐步 `execute`，顺序即绘制顺序（先页背景、再白卡、再内容）。
  * `trend` 的 `pts` 是**绝对画布坐标**（投影已在纯层算完），执行层不做任何投影。
  */
@@ -140,6 +198,8 @@ export type ExportStep =
       share: number;
       track: string;
       fill: string;
+      /** 可选描边色（二轮实机反馈 ②：费用段描边样式——执行层沿填充条同一圆角路径描一圈） */
+      stroke?: string;
       r?: number;
     }
   | {
@@ -154,12 +214,23 @@ export type ExportStep =
       sh: number;
     };
 
-/** 段锚点 id（顺序即段序；`y` 严格递增） */
+/** 段锚点 id（`groups` 一段一个锚点、可重复出现；缺席的段**没有**锚点；y 严格递增） */
 export type ExportSectionId =
-  "brand" | "range" | "hero" | "metrics" | "trend" | "groups" | "tools" | "quote" | "footer";
+  | "brand"
+  | "range"
+  | "hero"
+  | "metrics"
+  | "trend"
+  | "groups"
+  | "cost"
+  | "tools"
+  | "quote"
+  | "footer";
 
 export interface ExportAnchor {
   id: ExportSectionId;
+  /** 分组段的维度（`id === "groups"` 时用于区分多段；其余段缺省） */
+  key?: UsageGroupBy;
   y: number;
 }
 
@@ -171,7 +242,7 @@ export interface ExportInput {
   rangeLabel: string;
   /** `t("usage.hero.label", { range })`（**不是** `card.trend`——用了它全图会连着出现两次「用量趋势」） */
   heroLabel: string;
-  /** 完整千分位（`fmtInt`） */
+  /** token 量（二轮实机反馈 ②：`fmtTokens` 万/亿，与看板同口径；非 Token 计数不走这） */
   hero: string;
   /** 采集时刻；`collectedAt === 0` 时调用方给 `usage.notCollected` */
   heroSub: string;
@@ -182,21 +253,19 @@ export interface ExportInput {
   /** 趋势点 < 2 时画的占位文案（`t("usage.empty")`） */
   emptyLabel: string;
   points: readonly ExportPoint[];
-  /** `t("usage.card.distribution")` */
-  groupTitle: string;
-  groups: readonly ExportGroupRow[];
   /**
-   * 分组区**没画出来的行数**文案（`usage.moreN` 已由装配层译好）；`null` = 一行没少、不出这行。
-   *
-   * 为什么必须有它（2026-10-06 缺陷修复 X2）：本层最多只画 `GROUPS_MAX`(6) 行，而屏上的分布卡是
-   * `DIST_MAX_ROWS`(10) 行 + 「等 N」。旧实现**静默**只画 6 行 ⇒ 导出的图看起来「就这么多」，
-   * 与屏上是两个口径，而且用户在图上**看不出**少了——这正是「导出与屏幕不一致且界面上看不出来」
-   * 那一类缺陷。装配层按 `dist.rows.length - GROUPS_MAX + dist.moreCount` 算总数（两者都要算：
-   * 前一半是图比列表少画的，后一半是列表自己被折掉的），本层只负责画。
-   *
-   * 按本接口的纪律，这里收的是**成品字符串**（本层不做 i18n、不拼 `等 N` 的措辞）。
+   * 分组分布段（2026-10-27 #3a：**数组**，每个选中的 `UsageGroupBy` 一段；空数组 = 整段缺席）。
+   * 旧单段字段（`groupTitle` / `groups` / `groupsMore`）已并入 `ExportGroupSection`，
+   * 字段语义逐条不变（含「屏上分布卡 N 行 / 本图最多 6 行」的 `groupsMore` 注记）。
    */
-  groupsMore: string | null;
+  groups: readonly ExportGroupSection[];
+  /** API 等效费用段；`null` = 未选 / 取数失败 / 无行 → **整段缺席**（无标题、无空盒） */
+  cost: ExportCostSection | null;
+  /**
+   * 工作小结开关（2026-10-27 #3a）：`true` = 画工具格 + 立绘/气泡（与旧版式一致）；
+   * `false` = 两段**都**缺席，图在最后一个数据段后以正常底距收尾。
+   */
+  work: boolean;
   /** `t("usage.work.toolCalls")` */
   toolsTitle: string;
   /** 工具 2×2 的 4 行，`[标签, 值]`（`null` 已由装配层换成 `EM_DASH`） */
@@ -298,7 +367,8 @@ function wrapText(text: string, maxW: number, font: string, measure: MeasureText
 
 /**
  * 看板数据（已格式化）→ 竖版分享图的绘制步骤 + 总高。纯函数：同样的输入与测量函数永远给同样的步骤序。
- * 调用方须保证 `input.metrics` 是 6 行、`input.tools2x2` 是 4 行（截断口径属装配层）。
+ * 调用方须保证 `input.metrics` 是 6 行、`input.tools2x2` 是 4 行、`cost.rows` ≤ 6 行
+ * （截断口径属装配层）。
  */
 export function layoutExport(input: ExportInput, measure: MeasureText): ExportLayout {
   const content: ExportStep[] = [];
@@ -384,109 +454,159 @@ export function layoutExport(input: ExportInput, measure: MeasureText): ExportLa
   }
   y = boxY + boxH + SECTION_GAP;
 
-  // ⑥ 分组 Top（≤6 行；轨道恒 CW，填充比交给执行层乘）
-  anchors.push({ id: "groups", y });
-  sectionTitle(input.groupTitle, y);
-  y += 16 + 20;
-  for (const group of input.groups.slice(0, GROUPS_MAX)) {
-    content.push(text(group.name, contentX, y + 15, FONT_ROW, INK));
-    content.push(text(group.value, contentRight, y + 15, FONT_ROW_VALUE, SUB, "right"));
-    content.push({
-      kind: "bar",
-      x: contentX,
-      y: y + 22,
-      w: CW,
-      h: BAR_H,
-      share: clampShare(group.share),
-      track: LINE,
-      fill: ACCENT_A,
-      r: 4,
+  // ⑥ 分组 Top × N（2026-10-27 #3a：每个选中的 groupBy 一段，段序 = 装配层给的数组序；
+  //    ≤6 行；轨道恒 CW，填充比交给执行层乘）
+  // 「等 N」：图上看不到的行数**必须**说出来（旧实现静默丢行，X2）。分组段与费用段同一款：
+  // 字号比数据行小一档、左对齐 ⇒ 读起来是「这一段的补充说明」，而不是第 7 行。
+  const paintMoreNote = (more: string, yy: number): number => {
+    content.push(text(more, contentX, yy + 12, FONT_TICK, SUB));
+    return yy + 22;
+  };
+  const paintGroupSection = (section: ExportGroupSection, yStart: number): number => {
+    let yy = yStart;
+    sectionTitle(section.title, yy);
+    yy += 16 + 20;
+    // 占比条随维度取色（二轮实机反馈 ②）：同段同色实心圆角条，多段之间以色相区分
+    const accent = GROUP_ACCENTS[section.groupBy];
+    for (const group of section.rows.slice(0, GROUPS_MAX)) {
+      content.push(text(group.name, contentX, yy + 15, FONT_ROW, INK));
+      content.push(text(group.value, contentRight, yy + 15, FONT_ROW_VALUE, SUB, "right"));
+      content.push({
+        kind: "bar",
+        x: contentX,
+        y: yy + 22,
+        w: CW,
+        h: BAR_H,
+        share: clampShare(group.share),
+        track: LINE,
+        fill: accent,
+        r: 4,
+      });
+      yy += GROUP_ROW_H;
+    }
+    if (section.groupsMore !== null) yy = paintMoreNote(section.groupsMore, yy);
+    return yy + 8;
+  };
+  for (const section of input.groups) {
+    anchors.push({ id: "groups", key: section.groupBy, y });
+    y = paintGroupSection(section, y);
+  }
+
+  // ⑦ API 等效费用（可选段）：标题 + 总额行 + ≤6 行（名称左 / 金额右 / 占比条在下，
+  //    与分组段同一套行语法；占比条用**描边样式**（淡紫填充 + 紫描边，二轮实机反馈 ②）
+  //    与分组段的实心条区分）。
+  //    装配层保证 `rows` ≤ 6（截断口径归装配层，同 `metrics` 6 行 / `tools2x2` 4 行）；
+  //    `more` 非空 = 有行没画出来（`total` 是全部行的合计，缺披露会让人以为对不上账是算错）。
+  if (input.cost) {
+    anchors.push({ id: "cost", y });
+    sectionTitle(input.cost.title, y);
+    y += 16 + 20;
+    content.push(text(input.cost.totalLabel, contentX, y + 15, FONT_ROW, SUB));
+    content.push(text(input.cost.total, contentRight, y + 15, FONT_ROW_VALUE, INK, "right"));
+    y += ROW_PITCH;
+    for (const row of input.cost.rows) {
+      content.push(text(row.label, contentX, y + 15, FONT_ROW, INK));
+      content.push(text(row.value, contentRight, y + 15, FONT_ROW_VALUE, SUB, "right"));
+      if (typeof row.share === "number") {
+        content.push({
+          kind: "bar",
+          x: contentX,
+          y: y + 22,
+          w: CW,
+          h: BAR_H,
+          share: clampShare(row.share),
+          track: LINE,
+          fill: COST_BAR_FILL,
+          stroke: COST_BAR_STROKE,
+          r: 4,
+        });
+        y += GROUP_ROW_H;
+      } else {
+        y += ROW_PITCH;
+      }
+    }
+    if (input.cost.more !== null) y = paintMoreNote(input.cost.more, y);
+    y += 8;
+  }
+
+  // ⑧ 工作小结 + ⑨ 评语（`work` 一个开关管两段；false 时两段整体缺席，不残留空的立绘区）
+  if (input.work) {
+    // 工具 2×2（4 格；格宽 = (CW - 16) / 2）
+    anchors.push({ id: "tools", y });
+    sectionTitle(input.toolsTitle, y);
+    y += 16 + 20;
+    input.tools2x2.forEach(([label, value], i) => {
+      const cx = contentX + (i % 2) * (CELL_W + CELL_GAP);
+      const cy = y + Math.floor(i / 2) * (CELL_H + CELL_GAP);
+      content.push({ kind: "rect", x: cx, y: cy, w: CELL_W, h: CELL_H, color: SOFT_BG, r: 12 });
+      content.push(text(label, cx + 14, cy + 26, FONT_ROW, SUB));
+      content.push(text(value, cx + 14, cy + 52, FONT_ROW_VALUE, INK));
     });
-    y += GROUP_ROW_H;
-  }
-  // 「等 N」：图上看不到的组数**必须**说出来（旧实现静默丢行，见 `groupsMore` 的长注释）。
-  // 字号比分组行小一档、同样左对齐 ⇒ 读起来是「这一段的补充说明」，而不是第 7 个分组行。
-  if (input.groupsMore !== null) {
-    content.push(text(input.groupsMore, contentX, y + 12, FONT_TICK, SUB));
-    y += 22;
-  }
-  y += 8;
+    const cellRows = Math.ceil(input.tools2x2.length / 2);
+    y += cellRows * CELL_H + Math.max(0, cellRows - 1) * CELL_GAP + SECTION_GAP;
 
-  // ⑦ 工具 2×2（4 格；格宽 = (CW - 16) / 2）
-  anchors.push({ id: "tools", y });
-  sectionTitle(input.toolsTitle, y);
-  y += 16 + 20;
-  input.tools2x2.forEach(([label, value], i) => {
-    const cx = contentX + (i % 2) * (CELL_W + CELL_GAP);
-    const cy = y + Math.floor(i / 2) * (CELL_H + CELL_GAP);
-    content.push({ kind: "rect", x: cx, y: cy, w: CELL_W, h: CELL_H, color: SOFT_BG, r: 12 });
-    content.push(text(label, cx + 14, cy + 26, FONT_ROW, SUB));
-    content.push(text(value, cx + 14, cy + 52, FONT_ROW_VALUE, INK));
-  });
-  const cellRows = Math.ceil(input.tools2x2.length / 2);
-  y += cellRows * CELL_H + Math.max(0, cellRows - 1) * CELL_GAP + SECTION_GAP;
-
-  // ⑧ 评语：立绘（固定高）与气泡左右分离；气泡高过立绘时页脚让位
-  anchors.push({ id: "quote", y });
-  const petY = y;
-  const sheet = input.sheet;
-  const petW = sheet
-    ? Math.round((EXPORT_PET_H * sheet.geometry.frameW) / sheet.geometry.frameH)
-    : 0;
-  const petX = EXPORT_W - PAD - petW;
-  const bubbleY = petY + EXPORT_PET_H * 0.1;
-  const quoteTextW = measure(input.quote, FONT_QUOTE);
-  const bubbleW = Math.min(
-    340,
-    Math.max(150, quoteTextW + 44),
-    Math.max(150, petX - BUBBLE_TAIL_GAP - PAD)
-  );
-  const bubbleX = Math.max(PAD, petX - BUBBLE_TAIL_GAP - bubbleW);
-  const quoteLines = wrapText(input.quote, bubbleW - QUOTE_PAD * 2, FONT_QUOTE, measure);
-  const bubbleH = QUOTE_PAD * 2 + QUOTE_ASC + (quoteLines.length - 1) * QUOTE_LINE_H;
-  content.push({
-    kind: "rect",
-    x: bubbleX,
-    y: bubbleY,
-    w: bubbleW,
-    h: bubbleH,
-    color: BUBBLE_BG,
-    r: BUBBLE_R,
-    stroke: LINE,
-  });
-  quoteLines.forEach((line, i) => {
-    content.push(
-      text(
-        line,
-        bubbleX + QUOTE_PAD,
-        bubbleY + QUOTE_PAD + QUOTE_ASC + i * QUOTE_LINE_H,
-        FONT_QUOTE,
-        INK
-      )
+    // 评语：立绘（固定高）与气泡左右分离；气泡高过立绘时页脚让位
+    anchors.push({ id: "quote", y });
+    const petY = y;
+    const sheet = input.sheet;
+    const petW = sheet
+      ? Math.round((EXPORT_PET_H * sheet.geometry.frameW) / sheet.geometry.frameH)
+      : 0;
+    const petX = EXPORT_W - PAD - petW;
+    const bubbleY = petY + EXPORT_PET_H * 0.1;
+    const quoteTextW = measure(input.quote, FONT_QUOTE);
+    const bubbleW = Math.min(
+      340,
+      Math.max(150, quoteTextW + 44),
+      Math.max(150, petX - BUBBLE_TAIL_GAP - PAD)
     );
-  });
-  if (sheet) {
-    const row = resolvePoseRow(input.pose, sheet.rows);
-    const col = poseCol(input.pose, input.poseColIndex);
+    const bubbleX = Math.max(PAD, petX - BUBBLE_TAIL_GAP - bubbleW);
+    const quoteLines = wrapText(input.quote, bubbleW - QUOTE_PAD * 2, FONT_QUOTE, measure);
+    const bubbleH = QUOTE_PAD * 2 + QUOTE_ASC + (quoteLines.length - 1) * QUOTE_LINE_H;
     content.push({
-      kind: "sprite",
-      x: petX,
-      y: petY,
-      w: petW,
-      h: EXPORT_PET_H,
-      sx: col * sheet.geometry.frameW,
-      sy: row * sheet.geometry.frameH,
-      sw: sheet.geometry.frameW,
-      sh: sheet.geometry.frameH,
+      kind: "rect",
+      x: bubbleX,
+      y: bubbleY,
+      w: bubbleW,
+      h: bubbleH,
+      color: BUBBLE_BG,
+      r: BUBBLE_R,
+      stroke: LINE,
     });
+    quoteLines.forEach((line, i) => {
+      content.push(
+        text(
+          line,
+          bubbleX + QUOTE_PAD,
+          bubbleY + QUOTE_PAD + QUOTE_ASC + i * QUOTE_LINE_H,
+          FONT_QUOTE,
+          INK
+        )
+      );
+    });
+    if (sheet) {
+      const row = resolvePoseRow(input.pose, sheet.rows);
+      const col = poseCol(input.pose, input.poseColIndex);
+      content.push({
+        kind: "sprite",
+        x: petX,
+        y: petY,
+        w: petW,
+        h: EXPORT_PET_H,
+        sx: col * sheet.geometry.frameW,
+        sy: row * sheet.geometry.frameH,
+        sw: sheet.geometry.frameW,
+        sh: sheet.geometry.frameH,
+      });
+    }
+    const clusterBottom = Math.max(petY + (sheet ? EXPORT_PET_H : 0), bubbleY + bubbleH);
+    // `clusterBottom` **恒** ≥ `petY`（`EXPORT_PET_H` 是正数常量；无立绘时那一项就是 `petY` 本身），
+    // 而 `petY === y` 且中间没有再动过 `y` ⇒ 这里直接取 `clusterBottom`。原先写成
+    // `Math.max(clusterBottom, y)` 是恒取前者的空运算，只会让人误以为 `y` 可能更大。
+    y = clusterBottom + 24;
   }
-  const clusterBottom = Math.max(petY + (sheet ? EXPORT_PET_H : 0), bubbleY + bubbleH);
-  // `clusterBottom` **恒** ≥ `petY`（`EXPORT_PET_H` 是正数常量；无立绘时那一项就是 `petY` 本身），
-  // 而 `petY === y` 且中间没有再动过 `y` ⇒ 这里直接取 `clusterBottom`。原先写成
-  // `Math.max(clusterBottom, y)` 是恒取前者的空运算，只会让人误以为 `y` 可能更大。
-  y = clusterBottom + 24;
 
-  // ⑨ 页脚
+  // ⑩ 页脚
   anchors.push({ id: "footer", y });
   content.push(text(input.footer, contentX, y + 15, FONT_FOOTER, FAINT));
   const contentBottom = y + FOOTER_BLOCK_H;

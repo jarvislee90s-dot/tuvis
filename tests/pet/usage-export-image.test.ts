@@ -18,6 +18,7 @@ import { defaultExportDeps, renderShareImage, type ExportDeps } from "@/lib/usag
 import {
   EXPORT_W,
   layoutExport,
+  type ExportGroupSection,
   type ExportInput,
   type ExportStep,
   type MeasureText,
@@ -26,6 +27,17 @@ import type { SheetBitmap } from "@/lib/usage/sheet";
 
 /** 与布局用例同款的假测量（1 字符 10px）：两遍绘制必须共用同一份测量口径 */
 const measure: MeasureText = (text) => text.length * 10;
+
+/** 分组段（与 `usage-export-layout.test.ts` 的 `groupSection` 同形） */
+function groupSection(over: Partial<ExportGroupSection> = {}): ExportGroupSection {
+  return {
+    groupBy: "tool",
+    title: "分组分布",
+    rows: [{ name: "Claude", value: "1,246,567", share: 0.5 }],
+    groupsMore: null,
+    ...over,
+  };
+}
 
 /** 布局入参：与 `usage-export-layout.test.ts` 同形（这里的关注点是「画得对不对」） */
 function input(over: Partial<ExportInput> = {}): ExportInput {
@@ -50,9 +62,9 @@ function input(over: Partial<ExportInput> = {}): ExportInput {
       { label: "09/28", value: 250 },
       { label: "10/03", value: 400 },
     ],
-    groupTitle: "分组分布",
-    groups: [{ name: "Claude", value: "1,246,567", share: 0.5 }],
-    groupsMore: null,
+    groups: [groupSection()],
+    cost: null,
+    work: true,
     toolsTitle: "工具调用",
     tools2x2: [
       ["调用总数", "1,234"],
@@ -80,6 +92,8 @@ interface Box {
 interface CtxCall {
   m: string;
   args: unknown[];
+  /** stroke 调用瞬间的 `ctx.lineWidth`（执行层 set 后立刻读，晚帧会被后续步骤覆盖） */
+  lw?: number;
 }
 
 interface FakeCanvas {
@@ -92,7 +106,7 @@ interface FakeCanvas {
   blobType: string | null;
 }
 
-/** 假 2D 上下文：只实现执行层真正用到的方法；`fill` 记路径外接框，`fillText` 记 (文本, x, y) */
+/** 假 2D 上下文：只实现执行层真正用到的方法；`fill`/`stroke` 记路径外接框，`fillText` 记 (文本, x, y) */
 function fakeCtx(canvas: FakeCanvas): CanvasRenderingContext2D {
   let path: { x: number; y: number }[] = [];
   const method =
@@ -118,6 +132,8 @@ function fakeCtx(canvas: FakeCanvas): CanvasRenderingContext2D {
       h: Math.max(...ys) - Math.min(...ys),
     };
   };
+  // save/restore 真实建模（状态栈）：执行层的描边分支必须包夹，lineWidth/lineJoin 不外泄
+  const saved: Record<string, unknown>[] = [];
   const ctx: Record<string, unknown> = {
     fillStyle: "",
     strokeStyle: "",
@@ -134,9 +150,25 @@ function fakeCtx(canvas: FakeCanvas): CanvasRenderingContext2D {
     arcTo: method("arcTo"),
     arc: method("arc"),
     closePath: method("closePath"),
-    stroke: method("stroke"),
+    // stroke 记调用瞬间的 lineWidth 与路径外接框（「以填充宽几何描边」才核对得到像素）
+    stroke: () => canvas.calls.push({ m: "stroke", args: [boxOf()], lw: ctx.lineWidth as number }),
     fill: () => canvas.calls.push({ m: "fill", args: [boxOf()] }),
     fillText: method("fillText"),
+    save: () => {
+      saved.push({
+        fillStyle: ctx.fillStyle,
+        strokeStyle: ctx.strokeStyle,
+        lineWidth: ctx.lineWidth,
+        globalAlpha: ctx.globalAlpha,
+        lineJoin: ctx.lineJoin,
+        lineCap: ctx.lineCap,
+      });
+      canvas.calls.push({ m: "save", args: [] });
+    },
+    restore: () => {
+      Object.assign(ctx, saved.pop() ?? {});
+      canvas.calls.push({ m: "restore", args: [] });
+    },
     measureText: (text: string) => ({ width: text.length * 10 }),
     createLinearGradient: () => ({ addColorStop: method("addColorStop") }),
     drawImage: (...args: unknown[]) => {
@@ -315,5 +347,56 @@ describe("exportImage（计划② Task 12：分享图执行层）", () => {
     expect(textYs(drawn)).toEqual(layoutTextYs(layout.steps));
     // 布局里确实**有** sprite 步骤（不是布局没画，而是执行层按 bitmap 跳过）
     expect(layout.steps.some((s) => s.kind === "sprite")).toBe(true);
+  });
+
+  it("6. bar 描边（Batch 5 补充：费用段）：沿**填充条**几何 stroke 一次（lineWidth 1.5）且 save/restore 包夹；无 stroke 的条不描边", async () => {
+    const src = input({
+      cost: {
+        title: "API 等效费用",
+        totalLabel: "合计（估价）",
+        total: "$12.34",
+        rows: [{ label: "Anthropic / claude-x", value: "$10.00", share: 0.5 }],
+        more: null,
+      },
+    });
+    const layout = layoutExport(src, measure);
+    const { deps, canvases } = fakeDeps({ blob: pngBlob, bitmap: null });
+    await renderShareImage(src, deps);
+
+    const draw = canvases[1];
+    const bars = layout.steps.filter(
+      (s): s is Extract<ExportStep, { kind: "bar" }> => s.kind === "bar"
+    );
+    const costBar = bars.find((b) => b.stroke);
+    expect(costBar).toBeDefined(); // 费用条带 stroke（描边样式）
+    expect(bars.some((b) => !b.stroke)).toBe(true); // 分组条在场（对照组：实心无描边）
+
+    const strokes = draw.calls.filter((c): c is CtxCall & { lw: number } => c.m === "stroke");
+    // 恰好一次 lineWidth 1.5 的描边，外接框 = **填充条**（w × share，同一圆角路径），不是整条轨道
+    const at15 = strokes.filter((c) => c.lw === 1.5);
+    expect(at15).toHaveLength(1);
+    expect(at15[0].args[0]).toEqual({
+      x: costBar!.x,
+      y: costBar!.y,
+      w: costBar!.w * costBar!.share,
+      h: costBar!.h,
+    });
+    // 无 stroke 的分组条：没有任何 stroke 落在它们的填充几何上（删掉 stroke 分支这里即红）
+    for (const gb of bars.filter((b) => !b.stroke)) {
+      const fill = { x: gb.x, y: gb.y, w: gb.w * gb.share, h: gb.h };
+      expect(
+        strokes.some((c) => {
+          const b = c.args[0] as Box;
+          return b.x === fill.x && b.y === fill.y && b.w === fill.w && b.h === fill.h;
+        })
+      ).toBe(false);
+    }
+    // Nit：描边分支包 save/restore——lineJoin/lineWidth 不随同一 ctx 流入后续步骤（栈配平）
+    const idx = draw.calls.findIndex((c) => c.m === "stroke" && c.lw === 1.5);
+    expect(draw.calls.slice(0, idx).some((c) => c.m === "save")).toBe(true);
+    expect(draw.calls.slice(idx + 1).some((c) => c.m === "restore")).toBe(true);
+    expect(draw.calls.filter((c) => c.m === "save")).toHaveLength(
+      draw.calls.filter((c) => c.m === "restore").length
+    );
   });
 });

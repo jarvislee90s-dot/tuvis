@@ -14,7 +14,7 @@
 //  * `invoke` 走 tests/setup.ts 接进 `@tauri-apps/api/core` 的那个单例（① 的 mock case → ② 同源夹具），
 //    不另起 `vi.mock("@tauri-apps/api/core")`（那会绕开夹具）。
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeAll, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { ReactNode } from "react";
 
@@ -46,7 +46,7 @@ vi.mock("@tauri-apps/api/event", () => ({
 }));
 
 import i18n from "@/i18n";
-import UsageDashboardPage from "@/pages/usage-dashboard";
+import { UsageDashboardBody } from "@/components/usage/UsageDashboardBody";
 import { UsageSummary } from "@/components/usage/UsageSummary";
 import { tauriInvokeMock } from "../msw/tauriMocks";
 import { EM_DASH, fmtTokens } from "@/lib/usage/format";
@@ -77,7 +77,7 @@ function renderPage() {
   const wrapper = ({ children }: { children: ReactNode }) => (
     <QueryClientProvider client={client}>{children}</QueryClientProvider>
   );
-  return render(<UsageDashboardPage />, { wrapper });
+  return render(<UsageDashboardBody active />, { wrapper });
 }
 
 beforeAll(async () => {
@@ -266,36 +266,25 @@ describe("usage-page（计划② Task 6：大看板首屏）", () => {
     expect(screen.getByTestId("usage-dist-expand")).toHaveTextContent("显示更多（2）");
   });
 
-  it("6. 页脚口径常驻 + 环比基准声明一次 + 保留期由设置项驱动 + collectedAt===0 哨兵可见", async () => {
+  it("6. 口径页脚已随实机反馈移除（迁入分享图）+ collectedAt===0 哨兵可见 + compare===null 只显当前值", async () => {
     const page = renderPage();
     await screen.findByTestId("usage-hero");
-    const footer = screen.getByTestId("usage-footer");
-    expect(footer).toHaveTextContent("纯 token · 含子代理 · 本地聚合");
-    // 2026-10-06 排版修复：页脚的「数据新鲜度：<时刻>」删掉了——它与网格的 asOf 行是**同一个
-    // `collected`**（真机截图里同一时间戳在一张卡上出现两遍）；腾出的位置放「环比基准」，
-    // 因为屏上 8 处环比现在都只印差值，基准必须在卡上声明一次。
-    expect(footer).toHaveTextContent("环比基准：上一等长周期");
-    expect(footer.textContent).not.toMatch(/\d{2}:\d{2}:\d{2}/);
-    // 设置夹具默认 `detailRetentionDays = 90` ⇒ 页面把设置值传进页脚（设置查询与看板并行，
-    // 谁先落地不定 ⇒ 这句要等）
-    await waitFor(() =>
-      expect(screen.getByTestId("usage-footer")).toHaveTextContent("90 天前无明细")
-    );
+    // 三轮实机反馈 ⑤：页脚「纯 token · 含子代理 · 本地聚合 · 环比基准…」整行移除
+    // （口径声明迁入导出分享图 usage.footer.caliber，屏上不再占一行）
+    expect(screen.queryByTestId("usage-footer")).toBeNull();
     page.unmount();
 
     // `collectedAt === 0` 是「尚未采集」哨兵。mock 的 0 哨兵必与空态同现（页面走 UsageEmpty），
-    // 故这一支只能直接渲染组件覆盖：**网格 asOf 行**要出哨兵（页脚那处已随 freshness 一并删除），
-    // **不得**出 `—`。
+    // 故这一支只能直接渲染组件覆盖：**网格 asOf 行**要出哨兵，**不得**出 `—`。
     const dash = {
       ...mockUsageDashboard({ preset: "last7d" }, "tool"),
       compare: null,
       collectedAt: 0,
     };
     const t = i18n.t.bind(i18n);
-    const one = render(<UsageSummary dash={dash} retentionDays={30} t={t} />);
+    const one = render(<UsageSummary dash={dash} t={t} />);
     expect(screen.getByTestId("usage-grid-asOf")).toHaveTextContent("尚未采集");
-    expect(screen.getByTestId("usage-footer")).toHaveTextContent("30 天前无明细");
-    expect(screen.getByTestId("usage-footer").textContent).not.toMatch(/NaN|Infinity|0%/);
+    expect(screen.getByTestId("usage-grid-asOf")).not.toHaveTextContent(EM_DASH);
 
     // compare === null ⇒ 只显示当前值：不得出现对比段（值照常出）
     const hitRow = screen.getByTestId("usage-grid-hitRate");
@@ -303,18 +292,20 @@ describe("usage-page（计划② Task 6：大看板首屏）", () => {
     expect(hitRow).not.toHaveTextContent("上一周期");
     expect(hitRow.textContent).not.toMatch(/pt）/);
     one.unmount();
-
-    // `retentionDays` 为空 ⇒ 不出保留期（步骤 6 的页脚三件套）
-    render(<UsageSummary dash={dash} retentionDays={null} t={t} />);
-    expect(screen.getByTestId("usage-footer")).not.toHaveTextContent("天前无明细");
   });
 
-  it("7. 打开即按需采集恰一次（force=false）；切档重查不触发扫描", async () => {
+  it("7. 打开即可见即采恰一次（可见性命令）；切档重查不触发扫描", async () => {
+    // 可见即采的 60s 去抖：前端模块级时间戳跨实例共享（前面的用例已记下时间戳），把 Date 拨过
+    // 窗口，模拟「新开窗口」的首次打开仍会触发；真正的跨 WebView 去抖由后端门闩裁定。
+    const at = vi.spyOn(Date, "now").mockReturnValue(Date.now() + 61_000);
+    onTestFinished(() => at.mockRestore());
+
     renderPage();
     await screen.findByTestId("usage-hero");
 
-    expect(callsOf("usage_collect")).toHaveLength(1);
-    expect(callsOf("usage_collect")[0][1]).toEqual({ force: false });
+    expect(callsOf("usage_collect_visible")).toHaveLength(1);
+    // 可见性触发不走手动命令（手动 `force=true` 只由「立即采集」按钮发出）
+    expect(callsOf("usage_collect")).toHaveLength(0);
     // 三条读命令只读账本（§3 第 15 条）
     expect(callsOf("usage_dashboard").length).toBeGreaterThan(0);
     expect(callsOf("usage_get_settings").length).toBeGreaterThan(0);
@@ -327,6 +318,6 @@ describe("usage-page（计划② Task 6：大看板首屏）", () => {
         )
       ).toBe(true)
     );
-    expect(callsOf("usage_collect")).toHaveLength(1);
+    expect(callsOf("usage_collect_visible")).toHaveLength(1);
   });
 });

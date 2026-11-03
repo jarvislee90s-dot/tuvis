@@ -88,8 +88,9 @@ export function MainTitleBar() {
       title={`${t("app.title")} v${packageJson.version}`}
       rightActions={
         <>
-          {/* 用量看板入口（计划② Task 6 步骤 9）：图表键 → 独立窗口 usage-dashboard。
-              主题经 openUsageDashboard 的 `theme` 传入（`system` 传 undefined 跟随系统） */}
+          {/* 用量看板入口（计划② Task 6 步骤 9）：图表键 → 经 openUsageDashboard 请求
+              主窗导航至「模型用量」页签（V2 四页同窗后不再创建独立 usage-dashboard 窗口）。
+              title/theme 形参为旧签名兼容保留，已无效果 */}
           <button
             onClick={() => void openUsageDashboard({ title: t("usage.title"), theme: tauriTheme })}
             className="title-bar-btn mr-1"

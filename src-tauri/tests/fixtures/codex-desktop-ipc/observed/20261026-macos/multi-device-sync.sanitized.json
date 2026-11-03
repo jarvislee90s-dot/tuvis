@@ -1,0 +1,37 @@
+{
+  "case": "F05 多端同步 · 远程应答使桌面原卡撤下（19:40）",
+  "sequence": [
+    {
+      "t": "19:34",
+      "actor": "用户桌面",
+      "what": "点「Yes, implement this plan」→ 链上出现 PLEASE IMPLEMENT 前缀消息"
+    },
+    {
+      "t": "19:3x",
+      "actor": "上游",
+      "what": "新弹 item/commandExecution/requestApproval id=194（offered accept/OBJ/cancel）；桌面显示 Ask permission + Deny/Allow once"
+    },
+    {
+      "t": "19:40",
+      "actor": "harness（远程 follower）",
+      "what": "thread-follower-command-approval-decision v1 decision=accept 一帧 → Accepted"
+    },
+    {
+      "t": "19:40+",
+      "actor": "链上",
+      "what": "后续 snapshot requests=[]、runtime idle、两个回合均 completed；probe/probe-plan-approve.txt 真实生成"
+    },
+    {
+      "t": "19:4x",
+      "actor": "用户目视",
+      "what": "确认桌面那张 Ask permission 卡**已消失**"
+    }
+  ],
+  "conclusion": "远程（非发起端）应答审批 → 原 Desktop 活动卡被撤下，多端状态一致；撤卡由上游状态驱动，不依赖桌面自身点击",
+  "designNote": "这条与 §3.1 的『收起只改本地』正好成对：**decision 帧会撤卡，收起不会** ⇒ F05 状态机不能把两者混为同一动作",
+  "evidence": [
+    "sanitized/decision-accept.json-m05-planexec-accept",
+    "raw/screenshots/2026-10-26T1934-plan-approved-new-approval.png",
+    "probe/probe-plan-approve.txt"
+  ]
+}

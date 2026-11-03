@@ -1,0 +1,58 @@
+{
+  "case": "answer-async",
+  "envelopeShape": "<send_user_message_question_reply>\\n[{questionItemId,question,answer}]\\n</send_user_message_question_reply>",
+  "envelopeLenChars": 201,
+  "answered": [
+    {
+      "questionItemId": "<ID-6>",
+      "itemId": "<ID-5>",
+      "itemType": "agentMessage",
+      "delivery": "async",
+      "qindex": 0,
+      "optionCount": 2,
+      "answerInOptions": true,
+      "answerChars": 2,
+      "questionKeys": ["title", "options"]
+    }
+  ],
+  "request": {
+    "conversationId": "<ID-2>#uuid",
+    "turnStart": {
+      "request": {
+        "threadId": "<ID-2>#uuid",
+        "input": [
+          {
+            "type": "text",
+            "text": "<str:201>",
+            "text_elements": []
+          }
+        ],
+        "clientUserMessageId": "<ID-7>#uuid"
+      },
+      "context": {}
+    }
+  },
+  "receipt": {
+    "method": "thread-follower-start-turn",
+    "version": 2,
+    "delivery": "Accepted",
+    "resultType": "success",
+    "handledByPresent": true,
+    "reasonCode": null,
+    "result": {
+      "result": {
+        "turn": {
+          "id": "<ID-8>#uuid",
+          "rootTurnId": "01a177b3-2706-7c72-953e-6312309400aa",
+          "items": [],
+          "itemsView": "notLoaded",
+          "status": "inProgress",
+          "error": null,
+          "startedAt": null,
+          "completedAt": null,
+          "durationMs": null
+        }
+      }
+    }
+  }
+}

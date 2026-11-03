@@ -9,7 +9,9 @@
       "turnStart": {
         "request": {
           "threadId": "00000000-0000-4000-8000-0000000000cv",
-          "input": [{ "type": "text", "text": "[harness-40934-profile-probe] …占位…", "text_elements": [] }],
+          "input": [
+            { "type": "text", "text": "[harness-40934-profile-probe] …占位…", "text_elements": [] }
+          ],
           "clientUserMessageId": "00000000-0000-4000-8000-0000000000cm"
         },
         "context": {}

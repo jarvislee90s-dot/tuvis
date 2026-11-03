@@ -57,6 +57,11 @@ fn state(conn: &SharedConn) -> Arc<RemoteState> {
             total_count: 0,
             waiting_count: 0,
         }),
+        fresh_session_source: Box::new(|| SessionsResponse {
+            sessions: Vec::new(),
+            total_count: 0,
+            waiting_count: 0,
+        }),
         pairing_counter: Box::new(Vec::new),
         board_hidden_ids: Box::new(Vec::new),
         board_hidden_hide: Arc::new(|_| 0usize),

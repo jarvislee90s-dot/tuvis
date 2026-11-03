@@ -25,12 +25,15 @@ import { useAppTranslation } from "@/hooks/use-app-translation";
 import { usageErrMsg } from "@/components/usage/usageErrors";
 import { PricingStatusPanel } from "@/components/usage/PricingStatusPanel";
 import { UsageConfigDialog } from "@/components/usage/UsageConfigDialog";
+import { SpeedSourcesPanel } from "@/components/speed/SpeedSourcesPanel";
 import { USAGE_KEY, useUsageSettingsQuery } from "@/lib/query/queries/usage";
+import { useSpeedDashboardQuery } from "@/lib/query/queries/speed";
 import { usageSetSettings } from "@/lib/api/usage";
 import { useDisplayCurrency, type DisplayCurrency } from "@/lib/usage/displayCurrency";
 import { subscribeConfig } from "@/components/pet/petConfig";
 import { loadActiveId } from "@/components/pet/petRuntime";
 import type { UsageSettings, UsageSettingsPatch } from "@/types/usage";
+import type { SpeedDashboardQuery } from "@/types/speed";
 
 /** 浮窗口径三档（顺序即下拉顺序；键族复用 `UsageSettings["miniBarRange"]`，不另立类型） */
 const RANGE_OPTIONS: { value: UsageSettings["miniBarRange"]; key: string }[] = [
@@ -75,6 +78,33 @@ const TOOL_ROWS_RANGE = [1, 7] as const;
 const RETENTION_RANGE = [1, 90] as const;
 
 const INTERVAL_RANGE = [1, 1440] as const;
+
+/**
+ * 设置侧取 sourceStates 用的最小 dashboard 查询（Task 11）：设置页不关心曲线/选择，
+ * 只用快照里的 `sourceStates`——字段取契约缺省形态（1h / 无选择 / stream）。
+ */
+const SPEED_SOURCES_QUERY: SpeedDashboardQuery = {
+  range: "1h",
+  selection: null,
+  metricMode: "stream",
+  toolId: null,
+  search: "",
+  sort: "tool",
+};
+
+/** 窗口可见性（文档侧）：设置窗隐藏/最小化时面板不再取数（Spec §8.7「面板 open 且窗口可见」）。 */
+function useSettingsWindowVisible(): boolean {
+  const [visible, setVisible] = useState(
+    () => typeof document === "undefined" || document.visibilityState !== "hidden"
+  );
+  useEffect(() => {
+    const sync = () => setVisible(document.visibilityState !== "hidden");
+    sync();
+    document.addEventListener("visibilitychange", sync);
+    return () => document.removeEventListener("visibilitychange", sync);
+  }, []);
+  return visible;
+}
 
 /** 数字设置输入：编辑期保留字符串草稿，失焦/Enter 才夹取并保存，避免逐字符重渲染导致光标跳动。 */
 function NumericSettingInput({
@@ -133,6 +163,53 @@ export function UsageSection() {
   const { currency, rate, setCurrency, setRate } = useDisplayCurrency();
   /** 汇率输入草稿：允许用户输入过程中出现无效串，只有合法值才落库 */
   const [rateDraft, setRateDraft] = useState(rate);
+
+  // ── 输出速度来源状态（Task 11 采集管理面板）────────────────────────────────
+  // 设置侧纪律（Spec §8.7）：**只在面板 open 且窗口可见时**取 sourceStates，且**单次取数即停**
+  // ——不开速度页的 5 秒轮询、不申请视图租约（`useTpsViewLease` 只归速度页宿主）；面板内
+  // 刷新/安装/卸载动作失效 `["tps"]` 前缀后经缓存失效订阅再武装一次取数（见下方订阅）。
+  // 收口认**终态**：成功与失败都算一次取数完成——失败若不收口，hook 的 refetchInterval 会把
+  // 设置面板变成 5 秒轮询循环（2026-10-26 评审 Important 修复），错误由面板内联渲染 + 手动重试。
+  const [sourcesOpen, setSourcesOpen] = useState(false);
+  const windowVisible = useSettingsWindowVisible();
+  /** 单次取数收口：进入终态（isSuccess/isError）即置位，面板关闭时复位（重开再取新事实） */
+  const [sourcesSettled, setSourcesSettled] = useState(false);
+  /** 已收口的事实代际：成功看 dataUpdatedAt、失败看 errorUpdatedAt——只有**新**完成的取数才
+   *  再次收口，刷新/动作触发的重新武装不会被缓存里的旧结果立刻抵消（否则 enabled true→false
+   *  抢在重取派发之前） */
+  const settledSuRef = useRef<number>(0);
+  const settledErRef = useRef<number>(0);
+  useEffect(() => {
+    if (!sourcesOpen) setSourcesSettled(false);
+  }, [sourcesOpen]);
+  const speedSourcesQuery = useSpeedDashboardQuery(SPEED_SOURCES_QUERY, {
+    active: sourcesOpen && windowVisible && !sourcesSettled,
+  });
+  useEffect(() => {
+    const du = speedSourcesQuery.dataUpdatedAt;
+    if (sourcesOpen && du > 0 && du !== settledSuRef.current) {
+      settledSuRef.current = du;
+      setSourcesSettled(true);
+    }
+  }, [sourcesOpen, speedSourcesQuery.dataUpdatedAt]);
+  useEffect(() => {
+    const eu = speedSourcesQuery.errorUpdatedAt;
+    if (sourcesOpen && eu > 0 && eu !== settledErRef.current) {
+      settledErRef.current = eu;
+      setSourcesSettled(true);
+    }
+  }, [sourcesOpen, speedSourcesQuery.errorUpdatedAt]);
+  // 停轮询态（enabled=false）下 invalidate 不会自动重取，且失效不改变 observer 结果
+  // （不触发重渲染）→ 订阅缓存失效事件：面板内刷新/安装/卸载动作失效 `["tps"]` 前缀时
+  // 重新武装一次取数（关闭状态收到失效也不取——active 仍被 open 压住，重开才取）。
+  useEffect(() => {
+    const cache = queryClient.getQueryCache();
+    return cache.subscribe((event) => {
+      if (event.type !== "updated" || event.action.type !== "invalidate") return;
+      if (event.query.queryKey[0] !== "tps") return;
+      setSourcesSettled(false);
+    });
+  }, [queryClient]);
 
   useEffect(() => {
     setRateDraft(rate);
@@ -367,6 +444,40 @@ export function UsageSection() {
               <p className="text-muted-foreground text-xs">{t("settings.usage.pricingHint")}</p>
               <PricingStatusPanel t={t} />
             </div>
+            <div className="border-t" />
+
+            {/* 输出速度采集管理（Task 11）：设置与速度页共用同一个 SpeedSourcesPanel。
+              取数只在面板 open 且窗口可见时发生（单次，见上方状态机）；安装/卸载动作与
+              速度页走同一套 TpsInstallFlow，不在此复制安装算法。 */}
+            <div className="flex items-center justify-between gap-4 py-2.5">
+              <div className="min-w-0 flex-1">
+                <p className={SETTINGS_FIELD}>{t("settings.usage.sourcesTitle")}</p>
+                <p className="text-muted-foreground mt-0.5 text-xs">
+                  {t("settings.usage.sourcesHint")}
+                </p>
+              </div>
+              <Button
+                size="sm"
+                variant="outline"
+                data-testid="usage-sources-open"
+                onClick={() => setSourcesOpen(true)}
+              >
+                {t("settings.usage.sourcesOpen")}
+              </Button>
+            </div>
+            <SpeedSourcesPanel
+              open={sourcesOpen}
+              onOpenChange={setSourcesOpen}
+              sources={speedSourcesQuery.data?.sourceStates ?? []}
+              fetchState={
+                speedSourcesQuery.isError
+                  ? "error"
+                  : speedSourcesQuery.isPending && sourcesOpen
+                    ? "loading"
+                    : "ready"
+              }
+              onRetry={() => setSourcesSettled(false)}
+            />
             <div className="border-t" />
 
             {/* 供应商映射规则（JSON）**已从界面撤下**（2026-10-07 用户裁决）：

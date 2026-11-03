@@ -4,7 +4,7 @@
 > （不是自然采集出来的）。将来任何人核对 dsh 历史、对比事件流、或怀疑某天的数字时，
 > **必须先知道这件事**。口头报告不算可追溯，故落成入库文档。
 >
-> 关联：施工提示词 `docs/superpowers/plans/2026-10-07-dsh-time-attribution-fix-brief.md`、
+> 关联：施工提示词 `docs/engineering/plans/2026-10-07-dsh-time-attribution-fix-brief.md`、
 > 契约 §4「2026-10-07 接口变更申报」、验收清单 §0 第 10 行 / A-11 / F-5。
 > 分支：`fix/dsh-event-time-attribution`（commit `3956768` / `5200731`）。
 

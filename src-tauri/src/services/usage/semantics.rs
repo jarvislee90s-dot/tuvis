@@ -18,7 +18,7 @@ pub enum CacheSemantics {
     /// 为什么复用 `cache_semantics` 列而不是新增列：任务书 §3.2 明确允许（「可用 `cache_semantics`
     /// 或新增列；新增列必须走 migration 并申报接口变更」）；本列是 TEXT、取值集合由本枚举定义，
     /// 扩充取值不需要 migration。**取值的扩充已在契约里做日期化申报**（见
-    /// `docs/superpowers/plans/2026-10-03-usage-interface-contract.md` 的 2026-10-07 变更申报）。
+    /// `docs/engineering/plans/2026-10-03-usage-interface-contract.md` 的 2026-10-07 变更申报）。
     ///
     /// **不得**拿它当语义用：`normalize()` 对它返回 `None`（补录行由采集器按 `Exclusive`
     /// 构造好四桶，不经过归一化）。

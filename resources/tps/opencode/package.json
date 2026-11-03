@@ -1,0 +1,24 @@
+{
+  "name": "tuvis-tps-opencode-observer",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "description": "兔维斯 TPS 短时抽样的 OpenCode 服务端最小观察插件（仅观察、取数字后丢正文、本地 JSONL 事实落盘）",
+  "main": "tuvis-tps-observer.ts",
+  "exports": {
+    ".": "./tuvis-tps-observer.ts"
+  },
+  "engines": {
+    "bun": ">=1.0"
+  },
+  "dependencies": {},
+  "devDependencies": {},
+  "tuvis": {
+    "host": "opencode",
+    "verifiedHostVersion": "2.0.22",
+    "installTarget": "~/.config/opencode/plugins/tuvis-tps-observer.ts",
+    "factFile": "~/.tuvis/tps/opencode/facts.jsonl",
+    "notes": "零 npm 依赖（仅 Node/Bun 内建模块），纯 JavaScript 以 .ts 分发（宿主 2.0.22 目录发现不装载 .mjs，隔离实测）。package.json 是分发清单（许可/依赖闭包说明），安装时**不**落入宿主 plugins 目录——目录发现会把该目录里的每个文件当插件模块 import。"
+  }
+}

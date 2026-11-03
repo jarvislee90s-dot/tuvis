@@ -1,4 +1,12 @@
 import { useTranslation } from "react-i18next";
+import { useQueryClient } from "@tanstack/react-query";
+import {
+  SESSIONS_QUERY_KEY,
+  applyOptimisticSessionMutation,
+  getSessionDismissBehavior,
+  settleSessionMutation,
+  type SessionMutationOutcome,
+} from "@/lib/query/optimisticSessions";
 import { Cpu, Clock, Bot, ChevronRight, X, ArrowLeftRight, ExternalLink } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { cn } from "@/lib/utils";
@@ -53,33 +61,51 @@ export function SessionCard({
   pairingAmbiguous?: boolean;
 }) {
   const { t } = useTranslation();
+  const queryClient = useQueryClient();
   const badge = AGENT_BADGE[session.agentType];
   const Icon = badge.Icon;
   // 跳转共享逻辑（歧义候选窗口由 hook 状态承载，命中多个窗口时弹出选择器）
   const { candidates, setCandidates, focus, focusHwnd } = useSessionJump();
 
   // 手动关闭卡（X）：不触发卡片跳转。全部形态（App/CLI）均可关闭。
-  // 未读卡 = 标记已读（mark_session_read，spec W4 已读信号 2）；
-  // 非未读卡（黄/红/绿）= 暂离不提示（dismiss_session_card，T2）——写入进程内
-  // dismiss 集合从看板与宠物隐藏，同一会话状态变化后自然重现
+  // 生命周期分类与批量共用（`getSessionDismissBehavior`）：
+  //  - 普通未读卡 = 标记已读（mark_session_read，spec W4）：卡面保留、未读态消失；
+  //  - 数据驱动聚合绿卡（未读）= 标记已读，后端已读即剔除 → 整卡移除；
+  //  - 非未读卡（黄/红/绿）= 暂离不提示（dismiss_session_card，T2）→ 整卡移除。
+  // F5（09b95a3c + 2026-10-31 定案）：点击后**先乐观更新**；命令内部补扫等待不阻塞
+  // 感知；applied=false 时 pending 保留到 epoch 更大的快照事件（有界 10s），
+  // 旧快照回写不得让卡片复活；命令失败立即 invalidate + 清 pending（回滚）。
   const handleClose = async (e: React.MouseEvent) => {
     e.stopPropagation(); // 不触发卡片跳转
+    const behavior = getSessionDismissBehavior(session);
+    // G1：先取消在飞轮询，避免旧快照在乐观更新后回写；pending 集合在命令期间
+    // 继续拦截轮询回写（会话卡/未读态都不复活）
+    void queryClient.cancelQueries({ queryKey: SESSIONS_QUERY_KEY });
+    const ticket = applyOptimisticSessionMutation(queryClient, [session]);
+    let outcome: SessionMutationOutcome | null = null;
     try {
-      if (session.unread) {
-        await invoke("mark_session_read", {
-          agentType: session.agentType,
-          sessionId: session.id,
-        });
-      } else {
-        await invoke("dismiss_session_card", {
-          agentType: session.agentType,
-          sessionId: session.id,
-          status: session.status,
-        });
+      outcome =
+        behavior === "dismiss"
+          ? await invoke<SessionMutationOutcome>("dismiss_session_card", {
+              agentType: session.agentType,
+              sessionId: session.id,
+              status: session.status,
+            })
+          : await invoke<SessionMutationOutcome>("mark_session_read", {
+              agentType: session.agentType,
+              sessionId: session.id,
+            });
+      if (!outcome?.applied) {
+        console.warn(
+          "[sessions] 关闭后补扫降级（applied=false），等待 epoch 更大的快照再收口",
+          outcome
+        );
       }
     } catch (err) {
+      // 失败：settle(null) 会 invalidate 权威快照并清 pending（乐观更新回滚）
       console.error("session card close failed:", err);
     }
+    await settleSessionMutation(queryClient, ticket, outcome);
   };
 
   const handleClick = async () => {
@@ -126,55 +152,54 @@ export function SessionCard({
     <>
       <Card
         className={cn(
-          "group hover:bg-accent/50 @container relative cursor-pointer border p-3 transition-colors",
+          // 行距 8px（用户裁决 2026-10-27）：Card 基类自带 flex flex-col gap-6（24px）
+          // ——三行（标题/会话名/正文）之间的空行就是它垫出来的；改为 gap-2 统一 8px，
+          // 行内 mb 全部移除，避免 margin 叠在 gap 上
+          "group hover:bg-accent/50 @container relative flex cursor-pointer flex-col gap-2 border p-3 transition-colors",
           session.status === "waiting" && "border-red-500/40",
           !session.jumpSupported && "cursor-default opacity-80"
         )}
         onClick={handleClick}
         title={session.jumpSupported ? t("sessions.jumpToTerminal") : t("sessions.jumpUnsupported")}
       >
-        {/* 顶部：工具标签 + 项目目录名（自然宽度优先完整显示）+ 会话标题尾巴 + 分支 | 状态指示区 | 关闭 X 最右。
-            会话标题主要用于跳转匹配定位而非阅读，压缩为灰色尾巴（悬停 tooltip 看全文）；
-            空间不足时尾巴先截断（flex-shrink 5 倍让路），项目名最后才截——
-            kimi 长任务标题曾把项目名挤成单字（窄卡 + DPI 缩放下定宽尾巴同样会饿死项目名） */}
-        <div className="mb-2 flex items-center justify-between gap-2">
-          <div className="flex min-w-0 flex-1 items-center gap-2">
+        {/* 第一行：工具标签 + 项目目录名（自然宽度优先完整显示）+ 配对歧义图标 + 分支 | 状态指示区 | 关闭 X 最右。
+            会话标题主要用于跳转匹配定位而非阅读，移到第二行独立展示（灰色 mono 次文字，
+            悬停 tooltip 看全文，有整行空间不再需要容器查询隐藏——实机反馈轮 2026-10-27 #1）。
+            项目名 shrink-0 **绝不参与收缩**（JS 预算已限 15 字，max-w-[12rem] 只作病理宽度安全帽）：
+            实测 flex-shrink 1:5 分摊仍会让短名缩 2~3px，而 truncate 溢出 1px 就把尾字换成
+            省略号（「tuvis」→「tu…」）；分支改 flex-1 min-w-0 吸收剩余空间、先截。
+            首组 overflow-hidden + 右侧 pr-1 保证任何溢出都裁在状态点之前，永不压到状态灯下 */}
+        <div className="flex items-center justify-between gap-2">
+          <div className="flex min-w-0 flex-1 items-center gap-2 overflow-hidden pr-1">
             <span
               className={cn(
-                "inline-flex shrink-0 items-center gap-1 rounded border px-1.5 py-0.5 text-[10px] font-semibold",
+                "inline-flex shrink-0 items-center gap-1 rounded border px-1.5 py-0.5 text-xs font-semibold",
                 badge.className
               )}
             >
               <Icon className="h-3 w-3" />
               {getAgentLabel(session.agentType, session.form)}
             </span>
-            <span className="min-w-0 truncate text-sm font-medium" title={session.projectName}>
+            <span
+              className="max-w-[12rem] shrink-0 truncate text-sm font-medium"
+              title={session.projectName}
+            >
               {truncateProjectName(session.projectName)}
             </span>
             {pairingAmbiguous && (
               <span
-                className="shrink-0 text-amber-500/80"
+                className="shrink-0 text-amber-600 dark:text-amber-400"
                 title={t("sessions.pairingAmbiguous")}
                 aria-label={t("sessions.pairingAmbiguous")}
               >
                 <ArrowLeftRight className="h-3 w-3" />
               </span>
             )}
-            {/* issue #51：容器查询阈值隐藏——容器查询按 Card 的 content box 度量，
-                比外卡宽小 26px（1px 边框×2 + p-3 内边距 12px×2），故阈值 374px 对应
-                外卡宽 400px：低于此值时整段收起，避免尾巴被项目名挤压到只剩孤立
-                省略号（实测窄卡 ≈366px 时发生）；跳转匹配消费的是 session.title
-                数据而非可见文本，隐藏无功能影响 */}
-            {(session.title || session.id) && (
-              <span
-                className="text-muted-foreground/60 hidden max-w-[14em] min-w-0 [flex-shrink:5] truncate font-mono text-[10px] @min-[374px]:block"
-                title={session.title || session.id.slice(0, 8)}
-              >
-                {session.title || session.id.slice(0, 8)}
-              </span>
-            )}
             {session.gitBranch && (
-              <span className="text-muted-foreground shrink-0 font-mono text-[10px]">
+              <span
+                className="text-muted-foreground min-w-0 flex-1 truncate font-mono text-xs"
+                title={session.gitBranch}
+              >
                 {session.gitBranch}
               </span>
             )}
@@ -201,13 +226,25 @@ export function SessionCard({
           </div>
         </div>
 
-        {/* 中间：最后消息预览 */}
-        <p className="text-muted-foreground mb-2 line-clamp-2 min-h-[2.5rem] text-xs">
+        {/* 第二行：会话标题尾巴——独立整行展示，截断加省略号 + title 全文悬停。
+            二轮实机反馈 ①（2026-10-27）：加粗（font-semibold）拉近（mb-2→mb-1）——
+            会话名是卡片的主要可读内容，预览行距同步收紧（mb-2→mb-1.5），三行更紧凑 */}
+        {(session.title || session.id || "").trim() !== "" && (
+          <div
+            className="text-muted-foreground truncate font-mono text-xs font-semibold"
+            title={session.title || session.id.slice(0, 8)}
+          >
+            {session.title || session.id.slice(0, 8)}
+          </div>
+        )}
+
+        {/* 中间：最后消息预览（二轮实机反馈 ①：mb-2→mb-1.5，其余不动） */}
+        <p className="text-muted-foreground line-clamp-2 min-h-[2.5rem] text-xs">
           {session.lastMessage || t("sessions.noMessage")}
         </p>
 
         {/* 底部：CPU + PID + 运行时长 */}
-        <div className="text-muted-foreground flex items-center gap-3 text-[10px]">
+        <div className="text-muted-foreground flex items-center gap-3 text-xs">
           <span className="flex items-center gap-1">
             <Cpu className="h-3 w-3" />
             {session.cpuUsage.toFixed(1)}%
@@ -248,7 +285,7 @@ export function SessionCard({
           onClick={() => setCandidates(null)}
         >
           <div
-            className="bg-card w-96 rounded-lg border p-4 shadow-xl"
+            className="workspace-glass w-96 rounded-lg border p-4 shadow-xl"
             onClick={(e) => e.stopPropagation()}
           >
             <p className="mb-3 text-sm font-medium">{t("sessions.pickWindow")}</p>

@@ -38,7 +38,7 @@
 //
 // ## 线稿硬契约档（**不属上面的层级表**：按 UI 唯一契约原样落地，不得按「凑成整档」改数）
 //  * `SETTINGS_REMOTE_BADGE`（`text-[10.5px]`）：远程接入分区的徽标档。出处 =
-//    `docs/superpowers/wireframes/2026-09-17-remote-settings-redesign.html` 的
+//    `docs/engineering/architecture/wireframes/2026-09-17-remote-settings-redesign.html` 的
 //    `.badge { font-size: 10.5px; border-radius: 999px; padding: 2px 8px; flex: none; }`
 //    ——该线稿是 UI 唯一契约（「实现与线稿不一致即缺陷」），且**全部徽标色**（green /
 //    blue / gray / violet / amber）共用这一处字号定义。
@@ -70,7 +70,7 @@ export const SETTINGS_BADGE = "text-[10px]";
 /**
  * 远程接入分区的徽标档（**线稿硬契约**，非层级档）。
  *
- * 出处：`docs/superpowers/wireframes/2026-09-17-remote-settings-redesign.html` 的
+ * 出处：`docs/engineering/architecture/wireframes/2026-09-17-remote-settings-redesign.html` 的
  * `.badge { font-size: 10.5px; border-radius: 999px; padding: 2px 8px; flex: none; }`
  * ——线稿是 UI 唯一契约，且全部徽标色（green / blue / gray / violet / amber）共用它。
  *
@@ -106,3 +106,14 @@ export const SETTINGS_REMOTE_ROW = "text-[13px]";
  * （#125 立档，同上。）
  */
 export const SETTINGS_REMOTE_HINT = "text-[12px]";
+
+/**
+ * 远程接入分区的组标题档（**线稿硬契约**，非层级档）。
+ *
+ * 出处：同一线稿的 `.group-label { font-size: 12.5px; color: var(--muted);
+ * font-weight: 600; margin: 16px 0 2px; }`——分区内的组头（① 通用 / ② 远程控制 /
+ * ⑤ Codex 自动适配…）共用这一档。此前该值只以裸字面量存在于豁免面
+ * （`RemoteSection`）内；S5 拆出 `CodexAdaptSection` 后组头落到非豁免文件，
+ * 由 S6 依测试指引立档（非豁免面要用请走 typography.ts 常量）。
+ */
+export const SETTINGS_REMOTE_GROUP_LABEL = "text-[12.5px]";

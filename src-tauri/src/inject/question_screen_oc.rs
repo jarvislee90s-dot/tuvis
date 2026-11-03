@@ -344,7 +344,7 @@ pub fn kimi_question_screen_snapshot(lines: &[String]) -> Option<QuestionScreenS
 }
 
 // ===== codex 0.160.0 问答面板快照解析器（2026-10-09 取证批 Task 4）=====
-// 底料 `docs/superpowers/specs/2026-10-08-codex-160-question-屏读底料.md` §2；
+// 底料 `docs/engineering/specs/2026-10-08-codex-160-question-屏读底料.md` §2；
 // 夹具 = `question::live_fixtures::codex_*`（活体逐字取证，F 证据根
 // `%USERPROFILE%\mam-probe-m6r\evidence\`）。屏形事实（取证定案）：
 //
@@ -875,7 +875,7 @@ mod tests {
     }
 
     /// codex 0.160.0 问答面板快照解析器（2026-10-09 取证批 Task 4，底料
-    /// `docs/superpowers/specs/2026-10-08-codex-160-question-屏读底料.md` §2）。
+    /// `docs/engineering/specs/2026-10-08-codex-160-question-屏读底料.md` §2）。
     /// 夹具 = `question::live_fixtures::codex_*`（活体逐字取证，不得改夹具）。
     mod codex_snapshot_tests {
         use super::*;

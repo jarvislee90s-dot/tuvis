@@ -1,0 +1,39 @@
+{
+  "case": "F04 手机端端到端实测（20:06:17，用户亲手点「批准」）",
+  "path": "手机/浏览器页 → POST /m/api/v1/codex/pending-response → 动作账本 reserve → adapter respond → thread-follower-command-approval-decision v1 decision=accept → 上游执行",
+  "proof": {
+    "sentinelFile": {
+      "path": "probe/sentinel-mobile.txt",
+      "content": "TUVIS-MAC-PROBE-MOBILE-F",
+      "createdAt": "20:06"
+    },
+    "wire": {
+      "requests": 0,
+      "threadRuntimeStatus": {
+        "type": "idle"
+      },
+      "turnStatus": "completed",
+      "commandExecutionExitCode": 0
+    },
+    "productAudit": {
+      "table": "write_audit",
+      "ids": [102, 103],
+      "ts": "20:06:17",
+      "action": "codex_approve",
+      "channel": "codex_desktop_ipc",
+      "deviceName": "新设备",
+      "results": ["reserved", "accepted"]
+    },
+    "screenshots": [
+      "raw/screenshots/2026-10-26T2007-mobile-after-approve.png",
+      "raw/screenshots/2026-10-26T2007-desktop-stale-waiting-text.png"
+    ]
+  },
+  "correction": "探测报告初稿写『当前 build caps.command=false ⇒ 产品不放行审批』，**错误**。实际放行路是 `adapter.rs:1012-1043` 的 schema 证据 + 自动适配活门（本 build 的 schema 证据 14:31 已入账，含 accept/cancel），`pending.rs:260-266` 判 `actionable = !allowed_decisions.is_empty()` → 卡片按钮可用，并已端到端跑通。",
+  "stillBlockedByCaps": [
+    "blocking_input（F02 阻塞问答，无 schema 回退路）",
+    "interrupt（F07 打断，无 schema 回退路）",
+    "permissions（同上）"
+  ],
+  "uxFinding": "桌面正文里模型写的「已提交…目前等待审批」在审批已解决、命令已执行（exitCode 0）之后**仍然留在流里**，用户据此误判为仍在等待 ⇒ 印证 spec『只读历史正文不单独证明当前仍有未决请求』；F06 的待处理标记必须以 requests[]/activeFlags 为准，正文只作历史。"
+}

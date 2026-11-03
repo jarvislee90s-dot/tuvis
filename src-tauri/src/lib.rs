@@ -196,6 +196,12 @@ pub fn run() {
             });
             // M4：全局句柄落位（先于 restore_on_launch——隧道自启即可发通知）
             let _ = crate::remote::events::APP_HANDLE.set(app.handle().clone());
+            // 会话扫描总线必须早于远控 listener 恢复：首个远程读取即使撞上首扫，
+            // 也会等待成功快照，而不会把初始化中的 degraded 空结果当成真实空列表。
+            crate::adapter::scan_bus::start(app.handle().clone());
+            // 尽早启动事件监控；首拍会额外做一次 Event 对账，覆盖冷扫读取事件之后、
+            // wakeup 基线落位之前的写入，且不被远控恢复等后续启动工作延后。
+            crate::adapter::wakeup::spawn_runtime();
             // T5（2A 改操作卡）：codex 信任门常驻操作卡——register_all_hooks 在
             // run() 早期执行（彼时 builder 未构建、AppHandle 不可得）只置 pending
             // KV，此处句柄就绪后消费：pending 且未销账（shown）才弹；销账只发生在
@@ -219,6 +225,12 @@ pub fn run() {
             commands::autostart::initialize_on_first_launch(app.handle());
             // 用量账本：应用启动采集一次（按需路径，绝不进 3 秒轮询）
             crate::services::usage::collect::spawn_initial_collection();
+            // 用量兜底 ticker：每「采集间隔 + 2 分钟」后台采一次，不依赖任何页面
+            // （debug 构建默认关闭，TUVIS_USAGE_TICKER=1 可开，见 ticker.rs 文档）
+            crate::services::usage::ticker::spawn_runtime();
+            // TPS 短时抽样（2026-10-24 计划 Task 7）：调度/接收随 usage.enabled 总授权
+            // 启停——关闭时每拍只读一行 settings（惯性，不改旧 usage 采集的启动时序）
+            crate::services::tps::collector::spawn_runtime();
             // 公开价格：每 5 分钟检查一次 enabled && stale；未启用时零请求
             crate::services::usage::v2::pricing::spawn_pricing_refresh_loop();
             // 升级残留清理：Windows 升级流把安装包留在 %TEMP% 的
@@ -239,7 +251,10 @@ pub fn run() {
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             Some(vec![commands::autostart::AUTOSTART_ARG]),
         ))
-        .plugin(plugins::system_tray::init());
+        .plugin(plugins::system_tray::init())
+        // 四页工作区导航（2026-10-26 计划 Task 7）：待导航目标队列（revision/ACK 语义见
+        // services/workspace_navigation.rs；纯内存，不落盘）
+        .manage(services::workspace_navigation::NavigationQueue::default());
     let builder = builder.invoke_handler(tauri::generate_handler![
         greet,
         // 物理坠落按应用重启归位的前端运行标记源（见上方 app_run_id 注释）
@@ -247,10 +262,16 @@ pub fn run() {
         update_tray_menu,
         refresh_tray,
         commands::session::get_all_sessions,
+        commands::session::get_sessions_snapshot,
+        // 扫描总线状态与「有人在看」心跳（前端档位跟随 / 可见性上报）
+        commands::session::scan_bus_status,
+        commands::session::scan_bus_watch,
         commands::session::focus_session,
         commands::session::focus_hwnd,
         commands::session::kill_session,
         commands::session::dismiss_session_card,
+        // R1：一键清除批量隐藏/已读（N 张卡只补扫一次）
+        commands::session::dismiss_session_cards,
         // M6R–M9R Task 11：R5 一键 resume（桌面卡「在电脑上打开」）
         commands::session::session_open,
         commands::notification::show_notification_window,
@@ -378,12 +399,16 @@ pub fn run() {
         remote::remote_toggle_headless,
         // H4：无头子区另两件——watchdog 超时 + 全局并发上限
         remote::remote_set_headless_limits,
-        // #172/T8：兼容发送（实验）——默认关；开启需「该 build 读链已取证」
+        // #172/T8：兼容发送（实验）——S1 起仅剩旧设置 UI 的记录值，不参与任何门
         remote::remote_toggle_compat_send,
+        // S1：自动适配（新设置，缺省开）+ 适配状态 DTO
+        remote::remote_toggle_codex_auto_adapt,
+        remote::codex_adapt_status,
         // M7 W5：桌面端写审计查看（最近 N 条，只读）
         inject::inject_list_audit,
         // 用量域（计划①）：采集 / 大看板 / 记录页 / CSV / 设置读写
         commands::usage::usage_collect,
+        commands::usage::usage_collect_visible,
         commands::usage::usage_dashboard,
         commands::usage::usage_records,
         commands::usage::usage_export_csv,
@@ -420,6 +445,23 @@ pub fn run() {
         // 导出落盘（计划①，契约 §3 新增）：文本/二进制写导出目录（2026-10-07 A2 起 = 系统下载目录）
         commands::export::export_save_text,
         commands::export::export_save_bytes,
+        // TPS 短时抽样（2026-10-24 计划 Task 7）：调度/查询/视图租约/一次统计七命令
+        //（Spec §6 IPC 契约逐字；锁：commands/tps.rs 自检 + tests/tps_sampling_test.rs）
+        commands::tps::tps_snapshot,
+        commands::tps::tps_points,
+        commands::tps::tps_refresh,
+        // V2 速度 dashboard（2026-10-26 计划 Task 6）：只读区间/桶聚合
+        commands::tps::tps_speed_dashboard,
+        commands::tps::tps_view_heartbeat,
+        commands::tps::tps_install_preview,
+        commands::tps::tps_install_apply,
+        commands::tps::tps_uninstall,
+        // 四页工作区导航（2026-10-26 计划 Task 7）：跨窗「打开用量详情」→ 主窗页签
+        //（先存后 emit + 唤醒既有主窗；队列状态由上方先于 invoke_handler 的
+        // .manage(NavigationQueue) 注册，见本函数开头）
+        commands::workspace::workspace_request_navigation,
+        commands::workspace::workspace_peek_navigation,
+        commands::workspace::workspace_ack_navigation,
         // 升级检查（prerelease 渠道）：GitHub 发现层 + 动态端点一键升级
         commands::updater::check_for_github_update,
         commands::updater::install_github_update,
@@ -474,6 +516,8 @@ pub(crate) fn exit_cleanup() {
     // auto 意图/内存 JWT 可能都还有效，普通入口的 P2-5 补唤醒会真的新开 relay。
     // 重启需显式 connect（不自动重连）。
     crate::remote::disconnect_zcode_hub_silent();
+    // TPS 接收器随进程退出而停（Spec §5「Tuvis真正退出就停止接收，不增系统守护进程」）
+    crate::services::tps::receiver::shutdown();
     // §C1 修复轮 1 Finding 2②：Funnel 无子进程可 kill_on_drop（守护 =
     // 轮询线程 + tailscaled 常驻配置），进程退出必须显式撤 + 收 DESIRED
     crate::remote::tailscale::stop_all();
@@ -488,5 +532,38 @@ pub(crate) fn exit_cleanup() {
     let killed = crate::inject::headless::runner::shutdown_inflight();
     if killed > 0 {
         log::info!("退出：已终结 {killed} 个在飞无头进程树");
+    }
+}
+
+#[cfg(test)]
+mod scan_bus_start_order_tests {
+    #[test]
+    fn scan_bus_starts_after_app_handle_and_before_remote_listener_restore() {
+        let src = include_str!("lib.rs");
+        let app_handle = src.find("APP_HANDLE.set(app.handle().clone())").unwrap();
+        let scan_bus = src
+            .find("crate::adapter::scan_bus::start(app.handle().clone())")
+            .unwrap();
+        let remote = src.find("crate::remote::restore_on_launch();").unwrap();
+        let wakeup = src
+            .find("crate::adapter::wakeup::spawn_runtime();")
+            .unwrap();
+
+        assert!(app_handle < scan_bus, "Scan Bus 启动前必须先落位 AppHandle");
+        assert!(scan_bus < remote, "远控 listener 恢复前必须先启动 Scan Bus");
+        assert!(scan_bus < wakeup, "wakeup runtime 必须在 Scan Bus 之后启动");
+    }
+
+    #[test]
+    fn versioned_session_snapshot_command_is_registered() {
+        let src = include_str!("lib.rs");
+        assert!(
+            src.contains("commands::session::get_all_sessions,"),
+            "旧会话命令必须保留兼容"
+        );
+        assert!(
+            src.contains("commands::session::get_sessions_snapshot"),
+            "前端读取 versioned snapshot 的 Tauri command 必须注册"
+        );
     }
 }

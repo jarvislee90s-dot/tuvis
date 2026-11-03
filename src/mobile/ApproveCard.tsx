@@ -23,7 +23,7 @@ import i18n from "@/i18n";
 import { formatInvokeError } from "@/lib/invokeError";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import InteractiveCard, { type InteractiveCardTone } from "./InteractiveCard";
+import InteractiveCard, { toneTokens, type InteractiveCardTone } from "./InteractiveCard";
 import {
   ApiError,
   approveErrorCopy,
@@ -328,11 +328,11 @@ export default function ApproveCard({ session, onPlanFeedbackReady }: ApproveCar
     );
   }
 
-  // 裁11 活口收口（2026-09-24 用户裁决「完全并成一套」）：审批卡与问答卡统一蓝系
-  // （sky）+ 同一**纵向编号列表**形态——两者只差选项数目。原「二元审批保留红系
-  // 警示」的活口由用户本次关闭；`mode` 数据属性仍区分 binary/dialog（测试/可观测
-  // 面）。警示类脚注（drift/degradedHint）保留琥珀——那是告警语义层，不是选项层。
-  const cardTone: InteractiveCardTone = "question";
+  // 2026-10-28 用户裁决（覆盖 2026-09-24 的蓝系统一）：选择题蓝卡、审批卡红卡。
+  // 结构与问答卡保持同一 `InteractiveCard` + 纵向编号行，只换色系 token；
+  // `mode` 数据属性仍区分 binary/dialog。警示类脚注保留琥珀（告警语义层）。
+  const cardTone: InteractiveCardTone = "approve";
+  const tone = toneTokens(cardTone);
   return (
     <InteractiveCard
       tone={cardTone}
@@ -408,20 +408,18 @@ export default function ApproveCard({ session, onPlanFeedbackReady }: ApproveCar
                 data-testid={isFeedback ? "approve-option-feedback" : `approve-option-${o.id}`}
                 disabled={busy || sent || degraded}
                 onClick={() => (isFeedback ? handleFeedbackStart() : handleAnswer(o.id))}
-                className={`flex w-full items-start gap-2 rounded-lg px-2.5 py-1.5 text-left text-sm disabled:opacity-40 ${
-                  // 行形态与问答卡选项行同款（2026-10-04 蓝系统一批：同内距/字号/
-                  // 中性底+hover——「一套，只差选项数目」的视觉收口）
-                  "bg-sky-500/5 text-slate-700 hover:bg-sky-500/10 dark:bg-sky-400/5 dark:text-slate-300 dark:hover:bg-sky-400/10"
-                }`}
+                className={`flex w-full items-start gap-2 rounded-lg px-2.5 py-1.5 text-left text-sm disabled:opacity-40 ${tone.action}`}
               >
                 {options.dialog && (
-                  <span className="mt-0.5 inline-flex h-4 w-4 shrink-0 items-center justify-center rounded bg-sky-500/15 text-[10px] font-semibold text-sky-700 dark:bg-sky-400/15 dark:text-sky-400">
+                  <span
+                    className={`mt-0.5 inline-flex h-4 w-4 shrink-0 items-center justify-center rounded text-[10px] font-semibold ${tone.badge} ${tone.title}`}
+                  >
                     {i + 1}
                   </span>
                 )}
                 <span className="min-w-0 flex-1 break-words">{o.label}</span>
                 {isFeedback && (
-                  <span className="mt-0.5 shrink-0 text-[11px] text-sky-700/70 dark:text-sky-400/70">
+                  <span className={`mt-0.5 shrink-0 text-[11px] ${tone.title} opacity-70`}>
                     {i18n.t("mobile.approve.feedbackEntry")}
                   </span>
                 )}

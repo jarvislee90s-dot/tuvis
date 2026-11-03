@@ -71,9 +71,7 @@
       {
         "environmentId": "local",
         "cwd": "C:\\Temp\\probe-project",
-        "runtimeWorkspaceRoots": [
-          "C:\\Temp\\probe-project"
-        ]
+        "runtimeWorkspaceRoots": ["C:\\Temp\\probe-project"]
       }
     ],
     "environmentSelectionEvidence": {
@@ -107,9 +105,7 @@
               "approvalPolicy": "on-request",
               "approvalsReviewer": "user",
               "permissions": ":workspace",
-              "runtimeWorkspaceRoots": [
-                "C:\\Temp\\probe-project"
-              ],
+              "runtimeWorkspaceRoots": ["C:\\Temp\\probe-project"],
               "model": "gpt-6-luna",
               "cwd": "C:\\Temp\\probe-project",
               "effort": "low",
@@ -214,9 +210,7 @@
               "approvalPolicy": "on-request",
               "approvalsReviewer": "user",
               "permissions": ":workspace",
-              "runtimeWorkspaceRoots": [
-                "C:\\Temp\\probe-project"
-              ],
+              "runtimeWorkspaceRoots": ["C:\\Temp\\probe-project"],
               "model": "gpt-6-luna",
               "cwd": "C:\\Temp\\probe-project",
               "effort": "low",
@@ -321,9 +315,7 @@
               "approvalPolicy": "on-request",
               "approvalsReviewer": "user",
               "permissions": ":workspace",
-              "runtimeWorkspaceRoots": [
-                "C:\\Temp\\probe-project"
-              ],
+              "runtimeWorkspaceRoots": ["C:\\Temp\\probe-project"],
               "model": "gpt-6-luna",
               "cwd": "C:\\Temp\\probe-project",
               "effort": "low",
@@ -407,9 +399,7 @@
               "approvalPolicy": "on-request",
               "approvalsReviewer": "user",
               "permissions": ":workspace",
-              "runtimeWorkspaceRoots": [
-                "C:\\Temp\\probe-project"
-              ],
+              "runtimeWorkspaceRoots": ["C:\\Temp\\probe-project"],
               "model": "gpt-6-luna",
               "cwd": "C:\\Temp\\probe-project",
               "effort": "low",
@@ -545,9 +535,7 @@
               "approvalPolicy": "on-request",
               "approvalsReviewer": "user",
               "permissions": ":workspace",
-              "runtimeWorkspaceRoots": [
-                "C:\\Temp\\probe-project"
-              ],
+              "runtimeWorkspaceRoots": ["C:\\Temp\\probe-project"],
               "model": "gpt-6-luna",
               "cwd": "C:\\Temp\\probe-project",
               "effort": "low",
@@ -1043,9 +1031,7 @@
         "id": ":workspace",
         "extends": null
       },
-      "runtimeWorkspaceRoots": [
-        "C:\\Temp\\probe-project"
-      ],
+      "runtimeWorkspaceRoots": ["C:\\Temp\\probe-project"],
       "approvalPolicy": "on-request",
       "approvalsReviewer": "user",
       "sandboxPolicy": {

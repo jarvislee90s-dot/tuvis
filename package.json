@@ -1,7 +1,7 @@
 {
   "name": "tuvis",
   "private": true,
-  "version": "0.6.1",
+  "version": "0.6.4",
   "license": "MIT",
   "type": "module",
   "engines": {
@@ -22,7 +22,9 @@
     "format:check": "prettier --check \"src/**/*.{ts,tsx,css,json}\" \"tests/**/*.{ts,tsx}\" \"scripts/*.mjs\" \"scripts/zcode-bridge-probe/**/*.ts\"",
     "lint": "eslint \"src/**/*.{ts,tsx}\" \"tests/**/*.{ts,tsx}\" \"scripts/*.mjs\" \"scripts/zcode-bridge-probe/**/*.ts\" vite.config.ts vite.config.mobile.ts",
     "lint:fix": "eslint \"src/**/*.{ts,tsx}\" \"tests/**/*.{ts,tsx}\" \"scripts/*.mjs\" \"scripts/zcode-bridge-probe/**/*.ts\" vite.config.ts vite.config.mobile.ts --fix",
-    "check": "pnpm format:check && pnpm lint && pnpm check:i18n && node scripts/check-error-codes.mjs && pnpm build",
+    "sync:capabilities": "node scripts/sync-capabilities.mjs",
+    "check:capabilities": "node scripts/sync-capabilities.mjs --check",
+    "check": "pnpm check:capabilities && pnpm format:check && pnpm lint && pnpm check:i18n && node scripts/check-error-codes.mjs && pnpm build",
     "check:i18n": "node scripts/check-i18n.mjs",
     "test": "vitest run",
     "test:watch": "vitest",

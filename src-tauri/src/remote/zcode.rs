@@ -1066,8 +1066,7 @@ pub async fn events(
     };
     // M4 T0a 同规：注册连接，吊销/停服信号经 take_until 终止流。
     let device = super::gate::extract_device(&headers).unwrap_or_default();
-    let (conn_id, close_rx) = st.sse_registry.register(&device);
-    let registry = st.sse_registry.clone();
+    let (conn_guard, close_rx) = super::server::SseConnGuard::register(&st.sse_registry, &device);
     // 先订阅、后取首帧（顺序刻意，勿换）：订阅与首帧之间产生的跃迁落进广播缓冲，
     // 在首帧之后依次送出；反序会永久漏掉窗口内的更新。
     let rx = hub.subscribe();
@@ -1143,9 +1142,7 @@ pub async fn events(
     let guarded = first.chain(updates).take_until(close_rx);
     let cleaned = CleanupStream {
         inner: guarded,
-        reg: registry,
-        device,
-        conn_id,
+        _conn: conn_guard,
     };
     (
         [(CACHE_CONTROL, "no-store")],

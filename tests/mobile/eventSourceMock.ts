@@ -49,6 +49,11 @@ export class MockEventSource {
    *  close() 之后投递是 no-op：与真实 EventSource 一致（关闭后不再分发事件） */
   emit(type: string, data: unknown) {
     if (this.closed) return;
+    this.emitQueued(type, data);
+  }
+
+  /** 注入浏览器已经排队、但在 close 后才交付的回调；Board 的连接代次闸应丢弃它。 */
+  emitQueued(type: string, data: unknown) {
     const e = {
       data: typeof data === "string" ? data : JSON.stringify(data),
     } as MessageEvent;

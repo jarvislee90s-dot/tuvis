@@ -27,7 +27,7 @@ vi.mock("@tauri-apps/api/webviewWindow", () => ({
 }));
 
 import i18n from "@/i18n";
-import UsageDashboardPage from "@/pages/usage-dashboard";
+import { UsageDashboardBody } from "@/components/usage/UsageDashboardBody";
 import { tauriInvokeMock } from "../msw/tauriMocks";
 
 type InvokeCall = [string, Record<string, unknown> | undefined];
@@ -55,7 +55,7 @@ function renderPage() {
   const wrapper = ({ children }: { children: ReactNode }) => (
     <QueryClientProvider client={client}>{children}</QueryClientProvider>
   );
-  return render(<UsageDashboardPage />, { wrapper });
+  return render(<UsageDashboardBody active />, { wrapper });
 }
 
 beforeAll(async () => {
@@ -552,5 +552,30 @@ describe("usage-dashboard V2 编排", () => {
     expect(screen.getByTestId("usage-trend-target-missing")).not.toHaveTextContent("bp:");
 
     restore();
+  });
+
+  it("17. 实机反馈二轮 ②：工具栏并行单行（看板/记录页签在左、范围条在右），页头区不再吸顶", async () => {
+    renderPage();
+    await screen.findByTestId("usage-tab-board");
+
+    // 页签对与范围条同处一个 justify-between 行（两行合并为一行）
+    const board = screen.getByTestId("usage-tab-board");
+    const records = screen.getByTestId("usage-tab-records");
+    const row = board.closest(".justify-between") as HTMLElement | null;
+    expect(row).not.toBeNull();
+    const range = row!.querySelector('[data-testid^="usage-range-"]') as HTMLElement | null;
+    expect(range).not.toBeNull();
+    expect(row!.contains(board)).toBe(true);
+    expect(row!.contains(records)).toBe(true);
+    // 单行顺序：看板/记录页签对在前、范围条在后
+    expect(board.compareDocumentPosition(range!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(records.compareDocumentPosition(range!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+
+    // 去吸顶：页头块保留通栏负边距 + 下边框，但不再 sticky 压屏
+    const header = board.closest(".border-b") as HTMLElement | null;
+    expect(header).not.toBeNull();
+    expect(header!.className).toContain("-mx-4");
+    expect(header!.className).not.toContain("sticky");
+    expect(header!.className).not.toContain("z-10");
   });
 });

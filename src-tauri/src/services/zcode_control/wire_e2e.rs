@@ -1669,11 +1669,6 @@ mod tests {
         });
     }
 
-    /// 移动端快照里的唯一 ZCode 会话（id 与假体任务索引精确相等）。
-    fn zcode_session() -> Session {
-        zcode_session_with_project("/tmp/travel")
-    }
-
     /// 三轮 C：项目目录可注入的合成 ZCode 会话（附件上传一致性闸的扫描快照侧）。
     fn zcode_session_with_project(project_path: &str) -> Session {
         Session {
@@ -1696,6 +1691,7 @@ mod tests {
             form: ProcessForm::Cli,
             jump_supported: false,
             unread: false,
+            unread_turned_green_at_ms: None,
         }
     }
 
@@ -1748,7 +1744,9 @@ mod tests {
         project_path: &str,
     ) -> Arc<RemoteState> {
         let mut state = {
-            let sessions = vec![zcode_session()];
+            let sessions = vec![zcode_session_with_project(project_path)];
+            let display_sessions = sessions.clone();
+            let fresh_sessions = sessions.clone();
             let store = DeviceStore::Owned(conn.clone());
             Arc::new(RemoteState {
                 ui_config_source: Box::new(|| None),
@@ -1756,8 +1754,13 @@ mod tests {
                 subagent_message_source: std::collections::HashMap::new(),
                 capability_table: new_table(),
                 session_source: Box::new(move || SessionsResponse {
-                    total_count: sessions.len(),
-                    sessions: sessions.clone(),
+                    total_count: display_sessions.len(),
+                    sessions: display_sessions.clone(),
+                    waiting_count: 0,
+                }),
+                fresh_session_source: Box::new(move || SessionsResponse {
+                    total_count: fresh_sessions.len(),
+                    sessions: fresh_sessions.clone(),
                     waiting_count: 0,
                 }),
                 pairing_counter: Box::new(Vec::new),

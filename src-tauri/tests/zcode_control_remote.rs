@@ -98,6 +98,7 @@ fn zcode_session() -> Session {
         form: ProcessForm::Cli,
         jump_supported: false,
         unread: false,
+        unread_turned_green_at_ms: None,
     }
 }
 
@@ -120,6 +121,7 @@ fn state_with_hidden(
     sessions: Vec<Session>,
     hidden: Vec<String>,
 ) -> Arc<RemoteState> {
+    let fresh_sessions = sessions.clone();
     Arc::new(RemoteState {
         ui_config_source: Box::new(|| None),
         subagent_source: std::collections::HashMap::new(),
@@ -128,6 +130,11 @@ fn state_with_hidden(
         session_source: Box::new(move || SessionsResponse {
             total_count: sessions.len(),
             sessions: sessions.clone(),
+            waiting_count: 0,
+        }),
+        fresh_session_source: Box::new(move || SessionsResponse {
+            total_count: fresh_sessions.len(),
+            sessions: fresh_sessions.clone(),
             waiting_count: 0,
         }),
         pairing_counter: Box::new(Vec::new),

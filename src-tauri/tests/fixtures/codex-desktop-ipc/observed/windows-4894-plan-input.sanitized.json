@@ -40,9 +40,7 @@
       "response": {
         "answers": {
           "archive_method": {
-            "answers": [
-              "按文件修改日期（推荐）"
-            ]
+            "answers": ["按文件修改日期（推荐）"]
           }
         }
       }

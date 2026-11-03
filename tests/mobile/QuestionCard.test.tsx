@@ -597,6 +597,77 @@ describe("QuestionCard：问答卡渲染与应答（批次乙 T8）", () => {
   });
 });
 
+// ============================================================
+// T04：旧 CLI 卡字号同口径（spec §3.3）——题干/选项文字跟随字号档位，
+// 动作按钮与卡头页头不跟随（不整体缩放按钮点击面积）。
+// ============================================================
+describe("QuestionCard：T04 字号同口径", () => {
+  it("t04_question_content_in_font_scale_scope_while_actions_and_header_stay_fixed", async () => {
+    installFetch();
+    routes.question = singleQuestionInfo();
+    render(<QuestionCard session={{ id: "sess-font" }} fontScale={1.25} />);
+    await screen.findByTestId("question-card");
+    // 题干与选项在 [data-font-scale] 作用域内（text-sm 相对档位，100% = 14px 基准）；
+    // 题干/选项是同档位的两个作用域兄弟（值一致即可，不要求同一节点）
+    const text = screen.getByTestId("question-text");
+    const scope = text.closest("[data-font-scale]");
+    expect(scope?.getAttribute("data-font-scale")).toBe("1.25");
+    const option = screen.getByTestId("question-option-0");
+    expect(option.closest("[data-font-scale]")?.getAttribute("data-font-scale")).toBe("1.25");
+    expect(text.className).toContain("text-sm");
+    expect(text.className).not.toMatch(/text-\[\d+px\]/);
+    // 动作按钮（取消=动作区常驻钮）不进入字号作用域
+    expect(screen.getByTestId("question-cancel").closest("[data-font-scale]")).toBeNull();
+    // 卡头页头不跟随
+    expect(screen.getByText("等待回答").closest("[data-font-scale]")).toBeNull();
+  });
+
+  it("t04_single_freetext_input_and_label_in_font_scale_scope_while_send_button_stays_fixed", async () => {
+    // 集中审查 D4 补齐：单题卡自由输入（question-freetext-input/label）与异步卡
+    // 自由输入同口径——进入 [data-font-scale] 作用域；发送按钮在作用域外（点击
+    // 面积不随档位缩放）。
+    installFetch();
+    routes.question = singleQuestionInfo({ freeText: true });
+    render(<QuestionCard session={{ id: "sess-font-ft" }} fontScale={1.25} />);
+    await screen.findByTestId("question-card");
+    const input = screen.getByTestId("question-freetext-input");
+    expect(input.closest("[data-font-scale]")?.getAttribute("data-font-scale")).toBe("1.25");
+    const label = screen.getByTestId("question-freetext-label");
+    expect(label.closest("[data-font-scale]")?.getAttribute("data-font-scale")).toBe("1.25");
+    // 输入文字用相对档位单位（text-sm），不用固定 px
+    expect(input.className).toContain("text-sm");
+    expect(input.className).not.toMatch(/text-\[\d+px\]/);
+    // 发送按钮不在作用域内（动作钮保持固定操作尺寸）
+    expect(screen.getByTestId("question-freetext-send").closest("[data-font-scale]")).toBeNull();
+  });
+
+  it("t04_multi_freetext_input_and_label_in_font_scale_scope_while_send_button_stays_fixed", async () => {
+    // 控制器裁决（D4 追加）：renderMultiFreeText（多题交互卡/单题多选卡共用的
+    // 自由输入）同属「题卡内容同口径」——label 与输入进 [data-font-scale] 作用域；
+    // 发送等操作按钮留在外（点击面积不随档位缩放）。
+    installFetch();
+    const info = multiQuestionInfo();
+    // 单题多选形态（claude 换成逐个提问）→ 走单题分支 renderMultiFreeText(0)
+    info.questions = [info.questions[0]];
+    info.freeText = true;
+    info.navBoth = true;
+    routes.question = info;
+    render(<QuestionCard session={{ id: "sess-font-mft" }} fontScale={1.25} />);
+    await screen.findByTestId("question-card");
+    const input = screen.getByTestId("question-multi-freetext-input");
+    expect(input.closest("[data-font-scale]")?.getAttribute("data-font-scale")).toBe("1.25");
+    const label = screen.getByText("自由作答（直接输入，切题时自动保存）");
+    expect(label.closest("[data-font-scale]")?.getAttribute("data-font-scale")).toBe("1.25");
+    // 输入文字用相对档位单位（text-xs），不用固定 px
+    expect(input.className).toContain("text-xs");
+    expect(input.className).not.toMatch(/text-\[\d+px\]/);
+    // 发送按钮不在作用域内（动作钮保持固定操作尺寸）
+    expect(
+      screen.getByTestId("question-multi-freetext-send").closest("[data-font-scale]")
+    ).toBeNull();
+  });
+});
+
 // ==== 联合断言：问答模式不渲染 允许/拒绝 + key 前缀互异 ====
 describe("QuestionCard 与 ApproveCard 联合（硬约束① UI 面）", () => {
   it("问答会话上 ApproveCard 自隐（approve 选项不可用即 null）、QuestionCard 在场且无允许/拒绝", async () => {

@@ -59,7 +59,7 @@ description: Windows 终端 TUI 工具注入与屏读探测工作流——为新
 
 ### P7 · 规格表 + 判定（5 分钟）
 
-按 `references/report-template.md` 产出规格定案表 + 判定：**GO**（全规格通）/ **GO-with-branches**（带按家分支，常态）/ **PARTIAL**（部分长度/宿主受限，注明）/ **NO-GO**（不可注入，注明证据）。归档：兔维斯 项目内入 `research/refs/phase2-消息注入/`，其他项目入用户指定目录。
+按 `references/report-template.md` 产出规格定案表 + 判定：**GO**（全规格通）/ **GO-with-branches**（带按家分支，常态）/ **PARTIAL**（部分长度/宿主受限，注明）/ **NO-GO**（不可注入，注明证据）。归档：兔维斯 项目内入 `docs/research/refs/phase2-消息注入/`，其他项目入用户指定目录。
 
 ## 探测纪律（八条铁律，违反则该实验作废重做）
 

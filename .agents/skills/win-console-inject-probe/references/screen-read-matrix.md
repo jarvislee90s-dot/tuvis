@@ -41,7 +41,7 @@
 | **按键路径** | 每个动作的键序 + 发前定位/发后核验点（引用注入规格定案表对应族） |
 | **已知边界** | 该屏形上不可达的动作及原因（如：单选子题无 Next → 「切换到下一题」按键路径不存在） |
 
-判定：**已识别**（解析 + 按键全通）/ **部分识别**（解析通、按键缺）/ **盲区**（解析不出）。归档与注入定案表同处：`research/refs/phase2-消息注入/`（本地不入库），派生夹具随库入库。
+判定：**已识别**（解析 + 按键全通）/ **部分识别**（解析通、按键缺）/ **盲区**（解析不出）。归档与注入定案表同处：`docs/research/refs/phase2-消息注入/`（本地不入库），派生夹具随库入库。
 
 ## 维护触发点（任一触发即复验 / 补档）
 
@@ -131,7 +131,7 @@
 
 ## codex 形态矩阵（2026-10-09 取证批，codex-cli 0.160.0 问答面板）
 
-**证据源**：底料 `docs/superpowers/specs/2026-10-08-codex-160-question-屏读底料.md`（四闸门①活体取证，conhost 自建会话，证据根 `%USERPROFILE%\mam-probe-m6r\evidence\`，FIXTURE 行程序化提取生成夹具 `inject/question.rs` `live_fixtures::codex_*`）。**确认屏与 `?` 首帧形本轮不可达，无活体证据，不得伪造**。
+**证据源**：底料 `docs/engineering/specs/2026-10-08-codex-160-question-屏读底料.md`（四闸门①活体取证，conhost 自建会话，证据根 `%USERPROFILE%\mam-probe-m6r\evidence\`，FIXTURE 行程序化提取生成夹具 `inject/question.rs` `live_fixtures::codex_*`）。**确认屏与 `?` 首帧形本轮不可达，无活体证据，不得伪造**。
 
 ### (codex, 0.160.0, 问答面板·题号头) —— 已活体补档
 
