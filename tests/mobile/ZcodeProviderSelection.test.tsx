@@ -145,9 +145,12 @@ describe("ZcodeProviderSelection", () => {
     await waitFor(() => expect(screen.getByTestId("zcode-provider-select")).toBeVisible());
     fireEvent.change(screen.getByTestId("zcode-provider-select"), { target: { value: "b" } });
     await waitFor(() => expect(posts).toHaveLength(0));
-    const model = screen.getByTestId("zcode-model-select") as HTMLSelectElement;
-    expect(Array.from(model.options).map((option) => option.value)).toEqual(["b-model"]);
-    fireEvent.change(model, { target: { value: "b-model" } });
+    // provider 变更后的模型目录由 React 状态刷新；不能只等 posts==0（初始即为 0），
+    // 否则旧 model 在 CI 慢机上仍是 a-model，形成与实现无关的竞态。
+    await waitFor(() => {
+      expect(Array.from(modelSelect().options).map((option) => option.value)).toEqual(["b-model"]);
+    });
+    fireEvent.change(modelSelect(), { target: { value: "b-model" } });
     await waitFor(() => expect(posts).toHaveLength(1));
     expect(posts[0].action).toMatchObject({
       kind: "selection",
