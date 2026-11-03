@@ -108,14 +108,18 @@ describe("ZcodeModeControl", () => {
     const posts = install();
     render(<ZcodeControlPanel sessionId={SID} />);
     await waitFor(() => expect(screen.getByTestId("zcode-mode-select")).toBeVisible());
-    fireEvent.change(screen.getByTestId("zcode-mode-select"), { target: { value: "yolo" } });
-    fireEvent.click(screen.getByTestId("zcode-mode-apply"));
-    expect(screen.getByTestId("zcode-mode-confirm-dialog")).toBeVisible();
+    const modeSelect = screen.getByTestId("zcode-mode-select");
+    const apply = screen.getByTestId("zcode-mode-apply") as HTMLButtonElement;
+    fireEvent.change(modeSelect, { target: { value: "yolo" } });
+    await waitFor(() => expect(apply).not.toBeDisabled());
+    fireEvent.click(apply);
+    expect(await screen.findByTestId("zcode-mode-confirm-dialog")).toBeVisible();
     fireEvent.click(screen.getByTestId("zcode-mode-cancel"));
     expect(posts).toHaveLength(0);
 
-    fireEvent.change(screen.getByTestId("zcode-mode-select"), { target: { value: "yolo" } });
-    fireEvent.click(screen.getByTestId("zcode-mode-apply"));
+    fireEvent.change(modeSelect, { target: { value: "yolo" } });
+    await waitFor(() => expect(apply).not.toBeDisabled());
+    fireEvent.click(apply);
     fireEvent.click(screen.getByTestId("zcode-mode-confirm"));
     await waitFor(() => expect(posts).toHaveLength(1));
     expect(posts[0].action).toMatchObject({
