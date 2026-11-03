@@ -1060,12 +1060,29 @@ describe("ZCode 控制面板：主按钮在发送与打断之间切换（R5/U3�
     // 原因就在主按钮旁（删除独立打断行后原因不消失）。慢机先禁用后到原因：
     // 必须等原因节点出现，不能把「加载中已禁用」误当成最终态。
     const reason = await screen.findByTestId("zcode-send-reason");
-    expect(reason.getAttribute("data-reason-code")).toBe("target_ambiguous");
+    await waitFor(() => expect(reason).toHaveAttribute("data-reason-code", "target_ambiguous"));
+    // 917 的核心口径：目标歧义时不能继续显示「打断」，回落发送位（禁用）+ 原因。
+    expect(primary.getAttribute("data-primary-mode")).toBe("send");
+    expect(primary.textContent).toBe("发送");
     expect(reason.textContent?.trim().length ?? 0).toBeGreaterThan(0);
 
     fireEvent.click(primary);
     await act(async () => {});
     expect(postedActions()).toHaveLength(0);
+  });
+
+  it("interrupt 能力关闭 → 主按钮回落发送位并显示能力原因", async () => {
+    const caps = capabilities();
+    caps.interrupt = flag(false);
+    installRunning(runningSession({ capabilities: caps }));
+    render(<ZcodeControlPanel sessionId={SID} />);
+
+    const primary = (await screen.findByTestId("zcode-send")) as HTMLButtonElement;
+    await waitFor(() => expect(primary).toBeDisabled());
+    expect(primary.getAttribute("data-primary-mode")).toBe("send");
+    expect(primary.textContent).toBe("发送");
+    const reason = await screen.findByTestId("zcode-send-reason");
+    await waitFor(() => expect(reason).toHaveAttribute("data-reason-code", "needs_evidence"));
   });
 
   it("上传中附件 → 主按钮禁用并保留既有提示（不得翻成打断）", async () => {
@@ -1111,6 +1128,8 @@ describe("ZCode 控制面板：主按钮在发送与打断之间切换（R5/U3�
     fireEvent.click(primary);
     await waitFor(() => expect(primary).toBeDisabled());
     expect(primary.getAttribute("data-primary-action")).toBe("disabled");
+    // stop 已飞出去：动作禁用，但语义位仍保留打断（不能瞬间翻成发送）
+    expect(primary.getAttribute("data-primary-mode")).toBe("stop");
     // 双击（以及在途期间的任何点击）都不得产生第二个动作
     fireEvent.click(primary);
     fireEvent.click(primary);
@@ -2175,15 +2194,18 @@ describe("ZCode 控制面板：原因码 zh/en 全覆盖", () => {
     );
     // R5/U3：独立打断行删除后，多目标歧义的原因并到主按钮旁（不再有第二行原因）。
     const interruptReason = await screen.findByTestId("zcode-send-reason");
-    expect(interruptReason.getAttribute("data-reason-code")).toBe("target_ambiguous");
+    await waitFor(() =>
+      expect(interruptReason).toHaveAttribute("data-reason-code", "target_ambiguous")
+    );
     expect(interruptReason.textContent).toBe(
       "Multiple tasks can be interrupted — choose one in the terminal"
     );
 
     // 控件/无障碍文案同样走英文
     expect(cardIn().getByTestId("zcode-pending-submit").textContent).toBe("Submit");
-    // 打断位并入主按钮：运行中且输入为空 → 主按钮文案是 Interrupt
-    expect(screen.getByTestId("zcode-send").textContent).toBe("Interrupt");
+    // 多目标歧义：主按钮回落发送位（禁用），不再给不可执行的 Interrupt 承诺。
+    expect(screen.getByTestId("zcode-send").getAttribute("data-primary-mode")).toBe("send");
+    expect(screen.getByTestId("zcode-send").textContent).toBe("Send");
     expect(screen.queryByTestId("zcode-interrupt")).toBeNull();
     expect(screen.getByTestId("zcode-model-select").getAttribute("aria-label")).toBe("Model");
     expect(screen.getByTestId("zcode-thought-select").getAttribute("aria-label")).toBe(

@@ -474,13 +474,11 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
    * 有内容（含就绪附件）时按钮留在发送位：有内容发送绝不先打断。
    */
   // 运行中且无内容 = 用户以为要打断的位；但最终文案只在真的可执行 stop 时显示
-  // 「打断」，能力关闭/守卫缺失时仍显示「发送」（禁用态），不能给不可执行的承诺。
+  // 「打断」，能力关闭/多目标歧义/守卫缺失时回落「发送」（禁用态），不能给不可执行
+  // 的承诺。stop 在途时 primaryAction 已 disabled，但语义位仍是打断——保留「打断」
+  // 文案，避免在停止请求飞出去的一瞬翻成“发送”。
   const stopIntent = running && !hasContent && !attachmentBlocked;
-  const stopSlot =
-    stopIntent &&
-    session?.capabilities.interrupt.enabled === true &&
-    gateReason === null &&
-    !staleGeneration;
+  const stopSlot = primaryAction === "stop" || (busy && stopIntent && stopAllowed);
   /**
    * 主按钮旁的原因（冻结码）：删除独立打断行后，原因必须仍在按钮旁可见。
    * 优先级：写面硬门 > 旧代际 > 打断位（能力关闭 / 目标歧义）> 发送位（能力关闭）。
@@ -2288,8 +2286,9 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
           data-testid="zcode-send"
           // 主按钮唯一动作（send / stop / disabled）：由纯函数推导，UI 不另做判断。
           data-primary-action={primaryAction}
-          // 主按钮所处的语义位（stop = 运行中且无内容 → 此按钮代表打断；send = 发送）。
-          // 与 action 分离：位可以「是打断但此刻禁用」（例如多目标歧义 / 投影未就绪）。
+          // 主按钮所处的语义位（stop = 运行中且无内容且可执行 → 此按钮代表打断；send = 发送）。
+          // 与 action 分离：stop 在途时 action 已 disabled，但语义位仍是 stop；多目标歧义/
+          // 能力关闭则回落 send，不再给不可执行的「打断」承诺。
           data-primary-mode={stopSlot ? "stop" : "send"}
           disabled={primaryAction === "disabled"}
           onClick={() => void handlePrimaryAction()}
