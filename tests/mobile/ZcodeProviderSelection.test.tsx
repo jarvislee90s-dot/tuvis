@@ -143,6 +143,10 @@ describe("ZcodeProviderSelection", () => {
     const posts = install();
     render(<ZcodeControlPanel sessionId={SID} />);
     await waitFor(() => expect(screen.getByTestId("zcode-provider-select")).toBeVisible());
+    // 初始投影落地后 effect 会把 pendingProvider 清回服务端值；等这次同步完成再改，
+    // 否则慢机上 change 会被 late effect 覆盖，模型目录仍停在 a-model。
+    await waitFor(() => expect(providerSelect().value).toBe("a"));
+    await waitFor(() => expect(modelSelect().value).toBe("a-model"));
     fireEvent.change(screen.getByTestId("zcode-provider-select"), { target: { value: "b" } });
     await waitFor(() => expect(posts).toHaveLength(0));
     // provider 变更后的模型目录由 React 状态刷新；不能只等 posts==0（初始即为 0），
