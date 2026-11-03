@@ -2138,6 +2138,13 @@ describe("RemoteSection Codex 自动适配（S5 换装）", () => {
       node.getAttribute("data-group")
     );
     expect(groups).toEqual(["general", "channels", "tools", "security"]);
+    const numbered = ["general", "channels", "tools", "security"].map(
+      (group, index) =>
+        container
+          .querySelector(`[data-group="${group}"]`)
+          ?.textContent?.startsWith(["①", "②", "③", "④"][index]) === true
+    );
+    expect(numbered).toEqual([true, true, true, true]);
 
     const cards = [...container.querySelectorAll("[data-tool-card]")];
     expect(cards.map((card) => card.getAttribute("data-tool-card"))).toEqual(["codex", "zcode"]);

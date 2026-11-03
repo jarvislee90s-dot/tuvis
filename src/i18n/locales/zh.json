@@ -495,7 +495,6 @@
       "compatSendTitle": "兼容发送（实验）",
       "compatSendHint": "仅对未验证的 Codex 桌面版本生效；消息可能被投递到错误会话，风险自负。",
       "compatSendNeedsProbe": "需先完成只读探测（该 Codex 桌面版本的读链尚未取证）",
-      "groupCompatSend": "⑤ 兼容发送（仅未验证的 Codex 桌面版本）",
       "codexAdaptTitle": "自动适配",
       "codexAdaptHint": "开启后，兔维斯会按实际能力尝试连接新版 Codex 桌面端：先尝试、成功后记住、失败如实显示；关闭则只使用已验证的能力。",
       "codexAdaptHintBody": "已开启自动适配；新版本会按实际能力尝试连接，遇到问题可在发送区查看详情。",

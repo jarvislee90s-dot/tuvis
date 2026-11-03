@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState, type CSSProperties } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { useTranslation } from "react-i18next";
-import { SETTINGS_CARD_TITLE } from "@/components/settings/typography";
+import { SETTINGS_CARD_TITLE, SETTINGS_SECTION_TITLE } from "@/components/settings/typography";
 import { TOOL_BRAND_COLORS, TOOL_BRAND_COLORS_DARK } from "@/mobile/board-logic";
 import type { AgentType } from "@/types/session";
 
@@ -424,9 +424,9 @@ export default function RemoteAppearanceSection() {
 
         {/* ① 字体（自证样式：文字即其字体本样） */}
         <div className="border-b pb-4">
-          <div className="text-muted-foreground mb-1.5 text-[11px] font-bold tracking-wide">
+          <h3 className={`${SETTINGS_SECTION_TITLE} mb-1.5`}>
             {t("settings.remoteAppearance.fontLabel")}
-          </div>
+          </h3>
           <div className="grid grid-cols-4 gap-2">
             {Object.entries(FONTS).map(([k, f]) => (
               <button
@@ -445,9 +445,9 @@ export default function RemoteAppearanceSection() {
 
         {/* ② 皮肤（白天/夜间各选其一） */}
         <div className="border-b pb-4">
-          <div className="text-muted-foreground mb-1.5 text-[11px] font-bold tracking-wide">
+          <h3 className={`${SETTINGS_SECTION_TITLE} mb-1.5`}>
             {t("settings.remoteAppearance.skinLabel")}
-          </div>
+          </h3>
           <div className="grid grid-cols-6 gap-2">
             {Object.entries(SKINS).map(([k, s]) => {
               const isDay = k.startsWith("l");
@@ -484,9 +484,9 @@ export default function RemoteAppearanceSection() {
 
         {/* ③ 圆角 */}
         <div className="border-b pb-4">
-          <div className="text-muted-foreground mb-1.5 text-[11px] font-bold tracking-wide">
+          <h3 className={`${SETTINGS_SECTION_TITLE} mb-1.5`}>
             {t("settings.remoteAppearance.radiusLabel")}
-          </div>
+          </h3>
           <div className="grid grid-cols-4 gap-2">
             {RADII.map((r) => (
               <button
@@ -504,9 +504,9 @@ export default function RemoteAppearanceSection() {
 
         {/* ④ 品牌点缀 */}
         <div className="border-b pb-4">
-          <div className="text-muted-foreground mb-1.5 text-[11px] font-bold tracking-wide">
+          <h3 className={`${SETTINGS_SECTION_TITLE} mb-1.5`}>
             {t("settings.remoteAppearance.accentLabel")}
-          </div>
+          </h3>
           <div className="grid grid-cols-4 gap-2">
             {ACCENTS.map((a) => (
               <button

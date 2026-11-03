@@ -180,6 +180,9 @@ describe("ZcodeProviderSelection", () => {
     const posts = install(session([providerA, unknownProviderB]));
     render(<ZcodeControlPanel sessionId={SID} />);
     await waitFor(() => expect(screen.getByTestId("zcode-provider-select")).toBeVisible());
+    // 同上：等初始投影（a / a-model）落定，避免 late effect 把 pendingProvider 清回 a。
+    await waitFor(() => expect(providerSelect().value).toBe("a"));
+    await waitFor(() => expect(modelSelect().value).toBe("a-model"));
 
     fireEvent.change(providerSelect(), { target: { value: "b" } });
     await waitFor(() => expect(posts).toHaveLength(0));

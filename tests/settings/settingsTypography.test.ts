@@ -22,6 +22,7 @@ import {
   SETTINGS_REMOTE_HINT,
   SETTINGS_REMOTE_QR_CAPTION,
   SETTINGS_REMOTE_ROW,
+  SETTINGS_SECTION_TITLE,
   SETTINGS_SUBTITLE,
 } from "@/components/settings/typography";
 
@@ -47,10 +48,6 @@ const EXEMPT = new Map<string, string>([
   ["src/components/settings/AuditLogSection.tsx", "五列审计表（密集网格）"],
   ["src/components/settings/SignalHealthSection.tsx", "信号矩阵（密集网格）"],
   ["src/components/settings/RemoteSection.tsx", "远程设备/文件表与模式名（密集网格）"],
-  [
-    "src/components/settings/HeadlessSettingsSection.tsx",
-    "远程分组标题（A2 自 RemoteSection 抽取的无头/兼容发送区，沿用 12.5px 分组档）",
-  ],
   ["src/components/settings/UsageStatusSection.tsx", "采集状态表（密集网格）"],
   ["src/components/settings/RemoteAppearanceSection.tsx", "缩微设备预览（小字号是缩微的一部分）"],
 ]);
@@ -81,9 +78,16 @@ const scanFontLiterals = (src: string): string[] =>
   [...src.matchAll(/text-\[([0-9.]+)px\]/g)].map((m) => m[1]);
 
 describe("设置页排版层级（C1）", () => {
+  it("⓪ 页面块标题用 h1，卡片标题用 h2（语义层级不混）", () => {
+    const page = readFileSync(path.join(ROOT, "src/pages/settings.tsx"), "utf8");
+    expect(page).toContain("<h1 className={SETTINGS_PAGE_TITLE}>");
+    expect(page).not.toContain("<h2 className={SETTINGS_PAGE_TITLE}>");
+  });
+
   it("① 档位表逐字钉住（二级标题必须比一级小一档 —— 改动前两者都是 18）", () => {
     expect(SETTINGS_PAGE_TITLE).toBe("text-lg font-semibold"); // 18 一级
     expect(SETTINGS_CARD_TITLE).toBe("text-sm font-semibold"); // 14 二级
+    expect(SETTINGS_SECTION_TITLE).toBe("text-[12.5px] font-semibold text-muted-foreground"); // 12.5 三级
     expect(SETTINGS_SUBTITLE).toBe("text-sm text-muted-foreground");
     expect(SETTINGS_FIELD).toBe("text-sm font-medium");
     expect(SETTINGS_HINT).toBe("text-xs text-muted-foreground");
@@ -104,17 +108,19 @@ describe("设置页排版层级（C1）", () => {
       const tiered = [...src.matchAll(/<h[23]\b[^>]*?className=\{([^}]*)\}/g)].map((m) => m[1]);
       for (const expr of tiered) {
         expect(expr, `${rel(f)} 的标题必须引用 SETTINGS_* 档位常量，实际：${expr}`).toMatch(
-          /SETTINGS_(PAGE_TITLE|CARD_TITLE)/
+          /SETTINGS_(PAGE_TITLE|CARD_TITLE|SECTION_TITLE)/
         );
       }
       checked += tiered.length;
     }
-    // 设置面标题总数：settings.tsx 7（1 一级色条 + 6 卡头条 h2）+ 7 个组件卡头条各 1
-    //（Remote/Audit/Signal/DataMgmt/Usage/UsageStatus/RemoteAppearance）+ UsageStatusSection 的 h3 1 = 15。
+    // 设置面标题总数：L2 卡片 h2 13 个（settings.tsx 6 张 + 组件卡 7 张）+
+    // L3 卡内小节 h3 10 个（远程 5 + 远程端外观 4 + 用量采集状态 1）= 23。
+    // L1 页面块标题是 h1，单独由 settings.tsx 的色条标题承担，不计入本锁。
     // 2026-10-07 D4 把「快捷键」整节移除 ⇒ 账曾由 14 降为 13；2026-10-11（a）开机自启
-    // 分区加入、（b）远程端外观卡头条化并补 h2 语义（原折叠壳无 h2）⇒ 14 → 15（**本锁
-    // 当场抓到过多次变化**：分区/卡增删时它先红，逼我们把数字与新事实对齐，而不是让计数悄悄漂）。
-    expect(checked, "设置面标题总数（少一个就说明有标题漏掉了档位）").toBe(15);
+    // 分区加入、（b）远程端外观卡头条化并补 h2 语义（原折叠壳无 h2）⇒ 14 → 15；
+    // 2026-11-04 层级收口：页面标题 h2→h1、卡内小节统一 h3 + SETTINGS_SECTION_TITLE ⇒ 23。
+    // **本锁当场抓到过多次变化**：分区/卡增删时它先红，逼我们把数字与新事实对齐，而不是让计数悄悄漂。
+    expect(checked, "设置面标题总数（少一个就说明有标题漏掉了档位）").toBe(23);
   });
 
   it("③ 字号按值登记：未登记值在任何文件都红；登记小字号的裸字面量不得外溢豁免面", () => {
@@ -179,6 +185,29 @@ describe("设置页排版层级（C1）", () => {
         SMALL_LITERAL_ONLY_IN_EXEMPT.some((v) => src.includes(`text-[${v}px]`)),
         `${r}（${reason}）是豁免面，但已找不到任何登记小字号——若确实重排了版面，请同时更新本清单与 typography.ts`
       ).toBe(true);
+    }
+  });
+  it("⑤ 卡内并列小节编号连续，且中英同一套圈号", () => {
+    const read = (lang: string) =>
+      JSON.parse(readFileSync(path.join(ROOT, `src/i18n/locales/${lang}.json`), "utf8")).settings;
+    for (const lang of ["zh", "en"]) {
+      const settings = read(lang);
+      expect(
+        [
+          settings.remote.groupGeneral,
+          settings.remote.groupChannels,
+          settings.remote.groupTools,
+          settings.remote.groupSecurity,
+        ].map((label: string) => label.slice(0, 1))
+      ).toEqual(["①", "②", "③", "④"]);
+      expect(
+        [
+          settings.remoteAppearance.fontLabel,
+          settings.remoteAppearance.skinLabel,
+          settings.remoteAppearance.radiusLabel,
+          settings.remoteAppearance.accentLabel,
+        ].map((label: string) => label.slice(0, 1))
+      ).toEqual(["①", "②", "③", "④"]);
     }
   });
 });

@@ -1,5 +1,5 @@
 // tests/settings/zcodeRemoteSettings.test.tsx — A5（设计 §4.1/§4.2/§4.3）：
-// 「④ 工具特殊配置」首版只放 **ZCode 一张折叠卡**。
+// 「③ 工具特殊配置」中的 **ZCode 折叠卡**（与 Codex APP 卡并列；本文件只测 ZCode）。
 // 覆盖三条契约：
 //  1. 默认收起 + 键盘可操作 + 草稿/已存值分开 + 折叠不删配置（zcode_card_starts_collapsed）；
 //  2. 保存失败**就地**报错且不破坏任何东西：已存值与草稿都保留、复制取已存值、
@@ -187,7 +187,7 @@ describe("ZcodeRemoteSettingsCard 默认收起（A5 zcode_card_starts_collapsed�
     mockBackend(saved);
     render(<ToolRemoteSettingsSection />);
 
-    // ① 首版只渲染 ZCode 一张卡——不交付空工具卡，也不预建多工具框架
+    // ① 本组件只渲染 ZCode 一张卡；Codex APP 卡由外层 ToolConfigCard 装配，不在本组件内
     await waitFor(() => expect(getCalls()).toHaveLength(1));
     expect(document.querySelectorAll("[data-tool-card]")).toHaveLength(1);
     expect(document.querySelector('[data-tool-card="zcode"]')).toBeTruthy();

@@ -114,11 +114,11 @@ describe("设置页两级导航：块表与渲染守卫的可达性锁", () => {
     expect(Object.keys(zh.settings.nav).sort()).toEqual(Object.keys(en.settings.nav).sort());
   });
 
-  // A2（2026-10-24 设计 §4.1）：远程大块内六段顺序收尾 = 注入审计。RemoteSection 内部
-  // 承载前六段的前五段（通用/通道/安全设备/工具配置/无头注入含兼容发送），审计卡片由
-  // SettingsPage 紧随其后装配。本锁判据是源码装配顺序（与上面 ①③ 同法）：两处守卫
-  // 各一份，且审计守卫**紧邻**远程守卫之后——中间插进任何其它分区即红。
-  it("⑥ 审计紧随远程分区之后装配（A2 六段顺序的末段）", () => {
+  // A2（2026-10-24 设计 §4.1；2026-11-04 收口为四段）：远程大块内四段
+  // （通用含无头注入 / 通道 / 工具特殊配置 / 访问与安全）后，审计卡片由 SettingsPage
+  // 紧随其后装配。本锁判据是源码装配顺序（与上面 ①③ 同法）：两处守卫各一份，且审计
+  // 守卫**紧邻**远程守卫之后——中间插进任何其它分区即红。
+  it("⑥ 审计紧随远程分区之后装配（四段顺序的末段）", () => {
     const remoteIdx = SRC.indexOf('{visibleIds.has("remote")');
     const auditIdx = SRC.indexOf('{visibleIds.has("audit")');
     expect(remoteIdx, "找不到远程分区守卫").toBeGreaterThan(-1);

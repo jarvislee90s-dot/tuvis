@@ -9,7 +9,12 @@
 // 排版层级统一走 components/settings/typography.ts 单一出处（2026-10-07 用户裁决 C1）：
 // 卡标题取 SETTINGS_CARD_TITLE（2026-10-11 起搬进灰底卡头条），不再内联字号字重；本文件
 // 另被登记为小字号豁免面（密集数据网格），豁免理由见 typography.ts。
-import { SETTINGS_CARD_TITLE, SETTINGS_REMOTE_BADGE } from "@/components/settings/typography";
+import {
+  SETTINGS_CARD_TITLE,
+  SETTINGS_FIELD,
+  SETTINGS_REMOTE_BADGE,
+  SETTINGS_SECTION_TITLE,
+} from "@/components/settings/typography";
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -827,15 +832,12 @@ export function RemoteSection() {
         </div>
         <div className="p-3">
           {/* ① 通用 */}
-          <div
-            data-group="general"
-            className="text-muted-foreground mt-2 text-[12.5px] font-semibold"
-          >
+          <h3 data-group="general" className={`${SETTINGS_SECTION_TITLE} mt-2`}>
             {t("settings.remote.groupGeneral")}
-          </div>
+          </h3>
           <div className="flex items-center justify-between gap-4 py-3">
             <div className="flex-1">
-              <label className="text-sm font-semibold">{t("settings.remote.enable")}</label>
+              <label className={SETTINGS_FIELD}>{t("settings.remote.enable")}</label>
               <p className="text-muted-foreground mt-0.5 text-xs">
                 {t("settings.remote.enableCloseHint")}
               </p>
@@ -849,7 +851,7 @@ export function RemoteSection() {
           </div>
           <div className="flex items-center justify-between gap-4 py-3">
             <div className="flex-1">
-              <label className="text-sm font-semibold">{t("settings.remote.keepalive")}</label>
+              <label className={SETTINGS_FIELD}>{t("settings.remote.keepalive")}</label>
               <p className="text-muted-foreground mt-0.5 text-xs">
                 {t("settings.remote.keepaliveHint")}
               </p>
@@ -863,7 +865,7 @@ export function RemoteSection() {
           </div>
           <div className="flex items-center justify-between gap-4 py-3">
             <div className="flex-1">
-              <label className="text-sm font-semibold">{t("settings.remote.signature")}</label>
+              <label className={SETTINGS_FIELD}>{t("settings.remote.signature")}</label>
               <p className="text-muted-foreground mt-0.5 text-xs">
                 {t("settings.remote.signatureHint")}
               </p>
@@ -875,7 +877,7 @@ export function RemoteSection() {
             />
           </div>
           <div className="flex items-center justify-between gap-4 py-3">
-            <label htmlFor="remote-host-name" className="flex-none text-sm font-semibold">
+            <label htmlFor="remote-host-name" className={`${SETTINGS_FIELD} flex-none`}>
               {t("settings.remote.hostName")}
             </label>
             <Input
@@ -889,12 +891,10 @@ export function RemoteSection() {
 
           {/* ①b 通用 · 无头注入（H3）：**单一总开关**，默认关；H4 的 watchdog 超时 /
               并发上限两件同住本分组。开关关闭时兼容发送入口一律 403/置灰。 */}
-          <div className="text-muted-foreground mt-4 text-[12.5px] font-semibold">
-            {t("settings.remote.groupHeadless")}
-          </div>
+          <h3 className={`${SETTINGS_SECTION_TITLE} mt-4`}>{t("settings.remote.groupHeadless")}</h3>
           <div className="flex items-center justify-between gap-4 py-3">
             <div className="flex-1">
-              <label className="text-sm font-semibold">{t("settings.remote.headlessTitle")}</label>
+              <label className={SETTINGS_FIELD}>{t("settings.remote.headlessTitle")}</label>
               <p className="text-muted-foreground mt-0.5 text-xs">
                 {t("settings.remote.headlessHint")}
               </p>
@@ -911,7 +911,7 @@ export function RemoteSection() {
             className="flex flex-wrap items-start gap-4 border-t border-dashed py-3"
           >
             <div className="min-w-[190px] flex-1">
-              <label htmlFor="headless-timeout" className="text-sm font-semibold">
+              <label htmlFor="headless-timeout" className={SETTINGS_FIELD}>
                 {t("settings.remote.headlessTimeoutLabel")}
               </label>
               <Input
@@ -929,7 +929,7 @@ export function RemoteSection() {
               </p>
             </div>
             <div className="min-w-[160px] flex-1">
-              <label htmlFor="headless-concurrency" className="text-sm font-semibold">
+              <label htmlFor="headless-concurrency" className={SETTINGS_FIELD}>
                 {t("settings.remote.headlessConcurrencyLabel")}
               </label>
               <Input
@@ -957,12 +957,9 @@ export function RemoteSection() {
           </div>
 
           {/* ② 通道（开关各自独立，可同时开启；点卡片在下方展开详情） */}
-          <div
-            data-group="channels"
-            className="text-muted-foreground mt-4 text-[12.5px] font-semibold"
-          >
+          <h3 data-group="channels" className={`${SETTINGS_SECTION_TITLE} mt-4`}>
             {t("settings.remote.groupChannels")}
-          </div>
+          </h3>
           <div className="mt-2 grid grid-cols-4 gap-2">
             {cardDefs.map((c) => {
               const sel = selected === c.key;
@@ -1332,12 +1329,9 @@ export function RemoteSection() {
           </div>
 
           {/* ③ 工具特殊配置（Codex APP / ZCode 各一张折叠卡，默认收起） */}
-          <div
-            data-group="tools"
-            className="text-muted-foreground mt-4 text-[12.5px] font-semibold"
-          >
+          <h3 data-group="tools" className={`${SETTINGS_SECTION_TITLE} mt-4`}>
             {t("settings.remote.groupTools")}
-          </div>
+          </h3>
           <ToolConfigCard toolId="codex" title="Codex APP">
             <CodexAdaptSection
               enabled={status?.codexAutoAdaptEnabled ?? true}
@@ -1349,15 +1343,12 @@ export function RemoteSection() {
           </ToolConfigCard>
           <ToolRemoteSettingsSection />
           {/* ④ 访问与安全 */}
-          <div
-            data-group="security"
-            className="text-muted-foreground mt-4 text-[12.5px] font-semibold"
-          >
+          <h3 data-group="security" className={`${SETTINGS_SECTION_TITLE} mt-4`}>
             {t("settings.remote.groupSecurity")}
-          </div>
+          </h3>
           <div className="flex items-center justify-between gap-4 py-3">
             <div className="flex-1">
-              <label htmlFor="remote-pin" className="text-sm font-semibold">
+              <label htmlFor="remote-pin" className={SETTINGS_FIELD}>
                 {t("settings.remote.pinTitle")}
               </label>
               <p className="text-muted-foreground mt-0.5 text-xs">{t("settings.remote.pinHint")}</p>
@@ -1390,7 +1381,7 @@ export function RemoteSection() {
           </div>
           <div className="py-3">
             <div className="flex items-center gap-2">
-              <span className="text-sm font-semibold">{t("settings.remote.devicesTitle")}</span>
+              <span className={SETTINGS_FIELD}>{t("settings.remote.devicesTitle")}</span>
               {/* 上限徽标：上限来自 remote_status.maxDevices（KV 可改，默认 10），不再硬编码 */}
               <Badge tone="gray">{`${devices.length} / ${maxDevices}`}</Badge>
             </div>

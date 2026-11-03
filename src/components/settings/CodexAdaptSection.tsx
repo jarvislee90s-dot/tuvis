@@ -14,6 +14,7 @@
 //   诊断服务未部署 → 明确「诊断服务未开启」+ 复制摘要出口，不伪造成功。
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
+import { SETTINGS_FIELD } from "@/components/settings/typography";
 import { Switch } from "@/components/ui/switch";
 import { useAppTranslation } from "@/hooks/use-app-translation";
 import { toast } from "sonner";
@@ -204,7 +205,7 @@ export function CodexAdaptSection({
       )}
       <div className="flex items-center justify-between gap-4 py-3">
         <div className="flex-1">
-          <label className="text-sm font-semibold">{t("settings.remote.codexAdaptTitle")}</label>
+          <label className={SETTINGS_FIELD}>{t("settings.remote.codexAdaptTitle")}</label>
           <p className="text-muted-foreground mt-0.5 text-xs">
             {t("settings.remote.codexAdaptHint")}
           </p>
