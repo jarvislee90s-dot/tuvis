@@ -321,6 +321,7 @@ fn codex_app_session(id: &str) -> Session {
         form: ProcessForm::App,
         jump_supported: false,
         unread: false,
+        unread_turned_green_at_ms: None,
     }
 }
 
@@ -622,6 +623,16 @@ fn fixture_on(
         subagent_message_source: std::collections::HashMap::new(),
         capability_table: multi_agents_manager_lib::inject::capability::new_table(),
         session_source: {
+            let sessions = sessions.clone();
+            Box::new(move || SessionsResponse {
+                sessions: sessions.clone(),
+                total_count: sessions.len(),
+                waiting_count: 0,
+            })
+        },
+        // 动作路径同源（Task 4）：镜像 session_source 的数据，保证动作端点测试
+        // 切到新鲜源后仍能定位会话
+        fresh_session_source: {
             let sessions = sessions.clone();
             Box::new(move || SessionsResponse {
                 sessions: sessions.clone(),

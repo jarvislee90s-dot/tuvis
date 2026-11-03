@@ -96,6 +96,10 @@ pub struct Session {
     pub jump_supported: bool,
     /// 未读标记（W4）：true = 绿色已完成且用户未查看的持久未读卡（APP 类专用）
     pub unread: bool,
+    /// 未读池里的首次转绿时间（epoch ms）。与 last_activity_at 的业务活动时间分离：
+    /// 前端首见未读卡的新鲜度必须用它判断，不能用旧业务活动时间误杀补偿通知。
+    #[serde(default)]
+    pub unread_turned_green_at_ms: Option<i64>,
 }
 
 /// 全部会话的聚合响应
@@ -168,11 +172,16 @@ mod jump_tests {
             form: ProcessForm::Cli,
             jump_supported: false,
             unread: false,
+            unread_turned_green_at_ms: Some(42),
         };
         let v = serde_json::to_value(&s).unwrap();
         assert_eq!(
             v["flapFromSubagentActivity"], true,
             "wire 键必须为 camelCase 的 flapFromSubagentActivity"
+        );
+        assert_eq!(
+            v["unreadTurnedGreenAtMs"], 42,
+            "未读转绿时间必须按 camelCase 下发，前端通知用它判断新鲜度"
         );
         assert!(
             v.get("flap_from_subagent_activity").is_none(),

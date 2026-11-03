@@ -9,6 +9,7 @@ on:
   push:
     branches: [main]
     paths:
+      - "docs/product/manual/**"
       - "docs/user-manual/**"
       - "CHANGELOG.md"
       - "CHANGELOG.en.md"

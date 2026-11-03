@@ -173,6 +173,7 @@ fn write_settings_conn(conn: &rusqlite::Connection, json: &str) -> Result<(), Us
             format!("usage settings write did not persist (readback mismatch): key={SETTINGS_KEY}"),
         ));
     }
+    super::ticker::notify_scheduler();
     Ok(())
 }
 // ==== usage 自省锁：以下为排除区（测试代码），勿删勿复制 ====

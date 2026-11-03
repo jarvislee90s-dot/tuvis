@@ -15,6 +15,7 @@ import {
   exportSaveText,
   revealDir,
   usageCollect,
+  usageCollectVisible,
   usageDashboard,
   usageExportCsv,
   usageGetSettings,
@@ -35,8 +36,9 @@ function invocations(): Array<[string, string[]]> {
 }
 
 describe("用量域 IPC 入口（src/lib/api/usage.ts）", () => {
-  it("1. 8 条命令名与入参键名逐字对齐契约（另锁既有的 reveal_dir）", async () => {
+  it("1. 命令名与入参键名逐字对齐契约（含 F7 可见性采集；另锁既有的 reveal_dir）", async () => {
     await usageCollect(true);
+    await usageCollectVisible();
     await usageDashboard(TODAY, "tool");
     await usageRecords(TODAY, "project", { toolIds: ["claude"] });
     await usageExportCsv(TODAY, "project", {});
@@ -48,6 +50,7 @@ describe("用量域 IPC 入口（src/lib/api/usage.ts）", () => {
 
     expect(invocations()).toEqual([
       ["usage_collect", ["force"]],
+      ["usage_collect_visible", []],
       ["usage_dashboard", ["groupBy", "range"]],
       ["usage_records", ["filters", "groupBy", "range"]],
       ["usage_export_csv", ["filters", "groupBy", "range"]],

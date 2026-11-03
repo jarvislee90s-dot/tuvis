@@ -140,12 +140,8 @@ fn build_session(
     let now = chrono::Utc::now();
     let last_activity_at = now.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
 
-    // OpenClaw 状态判断：基于 CPU 使用率
-    let status = if process.cpu_usage > 5.0 {
-        SessionStatus::Processing
-    } else {
-        SessionStatus::Idle
-    };
+    // OpenClaw 状态判断：基于仍逐扫描刷新的 CPU 使用率
+    let status = status_from_cpu_usage(process.cpu_usage);
 
     Some(Session {
         id: agent.id.clone(),
@@ -166,6 +162,27 @@ fn build_session(
         form: process.form,
         jump_supported: jump_supported_for(process.form),
         unread: false, // 扫描出的活跃卡默认非未读；未读卡由 adapter 层合并
+        unread_turned_green_at_ms: None,
         title: Some(display_name.to_string()),
     })
+}
+
+fn status_from_cpu_usage(cpu_usage: f32) -> SessionStatus {
+    if cpu_usage > 5.0 {
+        SessionStatus::Processing
+    } else {
+        SessionStatus::Idle
+    }
+}
+
+#[cfg(test)]
+mod cpu_status_tests {
+    use super::*;
+
+    #[test]
+    fn processing_threshold_is_strictly_above_five_percent() {
+        assert_eq!(status_from_cpu_usage(0.0), SessionStatus::Idle);
+        assert_eq!(status_from_cpu_usage(5.0), SessionStatus::Idle);
+        assert_eq!(status_from_cpu_usage(5.1), SessionStatus::Processing);
+    }
 }

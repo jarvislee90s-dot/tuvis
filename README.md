@@ -42,7 +42,7 @@ Step-by-step documentation lives in the **[user manual](docs/product/manual/en/0
 
 | Feature                              |                                                                                                                                                   | Manual                                                  |
 | ------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------- |
-| 🎛️ **Session monitoring dashboard**  | Real-time traffic-light board: status, project, branch, last message, CPU — click a card to jump straight to the session's terminal or app window | [Ch. 4](docs/product/manual/en/04-dashboard.md)            |
+| 🎛️ **Session monitoring dashboard**  | Adaptive traffic-light board: status, project, branch, last message, CPU — click a card to jump straight to the session's terminal or app window | [Ch. 4](docs/product/manual/en/04-dashboard.md)            |
 | 📶 **Remote access & mobile board**  | The same board on your phone, over four simultaneous channels with per-channel setup wizards and one permanent address option                     | [Ch. 8](docs/product/manual/en/08-mobile-remote.md)        |
 | 📱 **Remote control** (experimental) | Send & queue messages, approve tool calls and plans, answer Q&A cards, switch permission modes, create sessions — all screen-read verified        | [Ch. 8](docs/product/manual/en/08-mobile-remote.md)        |
 | 🕵️ **Sub-agent observatory**         | Live sub-agent chips, a dedicated sub-agent board and execution details in the session view (Claude Code)                                         | [Ch. 5](docs/product/manual/en/05-subagent-observatory.md) |
@@ -76,26 +76,32 @@ Step-by-step documentation lives in the **[user manual](docs/product/manual/en/0
 
 ## Capability Matrix
 
-13 capability rows × 8 terminal-class AI coding tools (✅ supported / ◐ partial / 🧪 experimental / ❌ not supported) — the master table, updated with every release. Structured source: [`docs/capabilities.json`](docs/capabilities.json), shared with the website.
+<!-- capabilities:start (generated; run pnpm sync:capabilities) -->
 
-| Capability                               | Claude Code | Codex CLI   | OpenCode | OpenClaw | Kimi Code    | WorkBuddy | ZCode           | dsh         |
-| ---------------------------------------- | ----------- | ----------- | -------- | -------- | ------------ | --------- | --------------- | ----------- |
-| Session monitoring                       | ✅          | ✅          | ✅       | ✅       | ✅           | ✅        | ✅              | ✅          |
-| Desktop notifications                    | ✅          | ✅          | ✅       | ✅       | ✅           | ✅        | ✅              | ✅          |
-| Skill management                         | ✅          | ✅          | ✅       | ✅       | ✅           | ✅        | ✅              | ◐ read-only |
-| MCP management                           | ✅ JSON     | ✅ TOML     | ✅ JSONC | ✅ JSON  | ✅ JSON      | ✅ JSON   | ✅ JSON subtree | ❌          |
-| Plugin management                        | ✅          | ✅          | ✅       | ✅       | ◐ file-based | ❌        | ❌              | ❌          |
-| Status hooks                             | ✅          | ✅          | ❌       | ❌       | ✅           | ❌        | ❌              | ❌          |
-| Mobile · message viewing                 | ✅          | ✅          | ✅       | ❌       | ✅           | ✅        | ✅              | ✅          |
-| Mobile · file preview                    | ✅          | ✅          | ✅       | ❌       | ✅           | ✅        | ✅              | ✅          |
-| Mobile · send messages (injection)       | 🧪          | 🧪          | 🧪       | ❌       | 🧪           | ❌        | ❌              | ❌          |
-| Mobile · create sessions                 | 🧪          | 🧪          | 🧪       | ❌       | 🧪           | ❌        | ❌              | ❌          |
-| Token usage collection                   | ✅          | ✅          | ✅       | ❌       | ✅           | ✅        | ✅              | ✅          |
-| Output speed (TPS sampling)              | ◐ approx    | ◐ resp-only | ◐ plugin | ❌       | ✅           | ✅        | ✅              | ✅          |
-| Mobile · sub-agent observatory           | ✅          | ❌          | ❌       | ❌       | ❌           | ❌        | ❌              | ❌          |
-| Mobile · Codex APP control (Desktop IPC) | ❌          | 🧪          | ❌       | ❌       | ❌           | ❌        | ❌              | ❌          |
+14 capability rows × 8 tools (✅ supported / ◐ partial / 🧪 experimental / ❌ not supported).
 
-> **0.6.3 flagship: Codex Desktop adaptive control.** Per-operation contract evidence, grouped async answering, and a persistent queue-pause safety valve — no headless fallback and no guessed approvals. The matrix marks verified vs experimental; exact limits (Plan mode and permissions remain unsupported) are stated in [Ch. 8](docs/product/manual/en/08-mobile-remote.md).
+Single maintained source: [`docs/capabilities.json`](docs/capabilities.json), shared with the website.
+
+| Capability | Claude Code | Codex CLI / APP | OpenCode | Kimi Code | WorkBuddy | ZCode | dsh | OpenClaw |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Session monitoring (status lights) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Desktop notifications | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Skill management | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ◐ read-only | ✅ |
+| MCP management | ✅ JSON | ✅ TOML | ✅ JSONC | ✅ JSON | ✅ JSON | ✅ JSON subtree | ❌ | ✅ JSON |
+| Plugin management | ✅ | ✅ | ✅ | ◐ file-based | ❌ | ❌ | ❌ | ✅ |
+| Status hooks | ✅ | ✅ | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ |
+| Mobile · message viewing | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
+| Mobile · file preview | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
+| Mobile · message injection | 🧪 | 🧪 | 🧪 | 🧪 | ❌ | ❌ | ❌ | ❌ |
+| Mobile · session creation | 🧪 | 🧪 | 🧪 | 🧪 | ❌ | ❌ | ❌ | ❌ |
+| Token usage collection | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
+| Mobile · sub-agent observatory | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| Codex APP remote control (Desktop IPC) | ❌ | 🧪 | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| Output speed (TPS sampling) | ◐ approximate | ◐ response only | ◐ plugin | ✅ | ✅ | ✅ | ✅ | ❌ |
+
+The Codex column covers both CLI and APP; Desktop APP control has its own row and is gated per operation by contract evidence.
+
+<!-- capabilities:end -->
 
 ## Quick Start
 

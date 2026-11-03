@@ -891,6 +891,7 @@ mod tests {
             form: crate::session::ProcessForm::Cli,
             jump_supported: false,
             unread: false,
+            unread_turned_green_at_ms: None,
         }
     }
 

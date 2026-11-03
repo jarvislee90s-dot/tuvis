@@ -11,6 +11,10 @@ pub mod status;
 use crate::adapter::AgentProcess;
 use crate::monitor::session_scan::SessionFileScan;
 use crate::session::{AgentType, ProcessForm, Session, SessionStatus};
+use once_cell::sync::Lazy;
+use std::collections::{hash_map::DefaultHasher, HashMap, HashSet};
+use std::hash::Hasher;
+use std::sync::Mutex;
 
 pub use status::LockState;
 
@@ -19,6 +23,51 @@ pub use status::LockState;
 // 零解码零解析。M1 实测真机 77 会话/解压 155MB 每轮全量重扫 12.5s（debug），
 // 远超 3s 轮询间隔且跑在 IPC 线程上，是 dev 模式整机卡顿的根因
 const DSH_LOG_SCAN: SessionFileScan = SessionFileScan::new("dsh-log");
+static DSH_GENERATION_PATHS: Lazy<log::GenerationPathCache> =
+    Lazy::new(log::GenerationPathCache::default);
+
+type UnknownGenerationKey = (String, i64);
+type UnknownGenerationFingerprint = (i64, u64, u64);
+
+#[derive(Default)]
+struct UnknownGenerationWarningCache {
+    fingerprints: Mutex<HashMap<UnknownGenerationKey, UnknownGenerationFingerprint>>,
+}
+
+impl UnknownGenerationWarningCache {
+    fn should_warn(
+        &self,
+        session_id: &str,
+        generation: i64,
+        header_version: i64,
+        content_hash: u64,
+        content_size: u64,
+    ) -> bool {
+        let mut fingerprints = self.fingerprints.lock().unwrap_or_else(|e| e.into_inner());
+        let key = (session_id.to_string(), generation);
+        let fingerprint = (header_version, content_hash, content_size);
+        if let Some(previous) = fingerprints.get_mut(&key) {
+            if *previous == fingerprint {
+                return false;
+            }
+            *previous = fingerprint;
+            return true;
+        }
+
+        fingerprints.insert(key, fingerprint);
+        true
+    }
+
+    fn retain_existing(&self, live: &HashSet<UnknownGenerationKey>) {
+        self.fingerprints
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|key, _| live.contains(key));
+    }
+}
+
+static DSH_UNKNOWN_GENERATION_WARNINGS: Lazy<UnknownGenerationWarningCache> =
+    Lazy::new(UnknownGenerationWarningCache::default);
 
 /// 单个会话代际日志的纯内容解析产物（不含 lock / 时间叠加，可安全跨轮询缓存）
 #[derive(Debug, Clone)]
@@ -34,6 +83,9 @@ pub(crate) struct DshSessionDigest {
     pub(crate) max_event_time_ms: Option<i64>,
     /// 所选代际文件 mtime（静默兜底 / last_activity 兜底输入）
     pub(crate) log_mtime_ms: i64,
+    /// 内容签名，只在 L2 内容缓存失效并实际读文件后重算
+    pub(crate) content_hash: u64,
+    pub(crate) log_size_bytes: u64,
 }
 
 /// 读取（带 L2 缓存）代际日志解析产物：内容未变 → 同一 Arc 秒回；损坏/不可读
@@ -51,12 +103,18 @@ fn load_digest(
 #[cfg(test)]
 thread_local! {
     pub(crate) static TEST_DIGEST_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static TEST_GENERATION_STAT_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static TEST_SELECTED_GENERATION_VERSION: std::cell::Cell<Option<i64>> = const { std::cell::Cell::new(None) };
 }
 
 fn build_digest(gen_path: &std::path::Path) -> Option<DshSessionDigest> {
     #[cfg(test)]
     TEST_DIGEST_CALLS.with(|c| c.set(c.get() + 1));
     let bytes = std::fs::read(gen_path).ok()?;
+    let mut content_hasher = DefaultHasher::new();
+    content_hasher.write(&bytes);
+    let content_hash = content_hasher.finish();
+    let log_size_bytes = bytes.len() as u64;
     let text = if gen_path.extension().map(|e| e == "zstd").unwrap_or(false) {
         decode::decode_zstd_frames(&bytes).ok()?.text
     } else {
@@ -82,6 +140,8 @@ fn build_digest(gen_path: &std::path::Path) -> Option<DshSessionDigest> {
         log_title,
         max_event_time_ms,
         log_mtime_ms,
+        content_hash,
+        log_size_bytes,
     })
 }
 
@@ -211,6 +271,27 @@ fn scan_sessions(
     host: &AgentProcess,
     scan: &SessionFileScan,
 ) -> Vec<Session> {
+    scan_sessions_with_path_cache(home, host, scan, &DSH_GENERATION_PATHS)
+}
+
+fn scan_sessions_with_path_cache(
+    home: &std::path::Path,
+    host: &AgentProcess,
+    scan: &SessionFileScan,
+    path_cache: &log::GenerationPathCache,
+) -> Vec<Session> {
+    scan_sessions_with_path_cache_at(home, host, scan, path_cache, std::time::Instant::now())
+}
+
+fn scan_sessions_with_path_cache_at(
+    home: &std::path::Path,
+    host: &AgentProcess,
+    scan: &SessionFileScan,
+    path_cache: &log::GenerationPathCache,
+    now: std::time::Instant,
+) -> Vec<Session> {
+    #[cfg(test)]
+    TEST_SELECTED_GENERATION_VERSION.with(|v| v.set(None));
     let sessions_root = home.join("sessions");
     let Ok(entries) = std::fs::read_dir(&sessions_root) else {
         return Vec::new();
@@ -222,6 +303,7 @@ fn scan_sessions(
     // 本轮扫描命中的代际日志全集（缓存收敛用，防已删会话的孤儿条目常驻）
     let mut live_logs: std::collections::HashSet<std::path::PathBuf> =
         std::collections::HashSet::new();
+    let mut live_unknown_generations: HashSet<UnknownGenerationKey> = HashSet::new();
     for project_dir in entries.flatten() {
         let ppath = project_dir.path();
         if !ppath.is_dir() {
@@ -242,9 +324,14 @@ fn scan_sessions(
             // 代际选择（取代际最大者）。预过滤反模式禁令（AGENTS.md L3-4）：窗口判定
             // 必须发生在打开/解压文件之前——先 stat 代际文件 mtime，超窗且无缓存命中
             // → 文件不读不解压（冷启动 77 会话 155MB 全量解码的教训）
-            let Some((version, gen_path)) = log::generation_logs(&spath).pop() else {
+            let Some((version, gen_path)) = path_cache.generation_logs_at(&spath, now).pop() else {
                 continue;
             };
+            #[cfg(test)]
+            {
+                TEST_GENERATION_STAT_CALLS.with(|c| c.set(c.get() + 1));
+                TEST_SELECTED_GENERATION_VERSION.with(|v| v.set(Some(version)));
+            }
             let mtime_ms = std::fs::metadata(&gen_path)
                 .ok()
                 .and_then(|m| m.modified().ok())
@@ -273,7 +360,16 @@ fn scan_sessions(
             // 降级卡"格式待适配"（未知语义不猜——探测红线），不影响其他会话
             if let Some(v) = header.version {
                 if !(0..=3).contains(&v) {
-                    ::log::warn!("dsh: 会话 {} 为未知代际 v{}，出降级卡", header.id, v);
+                    live_unknown_generations.insert((header.id.clone(), version));
+                    if DSH_UNKNOWN_GENERATION_WARNINGS.should_warn(
+                        &header.id,
+                        version,
+                        v,
+                        digest.content_hash,
+                        digest.log_size_bytes,
+                    ) {
+                        ::log::warn!("dsh: 会话 {} 为未知代际 v{}，出降级卡", header.id, v);
+                    }
                     // 超窗拦截已前移到 stat 预过滤（两分支共用），此处无需重复
                     cards.push((
                         digest.log_mtime_ms,
@@ -305,6 +401,7 @@ fn scan_sessions(
                             form: ProcessForm::App,
                             jump_supported: crate::session::jump_supported_for(ProcessForm::App),
                             unread: false,
+                            unread_turned_green_at_ms: None,
                         },
                     ));
                     continue;
@@ -370,12 +467,14 @@ fn scan_sessions(
                     // 管线（W4）统一标记/清除——绿卡「池行在⇒未读、已读删行⇒P1-3 剔除」，
                     // 与 codex/zcode 数据驱动绿卡同一套出现周期
                     unread: false,
+                    unread_turned_green_at_ms: None,
                 },
             ));
         }
     }
     // 收敛缓存：清掉本轮未命中的代际日志条目（会话目录已被删除等）
     scan.retain_existing(&live_logs);
+    DSH_UNKNOWN_GENERATION_WARNINGS.retain_existing(&live_unknown_generations);
     take_recent(cards, RECENT_SESSIONS_LIMIT)
 }
 
@@ -522,6 +621,34 @@ mod cmdline_gate_tests {
 
 // ===== 集成测试（Task 8）：会话编排流水线（home 注入直调，不触真机 ~/.dsh）=====
 #[cfg(test)]
+mod generation_warning_tests {
+    use super::*;
+
+    #[test]
+    fn unknown_generation_warning_dedupes_by_session_generation_and_content() {
+        let warnings = UnknownGenerationWarningCache::default();
+        assert!(warnings.should_warn("sid-a", 3, 8, 101, 55));
+        assert!(
+            !warnings.should_warn("sid-a", 3, 8, 101, 55),
+            "同一 session/代际/内容只 warn 一次"
+        );
+        assert!(
+            warnings.should_warn("sid-a", 3, 8, 102, 56),
+            "内容变化后重报"
+        );
+        assert!(
+            warnings.should_warn("sid-a", 4, 8, 102, 56),
+            "文件代际变化后重报"
+        );
+        assert!(
+            warnings.should_warn("sid-b", 3, 8, 102, 56),
+            "会话变化后重报"
+        );
+    }
+}
+
+// ===== 集成测试（Task 8）：会话编排流水线（home 注入直调，不触真机 ~/.dsh）=====
+#[cfg(test)]
 mod integration_tests {
     use super::*;
     /// 函数内私有缓存实例：namespace 进程内唯一（原子计数后缀）——registry 是
@@ -546,6 +673,13 @@ mod integration_tests {
             zstd::stream::encode_all(format!("{header_line}\n{events}").as_bytes(), 3).unwrap();
         std::fs::write(sess.join("session.v3.jsonl.zstd"), &frame).unwrap();
         dir
+    }
+
+    fn write_plain_generation(home: &std::path::Path, generation: i64) {
+        let dir = home.join("sessions/--tmp-proj--/session-abc");
+        let header =
+            "{\"type\":\"session\",\"version\":3,\"id\":\"session-abc\",\"cwd\":\"/tmp/proj\"}\n";
+        std::fs::write(dir.join(format!("session.v{generation}.jsonl")), header).unwrap();
     }
 
     fn fake_host() -> AgentProcess {
@@ -628,6 +762,124 @@ mod integration_tests {
         assert!(
             std::sync::Arc::ptr_eq(&second, &third),
             "其他实例的逐出不得影响本实例的缓存命中"
+        );
+    }
+
+    #[test]
+    fn hot_generation_path_cache_reduces_enumeration_and_records_stat_count() {
+        let home = make_home(
+            "{\"type\":\"turn/start\",\"seq\":4,\"data\":{}}\n\
+             {\"type\":\"turn/end\",\"seq\":6,\"data\":{\"reason\":{\"kind\":\"completed\"}}}\n",
+        );
+        let path_cache = log::GenerationPathCache::default();
+        let scan = test_scan();
+        let host = fake_host();
+        TEST_GENERATION_STAT_CALLS.with(|c| c.set(0));
+
+        let first = scan_sessions_with_path_cache(home.path(), &host, &scan, &path_cache);
+        assert_eq!(first.len(), 1);
+        let first_stat_count = TEST_GENERATION_STAT_CALLS.with(std::cell::Cell::get);
+        let second = scan_sessions_with_path_cache(home.path(), &host, &scan, &path_cache);
+        let hot_stat_count = TEST_GENERATION_STAT_CALLS.with(std::cell::Cell::get);
+
+        assert_eq!(second.len(), 1);
+        assert_eq!(
+            path_cache.enumeration_count(),
+            1,
+            "两轮热扫只枚举一次代际目录"
+        );
+        assert_eq!(first_stat_count, 1);
+        assert_eq!(
+            hot_stat_count, 2,
+            "每轮仍 stat 最新代际，维持 L3 预过滤真实性"
+        );
+        assert!(
+            path_cache.enumeration_count() < 2,
+            "相同工作量的未缓存基线会枚举两次"
+        );
+    }
+
+    #[test]
+    fn generation_discovery_respects_active_and_idle_scan_intervals() {
+        let home = make_home(
+            "{\"type\":\"turn/start\",\"seq\":4,\"data\":{}}\n\
+             {\"type\":\"turn/end\",\"seq\":6,\"data\":{\"reason\":{\"kind\":\"completed\"}}}\n",
+        );
+        let path_cache = log::GenerationPathCache::default();
+        let scan = test_scan();
+        let host = fake_host();
+        let base = std::time::Instant::now();
+
+        scan_sessions_with_path_cache_at(home.path(), &host, &scan, &path_cache, base);
+        assert_eq!(
+            TEST_SELECTED_GENERATION_VERSION.with(std::cell::Cell::get),
+            Some(3)
+        );
+        write_plain_generation(home.path(), 4);
+
+        scan_sessions_with_path_cache_at(
+            home.path(),
+            &host,
+            &scan,
+            &path_cache,
+            base + std::time::Duration::from_secs(2),
+        );
+        assert_eq!(
+            TEST_SELECTED_GENERATION_VERSION.with(std::cell::Cell::get),
+            Some(3),
+            "Active 2s scan may hit the live path index before its 2.5s TTL"
+        );
+        scan_sessions_with_path_cache_at(
+            home.path(),
+            &host,
+            &scan,
+            &path_cache,
+            base + std::time::Duration::from_secs(4),
+        );
+        assert_eq!(
+            TEST_SELECTED_GENERATION_VERSION.with(std::cell::Cell::get),
+            Some(4),
+            "the next Active scan after the 2.5s refresh deadline must discover v4"
+        );
+
+        write_plain_generation(home.path(), 5);
+        scan_sessions_with_path_cache_at(
+            home.path(),
+            &host,
+            &scan,
+            &path_cache,
+            base + std::time::Duration::from_secs(14),
+        );
+        assert_eq!(
+            TEST_SELECTED_GENERATION_VERSION.with(std::cell::Cell::get),
+            Some(5),
+            "Idle 10s polling naturally crosses the TTL and discovers v5 on its next scan"
+        );
+        assert_eq!(path_cache.enumeration_count(), 3);
+    }
+
+    #[test]
+    fn broken_generation_content_can_recover_without_path_reenumeration() {
+        let home = make_home_timed("session-recovery", chrono::Utc::now().timestamp_millis());
+        let session_dir = home.path().join("sessions/--tmp-proj--/session-recovery");
+        let (_, generation_path) = log::generation_logs(&session_dir).pop().unwrap();
+        let path_cache = log::GenerationPathCache::default();
+        let scan = test_scan();
+        let host = fake_host();
+        std::fs::write(&generation_path, b"broken").unwrap();
+        assert!(scan_sessions_with_path_cache(home.path(), &host, &scan, &path_cache).is_empty());
+        let enum_after_failure = path_cache.enumeration_count();
+
+        let valid = "{\"type\":\"session\",\"version\":3,\"id\":\"session-recovery\",\"cwd\":\"/tmp/proj\"}\n{\"type\":\"turn/end\",\"seq\":2,\"data\":{\"reason\":{\"kind\":\"completed\"}}}\n";
+        let frame = zstd::stream::encode_all(valid.as_bytes(), 3).unwrap();
+        std::fs::write(&generation_path, frame).unwrap();
+        let recovered = scan_sessions_with_path_cache(home.path(), &host, &scan, &path_cache);
+
+        assert_eq!(recovered.len(), 1, "文件内容修复后 L2 缓存失效并恢复出卡");
+        assert_eq!(
+            path_cache.enumeration_count(),
+            enum_after_failure,
+            "修复同一路径的文件不需重枚举目录"
         );
     }
 
@@ -799,6 +1051,7 @@ mod integration_tests {
             form: ProcessForm::App,
             jump_supported: true,
             unread: false,
+            unread_turned_green_at_ms: None,
         };
         let cards = vec![(100, mk("old")), (300, mk("new")), (200, mk("mid"))];
         let out = take_recent(cards, 2);

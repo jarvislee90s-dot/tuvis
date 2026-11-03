@@ -752,15 +752,28 @@ async fn cached_session_bridge(
     tx: tokio::sync::watch::Sender<Vec<crate::services::codex_desktop_ipc::types::ThreadKey>>,
     mut stop: tokio::sync::watch::Receiver<bool>,
 ) {
-    let mut sessions = crate::adapter::subscribe_cached_sessions();
     let Some(mut changes) = gate.subscribe() else {
         return;
     };
+    // scan_bus 无 watch 通道：以 2 秒轮询版本号驱动，快照变化时重算身份列。
+    let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
+    let mut last_version = crate::adapter::scan_bus::version();
     loop {
         if *stop.borrow() {
             return;
         }
         if let Some(permit) = gate.permit() {
+            let version = crate::adapter::scan_bus::version();
+            if version == last_version {
+                // 快照未变：跳过重算，直接进入等待。
+                tokio::select! {
+                    changed=stop.changed()=>if changed.is_err() {return},
+                    changed=changes.changed()=>if changed.is_err() {return},
+                    _=tick.tick()=>{},
+                }
+                continue;
+            }
+            last_version = version;
             let observed = tokio::task::spawn_blocking(|| {
                 let Some(ids) = crate::adapter::cached_codex_app_ids() else {
                     return Vec::new();
@@ -805,7 +818,7 @@ async fn cached_session_bridge(
         tokio::select! {
             changed=stop.changed()=>if changed.is_err() {return},
             changed=changes.changed()=>if changed.is_err() {return},
-            changed=sessions.changed()=>if changed.is_err() {return},
+            _=tick.tick()=>{},
         }
     }
 }

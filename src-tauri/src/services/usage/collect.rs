@@ -12,6 +12,17 @@
 //! * 采集在**后台线程**执行（调用方 `spawn_blocking` / `spawn_initial_collection`），
 //!   绝不进 3 秒轮询（GC 3/5）。
 //!
+//! ## F7 可见性采集门闩与统一完成事件（2026-10-31 整改）
+//! * **可见性触发**走 `collect_visible()`（IPC `usage_collect_visible`）：跨 WebView 共用一把
+//!   `VISIBLE_GATE`，60s 窗口内直接复用上次真扫结果（**零扫描**）；同时到达的可见性调用在
+//!   同一门闩上等待、拿同一次结果（合并为一次重型采集）。手动采集**不经**该门闩，因此
+//!   **总是执行**；任何一次真扫（含手动）结束后都会刷新该窗口，避免「手动之后马上又被可见性
+//!   触发一遍」。全失败的扫描不写回窗口（下一次可见触发可立即重试），panic 由释放护栏清位。
+//! * **统一完成事件**：`collect_with` 的 runner 返回后（= 真实扫描完成处）emit 一次
+//!   `usage-collected`（载荷 `collectedAt / success / newRecords / sources`），**0 条新记录也发**；
+//!   缓存复用（窗口内 / 最小间隔内直接返回）**不发**。可见 / 手动 / ticker / 启动采集四条
+//!   入口因此共用同一个事件，ticker 不再自己条件 emit。
+//!
 //! ## ⚠️ 锁序铁律（评审 Critical A：ABBA 死锁，**不得回退**）
 //! **`COLLECT_FLIGHT` 的任何临界区内不得获取 `DB` 锁**（也不得执行整轮扫描——扫描会走
 //! `dao::usage::load_cursors` / `ledger::apply_delta` / `ledger::purge_expired`，全都取 `DB`）。
@@ -42,6 +53,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 use once_cell::sync::Lazy;
 
@@ -396,9 +408,10 @@ pub fn run_collection(now_ms: i64) -> UsageCollectResult {
 struct Flight {
     /// 正在扫描（单飞互斥点；等待者用 `Condvar` 睡在这一位上）
     in_flight: bool,
-    /// 上次**真扫**的结果与时刻（最小间隔的锚点 = 上次真扫时刻，**不是**上次调用时刻）
+    /// 上次**真扫**的结果
     last: Option<UsageCollectResult>,
-    last_at_ms: i64,
+    /// 上次真实扫描完成的单调时刻；缓存复用不更新
+    last_completed_at: Option<Instant>,
 }
 
 /// 单飞互斥 + 最小间隔判定。**锁序铁律（评审 Critical A）**：本锁的临界区内**不得**获取
@@ -415,6 +428,83 @@ static COLLECT_CALLS: AtomicUsize = AtomicUsize::new(0);
 /// → 「持 `DB` 锁的查询路径调 `cached_result()`」与「飞行中的采集」之间不再有任何等待关系
 /// （这正是把 ABBA 环路拆掉的那一刀）。锁：`cached_result_never_blocks_behind_an_in_flight_scan`。
 static LAST_RESULT: Lazy<Mutex<Option<UsageCollectResult>>> = Lazy::new(|| Mutex::new(None));
+
+/// 可见性采集的 60s 窗口（F7：跨 WebView / 跨入口统一去抖）。
+const VISIBLE_WINDOW: Duration = Duration::from_secs(60);
+
+/// 可见性采集门闩（F7，「可见即采」的**唯一**协调点）。
+///
+/// 与 `COLLECT_FLIGHT` **刻意分开**：后者守最小间隔 + 单飞，服务手动 / ticker / 启动采集；
+/// 本门闩只守可见性入口。分开才能同时满足「手动采集总是执行」与「可见性 60s 内不重扫」。
+///
+/// 纪律与飞行锁同款：`in_flight` 只作占位与合并谓词，**扫描期间这把锁必须已释放**
+/// （`runner` 会取 `DB`）；等待者用 `Condvar` 睡在 `in_flight` 上，醒来后重新判定窗口。
+/// `last` 记的是「上次**真扫**完成的时刻 + 结果」，锚点是完成时刻（不是调用时刻）。
+#[derive(Default)]
+struct VisibleGate {
+    in_flight: bool,
+    last: Option<(Instant, UsageCollectResult)>,
+}
+
+static VISIBLE_GATE: Lazy<(Mutex<VisibleGate>, Condvar)> =
+    Lazy::new(|| (Mutex::new(VisibleGate::default()), Condvar::new()));
+
+/// 可见性门闩的释放护栏：扫描 panic 时也必须清位并唤醒等待者，否则一次 panic 就把
+/// 「可见即采」永久卡死（与 `FlightGuard` 同款理由）。失败**不写回窗口** → 下一次可重试。
+struct VisibleGateGuard;
+
+impl Drop for VisibleGateGuard {
+    fn drop(&mut self) {
+        let (lock, cvar) = &*VISIBLE_GATE;
+        {
+            let mut st = lock.lock().unwrap_or_else(|e| e.into_inner());
+            st.in_flight = false;
+        } // 谓词变更在锁内，再唤醒（避免丢失唤醒）
+        cvar.notify_all();
+    }
+}
+
+/// 本轮结果是否值得写回可见性窗口。
+/// * 总开关关闭（零源，未真扫）→ 值得：本来就是「不采集」的如实结果，缓存 60s 无害；
+/// * 部分源失败 → 值得：否则某个长期失败的源会让每次「可见」都重扫一遍；
+/// * **全部源失败** → 不值得：下一次可见触发必须能立刻重试（失败不得锁死窗口）。
+fn scan_worth_caching(result: &UsageCollectResult) -> bool {
+    result.sources.is_empty() || result.sources.iter().any(|s| s.ok)
+}
+
+/// 任何**真实扫描**结束后刷新可见性窗口：手动 / ticker / 启动采集之后 60s 内，可见性触发
+/// 直接复用这次结果（手动采集后不会紧接着再被可见性触发一遍）。
+fn remember_real_scan(result: &UsageCollectResult, completed_at: Instant) {
+    let (lock, _cvar) = &*VISIBLE_GATE;
+    let mut st = lock.lock().unwrap_or_else(|e| e.into_inner());
+    st.last = if scan_worth_caching(result) {
+        Some((completed_at, result.clone()))
+    } else {
+        None
+    };
+}
+
+/// `usage-collected` 的统一载荷（纯函数，可单测）：**采集完成即发**，与是否新增记录无关。
+/// `success` = 本轮所有源都成功（零源轮按成功算：它如实完成了「总开关关闭 → 不采集」）。
+fn collected_event_payload(result: &UsageCollectResult) -> serde_json::Value {
+    serde_json::json!({
+        "collectedAt": result.collected_at,
+        "success": result.sources.iter().all(|s| s.ok),
+        "newRecords": result.total_new_records,
+        "sources": result.sources.iter().map(|s| serde_json::json!({
+            "sourceId": s.source_id.db_id(),
+            "ok": s.ok,
+            "newRecords": s.new_records,
+        })).collect::<Vec<_>>(),
+    })
+}
+
+/// 真实扫描完成处（`collect_with` 的 runner 返回后）唯一的广播点；四条入口共用。
+fn emit_collected(result: &UsageCollectResult) {
+    #[cfg(test)]
+    tests::note_emitted_for_test();
+    crate::remote::events::emit_ui("usage-collected", collected_event_payload(result));
+}
 
 /// 飞行位释放护栏：扫描 **panic** 时也必须清位并唤醒等待者，否则单飞永久卡死
 /// （与 `adapter/mod.rs` 的 `ScanFlightGuard` 同款：一次 panic 把「单轮失败」恶化成
@@ -439,10 +529,21 @@ pub fn collect_with(
     now_ms: i64,
     runner: &dyn Fn(i64) -> UsageCollectResult,
 ) -> UsageCollectResult {
+    collect_with_clock(force, now_ms, &Instant::now, runner)
+}
+
+fn collect_with_clock(
+    force: bool,
+    now_ms: i64,
+    clock: &dyn Fn() -> Instant,
+    runner: &dyn Fn(i64) -> UsageCollectResult,
+) -> UsageCollectResult {
     // ① 设置读取放在**取飞行锁之前**：生产构建里 `settings::load()` 会经
     //    `dao::settings::get_setting` 取 `DB` 锁 → 放进临界区就是
     //    `COLLECT_FLIGHT → DB` 这条致命序的第二个实例（模块文档「锁序铁律」）。
-    let interval_ms = super::settings::load().collect_interval_min.max(1) * 60_000;
+    let interval = Duration::from_secs(
+        super::settings::load().collect_interval_min.clamp(1, 1440) as u64 * 60,
+    );
     let (lock, cvar) = &*COLLECT_FLIGHT;
     let mut st = lock.lock().unwrap_or_else(|e| e.into_inner());
     // ② 单飞：飞行中就让出锁去等（`Condvar::wait` 原子释放锁；等待期间不持任何锁、不取 DB）。
@@ -450,9 +551,13 @@ pub fn collect_with(
     while st.in_flight {
         st = cvar.wait(st).unwrap_or_else(|e| e.into_inner());
     }
+    let monotonic_now = clock();
     if !force {
         if let Some(last) = st.last.clone() {
-            if now_ms.saturating_sub(st.last_at_ms) < interval_ms {
+            if st
+                .last_completed_at
+                .is_some_and(|last_at| monotonic_now.saturating_duration_since(last_at) < interval)
+            {
                 return last; // 不扫描（也不碰 DB：连 settings 都在锁外读过了）
             }
         }
@@ -464,13 +569,20 @@ pub fn collect_with(
     drop(st);
     COLLECT_CALLS.fetch_add(1, Ordering::SeqCst);
     let result = runner(now_ms);
+    let completed_at = clock();
     // ④ 发布：扫描结束、**所有 DB 操作都做完之后**才写回状态（此后等待者醒来即复用）
     {
         let mut st = lock.lock().unwrap_or_else(|e| e.into_inner());
         st.last = Some(result.clone());
-        st.last_at_ms = now_ms; // 锚点 = 本次**真扫**时刻（M-6 锁：滑动窗口抑制会被用例抓住）
+        st.last_completed_at = Some(completed_at);
     }
     *LAST_RESULT.lock().unwrap_or_else(|e| e.into_inner()) = Some(result.clone());
+    super::ticker::notify_scheduler();
+    // ⑤ F7：真实扫描完成 → 刷新可见性窗口（手动/退避真扫之后 60s 内可见性触发直接复用）
+    remember_real_scan(&result, completed_at);
+    // ⑥ F7：真实扫描完成 → 统一广播（0 条新记录也发；缓存复用在上面已 return，不发）。
+    //    发布区先写入，前端收到事件后重查时能读到本轮结果（查询以账本为准，这里只是次序稳妥）。
+    emit_collected(&result);
     result
 }
 
@@ -493,6 +605,47 @@ pub fn collect(force: bool) -> UsageCollectResult {
     collect_with(force, super::now_ms(), &run_collection)
 }
 
+/// 可见性触发的**可注入内核**（生产入口 `collect_visible`；单测传替身 → 零 DB）。
+///
+/// 语义（F7 §5.1/§5.2）：
+/// 1. 60s 窗口内（按**上次真扫完成时刻**算）直接返回缓存结果，**不扫描**；
+/// 2. 窗口外执行一次 `runner`；扫描期间其他可见性调用睡在同一门闩上，醒来后拿到同一次结果
+///    ——同时到达的请求合并为一次重型采集（跨 WebView 天然成立，门闩是进程级的）；
+/// 3. 扫描 panic 由 `VisibleGateGuard` 清位并唤醒等待者，下一次调用可重试；
+/// 4. 全失败的扫描不写回窗口（下一次可立即重试），部分失败照常缓存 60s。
+pub fn collect_visible_with(
+    now: Instant,
+    runner: &dyn Fn() -> UsageCollectResult,
+) -> UsageCollectResult {
+    let (lock, cvar) = &*VISIBLE_GATE;
+    let mut st = lock.lock().unwrap_or_else(|e| e.into_inner());
+    loop {
+        if !st.in_flight {
+            if let Some((at, result)) = &st.last {
+                if now.saturating_duration_since(*at) < VISIBLE_WINDOW {
+                    return result.clone(); // 窗口内：零扫描
+                }
+            }
+            break;
+        }
+        // 单飞：扫描在途 → 让出锁等待（`Condvar::wait` 原子释放锁），醒来重新判定窗口。
+        st = cvar.wait(st).unwrap_or_else(|e| e.into_inner());
+    }
+    st.in_flight = true;
+    let _gate_guard = VisibleGateGuard;
+    drop(st); // **扫描必须在锁外跑**（runner 会取 DB）；护栏从占位那一刻就挂上
+    let result = runner();
+    remember_real_scan(&result, Instant::now());
+    result
+}
+
+/// 可见性触发（IPC `usage_collect_visible` 的唯一后端入口）：
+/// 设置分区 / 大看板 / 浮窗变得可见时调用，走 60s 门闩 + 跨 WebView 单飞。
+/// 生产路径的 `runner` = `collect(true)`（强制真扫，绕过最小间隔窗口；失败拒绝闸仍在 `collect` 内）。
+pub fn collect_visible() -> UsageCollectResult {
+    collect_visible_with(Instant::now(), &|| collect(true))
+}
+
 /// 最近一次采集结果。**只读 `LAST_RESULT`**（短暂持锁 clone）——**不触碰飞行锁**，
 /// 所以查询层可以「先持 `DB` 锁、再调本函数」（Task 19 的 `usage_records` 就是这么写的），
 /// 不会与飞行中的采集构成 ABBA（评审 Critical A）。
@@ -503,6 +656,15 @@ pub fn cached_result() -> Option<UsageCollectResult> {
         .clone()
 }
 
+/// 最近一次真实采集完成时刻；ticker 以同一单调锚点计算下个截止时间。
+pub(crate) fn last_real_scan_completed_at() -> Option<Instant> {
+    COLLECT_FLIGHT
+        .0
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .last_completed_at
+}
+
 /// 采集轮次计数（**「采集不进入 3 秒轮询」的可执行断言**：会话扫描后它必须仍为 0）。
 /// 原子量：**不取任何锁**（否则又是 `COLLECT_FLIGHT → DB` 那条序的入口）。
 pub fn collect_calls() -> usize {
@@ -511,7 +673,7 @@ pub fn collect_calls() -> usize {
 
 /// 单测专用：复位单飞状态（评审 C5）。`COLLECT_FLIGHT` / `LAST_RESULT` / `COLLECT_CALLS`
 /// 都是**进程级**全局量，三个用例（最小间隔 / 并发单飞 / 总开关）共享它们 → 不隔离就会
-/// 间歇性互相串味（典型交错：`concurrent…` 把 `last_at_ms` 置为 2e12，`min_interval…` 的
+/// 间歇性互相串味（典型交错：并发用例留下完成时刻，最小间隔用例误用为自己的锚点 → 拿到
 /// `saturating_sub` 饱和成 0 → 拿到**另一个用例的结果**）。
 /// 每个用例持有 `tests::TEST_LOCK` 后调用本函数，即可保证各自从零态开始。
 #[cfg(test)]
@@ -523,6 +685,13 @@ pub fn reset_state_for_test() {
     }
     *LAST_RESULT.lock().unwrap_or_else(|e| e.into_inner()) = None;
     COLLECT_CALLS.store(0, Ordering::SeqCst);
+    // F7：可见性门闩与事件计数也是进程级全局量（并发/窗口用例共享）→ 一并复位
+    {
+        let (lock, _cvar) = &*VISIBLE_GATE;
+        let mut st = lock.lock().unwrap_or_else(|e| e.into_inner());
+        *st = VisibleGate::default();
+    }
+    tests::EMITTED_EVENTS.store(0, Ordering::SeqCst);
 }
 
 /// 应用启动一次（Task 20 在 lib.rs setup 调用；延迟 3s 避开启动高峰，失败只 warn）
@@ -543,7 +712,7 @@ pub fn spawn_initial_collection() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex, MutexGuard};
     // **必须显式导入设置层**（本轮自查额外发现①，§3.2.3）：`use super::*` 只带进
     // `collect.rs` 自己 `use` 进来的名字，兄弟模块 `settings` 与其类型/函数不在其中——
@@ -597,6 +766,33 @@ mod tests {
     /// 设置 / 复位 fixture 根。要真跑采集的用例必须先调它（传一个**临时目录**）。
     pub(super) fn set_fixture_home(home: Option<PathBuf>) {
         *FIXTURE_HOME.lock().unwrap_or_else(|e| e.into_inner()) = home;
+    }
+
+    /// **F7 事件广播计数**：`emit_collected` 在 `cfg(test)` 下打点（生产构建零开销）。
+    /// 用途：断言「真实扫描发事件、缓存复用不发」——`emit_ui` 在无 AppHandle 的 lib 单测里
+    /// 是静默的，没有计数点就分不清到底有没有走广播路径。
+    pub(super) static EMITTED_EVENTS: AtomicUsize = AtomicUsize::new(0);
+
+    pub(super) fn note_emitted_for_test() {
+        EMITTED_EVENTS.fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub(super) fn emitted_events_for_test() -> usize {
+        EMITTED_EVENTS.load(Ordering::SeqCst)
+    }
+
+    fn source_status(ok: bool, records: i64) -> UsageSourceStatus {
+        UsageSourceStatus {
+            source_id: UsageSourceId::Claude,
+            ok,
+            parsed_files: 1,
+            new_records: records,
+            error_code: if ok {
+                None
+            } else {
+                Some("usage-source-io".to_string())
+            },
+        }
     }
 
     /// **fixture 根的 Drop 守卫**（Task 16 修复轮 1 / Minor 3）：把它从「手工复位的纪律」变成
@@ -728,6 +924,224 @@ mod tests {
         reset_state_for_test();
     }
 
+    /// **F7 §5.1 锁**：可见性采集 60s 窗口内只扫描一次；越过窗口必须重扫。
+    /// 时钟由 `collect_visible_with(now, …)` 注入 → 不真等 60s。
+    #[test]
+    fn visible_collect_scans_once_within_the_window_and_rescans_after_it() {
+        let _g = exclusive();
+        reset_state_for_test();
+        settings::set_override_for_test(Some(UsageSettings {
+            collect_interval_min: 10,
+            ..Default::default()
+        }));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = calls.clone();
+        let runner = move || {
+            c.fetch_add(1, Ordering::SeqCst);
+            fake_result(42)
+        };
+        let base = Instant::now();
+        let first = collect_visible_with(base, &runner);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        // 30s 后再次可见：窗口内 → 复用，不扫描
+        let second = collect_visible_with(base + Duration::from_secs(30), &runner);
+        assert_eq!(first, second, "窗口内必须复用同一次结果");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "60s 窗口内的第二次可见性触发不得重扫（F7 跨 WebView 去抖）"
+        );
+        // 越过 60s：重扫
+        let third = collect_visible_with(base + Duration::from_secs(61), &runner);
+        assert_eq!(third.collected_at, 42);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "距上次真扫满 60s 的可见性触发必须重扫"
+        );
+        settings::set_override_for_test(None);
+        reset_state_for_test();
+    }
+
+    /// **F7 §5.2 锁**：同时到达的可见性调用（模拟两个 WebView）合并为一次重型采集。
+    #[test]
+    fn simultaneous_visible_calls_share_one_scan() {
+        let _g = exclusive();
+        reset_state_for_test();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = calls.clone();
+        let runner = Arc::new(move || {
+            c.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(50));
+            fake_result(7)
+        });
+        let base = Instant::now();
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                let r = runner.clone();
+                std::thread::spawn(move || collect_visible_with(base, r.as_ref()))
+            })
+            .collect();
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "并发可见性触发只能扫 1 次（跨 WebView 单飞）"
+        );
+        assert!(
+            results.iter().all(|r| *r == results[0]),
+            "同时到达的调用必须拿到同一次结果"
+        );
+        reset_state_for_test();
+    }
+
+    /// **F7 §5.2 锁**：手动采集总是执行，且结束后刷新可见性窗口（之后 60s 内可见性触发不重扫）。
+    #[test]
+    fn a_real_manual_scan_suppresses_the_visible_trigger_for_60s() {
+        let _g = exclusive();
+        reset_state_for_test();
+        settings::set_override_for_test(Some(UsageSettings {
+            collect_interval_min: 10,
+            ..Default::default()
+        }));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = calls.clone();
+        let runner = move |now: i64| {
+            c.fetch_add(1, Ordering::SeqCst);
+            fake_result(now)
+        };
+        // 手动（force=true）总是扫描
+        let manual = collect_with(true, 1_000, &runner);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        // 手动后 30s 内的可见性触发：窗口已被手动真扫刷新 → 不重扫
+        let visible_calls = calls.clone();
+        let visible = collect_visible_with(Instant::now() + Duration::from_secs(30), &move || {
+            visible_calls.fetch_add(1, Ordering::SeqCst);
+            fake_result(9_999)
+        });
+        assert_eq!(
+            (visible.collected_at, calls.load(Ordering::SeqCst)),
+            (manual.collected_at, 1),
+            "手动真扫后 60s 内可见性触发必须复用，不得再扫一遍"
+        );
+        // 越过窗口：恢复扫描
+        let later_calls = calls.clone();
+        let _ = collect_visible_with(Instant::now() + Duration::from_secs(61), &move || {
+            later_calls.fetch_add(1, Ordering::SeqCst);
+            fake_result(10_000)
+        });
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "越过 60s 后可见性触发必须重新扫描"
+        );
+        settings::set_override_for_test(None);
+        reset_state_for_test();
+    }
+
+    /// **F7 §5.2 锁**：全失败的扫描不写回窗口 → 下一次可见触发可立即重试（失败不锁死）。
+    #[test]
+    fn a_failed_visible_scan_is_not_cached_so_the_next_call_retries() {
+        let _g = exclusive();
+        reset_state_for_test();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = calls.clone();
+        let broken = move || {
+            c.fetch_add(1, Ordering::SeqCst);
+            UsageCollectResult {
+                collected_at: 100,
+                duration_ms: 1,
+                sources: vec![source_status(false, 0)],
+                total_new_records: 0,
+            }
+        };
+        let base = Instant::now();
+        let first = collect_visible_with(base, &broken);
+        assert!(!first.sources.iter().any(|s| s.ok));
+        // 1s 后（仍在 60s 窗口内）再次可见：失败结果不得被缓存 → 必须重试
+        let _ = collect_visible_with(base + Duration::from_secs(1), &broken);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "全失败的扫描不得写回 60s 窗口，下一次可见触发必须能立即重试"
+        );
+        reset_state_for_test();
+    }
+
+    /// **F7 §5.2 锁**：可见性扫描 panic 时门闩必须释放（否则「可见即采」永久卡死）。
+    #[test]
+    fn a_panicking_visible_scan_releases_the_gate() {
+        let _g = exclusive();
+        reset_state_for_test();
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            collect_visible_with(Instant::now(), &|| panic!("模拟可见性扫描 panic"))
+        }));
+        assert!(
+            caught.is_err(),
+            "本腿必须真的 panic（否则测的不是恢复路径）"
+        );
+        // panic 之后：下一次可见触发必须能进锁并正常扫描
+        let r = collect_visible_with(Instant::now() + Duration::from_secs(1), &|| fake_result(9));
+        assert_eq!(r.collected_at, 9, "panic 后门闩必须已释放（下一次可重试）");
+        reset_state_for_test();
+    }
+
+    /// **F7 §5.3 锁**：事件载荷 = 采集完成信号，**与是否新增记录无关**；`success` 逐源判定。
+    #[test]
+    fn collected_event_reports_completion_even_without_new_records() {
+        let mut result = fake_result(1_700_000_000_000);
+        result.sources = vec![source_status(true, 0)];
+        let v = collected_event_payload(&result);
+        assert_eq!(v["collectedAt"], 1_700_000_000_000i64);
+        assert_eq!(v["success"], true);
+        assert_eq!(v["newRecords"], 0, "0 条新记录仍必须发事件");
+        assert_eq!(v["sources"][0]["sourceId"], "claude");
+        assert_eq!(v["sources"][0]["ok"], true);
+        assert_eq!(v["sources"][0]["newRecords"], 0);
+        // 部分失败：事件仍发，但 success=false（失败如实上报）
+        result.sources[0].ok = false;
+        result.sources[0].error_code = Some("usage-source-io".into());
+        assert_eq!(collected_event_payload(&result)["success"], false);
+    }
+
+    /// **F7 §5.3 锁**：真实扫描发一次事件；缓存复用（窗口内 / 最小间隔内）**不发**。
+    #[test]
+    fn real_scans_emit_exactly_once_while_cached_reuse_emits_nothing() {
+        let _g = exclusive();
+        reset_state_for_test();
+        settings::set_override_for_test(Some(UsageSettings {
+            collect_interval_min: 10,
+            ..Default::default()
+        }));
+        let runner = |now: i64| fake_result(now);
+        let revision_before_scan = super::super::ticker::scheduler_revision_for_test();
+        collect_with(true, 1_000, &runner); // 真扫 → 1 次事件
+        let revision_after_scan = super::super::ticker::scheduler_revision_for_test();
+        assert!(
+            revision_after_scan > revision_before_scan,
+            "真实采集应唤醒 ticker"
+        );
+        assert_eq!(emitted_events_for_test(), 1);
+        collect_with(false, 2_000, &runner); // 最小间隔内复用 → 不扫、不发
+        assert_eq!(
+            super::super::ticker::scheduler_revision_for_test(),
+            revision_after_scan,
+            "缓存复用不得当作真实采集唤醒 ticker"
+        );
+        assert_eq!(
+            emitted_events_for_test(),
+            1,
+            "缓存复用（未真扫）不得发 usage-collected"
+        );
+        // 可见性窗口内复用同样不发
+        let _ = collect_visible_with(Instant::now() + Duration::from_secs(5), &|| {
+            fake_result(3_000)
+        });
+        assert_eq!(emitted_events_for_test(), 1);
+        settings::set_override_for_test(None);
+        reset_state_for_test();
+    }
+
     /// 契约 §3：`force=false` 且距上次采集小于 `collectIntervalMin` → **直接返回上次结果（不扫描）**
     #[test]
     fn min_interval_reuses_last_result_without_scanning() {
@@ -743,15 +1157,21 @@ mod tests {
             c.fetch_add(1, Ordering::SeqCst);
             fake_result(now)
         };
+        let clock_ms = Arc::new(AtomicU64::new(0));
+        let clock_reader = clock_ms.clone();
+        let clock_base = Instant::now();
+        let clock = move || clock_base + Duration::from_millis(clock_reader.load(Ordering::SeqCst));
         let t0 = 1_000_000_000_000i64;
-        let a = collect_with(true, t0, &runner); // force 必扫（锚点 = t0）
-        let b = collect_with(false, t0 + 60_000, &runner); // 1 分钟后：仍在 10 分钟窗口内
-                                                           // **M-6（评审）**：窗口锚点必须是**上次真扫时刻**，不是「上次调用时刻」。
-                                                           // 只喂「1 分钟 → 11 分钟」这种跳变锁不住它：把 `st.last_at_ms = now_ms` 挪进复用分支
-                                                           // （= 滑动窗口抑制：每次复用都把窗口往前推）在旧断言下**仍绿**。
-                                                           // 所以这里在窗口内**连续探两次**（1min 已探过，再探 9min），再探**恰好 t0+10min**：
-                                                           // 锚点若被滑动到 t0+9min，最后一次就该「复用」而不是重扫 → 下面 calls==2 立刻红。
-        let b9 = collect_with(false, t0 + 9 * 60_000, &runner);
+        let a = collect_with_clock(true, t0, &clock, &runner); // force 必扫（单调锚点 = t0）
+        clock_ms.store(60_000, Ordering::SeqCst);
+        let b = collect_with_clock(false, t0 + 60_000, &clock, &runner); // 1 分钟后：仍在窗口内
+                                                                         // **M-6（评审）**：窗口锚点必须是**上次真扫时刻**，不是「上次调用时刻」。
+                                                                         // 只喂「1 分钟 → 11 分钟」这种跳变锁不住它：把 `last_completed_at = clock()` 挪进
+                                                                         // 复用分支（= 滑动窗口抑制：每次复用都把窗口往前推）在旧断言下**仍绿**。
+                                                                         // 所以这里在窗口内**连续探两次**（1min 已探过，再探 9min），再探**恰好 t0+10min**：
+                                                                         // 锚点若被滑动到 t0+9min，最后一次就该「复用」而不是重扫 → 下面 calls==2 立刻红。
+        clock_ms.store(9 * 60_000, Ordering::SeqCst);
+        let b9 = collect_with_clock(false, t0 + 9 * 60_000, &clock, &runner);
         assert_eq!(
             b9, a,
             "窗口内两次调用都必须复用同一次结果（滑动窗口抑制会在这里露馅）"
@@ -761,7 +1181,8 @@ mod tests {
             1,
             "窗口内连续调用（1min / 9min）都不得重扫：锚点是上次真扫时刻 t0"
         );
-        let c = collect_with(false, t0 + 10 * 60_000, &runner); // 恰好 t0+10min：超窗口，重扫
+        clock_ms.store(10 * 60_000, Ordering::SeqCst);
+        let c = collect_with_clock(false, t0 + 10 * 60_000, &clock, &runner); // 满 10 分钟：重扫
         assert_eq!(
             calls.load(Ordering::SeqCst),
             2,
@@ -769,9 +1190,82 @@ mod tests {
         );
         assert_eq!(a, b, "窗口内必须复用上次结果（同一对象语义）");
         assert_ne!(b, c);
-        let d = collect_with(true, t0 + 11 * 60_000 + 1000, &runner);
+        clock_ms.store(11 * 60_000 + 1000, Ordering::SeqCst);
+        let d = collect_with_clock(true, t0 + 11 * 60_000 + 1000, &clock, &runner);
         assert_eq!(calls.load(Ordering::SeqCst), 3, "force=true 无视最小间隔");
         assert_eq!(d.collected_at, t0 + 11 * 60_000 + 1000);
+        settings::set_override_for_test(None);
+        reset_state_for_test();
+    }
+
+    #[test]
+    fn ticker_anchor_tracks_real_completion_and_ignores_cached_reuse() {
+        let _g = exclusive();
+        reset_state_for_test();
+        settings::set_override_for_test(Some(UsageSettings {
+            collect_interval_min: 10,
+            ..Default::default()
+        }));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = calls.clone();
+        let clock_ms = Arc::new(AtomicU64::new(0));
+        let clock_reader = clock_ms.clone();
+        let clock_base = Instant::now();
+        let clock = move || clock_base + Duration::from_millis(clock_reader.load(Ordering::SeqCst));
+        let runner_clock = clock_ms.clone();
+        let runner = move |now: i64| {
+            c.fetch_add(1, Ordering::SeqCst);
+            if runner_clock.load(Ordering::SeqCst) == 0 {
+                runner_clock.store(3 * 60_000, Ordering::SeqCst);
+            }
+            fake_result(now)
+        };
+
+        collect_with_clock(true, 1_000_000, &clock, &runner);
+        assert_eq!(
+            last_real_scan_completed_at(),
+            Some(clock_base + Duration::from_secs(3 * 60))
+        );
+
+        clock_ms.store(12 * 60_000, Ordering::SeqCst);
+        collect_with_clock(false, 1_000_000 + 12 * 60_000, &clock, &runner);
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "9 分钟仅复用缓存");
+        assert_eq!(
+            last_real_scan_completed_at(),
+            Some(clock_base + Duration::from_secs(3 * 60)),
+            "缓存复用不得移动真实扫描锚点"
+        );
+
+        clock_ms.store(15 * 60_000, Ordering::SeqCst);
+        collect_with_clock(false, 1_000_000 + 15 * 60_000, &clock, &runner);
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "t=15 分钟应开始第二次真采");
+        settings::set_override_for_test(None);
+        reset_state_for_test();
+    }
+
+    #[test]
+    fn minimum_interval_ignores_wall_clock_jumps() {
+        let _g = exclusive();
+        reset_state_for_test();
+        settings::set_override_for_test(Some(UsageSettings {
+            collect_interval_min: 10,
+            ..Default::default()
+        }));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = calls.clone();
+        let runner = move |now: i64| {
+            c.fetch_add(1, Ordering::SeqCst);
+            fake_result(now)
+        };
+
+        collect_with(true, 1_000_000, &runner);
+        collect_with(false, 1_000_000 + 60 * 60_000, &runner);
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "墙钟前拨或后拨不得绕过单调最小间隔"
+        );
         settings::set_override_for_test(None);
         reset_state_for_test();
     }
@@ -1742,9 +2236,9 @@ mod tests {
         );
     }
 
-    /// 自省锁的**扫描面**：`services/usage/**/*.rs` **全部 37 个文件**。
-    /// 与磁盘**逐一对账**见 `usage_source_scan_covers_every_file_on_disk`（防第 38 个文件静默逃逸）。
-    const USAGE_SOURCES: [(&str, &str); 37] = [
+    /// 自省锁的**扫描面**：`services/usage/**/*.rs` **全部 38 个文件**。
+    /// 与磁盘**逐一对账**见 `usage_source_scan_covers_every_file_on_disk`（防第 39 个文件静默逃逸）。
+    const USAGE_SOURCES: [(&str, &str); 38] = [
         ("caps.rs", include_str!("caps.rs")),
         ("collect.rs", include_str!("collect.rs")),
         ("collectors/claude.rs", include_str!("collectors/claude.rs")),
@@ -1775,6 +2269,7 @@ mod tests {
         ("semantics.rs", include_str!("semantics.rs")),
         ("settings.rs", include_str!("settings.rs")),
         ("stream.rs", include_str!("stream.rs")),
+        ("ticker.rs", include_str!("ticker.rs")),
         ("v2/billing.rs", include_str!("v2/billing.rs")),
         ("v2/channel.rs", include_str!("v2/channel.rs")),
         ("v2/cost.rs", include_str!("v2/cost.rs")),
@@ -2074,6 +2569,55 @@ mod tests {
     /// 13936/312799 → 13963/313420；源码枚举与排除区标记不变。
     /// 停采锁序修复使 `settings.rs` 判据面 +13 行 / +487 字符，
     /// 13963/313420 → 13976/313907；文件枚举与排除区不变。
+    ///
+    /// **第 49 轮同步（扫描总线计划 Task 8 用量兜底 ticker）**：13936/312799 →
+    /// **13991/313966**（+55 行 / +1167 字符）。变化**只来自新增文件**
+    /// `services/usage/ticker.rs` 的生产半边（兜底 ticker：步长/开关纯函数 + 常驻线程，
+    /// 含 `catch_unwind` 自愈）；其测试模块落在 BEGIN..END 排除区内 ⇒ 不进面。
+    /// 文件数 37 → 38、分类 32/5 → **33/5**（ticker 以测试模块区形态入面）。
+    ///
+    /// **第 50 轮同步（扫描总线计划 Task 8 质量复修：设置读取纳入 `catch_unwind`）**：
+    /// 13991/313966 → **14001/314132**（+10 行 / +166 字符）。变化**只来自**
+    /// `services/usage/ticker.rs` 生产半边：新增 `protected_interval_min()`（设置读取的
+    /// panic 安全包装），启动日志与每轮步长读取均改走该包装；文件数、分类与排除区
+    /// 标记均未动。
+    ///
+    /// **第 51 轮同步（PR #191 整改 Task 4：F7 可见性采集 + 统一完成事件）**：
+    /// 14001/314132 → **14093/316242**（+92 行 / +2110 字符）。变化来自：
+    ///   * `collect.rs` 生产半边：`VISIBLE_WINDOW` / `VisibleGate` / `VISIBLE_GATE` /
+    ///     `VisibleGateGuard` / `scan_worth_caching` / `remember_real_scan` /
+    ///     `collected_event_payload` / `emit_collected` / `collect_visible_with` /
+    ///     `collect_visible`，以及 `collect_with` 末尾的「刷新窗口 + 广播」两拍；
+    ///   * `ticker.rs` 删掉条件 emit（统一广播后不得双发）——负增量已并入上面的净值。
+    ///     新增测试全部落在 BEGIN..END 排除区内 ⇒ 不进面；文件数 38、33/5 分类未动。
+    ///
+    /// **第 52 轮同步（F7 ticker 截止时间重算）**：14093/316242 → **14195/318600**
+    /// （+102 行 / +2358 字符）。变化来自：
+    ///   * `collect.rs` 生产半边：最小间隔锚点改为真实扫描完成 `Instant`，读取该锚点供 ticker
+    ///     调度，并在真实扫描发布后唤醒 ticker；可见性窗口复用同一完成时刻；
+    ///   * `ticker.rs` 生产半边：增加绝对截止函数、revision/Condvar 唤醒、按设置和最新真采
+    ///     时刻重算的等待循环与 panic 退避；
+    ///   * `settings.rs` 生产半边：用量设置写后回读成功时唤醒 ticker。
+    ///     新增测试仍在排除区；文件数 38、33/5 分类和排除标记均未变。
+    ///
+    /// **第 49 轮同步（2026-10-30 WorkBuddy 5.9.3 子代理入账 + 看板在场判据）**：
+    /// 13936/312799 → **14296/319487**（含子代理采集、心跳冻结看板、严格文件定位、身份冲突校验、重扫拒绝、
+    /// 未读通知转绿时间与后续 simplify 收敛）。
+    /// **扫描面只含 `services/usage/**`**（`USAGE_SOURCES` 决定），
+    /// `monitor/workbuddy_parser.rs` / `monitor/host.rs` 的看板改动**不在面内**；本轮的
+    /// 全部增量来自生产半边：
+    ///   * `services/usage/collectors/workbuddy.rs`：`collect_file` 抽取、子代理目录枚举、
+    ///     身份解析（`resolve_subagent_session_id`）与 `WbState.subagent_session_id`、
+    ///     rescan 可观测 warn（I4）、`row_cwd_first` 显式化；
+    ///   * `services/usage/caps.rs`：仅注释（5.9.3 子代理独立入账不改口径）。
+    ///     新增测试全部落在 BEGIN..END 排除区内 ⇒ 不进面；文件数仍为 37、分类与排除区标记均未动。
+    ///
+    /// 合并扫描总线与 WorkBuddy 5.9.3 后，生产面合计 14555 行 / 325288 字符。
+    ///
+    /// **分词器估算分支并入对账（2026-11-03）**：14555/325288 → **14595/326396**
+    /// （+40 行 / +1108 字符）。变化**只来自** `settings.rs` 生产半边两处接缝：
+    /// 正文估算总授权保存缝（+27/+621）与停采锁序保存缝（+13/+487）；
+    /// 文件数、分类与排除区标记未动。
     #[test]
     fn scan_face_size_is_pinned() {
         let (mut lines, mut chars) = (0usize, 0usize);
@@ -2084,11 +2628,10 @@ mod tests {
         }
         assert_eq!(
             (lines, chars),
-            (13976, 313907),
+            (14595, 326396),
             "判据面尺寸变了（实测 {lines} 行 / {chars} 字符）：本用例是**声明 = 实际**的钉子——\
              先弄清面为什么变（新增文件？改了排除区标记？动了生产代码？），再同步本常量、\
-             `no_source_timezone_is_fed_into_any_key_function` 的锁注释、`KNOWN-PLAN-DEFECTS.md` \
-             与 `FINAL-FIX-report.md`"
+             本轮扫描面说明与相关的判据锁注释"
         );
     }
 
@@ -2139,8 +2682,8 @@ mod tests {
             .count();
         assert_eq!(
             (USAGE_SOURCES.len() - empty, empty),
-            (32, 5),
-            "排除区分类应为 **32 个测试模块区 / 5 个空区**（空区 = `caps.rs` / `delta.rs` / \
+            (33, 5),
+            "排除区分类应为 **33 个测试模块区 / 5 个空区**（空区 = `caps.rs` / `delta.rs` / \
              `model.rs` / `v2/model.rs` / `v2/mod.rs`）。改动某文件的\
              排除区形态（加测试模块 / 改成空区）时，必须**同步**本断言、`self_lock` 的文档与\
              两处锁的声明"

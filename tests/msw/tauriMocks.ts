@@ -262,6 +262,14 @@ export const tauriInvokeMock = vi.fn((cmd: string, args?: unknown) => {
       return Promise.resolve(null);
     case "get_all_sessions":
       return Promise.resolve(mockSessions);
+    case "get_sessions_snapshot":
+      return Promise.resolve({
+        version: 1,
+        epoch: 1,
+        mode: "active",
+        degraded: false,
+        data: mockSessions,
+      });
     case "list_extensions_with_assignments":
       return Promise.resolve(mockExtensions);
     case "list_presets":
@@ -455,6 +463,12 @@ export const tauriInvokeMock = vi.fn((cmd: string, args?: unknown) => {
         : Promise.resolve(
             mockUsageCollect((args as { force?: boolean } | undefined)?.force ?? false)
           );
+    // F7：可见性触发采集（无入参）。60s 门闩在后端；mock 直接返回一次「真扫」形状
+    // （force 分支的 durationMs），与手动采集区分。
+    case "usage_collect_visible":
+      return mockUsageMode() === "error"
+        ? Promise.reject({ code: "usage-db-failed", detail: "mam-mock-usage=error" })
+        : Promise.resolve(mockUsageCollect(true));
     case "usage_dashboard": {
       const range = (args as { range?: UsageRange } | undefined)?.range ?? { preset: "today" };
       const groupBy = (args as { groupBy?: UsageGroupBy } | undefined)?.groupBy ?? "tool";
