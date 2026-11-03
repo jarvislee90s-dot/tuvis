@@ -1,0 +1,9 @@
+[
+  {"text":"","tokens":0},
+  {"text":"hello world","tokens":2},
+  {"text":"你好，世界","tokens":3},
+  {"text":"hello 世界\n","tokens":3},
+  {"text":"let x = 1;\n","tokens":6},
+  {"text":"é","tokens":2},
+  {"text":"<|endoftext|>","tokens":7}
+]

@@ -27,6 +27,7 @@ pub mod install;
 pub mod model;
 pub mod policy;
 pub mod query;
+pub mod reference;
 pub mod receiver;
 pub mod scheduler;
 pub mod sources;
