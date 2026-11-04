@@ -771,8 +771,11 @@ fn workbuddy_is_live(
 /// 仍在写，纯 300s 规则会在第 5 分钟把正在跑的卡掉掉。
 ///
 /// 状态：DB `status == "working"` → `Processing`（覆盖主 jsonl 尾部 Idle 的子代理运行期，
-/// AC9）；其余仍由主 jsonl 尾部推导（10s 完成防抖 + 300s mtime 叠加），
-/// `eff_age` 取 `max(主 jsonl mtime, DB activity, 心跳时刻)` 的年龄。
+/// AC9）；其余由主 jsonl 尾部推导，**两轴锚点不可混用**：
+/// ① 完成冷却吃 `content_age`（只取主 jsonl mtime）；
+/// ② 停更降级吃 `presence_age`（max(主 jsonl mtime, DB activity, 心跳时刻)）。
+/// 2026-11-04 前两者共用同一个 `eff_age`，心跳每 30s 刷新把年龄打回 0，
+/// 造成任务结束后的绿↔黄周期振荡（本函数的回归锁见 board_tests）。
 pub fn get_workbuddy_sessions_with(
     home: &Path,
     processes: &[AgentProcess],
@@ -900,17 +903,18 @@ pub fn get_workbuddy_sessions_with(
             // AC9：DB 说在干活 → 上拉 Processing（不因父会话静默而掉卡/误绿）
             SessionStatus::Processing
         } else {
-            // ① 完成冷却：content 轴（无内容源 → None = 不启用冷却）
-            let cooldown = CooldownSignal {
-                observed_at_ms: jsonl_mtime_ms.unwrap_or(0),
+            // ① 完成冷却：content 轴。无内容源（mtime 未知）→ 无信号 = 不启用冷却。
+            // `observed_at` 必须是内容时间戳——**绝不可**用 presence 源的 max，
+            // 否则心跳每 30s 刷新会把冷却窗重置（2026-11-04 振荡缺陷根因）。
+            let signal = jsonl_mtime_ms.map(|mtime| CooldownSignal {
+                observed_at_ms: mtime,
                 hold_ms: crate::monitor::app_status::COMPLETION_COOLDOWN_MS,
                 requires_tail: Some(AppEntryKind::AssistantMessage),
-            };
-            let signal = ages.content_age_ms.map(|_| cooldown);
+            });
             overlay_mtime_stale(
                 apply_completion_cooldown(d.status_core.clone(), d.tail_kind, signal, now),
                 // ② 停更降级：presence 轴
-                ages.presence_age_ms.unwrap_or(0),
+                ages.presence_age_ms().unwrap_or(0),
             )
         };
         let last_message = d.last_message.clone().unwrap_or_default();
@@ -3659,7 +3663,37 @@ mod board_tests {
         assert!(ids.contains(&SID) && ids.contains(&SID2));
     }
 
-    /// **P0 核心回归锁（2026-11-04 缺陷）**：任务已结束（DB completed、jsonl 停写
+    /// **P0 正向锁（I5）**：内容刚写下（5s）+ 心跳 1s 前刚刷新 → 冷却**必须**生效（黄）。
+    /// 与下一条反向用例成对：若有人把观测锚点从 `jsonl_mtime` 改回 presence 源的
+    /// max、或把 signal 改成 `None`，本用例立刻变绿，缺陷当场复发可被捕获。
+    #[test]
+    fn fresh_content_still_triggers_cooldown_despite_heartbeat() {
+        let home = tempfile::tempdir().unwrap();
+        let now = now_ms();
+        // jsonl 5 秒前写下（在 10s 冷却窗内）；DB completed；心跳 1 秒前
+        write_jsonl(home.path(), SID, now - 5_000);
+        seed_db(
+            home.path(),
+            &[(
+                SID,
+                "completed",
+                (now - 5_000) as i64,
+                (now - 5_000) as i64,
+                None,
+            )],
+        );
+        write_heartbeat(home.path(), 11952, SID, now - 1_000);
+
+        let out = run_board(home.path(), &[process(11952)], now);
+        assert_eq!(out.len(), 1);
+        assert_eq!(
+            out[0].status,
+            SessionStatus::Processing,
+            "assistant 尾 + 内容仅 5s 旧 → 冷却必须压住假绿（中间消息窗口）"
+        );
+    }
+
+    /// **P0 核心反向锁（2026-11-04 缺陷）**：任务已结束（DB completed、jsonl 停写
     /// 30s），但心跳每 30s 刷新一次。心跳只能证明进程还开着，不得延长完成冷却。
     /// 修复前：eff_age 被心跳打回 0 → assistant 尾 Idle 被拉回 Processing 10s，
     /// 形成绿 20s / 黄 10s 的 30s 周期振荡；修复后：稳定 Idle。
@@ -3671,7 +3705,13 @@ mod board_tests {
         write_jsonl(home.path(), SID, now - 30_000);
         seed_db(
             home.path(),
-            &[(SID, "completed", (now - 30_000) as i64, (now - 30_000) as i64, None)],
+            &[(
+                SID,
+                "completed",
+                (now - 30_000) as i64,
+                (now - 30_000) as i64,
+                None,
+            )],
         );
         write_heartbeat(home.path(), 11952, SID, now - 1_000);
 
@@ -3692,7 +3732,13 @@ mod board_tests {
         write_jsonl(home.path(), SID, now - 30_000);
         seed_db(
             home.path(),
-            &[(SID, "working", (now - 1_000) as i64, (now - 1_000) as i64, None)],
+            &[(
+                SID,
+                "working",
+                (now - 1_000) as i64,
+                (now - 1_000) as i64,
+                None,
+            )],
         );
         write_heartbeat(home.path(), 11952, SID, now - 1_000);
 
@@ -3705,25 +3751,37 @@ mod board_tests {
         );
     }
 
-    /// P0 边界：jsonl mtime 不可得（content_age=None）→ 不启用冷却，直接按尾部判定
+    /// P0 边界：**内容源缺失 → 冷却不启用**（未知 ≠ 刚刚）。
+    /// 直接测共享纯函数：`SessionAges::derive(now, None, …)` 的 content 轴为 None，
+    /// 派生的 `CooldownSignal` 为 None → `apply_completion_cooldown` 透传。
+    /// （旧版此测试靠删 jsonl 文件，实际只走到 `find_session_jsonl` 未命中分支，
+    /// 与 content_age 无关 —— 2026-11-04 review I4 修正。）
     #[test]
     fn missing_content_mtime_disables_cooldown() {
-        let home = tempfile::tempdir().unwrap();
-        let now = now_ms();
-        write_jsonl(home.path(), SID, now - 30_000);
-        seed_db(
-            home.path(),
-            &[(SID, "completed", (now - 30_000) as i64, (now - 30_000) as i64, None)],
-        );
-        write_heartbeat(home.path(), 11952, SID, now - 1_000);
-        // 删掉 jsonl：content 源缺失，但 DB activity 仍在 300s 内 → 卡片仍出
-        let jsonl_dir = home.path().join(".workbuddy/projects").join(mangle_project_path(CWD));
-        std::fs::remove_file(jsonl_dir.join(format!("{SID}.jsonl"))).unwrap();
+        use crate::monitor::app_status::{apply_completion_cooldown, CooldownSignal, SessionAges};
+        let now = 1_000_000u64;
+        // content 源缺失，但心跳/DB 源在（presence 轴有值）
+        let ages = SessionAges::derive(now, None, &[None, Some(now - 1_000)]);
+        assert_eq!(ages.content_age_ms(), None);
+        assert_eq!(ages.presence_age_ms(), Some(1_000), "presence 不受影响");
 
-        // jsonl 缺失时 find_session_jsonl 未命中 → 不出卡（既有语义），
-        // 本测试改为断言「函数不 panic 且返回空」
-        let out = run_board(home.path(), &[process(11952)], now);
-        assert!(out.is_empty(), "jsonl 缺失 → 不出卡（既有语义不变）");
+        // 与构卡层同款接线：content_age 为 None ⇒ 无信号 ⇒ 冷却不启用
+        let signal = ages.content_age_ms().map(|_| CooldownSignal {
+            observed_at_ms: 0,
+            hold_ms: crate::monitor::app_status::COMPLETION_COOLDOWN_MS,
+            requires_tail: Some(AppEntryKind::AssistantMessage),
+        });
+        assert_eq!(signal, None, "无内容源时不得合成冷却信号");
+        assert_eq!(
+            apply_completion_cooldown(
+                SessionStatus::Idle,
+                Some(AppEntryKind::AssistantMessage),
+                signal,
+                now
+            ),
+            SessionStatus::Idle,
+            "无内容源 → 不启用冷却，直接按尾部判定为 Idle"
+        );
     }
 }
 
@@ -3734,8 +3792,8 @@ mod debounce_tests {
     /// 完成冷却：仅对「assistant 尾导出的绿 + 窗内」生效，其余透传
     #[test]
     fn completion_cooldown_holds_processing_only_for_fresh_assistant_idle() {
-        use crate::session::SessionStatus::*;
         use crate::monitor::app_status::{apply_completion_cooldown, CooldownSignal};
+        use crate::session::SessionStatus::*;
         let at = 1_000_000u64;
         let assistant = Some(AppEntryKind::AssistantMessage);
         let fresh = Some(CooldownSignal {
@@ -3743,14 +3801,20 @@ mod debounce_tests {
             hold_ms: crate::monitor::app_status::COMPLETION_COOLDOWN_MS,
             requires_tail: Some(AppEntryKind::AssistantMessage),
         });
-        assert_eq!(apply_completion_cooldown(Idle, assistant, fresh, at), Processing);
+        assert_eq!(
+            apply_completion_cooldown(Idle, assistant, fresh, at),
+            Processing
+        );
         // 恰好到窗：放行
         let expired = Some(CooldownSignal {
             observed_at_ms: at - crate::monitor::app_status::COMPLETION_COOLDOWN_MS,
             hold_ms: crate::monitor::app_status::COMPLETION_COOLDOWN_MS,
             requires_tail: Some(AppEntryKind::AssistantMessage),
         });
-        assert_eq!(apply_completion_cooldown(Idle, assistant, expired, at), Idle);
+        assert_eq!(
+            apply_completion_cooldown(Idle, assistant, expired, at),
+            Idle
+        );
         // 无信号 → 透传
         assert_eq!(apply_completion_cooldown(Idle, assistant, None, at), Idle);
         // 非 assistant 尾 → 透传
@@ -3759,8 +3823,14 @@ mod debounce_tests {
             Idle
         );
         // 非绿态 → 透传
-        assert_eq!(apply_completion_cooldown(Waiting, assistant, fresh, at), Waiting);
-        assert_eq!(apply_completion_cooldown(Processing, assistant, fresh, at), Processing);
+        assert_eq!(
+            apply_completion_cooldown(Waiting, assistant, fresh, at),
+            Waiting
+        );
+        assert_eq!(
+            apply_completion_cooldown(Processing, assistant, fresh, at),
+            Processing
+        );
     }
 
     /// 尾部语义条目随摘要产出：assistant 文本尾 → (Idle, AssistantMessage)；

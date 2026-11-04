@@ -49,9 +49,9 @@ pub const APP_STATUS_STALE_MS: u64 = 300_000;
 pub struct SessionAges {
     /// 距**内容最后写入**的毫秒数。只取内容源（jsonl mtime / DB time_updated /
     /// 事件流末条时间戳）。无内容源时为 `None`——**未知不等于刚刚**。
-    pub content_age_ms: Option<u64>,
+    content_age_ms: Option<u64>,
     /// 距**会话最后生命迹象**的毫秒数。内容源 ∨ DB 活动 ∨ 心跳 ∨ 锁租约取最近。
-    pub presence_age_ms: Option<u64>,
+    presence_age_ms: Option<u64>,
 }
 
 impl SessionAges {
@@ -61,6 +61,9 @@ impl SessionAges {
     /// - `presence_sources`：所有生命迹象的绝对时刻，含内容源自身。
     ///
     /// 两轴都为 `None` 表示证据完全缺失。
+    ///
+    /// **字段刻意私有**：结构体字面量构造在本模块外不可达，"一个 age 只服务一个
+    /// 语义"由类型系统而非 review 纪律保证（2026-11-04 裁决的强制手段）。
     pub fn derive(now_ms: u64, content_ms: Option<u64>, presence_sources: &[Option<u64>]) -> Self {
         let content_age_ms = content_ms.map(|ms| now_ms.saturating_sub(ms));
         let presence_age_ms = presence_sources
@@ -72,6 +75,16 @@ impl SessionAges {
             content_age_ms,
             presence_age_ms,
         }
+    }
+
+    /// 内容写入年龄：**只许喂完成冷却与内容新鲜度判定**。
+    pub fn content_age_ms(&self) -> Option<u64> {
+        self.content_age_ms
+    }
+
+    /// 会话在场年龄：**只许喂在板判定、停更降级与未读补偿**。
+    pub fn presence_age_ms(&self) -> Option<u64> {
+        self.presence_age_ms
     }
 }
 
@@ -823,13 +836,17 @@ mod tests {
     fn session_ages_separates_content_and_presence() {
         let now = 1_000_000u64;
         // 内容 40 秒前写下；DB 活动 5 秒前；心跳 1 秒前
-        let ages = SessionAges::derive(now, Some(now - 40_000), &[
+        let ages = SessionAges::derive(
+            now,
             Some(now - 40_000),
-            Some(now - 5_000),
-            Some(now - 1_000),
-        ]);
-        assert_eq!(ages.content_age_ms, Some(40_000), "content 只认内容源");
-        assert_eq!(ages.presence_age_ms, Some(1_000), "presence 取最近生命迹象");
+            &[Some(now - 40_000), Some(now - 5_000), Some(now - 1_000)],
+        );
+        assert_eq!(ages.content_age_ms(), Some(40_000), "content 只认内容源");
+        assert_eq!(
+            ages.presence_age_ms(),
+            Some(1_000),
+            "presence 取最近生命迹象（时刻取最近 → 年龄最小）"
+        );
     }
 
     /// 内容源缺失 → content=None（未知不等于刚刚）；presence 仍可由其他源给出
@@ -837,16 +854,16 @@ mod tests {
     fn session_ages_content_unknown_when_no_content_source() {
         let now = 1_000_000u64;
         let ages = SessionAges::derive(now, None, &[None, Some(now - 3_000)]);
-        assert_eq!(ages.content_age_ms, None);
-        assert_eq!(ages.presence_age_ms, Some(3_000));
+        assert_eq!(ages.content_age_ms(), None);
+        assert_eq!(ages.presence_age_ms(), Some(3_000));
     }
 
     /// 全部来源缺失 → 两轴均为 None
     #[test]
     fn session_ages_both_none_when_no_sources() {
         let ages = SessionAges::derive(1_000_000, None, &[None, None]);
-        assert_eq!(ages.content_age_ms, None);
-        assert_eq!(ages.presence_age_ms, None);
+        assert_eq!(ages.content_age_ms(), None);
+        assert_eq!(ages.presence_age_ms(), None);
     }
 
     /// 心跳只能刷新 presence，绝不能缩短 content —— 本类缺陷的回归锁
@@ -856,11 +873,11 @@ mod tests {
         let content_ms = Some(now - 30_000);
         let ages = SessionAges::derive(now, content_ms, &[content_ms, Some(now - 500)]);
         assert_eq!(
-            ages.content_age_ms,
+            ages.content_age_ms(),
             Some(30_000),
             "心跳新鲜时 content 仍是 30s（冷却窗必须等满）"
         );
-        assert_eq!(ages.presence_age_ms, Some(500));
+        assert_eq!(ages.presence_age_ms(), Some(500));
     }
 
     // ---- 时间常量集中（P1）：语义命名 + 同源锁 ----
@@ -880,18 +897,13 @@ mod tests {
         assert_eq!(CONTENT_FRESH_OPENCODE_MS, 60_000);
     }
 
-    /// WorkBuddy 完成冷却窗与心跳周期必须独立——若两者接近，
-    /// 冷却会被心跳反复重置（2026-11-04 缺陷的面板条件）
-    // 两个常量的关系断言会触发 clippy::assertions_on_constants（-D warnings），
-    // 保留运行时断言形态（计划原意 = 测试期回归锁），就地放行该 lint
-    #[test]
-    #[allow(clippy::assertions_on_constants)]
-    fn workbuddy_cooldown_is_shorter_than_its_heartbeat() {
-        assert!(
-            COMPLETION_COOLDOWN_MS < crate::monitor::workbuddy_parser::HEARTBEAT_FRESH_MS,
-            "冷却窗必须显著小于心跳周期，否则行为退化"
-        );
-    }
+    // 注：曾有一条 `workbuddy_cooldown_is_shorter_than_its_heartbeat` 断言
+    // COMPLETION_COOLDOWN_MS < HEARTBEAT_FRESH_MS，2026-11-04 review 后删除：
+    // ① 两个编译期常量的大小关系恒真（只有人工改常量才失败），测不出任何行为；
+    // ② 依赖方向错误——共享核不该反向依赖 workbuddy_parser 的常量；
+    // ③ 断言对象错位——HEARTBEAT_FRESH_MS 是"心跳新鲜窗"(90s)，不是心跳"周期"(30s)；
+    // ④ 缺陷条件是「拿心跳时刻当冷却锚点」，与两个数值的大小无关。
+    // 真正的回归锁是 workbuddy_parser 的 board 级正反例对（见 board_tests）。
 
     // ---- CooldownSignal：完成冷却通用形态（P2） ----
 
