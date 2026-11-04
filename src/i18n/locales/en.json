@@ -3232,6 +3232,7 @@
       "modeYolo": "Full access",
       "modeEdit": "Auto edit",
       "modeApply": "Apply mode",
+      "selectionApply": "Apply",
       "modeConfirmTitle": "Switch to full access?",
       "modeConfirmHint": "Full access removes most confirmations. Confirm that this is the scope you want.",
       "modeConfirm": "Switch",

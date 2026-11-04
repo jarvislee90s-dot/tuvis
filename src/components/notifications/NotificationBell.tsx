@@ -108,13 +108,16 @@ export function NotificationBell() {
   return (
     <div className="relative">
       <button
-        className="hover:bg-accent relative rounded p-1.5"
+        className="relative rounded p-1.5 transition-colors hover:bg-accent"
         onClick={toggle}
         title={t("notifications.historyTitle")}
       >
         <Bell className="h-4 w-4" />
         {unread > 0 && (
-          <span className="absolute -top-0.5 -right-0.5 flex h-4 min-w-4 items-center justify-center rounded-full bg-red-500 px-1 text-[9px] font-bold text-white">
+          // 角标几何与「清除已完成」徽章（home.tsx）完全同款：位置/字号/字重一致，
+          // 只用颜色区分语义（绿=可清除已完成、红=未读通知）——2026-11-04 用户裁决
+          // 「泡泡外形样式统一」。
+          <span className="absolute -top-1 -right-1 flex h-4 min-w-4 items-center justify-center rounded-full bg-red-500 px-1 text-[10px] leading-none font-semibold text-white">
             {unread > 99 ? "99+" : unread}
           </span>
         )}

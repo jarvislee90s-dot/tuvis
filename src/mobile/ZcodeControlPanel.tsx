@@ -1485,12 +1485,6 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
     });
   };
 
-  /** 不做 provider 可用性预判：直接发送一次完整三元组，由宿主返回真实错误。 */
-  const requestSelection = (model: string, thought: string, provider?: string) => {
-    if (session === null || !selectionEnabled || thought === "") return;
-    submitSelection(model, thought, provider);
-  };
-
   const handleProviderChange = (providerId: string) => {
     if (selection === null || providerId === activeProviderId) return;
     // 只更新待选组合；不写 provider-only 中间态。可用性不阻止选择。
@@ -1499,26 +1493,39 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
     setPendingThought(null);
   };
 
+  // 2026-11-04 用户裁决：下拉只改**本地待选**，点「确认修改」才构成一次配置变更
+  // （显式生效时间点；弱网下即时提交的「选不上/被拉回」不再发生——失败时待选保留，
+  // 可以直接再点确认重试）。
   const handleModelChange = (modelId: string) => {
     if (selection === null) return;
     const resolved = resolveModelChoice(selection, activeProviderId, modelId);
     if (resolved === null) return;
     setPendingModel(resolved.model);
     setPendingThought(null);
-    requestSelection(
-      resolved.model,
-      resolved.thought,
-      providerGroups.length === 0 ? undefined : activeProviderId
-    );
   };
 
   const handleThoughtChange = (thought: string) => {
     if (selection === null || currentChoice?.thoughtLevels.includes(thought) !== true) return;
     setPendingThought(thought);
-    // 同一 provider/model 只换思考档位，不是重新选择供应商；当前组合已经在使用中，
-    // 不应再次弹出“未知 provider”确认，否则用户会看到档位被旧值拉回。
-    requestSelection(
-      currentChoice.modelId,
+  };
+
+  // 待选是否偏离当前生效组合（确认按钮的使能条件；pending 值与当前值相同视作无变化）。
+  const selectionDirty =
+    selection !== null &&
+    ((pendingProvider !== null && pendingProvider !== selection.provider) ||
+      (pendingModel !== null && pendingModel !== selection.model) ||
+      (pendingThought !== null && pendingThought !== selection.thought));
+
+  /** 确认修改：把本地待选组合一次性提交为完整三元组（由宿主返回真实错误）。 */
+  const applySelection = () => {
+    if (session === null || selection === null || !selectionEnabled || !selectionDirty) return;
+    const modelId = pendingModel ?? currentChoice?.modelId ?? selection.model;
+    const resolved = resolveModelChoice(selection, activeProviderId, modelId);
+    if (resolved === null) return;
+    const thought = pendingThought ?? resolved.thought;
+    if (thought === "") return;
+    submitSelection(
+      resolved.model,
       thought,
       providerGroups.length === 0 ? undefined : activeProviderId
     );
@@ -2081,6 +2088,18 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
                   </option>
                 ))}
               </select>
+              {/* 确认修改（2026-11-04 用户裁决）：下拉只改本地待选，显式确认才提交
+                  配置变更——生效时间点一目了然，弱网失败时待选保留、可直接重试。 */}
+              <button
+                type="button"
+                data-testid="zcode-selection-apply"
+                disabled={!selectionEnabled || !selectionDirty}
+                onClick={applySelection}
+                title={i18n.t("mobile.zcodeControl.selectionApply")}
+                className="shrink-0 rounded-full border border-[var(--cb)] px-2 py-1 text-xs text-[var(--tx)] disabled:opacity-40"
+              >
+                {i18n.t("mobile.zcodeControl.selectionApply")}
+              </button>
             </>
           )}
         </div>

@@ -3232,6 +3232,7 @@
       "modeYolo": "完全访问",
       "modeEdit": "自动编辑",
       "modeApply": "应用模式",
+      "selectionApply": "确认修改",
       "modeConfirmTitle": "切换到完全访问？",
       "modeConfirmHint": "完全访问会显著减少确认，请确认这是你要的权限范围。",
       "modeConfirm": "确认切换",

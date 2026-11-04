@@ -39,6 +39,9 @@
 // - 模型选择 `zcode-model-select`（选项 = 当前 provider 的 models）、思考档位
 //   `zcode-thought-select`（选项 = 所选模型的 thoughtLevels）；model/thoughtLevel
 //   任一能力关闭 → 两个控件都禁用并给出可见原因，改值/点击零动作 POST。
+// - 选择变更的生效时间点（2026-11-04 用户裁决）：下拉只改本地待选（零 POST），
+//   点确认按钮 `zcode-selection-apply`（文案 mobile.zcodeControl.selectionApply=确认修改）
+//   才提交一次完整三元组 model/thought/provider；无待选偏离时该按钮 disabled。
 //
 // 网络层替身：GET connection / GET session / POST actions 全部为合成 DTO；不读真实
 // 账号、DB 或链接。断言「零旧 session-send / 零无头通道」= 旧发送链从未被触碰。
@@ -1995,6 +1998,9 @@ describe("ZCode 控制面板：模型/档位按能力开放", () => {
 
     fireEvent.change(thought, { target: { value: "low" } });
     await waitFor(() => expect(thought.value).toBe("low"));
+    // 只会改本地待选：确认前零 POST。
+    expect(postedActions()).toHaveLength(0);
+    fireEvent.click(screen.getByTestId("zcode-selection-apply"));
     await waitFor(() => expect(postedActions()).toHaveLength(1));
     expect(postedActions()[0].action).toEqual({
       kind: "selection",
@@ -2769,8 +2775,13 @@ describe("ZCode 控制面板：单行紧凑工具栏（R4/U2）", () => {
     expect(openSpy).toHaveBeenCalledWith(OFFICIAL_URL, "_blank", "noopener,noreferrer");
     expect(postedActions()).toHaveLength(0);
 
-    // 换模型协议不变：仍是同形状的 tagged selection 动作。
+    // 换模型协议不变：仍是同形状的 tagged selection 动作——但下拉只改待选，
+    // 必须点「确认修改」才提交（2026-11-04 契约）。
     fireEvent.change(model, { target: { value: "model-b" } });
+    expect(model.value).toBe("model-b");
+    await act(async () => {});
+    expect(postedActions()).toHaveLength(0);
+    fireEvent.click(scope.getByTestId("zcode-selection-apply"));
     await waitFor(() => expect(postedActions()).toHaveLength(1));
     expect(postedActions()[0].action).toEqual({
       kind: "selection",
@@ -2968,6 +2979,18 @@ function installQueueScenario(opts: {
 /** 展开队列条目（默认收起）。 */
 function openQueue() {
   fireEvent.click(screen.getByTestId("zcode-queue-toggle"));
+}
+
+/**
+ * 冲刷本轮提交的被动 effect。
+ *
+ * 面板的队列事务处理器（撤回/恢复）读 `sessionRef`——它由 `useEffect` 在提交后同步。
+ * 若 DOM 刚出现（fetch 决议在 act 之外）就 `fireEvent.click`，点击处理器会在该 effect
+ * 之前执行、读到 null 而早退（零 POST 的假阴性，实测约 1/10 概率）。
+ * 点击前先 `act` 一次把挂起的 effect 冲刷掉，交互才对应「按钮可见即可用」。
+ */
+async function flushPendingEffects() {
+  await act(async () => {});
 }
 
 describe("ZCode 控制面板：队列修改（撤回 + 人工复制兜底）", () => {
@@ -3204,6 +3227,8 @@ describe("ZCode 控制面板：队列撤回与恢复", () => {
     expect(resume).toBeEnabled();
     expect(screen.queryByTestId("zcode-queue-resume-done")).toBeNull();
 
+    // 先冲刷 sessionRef 的同步 effect，再做「可见即可点」的断言（否则慢机假死）。
+    await flushPendingEffects();
     fireEvent.click(resume);
     await waitFor(() => expect(postedActions()).toHaveLength(1));
     expect(postedActions()[0].action).toEqual({
@@ -3224,7 +3249,9 @@ describe("ZCode 控制面板：队列撤回与恢复", () => {
       receiptReason: "needs_evidence",
     });
     render(<ZcodeControlPanel sessionId={SID} />);
-    fireEvent.click(await screen.findByTestId("zcode-queue-resume"));
+    const resume = (await screen.findByTestId("zcode-queue-resume")) as HTMLButtonElement;
+    await flushPendingEffects();
+    fireEvent.click(resume);
     const notice = await screen.findByTestId("zcode-queue-notice");
     expect(notice.dataset.state).toBe("error");
     expect(notice.getAttribute("data-reason-code")).toBe("needs_evidence");

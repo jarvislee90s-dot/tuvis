@@ -137,9 +137,10 @@ function install(view: SessionView = session()) {
 
 const providerSelect = () => screen.getByTestId("zcode-provider-select") as HTMLSelectElement;
 const modelSelect = () => screen.getByTestId("zcode-model-select") as HTMLSelectElement;
+const thoughtSelect = () => screen.getByTestId("zcode-thought-select") as HTMLSelectElement;
 
 describe("ZcodeProviderSelection", () => {
-  it("provider_change_alone_emits_zero_post_then_model_sends_one_full_triple", async () => {
+  it("provider_and_model_stay_pending_until_apply_sends_one_full_triple", async () => {
     const posts = install();
     render(<ZcodeControlPanel sessionId={SID} />);
     await waitFor(() => expect(screen.getByTestId("zcode-provider-select")).toBeVisible());
@@ -147,14 +148,26 @@ describe("ZcodeProviderSelection", () => {
     // 否则慢机上 change 会被 late effect 覆盖，模型目录仍停在 a-model。
     await waitFor(() => expect(providerSelect().value).toBe("a"));
     await waitFor(() => expect(modelSelect().value).toBe("a-model"));
+    const apply = screen.getByTestId("zcode-selection-apply") as HTMLButtonElement;
+    // 无待选偏离：确认修改禁用（下拉只是浏览，不构成变更）。
+    expect(apply).toBeDisabled();
+
     fireEvent.change(screen.getByTestId("zcode-provider-select"), { target: { value: "b" } });
     await waitFor(() => expect(posts).toHaveLength(0));
+    // 待选偏离 → 确认修改可点，但此刻仍零 POST。
+    await waitFor(() => expect(apply).toBeEnabled());
     // provider 变更后的模型目录由 React 状态刷新；不能只等 posts==0（初始即为 0），
     // 否则旧 model 在 CI 慢机上仍是 a-model，形成与实现无关的竞态。
     await waitFor(() => {
       expect(Array.from(modelSelect().options).map((option) => option.value)).toEqual(["b-model"]);
     });
     fireEvent.change(modelSelect(), { target: { value: "b-model" } });
+    // 模型下拉同样只改本地待选：下拉显示用户选值，但零 POST。
+    expect(modelSelect().value).toBe("b-model");
+    await waitFor(() => expect(posts).toHaveLength(0));
+
+    // 显式确认才提交一次完整三元组（provider 也随待选值上行）。
+    fireEvent.click(apply);
     await waitFor(() => expect(posts).toHaveLength(1));
     expect(posts[0].action).toMatchObject({
       kind: "selection",
@@ -176,17 +189,25 @@ describe("ZcodeProviderSelection", () => {
     expect(screen.queryByTestId("zcode-selection-unknown-hint")).toBeNull();
   });
 
-  it("unknown_provider_switch_posts_directly_without_confirmation", async () => {
+  it("unknown_provider_switch_posts_only_after_apply_without_confirmation", async () => {
     const posts = install(session([providerA, unknownProviderB]));
     render(<ZcodeControlPanel sessionId={SID} />);
     await waitFor(() => expect(screen.getByTestId("zcode-provider-select")).toBeVisible());
     // 同上：等初始投影（a / a-model）落定，避免 late effect 把 pendingProvider 清回 a。
     await waitFor(() => expect(providerSelect().value).toBe("a"));
     await waitFor(() => expect(modelSelect().value).toBe("a-model"));
+    const apply = screen.getByTestId("zcode-selection-apply") as HTMLButtonElement;
 
     fireEvent.change(providerSelect(), { target: { value: "b" } });
     await waitFor(() => expect(posts).toHaveLength(0));
     fireEvent.change(modelSelect(), { target: { value: "b-model" } });
+    expect(modelSelect().value).toBe("b-model");
+    await waitFor(() => expect(apply).toBeEnabled());
+    // 未知可用性不触发任何预判弹窗；确认前零 POST。
+    expect(screen.queryByTestId("zcode-selection-confirm-dialog")).toBeNull();
+    await waitFor(() => expect(posts).toHaveLength(0));
+
+    fireEvent.click(apply);
     await waitFor(() => expect(posts).toHaveLength(1));
     expect(posts[0].action).toEqual({
       kind: "selection",
@@ -197,5 +218,59 @@ describe("ZcodeProviderSelection", () => {
       thought: "low",
     });
     expect(screen.queryByTestId("zcode-selection-confirm-dialog")).toBeNull();
+  });
+
+  it("apply_is_disabled_without_pending_drift_and_click_emits_zero_post", async () => {
+    // 无待选偏离时确认按钮禁用；把下拉 change 成**同值**仍不算变更：
+    // 按钮保持 disabled，点击是硬门，不得发出 selection。
+    const posts = install();
+    render(<ZcodeControlPanel sessionId={SID} />);
+    await waitFor(() => expect(providerSelect().value).toBe("a"));
+    await waitFor(() => expect(modelSelect().value).toBe("a-model"));
+    const apply = screen.getByTestId("zcode-selection-apply") as HTMLButtonElement;
+    // 文案来自 mobile.zcodeControl.selectionApply（zh=确认修改），不是裸 testid 按钮。
+    expect(apply.textContent).toBe("确认修改");
+    expect(apply).toBeDisabled();
+    // 同值 change 不构成偏离：按钮保持禁用。
+    fireEvent.change(modelSelect(), { target: { value: "a-model" } });
+    fireEvent.change(thoughtSelect(), { target: { value: "low" } });
+    expect(apply).toBeDisabled();
+    fireEvent.click(apply);
+    await waitFor(() => expect(posts).toHaveLength(0));
+    expect(posts).toHaveLength(0);
+  });
+
+  it("apply_keeps_pending_selection_in_dropdowns_before_projection_changes", async () => {
+    // 待选偏离时确认可点；提交后投影未变（回执只到 accepted、会话未刷新）：
+    // 下拉保持用户待选值，不能被旧投影立刻拉回——这正是「显式生效时间点」的可见承诺。
+    const posts = install();
+    render(<ZcodeControlPanel sessionId={SID} />);
+    await waitFor(() => expect(providerSelect().value).toBe("a"));
+    await waitFor(() => expect(modelSelect().value).toBe("a-model"));
+    await waitFor(() =>
+      expect(Array.from(thoughtSelect().options).map((option) => option.value)).toEqual([
+        "low",
+        "high",
+      ])
+    );
+    const apply = screen.getByTestId("zcode-selection-apply") as HTMLButtonElement;
+    expect(apply).toBeDisabled();
+
+    // 档位 low → high：待选偏离，但确认前零 POST。
+    fireEvent.change(thoughtSelect(), { target: { value: "high" } });
+    expect(thoughtSelect().value).toBe("high");
+    await waitFor(() => expect(apply).toBeEnabled());
+    expect(posts).toHaveLength(0);
+
+    fireEvent.click(apply);
+    await waitFor(() => expect(posts).toHaveLength(1));
+    expect(posts[0].action).toMatchObject({
+      kind: "selection",
+      provider: "a",
+      model: "a-model",
+      thought: "high",
+    });
+    // 投影（selection.thought="low"）没变：待选 high 必须仍在屏上，不得回弹。
+    expect(thoughtSelect().value).toBe("high");
   });
 });

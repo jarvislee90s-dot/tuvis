@@ -215,7 +215,7 @@ export default function HomePage() {
                   <button
                     onClick={clearFinishedCards}
                     data-testid="clear-finished-cards"
-                    className="text-muted-foreground hover:bg-muted hover:text-foreground relative rounded p-1.5 transition-colors"
+                    className="text-muted-foreground relative rounded p-1.5 transition-colors hover:bg-accent"
                     title={t("home.clearFinishedCards")}
                     aria-label={t("home.clearFinishedCardsWithCount", {
                       count: finishedCards.length,
