@@ -36,6 +36,136 @@ pub enum AppEntryKind {
 /// JSONL mtime 停更超过该时长时，函数调用类尾部（Processing）降级为 Waiting
 pub const APP_STATUS_STALE_MS: u64 = 300_000;
 
+/// 会话年龄双轴（唯一构造点：[`SessionAges::derive`]）。
+///
+/// **纪律（2026-11-04 用户裁决）**：一个 age 值只服务一个判定语义。
+/// - `content_age_ms` 只喂**完成冷却**与内容新鲜度判定；
+/// - `presence_age_ms` 只喂**在板判定**、**停更降级**与未读补偿。
+///
+/// 违反后果：心跳/DB 活动会把内容年龄打回 0，完成冷却永远等不满，
+/// 造成绿↔黄周期振荡并重复播报完成提醒（2026-11-04 WorkBuddy 缺陷，
+/// 活体实测 30s 周期：心跳刷新 → 黄 10s → 心跳老化 → 绿 20s → 循环）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionAges {
+    /// 距**内容最后写入**的毫秒数。只取内容源（jsonl mtime / DB time_updated /
+    /// 事件流末条时间戳）。无内容源时为 `None`——**未知不等于刚刚**。
+    content_age_ms: Option<u64>,
+    /// 距**会话最后生命迹象**的毫秒数。内容源 ∨ DB 活动 ∨ 心跳 ∨ 锁租约取最近。
+    presence_age_ms: Option<u64>,
+}
+
+impl SessionAges {
+    /// 唯一构造点。
+    ///
+    /// - `content_ms`：内容最后写入的**绝对时刻**（epoch ms），由各 parser 的证据层提供；
+    /// - `presence_sources`：所有生命迹象的绝对时刻，含内容源自身。
+    ///
+    /// 两轴都为 `None` 表示证据完全缺失。
+    ///
+    /// **字段刻意私有**：结构体字面量构造在本模块外不可达，"一个 age 只服务一个
+    /// 语义"由类型系统而非 review 纪律保证（2026-11-04 裁决的强制手段）。
+    pub fn derive(now_ms: u64, content_ms: Option<u64>, presence_sources: &[Option<u64>]) -> Self {
+        let content_age_ms = content_ms.map(|ms| now_ms.saturating_sub(ms));
+        let presence_age_ms = presence_sources
+            .iter()
+            .flatten()
+            .map(|ms| now_ms.saturating_sub(*ms))
+            .min();
+        Self {
+            content_age_ms,
+            presence_age_ms,
+        }
+    }
+
+    /// 内容写入年龄：**只许喂完成冷却与内容新鲜度判定**。
+    pub fn content_age_ms(&self) -> Option<u64> {
+        self.content_age_ms
+    }
+
+    /// 会话在场年龄：**只许喂在板判定、停更降级与未读补偿**。
+    pub fn presence_age_ms(&self) -> Option<u64> {
+        self.presence_age_ms
+    }
+}
+
+/// 无信号时的新鲜度兜底窗（zcode / codex APP 共用）：与 [`APP_STATUS_STALE_MS`]
+/// 同值同源。判据是「会话最后更新时间在窗内 → Processing，否则 Idle」——
+/// 与停更降级（Processing → Waiting）语义不同，但窗口量级刻意对齐，
+/// 避免同一会话在两条路径上得到矛盾结论。
+pub const FALLBACK_FRESH_MS: i64 = APP_STATUS_STALE_MS as i64;
+
+/// Claude 文件新鲜兜底窗：`determine_status` 无信号分支的 mtime 判据。
+/// 3s 是"轮询周期 + 落盘延迟"量级——claude 有消息内 tool_use 判据兜底，
+/// 这只是极短窗的防御，不是主力判据。
+pub const CONTENT_FRESH_CLAUDE_MS: u64 = 3_000;
+
+/// Kimi 文件新鲜兜底窗：`wire.jsonl` 无状态信号时的 mtime 判据。
+/// 60s 是主力兜底（kimi 事件流可能缺失），与 claude 的 3s 防御性兜底不同源。
+pub const CONTENT_FRESH_KIMI_MS: u64 = 60_000;
+
+/// OpenCode "user 尾 + 近期活跃" 的活跃窗。
+pub const CONTENT_FRESH_OPENCODE_MS: u64 = 60_000;
+
+/// WorkBuddy 完成冷却窗（原 `GREEN_DEBOUNCE_MS`）：assistant 语义尾 + 内容年龄
+/// 小于该窗 → 保持 Processing。WorkBuddy 格式无轮次边界信号，中间 assistant
+/// 消息的假绿只能时间防抖（spec 2026-09-16 §4.2）。
+///
+/// **必须用 content_age 喂它，绝不可用含心跳的 presence_age**——心跳每 30s
+/// 刷新会把年龄打回 0，冷却永远等不满（2026-11-04 缺陷根因）。
+pub const COMPLETION_COOLDOWN_MS: u64 = 10_000;
+
+/// 完成冷却信号（纯数据，各 parser 在证据层构造）。
+///
+/// 语义：在 `observed_at_ms` 观测到"完成候选"，到 `observed_at_ms + hold_ms`
+/// 之前不得报绿。`requires_tail` 用于限定只有特定尾部语义才适用冷却
+/// （WorkBuddy 的中间 assistant 假绿只发生在 assistant 尾）。
+///
+/// **`observed_at_ms` 必须是内容/事件时间戳，绝不可含心跳或 DB 活动**——
+/// 那是 [`SessionAges`] 的 presence 轴，混用会导致冷却被周期性重置。
+///
+/// 两种已知形态：
+/// - WorkBuddy：`observed_at = jsonl mtime`，`hold = COMPLETION_COOLDOWN_MS`，
+///   `requires_tail = Some(AssistantMessage)`
+/// - Claude：`observed_at = hook Stop 事件 ts`，`hold = cli/app grace`，
+///   `requires_tail = None`（预留，本批不接入）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CooldownSignal {
+    /// 完成候选被观测到的时刻（epoch ms）
+    pub observed_at_ms: u64,
+    /// 冷却时长（ms）
+    pub hold_ms: u64,
+    /// 仅该尾部语义可被冷却；`None` = 不限尾部
+    pub requires_tail: Option<AppEntryKind>,
+}
+
+/// 完成冷却（纯函数）：观测到完成候选后压住 hold 时长才允许报绿。
+///
+/// 仅作用于绿态（Idle/Finished）；其余状态透传。`signal` 为 `None` → 透传
+/// （无冷却证据 = 不启用）。`requires_tail` 与 `tail_kind` 不匹配 → 透传。
+pub fn apply_completion_cooldown(
+    status: SessionStatus,
+    tail_kind: Option<AppEntryKind>,
+    signal: Option<CooldownSignal>,
+    now_ms: u64,
+) -> SessionStatus {
+    let Some(sig) = signal else {
+        return status;
+    };
+    if !matches!(status, SessionStatus::Idle | SessionStatus::Finished) {
+        return status;
+    }
+    if let Some(required) = sig.requires_tail {
+        if tail_kind != Some(required) {
+            return status;
+        }
+    }
+    if now_ms.saturating_sub(sig.observed_at_ms) < sig.hold_ms {
+        SessionStatus::Processing
+    } else {
+        status
+    }
+}
+
 /// mtime 阈值叠加（spec §4）：函数调用类尾部停更 >= 300s 降级 Waiting；
 /// assistant 文本（Idle）等其余状态不受影响。mtime 年龄不可知时按未过期处理（防御）
 pub fn overlay_mtime_stale(status: SessionStatus, mtime_age_ms: u64) -> SessionStatus {
@@ -697,5 +827,197 @@ mod tests {
     #[test]
     fn clean_flags_map_to_human_origin() {
         assert_eq!(entry_origin_from_flags(false, false), EntryOrigin::Human);
+    }
+
+    // ---- SessionAges：双轴年龄（P0 锚点纪律） ----
+
+    /// content 轴只取内容源；presence 轴取全部来源的最大值
+    #[test]
+    fn session_ages_separates_content_and_presence() {
+        let now = 1_000_000u64;
+        // 内容 40 秒前写下；DB 活动 5 秒前；心跳 1 秒前
+        let ages = SessionAges::derive(
+            now,
+            Some(now - 40_000),
+            &[Some(now - 40_000), Some(now - 5_000), Some(now - 1_000)],
+        );
+        assert_eq!(ages.content_age_ms(), Some(40_000), "content 只认内容源");
+        assert_eq!(
+            ages.presence_age_ms(),
+            Some(1_000),
+            "presence 取最近生命迹象（时刻取最近 → 年龄最小）"
+        );
+    }
+
+    /// 内容源缺失 → content=None（未知不等于刚刚）；presence 仍可由其他源给出
+    #[test]
+    fn session_ages_content_unknown_when_no_content_source() {
+        let now = 1_000_000u64;
+        let ages = SessionAges::derive(now, None, &[None, Some(now - 3_000)]);
+        assert_eq!(ages.content_age_ms(), None);
+        assert_eq!(ages.presence_age_ms(), Some(3_000));
+    }
+
+    /// 全部来源缺失 → 两轴均为 None
+    #[test]
+    fn session_ages_both_none_when_no_sources() {
+        let ages = SessionAges::derive(1_000_000, None, &[None, None]);
+        assert_eq!(ages.content_age_ms(), None);
+        assert_eq!(ages.presence_age_ms(), None);
+    }
+
+    /// 心跳只能刷新 presence，绝不能缩短 content —— 本类缺陷的回归锁
+    #[test]
+    fn heartbeat_never_shortens_content_age() {
+        let now = 1_000_000u64;
+        let content_ms = Some(now - 30_000);
+        let ages = SessionAges::derive(now, content_ms, &[content_ms, Some(now - 500)]);
+        assert_eq!(
+            ages.content_age_ms(),
+            Some(30_000),
+            "心跳新鲜时 content 仍是 30s（冷却窗必须等满）"
+        );
+        assert_eq!(ages.presence_age_ms(), Some(500));
+    }
+
+    // ---- 时间常量集中（P1）：语义命名 + 同源锁 ----
+
+    /// 无信号兜底窗必须与 APP 停更阈值同源——两者历史上是同一个值，
+    /// 单独调一个会静默改变"兜底新鲜度"语义。
+    #[test]
+    fn fallback_fresh_equals_app_stale() {
+        assert_eq!(FALLBACK_FRESH_MS, APP_STATUS_STALE_MS as i64);
+    }
+
+    /// 各家"内容新鲜"阈值已收录且量级正确（防止实现期写错数量级）
+    #[test]
+    fn content_fresh_constants_have_expected_magnitudes() {
+        assert_eq!(CONTENT_FRESH_CLAUDE_MS, 3_000);
+        assert_eq!(CONTENT_FRESH_KIMI_MS, 60_000);
+        assert_eq!(CONTENT_FRESH_OPENCODE_MS, 60_000);
+    }
+
+    // 注：曾有一条 `workbuddy_cooldown_is_shorter_than_its_heartbeat` 断言
+    // COMPLETION_COOLDOWN_MS < HEARTBEAT_FRESH_MS，2026-11-04 review 后删除：
+    // ① 两个编译期常量的大小关系恒真（只有人工改常量才失败），测不出任何行为；
+    // ② 依赖方向错误——共享核不该反向依赖 workbuddy_parser 的常量；
+    // ③ 断言对象错位——HEARTBEAT_FRESH_MS 是"心跳新鲜窗"(90s)，不是心跳"周期"(30s)；
+    // ④ 缺陷条件是「拿心跳时刻当冷却锚点」，与两个数值的大小无关。
+    // 真正的回归锁是 workbuddy_parser 的 board 级正反例对（见 board_tests）。
+
+    // ---- CooldownSignal：完成冷却通用形态（P2） ----
+
+    fn sig(
+        observed_at_ms: u64,
+        hold_ms: u64,
+        requires_tail: Option<AppEntryKind>,
+    ) -> CooldownSignal {
+        CooldownSignal {
+            observed_at_ms,
+            hold_ms,
+            requires_tail,
+        }
+    }
+
+    /// 冷却窗内：绿态 → Processing
+    #[test]
+    fn cooldown_blocks_green_within_window() {
+        let now = 1_000_000u64;
+        let s = sig(now - 5_000, 10_000, Some(AppEntryKind::AssistantMessage));
+        assert_eq!(
+            apply_completion_cooldown(
+                SessionStatus::Idle,
+                Some(AppEntryKind::AssistantMessage),
+                Some(s),
+                now
+            ),
+            SessionStatus::Processing
+        );
+    }
+
+    /// 冷却窗已过：绿态放行
+    #[test]
+    fn cooldown_passes_green_after_window() {
+        let now = 1_000_000u64;
+        let s = sig(now - 10_000, 10_000, Some(AppEntryKind::AssistantMessage));
+        assert_eq!(
+            apply_completion_cooldown(
+                SessionStatus::Idle,
+                Some(AppEntryKind::AssistantMessage),
+                Some(s),
+                now
+            ),
+            SessionStatus::Idle
+        );
+    }
+
+    /// 非绿态一律透传（黄/红不受冷却影响）
+    #[test]
+    fn cooldown_passes_non_green() {
+        let now = 1_000_000u64;
+        let s = sig(now, 10_000, None);
+        for status in [
+            SessionStatus::Processing,
+            SessionStatus::Waiting,
+            SessionStatus::Thinking,
+            SessionStatus::Compacting,
+        ] {
+            assert_eq!(
+                apply_completion_cooldown(status.clone(), None, Some(s), now),
+                status,
+                "非绿态必须透传"
+            );
+        }
+    }
+
+    /// 无信号 → 透传（无冷却证据 = 不启用）
+    #[test]
+    fn cooldown_none_signal_passes_through() {
+        assert_eq!(
+            apply_completion_cooldown(
+                SessionStatus::Idle,
+                Some(AppEntryKind::AssistantMessage),
+                None,
+                1_000_000
+            ),
+            SessionStatus::Idle
+        );
+    }
+
+    /// requires_tail 不匹配 → 透传（冷却只对特定尾部语义生效）
+    #[test]
+    fn cooldown_requires_tail_mismatch_passes() {
+        let now = 1_000_000u64;
+        let s = sig(now, 10_000, Some(AppEntryKind::AssistantMessage));
+        assert_eq!(
+            apply_completion_cooldown(
+                SessionStatus::Idle,
+                Some(AppEntryKind::ToolCall),
+                Some(s),
+                now
+            ),
+            SessionStatus::Idle,
+            "尾部是 ToolCall 时不适用 assistant 冷却"
+        );
+    }
+
+    /// requires_tail=None → 不限尾部（claude Stop grace 形态）
+    #[test]
+    fn cooldown_without_tail_requirement_applies_to_any_green() {
+        let now = 1_000_000u64;
+        let s = sig(now, 5_000, None);
+        assert_eq!(
+            apply_completion_cooldown(
+                SessionStatus::Idle,
+                Some(AppEntryKind::ToolCall),
+                Some(s),
+                now
+            ),
+            SessionStatus::Processing
+        );
+        assert_eq!(
+            apply_completion_cooldown(SessionStatus::Finished, None, Some(s), now),
+            SessionStatus::Processing
+        );
     }
 }

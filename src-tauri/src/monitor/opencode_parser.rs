@@ -1035,9 +1035,10 @@ fn determine_opencode_status(
         // 检查是否近期活跃（最后消息时间或会话更新时间在 60s 内）
         let now = chrono::Utc::now().timestamp_millis();
         let last_active = last_msg_time.max(session_updated);
-        let is_recent = now - last_active < 60_000; // 60 秒内
-                                                    // user 尾 + 近期活跃 = 输入刚提交 → 黄；其余（含 assistant 回复完）→ Idle
-                                                    // 完成即绿（2026-09-17 用户裁决）：不再有 60s Waiting 红窗
+        let is_recent =
+            now - last_active < crate::monitor::app_status::CONTENT_FRESH_OPENCODE_MS as i64;
+        // user 尾 + 近期活跃 = 输入刚提交 → 黄；其余（含 assistant 回复完）→ Idle
+        // 完成即绿（2026-09-17 用户裁决）：不再有 60s Waiting 红窗
         if last_role == Some("user") && is_recent {
             SessionStatus::Processing
         } else {

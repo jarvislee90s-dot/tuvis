@@ -2,7 +2,10 @@
 // 会话历史在 ~/.workbuddy/projects/<路径编码>/<sessionId>.jsonl（OpenAI 风格 type/role/content）
 // 所有文件均为未文档化私有格式：解析失败一律跳过/降级，禁止 panic（spec W3 防御性要求）
 
-use super::app_status::{derive_app_status, tail_semantic_kind, AppEntryKind};
+use super::app_status::{
+    apply_completion_cooldown, derive_app_status, tail_semantic_kind, AppEntryKind, CooldownSignal,
+    SessionAges,
+};
 use super::git::get_github_url;
 use super::jsonl::{read_first_lines, read_recent_lines};
 use super::project::project_name_from_path;
@@ -71,11 +74,6 @@ pub const HEARTBEAT_FRESH_MS: u64 = 90_000;
 /// 看板在场 / 未读补偿的活动窗口。刻意**不**别名到 `APP_STATUS_STALE_MS`
 /// （状态叠加阈值与在场判定是两套产品语义；调一个不应静默改另一个）。
 pub const SESSION_ACTIVE_WINDOW_MS: i64 = 300_000;
-
-/// 完成防抖窗（spec 假绿治理 §4.2）：assistant 语义尾 + JSONL mtime 年龄 < 该窗 → 拉回
-/// Processing（WorkBuddy 格式无轮次信号，中间消息假绿只能时间防抖），≥ 该窗才转绿。
-/// 注意与 FALLBACK_FRESH_MS（无信号兜底新鲜窗，300s）语义不同，独立常量不得混用
-pub const GREEN_DEBOUNCE_MS: u64 = 10_000;
 
 /// App 形态状态叠加阈值与叠加函数自共享核 re-export（issue #6 收敛后保持兼容）：
 /// 语义见 monitor::app_status——JSONL mtime 停更 >= 300s 时函数调用类尾部（Processing）
@@ -348,23 +346,6 @@ fn derive_tail_facts(lines: &[String]) -> (SessionStatus, Option<AppEntryKind>, 
 fn derive_status_with_tail(lines: &[String]) -> (SessionStatus, Option<AppEntryKind>) {
     let (status, tail_kind, _) = derive_tail_facts(lines);
     (status, tail_kind)
-}
-
-/// 完成防抖纯判定（§4.2，可测）：仅作用于「assistant 尾导出的 Idle + 新鲜」，
-/// 其余状态透传；真完成的转绿由调用方在 mtime 年龄 ≥ 窗口后自然到达
-fn apply_green_debounce(
-    status: SessionStatus,
-    tail_kind: Option<AppEntryKind>,
-    mtime_age_ms: u64,
-) -> SessionStatus {
-    if status == SessionStatus::Idle
-        && tail_kind == Some(AppEntryKind::AssistantMessage)
-        && mtime_age_ms < GREEN_DEBOUNCE_MS
-    {
-        SessionStatus::Processing
-    } else {
-        status
-    }
 }
 
 /// JSONL 尾部状态推导（对外签名不变，issue #6 起为共享核的翻译适配器）：
@@ -790,8 +771,11 @@ fn workbuddy_is_live(
 /// 仍在写，纯 300s 规则会在第 5 分钟把正在跑的卡掉掉。
 ///
 /// 状态：DB `status == "working"` → `Processing`（覆盖主 jsonl 尾部 Idle 的子代理运行期，
-/// AC9）；其余仍由主 jsonl 尾部推导（10s 完成防抖 + 300s mtime 叠加），
-/// `eff_age` 取 `max(主 jsonl mtime, DB activity, 心跳时刻)` 的年龄。
+/// AC9）；其余由主 jsonl 尾部推导，**两轴锚点不可混用**：
+/// ① 完成冷却吃 `content_age`（只取主 jsonl mtime）；
+/// ② 停更降级吃 `presence_age`（max(主 jsonl mtime, DB activity, 心跳时刻)）。
+/// 2026-11-04 前两者共用同一个 `eff_age`，心跳每 30s 刷新把年龄打回 0，
+/// 造成任务结束后的绿↔黄周期振荡（本函数的回归锁见 board_tests）。
 pub fn get_workbuddy_sessions_with(
     home: &Path,
     processes: &[AgentProcess],
@@ -900,18 +884,17 @@ pub fn get_workbuddy_sessions_with(
         // 尾部解析走 L2 摘要缓存（monitor::session_scan；行数与 codex 一致 500）
         let digest = WORKBUDDY_SCAN.parse(&jsonl, read_workbuddy_tail_digest);
         let d = digest.as_ref();
-        // 有效活动时刻 = max(主 jsonl mtime, DB activity, 心跳时刻)：
-        // 子代理干活时父 jsonl 可能停更，心跳又冻结 → 用最早的那个会把卡误判成「旧」，
-        // 混着用会把 Processing 降成 Waiting（`overlay_mtime_stale`）。
-        let eff_activity_ms = [
+        // **锚点纪律（2026-11-04 用户裁决）**：一个 age 值只服务一个判定语义。
+        // content 轴只取内容源（jsonl mtime）→ 喂完成冷却；
+        // presence 轴取内容 ∨ DB 活动 ∨ 心跳 → 喂停更降级。
+        // 修复前两轴共用 eff_age，心跳每 30s 刷新把 eff_age 打回 0，导致
+        // assistant 尾 Idle 被反复拉回 Processing（绿 20s / 黄 10s 周期振荡）。
+        let db_activity_ms = c.db_activity_ms.map(|a| a.max(0) as u64);
+        let ages = SessionAges::derive(
+            now,
             jsonl_mtime_ms,
-            c.db_activity_ms.map(|a| a.max(0) as u64),
-            c.last_heartbeat_ms,
-        ]
-        .into_iter()
-        .flatten()
-        .max();
-        let eff_age_ms = eff_activity_ms.map_or(0, |a| now.saturating_sub(a));
+            &[jsonl_mtime_ms, db_activity_ms, c.last_heartbeat_ms],
+        );
         // 已读生命周期专用“新工作”时间：只取明确的业务条目（用户消息 / 模型请求 /
         // 工具执行），不混入 DB 活动、mtime 或心跳——那些只能证明“在场”，不能证明
         // “产生了新回合”。没有业务条目时为 None，已读卡不会因普通后台更新复活。
@@ -920,9 +903,18 @@ pub fn get_workbuddy_sessions_with(
             // AC9：DB 说在干活 → 上拉 Processing（不因父会话静默而掉卡/误绿）
             SessionStatus::Processing
         } else {
+            // ① 完成冷却：content 轴。无内容源（mtime 未知）→ 无信号 = 不启用冷却。
+            // `observed_at` 必须是内容时间戳——**绝不可**用 presence 源的 max，
+            // 否则心跳每 30s 刷新会把冷却窗重置（2026-11-04 振荡缺陷根因）。
+            let signal = jsonl_mtime_ms.map(|mtime| CooldownSignal {
+                observed_at_ms: mtime,
+                hold_ms: crate::monitor::app_status::COMPLETION_COOLDOWN_MS,
+                requires_tail: Some(AppEntryKind::AssistantMessage),
+            });
             overlay_mtime_stale(
-                apply_green_debounce(d.status_core.clone(), d.tail_kind, eff_age_ms),
-                eff_age_ms,
+                apply_completion_cooldown(d.status_core.clone(), d.tail_kind, signal, now),
+                // ② 停更降级：presence 轴
+                ages.presence_age_ms().unwrap_or(0),
             )
         };
         let last_message = d.last_message.clone().unwrap_or_default();
@@ -3670,53 +3662,174 @@ mod board_tests {
         let ids: Vec<&str> = out.iter().map(|s| s.id.as_str()).collect();
         assert!(ids.contains(&SID) && ids.contains(&SID2));
     }
+
+    /// **P0 正向锁（I5）**：内容刚写下（5s）+ 心跳 1s 前刚刷新 → 冷却**必须**生效（黄）。
+    /// 与下一条反向用例成对：若有人把观测锚点从 `jsonl_mtime` 改回 presence 源的
+    /// max、或把 signal 改成 `None`，本用例立刻变绿，缺陷当场复发可被捕获。
+    #[test]
+    fn fresh_content_still_triggers_cooldown_despite_heartbeat() {
+        let home = tempfile::tempdir().unwrap();
+        let now = now_ms();
+        // jsonl 5 秒前写下（在 10s 冷却窗内）；DB completed；心跳 1 秒前
+        write_jsonl(home.path(), SID, now - 5_000);
+        seed_db(
+            home.path(),
+            &[(
+                SID,
+                "completed",
+                (now - 5_000) as i64,
+                (now - 5_000) as i64,
+                None,
+            )],
+        );
+        write_heartbeat(home.path(), 11952, SID, now - 1_000);
+
+        let out = run_board(home.path(), &[process(11952)], now);
+        assert_eq!(out.len(), 1);
+        assert_eq!(
+            out[0].status,
+            SessionStatus::Processing,
+            "assistant 尾 + 内容仅 5s 旧 → 冷却必须压住假绿（中间消息窗口）"
+        );
+    }
+
+    /// **P0 核心反向锁（2026-11-04 缺陷）**：任务已结束（DB completed、jsonl 停写
+    /// 30s），但心跳每 30s 刷新一次。心跳只能证明进程还开着，不得延长完成冷却。
+    /// 修复前：eff_age 被心跳打回 0 → assistant 尾 Idle 被拉回 Processing 10s，
+    /// 形成绿 20s / 黄 10s 的 30s 周期振荡；修复后：稳定 Idle。
+    #[test]
+    fn heartbeat_does_not_revive_green_debounce() {
+        let home = tempfile::tempdir().unwrap();
+        let now = now_ms();
+        // jsonl 30 秒前写下（超过 10s 冷却窗），DB completed，心跳 1 秒前刚刷新
+        write_jsonl(home.path(), SID, now - 30_000);
+        seed_db(
+            home.path(),
+            &[(
+                SID,
+                "completed",
+                (now - 30_000) as i64,
+                (now - 30_000) as i64,
+                None,
+            )],
+        );
+        write_heartbeat(home.path(), 11952, SID, now - 1_000);
+
+        let out = run_board(home.path(), &[process(11952)], now);
+        assert_eq!(out.len(), 1, "心跳 pid 存活 + jsonl 在 300s 内 → 必须出卡");
+        assert_eq!(
+            out[0].status,
+            SessionStatus::Idle,
+            "心跳新鲜不得把已完成的会话拉回 Processing（30s 绿黄振荡的根因）"
+        );
+    }
+
+    /// P0 反面对照：DB 说 working → 仍必须上拉 Processing（保护 AC9 不被误伤）
+    #[test]
+    fn db_working_still_pulls_processing_regardless_of_heartbeat() {
+        let home = tempfile::tempdir().unwrap();
+        let now = now_ms();
+        write_jsonl(home.path(), SID, now - 30_000);
+        seed_db(
+            home.path(),
+            &[(
+                SID,
+                "working",
+                (now - 1_000) as i64,
+                (now - 1_000) as i64,
+                None,
+            )],
+        );
+        write_heartbeat(home.path(), 11952, SID, now - 1_000);
+
+        let out = run_board(home.path(), &[process(11952)], now);
+        assert_eq!(out.len(), 1);
+        assert_eq!(
+            out[0].status,
+            SessionStatus::Processing,
+            "AC9：DB working 必须无条件上拉 Processing"
+        );
+    }
+
+    /// P0 边界：**内容源缺失 → 冷却不启用**（未知 ≠ 刚刚）。
+    /// 直接测共享纯函数：`SessionAges::derive(now, None, …)` 的 content 轴为 None，
+    /// 派生的 `CooldownSignal` 为 None → `apply_completion_cooldown` 透传。
+    /// （旧版此测试靠删 jsonl 文件，实际只走到 `find_session_jsonl` 未命中分支，
+    /// 与 content_age 无关 —— 2026-11-04 review I4 修正。）
+    #[test]
+    fn missing_content_mtime_disables_cooldown() {
+        use crate::monitor::app_status::{apply_completion_cooldown, CooldownSignal, SessionAges};
+        let now = 1_000_000u64;
+        // content 源缺失，但心跳/DB 源在（presence 轴有值）
+        let ages = SessionAges::derive(now, None, &[None, Some(now - 1_000)]);
+        assert_eq!(ages.content_age_ms(), None);
+        assert_eq!(ages.presence_age_ms(), Some(1_000), "presence 不受影响");
+
+        // 与构卡层同款接线：content_age 为 None ⇒ 无信号 ⇒ 冷却不启用
+        let signal = ages.content_age_ms().map(|_| CooldownSignal {
+            observed_at_ms: 0,
+            hold_ms: crate::monitor::app_status::COMPLETION_COOLDOWN_MS,
+            requires_tail: Some(AppEntryKind::AssistantMessage),
+        });
+        assert_eq!(signal, None, "无内容源时不得合成冷却信号");
+        assert_eq!(
+            apply_completion_cooldown(
+                SessionStatus::Idle,
+                Some(AppEntryKind::AssistantMessage),
+                signal,
+                now
+            ),
+            SessionStatus::Idle,
+            "无内容源 → 不启用冷却，直接按尾部判定为 Idle"
+        );
+    }
 }
 
 #[cfg(test)]
 mod debounce_tests {
     use super::*;
 
-    /// §4.2 判定表：仅「Idle 且尾部语义条目为 AssistantMessage 且 mtime 年龄 < 10s」拉回
-    /// Processing；窗口边界值 10_000ms 恰好放行（< 判定）；其余状态一概透传
+    /// 完成冷却：仅对「assistant 尾导出的绿 + 窗内」生效，其余透传
     #[test]
-    fn debounce_holds_processing_only_for_fresh_assistant_idle() {
+    fn completion_cooldown_holds_processing_only_for_fresh_assistant_idle() {
+        use crate::monitor::app_status::{apply_completion_cooldown, CooldownSignal};
         use crate::session::SessionStatus::*;
-        // 防抖窗内：Idle ← assistant 尾 → Processing（拦截中间消息瞬态假绿）
+        let at = 1_000_000u64;
+        let assistant = Some(AppEntryKind::AssistantMessage);
+        let fresh = Some(CooldownSignal {
+            observed_at_ms: at - 9_999,
+            hold_ms: crate::monitor::app_status::COMPLETION_COOLDOWN_MS,
+            requires_tail: Some(AppEntryKind::AssistantMessage),
+        });
         assert_eq!(
-            apply_green_debounce(Idle, Some(AppEntryKind::AssistantMessage), 9_999),
+            apply_completion_cooldown(Idle, assistant, fresh, at),
             Processing
         );
+        // 恰好到窗：放行
+        let expired = Some(CooldownSignal {
+            observed_at_ms: at - crate::monitor::app_status::COMPLETION_COOLDOWN_MS,
+            hold_ms: crate::monitor::app_status::COMPLETION_COOLDOWN_MS,
+            requires_tail: Some(AppEntryKind::AssistantMessage),
+        });
         assert_eq!(
-            apply_green_debounce(Idle, Some(AppEntryKind::AssistantMessage), 0),
-            Processing
-        );
-        // 恰好到窗：放行转绿（真完成绿灯/语音延迟 10s 到达，用户已接纳）
-        assert_eq!(
-            apply_green_debounce(
-                Idle,
-                Some(AppEntryKind::AssistantMessage),
-                GREEN_DEBOUNCE_MS
-            ),
+            apply_completion_cooldown(Idle, assistant, expired, at),
             Idle
         );
-        // 非 assistant 尾导出的 Idle（tail 为 None，如仅记账条目兜底前的形态）→ 不防抖
-        assert_eq!(apply_green_debounce(Idle, None, 0), Idle);
-        // 其他状态透传：Waiting 兜底、Processing（含 function_call 尾）、Thinking（user 尾）不受影响
+        // 无信号 → 透传
+        assert_eq!(apply_completion_cooldown(Idle, assistant, None, at), Idle);
+        // 非 assistant 尾 → 透传
         assert_eq!(
-            apply_green_debounce(Waiting, Some(AppEntryKind::AssistantMessage), 0),
+            apply_completion_cooldown(Idle, Some(AppEntryKind::ToolCall), fresh, at),
+            Idle
+        );
+        // 非绿态 → 透传
+        assert_eq!(
+            apply_completion_cooldown(Waiting, assistant, fresh, at),
             Waiting
         );
         assert_eq!(
-            apply_green_debounce(Processing, Some(AppEntryKind::AssistantMessage), 0),
+            apply_completion_cooldown(Processing, assistant, fresh, at),
             Processing
-        );
-        assert_eq!(
-            apply_green_debounce(Processing, Some(AppEntryKind::ToolCall), 0),
-            Processing
-        );
-        assert_eq!(
-            apply_green_debounce(Thinking, Some(AppEntryKind::UserMessage), 0),
-            Thinking
         );
     }
 
