@@ -2,7 +2,10 @@
 // 会话历史在 ~/.workbuddy/projects/<路径编码>/<sessionId>.jsonl（OpenAI 风格 type/role/content）
 // 所有文件均为未文档化私有格式：解析失败一律跳过/降级，禁止 panic（spec W3 防御性要求）
 
-use super::app_status::{derive_app_status, tail_semantic_kind, AppEntryKind, SessionAges};
+use super::app_status::{
+    apply_completion_cooldown, derive_app_status, tail_semantic_kind, AppEntryKind, CooldownSignal,
+    SessionAges,
+};
 use super::git::get_github_url;
 use super::jsonl::{read_first_lines, read_recent_lines};
 use super::project::project_name_from_path;
@@ -347,23 +350,6 @@ fn derive_tail_facts(lines: &[String]) -> (SessionStatus, Option<AppEntryKind>, 
 fn derive_status_with_tail(lines: &[String]) -> (SessionStatus, Option<AppEntryKind>) {
     let (status, tail_kind, _) = derive_tail_facts(lines);
     (status, tail_kind)
-}
-
-/// 完成防抖纯判定（§4.2，可测）：仅作用于「assistant 尾导出的 Idle + 新鲜」，
-/// 其余状态透传；真完成的转绿由调用方在 mtime 年龄 ≥ 窗口后自然到达
-fn apply_green_debounce(
-    status: SessionStatus,
-    tail_kind: Option<AppEntryKind>,
-    mtime_age_ms: u64,
-) -> SessionStatus {
-    if status == SessionStatus::Idle
-        && tail_kind == Some(AppEntryKind::AssistantMessage)
-        && mtime_age_ms < GREEN_DEBOUNCE_MS
-    {
-        SessionStatus::Processing
-    } else {
-        status
-    }
 }
 
 /// JSONL 尾部状态推导（对外签名不变，issue #6 起为共享核的翻译适配器）：
@@ -918,14 +904,16 @@ pub fn get_workbuddy_sessions_with(
             // AC9：DB 说在干活 → 上拉 Processing（不因父会话静默而掉卡/误绿）
             SessionStatus::Processing
         } else {
-            // ① 完成冷却：content 轴。None（mtime 未知）→ 不启用冷却（未知 ≠ 刚刚）
+            // ① 完成冷却：content 轴（无内容源 → None = 不启用冷却）
+            let cooldown = CooldownSignal {
+                observed_at_ms: jsonl_mtime_ms.unwrap_or(0),
+                hold_ms: crate::monitor::app_status::COMPLETION_COOLDOWN_MS,
+                requires_tail: Some(AppEntryKind::AssistantMessage),
+            };
+            let signal = ages.content_age_ms.map(|_| cooldown);
             overlay_mtime_stale(
-                apply_green_debounce(
-                    d.status_core.clone(),
-                    d.tail_kind,
-                    ages.content_age_ms.unwrap_or(u64::MAX),
-                ),
-                // ② 停更降级：presence 轴。None → 按 0 处理（与既有 map_or(0) 一致）
+                apply_completion_cooldown(d.status_core.clone(), d.tail_kind, signal, now),
+                // ② 停更降级：presence 轴
                 ages.presence_age_ms.unwrap_or(0),
             )
         };
@@ -3747,48 +3735,36 @@ mod board_tests {
 mod debounce_tests {
     use super::*;
 
-    /// §4.2 判定表：仅「Idle 且尾部语义条目为 AssistantMessage 且 mtime 年龄 < 10s」拉回
-    /// Processing；窗口边界值 10_000ms 恰好放行（< 判定）；其余状态一概透传
+    /// 完成冷却：仅对「assistant 尾导出的绿 + 窗内」生效，其余透传
     #[test]
-    fn debounce_holds_processing_only_for_fresh_assistant_idle() {
+    fn completion_cooldown_holds_processing_only_for_fresh_assistant_idle() {
         use crate::session::SessionStatus::*;
-        // 防抖窗内：Idle ← assistant 尾 → Processing（拦截中间消息瞬态假绿）
+        use crate::monitor::app_status::{apply_completion_cooldown, CooldownSignal};
+        let at = 1_000_000u64;
+        let assistant = Some(AppEntryKind::AssistantMessage);
+        let fresh = Some(CooldownSignal {
+            observed_at_ms: at - 9_999,
+            hold_ms: crate::monitor::app_status::COMPLETION_COOLDOWN_MS,
+            requires_tail: Some(AppEntryKind::AssistantMessage),
+        });
+        assert_eq!(apply_completion_cooldown(Idle, assistant, fresh, at), Processing);
+        // 恰好到窗：放行
+        let expired = Some(CooldownSignal {
+            observed_at_ms: at - crate::monitor::app_status::COMPLETION_COOLDOWN_MS,
+            hold_ms: crate::monitor::app_status::COMPLETION_COOLDOWN_MS,
+            requires_tail: Some(AppEntryKind::AssistantMessage),
+        });
+        assert_eq!(apply_completion_cooldown(Idle, assistant, expired, at), Idle);
+        // 无信号 → 透传
+        assert_eq!(apply_completion_cooldown(Idle, assistant, None, at), Idle);
+        // 非 assistant 尾 → 透传
         assert_eq!(
-            apply_green_debounce(Idle, Some(AppEntryKind::AssistantMessage), 9_999),
-            Processing
-        );
-        assert_eq!(
-            apply_green_debounce(Idle, Some(AppEntryKind::AssistantMessage), 0),
-            Processing
-        );
-        // 恰好到窗：放行转绿（真完成绿灯/语音延迟 10s 到达，用户已接纳）
-        assert_eq!(
-            apply_green_debounce(
-                Idle,
-                Some(AppEntryKind::AssistantMessage),
-                GREEN_DEBOUNCE_MS
-            ),
+            apply_completion_cooldown(Idle, Some(AppEntryKind::ToolCall), fresh, at),
             Idle
         );
-        // 非 assistant 尾导出的 Idle（tail 为 None，如仅记账条目兜底前的形态）→ 不防抖
-        assert_eq!(apply_green_debounce(Idle, None, 0), Idle);
-        // 其他状态透传：Waiting 兜底、Processing（含 function_call 尾）、Thinking（user 尾）不受影响
-        assert_eq!(
-            apply_green_debounce(Waiting, Some(AppEntryKind::AssistantMessage), 0),
-            Waiting
-        );
-        assert_eq!(
-            apply_green_debounce(Processing, Some(AppEntryKind::AssistantMessage), 0),
-            Processing
-        );
-        assert_eq!(
-            apply_green_debounce(Processing, Some(AppEntryKind::ToolCall), 0),
-            Processing
-        );
-        assert_eq!(
-            apply_green_debounce(Thinking, Some(AppEntryKind::UserMessage), 0),
-            Thinking
-        );
+        // 非绿态 → 透传
+        assert_eq!(apply_completion_cooldown(Waiting, assistant, fresh, at), Waiting);
+        assert_eq!(apply_completion_cooldown(Processing, assistant, fresh, at), Processing);
     }
 
     /// 尾部语义条目随摘要产出：assistant 文本尾 → (Idle, AssistantMessage)；

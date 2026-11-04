@@ -101,6 +101,58 @@ pub const CONTENT_FRESH_OPENCODE_MS: u64 = 60_000;
 /// 刷新会把年龄打回 0，冷却永远等不满（2026-11-04 缺陷根因）。
 pub const COMPLETION_COOLDOWN_MS: u64 = 10_000;
 
+/// 完成冷却信号（纯数据，各 parser 在证据层构造）。
+///
+/// 语义：在 `observed_at_ms` 观测到"完成候选"，到 `observed_at_ms + hold_ms`
+/// 之前不得报绿。`requires_tail` 用于限定只有特定尾部语义才适用冷却
+/// （WorkBuddy 的中间 assistant 假绿只发生在 assistant 尾）。
+///
+/// **`observed_at_ms` 必须是内容/事件时间戳，绝不可含心跳或 DB 活动**——
+/// 那是 [`SessionAges`] 的 presence 轴，混用会导致冷却被周期性重置。
+///
+/// 两种已知形态：
+/// - WorkBuddy：`observed_at = jsonl mtime`，`hold = COMPLETION_COOLDOWN_MS`，
+///   `requires_tail = Some(AssistantMessage)`
+/// - Claude：`observed_at = hook Stop 事件 ts`，`hold = cli/app grace`，
+///   `requires_tail = None`（预留，本批不接入）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CooldownSignal {
+    /// 完成候选被观测到的时刻（epoch ms）
+    pub observed_at_ms: u64,
+    /// 冷却时长（ms）
+    pub hold_ms: u64,
+    /// 仅该尾部语义可被冷却；`None` = 不限尾部
+    pub requires_tail: Option<AppEntryKind>,
+}
+
+/// 完成冷却（纯函数）：观测到完成候选后压住 hold 时长才允许报绿。
+///
+/// 仅作用于绿态（Idle/Finished）；其余状态透传。`signal` 为 `None` → 透传
+/// （无冷却证据 = 不启用）。`requires_tail` 与 `tail_kind` 不匹配 → 透传。
+pub fn apply_completion_cooldown(
+    status: SessionStatus,
+    tail_kind: Option<AppEntryKind>,
+    signal: Option<CooldownSignal>,
+    now_ms: u64,
+) -> SessionStatus {
+    let Some(sig) = signal else {
+        return status;
+    };
+    if !matches!(status, SessionStatus::Idle | SessionStatus::Finished) {
+        return status;
+    }
+    if let Some(required) = sig.requires_tail {
+        if tail_kind != Some(required) {
+            return status;
+        }
+    }
+    if now_ms.saturating_sub(sig.observed_at_ms) < sig.hold_ms {
+        SessionStatus::Processing
+    } else {
+        status
+    }
+}
+
 /// mtime 阈值叠加（spec §4）：函数调用类尾部停更 >= 300s 降级 Waiting；
 /// assistant 文本（Idle）等其余状态不受影响。mtime 年龄不可知时按未过期处理（防御）
 pub fn overlay_mtime_stale(status: SessionStatus, mtime_age_ms: u64) -> SessionStatus {
@@ -838,6 +890,122 @@ mod tests {
         assert!(
             COMPLETION_COOLDOWN_MS < crate::monitor::workbuddy_parser::HEARTBEAT_FRESH_MS,
             "冷却窗必须显著小于心跳周期，否则行为退化"
+        );
+    }
+
+    // ---- CooldownSignal：完成冷却通用形态（P2） ----
+
+    fn sig(
+        observed_at_ms: u64,
+        hold_ms: u64,
+        requires_tail: Option<AppEntryKind>,
+    ) -> CooldownSignal {
+        CooldownSignal {
+            observed_at_ms,
+            hold_ms,
+            requires_tail,
+        }
+    }
+
+    /// 冷却窗内：绿态 → Processing
+    #[test]
+    fn cooldown_blocks_green_within_window() {
+        let now = 1_000_000u64;
+        let s = sig(now - 5_000, 10_000, Some(AppEntryKind::AssistantMessage));
+        assert_eq!(
+            apply_completion_cooldown(
+                SessionStatus::Idle,
+                Some(AppEntryKind::AssistantMessage),
+                Some(s),
+                now
+            ),
+            SessionStatus::Processing
+        );
+    }
+
+    /// 冷却窗已过：绿态放行
+    #[test]
+    fn cooldown_passes_green_after_window() {
+        let now = 1_000_000u64;
+        let s = sig(now - 10_000, 10_000, Some(AppEntryKind::AssistantMessage));
+        assert_eq!(
+            apply_completion_cooldown(
+                SessionStatus::Idle,
+                Some(AppEntryKind::AssistantMessage),
+                Some(s),
+                now
+            ),
+            SessionStatus::Idle
+        );
+    }
+
+    /// 非绿态一律透传（黄/红不受冷却影响）
+    #[test]
+    fn cooldown_passes_non_green() {
+        let now = 1_000_000u64;
+        let s = sig(now, 10_000, None);
+        for status in [
+            SessionStatus::Processing,
+            SessionStatus::Waiting,
+            SessionStatus::Thinking,
+            SessionStatus::Compacting,
+        ] {
+            assert_eq!(
+                apply_completion_cooldown(status.clone(), None, Some(s), now),
+                status,
+                "非绿态必须透传"
+            );
+        }
+    }
+
+    /// 无信号 → 透传（无冷却证据 = 不启用）
+    #[test]
+    fn cooldown_none_signal_passes_through() {
+        assert_eq!(
+            apply_completion_cooldown(
+                SessionStatus::Idle,
+                Some(AppEntryKind::AssistantMessage),
+                None,
+                1_000_000
+            ),
+            SessionStatus::Idle
+        );
+    }
+
+    /// requires_tail 不匹配 → 透传（冷却只对特定尾部语义生效）
+    #[test]
+    fn cooldown_requires_tail_mismatch_passes() {
+        let now = 1_000_000u64;
+        let s = sig(now, 10_000, Some(AppEntryKind::AssistantMessage));
+        assert_eq!(
+            apply_completion_cooldown(
+                SessionStatus::Idle,
+                Some(AppEntryKind::ToolCall),
+                Some(s),
+                now
+            ),
+            SessionStatus::Idle,
+            "尾部是 ToolCall 时不适用 assistant 冷却"
+        );
+    }
+
+    /// requires_tail=None → 不限尾部（claude Stop grace 形态）
+    #[test]
+    fn cooldown_without_tail_requirement_applies_to_any_green() {
+        let now = 1_000_000u64;
+        let s = sig(now, 5_000, None);
+        assert_eq!(
+            apply_completion_cooldown(
+                SessionStatus::Idle,
+                Some(AppEntryKind::ToolCall),
+                Some(s),
+                now
+            ),
+            SessionStatus::Processing
+        );
+        assert_eq!(
+            apply_completion_cooldown(SessionStatus::Finished, None, Some(s), now),
+            SessionStatus::Processing
         );
     }
 }
