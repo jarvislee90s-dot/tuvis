@@ -22,6 +22,8 @@ pub mod server;
 pub mod tailscale;
 pub mod tunnel;
 pub mod watcher;
+// ZCode 官方控制手机 API（T7.1 B2a）：连接/会话只读投影，注册在既有配对 gate nest 内
+pub mod zcode;
 
 pub const KEY_ENABLED: &str = "remote.enabled";
 /// **M5 A5 起废弃**：bind 由 chan_lan 派生（bind_from_channels），生产路径不再读取；
@@ -54,8 +56,9 @@ pub const KEY_NAMED_ADDR_LAST: &str = "remote.named_addr_last";
 /// 访问密码键（M5 A2）：4 位数字（validate_pin 唯一口径；A3 端点 / A4 命令消费）
 pub const KEY_ACCESS_PIN: &str = "remote.access_pin";
 
-/// **无头注入总开关键（H3）**：默认关（缺键 = 关），显式开启才放行无头通道；
-/// 值口径与 KEY_ENABLED 同（写侧恒 "true"/"false" 显式两值，读侧只认 "true"）。
+/// **无头注入总开关键（H3）**：默认开（缺键 = 开；2026-10-24 用户裁决 §7.1），
+/// 只有显式 "false" 才保留用户关闭；空串/乱串等非法值仍判关。
+/// 值口径（写侧恒 "true"/"false" 显式两值，读侧只认 "true"）不随默认变化。
 /// 消费方：session-send / session-send-info 的 H3 门（`headless_enabled_conn`）、
 /// `remote_status.headlessEnabled` 下发、设置页「无头注入」开关。
 pub const KEY_HEADLESS: &str = "remote.headless_enabled";
@@ -121,10 +124,11 @@ pub fn headless_concurrency_conn(conn: &rusqlite::Connection) -> usize {
     )
 }
 
-/// 无头开关解析（纯函数）：仅 `"true"` 为开——缺键（未设置 = 默认关）/
-/// `"false"` / 乱串一律判关（与 KEY_ENABLED 的 `v == "true"` 同口径，不认第二真值）
+/// 无头开关解析（纯函数）：**缺键 = 开**（新默认；未配置不是用户关闭）——
+/// 显式 `"true"` 为开，显式 `"false"` 保留用户关闭；空串/乱串等非法值仍判关
+/// （不认第二真值，也不猜成用户允许）。写侧仍恒写显式两值，不做全表迁移。
 pub fn headless_enabled_from(v: Option<&str>) -> bool {
-    v == Some("true")
+    matches!(v, None | Some("true"))
 }
 
 /// 无头开关读取（**store 缝版本**，两个 H3 门共用）：直用调用方 `DeviceStore.with`
@@ -137,7 +141,8 @@ pub fn headless_enabled_conn(conn: &rusqlite::Connection) -> bool {
 
 /// **无头状态下发装配（可测缝）**：从注入的连接读开关 + H4 两项配置并写入 status
 /// 载荷——键名与取值口径的唯一落点（H3：开关状态持久化 settings 表并随
-/// `remote_status` 下发；H4：watchdog 超时与并发上限同住，三件套控件同一数据源）。
+/// `remote_status` 下发，**缺键 = 新默认开**；H4：watchdog 超时与并发上限同住，
+/// 三件套控件同一数据源）。
 pub fn apply_headless_status(st: &mut serde_json::Value, conn: &rusqlite::Connection) {
     st["headlessEnabled"] = serde_json::json!(headless_enabled_conn(conn));
     // H4：缺键也上线默认值（前端三件套控件不出现 undefined）
@@ -163,7 +168,7 @@ fn toggle_headless_core(
     );
 }
 
-/// 无头注入总开关翻转（H3：默认关，显式开启；单一总开关，不做每工具分开关）。
+/// 无头注入总开关翻转（H3：缺键默认开，显式关闭保留；单一总开关，不做每工具分开关）。
 #[tauri::command]
 pub fn remote_toggle_headless(enabled: bool) -> Result<(), String> {
     pairing::DeviceStore::global().with(|c| toggle_headless_core(c, enabled, events::audit));
@@ -174,7 +179,7 @@ pub fn remote_toggle_headless(enabled: bool) -> Result<(), String> {
 /// `"false"` / 乱串一律判关（与 `headless_enabled_from` 同口径，不认第二真值）。
 /// S1 起该键不再参与任何门（见 [`KEY_COMPAT_SEND`]），仅供旧设置 UI 显示。
 pub fn compat_send_enabled_from(v: Option<&str>) -> bool {
-    v == Some("true")
+    matches!(v, None | Some("true"))
 }
 
 /// **自动适配三态解析（纯函数，S1 单点）**：`None` = 未显式写过（缺键/乱串）→
@@ -309,12 +314,13 @@ pub fn compat_send_allowed(auto_adapt: bool, profile_send_capable: bool) -> bool
 }
 
 /// **兼容发送状态下发装配（可测缝）**：从注入的连接读开关 + 写入「读链是否已取证」
-/// 的前置判据——设置页「兼容发送（实验）」开关的唯一数据源（缺键 = 关）。
+/// 的前置判据——设置页「兼容发送（实验）」开关的唯一数据源（缺键 = 新默认开）。
 ///
 /// `compatSendEligible` = 该 build 的读链已取证（shipped 证据或只读探测通过）：
-/// false 时前端置灰并提示「需先完成只读探测」。**为什么带这个字段**：remote_status
-/// 原本没有任何 Codex 能力字段，前端没有判据就无法置灰；这里补一个**只读事实**
-/// （不改任何协议语义：send-info 的 reasonCode 契约原样不动）。
+/// false 时前端提示「需先完成只读探测」并禁止从关切到开（偏好本身可随时关闭）。
+/// **为什么带这个字段**：remote_status 原本没有任何 Codex 能力字段，前端没有判据
+/// 就无法表达资格；这里补一个**只读事实**（不改任何协议语义：send-info 的
+/// reasonCode 契约原样不动）。
 pub fn apply_compat_send_status(
     st: &mut serde_json::Value,
     conn: &rusqlite::Connection,
@@ -342,11 +348,12 @@ fn toggle_compat_send_core(
     );
 }
 
-/// 兼容发送（实验）开关翻转（#172/T8：默认关，显式开启才放行）。
+/// 兼容发送（实验）开关翻转（#172/T8；A1 起缺键默认开，显式关闭保留）。
 ///
-/// **前置门**：开启时要求「该 build 的读链已取证」（shipped 证据或只读探测通过）——
-/// 未取证时**拒绝并给出引导文案**（前端同口径置灰；后端是最终裁决，防绕过 UI 打开）。
-/// 关闭**永远允许**（用户随时能收回风险）。
+/// **前置门**：用户显式开启（例如关掉后重新打开）时要求「该 build 的读链已取证」
+/// （shipped 证据或只读探测通过）——未取证时**拒绝并给出引导文案**（前端同口径
+/// 置灰；后端是最终裁决，防绕过 UI 打开）。关闭**永远允许**（用户随时能收回风险）。
+/// 缺键默认开不写审计、不伪造用户操作——启动不迁移、不补 toggle 事件。
 #[tauri::command]
 pub fn remote_toggle_compat_send(enabled: bool) -> Result<(), String> {
     let store = pairing::DeviceStore::global();
@@ -944,6 +951,137 @@ static STATE: Lazy<std::sync::Arc<server::RemoteState>> = Lazy::new(|| {
     })
 });
 
+// ============================================================
+// ZCode 统一控制 Hub 装配（T7.1 C2b）
+// ============================================================
+
+/// 装配内核（可测）：构造**唯一** Hub，先交给远程 HTTP 状态（`/m/api/v1`），
+/// 再把同一个 Arc 交回调用方（`lib.rs` 的 `app.manage` = 桌面 IPC）。
+/// 构造闭包是唯一测试缝：生产只经 [`install_zcode_hub`]。
+fn install_zcode_hub_core(
+    build: impl FnOnce() -> std::sync::Arc<crate::services::zcode_control::ZcodeHub>,
+    attach_remote: impl FnOnce(std::sync::Arc<crate::services::zcode_control::ZcodeHub>),
+) -> std::sync::Arc<crate::services::zcode_control::ZcodeHub> {
+    let hub = build();
+    attach_remote(hub.clone());
+    hub
+}
+
+/// 生产装配：构造唯一 Hub 并挂进远程 STATE，返回给 Tauri `manage`。
+///
+/// **必须在 Tokio runtime 内调用**（`ZcodeHub::new` 会 spawn relay 事件泵与桥
+/// 出站 actor）。装配本身零授权/零连接/零浏览器：状态按已保存链接 = `needs_config`
+/// 或 `needs_auth`；已记住授权的恢复与自动连接只由 `lib.rs` 在
+/// [`start_zcode_auto_connect_after_restore`] 中显式触发。
+pub(crate) fn install_zcode_hub() -> std::sync::Arc<crate::services::zcode_control::ZcodeHub> {
+    use crate::services::zcode_control::ZcodeHub;
+
+    install_zcode_hub_core(
+        || std::sync::Arc::new(ZcodeHub::new(pairing::DeviceStore::global())),
+        |hub| STATE.set_zcode_hub(hub),
+    )
+}
+
+/// 停服/退出断开内核（**仅测试缝**）：生产同步入口自己先 `begin_disconnect`，
+/// 再把 `finish_zcode_hub` 交给 runtime；本函数保留给测试一次调用断言「begin +
+/// 有界等待」的组合语义（`wait` 只约束等待，超时返回 `false` 且不取消清理）。
+///
+/// `wake` 必须与生产入口一致：远程停服 = `true`（P2-5 补唤醒，不动
+/// `shutting_down`），退出清理 = `false`（静默：先 `begin_shutdown` 单调停机自动
+/// 连接 worker，再只释放、不自动重连）。
+#[cfg(test)]
+async fn disconnect_zcode_hub_core(
+    hub: Option<std::sync::Arc<crate::services::zcode_control::ZcodeHub>>,
+    wait: std::time::Duration,
+    wake: bool,
+) -> bool {
+    let Some(hub) = hub else {
+        return false;
+    };
+    // 与生产入口同序：退出（wake=false）先单调停机自动连接 worker，再断连接。
+    if !wake {
+        hub.begin_shutdown();
+    }
+    // 前半段：同步、不持 connect_lock、不 await——到点前 Hub 必须已经 offline。
+    let (_view, guard) = hub.begin_disconnect();
+    finish_zcode_hub(hub, guard, wait, wake).await
+}
+
+/// 清理 + 有界等待（同步入口与可测内核共用）。
+///
+/// `wake`：`true` = 远程停服/显式关闭（清位后补唤醒自动连接，P2-5）；
+/// `false` = 退出清理（静默清位，绝不新开 relay）。
+///
+/// `guard` 随 detached 任务移动：任务被取消、runtime 关停或 future 从未被调度时，
+/// future 析构会让 [`CloseGuard`](crate::services::zcode_control::hub::CloseGuard)
+/// 按 epoch 清位——绝不把 Hub 永久锁在拒绝连接态。
+async fn finish_zcode_hub(
+    hub: std::sync::Arc<crate::services::zcode_control::ZcodeHub>,
+    guard: crate::services::zcode_control::hub::CloseGuard,
+    wait: std::time::Duration,
+    wake: bool,
+) -> bool {
+    // 后半段：detached 清理（超时只影响下面的等待，不 abort 本任务）。
+    let mut cleanup = tauri::async_runtime::spawn(async move {
+        if wake {
+            hub.finish_disconnect(guard).await;
+        } else {
+            hub.finish_disconnect_silent(guard).await;
+        }
+    });
+    match tokio::time::timeout(wait, &mut cleanup).await {
+        Ok(Ok(())) => true,
+        Ok(Err(error)) => {
+            log::warn!("ZCode Hub 关停清理任务异常结束：{error}");
+            false
+        }
+        Err(_) => {
+            log::warn!(
+                "ZCode Hub 关停未在期限内完成（Hub 已 offline；清理任务继续在后台收尾，不取消）"
+            );
+            false
+        }
+    }
+}
+
+/// 关停任务上限：兜住后台断开不无限悬住（relay 断开自身另有界）。
+const ZCODE_HUB_SHUTDOWN_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// 远程显性关闭的断开口（T7.1 C2b / Fix round 2）：清位后**补唤醒**自动连接
+/// （P2-5：关闭窗口内被消费的唤醒不得丢；worker 现查 remote.enabled=false 即放弃）。
+///
+/// 调用点都在主线程或同步上下文：这里**在调用线程只做同步前半段**
+/// （`begin_disconnect`：不 await、不持 connect_lock，立即 Offline 并拿到关闭凭据），
+/// 再把清理+有界等待交给 async runtime。即使 runtime 从未调度清理任务，凭据也会随
+/// future 析构清位（不锁死 connect）。
+pub(crate) fn disconnect_zcode_hub() {
+    disconnect_zcode_hub_with(true);
+}
+
+/// 退出清理的断开口（`RunEvent::Exit` / 升级前 `on_before_exit`）：**静默**——先
+/// `begin_shutdown` 让自动连接 worker 单调停机（取消在途/退避轮），再只释放
+/// relay/计时器并清位，绝不唤醒。
+///
+/// 只去 wake 不够：已在途的握手被取消后 worker 会自行重试，退避中的定时器也会在
+/// 关闭窗口清位后到点——两者都无需任何唤醒就能重新 connect。退出时
+/// remote.enabled/auto 意图/内存 JWT 可能仍有效，因此必须同时置停机闸。
+pub(crate) fn disconnect_zcode_hub_silent() {
+    disconnect_zcode_hub_with(false);
+}
+
+/// 同步前半段 + 交给 runtime 的公共实现（两个生产入口只差 `wake`；退出先停机）。
+fn disconnect_zcode_hub_with(wake: bool) {
+    let Some(hub) = STATE.zcode_hub() else {
+        return;
+    };
+    if !wake {
+        // 退出：先单调停机自动连接 worker（在途/退避轮），再断连接。
+        hub.begin_shutdown();
+    }
+    let (_view, guard) = hub.begin_disconnect();
+    tauri::async_runtime::spawn(finish_zcode_hub(hub, guard, ZCODE_HUB_SHUTDOWN_WAIT, wake));
+}
+
 /// 从看板地址抽域名（纯函数）：快照 url 契约恒为含 /m 的完整地址（board_url 归一），
 /// 取 scheme 后、首个 / 前的 host 段，过 gate::normalize_host 归一（小写+剥端口）
 fn host_of_board_url(url: &str) -> Option<String> {
@@ -1313,6 +1451,10 @@ fn stop_server(revoke: bool) {
 /// 修订后误接回 true 会让「开关切换掉线」复活——评审时对照本矩阵逐行核对）
 fn stop_server_explicit_close() {
     stop_server(false);
+    // T7.1 C2b：远程关闭 = 断开唯一控制 Hub（推进代际、关 relay/计时器）。
+    // C4：关闭后由 `remote_toggle` 唤醒 worker；它现查 remote.enabled=false 即放弃，
+    // 不连接；重新开启远程时才允许按 auto 意图自动恢复。
+    disconnect_zcode_hub();
 }
 
 /// 热重启的停止路径（restart_listener 专用；M5 A4 遗留命名化——原为 restart_listener
@@ -1416,13 +1558,18 @@ fn record_ts_failure(e: String) {
 /// 开启分支 start 失败时**回滚 SSOT 为 false** 再传 Err：若不回滚，DB 里 enabled 残留
 /// true 而服务器实际没起（典型：TLS 安全门拒绝 / 端口被占），重进设置页开关显示 ON
 /// 而无人监听——Task 8 验收场景「TLS 门」的状态撒谎。remote_status 的句柄校准只是
-/// 展示层兜底，SSOT 本身必须与现实一致
+/// 展示层兜底，SSOT 本身必须与现实一致。
+///
+/// `wake`（C4）：开关**成功**后唤醒同一 ZCode Hub 的自动连接 worker；开启时它会按
+/// 现查的 auto 意图/授权/链接尝试一次连接，关闭时 worker 现查 `remote.enabled=false`
+/// 直接放弃（不连接）。启动失败不得唤醒。
 fn toggle_core(
     enabled: bool,
     // FnMut：开启失败时会被调用两次（写 true + 回滚写 false）
     mut set_enabled: impl FnMut(bool),
     start: impl FnOnce() -> Result<(), String>,
     stop: impl FnOnce(),
+    wake: impl FnOnce(),
 ) -> Result<(), String> {
     if enabled {
         set_enabled(true);
@@ -1431,12 +1578,111 @@ fn toggle_core(
             set_enabled(false);
             return Err(e);
         }
+        wake();
         Ok(())
     } else {
         set_enabled(false);
         stop();
+        wake();
         Ok(())
     }
+}
+
+/// C4：唤醒同一 Hub 的自动连接 worker（未装配 = no-op，不新建 Hub/不改通道规则）。
+fn wake_zcode_hub_auto_connect() {
+    if let Some(hub) = STATE.zcode_hub() {
+        hub.wake_auto_connect();
+        if let Some(queue) = hub.queue_service() {
+            queue.wake_all();
+        }
+    }
+}
+
+/// 队列事件监听（启动后由 `start_zcode_auto_connect_after_restore` 拉起）。
+pub(crate) async fn run_queue_listener(
+    listener: std::sync::Arc<
+        crate::services::zcode_control::local_queue::service::ZcodeQueueService,
+    >,
+    mut events: tokio::sync::broadcast::Receiver<
+        crate::services::zcode_control::types::ControlEvent,
+    >,
+    initial_paired: bool,
+) {
+    use crate::services::zcode_control::types::ControlEventKind;
+    if initial_paired {
+        let activation = listener.clone();
+        tokio::spawn(async move {
+            activation.on_connected().await;
+        });
+    }
+    loop {
+        tokio::select! {
+            _ = listener.wait_shutdown() => break,
+            event = events.recv() => match event {
+                Ok(event) => {
+                    if event.kind == ControlEventKind::Session {
+                        if let Ok(view) = serde_json::from_value(event.data) { listener.on_session(&view); }
+                    } else if event.kind == ControlEventKind::Connection && event.data.get("state").and_then(serde_json::Value::as_str) == Some("paired") { let activation = listener.clone(); tokio::spawn(async move { activation.on_connected().await; }); } else if event.kind != ControlEventKind::LocalQueue { listener.wake_all(); }
+                },
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => listener.wake_all(),
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    }
+}
+
+/// C4 启动接线（非阻塞）：安装本地队列/恢复队列，然后启动自动连接 worker。
+///
+/// **不再在启动时无条件读系统保险箱**：凭据恢复由 worker 在
+/// 「远程总开关 + 用户自动连接意图 + 已保存官方链接」gate 全部通过后执行；
+/// gate 未过时停在 `needs_auth`/`needs_config`，零 Keychain 读取、零连接、零 OAuth。
+/// 用户显式 connect 仍可随时触发恢复。
+pub(crate) fn start_zcode_auto_connect_after_restore(
+    hub: std::sync::Arc<crate::services::zcode_control::ZcodeHub>,
+) {
+    tauri::async_runtime::spawn(async move {
+        let (queue, first) = hub.install_queue();
+        if first {
+            queue.start_cleanup();
+        }
+        // 凭据恢复延迟到 auto-connect worker 的 gate 之后（已保存链接 + 远程开启）；
+        // 启动时不再无条件读系统保险箱。
+        if first {
+            let events = hub.subscribe();
+            if queue.recover().await.is_ok() {
+                queue.start();
+                let initial_paired = hub.connection().state
+                    == crate::services::zcode_control::types::ConnectionState::Paired;
+                tauri::async_runtime::spawn(run_queue_listener(
+                    queue.clone(),
+                    events,
+                    initial_paired,
+                ));
+            } else {
+                log::warn!("zcode local queue recovery failed; dispatch remains stopped");
+            }
+        }
+        hub.start_auto_connect();
+    });
+}
+
+/// 生产总开关内核（`remote_toggle` 的唯一调用点，可测包装）：成功启停后唤醒
+/// **同一** ZCode Hub 的自动连接 worker。唤醒闭包是生产实参
+/// [`wake_zcode_hub_auto_connect`]（不是 `|| {}`），由
+/// `production_toggle_wakes_state_hub` 经 STATE 槽做可证伪验证。
+fn toggle_remote_and_wake(
+    enabled: bool,
+    set_enabled: impl FnMut(bool),
+    start: impl FnOnce() -> Result<(), String>,
+    stop: impl FnOnce(),
+) -> Result<(), String> {
+    toggle_core(
+        enabled,
+        set_enabled,
+        start,
+        stop,
+        wake_zcode_hub_auto_connect,
+    )
 }
 
 /// 开关远程接入（前端设置页 invoke）：写设置 SSOT 后启停服务器（失败回滚见 toggle_core）。
@@ -1445,7 +1691,7 @@ fn toggle_core(
 /// （关闭 = 全停，重开按各卡状态恢复——用户裁决）
 #[tauri::command]
 pub fn remote_toggle(enabled: bool) -> Result<(), String> {
-    toggle_core(
+    toggle_remote_and_wake(
         enabled,
         |v| {
             crate::database::dao::settings::set_setting(
@@ -1516,11 +1762,12 @@ pub fn remote_status() -> serde_json::Value {
     // 设备上限（线稿「已接入设备 N / 上限」徽标；KV 可改，未设置默认 10——决策 #17）
     st["maxDevices"] = serde_json::json!(max_devices_from_kv());
     // H3/H4：无头注入总开关 + watchdog 超时 + 并发上限（设置页初值 + 移动端置灰判据；
-    // 缺键 = 默认关 / 600000ms / 2）。经可测缝 apply_headless_status（与门同一条读取路径）
+    // A1 起缺键 = 默认开 / 600000ms / 2）。经可测缝 apply_headless_status
+    //（与门同一条读取路径）
     pairing::DeviceStore::global().with(|c| apply_headless_status(&mut st, c));
     // #172/T8：兼容发送（实验）开关 + 「读链已取证」前置判据（设置页置灰的唯一数据源；
-    // 缺键 = 默认关）。判定走**只读**路径（账本 + endpoint 解析），不装配控制面、
-    // 不跑 schema 探针——设置页读一次状态不该有副作用。
+    // A1 起缺键 = 默认开；资格字段仍独立为 false）。判定走**只读**路径（账本 +
+    // endpoint 解析），不装配控制面、不跑 schema 探针——设置页读一次状态不该有副作用。
     {
         let store = pairing::DeviceStore::global();
         let eligible = codex_ipc::read_chain_verified(&store);
@@ -2610,12 +2857,65 @@ mod tests {
         assert_eq!(DEFAULT_PORT, 9420);
     }
 
-    /// #172/T8：兼容发送开关的取值口径（缺键 = 关；只认 "true"）+ 放行判据
+    /// A1（2026-10-24 用户裁决 §7.1）：两个投递偏好「缺键 = 开」——只改缺键默认，
+    /// 显式 true/false 与非法值的旧口径不动；两个设置键互相独立，不得彼此替代。
+    #[test]
+    fn default_flags_preserve_user_choice() {
+        for (name, f) in [
+            (
+                "headless",
+                headless_enabled_from as fn(Option<&str>) -> bool,
+            ),
+            (
+                "compat_send",
+                compat_send_enabled_from as fn(Option<&str>) -> bool,
+            ),
+        ] {
+            assert!(f(None), "{name}: 缺键 = 新默认开（未配置不是用户关闭）");
+            assert!(f(Some("true")), "{name}: 显式 true 仍是开");
+            assert!(!f(Some("false")), "{name}: 显式 false 保留用户关闭");
+            // 非法值一律保守判关：不猜成用户允许（空串 / 数字 / 大写变体）
+            assert!(!f(Some("")), "{name}: 空串是非法值");
+            assert!(!f(Some("1")), "{name}: 不认第二真值");
+            assert!(!f(Some("TRUE")), "{name}: 大小写变体不收");
+        }
+
+        // 同一个内存库：两键各自读取，缺键各取默认；写其中一个不影响另一个。
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::database::schema::init(&conn);
+        crate::database::migration::migrate(&conn).unwrap();
+        assert!(headless_enabled_conn(&conn), "两键均缺 → 各取默认开");
+        assert!(compat_send_enabled_conn(&conn), "两键均缺 → 各取默认开");
+        // 缺键读取只是解释默认值，不迁移、不补写、不伪造用户操作。
+        let stored: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM settings WHERE key IN (?1, ?2)",
+                rusqlite::params![KEY_HEADLESS, KEY_COMPAT_SEND],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, 0, "缺键不得被补写成显式设置");
+        crate::database::dao::settings::set_setting_conn(&conn, KEY_HEADLESS, "false");
+        assert!(!headless_enabled_conn(&conn));
+        assert!(
+            compat_send_enabled_conn(&conn),
+            "显式关闭 H3 不得连带关闭兼容发送"
+        );
+        crate::database::dao::settings::set_setting_conn(&conn, KEY_COMPAT_SEND, "false");
+        crate::database::dao::settings::set_setting_conn(&conn, KEY_HEADLESS, "true");
+        assert!(headless_enabled_conn(&conn));
+        assert!(
+            !compat_send_enabled_conn(&conn),
+            "显式关闭兼容发送不得被 H3 的开覆盖"
+        );
+    }
+
+    /// #172/T8：兼容发送开关的取值口径（缺键 = 开；只认 "true"）+ 放行判据
     /// （开关开 ∧ 写能力未取证；已验证 build 恒不受益）。
     #[test]
     fn compat_send_switch_and_gate_semantics() {
-        // 缺键 / "false" / 乱串 → 一律关（与 headless 同口径，不认第二真值）
-        assert!(!compat_send_enabled_from(None));
+        // 缺键 = 新默认开；"false" / 乱串 → 一律关（不认第二真值）
+        assert!(compat_send_enabled_from(None));
         assert!(!compat_send_enabled_from(Some("false")));
         assert!(!compat_send_enabled_from(Some("1")));
         assert!(!compat_send_enabled_from(Some("TRUE")));
@@ -2628,16 +2928,21 @@ mod tests {
         assert!(!compat_send_allowed(true, true));
     }
 
-    /// #172/T8：兼容发送状态装配（设置页的唯一数据源）——缺键 = 关；前置判据原样下发。
+    /// #172/T8：兼容发送状态装配（设置页的唯一数据源）——A1 起缺键 = 默认开；
+    /// 显式 false 保留；前置判据原样下发（不随开关默认值变化）。
     #[test]
     fn compat_send_status_payload_shape() {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         crate::database::schema::init(&conn);
         let mut st = serde_json::json!({});
         apply_compat_send_status(&mut st, &conn, false);
-        assert_eq!(st["compatSendEnabled"], serde_json::json!(false));
+        assert_eq!(st["compatSendEnabled"], serde_json::json!(true));
         assert_eq!(st["compatSendEligible"], serde_json::json!(false));
-        // 写侧恒写显式两值；读侧只认 "true"
+        // 写侧恒写显式两值；显式 false 不被缺键默认覆盖
+        crate::database::dao::settings::set_setting_conn(&conn, KEY_COMPAT_SEND, "false");
+        let mut st = serde_json::json!({});
+        apply_compat_send_status(&mut st, &conn, false);
+        assert_eq!(st["compatSendEnabled"], serde_json::json!(false));
         crate::database::dao::settings::set_setting_conn(&conn, KEY_COMPAT_SEND, "true");
         let mut st = serde_json::json!({});
         apply_compat_send_status(&mut st, &conn, true);
@@ -2892,6 +3197,8 @@ mod tests {
     /// 记录调用的假闭包，不触真实 ~/.tuvis/tuvis.db、不绑端口、不碰 SERVER_HANDLE
     #[test]
     fn toggle_core_rolls_back_ssot_when_start_fails() {
+        // C4：成功开启/关闭都要唤醒 ZCode 自动连接 worker；启动失败不得唤醒。
+        let mut woke = 0;
         // (1) 开启失败：先写 true，start 报错后回滚 false，Err 原样传出
         let mut log: Vec<&str> = vec![];
         let r = toggle_core(
@@ -2899,6 +3206,7 @@ mod tests {
             |v| log.push(if v { "set=true" } else { "set=false" }),
             || Err("对外绑定需先确认已配置 TLS 反向代理（remote_confirm_public）".into()),
             || panic!("开启分支不得触发 stop"),
+            || woke += 1,
         );
         assert!(r.is_err(), "start 失败必须把 Err 传出去");
         assert_eq!(
@@ -2906,6 +3214,7 @@ mod tests {
             vec!["set=true", "set=false"],
             "启动失败必须把 SSOT 回滚为 false"
         );
+        assert_eq!(woke, 0, "开启失败不得唤醒自动连接");
 
         // (2) 开启成功：SSOT 保持 true，不回滚
         let mut log: Vec<&str> = vec![];
@@ -2914,9 +3223,11 @@ mod tests {
             |v| log.push(if v { "set=true" } else { "set=false" }),
             || Ok(()),
             || panic!("开启分支不得触发 stop"),
+            || woke += 1,
         );
         assert!(r.is_ok());
         assert_eq!(log, vec!["set=true"], "成功路径不得回滚 SSOT");
+        assert_eq!(woke, 1, "开启成功必须唤醒 ZCode 自动连接 worker");
 
         // (3) 关闭：SSOT 写 false + 触发 stop，不触发 start
         let mut log: Vec<&str> = vec![];
@@ -2926,10 +3237,15 @@ mod tests {
             |v| log.push(if v { "set=true" } else { "set=false" }),
             || panic!("关闭分支不得触发 start"),
             || stopped = true,
+            || woke += 1,
         );
         assert!(r.is_ok());
         assert!(stopped, "关闭必须触发 stop");
         assert_eq!(log, vec!["set=false"], "关闭路径 SSOT 直接写 false");
+        assert_eq!(
+            woke, 2,
+            "关闭同样唤醒 worker（现查 remote.enabled=false 不连接）"
+        );
     }
 
     /// (c-2) remote_status 的 enabled 校准内核（终审修复轮）：DB 声明与句柄存活
@@ -5058,5 +5374,754 @@ mod host_tests {
         } else {
             assert_eq!(p, "linux");
         }
+    }
+}
+
+/// T7.1 C2b 装配测试：单 Hub Arc（桌面 managed state ↔ `/m/api/v1`）、启动零
+/// 授权/零连接、停服断开。fixture 全部合成（内存 DeviceStore + fake HubBackend），
+/// 不触真实账号/DB/网络。
+#[cfg(test)]
+mod zcode_wiring_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    use futures::future::BoxFuture;
+
+    use crate::database::dao::settings::try_set_setting_conn;
+    use crate::remote::pairing::DeviceStore;
+    use crate::services::zcode_control::{
+        codes, set_config, ActionContext, ActionReceipt, AuthProblem, AuthStatus, BoundTarget,
+        CapabilityView, ConnectionState, ConnectionView, ControlAction, DeviceRoute, HubBackend,
+        OAuthProvider, OpenAuthorize, SessionView, TargetKey, ZResult, ZcodeError, ZcodeHub,
+    };
+
+    const URL: &str = "https://zcode.z.ai/remote/v4?sid=synthetic-wire-0001&name=SyntheticWire";
+
+    /// 记录型后端：所有方法只计数（装配/断开断言零授权、零连接）。
+    #[derive(Default)]
+    struct FakeBackend {
+        authorize_calls: AtomicUsize,
+        connect_calls: AtomicUsize,
+        disconnect_calls: AtomicUsize,
+        reset_calls: AtomicUsize,
+        /// 模拟 connect 持锁时 disconnect 被挂住（关停有界测试）。
+        disconnect_hangs: AtomicBool,
+        /// 首次 disconnect 的闸：模拟「清理在超时之后才继续」（默认放行）。
+        disconnect_gate: Mutex<Option<Arc<tokio::sync::Notify>>>,
+        /// 一次性 connect 闸：模拟「自动连接握手已在途」（退出取消在途尝试用）。
+        connect_gate: Mutex<Option<Arc<tokio::sync::Notify>>>,
+        /// C4 启动/唤醒接线：后端是否持有可用授权（默认未授权 = 无 OAuth 记录）。
+        authorized: AtomicBool,
+        remembered: AtomicBool,
+        /// 恢复结果的 problem（如系统保险箱锁定）；`None` = 无问题。
+        problem: Mutex<Option<AuthProblem>>,
+        restore_calls: AtomicUsize,
+    }
+
+    impl FakeBackend {
+        fn counters(&self) -> [usize; 4] {
+            [
+                self.authorize_calls.load(Ordering::SeqCst),
+                self.connect_calls.load(Ordering::SeqCst),
+                self.disconnect_calls.load(Ordering::SeqCst),
+                self.reset_calls.load(Ordering::SeqCst),
+            ]
+        }
+    }
+
+    impl HubBackend for FakeBackend {
+        fn authorize<'a>(
+            &'a self,
+            _provider: OAuthProvider,
+            _open: OpenAuthorize,
+        ) -> BoxFuture<'a, ZResult<()>> {
+            self.authorize_calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(()) })
+        }
+
+        fn restore_authorization<'a>(&'a self) -> BoxFuture<'a, AuthStatus> {
+            self.restore_calls.fetch_add(1, Ordering::SeqCst);
+            let status = self.auth_status();
+            Box::pin(async move { status })
+        }
+
+        fn auth_status(&self) -> AuthStatus {
+            AuthStatus {
+                authorized: self.authorized.load(Ordering::SeqCst),
+                remembered: self.remembered.load(Ordering::SeqCst),
+                problem: *self.problem.lock().unwrap(),
+                ..AuthStatus::default()
+            }
+        }
+
+        fn connect<'a>(&'a self, _route: DeviceRoute) -> BoxFuture<'a, ZResult<ConnectionView>> {
+            self.connect_calls.fetch_add(1, Ordering::SeqCst);
+            let gate = self.connect_gate.lock().unwrap().take();
+            Box::pin(async move {
+                if let Some(gate) = gate {
+                    gate.notified().await;
+                }
+                Ok(ConnectionView {
+                    state: ConnectionState::Paired,
+                    generation: 1,
+                    reason_code: None,
+                    device_label: Some("synthetic-wire".into()),
+                })
+            })
+        }
+
+        fn disconnect<'a>(&'a self) -> BoxFuture<'a, ()> {
+            let call = self.disconnect_calls.fetch_add(1, Ordering::SeqCst);
+            if self.disconnect_hangs.load(Ordering::SeqCst) {
+                return Box::pin(futures::future::pending());
+            }
+            // 只挂住首次断开（模拟超时后的清理窗口）；第二次断开（锁后收尾）直接放行。
+            let gate = if call == 0 {
+                self.disconnect_gate.lock().unwrap().take()
+            } else {
+                None
+            };
+            Box::pin(async move {
+                if let Some(gate) = gate {
+                    gate.notified().await;
+                }
+            })
+        }
+
+        fn reset<'a>(&'a self, _generation: u64) -> BoxFuture<'a, ()> {
+            self.reset_calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async {})
+        }
+
+        fn bind_session<'a>(&'a self, _key: &'a TargetKey) -> BoxFuture<'a, ZResult<BoundTarget>> {
+            Box::pin(async { Err(ZcodeError::of(codes::NO_SESSION)) })
+        }
+
+        fn session<'a>(&'a self, _target: &'a BoundTarget) -> BoxFuture<'a, ZResult<SessionView>> {
+            Box::pin(async { Err(ZcodeError::of(codes::NOT_READY)) })
+        }
+
+        fn execute<'a>(
+            &'a self,
+            _ctx: &'a ActionContext,
+            _target: &'a BoundTarget,
+            _action: &'a ControlAction,
+        ) -> BoxFuture<'a, ZResult<ActionReceipt>> {
+            Box::pin(async { Err(ZcodeError::of(codes::NOT_READY)) })
+        }
+
+        fn policy(&self) -> CapabilityView {
+            CapabilityView::default()
+        }
+    }
+
+    /// 内存库 + 合成保存链接（不落真实 ~/.tuvis）。
+    fn stored(url: &str) -> DeviceStore {
+        let store = DeviceStore::memory();
+        store.with(|conn| set_config(conn, url).unwrap());
+        store
+    }
+
+    fn fake_hub(fake: Arc<FakeBackend>, store: DeviceStore) -> Arc<ZcodeHub> {
+        Arc::new(ZcodeHub::with_parts(store, fake, CapabilityView::default()))
+    }
+
+    fn noop_open() -> OpenAuthorize {
+        Arc::new(|_| Ok(()))
+    }
+
+    /// 有界等待（detached 清理跑在 tauri 全局 runtime 上，不忙等也不无限等）。
+    async fn wait_until(mut condition: impl FnMut() -> bool, what: &str) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !condition() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "清理未在 2s 内推进：{what}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+
+    /// 装配只产出**一个** Arc：远程状态（`/m/api/v1`）与桌面 managed state 是同一份。
+    #[test]
+    fn remote_and_desktop_share_one_hub_arc() {
+        let fake = Arc::new(FakeBackend::default());
+        let remote_slot: Arc<Mutex<Option<Arc<ZcodeHub>>>> = Arc::new(Mutex::new(None));
+        let attach = remote_slot.clone();
+        let build_fake = fake.clone();
+        let managed = install_zcode_hub_core(
+            move || fake_hub(build_fake, stored(URL)),
+            move |hub| *attach.lock().unwrap() = Some(hub),
+        );
+
+        let guard = remote_slot.lock().unwrap();
+        let remote = guard.as_ref().expect("远程 /m/api/v1 必须拿到 Hub");
+        assert!(Arc::ptr_eq(&managed, remote), "桌面与手机必须共用同一 Arc");
+        assert_eq!(Arc::strong_count(&managed), 2, "全进程只允许一个 Hub 实例");
+        assert_eq!(remote.connection().state, ConnectionState::NeedsAuth);
+        drop(guard);
+        assert_eq!(fake.counters(), [0; 4], "装配不得授权/连接/断开");
+    }
+
+    /// C4 新契约：**装配本身**零副作用（已保存链接 → needs_auth、未保存 →
+    /// needs_config；两态都零授权、零连接、零事件广播）。启动恢复/自动连接只发生在
+    /// `start_zcode_auto_connect_after_restore`（见下方 startup_wiring_* 用例），
+    /// 绝不藏在 Hub 构造里。
+    #[test]
+    fn assembly_does_not_authorize_or_connect() {
+        let fake = Arc::new(FakeBackend::default());
+        let build_fake = fake.clone();
+        let hub = install_zcode_hub_core(move || fake_hub(build_fake, stored(URL)), |_| {});
+        assert_eq!(hub.connection().state, ConnectionState::NeedsAuth);
+        assert_eq!(fake.counters(), [0; 4]);
+        assert!(
+            hub.subscribe().try_recv().is_err(),
+            "装配不得广播任何连接事件"
+        );
+
+        let build_fake = fake.clone();
+        let unconfigured =
+            install_zcode_hub_core(move || fake_hub(build_fake, DeviceStore::memory()), |_| {});
+        assert_eq!(
+            unconfigured.connection().state,
+            ConnectionState::NeedsConfig
+        );
+        assert_eq!(fake.counters(), [0; 4], "两态都不得触达后端");
+    }
+
+    /// C4 启动接线：先恢复系统存储授权（不打开浏览器），再启动自动连接 worker；
+    /// 已记住授权 → 一次恢复、一次连接即 paired，零 OAuth。
+    #[tokio::test]
+    async fn startup_installs_queue_after_restore_and_shutdown_stops_it() {
+        let fake = Arc::new(FakeBackend::default());
+        let hub = fake_hub(fake.clone(), DeviceStore::memory());
+        start_zcode_auto_connect_after_restore(hub.clone());
+        wait_until(|| hub.queue_service().is_some(), "启动必须安装队列服务").await;
+        assert_eq!(
+            fake.restore_calls.load(Ordering::SeqCst),
+            0,
+            "未配置链接/远程关闭时启动不得读系统保险箱"
+        );
+        let service = hub.queue_service().unwrap();
+        hub.begin_shutdown();
+        assert!(service.is_stopped());
+    }
+    #[tokio::test]
+    async fn startup_wiring_restores_and_auto_connects_once() {
+        let fake = Arc::new(FakeBackend::default());
+        fake.authorized.store(true, Ordering::SeqCst);
+        let store = stored(URL);
+        store
+            .with(|conn| try_set_setting_conn(conn, KEY_ENABLED, "true"))
+            .unwrap();
+        let hub = fake_hub(fake.clone(), store);
+
+        start_zcode_auto_connect_after_restore(hub.clone());
+        wait_until(
+            || hub.connection().state == ConnectionState::Paired,
+            "启动接线必须恢复授权并自动连接一次",
+        )
+        .await;
+        assert_eq!(fake.authorize_calls.load(Ordering::SeqCst), 0, "不得 OAuth");
+        assert_eq!(fake.connect_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            fake.restore_calls.load(Ordering::SeqCst),
+            1,
+            "启动助手恢复 + worker 尝试合计只允许读一次系统存储"
+        );
+    }
+
+    /// C4 启动接线：无 OAuth 记录时只恢复、不连接、不开浏览器（保留旧安全契约）。
+    #[tokio::test]
+    async fn startup_wiring_without_stored_authorization_never_connects_or_opens_browser() {
+        let fake = Arc::new(FakeBackend::default());
+        let store = stored(URL);
+        store
+            .with(|conn| try_set_setting_conn(conn, KEY_ENABLED, "true"))
+            .unwrap();
+        let hub = fake_hub(fake.clone(), store);
+
+        start_zcode_auto_connect_after_restore(hub.clone());
+        wait_until(
+            || fake.restore_calls.load(Ordering::SeqCst) >= 1,
+            "启动接线必须先恢复授权",
+        )
+        .await;
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            fake.authorize_calls.load(Ordering::SeqCst),
+            0,
+            "不得自动 OAuth"
+        );
+        assert_eq!(
+            fake.connect_calls.load(Ordering::SeqCst),
+            0,
+            "无授权不得连接"
+        );
+        assert_eq!(hub.connection().state, ConnectionState::NeedsAuth);
+    }
+
+    /// P2-7：启动恢复失败（系统保险箱锁定）后 worker 不得再读一次原生存储。
+    ///
+    /// gate 全开（remote.enabled + auto=true + 链接已保存）：旧实现 worker 会再调一次
+    /// `restore_authorization`，restore 次数变 2；启动恢复只允许尝试一次。
+    #[tokio::test]
+    async fn startup_wiring_locked_restore_is_attempted_only_once() {
+        let fake = Arc::new(FakeBackend::default());
+        *fake.problem.lock().unwrap() = Some(AuthProblem::LockedOrDenied);
+        let store = stored(URL);
+        store
+            .with(|conn| try_set_setting_conn(conn, KEY_ENABLED, "true"))
+            .unwrap();
+        let hub = fake_hub(fake.clone(), store);
+
+        start_zcode_auto_connect_after_restore(hub.clone());
+        wait_until(
+            || hub.auto_attempt_count() >= 1,
+            "worker 必须在 gate 全开时跑完首次尝试",
+        )
+        .await;
+        wait_until(
+            || hub.auth_status().problem == Some(AuthProblem::LockedOrDenied),
+            "首次恢复的锁定问题必须保留在状态里",
+        )
+        .await;
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            fake.restore_calls.load(Ordering::SeqCst),
+            1,
+            "锁定失败也只允许尝试一次启动恢复"
+        );
+        assert_eq!(
+            fake.connect_calls.load(Ordering::SeqCst),
+            0,
+            "锁定未授权不得连接"
+        );
+        assert_eq!(fake.authorize_calls.load(Ordering::SeqCst), 0, "不得 OAuth");
+        assert_eq!(hub.connection().state, ConnectionState::NeedsAuth);
+    }
+
+    /// P2-7：启动恢复无凭据（失败）后 worker 打开 gate 也不得二次恢复；零连接零 OAuth。
+    #[tokio::test]
+    async fn auto_worker_never_reads_native_store_after_startup_restore() {
+        let fake = Arc::new(FakeBackend::default());
+        let store = stored(URL);
+        store
+            .with(|conn| try_set_setting_conn(conn, KEY_ENABLED, "true"))
+            .unwrap();
+        let hub = fake_hub(fake.clone(), store);
+
+        start_zcode_auto_connect_after_restore(hub.clone());
+        wait_until(
+            || hub.auto_attempt_count() >= 1,
+            "gate 全开时 worker 必须跑完首次尝试",
+        )
+        .await;
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            fake.restore_calls.load(Ordering::SeqCst),
+            1,
+            "启动恢复只允许尝试一次（worker 不得再读原生存储）"
+        );
+        assert_eq!(fake.connect_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(fake.authorize_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(hub.connection().state, ConnectionState::NeedsAuth);
+    }
+
+    /// P2-7：显式 connect 是用户点击重试，不受「启动只恢复一次」限制。
+    #[tokio::test]
+    async fn explicit_connect_still_restores_after_startup_attempt() {
+        let fake = Arc::new(FakeBackend::default());
+        let store = stored(URL);
+        store
+            .with(|conn| try_set_setting_conn(conn, KEY_ENABLED, "true"))
+            .unwrap();
+        let hub = fake_hub(fake.clone(), store);
+
+        start_zcode_auto_connect_after_restore(hub.clone());
+        wait_until(
+            || fake.restore_calls.load(Ordering::SeqCst) >= 1,
+            "启动助手必须先恢复一次",
+        )
+        .await;
+        wait_until(
+            || hub.auto_attempt_count() >= 1,
+            "worker 必须跑完首次尝试（不得二次恢复）",
+        )
+        .await;
+        assert_eq!(fake.restore_calls.load(Ordering::SeqCst), 1);
+
+        // 用户点击连接：未授权 → 显式重试恢复（仍不打开浏览器/不连接）。
+        assert!(hub.connect_requested().await.is_err());
+        assert_eq!(
+            fake.restore_calls.load(Ordering::SeqCst),
+            2,
+            "显式 connect 必须能再次触发恢复"
+        );
+        assert_eq!(fake.authorize_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(fake.connect_calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// 新契约：未配置链接/远程关闭时，启动不得触碰系统保险箱；worker gate 不通过
+    /// 就不恢复，Hub 保持在 needs_auth/needs_config 的安全侧。
+    #[tokio::test]
+    async fn startup_skips_restore_when_auto_connect_gate_is_closed() {
+        let fake = Arc::new(FakeBackend::default());
+        fake.authorized.store(true, Ordering::SeqCst);
+        fake.remembered.store(true, Ordering::SeqCst);
+        let store = stored(URL);
+        store
+            .with(|conn| {
+                try_set_setting_conn(conn, KEY_ENABLED, "false")?;
+                try_set_setting_conn(conn, "remote.zcode_auto_connect", "false")
+            })
+            .unwrap();
+        let hub = fake_hub(fake.clone(), store);
+
+        start_zcode_auto_connect_after_restore(hub.clone());
+        wait_until(
+            || hub.auto_attempt_count() >= 1,
+            "worker 必须跑完一次尝试（gate 关闭即停）",
+        )
+        .await;
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            fake.restore_calls.load(Ordering::SeqCst),
+            0,
+            "gate 关闭时不得读取系统保险箱"
+        );
+        assert_eq!(fake.connect_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(fake.authorize_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(hub.connection().state, ConnectionState::NeedsAuth);
+    }
+
+    /// C4 生产唤醒接线可证伪用例：`remote_toggle` 唯一调用 `toggle_remote_and_wake`，
+    /// 后者的生产实参是 `wake_zcode_hub_auto_connect`（不是 `|| {}`）。这里经 STATE
+    /// 槽放同一个 fake Hub，走**生产包装**分别开启/关闭一次，断言 `auto_attempt_count`
+    /// 每次增长（worker 真被唤醒）。把包装里的 wake 换成 `|| {}`，本用例即超时失败。
+    #[tokio::test]
+    async fn production_toggle_wakes_state_hub() {
+        let fake = Arc::new(FakeBackend::default());
+        let hub = fake_hub(fake.clone(), stored(URL));
+        STATE.set_zcode_hub(hub.clone());
+        hub.start_auto_connect();
+        wait_until(
+            || hub.auto_attempt_count() >= 1,
+            "worker 首次尝试（start 自带一次）",
+        )
+        .await;
+
+        let before_enable = hub.auto_attempt_count();
+        toggle_remote_and_wake(true, |_| {}, || Ok(()), || panic!("开启分支不得 stop"))
+            .expect("开启包装应成功");
+        wait_until(
+            || hub.auto_attempt_count() > before_enable,
+            "开启成功必须唤醒 STATE 里的同一 Hub（不能是 || {}）",
+        )
+        .await;
+
+        let before_disable = hub.auto_attempt_count();
+        toggle_remote_and_wake(false, |_| {}, || panic!("关闭分支不得 start"), || {})
+            .expect("关闭包装应成功");
+        wait_until(
+            || hub.auto_attempt_count() > before_disable,
+            "关闭成功同样必须唤醒 worker（现查 remote.enabled=false 不连接）",
+        )
+        .await;
+        assert_eq!(
+            fake.connect_calls.load(Ordering::SeqCst),
+            0,
+            "remote.enabled 未开：唤醒只做一次 gate 判定，不连接"
+        );
+
+        // 清理：把槽换成未启动 worker 的空 Hub，避免其他用例意外唤醒本记录型 fake。
+        // （槽按 STATE.sse_registry 身份只增不删，这是唯一可用的复位方式。）
+        let inert_fake = Arc::new(FakeBackend::default());
+        STATE.set_zcode_hub(fake_hub(inert_fake, DeviceStore::memory()));
+    }
+
+    /// 停服 = 显式断开 Hub（关 relay/计时器、状态 offline），**绝不自动重连**；
+    /// 未装配时 no-op。
+    #[tokio::test]
+    async fn remote_stop_disconnects_hub() {
+        let fake = Arc::new(FakeBackend::default());
+        let hub = fake_hub(fake.clone(), stored(URL));
+        hub.authorize(OAuthProvider::Bigmodel, noop_open())
+            .await
+            .unwrap();
+        hub.connect().await.unwrap();
+        assert!(hub.connection().is_paired());
+        let connects_before = fake.connect_calls.load(Ordering::SeqCst);
+
+        assert!(
+            disconnect_zcode_hub_core(Some(hub.clone()), ZCODE_HUB_SHUTDOWN_WAIT, true).await,
+            "正常断开应完成"
+        );
+        assert_eq!(
+            fake.disconnect_calls.load(Ordering::SeqCst),
+            2,
+            "断开 = 先取消在途 + 锁后再关一次"
+        );
+        assert_eq!(hub.connection().state, ConnectionState::Offline);
+        assert!(
+            !hub.shutting_down(),
+            "远程停服不是退出：不得置单调停机闸（否则重开远程后无法自动恢复）"
+        );
+        assert_eq!(
+            fake.connect_calls.load(Ordering::SeqCst),
+            connects_before,
+            "停服不得自动重连"
+        );
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            hub.connection().state,
+            ConnectionState::Offline,
+            "无人显式 connect 前必须保持 offline"
+        );
+
+        assert!(
+            !disconnect_zcode_hub_core(None, ZCODE_HUB_SHUTDOWN_WAIT, true).await,
+            "未装配 = no-op"
+        );
+    }
+
+    /// 终审 scoped Important（exit-only 残留）：静默入口不仅要「不唤醒」，还必须
+    /// **单调停机** worker——已在途的自动连接握手被取消后，worker 会自行重试；
+    /// 关闭窗口清位后它无需任何唤醒就能再 connect。
+    #[tokio::test]
+    async fn silent_shutdown_cancels_inflight_auto_attempt() {
+        let fake = Arc::new(FakeBackend::default());
+        fake.authorized.store(true, Ordering::SeqCst);
+        fake.remembered.store(true, Ordering::SeqCst);
+        let store = stored(URL);
+        store
+            .with(|conn| try_set_setting_conn(conn, KEY_ENABLED, "true"))
+            .unwrap();
+        let hub = fake_hub(fake.clone(), store);
+        hub.start_auto_connect();
+        wait_until(
+            || hub.connection().state == ConnectionState::Paired,
+            "前置：自动连接必须已配对",
+        )
+        .await;
+        assert_eq!(fake.connect_calls.load(Ordering::SeqCst), 1);
+
+        // 普通断开会唤醒 worker 立刻开新握手：用闸把它卡在 fake.connect 内
+        //（此时它已持 connect_lock，正是退出清理必须取消的在途尝试）。
+        let gate = Arc::new(tokio::sync::Notify::new());
+        fake.connect_gate.lock().unwrap().replace(gate.clone());
+        hub.disconnect().await;
+        wait_until(
+            || fake.connect_calls.load(Ordering::SeqCst) >= 2,
+            "worker 必须已进入在途握手（被闸卡住）",
+        )
+        .await;
+
+        // 退出静默：begin_shutdown（单调停机）+ begin_disconnect + 静默收尾。
+        let silent = {
+            let hub = hub.clone();
+            tokio::spawn(async move {
+                disconnect_zcode_hub_core(Some(hub), ZCODE_HUB_SHUTDOWN_WAIT, false).await
+            })
+        };
+        wait_until(
+            || hub.connection().state == ConnectionState::Offline,
+            "静默前半段必须立即 offline",
+        )
+        .await;
+        assert!(
+            hub.shutting_down(),
+            "静默退出必须先置单调停机闸（不能只去 wake）"
+        );
+
+        // 放行在途握手：结果作废；worker 不得凭旧轮次再发起 connect。
+        gate.notify_one();
+        assert!(silent.await.expect("spawn 不应 panic"), "静默关闭应完成");
+        assert_eq!(
+            fake.connect_calls.load(Ordering::SeqCst),
+            2,
+            "退出不得再发起新的 connect"
+        );
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            fake.connect_calls.load(Ordering::SeqCst),
+            2,
+            "停机后 worker 绝不自重连"
+        );
+        assert_eq!(hub.connection().state, ConnectionState::Offline);
+    }
+
+    /// 退出路径回归（P2-5 补唤醒不得外溢）：自动连接/远程/链接全开且已配对时，
+    /// **静默**入口（`disconnect_zcode_hub_silent`）只唤醒 worker 做停机取消
+    ///（`begin_shutdown`），绝不补「可重连」的唤醒——退出只释放，不自动重连。
+    ///
+    /// 终审补充：停机是**单调**的（`shutting_down` 不撤销）——退出后的显式唤醒同样
+    /// 不得重连（进程即将终结，绝不复活连接）。
+    #[tokio::test]
+    async fn silent_shutdown_does_not_wake_auto_connect() {
+        let fake = Arc::new(FakeBackend::default());
+        fake.authorized.store(true, Ordering::SeqCst);
+        fake.remembered.store(true, Ordering::SeqCst);
+        let store = stored(URL);
+        store
+            .with(|conn| try_set_setting_conn(conn, KEY_ENABLED, "true"))
+            .unwrap();
+        let hub = fake_hub(fake.clone(), store);
+        hub.start_auto_connect();
+        wait_until(
+            || hub.connection().state == ConnectionState::Paired,
+            "前置：自动连接必须已配对",
+        )
+        .await;
+        let connects = fake.connect_calls.load(Ordering::SeqCst);
+
+        // 退出清理内核：begin（同步前半段）+ finish(..., wake=false)。
+        assert!(
+            disconnect_zcode_hub_core(Some(hub.clone()), ZCODE_HUB_SHUTDOWN_WAIT, false).await,
+            "静默断开应完成"
+        );
+        assert_eq!(hub.connection().state, ConnectionState::Offline);
+
+        // 观察窗：`begin_shutdown` 的唤醒只允许让 worker 跑出一次 Stopped；
+        // 若误走「可重连」的唤醒，这里会看到新 connect。
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            fake.connect_calls.load(Ordering::SeqCst),
+            connects,
+            "退出静默断开后不得自动重连"
+        );
+        assert_eq!(hub.connection().state, ConnectionState::Offline);
+        assert!(hub.shutting_down(), "静默退出必须置单调停机闸");
+
+        // 单调停机：退出后的显式唤醒也不得重连（不复活即将终结的进程连接）。
+        hub.wake_auto_connect();
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            fake.connect_calls.load(Ordering::SeqCst),
+            connects,
+            "停机后即使显式唤醒也不得自动连接"
+        );
+        assert_eq!(hub.connection().state, ConnectionState::Offline);
+    }
+
+    /// 关停任务必须有界：清理被挂住时，内核按上限返回 false，Hub 仍**立即** offline，
+    /// 绝不无限悬住（调用线程不等待，后台任务也不许永久占着）。
+    #[tokio::test]
+    async fn shutdown_disconnect_is_bounded_even_when_disconnect_hangs() {
+        let fake = Arc::new(FakeBackend::default());
+        fake.disconnect_hangs.store(true, Ordering::SeqCst);
+        let hub = fake_hub(fake.clone(), stored(URL));
+        hub.authorize(OAuthProvider::Bigmodel, noop_open())
+            .await
+            .unwrap();
+
+        let started = std::time::Instant::now();
+        let completed = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            disconnect_zcode_hub_core(
+                Some(hub.clone()),
+                std::time::Duration::from_millis(50),
+                true,
+            ),
+        )
+        .await
+        .expect("关停内核必须在有界时间内返回");
+        assert!(!completed, "超时必须有界返回 false");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "超时不得超过上限太多"
+        );
+        // 同步前半段已落定：即便清理永远挂住，状态也不得以 paired 挂账。
+        assert_eq!(hub.connection().state, ConnectionState::Offline);
+        wait_until(
+            || fake.disconnect_calls.load(Ordering::SeqCst) >= 1,
+            "detached 清理必须已发起 backend.disconnect",
+        )
+        .await;
+    }
+
+    /// 超时只放弃**等待**，绝不取消清理：首次 disconnect 被挂住时内核按上限返回
+    /// false，此时 Hub 已 Offline；放行后 detached 清理继续（拿到 connect_lock →
+    /// 第二次 backend.disconnect），证明没有被 timeout 连根取消。
+    #[tokio::test]
+    async fn shutdown_timeout_does_not_cancel_cleanup() {
+        let fake = Arc::new(FakeBackend::default());
+        let gate = Arc::new(tokio::sync::Notify::new());
+        fake.disconnect_gate.lock().unwrap().replace(gate.clone());
+        let hub = fake_hub(fake.clone(), stored(URL));
+        hub.authorize(OAuthProvider::Bigmodel, noop_open())
+            .await
+            .unwrap();
+        hub.connect().await.unwrap();
+        assert!(hub.connection().is_paired());
+
+        let completed = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            disconnect_zcode_hub_core(
+                Some(hub.clone()),
+                std::time::Duration::from_millis(50),
+                true,
+            ),
+        )
+        .await
+        .expect("关停内核必须在有界时间内返回");
+        assert!(!completed, "清理被挂住 ⇒ 有界返回 false");
+        // begin 是同步的：超时返回时 Hub 必须已经 Offline（旧实现会等到清理完成）。
+        assert_eq!(hub.connection().state, ConnectionState::Offline);
+        wait_until(
+            || fake.disconnect_calls.load(Ordering::SeqCst) >= 1,
+            "detached 清理必须已发起 backend.disconnect",
+        )
+        .await;
+
+        // 放行首次断开：清理继续跑完（第二次断开证明超时没有取消它）。
+        gate.notify_one();
+        wait_until(
+            || fake.disconnect_calls.load(Ordering::SeqCst) >= 2,
+            "超时后清理必须继续到锁后收尾",
+        )
+        .await;
+        assert_eq!(
+            hub.connection().state,
+            ConnectionState::Offline,
+            "清理不得自动重连"
+        );
+        assert_eq!(
+            fake.connect_calls.load(Ordering::SeqCst),
+            1,
+            "关停不得触发新的后端连接"
+        );
+        assert_eq!(fake.authorize_calls.load(Ordering::SeqCst), 1); // 前置：仅首次授权
+
+        // 清理收尾后 CloseGuard 已清位：显式 connect 可达且保留 JWT（不重授权）。
+        let reconnected = hub.connect().await.expect("closing 已清位，显式重连应成功");
+        assert!(reconnected.is_paired());
+        assert_eq!(
+            fake.connect_calls.load(Ordering::SeqCst),
+            2,
+            "只有用户显式 connect 才允许再连"
+        );
+        assert_eq!(
+            fake.authorize_calls.load(Ordering::SeqCst),
+            1,
+            "关停/重连不得重新授权（JWT 保留）"
+        );
     }
 }

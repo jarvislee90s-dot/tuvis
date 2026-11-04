@@ -138,15 +138,18 @@ export default function InteractiveCard({
       )}
       className={`card-slide-enter shrink-0 px-3 py-2 ${t.box}`}
     >
-      {/* 状态色条头部：脉冲圆点 + 类型徽标（+ 可选附加） */}
-      <div className="flex flex-wrap items-center gap-1.5">
-        <span
-          data-testid={`${testId}-dot`}
-          className={`inline-block h-2 w-2 rounded-full ${t.dot} ${pulsing ? "animate-pulse" : ""}`}
-        />
-        <span className={`text-sm font-semibold ${t.title}`}>{title}</span>
-        {titleSuffix}
-      </div>
+      {/* 状态色条头部：脉冲圆点 + 类型徽标（+ 可选附加）。计划卡标题为空时
+          整个头部不渲染，避免只留一个无名圆点。 */}
+      {title !== "" && (
+        <div className="flex flex-wrap items-center gap-1.5">
+          <span
+            data-testid={`${testId}-dot`}
+            className={`inline-block h-2 w-2 rounded-full ${t.dot} ${pulsing ? "animate-pulse" : ""}`}
+          />
+          <span className={`text-sm font-semibold ${t.title}`}>{title}</span>
+          {titleSuffix}
+        </div>
+      )}
       {/* 主体 */}
       {children}
       {/* 动作区 */}

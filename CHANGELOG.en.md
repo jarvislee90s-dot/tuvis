@@ -13,6 +13,261 @@ English · [中文](CHANGELOG.md)
 _Only versions translated so far are listed here; the full history lives in the
 [Chinese changelog](CHANGELOG.md)._
 
+## [0.6.5] - 2026-11-04
+
+### Added
+
+- **ZCode Windows integration closeout (build probe)**: on Windows, Tuvis reads the installed
+  ZCode desktop app's 4-segment PE file version (location discovered via the uninstall table →
+  protocol handler → common default dirs → running process), so the capability key now matches
+  `3.17.2.9661` and capabilities such as collaboration mode open as candidates (a single bounded
+  confirmation on first real use) instead of a whole-board grey-out. Live Windows matrix
+  (2026-11-04): send / Q&A (single, multi, free text) / interrupt / model & thinking level /
+  collaboration mode all pass, and the local outbox was also exercised against Windows 3.17.2.
+- **ZCode dual-path network fallback (Windows live forensics)**: the OAuth exchange and terminal
+  token go through the system proxy first and retry once over a direct connection on transport
+  failure (a system proxy that is on but tunnelling nothing no longer blocks authorisation); the
+  relay WebSocket tries direct first (half the upgrade budget, so a hung direct attempt cannot
+  starve the fallback) and then tunnels through the system proxy via HTTP CONNECT — TLS
+  verification stays on the same stack as direct. SOCKS proxies are rejected explicitly (SOCKS
+  credentials are never sent as Basic auth to a non-HTTP endpoint).
+- **ZCode explicit "Apply" for model & thinking level**: provider/model/level dropdowns only
+  stage a local pending choice; clicking "Apply" submits the full triple once — the point of
+  effect is explicit, and on a weak network a failed submit keeps the staged values for an
+  immediate retry (mirroring the collaboration-mode "Apply" interaction).
+- **ZCode phone outbox and single-item priority**: while a turn is running, sending stores the
+  message in the local Tuvis outbox first (expanded by default, position + 20-grapheme preview),
+  with edit, retract, "stop the current turn and send only this item", and explicit resume.
+  An enqueue is not an official acceptance; the official queue remains a separate read-only
+  view. Edit snapshots survive a lost response / refresh, and a non-empty draft is never
+  overwritten without choose replace / merge / cancel; an unknown stop result sends nothing and
+  never re-stops or resends under a new ID.
+- **ZCode provider-scoped model selection and R10 collaboration modes**: choose a provider,
+  then a model and a level that belongs to that provider, and submit the full triple once. Adds
+  Plan / Confirm before changes / Autonomous / Full access (Auto edit read-only compatibility),
+  with an extra confirmation for Full access; the confirmed label follows only a fresh,
+  normalized mode (`planEnabled=true` means Plan), and an ACK never upgrades the label
+  optimistically.
+- **ZCode stable signed debug build entry (R02 engineering item)**:
+  `pnpm build:macos:signed-dev` reads an existing certificate name from
+  `TUVIS_APPLE_SIGN_IDENTITY` and builds a same-identity debug `.app` through Tauri bundle
+  configuration. It never installs certificates, reads private keys, changes ACLs, or launches
+  the app. Real Keychain prompt counts still require four separate on-device scenarios.
+
+- **ZCode authorization restores automatically (credential reuse)**: after a successful
+  ZCode authorization the account JWT is written to this machine's system credential vault
+  (macOS Keychain / Windows Credential Manager / Linux Secret Service); startup restores it
+  read-only and then applies the existing three automatic-connect conditions (remote master
+  switch on + automatic-connect intent on + a valid saved link). **The first upgrade from an
+  older version requires one fresh authorization** (older versions kept authorization in
+  memory only); after that, restarts restore it automatically with no repeated OAuth.
+  "Disconnect" stops the current connection and auto-connect but **keeps the credential**;
+  "Forget authorization" deletes the credential and **keeps the link**; changing / deleting
+  the link never requires re-authorization. The JWT lives only in the system vault +
+  controlled memory — never in settings / the database / a file, and never in logs, error
+  messages, or phone responses; the relay short-lived token is still fetched fresh per
+  connection, memory-only, and discarded after use. Real-vault / real-OAuth / real-restart
+  on-device acceptance has not run yet; see the acceptance report.
+- **ZCode unified control (official bridge)**: ZCode now drives sessions through the
+  official bridge — the desktop completes **BigModel** authorization and connection in the
+  ZCode card under **Settings → Remote Access → ③ Tool-specific configuration** (official
+  credentials stay on this machine, **the JWT lives in memory only**, terminal tokens are
+  fetched fresh each time, and the phone holds no credential or short-lived token), connects
+  to the official host over a **single relay**, projects workspaces / sessions onto the board
+  with exact session binding, and on the phone reuses the same composer, question cards,
+  approval cards, interrupt and model / thought controls as the other tools. Every control
+  action goes through an **action ledger with actionId idempotency** (single-send, an ACK
+  timeout conservatively recorded as "result unknown", never auto-resent); sending, Q&A
+  (single / multiple choice / free text), approval replies, interrupt, and model /
+  thought-level switching are all wired in; the board, messages and file previews never
+  depend on control succeeding — losing control never blocks reading.
+- **ZCode unified control opens per host evidence (capability boundary, stated honestly)**:
+  all eight control capabilities **stay closed by default** in production builds and open one
+  by one only after host evidence; approvals cover only **replying to an existing card** —
+  sending from Tuvis to trigger a permission card produced a **negative result** across
+  repeated runs (no card appeared), so that send is not treated as approval protection; the
+  host end state for multi-select / free text / interrupt is not live-verified (single-select
+  and interrupt currently have an acceptance receipt only), the ZAI channel has source and
+  simulated evidence only, and Windows has not been built or run; unverified capabilities say
+  so in place and never open just because sending works.
+- **ZCode capabilities open per build (silent build-level capability resolution)**: on top
+  of the earlier "everything closed by default", build-level capability resolution ships —
+  the evidenced known build (`3.16.2.8769`) opens capabilities straight from a static table
+  (send / model / thought level / approval reply confirmed, single-select / interrupt as
+  candidates, multi-select / free text closed per contract); an **unknown build** (e.g.
+  after an official upgrade) no longer goes fully grey: capabilities whose interface shape
+  and real target match open as **candidates** first, and your **first real use** of one
+  runs a bounded confirmation (after the send, watch for 5 seconds for the host state to
+  advance — never resends, never sends any test message); a confirmed use sticks, an
+  explicit failure degrades that build + capability, and a timeout stays a candidate.
+  Capability keys invalidate and recompute automatically when the build / protocol changes,
+  and the confirmation ledger lives in the local database storing structured verdict
+  markers only (message content / questions / answers / credentials / links are never
+  recorded). The UI shows only "available / unavailable + an in-place reason" — there is no
+  probe page, probe button, or compatibility badge. Real-machine unknown-build verification
+  and send-fingerprint advancement forensics have not run yet; see the acceptance report.
+- **"Disconnect and take back" from the phone on conflict**: opening the ZCode official
+  page kicks Tuvis into "connection conflict" — the mobile ZCode control area then shows a
+  "**Disconnect and take back**" button: one tap drops the conflicting connection and
+  immediately reconnects with the saved authorization (credentials kept, no re-OAuth, no
+  second confirmation dialog), restoring "paired" on success; it tries **once** — if the
+  state is still conflict it only hints to close the official page first, and on failure
+  shows the localized reason for the frozen error code in place. It never loops.
+- **ZCode official remote link configuration with per-state phone hints**: the remote
+  settings gained a "③ Tool-specific configuration" section whose first release is a
+  single collapsed ZCode card — it stores the official remote-control link produced by
+  the ZCode app's "mobile remote control" on this machine (strict format checks: only
+  https on the official host with a versioned /remote/vN path and a non-empty sid;
+  errors are shown in place, malformed values are never distributed, and the full link
+  never enters logs); paired phones read the same value through a read-only endpoint.
+  The card's "Saved · connection pending" state only means the link passed format
+  checks — **saved ≠ connected**. On the phone, a ZCode session's board, messages and
+  files keep working; the composer explains the link state in place (not configured /
+  needs updating / connection pending), keeps the draft, and never fakes a send.
+- **ZCode session read recovery**: main session IDs written by newer ZCode builds
+  (`session_` + 32 hex chars) used to be rejected wholesale by the read gate; they are
+  now accepted alongside the legacy shape (`sess_` + UUID) — original IDs are preserved
+  verbatim, never rewritten or merged; all other read gates (interactive, 24h window,
+  caps) are unchanged. ZCode attachment reference numbers are now aligned with the
+  final rendered message sequence (numbered after multi-part expansion and tail
+  trimming), so "jump to latest reference" no longer lands off-target; file-only
+  messages keep their files and honestly carry no message sequence number.
+
+### Changed
+
+- **ZCode outbox panel only shows while visible messages exist**: a bare paused state (0 items)
+  no longer occupies the panel permanently; the pause semantics after interrupt/priority are
+  unchanged (messages queued afterwards still need a manual resume); the restart review card
+  keeps its "show whenever review items exist" behaviour — unconfirmed barriers anchor on
+  accepted items that are invisible, so gating the card by visible count would deadlock the
+  barrier with no UI to clear it.
+- **ZCode control errors now surface the frozen code**: the generic `ZCODE_CONTROL:*` fallback
+  message appends the frozen code (e.g. "(offline)", "(needs_auth)") instead of one
+  un-actionable "unavailable" line for everything.
+- **Home header badges unified**: the clear-finished (green) and notification-bell (red) badges
+  share identical geometry, font size/weight and hover, keeping only the colour distinction
+  (green = clearable finished, red = unread notifications).
+- **ZCode sends now go through official unified control (behavior change)**: the legacy
+  ZCode session-send path is retired (M11) — old channel requests to send into a ZCode
+  session now return **409 `official_control_required`**, pointing at official-bridge
+  unified control; there is no headless-injection fallback and no silent downgrade to
+  "delivered". The board, messages and file reading paths are unaffected.
+- **Headless injection and compatibility send default to on (upgrade note)**:
+  `remote.headless_enabled` and `remote.compat_send_enabled` now resolve to **on** when
+  the settings hold no choice of yours (key absent — fresh installs or upgrades without
+  a stored value); users who explicitly turned a switch **off keep it off**, and invalid
+  values (e.g. empty) still resolve to off — never guessed into on. No table-wide
+  migration and no fabricated toggle audit; the existing timeout (600000 ms), concurrency
+  cap (2) and the compatibility-send guards (read-chain verification / build / device /
+  pending queue) are unchanged.
+- **Remote settings page rearranged into a fixed four-section order**: ① General
+  (including headless injection) → ② Channels → ③ Tool-specific configuration
+  (Codex APP / ZCode collapsible cards) → ④ Access & security (including the device list)
+  → Injection audit.
+- **Access PIN masked by default**: the 4-digit PIN box in settings starts masked, with
+  an eye button toggling reveal / mask; leaving the block, switching settings blocks, or
+  the window losing focus restores the mask automatically — display only; the PIN value,
+  storage and pairing are unaffected.
+
+- **Default README switched to English**: `README.md` is now the English version
+  (content moved in from `README.en.md`); the Chinese source-of-truth moved to
+  `README.zh-CN.md`, with language-switcher links at the top of both files. The
+  `AGENTS.md` bilingual asset table, project tree, and the README pin in the
+  `usage-partial-coverage-lock` test were updated accordingly.
+- **README facade rewrite and dual community channels**: both READMEs were rebuilt as
+  facade pages (hero trio, feature table linking into the manual, a 2×3 screenshot
+  gallery, and a community section), with the former release-level details migrated
+  into 8 chapters of the 13-chapter user manual (16 files across zh/en,
+  `docs/user-manual/{zh,en}/`); two community channels went live — QQ group
+  `1131682176` and Discord (`discord.gg/2PBUDYuD5`) — with stable links and QR images
+  checked into `docs/images/` (expiring group-QR screenshots are never inlined);
+  `AGENTS.md` gained a "documentation division of labor" discipline (facade / manual /
+  ledger responsibilities are mutually exclusive).
+
+### Fixed
+
+- **ZCode send first-use confirmation always timed out on hosts that never advance the
+  fingerprint**: the Windows 3.17.2 `state.updated` patch carries no `logEpoch:seq`, so the
+  "last user message fingerprint changed" criterion was always false and 3/3 first-use
+  confirmations landed `timeout_5s`; an equivalent causal evidence path was added — the
+  receipt's `sendAdmission inputId` is matched exactly against `executionTerminal inputId`,
+  confirming only when both are present and equal (a finished turn from another send never
+  confirms this one).
+- **ZCode interrupts never landed in the ledger**: the local-queue stop (including priority
+  interrupts) bypassed the confirmation registration, so the interrupt capability could never
+  gather live evidence; registration is now in place and the window re-arms after ACK (the
+  dispatch internally includes bounded control re-sync waits that could have consumed most of
+  the window registered at submit time).
+- **ZCode upgrade budget starved by a slow token**: the relay upgrade budget used to start
+  before the terminal token fetch, so one slow token left both paths with a zero budget and an
+  immediate offline; the budget now starts after the token is in hand.
+- **ZCode phone outbox recovery and provider/plan-card usability**: after a restart, an
+  accepted send whose terminal state cannot be proven shows "Results to review" and pauses
+  the outbox; while unreviewed, "Resume queue / Send this one" are explicitly rejected, and
+  "Confirm and resume queue" only clears the barrier and continues items that have not been
+  sent — the old message is never resent. Provider availability is no longer pre-judged by Tuvis:
+  the catalog's `available`/`availabilityKnown` fields do not block selection; Tuvis sends
+  the full triple and surfaces the host's real error. Plan approval (`ExitPlanMode`/`plan_approval`) now has a dedicated native approve
+  action for the exact host `approve` option and a feedback box that keeps plan mode and
+  sends text back to the agent; failures stay honest and never fabricate a frame. Both
+  desktop paths were verified; mobile remote acceptance is pending reconnect.
+- ZCode credential restore no longer reads the OS keychain unconditionally at startup:
+  only a saved official link, enabled remote, and the auto-connect intent allow it;
+  otherwise the hub stays in needs_auth/needs_config, avoiding repeated Keychain prompts
+  from dev builds.
+- **ZCode review fixes (providers / recovery / mode guards)**: the production read
+  path now sends every provider group and refreshes the catalog on a live provider switch; editing with a known draft asks first, and
+  cancelling no longer retracts the original item or deletes its recovery snapshot;
+  Unknown / stop / dispatch / restart barriers get manual-review actions that never
+  resend or re-stop and still require an explicit queue resume; Selection and Mode
+  writes now require confirmed idle with no pending; a same model under another
+  provider no longer borrows the current provider's levels; Mode opens only for a
+  known build and is wired into first-use confirmation / failure degradation. A
+  non-current provider with no `available` field is conservatively disabled.
+- **Crash when toggling remote or hot-restarting a channel (Windows)**: turning the
+  Remote Access master switch off or hot-restarting a channel could abort the whole
+  process (0xc0000409 crashes, observed three times on 2026-10-23) — the stop path of
+  the Codex APP desktop IPC spawned its shutdown from a synchronous command thread
+  with no async runtime, and the panic crossed a no-unwind WebView2 callback boundary;
+  the shutdown is now spawned via the app runtime, so toggling no longer crashes the
+  app.
+- **Updater install network fallback and honest errors**: the install layer had no
+  network fallback (the discovery layer does) — when the system proxy broke
+  mid-install, the download timed out reaching GitHub directly and only reported a
+  manifest verification failure. Installation now runs two hops: the plugin's default
+  pipeline first (10s connect timeout), then on transport-class failures a retry
+  through a no-proxy client pinning DoH-resolved addresses for github.com and both
+  release asset hosts. Errors are flattened through the full source chain, so the
+  failure toast shows the actual cause.
+
+### Engineering
+
+- ZCode probe machinery closeout: `mode` joined the permit whitelist (its permits channel
+  already exists); `queue_*` are deliberately excluded — `execute_queue_write` explicitly
+  refuses T8.2 permit relaxation, so issuing permits would burn them for nothing; the permits
+  threading precondition is documented in comments. Windows probe unit tests added: uninstall
+  `DisplayName` "ZCode 3.17.2" suffixed form (prefix match, not equality), PE version read via
+  unaligned access (fixes an alignment UB), four value-string shapes; four end-to-end WS tunnel
+  cases (exact CONNECT line / 403 rejection / Proxy-Authorization header / garbage response);
+  three auth dual-path cases (dead primary → direct succeeds with a single exchange consumed,
+  both paths failing → offline).
+- ZCode credential-reuse acceptance: `wire_e2e` uses a shared fake persistent store and
+  **rebuilt** AuthService/Hub instances to verify "OAuth still once, terminal token / WS
+  re-fetched after restart, zero upstream after disconnect or forget, capability gates not
+  widened on restore"; the acceptance report, unified-design addendum, contract +
+  `contract.json` persistence note, and the zh/en manual are updated in the same batch.
+  Real system-vault / real OAuth / real restart acceptance still needs macOS / Windows /
+  Linux on-device runs; platforms not run stay `awaiting_platform_validation` / `not_run`
+  in the report and are never marked PASS.
+- Gate cleanup for the A package: one closure in `tests/zcode_config_remote.rs` replaced
+  with a function reference (new clippy `redundant_closure` warning; test-only, no
+  behavior change).
+- B-package evidence artifacts landed: the ZCode official-bridge decision document
+  (`docs/superpowers/decisions/2026-10-24-zcode-official-bridge-contract.md`, including
+  line-number auth-chain evidence from the pinned source SHA), a fake-relay Vitest suite
+  (`tests/remote/zcodeBridgeRelay.test.ts`), and the `scripts/zcode-bridge-probe` skeleton;
+  all forensic/test assets, no product behavior change.
+
 ## [0.6.4] - 2026-11-02
 
 ### Upgrade notes

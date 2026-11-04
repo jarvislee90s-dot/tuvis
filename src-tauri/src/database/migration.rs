@@ -105,6 +105,21 @@ pub fn migrate(conn: &Connection) -> Result<(), String> {
     // 上面 DROP 掉的预览版账本四表，由这次 init 按新 DDL 重建为空表。
     crate::database::schema::init(conn);
 
+    if !column_exists(conn, "zcode_actions", "send_admission") {
+        conn.execute(
+            "ALTER TABLE zcode_actions ADD COLUMN send_admission TEXT",
+            [],
+        )
+        .map_err(|e| format!("MIGRATE_FAIL: {}", e))?;
+    }
+    if !column_exists(conn, "zcode_send_queue", "request_input_hash") {
+        conn.execute(
+            "ALTER TABLE zcode_send_queue ADD COLUMN request_input_hash TEXT",
+            [],
+        )
+        .map_err(|e| format!("MIGRATE_FAIL: {}", e))?;
+    }
+
     // tps_point.cadence_ms（独立复核 R11）：老库的点表无此列 → 补加可空列（旧行 NULL = 无节奏信息，
     // 前端不据此断线）；schema::init 的 CREATE IF NOT EXISTS 对已存在表不生效，须 ALTER 补齐
     if !column_exists(conn, "tps_point", "cadence_ms") {

@@ -621,6 +621,37 @@ pub async fn device_language(
     }
 }
 
+/// GET /m/api/v1/official-control?agent_type=zcode（A4）：ZCode 官方远控链接配置。
+///
+/// - 缺参/空/首版不支持的其他工具 → 400（首版只有 ZCode 一种官方控制目标）；
+/// - 响应 = `ZcodeRemoteConfig` wire DTO `{configState, url}`；`configState=saved`
+///   **只表示格式已落库**，绝不表示已联机/已授权（设计 §4.3/§5.2）；
+/// - 只读：不回写、不读取官方账号、不发任何外部 HTTP（数据链留给 B 包适配器）；
+/// - `Cache-Control: no-store`：门禁下的私有配置，sessions 同规。
+pub async fn official_control(
+    State(st): State<Arc<RemoteState>>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Response, StatusCode> {
+    let Some(agent) = params
+        .get("agent_type")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    else {
+        return Err(StatusCode::BAD_REQUEST);
+    };
+    if !agent.eq_ignore_ascii_case("zcode") {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    // 只读 settings（DeviceStore 即全局 DB 连接缝；测试 = 内存库）。读取时复验格式，
+    // 坏值如实 Invalid + url null——不缓存、不探测官方服务。
+    let config = st.store.with(crate::services::zcode_control::get_config);
+    Ok((
+        [(axum::http::header::CACHE_CONTROL, "no-store")],
+        Json(config),
+    )
+        .into_response())
+}
+
 /// GET /m/api/v1/ui-config（2026-10-05 UI 改版，spec §6.2）：远程端外观配置下发。
 /// 载荷 `{daySkin, nightSkin, font, radius, accent}`（camelCase，与 TS `UiConfig`
 /// 逐字段对应）。KV 未配置 / JSON 解析失败 / 非对象 → 回落默认值（纸感对 + 标准
@@ -1080,7 +1111,9 @@ pub async fn session_messages(
 // 契约（JSON camelCase；所有 Json 响应带 Cache-Control: no-store——门禁下私有写路径）：
 //   POST /session-send          → delivered{pairingHint} | queued{itemId,position} | failed{error} | 400 | 404 | 403
 //                                 （pairingHint = C7 配对不确定提示，恒在场 true/false，不拦截）
+//                                 （ZCode 恒 409 official_control_required：官方控制接口是唯一写通道）
 //   GET  /session-send-info     → {injectable, reasonCode?, reason?, channels, visibility}
+//                                 （ZCode：injectable=false + officialControl + configState，不宣称已连接）
 //   GET  /session-queue         → {items:[{id,content,enqueuedAt,position}]}
 //   POST /session-queue/jump    → delivered | queued{itemId,position} | failed{error} | 400 | 404 | 403
 //   POST /session-queue/retract → {ok:true} | failed{error}（守卫忙让位） | 400 | 404 | 403
@@ -1206,6 +1239,50 @@ fn find_session_sync(st: &Arc<RemoteState>, session_id: &str) -> Option<crate::s
         .find(|s| s.id == session_id)
 }
 
+/// 附件上传拒绝码：扫描快照的项目目录与 ZCode 桥的精确绑定工作区不一致。
+/// （仅对已绑定的 ZCode 会话生效；其余会话不启用该校验，原上传流程零变化。）
+pub(crate) const WORKSPACE_MISMATCH: &str = "workspace_mismatch";
+
+/// 三轮 C：两个项目目录是否指同一目录。先做尾斜杠归一的字符串比较；不一致再尝试
+/// 双侧 `fs::canonicalize`（解析符号链接/`..`，如 macOS `/var` ↔ `/private/var`），
+/// 任一侧 canonicalize 失败（目录尚未创建等）则维持字符串比较结果。
+fn same_project_dir(left: &str, right: &str) -> bool {
+    fn trim(p: &str) -> &str {
+        p.trim().trim_end_matches('/')
+    }
+    let (l, r) = (trim(left), trim(right));
+    if l == r {
+        return true;
+    }
+    match (std::fs::canonicalize(l), std::fs::canonicalize(r)) {
+        (Ok(l), Ok(r)) => l == r,
+        _ => false,
+    }
+}
+
+/// 三轮 C：附件上传的「上传项目 ↔ ZCode 精确绑定工作区」一致性闸。
+///
+/// 仅当该会话已被 ZCode 桥**精确绑定**时启用（`hub.bound_workspace_path` 有值）：
+/// 附件必须落进 ZCode 实际工作的工作区，否则 send 正文里的相对引用会指向会话之外。
+/// 未绑定（非 ZCode 会话/桥未装配）→ 直接放行，原上传流程零变化。
+fn ensure_project_matches_bound_workspace(
+    hub: Option<&std::sync::Arc<crate::services::zcode_control::ZcodeHub>>,
+    session_id: &str,
+    project_path: &str,
+) -> Result<(), (axum::http::StatusCode, serde_json::Value)> {
+    let Some(bound) = hub.and_then(|hub| hub.bound_workspace_path(session_id)) else {
+        return Ok(());
+    };
+    if same_project_dir(project_path, &bound) {
+        return Ok(());
+    }
+    // 不透传两侧路径原文（可能含用户目录结构），只回冻结码。
+    Err((
+        axum::http::StatusCode::CONFLICT,
+        serde_json::json!({ "error": WORKSPACE_MISMATCH }),
+    ))
+}
+
 /// 端点审计 action 选择（丁T3 裁2，**单点**）：`/` 开头消息记 `slash`，其余按投递
 /// 路径记 `send` / `queue`。
 ///
@@ -1241,7 +1318,8 @@ fn audit_action_for(text: &str, base: &'static str) -> &'static str {
 
 /// **H3 无头总开关门**（session-send / session-send-info 共用）：判据 =
 /// 「路由结论是无头族」（`routing::headless_kind_of`，不另立工具/形态表）+
-/// `KEY_HEADLESS`（缺键 = 默认关），开关经 `st.store` 缝读取——生产 = 全局 DB
+/// `KEY_HEADLESS`（缺键 = 默认开；显式 "false" 才是用户关闭；空串/乱串等非法值判关），
+/// 开关经 `st.store` 缝读取——生产 = 全局 DB
 /// 同锁同连接，测试 = 内存库（零接触真实 ~/.tuvis）。
 ///
 /// **边界（按构造成立）**：终端通道（claude/kimi/opencode/codex CLI）的路由候选全是
@@ -1288,6 +1366,14 @@ const APP_FORM_PENDING_CODE: &str = "app_form_pending";
 const APP_FORM_PENDING_REASON: &str = "APP 会话该操作走协议通道，开发中——请在 APP 内操作";
 /// 止血门审计 result（「开发中」状态对账本可查：refused + 拒绝码，形如 failed:{e}）
 const APP_FORM_PENDING_AUDIT_RESULT: &str = "refused:app_form_pending";
+
+/// **ZCode 旧 session-send 的兼容拒绝码（T7.1）**：官方控制接口是唯一写通道——
+/// M11 无头门退役后，旧入口在路由/注入/入队之前返回 409，绝不回退终端/CLI。
+const ZCODE_OFFICIAL_CONTROL_REQUIRED: &str = "official_control_required";
+
+/// send-info 对 ZCode 的原因文案（前端按 reasonCode 本地化，reason 仅兜底）。
+const ZCODE_OFFICIAL_CONTROL_REASON: &str =
+    "ZCode 请使用配对后的官方控制接口（旧发送入口不提供终端/无头注入）";
 
 /// 止血门 409 回执（四处写入口共用同一形态：409 + error + reason）
 fn app_form_pending_response() -> Response {
@@ -1400,6 +1486,19 @@ pub async fn session_send(
             serde_json::json!({ "error": "no_session" }),
         );
     };
+    // ③b **ZCode 路由边界（T7.1）**：官方控制接口是唯一写通道——旧 session-send
+    //     在路由/注入/入队**之前** 409 兼容拒绝（M11 无头门已退役，绝不让 ZCode
+    //     回退终端/CLI 注入）。判据只看会话工具，与形态/pid/平台无关。
+    if session.agent_type.tool_id() == "zcode" {
+        return json_no_store(
+            StatusCode::CONFLICT,
+            serde_json::json!({ "error": ZCODE_OFFICIAL_CONTROL_REQUIRED }),
+        );
+    }
+    // ④ Codex APP → Desktop IPC control hub：**必须在 H3 门之前交给 hub**——只有
+    //    兼容分支受 H3（A 可用时 H3 关闭不挡 IPC）。判据：codex APP 形态 ∧ thread 可
+    //    解析。hub 分支内自管 actionId 契约 / desktop_ipc/codex_queued 回执 / 兜底交接
+    //    （兜底分支内部再受 H3）。
     // ④ Codex APP → Desktop IPC control hub：**必须在 H3 门之前交给 hub**（H3 与
     //    hub 面无关——S2 起 Desktop 会话没有任何兜底分支）。判据：codex APP 形态 ∧
     //    thread 可解析。hub 分支内自管 actionId 契约 / desktop_ipc/codex_queued 回执 /
@@ -1438,9 +1537,10 @@ pub async fn session_send(
         )
         .await;
     }
-    // ④b H3 无头通道总开关（默认关，显式开启；**门在最前**——无头绑定会话先看开关，
-    //    再看路由判据）。判据单点在 [`headless_blocked`]（路由结论 + 开关；开关经
-    //    st.store 缝读取）。**边界**：终端注入四家恒不受本门影响。
+    // ④b H3 无头通道总开关（缺键 = 默认开；显式 "false" 才是用户关闭，非法值判关；
+    //    **门在最前**——无头绑定会话先看开关，再看路由判据）。判据单点在
+    //    [`headless_blocked`]（路由结论 + 开关；开关经 st.store 缝读取）。
+    //    **边界**：终端注入四家恒不受本门影响。
     let tool = session.agent_type.tool_id().to_string();
     if headless_blocked(&st, &tool, session.form, session.pid).is_some() {
         return json_no_store(
@@ -1810,6 +1910,25 @@ pub async fn session_send_info(
         );
     };
     let tool = session.agent_type.tool_id().to_string();
+    // **ZCode 边界（T7.1）**：只广告官方控制路径（旧注入入口不可用），携带本机
+    // 已保存的配置状态。`configState=saved` 仅表示格式已落库——**绝不等于已连接/
+    // 已授权**，故不携带 connected/authorized 之类联机旗标。
+    if tool == "zcode" {
+        let config = st.store.with(crate::services::zcode_control::get_config);
+        let official_control =
+            config.config_state == crate::services::zcode_control::ConfigState::Saved;
+        return json_no_store(
+            StatusCode::OK,
+            serde_json::json!({
+                "injectable": false,
+                "reasonCode": ZCODE_OFFICIAL_CONTROL_REQUIRED,
+                "reason": ZCODE_OFFICIAL_CONTROL_REASON,
+                "officialControl": official_control,
+                "configState": config.config_state,
+                "url": config.url,
+            }),
+        );
+    }
     // S2：**与 session-send 同源的静态门（单点 `hub.send_gate_static`）**——桌面
     // 归属会话不可尝试（未取证/自动适配关闭/已取证 build 瞬时断链）→ 输入区置灰 +
     // 同一理由码同一句文案（两端口径不一致面在 S2 收敛为单点函数）。旧的
@@ -2221,6 +2340,12 @@ pub async fn session_attachment(
             StatusCode::NOT_FOUND,
             serde_json::json!({ "error": "no_cwd" }),
         );
+    }
+    // 三轮 C：已绑定 ZCode 会话的附件必须落在其精确绑定工作区内。
+    if let Err((status, body)) =
+        ensure_project_matches_bound_workspace(st.zcode_hub().as_ref(), &sid, &cwd)
+    {
+        return json_no_store(status, body);
     }
     let tool = session.agent_type.tool_id().to_string();
     // ⑤ 写盘（spawn_blocking：同步 IO）+ 审计
@@ -10743,6 +10868,72 @@ pub async fn create_projects(
 
 #[cfg(test)]
 mod tests {
+    /// 三轮 C：项目目录同一性——尾斜杠归一、macOS symlink（/tmp ↔ /private/tmp）、
+    /// 真实不同目录（canonicalize 后仍不等）。
+    #[test]
+    fn same_project_dir_normalizes_and_resolves_symlinks() {
+        // 通用面（跨平台）：尾斜杠/空白归一。
+        assert!(same_project_dir("/tmp/travel", "/tmp/travel/"));
+        assert!(same_project_dir(" /tmp/travel ", "/tmp/travel"));
+        // 通用面：临时目录真实存在时 canonicalize 双侧成功；同一目录判等、
+        // 不同目录不等（std::env::temp_dir 在 Linux/Windows/macOS 都有稳定布局）。
+        let base = std::env::temp_dir();
+        let dir_a = base.join(format!("tuvis-att-a-{}", std::process::id()));
+        let dir_b = base.join(format!("tuvis-att-a-{}", std::process::id()));
+        let dir_c = base.join(format!("tuvis-att-c-{}", std::process::id()));
+        std::fs::create_dir_all(&dir_a).expect("建临时目录 a");
+        std::fs::create_dir_all(&dir_c).expect("建临时目录 c");
+        assert!(same_project_dir(
+            &dir_a.to_string_lossy(),
+            &dir_b.to_string_lossy()
+        ));
+        assert!(!same_project_dir(
+            &dir_a.to_string_lossy(),
+            &dir_c.to_string_lossy()
+        ));
+        std::fs::remove_dir_all(&dir_a).ok();
+        std::fs::remove_dir_all(&dir_c).ok();
+        // 目录不存在：canonicalize 失败 → 回退字符串比较，不等。
+        assert!(!same_project_dir(
+            "/tmp/definitely-missing-a",
+            "/tmp/definitely-missing-b"
+        ));
+        // 符号链接解析（符号链接创建是 Unix 能力；macOS 特有的 /tmp↔/private/tmp
+        // 布局单独断言，不混入跨平台用例）。
+        #[cfg(unix)]
+        {
+            let real = base.join(format!("tuvis-att-real-{}", std::process::id()));
+            let link = base.join(format!("tuvis-att-link-{}", std::process::id()));
+            std::fs::create_dir_all(&real).expect("建真实目录");
+            std::os::unix::fs::symlink(&real, &link).expect("建符号链接");
+            assert!(same_project_dir(
+                &link.to_string_lossy(),
+                &real.to_string_lossy()
+            ));
+            std::fs::remove_dir_all(&real).ok();
+            std::fs::remove_file(&link).ok();
+        }
+        #[cfg(target_os = "macos")]
+        {
+            // macOS 布局：/tmp 是 /private/tmp 的符号链接。
+            let unique = format!("tuvis-att-macos-{}", std::process::id());
+            let as_tmp = format!("/tmp/{unique}");
+            let as_private = format!("/private/tmp/{unique}");
+            std::fs::create_dir_all(&as_private).expect("建临时目录");
+            assert!(
+                same_project_dir(&as_tmp, &as_private),
+                "{as_tmp} 与 {as_private} 应判同一目录"
+            );
+            std::fs::remove_dir_all(&as_private).ok();
+        }
+    }
+
+    /// 三轮 C：一致性闸只对已绑定会话生效；未绑定（无 hub / 桥不知会话）直接放行。
+    #[test]
+    fn workspace_gate_passes_when_session_unbound() {
+        assert!(ensure_project_matches_bound_workspace(None, "sess_x", "/anywhere").is_ok());
+    }
+
     use super::*;
     use crate::remote::content::SessionMessage;
 

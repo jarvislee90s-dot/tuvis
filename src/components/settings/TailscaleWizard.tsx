@@ -25,6 +25,7 @@ import {
 } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
 import {
+  SETTINGS_FIELD,
   SETTINGS_NOTE,
   SETTINGS_REMOTE_BADGE,
   SETTINGS_REMOTE_HINT,
@@ -364,7 +365,7 @@ export function TailscaleWizard({
     >
       <div data-testid="ts-wizard">
         <div className="flex items-center justify-between gap-2">
-          <p className="text-sm font-semibold">{t("settings.remote.tsWizard.title")}</p>
+          <p className={SETTINGS_FIELD}>{t("settings.remote.tsWizard.title")}</p>
           <Button variant="ghost" size="sm" onClick={() => void load()}>
             {t("settings.remote.tsWizard.refresh")}
           </Button>

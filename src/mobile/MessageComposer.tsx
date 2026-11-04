@@ -80,6 +80,12 @@ import {
   type SendInfo,
 } from "./api";
 import { ChannelBwNote } from "./FilePanel";
+import {
+  attachmentMarkup,
+  isImageFile,
+  newAttachmentId,
+  type PendingAttachment,
+} from "./attachments";
 import { etaRemainingText, formatBytes, transferRateBps, type TransferSample } from "./board-logic";
 // Codex APP 原生发送（Desktop IPC）：actionId 生成与回执 DTO
 import {
@@ -135,18 +141,8 @@ interface MessageComposerProps {
  *  path = 服务端落盘后的绝对路径（仅 ready 有）；
  *  loaded/total = 上行进度（Task 10 §C5，仅 uploading 且收到过进度事件才有——
  *  total 未知（事件未到/事件报 0）→ null，chip 只显示已传字节，不编假百分比） */
-type PendingAttachment = {
-  id: string;
-  name: string;
-  isImage: boolean;
-  status: "uploading" | "ready" | "failed";
-  path?: string;
-  error?: string;
-  loaded?: number;
-  total?: number | null;
-  /** 瞬时速率估算（字节/秒；样本不足 → null——「预计剩余」文案的开关） */
-  rateBps?: number | null;
-};
+// 三轮 C：附件条目形状/引用约定抽到 ./attachments 共享（ZcodeControlPanel 同源
+// 接入同一上传管线）；本组件保留编排（速率估算/排队语义不外移）。
 
 /** 回执条状态（与 SendResult 对应 + 网络层 ApiError 归入 failed；
  *  gone = 中性收敛（评审裁决）：条目经复核确认已离开队列——大概率已被送达，
@@ -692,6 +688,8 @@ export default function MessageComposer({
     };
   }, [codexQueuedTracked, session.id]);
 
+  // A5：ZCode 会话的只读控制面已迁移到 ZcodeControlPanel（SessionDetail 的 ZCode
+  // 挂载点不再走本组件）——本组件保留的是非 ZCode 会话的既有终端注入路径。
   const injectable = sendInfo !== null && sendInfo.injectable;
 
   /** S5：发送静态门的「可尝试」判据（send-info 展示面单点的消费；不复刻能力策略
@@ -907,6 +905,10 @@ export default function MessageComposer({
         }
         return;
       }
+      // 附件标记行（文件池既有约定 <image|file path>）：拼在正文之后随消息注入，
+      // agent 据路径读文件；failed 附件不拼（未落盘，拼了 agent 也读不到）
+      const markup = attachmentMarkup(attachments);
+      const fullText = markup ? `${text}\n${markup}` : text;
       // D6：修改重发的下一次发送带 queueOnly=true 强制入队，消费即清——本次发送
       // 失败的话，用户重试走的是普通发送语义（后端失败行已退出 pending，可重发）
       const forceQueue = queueOnlyNext;
@@ -1401,8 +1403,8 @@ export default function MessageComposer({
       for (const f of files) {
         // Q2：附件增补也是草稿变更（版本前移）
         draftVersionRef.current += 1;
-        const id = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
-        const isImage = f.type.startsWith("image/");
+        const id = newAttachmentId();
+        const isImage = isImageFile(f);
         setAttachments((prev) => [
           ...prev,
           {
@@ -1524,6 +1526,9 @@ export default function MessageComposer({
 
   return (
     <div data-testid="message-composer" className="shrink-0 border-t border-[var(--cb)] px-3 py-2">
+      {/* 不可注入：同一处原因呈现（send-info 的 reason/reasonCode）。
+          ZCode 会话不挂本组件（SessionDetail 路由到 ZcodeControlPanel），其只读原因
+          面（配置/连接/离线）由面板就地申报。 */}
       {pendingEdit?.sessionId === session.id && (
         <div
           data-testid="composer-edit-choice"

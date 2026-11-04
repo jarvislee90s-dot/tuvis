@@ -1,7 +1,7 @@
 {
   "name": "tuvis",
   "private": true,
-  "version": "0.6.4",
+  "version": "0.6.5",
   "license": "MIT",
   "type": "module",
   "engines": {
@@ -18,17 +18,18 @@
     "tauri:build": "tauri build --bundles nsis --features marker-helper",
     "release": "bash scripts/release.sh",
     "release:macos": "tauri build --bundles dmg && bash scripts/release.sh",
-    "format": "prettier --write \"src/**/*.{ts,tsx,css,json}\" \"tests/**/*.{ts,tsx}\" \"scripts/*.mjs\"",
-    "format:check": "prettier --check \"src/**/*.{ts,tsx,css,json}\" \"tests/**/*.{ts,tsx}\" \"scripts/*.mjs\"",
-    "lint": "eslint \"src/**/*.{ts,tsx}\" \"tests/**/*.{ts,tsx}\" \"scripts/*.mjs\" vite.config.ts vite.config.mobile.ts",
-    "lint:fix": "eslint \"src/**/*.{ts,tsx}\" \"tests/**/*.{ts,tsx}\" \"scripts/*.mjs\" vite.config.ts vite.config.mobile.ts --fix",
+    "format": "prettier --write \"src/**/*.{ts,tsx,css,json}\" \"tests/**/*.{ts,tsx}\" \"scripts/*.mjs\" \"scripts/zcode-bridge-probe/**/*.ts\"",
+    "format:check": "prettier --check \"src/**/*.{ts,tsx,css,json}\" \"tests/**/*.{ts,tsx}\" \"scripts/*.mjs\" \"scripts/zcode-bridge-probe/**/*.ts\"",
+    "lint": "eslint \"src/**/*.{ts,tsx}\" \"tests/**/*.{ts,tsx}\" \"scripts/*.mjs\" \"scripts/zcode-bridge-probe/**/*.ts\" vite.config.ts vite.config.mobile.ts",
+    "lint:fix": "eslint \"src/**/*.{ts,tsx}\" \"tests/**/*.{ts,tsx}\" \"scripts/*.mjs\" \"scripts/zcode-bridge-probe/**/*.ts\" vite.config.ts vite.config.mobile.ts --fix",
     "sync:capabilities": "node scripts/sync-capabilities.mjs",
     "check:capabilities": "node scripts/sync-capabilities.mjs --check",
     "check": "pnpm check:capabilities && pnpm format:check && pnpm lint && pnpm check:i18n && node scripts/check-error-codes.mjs && pnpm build",
     "check:i18n": "node scripts/check-i18n.mjs",
     "test": "vitest run",
     "test:watch": "vitest",
-    "test:coverage": "vitest run --coverage"
+    "test:coverage": "vitest run --coverage",
+    "build:macos:signed-dev": "node scripts/zcode-signed-build.mjs"
   },
   "dependencies": {
     "@tailwindcss/vite": "^4.3.3",

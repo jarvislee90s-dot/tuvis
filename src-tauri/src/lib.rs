@@ -207,9 +207,21 @@ pub fn run() {
             // KV，此处句柄就绪后消费：pending 且未销账（shown）才弹；销账只发生在
             // 用户点「复制命令」/「不再提醒」（codex_trust_notice_ack 命令）
             monitor::hooks::consume_codex_trust_notice(app.handle());
+            // T7.1 C2b：进程内唯一 ZCode 控制 Hub——Tauri managed state（桌面 IPC）
+            // 与远程 STATE（/m/api/v1）共用同一 Arc（无第二 Hub、无第二 relay）。
+            // `ZcodeHub::new` 必须在 Tokio runtime 内构造（relay 事件泵/桥 actor）；
+            // 构造零授权、零连接、零浏览器：状态按保存链接 = needs_config/needs_auth。
+            let zcode_hub =
+                tauri::async_runtime::block_on(async { crate::remote::install_zcode_hub() });
+            // 桌面 IPC 与远程 STATE 共用同一 Arc（manage 只克隆，原个留给启动任务）。
+            app.manage(zcode_hub.clone());
             // M2 远程接入：按设置恢复远程服务器（开机自启语义；内部用
             // tauri::async_runtime，无 runtime 上下文的主线程可安全调用）
             crate::remote::restore_on_launch();
+            // C4：启动恢复接线（非阻塞）。先读系统存储恢复已保存授权，再启动同一 Hub
+            // 的自动连接 worker；绝不在 Tauri 主线程等待保险箱/浏览器。Hub 未配置或
+            // 远程未启用时 worker 现查前置条件后 no-op（零连接）。
+            crate::remote::start_zcode_auto_connect_after_restore(zcode_hub);
             commands::autostart::initialize_on_first_launch(app.handle());
             // 用量账本：应用启动采集一次（按需路径，绝不进 3 秒轮询）
             crate::services::usage::collect::spawn_initial_collection();
@@ -455,6 +467,22 @@ pub fn run() {
         // 升级检查（prerelease 渠道）：GitHub 发现层 + 动态端点一键升级
         commands::updater::check_for_github_update,
         commands::updater::install_github_update,
+        // ZCode 官方远控链接配置（A4）：桌面端读写，服务端单点校验、读取即复验；
+        // 手机只经配对门内 GET /m/api/v1/official-control 读取，无写接口
+        commands::zcode_remote::zcode_remote_config_get,
+        commands::zcode_remote::zcode_remote_config_set,
+        // ZCode 统一控制（T7.1 C2a / C4）：桌面入口只回 ConnectionView/AuthStatus，
+        // 绝不回凭据；同一 Arc 已在上方 manage（与 RemoteState 共用）。
+        commands::zcode_remote::zcode_control_authorize,
+        commands::zcode_remote::zcode_control_connect,
+        commands::zcode_remote::zcode_control_disconnect,
+        commands::zcode_remote::zcode_control_status,
+        commands::zcode_remote::zcode_control_auth_status,
+        commands::zcode_remote::zcode_control_forget_authorization,
+        // T8.2 仅 debug 证据构建：桌面发放单次验收许可（普通构建不编入本命令，
+        // generate_handler 对条目上的 cfg 属性生效；手机侧无对应 HTTP 入口）。
+        #[cfg(all(feature = "zcode-bridge-evidence", debug_assertions))]
+        commands::zcode_remote::zcode_control_arm_evidence,
     ]);
 
     // 仅 release 构建注册 updater（评审 I3 修正，2026-10-08）：
@@ -485,6 +513,11 @@ pub fn run() {
 /// 的 `on_before_exit` 钩子调用本函数，保证不留孤儿进程、不失电源锁。
 pub(crate) fn exit_cleanup() {
     crate::remote::tunnel::stop_all();
+    // T7.1 C2b：退出断开唯一 ZCode 控制 Hub（推进代际、关 relay/计时器）。
+    // 退出专用**静默**入口：只释放并清位，绝不补唤醒自动连接——退出时 remote.enabled/
+    // auto 意图/内存 JWT 可能都还有效，普通入口的 P2-5 补唤醒会真的新开 relay。
+    // 重启需显式 connect（不自动重连）。
+    crate::remote::disconnect_zcode_hub_silent();
     // TPS 接收器随进程退出而停（Spec §5「Tuvis真正退出就停止接收，不增系统守护进程」）
     crate::services::tps::receiver::shutdown();
     crate::services::tps::body_runtime::shutdown_production();

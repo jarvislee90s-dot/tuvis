@@ -13,8 +13,9 @@
 //
 // | 档 | 常量 | 类 | 用途 |
 // |---|---|---|---|
-// | 一级标题（页面） | `SETTINGS_PAGE_TITLE` | `text-lg font-semibold`（18） | **每页唯一**：当前功能块的标题 |
-// | 二级标题（卡片） | `SETTINGS_CARD_TITLE` | `text-sm font-semibold`（14） | 每个设置分区 / 卡的 `h2`/`h3` |
+// | 一级标题（页面块） | `SETTINGS_PAGE_TITLE` | `text-lg font-semibold`（18） | **每页唯一**：当前功能块的 `h1` |
+// | 二级标题（卡片） | `SETTINGS_CARD_TITLE` | `text-sm font-semibold`（14） | 每个设置卡片的 `h2` |
+// | 三级标题（卡内小节） | `SETTINGS_SECTION_TITLE` | `text-[12.5px] font-semibold text-muted-foreground`（12.5 弱） | 卡内并列小节，如 ① 通用 / ② 通道 / ① 字体气质 |
 // | 副标题（段落级说明） | `SETTINGS_SUBTITLE` | `text-sm text-muted-foreground`（14 弱） | 标题正下方那句「这块是干什么的」 |
 // | 字段名 | `SETTINGS_FIELD` | `text-sm font-medium`（14 中） | 设置项的 `label` |
 // | 说明（细） | `SETTINGS_HINT` | `text-xs text-muted-foreground`（12 弱） | 字段旁/下的补充说明 |
@@ -49,8 +50,11 @@
 /** 一级标题（页面级）：**每页唯一**，当前功能块的标题 */
 export const SETTINGS_PAGE_TITLE = "text-lg font-semibold";
 
-/** 二级标题（卡片级）：每个设置分区 / 卡的 `h2` / `h3` */
+/** 二级标题（卡片级）：每个设置卡片的 `h2` */
 export const SETTINGS_CARD_TITLE = "text-sm font-semibold";
+
+/** 三级标题（卡内小节）：卡内并列分组（远程 ①–④ / 远程端外观 ①–④） */
+export const SETTINGS_SECTION_TITLE = "text-[12.5px] font-semibold text-muted-foreground";
 
 /** 副标题（段落级说明）：标题正下方那句「这块是干什么的」 */
 export const SETTINGS_SUBTITLE = "text-sm text-muted-foreground";
@@ -108,12 +112,10 @@ export const SETTINGS_REMOTE_ROW = "text-[13px]";
 export const SETTINGS_REMOTE_HINT = "text-[12px]";
 
 /**
- * 远程接入分区的组标题档（**线稿硬契约**，非层级档）。
+ * 组标题档（**线稿硬契约**）：同一线稿的 `.group-label { font-size: 12.5px;
+ * color: var(--muted); font-weight: 600; margin: 16px 0 2px; }`。
  *
- * 出处：同一线稿的 `.group-label { font-size: 12.5px; color: var(--muted);
- * font-weight: 600; margin: 16px 0 2px; }`——分区内的组头（① 通用 / ② 远程控制 /
- * ⑤ Codex 自动适配…）共用这一档。此前该值只以裸字面量存在于豁免面
- * （`RemoteSection`）内；S5 拆出 `CodexAdaptSection` 后组头落到非豁免文件，
- * 由 S6 依测试指引立档（非豁免面要用请走 typography.ts 常量）。
+ * 2026-11 收口：组标题不再只取“字号”半档，而是连同字重/弱色一起由
+ * `SETTINGS_SECTION_TITLE` 统一提供；本常量保留为线稿值来源，避免文档链断。
  */
-export const SETTINGS_REMOTE_GROUP_LABEL = "text-[12.5px]";
+export const SETTINGS_REMOTE_GROUP_LABEL = SETTINGS_SECTION_TITLE;

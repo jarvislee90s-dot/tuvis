@@ -717,6 +717,73 @@ fn api_router(state: Arc<RemoteState>) -> Router<Arc<RemoteState>> {
         // /ui-config（2026-10-05 UI 改版）：远程端外观配置下发（settings KV 只读缝；
         // PIN 门禁内层 gate 结构性覆盖——新端点不需要各自鉴权代码）
         .route("/ui-config", get(api::ui_config))
+        // /official-control（A4）：ZCode 官方远控链接配置只读下发（settings KV，
+        // 读取即复验）。PIN 门禁内层 gate 结构性覆盖；移动端无写接口——
+        // 保存只走桌面端 Tauri 命令（设计 §4.2「首版桌面编辑」）
+        .route("/official-control", get(api::official_control))
+        // ZCode 官方控制只读投影（T7.1 B2a）：连接视图 + 单会话投影。GET 不触发
+        // OAuth/连接；会话绑定只认服务端快照 + 手机提交的原始 sessionId。PIN 门禁
+        // 内层 gate 结构性覆盖——未配对在 handler 之前 403。
+        .route("/zcode/connection", get(super::zcode::connection))
+        .route("/zcode/session", get(super::zcode::session))
+        .route("/zcode/local-queue", get(super::zcode::local_queue))
+        .route(
+            "/zcode/local-queue/enqueue",
+            post(super::zcode::local_queue_enqueue),
+        )
+        .route(
+            "/zcode/local-queue/edit",
+            post(super::zcode::local_queue_edit),
+        )
+        .route(
+            "/zcode/local-queue/edit/finish",
+            post(super::zcode::local_queue_finish_edit),
+        )
+        .route(
+            "/zcode/local-queue/retract",
+            post(super::zcode::local_queue_retract),
+        )
+        .route(
+            "/zcode/local-queue/prioritize",
+            post(super::zcode::local_queue_prioritize),
+        )
+        .route(
+            "/zcode/local-queue/resume",
+            post(super::zcode::local_queue_resume),
+        )
+        .route(
+            "/zcode/local-queue/stop",
+            post(super::zcode::local_queue_stop),
+        )
+        .route(
+            "/zcode/local-queue/operations",
+            get(super::zcode::local_queue_operation),
+        )
+        .route(
+            "/zcode/local-queue/recovery",
+            get(super::zcode::local_queue_recovery),
+        )
+        .route(
+            "/zcode/local-queue/recovery/ack",
+            post(super::zcode::local_queue_recovery_ack),
+        )
+        .route(
+            "/zcode/local-queue/edits",
+            get(super::zcode::local_queue_edit_snapshot),
+        )
+        // ZCode 官方控制写动作（T7.1 B2b）：`{actionId, action}` → ActionReceipt。
+        // 设备身份只取 cookie/DB（请求体多字段即 400 `invalid_action`）；回执一律
+        // no-store，accepted/confirmed/noop/unknown 均 200 并按 state 区分。
+        .route("/zcode/actions", post(super::zcode::actions))
+        // ZCode 手机「断开并抢回」（T8）：conflict 终态的一次性 disconnect→connect。
+        // 空请求体；成功 200 ConnectionView（与 connection 同款 DTO，无凭据字段），
+        // 失败冻结码 `{error}`。PIN 门禁内层 gate 结构性覆盖——未配对在 handler
+        // 之前 403。
+        .route("/zcode/takeover", post(super::zcode::takeover))
+        // ZCode 控制事件流（T7.1 B3）：SSE 首帧连接+会话状态，随后转发连接/本会话
+        // 事件；lag 只发 resync（客户端重 GET），设备吊销/停服经 SseRegistry 即时断流。
+        // PIN 门禁内层 gate 结构性覆盖——未配对在 handler 之前 403。
+        .route("/zcode/events", get(super::zcode::events))
         // /channel（§C5，Task 10）：通道能力**装饰**端点（走哪条通道/带宽受限 +
         // 实测速率）。读 Host 推断、可被伪造、允许不准、**永不得进安全判定**
         // （不变量 §G1 推论③，见 api::channel_info 注释）；gate 由本子路由的
@@ -5852,7 +5919,8 @@ mod tests {
         assert_eq!(audits[0].result, "ok");
     }
 
-    /// 拒绝矩阵：workbuddy → 403 blackbox；zcode → 403 headless_only（均不入队）；
+    /// 拒绝矩阵：workbuddy → 403 blackbox；zcode → 409 official_control_required
+    /// （T7.1：官方控制接口是唯一写通道，有意兼容拒绝；均不入队）；
     /// 未知会话 → 404 no_session；空/全空白 text 与超长（MAX_SEND_CHARS+1）→ 400
     #[tokio::test]
     async fn send_rejects_not_injectable_and_missing() {
@@ -5878,7 +5946,7 @@ mod tests {
             body.contains("not_injectable") && body.contains("blackbox"),
             "403 体必须带 not_injectable + reasonCode：{body}"
         );
-        // zcode 走无头（M11）→ 403 headless_only
+        // zcode 走官方控制接口（T7.1：M11 无头门退役）→ 409 official_control_required
         let r = app
             .clone()
             .oneshot(req(
@@ -5889,8 +5957,8 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert_eq!(r.status(), 403);
-        assert!(body_string(r).await.contains("headless_only"));
+        assert_eq!(r.status(), 409);
+        assert!(body_string(r).await.contains("official_control_required"));
         // 不存在的会话 → 404 no_session（W1：定位失败不入队）
         let r = app
             .clone()

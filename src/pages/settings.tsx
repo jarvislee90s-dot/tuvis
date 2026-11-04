@@ -622,9 +622,10 @@ export default function SettingsPage() {
       <div className="flex-1 overflow-auto">
         <div className="max-w-3xl space-y-4 p-4">
           {/* 一级标题（2026-10-11 两级标题拉开）：左侧 primary 色条 + 大字块标题与说明行，
-              与卡内灰底小字头条（SETTINGS_CARD_TITLE 在 bg-muted 条内）形成强对比 */}
+              与卡内灰底小字头条（SETTINGS_CARD_TITLE 在 bg-muted 条内）形成强对比。
+              语义层级固定：L1 块 h1 → L2 卡片 h2 → L3 卡内小节 h3 → L4 字段。 */}
           <div className="border-primary border-l-4 pl-3">
-            <h2 className={SETTINGS_PAGE_TITLE}>{t(activeBlockMeta.labelKey)}</h2>
+            <h1 className={SETTINGS_PAGE_TITLE}>{t(activeBlockMeta.labelKey)}</h1>
             <p className={SETTINGS_SUBTITLE}>{t(activeBlockMeta.descKey)}</p>
           </div>
           {/* 框一 · 桌面端外观（即点即生效，本期维持现状）——卡头条 = 二级卡头；

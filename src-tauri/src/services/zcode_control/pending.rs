@@ -1,0 +1,2151 @@
+//! 会话 pending 册与 control 观察（生产计划 T2.2；T4.1/T4.2/T5 在此扩展应答闸）。
+//!
+//! # 权威源与边界
+//!
+//! pending 卡与 control **只能**来自本会话 conversation topic 的真实帧
+//! （`scripts/zcode-bridge-probe/interactionBridge.ts` 的 `PendingBook` 同语义，
+//! 形状钉固定官方源码 `zai-org/ZCode @ 3c5b2276` 的 `snapshot.ts:242-355`）：
+//!
+//! - `payload.kind="snapshot"`：`snapshot.pendingInteractions` 整体替换本册；
+//!   `snapshot.control` 记录最新 control；
+//! - `payload.kind="deltas"`：只认 `op="state.updated"` 的 `patch`，键级**整体替换**
+//!   （不深合并）：`patch.pendingInteractions` 替换册、`patch.control` 替换 control。
+//!
+//! 纪律：
+//! - 会话过滤由上游（[`Projection`](super::projection::Projection)）完成；本册仍按
+//!   绑定 sessionId 校验卡内归属，绝不把异会话的卡收进本册；
+//! - `control.activeWorks` **必须是数组**才算「宿主已明确宣告」：`[]` = 已确认空闲，
+//!   字段缺失/非数组 = 未知（不得归一为空数组，也绝不据此发 stop）；
+//! - 形状不符的卡跳过并计数（不致命、更不猜测）；已消费的 interactionId 不被迟到
+//!   快照复活（T4.1 在此接入消费闸）；
+//! - 文本只保留宿主原值（summary/prompt/题干/选项），不落盘、不写日志。
+
+use std::collections::{BTreeMap, BTreeSet};
+
+use serde_json::{Map, Value};
+
+use super::types::{
+    codes, project_pending_detail_bounded, ActiveWork, AnswerEntry, BoundTarget, ControlView,
+    PendingKind, PendingView, PermissionOptionView, PlanApprovalDecision, QuestionOption,
+    QuestionView, ZResult, ZcodeError,
+};
+
+/// 本册最多保留的 pending 卡数（防巨库/恶意帧撑爆内存；超出丢弃并计数）。
+pub const MAX_PENDING_CARDS: usize = 256;
+
+/// AskUserQuestion 的官方工具名（探针 `isAnswerableUserInput` 的判据）。
+pub const ASK_USER_QUESTION_TOOL: &str = "AskUserQuestion";
+
+/// 已建模的问答 `schema.interaction` 值（其余子类一律只读、不代答）。
+pub const ASK_USER_QUESTION_INTERACTION: &str = "AskUserQuestion";
+
+/// 计划批准的工具名（C1 只读标识判据，官方 `ExitPlanMode`）。
+pub const EXIT_PLAN_MODE_TOOL: &str = "ExitPlanMode";
+
+/// 计划批准的 `payload.schema.interaction` 原值（C1 只读标识）。
+pub const PLAN_APPROVAL_INTERACTION: &str = "plan_approval";
+
+fn unsupported() -> ZcodeError {
+    ZcodeError::of(codes::UNSUPPORTED_PROTOCOL)
+}
+
+fn invalid_answer() -> ZcodeError {
+    ZcodeError::of(codes::INVALID_ANSWER)
+}
+
+fn needs_evidence() -> ZcodeError {
+    ZcodeError::of(codes::NEEDS_EVIDENCE)
+}
+
+fn stale_pending() -> ZcodeError {
+    ZcodeError::of(codes::STALE_PENDING)
+}
+
+fn forbidden_option() -> ZcodeError {
+    ZcodeError::of(codes::FORBIDDEN_OPTION)
+}
+
+/// 单会话 pending 册（绑定 sessionId + 连接代际）。
+#[derive(Debug, Clone)]
+pub struct PendingBook {
+    session_id: String,
+    generation: u64,
+    pendings: BTreeMap<String, PendingView>,
+    /// 宿主最近一次整体替换里**存在**的 interactionId（与本地消费/在途无关）。
+    host_pending_ids: BTreeSet<String>,
+    /// 本地已授权提交、尚未收口的 interactionId（重复提交闸）。
+    inflight: BTreeSet<String>,
+    consumed: BTreeSet<String>,
+    control: Option<ControlView>,
+    host_pending_revision: u64,
+    invalid_pending_skipped: u64,
+    /// 被跳过的**单个选项**数（卡片仍保留）：让「卡在但少了某个选项」可诊断，
+    /// 而不是静默丢项（R0 复审 I5）。
+    invalid_option_skipped: u64,
+}
+
+impl PendingBook {
+    /// 以精确 sessionId 与当前连接代际构造空册。
+    pub fn new(session_id: impl Into<String>, generation: u64) -> Self {
+        Self {
+            session_id: session_id.into(),
+            generation,
+            pendings: BTreeMap::new(),
+            host_pending_ids: BTreeSet::new(),
+            inflight: BTreeSet::new(),
+            consumed: BTreeSet::new(),
+            control: None,
+            host_pending_revision: 0,
+            invalid_pending_skipped: 0,
+            invalid_option_skipped: 0,
+        }
+    }
+
+    /// 绑定会话 id。
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    /// 绑定代际。
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// 宿主是否已**明确宣告** control（`activeWorks` 为数组，显式 `[]` 亦算）。
+    ///
+    /// 订阅 ACK 本身不是宣告：未收到含 control 的快照/增量前一律 `false`。
+    pub fn has_confirmed_control(&self) -> bool {
+        self.control.is_some()
+    }
+
+    /// 最近一次观察到的 control（未宣告 = `None`，不归一为空数组）。
+    pub fn control(&self) -> Option<&ControlView> {
+        self.control.as_ref()
+    }
+
+    /// 当前 pending 卡（按 interactionId 稳定排序）。
+    pub fn pendings(&self) -> Vec<PendingView> {
+        self.pendings.values().cloned().collect()
+    }
+
+    /// 只读查询单张 pending 卡（不校验目标、不置本地在途、不消费）。
+    ///
+    /// 调用方必须先完成会话/代际/workspace 绑定与 `is_ready` 校验；本访问器只回答
+    /// 「这张卡此刻是否仍在本册」，绝不把「在册」当成「可提交」。
+    pub fn pending(&self, interaction_id: &str) -> Option<&PendingView> {
+        self.pendings.get(interaction_id)
+    }
+
+    /// 宿主 pending 集合的观察代数（每次整体替换 +1；T4.1 用它确认终态）。
+    pub fn host_pending_revision(&self) -> u64 {
+        self.host_pending_revision
+    }
+
+    /// 宿主最近一次整体替换里是否有这张卡（**与本地消费/在途无关**）。
+    pub fn host_has_pending(&self, interaction_id: &str) -> bool {
+        self.host_pending_ids.contains(interaction_id)
+    }
+
+    /// 宿主最近一次整体替换里的 pending id 集合（只含 id 形状，无题目/选项/答案；
+    /// 外部评审 C2：pending 首次确认判据的撤卡证据源）。
+    pub fn host_pending_ids(&self) -> Vec<String> {
+        self.host_pending_ids.iter().cloned().collect()
+    }
+
+    /// 应答授权：精确校验会话/代际/卡锚，原子置本地 in-flight（重复提交闸）。
+    ///
+    /// 只证明「本进程尚未提交这张卡」——**不**代表宿主已收口：宿主 pending 集合
+    /// 仍由下一帧整体替换独立推进。
+    pub fn authorize(
+        &mut self,
+        target: &BoundTarget,
+        interaction_id: &str,
+    ) -> ZResult<PendingView> {
+        if target.session_id != self.session_id || target.bridge_generation() != self.generation {
+            return Err(stale_pending());
+        }
+        if self.consumed.contains(interaction_id) || self.inflight.contains(interaction_id) {
+            return Err(stale_pending());
+        }
+        let Some(card) = self.pendings.get(interaction_id).cloned() else {
+            return Err(stale_pending());
+        };
+        self.inflight.insert(interaction_id.to_owned());
+        Ok(card)
+    }
+
+    /// 本地消费（已发出 resolve）：**不是**宿主撤卡，宿主集合保持不变。
+    pub fn mark_resolved_local(&mut self, interaction_id: &str) {
+        self.inflight.remove(interaction_id);
+        self.consumed.insert(interaction_id.to_owned());
+        self.pendings.remove(interaction_id);
+    }
+
+    /// 释放本地 in-flight（仅当确证零写、用户可重试时由调用方使用）。
+    pub fn clear_local_inflight(&mut self, interaction_id: &str) {
+        self.inflight.remove(interaction_id);
+    }
+
+    /// 形状不符被跳过的卡数（证据计数，不含值）。
+    pub fn invalid_pending_skipped(&self) -> u64 {
+        self.invalid_pending_skipped
+    }
+
+    /// 形状不符被跳过的**选项**数（卡片仍保留；证据计数，不含值）。
+    pub fn invalid_option_skipped(&self) -> u64 {
+        self.invalid_option_skipped
+    }
+
+    /// 应用一帧 snapshot 的 `snapshot` 对象。
+    ///
+    /// `pendingInteractions` 是官方 schema 的必填数组：缺席/非数组 = 形状不符
+    /// （fail-closed，由上层置 `ready=false` 后重取快照）。
+    pub fn accept_snapshot(&mut self, snapshot: &Value) -> ZResult<()> {
+        let object = snapshot.as_object().ok_or_else(unsupported)?;
+        if let Some(session_id) = object.get("sessionId").and_then(Value::as_str) {
+            if session_id != self.session_id {
+                return Err(ZcodeError::of(codes::NO_SESSION));
+            }
+        }
+        self.control = object.get("control").and_then(parse_control);
+        let cards = object
+            .get("pendingInteractions")
+            .and_then(Value::as_array)
+            .ok_or_else(unsupported)?;
+        self.replace_pendings(cards);
+        Ok(())
+    }
+
+    /// 应用一条 `state.updated` 的 `patch` 对象（键级整体替换）。
+    pub fn accept_delta_patch(&mut self, patch: &Value) -> ZResult<()> {
+        let object = patch.as_object().ok_or_else(unsupported)?;
+        if let Some(control) = object.get("control") {
+            self.control = parse_control(control);
+        }
+        if let Some(cards) = object.get("pendingInteractions") {
+            let cards = cards.as_array().ok_or_else(unsupported)?;
+            self.replace_pendings(cards);
+        }
+        Ok(())
+    }
+
+    /// 整体替换 pending 集合（已消费 id 不复活；坏卡跳过计数）。
+    fn replace_pendings(&mut self, cards: &[Value]) {
+        self.pendings.clear();
+        self.host_pending_ids.clear();
+        self.host_pending_revision = self.host_pending_revision.saturating_add(1);
+        let mut skipped_options = 0u64;
+        for card in cards {
+            // 上限按「宿主本帧解析出的卡数」计（含已被本地消费的卡），避免本地消费
+            // 让 host 集合绕过内存上限。
+            if self.host_pending_ids.len() >= MAX_PENDING_CARDS {
+                self.invalid_pending_skipped = self.invalid_pending_skipped.saturating_add(1);
+                continue;
+            }
+            let Some(parsed) = parse_pending(card, &mut skipped_options) else {
+                self.invalid_pending_skipped = self.invalid_pending_skipped.saturating_add(1);
+                continue;
+            };
+            // 宿主集合与本地消费闸分开记：本地已消费不代表宿主已撤卡。
+            self.host_pending_ids.insert(parsed.interaction_id.clone());
+            if self.consumed.contains(&parsed.interaction_id) {
+                continue;
+            }
+            self.pendings.insert(parsed.interaction_id.clone(), parsed);
+        }
+        self.invalid_option_skipped = self.invalid_option_skipped.saturating_add(skipped_options);
+        // 写后结果未知的在途闸只由宿主自己解除：该帧缺席（撤卡/换卡）= 宿主已
+        // 不再等这张卡，释放闸允许重试；仍在本帧 = 保留（绝不自动重发）。
+        self.inflight
+            .retain(|interaction_id| self.host_pending_ids.contains(interaction_id));
+    }
+}
+
+/// 问答卡的**唯一**可远程作答判定（纯函数，供投影与应答闸共用）。
+///
+/// 三条同时成立：`kind=userInput`、`toolName=AskUserQuestion`、`schema.interaction`
+/// 缺失或恰为 [`ASK_USER_QUESTION_INTERACTION`]。`plan_approval` / MCP elicitation
+/// 等子型虽然也投影成 `userInput`，但**不可代答**——卡片据此渲染只读面，用户不会
+/// 选完才吃到 `needs_evidence`。
+pub fn is_answerable_user_input(pending: &PendingView) -> bool {
+    answerable_parts(
+        pending.kind,
+        pending.tool_name.as_deref(),
+        pending.schema_interaction.as_deref(),
+    )
+}
+
+/// [`is_answerable_user_input`] 的字段级实现（投影期还拿不到完整的 `PendingView`）。
+fn answerable_parts(
+    kind: PendingKind,
+    tool_name: Option<&str>,
+    schema_interaction: Option<&str>,
+) -> bool {
+    kind == PendingKind::UserInput
+        && tool_name == Some(ASK_USER_QUESTION_TOOL)
+        && schema_interaction.is_none_or(|interaction| interaction == ASK_USER_QUESTION_INTERACTION)
+}
+
+/// 本卡是否为**计划批准**（纯函数；只用于 C1 的只读解释，**不参与**应答判定）。
+///
+/// 三条同时成立：`kind=userInput`、`toolName=ExitPlanMode`、
+/// `schema.interaction` 恰为 [`PLAN_APPROVAL_INTERACTION`]。相似形状（缺 schema、
+/// 工具名不符、MCP elicitation、`kind=permission`）一律不置位，走通用只读文案。
+///
+/// `build_user_answer` 仍拒绝计划批准；原生批准走独立的
+/// [`build_plan_approval_answer`]（C2），绝不把它当普通问答应答。
+pub fn is_plan_approval(pending: &PendingView) -> bool {
+    plan_approval_parts(
+        pending.kind,
+        pending.tool_name.as_deref(),
+        pending.schema_interaction.as_deref(),
+    )
+}
+
+/// [`is_plan_approval`] 的字段级实现（投影期还拿不到完整的 `PendingView`）。
+fn plan_approval_parts(
+    kind: PendingKind,
+    tool_name: Option<&str>,
+    schema_interaction: Option<&str>,
+) -> bool {
+    kind == PendingKind::UserInput
+        && tool_name == Some(EXIT_PLAN_MODE_TOOL)
+        && schema_interaction == Some(PLAN_APPROVAL_INTERACTION)
+}
+
+/// 计划批准/反馈意见的长度上限（字符数；正文只走 wire，不落账本/日志）。
+pub const MAX_PLAN_FEEDBACK_CHARS: usize = 4096;
+
+/// 按宿主原值构造计划批准的 `resolveInteraction.answer`（C2）。
+///
+/// 官方 `ExitPlanMode` 投影为唯一问题 + 唯一 option，option value 为
+/// `approve`（`createExitPlanModeApprovalQuestions`）。这里只接受这一种**精确**
+/// 形状：计划批准不是普通问答，不接受多题/多选项/其他 value，也不从 label 猜值。
+///
+/// 真实宿主（2026-11-03）已确认：
+/// - 批准：`action=accept` + `content.answers[question]="approve"`、
+///   `answer_0="approve"`、`answer="approve"`；缺 content 会被当成无反馈拒绝。
+/// - 反馈：同一形状，文本写入三个 answer 字段；宿主保持 plan mode，并把文本作为
+///   `plan_approval_feedback` 送回 agent。
+pub fn build_plan_approval_answer(
+    pending: &PendingView,
+    decision: PlanApprovalDecision,
+    feedback: Option<&str>,
+) -> ZResult<Value> {
+    if !is_plan_approval(pending) || pending.answerable {
+        return Err(invalid_answer());
+    }
+    if pending.questions.len() != 1 {
+        return Err(invalid_answer());
+    }
+    let question = &pending.questions[0];
+    if question.options.len() != 1 || question.options[0].value != "approve" {
+        return Err(forbidden_option());
+    }
+    let value = match decision {
+        PlanApprovalDecision::Approve => {
+            if feedback.is_some_and(|text| !text.trim().is_empty()) {
+                return Err(invalid_answer());
+            }
+            "approve".to_owned()
+        }
+        PlanApprovalDecision::Feedback => {
+            if !question.free_text_allowed {
+                return Err(forbidden_option());
+            }
+            let text = feedback.unwrap_or_default().trim();
+            if text.is_empty() || text.chars().count() > MAX_PLAN_FEEDBACK_CHARS {
+                return Err(invalid_answer());
+            }
+            text.to_owned()
+        }
+    };
+    let mut answers = Map::new();
+    answers.insert(question.question_text.clone(), Value::String(value.clone()));
+    Ok(serde_json::json!({
+        "action": "accept",
+        "content": {
+            "answers": answers,
+            "answer_0": value,
+            "answer": value,
+        }
+    }))
+}
+
+/// 按宿主原值构造 `resolveInteraction.answer`（T4.1 Slice A；纯映射，不落盘）。
+/// 按宿主原值构造 `resolveInteraction.answer`（T4.1 Slice A；纯映射，不落盘）。
+///
+/// 形状钉固定探针 `buildUserInputAnswer`（`interactionBridge.ts:536-590`；
+/// 官方 `command.ts:222-258`、`interaction-broker.ts:623-650,766-780`）：
+///
+/// - `content.answers[题干全文]` = 选中 value 以 `", "` 连接（多选同形）；
+/// - `content.answer_<index>` = 多选 value 数组 / 单选首个 value（**index = 题序**）；
+/// - 仅单题时附 `content.answer`（旧读取路径兼容）；
+/// - 自由文本只写 `content.answers` 原题键（探针只在有选中 value 时补 answer_i）。
+///
+/// 冻结闸（任何一条不满足都零 value，绝不猜测）：
+/// - 只答 `kind=userInput` + `toolName=AskUserQuestion` + schema 为已建模形态的卡；
+///   `plan_approval` / MCP elicitation 等其他子类 → `needs_evidence`；
+/// - 每题恰好一个答案、题干不重名、选项 value 必须来自宿主集合、单/多选基数正确、
+///   未允许自由文本或混用自由文本+选中值 → `invalid_answer`；
+/// - 空答案列表一律拒绝（空 ≠ 用户同意继续）。
+///
+/// 本函数**不**写卡、不落草稿/历史/审计正文：敏感卡的正文只穿过返回值上 wire。
+pub fn build_user_answer(pending: &PendingView, answers: &[AnswerEntry]) -> ZResult<Value> {
+    if pending.kind != PendingKind::UserInput {
+        return Err(invalid_answer());
+    }
+    // 计划审批/MCP elicitation 同样投影成 userInput：只认已建模的问答子类。
+    // 与手机卡片的 `answerable` 共用同一个纯判定（绝不前端第二套规则）。
+    if !is_answerable_user_input(pending) {
+        return Err(needs_evidence());
+    }
+    if answers.is_empty() || pending.questions.is_empty() {
+        return Err(invalid_answer());
+    }
+
+    // 题干全文是 answers 的键：重名即歧义，整卡拒绝。
+    let mut by_text = BTreeMap::new();
+    for question in &pending.questions {
+        if by_text
+            .insert(question.question_text.as_str(), question)
+            .is_some()
+        {
+            return Err(invalid_answer());
+        }
+    }
+    // 每题恰好一次：数量与题干集合都必须精确相等（多答/漏答/答非所问都拒绝）。
+    if answers.len() != pending.questions.len() {
+        return Err(invalid_answer());
+    }
+    let mut seen = BTreeSet::new();
+    for entry in answers {
+        if !by_text.contains_key(entry.question_text.as_str())
+            || !seen.insert(entry.question_text.as_str())
+        {
+            return Err(invalid_answer());
+        }
+    }
+
+    let mut answer_map = Map::new();
+    let mut content = Map::new();
+    for (index, question) in pending.questions.iter().enumerate() {
+        let entry = answers
+            .iter()
+            .find(|entry| entry.question_text == question.question_text)
+            .ok_or_else(invalid_answer)?;
+        match (&entry.free_text, entry.selected_values.is_empty()) {
+            // 自由文本：宿主必须显式允许（payload.freeText），且不得与选中值混用。
+            (Some(text), true) => {
+                if !question.free_text_allowed || text.trim().is_empty() {
+                    return Err(invalid_answer());
+                }
+                answer_map.insert(question.question_text.clone(), Value::from(text.clone()));
+            }
+            // 选项答案：value 必须是宿主集合里的原值（绝不回传 label）。
+            (None, false) => {
+                if !question.multi_select && entry.selected_values.len() > 1 {
+                    return Err(invalid_answer());
+                }
+                let mut unique = BTreeSet::new();
+                for value in &entry.selected_values {
+                    if !unique.insert(value.as_str())
+                        || !question.options.iter().any(|option| option.value == *value)
+                    {
+                        return Err(invalid_answer());
+                    }
+                }
+                answer_map.insert(
+                    question.question_text.clone(),
+                    Value::from(entry.selected_values.join(", ")),
+                );
+                let slot = if question.multi_select {
+                    Value::Array(
+                        entry
+                            .selected_values
+                            .iter()
+                            .cloned()
+                            .map(Value::from)
+                            .collect(),
+                    )
+                } else {
+                    Value::from(entry.selected_values[0].clone())
+                };
+                content.insert(format!("answer_{index}"), slot.clone());
+                if pending.questions.len() == 1 {
+                    content.insert("answer".to_owned(), slot);
+                }
+            }
+            // 自由文本+选中值混用，或两者都空：都不是探针支持的形状。
+            _ => return Err(invalid_answer()),
+        }
+    }
+
+    let mut payload = Map::new();
+    payload.insert("answers".to_owned(), Value::Object(answer_map));
+    for (key, value) in content {
+        payload.insert(key, value);
+    }
+    let mut root = Map::new();
+    root.insert("action".to_owned(), Value::from("accept"));
+    root.insert("content".to_owned(), Value::Object(payload));
+    Ok(Value::Object(root))
+}
+
+/// fullAccess 特权选项 id（探针 `PERMISSION_FULL_ACCESS_OPTION_ID`，
+/// 固定源码 `snapshot.ts:234`）：无论宿主给的 kind 是什么都硬闸拒绝。
+const PERMISSION_FULL_ACCESS_OPTION_ID: &str = "fullAccess";
+
+/// 可回传的权限选项 kind 白名单（探针 `pickPermissionOption` 的 once/deny 闭集）。
+const PERMISSION_ALLOW_ONCE_KIND: &str = "allowOnce";
+/// 拒绝型权限选项 kind（一次性拒绝，不是常驻授权）。
+const PERMISSION_DENY_KIND: &str = "deny";
+
+/// 按宿主原值构造 `resolveInteraction.answer` 的权限应答（T5；纯映射，不落盘）。
+///
+/// 形状钉固定探针 `buildPermissionAnswer`（`interactionBridge.ts:509-528`）与决策
+/// §8.10：应答值是 `{optionId: <宿主原值>}`，**绝不**把 kind 名（`allowOnce`/`deny`）
+/// 硬编码成真正下发的 optionId。`ControlAction::Permission` 不携带自由文本，因此
+/// 本函数不产出 `freeText`（探针的可选字段在没有正文时不写）。
+///
+/// 冻结闸（任何一条不满足都零 value，绝不猜测）：
+/// - 只答 `kind=permission` 的卡（userInput / workspaceHookReview → `invalid_answer`）；
+/// - optionId 必须非空且**精确属于本卡**，且本卡选项 id 无重复（歧义 → `forbidden_option`）；
+/// - `fullAccess` 特权项无论 kind 一律拒绝（`forbidden_option`）——绝不走宿主
+///   resolveFullAccess 特权分支；
+/// - 只放行宿主 kind 白名单 `PERMISSION_ALLOW_ONCE_KIND` / `PERMISSION_DENY_KIND`；
+///   `allowAlways`（常驻授权）/ `allow_session` / `allow_project` / `custom` 及未知
+///   kind 一律拒绝（`forbidden_option`）。
+///
+/// 本函数**不**读改会话权限模式、不写账本正文：选项原值只穿过返回值上 wire。
+pub fn build_permission_answer(pending: &PendingView, option_id: &str) -> ZResult<Value> {
+    if pending.kind != PendingKind::Permission {
+        return Err(invalid_answer());
+    }
+    if option_id.is_empty() {
+        return Err(invalid_answer());
+    }
+    // fullAccess 特权项：无论宿主 kind（甚至卡内不存在该项）都硬闸拒绝。
+    if option_id == PERMISSION_FULL_ACCESS_OPTION_ID {
+        return Err(forbidden_option());
+    }
+    // 同一 optionId 重复 = 歧义卡：无法证明回传的是哪个选项，整卡拒绝。
+    let mut seen = BTreeSet::new();
+    for option in &pending.options {
+        if !seen.insert(option.option_id.as_str()) {
+            return Err(forbidden_option());
+        }
+    }
+    // optionId 必须精确属于本卡；绝不按 label/相似度猜，也不回退到第一个选项。
+    let option = pending
+        .options
+        .iter()
+        .find(|option| option.option_id == option_id)
+        .ok_or_else(forbidden_option)?;
+    // kind 是白名单依据：只放行一次性放行/拒绝；常驻与未知 kind 一律拒绝。
+    match option.kind.as_str() {
+        PERMISSION_ALLOW_ONCE_KIND | PERMISSION_DENY_KIND => {}
+        _ => return Err(forbidden_option()),
+    }
+    // ControlAction::Permission 不携带自由文本：应答恰好只有一个 optionId 键。
+    let mut answer = Map::new();
+    answer.insert("optionId".to_owned(), Value::from(option_id));
+    Ok(Value::Object(answer))
+}
+
+/// 解析 control：`activeWorks` 必须是数组；任何元素形状不符 → `None`（未知，不猜）。
+fn parse_control(control: &Value) -> Option<ControlView> {
+    let object = control.as_object()?;
+    let works = object.get("activeWorks")?.as_array()?;
+    let mut active_works = Vec::with_capacity(works.len());
+    for work in works {
+        let work = work.as_object()?;
+        let kind = work.get("kind")?.as_str().filter(|text| !text.is_empty())?;
+        let foreground_execution_id = match work.get("foregroundExecutionId") {
+            None => None,
+            Some(value) => Some(value.as_str().filter(|text| !text.is_empty())?.to_owned()),
+        };
+        let source_command_id = match work.get("sourceCommandId") {
+            None => None,
+            Some(value) => Some(value.as_str().filter(|text| !text.is_empty())?.to_owned()),
+        };
+        active_works.push(ActiveWork {
+            source_command_id,
+            kind: kind.to_owned(),
+            foreground_execution_id,
+        });
+    }
+    Some(ControlView { active_works })
+}
+
+fn pending_kind(kind: &str) -> Option<PendingKind> {
+    match kind {
+        "permission" => Some(PendingKind::Permission),
+        "userInput" => Some(PendingKind::UserInput),
+        "workspaceHookReview" => Some(PendingKind::WorkspaceHookReview),
+        _ => None,
+    }
+}
+
+fn optional_string(object: &Map<String, Value>, key: &str) -> Option<String> {
+    object.get(key).and_then(Value::as_str).map(str::to_owned)
+}
+
+/// 解析一张 pending 卡；形状不符返回 `None`（调用方跳过并计数，绝不猜测）。
+fn parse_pending(card: &Value, skipped_options: &mut u64) -> Option<PendingView> {
+    let record = card.as_object()?;
+    let interaction_id = record
+        .get("interactionId")?
+        .as_str()
+        .filter(|text| !text.is_empty())?;
+    let kind_text = record.get("kind")?.as_str()?;
+    let kind = pending_kind(kind_text)?;
+    let payload = record.get("payload")?.as_object()?;
+    // 顶层 kind 与 payload.kind 必须一致（官方 superRefine 同款判据）。
+    if payload.get("kind").and_then(Value::as_str) != Some(kind_text) {
+        return None;
+    }
+
+    let free_text_allowed = payload
+        .get("freeText")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let questions = match payload.get("questions") {
+        None => Vec::new(),
+        Some(value) => parse_questions(value, free_text_allowed, skipped_options)?,
+    };
+    if kind == PendingKind::UserInput && questions.is_empty() {
+        return None;
+    }
+    let options = match payload.get("options") {
+        None => Vec::new(),
+        Some(value) => parse_permission_options(value, skipped_options)?,
+    };
+
+    let auto_resolution = record.get("autoResolution").and_then(Value::as_object);
+    let summary = optional_string(payload, "summary")
+        .or_else(|| optional_string(payload, "prompt"))
+        .filter(|text| !text.is_empty());
+    // 官方投影的 schema 子类（plan_approval / MCP elicitation …）：只读原值，
+    // 是否可答由与 build_user_answer 共用的纯判定给出（`answerable`）。
+    let schema_interaction = payload
+        .get("schema")
+        .and_then(Value::as_object)
+        .and_then(|schema| schema.get("interaction"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let tool_name = optional_string(payload, "toolName");
+    let answerable = answerable_parts(kind, tool_name.as_deref(), schema_interaction.as_deref());
+    // C1：计划批准是**只读**子型（`answerable` 仍为 false）。标识只供手机端换专用
+    // 文案与只读面，不进入任何应答载荷。
+    let plan_approval =
+        plan_approval_parts(kind, tool_name.as_deref(), schema_interaction.as_deref());
+    // R0 复审遗留 I4：Bash 审批的命令正文只在 payload.detail，手机端此前看不到。
+    // 只做只读投影（截断有界），不写日志/账本，也不参与任何应答载荷。
+    // 截断真值与文本同一次算出：前端不按长度猜「是不是全貌」。
+    // 计划批准的实际文本可能只在工具 input/schema.plan 中（桥投影没有单独字段）；
+    // 复用只读 detail 通道展示，仍按同一上限截断，绝不进入任何应答载荷。
+    let detail_value = payload
+        .get("detail")
+        .or_else(|| {
+            payload
+                .get("input")
+                .and_then(Value::as_object)
+                .and_then(|input| input.get("plan"))
+        })
+        .or_else(|| {
+            payload
+                .get("schema")
+                .and_then(Value::as_object)
+                .and_then(|schema| schema.get("plan"))
+        })
+        .or_else(|| payload.get("plan"));
+    let detail = project_pending_detail_bounded(detail_value);
+
+    Some(PendingView {
+        interaction_id: interaction_id.to_owned(),
+        kind,
+        anchor_row_id: record.get("anchorRowId").and_then(Value::as_u64),
+        tool_call_id: optional_string(payload, "toolCallId"),
+        created_at: record.get("createdAt").and_then(Value::as_u64),
+        summary,
+        tool_name,
+        schema_interaction,
+        sensitive: payload
+            .get("sensitive")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        auto_resolution: auto_resolution.is_some(),
+        auto_resolution_state: auto_resolution
+            .and_then(|object| object.get("state"))
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        questions,
+        options,
+        detail: detail.text,
+        answerable,
+        plan_approval,
+        detail_truncated: detail.truncated,
+    })
+}
+
+fn parse_questions(
+    value: &Value,
+    free_text_allowed: bool,
+    skipped_options: &mut u64,
+) -> Option<Vec<QuestionView>> {
+    let items = value.as_array()?;
+    let mut questions = Vec::with_capacity(items.len());
+    for item in items {
+        let record = item.as_object()?;
+        let question_text = record
+            .get("question")?
+            .as_str()
+            .filter(|text| !text.is_empty())?;
+        let header = record.get("header").and_then(Value::as_str)?;
+        let options = match record.get("options") {
+            None => Vec::new(),
+            Some(value) => parse_question_options(value, skipped_options)?,
+        };
+        questions.push(QuestionView {
+            header: header.to_owned(),
+            question_text: question_text.to_owned(),
+            options,
+            multi_select: record
+                .get("multiSelect")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            free_text_allowed,
+        });
+    }
+    Some(questions)
+}
+
+/// 解析问答选项：**逐项宽容**（坏选项只跳过该项，不牵连整题/整卡）。
+///
+/// 官方卡里 `options` 元素是 `{value,label,description?,preview?}`；单个元素形状不符
+/// （缺 `value`/`label`）只丢该项——整卡可见性优先，绝不因一个坏选项把整张问答卡
+/// 从手机端抹掉。
+fn parse_question_options(value: &Value, skipped_options: &mut u64) -> Option<Vec<QuestionOption>> {
+    let items = value.as_array()?;
+    let mut options = Vec::with_capacity(items.len());
+    for item in items {
+        let Some(record) = item.as_object() else {
+            *skipped_options = skipped_options.saturating_add(1);
+            continue;
+        };
+        let Some(value) = record
+            .get("value")
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty())
+        else {
+            *skipped_options = skipped_options.saturating_add(1);
+            continue;
+        };
+        let Some(label) = record.get("label").and_then(Value::as_str) else {
+            *skipped_options = skipped_options.saturating_add(1);
+            continue;
+        };
+        options.push(QuestionOption {
+            value: value.to_owned(),
+            label: label.to_owned(),
+            description: optional_string(record, "description"),
+            preview: optional_string(record, "preview"),
+        });
+    }
+    Some(options)
+}
+
+/// 解析审批选项：**逐项宽容**（坏选项只跳过该项，不牵连整卡）。
+///
+/// 依据（安装包 3.16.2.8769 的 zod schema，`E$`）：官方 `options` 没有 min 长度，
+/// 元素为 `{optionId,label,kind,response?}`。旧实现用 `?` 逐字段展开，任何一个选项
+/// 缺 `label`/`kind` 都会让 `parse_pending` 返回 `None`，**整张审批卡被静默丢弃**。
+/// 因此这里改为「保留能解析的选项 + 保留卡片身份」。
+///
+/// **未定位项（如实申报）**：现场「图片三审批消失」是否由这条路径造成，本轮**没有**
+/// 真实帧证据（证据文档 §6：零实连、零帧捕获）；另一条已知差距是 `allowAlways`
+/// 被写闸拒绝（`forbidden_option`）。本改动只消除「一个坏选项吞整卡」这一**代码
+/// 层面可证伪**的丢卡路径，不宣称现场症状已归因。
+///
+/// `kind` 只读原值（`allowOnce`/`allowAlways`/`deny`/`custom`），不在投影期改写或
+/// 过滤——是否可回传由 `build_permission_answer` 的冻结闸判定。
+fn parse_permission_options(
+    value: &Value,
+    skipped_options: &mut u64,
+) -> Option<Vec<PermissionOptionView>> {
+    let items = value.as_array()?;
+    let mut options = Vec::with_capacity(items.len());
+    for item in items {
+        let Some(record) = item.as_object() else {
+            *skipped_options = skipped_options.saturating_add(1);
+            continue;
+        };
+        let Some(option_id) = record
+            .get("optionId")
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty())
+        else {
+            *skipped_options = skipped_options.saturating_add(1);
+            continue;
+        };
+        let Some(label) = record.get("label").and_then(Value::as_str) else {
+            *skipped_options = skipped_options.saturating_add(1);
+            continue;
+        };
+        let Some(kind) = record.get("kind").and_then(Value::as_str) else {
+            *skipped_options = skipped_options.saturating_add(1);
+            continue;
+        };
+        options.push(PermissionOptionView {
+            option_id: option_id.to_owned(),
+            label: label.to_owned(),
+            kind: kind.to_owned(),
+        });
+    }
+    Some(options)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn control_projects_source_command_id() {
+        let control = super::parse_control(&serde_json::json!({"activeWorks": [{"kind":"primaryTurn", "foregroundExecutionId":"E", "sourceCommandId":"input"}]})).unwrap();
+        let value = serde_json::to_value(control).unwrap();
+        assert_eq!(value["activeWorks"][0]["sourceCommandId"], "input");
+    }
+    use super::super::types::MAX_PENDING_DETAIL_CHARS;
+    use super::*;
+    use serde_json::json;
+
+    const SESSION: &str = "sess_0f9a1c0d-0000-4000-8000-000000000001";
+    const SESSION_HEX: &str = "session_0123456789abcdef0123456789abcdef";
+
+    fn permission_card(interaction_id: &str) -> Value {
+        json!({
+            "interactionId": interaction_id,
+            "kind": "permission",
+            "anchorRowId": 12,
+            "createdAt": 1_700_000_000_000u64,
+            "payload": {
+                "kind": "permission",
+                "toolCallId": "call_synthetic_0001",
+                "toolName": "Write",
+                "summary": "synthetic: write a scratch file",
+                "freeText": true,
+                "options": [
+                    {"optionId": "allowOnce", "label": "Allow once", "kind": "allowOnce"},
+                    {"optionId": "denyOnce", "label": "Deny", "kind": "deny"}
+                ]
+            }
+        })
+    }
+
+    fn user_input_card(interaction_id: &str) -> Value {
+        json!({
+            "interactionId": interaction_id,
+            "kind": "userInput",
+            "anchorRowId": 7,
+            "createdAt": 1_700_000_000_500u64,
+            "autoResolution": {"state": "visibleCountdown"},
+            "payload": {
+                "kind": "userInput",
+                "prompt": "synthetic: pick answers",
+                "freeText": true,
+                "toolCallId": "call_synthetic_0002",
+                "toolName": "AskUserQuestion",
+                "questions": [
+                    {
+                        "question": "Which color?",
+                        "header": "Color",
+                        "options": [
+                            {"value": "Red", "label": "Red", "description": "warm"},
+                            {"value": "Blue", "label": "Blue"}
+                        ]
+                    },
+                    {
+                        "question": "Which sizes?",
+                        "header": "Size",
+                        "multiSelect": true,
+                        "options": [
+                            {"value": "S", "label": "S"},
+                            {"value": "M", "label": "M", "preview": "medium"}
+                        ]
+                    }
+                ]
+            }
+        })
+    }
+
+    fn snapshot(control: Option<Value>, cards: Value) -> Value {
+        json!({
+            "protocolVersion": 1,
+            "sessionId": SESSION,
+            "logEpoch": "synthetic-epoch",
+            "seq": 1,
+            "revision": 3,
+            "control": control,
+            "pendingInteractions": cards
+        })
+    }
+
+    #[test]
+    fn ack_only_does_not_confirm_control() {
+        // 订阅 ACK 只表示已受理：没有快照/control 前不得宣称空闲，也不得发 stop。
+        let pending = PendingBook::new(SESSION, 1);
+        assert!(!pending.has_confirmed_control());
+
+        // 快照到达但 control 字段缺席 = 仍未宣告。
+        let mut snapshot_without_control = PendingBook::new(SESSION, 1);
+        snapshot_without_control
+            .accept_snapshot(&json!({
+                "sessionId": SESSION,
+                "pendingInteractions": []
+            }))
+            .expect("snapshot shape");
+        assert!(!snapshot_without_control.has_confirmed_control());
+        assert_eq!(snapshot_without_control.control(), None);
+
+        // control 在场但 activeWorks 不是数组 = 未知（fail-closed）。
+        let mut non_array = PendingBook::new(SESSION, 1);
+        non_array
+            .accept_snapshot(&json!({
+                "sessionId": SESSION,
+                "pendingInteractions": [],
+                "control": {"activeWorks": null}
+            }))
+            .expect("snapshot shape");
+        assert!(!non_array.has_confirmed_control());
+        assert_eq!(non_array.control(), None);
+    }
+
+    #[test]
+    fn explicit_empty_control_is_known() {
+        let mut pending_with_active_works_empty = PendingBook::new(SESSION, 1);
+        pending_with_active_works_empty
+            .accept_snapshot(&json!({
+                "sessionId": SESSION,
+                "pendingInteractions": [],
+                "control": {"activeWorks": []}
+            }))
+            .expect("snapshot shape");
+        assert!(pending_with_active_works_empty.has_confirmed_control());
+        assert_eq!(
+            pending_with_active_works_empty
+                .control()
+                .expect("control observed")
+                .active_works
+                .len(),
+            0
+        );
+    }
+
+    #[test]
+    fn control_active_works_keeps_host_execution_ids() {
+        let mut book = PendingBook::new(SESSION_HEX, 2);
+        book.accept_snapshot(&json!({
+            "sessionId": SESSION_HEX,
+            "pendingInteractions": [],
+            "control": {"activeWorks": [
+                {"kind": "primaryTurn", "foregroundExecutionId": "E-existing"},
+                {"kind": "subAgent"}
+            ]}
+        }))
+        .expect("snapshot shape");
+        assert!(book.has_confirmed_control());
+        let control = book.control().expect("control");
+        assert_eq!(control.active_works.len(), 2);
+        assert_eq!(
+            control.active_works[0].foreground_execution_id.as_deref(),
+            Some("E-existing")
+        );
+        assert_eq!(control.active_works[1].foreground_execution_id, None);
+    }
+
+    // -----------------------------------------------------------------------
+    // R0：审批合同（形状取自安装包 3.16.2.8769 的 `pendingInteractions[]` 实证）
+    // -----------------------------------------------------------------------
+
+    /// 官方 permission 卡合成样本（字段名/值域见
+    /// `docs/superpowers/reviews/2026-10-29-zcode-r0-wire-evidence.md` §2）：
+    /// `options[].kind ∈ {allowOnce, allowAlways, deny, custom}`；
+    /// `fullAccessOption` 是**独立字段**（`optionId:"fullAccess"`, `kind:"custom"`），
+    /// 不在 `options[]` 里。
+    fn official_permission_card(interaction_id: &str) -> Value {
+        json!({
+            "interactionId": interaction_id,
+            "kind": "permission",
+            "anchorRowId": 21,
+            "createdAt": 1_700_000_000_000u64,
+            "payload": {
+                "kind": "permission",
+                "toolCallId": "call_synthetic_2001",
+                "toolName": "Bash",
+                "summary": "synthetic: run a shell command",
+                "freeText": true,
+                "detail": {"command": "synthetic-command"},
+                "fullAccessOption": {
+                    "optionId": "fullAccess",
+                    "kind": "custom",
+                    "label": "Full access",
+                    "response": {"decision": "deny"}
+                },
+                "options": [
+                    {
+                        "optionId": "allowOnce",
+                        "label": "Allow once",
+                        "kind": "allowOnce",
+                        "response": {"decision": "allow", "reason": "Approved once"}
+                    },
+                    {
+                        "optionId": "allowSession",
+                        "label": "Always allow in this session",
+                        "kind": "allowAlways",
+                        "response": {"decision": "allow"}
+                    },
+                    {
+                        "optionId": "deny",
+                        "label": "Deny",
+                        "kind": "deny",
+                        "response": {"decision": "deny"}
+                    }
+                ]
+            }
+        })
+    }
+
+    #[test]
+    fn permission_snapshot_is_retained_with_original_options() {
+        let mut book = PendingBook::new(SESSION, 1);
+        book.accept_snapshot(&snapshot(
+            None,
+            json!([official_permission_card("perm-call_synthetic_2001")]),
+        ))
+        .expect("snapshot shape");
+
+        let pending = book.pendings();
+        assert_eq!(pending.len(), 1, "官方形状的审批卡必须保留，不得整卡丢弃");
+        let card = &pending[0];
+        // 身份保留：interactionId 原样（官方 `requestId ?? perm-<toolCallId>` 派生）。
+        assert_eq!(card.interaction_id, "perm-call_synthetic_2001");
+        assert_eq!(card.tool_call_id.as_deref(), Some("call_synthetic_2001"));
+        assert_eq!(card.tool_name.as_deref(), Some("Bash"));
+        assert_eq!(card.kind, PendingKind::Permission);
+        // 选项原值/原序保留（kind 的 allowAlways 不得被改写成别的值）。
+        assert_eq!(
+            card.options
+                .iter()
+                .map(|option| (option.option_id.as_str(), option.kind.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("allowOnce", "allowOnce"),
+                ("allowSession", "allowAlways"),
+                ("deny", "deny"),
+            ]
+        );
+        // `fullAccessOption` 是独立字段：绝不并进 options（否则手机可能渲染成可点）。
+        assert!(
+            !card
+                .options
+                .iter()
+                .any(|option| option.option_id == "fullAccess"),
+            "fullAccess 不得出现在 options[] 里"
+        );
+        assert_eq!(book.invalid_pending_skipped(), 0);
+
+        // 宿主撤卡（整数组替换为空）→ 卡消失，身份不复活。
+        book.accept_delta_patch(&json!({"pendingInteractions": []}))
+            .expect("delta shape");
+        assert!(book.pendings().is_empty());
+    }
+
+    #[test]
+    fn malformed_sibling_option_does_not_drop_the_card() {
+        // 官方 `options` 无 min 长度；单个选项坏形状（缺 label）只跳过该项，
+        // 整卡必须仍可见（阅读面优先），绝不让「一个坏选项」吞掉整张审批卡。
+        let mut card = official_permission_card("perm-call_synthetic_2002");
+        card["payload"]["options"] = json!([
+            {"optionId": "allowOnce", "label": "Allow once", "kind": "allowOnce"},
+            {"optionId": "broken", "kind": "deny"},
+            {"optionId": "deny", "label": "Deny", "kind": "deny"}
+        ]);
+        let mut book = PendingBook::new(SESSION, 1);
+        book.accept_snapshot(&snapshot(None, json!([card])))
+            .expect("snapshot shape");
+        let pending = book.pendings();
+        assert_eq!(pending.len(), 1, "坏选项不得导致整卡被跳过");
+        assert_eq!(
+            pending[0]
+                .options
+                .iter()
+                .map(|option| option.option_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["allowOnce", "deny"]
+        );
+        // 丢项必须可诊断（不是静默 continue）：计数 +1，卡仍在。
+        assert_eq!(book.invalid_option_skipped(), 1);
+        assert_eq!(book.invalid_pending_skipped(), 0, "整卡未被跳过");
+    }
+
+    #[test]
+    fn old_generation_permission_sample_is_dropped() {
+        // 旧代际的样本不得进入新代际的册：异会话快照直接拒收（零应用）。
+        let mut book = PendingBook::new(SESSION, 1);
+        let error = book
+            .accept_snapshot(&json!({
+                "sessionId": SESSION_HEX,
+                "pendingInteractions": [official_permission_card("perm-old-generation")]
+            }))
+            .expect_err("foreign session sample");
+        assert!(error.is(codes::NO_SESSION));
+        assert!(book.pendings().is_empty());
+
+        // 同会话但旧代际目标不得授权（stale_pending，零消费）。
+        book.accept_snapshot(&snapshot(
+            None,
+            json!([official_permission_card("perm-call_synthetic_2003")]),
+        ))
+        .expect("snapshot shape");
+        let stale_target = BoundTarget {
+            session_id: SESSION.to_owned(),
+            workspace_path: "/tmp/synthetic-workspace".to_owned(),
+            workspace_identity: None,
+            workspace_key: "/tmp/synthetic-workspace".to_owned(),
+            generation: 2,
+            bridge_generation: Some(2),
+        };
+        let error = book
+            .authorize(&stale_target, "perm-call_synthetic_2003")
+            .expect_err("old generation target");
+        assert!(error.is(codes::STALE_PENDING));
+    }
+
+    #[test]
+    fn permission_card_fields_are_preserved() {
+        let mut book = PendingBook::new(SESSION, 1);
+        book.accept_snapshot(&snapshot(
+            None,
+            json!([permission_card("pi-synthetic-0001")]),
+        ))
+        .expect("snapshot shape");
+        let pending = book.pendings();
+        assert_eq!(pending.len(), 1);
+        let card = &pending[0];
+        assert_eq!(card.interaction_id, "pi-synthetic-0001");
+        assert_eq!(card.kind, PendingKind::Permission);
+        assert_eq!(card.anchor_row_id, Some(12));
+        assert_eq!(card.created_at, Some(1_700_000_000_000));
+        assert_eq!(card.tool_call_id.as_deref(), Some("call_synthetic_0001"));
+        assert_eq!(card.tool_name.as_deref(), Some("Write"));
+        assert_eq!(
+            card.summary.as_deref(),
+            Some("synthetic: write a scratch file")
+        );
+        assert!(!card.sensitive);
+        assert!(card.questions.is_empty());
+        assert_eq!(
+            card.options
+                .iter()
+                .map(|option| (option.option_id.as_str(), option.kind.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("allowOnce", "allowOnce"), ("denyOnce", "deny")]
+        );
+    }
+
+    #[test]
+    fn user_input_questions_keep_host_values() {
+        let mut book = PendingBook::new(SESSION, 1);
+        book.accept_snapshot(&snapshot(
+            None,
+            json!([user_input_card("pi-synthetic-0002")]),
+        ))
+        .expect("snapshot shape");
+        let card = &book.pendings()[0];
+        assert_eq!(card.kind, PendingKind::UserInput);
+        assert_eq!(card.summary.as_deref(), Some("synthetic: pick answers"));
+        assert!(card.auto_resolution);
+        assert_eq!(
+            card.auto_resolution_state.as_deref(),
+            Some("visibleCountdown")
+        );
+        assert_eq!(card.questions.len(), 2);
+        let first = &card.questions[0];
+        assert_eq!(first.header, "Color");
+        assert_eq!(first.question_text, "Which color?");
+        assert!(!first.multi_select);
+        assert!(first.free_text_allowed);
+        assert_eq!(first.options[0].value, "Red");
+        assert_eq!(first.options[0].label, "Red");
+        assert_eq!(first.options[0].description.as_deref(), Some("warm"));
+        assert_eq!(first.options[0].preview, None);
+        let second = &card.questions[1];
+        assert!(second.multi_select);
+        assert_eq!(second.options[1].preview.as_deref(), Some("medium"));
+        assert!(card.options.is_empty());
+    }
+
+    #[test]
+    fn free_text_requires_host_declaration() {
+        let mut card = user_input_card("pi-synthetic-0003");
+        card["payload"]["freeText"] = json!(false);
+        let mut book = PendingBook::new(SESSION, 1);
+        book.accept_snapshot(&snapshot(None, json!([card])))
+            .expect("snapshot shape");
+        assert!(!book.pendings()[0].questions[0].free_text_allowed);
+    }
+
+    #[test]
+    fn malformed_card_is_skipped() {
+        let mut mismatched = permission_card("pi-synthetic-bad");
+        // payload.kind 与顶层 kind 不一致：整卡跳过，绝不「尽量猜」。
+        mismatched["payload"]["kind"] = json!("userInput");
+        let mut book = PendingBook::new(SESSION, 1);
+        book.accept_snapshot(&snapshot(
+            None,
+            json!([mismatched, permission_card("pi-synthetic-ok")]),
+        ))
+        .expect("snapshot shape");
+        let pending = book.pendings();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].interaction_id, "pi-synthetic-ok");
+        assert_eq!(book.invalid_pending_skipped(), 1);
+    }
+
+    #[test]
+    fn sensitive_card_is_flagged() {
+        let mut card = permission_card("pi-synthetic-sensitive");
+        card["payload"]["sensitive"] = json!(true);
+        let mut book = PendingBook::new(SESSION, 1);
+        book.accept_snapshot(&snapshot(None, json!([card])))
+            .expect("snapshot shape");
+        assert!(book.pendings()[0].sensitive);
+    }
+
+    #[test]
+    fn pending_accessor_is_read_only() {
+        let mut book = book_with(permission_card("pi-synthetic-view"));
+        {
+            let card = book
+                .pending("pi-synthetic-view")
+                .expect("host card is in the book");
+            assert_eq!(card.interaction_id, "pi-synthetic-view");
+            assert_eq!(card.kind, PendingKind::Permission);
+        }
+        assert!(book.pending("pi-synthetic-missing").is_none());
+        // 读取不置本地在途：同一张卡随后仍可授权。
+        let target = answer_target(SESSION, 1);
+        let authorized = book
+            .authorize(&target, "pi-synthetic-view")
+            .expect("read-only accessor must not set in-flight");
+        assert_eq!(authorized.interaction_id, "pi-synthetic-view");
+    }
+
+    #[test]
+    fn delta_replaces_set_and_control() {
+        let mut book = PendingBook::new(SESSION, 1);
+        book.accept_snapshot(&snapshot(
+            Some(json!({"activeWorks": [{"kind": "primaryTurn", "foregroundExecutionId": "E-1"}]})),
+            json!([permission_card("pi-synthetic-0004")]),
+        ))
+        .expect("snapshot shape");
+        assert_eq!(book.pendings().len(), 1);
+        assert!(book.has_confirmed_control());
+        let revision = book.host_pending_revision();
+        book.accept_delta_patch(&json!({
+            "pendingInteractions": [],
+            "control": {"activeWorks": []}
+        }))
+        .expect("delta shape");
+        assert!(book.pendings().is_empty());
+        assert!(book.has_confirmed_control());
+        assert_eq!(
+            book.control().expect("control").active_works.len(),
+            0,
+            "key-level replacement, not a merge"
+        );
+        assert!(book.host_pending_revision() > revision);
+    }
+
+    #[test]
+    fn malformed_pending_list_fails_closed() {
+        let mut book = PendingBook::new(SESSION, 1);
+        let error = book
+            .accept_snapshot(&json!({
+                "sessionId": SESSION,
+                "pendingInteractions": "not-an-array"
+            }))
+            .expect_err("snapshot without pendingInteractions array is a schema fault");
+        assert!(error.is(codes::UNSUPPORTED_PROTOCOL));
+    }
+
+    // -----------------------------------------------------------------------
+    // T4.1 Slice A：原值映射与本地在途授权（合成夹具，不读真实账号/DB）
+    // -----------------------------------------------------------------------
+
+    const SIBLING: &str = "sess_0f9a1c0d-0000-4000-8000-000000000002";
+
+    fn answer_target(session: &str, generation: u64) -> BoundTarget {
+        BoundTarget {
+            session_id: session.to_owned(),
+            workspace_path: "/tmp/synthetic-workspace".to_owned(),
+            workspace_identity: None,
+            workspace_key: "/tmp/synthetic-workspace".to_owned(),
+            generation,
+            bridge_generation: None,
+        }
+    }
+
+    fn book_with(card: Value) -> PendingBook {
+        let mut book = PendingBook::new(SESSION, 1);
+        book.accept_snapshot(&snapshot(None, json!([card])))
+            .expect("snapshot shape");
+        book
+    }
+
+    fn entry(question_text: &str, selected: &[&str], free_text: Option<&str>) -> AnswerEntry {
+        AnswerEntry {
+            question_text: question_text.to_owned(),
+            selected_values: selected.iter().map(|value| (*value).to_owned()).collect(),
+            free_text: free_text.map(str::to_owned),
+        }
+    }
+
+    /// 单选 AskUserQuestion：value 与 label 不同，答案必须回传 value。
+    fn single_question_card() -> Value {
+        json!({
+            "interactionId": "pi-synthetic-2001",
+            "kind": "userInput",
+            "anchorRowId": 21,
+            "payload": {
+                "kind": "userInput",
+                "prompt": "synthetic: answer",
+                "freeText": true,
+                "toolCallId": "call_synthetic_2001",
+                "toolName": "AskUserQuestion",
+                "schema": {"interaction": "AskUserQuestion"},
+                "questions": [{
+                    "question": "原题？",
+                    "header": "题",
+                    "options": [
+                        {"value": "原值 A", "label": "显示 A"},
+                        {"value": "原值 B", "label": "显示 B"}
+                    ]
+                }]
+            }
+        })
+    }
+
+    fn multi_question_card() -> Value {
+        json!({
+            "interactionId": "pi-synthetic-2002",
+            "kind": "userInput",
+            "anchorRowId": 22,
+            "payload": {
+                "kind": "userInput",
+                "prompt": "synthetic: multi",
+                "freeText": false,
+                "toolCallId": "call_synthetic_2002",
+                "toolName": "AskUserQuestion",
+                "questions": [{
+                    "question": "多选题？",
+                    "header": "多选",
+                    "multiSelect": true,
+                    "options": [
+                        {"value": "A", "label": "选项甲"},
+                        {"value": "B", "label": "选项乙"},
+                        {"value": "C", "label": "选项丙"}
+                    ]
+                }]
+            }
+        })
+    }
+
+    fn free_text_card(free_text_allowed: bool) -> Value {
+        json!({
+            "interactionId": "pi-synthetic-2003",
+            "kind": "userInput",
+            "anchorRowId": 23,
+            "payload": {
+                "kind": "userInput",
+                "prompt": "synthetic: free text",
+                "freeText": free_text_allowed,
+                "toolCallId": "call_synthetic_2003",
+                "toolName": "AskUserQuestion",
+                "questions": [{
+                    "question": "原题？",
+                    "header": "题",
+                    "options": [{"value": "原值 A", "label": "显示 A"}]
+                }]
+            }
+        })
+    }
+
+    fn duplicate_question_card() -> Value {
+        json!({
+            "interactionId": "pi-synthetic-2004",
+            "kind": "userInput",
+            "anchorRowId": 24,
+            "payload": {
+                "kind": "userInput",
+                "prompt": "synthetic: duplicate",
+                "freeText": false,
+                "toolName": "AskUserQuestion",
+                "questions": [
+                    {"question": "同名？", "header": "一", "options": [{"value": "A", "label": "A"}]},
+                    {"question": "同名？", "header": "二", "options": [{"value": "B", "label": "B"}]}
+                ]
+            }
+        })
+    }
+
+    fn plan_approval_card() -> Value {
+        json!({
+            "interactionId": "pi-synthetic-2005",
+            "kind": "userInput",
+            "anchorRowId": 25,
+            "payload": {
+                "kind": "userInput",
+                "prompt": "synthetic: plan",
+                "freeText": true,
+                "toolName": "ExitPlanMode",
+                "schema": {"interaction": "plan_approval"},
+                "input": {"plan": "Synthetic plan body"},
+                "questions": [{
+                    "question": "Approve this plan?",
+                    "header": "Plan",
+                    "options": [{"value": "approve", "label": "Approve"}]
+                }]
+            }
+        })
+    }
+
+    fn elicitation_card() -> Value {
+        json!({
+            "interactionId": "pi-synthetic-2006",
+            "kind": "userInput",
+            "anchorRowId": 26,
+            "payload": {
+                "kind": "userInput",
+                "prompt": "synthetic: elicitation",
+                "freeText": false,
+                "toolName": "mcp__synthetic__ask",
+                "schema": {"interaction": "mcp_elicitation"},
+                "questions": [{
+                    "question": "MCP 表单？",
+                    "header": "MCP",
+                    "options": [{"value": "yes", "label": "Yes"}]
+                }]
+            }
+        })
+    }
+
+    #[test]
+    fn single_select_keeps_exact_question_and_value() {
+        let book = book_with(single_question_card());
+        let cards = book.pendings();
+        let answer = build_user_answer(&cards[0], &[entry("原题？", &["原值 A"], None)])
+            .expect("single select maps to host value");
+
+        assert_eq!(answer["action"], json!("accept"));
+        assert_eq!(answer["content"]["answers"]["原题？"], json!("原值 A"));
+        assert_eq!(answer["content"]["answer_0"], json!("原值 A"));
+        assert_eq!(answer["content"]["answer"], json!("原值 A"));
+    }
+
+    #[test]
+    fn multi_select_uses_host_values_not_labels() {
+        let book = book_with(multi_question_card());
+        let cards = book.pendings();
+        let answer = build_user_answer(&cards[0], &[entry("多选题？", &["A", "B"], None)])
+            .expect("multi select maps to host value array");
+
+        assert_eq!(answer["content"]["answer_0"], json!(["A", "B"]));
+        assert_eq!(answer["content"]["answers"]["多选题？"], json!("A, B"));
+        assert_eq!(answer["content"]["answer"], json!(["A", "B"]));
+        assert!(!answer["content"].to_string().contains("选项甲"));
+    }
+
+    #[test]
+    fn free_text_matches_broker_contract() {
+        let book = book_with(free_text_card(true));
+        let cards = book.pendings();
+        let answer = build_user_answer(&cards[0], &[entry("原题？", &[], Some("用户文本"))])
+            .expect("free text maps to the original question key");
+
+        assert_eq!(answer["content"]["answers"]["原题？"], json!("用户文本"));
+        // 探针只在有选中 value 时补 answer_i/answer；自由文本只走 answers 原题键。
+        assert!(answer["content"].get("answer_0").is_none());
+        assert!(answer["content"].get("answer").is_none());
+    }
+
+    #[test]
+    fn plan_approval_is_not_a_question_auto_approval() {
+        // 计划审批也是 kind=userInput，但 schema.interaction=plan_approval：
+        // 即便选项叫 approve，也绝不构造问答应答（零 value）。
+        let book = book_with(plan_approval_card());
+        let cards = book.pendings();
+        assert_eq!(
+            cards[0].schema_interaction.as_deref(),
+            Some("plan_approval")
+        );
+
+        let error = build_user_answer(
+            &cards[0],
+            &[entry("Approve this plan?", &["approve"], None)],
+        )
+        .expect_err("plan approval must never be answered as a question");
+        assert!(error.is(codes::NEEDS_EVIDENCE));
+    }
+
+    #[test]
+    fn unknown_option_value_is_rejected() {
+        let book = book_with(single_question_card());
+        let cards = book.pendings();
+        let error = build_user_answer(&cards[0], &[entry("原题？", &["原值 Z"], None)])
+            .expect_err("value outside the host option set");
+        assert!(error.is(codes::INVALID_ANSWER));
+    }
+
+    #[test]
+    fn duplicate_question_text_is_ambiguous() {
+        let book = book_with(duplicate_question_card());
+        let cards = book.pendings();
+        let error = build_user_answer(
+            &cards[0],
+            &[entry("同名？", &["A"], None), entry("同名？", &["B"], None)],
+        )
+        .expect_err("duplicate question text cannot key answers unambiguously");
+        assert!(error.is(codes::INVALID_ANSWER));
+    }
+
+    #[test]
+    fn empty_answers_are_rejected() {
+        let book = book_with(single_question_card());
+        let cards = book.pendings();
+
+        let error = build_user_answer(&cards[0], &[]).expect_err("empty answer list");
+        assert!(error.is(codes::INVALID_ANSWER));
+        // 空选择绝不解释为「用户同意继续」。
+        let error = build_user_answer(&cards[0], &[entry("原题？", &[], None)])
+            .expect_err("empty selection is not consent");
+        assert!(error.is(codes::INVALID_ANSWER));
+    }
+
+    #[test]
+    fn free_text_not_allowed_is_rejected() {
+        let book = book_with(free_text_card(false));
+        let cards = book.pendings();
+        let error = build_user_answer(&cards[0], &[entry("原题？", &[], Some("补充"))])
+            .expect_err("host did not allow free text");
+        assert!(error.is(codes::INVALID_ANSWER));
+
+        // 探针不同时混用自由文本与选中 value。
+        let book = book_with(free_text_card(true));
+        let cards = book.pendings();
+        let error = build_user_answer(&cards[0], &[entry("原题？", &["原值 A"], Some("补充"))])
+            .expect_err("mixing free text and selected values");
+        assert!(error.is(codes::INVALID_ANSWER));
+    }
+
+    #[test]
+    fn unsupported_schema_is_needs_evidence() {
+        // MCP elicitation 不是 AskUserQuestion：只读、零应答。
+        let book = book_with(elicitation_card());
+        let cards = book.pendings();
+        let error = build_user_answer(&cards[0], &[entry("MCP 表单？", &["yes"], None)])
+            .expect_err("MCP elicitation is not answerable");
+        assert!(error.is(codes::NEEDS_EVIDENCE));
+
+        // 非 AskUserQuestion 工具名同样不可答（没有 schema 也不放宽）。
+        let mut unknown_tool = single_question_card();
+        unknown_tool["payload"]["toolName"] = json!("ExitPlanMode");
+        unknown_tool["payload"]
+            .as_object_mut()
+            .expect("payload")
+            .remove("schema");
+        let book = book_with(unknown_tool);
+        let cards = book.pendings();
+        let error = build_user_answer(&cards[0], &[entry("原题？", &["原值 A"], None)])
+            .expect_err("only AskUserQuestion may be answered");
+        assert!(error.is(codes::NEEDS_EVIDENCE));
+    }
+
+    #[test]
+    fn authorize_rejects_stale_session_anchor_generation() {
+        let mut book = book_with(permission_card("pi-synthetic-3001"));
+        let revision = book.host_pending_revision();
+
+        for (target, interaction_id) in [
+            (answer_target(SIBLING, 1), "pi-synthetic-3001"),
+            (answer_target(SESSION, 2), "pi-synthetic-3001"),
+            (answer_target(SESSION, 1), "pi-synthetic-9999"),
+        ] {
+            let error = book
+                .authorize(&target, interaction_id)
+                .expect_err("stale session/generation/anchor must be rejected");
+            assert!(error.is(codes::STALE_PENDING));
+        }
+
+        // 零副作用：卡与宿主观察都未被消费/推进。
+        assert_eq!(book.host_pending_revision(), revision);
+        assert_eq!(book.pendings().len(), 1);
+        assert!(book.host_has_pending("pi-synthetic-3001"));
+        let card = book
+            .authorize(&answer_target(SESSION, 1), "pi-synthetic-3001")
+            .expect("exact target is not poisoned by the rejected attempts");
+        assert_eq!(card.interaction_id, "pi-synthetic-3001");
+    }
+
+    #[test]
+    fn authorize_blocks_duplicate_local_submit_without_host_clear() {
+        let mut book = book_with(permission_card("pi-synthetic-3002"));
+        let first = book
+            .authorize(&answer_target(SESSION, 1), "pi-synthetic-3002")
+            .expect("first authorization");
+        assert_eq!(first.interaction_id, "pi-synthetic-3002");
+        let revision = book.host_pending_revision();
+
+        let duplicate = book
+            .authorize(&answer_target(SESSION, 1), "pi-synthetic-3002")
+            .expect_err("duplicate submit while locally in flight");
+        assert!(duplicate.is(codes::STALE_PENDING));
+        assert_eq!(book.host_pending_revision(), revision);
+        assert!(book.host_has_pending("pi-synthetic-3002"));
+
+        // 只有确证零写才允许清 in-flight 重试（Slice B 的 send_failed 路径）。
+        book.clear_local_inflight("pi-synthetic-3002");
+        assert!(book
+            .authorize(&answer_target(SESSION, 1), "pi-synthetic-3002")
+            .is_ok());
+
+        // 宿主撤卡后（哪怕本地在途）不复活、不再授权。
+        book.accept_delta_patch(&json!({"pendingInteractions": []}))
+            .expect("delta shape");
+        assert!(!book.host_has_pending("pi-synthetic-3002"));
+        assert!(book
+            .authorize(&answer_target(SESSION, 1), "pi-synthetic-3002")
+            .expect_err("host cleared card is not resurrected")
+            .is(codes::STALE_PENDING));
+    }
+
+    #[test]
+    fn local_consume_is_not_host_cleared() {
+        let id = "pi-synthetic-3003";
+        let mut book = book_with(permission_card(id));
+        let revision = book.host_pending_revision();
+
+        book.mark_resolved_local(id);
+
+        // 本地消费 ≠ 宿主撤卡：宿主集合仍在，观察代数不前进。
+        assert!(book.host_has_pending(id));
+        assert_eq!(book.host_pending_revision(), revision);
+        assert!(book.pendings().iter().all(|card| card.interaction_id != id));
+        assert!(book
+            .authorize(&answer_target(SESSION, 1), id)
+            .expect_err("consumed local card cannot be submitted again")
+            .is(codes::STALE_PENDING));
+
+        // 只有宿主自己的下一次整体替换才能宣告撤卡。
+        book.accept_delta_patch(&json!({"pendingInteractions": []}))
+            .expect("delta shape");
+        assert!(!book.host_has_pending(id));
+        assert!(book.host_pending_revision() > revision);
+    }
+
+    #[test]
+    fn host_removal_clears_inflight() {
+        let id = "pi-synthetic-3004";
+        let mut book = book_with(permission_card(id));
+        let target = answer_target(SESSION, 1);
+        book.authorize(&target, id).expect("first authorization");
+
+        // 写后 unknown：宿主下一帧仍列该卡 → 在途闸保留（不自动放开重复提交）。
+        book.accept_delta_patch(&json!({"pendingInteractions": [permission_card(id)]}))
+            .expect("delta shape");
+        assert!(book
+            .authorize(&target, id)
+            .expect_err("host still lists the card: in-flight gate must hold")
+            .is(codes::STALE_PENDING));
+
+        // 宿主帧撤卡（本帧缺席）→ 释放该 id 的在途闸；本地展示同步撤下。
+        book.accept_delta_patch(&json!({"pendingInteractions": []}))
+            .expect("delta shape");
+        assert!(!book.host_has_pending(id));
+        assert!(book
+            .authorize(&target, id)
+            .expect_err("removed card is not displayed/authorizable")
+            .is(codes::STALE_PENDING));
+
+        // 宿主后续帧重新列出同一 id（迟到观测/宿主未消费）：无需人工清闸即可重试。
+        book.accept_delta_patch(&json!({"pendingInteractions": [permission_card(id)]}))
+            .expect("delta shape");
+        assert!(book.authorize(&target, id).is_ok());
+    }
+
+    #[test]
+    fn sensitive_question_mapping_stores_no_body() {
+        let mut card = free_text_card(true);
+        card["payload"]["sensitive"] = json!(true);
+        let book = book_with(card);
+        let cards = book.pendings();
+        let pending = &cards[0];
+        assert!(pending.sensitive);
+        let before = pending.clone();
+
+        let answer = build_user_answer(pending, &[entry("原题？", &[], Some("机密文本"))])
+            .expect("sensitive free text still maps for the wire");
+
+        // 线上值必须携带正文；本地卡与册子里绝不留下草稿/历史。
+        assert_eq!(answer["content"]["answers"]["原题？"], json!("机密文本"));
+        assert_eq!(
+            pending, &before,
+            "mapping must not write back into the card"
+        );
+        assert!(!format!("{book:?}").contains("机密文本"));
+        assert!(!serde_json::to_string(pending)
+            .expect("serialize pending")
+            .contains("机密文本"));
+    }
+
+    // -----------------------------------------------------------------------
+    // T5：审批既有卡的应答映射（合成夹具，不读真实账号/DB）
+    // -----------------------------------------------------------------------
+
+    fn permission_view(interaction_id: &str, options: &[(&str, &str, &str)]) -> PendingView {
+        PendingView {
+            interaction_id: interaction_id.to_owned(),
+            kind: PendingKind::Permission,
+            anchor_row_id: Some(31),
+            tool_call_id: Some("call_synthetic_3101".to_owned()),
+            created_at: Some(1_700_000_000_100),
+            summary: Some("synthetic: write a scratch file".to_owned()),
+            tool_name: Some("Write".to_owned()),
+            schema_interaction: None,
+            sensitive: false,
+            auto_resolution: false,
+            auto_resolution_state: None,
+            questions: Vec::new(),
+            options: options
+                .iter()
+                .map(|(option_id, label, kind)| PermissionOptionView {
+                    option_id: (*option_id).to_owned(),
+                    label: (*label).to_owned(),
+                    kind: (*kind).to_owned(),
+                })
+                .collect(),
+            detail: None,
+            answerable: false,
+            plan_approval: false,
+            detail_truncated: false,
+        }
+    }
+
+    #[test]
+    fn permission_answer_preserves_custom_option_ids() {
+        // optionId 是宿主原值：kind 只是白名单依据，绝不把 "allowOnce"/"deny"
+        // 当成真正的 optionId 下发。
+        let card = permission_view(
+            "pi-synthetic-3101",
+            &[
+                ("once-id-9", "Allow once", "allowOnce"),
+                ("deny-id-7", "Deny", "deny"),
+            ],
+        );
+
+        let allow = build_permission_answer(&card, "once-id-9").expect("allowOnce option");
+        assert_eq!(allow["optionId"], json!("once-id-9"));
+        assert_eq!(
+            allow.as_object().expect("answer object").len(),
+            1,
+            "ControlAction::Permission 不带自由文本：不得虚构 freeText"
+        );
+        assert_eq!(allow, json!({ "optionId": "once-id-9" }));
+
+        let deny = build_permission_answer(&card, "deny-id-7").expect("deny option");
+        assert_eq!(deny["optionId"], json!("deny-id-7"));
+    }
+
+    #[test]
+    fn permission_answer_rejects_full_access_regardless_of_kind() {
+        // fullAccess 特权项即使被宿主标成 allowOnce（或卡内根本没有该项）也硬闸。
+        let card = permission_view(
+            "pi-synthetic-3102",
+            &[
+                ("fullAccess", "Full access", "allowOnce"),
+                ("once-id-9", "Allow once", "allowOnce"),
+            ],
+        );
+        let error = build_permission_answer(&card, "fullAccess")
+            .expect_err("fullAccess is never answerable");
+        assert!(error.is(codes::FORBIDDEN_OPTION));
+    }
+
+    #[test]
+    fn permission_answer_rejects_standing_and_unknown_kinds() {
+        for (option_id, kind) in [
+            ("always-id", "allowAlways"),
+            ("session-id", "allow_session"),
+            ("project-id", "allow_project"),
+            ("custom-id", "custom"),
+            ("mystery-id", "whatever"),
+        ] {
+            let card = permission_view("pi-synthetic-3103", &[(option_id, "Standing", kind)]);
+            let error = build_permission_answer(&card, option_id)
+                .expect_err("standing/unknown permission kinds are never sent");
+            assert!(
+                error.is(codes::FORBIDDEN_OPTION),
+                "kind {kind} must be forbidden"
+            );
+        }
+    }
+
+    #[test]
+    fn permission_answer_rejects_foreign_or_ambiguous_options() {
+        let card = permission_view(
+            "pi-synthetic-3104",
+            &[("once-id-9", "Allow once", "allowOnce")],
+        );
+        // 不在本卡上的 optionId（含字面 kind 名）一律零 value。
+        for foreign in ["once-id-other", "allowOnce", "deny", ""] {
+            let error = build_permission_answer(&card, foreign)
+                .expect_err("foreign option id is never answerable");
+            assert!(
+                error.is(codes::FORBIDDEN_OPTION) || error.is(codes::INVALID_ANSWER),
+                "foreign {foreign:?} must be rejected"
+            );
+        }
+
+        // 同一 optionId 重复 = 歧义卡：整卡拒绝，绝不猜第一条。
+        let ambiguous = permission_view(
+            "pi-synthetic-3105",
+            &[
+                ("once-id-9", "Allow once", "allowOnce"),
+                ("once-id-9", "Allow once (dup)", "allowOnce"),
+            ],
+        );
+        let error = build_permission_answer(&ambiguous, "once-id-9")
+            .expect_err("duplicate option ids are ambiguous");
+        assert!(error.is(codes::FORBIDDEN_OPTION));
+    }
+
+    #[test]
+    fn permission_answer_rejects_non_permission_card() {
+        let book = book_with(single_question_card());
+        let cards = book.pendings();
+        let error = build_permission_answer(&cards[0], "once-id-9")
+            .expect_err("userInput cards are not permission cards");
+        assert!(error.is(codes::INVALID_ANSWER));
+
+        // workspaceHookReview 同理：审批只认 kind=permission。
+        let mut hook = permission_view("pi-synthetic-3106", &[("once-id-9", "Allow", "allowOnce")]);
+        hook.kind = PendingKind::WorkspaceHookReview;
+        let error = build_permission_answer(&hook, "once-id-9")
+            .expect_err("hook review is read-only for approval");
+        assert!(error.is(codes::INVALID_ANSWER));
+    }
+    // -----------------------------------------------------------------------
+    // R3 / R0 复审 I4：审批卡正文（payload.detail）进入手机视图
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn permission_detail_is_projected_without_touching_answers() {
+        // 官方 `detail` = 工具输入对象（Bash 即 {command,...}）：手机端要能只读展示，
+        // 但绝不进入应答载荷、也绝不被 Debug/序列化日志带出去。
+        let card = json!({
+            "interactionId": "pi-synthetic-detail",
+            "kind": "permission",
+            "anchorRowId": 21,
+            "createdAt": 1_700_000_000_600u64,
+            "payload": {
+                "kind": "permission",
+                "toolCallId": "call_synthetic_detail",
+                "toolName": "Bash",
+                "summary": "synthetic: run a command",
+                "detail": {"command": "rm -rf /tmp/tuvis-scratch", "description": "清理"},
+                "freeText": true,
+                "options": [
+                    {"optionId": "allowOnce", "label": "Allow once", "kind": "allowOnce"},
+                    {"optionId": "denyOnce", "label": "Deny", "kind": "deny"}
+                ]
+            }
+        });
+        let book = book_with(card.clone());
+        let cards = book.pendings();
+        assert_eq!(
+            cards[0].detail.as_deref(),
+            Some(r#"{"command":"rm -rf /tmp/tuvis-scratch","description":"清理"}"#),
+            "对象 detail 取紧凑 JSON"
+        );
+
+        // 应答载荷只有 optionId：正文一个字都不上行。
+        let answer = build_permission_answer(&cards[0], "allowOnce").expect("allow once");
+        assert_eq!(answer, json!({"optionId": "allowOnce"}));
+        assert!(!answer.to_string().contains("rm -rf"));
+
+        // 字符串 detail 原样投影；缺失 → None（不渲染空详情入口）。
+        let mut string_card = card.clone();
+        string_card["payload"]["detail"] = json!("npm test --silent");
+        let book = book_with(string_card);
+        assert_eq!(
+            book.pendings()[0].detail.as_deref(),
+            Some("npm test --silent")
+        );
+        let mut absent = card;
+        absent["payload"]
+            .as_object_mut()
+            .expect("payload")
+            .remove("detail");
+        let book = book_with(absent);
+        assert_eq!(book.pendings()[0].detail, None);
+    }
+
+    // -----------------------------------------------------------------------
+    // W5 / F4：不可答的 userInput 子型在**投影期**就标记只读
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn unsupported_pending_subtype_is_readonly() {
+        // 同一帧里放四种卡：支持子型、计划审批、MCP elicitation、权限审批。
+        // 「可答」必须由与 build_user_answer 共用的纯判定给出，前端不再猜。
+        let mut book = PendingBook::new(SESSION, 1);
+        book.accept_snapshot(&snapshot(
+            None,
+            json!([
+                single_question_card(),
+                plan_approval_card(),
+                elicitation_card(),
+                official_permission_card("perm-call_synthetic_9001"),
+            ]),
+        ))
+        .expect("snapshot shape");
+        let cards = book.pendings();
+        let by_id = |id: &str| {
+            cards
+                .iter()
+                .find(|card| card.interaction_id == id)
+                .expect("card present")
+        };
+
+        let supported = by_id("pi-synthetic-2001");
+        assert!(supported.answerable, "支持子型仍可答（回归）");
+        assert_eq!(
+            build_user_answer(supported, &[entry("原题？", &["原值 A"], None)])
+                .expect("supported subtype still maps"),
+            json!({
+                "action": "accept",
+                "content": {
+                    "answers": {"原题？": "原值 A"},
+                    "answer_0": "原值 A",
+                    "answer": "原值 A"
+                }
+            })
+        );
+
+        for (id, hint) in [
+            ("pi-synthetic-2005", "plan_approval"),
+            ("pi-synthetic-2006", "mcp_elicitation"),
+        ] {
+            let card = by_id(id);
+            assert!(!card.answerable, "{hint} 不得声称可答");
+            // 投影与应答闸同源：只读卡没有「选完才被拒」的窗口。
+            let error = build_user_answer(card, &[entry("Approve this plan?", &["approve"], None)])
+                .expect_err("unsupported subtype stays zero-value");
+            assert!(error.is(codes::NEEDS_EVIDENCE));
+        }
+
+        // 非 userInput 卡（审批）不看本字段：它的可答性由 approvalReply 与选项白名单决定。
+        let permission = by_id("perm-call_synthetic_9001");
+        assert!(!permission.answerable);
+        assert!(build_permission_answer(permission, "allowOnce").is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // C1：计划批准只读标识（plan_approval）——只有确认形状才置位
+    // -----------------------------------------------------------------------
+
+    /// 投影后的 wire 形状（断言 `planApproval` 的 camelCase 与缺省语义）。
+    fn wire(card: &PendingView) -> Value {
+        serde_json::to_value(card).expect("pending 视图应可序列化")
+    }
+
+    #[test]
+    fn plan_approval_projection_sets_flag_and_stays_unanswerable() {
+        // C1 目标：ExitPlanMode/plan_approval 在投影期带上只读标识，供手机端换专用
+        // 文案（不是放开可答性）。本断言在实现前失败（字段尚不存在）。
+        let book = book_with(plan_approval_card());
+        let card = &book.pendings()[0];
+        assert_eq!(
+            wire(card)["planApproval"],
+            json!(true),
+            "ExitPlanMode/plan_approval 必须置只读标识"
+        );
+        assert_eq!(
+            wire(card)["answerable"],
+            json!(false),
+            "C1 只加解释，不放开计划批准的可答性"
+        );
+        // 零应答：标识存在与否都不改变冻结闸。
+        assert!(
+            build_user_answer(card, &[entry("Approve this plan?", &["approve"], None)])
+                .expect_err("plan_approval 永远不进普通 Answer 路径")
+                .is(codes::NEEDS_EVIDENCE)
+        );
+    }
+
+    #[test]
+    fn ask_user_question_projection_is_not_plan_approval() {
+        let book = book_with(single_question_card());
+        let card = &book.pendings()[0];
+        assert!(card.answerable, "普通 AskUserQuestion 可答性回归");
+        assert_eq!(
+            wire(card)["planApproval"],
+            json!(false),
+            "普通问答不得被打上计划批准标识"
+        );
+    }
+
+    #[test]
+    fn plan_approval_answer_uses_exact_host_approve_option() {
+        // C2：官方计划卡的唯一选项原值是 approve；批准必须原样回传该值，
+        // 不能把 label 当 value，也不能复用普通问答 content 形状。
+        let book = book_with(plan_approval_card());
+        let answer =
+            build_plan_approval_answer(&book.pendings()[0], PlanApprovalDecision::Approve, None)
+                .expect("approve 形状");
+        assert_eq!(
+            answer,
+            json!({
+                "action": "accept",
+                "content": {
+                    "answers": {"Approve this plan?": "approve"},
+                    "answer_0": "approve",
+                    "answer": "approve"
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn plan_approval_feedback_uses_same_question_content_without_option_id() {
+        let book = book_with(plan_approval_card());
+        let answer = build_plan_approval_answer(
+            &book.pendings()[0],
+            PlanApprovalDecision::Feedback,
+            Some("把 hello.py 放到 scripts/ 并加日期"),
+        )
+        .expect("反馈形状");
+        assert_eq!(
+            answer,
+            json!({
+                "action": "accept",
+                "content": {
+                    "answers": {"Approve this plan?": "把 hello.py 放到 scripts/ 并加日期"},
+                    "answer_0": "把 hello.py 放到 scripts/ 并加日期",
+                    "answer": "把 hello.py 放到 scripts/ 并加日期"
+                }
+            })
+        );
+        assert!(build_plan_approval_answer(
+            &book.pendings()[0],
+            PlanApprovalDecision::Feedback,
+            Some("  "),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn plan_approval_answer_rejects_ambiguous_or_non_approve_shapes() {
+        let mut multiple = plan_approval_card();
+        multiple["payload"]["questions"][0]["options"] = json!([
+            {"value": "approve", "label": "Approve"},
+            {"value": "deny", "label": "Deny"}
+        ]);
+        let mut wrong_value = plan_approval_card();
+        wrong_value["payload"]["questions"][0]["options"][0]["value"] = json!("yes");
+        let mut two_questions = plan_approval_card();
+        two_questions["payload"]["questions"] = json!([
+            {"question": "Approve?", "header": "Plan", "options": [{"value": "approve", "label": "Approve"}]},
+            {"question": "Again?", "header": "Plan", "options": [{"value": "approve", "label": "Approve"}]}
+        ]);
+        for (hint, card) in [
+            ("多选项", multiple),
+            ("非 approve 原值", wrong_value),
+            ("多问题", two_questions),
+        ] {
+            let book = book_with(card);
+            let error = build_plan_approval_answer(
+                &book.pendings()[0],
+                PlanApprovalDecision::Approve,
+                None,
+            )
+            .expect_err("歧义计划卡必须拒绝");
+            assert!(
+                error.is(codes::INVALID_ANSWER) || error.is(codes::FORBIDDEN_OPTION),
+                "{hint} 必须落到明确错误码"
+            );
+        }
+    }
+
+    #[test]
+    fn other_user_input_plan_shapes_are_not_misflagged() {
+        // 判据必须三条同时成立（kind=userInput ∧ toolName=ExitPlanMode ∧
+        // schema.interaction=plan_approval）；相似形状一律不误标。
+        let mut no_schema = plan_approval_card();
+        no_schema["payload"]
+            .as_object_mut()
+            .expect("payload")
+            .remove("schema");
+        let mut wrong_tool = plan_approval_card();
+        wrong_tool["payload"]["toolName"] = json!("AskUserQuestion");
+        let mut permission_shape = plan_approval_card();
+        permission_shape["kind"] = json!("permission");
+        permission_shape["payload"]["kind"] = json!("permission");
+
+        for (hint, card) in [
+            ("ExitPlanMode 但缺 schema", no_schema),
+            ("plan_approval 但工具名不符", wrong_tool),
+            ("mcp_elicitation", elicitation_card()),
+            ("kind=permission 同形字段", permission_shape),
+        ] {
+            let book = book_with(card);
+            let parsed = &book.pendings()[0];
+            assert_eq!(
+                wire(parsed)["planApproval"],
+                json!(false),
+                "{hint} 不得误标为计划批准"
+            );
+            assert!(!parsed.answerable, "{hint} 仍不可代答");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // W5 / F5：截断真值随投影给出（前端不得按字符串长度猜）
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn pending_detail_truncation_is_projected_from_the_same_cap() {
+        let long_command = "x".repeat(MAX_PENDING_DETAIL_CHARS + 512);
+        let mut card = official_permission_card("perm-call_synthetic_9002");
+        card["payload"]["detail"] = json!(long_command);
+        let book = book_with(card);
+        let projected = &book.pendings()[0];
+        assert!(projected.detail_truncated, "超长正文必须标记截断");
+        let detail = projected.detail.as_deref().expect("detail projected");
+        assert_eq!(detail.chars().count(), MAX_PENDING_DETAIL_CHARS + 1);
+        assert!(detail.ends_with('…'), "截断仍带显式省略标记");
+
+        // 未截断：同一上限内不标记，且文本一字不改。
+        let exact = "y".repeat(MAX_PENDING_DETAIL_CHARS);
+        let mut short = official_permission_card("perm-call_synthetic_9003");
+        short["payload"]["detail"] = json!(exact);
+        let book = book_with(short);
+        assert!(!book.pendings()[0].detail_truncated);
+        assert_eq!(book.pendings()[0].detail.as_deref(), Some(exact.as_str()));
+
+        // 无正文：不标记，也不产生空详情入口。
+        let absent = permission_card("pi-synthetic-9004");
+        let book = book_with(absent);
+        assert!(!book.pendings()[0].detail_truncated);
+        assert_eq!(book.pendings()[0].detail, None);
+    }
+}

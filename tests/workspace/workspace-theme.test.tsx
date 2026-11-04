@@ -117,6 +117,7 @@ vi.mock("@/components/pet/PetStartupGuard", () => ({ PetStartupGuard: () => null
 import i18n from "@/i18n";
 import HomePage from "@/pages/home";
 import { useWorkspaceStore } from "@/stores/workspaceStore";
+import { useSessionStore } from "@/stores/sessionStore";
 import { useTheme } from "@/components/common/theme-provider";
 import WorkspacePageHeader from "@/components/common/WorkspacePageHeader";
 import { resetWorkspaceNavMock } from "../msw/tauriMocks";
@@ -269,6 +270,9 @@ describe("workspace-theme（Task 8：已定主题与轻玻璃契约）", () => {
     expect(screen.getByRole("heading", { level: 1, name: "页面标题" })).toBeInTheDocument();
     expect(screen.getByText("次级说明")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "动作" })).toBeInTheDocument();
+    // 角标溢出空间：动作槽内边距保证右上角泡泡完整显示，不被页顶 overflow 裁切。
+    const header = screen.getByRole("heading", { level: 1 }).closest("header")!;
+    expect(header.lastElementChild).toHaveClass("pt-2", "pr-2");
   });
 
   it("5. 四页各挂统一页头：活动页恰有一个 h1 且文案正确", async () => {
@@ -308,5 +312,49 @@ describe("workspace-theme（Task 8：已定主题与轻玻璃契约）", () => {
     expect(actionsWrapper).toHaveClass("flex-wrap");
     expect(actionsWrapper).toHaveClass("min-w-0");
     expect(actionsWrapper).toHaveClass("justify-end");
+  });
+  it("7. 一键清除已完成：角标数字 = 当前看板绿色卡（idle/finished）数量", async () => {
+    const card = (id: string, status: string, agentType = "claude") => ({
+      id,
+      agentType,
+      form: "cli",
+      projectName: "Demo",
+      title: id,
+      gitBranch: null,
+      githubUrl: null,
+      status,
+      lastMessage: "ok",
+      lastMessageRole: null,
+      lastActivityAt: new Date().toISOString(),
+      pid: 1,
+      cpuUsage: 0,
+      activeSubagentCount: 0,
+      jumpSupported: true,
+      unread: false,
+      flapFromSubagentActivity: false,
+    });
+    // 故意把工具筛选设成 codex，并混入 claude 绿卡：计数必须仍是全看板绿卡，
+    // 不能误用 filteredSessions（否则这里会变成 1）。
+    localStorage.setItem("board.toolFilter", "codex");
+    useSessionStore.setState({
+      sessions: [
+        card("idle-claude", "idle", "claude"),
+        card("finished-claude", "finished", "claude"),
+        card("idle-codex", "idle", "codex"),
+        card("waiting-codex", "waiting", "codex"),
+      ] as never,
+      totalCount: 4,
+      waitingCount: 1,
+      loading: false,
+    });
+    renderHost();
+    const badge = await screen.findByTestId("clear-finished-count");
+    expect(badge).toHaveTextContent("3");
+    expect(badge).toHaveClass("absolute", "-top-1", "-right-1", "bg-green-500", "text-white");
+    expect(screen.getByTestId("clear-finished-cards")).toHaveAttribute(
+      "aria-label",
+      expect.stringContaining("3")
+    );
+    useSessionStore.setState({ sessions: [], totalCount: 0, waitingCount: 0, loading: false });
   });
 });

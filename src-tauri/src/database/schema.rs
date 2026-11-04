@@ -268,6 +268,111 @@ pub fn init(conn: &Connection) {
         CREATE INDEX IF NOT EXISTS idx_codex_actions_terminal_retention
             ON codex_actions(updated_at)
             WHERE state IN ('accepted', 'rejected', 'cancelled') AND compat_outstanding = 0;
+        -- ZCode 官方桥控制动作账本（生产计划 T3）。只存去重与终态所需的最小面：
+        -- 正文/答案/JWT/URL 一律不落库（正文只以 sha256 payload_hash 参与幂等判定）。
+        -- action_id 是幂等键：同 id 同哈希同设备同会话 → 返回既有回执、零重发；
+        -- 任一不同 → action_payload_conflict（跨设备同 id 绝不泄漏旧回执）。
+        -- state 写前即 'reserved'（DB 专用的「已预留未落账」，回执一律映射为保守
+        -- unknown）：崩溃/重启后重放只返回 unknown，不再派发；只有 reserved 行能被
+        -- 第一次 finish 改写（CAS），终态行绝不被第二次 finish 覆盖。
+        -- summary 只存审计摘要（类别 + 字数/选项数），同样不含正文。
+        CREATE TABLE IF NOT EXISTS zcode_send_queue (
+            seq INTEGER PRIMARY KEY AUTOINCREMENT,
+            request_id TEXT NOT NULL UNIQUE,
+            item_id TEXT NOT NULL UNIQUE,
+            payload_hash TEXT NOT NULL,
+            request_input_hash TEXT,
+            device_id TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            device_name TEXT NOT NULL,
+            workspace_path TEXT NOT NULL,
+            workspace_identity TEXT,
+            prepared TEXT NOT NULL,
+            receipt_queue_version INTEGER NOT NULL,
+            receipt_position INTEGER NOT NULL,
+            created_at INTEGER NOT NULL DEFAULT 0,
+            priority_request TEXT,
+            dispatch_action_id TEXT,
+            dispatch_target TEXT,
+            receipt TEXT,
+            draft TEXT,
+            state TEXT NOT NULL DEFAULT 'queued',
+            item_version INTEGER NOT NULL DEFAULT 1
+        );
+        CREATE TABLE IF NOT EXISTS zcode_queue_state (
+            session_id TEXT PRIMARY KEY,
+            version INTEGER NOT NULL DEFAULT 0,
+            auto_drain INTEGER NOT NULL DEFAULT 1,
+            pause_reason TEXT
+        );
+        CREATE TABLE IF NOT EXISTS zcode_queue_operations (
+            request_id TEXT PRIMARY KEY,
+            kind TEXT NOT NULL DEFAULT 'edit',
+            payload_hash TEXT,
+            stop_action_id TEXT,
+            send_action_id TEXT,
+            expected_execution_id TEXT,
+            confirm_stop INTEGER NOT NULL DEFAULT 0,
+            stop_claimed INTEGER NOT NULL DEFAULT 0,
+            stop_reviewed INTEGER NOT NULL DEFAULT 0,
+            stop_generation INTEGER,
+            result_version INTEGER,
+            operation_state TEXT NOT NULL DEFAULT 'in_flight',
+            operation_receipt TEXT,
+            device_name TEXT NOT NULL DEFAULT '',
+            device_id TEXT NOT NULL,
+            item_id TEXT NOT NULL,
+            expected_version INTEGER NOT NULL,
+            draft TEXT,
+            expires_at INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_zcode_send_queue_active ON zcode_send_queue(session_id,seq) WHERE state IN ('queued','dispatching','unknown');
+        CREATE INDEX IF NOT EXISTS idx_zcode_queue_edits_expiry ON zcode_queue_operations(expires_at) WHERE kind='edit' AND draft IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS idx_zcode_queue_priority ON zcode_queue_operations(item_id,operation_state) WHERE kind='priority';
+        CREATE TRIGGER IF NOT EXISTS zcode_queue_request_guard BEFORE INSERT ON zcode_send_queue
+        WHEN EXISTS (SELECT 1 FROM zcode_queue_operations WHERE request_id=NEW.request_id)
+        BEGIN SELECT RAISE(ABORT, 'queue request conflict'); END;
+        CREATE TRIGGER IF NOT EXISTS zcode_operation_request_guard BEFORE INSERT ON zcode_queue_operations
+        WHEN EXISTS (SELECT 1 FROM zcode_send_queue WHERE request_id=NEW.request_id)
+        BEGIN SELECT RAISE(ABORT, 'queue request conflict'); END;
+        CREATE TABLE IF NOT EXISTS zcode_actions (
+            action_id    TEXT PRIMARY KEY,
+            device_id    TEXT NOT NULL,
+            device_name  TEXT NOT NULL,
+            session_id   TEXT NOT NULL,
+            generation   INTEGER NOT NULL,
+            kind         TEXT NOT NULL,
+            payload_hash TEXT NOT NULL,
+            state        TEXT NOT NULL,
+            reason_code  TEXT,
+            send_admission TEXT,
+            summary      TEXT NOT NULL,
+            created_at   INTEGER NOT NULL,
+            updated_at   INTEGER NOT NULL
+        );
+        -- 保留清理选路（终态行按更新时间分批挑选；与 codex_actions 的
+        -- terminal_retention 同口径，清理入口由后续任务接入）。
+        CREATE INDEX IF NOT EXISTS idx_zcode_actions_updated_at
+            ON zcode_actions(updated_at);
+        -- ===== ZCode 能力证据账本（生产计划 T2，spec R6）=====
+        -- 每个 (key, capability) 一行，upsert 覆盖不追加（同一 key 重新解析出的能力
+        -- 结论覆盖旧值，不积累历史行）。key = 能力 key 五元组的确定性拼接
+        -- （CapabilityKey::to_storage_key：platform|app_build|protocol|
+        -- schema_fingerprint|epoch，只含 build 指纹类字段，不含凭据），五元组任一
+        -- 变化即换 key，旧记录天然失配（能力解析的失效单元语义）。
+        -- state ∈ confirmed/degraded/inconclusive/unsupported/interface_matched（小写冻结词表）。
+        -- reason_code/evidence 只存**结构化判据标识**（判据名/状态码，写入侧
+        -- validate_evidence_token 硬闸）——正文/题目/选项/答案、JWT、链接一律不落库。
+        -- 时间列用 INTEGER 毫秒（与 codex_ipc_probe 等既有表同惯例，不依赖本地时区）。
+        CREATE TABLE IF NOT EXISTS zcode_capability_evidence (
+            key         TEXT NOT NULL,
+            capability  TEXT NOT NULL,
+            state       TEXT NOT NULL,
+            reason_code TEXT,
+            evidence    TEXT,
+            updated_at  INTEGER NOT NULL,
+            PRIMARY KEY (key, capability)
+        );
         -- ===== S2：打断后队列持久暂停（设计 §4.2/§4.3）=====
         -- 复审 R-T2 起**按 token 多行共存**：每次打断（interrupt_pending 前置档）
         -- 落**自己的行**，受理/不确定保留、Rejected/NotSent 只撤自己的行、显式

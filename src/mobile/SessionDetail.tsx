@@ -71,6 +71,7 @@ import BookmarkBar from "./BookmarkBar";
 import FilePanel, { type FilePanelEntry } from "./FilePanel";
 import FilePreview from "./FilePreview";
 import MessageComposer, { type ComposerDraftRequest } from "./MessageComposer";
+import ZcodeControlPanel from "./ZcodeControlPanel";
 // T05：页面共享停止控制器（composer 主按钮/紧凑入口与队列面板打断共用同一实例）
 import { useCodexTurnControl } from "./useCodexTurnControl";
 import PreviewModeSwitcher, { type PreviewMode } from "./PreviewModeSwitcher";
@@ -814,7 +815,13 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
   // ApproveCard 挂载门：红灯 ∨ 计划预期态（两个**并列**的门，不互相削弱——
   // waiting 门仍是审批红灯的入口，T1 裁决未动；预期态门是 codex/kimi 计划确认的
   // 唯一入口，两者都经同一张卡的 `available` 数据门做最终裁决）
-  const approveMounted = session.status === "waiting" || planPending;
+  //
+  // ZCode 例外（R1）：ZCode 的审批/问答**只**消费官方协议的原生 pending（由
+  // `ZcodeControlPanel` 渲染），旧 CLI 卡（终端屏读 + `/session-approve-options`
+  // + `/session-question` + 终端按键注入）对 ZCode 一律不挂载——两套卡并存会出现
+  // 「官方卡可答、旧只读卡残留在上方」的现场缺陷，且旧链路的写动作对 ZCode 不可达。
+  const isZcodeSession = session.agentType === "zcode";
+  const approveMounted = !isZcodeSession && (session.status === "waiting" || planPending);
 
   // 消息流拉取：挂载 / limit 变化 / 手动刷新时重拉（整页替换；M3 不做增量追加
   // 与滚动位置保持——「加载更多」按钮替代无限滚动的裁决即含此简化）
@@ -1782,7 +1789,10 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
           {i18n.t("mobile.codex.ops.connecting")}
         </p>
       ) : (
-        !isSummary && (
+        // ZCode：原生 pending 只在 `ZcodeControlPanel` 里渲染（R1）；旧终端问答卡
+        // 一律不挂载——它不是原生降级卡，残留只会与官方卡并存。
+        !isSummary &&
+        !isZcodeSession && (
           <QuestionCard key={`question-${session.id}`} session={session} fontScale={fontScale} />
         )
       )}
@@ -1804,6 +1814,34 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
       </div>
     </div>
   );
+
+  // ===== 发送区（T7.2 集成，2026-10-25）=====
+  // **ZCode 会话挂统一控制面板**，不再挂旧终端 composer：
+  // - 旧 composer 的 ZCode 档只是 A5 的只读占位（控制未接上时发送恒禁用），B 包接上
+  //   官方连接后由本面板接管写面；旧 `/session-send`、无头 CLI、终端按键对 ZCode
+  //   一律不可达（面板只 POST `/m/api/v1/zcode/actions`）；
+  // - 阅读链与发送区解耦：面板自己的连接/会话 GET 失败只影响控制区（就地原因），
+  //   正文/文件/子 agent 这条既有读取链完全不受影响（本页照常渲染）；
+  // - 非 ZCode 会话逐字走原 MessageComposer（零回归）。
+  // 两处布局分支（分屏对话列 / 正文列）共用同一份选择逻辑，钥匙前缀互异。
+  const composerArea =
+    session.agentType === "zcode" ? (
+      <ZcodeControlPanel key={`zcode-composer-${session.id}`} sessionId={session.id} />
+    ) : (
+      <MessageComposer
+        editDraft={editDraft}
+        onEditDraftConsumed={consumeEditDraft}
+        draftText={composerDrafts[session.id] ?? ""}
+        onDraftTextChange={changeDraftText}
+        key={`composer-${session.id}`}
+        session={session}
+        onQueueChanged={bumpQueue}
+        onSendGate={setCodexSendGate}
+        refreshSendInfoSignal={sendInfoTick}
+        disableTerminalProbes={appForm}
+        turnControl={appForm ? codexTurnControl : undefined}
+      />
+    );
 
   // 消息区（split 布局复用同一份 JSX）
   const messageArea = (
@@ -2319,19 +2357,7 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
               {messageArea}
             </MessageScrollArea>
             {cardDock}
-            <MessageComposer
-              editDraft={editDraft}
-              onEditDraftConsumed={consumeEditDraft}
-              draftText={composerDrafts[session.id] ?? ""}
-              onDraftTextChange={changeDraftText}
-              key={`composer-${session.id}`}
-              session={session}
-              onQueueChanged={bumpQueue}
-              onSendGate={setCodexSendGate}
-              refreshSendInfoSignal={sendInfoTick}
-              disableTerminalProbes={appForm}
-              turnControl={appForm ? codexTurnControl : undefined}
-            />
+            {composerArea}
           </div>
           <SplitHandle
             orientation={preview.mode === "split-h" ? "horizontal" : "vertical"}
@@ -2401,20 +2427,10 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
           {cardDock}
           {/* 发送输入区（M7 Task 7，W4）：**全布局态挂载**（正文 / split / split-h，
               2026-09-19 用户裁决）——分屏时对话列同样可发消息；
-              send-info 拉取失败时组件自静默，不影响对话渲染；钥匙口径同上 */}
-          <MessageComposer
-            editDraft={editDraft}
-            onEditDraftConsumed={consumeEditDraft}
-            draftText={composerDrafts[session.id] ?? ""}
-            onDraftTextChange={changeDraftText}
-            key={`composer-${session.id}`}
-            session={session}
-            onQueueChanged={bumpQueue}
-            onSendGate={setCodexSendGate}
-            refreshSendInfoSignal={sendInfoTick}
-            disableTerminalProbes={appForm}
-            turnControl={appForm ? codexTurnControl : undefined}
-          />
+              send-info 拉取失败时组件自静默，不影响对话渲染；钥匙口径同上。
+              T7.2：ZCode 会话改挂统一控制面板（composerArea 的选择逻辑见其定义处）；
+              非 ZCode 会话的 composer 不再接收 agentType（ZCode 分支已删除）。 */}
+          {composerArea}
         </div>
       )}
 

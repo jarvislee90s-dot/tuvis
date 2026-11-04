@@ -3,6 +3,16 @@ import i18n from "@/i18n";
 import type { SessionsResponse, TransitionEvent } from "@/types/session";
 // Codex Desktop IPC：SendResult 的 desktop_ipc 分支引用 ActionReceipt（type-only，无运行时环）
 import type { ActionReceipt } from "./codexIpcApi";
+// A5：ZCode 官方远控链接的 wire DTO 与桌面端**同一个形状**（type-only import：
+// 移动端零 Tauri 运行时依赖，构建期即擦除；不得在 mobile 侧重定义另一份 DTO）
+import type { ZcodeRemoteConfig } from "@/lib/api/zcodeRemote";
+// T8 抢回：冻结码解析与错误类型复用 zcodeControl 客户端（同域同契约，不另立一份）
+import {
+  ZcodeControlApiError,
+  isZcodeErrorCode,
+  type ConnectionView,
+  type ZcodeErrorCode,
+} from "@/lib/api/zcodeControl";
 
 /** 带 HTTP 状态的请求失败（status=null 表示网络层异常，无响应可读）。
  *  详情页/预览按 status 分流错误文案（404 → 会话不可读，403 → 文件不可预览）；
@@ -513,6 +523,93 @@ export async function fetchSendInfo(sessionId: string): Promise<SendInfo | null>
   if (r.status === 403) return null; // 设备失效 → 回配对页
   if (!r.ok) throw new ApiError(r.status, `session-send-info ${r.status}`);
   return (await r.json()) as SendInfo;
+}
+
+/**
+ * ZCode 官方远控配置的手机侧读面（A5，设计 §4.2/§4.3/§5.1）。
+ *
+ * **两个面分开持有，绝不合并成一个「可用」布尔**：
+ * - `readState`：本机配置**读到了没有**（checking / ok / failed）——读失败**不等于**
+ *   未配置或删除（§4.3 最后一行：外跳只看到 Not Found 时 Tuvis 也无权据此判定）；
+ * - `configState`：A4 的 wire 值（missing / saved / invalid）。`saved` 只表示**格式已
+ *   校验并落库**，永不表示已联机。
+ *
+ * 官方连接态**不在本读面**：它只由 `ZcodeControlPanel` 通过官方
+ * `GET /m/api/v1/zcode/connection` 持有（T7.2）。本读面不预置 `needs_connection`
+ * 之类的占位字段——没有消费方的死字段只会诱导把「配置已保存」当「已连接」。
+ *
+ * 手机侧**没有写接口**（首版桌面编辑，设计 §4.2）：这里只有 GET。
+ */
+export type ZcodeControlAvailability = {
+  readState: "checking" | "ok" | "failed";
+  /** readState=ok 时的本机配置态；其余为 null（不猜） */
+  configState: ZcodeRemoteConfig["configState"] | null;
+  /** 官方远控链接（仅 saved 才有；invalid/missing/读失败恒 null——坏值不下发） */
+  url: string | null;
+};
+
+const zcodeAvailability = (
+  readState: ZcodeControlAvailability["readState"],
+  configState: ZcodeControlAvailability["configState"],
+  url: string | null
+): ZcodeControlAvailability => ({
+  readState,
+  configState,
+  url,
+});
+
+/**
+ * 只读拉取本机 ZCode 官方远控配置（GET /m/api/v1/official-control?agent_type=zcode，
+ * 配对门 + Cache-Control: no-store 在服务端）。任何失败（网络 / 非 2xx / 设备失效）
+ * → readState=failed：只有「打开官方页面」入口据此取已保存链接，**正文与文件预览
+ * 不受影响**（与 fetchChannel 的静默降级同一惯例，但这里必须说得出原因，不能装成
+ * 未配置）。控制面的连接/发送原因由 ZcodeControlPanel（官方 GET）单独持有。
+ */
+export async function fetchZcodeControl(): Promise<ZcodeControlAvailability> {
+  try {
+    const r = await fetch("/m/api/v1/official-control?agent_type=zcode");
+    if (!r.ok) return zcodeAvailability("failed", null, null);
+    const cfg = (await r.json()) as ZcodeRemoteConfig;
+    if (!cfg || typeof cfg.configState !== "string") {
+      return zcodeAvailability("failed", null, null);
+    }
+    return zcodeAvailability("ok", cfg.configState, cfg.url ?? null);
+  } catch {
+    return zcodeAvailability("failed", null, null);
+  }
+}
+
+/** 手机「断开并抢回」端点（T8，spec §6.5；POST，空请求体；配对门内 no-store）。 */
+export const ZCODE_TAKEOVER_PATH = "/m/api/v1/zcode/takeover";
+
+/**
+ * 手机「断开并抢回」（POST /m/api/v1/zcode/takeover，T8）：一次 disconnect→connect。
+ *
+ * 语义在服务端 Hub：paired 幂等返回当前；未授权回 `needs_auth`（零 OAuth）；
+ * conflict 一次断开+重连，**仍 conflict 也 200** 原样返回该视图（调用方提示先关
+ * 官方页面，本函数不循环不重试）。失败（非 2xx）抛
+ * [`ZcodeControlApiError`]：冻结码在 `code`（网络层为 `null`），调用方按码取
+ * 本地化文案，不展示 `message`。
+ */
+export async function postZcodeTakeover(): Promise<ConnectionView> {
+  let r: Response;
+  try {
+    r = await fetch(ZCODE_TAKEOVER_PATH, { method: "POST" });
+  } catch (e) {
+    throw new ZcodeControlApiError(null, null, `zcode takeover network failure: ${String(e)}`);
+  }
+  if (!r.ok) {
+    let code: ZcodeErrorCode | null = null;
+    try {
+      const body = (await r.json()) as { error?: unknown } | null;
+      const raw = body?.error;
+      if (typeof raw === "string") code = isZcodeErrorCode(raw) ? raw : "unknown";
+    } catch {
+      /* 非 JSON 错误体（代理注入页等）：code 保持 null，调用方按状态码兜底 */
+    }
+    throw new ZcodeControlApiError(r.status, code, `zcode takeover ${r.status}`);
+  }
+  return (await r.json()) as ConnectionView;
 }
 
 /** 发送回执（POST /session-send 响应四态，HTTP 200 恒定，语义在 body.status）：

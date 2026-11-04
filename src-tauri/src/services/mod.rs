@@ -12,6 +12,8 @@ pub mod skill;
 pub mod tool_settings;
 pub mod tps;
 pub mod usage;
+// ZCode 统一远控的配置合同（A4）：官方链接格式校验 + settings 持久化
+pub mod zcode_control;
 // 四页工作区导航（2026-10-26 计划 Task 7）：主窗待导航目标与 revision/ACK 队列
 pub mod workspace_navigation;
 

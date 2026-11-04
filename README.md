@@ -44,7 +44,7 @@ Step-by-step documentation lives in the **[user manual](docs/product/manual/en/0
 | ------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------- |
 | 🎛️ **Session monitoring dashboard**  | Adaptive traffic-light board: status, project, branch, last message, CPU — click a card to jump straight to the session's terminal or app window | [Ch. 4](docs/product/manual/en/04-dashboard.md)            |
 | 📶 **Remote access & mobile board**  | The same board on your phone, over four simultaneous channels with per-channel setup wizards and one permanent address option                     | [Ch. 8](docs/product/manual/en/08-mobile-remote.md)        |
-| 📱 **Remote control** (experimental) | Send & queue messages, approve tool calls and plans, answer Q&A cards, switch permission modes, create sessions — all screen-read verified        | [Ch. 8](docs/product/manual/en/08-mobile-remote.md)        |
+| 📱 **Remote control** (experimental) | Send & queue messages, approve tool calls and plans, answer Q&A cards, switch permission modes, create sessions — all screen-read verified; **since 0.6.5 ZCode joins via the official bridge** (verified on Windows)        | [Ch. 8](docs/product/manual/en/08-mobile-remote.md)        |
 | 🕵️ **Sub-agent observatory**         | Live sub-agent chips, a dedicated sub-agent board and execution details in the session view (Claude Code)                                         | [Ch. 5](docs/product/manual/en/05-subagent-observatory.md) |
 | 🐰 **Desktop pets**                  | tuvis-3D & Foxbell watch your sessions with status cards and voice alerts; open pet format for custom imports                                     | [Ch. 7](docs/product/manual/en/07-pet.md)                  |
 | 🧮 **Token usage ledger**            | One ledger for seven tools: overview, trends, distribution, API-equivalent cost estimates, CSV export                                             | [Ch. 11](docs/product/manual/en/11-usage.md)               |
@@ -78,7 +78,7 @@ Step-by-step documentation lives in the **[user manual](docs/product/manual/en/0
 
 <!-- capabilities:start (generated; run pnpm sync:capabilities) -->
 
-14 capability rows × 8 tools (✅ supported / ◐ partial / 🧪 experimental / ❌ not supported).
+15 capability rows × 8 tools (✅ supported / ◐ partial / 🧪 experimental / ❌ not supported).
 
 Single maintained source: [`docs/capabilities.json`](docs/capabilities.json), shared with the website.
 
@@ -92,11 +92,12 @@ Single maintained source: [`docs/capabilities.json`](docs/capabilities.json), sh
 | Status hooks | ✅ | ✅ | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ |
 | Mobile · message viewing | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
 | Mobile · file preview | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
-| Mobile · message injection | 🧪 | 🧪 | 🧪 | 🧪 | ❌ | ❌ | ❌ | ❌ |
+| Mobile · message injection | 🧪 | 🧪 | 🧪 | 🧪 | ❌ | ✅ | ❌ | ❌ |
 | Mobile · session creation | 🧪 | 🧪 | 🧪 | 🧪 | ❌ | ❌ | ❌ | ❌ |
 | Token usage collection | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
 | Mobile · sub-agent observatory | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
 | Codex APP remote control (Desktop IPC) | ❌ | 🧪 | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| ZCode remote control (official bridge) | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ | ❌ | ❌ |
 | Output speed (TPS sampling) | ◐ approximate | ◐ response only | ◐ plugin | ✅ | ✅ | ✅ | ✅ | ❌ |
 
 The Codex column covers both CLI and APP; Desktop APP control has its own row and is gated per operation by contract evidence.

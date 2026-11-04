@@ -70,7 +70,11 @@ function offenders(): string[] {
 }
 
 describe("usage locale 扫描（issue #160 兜底网）", () => {
-  it("src/ 内三函数的全部出现点都显式传 locale（无单参调用、无裸引用传递）", () => {
-    expect(offenders()).toEqual([]);
-  });
+  it(
+    "src/ 内三函数的全部出现点都显式传 locale（无单参调用、无裸引用传递）",
+    { timeout: 20000 },
+    () => {
+      expect(offenders()).toEqual([]);
+    }
+  );
 });

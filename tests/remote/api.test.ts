@@ -29,6 +29,12 @@ import {
   setPin,
   toggleChannel,
 } from "@/lib/api/remote";
+import {
+  forgetZcodeAuthorization,
+  getZcodeAuthStatus,
+  getZcodeRemoteConfig,
+  setZcodeRemoteConfig,
+} from "@/lib/api/zcodeRemote";
 
 beforeEach(() => {
   invokeMock.mockReset();
@@ -179,5 +185,88 @@ describe("remote api wrappers", () => {
     invokeMock.mockResolvedValueOnce(probe);
     expect(await remoteNamedVerify()).toEqual(probe);
     expect(invokeMock).toHaveBeenLastCalledWith("remote_named_verify");
+  });
+});
+
+// A4：ZCode 官方远控链接配置的桌面 IPC 封装锁形。命令名/参数形态与 Rust 端
+// commands::zcode_remote（zcode_remote_config_get() / zcode_remote_config_set(raw_url)）
+// 是隐式契约；wire DTO 与 Rust ZcodeRemoteConfig（serde camelCase）逐字段一致。
+// 夹具只用合成 sid，不含任何真实用户链接。
+describe("zcode remote config api wrappers", () => {
+  it("getZcodeRemoteConfig 无参调用 zcode_remote_config_get，透传 Saved wire DTO", async () => {
+    const saved = {
+      configState: "saved",
+      url: "https://zcode.z.ai/remote/v4?sid=synthetic-sid-a4-ts-0001",
+    };
+    invokeMock.mockResolvedValueOnce(saved);
+    expect(await getZcodeRemoteConfig()).toEqual(saved);
+    expect(invokeMock).toHaveBeenCalledTimes(1);
+    expect(invokeMock).toHaveBeenCalledWith("zcode_remote_config_get");
+  });
+
+  it("setZcodeRemoteConfig 以 { rawUrl } 形态传参（Rust raw_url: String）；空白=删除同源回 missing/null", async () => {
+    const saved = {
+      configState: "saved",
+      url: "https://zcode.z.ai/remote/v4?sid=synthetic-sid-a4-ts-0002",
+    };
+    invokeMock.mockResolvedValueOnce(saved);
+    expect(await setZcodeRemoteConfig(saved.url)).toEqual(saved);
+    expect(invokeMock).toHaveBeenLastCalledWith("zcode_remote_config_set", { rawUrl: saved.url });
+
+    invokeMock.mockResolvedValueOnce({ configState: "missing", url: null });
+    expect(await setZcodeRemoteConfig("   ")).toEqual({ configState: "missing", url: null });
+    expect(invokeMock).toHaveBeenLastCalledWith("zcode_remote_config_set", { rawUrl: "   " });
+  });
+
+  it("保存失败透传后端错误码串（ZCODE_URL_* 前缀、不含原链接）", async () => {
+    invokeMock.mockRejectedValueOnce("ZCODE_URL_HOST: 仅支持 zcode.z.ai 官方主机");
+    await expect(
+      setZcodeRemoteConfig("https://evil.example/remote/v4?sid=synthetic-sid-a4-ts-0003")
+    ).rejects.toBe("ZCODE_URL_HOST: 仅支持 zcode.z.ai 官方主机");
+  });
+});
+
+// C4：记住授权相关的桌面 IPC 封装锁形。命令名/参数形态与 Rust
+// commands::zcode_remote（zcode_control_auth_status() /
+// zcode_control_forget_authorization()）是隐式契约；AuthStatus 为 camelCase，
+// 词表外的 problem 由调用方按读取失败处理。夹具全合成，不含真实 JWT/链接。
+describe("zcode auth api wrappers (C4)", () => {
+  it("getZcodeAuthStatus 无参调用 zcode_control_auth_status，透传 AuthStatus（camelCase）", async () => {
+    const status = {
+      authorized: true,
+      remembered: true,
+      restoring: false,
+      provider: "bigmodel",
+      problem: null,
+    };
+    invokeMock.mockResolvedValueOnce(status);
+    expect(await getZcodeAuthStatus()).toEqual(status);
+    expect(invokeMock).toHaveBeenCalledTimes(1);
+    expect(invokeMock).toHaveBeenCalledWith("zcode_control_auth_status");
+    expect(Object.keys(status)).toEqual([
+      "authorized",
+      "remembered",
+      "restoring",
+      "provider",
+      "problem",
+    ]);
+  });
+
+  it("forgetZcodeAuthorization 无参调用 zcode_control_forget_authorization，返回 ConnectionView", async () => {
+    const view = {
+      state: "needs_auth",
+      generation: 9,
+      reasonCode: null,
+      deviceLabel: null,
+    };
+    invokeMock.mockResolvedValueOnce(view);
+    expect(await forgetZcodeAuthorization()).toEqual(view);
+    expect(invokeMock).toHaveBeenCalledTimes(1);
+    expect(invokeMock).toHaveBeenCalledWith("zcode_control_forget_authorization");
+  });
+
+  it("forget 失败透传后端码前缀（ZCODE_CONTROL:*），前端不伪造成功", async () => {
+    invokeMock.mockRejectedValueOnce("ZCODE_CONTROL:storage_failed");
+    await expect(forgetZcodeAuthorization()).rejects.toBe("ZCODE_CONTROL:storage_failed");
   });
 });

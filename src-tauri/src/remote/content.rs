@@ -481,12 +481,53 @@ fn find_jsonl_in_projects(
     ))
 }
 
-fn read_zcode_messages_with(
+/// A7 同源锚点（设计 §6 末段）：正文页 + 「数据库 message ID → 最终显示序号」映射。
+/// 映射在多 parts 展开、合成过滤、tail 裁剪（finalize）**之后**产出——正文 seq 与
+/// 附件引用序号共用同一个有界窗口／finalize 结果，偏移只算一份。
+/// 私有类型：数据库 message ID 不上任何公开 wire。
+struct ZcodeProjection {
+    messages: MessagesPage,
+    source_anchors: std::collections::HashMap<String, i64>,
+}
+
+/// ZCode 附件引用形态：(投影后显示序号, 路径或 artifact URI, 消息时间戳)
+type ZcodeAttachmentRefs = Vec<(i64, String, Option<i64>)>;
+
+/// `finalize` 的带来源变体（A7）：同一「尾部截取 + seq 重排」规则，但条目携带所属
+/// 数据库 message ID；裁剪后产出 ID → 最终显示序号映射。一条消息展开多个显示项时
+/// 取末项 seq（FileEntry.lastSeq 同语义）；被裁剪掉／零显示项（合成、file-only、
+/// 空正文）的 ID 不进映射。
+fn finalize_with_sources(
+    mut items: Vec<(String, SessionMessage)>,
+    limit: usize,
+) -> (Vec<SessionMessage>, std::collections::HashMap<String, i64>) {
+    if items.len() > limit {
+        items = items.split_off(items.len() - limit);
+    }
+    let mut anchors: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+    let mut out = Vec::with_capacity(items.len());
+    for (i, (id, mut m)) in items.into_iter().enumerate() {
+        m.seq = i as i64;
+        anchors.insert(id, m.seq); // 同 ID 后写覆盖 = 末项 seq
+        out.push(m);
+    }
+    (out, anchors)
+}
+
+/// ZCode 同源投影（A7 唯一 seq 推导点）：有界窗查询 → 正文投影 → finalize →
+/// 同时把窗口内全部 `type=file` parts（任意角色、data 损坏或被过滤的消息也收——
+/// 与改造前独立查询的附件面一致）的锚点改写为所属消息的最终显示 seq。
+/// 返回 (投影, (显示序号, 路径或 artifact URI, 消息时间戳))。
+fn read_zcode_projection_with(
     home: &Path,
     session_id: &str,
     limit: usize,
-) -> Result<MessagesPage, String> {
+) -> Result<(ZcodeProjection, ZcodeAttachmentRefs), String> {
     use crate::monitor::zcode_parser::ZcodeRoots;
+    // limit 夹取 [1,1000] 在投影内自持（派发核同款幂等口径）：附件锚点路径
+    // （read_zcode_attachment_refs_with）与正文路径必须落在**同一个有界窗**上，
+    // 夹取若只发生在派发核，两条链各算各的窗就不再同源
+    let limit = limit.clamp(1, 1000);
     let roots = ZcodeRoots::from_home(home);
     let conn = crate::monitor::sqlite::open_readonly_with_timeout(&roots.cli_db)
         .ok_or_else(|| "ZCode cli db 不可读".to_string())?;
@@ -533,8 +574,29 @@ fn read_zcode_messages_with(
     // parts 按 message_id 分组（IN 子句单查询，保序同 load_parts_for_messages）
     let parts = zcode_parts_by_message(&conn, &messages)?;
 
-    let mut out = Vec::new();
+    // (owner 数据库 message ID, 显示条目)——seq 由 finalize_with_sources 统一重排
+    let mut out: Vec<(String, SessionMessage)> = Vec::new();
+    // 附件原始引用 (message ID, 路径或 artifact URI, ts)：与旧实现同口径——任意
+    // 角色、data 损坏也收（旧实现不解析 message data），故先于损坏跳过收集
+    let mut raw_refs: Vec<(String, String, Option<i64>)> = Vec::new();
     for (id, data, ts) in &messages {
+        let msg_parts = parts.get(id);
+        if let Some(ps) = msg_parts {
+            for p in ps {
+                let ptype = p.get("type").and_then(|t| t.as_str()).unwrap_or_default();
+                if ptype != "file" {
+                    continue;
+                }
+                // 优先原始落盘路径（source.path）；无则 artifact URI（调用方解析磁盘实体）
+                let r = p
+                    .pointer("/source/path")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| p.get("url").and_then(|v| v.as_str()));
+                if let Some(r) = r {
+                    raw_refs.push((id.clone(), r.to_string(), *ts));
+                }
+            }
+        }
         let Ok(v) = serde_json::from_str::<serde_json::Value>(data) else {
             continue; // data 损坏 → 跳过该消息（防御）
         };
@@ -548,7 +610,6 @@ fn read_zcode_messages_with(
         {
             continue;
         }
-        let msg_parts = parts.get(id);
         match role {
             "user" => {
                 // 真实用户消息：text parts 拼接（实测 user 消息带 type=text part）
@@ -556,7 +617,7 @@ fn read_zcode_messages_with(
                     .map(|ps| zcode_text_of(ps, "text"))
                     .unwrap_or_default();
                 if !text.is_empty() {
-                    out.push(SessionMessage::text("user", text, *ts));
+                    out.push((id.clone(), SessionMessage::text("user", text, *ts)));
                 }
             }
             "assistant" => {
@@ -571,7 +632,7 @@ fn read_zcode_messages_with(
                                 .unwrap_or_default()
                                 .trim();
                             if !t.is_empty() {
-                                out.push(SessionMessage::text("assistant", t, *ts));
+                                out.push((id.clone(), SessionMessage::text("assistant", t, *ts)));
                             }
                         }
                         "reasoning" => {
@@ -581,7 +642,7 @@ fn read_zcode_messages_with(
                                 .unwrap_or_default()
                                 .trim();
                             if !t.is_empty() {
-                                out.push(SessionMessage::text("thinking", t, *ts));
+                                out.push((id.clone(), SessionMessage::text("thinking", t, *ts)));
                             }
                         }
                         "tool" => {
@@ -594,11 +655,14 @@ fn read_zcode_messages_with(
                                 .pointer("/state/input")
                                 .filter(|v| !v.is_null())
                                 .and_then(|v| serde_json::to_string(v).ok());
-                            out.push(SessionMessage::tool_call(
-                                tool_summary(name),
-                                *ts,
-                                name.map(String::from),
-                                args,
+                            out.push((
+                                id.clone(),
+                                SessionMessage::tool_call(
+                                    tool_summary(name),
+                                    *ts,
+                                    name.map(String::from),
+                                    args,
+                                ),
                             ));
                         }
                         // step-start / step-finish / timeline / file / compaction 是
@@ -612,80 +676,61 @@ fn read_zcode_messages_with(
         }
     }
     // SQLite 查询自带 LIMIT：无「头部截断」语义（truncated 恒 false，Bug 1 契约）
-    Ok(page(out, limit, false))
+    let (messages, source_anchors) = finalize_with_sources(out, limit);
+    let proj = ZcodeProjection {
+        messages: MessagesPage {
+            messages,
+            truncated: false,
+            cwd: None,
+        },
+        source_anchors,
+    };
+    // A7 锚点改写（唯一一处）：所属消息有显示条目 → 其最终显示 seq；没有
+    // （file-only／被过滤／被裁剪）→ 项目既有中性 0 口径，仅作排序占位，
+    // 不伪造正文条目、不引入负数哨兵
+    let refs = raw_refs
+        .into_iter()
+        .map(|(mid, r#ref, ts)| {
+            (
+                proj.source_anchors.get(&mid).copied().unwrap_or(0),
+                r#ref,
+                ts,
+            )
+        })
+        .collect();
+    Ok((proj, refs))
+}
+
+/// ZCode 正文读取（派发核入口）：投影的唯一正文消费方，附件面见
+/// [`read_zcode_attachment_refs_with`]——两者走同一个 `read_zcode_projection_with`
+/// （同窗同 finalize，seq 偏移只算一份）
+fn read_zcode_messages_with(
+    home: &Path,
+    session_id: &str,
+    limit: usize,
+) -> Result<MessagesPage, String> {
+    read_zcode_projection_with(home, session_id, limit).map(|(proj, _)| proj.messages)
 }
 
 /// M5 B2：zcode 用户附件第二抽取源——窗口内消息的 part 表 `type=file` 行
 /// （B1 调研：`source.path` = 原始落盘路径；无 source 时 `url` = artifact URI，
 /// 由 files.rs 解析到 `~/.zcode/cli/artifacts/` 磁盘实体）。
-/// 返回 (窗口序号, 路径或 URI, 消息时间戳)——序号与 `read_zcode_messages_with`
-/// 同一窗口查询（同序同 LIMIT），与 SessionMessage.seq 同刻度，合并排序语义一致。
-/// 库不可读 / 会话不存在 → 空表（附件是增强能力，与提取失败同口径）
+/// 返回 (显示序号, 路径或 URI, 消息时间戳)。
+/// A7 同源锚点（设计 §6 末段）：序号**不是**原始 DB 窗口 ordinal，而是
+/// `read_zcode_projection_with` finalize 后所属消息的「最终显示 seq」——与
+/// `/session-messages` 载荷里该消息条目的 SessionMessage.seq 同刻度（多 parts
+/// 展开、合成过滤、tail 裁剪都影响 seq，只有投影后对齐才稳）；所属消息无显示
+/// 条目（file-only／被过滤／被裁剪）时保留文件、序号取中性 0 排序占位。
+/// 库不可读 / 会话不存在 / 查询失败 → 空表（附件是增强能力，与提取失败同口径）
 pub(crate) fn read_zcode_attachment_refs_with(
     home: &Path,
     session_id: &str,
     limit: usize,
 ) -> Vec<(i64, String, Option<i64>)> {
-    use crate::monitor::zcode_parser::ZcodeRoots;
-    let roots = ZcodeRoots::from_home(home);
-    let Some(conn) = crate::monitor::sqlite::open_readonly_with_timeout(&roots.cli_db) else {
-        return Vec::new();
-    };
-    // 顺序列探测：与 read_zcode_messages_with 同款（sequence 优先，time_created 兜底）
-    let order_col = if conn.prepare("SELECT sequence FROM message LIMIT 0").is_ok() {
-        "sequence"
-    } else if conn
-        .prepare("SELECT time_created FROM message LIMIT 0")
-        .is_ok()
-    {
-        "time_created"
-    } else {
-        return Vec::new();
-    };
-    let sql = format!(
-        "SELECT id, time_created FROM message WHERE session_id = ?1 \
-         ORDER BY {order_col} DESC LIMIT {limit}"
-    );
-    let Ok(mut stmt) = conn.prepare(&sql) else {
-        return Vec::new();
-    };
-    let Ok(rows) = stmt.query_map([session_id], |row| {
-        Ok((sqlite_text(row, 0)?, row.get::<_, Option<i64>>(1)?))
-    }) else {
-        return Vec::new();
-    };
-    // 查询取「最新在前」，反转为文件序（旧 → 新）——序号与 finalize 的 seq 同刻度
-    let mut msgs: Vec<(String, Option<i64>)> = rows.filter_map(|r| r.ok()).collect();
-    msgs.reverse();
-    if msgs.is_empty() {
-        return Vec::new();
+    match read_zcode_projection_with(home, session_id, limit) {
+        Ok((_, refs)) => refs,
+        Err(_) => Vec::new(),
     }
-    let part_keys: Vec<(String, String, Option<i64>)> = msgs
-        .iter()
-        .map(|(id, ts)| (id.clone(), String::new(), *ts))
-        .collect();
-    let Ok(parts) = zcode_parts_by_message(&conn, &part_keys) else {
-        return Vec::new();
-    };
-    let mut out: Vec<(i64, String, Option<i64>)> = Vec::new();
-    for (ordinal, (id, ts)) in msgs.iter().enumerate() {
-        let Some(ps) = parts.get(id) else { continue };
-        for p in ps {
-            let ptype = p.get("type").and_then(|t| t.as_str()).unwrap_or_default();
-            if ptype != "file" {
-                continue;
-            }
-            // 优先原始落盘路径（source.path）；无则 artifact URI（调用方解析磁盘实体）
-            let r = p
-                .pointer("/source/path")
-                .and_then(|v| v.as_str())
-                .or_else(|| p.get("url").and_then(|v| v.as_str()));
-            if let Some(r) = r {
-                out.push((ordinal as i64, r.to_string(), *ts));
-            }
-        }
-    }
-    out
 }
 
 /// ZCode：一组消息的全部 parts（IN 子句，sequence 列存在则保流顺序，否则 rowid）
@@ -1216,7 +1261,8 @@ fn read_codex_rollout_with(
 /// Codex 用户图片附件第二抽取源（#69）：rollout `event_msg` 行的 local_images
 /// 字段（实测 2290 行中 2289 承载车道在 rollout；thread_history 投影车道 1 例
 /// 不接）。形态照 [`read_zcode_attachment_refs_with`]：同 limit 同窗口刻度
-/// （条数窗 + 字节窗与 `read_codex_messages_with` 完全同参），任何失败返回
+/// （条数窗 + 字节窗与 `read_codex_messages_with` 完全同参；A7 起 zcode 侧锚点
+/// 已是投影后显示 seq，codex 面标尺见下方 seq 注释、本任务未动），任何失败返回
 /// 空 Vec（附件是增强能力，不阻塞详情页）。判据层级：`payload.local_images`
 /// 主判据（与 event_msg 既有消费先例 `monitor::subagents::codex::apply_rollout_line` 的
 /// payload 层同构）+ 顶层 `local_images` 兜底（形态漂移容忍，命中任一即收）；

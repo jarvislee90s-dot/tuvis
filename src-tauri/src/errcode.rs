@@ -46,3 +46,11 @@
 //!   前端键备而不用。
 //! * **审计行格式变更**（2026-10-15）：审计 `result` 字段自此带码前缀
 //!   （`failed:RAPI_DELIVERY_BUSY: …`），外部按纯中文 grep 审计日志的脚本需知悉。
+
+/// ZCode 统一控制域的 IPC 错误前缀（T7.1 C2a）：`ZCODE_CONTROL:<冻结码>`。
+///
+/// `<冻结码>` 只来自 `services::zcode_control::codes`（本域冻结错误表），官方上游
+/// 原文/URL/token 一律丢弃、绝不续接。前端以 `errors.zcodeControl` 作为本域
+/// 本地化入口（逐 reason 的中英文案在 T7.2 展开）；本串形态满足既有
+/// `formatInvokeError` 的「码 + 参数」解析（参数即冻结 reason）。
+pub const ZCODE_CONTROL_PREFIX: &str = "ZCODE_CONTROL:";

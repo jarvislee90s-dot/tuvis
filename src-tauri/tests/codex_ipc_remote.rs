@@ -1734,6 +1734,13 @@ async fn send_desktop_owned_without_send_refuses_instead_of_headless() {
 #[tokio::test]
 async fn send_state_only_build_refuses_as_capability_unverified() {
     let f = fixture_state_only(vec![codex_app_session(THREAD)]);
+    f.state.store.with(|c| {
+        c.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES ('remote.compat_send_enabled', 'false')",
+            [],
+        )
+        .unwrap();
+    });
     assert!(
         f.state.codex_control.state_available(),
         "读链已取证 → 详情投影可用"
@@ -6142,11 +6149,6 @@ async fn count_start_turn_frames(peer: &mut ScriptedPeer) -> usize {
     count
 }
 
-/// 2026-10-22 用户裁决（main 合并）：未知 build → 兼容发送档，send/state 默认开——
-/// **开关关不再拦截**派发（send stays up）。本用例重钉新形态：开关保持默认关，
-/// 发送照常走 start_turn、send-info 不置灰；账本**不留** send 行（实验未开启，
-/// 正常路径与已验证 build 同口径）。开关门只对「无写能力证据」的档位（closed /
-/// 强制压档 / 断链兜底路径）继续生效（见同文件 not_sent / inconclusive 两用例）。
 #[tokio::test]
 async fn unknown_build_send_dispatches_even_with_compat_switch_off() {
     let mut f = fixture_unknown_build(vec![codex_app_session(THREAD)]);
@@ -6155,7 +6157,14 @@ async fn unknown_build_send_dispatches_even_with_compat_switch_off() {
         !f.state.codex_control.profile_send_capable(),
         "连接前：没有写能力记录"
     );
-    // 开关保持默认关（不写设置键）
+    // A1 起缺键 = 默认开，故显式写 false 表达「用户关了兼容实验」
+    f.state.store.with(|c| {
+        c.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES ('remote.compat_send_enabled', 'false')",
+            [],
+        )
+        .unwrap();
+    });
     let mut peer = f.peer.take().unwrap();
     let app = f.app.clone();
     let body = send_body("开关关也照发的消息", Some("act-cs-off-1"), false);
@@ -12059,21 +12068,29 @@ async fn r3_concurrent_interrupts_each_withdraw_own_token_only() {
             .unwrap()
     });
 
-    // 两条 interrupt 帧都到达（并发在飞；各自带自己的 pause token）
+    // 两条 interrupt 帧都到达（并发在飞；各自带自己的 pause token）。
+    // 两个任务并发，帧到达顺序不保证是 A→B；必须按帧内的 expectedTurnId 配对。
     let frame1 = recv_within(&mut peer, 10).await;
     assert_eq!(frame1["method"], "thread-follower-interrupt-turn");
     let frame2 = recv_within(&mut peer, 10).await;
     assert_eq!(frame2["method"], "thread-follower-interrupt-turn");
+    let (frame_a, frame_b) = if frame1["params"]["expectedTurnId"] == "t-live" {
+        (frame1, frame2)
+    } else {
+        (frame2, frame1)
+    };
+    assert_eq!(frame_a["params"]["expectedTurnId"], "t-live", "A 帧");
+    assert_eq!(frame_b["params"]["expectedTurnId"], "t-second", "B 帧");
 
     // 交错投放：先 B（error → Rejected），后 A（success → Accepted）
     peer.send(&serde_json::json!({
-        "type": "response", "requestId": frame2["requestId"],
+        "type": "response", "requestId": frame_b["requestId"],
         "resultType": "error", "method": "thread-follower-interrupt-turn",
         "error": { "message": "busy" }
     }))
     .await;
     peer.send(&serde_json::json!({
-        "type": "response", "requestId": frame1["requestId"],
+        "type": "response", "requestId": frame_a["requestId"],
         "resultType": "success", "method": "thread-follower-interrupt-turn",
         "result": { "interruptedTurnId": "t-live", "ok": true }
     }))
