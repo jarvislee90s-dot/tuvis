@@ -35,7 +35,14 @@ use super::types::ProtocolError;
 ///   守卫／解析同接收者同作用域、题目标识形参↔数组位置↔map index、字符串专有组合子
 ///   证人、恒等 transform——收紧发生在 v2 落账前，不另 +1）。v1 下对 Desktop
 ///   26.1023.51421 落账的证据行**不含** AsyncAnswerIdle，必须作废重识别。
-pub const CONTRACT_RULE_VERSION: u32 = 2;
+/// * 3 — 2026-11-04 真机 26.1029.7803.0 取证（Windows）：两处已观测**协议等价**的
+///   形态变化使 v2 失配 —— ① 信封解包切片从数字字面量 `slice(34,-35)` 改为从标记
+///   绑定推导 `slice(Sc.length,-Sd.length)`（标记字面量本身未变，长度语义等价）；
+///   ② 题目标识合成函数被内联进 `.map` 箭头（参数关系逐项不变）。
+///   v3 对两者均接受**原形态或新形态**，其余判据（引用关系、schema 形状、参数序、
+///   index 绑定、map 源同接收者）全部保持不变。v2 证据行对 ≥26.1027 落账为"不匹配"，
+///   必须作废重识别。
+pub const CONTRACT_RULE_VERSION: u32 = 3;
 
 /// 逐操作键（spec §3.1：消息、命令审批、文件审批、阻塞答题、异步空闲答题、
 /// 请求级取消、回合打断、权限与模式分别判断）。
@@ -1126,12 +1133,15 @@ mod tests {
         assert_ne!(a.policy_revision, c.policy_revision);
     }
 
-    /// 2026-10-28：异步答题规则改为结构化识别（重命名容忍）。规则一变就 +1——
-    /// 已缓存的 v1 证据行对 26.1023.51421 **不含** AsyncAnswerIdle，若按旧版本号
-    /// 复用，修了规则也不生效。
+    /// 规则一变就 +1——已缓存的旧版本证据行不能按新规则复用，否则修了规则也不生效。
+    ///
+    /// v1 → v2（2026-10-28）：异步答题改为结构化识别，v1 证据行对 26.1023.51421
+    /// **不含** AsyncAnswerIdle。
+    /// v2 → v3（2026-11-04）：26.1029.7803.0 的切片推导形态 + 内联合成函数形态；
+    /// v2 证据行对该 build 落账为"不匹配"。
     #[test]
     fn contract_rule_version_bumped_for_structural_async_rule() {
-        assert_eq!(CONTRACT_RULE_VERSION, 2);
+        assert_eq!(CONTRACT_RULE_VERSION, 3);
     }
 
     /// 已识别（包已读、规则已跑）但本操作无匹配 → `operation_contract_unmatched`
