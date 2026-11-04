@@ -30,7 +30,10 @@ export default function ZcodeLocalQueuePanel({
   const visible = view.items.filter(
     (item) => item.state !== "cancelled" && item.state !== "accepted"
   );
-  if (visible.length === 0 && view.recoverableEdits.length === 0 && view.autoDrain) return null;
+  // 2026-11-04 用户裁决：面板只在「队列里还有可见消息（或可恢复的编辑）」时挂出。
+  // 纯暂停（0 条）不再常驻——打断/插队后的暂停语义不变（新排队消息仍需手动
+  // 「继续队列」），只是空队列时不再整块挂出占位。
+  if (visible.length === 0 && view.recoverableEdits.length === 0) return null;
 
   return (
     <section

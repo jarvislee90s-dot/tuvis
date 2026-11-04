@@ -2287,7 +2287,7 @@
     "migrateClaimOwnerTokenFail": "迁移占用调用令牌失败",
     "codexBatchRequiresVerification": "此消息已合并发送，请先在桌面核对整批结果，不能按单条重发。",
     "migrateBatchSignatureFail": "合并发送批次签名列迁移失败",
-    "zcodeControl": "ZCode 官方控制暂不可用，请稍后重试",
+    "zcodeControl": "ZCode 官方控制暂不可用（{{param}}），请稍后重试",
     "zcodeUrlInvalid": "远控链接格式无效，请粘贴 ZCode 应用内复制的完整链接",
     "zcodeUrlScheme": "仅支持 https 官方链接",
     "zcodeUrlHost": "仅支持 zcode.z.ai 官方主机",

@@ -625,7 +625,7 @@ export function ZcodeRemoteSettingsCard({
               >
                 {CONNECTION_REASON_KEYS[connection.reasonCode]
                   ? t(CONNECTION_REASON_KEYS[connection.reasonCode])
-                  : t("errors.zcodeControl")}
+                  : t("errors.zcodeControl", { param: connection.reasonCode })}
               </p>
             )}
             {/* C4 授权状态（只读内存快照；null = 未知，不显示、不猜） */}

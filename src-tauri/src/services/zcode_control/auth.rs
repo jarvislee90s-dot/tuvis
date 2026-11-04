@@ -210,6 +210,10 @@ pub struct TerminalToken {
 /// 端点注入仅测试可见。
 pub struct AuthService {
     http: reqwest::Client,
+    /// 直连兜底客户端：主客户端读系统代理，代理进程/隧道损坏导致**传输层失败**时
+    /// 改走直连重试一次，「系统代理开着但不通」不再挡死授权与终端 token
+    /// （WS 侧对称能力见 relay 的 CONNECT 隧道兜底）。
+    http_direct: reqwest::Client,
     zcode_origin: String,
     /// 测试专用授权 origin 覆盖（生产恒为 `None`，即固定官方 origin）。
     authorize_origin_override: Option<String>,
@@ -267,8 +271,10 @@ enum CallbackOutcome {
 impl AuthService {
     /// 生产工厂：固定官方 origin，不读取任何配置、不暴露 IPC/settings 入口。
     pub fn new(http: reqwest::Client) -> Self {
+        let direct = direct_fallback_client(&http);
         Self {
             http,
+            http_direct: direct,
             zcode_origin: OFFICIAL_ZCODE_ORIGIN.to_owned(),
             authorize_origin_override: None,
             callback_timeout: AUTHORIZE_TIMEOUT,
@@ -294,8 +300,10 @@ impl AuthService {
         authorize_origin: String,
         zcode_origin: String,
     ) -> Self {
+        let direct = direct_fallback_client(&http);
         Self {
             http,
+            http_direct: direct,
             zcode_origin,
             authorize_origin_override: Some(authorize_origin),
             callback_timeout: AUTHORIZE_TIMEOUT,
@@ -401,12 +409,13 @@ impl AuthService {
         }
 
         let response = self
-            .http
-            .post(endpoint_url(&self.zcode_origin, RELAY_TOKEN_PATH))
-            .header(reqwest::header::AUTHORIZATION, format!("Bearer {jwt}"))
-            .json(&serde_json::json!({ "role": "terminal" }))
-            .timeout(HTTP_TIMEOUT)
-            .send()
+            .send_with_direct_fallback(|client| {
+                client
+                    .post(endpoint_url(&self.zcode_origin, RELAY_TOKEN_PATH))
+                    .header(reqwest::header::AUTHORIZATION, format!("Bearer {jwt}"))
+                    .json(&serde_json::json!({ "role": "terminal" }))
+                    .timeout(HTTP_TIMEOUT)
+            })
             .await
             // reqwest 错误可能含 URL/认证头：整体丢弃，只映射常量码
             .map_err(|_| ZcodeError::offline())?;
@@ -910,6 +919,25 @@ impl AuthService {
         result
     }
 
+    /// 双路发送：先主客户端（读系统代理）发起；**传输层失败**（代理拒连/隧道不通/
+    /// 直连网络异常）才用直连客户端重试一次。
+    ///
+    /// 「传输失败」= 本次未取得任何 HTTP 响应（reqwest `send()` 错误无法区分「连接
+    /// 未建立」与「已写出、响应丢失」——对一次性 OAuth code，后者重试必然再失败，
+    /// 但不劣于不重试；已收到响应的情况（状态码/响应体异常）绝不重放，重试无意义
+    /// 且可能重复消费一次性语义）。两路的 reqwest 原始错误都由调用方 `map_err`
+    /// 丢弃、只映射冻结码，安全纪律不变。
+    async fn send_with_direct_fallback(
+        &self,
+        build: impl Fn(&reqwest::Client) -> reqwest::RequestBuilder,
+    ) -> Result<reqwest::Response, reqwest::Error> {
+        let build = &build;
+        match build(&self.http).send().await {
+            Ok(response) => Ok(response),
+            Err(_) => build(&self.http_direct).send().await,
+        }
+    }
+
     /// `POST {zcode_origin}/api/v1/oauth/token`，只读 `data.token`（账号 JWT）。
     async fn exchange(
         &self,
@@ -925,11 +953,12 @@ impl AuthService {
             "state": oauth_state,
         });
         let response = self
-            .http
-            .post(endpoint_url(&self.zcode_origin, OAUTH_TOKEN_PATH))
-            .json(&body)
-            .timeout(HTTP_TIMEOUT)
-            .send()
+            .send_with_direct_fallback(|client| {
+                client
+                    .post(endpoint_url(&self.zcode_origin, OAUTH_TOKEN_PATH))
+                    .json(&body)
+                    .timeout(HTTP_TIMEOUT)
+            })
             .await
             .map_err(|_| ZcodeError::offline())?;
         let status = response.status();
@@ -949,6 +978,19 @@ fn lock_state(state: &Mutex<AuthState>) -> std::sync::MutexGuard<'_, AuthState> 
     state
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// 直连兜底客户端（`no_proxy`）。构建失败（TLS 后端初始化异常）时退化为复用主
+/// 客户端：语义等价于旧单客户端行为，不引入新故障面。
+///
+/// 注意：兜底客户端是**裸 builder**，不继承注入主客户端的自定义项（`.resolve()`/
+/// 自定义根证书/UA 等）——生产主客户端就是 `Client::new()`，两者等价；将来若给
+/// 主客户端加自定义配置，这里要同步评估。
+fn direct_fallback_client(primary: &reqwest::Client) -> reqwest::Client {
+    reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap_or_else(|_| primary.clone())
 }
 
 /// 由内存状态构造授权状态快照（只读：不访问系统存储，也不写回状态）。

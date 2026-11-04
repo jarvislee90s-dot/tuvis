@@ -291,17 +291,29 @@ impl ConfirmationTracker {
                         confirm_mode(&ctx, &obs)
                     }
                     ConfirmationTarget::UserMessage { .. } => {
-                        // 观察证据缺一半（revision 或指纹未取得）→ 不判定，等下一帧。
-                        match (view.revision, fingerprint.as_ref()) {
-                            (Some(revision), Some(id)) => {
+                        // revision 未取得 → 没有任何证据，等下一帧。指纹**缺席本身**
+                        // 不再挡判定：2026-11-04 Windows 实机（证据包
+                        // `zcode-windows-3.17.2-20261104` §三.A）该宿主 build 的
+                        // patch 不带 `logEpoch:seq`，指纹恒缺/恒不前进——此时由
+                        // `executionTerminal.inputId` 对拍路径收口（见 confirm_send
+                        // 因果证据）。
+                        match view.revision {
+                            Some(revision) => {
                                 let obs = SendObservation {
                                     generation,
                                     revision,
-                                    last_user_message_id: id.clone(),
+                                    last_user_message_id: fingerprint
+                                        .as_deref()
+                                        .unwrap_or_default()
+                                        .to_owned(),
+                                    terminal_input_id: view
+                                        .execution_terminal
+                                        .as_ref()
+                                        .map(|terminal| terminal.input_id.clone()),
                                 };
                                 confirm_send(&ctx, &obs)
                             }
-                            _ => ConfirmationOutcome::Inconclusive,
+                            None => ConfirmationOutcome::Inconclusive,
                         }
                     }
                     ConfirmationTarget::Selection { .. } => match view.selection.as_ref() {
@@ -409,7 +421,34 @@ impl ConfirmationTracker {
             }
             match receipt.state {
                 // ACK-only：保持 pending，交给事件泵/计时器（绝不因此升级）。
-                ActionState::Accepted => Vec::new(),
+                // send 回执携带的 `sendAdmission.inputId` 在此刻回填进 pending
+                // 目标：指纹恒不前进的宿主（2026-11-04 Windows 3.17.2 实测）靠它
+                // 与观察 `executionTerminal.inputId` 对拍收口（confirm_send 因果
+                // 证据路径）。inputId 是 id 形状，不落日志、不进投影输出。
+                ActionState::Accepted => {
+                    if receipt.send_admission.is_some() {
+                        for slot in &slots {
+                            let Some(ctx) = pending.get_mut(slot) else {
+                                continue;
+                            };
+                            if ctx.capability != Capability::Send {
+                                continue;
+                            }
+                            if let ConfirmationTarget::UserMessage { sent_input_id, .. } =
+                                &mut ctx.target
+                            {
+                                if sent_input_id.is_none() {
+                                    *sent_input_id = receipt
+                                        .send_admission
+                                        .as_ref()
+                                        .map(|admission| admission.input_id.clone())
+                                        .filter(|id| !id.is_empty());
+                                }
+                            }
+                        }
+                    }
+                    Vec::new()
+                }
                 // 因果终态（如 selection 的 wait_selection 命中）→ confirmed。
                 ActionState::Confirmed => slots
                     .iter()
@@ -1309,6 +1348,11 @@ fn overlay_permit(view: &mut CapabilityView, capability: &str) -> bool {
         "approval_reply" => &mut view.approval_reply,
         "model" => &mut view.model,
         "thought_level" => &mut view.thought_level,
+        // 2026-11-04 Windows 实机探测：arm 白名单补入 `mode` 后，许可叠加面也必须
+        // 认识它，否则许可发放成功但投影永远显示关闭（探测面自相矛盾）。
+        // queue_* 不在许可面：`execute_queue_write` 显式不接受 T8.2 许可放宽
+        // （command.rs），见 evidence.rs `CAPABILITY_NAMES` 的注释。
+        "mode" => &mut view.mode,
         _ => return false,
     };
     flag.enabled = true;
@@ -2210,9 +2254,50 @@ impl ZcodeHub {
         )? {
             return Err(ZcodeError::of(codes::ATTACHMENT_MISSING).into());
         }
-        self.backend
+        // R4 首次真实打断确认：与 /actions 路径同一登记面（2026-11-04 Windows 实机
+        // 探测异常 B：本地队列 stop 原先绕过登记面，interrupt 永不落账）。登记时刻
+        // 捕获 baseline；守卫不在场的收窄逻辑在 `register_confirmations` 内。
+        self.register_confirmations(&action, &[Capability::Interrupt], generation)
+            .await;
+        let staged = self
+            .backend
             .execute_stop_staged(ctx, &current, &action)
-            .await
+            .await;
+        match &staged {
+            Ok(receipt) => {
+                // 回执终态先收口确认（Confirmed 直接落账；ACK-only 保持 pending，
+                // 守卫消失由事件泵收口）。结算用当前代际，纪律与 /actions 一致；
+                // Accepted 后按 spec 重置确认窗（ACK 后 5s 起算——派发内部含
+                // control 重同步/ACK 等有界等待，登记时刻的窗可能已被吃掉大半）。
+                let current_generation = self.lock().generation;
+                self.confirmations.settle_receipt(
+                    action.session_id(),
+                    &[Capability::Interrupt],
+                    receipt,
+                    current_generation,
+                );
+                if receipt.state == ActionState::Accepted {
+                    for deadline in self.confirmations.rearm(
+                        action.session_id(),
+                        generation,
+                        self.confirmation_timeout,
+                    ) {
+                        self.spawn_confirmation_timer(deadline);
+                    }
+                }
+            }
+            Err(super::command::PreparedDispatchError::MayHaveWritten(_)) => {
+                // 写可能在途：保持 pending 交给观察面/计时器（守卫消失即确认；
+                // 到点未决由计时器 sweep 收口），绝不据「未知」降级。
+            }
+            Err(_) => {
+                // 派发失败（CAS 陈旧/端口错误）不构成能力证据：只摘除本动作的
+                // pending，绝不据此降级（与 /actions 错误路径同语义）。
+                self.confirmations
+                    .drop_pending(action.session_id(), &[Capability::Interrupt]);
+            }
+        }
+        staged
     }
     pub(crate) async fn queue_send_prepared(
         &self,
@@ -4050,7 +4135,11 @@ impl ZcodeHub {
                     // 日志头 = 没有消息基线，不开确认窗。
                     let baseline_id = baseline.observation.log_fingerprint.clone();
                     match baseline_id.filter(|id| !id.is_empty()) {
-                        Some(baseline_id) => ConfirmationTarget::UserMessage { baseline_id },
+                        Some(baseline_id) => ConfirmationTarget::UserMessage {
+                            baseline_id,
+                            // 回执未发生：inputId 由 settle_receipt 在 ACK 时回填。
+                            sent_input_id: None,
+                        },
                         None => continue,
                     }
                 }

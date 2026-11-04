@@ -2287,7 +2287,7 @@
     "migrateClaimOwnerTokenFail": "Failed to migrate claim-owner token column",
     "codexBatchRequiresVerification": "This message was sent in a combined batch. Check the entire batch on Desktop before continuing; a single member cannot be resent separately.",
     "migrateBatchSignatureFail": "Failed to migrate the batch signature column",
-    "zcodeControl": "ZCode official control is currently unavailable. Please try again later.",
+    "zcodeControl": "ZCode official control is currently unavailable ({{param}}). Please try again later.",
     "zcodeUrlInvalid": "Invalid remote-control link format — paste the full link copied from the ZCode app",
     "zcodeUrlScheme": "Only official https links are supported",
     "zcodeUrlHost": "Only the official zcode.z.ai host is supported",

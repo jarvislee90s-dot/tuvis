@@ -53,6 +53,7 @@
 //! - **Data（非阻塞）**：保持 `try_send`，队列满时**置位 [`RelayLag`] 并唤醒**消费方，
 //!   然后丢弃该帧（绝不阻塞 actor）；消费方据 lag 显式作废投影并重 GET，绝不只读旧缓存。
 
+use std::str::FromStr;
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -60,6 +61,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures::{SinkExt, StreamExt};
+use hyper_util::client::proxy::matcher::Matcher;
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot, Notify};
 use tokio::time::Instant;
@@ -472,10 +474,11 @@ impl RelayClient {
         let connecting = self.shared.begin_attempt(&device);
         let generation = connecting.generation;
         self.shared.announce_connecting(connecting).await;
-        // 升级 + 握手共用的绝对预算；任何一步超时都按同一终态收口。
-        let connect_deadline = Instant::now() + self.shared.timing.connect_timeout;
 
         // 1) 每次连接现取一次性 terminal token（不缓存、用后即弃）。
+        //    取 token 在升级预算之外（HTTP 超时 30s 自身有界）：预算从取到 token
+        //    之后再起算——否则 token 慢一次就把升级预算吃穿，双路都拿零预算
+        //    （2026-11-04 评审 P2-8）。
         let token_result = self.shared.auth.terminal_token().await;
         if !self.shared.is_current(generation) {
             return Err(ZcodeError::of(codes::STALE_GENERATION));
@@ -504,12 +507,31 @@ impl RelayClient {
         };
         drop(token);
 
+        // 升级 + 握手共用的绝对预算；任何一步超时都按同一终态收口。
+        let connect_deadline = Instant::now() + self.shared.timing.connect_timeout;
+
         // 3) WS 升级（有界等待；原始错误可能含 URL，一律丢弃只映射常量码）。
-        let connected =
-            tokio::time::timeout_at(connect_deadline, tokio_tungstenite::connect_async(url)).await;
+        //    双路兜底：直连先试但只给**总预算一半**（防直连挂起吃光预算让兜底路
+        //    饿死）；传输失败（拒连/超时）且系统配置了代理 → CONNECT 隧道兜底
+        //    （2026-11-04 Windows 实机取证：系统代理开着但隧道不通时直连官方可达；
+        //    反向「直连不可达、代理可达」环境由同一兜底覆盖）。任一路成功即用；
+        //    两路都失败 offline 收口。
+        let connected = tokio::time::timeout_at(connect_deadline, async {
+            let total = connect_deadline.duration_since(Instant::now());
+            match tokio::time::timeout_at(
+                Instant::now() + total / 2,
+                tokio_tungstenite::connect_async(url.as_str()),
+            )
+            .await
+            {
+                Ok(Ok((socket, _response))) => Ok(socket),
+                _ => connect_ws_via_system_proxy(&url).await,
+            }
+        })
+        .await;
         let socket = match connected {
-            Ok(Ok((socket, _response))) => socket,
-            Ok(Err(_)) | Err(_) => {
+            Ok(Ok(socket)) => socket,
+            _ => {
                 self.shared
                     .fail_attempt(generation, ConnectionState::Offline, codes::OFFLINE)
                     .await;
@@ -1291,6 +1313,110 @@ fn build_relay_url(origin: &str, token: &str, device: &DeviceRoute) -> ZResult<S
         }
     }
     Ok(url.to_string())
+}
+
+/// WS 兜底：读系统代理（环境变量 / Windows 注册表 / macOS 系统配置，与 reqwest 的
+/// `system-proxy` 特性同一读法），对官方升级 URL 做 HTTP CONNECT 隧道，隧道成功后把
+/// 裸流交给 tokio-tungstenite 完成 TLS + WS 升级——证书校验与直连同栈（rustls +
+/// webpki 根），不因走代理而放松。
+///
+/// 代理地址**只**来自系统配置，不新增 settings/IPC 入口；CONNECT 的 authority 直接
+/// 取自官方升级 URL 的 host:port。任何一步失败都返回 `Err(())`：调用方保留直连的
+/// 原始错误做冻结码映射（原始错误可能含 URL，一律不落日志）。
+async fn connect_ws_via_system_proxy(url: &str) -> Result<WsStream, ()> {
+    let parsed = reqwest::Url::parse(url).map_err(|_| ())?;
+    // matcher 只按 http/https scheme 匹配：wss 按 https 查（同一 443 / 同源语义）
+    let scheme = match parsed.scheme() {
+        "wss" | "https" => "https",
+        _ => "http",
+    };
+    let dst = http::Uri::from_str(&format!("{}://{}", scheme, host_and_port(&parsed)?))
+        .map_err(|_| ())?;
+    let Some(intercept) = Matcher::from_system().intercept(&dst) else {
+        // 系统未配置代理：没有兜底路（返回 Err 让调用方沿用直连的原始错误）
+        return Err(());
+    };
+    let proxy_scheme = intercept.uri().scheme_str();
+    // 只支持 HTTP(S) 代理：socks5/socks5h 的 userinfo 是代理凭据但语义完全不同——
+    // 把它当 Basic 发给非 HTTP 端点既必然失败也是凭据外泄面（2026-11-04 评审 P2-9）。
+    if !matches!(proxy_scheme, Some("http") | Some("https")) {
+        return Err(());
+    }
+    let proxy_host = intercept.uri().host().ok_or(())?.to_owned();
+    let proxy_port = intercept.uri().port_u16().unwrap_or(match proxy_scheme {
+        Some("https") => 443,
+        _ => 80,
+    });
+    // 认证值是 ready-made "Basic xxx" 头值（hyper-util 解析自代理 URL 的 userinfo）
+    let auth = intercept
+        .basic_auth()
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    connect_ws_via_proxy(url, &format!("{proxy_host}:{proxy_port}"), auth.as_deref()).await
+}
+
+/// 经指定代理建立 CONNECT 隧道并完成 WS 升级（`proxy_authority` = "host:port"）。
+///
+/// 与系统代理解析分离，便于用本机假代理做确定性测试。失败一律收敛为 `Err(())`，
+/// 不携带任何原始错误/代理地址（避免凭据或网络拓扑进入日志）。
+async fn connect_ws_via_proxy(
+    url: &str,
+    proxy_authority: &str,
+    proxy_auth: Option<&str>,
+) -> Result<WsStream, ()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    // 1) TCP 连代理
+    let mut stream = tokio::net::TcpStream::connect(proxy_authority)
+        .await
+        .map_err(|_| ())?;
+    // 2) CONNECT 隧道：authority 直接取自官方升级 URL 的 host:port
+    let target = host_and_port(&reqwest::Url::parse(url).map_err(|_| ())?)?;
+    let mut request = format!("CONNECT {target} HTTP/1.1\r\nHost: {target}");
+    if let Some(auth) = proxy_auth {
+        request.push_str("\r\nProxy-Authorization: ");
+        request.push_str(auth);
+    }
+    request.push_str("\r\n\r\n");
+    stream.write_all(request.as_bytes()).await.map_err(|_| ())?;
+    // 3) 校验代理响应：只读响应头（16KB 上限），状态码解析为数字判 2xx
+    //    （字符串前缀 `2` 会误收 `2000` 之类，2026-11-04 评审 P3-17）。
+    let mut head = Vec::new();
+    let mut chunk = [0u8; 512];
+    loop {
+        let read = stream.read(&mut chunk).await.map_err(|_| ())?;
+        if read == 0 {
+            return Err(());
+        }
+        head.extend_from_slice(&chunk[..read]);
+        if head.windows(4).any(|window| window == b"\r\n\r\n") {
+            break;
+        }
+        if head.len() > 16 * 1024 {
+            return Err(());
+        }
+    }
+    let status = String::from_utf8_lossy(&head)
+        .split_whitespace()
+        .nth(1)
+        .and_then(|status| status.parse::<u16>().ok())
+        .ok_or(())?;
+    if !(200..300).contains(&status) {
+        return Err(());
+    }
+    // 4) 隧道后的裸流交给既有 TLS+WS 栈升级（wss 在此做 rustls 证书校验，与直连
+    //    同栈）。读到 `\r\n\r\n` 后同批残留字节直接丢弃是安全的：TLS 场景下服务端
+    //    不会在客户端发 ClientHello 前抢发数据。
+    let (socket, _response) = tokio_tungstenite::client_async_tls(url, stream)
+        .await
+        .map_err(|_| ())?;
+    Ok(socket)
+}
+
+/// 取 URL 的 `host:port`（端口缺省按 ws/wss 已知默认；IPv6 host 自带方括号）。
+fn host_and_port(url: &reqwest::Url) -> Result<String, ()> {
+    let host = url.host_str().ok_or(())?;
+    let port = url.port_or_known_default().ok_or(())?;
+    Ok(format!("{host}:{port}"))
 }
 
 /// 下一次心跳延迟：`interval ± jitter`（官方 `heartbeatTiming` 公式，下界至少 1ms）。

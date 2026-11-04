@@ -5,8 +5,15 @@
 //! `ConfirmationTracker`（hub.rs），本文件只回答「这条观察算不算确认」。
 //!
 //! 判据（spec R4，控制者裁决口径）：
-//! - send = generation 匹配 AND revision 前进 AND last_user_message_id 变化
-//!   （新用户消息可见——用 id 变化代表可见，绝不存正文）；
+//! - send = generation 匹配 AND revision 前进 AND（last_user_message_id 变化
+//!   **或** 回执登记的 sendAdmission inputId 与观察 `executionTerminal.inputId`
+//!   精确相等）。前者是 spec 原口径（新用户消息可见——用 id 变化代表可见，绝不存
+//!   正文）；后者是 2026-11-04 Windows 实机探测（证据包
+//!   `zcode-windows-3.17.2-20261104` §三.A）补的等价因果证据：该 build 的
+//!   `state.updated` patch 不携带 `logEpoch:seq`，指纹恒不前进，原判据恒假、
+//!   send 首验恒 `timeout_5s`。`executionTerminal.inputId` 与本次 send 回执的
+//!   `sendAdmission.inputId` 同源同值 = 本条消息产生了已终局的回合，因果强度
+//!   与「指纹变化」等同；id 只在回执与判据间对拍，不落日志、不进投影输出。
 //! - model/thought = generation 匹配 AND revision 前进 AND 新快照
 //!   `selection.{provider,model,thought}` 与目标**精确相等**（三字段全等；
 //!   wrong model → 不确认，保持候选）；
@@ -38,6 +45,10 @@ pub(crate) enum ConfirmationTarget {
     UserMessage {
         /// 登记时的指纹；观察侧指纹与它不同 = 有新用户消息可见。
         baseline_id: String,
+        /// 本动作回执的 `sendAdmission.inputId`（回执收口时回填；id 形状）。
+        /// 观察侧 `executionTerminal.inputId` 与它相等 = 本条消息的回合已终局。
+        /// 登记时恒为 `None`（回执尚未发生），由 tracker 在 ACK 收口时补齐。
+        sent_input_id: Option<String>,
     },
     /// 模型/思考档位切换：动作携带的目标三元组（provider 来自登记时刻快照）。
     Selection {
@@ -97,7 +108,11 @@ pub(crate) enum ConfirmationOutcome {
 pub(crate) struct SendObservation {
     pub generation: u64,
     pub revision: u64,
+    /// 日志头指纹（`logEpoch:seq`；快照未携带 = 空串——指纹缺席时只剩
+    /// `terminal_input_id` 这条因果证据可用，见 [`confirm_send`]）。
     pub last_user_message_id: String,
+    /// 观察时刻 `executionTerminal.inputId`（会话无已终局回合 = `None`）。
+    pub terminal_input_id: Option<String>,
 }
 
 /// 纯判据输入（由桥/事件泵/测试构造；不含正文）：选择侧观察。
@@ -173,14 +188,23 @@ pub(crate) fn confirm_send(
     if obs.generation != ctx.generation {
         return ConfirmationOutcome::Inconclusive;
     }
-    let ConfirmationTarget::UserMessage { baseline_id } = &ctx.target else {
+    let ConfirmationTarget::UserMessage {
+        baseline_id,
+        sent_input_id,
+    } = &ctx.target
+    else {
         // send 上下文配了别的目标类型：登记侧接线错误，保守不确认。
         return ConfirmationOutcome::Inconclusive;
     };
     let revision_advanced = obs.revision > ctx.baseline_revision;
     let message_changed =
         !obs.last_user_message_id.is_empty() && obs.last_user_message_id != *baseline_id;
-    if revision_advanced && message_changed {
+    // 因果证据（等价路径）：观察到的已终局回合，inputId 与本动作回执登记的
+    // sendAdmission 精确相等。两侧都是 `Some` 且相等才成立——`None`（回执未到/
+    // 会话无终局回合）绝不确认；不等（别的回合先终局）也绝不代答。
+    let terminal_matches =
+        sent_input_id.is_some() && obs.terminal_input_id.as_deref() == sent_input_id.as_deref();
+    if revision_advanced && (message_changed || terminal_matches) {
         ConfirmationOutcome::Confirmed
     } else {
         ConfirmationOutcome::Inconclusive
@@ -341,6 +365,7 @@ mod tests {
             baseline_revision: revision,
             target: ConfirmationTarget::UserMessage {
                 baseline_id: "u0".to_owned(),
+                sent_input_id: None,
             },
             deadline: Instant::now() + std::time::Duration::from_secs(5),
         }
@@ -352,6 +377,7 @@ mod tests {
             generation,
             revision,
             last_user_message_id: last_user.to_owned(),
+            terminal_input_id: None,
         }
     }
 
@@ -423,6 +449,82 @@ mod tests {
         let after = send_obs(7, 11, "u0");
         assert_eq!(
             confirm_send(&ctx, &after),
+            ConfirmationOutcome::Inconclusive
+        );
+    }
+
+    /// 2026-11-04 Windows 实机判据（证据包 zcode-windows-3.17.2-20261104 §三.A）：
+    /// 指纹恒不前进的宿主上，回执登记的 inputId 与观察 executionTerminal.inputId
+    /// 精确相等 + revision 前进 → confirmed（因果证据路径）。
+    #[test]
+    fn terminal_input_id_match_confirms_send() {
+        let mut ctx = send_ctx(7, 10);
+        ctx.target = ConfirmationTarget::UserMessage {
+            baseline_id: "u0".to_owned(),
+            sent_input_id: Some("input-1".to_owned()),
+        };
+        let after = SendObservation {
+            generation: 7,
+            revision: 11,
+            // 指纹不前进（Windows 实机形态）：原判据恒假。
+            last_user_message_id: "u0".to_owned(),
+            terminal_input_id: Some("input-1".to_owned()),
+        };
+        assert_eq!(confirm_send(&ctx, &after), ConfirmationOutcome::Confirmed);
+    }
+
+    /// 因果证据的咬合面：inputId 不相等（别的回合先终局）绝不代答。
+    #[test]
+    fn terminal_input_id_mismatch_is_not_confirmed() {
+        let mut ctx = send_ctx(7, 10);
+        ctx.target = ConfirmationTarget::UserMessage {
+            baseline_id: "u0".to_owned(),
+            sent_input_id: Some("input-1".to_owned()),
+        };
+        let after = SendObservation {
+            generation: 7,
+            revision: 11,
+            last_user_message_id: "u0".to_owned(),
+            terminal_input_id: Some("input-other".to_owned()),
+        };
+        assert_eq!(
+            confirm_send(&ctx, &after),
+            ConfirmationOutcome::Inconclusive
+        );
+    }
+
+    /// 因果证据的咬合面：观察无终局回合（None）或回执未登记 inputId（None）
+    /// 都不确认——只有两侧 `Some` 且相等才成立。
+    #[test]
+    fn terminal_input_id_none_on_either_side_is_not_confirmed() {
+        let mut ctx = send_ctx(7, 10);
+        ctx.target = ConfirmationTarget::UserMessage {
+            baseline_id: "u0".to_owned(),
+            sent_input_id: None,
+        };
+        let after = SendObservation {
+            generation: 7,
+            revision: 11,
+            last_user_message_id: "u0".to_owned(),
+            terminal_input_id: Some("input-1".to_owned()),
+        };
+        assert_eq!(
+            confirm_send(&ctx, &after),
+            ConfirmationOutcome::Inconclusive
+        );
+        let mut ctx2 = send_ctx(7, 10);
+        ctx2.target = ConfirmationTarget::UserMessage {
+            baseline_id: "u0".to_owned(),
+            sent_input_id: Some("input-1".to_owned()),
+        };
+        let after2 = SendObservation {
+            generation: 7,
+            revision: 11,
+            last_user_message_id: "u0".to_owned(),
+            terminal_input_id: None,
+        };
+        assert_eq!(
+            confirm_send(&ctx2, &after2),
             ConfirmationOutcome::Inconclusive
         );
     }

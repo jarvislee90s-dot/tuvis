@@ -126,6 +126,16 @@ base64 = "0.22"
 # dev-dependency（本机 fake WS），生产依赖不引入 server feature。
 tokio-tungstenite = { version = "0.28", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 
+# ZCode 官方桥接 WS 双路兜底（2026-11-04 Windows 实机取证：系统代理开着但隧道不通时
+# 直连官方可达）：relay 直连失败后读系统代理做 CONNECT 隧道兜底。hyper-util 的
+# Matcher 与 reqwest 的 system-proxy 特性同源（同一份 Windows 注册表/macOS 系统配置/
+# 环境变量读法），default-features=false 只取系统代理解析；`client-proxy` 是
+# matcher 模块的门控特性（此前只写 client-proxy-system 是靠 reqwest 的特性合并才
+# 编过，显式声明消除隐式依赖）。http crate 已在依赖树（1.4.2，锁内零新源码），
+# 仅用于 Uri 类型与 Intercept 的 scheme 匹配
+hyper-util = { version = "0.1", default-features = false, features = ["client-proxy", "client-proxy-system"] }
+http = "1"
+
 # ZCode 系统凭据存储（设计 §3.2）：macOS 只用用户 Keychain 的 apple-native 后端。
 # 版本精确锁定 =3.6.3（MSRV 1.75 < 项目 1.89）；default-features=false 避免其他平台后端。
 [target.'cfg(target_os = "macos")'.dependencies]

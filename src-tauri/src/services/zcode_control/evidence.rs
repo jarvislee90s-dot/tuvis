@@ -1,6 +1,6 @@
 //! T8.2 **仅 debug 证据构建**的「单次验收许可」（`zcode-bridge-evidence`）。
 //!
-//! 生产能力闸（[`CapabilityPolicy`](super::types::CapabilityPolicy)）把八项控制能力
+//! 生产能力闸（[`CapabilityPolicy`](super::types::CapabilityPolicy)）把九项控制能力
 //! 全部关闭且原因码冻结为 `needs_evidence`；没有实机证据就不能开闸。验收未开闸能力时
 //! 又不能伪造证据，因此提供本模块：由**桌面**在指定会话上发放一条内存许可，手机上的
 //! 配对设备随后可以执行**恰一次**用户动作，从而跑出真实证据。
@@ -34,9 +34,18 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// 许可有效期（毫秒）：一次用户动作的窗口，过期即失效。
 pub const EVIDENCE_PERMIT_TTL_MS: u64 = 120_000;
 
-/// 可发放许可的能力名（与 [`CapabilityView`](super::types::CapabilityView) 的八项
+/// 可发放许可的能力名（与 [`CapabilityView`](super::types::CapabilityView) 的
 /// 字段一一对应；桌面命令只接受这些字面量，避免发放永远匹配不到闸门的空许可）。
-pub const CAPABILITY_NAMES: [&str; 8] = [
+/// 2026-11-04 Windows 实机探测（证据包 `zcode-windows-3.17.2-20261104`）：补入
+/// `mode`——原白名单把它挡在 arm 通道外（`ZCODE_CONTROL:invalid_action`），而
+/// `execute_mode` 的 permits 放行通道是现成的（command.rs）。
+///
+/// **queue_edit / queue_now / queue_resume 刻意不在表内**：`execute_queue_write`
+/// 的队列专属闸显式声明「不接受 T8.2 许可放宽」（command.rs），发放许只会被消费
+/// 后仍被拒（许可白烧、动作照旧 `needs_evidence`）。要让队列写可测，先把 permits
+/// 透传进 `execute_queue_write`（或给证据构建加 build 命令条目取证），再补入这三个
+/// 名字——两步都还没做，如实缺位比「看似可测」诚实。
+pub const CAPABILITY_NAMES: [&str; 9] = [
     "send",
     "single_select",
     "multi_select",
@@ -45,6 +54,7 @@ pub const CAPABILITY_NAMES: [&str; 8] = [
     "approval_reply",
     "model",
     "thought_level",
+    "mode",
 ];
 
 /// snooze 允许绑定的四类答案/审批许可（其余能力绝不由 snooze 绑定）。
@@ -55,7 +65,7 @@ const ANSWER_CAPABILITIES: [&str; 4] = [
     "approval_reply",
 ];
 
-/// 能力名是否属于八项受证据闸约束的能力（去空白后精确匹配）。
+/// 能力名是否属于九项受证据闸约束的能力（去空白后精确匹配）。
 pub fn is_known_capability(name: &str) -> bool {
     CAPABILITY_NAMES.contains(&name.trim())
 }
