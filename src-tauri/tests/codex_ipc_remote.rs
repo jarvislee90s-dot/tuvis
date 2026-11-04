@@ -12068,21 +12068,29 @@ async fn r3_concurrent_interrupts_each_withdraw_own_token_only() {
             .unwrap()
     });
 
-    // 两条 interrupt 帧都到达（并发在飞；各自带自己的 pause token）
+    // 两条 interrupt 帧都到达（并发在飞；各自带自己的 pause token）。
+    // 两个任务并发，帧到达顺序不保证是 A→B；必须按帧内的 expectedTurnId 配对。
     let frame1 = recv_within(&mut peer, 10).await;
     assert_eq!(frame1["method"], "thread-follower-interrupt-turn");
     let frame2 = recv_within(&mut peer, 10).await;
     assert_eq!(frame2["method"], "thread-follower-interrupt-turn");
+    let (frame_a, frame_b) = if frame1["params"]["expectedTurnId"] == "t-live" {
+        (frame1, frame2)
+    } else {
+        (frame2, frame1)
+    };
+    assert_eq!(frame_a["params"]["expectedTurnId"], "t-live", "A 帧");
+    assert_eq!(frame_b["params"]["expectedTurnId"], "t-second", "B 帧");
 
     // 交错投放：先 B（error → Rejected），后 A（success → Accepted）
     peer.send(&serde_json::json!({
-        "type": "response", "requestId": frame2["requestId"],
+        "type": "response", "requestId": frame_b["requestId"],
         "resultType": "error", "method": "thread-follower-interrupt-turn",
         "error": { "message": "busy" }
     }))
     .await;
     peer.send(&serde_json::json!({
-        "type": "response", "requestId": frame1["requestId"],
+        "type": "response", "requestId": frame_a["requestId"],
         "resultType": "success", "method": "thread-follower-interrupt-turn",
         "result": { "interruptedTurnId": "t-live", "ok": true }
     }))
