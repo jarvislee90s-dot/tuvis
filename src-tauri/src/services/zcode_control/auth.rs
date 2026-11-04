@@ -3761,4 +3761,103 @@ mod tests {
         assert!(!state.purge_pending, "新代已清义务，旧代失败不得复活");
         assert_eq!(state.problem, None, "旧代失败不得污染新代状态");
     }
+
+    // ───────────────────────── 双路发送兜底（系统代理不通 → 直连重试一次） ─────────────────────────
+
+    /// 主客户端把全部流量塞给必然拒连的代理（127.0.0.1:1），模拟「系统代理开着
+    /// 但代理进程/隧道已坏」：任何请求都会在传输层失败。
+    fn broken_primary_client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .proxy(reqwest::Proxy::all("http://127.0.0.1:1").expect("合成代理 URL"))
+            .build()
+            .expect("broken-primary 客户端")
+    }
+
+    /// 端点指向 fake、主客户端读「坏代理」的服务：直连兜底客户端由构造过程自动生成。
+    fn broken_primary_service(fake: &FakeZcode) -> AuthService {
+        AuthService::with_endpoints(
+            broken_primary_client(),
+            fake.origin.clone(),
+            fake.origin.clone(),
+        )
+    }
+
+    /// 交换：主客户端传输失败（代理拒连）后改走直连兜底，只产生一次交换。
+    #[tokio::test]
+    async fn exchange_falls_back_to_direct_client_on_primary_transport_failure() {
+        let fake = FakeZcode::start().await;
+        let jwt = valid_jwt();
+        fake.set_exchange(200, exchange_ok(&jwt));
+        let service = broken_primary_service(&fake);
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            service.exchange(
+                OAuthProvider::Bigmodel,
+                SYNTHETIC_CODE,
+                "http://127.0.0.1:1/callback",
+                "state",
+            ),
+        )
+        .await
+        .expect("兜底路径不得挂起");
+        let token = result.expect("主路传输失败后必须由直连兜底成功");
+        // 布尔比较：失败断言不得回显 JWT 值
+        assert!(token == jwt, "交换必须返回兜底路径取得的账号 JWT");
+        assert_eq!(
+            fake.exchange_count(),
+            1,
+            "兜底成功只交换一次，不重复消费授权码"
+        );
+    }
+
+    /// 终端 token：主客户端传输失败后同样走直连兜底，取得一次性 token。
+    #[tokio::test]
+    async fn terminal_token_falls_back_to_direct_client_on_primary_transport_failure() {
+        let fake = FakeZcode::start().await;
+        fake.set_relay(200, relay_ok(SYNTHETIC_RELAY_TOKEN, 60));
+        let service = broken_primary_service(&fake);
+        // 模块内可直接读私有状态：直接在内存落一份有效 JWT（不经过 OAuth 回调）
+        let epoch = service.lock_state().epoch;
+        service
+            .commit_jwt(epoch, valid_jwt(), OAuthProvider::Bigmodel)
+            .expect("测试内落 JWT 必须成功");
+
+        let result = tokio::time::timeout(Duration::from_secs(10), service.terminal_token())
+            .await
+            .expect("兜底路径不得挂起");
+        let token = result.expect("主路传输失败后必须由直连兜底取得终端 token");
+        assert!(
+            token.value == SYNTHETIC_RELAY_TOKEN,
+            "终端 token 必须来自兜底路径的 relay 响应"
+        );
+        assert_eq!(token.expires_in, 60);
+        assert_eq!(fake.relay_count(), 1, "兜底成功只申请一次终端 token");
+    }
+
+    /// 两条路都失败（主代理拒连 + 直连目标端口已关闭）→ 冻结码 offline。
+    #[tokio::test]
+    async fn exchange_reports_offline_when_both_paths_fail() {
+        // 先 bind 拿到一个空闲端口再立即释放：端口确定无监听，直连必然拒连
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("占位端口");
+        let port = listener.local_addr().expect("占位地址").port();
+        drop(listener);
+        let origin = format!("http://127.0.0.1:{port}");
+        let service = AuthService::with_endpoints(broken_primary_client(), origin.clone(), origin);
+
+        let code = err_code(
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                service.exchange(
+                    OAuthProvider::Bigmodel,
+                    SYNTHETIC_CODE,
+                    "http://127.0.0.1:1/callback",
+                    "state",
+                ),
+            )
+            .await
+            .expect("两路失败必须及时收敛，不得挂起"),
+        );
+        assert_eq!(code, codes::OFFLINE, "两路都不可达必须报 offline");
+    }
 }

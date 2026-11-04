@@ -3785,4 +3785,278 @@ mod tests {
         );
         server.abort();
     }
+
+    // ───────────────────────── CONNECT 隧道兜底（本机假代理/假 WS） ─────────────────────────
+
+    /// 假 WS 回显服务器：收到的每个 Text 帧加 `echo:` 前缀回发。
+    async fn start_ws_echo_server() -> (u16, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("WS 回显监听");
+        let port = listener.local_addr().expect("WS 回显地址").port();
+        let task = tokio::spawn(async move {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let Ok(mut socket) = tokio_tungstenite::accept_async(stream).await else {
+                return;
+            };
+            while let Some(Ok(message)) = socket.next().await {
+                if let Message::Text(text) = message {
+                    let reply = format!("echo:{}", text.as_str());
+                    if socket.send(Message::text(reply)).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+        (port, task)
+    }
+
+    /// 读一段 HTTP 请求头（截止 `\r\n\r\n`），返回（头文本，同批多读到的剩余字节）。
+    async fn read_proxy_head(stream: &mut TcpStream) -> Option<(String, Vec<u8>)> {
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 1024];
+        loop {
+            let read = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut chunk))
+                .await
+                .ok()?
+                .ok()?;
+            if read == 0 {
+                return None;
+            }
+            buf.extend_from_slice(&chunk[..read]);
+            if let Some(position) = buf.windows(4).position(|window| window == b"\r\n\r\n") {
+                let head = String::from_utf8_lossy(&buf[..position + 4]).to_string();
+                return Some((head, buf[position + 4..].to_vec()));
+            }
+            if buf.len() > 16 * 1024 {
+                return None;
+            }
+        }
+    }
+
+    /// 假 CONNECT 代理（200 隧道）：记录请求头后从 CONNECT 行取 authority 连目标，
+    /// 回 200 并做双向字节转发。
+    async fn start_tunneling_proxy() -> (u16, Arc<Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("假代理监听");
+        let port = listener.local_addr().expect("假代理地址").port();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let recorded = requests.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut client, _)) = listener.accept().await else {
+                    return;
+                };
+                let recorded = recorded.clone();
+                tokio::spawn(async move {
+                    let Some((head, leftover)) = read_proxy_head(&mut client).await else {
+                        return;
+                    };
+                    recorded.lock().unwrap().push(head.clone());
+                    // CONNECT 行形如 `CONNECT host:port HTTP/1.1`
+                    let authority = head
+                        .lines()
+                        .next()
+                        .and_then(|line| line.split_whitespace().nth(1));
+                    let Some(authority) = authority else {
+                        return;
+                    };
+                    let Ok(mut upstream) = TcpStream::connect(authority).await else {
+                        let _ = client.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
+                        return;
+                    };
+                    if client
+                        .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    // 建隧道前同批读到的字节属于隧道内容，先转发给目标
+                    if !leftover.is_empty() && upstream.write_all(&leftover).await.is_err() {
+                        return;
+                    }
+                    let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
+                });
+            }
+        });
+        (port, requests)
+    }
+
+    /// 假代理：读完请求头后回固定原始字节（不建隧道），用于非 2xx / 垃圾响应用例。
+    async fn start_static_proxy(raw_response: Vec<u8>) -> (u16, Arc<Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("假代理监听");
+        let port = listener.local_addr().expect("假代理地址").port();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let recorded = requests.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut client, _)) = listener.accept().await else {
+                    return;
+                };
+                let recorded = recorded.clone();
+                let raw_response = raw_response.clone();
+                tokio::spawn(async move {
+                    let Some((head, _)) = read_proxy_head(&mut client).await else {
+                        return;
+                    };
+                    recorded.lock().unwrap().push(head);
+                    let _ = client.write_all(&raw_response).await;
+                    let _ = client.flush().await;
+                });
+            }
+        });
+        (port, requests)
+    }
+
+    /// 正例：CONNECT 隧道建立后经隧道完成 WS 升级，数据帧可往返；
+    /// 代理收到的请求行精确为 `CONNECT <ws host:port> HTTP/1.1`。
+    #[tokio::test]
+    async fn connect_via_proxy_tunnels_connect_and_completes_ws_upgrade() {
+        let (ws_port, ws_task) = start_ws_echo_server().await;
+        let (proxy_port, proxy_requests) = start_tunneling_proxy().await;
+        let url = format!("ws://127.0.0.1:{ws_port}/synthetic-relay");
+
+        let mut socket = tokio::time::timeout(
+            Duration::from_secs(10),
+            connect_ws_via_proxy(&url, &format!("127.0.0.1:{proxy_port}"), None),
+        )
+        .await
+        .expect("CONNECT 隧道不得挂起")
+        .expect("隧道建立后 WS 升级必须成功");
+
+        // 经隧道发一帧，收一帧回显
+        socket
+            .send(Message::text("probe-frame"))
+            .await
+            .expect("隧道内写帧");
+        let reply = tokio::time::timeout(Duration::from_secs(5), socket.next())
+            .await
+            .expect("隧道内读帧不得挂起")
+            .expect("回显帧必须到达")
+            .expect("回显帧必须可解析");
+        assert_eq!(reply, Message::text("echo:probe-frame"));
+
+        wait_until(
+            || !proxy_requests.lock().unwrap().is_empty(),
+            "代理收到 CONNECT",
+        )
+        .await;
+        let request_line = proxy_requests.lock().unwrap()[0]
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        assert_eq!(
+            request_line,
+            format!("CONNECT 127.0.0.1:{ws_port} HTTP/1.1"),
+            "CONNECT 目标必须是升级 URL 的 host:port"
+        );
+        ws_task.abort();
+    }
+
+    /// 负例：代理回非 2xx 时隧道必须失败（且 CONNECT 已真实到达代理）。
+    #[tokio::test]
+    async fn connect_via_proxy_fails_on_non_2xx_tunnel_response() {
+        let (proxy_port, proxy_requests) =
+            start_static_proxy(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n".to_vec())
+                .await;
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            connect_ws_via_proxy(
+                "ws://127.0.0.1:9/synthetic-relay",
+                &format!("127.0.0.1:{proxy_port}"),
+                None,
+            ),
+        )
+        .await
+        .expect("非 2xx 必须及时收敛");
+        assert!(result.is_err(), "403 隧道响应不得被当作成功");
+
+        wait_until(
+            || !proxy_requests.lock().unwrap().is_empty(),
+            "代理收到 CONNECT",
+        )
+        .await;
+    }
+
+    /// 正例：注入代理凭据时 CONNECT 请求头携带精确的 Proxy-Authorization 行。
+    #[tokio::test]
+    async fn connect_via_proxy_sends_proxy_authorization_header() {
+        let (ws_port, ws_task) = start_ws_echo_server().await;
+        let (proxy_port, proxy_requests) = start_tunneling_proxy().await;
+        let url = format!("ws://127.0.0.1:{ws_port}/synthetic-relay");
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            connect_ws_via_proxy(
+                &url,
+                &format!("127.0.0.1:{proxy_port}"),
+                Some("Basic dXNlcjpwYXNz"),
+            ),
+        )
+        .await
+        .expect("CONNECT 隧道不得挂起");
+        assert!(result.is_ok(), "携带代理凭据的隧道必须成功升级");
+
+        wait_until(
+            || !proxy_requests.lock().unwrap().is_empty(),
+            "代理收到 CONNECT",
+        )
+        .await;
+        let head = proxy_requests.lock().unwrap()[0].clone();
+        assert!(
+            head.lines()
+                .any(|line| line == "Proxy-Authorization: Basic dXNlcjpwYXNz"),
+            "必须发送精确的代理认证头"
+        );
+        ws_task.abort();
+    }
+
+    /// 负例：代理回非 HTTP 垃圾字节时必须失败，不得误判为隧道成功。
+    #[tokio::test]
+    async fn connect_via_proxy_rejects_garbage_tunnel_response() {
+        let (proxy_port, _proxy_requests) =
+            start_static_proxy(b"not-http-garbage-bytes\r\n\r\n".to_vec()).await;
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            connect_ws_via_proxy(
+                "ws://127.0.0.1:9/synthetic-relay",
+                &format!("127.0.0.1:{proxy_port}"),
+                None,
+            ),
+        )
+        .await
+        .expect("垃圾响应必须及时收敛");
+        assert!(result.is_err(), "非 HTTP 响应不得被当作隧道成功");
+    }
+
+    /// `host_and_port`：显式端口直取；ws→80、wss→443 默认；IPv6 host 自带方括号。
+    #[test]
+    fn host_and_port_defaults_and_explicit_ports() {
+        let parse = |url: &str| reqwest::Url::parse(url).expect("测试 URL 应合法");
+        let authority = |url: &str| host_and_port(&parse(url)).expect("URL 必须能取 host:port");
+
+        assert_eq!(
+            authority("ws://127.0.0.1:8080/synthetic"),
+            "127.0.0.1:8080",
+            "显式端口必须直取"
+        );
+        assert_eq!(
+            authority("ws://relay.example/synthetic"),
+            "relay.example:80",
+            "ws 缺省端口是 80"
+        );
+        assert_eq!(
+            authority("wss://relay.example/synthetic"),
+            "relay.example:443",
+            "wss 缺省端口是 443"
+        );
+        assert_eq!(
+            authority("ws://[::1]:8080/synthetic"),
+            "[::1]:8080",
+            "IPv6 host 必须带方括号"
+        );
+    }
 }
