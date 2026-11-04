@@ -275,8 +275,7 @@ fn parse_claude_jsonl(
         .ok()
         .and_then(|m| SystemTime::now().duration_since(m).ok())
         .map(|age| {
-            age.as_secs_f32()
-                < crate::monitor::app_status::CONTENT_FRESH_CLAUDE_MS as f32 / 1000.0
+            age.as_secs_f32() < crate::monitor::app_status::CONTENT_FRESH_CLAUDE_MS as f32 / 1000.0
         })
         .unwrap_or(false);
 
