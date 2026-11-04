@@ -32,7 +32,7 @@
 use super::app_status::{
     derive_app_status, entry_origin_from_flags, overlay_completion_with_pending,
     overlay_stale_with_descendants, AppEntryKind, DescendantActivity, EntryOrigin,
-    APP_STATUS_STALE_MS,
+    FALLBACK_FRESH_MS,
 };
 use super::git::get_github_url;
 use super::project::project_name_from_path;
@@ -50,11 +50,9 @@ const CARD_WINDOW_MS: i64 = 24 * 3600 * 1000;
 const RECENT_SESSIONS_LIMIT: usize = 100;
 /// 尾部消息读取深度（与既有工具 JSONL 尾读 500 行同档；ZCode 按消息计）
 const TAIL_MESSAGES_LIMIT: usize = 200;
-/// 无语义条目兜底的新鲜阈值（与 APP 形态 300s 停更阈值同源）
-const FALLBACK_FRESH_MS: i64 = APP_STATUS_STALE_MS as i64;
 
 /// 子代理活跃窗口（卡片「N 个子代理」计数口径）：窗口内有落库的子行才算活跃，
-/// 与 Claude 的 30s 活跃口径对齐（区别于停更仲裁的 300s 窗口 FALLBACK_FRESH_MS）
+/// 与 Claude 的 30s 活跃口径对齐（区别于停更仲裁的 300s 窗口 `FALLBACK_FRESH_MS`）
 const SUBAGENT_ACTIVE_WINDOW_MS: i64 = 30_000;
 /// 标题降级截断（与 WorkBuddy 60 字符口径一致）
 const TITLE_TRUNC: usize = 60;
