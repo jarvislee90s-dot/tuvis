@@ -7087,6 +7087,16 @@ async fn publish_projection(adapter: &DesktopIpcAdapter, key: &ThreadKey) {
         // → 重观察后再预留。
         let p = adapter.stamp_queue_pause(key, p);
         let p = adapter.stamp_probe_status(p).await;
+        // L2（2026-11-05）：**SSE 推送路径也要写穿持久提示**。
+        // 此前全仓库只有 `projection()` 尾部（:4730）会 persist，而桌面端答题走
+        // 的是本条发布路径（handle_state_changed → publish_projection）——于是
+        // 「移动端视图实时清卡、DB hint 仍停在 pending」，页面没开该会话时更是
+        // 无限期滞后；下次投影又会拿旧 hint 产出占位/待作答。
+        // persist 自带「fact 未变不写」去重，且此处镜像锁已释放（本就如此）、
+        // persist 只取 hints 缓存短锁 + spawn_blocking 落库——锁纪律不变。
+        adapter
+            .persist_interaction_hints(key, &p.async_questions)
+            .await;
         adapter.publish_fresh_projection(key, p).await;
     }
 }

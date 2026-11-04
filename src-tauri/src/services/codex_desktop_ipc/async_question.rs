@@ -499,12 +499,38 @@ impl AsyncQuestionProjector {
         }
         let turns = view.turns();
         let questions = found_questions(state);
+        let thread_hints: Vec<&InteractionHint> = hints
+            .iter()
+            .filter(|hint| hint.thread_id == key.thread_id)
+            .collect();
         if questions.is_empty() {
             // R18：当前窗口里**没有可发现的题**时，持久提示仍要为「已知但未加载」
             // 的题给出 Unknown 占位——不能把"没看到"当"没答过"（尤其重启后）。
-            return unknown_placeholders(key, lease, hints);
+            //
+            // L1（2026-11-05）：占位也要先过一遍信封——题干滑出窗口但作答已在
+            // 窗口内时，这是「已答」而非「未知」。
+            let known = hint_derived_keys(&thread_hints);
+            let answers = answered_map(&turns, &known);
+            return unknown_placeholders(key, lease, hints)
+                .into_iter()
+                .map(|mut view| {
+                    if answers.contains_key(&view.question_key) {
+                        view.state = InteractionState::Answered;
+                        view.actionable = false;
+                        view.disabled_reason_code = None;
+                    }
+                    view
+                })
+                .collect();
         }
-        let known: HashSet<String> = questions.iter().map(|q| q.question_key.clone()).collect();
+        // L1：配对集合 = 窗口内可见题 ∪ 本线程 hint 派生的题身份。
+        // 题干条目被 Desktop 尾窗淘汰后，`found_questions` 看不到它，但 hint 仍
+        // 记着 `source_item_id + question_index`，可无损重建 question_key
+        // （与 `unknown_placeholders` 同源）。不并进去的话，作答信封会因
+        // 键不在 `known` 而被静默丢弃（`answered_map` 的防假清卡门），旧题
+        // 永远派生不出 Answered → hint 永久滞留 pending → 卡不消失。
+        let mut known: HashSet<String> = questions.iter().map(|q| q.question_key.clone()).collect();
+        known.extend(hint_derived_keys(&thread_hints));
         let answers = answered_map(&turns, &known);
         let epoch = lease.map(|lease| lease.epoch).unwrap_or(0);
         let generation = lease.map(|lease| lease.generation).unwrap_or(0);
@@ -589,16 +615,40 @@ impl AsyncQuestionProjector {
         }
         // R18：提示里存在、但当前窗口发现不到的题（原 turn/条目缺页、重启丢窗口）
         // → Unknown 占位（不可提交），而不是从列表里消失。
-        for placeholder in unknown_placeholders(key, lease, hints) {
-            if !views
+        //
+        // L1（2026-11-05）：占位若已被作答信封命中（题干滑出窗口、作答仍在窗口内）
+        // → 纠正为 Answered，让 persist 把 hint 写成 answered，卡随之消失。
+        // 未命中者保持 Unknown（**不猜已答**，且 Unknown 在前端不算 live，
+        // 不会渲染成待作答卡）。
+        for mut placeholder in unknown_placeholders(key, lease, hints) {
+            if views
                 .iter()
                 .any(|view| view.question_key == placeholder.question_key)
             {
-                views.push(placeholder);
+                continue;
             }
+            if answers.contains_key(&placeholder.question_key) {
+                placeholder.state = InteractionState::Answered;
+                placeholder.actionable = false;
+                placeholder.disabled_reason_code = None;
+            }
+            views.push(placeholder);
         }
         views
     }
+}
+
+/// 由本线程的持久提示重建题目标识集合（`questionItemId`）。
+///
+/// L1：`found_questions` 只看当前窗口，题干条目被尾窗淘汰后就看不见了；但 hint
+/// 保留了 `source_item_id + question_index`，`question_item_id` 可无损重建
+/// （与 [`unknown_placeholders`] 同源）。把它并入 `answered_map` 的 `known`
+/// 集合，作答信封才能纠正「题已在窗口外」的旧题。
+fn hint_derived_keys(hints: &[&InteractionHint]) -> HashSet<String> {
+    hints
+        .iter()
+        .map(|hint| question_item_id(&hint.source_item_id, hint.question_index))
+        .collect()
 }
 
 /// R18：由持久提示构造「已知但当前不可见」的 Unknown 占位（无正文、不可提交）。
@@ -1441,6 +1491,81 @@ mod r18_placeholder_tests {
         }
     }
 
+    // ---- L1 用到的 canonical 构造器（与本文件主测试模块同形；模块内本地副本，
+    //      避免跨 `mod` 可见性改动）----
+
+    /// 构造 canonical state：`turns` = [(turn_id, status, items, None, None)]
+    fn canonical(turns: &[(&str, &str, Vec<Value>)], is_complete: bool) -> Value {
+        let mut entities = serde_json::Map::new();
+        let mut entries = Vec::new();
+        for (turn_id, status, items) in turns {
+            let entity = json!({
+                "turnId": turn_id,
+                "status": status,
+                "items": items,
+            });
+            let map_key = format!("turn:{turn_id}");
+            entities.insert(map_key.clone(), entity);
+            entries.push(json!({"key": map_key, "value": map_key}));
+        }
+        json!({
+            "turnHistory": {
+                "history": {
+                    "generation": 1,
+                    "isComplete": is_complete,
+                    "entitiesByKey": entities,
+                    "islands": [{"id": "island-1", "entries": entries}],
+                }
+            },
+            "requests": [],
+            "threadRuntimeStatus": {"type": "idle"},
+        })
+    }
+
+    fn question_item(item_id: &str, title: &str, options: &[&str]) -> Value {
+        json!({
+            "type": "agentMessage",
+            "id": item_id,
+            "text": "题",
+            "phase": "final_answer",
+            "delivery": "async",
+            "questions": [{"title": title, "options": options}],
+        })
+    }
+
+    fn user_item(id: &str, text: &str) -> Value {
+        json!({
+            "type": "userMessage",
+            "id": id,
+            "content": [{"type": "text", "text": text, "text_elements": []}],
+        })
+    }
+
+    /// 策略允许异步答题的 ops（`OperationContext::default()` 会让题落
+    /// TemporarilyBlocked，掩盖「真待答」的断言）。
+    fn ops_allowing_async() -> EffectiveOperations {
+        use crate::services::codex_desktop_ipc::capability::{CodexOperation, ContractMatch};
+        let mut context = OperationContext {
+            target_fresh: true,
+            auto_adapt_enabled: true,
+            runtime_status: "idle".into(),
+            read_evidence: true,
+            contract_identified: true,
+            ..Default::default()
+        };
+        context.contract.insert(
+            CodexOperation::AsyncAnswerIdle,
+            ContractMatch {
+                method: "thread-follower-start-turn".into(),
+                base_version: 2,
+                request_rule: "conversationId+turnStart".into(),
+                response_rule: "result.result".into(),
+                semantic_rule: "test".into(),
+            },
+        );
+        OperationPolicy.evaluate(&context)
+    }
+
     /// 重启后窗口完全不含该题：提示仍给出 Unknown 占位（不可提交；无正文）。
     #[test]
     fn r18_hint_yields_unknown_placeholder_when_window_has_no_questions() {
@@ -1488,6 +1613,142 @@ mod r18_placeholder_tests {
             &[hint("call-old", 0, "answered")],
         );
         assert!(views.is_empty());
+    }
+
+    // ==== L1（2026-11-05）：hint 身份纳入信封配对，纠正"题干滑出窗口"的滞留 ====
+
+    /// 构造「题干已滑出窗口、但作答信封仍在窗口里」的 canonical state：
+    /// 只有一条承载信封的 userMessage，没有 agentMessage.questions[]。
+    fn state_with_envelope_only(item: &str, answer: &str) -> Value {
+        let echo = compose_async_answer(item, 0, "旧题", answer);
+        canonical(
+            &[(
+                "turn-answer",
+                "completed",
+                vec![user_item("u-answer", &echo)],
+            )],
+            true,
+        )
+    }
+
+    /// **L1 核心**：题干条目已不在窗口（被尾窗淘汰），但 hint 记得这道题的身份，
+    /// 且作答信封仍在窗口里 → 必须派生 Answered（而不是 Unknown 占位）。
+    ///
+    /// 修复前：`answered_map` 的 `known` 只含窗口内可见题 → 信封因键不匹配被丢弃
+    /// → 只能产出 Unknown 占位 → hint 永远纠不回 answered → 卡滞留。
+    #[test]
+    fn hint_derived_key_matches_envelope_after_question_scrolled_out() {
+        let state = state_with_envelope_only("call-old", "用户选的答案");
+        let ops = ops_allowing_async();
+        let views = AsyncQuestionProjector.project_with_hints(
+            &key(),
+            None,
+            &state,
+            &ops,
+            &[hint("call-old", 0, "pending")],
+        );
+        assert_eq!(views.len(), 1);
+        assert_eq!(
+            views[0].state,
+            InteractionState::Answered,
+            "hint 身份 + 信封在场 → 必须判已答（卡应消失）"
+        );
+        assert!(!views[0].actionable);
+        assert!(views[0].disabled_reason_code.is_none());
+    }
+
+    /// hint 只有题身份、窗口里**没有**信封 → 仍产出 Unknown 占位（不猜已答）。
+    /// 这条保证 L1 没有放松「不伪造已答」的纪律。
+    #[test]
+    fn hint_only_question_without_envelope_yields_unknown_not_pending() {
+        // 窗口里有无关内容，但没有该题的信封
+        let state = canonical(
+            &[(
+                "turn-other",
+                "completed",
+                vec![user_item("u-other", "聊点别的")],
+            )],
+            true,
+        );
+        let ops = ops_allowing_async();
+        let views = AsyncQuestionProjector.project_with_hints(
+            &key(),
+            None,
+            &state,
+            &ops,
+            &[hint("call-old", 0, "pending")],
+        );
+        assert_eq!(views.len(), 1, "hint 非 answered → 仍给占位");
+        assert_eq!(
+            views[0].state,
+            InteractionState::Unknown,
+            "无信封不得猜已答，但也不得降级成 Pending（会渲染成待作答卡）"
+        );
+        assert!(!views[0].actionable);
+    }
+
+    /// **回归锁**：窗口中**仍可见**的题不受 L1 影响 —— coverage 完整且无信封时
+    /// 必须继续是 Pending + actionable（真待答的卡不得被误降级）。
+    #[test]
+    fn visible_question_still_pending_when_coverage_complete() {
+        let state = canonical(
+            &[(
+                "turn-1",
+                "completed",
+                vec![question_item("call-live", "选一个", &["甲", "乙"])],
+            )],
+            true,
+        );
+        let ops = ops_allowing_async();
+        // 同时存在一条指向**别的**旧题的 hint
+        let views = AsyncQuestionProjector.project_with_hints(
+            &key(),
+            None,
+            &state,
+            &ops,
+            &[hint("call-old", 0, "pending")],
+        );
+        let live = views
+            .iter()
+            .find(|v| v.question_key == question_item_id("call-live", 0))
+            .expect("可见题必须在");
+        assert_eq!(live.state, InteractionState::Pending, "真待答不得被误降级");
+        assert!(live.actionable);
+    }
+
+    /// 窗口内多题时，旧题的 hint 存在不影响新题派生；旧题按 hint 收口。
+    #[test]
+    fn visible_question_unaffected_by_other_hints() {
+        // 窗口里有一道新题（可见、未答）
+        let state = canonical(
+            &[(
+                "turn-new",
+                "completed",
+                vec![question_item("call-new", "新问题", &["A", "B"])],
+            )],
+            true,
+        );
+        let ops = ops_allowing_async();
+        let mut old = hint("call-old", 0, "pending");
+        old.source_turn_id = "t-old".into();
+        let views = AsyncQuestionProjector.project_with_hints(&key(), None, &state, &ops, &[old]);
+
+        let new = views
+            .iter()
+            .find(|v| v.question_key == question_item_id("call-new", 0))
+            .expect("新题必须在");
+        assert_eq!(new.state, InteractionState::Pending);
+        assert!(new.actionable);
+
+        let old_view = views
+            .iter()
+            .find(|v| v.question_key == question_item_id("call-old", 0))
+            .expect("旧题按 hint 产出占位");
+        assert_eq!(
+            old_view.state,
+            InteractionState::Unknown,
+            "无信封 → 占位而非待答"
+        );
     }
 }
 

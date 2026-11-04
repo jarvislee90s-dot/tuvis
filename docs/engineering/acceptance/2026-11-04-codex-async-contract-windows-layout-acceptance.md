@@ -154,14 +154,73 @@ let legacy = resources.join("codex-cli").join("bin").join("codex.exe");    // �
 
 ## 6. 已知限制
 
-- **桌面已答 → 移动端自动消失仍未根治**：Tuvis 判断「已答」的唯一手段是
-  「userMessage 文本信封 + questionItemId 逐字符配对」（`async_question.rs:424-452`），
-  而 Codex 的 canonical state **没有** answered/resolved 字段。若镜像漏掉作答事件，
-  投影永远 pending。本批只提供**手动收纳**作为出口；服务端主动对账（有活卡 + 转 idle
-  时触发有界重取）为后续 follow-up。
 - **compat 档不因此解锁写入**：`profile_for` 白名单未新增该 build，
   写能力仍走契约证据门控（`auto_adapt_enabled && contract`）。
   若要 shipped 档位，需补完整只读探测取证后单独登记。
 - **macOS 未验证**：本批形态变化取证仅限 Windows 26.1029.7803.0；
   macOS 包若出现同类内联/推导形态，v3 规则同样适用（形态判据平台无关），
   但未实测。
+
+## 6.1 过期答题卡自动纠正（L1 + L2，2026-11-05 追加）
+
+### 问题
+
+桌面端已作答后，移动端仍挂出待作答卡。手动收纳是唯一出口（用户兜底）。
+
+### 为什么不按「对话推进程度」自动隐藏
+
+用户曾提议「卡片出新题后，若正文已多出很多内容就绕过该卡」。**该方案不可行**：
+
+- `request_user_input_async` 是**非阻塞**语义：模型提问后继续干活，用户可很久不答。
+- 仓库有钉死测试 `f08p_t03_historical_unanswered_survives_completed`
+  （`async_question.rs:885-915`）：turn-1 带题且 completed + turn-2 无关消息
+  → 仍 `Pending` + `actionable`。
+- spec `2026-10-27:49` 明文禁止「回合完成自动等同异步题已答」。
+- 真机台账 `async-question-ledger.sanitized.json:30-38`：官方客户端对一道题
+  **挂 5 小时、跨多轮对话**才被作答。
+- 反直觉点：`coverage == Complete` 且 `answered_map` 为空时，「后面有很多 turn」
+  恰恰**证明用户聊了很多但真没答**——隐藏卡就是隐藏真待答。
+
+### 实际断点（两处）
+
+1. **`answered_map` 的 `known` 集合只含窗口内可见题**（原 `async_question.rs:441-444`
+   的成员检查）：题干条目被 Desktop 尾窗淘汰后，作答信封因键不匹配被静默丢弃
+   → 永远派生不出 `Answered` → hint 永久滞留 `pending`。
+2. **persist 只有一个调用点**（`adapter.rs:4730`，在 `projection()` 尾部）：
+   SSE 推送路径（`publish_projection`）不落库 → 桌面答题后视图实时清了，
+   但 DB hint 滞后；页面未开该会话时无限期。
+
+### 修复
+
+**L1 — 信封配对覆盖窗口外的题**（`async_question.rs`）
+
+- `known` = 可见题 ∪ 本线程 hint 派生 key（`hint_derived_keys`，
+  由 `source_item_id + question_index` 无损重建 `questionItemId`）。
+- `questions.is_empty()` 早退分支与主循环后的占位合并，均对命中信封的占位
+  改判 `Answered`。
+- **必守**：仍可见的题继续走 `coverage_since`（Complete → `Pending`），
+  绝不降级；未命中信封的 hint-only 题保持 `Unknown`（前端不算 `live`，
+  不渲染成待作答卡）——**不猜已答**。
+
+**L2 — SSE 路径也写穿 hint**（`adapter.rs`）
+
+- `publish_projection` 发布前补 `persist_interaction_hints`（复用既有方法，
+  自带「fact 未变不写」去重；镜像锁已释放，锁纪律不变）。
+
+### 新增测试（`async_question.rs`）
+
+| 用例 | 断言 |
+|---|---|
+| `hint_derived_key_matches_envelope_after_question_scrolled_out` | 题干不在窗口 + 信封在 → `Answered` |
+| `hint_only_question_without_envelope_yields_unknown_not_pending` | 无信封 → `Unknown`（非 `Pending`），不可提交 |
+| `visible_question_still_pending_when_coverage_complete` | **回归锁**：可见题仍 `Pending` + `actionable` |
+| `visible_question_unaffected_by_other_hints` | 多题并存时旧题收口不影响新题 |
+
+`cargo test --lib codex_desktop_ipc`：**302 passed**（原 298 + 4）。
+
+### 剩余边界（L1 无法覆盖，手动收纳仍是出口）
+
+- **桌面用非官方入口作答**（未生成 `<send_user_message_question_reply>` 信封）
+  → Tuvis 无法确认已答，按纪律不猜。
+- **IPC 漏帧且镜像从不重取**（`ensure_thread` 对新鲜镜像短路）→ 信封根本没进镜像。
+- **信封与题干都滑出窗口** → 无证据可配对。
