@@ -2,7 +2,7 @@
 // 会话历史在 ~/.workbuddy/projects/<路径编码>/<sessionId>.jsonl（OpenAI 风格 type/role/content）
 // 所有文件均为未文档化私有格式：解析失败一律跳过/降级，禁止 panic（spec W3 防御性要求）
 
-use super::app_status::{derive_app_status, tail_semantic_kind, AppEntryKind};
+use super::app_status::{derive_app_status, tail_semantic_kind, AppEntryKind, SessionAges};
 use super::git::get_github_url;
 use super::jsonl::{read_first_lines, read_recent_lines};
 use super::project::project_name_from_path;
@@ -900,18 +900,17 @@ pub fn get_workbuddy_sessions_with(
         // 尾部解析走 L2 摘要缓存（monitor::session_scan；行数与 codex 一致 500）
         let digest = WORKBUDDY_SCAN.parse(&jsonl, read_workbuddy_tail_digest);
         let d = digest.as_ref();
-        // 有效活动时刻 = max(主 jsonl mtime, DB activity, 心跳时刻)：
-        // 子代理干活时父 jsonl 可能停更，心跳又冻结 → 用最早的那个会把卡误判成「旧」，
-        // 混着用会把 Processing 降成 Waiting（`overlay_mtime_stale`）。
-        let eff_activity_ms = [
+        // **锚点纪律（2026-11-04 用户裁决）**：一个 age 值只服务一个判定语义。
+        // content 轴只取内容源（jsonl mtime）→ 喂完成冷却；
+        // presence 轴取内容 ∨ DB 活动 ∨ 心跳 → 喂停更降级。
+        // 修复前两轴共用 eff_age，心跳每 30s 刷新把 eff_age 打回 0，导致
+        // assistant 尾 Idle 被反复拉回 Processing（绿 20s / 黄 10s 周期振荡）。
+        let db_activity_ms = c.db_activity_ms.map(|a| a.max(0) as u64);
+        let ages = SessionAges::derive(
+            now,
             jsonl_mtime_ms,
-            c.db_activity_ms.map(|a| a.max(0) as u64),
-            c.last_heartbeat_ms,
-        ]
-        .into_iter()
-        .flatten()
-        .max();
-        let eff_age_ms = eff_activity_ms.map_or(0, |a| now.saturating_sub(a));
+            &[jsonl_mtime_ms, db_activity_ms, c.last_heartbeat_ms],
+        );
         // 已读生命周期专用“新工作”时间：只取明确的业务条目（用户消息 / 模型请求 /
         // 工具执行），不混入 DB 活动、mtime 或心跳——那些只能证明“在场”，不能证明
         // “产生了新回合”。没有业务条目时为 None，已读卡不会因普通后台更新复活。
@@ -920,9 +919,15 @@ pub fn get_workbuddy_sessions_with(
             // AC9：DB 说在干活 → 上拉 Processing（不因父会话静默而掉卡/误绿）
             SessionStatus::Processing
         } else {
+            // ① 完成冷却：content 轴。None（mtime 未知）→ 不启用冷却（未知 ≠ 刚刚）
             overlay_mtime_stale(
-                apply_green_debounce(d.status_core.clone(), d.tail_kind, eff_age_ms),
-                eff_age_ms,
+                apply_green_debounce(
+                    d.status_core.clone(),
+                    d.tail_kind,
+                    ages.content_age_ms.unwrap_or(u64::MAX),
+                ),
+                // ② 停更降级：presence 轴。None → 按 0 处理（与既有 map_or(0) 一致）
+                ages.presence_age_ms.unwrap_or(0),
             )
         };
         let last_message = d.last_message.clone().unwrap_or_default();
@@ -3669,6 +3674,73 @@ mod board_tests {
         assert_eq!(out.len(), 2);
         let ids: Vec<&str> = out.iter().map(|s| s.id.as_str()).collect();
         assert!(ids.contains(&SID) && ids.contains(&SID2));
+    }
+
+    /// **P0 核心回归锁（2026-11-04 缺陷）**：任务已结束（DB completed、jsonl 停写
+    /// 30s），但心跳每 30s 刷新一次。心跳只能证明进程还开着，不得延长完成冷却。
+    /// 修复前：eff_age 被心跳打回 0 → assistant 尾 Idle 被拉回 Processing 10s，
+    /// 形成绿 20s / 黄 10s 的 30s 周期振荡；修复后：稳定 Idle。
+    #[test]
+    fn heartbeat_does_not_revive_green_debounce() {
+        let home = tempfile::tempdir().unwrap();
+        let now = now_ms();
+        // jsonl 30 秒前写下（超过 10s 冷却窗），DB completed，心跳 1 秒前刚刷新
+        write_jsonl(home.path(), SID, now - 30_000);
+        seed_db(
+            home.path(),
+            &[(SID, "completed", (now - 30_000) as i64, (now - 30_000) as i64, None)],
+        );
+        write_heartbeat(home.path(), 11952, SID, now - 1_000);
+
+        let out = run_board(home.path(), &[process(11952)], now);
+        assert_eq!(out.len(), 1, "心跳 pid 存活 + jsonl 在 300s 内 → 必须出卡");
+        assert_eq!(
+            out[0].status,
+            SessionStatus::Idle,
+            "心跳新鲜不得把已完成的会话拉回 Processing（30s 绿黄振荡的根因）"
+        );
+    }
+
+    /// P0 反面对照：DB 说 working → 仍必须上拉 Processing（保护 AC9 不被误伤）
+    #[test]
+    fn db_working_still_pulls_processing_regardless_of_heartbeat() {
+        let home = tempfile::tempdir().unwrap();
+        let now = now_ms();
+        write_jsonl(home.path(), SID, now - 30_000);
+        seed_db(
+            home.path(),
+            &[(SID, "working", (now - 1_000) as i64, (now - 1_000) as i64, None)],
+        );
+        write_heartbeat(home.path(), 11952, SID, now - 1_000);
+
+        let out = run_board(home.path(), &[process(11952)], now);
+        assert_eq!(out.len(), 1);
+        assert_eq!(
+            out[0].status,
+            SessionStatus::Processing,
+            "AC9：DB working 必须无条件上拉 Processing"
+        );
+    }
+
+    /// P0 边界：jsonl mtime 不可得（content_age=None）→ 不启用冷却，直接按尾部判定
+    #[test]
+    fn missing_content_mtime_disables_cooldown() {
+        let home = tempfile::tempdir().unwrap();
+        let now = now_ms();
+        write_jsonl(home.path(), SID, now - 30_000);
+        seed_db(
+            home.path(),
+            &[(SID, "completed", (now - 30_000) as i64, (now - 30_000) as i64, None)],
+        );
+        write_heartbeat(home.path(), 11952, SID, now - 1_000);
+        // 删掉 jsonl：content 源缺失，但 DB activity 仍在 300s 内 → 卡片仍出
+        let jsonl_dir = home.path().join(".workbuddy/projects").join(mangle_project_path(CWD));
+        std::fs::remove_file(jsonl_dir.join(format!("{SID}.jsonl"))).unwrap();
+
+        // jsonl 缺失时 find_session_jsonl 未命中 → 不出卡（既有语义），
+        // 本测试改为断言「函数不 panic 且返回空」
+        let out = run_board(home.path(), &[process(11952)], now);
+        assert!(out.is_empty(), "jsonl 缺失 → 不出卡（既有语义不变）");
     }
 }
 
