@@ -1716,6 +1716,47 @@ mod r18_placeholder_tests {
         assert!(live.actionable);
     }
 
+    /// **安全锁**：hint 里存在 `answered` 记录时，它派生的 key 也会进入
+    /// `answered_map` 的 `known`——必须确认这**不会**把别的题的信封误配过来。
+    /// `question_key` 含 `source_item_id`（唯一工具调用 id）与 index，逐字符
+    /// 精确匹配，不存在跨题串号的可能；本测试把这条不变量钉死。
+    #[test]
+    fn answered_hint_key_does_not_capture_other_questions_envelope() {
+        // 窗口里：新题可见（未答）+ 另一道题的作答信封
+        let echo = compose_async_answer("call-other", 0, "别的题", "别的答案");
+        let state = canonical(
+            &[
+                (
+                    "turn-new",
+                    "completed",
+                    vec![question_item("call-new", "新问题", &["A", "B"])],
+                ),
+                ("turn-other", "completed", vec![user_item("u-other", &echo)]),
+            ],
+            true,
+        );
+        let ops = ops_allowing_async();
+        // 一条 answered 的旧 hint（题在窗口外）
+        let views = AsyncQuestionProjector.project_with_hints(
+            &key(),
+            None,
+            &state,
+            &ops,
+            &[hint("call-old", 0, "answered")],
+        );
+        // 新题不得被影响
+        let new = views
+            .iter()
+            .find(|v| v.question_key == question_item_id("call-new", 0))
+            .expect("新题必须在");
+        assert_eq!(
+            new.state,
+            InteractionState::Pending,
+            "answered hint 不得让别题被误判或误降级"
+        );
+        assert!(new.actionable);
+    }
+
     /// 窗口内多题时，旧题的 hint 存在不影响新题派生；旧题按 hint 收口。
     #[test]
     fn visible_question_unaffected_by_other_hints() {
