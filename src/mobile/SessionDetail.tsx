@@ -607,11 +607,13 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
       ),
     }));
     const visibleGroups = groups.filter(
-      (group) => !group.isArchived && (group.live.length > 0 || (group.hasAnchor && !group.allAnswered))
+      (group) =>
+        !group.isArchived && (group.live.length > 0 || (group.hasAnchor && !group.allAnswered))
     );
     // 已收纳组（仅本机隐藏）：单独回传，供"恢复"入口撤销误收纳。
     const archivedGroups = groups.filter(
-      (group) => group.isArchived && (group.live.length > 0 || (group.hasAnchor && !group.allAnswered))
+      (group) =>
+        group.isArchived && (group.live.length > 0 || (group.hasAnchor && !group.allAnswered))
     );
     return {
       pending,
