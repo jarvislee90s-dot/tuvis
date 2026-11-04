@@ -6987,6 +6987,16 @@ async fn handle_state_changed(
         // 不再以发送时刻取得更大序号（W1② 红测窗口）。
         let p = adapter.stamp_queue_pause(&key, p);
         let p = adapter.stamp_probe_status(p).await;
+        // L2（2026-11-05）：**状态帧推送路径也要写穿持久提示**。
+        // 此前全仓库只有 `projection()` 尾部（:4730）会 persist，而桌面端作答
+        // 走的是 `handle_state_changed` 的这条正常发布分支——于是「移动端视图
+        // 实时清卡、DB hint 仍停在 pending」；页面没开该会话时更是无限期滞后，
+        // 下次投影又会拿旧 hint 产出占位/待作答。
+        // 开销可控：persist 对空列表早退、无 store 早退、fact 未变不落库；
+        // 镜像锁已释放，persist 只取 hints 缓存短锁 + spawn_blocking 落库。
+        adapter
+            .persist_interaction_hints(&key, &p.async_questions)
+            .await;
         adapter.publish_fresh_projection(&key, p).await;
         if history_needed {
             maybe_request_complete_history(adapter, &key).await;
@@ -7087,16 +7097,6 @@ async fn publish_projection(adapter: &DesktopIpcAdapter, key: &ThreadKey) {
         // → 重观察后再预留。
         let p = adapter.stamp_queue_pause(key, p);
         let p = adapter.stamp_probe_status(p).await;
-        // L2（2026-11-05）：**SSE 推送路径也要写穿持久提示**。
-        // 此前全仓库只有 `projection()` 尾部（:4730）会 persist，而桌面端答题走
-        // 的是本条发布路径（handle_state_changed → publish_projection）——于是
-        // 「移动端视图实时清卡、DB hint 仍停在 pending」，页面没开该会话时更是
-        // 无限期滞后；下次投影又会拿旧 hint 产出占位/待作答。
-        // persist 自带「fact 未变不写」去重，且此处镜像锁已释放（本就如此）、
-        // persist 只取 hints 缓存短锁 + spawn_blocking 落库——锁纪律不变。
-        adapter
-            .persist_interaction_hints(key, &p.async_questions)
-            .await;
         adapter.publish_fresh_projection(key, p).await;
     }
 }
@@ -9921,6 +9921,61 @@ mod h14_package_content_tests {
                     crate::services::codex_desktop_ipc::capability::CodexOperation::AsyncAnswerIdle
                 ),
             "旧结论不得生效"
+        );
+    }
+}
+
+/// L2 位置回归锁（2026-11-05）：`persist_interaction_hints` 必须挂在
+/// **`handle_state_changed` 的正常发布分支**（`publish_fresh_projection(&key, p)`
+/// 之前），而不是只挂在 `publish_projection`（异常恢复路径）或 `projection()`
+/// （轮询路径）。
+///
+/// 为什么需要这条锁：`publish_projection` 只在 `need_recover` 时调用
+/// （adapter.rs 两处：stale 恢复与 need_snapshot），桌面端正常作答**不经过**
+/// 它。第一版实现误挂在 `publish_projection`，等于没修——桌面答完后 DB hint
+/// 依旧停在 pending。本测试用源码形态断言钉死正确位置：未来若有人把它挪走，
+/// 这里会失败而不是静默退化。
+#[cfg(test)]
+mod l2_persist_call_site_tests {
+    /// 取 `handle_state_changed` 到文件末尾的切片（该函数是文件的最后一个
+    /// 大函数之一，其后的 `publish_projection` 等工具函数也在切片内——
+    /// 我们只关心“正常分支里是否有 persist 调用”）。
+    #[test]
+    fn persist_runs_on_normal_state_publish_branch() {
+        let src = include_str!("adapter.rs");
+        // 正常分支的标志：`publish_fresh_projection(&key, p)` 带 &key
+        // （`publish_projection` 里是 `publish_fresh_projection(key, p)`，无 &）。
+        let marker = "adapter.publish_fresh_projection(&key, p).await;";
+        let at = src
+            .find(marker)
+            .expect("正常发布分支必须存在（handle_state_changed 的 fresh 分支）");
+        // 该调用点前 2000 字节内必须有 persist（顺序也在断言之列：先落库再发布，
+        // 保证订阅方收到 Answered 帧时 DB 已记下，下次投影不会用旧 hint 反悔）。
+        let start = at.saturating_sub(2000);
+        let window = &src[start..at];
+        assert!(
+            window.contains("persist_interaction_hints(&key, &p.async_questions)"),
+            "handle_state_changed 正常发布分支必须先写穿持久提示（L2）；\
+             若挪到 publish_projection（异常恢复路径）等于没修。窗口片段：\n{window}"
+        );
+    }
+
+    /// 反向锁：`publish_projection`（异常恢复路径）里**不应**再挂 persist，
+    /// 避免同一路径重复落库与无谓开销。
+    #[test]
+    fn persist_absent_from_recovery_only_publish_path() {
+        let src = include_str!("adapter.rs");
+        let fn_start = src
+            .find("async fn publish_projection(adapter: &DesktopIpcAdapter, key: &ThreadKey) {")
+            .expect("publish_projection 必须存在");
+        let tail = &src[fn_start..];
+        let fn_end = tail
+            .find("\nasync fn current_conn(")
+            .expect("publish_projection 之后应紧跟 current_conn");
+        let body = &tail[..fn_end];
+        assert!(
+            !body.contains("persist_interaction_hints"),
+            "publish_projection 是异常恢复路径，不应重复挂 persist"
         );
     }
 }
