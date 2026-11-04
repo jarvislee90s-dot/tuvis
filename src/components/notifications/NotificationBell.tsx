@@ -108,7 +108,7 @@ export function NotificationBell() {
   return (
     <div className="relative">
       <button
-        className="relative rounded p-1.5 transition-colors hover:bg-accent"
+        className="hover:bg-accent relative rounded p-1.5 transition-colors"
         onClick={toggle}
         title={t("notifications.historyTitle")}
       >

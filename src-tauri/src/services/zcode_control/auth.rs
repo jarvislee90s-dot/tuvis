@@ -931,7 +931,6 @@ impl AuthService {
         &self,
         build: impl Fn(&reqwest::Client) -> reqwest::RequestBuilder,
     ) -> Result<reqwest::Response, reqwest::Error> {
-        let build = &build;
         match build(&self.http).send().await {
             Ok(response) => Ok(response),
             Err(_) => build(&self.http_direct).send().await,
