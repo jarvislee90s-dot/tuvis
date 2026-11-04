@@ -29,8 +29,6 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 const RECENT_LINES: usize = 500;
-/// 值来源见 `monitor::app_status::CONTENT_FRESH_KIMI_MS`（P1 常量集中）。
-const FILE_RECENT_SECS: f32 = crate::monitor::app_status::CONTENT_FRESH_KIMI_MS as f32 / 1000.0;
 
 /// 串行化 `KIMI_CODE_HOME` 环境变量切换：它是**进程级**量，并行测试线程共享，必须互斥。
 ///
@@ -343,7 +341,7 @@ fn parse_kimi_session(entry: &IndexedSession, process: &AgentProcess) -> Option<
         .and_then(|m| m.modified())
         .ok()
         .and_then(|m| SystemTime::now().duration_since(m).ok())
-        .map(|dur| dur.as_secs_f32() < FILE_RECENT_SECS)
+        .map(|dur| dur.as_millis() < crate::monitor::app_status::CONTENT_FRESH_KIMI_MS as u128)
         .unwrap_or(false);
 
     let state: Option<KimiState> = fs::read_to_string(entry.session_dir.join("state.json"))
