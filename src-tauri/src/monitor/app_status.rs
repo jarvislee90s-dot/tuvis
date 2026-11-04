@@ -75,6 +75,32 @@ impl SessionAges {
     }
 }
 
+/// 无信号时的新鲜度兜底窗（zcode / codex APP 共用）：与 [`APP_STATUS_STALE_MS`]
+/// 同值同源。判据是「会话最后更新时间在窗内 → Processing，否则 Idle」——
+/// 与停更降级（Processing → Waiting）语义不同，但窗口量级刻意对齐，
+/// 避免同一会话在两条路径上得到矛盾结论。
+pub const FALLBACK_FRESH_MS: i64 = APP_STATUS_STALE_MS as i64;
+
+/// Claude 文件新鲜兜底窗：`determine_status` 无信号分支的 mtime 判据。
+/// 3s 是"轮询周期 + 落盘延迟"量级——claude 有消息内 tool_use 判据兜底，
+/// 这只是极短窗的防御，不是主力判据。
+pub const CONTENT_FRESH_CLAUDE_MS: u64 = 3_000;
+
+/// Kimi 文件新鲜兜底窗：`wire.jsonl` 无状态信号时的 mtime 判据。
+/// 60s 是主力兜底（kimi 事件流可能缺失），与 claude 的 3s 防御性兜底不同源。
+pub const CONTENT_FRESH_KIMI_MS: u64 = 60_000;
+
+/// OpenCode "user 尾 + 近期活跃" 的活跃窗。
+pub const CONTENT_FRESH_OPENCODE_MS: u64 = 60_000;
+
+/// WorkBuddy 完成冷却窗（原 `GREEN_DEBOUNCE_MS`）：assistant 语义尾 + 内容年龄
+/// 小于该窗 → 保持 Processing。WorkBuddy 格式无轮次边界信号，中间 assistant
+/// 消息的假绿只能时间防抖（spec 2026-09-16 §4.2）。
+///
+/// **必须用 content_age 喂它，绝不可用含心跳的 presence_age**——心跳每 30s
+/// 刷新会把年龄打回 0，冷却永远等不满（2026-11-04 缺陷根因）。
+pub const COMPLETION_COOLDOWN_MS: u64 = 10_000;
+
 /// mtime 阈值叠加（spec §4）：函数调用类尾部停更 >= 300s 降级 Waiting；
 /// assistant 文本（Idle）等其余状态不受影响。mtime 年龄不可知时按未过期处理（防御）
 pub fn overlay_mtime_stale(status: SessionStatus, mtime_age_ms: u64) -> SessionStatus {
@@ -783,5 +809,35 @@ mod tests {
             "心跳新鲜时 content 仍是 30s（冷却窗必须等满）"
         );
         assert_eq!(ages.presence_age_ms, Some(500));
+    }
+
+    // ---- 时间常量集中（P1）：语义命名 + 同源锁 ----
+
+    /// 无信号兜底窗必须与 APP 停更阈值同源——两者历史上是同一个值，
+    /// 单独调一个会静默改变"兜底新鲜度"语义。
+    #[test]
+    fn fallback_fresh_equals_app_stale() {
+        assert_eq!(FALLBACK_FRESH_MS, APP_STATUS_STALE_MS as i64);
+    }
+
+    /// 各家"内容新鲜"阈值已收录且量级正确（防止实现期写错数量级）
+    #[test]
+    fn content_fresh_constants_have_expected_magnitudes() {
+        assert_eq!(CONTENT_FRESH_CLAUDE_MS, 3_000);
+        assert_eq!(CONTENT_FRESH_KIMI_MS, 60_000);
+        assert_eq!(CONTENT_FRESH_OPENCODE_MS, 60_000);
+    }
+
+    /// WorkBuddy 完成冷却窗与心跳周期必须独立——若两者接近，
+    /// 冷却会被心跳反复重置（2026-11-04 缺陷的面板条件）
+    // 两个常量的关系断言会触发 clippy::assertions_on_constants（-D warnings），
+    // 保留运行时断言形态（计划原意 = 测试期回归锁），就地放行该 lint
+    #[test]
+    #[allow(clippy::assertions_on_constants)]
+    fn workbuddy_cooldown_is_shorter_than_its_heartbeat() {
+        assert!(
+            COMPLETION_COOLDOWN_MS < crate::monitor::workbuddy_parser::HEARTBEAT_FRESH_MS,
+            "冷却窗必须显著小于心跳周期，否则行为退化"
+        );
     }
 }

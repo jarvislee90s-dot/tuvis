@@ -72,10 +72,9 @@ pub const HEARTBEAT_FRESH_MS: u64 = 90_000;
 /// （状态叠加阈值与在场判定是两套产品语义；调一个不应静默改另一个）。
 pub const SESSION_ACTIVE_WINDOW_MS: i64 = 300_000;
 
-/// 完成防抖窗（spec 假绿治理 §4.2）：assistant 语义尾 + JSONL mtime 年龄 < 该窗 → 拉回
-/// Processing（WorkBuddy 格式无轮次信号，中间消息假绿只能时间防抖），≥ 该窗才转绿。
-/// 注意与 FALLBACK_FRESH_MS（无信号兜底新鲜窗，300s）语义不同，独立常量不得混用
-pub const GREEN_DEBOUNCE_MS: u64 = 10_000;
+/// 完成冷却窗（值来源见 `monitor::app_status::COMPLETION_COOLDOWN_MS`，P1 集中）。
+/// 保留旧名以兼容既有测试与文档引用（决策 8）。
+pub const GREEN_DEBOUNCE_MS: u64 = crate::monitor::app_status::COMPLETION_COOLDOWN_MS;
 
 /// App 形态状态叠加阈值与叠加函数自共享核 re-export（issue #6 收敛后保持兼容）：
 /// 语义见 monitor::app_status——JSONL mtime 停更 >= 300s 时函数调用类尾部（Processing）

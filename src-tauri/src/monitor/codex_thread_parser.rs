@@ -49,8 +49,8 @@ const CARD_WINDOW_S: i64 = 24 * 3600;
 const RECENT_THREADS_LIMIT: usize = 100;
 /// 尾部条目读取深度（rollout 尾读 500 行同档；items 是高层事件，条数更少信息更密）
 const TAIL_ITEMS_LIMIT: usize = 200;
-/// 无语义信号兜底的新鲜阈值（与 APP 形态 300s 停更阈值同源）
-const FALLBACK_FRESH_MS: i64 = APP_STATUS_STALE_MS as i64;
+/// 值来源见 `monitor::app_status::FALLBACK_FRESH_MS`（P1 常量集中）。
+const FALLBACK_FRESH_MS: i64 = crate::monitor::app_status::FALLBACK_FRESH_MS;
 /// 子代理活跃窗口（「N 个子代理」计数口径，与 Claude 30s 对齐）
 const SUBAGENT_ACTIVE_WINDOW_S: i64 = 30;
 /// 末条消息摘要截断（与其他工具 100 字符口径一致）

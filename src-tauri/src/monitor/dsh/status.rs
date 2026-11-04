@@ -15,7 +15,9 @@ pub enum LockState {
     Unknown,
 }
 
-/// v0 兜底：日志静默超此阈值 → 判中断（备忘 §A4）
+/// v0 无锁目录的静默中断阈值（30 分钟）。**刻意不迁入 app_status 共享常量**：
+/// dsh 用持有式 fd 租约判定在场，静默阈值只服务"无锁降级"这一独有路径，
+/// 与其他工具的停更降级无共性（见 spec 2026-11-04 §7.3 收敛原则）。
 pub const V0_SILENCE_INTERRUPT_MS: i64 = 30 * 60 * 1000;
 
 pub struct StatusInput<'a> {

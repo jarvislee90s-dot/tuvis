@@ -274,7 +274,10 @@ fn parse_claude_jsonl(
         .and_then(|m| m.modified())
         .ok()
         .and_then(|m| SystemTime::now().duration_since(m).ok())
-        .map(|age| age.as_secs_f32() < 3.0)
+        .map(|age| {
+            age.as_secs_f32()
+                < crate::monitor::app_status::CONTENT_FRESH_CLAUDE_MS as f32 / 1000.0
+        })
         .unwrap_or(false);
 
     let session_id = digest.session_id.clone()?;

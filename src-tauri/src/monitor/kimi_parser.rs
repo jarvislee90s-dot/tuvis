@@ -29,8 +29,8 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 const RECENT_LINES: usize = 500;
-/// 兜底"文件仍在写入"的时间窗（秒），与既有解析器同量级
-const FILE_RECENT_SECS: f32 = 60.0;
+/// 值来源见 `monitor::app_status::CONTENT_FRESH_KIMI_MS`（P1 常量集中）。
+const FILE_RECENT_SECS: f32 = crate::monitor::app_status::CONTENT_FRESH_KIMI_MS as f32 / 1000.0;
 
 /// 串行化 `KIMI_CODE_HOME` 环境变量切换：它是**进程级**量，并行测试线程共享，必须互斥。
 ///
