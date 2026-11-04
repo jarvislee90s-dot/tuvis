@@ -13,10 +13,28 @@ English · [中文](CHANGELOG.md)
 _Only versions translated so far are listed here; the full history lives in the
 [Chinese changelog](CHANGELOG.md)._
 
-## [Unreleased]
+## [0.6.5] - 2026-11-04
 
 ### Added
 
+- **ZCode Windows integration closeout (build probe)**: on Windows, Tuvis reads the installed
+  ZCode desktop app's 4-segment PE file version (location discovered via the uninstall table →
+  protocol handler → common default dirs → running process), so the capability key now matches
+  `3.17.2.9661` and capabilities such as collaboration mode open as candidates (a single bounded
+  confirmation on first real use) instead of a whole-board grey-out. Live Windows matrix
+  (2026-11-04): send / Q&A (single, multi, free text) / interrupt / model & thinking level /
+  collaboration mode all pass, and the local outbox was also exercised against Windows 3.17.2.
+- **ZCode dual-path network fallback (Windows live forensics)**: the OAuth exchange and terminal
+  token go through the system proxy first and retry once over a direct connection on transport
+  failure (a system proxy that is on but tunnelling nothing no longer blocks authorisation); the
+  relay WebSocket tries direct first (half the upgrade budget, so a hung direct attempt cannot
+  starve the fallback) and then tunnels through the system proxy via HTTP CONNECT — TLS
+  verification stays on the same stack as direct. SOCKS proxies are rejected explicitly (SOCKS
+  credentials are never sent as Basic auth to a non-HTTP endpoint).
+- **ZCode explicit "Apply" for model & thinking level**: provider/model/level dropdowns only
+  stage a local pending choice; clicking "Apply" submits the full triple once — the point of
+  effect is explicit, and on a weak network a failed submit keeps the staged values for an
+  immediate retry (mirroring the collaboration-mode "Apply" interaction).
 - **ZCode phone outbox and single-item priority**: while a turn is running, sending stores the
   message in the local Tuvis outbox first (expanded by default, position + 20-grapheme preview),
   with edit, retract, "stop the current turn and send only this item", and explicit resume.
@@ -117,6 +135,18 @@ _Only versions translated so far are listed here; the full history lives in the
 
 ### Changed
 
+- **ZCode outbox panel only shows while visible messages exist**: a bare paused state (0 items)
+  no longer occupies the panel permanently; the pause semantics after interrupt/priority are
+  unchanged (messages queued afterwards still need a manual resume); the restart review card
+  keeps its "show whenever review items exist" behaviour — unconfirmed barriers anchor on
+  accepted items that are invisible, so gating the card by visible count would deadlock the
+  barrier with no UI to clear it.
+- **ZCode control errors now surface the frozen code**: the generic `ZCODE_CONTROL:*` fallback
+  message appends the frozen code (e.g. "(offline)", "(needs_auth)") instead of one
+  un-actionable "unavailable" line for everything.
+- **Home header badges unified**: the clear-finished (green) and notification-bell (red) badges
+  share identical geometry, font size/weight and hover, keeping only the colour distinction
+  (green = clearable finished, red = unread notifications).
 - **ZCode sends now go through official unified control (behavior change)**: the legacy
   ZCode session-send path is retired (M11) — old channel requests to send into a ZCode
   session now return **409 `official_control_required`**, pointing at official-bridge
@@ -156,6 +186,21 @@ _Only versions translated so far are listed here; the full history lives in the
 
 ### Fixed
 
+- **ZCode send first-use confirmation always timed out on hosts that never advance the
+  fingerprint**: the Windows 3.17.2 `state.updated` patch carries no `logEpoch:seq`, so the
+  "last user message fingerprint changed" criterion was always false and 3/3 first-use
+  confirmations landed `timeout_5s`; an equivalent causal evidence path was added — the
+  receipt's `sendAdmission inputId` is matched exactly against `executionTerminal inputId`,
+  confirming only when both are present and equal (a finished turn from another send never
+  confirms this one).
+- **ZCode interrupts never landed in the ledger**: the local-queue stop (including priority
+  interrupts) bypassed the confirmation registration, so the interrupt capability could never
+  gather live evidence; registration is now in place and the window re-arms after ACK (the
+  dispatch internally includes bounded control re-sync waits that could have consumed most of
+  the window registered at submit time).
+- **ZCode upgrade budget starved by a slow token**: the relay upgrade budget used to start
+  before the terminal token fetch, so one slow token left both paths with a zero budget and an
+  immediate offline; the budget now starts after the token is in hand.
 - **ZCode phone outbox recovery and provider/plan-card usability**: after a restart, an
   accepted send whose terminal state cannot be proven shows "Results to review" and pauses
   the outbox; while unreviewed, "Resume queue / Send this one" are explicitly rejected, and
@@ -197,6 +242,15 @@ _Only versions translated so far are listed here; the full history lives in the
 
 ### Engineering
 
+- ZCode probe machinery closeout: `mode` joined the permit whitelist (its permits channel
+  already exists); `queue_*` are deliberately excluded — `execute_queue_write` explicitly
+  refuses T8.2 permit relaxation, so issuing permits would burn them for nothing; the permits
+  threading precondition is documented in comments. Windows probe unit tests added: uninstall
+  `DisplayName` "ZCode 3.17.2" suffixed form (prefix match, not equality), PE version read via
+  unaligned access (fixes an alignment UB), four value-string shapes; four end-to-end WS tunnel
+  cases (exact CONNECT line / 403 rejection / Proxy-Authorization header / garbage response);
+  three auth dual-path cases (dead primary → direct succeeds with a single exchange consumed,
+  both paths failing → offline).
 - ZCode credential-reuse acceptance: `wire_e2e` uses a shared fake persistent store and
   **rebuilt** AuthService/Hub instances to verify "OAuth still once, terminal token / WS
   re-fetched after restart, zero upstream after disconnect or forget, capability gates not
