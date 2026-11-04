@@ -985,12 +985,12 @@ fn inline_synthesis_bound(hay: &str) -> bool {
         let Some((index, e_n)) = ident_at(hay, e_x + 1) else {
             return false;
         };
-        // 箭头体必须立刻就是合成表达式：`)=>{tail}`
-        let body = format!(")=>");
-        if !hay[e_n..].starts_with(&body) {
+        // 箭头体必须立刻就是合成表达式：`)=>JSON.stringify(...`
+        const BODY: &str = ")=>";
+        if !hay[e_n..].starts_with(BODY) {
             return false;
         }
-        let body_at = e_n + body.len();
+        let body_at = e_n + BODY.len();
         if !hay[body_at..].starts_with(&needle) {
             return false;
         }
