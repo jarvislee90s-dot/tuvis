@@ -36,6 +36,45 @@ pub enum AppEntryKind {
 /// JSONL mtime 停更超过该时长时，函数调用类尾部（Processing）降级为 Waiting
 pub const APP_STATUS_STALE_MS: u64 = 300_000;
 
+/// 会话年龄双轴（唯一构造点：[`SessionAges::derive`]）。
+///
+/// **纪律（2026-11-04 用户裁决）**：一个 age 值只服务一个判定语义。
+/// - `content_age_ms` 只喂**完成冷却**与内容新鲜度判定；
+/// - `presence_age_ms` 只喂**在板判定**、**停更降级**与未读补偿。
+///
+/// 违反后果：心跳/DB 活动会把内容年龄打回 0，完成冷却永远等不满，
+/// 造成绿↔黄周期振荡并重复播报完成提醒（2026-11-04 WorkBuddy 缺陷，
+/// 活体实测 30s 周期：心跳刷新 → 黄 10s → 心跳老化 → 绿 20s → 循环）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionAges {
+    /// 距**内容最后写入**的毫秒数。只取内容源（jsonl mtime / DB time_updated /
+    /// 事件流末条时间戳）。无内容源时为 `None`——**未知不等于刚刚**。
+    pub content_age_ms: Option<u64>,
+    /// 距**会话最后生命迹象**的毫秒数。内容源 ∨ DB 活动 ∨ 心跳 ∨ 锁租约取最近。
+    pub presence_age_ms: Option<u64>,
+}
+
+impl SessionAges {
+    /// 唯一构造点。
+    ///
+    /// - `content_ms`：内容最后写入的**绝对时刻**（epoch ms），由各 parser 的证据层提供；
+    /// - `presence_sources`：所有生命迹象的绝对时刻，含内容源自身。
+    ///
+    /// 两轴都为 `None` 表示证据完全缺失。
+    pub fn derive(now_ms: u64, content_ms: Option<u64>, presence_sources: &[Option<u64>]) -> Self {
+        let content_age_ms = content_ms.map(|ms| now_ms.saturating_sub(ms));
+        let presence_age_ms = presence_sources
+            .iter()
+            .flatten()
+            .map(|ms| now_ms.saturating_sub(*ms))
+            .min();
+        Self {
+            content_age_ms,
+            presence_age_ms,
+        }
+    }
+}
+
 /// mtime 阈值叠加（spec §4）：函数调用类尾部停更 >= 300s 降级 Waiting；
 /// assistant 文本（Idle）等其余状态不受影响。mtime 年龄不可知时按未过期处理（防御）
 pub fn overlay_mtime_stale(status: SessionStatus, mtime_age_ms: u64) -> SessionStatus {
@@ -697,5 +736,52 @@ mod tests {
     #[test]
     fn clean_flags_map_to_human_origin() {
         assert_eq!(entry_origin_from_flags(false, false), EntryOrigin::Human);
+    }
+
+    // ---- SessionAges：双轴年龄（P0 锚点纪律） ----
+
+    /// content 轴只取内容源；presence 轴取全部来源的最大值
+    #[test]
+    fn session_ages_separates_content_and_presence() {
+        let now = 1_000_000u64;
+        // 内容 40 秒前写下；DB 活动 5 秒前；心跳 1 秒前
+        let ages = SessionAges::derive(now, Some(now - 40_000), &[
+            Some(now - 40_000),
+            Some(now - 5_000),
+            Some(now - 1_000),
+        ]);
+        assert_eq!(ages.content_age_ms, Some(40_000), "content 只认内容源");
+        assert_eq!(ages.presence_age_ms, Some(1_000), "presence 取最近生命迹象");
+    }
+
+    /// 内容源缺失 → content=None（未知不等于刚刚）；presence 仍可由其他源给出
+    #[test]
+    fn session_ages_content_unknown_when_no_content_source() {
+        let now = 1_000_000u64;
+        let ages = SessionAges::derive(now, None, &[None, Some(now - 3_000)]);
+        assert_eq!(ages.content_age_ms, None);
+        assert_eq!(ages.presence_age_ms, Some(3_000));
+    }
+
+    /// 全部来源缺失 → 两轴均为 None
+    #[test]
+    fn session_ages_both_none_when_no_sources() {
+        let ages = SessionAges::derive(1_000_000, None, &[None, None]);
+        assert_eq!(ages.content_age_ms, None);
+        assert_eq!(ages.presence_age_ms, None);
+    }
+
+    /// 心跳只能刷新 presence，绝不能缩短 content —— 本类缺陷的回归锁
+    #[test]
+    fn heartbeat_never_shortens_content_age() {
+        let now = 1_000_000u64;
+        let content_ms = Some(now - 30_000);
+        let ages = SessionAges::derive(now, content_ms, &[content_ms, Some(now - 500)]);
+        assert_eq!(
+            ages.content_age_ms,
+            Some(30_000),
+            "心跳新鲜时 content 仍是 30s（冷却窗必须等满）"
+        );
+        assert_eq!(ages.presence_age_ms, Some(500));
     }
 }
