@@ -75,10 +75,6 @@ pub const HEARTBEAT_FRESH_MS: u64 = 90_000;
 /// （状态叠加阈值与在场判定是两套产品语义；调一个不应静默改另一个）。
 pub const SESSION_ACTIVE_WINDOW_MS: i64 = 300_000;
 
-/// 完成冷却窗（值来源见 `monitor::app_status::COMPLETION_COOLDOWN_MS`，P1 集中）。
-/// 保留旧名以兼容既有测试与文档引用（决策 8）。
-pub const GREEN_DEBOUNCE_MS: u64 = crate::monitor::app_status::COMPLETION_COOLDOWN_MS;
-
 /// App 形态状态叠加阈值与叠加函数自共享核 re-export（issue #6 收敛后保持兼容）：
 /// 语义见 monitor::app_status——JSONL mtime 停更 >= 300s 时函数调用类尾部（Processing）
 /// 降级 Waiting；assistant 文本（Idle）等其余状态不受影响
