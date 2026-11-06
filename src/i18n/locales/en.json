@@ -2280,6 +2280,7 @@
     "asyncAnswerHistoryIncomplete": "The answer range from this question to now has not fully loaded, so it is unknown whether it was answered. Your answer is kept — refresh or retry later; Tuvis will not answer on your behalf.",
     "migrateContractEvidencePkgFail": "Contract evidence cache migration failed (package fingerprint column): {{e}}",
     "migrateEffectTargetFail": "Failed to migrate effect target columns",
+    "migrateB1HintSchemaFail": "Failed to migrate Codex question hints",
     "migrateOperationSuccessRebuildFail": "Failed to rebuild operation-success table",
     "migrateClaimEpochFail": "Failed to migrate question-claim epoch column",
     "migrateClaimOwnerFail": "Failed to migrate question-claim owner column",

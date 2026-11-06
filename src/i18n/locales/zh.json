@@ -2280,6 +2280,7 @@
     "asyncAnswerHistoryIncomplete": "该题到当前之间的答复范围尚未完整加载，无法确认是否已作答；答案会保留，请刷新或稍后重试，兔维斯不会自动代答",
     "migrateContractEvidencePkgFail": "契约证据缓存迁移失败（补包指纹列）：{{e}}",
     "migrateEffectTargetFail": "迁移效果归属列失败",
+    "migrateB1HintSchemaFail": "迁移 Codex 答题提示表失败",
     "migrateOperationSuccessRebuildFail": "重建成功证据表失败",
     "migrateClaimEpochFail": "迁移同题占用代际列失败",
     "migrateClaimOwnerFail": "迁移同题占用世系列失败",

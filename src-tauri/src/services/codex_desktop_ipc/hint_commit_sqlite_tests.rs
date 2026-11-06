@@ -429,7 +429,7 @@ fn b1_store_post_sql_registry_revocation_rolls_back() {
             let _ = revoked_tx.send(());
         }));
         recv(&revoked_rx);
-        assert!(probe.resume(), "{operation}: probe 未正常恢复");
+        assert!(probe.resume(), "{operation}: probe did not resume");
         assert_eq!(
             recv(&result_rx),
             Err(HintStoreError::OwnerFenced),

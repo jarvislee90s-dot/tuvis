@@ -157,7 +157,8 @@ pub fn migrate(conn: &Connection) -> Result<(), String> {
     // 已存在的表保持原样（缺列由下方 ALTER 迁移补齐），与生产启动顺序（schema::init → migrate）一致。
     // 上面 DROP 掉的预览版账本四表，由这次 init 按新 DDL 重建为空表。
     crate::database::schema::init(conn);
-    migrate_b1_hint_schema(conn).map_err(|e| format!("MIGRATE_B1_HINT_SCHEMA_FAIL: {e}"))?;
+    migrate_b1_hint_schema(conn)
+        .map_err(|e| format!("MIGRATE_B1_HINT_SCHEMA_FAIL: 迁移 Codex 答题提示表失败: {e}"))?;
 
     if !column_exists(conn, "zcode_actions", "send_admission") {
         conn.execute(
