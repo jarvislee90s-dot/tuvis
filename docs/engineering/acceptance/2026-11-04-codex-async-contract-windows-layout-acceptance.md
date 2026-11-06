@@ -261,3 +261,10 @@ Windows 隔离验收构建使用单独的 Tuvis 数据目录和 WebView 配置�
 | 窗口外题目配对       | `hint_derived_key_matches_envelope_after_question_scrolled_out`：1 passed                                                                              | 函数级模拟，不证明真实 Desktop 的历史窗口形态 |
 
 按用户要求，后续不再进行电脑操控；未完成的实体手机和真实窗口边界保留待验。
+
+### 2026-11-06 双端正式答题复验
+
+- Windows Desktop MSIX 26.1103.3517.0 的安装包通过 v5 只读契约识别，六项操作均匹配。新版由类型与长度守卫后直接遍历同一条目的题目，题目标识继续使用原条目 ID 和题序。
+- 普通助手条目的 `questions: null` 等同无题。非空非法结构继续保守处理。
+- 用户在当前开发构建清理旧卡后测试两道新题，分别在 Desktop 原生卡和远程卡正式提交，另一端均撤下对应题。
+- 运行中可保留草稿，空闲后正式提交。运行中提交单独跟踪 [#203](https://github.com/jarvislee90s-dot/tuvis/issues/203)。直接跳过或关闭后的当前出口为 Tuvis 本地收纳。
