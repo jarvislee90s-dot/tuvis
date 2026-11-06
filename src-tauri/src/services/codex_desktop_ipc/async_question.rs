@@ -16,6 +16,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use super::capability::{CodexOperation, EffectiveOperations};
 use super::history_view::{HistoryView, TurnRef};
@@ -207,6 +208,177 @@ struct FoundQuestion {
     turn_index: usize,
 }
 
+/// 直接观察到的正式答复身份；不包含题目或答案正文。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnswerWitness {
+    pub proof_version: i64,
+    pub answer_turn_id: String,
+    pub answer_item_id: String,
+    pub answer_digest: String,
+}
+
+/// 从原始 canonical 引用链取得唯一答复；任何引用或身份歧义均保守拒绝。
+fn analyze_answer_witnesses(
+    thread_id: &str,
+    state: &Value,
+) -> Option<HashMap<String, AnswerWitness>> {
+    if thread_id.is_empty() {
+        return None;
+    }
+    let history = state.pointer("/turnHistory/history")?;
+    let entities = history.get("entitiesByKey").and_then(Value::as_object)?;
+    let islands = history.get("islands").and_then(Value::as_array)?;
+    let mut refs = HashSet::new();
+    let mut turns = HashSet::new();
+    let mut items = HashSet::new();
+    let mut questions: HashMap<String, (String, usize)> = HashMap::new();
+    let mut answers: HashMap<String, Vec<(String, String, usize, AnswerEnvelope)>> = HashMap::new();
+    let mut position = 0usize;
+    for island in islands {
+        let entries = island.get("entries").and_then(Value::as_array)?;
+        for entry in entries {
+            let reference = entry
+                .get("value")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())?;
+            if !refs.insert(reference) {
+                return None;
+            }
+            let turn = entities.get(reference)?;
+            let turn_id = turn
+                .get("turnId")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())?;
+            if !turns.insert(turn_id) {
+                return None;
+            }
+            let Some(turn_items) = turn.get("items").and_then(Value::as_array) else {
+                if turn.get("itemsView").and_then(Value::as_str) == Some("notLoaded") {
+                    continue;
+                }
+                return None;
+            };
+            for item in turn_items {
+                position += 1;
+                let object = item.as_object()?;
+                let id = object
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())?;
+                if !items.insert(id) {
+                    return None;
+                }
+                match object.get("type").and_then(Value::as_str) {
+                    Some("agentMessage") => {
+                        if let Some(qs) = object.get("questions") {
+                            let qs = qs.as_array()?;
+                            for (index, q) in qs.iter().enumerate() {
+                                if !q.is_object() || index > u32::MAX as usize {
+                                    return None;
+                                }
+                                if questions
+                                    .insert(
+                                        question_item_id(id, index as u32),
+                                        (turn_id.to_string(), position),
+                                    )
+                                    .is_some()
+                                {
+                                    return None;
+                                }
+                            }
+                        }
+                    }
+                    Some("userMessage") => {
+                        if let Some(text) = user_message_text(object) {
+                            if text.matches(ENVELOPE_OPEN).count() > 1 {
+                                return None;
+                            }
+                            if text.contains(ENVELOPE_OPEN) {
+                                let entries = parse_answer_envelope(&text)?;
+                                for answer in entries {
+                                    answers
+                                        .entry(answer.question_item_id.clone())
+                                        .or_default()
+                                        .push((
+                                            turn_id.to_string(),
+                                            id.to_string(),
+                                            position,
+                                            answer,
+                                        ));
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    let mut result = HashMap::new();
+    let view = HistoryView::new(state);
+    let canonical_turns = view.turns();
+    for (key, (source_turn, source_position)) in questions {
+        let Some(turn_index) = canonical_turns
+            .iter()
+            .position(|turn| turn.turn_id == source_turn)
+        else {
+            continue;
+        };
+        if coverage_since(
+            &canonical_turns,
+            turn_index,
+            view.strict_gap_after_turn(&source_turn),
+        ) != AnswerCoverage::CompleteSinceQuestion
+        {
+            continue;
+        }
+        let Some(entries) = answers.get(&key) else {
+            continue;
+        };
+        if entries.len() != 1 {
+            continue;
+        }
+        let (answer_turn, answer_item, answer_position, answer) = &entries[0];
+        if *answer_position <= source_position {
+            continue;
+        }
+        // v1: 线程、题目标识、来源回合、答复回合、答复条目、question、answer；
+        // 每项先写 UTF-8 字节长度的 u64 大端，再写字节本身。
+        let mut digest = Sha256::new();
+        for field in [
+            thread_id,
+            key.as_str(),
+            source_turn.as_str(),
+            answer_turn.as_str(),
+            answer_item.as_str(),
+            answer.question.as_str(),
+            answer.answer.as_str(),
+        ] {
+            digest.update((field.len() as u64).to_be_bytes());
+            digest.update(field.as_bytes());
+        }
+        let answer_digest = digest
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        result.insert(
+            key,
+            AnswerWitness {
+                proof_version: 1,
+                answer_turn_id: answer_turn.clone(),
+                answer_item_id: answer_item.clone(),
+                answer_digest,
+            },
+        );
+    }
+    Some(result)
+}
+
+pub fn answer_witnesses(thread_id: &str, state: &Value) -> HashMap<String, AnswerWitness> {
+    analyze_answer_witnesses(thread_id, state).unwrap_or_default()
+}
+
 /// 持久提示（DB 事实的只读副本；**不含正文**）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InteractionHint {
@@ -216,6 +388,65 @@ pub struct InteractionHint {
     pub question_index: u32,
     /// 最后已知事实（`answered` / `pending` / `unknown`）。
     pub last_fact: String,
+    pub witness: Option<AnswerWitness>,
+    pub evidence_state: Option<String>,
+}
+
+impl InteractionHint {
+    pub(crate) fn from_stored(
+        row: crate::database::dao::codex_interactions::StoredInteractionHint,
+    ) -> Self {
+        let witness = match (
+            row.proof_version,
+            row.answer_turn_id,
+            row.answer_item_id,
+            row.answer_digest,
+        ) {
+            (
+                Some(proof_version),
+                Some(answer_turn_id),
+                Some(answer_item_id),
+                Some(answer_digest),
+            ) => Some(AnswerWitness {
+                proof_version,
+                answer_turn_id,
+                answer_item_id,
+                answer_digest,
+            }),
+            _ => None,
+        };
+        Self {
+            thread_id: row.thread_id,
+            source_turn_id: row.source_turn_id,
+            source_item_id: row.source_item_id,
+            question_index: row.question_index,
+            last_fact: row.last_fact,
+            witness,
+            evidence_state: row.evidence_state,
+        }
+    }
+    pub(crate) fn to_stored(
+        &self,
+        at_ms: i64,
+        epoch: Option<i64>,
+        sequence: Option<i64>,
+    ) -> crate::database::dao::codex_interactions::StoredInteractionHint {
+        crate::database::dao::codex_interactions::StoredInteractionHint {
+            thread_id: self.thread_id.clone(),
+            source_turn_id: self.source_turn_id.clone(),
+            source_item_id: self.source_item_id.clone(),
+            question_index: self.question_index,
+            last_fact: self.last_fact.clone(),
+            updated_at: at_ms,
+            observation_epoch: epoch,
+            observation_seq: sequence,
+            proof_version: self.witness.as_ref().map(|w| w.proof_version),
+            answer_turn_id: self.witness.as_ref().map(|w| w.answer_turn_id.clone()),
+            answer_item_id: self.witness.as_ref().map(|w| w.answer_item_id.clone()),
+            answer_digest: self.witness.as_ref().map(|w| w.answer_digest.clone()),
+            evidence_state: self.evidence_state.clone(),
+        }
+    }
 }
 
 /// 提示持久化错误分类；不包含用户正文或底层错误字符串。
@@ -519,43 +750,26 @@ impl AsyncQuestionProjector {
     ) -> Vec<AsyncQuestionView> {
         let view = HistoryView::new(state);
         if !view.readable() {
-            return Vec::new();
+            return unknown_placeholders(key, lease, hints);
         }
         let turns = view.turns();
         let questions = found_questions(state);
-        let thread_hints: Vec<&InteractionHint> = hints
-            .iter()
-            .filter(|hint| hint.thread_id == key.thread_id)
-            .collect();
         if questions.is_empty() {
-            // R18：当前窗口里**没有可发现的题**时，持久提示仍要为「已知但未加载」
-            // 的题给出 Unknown 占位——不能把"没看到"当"没答过"（尤其重启后）。
-            //
-            // L1（2026-11-05）：占位也要先过一遍信封——题干滑出窗口但作答已在
-            // 窗口内时，这是「已答」而非「未知」。
-            let known = hint_derived_keys(&thread_hints);
-            let answers = answered_map(&turns, &known);
-            return unknown_placeholders(key, lease, hints)
-                .into_iter()
-                .map(|mut view| {
-                    if answers.contains_key(&view.question_key) {
-                        view.state = InteractionState::Answered;
-                        view.actionable = false;
-                        view.disabled_reason_code = None;
-                    }
-                    view
-                })
-                .collect();
+            return unknown_placeholders(key, lease, hints);
         }
-        // L1：配对集合 = 窗口内可见题 ∪ 本线程 hint 派生的题身份。
-        // 题干条目被 Desktop 尾窗淘汰后，`found_questions` 看不到它，但 hint 仍
-        // 记着 `source_item_id + question_index`，可无损重建 question_key
-        // （与 `unknown_placeholders` 同源）。不并进去的话，作答信封会因
-        // 键不在 `known` 而被静默丢弃（`answered_map` 的防假清卡门），旧题
-        // 永远派生不出 Answered → hint 永久滞留 pending → 卡不消失。
-        let mut known: HashSet<String> = questions.iter().map(|q| q.question_key.clone()).collect();
-        known.extend(hint_derived_keys(&thread_hints));
+        let known: HashSet<String> = questions.iter().map(|q| q.question_key.clone()).collect();
         let answers = answered_map(&turns, &known);
+        let analysis = analyze_answer_witnesses(&key.thread_id, state);
+        let invalid_history = analysis.is_none();
+        let witnesses = analysis.unwrap_or_default();
+        let malformed_envelope = turns.iter().flat_map(|turn| turn.items.iter()).any(|item| {
+            item.as_object()
+                .filter(|object| object.get("type").and_then(Value::as_str) == Some("userMessage"))
+                .and_then(user_message_text)
+                .is_some_and(|text| {
+                    text.contains(ENVELOPE_OPEN) && parse_answer_envelope(&text).is_none()
+                })
+        });
         let epoch = lease.map(|lease| lease.epoch).unwrap_or(0);
         let generation = lease.map(|lease| lease.generation).unwrap_or(0);
         let async_status = ops.get(CodexOperation::AsyncAnswerIdle);
@@ -566,7 +780,8 @@ impl AsyncQuestionProjector {
 
         let mut views = Vec::with_capacity(questions.len());
         for question in &questions {
-            let answered = answers.contains_key(&question.question_key);
+            let answered = witnesses.contains_key(&question.question_key);
+            let ambiguous_answer = answers.contains_key(&question.question_key) && !answered;
             let coverage = coverage_since(
                 &turns,
                 question.turn_index,
@@ -584,6 +799,12 @@ impl AsyncQuestionProjector {
             });
             let (state, actionable, disabled_reason_code) = if answered {
                 (InteractionState::Answered, false, None)
+            } else if ambiguous_answer || malformed_envelope || invalid_history {
+                (
+                    InteractionState::Unknown,
+                    false,
+                    Some(super::reason_code::ASYNC_HISTORY_INCOMPLETE.to_string()),
+                )
             } else {
                 match coverage {
                     AnswerCoverage::CompleteSinceQuestion => {
@@ -644,35 +865,17 @@ impl AsyncQuestionProjector {
         // → 纠正为 Answered，让 persist 把 hint 写成 answered，卡随之消失。
         // 未命中者保持 Unknown（**不猜已答**，且 Unknown 在前端不算 live，
         // 不会渲染成待作答卡）。
-        for mut placeholder in unknown_placeholders(key, lease, hints) {
+        for placeholder in unknown_placeholders(key, lease, hints) {
             if views
                 .iter()
                 .any(|view| view.question_key == placeholder.question_key)
             {
                 continue;
             }
-            if answers.contains_key(&placeholder.question_key) {
-                placeholder.state = InteractionState::Answered;
-                placeholder.actionable = false;
-                placeholder.disabled_reason_code = None;
-            }
             views.push(placeholder);
         }
         views
     }
-}
-
-/// 由本线程的持久提示重建题目标识集合（`questionItemId`）。
-///
-/// L1：`found_questions` 只看当前窗口，题干条目被尾窗淘汰后就看不见了；但 hint
-/// 保留了 `source_item_id + question_index`，`question_item_id` 可无损重建
-/// （与 [`unknown_placeholders`] 同源）。把它并入 `answered_map` 的 `known`
-/// 集合，作答信封才能纠正「题已在窗口外」的旧题。
-fn hint_derived_keys(hints: &[&InteractionHint]) -> HashSet<String> {
-    hints
-        .iter()
-        .map(|hint| question_item_id(&hint.source_item_id, hint.question_index))
-        .collect()
 }
 
 /// R18：由持久提示构造「已知但当前不可见」的 Unknown 占位（无正文、不可提交）。
@@ -685,7 +888,7 @@ fn unknown_placeholders(
     let generation = lease.map(|lease| lease.generation).unwrap_or(0);
     hints
         .iter()
-        .filter(|hint| hint.thread_id == key.thread_id && hint.last_fact != "answered")
+        .filter(|hint| hint.thread_id == key.thread_id)
         .map(|hint| {
             let question_key = question_item_id(&hint.source_item_id, hint.question_index);
             let token_material =
@@ -1270,6 +1473,8 @@ mod tests {
             source_item_id: "call-a".into(),
             question_index: 0,
             last_fact: "unknown".into(),
+            witness: None,
+            evidence_state: None,
         };
         let views = AsyncQuestionProjector.project_with_hints(
             &key(),
@@ -1458,6 +1663,8 @@ mod tests {
                 source_item_id: format!("call-{i}"),
                 question_index: 0,
                 last_fact: "pending".into(),
+                witness: None,
+                evidence_state: None,
             })
             .collect();
         let views = AsyncQuestionProjector.project_with_hints(
@@ -1512,6 +1719,8 @@ mod r18_placeholder_tests {
             source_item_id: item.into(),
             question_index: index,
             last_fact: fact.into(),
+            witness: None,
+            evidence_state: None,
         }
     }
 
@@ -1590,6 +1799,158 @@ mod r18_placeholder_tests {
         OperationPolicy.evaluate(&context)
     }
 
+    #[test]
+    fn b1_answer_witness_is_thread_scoped() {
+        let echo = compose_async_answer("call-q", 0, "题", "答");
+        let state = canonical(
+            &[
+                ("t-q", "completed", vec![question_item("call-q", "题", &[])]),
+                ("t-a", "completed", vec![user_item("u", &echo)]),
+            ],
+            true,
+        );
+        let witnesses = answer_witnesses("th", &state);
+        let witness = &witnesses[&question_item_id("call-q", 0)];
+        assert_eq!(witness.proof_version, 1);
+        assert_eq!(
+            witness.answer_digest,
+            "0ae910072509ab10d930a02165286b771a6038bd52f7d348132d88ec3b95b7ab"
+        );
+        assert_ne!(
+            witness.answer_digest,
+            answer_witnesses("other", &state)[&question_item_id("call-q", 0)].answer_digest
+        );
+    }
+
+    #[test]
+    fn b1_answer_witness_rejects_duplicate_ids() {
+        let echo = compose_async_answer("call-q", 0, "题", "答");
+        let state = canonical(
+            &[
+                ("t-q", "completed", vec![question_item("call-q", "题", &[])]),
+                (
+                    "t-a",
+                    "completed",
+                    vec![user_item("u", &echo), user_item("u", &echo)],
+                ),
+            ],
+            true,
+        );
+        let views = AsyncQuestionProjector.project(&key(), None, &state, &ops_allowing_async());
+        assert_ne!(views[0].state, InteractionState::Answered);
+    }
+
+    #[test]
+    fn b1_answer_witness_rejects_dangling_refs() {
+        let echo = compose_async_answer("call-q", 0, "题", "答");
+        let mut state = canonical(
+            &[
+                ("t-q", "completed", vec![question_item("call-q", "题", &[])]),
+                ("t-a", "completed", vec![user_item("u", &echo)]),
+            ],
+            true,
+        );
+        state["turnHistory"]["history"]["islands"][0]["entries"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"value": "missing"}));
+        let views = AsyncQuestionProjector.project(&key(), None, &state, &ops_allowing_async());
+        assert_ne!(views[0].state, InteractionState::Answered);
+    }
+
+    #[test]
+    fn b1_duplicate_raw_reference_without_answer_is_unknown() {
+        let mut state = canonical(
+            &[("t-q", "completed", vec![question_item("call-q", "题", &[])])],
+            true,
+        );
+        let entries = state["turnHistory"]["history"]["islands"][0]["entries"]
+            .as_array_mut()
+            .unwrap();
+        entries.push(entries[0].clone());
+        let views = AsyncQuestionProjector.project(&key(), None, &state, &ops_allowing_async());
+        assert_eq!(views[0].state, InteractionState::Unknown);
+        assert!(!views[0].actionable);
+    }
+
+    #[test]
+    fn b1_unreadable_history_keeps_answered_hint_unknown() {
+        let state = json!({});
+        let views = AsyncQuestionProjector.project_with_hints(
+            &key(),
+            None,
+            &state,
+            &ops_allowing_async(),
+            &[hint("call-old", 0, "answered")],
+        );
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0].state, InteractionState::Unknown);
+        assert!(!views[0].actionable);
+    }
+
+    #[test]
+    fn b1_duplicate_envelopes_in_one_message_are_unknown() {
+        let echo = compose_async_answer("call-q", 0, "题", "答");
+        let text = format!("{echo}\n{echo}");
+        let state = canonical(
+            &[
+                ("t-q", "completed", vec![question_item("call-q", "题", &[])]),
+                ("t-a", "completed", vec![user_item("u", &text)]),
+            ],
+            true,
+        );
+        let views = AsyncQuestionProjector.project(&key(), None, &state, &ops_allowing_async());
+        assert_eq!(views[0].state, InteractionState::Unknown);
+        assert!(!views[0].actionable);
+    }
+
+    #[test]
+    fn b1_malformed_answer_envelope_is_unknown() {
+        let state = canonical(&[
+            ("t-q", "completed", vec![question_item("call-q", "题", &[])]),
+            ("t-a", "completed", vec![user_item("u", "<send_user_message_question_reply>\n{bad json\n</send_user_message_question_reply>")]),
+        ], true);
+        let views = AsyncQuestionProjector.project(&key(), None, &state, &ops_allowing_async());
+        assert_eq!(views[0].state, InteractionState::Unknown);
+    }
+
+    #[test]
+    fn b1_answer_witness_rejects_incomplete_answer_items() {
+        let echo = compose_async_answer("call-q", 0, "题", "答");
+        let mut state = canonical(
+            &[
+                ("t-q", "completed", vec![question_item("call-q", "题", &[])]),
+                ("t-a", "completed", vec![user_item("u", &echo)]),
+            ],
+            true,
+        );
+        state["turnHistory"]["history"]["entitiesByKey"]["turn:t-a"]["itemsPagination"] =
+            json!({"hasLoadedOldest": false});
+        let views = AsyncQuestionProjector.project(&key(), None, &state, &ops_allowing_async());
+        assert_eq!(views[0].state, InteractionState::Unknown);
+    }
+
+    #[test]
+    fn b1_earlier_unrelated_item_gap_does_not_invalidate_answer() {
+        let echo = compose_async_answer("call-q", 0, "题", "答");
+        let mut state = canonical(
+            &[
+                (
+                    "t-before",
+                    "completed",
+                    vec![user_item("u-before", "早期消息")],
+                ),
+                ("t-q", "completed", vec![question_item("call-q", "题", &[])]),
+                ("t-a", "completed", vec![user_item("u-answer", &echo)]),
+            ],
+            true,
+        );
+        state["turnHistory"]["history"]["entitiesByKey"]["turn:t-before"]["itemsPagination"] =
+            json!({"hasLoadedOldest": false});
+        let views = AsyncQuestionProjector.project(&key(), None, &state, &ops_allowing_async());
+        assert_eq!(views[0].state, InteractionState::Answered);
+    }
+
     /// 重启后窗口完全不含该题：提示仍给出 Unknown 占位（不可提交；无正文）。
     #[test]
     fn r18_hint_yields_unknown_placeholder_when_window_has_no_questions() {
@@ -1622,7 +1983,7 @@ mod r18_placeholder_tests {
 
     /// 已答提示不产生占位（否则已清的卡会复活）。
     #[test]
-    fn r18_answered_hint_does_not_create_placeholder() {
+    fn b1_legacy_answered_does_not_gain_witness() {
         let state = json!({ "turnHistory": { "history": {
             "isComplete": true,
             "entitiesByKey": {},
@@ -1636,7 +1997,9 @@ mod r18_placeholder_tests {
             &ops,
             &[hint("call-old", 0, "answered")],
         );
-        assert!(views.is_empty());
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0].state, InteractionState::Unknown);
+        assert!(!views[0].actionable);
     }
 
     // ==== L1（2026-11-05）：hint 身份纳入信封配对，纠正"题干滑出窗口"的滞留 ====
@@ -1661,7 +2024,7 @@ mod r18_placeholder_tests {
     /// 修复前：`answered_map` 的 `known` 只含窗口内可见题 → 信封因键不匹配被丢弃
     /// → 只能产出 Unknown 占位 → hint 永远纠不回 answered → 卡滞留。
     #[test]
-    fn hint_derived_key_matches_envelope_after_question_scrolled_out() {
+    fn b1_hint_and_envelope_without_question_are_unknown() {
         let state = state_with_envelope_only("call-old", "用户选的答案");
         let ops = ops_allowing_async();
         let views = AsyncQuestionProjector.project_with_hints(
@@ -1674,11 +2037,11 @@ mod r18_placeholder_tests {
         assert_eq!(views.len(), 1);
         assert_eq!(
             views[0].state,
-            InteractionState::Answered,
-            "hint 身份 + 信封在场 → 必须判已答（卡应消失）"
+            InteractionState::Unknown,
+            "缺失原始题目不能建立强证据"
         );
         assert!(!views[0].actionable);
-        assert!(views[0].disabled_reason_code.is_none());
+        assert!(views[0].disabled_reason_code.is_some());
     }
 
     /// hint 只有题身份、窗口里**没有**信封 → 仍产出 Unknown 占位（不猜已答）。
@@ -1860,9 +2223,9 @@ mod r18_coverage_tests {
         assert!(!views[0].actionable);
     }
 
-    /// 缺口在题目**之前**不影响最新题（更早历史缺页允许作答）。
+    /// 题目前的悬空原始引用不能经跳过后被当成完整身份链。
     #[test]
-    fn r18_gap_before_question_does_not_block_latest_question() {
+    fn b1_dangling_ref_before_question_is_unknown() {
         let state = json!({ "turnHistory": { "history": {
             "isComplete": false,
             "entitiesByKey": {
@@ -1883,11 +2246,8 @@ mod r18_coverage_tests {
         let ops: EffectiveOperations = OperationPolicy.evaluate(&OperationContext::default());
         let views = AsyncQuestionProjector.project(&key(), None, &state, &ops);
         assert_eq!(views.len(), 1);
-        assert!(
-            views[0].state != InteractionState::Unknown,
-            "更早缺口不该把最新题判成未核对：{:?}",
-            views[0].state
-        );
+        assert_eq!(views[0].state, InteractionState::Unknown);
+        assert!(!views[0].actionable);
     }
 }
 
@@ -2008,6 +2368,8 @@ mod h08_tests {
             source_item_id: "call-q".into(),
             question_index: 0,
             last_fact: fact.into(),
+            witness: None,
+            evidence_state: None,
         }
     }
 

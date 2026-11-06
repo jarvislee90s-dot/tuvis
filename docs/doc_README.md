@@ -20,6 +20,8 @@
 - [人工裁决台账](engineering/decisions/)：用户裁决、推翻与边界；只记决定，不记 agent 返工过程。
 - [最终审查索引](engineering/reviews/)：审查范围、最终结论、未闭合风险。
 - [Codex B1 持久事实设计审查](engineering/reviews/2026-11-05-codex-b1-durability-design-review.md)：六项风险的证据等级、五处方案缺口与实施计划修订清单。
+- [Codex B1.2 进度与剩余项](engineering/reviews/2026-11-05-codex-b1-2-progress-review.md)：多次撤销重放的真实 Rust 失败证据、B1.2 收口与 B1.3 未实施范围。
+- [Codex B1.2 验收](engineering/acceptance/2026-11-05-codex-b1-2-acceptance.md)：历史答复证据、重放防护、测试结果及后续边界。
 - [探测与取证](engineering/evidence/)：脱敏的 probe/复探证据。
 - [WorkBuddy 5.9.3 证据](engineering/evidence/2026-10-30-workbuddy-5.9.3/evidence.md)：真机核算、心跳/DB/TPS 探针。
 - [验收](engineering/acceptance/)：最终验收；`history/` 为历史验收材料。

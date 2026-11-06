@@ -53,6 +53,20 @@ where
             }
         }
     }
+    for (column, ty) in [
+        ("proof_version", "INTEGER"),
+        ("answer_turn_id", "TEXT"),
+        ("answer_item_id", "TEXT"),
+        ("answer_digest", "TEXT"),
+        ("evidence_state", "TEXT"),
+    ] {
+        if !column_exists(&tx, "codex_interaction_hints", column) {
+            tx.execute(
+                &format!("ALTER TABLE codex_interaction_hints ADD COLUMN {column} {ty}"),
+                [],
+            )?;
+        }
+    }
     checkpoint(3)?;
     tx.commit()
 }
@@ -1962,7 +1976,15 @@ mod b1_hint_migration_tests {
         crate::database::schema::init(&conn);
         migrate(&conn).unwrap();
         migrate(&conn).unwrap();
-        for column in ["observation_epoch", "observation_seq"] {
+        for column in [
+            "observation_epoch",
+            "observation_seq",
+            "proof_version",
+            "answer_turn_id",
+            "answer_item_id",
+            "answer_digest",
+            "evidence_state",
+        ] {
             assert!(
                 column_exists(&conn, "codex_interaction_hints", column),
                 "missing {column}"
@@ -1973,6 +1995,11 @@ mod b1_hint_migration_tests {
             [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         ).unwrap();
         assert_eq!(row, ("answered".into(), None, None));
+        let evidence: (Option<i64>, Option<String>, Option<String>, Option<String>, Option<String>) = conn.query_row(
+            "SELECT proof_version, answer_turn_id, answer_item_id, answer_digest, evidence_state FROM codex_interaction_hints WHERE thread_id='th'", [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        ).unwrap();
+        assert_eq!(evidence, (None, None, None, None, None));
     }
 
     type B1Column = (i64, String, String, i64, Option<String>, i64);

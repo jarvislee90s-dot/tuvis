@@ -305,6 +305,19 @@ impl HintState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn b1_newer_invalidation_survives_coalescing() {
+        let mut state = HintState::new(1).unwrap();
+        let answered = observe(&mut state, 1, "answered");
+        let unknown = observe(&mut state, 1, "unknown");
+        assert!(unknown.hints[0].version > answered.hints[0].version);
+        assert!(state.prepare_batch(&answered).is_empty());
+        state.apply_report(
+            &answered,
+            &[WriteOutcome::Applied(answered.hints[0].clone())],
+        );
+        assert_eq!(state.prepare_batch(&unknown), unknown.hints);
+    }
     fn key() -> ThreadKey {
         ThreadKey {
             host_id: "local".into(),
@@ -326,6 +339,8 @@ mod tests {
             source_item_id: "item".into(),
             question_index: 0,
             last_fact: fact.into(),
+            witness: None,
+            evidence_state: None,
         }
     }
     fn observe(s: &mut HintState, generation: u64, fact: &str) -> HintObservation {

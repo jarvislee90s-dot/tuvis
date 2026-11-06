@@ -37,6 +37,11 @@ fn hint(epoch: i64) -> StoredInteractionHint {
         updated_at: 1,
         observation_epoch: Some(epoch),
         observation_seq: Some(1),
+        proof_version: None,
+        answer_turn_id: None,
+        answer_item_id: None,
+        answer_digest: None,
+        evidence_state: None,
     }
 }
 fn recv<T>(rx: &mpsc::Receiver<T>) -> T {
@@ -213,6 +218,8 @@ fn b1_store_sqlite_commit_first_blocks_real_owner_revocation() {
             source_item_id: "item".into(),
             question_index: 0,
             last_fact: "answered".into(),
+            witness: None,
+            evidence_state: None,
         },
         version: HintVersion { epoch, sequence: 1 },
     };
@@ -295,6 +302,8 @@ fn b1_store_db_queue_allows_registry_revocation() {
             source_item_id: "item".into(),
             question_index: 0,
             last_fact: "answered".into(),
+            witness: None,
+            evidence_state: None,
         },
         version: HintVersion { epoch, sequence: 1 },
     };
@@ -353,6 +362,8 @@ fn versioned_hint(epoch: i64) -> super::super::hint_state::VersionedHint {
             source_item_id: "item".into(),
             question_index: 0,
             last_fact: "answered".into(),
+            witness: None,
+            evidence_state: None,
         },
         version: HintVersion { epoch, sequence: 1 },
     }

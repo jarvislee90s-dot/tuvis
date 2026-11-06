@@ -16,7 +16,7 @@ pub fn next_hint_epoch_conn(conn: &Connection) -> rusqlite::Result<i64> {
     {
         let _ = tx.prepare(
             "SELECT thread_id, source_turn_id, source_item_id, question_index, last_fact, \
-             updated_at, observation_epoch, observation_seq FROM codex_interaction_hints LIMIT 0",
+             updated_at, observation_epoch, observation_seq, proof_version, answer_turn_id, answer_item_id, answer_digest, evidence_state FROM codex_interaction_hints LIMIT 0",
         )?;
         let _ = tx.prepare("SELECT singleton, epoch FROM codex_hint_writer_state LIMIT 0")?;
     }
@@ -45,6 +45,11 @@ pub struct StoredInteractionHint {
     pub updated_at: i64,
     pub observation_epoch: Option<i64>,
     pub observation_seq: Option<i64>,
+    pub proof_version: Option<i64>,
+    pub answer_turn_id: Option<String>,
+    pub answer_item_id: Option<String>,
+    pub answer_digest: Option<String>,
+    pub evidence_state: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -105,9 +110,9 @@ pub(crate) fn prepare_versioned_hints_conn<'c>(
             return Err(HintWriteError::InvalidVersion);
         }
         let previous: Option<StoredInteractionHint> = tx.query_row(
-            "SELECT thread_id, source_turn_id, source_item_id, question_index, last_fact, updated_at, observation_epoch, observation_seq FROM codex_interaction_hints WHERE thread_id=?1 AND source_turn_id=?2 AND source_item_id=?3 AND question_index=?4",
+            "SELECT thread_id, source_turn_id, source_item_id, question_index, last_fact, updated_at, observation_epoch, observation_seq, proof_version, answer_turn_id, answer_item_id, answer_digest, evidence_state FROM codex_interaction_hints WHERE thread_id=?1 AND source_turn_id=?2 AND source_item_id=?3 AND question_index=?4",
             params![hint.thread_id, hint.source_turn_id, hint.source_item_id, hint.question_index],
-            |row| Ok(StoredInteractionHint { thread_id: row.get(0)?, source_turn_id: row.get(1)?, source_item_id: row.get(2)?, question_index: row.get(3)?, last_fact: row.get(4)?, updated_at: row.get(5)?, observation_epoch: row.get(6)?, observation_seq: row.get(7)? }),
+            |row| Ok(StoredInteractionHint { thread_id: row.get(0)?, source_turn_id: row.get(1)?, source_item_id: row.get(2)?, question_index: row.get(3)?, last_fact: row.get(4)?, updated_at: row.get(5)?, observation_epoch: row.get(6)?, observation_seq: row.get(7)?, proof_version: row.get(8)?, answer_turn_id: row.get(9)?, answer_item_id: row.get(10)?, answer_digest: row.get(11)?, evidence_state: row.get(12)? }),
         ).optional()?;
         if let Some(ref row) = previous {
             match (row.observation_epoch, row.observation_seq) {
@@ -118,7 +123,13 @@ pub(crate) fn prepare_versioned_hints_conn<'c>(
                         continue;
                     }
                     std::cmp::Ordering::Equal => {
-                        if row.last_fact != hint.last_fact {
+                        if row.last_fact != hint.last_fact
+                            || row.proof_version != hint.proof_version
+                            || row.answer_turn_id != hint.answer_turn_id
+                            || row.answer_item_id != hint.answer_item_id
+                            || row.answer_digest != hint.answer_digest
+                            || row.evidence_state != hint.evidence_state
+                        {
                             return Err(HintWriteError::VersionCollision);
                         }
                         report.push(HintWriteOutcome::AlreadyCurrent(row.clone()));
@@ -130,10 +141,10 @@ pub(crate) fn prepare_versioned_hints_conn<'c>(
             }
         }
         let changed = tx.execute(
-            "INSERT INTO codex_interaction_hints (thread_id, source_turn_id, source_item_id, question_index, last_fact, updated_at, observation_epoch, observation_seq) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
-             ON CONFLICT(thread_id, source_turn_id, source_item_id, question_index) DO UPDATE SET last_fact=excluded.last_fact, updated_at=excluded.updated_at, observation_epoch=excluded.observation_epoch, observation_seq=excluded.observation_seq
+            "INSERT INTO codex_interaction_hints (thread_id, source_turn_id, source_item_id, question_index, last_fact, updated_at, observation_epoch, observation_seq, proof_version, answer_turn_id, answer_item_id, answer_digest, evidence_state) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)
+             ON CONFLICT(thread_id, source_turn_id, source_item_id, question_index) DO UPDATE SET last_fact=excluded.last_fact, updated_at=excluded.updated_at, observation_epoch=excluded.observation_epoch, observation_seq=excluded.observation_seq, proof_version=excluded.proof_version, answer_turn_id=excluded.answer_turn_id, answer_item_id=excluded.answer_item_id, answer_digest=excluded.answer_digest, evidence_state=excluded.evidence_state
              WHERE (codex_interaction_hints.observation_epoch IS NULL AND codex_interaction_hints.observation_seq IS NULL) OR excluded.observation_epoch > codex_interaction_hints.observation_epoch OR (excluded.observation_epoch = codex_interaction_hints.observation_epoch AND excluded.observation_seq > codex_interaction_hints.observation_seq)",
-            params![hint.thread_id, hint.source_turn_id, hint.source_item_id, hint.question_index, hint.last_fact, hint.updated_at, epoch, sequence],
+            params![hint.thread_id, hint.source_turn_id, hint.source_item_id, hint.question_index, hint.last_fact, hint.updated_at, epoch, sequence, hint.proof_version, hint.answer_turn_id, hint.answer_item_id, hint.answer_digest, hint.evidence_state],
         )?;
         if changed != 1 {
             return Err(HintWriteError::InvalidVersion);
@@ -181,7 +192,7 @@ pub fn get_interaction_hints_conn(
     thread_id: &str,
 ) -> rusqlite::Result<Vec<StoredInteractionHint>> {
     let mut stmt = conn.prepare(
-        "SELECT thread_id, source_turn_id, source_item_id, question_index, last_fact, updated_at, observation_epoch, observation_seq
+        "SELECT thread_id, source_turn_id, source_item_id, question_index, last_fact, updated_at, observation_epoch, observation_seq, proof_version, answer_turn_id, answer_item_id, answer_digest, evidence_state
          FROM codex_interaction_hints WHERE thread_id = ?1
          ORDER BY source_turn_id, source_item_id, question_index",
     )?;
@@ -195,6 +206,11 @@ pub fn get_interaction_hints_conn(
             updated_at: row.get(5)?,
             observation_epoch: row.get(6)?,
             observation_seq: row.get(7)?,
+            proof_version: row.get(8)?,
+            answer_turn_id: row.get(9)?,
+            answer_item_id: row.get(10)?,
+            answer_digest: row.get(11)?,
+            evidence_state: row.get(12)?,
         })
     })?;
     let rows: Vec<StoredInteractionHint> = rows.collect::<rusqlite::Result<_>>()?;
@@ -230,7 +246,36 @@ mod tests {
             updated_at: at,
             observation_epoch: None,
             observation_seq: None,
+            proof_version: None,
+            answer_turn_id: None,
+            answer_item_id: None,
+            answer_digest: None,
+            evidence_state: None,
         }
+    }
+
+    #[test]
+    fn b12_evidence_round_trip_and_collision() {
+        let c = Connection::open_in_memory().unwrap();
+        crate::database::schema::init(&c);
+        crate::database::migration::migrate(&c).unwrap();
+        let epoch = next_hint_epoch_conn(&c).unwrap();
+        let mut h = versioned(epoch, 1, "answered");
+        h.proof_version = Some(1);
+        h.answer_turn_id = Some("answer-turn".into());
+        h.answer_item_id = Some("answer-item".into());
+        h.answer_digest = Some("digest".into());
+        h.evidence_state = Some("unverified".into());
+        upsert_versioned_hints_conn(&c, epoch, &[h.clone()]).unwrap();
+        assert_eq!(
+            get_interaction_hints_conn(&c, &h.thread_id).unwrap(),
+            vec![h.clone()]
+        );
+        h.answer_digest = Some("other".into());
+        assert!(matches!(
+            upsert_versioned_hints_conn(&c, epoch, &[h]),
+            Err(HintWriteError::VersionCollision)
+        ));
     }
 
     #[test]

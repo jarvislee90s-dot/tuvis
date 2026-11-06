@@ -242,6 +242,7 @@ struct AdapterInner {
     mirrors: Mutex<HashMap<ThreadKey, ThreadMirror>>,
     /// C4：全体镜像字节账本（生产 64MiB；所有镜像共用一份）
     mirror_ledger: Arc<std::sync::Mutex<super::mirror::MirrorLedger>>,
+    answer_validity: Arc<super::answer_validity::AnswerValidityLedger>,
     followings: Mutex<FollowingSet>,
     remote_write_generation: Arc<super::observation::RemoteWriteGeneration>,
     estimate_pins: std::sync::atomic::AtomicUsize,
@@ -883,6 +884,19 @@ impl DesktopIpcAdapter {
     }
 
     pub fn new(connector: Arc<dyn Connector>, profile: ProtocolProfile) -> Self {
+        Self::with_answer_validity(
+            connector,
+            profile,
+            Arc::new(super::answer_validity::AnswerValidityLedger::default()),
+        )
+    }
+
+    /// 串行重装时使用上一实例的运行期账本；调用方须先停用旧实例。
+    pub fn with_answer_validity(
+        connector: Arc<dyn Connector>,
+        profile: ProtocolProfile,
+        answer_validity: Arc<super::answer_validity::AnswerValidityLedger>,
+    ) -> Self {
         Self {
             inner: Arc::new(AdapterInner {
                 connector,
@@ -914,6 +928,7 @@ impl DesktopIpcAdapter {
                 mirror_ledger: Arc::new(std::sync::Mutex::new(
                     super::mirror::MirrorLedger::global(),
                 )),
+                answer_validity,
                 followings: Mutex::new(FollowingSet::default()),
                 remote_write_generation: Arc::default(),
                 estimate_pins: std::sync::atomic::AtomicUsize::new(0),
@@ -986,6 +1001,11 @@ impl DesktopIpcAdapter {
                 events: broadcast::channel(256).0,
             }),
         }
+    }
+
+    /// 获取运行期账本，仅供旧实例停止后的串行重装接续。
+    pub fn answer_validity(&self) -> Arc<super::answer_validity::AnswerValidityLedger> {
+        self.inner.answer_validity.clone()
     }
 
     /// #172/T7：注入官方 schema 证据（生产由装配期一次性探测填入；测试直接注入）。
@@ -3171,13 +3191,7 @@ impl DesktopIpcAdapter {
         };
         let hints: Vec<super::async_question::InteractionHint> = rows
             .into_iter()
-            .map(|row| super::async_question::InteractionHint {
-                thread_id: row.thread_id,
-                source_turn_id: row.source_turn_id,
-                source_item_id: row.source_item_id,
-                question_index: row.question_index,
-                last_fact: row.last_fact,
-            })
+            .map(super::async_question::InteractionHint::from_stored)
             .collect();
         self.inner
             .interaction_hints_cache
@@ -3215,19 +3229,52 @@ impl DesktopIpcAdapter {
             return None;
         }
         let scope = permit.scope_id();
+        let previous = self
+            .inner
+            .interaction_hints_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key.thread_id)
+            .cloned()?;
+        let current_witnesses = mirror
+            .observation_state()
+            .map(|state| super::async_question::answer_witnesses(&key.thread_id, state))
+            .unwrap_or_default();
         let hints: Vec<_> = questions
             .iter()
-            .map(|question| super::async_question::InteractionHint {
-                thread_id: key.thread_id.clone(),
-                source_turn_id: question.source_turn_id.clone(),
-                source_item_id: question.source_item_id.clone(),
-                question_index: question.question_index,
-                last_fact: match question.state {
-                    super::async_question::InteractionState::Answered => "answered",
-                    super::async_question::InteractionState::Unknown => "unknown",
-                    _ => "pending",
+            .map(|question| {
+                let direct = current_witnesses.get(&question.question_key).cloned();
+                let prior = previous.iter().find(|h| {
+                    h.source_turn_id == question.source_turn_id
+                        && h.source_item_id == question.source_item_id
+                        && h.question_index == question.question_index
+                });
+                let witness = direct
+                    .clone()
+                    .or_else(|| prior.and_then(|h| h.witness.clone()));
+                let evidence_state = if direct.is_some()
+                    && question.state == super::async_question::InteractionState::Answered
+                {
+                    Some("valid".to_string())
+                } else if witness.is_some() {
+                    Some("unverified".to_string())
+                } else {
+                    None
+                };
+                super::async_question::InteractionHint {
+                    thread_id: key.thread_id.clone(),
+                    source_turn_id: question.source_turn_id.clone(),
+                    source_item_id: question.source_item_id.clone(),
+                    question_index: question.question_index,
+                    last_fact: match question.state {
+                        super::async_question::InteractionState::Answered => "answered",
+                        super::async_question::InteractionState::Unknown => "unknown",
+                        _ => "pending",
+                    }
+                    .into(),
+                    witness,
+                    evidence_state,
                 }
-                .into(),
             })
             .collect();
         let mut observations = self
@@ -3393,6 +3440,8 @@ impl DesktopIpcAdapter {
                         source_item_id: question.source_item_id.clone(),
                         question_index: question.question_index,
                         last_fact: fact.to_string(),
+                        witness: None,
+                        evidence_state: None,
                     });
                 }
             }
@@ -4751,7 +4800,10 @@ impl DesktopIpcAdapter {
         {
             let mut mirrors = self.inner.mirrors.lock().await;
             mirrors.entry(key.clone()).or_insert_with(|| {
-                ThreadMirror::with_ledger(key.clone(), self.inner.mirror_ledger.clone())
+                let mut mirror =
+                    ThreadMirror::with_ledger(key.clone(), self.inner.mirror_ledger.clone());
+                mirror.set_answer_validity_ledger(self.inner.answer_validity.clone());
+                mirror
             });
         }
         // discovery（await 不持锁）→ 绑定（短锁）。
@@ -10220,6 +10272,152 @@ mod pr202_hint_init_tests {
     };
     use std::sync::atomic::{AtomicBool, AtomicUsize};
 
+    #[tokio::test]
+    async fn b1_serial_adapter_rebuild_preserves_retired_sources() {
+        let (old, key, _) = setup();
+        let ledger = old.answer_validity();
+        let witness = |id: &str| super::super::async_question::AnswerWitness {
+            proof_version: 1,
+            answer_turn_id: "turn".into(),
+            answer_item_id: id.into(),
+            answer_digest: "digest".into(),
+        };
+        assert!(ledger.apply(&key, "q", Some("v1"), Some(&witness("old")), &[]));
+        assert!(ledger.apply(&key, "q", Some("v2"), Some(&witness("new")), &[]));
+        old.begin_shutdown();
+        old.shutdown().await;
+        drop(old);
+        let replacement = DesktopIpcAdapter::with_answer_validity(
+            Arc::new(super::publish_protocol_tests::NoopConnector),
+            ProtocolProfile::closed(),
+            ledger,
+        );
+        assert!(!replacement
+            .inner
+            .answer_validity
+            .allows_candidate(&key, "q", "old"));
+        assert!(replacement
+            .inner
+            .answer_validity
+            .allows_candidate(&key, "q", "new"));
+    }
+
+    #[tokio::test]
+    async fn b1_replayed_witness_is_not_persisted_valid() {
+        use super::super::hint_state::WriteOutcome;
+        use crate::remote::codex_evidence::StoreInteractionHints;
+        use crate::remote::pairing::DeviceStore;
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::database::schema::init(&conn);
+        crate::database::migration::migrate(&conn).unwrap();
+        let store = Arc::new(StoreInteractionHints::new(DeviceStore::Owned(Arc::new(
+            std::sync::Mutex::new(conn),
+        ))));
+        let adapter = DesktopIpcAdapter::new(
+            Arc::new(super::publish_protocol_tests::NoopConnector),
+            ProtocolProfile::closed(),
+        );
+        adapter.set_interaction_hint_store(Some(store.clone()));
+        let key = ThreadKey {
+            host_id: "local".into(),
+            thread_id: "replay".into(),
+        };
+        adapter.ensure_interaction_hints(&key).await;
+        let lease = super::super::types::OwnerLease {
+            key: key.clone(),
+            client_id: "owner".into(),
+            epoch: 1,
+            generation: 1,
+        };
+        let mut mirror = ThreadMirror::new(key.clone());
+        mirror.set_answer_validity_ledger(adapter.inner.answer_validity.clone());
+        mirror.bind_hint_authority(super::super::hint_commit::HintLeaseAuthority::new(
+            lease.clone(),
+        ));
+        let envelope = super::super::async_question::compose_async_answer("call-1", 0, "Q", "A");
+        let state = serde_json::json!({"turnHistory":{"history":{"isComplete":true,"entitiesByKey":{
+            "q":{"turnId":"q","status":"completed","items":[{"type":"agentMessage","id":"call-1","questions":[{"title":"Q"}]}]},
+            "a":{"turnId":"a","status":"completed","items":[{"type":"userMessage","id":"answer-1","content":[{"type":"text","text":envelope}]}]}
+        },"islands":[{"entries":[{"value":"q"},{"value":"a"}]}]}}});
+        mirror
+            .apply(
+                &lease,
+                &serde_json::json!({"type":"snapshot","revision":1,"conversationState":state}),
+            )
+            .unwrap();
+        let projection = mirror.project(adapter.current_caps());
+        assert_eq!(
+            projection.async_questions[0].state,
+            InteractionState::Answered
+        );
+        let old = adapter
+            .capture_hint_observation(&key, &mirror, &projection.async_questions)
+            .unwrap();
+        let old_observation = old.observation.clone();
+        let old_scope = old.scope;
+        adapter.persist_authorized_hints(old).await;
+        mirror.apply(&lease, &serde_json::json!({"type":"patches","baseRevision":1,"revision":2,"patches":[{"op":"replace","path":["turnHistory","history","entitiesByKey","q","items",0,"questions",0,"title"],"value":"Q1"}]})).unwrap();
+        mirror.apply(&lease, &serde_json::json!({"type":"patches","baseRevision":2,"revision":3,"patches":[{"op":"replace","path":["turnHistory","history","entitiesByKey","q","items",0,"questions",0,"title"],"value":"Q"}]})).unwrap();
+        let replay = mirror.project(adapter.current_caps());
+        assert_eq!(replay.async_questions[0].state, InteractionState::Unknown);
+        let newer = adapter
+            .capture_hint_observation(&key, &mirror, &replay.async_questions)
+            .unwrap();
+        {
+            let mut guard = adapter.inner.hint_observations.lock().unwrap();
+            let observations = guard.as_mut().unwrap();
+            let late_ack: Vec<_> = old_observation
+                .hints
+                .iter()
+                .cloned()
+                .map(WriteOutcome::Applied)
+                .collect();
+            observations
+                .state
+                .apply_report_scoped(&old_observation, old_scope, &late_ack);
+        }
+        adapter.persist_authorized_hints(newer).await;
+        let rows = store.load(&key.thread_id).unwrap();
+        let row = rows
+            .iter()
+            .find(|row| row.source_item_id == "call-1")
+            .unwrap();
+        assert_eq!(row.last_fact, "unknown");
+        assert_ne!(row.evidence_state.as_deref(), Some("valid"));
+    }
+
+    #[tokio::test]
+    async fn b1_revocations_survive_remote_stop_start() {
+        let (adapter, key, _) = setup();
+        let ledger = &adapter.inner.answer_validity;
+        let witness = |id: &str| super::super::async_question::AnswerWitness {
+            proof_version: 1,
+            answer_turn_id: "turn".into(),
+            answer_item_id: id.into(),
+            answer_digest: "digest".into(),
+        };
+        assert!(ledger.apply(
+            &key,
+            "question",
+            Some("before"),
+            Some(&witness("answer-1")),
+            &[]
+        ));
+        assert!(ledger.apply(
+            &key,
+            "question",
+            Some("after"),
+            Some(&witness("answer-2")),
+            &[]
+        ));
+        assert!(!ledger.allows_candidate(&key, "question", "answer-1"));
+        adapter.begin_remote_shutdown();
+        adapter.shutdown().await;
+        adapter.resume();
+        assert!(!ledger.allows_candidate(&key, "question", "answer-1"));
+        assert!(ledger.allows_candidate(&key, "question", "answer-2"));
+    }
+
     #[derive(Default)]
     struct MemoryHints {
         rows: std::sync::Mutex<Vec<StoredInteractionHint>>,
@@ -10274,16 +10472,9 @@ mod pr202_hint_init_tests {
             let mut rows = self.rows.lock().unwrap();
             let guard = permit.lock().map_err(|_| HintStoreError::Fenced)?;
             for h in hints {
-                let row = StoredInteractionHint {
-                    thread_id: h.hint.thread_id.clone(),
-                    source_turn_id: h.hint.source_turn_id.clone(),
-                    source_item_id: h.hint.source_item_id.clone(),
-                    question_index: h.hint.question_index,
-                    last_fact: h.hint.last_fact.clone(),
-                    updated_at: at_ms,
-                    observation_epoch: Some(h.version.epoch),
-                    observation_seq: Some(h.version.sequence),
-                };
+                let row = h
+                    .hint
+                    .to_stored(at_ms, Some(h.version.epoch), Some(h.version.sequence));
                 if let Some(existing) = rows.iter_mut().find(|r| {
                     r.thread_id == row.thread_id
                         && r.source_turn_id == row.source_turn_id
@@ -10320,6 +10511,11 @@ mod pr202_hint_init_tests {
                 updated_at: at_ms,
                 observation_epoch: None,
                 observation_seq: None,
+                proof_version: None,
+                answer_turn_id: None,
+                answer_item_id: None,
+                answer_digest: None,
+                evidence_state: None,
             };
             let mut rows = self.rows.lock().unwrap();
             if let Some(slot) = rows.iter_mut().find(|old| {
@@ -10354,6 +10550,11 @@ mod pr202_hint_init_tests {
             updated_at: 1,
             observation_epoch: None,
             observation_seq: None,
+            proof_version: None,
+            answer_turn_id: None,
+            answer_item_id: None,
+            answer_digest: None,
+            evidence_state: None,
         });
         adapter.set_interaction_hint_store(Some(store.clone()));
         (adapter, key, store)
@@ -10411,6 +10612,11 @@ mod pr202_hint_init_tests {
             updated_at: 1,
             observation_epoch: None,
             observation_seq: None,
+            proof_version: None,
+            answer_turn_id: None,
+            answer_item_id: None,
+            answer_digest: None,
+            evidence_state: None,
         });
         store.fail_next_load.store(true, Ordering::SeqCst);
         adapter.ensure_interaction_hints(&second).await;
@@ -10491,6 +10697,45 @@ mod pr202_hint_init_tests {
             .unwrap()
             .iter()
             .any(|row| row.source_item_id == "new-item"));
+    }
+
+    #[tokio::test]
+    async fn b1_unknown_observation_does_not_mark_witness_valid() {
+        let (adapter, key, _) = setup();
+        adapter.ensure_interaction_hints(&key).await;
+        let lease = super::super::types::OwnerLease {
+            key: key.clone(),
+            client_id: "owner".into(),
+            epoch: 1,
+            generation: 1,
+        };
+        let mut mirror = ThreadMirror::new(key.clone());
+        mirror.bind_hint_authority(super::super::hint_commit::HintLeaseAuthority::new(
+            lease.clone(),
+        ));
+        let envelope = super::super::async_question::compose_async_answer("call-1", 0, "Q", "A");
+        let state = serde_json::json!({"turnHistory":{"history":{"isComplete":true,"entitiesByKey":{
+            "q":{"turnId":"q","items":[{"type":"agentMessage","id":"call-1","questions":[{"title":"Q"}]}]},
+            "a":{"turnId":"a","items":[{"type":"userMessage","id":"answer","content":[{"type":"text","text":envelope}]}]}
+        },"islands":[{"entries":[{"value":"q"},{"value":"a"}]}]}}});
+        mirror
+            .apply(
+                &lease,
+                &serde_json::json!({"type":"snapshot","revision":1,"conversationState":state}),
+            )
+            .unwrap();
+        let mut question = new_question();
+        question.question_key = super::super::async_question::question_item_id("call-1", 0);
+        question.source_turn_id = "q".into();
+        question.source_item_id = "call-1".into();
+        question.state = InteractionState::Unknown;
+        let observed = adapter
+            .capture_hint_observation(&key, &mirror, &[question])
+            .unwrap();
+        assert_ne!(
+            observed.observation.hints[0].hint.evidence_state.as_deref(),
+            Some("valid")
+        );
     }
 
     #[tokio::test]

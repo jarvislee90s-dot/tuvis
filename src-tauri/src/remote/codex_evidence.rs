@@ -246,15 +246,9 @@ impl InteractionHintStore for StoreInteractionHints {
         }
         let rows: Vec<_> = hints
             .iter()
-            .map(|h| StoredInteractionHint {
-                thread_id: h.hint.thread_id.clone(),
-                source_turn_id: h.hint.source_turn_id.clone(),
-                source_item_id: h.hint.source_item_id.clone(),
-                question_index: h.hint.question_index,
-                last_fact: h.hint.last_fact.clone(),
-                updated_at: at_ms,
-                observation_epoch: Some(h.version.epoch),
-                observation_seq: Some(h.version.sequence),
+            .map(|h| {
+                h.hint
+                    .to_stored(at_ms, Some(h.version.epoch), Some(h.version.sequence))
             })
             .collect();
         let map_error = |e| match e {
@@ -290,17 +284,11 @@ impl InteractionHintStore for StoreInteractionHints {
             .into_iter()
             .map(|outcome| {
                 let convert = |row: StoredInteractionHint| VersionedHint {
-                    hint: InteractionHint {
-                        thread_id: row.thread_id,
-                        source_turn_id: row.source_turn_id,
-                        source_item_id: row.source_item_id,
-                        question_index: row.question_index,
-                        last_fact: row.last_fact,
-                    },
                     version: HintVersion {
                         epoch: row.observation_epoch.expect("versioned report"),
                         sequence: row.observation_seq.expect("versioned report"),
                     },
+                    hint: InteractionHint::from_stored(row),
                 };
                 match outcome {
                     HintWriteOutcome::Applied(row) => WriteOutcome::Applied(convert(row)),
@@ -324,6 +312,11 @@ impl InteractionHintStore for StoreInteractionHints {
             updated_at: at_ms,
             observation_epoch: None,
             observation_seq: None,
+            proof_version: None,
+            answer_turn_id: None,
+            answer_item_id: None,
+            answer_digest: None,
+            evidence_state: None,
         };
         self.store.with(|conn| {
             if let Err(e) =
@@ -375,6 +368,8 @@ mod tests {
                 source_item_id: "item".into(),
                 question_index: 0,
                 last_fact: "pending".into(),
+                witness: None,
+                evidence_state: None,
             },
             version: HintVersion { epoch, sequence: 1 },
         };
@@ -425,6 +420,8 @@ mod tests {
                 source_item_id: "item".into(),
                 question_index: 0,
                 last_fact: "answered".into(),
+                witness: None,
+                evidence_state: None,
             },
             version: HintVersion { epoch, sequence: 1 },
         };
@@ -465,6 +462,8 @@ mod tests {
                 source_item_id: "item".into(),
                 question_index: 0,
                 last_fact: "answered".into(),
+                witness: None,
+                evidence_state: None,
             },
             version: HintVersion { epoch, sequence: 1 },
         };
@@ -584,6 +583,8 @@ mod tests {
             source_item_id: "i1".into(),
             question_index: 2,
             last_fact: "unknown".into(),
+            witness: None,
+            evidence_state: None,
         };
         hints.upsert(&hint, 1_000);
         let loaded = hints.load("th").expect("rows");

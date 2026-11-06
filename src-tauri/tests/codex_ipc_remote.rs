@@ -25195,7 +25195,7 @@ async fn pr202_first_snapshot_reconciles_old_answer() {
         first
             .async_questions
             .iter()
-            .any(|q| q.source_item_id == "old-item" && q.state == InteractionState::Answered),
+            .any(|q| q.source_item_id == "old-item" && q.state == InteractionState::Unknown),
         "first published: {:?}",
         first.async_questions
     );
@@ -25217,7 +25217,7 @@ async fn pr202_first_snapshot_reconciles_old_answer() {
     assert!(
         initial_questions
             .iter()
-            .all(|q| q["sourceItemId"] != "old-item" || q["state"] == "answered"),
+            .any(|q| q["sourceItemId"] == "old-item" && q["state"] == "unknown"),
         "initial={initial}"
     );
     assert!(
@@ -25243,5 +25243,5 @@ async fn pr202_first_snapshot_reconciles_old_answer() {
     );
     let conn = f.conn.lock().unwrap();
     let fact: String = conn.query_row("SELECT last_fact FROM codex_interaction_hints WHERE thread_id=?1 AND source_item_id='old-item'", [THREAD], |r| r.get(0)).unwrap();
-    assert_eq!(fact, "answered");
+    assert_eq!(fact, "unknown");
 }
