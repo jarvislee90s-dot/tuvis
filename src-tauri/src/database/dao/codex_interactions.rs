@@ -9,6 +9,30 @@
 
 use rusqlite::{params, Connection, OptionalExtension};
 
+/// 分配唯一的提示写入器世代；不修补不完整的 schema。
+pub fn next_hint_epoch_conn(conn: &Connection) -> rusqlite::Result<i64> {
+    let tx = conn.unchecked_transaction()?;
+    // 只验证结构，不先读取或缓存 epoch；实际递增由单条 SQL 原子执行。
+    {
+        let _ = tx.prepare(
+            "SELECT thread_id, source_turn_id, source_item_id, question_index, last_fact, \
+             updated_at, observation_epoch, observation_seq FROM codex_interaction_hints LIMIT 0",
+        )?;
+        let _ = tx.prepare("SELECT singleton, epoch FROM codex_hint_writer_state LIMIT 0")?;
+    }
+    let epoch = tx.query_row(
+        "UPDATE codex_hint_writer_state SET epoch = epoch + 1
+         WHERE singleton = 1 AND typeof(epoch) = 'integer' AND epoch >= 0
+           AND epoch < 9223372036854775807
+           AND (SELECT COUNT(*) FROM codex_hint_writer_state) = 1
+         RETURNING epoch",
+        [],
+        |row| row.get::<_, i64>(0),
+    )?;
+    tx.commit()?;
+    Ok(epoch)
+}
+
 /// 持久提示行。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredInteractionHint {
@@ -19,9 +43,115 @@ pub struct StoredInteractionHint {
     /// `answered` / `pending` / `unknown`（未知词按 `unknown` 由上层保守处理）。
     pub last_fact: String,
     pub updated_at: i64,
+    pub observation_epoch: Option<i64>,
+    pub observation_seq: Option<i64>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HintWriteOutcome {
+    Applied(StoredInteractionHint),
+    AlreadyCurrent(StoredInteractionHint),
+    Superseded(StoredInteractionHint),
+}
+#[derive(Debug)]
+pub enum HintWriteError {
+    Storage(rusqlite::Error),
+    VersionCollision,
+    Fenced,
+    InvalidVersion,
+}
+impl From<rusqlite::Error> for HintWriteError {
+    fn from(value: rusqlite::Error) -> Self {
+        Self::Storage(value)
+    }
+}
+pub(crate) struct PreparedHintBatch<'c> {
+    tx: rusqlite::Transaction<'c>,
+    report: Vec<HintWriteOutcome>,
+}
+impl PreparedHintBatch<'_> {
+    pub(crate) fn commit(self) -> Result<Vec<HintWriteOutcome>, HintWriteError> {
+        self.tx.commit()?;
+        Ok(self.report)
+    }
+}
+pub(crate) fn prepare_versioned_hints_conn<'c>(
+    conn: &'c Connection,
+    epoch: i64,
+    hints: &[StoredInteractionHint],
+) -> Result<PreparedHintBatch<'c>, HintWriteError> {
+    if epoch <= 0 {
+        return Err(HintWriteError::InvalidVersion);
+    }
+    let tx = conn.unchecked_transaction()?;
+    let current: Option<i64> = tx.query_row(
+        "SELECT epoch FROM codex_hint_writer_state WHERE singleton = 1 AND typeof(epoch) = 'integer' AND (SELECT COUNT(*) FROM codex_hint_writer_state) = 1",
+        [], |row| row.get(0),
+    ).optional()?;
+    if current != Some(epoch) {
+        return Err(HintWriteError::Fenced);
+    }
+    let mut report = Vec::with_capacity(hints.len());
+    for hint in hints {
+        let sequence = match (hint.observation_epoch, hint.observation_seq) {
+            (Some(e), Some(s)) if e == epoch && s > 0 => s,
+            _ => return Err(HintWriteError::InvalidVersion),
+        };
+        if hint.thread_id.is_empty()
+            || hint.source_turn_id.is_empty()
+            || hint.source_item_id.is_empty()
+            || !matches!(hint.last_fact.as_str(), "pending" | "answered" | "unknown")
+        {
+            return Err(HintWriteError::InvalidVersion);
+        }
+        let previous: Option<StoredInteractionHint> = tx.query_row(
+            "SELECT thread_id, source_turn_id, source_item_id, question_index, last_fact, updated_at, observation_epoch, observation_seq FROM codex_interaction_hints WHERE thread_id=?1 AND source_turn_id=?2 AND source_item_id=?3 AND question_index=?4",
+            params![hint.thread_id, hint.source_turn_id, hint.source_item_id, hint.question_index],
+            |row| Ok(StoredInteractionHint { thread_id: row.get(0)?, source_turn_id: row.get(1)?, source_item_id: row.get(2)?, question_index: row.get(3)?, last_fact: row.get(4)?, updated_at: row.get(5)?, observation_epoch: row.get(6)?, observation_seq: row.get(7)? }),
+        ).optional()?;
+        if let Some(ref row) = previous {
+            match (row.observation_epoch, row.observation_seq) {
+                (None, None) => {}
+                (Some(e), Some(s)) if e > 0 && s > 0 => match (e, s).cmp(&(epoch, sequence)) {
+                    std::cmp::Ordering::Greater => {
+                        report.push(HintWriteOutcome::Superseded(row.clone()));
+                        continue;
+                    }
+                    std::cmp::Ordering::Equal => {
+                        if row.last_fact != hint.last_fact {
+                            return Err(HintWriteError::VersionCollision);
+                        }
+                        report.push(HintWriteOutcome::AlreadyCurrent(row.clone()));
+                        continue;
+                    }
+                    std::cmp::Ordering::Less => {}
+                },
+                _ => return Err(HintWriteError::InvalidVersion),
+            }
+        }
+        let changed = tx.execute(
+            "INSERT INTO codex_interaction_hints (thread_id, source_turn_id, source_item_id, question_index, last_fact, updated_at, observation_epoch, observation_seq) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
+             ON CONFLICT(thread_id, source_turn_id, source_item_id, question_index) DO UPDATE SET last_fact=excluded.last_fact, updated_at=excluded.updated_at, observation_epoch=excluded.observation_epoch, observation_seq=excluded.observation_seq
+             WHERE (codex_interaction_hints.observation_epoch IS NULL AND codex_interaction_hints.observation_seq IS NULL) OR excluded.observation_epoch > codex_interaction_hints.observation_epoch OR (excluded.observation_epoch = codex_interaction_hints.observation_epoch AND excluded.observation_seq > codex_interaction_hints.observation_seq)",
+            params![hint.thread_id, hint.source_turn_id, hint.source_item_id, hint.question_index, hint.last_fact, hint.updated_at, epoch, sequence],
+        )?;
+        if changed != 1 {
+            return Err(HintWriteError::InvalidVersion);
+        }
+        report.push(HintWriteOutcome::Applied(hint.clone()));
+    }
+    Ok(PreparedHintBatch { tx, report })
+}
+#[cfg(test)]
+pub fn upsert_versioned_hints_conn(
+    conn: &Connection,
+    epoch: i64,
+    hints: &[StoredInteractionHint],
+) -> Result<Vec<HintWriteOutcome>, HintWriteError> {
+    prepare_versioned_hints_conn(conn, epoch, hints)?.commit()
+}
 /// 写一条提示（主键 `(thread, turn, item, index)`；同键覆盖，幂等）。
+#[cfg(test)]
 pub fn upsert_interaction_hint_conn(
     conn: &Connection,
     hint: &StoredInteractionHint,
@@ -51,7 +181,7 @@ pub fn get_interaction_hints_conn(
     thread_id: &str,
 ) -> rusqlite::Result<Vec<StoredInteractionHint>> {
     let mut stmt = conn.prepare(
-        "SELECT thread_id, source_turn_id, source_item_id, question_index, last_fact, updated_at
+        "SELECT thread_id, source_turn_id, source_item_id, question_index, last_fact, updated_at, observation_epoch, observation_seq
          FROM codex_interaction_hints WHERE thread_id = ?1
          ORDER BY source_turn_id, source_item_id, question_index",
     )?;
@@ -63,9 +193,20 @@ pub fn get_interaction_hints_conn(
             question_index: row.get::<_, i64>(3)? as u32,
             last_fact: row.get(4)?,
             updated_at: row.get(5)?,
+            observation_epoch: row.get(6)?,
+            observation_seq: row.get(7)?,
         })
     })?;
-    rows.collect()
+    let rows: Vec<StoredInteractionHint> = rows.collect::<rusqlite::Result<_>>()?;
+    if rows.iter().any(|row| {
+        !matches!(
+            (row.observation_epoch, row.observation_seq),
+            (None, None) | (Some(1..), Some(1..))
+        )
+    }) {
+        return Err(rusqlite::Error::InvalidQuery);
+    }
+    Ok(rows)
 }
 
 #[cfg(test)]
@@ -75,6 +216,7 @@ mod tests {
     fn mem() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         crate::database::schema::init(&conn);
+        crate::database::migration::migrate(&conn).unwrap();
         conn
     }
 
@@ -86,9 +228,187 @@ mod tests {
             question_index: 0,
             last_fact: fact.into(),
             updated_at: at,
+            observation_epoch: None,
+            observation_seq: None,
         }
     }
 
+    #[test]
+    fn b1_dao_older_observation_cannot_replace_new_fact() {
+        let conn = mem();
+        let epoch = next_hint_epoch_conn(&conn).unwrap();
+        let mut newer = hint("answered", 20);
+        newer.observation_epoch = Some(epoch);
+        newer.observation_seq = Some(2);
+        let report = upsert_versioned_hints_conn(&conn, epoch, &[newer]).unwrap();
+        assert_eq!(report.len(), 1);
+        let mut older = hint("pending", 30);
+        older.observation_epoch = Some(epoch);
+        older.observation_seq = Some(1);
+        upsert_versioned_hints_conn(&conn, epoch, &[older]).unwrap();
+        let rows = get_interaction_hints_conn(&conn, "thread-1").unwrap();
+        assert_eq!(rows[0].last_fact, "answered");
+        assert_eq!(rows[0].observation_seq, Some(2));
+    }
+    fn versioned(epoch: i64, seq: i64, fact: &str) -> StoredInteractionHint {
+        let mut h = hint(fact, seq);
+        h.observation_epoch = Some(epoch);
+        h.observation_seq = Some(seq);
+        h
+    }
+    #[test]
+    fn b1_same_version_same_content_is_idempotent() {
+        let c = mem();
+        let e = next_hint_epoch_conn(&c).unwrap();
+        let h = versioned(e, 1, "pending");
+        upsert_versioned_hints_conn(&c, e, &[h.clone()]).unwrap();
+        let mut repeat = h.clone();
+        repeat.updated_at = 999;
+        assert_eq!(
+            upsert_versioned_hints_conn(&c, e, &[repeat]).unwrap(),
+            vec![HintWriteOutcome::AlreadyCurrent(h)]
+        );
+    }
+    #[test]
+    fn b1_same_version_different_content_rolls_back() {
+        let c = mem();
+        let e = next_hint_epoch_conn(&c).unwrap();
+        let h = versioned(e, 1, "pending");
+        upsert_versioned_hints_conn(&c, e, &[h.clone()]).unwrap();
+        let mut first = versioned(e, 2, "answered");
+        first.question_index = 1;
+        let collision = versioned(e, 1, "answered");
+        assert!(matches!(
+            upsert_versioned_hints_conn(&c, e, &[first, collision]),
+            Err(HintWriteError::VersionCollision)
+        ));
+        assert_eq!(get_interaction_hints_conn(&c, "thread-1").unwrap(), vec![h]);
+    }
+    #[test]
+    fn b1_batch_sql_failure_rolls_back_all() {
+        let c = mem();
+        let e = next_hint_epoch_conn(&c).unwrap();
+        c.execute_batch("CREATE TRIGGER fail_second BEFORE INSERT ON codex_interaction_hints WHEN NEW.question_index=1 BEGIN SELECT RAISE(ABORT, 'test'); END;").unwrap();
+        let first = versioned(e, 1, "pending");
+        let mut second = versioned(e, 2, "pending");
+        second.question_index = 1;
+        assert!(matches!(
+            upsert_versioned_hints_conn(&c, e, &[first, second]),
+            Err(HintWriteError::Storage(_))
+        ));
+        assert!(get_interaction_hints_conn(&c, "thread-1")
+            .unwrap()
+            .is_empty());
+    }
+    #[test]
+    fn b1_superseded_report_contains_actual_row() {
+        let c = mem();
+        let e = next_hint_epoch_conn(&c).unwrap();
+        let newer = versioned(e, 2, "answered");
+        upsert_versioned_hints_conn(&c, e, &[newer.clone()]).unwrap();
+        assert_eq!(
+            upsert_versioned_hints_conn(&c, e, &[versioned(e, 1, "pending")]).unwrap(),
+            vec![HintWriteOutcome::Superseded(newer)]
+        );
+    }
+    #[test]
+    fn b1_replaced_writer_is_fenced() {
+        let c = mem();
+        let old = next_hint_epoch_conn(&c).unwrap();
+        let _new = next_hint_epoch_conn(&c).unwrap();
+        assert!(matches!(
+            upsert_versioned_hints_conn(&c, old, &[versioned(old, 1, "pending")]),
+            Err(HintWriteError::Fenced)
+        ));
+        assert!(get_interaction_hints_conn(&c, "thread-1")
+            .unwrap()
+            .is_empty());
+    }
+    #[test]
+    fn b1_hint_keys_are_thread_scoped() {
+        let c = mem();
+        let e = next_hint_epoch_conn(&c).unwrap();
+        let a = versioned(e, 1, "pending");
+        let mut b = versioned(e, 2, "answered");
+        b.thread_id = "thread-2".into();
+        upsert_versioned_hints_conn(&c, e, &[a.clone(), b.clone()]).unwrap();
+        assert_eq!(get_interaction_hints_conn(&c, "thread-1").unwrap(), vec![a]);
+        assert_eq!(get_interaction_hints_conn(&c, "thread-2").unwrap(), vec![b]);
+    }
+    #[test]
+    fn b1_legacy_row_is_replaced_without_forging_proof() {
+        let c = mem();
+        upsert_interaction_hint_conn(&c, &hint("answered", 1)).unwrap();
+        let e = next_hint_epoch_conn(&c).unwrap();
+        let h = versioned(e, 1, "unknown");
+        assert_eq!(
+            upsert_versioned_hints_conn(&c, e, &[h.clone()]).unwrap(),
+            vec![HintWriteOutcome::Applied(h.clone())]
+        );
+        assert_eq!(get_interaction_hints_conn(&c, "thread-1").unwrap(), vec![h]);
+    }
+    #[test]
+    fn b1_invalid_partial_version_is_rejected_by_batch() {
+        let c = mem();
+        upsert_interaction_hint_conn(&c, &hint("answered", 1)).unwrap();
+        c.execute(
+            "UPDATE codex_interaction_hints SET observation_epoch=1, observation_seq=NULL",
+            [],
+        )
+        .unwrap();
+        let e = next_hint_epoch_conn(&c).unwrap();
+        assert!(matches!(
+            upsert_versioned_hints_conn(&c, e, &[versioned(e, 1, "pending")]),
+            Err(HintWriteError::InvalidVersion)
+        ));
+        assert!(get_interaction_hints_conn(&c, "thread-1").is_err());
+        let fact: String = c
+            .query_row(
+                "SELECT last_fact FROM codex_interaction_hints WHERE thread_id = ?1",
+                ["thread-1"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(fact, "answered");
+    }
+    #[test]
+    fn b1_prepared_batch_can_be_dropped_without_commit() {
+        let c = mem();
+        let e = next_hint_epoch_conn(&c).unwrap();
+        let h = versioned(e, 1, "answered");
+        let batch = prepare_versioned_hints_conn(&c, e, &[h]).unwrap();
+        let staged: i64 = c
+            .query_row("SELECT COUNT(*) FROM codex_interaction_hints", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(staged, 1);
+        drop(batch);
+        assert!(get_interaction_hints_conn(&c, "thread-1")
+            .unwrap()
+            .is_empty());
+    }
+    #[test]
+    fn b1_invalid_version_cold_load_is_not_authoritative() {
+        for (epoch, seq) in [
+            ("NULL", "1"),
+            ("1", "NULL"),
+            ("0", "1"),
+            ("1", "-1"),
+            ("'bad'", "1"),
+        ] {
+            let c = mem();
+            upsert_interaction_hint_conn(&c, &hint("answered", 1)).unwrap();
+            c.execute_batch(&format!("UPDATE codex_interaction_hints SET observation_epoch={epoch}, observation_seq={seq}")).unwrap();
+            assert!(get_interaction_hints_conn(&c, "thread-1").is_err());
+        }
+        let c = mem();
+        upsert_interaction_hint_conn(&c, &hint("answered", 1)).unwrap();
+        assert_eq!(
+            get_interaction_hints_conn(&c, "thread-1").unwrap()[0].last_fact,
+            "answered"
+        );
+    }
     /// 同键覆盖（不累加）、按线程隔离、无正文列。
     #[test]
     fn f08p_t03_interaction_hints_are_keyed_and_bodyless() {
@@ -789,5 +1109,132 @@ mod j02_claim_owner_tests {
             })
             .unwrap();
         assert_eq!(left, 0);
+    }
+}
+
+#[cfg(test)]
+mod b1_epoch_tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn ready(conn: &Connection) {
+        crate::database::schema::init(conn);
+        crate::database::migration::migrate(conn).unwrap();
+    }
+
+    fn begin(conn: &Connection) -> rusqlite::Result<i64> {
+        next_hint_epoch_conn(conn)
+    }
+
+    #[test]
+    fn b1_epoch_allocation_is_monotonic() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hint.sqlite");
+        let conn = Connection::open(&path).unwrap();
+        ready(&conn);
+        assert_eq!(begin(&conn).unwrap(), 1);
+        assert_eq!(begin(&conn).unwrap(), 2);
+        drop(conn);
+        let reopened = Connection::open(&path).unwrap();
+        assert_eq!(begin(&reopened).unwrap(), 3);
+    }
+
+    #[test]
+    fn b1_epoch_allocation_two_connections() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hint.sqlite");
+        let a = Connection::open(&path).unwrap();
+        ready(&a);
+        let b = Connection::open(&path).unwrap();
+        b.busy_timeout(Duration::ZERO).unwrap();
+        assert_eq!(begin(&a).unwrap(), 1);
+        let tx = a.unchecked_transaction().unwrap();
+        tx.execute(
+            "UPDATE codex_hint_writer_state SET epoch=epoch WHERE singleton=1",
+            [],
+        )
+        .unwrap();
+        assert!(
+            begin(&b).is_err(),
+            "被持有的写锁应返回 busy，不得发放重复 epoch"
+        );
+        tx.rollback().unwrap();
+        assert_eq!(begin(&b).unwrap(), 2);
+    }
+
+    #[test]
+    fn b1_epoch_exhaustion_is_error() {
+        let conn = Connection::open_in_memory().unwrap();
+        ready(&conn);
+        conn.execute(
+            "UPDATE codex_hint_writer_state SET epoch=?1 WHERE singleton=1",
+            [i64::MAX],
+        )
+        .unwrap();
+        assert!(begin(&conn).is_err());
+        let current: i64 = conn
+            .query_row(
+                "SELECT epoch FROM codex_hint_writer_state WHERE singleton=1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(current, i64::MAX);
+    }
+
+    #[test]
+    fn b1_begin_epoch_rejects_incomplete_schema() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::database::schema::init(&conn);
+        conn.execute_batch("CREATE TABLE codex_hint_writer_state(singleton INTEGER PRIMARY KEY, epoch INTEGER NOT NULL); INSERT INTO codex_hint_writer_state VALUES(1,7)").unwrap();
+        assert!(begin(&conn).is_err());
+        let epoch: i64 = conn
+            .query_row(
+                "SELECT epoch FROM codex_hint_writer_state WHERE singleton=1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(epoch, 7);
+        assert!(!conn
+            .prepare("SELECT observation_epoch FROM codex_interaction_hints LIMIT 0")
+            .is_ok());
+    }
+
+    #[test]
+    fn b1_begin_epoch_rejects_invalid_writer_state() {
+        for rows in [
+            "",
+            "INSERT INTO codex_hint_writer_state VALUES(1,-1);",
+            "INSERT INTO codex_hint_writer_state VALUES(1,7),(2,8);",
+            "INSERT INTO codex_hint_writer_state VALUES(1,'invalid');",
+        ] {
+            let conn = Connection::open_in_memory().unwrap();
+            crate::database::schema::init(&conn);
+            conn.execute_batch("ALTER TABLE codex_interaction_hints ADD COLUMN observation_epoch INTEGER; ALTER TABLE codex_interaction_hints ADD COLUMN observation_seq INTEGER; CREATE TABLE codex_hint_writer_state(singleton INTEGER, epoch);").unwrap();
+            conn.execute_batch(rows).unwrap();
+            assert!(
+                begin(&conn).is_err(),
+                "非法 writer 状态不得分配世代: {rows}"
+            );
+        }
+    }
+
+    #[test]
+    fn b1_existing_writer_epoch_survives_failed_migration() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::database::schema::init(&conn);
+        conn.execute_batch("CREATE TABLE codex_hint_writer_state(singleton INTEGER PRIMARY KEY, epoch INTEGER NOT NULL); INSERT INTO codex_hint_writer_state VALUES(1,7)").unwrap();
+        crate::database::migration::migrate(&conn).unwrap();
+        crate::database::migration::migrate(&conn).unwrap();
+        let epoch: i64 = conn
+            .query_row(
+                "SELECT epoch FROM codex_hint_writer_state WHERE singleton=1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(epoch, 7);
+        assert_eq!(begin(&conn).unwrap(), 8);
     }
 }

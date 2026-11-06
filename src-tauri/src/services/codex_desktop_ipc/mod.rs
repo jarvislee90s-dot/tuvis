@@ -30,3 +30,9 @@ pub mod profile;
 pub mod reason_code;
 pub mod transport;
 pub mod types;
+
+pub mod hint_commit;
+pub mod hint_state;
+
+#[cfg(test)]
+pub(crate) mod hint_test_probe;

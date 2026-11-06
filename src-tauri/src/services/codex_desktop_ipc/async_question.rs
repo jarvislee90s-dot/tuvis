@@ -218,6 +218,17 @@ pub struct InteractionHint {
     pub last_fact: String,
 }
 
+/// 提示持久化错误分类；不包含用户正文或底层错误字符串。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HintStoreError {
+    Storage,
+    VersionCollision,
+    Fenced,
+    OwnerFenced,
+    ScopeFenced,
+    VersionExhausted,
+}
+pub type BatchWriteReport = Vec<super::hint_state::WriteOutcome>;
 /// 持久提示的存储（生产 = `codex_interaction_hints` DAO；测试 = 内存实现）。
 ///
 /// **读失败 / 无行 → `None`**：上层保持 Unknown，不合成"已答"。
@@ -226,6 +237,19 @@ pub trait InteractionHintStore: Send + Sync {
         &self,
         thread_id: &str,
     ) -> Option<Vec<crate::database::dao::codex_interactions::StoredInteractionHint>>;
+    fn begin_epoch(&self) -> Result<i64, HintStoreError> {
+        Err(HintStoreError::Storage)
+    }
+    fn write_batch(
+        &self,
+        _epoch: i64,
+        _hints: &[super::hint_state::VersionedHint],
+        _at_ms: i64,
+        _permit: &super::hint_commit::HintCommitPermit,
+    ) -> Result<BatchWriteReport, HintStoreError> {
+        Err(HintStoreError::Storage)
+    }
+    #[cfg(test)]
     fn upsert(&self, hint: &InteractionHint, at_ms: i64);
 }
 

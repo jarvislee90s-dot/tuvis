@@ -178,11 +178,28 @@ pub fn record_operation_success(
 /// 异步题持久提示：生产 DB（`codex_interaction_hints`；无正文）。
 pub struct StoreInteractionHints {
     store: DeviceStore,
+    #[cfg(test)]
+    probe: Option<std::sync::Arc<crate::services::codex_desktop_ipc::hint_test_probe::TestProbe>>,
 }
 
 impl StoreInteractionHints {
     pub fn new(store: DeviceStore) -> Self {
-        Self { store }
+        Self {
+            store,
+            #[cfg(test)]
+            probe: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_probe(
+        store: DeviceStore,
+        probe: std::sync::Arc<crate::services::codex_desktop_ipc::hint_test_probe::TestProbe>,
+    ) -> Self {
+        Self {
+            store,
+            probe: Some(probe),
+        }
     }
 }
 
@@ -194,6 +211,109 @@ impl InteractionHintStore for StoreInteractionHints {
         })
     }
 
+    fn begin_epoch(
+        &self,
+    ) -> Result<i64, crate::services::codex_desktop_ipc::async_question::HintStoreError> {
+        self.store
+            .with(crate::database::dao::codex_interactions::next_hint_epoch_conn)
+            .map_err(|_| {
+                crate::services::codex_desktop_ipc::async_question::HintStoreError::Storage
+            })
+    }
+
+    fn write_batch(
+        &self,
+        epoch: i64,
+        hints: &[crate::services::codex_desktop_ipc::hint_state::VersionedHint],
+        at_ms: i64,
+        permit: &crate::services::codex_desktop_ipc::hint_commit::HintCommitPermit,
+    ) -> Result<
+        crate::services::codex_desktop_ipc::async_question::BatchWriteReport,
+        crate::services::codex_desktop_ipc::async_question::HintStoreError,
+    > {
+        use crate::database::dao::codex_interactions::{
+            prepare_versioned_hints_conn, HintWriteError, HintWriteOutcome,
+        };
+        use crate::services::codex_desktop_ipc::async_question::HintStoreError;
+        use crate::services::codex_desktop_ipc::hint_state::{
+            HintVersion, VersionedHint, WriteOutcome,
+        };
+        if hints
+            .iter()
+            .any(|h| h.hint.thread_id != permit.lease().key.thread_id)
+        {
+            return Err(HintStoreError::Fenced);
+        }
+        let rows: Vec<_> = hints
+            .iter()
+            .map(|h| StoredInteractionHint {
+                thread_id: h.hint.thread_id.clone(),
+                source_turn_id: h.hint.source_turn_id.clone(),
+                source_item_id: h.hint.source_item_id.clone(),
+                question_index: h.hint.question_index,
+                last_fact: h.hint.last_fact.clone(),
+                updated_at: at_ms,
+                observation_epoch: Some(h.version.epoch),
+                observation_seq: Some(h.version.sequence),
+            })
+            .collect();
+        let map_error = |e| match e {
+            HintWriteError::Fenced => HintStoreError::Fenced,
+            HintWriteError::VersionCollision => HintStoreError::VersionCollision,
+            _ => HintStoreError::Storage,
+        };
+        let write = |conn: &rusqlite::Connection| {
+            let batch = prepare_versioned_hints_conn(conn, epoch, &rows).map_err(map_error)?;
+            #[cfg(test)]
+            if let Some(probe) = &self.probe {
+                probe.hit(crate::services::codex_desktop_ipc::hint_test_probe::TestPoint::AfterSqlPreparedBeforePermit)
+                    .map_err(|_| HintStoreError::Storage)?;
+            }
+            let _guard = permit.lock().map_err(|reason| match reason {
+                crate::services::codex_desktop_ipc::hint_commit::Fence::Owner => {
+                    HintStoreError::OwnerFenced
+                }
+                crate::services::codex_desktop_ipc::hint_commit::Fence::Scope => {
+                    HintStoreError::ScopeFenced
+                }
+            })?;
+            batch.commit().map_err(map_error)
+        };
+        #[cfg(test)]
+        let report = self
+            .store
+            .with_probe(self.probe.as_deref(), write)
+            .map_err(|_| HintStoreError::Storage)??;
+        #[cfg(not(test))]
+        let report = self.store.with(write)?;
+        Ok(report
+            .into_iter()
+            .map(|outcome| {
+                let convert = |row: StoredInteractionHint| VersionedHint {
+                    hint: InteractionHint {
+                        thread_id: row.thread_id,
+                        source_turn_id: row.source_turn_id,
+                        source_item_id: row.source_item_id,
+                        question_index: row.question_index,
+                        last_fact: row.last_fact,
+                    },
+                    version: HintVersion {
+                        epoch: row.observation_epoch.expect("versioned report"),
+                        sequence: row.observation_seq.expect("versioned report"),
+                    },
+                };
+                match outcome {
+                    HintWriteOutcome::Applied(row) => WriteOutcome::Applied(convert(row)),
+                    HintWriteOutcome::AlreadyCurrent(row) => {
+                        WriteOutcome::AlreadyCurrent(convert(row))
+                    }
+                    HintWriteOutcome::Superseded(row) => WriteOutcome::Superseded(convert(row)),
+                }
+            })
+            .collect())
+    }
+
+    #[cfg(test)]
     fn upsert(&self, hint: &InteractionHint, at_ms: i64) {
         let row = StoredInteractionHint {
             thread_id: hint.thread_id.clone(),
@@ -202,6 +322,8 @@ impl InteractionHintStore for StoreInteractionHints {
             question_index: hint.question_index,
             last_fact: hint.last_fact.clone(),
             updated_at: at_ms,
+            observation_epoch: None,
+            observation_seq: None,
         };
         self.store.with(|conn| {
             if let Err(e) =
@@ -222,9 +344,137 @@ mod tests {
     fn store() -> DeviceStore {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         crate::database::schema::init(&conn);
+        crate::database::migration::migrate(&conn).unwrap();
         DeviceStore::Owned(Arc::new(Mutex::new(conn)))
     }
 
+    #[test]
+    fn b1_store_batch_reports_and_fences() {
+        use crate::services::codex_desktop_ipc::hint_state::{
+            HintVersion, VersionedHint, WriteOutcome,
+        };
+        let db = store();
+        let ledger = StoreInteractionHints::new(db);
+        let authority = crate::services::codex_desktop_ipc::hint_commit::HintLeaseAuthority::new(
+            crate::services::codex_desktop_ipc::types::OwnerLease {
+                key: crate::services::codex_desktop_ipc::types::ThreadKey {
+                    host_id: "h".into(),
+                    thread_id: "t".into(),
+                },
+                client_id: "c".into(),
+                epoch: 1,
+                generation: 1,
+            },
+        );
+        let permit = authority.rotate_scope().unwrap();
+        let epoch = ledger.begin_epoch().unwrap();
+        let hint = VersionedHint {
+            hint: InteractionHint {
+                thread_id: "t".into(),
+                source_turn_id: "turn".into(),
+                source_item_id: "item".into(),
+                question_index: 0,
+                last_fact: "pending".into(),
+            },
+            version: HintVersion { epoch, sequence: 1 },
+        };
+        assert_eq!(
+            ledger
+                .write_batch(epoch, &[hint.clone()], 5, &permit)
+                .unwrap(),
+            vec![WriteOutcome::Applied(hint.clone())]
+        );
+        assert_eq!(
+            ledger
+                .write_batch(epoch, &[hint.clone()], 6, &permit)
+                .unwrap(),
+            vec![WriteOutcome::AlreadyCurrent(hint.clone())]
+        );
+        ledger.begin_epoch().unwrap();
+        assert_eq!(
+            ledger.write_batch(epoch, &[hint], 7, &permit),
+            Err(crate::services::codex_desktop_ipc::async_question::HintStoreError::Fenced)
+        );
+    }
+
+    #[test]
+    fn b1_store_revoked_owner_rolls_back_real_batch() {
+        use crate::services::codex_desktop_ipc::{
+            async_question::HintStoreError,
+            hint_commit::HintLeaseAuthority,
+            hint_state::{HintVersion, VersionedHint},
+            types::{OwnerLease, ThreadKey},
+        };
+        let db = store();
+        let ledger = StoreInteractionHints::new(db.clone());
+        let authority = HintLeaseAuthority::new(OwnerLease {
+            key: ThreadKey {
+                host_id: "h".into(),
+                thread_id: "t".into(),
+            },
+            client_id: "c".into(),
+            epoch: 1,
+            generation: 1,
+        });
+        let permit = authority.rotate_scope().unwrap();
+        let epoch = ledger.begin_epoch().unwrap();
+        let hint = VersionedHint {
+            hint: InteractionHint {
+                thread_id: "t".into(),
+                source_turn_id: "turn".into(),
+                source_item_id: "item".into(),
+                question_index: 0,
+                last_fact: "answered".into(),
+            },
+            version: HintVersion { epoch, sequence: 1 },
+        };
+        authority.revoke_owner();
+        assert_eq!(
+            ledger.write_batch(epoch, &[hint], 1, &permit),
+            Err(HintStoreError::OwnerFenced)
+        );
+        assert!(ledger.load("t").unwrap().is_empty());
+    }
+
+    #[test]
+    fn b1_store_real_commit_failure_does_not_return_success() {
+        use crate::services::codex_desktop_ipc::{
+            async_question::HintStoreError,
+            hint_commit::HintLeaseAuthority,
+            hint_state::{HintVersion, VersionedHint},
+            types::{OwnerLease, ThreadKey},
+        };
+        let db = store();
+        db.with(|conn| conn.execute_batch("PRAGMA foreign_keys=ON; CREATE TABLE test_parent(id INTEGER PRIMARY KEY); CREATE TABLE test_child(parent_id INTEGER REFERENCES test_parent(id) DEFERRABLE INITIALLY DEFERRED); CREATE TRIGGER test_deferred AFTER INSERT ON codex_interaction_hints BEGIN INSERT INTO test_child(parent_id) VALUES(42); END;").unwrap());
+        let ledger = StoreInteractionHints::new(db);
+        let authority = HintLeaseAuthority::new(OwnerLease {
+            key: ThreadKey {
+                host_id: "h".into(),
+                thread_id: "t".into(),
+            },
+            client_id: "c".into(),
+            epoch: 1,
+            generation: 1,
+        });
+        let permit = authority.rotate_scope().unwrap();
+        let epoch = ledger.begin_epoch().unwrap();
+        let hint = VersionedHint {
+            hint: InteractionHint {
+                thread_id: "t".into(),
+                source_turn_id: "turn".into(),
+                source_item_id: "item".into(),
+                question_index: 0,
+                last_fact: "answered".into(),
+            },
+            version: HintVersion { epoch, sequence: 1 },
+        };
+        assert_eq!(
+            ledger.write_batch(epoch, &[hint], 1, &permit),
+            Err(HintStoreError::Storage)
+        );
+        authority.revoke_owner();
+        assert!(ledger.load("t").unwrap().is_empty());
+    }
     fn evidence() -> DesktopContractEvidence {
         let mut matches = BTreeMap::new();
         matches.insert(

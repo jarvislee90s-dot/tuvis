@@ -1,6 +1,6 @@
 use rusqlite::Connection;
 
-/// 初始化数据库 schema（所有 CREATE TABLE 语句）
+/// 初始化基础数据库 schema；部分增量表由独立迁移事务创建。
 pub fn init(conn: &Connection) {
     conn.execute_batch(
         r#"

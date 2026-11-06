@@ -22,6 +22,45 @@ fn column_notnull(conn: &Connection, table: &str, column: &str) -> Option<bool> 
         .map(|(_, notnull)| notnull != 0)
 }
 
+/// B1 增量结构在单独事务中创建，失败严格回到事务开始时的形态。
+fn migrate_b1_hint_schema_with<F>(conn: &Connection, mut checkpoint: F) -> rusqlite::Result<()>
+where
+    F: FnMut(u8) -> rusqlite::Result<()>,
+{
+    let tx = conn.unchecked_transaction()?;
+    if !table_exists(&tx, "codex_interaction_hints") {
+        return tx.commit();
+    }
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS codex_hint_writer_state (
+            singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+            epoch INTEGER NOT NULL CHECK(epoch >= 0)
+        );
+        INSERT OR IGNORE INTO codex_hint_writer_state(singleton, epoch) VALUES(1, 0);",
+    )?;
+    checkpoint(1)?;
+    let mut first_added = false;
+    for column in ["observation_epoch", "observation_seq"] {
+        if !column_exists(&tx, "codex_interaction_hints", column) {
+            // 列名仅取自本函数的固定数组，不接受外部输入。
+            tx.execute(
+                &format!("ALTER TABLE codex_interaction_hints ADD COLUMN {column} INTEGER"),
+                [],
+            )?;
+            if !first_added {
+                first_added = true;
+                checkpoint(2)?;
+            }
+        }
+    }
+    checkpoint(3)?;
+    tx.commit()
+}
+
+fn migrate_b1_hint_schema(conn: &Connection) -> rusqlite::Result<()> {
+    migrate_b1_hint_schema_with(conn, |_| Ok(()))
+}
+
 pub fn migrate(conn: &Connection) -> Result<(), String> {
     // ---- 用量账本（计划①）①：预览版明细表**形状不可就地迁移** ----
     // 主键要加 project_key（记录级归属，GC 18-R2）、user_est 要从 NOT NULL DEFAULT 0 改成可空（R1）
@@ -104,6 +143,7 @@ pub fn migrate(conn: &Connection) -> Result<(), String> {
     // 已存在的表保持原样（缺列由下方 ALTER 迁移补齐），与生产启动顺序（schema::init → migrate）一致。
     // 上面 DROP 掉的预览版账本四表，由这次 init 按新 DDL 重建为空表。
     crate::database::schema::init(conn);
+    migrate_b1_hint_schema(conn).map_err(|e| format!("MIGRATE_B1_HINT_SCHEMA_FAIL: {e}"))?;
 
     if !column_exists(conn, "zcode_actions", "send_admission") {
         conn.execute(
@@ -1899,5 +1939,197 @@ mod batch_migration_tests {
         assert_eq!(v, 0, "老行回填 0（未签名）");
         // 幂等：再跑一遍不报错
         migrate(&conn).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod b1_hint_migration_tests {
+    use super::*;
+
+    #[test]
+    fn b1_legacy_hint_migration() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE codex_interaction_hints (
+                thread_id TEXT NOT NULL, source_turn_id TEXT NOT NULL,
+                source_item_id TEXT NOT NULL, question_index INTEGER NOT NULL,
+                last_fact TEXT NOT NULL, updated_at INTEGER NOT NULL,
+                PRIMARY KEY (thread_id, source_turn_id, source_item_id, question_index)
+            );
+            INSERT INTO codex_interaction_hints VALUES ('th','turn','item',0,'answered',1);",
+        )
+        .unwrap();
+        crate::database::schema::init(&conn);
+        migrate(&conn).unwrap();
+        migrate(&conn).unwrap();
+        for column in ["observation_epoch", "observation_seq"] {
+            assert!(
+                column_exists(&conn, "codex_interaction_hints", column),
+                "missing {column}"
+            );
+        }
+        let row: (String, Option<i64>, Option<i64>) = conn.query_row(
+            "SELECT last_fact, observation_epoch, observation_seq FROM codex_interaction_hints WHERE thread_id='th'",
+            [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        ).unwrap();
+        assert_eq!(row, ("answered".into(), None, None));
+    }
+
+    type B1Column = (i64, String, String, i64, Option<String>, i64);
+    #[derive(Debug, PartialEq, Eq)]
+    struct B1Shape {
+        tables: Vec<(String, String)>,
+        columns: Vec<B1Column>,
+        writer: Vec<(i64, i64)>,
+        hints: Vec<(String, i64)>,
+    }
+
+    fn b1_shape(conn: &Connection) -> B1Shape {
+        let mut tables = conn.prepare("SELECT name,sql FROM sqlite_master WHERE type='table' AND name IN ('codex_interaction_hints','codex_hint_writer_state') ORDER BY name").unwrap();
+        let tables = tables
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        let mut cols = conn
+            .prepare("PRAGMA table_info(codex_interaction_hints)")
+            .unwrap();
+        let cols = cols
+            .query_map([], |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        let writer = if table_exists(conn, "codex_hint_writer_state") {
+            let mut q = conn
+                .prepare("SELECT singleton, epoch FROM codex_hint_writer_state ORDER BY singleton")
+                .unwrap();
+            let rows = q
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            rows
+        } else {
+            vec![]
+        };
+        let hints = if table_exists(conn, "codex_interaction_hints") {
+            let mut q = conn
+                .prepare(
+                    "SELECT last_fact,updated_at FROM codex_interaction_hints ORDER BY thread_id",
+                )
+                .unwrap();
+            let rows = q
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            rows
+        } else {
+            vec![]
+        };
+        B1Shape {
+            tables,
+            columns: cols,
+            writer,
+            hints,
+        }
+    }
+
+    fn run_b1_injected(conn: &Connection, fault: Option<u8>) -> rusqlite::Result<()> {
+        migrate_b1_hint_schema_with(conn, |step| {
+            if Some(step) == fault {
+                Err(rusqlite::Error::InvalidQuery)
+            } else {
+                Ok(())
+            }
+        })
+    }
+
+    #[test]
+    fn b1_migration_rolls_back_partial_schema() {
+        for shape in 0..3 {
+            for fault in 1..=3 {
+                let conn = Connection::open_in_memory().unwrap();
+                crate::database::schema::init(&conn);
+                conn.execute("INSERT INTO codex_interaction_hints VALUES ('th','turn','item',0,'answered',7)", []).unwrap();
+                if shape == 1 {
+                    conn.execute_batch("CREATE TABLE codex_hint_writer_state (singleton INTEGER PRIMARY KEY CHECK(singleton=1), epoch INTEGER NOT NULL CHECK(epoch>=0)); INSERT INTO codex_hint_writer_state VALUES(1,7);").unwrap();
+                }
+                if shape == 2 {
+                    conn.execute(
+                        "ALTER TABLE codex_interaction_hints ADD COLUMN observation_epoch INTEGER",
+                        [],
+                    )
+                    .unwrap();
+                }
+                let before = b1_shape(&conn);
+                assert!(
+                    run_b1_injected(&conn, Some(fault)).is_err(),
+                    "shape={shape} fault={fault}"
+                );
+                assert_eq!(
+                    b1_shape(&conn),
+                    before,
+                    "事务失败必须恢复原有形态 shape={shape} fault={fault}"
+                );
+                run_b1_injected(&conn, None).unwrap();
+                run_b1_injected(&conn, None).unwrap();
+                assert!(column_exists(
+                    &conn,
+                    "codex_interaction_hints",
+                    "observation_epoch"
+                ));
+                assert!(column_exists(
+                    &conn,
+                    "codex_interaction_hints",
+                    "observation_seq"
+                ));
+                assert_eq!(
+                    b1_shape(&conn).writer,
+                    vec![(1, if shape == 1 { 7 } else { 0 })]
+                );
+                assert_eq!(b1_shape(&conn).hints, vec![("answered".into(), 7)]);
+            }
+        }
+    }
+
+    #[test]
+    fn b1_fresh_database_uses_atomic_migration() {
+        for fault in 1..=3 {
+            let conn = Connection::open_in_memory().unwrap();
+            crate::database::schema::init(&conn);
+            let before = b1_shape(&conn);
+            assert!(!table_exists(&conn, "codex_hint_writer_state"));
+            assert!(!column_exists(
+                &conn,
+                "codex_interaction_hints",
+                "observation_epoch"
+            ));
+            assert!(run_b1_injected(&conn, Some(fault)).is_err());
+            assert_eq!(b1_shape(&conn), before);
+            migrate(&conn).unwrap();
+            assert!(table_exists(&conn, "codex_hint_writer_state"));
+            assert!(column_exists(
+                &conn,
+                "codex_interaction_hints",
+                "observation_seq"
+            ));
+        }
+    }
+
+    #[test]
+    fn b1_migration_without_hint_base_creates_no_writer() {
+        let conn = Connection::open_in_memory().unwrap();
+        run_b1_injected(&conn, None).unwrap();
+        assert!(!table_exists(&conn, "codex_hint_writer_state"));
     }
 }

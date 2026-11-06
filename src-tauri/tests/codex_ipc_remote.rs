@@ -25199,6 +25199,15 @@ async fn pr202_first_snapshot_reconciles_old_answer() {
         "first published: {:?}",
         first.async_questions
     );
+    assert!(
+        first
+            .async_questions
+            .iter()
+            .any(|q| q.source_item_id == "new-item"
+                && q.state == InteractionState::TemporarilyBlocked),
+        "首个快照必须同时保留新题: {:?}",
+        first.async_questions
+    );
     let response = tokio::time::timeout(Duration::from_secs(15), task)
         .await
         .unwrap()
@@ -25210,6 +25219,12 @@ async fn pr202_first_snapshot_reconciles_old_answer() {
             .iter()
             .all(|q| q["sourceItemId"] != "old-item" || q["state"] == "answered"),
         "initial={initial}"
+    );
+    assert!(
+        initial_questions
+            .iter()
+            .any(|q| q["sourceItemId"] == "new-item" && q["state"] == "temporarily_blocked"),
+        "首个 GET 必须保留新题: {initial}"
     );
     install_async_answer_contract(&f);
     let p = f

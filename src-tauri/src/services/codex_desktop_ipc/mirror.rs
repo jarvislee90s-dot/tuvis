@@ -214,6 +214,8 @@ struct TurnObservation {
 pub struct ThreadMirror {
     key: ThreadKey,
     lease: Option<OwnerLease>,
+    hint_authority: Option<Arc<super::hint_commit::HintLeaseAuthority>>,
+    hint_permit: Option<super::hint_commit::HintCommitPermit>,
     revision: Option<u64>,
     stale: bool,
     /// conversationState 本体（R1：snapshot 存 `change["conversationState"]`；
@@ -250,6 +252,7 @@ pub struct ThreadMirror {
 
 impl Drop for ThreadMirror {
     fn drop(&mut self) {
+        self.revoke_hint_scope();
         if let Some(ledger) = &self.ledger {
             ledger
                 .lock()
@@ -264,6 +267,8 @@ impl ThreadMirror {
         Self {
             key,
             lease: None,
+            hint_authority: None,
+            hint_permit: None,
             revision: None,
             stale: false,
             state: None,
@@ -327,6 +332,32 @@ impl ThreadMirror {
         let mut m = Self::new(key);
         m.ledger = Some(ledger);
         m
+    }
+
+    pub(crate) fn bind_hint_authority(
+        &mut self,
+        authority: Arc<super::hint_commit::HintLeaseAuthority>,
+    ) {
+        if self
+            .hint_authority
+            .as_ref()
+            .is_some_and(|old| Arc::ptr_eq(old, &authority))
+        {
+            return;
+        }
+        self.revoke_hint_scope();
+        self.hint_authority = Some(authority);
+    }
+    pub(crate) fn hint_permit(&self) -> Option<super::hint_commit::HintCommitPermit> {
+        self.hint_permit.clone()
+    }
+    fn revoke_hint_scope(&mut self) {
+        if let Some(permit) = self.hint_permit.take() {
+            permit.revoke_scope();
+        }
+    }
+    pub(crate) fn build_generation(&self) -> u64 {
+        self.build_generation
     }
 
     pub fn key(&self) -> &ThreadKey {
@@ -536,6 +567,7 @@ impl ThreadMirror {
 
     /// 标记过期（连接断开/缺口/预算超限）。保留最后视图但禁写（adapter 侧门）。
     pub fn mark_stale(&mut self) {
+        self.revoke_hint_scope();
         self.stale = true;
     }
 
@@ -547,6 +579,7 @@ impl ThreadMirror {
     }
 
     fn clear_state(&mut self) {
+        self.revoke_hint_scope();
         if let Some(ledger) = &self.ledger {
             ledger
                 .lock()
@@ -581,16 +614,32 @@ impl ThreadMirror {
         }
 
         let change_type = change.get("type").and_then(|t| t.as_str()).unwrap_or("");
-        match change_type {
+        let result = match change_type {
             "snapshot" => self.apply_snapshot(change),
             "patches" => self.apply_patches(change),
             _ => {
                 // 未知 change 形态：保守 stale + 重拉（不猜测语义）
-                self.stale = true;
+                self.mark_stale();
                 Ok(MirrorEffect {
                     changed: false,
                     need_snapshot: true,
                 })
+            }
+        };
+        if result.is_err() || self.stale {
+            self.revoke_hint_scope();
+        }
+        result
+    }
+
+    fn install_hint_scope(&mut self) {
+        if let Some(authority) = &self.hint_authority {
+            if let Some(permit) = authority.rotate_scope() {
+                if self.lease.as_ref() == Some(permit.lease()) {
+                    self.hint_permit = Some(permit);
+                } else {
+                    permit.revoke_scope();
+                }
             }
         }
     }
@@ -598,7 +647,7 @@ impl ThreadMirror {
     fn apply_snapshot(&mut self, change: &Value) -> Result<MirrorEffect, ProtocolError> {
         let rev = change.get("revision").and_then(|r| r.as_u64());
         let Some(rev) = rev else {
-            self.stale = true;
+            self.mark_stale();
             return Ok(MirrorEffect {
                 changed: false,
                 need_snapshot: true,
@@ -615,7 +664,9 @@ impl ThreadMirror {
             .get("conversationState")
             .cloned()
             .unwrap_or(Value::Null);
+        self.revoke_hint_scope();
         self.adopt(rev, state)?;
+        self.install_hint_scope();
         // 镜像重建代：只在新 snapshot 装订成功时递增（patch 是增量，不动它）。
         self.build_generation = self.build_generation.saturating_add(1);
         Ok(MirrorEffect {
@@ -629,7 +680,7 @@ impl ThreadMirror {
         let rev = change.get("revision").and_then(|r| r.as_u64());
         let patches = change.get("patches").and_then(|p| p.as_array()).cloned();
         let (Some(base), Some(rev), Some(patches)) = (base, rev, patches) else {
-            self.stale = true;
+            self.mark_stale();
             return Ok(MirrorEffect {
                 changed: false,
                 need_snapshot: true,
@@ -643,7 +694,7 @@ impl ThreadMirror {
         }
         let Some(cur) = self.revision else {
             // 尚无快照基线：缺口
-            self.stale = true;
+            self.mark_stale();
             return Ok(MirrorEffect {
                 changed: false,
                 need_snapshot: true,
@@ -651,7 +702,7 @@ impl ThreadMirror {
         };
         if base != cur {
             // revision 缺口/乱序：整批不应用，stale + 重拉
-            self.stale = true;
+            self.mark_stale();
             return Ok(MirrorEffect {
                 changed: false,
                 need_snapshot: true,
@@ -659,7 +710,7 @@ impl ThreadMirror {
         }
         // 原子应用：clone 上逐条 op，任一失败整批作废
         let Some(state) = self.state.clone() else {
-            self.stale = true;
+            self.mark_stale();
             return Ok(MirrorEffect {
                 changed: false,
                 need_snapshot: true,
@@ -668,7 +719,7 @@ impl ThreadMirror {
         let mut next = state;
         for op in &patches {
             if apply_op(&mut next, op).is_err() {
-                self.stale = true;
+                self.mark_stale();
                 return Ok(MirrorEffect {
                     changed: false,
                     need_snapshot: true,
@@ -677,7 +728,11 @@ impl ThreadMirror {
         }
         // 2026-10-18 形态适配：完整性从**新 state** 派生（snapshot/patch 同一判定
         // 单点），不再沿用上一状态的缓存 bool
+        let recovering = self.stale;
         self.adopt(rev, next)?;
+        if recovering {
+            self.install_hint_scope();
+        }
         Ok(MirrorEffect {
             changed: true,
             need_snapshot: false,
@@ -693,7 +748,7 @@ impl ThreadMirror {
             .map(|b| b.len())
             .unwrap_or(usize::MAX);
         if size > MIRROR_BUDGET {
-            self.stale = true;
+            self.mark_stale();
             self.budget_refused = true;
             return Err(ProtocolError::Capacity(format!(
                 "mirror exceeds per-thread budget: {size} > {MIRROR_BUDGET}"
@@ -703,11 +758,13 @@ impl ThreadMirror {
         if let Some(ledger) = &self.ledger {
             let mut l = ledger.lock().expect("ledger lock");
             if !l.claim(&self.key, self.size, size) {
-                self.stale = true;
+                let cap = l.cap_of();
+                drop(l);
+                self.mark_stale();
                 self.budget_refused = true;
                 return Err(ProtocolError::Capacity(format!(
                     "mirror exceeds global budget: total would exceed {} bytes",
-                    l.cap_of()
+                    cap
                 )));
             }
         }
@@ -1980,6 +2037,52 @@ fn key_of(seg: &Value) -> Result<String, ProtocolError> {
 mod tests {
     use super::*;
     use crate::services::codex_desktop_ipc::types::{PendingKind, ThreadKey};
+
+    #[test]
+    fn b1_stale_patch_recovery_rotates_scope() {
+        let authority = super::super::hint_commit::HintLeaseAuthority::new(lease());
+        let mut mirror = ThreadMirror::new(key());
+        mirror.bind_hint_authority(authority);
+        mirror
+            .apply(
+                &lease(),
+                &serde_json::json!({"type":"snapshot", "revision":1, "conversationState":{}}),
+            )
+            .unwrap();
+        let old = mirror.hint_permit().unwrap();
+        mirror.mark_stale();
+        mirror.apply(&lease(), &serde_json::json!({"type":"patches", "baseRevision":1, "revision":2, "patches":[]})).unwrap();
+        assert!(!mirror.is_stale());
+        let fresh = mirror.hint_permit().expect("recovery creates a new permit");
+        assert!(old.lock().is_err());
+        assert_ne!(old.scope_id(), fresh.scope_id());
+        assert!(fresh.lock().is_ok());
+    }
+
+    #[test]
+    fn b1_mirror_scope_lifecycle() {
+        let authority = super::super::hint_commit::HintLeaseAuthority::new(lease());
+        let mut mirror = ThreadMirror::new(key());
+        mirror.bind_hint_authority(authority);
+        let snapshot = |revision| serde_json::json!({"type":"snapshot", "revision":revision, "conversationState":{}});
+        mirror.apply(&lease(), &snapshot(1)).unwrap();
+        let old = mirror.hint_permit().expect("snapshot creates permit");
+        mirror.apply(&lease(), &snapshot(2)).unwrap();
+        let new = mirror.hint_permit().expect("new snapshot creates permit");
+        assert!(old.lock().is_err());
+        old.revoke_scope();
+        assert!(new.lock().is_ok());
+        mirror.mark_stale();
+        assert!(new.lock().is_err());
+        mirror.apply(&lease(), &snapshot(3)).unwrap();
+        let third = mirror.hint_permit().unwrap();
+        mirror.invalidate();
+        assert!(third.lock().is_err());
+        mirror.apply(&lease(), &snapshot(4)).unwrap();
+        let fourth = mirror.hint_permit().unwrap();
+        drop(mirror);
+        assert!(fourth.lock().is_err());
+    }
 
     fn key() -> ThreadKey {
         ThreadKey {
