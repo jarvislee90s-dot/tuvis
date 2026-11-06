@@ -306,7 +306,7 @@ mod tests {
         let c = mem();
         let e = next_hint_epoch_conn(&c).unwrap();
         let h = versioned(e, 1, "pending");
-        upsert_versioned_hints_conn(&c, e, &[h.clone()]).unwrap();
+        upsert_versioned_hints_conn(&c, e, std::slice::from_ref(&h)).unwrap();
         let mut repeat = h.clone();
         repeat.updated_at = 999;
         assert_eq!(
@@ -319,7 +319,7 @@ mod tests {
         let c = mem();
         let e = next_hint_epoch_conn(&c).unwrap();
         let h = versioned(e, 1, "pending");
-        upsert_versioned_hints_conn(&c, e, &[h.clone()]).unwrap();
+        upsert_versioned_hints_conn(&c, e, std::slice::from_ref(&h)).unwrap();
         let mut first = versioned(e, 2, "answered");
         first.question_index = 1;
         let collision = versioned(e, 1, "answered");
@@ -350,7 +350,7 @@ mod tests {
         let c = mem();
         let e = next_hint_epoch_conn(&c).unwrap();
         let newer = versioned(e, 2, "answered");
-        upsert_versioned_hints_conn(&c, e, &[newer.clone()]).unwrap();
+        upsert_versioned_hints_conn(&c, e, std::slice::from_ref(&newer)).unwrap();
         assert_eq!(
             upsert_versioned_hints_conn(&c, e, &[versioned(e, 1, "pending")]).unwrap(),
             vec![HintWriteOutcome::Superseded(newer)]
@@ -387,7 +387,7 @@ mod tests {
         let e = next_hint_epoch_conn(&c).unwrap();
         let h = versioned(e, 1, "unknown");
         assert_eq!(
-            upsert_versioned_hints_conn(&c, e, &[h.clone()]).unwrap(),
+            upsert_versioned_hints_conn(&c, e, std::slice::from_ref(&h)).unwrap(),
             vec![HintWriteOutcome::Applied(h.clone())]
         );
         assert_eq!(get_interaction_hints_conn(&c, "thread-1").unwrap(), vec![h]);

@@ -375,13 +375,13 @@ mod tests {
         };
         assert_eq!(
             ledger
-                .write_batch(epoch, &[hint.clone()], 5, &permit)
+                .write_batch(epoch, std::slice::from_ref(&hint), 5, &permit)
                 .unwrap(),
             vec![WriteOutcome::Applied(hint.clone())]
         );
         assert_eq!(
             ledger
-                .write_batch(epoch, &[hint.clone()], 6, &permit)
+                .write_batch(epoch, std::slice::from_ref(&hint), 6, &permit)
                 .unwrap(),
             vec![WriteOutcome::AlreadyCurrent(hint.clone())]
         );

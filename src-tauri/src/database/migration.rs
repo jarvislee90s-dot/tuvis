@@ -1996,7 +1996,14 @@ mod b1_hint_migration_tests {
             [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         ).unwrap();
         assert_eq!(row, ("answered".into(), None, None));
-        let evidence: (Option<i64>, Option<String>, Option<String>, Option<String>, Option<String>) = conn.query_row(
+        type WitnessColumns = (
+            Option<i64>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        );
+        let evidence: WitnessColumns = conn.query_row(
             "SELECT proof_version, answer_turn_id, answer_item_id, answer_digest, evidence_state FROM codex_interaction_hints WHERE thread_id='th'", [],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
         ).unwrap();
