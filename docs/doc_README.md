@@ -15,12 +15,17 @@
 - [DSH Desktop 远程连接统一 Spec](engineering/specs/2026-10-29-dsh-desktop-remote-design.md)：八类功能、支撑证据、逐操作版本兼容与验收条件。
 - [WorkBuddy 5.9.3 子代理与看板 Spec](engineering/specs/2026-10-30-workbuddy-5.9.3-subagents-and-board-spec.md) / [设计](engineering/specs/2026-10-30-workbuddy-5.9.3-subagents-and-board-design.md)：5.9.3 子代理漏采与心跳冻结掉线。
 - [实施计划](engineering/plans/)：当前/历史执行计划；executor prompt 不入库。
+- [Codex 答题卡修复与升级兼容执行手册](engineering/plans/2026-11-05-codex-答题卡修复与升级兼容执行手册.md)：PR #202 三项缺陷的修法、回归与验收，以及后续持久化、历史核对和版本兼容工作单。
 - [WorkBuddy 5.9.3 TDD 执行计划](engineering/plans/2026-10-30-workbuddy-5.9.3-subagents-and-board-tdd.md)：R1/R2 任务、停止点与回滚。
 - [人工裁决台账](engineering/decisions/)：用户裁决、推翻与边界；只记决定，不记 agent 返工过程。
 - [最终审查索引](engineering/reviews/)：审查范围、最终结论、未闭合风险。
+- [Codex B1 持久事实设计审查](engineering/reviews/2026-11-05-codex-b1-durability-design-review.md)：六项风险的证据等级、五处方案缺口与实施计划修订清单。
+- [Codex B1.2 进度与剩余项](engineering/reviews/2026-11-05-codex-b1-2-progress-review.md)：多次撤销重放的真实 Rust 失败证据、B1.2 收口与 B1.3 未实施范围。
+- [Codex B1.2 验收](engineering/acceptance/2026-11-05-codex-b1-2-acceptance.md)：历史答复证据、重放防护、测试结果及后续边界。
 - [探测与取证](engineering/evidence/)：脱敏的 probe/复探证据。
 - [WorkBuddy 5.9.3 证据](engineering/evidence/2026-10-30-workbuddy-5.9.3/evidence.md)：真机核算、心跳/DB/TPS 探针。
 - [验收](engineering/acceptance/)：最终验收；`history/` 为历史验收材料。
+- [Codex B1.1 验收收口](engineering/acceptance/2026-11-05-codex-b1-1-acceptance.md)：生产 Store 窗口证据、自动检查结果与后续阶段边界。
 - [WorkBuddy 5.9.3 验收清单](engineering/acceptance/2026-10-30-workbuddy-5.9.3-acceptance.md)。
 - [架构](engineering/architecture/)：ADR、设计、线稿。
 - [参考](engineering/reference/)：实体对齐、并发评估等。

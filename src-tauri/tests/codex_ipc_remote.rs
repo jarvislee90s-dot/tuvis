@@ -14048,10 +14048,10 @@ async fn sse_late_stale_republish_cannot_override_completed_disable_publish() {
     // —— 被测连接 #2：重新跟随；SSE 基线 = 启用快照（R5/T3 同款驱动）——
     let mut body2 = t3_drive_refollow_and_spawn_sse(&f, &mut peer).await;
 
-    // —— 发布缝：被测任务是 `notify_auto_adapt_changed(true)` 的**直发臂**重发布
-    //    （第 2 次 republish_all），停在「payload 已取好（启用内容已盖章）、尚未
+    // —— 发布缝：被测任务是 `notify_auto_adapt_changed(true)` 的首次重发布，
+    //    停在「payload 已取好（启用内容已盖章）、尚未
     //    发布」。缝内完成伙伴动作（真实写设置关闭 + 新禁用策略发布广播，seq=N
-    //    已在轴上）再放行。装回臂（第 1 次）与伙伴自身（第 3 次起）照常放行。 ——
+    //    已在轴上）再放行。伙伴自身的后续重发布照常放行。 ——
     let adapter = f.state.codex_control.adapter.clone();
     let store = f.state.store.clone();
     // 被测任务（notify(true) 的重发布）跑在 tauri runtime worker 上：缝回调在该
@@ -14067,7 +14067,7 @@ async fn sse_late_stale_republish_cannot_override_completed_disable_publish() {
         .adapter
         .set_republish_publish_gate(Some(Arc::new(move || {
             let n = fire.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            if n != 1 {
+            if n != 0 {
                 return;
             }
             let adapter2 = adapter.clone();
@@ -14239,9 +14239,9 @@ async fn sse_publish_window_after_refresh_cannot_override_completed_disable_publ
     let mut body2 = t3_drive_refollow_and_spawn_sse(&f, &mut peer).await;
 
     // —— 发布缝（round 5 后置位）：被测任务是 `notify_auto_adapt_changed(true)`
-    //    直发臂重发布，停在「refresh 已通过、publish_event 尚未取号」。缝内完成
+    //    首次重发布，停在「refresh 已通过、publish_event 尚未取号」。缝内完成
     //    伙伴动作（真实写设置关闭 + 新禁用策略发布广播，seq=N 已在轴上）再放行。
-    //    装回臂（第 1 次）与伙伴自身（第 3 次起）照常放行。伙伴动作经独立 OS
+    //    伙伴自身的后续重发布照常放行。伙伴动作经独立 OS
     //    线程 + 测试 runtime `block_on` 驱动（被阻塞 worker 的 LIFO 槽教训，V3
     //    同款）。 ——
     let adapter = f.state.codex_control.adapter.clone();
@@ -14253,7 +14253,7 @@ async fn sse_publish_window_after_refresh_cannot_override_completed_disable_publ
         .adapter
         .set_republish_publish_gate(Some(Arc::new(move || {
             let n = fire.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            if n != 1 {
+            if n != 0 {
                 return;
             }
             let adapter2 = adapter.clone();
@@ -25129,4 +25129,119 @@ async fn stopping_capture_does_not_deadlock_mirror_and_database() {
         service.shutdown().await;
         adapter.shutdown().await;
     }
+}
+
+#[tokio::test]
+async fn pr202_first_snapshot_reconciles_old_answer() {
+    use multi_agents_manager_lib::services::codex_desktop_ipc::async_question::InteractionState;
+    let mut f = fixture_ipc_unknown_interrupt(vec![codex_app_session(THREAD)], false);
+    {
+        let conn = f.conn.lock().unwrap();
+        conn.execute("INSERT INTO codex_interaction_hints (thread_id, source_turn_id, source_item_id, question_index, last_fact, updated_at) VALUES (?1, 'old-turn', 'old-item', 0, 'pending', 1)", [THREAD]).unwrap();
+    }
+    f.state
+        .codex_control
+        .adapter
+        .set_interaction_hint_store(Some(Arc::new(
+            multi_agents_manager_lib::remote::codex_evidence::StoreInteractionHints::new(
+                DeviceStore::Owned(f.conn.clone()),
+            ),
+        )));
+    let mut published = f.state.codex_control.adapter.subscribe();
+    let mut peer = f.peer.take().unwrap();
+    let app = f.app.clone();
+    let task = tokio::spawn(async move {
+        app.oneshot(req(
+            "GET",
+            &format!("/m/api/v1/codex/thread?session_id={THREAD}"),
+            Some(COOKIE),
+            None,
+        ))
+        .await
+        .unwrap()
+    });
+    handshake(&mut peer, "owner-1").await;
+    let disc = peer.recv().await;
+    peer.send(&discovery_response(
+        disc["requestId"].as_str().unwrap(),
+        "owner-1",
+    ))
+    .await;
+    let follow = peer.recv().await;
+    assert_eq!(follow["method"], "thread-stream-following-changed");
+    let old_key = r#"["request_user_input_async","old-item",0]"#;
+    let envelope = format!("<send_user_message_question_reply>\n[{{\"questionItemId\":{},\"question\":\"旧题\",\"answer\":\"甲\"}}]\n</send_user_message_question_reply>", serde_json::to_string(old_key).unwrap());
+    peer.send(&serde_json::json!({
+        "type":"broadcast", "method":"thread-stream-state-changed", "version":11,
+        "sourceClientId":"owner-1", "params": {"conversationId":THREAD,"hostId":"local",
+        "change":{"type":"snapshot","revision":9,"conversationState":{
+          "turns":[],"requests":[],"threadRuntimeStatus":{"type":"idle"},
+          "turnHistory":{"history":{"isComplete":true,"entitiesByKey":{
+            "turn:new":{"turnId":"new","status":"completed","items":[{"type":"agentMessage","id":"new-item","text":"新题","phase":"final_answer","delivery":"async","questions":[{"title":"新题","options":["甲"]}]}]},
+            "turn:answer":{"turnId":"answer","status":"completed","items":[{"type":"userMessage","id":"answer-item","content":[{"type":"text","text":envelope,"text_elements":[]}]}]}
+          },"islands":[{"id":"i","entries":[{"key":"turn:new","value":"turn:new"},{"key":"turn:answer","value":"turn:answer"}]}]}}
+        }}}})).await;
+    let first = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let p = published.recv().await.unwrap();
+            if p.revision == Some(9) {
+                break p;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        first
+            .async_questions
+            .iter()
+            .any(|q| q.source_item_id == "old-item" && q.state == InteractionState::Unknown),
+        "first published: {:?}",
+        first.async_questions
+    );
+    assert!(
+        first
+            .async_questions
+            .iter()
+            .any(|q| q.source_item_id == "new-item"
+                && q.state == InteractionState::TemporarilyBlocked),
+        "首个快照必须同时保留新题: {:?}",
+        first.async_questions
+    );
+    let response = tokio::time::timeout(Duration::from_secs(15), task)
+        .await
+        .unwrap()
+        .unwrap();
+    let initial: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
+    let initial_questions = initial["asyncQuestions"].as_array().unwrap();
+    assert!(
+        initial_questions
+            .iter()
+            .any(|q| q["sourceItemId"] == "old-item" && q["state"] == "unknown"),
+        "initial={initial}"
+    );
+    assert!(
+        initial_questions
+            .iter()
+            .any(|q| q["sourceItemId"] == "new-item" && q["state"] == "temporarily_blocked"),
+        "首个 GET 必须保留新题: {initial}"
+    );
+    install_async_answer_contract(&f);
+    let p = f
+        .state
+        .codex_control
+        .adapter
+        .projection(&f.thread_key())
+        .await;
+    assert_eq!(
+        p.async_questions
+            .iter()
+            .find(|q| q.source_item_id == "new-item")
+            .unwrap()
+            .state,
+        InteractionState::Pending
+    );
+    let conn = f.conn.lock().unwrap();
+    let fact: String = conn.query_row("SELECT last_fact FROM codex_interaction_hints WHERE thread_id=?1 AND source_item_id='old-item'", [THREAD], |r| r.get(0)).unwrap();
+    assert_eq!(fact, "unknown");
 }

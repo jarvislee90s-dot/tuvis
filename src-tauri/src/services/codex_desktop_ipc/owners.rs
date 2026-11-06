@@ -18,6 +18,7 @@ struct LeaseEntry {
     epoch: u64,
     generation: u64,
     validity_tx: watch::Sender<bool>,
+    authority: std::sync::Arc<super::hint_commit::HintLeaseAuthority>,
 }
 
 /// owner 租约登记表。generation 按 Thread 单调增加；reset 后 epoch 增加。
@@ -38,7 +39,7 @@ impl OwnerRegistry {
     /// adapter 的「换代兜底」按失败重试。（表内没有「存档」条目的读者，存档无意义。）
     pub fn bind(&mut self, key: ThreadKey, client_id: String, epoch: u64) -> OwnerLease {
         if epoch > self.epoch {
-            self.epoch = epoch;
+            self.reset(epoch);
         }
         if epoch < self.epoch {
             // 旧连接迟到：保持 current 不变（回归测试
@@ -52,6 +53,7 @@ impl OwnerRegistry {
         }
         // 旧绑定失效（换代）
         if let Some(old) = self.threads.remove(&key) {
+            old.authority.revoke_owner();
             let _ = old.validity_tx.send(false);
             if let Some(set) = self.by_client.get_mut(&old.client_id) {
                 set.remove(&key);
@@ -73,6 +75,12 @@ impl OwnerRegistry {
                 epoch,
                 generation,
                 validity_tx,
+                authority: super::hint_commit::HintLeaseAuthority::new(OwnerLease {
+                    key: key.clone(),
+                    client_id: client_id.clone(),
+                    epoch,
+                    generation,
+                }),
             },
         );
         self.by_client
@@ -94,6 +102,7 @@ impl OwnerRegistry {
         };
         for key in keys {
             if let Some(entry) = self.threads.remove(&key) {
+                entry.authority.revoke_owner();
                 let _ = entry.validity_tx.send(false);
             }
         }
@@ -103,6 +112,7 @@ impl OwnerRegistry {
     /// lease 移除 + validity false，后续该 owner 的帧不再有授权可套）。
     pub fn release(&mut self, key: &ThreadKey) {
         if let Some(old) = self.threads.remove(key) {
+            old.authority.revoke_owner();
             let _ = old.validity_tx.send(false);
             if let Some(set) = self.by_client.get_mut(&old.client_id) {
                 set.remove(key);
@@ -118,9 +128,22 @@ impl OwnerRegistry {
     pub fn reset(&mut self, new_epoch: u64) {
         self.epoch = new_epoch;
         for (_, entry) in self.threads.drain() {
+            entry.authority.revoke_owner();
             let _ = entry.validity_tx.send(false);
         }
         self.by_client.clear();
+    }
+
+    pub(crate) fn authority(
+        &self,
+        lease: &OwnerLease,
+    ) -> Option<std::sync::Arc<super::hint_commit::HintLeaseAuthority>> {
+        if !self.is_current(lease) {
+            return None;
+        }
+        self.threads
+            .get(&lease.key)
+            .map(|entry| entry.authority.clone())
     }
 
     /// 当前绑定（epoch 不符视为无绑定）。
@@ -454,6 +477,35 @@ mod tests {
         ThreadKey {
             host_id: "local".into(),
             thread_id: id.into(),
+        }
+    }
+
+    #[test]
+    fn b1_higher_epoch_bind_revokes_other_threads() {
+        let mut r = OwnerRegistry::default();
+        let old = r.bind(key("old"), "owner".into(), 1);
+        let permit = r.authority(&old).unwrap().rotate_scope().unwrap();
+        r.bind(key("new"), "other".into(), 2);
+        assert!(!r.is_current(&old));
+        assert!(permit.lock().is_err());
+    }
+
+    #[test]
+    fn b1_registry_entrypoints_revoke_authority() {
+        for mode in 0..4 {
+            let mut r = OwnerRegistry::default();
+            let lease = r.bind(key("t"), "owner".into(), 1);
+            let authority = r.authority(&lease).unwrap();
+            let permit = authority.rotate_scope().unwrap();
+            match mode {
+                0 => {
+                    r.bind(key("t"), "new".into(), 1);
+                }
+                1 => r.invalidate_client("owner"),
+                2 => r.release(&key("t")),
+                _ => r.reset(2),
+            }
+            assert!(permit.lock().is_err(), "entrypoint {mode} did not revoke");
         }
     }
 

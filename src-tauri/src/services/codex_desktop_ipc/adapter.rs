@@ -242,6 +242,7 @@ struct AdapterInner {
     mirrors: Mutex<HashMap<ThreadKey, ThreadMirror>>,
     /// C4：全体镜像字节账本（生产 64MiB；所有镜像共用一份）
     mirror_ledger: Arc<std::sync::Mutex<super::mirror::MirrorLedger>>,
+    answer_validity: Arc<super::answer_validity::AnswerValidityLedger>,
     followings: Mutex<FollowingSet>,
     remote_write_generation: Arc<super::observation::RemoteWriteGeneration>,
     estimate_pins: std::sync::atomic::AtomicUsize,
@@ -443,8 +444,10 @@ struct AdapterInner {
     /// 执行权、无 await）：先失效先胜出，claim 之后才允许写出。
     interaction_gate: std::sync::Mutex<()>,
     /// T03：已装载提示缓存（thread_id → 提示；镜像锁内只读它，不读 DB）。
+    interaction_hint_io: tokio::sync::Mutex<()>,
     interaction_hints_cache:
         std::sync::Mutex<HashMap<String, Arc<Vec<super::async_question::InteractionHint>>>>,
+    hint_observations: std::sync::Mutex<Option<HintObservationState>>,
     /// S1：本进程内已确立的**读链成功证据**（与能力位分离——S0 §3.1 裁决：兼容档
     /// state=true 表达「可尝试」，不等于已取证；探测触发与否看证据，不看能力位）。
     /// Some(target) = 该连接代际 + build 目标已有成功证据（账本命中或探测通过）。
@@ -465,6 +468,17 @@ struct AdapterInner {
 }
 
 use super::owners::OwnerRegistry;
+
+struct HintObservationState {
+    state: super::hint_state::HintState,
+    scopes: HashMap<ThreadKey, (super::types::OwnerLease, u64)>,
+}
+
+struct AuthorizedHintObservation {
+    observation: super::hint_state::HintObservation,
+    permit: super::hint_commit::HintCommitPermit,
+    scope: u64,
+}
 
 /// Desktop IPC 适配器（克隆共享）。
 /// 复审 R-T4：队列暂停事实源（thread_id → 是否存在任意暂停行；读失败按 true
@@ -870,6 +884,19 @@ impl DesktopIpcAdapter {
     }
 
     pub fn new(connector: Arc<dyn Connector>, profile: ProtocolProfile) -> Self {
+        Self::with_answer_validity(
+            connector,
+            profile,
+            Arc::new(super::answer_validity::AnswerValidityLedger::default()),
+        )
+    }
+
+    /// 串行重装时使用上一实例的运行期账本；调用方须先停用旧实例。
+    pub fn with_answer_validity(
+        connector: Arc<dyn Connector>,
+        profile: ProtocolProfile,
+        answer_validity: Arc<super::answer_validity::AnswerValidityLedger>,
+    ) -> Self {
         Self {
             inner: Arc::new(AdapterInner {
                 connector,
@@ -901,6 +928,7 @@ impl DesktopIpcAdapter {
                 mirror_ledger: Arc::new(std::sync::Mutex::new(
                     super::mirror::MirrorLedger::global(),
                 )),
+                answer_validity,
                 followings: Mutex::new(FollowingSet::default()),
                 remote_write_generation: Arc::default(),
                 estimate_pins: std::sync::atomic::AtomicUsize::new(0),
@@ -951,7 +979,9 @@ impl DesktopIpcAdapter {
                 contract_target_override: std::sync::Mutex::new(None),
                 observed_operations: std::sync::Mutex::new(None),
                 interaction_hint_store: std::sync::Mutex::new(None),
+                interaction_hint_io: tokio::sync::Mutex::new(()),
                 interaction_hints_cache: std::sync::Mutex::new(HashMap::new()),
+                hint_observations: std::sync::Mutex::new(None),
                 interaction_facts: std::sync::Mutex::new(HashMap::new()),
                 group_bindings: std::sync::Mutex::new(HashMap::new()),
                 interaction_gate: std::sync::Mutex::new(()),
@@ -971,6 +1001,11 @@ impl DesktopIpcAdapter {
                 events: broadcast::channel(256).0,
             }),
         }
+    }
+
+    /// 获取运行期账本，仅供旧实例停止后的串行重装接续。
+    pub fn answer_validity(&self) -> Arc<super::answer_validity::AnswerValidityLedger> {
+        self.inner.answer_validity.clone()
     }
 
     /// #172/T7：注入官方 schema 证据（生产由装配期一次性探测填入；测试直接注入）。
@@ -3090,6 +3125,43 @@ impl DesktopIpcAdapter {
     ///
     /// 读失败 / 无存储 → 不缓存（保持 Unknown 的保守语义；不合成"已答"）。
     pub async fn ensure_interaction_hints(&self, key: &ThreadKey) {
+        let _io = self.inner.interaction_hint_io.lock().await;
+        if !self.load_interaction_hints_locked(key).await {
+            return;
+        }
+        let initialized = self
+            .inner
+            .hint_observations
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some();
+        if !initialized {
+            let store = self
+                .inner
+                .interaction_hint_store
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            if let Some(store) = store {
+                if let Ok(Ok(epoch)) =
+                    tokio::task::spawn_blocking(move || store.begin_epoch()).await
+                {
+                    if let Ok(state) = super::hint_state::HintState::new(epoch) {
+                        *self
+                            .inner
+                            .hint_observations
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner()) = Some(HintObservationState {
+                            state,
+                            scopes: HashMap::new(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    async fn load_interaction_hints_locked(&self, key: &ThreadKey) -> bool {
         {
             let cache = self
                 .inner
@@ -3097,8 +3169,180 @@ impl DesktopIpcAdapter {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             if cache.contains_key(&key.thread_id) {
+                return true;
+            }
+        }
+        let store = self
+            .inner
+            .interaction_hint_store
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let Some(store) = store else {
+            return false;
+        };
+        let thread_id = key.thread_id.clone();
+        let loaded = tokio::task::spawn_blocking(move || store.load(&thread_id))
+            .await
+            .ok()
+            .flatten();
+        let Some(rows) = loaded else {
+            return false;
+        };
+        let hints: Vec<super::async_question::InteractionHint> = rows
+            .into_iter()
+            .map(super::async_question::InteractionHint::from_stored)
+            .collect();
+        self.inner
+            .interaction_hints_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key.thread_id.clone(), Arc::new(hints));
+        true
+    }
+
+    fn capture_hint_observation(
+        &self,
+        key: &ThreadKey,
+        mirror: &ThreadMirror,
+        questions: &[super::async_question::AsyncQuestionView],
+    ) -> Option<AuthorizedHintObservation> {
+        if mirror.is_stale() {
+            return None;
+        }
+        let owner = mirror.lease()?.clone();
+        let permit = mirror.hint_permit()?;
+        if permit.lease() != &owner {
+            return None;
+        }
+        // 此检查只是淘汰已知失效的侧载；提交仍由原 permit 的 gate 保护。
+        if permit.lock().is_err() {
+            return None;
+        }
+        if !self
+            .inner
+            .interaction_hints_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(&key.thread_id)
+        {
+            return None;
+        }
+        let scope = permit.scope_id();
+        let previous = self
+            .inner
+            .interaction_hints_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key.thread_id)
+            .cloned()?;
+        let current_witnesses = mirror
+            .observation_state()
+            .map(|state| super::async_question::answer_witnesses(&key.thread_id, state))
+            .unwrap_or_default();
+        let hints: Vec<_> = questions
+            .iter()
+            .map(|question| {
+                let direct = current_witnesses.get(&question.question_key).cloned();
+                let prior = previous.iter().find(|h| {
+                    h.source_turn_id == question.source_turn_id
+                        && h.source_item_id == question.source_item_id
+                        && h.question_index == question.question_index
+                });
+                let witness = direct
+                    .clone()
+                    .or_else(|| prior.and_then(|h| h.witness.clone()));
+                let evidence_state = if direct.is_some()
+                    && question.state == super::async_question::InteractionState::Answered
+                {
+                    Some("valid".to_string())
+                } else if witness.is_some() {
+                    Some("unverified".to_string())
+                } else {
+                    None
+                };
+                super::async_question::InteractionHint {
+                    thread_id: key.thread_id.clone(),
+                    source_turn_id: question.source_turn_id.clone(),
+                    source_item_id: question.source_item_id.clone(),
+                    question_index: question.question_index,
+                    last_fact: match question.state {
+                        super::async_question::InteractionState::Answered => "answered",
+                        super::async_question::InteractionState::Unknown => "unknown",
+                        _ => "pending",
+                    }
+                    .into(),
+                    witness,
+                    evidence_state,
+                }
+            })
+            .collect();
+        let mut observations = self
+            .inner
+            .hint_observations
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let observations = observations.as_mut()?;
+        let observation = observations
+            .state
+            .observe_scoped(
+                key.clone(),
+                owner.clone(),
+                mirror.build_generation(),
+                scope,
+                hints,
+            )
+            .ok()?;
+        observations.scopes.insert(key.clone(), (owner, scope));
+        let mut cache = self
+            .inner
+            .interaction_hints_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(existing) = cache.get_mut(&key.thread_id) {
+            let mut merged = (**existing).clone();
+            for versioned in &observation.hints {
+                let hint = &versioned.hint;
+                if let Some(slot) = merged.iter_mut().find(|h| {
+                    h.source_turn_id == hint.source_turn_id
+                        && h.source_item_id == hint.source_item_id
+                        && h.question_index == hint.question_index
+                }) {
+                    *slot = hint.clone();
+                } else {
+                    merged.push(hint.clone());
+                }
+            }
+            *existing = Arc::new(merged);
+        }
+        Some(AuthorizedHintObservation {
+            observation,
+            permit,
+            scope,
+        })
+    }
+
+    async fn persist_authorized_hints(&self, authorized: AuthorizedHintObservation) {
+        let _io = self.inner.interaction_hint_io.lock().await;
+        let mut sent = authorized.observation.clone();
+        {
+            let observations = self
+                .inner
+                .hint_observations
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let Some(observations) = observations.as_ref() else {
+                return;
+            };
+            if observations.scopes.get(&sent.key) != Some(&(sent.owner.clone(), authorized.scope)) {
                 return;
             }
+            sent.hints = observations
+                .state
+                .prepare_batch_scoped(&sent, authorized.scope);
+        }
+        if sent.hints.is_empty() {
+            return;
         }
         let store = self
             .inner
@@ -3109,41 +3353,52 @@ impl DesktopIpcAdapter {
         let Some(store) = store else {
             return;
         };
-        let thread_id = key.thread_id.clone();
-        let loaded = tokio::task::spawn_blocking(move || store.load(&thread_id))
-            .await
-            .ok()
-            .flatten();
-        let Some(rows) = loaded else {
+        let batch = sent.hints.clone();
+        let epoch = batch[0].version.epoch;
+        let permit = authorized.permit.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            store.write_batch(
+                epoch,
+                &batch,
+                chrono::Utc::now().timestamp_millis(),
+                &permit,
+            )
+        })
+        .await;
+        let Ok(Ok(report)) = result else {
             return;
         };
-        let hints: Vec<super::async_question::InteractionHint> = rows
-            .into_iter()
-            .map(|row| super::async_question::InteractionHint {
-                thread_id: row.thread_id,
-                source_turn_id: row.source_turn_id,
-                source_item_id: row.source_item_id,
-                question_index: row.question_index,
-                last_fact: row.last_fact,
-            })
-            .collect();
-        self.inner
-            .interaction_hints_cache
+        let mut observations = self
+            .inner
+            .hint_observations
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(key.thread_id.clone(), Arc::new(hints));
+            .unwrap_or_else(|e| e.into_inner());
+        let Some(observations) = observations.as_mut() else {
+            return;
+        };
+        if observations.scopes.get(&sent.key) != Some(&(sent.owner.clone(), authorized.scope)) {
+            return;
+        }
+        observations
+            .state
+            .apply_report_scoped(&sent, authorized.scope, &report);
     }
 
     /// R18：把投影里的题目事实写穿到持久提示（**仅变化时落库**；无存储/无题即跳过）。
     ///
     /// 只写"事实"（answered/pending/unknown），不写题干/答案/信封。用途：重启后相关
     /// 历史未加载时仍能给「已知但未核对」的题一个占位，而不是把"没看到"当"没答过"。
+    #[cfg(test)]
     async fn persist_interaction_hints(
         &self,
         key: &ThreadKey,
         questions: &[super::async_question::AsyncQuestionView],
     ) {
         if questions.is_empty() {
+            return;
+        }
+        let _io = self.inner.interaction_hint_io.lock().await;
+        if !self.load_interaction_hints_locked(key).await {
             return;
         }
         let store = self
@@ -3185,6 +3440,8 @@ impl DesktopIpcAdapter {
                         source_item_id: question.source_item_id.clone(),
                         question_index: question.question_index,
                         last_fact: fact.to_string(),
+                        witness: None,
+                        evidence_state: None,
                     });
                 }
             }
@@ -4455,6 +4712,7 @@ impl DesktopIpcAdapter {
     ///
     /// #172/T9a：探测只读事实在镜像锁**之外**再盖（读账本/单飞器，不得持镜像锁）。
     async fn fresh_projection(&self, key: &ThreadKey) -> Option<ThreadProjection> {
+        self.ensure_interaction_hints(key).await;
         // T3 红测缝：旧代码 caps 锁外先读后、镜像锁前的窗口（生产恒 None 直通）。
         // 修复后 caps 在临界区内读取，本缝退化为「先跑窗口动作再取快照」的无害定序。
         self.run_fresh_snapshot_gate();
@@ -4468,17 +4726,24 @@ impl DesktopIpcAdapter {
             let p = mirrors
                 .get_mut(key)
                 .filter(|m| !m.is_stale() && m.revision().is_some())
-                .map(|m| self.project_mirror(key, m, caps));
+                .map(|m| {
+                    let projection = self.project_mirror(key, m, caps);
+                    let hint = self.capture_hint_observation(key, m, &projection.async_questions);
+                    (projection, hint)
+                });
             // Gate F Major 1：快路径首快照同样盖章（临界区内，见 seal_snapshot_seq）
             //——第二订阅者/重连与事件共享同一条本地排序轴。
-            p.map(|mut p| {
+            p.map(|(mut p, hint)| {
                 p.local_seq = self.seal_snapshot_seq();
-                p
+                (p, hint)
             })
         };
         match p.as_mut() {
             Some(_) => {
-                let p = p.take().expect("just checked");
+                let (p, hint) = p.take().expect("just checked");
+                if let Some(hint) = hint {
+                    self.persist_authorized_hints(hint).await;
+                }
                 // 复审 R-T4：快路径同样盖队列暂停事实（与 projection() 同源）
                 let p = self.stamp_queue_pause(key, p);
                 Some(self.stamp_probe_status(p).await)
@@ -4535,7 +4800,10 @@ impl DesktopIpcAdapter {
         {
             let mut mirrors = self.inner.mirrors.lock().await;
             mirrors.entry(key.clone()).or_insert_with(|| {
-                ThreadMirror::with_ledger(key.clone(), self.inner.mirror_ledger.clone())
+                let mut mirror =
+                    ThreadMirror::with_ledger(key.clone(), self.inner.mirror_ledger.clone());
+                mirror.set_answer_validity_ledger(self.inner.answer_validity.clone());
+                mirror
             });
         }
         // discovery（await 不持锁）→ 绑定（短锁）。
@@ -4670,7 +4938,7 @@ impl DesktopIpcAdapter {
         // 直接发布路径（handle_state_changed / publish_projection /
         // handle_client_status_changed / mark_all_mirrors_stale）的 caps 观察一并
         // 挪进临界区，与快照路径同一边界。
-        let p = {
+        let (p, hint_observation) = {
             let mut mirrors = self.inner.mirrors.lock().await;
             let caps = self.effective_projection_caps();
             let policy = self.approval_policy();
@@ -4680,43 +4948,47 @@ impl DesktopIpcAdapter {
                     m.set_approval_policy(Some(policy));
                     let mut p = self.project_mirror(key, m, caps);
                     p.local_seq = sealed;
-                    p
+                    let hint = self.capture_hint_observation(key, m, &p.async_questions);
+                    (p, hint)
                 }
                 // 无镜像回退分支同样以临界区内的基线盖章：revision=None 的空投影
                 // 仅与 revision=None 事件按 local_seq 竞争，而该类事件（本地重发
                 // 布）必须镜像在场才会发布——此处无被回退风险，R5「空投影也盖章」
                 // 语义保持。
-                None => ThreadProjection {
-                    thread_id: key.thread_id.clone(),
-                    revision: None,
-                    stale: true,
-                    availability: ControlAvailability::CompatOnly,
-                    capabilities: caps,
-                    runtime_status: "unknown".into(),
-                    content_state: ContentState::Loading,
-                    messages: Vec::new(),
-                    truncated: false,
-                    history_token: String::new(),
-                    pending: Vec::new(),
-                    // 无镜像：无题目可投影（不是"没有未答题"的事实）。
-                    async_questions: Vec::new(),
-                    // 无镜像也要给出**当前证据**（断链只撤回动作，不抹掉"已识别"）；
-                    // 运行态按 unknown 保守处理。
-                    effective_operations: self.compute_operations(
-                        "unknown".to_string(),
-                        false,
-                        queue_paused,
-                    ),
-                    probe_status: ProbeStatus::idle(),
-                    queue_paused: false,
-                    owner_epoch: 0,
-                    owner_generation: 0,
-                    local_seq: sealed,
-                    // T02：版本束由远程层**发射点**盖章（adapter 不知道 hub 世系身份）。
-                    projection_version: None,
-                    // T03：无镜像 = 无同次观察的活动回合事实 → None（不猜）。
-                    active_turn_id: None,
-                },
+                None => (
+                    ThreadProjection {
+                        thread_id: key.thread_id.clone(),
+                        revision: None,
+                        stale: true,
+                        availability: ControlAvailability::CompatOnly,
+                        capabilities: caps,
+                        runtime_status: "unknown".into(),
+                        content_state: ContentState::Loading,
+                        messages: Vec::new(),
+                        truncated: false,
+                        history_token: String::new(),
+                        pending: Vec::new(),
+                        // 无镜像：无题目可投影（不是"没有未答题"的事实）。
+                        async_questions: Vec::new(),
+                        // 无镜像也要给出**当前证据**（断链只撤回动作，不抹掉"已识别"）；
+                        // 运行态按 unknown 保守处理。
+                        effective_operations: self.compute_operations(
+                            "unknown".to_string(),
+                            false,
+                            queue_paused,
+                        ),
+                        probe_status: ProbeStatus::idle(),
+                        queue_paused: false,
+                        owner_epoch: 0,
+                        owner_generation: 0,
+                        local_seq: sealed,
+                        // T02：版本束由远程层**发射点**盖章（adapter 不知道 hub 世系身份）。
+                        projection_version: None,
+                        // T03：无镜像 = 无同次观察的活动回合事实 → None（不猜）。
+                        active_turn_id: None,
+                    },
+                    None,
+                ),
             }
         };
         // T3 红测缝：临界区后插窗（生产恒 None 直通）。
@@ -4727,8 +4999,9 @@ impl DesktopIpcAdapter {
         let p = self.stamp_queue_pause(key, p);
         let p = self.stamp_probe_status(p).await;
         // R18：题目事实写穿持久提示（仅变化时落库；重启后未加载的题有占位）。
-        self.persist_interaction_hints(key, &p.async_questions)
-            .await;
+        if let Some(hint) = hint_observation {
+            self.persist_authorized_hints(hint).await;
+        }
         p
     }
 
@@ -6772,6 +7045,9 @@ async fn handle_state_changed(
     if source != Some(lease.client_id.as_str()) {
         return;
     }
+    // 首帧投影必须先看到已持久化的历史身份；不能在生成投影后才加载，
+    // 否则旧题的正式答复会从广播与本次写穿中遗漏。镜像锁外读取。
+    adapter.ensure_interaction_hints(&key).await;
     let estimate_followed = adapter
         .inner
         .followings
@@ -6801,7 +7077,7 @@ async fn handle_state_changed(
     // 区内的最新观察吸收）。
     adapter.run_caps_observe_gate("state_changed");
     // 短锁 2：原子应用
-    let mut fresh: Option<ThreadProjection> = None;
+    let mut fresh: Option<(ThreadProjection, Option<AuthorizedHintObservation>)> = None;
     let mut need_recover = false;
     let mut history_needed = false;
     // T02：暂停事实在镜像锁外读取（锁内不读 DB）。
@@ -6826,6 +7102,9 @@ async fn handle_state_changed(
         };
         if !owners.is_current(&lease) {
             return;
+        }
+        if let Some(authority) = owners.authority(&lease) {
+            mirror.bind_hint_authority(authority);
         }
         let mut trackers = adapter
             .inner
@@ -6937,7 +7216,9 @@ async fn handle_state_changed(
                     // 的盖章声明其内容版本（T3 快照同款边界）——发布点的 CAS 以
                     // 它为比较值，「内容观察」与「发布资格取得」才有共同的版本轴。
                     proj.local_seq = adapter.seal_snapshot_seq();
-                    fresh = Some(proj);
+                    let hint =
+                        adapter.capture_hint_observation(&key, mirror, &proj.async_questions);
+                    fresh = Some((proj, hint));
                     // 2026-10-19 复审 P2-2：触发判据 = 列表不完整 **或** items 未加载/
                     // 淘汰（itemsView）——列表完整不代表正文完整，不能等 Desktop
                     // 自己打开才补全
@@ -6971,7 +7252,7 @@ async fn handle_state_changed(
         publish_projection(adapter, &key).await;
         spawn_stale_refollow(adapter.clone(), key.clone(), current_conn(adapter).await);
     }
-    if let Some(p) = fresh {
+    if let Some((p, hint_observation)) = fresh {
         // C3：状态应用驱动的提交屏障清理——pending 消失或重现换 token 即解除旧
         // Unknown 屏障（不等下一次 respond 入口），新卡立即可答
         cleanup_inflight_for(adapter, &key.thread_id, &p.pending).await;
@@ -6987,6 +7268,15 @@ async fn handle_state_changed(
         // 不再以发送时刻取得更大序号（W1② 红测窗口）。
         let p = adapter.stamp_queue_pause(&key, p);
         let p = adapter.stamp_probe_status(p).await;
+        // L2（2026-11-05）：**状态帧推送路径也要写穿持久提示**。
+        // 此前全仓库只有 `projection()` 尾部（:4730）会 persist，而桌面端作答
+        // 走的是 `handle_state_changed` 的这条正常发布分支——于是「移动端视图
+        // 实时清卡、DB hint 仍停在 pending」；页面没开该会话时更是无限期滞后，
+        // 下次投影又会拿旧 hint 产出占位/待作答。
+        // 空列表仍会检查同 scope 的待写事实；镜像锁已释放后再执行数据库写入。
+        if let Some(hint) = hint_observation {
+            adapter.persist_authorized_hints(hint).await;
+        }
         adapter.publish_fresh_projection(&key, p).await;
         if history_needed {
             maybe_request_complete_history(adapter, &key).await;
@@ -7064,6 +7354,7 @@ async fn is_fresh(adapter: &DesktopIpcAdapter, key: &ThreadKey) -> bool {
 
 /// 发布该 thread 的当前投影（短锁读取后发广播）。
 async fn publish_projection(adapter: &DesktopIpcAdapter, key: &ThreadKey) {
+    adapter.ensure_interaction_hints(key).await;
     // 复审 round 6（Q1）测试缝：「caps 观察窗」（修复后 caps 在临界区内读取，无害
     // 定序——见 handle_state_changed 同款注释）。
     adapter.run_caps_observe_gate("publish_projection");
@@ -7078,10 +7369,14 @@ async fn publish_projection(adapter: &DesktopIpcAdapter, key: &ThreadKey) {
             // 复审 round 5（W1）：发布 payload 以镜像临界区内的盖章声明内容版本
             //（handle_state_changed 同款）——发布点的 CAS 以它为比较值。
             p.local_seq = adapter.seal_snapshot_seq();
-            p
+            let hint = adapter.capture_hint_observation(key, m, &p.async_questions);
+            (p, hint)
         })
     };
-    if let Some(p) = projection {
+    if let Some((p, hint)) = projection {
+        if let Some(hint) = hint {
+            adapter.persist_authorized_hints(hint).await;
+        }
         // 复审 R-T4：队列暂停事实（镜像锁已释放）+ #172/T9a：探测只读事实。
         // 复审 round 5（W1）：CAS 预留发布（全入口统一协议）；被并发发布越过
         // → 重观察后再预留。
@@ -9912,5 +10207,804 @@ mod h14_package_content_tests {
                 ),
             "旧结论不得生效"
         );
+    }
+}
+
+/// L2 位置回归锁（2026-11-05）：授权侧载的写穿必须挂在
+/// **`handle_state_changed` 的正常发布分支**（`publish_fresh_projection(&key, p)`
+/// 之前），而不是只挂在 `publish_projection`（异常恢复路径）或 `projection()`
+/// （轮询路径）。
+///
+/// 为什么需要这条锁：`publish_projection` 只在 `need_recover` 时调用
+/// （adapter.rs 两处：stale 恢复与 need_snapshot），桌面端正常作答**不经过**
+/// 它。第一版实现误挂在 `publish_projection`，等于没修——桌面答完后 DB hint
+/// 依旧停在 pending。本测试用源码形态断言钉死正确位置：未来若有人把它挪走，
+/// 这里会失败而不是静默退化。
+#[cfg(test)]
+mod l2_persist_call_site_tests {
+    /// 取 `handle_state_changed` 到文件末尾的切片（该函数是文件的最后一个
+    /// 大函数之一，其后的 `publish_projection` 等工具函数也在切片内——
+    /// 我们只关心“正常分支里是否有 persist 调用”）。
+    #[test]
+    fn persist_runs_on_normal_state_publish_branch() {
+        let src = include_str!("adapter.rs");
+        // 正常分支的标志：`publish_fresh_projection(&key, p)` 带 &key
+        // （`publish_projection` 里是 `publish_fresh_projection(key, p)`，无 &）。
+        let marker = "adapter.publish_fresh_projection(&key, p).await;";
+        let at = src
+            .find(marker)
+            .expect("正常发布分支必须存在（handle_state_changed 的 fresh 分支）");
+        // 发布前尝试写穿；只有写入成功时才表示 DB 已记下，失败仍可发布观察。
+        let start = at.saturating_sub(2000);
+        let window = &src[start..at];
+        assert!(
+            window.contains("persist_authorized_hints(hint)"),
+            "handle_state_changed 正常发布分支必须先写穿持久提示（L2）；\
+             若挪到 publish_projection（异常恢复路径）等于没修。窗口片段：\n{window}"
+        );
+    }
+
+    /// 恢复路径也只持久化同次镜像观察捕获的授权侧载。
+    #[test]
+    fn recovery_publish_uses_authorized_observation() {
+        let src = include_str!("adapter.rs");
+        let fn_start = src
+            .find("async fn publish_projection(adapter: &DesktopIpcAdapter, key: &ThreadKey) {")
+            .expect("publish_projection 必须存在");
+        let tail = &src[fn_start..];
+        let fn_end = tail
+            .find("\nasync fn current_conn(")
+            .expect("publish_projection 之后应紧跟 current_conn");
+        let body = &tail[..fn_end];
+        assert!(
+            body.contains("capture_hint_observation") && body.contains("persist_authorized_hints"),
+            "publish_projection 必须使用同次观察的授权侧载"
+        );
+    }
+}
+
+#[cfg(test)]
+mod pr202_hint_init_tests {
+    use super::*;
+    use crate::database::dao::codex_interactions::StoredInteractionHint;
+    use crate::services::codex_desktop_ipc::async_question::{
+        AsyncQuestionView, InteractionHint, InteractionHintStore, InteractionState,
+    };
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
+
+    #[tokio::test]
+    async fn b1_serial_adapter_rebuild_preserves_retired_sources() {
+        let (old, key, _) = setup();
+        let ledger = old.answer_validity();
+        let witness = |id: &str| super::super::async_question::AnswerWitness {
+            proof_version: 1,
+            answer_turn_id: "turn".into(),
+            answer_item_id: id.into(),
+            answer_digest: "digest".into(),
+        };
+        assert!(ledger.apply(&key, "q", Some("v1"), Some(&witness("old")), &[]));
+        assert!(ledger.apply(&key, "q", Some("v2"), Some(&witness("new")), &[]));
+        old.begin_shutdown();
+        old.shutdown().await;
+        drop(old);
+        let replacement = DesktopIpcAdapter::with_answer_validity(
+            Arc::new(super::publish_protocol_tests::NoopConnector),
+            ProtocolProfile::closed(),
+            ledger,
+        );
+        assert!(!replacement
+            .inner
+            .answer_validity
+            .allows_candidate(&key, "q", "old"));
+        assert!(replacement
+            .inner
+            .answer_validity
+            .allows_candidate(&key, "q", "new"));
+    }
+
+    #[tokio::test]
+    async fn b1_replayed_witness_is_not_persisted_valid() {
+        use super::super::hint_state::WriteOutcome;
+        use crate::remote::codex_evidence::StoreInteractionHints;
+        use crate::remote::pairing::DeviceStore;
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::database::schema::init(&conn);
+        crate::database::migration::migrate(&conn).unwrap();
+        let store = Arc::new(StoreInteractionHints::new(DeviceStore::Owned(Arc::new(
+            std::sync::Mutex::new(conn),
+        ))));
+        let adapter = DesktopIpcAdapter::new(
+            Arc::new(super::publish_protocol_tests::NoopConnector),
+            ProtocolProfile::closed(),
+        );
+        adapter.set_interaction_hint_store(Some(store.clone()));
+        let key = ThreadKey {
+            host_id: "local".into(),
+            thread_id: "replay".into(),
+        };
+        adapter.ensure_interaction_hints(&key).await;
+        let lease = super::super::types::OwnerLease {
+            key: key.clone(),
+            client_id: "owner".into(),
+            epoch: 1,
+            generation: 1,
+        };
+        let mut mirror = ThreadMirror::new(key.clone());
+        mirror.set_answer_validity_ledger(adapter.inner.answer_validity.clone());
+        mirror.bind_hint_authority(super::super::hint_commit::HintLeaseAuthority::new(
+            lease.clone(),
+        ));
+        let envelope = super::super::async_question::compose_async_answer("call-1", 0, "Q", "A");
+        let state = serde_json::json!({"turnHistory":{"history":{"isComplete":true,"entitiesByKey":{
+            "q":{"turnId":"q","status":"completed","items":[{"type":"agentMessage","id":"call-1","questions":[{"title":"Q"}]}]},
+            "a":{"turnId":"a","status":"completed","items":[{"type":"userMessage","id":"answer-1","content":[{"type":"text","text":envelope}]}]}
+        },"islands":[{"entries":[{"value":"q"},{"value":"a"}]}]}}});
+        mirror
+            .apply(
+                &lease,
+                &serde_json::json!({"type":"snapshot","revision":1,"conversationState":state}),
+            )
+            .unwrap();
+        let projection = mirror.project(adapter.current_caps());
+        assert_eq!(
+            projection.async_questions[0].state,
+            InteractionState::Answered
+        );
+        let old = adapter
+            .capture_hint_observation(&key, &mirror, &projection.async_questions)
+            .unwrap();
+        let old_observation = old.observation.clone();
+        let old_scope = old.scope;
+        adapter.persist_authorized_hints(old).await;
+        mirror.apply(&lease, &serde_json::json!({"type":"patches","baseRevision":1,"revision":2,"patches":[{"op":"replace","path":["turnHistory","history","entitiesByKey","q","items",0,"questions",0,"title"],"value":"Q1"}]})).unwrap();
+        mirror.apply(&lease, &serde_json::json!({"type":"patches","baseRevision":2,"revision":3,"patches":[{"op":"replace","path":["turnHistory","history","entitiesByKey","q","items",0,"questions",0,"title"],"value":"Q"}]})).unwrap();
+        let replay = mirror.project(adapter.current_caps());
+        assert_eq!(replay.async_questions[0].state, InteractionState::Unknown);
+        let newer = adapter
+            .capture_hint_observation(&key, &mirror, &replay.async_questions)
+            .unwrap();
+        {
+            let mut guard = adapter.inner.hint_observations.lock().unwrap();
+            let observations = guard.as_mut().unwrap();
+            let late_ack: Vec<_> = old_observation
+                .hints
+                .iter()
+                .cloned()
+                .map(WriteOutcome::Applied)
+                .collect();
+            observations
+                .state
+                .apply_report_scoped(&old_observation, old_scope, &late_ack);
+        }
+        adapter.persist_authorized_hints(newer).await;
+        let rows = store.load(&key.thread_id).unwrap();
+        let row = rows
+            .iter()
+            .find(|row| row.source_item_id == "call-1")
+            .unwrap();
+        assert_eq!(row.last_fact, "unknown");
+        assert_ne!(row.evidence_state.as_deref(), Some("valid"));
+    }
+
+    #[tokio::test]
+    async fn b1_revocations_survive_remote_stop_start() {
+        let (adapter, key, _) = setup();
+        let ledger = &adapter.inner.answer_validity;
+        let witness = |id: &str| super::super::async_question::AnswerWitness {
+            proof_version: 1,
+            answer_turn_id: "turn".into(),
+            answer_item_id: id.into(),
+            answer_digest: "digest".into(),
+        };
+        assert!(ledger.apply(
+            &key,
+            "question",
+            Some("before"),
+            Some(&witness("answer-1")),
+            &[]
+        ));
+        assert!(ledger.apply(
+            &key,
+            "question",
+            Some("after"),
+            Some(&witness("answer-2")),
+            &[]
+        ));
+        assert!(!ledger.allows_candidate(&key, "question", "answer-1"));
+        adapter.begin_remote_shutdown();
+        adapter.shutdown().await;
+        adapter.resume();
+        assert!(!ledger.allows_candidate(&key, "question", "answer-1"));
+        assert!(ledger.allows_candidate(&key, "question", "answer-2"));
+    }
+
+    #[derive(Default)]
+    struct MemoryHints {
+        rows: std::sync::Mutex<Vec<StoredInteractionHint>>,
+        loads: AtomicUsize,
+        fail_next_load: AtomicBool,
+        writes: AtomicUsize,
+        fail_next_write: AtomicBool,
+        fence_next_write: AtomicBool,
+        ack_gate:
+            std::sync::Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
+    }
+
+    impl InteractionHintStore for MemoryHints {
+        fn load(&self, thread_id: &str) -> Option<Vec<StoredInteractionHint>> {
+            self.loads.fetch_add(1, Ordering::SeqCst);
+            if self.fail_next_load.swap(false, Ordering::SeqCst) {
+                return None;
+            }
+            Some(
+                self.rows
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|row| row.thread_id == thread_id)
+                    .cloned()
+                    .collect(),
+            )
+        }
+
+        fn begin_epoch(&self) -> Result<i64, super::super::async_question::HintStoreError> {
+            Ok(1)
+        }
+        fn write_batch(
+            &self,
+            _epoch: i64,
+            hints: &[super::super::hint_state::VersionedHint],
+            at_ms: i64,
+            permit: &super::super::hint_commit::HintCommitPermit,
+        ) -> Result<
+            super::super::async_question::BatchWriteReport,
+            super::super::async_question::HintStoreError,
+        > {
+            use super::super::async_question::HintStoreError;
+            use super::super::hint_state::WriteOutcome;
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            if self.fence_next_write.swap(false, Ordering::SeqCst) {
+                return Err(HintStoreError::OwnerFenced);
+            }
+            if self.fail_next_write.swap(false, Ordering::SeqCst) {
+                return Err(HintStoreError::Storage);
+            }
+            let mut rows = self.rows.lock().unwrap();
+            let guard = permit.lock().map_err(|_| HintStoreError::Fenced)?;
+            for h in hints {
+                let row = h
+                    .hint
+                    .to_stored(at_ms, Some(h.version.epoch), Some(h.version.sequence));
+                if let Some(existing) = rows.iter_mut().find(|r| {
+                    r.thread_id == row.thread_id
+                        && r.source_turn_id == row.source_turn_id
+                        && r.source_item_id == row.source_item_id
+                        && r.question_index == row.question_index
+                }) {
+                    *existing = row;
+                } else {
+                    rows.push(row);
+                }
+            }
+            drop(guard);
+            drop(rows);
+            if let Some((reached, release)) = self.ack_gate.lock().unwrap().take() {
+                reached.send(()).unwrap();
+                release
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .unwrap();
+            }
+            Ok(hints.iter().cloned().map(WriteOutcome::Applied).collect())
+        }
+
+        fn upsert(&self, hint: &InteractionHint, at_ms: i64) {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            if self.fail_next_write.swap(false, Ordering::SeqCst) {
+                return;
+            }
+            let row = StoredInteractionHint {
+                thread_id: hint.thread_id.clone(),
+                source_turn_id: hint.source_turn_id.clone(),
+                source_item_id: hint.source_item_id.clone(),
+                question_index: hint.question_index,
+                last_fact: hint.last_fact.clone(),
+                updated_at: at_ms,
+                observation_epoch: None,
+                observation_seq: None,
+                proof_version: None,
+                answer_turn_id: None,
+                answer_item_id: None,
+                answer_digest: None,
+                evidence_state: None,
+            };
+            let mut rows = self.rows.lock().unwrap();
+            if let Some(slot) = rows.iter_mut().find(|old| {
+                old.thread_id == row.thread_id
+                    && old.source_turn_id == row.source_turn_id
+                    && old.source_item_id == row.source_item_id
+                    && old.question_index == row.question_index
+            }) {
+                *slot = row;
+            } else {
+                rows.push(row);
+            }
+        }
+    }
+
+    fn setup() -> (DesktopIpcAdapter, ThreadKey, Arc<MemoryHints>) {
+        let adapter = DesktopIpcAdapter::new(
+            Arc::new(super::publish_protocol_tests::NoopConnector),
+            ProtocolProfile::closed(),
+        );
+        let key = ThreadKey {
+            host_id: "local".into(),
+            thread_id: "th".into(),
+        };
+        let store = Arc::new(MemoryHints::default());
+        store.rows.lock().unwrap().push(StoredInteractionHint {
+            thread_id: "th".into(),
+            source_turn_id: "t-old".into(),
+            source_item_id: "old-item".into(),
+            question_index: 0,
+            last_fact: "pending".into(),
+            updated_at: 1,
+            observation_epoch: None,
+            observation_seq: None,
+            proof_version: None,
+            answer_turn_id: None,
+            answer_item_id: None,
+            answer_digest: None,
+            evidence_state: None,
+        });
+        adapter.set_interaction_hint_store(Some(store.clone()));
+        (adapter, key, store)
+    }
+
+    fn new_question() -> AsyncQuestionView {
+        AsyncQuestionView {
+            question_key: "[\"request_user_input_async\",\"new-item\",0]".into(),
+            context_token: "test-only".into(),
+            source_turn_id: "t-new".into(),
+            source_item_id: "new-item".into(),
+            question_index: 0,
+            title: "测试题".into(),
+            options: vec![],
+            state: InteractionState::Pending,
+            actionable: true,
+            disabled_reason_code: None,
+        }
+    }
+
+    async fn live_mirror(adapter: &DesktopIpcAdapter, key: &ThreadKey) -> ThreadMirror {
+        adapter.ensure_interaction_hints(key).await;
+        let lease = super::super::types::OwnerLease {
+            key: key.clone(),
+            client_id: "owner".into(),
+            epoch: 1,
+            generation: 1,
+        };
+        let authority = super::super::hint_commit::HintLeaseAuthority::new(lease.clone());
+        let mut mirror = ThreadMirror::new(key.clone());
+        mirror.bind_hint_authority(authority);
+        mirror
+            .apply(
+                &lease,
+                &serde_json::json!({"type":"snapshot", "revision":1, "conversationState":{}}),
+            )
+            .unwrap();
+        mirror
+    }
+
+    #[tokio::test]
+    async fn b1_loading_failure_after_other_thread_initialized_never_seeds_cache() {
+        let (adapter, first, store) = setup();
+        adapter.ensure_interaction_hints(&first).await;
+        let second = ThreadKey {
+            host_id: "local".into(),
+            thread_id: "other".into(),
+        };
+        store.rows.lock().unwrap().push(StoredInteractionHint {
+            thread_id: "other".into(),
+            source_turn_id: "old".into(),
+            source_item_id: "old-item".into(),
+            question_index: 0,
+            last_fact: "pending".into(),
+            updated_at: 1,
+            observation_epoch: None,
+            observation_seq: None,
+            proof_version: None,
+            answer_turn_id: None,
+            answer_item_id: None,
+            answer_digest: None,
+            evidence_state: None,
+        });
+        store.fail_next_load.store(true, Ordering::SeqCst);
+        adapter.ensure_interaction_hints(&second).await;
+        let lease = super::super::types::OwnerLease {
+            key: second.clone(),
+            client_id: "owner".into(),
+            epoch: 1,
+            generation: 1,
+        };
+        let mut mirror = ThreadMirror::new(second.clone());
+        mirror.bind_hint_authority(super::super::hint_commit::HintLeaseAuthority::new(
+            lease.clone(),
+        ));
+        mirror
+            .apply(
+                &lease,
+                &serde_json::json!({"type":"snapshot", "revision":1, "conversationState":{}}),
+            )
+            .unwrap();
+        assert!(adapter
+            .capture_hint_observation(&second, &mirror, &[new_question()])
+            .is_none());
+        assert_eq!(store.writes.load(Ordering::SeqCst), 0);
+        adapter.ensure_interaction_hints(&second).await;
+        let observation = adapter
+            .capture_hint_observation(&second, &mirror, &[new_question()])
+            .unwrap();
+        adapter.persist_authorized_hints(observation).await;
+        let cache = adapter.inner.interaction_hints_cache.lock().unwrap();
+        let rows = cache.get("other").unwrap();
+        assert!(rows.iter().any(|row| row.source_item_id == "old-item"));
+        assert!(rows.iter().any(|row| row.source_item_id == "new-item"));
+    }
+
+    #[tokio::test]
+    async fn b1_empty_projection_retries_existing_dirty() {
+        let (adapter, key, store) = setup();
+        let mirror = live_mirror(&adapter, &key).await;
+        store.fail_next_write.store(true, Ordering::SeqCst);
+        let first = adapter
+            .capture_hint_observation(&key, &mirror, &[new_question()])
+            .unwrap();
+        adapter.persist_authorized_hints(first).await;
+        let empty = adapter
+            .capture_hint_observation(&key, &mirror, &[])
+            .unwrap();
+        adapter.persist_authorized_hints(empty).await;
+        assert_eq!(store.writes.load(Ordering::SeqCst), 2);
+        assert!(store
+            .rows
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|row| row.source_item_id == "new-item"));
+    }
+
+    #[tokio::test]
+    async fn b1_adapter_owner_fenced_does_not_advance_durable() {
+        let (adapter, key, store) = setup();
+        let mirror = live_mirror(&adapter, &key).await;
+        let authorized = adapter
+            .capture_hint_observation(&key, &mirror, &[new_question()])
+            .unwrap();
+        let observation = authorized.observation.clone();
+        let scope = authorized.scope;
+        store.fence_next_write.store(true, Ordering::SeqCst);
+        adapter.persist_authorized_hints(authorized).await;
+        let observations = adapter.inner.hint_observations.lock().unwrap();
+        let state = &observations.as_ref().unwrap().state;
+        assert!(state.durable_for_test(&observation.hints[0].hint).is_none());
+        assert_eq!(
+            state.prepare_batch_scoped(&observation, scope),
+            observation.hints
+        );
+        assert!(!store
+            .rows
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|row| row.source_item_id == "new-item"));
+    }
+
+    #[tokio::test]
+    async fn b1_unknown_observation_does_not_mark_witness_valid() {
+        let (adapter, key, _) = setup();
+        adapter.ensure_interaction_hints(&key).await;
+        let lease = super::super::types::OwnerLease {
+            key: key.clone(),
+            client_id: "owner".into(),
+            epoch: 1,
+            generation: 1,
+        };
+        let mut mirror = ThreadMirror::new(key.clone());
+        mirror.bind_hint_authority(super::super::hint_commit::HintLeaseAuthority::new(
+            lease.clone(),
+        ));
+        let envelope = super::super::async_question::compose_async_answer("call-1", 0, "Q", "A");
+        let state = serde_json::json!({"turnHistory":{"history":{"isComplete":true,"entitiesByKey":{
+            "q":{"turnId":"q","items":[{"type":"agentMessage","id":"call-1","questions":[{"title":"Q"}]}]},
+            "a":{"turnId":"a","items":[{"type":"userMessage","id":"answer","content":[{"type":"text","text":envelope}]}]}
+        },"islands":[{"entries":[{"value":"q"},{"value":"a"}]}]}}});
+        mirror
+            .apply(
+                &lease,
+                &serde_json::json!({"type":"snapshot","revision":1,"conversationState":state}),
+            )
+            .unwrap();
+        let mut question = new_question();
+        question.question_key = super::super::async_question::question_item_id("call-1", 0);
+        question.source_turn_id = "q".into();
+        question.source_item_id = "call-1".into();
+        question.state = InteractionState::Unknown;
+        let observed = adapter
+            .capture_hint_observation(&key, &mirror, &[question])
+            .unwrap();
+        assert_ne!(
+            observed.observation.hints[0].hint.evidence_state.as_deref(),
+            Some("valid")
+        );
+    }
+
+    #[tokio::test]
+    async fn b1_new_scope_empty_observation_does_not_retry_old_dirty() {
+        let (adapter, key, store) = setup();
+        let mut mirror = live_mirror(&adapter, &key).await;
+        store.fail_next_write.store(true, Ordering::SeqCst);
+        let mut answered = new_question();
+        answered.state = InteractionState::Answered;
+        let old = adapter
+            .capture_hint_observation(&key, &mirror, &[answered])
+            .unwrap();
+        adapter.persist_authorized_hints(old).await;
+        mirror.mark_stale();
+        let lease = mirror.lease().unwrap().clone();
+        mirror.apply(&lease, &serde_json::json!({"type":"patches", "baseRevision":1, "revision":2, "patches":[]})).unwrap();
+        let new = adapter
+            .capture_hint_observation(&key, &mirror, &[])
+            .unwrap();
+        adapter.persist_authorized_hints(new).await;
+        assert_eq!(
+            store.writes.load(Ordering::SeqCst),
+            1,
+            "旧 scope 未重见的 dirty 不得重试"
+        );
+    }
+
+    #[tokio::test]
+    async fn b1_adapter_older_observation_cannot_replace_new_fact() {
+        let (adapter, key, store) = setup();
+        let mirror = live_mirror(&adapter, &key).await;
+        let old = adapter
+            .capture_hint_observation(&key, &mirror, &[new_question()])
+            .unwrap();
+        let mut answered = new_question();
+        answered.state = InteractionState::Answered;
+        let new = adapter
+            .capture_hint_observation(&key, &mirror, &[answered])
+            .unwrap();
+        adapter.persist_authorized_hints(new).await;
+        adapter.persist_authorized_hints(old).await;
+        let rows = store.rows.lock().unwrap();
+        assert_eq!(
+            rows.iter()
+                .find(|row| row.source_item_id == "new-item")
+                .unwrap()
+                .last_fact,
+            "answered"
+        );
+        assert_eq!(store.writes.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn b1_pending_answered_pending_is_not_content_deduped() {
+        let (adapter, key, store) = setup();
+        let mirror = live_mirror(&adapter, &key).await;
+        for state in [
+            InteractionState::Pending,
+            InteractionState::Answered,
+            InteractionState::Pending,
+        ] {
+            let mut question = new_question();
+            question.state = state;
+            let observation = adapter
+                .capture_hint_observation(&key, &mirror, &[question])
+                .unwrap();
+            adapter.persist_authorized_hints(observation).await;
+        }
+        let rows = store.rows.lock().unwrap();
+        let row = rows
+            .iter()
+            .find(|row| row.source_item_id == "new-item")
+            .unwrap();
+        assert_eq!(row.last_fact, "pending");
+        assert_eq!(row.observation_seq, Some(3));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn b1_revoked_scope_ack_cannot_clear_new_dirty() {
+        let (adapter, key, store) = setup();
+        let mut mirror = live_mirror(&adapter, &key).await;
+        let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        *store.ack_gate.lock().unwrap() = Some((reached_tx, release_rx));
+        let old = adapter
+            .capture_hint_observation(&key, &mirror, &[new_question()])
+            .unwrap();
+        let writer = adapter.clone();
+        let pending = tokio::spawn(async move {
+            writer.persist_authorized_hints(old).await;
+        });
+        reached_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        let lease = mirror.lease().unwrap().clone();
+        mirror
+            .apply(
+                &lease,
+                &serde_json::json!({"type":"snapshot", "revision":2, "conversationState":{}}),
+            )
+            .unwrap();
+        let mut answered = new_question();
+        answered.state = InteractionState::Answered;
+        let current = adapter
+            .capture_hint_observation(&key, &mirror, &[answered])
+            .unwrap();
+        release_tx.send(()).unwrap();
+        pending.await.unwrap();
+        adapter.persist_authorized_hints(current).await;
+        let rows = store.rows.lock().unwrap();
+        assert_eq!(
+            rows.iter()
+                .find(|row| row.source_item_id == "new-item")
+                .unwrap()
+                .last_fact,
+            "answered"
+        );
+        assert_eq!(store.writes.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn b1_hint_write_failure_retries() {
+        let (adapter, key, store) = setup();
+        adapter.ensure_interaction_hints(&key).await;
+        let lease = super::super::types::OwnerLease {
+            key: key.clone(),
+            client_id: "owner".into(),
+            epoch: 1,
+            generation: 1,
+        };
+        let authority = super::super::hint_commit::HintLeaseAuthority::new(lease.clone());
+        let mut mirror = ThreadMirror::new(key.clone());
+        mirror.bind_hint_authority(authority);
+        mirror
+            .apply(
+                &lease,
+                &serde_json::json!({"type":"snapshot", "revision":1, "conversationState":{}}),
+            )
+            .unwrap();
+        store.fail_next_write.store(true, Ordering::SeqCst);
+        let first = adapter
+            .capture_hint_observation(&key, &mirror, &[new_question()])
+            .unwrap();
+        adapter.persist_authorized_hints(first).await;
+        assert!(!store
+            .rows
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|r| r.source_item_id == "new-item"));
+        let second = adapter
+            .capture_hint_observation(&key, &mirror, &[new_question()])
+            .unwrap();
+        adapter.persist_authorized_hints(second).await;
+        assert_eq!(
+            store.writes.load(Ordering::SeqCst),
+            2,
+            "失败后同一事实必须再次写入"
+        );
+        assert!(store
+            .rows
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|r| r.source_item_id == "new-item"));
+    }
+
+    #[tokio::test]
+    async fn pr202_first_persist_loads_old_hints() {
+        let (adapter, key, store) = setup();
+        adapter
+            .persist_interaction_hints(&key, &[new_question()])
+            .await;
+        adapter.ensure_interaction_hints(&key).await;
+        assert_eq!(store.loads.load(Ordering::SeqCst), 1);
+        let cache = adapter.inner.interaction_hints_cache.lock().unwrap();
+        let rows = cache.get("th").unwrap();
+        assert!(rows.iter().any(|row| row.source_item_id == "old-item"));
+        assert!(rows.iter().any(|row| row.source_item_id == "new-item"));
+    }
+
+    #[tokio::test]
+    async fn pr202_load_failure_does_not_mark_cache_loaded() {
+        let (adapter, key, store) = setup();
+        store.fail_next_load.store(true, Ordering::SeqCst);
+        adapter
+            .persist_interaction_hints(&key, &[new_question()])
+            .await;
+        assert!(!adapter
+            .inner
+            .interaction_hints_cache
+            .lock()
+            .unwrap()
+            .contains_key("th"));
+        adapter
+            .persist_interaction_hints(&key, &[new_question()])
+            .await;
+        let cache = adapter.inner.interaction_hints_cache.lock().unwrap();
+        let rows = cache.get("th").unwrap();
+        assert!(rows.iter().any(|row| row.source_item_id == "old-item"));
+        assert!(rows.iter().any(|row| row.source_item_id == "new-item"));
+    }
+    #[tokio::test]
+    async fn pr202_hints_stay_thread_scoped() {
+        let (adapter, key, store) = setup();
+        let other = ThreadKey {
+            host_id: "local".into(),
+            thread_id: "other".into(),
+        };
+        let mut same = new_question();
+        same.source_item_id = "old-item".into();
+        adapter.persist_interaction_hints(&other, &[same]).await;
+        adapter.ensure_interaction_hints(&key).await;
+        let cache = adapter.inner.interaction_hints_cache.lock().unwrap();
+        assert!(cache["th"].iter().all(|hint| hint.thread_id == "th"));
+        assert!(cache["other"].iter().all(|hint| hint.thread_id == "other"));
+        assert_eq!(store.loads.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn pr202_load_and_persist_are_serialized() {
+        struct BlockingHints {
+            inner: Arc<MemoryHints>,
+            started: std::sync::mpsc::Sender<()>,
+            release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+        }
+        impl InteractionHintStore for BlockingHints {
+            fn load(&self, thread_id: &str) -> Option<Vec<StoredInteractionHint>> {
+                self.started.send(()).unwrap();
+                self.release.lock().unwrap().recv().unwrap();
+                self.inner.load(thread_id)
+            }
+            fn upsert(&self, hint: &InteractionHint, at_ms: i64) {
+                self.inner.upsert(hint, at_ms);
+            }
+        }
+        let (adapter, key, store) = setup();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        adapter.set_interaction_hint_store(Some(Arc::new(BlockingHints {
+            inner: store.clone(),
+            started: started_tx,
+            release: std::sync::Mutex::new(release_rx),
+        })));
+        let loader = adapter.clone();
+        let loader_key = key.clone();
+        let load = tokio::spawn(async move { loader.ensure_interaction_hints(&loader_key).await });
+        tokio::task::spawn_blocking(move || started_rx.recv().unwrap())
+            .await
+            .unwrap();
+        let writer = adapter.clone();
+        let writer_key = key.clone();
+        let persist = tokio::spawn(async move {
+            writer
+                .persist_interaction_hints(&writer_key, &[new_question()])
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert!(!persist.is_finished());
+        release_tx.send(()).unwrap();
+        load.await.unwrap();
+        persist.await.unwrap();
+        let cache = adapter.inner.interaction_hints_cache.lock().unwrap();
+        assert!(cache["th"]
+            .iter()
+            .any(|row| row.source_item_id == "old-item"));
+        assert!(cache["th"]
+            .iter()
+            .any(|row| row.source_item_id == "new-item"));
+        assert_eq!(store.loads.load(Ordering::SeqCst), 1);
     }
 }

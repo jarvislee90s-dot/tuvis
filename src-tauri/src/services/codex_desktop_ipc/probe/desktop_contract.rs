@@ -177,17 +177,32 @@ pub fn resolve_contract_target_with(
 }
 
 /// 平台内的随包 CLI 路径（只做存在性判定；不执行）。
+///
+/// **Windows 双布局（2026-11-04 真机取证）**：Codex ≥26.1027 把随包 CLI 从
+/// `app\resources\codex-cli\bin\codex.exe` 提到了 `app\resources\codex.exe`
+/// （实测 26.1029.7803.0：`codex-cli` 目录整个不存在，`resources\codex.exe`
+/// 37MB + `resources\codex` 319MB 单文件）。只认旧路径会让契约探测在目标解析
+/// 阶段就失败（`contract_package_unavailable`），**规则根本没机会跑**——
+/// 这是"未匹配异步答题契约"文案的真因（不是规则失配）。
+///
+/// 顺序：新布局优先（当前 build），旧布局兜底（≤26.1016）。两者都只做
+/// `is_file()` 判定，不执行、不读内容——身份绑定语义不变。
 fn cli_path_in_bundle(platform: &str, bundle: &Path) -> Option<PathBuf> {
     match platform {
         "macos" => macos_cli_in_bundle(bundle),
         "windows" => {
-            let cli = bundle
-                .join("app")
-                .join("resources")
-                .join("codex-cli")
-                .join("bin")
-                .join("codex.exe");
-            cli.is_file().then_some(cli)
+            let resources = bundle.join("app").join("resources");
+            // ≥26.1027：CLI 提到 resources 根
+            let modern = resources.join("codex.exe");
+            // ≤26.1016：旧布局
+            let legacy = resources.join("codex-cli").join("bin").join("codex.exe");
+            if modern.is_file() {
+                Some(modern)
+            } else if legacy.is_file() {
+                Some(legacy)
+            } else {
+                None
+            }
         }
         _ => None,
     }
@@ -566,13 +581,17 @@ const RULES: &[OperationRule] = &[
             "JSON.stringify([\"request_user_input_async\",",
             "questionItemId:",
             ".min(1)",
-            "slice(34,-35)",
+            // v3（2026-11-04）：切片**形态**由 structural 规则按引用关系核验，这里只锚
+            // 「解包时确实切掉了标记长度」这一协议事实。两种已观测形态都含 `slice(`
+            // 且都以闭标记长度收尾：`slice(34,-35)` / `slice(Sc.length,-Sd.length)`。
+            // 写死 34／35 会让 ≥26.1027 的推导形态在**字面门槛**就失败（规则从未跑）。
+            ".slice(",
             "case\"thread-follower-start-turn\":",
         ],
         structural: Some(async_answer_envelope_structure),
         request_rule: "conversationId+turnStart{text=envelope[questionItemId,question,answer]}",
         response_rule: "result.result",
-        semantic_rule: "questionItemId=JSON.stringify([\"request_user_input_async\",item,index])（形参按序;第二元素=map源(<Q>.questions??[])同接收者的原条目.id;第三元素=map index）;answers=min(1)数组∪恒等transform;三字段同一字符串构造（字符串专有组合子证人）;守卫if(!…||!…)失败即返回+try{let <局部>=直接解析（同接收者）",
+        semantic_rule: "questionItemId=JSON.stringify([\"request_user_input_async\",item,index])（形参按序;第二元素=map源questions同接收者的原条目.id;第三元素=map index）;answers=min(1)数组∪恒等transform;三字段同一字符串构造（字符串专有组合子证人）;守卫if(!…||!…)失败即返回+try{let <局部>=直接解析（同接收者）",
     },
     OperationRule {
         operation: CodexOperation::Interrupt,
@@ -728,15 +747,35 @@ const STRING_ONLY_COMBINATORS: &[&str] = &[
 /// 守卫与解析必须是**同一条引用链**，且只接受已观测的分支形态：
 /// `if(!R.startsWith(O)||!R.endsWith(C))return null;`——负向检查失败即返回（两版观测
 /// 包都只有这一形态；不保留肯定形分支）。解析必须紧跟已观测的直接语法
-/// `;try{let <局部名>=E.safeParse(JSON.parse(R.slice(34,-35)))`：守卫到解析之间**只
+/// `;try{let <局部名>=E.safeParse(JSON.parse(R.<切片>))`：守卫到解析之间**只
 /// 允许这一段**（局部名可一致改名），不出现任何其他语句——嵌套/箭头函数、改道返回、
 /// 未调用包装全部无处容身。返回所有这样的信封 schema 名 `E`。
+///
+/// **v3 双切片形态**（2026-11-04 真机 26.1029.7803.0）：
+/// * `slice(34,-35)` —— 长度数字字面量（≤26.1023 观测形态）；
+/// * `slice(Sc.length,-Sd.length)` —— 从**已核验的标记绑定**取长度（≥26.1027）。
+///   两种都接受：标记绑定本身已按引用关系核验（`opens`/`closes` 来自
+///   [`bindings_of_literal`] 的实参），长度从同一绑定推导语义等价，且天然免疫
+///   标记字面量长度变化——比写死 34／35 更健壮。
 fn guarded_parse_schemas<'a>(hay: &'a str, opens: &[&str], closes: &[&str]) -> Vec<&'a str> {
-    let slice = format!(
+    // 形态一：数字字面量（历史形态）
+    let literal_slice = format!(
         ".slice({},-{})))",
         ASYNC_OPEN_MARKER.len(),
         ASYNC_CLOSE_MARKER.len()
     );
+    // 形态二：标记绑定 .length 推导（v3 新增；绑定名可一致改名）
+    let derived_slices: Vec<String> = opens
+        .iter()
+        .flat_map(|open| {
+            closes
+                .iter()
+                .map(move |close| format!(".slice({open}.length,-{close}.length)))"))
+        })
+        .collect();
+    let mut slices = vec![literal_slice];
+    slices.extend(derived_slices);
+
     let mut out = Vec::new();
     for open in opens {
         let starts = format!(".startsWith({open})");
@@ -759,13 +798,15 @@ fn guarded_parse_schemas<'a>(hay: &'a str, opens: &[&str], closes: &[&str]) -> V
                 continue;
             };
             let scope = window(hay, guard_end, 256);
-            let parse = format!(".safeParse(JSON.parse({receiver}{slice}");
-            for (pos, _) in scope.match_indices(&parse) {
-                let Some(e_start) = ident_before(scope, pos) else {
-                    continue;
-                };
-                if observed_parse_gap(&scope[..e_start]) {
-                    out.push(&scope[e_start..pos]);
+            for slice in &slices {
+                let parse = format!(".safeParse(JSON.parse({receiver}{slice}");
+                for (pos, _) in scope.match_indices(&parse) {
+                    let Some(e_start) = ident_before(scope, pos) else {
+                        continue;
+                    };
+                    if observed_parse_gap(&scope[..e_start]) {
+                        out.push(&scope[e_start..pos]);
+                    }
                 }
             }
         }
@@ -872,12 +913,27 @@ fn identity_wrap_at(hay: &str, at: usize) -> bool {
     callback.is_some_and(|(param, end)| hay[end..].starts_with(&format!("=>[{param}])])")))
 }
 
-/// 题目标识合成的**参数关系**（不止看 tag 与两个变量共现）：
-/// * 定义：`function F(P1,P2){return JSON.stringify(["request_user_input_async",P1,P2])`——
-///   数组第二／三元素必须按序就是两个形参，且 `P1≠P2`；
-/// * 调用：`.map((X,N)=>F(ARG,N))`——第三元素来自 map 回调的 index 形参 `N`，第二元素来自
-///   条目侧表达式（≠N、不派生于 N）。
+/// 题目标识合成的**参数关系**（不止看 tag 与两个变量共现）。
+///
+/// **形态 A（命名函数 + 调用点，≤26.1023）**
+/// * 定义：`function F(P1,P2){return JSON.stringify(["request_user_input_async",P1,P2])`
+///   ——数组第二／三元素必须按序就是两个形参，且 `P1≠P2`；
+/// * 调用：`.map((X,N)=>F(ARG,N))`——第三元素来自 map 回调的 index 形参 `N`，
+///   第二元素来自条目侧表达式（≠N、不派生于 N）。
+///
+/// **形态 B（内联进 map 箭头，≥26.1027，2026-11-04 真机 26.1029.7803.0）**
+/// * `.map((X,N)=>JSON.stringify(["request_user_input_async",ARG,N]))`
+///   ——打包器把单引用函数内联后，定义与调用合一。参数关系逐项不变：
+///   第三元素 = map index 形参、第二元素 = 同一 map 源的条目 `.id`。
+///
+/// 26.1103.3517.0 的内联形态改由条目类型和题目长度守卫，成立后直接遍历
+/// `<条目>.questions`，否则返回空数组。同一条目的 `.id` 与遍历序号绑定保持不变。
 fn question_id_synthesis_bound(hay: &str) -> bool {
+    named_synthesis_bound(hay) || inline_synthesis_bound(hay)
+}
+
+/// 形态 A：命名函数定义 + 调用点（≤26.1023 观测形态）。
+fn named_synthesis_bound(hay: &str) -> bool {
     const RET: &str = "{return ";
     let needle = format!("JSON.stringify([\"{ASYNC_QUESTION_ID_TAG}\",");
     hay.match_indices(&needle).any(|(idx, _)| {
@@ -910,6 +966,84 @@ fn question_id_synthesis_bound(hay: &str) -> bool {
         }
         callsite_passes_index(hay, &hay[f_start..params_at])
     })
+}
+
+/// 形态 B：`.map((X,N)=>JSON.stringify(["request_user_input_async",ARG,N]))`
+/// （≥26.1027 内联）。参数关系与形态 A 完全同构，只是没有中间函数名。
+fn inline_synthesis_bound(hay: &str) -> bool {
+    const HEAD: &str = ".map((";
+    let needle = format!("JSON.stringify([\"{ASYNC_QUESTION_ID_TAG}\",");
+    hay.match_indices(HEAD).any(|(idx, _)| {
+        // map 回调形参 (X, N)
+        let Some((element, e_x)) = ident_at(hay, idx + HEAD.len()) else {
+            return false;
+        };
+        if !hay[e_x..].starts_with(',') {
+            return false;
+        }
+        let Some((index, e_n)) = ident_at(hay, e_x + 1) else {
+            return false;
+        };
+        // 箭头体必须立刻就是合成表达式：`)=>JSON.stringify(...`
+        const BODY: &str = ")=>";
+        if !hay[e_n..].starts_with(BODY) {
+            return false;
+        }
+        let body_at = e_n + BODY.len();
+        if !hay[body_at..].starts_with(&needle) {
+            return false;
+        }
+        // 数组元素：ARG, N
+        let args_at = body_at + needle.len();
+        let Some((arg, e_arg)) = member_chain_at(hay, args_at) else {
+            return false;
+        };
+        // 第三元素必须正是 map index 形参；第二元素不得派生于 index
+        if arg == index || arg.starts_with(&format!("{index}.")) {
+            return false;
+        }
+        let Some(after_map) = hay[e_arg..].strip_prefix(&format!(",{index}]))")) else {
+            return false;
+        };
+        // 第二元素 = 原条目 `.id`，map 源须为同一条目的 questions。
+        let Some(item) = arg.strip_suffix(".id") else {
+            return false;
+        };
+        if item.is_empty() || !item.chars().next().is_some_and(is_ident_start) {
+            return false;
+        }
+        let root = item.split('.').next().unwrap_or_default();
+        if element == index
+            || root == element
+            || root == index
+            || [element, index, root].contains(&"JSON")
+        {
+            return false;
+        }
+        window_before(hay, idx, 64).ends_with(&format!("({item}.questions??[])"))
+            || guarded_inline_questions_source(&hay[..idx], after_map, item)
+    })
+}
+
+/// 26.1103.3517.0：`return(A=Q,A?.type==="agentMessage"&&Q.questions?.length)?Q.questions.map(...):[]`。
+/// 类型守卫的别名、长度守卫、map 源和题目标识都必须指向同一条目。
+fn guarded_inline_questions_source(before_map: &str, after_map: &str, item: &str) -> bool {
+    // 实测接收者是简单标识符，避免守卫别名赋值覆盖成员链的根。
+    if item.contains('.') || !after_map.starts_with(":[]}") {
+        return false;
+    }
+    let guard = format!("?.type===\"agentMessage\"&&{item}.questions?.length)?{item}.questions");
+    let Some(before_type_check) = before_map.strip_suffix(&guard) else {
+        return false;
+    };
+    let Some(alias_start) = ident_before(before_type_check, before_type_check.len()) else {
+        return false;
+    };
+    let alias = &before_type_check[alias_start..];
+    alias != "JSON"
+        && before_type_check[..alias_start]
+            .strip_suffix(&format!("return({alias}={item},"))
+            .is_some_and(|prefix| prefix.ends_with(['{', ';', '}']))
 }
 
 /// `.map((X,N)=>F(ARG,N))`：第二实参正是 map 回调的 index 形参 `N`；第一实参必须是
@@ -981,8 +1115,8 @@ fn start_turn_carrier_present(hay: &str) -> bool {
 /// 2. 条目 schema 三字段同一空参构造，且该构造链有字符串专有组合子证人；
 /// 3. 信封 schema 由该条目 schema 组成（`min(1)` 数组 ∪ 恒等 transform `p=>[p]`），
 ///    并且正是第 1 条解析链用的 schema；
-/// 4. `questionItemId` 由生成函数两个形参按序合成，调用点第二元素是 map 源
-///    `(<Q>.questions??[])` 同接收者原条目的 `.id`、第三元素是 map index；
+/// 4. `questionItemId` 的第二元素是 map 源 `questions` 同接收者原条目的 `.id`、
+///    第三元素是 map index，命名函数形态还要求两个形参按序绑定；
 /// 5. 承载 handler 仍是 `startTurn(conversationId, turnStart)`。
 ///
 /// 证据覆盖范围：以上全是有限词法上的引用关系，不是 JS 求值。数组／联合构造只核"接受
@@ -1074,6 +1208,86 @@ fn match_operations(candidates: &[(String, String)]) -> BTreeMap<CodexOperation,
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn pr202_full_contract_accepts_derived_slice_and_bound_inline() {
+        let removed = ASYNC_ENVELOPE_20261028.replace(
+            "function bSe(e,t){return JSON.stringify([`request_user_input_async`,e,t])}",
+            "",
+        );
+        assert_ne!(removed, ASYNC_ENVELOPE_20261028);
+        let envelope = removed.replace("r.slice(34,-35)", "r.slice(_Se.length,-vSe.length)");
+        assert_ne!(envelope, removed);
+        let callsite = "var q=(e.questions??[]).map((t,r)=>JSON.stringify([`request_user_input_async`,e.id,r]));";
+        let dir = tempfile::tempdir().unwrap();
+        let evidence = evidence_20261028(
+            dir.path(),
+            "pr202-bound.asar",
+            &main_js_20261028_with(
+                START_TURN_HANDLER_20261028,
+                &envelope,
+                callsite,
+                STRING_WITNESS_20261028,
+            ),
+            VERSION_TABLE_20261028,
+        );
+        assert!(evidence.matched(CodexOperation::AsyncAnswerIdle));
+        assert!(evidence.matched(CodexOperation::CommandApproval));
+    }
+
+    #[test]
+    fn pr202_inline_synthesis_checks_lexical_binding() {
+        let cases = [
+            (
+                r#"(e.questions??[]).map((t,r)=>JSON.stringify(["request_user_input_async",e.id,r]))"#,
+                true,
+            ),
+            (
+                r#"(e.questions??[]).map((e,r)=>JSON.stringify(["request_user_input_async",e.id,r]))"#,
+                false,
+            ),
+            (
+                r#"(holder.e.questions??[]).map((holder,r)=>JSON.stringify(["request_user_input_async",holder.e.id,r]))"#,
+                false,
+            ),
+            (
+                r#"(e.questions??[]).map((t,r)=>JSON.stringify(["request_user_input_async",r.id,r]))"#,
+                false,
+            ),
+            (
+                r#"(holder.e.questions??[]).map((t,r)=>JSON.stringify(["request_user_input_async",holder.e.id,r]))"#,
+                true,
+            ),
+        ];
+        for (js, expected) in cases {
+            assert_eq!(inline_synthesis_bound(&normalize(js)), expected, "{js}");
+        }
+    }
+    #[test]
+    fn pr202_full_contract_rejects_shadowed_inline_synthesis() {
+        let envelope = ASYNC_ENVELOPE_20261028
+            .replace(
+                "function bSe(e,t){return JSON.stringify([`request_user_input_async`,e,t])}",
+                "",
+            )
+            .replace("r.slice(34,-35)", "r.slice(_Se.length,-vSe.length)");
+        assert_ne!(envelope, ASYNC_ENVELOPE_20261028);
+        let callsite = "var q=(e.questions??[]).map((e,r)=>JSON.stringify([`request_user_input_async`,e.id,r]));";
+        let dir = tempfile::tempdir().unwrap();
+        let evidence = evidence_20261028(
+            dir.path(),
+            "pr202-shadow.asar",
+            &main_js_20261028_with(
+                START_TURN_HANDLER_20261028,
+                &envelope,
+                callsite,
+                STRING_WITNESS_20261028,
+            ),
+            VERSION_TABLE_20261028,
+        );
+        assert!(!evidence.matched(CodexOperation::AsyncAnswerIdle));
+        assert!(evidence.matched(CodexOperation::CommandApproval));
+    }
+
     use super::*;
     use crate::services::codex_desktop_ipc::probe::fingerprint::ProbeKey;
     use crate::services::codex_desktop_ipc::transport::DesktopEndpoint;
@@ -1289,6 +1503,46 @@ mod tests {
 
         let b = read(&package, "26.1021.31345").expect("second read");
         assert_ne!(a.package_sha256, b.package_sha256);
+    }
+
+    /// **Windows 双布局（2026-11-04 真机取证 26.1029.7803.0）**：CLI 从
+    /// `app\resources\codex-cli\bin\codex.exe` 提到了 `app\resources\codex.exe`。
+    /// 只认旧路径会让契约探测在目标解析阶段失败（`contract_package_unavailable`），
+    /// 规则根本没机会跑 —— 这是"未匹配异步答题契约"文案的真因。
+    #[test]
+    fn cli_path_accepts_both_windows_layouts() {
+        // 新布局：resources\codex.exe（≥26.1027）
+        let dir = tempfile::tempdir().unwrap();
+        let bundle = dir.path().join("Codex_26.1029.7803.0");
+        let resources = bundle.join("app").join("resources");
+        std::fs::create_dir_all(&resources).unwrap();
+        std::fs::write(resources.join("app.asar"), b"stub").unwrap();
+        std::fs::write(resources.join("codex.exe"), b"stub").unwrap();
+        let found = cli_path_in_bundle("windows", &bundle).expect("新布局必须命中");
+        assert_eq!(found, resources.join("codex.exe"));
+
+        // 旧布局：resources\codex-cli\bin\codex.exe（≤26.1016）仍必须命中（零回归）
+        let dir2 = tempfile::tempdir().unwrap();
+        let bundle2 = dir2.path().join("Codex_26.1016.6573.0");
+        let resources2 = bundle2.join("app").join("resources");
+        std::fs::create_dir_all(resources2.join("codex-cli").join("bin")).unwrap();
+        std::fs::write(resources2.join("app.asar"), b"stub").unwrap();
+        std::fs::write(
+            resources2.join("codex-cli").join("bin").join("codex.exe"),
+            b"stub",
+        )
+        .unwrap();
+        let found2 = cli_path_in_bundle("windows", &bundle2).expect("旧布局必须命中");
+        assert_eq!(
+            found2,
+            resources2.join("codex-cli").join("bin").join("codex.exe")
+        );
+
+        // 两种都没有 → None（诚实失败，不猜）
+        let dir3 = tempfile::tempdir().unwrap();
+        let bundle3 = dir3.path().join("Codex_broken");
+        std::fs::create_dir_all(bundle3.join("app").join("resources")).unwrap();
+        assert!(cli_path_in_bundle("windows", &bundle3).is_none());
     }
 
     /// 四个核心具名用例之四：安装多义 → 不产出目标（不挑一个凑合）。
@@ -1714,6 +1968,152 @@ mod tests {
             evidence.matches.keys().collect::<Vec<_>>()
         );
         assert!(evidence.matched(CodexOperation::CommandApproval));
+    }
+
+    // ==== v3（2026-11-04）：26.1029.7803.0 两处协议等价的形态变化 ====
+
+    /// **v3 形态①：切片从标记绑定推导**（`slice(Sc.length,-Sd.length)` 取代
+    /// `slice(34,-35)`）。真机 26.1029.7803.0 实测形态。
+    #[test]
+    fn async_contract_accepts_derived_slice_lengths() {
+        let envelope = mutate(
+            ASYNC_ENVELOPE_20261028,
+            "r.slice(34,-35)",
+            "r.slice(_Se.length,-vSe.length)",
+        );
+        assert_ne!(envelope, ASYNC_ENVELOPE_20261028, "变异必须真的改到东西");
+        let dir = tempfile::tempdir().unwrap();
+        let evidence = evidence_20261028(
+            dir.path(),
+            "v3-slice.asar",
+            &main_js_20261028(START_TURN_HANDLER_20261028, &envelope),
+            VERSION_TABLE_20261028,
+        );
+        assert!(
+            evidence.matched(CodexOperation::AsyncAnswerIdle),
+            "标记绑定 .length 推导与字面量长度语义等价，不得失配: {:?}",
+            evidence.matches.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// **v3 形态②：题目标识合成函数内联进 map 箭头**（真机 26.1029.7803.0）：
+    /// `(e.questions??[]).map((t,r)=>JSON.stringify(["request_user_input_async",e.id,r]))`
+    /// 取代「命名函数 + 调用点」。参数关系逐项不变。
+    #[test]
+    fn async_contract_accepts_inline_question_id_synthesis() {
+        // 定义函数改空（内联后不存在），调用点改写成内联箭头形态。
+        let inline_envelope = ASYNC_ENVELOPE_20261028.replace(
+            "function bSe(e,t){return JSON.stringify([`request_user_input_async`,e,t])}",
+            "",
+        );
+        assert_ne!(
+            inline_envelope, ASYNC_ENVELOPE_20261028,
+            "变异必须真的删掉命名函数"
+        );
+        let inline_callsite = "var q=(e.questions??[]).map((t,r)=>JSON.stringify([`request_user_input_async`,e.id,r]));";
+        let dir = tempfile::tempdir().unwrap();
+        let evidence = evidence_20261028(
+            dir.path(),
+            "v3-inline.asar",
+            &main_js_20261028_with(
+                START_TURN_HANDLER_20261028,
+                &inline_envelope,
+                inline_callsite,
+                STRING_WITNESS_20261028,
+            ),
+            VERSION_TABLE_20261028,
+        );
+        assert!(
+            evidence.matched(CodexOperation::AsyncAnswerIdle),
+            "内联合成形态参数关系不变，不得失配: {:?}",
+            evidence.matches.keys().collect::<Vec<_>>()
+        );
+    }
+
+    // Windows 26.1103.3517.0：同一条目的 questions 经长度守卫后直接 map。
+    const GUARDED_QUESTION_ID_CALLSITE_20261106: &str = concat!(
+        "function list(e){var t;",
+        "return(t=e,t?.type===\"agentMessage\"&&e.questions?.length)?",
+        "e.questions.map((t,r)=>JSON.stringify([\"request_user_input_async\",e.id,r])):[]}",
+    );
+
+    #[test]
+    fn async_contract_accepts_guarded_direct_question_id_map() {
+        let envelope = mutate(
+            ASYNC_ENVELOPE_20261028,
+            "function bSe(e,t){return JSON.stringify([`request_user_input_async`,e,t])}",
+            "",
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let evidence = evidence_20261028(
+            dir.path(),
+            "guarded-inline.asar",
+            &main_js_20261028_with(
+                START_TURN_HANDLER_20261028,
+                &envelope,
+                GUARDED_QUESTION_ID_CALLSITE_20261106,
+                STRING_WITNESS_20261028,
+            ),
+            VERSION_TABLE_20261028,
+        );
+        assert!(evidence.matched(CodexOperation::AsyncAnswerIdle));
+    }
+
+    #[test]
+    fn async_contract_rejects_guarded_direct_question_id_map_with_wrong_bindings() {
+        for (from, to) in [
+            ("return(", "otherReturn("),
+            ("return(", "return other.return("),
+            ("t=e,", "t=other,"),
+            ("t?.type", "other?.type"),
+            (
+                "var t;return(t=e,t?.type",
+                "var JSON;return(JSON=e,JSON?.type",
+            ),
+            ("&&e.questions?.length", "&&other.questions?.length"),
+            ("?e.questions.map", "?other.questions.map"),
+            ("e.id,r", "other.id,r"),
+            ("e.id,r", "e.id,t"),
+            ("(t,r)=>", "(e,r)=>"),
+            ("(t,r)=>", "(JSON,r)=>"),
+            (":[]}", ":other}"),
+        ] {
+            let callsite = mutate(GUARDED_QUESTION_ID_CALLSITE_20261106, from, to);
+            assert!(!question_id_synthesis_bound(&callsite), "{from} → {to}");
+        }
+        let rebound_receiver = GUARDED_QUESTION_ID_CALLSITE_20261106
+            .replace("t=e,t?.type", "e=e.inner,e?.type")
+            .replace("e.questions", "e.inner.questions")
+            .replace("e.id,r", "e.inner.id,r");
+        assert!(!question_id_synthesis_bound(&rebound_receiver));
+    }
+
+    /// **v3 阴性锁**：内联形态下若第二元素派生于 index（而非条目 `.id`），
+    /// 必须拒绝——v3 放宽的是「形态」不是「参数关系」。
+    #[test]
+    fn async_contract_rejects_inline_with_index_derived_item() {
+        let inline_envelope = ASYNC_ENVELOPE_20261028.replace(
+            "function bSe(e,t){return JSON.stringify([`request_user_input_async`,e,t])}",
+            "",
+        );
+        // 第二元素写成 `t`（index 形参）而非条目 `.id` —— 协议语义错误
+        let bad_callsite =
+            "var q=(e.questions??[]).map((t,r)=>JSON.stringify([`request_user_input_async`,t,r]));";
+        let dir = tempfile::tempdir().unwrap();
+        let evidence = evidence_20261028(
+            dir.path(),
+            "v3-inline-bad.asar",
+            &main_js_20261028_with(
+                START_TURN_HANDLER_20261028,
+                &inline_envelope,
+                bad_callsite,
+                STRING_WITNESS_20261028,
+            ),
+            VERSION_TABLE_20261028,
+        );
+        assert!(!evidence.matched(CodexOperation::AsyncAnswerIdle));
+        // 包本身仍可读（拒绝的是本操作，不是整包）
+        assert!(!evidence.matches.is_empty());
     }
 
     #[test]

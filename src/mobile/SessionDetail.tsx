@@ -583,6 +583,12 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
   const codexState = codex.state;
   // 有效卡：当前可答组，或本机已发出过动作（sessionStorage 锚）的待核对组。
   // 历史已答/无锚 unknown 一律不渲染（2026-10-28 用户裁决）。
+  //
+  // 2026-11-04 补：手动收纳（archived）。桌面端答完后 Tuvis 若读不出「已答」
+  // （契约失配/事件漏帧），卡会永久滞留且无出口——用户可显式声明"已在桌面处理"，
+  // 该组在**本机**隐藏，不再占位。收纳只作用于本机展示，不向桌面发送任何动作
+  // （`onArchive` 契约）；桌面若确有新回合，题目换代后 sourceTurnId/sourceItemId
+  // 变化即生成新 storage key，卡自然重新出现——不会被一次收纳永久吞掉。
   const inbox = useMemo(() => {
     const pending = (codexState?.pending ?? []).filter(
       (item, index, all) => all.findIndex((other) => other.requestKey === item.requestKey) === index
@@ -594,13 +600,22 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
           `codex:group:${session.id}:${group.members[0]?.sourceTurnId}:${group.members[0]?.sourceItemId}`
         )
       ),
+      isArchived: Boolean(
+        window.sessionStorage.getItem(
+          `codex:group-archived:${session.id}:${group.members[0]?.sourceTurnId}:${group.members[0]?.sourceItemId}`
+        )
+      ),
     }));
-    const visibleGroups = groups.filter(
+    const retainedGroups = groups.filter(
       (group) => group.live.length > 0 || (group.hasAnchor && !group.allAnswered)
     );
+    const visibleGroups = retainedGroups.filter((group) => !group.isArchived);
+    const archivedGroups = retainedGroups.filter((group) => group.isArchived);
     return {
       pending,
       groups: visibleGroups,
+      retainedGroups,
+      archivedGroups,
       count: pending.length + visibleGroups.length,
     };
   }, [codexState, session.id, queueTick]);
@@ -1692,6 +1707,31 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
               已发出过动作的待核对组；已答/无锚 unknown 不再有历史入口。 */}
           {codexProjectionActive && (
             <div data-testid="codex-dock-cards" className="contents">
+              {/* 2026-11-04：已收纳组恢复入口——收纳只隐藏本机展示，误点可撤销。 */}
+              {inbox.archivedGroups.length > 0 && (
+                <button
+                  type="button"
+                  data-testid="codex-archived-groups"
+                  onClick={() => {
+                    for (const group of inbox.archivedGroups) {
+                      const first = group.members[0];
+                      if (!first) continue;
+                      window.sessionStorage.removeItem(
+                        `codex:group-archived:${session.id}:${first.sourceTurnId}:${first.sourceItemId}`
+                      );
+                    }
+                    setQueueTick((tick) => tick + 1);
+                  }}
+                  className="flex w-full items-center justify-between rounded-xl border border-[var(--bd)] bg-[var(--cd)] px-3 py-1.5 text-left text-xs text-[var(--mut)]"
+                >
+                  <span>
+                    {i18n.t("mobile.codex.async.archivedGroupsCount", {
+                      count: inbox.archivedGroups.length,
+                    })}
+                  </span>
+                  <span className="underline">{i18n.t("mobile.codex.async.restoreGroup")}</span>
+                </button>
+              )}
               {inbox.pending.map((p) => (
                 <PendingRequestCard
                   key={`codex-pending-${session.id}-${p.requestKey}`}
@@ -1752,17 +1792,29 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
                     ))}
                 </div>
               )}
-              {inbox.groups.map((group) => (
+              {inbox.retainedGroups.map((group) => (
                 <div
                   key={`codex-group-panel-${session.id}-${group.key}`}
                   data-testid={`codex-group-panel-${group.key}`}
-                  hidden={group.key !== activeGroup?.key}
+                  hidden={group.isArchived || group.key !== activeGroup?.key}
                 >
                   <AsyncQuestionGroupCard
                     sessionId={session.id}
                     questions={group.members}
                     fontScale={fontScale}
                     onChanged={() => setQueueTick((tick) => tick + 1)}
+                    onArchive={() => {
+                      // 本机收纳：写 sessionStorage 标记 → inbox 重新计算即隐藏。
+                      // 不向桌面发送任何动作（契约）。桌面若有新回合，题目换代后
+                      // sourceTurnId/sourceItemId 变化 → 新 key → 卡自然重现。
+                      const first = group.members[0];
+                      if (!first) return;
+                      window.sessionStorage.setItem(
+                        `codex:group-archived:${session.id}:${first.sourceTurnId}:${first.sourceItemId}`,
+                        "1"
+                      );
+                      setQueueTick((tick) => tick + 1);
+                    }}
                   />
                 </div>
               ))}

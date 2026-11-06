@@ -236,19 +236,57 @@ impl DeviceStore {
     /// 必自锁死（std Mutex 非重入）。需要"先判断、后写入"的两段逻辑必须合并进**同一个**
     /// 闭包（如 gate 的 device_valid + touch_device），不得嵌套调用。
     pub fn with<R>(&self, f: impl FnOnce(&rusqlite::Connection) -> R) -> R {
-        match self {
-            DeviceStore::Global => {
-                // 锁自愈取锁（P3 统一）：Global 是生产全局咽喉，毒锁不连坐全部 DB 访问方
-                let c = crate::database::connection::DB
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
-                f(&c)
-            }
-            DeviceStore::Owned(arc) => {
-                let c = arc.lock().unwrap();
-                f(&c)
+        self.with_core(
+            f,
+            #[cfg(test)]
+            None,
+        )
+        .expect("unobserved DB lock cannot abort")
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_probe<R>(
+        &self,
+        probe: Option<&crate::services::codex_desktop_ipc::hint_test_probe::TestProbe>,
+        f: impl FnOnce(&rusqlite::Connection) -> R,
+    ) -> Result<R, ()> {
+        self.with_core(f, probe)
+    }
+
+    fn with_core<R>(
+        &self,
+        f: impl FnOnce(&rusqlite::Connection) -> R,
+        #[cfg(test)] probe: Option<&crate::services::codex_desktop_ipc::hint_test_probe::TestProbe>,
+    ) -> Result<R, ()> {
+        let (mutex, recover) = match self {
+            DeviceStore::Global => (&*crate::database::connection::DB, true),
+            DeviceStore::Owned(arc) => (&**arc, false),
+        };
+        #[cfg(test)]
+        if let Some(probe) = probe {
+            match mutex.try_lock() {
+                Ok(guard) => return Ok(f(&guard)),
+                Err(std::sync::TryLockError::Poisoned(error)) => {
+                    if recover {
+                        return Ok(f(&error.into_inner()));
+                    }
+                    panic!("owned DB mutex poisoned");
+                }
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    probe.hit(
+                        crate::services::codex_desktop_ipc::hint_test_probe::TestPoint::DbContended,
+                    )?;
+                }
             }
         }
+        let guard = mutex.lock().unwrap_or_else(|error| {
+            if recover {
+                error.into_inner()
+            } else {
+                panic!("owned DB mutex poisoned")
+            }
+        });
+        Ok(f(&guard))
     }
 }
 

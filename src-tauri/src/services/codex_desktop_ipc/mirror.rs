@@ -211,9 +211,382 @@ struct TurnObservation {
     active: bool,
 }
 
+fn question_dependencies(state: &Value) -> std::collections::HashMap<String, (String, Value)> {
+    let mut dependencies = std::collections::HashMap::new();
+    for turn in HistoryView::new(state).turns() {
+        for item in turn.items {
+            if item.get("type").and_then(Value::as_str) != Some("agentMessage") {
+                continue;
+            }
+            let Some(id) = item.get("id").and_then(Value::as_str) else {
+                continue;
+            };
+            let Some(questions) = item.get("questions").and_then(Value::as_array) else {
+                continue;
+            };
+            for (index, question) in questions.iter().enumerate() {
+                if let Ok(index) = u32::try_from(index) {
+                    dependencies.insert(
+                        super::async_question::question_item_id(id, index),
+                        (turn.turn_id.to_owned(), question.clone()),
+                    );
+                }
+            }
+        }
+    }
+    dependencies
+}
+
+/// 退役必须基于完整且身份唯一的 canonical 引用链。
+fn unambiguous_complete_history(state: &Value) -> bool {
+    if HistoryView::new(state).needs_hydration() {
+        return false;
+    }
+    unambiguous_loaded_history(state)
+}
+
+fn unambiguous_loaded_history(state: &Value) -> bool {
+    let Some(history) = state.pointer("/turnHistory/history") else {
+        return false;
+    };
+    let Some(entities) = history.get("entitiesByKey").and_then(Value::as_object) else {
+        return false;
+    };
+    let Some(islands) = history.get("islands").and_then(Value::as_array) else {
+        return false;
+    };
+    let (mut refs, mut turns, mut items) = (HashSet::new(), HashSet::new(), HashSet::new());
+    for island in islands {
+        let Some(entries) = island.get("entries").and_then(Value::as_array) else {
+            return false;
+        };
+        for entry in entries {
+            let Some(reference) = entry
+                .get("value")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+            else {
+                return false;
+            };
+            if !refs.insert(reference) {
+                return false;
+            }
+            let Some(turn) = entities.get(reference) else {
+                return false;
+            };
+            let Some(id) = turn
+                .get("turnId")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+            else {
+                return false;
+            };
+            if !turns.insert(id) {
+                return false;
+            }
+            let Some(entries) = turn.get("items").and_then(Value::as_array) else {
+                if turn.get("itemsView").and_then(Value::as_str) == Some("notLoaded") {
+                    continue;
+                }
+                return false;
+            };
+            for item in entries {
+                let Some(id) = item
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                else {
+                    return false;
+                };
+                if !items.insert(id) {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
+fn answer_in_canonical_history(
+    state: &Value,
+    witness: &super::async_question::AnswerWitness,
+) -> bool {
+    HistoryView::new(state).turns().iter().any(|turn| {
+        turn.turn_id == witness.answer_turn_id
+            && turn.items.iter().any(|item| {
+                item.get("id").and_then(Value::as_str) == Some(witness.answer_item_id.as_str())
+            })
+    })
+}
+
+fn complete_history_preserves_prefix(previous: &Value, next: &Value) -> bool {
+    if !unambiguous_complete_history(next) {
+        return false;
+    }
+    let ordered = |state: &Value| -> Option<Vec<Value>> {
+        let history = state.pointer("/turnHistory/history")?;
+        let entities = history.get("entitiesByKey")?.as_object()?;
+        let mut result = Vec::new();
+        for island in history.get("islands")?.as_array()? {
+            for entry in island.get("entries")?.as_array()? {
+                result.push(entities.get(entry.get("value")?.as_str()?)?.clone());
+            }
+        }
+        Some(result)
+    };
+    match (ordered(previous), ordered(next)) {
+        (Some(old), Some(new)) if new.len() >= old.len() => {
+            old.iter()
+                .zip(&new)
+                .enumerate()
+                .all(|(index, (before, after))| {
+                    let (Some(mut a), Some(mut b)) =
+                        (before.as_object().cloned(), after.as_object().cloned())
+                    else {
+                        return false;
+                    };
+                    a.remove("status");
+                    b.remove("status");
+                    a.remove("runtime");
+                    b.remove("runtime");
+                    let (Some(old_items), Some(new_items)) = (a.remove("items"), b.remove("items"))
+                    else {
+                        return false;
+                    };
+                    if a != b {
+                        return false;
+                    }
+                    let (Some(old_items), Some(new_items)) =
+                        (old_items.as_array(), new_items.as_array())
+                    else {
+                        return false;
+                    };
+                    if old_items == new_items {
+                        return true;
+                    }
+                    index + 1 == old.len()
+                        && new_items.starts_with(old_items)
+                        && new_items[old_items.len()..].iter().all(|item| {
+                            item.get("type").and_then(Value::as_str) == Some("userMessage")
+                                && !item
+                                    .to_string()
+                                    .contains(super::async_question::ENVELOPE_OPEN)
+                        })
+                })
+        }
+        _ => false,
+    }
+}
+
+fn explicitly_removes_answer_reference(
+    state: &Value,
+    next: &Value,
+    witness: &super::async_question::AnswerWitness,
+    patches: &[Value],
+) -> bool {
+    if HistoryView::new(next).needs_hydration() {
+        return false;
+    }
+    if answer_in_canonical_history(next, witness) {
+        return false;
+    }
+    let Some(history) = state.pointer("/turnHistory/history") else {
+        return false;
+    };
+    let Some(entities) = history.get("entitiesByKey").and_then(Value::as_object) else {
+        return false;
+    };
+    let Some(islands) = history.get("islands").and_then(Value::as_array) else {
+        return false;
+    };
+    for (island_index, island) in islands.iter().enumerate() {
+        let Some(entries) = island.get("entries").and_then(Value::as_array) else {
+            continue;
+        };
+        for (entry_index, entry) in entries.iter().enumerate() {
+            let Some(reference) = entry.get("value").and_then(Value::as_str) else {
+                continue;
+            };
+            if entities
+                .get(reference)
+                .and_then(|turn| turn.get("turnId"))
+                .and_then(Value::as_str)
+                != Some(witness.answer_turn_id.as_str())
+            {
+                continue;
+            }
+            let prefix = serde_json::json!([
+                "turnHistory",
+                "history",
+                "islands",
+                island_index,
+                "entries",
+                entry_index
+            ]);
+            let prefix = prefix.as_array().unwrap();
+            if patches.iter().any(|op| {
+                matches!(
+                    op.get("op").and_then(Value::as_str),
+                    Some("remove" | "replace")
+                ) && op
+                    .get("path")
+                    .and_then(Value::as_array)
+                    .is_some_and(|path| {
+                        path.starts_with(prefix)
+                            || prefix.starts_with(path)
+                            || (op.get("op").and_then(Value::as_str) == Some("remove")
+                                && path.len() == prefix.len()
+                                && path.starts_with(&prefix[..prefix.len() - 1]))
+                    })
+            }) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// 明确对已定位的正式答复项做删除或改写，才视为永久退役。
+fn explicitly_rewrites_answer(
+    state: &Value,
+    next: &Value,
+    witness: &super::async_question::AnswerWitness,
+    patches: &[Value],
+) -> bool {
+    // 项被卸载时即使伴随 remove，也不能证明发生了语义删除。
+    if HistoryView::new(next).needs_hydration() {
+        return false;
+    }
+    let Some(entities) = state
+        .pointer("/turnHistory/history/entitiesByKey")
+        .and_then(Value::as_object)
+    else {
+        return false;
+    };
+    for (key, turn) in entities {
+        if turn.get("turnId").and_then(Value::as_str) != Some(witness.answer_turn_id.as_str()) {
+            continue;
+        }
+        let Some(items) = turn.get("items").and_then(Value::as_array) else {
+            continue;
+        };
+        for (index, item) in items.iter().enumerate() {
+            if item.get("id").and_then(Value::as_str) != Some(witness.answer_item_id.as_str()) {
+                continue;
+            }
+            let prefix = serde_json::json!([
+                "turnHistory",
+                "history",
+                "entitiesByKey",
+                key,
+                "items",
+                index
+            ]);
+            let prefix = prefix.as_array().unwrap();
+            let touched = patches.iter().any(|op| {
+                matches!(
+                    op.get("op").and_then(Value::as_str),
+                    Some("remove" | "replace")
+                ) && op
+                    .get("path")
+                    .and_then(Value::as_array)
+                    .is_some_and(|path| path.starts_with(prefix) || prefix.starts_with(path))
+            });
+            // 数组中的前项可能在同一批中先被删除，使目标项移到较小索引。
+            // 对同一 items 数组的直接删除，结合最终 canonical 项是否消失判定。
+            let array_prefix = &prefix[..prefix.len() - 1];
+            let shifted_removal = !answer_in_canonical_history(next, witness)
+                && patches.iter().any(|op| {
+                    op.get("op").and_then(Value::as_str) == Some("remove")
+                        && op
+                            .get("path")
+                            .and_then(Value::as_array)
+                            .is_some_and(|path| {
+                                path.len() == prefix.len() && path.starts_with(array_prefix)
+                            })
+                });
+            if touched || shifted_removal {
+                let unchanged = next
+                    .pointer("/turnHistory/history/entitiesByKey")
+                    .and_then(Value::as_object)
+                    .and_then(|entities| entities.get(key))
+                    .and_then(|turn| turn.get("items"))
+                    .and_then(Value::as_array)
+                    .is_some_and(|items| items.iter().any(|candidate| candidate == item));
+                return !unchanged;
+            }
+        }
+    }
+    false
+}
+
+/// 完整历史中明确删除已定位的题目，不能将其视为暂时未加载。
+fn explicitly_removes_question(
+    state: &Value,
+    next: &Value,
+    question: &str,
+    patches: &[Value],
+) -> bool {
+    if HistoryView::new(next).needs_hydration() {
+        return false;
+    }
+    let Some((item_id, index)) = super::async_question::parse_question_key(question) else {
+        return false;
+    };
+    let Some(entities) = state
+        .pointer("/turnHistory/history/entitiesByKey")
+        .and_then(Value::as_object)
+    else {
+        return false;
+    };
+    for (key, turn) in entities {
+        let Some(items) = turn.get("items").and_then(Value::as_array) else {
+            continue;
+        };
+        for (item_index, item) in items.iter().enumerate() {
+            if item.get("id").and_then(Value::as_str) != Some(item_id.as_str()) {
+                continue;
+            }
+            let prefix = serde_json::json!([
+                "turnHistory",
+                "history",
+                "entitiesByKey",
+                key,
+                "items",
+                item_index,
+                "questions",
+                index
+            ]);
+            let prefix = prefix.as_array().unwrap();
+            if patches.iter().any(|op| {
+                matches!(
+                    op.get("op").and_then(Value::as_str),
+                    Some("remove" | "replace")
+                ) && op
+                    .get("path")
+                    .and_then(Value::as_array)
+                    .is_some_and(|path| {
+                        path.starts_with(prefix)
+                            || prefix.starts_with(path)
+                            || (op.get("op").and_then(Value::as_str) == Some("remove")
+                                && path.len() == prefix.len()
+                                && path.starts_with(&prefix[..prefix.len() - 1]))
+                    })
+            }) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 pub struct ThreadMirror {
     key: ThreadKey,
+    answer_validity: Arc<super::answer_validity::AnswerValidityLedger>,
+    complete_rebuild: bool,
     lease: Option<OwnerLease>,
+    hint_authority: Option<Arc<super::hint_commit::HintLeaseAuthority>>,
+    hint_permit: Option<super::hint_commit::HintCommitPermit>,
     revision: Option<u64>,
     stale: bool,
     /// conversationState 本体（R1：snapshot 存 `change["conversationState"]`；
@@ -250,6 +623,7 @@ pub struct ThreadMirror {
 
 impl Drop for ThreadMirror {
     fn drop(&mut self) {
+        self.revoke_hint_scope();
         if let Some(ledger) = &self.ledger {
             ledger
                 .lock()
@@ -263,7 +637,11 @@ impl ThreadMirror {
     pub fn new(key: ThreadKey) -> Self {
         Self {
             key,
+            answer_validity: Arc::new(super::answer_validity::AnswerValidityLedger::default()),
+            complete_rebuild: false,
             lease: None,
+            hint_authority: None,
+            hint_permit: None,
             revision: None,
             stale: false,
             state: None,
@@ -323,10 +701,132 @@ impl ThreadMirror {
     }
 
     /// 挂全局字节账本（adapter 构造镜像的唯一生产入口）。
+    pub(crate) fn set_answer_validity_ledger(
+        &mut self,
+        ledger: Arc<super::answer_validity::AnswerValidityLedger>,
+    ) {
+        self.answer_validity = ledger;
+    }
+
+    /// 只在整批状态采用之后登记证明；缺页不构成来源退役。
+    fn update_answer_validity(
+        &mut self,
+        previous: Option<&Value>,
+        next: &Value,
+        patches: &[Value],
+        snapshot: bool,
+    ) {
+        if !unambiguous_loaded_history(next) {
+            return;
+        }
+        let current = super::async_question::answer_witnesses(&self.key.thread_id, next);
+        let old = previous
+            .map(|s| super::async_question::answer_witnesses(&self.key.thread_id, s))
+            .unwrap_or_default();
+        let dependencies = question_dependencies(next);
+        if snapshot && unambiguous_complete_history(next) {
+            for (question, witness) in self.answer_validity.witnesses_for_thread(&self.key) {
+                if !dependencies.contains_key(&question) {
+                    self.answer_validity
+                        .retire_if_observed(&self.key, &question, &witness);
+                }
+            }
+        }
+        if let Some(state) = previous {
+            let old_dependencies = question_dependencies(state);
+            for (question, witness) in &old {
+                let removed_reference =
+                    old_dependencies.get(question).is_some_and(|(turn_id, _)| {
+                        let Some((item_id, _)) =
+                            super::async_question::parse_question_key(question)
+                        else {
+                            return false;
+                        };
+                        let mut question_source = witness.clone();
+                        question_source.answer_turn_id = turn_id.clone();
+                        question_source.answer_item_id = item_id;
+                        explicitly_removes_answer_reference(state, next, &question_source, patches)
+                    });
+                if !dependencies.contains_key(question)
+                    && (explicitly_removes_question(state, next, question, patches)
+                        || removed_reference
+                        || (unambiguous_complete_history(state)
+                            && unambiguous_complete_history(next)))
+                {
+                    self.answer_validity.apply(
+                        &self.key,
+                        question,
+                        None,
+                        None,
+                        std::slice::from_ref(&witness.answer_item_id),
+                    );
+                }
+            }
+        }
+        for (question, dependency) in &dependencies {
+            let digest = Sha256::digest(serde_json::to_vec(dependency).unwrap_or_default())
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            let candidate = current.get(question);
+            if snapshot && candidate.is_none() && unambiguous_complete_history(next) {
+                if let Some(observed) = self.answer_validity.current_witness(&self.key, question) {
+                    if !answer_in_canonical_history(next, &observed) {
+                        self.answer_validity
+                            .retire_if_observed(&self.key, question, &observed);
+                    }
+                }
+            }
+            let mut retired = Vec::new();
+            if let (Some(state), Some(witness)) = (previous, old.get(question)) {
+                if (current.get(question) != Some(witness)
+                    && explicitly_rewrites_answer(state, next, witness, patches))
+                    || explicitly_removes_answer_reference(state, next, witness, patches)
+                    || current.get(question).is_some_and(|candidate| {
+                        candidate.answer_item_id == witness.answer_item_id && candidate != witness
+                    })
+                    || (unambiguous_complete_history(state)
+                        && unambiguous_complete_history(next)
+                        && !answer_in_canonical_history(next, witness))
+                {
+                    retired.push(witness.answer_item_id.clone());
+                }
+            }
+            self.answer_validity
+                .apply(&self.key, question, Some(&digest), candidate, &retired);
+        }
+    }
+
     pub fn with_ledger(key: ThreadKey, ledger: Arc<std::sync::Mutex<MirrorLedger>>) -> Self {
         let mut m = Self::new(key);
         m.ledger = Some(ledger);
         m
+    }
+
+    pub(crate) fn bind_hint_authority(
+        &mut self,
+        authority: Arc<super::hint_commit::HintLeaseAuthority>,
+    ) {
+        if self
+            .hint_authority
+            .as_ref()
+            .is_some_and(|old| Arc::ptr_eq(old, &authority))
+        {
+            return;
+        }
+        self.revoke_hint_scope();
+        self.hint_authority = Some(authority);
+    }
+    pub(crate) fn hint_permit(&self) -> Option<super::hint_commit::HintCommitPermit> {
+        self.hint_permit.clone()
+    }
+    fn revoke_hint_scope(&mut self) {
+        if let Some(permit) = self.hint_permit.take() {
+            permit.revoke_scope();
+        }
+    }
+    pub(crate) fn build_generation(&self) -> u64 {
+        self.build_generation
     }
 
     pub fn key(&self) -> &ThreadKey {
@@ -536,6 +1036,7 @@ impl ThreadMirror {
 
     /// 标记过期（连接断开/缺口/预算超限）。保留最后视图但禁写（adapter 侧门）。
     pub fn mark_stale(&mut self) {
+        self.revoke_hint_scope();
         self.stale = true;
     }
 
@@ -547,6 +1048,8 @@ impl ThreadMirror {
     }
 
     fn clear_state(&mut self) {
+        self.complete_rebuild = false;
+        self.revoke_hint_scope();
         if let Some(ledger) = &self.ledger {
             ledger
                 .lock()
@@ -581,16 +1084,32 @@ impl ThreadMirror {
         }
 
         let change_type = change.get("type").and_then(|t| t.as_str()).unwrap_or("");
-        match change_type {
+        let result = match change_type {
             "snapshot" => self.apply_snapshot(change),
             "patches" => self.apply_patches(change),
             _ => {
                 // 未知 change 形态：保守 stale + 重拉（不猜测语义）
-                self.stale = true;
+                self.mark_stale();
                 Ok(MirrorEffect {
                     changed: false,
                     need_snapshot: true,
                 })
+            }
+        };
+        if result.is_err() || self.stale {
+            self.revoke_hint_scope();
+        }
+        result
+    }
+
+    fn install_hint_scope(&mut self) {
+        if let Some(authority) = &self.hint_authority {
+            if let Some(permit) = authority.rotate_scope() {
+                if self.lease.as_ref() == Some(permit.lease()) {
+                    self.hint_permit = Some(permit);
+                } else {
+                    permit.revoke_scope();
+                }
             }
         }
     }
@@ -598,7 +1117,7 @@ impl ThreadMirror {
     fn apply_snapshot(&mut self, change: &Value) -> Result<MirrorEffect, ProtocolError> {
         let rev = change.get("revision").and_then(|r| r.as_u64());
         let Some(rev) = rev else {
-            self.stale = true;
+            self.mark_stale();
             return Ok(MirrorEffect {
                 changed: false,
                 need_snapshot: true,
@@ -615,7 +1134,12 @@ impl ThreadMirror {
             .get("conversationState")
             .cloned()
             .unwrap_or(Value::Null);
-        self.adopt(rev, state)?;
+        self.revoke_hint_scope();
+        let previous = self.state.clone();
+        self.adopt(rev, state.clone())?;
+        self.update_answer_validity(previous.as_ref(), &state, &[], true);
+        self.complete_rebuild = unambiguous_complete_history(&state);
+        self.install_hint_scope();
         // 镜像重建代：只在新 snapshot 装订成功时递增（patch 是增量，不动它）。
         self.build_generation = self.build_generation.saturating_add(1);
         Ok(MirrorEffect {
@@ -629,7 +1153,7 @@ impl ThreadMirror {
         let rev = change.get("revision").and_then(|r| r.as_u64());
         let patches = change.get("patches").and_then(|p| p.as_array()).cloned();
         let (Some(base), Some(rev), Some(patches)) = (base, rev, patches) else {
-            self.stale = true;
+            self.mark_stale();
             return Ok(MirrorEffect {
                 changed: false,
                 need_snapshot: true,
@@ -643,7 +1167,7 @@ impl ThreadMirror {
         }
         let Some(cur) = self.revision else {
             // 尚无快照基线：缺口
-            self.stale = true;
+            self.mark_stale();
             return Ok(MirrorEffect {
                 changed: false,
                 need_snapshot: true,
@@ -651,7 +1175,7 @@ impl ThreadMirror {
         };
         if base != cur {
             // revision 缺口/乱序：整批不应用，stale + 重拉
-            self.stale = true;
+            self.mark_stale();
             return Ok(MirrorEffect {
                 changed: false,
                 need_snapshot: true,
@@ -659,16 +1183,17 @@ impl ThreadMirror {
         }
         // 原子应用：clone 上逐条 op，任一失败整批作废
         let Some(state) = self.state.clone() else {
-            self.stale = true;
+            self.mark_stale();
             return Ok(MirrorEffect {
                 changed: false,
                 need_snapshot: true,
             });
         };
+        let previous = state.clone();
         let mut next = state;
         for op in &patches {
             if apply_op(&mut next, op).is_err() {
-                self.stale = true;
+                self.mark_stale();
                 return Ok(MirrorEffect {
                     changed: false,
                     need_snapshot: true,
@@ -677,7 +1202,15 @@ impl ThreadMirror {
         }
         // 2026-10-18 形态适配：完整性从**新 state** 派生（snapshot/patch 同一判定
         // 单点），不再沿用上一状态的缓存 bool
-        self.adopt(rev, next)?;
+        let recovering = self.stale;
+        self.adopt(rev, next.clone())?;
+        self.update_answer_validity(Some(&previous), &next, &patches, false);
+        self.complete_rebuild = self.complete_rebuild
+            && (previous.get("turnHistory") == next.get("turnHistory")
+                || complete_history_preserves_prefix(&previous, &next));
+        if recovering {
+            self.install_hint_scope();
+        }
         Ok(MirrorEffect {
             changed: true,
             need_snapshot: false,
@@ -693,7 +1226,7 @@ impl ThreadMirror {
             .map(|b| b.len())
             .unwrap_or(usize::MAX);
         if size > MIRROR_BUDGET {
-            self.stale = true;
+            self.mark_stale();
             self.budget_refused = true;
             return Err(ProtocolError::Capacity(format!(
                 "mirror exceeds per-thread budget: {size} > {MIRROR_BUDGET}"
@@ -703,11 +1236,13 @@ impl ThreadMirror {
         if let Some(ledger) = &self.ledger {
             let mut l = ledger.lock().expect("ledger lock");
             if !l.claim(&self.key, self.size, size) {
-                self.stale = true;
+                let cap = l.cap_of();
+                drop(l);
+                self.mark_stale();
                 self.budget_refused = true;
                 return Err(ProtocolError::Capacity(format!(
                     "mirror exceeds global budget: total would exceed {} bytes",
-                    l.cap_of()
+                    cap
                 )));
             }
         }
@@ -796,7 +1331,7 @@ impl ThreadMirror {
             &self.key.thread_id,
             &state,
         );
-        let async_questions =
+        let mut async_questions =
             crate::services::codex_desktop_ipc::async_question::AsyncQuestionProjector
                 .project_with_hints(
                     &self.key,
@@ -808,6 +1343,40 @@ impl ThreadMirror {
                         .map(Vec::as_slice)
                         .unwrap_or(&[]),
                 );
+        let current_witnesses =
+            super::async_question::answer_witnesses(&self.key.thread_id, &state);
+        for question in &mut async_questions {
+            let candidate_blocked =
+                current_witnesses
+                    .get(&question.question_key)
+                    .is_some_and(|witness| {
+                        !self.answer_validity.allows_candidate(
+                            &self.key,
+                            &question.question_key,
+                            &witness.answer_item_id,
+                        )
+                    });
+            let status = self
+                .answer_validity
+                .status(&self.key, &question.question_key);
+            let blocked = match status {
+                super::answer_validity::ValidityStatus::Quarantined
+                | super::answer_validity::ValidityStatus::AdmissionClosed => true,
+                super::answer_validity::ValidityStatus::Retired => {
+                    !current_witnesses.contains_key(&question.question_key)
+                        && !self.complete_rebuild
+                }
+                super::answer_validity::ValidityStatus::Normal => false,
+            };
+            if (self.stale || blocked || candidate_blocked)
+                && question.state != super::async_question::InteractionState::Unknown
+            {
+                question.state = super::async_question::InteractionState::Unknown;
+                question.actionable = false;
+                question.disabled_reason_code =
+                    Some(super::reason_code::ASYNC_HISTORY_INCOMPLETE.to_string());
+            }
+        }
         ThreadProjection {
             thread_id: self.key.thread_id.clone(),
             revision: self.revision,
@@ -1980,6 +2549,1686 @@ fn key_of(seg: &Value) -> Result<String, ProtocolError> {
 mod tests {
     use super::*;
     use crate::services::codex_desktop_ipc::types::{PendingKind, ThreadKey};
+
+    fn b1_replay_envelope(answer: &str) -> String {
+        let key = r#"["request_user_input_async","call-1",0]"#;
+        format!("<send_user_message_question_reply>\n[{{\"questionItemId\":{},\"question\":\"Q\",\"answer\":{}}}]\n</send_user_message_question_reply>", serde_json::to_string(key).unwrap(), serde_json::to_string(answer).unwrap())
+    }
+
+    fn b1_replay_mirror() -> ThreadMirror {
+        let state = serde_json::json!({"turnHistory":{"history":{"isComplete":true,"entitiesByKey":{
+            "turn:q":{"turnId":"q","status":"completed","items":[{"type":"agentMessage","id":"call-1","questions":[{"title":"Q"}]}]},
+            "turn:a":{"turnId":"a","status":"completed","items":[{"type":"userMessage","id":"answer-1","content":[{"type":"text","text":b1_replay_envelope("A")}]}]}
+        },"islands":[{"entries":[{"value":"turn:q"},{"value":"turn:a"}]}]}}});
+        let mut mirror = ThreadMirror::new(key());
+        mirror
+            .apply(
+                &lease(),
+                &serde_json::json!({"type":"snapshot","revision":1,"conversationState":state}),
+            )
+            .unwrap();
+        mirror
+    }
+
+    fn b1_replay_patch(mirror: &mut ThreadMirror, revision: u64, patches: Value) {
+        mirror.apply(&lease(), &serde_json::json!({"type":"patches","baseRevision":revision - 1,"revision":revision,"patches":patches})).unwrap();
+    }
+
+    #[test]
+    fn b1_atomic_temporary_ambiguity_cannot_hide_question_deletion() {
+        use super::super::async_question::InteractionState;
+        let mut state = b1_replay_mirror().observation_state().unwrap().clone();
+        let plain = serde_json::json!({"type":"userMessage","id":"p","content":[{"type":"text","text":"hello"}]});
+        state["turnHistory"]["history"]["entitiesByKey"]["turn:q"]["items"]
+            .as_array_mut()
+            .unwrap()
+            .insert(0, plain.clone());
+        let mut mirror = ThreadMirror::new(key());
+        mirror
+            .apply(
+                &lease(),
+                &serde_json::json!({"type":"snapshot","revision":1,"conversationState":state}),
+            )
+            .unwrap();
+        assert_eq!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Answered
+        );
+        b1_replay_patch(
+            &mut mirror,
+            2,
+            serde_json::json!([
+                {"op":"add","path":["turnHistory","history","entitiesByKey","turn:q","items",0],"value":plain},
+                {"op":"remove","path":["turnHistory","history","entitiesByKey","turn:q","items",2,"questions",0]},
+                {"op":"remove","path":["turnHistory","history","entitiesByKey","turn:q","items",0]}
+            ]),
+        );
+        b1_replay_patch(
+            &mut mirror,
+            3,
+            serde_json::json!([
+                {"op":"add","path":["turnHistory","history","entitiesByKey","turn:q","items",1,"questions",0],"value":{"title":"Q"}}
+            ]),
+        );
+        assert_eq!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Unknown,
+            "最终完整且唯一的删除不能被中间临时多义掩盖"
+        );
+    }
+
+    #[test]
+    fn b1_atomic_remove_and_restore_same_answer_does_not_retire() {
+        use super::super::async_question::InteractionState;
+        let mut mirror = b1_replay_mirror();
+        let answer = mirror.observation_state().unwrap()["turnHistory"]["history"]["entitiesByKey"]
+            ["turn:a"]["items"][0]
+            .clone();
+        assert_eq!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Answered
+        );
+        b1_replay_patch(
+            &mut mirror,
+            2,
+            serde_json::json!([
+                {"op":"remove","path":["turnHistory","history","entitiesByKey","turn:a","items",0]},
+                {"op":"add","path":["turnHistory","history","entitiesByKey","turn:a","items",0],"value":answer}
+            ]),
+        );
+        assert_eq!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Answered,
+            "同批原样恢复的答复不能被永久退役"
+        );
+    }
+
+    #[test]
+    fn b1_shifted_question_item_then_question_removal_retires_w1() {
+        use super::super::async_question::InteractionState;
+        let mut state = b1_replay_mirror().observation_state().unwrap().clone();
+        state["turnHistory"]["history"]["entitiesByKey"]["turn:q"]["items"].as_array_mut().unwrap().insert(0, serde_json::json!({"type":"userMessage","id":"plain","content":[{"type":"text","text":"hello"}]}));
+        let mut mirror = ThreadMirror::new(key());
+        mirror
+            .apply(
+                &lease(),
+                &serde_json::json!({"type":"snapshot","revision":1,"conversationState":state}),
+            )
+            .unwrap();
+        assert_eq!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Answered
+        );
+        b1_replay_patch(
+            &mut mirror,
+            2,
+            serde_json::json!([
+                {"op":"remove","path":["turnHistory","history","entitiesByKey","turn:q","items",0]},
+                {"op":"remove","path":["turnHistory","history","entitiesByKey","turn:q","items",0,"questions",0]}
+            ]),
+        );
+        b1_replay_patch(
+            &mut mirror,
+            3,
+            serde_json::json!([
+                {"op":"add","path":["turnHistory","history","entitiesByKey","turn:q","items",0,"questions",0],"value":{"title":"Q"}}
+            ]),
+        );
+        assert_eq!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Unknown,
+            "题目项移位后删除并恢复不得复活 W1"
+        );
+    }
+
+    #[test]
+    fn b1_shifted_island_then_answer_reference_removal_retires_w1() {
+        use super::super::async_question::InteractionState;
+        let mut state = b1_replay_mirror().observation_state().unwrap().clone();
+        state["turnHistory"]["history"]["islands"]
+            .as_array_mut()
+            .unwrap()
+            .insert(0, serde_json::json!({"entries":[]}));
+        let entry = state["turnHistory"]["history"]["islands"][1]["entries"][1].clone();
+        let mut mirror = ThreadMirror::new(key());
+        mirror
+            .apply(
+                &lease(),
+                &serde_json::json!({"type":"snapshot","revision":1,"conversationState":state}),
+            )
+            .unwrap();
+        assert_eq!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Answered
+        );
+        b1_replay_patch(
+            &mut mirror,
+            2,
+            serde_json::json!([
+                {"op":"remove","path":["turnHistory","history","islands",0]},
+                {"op":"remove","path":["turnHistory","history","islands",0,"entries",1]}
+            ]),
+        );
+        b1_replay_patch(
+            &mut mirror,
+            3,
+            serde_json::json!([
+                {"op":"add","path":["turnHistory","history","islands",0,"entries",1],"value":entry}
+            ]),
+        );
+        assert_eq!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Unknown,
+            "island 移位后删除并恢复答复引用不得复活 W1"
+        );
+    }
+
+    #[test]
+    fn b1_shifted_question_array_removal_retires_w1() {
+        use super::super::async_question::{compose_async_answer, InteractionState};
+        let mut state = b1_replay_mirror().observation_state().unwrap().clone();
+        state["turnHistory"]["history"]["entitiesByKey"]["turn:q"]["items"][0]["questions"] =
+            serde_json::json!([{"title":"Q0"},{"title":"Q1"}]);
+        state["turnHistory"]["history"]["entitiesByKey"]["turn:a"]["items"][0]["content"][0]
+            ["text"] = serde_json::json!(compose_async_answer("call-1", 1, "Q1", "A"));
+        let mut mirror = ThreadMirror::new(key());
+        mirror
+            .apply(
+                &lease(),
+                &serde_json::json!({"type":"snapshot","revision":1,"conversationState":state}),
+            )
+            .unwrap();
+        assert_eq!(
+            mirror
+                .project(caps())
+                .async_questions
+                .iter()
+                .find(|q| q.question_index == 1)
+                .unwrap()
+                .state,
+            InteractionState::Answered
+        );
+        b1_replay_patch(
+            &mut mirror,
+            2,
+            serde_json::json!([
+                {"op":"remove","path":["turnHistory","history","entitiesByKey","turn:q","items",0,"questions",0]},
+                {"op":"remove","path":["turnHistory","history","entitiesByKey","turn:q","items",0,"questions",0]}
+            ]),
+        );
+        b1_replay_patch(
+            &mut mirror,
+            3,
+            serde_json::json!([
+                {"op":"add","path":["turnHistory","history","entitiesByKey","turn:q","items",0,"questions",0],"value":{"title":"Q0"}},
+                {"op":"add","path":["turnHistory","history","entitiesByKey","turn:q","items",0,"questions",1],"value":{"title":"Q1"}}
+            ]),
+        );
+        assert_eq!(
+            mirror
+                .project(caps())
+                .async_questions
+                .iter()
+                .find(|q| q.question_index == 1)
+                .unwrap()
+                .state,
+            InteractionState::Unknown,
+            "移位后删除并恢复的 Q1 不得复活 W1"
+        );
+    }
+
+    #[test]
+    fn b1_shifted_answer_reference_removal_retires_w1() {
+        use super::super::async_question::InteractionState;
+        let mut state = b1_replay_mirror().observation_state().unwrap().clone();
+        state["turnHistory"]["history"]["entitiesByKey"]["turn:plain"] =
+            serde_json::json!({"turnId":"plain","status":"completed","items":[]});
+        state["turnHistory"]["history"]["islands"][0]["entries"]
+            .as_array_mut()
+            .unwrap()
+            .insert(0, serde_json::json!({"value":"turn:plain"}));
+        let answer_entry = state["turnHistory"]["history"]["islands"][0]["entries"][2].clone();
+        let mut mirror = ThreadMirror::new(key());
+        mirror
+            .apply(
+                &lease(),
+                &serde_json::json!({"type":"snapshot","revision":1,"conversationState":state}),
+            )
+            .unwrap();
+        assert_eq!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Answered
+        );
+        b1_replay_patch(
+            &mut mirror,
+            2,
+            serde_json::json!([
+                {"op":"remove","path":["turnHistory","history","islands",0,"entries",0]},
+                {"op":"remove","path":["turnHistory","history","islands",0,"entries",1]}
+            ]),
+        );
+        assert!(
+            mirror.observation_state().unwrap()["turnHistory"]["history"]["entitiesByKey"]
+                .get("turn:a")
+                .is_some()
+        );
+        b1_replay_patch(
+            &mut mirror,
+            3,
+            serde_json::json!([
+                {"op":"add","path":["turnHistory","history","islands",0,"entries",1],"value":answer_entry}
+            ]),
+        );
+        assert_eq!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Unknown,
+            "移位后被删除的答复引用恢复时不得复活 W1"
+        );
+    }
+
+    #[test]
+    fn b1_shifted_question_reference_removal_retires_w1() {
+        use super::super::async_question::InteractionState;
+        let mut state = b1_replay_mirror().observation_state().unwrap().clone();
+        state["turnHistory"]["history"]["entitiesByKey"]["turn:plain"] =
+            serde_json::json!({"turnId":"plain","status":"completed","items":[]});
+        state["turnHistory"]["history"]["islands"][0]["entries"]
+            .as_array_mut()
+            .unwrap()
+            .insert(0, serde_json::json!({"value":"turn:plain"}));
+        let question_entry = state["turnHistory"]["history"]["islands"][0]["entries"][1].clone();
+        let mut mirror = ThreadMirror::new(key());
+        mirror
+            .apply(
+                &lease(),
+                &serde_json::json!({"type":"snapshot","revision":1,"conversationState":state}),
+            )
+            .unwrap();
+        assert_eq!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Answered
+        );
+        b1_replay_patch(
+            &mut mirror,
+            2,
+            serde_json::json!([
+                {"op":"remove","path":["turnHistory","history","islands",0,"entries",0]},
+                {"op":"remove","path":["turnHistory","history","islands",0,"entries",0]}
+            ]),
+        );
+        assert!(
+            mirror.observation_state().unwrap()["turnHistory"]["history"]["entitiesByKey"]
+                .get("turn:q")
+                .is_some()
+        );
+        b1_replay_patch(
+            &mut mirror,
+            3,
+            serde_json::json!([
+                {"op":"add","path":["turnHistory","history","islands",0,"entries",0],"value":question_entry}
+            ]),
+        );
+        assert_eq!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Unknown,
+            "移位后被删除的题目引用恢复时不得复活 W1"
+        );
+    }
+
+    #[test]
+    fn b1_question_reference_deletion_retires_w1_even_if_entity_remains() {
+        use super::super::async_question::InteractionState;
+        let mut mirror = b1_replay_mirror();
+        let entry = mirror.observation_state().unwrap()["turnHistory"]["history"]["islands"][0]
+            ["entries"][0]
+            .clone();
+        assert_eq!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Answered
+        );
+        b1_replay_patch(
+            &mut mirror,
+            2,
+            serde_json::json!([
+                {"op":"remove","path":["turnHistory","history","islands",0,"entries",0]}
+            ]),
+        );
+        let state = mirror.observation_state().unwrap();
+        assert!(state["turnHistory"]["history"]["entitiesByKey"]
+            .get("turn:q")
+            .is_some());
+        assert_eq!(
+            state["turnHistory"]["history"]["islands"][0]["entries"][0]["value"],
+            "turn:a"
+        );
+        b1_replay_patch(
+            &mut mirror,
+            3,
+            serde_json::json!([
+                {"op":"add","path":["turnHistory","history","islands",0,"entries",0],"value":entry}
+            ]),
+        );
+        assert_eq!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Unknown,
+            "移出引用链的题目恢复后不得复活旧 W1"
+        );
+    }
+
+    #[test]
+    fn b1_shifted_answer_removal_in_same_patch_retires_w1() {
+        use super::super::async_question::InteractionState;
+        let mut state = b1_replay_mirror().observation_state().unwrap().clone();
+        let items = state["turnHistory"]["history"]["entitiesByKey"]["turn:a"]["items"]
+            .as_array_mut()
+            .unwrap();
+        let answer = items[0].clone();
+        items.insert(0, serde_json::json!({"type":"userMessage","id":"ordinary","content":[{"type":"text","text":"hello"}]}));
+        let mut mirror = ThreadMirror::new(key());
+        mirror
+            .apply(
+                &lease(),
+                &serde_json::json!({"type":"snapshot","revision":1,"conversationState":state}),
+            )
+            .unwrap();
+        assert_eq!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Answered
+        );
+        b1_replay_patch(
+            &mut mirror,
+            2,
+            serde_json::json!([
+                {"op":"remove","path":["turnHistory","history","entitiesByKey","turn:a","items",0]},
+                {"op":"remove","path":["turnHistory","history","entitiesByKey","turn:a","items",0]}
+            ]),
+        );
+        b1_replay_patch(
+            &mut mirror,
+            3,
+            serde_json::json!([
+                {"op":"add","path":["turnHistory","history","entitiesByKey","turn:a","items",0],"value":answer}
+            ]),
+        );
+        assert_eq!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Unknown,
+            "移位后被删除的 W1 恢复时不得复活"
+        );
+    }
+
+    #[test]
+    fn b1_unanswered_rebuild_survives_turn_metadata_and_ordinary_item() {
+        use super::super::async_question::InteractionState;
+        let mut mirror = b1_replay_mirror();
+        b1_replay_patch(
+            &mut mirror,
+            2,
+            serde_json::json!([
+                {"op":"remove","path":["turnHistory","history","entitiesByKey","turn:a","items",0]}
+            ]),
+        );
+        assert_eq!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Unknown
+        );
+        let unanswered = mirror.observation_state().unwrap().clone();
+        mirror
+            .apply(
+                &lease(),
+                &serde_json::json!({"type":"snapshot","revision":3,"conversationState":unanswered}),
+            )
+            .unwrap();
+        let expected = mirror.project(caps()).async_questions[0].state;
+        assert!(matches!(
+            expected,
+            InteractionState::Pending | InteractionState::TemporarilyBlocked
+        ));
+        b1_replay_patch(
+            &mut mirror,
+            4,
+            serde_json::json!([
+                {"op":"replace","path":["turnHistory","history","entitiesByKey","turn:a","status"],"value":"inProgress"}
+            ]),
+        );
+        assert_eq!(
+            mirror.project(caps()).async_questions[0].state,
+            expected,
+            "无关回合状态变化不得撤销未答证明"
+        );
+        b1_replay_patch(
+            &mut mirror,
+            5,
+            serde_json::json!([
+                {"op":"add","path":["turnHistory","history","entitiesByKey","turn:a","items",0],"value":{"type":"userMessage","id":"ordinary","content":[{"type":"text","text":"hello"}]}}
+            ]),
+        );
+        assert_eq!(
+            mirror.project(caps()).async_questions[0].state,
+            expected,
+            "追加无答复信封的普通消息不得撤销未答证明"
+        );
+    }
+
+    #[test]
+    fn b1_unanswered_rebuild_survives_ordinary_item_in_existing_turn() {
+        use super::super::async_question::InteractionState;
+        let mut mirror = b1_replay_mirror();
+        b1_replay_patch(
+            &mut mirror,
+            2,
+            serde_json::json!([
+                {"op":"remove","path":["turnHistory","history","entitiesByKey","turn:a","items",0]}
+            ]),
+        );
+        let unanswered = mirror.observation_state().unwrap().clone();
+        mirror
+            .apply(
+                &lease(),
+                &serde_json::json!({"type":"snapshot","revision":3,"conversationState":unanswered}),
+            )
+            .unwrap();
+        let expected = mirror.project(caps()).async_questions[0].state;
+        assert!(matches!(
+            expected,
+            InteractionState::Pending | InteractionState::TemporarilyBlocked
+        ));
+        b1_replay_patch(
+            &mut mirror,
+            4,
+            serde_json::json!([
+                {"op":"add","path":["turnHistory","history","entitiesByKey","turn:a","items",0],"value":{"type":"userMessage","id":"ordinary","content":[{"type":"text","text":"hello"}]}}
+            ]),
+        );
+        assert_eq!(
+            mirror.project(caps()).async_questions[0].state,
+            expected,
+            "追加普通消息不得撤销未答证明"
+        );
+    }
+
+    #[test]
+    fn b1_shared_answer_message_rewrite_is_question_scoped() {
+        use super::super::async_question::{compose_async_answers, InteractionState};
+        let envelope = |answer: &str| {
+            compose_async_answers(&[
+                ("call-1".into(), 0, "Q0".into(), answer.into()),
+                ("call-1".into(), 1, "Q1".into(), "B".into()),
+            ])
+        };
+        let mut state = b1_replay_mirror().observation_state().unwrap().clone();
+        state["turnHistory"]["history"]["entitiesByKey"]["turn:q"]["items"][0]["questions"] =
+            serde_json::json!([{"title":"Q0"},{"title":"Q1"}]);
+        state["turnHistory"]["history"]["entitiesByKey"]["turn:a"]["items"][0]["content"][0]
+            ["text"] = serde_json::json!(envelope("A"));
+        let mut mirror = ThreadMirror::new(key());
+        mirror
+            .apply(
+                &lease(),
+                &serde_json::json!({"type":"snapshot","revision":1,"conversationState":state}),
+            )
+            .unwrap();
+        let before = mirror.project(caps());
+        assert_eq!(before.async_questions.len(), 2);
+        assert!(before
+            .async_questions
+            .iter()
+            .all(|q| q.state == InteractionState::Answered));
+        b1_replay_patch(
+            &mut mirror,
+            2,
+            serde_json::json!([
+                {"op":"replace","path":["turnHistory","history","entitiesByKey","turn:a","items",0,"content",0,"text"],"value":envelope("changed")}
+            ]),
+        );
+        let after = mirror.project(caps());
+        assert_eq!(
+            after
+                .async_questions
+                .iter()
+                .find(|q| q.question_index == 0)
+                .unwrap()
+                .state,
+            InteractionState::Unknown
+        );
+        assert_eq!(
+            after
+                .async_questions
+                .iter()
+                .find(|q| q.question_index == 1)
+                .unwrap()
+                .state,
+            InteractionState::Answered,
+            "另一题的信封条目没有变化，应保留当前有效证明"
+        );
+    }
+
+    #[test]
+    fn b1_cold_start_reproof_scope_is_explicit() {
+        use super::super::async_question::{InteractionHint, InteractionState};
+        let previous_run = b1_replay_mirror();
+        let original = previous_run.observation_state().unwrap().clone();
+        let question_key = r#"["request_user_input_async","call-1",0]"#;
+        let witness = super::super::async_question::answer_witnesses(&key().thread_id, &original)
+            .remove(question_key)
+            .unwrap();
+        // 新进程使用独立账本；不承诺上次进程全部退役来源跨进程保存。
+        let mut cold = ThreadMirror::new(key());
+        cold.set_interaction_hints(Some(Arc::new(vec![InteractionHint {
+            thread_id: key().thread_id,
+            source_turn_id: "q".into(),
+            source_item_id: "call-1".into(),
+            question_index: 0,
+            last_fact: "unknown".into(),
+            witness: Some(witness),
+            evidence_state: Some("unverified".into()),
+        }])));
+        let unloaded = serde_json::json!({"turnHistory":{"history":{"isComplete":false,"entitiesByKey":{},"islands":[]}}});
+        cold.apply(
+            &lease(),
+            &serde_json::json!({"type":"snapshot","revision":1,"conversationState":unloaded}),
+        )
+        .unwrap();
+        assert_eq!(
+            cold.project(caps()).async_questions[0].state,
+            InteractionState::Unknown,
+            "旧提示没有当前证明时不能恢复已答"
+        );
+        cold.apply(
+            &lease(),
+            &serde_json::json!({"type":"snapshot","revision":2,"conversationState":original}),
+        )
+        .unwrap();
+        assert_eq!(
+            cold.project(caps()).async_questions[0].state,
+            InteractionState::Answered,
+            "冷启动可从唯一合法当前答复重新取证"
+        );
+    }
+
+    #[test]
+    fn b1_unloaded_then_complete_empty_history_retires_old_w1() {
+        use super::super::answer_validity::ValidityStatus;
+        use super::super::async_question::InteractionState;
+        let mut mirror = b1_replay_mirror();
+        let original = mirror.observation_state().unwrap().clone();
+        let question = r#"["request_user_input_async","call-1",0]"#;
+        assert_eq!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Answered
+        );
+        let unloaded = serde_json::json!({"turnHistory":{"history":{"isComplete":false,"entitiesByKey":{},"islands":[]}}});
+        mirror
+            .apply(
+                &lease(),
+                &serde_json::json!({"type":"snapshot","revision":2,"conversationState":unloaded}),
+            )
+            .unwrap();
+        assert_eq!(
+            mirror.answer_validity.status(&key(), question),
+            ValidityStatus::Normal,
+            "单纯缺页不能退役旧来源"
+        );
+        let empty = serde_json::json!({"turnHistory":{"history":{"isComplete":true,"entitiesByKey":{},"islands":[]}}});
+        mirror
+            .apply(
+                &lease(),
+                &serde_json::json!({"type":"snapshot","revision":3,"conversationState":empty}),
+            )
+            .unwrap();
+        mirror
+            .apply(
+                &lease(),
+                &serde_json::json!({"type":"snapshot","revision":4,"conversationState":original}),
+            )
+            .unwrap();
+        assert_eq!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Unknown,
+            "完整空历史已证明删除，旧题答重现不得复活 W1"
+        );
+    }
+
+    #[test]
+    fn b1_shifted_answer_rewrite_retires_same_source() {
+        use super::super::async_question::InteractionState;
+        let mut mirror = b1_replay_mirror();
+        assert_eq!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Answered
+        );
+        b1_replay_patch(
+            &mut mirror,
+            2,
+            serde_json::json!([
+                {"op":"add","path":["turnHistory","history","entitiesByKey","turn:a","items",0],"value":{"type":"userMessage","id":"ordinary","content":[{"type":"text","text":"hello"}]}},
+                {"op":"replace","path":["turnHistory","history","entitiesByKey","turn:a","items",1,"content",0,"text"],"value":b1_replay_envelope("B")}
+            ]),
+        );
+        assert_eq!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Unknown,
+            "同 ID 答复即使因插入而移位，改写后也必须退役"
+        );
+    }
+
+    #[test]
+    fn b1_snapshot_answer_rewrite_cannot_rebind_same_source() {
+        use super::super::async_question::InteractionState;
+        let mut mirror = b1_replay_mirror();
+        let mut changed = mirror.observation_state().unwrap().clone();
+        changed["turnHistory"]["history"]["entitiesByKey"]["turn:a"]["items"][0]["content"][0]
+            ["text"] = serde_json::json!(b1_replay_envelope("B"));
+        assert_eq!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Answered
+        );
+        mirror
+            .apply(
+                &lease(),
+                &serde_json::json!({"type":"snapshot","revision":2,"conversationState":changed}),
+            )
+            .unwrap();
+        assert_eq!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Unknown,
+            "同答复 ID 的内容改写不能被视为新来源"
+        );
+    }
+
+    #[test]
+    fn b1_unanswered_rebuild_survives_ordinary_complete_turn_append() {
+        use super::super::async_question::InteractionState;
+        let mut mirror = b1_replay_mirror();
+        b1_replay_patch(
+            &mut mirror,
+            2,
+            serde_json::json!([
+                {"op":"remove","path":["turnHistory","history","entitiesByKey","turn:a","items",0]}
+            ]),
+        );
+        assert_eq!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Unknown
+        );
+        let unanswered = mirror.observation_state().unwrap().clone();
+        mirror
+            .apply(
+                &lease(),
+                &serde_json::json!({"type":"snapshot","revision":3,"conversationState":unanswered}),
+            )
+            .unwrap();
+        let expected = mirror.project(caps()).async_questions[0].state;
+        assert!(matches!(
+            expected,
+            InteractionState::Pending | InteractionState::TemporarilyBlocked
+        ));
+        b1_replay_patch(
+            &mut mirror,
+            4,
+            serde_json::json!([
+                {"op":"add","path":["turnHistory","history","entitiesByKey","turn:later"],"value":{"turnId":"later","status":"completed","items":[{"type":"userMessage","id":"ordinary","content":[{"type":"text","text":"hello"}]}]}},
+                {"op":"add","path":["turnHistory","history","islands",0,"entries",2],"value":{"value":"turn:later"}}
+            ]),
+        );
+        assert_eq!(
+            mirror.project(caps()).async_questions[0].state,
+            expected,
+            "追加完整普通回合不得撤销未答证明"
+        );
+    }
+
+    #[test]
+    fn b1_older_unloaded_turn_does_not_hide_question_dependency_change() {
+        use super::super::async_question::InteractionState;
+        let mut state = b1_replay_mirror().observation_state().unwrap().clone();
+        state["turnHistory"]["history"]["entitiesByKey"]["turn:older"] =
+            serde_json::json!({"turnId":"older","status":"completed","itemsView":"notLoaded"});
+        state["turnHistory"]["history"]["islands"][0]["entries"]
+            .as_array_mut()
+            .unwrap()
+            .insert(0, serde_json::json!({"value":"turn:older"}));
+        let mut mirror = ThreadMirror::new(key());
+        mirror
+            .apply(
+                &lease(),
+                &serde_json::json!({"type":"snapshot","revision":1,"conversationState":state}),
+            )
+            .unwrap();
+        assert_eq!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Answered
+        );
+        b1_replay_patch(
+            &mut mirror,
+            2,
+            serde_json::json!([
+                {"op":"replace","path":["turnHistory","history","entitiesByKey","turn:q","items",0,"questions",0,"title"],"value":"Q1"}
+            ]),
+        );
+        assert_eq!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Unknown,
+            "较早无关回合缺页不能掩盖当前题目的明确改写"
+        );
+    }
+
+    #[test]
+    fn b1_unloaded_then_complete_deletion_retires_old_w1() {
+        use super::super::answer_validity::ValidityStatus;
+        use super::super::async_question::InteractionState;
+        let mut mirror = b1_replay_mirror();
+        let original = mirror.observation_state().unwrap().clone();
+        let question = r#"["request_user_input_async","call-1",0]"#;
+        let mut unloaded = original.clone();
+        unloaded["turnHistory"]["history"]["entitiesByKey"]["turn:a"]["items"] =
+            serde_json::json!([]);
+        unloaded["turnHistory"]["history"]["entitiesByKey"]["turn:a"]["itemsView"] =
+            serde_json::json!("notLoaded");
+        mirror
+            .apply(
+                &lease(),
+                &serde_json::json!({"type":"snapshot","revision":2,"conversationState":unloaded}),
+            )
+            .unwrap();
+        assert_eq!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Unknown
+        );
+        assert_eq!(
+            mirror.answer_validity.status(&key(), question),
+            ValidityStatus::Normal,
+            "单纯缺页不能退役来源"
+        );
+        let mut deleted = original.clone();
+        deleted["turnHistory"]["history"]["entitiesByKey"]["turn:a"]["items"] =
+            serde_json::json!([]);
+        mirror
+            .apply(
+                &lease(),
+                &serde_json::json!({"type":"snapshot","revision":3,"conversationState":deleted}),
+            )
+            .unwrap();
+        mirror
+            .apply(
+                &lease(),
+                &serde_json::json!({"type":"snapshot","revision":4,"conversationState":original}),
+            )
+            .unwrap();
+        assert_eq!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Unknown,
+            "后续完整历史明确删除后，旧 W1 不得复活"
+        );
+    }
+
+    #[test]
+    fn b1_complete_unanswered_rebuild_survives_unrelated_patches() {
+        use super::super::async_question::InteractionState;
+        let mut mirror = b1_replay_mirror();
+        b1_replay_patch(
+            &mut mirror,
+            2,
+            serde_json::json!([
+                {"op":"remove","path":["turnHistory","history","entitiesByKey","turn:a","items",0]}
+            ]),
+        );
+        assert_eq!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Unknown
+        );
+        let unanswered = mirror.observation_state().unwrap().clone();
+        mirror
+            .apply(
+                &lease(),
+                &serde_json::json!({"type":"snapshot","revision":3,"conversationState":unanswered}),
+            )
+            .unwrap();
+        let state = mirror.project(caps()).async_questions[0].state;
+        assert!(matches!(
+            state,
+            InteractionState::Pending | InteractionState::TemporarilyBlocked
+        ));
+        b1_replay_patch(&mut mirror, 4, serde_json::json!([]));
+        assert_eq!(
+            mirror.project(caps()).async_questions[0].state,
+            state,
+            "空 patch 不得撤销完整历史重建"
+        );
+        b1_replay_patch(
+            &mut mirror,
+            5,
+            serde_json::json!([
+                {"op":"add","path":["unrelatedRuntimeMarker"],"value":true}
+            ]),
+        );
+        assert_eq!(
+            mirror.project(caps()).async_questions[0].state,
+            state,
+            "无关状态更新不得撤销完整历史重建"
+        );
+    }
+
+    #[test]
+    fn b1_answer_reference_deletion_retires_w1_even_if_entity_remains() {
+        use super::super::async_question::InteractionState;
+        let mut mirror = b1_replay_mirror();
+        let entry = mirror.observation_state().unwrap()["turnHistory"]["history"]["islands"][0]
+            ["entries"][1]
+            .clone();
+        assert_eq!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Answered
+        );
+        b1_replay_patch(
+            &mut mirror,
+            2,
+            serde_json::json!([
+                {"op":"remove","path":["turnHistory","history","islands",0,"entries",1]}
+            ]),
+        );
+        assert!(
+            mirror.observation_state().unwrap()["turnHistory"]["history"]["entitiesByKey"]
+                .get("turn:a")
+                .is_some()
+        );
+        assert_eq!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Unknown
+        );
+        b1_replay_patch(
+            &mut mirror,
+            3,
+            serde_json::json!([
+                {"op":"add","path":["turnHistory","history","islands",0,"entries",1],"value":entry}
+            ]),
+        );
+        assert_eq!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Unknown,
+            "被明确移出引用链的 W1 不能因引用恢复而复活"
+        );
+    }
+
+    #[test]
+    fn b1_ambiguous_duplicate_question_does_not_retire_w1() {
+        use super::super::async_question::InteractionState;
+        let mut mirror = b1_replay_mirror();
+        assert_eq!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Answered
+        );
+        b1_replay_patch(
+            &mut mirror,
+            2,
+            serde_json::json!([
+                {"op":"add","path":["turnHistory","history","entitiesByKey","turn:q","items",1],"value":{"type":"agentMessage","id":"call-1","questions":[{"title":"different"}]}}
+            ]),
+        );
+        assert!(
+            mirror
+                .project(caps())
+                .async_questions
+                .iter()
+                .all(|q| q.state == InteractionState::Unknown),
+            "冲突副本应保持未验证"
+        );
+        b1_replay_patch(
+            &mut mirror,
+            3,
+            serde_json::json!([
+                {"op":"remove","path":["turnHistory","history","entitiesByKey","turn:q","items",1]}
+            ]),
+        );
+        assert_eq!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Answered,
+            "消除多义并恢复 Q0/W1 后应重新直接核验"
+        );
+    }
+
+    #[test]
+    fn b1_complete_snapshot_deletion_does_not_allow_old_w1_replay() {
+        use super::super::async_question::InteractionState;
+        let mut mirror = b1_replay_mirror();
+        let original = mirror.observation_state().unwrap().clone();
+        let mut unanswered = original.clone();
+        unanswered["turnHistory"]["history"]["entitiesByKey"]["turn:a"]["items"] =
+            serde_json::json!([]);
+        assert_eq!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Answered
+        );
+        mirror
+            .apply(
+                &lease(),
+                &serde_json::json!({"type":"snapshot","revision":2,"conversationState":unanswered}),
+            )
+            .unwrap();
+        assert!(matches!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Pending | InteractionState::TemporarilyBlocked
+        ));
+        mirror
+            .apply(
+                &lease(),
+                &serde_json::json!({"type":"snapshot","revision":3,"conversationState":original}),
+            )
+            .unwrap();
+        assert_eq!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Unknown,
+            "完整历史明确删除的 W1 原样恢复不得复活"
+        );
+    }
+
+    #[test]
+    fn b1_complete_unanswered_snapshot_rebuilds_but_patch_deletion_is_unknown() {
+        use super::super::async_question::InteractionState;
+        let mut snapshot_mirror = b1_replay_mirror();
+        let mut unanswered = snapshot_mirror.observation_state().unwrap().clone();
+        unanswered["turnHistory"]["history"]["entitiesByKey"]["turn:a"]["items"] =
+            serde_json::json!([]);
+        assert_eq!(
+            snapshot_mirror.project(caps()).async_questions[0].state,
+            InteractionState::Answered
+        );
+        snapshot_mirror
+            .apply(
+                &lease(),
+                &serde_json::json!({"type":"snapshot","revision":2,"conversationState":unanswered}),
+            )
+            .unwrap();
+        assert!(
+            matches!(
+                snapshot_mirror.project(caps()).async_questions[0].state,
+                InteractionState::Pending | InteractionState::TemporarilyBlocked
+            ),
+            "完整快照直接证明未答时应恢复可答状态"
+        );
+
+        let mut patch_mirror = b1_replay_mirror();
+        b1_replay_patch(
+            &mut patch_mirror,
+            2,
+            serde_json::json!([
+                {"op":"remove","path":["turnHistory","history","entitiesByKey","turn:a","items",0]}
+            ]),
+        );
+        assert_eq!(
+            patch_mirror.project(caps()).async_questions[0].state,
+            InteractionState::Unknown,
+            "增量删除答复后仍需完整历史重建"
+        );
+    }
+
+    #[test]
+    fn b1_complete_unanswered_snapshot_respects_quarantine_and_closed_admission() {
+        use super::super::answer_validity::{AnswerValidityLedger, LedgerLimits};
+        use super::super::async_question::InteractionState;
+        let mut unanswered = b1_replay_mirror().observation_state().unwrap().clone();
+        unanswered["turnHistory"]["history"]["entitiesByKey"]["turn:a"]["items"] =
+            serde_json::json!([]);
+        let question = r#"["request_user_input_async","call-1",0]"#;
+        let quarantined = Arc::new(AnswerValidityLedger::new(LedgerLimits {
+            per_question: 1,
+            keys: 1,
+            bytes: 4096,
+        }));
+        quarantined.apply(
+            &key(),
+            question,
+            Some("dependency"),
+            None,
+            &["old-1".into(), "old-2".into()],
+        );
+        let closed = Arc::new(AnswerValidityLedger::new(LedgerLimits {
+            per_question: 1,
+            keys: 0,
+            bytes: 4096,
+        }));
+        closed.apply(&key(), "other", Some("dependency"), None, &[]);
+        for ledger in [quarantined, closed] {
+            let mut mirror = ThreadMirror::new(key());
+            mirror.set_answer_validity_ledger(ledger);
+            mirror.apply(&lease(), &serde_json::json!({"type":"snapshot","revision":1,"conversationState":unanswered})).unwrap();
+            assert_eq!(
+                mirror.project(caps()).async_questions[0].state,
+                InteractionState::Unknown,
+                "隔离或关闭准入不能因完整快照解除"
+            );
+        }
+    }
+
+    #[test]
+    fn b1_single_snapshot_does_not_cache_untracked_candidates() {
+        use super::super::answer_validity::{AnswerValidityLedger, LedgerLimits, ValidityStatus};
+        let mut state = b1_replay_mirror().observation_state().unwrap().clone();
+        let questions = state["turnHistory"]["history"]["entitiesByKey"]["turn:q"]["items"]
+            .as_array_mut()
+            .unwrap();
+        questions.clear();
+        for index in 0..5 {
+            questions.push(serde_json::json!({"type":"agentMessage","id":format!("call-{index}"),"questions":[{"title":"Q"}]}));
+        }
+        let answers = state["turnHistory"]["history"]["entitiesByKey"]["turn:a"]["items"]
+            .as_array_mut()
+            .unwrap();
+        answers.clear();
+        for index in 0..5 {
+            let question =
+                serde_json::json!(["request_user_input_async", format!("call-{index}"), 0])
+                    .to_string();
+            let text = format!("<send_user_message_question_reply>\n[{{\"questionItemId\":{},\"question\":\"Q\",\"answer\":\"A\"}}]\n</send_user_message_question_reply>", serde_json::to_string(&question).unwrap());
+            answers.push(serde_json::json!({"type":"userMessage","id":format!("answer-{index}"),"content":[{"type":"text","text":text}]}));
+        }
+        let ledger = Arc::new(AnswerValidityLedger::new(LedgerLimits {
+            per_question: 4,
+            keys: 1,
+            bytes: 4096,
+        }));
+        let mut mirror = ThreadMirror::new(key());
+        mirror.set_answer_validity_ledger(ledger.clone());
+        mirror
+            .apply(
+                &lease(),
+                &serde_json::json!({"type":"snapshot","revision":1,"conversationState":state}),
+            )
+            .unwrap();
+        let witnesses = super::super::async_question::answer_witnesses(
+            &key().thread_id,
+            mirror.observation_state().unwrap(),
+        );
+        assert_eq!(witnesses.len(), 5, "同帧必须含五个可直接核验的候选");
+        assert_eq!(
+            witnesses
+                .keys()
+                .filter(|q| ledger.status(&key(), q) == ValidityStatus::AdmissionClosed)
+                .count(),
+            4
+        );
+        let (count, bytes) = ledger.tracked_for_test();
+        assert_eq!(count, 1);
+        assert!(bytes <= 4096);
+        for question in mirror.project(caps()).async_questions {
+            if ledger.status(&key(), &question.question_key) == ValidityStatus::AdmissionClosed {
+                assert_eq!(
+                    question.state,
+                    super::super::async_question::InteractionState::Unknown
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn b1_ambiguous_duplicate_identity_does_not_retire_w1() {
+        use super::super::async_question::InteractionState;
+        let mut mirror = b1_replay_mirror();
+        let answer = mirror.observation_state().unwrap()["turnHistory"]["history"]["entitiesByKey"]
+            ["turn:a"]["items"][0]
+            .clone();
+        assert_eq!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Answered
+        );
+        b1_replay_patch(
+            &mut mirror,
+            2,
+            serde_json::json!([
+                {"op":"add","path":["turnHistory","history","entitiesByKey","turn:a","items",1],"value":answer}
+            ]),
+        );
+        assert_eq!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Unknown
+        );
+        b1_replay_patch(
+            &mut mirror,
+            3,
+            serde_json::json!([
+                {"op":"remove","path":["turnHistory","history","entitiesByKey","turn:a","items",1]}
+            ]),
+        );
+        assert_eq!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Answered,
+            "消除身份多义后应允许原来源重新核验"
+        );
+    }
+
+    #[test]
+    fn b1_complete_history_answer_turn_deletion_retires_w1() {
+        use super::super::async_question::InteractionState;
+        let mut mirror = b1_replay_mirror();
+        let state = mirror.observation_state().unwrap();
+        let answer_turn = state["turnHistory"]["history"]["entitiesByKey"]["turn:a"].clone();
+        let entry = state["turnHistory"]["history"]["islands"][0]["entries"][1].clone();
+        assert_eq!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Answered
+        );
+        b1_replay_patch(
+            &mut mirror,
+            2,
+            serde_json::json!([
+                {"op":"remove","path":["turnHistory","history","islands",0,"entries",1]},
+                {"op":"remove","path":["turnHistory","history","entitiesByKey","turn:a"]}
+            ]),
+        );
+        assert_eq!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Unknown
+        );
+        b1_replay_patch(
+            &mut mirror,
+            3,
+            serde_json::json!([
+                {"op":"add","path":["turnHistory","history","entitiesByKey","turn:a"],"value":answer_turn},
+                {"op":"add","path":["turnHistory","history","islands",0,"entries",1],"value":entry}
+            ]),
+        );
+        assert_eq!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Unknown,
+            "明确删除的答复来源不得因原样重现而复活"
+        );
+    }
+
+    #[test]
+    fn b1_complete_history_question_deletion_retires_w1() {
+        use super::super::async_question::InteractionState;
+        let mut mirror = b1_replay_mirror();
+        let question = mirror.observation_state().unwrap()["turnHistory"]["history"]
+            ["entitiesByKey"]["turn:q"]["items"][0]["questions"][0]
+            .clone();
+        assert_eq!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Answered
+        );
+        b1_replay_patch(
+            &mut mirror,
+            2,
+            serde_json::json!([
+                {"op":"remove","path":["turnHistory","history","entitiesByKey","turn:q","items",0,"questions",0]}
+            ]),
+        );
+        b1_replay_patch(
+            &mut mirror,
+            3,
+            serde_json::json!([
+                {"op":"add","path":["turnHistory","history","entitiesByKey","turn:q","items",0,"questions",0],"value":question}
+            ]),
+        );
+        assert_eq!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Unknown,
+            "明确删除的题目恢复后不得复活旧答复"
+        );
+    }
+
+    #[test]
+    fn b1_shared_ledger_retirement_invalidates_other_mirror_projection() {
+        use super::super::async_question::InteractionState;
+        let first = b1_replay_mirror();
+        let original = first.observation_state().unwrap().clone();
+        let ledger = first.answer_validity.clone();
+        let mut second = ThreadMirror::new(key());
+        second.set_answer_validity_ledger(ledger);
+        second
+            .apply(
+                &lease(),
+                &serde_json::json!({"type":"snapshot","revision":1,"conversationState":original}),
+            )
+            .unwrap();
+        assert_eq!(
+            first.project(caps()).async_questions[0].state,
+            InteractionState::Answered
+        );
+        assert_eq!(
+            second.project(caps()).async_questions[0].state,
+            InteractionState::Answered
+        );
+
+        b1_replay_patch(
+            &mut second,
+            2,
+            serde_json::json!([
+                {"op":"replace","path":["turnHistory","history","entitiesByKey","turn:q","items",0,"questions",0,"title"],"value":"Q1"}
+            ]),
+        );
+        assert_eq!(
+            second.project(caps()).async_questions[0].state,
+            InteractionState::Unknown
+        );
+        assert_eq!(
+            first.project(caps()).async_questions[0].state,
+            InteractionState::Unknown,
+            "共享账本退役后，未收到新帧的镜像也不得显示旧答复有效"
+        );
+    }
+
+    #[test]
+    fn b1_unloaded_answer_item_can_be_reverified_after_same_patch_eviction() {
+        use super::super::async_question::InteractionState;
+        let mut mirror = b1_replay_mirror();
+        let answer = mirror.observation_state().unwrap()["turnHistory"]["history"]["entitiesByKey"]
+            ["turn:a"]["items"][0]
+            .clone();
+        assert_eq!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Answered
+        );
+        b1_replay_patch(
+            &mut mirror,
+            2,
+            serde_json::json!([
+                {"op":"remove","path":["turnHistory","history","entitiesByKey","turn:a","items",0]},
+                {"op":"add","path":["turnHistory","history","entitiesByKey","turn:a","itemsView"],"value":"notLoaded"}
+            ]),
+        );
+        assert_eq!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Unknown
+        );
+        b1_replay_patch(
+            &mut mirror,
+            3,
+            serde_json::json!([
+                {"op":"remove","path":["turnHistory","history","entitiesByKey","turn:a","itemsView"]},
+                {"op":"add","path":["turnHistory","history","entitiesByKey","turn:a","items",0],"value":answer}
+            ]),
+        );
+        assert_eq!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Answered,
+            "缺页恢复的相同来源应能重新直接核验"
+        );
+    }
+
+    #[test]
+    fn b1_closed_admission_does_not_accumulate_local_invalidation_markers() {
+        use super::super::answer_validity::{AnswerValidityLedger, LedgerLimits, ValidityStatus};
+        let state = b1_replay_mirror().observation_state().unwrap().clone();
+        let ledger = Arc::new(AnswerValidityLedger::new(LedgerLimits {
+            per_question: 4,
+            keys: 1,
+            bytes: 4096,
+        }));
+        let mut mirror = ThreadMirror::new(key());
+        mirror.set_answer_validity_ledger(ledger.clone());
+        mirror
+            .apply(
+                &lease(),
+                &serde_json::json!({"type":"snapshot","revision":1,"conversationState":state}),
+            )
+            .unwrap();
+        let mut revision = 1;
+        for index in 0..10 {
+            let call = format!("call-{index}");
+            let question = serde_json::json!(["request_user_input_async", call, 0]).to_string();
+            let answer = format!("<send_user_message_question_reply>\n[{{\"questionItemId\":{},\"question\":\"Q\",\"answer\":\"A\"}}]\n</send_user_message_question_reply>", serde_json::to_string(&question).unwrap());
+            revision += 1;
+            b1_replay_patch(
+                &mut mirror,
+                revision,
+                serde_json::json!([
+                    {"op":"replace","path":["turnHistory","history","entitiesByKey","turn:q","items",0,"id"],"value":call},
+                    {"op":"replace","path":["turnHistory","history","entitiesByKey","turn:a","items",0,"id"],"value":format!("answer-{index}")},
+                    {"op":"replace","path":["turnHistory","history","entitiesByKey","turn:a","items",0,"content",0,"text"],"value":answer}
+                ]),
+            );
+            revision += 1;
+            b1_replay_patch(
+                &mut mirror,
+                revision,
+                serde_json::json!([
+                    {"op":"replace","path":["turnHistory","history","entitiesByKey","turn:a","items",0,"content",0,"text"],"value":"普通消息"}
+                ]),
+            );
+            if index > 1 {
+                assert_eq!(
+                    ledger.status(&key(), &question),
+                    ValidityStatus::AdmissionClosed
+                );
+            }
+        }
+        let (count, bytes) = ledger.tracked_for_test();
+        assert_eq!(count, 1, "关闭准入后账本不得为每个新题累积标记");
+        assert!(bytes <= 4096);
+    }
+
+    #[test]
+    fn b1_revocations_survive_snapshot_owner_and_mirror_rebuild() {
+        use super::super::async_question::InteractionState;
+        let mut mirror = b1_replay_mirror();
+        let ledger = mirror.answer_validity.clone();
+        let original = mirror.observation_state().unwrap().clone();
+        assert_eq!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Answered
+        );
+        b1_replay_patch(
+            &mut mirror,
+            2,
+            serde_json::json!([{"op":"replace","path":["turnHistory","history","entitiesByKey","turn:q","items",0,"questions",0,"title"],"value":"Q1"}]),
+        );
+        assert_eq!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Unknown
+        );
+
+        mirror
+            .apply(
+                &lease(),
+                &serde_json::json!({"type":"snapshot","revision":3,"conversationState":original}),
+            )
+            .unwrap();
+        assert_eq!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Unknown,
+            "snapshot 不得复活已退役来源"
+        );
+        let mut next_lease = lease();
+        next_lease.generation += 1;
+        mirror
+            .apply(
+                &next_lease,
+                &serde_json::json!({"type":"snapshot","revision":1,"conversationState":original}),
+            )
+            .unwrap();
+        assert_eq!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Unknown,
+            "owner 换代不得复活已退役来源"
+        );
+
+        drop(mirror);
+        let mut rebuilt = ThreadMirror::new(key());
+        rebuilt.set_answer_validity_ledger(ledger);
+        rebuilt
+            .apply(
+                &next_lease,
+                &serde_json::json!({"type":"snapshot","revision":1,"conversationState":original}),
+            )
+            .unwrap();
+        assert_eq!(
+            rebuilt.project(caps()).async_questions[0].state,
+            InteractionState::Unknown,
+            "共享账本必须跨镜像重建保留退役来源"
+        );
+    }
+
+    #[test]
+    fn b1_rejected_patch_does_not_retire_witness() {
+        use super::super::async_question::InteractionState;
+        let mut mirror = b1_replay_mirror();
+        let original = mirror.observation_state().unwrap().clone();
+        assert_eq!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Answered
+        );
+        let effect = mirror.apply(&lease(), &serde_json::json!({"type":"patches","baseRevision":1,"revision":2,"patches":[
+            {"op":"replace","path":["turnHistory","history","entitiesByKey","turn:q","items",0,"questions",0,"title"],"value":"Q1"},
+            {"op":"remove","path":["turnHistory","history","missing"]}
+        ]})).unwrap();
+        assert!(!effect.changed);
+        assert!(effect.need_snapshot);
+        mirror
+            .apply(
+                &lease(),
+                &serde_json::json!({"type":"snapshot","revision":2,"conversationState":original}),
+            )
+            .unwrap();
+        assert_eq!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Answered,
+            "未采用的变更不得退役 W1"
+        );
+    }
+
+    #[test]
+    fn b1_retired_w1_cannot_revive_after_w2_cycle() {
+        use super::super::async_question::InteractionState;
+        let mut mirror = b1_replay_mirror();
+        assert_eq!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Answered
+        );
+        b1_replay_patch(
+            &mut mirror,
+            2,
+            serde_json::json!([{"op":"replace","path":["turnHistory","history","entitiesByKey","turn:q","items",0,"questions",0,"title"],"value":"Q1"}]),
+        );
+        assert_eq!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Unknown
+        );
+        b1_replay_patch(
+            &mut mirror,
+            3,
+            serde_json::json!([{"op":"replace","path":["turnHistory","history","entitiesByKey","turn:a","items",0,"id"],"value":"answer-2"},{"op":"replace","path":["turnHistory","history","entitiesByKey","turn:a","items",0,"content",0,"text"],"value":b1_replay_envelope("B")} ]),
+        );
+        assert_eq!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Answered
+        );
+        b1_replay_patch(
+            &mut mirror,
+            4,
+            serde_json::json!([{"op":"replace","path":["turnHistory","history","entitiesByKey","turn:q","items",0,"questions",0,"title"],"value":"Q2"}]),
+        );
+        assert_eq!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Unknown
+        );
+        b1_replay_patch(
+            &mut mirror,
+            5,
+            serde_json::json!([{"op":"replace","path":["turnHistory","history","entitiesByKey","turn:a","items",0,"id"],"value":"answer-1"},{"op":"replace","path":["turnHistory","history","entitiesByKey","turn:a","items",0,"content",0,"text"],"value":b1_replay_envelope("A")} ]),
+        );
+        assert_eq!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Unknown
+        );
+    }
+
+    #[test]
+    fn b1_same_patch_replacement_retires_old_witness() {
+        use super::super::async_question::InteractionState;
+        let mut mirror = b1_replay_mirror();
+        assert_eq!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Answered
+        );
+        b1_replay_patch(
+            &mut mirror,
+            2,
+            serde_json::json!([{"op":"replace","path":["turnHistory","history","entitiesByKey","turn:q","items",0,"questions",0,"title"],"value":"Q1"},{"op":"replace","path":["turnHistory","history","entitiesByKey","turn:a","items",0,"id"],"value":"answer-2"},{"op":"replace","path":["turnHistory","history","entitiesByKey","turn:a","items",0,"content",0,"text"],"value":b1_replay_envelope("B")} ]),
+        );
+        assert_eq!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Answered
+        );
+        b1_replay_patch(
+            &mut mirror,
+            3,
+            serde_json::json!([{"op":"replace","path":["turnHistory","history","entitiesByKey","turn:a","items",0,"id"],"value":"answer-1"},{"op":"replace","path":["turnHistory","history","entitiesByKey","turn:a","items",0,"content",0,"text"],"value":b1_replay_envelope("A")} ]),
+        );
+        assert_eq!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Unknown
+        );
+    }
+
+    #[test]
+    fn b1_invalidated_witness_cannot_revive_after_disappearance() {
+        use super::super::async_question::InteractionState;
+        let question_key = r#"["request_user_input_async","call-1",0]"#;
+        let envelope = |answer: &str| {
+            format!("<send_user_message_question_reply>\n[{{\"questionItemId\":{},\"question\":\"Q\",\"answer\":{}}}]\n</send_user_message_question_reply>", serde_json::to_string(question_key).unwrap(), serde_json::to_string(answer).unwrap())
+        };
+        let old = envelope("A");
+        let state = serde_json::json!({"turnHistory":{"history":{"isComplete":true,"entitiesByKey":{
+            "turn:q":{"turnId":"q","status":"completed","items":[{"type":"agentMessage","id":"call-1","questions":[{"title":"Q"}]}]},
+            "turn:a":{"turnId":"a","status":"completed","items":[{"type":"userMessage","id":"answer-1","content":[{"type":"text","text":old}]}]}
+        },"islands":[{"entries":[{"value":"turn:q"},{"value":"turn:a"}]}]}}});
+        let mut mirror = ThreadMirror::new(key());
+        mirror
+            .apply(
+                &lease(),
+                &serde_json::json!({"type":"snapshot","revision":1,"conversationState":state}),
+            )
+            .unwrap();
+        assert_eq!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Answered
+        );
+        mirror.apply(&lease(), &serde_json::json!({"type":"patches","baseRevision":1,"revision":2,"patches":[{"op":"replace","path":["turnHistory","history","entitiesByKey","turn:q","items",0,"questions",0,"title"],"value":"changed"}]})).unwrap();
+        assert_eq!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Unknown
+        );
+        mirror.apply(&lease(), &serde_json::json!({"type":"patches","baseRevision":2,"revision":3,"patches":[{"op":"replace","path":["turnHistory","history","entitiesByKey","turn:a","items",0,"content",0,"text"],"value":"普通消息"}]})).unwrap();
+        assert_eq!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Unknown
+        );
+        mirror.apply(&lease(), &serde_json::json!({"type":"patches","baseRevision":3,"revision":4,"patches":[{"op":"replace","path":["turnHistory","history","entitiesByKey","turn:a","items",0,"content",0,"text"],"value":envelope("A")}]})).unwrap();
+        assert_eq!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Unknown,
+            "旧 witness 原样重现不得复活"
+        );
+        mirror.apply(&lease(), &serde_json::json!({"type":"patches","baseRevision":4,"revision":5,"patches":[{"op":"replace","path":["turnHistory","history","entitiesByKey","turn:a","items",0,"id"],"value":"answer-2"},{"op":"replace","path":["turnHistory","history","entitiesByKey","turn:a","items",0,"content",0,"text"],"value":envelope("B")}]})).unwrap();
+        assert_eq!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Answered,
+            "真正的新 witness 可恢复"
+        );
+    }
+
+    #[test]
+    fn b1_patch_question_dependency_change_invalidates_answer() {
+        use super::super::async_question::InteractionState;
+        let question_key = r#"["request_user_input_async","call-1",0]"#;
+        let envelope = format!("<send_user_message_question_reply>\n[{{\"questionItemId\":{},\"question\":\"Q\",\"answer\":\"A\"}}]\n</send_user_message_question_reply>", serde_json::to_string(question_key).unwrap());
+        let state = serde_json::json!({"turnHistory":{"history":{"isComplete":true,"entitiesByKey":{
+            "turn:q":{"turnId":"q","status":"completed","items":[{"type":"agentMessage","id":"call-1","questions":[{"title":"Q","options":["A"]}]}]},
+            "turn:a":{"turnId":"a","status":"completed","items":[{"type":"userMessage","id":"answer-1","content":[{"type":"text","text":envelope}]}]}
+        },"islands":[{"entries":[{"value":"turn:q"},{"value":"turn:a"}]}]}}});
+        for (field, value) in [
+            ("title", serde_json::json!("changed")),
+            ("options", serde_json::json!(["B"])),
+        ] {
+            let mut mirror = ThreadMirror::new(key());
+            mirror
+                .apply(
+                    &lease(),
+                    &serde_json::json!({"type":"snapshot","revision":1,"conversationState":state}),
+                )
+                .unwrap();
+            assert_eq!(
+                mirror.project(caps()).async_questions[0].state,
+                InteractionState::Answered
+            );
+            mirror.apply(&lease(), &serde_json::json!({"type":"patches","baseRevision":1,"revision":2,"patches":[{"op":"replace","path":["turnHistory","history","entitiesByKey","turn:q","items",0,"questions",0,field],"value":value}]})).unwrap();
+            assert_eq!(
+                mirror.project(caps()).async_questions[0].state,
+                InteractionState::Unknown,
+                "{field} 修改必须失效旧答复"
+            );
+        }
+    }
+
+    #[test]
+    fn b1_contiguous_patch_can_invalidate_answer() {
+        use super::super::async_question::{InteractionHint, InteractionState};
+        let question_key = r#"["request_user_input_async","call-1",0]"#;
+        let envelope = format!("<send_user_message_question_reply>\n[{{\"questionItemId\":{},\"question\":\"Q\",\"answer\":\"A\"}}]\n</send_user_message_question_reply>", serde_json::to_string(question_key).unwrap());
+        let state = serde_json::json!({"turnHistory":{"history":{"isComplete":true,"entitiesByKey":{
+            "turn:q":{"turnId":"q","status":"completed","items":[{"type":"agentMessage","id":"call-1","questions":[{"title":"Q"}]}]},
+            "turn:a":{"turnId":"a","status":"completed","items":[{"type":"userMessage","id":"answer-1","content":[{"type":"text","text":envelope}]}]}
+        },"islands":[{"entries":[{"value":"turn:q"},{"value":"turn:a"}]}]}}});
+        let mut mirror = ThreadMirror::new(key());
+        mirror
+            .apply(
+                &lease(),
+                &serde_json::json!({"type":"snapshot","revision":1,"conversationState":state}),
+            )
+            .unwrap();
+        assert_eq!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Answered
+        );
+        mirror.set_interaction_hints(Some(Arc::new(vec![InteractionHint {
+            thread_id: key().thread_id,
+            source_turn_id: "q".into(),
+            source_item_id: "call-1".into(),
+            question_index: 0,
+            last_fact: "answered".into(),
+            witness: None,
+            evidence_state: None,
+        }])));
+        mirror
+            .apply(
+                &lease(),
+                &serde_json::json!({"type":"patches","baseRevision":1,"revision":2,"patches":[
+                    {"op":"remove","path":["turnHistory","history","islands",0,"entries",1]},
+                    {"op":"remove","path":["turnHistory","history","entitiesByKey","turn:a"]}
+                ]}),
+            )
+            .unwrap();
+        assert_eq!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Unknown
+        );
+    }
+
+    #[test]
+    fn b1_stale_patch_recovery_rotates_scope() {
+        let authority = super::super::hint_commit::HintLeaseAuthority::new(lease());
+        let mut mirror = ThreadMirror::new(key());
+        mirror.bind_hint_authority(authority);
+        mirror
+            .apply(
+                &lease(),
+                &serde_json::json!({"type":"snapshot", "revision":1, "conversationState":{}}),
+            )
+            .unwrap();
+        let old = mirror.hint_permit().unwrap();
+        mirror.mark_stale();
+        mirror.apply(&lease(), &serde_json::json!({"type":"patches", "baseRevision":1, "revision":2, "patches":[]})).unwrap();
+        assert!(!mirror.is_stale());
+        let fresh = mirror.hint_permit().expect("recovery creates a new permit");
+        assert!(old.lock().is_err());
+        assert_ne!(old.scope_id(), fresh.scope_id());
+        assert!(fresh.lock().is_ok());
+    }
+
+    #[test]
+    fn b1_mirror_scope_lifecycle() {
+        let authority = super::super::hint_commit::HintLeaseAuthority::new(lease());
+        let mut mirror = ThreadMirror::new(key());
+        mirror.bind_hint_authority(authority);
+        let snapshot = |revision| serde_json::json!({"type":"snapshot", "revision":revision, "conversationState":{}});
+        mirror.apply(&lease(), &snapshot(1)).unwrap();
+        let old = mirror.hint_permit().expect("snapshot creates permit");
+        mirror.apply(&lease(), &snapshot(2)).unwrap();
+        let new = mirror.hint_permit().expect("new snapshot creates permit");
+        assert!(old.lock().is_err());
+        old.revoke_scope();
+        assert!(new.lock().is_ok());
+        mirror.mark_stale();
+        assert!(new.lock().is_err());
+        mirror.apply(&lease(), &snapshot(3)).unwrap();
+        let third = mirror.hint_permit().unwrap();
+        mirror.invalidate();
+        assert!(third.lock().is_err());
+        mirror.apply(&lease(), &snapshot(4)).unwrap();
+        let fourth = mirror.hint_permit().unwrap();
+        drop(mirror);
+        assert!(fourth.lock().is_err());
+    }
 
     fn key() -> ThreadKey {
         ThreadKey {
