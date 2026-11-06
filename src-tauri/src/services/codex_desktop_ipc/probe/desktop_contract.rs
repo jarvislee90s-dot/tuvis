@@ -591,7 +591,7 @@ const RULES: &[OperationRule] = &[
         structural: Some(async_answer_envelope_structure),
         request_rule: "conversationId+turnStart{text=envelope[questionItemId,question,answer]}",
         response_rule: "result.result",
-        semantic_rule: "questionItemId=JSON.stringify([\"request_user_input_async\",item,index])（形参按序;第二元素=map源(<Q>.questions??[])同接收者的原条目.id;第三元素=map index）;answers=min(1)数组∪恒等transform;三字段同一字符串构造（字符串专有组合子证人）;守卫if(!…||!…)失败即返回+try{let <局部>=直接解析（同接收者）",
+        semantic_rule: "questionItemId=JSON.stringify([\"request_user_input_async\",item,index])（形参按序;第二元素=map源questions同接收者的原条目.id;第三元素=map index）;answers=min(1)数组∪恒等transform;三字段同一字符串构造（字符串专有组合子证人）;守卫if(!…||!…)失败即返回+try{let <局部>=直接解析（同接收者）",
     },
     OperationRule {
         operation: CodexOperation::Interrupt,
@@ -913,7 +913,7 @@ fn identity_wrap_at(hay: &str, at: usize) -> bool {
     callback.is_some_and(|(param, end)| hay[end..].starts_with(&format!("=>[{param}])])")))
 }
 
-/// 题目标识合成的**参数关系**（不止看 tag 与两个变量共现）。两种已观测形态：
+/// 题目标识合成的**参数关系**（不止看 tag 与两个变量共现）。
 ///
 /// **形态 A（命名函数 + 调用点，≤26.1023）**
 /// * 定义：`function F(P1,P2){return JSON.stringify(["request_user_input_async",P1,P2])`
@@ -926,9 +926,8 @@ fn identity_wrap_at(hay: &str, at: usize) -> bool {
 ///   ——打包器把单引用函数内联后，定义与调用合一。参数关系逐项不变：
 ///   第三元素 = map index 形参、第二元素 = 同一 map 源的条目 `.id`。
 ///
-/// 形态 B **不是放宽**：它复用形态 A 的全部参数关系判据（[`inline_synthesis_passes_index`]），
-/// 只是把"函数体里的形参绑定"换成"箭头体内直接书写"，同样拒绝 index 派生的第二元素、
-/// 同样要求 map 源等于 `(<条目>.questions??[])`。
+/// 26.1103.3517.0 的内联形态改由条目类型和题目长度守卫，成立后直接遍历
+/// `<条目>.questions`，否则返回空数组。同一条目的 `.id` 与遍历序号绑定保持不变。
 fn question_id_synthesis_bound(hay: &str) -> bool {
     named_synthesis_bound(hay) || inline_synthesis_bound(hay)
 }
@@ -1003,10 +1002,10 @@ fn inline_synthesis_bound(hay: &str) -> bool {
         if arg == index || arg.starts_with(&format!("{index}.")) {
             return false;
         }
-        if !hay[e_arg..].starts_with(&format!(",{index}]))")) {
+        let Some(after_map) = hay[e_arg..].strip_prefix(&format!(",{index}]))")) else {
             return false;
-        }
-        // 第二元素 = 原条目 `.id`，且 map 源是 `(<该条目>.questions??[])`（完整相等）
+        };
+        // 第二元素 = 原条目 `.id`，map 源须为同一条目的 questions。
         let Some(item) = arg.strip_suffix(".id") else {
             return false;
         };
@@ -1014,11 +1013,37 @@ fn inline_synthesis_bound(hay: &str) -> bool {
             return false;
         }
         let root = item.split('.').next().unwrap_or_default();
-        if element == index || root == element || root == index {
+        if element == index
+            || root == element
+            || root == index
+            || [element, index, root].contains(&"JSON")
+        {
             return false;
         }
         window_before(hay, idx, 64).ends_with(&format!("({item}.questions??[])"))
+            || guarded_inline_questions_source(&hay[..idx], after_map, item)
     })
+}
+
+/// 26.1103.3517.0：`return(A=Q,A?.type==="agentMessage"&&Q.questions?.length)?Q.questions.map(...):[]`。
+/// 类型守卫的别名、长度守卫、map 源和题目标识都必须指向同一条目。
+fn guarded_inline_questions_source(before_map: &str, after_map: &str, item: &str) -> bool {
+    // 实测接收者是简单标识符，避免守卫别名赋值覆盖成员链的根。
+    if item.contains('.') || !after_map.starts_with(":[]}") {
+        return false;
+    }
+    let guard = format!("?.type===\"agentMessage\"&&{item}.questions?.length)?{item}.questions");
+    let Some(before_type_check) = before_map.strip_suffix(&guard) else {
+        return false;
+    };
+    let Some(alias_start) = ident_before(before_type_check, before_type_check.len()) else {
+        return false;
+    };
+    let alias = &before_type_check[alias_start..];
+    alias != "JSON"
+        && before_type_check[..alias_start]
+            .strip_suffix(&format!("return({alias}={item},"))
+            .is_some_and(|prefix| prefix.ends_with(['{', ';', '}']))
 }
 
 /// `.map((X,N)=>F(ARG,N))`：第二实参正是 map 回调的 index 形参 `N`；第一实参必须是
@@ -1090,8 +1115,8 @@ fn start_turn_carrier_present(hay: &str) -> bool {
 /// 2. 条目 schema 三字段同一空参构造，且该构造链有字符串专有组合子证人；
 /// 3. 信封 schema 由该条目 schema 组成（`min(1)` 数组 ∪ 恒等 transform `p=>[p]`），
 ///    并且正是第 1 条解析链用的 schema；
-/// 4. `questionItemId` 由生成函数两个形参按序合成，调用点第二元素是 map 源
-///    `(<Q>.questions??[])` 同接收者原条目的 `.id`、第三元素是 map index；
+/// 4. `questionItemId` 的第二元素是 map 源 `questions` 同接收者原条目的 `.id`、
+///    第三元素是 map index，命名函数形态还要求两个形参按序绑定；
 /// 5. 承载 handler 仍是 `startTurn(conversationId, turnStart)`。
 ///
 /// 证据覆盖范围：以上全是有限词法上的引用关系，不是 JS 求值。数组／联合构造只核"接受
@@ -2003,6 +2028,64 @@ mod tests {
             "内联合成形态参数关系不变，不得失配: {:?}",
             evidence.matches.keys().collect::<Vec<_>>()
         );
+    }
+
+    // Windows 26.1103.3517.0：同一条目的 questions 经长度守卫后直接 map。
+    const GUARDED_QUESTION_ID_CALLSITE_20261106: &str = concat!(
+        "function list(e){var t;",
+        "return(t=e,t?.type===\"agentMessage\"&&e.questions?.length)?",
+        "e.questions.map((t,r)=>JSON.stringify([\"request_user_input_async\",e.id,r])):[]}",
+    );
+
+    #[test]
+    fn async_contract_accepts_guarded_direct_question_id_map() {
+        let envelope = mutate(
+            ASYNC_ENVELOPE_20261028,
+            "function bSe(e,t){return JSON.stringify([`request_user_input_async`,e,t])}",
+            "",
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let evidence = evidence_20261028(
+            dir.path(),
+            "guarded-inline.asar",
+            &main_js_20261028_with(
+                START_TURN_HANDLER_20261028,
+                &envelope,
+                GUARDED_QUESTION_ID_CALLSITE_20261106,
+                STRING_WITNESS_20261028,
+            ),
+            VERSION_TABLE_20261028,
+        );
+        assert!(evidence.matched(CodexOperation::AsyncAnswerIdle));
+    }
+
+    #[test]
+    fn async_contract_rejects_guarded_direct_question_id_map_with_wrong_bindings() {
+        for (from, to) in [
+            ("return(", "otherReturn("),
+            ("return(", "return other.return("),
+            ("t=e,", "t=other,"),
+            ("t?.type", "other?.type"),
+            (
+                "var t;return(t=e,t?.type",
+                "var JSON;return(JSON=e,JSON?.type",
+            ),
+            ("&&e.questions?.length", "&&other.questions?.length"),
+            ("?e.questions.map", "?other.questions.map"),
+            ("e.id,r", "other.id,r"),
+            ("e.id,r", "e.id,t"),
+            ("(t,r)=>", "(e,r)=>"),
+            ("(t,r)=>", "(JSON,r)=>"),
+            (":[]}", ":other}"),
+        ] {
+            let callsite = mutate(GUARDED_QUESTION_ID_CALLSITE_20261106, from, to);
+            assert!(!question_id_synthesis_bound(&callsite), "{from} → {to}");
+        }
+        let rebound_receiver = GUARDED_QUESTION_ID_CALLSITE_20261106
+            .replace("t=e,t?.type", "e=e.inner,e?.type")
+            .replace("e.questions", "e.inner.questions")
+            .replace("e.id,r", "e.inner.id,r");
+        assert!(!question_id_synthesis_bound(&rebound_receiver));
     }
 
     /// **v3 阴性锁**：内联形态下若第二元素派生于 index（而非条目 `.id`），
