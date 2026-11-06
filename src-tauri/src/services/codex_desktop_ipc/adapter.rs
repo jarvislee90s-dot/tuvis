@@ -443,6 +443,7 @@ struct AdapterInner {
     /// 执行权、无 await）：先失效先胜出，claim 之后才允许写出。
     interaction_gate: std::sync::Mutex<()>,
     /// T03：已装载提示缓存（thread_id → 提示；镜像锁内只读它，不读 DB）。
+    interaction_hint_io: tokio::sync::Mutex<()>,
     interaction_hints_cache:
         std::sync::Mutex<HashMap<String, Arc<Vec<super::async_question::InteractionHint>>>>,
     /// S1：本进程内已确立的**读链成功证据**（与能力位分离——S0 §3.1 裁决：兼容档
@@ -951,6 +952,7 @@ impl DesktopIpcAdapter {
                 contract_target_override: std::sync::Mutex::new(None),
                 observed_operations: std::sync::Mutex::new(None),
                 interaction_hint_store: std::sync::Mutex::new(None),
+                interaction_hint_io: tokio::sync::Mutex::new(()),
                 interaction_hints_cache: std::sync::Mutex::new(HashMap::new()),
                 interaction_facts: std::sync::Mutex::new(HashMap::new()),
                 group_bindings: std::sync::Mutex::new(HashMap::new()),
@@ -3090,6 +3092,11 @@ impl DesktopIpcAdapter {
     ///
     /// 读失败 / 无存储 → 不缓存（保持 Unknown 的保守语义；不合成"已答"）。
     pub async fn ensure_interaction_hints(&self, key: &ThreadKey) {
+        let _io = self.inner.interaction_hint_io.lock().await;
+        self.load_interaction_hints_locked(key).await;
+    }
+
+    async fn load_interaction_hints_locked(&self, key: &ThreadKey) -> bool {
         {
             let cache = self
                 .inner
@@ -3097,7 +3104,7 @@ impl DesktopIpcAdapter {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             if cache.contains_key(&key.thread_id) {
-                return;
+                return true;
             }
         }
         let store = self
@@ -3107,7 +3114,7 @@ impl DesktopIpcAdapter {
             .unwrap_or_else(|e| e.into_inner())
             .clone();
         let Some(store) = store else {
-            return;
+            return false;
         };
         let thread_id = key.thread_id.clone();
         let loaded = tokio::task::spawn_blocking(move || store.load(&thread_id))
@@ -3115,7 +3122,7 @@ impl DesktopIpcAdapter {
             .ok()
             .flatten();
         let Some(rows) = loaded else {
-            return;
+            return false;
         };
         let hints: Vec<super::async_question::InteractionHint> = rows
             .into_iter()
@@ -3132,6 +3139,7 @@ impl DesktopIpcAdapter {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(key.thread_id.clone(), Arc::new(hints));
+        true
     }
 
     /// R18：把投影里的题目事实写穿到持久提示（**仅变化时落库**；无存储/无题即跳过）。
@@ -3144,6 +3152,10 @@ impl DesktopIpcAdapter {
         questions: &[super::async_question::AsyncQuestionView],
     ) {
         if questions.is_empty() {
+            return;
+        }
+        let _io = self.inner.interaction_hint_io.lock().await;
+        if !self.load_interaction_hints_locked(key).await {
             return;
         }
         let store = self
@@ -6772,6 +6784,9 @@ async fn handle_state_changed(
     if source != Some(lease.client_id.as_str()) {
         return;
     }
+    // 首帧投影必须先看到已持久化的历史身份；不能在生成投影后才加载，
+    // 否则旧题的正式答复会从广播与本次写穿中遗漏。镜像锁外读取。
+    adapter.ensure_interaction_hints(&key).await;
     let estimate_followed = adapter
         .inner
         .followings
@@ -9977,5 +9992,204 @@ mod l2_persist_call_site_tests {
             !body.contains("persist_interaction_hints"),
             "publish_projection 是异常恢复路径，不应重复挂 persist"
         );
+    }
+}
+
+#[cfg(test)]
+mod pr202_hint_init_tests {
+    use super::*;
+    use crate::database::dao::codex_interactions::StoredInteractionHint;
+    use crate::services::codex_desktop_ipc::async_question::{
+        AsyncQuestionView, InteractionHint, InteractionHintStore, InteractionState,
+    };
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
+
+    #[derive(Default)]
+    struct MemoryHints {
+        rows: std::sync::Mutex<Vec<StoredInteractionHint>>,
+        loads: AtomicUsize,
+        fail_next_load: AtomicBool,
+    }
+
+    impl InteractionHintStore for MemoryHints {
+        fn load(&self, thread_id: &str) -> Option<Vec<StoredInteractionHint>> {
+            self.loads.fetch_add(1, Ordering::SeqCst);
+            if self.fail_next_load.swap(false, Ordering::SeqCst) {
+                return None;
+            }
+            Some(
+                self.rows
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|row| row.thread_id == thread_id)
+                    .cloned()
+                    .collect(),
+            )
+        }
+
+        fn upsert(&self, hint: &InteractionHint, at_ms: i64) {
+            let row = StoredInteractionHint {
+                thread_id: hint.thread_id.clone(),
+                source_turn_id: hint.source_turn_id.clone(),
+                source_item_id: hint.source_item_id.clone(),
+                question_index: hint.question_index,
+                last_fact: hint.last_fact.clone(),
+                updated_at: at_ms,
+            };
+            let mut rows = self.rows.lock().unwrap();
+            if let Some(slot) = rows.iter_mut().find(|old| {
+                old.thread_id == row.thread_id
+                    && old.source_turn_id == row.source_turn_id
+                    && old.source_item_id == row.source_item_id
+                    && old.question_index == row.question_index
+            }) {
+                *slot = row;
+            } else {
+                rows.push(row);
+            }
+        }
+    }
+
+    fn setup() -> (DesktopIpcAdapter, ThreadKey, Arc<MemoryHints>) {
+        let adapter = DesktopIpcAdapter::new(
+            Arc::new(super::publish_protocol_tests::NoopConnector),
+            ProtocolProfile::closed(),
+        );
+        let key = ThreadKey {
+            host_id: "local".into(),
+            thread_id: "th".into(),
+        };
+        let store = Arc::new(MemoryHints::default());
+        store.rows.lock().unwrap().push(StoredInteractionHint {
+            thread_id: "th".into(),
+            source_turn_id: "t-old".into(),
+            source_item_id: "old-item".into(),
+            question_index: 0,
+            last_fact: "pending".into(),
+            updated_at: 1,
+        });
+        adapter.set_interaction_hint_store(Some(store.clone()));
+        (adapter, key, store)
+    }
+
+    fn new_question() -> AsyncQuestionView {
+        AsyncQuestionView {
+            question_key: "[\"request_user_input_async\",\"new-item\",0]".into(),
+            context_token: "test-only".into(),
+            source_turn_id: "t-new".into(),
+            source_item_id: "new-item".into(),
+            question_index: 0,
+            title: "测试题".into(),
+            options: vec![],
+            state: InteractionState::Pending,
+            actionable: true,
+            disabled_reason_code: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn pr202_first_persist_loads_old_hints() {
+        let (adapter, key, store) = setup();
+        adapter
+            .persist_interaction_hints(&key, &[new_question()])
+            .await;
+        adapter.ensure_interaction_hints(&key).await;
+        assert_eq!(store.loads.load(Ordering::SeqCst), 1);
+        let cache = adapter.inner.interaction_hints_cache.lock().unwrap();
+        let rows = cache.get("th").unwrap();
+        assert!(rows.iter().any(|row| row.source_item_id == "old-item"));
+        assert!(rows.iter().any(|row| row.source_item_id == "new-item"));
+    }
+
+    #[tokio::test]
+    async fn pr202_load_failure_does_not_mark_cache_loaded() {
+        let (adapter, key, store) = setup();
+        store.fail_next_load.store(true, Ordering::SeqCst);
+        adapter
+            .persist_interaction_hints(&key, &[new_question()])
+            .await;
+        assert!(!adapter
+            .inner
+            .interaction_hints_cache
+            .lock()
+            .unwrap()
+            .contains_key("th"));
+        adapter
+            .persist_interaction_hints(&key, &[new_question()])
+            .await;
+        let cache = adapter.inner.interaction_hints_cache.lock().unwrap();
+        let rows = cache.get("th").unwrap();
+        assert!(rows.iter().any(|row| row.source_item_id == "old-item"));
+        assert!(rows.iter().any(|row| row.source_item_id == "new-item"));
+    }
+    #[tokio::test]
+    async fn pr202_hints_stay_thread_scoped() {
+        let (adapter, key, store) = setup();
+        let other = ThreadKey {
+            host_id: "local".into(),
+            thread_id: "other".into(),
+        };
+        let mut same = new_question();
+        same.source_item_id = "old-item".into();
+        adapter.persist_interaction_hints(&other, &[same]).await;
+        adapter.ensure_interaction_hints(&key).await;
+        let cache = adapter.inner.interaction_hints_cache.lock().unwrap();
+        assert!(cache["th"].iter().all(|hint| hint.thread_id == "th"));
+        assert!(cache["other"].iter().all(|hint| hint.thread_id == "other"));
+        assert_eq!(store.loads.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn pr202_load_and_persist_are_serialized() {
+        struct BlockingHints {
+            inner: Arc<MemoryHints>,
+            started: std::sync::mpsc::Sender<()>,
+            release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+        }
+        impl InteractionHintStore for BlockingHints {
+            fn load(&self, thread_id: &str) -> Option<Vec<StoredInteractionHint>> {
+                self.started.send(()).unwrap();
+                self.release.lock().unwrap().recv().unwrap();
+                self.inner.load(thread_id)
+            }
+            fn upsert(&self, hint: &InteractionHint, at_ms: i64) {
+                self.inner.upsert(hint, at_ms);
+            }
+        }
+        let (adapter, key, store) = setup();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        adapter.set_interaction_hint_store(Some(Arc::new(BlockingHints {
+            inner: store.clone(),
+            started: started_tx,
+            release: std::sync::Mutex::new(release_rx),
+        })));
+        let loader = adapter.clone();
+        let loader_key = key.clone();
+        let load = tokio::spawn(async move { loader.ensure_interaction_hints(&loader_key).await });
+        tokio::task::spawn_blocking(move || started_rx.recv().unwrap())
+            .await
+            .unwrap();
+        let writer = adapter.clone();
+        let writer_key = key.clone();
+        let persist = tokio::spawn(async move {
+            writer
+                .persist_interaction_hints(&writer_key, &[new_question()])
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert!(!persist.is_finished());
+        release_tx.send(()).unwrap();
+        load.await.unwrap();
+        persist.await.unwrap();
+        let cache = adapter.inner.interaction_hints_cache.lock().unwrap();
+        assert!(cache["th"]
+            .iter()
+            .any(|row| row.source_item_id == "old-item"));
+        assert!(cache["th"]
+            .iter()
+            .any(|row| row.source_item_id == "new-item"));
+        assert_eq!(store.loads.load(Ordering::SeqCst), 1);
     }
 }

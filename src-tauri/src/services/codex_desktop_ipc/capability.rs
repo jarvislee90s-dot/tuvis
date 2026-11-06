@@ -42,7 +42,8 @@ use super::types::ProtocolError;
 ///   v3 对两者均接受**原形态或新形态**，其余判据（引用关系、schema 形状、参数序、
 ///   index 绑定、map 源同接收者）全部保持不变。v2 证据行对 ≥26.1027 落账为"不匹配"，
 ///   必须作废重识别。
-pub const CONTRACT_RULE_VERSION: u32 = 3;
+/// * 4 — 拒绝内联题目标识中回调形参遮蔽来源标识；旧证据须重新识别。
+pub const CONTRACT_RULE_VERSION: u32 = 4;
 
 /// 逐操作键（spec §3.1：消息、命令审批、文件审批、阻塞答题、异步空闲答题、
 /// 请求级取消、回合打断、权限与模式分别判断）。
@@ -1141,7 +1142,7 @@ mod tests {
     /// v2 证据行对该 build 落账为"不匹配"。
     #[test]
     fn contract_rule_version_bumped_for_structural_async_rule() {
-        assert_eq!(CONTRACT_RULE_VERSION, 3);
+        assert_eq!(CONTRACT_RULE_VERSION, 4);
     }
 
     /// 已识别（包已读、规则已跑）但本操作无匹配 → `operation_contract_unmatched`

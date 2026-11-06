@@ -976,7 +976,7 @@ fn inline_synthesis_bound(hay: &str) -> bool {
     let needle = format!("JSON.stringify([\"{ASYNC_QUESTION_ID_TAG}\",");
     hay.match_indices(HEAD).any(|(idx, _)| {
         // map 回调形参 (X, N)
-        let Some((_, e_x)) = ident_at(hay, idx + HEAD.len()) else {
+        let Some((element, e_x)) = ident_at(hay, idx + HEAD.len()) else {
             return false;
         };
         if !hay[e_x..].starts_with(',') {
@@ -1011,6 +1011,10 @@ fn inline_synthesis_bound(hay: &str) -> bool {
             return false;
         };
         if item.is_empty() || !item.chars().next().is_some_and(is_ident_start) {
+            return false;
+        }
+        let root = item.split('.').next().unwrap_or_default();
+        if element == index || root == element || root == index {
             return false;
         }
         window_before(hay, idx, 64).ends_with(&format!("({item}.questions??[])"))
@@ -1179,6 +1183,86 @@ fn match_operations(candidates: &[(String, String)]) -> BTreeMap<CodexOperation,
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn pr202_full_contract_accepts_derived_slice_and_bound_inline() {
+        let removed = ASYNC_ENVELOPE_20261028.replace(
+            "function bSe(e,t){return JSON.stringify([`request_user_input_async`,e,t])}",
+            "",
+        );
+        assert_ne!(removed, ASYNC_ENVELOPE_20261028);
+        let envelope = removed.replace("r.slice(34,-35)", "r.slice(_Se.length,-vSe.length)");
+        assert_ne!(envelope, removed);
+        let callsite = "var q=(e.questions??[]).map((t,r)=>JSON.stringify([`request_user_input_async`,e.id,r]));";
+        let dir = tempfile::tempdir().unwrap();
+        let evidence = evidence_20261028(
+            dir.path(),
+            "pr202-bound.asar",
+            &main_js_20261028_with(
+                START_TURN_HANDLER_20261028,
+                &envelope,
+                callsite,
+                STRING_WITNESS_20261028,
+            ),
+            VERSION_TABLE_20261028,
+        );
+        assert!(evidence.matched(CodexOperation::AsyncAnswerIdle));
+        assert!(evidence.matched(CodexOperation::CommandApproval));
+    }
+
+    #[test]
+    fn pr202_inline_synthesis_checks_lexical_binding() {
+        let cases = [
+            (
+                r#"(e.questions??[]).map((t,r)=>JSON.stringify(["request_user_input_async",e.id,r]))"#,
+                true,
+            ),
+            (
+                r#"(e.questions??[]).map((e,r)=>JSON.stringify(["request_user_input_async",e.id,r]))"#,
+                false,
+            ),
+            (
+                r#"(holder.e.questions??[]).map((holder,r)=>JSON.stringify(["request_user_input_async",holder.e.id,r]))"#,
+                false,
+            ),
+            (
+                r#"(e.questions??[]).map((t,r)=>JSON.stringify(["request_user_input_async",r.id,r]))"#,
+                false,
+            ),
+            (
+                r#"(holder.e.questions??[]).map((t,r)=>JSON.stringify(["request_user_input_async",holder.e.id,r]))"#,
+                true,
+            ),
+        ];
+        for (js, expected) in cases {
+            assert_eq!(inline_synthesis_bound(&normalize(js)), expected, "{js}");
+        }
+    }
+    #[test]
+    fn pr202_full_contract_rejects_shadowed_inline_synthesis() {
+        let envelope = ASYNC_ENVELOPE_20261028
+            .replace(
+                "function bSe(e,t){return JSON.stringify([`request_user_input_async`,e,t])}",
+                "",
+            )
+            .replace("r.slice(34,-35)", "r.slice(_Se.length,-vSe.length)");
+        assert_ne!(envelope, ASYNC_ENVELOPE_20261028);
+        let callsite = "var q=(e.questions??[]).map((e,r)=>JSON.stringify([`request_user_input_async`,e.id,r]));";
+        let dir = tempfile::tempdir().unwrap();
+        let evidence = evidence_20261028(
+            dir.path(),
+            "pr202-shadow.asar",
+            &main_js_20261028_with(
+                START_TURN_HANDLER_20261028,
+                &envelope,
+                callsite,
+                STRING_WITNESS_20261028,
+            ),
+            VERSION_TABLE_20261028,
+        );
+        assert!(!evidence.matched(CodexOperation::AsyncAnswerIdle));
+        assert!(evidence.matched(CodexOperation::CommandApproval));
+    }
+
     use super::*;
     use crate::services::codex_desktop_ipc::probe::fingerprint::ProbeKey;
     use crate::services::codex_desktop_ipc::transport::DesktopEndpoint;

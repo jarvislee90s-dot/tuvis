@@ -44,18 +44,18 @@ tuvis.db: codex_ipc_contract_evidence 表 0 行   ← 该机器从未成功识�
 
 实测（`C:\Program Files\WindowsApps\OpenAI.Codex_26.1029.7803.0_x64__2p2nqsd0c76g0`）：
 
-| 路径 | 状态 |
-|---|---|
-| `app\resources\codex-cli\` | **不存在** |
-| `app\resources\codex.exe` | 37 MB ✅ |
-| `app\resources\codex` | 319 MB（单文件版） |
+| 路径                       | 状态               |
+| -------------------------- | ------------------ |
+| `app\resources\codex-cli\` | **不存在**         |
+| `app\resources\codex.exe`  | 37 MB ✅           |
+| `app\resources\codex`      | 319 MB（单文件版） |
 
 ### 2.2 版本号双体系（易误导）
 
-| 显示位置 | 值 |
-|---|---|
-| 界面「版本」 | `26.1029.61003`（来自 `app\resources\owl-app.ini` 的 `AppVersion=`） |
-| **MSIX `AppxManifest.xml` Identity** | **`26.1029.7803.0`** ← `profile_for()` 走这个 |
+| 显示位置                             | 值                                                                   |
+| ------------------------------------ | -------------------------------------------------------------------- |
+| 界面「版本」                         | `26.1029.61003`（来自 `app\resources\owl-app.ini` 的 `AppVersion=`） |
+| **MSIX `AppxManifest.xml` Identity** | **`26.1029.7803.0`** ← `profile_for()` 走这个                        |
 
 排查时必须以 MSIX 版本为准。
 
@@ -63,9 +63,9 @@ tuvis.db: codex_ipc_contract_evidence 表 0 行   ← 该机器从未成功识�
 
 用 Node 只读解析 `app.asar`（720 MB），**先用仓库 20261028 夹具做阳性对照**确认解析器可信，再在真机包上比对：
 
-| 条件 | v2 要求 | 真机 26.1029.7803.0 实际 |
-|---|---|---|
-| 信封解包切片 | 字面 `slice(34,-35)` | `slice(Sc.length,-Sd.length)`（标记绑定推导） |
+| 条件         | v2 要求                                                  | 真机 26.1029.7803.0 实际                                                     |
+| ------------ | -------------------------------------------------------- | ---------------------------------------------------------------------------- |
+| 信封解包切片 | 字面 `slice(34,-35)`                                     | `slice(Sc.length,-Sd.length)`（标记绑定推导）                                |
 | 题目标识合成 | `function F(P1,P2){return JSON.stringify(...)}` + 调用点 | 内联进 map 箭头 `(e.questions??[]).map((t,r)=>JSON.stringify([...,e.id,r]))` |
 
 **能力本身完整**：信封、守卫、schema、合成、carrier 全链在场，与 26.1023 语义等价。
@@ -109,27 +109,27 @@ let legacy = resources.join("codex-cli").join("bin").join("codex.exe");    // �
 
 ### 自动化
 
-| 用例 | 断言 |
-|---|---|
-| `cli_path_accepts_both_windows_layouts` | 新布局命中 / 旧布局命中 / 两者皆无 → None |
-| `async_contract_accepts_derived_slice_lengths` | `slice(Sc.length,-Sd.length)` 形态匹配成功 |
-| `async_contract_accepts_inline_question_id_synthesis` | 内联形态匹配成功 |
-| `async_contract_rejects_inline_with_index_derived_item` | **阴性锁**：内联但第二元素取 index → 拒绝 |
-| `contract_rule_version_bumped_for_structural_async_rule` | 版本 = 3 |
+| 用例                                                     | 断言                                       |
+| -------------------------------------------------------- | ------------------------------------------ |
+| `cli_path_accepts_both_windows_layouts`                  | 新布局命中 / 旧布局命中 / 两者皆无 → None  |
+| `async_contract_accepts_derived_slice_lengths`           | `slice(Sc.length,-Sd.length)` 形态匹配成功 |
+| `async_contract_accepts_inline_question_id_synthesis`    | 内联形态匹配成功                           |
+| `async_contract_rejects_inline_with_index_derived_item`  | **阴性锁**：内联但第二元素取 index → 拒绝  |
+| `contract_rule_version_bumped_for_structural_async_rule` | 当前版本 = 4；旧 v3 证据需重新识别         |
 
 `cargo test --lib codex_desktop_ipc`：**298 passed, 0 failed**。
 
 ## 5. 真机验收（待执行）
 
-前置：重启 Tuvis（使新规则生效，并让契约证据按 v3 重探）。
+前置：重启 Tuvis（使新规则生效，并让契约证据按当前 v4 重探）。
 
 ### 5.1 契约识别恢复
 
-| 项 | 期望 |
-|---|---|
-| `mam.log` 中 `codex-ipc contract` 行 | 不再出现 `contract_package_unavailable` |
+| 项                                                   | 期望                                                  |
+| ---------------------------------------------------- | ----------------------------------------------------- |
+| `mam.log` 中 `codex-ipc contract` 行                 | 不再出现 `contract_package_unavailable`               |
 | `~/.tuvis/tuvis.db` 的 `codex_ipc_contract_evidence` | 出现 `windows\|26.1029.7803.0\|0.166.0-alpha.6\|1` 行 |
-| 移动端卡片 | 不再显示「未匹配契约」，按钮可提交 |
+| 移动端卡片                                           | 不再显示「未匹配契约」，按钮可提交                    |
 
 ### 5.2 「正式提交 → Desktop 原卡撤下」闭环
 
@@ -146,11 +146,11 @@ let legacy = resources.join("codex-cli").join("bin").join("codex.exe");    // �
 
 ### 5.3 收纳与恢复
 
-| 步骤 | 期望 |
-|---|---|
+| 步骤                      | 期望                                       |
+| ------------------------- | ------------------------------------------ |
 | 点「在 Tuvis 中收纳本组」 | 卡片立即隐藏，dock 顶部出现「已收纳 1 组」 |
-| 点「恢复显示」 | 卡片重新出现，草稿仍在 |
-| 桌面该会话产生新回合 | 旧收纳不影响新题（新 key） |
+| 点「恢复显示」            | 卡片重新出现，草稿仍在                     |
+| 桌面该会话产生新回合      | 旧收纳不影响新题（新 key）                 |
 
 ## 6. 已知限制
 
@@ -187,7 +187,7 @@ let legacy = resources.join("codex-cli").join("bin").join("codex.exe");    // �
    的成员检查）：题干条目被 Desktop 尾窗淘汰后，作答信封因键不匹配被静默丢弃
    → 永远派生不出 `Answered` → hint 永久滞留 `pending`。
 2. **persist 只有一个调用点**（`adapter.rs:4730`，在 `projection()` 尾部）：
-   SSE 推送路径（`publish_projection`）不落库 → 桌面答题后视图实时清了，
+   正常状态帧推送路径（`handle_state_changed`）不落库 → 桌面答题后视图实时清了，
    但 DB hint 滞后；页面未开该会话时无限期。
 
 ### 修复
@@ -204,19 +204,20 @@ let legacy = resources.join("codex-cli").join("bin").join("codex.exe");    // �
 
 **L2 — SSE 路径也写穿 hint**（`adapter.rs`）
 
-- `publish_projection` 发布前补 `persist_interaction_hints`（复用既有方法，
-  自带「fact 未变不写」去重；镜像锁已释放，锁纪律不变）。
+- 正常 `handle_state_changed` 路径投影前在镜像锁外加载历史提示；发布前调用
+  `persist_interaction_hints` 写穿（fact 未变不写）。初始化与写穿由异步闸串行，
+  读取失败不标记已加载。首次广播可据同线程正式信封核销窗口外旧题。
 
 ### 新增测试（`async_question.rs`）
 
-| 用例 | 断言 |
-|---|---|
-| `hint_derived_key_matches_envelope_after_question_scrolled_out` | 题干不在窗口 + 信封在 → `Answered` |
-| `hint_only_question_without_envelope_yields_unknown_not_pending` | 无信封 → `Unknown`（非 `Pending`），不可提交 |
-| `visible_question_still_pending_when_coverage_complete` | **回归锁**：可见题仍 `Pending` + `actionable` |
-| `visible_question_unaffected_by_other_hints` | 多题并存时旧题收口不影响新题 |
+| 用例                                                             | 断言                                          |
+| ---------------------------------------------------------------- | --------------------------------------------- |
+| `hint_derived_key_matches_envelope_after_question_scrolled_out`  | 题干不在窗口 + 信封在 → `Answered`            |
+| `hint_only_question_without_envelope_yields_unknown_not_pending` | 无信封 → `Unknown`（非 `Pending`），不可提交  |
+| `visible_question_still_pending_when_coverage_complete`          | **回归锁**：可见题仍 `Pending` + `actionable` |
+| `visible_question_unaffected_by_other_hints`                     | 多题并存时旧题收口不影响新题                  |
 
-`cargo test --lib codex_desktop_ipc`：**302 passed**（原 298 + 4）。
+历史结果：`cargo test --lib codex_desktop_ipc` 曾为 302 passed。本批当前结果见下方补充。
 
 ### 剩余边界（L1 无法覆盖，手动收纳仍是出口）
 
@@ -224,3 +225,39 @@ let legacy = resources.join("codex-cli").join("bin").join("codex.exe");    // �
   → Tuvis 无法确认已答，按纪律不猜。
 - **IPC 漏帧且镜像从不重取**（`ensure_thread` 对新鲜镜像短路）→ 信封根本没进镜像。
 - **信封与题干都滑出窗口** → 无证据可配对。
+
+### 2026-11-05 PR #202 A 批补充
+
+- A1：首次状态投影前加载历史提示，并串行化加载和写穿；假连接首次广播验证旧题正式核销、新题保留及提示落库。
+- A2：手动收纳保留组组件与当前页面草稿、选项和动作锚；组换代及线程切换各自隔离。
+- A3：拒绝回调形参遮蔽题目来源的内联表达式，契约规则升为 v4，旧证据重新识别。
+- 自动测试：`cargo test --lib codex_desktop_ipc` 312 passed / 1 ignored；
+  `cargo test --test codex_desktop_ipc` 104 passed；前端两套件 67 passed。
+  远程集成套件最终复跑 **266 passed**。此前两项 SSE 测试在本批及同机基线均失败：测试误以为缓存命中后必有两次重发布，实际只发生一次，竞态钩子未触发；调整为拦截首次重发布后，两项定向及整套通过，禁用后不回退断言保持不变。另一次全套运行的 `stop_reconnect_and_late_worker_preserve_other_consumers` 超时，单独复跑及最终全套均通过，仍按时序不稳定记录。
+- `pnpm check` 通过（ESLint 5 条警告），`pnpm build:mobile` 通过；`cargo clippy --lib -- -D warnings` 通过。
+- 隔离 Desktop / 手机真机验收：未执行；本记录的自动化结果不能替代正式答题与原卡收敛证据。
+- 慢库隔离、写入失败重试、历史补读及语义识别仍属于手册 B/C 后续独立批次。
+
+### 隔离环境验收（2026-11-05）
+
+Windows 隔离验收构建使用单独的 Tuvis 数据目录和 WebView 配置，并在验收副本中禁用 Hook 注册、Skill 补链、用量采集等无关启动副作用；因此该构建不是未经修改的发布包。Codex Desktop 26.1029.7803.0 的当前包通过只读契约识别；隔离数据库中 `async_answer_idle` 证据规则版本为 4，包 SHA-256 前缀为 `77ed4ddc5b38`。移动页面适配详情显示该能力契约匹配，但当时存在原生阻塞提问，故不可提交异步答题。
+
+隔离验收随后以本机浏览器模拟移动端，在专用 Test 聊天生成一题异步选择题：选项收纳并恢复后保持选中；一次提交后移动卡消失，原会话存在同题标识的正式答复，模型按答案继续，隔离 hints 行更新为 `answered`。随后在 Desktop 专用聊天直接核对，原题已收起；本次浏览器代替手机，且使用屏蔽启动副作用的验收构建，不能表述为发布包及实体手机全面验收通过。其余场景的后续结果和限制见下。
+
+隔离版重启后重新进入同一测试聊天，已回答题未重新显示为待答卡，聊天中仍可见正式答复及模型回复。此检查未构造旧题滑出历史窗口并与新题并存的情况，不替代该场景的完整验收。
+
+同一专用聊天随后生成一组两题异步问题；发题回合完成后仍显示待答。第一题输入自由文本后收纳、恢复，原稿保留。用户在 Desktop 原生提交整组后，已打开的移动页面无需手动刷新即移除待答卡；原会话中的正式答复覆盖两个精确题目身份，隔离 hints 的两条记录均为 `answered`。这验证了该版本的 Desktop 先答和自由稿恢复；两道题属于同一组，不作为独立新组换代证据。
+
+新组换代检查：先在移动页面选中旧题并收纳；随后用户关闭 Desktop 旧题并在新回合生成另一道异步题。移动页面仍有旧组收纳入口，新题独立可见且无旧选项。隔离库中两题提示均为 `pending`，未因回合结束或关闭原卡伪造已答；本次未在 Desktop 保持旧原卡打开，不能据此声称验证了该变体。
+
+经用户授权，在专用聊天追加两轮不回答测试题的短回合后，Desktop 仍显示该未答原题；但隔离版重启后将该聊天列为历史，移动端未建立实时连接，不能据此认定移动端仍显示待答。旧题滑出 Desktop 实际历史窗口的场景未构造，仍待验；不能把消息列表的截断等同于事实历史窗口截断。
+
+### 未完成实机场景的自动证据（2026-11-05）
+
+| 场景                 | 本轮自动检查                                                                                                                                           | 边界                                          |
+| -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------- |
+| 窗口外旧题与新题并存 | `pr202_first_snapshot_reconciles_old_answer`：1 passed；假连接首帧核销旧题、保留新题并写入提示                                                         | 模拟历史窗口，不是 Desktop 真机窗口截断       |
+| 未答跨回合及缺失证据 | `async_question::tests`：13 passed，含完成回合后未答保留与历史缺口 Unknown；`hint_only_question_without_envelope_yields_unknown_not_pending`：1 passed | 自动投影证据，不能替代断链／缺页真机验收      |
+| 窗口外题目配对       | `hint_derived_key_matches_envelope_after_question_scrolled_out`：1 passed                                                                              | 函数级模拟，不证明真实 Desktop 的历史窗口形态 |
+
+按用户要求，后续不再进行电脑操控；未完成的实体手机和真实窗口边界保留待验。

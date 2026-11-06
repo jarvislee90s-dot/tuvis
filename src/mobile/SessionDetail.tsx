@@ -606,18 +606,15 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
         )
       ),
     }));
-    const visibleGroups = groups.filter(
-      (group) =>
-        !group.isArchived && (group.live.length > 0 || (group.hasAnchor && !group.allAnswered))
+    const retainedGroups = groups.filter(
+      (group) => group.live.length > 0 || (group.hasAnchor && !group.allAnswered)
     );
-    // 已收纳组（仅本机隐藏）：单独回传，供"恢复"入口撤销误收纳。
-    const archivedGroups = groups.filter(
-      (group) =>
-        group.isArchived && (group.live.length > 0 || (group.hasAnchor && !group.allAnswered))
-    );
+    const visibleGroups = retainedGroups.filter((group) => !group.isArchived);
+    const archivedGroups = retainedGroups.filter((group) => group.isArchived);
     return {
       pending,
       groups: visibleGroups,
+      retainedGroups,
       archivedGroups,
       count: pending.length + visibleGroups.length,
     };
@@ -1795,11 +1792,11 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
                     ))}
                 </div>
               )}
-              {inbox.groups.map((group) => (
+              {inbox.retainedGroups.map((group) => (
                 <div
                   key={`codex-group-panel-${session.id}-${group.key}`}
                   data-testid={`codex-group-panel-${group.key}`}
-                  hidden={group.key !== activeGroup?.key}
+                  hidden={group.isArchived || group.key !== activeGroup?.key}
                 >
                   <AsyncQuestionGroupCard
                     sessionId={session.id}

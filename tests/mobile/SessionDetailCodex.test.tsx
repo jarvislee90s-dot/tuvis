@@ -1505,3 +1505,168 @@ describe("R07：详情同源 + 真实重连展示", () => {
     );
   });
 });
+
+describe("PR202 手动收纳与恢复", () => {
+  beforeEach(() => {
+    window.sessionStorage.clear();
+    installFetch();
+  });
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+    window.sessionStorage.clear();
+  });
+
+  it("pr202_archive_restore_preserves_draft", async () => {
+    render(<SessionDetail session={makeSession()} onBack={() => {}} />);
+    const es = await waitFor(() => MockEventSource.latest());
+    const question = {
+      questionKey: "q-pr202",
+      contextToken: "ctx-pr202",
+      sourceTurnId: "turn-pr202",
+      sourceItemId: "item-pr202",
+      questionIndex: 0,
+      title: "选一个",
+      options: ["甲"],
+      state: "pending",
+      actionable: true,
+      disabledReasonCode: null,
+    };
+    emit(es, "snapshot", projection({ asyncQuestions: [question] }));
+    const dock = await screen.findByTestId("codex-dock-cards");
+    fireEvent.click(within(dock).getByTestId("codex-async-free-toggle"));
+    fireEvent.change(within(dock).getByTestId("codex-async-free"), {
+      target: { value: "收纳前的草稿" },
+    });
+    fireEvent.click(within(dock).getByTestId("codex-async-archive"));
+    fireEvent.click(await screen.findByTestId("codex-archived-groups"));
+    if (!within(dock).queryByTestId("codex-async-free")) {
+      fireEvent.click(within(dock).getByTestId("codex-async-free-toggle"));
+    }
+    expect((within(dock).getByTestId("codex-async-free") as HTMLInputElement).value).toBe(
+      "收纳前的草稿"
+    );
+  });
+  it("pr202_archived_answered_group_retires", async () => {
+    window.sessionStorage.setItem("codex:group:sess-codex:turn-pr202:item-pr202", "act-old");
+    render(<SessionDetail session={makeSession()} onBack={() => {}} />);
+    const es = await waitFor(() => MockEventSource.latest());
+    const question = {
+      questionKey: "q-pr202",
+      contextToken: "ctx-pr202",
+      sourceTurnId: "turn-pr202",
+      sourceItemId: "item-pr202",
+      questionIndex: 0,
+      title: "选一个",
+      options: ["甲"],
+      state: "pending",
+      actionable: true,
+      disabledReasonCode: null,
+    };
+    emit(es, "snapshot", projection({ asyncQuestions: [question] }));
+    fireEvent.click(await screen.findByTestId("codex-async-archive"));
+    expect(await screen.findByTestId("codex-archived-groups")).toBeTruthy();
+    expect(window.sessionStorage.getItem("codex:group:sess-codex:turn-pr202:item-pr202")).toBe(
+      "act-old"
+    );
+    fireEvent.click(screen.getByTestId("codex-archived-groups"));
+    expect(window.sessionStorage.getItem("codex:group:sess-codex:turn-pr202:item-pr202")).toBe(
+      "act-old"
+    );
+    fireEvent.click(screen.getByTestId("codex-async-archive"));
+    emit(
+      es,
+      "snapshot",
+      projection({
+        revision: 6,
+        asyncQuestions: [{ ...question, state: "answered", actionable: false }],
+      })
+    );
+    await waitFor(() => expect(screen.queryByTestId("codex-archived-groups")).toBeNull());
+    expect(
+      window.sessionStorage.getItem("codex:group:sess-codex:turn-pr202:item-pr202")
+    ).toBeNull();
+  });
+  it("pr202_choice_archive_is_display_only_and_new_group_visible", async () => {
+    render(<SessionDetail session={makeSession()} onBack={() => {}} />);
+    const es = await waitFor(() => MockEventSource.latest());
+    const question = {
+      questionKey: "q-old",
+      contextToken: "ctx-old",
+      sourceTurnId: "turn-old",
+      sourceItemId: "item-old",
+      questionIndex: 0,
+      title: "旧题",
+      options: ["甲"],
+      state: "pending",
+      actionable: true,
+      disabledReasonCode: null,
+    };
+    emit(es, "snapshot", projection({ asyncQuestions: [question] }));
+    fireEvent.click(await screen.findByRole("button", { name: "甲" }));
+    const writes = () =>
+      fetchMock!.mock.calls.filter(([, init]) => {
+        const method = (init as RequestInit | undefined)?.method?.toUpperCase();
+        return method && method !== "GET";
+      }).length;
+    const before = writes();
+    fireEvent.click(screen.getByTestId("codex-async-archive"));
+    const archived = await screen.findByTestId("codex-archived-groups");
+    expect(screen.queryByRole("button", { name: "甲" })).toBeNull();
+    fireEvent.click(archived);
+    expect(screen.getByRole("button", { name: "甲" }).getAttribute("aria-pressed")).toBe("true");
+    expect(writes()).toBe(before);
+    fireEvent.click(screen.getByTestId("codex-async-archive"));
+    emit(
+      es,
+      "snapshot",
+      projection({
+        revision: 6,
+        asyncQuestions: [
+          question,
+          {
+            ...question,
+            questionKey: "q-new",
+            contextToken: "ctx-new",
+            sourceTurnId: "turn-new",
+            sourceItemId: "item-new",
+            title: "新题",
+            options: ["乙"],
+          },
+        ],
+      })
+    );
+    expect(await screen.findByRole("button", { name: "乙" })).toBeTruthy();
+    expect(writes()).toBe(before);
+  });
+  it("pr202_group_does_not_leak_between_sessions", async () => {
+    const { rerender } = render(<SessionDetail session={makeSession()} onBack={() => {}} />);
+    const es = await waitFor(() => MockEventSource.latest());
+    const question = {
+      questionKey: "q-same",
+      contextToken: "ctx-same",
+      sourceTurnId: "turn-same",
+      sourceItemId: "item-same",
+      questionIndex: 0,
+      title: "题目",
+      options: ["甲"],
+      state: "pending",
+      actionable: true,
+      disabledReasonCode: null,
+    };
+    emit(es, "snapshot", projection({ asyncQuestions: [question] }));
+    fireEvent.click(await screen.findByRole("button", { name: "甲" }));
+    fireEvent.click(screen.getByTestId("codex-async-archive"));
+    expect(await screen.findByTestId("codex-archived-groups")).toBeTruthy();
+    rerender(<SessionDetail session={makeSession({ id: "sess-other" })} onBack={() => {}} />);
+    const next = await waitFor(() => {
+      const latest = MockEventSource.latest();
+      expect(latest).not.toBe(es);
+      return latest;
+    });
+    emit(next, "snapshot", projection({ asyncQuestions: [question] }));
+    const choice = await screen.findByRole("button", { name: "甲" });
+    expect(choice.getAttribute("aria-pressed")).toBe("false");
+    expect(screen.queryByTestId("codex-archived-groups")).toBeNull();
+  });
+});
