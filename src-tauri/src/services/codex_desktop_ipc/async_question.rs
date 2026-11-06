@@ -270,7 +270,10 @@ fn analyze_answer_witnesses(
                 }
                 match object.get("type").and_then(Value::as_str) {
                     Some("agentMessage") => {
-                        if let Some(qs) = object.get("questions") {
+                        // 真机 26.1029.7803.0：普通 agentMessage 也带 questions 键
+                        // （显式 null）。缺省与显式 null 同义——该条消息没有题目，
+                        // 继续扫描；非 null 的非法类型仍按既有严格判定失效。
+                        if let Some(qs) = object.get("questions").filter(|value| !value.is_null()) {
                             let qs = qs.as_array()?;
                             for (index, q) in qs.iter().enumerate() {
                                 if !q.is_object() || index > u32::MAX as usize {
@@ -787,16 +790,6 @@ impl AsyncQuestionProjector {
                 question.turn_index,
                 view.strict_gap_after_turn(&question.source_turn_id),
             );
-            // H08：提示只是"历史缺页时的保守占位"——**当前证据完整且没有正式答复**
-            // 时必须纠偏回可答（否则暂缺一次就永久锁题）。提示继续用于：当前窗口
-            // 发现不到题（占位）与覆盖不完整（Unknown）。
-            let _hinted_unknown = hints.iter().any(|hint| {
-                hint.thread_id == key.thread_id
-                    && hint.source_turn_id == question.source_turn_id
-                    && hint.source_item_id == question.source_item_id
-                    && hint.question_index == question.question_index
-                    && hint.last_fact == "unknown"
-            });
             let (state, actionable, disabled_reason_code) = if answered {
                 (InteractionState::Answered, false, None)
             } else if ambiguous_answer || malformed_envelope || invalid_history {
@@ -818,20 +811,13 @@ impl AsyncQuestionProjector {
                             )
                         }
                     }
-                    AnswerCoverage::Incomplete => (
-                        InteractionState::Unknown,
-                        false,
-                        Some(super::reason_code::ASYNC_HISTORY_INCOMPLETE.to_string()),
-                    ),
-                    AnswerCoverage::Unknown => (
+                    AnswerCoverage::Incomplete | AnswerCoverage::Unknown => (
                         InteractionState::Unknown,
                         false,
                         Some(super::reason_code::ASYNC_HISTORY_INCOMPLETE.to_string()),
                     ),
                 }
             };
-            // 持久提示（重启后"已知但未加载"）：最后事实是 unknown 的题保持
-            // 保守 Unknown——不因当前页恰好完整就重新放行（提示是历史事实）。
             // R18：token 绑定 本次 boot nonce ＋ owner 世系 ＋ 题目内容版本
             //（title/options 变化也换 token，旧卡不得批准新内容）。
             let token_material = format!(
@@ -1693,6 +1679,157 @@ mod tests {
                 assert!(!view.actionable);
             }
         }
+    }
+
+    // ------------------------------------------------------------------
+    // 真机 26.1029.7803.0 回归（2026-11-06）：普通 agentMessage 携带
+    // `questions: null`，后续 agentMessage 仍可携带结构化异步题。修前
+    // `as_array()?` 让整条历史分析返回 None → invalid_history → 全线程题
+    // Unknown（远程端无卡）；修后 null 与缺省同义（该条消息没有题目）。
+
+    fn plain_agent_message_with_null_questions() -> Value {
+        json!({
+            "type": "agentMessage",
+            "id": "call-plain",
+            "text": "普通回复",
+            "phase": "final_answer",
+            "questions": null,
+        })
+    }
+
+    /// questions:null 普通消息不再使历史分析失效：结构化题恢复 Pending + actionable。
+    #[test]
+    fn null_questions_agent_message_does_not_invalidate_history() {
+        let state = canonical(
+            &[
+                (
+                    "turn-1",
+                    "completed",
+                    vec![
+                        user_item("u-1", "在吗"),
+                        plain_agent_message_with_null_questions(),
+                    ],
+                    None,
+                    None,
+                ),
+                (
+                    "turn-2",
+                    "completed",
+                    vec![question_item("call-q", "选一个", &["a", "b"])],
+                    None,
+                    None,
+                ),
+            ],
+            true,
+        );
+        let views = AsyncQuestionProjector.project(&key(), None, &state, &ops_allowing_async());
+        assert_eq!(views.len(), 1, "questions:null 普通消息不得吞掉结构化题");
+        assert_eq!(views[0].state, InteractionState::Pending);
+        assert!(views[0].actionable);
+        assert_eq!(views[0].disabled_reason_code, None);
+    }
+
+    /// 同型历史下，与正确选项逐字符相同的普通聊天文本不核销题目。
+    #[test]
+    fn null_questions_history_plain_option_text_is_not_answer() {
+        let state = canonical(
+            &[
+                (
+                    "turn-1",
+                    "completed",
+                    vec![
+                        user_item("u-1", "在吗"),
+                        plain_agent_message_with_null_questions(),
+                    ],
+                    None,
+                    None,
+                ),
+                (
+                    "turn-2",
+                    "completed",
+                    vec![question_item("call-q", "选一个", &["a", "b"])],
+                    None,
+                    None,
+                ),
+                (
+                    "turn-3",
+                    "completed",
+                    vec![user_item("u-3", "a")],
+                    None,
+                    None,
+                ),
+            ],
+            true,
+        );
+        let views = AsyncQuestionProjector.project(&key(), None, &state, &ops_allowing_async());
+        assert_eq!(views.len(), 1);
+        assert_eq!(
+            views[0].state,
+            InteractionState::Pending,
+            "普通文本（即使与正确选项相同）≠ 正式答复"
+        );
+        assert!(views[0].actionable);
+    }
+
+    /// 同型历史下，精确 questionItemId 的正式答复只核销对应题，另一道未答题保留待答。
+    #[test]
+    fn null_questions_history_envelope_answers_only_target_question() {
+        let envelope = compose_async_answer("call-q1", 0, "选一个", "a");
+        let state = canonical(
+            &[
+                (
+                    "turn-1",
+                    "completed",
+                    vec![
+                        user_item("u-1", "在吗"),
+                        plain_agent_message_with_null_questions(),
+                    ],
+                    None,
+                    None,
+                ),
+                (
+                    "turn-2",
+                    "completed",
+                    vec![question_item("call-q1", "选一个", &["a", "b"])],
+                    None,
+                    None,
+                ),
+                (
+                    "turn-3",
+                    "completed",
+                    vec![user_item("u-3", "随便聊聊")],
+                    None,
+                    None,
+                ),
+                (
+                    "turn-4",
+                    "completed",
+                    vec![question_item("call-q2", "再选一个", &["c", "d"])],
+                    None,
+                    None,
+                ),
+                (
+                    "turn-5",
+                    "completed",
+                    vec![user_item("u-5", &envelope)],
+                    None,
+                    None,
+                ),
+            ],
+            true,
+        );
+        let views = AsyncQuestionProjector.project(&key(), None, &state, &ops_allowing_async());
+        assert_eq!(views.len(), 2);
+        let by_key: std::collections::HashMap<String, &_> = views
+            .iter()
+            .map(|view| (view.question_key.clone(), view))
+            .collect();
+        let answered = &by_key[&question_item_id("call-q1", 0)];
+        assert_eq!(answered.state, InteractionState::Answered);
+        assert!(!answered.actionable);
+        let untouched = &by_key[&question_item_id("call-q2", 0)];
+        assert_eq!(untouched.state, InteractionState::Pending);
+        assert!(untouched.actionable);
     }
 }
 
