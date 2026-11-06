@@ -13,6 +13,17 @@ English · [中文](CHANGELOG.md)
 _Only versions translated so far are listed here; the full history lives in the
 [Chinese changelog](CHANGELOG.md)._
 
+## [0.6.6] - 2026-11-06
+
+### Fixed
+
+- **Codex Desktop async answers**: recognise both Windows installation layouts and newer question ID syntax. On 26.1103.3517.0, submitting a formal answer on either side dismisses the matching card on the other side.
+- **Question visibility and archiving**: an empty question field on a regular assistant message no longer hides pending cards. Formal answers are matched by conversation and question ID. Archive and restore older groups on the remote page while keeping its drafts.
+
+### Engineering
+
+- **Answer state reliability**: migrate existing hints, use observation versions and an owner commit fence to reject late writes, and reject replay of invalidated answers. Add IPC, SQLite, contract-shape, and mobile regression coverage.
+
 ## [0.6.5] - 2026-11-04
 
 ### Added

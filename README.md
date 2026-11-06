@@ -100,7 +100,7 @@ Single maintained source: [`docs/capabilities.json`](docs/capabilities.json), sh
 | ZCode remote control (official bridge) | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ | ❌ | ❌ |
 | Output speed (TPS sampling) | ◐ approximate | ◐ response only | ◐ plugin | ✅ | ✅ | ✅ | ✅ | ❌ |
 
-The Codex column covers both CLI and APP; Desktop APP control has its own row and is gated per operation by contract evidence.
+The Codex column covers both CLI and APP; Desktop APP control has its own row and is gated per operation by contract evidence. Bidirectional idle async answers are verified on Windows 26.1103.3517.0.
 
 <!-- capabilities:end -->
 
