@@ -42,11 +42,25 @@ import PendingRequestCard, { CodexAvailabilityBanner } from "./PendingRequestCar
 import AsyncQuestionGroupCard from "./AsyncQuestionGroupCard";
 import CodexOperationToolbar from "./CodexOperationToolbar";
 import CodexAdaptSheet from "./CodexAdaptSheet";
+import QuestionSkipControls from "./QuestionSkipControls";
 import {
   fetchCodexAdaptStatus,
   updateCodexAdaptSettings,
   type CodexAsyncQuestionView,
 } from "./codexIpcApi";
+import {
+  groupIdentityKey,
+  type GroupDisplayView,
+  type QuestionDisplayDecision,
+  type QuestionDisplayGroupView,
+  type QuestionSkipBodyObservation,
+  type QuestionSkipUnifiedFact,
+} from "./codexQuestionSkipApi";
+import {
+  buildQuestionSkipFactsSnapshot,
+  getAcceptedQuestionSkipReceipts,
+  subscribeAcceptedQuestionSkipReceipts,
+} from "./questionSkipOperations";
 import {
   retainCapabilityDisplay,
   sameDisplayCache,
@@ -434,6 +448,48 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
   const [activeGroupKey, setActiveGroupKey] = useState<string | null>(null);
   // T04（spec §3.2）：其余有效组收进唯一「另有 N 组」入口的展开态（切换组后自动收起）。
   const [otherGroupsOpen, setOtherGroupsOpen] = useState(false);
+  // T4（B6-04）：即时卡「跳过（仅 Tuvis）」的本地收起态——按
+  // sessionId/requestKey/contextToken 归属，sessionStorage 只写收起标记
+  // （无题号/草稿；与异步 group-archived、答题 action 锚前缀不同）。页面状态
+  // 与 storage 同步更新；刷新后同代请求读标记保持收起，展开为首题空稿。
+  const [pendingCollapsed, setPendingCollapsed] = useState<Record<string, boolean>>({});
+  const pendingCollapseKey = useCallback(
+    (requestKey: string, contextToken: string) =>
+      `codex:pending-collapsed:${session.id}:${requestKey}:${contextToken}`,
+    [session.id]
+  );
+  const pendingSkip = useCallback(
+    (requestKey: string, contextToken: string) => {
+      const marker = pendingCollapseKey(requestKey, contextToken);
+      window.sessionStorage.setItem(marker, "1");
+      justCollapsedMarker.current = marker;
+      setPendingCollapsed((prev) => ({ ...prev, [marker]: true }));
+    },
+    [pendingCollapseKey]
+  );
+  const pendingRestore = useCallback(
+    (requestKey: string, contextToken: string) => {
+      const marker = pendingCollapseKey(requestKey, contextToken);
+      window.sessionStorage.removeItem(marker);
+      setPendingCollapsed((prev) => {
+        const next = { ...prev };
+        delete next[marker];
+        return next;
+      });
+    },
+    [pendingCollapseKey]
+  );
+  const pendingIsCollapsed = useCallback(
+    (requestKey: string, contextToken: string) => {
+      const marker = pendingCollapseKey(requestKey, contextToken);
+      return pendingCollapsed[marker] === true || window.sessionStorage.getItem(marker) === "1";
+    },
+    [pendingCollapsed, pendingCollapseKey]
+  );
+  /** T4-A：最近一次展开的标记键（渲染后把焦点交回该卡容器）。 */
+  const justExpandedMarker = useRef<string | null>(null);
+  /** T4-A：最近一次收起的标记键（渲染后把焦点交给可见的展开入口）。 */
+  const justCollapsedMarker = useRef<string | null>(null);
   // F08：适配详情/开关（移动端页内 sheet；只读展示 + 与桌面同源开关）。
   const [codexAdaptOpen, setCodexAdaptOpen] = useState(false);
   // R16：首次进入 App 会话的**轻提示**（一次；不要求用户先打开详情）。
@@ -581,6 +637,234 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
     if (codexReady) bumpQueue();
   }, [codexRevision, codexReady, bumpQueue]);
   const codexState = codex.state;
+  // ===== 题卡跳过分层事实（useCodexThread 的 FactLedger 快照；SessionDetail 只派生）=====
+  // descriptor（每 source 唯一 canonical gid）、unified（display/history/已受理回执
+  // 按 (rev, 同钟 seq) 同 gid 择新）、observation（gid↔题体，exclude token/runtime）
+  // 全部由 buildQuestionSkipFactsSnapshot 合成。**受理回执经会话订阅即时并入**——
+  // GET 刷新失败不掩盖已知成功。
+  const qsFacts = codexState?.questionSkipFacts;
+  const [receiptTick, setReceiptTick] = useState(0);
+  useEffect(() => {
+    return subscribeAcceptedQuestionSkipReceipts(session.id, () =>
+      setReceiptTick((tick) => tick + 1)
+    );
+  }, [session.id]);
+  const qs = useMemo(() => {
+    if (qsFacts === undefined) return null;
+    // 帧事实 + 本会话已受理回执（同钟择新）合成分层快照。
+    return buildQuestionSkipFactsSnapshot(qsFacts, getAcceptedQuestionSkipReceipts(session.id));
+    // receiptTick 是订阅驱动的重算信号（回执落账先于通知，见 questionSkipOperations）。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [qsFacts, session.id, receiptTick]);
+  const qsDerived = useMemo(() => {
+    if (qs === null) return null;
+    const unifiedByGid = new Map<string, QuestionSkipUnifiedFact>();
+    for (const entry of qs.unifiedByGid) unifiedByGid.set(entry.gid, entry.fact);
+    const displayByGid = new Map<string, QuestionDisplayGroupView>();
+    for (const entry of qs.displayByGid) displayByGid.set(entry.gid, entry.view);
+    const descriptorBySource = new Map<string, { gid: string; view: QuestionDisplayGroupView }>();
+    for (const descriptor of qs.descriptorBySource) {
+      descriptorBySource.set(`${descriptor.sourceTurnId}|${descriptor.sourceItemId}`, {
+        gid: descriptor.gid,
+        view: descriptor.view,
+      });
+    }
+    const observations = new Map<string, QuestionSkipBodyObservation[]>();
+    for (const observation of qs.observations)
+      observations.set(observation.gid, observation.bodies);
+    const bodyOf = (members: CodexAsyncQuestionView[]) =>
+      [...members]
+        .sort((a, b) => a.questionIndex - b.questionIndex)
+        .map((question) => ({
+          questionKey: question.questionKey,
+          questionIndex: question.questionIndex,
+          title: question.title,
+          orderedOptions: [...question.options],
+        }));
+    const sameBodies = (
+      a: QuestionSkipBodyObservation[],
+      b: QuestionSkipBodyObservation[]
+    ): boolean =>
+      a.length === b.length &&
+      a.every(
+        (item, index) =>
+          item.questionKey === b[index].questionKey &&
+          item.questionIndex === b[index].questionIndex &&
+          item.title === b[index].title &&
+          item.orderedOptions.length === b[index].orderedOptions.length &&
+          item.orderedOptions.every(
+            (option, optionIndex) => option === b[index].orderedOptions[optionIndex]
+          )
+      );
+    /** 题体一致性（descriptor gid 观察 vs 当前成员）：dock 隐藏、skip 入口、verified
+     *  草稿认领**共用同一道闸**。**缺观察 ≠ 自动准入**——descriptor 与成员的 current
+     *  关联必须被合法帧证实过；无观察或矛盾一律不准入（真 body 矛盾解除旧 hide 并
+     *  禁新 skip/verified seed；lastKnown 只用于旧稿匹配，不认领新 body）。 */
+    const bodyConsistent = (gid: string, members: CodexAsyncQuestionView[]): boolean => {
+      const observed = observations.get(gid);
+      if (observed === undefined) return false;
+      if (members.length === 0) return false;
+      return sameBodies(observed, bodyOf(members));
+    };
+    return {
+      displayInvalid: qs.displayInvalid,
+      historyInvalid: qs.historyInvalid,
+      bodyConsistent,
+      /** dock 隐藏：唯一 canonical descriptor gid 的统一决策为 skipped 且题体一致。 */
+      dockHidden(sourceKey: string, members: CodexAsyncQuestionView[]): boolean {
+        const descriptor = descriptorBySource.get(sourceKey);
+        if (descriptor === undefined) return false;
+        const unifiedFact = unifiedByGid.get(descriptor.gid);
+        if (unifiedFact === undefined || unifiedFact.decision !== "skipped") return false;
+        return bodyConsistent(descriptor.gid, members);
+      },
+      /** skip 入口资格事实：**统一决策事实**（merged view 传 Controls，避免旧
+       *  display skipped 压掉新 history active）+ descriptor display 事实的完整性
+       *  字段 + 题体一致性 + display 账未失效。gateFact = 帧事实（display 账原值，
+       *  不含本端回执回声）——Done 释放只认 canonical 帧，回执回声不得解除恢复反馈。 */
+      startFactFor(
+        sourceKey: string,
+        members: CodexAsyncQuestionView[]
+      ): {
+        view: GroupDisplayView;
+        gateFact: { decision: QuestionDisplayDecision; revision: number };
+        sourceComplete: boolean;
+        sourceQuestionCount: number;
+      } | null {
+        const descriptor = descriptorBySource.get(sourceKey);
+        if (descriptor === undefined) return null;
+        const fact = displayByGid.get(descriptor.gid);
+        const unifiedFact = unifiedByGid.get(descriptor.gid);
+        if (fact === undefined || unifiedFact === undefined) return null;
+        if (!bodyConsistent(descriptor.gid, members)) return null;
+        return {
+          view: {
+            group: unifiedFact.group,
+            revision: unifiedFact.revision,
+            decision: unifiedFact.decision,
+            latestNativeEffect: unifiedFact.latestNativeEffect,
+            reasonCode: unifiedFact.reasonCode,
+          },
+          gateFact: { decision: fact.decision, revision: fact.revision },
+          sourceComplete: fact.sourceComplete,
+          sourceQuestionCount: fact.sourceQuestionCount,
+        };
+      },
+      descriptorGidOf(sourceKey: string): string | null {
+        return descriptorBySource.get(sourceKey)?.gid ?? null;
+      },
+      unifiedFactOf(gid: string): QuestionSkipUnifiedFact | null {
+        return unifiedByGid.get(gid) ?? null;
+      },
+      observedTitleOf(gid: string): string | null {
+        const observed = observations.get(gid);
+        return observed !== undefined && observed.length === 1 ? observed[0].title : null;
+      },
+    };
+  }, [qs]);
+  /** 结果/恢复条目：每 gid 一条 = 服务端 history ∪ **真实已受理 skip 回执**（receipt
+   *  仅在无 history 条目时补位——不拿 display 伪造 history；后续 server history 到达
+   *  即按 gid 去重、按 (revision, 同钟 seq) 收敛进同一 unified 决策）。view 用合并
+   *  后的统一事实；restore 回执不另立条目（其 active 世界由 dock start/入口资格表
+   *  达，恢复说明走只读记录）。skipped → 恢复入口 + 原生效果；active → 只读记录。 */
+  const skipHistoryEntries = useMemo(() => {
+    if (qsDerived === null || qsFacts === undefined) {
+      return [] as {
+        gid: string;
+        view: GroupDisplayView;
+        gateFact: { decision: QuestionDisplayDecision; revision: number } | null;
+        title: string | null;
+        label: string;
+      }[];
+    }
+    // restore 回执同样立条目（readOnly 记录自然呈现「已恢复」说明，直到 canonical
+    // history 接管后按 gid 去重/事实择新）——不虚构 Native 成功，恢复只恢复展示。
+    const acceptedReceipts = getAcceptedQuestionSkipReceipts(session.id);
+    const displayFrameByGid = new Map(qsFacts.displayByGid.map((entry) => [entry.gid, entry]));
+    const historyFrameByGid = new Map(qsFacts.historyByGid.map((entry) => [entry.gid, entry]));
+    const receiptByGid = new Map(
+      acceptedReceipts.map((receipt) => [groupIdentityKey(receipt.group), receipt] as const)
+    );
+    const gids: string[] = [];
+    const seen = new Set<string>();
+    for (const entry of qsFacts.historyByGid) {
+      if (!seen.has(entry.gid)) {
+        seen.add(entry.gid);
+        gids.push(entry.gid);
+      }
+    }
+    for (const gid of receiptByGid.keys()) {
+      if (!seen.has(gid)) {
+        seen.add(gid);
+        gids.push(gid);
+      }
+    }
+    const entries: {
+      gid: string;
+      view: GroupDisplayView;
+      gateFact: { decision: QuestionDisplayDecision; revision: number } | null;
+      title: string | null;
+      label: string;
+    }[] = [];
+    for (const gid of gids) {
+      const historyView = historyFrameByGid.get(gid)?.view ?? null;
+      const unifiedFact = qsDerived.unifiedFactOf(gid);
+      const group =
+        unifiedFact?.group ?? historyView?.group ?? receiptByGid.get(gid)?.group ?? null;
+      if (group === null || unifiedFact === null) continue; // 无统一事实不立条目（不猜）
+      // 历史条目的准入事实**只取服务端帧事实**（display 账 / history 账），对应账
+      // invalid 时不取该账；两账都在时按 (revision, 同钟 seq) 择新——history 已到
+      // rev2、display 停在 rev1 时必须用 rev2 释放 Done，不能无条件 display 优先。
+      // 两者都缺（receipt 补位条目/帧未到）→ 显式 null：不拿 unified view（可能是
+      // 本端回执回声）冒充 canonical，否则回执会把 Done 提前释放回 Ready。
+      // readOnly 条目本就不发布 gate；skipped 恢复条目用真实帧 expectedRevision，
+      // 缺失时控制器按不可准入处理。
+      const displayFrame = qsFacts.displayInvalid ? undefined : displayFrameByGid.get(gid);
+      const historyFrame = qsFacts.historyInvalid ? undefined : historyFrameByGid.get(gid);
+      const newerFrame =
+        displayFrame === undefined
+          ? historyFrame
+          : historyFrame === undefined
+            ? displayFrame
+            : historyFrame.view.revision > displayFrame.view.revision ||
+                (historyFrame.view.revision === displayFrame.view.revision &&
+                  historyFrame.seq > displayFrame.seq)
+              ? historyFrame
+              : displayFrame;
+      const gateFact =
+        newerFrame === undefined
+          ? null
+          : { decision: newerFrame.view.decision, revision: newerFrame.view.revision };
+      let title: string | null = historyView?.question?.title ?? null;
+      if (title === null) {
+        const descriptorGid = qsDerived.descriptorGidOf(
+          `${unifiedFact.group.sourceTurnId}|${unifiedFact.group.sourceItemId}`
+        );
+        if (descriptorGid === gid) title = qsDerived.observedTitleOf(gid);
+      }
+      entries.push({
+        gid,
+        view: {
+          group: unifiedFact.group,
+          revision: unifiedFact.revision,
+          decision: unifiedFact.decision,
+          latestNativeEffect: unifiedFact.latestNativeEffect,
+          reasonCode: unifiedFact.reasonCode,
+        },
+        gateFact,
+        title,
+        label:
+          title ??
+          `${unifiedFact.group.sourceTurnId} · ${unifiedFact.group.sourceItemId} · ${unifiedFact.group.contentGeneration}`,
+      });
+    }
+    return entries;
+  }, [qsDerived, qsFacts, session.id]);
+  /** 跳过/恢复后的专用刷新：走真投影 refresh（GET + SSE 自会推进），不混
+   *  answer/queue 的 queueTick 语义。 */
+  const onSkipChanged = useCallback(() => {
+    void codex.refresh();
+  }, [codex.refresh]);
   // 有效卡：当前可答组，或本机已发出过动作（sessionStorage 锚）的待核对组。
   // 历史已答/无锚 unknown 一律不渲染（2026-10-28 用户裁决）。
   //
@@ -609,16 +893,55 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
     const retainedGroups = groups.filter(
       (group) => group.live.length > 0 || (group.hasAnchor && !group.allAnswered)
     );
-    const visibleGroups = retainedGroups.filter((group) => !group.isArchived);
-    const archivedGroups = retainedGroups.filter((group) => group.isArchived);
+    // 跳过事实（descriptor gid 统一决策 skipped 且题体一致）：整组退出 dock/count/
+    // activeGroup，只留历史恢复入口（恢复后事实翻回 active 即自动回归）。
+    const panelGroups = retainedGroups.filter(
+      (group) => !(qsDerived !== null && qsDerived.dockHidden(group.key, group.members))
+    );
+    const visibleGroups = panelGroups.filter((group) => !group.isArchived);
+    const archivedGroups = panelGroups.filter((group) => group.isArchived);
     return {
       pending,
       groups: visibleGroups,
       retainedGroups,
+      panelGroups,
       archivedGroups,
       count: pending.length + visibleGroups.length,
     };
-  }, [codexState, session.id, queueTick]);
+  }, [codexState, session.id, queueTick, qsDerived]);
+
+  const inboxPendingForCleanup = inbox.pending;
+  // T4-C：**新鲜**投影确认退场/换代后清理旧收起标记；仅清本会话前缀。同
+  // requestKey 换新 contextToken 时，旧 token 的标记键不再命中 live 集合 →
+  // 一并清除。暂缺投影（codexState === null，如首帧 GET 在途）与 stale 过期
+  // 视图都不判结束——不动 storage，等真实新鲜数据。
+  useEffect(() => {
+    if (codexState === null || codexState.stale) return;
+    const prefix = `codex:pending-collapsed:${session.id}:`;
+    const live = new Set(
+      inboxPendingForCleanup.map(
+        (p) => `codex:pending-collapsed:${session.id}:${p.requestKey}:${p.contextToken}`
+      )
+    );
+    for (let i = window.sessionStorage.length - 1; i >= 0; i -= 1) {
+      const key = window.sessionStorage.key(i);
+      if (key && key.startsWith(prefix) && !live.has(key)) {
+        window.sessionStorage.removeItem(key);
+      }
+    }
+    setPendingCollapsed((prev) => {
+      const next: Record<string, boolean> = {};
+      let changed = false;
+      for (const key of Object.keys(prev)) {
+        if (key.startsWith(prefix) && !live.has(key)) {
+          changed = true;
+          continue;
+        }
+        next[key] = prev[key];
+      }
+      return changed ? next : prev;
+    });
+  }, [codexState, inboxPendingForCleanup, session.id]);
 
   const activeGroup =
     inbox.groups.find((group) => group.key === activeGroupKey) ??
@@ -1732,14 +2055,58 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
                   <span className="underline">{i18n.t("mobile.codex.async.restoreGroup")}</span>
                 </button>
               )}
-              {inbox.pending.map((p) => (
-                <PendingRequestCard
-                  key={`codex-pending-${session.id}-${p.requestKey}`}
-                  sessionId={session.id}
-                  request={p}
-                  writeLocked={codexState.stale}
-                />
-              ))}
+              {inbox.pending.map((p) => {
+                const marker = pendingCollapseKey(p.requestKey, p.contextToken);
+                const collapsed = pendingIsCollapsed(p.requestKey, p.contextToken);
+                return (
+                  <div
+                    key={`codex-pending-${session.id}-${p.requestKey}`}
+                    ref={(el) => {
+                      // T4-A：展开后焦点回该卡（最近一次展开的请求）。
+                      if (el && justExpandedMarker.current === marker) {
+                        justExpandedMarker.current = null;
+                        el.focus();
+                      }
+                    }}
+                    tabIndex={-1}
+                  >
+                    {/* T4-B：hidden 只切换可见性——卡片父子链稳定，同页收起/
+                        展开不重挂载（草稿、题号、在途状态保留）。 */}
+                    <div hidden={collapsed}>
+                      <PendingRequestCard
+                        sessionId={session.id}
+                        request={p}
+                        writeLocked={codexState.stale}
+                        onLocalSkip={
+                          p.kind === "user_input"
+                            ? () => pendingSkip(p.requestKey, p.contextToken)
+                            : undefined
+                        }
+                      />
+                    </div>
+                    {collapsed && (
+                      <button
+                        type="button"
+                        data-testid="codex-pending-local-restore"
+                        ref={(el) => {
+                          // T4-A：收起后焦点移到可见的展开入口（不落在被隐藏节点上）。
+                          if (el && justCollapsedMarker.current === marker) {
+                            justCollapsedMarker.current = null;
+                            el.focus();
+                          }
+                        }}
+                        onClick={() => {
+                          justExpandedMarker.current = marker;
+                          pendingRestore(p.requestKey, p.contextToken);
+                        }}
+                        className="flex w-full items-center justify-between rounded-xl border border-[var(--bd)] bg-[var(--cd)] px-3 py-1.5 text-left text-xs text-[var(--mut)]"
+                      >
+                        <span>{i18n.t("mobile.codex.pending.localRestore")}</span>
+                      </button>
+                    )}
+                  </div>
+                );
+              })}
               {/* T04（spec §3.2）：其余有效组收进**唯一**「另有 N 组」入口（不常驻 N 行）；
                   展开后可切任意组；已答组不计数（inbox 已过滤）。组卡片仍全部挂载
                   （hidden 控制），切组/收起/展开不卸载组件——草稿与在途状态不丢。 */}
@@ -1792,32 +2159,81 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
                     ))}
                 </div>
               )}
-              {inbox.retainedGroups.map((group) => (
-                <div
-                  key={`codex-group-panel-${session.id}-${group.key}`}
-                  data-testid={`codex-group-panel-${group.key}`}
-                  hidden={group.isArchived || group.key !== activeGroup?.key}
-                >
-                  <AsyncQuestionGroupCard
-                    sessionId={session.id}
-                    questions={group.members}
-                    fontScale={fontScale}
-                    onChanged={() => setQueueTick((tick) => tick + 1)}
-                    onArchive={() => {
-                      // 本机收纳：写 sessionStorage 标记 → inbox 重新计算即隐藏。
-                      // 不向桌面发送任何动作（契约）。桌面若有新回合，题目换代后
-                      // sourceTurnId/sourceItemId 变化 → 新 key → 卡自然重现。
-                      const first = group.members[0];
-                      if (!first) return;
-                      window.sessionStorage.setItem(
-                        `codex:group-archived:${session.id}:${first.sourceTurnId}:${first.sourceItemId}`,
-                        "1"
-                      );
-                      setQueueTick((tick) => tick + 1);
-                    }}
-                  />
-                </div>
+              {inbox.panelGroups.map((group) => {
+                // 单题 skip 入口资格（与草稿归属分开判定）：唯一 canonical descriptor
+                // 的统一决策事实（merged view）+ 来源完整 + 来源单题 + 成员单题 +
+                // 题体一致 + display 账未失效（descriptor 属 display 账）。
+                const startFact = qsDerived?.startFactFor(group.key, group.members) ?? null;
+                const skipEligible =
+                  qsDerived !== null &&
+                  !qsDerived.displayInvalid &&
+                  startFact !== null &&
+                  startFact.view.decision === "active" &&
+                  startFact.sourceComplete &&
+                  startFact.sourceQuestionCount === 1 &&
+                  group.members.length === 1;
+                return (
+                  <div
+                    key={`codex-group-panel-${session.id}-${group.key}`}
+                    data-testid={`codex-group-panel-${group.key}`}
+                    hidden={group.isArchived || group.key !== activeGroup?.key}
+                  >
+                    <AsyncQuestionGroupCard
+                      sessionId={session.id}
+                      questions={group.members}
+                      fontScale={fontScale}
+                      questionDisplayGroup={startFact?.view}
+                      onChanged={() => setQueueTick((tick) => tick + 1)}
+                      onArchive={() => {
+                        // 本机收纳：写 sessionStorage 标记 → inbox 重新计算即隐藏。
+                        // 不向桌面发送任何动作（契约）。桌面若有新回合，题目换代后
+                        // sourceTurnId/sourceItemId 变化 → 新 key → 卡自然重现。
+                        const first = group.members[0];
+                        if (!first) return;
+                        window.sessionStorage.setItem(
+                          `codex:group-archived:${session.id}:${first.sourceTurnId}:${first.sourceItemId}`,
+                          "1"
+                        );
+                        setQueueTick((tick) => tick + 1);
+                      }}
+                    />
+                    {skipEligible && startFact !== null && (
+                      <QuestionSkipControls
+                        sessionId={session.id}
+                        view={startFact.view}
+                        gateFact={startFact.gateFact}
+                        disabled={codexState.stale}
+                        onChanged={onSkipChanged}
+                      />
+                    )}
+                  </div>
+                );
+              })}
+              {/* 跳过历史恢复区：每 gid 一条（ledger 真实承接）。skipped → 恢复入口 +
+                  原生效果如实展示；active → 只读记录（无伪可答、无新 skip）。题文 =
+                  历史快照 / 已证唯一 current 借文 / 诚实 source 标识；role=group +
+                  aria 区分多条目。 */}
+              {skipHistoryEntries.map(({ gid, view, gateFact, title, label }) => (
+                <QuestionSkipControls
+                  key={`question-skip-history-${session.id}-${gid}`}
+                  sessionId={session.id}
+                  view={view}
+                  gateFact={gateFact}
+                  readOnly={view.decision !== "skipped"}
+                  disabled={codexState.stale}
+                  onChanged={onSkipChanged}
+                  questionTitle={title}
+                  ariaLabel={label}
+                />
               ))}
+              {qsDerived !== null && qsDerived.displayInvalid && (
+                <p
+                  data-testid="codex-question-skip-invalid"
+                  className="text-xs text-amber-700 dark:text-amber-400"
+                >
+                  {i18n.t("mobile.codex.skip.invalidFacts")}
+                </p>
+              )}
             </div>
           )}
           <CodexQueuePanel
@@ -1996,8 +2412,10 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
           )}
         </div>
       )}
-      {/* 总结模式提示行（Bug 8）：仅总结模式且有可折叠过程消息时出现 */}
-      {isSummary && toggleableMessages.length > 0 && (
+      {/* 总结模式提示行（Bug 8）：仅总结模式且有可折叠过程消息时出现。
+          F9（2026-11-12 note §五）：Codex 投影激活时通用消息源被投影取代——
+          通用展开/收起控件与通用 ul 同规则隐藏，不得操作隐藏源 */}
+      {!codexProjectionActive && isSummary && toggleableMessages.length > 0 && (
         <div
           data-testid="summary-banner"
           className="mb-2 flex items-center gap-2 rounded-lg bg-[var(--btnp)]/10 px-3 py-2 text-xs text-[var(--tx)]"
@@ -2071,8 +2489,9 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
       )}
       {/* 「加载更早消息」置于列表**最上方**（2026-09-16 用户裁决）：语义是
           「往前翻到头再加一段更早的」，与阅读方向一致；此前放在列表末尾，
-          与「更早」的空间直觉相反 */}
-      {hasLoadMore && (
+          与「更早」的空间直觉相反。F9：Codex 投影激活时隐藏（通用消息源
+          不在显示面；「跳到最新」仅滚动语义不受影响） */}
+      {!codexProjectionActive && hasLoadMore && (
         <div className="pt-1 pb-3 text-center">
           <button
             type="button"

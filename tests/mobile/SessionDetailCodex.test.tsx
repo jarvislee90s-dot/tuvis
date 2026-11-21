@@ -54,6 +54,7 @@ function projection(over: Record<string, unknown> = {}) {
 }
 
 let queueResponse: unknown;
+let messagesResponse: unknown;
 let queueCalls: string[];
 let fetchMock: ReturnType<typeof vi.fn> | null = null;
 let retractBodies: string[];
@@ -75,6 +76,7 @@ function json(body: unknown, status = 200) {
 
 function installFetch() {
   queueResponse = { actions: [], blockedReasonCode: null };
+  messagesResponse = { messages: [], truncated: false };
   queueCalls = [];
   retractBodies = [];
   sendCalls = [];
@@ -129,7 +131,9 @@ function installFetch() {
       }
       return json({ status: "codex_queued", actionId: "act-q", position: 1 });
     }
-    if (url.includes("/session-messages")) return json({ messages: [], truncated: false });
+    if (url.includes("/session-messages")) {
+      return json(messagesResponse ?? { messages: [], truncated: false });
+    }
     if (url.includes("/session-files")) return json({ files: [], truncated: false });
     if (url.includes("/session-queue")) return json({ items: [] });
     if (url.includes("/session-approve-options")) {
@@ -608,6 +612,92 @@ describe("H12 来源与收纳", () => {
     });
     expect(calls.some((url) => url.includes("/codex/thread"))).toBe(false);
     expect(screen.queryByTestId("codex-ops-row")).toBeNull();
+  });
+
+  it("b6_live_pending_state_mounts_card_without_refresh", async () => {
+    const fetch = installFetch();
+    // 与 Rust 观测用例使用同形事件，浏览器世系和临时令牌为独立夹具值。
+    const threadId = "0f1e2d3c-1111-4222-8333-444455556666";
+    const version = {
+      instanceId: "t3a-synthetic-boot",
+      ownerEpoch: 1,
+      ownerGeneration: 1,
+      revision: 7,
+      localSeq: 1,
+    };
+    const requestKey = "n:19619";
+    const contextToken = "t3a-synthetic-context";
+    const question = "Synthetic live pending question";
+    const stateVersion = { ...version, revision: 8, localSeq: 2 };
+    render(<SessionDetail session={makeSession({ id: threadId })} onBack={() => {}} />);
+    const es = await waitFor(() => MockEventSource.latest());
+    es.readyState = 1;
+    emit(es, "snapshot", projection({ threadId, revision: 7, projectionVersion: version }));
+    expect(screen.queryByTestId("codex-pending-card")).toBeNull();
+    const threadReads = () =>
+      fetch.mock.calls.filter(([input]) => /\/codex\/thread(?:\?|$)/.test(String(input))).length;
+    const readsBeforeState = threadReads();
+
+    const receivedAt = performance.now();
+    emit(
+      es,
+      "state",
+      projection({
+        threadId,
+        revision: 8,
+        projectionVersion: stateVersion,
+        pending: [
+          {
+            requestKey,
+            contextToken,
+            kind: "user_input",
+            actionable: true,
+            allowedDecisions: [],
+            questions: [
+              {
+                id: "b6-observation",
+                header: "Synthetic observation",
+                question,
+                isOther: false,
+                isSecret: false,
+                options: [{ label: "A", description: "" }],
+                answerPolicy: { allowMultiple: true, maxAnswers: 32, allowFreeText: false },
+              },
+            ],
+          },
+        ],
+      })
+    );
+    try {
+      const card = await screen.findByTestId("codex-pending-card");
+      expect(card).toBeVisible();
+      expect(card).toHaveAttribute("data-mode", "user_input");
+      expect(within(card).getByTestId("codex-pending-request-key")).toHaveTextContent(requestKey);
+      expect(MockEventSource.instances).toEqual([es]);
+      expect(es.closed).toBe(false);
+      expect(threadReads()).toBe(readsBeforeState);
+      console.info("T3a T3", {
+        requestKey,
+        contextToken,
+        version: stateVersion,
+        transport: "MockEventSource/state",
+        connection: "open",
+        outcome: "accepted_and_first_card_mounted",
+        elapsedMs: performance.now() - receivedAt,
+        extraThreadGets: threadReads() - readsBeforeState,
+      });
+    } catch (error) {
+      console.error("T3a T3", {
+        requestKey,
+        contextToken,
+        version: stateVersion,
+        transport: "MockEventSource/state",
+        connection: es.closed ? "closed" : "open",
+        elapsedMs: performance.now() - receivedAt,
+        reason: error instanceof Error ? error.message.split("\n")[0] : String(error),
+      });
+      throw error;
+    }
   });
 
   it("h12_multiple_pending_collapse_into_one_row_and_expand", async () => {
@@ -1668,5 +1758,86 @@ describe("PR202 手动收纳与恢复", () => {
     const choice = await screen.findByRole("button", { name: "甲" });
     expect(choice.getAttribute("aria-pressed")).toBe("false");
     expect(screen.queryByTestId("codex-archived-groups")).toBeNull();
+  });
+});
+
+// ============================================================
+// A5.3（F9）：真实详情页切换 Codex 与通用消息源。
+// ============================================================
+describe("SessionDetail × Codex IPC：A5.3 Codex/通用消息源切换", () => {
+  const codexQuestions = [
+    {
+      questionKey: '["request_user_input_async","call-1",0]',
+      contextToken: "tok-codex",
+      title: "问题1",
+      options: ["甲", "乙"],
+      actionable: true,
+      disabledReasonCode: null,
+    },
+  ];
+
+  it("A5.3-a：可见 Codex 投影隐藏通用摘要与加载更早；回到通用源恢复", async () => {
+    installFetch();
+    queueResponse = {
+      actions: [{ actionId: "a1", state: "queued", position: 1, receipt: null }],
+      blockedReasonCode: null,
+    };
+    // 通用面先在场：200 条消息（混入过程消息 → toggleableMessages > 0，
+    // summary-banner 阳性前置——终审 Minor）+ truncated → 摘要横幅/加载更早可渲染。
+    messagesResponse = {
+      messages: Array.from({ length: 200 }, (_, i) => ({
+        seq: i,
+        kind: i % 10 === 5 ? "thinking" : "user",
+        content: `m${i}`,
+      })),
+      truncated: true,
+    };
+    render(<SessionDetail session={makeSession({ status: "idle" })} onBack={() => {}} />);
+    const es = await waitFor(() => MockEventSource.latest());
+    // 通用相：尚未收到 Codex 快照（codexState=null）→ 通用源激活
+    // （F9：加载更早 + 摘要横幅均可见——阳性前置，缺席断言不空过）。
+    expect(await screen.findByTestId("load-more")).toBeTruthy();
+    expect(await screen.findByTestId("summary-banner")).toBeTruthy();
+    // Codex 投影激活（controllable + asyncQuestions）→ 通用面隐藏（F9 合同）。
+    emit(es, "snapshot", projection({ asyncQuestions: codexQuestions }));
+    await waitFor(() => expect(screen.queryByTestId("load-more")).toBeNull());
+    expect(screen.queryByTestId("summary-banner")).toBeNull();
+    // 回到通用源：Codex 投影撤（compat_only 非 controllable 面）→ 通用面恢复。
+    emit(es, "snapshot", projection({ availability: "compat_only" }));
+    // 恢复相：加载更早**与**摘要横幅都回来（终审 Minor：横幅永久消失也不得通过）。
+    await waitFor(() => expect(screen.getByTestId("load-more")).toBeTruthy());
+    expect(screen.getByTestId("summary-banner")).toBeTruthy();
+  });
+
+  it("A5.3-b：Codex 投影激活期间零通用历史请求（加载更早不触发 session-messages）", async () => {
+    installFetch();
+    queueResponse = {
+      actions: [{ actionId: "a1", state: "queued", position: 1, receipt: null }],
+      blockedReasonCode: null,
+    };
+    messagesResponse = {
+      messages: Array.from({ length: 200 }, (_, i) => ({
+        seq: i,
+        kind: i % 10 === 5 ? "thinking" : "user",
+        content: `m${i}`,
+      })),
+      truncated: true,
+    };
+    render(<SessionDetail session={makeSession({ status: "idle" })} onBack={() => {}} />);
+    const es = await waitFor(() => MockEventSource.latest());
+    // 通用相：尚未收到 Codex 快照 → 通用源激活（横幅阳性前置）。
+    expect(await screen.findByTestId("load-more")).toBeTruthy();
+    expect(await screen.findByTestId("summary-banner")).toBeTruthy();
+    const messageCallsBefore = fetchMock.mock.calls.filter(([u]) =>
+      String(u).includes("/session-messages")
+    ).length;
+    // Codex 投影激活：加载更早隐藏 → 零通用历史请求。
+    emit(es, "snapshot", projection({ asyncQuestions: codexQuestions }));
+    // Codex 投影激活的源切换直接信号：load-more 消失（F9 隐藏面）。
+    await waitFor(() => expect(screen.queryByTestId("load-more")).toBeNull());
+    const messageCallsAfter = fetchMock.mock.calls.filter(([u]) =>
+      String(u).includes("/session-messages")
+    ).length;
+    expect(messageCallsAfter).toBe(messageCallsBefore);
   });
 });
