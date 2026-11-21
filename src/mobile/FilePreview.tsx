@@ -229,8 +229,9 @@ export default function FilePreview({
       : null;
   const errorText = (() => {
     if (state.phase !== "error") return "";
-    // 403 原因分诊文案走 i18n 键（M5 双语）；未列原因保留兜底
-    if (errorReason === "sensitive") return i18n.t("mobile.preview.errSensitive");
+    // 403 原因分诊文案走 i18n 键（M5 双语）；未列原因保留兜底。
+    // D22（2026-11-12 note §三/§六）：sensitive 原因码已随预览目录准入取消退役，
+    // 后端不再产生该分支（旧服务端残留值走 errUnpreviewable 兜底）
     if (errorReason === "too_large") return i18n.t("mobile.preview.errTooLarge");
     if (errorReason === "not_found") return i18n.t("mobile.preview.errNotFound");
     if (errorReason === "not_file") return i18n.t("mobile.preview.errNotFile");

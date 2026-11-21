@@ -933,12 +933,13 @@ enum FileReadOutcome {
 }
 
 /// GET /m/api/v1/file?session_id=&path=（M3 Task 8；M5 P2-a 全盘语义）
-/// 安全文件只读读取（read_file_safe：任意路径、敏感目录黑名单、只读、
-/// 双阈值 500KB/5MB——2026-09-18 用户裁决放开项目外文件预览）。
+/// 安全文件只读读取（read_file_safe：任意路径可读、只读、双阈值 500KB/5MB，
+/// 实际读取同样有界——2026-11-12 note §三（宪法 D22）取消目录级准入，
+/// 信任边界回到已授权总闸门；`SENSITIVE_DIRS` 仅创建域消费）。
 /// - 缺参 / 空白 → 400；session_id 不在会话快照 → 404；
 /// - 图片 mime → 二进制响应 + Content-Type；文本 → JSON `{content, mime, size}`；
-/// - 拒绝（敏感目录/不存在/超限/目录/IO）→ 403 + `{"error":"<reason>"}`（snake_case
-///   原因码：sensitive/too_large/not_found/not_file/io，前端据此分診文案）+ log::warn；
+/// - 拒绝（不存在/超限/目录/IO）→ 403 + `{"error":"<reason>"}`（snake_case
+///   原因码：too_large/not_found/not_file/io，前端据此分診文案）+ log::warn；
 /// - cwd 查找与文件读取同在一个 `spawn_blocking` 里：会话快照源是同步阻塞调用
 ///   （sysinfo 全进程刷新，实机教训见 commands/session.rs），文件 IO 同为重活。
 pub async fn read_file(
