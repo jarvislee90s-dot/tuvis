@@ -160,6 +160,26 @@ pub fn migrate(conn: &Connection) -> Result<(), String> {
     migrate_b1_hint_schema(conn)
         .map_err(|e| format!("MIGRATE_B1_HINT_SCHEMA_FAIL: 迁移 Codex 答题提示表失败: {e}"))?;
 
+    // ===== 单题 skip 展示域（codex_question_skip）=====
+    // 旧库的 codex_question_display 缺 source_snapshot_json（原题快照列，此前的
+    // 8 列形状）→ ALTER 幂等补**可空**列（旧行 NULL = 升级前无快照，读侧保守按
+    // 无快照 fallback；DAO 只允许 NULL 行在下次 prepare 时补写一次，绝不覆盖非
+    // NULL 存量）。新库已由 schema.rs 建表 DDL 直接带上（column_exists 短路）；
+    // 表整体缺失时由上方 schema::init 补建（含全列），本分支自然短路，幂等可重入。
+    if !column_exists(conn, "codex_question_display", "source_snapshot_json") {
+        conn.execute(
+            "ALTER TABLE codex_question_display ADD COLUMN source_snapshot_json TEXT",
+            [],
+        )
+        .map_err(|e| {
+            format!(
+                "MIGRATE_QUESTION_DISPLAY_SNAPSHOT_FAIL: 旧库补列 codex_question_display.source_snapshot_json 失败: {e}"
+            )
+        })?;
+    }
+    // codex_question_skip_actions 无历史形状（首版即全列 DDL，动作账本不删行）：
+    // 老库缺表由 schema::init 直接补建，无 ALTER 需求，不在此重复。
+
     if !column_exists(conn, "zcode_actions", "send_admission") {
         conn.execute(
             "ALTER TABLE zcode_actions ADD COLUMN send_admission TEXT",
@@ -594,6 +614,11 @@ pub fn migrate(conn: &Connection) -> Result<(), String> {
     // usage_detail 补列路径。
     for (table, col, ddl) in [
         (
+            "codex_actions",
+            "async_answer_route",
+            "ALTER TABLE codex_actions ADD COLUMN async_answer_route TEXT",
+        ),
+        (
             "usage_detail",
             "day_key",
             "ALTER TABLE usage_detail ADD COLUMN day_key TEXT NOT NULL DEFAULT ''",
@@ -752,6 +777,57 @@ pub fn migrate(conn: &Connection) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn async_active_store_fresh_schema_has_one_nullable_route_column() {
+        let c = Connection::open_in_memory().unwrap();
+        crate::database::schema::init(&c);
+        let columns: Vec<(String, String, i64, Option<String>)> = c
+            .prepare("PRAGMA table_info(codex_actions)")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        let route: Vec<_> = columns
+            .iter()
+            .filter(|col| col.0 == "async_answer_route")
+            .collect();
+        assert_eq!(route.len(), 1, "新库必须直接建持久路由列");
+        assert_eq!(
+            (route[0].1.as_str(), route[0].2, route[0].3.as_deref()),
+            ("TEXT", 0, None)
+        );
+        migrate(&c).unwrap();
+        migrate(&c).unwrap();
+    }
+
+    #[test]
+    fn async_active_store_legacy_migration_preserves_null_and_facts_idempotently() {
+        let c = Connection::open_in_memory().unwrap();
+        crate::database::schema::init(&c);
+        let exists: i64 = c.query_row("SELECT count(*) FROM pragma_table_info('codex_actions') WHERE name='async_answer_route'", [], |r| r.get(0)).unwrap();
+        if exists != 0 {
+            c.execute_batch("ALTER TABLE codex_actions DROP COLUMN async_answer_route")
+                .unwrap();
+        }
+        c.execute_batch("INSERT INTO codex_actions (action_id,device_id,device_name,thread_id,kind,payload_hash,client_message_id,state,route,created_at,updated_at,compat_outstanding,compat_turn_id) VALUES ('old-a','d','n','t','async_question','h','cm','unknown','desktop_ipc',1,2,1,'turn-a')").unwrap();
+        migrate(&c).unwrap();
+        migrate(&c).unwrap();
+        let count: i64 = c.query_row("SELECT count(*) FROM pragma_table_info('codex_actions') WHERE name='async_answer_route' AND type='TEXT' AND [notnull]=0 AND dflt_value IS NULL", [], |r| r.get(0)).unwrap();
+        assert_eq!(count, 1, "旧库必须恰好补一列可空路由");
+        let row: (Option<String>, String, String, i64, Option<String>) = c.query_row("SELECT async_answer_route,state,route,compat_outstanding,compat_turn_id FROM codex_actions WHERE action_id='old-a'", [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).unwrap();
+        assert_eq!(
+            row,
+            (
+                None,
+                "unknown".into(),
+                "desktop_ipc".into(),
+                1,
+                Some("turn-a".into())
+            )
+        );
+    }
 
     #[test]
     fn migrate_adds_skill_source_columns() {
