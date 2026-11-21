@@ -2,6 +2,10 @@
 
 # Tuvis
 
+<!-- yarkr:badges:start -->
+[![Indexed on Yarkr](https://api.yarkr.com/functions/v1/api/api/v1/badges/repos/jarvislee90s-dot/tuvis/version.svg)](https://yarkr.com/arks/jarvislee90s-dot/tuvis)
+<!-- yarkr:badges:end -->
+
 **Your desktop mission control for AI coding agents**
 
 Monitor, jump to, and manage Claude Code / Codex CLI / OpenCode / OpenClaw / Kimi Code / WorkBuddy / ZCode / dsh sessions — from your desk or your phone.
@@ -126,6 +130,38 @@ pnpm check          # format:check + lint + build
 - **Helper binaries are feature-gated**: `pnpm tauri:dev` / `pnpm tauri:build` already include the required features; standalone builds need `--features hook-listener` (see [AGENTS.md](AGENTS.md)).
 
 </details>
+
+<!-- yarkr:install:start -->
+## Install with Yarkr
+
+This repo is indexed on [Yarkr](https://yarkr.com/arks/jarvislee90s-dot/tuvis) as the ark [jarvislee90s-dot/tuvis](https://yarkr.com/arks/jarvislee90s-dot/tuvis), so its skills install into Claude Code, Codex, Cursor and other agent harnesses with one command.
+
+### CLI
+
+Install the whole ark, which Yarkr keeps equal to this repo:
+
+```bash
+npx yarkr-cli sync jarvislee90s-dot/tuvis
+```
+
+Or add individual skills:
+
+```bash
+npx yarkr-cli add skill:jarvislee90s-dot/tuvis/win-console-inject-probe
+```
+
+No Node.js? `curl -fsSL https://yarkr.com/install.sh | sh` (macOS, Linux) or `irm https://yarkr.com/install.ps1 | iex` (Windows PowerShell) installs `yarkr` as a standalone binary; then type `yarkr` in place of `npx yarkr-cli`.
+
+### MCP
+
+Connect your agent to the ark over MCP:
+
+```bash
+npx yarkr-cli mcp add jarvislee90s-dot/tuvis
+```
+
+Or point any MCP client at `https://api.yarkr.com/functions/v1/api/mcp/o/jarvislee90s-dot/tuvis`.
+<!-- yarkr:install:end -->
 
 ## Roadmap
 
