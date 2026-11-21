@@ -498,9 +498,11 @@ describe("ProjectedArtifacts：不可用引用与外链", () => {
 });
 
 describe("ProjectedArtifacts：读取失败与解码失败占位", () => {
-  it("敏感路径 / 文件不存在 / 超限 → 可理解占位", async () => {
+  it("文件不存在 / 超限 → 可理解占位；sensitive 旧值按通用读取失败占位（D22）", async () => {
     const reasons = [
-      { error: "sensitive", text: "安全策略保护" },
+      // D22（2026-11-12 note §三）：后端已取消目录准入不再产生 sensitive；
+      // 旧服务端残留值归并到通用读取失败占位（不再展示安全策略文案）
+      { error: "sensitive", text: "无法读取该文件" },
       { error: "not_found", text: "不存在或已被移动" },
       { error: "too_large", text: "超过预览上限" },
     ];

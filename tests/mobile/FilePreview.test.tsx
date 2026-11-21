@@ -229,9 +229,12 @@ describe("FilePreview 403 原因分診（M5 P2-a）", () => {
     renderPreview("/tmp/proj/x.txt");
   }
 
-  it("sensitive → 安全策略文案", async () => {
+  it("sensitive（旧服务端残留值）→ 走通用不可预览兜底而非敏感策略文案（D22）", async () => {
     case403("sensitive");
-    expect((await screen.findByTestId("preview-error")).textContent).toContain("安全策略保护");
+    const text = (await screen.findByTestId("preview-error")).textContent ?? "";
+    expect(text).not.toContain("安全策略保护");
+    expect(text).not.toBe("");
+    expect(text).toContain("无法预览");
   });
 
   it("too_large → 上限文案（文本 500KB / 图片 5MB）", async () => {

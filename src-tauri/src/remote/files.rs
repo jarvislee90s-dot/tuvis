@@ -81,35 +81,9 @@ fn artifact_ext_allowed(path: &str) -> bool {
 // 安全读取（read_file_safe）
 // ============================================================
 
-/// macOS APFS 数据卷 firmlink 前缀折叠：`/System/Volumes/Data/Users/x` 与
-/// `/Users/x` 是同一 inode 的两个字面形态，而 `canonicalize` **不解析 firmlink**
-/// （firmlink 非 symlink）——不折叠会被误判为「主目录外」而整段跳过黑名单
-/// （2026-09-18 复核实锤：该别名可读 `~/.ssh/known_hosts`，194 字节泄露）。
-/// 纯函数、平台中立（非 macOS 上该前缀不出现，调用为恒等变换）。
-fn fold_data_volume_alias(p: &Path) -> PathBuf {
-    const PREFIX: &str = "/System/Volumes/Data/";
-    let s = p.to_string_lossy();
-    match s.strip_prefix(PREFIX) {
-        Some(rest) => PathBuf::from(format!("/{rest}")),
-        None if s == "/System/Volumes/Data" => PathBuf::from("/"),
-        None => p.to_path_buf(),
-    }
-}
-
-/// 敏感黑名单命中判定（纯函数，无 IO——跨平台 CI 锁定用）：
-/// 先对 child/base 两侧折叠 macOS Data 卷 firmlink 前缀（同 inode 双字面归一），
-/// 再判「child 在主目录基准内 ∧ 相对段命中 SENSITIVE_DIRS」。
-/// `windows` = 平台语义注入（路径分隔符双态 + Windows 语义大小写不敏感）。
-fn sensitive_under_home(child: &Path, home_base: &Path, windows: bool) -> bool {
-    let child = fold_data_volume_alias(child);
-    let base = fold_data_volume_alias(home_base);
-    path_within(&child, &base)
-        && is_sensitive_path(&child.to_string_lossy(), &base.to_string_lossy(), windows)
-}
-
-/// 敏感目录拒绝清单（2026-09-16 用户裁决）：主目录放宽后，这些目录下的文件
-/// 对**已配对设备**一律不可读——密钥/凭据/浏览器与会话数据。按路径段精确匹配
-/// （`.ssh2` 这类前缀相似目录不误伤），平台语义可注入便于测试
+/// 敏感目录清单（2026-09-16 用户裁决；2026-11-12 note §三/D22 起**仅创建域**
+/// 继续引用——`inject/create_path.rs` 的黑名单判定读本表；文件预览链的目录
+/// 准入已整体取消，读侧不再引用）
 pub(crate) const SENSITIVE_DIRS: &[&str] = &[
     ".ssh",
     ".aws",
@@ -128,58 +102,9 @@ pub(crate) const SENSITIVE_DIRS: &[&str] = &[
     ".git-credentials",
     "AppData", // Windows 应用数据（含浏览器 profile / 凭据库）
     "Library", // macOS 应用支持与凭据（~/Library/Keychains）
-               // 黑名单仅作用于**用户主目录范围内**（凭据高价值区）；主目录之外不设
-               // 路径级防线（M5 P2-a 全盘放开——系统目录本就低敏，且全路径黑名单会
-               // 误伤 AppData 下的临时文件）
-];
-
-/// 子路径豁免表（T6/D9，手工验收修复批）：SENSITIVE_DIRS 整目录拦截下的「agent
-/// 写给用户看的纯 markdown 产物」豁免——命中黑名单的路径若落在豁免子路径**子树**
-/// 内（段精确：`.claude/plans-x` 不误豁免 `.claude/plans`）则放行预览。
-/// 首例 `.claude/plans`（用户 C-10 发现计划文件「受安全策略保护」）；`.codex/plans`
-/// 为 T0 盘点第二例（<turn>/<uuid>/PLAN.md 子树，纯 md）。凭据/会话原始数据照拦
-/// （豁免只放产物目录；WorkBuddy 等其余候选待黑名单盲区补拦裁决，T0 盘点只记录）。
-///
-/// **批次丙 T7 · 尾段序列匹配**：kimi 的计划产物在
-/// `~/.kimi-code/sessions/wd_<proj>_<hash>/session_<uuid>/agents/main/plans/*.md`
-/// ——前缀含**变量段**（会话 id、工作目录 hash），段精确的静态前缀表永远接不住。
-/// 故 `exempt_subpath_under_home` 增补第二条判据：豁免项作为**连续尾段序列**出现即
-/// 命中（`agents/main/plans` 在 rel 中连续同序出现）。段精确性保持不变（`plans-x`
-/// 不等于 `plans`；非连续同序不命中），凭据面照拦（`.kimi-code` 其余子路径仍被
-/// SENSITIVE_DIRS 拦截，只有明确列出的产物目录放行）。
-const EXEMPT_SUBPATHS: &[&str] = &[
-    ".claude/plans",
-    ".codex/plans",
-    // 2026-10-20：Codex APP 生成图（`~/.codex/generated_images/<thread>/exec-*.png`）
-    // 是模型产物，不是会话/凭据原始数据；不豁免则文件面板可列出但预览必 403。
-    ".codex/generated_images",
-    // T7 第三例：kimi 计划文件（深路径，含会话 id 变量段 → 靠尾段序列匹配；
-    // 实测样本 `~/.kimi-code/sessions/wd_test_.../session_<uuid>/agents/main/plans/
-    // miss-martian-she-hulk-beast.md`）
-    "agents/main/plans",
-];
-
-/// fail-closed 全段匹配面（基准不可用分支专用）：仅凭据类目录。AppData/Library
-/// 是「主目录内」语义段，不进全段面——Windows 的 TEMP 本就在 AppData 之下，
-/// 全局段匹配会误伤一切临时文件（含测试 tempdir，feat/phase2-injection 合并
-/// main 后 Windows 实机回归抓获；与本文件上方"全路径黑名单误伤 AppData 临时
-/// 文件"实测教训同源——那条教训只落在了正常分支，fail-closed 分支漏了）
-const CREDENTIAL_DIRS: &[&str] = &[
-    ".ssh",
-    ".aws",
-    ".gnupg",
-    ".tuvis",
-    ".claude",
-    ".codex",
-    ".kimi-code",
-    ".zcode",
-    ".dsh",
-    ".config",
-    ".docker",
-    ".kube",
-    ".npmrc",
-    ".netrc",
-    ".git-credentials",
+               // 历史注记（2026-09-16 裁决）：预览链曾仅作用于用户主目录范围内；
+               // D22（2026-11-12 note §三）起预览读侧引用解除，本表仅创建域
+               // （inject/create_path.rs）按其自身策略（全局段匹配）消费
 ];
 
 /// 预览拒绝原因（M5 P2-a：403 细分——原因仅暴露给已过闸设备，便于用户自助排障；
@@ -188,9 +113,6 @@ const CREDENTIAL_DIRS: &[&str] = &[
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FileRejectReason {
-    /// 命中敏感目录黑名单（基准可用时仅主目录内路径参与判定；基准不可用时
-    /// 退化为全段匹配——见 `read_file_safe` 的 fail-closed 分支）
-    Sensitive,
     /// 超过预览大小上限
     TooLarge,
     /// 路径不存在 / 不可解析
@@ -205,7 +127,6 @@ impl FileRejectReason {
     /// 日志用中文明细（reason 字段本身走 snake_case 序列化）
     pub fn message(&self) -> String {
         match self {
-            FileRejectReason::Sensitive => "路径命中敏感目录黑名单，不可预览".into(),
             FileRejectReason::TooLarge => format!(
                 "文件超过预览上限（文本 {}KB / 图片 {}MB）",
                 MAX_TEXT_BYTES / 1024,
@@ -218,28 +139,21 @@ impl FileRejectReason {
     }
 }
 
-/// 安全读取文件（M5 P2-a 全盘语义：任意路径可读，仅两道约束——① 主目录内的
-/// 敏感目录黑名单（凭据防护，威胁主体是隧道/局域网上的配对设备读密钥）；②
-/// 只读 + 双阈值大小上限。主目录之外不再设路径级防线：系统目录等本就任何
-/// 用户可读，访问门槛 = PIN + 设备 cookie）。返回 (字节, mime)；拒绝一律
-/// Err(FileRejectReason)（file 端点统一 403 并把 reason 序列化进响应体）。
-/// `path` 支持绝对路径与相对路径（相对者按会话 cwd 解析——部分工具 toolArgs
-/// 记录项目内相对路径）。
+/// 安全读取文件（全盘语义）：任意路径可读，仅两道约束——① 只读；② 双阈值
+/// 大小上限。目录级准入（主目录内敏感黑名单 + 产物子路径豁免 + 基准缺失
+/// fail-closed 凭据段）已按 2026-11-12 note §三（宪法 D22）**整体取消**：信任
+/// 边界统一回到已授权总闸门（PIN + 设备 cookie），读取以 OS 实际权限为准，
+/// 不再伪报目录策略拒绝；`SENSITIVE_DIRS` 仍由 `inject/create_path.rs` 的
+/// 创建域判定引用（读侧引用已解除，原表值保留）。
+/// 返回 (字节, mime)；拒绝一律 Err(FileRejectReason)（file 端点统一 403 并把
+/// reason 序列化进响应体）。`path` 支持绝对路径与相对路径（相对者按会话 cwd
+/// 解析——部分工具 toolArgs 记录项目内相对路径）。
 ///
-/// 边界沿革：2026-09-16 放宽为「cwd ∪ 主目录」；2026-09-18 用户裁决**全盘放开**
-/// ——经常需要查看/参考项目外文件（微信目录附件等）。取舍记录：黑名单仅作用
-/// 于主目录内（凭据高价值区）；主目录外连 Windows 系统目录都不设防（低价值 +
-/// 避免误伤 AppData 下的临时文件/测试目录——全路径黑名单会让 Windows 临时目录
-/// 全部不可读，实测教训）。
-///
-/// `home` = 敏感黑名单的**主目录基准**（非边界）：基准可用时仅主目录内路径过
-/// 段匹配；基准不可用（None / 无法 canonicalize）时退化为**全段保守匹配**
-/// （fail-closed，见 2026-09-18 追记：生产曾传 None 致黑名单整段失效）。
-/// **调用方必须传真实 home**（端点经 `RemoteState.home_source`）。
+/// `home` 参数保留仅为调用方签名稳定（预览链已不再消费）。
 pub fn read_file_safe(
     session_cwd: &str,
     path: &str,
-    home: Option<&str>,
+    _home: Option<&str>,
 ) -> Result<(Vec<u8>, String), FileRejectReason> {
     if path.trim().is_empty() {
         return Err(FileRejectReason::NotFound);
@@ -255,32 +169,6 @@ pub fn read_file_safe(
     let canon = full
         .canonicalize()
         .map_err(|_| FileRejectReason::NotFound)?;
-    // 敏感黑名单（凭据防护，威胁主体 = 隧道/局域网上的配对设备读密钥）：
-    // - 主目录基准可用 → 仅主目录内的路径过段匹配（相对主目录段；主目录之外
-    //   不设路径级防线——M5 P2-a 2026-09-18 裁决原样保留）；
-    // - 基准不可用（未注入 / 无法 canonicalize）→ **全段保守匹配**（fail-closed：
-    //   宁可少读一个文件，凭据防护不因基准缺失而失效；也不让一个坏基准把全部
-    //   预览打成 NotFound——根因回归锁，生产曾在 3d22e2e 传 None 致黑名单整段跳过）
-    match home.and_then(|h| Path::new(h).canonicalize().ok()) {
-        Some(home_canon) => {
-            // firmlink 折叠与归属/段匹配收敛在 sensitive_under_home（纯函数、
-            // 跨平台 CI 锁定——CI 无 macOS runner，平台门控的端到端锁永不执行）
-            // T6：黑名单命中但落在豁免产物子树（.claude/plans 等）→ 放行预览
-            if sensitive_under_home(&canon, &home_canon, cfg!(windows))
-                && !exempt_subpath_under_home(&canon, &home_canon, cfg!(windows))
-            {
-                return Err(FileRejectReason::Sensitive);
-            }
-        }
-        // fail-closed：基准不可用 → 全段匹配（仅凭据目录——AppData/Library 为
-        // 主目录内语义段，全局匹配在 Windows 会误伤 TEMP（其位于 AppData 下），
-        // 见 CREDENTIAL_DIRS 注释）
-        None => {
-            if is_credential_path(&canon.to_string_lossy(), cfg!(windows)) {
-                return Err(FileRejectReason::Sensitive);
-            }
-        }
-    }
     let meta = canon.metadata().map_err(|_| FileRejectReason::NotFound)?;
     if !meta.is_file() {
         return Err(FileRejectReason::NotFile);
@@ -296,175 +184,51 @@ pub fn read_file_safe(
     if meta.len() > max {
         return Err(FileRejectReason::TooLarge);
     }
-    let bytes = std::fs::read(&canon).map_err(|_| FileRejectReason::Io)?;
+    // A5.2/F7（终审 Minor）：stat 与读取之间的**可控变更缝**（仅测试）——
+    // 增长用例经此在 stat 通过后、读取前把文件追加到超限，真实覆盖
+    // 「读取时有界」分支（而非 stat 可见的超限回归）。
+    #[cfg(test)]
+    if let Some(mutator) = STAT_READ_MUTATOR.with(|cell| cell.borrow().clone()) {
+        mutator(&canon);
+        // 变更后重新 stat：仅当仍是常规文件才继续（增长形态）。
+        let grown = canon.metadata().map_err(|_| FileRejectReason::NotFound)?;
+        if !grown.is_file() {
+            return Err(FileRejectReason::NotFile);
+        }
+    }
+    // A5.2/F7：实际读取亦有界——stat 与读取之间的增长不得绕过上限
+    //（take(max+1) 截断 + 多读一字节探测超限；恰好上限完整可读、无空成功）。
+    let file = std::fs::File::open(&canon).map_err(|_| FileRejectReason::Io)?;
+    let mut limited = file.take(max + 1);
+    let mut bytes = Vec::new();
+    use std::io::Read as _;
+    limited
+        .read_to_end(&mut bytes)
+        .map_err(|_| FileRejectReason::Io)?;
+    if bytes.len() as u64 > max {
+        return Err(FileRejectReason::TooLarge);
+    }
     Ok((bytes, mime))
 }
 
-/// 敏感路径判定内核（纯函数，平台语义可注入）：路径**相对主目录**的每一段
-/// 命中 SENSITIVE_DIRS 即拒（含嵌套 `.config/gh/hosts.yml`）。分隔符双态
-/// （`/` 与 `\`）、Windows 语义大小写不敏感、剥 verbatim 前缀——macOS 形态
-/// `/Users/x/.ssh/id_rsa` 与 Windows 形态 `C:\Users\x\.ssh\id_rsa` 一并覆盖
-fn is_sensitive_path(child: &str, home: &str, windows: bool) -> bool {
-    any_segment_hit(child, home, SENSITIVE_DIRS, windows)
+#[cfg(test)]
+thread_local! {
+    /// A5.2/F7：stat→read 之间的可控变更缝（None = 直通）。
+    static STAT_READ_MUTATOR: std::cell::RefCell<Option<std::rc::Rc<dyn Fn(&Path)>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
-/// fail-closed 全段面（基准不可用）：仅凭据目录参与（见 CREDENTIAL_DIRS 注释）
-fn is_credential_path(child: &str, windows: bool) -> bool {
-    any_segment_hit(child, "/", CREDENTIAL_DIRS, windows)
-}
-
-/// 豁免子路径判定（T6 纯函数，平台语义可注入）：路径相对主目录的 rel 前缀命中
-/// EXEMPT_SUBPATHS 且段边界精确（`{entry}/` 前缀——`plans-x` 不吃 `plans` 的豁免）。
-/// 仅主目录内生效（fail-closed 基准缺失分支不豁免——无法验证落点时保守照拦）；
-/// 归一口径与 any_segment_hit 同源（双分隔符/verbatim 剥离/Windows 大小写）
-fn exempt_subpath_under_home(child: &Path, home_base: &Path, windows: bool) -> bool {
-    let child = fold_data_volume_alias(child);
-    let base = fold_data_volume_alias(home_base);
-    if !path_within(&child, &base) {
-        return false;
+/// A5.2/F7（测试缝）：安装 stat→read 之间的文件变更回调；返回清除守卫。
+#[cfg(test)]
+pub(crate) fn install_stat_read_mutator(mutator: Option<std::rc::Rc<dyn Fn(&Path)>>) -> impl Drop {
+    struct Guard;
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            STAT_READ_MUTATOR.with(|cell| *cell.borrow_mut() = None);
+        }
     }
-    let norm = |s: &str| -> String {
-        let s = if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
-            format!(r"\\{rest}")
-        } else if let Some(rest) = s.strip_prefix(r"\\?\") {
-            rest.to_string()
-        } else {
-            s.to_string()
-        };
-        let mut s = s.replace('\\', "/");
-        while s.len() > 1 && s.ends_with('/') {
-            s.pop();
-        }
-        if windows {
-            s.to_lowercase()
-        } else {
-            s.to_string()
-        }
-    };
-    let rel = norm(&child.to_string_lossy())
-        .strip_prefix(&norm(&base.to_string_lossy()))
-        .map(|r| r.trim_start_matches('/').to_string())
-        .unwrap_or_default();
-    let rel_segs: Vec<&str> = rel.split('/').filter(|s| !s.is_empty()).collect();
-    EXEMPT_SUBPATHS.iter().any(|e| {
-        let e = if windows {
-            e.to_lowercase()
-        } else {
-            e.to_string()
-        };
-        // ① 前缀形态（既有）：`.claude/plans/...` —— rel 以该子路径开头
-        if rel.starts_with(&format!("{e}/")) {
-            return true;
-        }
-        // ② 尾段序列形态（批次丙 T7）：`.kimi-code/…/agents/main/plans/<f>.md`
-        // 这类**路径前缀含变量段**（会话 id）的产物目录接不住前缀形态，改用
-        // **尾段序列**匹配：rel 的**连续段序列**与豁免项段序列全等。
-        //
-        // 段精确不放松：比对的是完整段序列（`plans-x` 不等于 `plans`；
-        // `agents/main/plans` 只在**连续同序**出现时命中）。凭据面照拦——
-        // 豁免项本身写死为产物目录（见 EXEMPT_SUBPATHS 注释），不含会话/凭据目录。
-        let pat: Vec<&str> = e.split('/').filter(|s| !s.is_empty()).collect();
-        if pat.is_empty() || pat.len() > rel_segs.len() {
-            return false;
-        }
-        rel_segs
-            .windows(pat.len())
-            .any(|w| w.iter().zip(&pat).all(|(a, b)| a == b))
-    })
-}
-
-/// 段匹配内核：child 相对 home 的路径段（home 之下取相对段，否则全段）与给定
-/// 目录清单精确比对（平台语义大小写注入）
-fn any_segment_hit(child: &str, home: &str, dirs: &[&str], windows: bool) -> bool {
-    let norm = |s: &str| -> String {
-        let s = if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
-            format!(r"\\{rest}")
-        } else if let Some(rest) = s.strip_prefix(r"\\?\") {
-            rest.to_string()
-        } else {
-            s.to_string()
-        };
-        let mut s = s.replace('\\', "/");
-        while s.len() > 1 && s.ends_with('/') {
-            s.pop();
-        }
-        if windows {
-            s.to_lowercase()
-        } else {
-            s
-        }
-    };
-    let c = norm(child);
-    let h = norm(home);
-    // 相对主目录的部分（不在 home 之下时——cwd 内路径——用全段匹配，
-    // 项目目录里叫 .config 的子目录同样按敏感处理，宁可少读一个文件）
-    let rel = c
-        .strip_prefix(&h)
-        .map(|r| r.trim_start_matches('/').to_string())
-        .unwrap_or_else(|| c.trim_start_matches('/').to_string());
-    rel.split('/').any(|seg| {
-        let seg = if windows {
-            seg.to_lowercase()
-        } else {
-            seg.to_string()
-        };
-        dirs.iter().any(|d| {
-            let d = if windows {
-                d.to_lowercase()
-            } else {
-                (*d).to_string()
-            };
-            seg == d
-        })
-    })
-}
-
-/// 路径包含判定（canonicalize 之后的双方）：Windows 语义自动分派
-fn path_within(child: &Path, ancestor: &Path) -> bool {
-    path_within_semantics(
-        &child.to_string_lossy(),
-        &ancestor.to_string_lossy(),
-        cfg!(windows),
-    )
-}
-
-/// 路径包含判定内核（字符串级、平台语义可注入——darwin 上可测全分支）：
-/// - 剥 Windows verbatim 前缀（`\\?\UNC\` → `\\`、`\\?\` → 空），统一分隔符为 `/`，
-///   去尾部分隔符；Windows 语义整体转小写（文件系统大小写不敏感）；
-/// - 前缀命中后剩余必须为空或以 `/` 开头（`/ab` 不在 `/a` 之下——分隔符边界）；
-/// - 祖先为根（`/`）时任意绝对路径都包含（根即一切）。
-fn path_within_semantics(child: &str, ancestor: &str, windows: bool) -> bool {
-    let norm = |s: &str| -> String {
-        // 剥 verbatim 前缀（UNC 形态还原为 `\\server\share` 常规形态再统一分隔符）
-        let s = if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
-            format!(r"\\{rest}")
-        } else if let Some(rest) = s.strip_prefix(r"\\?\") {
-            rest.to_string()
-        } else {
-            s.to_string()
-        };
-        let mut s = s.replace('\\', "/");
-        while s.len() > 1 && s.ends_with('/') {
-            s.pop();
-        }
-        if windows {
-            s.to_lowercase()
-        } else {
-            s
-        }
-    };
-    let c = norm(child);
-    let a = norm(ancestor);
-    if a.is_empty() {
-        return false;
-    }
-    if a == "/" {
-        return c.starts_with('/');
-    }
-    match c.strip_prefix(&a) {
-        Some(rest) => rest.is_empty() || rest.starts_with('/'),
-        None => false,
-    }
+    STAT_READ_MUTATOR.with(|cell| *cell.borrow_mut() = mutator);
+    Guard
 }
 
 /// 按扩展名给 MIME（预览渲染分支依据；未知扩展回落 text/plain——按纯文本
@@ -1307,6 +1071,94 @@ mod tests {
         );
     }
 
+    /// A5.2（F7）增长场景：小文件创建 → 复制引用 → 追加至超限 → read_file_safe
+    /// → TooLarge 且无字节返回（无空成功）。有界读取（File::take(max+1)）下
+    /// stat 后增长在读侧被截断探测（超过 max+1 即 TooLarge，无需外部时序缝）。
+    #[test]
+    fn read_file_safe_rejects_growth_beyond_cap_after_stat() {
+        // A5.2（终审 Minor）：经 stat→read 定序缝的真实「读取时增长」覆盖——
+        // 调用前文件恰在上限内（stat 可见通过），缝内在读取前追加超限，
+        // 断言有界读取在读侧截断探测为 TooLarge 且无字节返回。
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().to_str().unwrap();
+        let txt = tmp.path().join("grow.txt");
+        std::fs::write(&txt, vec![b'a'; MAX_TEXT_BYTES as usize]).unwrap();
+        {
+            let grown = txt.clone();
+            let _guard = install_stat_read_mutator(Some(std::rc::Rc::new(move |_| {
+                let bigger: Vec<u8> = vec![b'a'; MAX_TEXT_BYTES as usize + 1];
+                let _ = std::fs::write(&grown, bigger);
+            })));
+            match read_file_safe(cwd, txt.to_str().unwrap(), Some(cwd)) {
+                Err(FileRejectReason::TooLarge) => {}
+                Err(other) => panic!("stat 后增长超限必须 TooLarge，实际 {other:?}"),
+                Ok((bytes, _)) => panic!(
+                    "stat 后增长超限必须拒绝且无字节返回，实际返回 {} 字节",
+                    bytes.len()
+                ),
+            }
+        }
+        // 图片阈值同理（5 MiB + 1，缝内追加）。
+        let png = tmp.path().join("grow.png");
+        std::fs::write(&png, vec![0u8; MAX_IMAGE_BYTES as usize]).unwrap();
+        {
+            let grown = png.clone();
+            let _guard = install_stat_read_mutator(Some(std::rc::Rc::new(move |_| {
+                let bigger: Vec<u8> = vec![0u8; MAX_IMAGE_BYTES as usize + 1];
+                let _ = std::fs::write(&grown, bigger);
+            })));
+            match read_file_safe(cwd, png.to_str().unwrap(), Some(cwd)) {
+                Err(FileRejectReason::TooLarge) => {}
+                Err(other) => panic!("图片 stat 后增长超限必须 TooLarge，实际 {other:?}"),
+                Ok((bytes, _)) => panic!(
+                    "图片 stat 后增长超限必须拒绝且无字节返回，实际返回 {} 字节",
+                    bytes.len()
+                ),
+            }
+        }
+    }
+
+    /// A5.2（F7）：实际读取硬上限合同。
+    /// 合同点 = stat 后增长超限明确拒绝（读后 bytes.len() > max → TooLarge）；
+    /// 可观察面 = 当前实现 stat 与 `fs::read` 为相邻 syscall 且无注入缝（外部
+    /// 时序不可控），故本用例钉住可达面（恰上限完整可读 / stat 可见超限明确
+    /// 拒绝 TooLarge / 非空文件无空成功）；stat 后增长的注入形态留待实现侧
+    /// 补缝（读后上限校验）后以同形样本转 RED→GREEN。
+    /// 既有回归面（不重写断言，仅名称核对）：`read_file_safe_enforces_dual_size_thresholds`
+    /// （双阈值两侧样本）、`read_file_safe_allows_outside_project_and_home`
+    /// （原限制目录隔离已取消、普通文件可读）；认证/响应头（CSP/nosniff/
+    /// no-store）/HTML iframe 沙箱/D21 创建路径保护由 codex_ipc_remote 集成面
+    /// 既有用例覆盖（file 端点统一 403 + reason 序列化）。
+    #[test]
+    fn read_file_safe_f7_hard_cap_contract() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().to_str().unwrap();
+        // 恰上限：可读且读取字节数 == stat 尺寸（实际读取有限）。
+        let txt = tmp.path().join("exact.txt");
+        std::fs::write(&txt, vec![b'a'; MAX_TEXT_BYTES as usize]).unwrap();
+        let (bytes, _) = read_file_safe(cwd, txt.to_str().unwrap(), Some(cwd)).unwrap();
+        assert_eq!(bytes.len(), MAX_TEXT_BYTES as usize, "恰上限完整可读");
+        assert!(!bytes.is_empty(), "非空文件无空成功");
+        // 上限 + 1（stat 可见）：明确 TooLarge（非 Io/NotFound 误报）。
+        std::fs::write(&txt, vec![b'a'; MAX_TEXT_BYTES as usize + 1]).unwrap();
+        assert_eq!(
+            read_file_safe(cwd, txt.to_str().unwrap(), Some(cwd)).unwrap_err(),
+            FileRejectReason::TooLarge,
+            "stat 可见超限明确拒绝（TooLarge）"
+        );
+        // 图片阈值同理（5 MiB 恰上限 / +1）。
+        let png = tmp.path().join("exact.png");
+        std::fs::write(&png, vec![0u8; MAX_IMAGE_BYTES as usize]).unwrap();
+        let (bytes, mime) = read_file_safe(cwd, png.to_str().unwrap(), Some(cwd)).unwrap();
+        assert_eq!(bytes.len(), MAX_IMAGE_BYTES as usize);
+        assert_eq!(mime, "image/png");
+        std::fs::write(&png, vec![0u8; MAX_IMAGE_BYTES as usize + 1]).unwrap();
+        assert_eq!(
+            read_file_safe(cwd, png.to_str().unwrap(), Some(cwd)).unwrap_err(),
+            FileRejectReason::TooLarge
+        );
+    }
+
     /// 全盘放开（2026-09-18 用户裁决）：项目外 / 主目录外的文件**放行**——
     /// 经常需要查看/参考项目目录外文件（微信目录附件等实测场景）；
     /// 访问门槛 = PIN + 设备 cookie，路径级防线收敛为敏感目录黑名单
@@ -1346,17 +1198,16 @@ mod tests {
             read_file_safe(cwd, outside.to_str().unwrap(), Some(home.to_str().unwrap()))
                 .unwrap_or_else(|e| panic!("全盘语义下主目录外文件必须放行: {e:?}"));
         assert_eq!(bytes, b"x");
-        // home=None ⇒ 基准不可用 → 全段保守匹配分支：outside.txt 不含敏感段，
-        // 故仍可读（全盘语义不变；黑名单对含敏感段路径照拒——见
-        // sensitive_check_still_applies_when_home_base_unusable）
+        // home=None ⇒ 无任何预览边界（D22：准入取消；OS 权限为准）
         let r = read_file_safe(cwd, outside.to_str().unwrap(), None);
         assert!(r.is_ok(), "home=None 不再构成边界（全盘语义）");
     }
 
-    /// 敏感目录拒绝清单（2026-09-16 用户裁决）：主目录内但这些目录下的文件
-    /// 一律拒绝——配对手机不得读取密钥与凭据
+    /// D22（2026-11-12 note §三）：预览目录准入取消后的新行为锁——原敏感清单
+    /// 目录下的普通文件沿现有预览入口可读（OS 权限为准），不再伪报目录策略
+    /// 拒绝；前缀相似目录本就不误伤。创建域（create_path）仍引用原表，不在本锁。
     #[test]
-    fn read_file_safe_rejects_sensitive_dirs_inside_home() {
+    fn sensitive_dirs_preview_like_any_other_file_after_d22() {
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path().join("home");
         let proj = home.join("Desktop").join("proj");
@@ -1364,47 +1215,32 @@ mod tests {
         let cwd = proj.to_str().unwrap();
         let home_s = home.to_str().unwrap();
 
-        for dir in [
-            ".ssh",
-            ".aws",
-            ".gnupg",
-            ".tuvis",
-            ".claude",
-            ".codex",
-            ".kimi-code",
-            ".zcode",
-            ".dsh",
-            ".config",
-            ".docker",
-            ".kube",
-            ".npmrc",
-        ] {
+        for dir in [".ssh", ".aws", ".config", ".codex", ".kimi-code"] {
             let d = home.join(dir);
             std::fs::create_dir_all(&d).unwrap();
-            let f = d.join("id_rsa");
-            std::fs::write(&f, "PRIVATE").unwrap();
+            let f = d.join("notes.txt");
+            std::fs::write(&f, "content").unwrap();
             let r = read_file_safe(cwd, f.to_str().unwrap(), Some(home_s));
             assert!(
-                r.is_err(),
-                "敏感目录 {dir} 下的文件必须拒绝（配对设备不得读凭据）"
+                r.is_ok(),
+                "D22 后敏感目录 {dir} 下普通文件必须可预览（准入已取消）"
             );
         }
-        // 敏感目录的**同级前缀**目录不得被误伤（.ssh2 不是 .ssh）
+        // 前缀相似目录（.ssh2）与普通文件一样可读（回归不变量保持）
         let lookalike = home.join(".ssh2");
         std::fs::create_dir_all(&lookalike).unwrap();
         let f = lookalike.join("notes.txt");
         std::fs::write(&f, "ok").unwrap();
         assert!(
             read_file_safe(cwd, f.to_str().unwrap(), Some(home_s)).is_ok(),
-            "前缀相似目录（.ssh2）不得被误拒"
+            "前缀相似目录（.ssh2）必须可读"
         );
     }
 
-    /// 黑名单基准不可用时的保守语义：敏感段照拒——凭据防护不得因基准缺失而
-    /// 失效（M5 P2-a 追记回归：生产曾传 None 致黑名单整段跳过，配对设备可读
-    /// ~/.ssh）；且坏基准不得把一个普通文件读成 NotFound 错误（不打死预览）
+    /// D22 后：home 基准缺失/坏基准不再构成任何预览边界——原 fail-closed 分支
+    /// 已随准入取消退役；坏基准不得把读取打成 NotFound（回归不变量保持）。
     #[test]
-    fn sensitive_check_still_applies_when_home_base_unusable() {
+    fn sensitive_paths_readable_even_when_home_base_unusable() {
         let tmp = tempfile::tempdir().unwrap();
         let proj = tmp.path().join("proj");
         std::fs::create_dir_all(&proj).unwrap();
@@ -1417,27 +1253,19 @@ mod tests {
         let ok = tmp.path().join("notes.txt");
         std::fs::write(&ok, "ok").unwrap();
 
-        // (1) home 未注入 → 敏感段必须拒（fail-closed）
-        assert_eq!(
-            read_file_safe(cwd, secret.to_str().unwrap(), None).unwrap_err(),
-            FileRejectReason::Sensitive,
-            "home 未知时敏感段必须照拒（fail-closed）"
-        );
-        // (2) home 给了但不存在（canonicalize 失败）→ 同样拒，且不得误报 NotFound
-        assert_eq!(
-            read_file_safe(cwd, secret.to_str().unwrap(), Some("/no-such-mam-home")).unwrap_err(),
-            FileRejectReason::Sensitive,
-            "坏基准下敏感段仍须拒（不得退化为 NotFound 跳过检查）"
-        );
-        // (3) 两者下普通文件仍可读（不误伤全盘语义、不打死预览）
+        // (1) home 未注入 → 敏感段普通文件可读（准入已取消；OS 权限为准）
         assert!(
-            read_file_safe(cwd, ok.to_str().unwrap(), None).is_ok(),
-            "基准不可用不得妨碍普通文件（全盘语义不变）"
+            read_file_safe(cwd, secret.to_str().unwrap(), None).is_ok(),
+            "home 未知不再构成预览边界（D22）"
         );
+        // (2) 坏基准（canonicalize 失败）同样可读，且不得误报 NotFound
         assert!(
-            read_file_safe(cwd, ok.to_str().unwrap(), Some("/no-such-mam-home")).is_ok(),
-            "坏基准不得让普通文件读取整体失败"
+            read_file_safe(cwd, secret.to_str().unwrap(), Some("/no-such-mam-home")).is_ok(),
+            "坏基准不得构成预览边界（D22）"
         );
+        // (3) 普通文件照常可读（回归不变量保持）
+        assert!(read_file_safe(cwd, ok.to_str().unwrap(), None).is_ok());
+        assert!(read_file_safe(cwd, ok.to_str().unwrap(), Some("/no-such-mam-home")).is_ok());
     }
 
     /// macOS firmlink 别名旁路回归锁（2026-09-18 复核阻塞项）：
@@ -1467,18 +1295,17 @@ mod tests {
             "夹具别名必须真实存在（先 canonicalize 再加前缀，见本测试文档）"
         );
 
-        // (1) 别名形态的凭据必须拒（本锁的靶心；修复前此处 Ok = 泄露）
-        assert_eq!(
-            read_file_safe(h, &alias(".ssh/id_rsa"), Some(h)).unwrap_err(),
-            FileRejectReason::Sensitive,
-            "firmlink 别名不得绕过敏感黑名单（2026-09-18 复核阻塞项）"
+        // (1) 别名形态凭据文件可读（D22：准入已取消，OS 权限为准）
+        assert!(
+            read_file_safe(h, &alias(".ssh/id_rsa"), Some(h)).is_ok(),
+            "firmlink 别名形态文件必须可预览（D22）"
         );
-        // (2) 别名形态的普通文件仍可读（不得靠全盘拒绝蒙混过关）
+        // (2) 别名形态的普通文件仍可读（回归不变量保持）
         assert!(
             read_file_safe(h, &alias("ok.txt"), Some(h)).is_ok(),
-            "别名形态普通文件必须放行（黑名单不得误伤）"
+            "别名形态普通文件必须放行"
         );
-        // (3) 主目录**外**别名路径不设路径级防线（2026-09-18 裁决未收窄）
+        // (3) 主目录**外**别名路径可读（回归不变量保持）
         let out = tempfile::tempdir().unwrap();
         let op = out.path().canonicalize().unwrap().join(".ssh");
         std::fs::create_dir_all(&op).unwrap();
@@ -1486,41 +1313,12 @@ mod tests {
         let outside = format!("/System/Volumes/Data{}", op.join("n.txt").display());
         assert!(
             read_file_safe(h, &outside, Some(h)).is_ok(),
-            "主目录外路径不设防线（裁决未被收窄）"
+            "主目录外路径可读"
         );
     }
 
-    /// firmlink 前缀折叠纯函数锁（跨平台——CI 只有 ubuntu 跑 `cargo test`，
-    /// `#[cfg(target_os = "macos")]` 的端到端锁在 CI 永不执行，2026-09-18 复核
-    /// Important）：别名形态折叠、恒等形态原样、挂载点本身归根。
-    #[test]
-    fn fold_data_volume_alias_folds_prefix_and_keeps_others() {
-        // 别名形态 → 折叠为主目录字面
-        assert_eq!(
-            fold_data_volume_alias(Path::new("/System/Volumes/Data/Users/u/.ssh/id_rsa")),
-            Path::new("/Users/u/.ssh/id_rsa")
-        );
-        // 恒等：非前缀路径原样返回
-        assert_eq!(
-            fold_data_volume_alias(Path::new("/Users/u/.ssh/id_rsa")),
-            Path::new("/Users/u/.ssh/id_rsa")
-        );
-        // 挂载点本身 → 根
-        assert_eq!(
-            fold_data_volume_alias(Path::new("/System/Volumes/Data")),
-            Path::new("/")
-        );
-    }
-
-    /// 折叠 + 归属 + 段匹配的组合判定锁（跨平台，纯字符串无 IO）：
-    /// 覆盖 CI 不可达的 firmlink 别名形态——折叠被还原为恒等时，别名用例必红；
-    /// 同时锁定裁决边界（主目录外含敏感段名不设防线、主目录内非敏感不误伤）。
-    /// T6（D9）：豁免子路径边界锁——`.claude/plans` 与 `.codex/plans` 子树放行
-    /// （黑名单命中但豁免），同工具其余路径（会话/凭据）照拦；段精确不误伤
-    /// （`plans-x` 不吃 `plans` 的豁免）。组合判定：sensitive 命中 ∧ 豁免成立
-    /// ⇒ 调用方放行（files.rs 主路径的 `&& !exempt` 形态）
     /// 2026-10-20 快速接入：消息流读不到时，Codex APP 生成图仍进「会话产物」池，
-    /// 且预览豁免 `.codex/generated_images`（否则列表可见但点击 403）。
+    /// 且可预览（D22 后沿全盘语义可读，不再依赖豁免表）。
     #[test]
     fn codex_generated_images_appear_in_file_pool_and_are_previewable() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1545,199 +1343,9 @@ mod tests {
             hit.path.as_str(),
             Some(home.to_str().unwrap()),
         )
-        .expect("生成的 PNG 预览必须豁免 .codex 敏感目录");
+        .expect("生成的 PNG 预览可读（D22 全盘语义）");
         assert_eq!(mime, "image/png");
         assert_eq!(bytes, b"\x89PNG\r\n\x1a\n");
-    }
-
-    #[test]
-    fn exempt_subpaths_allow_plan_artifacts_only() {
-        let home = Path::new("/Users/u");
-        // 豁免产物：黑名单命中 ∧ 豁免成立 → 放行
-        for p in [
-            "/Users/u/.claude/plans/shiny-words.md",
-            "/Users/u/.codex/plans/turn-1/018f-uuid/PLAN.md", // 子树嵌套（T0 盘点形态）
-            "/Users/u/.codex/generated_images/01a1433f-b5cb-7450-98c8-ea40acc92288/exec-ad90a013-6d1e-4c38-a545-f3b098378e75.png",
-        ] {
-            assert!(
-                sensitive_under_home(Path::new(p), home, false),
-                "{p} 应命中黑名单（否则豁免无从谈起）"
-            );
-            assert!(
-                exempt_subpath_under_home(Path::new(p), home, false),
-                "{p} 应豁免"
-            );
-        }
-        // 照拦：同工具非豁免路径（会话/凭据/记忆）
-        for p in [
-            "/Users/u/.claude/projects/abc.jsonl",
-            "/Users/u/.claude/credentials.yaml",
-            "/Users/u/.codex/auth.json",
-            "/Users/u/.codex/sessions/2026/09/20/rollout-x.jsonl",
-            "/Users/u/.codex/generated_images-x/a.png", // 段精确：不误伤
-        ] {
-            assert!(
-                sensitive_under_home(Path::new(p), home, false),
-                "{p} 应照拦"
-            );
-            assert!(
-                !exempt_subpath_under_home(Path::new(p), home, false),
-                "{p} 不在豁免子树"
-            );
-        }
-        // 段精确：`plans-x` 目录不吃 `plans` 的豁免（前后缀相似不误伤，黑名单
-        // 同款裁决口径）
-        let p = "/Users/u/.claude/plans-x/secret.md";
-        assert!(sensitive_under_home(Path::new(p), home, false));
-        assert!(
-            !exempt_subpath_under_home(Path::new(p), home, false),
-            "段精确：plans-x 不豁免"
-        );
-        // Windows 语义（大小写不敏感 + 反斜杠）
-        assert!(exempt_subpath_under_home(
-            Path::new("C:/Users/u/.Claude/Plans/a.md"),
-            Path::new("C:/Users/u"),
-            true
-        ));
-    }
-
-    /// 批次丙 T7：**尾段序列匹配**——kimi 计划产物在深路径（前缀含会话 id 变量段），
-    /// 前缀形态接不住，靠「豁免项作为连续尾段序列出现」命中；段精确性与凭据面
-    /// 照旧（`plans-x` 不豁免、`.kimi-code` 其余路径照拦）
-    #[test]
-    fn exempt_tail_sequence_matches_kimi_plan_paths() {
-        let home = Path::new("/Users/u");
-        // 实机路径形态（本机实测样本）：wd_<proj>_<hash>/session_<uuid>/agents/main/plans/x.md
-        let hit = "/Users/u/.kimi-code/sessions/wd_test_72c4040eb71a/session_46b9cd5f-c817-4b84-a7ef-ee1ff8a4c59d/agents/main/plans/miss-martian-she-hulk-beast.md";
-        assert!(
-            sensitive_under_home(Path::new(hit), home, false),
-            "kimi 计划路径命中 .kimi-code 黑名单（否则豁免无从谈起）"
-        );
-        assert!(
-            exempt_subpath_under_home(Path::new(hit), home, false),
-            "T7：kimi 深路径计划文件应豁免（尾段序列 agents/main/plans）"
-        );
-        // 多级 plans 子目录同样命中（尾段序列不要求是叶子目录）
-        assert!(exempt_subpath_under_home(
-            Path::new("/Users/u/.kimi-code/x/y/agents/main/plans/sub/p.md"),
-            home,
-            false
-        ));
-        // 照拦：kimi 其余路径（会话数据/配置——凭据面不放松）
-        for p in [
-            "/Users/u/.kimi-code/config.toml",
-            "/Users/u/.kimi-code/sessions/wd_x/session_y/agents/main/wire.jsonl",
-            "/Users/u/.kimi-code/sessions/wd_x/session_y/agents/main/plans-x/secret.md",
-            // 段序列不连续 → 不命中（`agents/plans/main` 不等于 `agents/main/plans`）
-            "/Users/u/.kimi-code/sessions/x/agents/plans/main/f.md",
-        ] {
-            assert!(
-                !exempt_subpath_under_home(Path::new(p), home, false),
-                "{p} 应照拦"
-            );
-        }
-        // Windows 形态（反斜杠 + 大写盘符）
-        assert!(exempt_subpath_under_home(
-            Path::new(r"C:\Users\u\.kimi-code\sessions\wd_x\session_y\agents\main\plans\p.md"),
-            Path::new(r"C:\Users\u"),
-            true
-        ));
-    }
-
-    #[test]
-    fn sensitive_home_hit_covers_firmlink_alias_and_keeps_ruling_boundary() {
-        let home = Path::new("/Users/u");
-
-        // firmlink 别名形态（主目录内凭据）→ 命中
-        assert!(sensitive_under_home(
-            Path::new("/System/Volumes/Data/Users/u/.ssh/id_rsa"),
-            home,
-            false
-        ));
-        // 直接形态（主目录内凭据）→ 命中
-        assert!(sensitive_under_home(
-            Path::new("/Users/u/.ssh/id_rsa"),
-            home,
-            false
-        ));
-        // Windows 盘符形态 → 命中（段匹配的 Windows 语义）
-        assert!(sensitive_under_home(
-            Path::new("C:\\Users\\u\\.ssh\\id_rsa"),
-            Path::new("C:/Users/u"),
-            true
-        ));
-        // 主目录外含敏感段名 → 不命中（2026-09-18 裁决：主目录外不设防线）
-        assert!(!sensitive_under_home(
-            Path::new("/System/Volumes/Data/Users/other/.ssh/id_rsa"),
-            home,
-            false
-        ));
-        // 主目录内非敏感 → 不命中（不误伤）
-        assert!(!sensitive_under_home(
-            Path::new("/Users/u/notes.txt"),
-            home,
-            false
-        ));
-    }
-
-    /// 敏感清单匹配内核（纯函数，平台语义可注入）：
-    /// - 命中清单任一段即拒（含嵌套 .config/xxx）；
-    /// - macOS 形态（/Users/x/.ssh/id_rsa）与 Windows 形态（C:\Users\x\.ssh\id_rsa）
-    ///   必须一并覆盖；大小写不敏感（Windows 语义）
-    #[test]
-    fn sensitive_path_check_covers_mac_and_windows_forms() {
-        // macOS 形态（正斜杠）
-        assert!(is_sensitive_path(
-            "/Users/alice/.ssh/id_rsa",
-            "/Users/alice",
-            true
-        ));
-        assert!(is_sensitive_path(
-            "/Users/alice/.aws/credentials",
-            "/Users/alice",
-            true
-        ));
-        // Windows 形态（反斜杠，大小写混合）
-        assert!(is_sensitive_path(
-            r"C:\Users\bunny\.SSH\id_rsa",
-            r"C:\Users\bunny",
-            true
-        ));
-        assert!(is_sensitive_path(
-            r"C:\Users\bunny\.gnupg\secring.gpg",
-            r"C:\Users\bunny",
-            true
-        ));
-        // 嵌套命中：清单项出现在路径中段也算（~/.config/gh/hosts.yml）
-        assert!(is_sensitive_path(
-            "/Users/alice/.config/gh/hosts.yml",
-            "/Users/alice",
-            true
-        ));
-        // 普通文件不误拒
-        assert!(!is_sensitive_path(
-            "/Users/alice/Downloads/trip.png",
-            "/Users/alice",
-            true
-        ));
-        assert!(!is_sensitive_path(
-            r"C:\Users\bunny\Desktop\proj\src\main.rs",
-            r"C:\Users\bunny",
-            true
-        ));
-        // 前缀相似不误拒（.ssh2 / .awsome）
-        assert!(!is_sensitive_path(
-            "/Users/alice/.ssh2/notes.txt",
-            "/Users/alice",
-            true
-        ));
-        assert!(!is_sensitive_path(
-            "/Users/alice/.awsome/x.txt",
-            "/Users/alice",
-            true
-        ));
-        // 目录名恰好等于清单项本身（非其内文件）仍拒（目录不可预览，语义一致）
-        assert!(is_sensitive_path("/Users/alice/.ssh", "/Users/alice", true));
     }
 
     #[test]
@@ -1815,54 +1423,6 @@ mod tests {
     }
 
     // ==== path_within_semantics（Windows 语义注入，darwin 全分支可测）====
-
-    #[test]
-    fn path_within_unix_semantics_with_boundary() {
-        assert!(path_within_semantics("/a/b/c", "/a/b", false));
-        assert!(
-            path_within_semantics("/a/b", "/a/b", false),
-            "自身包含自身（目录拒绝由 is_file 兜）"
-        );
-        assert!(
-            path_within_semantics("/a/x", "/", false),
-            "根包含一切绝对路径"
-        );
-        // 分隔符边界：/ab 不在 /a 之下
-        assert!(!path_within_semantics("/ab", "/a", false));
-        assert!(!path_within_semantics("/a/b", "/a/c", false));
-        assert!(
-            !path_within_semantics("/a/b", "", false),
-            "空祖先不含任何路径"
-        );
-        // 相对路径形态不误判（canonicalize 后不会出现，防御性只判字面）
-        assert!(!path_within_semantics("a/b", "/a", false));
-    }
-
-    #[test]
-    fn path_within_windows_semantics_strips_verbatim_and_case_insensitive() {
-        // verbatim 前缀剥离 + 大小写不敏感（canonicalize 恒返 \\?\ 形态 vs 字面 cwd）
-        assert!(path_within_semantics(
-            r"\\?\C:\proj\src\m.rs",
-            r"C:\proj",
-            true
-        ));
-        assert!(path_within_semantics(
-            r"C:\proj\src\m.rs",
-            r"\\?\C:\PROJ",
-            true
-        ));
-        // UNC 形态还原
-        assert!(path_within_semantics(
-            r"\\?\UNC\server\share\x.txt",
-            r"\\server\share",
-            true
-        ));
-        // 边界：C:\proj2 不在 C:\proj 之下
-        assert!(!path_within_semantics(r"\\?\C:\proj2\a", r"C:\proj", true));
-        assert!(!path_within_semantics(r"\\?\D:\proj\a", r"C:\proj", true));
-        // 尾部分隔符的祖先
-        assert!(path_within_semantics(r"\\?\C:\proj\a", r"C:\proj\", true));
-    }
 
     // ==== extract_paths_from_messages ====
 
@@ -2055,28 +1615,29 @@ mod tests {
         }
     }
 
-    /// 评审 I1 回归锁（M5 P2-a 全盘语义下语义不变）：会话 cwd == 用户主目录时，
-    /// ~/.ssh/id_rsa 必须仍被拒绝（黑名单全路径一致生效，无 cwd 豁免），而
-    /// ~/Downloads 下的普通文件仍可读
+    /// D22 后：cwd==home（在 ~ 下启动 agent 的常见场景）时，~/.ssh 与
+    /// ~/Downloads 一视同仁可读（目录准入已取消）。
     #[test]
-    fn read_file_safe_cwd_equals_home_still_enforces_sensitive_list() {
+    fn read_file_safe_cwd_equals_home_reads_sensitive_dirs_after_d22() {
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path().join("home");
         std::fs::create_dir_all(home.join(".ssh")).unwrap();
         std::fs::create_dir_all(home.join("Downloads")).unwrap();
         std::fs::write(home.join(".ssh").join("id_rsa"), "PRIVATE").unwrap();
-        std::fs::write(home.join("Downloads").join("trip.png"), b"\x89PNG").unwrap();
+        std::fs::write(
+            home.join("Downloads").join("trip.png"),
+            &[0x89, 0x50, 0x4e, 0x47],
+        )
+        .unwrap();
         let home_s = home.to_str().unwrap();
-        // 会话 cwd = 主目录本身（在 ~ 下启动 agent 的常见场景）
-        assert_eq!(
+        assert!(
             read_file_safe(
                 home_s,
                 home.join(".ssh").join("id_rsa").to_str().unwrap(),
                 Some(home_s)
             )
-            .unwrap_err(),
-            FileRejectReason::Sensitive,
-            "cwd==home 时 ~/.ssh 必须仍被敏感清单拒绝"
+            .is_ok(),
+            "cwd==home 时 ~/.ssh 文件必须可预览（D22）"
         );
         assert!(
             read_file_safe(

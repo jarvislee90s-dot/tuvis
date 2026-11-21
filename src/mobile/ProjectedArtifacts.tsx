@@ -62,7 +62,9 @@ const REASON_KEYS: Record<string, string> = {
   missing_url: "mobile.artifacts.reason.missingUrl",
   url_too_long: "mobile.artifacts.reason.urlTooLong",
   // 预览读取 / 图片解码失败（UI 侧原因）
-  sensitive: "mobile.artifacts.reason.denied",
+  // D22（2026-11-12 note §三）：后端已取消目录准入，不再产生 sensitive；
+  // 旧服务端残留值按通用读取失败处理（不再展示安全策略文案）
+  sensitive: "mobile.artifacts.reason.unreadable",
   not_found: "mobile.artifacts.reason.removed",
   too_large: "mobile.artifacts.reason.tooLarge",
   not_file: "mobile.artifacts.reason.notFile",

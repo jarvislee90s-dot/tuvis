@@ -3165,21 +3165,33 @@ mod tests {
             "session-files 应透传注入路径源的结构化条目，实际 {files_body}"
         );
         let files_json: serde_json::Value = serde_json::from_str(&files_body).unwrap();
-        let expected_key = tmp.path().join("src/main.rs").to_string_lossy().to_string();
+        // fileKey = 三池比较键（file_identity_key）：统一分隔符 + Windows 语义折叠
+        // 大小写——期望键必须经同一归一化函数产出，否则 Windows 上恒红（展示 path
+        // 字段原样保留，比较键不是展示路径）。cwd 传 None 是安全的：join 后已是
+        // 绝对路径，与生产「cwd + 相对路径」的产物逐字符一致。
+        let expected_key = crate::file_identity::file_identity_key(
+            &tmp.path().join("src/main.rs").to_string_lossy(),
+            None,
+            cfg!(windows),
+        );
         assert_eq!(
             files_json["files"][0]["fileKey"], expected_key,
-            "文件池身份键须按预览端点使用的会话 cwd 解析，且不存在的文件也有键"
+            "文件池身份键须按预览端点使用的会话 cwd 解析，且不存在的文件也有键（三池归一化口径）"
         );
     }
 
-    /// 敏感黑名单端到端回归锁（M5 P2-a 追记）：/file 端点必须**消费** home_source。
-    /// 3d22e2e 曾把端点调用改传 None，使主目录内黑名单在生产链路上整段失效——
-    /// 当时单元测试全绿（read_file_safe 每个用例都显式传 Some(home)，无从暴露
-    /// 接线缺失），本锁补上这一层：探针 = 调用标记（照
+    /// D22（2026-11-12 note §三）端点级回归锁（原 M5 P2-a 敏感黑名单端到端锁的
+    /// F7.03 口径更新）：/file 端点必须**消费** home_source 并把它传进
+    /// read_file_safe——3d22e2e 曾把端点调用改传 None（当时 = 主目录内黑名单
+    /// 整段失效）；D22 后读侧不再用 home 做目录判定，但接线不能漂移（缝保留，
+    /// 参数必须照传，即使读侧暂不消费）。探针 = 调用标记（照
     /// session_messages_endpoint_is_gated_and_shaped 的捕获注入先例），端点漏接
     /// home_source 时 hit 恒 false，断言直接变红。
+    /// 行为口径（照 files.rs sensitive_paths_readable_even_when_home_base_unusable
+    /// / sensitive_dirs_preview_like_any_other_file_after_d22）：主目录内凭据等
+    /// 敏感段路径 → 200 可读（OS 权限为准），不再伪报目录策略拒绝。
     #[tokio::test]
-    async fn file_endpoint_rejects_sensitive_paths_inside_home() {
+    async fn file_endpoint_reads_sensitive_paths_inside_home_after_d22() {
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path().join("home");
         let proj = home.join("Desktop").join("proj");
@@ -3279,7 +3291,8 @@ mod tests {
         let app = router(state.clone());
         persist_device(&state, "fe");
 
-        // (1) 主目录内凭据 → 403 + 原因码 sensitive
+        // (1) 主目录内凭据 → 200 可读（D22：准入已取消，OS 权限为准）+ no-store +
+        // 内容原样回读；探针 hit 断言保持——接线漂移仍是本锁的第一拦截线
         let r = app
             .clone()
             .oneshot(req(
@@ -3295,13 +3308,24 @@ mod tests {
             .unwrap();
         assert!(
             hit.load(std::sync::atomic::Ordering::SeqCst),
-            "/file 必须消费 home_source（漏接 = 生产黑名单失效，3d22e2e 回归形态）"
+            "/file 必须消费 home_source 并照传 read_file_safe（漏接 = 接线漂移，3d22e2e 回归形态）"
         );
-        assert_eq!(r.status(), 403, "主目录内凭据必须拒绝");
+        assert_eq!(
+            r.status(),
+            200,
+            "D22 后主目录内凭据不再按目录策略拒绝，须可预览（OS 权限为准）"
+        );
+        assert_eq!(
+            r.headers()
+                .get("cache-control")
+                .and_then(|v| v.to_str().ok()),
+            Some("no-store"),
+            "门禁下的私有文件内容禁止中间层缓存"
+        );
         let b = body_string(r).await;
-        assert!(b.contains("sensitive"), "403 体必须带原因码 sensitive: {b}");
+        assert!(b.contains("PRIVATE"), "200 体必须原样回读凭据内容: {b}");
 
-        // (2) 主目录内普通文件 → 200（黑名单不误伤；同时证明 (1) 不是全盘拒绝）
+        // (2) 主目录内普通文件 → 200（与 (1) 同口径；回归不变量保持）
         let r = app
             .clone()
             .oneshot(req(
@@ -3317,11 +3341,10 @@ mod tests {
             .unwrap();
         assert_eq!(r.status(), 200, "主目录内普通文件必须放行");
 
-        // (3) **区分度断言**：主目录**外**含敏感段名的路径必须放行——
-        // 这正是「基准被真正消费」的判据：若端点传 None（3d22e2e 形态），
-        // read_file_safe 会走全段保守分支把 .ssh 段一并拒掉（403）；
-        // 只有消费了 home 基准、且裁决边界（主目录外不设路径级防线）未被扩大，
-        // 才会放行。本条同时是「T1 fail-closed 不得吞掉接线错误」的防回归锁。
+        // (3) 主目录**外**含敏感段名的路径必须放行（回归不变量保持）。
+        // 注：D22 后 read_file_safe 不再用 home 做目录判定，本条不再构成
+        // 「基准被真正消费」的区分度判据（接线判据由探针 hit 断言独担），
+        // 但「主目录外不设路径级防线」（2026-09-18 裁决）仍是行为锁。
         let outside_secret = tmp.path().join("outside").join(".ssh").join("id_rsa");
         std::fs::create_dir_all(outside_secret.parent().unwrap()).unwrap();
         std::fs::write(&outside_secret, "PRIVATE").unwrap();
@@ -3341,7 +3364,7 @@ mod tests {
         assert_eq!(
             r.status(),
             200,
-            "主目录外路径不设路径级防线（2026-09-18 裁决）——基准被消费时必须放行"
+            "主目录外路径不设路径级防线（2026-09-18 裁决；D22 后全盘同口径）"
         );
     }
 
