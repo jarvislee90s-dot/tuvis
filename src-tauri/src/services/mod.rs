@@ -2,6 +2,7 @@
 
 pub mod codex_control;
 pub mod codex_desktop_ipc;
+pub(crate) mod codex_question_skip;
 pub mod manifest;
 pub mod mcp;
 pub mod pet;

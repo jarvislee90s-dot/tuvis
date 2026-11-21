@@ -137,6 +137,25 @@ pub fn rename_device(
     Ok(n > 0)
 }
 
+/// 指纹命中探测（B2/M4 审查修复 round3，只读）：与 [`persist_device_with_fingerprint`]
+/// 的命中路径同判据（**传入与 persist 相同的已计算指纹值**——`fingerprint_for(ua, origin)`，
+/// 不是原始 IP；未吊销行 + 最近活跃优先 LIMIT 1），供配对路径在持久化前确定本次
+/// upsert 的**实际目标设备 id**——Device live 更新票必须对准真实目标（命中旧行时 =
+/// 旧行 id，而非本次新生成的随机 id），否则事实写错槽位。
+pub fn fingerprint_target_conn(
+    conn: &rusqlite::Connection,
+    fingerprint: &str,
+) -> rusqlite::Result<Option<String>> {
+    conn.query_row(
+        "SELECT id FROM remote_devices
+         WHERE fingerprint = ?1 AND revoked = 0
+         ORDER BY last_seen_at DESC LIMIT 1",
+        rusqlite::params![fingerprint],
+        |r| r.get::<_, String>(0),
+    )
+    .optional()
+}
+
 pub fn device_valid(conn: &rusqlite::Connection, device_id: &str, now: i64) -> bool {
     conn.query_row(
         "SELECT revoked, last_seen_at FROM remote_devices WHERE id = ?1",

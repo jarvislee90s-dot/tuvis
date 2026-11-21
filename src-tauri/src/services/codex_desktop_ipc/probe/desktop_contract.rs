@@ -15,7 +15,8 @@
 //! 当前规则覆盖：start-turn v2、submit-user-input v1、command/file decision v1、
 //! interrupt v4 + expectedTurnId、异步 Question 信封（`questionItemId` 合成规则与
 //! 单条 min(1) 解析；标记绑定／schema／守卫按**引用关系**核验，压缩器改局部名不失配，
-//! 见 [`async_answer_envelope_structure`]）。本阶段不识别 steer（明确不接入答题路径）。
+//! 见 [`async_answer_envelope_structure`]）；运行中答题另核 steer v1 与已接受 steering
+//! 的正式信封引用链，不借空闲答题证据授权。
 
 use std::collections::BTreeMap;
 use std::io::Read;
@@ -508,8 +509,8 @@ const ASYNC_QUESTION_ID_TAG: &str = "request_user_input_async";
 
 /// 当前规则版本下的全部识别规则。
 ///
-/// **刻意不含** `steer`（本阶段明确不接入答题路径）、`request_cancel`（无已核验专用
-/// RPC）与 mode／permissions 组（F09—F11 不新增写能力）。
+/// 不含 `request_cancel`（无已核验专用 RPC）与 mode／permissions 组。
+/// steer 仅作为正式异步答题的独立契约，不开放任意正文引导。
 const RULES: &[OperationRule] = &[
     OperationRule {
         operation: CodexOperation::Send,
@@ -592,6 +593,22 @@ const RULES: &[OperationRule] = &[
         request_rule: "conversationId+turnStart{text=envelope[questionItemId,question,answer]}",
         response_rule: "result.result",
         semantic_rule: "questionItemId=JSON.stringify([\"request_user_input_async\",item,index])（形参按序;第二元素=map源questions同接收者的原条目.id;第三元素=map index）;answers=min(1)数组∪恒等transform;三字段同一字符串构造（字符串专有组合子证人）;守卫if(!…||!…)失败即返回+try{let <局部>=直接解析（同接收者）",
+    },
+    OperationRule {
+        operation: CodexOperation::AsyncAnswerActive,
+        method: "thread-follower-steer-turn",
+        base_version: 1,
+        requires: &[
+            "case\"thread-follower-steer-turn\":",
+            "<send_user_message_question_reply>",
+            "</send_user_message_question_reply>",
+            "\"steeringUserMessage\"",
+            "steerAcknowledged",
+        ],
+        structural: Some(async_active_answer_structure),
+        request_rule: "conversationId+input+restoreMessage+clientUserMessageId",
+        response_rule: "result.result",
+        semantic_rule: "独立 steer v1 参数链；accepted 或 steerAcknowledged 的 input 经同源正式信封解析；作用于执行时活动回合",
     },
     OperationRule {
         operation: CodexOperation::Interrupt,
@@ -1170,6 +1187,374 @@ fn table_version(hay: &str, method: &str) -> Option<u32> {
         [only] => Some(*only),
         _ => None,
     }
+}
+
+fn take_contract_literal(rest: &mut &str, literal: &str) -> Option<()> {
+    *rest = rest.strip_prefix(literal)?;
+    Some(())
+}
+
+fn take_contract_ident<'a>(rest: &mut &'a str) -> Option<&'a str> {
+    let source = *rest;
+    let (name, end) = ident_at(source, 0)?;
+    *rest = &source[end..];
+    Some(name)
+}
+
+/// 仅扫描有界函数体；字符串内的括号不参与配对，不执行打包代码。
+fn contract_block_end(source: &str, start: usize) -> Option<usize> {
+    if source.as_bytes().get(start) != Some(&b'{') {
+        return None;
+    }
+    let mut depth = 0usize;
+    let mut quote = None;
+    let mut escaped = false;
+    for (offset, ch) in source[start..].char_indices().take(16_384) {
+        if let Some(delimiter) = quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == delimiter {
+                quote = None;
+            }
+            continue;
+        }
+        match ch {
+            '\'' | '"' => quote = Some(ch),
+            '{' => depth += 1,
+            '}' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(start + offset + 1);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn contract_functions(hay: &str) -> Vec<(&str, &str, &str)> {
+    hay.match_indices("function ")
+        .filter_map(|(at, _)| {
+            let (name, end) = ident_at(hay, at + "function ".len())?;
+            if !hay[end..].starts_with('(') {
+                return None;
+            }
+            let (param, end) = ident_at(hay, end + 1)?;
+            if !hay[end..].starts_with("){") {
+                return None;
+            }
+            let close = contract_block_end(hay, end + 1)?;
+            Some((name, param, &hay[end + 2..close - 1]))
+        })
+        .collect()
+}
+
+fn steer_turn_carrier_present(hay: &str) -> bool {
+    const HEAD: &str = "case\"thread-follower-steer-turn\":{let ";
+    hay.match_indices(HEAD).any(|(at, _)| {
+        (|| {
+            let mut rest = &hay[at + HEAD.len()..];
+            let reply = take_contract_ident(&mut rest)?;
+            take_contract_literal(&mut rest, "=await ")?;
+            let (callee, end) = member_chain_at(rest, 0)?;
+            if !callee.ends_with(".steerTurn") {
+                return None;
+            }
+            rest = &rest[end..];
+            take_contract_literal(&mut rest, "(")?;
+            let (request, _) = ident_at(rest, 0)?;
+            let receiver = callee.strip_suffix(".steerTurn")?;
+            if receiver == request || receiver.starts_with(&format!("{request}.")) {
+                return None;
+            }
+            let args = [
+                "conversationId",
+                "input",
+                "restoreMessage",
+                "serviceTier",
+                "attachments",
+                "clientUserMessageId",
+                "additionalContext",
+                "toolOutput",
+            ]
+            .map(|field| format!("{request}.params.{field}"))
+            .join(",");
+            let tail =
+                args + ");return{method:" + request + ".method,result:{result:" + reply + "}}}";
+            rest.starts_with(&tail).then_some(())
+        })()
+        .is_some()
+    })
+}
+
+/// 守卫、切片、schema 解析与成功返回必须来自同一个接收者，且中间没有改道语句。
+fn guarded_envelope_result(
+    body: &str,
+    receiver: &str,
+    opens: &[&str],
+    closes: &[&str],
+    schema: &str,
+    parsed: &str,
+) -> bool {
+    opens.iter().any(|open| closes.iter().any(|close| {
+        let guard = format!("if(!{receiver}.startsWith({open})||!{receiver}.endsWith({close}))return null;try")
+            + "{let " + parsed + "=" + schema;
+        let Some(rest) = body.strip_prefix(&guard) else { return false; };
+        let slices = [
+            format!("{},-{}", ASYNC_OPEN_MARKER.len(), ASYNC_CLOSE_MARKER.len()),
+            format!("{open}.length,-{close}.length"),
+        ];
+        slices.iter().any(|slice| {
+            let expected = format!(".safeParse(JSON.parse({receiver}.slice({slice})));return {parsed}.success?{parsed}.data:null")
+                + "}catch{return null}";
+            rest == expected || rest.strip_suffix(';') == Some(expected.as_str())
+        })
+    }))
+}
+
+fn envelope_body_uses_input(
+    body: &str,
+    input: &str,
+    opens: &[&str],
+    closes: &[&str],
+    schemas: &[&str],
+) -> bool {
+    if body.matches(".safeParse(JSON.parse(").count() != 1 {
+        return false;
+    }
+    let Some(at) = body.find("try{let ") else {
+        return false;
+    };
+    let Some((parsed, end)) = ident_at(body, at + "try{let ".len()) else {
+        return false;
+    };
+    let Some(after_equal) = body[end..].strip_prefix('=') else {
+        return false;
+    };
+    let Some((schema, _)) = ident_at(after_equal, 0) else {
+        return false;
+    };
+    if parsed == schema
+        || input == schema
+        || !schemas.contains(&schema)
+        || !guarded_parse_schemas(body, opens, closes).contains(&schema)
+        || !body.contains(&format!(";return {parsed}.success?{parsed}.data:null"))
+    {
+        return false;
+    }
+    if guarded_envelope_result(body, input, opens, closes, schema, parsed) {
+        return true;
+    }
+    // 当前包在严格解析前先剥离原生来源前缀；逐个变量绑定到输入，不能读取无关对象。
+    (|| {
+        let mut rest = body;
+        take_contract_literal(&mut rest, "let ")?;
+        let prefix = take_contract_ident(&mut rest)?;
+        take_contract_literal(&mut rest, "=\"")?;
+        let mut escaped = false;
+        let mut quote_end = None;
+        for (at, ch) in rest.char_indices() {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                quote_end = Some(at + 1);
+                break;
+            }
+        }
+        rest = &rest[quote_end?..];
+        take_contract_literal(&mut rest, ",")?;
+        let position = take_contract_ident(&mut rest)?;
+        take_contract_literal(&mut rest, &format!("={input}.lastIndexOf({prefix}),"))?;
+        let stripped = take_contract_ident(&mut rest)?;
+        let legacy_trim =
+            format!("=({position}===-1?{input}:{input}.slice({position}+{prefix}.length)).trim();");
+        if let Some(tail) = rest.strip_prefix(&legacy_trim) {
+            let names = [prefix, position, stripped];
+            if names.iter().any(|name| *name == input || *name == schema)
+                || names
+                    .iter()
+                    .enumerate()
+                    .any(|(i, name)| names[..i].contains(name))
+            {
+                return None;
+            }
+            return guarded_envelope_result(tail, stripped, opens, closes, schema, parsed)
+                .then_some(());
+        }
+        take_contract_literal(
+            &mut rest,
+            &format!(
+                "=(-1==={position}?{input}:{input}.slice({position}+{prefix}.length)).trim(),"
+            ),
+        )?;
+        let receiver = take_contract_ident(&mut rest)?;
+        let names = [prefix, position, stripped, receiver];
+        if names.iter().any(|name| *name == input || *name == schema)
+            || names
+                .iter()
+                .enumerate()
+                .any(|(i, name)| names[..i].contains(name))
+        {
+            return None;
+        }
+        opens.iter().find_map(|open| {
+            let mut tail = rest;
+            take_contract_literal(
+                &mut tail,
+                &format!("={stripped}.startsWith({open})?{stripped}:((0,"),
+            )?;
+            let (_, end) = member_chain_at(tail, 0)?;
+            tail = &tail[end..];
+            take_contract_literal(
+                &mut tail,
+                &format!(")({stripped})?.message??{stripped}).trim();"),
+            )?;
+            guarded_envelope_result(tail, receiver, opens, closes, schema, parsed).then_some(())
+        })
+    })()
+    .is_some()
+}
+
+/// 只在同一 bundle、同一可确认词法域内绑定命名 helper；未知注释/正则域不猜。
+/// 保留祖先块的位置而非仅深度，避免把两个平级但不同的模块作用域混在一起。
+fn contract_declaration_scope(hay: &str, at: usize) -> Option<Vec<usize>> {
+    let start = hay[..at].rfind("\n\n").map_or(0, |boundary| boundary + 2);
+    let mut blocks = Vec::new();
+    let mut quote = None;
+    let mut escaped = false;
+    for (offset, ch) in hay[start..at].char_indices() {
+        if let Some(delimiter) = quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == delimiter {
+                quote = None;
+            }
+            continue;
+        }
+        match ch {
+            '\'' | '"' => quote = Some(ch),
+            '{' => blocks.push(start + offset),
+            '}' => {
+                blocks.pop()?;
+            }
+            '/' => return None,
+            _ => {}
+        }
+    }
+    quote.is_none().then_some(blocks)
+}
+
+fn named_contract_parser_bound(
+    hay: &str,
+    functions: &[(&str, &str, &str)],
+    parser: &str,
+    caller: &str,
+) -> bool {
+    if functions
+        .iter()
+        .filter(|(name, _, _)| *name == parser)
+        .count()
+        != 1
+        || functions
+            .iter()
+            .filter(|(name, _, _)| *name == caller)
+            .count()
+            != 1
+    {
+        return false;
+    }
+    let Some(definition) = hay.find(&format!("function {parser}(")) else {
+        return false;
+    };
+    let Some(callsite) = hay.find(&format!("function {caller}(")) else {
+        return false;
+    };
+    let bundle_start = |at| hay[..at].rfind("\n\n").map_or(0, |boundary| boundary + 2);
+    let start = bundle_start(definition);
+    let definition_scope = contract_declaration_scope(hay, definition);
+    if start != bundle_start(callsite)
+        || definition_scope.is_none()
+        || definition_scope != contract_declaration_scope(hay, callsite)
+    {
+        return false;
+    }
+    let end = hay[start..]
+        .find("\n\n")
+        .map_or(hay.len(), |boundary| start + boundary);
+    let bundle = &hay[start..end];
+    !bundle
+        .match_indices(&format!("{parser}="))
+        .any(|(at, _)| at == 0 || !bundle[..at].chars().next_back().is_some_and(is_ident_char))
+}
+
+fn accepted_steering_index_present(hay: &str) -> bool {
+    let opens = bindings_of_literal(hay, &format!("\"{ASYNC_OPEN_MARKER}\""));
+    let closes = bindings_of_literal(hay, &format!("\"{ASYNC_CLOSE_MARKER}\""));
+    let schemas: Vec<_> = item_schema_bindings(hay)
+        .into_iter()
+        .filter(|(_, ty)| string_schema_witness(hay, ty))
+        .flat_map(|(item, _)| envelope_schema_bindings(hay, item))
+        .collect();
+    let functions = contract_functions(hay);
+    let parsers: Vec<_> = functions
+        .iter()
+        .filter(|(_, input, body)| envelope_body_uses_input(body, input, &opens, &closes, &schemas))
+        .map(|(name, _, _)| *name)
+        .collect();
+    functions.iter().any(|(index_name, input, body)| (|| {
+        let mut rest = *body;
+        take_contract_literal(&mut rest, "var ")?;
+        let alias = take_contract_ident(&mut rest)?;
+        take_contract_literal(&mut rest, ";let ")?;
+        let parts = take_contract_ident(&mut rest)?;
+        if parts == *input || parts == alias { return None; }
+        take_contract_literal(&mut rest, &format!("=\"userMessage\"==={input}.type||\"steeringUserMessage\"==={input}.type&&(\"accepted\"==={input}.status||!0==={input}.steerAcknowledged)?\"userMessage\"===({alias}={input}).type&&\"content\"in {alias}?"))?;
+        let checker = take_contract_ident(&mut rest)?;
+        take_contract_literal(&mut rest, &format!("({alias}.content)?{alias}.content:null:\"steeringUserMessage\"==={alias}.type&&\"input\"in {alias}&&{checker}({alias}.input)?{alias}.input:null:null;if(null=={parts})return[];let "))?;
+        let text = take_contract_ident(&mut rest)?;
+        if [*input, alias, parts].contains(&text) { return None; }
+        take_contract_literal(&mut rest, &format!("={parts}.flatMap("))?;
+        let element = take_contract_ident(&mut rest)?;
+        take_contract_literal(&mut rest, &format!(r#"=>"text"==={element}.type?[{element}.text]:[]).join("\n");return"#))?;
+        if rest.starts_with("(function(") {
+            take_contract_literal(&mut rest, "(function(")?;
+            let param = take_contract_ident(&mut rest)?;
+            take_contract_literal(&mut rest, ")")?;
+            let end = contract_block_end(rest, 0)?;
+            if !envelope_body_uses_input(&rest[1..end - 1], param, &opens, &closes, &schemas) {
+                return None;
+            }
+            rest = &rest[end..];
+            take_contract_literal(&mut rest, &format!(")({text})"))?;
+        } else {
+            take_contract_literal(&mut rest, " ")?;
+            let parser = take_contract_ident(&mut rest)?;
+            if !parsers.contains(&parser)
+                || [*input, alias, parts, text].contains(&parser)
+                || !named_contract_parser_bound(hay, &functions, parser, index_name)
+            {
+                return None;
+            }
+            take_contract_literal(&mut rest, &format!("({text})"))?;
+        }
+        take_contract_literal(&mut rest, "?.map(({questionItemId:")?;
+        let item = take_contract_ident(&mut rest)?;
+        take_contract_literal(&mut rest, &(String::from("})=>") + item + ")??[]"))?;
+        matches!(rest, "" | ";").then_some(())
+    })().is_some())
+}
+
+fn async_active_answer_structure(hay: &str) -> bool {
+    async_answer_envelope_structure(hay)
+        && steer_turn_carrier_present(hay)
+        && accepted_steering_index_present(hay)
 }
 
 fn match_operations(candidates: &[(String, String)]) -> BTreeMap<CodexOperation, ContractMatch> {
@@ -1881,6 +2266,392 @@ mod tests {
             evidence.matched(CodexOperation::CommandApproval),
             "{what}: 包应被正常读取（对照项 CommandApproval 仍匹配）"
         );
+    }
+
+    // synthetic-from-static：按已核验的主进程 steer v1 与消息索引结构合成；
+    // 信封解析器 xSe 来自 20261028 正式信封夹具，不含真实会话内容。
+    const ASYNC_ACTIVE_STEER: &str = r#"case"thread-follower-steer-turn":{let n=await e.steerTurn(t.params.conversationId,t.params.input,t.params.restoreMessage,t.params.serviceTier,t.params.attachments,t.params.clientUserMessageId,t.params.additionalContext,t.params.toolOutput);return{method:t.method,result:{result:n}}}"#;
+    const ASYNC_ACTIVE_PARSER: &str = r#"function SJ(e){var t;let n="userMessage"===e.type||"steeringUserMessage"===e.type&&("accepted"===e.status||!0===e.steerAcknowledged)?"userMessage"===(t=e).type&&"content"in t?Sj(t.content)?t.content:null:"steeringUserMessage"===t.type&&"input"in t&&Sj(t.input)?t.input:null:null;if(null==n)return[];let r=n.flatMap(e=>"text"===e.type?[e.text]:[]).join("\n");return xSe(r)?.map(({questionItemId:e})=>e)??[]}"#;
+
+    // synthetic-from-static：观测片段有意截断，在合成包中补齐三个尾括号。
+    // 单独容器模拟同一嵌套模块，让信封 helper 和索引调用者处于同一词法域。
+    fn async_active_contract_main(steer: &str, envelope: &str, parser: &str) -> String {
+        format!(
+            "{START_TURN_HANDLER_20261028}}}\n{DECISION_HANDLERS_20261028}\n{INTERRUPT_HANDLER_20261028}}}\n{QUESTION_ID_CALLSITE_20261028}\n{STRING_WITNESS_20261028}\n{START_TURN_REQUEST_20261028}}}\n{steer}\n{{\n{envelope}\n{parser}\n}}"
+        )
+    }
+
+    fn async_active_contract_evidence(
+        steer: &str,
+        parser: &str,
+        version: &str,
+    ) -> DesktopContractEvidence {
+        let dir = tempfile::tempdir().unwrap();
+        let main = async_active_contract_main(steer, ASYNC_ENVELOPE_20261028, parser);
+        evidence_20261028(dir.path(), "active.asar", &main, version)
+    }
+
+    fn async_active_contract_assert_rejected(steer: &str, parser: &str, version: &str) {
+        let evidence = async_active_contract_evidence(steer, parser, version);
+        assert!(
+            evidence.matched(CodexOperation::AsyncAnswerIdle),
+            "对照：idle 必须仍匹配"
+        );
+        assert!(
+            !evidence.matched(CodexOperation::AsyncAnswerActive),
+            "active 漂移必须拒绝"
+        );
+    }
+
+    #[test]
+    fn async_active_contract_accepted_steering_with_formal_envelope_matches() {
+        let evidence = async_active_contract_evidence(
+            ASYNC_ACTIVE_STEER,
+            ASYNC_ACTIVE_PARSER,
+            VERSION_TABLE_20261028,
+        );
+        assert!(evidence.matched(CodexOperation::AsyncAnswerIdle));
+        assert!(evidence.matched(CodexOperation::AsyncAnswerActive));
+        assert_eq!(
+            evidence.matches[&CodexOperation::AsyncAnswerActive].base_version,
+            1
+        );
+    }
+
+    // synthetic-from-static：当前索引内联解析器的前缀剥离及原生消息提取形态。
+    const ASYNC_ACTIVE_INLINE_BODY: &str = r#"(function(e){let t="\norigin\n",n=e.lastIndexOf(t),r=(-1===n?e:e.slice(n+t.length)).trim(),s=r.startsWith(_Se)?r:((0,helpers.extract)(r)?.message??r).trim();if(!s.startsWith(_Se)||!s.endsWith(vSe))return null;try{let e=ySe.safeParse(JSON.parse(s.slice(34,-35)));return e.success?e.data:null}catch{return null}})(r)"#;
+
+    fn async_active_contract_inline_parser() -> String {
+        mutate(ASYNC_ACTIVE_PARSER, "xSe(r)", ASYNC_ACTIVE_INLINE_BODY)
+    }
+
+    #[test]
+    fn async_active_contract_named_helper_and_caller_in_same_nested_module_match() {
+        let evidence = async_active_contract_evidence(
+            ASYNC_ACTIVE_STEER,
+            ASYNC_ACTIVE_PARSER,
+            VERSION_TABLE_20261028,
+        );
+        assert!(evidence.matched(CodexOperation::AsyncAnswerIdle));
+        assert!(evidence.matched(CodexOperation::AsyncAnswerActive));
+    }
+
+    #[test]
+    fn async_active_contract_named_helper_in_sibling_module_is_rejected() {
+        let parser = format!("}}\n{{\n{ASYNC_ACTIVE_PARSER}");
+        async_active_contract_assert_rejected(ASYNC_ACTIVE_STEER, &parser, VERSION_TABLE_20261028);
+    }
+
+    #[test]
+    fn async_active_contract_unique_helper_in_other_bundle_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let package = dir.path().join("separate-helper.asar");
+        let main = async_active_contract_main(ASYNC_ACTIVE_STEER, "", ASYNC_ACTIVE_PARSER);
+        write_asar(
+            &package,
+            &[
+                ("/.vite/build/main-fixture.js", &main),
+                ("/.vite/build/src-fixture.js", VERSION_TABLE_20261028),
+                ("/.vite/build/other-fixture.js", ASYNC_ENVELOPE_20261028),
+            ],
+        );
+        let evidence = read(&package, "26.1023.51421").expect("synthetic package evidence");
+        assert!(evidence.matched(CodexOperation::AsyncAnswerIdle));
+        assert!(!evidence.matched(CodexOperation::AsyncAnswerActive));
+    }
+
+    #[test]
+    fn async_active_contract_inline_accepted_steering_matches() {
+        let parser = async_active_contract_inline_parser();
+        let evidence =
+            async_active_contract_evidence(ASYNC_ACTIVE_STEER, &parser, VERSION_TABLE_20261028);
+        assert!(evidence.matched(CodexOperation::AsyncAnswerIdle));
+        assert!(evidence.matched(CodexOperation::AsyncAnswerActive));
+    }
+
+    #[test]
+    fn async_active_contract_inline_wrong_input_receiver_is_rejected() {
+        let parser = mutate(
+            &async_active_contract_inline_parser(),
+            "n=e.lastIndexOf(t)",
+            "n=other.lastIndexOf(t)",
+        );
+        async_active_contract_assert_rejected(ASYNC_ACTIVE_STEER, &parser, VERSION_TABLE_20261028);
+    }
+
+    /// 仅对显式传入的已核验官方包做静态读取；不启动或连接 Desktop/IPC/CLI。
+    #[test]
+    #[ignore = "仅人工授权读取 TUVIS_ACTIVE_CONTRACT_PACKAGE 指定的官方 app.asar"]
+    fn async_active_contract_official_package_static_evidence() {
+        let package = std::env::var_os("TUVIS_ACTIVE_CONTRACT_PACKAGE")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .expect("必须指定已核验的 TUVIS_ACTIVE_CONTRACT_PACKAGE");
+        assert_eq!(
+            package.file_name().and_then(|name| name.to_str()),
+            Some("app.asar")
+        );
+        assert_eq!(std::env::consts::OS, "windows", "该包身份为 Windows 官方包");
+        let target = ContractTarget {
+            probe_key: ProbeKey::new(
+                "windows",
+                Some("26.1106.6628.0"),
+                Some("static-verification-only"),
+            ),
+            connection_epoch: 0,
+            package_path: package,
+            cli_path: PathBuf::new(),
+        };
+        let evidence = read_desktop_contract(&target).expect("官方包静态契约读取失败");
+        assert_eq!(
+            evidence.package_sha256,
+            "54b74a9131680fc9eead711ed5d9f718f6127c22222ca60d2e3b577a707e2485"
+        );
+        for (operation, version) in [
+            (CodexOperation::AsyncAnswerIdle, 2),
+            (CodexOperation::AsyncAnswerActive, 1),
+        ] {
+            assert!(evidence.matched(operation), "缺少 {operation:?}");
+            assert_eq!(evidence.matches[&operation].base_version, version);
+        }
+        println!(
+            "static package sha256={} idle=v2 active=v1",
+            evidence.package_sha256
+        );
+    }
+
+    #[test]
+    fn async_active_contract_named_parser_guard_on_unrelated_receiver_is_rejected() {
+        // 直接变异唯一正式解析器，避免额外的合格同名定义掩盖断链。
+        let envelope = mutate(
+            ASYNC_ENVELOPE_20261028,
+            "function xSe(e){let t=",
+            "function xSe(e){if(!e.startsWith(_Se))return null;let t=",
+        );
+        let envelope = mutate(
+            &envelope,
+            "!r.startsWith(_Se)||!r.endsWith(vSe)",
+            "!other.startsWith(_Se)||!other.endsWith(vSe)",
+        );
+        let envelope = mutate(
+            &envelope,
+            "JSON.parse(r.slice(34,-35))",
+            "JSON.parse(other.slice(34,-35))",
+        );
+        let main = async_active_contract_main(ASYNC_ACTIVE_STEER, &envelope, ASYNC_ACTIVE_PARSER);
+        let dir = tempfile::tempdir().unwrap();
+        let evidence = evidence_20261028(
+            dir.path(),
+            "disconnected.asar",
+            &main,
+            VERSION_TABLE_20261028,
+        );
+        println!(
+            "disconnected parser idle matched: {}",
+            evidence.matched(CodexOperation::AsyncAnswerIdle)
+        );
+        assert!(
+            !evidence.matched(CodexOperation::AsyncAnswerActive),
+            "无关对象的双守卫和解析不能授权 active"
+        );
+    }
+
+    #[test]
+    fn async_active_contract_text_local_shadowing_parser_is_rejected() {
+        let parser = mutate(ASYNC_ACTIVE_PARSER, "let r=n.flatMap", "let xSe=n.flatMap");
+        let parser = mutate(&parser, "xSe(r)", "xSe(xSe)");
+        async_active_contract_assert_rejected(ASYNC_ACTIVE_STEER, &parser, VERSION_TABLE_20261028);
+    }
+
+    #[test]
+    fn async_active_contract_parameter_shadowing_parser_is_rejected() {
+        let parser = ASYNC_ACTIVE_PARSER
+            .replace("function SJ(e)", "function SJ(xSe)")
+            .replace("e.type", "xSe.type")
+            .replace("e.status", "xSe.status")
+            .replace("e.steerAcknowledged", "xSe.steerAcknowledged")
+            .replace("(t=e)", "(t=xSe)")
+            .replace(
+                "flatMap(e=>\"text\"===xSe.type",
+                "flatMap(e=>\"text\"===e.type",
+            );
+        assert!(parser.contains("function SJ(xSe)"));
+        async_active_contract_assert_rejected(ASYNC_ACTIVE_STEER, &parser, VERSION_TABLE_20261028);
+    }
+
+    #[test]
+    fn async_active_contract_alias_shadowing_parser_is_rejected() {
+        let parser = ASYNC_ACTIVE_PARSER
+            .replace("var t;", "var xSe;")
+            .replace("(t=e)", "(xSe=e)")
+            .replace("t.type", "xSe.type")
+            .replace("in t", "in xSe")
+            .replace("t.content", "xSe.content")
+            .replace("t.input", "xSe.input");
+        assert!(parser.contains("var xSe;"));
+        async_active_contract_assert_rejected(ASYNC_ACTIVE_STEER, &parser, VERSION_TABLE_20261028);
+    }
+
+    #[test]
+    fn async_active_contract_parts_shadowing_parser_is_rejected() {
+        let parser = ASYNC_ACTIVE_PARSER
+            .replace("let n=", "let xSe=")
+            .replace("null==n", "null==xSe")
+            .replace("r=n.flatMap", "r=xSe.flatMap");
+        assert!(parser.contains("let xSe="));
+        async_active_contract_assert_rejected(ASYNC_ACTIVE_STEER, &parser, VERSION_TABLE_20261028);
+    }
+
+    #[test]
+    fn async_active_contract_duplicate_named_parser_in_same_file_is_rejected() {
+        let parser = format!(
+            "{}\nfunction xSe(value){{return value}}",
+            ASYNC_ACTIVE_PARSER
+        );
+        async_active_contract_assert_rejected(ASYNC_ACTIVE_STEER, &parser, VERSION_TABLE_20261028);
+    }
+
+    #[test]
+    fn async_active_contract_duplicate_named_parser_in_other_bundle_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let package = dir.path().join("duplicate.asar");
+        let main = async_active_contract_main(
+            ASYNC_ACTIVE_STEER,
+            ASYNC_ENVELOPE_20261028,
+            ASYNC_ACTIVE_PARSER,
+        );
+        write_asar(
+            &package,
+            &[
+                ("/.vite/build/main-fixture.js", &main),
+                ("/.vite/build/src-fixture.js", VERSION_TABLE_20261028),
+                (
+                    "/.vite/build/other-fixture.js",
+                    "function xSe(value){return value}",
+                ),
+            ],
+        );
+        let evidence = read(&package, "26.1023.51421").expect("synthetic package evidence");
+        assert!(evidence.matched(CodexOperation::AsyncAnswerIdle));
+        assert!(!evidence.matched(CodexOperation::AsyncAnswerActive));
+    }
+
+    #[test]
+    fn async_active_contract_steer_called_on_request_object_is_rejected() {
+        let steer = mutate(
+            ASYNC_ACTIVE_STEER,
+            "await e.steerTurn(",
+            "await t.steerTurn(",
+        );
+        async_active_contract_assert_rejected(&steer, ASYNC_ACTIVE_PARSER, VERSION_TABLE_20261028);
+    }
+
+    #[test]
+    fn async_active_contract_method_name_alone_is_rejected() {
+        async_active_contract_assert_rejected(
+            r#"case"thread-follower-steer-turn":{return null}"#,
+            ASYNC_ACTIVE_PARSER,
+            VERSION_TABLE_20261028,
+        );
+    }
+
+    #[test]
+    fn async_active_contract_wrong_version_is_rejected() {
+        let version = mutate(
+            VERSION_TABLE_20261028,
+            r#""thread-follower-steer-turn":1"#,
+            r#""thread-follower-steer-turn":2"#,
+        );
+        async_active_contract_assert_rejected(ASYNC_ACTIVE_STEER, ASYNC_ACTIVE_PARSER, &version);
+    }
+
+    #[test]
+    fn async_active_contract_input_from_wrong_receiver_is_rejected() {
+        let steer = mutate(ASYNC_ACTIVE_STEER, "t.params.input", "other.params.input");
+        async_active_contract_assert_rejected(&steer, ASYNC_ACTIVE_PARSER, VERSION_TABLE_20261028);
+    }
+
+    #[test]
+    fn async_active_contract_unconfirmed_steering_is_rejected() {
+        let parser = mutate(
+            ASYNC_ACTIVE_PARSER,
+            r#"&&("accepted"===e.status||!0===e.steerAcknowledged)"#,
+            "",
+        );
+        async_active_contract_assert_rejected(ASYNC_ACTIVE_STEER, &parser, VERSION_TABLE_20261028);
+    }
+
+    #[test]
+    fn async_active_contract_wrong_steering_input_field_is_rejected() {
+        let parser = mutate(
+            ASYNC_ACTIVE_PARSER,
+            r#""input"in t&&Sj(t.input)?t.input"#,
+            r#""content"in t&&Sj(t.content)?t.content"#,
+        );
+        async_active_contract_assert_rejected(ASYNC_ACTIVE_STEER, &parser, VERSION_TABLE_20261028);
+    }
+
+    #[test]
+    fn async_active_contract_confirmation_on_unrelated_object_is_rejected() {
+        let parser = mutate(
+            ASYNC_ACTIVE_PARSER,
+            r#""accepted"===e.status||!0===e.steerAcknowledged"#,
+            r#""accepted"===other.status||!0===other.steerAcknowledged"#,
+        );
+        async_active_contract_assert_rejected(ASYNC_ACTIVE_STEER, &parser, VERSION_TABLE_20261028);
+    }
+
+    #[test]
+    fn async_active_contract_confirmation_guard_bypass_is_rejected() {
+        let parser = mutate(
+            ASYNC_ACTIVE_PARSER,
+            r#"("accepted"===e.status||!0===e.steerAcknowledged)"#,
+            r#"("accepted"===e.status||!0===e.steerAcknowledged||!0)"#,
+        );
+        async_active_contract_assert_rejected(ASYNC_ACTIVE_STEER, &parser, VERSION_TABLE_20261028);
+    }
+
+    #[test]
+    fn async_active_contract_unrelated_envelope_parser_is_rejected() {
+        let parser = mutate(ASYNC_ACTIVE_PARSER, "xSe(r)", "otherParser(r)");
+        async_active_contract_assert_rejected(ASYNC_ACTIVE_STEER, &parser, VERSION_TABLE_20261028);
+    }
+
+    #[test]
+    fn async_active_contract_consistent_local_renames_match() {
+        let steer = ASYNC_ACTIVE_STEER
+            .replace(
+                "let n=await e.steerTurn(t.params.",
+                "let reply=await client.steerTurn(req.params.",
+            )
+            .replace("t.params.", "req.params.")
+            .replace(
+                "method:t.method,result:{result:n}",
+                "method:req.method,result:{result:reply}",
+            );
+        let parser = ASYNC_ACTIVE_PARSER
+            .replace(
+                "function SJ(e){var t;let n=",
+                "function index(msg){var item;let parts=",
+            )
+            .replace("e.type", "msg.type")
+            .replace("e.status", "msg.status")
+            .replace("e.steerAcknowledged", "msg.steerAcknowledged")
+            .replace("(t=e)", "(item=msg)")
+            .replace("t.type", "item.type")
+            .replace("in t", "in item")
+            .replace("t.content", "item.content")
+            .replace("t.input", "item.input")
+            .replace("null==n", "null==parts")
+            .replace("let r=n.flatMap", "let text=parts.flatMap")
+            .replace(
+                "parts.flatMap(e=>\"text\"===msg.type",
+                "parts.flatMap(e=>\"text\"===e.type",
+            )
+            .replace("xSe(r)", "xSe(text)");
+        let evidence = async_active_contract_evidence(&steer, &parser, VERSION_TABLE_20261028);
+        assert!(evidence.matched(CodexOperation::AsyncAnswerIdle));
+        assert!(evidence.matched(CodexOperation::AsyncAnswerActive));
     }
 
     /// 当前安装包（26.1023.51421）的片段必须识别出全部六项，异步答题仍走 start-turn v2。

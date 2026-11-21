@@ -5,7 +5,7 @@
 //! 测试里注入内存实现。
 
 use std::collections::BTreeMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use crate::database::dao::codex_interactions::StoredInteractionHint;
 use crate::database::dao::codex_ipc_probe::StoredContractEvidence;
@@ -93,14 +93,132 @@ type ObservedCacheEntry = (
 pub struct TargetObservedOperations {
     store: DeviceStore,
     cache: Mutex<Option<ObservedCacheEntry>>,
+    /// A2.2/T8：后台刷新自引用（装配点 `Arc` 包装后 `arm_background_refresh` 注入；
+    /// 未注入 = 同步刷新回退，保持既有同步测试行为）。
+    self_ref: Mutex<Option<std::sync::Weak<TargetObservedOperations>>>,
+    /// A2.2/T8：刷新完成且事实变化时的回调（变化 → 重发布；None = 不通知）。
+    on_refreshed: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// A2.2/T8：后台刷新在飞去重。
+    refreshing: std::sync::atomic::AtomicBool,
+    /// A2/M3：最近一次查询的目标（install 只接受它——换目标后旧目标的迟到
+    /// 结果不得覆盖；新目标自己的刷新结果必须可安装）。
+    request_state: Mutex<ObservedRequestState>,
 }
+
+/// 终审 M3：目标代次 + 待接续请求（与安装资格同一把锁）。
+#[derive(Default)]
+struct ObservedRequestState {
+    target: Option<ObservedTarget>,
+    generation: u64,
+    pending: Option<ObservedTarget>,
+}
+
+const OBSERVED_TTL: std::time::Duration = std::time::Duration::from_secs(10);
 
 impl TargetObservedOperations {
     pub fn new(store: DeviceStore) -> Self {
         Self {
             store,
             cache: Mutex::new(None),
+            self_ref: Mutex::new(None),
+            on_refreshed: Mutex::new(None),
+            refreshing: std::sync::atomic::AtomicBool::new(false),
+            request_state: Mutex::new(ObservedRequestState::default()),
         }
+    }
+
+    /// A2.2/T8：装配点在 `Arc` 包装后调用——后台刷新需要克隆自身 Arc；
+    /// 回调在 adapter 装配完成后由 `set_on_refreshed` 注入。
+    pub fn arm_background_refresh(self: &Arc<Self>) {
+        *self.self_ref.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::downgrade(self));
+    }
+
+    /// A2.2/T8：刷新完成且事实变化时的重发布回调（sync Fn；内部自行 spawn）。
+    /// A2/M3：回调持 adapter **弱引用**（upgrade 失败即跳过）——不形成
+    /// adapter → source → adapter 强引用环。
+    pub fn set_on_refreshed(&self, callback: Option<Arc<dyn Fn() + Send + Sync>>) {
+        *self.on_refreshed.lock().unwrap_or_else(|e| e.into_inner()) = callback;
+    }
+
+    fn install(
+        &self,
+        target: &crate::services::codex_desktop_ipc::capability::ObservedTarget,
+        generation: u64,
+        value: BTreeMap<CodexOperation, bool>,
+    ) -> bool {
+        // 终审 M3：目标代次/身份核对与 cache 写入在同一锁序内完成
+        //（request_state → cache），换目标后旧结果无法越过窗口写入；
+        // 目标身份也计入「变化」判定（目标换了即使 map 相同也要重发布）。
+        let request = self.request_state.lock().unwrap_or_else(|e| e.into_inner());
+        if request.generation != generation || request.target.as_ref() != Some(target) {
+            return false;
+        }
+        let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+        let changed = cache
+            .as_ref()
+            .is_none_or(|(cached, _, v)| *cached != *target || *v != value);
+        *cache = Some((target.clone(), std::time::Instant::now(), value));
+        changed
+    }
+
+    fn spawn_background_refresh(self: &Arc<Self>, target: ObservedTarget, generation: u64) {
+        // A2/M3：在飞去重由调用方（observed）的 swap 负责——本函数只派发任务。
+        let job = self.clone();
+        tokio::spawn(async move {
+            let value = {
+                let job_read = job.clone();
+                let target_read = target.clone();
+                tokio::task::spawn_blocking(move || job_read.refresh(&target_read))
+                    .await
+                    .ok()
+            };
+            if let Some(value) = value {
+                let changed = job.install(&target, generation, value);
+                if changed {
+                    if let Some(callback) = job
+                        .on_refreshed
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .clone()
+                    {
+                        callback();
+                    }
+                }
+            }
+            // 终审 M3：单飞期间登记的新目标在此接续（不丢失最新请求）。
+            let pending = {
+                let mut request = job.request_state.lock().unwrap_or_else(|e| e.into_inner());
+                match request.pending.take() {
+                    Some(next) => (Some(next), request.generation),
+                    None => {
+                        job.refreshing
+                            .store(false, std::sync::atomic::Ordering::Release);
+                        (None, request.generation)
+                    }
+                }
+            };
+            if let (Some(next), generation) = pending {
+                job.spawn_background_refresh(next, generation);
+            }
+        });
+    }
+
+    /// 终审 M3：按当前请求状态发起（必要时接续的）后台刷新。
+    fn request_refresh(self: &Arc<Self>, target: ObservedTarget) {
+        if self
+            .refreshing
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            // 单飞中：登记为待接续（同一状态锁）。
+            let mut request = self.request_state.lock().unwrap_or_else(|e| e.into_inner());
+            request.pending = Some(target);
+            return;
+        }
+        let generation = {
+            let request = self.request_state.lock().unwrap_or_else(|e| e.into_inner());
+            request.generation
+        };
+        self.spawn_background_refresh(target, generation);
     }
 
     fn refresh(
@@ -137,17 +255,83 @@ impl ObservedOperationsSource for TargetObservedOperations {
         let Some(target) = target
             .filter(|target| !target.probe_key.is_empty() && !target.package_sha256.is_empty())
         else {
+            // 终审 Major 3：切到无目标也推进代次（旧目标迟到结果不得安装）。
+            let mut request = self.request_state.lock().unwrap_or_else(|e| e.into_inner());
+            if request.target.is_some() {
+                request.generation = request.generation.wrapping_add(1);
+                request.target = None;
+                request.pending = None;
+            }
             return BTreeMap::new();
         };
-        let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+        // 终审 M3：登记目标 + 推进代次（install 的授权基准，同一把锁）。
+        let generation = {
+            let mut request = self.request_state.lock().unwrap_or_else(|e| e.into_inner());
+            if request.target.as_ref() != Some(target) {
+                request.generation = request.generation.wrapping_add(1);
+                request.target = Some(target.clone());
+            }
+            request.generation
+        };
+        let cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
         if let Some((cached, at, value)) = cache.as_ref() {
-            if cached == target && at.elapsed() < std::time::Duration::from_secs(10) {
+            if cached == target && at.elapsed() < OBSERVED_TTL {
                 return value.clone();
             }
         }
-        let value = self.refresh(target);
-        *cache = Some((target.clone(), std::time::Instant::now(), value.clone()));
-        value
+        // A2.2/T8：TTL 过期/无缓存 → 有缓存值就如实返回旧事实（只读成功历史，
+        // 迟到只意味着少报新成功，保守方向），并触发后台刷新——镜像临界区内
+        // 不再等待慢存储。无自引用（同步测试上下文/未装配）保持原同步刷新。
+        let stale = cache
+            .as_ref()
+            .filter(|(cached, _, _)| *cached == *target)
+            .map(|(_, _, value)| value.clone());
+        drop(cache);
+        let armed = self
+            .self_ref
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .and_then(|weak| weak.upgrade());
+        match armed {
+            Some(self_arc) => {
+                // 终审 M3：仅运行时在位时后台刷新；无运行时（同步测试）就地
+                // 同步刷新并放回去重旗标（回调经 safe_notify 调度，不裸 spawn）。
+                match tokio::runtime::Handle::try_current() {
+                    Ok(_) => self_arc.request_refresh(target.clone()),
+                    Err(_) => {
+                        if !self_arc
+                            .refreshing
+                            .swap(true, std::sync::atomic::Ordering::AcqRel)
+                        {
+                            self_arc
+                                .refreshing
+                                .store(false, std::sync::atomic::Ordering::Release);
+                            let value = self.refresh(target);
+                            let changed = self.install(target, generation, value.clone());
+                            if changed {
+                                if let Some(callback) = self
+                                    .on_refreshed
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .clone()
+                                {
+                                    callback();
+                                }
+                            }
+                            return value;
+                        }
+                    }
+                }
+                stale.unwrap_or_default()
+            }
+            None => {
+                let value = self.refresh(target);
+                // 同步回退同样经 install（目标代次/身份与写入同锁序）。
+                let _ = self.install(target, generation, value.clone());
+                value
+            }
+        }
     }
 }
 

@@ -15,7 +15,7 @@
 // - 不在 `get_all_sessions` 扫描里逐条连 IPC：只按请求解析（session → thread 单点）和
 //   有界关注集合（adapter 已跟随的 Thread）工作。
 use rusqlite::OptionalExtension;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::convert::Infallible;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -40,6 +40,7 @@ use crate::services::codex_control::{
 use crate::services::codex_desktop_ipc::adapter::{
     Connector, DesktopIpcAdapter, ProductionConnector,
 };
+use crate::services::codex_desktop_ipc::async_question::AsyncAnswerRoute;
 use crate::services::codex_desktop_ipc::mirror::MESSAGES_PAGE_LIMIT;
 use crate::services::codex_desktop_ipc::probe::runner::ProbeOutcome;
 use crate::services::codex_desktop_ipc::probe::schema_probe::SchemaEvidence;
@@ -51,6 +52,16 @@ use crate::services::codex_desktop_ipc::types::{
     ActionReceipt, ActionState, CodexActionVerifyView, CodexActionView, CodexQueueView,
     CodexVerifyOutcome, PendingKind, ProtocolError, ThreadKey, ThreadProjection,
 };
+use crate::services::codex_question_skip::coordinator::QuestionSkipCoordinator;
+use crate::services::codex_question_skip::display::QuestionDisplayStore;
+use crate::services::codex_question_skip::live::{
+    Claim, ClaimKind, ClaimsLayer, ClaimsScope, LiveFact, LiveFactKey, LiveRefusal,
+    QuestionSkipLive,
+};
+use crate::services::codex_question_skip::native_discovery::{
+    DiscoveredWindow, DiscoveryFactories, NativeDiscovery, ProviderFactory,
+};
+use crate::services::codex_question_skip::types::UiError as QsUiError;
 
 use super::server::RemoteState;
 
@@ -108,7 +119,7 @@ fn local_key(thread_id: &str) -> ThreadKey {
 }
 
 /// 状态码 + JSON 的统一 no-store 响应（门禁下私有读写路径一律禁中间层缓存）。
-fn json_no_store(status: StatusCode, body: serde_json::Value) -> Response {
+pub(crate) fn json_no_store(status: StatusCode, body: serde_json::Value) -> Response {
     (
         status,
         [(axum::http::header::CACHE_CONTROL, "no-store")],
@@ -167,6 +178,49 @@ pub(crate) enum HubEvent {
 /// 不恢复/不调度）。
 /// R8 起普通消息**仍经 router**（登记→reserve→NotSent 即终态回执【S2 起无兜底交接】，
 /// 账本纪律不因 hub 不可用绕过）。
+/// B-R1 复审终修：已装载线程簿记——epoch 与集合在同一把锁内，标记/查询/
+/// 推进清空三者对「世代」的判定原子。epoch 由 start（换代）与 stop（shutdown）
+/// 推进；装载任务以捕获 epoch 标记，换代后迟到标记被拒。
+#[derive(Default)]
+struct QuestionSkipLoadedBook {
+    epoch: u64,
+    threads: std::collections::HashSet<String>,
+}
+
+impl QuestionSkipLoadedBook {
+    fn contains(&self, epoch: u64, thread_id: &str) -> bool {
+        self.epoch == epoch && self.threads.contains(thread_id)
+    }
+
+    fn mark(&mut self, epoch: u64, thread_id: &str) -> bool {
+        if self.epoch != epoch {
+            return false;
+        }
+        self.threads.insert(thread_id.to_string());
+        true
+    }
+
+    fn advance_and_clear(&mut self) -> u64 {
+        self.epoch += 1;
+        self.threads.clear();
+        self.epoch
+    }
+}
+
+#[cfg(debug_assertions)]
+struct FormalEchoCasGate {
+    action_id: String,
+    entered: Arc<tokio::sync::Notify>,
+    proceed: Arc<tokio::sync::Notify>,
+}
+
+#[cfg(debug_assertions)]
+struct BeforeCompletionGate {
+    thread_id: String,
+    arrived: tokio::sync::oneshot::Sender<()>,
+    release: tokio::sync::oneshot::Receiver<()>,
+}
+
 pub struct CodexControlHub {
     /// 动作账本 + 安全路由（Task 7；`store()` 供动作/队列端点读取）
     pub router: Arc<CodexControlRouter>,
@@ -202,6 +256,27 @@ pub struct CodexControlHub {
     /// N07：本 hub 的**启动/装配身份**（同进程重建 hub 也会换新）；与连接 epoch、
     /// owner generation 一起组成同题占用的 owner 世系。
     owner_boot: String,
+    /// Source/live 门禁共享事实（合同 §1：adapter / ActionStore / hub 的失效接点
+    /// 共享同一份 Arc；装配点注入两处，revoke/stop 端点经本 hub 取用）。
+    question_skip_live: std::sync::Arc<QuestionSkipLive>,
+    /// 单题跳过协调器（合同 §5 hub 装配：typed ledger / OwnedOperation / 四路
+    /// HTTP 的承接点；disabled hub 恒 None）。
+    question_skip: Option<std::sync::Arc<QuestionSkipCoordinator>>,
+    /// B3 四路 HTTP 配对面：与 coordinator 同一 Arc<NativeDiscovery>（challenge/
+    /// binding 租约单一事实源；preview/confirm 只读 0 Invoke）。
+    question_skip_native: std::sync::Arc<NativeDiscovery>,
+    /// B-R1 复审终修：已装载簿记（epoch + 线程集同一锁管理）。epoch 在
+    /// start（换代）/ stop（shutdown）推进并清集合；装载以捕获的 epoch 标记，
+    /// 仅当簿记 epoch 仍相同才插入——「装载完成→标记插入」之间的换代不再产生
+    /// 迟到标记，混合代装载（all_ok 跨代拼凑）同样被拒。事实本体全在
+    /// QuestionSkipLive，本簿记不含事实数据。
+    question_skip_loaded: std::sync::Mutex<QuestionSkipLoadedBook>,
+    #[cfg(debug_assertions)]
+    formal_echo_cas_gate: Mutex<Option<FormalEchoCasGate>>,
+    #[cfg(debug_assertions)]
+    before_completion_gate: Mutex<Option<BeforeCompletionGate>>,
+    #[cfg(debug_assertions)]
+    native_hash_clear_gate: Mutex<Option<BeforeCompletionGate>>,
 }
 
 /// 周期对账默认间隔（R7.2：有界定时器；空待发集合时只有一条 EXISTS 级查询）。
@@ -305,6 +380,38 @@ pub fn read_chain_verified(store: &DeviceStore) -> bool {
     })
 }
 
+/// 只有 production 构造显式启用真实工厂；测试构造缺省拒绝，避免触达桌面。
+struct HubDiscoveryFactories {
+    production: bool,
+}
+
+impl DiscoveryFactories for HubDiscoveryFactories {
+    fn discovery_provider(&self) -> ProviderFactory {
+        #[cfg(windows)]
+        if self.production {
+            return Box::new(
+                crate::services::codex_question_skip::windows::windows_provider_factory(),
+            );
+        }
+        Box::new(|| Err(QsUiError::Unavailable))
+    }
+
+    fn candidate_provider(&self, window: DiscoveredWindow) -> ProviderFactory {
+        #[cfg(windows)]
+        if self.production {
+            return Box::new(
+                crate::services::codex_question_skip::windows::windows_provider_factory_for(window),
+            );
+        }
+        let _ = window;
+        Box::new(|| Err(QsUiError::Unavailable))
+    }
+}
+
+fn default_discovery_factories(production: bool) -> Arc<dyn DiscoveryFactories> {
+    Arc::new(HubDiscoveryFactories { production })
+}
+
 impl CodexControlHub {
     /// T05：终止类动作（cancel／interrupt）的**共享前置暂停**。
     ///
@@ -383,9 +490,31 @@ impl CodexControlHub {
         adapter.set_contract_evidence_store(Some(Arc::new(
             super::codex_evidence::StoreContractEvidence::new(store.clone()),
         )));
-        adapter.set_observed_operations_source(Some(Arc::new(
-            super::codex_evidence::TargetObservedOperations::new(store.clone()),
-        )));
+        // A2.2/T8：observed 成功历史后台刷新（TTL 过期后镜像临界区只读缓存值，
+        // 慢库不再拖投影）；刷新完成且事实变化 → 重发布全部投影。
+        // A2/M3：回调持 adapter **弱引用**（upgrade 失败即跳过）——adapter 持
+        // source、source 的回调再持 adapter 的强引用会构成环，实例永不回收。
+        let observed_source = Arc::new(super::codex_evidence::TargetObservedOperations::new(
+            store.clone(),
+        ));
+        observed_source.arm_background_refresh();
+        adapter.set_observed_operations_source(Some(observed_source.clone()));
+        let observed_adapter = Arc::downgrade(&adapter);
+        observed_source.set_on_refreshed(Some(Arc::new(move || {
+            let notify = observed_adapter.clone();
+            // 终审 M3：回调可能在**无当前 Tokio runtime** 的同步回退路径被调用——
+            // 裸 `tokio::spawn` 会 panic。统一经 `tauri::async_runtime`（自带全局
+            // runtime，任意线程可用；与 notify_auto_adapt_changed 同源做法）。
+            let publish = move || {
+                let notify = notify.clone();
+                tauri::async_runtime::spawn(async move {
+                    if let Some(notify) = notify.upgrade() {
+                        notify.republish_all_projections().await;
+                    }
+                });
+            };
+            publish();
+        })));
         adapter.set_interaction_hint_store(Some(Arc::new(
             super::codex_evidence::StoreInteractionHints::new(store.clone()),
         )));
@@ -415,12 +544,23 @@ impl CodexControlHub {
         // 与 hub（SSE 引用计数）必须看同一份关注引用——双实例会让派发侧误判零引用，
         // 把有活跃订阅的 thread 挤出 following 且恢复循环不再重建
         let gate: Arc<FollowGate> = Arc::default();
-        let dispatch = Arc::new(AdapterDispatch {
+        let concrete = AdapterDispatch {
             adapter: adapter.clone(),
             gate: gate.clone(),
             store: store.clone(),
-        });
-        let mut hub = Self::with_parts(store, adapter, dispatch, true);
+        };
+        let dispatch: Arc<dyn DesktopDispatch> = Arc::new(concrete.clone());
+        // Task5：同一具体派发器的租约伴随面——生产装配注入（Frame 钩子链持锁）。
+        let leased: Arc<dyn crate::services::codex_control::router::LeasedDispatch> =
+            Arc::new(concrete);
+        let mut hub = Self::with_parts_inner(
+            store,
+            adapter,
+            dispatch,
+            Some(leased),
+            true,
+            Some(default_discovery_factories(true)),
+        );
         hub.gate = gate;
         // #172/T7：审批回执的消失确认窗口（5s）——受理后等 pending 真的从快照消失
         hub.set_decision_confirm_ms(DECISION_CONFIRM_MS);
@@ -437,9 +577,50 @@ impl CodexControlHub {
         dispatch: Arc<dyn DesktopDispatch>,
         capable: bool,
     ) -> Self {
+        // Task5：既有构造保持无租约伴随（FakeDispatch/NullDispatch 兼容，行为与
+        // 升级前逐字一致）；生产装配经 [`Self::with_parts_inner`] 注入同一具体
+        // 实现的双 trait 面。
+        Self::with_parts_inner(store, adapter, dispatch, None, capable, None)
+    }
+
+    /// 装配内窥（含租约伴随注入）——生产/测试装配路径用；crate 内私有，不入
+    /// 公共 API。`leased` = 与 `dispatch` 同一具体派发器的 [`LeasedDispatch`] 面。
+    fn with_parts_inner(
+        store: DeviceStore,
+        adapter: Arc<DesktopIpcAdapter>,
+        dispatch: Arc<dyn DesktopDispatch>,
+        leased: Option<Arc<dyn crate::services::codex_control::router::LeasedDispatch>>,
+        capable: bool,
+        qs_factories: Option<std::sync::Arc<dyn DiscoveryFactories>>,
+    ) -> Self {
         let guard_store = store.clone();
         let store = Arc::new(crate::services::codex_control::ActionStore::new(store));
-        let router = Arc::new(CodexControlRouter::new(store, dispatch));
+        // Source/live 门禁装配点（合同 §8-4）：adapter / ActionStore / hub 共享
+        // 同一份 Arc<QuestionSkipLive>——失效接点同源，final recheck 只读内存。
+        // store 先注入（其 Arc move 进 router 之前），adapter 紧随。
+        let question_skip_live = std::sync::Arc::new(QuestionSkipLive::default());
+        store.set_question_skip_live(question_skip_live.clone());
+        adapter.set_question_skip_live(question_skip_live.clone());
+        // 单题跳过装配（合同 §5）：display 同实例注入 adapter（overlay 投影消费）+
+        // coordinator（同 DeviceStore clone / 同 router / 同 live）；Native 工厂
+        // 显式注入（测试 with_question_skip_factories），缺省按 capable/平台取默认
+        // ——非 windows 或非 capable 一律保守拒绝工厂（默认禁真实 Native，惰性
+        // 不触 COM）。
+        let question_skip_display = QuestionDisplayStore::new(guard_store.clone());
+        // B2/F6.25（合同 §5）：display 同实例注入 adapter（overlay 投影消费）——
+        // adapter 侧 setter/消费链（ensure_question_display /
+        // overlay_question_display_locked）已 Root；与 store/coordinator 共用
+        // 同一 DeviceStore 与同一 live。
+        adapter.set_question_skip_display(question_skip_display.clone());
+        let question_skip_native = NativeDiscovery::new(
+            qs_factories.unwrap_or_else(|| default_discovery_factories(false)),
+        );
+        // B3 四路 HTTP：配对 preview/confirm 直连同一 NativeDiscovery 实例（只读
+        // 0 Invoke 面）；skip/restore 走 coordinator（同一 Arc 已注入其中）。
+        let question_skip_native_for_hub = question_skip_native.clone();
+        let router = Arc::new(CodexControlRouter::with_leased_dispatch(
+            store, dispatch, leased,
+        ));
         // 终审 F4：**写边界守卫**（mutation 进 writer 队列前的最后判定）——同一
         // 持久撤销标记（人工继续事务写入）+ 兼容许可活值。撤销读取失败 → 保守
         // 拒绝（保守面 = manual_resume_revoked 的 Unknown——与撤销胜出同臂，宁可
@@ -575,6 +756,7 @@ impl CodexControlHub {
                         row.request_key.as_deref(),
                         row.context_token.as_deref(),
                         bypass,
+                        row.async_answer_route,
                         || {
                             // H02：**同一次 DB 访问**完成设备核验 + 首次写权 CAS
                             //（旧实现两次 with 之间撤设备仍可写出）。判定即线性化点。
@@ -701,10 +883,49 @@ impl CodexControlHub {
                 }
             },
         )));
+        let events = tokio::sync::broadcast::channel(64).0;
+        // Task7：意图注销轻量唤醒——仅捕获既有 HubEvent sender（不捕 hub，防引用
+        // 环）；guard Drop 条件注销成功后唤醒调度循环（周期 tick 仍兜底）。
+        {
+            let wake_sender = events.clone();
+            let wake: crate::services::codex_control::router::PriorityWake = Arc::new(
+                move |key: &crate::services::codex_desktop_ipc::types::ThreadKey| {
+                    let _ = wake_sender.send(HubEvent::ThreadSettled(key.clone()));
+                },
+            );
+            router.set_priority_wake(Some(wake));
+        }
+        let question_skip = QuestionSkipCoordinator::new(
+            question_skip_display.store().clone(),
+            router.clone(),
+            adapter.clone(),
+            question_skip_live.clone(),
+            question_skip_display.clone(),
+            question_skip_native,
+        );
+        // B2/F6.28（合同 §2 冷启动恢复门）：装配即关准入 → 无活 job（新 registry
+        // 必空）recover 遗留 Prepared/Claimed（收敛 Unresolved，不重放 Invoke）
+        // → 开放准入。热重启复用同一 hub/coordinator（registry 保留在途 owner，
+        // 不再走本链），不误当遗留重放。恢复失败保持关闭：新动作保守 Pending，
+        // 不以恢复失败冒充健康开放。
+        question_skip.close_admission();
+        match question_skip.complete_startup_recovery() {
+            Ok(n) => {
+                if n > 0 {
+                    log::info!(
+                        "题卡 skip 启动恢复：收敛遗留 prepared/claimed 行 {n} 条（不重放 Invoke）"
+                    );
+                }
+                question_skip.open_admission();
+            }
+            Err(_) => {
+                log::error!("题卡 skip 启动恢复失败：保持准入关闭（新动作保守 Pending）");
+            }
+        }
         Self {
             router,
             adapter,
-            events: tokio::sync::broadcast::channel(64).0,
+            events,
             gate: Arc::default(),
             capable,
             running: AtomicBool::new(false),
@@ -718,7 +939,99 @@ impl CodexControlHub {
                 crate::services::codex_desktop_ipc::budget::VERIFY_BUDGET_MS,
             ),
             owner_boot: crate::services::codex_desktop_ipc::types::new_uuid(),
+            question_skip_live,
+            question_skip: Some(question_skip),
+            question_skip_native: question_skip_native_for_hub,
+            question_skip_loaded: std::sync::Mutex::new(QuestionSkipLoadedBook::default()),
+            #[cfg(debug_assertions)]
+            formal_echo_cas_gate: Mutex::new(None),
+            #[cfg(debug_assertions)]
+            before_completion_gate: Mutex::new(None),
+            #[cfg(debug_assertions)]
+            native_hash_clear_gate: Mutex::new(None),
         }
+    }
+
+    /// Source/live 门禁共享事实取用点（设备吊销 / 停止 / skip 准备路径）。
+    pub(crate) fn question_skip_live(&self) -> std::sync::Arc<QuestionSkipLive> {
+        self.question_skip_live.clone()
+    }
+
+    /// B3 四路 HTTP：skip/restore 承接点（disabled hub → None，调用方保守 Pending）。
+    pub(crate) fn question_skip_coordinator(
+        &self,
+    ) -> Option<std::sync::Arc<QuestionSkipCoordinator>> {
+        self.question_skip.clone()
+    }
+
+    /// B3 四路 HTTP：配对 preview/confirm 直连面（与 coordinator 同一实例）。
+    pub(crate) fn question_skip_native(&self) -> std::sync::Arc<NativeDiscovery> {
+        self.question_skip_native.clone()
+    }
+
+    /// B2 初装载：adapter 实例（Adapter 层 Claims 经它真实读取在途占位）。
+    pub(crate) fn question_skip_adapter(&self) -> Arc<DesktopIpcAdapter> {
+        self.adapter.clone()
+    }
+
+    /// B-R1 复审终修：以捕获 epoch 批量标记；epoch 已推进（换代）→ 整批拒绝。
+    fn mark_question_skip_threads_loaded(&self, epoch: u64, tids: Vec<String>) {
+        let mut book = self
+            .question_skip_loaded
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for tid in tids {
+            book.mark(epoch, &tid);
+        }
+    }
+
+    /// B-R1（main review）：线程**首次权威使用**（skip/restore New 分支、配对
+    /// preview/confirm）时完整装载 Claims/Stop 真实事实——票据先于读取；读失败
+    /// 保持 Unknown 继续拒绝且不标记（下次首用重试）；已装载标记直接返回。
+    /// 最终 Native 守卫仍只读内存，不引入 DB/await。
+    pub(crate) async fn ensure_question_skip_thread_facts(&self, key: &ThreadKey) {
+        let tid = key.thread_id.clone();
+        // 捕获簿记 epoch：装载全程以此判定「我装载的事实是否仍属当前世代」。
+        let epoch = self
+            .question_skip_loaded
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .epoch;
+        // B-R2'（main review 第二轮）：「曾装载」≠「当前仍有健康事实资格」——
+        // 运行期写失败会把 Stop/Claims 置回 Unknown；事实不再完整已知时，
+        // 即使 loadedBook 命中也重新权威装载（票据协议 + gate + epoch 保护全部
+        // 保持；失败不标记 → 下次首用重试）。
+        let facts_known = self
+            .question_skip_live
+            .thread_facts_fully_known(key)
+            .unwrap_or(false);
+        if facts_known
+            && self
+                .question_skip_loaded
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains(epoch, &tid)
+        {
+            return;
+        }
+        let ok = load_single_thread_facts(
+            &self.question_skip_live,
+            &self.adapter,
+            self.router.store().device_store(),
+            self.router.store().stop_facts_gate_mutex(),
+            key,
+        )
+        .await;
+        if !ok {
+            return;
+        }
+        // 同一簿记锁内复核 epoch 并插入：装载期间发生 stop/start（epoch 推进）
+        // → 拒绝标记（该线程下次首用重装，不会命中迟到标记）。
+        let mut book = self
+            .question_skip_loaded
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        book.mark(epoch, &tid);
     }
 
     /// #172/T7：审批回执「消失确认」窗口（毫秒）。生产装配显式设 5000。
@@ -733,6 +1046,108 @@ impl CodexControlHub {
     pub fn set_verify_budget_ms(&self, ms: u64) {
         self.verify_budget_ms
             .store(ms.max(1), std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// 单次同步点，供测试在已读取回显、尚未写账时切换至另一归账调用。
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn set_formal_echo_cas_gate_for_tests(
+        &self,
+        action_id: String,
+        entered: Arc<tokio::sync::Notify>,
+        proceed: Arc<tokio::sync::Notify>,
+    ) {
+        *self
+            .formal_echo_cas_gate
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(FormalEchoCasGate {
+            action_id,
+            entered,
+            proceed,
+        });
+    }
+
+    #[cfg(debug_assertions)]
+    async fn wait_formal_echo_cas_gate(&self, action_id: &str) {
+        let gate = {
+            let mut slot = self
+                .formal_echo_cas_gate
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if slot
+                .as_ref()
+                .is_some_and(|gate| gate.action_id == action_id)
+            {
+                slot.take()
+            } else {
+                None
+            }
+        };
+        if let Some(gate) = gate {
+            gate.entered.notify_one();
+            gate.proceed.notified().await;
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn gate_next_settlement_before_completion_for_test(
+        &self,
+        thread_id: &str,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        Self::install_completion_gate(&self.before_completion_gate, thread_id)
+    }
+
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn gate_next_native_hash_clear_for_test(
+        &self,
+        thread_id: &str,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        Self::install_completion_gate(&self.native_hash_clear_gate, thread_id)
+    }
+
+    #[cfg(debug_assertions)]
+    fn install_completion_gate(
+        slot: &Mutex<Option<BeforeCompletionGate>>,
+        thread_id: &str,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (arrived, observed) = tokio::sync::oneshot::channel();
+        let (proceed, release) = tokio::sync::oneshot::channel();
+        *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(BeforeCompletionGate {
+            thread_id: thread_id.to_owned(),
+            arrived,
+            release,
+        });
+        (observed, proceed)
+    }
+
+    #[cfg(debug_assertions)]
+    async fn wait_completion_gate(slot: &Mutex<Option<BeforeCompletionGate>>, thread_id: &str) {
+        let gate = {
+            let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
+            if slot
+                .as_ref()
+                .is_some_and(|gate| gate.thread_id == thread_id)
+            {
+                slot.take()
+            } else {
+                None
+            }
+        };
+        if let Some(gate) = gate {
+            let _ = gate.arrived.send(());
+            let _ = gate.release.await;
+        }
     }
 
     fn verify_budget_ms(&self) -> u64 {
@@ -777,12 +1192,17 @@ impl CodexControlHub {
         capable: bool,
     ) -> Self {
         let gate: Arc<FollowGate> = Arc::default();
-        let dispatch = Arc::new(AdapterDispatch {
+        let concrete = AdapterDispatch {
             adapter: adapter.clone(),
             gate: gate.clone(),
             store: store.clone(),
-        });
-        let mut hub = Self::with_parts(store, adapter, dispatch, capable);
+        };
+        let dispatch: Arc<dyn DesktopDispatch> = Arc::new(concrete.clone());
+        // Task5：以生产形态装配租约伴随面（HTTP 集成测试经 ScriptedPeer 驱动完整
+        // IPC 语义——Frame 钩子链持锁面在测试下同样生效）。
+        let leased: Arc<dyn crate::services::codex_control::router::LeasedDispatch> =
+            Arc::new(concrete);
+        let mut hub = Self::with_parts_inner(store, adapter, dispatch, Some(leased), capable, None);
         hub.gate = gate;
         hub
     }
@@ -880,8 +1300,27 @@ impl CodexControlHub {
             return;
         }
         if self.running.swap(true, Ordering::SeqCst) {
-            return; // 运行中：幂等
+            return; // 运行中：幂等（不重复换 generation）
         }
+        // Source/live（修复合同 §4）：同 hub stop/start 复用同一 Arc——真正赢得
+        // 幂等启动后、adapter.resume 与调度开始之前开新 live generation：checked
+        // 推进私有世代、清空事实/语义产物（保留 sourceSeq 水位）、重开；所有旧
+        // 票/旧 guard/旧 FrozenSource 永久失效，新事实必须实际重装。溢出则保持
+        // 关闭并放弃本次启动。
+        if self.question_skip_live.start_new_generation().is_err() {
+            self.running.store(false, Ordering::SeqCst);
+            return;
+        }
+        // B-R1 复审终修：换代推进簿记 epoch 并清集合（同一锁内原子）——上代
+        // 标记全部失效；装载中任务的迟到标记因 epoch 不符被拒。
+        self.question_skip_loaded
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .advance_and_clear();
+        // B2/F6.26（合同 §2 事实初装载）：移入 spawn 任务——初装载完成后再进
+        // 调度循环（事实先于任何派发/转发就绪）。loader 为 async（M3：Adapter
+        // 层读取经 in-flight 异步锁），热重启每次 start 重装（generation 已推进，
+        // 旧事实已清空）。读失败该范围保守 Unknown；绝不把「没读到」当「确证没有」。
         // C4：热重启统一入口——解除停机态（stop 后 ensure 拒连），装配前恢复可连
         self.adapter.resume();
         let hub = self.clone();
@@ -891,7 +1330,10 @@ impl CodexControlHub {
         // 时序的既有假设——换 tauri 全局 runtime 后循环变跨 runtime 真并发，71 个
         // 集成用例中 2 个确定性红（2026-10-23 合入轮实证）。若未来 start 出现
         // runtime 外的调用方，须连测试假设一起重审，不能只换 spawn 宏
-        let handle = tokio::spawn(async move { scheduler_loop(hub, st).await });
+        let handle = tokio::spawn(async move {
+            load_initial_question_skip_facts(&hub, &st).await;
+            scheduler_loop(hub, st).await
+        });
         *self.sched.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
     }
 
@@ -902,6 +1344,14 @@ impl CodexControlHub {
     /// ensure 不再新建连接）并关闭连接（对端见 EOF）——stop 后推进退避时间也不
     /// 再有新 connect/follow；重新 start（resume）后仅装配一套任务。
     pub fn stop(&self) {
+        // Source/live（合同 §6）：hub stop 在其他收尾前 shutdown——所有旧票失效，
+        // 之后 begin/finish/try_source 恒 Closed。
+        self.question_skip_live.shutdown();
+        // B-R1 复审终修：shutdown 推进簿记 epoch 并清集合（与换代同口径）。
+        self.question_skip_loaded
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .advance_and_clear();
         if !self.capable {
             return;
         }
@@ -959,7 +1409,26 @@ async fn converge_one_late_result(
     };
     let mut reason_override: Option<String> =
         Some(crate::services::codex_control::LATE_RESULT_REASON.to_string());
-    if outcome.delivery == Delivery::Accepted {
+    if outcome.delivery == Delivery::Accepted && late.method == "thread-follower-steer-turn" {
+        let refusal = match hub.router.store().is_active_async_answer(&action_id) {
+            Ok(true) => crate::services::codex_desktop_ipc::adapter::async_steer_ack_refusal(
+                late.outcome.result.as_ref(),
+                late.outcome.handled_by.as_deref(),
+                late.target_client_id.as_deref(),
+            ),
+            Ok(false) => Some("client_message_unverified"),
+            Err(error) => {
+                log::error!("codex_ipc: 迟到 steer 路径读取失败 action={action_id} err={error}");
+                Some("store_error")
+            }
+        };
+        if let Some(reason) = refusal {
+            outcome.delivery = Delivery::UnknownDelivery;
+            outcome.turn_id = None;
+            outcome.reason_code = Some(reason.into());
+            reason_override = outcome.reason_code.clone();
+        }
+    } else if outcome.delivery == Delivery::Accepted {
         if let Some((thread_id, cmid)) = hub.router.store().action_thread_and_cmid(&action_id) {
             outcome = validate_late_accepted_outcome(
                 &hub.adapter,
@@ -1074,36 +1543,138 @@ async fn settle_turn_evidence(
     key: &ThreadKey,
     projection: &ThreadProjection,
 ) {
-    // ① R6.3：投影驱动的顺序限制释放（idle 边沿 / 周期对账都经此处，不只靠手工 flush）
-    hub.router.release_turn_if_complete(key, projection);
+    // 先归账，再消费终态证据。写账失败的动作保留屏障和原证据，供后续事件或周期重试。
+    let mut defer_completion = HashSet::new();
+    if !projection.stale {
+        for (action_id, cmid) in hub
+            .router
+            .store()
+            .unknown_desktop_ipc_sends_for_thread(&key.thread_id)
+        {
+            match settle_send_via_formal_echo(hub, key, &action_id, &cmid, false).await {
+                Ok(Some(_)) => log::info!("codex_ipc: formal echo settled send action={action_id}"),
+                Ok(None) => {}
+                Err(err) => {
+                    log::warn!(
+                        "codex_ipc: formal echo settlement failed action={action_id} err={err}"
+                    );
+                    defer_completion.insert(action_id);
+                }
+            }
+        }
+    }
+    #[cfg(debug_assertions)]
+    CodexControlHub::wait_completion_gate(&hub.before_completion_gate, &key.thread_id).await;
+
+    hub.router
+        .release_turn_if_complete_except(key, projection, &defer_completion);
     // ② fence reconcile（只读，不改 Codex 数据文件；失败/证据不足保持 fence 在册）。
     //    P2（2026-10-30）：fence 分两路核对——
     //    * rollout 证据齐备（compat bridge 路径原子登记）→ 既有 rollout 尾窗核对；
     //    * native 保守屏障（route=desktop_ipc，无 rollout 证据——取不到就不伪造）
     //      但有 wire 文本 hash → **镜像只读核对**：正文 hash 唯一匹配的 userMessage
     //      所在 Turn 以终态在场才放行（纪律不变：仅 idle/到点都不算完成证据）。
+    //    Task4：本轮核对过的源 action 记入 covered——③ 的 orphan book 对账对已被
+    //    fence 路覆盖的源不再重复查询（证据不足同样保守保留，不二次判定）。
+    let mut fence_covered = defer_completion;
     if let Ok(fences) = hub.router.store().compat_fences(key) {
         for fence in fences {
-            let verified = match (
-                fence.rollout_path.as_deref(),
-                fence.rollout_baseline,
-                fence.wire_hash.as_deref(),
-            ) {
-                (Some(_), Some(_), Some(_)) => {
-                    matches!(reconcile_compat_fence(&fence, projection).await, Ok(true))
-                }
-                (_, _, Some(hash)) => {
-                    native_unknown_mirror_reconcile(hub, key, &fence, hash, projection).await
-                }
-                // 证据字段缺失（旧数据无从核对）→ 保持屏障
-                _ => false,
-            };
-            if verified {
-                match hub.router.store().clear_compat_fence(&fence.action_id) {
-                    Ok(()) => log::info!(
-                        "codex_ipc: 兼容 fence 完成核对通过，已解除 action={}",
+            if fence_covered.contains(&fence.action_id) {
+                continue;
+            }
+            // Task4：本 action 已在本轮 fence 路核对（证据不足/DB 失败同样保守保留
+            // ——可重试语义不变），orphan book 对账不再重复查询同一源。
+            fence_covered.insert(fence.action_id.clone());
+            // Task1（owner 精确化）：**在核对 await 之前**观察本动作的内存簿记身份
+            //（observe 短锁、无 await）。核对通过且 DB 清除成功后按这份**观察到的
+            // 身份**条件释放——核对期间同线程若重新派发登记了新占位（新 owner），
+            // 旧 fence 的完成证据不得清新占位。observe 无匹配（簿记空/不属于本动
+            // 作）→ None，DB 清除后不做释放调用（与旧 force_clear 无匹配即 no-op
+            // 等价）。
+            let observed_owner = hub.router.observe_turn_owner(key, &fence.action_id);
+            // Task3：精确证据先行（不以 wire_hash 存在为前提）——绑定 turnId 的该
+            // Turn 终态在场，或未绑定保守屏障按本动作正式消息身份唯一关联的实体
+            // Turn 终态在场。命中即交**统一按 action 核销入口**（verified 记录 + 清
+            // 屏障同一事务），提交成功（Ok(true)）才按观察 owner 条件释放内存簿记；
+            // 提交失败/未生效都保留 fence 与 book（可重试），且**不得 fallthrough
+            // 到 hash 分支绕过失败**（hash-only 兼容语义只服务「无精确证据」场景）。
+            let rollout = fence.rollout_path.is_some() && fence.rollout_baseline.is_some();
+            let native_hash = (!rollout && !projection.stale)
+                .then_some(fence.wire_hash.as_deref())
+                .flatten();
+            let evidence = completion_evidence(
+                hub,
+                key,
+                &fence.action_id,
+                fence.turn_id.as_deref(),
+                native_hash,
+                observed_owner.as_ref(),
+            )
+            .await;
+            if let CompletionEvidence::Verified(evidence_turn) = evidence {
+                match hub.router.commit_verified_complete(
+                    key,
+                    &fence.action_id,
+                    &evidence_turn,
+                    observed_owner.as_ref(),
+                ) {
+                    Ok(true) => log::info!(
+                        "codex_ipc: 精确完成证据核销通过，已解除 action={} turn={evidence_turn}",
                         fence.action_id
                     ),
+                    Ok(false) => log::warn!(
+                        "codex_ipc: 精确完成核销未生效（屏障保守保留）action={}",
+                        fence.action_id
+                    ),
+                    Err(e) => log::warn!(
+                        "codex_ipc: 精确完成核销提交失败（屏障保留可重试）action={} err={e}",
+                        fence.action_id
+                    ),
+                }
+                continue;
+            }
+            let verified = match evidence {
+                CompletionEvidence::NativeHash(_) => true,
+                CompletionEvidence::Missing => match (rollout, fence.wire_hash.as_deref()) {
+                    (true, Some(_)) => {
+                        matches!(reconcile_compat_fence(&fence, projection).await, Ok(true))
+                    }
+                    (false, Some(hash)) => {
+                        native_unknown_mirror_reconcile(hub, key, &fence, hash, projection).await
+                    }
+                    _ => false,
+                },
+                CompletionEvidence::Hold | CompletionEvidence::Verified(_) => false,
+            };
+            if verified {
+                let store = hub.router.store();
+                let cleared = if let CompletionEvidence::NativeHash(observed_state) = evidence {
+                    #[cfg(debug_assertions)]
+                    CodexControlHub::wait_completion_gate(
+                        &hub.native_hash_clear_gate,
+                        &key.thread_id,
+                    )
+                    .await;
+                    store.clear_unbound_native_send_fence(key, &fence, observed_state)
+                } else {
+                    store.clear_compat_fence(&fence.action_id).map(|()| true)
+                };
+                match cleared {
+                    Ok(true) => {
+                        // Task1：只在 DB 清除成功后条件释放（DB 失败臂不触碰内存
+                        // 簿记——错误不释放，原日志/Err 语义不变）；人工 force-clear
+                        // 的按 action 精确语义保留给显式端点，自动核对走观察身份
+                        // 配对（observe → owned release）。
+                        if let Some(owner) = observed_owner.as_ref() {
+                            hub.router
+                                .release_turn_limit_owned(key, owner, &fence.action_id);
+                        }
+                        log::info!(
+                            "codex_ipc: 兼容 fence 完成核对通过，已解除 action={}",
+                            fence.action_id
+                        );
+                    }
+                    Ok(false) => {}
                     Err(e) => {
                         log::warn!(
                             "codex_ipc: fence 清除失败 action={} err={e}",
@@ -1113,6 +1684,194 @@ async fn settle_turn_evidence(
                 }
             }
         }
+    }
+    // ③ Task4（2026-11-11 队列占位与强制插队 TDD）：orphan book 对账——对账候选
+    //    从**真实 book 的精确源 action**读取核销/完成证据，不只遍历 DB fence（源
+    //    fence 已被核销事务消化而内存 book 残留 = 提交后清理中断 / 旧版清理遗留
+    //    的孤儿占位，旧实现永不吸收）。
+    reconcile_orphan_turn_book(hub, key, &fence_covered).await;
+}
+
+enum CompletionEvidence {
+    Verified(String),
+    NativeHash(ActionState),
+    Missing,
+    Hold,
+}
+
+/// 可信绑定终态保留原路径。未绑定普通发送在同一镜像读取中核对正式实体及正文；
+/// 终态正式回显若迟到于首轮扫描，必须先持久确认该动作，才可提交核销。
+async fn completion_evidence(
+    hub: &CodexControlHub,
+    key: &ThreadKey,
+    action_id: &str,
+    bound_turn: Option<&str>,
+    native_hash: Option<&str>,
+    observed_owner: Option<&crate::services::codex_control::router::TurnOwner>,
+) -> CompletionEvidence {
+    use crate::services::codex_desktop_ipc::adapter::UnboundSendCompletion;
+
+    if let Some(turn) = bound_turn {
+        return if hub.adapter.turn_evidence_terminal(key, turn) {
+            CompletionEvidence::Verified(turn.to_owned())
+        } else {
+            CompletionEvidence::Missing
+        };
+    }
+    let store = hub.router.store();
+    let Ok(canonical) = store.canonical_batch_action_id(action_id) else {
+        return CompletionEvidence::Hold;
+    };
+    let Ok(Some(source)) = store.completion_source(&canonical) else {
+        return CompletionEvidence::Hold;
+    };
+    if source.thread_id != key.thread_id {
+        return CompletionEvidence::Hold;
+    }
+    if source.kind != "send"
+        || source.route != crate::services::codex_control::ControlRoute::DesktopIpc
+    {
+        return match hub
+            .adapter
+            .turn_of_client_message(key, &source.client_message_id)
+            .await
+        {
+            Some(turn) if hub.adapter.turn_evidence_terminal(key, &turn) => {
+                CompletionEvidence::Verified(turn)
+            }
+            _ => CompletionEvidence::Missing,
+        };
+    }
+    match hub
+        .adapter
+        .unbound_send_completion(key, &source.client_message_id, native_hash)
+        .await
+    {
+        UnboundSendCompletion::Missing => CompletionEvidence::Missing,
+        UnboundSendCompletion::Hold => CompletionEvidence::Hold,
+        UnboundSendCompletion::HashTerminal => CompletionEvidence::NativeHash(source.state),
+        UnboundSendCompletion::FormalTerminal(turn) => {
+            match source.state {
+                ActionState::Unknown => match persist_formal_echo(
+                    hub,
+                    key,
+                    &canonical,
+                    &source.client_message_id,
+                    &turn,
+                    false,
+                    observed_owner,
+                )
+                .await
+                {
+                    Ok(Some(_)) => CompletionEvidence::Verified(turn),
+                    Ok(None) => CompletionEvidence::Hold,
+                    Err(err) => {
+                        log::warn!("codex_ipc: formal completion settlement failed action={canonical} err={err}");
+                        CompletionEvidence::Hold
+                    }
+                },
+                // 已受理可按正式身份确认缺失的回合关联；已有回执 turn 必须相符。
+                ActionState::Accepted
+                    if source.receipt.as_ref().is_none_or(|receipt| {
+                        receipt
+                            .turn_id
+                            .as_deref()
+                            .is_none_or(|previous| previous == turn)
+                    }) =>
+                {
+                    CompletionEvidence::Verified(turn)
+                }
+                _ => CompletionEvidence::Hold,
+            }
+        }
+    }
+}
+
+/// Task4（2026-11-11 队列占位与强制插队 TDD）：orphan book 对账——内存 Turn 簿记
+/// 残留而源 fence 已不在册（verified 核销事务已消化屏障、随后 owned 清理中断 /
+/// 旧版本清理遗留）的孤儿占位。候选从**真实 book 的精确源 action**读取核销/完成
+/// 证据，不只遍历 DB fence。
+///
+/// 纪律（与 fence 路同源，不另造语义）：
+/// * book 只读快照原子携带 action+turn+owner（短锁复制，不跨 DB/await）；后续
+///   核对与清理一律只用快照 owner（[`CodexControlRouter::release_turn_limit_owned`]
+///   配对）——对账期间换代登记的新占位（新 owner）不受旧快照牵连，旧 A 的任何
+///   恢复都不能清新 B 的 owner/claim；
+/// * 有 `verified_complete` 记录：host/thread/source 核对一致 → 条件补清旧 book
+///   （**不依赖 fence 在册**，不重新推导另一证据覆写原记录——record 仍 1；scope
+///   不符或 DB 错误保守不清）；
+/// * 无记录：先按 Task3 精确终态证据补记 verified（统一按 action 核销入口
+///   [`CodexControlRouter::commit_verified_complete`]——提交成功才 owned 清 book）；
+///   无精确证据 → 不造 record / 不清 book / 不改 Unknown / 不重发（不拿 idle/
+///   out0/年龄猜完成）；
+/// * fence 路本轮已覆盖的源 action 跳过（covered），不重复查询不二次判定。
+async fn reconcile_orphan_turn_book(
+    hub: &CodexControlHub,
+    key: &ThreadKey,
+    covered: &HashSet<String>,
+) {
+    let Some(snap) = hub.router.turn_limit_snapshot(key) else {
+        return; // 簿记空：无 orphan 可言
+    };
+    if covered.contains(&snap.action_id) {
+        return; // 本轮 fence 路已核对（证据不足同样保守保留）
+    }
+    // ① 已核销事实在册 → 按 host/thread/source 核对后条件补清旧 book（不重推导
+    //    证据，不动既有记录；显式接管记录 reason 钉死不匹配，绝不当全局完成）。
+    match hub.router.store().verified_complete_record(&snap.action_id) {
+        Ok(Some((host, thread, _evidence_turn))) => {
+            if host == key.host_id && thread == key.thread_id {
+                hub.router
+                    .release_turn_limit_owned(key, &snap.owner, &snap.action_id);
+            } else {
+                log::warn!(
+                    "codex_ipc: orphan book 核销记录 scope 不符（保守保留）action={} rec_host={host} rec_thread={thread}",
+                    snap.action_id
+                );
+            }
+            return;
+        }
+        Ok(None) => {}
+        Err(e) => {
+            log::warn!(
+                "codex_ipc: orphan book 核销记录读取失败（保守保留可重试）action={} err={e}",
+                snap.action_id
+            );
+            return;
+        }
+    }
+    // ② 无记录：精确终态证据先补记 verified 再 owned 清（fence 清除与否不影响
+    //    DAO——核销事务清屏障对无屏障源即零行无害）。无证据保守返回。
+    let CompletionEvidence::Verified(evidence_turn) = completion_evidence(
+        hub,
+        key,
+        &snap.action_id,
+        snap.turn_id.as_deref(),
+        None,
+        Some(&snap.owner),
+    )
+    .await
+    else {
+        return;
+    };
+    match hub.router.commit_verified_complete(
+        key,
+        &snap.action_id,
+        &evidence_turn,
+        Some(&snap.owner),
+    ) {
+        Ok(true) => log::info!(
+            "codex_ipc: orphan book 精确完成核销通过，已吸收 action={} turn={evidence_turn}",
+            snap.action_id
+        ),
+        Ok(false) => log::warn!(
+            "codex_ipc: orphan book 精确核销未生效（保守保留）action={}",
+            snap.action_id
+        ),
+        Err(e) => log::warn!(
+            "codex_ipc: orphan book 核销提交失败（book 保留可重试）action={} err={e}",
+            snap.action_id
+        ),
     }
 }
 
@@ -1248,7 +2007,6 @@ async fn settle_thread(hub: &Arc<CodexControlHub>, key: &ThreadKey) {
             // Desktop 不在/超时：保持 stale 投影照常结算（派发只会白试，闸照常）
         }
     }
-    let projection = projection;
     settle_turn_evidence(hub, key, &projection).await;
     // ②′ P3（2026-10-30 用户裁决）：停止类暂停的终态自动解除——停止/取消建立的
     // 暂停只在「停止在途 / 结果未知」期间作为派发闸存在；其等待的回合拿到终态
@@ -1577,6 +2335,86 @@ impl DesktopDispatch for AdapterDispatch {
         client_message_id: &str,
         deadline: crate::services::codex_desktop_ipc::budget::Deadline,
     ) -> crate::services::codex_control::BoxDispatchFut {
+        // Task5：业务主体移入 [`AdapterDispatch::send_text_with_hook`]（带租约钩子
+        // 伴随）；本入口保持无租约路径（行为与升级前逐字一致）。
+        self.send_text_with_hook(
+            key,
+            action_id,
+            composed_text,
+            client_message_id,
+            deadline,
+            None,
+        )
+    }
+    /// S3：在收尾预算内轮询迟到槽位（RPC 超时后捕获的迟到回执）——主体在固有
+    /// `wait_late_result_impl`（Task5 拆分：trait 块单点委托 + 固有主体，行为一致）。
+    fn wait_late_result(
+        &self,
+        envelope_id: &str,
+        client_message_id: &str,
+        deadline: crate::services::codex_desktop_ipc::budget::Deadline,
+    ) -> crate::services::codex_control::BoxLateResultFut {
+        self.wait_late_result_impl(envelope_id, client_message_id, deadline)
+    }
+    fn respond(
+        &self,
+        key: &ThreadKey,
+        request_key: &str,
+        context_token: &str,
+        action: &PendingAction,
+        action_id: &str,
+    ) -> crate::services::codex_control::BoxDispatchFut {
+        self.respond_impl(key, request_key, context_token, action, action_id)
+    }
+    /// T07：异步正式答题（独立动作类别；不进普通消息 FIFO）——主体在固有
+    /// `answer_async_impl`（Task5 拆分；租约经 `answer_async_ordinary` 伴随）。
+    fn answer_async(
+        &self,
+        key: &ThreadKey,
+        action_id: &str,
+        command: &crate::services::codex_desktop_ipc::async_question::AsyncAnswerCommand,
+        client_message_id: &str,
+        bypass_paused_queue: bool,
+        deadline: crate::services::codex_desktop_ipc::budget::Deadline,
+    ) -> crate::services::codex_control::BoxDispatchFut {
+        self.answer_async_impl(
+            key,
+            action_id,
+            command,
+            client_message_id,
+            bypass_paused_queue,
+            deadline,
+        )
+    }
+    /// T04：把前台剩余预算一路传到连接等待层（同一绝对截止，不重置）。
+    fn respond_bounded(
+        &self,
+        key: &ThreadKey,
+        request_key: &str,
+        context_token: &str,
+        action: &PendingAction,
+        action_id: &str,
+        deadline: crate::services::codex_desktop_ipc::budget::Deadline,
+    ) -> crate::services::codex_control::BoxDispatchFut {
+        self.respond_bounded_impl(key, request_key, context_token, action, action_id, deadline)
+    }
+}
+
+impl AdapterDispatch {
+    /// Task5：send_text 业务主体（带租约钩子伴随）——业务语义（ensure → 忙态复核
+    /// → compat 许可 → start-turn → Turn 关联/身份核验）与升级前逐字一致；`hook`
+    /// = 租约 keepalive 钩子（None = 无租约路径）。租约随钩子经 adapter dispatch
+    /// 的 prior_recheck 包装进入 RpcRequest → FrameCmd → writer——真实 Frame 未
+    /// 离开 writer（写出完成 / 写前拒发 / 连接排空）前串行租约不释放。
+    fn send_text_with_hook(
+        &self,
+        key: &ThreadKey,
+        action_id: &str,
+        composed_text: &str,
+        client_message_id: &str,
+        deadline: crate::services::codex_desktop_ipc::budget::Deadline,
+        write_context: Option<crate::services::codex_desktop_ipc::types::FrameWriteContext>,
+    ) -> crate::services::codex_control::BoxDispatchFut {
         let adapter = self.adapter.clone();
         let key = key.clone();
         let composed = composed_text.to_string();
@@ -1621,29 +2459,20 @@ impl DesktopDispatch for AdapterDispatch {
             // 终审 F10：把**此刻**（写出前）的 Turn 集合快照随槽位冻结——迟到回执
             // 的 stale 判定比对这份快照（消费时的当前镜像已可能含本动作新 Turn，
             // 误比对会把有效回执判成旧 Turn 回显）。
-            let outcome = if compat {
-                adapter
-                    .start_turn_compat_bounded(
-                        &key,
-                        &action_id,
-                        &composed,
-                        &cmid,
-                        rpc_deadline,
-                        existing_turns.clone(),
-                    )
-                    .await
-            } else {
-                adapter
-                    .start_turn_bounded(
-                        &key,
-                        &action_id,
-                        &composed,
-                        &cmid,
-                        rpc_deadline,
-                        existing_turns.clone(),
-                    )
-                    .await
-            };
+            let outcome = adapter
+                .start_turn_with(
+                    &key,
+                    &action_id,
+                    &composed,
+                    &cmid,
+                    compat,
+                    rpc_deadline,
+                    existing_turns.clone(),
+                    None,
+                    None,
+                    write_context,
+                )
+                .await;
             // R6.3：回执时投影 revision 基线（完成证据的严格后续判定基准）
             let revision = adapter.projection(&key).await.revision;
             let mut out = outcome_of(outcome);
@@ -1719,9 +2548,51 @@ impl DesktopDispatch for AdapterDispatch {
             out
         })
     }
+
+    /// Task5：租约 keepalive 钩子工厂——把串行租约捕获进写边界复核闭包（恒放行，
+    /// 返回 `None`，不参与任何资格判定；其存在即为延长租约生命周期）。
+    fn lease_keepalive_hook(
+        lease: crate::services::codex_control::router::WriterLease,
+    ) -> crate::services::codex_desktop_ipc::types::InteractionRecheck {
+        std::sync::Arc::new(move || {
+            let _keepalive = &lease;
+            None
+        })
+    }
+
+    /// Task7：keepalive 与优先调度复核合成同一写边界钩子，调度准入标记随私有
+    /// 载体（`FrameWriteContext`）进 Frame——writer 预 claim 点 try_admit、真实
+    /// Claimed 臂 mark_claimed；租约仍强捕 Frame 至实际 write 完，原 native/
+    /// generation 链独立保留。
+    fn compose_frame_write_context(
+        keepalive: crate::services::codex_desktop_ipc::types::InteractionRecheck,
+        priority_recheck: Option<crate::services::codex_desktop_ipc::types::InteractionRecheck>,
+        admission: Option<
+            std::sync::Arc<crate::services::codex_desktop_ipc::types::AttemptAdmission>,
+        >,
+    ) -> crate::services::codex_desktop_ipc::types::FrameWriteContext {
+        let hook: crate::services::codex_desktop_ipc::types::InteractionRecheck =
+            match priority_recheck {
+                Some(priority) => std::sync::Arc::new(move || {
+                    if let Some(reason) = priority() {
+                        return Some(reason);
+                    }
+                    keepalive()
+                }),
+                None => keepalive,
+            };
+        crate::services::codex_desktop_ipc::types::FrameWriteContext {
+            interaction_hook: Some(hook),
+            admission,
+        }
+    }
+}
+
+impl AdapterDispatch {
     /// S3：在收尾预算内轮询迟到槽位（RPC 超时后捕获的迟到回执）；消费即取走
     ///（同一证据只收敛一次——与后台对账兜底消费竞争时先到先得，DAO 侧 CAS 再兜一层）。
-    fn wait_late_result(
+    ///（Task5：主体随 DesktopDispatch::wait_late_result 委托至本固有方法。）
+    fn wait_late_result_impl(
         &self,
         envelope_id: &str,
         client_message_id: &str,
@@ -1749,7 +2620,36 @@ impl DesktopDispatch for AdapterDispatch {
                     };
                     // Gate B #4：Accepted 迟到回执过**身份校验门**（与正常路径同一
                     // 验证标准）——thread/cmid 经账本单点解析（槽位绑定 actionId）。
-                    if out.delivery == Delivery::Accepted {
+                    if out.delivery == Delivery::Accepted
+                        && r.method == "thread-follower-steer-turn"
+                    {
+                        let active = match r.action_id.as_deref() {
+                            Some(action_id) => store.with(|conn| {
+                                crate::database::dao::codex_actions::get_row(conn, action_id)
+                                    .map(|row| row.is_some_and(|row| row.is_active_async_answer()))
+                            }),
+                            None => Ok(false),
+                        };
+                        let refusal = match active {
+                            Ok(true) => {
+                                crate::services::codex_desktop_ipc::adapter::async_steer_ack_refusal(
+                                    r.outcome.result.as_ref(),
+                                    r.outcome.handled_by.as_deref(),
+                                    r.target_client_id.as_deref(),
+                                )
+                            }
+                            Ok(false) => Some("client_message_unverified"),
+                            Err(error) => {
+                                log::error!("codex_ipc: 迟到 steer 路径读取失败 err={error}");
+                                Some("store_error")
+                            }
+                        };
+                        if let Some(reason) = refusal {
+                            out.delivery = Delivery::UnknownDelivery;
+                            out.turn_id = None;
+                            out.reason_code = Some(reason.into());
+                        }
+                    } else if out.delivery == Delivery::Accepted {
                         if let Some(action_id) = r.action_id.as_deref() {
                             let row = store
                                 .with(|c| {
@@ -1798,7 +2698,7 @@ impl DesktopDispatch for AdapterDispatch {
             }
         })
     }
-    fn respond(
+    fn respond_impl(
         &self,
         key: &ThreadKey,
         request_key: &str,
@@ -1820,8 +2720,9 @@ impl DesktopDispatch for AdapterDispatch {
         })
     }
 
-    /// T07：异步正式答题（独立动作类别；不进普通消息 FIFO）。
-    fn answer_async(
+    /// T07：异步正式答题（独立动作类别；不进普通消息 FIFO）——Task5：主体随
+    /// DesktopDispatch::answer_async 委托至本固有方法（租约经 answer_async_ordinary）。
+    fn answer_async_impl(
         &self,
         key: &ThreadKey,
         action_id: &str,
@@ -1851,8 +2752,9 @@ impl DesktopDispatch for AdapterDispatch {
         })
     }
 
-    /// T04：把前台剩余预算一路传到连接等待层（同一绝对截止，不重置）。
-    fn respond_bounded(
+    /// T04：把前台剩余预算一路传到连接等待层（同一绝对截止，不重置）——Task5：
+    /// 主体随 DesktopDispatch::respond_bounded 委托至本固有方法。
+    fn respond_bounded_impl(
         &self,
         key: &ThreadKey,
         request_key: &str,
@@ -1871,6 +2773,75 @@ impl DesktopDispatch for AdapterDispatch {
             outcome_of(
                 adapter
                     .respond_bounded(&key, &rk, &tk, action, &action_id, deadline)
+                    .await,
+            )
+        })
+    }
+}
+
+/// Task5：带串行租约的派发伴随（生产实现）——租约随真实 Frame 挂到 writer 写边界
+/// 钩子链；业务语义与 [`DesktopDispatch`] 对应方法逐字一致（仅延长生命周期）。
+impl crate::services::codex_control::router::LeasedDispatch for AdapterDispatch {
+    fn send_text_ordinary(
+        &self,
+        key: &ThreadKey,
+        action_id: &str,
+        composed_text: &str,
+        client_message_id: &str,
+        deadline: crate::services::codex_desktop_ipc::budget::Deadline,
+        context: crate::services::codex_control::router::LeasedSendContext,
+    ) -> crate::services::codex_control::BoxDispatchFut {
+        let write_context = Self::compose_frame_write_context(
+            Self::lease_keepalive_hook(context.lease),
+            Some(context.priority_recheck),
+            Some(context.admission),
+        );
+        self.send_text_with_hook(
+            key,
+            action_id,
+            composed_text,
+            client_message_id,
+            deadline,
+            Some(write_context),
+        )
+    }
+    fn answer_async_ordinary(
+        &self,
+        key: &ThreadKey,
+        action_id: &str,
+        command: &crate::services::codex_desktop_ipc::async_question::AsyncAnswerCommand,
+        client_message_id: &str,
+        deadline: crate::services::codex_desktop_ipc::budget::Deadline,
+        context: crate::services::codex_control::router::LeasedAnswerContext,
+    ) -> crate::services::codex_control::BoxDispatchFut {
+        let adapter = self.adapter.clone();
+        let key = key.clone();
+        let action_id = action_id.to_string();
+        let command = command.clone();
+        let cmid = client_message_id.to_string();
+        // Task7：keepalive 与调度准入伴随合成私有载体（租约强捕 + marker 随帧）。
+        let write_context = Self::compose_frame_write_context(
+            Self::lease_keepalive_hook(context.lease),
+            Some(context.priority_recheck),
+            Some(context.admission),
+        );
+        let bypass_paused_queue = context.bypass_paused_queue;
+        let route = context.route;
+        Box::pin(async move {
+            outcome_of(
+                adapter
+                    .answer_async_ordinary(
+                        &key,
+                        &action_id,
+                        &command,
+                        &cmid,
+                        deadline,
+                        crate::services::codex_desktop_ipc::adapter::AnswerDispatchContext {
+                            route,
+                            bypass_paused_queue,
+                            write_context: Some(write_context),
+                        },
+                    )
                     .await,
             )
         })
@@ -1957,26 +2928,45 @@ pub(crate) struct StoreProbeLedger {
     store: DeviceStore,
 }
 
+#[cfg(test)]
+impl StoreProbeLedger {
+    pub(crate) fn for_test(store: DeviceStore) -> Self {
+        Self { store }
+    }
+}
+
 impl ProbeLedger for StoreProbeLedger {
     fn get(&self, probe_key: &str, capability: &str) -> Option<ProbeLedgerEntry> {
+        self.try_get(probe_key, capability).ok().flatten()
+    }
+
+    fn try_get(
+        &self,
+        probe_key: &str,
+        capability: &str,
+    ) -> Result<
+        Option<ProbeLedgerEntry>,
+        crate::services::codex_desktop_ipc::probe::ProbeLedgerReadError,
+    > {
         self.store
             .with(|conn| {
                 crate::database::dao::codex_ipc_probe::get_conn(conn, probe_key, capability)
-                    .ok()
-                    .flatten()
             })
-            .map(|row| ProbeLedgerEntry {
-                // S1：成功证据与最近失败观测分离——「已取证」由 DAO 单点判
-                evidenced: row.has_evidence(),
-                evidenced_at: row.evidence_at,
-                last_seen_at: Some(row.last_seen_at),
-                state: row.state,
-                next_retry_at: row.next_retry_at,
-                // #172/T9a：探测只读事实要用的两个字段（只读；不改既有语义）
-                stage: row.probe_stage,
-                error_code: row.error_code,
-                // 证据指纹（只对 capability='schema' 有意义）
-                fingerprint: row.fingerprint,
+            .map_err(|_| crate::services::codex_desktop_ipc::probe::ProbeLedgerReadError)
+            .map(|row| {
+                row.map(|row| ProbeLedgerEntry {
+                    // S1：成功证据与最近失败观测分离——「已取证」由 DAO 单点判
+                    evidenced: row.has_evidence(),
+                    evidenced_at: row.evidence_at,
+                    last_seen_at: Some(row.last_seen_at),
+                    state: row.state,
+                    next_retry_at: row.next_retry_at,
+                    // #172/T9a：探测只读事实要用的两个字段（只读；不改既有语义）
+                    stage: row.probe_stage,
+                    error_code: row.error_code,
+                    // 证据指纹（只对 capability='schema' 有意义）
+                    fingerprint: row.fingerprint,
+                })
             })
     }
 
@@ -2273,16 +3263,201 @@ pub(crate) fn find_session_display_sync(
 
 /// session → local ThreadKey（服务端 resolve_thread 单点：rollout 文件名 UUID 权威 →
 /// 仅 UUID 形态会话号回退；非 codex / 无法解析 → None——HTTP 层 404）。
+/// Source/live（合同 §6）：以带票的 resolver 结果装载 session→ThreadKey 映射事实
+/// （准备阶段装载；后续改变/移除该映射先失效 Session）。没有已知映射就拒绝，
+/// 不拿 public sessionId 当 ThreadKey。
 pub(crate) fn resolve_session_thread(
     st: &RemoteState,
     session: &crate::session::Session,
 ) -> Option<ThreadKey> {
-    if session.agent_type.tool_id() != "codex" {
-        return None;
+    let resolved = if session.agent_type.tool_id() != "codex" {
+        None
+    } else {
+        let home = (st.home_source)().map(std::path::PathBuf::from);
+        let rollout = production_rollout_path(home.as_deref(), &session.id);
+        resolve_thread(rollout.as_deref(), &session.id).map(|t| local_key(&t.id))
+    };
+    let live = st.codex_control.question_skip_live();
+    if let Ok(update) = live.begin_gate_change(LiveFactKey::Session(session.id.clone())) {
+        let fact = LiveFact::Session(resolved.clone());
+        let _ = live.finish_gate_change(update, Ok(fact));
     }
-    let home = (st.home_source)().map(std::path::PathBuf::from);
-    let rollout = production_rollout_path(home.as_deref(), &session.id);
-    resolve_thread(rollout.as_deref(), &session.id).map(|t| local_key(&t.id))
+    resolved
+}
+
+// ============================================================
+// B2 事实初装载（合同 §2 / F6.26）
+// ============================================================
+
+/// B-R1：单线程完整事实装载（初装载与**首用装载**共用体；票据协议照旧——
+/// 票先于读取，读失败提交 Unknown）。返回三项（Claims 持久层 / Adapter 层 /
+/// Stop）是否全部权威提交成功；false = 存在 Unknown，调用方不得标记该线程
+/// 已装载（下次首用重试）。最终 Native 守卫仍只读内存，不因此引入 DB/await。
+async fn load_single_thread_facts(
+    live: &std::sync::Arc<QuestionSkipLive>,
+    adapter: &Arc<DesktopIpcAdapter>,
+    store: &DeviceStore,
+    stop_gate: &std::sync::Mutex<()>,
+    key: &ThreadKey,
+) -> bool {
+    let mut all_ok = true;
+    // Claims 持久层：完整读取（空集 = 已证空；读失败 = 该层 Unknown）。
+    if let Ok(refresh) = live.begin_claims_refresh(key, ClaimsLayer::Persistent, ClaimsScope::Full)
+    {
+        let observed = store
+            .with(|c| -> rusqlite::Result<Vec<Claim>> {
+                Ok(
+                    crate::database::dao::codex_interactions::claims_for_thread_conn(
+                        c,
+                        &key.thread_id,
+                    )?
+                    .into_iter()
+                    .map(|(question_key, action_id, state)| Claim {
+                        question_key,
+                        action_id,
+                        kind: match state.as_str() {
+                            "answered" => ClaimKind::Answered,
+                            "unknown" => ClaimKind::Unknown,
+                            _ => ClaimKind::InFlight,
+                        },
+                    })
+                    .collect(),
+                )
+            })
+            .map(Ok::<Vec<Claim>, LiveRefusal>)
+            .unwrap_or_else(|_| Err(LiveRefusal::Unknown));
+        let read_ok = observed.is_ok();
+        let committed = live.finish_claims_refresh(refresh, observed).is_ok();
+        all_ok &= read_ok && committed;
+    } else {
+        all_ok = false;
+    }
+    // Claims Adapter 层：adapter 既有 in-flight 真实读取 + 票据协议（热重启
+    // 在途占位按当前真值装载，不被「空集」冒充全读证明）。
+    all_ok &= adapter.refresh_adapter_claims_on_load(key).await;
+    // Stop：真实 StopAttempt 行判 running（claimed 在途 = true，无 = false）；
+    // 停止类暂停屏障判 persistent。完整读取的「无行」= 已证双 false。
+    // B-R2 复审：Stop 段与运行期写点共用临界区门——装载读不越过在途写。
+    let _stop_gate = stop_gate.lock().unwrap_or_else(|e| e.into_inner());
+    if let Ok(update) = live.begin_gate_change(LiveFactKey::Stop(key.clone())) {
+        let observed = store
+            .with(|c| -> rusqlite::Result<LiveFact> {
+                let running = crate::database::dao::codex_actions::thread_stop_running_conn(
+                    c,
+                    &key.thread_id,
+                )?;
+                let persistent =
+                    !crate::database::dao::codex_actions::stop_pause_rows_conn(c, &key.thread_id)?
+                        .is_empty();
+                Ok(LiveFact::Stop {
+                    running: Some(running),
+                    persistent: Some(persistent),
+                })
+            })
+            .map(Ok::<LiveFact, LiveRefusal>)
+            .unwrap_or_else(|_| Err(LiveRefusal::Unknown));
+        let read_ok = observed.is_ok();
+        let committed = live.finish_gate_change(update, observed).is_ok();
+        all_ok &= read_ok && committed;
+    } else {
+        all_ok = false;
+    }
+    all_ok
+}
+
+/// 启动事实初装载（B2/F6.26 + B-R1）：更新票早于实际读取，把持久事实装入
+/// [`QuestionSkipLive`]。
+///
+/// - **Device**：逐台「先票后读」（并发吊销不被本装载旧结果覆盖）。
+/// - **Session**：复用 `resolve_session_thread`，解析线程进装载并集。
+/// - **Claims/Stop/Adapter**：线程并集 = 解析线程 ∪ 有 claim 行 ∪ 有 stop 事实
+///   线程，逐线程经 [`load_single_thread_facts`] 装载（健康线程获两层已证空 +
+///   Stop 双 false）；全部提交成功的线程记入 hub 已装载标记集（B-R1 首用装载
+///   免重复）。启动后新增线程不在本装载范围——由首用装载兜住（B-R1）。
+async fn load_initial_question_skip_facts(hub: &CodexControlHub, st: &Arc<RemoteState>) {
+    let live = hub.question_skip_live();
+    let adapter = hub.question_skip_adapter();
+    let action_store = hub.router.store().clone();
+    let store = action_store.device_store().clone();
+
+    // ① Device：先票后读（逐台）。
+    let device_ids: Vec<String> = store
+        .with(|c| -> rusqlite::Result<Vec<String>> {
+            let mut stmt = c.prepare("SELECT id FROM remote_devices ORDER BY id")?;
+            let rows = stmt
+                .query_map([], |r| r.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+        .unwrap_or_default();
+    for id in device_ids {
+        if let Ok(update) = live.begin_gate_change(LiveFactKey::Device(id.clone())) {
+            use rusqlite::OptionalExtension;
+            let observed: Result<LiveFact, LiveRefusal> = store
+                .with(|c| -> rusqlite::Result<Option<bool>> {
+                    let revoked: Option<i64> = c
+                        .query_row(
+                            "SELECT revoked FROM remote_devices WHERE id = ?1",
+                            [&id],
+                            |r| r.get(0),
+                        )
+                        .optional()?;
+                    Ok(revoked.map(|r| r != 0))
+                })
+                .ok()
+                .flatten()
+                .map(|revoked| LiveFact::Device {
+                    paired: true,
+                    revoked,
+                    control_right: !revoked,
+                })
+                .ok_or(LiveRefusal::Unknown);
+            let _ = live.finish_gate_change(update, observed);
+        }
+    }
+
+    // ② Session：resolver 权威映射（非 codex 会话跳过）；解析线程进并集。
+    let mut union: Vec<ThreadKey> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = Default::default();
+    let sessions = (st.session_source)().sessions;
+    for session in &sessions {
+        if session.agent_type.tool_id() == "codex" {
+            if let Some(key) = resolve_session_thread(st, session) {
+                if seen.insert(key.thread_id.clone()) {
+                    union.push(key);
+                }
+            }
+        }
+    }
+
+    // ③ Claims/Stop/Adapter：并集逐线程装载（共用体），成功者进已装载标记集。
+    let mut extra_ids: Vec<String> = store
+        .with(|c| -> rusqlite::Result<Vec<String>> {
+            let mut ids = crate::database::dao::codex_interactions::threads_with_claims_conn(c)?;
+            ids.extend(crate::database::dao::codex_actions::threads_with_stop_facts_conn(c)?);
+            Ok(ids)
+        })
+        .unwrap_or_default();
+    extra_ids.sort();
+    extra_ids.dedup();
+    for thread_id in extra_ids {
+        if seen.insert(thread_id.clone()) {
+            union.push(local_key(&thread_id));
+        }
+    }
+    let stop_gate = action_store.stop_facts_gate_mutex();
+    let epoch = hub
+        .question_skip_loaded
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .epoch;
+    let mut loaded_ok: Vec<String> = Vec::new();
+    for key in &union {
+        if load_single_thread_facts(&live, &adapter, &store, stop_gate, key).await {
+            loaded_ok.push(key.thread_id.clone());
+        }
+    }
+    hub.mark_question_skip_threads_loaded(epoch, loaded_ok);
 }
 
 // ============================================================
@@ -2986,6 +4161,79 @@ pub async fn action_status(
 /// * accepted 但始终无 turnId 且无法补绑 → `accepted_unbound`（「消息已受理，
 ///   执行状态待确认」；显式解除运行屏障的出口对它开放）；
 /// * 无证据/快照缺失/查不到 → `unresolved`（**「没找到」≠「没发送」**，屏障保留）。
+///
+/// 唯一正式消息回显确认同动作的投递，并向已观察到的 owner 补绑回合。
+/// 调度器只处理 Unknown；显式核对还可确认已取得原写入权的 Reserved。
+/// 回合释放由 settle_turn_evidence 处理，存储错误保留至调用方决定是否重试。
+async fn settle_send_via_formal_echo(
+    hub: &CodexControlHub,
+    key: &ThreadKey,
+    action_id: &str,
+    cmid: &str,
+    allow_reserved: bool,
+) -> Result<Option<String>, crate::services::codex_control::StoreError> {
+    let owner = hub.router.observe_turn_owner(key, action_id);
+    if allow_reserved && owner.is_none() {
+        return Ok(None);
+    }
+    let Some(turn) = hub.adapter.unique_formal_echo_turn(key, cmid).await else {
+        return Ok(None);
+    };
+    persist_formal_echo(
+        hub,
+        key,
+        action_id,
+        cmid,
+        &turn,
+        allow_reserved,
+        owner.as_ref(),
+    )
+    .await
+}
+
+async fn persist_formal_echo(
+    hub: &CodexControlHub,
+    key: &ThreadKey,
+    action_id: &str,
+    cmid: &str,
+    turn: &str,
+    allow_reserved: bool,
+    owner: Option<&crate::services::codex_control::router::TurnOwner>,
+) -> Result<Option<String>, crate::services::codex_control::StoreError> {
+    let store = hub.router.store();
+    let receipt = ActionReceipt {
+        action_id: action_id.to_string(),
+        delivery: Delivery::Accepted,
+        route: crate::services::codex_control::ControlRoute::DesktopIpc,
+        turn_id: Some(turn.to_owned()),
+        envelope_id: None,
+        reason_code: Some(crate::services::codex_control::READ_VERIFY_REASON.to_string()),
+    };
+    #[cfg(debug_assertions)]
+    hub.wait_formal_echo_cas_gate(action_id).await;
+
+    if let Some(outstanding) =
+        store.finish_formal_echo(&receipt, &key.thread_id, cmid, allow_reserved)?
+    {
+        if let (true, Some(owner)) = (outstanding, owner) {
+            hub.router.bind_turn_id_owned(key, owner, action_id, turn);
+        }
+        return Ok(Some(turn.to_owned()));
+    }
+    // CAS 输家仅回放同动作、同 turn 的持久 Accepted。
+    let replay_ok = store
+        .get_for_device_unisolated(action_id)
+        .is_some_and(|row| {
+            row.state == ActionState::Accepted
+                && row.receipt.as_ref().is_some_and(|receipt| {
+                    receipt.action_id == action_id
+                        && receipt.delivery == Delivery::Accepted
+                        && receipt.turn_id.as_deref() == Some(turn)
+                })
+        });
+    Ok(replay_ok.then(|| turn.to_owned()))
+}
+
 async fn verify_action_core(
     hub: &CodexControlHub,
     key: &ThreadKey,
@@ -2997,6 +4245,9 @@ async fn verify_action_core(
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0);
     let store = hub.router.store();
+    let route = store.is_active_async_answer(action_id);
+    let active_answer = matches!(route.as_ref(), Ok(true));
+    let may_release_turn = matches!(route, Ok(false));
     let mut released = false;
     // ① 读账本当前事实（核对自身的账本读；属主隔离由端点先行完成）
     let first = store.get_for_device_unisolated(action_id);
@@ -3051,41 +4302,41 @@ async fn verify_action_core(
     let fresh = projection.as_ref().is_some_and(|p| !p.stale);
     let bound_turn = store.bound_turn_id(action_id);
     match cur.state {
-        // 已受理：绑 Turn 的查终态证据释放运行限制；未绑的先试补绑
         ActionState::Accepted => {
-            if let Some(turn) = bound_turn {
-                // 运行顺序限制按绑定 Turn 实时状态：终态证据 + 新鲜 idle 才解除
-                if fresh {
-                    let p = projection.clone().unwrap();
-                    released = hub.router.release_turn_if_complete(key, &p);
-                }
+            // 人工清障会清空兼容绑定槽；真实迟到回执仍能独立证明原动作送达。
+            let receipt_turn = cur
+                .receipt
+                .as_ref()
+                .filter(|receipt| {
+                    receipt.action_id == action_id && receipt.delivery == Delivery::Accepted
+                })
+                .and_then(|receipt| receipt.turn_id.as_deref())
+                .filter(|turn| !turn.trim().is_empty());
+            if let Some(turn) = receipt_turn.map(str::to_string).or(bound_turn) {
+                // T1（B6-01）：手动核对只结算**本动作**——线程级运行限制释放
+                // （release_turn_if_complete）留给后台调度，核对不再触碰同线程
+                // 其他动作的 owner/屏障/claim（run_limit_released 恒 false）。
                 CodexActionVerifyView {
                     action_id: action_id.to_string(),
                     stage: cur.stage,
                     outcome: CodexVerifyOutcome::Delivered,
                     turn_id: Some(turn),
-                    run_limit_released: released,
+                    run_limit_released: false,
                     reason_code: cur.receipt.as_ref().and_then(|r| r.reason_code.clone()),
                     verified_at,
                 }
             } else {
                 // 补绑：经原 client_message_id 与正式实体关联（不改写已受理事实）
                 match rebind_from_echo(hub, key, action_id, cmid).await {
-                    Some(turn) => {
-                        if fresh {
-                            let p = projection.clone().unwrap();
-                            released = hub.router.release_turn_if_complete(key, &p);
-                        }
-                        CodexActionVerifyView {
-                            action_id: action_id.to_string(),
-                            stage: cur.stage,
-                            outcome: CodexVerifyOutcome::Delivered,
-                            turn_id: Some(turn),
-                            run_limit_released: released,
-                            reason_code: cur.receipt.as_ref().and_then(|r| r.reason_code.clone()),
-                            verified_at,
-                        }
-                    }
+                    Some(turn) => CodexActionVerifyView {
+                        action_id: action_id.to_string(),
+                        stage: cur.stage,
+                        outcome: CodexVerifyOutcome::Delivered,
+                        turn_id: Some(turn),
+                        run_limit_released: false,
+                        reason_code: cur.receipt.as_ref().and_then(|r| r.reason_code.clone()),
+                        verified_at,
+                    },
                     None => CodexActionVerifyView {
                         action_id: action_id.to_string(),
                         stage: cur.stage,
@@ -3100,47 +4351,80 @@ async fn verify_action_core(
         }
         // 结果不确定（reserved/unknown）：正式回显收敛（迟到回执已在上一步收敛过）
         ActionState::Reserved | ActionState::Unknown => {
-            match hub.adapter.turn_of_client_message(key, cmid).await {
-                Some(turn) => {
-                    // 收敛 accepted + 绑 Turn 屏障（finish_late_result 单次 CAS：
-                    // accepted 绑定 Turn 身份 = 「送达/已受理」且顺序限制按 Turn 实时状态）
-                    let receipt = ActionReceipt {
-                        action_id: action_id.to_string(),
-                        delivery: Delivery::Accepted,
-                        route: crate::services::codex_control::ControlRoute::DesktopIpc,
-                        turn_id: Some(turn.clone()),
-                        envelope_id: None,
-                        reason_code: Some(
-                            crate::services::codex_control::READ_VERIFY_REASON.to_string(),
-                        ),
-                    };
-                    let _ = store.finish_late_result(&receipt);
-                    // 内存 Turn 簿记同步（补绑的身份供释放门消费）
-                    hub.router.bind_turn_id(key, action_id, &turn);
-                    if fresh {
-                        let p = projection.clone().unwrap();
-                        released = hub.router.release_turn_if_complete(key, &p);
+            if active_answer {
+                // 运行中异步答题保留既有手动路径与校验（回显只证明本动作送达）。
+                let echo = hub.adapter.turn_of_async_answer_message(key, cmid).await;
+                match echo {
+                    Some(turn) => {
+                        // 收敛 accepted + 绑 Turn 屏障（finish_late_result 单次 CAS：
+                        // accepted 绑定 Turn 身份 = 「送达/已受理」且顺序限制按 Turn 实时状态）
+                        let receipt = ActionReceipt {
+                            action_id: action_id.to_string(),
+                            delivery: Delivery::Accepted,
+                            route: crate::services::codex_control::ControlRoute::DesktopIpc,
+                            turn_id: Some(turn.clone()),
+                            envelope_id: None,
+                            reason_code: Some(
+                                crate::services::codex_control::READ_VERIFY_REASON.to_string(),
+                            ),
+                        };
+                        let _ = store.finish_late_result(&receipt);
+                        // steer 的回显只证明本动作送达，不补绑或释放原回合 A。
+                        if may_release_turn {
+                            hub.router.bind_turn_id(key, action_id, &turn);
+                        }
+                        if may_release_turn && fresh {
+                            let p = projection.clone().unwrap();
+                            released = hub.router.release_turn_if_complete(key, &p);
+                        }
+                        let cur = store.get_for_device_unisolated(action_id).unwrap_or(cur);
+                        CodexActionVerifyView {
+                            action_id: action_id.to_string(),
+                            stage: cur.stage,
+                            outcome: CodexVerifyOutcome::Delivered,
+                            turn_id: Some(turn),
+                            run_limit_released: released,
+                            reason_code: cur.receipt.as_ref().and_then(|r| r.reason_code.clone()),
+                            verified_at,
+                        }
                     }
-                    let cur = store.get_for_device_unisolated(action_id).unwrap_or(cur);
-                    CodexActionVerifyView {
+                    None => CodexActionVerifyView {
                         action_id: action_id.to_string(),
                         stage: cur.stage,
-                        outcome: CodexVerifyOutcome::Delivered,
-                        turn_id: Some(turn),
-                        run_limit_released: released,
+                        outcome: CodexVerifyOutcome::Unresolved,
+                        turn_id: bound_turn,
+                        run_limit_released: false,
                         reason_code: cur.receipt.as_ref().and_then(|r| r.reason_code.clone()),
                         verified_at,
-                    }
+                    },
                 }
-                None => CodexActionVerifyView {
-                    action_id: action_id.to_string(),
-                    stage: cur.stage,
-                    outcome: CodexVerifyOutcome::Unresolved,
-                    turn_id: bound_turn,
-                    run_limit_released: false,
-                    reason_code: cur.receipt.as_ref().and_then(|r| r.reason_code.clone()),
-                    verified_at,
-                },
+            } else {
+                // T1（B6-01）：普通 desktop_ipc 发送——实体级唯一正式回显 +
+                // CAS 感知归账（落账 Err/输家不报 Delivered；不释放线程级限制）。
+                let allow_reserved = cur.state == ActionState::Reserved;
+                match settle_send_via_formal_echo(hub, key, action_id, cmid, allow_reserved).await {
+                    Ok(Some(turn)) => {
+                        let cur = store.get_for_device_unisolated(action_id).unwrap_or(cur);
+                        CodexActionVerifyView {
+                            action_id: action_id.to_string(),
+                            stage: cur.stage,
+                            outcome: CodexVerifyOutcome::Delivered,
+                            turn_id: Some(turn),
+                            run_limit_released: false,
+                            reason_code: cur.receipt.as_ref().and_then(|r| r.reason_code.clone()),
+                            verified_at,
+                        }
+                    }
+                    Ok(None) | Err(_) => CodexActionVerifyView {
+                        action_id: action_id.to_string(),
+                        stage: cur.stage,
+                        outcome: CodexVerifyOutcome::Unresolved,
+                        turn_id: bound_turn,
+                        run_limit_released: false,
+                        reason_code: cur.receipt.as_ref().and_then(|r| r.reason_code.clone()),
+                        verified_at,
+                    },
+                }
             }
         }
         // 排队中：无不确定结论可收敛，如实保留（stage=queued 表达）
@@ -3167,23 +4451,36 @@ async fn verify_action_core(
 }
 
 /// 补绑（accepted-unbound）：正式 userMessage 回显 → Turn 身份补进持久绑定槽位
-///（`rebind_turn`：只补绑定槽位不改写已受理事实）+ 内存簿记同步。多义/无回显 → None。
+///（`rebind_turn`：只补绑定槽位不改写已受理事实）+ 内存簿记同步。多义/无回显
+/// / 补绑失败且持久侧未绑定 → `None`（核对按 AcceptedUnbound 如实回报，不虚报
+/// Delivered）。普通发送用**实体级**唯一回显查询（按 Turn 去重不足以证明唯一）。
 async fn rebind_from_echo(
     hub: &CodexControlHub,
     key: &ThreadKey,
     action_id: &str,
     cmid: &str,
 ) -> Option<String> {
-    let turn = hub.adapter.turn_of_client_message(key, cmid).await?;
-    if hub
-        .router
-        .store()
-        .rebind_turn(action_id, &turn)
-        .unwrap_or(false)
-    {
-        hub.router.bind_turn_id(key, action_id, &turn);
+    let store = hub.router.store();
+    let active_answer = store.is_active_async_answer(action_id).ok()?;
+    let turn = if active_answer {
+        hub.adapter.turn_of_async_answer_message(key, cmid).await?
+    } else {
+        hub.adapter.unique_formal_echo_turn(key, cmid).await?
+    };
+    if active_answer {
+        return Some(turn);
     }
-    Some(turn)
+    let rebound = store.rebind_turn(action_id, &turn).unwrap_or(false);
+    if rebound {
+        hub.router.bind_turn_id(key, action_id, &turn);
+        return Some(turn);
+    }
+    // 补绑未发生（false/Err）：仅当持久侧已绑定同一 Turn（并发赢家）才算成功；
+    // 否则保持 AcceptedUnbound（审查 Major 3：不隐藏未绑定状态）。
+    let already = store
+        .bound_turn_id(action_id)
+        .is_some_and(|bound| bound == turn);
+    already.then_some(turn)
 }
 
 /// GET /m/api/v1/codex/action/verify?action_id=：**只读核对**（设计 §6.1）。
@@ -4299,6 +5596,9 @@ async fn stop_current_turn(
             envelope_id: outcome.envelope_id,
             expected_turn_id: expected_turn_id.unwrap_or_default(),
             queue_pause_set,
+            // Task6：仅本次确实插入的行才携带可清 token（fresh UUID 幂等重放 /
+            // 他人行在场时 inserted=false → None，无可清、不可误清他人保护）。
+            pause_release: pause_pre_inserted.then_some(pause_token),
         },
         Delivery::UnknownDelivery => StopTurnOutcome::Unknown {
             reason: outcome
@@ -4326,11 +5626,17 @@ enum StopTurnOutcome {
     /// 明确受理。`interrupted_turn_id = None` = Desktop 无匹配回合（回合已结束或
     /// expectedTurnId 不匹配的静默 no-op）——调用方**不得谎报成功**（端点如实回
     /// null），也不得当作「停止已生效」继续派发（由调用方新鲜判定把关）。
+    /// Task6：`pause_release = Some(token)` 仅当前置暂停行确为**本次调用插入**
+    /// （fresh token 落行成功）；只有 queue/prioritize 会在「精确终态 + fresh
+    /// Clear + 线程锁仍在手」的交接点消费它做定向清除，独立 interrupt 端点不
+    /// 消费（终态自动解除仍走 settle 路径，公开行为不变）。行属他人/重放幂等
+    /// 未落行 → None，无可清。
     Accepted {
         interrupted_turn_id: Option<String>,
         envelope_id: String,
         expected_turn_id: String,
         queue_pause_set: bool,
+        pause_release: Option<String>,
     },
     /// 帧已交 writer、结果未知（打断可能已生效）——不得诱导重按、不得继续派发。
     Unknown {
@@ -4469,6 +5775,10 @@ pub async fn interrupt_turn(
             envelope_id,
             expected_turn_id,
             queue_pause_set,
+            // Task6：pause_release 仅 queue/prioritize 在终态确认后的锁内交接点
+            // 消费；独立 interrupt 端点公开行为不变——暂停保留到回合终态，自动
+            // 解除仍走 settle 路径（auto_release_stop_pauses）。
+            pause_release: _,
         }) => {
             // 触发一次结算：等回合终态帧到达时由调度循环释放屏障（**队列接力仍被
             // 暂停挡住**——恢复只经用户显式「继续发送」，/codex/queue/resume）。
@@ -4610,11 +5920,17 @@ pub enum PrioritizeResp {
 }
 
 /// T06：停止受理后的回合终态确认——**同一前台预算**内有界轮询新鲜门（`Clear` =
-/// 被停回合已终态且无 pending）；到期返回 false（不派发、不后台重试）。轮询间隔
-/// 100ms；每次判定都吃剩余预算（不重置）。
+/// 无运行回合且无 pending）**且目标回合精确终态证据在场**（Task6-exactT，review
+/// 850 Major1：Clear 只证明 runtime 空闲，不证明被停的那个 Turn 已终态——镜像
+/// 缺 T / 只有别的 T 终态 / T 仍 nonterminal 都可能呈现 Clear；终态判定复用
+/// `turn_evidence_terminal`，completed/failed/interrupted 既有语义，与
+/// auto_release_stop_pauses 同源）。证据未在场 → 继续有界轮询；预算到期返回
+/// false（不派发、不后台重试，pause/claim 保留）。轮询间隔 100ms；每次判定都
+/// 吃剩余预算（不重置）。
 async fn wait_turn_terminal(
     hub: &CodexControlHub,
     key: &ThreadKey,
+    expected_turn_id: &str,
     front: crate::services::codex_desktop_ipc::budget::Deadline,
 ) -> bool {
     loop {
@@ -4624,6 +5940,13 @@ async fn wait_turn_terminal(
         let gate_fut = fresh_send_gate(hub, key);
         match front.within(gate_fut).await {
             Ok(SendGate::Clear) => {
+                // Task6-exactT：fresh Clear 之上必须叠加**目标 T** 的精确终态证据
+                //（绑定原 expectedTurnId，不绑 ACK 回执 id）——证据未在场继续等，
+                // 不得据此清 pause / 放 claim / 派发。
+                if !hub.adapter.turn_evidence_terminal(key, expected_turn_id) {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    continue;
+                }
                 let projection = hub.adapter.projection(key).await;
                 let reconcile = settle_turn_evidence(hub, key, &projection);
                 return front.within(reconcile).await.is_ok();
@@ -4707,8 +6030,11 @@ async fn release_stop_claim(store: &ActionStore, action_id: &str) {
 /// POST /m/api/v1/codex/queue/prioritize：**已入队消息的显式优先处理闭环**——
 /// 用户对具体 queued 消息点「先处理这条」：运行中先确认停止当前回合（真实定向
 /// 停止 + 终态确认），该消息经**绑定原 action 的一次性越队授权**恰好发送一帧；
-/// 旧队列保持暂停（本端点不解除任何暂停行、不自动恢复接力——恢复仍只经显式
-/// resume）；不重排 FIFO（Q1/Q2 的 seq/位置原样）。
+/// 暂停语义（Task6）：本端点只定向清除**本次停止自己建立**的前置暂停行——在
+/// 目标回合精确终态确认后、同一线程派发锁仍在手的交接点（初始 pause=false →
+/// 结束仍 false；true → true）；用户/并发新 token 等其他来源的暂停行一律不动，
+/// 也不自动恢复接力——它们仍只经显式 resume 清除；不重排 FIFO（Q1/Q2 的
+/// seq/位置原样）。
 ///
 /// 契约与红线：
 /// - **不接受正文副本**（deny_unknown_fields 拒 `text` 等）——「再 POST 一次正文」
@@ -4800,18 +6126,137 @@ pub async fn queue_prioritize(
         return error_body(StatusCode::NOT_FOUND, "no_action", None);
     }
     let hub = &st.codex_control;
-    // 全程线程派发锁（跨「门判定 + 定向停止 + 终态等待 + 越队派发」）：并发的第二
-    // 次优先处理在此让路——不重复发停止帧（同一逻辑动作的重放至多一次 interrupt）、
-    // 不并发越队（授权 CAS 仍兜底恰好一次写出）。与 send/flush 共用同一线程锁。
-    let thread_lock = match hub.router.thread_dispatch_lock(&key).try_lock_owned() {
-        Ok(g) => g,
-        Err(_) => {
-            // 在飞派发/编排占锁：授权未消费、零写入、零停止，按仍在队回应
+    // Task7：先登记短期优先意图再争 writer 锁（身份/权限/线程归属验证已全部通过；
+    // 分类与观测在 begin 内完成，观测于 registry 短锁释放后必发）。全程线程派发锁
+    //（跨「门判定 + 定向停止 + 终态等待 + 越队派发」）：并发的第二次优先处理在此
+    // 让路——不重复发停止帧（同一逻辑动作的重放至多一次 interrupt）、不并发越队
+    //（授权 CAS 仍兜底恰好一次写出）。与 send/flush 共用同一线程锁。
+    let registration = hub.router.begin_priority_intent(&key, &action_id, front);
+    let (thread_lock, intent): (
+        tokio::sync::OwnedMutexGuard<()>,
+        Option<crate::services::codex_control::router::PriorityIntentGuard>,
+    ) = match registration {
+        crate::services::codex_control::router::PriorityRegistration::Leader(leader) => {
+            match hub.router.wait_priority_turn(&leader).await {
+                Ok(guard) => {
+                    // Task7 Major3：等锁胜出后、任何 stop/pause mutation（含
+                    // stop_attempt_phase 占有与定向停止）之前——目标/owner/期限
+                    // Result 复核（只闭合等锁期 retract 胜出缺口；完整写前退出
+                    // 矩阵归 Task8）。
+                    match hub
+                        .router
+                        .reverify_priority_intent(&key, &action_id, &leader)
+                    {
+                        crate::services::codex_control::router::PriorityReverify::Valid => {
+                            (guard, Some(leader))
+                        }
+                        crate::services::codex_control::router::PriorityReverify::StaleIntent => {
+                            return json_no_store(
+                                StatusCode::OK,
+                                serde_json::to_value(&PrioritizeResp::NotSent {
+                                    action_id,
+                                    reason_code:
+                                        crate::services::codex_control::router::DISPATCH_IN_FLIGHT_REASON
+                                            .to_string(),
+                                    receipt: None,
+                                    queued: true,
+                                })
+                                .unwrap_or_else(|_| serde_json::json!({})),
+                            );
+                        }
+                        crate::services::codex_control::router::PriorityReverify::LeftQueue => {
+                            // 按账本实际状态回应（离队映射；不复活）
+                            let view = match store.get_for_device(&action_id, &device_id) {
+                                Ok(v) => v,
+                                Err(_) => {
+                                    return json_no_store(
+                                        StatusCode::INTERNAL_SERVER_ERROR,
+                                        serde_json::json!({ "error": "internal" }),
+                                    );
+                                }
+                            };
+                            return match view {
+                                Some(view) => prioritize_left_queue_response(&action_id, view),
+                                None => error_body(StatusCode::NOT_FOUND, "no_action", None),
+                            };
+                        }
+                        crate::services::codex_control::router::PriorityReverify::StoreError => {
+                            log::error!(
+                                "codex/queue/prioritize 获锁复核读取失败（保守零 mutation）"
+                            );
+                            return json_no_store(
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                serde_json::json!({ "error": "internal" }),
+                            );
+                        }
+                    }
+                }
+                // 有界 FIFO 等待到期：授权未消费、零写入、零停止，按仍在队回应
+                //（guard Drop 按 key+token 条件注销）。
+                Err(outcome) => {
+                    let reason = match outcome {
+                        PrioritizeOutcome::StillQueued(reason) => reason,
+                        PrioritizeOutcome::LeftQueue | PrioritizeOutcome::Completed(_) => {
+                            crate::services::codex_control::router::DISPATCH_IN_FLIGHT_REASON
+                        }
+                    };
+                    return json_no_store(
+                        StatusCode::OK,
+                        serde_json::to_value(&PrioritizeResp::NotSent {
+                            action_id,
+                            reason_code: reason.to_string(),
+                            receipt: None,
+                            queued: true,
+                        })
+                        .unwrap_or_else(|_| serde_json::json!({})),
+                    );
+                }
+            }
+        }
+        // Task7 GREEN：Replay 只读原动作实际状态（零 stop/mint/reserve/争锁，DB
+        // 故障如实 500）；Occupied 同码快拒（不窃其他动作的 slot）——两者都零
+        // mutation、零帧。
+        crate::services::codex_control::router::PriorityRegistration::Replay(replay) => {
+            log::debug!(
+                "codex/queue/prioritize 同动作重放观测 action={}（只读原动作实际状态）",
+                replay.action_id
+            );
+            let view = match store.get_for_device(&action_id, &device_id) {
+                Ok(v) => v,
+                Err(e) => {
+                    log::error!("codex/queue/prioritize 重放状态读取失败: {e}");
+                    return json_no_store(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        serde_json::json!({ "error": "internal" }),
+                    );
+                }
+            };
+            return match view {
+                // 原操作进行中且仍 queued → dispatch_in_flight（queued:true 保留可重试）
+                Some(view) if view.state == ActionState::Queued => json_no_store(
+                    StatusCode::OK,
+                    serde_json::to_value(&PrioritizeResp::NotSent {
+                        action_id,
+                        reason_code:
+                            crate::services::codex_control::router::DISPATCH_IN_FLIGHT_REASON
+                                .to_string(),
+                        receipt: None,
+                        queued: true,
+                    })
+                    .unwrap_or_else(|_| serde_json::json!({})),
+                ),
+                // Reserved / 终态 / 不存在 → 沿既有离队映射（不复活）
+                Some(view) => prioritize_left_queue_response(&action_id, view),
+                None => error_body(StatusCode::NOT_FOUND, "no_action", None),
+            };
+        }
+        crate::services::codex_control::router::PriorityRegistration::Occupied => {
             return json_no_store(
                 StatusCode::OK,
                 serde_json::to_value(&PrioritizeResp::NotSent {
                     action_id,
-                    reason_code: "dispatch_in_flight".to_string(),
+                    reason_code: crate::services::codex_control::router::DISPATCH_IN_FLIGHT_REASON
+                        .to_string(),
                     receipt: None,
                     queued: true,
                 })
@@ -4842,6 +6287,10 @@ pub async fn queue_prioritize(
             return prioritize_stop_unknown_response(&action_id, &reason);
         }
     }
+    // Task6：本次停止自建前置暂停行的归属（Accepted 且确为本次插入才有值）；
+    // 清除在「精确终态确认 + settle 证据 + 线程锁仍在手」的锁内交接点执行（见
+    // prioritize_queued 之前）——失败/未知/未终态的全部早退臂不会消费它。
+    let mut stop_pause_release: Option<String> = None;
     // 新鲜门分类（同一前台预算）：决定「直接越队」还是「先停止当前回合」。
     let gate = match front.within(fresh_send_gate(hub, &key)).await {
         Ok(g) => g,
@@ -4900,6 +6349,29 @@ pub async fn queue_prioritize(
                     .unwrap_or_else(|_| serde_json::json!({})),
                 );
             }
+            // Task6-exactT（review850 Major2）：确认停止必须**显式绑定非空**
+            // expectedTurnId——缺字段 / null / blank 一律零停止零越队、零占有零
+            // 暂停（不落入共享 stop 的 current/outstanding fallback，防止「确认
+            // 停 T1 却停掉当前 T2」的错靶；此阀此后全程绑定该 id，不换绑 ACK
+            // 回执里的其他 id）。独立 interrupt 端点的 fallback 兼容语义不变。
+            let Some(expected_turn_id) = req
+                .expected_turn_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .map(str::to_string)
+            else {
+                return json_no_store(
+                    StatusCode::OK,
+                    serde_json::to_value(&PrioritizeResp::NotSent {
+                        action_id,
+                        reason_code: "expected_turn_required".to_string(),
+                        receipt: None,
+                        queued: true,
+                    })
+                    .unwrap_or_else(|_| serde_json::json!({})),
+                );
+            };
             // C02：**首次可能写出之前**持久占有停止尝试（CAS）——writer 已接收/
             // 写出 interrupt 后 handler 被取消或服务退出时，事后记录（Unknown/超时
             // 臂）永远执行不到；先占有把该盲窗闭合：重放读到占有即不再发停止帧。
@@ -4924,14 +6396,16 @@ pub async fn queue_prioritize(
                     );
                 }
             }
-            // 真实定向停止（复用打断编排核心：阀值/能力门/前置暂停/有界打断/暂停收尾）
+            // 真实定向停止（复用打断编排核心：阀值/能力门/前置暂停/有界打断/暂停收尾）。
+            // Task6-exactT：恒传显式 Some(非空)——prio 路径不触发共享 stop 的
+            // current/outstanding fallback（错靶防护，见上方校验）。
             match stop_current_turn(
                 &st,
                 &key,
                 &session.id,
                 &device_id,
                 &device_name,
-                req.expected_turn_id.clone(),
+                Some(expected_turn_id),
                 front,
             )
             .await
@@ -5027,12 +6501,18 @@ pub async fn queue_prioritize(
                 }
                 Ok(StopTurnOutcome::Accepted {
                     interrupted_turn_id,
+                    expected_turn_id,
+                    pause_release,
                     ..
                 }) => {
-                    // 终态确认（同一预算内有界等待）。Desktop 明确说「无可打断回合」
-                    // （interruptedTurnId=null）且新鲜门仍 Busy = 目标换代/停止未生效
-                    // → 立即零派发（不空耗预算、不误伤新回合）；Clear = 回合确已结束
-                    // → 直接越队。
+                    // Task6：记下本次停止自建暂停行的归属 token；清除统一在下方
+                    // 「终态确认 + settle 证据后」的锁内交接点执行。
+                    stop_pause_release = pause_release;
+                    // 终态确认（同一预算内有界等待）：fresh Clear 之上必须叠加**原
+                    // expectedTurnId** 的精确终态证据（Task6-exactT——ACK 本身不构
+                    // 成终态证据，也不换绑回执里的其他 id）。Desktop 明确说「无可打
+                    // 断回合」（interruptedTurnId=null）且门不转 = 目标换代/停止未
+                    // 生效 → 零派发（不空耗预算、不误伤新回合）；证据齐 → 直接越队。
                     if interrupted_turn_id.is_none() {
                         // P8/P10（2026-10-31 用户实机）：Desktop 回 `interruptedTurnId:null`
                         // 有两种含义——(a) 目标换代/无可打断回合（真 no-op），
@@ -5048,28 +6528,34 @@ pub async fn queue_prioritize(
                         //    （STOP_SETTLE_RETRY_WINDOW_MS）——覆盖「桌面停得更慢」
                         //    的长尾，避免用户必须再点一次。
                         // 两段都按剩余预算封顶（S3：子步骤不重置预算），因此真换代
-                        // （永不转 Clear）最多耗 3s + 4s，不会吃光整条 30 秒预算。
-                        // C02：Desktop 权威判定「无可打断回合」= 该帧已被处理且未
-                        // 打断任何回合（零打断效果）→ 释放占有。
-                        release_stop_claim(store, &action_id).await;
+                        // （永不转 Clear/证据永不在场）最多耗 3s + 4s，不会吃光整条
+                        // 30 秒预算。Task6-exactT（review850 Major3）：占有**不再在
+                        // 等待前释放**——null ACK 只说明该帧被 Desktop 处理，不构成
+                        // 目标 T 终态证据；精确终态 + fresh Clear 确认后才释放（与
+                        // Some ACK 分支同一时点），取消/超预算/证据未收敛一律占有
+                        // 留守（重放按 Claimed 拒发新停止，防重复停止）。
                         let mut settled = wait_turn_terminal(
                             hub,
                             &key,
+                            &expected_turn_id,
                             settle_window(front, STOP_SETTLE_WINDOW_MS),
                         )
                         .await;
                         if !settled {
                             log::info!(
-                                "codex/queue/prioritize: 停止后 {STOP_SETTLE_WINDOW_MS}ms 内未见终态，追加宽限 {STOP_SETTLE_RETRY_WINDOW_MS}ms（action={action_id}）"
+                                "codex/queue/prioritize: 停止后 {STOP_SETTLE_WINDOW_MS}ms 内未见目标 T 终态，追加宽限 {STOP_SETTLE_RETRY_WINDOW_MS}ms（action={action_id}）"
                             );
                             settled = wait_turn_terminal(
                                 hub,
                                 &key,
+                                &expected_turn_id,
                                 settle_window(front, STOP_SETTLE_RETRY_WINDOW_MS),
                             )
                             .await;
                         }
                         if !settled {
+                            // 未证明目标 T 终态：pause 保留、占有留守、零派发（既有
+                            // 持久 Claim 状态机继续自动核对，不新增永久冻结）。
                             return json_no_store(
                                 StatusCode::OK,
                                 serde_json::to_value(&PrioritizeResp::NotSent {
@@ -5081,7 +6567,10 @@ pub async fn queue_prioritize(
                                 .unwrap_or_else(|_| serde_json::json!({})),
                             );
                         }
-                    } else if !wait_turn_terminal(hub, &key, front).await {
+                        // Task6-exactT：两段精确等待确认目标 T 终态 + fresh Clear 后
+                        // 才释放占有——停止尝试已完全收敛（与 Some ACK 分支同时点）。
+                        release_stop_claim(store, &action_id).await;
+                    } else if !wait_turn_terminal(hub, &key, &expected_turn_id, front).await {
                         // 受理但预算内未见终态：如实「待确认」——不派发、不后台重试。
                         // R05/C02：同样是「停止结果未知」，把占有的结果升级为未知
                         // 原因（重放不再发停止帧）；升级失败占有留守（保守不变）。
@@ -5121,7 +6610,7 @@ pub async fn queue_prioritize(
     }
     // paused-idle 和 Desktop 回报无活动回合的分支也须结算旧屏障；只认已有
     // 精确 Turn 终态证据，不将 idle 本身当成投递确认。
-    let projection = hub.adapter.projection(&key).await;
+    let projection = hub.adapter.projection_for_admission(&key).await;
     if front
         .within(settle_turn_evidence(hub, &key, &projection))
         .await
@@ -5129,13 +6618,57 @@ pub async fn queue_prioritize(
     {
         return prioritize_not_sent_response(&action_id, "front_budget_elapsed", true);
     }
-    // 越队派发既有 queued 行（授权绑定原 action、写出前 CAS 恰好消费一次；
-    // 旧队列保持暂停，resume 仍是唯一恢复出口）。全程锁延续传入（不可重入）。
-    match hub
-        .router
-        .prioritize_queued(&action_id, &key, front, thread_lock)
-        .await
-    {
+    // Task6（暂停契约）：清除**本次停止自建**的前置暂停行。走到这里的前提链：
+    // 目标回合精确终态确认（wait_turn_terminal 内 fresh 门 Clear + Turn 终态证据
+    // 结算，上方 settle 再兜底一次）+ 同一线程派发锁仍由本端点持有——队列冻结
+    // 的使命（挡住「停止在途」）已完成。只清本 token 拥有的行
+    // （clear_queue_pause_owned）：用户/并发新 token/NULL 旧行一律不受影响；行已
+    // 不在（并发 resume 赢者）不重发布（resume 侧已发布）。清理 DB 失败 → 暂停
+    // 行保守保留并如实 500（不假 success、不继续派发）。失败/未知/未终态的全部
+    // 早退臂到不了这里——暂停与占有原样保留。
+    if let Some(pause_token) = stop_pause_release {
+        match store.clear_queue_pause_owned(&key, &pause_token) {
+            Ok(removed) => {
+                if removed {
+                    let still = store.queue_pause(&key).map(|p| p.is_some()).unwrap_or(true);
+                    if !still {
+                        hub.adapter.republish_thread_projection(&key).await;
+                    }
+                }
+            }
+            Err(e) => {
+                // 保守不放行：暂停行保留、如实失败（500），不假 success 继续
+                // 越队。响应与本端点既有 DB 失败同构（`{"error":"internal"}`，
+                // 明细只进日志）——不再新增错误码：码 ⇄ i18n 双向对账门禁
+                // 要求新码同步 zh/en 键，超出本批范围（详见 check-error-codes）。
+                log::error!(
+                    "codex/queue/prioritize 停止前置暂停解除失败（保守保留，不继续派发）: {e}"
+                );
+                return json_no_store(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    serde_json::json!({ "error": "internal" }),
+                );
+            }
+        }
+    }
+    // 越队派发既有 queued 行（授权绑定原 action、写出前 CAS 恰好消费一次；其他
+    // 来源的暂停行原样——本次停止的自建行已在上方交接点定向清除，resume 仍是
+    // 它们的唯一恢复出口）。全程锁延续传入（不可重入）。Task7：Leader 登记在场
+    // 时走伴随入口（壳期仅保活意图句柄并委托旧 public 正文，guard 返回时条件
+    // 注销）；无登记（Replay/Occupied 壳期降级原路径）走旧 public 直调。
+    let prioritize_outcome = match intent {
+        Some(leader) => {
+            hub.router
+                .prioritize_queued_with_intent(&action_id, &key, front, thread_lock, leader)
+                .await
+        }
+        None => {
+            hub.router
+                .prioritize_queued(&action_id, &key, front, thread_lock)
+                .await
+        }
+    };
+    match prioritize_outcome {
         PrioritizeOutcome::Completed(receipt) => match receipt.delivery {
             Delivery::Accepted => json_no_store(
                 StatusCode::OK,
@@ -5729,6 +7262,12 @@ pub(crate) fn device_identity(st: &RemoteState, headers: &HeaderMap) -> Option<(
     Some((device_id, device_name))
 }
 
+/// M6 纵向证据（B4/阶段 B3-B4）：crate 内真实 gated Router + Fake Native 工厂 +
+/// 真初装载入口。仅测试构建可见。
+#[cfg(test)]
+#[path = "codex_question_skip_vertical_tests.rs"]
+mod codex_question_skip_vertical_tests;
+
 #[cfg(test)]
 mod startup_merge_tests {
     //! 2026-10-20 复审 P2：SSE 首快照与订阅缓冲的合并语义（纯函数层，确定性覆盖
@@ -5797,6 +7336,10 @@ mod startup_merge_tests {
             local_seq: 0,
             projection_version: None,
             active_turn_id: None,
+            // 批次3（合同 §8）：展示 overlay 账/戳由 display 模块装配；诚实缺省 None。
+            question_display_groups: None,
+            question_skip_history: None,
+            display_stamp: None,
         }
     }
 
@@ -6063,6 +7606,13 @@ fn spawn_async_effect_observer(
             if tokio::time::Instant::now() >= deadline {
                 return;
             }
+            if matches!(
+                hub.router.store().is_active_async_answer(&action_id),
+                Ok(true)
+            ) {
+                // active 本批不登记 observed success，不用旧 idle 观察器等待错误的消息类型。
+                return;
+            }
             let view = hub.router.store().get_for_device_unisolated(&action_id);
             if let Some(view) = view {
                 match view.state {
@@ -6185,7 +7735,7 @@ pub async fn async_answer(
     // R02：同题**持久排他**——在任何派发之前用账本 CAS 裁决（跨 actionId／设备／
     // 重启）。题已不在当前投影 → 旧上下文（零占用写入）；已见正式答复 → 200 明确
     // 零投递；被其他动作占用（在途/未知）→ 409（客户端不得换新 ID 重试）。
-    let projection = hub.adapter.projection(&key).await;
+    let projection = hub.adapter.projection_for_admission(&key).await;
     let Some(question) = projection
         .async_questions
         .iter()
@@ -6226,6 +7776,9 @@ pub async fn async_answer(
             }),
         );
     }
+    let Some(answer_route) = AsyncAnswerRoute::from_runtime(&projection.runtime_status) else {
+        return error_body(StatusCode::CONFLICT, "operation_runtime_unknown", None);
+    };
     // H01：**不**在这里按“当前目标”记成功——历史已答题不能给当前 build 授权；
     // 成功只由原动作的捕获目标在效果确认后结算（见下方 Accepted 后的观察任务）。
     let owner_token = format!(
@@ -6329,14 +7882,15 @@ pub async fn async_answer(
     claim_guard.disarm();
     let outcome = hub
         .router
-        .answer_async(
+        .answer_async_with_route(
             ctx.clone(),
             command,
             front,
             crate::services::codex_control::router::EffectSettlement {
-                target: effect_target,
+                target: effect_target.filter(|_| answer_route.opens_turn()),
                 on_settled: None,
             },
+            answer_route,
         )
         .await;
     if newly_claimed {
@@ -6524,7 +8078,10 @@ pub async fn async_answer_group(
             }),
         );
     }
-    let projection = hub.adapter.projection(&key).await;
+    let projection = hub.adapter.projection_for_admission(&key).await;
+    let Some(answer_route) = AsyncAnswerRoute::from_runtime(&projection.runtime_status) else {
+        return error_body(StatusCode::CONFLICT, "operation_runtime_unknown", None);
+    };
     // 组答题的实际答案必须逐题对得上**当前投影**；任何一题缺失/换 token 都按
     // 过期上下文拒绝，绝不把旧答案套到新题。
     let mut resolved = Vec::with_capacity(req.answers.len());
@@ -6771,14 +8328,15 @@ pub async fn async_answer_group(
     claim_guard.disarm();
     let outcome = hub
         .router
-        .answer_async(
+        .answer_async_with_route(
             ctx.clone(),
             command,
             front,
             crate::services::codex_control::router::EffectSettlement {
-                target: effect_target,
+                target: effect_target.filter(|_| answer_route.opens_turn()),
                 on_settled: None,
             },
+            answer_route,
         )
         .await;
     if newly_claimed {
@@ -6808,5 +8366,45 @@ pub async fn async_answer_group(
             respond_receipt_response(receipt)
         }
         RouterOutcome::Queued { .. } => error_body(StatusCode::CONFLICT, "action_conflict", None),
+    }
+}
+
+#[cfg(test)]
+mod question_skip_loaded_book_tests {
+    use super::QuestionSkipLoadedBook;
+
+    /// B-R1 复审终修：簿记状态机等价类——正常标记、换代失效、迟到标记拒绝、
+    /// 推进清空。这是「装载完成→标记插入之间换代」竞态的确定性等价证明：
+    /// mark 内部在同一锁内复核 epoch，等价于任务在插入点核对世代。
+    #[test]
+    fn loaded_book_epoch_lifecycle() {
+        let mut book = QuestionSkipLoadedBook::default();
+        assert_eq!(book.epoch, 0);
+
+        // 正常：捕获 epoch=0，装载成功，标记生效，contains 命中。
+        assert!(book.mark(0, "t1"));
+        assert!(book.contains(0, "t1"));
+
+        // 换代（stop/start）：epoch 推进 + 集合清空。
+        let new_epoch = book.advance_and_clear();
+        assert_eq!(new_epoch, 1);
+        assert!(!book.contains(1, "t1"));
+        assert!(!book.contains(0, "t1"));
+
+        // 旧代任务迟到标记（捕获 epoch=0）→ 拒绝，不得进入新代集合。
+        assert!(!book.mark(0, "t1"));
+        assert!(!book.contains(1, "t1"));
+
+        // 新代装载标记（捕获 epoch=1）→ 生效。
+        assert!(book.mark(1, "t2"));
+        assert!(book.contains(1, "t2"));
+
+        // 再次换代：全部失效。
+        let newest = book.advance_and_clear();
+        assert_eq!(newest, 2);
+        assert!(!book.contains(1, "t2"));
+        assert!(!book.mark(1, "t3"));
+        assert!(book.mark(2, "t3"));
+        assert!(book.contains(2, "t3"));
     }
 }

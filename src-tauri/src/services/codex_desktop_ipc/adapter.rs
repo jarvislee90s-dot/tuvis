@@ -14,15 +14,17 @@
 //! * 锁纪律：所有互斥锁只在同步临界区持有，不跨 await；
 //! * 忙 Thread 留队由 router（Task 7）调度；审批/问答不等普通消息队列。
 
+use super::async_question::AsyncAnswerRoute;
 use super::capability::{
     CodexOperation, ContractEvidenceStore, ContractTarget, DesktopContractEvidence,
     DesktopContractReader, EffectiveOperations, ObservedOperationsSource, OperationContext,
     OperationPolicy, ProductionContractReader, CONTRACT_RULE_VERSION,
 };
 use super::connection::{ConnectionEvent, ConnectionHandle, RpcOutcome, RpcRequest};
-use super::mirror::ThreadMirror;
+use super::mirror::{FormalEchoMatch, ThreadMirror};
 use super::owners::{
-    bind_lease, declare_following, discover_owner, wait_first_snapshot, FollowingSet,
+    bind_lease, declare_following, discover_owner, wait_first_snapshot_rx, FollowingSet,
+    OwnerLeaseProof,
 };
 use super::pending::{parse_request_key, DECISION_ACCEPT, DECISION_CANCEL, DECISION_DECLINE};
 use super::probe::runner::{ProbeOutcome, ProbeRunner, ProbeStage};
@@ -34,6 +36,11 @@ use super::types::{
     OwnerLease, PendingAction, PendingKind, PendingView, ProbeStatus, ProtocolError, ThreadKey,
     ThreadProjection,
 };
+use crate::services::codex_question_skip::live::{
+    owner_lease_encoding, Claim, ClaimKind, ClaimsLayer, ClaimsScope, ClaimsUpdate, LiveRefusal,
+    QuestionSkipLive, SourceObservation,
+};
+use crate::services::codex_question_skip::source::{build_source_snapshot, SourceStamp};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::pin::Pin;
@@ -150,6 +157,14 @@ struct ProbeTarget {
     key: Option<String>,
 }
 
+/// 投影仅消费版本匹配的内存结论；在途加载不持有应用锁。
+#[derive(Default)]
+struct ProbeStatusCache {
+    version: u64,
+    value: Option<(u64, String, ProbeStatus)>,
+    loading: bool,
+}
+
 /// S1：官方 schema 证据槽（连接代际, 绑定目标, 决策词证据, 取证时间）。
 type SchemaEvidenceSlot = (u64, Option<ProbeTarget>, SchemaEvidence, i64);
 
@@ -193,7 +208,41 @@ struct PackageShaVerification {
 
 pub type DeviceValidSource = std::sync::Arc<dyn Fn(&str) -> bool + Send + Sync>;
 
+#[cfg(test)]
+#[derive(Default)]
+struct TransitionTestProbe {
+    subscribed: std::sync::atomic::AtomicBool,
+    processed: std::sync::atomic::AtomicUsize,
+    lagged: std::sync::atomic::AtomicBool,
+}
+/// Task5：答题伴随入参（crate 内）——「仅本题先发」消费结果 + 租约 keepalive
+/// 钩子成组传递（避免伴随入口在语义参数列上继续加参）。钩子经私有载体（Task7
+/// `FrameWriteContext`：interaction 钩子 + 调度准入标记）带进
+/// RpcRequest/FrameCmd（真实答题 Frame 未离开 writer 前串行租约不释放）；
+/// `None` = 无租约路径，行为与升级前逐字一致。
+pub(crate) struct AnswerDispatchContext {
+    pub(crate) route: AsyncAnswerRoute,
+    pub(crate) bypass_paused_queue: bool,
+    pub(crate) write_context: Option<super::types::FrameWriteContext>,
+}
+
+/// A2.2/T8：版本化内存事实条目（队列暂停）。`version` 在值变化时单调递增，
+/// 晚到的后台装载按版本与目标身份安装，不覆盖更新事实。
+struct PauseFact {
+    version: u64,
+    paused: Option<bool>,
+}
+
 struct AdapterInner {
+    #[cfg(test)]
+    transition_test_probe: TransitionTestProbe,
+    #[cfg(test)]
+    cleanup_gate: std::sync::Mutex<
+        Option<(
+            tokio::sync::oneshot::Sender<()>,
+            tokio::sync::oneshot::Receiver<()>,
+        )>,
+    >,
     connector: Arc<dyn Connector>,
     /// 当前连接的 profile（R3：动态）。初始为构造入参（首个连接前的基线）；
     /// 每次连接按 endpoint build 重算（登记 build → 证据档；未知 build → 兼容
@@ -231,6 +280,42 @@ struct AdapterInner {
     /// #172/T8 测试缝：固定账本键（生产恒 `None` → 真实计算；测试避免 spawn
     /// 本机 `codex.exe --version` 取 `cli_id`）。
     probe_key_override: std::sync::Mutex<Option<String>>,
+    /// A2.3/T8：探测键解析换代号——每次 `resolve_probe_key_with` 发号一次，
+    /// 只有「仍是最新发出」的解析允许回填 target 键，挂起中的旧解析不得覆盖
+    /// 已完成的更新解析（同代旧 cli-a 晚到不得替换 cli-b）。
+    probe_key_generation: std::sync::atomic::AtomicU64,
+    /// A2.2/T8：队列暂停**版本化内存事实**（投影/盖章消费面只读内存；事实源
+    /// DB 读全部在镜像临界区外的刷新点完成）。`paused: None` = 未装载。
+    pause_facts: std::sync::Mutex<HashMap<String, PauseFact>>,
+    /// 终审 Blocker 1：暂停事实后台刷新去重（thread_id）。
+    pause_fact_kick: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// 终审 Blocker 1：适配事实后台刷新在飞去重。
+    adapt_fact_kick: std::sync::atomic::AtomicBool,
+    /// A2.2/T8：自动适配**生效值**内存事实（`None` = 未装载 → 缺省开）。
+    /// 活值门闭包（可能读设置 DB）不再被镜像临界区内的 caps/policy 求值调用。
+    adapt_fact: std::sync::Mutex<(u64, Option<bool>)>,
+    /// A2/M4：自动适配事实的读取世代（读取前登记、安装时核对——迟到读不覆盖新读）。
+    adapt_fact_reads: std::sync::Mutex<u64>,
+    /// A2/M4：暂停事实的读取世代（同上，按 thread_id）。
+    pause_fact_reads: std::sync::Mutex<HashMap<String, u64>>,
+    /// A2.2/T8：投影路径 hints 冷载的在飞去重（thread_id 集合）。
+    interaction_hint_kicks: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// A3.1/T9：单写 worker 入队口。终审 Blocker 3：改 `Mutex<Option<Sender>>`——
+    /// 停机时 take 并 drop（worker 的 recv 收到 None 从而退出），恢复时重建
+    /// 通道与 worker（OnceLock 无法 take，会导致 resume 后任务无 worker 消费）。
+    hint_write_jobs:
+        std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<AuthorizedHintObservation>>>,
+    /// A6 终审 B3：worker 句柄（停机时有界等待；**共享槽**——等待期间取走
+    /// 会丢失监督，改由后台回收者持有并在完成时清位）。
+    hint_write_worker: Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    /// 终审 Blocker 2：worker 运行代次——stop/start/入队/回收全部以代次仲裁：
+    /// 旧代次的回收者不得清新代次句柄；旧代次 worker 不得继续消费新通道。
+    hint_write_epoch: Arc<std::sync::atomic::AtomicU64>,
+    /// A6 终审 B3：worker 准入开关——停机时置 false 并唤醒接收端，空闲 worker
+    /// 得以退出（Inner 自身持 sender，光靠弱引用无法让空闲 recv 返回）。
+    hint_write_open: Arc<std::sync::atomic::AtomicBool>,
+    /// A3.1/T9：真实写失败监督面（最近一次分类记录；诊断与测试读取）。
+    hint_write_supervision: Arc<std::sync::Mutex<Option<HintWriteSupervision>>>,
     /// #172：探测预算（生产 = P1/P2/P3 2/3/3s；测试可收紧，免得真等 8s）。
     probe_budget: std::sync::Mutex<super::probe::runner::ProbeBudget>,
     conn: Mutex<Option<ConnectionHandle>>,
@@ -240,6 +325,13 @@ struct AdapterInner {
     ensure_lock: tokio::sync::Mutex<()>,
     owners: Mutex<OwnerRegistry>,
     mirrors: Mutex<HashMap<ThreadKey, ThreadMirror>>,
+    /// Source/live 门禁共享事实（本批装配：hub 用同一份 `Arc<QuestionSkipLive>`
+    /// 注入 adapter 与 ActionStore；未装配 = 所有权威事实 Unknown → 全部保守拒绝，
+    /// 已知且健康的真实镜像必须存在正向路径，见 freeze 出口）。
+    question_skip_live: std::sync::OnceLock<Arc<QuestionSkipLive>>,
+    question_display: std::sync::OnceLock<
+        Arc<crate::services::codex_question_skip::display::QuestionDisplayStore>,
+    >,
     /// C4：全体镜像字节账本（生产 64MiB；所有镜像共用一份）
     mirror_ledger: Arc<std::sync::Mutex<super::mirror::MirrorLedger>>,
     answer_validity: Arc<super::answer_validity::AnswerValidityLedger>,
@@ -291,7 +383,7 @@ struct AdapterInner {
     /// 投影再次结算再发布——无外部输入的调度自激循环（CPU/DB/SSE 持续空转，去重
     /// 挡不住递增序号）。std::Mutex 短临界区（不跨 await），与 queue_pause_source
     /// 同款锁纪律。复审 round 6（Q1-W1 收口）：该锁同时是「去重判定 + CAS 预留 +
-    /// 登记」原子段（`pause_publish_grant`）的临界区——tracker 与发布资格的取得
+    /// 登记」原子段（`pause_publish_grant_display`）的临界区——tracker 与发布资格的取得
     /// 同步可见，并发去重不再漏看待提交值。复审 round 7（Q1）：判定基准改为临界区
     /// 内重读的暂停事实（发布头/先前观察都不证明事实未变），登记与广播同用重读值。
     pause_published: std::sync::Mutex<HashMap<ThreadKey, bool>>,
@@ -375,7 +467,7 @@ struct AdapterInner {
     /// 会把 SQLite 读放大成热路径负担。账本 `state` 行的**唯一写者**是本 adapter
     /// 的 [`DesktopIpcAdapter::ensure_read_evidence`]（remote 层只写 `send` 行），
     /// 故在写点与 build 目标变更点失效即可保持准确。
-    probe_status_cache: std::sync::Mutex<Option<ProbeStatus>>,
+    probe_status_cache: std::sync::Mutex<ProbeStatusCache>,
     /// S1：**自动适配门**（新设置「自动适配」的生效值来源；生产 = remote 层注入的
     /// settings 读取闭包，缺省开）。`None` = 未注入 → 恒开（适配器单测不依赖 DB）。
     /// 契约：只读查询、必须快（投影热路径会调）、**活值**（开关翻转即刻生效）。
@@ -474,10 +566,37 @@ struct HintObservationState {
     scopes: HashMap<ThreadKey, (super::types::OwnerLease, u64)>,
 }
 
+#[derive(Clone)]
 struct AuthorizedHintObservation {
     observation: super::hint_state::HintObservation,
     permit: super::hint_commit::HintCommitPermit,
     scope: u64,
+}
+
+/// A3.1/T9：真实写失败监督记录（生产结果面；worker 的最近一次分类）。
+/// 生产可见性 = [`DesktopIpcAdapter::record_hint_write_supervision`] 的
+/// `log::warn` 同步输出；本结构保留记录供诊断/测试读取（字段在 lib 构建
+/// 下无读取方 → 显式 allow，终审 B3 处置）。
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub(crate) struct HintWriteSupervision {
+    pub(crate) thread_id: String,
+    pub(crate) class: super::hint_writer::WriteFailureClass,
+    pub(crate) detail: String,
+    pub(crate) at_ms: i64,
+    /// 终审 Minor 2：定位一次具体失败的字段——attempt（本键连续失败次数）、
+    /// next_retry_at_ms（退避到期）、batch_size（本页行数）。
+    pub(crate) attempt: u32,
+    pub(crate) next_retry_at_ms: Option<u64>,
+    pub(crate) batch_size: usize,
+}
+
+/// A3.1/T9：worker 退避时钟（真实毫秒；Scheduler 退避阶梯 1/4/16s 封顶 60s）。
+fn worker_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or_default()
 }
 
 /// Desktop IPC 适配器（克隆共享）。
@@ -489,7 +608,7 @@ pub(crate) type QueuePauseSource = std::sync::Arc<dyn Fn(&str) -> bool + Send + 
 /// `None` 直通）。
 pub type CapsObserveGate = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
 
-/// 复审 round 6（Q1-W1 收口）：[`DesktopIpcAdapter::pause_publish_grant`] 的结果。
+/// 复审 round 6（Q1-W1 收口）：[`DesktopIpcAdapter::pause_publish_grant_display`] 的结果。
 enum PausePublishGrant {
     /// 重读事实与 tracker 记录值相同（含他人在途已登记的待发布值）→ 抑制
     ///（V1「按实际状态变化发布」的静默语义；在途值也是真实将要落地的值）。
@@ -512,6 +631,7 @@ enum PausePublishGrant {
 #[derive(Debug, Clone)]
 struct InteractionFacts {
     stale: bool,
+    runtime_status: String,
     /// 逐操作策略（与投影下发同一份事实）。
     operations: super::capability::EffectiveOperations,
     /// 同上但**视为未暂停**（仅一次性越队授权使用；其余门不变）。
@@ -528,8 +648,10 @@ struct InteractionFacts {
 }
 
 /// J01：组答题写入时绑定的**完整动作身份**（来源 + 成员 key/token）。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct GroupBinding {
+    pub route: AsyncAnswerRoute,
+    pub complete_group: bool,
     pub source_turn_id: String,
     pub source_item_id: String,
     pub members: Vec<(String, String)>,
@@ -546,6 +668,7 @@ impl InteractionFacts {
     ) -> Self {
         Self {
             stale: p.stale,
+            runtime_status: p.runtime_status.clone(),
             operations,
             operations_unpaused,
             queue_paused,
@@ -590,6 +713,13 @@ fn pending_kind_key(kind: super::types::PendingKind) -> &'static str {
         super::types::PendingKind::UserInput => "user_input",
         super::types::PendingKind::Unsupported => "unsupported",
     }
+}
+
+pub(crate) enum UnboundSendCompletion {
+    Missing,
+    Hold,
+    FormalTerminal(String),
+    HashTerminal,
 }
 
 #[derive(Clone)]
@@ -920,11 +1050,26 @@ impl DesktopIpcAdapter {
                     }
                 })),
                 probe_key_override: std::sync::Mutex::new(None),
+                probe_key_generation: std::sync::atomic::AtomicU64::new(0),
+                pause_facts: std::sync::Mutex::new(HashMap::new()),
+                pause_fact_kick: std::sync::Mutex::new(std::collections::HashSet::new()),
+                adapt_fact_kick: std::sync::atomic::AtomicBool::new(false),
+                adapt_fact: std::sync::Mutex::new((0, None)),
+                adapt_fact_reads: std::sync::Mutex::new(0),
+                pause_fact_reads: std::sync::Mutex::new(HashMap::new()),
+                interaction_hint_kicks: std::sync::Mutex::new(std::collections::HashSet::new()),
+                hint_write_jobs: std::sync::Mutex::new(None),
+                hint_write_worker: Arc::new(std::sync::Mutex::new(None)),
+                hint_write_epoch: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+                hint_write_open: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                hint_write_supervision: Arc::new(std::sync::Mutex::new(None)),
                 probe_budget: std::sync::Mutex::new(super::probe::runner::ProbeBudget::default()),
                 conn: Mutex::new(None),
                 ensure_lock: tokio::sync::Mutex::new(()),
                 owners: Mutex::new(OwnerRegistry::default()),
                 mirrors: Mutex::new(HashMap::new()),
+                question_skip_live: std::sync::OnceLock::new(),
+                question_display: std::sync::OnceLock::new(),
                 mirror_ledger: Arc::new(std::sync::Mutex::new(
                     super::mirror::MirrorLedger::global(),
                 )),
@@ -978,6 +1123,10 @@ impl DesktopIpcAdapter {
                 contract_install_gate: std::sync::Mutex::new(None),
                 contract_target_override: std::sync::Mutex::new(None),
                 observed_operations: std::sync::Mutex::new(None),
+                #[cfg(test)]
+                transition_test_probe: TransitionTestProbe::default(),
+                #[cfg(test)]
+                cleanup_gate: std::sync::Mutex::new(None),
                 interaction_hint_store: std::sync::Mutex::new(None),
                 interaction_hint_io: tokio::sync::Mutex::new(()),
                 interaction_hints_cache: std::sync::Mutex::new(HashMap::new()),
@@ -990,7 +1139,7 @@ impl DesktopIpcAdapter {
                 package_sha_override: std::sync::Mutex::new(None),
                 recheck_barrier: std::sync::Mutex::new(None),
                 recheck_reached: std::sync::atomic::AtomicBool::new(false),
-                probe_status_cache: std::sync::Mutex::new(None),
+                probe_status_cache: std::sync::Mutex::new(ProbeStatusCache::default()),
                 auto_adapt_gate: std::sync::Mutex::new(None),
                 write_guard: std::sync::Mutex::new(None),
                 state_evidence: std::sync::Mutex::new(None),
@@ -1006,6 +1155,220 @@ impl DesktopIpcAdapter {
     /// 获取运行期账本，仅供旧实例停止后的串行重装接续。
     pub fn answer_validity(&self) -> Arc<super::answer_validity::AnswerValidityLedger> {
         self.inner.answer_validity.clone()
+    }
+
+    // ------------------------------------------------------------------
+    // Source/live 门禁（source-live-contract §2/§3/§6）：共享 live 装配、
+    // 同锁 raw 冻结出口、独立 async 出口与 Claims adapter 层接点。
+    // ------------------------------------------------------------------
+
+    /// hub 装配点：与 ActionStore 共享同一份 `Arc<QuestionSkipLive>`。
+    pub(crate) fn set_question_skip_live(&self, live: Arc<QuestionSkipLive>) {
+        let _ = self.inner.question_skip_live.set(live);
+    }
+
+    /// 未装配 → None（所有权威事实 Unknown，冻结出口/装载接点保守拒绝）。
+    pub(crate) fn question_skip_live(&self) -> Option<Arc<QuestionSkipLive>> {
+        self.inner.question_skip_live.get().cloned()
+    }
+
+    pub(crate) fn set_question_skip_display(
+        &self,
+        display: Arc<crate::services::codex_question_skip::display::QuestionDisplayStore>,
+    ) {
+        let _ = self.inner.question_display.set(display);
+    }
+
+    async fn ensure_question_display(&self, key: &ThreadKey) {
+        if let Some(display) = self.inner.question_display.get() {
+            display.ensure_loaded(key).await;
+        }
+    }
+
+    /// 与原题体同一次镜像观察；这里只读冻结缓存，不访问数据库。
+    fn overlay_question_display_locked(
+        &self,
+        key: &ThreadKey,
+        mirror: Option<&ThreadMirror>,
+        projection: &mut ThreadProjection,
+    ) {
+        let Some(display) = self.inner.question_display.get() else {
+            return;
+        };
+        let history = display.try_frozen(key);
+        let source = self
+            .question_skip_live()
+            .ok_or(LiveRefusal::Unknown)
+            .and_then(|live| {
+                let mirror = mirror.ok_or(LiveRefusal::Unknown)?;
+                let refresh = live.begin_source_refresh(key)?;
+                let observed =
+                    self.freeze_question_skip_source_locked(key, mirror, refresh.base_source_seq());
+                live.finish_source_refresh(refresh, observed)
+            });
+        crate::services::codex_question_skip::display::overlay_projection(
+            projection,
+            source.as_ref().map_err(Clone::clone),
+            history.as_ref(),
+        );
+    }
+
+    /// 展示写入后的完整重观察使用既有发布序号；不借队列暂停去重。
+    pub(crate) async fn publish_question_skip_changed(&self, key: &ThreadKey) {
+        let projection = self.projection(key).await;
+        self.publish_fresh_projection(key, projection).await;
+    }
+
+    /// 同锁冻结 raw 与真实健康（修复合同 §1）：调用者已持有 inner.mirrors；本函数
+    /// 内部**不再取得 mirrors/owners 锁**——owner proof 由调用者在
+    /// `owners.try_lock + is_current` 同锁点经 `mirror.bind_owner_proof` 装订。
+    /// 从同一 mirror 的 raw_state、lease、owner proof、build_generation、stale、
+    /// 真实 budget_refused 和 raw coverage 生成 SourceStamp 并调用既有 builder；
+    /// 已知且健康的真实镜像必须存在正向路径（不能恒拒冒充接线）。最后参数 =
+    /// 票据捕获的候选 sourceSeq（mutation/refresh 各自传入，不对外发布）。
+    pub(crate) fn freeze_question_skip_source_locked(
+        &self,
+        key: &ThreadKey,
+        mirror: &ThreadMirror,
+        base_source_seq: u64,
+    ) -> Result<SourceObservation, LiveRefusal> {
+        // 真实协议 build 身份从现 profile 真实出口取；未知 build 身份拒绝。
+        let build = self.current_profile().build;
+        if build.trim().is_empty() {
+            return Err(LiveRefusal::SourceIncomplete);
+        }
+        let Some(lease) = mirror.lease() else {
+            return Err(LiveRefusal::Unknown);
+        };
+        let Some(proof) = mirror.owner_proof() else {
+            return Err(LiveRefusal::Unknown);
+        };
+        // proof.lease 与 mirror.lease 全等；撤销经原子信号立即可见。
+        if proof.lease() != lease {
+            return Err(LiveRefusal::ScopeChanged);
+        }
+        if !proof.is_live() {
+            return Err(LiveRefusal::OwnerLost);
+        }
+        if mirror.is_stale() || mirror.budget_refused() {
+            // stale / 真实预算拒绝（含保旧 raw 的预算拒绝）→ 健康拒绝，保旧值
+            // 也不能通过。
+            return Err(LiveRefusal::SourceIncomplete);
+        }
+        if mirror.raw_provenance() != super::mirror::RawProvenance::WholeInput {
+            // 无 WholeInput 证明 → raw coverage 未知：truncated 不能填 Some(false)。
+            return Err(LiveRefusal::SourceIncomplete);
+        }
+        let Some(state) = mirror.raw_state() else {
+            return Err(LiveRefusal::SourceIncomplete);
+        };
+        let stamp = SourceStamp {
+            owner_lease: Some(owner_lease_encoding(lease)),
+            owner_epoch: lease.epoch,
+            owner_generation: lease.generation,
+            mirror_build_generation: mirror.build_generation(),
+            // 候选值；不对外发布，finish 按语义比较封定真实 sourceSeq。
+            source_seq: base_source_seq,
+            stale: false,
+            budget_refused: Some(false),
+            // WholeInput provenance → raw 本体未截断；展示尾窗 truncated 不冒充。
+            truncated: Some(false),
+            // 复用既有完整性事实（turn 列表）；逐 turn 分页/引用完整性由 builder 校验。
+            raw_complete: Some(mirror.is_history_complete()),
+            display_local_seq: self.inner.projection_seq.load(Ordering::SeqCst),
+        };
+        let snapshot = build_source_snapshot(&key.thread_id, state, &stamp)
+            .map_err(|_| LiveRefusal::SourceIncomplete)?;
+        Ok(SourceObservation {
+            snapshot,
+            proof: proof.clone(),
+            build,
+        })
+    }
+
+    /// Claims adapter 层（修复合同 §2）：生产写入口走 typed
+    /// `begin_claims_change`（Adapter + **Full**——inflight 复制完整当前占位集合
+    /// 才可全量替换）。begin 发生在变更（inflight 锁）之前：失效先行，不能因
+    /// 变更未开始而暂时视为 clear。未装配 live → None（事实保持未知）。
+    fn begin_claims_adapter_layer(&self, thread_id: &str) -> Option<ClaimsUpdate> {
+        let live = self.question_skip_live()?;
+        let key = ThreadKey {
+            host_id: "local".into(),
+            thread_id: thread_id.to_string(),
+        };
+        live.begin_claims_change(&key, ClaimsLayer::Adapter, ClaimsScope::Full)
+            .ok()
+    }
+
+    /// Claims adapter 层提交单点：**必须在原 inflight 短锁内调用**（变更/复制与
+    /// finish 之间无 await）——同层同 key 旧写结果不能晚到覆盖新写。Full 整层
+    /// 替换（含没有 actionId 的 Dispatching）；Err 打回该层 Unknown。
+    fn submit_adapter_claims_locked(
+        &self,
+        update: Option<ClaimsUpdate>,
+        observed: Result<Vec<Claim>, LiveRefusal>,
+    ) {
+        let Some(update) = update else {
+            return;
+        };
+        if let Some(live) = self.question_skip_live() {
+            let _ = live.finish_claims_change(update, observed);
+        }
+    }
+
+    /// 测试读取原在途集合。
+    #[cfg(test)]
+    pub(crate) async fn question_skip_claims(&self, key: &ThreadKey) -> Vec<Claim> {
+        let inflight = self.inner.inflight.lock().await;
+        Self::collect_adapter_claims(&inflight, &key.thread_id)
+    }
+
+    /// B2 初装载（F6.26/M3 审查修复）：Adapter 层完整读取并经票据协议提交——
+    /// begin 票（失效先行）→ inflight 短锁内复制完整在途占位集合（含无 actionId
+    /// 的 Dispatching）→ 同锁内 finish Full 替换（变更/复制与 finish 之间无
+    /// await，同层同 key 旧写不能晚到覆盖）。热重启在途占位按当前真值装载，
+    /// 不被「空集」冒充全读证明。返回该层是否权威提交成功（begin/finish 失败
+    /// = false，该层保持 Unknown；B-R1 首用装载据此判断是否标记已装载）。
+    /// 未装配 live → false（保守，不假成功）。
+    pub(crate) async fn refresh_adapter_claims_on_load(&self, key: &ThreadKey) -> bool {
+        let Some(update) = self.begin_claims_adapter_layer(&key.thread_id) else {
+            return false;
+        };
+        let inflight = self.inner.inflight.lock().await;
+        let observed = Ok(Self::collect_adapter_claims(&inflight, &key.thread_id));
+        match self.question_skip_live() {
+            Some(live) => live.finish_claims_change(update, observed).is_ok(),
+            None => false,
+        }
+    }
+
+    /// inflight 当前完整占位集合（含没有 actionId 的 Dispatching）。
+    fn collect_adapter_claims(
+        inflight: &HashMap<(String, String), InflightEntry>,
+        thread_id: &str,
+    ) -> Vec<Claim> {
+        inflight
+            .iter()
+            .filter(|((tid, _), _)| tid == thread_id)
+            .map(|((_, request_key), entry)| Claim {
+                question_key: request_key.clone(),
+                action_id: None,
+                kind: match entry.state {
+                    InflightState::Dispatching => ClaimKind::InFlight,
+                    InflightState::BlockedUnknown => ClaimKind::Unknown,
+                },
+            })
+            .collect()
+    }
+
+    /// Source 槽位失效单点（合同 §6 接点表）：begin → finish Err，槽位打回
+    /// Unknown。未装配 live 时为 no-op（证据本就 Unknown）。
+    pub(crate) fn invalidate_question_skip_source(&self, key: &ThreadKey, refusal: LiveRefusal) {
+        if let Some(live) = self.question_skip_live() {
+            if let Ok(update) = live.begin_source_change(key) {
+                let _ = live.finish_source_change(update, Err(refusal));
+            }
+        }
     }
 
     /// #172/T7：注入官方 schema 证据（生产由装配期一次性探测填入；测试直接注入）。
@@ -1068,6 +1431,9 @@ impl DesktopIpcAdapter {
     /// `approval_policy` 与 `attemptable` 是活值，重发布让 SSE 下游收到生产真实
     /// 会发的 availability/可尝试翻转帧（终审 R6 后端半边；F2 安装身份守卫不变）。
     pub fn notify_auto_adapt_changed(&self, enabled: bool) {
+        // A2/M4：内存事实刷新在停机检查**之前**——停机期间的开关也必须落内存
+        // 事实（热启不得沿用旧资格）；后续探测/安装/重发布仍按停机态跳过。
+        self.refresh_adapt_fact();
         // 停机态不触发（stop 后不再有任何新探测/安装/重发布）。
         if self.inner.stopping.load(Ordering::SeqCst) {
             return;
@@ -1084,6 +1450,8 @@ impl DesktopIpcAdapter {
     /// 运行时里做该初始化会阻塞（T08 集成测试实证的死锁）。同步命令线程仍走
     /// [`Self::notify_auto_adapt_changed`]（那里没有当前运行时可用）。
     pub fn notify_auto_adapt_changed_async(&self, enabled: bool) {
+        // A2/M4：同上——停机检查前先刷新内存事实。
+        self.refresh_adapt_fact();
         if self.inner.stopping.load(Ordering::SeqCst) {
             return;
         }
@@ -1096,6 +1464,9 @@ impl DesktopIpcAdapter {
     /// 通知主体：重开 = 只读按需取证（schema 决策词 + 当前包契约识别，spec §3.2：
     /// 不自动批准、不发送、不恢复队列）；**开/关都重发布**已跟随线程的投影。
     async fn run_auto_adapt_notify(self, enabled: bool) {
+        // A2.2/T8：变化点同步刷新内存事实（toggle 通知即变化点）——关断后的
+        // 撤回与下一投影立即生效，不等落库。
+        self.refresh_adapt_fact();
         if enabled {
             self.ensure_schema_evidence().await;
             self.ensure_contract_evidence().await;
@@ -1297,7 +1668,8 @@ impl DesktopIpcAdapter {
     /// 证据安装/恢复、只读探测通过都会走这里，让已打开的审批卡与「已适配」状态
     /// **不需要重新进入会话**即更新（设计 §3.4「不能出现第一次进入禁用、重新进入
     /// 才解锁」）。无镜像的 key 跳过（不发布 stale 空投影）。
-    async fn republish_all_projections(&self) {
+    /// A2.2/T8：remote 装配的 observed 刷新回调也经此重发布。
+    pub(crate) async fn republish_all_projections(&self) {
         for key in followed_keys(self).await {
             if !self.has_mirror(&key).await {
                 continue;
@@ -1577,9 +1949,10 @@ impl DesktopIpcAdapter {
             return super::pending::DecisionPolicy::evidence();
         }
         // S1（设计 §3.3）：自动适配关闭 → 兼容审批决策一并关闭（已验证 build 的
-        // 证据档已在上面返回，不受影响）；**活值**门——关闭后迟到的 schema 结果
-        // 不得恢复未知版本操作。
-        if !self.auto_adapt_enabled() {
+        // 证据档已在上面返回，不受影响）；**缓存事实**门——本方法在镜像临界区内
+        // 被消费（T8：临界区不读 DB），事实在投影入口锁外刷新（A6 终审回归修复）；
+        // 关闭后迟到的 schema 结果同样不得恢复未知版本操作。
+        if !self.adapt_enabled_cached() {
             return super::pending::DecisionPolicy::default();
         }
         let evidence = self
@@ -1779,9 +2152,10 @@ impl DesktopIpcAdapter {
     /// 位点（availability/可尝试呈现）；协议能力检查（start_turn 等）仍用
     /// [`Self::current_caps`]。
     fn effective_projection_caps(&self) -> CapabilitySet {
+        // A6 终审回归修复：镜像临界区消费 → 缓存事实（入口锁外已刷新）。
         let mut caps = self.current_caps();
         let profile = self.current_profile();
-        if !self.auto_adapt_enabled()
+        if !self.adapt_enabled_cached()
             && profile.evidence == super::profile::EvidenceLevel::Unverified
             && caps.send
         {
@@ -1827,6 +2201,39 @@ impl DesktopIpcAdapter {
     ///   （发送本身提供写证据，设计 §3.3）；关 = 不可尝试。
     ///
     /// `Err(code)` = 不可尝试及其理由码；`Ok(())` = 可尝试（仍需实时守卫放行）。
+    /// 终审 Blocker 5：**投影路径**专用（镜像锁内调用）——未知 build 档读
+    /// 本帧固定的内存事实 `adapt_enabled_cached()`，与 `effective_operations`
+    /// 的求值依据同一版事实（不再在锁内二次活读设置 DB，也不出现「Send 撤了
+    /// 但审批仍按旧值放开」的同帧矛盾）。
+    ///
+    /// 写边界/DTO 仍用 [`Self::send_gate_static`]（活值，F4 合同）。
+    fn send_gate_static_cached(&self) -> Result<(), &'static str> {
+        let profile = self.current_profile();
+        match profile.evidence {
+            super::profile::EvidenceLevel::Closed => {
+                if self.profile_send_capable_opt() == Some(true) {
+                    Err("capability_unavailable")
+                } else {
+                    Err("capability_unverified")
+                }
+            }
+            super::profile::EvidenceLevel::Shipped => {
+                if profile.capabilities.send {
+                    Ok(())
+                } else {
+                    Err("capability_unverified")
+                }
+            }
+            super::profile::EvidenceLevel::Unverified => {
+                if self.adapt_enabled_cached() {
+                    Ok(())
+                } else {
+                    Err("capability_unverified")
+                }
+            }
+        }
+    }
+
     pub fn send_gate_static(&self) -> Result<(), &'static str> {
         let profile = self.current_profile();
         match profile.evidence {
@@ -1954,6 +2361,20 @@ impl DesktopIpcAdapter {
         }
     }
 
+    /// Task7 测试缝（仅 debug 构建）：真实 Claimed 后置停点门（元组 = action_id
+    /// 精确过滤 / entered / release；默认 None）。转接现行连接的同名默认关闭字段。
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub async fn set_claim_granted_gate_for_tests(
+        &self,
+        gate: Option<(String, Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
+    ) {
+        let conn = self.inner.conn.lock().await.clone();
+        if let Some(conn) = conn {
+            conn.set_claim_granted_gate(gate);
+        }
+    }
+
     #[doc(hidden)]
     pub async fn final_claim_gate_reached(&self) -> bool {
         let conn = self.inner.conn.lock().await.clone();
@@ -2017,6 +2438,9 @@ impl DesktopIpcAdapter {
             .auto_adapt_gate
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = gate;
+        // A2.2/T8：门即事实源——装配/换缝后同步刷新内存事实一次，未装载缺省
+        // 不再参与后续求值（测试缝直接 set gate 的语义与生产 notify 入口一致）。
+        self.refresh_adapt_fact();
     }
 
     /// S3：注入连接级参数（受控时间测试收窄超时/槽位容量；生产恒缺省常量）。
@@ -2059,14 +2483,100 @@ impl DesktopIpcAdapter {
     }
 
     /// 自动适配生效值（缺省开；活值——开关翻转即刻约束新的探测/安装/审批档）。
+    /// A2.2/T8：自动适配生效值改读**内存事实**——活值门闭包（可能读设置 DB）
+    /// 不再被镜像临界区内的 caps/policy 求值调用。事实未装载 → 缺省开（既有
+    /// 缺省语义）并后台刷新一次（去重）；变化点（toggle 的 notify）同步刷新。
+    /// A6 终审回归修复：活值门恢复**同步直读**（写边界/DTO/取证门等全部非临
+    /// 界区消费点保持旧时序语义——`f4_auto_adapt_off_must_reread_live_gate_...`
+    /// 与六个 R3 失败用例的合同面）。镜像临界区内的消费点改用
+    /// [`Self::adapt_enabled_cached`]（见各站点注释；T8：临界区不读 DB）。
     fn auto_adapt_enabled(&self) -> bool {
+        self.auto_adapt_gate_read().unwrap_or(true)
+    }
+
+    /// A2.2/T8：镜像临界区内的自动适配生效值——只读内存事实（缺省开）。
+    /// 事实在投影/发布/写门入口（锁外）经 [`Self::refresh_adapt_fact`] 同步刷新。
+    fn adapt_enabled_cached(&self) -> bool {
+        self.inner
+            .adapt_fact
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .1
+            .unwrap_or(true)
+    }
+
+    /// A2.2/T8：变化点同步刷新自动适配事实（notify 入口；闭包单次调用）。
+    /// A2/M4：gate 锁只用于取闭包（闭包可能读设置 DB，不得持锁调用）；
+    /// 读取世代在取值前登记，迟到读不覆盖新读。
+    fn refresh_adapt_fact(&self) {
+        // 终审 M2：**先登记读世代、再克隆闭包**——换源（set_auto_adapt_gate）
+        // 会推进世代，旧闭包因此拿不到「更新」的号（旧实现先 clone 再登记，
+        // 换源时旧闭包反而取得较新号）。
+        let generation = {
+            let mut reads = self
+                .inner
+                .adapt_fact_reads
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            *reads += 1;
+            *reads
+        };
+        let gate = self
+            .inner
+            .auto_adapt_gate
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let Some(gate) = gate else {
+            // 终审 M2：换到 None（卸载门）——使旧缓存失效，而不是保留旧值。
+            let mut fact = self
+                .inner
+                .adapt_fact
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let current_reads = self
+                .inner
+                .adapt_fact_reads
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if *current_reads == generation {
+                drop(current_reads);
+                if fact.1.is_some() {
+                    fact.0 = fact.0.wrapping_add(1);
+                    fact.1 = None;
+                }
+            }
+            return;
+        };
+        let value = gate();
+        let mut fact = self
+            .inner
+            .adapt_fact
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let current_reads = self
+            .inner
+            .adapt_fact_reads
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if *current_reads != generation {
+            return;
+        }
+        drop(current_reads);
+        if fact.1 != Some(value) {
+            fact.0 = fact.0.wrapping_add(1);
+            fact.1 = Some(value);
+        }
+    }
+
+    /// A2.2/T8：活值门闭包单次调用（供后台刷新的阻塞池使用）。
+    fn auto_adapt_gate_read(&self) -> Option<bool> {
         self.inner
             .auto_adapt_gate
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .as_ref()
             .map(|g| g())
-            .unwrap_or(true)
     }
 
     /// 读链成功证据是否对**当前**连接代际 + build 目标成立（S1；不查账本、纯内存）。
@@ -2134,6 +2644,9 @@ impl DesktopIpcAdapter {
         };
         let profile = self.current_profile();
         let caps = profile.capabilities;
+        // 终审：DTO 是**准入读**——先把适配事实刷新到最新，保证同一份 DTO 内的
+        // gate_on 与投影 effectiveOperations 来自同一版事实。
+        self.refresh_adapt_fact();
         let gate_on = self.auto_adapt_enabled();
         // Gate A #2：「已取证」的 shipped 判定读**最近一次成功建连的证据档**——
         // 断链把当前 profile 回落 closed 后，shipped build 的已取证维度不得失忆。
@@ -2265,40 +2778,78 @@ impl DesktopIpcAdapter {
     /// * **取不到**（无 build 目标 / 账本不可用）→ `idle` + **无码**（不猜）。
     pub async fn probe_status(&self) -> ProbeStatus {
         let Some(target) = self.probe_target_snapshot() else {
-            // 没有 build 目标（shipped build / 还没 resolve 到 build）→ 取不到，不猜
             return ProbeStatus::idle();
         };
-        let probe_key = self.resolve_probe_key(&target).await;
-        // 在飞 → probing（单飞器既有能力；只读查询）
-        if self.inner.probe.is_flight_active(&probe_key) {
-            return ProbeStatus::probing();
-        }
-        // 账本结论（缓存；写点失效后重查）
-        if let Some(cached) = self
+        let version = self
             .inner
             .probe_status_cache
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .clone()
-        {
-            return cached;
+            .version;
+        if version == u64::MAX {
+            return ProbeStatus::idle();
         }
-        let status = self.load_probe_status(&probe_key);
-        *self
-            .inner
-            .probe_status_cache
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = Some(status.clone());
-        status
+        let probe_key = self.resolve_probe_key(&target).await;
+        let cached = self.with_current_probe_identity(&target, Some(&probe_key), || {
+            if self.inner.probe.is_flight_active(&probe_key) {
+                return Some(ProbeStatus::probing());
+            }
+            let cache = self
+                .inner
+                .probe_status_cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if cache.version != version {
+                return Some(ProbeStatus::idle());
+            }
+            cache.value.as_ref().and_then(|(epoch, key, status)| {
+                (*epoch == target.epoch && key == &probe_key).then(|| status.clone())
+            })
+        });
+        match cached {
+            None => return ProbeStatus::idle(),
+            Some(Some(status)) => return status,
+            Some(None) => {}
+        }
+        let loader = self.clone();
+        let key = probe_key.clone();
+        let Ok(Ok(status)) =
+            tokio::task::spawn_blocking(move || loader.load_probe_status(&key)).await
+        else {
+            // 未取得结论时不缓存，让后续观察有机会重新加载。
+            return ProbeStatus::idle();
+        };
+        let installed = self
+            .with_current_probe_identity(&target, Some(&probe_key), || {
+                let mut cache = self
+                    .inner
+                    .probe_status_cache
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                if cache.version != version || cache.version == u64::MAX {
+                    return false;
+                }
+                cache.value = Some((target.epoch, probe_key.clone(), status.clone()));
+                true
+            })
+            .unwrap_or(false);
+        if installed {
+            status
+        } else {
+            ProbeStatus::idle()
+        }
     }
 
     /// 读账本 `state` 行 → 探测只读事实（**只读**：不写账本、不触发探测）。
-    fn load_probe_status(&self, probe_key: &str) -> ProbeStatus {
+    fn load_probe_status(
+        &self,
+        probe_key: &str,
+    ) -> Result<ProbeStatus, super::probe::ProbeLedgerReadError> {
         let Some(ledger) = self.probe_ledger() else {
             // 账本不可用 → 取不到，不猜（不报「未验证」——那也是猜）
-            return ProbeStatus::idle();
+            return Ok(ProbeStatus::idle());
         };
-        match ledger.get(probe_key, CAP_STATE) {
+        Ok(match ledger.try_get(probe_key, CAP_STATE)? {
             Some(entry) => super::reason_code::probe_status_from(
                 entry.state,
                 entry.stage.as_deref(),
@@ -2306,24 +2857,80 @@ impl DesktopIpcAdapter {
             ),
             // 该 build 尚无任何探测记录 → idle + desktop_build_unverified
             None => ProbeStatus::unverified(),
-        }
+        })
     }
 
     /// 探测只读事实的缓存作废（账本写点 / build 目标变更点调用）。
     fn invalidate_probe_status_cache(&self) {
-        *self
+        let mut cache = self
             .inner
             .probe_status_cache
             .lock()
-            .unwrap_or_else(|e| e.into_inner()) = None;
+            .unwrap_or_else(|e| e.into_inner());
+        cache.version = cache.version.saturating_add(1);
+        cache.value = None;
     }
 
     /// 给投影盖上探测只读事实（#172/T9a；**单一盖章点**）。
     ///
     /// 镜像层不知道账本与单飞器，故由 adapter 在**发布前**统一盖；既有字段的
     /// 语义一字不动——本方法只写 `probe_status` 这一个**只读**字段。
-    async fn stamp_probe_status(&self, mut p: ThreadProjection) -> ThreadProjection {
-        p.probe_status = self.probe_status().await;
+    fn stamp_probe_status(&self, mut p: ThreadProjection) -> ThreadProjection {
+        let Some(target) = self.probe_target_snapshot() else {
+            p.probe_status = ProbeStatus::idle();
+            return p;
+        };
+        let key = self.observed_probe_key();
+        #[cfg(test)]
+        self.run_caps_observe_gate("probe_stamp_before_cache");
+        // 按 target → cache 的既有锁序同时核对当前世代和缓存；不能在闭包内再取 target。
+        let decision = self.with_current_probe_identity(&target, key.as_deref(), || {
+            if key
+                .as_deref()
+                .is_some_and(|key| self.inner.probe.is_flight_active(key))
+            {
+                return (ProbeStatus::probing(), None);
+            }
+            let mut cache = self
+                .inner
+                .probe_status_cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some((epoch, cached_key, status)) = &cache.value {
+                if *epoch == target.epoch && key.as_ref() == Some(cached_key) {
+                    return (status.clone(), None);
+                }
+                // 旧键不能作为本次加载成功的依据，也不得令失败重发布自激。
+                cache.value = None;
+                cache.version = cache.version.saturating_add(1);
+            }
+            if cache.loading || cache.version == u64::MAX {
+                (ProbeStatus::idle(), None)
+            } else {
+                cache.loading = true;
+                (ProbeStatus::idle(), Some(cache.version))
+            }
+        });
+        let (status, start) = decision.unwrap_or_else(|| (ProbeStatus::idle(), None));
+        p.probe_status = status;
+        if let Some(start_version) = start {
+            let adapter = self.clone();
+            tokio::spawn(async move {
+                let _ = adapter.probe_status().await;
+                let republish = {
+                    let mut cache = adapter
+                        .inner
+                        .probe_status_cache
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    cache.loading = false;
+                    cache.value.is_some() || cache.version != start_version
+                };
+                if republish && !adapter.inner.stopping.load(Ordering::SeqCst) {
+                    adapter.republish_all_projections().await;
+                }
+            });
+        }
         p
     }
 
@@ -2351,6 +2958,9 @@ impl DesktopIpcAdapter {
         let (runtime_status, has_pending) = mirror.operation_preview();
         let operations = self.compute_operations(runtime_status.clone(), has_pending, queue_paused);
         // R01：越队授权消费后仍要求其余门（运行中/审批/证据）不通过则不予放行。
+        // 终审 Blocker 1：`operations_unpaused` 是**越队授权**语义（`bypass_paused_queue`）
+        // ——该路径的暂停门由 router 的持久行权威判定，故此处按「未暂停」求值，
+        // 不受展示事实未装载的保守值影响。
         let operations_unpaused = self.compute_operations(runtime_status, has_pending, false);
         mirror.set_effective_operations(operations.clone());
         // T03：持久提示的**已装载副本**（锁内不读 DB）；未装载 → 无提示（保守同前）。
@@ -2366,7 +2976,9 @@ impl DesktopIpcAdapter {
         // B01：可用性必须由**同一份逐操作结论**推导，而不是 profile caps 快照。
         // 契约匹配（或兼容档）让 Send 通过后，未知 build 也能进入可发送/可交互
         // 态；自动适配关闭时 send_gate_static 会否掉 Send，结论同步回退只读。
-        let send_static_ok = self.send_gate_static().is_ok();
+        // 终审 Blocker 5：本处在镜像临界区内 → 读本帧固定的事实（cached），
+        // 与 effective_operations 同源；写边界仍用活值版（send_gate_static）。
+        let send_static_ok = self.send_gate_static_cached().is_ok();
         let mut operations = projection.effective_operations.clone();
         if let Some(status) = operations
             .operations
@@ -2399,6 +3011,7 @@ impl DesktopIpcAdapter {
         );
         facts.active_turn_id = mirror.active_turn_id();
         self.store_interaction_facts(key, facts);
+        self.overlay_question_display_locked(key, Some(mirror), &mut projection);
         (projection, witnesses)
     }
 
@@ -2427,19 +3040,26 @@ impl DesktopIpcAdapter {
         source_turn_id: &str,
         source_item_id: &str,
         members: Vec<(String, String)>,
-    ) {
-        self.inner
+        route: AsyncAnswerRoute,
+        complete_group: bool,
+    ) -> bool {
+        let binding = GroupBinding {
+            route,
+            complete_group,
+            source_turn_id: source_turn_id.to_string(),
+            source_item_id: source_item_id.to_string(),
+            members,
+        };
+        let mut bindings = self
+            .inner
             .group_bindings
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(
-                action_id.to_string(),
-                GroupBinding {
-                    source_turn_id: source_turn_id.to_string(),
-                    source_item_id: source_item_id.to_string(),
-                    members,
-                },
-            );
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(existing) = bindings.get(action_id) {
+            return existing == &binding;
+        }
+        bindings.insert(action_id.to_string(), binding);
+        true
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2451,6 +3071,7 @@ impl DesktopIpcAdapter {
         request_key: Option<&str>,
         context_token: Option<&str>,
         bypass_paused: bool,
+        async_route: Option<AsyncAnswerRoute>,
         allowed: impl FnOnce() -> T,
     ) -> Result<T, String> {
         let _gate = self
@@ -2460,7 +3081,7 @@ impl DesktopIpcAdapter {
             .unwrap_or_else(|e| e.into_inner());
         if let Some(reason) = self.interaction_verdict_locked(
             action_id,
-            kind,
+            (kind, async_route),
             thread_id,
             request_key,
             context_token,
@@ -2475,19 +3096,24 @@ impl DesktopIpcAdapter {
     fn interaction_verdict_locked(
         &self,
         action_id: &str,
-        kind: crate::services::codex_desktop_ipc::types::ActionKind,
+        interaction: (
+            crate::services::codex_desktop_ipc::types::ActionKind,
+            Option<AsyncAnswerRoute>,
+        ),
         thread_id: &str,
         request_key: Option<&str>,
         context_token: Option<&str>,
         bypass_paused: bool,
     ) -> Option<String> {
         use crate::services::codex_desktop_ipc::types::ActionKind;
+        let (kind, async_route) = interaction;
+        let async_route = async_route.unwrap_or(AsyncAnswerRoute::IdleStart);
         // 只对**交互写**做逐题/逐请求复核；普通消息保持既有发送门语义。
         let operation = match kind {
             ActionKind::UserInput => super::capability::CodexOperation::BlockingInput,
             ActionKind::CommandApproval => super::capability::CodexOperation::CommandApproval,
             ActionKind::FileChangeApproval => super::capability::CodexOperation::FileChangeApproval,
-            ActionKind::AsyncQuestion => super::capability::CodexOperation::AsyncAnswerIdle,
+            ActionKind::AsyncQuestion => async_route.operation(),
             _ => return None,
         };
         let facts = {
@@ -2528,6 +3154,9 @@ impl DesktopIpcAdapter {
         }
         match kind {
             ActionKind::AsyncQuestion => {
+                if !async_route.runtime_matches(&facts.runtime_status) {
+                    return Some("busy_before_write".into());
+                }
                 let (Some(question_key), Some(token)) = (request_key, context_token) else {
                     return Some("stale_context".into());
                 };
@@ -2573,6 +3202,9 @@ impl DesktopIpcAdapter {
                     .get(action_id)
                     .cloned();
                 if let Some(binding) = binding {
+                    if binding.route != async_route {
+                        return Some("stale_context".into());
+                    }
                     let expected: std::collections::BTreeSet<String> =
                         binding.members.iter().map(|(key, _)| key.clone()).collect();
                     for (key, token) in &binding.members {
@@ -2582,6 +3214,8 @@ impl DesktopIpcAdapter {
                             return Some("stale_context".into());
                         };
                         if question.1 != *token
+                            || question.5 != binding.source_turn_id
+                            || question.6 != binding.source_item_id
                             || matches!(
                                 question.2.as_str(),
                                 "answered" | "ended" | "cancelled" | "rejected"
@@ -2616,9 +3250,11 @@ impl DesktopIpcAdapter {
                         })
                         .map(|question| question.0.clone())
                         .collect();
-                    if live != expected {
+                    if binding.complete_group && live != expected {
                         return Some("answers_mismatch".into());
                     }
+                } else if async_route == AsyncAnswerRoute::ActiveSteer {
+                    return Some("stale_context".into());
                 }
                 None
             }
@@ -2945,6 +3581,9 @@ impl DesktopIpcAdapter {
         key: &ThreadKey,
         queue_paused: bool,
     ) -> EffectiveOperations {
+        // A6 终审回归修复：写门在锁外同步刷新自动适配事实（临界区消费面用
+        // 缓存事实；本刷新保证 f4 的「写边界现读」语义——事实源即设置 DB）。
+        self.refresh_adapt_fact();
         let preview = {
             let mirrors = self.inner.mirrors.lock().await;
             mirrors.get(key).map(|mirror| mirror.operation_preview())
@@ -3014,7 +3653,9 @@ impl DesktopIpcAdapter {
         let target_fresh = self.current_conn_alive();
         OperationContext {
             target_fresh,
-            auto_adapt_enabled: self.auto_adapt_enabled(),
+            // A6 终审回归修复：本结构在镜像临界区内被消费（project_mirror）→
+            // 缓存事实；写门路径在 compute_operations_for 入口锁外刷新事实。
+            auto_adapt_enabled: self.adapt_enabled_cached(),
             runtime_status,
             blocking_pending,
             queue_paused,
@@ -3124,10 +3765,96 @@ impl DesktopIpcAdapter {
             .unwrap_or_else(|e| e.into_inner()) = store;
     }
 
+    /// A2.2/T8：投影路径的 hints 冷载触发——**不等待装载**；装载在
+    /// `interaction_hint_io` 串行纪律内后台完成，安装后按当前身份重观察并
+    /// 重发布（T8「完成后对当前镜像重新观察、合并与重发布」）。未装载投影
+    /// 如实 Unknown/Loading。`ensure_interaction_hints` 的同步语义保留给
+    /// 显式调用方与首帧路径。
+    fn kick_interaction_hints_background(&self, key: &ThreadKey) {
+        {
+            let cache = self
+                .inner
+                .interaction_hints_cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if cache.contains_key(&key.thread_id) {
+                return;
+            }
+        }
+        {
+            let mut kicks = self
+                .inner
+                .interaction_hint_kicks
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if !kicks.insert(key.thread_id.clone()) {
+                return;
+            }
+        }
+        let adapter = self.clone();
+        let key = key.clone();
+        tokio::spawn(async move {
+            let loaded_before = {
+                adapter
+                    .inner
+                    .interaction_hints_cache
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .contains_key(&key.thread_id)
+            };
+            adapter.ensure_interaction_hints(&key).await;
+            let loaded_after = {
+                adapter
+                    .inner
+                    .interaction_hints_cache
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .contains_key(&key.thread_id)
+            };
+            // 装载确实带来了新事实（此前未装载）→ 重观察重发布；失败/无存储
+            // 不发布（未装载保持如实 Unknown/Loading）。
+            // A2/M2：走内容版本协议发布（publish_fresh_projection）——不经
+            // pause-dedup 入口（暂停位不变时不得吞掉 hints 已变化的投影）。
+            if !loaded_before && loaded_after {
+                let projection = adapter.projection(&key).await;
+                adapter.publish_fresh_projection(&key, projection).await;
+            }
+            adapter
+                .inner
+                .interaction_hint_kicks
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&key.thread_id);
+        });
+    }
+
     /// T03：装载某线程的持久提示（**每线程一次**；DB 读取在镜像锁外）。
     ///
     /// 读失败 / 无存储 → 不缓存（保持 Unknown 的保守语义；不合成"已答"）。
+    /// 终审 Major 4：**writer 就绪**标记——与展示缓存（hints）就绪分开跟踪。
+    /// `load` 成功只代表展示缓存可用；`begin_epoch()` 暂态失败时不得被视为
+    /// 「该线程已初始化」，否则 cache 命中会永久跳过初始化、capture 恒退出。
+    fn hint_writer_ready(&self) -> bool {
+        self.inner
+            .hint_observations
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
+    }
+
     pub async fn ensure_interaction_hints(&self, key: &ThreadKey) {
+        // A2/M2 + 终审 Major 4：缓存与 writer 就绪**分别**判定——展示缓存已装载
+        // 但 writer 未就绪（epoch 初始化失败）时仍要继续初始化步骤。
+        {
+            let cache = self
+                .inner
+                .interaction_hints_cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if cache.contains_key(&key.thread_id) && self.hint_writer_ready() {
+                return;
+            }
+        }
         let _io = self.inner.interaction_hint_io.lock().await;
         if !self.load_interaction_hints_locked(key).await {
             return;
@@ -3196,11 +3923,56 @@ impl DesktopIpcAdapter {
             .into_iter()
             .map(super::async_question::InteractionHint::from_stored)
             .collect();
-        self.inner
-            .interaction_hints_cache
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(key.thread_id.clone(), Arc::new(hints));
+        {
+            // 终审 Blocker 4：**统一锁序 hint_observations → interaction_hints_cache**
+            //（与 capture 的登记路径一致）。旧实现先取 cache 再取 observations，
+            // 与持镜像锁的观察登记并发时构成循环等待。观察态快照在取 cache 之前
+            // 一次性取得（快照语义不变：合并仍以观察态优先）。
+            let observed_facts: Vec<super::async_question::InteractionHint> = {
+                let observations = self
+                    .inner
+                    .hint_observations
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                observations
+                    .as_ref()
+                    .map(|observations| observations.state.latest_facts(&key.thread_id))
+                    .unwrap_or_default()
+            };
+            let mut cache = self
+                .inner
+                .interaction_hints_cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            // A2.2/T8（r5）：装载晚于新观察时**合并而非整表替换**。优先级：
+            // 观察状态已登记的事实（capture 经 HintState::observe 注册，cache
+            // 逐出后仍在）> cache 既有行（慢 kick 与同步装载竞态）> 迟到的
+            // 持久行；仅补充更高层缺失的身份。装载失败已在上方早退，不假清。
+            let existing = cache.get(&key.thread_id).cloned();
+            let mut merged: Vec<super::async_question::InteractionHint> =
+                Vec::with_capacity(observed_facts.len());
+            let same_identity =
+                |a: &super::async_question::InteractionHint,
+                 b: &super::async_question::InteractionHint| {
+                    a.source_turn_id == b.source_turn_id
+                        && a.source_item_id == b.source_item_id
+                        && a.question_index == b.question_index
+                };
+            for hint in observed_facts
+                .into_iter()
+                .chain(existing.iter().flat_map(|rows| rows.iter().cloned()))
+            {
+                if !merged.iter().any(|kept| same_identity(kept, &hint)) {
+                    merged.push(hint);
+                }
+            }
+            for hint in hints {
+                if !merged.iter().any(|kept| same_identity(kept, &hint)) {
+                    merged.push(hint);
+                }
+            }
+            cache.insert(key.thread_id.clone(), Arc::new(merged));
+        }
         true
     }
 
@@ -3234,7 +4006,10 @@ impl DesktopIpcAdapter {
             return None;
         }
         // 此检查只是淘汰已知失效的侧载；提交仍由原 permit 的 gate 保护。
-        if permit.lock().is_err() {
+        // 终审 Blocker 2：改用**非阻塞**检查——观察登记在镜像锁内执行，阻塞地
+        // 取提交 gate 会让转发器等在飞 COMMIT 上（gate 后仍由 write_batch 的
+        // permit.lock() 做权威复核）。
+        if permit.is_fenced_nonblocking() {
             return None;
         }
         if !self
@@ -3297,14 +4072,16 @@ impl DesktopIpcAdapter {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let observations = observations.as_mut()?;
+        // A3.2/T9：有界观察——token 不携带 dirty 集；本次登记的事实就是上方
+        // 构造的 hints（合并与续批都从 entries 有界派生）。
         let observation = observations
             .state
-            .observe_scoped(
+            .observe_scoped_bounded(
                 key.clone(),
                 owner.clone(),
                 mirror.build_generation(),
                 scope,
-                hints,
+                hints.clone(),
             )
             .ok()?;
         observations.scopes.insert(key.clone(), (owner, scope));
@@ -3315,8 +4092,7 @@ impl DesktopIpcAdapter {
             .unwrap_or_else(|e| e.into_inner());
         if let Some(existing) = cache.get_mut(&key.thread_id) {
             let mut merged = (**existing).clone();
-            for versioned in &observation.hints {
-                let hint = &versioned.hint;
+            for hint in &hints {
                 if let Some(slot) = merged.iter_mut().find(|h| {
                     h.source_turn_id == hint.source_turn_id
                         && h.source_item_id == hint.source_item_id
@@ -3336,66 +4112,471 @@ impl DesktopIpcAdapter {
         })
     }
 
-    async fn persist_authorized_hints(&self, authorized: AuthorizedHintObservation) {
-        let _io = self.inner.interaction_hint_io.lock().await;
-        let mut sent = authorized.observation.clone();
-        {
-            let observations = self
+    /// A4/T10：临界区外撤销排空——gate 等待放阻塞池（forwarder/调用方不 await
+    /// 完成）；旧 authority 的迟到撤销恒安全：换代 bind 已建新
+    /// HintLeaseAuthority 实例，旧实例 fence 不触碰新 lease。
+    fn spawn_authority_revocations(
+        &self,
+        authorities: Vec<Arc<super::hint_commit::HintLeaseAuthority>>,
+    ) {
+        if authorities.is_empty() {
+            return;
+        }
+        tokio::spawn(async move {
+            for authority in authorities {
+                // gate 等待可能横跨在飞提交（T10 合同：撤销后台等待 gate）。
+                let _ = tokio::task::spawn_blocking(move || authority.revoke_owner()).await;
+            }
+        });
+    }
+
+    /// A3.1/T9：写任务入队（首个任务装配唯一 worker；调用方不等待提交）。
+    /// 同键以最新观察为准；L2 位置合同保留（写穿仍由正常发布分支发起）。
+    /// A6 终审 B3：worker 只持 `AdapterInner` **弱引用**——外部引用全部释放后
+    /// 任务退出（不构成 Arc 环；JoinHandle 存 Inner 供停机有界等待）。
+    fn enqueue_persist_authorized_hints(&self, authorized: AuthorizedHintObservation) {
+        // 终审 Blocker 2：准入判定与通道装配在**同一把锁**内完成——消除
+        // 「锁外检查 open → 停机取走 sender → 本调用重建通道」的窗口。
+        let sender = {
+            let mut slot = self
                 .inner
+                .hint_write_jobs
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if !self
+                .inner
+                .hint_write_open
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                return;
+            }
+            match slot.as_ref() {
+                Some(sender) => sender.clone(),
+                None => {
+                    // 仅当槽位无**存活** worker 时装配；已结束的句柄由本处清理。
+                    {
+                        let mut worker = self
+                            .inner
+                            .hint_write_worker
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
+                        if worker.as_ref().is_some_and(|h| h.is_finished()) {
+                            *worker = None;
+                        }
+                        if worker.is_some() {
+                            // 旧 worker 仍存活（停机等待超时）：本运行不接管。
+                            return;
+                        }
+                    }
+                    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+                    let weak_inner = Arc::downgrade(&self.inner);
+                    let open = self.inner.hint_write_open.clone();
+                    let worker_slot = self.inner.hint_write_worker.clone();
+                    let handle =
+                        tokio::spawn(Self::run_hint_write_worker(weak_inner, open, receiver));
+                    let cleanup_handle = handle.abort_handle();
+                    *worker_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
+                    let cleanup = worker_slot.clone();
+                    tokio::spawn(async move {
+                        while !cleanup_handle.is_finished() {
+                            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                        }
+                        // 终审 Blocker 2：句柄只由**对应任务**清理（槽内仍是该句柄时）。
+                        // 句柄只由对应任务清理：本任务已结束，且槽内句柄也已结束
+                        //（若槽内已是新运行的句柄，则不动它）。
+                        let mut slot = cleanup.lock().unwrap_or_else(|e| e.into_inner());
+                        if slot.as_ref().is_some_and(|h| h.is_finished()) {
+                            *slot = None;
+                        }
+                    });
+                    *slot = Some(sender.clone());
+                    sender
+                }
+            }
+        };
+        let _ = sender.send(authorized);
+    }
+
+    fn record_hint_write_supervision(
+        inner: &AdapterInner,
+        thread_id: &str,
+        class: super::hint_writer::WriteFailureClass,
+        detail: String,
+        attempt: u32,
+        next_retry_at_ms: Option<u64>,
+        batch_size: usize,
+    ) {
+        log::warn!(
+            "codex hints 写失败监督面：thread={thread_id} class={class:?} attempt={attempt}              next_retry_at_ms={next_retry_at_ms:?} batch={batch_size} detail={detail}"
+        );
+        *inner
+            .hint_write_supervision
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(HintWriteSupervision {
+            thread_id: thread_id.to_owned(),
+            class,
+            detail,
+            at_ms: chrono::Utc::now().timestamp_millis(),
+            attempt,
+            next_retry_at_ms,
+            batch_size,
+        });
+    }
+
+    /// A3.1 前的直接落库路径（仅测试）：pr202/过渡面用例需要同步完成语义；
+    /// 生产路径一律走 [`Self::enqueue_persist_authorized_hints`] 的单 worker。
+    #[cfg(test)]
+    async fn persist_authorized_hints(&self, authorized: AuthorizedHintObservation) {
+        let _ = Self::execute_hint_write(&self.inner, authorized).await;
+    }
+
+    /// A3.1/T9：单写 worker 主循环——每活跃适配运行唯一；Scheduler 驱动
+    /// 有界批次/公平轮转；真实失败分类到达监督面；全程零 Desktop mutation、
+    /// 零 B2 补读（只消费观察登记的 dirty 项）。
+    ///
+    /// A6 终审 B1/M1/B3 修复：
+    /// * job **保留至线程排空**——续批（批次写满）与暂态重试复用同一观察
+    ///   （批次内容由 execute_hint_write 每轮从 entries 现派生）；
+    /// * 满载 `DeferredStale` 的键进恢复队列，槽位腾出后自动重新准入；
+    /// * 暂态失败**出队计时**（retrying 表 + 定时唤醒），退避期间不忙转、
+    ///   不饿死其他线程；
+    /// * 弱引用生命周期：外部引用全部释放 → 升级失败 → 任务退出。
+    async fn run_hint_write_worker(
+        weak_inner: std::sync::Weak<AdapterInner>,
+        open: Arc<std::sync::atomic::AtomicBool>,
+        mut receiver: tokio::sync::mpsc::UnboundedReceiver<AuthorizedHintObservation>,
+    ) {
+        use super::hint_writer::{Enqueue, Scheduler, WriteFailureClass};
+        const HINT_WRITE_WORKER_THREADS: usize = 128;
+        const RETRY_WAKE_SLICE_MS: u64 = 200;
+        /// 终审 M1：每轮最多消费的入队条数（有界工作）。
+        const ENTRY_DRAIN_LIMIT: usize = 64;
+        let mut scheduler = Scheduler::new(HINT_WRITE_WORKER_THREADS);
+        // 同键最新观察（DeferredStale 也保留——恢复准入后即可写）。
+        let mut jobs: HashMap<ThreadKey, AuthorizedHintObservation> = HashMap::new();
+        let mut deferred: std::collections::VecDeque<ThreadKey> = Default::default();
+        // 暂态失败的出队退避（键 → 到期毫秒）；到期由主循环恢复准入。
+        let mut retrying: HashMap<ThreadKey, u64> = HashMap::new();
+        // 入队（含满载恢复判定）。
+        macro_rules! schedule_key {
+            ($scheduler:expr, $deferred:expr, $key:expr) => {
+                match $scheduler.enqueue($key.clone()) {
+                    Enqueue::DeferredStale => $deferred.push_back($key),
+                    _ => {}
+                }
+            };
+        }
+        // 槽位腾出后的递延恢复（FIFO；仍满则止）。
+        macro_rules! recover_deferred {
+            ($scheduler:expr, $deferred:expr) => {
+                while let Some(key) = $deferred.front() {
+                    match $scheduler.enqueue(key.clone()) {
+                        Enqueue::DeferredStale => break,
+                        _ => {
+                            $deferred.pop_front();
+                        }
+                    }
+                }
+            };
+        }
+        loop {
+            // 0) 准入关闭/外部引用全部释放 → 任务退出（终审 Blocker 3）。
+            //    停机时 shutdown() 置 open=false 并 drop sender 侧唤醒，空闲 recv
+            //    因此返回；Weak 升级失败（外部引用全释放）同样退出。
+            if !open.load(std::sync::atomic::Ordering::Acquire) {
+                break;
+            }
+            let Some(inner) = weak_inner.upgrade() else {
+                break;
+            };
+            // 1) 到期的退避键恢复准入（FIFO 由 scheduler 队列承接）。
+            let now = worker_now_ms();
+            let due_keys: Vec<ThreadKey> = retrying
+                .iter()
+                .filter(|(_, due)| **due <= now)
+                .map(|(key, _)| key.clone())
+                .collect();
+            for key in due_keys {
+                retrying.remove(&key);
+                schedule_key!(scheduler, deferred, key);
+            }
+            // 2) 非阻塞排空入队口（**每轮有界**——持续输入不得无限推迟落库：
+            //    终审 M1）。同键以最新观察为准（满队列保最新否定）。
+            let mut drained = 0usize;
+            while drained < ENTRY_DRAIN_LIMIT {
+                let Ok(job) = receiver.try_recv() else {
+                    break;
+                };
+                drained += 1;
+                let key = job.observation.key.clone();
+                jobs.insert(key.clone(), job);
+                schedule_key!(scheduler, deferred, key);
+            }
+            // 3) 调度出队；无待办则等待（有退避在飞 → 定时唤醒；否则阻塞）。
+            let Some(key) = scheduler.next() else {
+                // 终审 Blocker 3：等待输入前**释放强引用**——否则空闲 worker
+                // 通过 Inner 的 sender 把自己的通道钉活，外部释放后永不退出。
+                // 终审 M1：若退避在取样后到期，下一轮循环会重新走到期恢复分支，
+                // 因此这里的等待上界取 RETRY_WAKE_SLICE_MS（不无限阻塞）。
+                drop(inner);
+                let now = worker_now_ms();
+                // 最近一次到期（早退避先恢复）；未到期 → 定时唤醒等新任务，
+                // 无退避在飞 → 阻塞等待（A6 终审 B1：退避不忙转、不饿死）。
+                let due = retrying.values().copied().min();
+                if let Some(due) = due.filter(|&due| due > now) {
+                    let wait = (due - now).clamp(1, RETRY_WAKE_SLICE_MS);
+                    if let Ok(Some(job)) = tokio::time::timeout(
+                        std::time::Duration::from_millis(wait),
+                        receiver.recv(),
+                    )
+                    .await
+                    {
+                        let key = job.observation.key.clone();
+                        jobs.insert(key.clone(), job);
+                        schedule_key!(scheduler, deferred, key);
+                    }
+                } else {
+                    // 终审 M1：即使暂无待办，也按切片醒来重扫（retrying 可能在
+                    // 取样后到期；空转成本为每片一次比较）。
+                    match tokio::time::timeout(
+                        std::time::Duration::from_millis(RETRY_WAKE_SLICE_MS),
+                        receiver.recv(),
+                    )
+                    .await
+                    {
+                        Ok(Some(job)) => {
+                            let key = job.observation.key.clone();
+                            jobs.insert(key.clone(), job);
+                            schedule_key!(scheduler, deferred, key);
+                        }
+                        Ok(None) => break,
+                        Err(_) => {}
+                    }
+                }
+                continue;
+            };
+            // 4) 真实落库（job 保留在 map：批次内容每轮现派生）。
+            let Some(job) = jobs.get(&key) else {
+                scheduler.complete(&key, false);
+                jobs.remove(&key);
+                recover_deferred!(scheduler, deferred);
+                continue;
+            };
+            let execution = Self::execute_hint_write(&inner, job.clone()).await;
+            match execution {
+                Ok(more) => {
+                    scheduler.clear_retry(&key);
+                    // 终审 Blocker 3：more = 本线程仍有续页 → 重排（still_dirty），
+                    // 其他线程先得到服务；排空则丢弃观察。
+                    scheduler.complete(&key, more);
+                    if !more {
+                        jobs.remove(&key);
+                    }
+                }
+                Err((class, detail)) => {
+                    // 终审 Minor 2：监督记录带 attempt / 下次退避到期 / 批次规模；
+                    // 暂态的退避到期在此登记一次（下方分支复用，不重复计数）。
+                    let attempt = if scheduler.retry_due(&key).is_some() {
+                        2u32
+                    } else {
+                        1
+                    };
+                    let next_due = if matches!(class, WriteFailureClass::Temporary) {
+                        Some(scheduler.note_failure(&key, worker_now_ms()))
+                    } else {
+                        None
+                    };
+                    Self::record_hint_write_supervision(
+                        &inner,
+                        &key.thread_id,
+                        class,
+                        detail,
+                        attempt,
+                        next_due,
+                        0,
+                    );
+                    match class {
+                        WriteFailureClass::Temporary => {
+                            // 暂态：退避到期已在监督记录时登记一次（next_due），
+                            // 此处只出队重排（不重复计数）。
+                            scheduler.complete(&key, false);
+                            if let Some(due) = next_due {
+                                retrying.insert(key, due);
+                            }
+                        }
+                        // 终态/栅栏：保持 dirty（不写成功报文），条件改变（新
+                        // 观察）后由新任务恢复；不在退避阶梯上空转。
+                        WriteFailureClass::Terminal | WriteFailureClass::Fenced => {
+                            scheduler.clear_retry(&key);
+                            scheduler.complete(&key, false);
+                            jobs.remove(&key);
+                        }
+                    }
+                }
+            }
+            // 5) 槽位腾出后的递延恢复。
+            recover_deferred!(scheduler, deferred);
+        }
+    }
+
+    /// A3.1/T9：执行真实落库（io 锁串行）。**页循环**：按 `prepare_page_bounded`
+    /// 的游标与页状态推进（256 键/4 MiB 每批；每批一次真实 `write_batch` 事务 +
+    /// `apply_report`），直到 Complete / 无可写页——257+ 键、稀疏 dirty、超大键
+    /// （页空 → 有后续键则跳过推进，无后续键即止）都在本次服务内收敛。
+    /// 观察已被新观察接管/无待写事实 = `Ok(())`（正常生命周期，不记监督）；
+    /// 失败返回分类（durable 不动，后续按类恢复）。
+    /// A6 终审 B1：不再丢弃游标/状态——旧实现的「固定从头扫描」使首 256 项
+    /// 干净或首项超大时的后续 dirty 永远写不到。
+    async fn execute_hint_write(
+        inner: &AdapterInner,
+        authorized: AuthorizedHintObservation,
+    ) -> Result<bool, (super::hint_writer::WriteFailureClass, String)> {
+        use super::async_question::HintStoreError;
+        use super::hint_state::PageStatus;
+        use super::hint_writer::WriteFailureClass;
+        let _io = inner.interaction_hint_io.lock().await;
+        let sent = authorized.observation.clone();
+        {
+            let observations = inner
                 .hint_observations
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             let Some(observations) = observations.as_ref() else {
-                return;
+                return Ok(false);
             };
             if observations.scopes.get(&sent.key) != Some(&(sent.owner.clone(), authorized.scope)) {
-                return;
+                return Ok(false);
             }
-            sent.hints = observations
-                .state
-                .prepare_batch_scoped(&sent, authorized.scope);
         }
-        if sent.hints.is_empty() {
-            return;
-        }
-        let store = self
-            .inner
+        let store = inner
             .interaction_hint_store
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
         let Some(store) = store else {
-            return;
+            return Err((WriteFailureClass::Terminal, "hint store missing".into()));
         };
-        let batch = sent.hints.clone();
-        let epoch = batch[0].version.epoch;
-        let permit = authorized.permit.clone();
-        let result = tokio::task::spawn_blocking(move || {
-            store.write_batch(
-                epoch,
-                &batch,
-                chrono::Utc::now().timestamp_millis(),
-                &permit,
-            )
-        })
-        .await;
-        let Ok(Ok(report)) = result else {
-            return;
-        };
-        let mut observations = self
-            .inner
-            .hint_observations
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let Some(observations) = observations.as_mut() else {
-            return;
-        };
-        if observations.scopes.get(&sent.key) != Some(&(sent.owner.clone(), authorized.scope)) {
-            return;
+        let mut cursor = None;
+        // 终审 Blocker 4：本次服务内的超大键跳过集（不进游标）。
+        let mut skip = std::collections::HashSet::new();
+        loop {
+            let (page, next, status) = {
+                let observations = inner
+                    .hint_observations
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let Some(observations) = observations.as_ref() else {
+                    return Ok(false);
+                };
+                observations.state.prepare_page_bounded_skipping(
+                    &sent,
+                    Some(authorized.scope),
+                    cursor.as_ref(),
+                    super::hint_state::HINT_BATCH_KEY_LIMIT,
+                    super::hint_state::HINT_BATCH_BYTE_BUDGET,
+                    &mut skip,
+                )
+            };
+            if page.hints.is_empty() {
+                // 终审 Blocker 1：**凡是带有效游标的续页都必须推进**——空 `More`
+                // 页（前 256 键全干净、其后仍有 dirty）与 `Oversized`（超大键已
+                // 越过）都是「本页无可写、但扫描未到底」；只有 Complete/Stale/
+                // InvalidBudget 或游标缺失才结束。旧实现只放行 Oversized → 空
+                // More 页会丢弃其后的全部 dirty 项。
+                match (status, next) {
+                    // 空页但带游标：继续（空 More / Oversized 越过）。
+                    (PageStatus::More, Some(next)) => cursor = Some(next),
+                    (PageStatus::Oversized, next) => {
+                        // 终审 Blocker 4：超大键已进 skip（游标不含它）；记可见失败，
+                        // 有游标则继续、无游标（起点即超大键）则结束本次服务。
+                        Self::record_hint_write_supervision(
+                            inner,
+                            &sent.key.thread_id,
+                            super::hint_writer::WriteFailureClass::Terminal,
+                            "hint entry exceeds batch byte budget; skipped".into(),
+                            1,
+                            None,
+                            0,
+                        );
+                        match next {
+                            Some(_next) => return Ok(true),
+                            None => return Ok(false),
+                        }
+                    }
+                    _ => break,
+                }
+                continue;
+            }
+            // A6 终审 B1 修复：apply_report_scoped 需要与报文**同源**的 observation
+            //（token 有界化后 sent.hints 为空；本页行必须挂进批内 observation，
+            // 否则 Applied 无人认领、dirty 不清 → 后续观察重复落库）。
+            let page_observation = super::hint_state::HintObservation {
+                key: sent.key.clone(),
+                owner: sent.owner.clone(),
+                mirror_generation: sent.mirror_generation,
+                hints: page.hints.clone(),
+            };
+            let batch = page.hints.clone();
+            let epoch = batch[0].version.epoch;
+            let permit = authorized.permit.clone();
+            let store_for_write = store.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                store_for_write.write_batch(
+                    epoch,
+                    &batch,
+                    chrono::Utc::now().timestamp_millis(),
+                    &permit,
+                )
+            })
+            .await;
+            let report = match result {
+                Ok(Ok(report)) => report,
+                Ok(Err(error)) => {
+                    let class = match &error {
+                        HintStoreError::Fenced
+                        | HintStoreError::OwnerFenced
+                        | HintStoreError::ScopeFenced => WriteFailureClass::Fenced,
+                        HintStoreError::VersionCollision
+                        | HintStoreError::VersionExhausted
+                        | HintStoreError::Storage => WriteFailureClass::Temporary,
+                        HintStoreError::InvalidData => WriteFailureClass::Terminal,
+                    };
+                    return Err((class, format!("{error:?}")));
+                }
+                Err(join_error) => {
+                    return Err((
+                        WriteFailureClass::Temporary,
+                        format!("hint write task join failed: {join_error}"),
+                    ));
+                }
+            };
+            {
+                let mut observations = inner
+                    .hint_observations
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let Some(observations) = observations.as_mut() else {
+                    return Ok(false);
+                };
+                if observations.scopes.get(&sent.key)
+                    != Some(&(sent.owner.clone(), authorized.scope))
+                {
+                    return Ok(false);
+                }
+                observations.state.apply_report_scoped(
+                    &page_observation,
+                    authorized.scope,
+                    &report,
+                );
+            }
+            // 终审 Blocker 3：**每页后让位**——More 表示本线程仍有续批，返回
+            // true 由 worker 重排到队尾（其他线程因此获得公平轮转）。
+            match status {
+                PageStatus::More => return Ok(true),
+                _ => return Ok(false),
+            }
         }
-        observations
-            .state
-            .apply_report_scoped(&sent, authorized.scope, &report);
+        Ok(false)
     }
 
     /// R18：把投影里的题目事实写穿到持久提示（**仅变化时落库**；无存储/无题即跳过）。
@@ -3955,17 +5136,216 @@ impl DesktopIpcAdapter {
 
     /// 该 Thread 是否处于队列暂停（EXISTS 任意行；读失败按 true 保守——与
     /// router 的 `queue_paused_or_fallback` 同口径；未装配事实源 = false）。
+    /// A2.2/T8：队列暂停**内存事实**（投影/盖章消费面）。镜像临界区内一律读本
+    /// 方法——事实源（可能读 DB）只在镜像锁外的刷新点同步调用（`projection`
+    /// 入口、`fresh_projection`/`publish_projection` 入口、republish 变化点，
+    /// 与既有 T02「锁外读」同形）；装载前如实给缺省 `false`。权威写门另行直读
+    /// 事实源（[`Self::queue_paused_authoritative`]）。
+    /// 暂停事实（投影/展示面）。终审 Blocker 1：事实改后台装载后，**未装载必须
+    /// 保守视为「暂停」**——否则 kick 装载前的窗口会把暂停队列当未暂停放开
+    ///（b06/f08p_r06 的「暂停时默认不可提交」合同）。装载值为 false 才放开。
     fn queue_paused_of(&self, key: &ThreadKey) -> bool {
+        self.inner
+            .pause_facts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key.thread_id)
+            .and_then(|f| f.paused)
+            .unwrap_or(true)
+    }
+
+    /// A2.2/T8：**权威写门**消费面——直读事实源（语义与既有 T02 锁外读一致；
+    /// mutation 的最终资格复核不用可能滞后的展示事实）。
+    fn queue_paused_authoritative(&self, key: &ThreadKey) -> bool {
         let src = self
             .inner
             .queue_pause_source
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
-        match src {
-            Some(f) => f(&key.thread_id),
-            None => false,
+        src.map(|f| f(&key.thread_id)).unwrap_or(false)
+    }
+
+    /// A2.2/T8：变化点同步刷新（republish 入口）——事实源单次调用 + 版本化安装。
+    /// 返回值 = 本次是否发生事实变化（供变化点决定是否重发布）。
+    /// A2/M4：读取世代在取值前登记（按 thread_id），迟到读不覆盖新读。
+    /// 终审 Blocker 1：**后台**刷新暂停事实（状态帧/GET/重发布路径用）——
+    /// 事实源可能读共享 DeviceStore，绝不能在广播路径同步调用。
+    /// 装载/变化后由变化点重发布（暂停位变化 → 发布）。
+    fn kick_pause_fact(&self, key: &ThreadKey) {
+        {
+            let mut kicks = self
+                .inner
+                .pause_fact_kick
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if !kicks.insert(key.thread_id.clone()) {
+                return;
+            }
         }
+        let adapter = self.clone();
+        let key = key.clone();
+        tauri::async_runtime::spawn(async move {
+            // 终审 Major 2：**先领读世代再读取**（旧实现读完后才领号，导致
+            // 更晚开始的读可能拿到更小的号，晚到覆写新值）。
+            let generation = {
+                let mut reads = adapter
+                    .inner
+                    .pause_fact_reads
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let entry = reads.entry(key.thread_id.clone()).or_insert(0);
+                *entry += 1;
+                *entry
+            };
+            let read = {
+                let adapter_read = adapter.clone();
+                let key_read = key.clone();
+                tokio::task::spawn_blocking(move || {
+                    adapter_read.queue_paused_source_read(&key_read)
+                })
+                .await
+                .ok()
+                .flatten()
+            };
+            if let Some(value) = read {
+                let changed = adapter.install_pause_fact(&key, value, generation);
+                if changed {
+                    adapter.republish_thread_projection(&key).await;
+                }
+            }
+            adapter
+                .inner
+                .pause_fact_kick
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&key.thread_id);
+        });
+    }
+
+    /// 终审 Blocker 1：**后台**刷新适配事实（同上；变化 → 重发布）。
+    fn kick_adapt_fact(&self) {
+        if self
+            .inner
+            .adapt_fact_kick
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            return;
+        }
+        let generation = {
+            let mut reads = self
+                .inner
+                .adapt_fact_reads
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            *reads += 1;
+            *reads
+        };
+        let adapter = self.clone();
+        tauri::async_runtime::spawn(async move {
+            let read = {
+                let adapter_read = adapter.clone();
+                tokio::task::spawn_blocking(move || adapter_read.auto_adapt_gate_read())
+                    .await
+                    .ok()
+                    .flatten()
+            };
+            if let Some(value) = read {
+                let changed = {
+                    // 终审 Major 2：安装前核对读世代（晚到结果不覆盖更新的读）。
+                    let reads = adapter
+                        .inner
+                        .adapt_fact_reads
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    if *reads != generation {
+                        drop(reads);
+                        adapter
+                            .inner
+                            .adapt_fact_kick
+                            .store(false, std::sync::atomic::Ordering::Release);
+                        return;
+                    }
+                    drop(reads);
+                    let mut fact = adapter
+                        .inner
+                        .adapt_fact
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    let changed = fact.1 != Some(value);
+                    if changed {
+                        fact.0 = fact.0.wrapping_add(1);
+                        fact.1 = Some(value);
+                    }
+                    changed
+                };
+                if changed {
+                    adapter.republish_all_projections().await;
+                }
+            }
+            adapter
+                .inner
+                .adapt_fact_kick
+                .store(false, std::sync::atomic::Ordering::Release);
+        });
+    }
+
+    fn refresh_pause_fact(&self, key: &ThreadKey) -> bool {
+        let generation = {
+            let mut reads = self
+                .inner
+                .pause_fact_reads
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let entry = reads.entry(key.thread_id.clone()).or_insert(0);
+            *entry += 1;
+            *entry
+        };
+        let Some(value) = self.queue_paused_source_read(key) else {
+            return false;
+        };
+        self.install_pause_fact(key, value, generation)
+    }
+
+    fn queue_paused_source_read(&self, key: &ThreadKey) -> Option<bool> {
+        let src = self
+            .inner
+            .queue_pause_source
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        src.map(|f| f(&key.thread_id))
+    }
+
+    fn install_pause_fact(&self, key: &ThreadKey, paused: bool, generation: u64) -> bool {
+        // 终审 M2：世代核对与安装**同一临界区**——先取 facts 锁，再在锁内比较
+        // 读取世代；否则「核对通过 → 释放 reads → 新读完成安装 → 本读覆写」的
+        // 窗口仍会让旧结果覆盖新值（锁序固定 reads → facts，与其他站点一致）。
+        let mut facts = self
+            .inner
+            .pause_facts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        {
+            let reads = self
+                .inner
+                .pause_fact_reads
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if reads.get(&key.thread_id).copied().unwrap_or(0) != generation {
+                return false;
+            }
+        }
+        let fact = facts.entry(key.thread_id.clone()).or_insert(PauseFact {
+            version: 0,
+            paused: None,
+        });
+        let changed = fact.paused != Some(paused);
+        if changed {
+            fact.version = fact.version.wrapping_add(1);
+            fact.paused = Some(paused);
+        }
+        changed
     }
 
     /// 复审 R-T4：**单线程**投影重发布（暂停变化点触发：前置落行/撤回/resume/
@@ -3983,12 +5363,17 @@ impl DesktopIpcAdapter {
     ///
     /// 复审 round 7（Q1）：`projection()` 盖章的 `queue_paused` 只是**先前观察**，
     /// 不再参与去重判定——事实以 grant 临界区内的重读值为准（见
-    /// [`Self::pause_publish_grant`]），广播内容同样是重核值。同值恢复（观察后、
+    /// [`Self::pause_publish_grant_display`]），广播内容同样是重核值。同值恢复（观察后、
     /// grant 前真实 resume 清行）由此正确收敛为静默，旧观察无法复活成 stale true。
     pub async fn republish_thread_projection(&self, key: &ThreadKey) {
         if !self.has_mirror(key).await {
             return;
         }
+        // 终审 Blocker 1：变化点刷新暂停事实——**写者已提交后**调用本入口，
+        // 允许一次同步读（这是「落行→通知」链路唯一可接受的读点，且不在广播
+        // 临界区内）；广播/GET 路径一律走 kick（见 projection/publish_projection）。
+        self.refresh_pause_fact(key);
+        self.kick_adapt_fact();
         let p = self.projection(key).await;
         // 复审 round 4（V3）：同 `republish_all_projections`——观察被后续发布越过
         // 时重观察，暂停事实以重观察值为准做去重判定。
@@ -4013,7 +5398,7 @@ impl DesktopIpcAdapter {
         let mut p = p;
         let mut retries = 0u32;
         loop {
-            match self.pause_publish_grant(key, p.local_seq) {
+            match self.pause_publish_grant_display(key, p.local_seq, p.display_stamp.as_ref()) {
                 PausePublishGrant::Deduped => return,
                 PausePublishGrant::Granted(seq, paused) => {
                     // 复审 round 7（Q1）：广播内容 = grant 临界区内的重核值（不是
@@ -4063,7 +5448,19 @@ impl DesktopIpcAdapter {
     /// `republish_thread_projection`）、interrupt 撤回臂（`clear_queue_pause_
     /// owned` 同理）、settle（`queue_pause` 读毕语句即结束）各写点均在调用
     /// republish 之前完成并释放连接锁；`pause_published` 全库仅本方法使用。
+    ///
+    /// 仅测试调用（生产一律走 [`Self::pause_publish_grant_display`]）。
+    #[cfg(test)]
     fn pause_publish_grant(&self, key: &ThreadKey, observed: u64) -> PausePublishGrant {
+        self.pause_publish_grant_display(key, observed, None)
+    }
+
+    fn pause_publish_grant_display(
+        &self,
+        key: &ThreadKey,
+        observed: u64,
+        stamp: Option<&crate::services::codex_question_skip::display::DisplayObservationStamp>,
+    ) -> PausePublishGrant {
         let mut st = self
             .inner
             .pause_published
@@ -4075,7 +5472,14 @@ impl DesktopIpcAdapter {
         if st.get(key).is_some_and(|prev| *prev == paused) {
             return PausePublishGrant::Deduped;
         }
-        match self.reserve_publish_seq(observed) {
+        let reserved = match (self.inner.question_display.get(), stamp) {
+            (Some(display), Some(stamp)) => display
+                .with_publish_eligibility(stamp, || self.reserve_publish_seq(observed))
+                .ok()
+                .flatten(),
+            _ => self.reserve_publish_seq(observed),
+        };
+        match reserved {
             Some(seq) => {
                 st.insert(key.clone(), paused);
                 PausePublishGrant::Granted(seq, paused)
@@ -4246,7 +5650,12 @@ impl DesktopIpcAdapter {
             return false;
         };
         // 账本读取期间也可能重连；效果必须在身份守卫内提交。
-        self.with_current_probe_target(target, || {
+        self.with_current_probe_target_ref(target, |current| {
+            // A2.3：完整身份含解析键——解析键已被更新解析换走时，旧键的证据
+            // 不得授权当前目标（也不得写入 state_evidence）。
+            if current.key.as_deref().is_some_and(|k| k != probe_key) {
+                return false;
+            }
             // S1：命中判据 = **有成功证据**（`evidenced`：证据列或旧数据兼容的
             // state∈probed|verified）——「成功后失败」的行照样复用，不再重探
             //（设计 §3.2：成功证据不因后续超时/断链失效）。
@@ -4302,17 +5711,76 @@ impl DesktopIpcAdapter {
         Some(action())
     }
 
+    /// A2.3：同 [`Self::with_current_probe_target`]，闭包接收当前目标引用——
+    /// 回填效果需要核对解析键时使用（同一锁内读键，不得重入取锁）。
+    fn with_current_probe_target_ref<T>(
+        &self,
+        target: &ProbeTarget,
+        action: impl FnOnce(&ProbeTarget) -> T,
+    ) -> Option<T> {
+        let slot = self
+            .inner
+            .probe_target
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let current = slot.as_ref()?;
+        if current.epoch != target.epoch
+            || self.inner.epoch.load(Ordering::SeqCst) != target.epoch
+            || current.platform != target.platform
+            || current.build != target.build
+        {
+            return None;
+        }
+        Some(action(current))
+    }
+
+    /// probe 展示缓存额外绑定当前完整键；只用于短内存操作，不在闭包里读 DB。
+    fn with_current_probe_identity<T>(
+        &self,
+        target: &ProbeTarget,
+        expected_key: Option<&str>,
+        action: impl FnOnce() -> T,
+    ) -> Option<T> {
+        // 与 observed_probe_key 保持 override → target 顺序，再由调用方取 cache。
+        let override_key = self
+            .inner
+            .probe_key_override
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let slot = self
+            .inner
+            .probe_target
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let current = slot.as_ref()?;
+        if current.epoch != target.epoch
+            || self.inner.epoch.load(Ordering::SeqCst) != target.epoch
+            || current.platform != target.platform
+            || current.build != target.build
+            || override_key.as_deref().or(current.key.as_deref()) != expected_key
+        {
+            return None;
+        }
+        Some(action())
+    }
+
     fn apply_read_probe_result(
         &self,
         target: &ProbeTarget,
         key: &str,
         outcome: &ProbeOutcome,
     ) -> bool {
+        // A2.3：账本记录在目标**短锁外**执行——Store 等待不得拖住投影要用的
+        // probe_target 锁；落账前与效果回填前各核一次完整身份（记录期间可能
+        // 重连/换代），旧代结果不得落账本也不得解锁新连接。
+        if self.with_current_probe_target(target, || ()).is_none() {
+            return false;
+        }
+        if let Some(ledger) = self.probe_ledger() {
+            ledger.record(key, CAP_STATE, outcome, None);
+            self.invalidate_probe_status_cache();
+        }
         self.with_current_probe_target(target, || {
-            if let Some(ledger) = self.probe_ledger() {
-                ledger.record(key, CAP_STATE, outcome, None);
-                self.invalidate_probe_status_cache();
-            }
             if matches!(outcome, ProbeOutcome::Probed { .. }) {
                 self.set_state_capability(true);
             }
@@ -4352,11 +5820,15 @@ impl DesktopIpcAdapter {
     /// 测试里绝不 spawn 本机 CLI，故用固定键把归因钉死（断言也据此写死）。
     #[doc(hidden)]
     pub fn set_probe_key_override(&self, key: Option<String>) {
-        *self
+        let mut current = self
             .inner
             .probe_key_override
             .lock()
-            .unwrap_or_else(|e| e.into_inner()) = key;
+            .unwrap_or_else(|e| e.into_inner());
+        if *current != key {
+            *current = key;
+            self.invalidate_probe_status_cache();
+        }
     }
 
     /// 取（并缓存）该 build 的账本键：`cli_id` 可能要跑一次 `codex.exe --version`
@@ -4399,6 +5871,12 @@ impl DesktopIpcAdapter {
     where
         F: std::future::Future<Output = String>,
     {
+        // A2.3：先取换代号再计算——完成时仍「最新发出」才允许回填；同代挂起的
+        // 旧解析晚到不得替换已完成的更新解析（cli-b 已装后 cli-a 不得覆盖）。
+        let ticket = self
+            .inner
+            .probe_key_generation
+            .fetch_add(1, Ordering::SeqCst);
         let computed = compute.await;
         // 在 target 锁内核对连接代际与目标身份，拒绝同 build 重连的旧计算。
         let mut slot = self
@@ -4411,7 +5889,11 @@ impl DesktopIpcAdapter {
                 && self.inner.epoch.load(Ordering::SeqCst) == target.epoch
                 && cur.platform == target.platform
                 && cur.build == target.build
+                && self.inner.probe_key_generation.load(Ordering::SeqCst) == ticket + 1
             {
+                if cur.key.as_ref().is_some_and(|old| old != &computed) {
+                    self.invalidate_probe_status_cache();
+                }
                 cur.key = Some(computed.clone());
             }
         }
@@ -4475,9 +5957,19 @@ impl DesktopIpcAdapter {
     /// `republish_thread_projection` 内联循环处理）。
     async fn publish_fresh_projection(&self, key: &ThreadKey, p: ThreadProjection) -> bool {
         let mut p = p;
+        if self.inner.question_display.get().is_some() && p.display_stamp.is_none() {
+            p = self.projection(key).await;
+        }
         let mut retries = 0u32;
         loop {
-            if let Some(seq) = self.reserve_publish_seq(p.local_seq) {
+            let reserved = match (self.inner.question_display.get(), p.display_stamp.as_ref()) {
+                (Some(display), Some(stamp)) => display
+                    .with_publish_eligibility(stamp, || self.reserve_publish_seq(p.local_seq))
+                    .ok()
+                    .flatten(),
+                _ => self.reserve_publish_seq(p.local_seq),
+            };
+            if let Some(seq) = reserved {
                 self.publish_at_seq(p, seq).await;
                 return true;
             }
@@ -4625,10 +6117,23 @@ impl DesktopIpcAdapter {
             *guard = Some(conn.clone());
             (conn, epoch)
         };
+        #[cfg(test)]
+        {
+            let gate = self.inner.cleanup_gate.lock().unwrap().take();
+            if let Some((reached, release)) = gate {
+                let _ = reached.send(());
+                let _ = release.await;
+            }
+        }
         // #172/T9a：build 目标变了 → 探测只读事实的缓存作废（账本键换了）
         self.invalidate_probe_status_cache();
-        // 已释放 conn 锁：换代清理（短锁逐个）
-        self.inner.owners.lock().await.reset(epoch);
+        // 已释放 conn 锁：换代清理（短锁逐个）。A4/T10：撤销后台化。
+        let pending_revocations = {
+            let mut owners = self.inner.owners.lock().await;
+            owners.reset(epoch);
+            owners.take_pending_revocations()
+        };
+        self.spawn_authority_revocations(pending_revocations);
         // 每次连接均检查当前完整指纹；覆盖已知版本升级到未知版本。
         let adapter_for_schema = self.clone();
         tokio::spawn(async move {
@@ -4637,11 +6142,37 @@ impl DesktopIpcAdapter {
             // 旧代际迟到结果由安装守卫拒绝。
             adapter_for_schema.ensure_contract_evidence().await;
         });
-        // 旧镜像全部标 stale（重新 following 的 snapshot 复活）
+        // 旧镜像全部标 stale（重新 following 的 snapshot 复活）。
+        // A4/T10：迟到清理按**世系限定**——只 stale 不再属于当前注册表绑定的
+        // lease 的镜像；fresh current lease 的镜像（新 lease 先取 fresh revision
+        // 的场景）不得被迟到清理踩掉。
         {
             let mut mirrors = self.inner.mirrors.lock().await;
+            let owners = self.inner.owners.lock().await;
             for mirror in mirrors.values_mut() {
-                mirror.mark_stale();
+                let still_current = mirror.lease().is_some_and(|lease| owners.is_current(lease));
+                if !still_current {
+                    mirror.mark_stale();
+                }
+            }
+        }
+        // Source/live（合同 §6 行 2）：连接世系变化（owners.reset 已原子撤销全部
+        // proof）——换代后不保留可用 source，槽位同步打回 Unknown。
+        // A4/T10：同样按世系限定——当前 lease 仍在册的线程不踩 source。
+        if let Some(live) = self.question_skip_live() {
+            let retired_keys: Vec<ThreadKey> = {
+                let mirrors = self.inner.mirrors.lock().await;
+                let owners = self.inner.owners.lock().await;
+                mirrors
+                    .keys()
+                    .filter(|key| owners.current(key).is_none())
+                    .cloned()
+                    .collect()
+            };
+            for key in retired_keys {
+                if let Ok(update) = live.begin_source_change(&key) {
+                    let _ = live.finish_source_change(update, Err(LiveRefusal::OwnerLost));
+                }
             }
         }
         // 事件转发任务单飞（恢复期间由恢复任务在 follow 前自行就位，不在此 spawn）
@@ -4726,7 +6257,14 @@ impl DesktopIpcAdapter {
     ///
     /// #172/T9a：探测只读事实在镜像锁**之外**再盖（读账本/单飞器，不得持镜像锁）。
     async fn fresh_projection(&self, key: &ThreadKey) -> Option<ThreadProjection> {
-        self.ensure_interaction_hints(key).await;
+        self.ensure_question_display(key).await;
+        // A2.2/T8：冷载后台触发——首快照不再等 hints 装载（未装载如实呈现，
+        // 装载完成后重观察重发布）。首帧帧路径（handle_state_changed）保留
+        // 同步 ensure 的 F1.06 合同。
+        self.kick_interaction_hints_background(key);
+        // 终审 Blocker 1：后台刷新（同上）。
+        self.kick_pause_fact(key);
+        self.kick_adapt_fact();
         // T3 红测缝：旧代码 caps 锁外先读后、镜像锁前的窗口（生产恒 None 直通）。
         // 修复后 caps 在临界区内读取，本缝退化为「先跑窗口动作再取快照」的无害定序。
         self.run_fresh_snapshot_gate();
@@ -4761,11 +6299,13 @@ impl DesktopIpcAdapter {
             Some(_) => {
                 let (p, hint) = p.take().expect("just checked");
                 if let Some(hint) = hint {
-                    self.persist_authorized_hints(hint).await;
+                    // A3.1/T9：授权侧载写穿入队单 worker（A2.2/T8 起即离开发布
+                    // 线程；durable 在 worker 内有界批次/退避收敛）。
+                    self.enqueue_persist_authorized_hints(hint);
                 }
                 // 复审 R-T4：快路径同样盖队列暂停事实（与 projection() 同源）
                 let p = self.stamp_queue_pause(key, p);
-                Some(self.stamp_probe_status(p).await)
+                Some(self.stamp_probe_status(p))
             }
             None => None,
         }
@@ -4842,7 +6382,12 @@ impl DesktopIpcAdapter {
         }
         let lease = {
             let mut owners = self.inner.owners.lock().await;
-            bind_lease(&mut owners, key, owner_id, conn.epoch())
+            let lease = bind_lease(&mut owners, key, owner_id, conn.epoch());
+            // A4/T10：bind 的换代撤销在临界区外后台执行。
+            let pending = owners.take_pending_revocations();
+            drop(owners);
+            self.spawn_authority_revocations(pending);
+            lease
         };
         // 新 follow（owner 换代）：load-complete-history 每 follow 至多一次（R1）
         self.inner.history_hydrations.lock().await.remove(key);
@@ -4858,7 +6403,12 @@ impl DesktopIpcAdapter {
         // 第四轮复审 B3：declare **之前**最后核验——bind/declare 窗口内已卸载则
         // 不声明（清刚 bind 的复活 lease 与镜像，bail 交调用方退避/跳过）
         if !self.inner.followings.lock().await.is_following(key) {
-            self.inner.owners.lock().await.release(key);
+            let pending = {
+                let mut owners = self.inner.owners.lock().await;
+                owners.release(key);
+                owners.take_pending_revocations()
+            };
+            self.spawn_authority_revocations(pending);
             let removed = self.inner.mirrors.lock().await.remove(key);
             drop(removed);
             return Err(ProtocolError::StaleContext(
@@ -4869,6 +6419,10 @@ impl DesktopIpcAdapter {
             let owners = self.inner.owners.lock().await;
             owners.validity(&lease)
         };
+        // 早快照契约（owners::wait_first_snapshot 文档）：先订阅再 declare——
+        // 唯一 snapshot 可能在 declare 回执后、本任务恢复前就被 reader 发布，
+        // 迟到订阅会永久丢失它（tokio broadcast 无回放）。
+        let mut snapshot_rx = conn.subscribe();
         declare_following(conn, key).await?;
         // 第四轮复审 B3：declare **之后**复查——declare 前已发生的 unfollow 把
         // following:false 发上了 wire，本任务刚发出的 true 就是「false 之后的
@@ -4888,7 +6442,12 @@ impl DesktopIpcAdapter {
                     )
                     .await;
             }
-            self.inner.owners.lock().await.release(key);
+            let pending = {
+                let mut owners = self.inner.owners.lock().await;
+                owners.release(key);
+                owners.take_pending_revocations()
+            };
+            self.spawn_authority_revocations(pending);
             let removed = self.inner.mirrors.lock().await.remove(key);
             drop(removed);
             return Err(ProtocolError::StaleContext(
@@ -4901,7 +6460,7 @@ impl DesktopIpcAdapter {
                 "lease lost during follow".into(),
             ));
         }
-        wait_first_snapshot(conn, key).await?;
+        wait_first_snapshot_rx(&mut snapshot_rx, key).await?;
         let _ = &mut validity;
         self.wait_fresh_projection(key).await?;
         Ok(())
@@ -4934,15 +6493,26 @@ impl DesktopIpcAdapter {
     ///
     /// #172/T9a：镜像锁**之外**再盖探测只读事实（盖章要读账本/单飞器，不得持镜像锁）。
     pub async fn projection(&self, key: &ThreadKey) -> ThreadProjection {
+        self.ensure_question_display(key).await;
         // T3 红测缝：进入临界区前插窗（生产恒 None 直通）。修复后内容读取在临界
         // 区内，本缝只验证「窗口内完成翻转+重发布」的定序不再产生旧内容新序号。
         self.run_projection_presnapshot_gate();
         // T02：暂停事实在**镜像锁外**读取（锁内不读 DB）；策略求值仍与投影同一临界区。
         // 无镜像回退分支的策略求值需要暂停事实（有镜像时由 project_mirror 在临界区
         // 内自读，保证与资格事实同一观察点）。
+        // 终审 Blocker 1：读内存事实。**未装载时**在锁外装载一次（本方法是
+        // HTTP/准入读路径——组提交/作答/队列视图都经它取资格事实；不装载会让
+        // 保守缺省把已暂停的队列误判，或把显式授权误拒）。已装载后全部走内存，
+        // 无逐帧 DB 读；广播路径（handle_state_changed）不经此入口。
+        // 暂停事实：沿用既有 T02 纪律——**镜像锁外**单条 EXISTS 读（不新增等待，
+        // 原实现即在锁外同步读；pause 是准入资格事实，缓存过期会误判已暂停队列）。
+        // 适配事实：后台 kick（设置读不阻塞投影；写边界仍有活值门）。
+        self.refresh_pause_fact(key);
+        self.kick_adapt_fact();
         let queue_paused = self.queue_paused_of(key);
-        // T03：持久提示每线程装载一次（锁外；读失败保持 Unknown 保守语义）。
-        self.ensure_interaction_hints(key).await;
+        // T03：持久提示每线程装载一次（A2.2/T8：冷载后台触发，锁外；读失败保持
+        // Unknown 保守语义——投影不等待装载）。
+        self.kick_interaction_hints_background(key);
         // T3（复审 round 3）：caps/policy 与序号基线在**同一临界区**内读取——快照
         // 携带的序号必须是内容实际观察到的版本。任何 seq ≤ 盖章值的事件：其镜像
         // 变更与 caps/policy 观测都可证先于本临界区（发布点在镜像交互与内容生成
@@ -4957,7 +6527,7 @@ impl DesktopIpcAdapter {
         // 直接发布路径（handle_state_changed / publish_projection /
         // handle_client_status_changed / mark_all_mirrors_stale）的 caps 观察一并
         // 挪进临界区，与快照路径同一边界。
-        let (p, hint_observation) = {
+        let (mut p, hint_observation) = {
             let mut mirrors = self.inner.mirrors.lock().await;
             let caps = self.effective_projection_caps();
             let policy = self.approval_policy();
@@ -5010,23 +6580,47 @@ impl DesktopIpcAdapter {
                         projection_version: None,
                         // T03：无镜像 = 无同次观察的活动回合事实 → None（不猜）。
                         active_turn_id: None,
+                        // 批次3（合同 §8）：无镜像回退分支无 DB 账事实 → 两账全省略
+                        // + 无戳（不是假 []；装载走 ensure_loaded/overlay 投影点）。
+                        question_display_groups: None,
+                        question_skip_history: None,
+                        display_stamp: None,
                     },
                     None,
                 ),
             }
         };
+        // 无镜像时仍可恢复已存历史；这里只消费此前装载的冻结缓存。
+        if p.revision.is_none() && p.display_stamp.is_none() {
+            let mirrors = self.inner.mirrors.lock().await;
+            if !mirrors.contains_key(key) {
+                self.overlay_question_display_locked(key, None, &mut p);
+                p.local_seq = self.seal_snapshot_seq();
+            }
+        }
         // T3 红测缝：临界区后插窗（生产恒 None 直通）。
         self.run_projection_sealed_gate();
         // 复审 R-T4：队列暂停事实盖章（镜像层不知道账本；空投影也盖——暂停是
         // 账本事实，不随镜像在场与否漂移）。盖章（内容+序号）已定稿，此处只叠
         // 更晚读取的账本事实——内容只会比序号声称的更新，不会更旧。
         let p = self.stamp_queue_pause(key, p);
-        let p = self.stamp_probe_status(p).await;
+        let p = self.stamp_probe_status(p);
         // R18：题目事实写穿持久提示（仅变化时落库；重启后未加载的题有占位）。
         if let Some(hint) = hint_observation {
-            self.persist_authorized_hints(hint).await;
+            // A2.2/T8 + A3.1/T9：写穿入队单 worker——投影/GET 路径不等待提交
+            //（慢库合同），durable 在 worker 内有界批次/退避收敛。
+            self.enqueue_persist_authorized_hints(hint);
         }
         p
+    }
+
+    /// 终审 Blocker 1：**准入读**入口——先同步装载 pause/adapt 各一次（单行
+    /// EXISTS / settings 读，锁外），再走只读投影。仅供需要「当前新鲜资格」的
+    /// 调用方（组提交/作答/队列视图/DTO/优先处理决策），广播与 SSE 不用它。
+    pub async fn projection_for_admission(&self, key: &ThreadKey) -> ThreadProjection {
+        self.refresh_pause_fact(key);
+        self.refresh_adapt_fact();
+        self.projection(key).await
     }
 
     /// 该 Thread 是否已有镜像（分页端点前置：无镜像才走有界 ensure/hydrate）。
@@ -5161,6 +6755,94 @@ impl DesktopIpcAdapter {
             return None;
         }
         ids.into_iter().next()
+    }
+
+    /// T1（B6-01/X0）：**实体级**唯一正式回显所属 Turn（canonical 镜像中恰好一个
+    /// `userMessage` 实体承载该 clientId——同 Turn 重复实体同样否决；按 Turn 去重
+    /// 不足以证明唯一）。stale / 无镜像 / 非唯一 → `None`。
+    pub async fn unique_formal_echo_turn(
+        &self,
+        key: &ThreadKey,
+        client_message_id: &str,
+    ) -> Option<String> {
+        let mirrors = self.inner.mirrors.lock().await;
+        let m = mirrors.get(key)?;
+        if m.is_stale() {
+            return None;
+        }
+        m.unique_formal_echo_turn(client_message_id)
+    }
+
+    /// 未绑定普通发送的正式身份、终态和兼容正文证据都取自同一镜像。
+    pub(crate) async fn unbound_send_completion(
+        &self,
+        key: &ThreadKey,
+        client_message_id: &str,
+        wire_hash: Option<&str>,
+    ) -> UnboundSendCompletion {
+        let mirrors = self.inner.mirrors.lock().await;
+        let Some(mirror) = mirrors.get(key).filter(|mirror| !mirror.is_stale()) else {
+            return UnboundSendCompletion::Hold;
+        };
+        match mirror.formal_echo_match(client_message_id) {
+            FormalEchoMatch::Unique(turn) if mirror.turn_is_terminal(&turn) => {
+                UnboundSendCompletion::FormalTerminal(turn)
+            }
+            FormalEchoMatch::Unique(_) | FormalEchoMatch::Ambiguous => UnboundSendCompletion::Hold,
+            FormalEchoMatch::Missing => match wire_hash {
+                None => UnboundSendCompletion::Missing,
+                Some(hash) => {
+                    if mirror
+                        .unique_turn_of_user_message_text_hash(hash)
+                        .is_some_and(|turn| mirror.turn_is_terminal(&turn))
+                    {
+                        UnboundSendCompletion::HashTerminal
+                    } else {
+                        UnboundSendCompletion::Hold
+                    }
+                }
+            },
+        }
+    }
+
+    /// active 答题只读送达核对：接受正式用户回显或已确认 steering 的精确 cmid。
+    /// 不读取 params 的请求回声，不推导题目生命周期，也不建立回合屏障。
+    pub(crate) async fn turn_of_async_answer_message(
+        &self,
+        key: &ThreadKey,
+        client_message_id: &str,
+    ) -> Option<String> {
+        if client_message_id.is_empty() {
+            return None;
+        }
+        let mirrors = self.inner.mirrors.lock().await;
+        let mirror = mirrors.get(key)?;
+        if mirror.is_stale() {
+            return None;
+        }
+        let state = mirror.raw_state()?;
+        let view = super::history_view::HistoryView::new(state);
+        let mut found = None;
+        for turn in view.turns() {
+            let matched = turn.items.iter().any(|item| {
+                let identity = match item.get("type").and_then(Value::as_str) {
+                    Some("userMessage") => item.get("clientId"),
+                    Some("steeringUserMessage") => item.get("clientUserMessageId"),
+                    _ => None,
+                };
+                identity.and_then(Value::as_str) == Some(client_message_id)
+                    && super::async_question::formal_answer_text(item)
+                        .and_then(|text| super::async_question::parse_answer_envelope(&text))
+                        .is_some()
+            });
+            if matched {
+                if found.is_some_and(|previous| previous != turn.turn_id) {
+                    return None;
+                }
+                found = Some(turn.turn_id);
+            }
+        }
+        found.map(str::to_owned)
     }
 
     /// **派发边界快照**（2026-10-20 复审 P1）：ensure 之后、start-turn 之前的忙态与
@@ -5315,7 +6997,15 @@ impl DesktopIpcAdapter {
                 }
             }
         }
-        self.inner.owners.lock().await.release(key);
+        let pending = {
+            let mut owners = self.inner.owners.lock().await;
+            owners.release(key);
+            owners.take_pending_revocations()
+        };
+        self.spawn_authority_revocations(pending);
+        // Source/live（合同 §6 行 2）：unfollow/release 已原子撤销 proof；移除镜像
+        // 前先失效受影响 source（换代/移除后不保留可用 source）。
+        self.invalidate_question_skip_source(key, LiveRefusal::Unknown);
         let removed = self.inner.mirrors.lock().await.remove(key);
         drop(removed); // Drop 释放字节账本占用
     }
@@ -5337,6 +7027,32 @@ impl DesktopIpcAdapter {
                 .valid(self.inner.remote_write_generation.capture())
         {
             self.begin_shutdown();
+            // 终审 Blocker 3（生产停机路径）：远程停止也走**同一** worker 监督——
+            // 关准入 + 断开入队口 + 3s 有界等待（超时句柄仍被回收者持有）。
+            self.inner
+                .hint_write_open
+                .store(false, std::sync::atomic::Ordering::Release);
+            self.inner
+                .hint_write_epoch
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            let sender = self
+                .inner
+                .hint_write_jobs
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take();
+            drop(sender);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            while std::time::Instant::now() < deadline
+                && self
+                    .inner
+                    .hint_write_worker
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .is_some()
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
             if let Some(conn) = self.inner.conn.lock().await.clone() {
                 conn.shutdown_after_queued().await;
             }
@@ -5385,9 +7101,31 @@ impl DesktopIpcAdapter {
     }
 
     /// C4：从停机恢复（hub.start 热重启路径）——重新允许连接。
+    /// A2/M4：恢复时同步刷新自动适配内存事实（停机期间的开关变化已由
+    /// notify 前置刷新兜底；此处再刷一次防热启沿用旧资格）。
     pub fn resume(&self) {
+        // 终审 Blocker 2/M2：**先建立恢复态事实**（适配/暂停由后台 kick 迅速补齐，
+        // 写边界的活值门始终权威），再开放运行准入与 worker——避免「先开放后刷新」
+        // 的过时资格窗口。
+        self.refresh_adapt_fact();
         self.inner.remote_write_generation.resume();
         self.inner.stopping.store(false, Ordering::SeqCst);
+        // 终审 Blocker 2：旧 worker 仍在飞 → **不重开**（替代运行须等旧排空；
+        // 旧回收者在代次不变时才会清槽，故此处不推进代次）。
+        let worker_busy = self
+            .inner
+            .hint_write_worker
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some();
+        if !worker_busy {
+            self.inner
+                .hint_write_epoch
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            self.inner
+                .hint_write_open
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
     }
 
     /// C4 探针：是否处于停机态。
@@ -5412,6 +7150,7 @@ impl DesktopIpcAdapter {
             false,
             None,
             Default::default(),
+            None,
             None,
             None,
         )
@@ -5442,6 +7181,7 @@ impl DesktopIpcAdapter {
             Default::default(),
             None,
             None,
+            None,
         )
         .await
     }
@@ -5465,6 +7205,7 @@ impl DesktopIpcAdapter {
             false,
             deadline,
             pre_dispatch_turns,
+            None,
             None,
             None,
         )
@@ -5493,6 +7234,7 @@ impl DesktopIpcAdapter {
             pre_dispatch_turns,
             Some(recheck),
             None,
+            None,
         )
         .await
     }
@@ -5517,6 +7259,7 @@ impl DesktopIpcAdapter {
             pre_dispatch_turns,
             None,
             None,
+            None,
         )
         .await
     }
@@ -5525,8 +7268,13 @@ impl DesktopIpcAdapter {
     /// S3：`deadline` = 本动作的后台收尾预算（RPC 等待只用剩余预算，可能已写出时
     /// 上层按「待确认」收尾——绝不因预算记 NotSent）。超参上限是**刻意**豁免
     ///（与 upsert_ok_conn 同理：形参按语义成列，不为省参数打乱列序引入错位风险）。
+    /// Task5：`write_context.interaction_hook` = 租约 keepalive 钩子（crate 内带
+    /// 租约伴随路径直呼本主体传入；经 dispatch 的 prior_recheck 包装进入
+    /// RpcRequest/FrameCmd 钩子链，持有到帧离开 writer；缺省 None 与升级前逐字
+    /// 一致）。Task7：`write_context.admission` = 调度准入标记（经 dispatch →
+    /// crate 内 request_with_admission 随帧进 writer）。
     #[allow(clippy::too_many_arguments)]
-    async fn start_turn_with(
+    pub(crate) async fn start_turn_with(
         &self,
         key: &ThreadKey,
         action_id: &str,
@@ -5537,6 +7285,7 @@ impl DesktopIpcAdapter {
         pre_dispatch_turns: std::collections::HashSet<String>,
         async_write_recheck: Option<super::types::AsyncWriteRecheck>,
         source_generation: Option<u64>,
+        write_context: Option<super::types::FrameWriteContext>,
     ) -> RpcOutcome {
         let write_generation =
             source_generation.unwrap_or_else(|| self.inner.remote_write_generation.capture());
@@ -5585,7 +7334,7 @@ impl DesktopIpcAdapter {
             deadline,
             compat,
             pre_dispatch_turns,
-            None,
+            write_context,
             async_write_recheck,
             // P1：随迟到槽位冻结本次 wire 文本（迟到回执弱证据核对的比对源）
             Some(text.to_string()),
@@ -5778,7 +7527,11 @@ impl DesktopIpcAdapter {
             deadline.instant(),
             false,
             Default::default(),
-            Some(recheck),
+            // H02：写边界短命许可随私有载体传递（无调度准入伴随——打断无优先意图）。
+            Some(super::types::FrameWriteContext {
+                interaction_hook: Some(recheck),
+                admission: None,
+            }),
             None,
             None,
             write_generation,
@@ -5828,6 +7581,35 @@ impl DesktopIpcAdapter {
         client_message_id: &str,
         bypass_paused_queue: bool,
         deadline: super::budget::Deadline,
+    ) -> RpcOutcome {
+        self.answer_async_ordinary(
+            key,
+            action_id,
+            command,
+            client_message_id,
+            deadline,
+            AnswerDispatchContext {
+                route: AsyncAnswerRoute::IdleStart,
+                bypass_paused_queue,
+                write_context: None,
+            },
+        )
+        .await
+    }
+
+    /// Task5：答题派发的带钩子伴随方法（crate 内）——业务主体与
+    /// [`Self::answer_async`] 逐字一致，仅把租约 keepalive 钩子随
+    /// interaction_recheck 链带进 RpcRequest/FrameCmd（真实答题 Frame 未离开
+    /// writer 前串行租约不释放）。**仅延长生命周期**：单题/组题判定、
+    /// AsyncWriteRecheck、首次写权 claim、回答信封、B1.3 事实与暂停归属全部不变。
+    pub(crate) async fn answer_async_ordinary(
+        &self,
+        key: &ThreadKey,
+        action_id: &str,
+        command: &super::async_question::AsyncAnswerCommand,
+        client_message_id: &str,
+        deadline: super::budget::Deadline,
+        context: AnswerDispatchContext,
     ) -> RpcOutcome {
         let write_generation = self.inner.remote_write_generation.capture();
         let envelope_id = super::types::new_uuid();
@@ -5930,7 +7712,7 @@ impl DesktopIpcAdapter {
             if live_keys != keys {
                 return not_sent(&envelope_id, "answers_mismatch");
             }
-            let paused_only = bypass_paused_queue
+            let paused_only = context.bypass_paused_queue
                 && entries.iter().all(|(question, _)| {
                     question.state == super::async_question::InteractionState::TemporarilyBlocked
                         && question.disabled_reason_code.as_deref()
@@ -5962,7 +7744,7 @@ impl DesktopIpcAdapter {
             if terminal(question.state) {
                 return not_sent(&envelope_id, "not_actionable");
             }
-            let paused_only = bypass_paused_queue
+            let paused_only = context.bypass_paused_queue
                 && question.state == super::async_question::InteractionState::TemporarilyBlocked
                 && question.disabled_reason_code.as_deref() == Some("operation_queue_paused");
             if !question.actionable && !paused_only {
@@ -5999,119 +7781,198 @@ impl DesktopIpcAdapter {
         if envelope.len() > super::async_question::MAX_ENVELOPE_BYTES {
             return not_sent(&envelope_id, "answer_too_large");
         }
-        // 写前状态复核（最小窗口）：题仍在、仍空闲、无阻塞请求。
+        // 写前只复核冻结路径，不因等待期间的状态翻转自动改发另一种 RPC。
+        let route = context.route;
         let pre_write = self.projection(key).await;
         if pre_write.stale
             || !pre_write.pending.is_empty()
-            || !pre_write.runtime_status.eq_ignore_ascii_case("idle")
+            || !route.runtime_matches(&pre_write.runtime_status)
         {
             return not_sent(&envelope_id, "busy_before_write");
         }
-        // G04：组答题把完整组成员/token/来源绑定到 **writer 首写权** 的复核；
-        // 单题保持既有 `start_turn_bounded` 语义（其入口/写前检查已覆盖）。
-        let outcome = if is_group {
-            // G04：把完整组的成员/token/来源绑定到**writer 首写权临界区**的复核。
-            // 停在 gate 后任一成员被别端回答、移除或换 token → 零首次写出。
-            let expected: Vec<(String, String)> = group
-                .iter()
-                .map(|(question, _)| {
-                    (
-                        question.question_key.clone(),
-                        question.context_token.clone(),
-                    )
-                })
-                .collect();
-            let expected_keys: std::collections::BTreeSet<String> =
-                expected.iter().map(|(key, _)| key.clone()).collect();
-            let source = (
-                group[0].0.source_turn_id.clone(),
-                group[0].0.source_item_id.clone(),
-            );
-            // C01：只有真正登记成功、进入派发的拥有者才能建立组绑定。绑定放在
-            // 路由 register/reserve 之后的 adapter 内，冲突请求到不了这里，无法
-            // 用同 actionId 的另一组覆盖；writer 最终 gate 读到的必是本动作来源。
-            self.bind_group_action(action_id, &source.0, &source.1, expected.clone());
-            let recheck_adapter = self.clone();
-            let recheck_key = key.clone();
-            let recheck: super::types::AsyncWriteRecheck = std::sync::Arc::new(move || {
-                let adapter = recheck_adapter.clone();
-                let key = recheck_key.clone();
-                let expected = expected.clone();
-                let expected_keys = expected_keys.clone();
-                let source = source.clone();
-                Box::pin(async move {
-                    let projection = adapter.projection(&key).await;
-                    if projection.stale
-                        || !projection.pending.is_empty()
-                        || !projection.runtime_status.eq_ignore_ascii_case("idle")
+        let expected: Vec<(String, String)> = group
+            .iter()
+            .map(|(question, _)| {
+                (
+                    question.question_key.clone(),
+                    question.context_token.clone(),
+                )
+            })
+            .collect();
+        let expected_keys: std::collections::BTreeSet<String> =
+            expected.iter().map(|(key, _)| key.clone()).collect();
+        let source = (
+            group[0].0.source_turn_id.clone(),
+            group[0].0.source_item_id.clone(),
+        );
+        if !self.bind_group_action(
+            action_id,
+            &source.0,
+            &source.1,
+            expected.clone(),
+            route,
+            is_group,
+        ) {
+            return not_sent(&envelope_id, "stale_context");
+        }
+        let recheck_adapter = self.clone();
+        let recheck_key = key.clone();
+        let recheck: super::types::AsyncWriteRecheck = std::sync::Arc::new(move || {
+            let adapter = recheck_adapter.clone();
+            let key = recheck_key.clone();
+            let expected = expected.clone();
+            let expected_keys = expected_keys.clone();
+            let source = source.clone();
+            Box::pin(async move {
+                let projection = adapter.projection(&key).await;
+                if projection.stale
+                    || !projection.pending.is_empty()
+                    || !route.runtime_matches(&projection.runtime_status)
+                {
+                    return Some("busy_before_write".to_string());
+                }
+                for (question_key, token) in &expected {
+                    let Some(question) = projection
+                        .async_questions
+                        .iter()
+                        .find(|question| question.question_key == *question_key)
+                    else {
+                        return Some("stale_context".to_string());
+                    };
+                    if question.context_token != *token
+                        || question.source_turn_id != source.0
+                        || question.source_item_id != source.1
+                        || matches!(
+                            question.state,
+                            super::async_question::InteractionState::Answered
+                                | super::async_question::InteractionState::Ended
+                                | super::async_question::InteractionState::Cancelled
+                                | super::async_question::InteractionState::Rejected
+                        )
                     {
-                        return Some("busy_before_write".to_string());
+                        return Some("question_already_answered".to_string());
                     }
-                    for (question_key, token) in &expected {
-                        let Some(question) = projection
-                            .async_questions
-                            .iter()
-                            .find(|question| question.question_key == *question_key)
-                        else {
-                            return Some("stale_context".to_string());
-                        };
-                        if question.context_token != *token
-                            || matches!(
-                                question.state,
-                                super::async_question::InteractionState::Answered
-                                    | super::async_question::InteractionState::Ended
-                                    | super::async_question::InteractionState::Cancelled
-                                    | super::async_question::InteractionState::Rejected
-                            )
-                        {
-                            return Some("question_already_answered".to_string());
-                        }
-                    }
+                }
+                if is_group {
                     let live_keys: std::collections::BTreeSet<String> = projection
                         .async_questions
                         .iter()
                         .filter(|question| {
                             question.source_turn_id == source.0
                                 && question.source_item_id == source.1
-                                && question.state
-                                    != super::async_question::InteractionState::Answered
-                                && question.state != super::async_question::InteractionState::Ended
-                                && question.state
-                                    != super::async_question::InteractionState::Cancelled
-                                && question.state
-                                    != super::async_question::InteractionState::Rejected
+                                && !matches!(
+                                    question.state,
+                                    super::async_question::InteractionState::Answered
+                                        | super::async_question::InteractionState::Ended
+                                        | super::async_question::InteractionState::Cancelled
+                                        | super::async_question::InteractionState::Rejected
+                                )
                         })
                         .map(|question| question.question_key.clone())
                         .collect();
-                    (live_keys != expected_keys).then(|| "answers_mismatch".to_string())
-                })
-            });
-            // 一次 canonical start-turn（信封作为正文；不是 steer、不进 FIFO）。
-            self.start_turn_with(
-                key,
-                action_id,
-                &envelope,
-                client_message_id,
-                false,
-                deadline.instant(),
-                Default::default(),
-                Some(recheck),
-                Some(write_generation),
-            )
-            .await
-        } else {
-            self.start_turn_with(
-                key,
-                action_id,
-                &envelope,
-                client_message_id,
-                false,
-                deadline.instant(),
-                Default::default(),
-                None,
-                Some(write_generation),
-            )
-            .await
+                    if live_keys != expected_keys {
+                        return Some("answers_mismatch".to_string());
+                    }
+                }
+                None
+            })
+        });
+        let outcome = match route {
+            AsyncAnswerRoute::IdleStart => {
+                self.start_turn_with(
+                    key,
+                    action_id,
+                    &envelope,
+                    client_message_id,
+                    false,
+                    deadline.instant(),
+                    Default::default(),
+                    is_group.then_some(recheck),
+                    Some(write_generation),
+                    context.write_context.clone(),
+                )
+                .await
+            }
+            AsyncAnswerRoute::ActiveSteer => {
+                let (lease, validity) = {
+                    let owners = self.inner.owners.lock().await;
+                    let Some(lease) = current_lease(&owners, key) else {
+                        return not_sent(&envelope_id, "stale_context");
+                    };
+                    let validity = owners.validity(&lease);
+                    (lease, validity)
+                };
+                let (cwd, workspace_roots) = {
+                    let mirrors = self.inner.mirrors.lock().await;
+                    let Some(state) = mirrors.get(key).and_then(ThreadMirror::raw_state) else {
+                        return not_sent(&envelope_id, "stale_context");
+                    };
+                    let Some(cwd) = state
+                        .get("cwd")
+                        .and_then(Value::as_str)
+                        .filter(|cwd| !cwd.is_empty())
+                    else {
+                        return not_sent(&envelope_id, "stale_context");
+                    };
+                    (
+                        cwd.to_string(),
+                        state
+                            .get("workspaceRoots")
+                            .filter(|roots| roots.is_array())
+                            .cloned()
+                            .unwrap_or_else(|| json!([])),
+                    )
+                };
+                let params = json!({
+                    "conversationId": key.thread_id,
+                    "input": [{"type":"text", "text":envelope, "text_elements":[]}],
+                    "clientUserMessageId": client_message_id,
+                    "attachments": [],
+                    "restoreMessage": {
+                        "id": client_message_id,
+                        "text": envelope,
+                        "cwd": cwd,
+                        "createdAt": chrono::Utc::now().timestamp_millis(),
+                        "context": {
+                            "prompt": envelope,
+                            "turnTrigger": "send_user_message_async_question",
+                            "addedFiles": [], "fileAttachments": [], "imageAttachments": [],
+                            "ideContext": null, "workspaceRoots": workspace_roots,
+                        },
+                        "responsesapiClientMetadata": {"source":"codex"},
+                    },
+                });
+                let expected_owner = lease.client_id.clone();
+                let mut out = self
+                    .dispatch(
+                        "thread-follower-steer-turn",
+                        None,
+                        params,
+                        lease,
+                        validity,
+                        Some(action_id),
+                        deadline.instant(),
+                        false,
+                        Default::default(),
+                        context.write_context.clone(),
+                        Some(recheck),
+                        Some(envelope),
+                        write_generation,
+                    )
+                    .await;
+                if out.delivery == Delivery::Accepted {
+                    if let Some(reason) = async_steer_ack_refusal(
+                        out.result.as_ref(),
+                        out.handled_by.as_deref(),
+                        Some(&expected_owner),
+                    ) {
+                        out.delivery = Delivery::UnknownDelivery;
+                        out.result = None;
+                        out.reason_code = Some(reason.into());
+                    }
+                }
+                out
+            }
         };
         // 受理后核对：原题是否已由原会话正式答复派生为 Answered（更强证据）。
         outcome
@@ -6183,7 +8044,8 @@ impl DesktopIpcAdapter {
             // 前台预算已耗尽：零派发（不是"已送达"）。
             return not_sent(&envelope_id, "front_budget_exhausted");
         }
-        let queue_paused = self.queue_paused_of(key);
+        // A2.2/T8：放行门是 mutation 资格面——直读事实源（不用展示内存事实）。
+        let queue_paused = self.queue_paused_authoritative(key);
         // T04：放行门用的逐操作策略在**镜像锁外**求值（只读同一份事实；避免在
         // 持锁路径里再取 profile/settings 锁）。
         let operations = self.compute_operations_for(key, queue_paused).await;
@@ -6209,6 +8071,9 @@ impl DesktopIpcAdapter {
             )
         };
         // 阶段 2（R5 短锁：只持 inflight）：清理已消失/换 token 的 Blocked + 抢占提交权
+        // Source/live（修复合同 §2）：变更前同步失效 Claims adapter 层，变更与
+        // 完整占位集合提交同在原 inflight 锁内完成（期间无 await）。
+        let claims_update = self.begin_claims_adapter_layer(&key.thread_id);
         {
             let mut inflight = self.inner.inflight.lock().await;
             let live: std::collections::HashMap<&str, &str> = snap
@@ -6227,6 +8092,7 @@ impl DesktopIpcAdapter {
                     })
             });
             if inflight.contains_key(&inflight_key) {
+                self.submit_adapter_claims_locked(claims_update, Err(LiveRefusal::Unknown));
                 return not_sent(&envelope_id, "pending_submit_in_progress");
             }
             inflight.insert(
@@ -6236,6 +8102,8 @@ impl DesktopIpcAdapter {
                     token: None,
                 },
             );
+            let claims = Self::collect_adapter_claims(&inflight, &key.thread_id);
+            self.submit_adapter_claims_locked(claims_update, Ok(claims));
         }
         // 校验 + wire 组装（不持任何锁；失败必须退掉提交权）。
         // C3 同代复核锚在 snap 被消耗前取出
@@ -6243,7 +8111,12 @@ impl DesktopIpcAdapter {
         let prepared = match snap.into_prepared(key, request_key, context_token, &action) {
             Ok(p) => p,
             Err(reason) => {
-                self.inner.inflight.lock().await.remove(&inflight_key);
+                let update = self.begin_claims_adapter_layer(&key.thread_id);
+                let mut inflight = self.inner.inflight.lock().await;
+                inflight.remove(&inflight_key);
+                let claims = Self::collect_adapter_claims(&inflight, &key.thread_id);
+                self.submit_adapter_claims_locked(update, Ok(claims));
+                drop(inflight);
                 return not_sent(&envelope_id, &reason);
             }
         };
@@ -6274,7 +8147,12 @@ impl DesktopIpcAdapter {
         let (lease, validity) = match lease_valid {
             Some(v) => v,
             None => {
-                self.inner.inflight.lock().await.remove(&inflight_key);
+                let update = self.begin_claims_adapter_layer(&key.thread_id);
+                let mut inflight = self.inner.inflight.lock().await;
+                inflight.remove(&inflight_key);
+                let claims = Self::collect_adapter_claims(&inflight, &key.thread_id);
+                self.submit_adapter_claims_locked(update, Ok(claims));
+                drop(inflight);
                 return not_sent(&envelope_id, "stale_context");
             }
         };
@@ -6287,7 +8165,12 @@ impl DesktopIpcAdapter {
                 .is_some_and(|m| !m.is_stale() && m.token_valid(request_key, context_token))
         };
         if !reverified {
-            self.inner.inflight.lock().await.remove(&inflight_key);
+            let update = self.begin_claims_adapter_layer(&key.thread_id);
+            let mut inflight = self.inner.inflight.lock().await;
+            inflight.remove(&inflight_key);
+            let claims = Self::collect_adapter_claims(&inflight, &key.thread_id);
+            self.submit_adapter_claims_locked(update, Ok(claims));
+            drop(inflight);
             return not_sent(&envelope_id, "stale_context");
         }
         let outcome = self
@@ -6325,7 +8208,10 @@ impl DesktopIpcAdapter {
         }
         // R4.3 + C3：Accepted/Rejected/NotSent（保守零投递，可重试）释放提交权；
         // UnknownDelivery → 保留为 Blocked（记提交所用 token 分代，状态应用驱动清理）。
+        // Source/live（修复合同 §2）：unknown 结算同步更新 Claims adapter 层
+        //（变更与完整集合提交同在原 inflight 锁内完成）。
         {
+            let update = self.begin_claims_adapter_layer(&key.thread_id);
             let mut inflight = self.inner.inflight.lock().await;
             if outcome.delivery == Delivery::UnknownDelivery {
                 inflight.insert(
@@ -6338,6 +8224,8 @@ impl DesktopIpcAdapter {
             } else {
                 inflight.remove(&inflight_key);
             }
+            let claims = Self::collect_adapter_claims(&inflight, &key.thread_id);
+            self.submit_adapter_claims_locked(update, Ok(claims));
         }
         outcome
     }
@@ -6362,7 +8250,11 @@ impl DesktopIpcAdapter {
         deadline: Option<tokio::time::Instant>,
         compat_attempt: bool,
         pre_dispatch_turns: std::collections::HashSet<String>,
-        interaction_recheck: Option<super::types::InteractionRecheck>,
+        // Task7：私有 Frame 写出伴随（原 interaction_recheck 参数位）——interaction
+        // 钩子沿原链合成；admission 随帧进 writer（预 claim 点 try_admit、Claimed
+        // 臂 mark_claimed），经 crate 内 request_with_admission 传递，public
+        // `RpcRequest`/`request` 面不扩。
+        write_context: Option<super::types::FrameWriteContext>,
         async_write_recheck: Option<super::types::AsyncWriteRecheck>,
         // P1（2026-10-30）：本次写出的已组装文本（仅 start-turn 携带；随迟到槽位
         // 冻结，供迟到回执的正文 hash 弱证据核对）。
@@ -6438,14 +8330,18 @@ impl DesktopIpcAdapter {
             }
         }
         let gate = self.inner.remote_write_generation.clone();
-        let prior_recheck = interaction_recheck;
+        let prior_recheck = write_context
+            .as_ref()
+            .and_then(|c| c.interaction_hook.clone());
         let interaction_recheck: super::types::InteractionRecheck = Arc::new(move || {
             if let Some(reason) = prior_recheck.as_ref().and_then(|check| check()) {
                 return Some(reason);
             }
             (!gate.valid(write_generation)).then(|| "remote_stopped".to_string())
         });
-        conn.request(RpcRequest {
+        // Task7：调度准入伴随随帧进 writer（无伴随帧走旧 public request 逐字不变）。
+        let frame_admission = write_context.as_ref().and_then(|c| c.admission.clone());
+        let request = RpcRequest {
             method: method.to_string(),
             params,
             version: Some(version),
@@ -6461,8 +8357,12 @@ impl DesktopIpcAdapter {
             interaction_recheck: Some(interaction_recheck),
             async_write_recheck,
             wire_text,
-        })
-        .await
+        };
+        if let Some(admission) = frame_admission {
+            conn.request_with_admission(request, admission).await
+        } else {
+            conn.request(request).await
+        }
     }
 
     pub fn shutdown(&self) -> Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
@@ -6471,6 +8371,36 @@ impl DesktopIpcAdapter {
             let conn = inner.conn.lock().await.clone();
             if let Some(conn) = conn {
                 conn.shutdown().await;
+            }
+            // 终审 Blocker 3：先关准入并唤醒——空闲 worker 的 recv 因此返回，
+            // 它才会在看到 open=false 时退出；否则弱引用无法让它停止。
+            inner
+                .hint_write_open
+                .store(false, std::sync::atomic::Ordering::Release);
+            // 终审 Blocker 2：推进运行代次——旧回收者与新运行隔离。
+            inner
+                .hint_write_epoch
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            // 真正断开入队口：take 出 sender 并 drop → worker 的 recv 得到 None
+            //（或在下一次循环头看到 open=false）→ 退出。resume 后由入队口重建。
+            let sender = inner
+                .hint_write_jobs
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take();
+            drop(sender);
+            // 有界等待完成；超时**不清槽**——后台回收者仍持有句柄（监督不丢失）。
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            loop {
+                let finished = inner
+                    .hint_write_worker
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .is_none();
+                if finished || std::time::Instant::now() >= deadline {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             }
         })
     }
@@ -6503,6 +8433,30 @@ impl DesktopIpcAdapter {
             .map(|g| g.contains_key(&(thread_id.to_string(), request_key.to_string())))
             .unwrap_or(false)
     }
+}
+
+/// steer 的 ACK 证明受理，不证明原题已答；缺失/错归属只保留未知投递。
+pub(crate) fn async_steer_ack_refusal(
+    result: Option<&Value>,
+    handled_by: Option<&str>,
+    expected_owner: Option<&str>,
+) -> Option<&'static str> {
+    let expected_owner = expected_owner.filter(|owner| !owner.trim().is_empty());
+    if expected_owner.is_none() || expected_owner != handled_by {
+        return Some("client_message_unverified");
+    }
+    let turn = result
+        .and_then(|result| {
+            result
+                .pointer("/result/turnId")
+                .or_else(|| result.get("turnId"))
+        })
+        .and_then(Value::as_str)
+        .filter(|turn| !turn.trim().is_empty());
+    if turn.is_none() {
+        return Some("turn_unconfirmed");
+    }
+    None
 }
 
 fn not_sent(envelope_id: &str, reason: &str) -> RpcOutcome {
@@ -6799,6 +8753,12 @@ fn pick_decision<'a>(allowed: &[String], candidates: &[&'a str]) -> Option<&'a s
         .find(|word| allowed.iter().any(|w| w == word))
 }
 
+// Source/live M2 actor 回归（仅测试构建）：真实 handle_state_changed 生产面 +
+// 真 OwnerRegistry/mirror/profile；guard 全部为实际 CachedLiveAttemptGuard。
+#[cfg(test)]
+#[path = "adapter_source_actor_tests.rs"]
+mod source_actor_tests;
+
 // ============================================================
 // R1/R2：broadcast 事件转发（need_snapshot 闭环 / owner 失效 / 迟到帧 /
 // following 查询 / 断线重连恢复）。锁纪律（R5）：全程顺序短锁，绝不嵌套。
@@ -6815,13 +8775,43 @@ fn spawn_forward_task(adapter: DesktopIpcAdapter, conn: ConnectionHandle) {
 /// 交接给重连恢复任务后退出（新连接的事件处理由恢复任务在 follow 前先行就位）。
 async fn forward_events(adapter: DesktopIpcAdapter, conn: ConnectionHandle) {
     let mut rx = conn.subscribe();
+    #[cfg(test)]
+    adapter
+        .inner
+        .transition_test_probe
+        .subscribed
+        .store(true, Ordering::Release);
     loop {
         match rx.recv().await {
             Ok(ConnectionEvent::Broadcast { frame, arrival, .. }) => {
+                #[cfg(test)]
+                let tracked = frame["method"] == "client-status-changed"
+                    && frame["params"]["clientId"] == "owner-b";
                 handle_broadcast(&adapter, &conn, frame, arrival).await;
+                #[cfg(test)]
+                if tracked {
+                    adapter
+                        .inner
+                        .transition_test_probe
+                        .processed
+                        .fetch_add(1, Ordering::AcqRel);
+                }
             }
             Ok(ConnectionEvent::Initialized { .. }) => continue,
-            Ok(ConnectionEvent::Disconnected { .. }) | Err(_) => break,
+            Ok(ConnectionEvent::Disconnected { .. }) => break,
+            Err(err) => {
+                #[cfg(test)]
+                if matches!(err, tokio::sync::broadcast::error::RecvError::Lagged(_)) {
+                    adapter
+                        .inner
+                        .transition_test_probe
+                        .lagged
+                        .store(true, Ordering::Release);
+                }
+                #[cfg(not(test))]
+                let _ = err;
+                break;
+            }
         }
     }
     // 断链或广播接收丢帧均使测速候选失效。
@@ -7043,6 +9033,59 @@ async fn handle_broadcast(
     }
 }
 
+// ------------------------------------------------------------
+// Source/live M2 actor 暂停缝（仅测试构建）：匹配目标 ThreadKey 的 state-changed
+// handler 在「mutation 票捕获后、ensure_interaction_hints await 前」驻停——覆盖
+// 生产 await 窗口内 hub stop/start（generation 切换）或首 attach（None→Some）与
+// mirrors 锁内重开票的真实交错。生产构建该函数与静态均不存在，零开销。
+// ------------------------------------------------------------
+
+#[cfg(test)]
+static SOURCE_ACTOR_PAUSE_GATE: std::sync::Mutex<
+    Option<(
+        String,
+        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    )>,
+> = std::sync::Mutex::new(None);
+
+/// 驻停点：仅命中 armed 的 thread_id；一次性取走 gate 后等待 resume。
+#[cfg(test)]
+async fn test_pause_after_source_ticket(thread_id: &str) {
+    let gate = {
+        let mut gate = SOURCE_ACTOR_PAUSE_GATE.lock().unwrap();
+        if gate.as_ref().is_some_and(|(id, _, _)| id == thread_id) {
+            gate.take()
+        } else {
+            None
+        }
+    };
+    if let Some((_, entered, resume)) = gate {
+        let _ = entered.send(());
+        let _ = resume.await;
+    }
+}
+
+/// 测试侧武装：handler 到驻停点后经 entered 放行测试，resume 释放 handler。
+#[cfg(test)]
+fn arm_source_actor_pause(
+    thread_id: &str,
+) -> (
+    tokio::sync::oneshot::Receiver<()>,
+    tokio::sync::oneshot::Sender<()>,
+) {
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+    *SOURCE_ACTOR_PAUSE_GATE.lock().unwrap() = Some((thread_id.to_string(), entered_tx, resume_rx));
+    (entered_rx, resume_tx)
+}
+
+/// RAII 清理：移除未消费的 gate，不留跨测试驻停点（测试侧 guard Drop 调用）。
+#[cfg(test)]
+fn clear_source_actor_pause() {
+    *SOURCE_ACTOR_PAUSE_GATE.lock().unwrap() = None;
+}
+
 /// state-changed：来源核对（R2.4）→ 原子应用 → changed 发布 / need_snapshot 或
 /// 非法增量 → stale 发布 + 有界重拉（R1）→ 不完整历史 → 只读 load-complete-history。
 async fn handle_state_changed(
@@ -7069,9 +9112,26 @@ async fn handle_state_changed(
     if source != Some(lease.client_id.as_str()) {
         return;
     }
+    // Source/live 门禁（修复合同 §1）：已识别待处理 ThreadKey 后，先 begin
+    // **mutation 票**（同步失效 + 推进 mutationRevision + 登记在途），再进入可能
+    // 等待的镜像处理；取得 mirrors 锁后在同一无 await 同步段内完成 apply→freeze→
+    // finish_source_change，按实际镜像串行修改顺序记账。任何早退/失败路径都必须
+    // finish 票（错误/取消不漏票），旧 owner 帧不得发布 healthy。
+    let source_live = adapter.question_skip_live();
+    let mut source_update = source_live
+        .as_ref()
+        .and_then(|live| live.begin_source_change(&key).ok());
+    #[cfg(test)]
+    test_pause_after_source_ticket(&key.thread_id).await;
     // 首帧投影必须先看到已持久化的历史身份；不能在生成投影后才加载，
-    // 否则旧题的正式答复会从广播与本次写穿中遗漏。镜像锁外读取。
-    adapter.ensure_interaction_hints(&key).await;
+    // 否则旧题的正式答复会从广播与本次写穿中遗漏。
+    // 终审 Blocker 5：真实状态帧路径改为**后台 kick**（不再逐帧同步等 hints DB
+    // 与写 worker 共用的 io 锁）；未装载如实呈现，装载完成后自行重观察重发布。
+    adapter.kick_interaction_hints_background(&key);
+    // 暂停事实沿用既有 T02 纪律（镜像锁外单条 EXISTS 读，与原实现一致）；
+    // 适配事实走后台 kick（设置读不阻塞转发器）。
+    adapter.refresh_pause_fact(&key);
+    adapter.kick_adapt_fact();
     let estimate_followed = adapter
         .inner
         .followings
@@ -7108,6 +9168,10 @@ async fn handle_state_changed(
     {
         let mut mirrors = adapter.inner.mirrors.lock().await;
         let Some(mirror) = mirrors.get_mut(&key) else {
+            // 缺镜像 = Unknown/拒绝，不是健康空线程（合同 §6）；票不得悬空。
+            if let (Some(live), Some(update)) = (&source_live, source_update.take()) {
+                let _ = live.finish_source_change(update, Err(LiveRefusal::Unknown));
+            }
             return; // 未跟随的 thread 不建镜像、不投影
         };
         // 在镜像应用的同一临界区复核 owner。只尝试锁，避免与其他路径形成反向等待。
@@ -7116,6 +9180,11 @@ async fn handle_state_changed(
             Ok(owners) => owners,
             Err(_) => {
                 mirror.mark_stale();
+                // owners 忙导致 mark_stale 的早退同样 finish 为拒绝——同锁同步段
+                // 内完成（修复合同 §1）。
+                if let (Some(live), Some(update)) = (&source_live, source_update.take()) {
+                    let _ = live.finish_source_change(update, Err(LiveRefusal::Busy));
+                }
                 drop(mirrors);
                 adapter.invalidate_body_observation();
                 drop(producer.take());
@@ -7125,10 +9194,44 @@ async fn handle_state_changed(
             }
         };
         if !owners.is_current(&lease) {
+            // 旧 owner 帧：不发布 healthy，票完成失败观察。
+            if let (Some(live), Some(update)) = (&source_live, source_update.take()) {
+                let _ = live.finish_source_change(update, Err(LiveRefusal::ScopeChanged));
+            }
             return;
         }
         if let Some(authority) = owners.authority(&lease) {
             mirror.bind_hint_authority(authority);
+        }
+        // Source/live（合同 §3）：owners.try_lock + is_current 同锁点装订 owner
+        // 活性证明，随 mirror 冻结；撤销经原子信号早于镜像刷新可见。clone 一份
+        // 供 apply 后重绑（apply 的新 lease 路径 clear_state 会清 proof）。
+        let mut source_owner_proof: Option<OwnerLeaseProof> = None;
+        if let Some(proof) = owners.live_proof(&lease) {
+            source_owner_proof = Some(proof.clone());
+            mirror.bind_owner_proof(proof);
+        }
+        // Source/live（M2 callsite 代际核对，修复合同 §4）：mutation 票的 begin 在
+        // ensure_interaction_hints await 之前——窗口内同 hub 重启（generation 切
+        // 换）或首 attach 后，旧世代票的 finish 会被世代核拒绝，真实镜像变更不入
+        // 当前 cache；None（begin 失败/未装配重开）也不能静默放行当前 Ready 缓存
+        // 漏真实更改。故 apply 前在 mirrors 锁内核对：世代不符/缺失一律重开当前
+        // 世代 mutation（旧票 Drop 只清旧 cell 原子在途），再 apply→freeze→finish
+        // 同段。此处 begin 仍失败（closed/poison/溢出）= 无票可漏、读侧同样拒绝。
+        // 若 generation 在持镜像锁后再切：新世代冷 cache 的 getter 会等本镜像锁，
+        // 顺序安全（不牺牲测速只读连接——estimate_pins 只读路径不经本段）。
+        // 首 attach 补点：入口捕获的 live Arc 也可能为 None（Hub 在 await 窗口内
+        // 才 set_live）——mirrors 锁内**重新获取当前 Arc**再判/重开票，否则
+        // apply B 仍无票、当前 cache 可留 A。OnceLock 只装不卸：取当前优先、
+        // 旧值兜底（语义上旧值与当前一致）。
+        let source_live = adapter.question_skip_live().or(source_live);
+        if !matches!(
+            (&source_live, source_update.as_ref()),
+            (Some(live), Some(update)) if live.current_generation() == Some(update.generation())
+        ) {
+            source_update = source_live
+                .as_ref()
+                .and_then(|live| live.begin_source_change(&key).ok());
         }
         let mut trackers = adapter
             .inner
@@ -7271,6 +9374,28 @@ async fn handle_state_changed(
                 need_recover = true;
             }
         }
+        // Source/live：apply 的新 lease 路径走 clear_state，会清掉 apply 前装订的
+        // owner proof——同锁以当前 lease 的**已验证** proof 重绑（原子 live + 完整
+        // lease 全等复核，不伪造）；proof 失效/lease 漂移不重绑 → freeze 按
+        // 未知/撤销拒绝（错误/旧 owner 帧路径照旧拒）。
+        if let Some(proof) = source_owner_proof.as_ref() {
+            if proof.is_live() && proof.lease() == &lease {
+                mirror.bind_owner_proof(proof.clone());
+            }
+        }
+        // Source/live 门禁（修复合同 §1）：apply 的任何结果（changed/QUIET/
+        // need_snapshot/Err）都在**同一 mirrors 无 await 同步段内** freeze →
+        // finish_source_change——按实际镜像串行修改顺序记账；need_snapshot/error
+        // 保留旧 raw 也完成失败观察，不能因未发 projection 而留下旧 healthy。
+        // 有其他在途 mutation 时 finish 只记账不发布（内部返回 Updating）。
+        if let (Some(live), Some(update)) = (source_live.as_ref(), source_update.take()) {
+            let observed =
+                adapter.freeze_question_skip_source_locked(&key, mirror, update.base_source_seq());
+            let _ = live.finish_source_change(update, observed);
+        }
+        if let Some((projection, _)) = fresh.as_mut() {
+            adapter.overlay_question_display_locked(&key, Some(mirror), projection);
+        }
     }
     if need_recover {
         if estimate_followed {
@@ -7295,15 +9420,17 @@ async fn handle_state_changed(
         // = 临界区内的盖章）；等待窗内被并发发布越过 → 重观察后再预留，旧观察
         // 不再以发送时刻取得更大序号（W1② 红测窗口）。
         let p = adapter.stamp_queue_pause(&key, p);
-        let p = adapter.stamp_probe_status(p).await;
+        let p = adapter.stamp_probe_status(p);
         // L2（2026-11-05）：**状态帧推送路径也要写穿持久提示**。
         // 此前全仓库只有 `projection()` 尾部（:4730）会 persist，而桌面端作答
         // 走的是 `handle_state_changed` 的这条正常发布分支——于是「移动端视图
         // 实时清卡、DB hint 仍停在 pending」；页面没开该会话时更是无限期滞后，
         // 下次投影又会拿旧 hint 产出占位/待作答。
         // 空列表仍会检查同 scope 的待写事实；镜像锁已释放后再执行数据库写入。
+        // A2.2/T8 + A3.1/T9：写穿入队单 worker——L2 位置合同保留（写穿仍由
+        // 正常发布分支发起），桌面答完后的广播不再被落库等待拖住。
         if let Some(hint) = hint_observation {
-            adapter.persist_authorized_hints(hint).await;
+            adapter.enqueue_persist_authorized_hints(hint);
         }
         adapter.publish_fresh_projection(&key, p).await;
         if history_needed {
@@ -7323,6 +9450,10 @@ async fn cleanup_inflight_for(
         .iter()
         .map(|p| (p.request_key.as_str(), p.context_token.as_str()))
         .collect();
+    // Source/live（修复合同 §2）：token 变化清理既有未知占位时，先失效 Claims
+    // adapter 层再变更，变更与完整占位集合提交同在原 inflight 锁内完成（不借此
+    // 无条件推进 sourceSeq——闸门事实不进 source 语义键）。
+    let claims_update = adapter.begin_claims_adapter_layer(thread_id);
     let mut inflight = adapter.inner.inflight.lock().await;
     inflight.retain(|(tid, rk), entry| {
         !(tid == thread_id
@@ -7332,6 +9463,9 @@ async fn cleanup_inflight_for(
                 Some(cur) => Some(*cur) != entry.token.as_deref(),
             })
     });
+    let claims = DesktopIpcAdapter::collect_adapter_claims(&inflight, thread_id);
+    adapter.submit_adapter_claims_locked(claims_update, Ok(claims));
+    drop(inflight);
 }
 
 /// R1：消费 need_snapshot/apply error 的有界重拉——复用 probe 定案
@@ -7382,7 +9516,12 @@ async fn is_fresh(adapter: &DesktopIpcAdapter, key: &ThreadKey) -> bool {
 
 /// 发布该 thread 的当前投影（短锁读取后发广播）。
 async fn publish_projection(adapter: &DesktopIpcAdapter, key: &ThreadKey) {
-    adapter.ensure_interaction_hints(key).await;
+    adapter.ensure_question_display(key).await;
+    // A2.2/T8：冷载后台触发——发布路径不等待 hints 装载（慢库合同 r1/r2）。
+    adapter.kick_interaction_hints_background(key);
+    // 终审 Blocker 1：发布路径只后台刷新（不读共享 Store）。
+    adapter.kick_pause_fact(key);
+    adapter.kick_adapt_fact();
     // 复审 round 6（Q1）测试缝：「caps 观察窗」（修复后 caps 在临界区内读取，无害
     // 定序——见 handle_state_changed 同款注释）。
     adapter.run_caps_observe_gate("publish_projection");
@@ -7408,13 +9547,15 @@ async fn publish_projection(adapter: &DesktopIpcAdapter, key: &ThreadKey) {
     };
     if let Some((p, hint)) = projection {
         if let Some(hint) = hint {
-            adapter.persist_authorized_hints(hint).await;
+            // A2.2/T8 + A3.1/T9：写穿入队单 worker（interaction_hint_io 串行
+            // 纪律由 worker 保留）。
+            adapter.enqueue_persist_authorized_hints(hint);
         }
         // 复审 R-T4：队列暂停事实（镜像锁已释放）+ #172/T9a：探测只读事实。
         // 复审 round 5（W1）：CAS 预留发布（全入口统一协议）；被并发发布越过
         // → 重观察后再预留。
         let p = adapter.stamp_queue_pause(key, p);
-        let p = adapter.stamp_probe_status(p).await;
+        let p = adapter.stamp_probe_status(p);
         adapter.publish_fresh_projection(key, p).await;
     }
 }
@@ -7642,6 +9783,8 @@ async fn handle_client_status_changed(adapter: &DesktopIpcAdapter, frame: &Value
         mirrors.keys().cloned().collect()
     };
     // 短锁 B：owners——收集受影响 thread + invalidate_client
+    // A4/T10：gate 撤销在临界区外后台执行（forwarder 不等待慢提交）。
+    let pending_revocations;
     let affected: Vec<ThreadKey> = {
         let mut owners = adapter.inner.owners.lock().await;
         let affected: Vec<ThreadKey> = candidates
@@ -7654,10 +9797,28 @@ async fn handle_client_status_changed(adapter: &DesktopIpcAdapter, frame: &Value
             })
             .collect();
         owners.invalidate_client(client_id);
+        pending_revocations = owners.take_pending_revocations();
         affected
     };
+    adapter.spawn_authority_revocations(pending_revocations);
     if affected.is_empty() {
         return;
+    }
+    // Source/live（修复合同 §6 行 2）：owner 撤销已通过 proof 原子可见（不等取得
+    // mirrors 锁）；此处同步失效受影响 source 与 Claims adapter 层——换代/失效后
+    // 不保留可用 source，adapter 占位范围打回 Unknown（较早读出的空集合/鉴权结果
+    // 不能覆盖真实撤销）。
+    if let Some(live) = adapter.question_skip_live() {
+        for key in &affected {
+            if let Ok(update) = live.begin_source_change(key) {
+                let _ = live.finish_source_change(update, Err(LiveRefusal::OwnerLost));
+            }
+            if let Ok(update) =
+                live.begin_claims_change(key, ClaimsLayer::Adapter, ClaimsScope::Full)
+            {
+                let _ = live.finish_claims_change(update, Err(LiveRefusal::Unknown));
+            }
+        }
     }
     let affected_observation = {
         let trackers = adapter
@@ -7702,7 +9863,7 @@ async fn handle_client_status_changed(adapter: &DesktopIpcAdapter, frame: &Value
         // → 重观察后再预留（重观察经 `projection()` 出口，失效镜像给出同样
         // 如实的 stale 内容）。
         let p = adapter.stamp_queue_pause(&key, p);
-        let p = adapter.stamp_probe_status(p).await;
+        let p = adapter.stamp_probe_status(p);
         adapter.publish_fresh_projection(&key, p).await;
     }
     // 2026-10-17 复审 C2：owner 失效但 socket 仍活着——连接级恢复循环不会触发；
@@ -7769,8 +9930,11 @@ async fn mark_all_mirrors_stale(adapter: &DesktopIpcAdapter, invalidate: bool) {
                 false
             };
             if publish {
+                // Source/live（合同 §6 行 2）：先失效受影响 source（mirror 已置
+                // stale/invalidate，槽位不得保留可用 source）。
+                adapter.invalidate_question_skip_source(key, LiveRefusal::SourceIncomplete);
                 let (mut p, _) = adapter.project_mirror(key, mirror, caps);
-                // 复审 round 5（W1）：发布 payload 以镜像临界区内的盖章声明内容
+                // 复审 round 5（W1）：发布 payload 以镜像临界区内的盖章声明其内容
                 // 版本——发布点的 CAS 以它为比较值。
                 p.local_seq = adapter.seal_snapshot_seq();
                 projections.push((key.clone(), p));
@@ -7784,7 +9948,7 @@ async fn mark_all_mirrors_stale(adapter: &DesktopIpcAdapter, invalidate: bool) {
         // 复审 round 5（W1）：CAS 预留发布（全入口统一协议）；被并发发布越过
         // → 重观察后再预留。
         let p = adapter.stamp_queue_pause(&key, p);
-        let p = adapter.stamp_probe_status(p).await;
+        let p = adapter.stamp_probe_status(p);
         adapter.publish_fresh_projection(&key, p).await;
     }
 }
@@ -7984,6 +10148,302 @@ mod dispatch_tests {
         }
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn b1_probe_stamp_does_not_wait_for_real_device_store() {
+        use crate::remote::codex_ipc::StoreProbeLedger;
+        use crate::remote::pairing::DeviceStore;
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::database::schema::init(&conn);
+        crate::database::migration::migrate(&conn).unwrap();
+        let db = Arc::new(std::sync::Mutex::new(conn));
+        let adapter = DesktopIpcAdapter::new(
+            Arc::new(NoopConnector),
+            ProtocolProfile::unverified("macos", "test-build"),
+        );
+        adapter.set_probe_key_override(Some("macos|test-build|cli|1".into()));
+        adapter.set_probe_ledger(Arc::new(StoreProbeLedger::for_test(DeviceStore::Owned(
+            db.clone(),
+        ))));
+        let projection = ThreadMirror::new(ThreadKey {
+            host_id: "local".into(),
+            thread_id: "probe-test".into(),
+        })
+        .project(adapter.current_caps());
+        let guard = db.lock().unwrap();
+        let worker = adapter.clone();
+        let mut stamp = tokio::spawn(async move { worker.stamp_probe_status(projection) });
+        // 超时仅限制测试等待；先释放真实共享 DB 锁，再检查结果，避免遗留阻塞任务。
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), &mut stamp).await;
+        drop(guard);
+        match result {
+            Ok(joined) => assert_eq!(
+                joined.expect("stamp task must not panic").probe_status,
+                ProbeStatus::idle()
+            ),
+            Err(_) => {
+                let _ = stamp.await;
+                panic!("probe stamp must not wait for DeviceStore mutex");
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn b1_probe_stamp_rejects_old_epoch_during_invalidation_window() {
+        let adapter = DesktopIpcAdapter::new(
+            Arc::new(NoopConnector),
+            ProtocolProfile::unverified("macos", "test-build"),
+        );
+        let probe_key = "macos|test-build|cli|1";
+        adapter.set_probe_key_override(Some(probe_key.into()));
+        adapter.inner.probe_status_cache.lock().unwrap().value =
+            Some((0, probe_key.into(), ProbeStatus::unverified()));
+        let projection = ThreadMirror::new(ThreadKey {
+            host_id: "local".into(),
+            thread_id: "probe-test".into(),
+        })
+        .project(adapter.current_caps());
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let entered = Arc::new(std::sync::Mutex::new(Some(entered_tx)));
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let resume = Arc::new(std::sync::Mutex::new(resume_rx));
+        adapter.set_caps_observe_gate(Some(Arc::new(move |path| {
+            if path == "probe_stamp_before_cache" {
+                if let Some(tx) = entered.lock().unwrap().take() {
+                    let _ = tx.send(());
+                }
+                let _ = resume.lock().unwrap().recv();
+            }
+        })));
+        let worker = adapter.clone();
+        let stamp = tokio::spawn(async move { worker.stamp_probe_status(projection) });
+        entered_rx.await.unwrap();
+        adapter.inner.epoch.store(1, Ordering::SeqCst);
+        *adapter.inner.probe_target.lock().unwrap() = Some(ProbeTarget {
+            epoch: 1,
+            platform: "macos".into(),
+            build: "test-build".into(),
+            key: None,
+        });
+        // 故意还未 invalidate，覆盖真实连接换代与缓存失效之间的窗口。
+        resume_tx.send(()).unwrap();
+        let result = stamp.await.unwrap();
+        adapter.set_caps_observe_gate(None);
+        assert_eq!(
+            result.probe_status,
+            ProbeStatus::idle(),
+            "old epoch status must not stamp new epoch"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn b1_probe_failed_new_key_does_not_republish_old_cache() {
+        struct PanicLedger(Arc<AtomicU64>);
+        impl ProbeLedger for PanicLedger {
+            fn get(&self, _: &str, _: &str) -> Option<super::super::probe::ProbeLedgerEntry> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                panic!("controlled probe read failure");
+            }
+            fn record(&self, _: &str, _: &str, _: &ProbeOutcome, _: Option<&str>) {}
+        }
+        let adapter = DesktopIpcAdapter::new(
+            Arc::new(NoopConnector),
+            ProtocolProfile::unverified("macos", "test-build"),
+        );
+        let calls = Arc::new(AtomicU64::new(0));
+        adapter.set_probe_ledger(Arc::new(PanicLedger(calls.clone())));
+        adapter.set_probe_key_override(Some("new-key".into()));
+        adapter.inner.probe_status_cache.lock().unwrap().value =
+            Some((0, "old-key".into(), ProbeStatus::unverified()));
+        let projection = ThreadMirror::new(ThreadKey {
+            host_id: "local".into(),
+            thread_id: "probe-test".into(),
+        })
+        .project(adapter.current_caps());
+        assert_eq!(
+            adapter.stamp_probe_status(projection).probe_status,
+            ProbeStatus::idle()
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                if !adapter.inner.probe_status_cache.lock().unwrap().loading {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("probe loader should finish after controlled failure");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(
+            adapter
+                .inner
+                .probe_status_cache
+                .lock()
+                .unwrap()
+                .value
+                .is_none(),
+            "old-key fact must not be treated as the new-key load result"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn b1_probe_old_key_load_cannot_replace_new_key() {
+        struct OrderedLedger {
+            entered: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+            release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+        }
+        impl ProbeLedger for OrderedLedger {
+            fn get(&self, key: &str, _: &str) -> Option<super::super::probe::ProbeLedgerEntry> {
+                if key == "old-key" {
+                    if let Some(tx) = self.entered.lock().unwrap().take() {
+                        let _ = tx.send(());
+                    }
+                    self.release.lock().unwrap().recv().unwrap();
+                }
+                None
+            }
+            fn record(&self, _: &str, _: &str, _: &ProbeOutcome, _: Option<&str>) {}
+        }
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let adapter = DesktopIpcAdapter::new(
+            Arc::new(NoopConnector),
+            ProtocolProfile::unverified("macos", "test-build"),
+        );
+        adapter.set_probe_ledger(Arc::new(OrderedLedger {
+            entered: std::sync::Mutex::new(Some(entered_tx)),
+            release: std::sync::Mutex::new(release_rx),
+        }));
+        adapter.set_probe_key_override(Some("old-key".into()));
+        let old_adapter = adapter.clone();
+        let old = tokio::spawn(async move { old_adapter.probe_status().await });
+        entered_rx.await.unwrap();
+        adapter.set_probe_key_override(Some("new-key".into()));
+        assert_eq!(adapter.probe_status().await, ProbeStatus::unverified());
+        release_tx.send(()).unwrap();
+        let _ = old.await.unwrap();
+        let cache = adapter.inner.probe_status_cache.lock().unwrap();
+        assert_eq!(
+            cache.value.as_ref().map(|(_, key, _)| key.as_str()),
+            Some("new-key")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn b1_probe_record_db_wait_does_not_block_projection() {
+        use crate::remote::codex_ipc::StoreProbeLedger;
+        use crate::remote::pairing::DeviceStore;
+        struct RecordingLedger {
+            inner: StoreProbeLedger,
+            entered: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        }
+        impl ProbeLedger for RecordingLedger {
+            fn get(
+                &self,
+                key: &str,
+                capability: &str,
+            ) -> Option<super::super::probe::ProbeLedgerEntry> {
+                self.inner.get(key, capability)
+            }
+            fn record(
+                &self,
+                key: &str,
+                capability: &str,
+                outcome: &ProbeOutcome,
+                fingerprint: Option<&str>,
+            ) {
+                if let Some(tx) = self.entered.lock().unwrap().take() {
+                    let _ = tx.send(());
+                }
+                self.inner.record(key, capability, outcome, fingerprint);
+            }
+        }
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::database::schema::init(&conn);
+        crate::database::migration::migrate(&conn).unwrap();
+        let db = Arc::new(std::sync::Mutex::new(conn));
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let adapter = DesktopIpcAdapter::new(
+            Arc::new(NoopConnector),
+            ProtocolProfile::unverified("macos", "test-build"),
+        );
+        adapter.set_probe_key_override(Some("macos|test-build|cli|1".into()));
+        adapter.set_probe_ledger(Arc::new(RecordingLedger {
+            inner: StoreProbeLedger::for_test(DeviceStore::Owned(db.clone())),
+            entered: std::sync::Mutex::new(Some(entered_tx)),
+        }));
+        let target = adapter.probe_target_snapshot().unwrap();
+        let projection = ThreadMirror::new(ThreadKey {
+            host_id: "local".into(),
+            thread_id: "probe-test".into(),
+        })
+        .project(adapter.current_caps());
+        let guard = db.lock().unwrap();
+        let writing = adapter.clone();
+        let writer = tokio::task::spawn_blocking(move || {
+            writing.apply_read_probe_result(
+                &target,
+                "macos|test-build|cli|1",
+                &ProbeOutcome::Probed {
+                    stage: ProbeStage::P3,
+                    revision: Some(1),
+                    duration_ms: 1,
+                },
+            )
+        });
+        entered_rx.await.unwrap();
+        let stamping = adapter.clone();
+        let mut stamp = tokio::spawn(async move { stamping.stamp_probe_status(projection) });
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), &mut stamp).await;
+        drop(guard);
+        writer.await.unwrap();
+        match result {
+            Ok(joined) => {
+                joined.expect("stamp task must not panic");
+            }
+            Err(_) => {
+                let _ = stamp.await;
+                panic!("probe DB write must not hold a projection lock");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn b1_probe_sql_failure_is_not_cached_as_missing_record() {
+        use crate::remote::codex_ipc::StoreProbeLedger;
+        use crate::remote::pairing::DeviceStore;
+        let db = Arc::new(std::sync::Mutex::new(
+            rusqlite::Connection::open_in_memory().unwrap(),
+        ));
+        let adapter = DesktopIpcAdapter::new(
+            Arc::new(NoopConnector),
+            ProtocolProfile::unverified("macos", "test-build"),
+        );
+        adapter.set_probe_key_override(Some("macos|test-build|cli|1".into()));
+        adapter.set_probe_ledger(Arc::new(StoreProbeLedger::for_test(DeviceStore::Owned(
+            db.clone(),
+        ))));
+        // 尚无表：这是 SQL 错误，不是“查询成功但没有记录”。
+        assert_eq!(adapter.probe_status().await, ProbeStatus::idle());
+        assert!(adapter
+            .inner
+            .probe_status_cache
+            .lock()
+            .unwrap()
+            .value
+            .is_none());
+        {
+            let conn = db.lock().unwrap();
+            crate::database::schema::init(&conn);
+            crate::database::migration::migrate(&conn).unwrap();
+        }
+        assert_eq!(
+            adapter.probe_status().await,
+            ProbeStatus::unverified(),
+            "恢复后必须重新查询"
+        );
+    }
+
     #[tokio::test]
     async fn schema_evidence_is_bound_to_identity_and_reprobed() {
         let adapter = DesktopIpcAdapter::new(
@@ -8009,6 +10469,44 @@ mod dispatch_tests {
         assert!(adapter.approval_policy().is_empty(), "旧证据不得跨身份复用");
         adapter.ensure_schema_evidence().await;
         assert!(!adapter.approval_policy().is_empty(), "新身份应重新取证");
+    }
+
+    #[tokio::test]
+    async fn b1_older_same_epoch_probe_key_resolution_cannot_replace_newer() {
+        let adapter = DesktopIpcAdapter::new(
+            Arc::new(NoopConnector),
+            ProtocolProfile::unverified("macos", "same-build"),
+        );
+        adapter.set_probe_ledger(Arc::new(ProbedLedger::default()));
+        let target = adapter.probe_target_snapshot().unwrap();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let old_adapter = adapter.clone();
+        let old_target = target.clone();
+        let old = tokio::spawn(async move {
+            old_adapter
+                .resolve_probe_key_with(&old_target, async {
+                    started_tx.send(()).unwrap();
+                    release_rx.await.unwrap();
+                    "cli-a".to_string()
+                })
+                .await
+        });
+        started_rx.await.unwrap();
+        adapter
+            .resolve_probe_key_with(&target, async { "cli-b".to_string() })
+            .await;
+        release_tx.send(()).unwrap();
+        assert_eq!(old.await.unwrap(), "cli-a");
+        let _ = adapter.reuse_ledger_evidence(&target, "cli-a");
+        assert!(
+            !adapter.state_evidence_current(),
+            "stale key evidence must not authorize the current target"
+        );
+        assert_eq!(
+            adapter.probe_target_snapshot().unwrap().key.as_deref(),
+            Some("cli-b")
+        );
     }
 
     #[tokio::test]
@@ -8844,6 +11342,10 @@ mod publish_protocol_tests {
         a.set_queue_pause_source(Some(Arc::new(move |_tid: &str| {
             fact2.load(Ordering::SeqCst)
         })));
+        // A2.2/T8：grant 读内存事实，生产形刷新入口与 republish 一致——
+        // 生产每个真实变更点（落行/清行）后经 republish 入口同步刷新，
+        // 本用例在每次事实翻转后补同形刷新，断言一字不改。
+        a.refresh_pause_fact(&k);
         assert!(
             matches!(a.pause_publish_grant(&k, 999), PausePublishGrant::Conflict),
             "过期观察（头为 0）不得取得资格"
@@ -8861,6 +11363,7 @@ mod publish_protocol_tests {
         );
         // 真实恢复：事实翻转 false，重读 ≠ tracker → 放行并携带重读值。
         fact.store(false, Ordering::SeqCst);
+        a.refresh_pause_fact(&k);
         assert!(
             matches!(
                 a.pause_publish_grant(&k, 1),
@@ -8873,12 +11376,14 @@ mod publish_protocol_tests {
         // 修复前旧观察 true 经参数传入会广播 stale true 并登记（红测定序的单元面）。
         fact.store(true, Ordering::SeqCst);
         fact.store(false, Ordering::SeqCst);
+        a.refresh_pause_fact(&k);
         assert!(
             matches!(a.pause_publish_grant(&k, 2), PausePublishGrant::Deduped),
             "重读事实==上次广播值 → 去重（同值恢复不作废、也不复活旧观察）"
         );
         // 第三次真实变化照常通知（不被 stale true 吞掉）。
         fact.store(true, Ordering::SeqCst);
+        a.refresh_pause_fact(&k);
         assert!(matches!(
             a.pause_publish_grant(&k, 2),
             PausePublishGrant::Granted(3, true)
@@ -10268,7 +12773,12 @@ mod l2_persist_call_site_tests {
             .find(marker)
             .expect("正常发布分支必须存在（handle_state_changed 的 fresh 分支）");
         // 发布前尝试写穿；只有写入成功时才表示 DB 已记下，失败仍可发布观察。
-        let start = at.saturating_sub(2000);
+        // A2.2：源码上游文本增删会平移字节偏移，2000 字节回溯点可能落在多字节
+        // 字符中间——右向吸附到字符边界，窗口语义（最多回溯 2000 字节）不变。
+        let mut start = at.saturating_sub(2000);
+        while start < at && !src.is_char_boundary(start) {
+            start += 1;
+        }
         let window = &src[start..at];
         assert!(
             window.contains("persist_authorized_hints(hint)"),
@@ -10727,14 +13237,24 @@ mod pr202_hint_init_tests {
             .unwrap();
         let observation = authorized.observation.clone();
         let scope = authorized.scope;
+        // A3.2/T9：capture token 有界化，断言经实际写批（prepare_batch_scoped）。
+        let batch_before = {
+            let observations = adapter.inner.hint_observations.lock().unwrap();
+            let state = &observations.as_ref().unwrap().state;
+            let batch = state.prepare_batch_scoped(&observation, scope);
+            assert_eq!(batch.len(), 1, "实际写批携带 new-item 最新事实");
+            assert_eq!(batch[0].hint.source_item_id, "new-item");
+            batch
+        };
         store.fence_next_write.store(true, Ordering::SeqCst);
         adapter.persist_authorized_hints(authorized).await;
         let observations = adapter.inner.hint_observations.lock().unwrap();
         let state = &observations.as_ref().unwrap().state;
-        assert!(state.durable_for_test(&observation.hints[0].hint).is_none());
+        assert!(state.durable_for_test(&batch_before[0].hint).is_none());
         assert_eq!(
             state.prepare_batch_scoped(&observation, scope),
-            observation.hints
+            batch_before,
+            "fenced 后批次保持（重试面不变）"
         );
         assert!(!store
             .rows
@@ -10777,10 +13297,19 @@ mod pr202_hint_init_tests {
         let observed = adapter
             .capture_hint_observation(&key, &mirror, &[question])
             .unwrap();
+        // A3.2/T9：capture token 有界化，断言经实际写批（prepare_batch_scoped）
+        // + durable 查询：unknown 观察不得把 witness 标记为 valid。
+        let observations = adapter.inner.hint_observations.lock().unwrap();
+        let state = &observations.as_ref().unwrap().state;
+        let batch = state.prepare_batch_scoped(&observed.observation, observed.scope);
+        assert_eq!(batch.len(), 1, "实际写批携带 call-1 最新事实");
         assert_ne!(
-            observed.observation.hints[0].hint.evidence_state.as_deref(),
-            Some("valid")
+            batch[0].hint.evidence_state.as_deref(),
+            Some("valid"),
+            "unknown 观察不得把 witness 标记为 valid"
         );
+        assert_eq!(batch[0].hint.last_fact, "unknown");
+        assert!(state.durable_for_test(&batch[0].hint).is_none());
     }
 
     #[tokio::test]
@@ -11051,5 +13580,1629 @@ mod pr202_hint_init_tests {
             .iter()
             .any(|row| row.source_item_id == "new-item"));
         assert_eq!(store.loads.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[cfg(test)]
+mod b1_transition_forwarder_tests {
+    use super::super::async_question::{InteractionHint, InteractionHintStore};
+    use super::super::hint_state::{HintVersion, VersionedHint};
+    use super::*;
+    use crate::remote::codex_evidence::StoreInteractionHints;
+    use crate::remote::pairing::DeviceStore;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+    use tokio::io::AsyncWriteExt;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn b1_revocation_during_slow_commit_does_not_stall_other_threads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("isolated.sqlite");
+        let writer = rusqlite::Connection::open(&path).unwrap();
+        writer.execute_batch("PRAGMA journal_mode=DELETE").unwrap();
+        writer.busy_timeout(Duration::from_secs(20)).unwrap();
+        crate::database::schema::init(&writer);
+        crate::database::migration::migrate(&writer).unwrap();
+        let epoch =
+            crate::database::dao::codex_interactions::next_hint_epoch_conn(&writer).unwrap();
+        let reader = rusqlite::Connection::open(&path).unwrap();
+        reader
+            .execute_batch("BEGIN; SELECT count(*) FROM codex_interaction_hints")
+            .unwrap();
+        let store = StoreInteractionHints::new(DeviceStore::Owned(Arc::new(Mutex::new(writer))));
+        let adapter = DesktopIpcAdapter::new(
+            Arc::new(super::publish_protocol_tests::NoopConnector),
+            super::super::profile::ProtocolProfile::closed(),
+        );
+        let a = ThreadKey {
+            host_id: "local".into(),
+            thread_id: "a".into(),
+        };
+        let b = ThreadKey {
+            host_id: "local".into(),
+            thread_id: "b".into(),
+        };
+        let c = ThreadKey {
+            host_id: "local".into(),
+            thread_id: "c".into(),
+        };
+        let (authority, permit, b_validity, mut c_validity) = {
+            let mut owners = adapter.inner.owners.lock().await;
+            let lease_a = owners.bind(a.clone(), "owner-a".into(), 1);
+            let lease_b = owners.bind(b.clone(), "owner-b".into(), 1);
+            let lease_c = owners.bind(c.clone(), "owner-c".into(), 1);
+            let authority = owners.authority(&lease_a).unwrap();
+            (
+                authority.clone(),
+                authority.rotate_scope().unwrap(),
+                owners.validity(&lease_b),
+                owners.validity(&lease_c),
+            )
+        };
+        {
+            let mut mirrors = adapter.inner.mirrors.lock().await;
+            mirrors.insert(a.clone(), ThreadMirror::new(a.clone()));
+            mirrors.insert(b.clone(), ThreadMirror::new(b.clone()));
+            mirrors.insert(c.clone(), ThreadMirror::new(c.clone()));
+        }
+        let fact = VersionedHint {
+            hint: InteractionHint {
+                thread_id: "a".into(),
+                source_turn_id: "turn".into(),
+                source_item_id: "item".into(),
+                question_index: 0,
+                last_fact: "unknown".into(),
+                witness: None,
+                evidence_state: None,
+            },
+            version: HintVersion { epoch, sequence: 1 },
+        };
+        let gate_probe = permit.clone();
+        let release_gate_probe = permit.clone();
+        let write =
+            tokio::task::spawn_blocking(move || store.write_batch(epoch, &[fact], 1, &permit));
+        let observe_path = path.clone();
+        let pending = tokio::task::spawn_blocking(move || {
+            let observer = rusqlite::Connection::open(observe_path).unwrap();
+            observer.busy_timeout(Duration::ZERO).unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while std::time::Instant::now() < deadline {
+                if matches!(observer.query_row("SELECT count(*) FROM codex_interaction_hints", [], |r| r.get::<_, i64>(0)), Err(rusqlite::Error::SqliteFailure(ref e, _)) if e.code == rusqlite::ErrorCode::DatabaseBusy) && gate_probe.test_gate_held() { return true; }
+                std::thread::yield_now();
+            }
+            false
+        }).await.unwrap();
+        if !pending {
+            reader.execute_batch("ROLLBACK").unwrap();
+            let _ = write.await;
+            panic!("failed to establish real pending COMMIT");
+        }
+        let (client, mut peer) = tokio::io::duplex(65536);
+        let conn = super::super::connection::spawn(
+            Box::new(client),
+            super::super::profile::ProtocolProfile::closed(),
+            1,
+        );
+        let forward_adapter = adapter.clone();
+        let forward_conn = conn.clone();
+        let mut forward =
+            tokio::spawn(async move { forward_events(forward_adapter, forward_conn).await });
+        let probe = &adapter.inner.transition_test_probe;
+        let subscribed = tokio::time::timeout(Duration::from_secs(3), async {
+            while !probe.subscribed.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .is_ok();
+        let event = |client: &str| serde_json::json!({"type":"broadcast","method":"client-status-changed","version":0,"params":{"clientId":client,"status":"disconnected"}});
+        peer.write_all(&super::super::codec::encode_frame(&event("owner-a")).unwrap())
+            .await
+            .unwrap();
+        let revoke_entered = tokio::time::timeout(Duration::from_secs(3), async {
+            while !authority.test_revoke_contended() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .is_ok();
+        let mut batches = 0;
+        if subscribed && revoke_entered {
+            for batch in 1..=17 {
+                for _ in 0..16 {
+                    peer.write_all(&super::super::codec::encode_frame(&event("owner-b")).unwrap())
+                        .await
+                        .unwrap();
+                }
+                let handled = tokio::time::timeout(Duration::from_secs(2), async {
+                    while probe.processed.load(Ordering::Acquire) < batch * 16 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .is_ok();
+                if !handled {
+                    break;
+                }
+                batches = batch;
+            }
+        }
+        let progressed = !*b_validity.borrow();
+        let mut end_marker = false;
+        if batches == 17 {
+            peer.write_all(&super::super::codec::encode_frame(&event("owner-c")).unwrap())
+                .await
+                .unwrap();
+            end_marker = tokio::time::timeout(Duration::from_secs(2), c_validity.changed())
+                .await
+                .is_ok()
+                && !*c_validity.borrow();
+        }
+        let no_lag = !probe.lagged.load(Ordering::Acquire);
+        let alive = !forward.is_finished();
+        let gate_before_release = release_gate_probe.test_gate_held();
+        reader.execute_batch("ROLLBACK").unwrap();
+        let write_result = write.await;
+        adapter.begin_shutdown();
+        drop(peer);
+        let forward_outcome = tokio::time::timeout(Duration::from_secs(3), &mut forward).await;
+        let forward_joined = matches!(&forward_outcome, Ok(Ok(())));
+        let observed_after_abort = if forward_outcome.is_err() {
+            forward.abort();
+            tokio::time::timeout(Duration::from_secs(3), &mut forward)
+                .await
+                .is_ok()
+        } else {
+            true
+        };
+        let old_fenced = release_gate_probe.test_owner_fenced_nonblocking();
+        assert!(subscribed, "forwarder did not subscribe");
+        assert!(
+            revoke_entered,
+            "A did not contend on the original authority gate"
+        );
+        assert!(
+            gate_before_release,
+            "original gate was not held at reader release"
+        );
+        assert!(
+            matches!(write_result, Ok(Ok(_))),
+            "writer must join and commit normally"
+        );
+        assert_eq!(old_fenced, Ok(true), "A old permit must be owner-fenced after transition; errors identify a busy or poisoned gate");
+        assert!(
+            observed_after_abort,
+            "forwarder did not exit within the bounded observation after abort"
+        );
+        assert!(
+            forward_joined,
+            "forwarder did not finish normally after cleanup"
+        );
+        assert_eq!(
+            batches, 17,
+            "not all 272 B events completed while A COMMIT was held"
+        );
+        assert!(progressed, "B event stalled behind A's COMMIT");
+        assert!(
+            end_marker,
+            "end marker after 272 events did not reach forwarder"
+        );
+        assert!(no_lag, "forwarder received Lagged");
+        assert!(alive, "forwarder exited before the end marker");
+    }
+}
+
+#[cfg(test)]
+mod b1_connection_cleanup_transition_tests {
+    use super::*;
+    use std::collections::VecDeque;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::time::{timeout, Duration};
+
+    struct OneConnector(std::sync::Mutex<Option<super::super::transport::BoxIo>>);
+    impl Connector for OneConnector {
+        fn connect_endpoint(
+            &self,
+        ) -> Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<
+                            (
+                                super::super::transport::BoxIo,
+                                super::super::transport::DesktopEndpoint,
+                            ),
+                            ProtocolError,
+                        >,
+                    > + Send
+                    + '_,
+            >,
+        > {
+            Box::pin(async move {
+                let io = self
+                    .0
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .ok_or_else(|| ProtocolError::Disconnected("fixture exhausted".into()))?;
+                Ok((
+                    io,
+                    super::super::transport::DesktopEndpoint {
+                        platform: "windows".into(),
+                        path: "fixture".into(),
+                        build: Some("26.1013.3656.0".into()),
+                    },
+                ))
+            })
+        }
+    }
+    struct Peer {
+        io: tokio::io::DuplexStream,
+        decoder: super::super::codec::FrameDecoder,
+        frames: VecDeque<Value>,
+    }
+    impl Peer {
+        async fn receive(&mut self) -> Result<Value, String> {
+            loop {
+                if let Some(v) = self.frames.pop_front() {
+                    return Ok(v);
+                }
+                let mut buf = [0u8; 16384];
+                let n = self.io.read(&mut buf).await.map_err(|e| e.to_string())?;
+                if n == 0 {
+                    return Err("EOF".into());
+                }
+                self.frames
+                    .extend(self.decoder.push(&buf[..n]).map_err(|e| format!("{e:?}"))?);
+            }
+        }
+        async fn send(&mut self, v: Value) -> Result<(), String> {
+            self.io
+                .write_all(&super::super::codec::encode_frame(&v).map_err(|e| format!("{e:?}"))?)
+                .await
+                .map_err(|e| e.to_string())
+        }
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn b1_late_connection_cleanup_preserves_fresh_current_lease_mirror() {
+        let (client, server) = tokio::io::duplex(65536);
+        let adapter = DesktopIpcAdapter::new(
+            Arc::new(OneConnector(std::sync::Mutex::new(Some(Box::new(client))))),
+            ProtocolProfile::closed(),
+        );
+        adapter.inner.epoch.store(1, Ordering::SeqCst);
+        let old_key = ThreadKey {
+            host_id: "local".into(),
+            thread_id: "old".into(),
+        };
+        let fresh_key = ThreadKey {
+            host_id: "local".into(),
+            thread_id: "new".into(),
+        };
+        let old_lease =
+            adapter
+                .inner
+                .owners
+                .lock()
+                .await
+                .bind(old_key.clone(), "old-owner".into(), 1);
+        let mut old_mirror = ThreadMirror::new(old_key.clone());
+        old_mirror
+            .apply(
+                &old_lease,
+                &json!({"type":"snapshot","revision":1,"conversationState":{}}),
+            )
+            .unwrap();
+        {
+            let mut mirrors = adapter.inner.mirrors.lock().await;
+            mirrors.insert(old_key.clone(), old_mirror);
+            mirrors.insert(fresh_key.clone(), ThreadMirror::new(fresh_key.clone()));
+        }
+        adapter
+            .inner
+            .followings
+            .lock()
+            .await
+            .follow(fresh_key.clone());
+        let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        *adapter.inner.cleanup_gate.lock().unwrap() = Some((reached_tx, release_rx));
+        let bootstrap_adapter = adapter.clone();
+        let mut bootstrap =
+            tokio::spawn(async move { bootstrap_adapter.ensure_connection().await });
+        let mut peer = Peer {
+            io: server,
+            decoder: super::super::codec::FrameDecoder::new(),
+            frames: VecDeque::new(),
+        };
+        let a = adapter.clone();
+        let k = fresh_key.clone();
+        let mut recovery = None;
+        let exercise = timeout(Duration::from_secs(8), async {
+            reached_rx.await.map_err(|e| e.to_string())?;
+            let init = peer.receive().await?;
+            if init["method"] != "initialize" { return Err("missing initialize".into()); }
+            peer.send(json!({"type":"response","requestId":init["requestId"],"resultType":"success","method":"initialize","handledByClientId":"fixture-client","result":{"clientId":"fixture-client"}})).await?;
+            let recovery_adapter = a.clone();
+            recovery = Some(tokio::spawn(async move { recovery_loop(&recovery_adapter).await }));
+            while !a.inner.transition_test_probe.subscribed.load(Ordering::Acquire) { tokio::task::yield_now().await; }
+            let disc = peer.receive().await?;
+            if disc["method"] != "thread-owner-discovery" { return Err(format!("unexpected discovery: {disc}")); }
+            peer.send(json!({"type":"response","requestId":disc["requestId"],"resultType":"success","method":"thread-owner-discovery","handledByClientId":"new-owner","result":{"supportsUntrustedAppInput":true}})).await?;
+            let following = peer.receive().await?;
+            if following["method"] != "thread-stream-following-changed" { return Err(format!("unexpected following: {following}")); }
+            peer.send(json!({"type":"broadcast","method":"thread-stream-state-changed","version":11,"sourceClientId":"new-owner","params":{"conversationId":k.thread_id,"hostId":"local","change":{"type":"snapshot","revision":42,"conversationState":{"turns":[],"requests":[],"threadRuntimeStatus":{"type":"active"}}}}})).await?;
+            loop {
+                let mirrors = a.inner.mirrors.lock().await;
+                if mirrors.get(&k).is_some_and(|m| !m.is_stale() && m.revision() == Some(42) && m.lease().is_some_and(|l| l.epoch == 2 && l.client_id == "new-owner")) { break; }
+                drop(mirrors);
+                tokio::task::yield_now().await;
+            }
+            let recovery_handle = recovery.as_mut().ok_or("missing recovery task")?;
+            let joined = timeout(Duration::from_secs(5), recovery_handle).await;
+            // JoinHandle 只要返回就已消费；先取走句柄再处理 JoinError/None。
+            if joined.is_ok() { recovery.take(); }
+            let recovered = joined.map_err(|_| "recovery timeout")?.map_err(|e| e.to_string())?;
+            if recovered.is_none() { return Err("recovery returned None".into()); }
+            Ok::<_, String>(())
+        }).await;
+        let old_before = {
+            let mirrors = adapter.inner.mirrors.lock().await;
+            mirrors.get(&old_key).is_some_and(|m| {
+                !m.is_stale() && m.revision() == Some(1) && m.lease() == Some(&old_lease)
+            })
+        };
+        let _ = release_tx.send(());
+        let bootstrap_result = timeout(Duration::from_secs(5), &mut bootstrap).await;
+        if bootstrap_result.is_err() {
+            bootstrap.abort();
+            let _ = timeout(Duration::from_secs(1), &mut bootstrap).await;
+        }
+        let current_lease = adapter.inner.owners.lock().await.current(&fresh_key);
+        let (old_stale, new_fresh) = {
+            let mirrors = adapter.inner.mirrors.lock().await;
+            (
+                mirrors.get(&old_key).is_some_and(|m| {
+                    m.is_stale() && m.revision() == Some(1) && m.lease() == Some(&old_lease)
+                }),
+                mirrors.get(&fresh_key).is_some_and(|m| {
+                    !m.is_stale()
+                        && m.revision() == Some(42)
+                        && m.lease().is_some_and(|l| {
+                            l.epoch == 2
+                                && l.client_id == "new-owner"
+                                && Some(l) == current_lease.as_ref()
+                        })
+                }),
+            )
+        };
+        adapter.begin_shutdown();
+        drop(peer);
+        let recovery_result = match recovery {
+            Some(mut task) => {
+                let result = timeout(Duration::from_secs(5), &mut task).await;
+                if result.is_err() {
+                    task.abort();
+                    let _ = timeout(Duration::from_secs(1), &mut task).await;
+                }
+                Some(result)
+            }
+            None => None,
+        };
+        assert!(
+            matches!(bootstrap_result, Ok(Ok(Ok(_)))),
+            "bootstrap did not exit successfully"
+        );
+        assert!(
+            matches!(exercise, Ok(Ok(()))),
+            "real recovery path did not reach a fresh snapshot: {exercise:?}"
+        );
+        assert!(
+            recovery_result.is_none(),
+            "recovery required cleanup rather than completing before cleanup"
+        );
+        assert!(
+            old_before,
+            "old epoch mirror must be fresh with its original lease and revision before cleanup"
+        );
+        assert!(
+            old_stale,
+            "old epoch mirror must become stale while retaining its original lease and revision"
+        );
+        assert!(
+            new_fresh,
+            "late cleanup must not stale the fresh current epoch mirror"
+        );
+    }
+}
+
+#[cfg(test)]
+mod b1_a22_contract_tests {
+    //! A2.2（B1 §10 T8）：五个缺失合同用例。
+    //!
+    //! 夹具纪律：真实共享 Store（`StoreInteractionHints` + 隔离 SQLite，
+    //! journal_mode=DELETE）+ 可控真实 DB 锁（`std::sync::Mutex` guard），
+    //! 不用假 Store 冒充；每用例独立隔离库与 adapter；用例内使用的
+    //! per-adapter 测试缝（gate/override/pause source）结束显式复位。
+    //! 「后台装载」在当前实现中不存在独立后台任务（`ensure_interaction_hints`
+    //! 内联 await），用例 5 以「逐出 cache 后的再装载」作为当前实现下唯一
+    //! 可再现的「晚于新观察的装载」测试缝（详见该用例注释）。
+
+    use super::super::async_question::{InteractionHint, InteractionHintStore, InteractionState};
+    use super::*;
+    use crate::remote::codex_evidence::StoreInteractionHints;
+    use crate::remote::pairing::DeviceStore;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
+
+    fn a22_key(thread_id: &str) -> ThreadKey {
+        ThreadKey {
+            host_id: "local".into(),
+            thread_id: thread_id.into(),
+        }
+    }
+
+    /// 隔离真实 SQLite（journal_mode=DELETE）+ schema/migration。
+    fn a22_isolated_db() -> (
+        tempfile::TempDir,
+        Arc<std::sync::Mutex<rusqlite::Connection>>,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a22-isolated.sqlite");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch("PRAGMA journal_mode=DELETE").unwrap();
+        crate::database::schema::init(&conn);
+        crate::database::migration::migrate(&conn).unwrap();
+        (dir, Arc::new(std::sync::Mutex::new(conn)))
+    }
+
+    /// 带一道题的镜像（answered=true 时正式答复信封在场 → Answered）。
+    fn a22_question_mirror(key: &ThreadKey, answered: bool) -> ThreadMirror {
+        let lease = super::super::types::OwnerLease {
+            key: key.clone(),
+            client_id: "owner".into(),
+            epoch: 1,
+            generation: 1,
+        };
+        let mut mirror = ThreadMirror::new(key.clone());
+        mirror.bind_hint_authority(super::super::hint_commit::HintLeaseAuthority::new(
+            lease.clone(),
+        ));
+        let envelope = super::super::async_question::compose_async_answer("call-1", 0, "Q", "A");
+        let mut entities = serde_json::Map::new();
+        entities.insert(
+            "q".into(),
+            serde_json::json!({"turnId":"q","status":"completed","items":[
+                {"type":"agentMessage","id":"call-1","questions":[{"title":"Q"}]}
+            ]}),
+        );
+        let mut island = vec![serde_json::json!({"value":"q"})];
+        if answered {
+            entities.insert(
+                "a".into(),
+                serde_json::json!({"turnId":"a","status":"completed","items":[
+                    {"type":"userMessage","id":"answer-1","content":[{"type":"text","text":envelope}]}
+                ]}),
+            );
+            island.push(serde_json::json!({"value":"a"}));
+        }
+        let state = serde_json::json!({"turnHistory":{"history":{"isComplete":true,
+            "entitiesByKey": serde_json::Value::Object(entities),
+            "islands":[{"entries": island}]}}});
+        mirror
+            .apply(
+                &lease,
+                &serde_json::json!({"type":"snapshot","revision":1,"conversationState":state}),
+            )
+            .unwrap();
+        mirror
+    }
+
+    fn a22_preload_hint(store: &StoreInteractionHints, thread_id: &str, fact: &str) {
+        store.upsert(
+            &InteractionHint {
+                thread_id: thread_id.into(),
+                source_turn_id: "q".into(),
+                source_item_id: "call-1".into(),
+                question_index: 0,
+                last_fact: fact.into(),
+                witness: None,
+                evidence_state: None,
+            },
+            1,
+        );
+    }
+
+    /// T8 合同 1：持真实共享 DB 锁期间，经直接发布入口投递 >256 条合法状态帧 +
+    /// 尾标记，同一订阅者必须全部到达、无 Lagged，投影不被 hints 落库等待拖住。
+    ///
+    /// 当前实现 `publish_projection` 在广播发送**之前** await
+    /// `persist_authorized_hints`（调用方写穿）——首帧带待写事实 → 落库阻塞在
+    /// 被占用的 DeviceStore 连接锁上 → 广播停滞。预期 RED。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn b1_slow_store_does_not_drop_broadcasts() {
+        let (_dir, conn) = a22_isolated_db();
+        let store = Arc::new(StoreInteractionHints::new(DeviceStore::Owned(conn.clone())));
+        let adapter = DesktopIpcAdapter::new(
+            Arc::new(super::publish_protocol_tests::NoopConnector),
+            ProtocolProfile::closed(),
+        );
+        adapter.set_interaction_hint_store(Some(store.clone()));
+        let key = a22_key("a22-slow-store");
+        adapter
+            .inner
+            .mirrors
+            .lock()
+            .await
+            .insert(key.clone(), a22_question_mirror(&key, false));
+        let marker_key = a22_key("a22-slow-store-marker");
+        adapter
+            .inner
+            .mirrors
+            .lock()
+            .await
+            .insert(marker_key.clone(), ThreadMirror::new(marker_key.clone()));
+        // 占锁前热装载两个线程（cache 命中，消除冷加载干扰；首帧观察仍有待写事实）。
+        adapter.ensure_interaction_hints(&key).await;
+        adapter.ensure_interaction_hints(&marker_key).await;
+
+        let mut rx = adapter.subscribe();
+        let burst_seen = Arc::new(AtomicUsize::new(0));
+        let marker_seen = Arc::new(AtomicBool::new(false));
+        let lagged_seen = Arc::new(AtomicBool::new(false));
+        let drain_thread = marker_key.thread_id.clone();
+        let d_burst = burst_seen.clone();
+        let d_marker = marker_seen.clone();
+        let d_lagged = lagged_seen.clone();
+        let drain = tokio::spawn(async move {
+            loop {
+                match rx.recv().await {
+                    Ok(p) => {
+                        if p.thread_id == drain_thread {
+                            d_marker.store(true, Ordering::Release);
+                        } else {
+                            d_burst.fetch_add(1, Ordering::AcqRel);
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        d_lagged.store(true, Ordering::Release);
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        // 持有真实共享 DB 锁（std::sync::Mutex guard）期间投递 300 帧发布 + 尾标记。
+        let guard = conn.lock().unwrap();
+        let publisher = adapter.clone();
+        let burst_key = key.clone();
+        let mkey = marker_key.clone();
+        let burst = tokio::spawn(async move {
+            for _ in 0..300 {
+                publish_projection(&publisher, &burst_key).await;
+                tokio::task::yield_now().await;
+            }
+            publish_projection(&publisher, &mkey).await;
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline
+            && !(marker_seen.load(Ordering::Acquire) && burst_seen.load(Ordering::Acquire) >= 300)
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let received = burst_seen.load(Ordering::Acquire);
+        let marker = marker_seen.load(Ordering::Acquire);
+        let lagged = lagged_seen.load(Ordering::Acquire);
+        drop(guard);
+        // 放锁后让写穿收敛（RED 下阻塞的落库在此完成），避免残留任务跨用例。
+        let _ = tokio::time::timeout(Duration::from_secs(10), burst).await;
+        drain.abort();
+        eprintln!(
+            "slow-store: received={received}/300 marker={marker} lagged={lagged} (锁持有窗口内)"
+        );
+        assert_eq!(
+            received, 300,
+            "持真实 DB 锁期间广播必须全部到达（当前实现 hints 落库在调用方写穿，发布路径被落库等待拖住）"
+        );
+        assert!(marker, "尾标记必须在 300 帧全部到达后可见");
+        assert!(!lagged, "订阅者不得 Lagged 丢帧");
+    }
+
+    /// T8 合同 2：同一真实共享 Store 的 DB 锁被占用时，热（已装载）与冷（未装载）
+    /// 两条 `projection(&key)` 都必须在 1s 内完成；未装载的如实 Unknown/Loading
+    /// 语义，不得悬挂。
+    ///
+    /// 当前实现：热线程在 `projection()` 尾部 await 写穿落库、冷线程在
+    /// `ensure_interaction_hints` 内联 await 冷加载，两条都会被占用的 DB 锁拖死。
+    /// 预期 RED。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn b1_projection_never_waits_for_hint_db_lock() {
+        let (_dir, conn) = a22_isolated_db();
+        let store = Arc::new(StoreInteractionHints::new(DeviceStore::Owned(conn.clone())));
+        let adapter = DesktopIpcAdapter::new(
+            Arc::new(super::publish_protocol_tests::NoopConnector),
+            ProtocolProfile::closed(),
+        );
+        adapter.set_interaction_hint_store(Some(store.clone()));
+        let hot = a22_key("a22-lock-hot");
+        adapter
+            .inner
+            .mirrors
+            .lock()
+            .await
+            .insert(hot.clone(), a22_question_mirror(&hot, false));
+        let cold = a22_key("a22-lock-cold");
+        adapter
+            .inner
+            .mirrors
+            .lock()
+            .await
+            .insert(cold.clone(), a22_question_mirror(&cold, false));
+        // 热线程占锁前装载；冷线程保持未装载。
+        adapter.ensure_interaction_hints(&hot).await;
+
+        let guard = conn.lock().unwrap();
+        let hot_done = tokio::time::timeout(Duration::from_secs(1), adapter.projection(&hot)).await;
+        let cold_done =
+            tokio::time::timeout(Duration::from_secs(1), adapter.projection(&cold)).await;
+        drop(guard);
+        assert!(
+            hot_done.is_ok(),
+            "已装载热线程的 projection 不得等 hints 落库锁（1s 超时；当前实现在 projection 尾部 await 写穿落库）"
+        );
+        assert!(
+            cold_done.is_ok(),
+            "未装载冷线程的 projection 不得等 hints 冷加载（1s 超时）；未装载须如实 Unknown/Loading，不得悬挂"
+        );
+    }
+
+    /// T8 合同 3：先建立已缓存自适应允许（兼容审批决策词 + 写资格），再关闭自动
+    /// 适配开关；关闭后写资格即时撤销（下一投影不再授予），且无需等落库。
+    #[tokio::test]
+    async fn b1_auto_adapt_off_revokes_cached_allowance() {
+        let adapter = DesktopIpcAdapter::new(
+            Arc::new(super::publish_protocol_tests::NoopConnector),
+            ProtocolProfile::unverified("macos", "unknown-a"),
+        );
+        adapter.set_probe_key_override(Some("macos|unknown-a|cli-a|1".into()));
+        adapter.set_schema_probe_override(Some(SchemaProbeOutcome::Known(SchemaEvidence {
+            fingerprint: "schema-a".into(),
+            command_decisions: vec!["accept".into(), "cancel".into()],
+            file_decisions: vec![],
+        })));
+        adapter.ensure_schema_evidence().await;
+        assert!(
+            !adapter.approval_policy().is_empty(),
+            "前置：自适应允许（兼容审批决策词）已缓存"
+        );
+        assert!(
+            adapter.send_gate_static().is_ok(),
+            "前置：未知 build 兼容档写资格在场（自动适配开）"
+        );
+        let key = a22_key("a22-adapt");
+        adapter
+            .inner
+            .mirrors
+            .lock()
+            .await
+            .insert(key.clone(), ThreadMirror::new(key.clone()));
+
+        // 关闭开关：同一活值门 + 通知主体（生产 toggle 的 notify 主体），不等落库。
+        adapter.set_auto_adapt_gate(Some(Arc::new(|| false)));
+        let started = Instant::now();
+        adapter.clone().run_auto_adapt_notify(false).await;
+        assert!(
+            adapter.approval_policy().is_empty(),
+            "关闭后兼容审批允许即时撤销（活值门，无需等落库）"
+        );
+        let after = tokio::time::timeout(Duration::from_secs(1), adapter.projection(&key))
+            .await
+            .expect("关闭后下一投影不得等落库（1s 超时）");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "撤销必须即时完成，不等任何落库"
+        );
+        assert!(
+            !adapter.send_gate_static().is_ok(),
+            "下一投影不再授予未知 build 写资格（活值回撤）"
+        );
+        assert!(!after.capabilities.send, "投影能力位同步回撤");
+
+        // 清理 per-adapter 测试缝。
+        adapter.set_auto_adapt_gate(None);
+        adapter.set_schema_probe_override(None);
+        adapter.set_probe_key_override(None);
+    }
+
+    /// T8 合同 4：切换队列暂停事实后，同一线程新投影可见暂停状态变化且发布版本
+    /// 推进；旧观察不得以旧版本重发（同值重复通知去重、版本严格递增）。
+    #[tokio::test]
+    async fn b1_pause_change_updates_projection_version() {
+        let adapter = DesktopIpcAdapter::new(
+            Arc::new(super::publish_protocol_tests::NoopConnector),
+            ProtocolProfile::closed(),
+        );
+        let key = a22_key("a22-pause");
+        adapter
+            .inner
+            .mirrors
+            .lock()
+            .await
+            .insert(key.clone(), ThreadMirror::new(key.clone()));
+        let paused = Arc::new(AtomicBool::new(false));
+        let flag = paused.clone();
+        adapter.set_queue_pause_source(Some(Arc::new(move |_: &str| flag.load(Ordering::Acquire))));
+        // 终审 Blocker 1：事实未装载时投影保守按暂停（写资格安全侧）；本用例
+        // 验证「变化点刷新 + 去重 + 版本推进」，故先按生产变化点装载一次事实。
+        adapter.refresh_pause_fact(&key);
+        let mut rx = adapter.subscribe();
+        let p0 = adapter.projection(&key).await;
+        assert!(!p0.queue_paused, "前置：未暂停");
+
+        // 切换暂停事实（对应生产的落行变化点）→ 变化点重发布入口。
+        paused.store(true, Ordering::Release);
+        adapter.republish_thread_projection(&key).await;
+        let e1 = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("暂停变化点必须发布")
+            .expect("broadcast 不得关闭");
+        assert!(e1.queue_paused, "同一线程新投影可见暂停状态变化");
+        assert!(
+            e1.local_seq > p0.local_seq,
+            "发布版本必须推进（旧观察不得以旧版本重发）"
+        );
+
+        // 同值重复通知：去重，不再发布。
+        adapter.republish_thread_projection(&key).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), rx.recv())
+                .await
+                .is_err(),
+            "同值重复通知不得再发布（旧观察不得以旧版本重发）"
+        );
+
+        // resume 反向变化：同样发布且版本继续推进。
+        paused.store(false, Ordering::Release);
+        adapter.republish_thread_projection(&key).await;
+        let e2 = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("resume 变化点必须发布")
+            .expect("broadcast 不得关闭");
+        assert!(!e2.queue_paused, "恢复事实可见");
+        assert!(e2.local_seq > e1.local_seq, "发布版本继续推进（严格递增）");
+
+        // 清理 per-adapter 测试缝。
+        adapter.set_queue_pause_source(None);
+    }
+
+    /// T8 合同 5：装载晚于一次新观察完成时，装载结果不得覆盖新观察已确立的事实
+    /// （对照新事实读投影）；装载前投影如实呈现，不假清不假同步。
+    ///
+    /// 当前实现的装载是 `ensure_interaction_hints` 内联一次性读（cache 命中即跳过、
+    /// 无后台装载），「晚于新观察的装载」以「逐出 cache 后的再装载」缝再现：
+    /// 新观察经 `capture_hint_observation` 把 answered 合并进 cache 而 store 仍是
+    /// 旧 pending（未落库），晚到的装载当前实现整表 `insert` 替换 → 新事实丢失。
+    /// 预期 RED。
+    #[tokio::test]
+    async fn b1_late_load_does_not_replace_new_observation() {
+        let (_dir, conn) = a22_isolated_db();
+        let store = Arc::new(StoreInteractionHints::new(DeviceStore::Owned(conn.clone())));
+        let adapter = DesktopIpcAdapter::new(
+            Arc::new(super::publish_protocol_tests::NoopConnector),
+            ProtocolProfile::closed(),
+        );
+        adapter.set_interaction_hint_store(Some(store.clone()));
+        let key = a22_key("a22-late-load");
+        a22_preload_hint(&store, &key.thread_id, "pending");
+        adapter.ensure_interaction_hints(&key).await;
+        let mirror = a22_question_mirror(&key, true);
+        adapter
+            .inner
+            .mirrors
+            .lock()
+            .await
+            .insert(key.clone(), mirror);
+
+        // 新观察：窗口内正式答复在场 → Answered；capture 合并新事实（不落库，
+        // 保持 store 侧旧 pending —— 与「落库晚于装载」的真实时序同构）。
+        let questions = {
+            let mut mirrors = adapter.inner.mirrors.lock().await;
+            let mirror = mirrors.get_mut(&key).unwrap();
+            let projection = mirror.project(adapter.current_caps());
+            assert_eq!(
+                projection.async_questions[0].state,
+                InteractionState::Answered,
+                "前置：新观察确立 Answered（状态权威）"
+            );
+            projection.async_questions
+        };
+        let captured = {
+            let mirrors = adapter.inner.mirrors.lock().await;
+            let mirror = mirrors.get(&key).unwrap();
+            adapter
+                .capture_hint_observation(&key, mirror, &questions)
+                .expect("新观察必须可捕获")
+        };
+        let _ = captured;
+        {
+            let cache = adapter.inner.interaction_hints_cache.lock().unwrap();
+            assert!(
+                cache[&key.thread_id]
+                    .iter()
+                    .any(|h| h.source_item_id == "call-1" && h.last_fact == "answered"),
+                "前置：新观察事实已合并进 cache（store 侧仍为 pending，未落库）"
+            );
+        }
+
+        // 装载前投影如实呈现（cache 在场，窗口内事实以状态分析为权威）。
+        let mirrors = adapter.inner.mirrors.lock().await;
+        let before_load = mirrors.get(&key).unwrap().project(adapter.current_caps());
+        drop(mirrors);
+        assert_eq!(
+            before_load.async_questions[0].state,
+            InteractionState::Answered,
+            "装载前投影对照新事实如实呈现，不假清不假同步"
+        );
+
+        // 晚到的装载（逐出 cache 强制再装载；store 仍是旧 pending）。
+        {
+            let mut cache = adapter.inner.interaction_hints_cache.lock().unwrap();
+            cache.remove(&key.thread_id);
+        }
+        adapter.ensure_interaction_hints(&key).await;
+        {
+            let cache = adapter.inner.interaction_hints_cache.lock().unwrap();
+            assert!(
+                cache[&key.thread_id]
+                    .iter()
+                    .any(|h| h.source_item_id == "call-1" && h.last_fact == "answered"),
+                "晚到的装载不得覆盖新观察已确立的事实（必须合并而非整表替换；当前实现整表 insert → 新事实丢失）"
+            );
+        }
+        let after = adapter.projection(&key).await;
+        assert_eq!(
+            after.async_questions[0].state,
+            InteractionState::Answered,
+            "对照新事实读投影：窗口内事实以状态分析为权威，装载不得使投影回退"
+        );
+    }
+
+    /// A1 跟进（Major #4）生产入口测量：512 回合密集镜像（每回合一题一答）装入
+    /// adapter mirrors，其一题经账本预置退役；经**生产入口**
+    /// `projection`（GET）与 `republish_thread_projection`（重发布）各跑一次并
+    /// 计时。断言：退役题 Unknown、其余题 Answered、订阅帧数符合发布次数语义
+    ///（单次变化点重发布恰好一帧，无 Lagged）。另以一次真实注入拒绝重跑
+    /// projection：拒绝路径投影仍完成、事实如实（全 Unknown 不假答）。
+    /// 墙钟只记录不断言（eprintln 微秒）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn b1_dense_multiturn_production_get_republish_measurement() {
+        use crate::services::codex_desktop_ipc::answer_validity::AnswerValidityLedger;
+        use crate::services::codex_desktop_ipc::async_question::FAIL_WITNESS_ANALYSIS_AFTER;
+        use std::time::Instant;
+        let adapter = DesktopIpcAdapter::new(
+            Arc::new(super::publish_protocol_tests::NoopConnector),
+            ProtocolProfile::closed(),
+        );
+        let key = a22_key("a22-dense-prod");
+        let ledger = Arc::new(AnswerValidityLedger::default());
+        let lease = super::super::types::OwnerLease {
+            key: key.clone(),
+            client_id: "owner".into(),
+            epoch: 1,
+            generation: 1,
+        };
+        let mut mirror = ThreadMirror::new(key.clone());
+        mirror.set_answer_validity_ledger(ledger.clone());
+        mirror.bind_hint_authority(super::super::hint_commit::HintLeaseAuthority::new(
+            lease.clone(),
+        ));
+        let question_count = 512usize;
+        let mut entities = serde_json::Map::new();
+        let mut entries = Vec::with_capacity(question_count);
+        for index in 0..question_count {
+            let turn_key = format!("turn:t{index}");
+            let question =
+                serde_json::json!(["request_user_input_async", format!("call-{index}"), 0])
+                    .to_string();
+            let envelope = format!(
+                "<send_user_message_question_reply>\n[{{\"questionItemId\":{},\"question\":\"Q\",\"answer\":\"A\"}}]\n</send_user_message_question_reply>",
+                serde_json::to_string(&question).unwrap()
+            );
+            entities.insert(
+                turn_key.clone(),
+                serde_json::json!({
+                    "turnId": format!("t{index}"),
+                    "status": "completed",
+                    "items": [
+                        {"type":"agentMessage","id":format!("call-{index}"),"questions":[{"title":"Q"}]},
+                        {"type":"userMessage","id":format!("answer-{index}"),
+                         "content":[{"type":"text","text":envelope}]}
+                    ]
+                }),
+            );
+            entries.push(serde_json::json!({"value": turn_key}));
+        }
+        let state = serde_json::json!({"turnHistory":{"history":{"isComplete":true,
+            "entitiesByKey": serde_json::Value::Object(entities),
+            "islands":[{"entries": entries}]}}});
+        mirror
+            .apply(
+                &lease,
+                &serde_json::json!({"type":"snapshot","revision":1,"conversationState":state}),
+            )
+            .unwrap();
+        // 预置退役：题 0（账本级 retire_if_observed，与生产退役同一入口）。
+        let q0 = crate::services::codex_desktop_ipc::async_question::question_item_id("call-0", 0);
+        let witness = ledger
+            .current_witness(&key, &q0)
+            .expect("前置：基线证人已在账本");
+        assert!(
+            ledger.retire_if_observed(&key, &q0, &witness),
+            "前置：预置退役必须成功"
+        );
+        adapter
+            .inner
+            .mirrors
+            .lock()
+            .await
+            .insert(key.clone(), mirror);
+        let mut rx = adapter.subscribe();
+
+        // GET（生产 projection 入口）计时 + 退役/在场语义。
+        let started = Instant::now();
+        let projection = adapter.projection(&key).await;
+        let get_us = started.elapsed().as_micros();
+        assert_eq!(projection.async_questions.len(), question_count);
+        assert_eq!(
+            projection
+                .async_questions
+                .iter()
+                .filter(|q| q.state == InteractionState::Unknown)
+                .count(),
+            1,
+            "预置退役题必须 Unknown"
+        );
+        assert_eq!(
+            projection
+                .async_questions
+                .iter()
+                .filter(|q| q.state == InteractionState::Answered)
+                .count(),
+            question_count - 1,
+            "其余题 Answered"
+        );
+
+        // 重发布（生产变化点入口）计时 + 订阅帧数语义（单次变化点恰好一帧）。
+        let started = Instant::now();
+        adapter.republish_thread_projection(&key).await;
+        let republish_us = started.elapsed().as_micros();
+        let frame = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("重发布必须发布一帧")
+            .expect("broadcast 不得关闭");
+        assert_eq!(frame.thread_id, key.thread_id);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), rx.recv())
+                .await
+                .is_err(),
+            "单次变化点重发布只发布一帧（多余帧或 Lagged 视为失败）"
+        );
+        eprintln!(
+            "dense-prod: questions={question_count} get_us={get_us} republish_us={republish_us} frames=1 lagged=false"
+        );
+
+        // 拒绝路径：注入一次分析拒绝 → 投影仍完成、事实如实（全 Unknown 不假答）。
+        FAIL_WITNESS_ANALYSIS_AFTER.with(|remaining| remaining.set(Some(0)));
+        let started = Instant::now();
+        let refused = tokio::time::timeout(Duration::from_secs(5), adapter.projection(&key))
+            .await
+            .expect("拒绝路径投影不得悬挂");
+        let refused_us = started.elapsed().as_micros();
+        FAIL_WITNESS_ANALYSIS_AFTER.with(|remaining| remaining.set(None));
+        assert_eq!(
+            refused
+                .async_questions
+                .iter()
+                .filter(|q| q.state == InteractionState::Unknown)
+                .count(),
+            question_count,
+            "分析拒绝路径：全部题如实 Unknown（不假答、不悬挂）"
+        );
+        eprintln!(
+            "dense-prod-refused: questions={question_count} get_us={refused_us} unknown={question_count}/{question_count}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod b1_t101_handoff_tests {
+    //! A4（T10.1：异步撤销、停止监督与活连接串行交接）。
+    //! 夹具风格对照 `b1_connection_cleanup_transition_tests`（活 fake IPC 双工 +
+    //! 真实 bootstrap/恢复任务）。合同点 = 串行重装/退场状态/交接凭据（当前实现
+    //! 未建的部分在 red-analysis.md 逐条写明「合同点 = X，当前实现 = Y」）。
+
+    use super::*;
+    use std::collections::VecDeque;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::time::{timeout, Duration};
+
+    struct TwoConnector(std::sync::Mutex<VecDeque<super::super::transport::BoxIo>>);
+    impl Connector for TwoConnector {
+        fn connect_endpoint(
+            &self,
+        ) -> Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<
+                            (
+                                super::super::transport::BoxIo,
+                                super::super::transport::DesktopEndpoint,
+                            ),
+                            ProtocolError,
+                        >,
+                    > + Send
+                    + '_,
+            >,
+        > {
+            Box::pin(async move {
+                let io = self
+                    .0
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .ok_or_else(|| ProtocolError::Disconnected("fixture exhausted".into()))?;
+                Ok((
+                    io,
+                    super::super::transport::DesktopEndpoint {
+                        platform: "windows".into(),
+                        path: "fixture".into(),
+                        build: Some("26.1013.3656.0".into()),
+                    },
+                ))
+            })
+        }
+    }
+
+    struct Peer {
+        io: tokio::io::DuplexStream,
+        decoder: super::super::codec::FrameDecoder,
+        frames: VecDeque<Value>,
+    }
+    impl Peer {
+        fn new(io: tokio::io::DuplexStream) -> Self {
+            Self {
+                io,
+                decoder: super::super::codec::FrameDecoder::new(),
+                frames: VecDeque::new(),
+            }
+        }
+        async fn receive(&mut self) -> Result<Value, String> {
+            loop {
+                if let Some(v) = self.frames.pop_front() {
+                    return Ok(v);
+                }
+                let mut buf = [0u8; 16384];
+                let n = self.io.read(&mut buf).await.map_err(|e| e.to_string())?;
+                if n == 0 {
+                    return Err("EOF".into());
+                }
+                self.frames
+                    .extend(self.decoder.push(&buf[..n]).map_err(|e| format!("{e:?}"))?);
+            }
+        }
+        async fn send(&mut self, v: Value) -> Result<(), String> {
+            self.io
+                .write_all(&super::super::codec::encode_frame(&v).map_err(|e| format!("{e:?}"))?)
+                .await
+                .map_err(|e| e.to_string())
+        }
+    }
+
+    fn hand_key(id: &str) -> ThreadKey {
+        ThreadKey {
+            host_id: "local".into(),
+            thread_id: id.into(),
+        }
+    }
+
+    fn hand_question() -> super::super::async_question::AsyncQuestionView {
+        super::super::async_question::AsyncQuestionView {
+            question_key: super::super::async_question::question_item_id("call-1", 0),
+            context_token: "test-only".into(),
+            source_turn_id: "q".into(),
+            source_item_id: "call-1".into(),
+            question_index: 0,
+            title: "Q".into(),
+            options: vec![],
+            state: super::super::async_question::InteractionState::Unknown,
+            actionable: false,
+            disabled_reason_code: None,
+        }
+    }
+
+    fn qa_snapshot() -> Value {
+        let envelope = super::super::async_question::compose_async_answer("call-1", 0, "Q", "A");
+        serde_json::json!({"turns":[],"requests":[],"threadRuntimeStatus":{"type":"active"},
+            "turnHistory":{"history":{"isComplete":true,"entitiesByKey":{
+                "q":{"turnId":"q","items":[{"type":"agentMessage","id":"call-1","questions":[{"title":"Q"}]}]},
+                "a":{"turnId":"a","items":[{"type":"userMessage","id":"answer-1","content":[{"type":"text","text":envelope}]}]}
+            },"islands":[{"entries":[{"value":"q"},{"value":"a"}]}]}}})
+    }
+
+    /// 单连接 bootstrap：initialize → （首次时 recovery_loop）→ discovery →
+    /// following → snapshot（revision/client 由调用方指定）。第二次连接的
+    /// recovery 由断链的 forwarder 自动单飞派发（spawn_recovery_task）。
+    async fn bootstrap_epoch(
+        adapter: &DesktopIpcAdapter,
+        peer: &mut Peer,
+        key: &ThreadKey,
+        client: &str,
+        revision: u64,
+        conversation_state: Value,
+        spawn_recovery: bool,
+    ) -> Result<(), String> {
+        let init = timeout(Duration::from_secs(5), peer.receive())
+            .await
+            .map_err(|_| "bootstrap: initialize 未到达".to_string())??;
+        if init["method"] != "initialize" {
+            return Err(format!("missing initialize: {init}"));
+        }
+        peer.send(
+            serde_json::json!({"type":"response","requestId":init["requestId"],"resultType":"success",
+                "method":"initialize","handledByClientId":client,"result":{"clientId":client}}),
+        )
+        .await?;
+        if spawn_recovery {
+            let recovery_adapter = adapter.clone();
+            tokio::spawn(async move { recovery_loop(&recovery_adapter).await });
+        }
+        while !adapter
+            .inner
+            .transition_test_probe
+            .subscribed
+            .load(Ordering::Acquire)
+        {
+            tokio::task::yield_now().await;
+        }
+        let disc = timeout(Duration::from_secs(5), peer.receive())
+            .await
+            .map_err(|_| "bootstrap: discovery 未到达".to_string())??;
+        if disc["method"] != "thread-owner-discovery" {
+            return Err(format!("unexpected discovery: {disc}"));
+        }
+        peer.send(
+            serde_json::json!({"type":"response","requestId":disc["requestId"],"resultType":"success",
+                "method":"thread-owner-discovery","handledByClientId":client,
+                "result":{"supportsUntrustedAppInput":true}}),
+        )
+        .await?;
+        let following = timeout(Duration::from_secs(5), peer.receive())
+            .await
+            .map_err(|_| "bootstrap: following-changed 未到达".to_string())??;
+        if following["method"] != "thread-stream-following-changed" {
+            return Err(format!("unexpected following: {following}"));
+        }
+        peer.send(
+            serde_json::json!({"type":"broadcast","method":"thread-stream-state-changed","version":11,
+                "sourceClientId":client,"params":{"conversationId":key.thread_id,"hostId":"local",
+                "change":{"type":"snapshot","revision":revision,"conversationState":conversation_state}}}),
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn wait_fresh_mirror(
+        adapter: &DesktopIpcAdapter,
+        key: &ThreadKey,
+        revision: u64,
+        client: &str,
+    ) -> bool {
+        let deadline = std::time::Instant::now() + Duration::from_secs(8);
+        while std::time::Instant::now() < deadline {
+            let mirrors = adapter.inner.mirrors.lock().await;
+            if mirrors.get(key).is_some_and(|m| {
+                !m.is_stale()
+                    && m.revision() == Some(revision)
+                    && m.lease().is_some_and(|l| l.client_id == client)
+            }) {
+                return true;
+            }
+            drop(mirrors);
+            tokio::task::yield_now().await;
+        }
+        false
+    }
+
+    /// T10.1 合同 1：retiring 实例的在途观察者（驻停在 mutation 票后的 handler）
+    /// 完成或被明确拒绝前，替代活跃实例（新代接管）不得启动。
+    ///
+    /// 可观察对照：在途观察者驻停（resume 未发送）期间，替代连接的 initialize
+    /// 不得到达（接管未启动）。当前实现：断链即 recovery/ensure_connection 接管
+    /// ——initialize 在观察者驻停期间到达 → RED。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn b1_active_adapter_handoff_waits_for_observers() {
+        let (client_io, server) = tokio::io::duplex(65536);
+        let (client_io2, server2) = tokio::io::duplex(65536);
+        let adapter = DesktopIpcAdapter::new(
+            Arc::new(TwoConnector(std::sync::Mutex::new(VecDeque::from([
+                Box::new(client_io) as super::super::transport::BoxIo,
+                Box::new(client_io2) as super::super::transport::BoxIo,
+            ])))),
+            ProtocolProfile::closed(),
+        );
+        adapter.inner.epoch.store(1, Ordering::SeqCst);
+        let key = hand_key("hand-a");
+        adapter.inner.followings.lock().await.follow(key.clone());
+        let mut pre_mirror = ThreadMirror::new(key.clone());
+        pre_mirror.set_answer_validity_ledger(adapter.inner.answer_validity.clone());
+        adapter
+            .inner
+            .mirrors
+            .lock()
+            .await
+            .insert(key.clone(), pre_mirror);
+        let bootstrap_adapter = adapter.clone();
+        let bootstrap = tokio::spawn(async move { bootstrap_adapter.ensure_connection().await });
+        let mut peer = Peer::new(server);
+        bootstrap_epoch(
+            &adapter,
+            &mut peer,
+            &key,
+            "owner-1",
+            42,
+            serde_json::json!({"turns":[],"requests":[],"threadRuntimeStatus":{"type":"active"}}),
+            true,
+        )
+        .await
+        .unwrap();
+        assert!(
+            wait_fresh_mirror(&adapter, &key, 42, "owner-1").await,
+            "前置：epoch-1 镜像在场"
+        );
+        // 在途观察者驻停（mutation 票后）。
+        let (entered_rx, resume_tx) = arm_source_actor_pause("hand-a");
+        peer.send(
+            serde_json::json!({"type":"broadcast","method":"thread-stream-state-changed","version":11,
+                "sourceClientId":"owner-1","params":{"conversationId":key.thread_id,"hostId":"local",
+                "change":{"type":"patches","baseRevision":42,"revision":43,"patches":[
+                    {"op":"replace","path":["threadRuntimeStatus","type"],"value":"busy"}]}}}),
+        )
+        .await
+        .unwrap();
+        timeout(Duration::from_secs(5), entered_rx)
+            .await
+            .expect("观察者必须到达驻停点")
+            .expect("entered channel");
+        // 断链 → recovery/ensure_connection（新代接管）。
+        drop(peer);
+        let mut peer2 = Peer::new(server2);
+        // 合同可观察对照：观察者仍驻停期间，替代连接的 initialize 不得到达。
+        let init_arrived = timeout(Duration::from_secs(3), peer2.receive())
+            .await
+            .is_ok();
+        resume_tx.send(()).unwrap();
+        clear_source_actor_pause();
+        let landed = wait_fresh_mirror(&adapter, &key, 100, "owner-2").await;
+        assert!(
+            !init_arrived && !landed,
+            "合同点=替代接管须等在途观察者完成/拒绝；当前实现=断链即接管\
+            （initialize 在观察者驻停期间到达：init_arrived={init_arrived}，\
+             新代落地={landed}）→ RED"
+        );
+        adapter.begin_shutdown();
+    }
+
+    /// T10.1 合同 2：换代后旧实例的迟到帧/恢复不得变更共享账本（owners /
+    /// answer_validity）——迟到 old-epoch 帧的观察者（驻停后跨换代恢复）不得
+    /// 改写新代 lease/revision，也不得凭其改写退役/复活旧证人。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn b1_old_observer_cannot_mutate_ledger_after_handoff() {
+        let (client_io, server) = tokio::io::duplex(65536);
+        let (client_io2, server2) = tokio::io::duplex(65536);
+        let adapter = DesktopIpcAdapter::new(
+            Arc::new(TwoConnector(std::sync::Mutex::new(VecDeque::from([
+                Box::new(client_io) as super::super::transport::BoxIo,
+                Box::new(client_io2) as super::super::transport::BoxIo,
+            ])))),
+            ProtocolProfile::closed(),
+        );
+        adapter.inner.epoch.store(1, Ordering::SeqCst);
+        let key = hand_key("hand-b");
+        adapter.inner.followings.lock().await.follow(key.clone());
+        let mut pre_mirror = ThreadMirror::new(key.clone());
+        pre_mirror.set_answer_validity_ledger(adapter.inner.answer_validity.clone());
+        adapter
+            .inner
+            .mirrors
+            .lock()
+            .await
+            .insert(key.clone(), pre_mirror);
+        let bootstrap_adapter = adapter.clone();
+        let bootstrap = tokio::spawn(async move { bootstrap_adapter.ensure_connection().await });
+        let mut peer = Peer::new(server);
+        bootstrap_epoch(
+            &adapter,
+            &mut peer,
+            &key,
+            "owner-1",
+            42,
+            qa_snapshot(),
+            true,
+        )
+        .await
+        .unwrap();
+        assert!(wait_fresh_mirror(&adapter, &key, 42, "owner-1").await);
+        let qk = super::super::async_question::question_item_id("call-1", 0);
+        let witness_before = adapter
+            .inner
+            .answer_validity
+            .current_witness(&key, &qk)
+            .expect("前置：W1 已入账本");
+        // 在途观察者驻停（旧代改写答复正文的帧）。
+        let (entered_rx, resume_tx) = arm_source_actor_pause("hand-b");
+        let rewritten = {
+            let envelope =
+                super::super::async_question::compose_async_answer("call-1", 0, "Q", "A2");
+            serde_json::json!({"type":"broadcast","method":"thread-stream-state-changed","version":11,
+                "sourceClientId":"owner-1","params":{"conversationId":key.thread_id,"hostId":"local",
+                "change":{"type":"patches","baseRevision":42,"revision":43,"patches":[
+                    {"op":"replace","path":["turnHistory","history","entitiesByKey","turn:a","items",0,"content",0,"text"],
+                     "value":envelope}]}}})
+        };
+        peer.send(rewritten).await.unwrap();
+        timeout(Duration::from_secs(5), entered_rx)
+            .await
+            .expect("旧代观察者必须到达驻停点")
+            .expect("entered channel");
+        // 旧代观察者驻停期间断链；单写转发的 forwarder 被驻停 handler 阻塞，
+        // 断链事件在其恢复后才被处理（换代在恢复后启动）——恢复时旧代 lease
+        // 已非现行，旧观察者的写请求在 apply 前被 is_current 拒绝。
+        drop(peer);
+        resume_tx.send(()).unwrap();
+        clear_source_actor_pause();
+        let mut peer2 = Peer::new(server2);
+        bootstrap_epoch(
+            &adapter,
+            &mut peer2,
+            &key,
+            "owner-2",
+            100,
+            qa_snapshot(),
+            false,
+        )
+        .await
+        .expect("新代 bootstrap 必须完成");
+        assert!(
+            wait_fresh_mirror(&adapter, &key, 100, "owner-2").await,
+            "新代镜像已落地"
+        );
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+        let current_client = adapter
+            .inner
+            .owners
+            .lock()
+            .await
+            .current(&key)
+            .map(|lease| lease.client_id.clone());
+        let mirrors = adapter.inner.mirrors.lock().await;
+        let mirror = mirrors.get(&key).unwrap();
+        assert!(
+            mirror.revision() == Some(100)
+                && mirror
+                    .lease()
+                    .is_some_and(|l| l.client_id == "owner-2" && l.epoch >= 2),
+            "换代后旧观察者恢复不得改写新代 lease/revision"
+        );
+        drop(mirrors);
+        assert!(
+            current_client
+                .as_ref()
+                .is_some_and(|client| client == "owner-2"),
+            "owners 现行 lease 保持新代"
+        );
+        assert!(
+            adapter
+                .inner
+                .answer_validity
+                .allows_candidate(&key, &qk, "answer-1"),
+            "旧代改写帧不得使 W1 退役（账本不被迟到观察者变更）"
+        );
+        assert_eq!(
+            adapter.inner.answer_validity.current_witness(&key, &qk),
+            Some(witness_before),
+            "账本证人保持（不被迟到观察者改写）"
+        );
+        adapter.begin_shutdown();
+        drop(peer2);
+    }
+
+    /// T10.1 合同 3：重装（同实例重连，新代 + 活动连接）保留已退役证人——
+    /// retired 不清、退役答复重放不复活，且新代在活动连接下正常出 Fresh 镜像。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn b1_reinstall_preserves_retired_witnesses_with_active_connection() {
+        let (client_io, server) = tokio::io::duplex(65536);
+        let (client_io2, server2) = tokio::io::duplex(65536);
+        let adapter = DesktopIpcAdapter::new(
+            Arc::new(TwoConnector(std::sync::Mutex::new(VecDeque::from([
+                Box::new(client_io) as super::super::transport::BoxIo,
+                Box::new(client_io2) as super::super::transport::BoxIo,
+            ])))),
+            ProtocolProfile::closed(),
+        );
+        adapter.inner.epoch.store(1, Ordering::SeqCst);
+        let key = hand_key("hand-c");
+        adapter.inner.followings.lock().await.follow(key.clone());
+        let mut pre_mirror = ThreadMirror::new(key.clone());
+        pre_mirror.set_answer_validity_ledger(adapter.inner.answer_validity.clone());
+        adapter
+            .inner
+            .mirrors
+            .lock()
+            .await
+            .insert(key.clone(), pre_mirror);
+        let bootstrap_adapter = adapter.clone();
+        let bootstrap = tokio::spawn(async move { bootstrap_adapter.ensure_connection().await });
+        let mut peer = Peer::new(server);
+        bootstrap_epoch(
+            &adapter,
+            &mut peer,
+            &key,
+            "owner-1",
+            42,
+            qa_snapshot(),
+            true,
+        )
+        .await
+        .unwrap();
+        assert!(wait_fresh_mirror(&adapter, &key, 42, "owner-1").await);
+        let qk = super::super::async_question::question_item_id("call-1", 0);
+        let witness = adapter
+            .inner
+            .answer_validity
+            .current_witness(&key, &qk)
+            .expect("前置：W1 在场");
+        assert!(
+            adapter
+                .inner
+                .answer_validity
+                .retire_if_observed(&key, &qk, &witness),
+            "前置：预置退役成功"
+        );
+        // 重装：断链 → 同实例重连（新代、活动连接、内容原样恢复）。
+        drop(peer);
+        let mut peer2 = Peer::new(server2);
+        bootstrap_epoch(
+            &adapter,
+            &mut peer2,
+            &key,
+            "owner-2",
+            100,
+            qa_snapshot(),
+            false,
+        )
+        .await
+        .expect("新代 bootstrap 必须完成");
+        assert!(wait_fresh_mirror(&adapter, &key, 100, "owner-2").await);
+        // 断言：retired 不清 + 重放不复活 + 新代活动连接正常。
+        assert!(
+            !adapter
+                .inner
+                .answer_validity
+                .allows_candidate(&key, &qk, "answer-1"),
+            "重装后已退役证人必须保留（retired 不清）"
+        );
+        let projection = adapter.projection(&key).await;
+        assert_eq!(projection.async_questions.len(), 1);
+        assert_eq!(
+            projection.async_questions[0].state,
+            super::super::async_question::InteractionState::Unknown,
+            "退役答复重放不得复活（新代投影 Unknown）"
+        );
+        assert!(!projection.stale, "新代在活动连接下出 Fresh 投影");
+        adapter.begin_shutdown();
+        drop(peer2);
+    }
+
+    /// T10.1 合同 4：交接/停止的 3s 等待上界超时后，旧任务仍被监督（不得
+    /// abort / 声称已终止）——其副作用在自然完成后完整可见，监督面（单写
+    /// worker）继续消费后续任务。
+    ///
+    /// 合同点 = 停止对 hint-write worker 的 ≤3s 受控等待 + 句柄保留；当前实现
+    /// = 无受控等待（worker 由 Arc 托管自然存活、无 join/abort 面）→ 该子点
+    /// 在 red-analysis.md 记录为未实现面；本用例钉住可观察面：在飞写不被
+    /// abort、效果完整、worker 在 shutdown 后仍继续消费。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn b1_handoff_timeout_keeps_old_tasks_supervised() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a4-handoff.sqlite");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch("PRAGMA journal_mode=DELETE").unwrap();
+        crate::database::schema::init(&conn);
+        crate::database::migration::migrate(&conn).unwrap();
+        let conn = Arc::new(std::sync::Mutex::new(conn));
+        let store = Arc::new(crate::remote::codex_evidence::StoreInteractionHints::new(
+            crate::remote::pairing::DeviceStore::Owned(conn.clone()),
+        ));
+        let adapter = DesktopIpcAdapter::new(
+            Arc::new(super::publish_protocol_tests::NoopConnector),
+            ProtocolProfile::closed(),
+        );
+        adapter.set_interaction_hint_store(Some(store.clone()));
+        let key = hand_key("hand-d");
+        let lease = super::super::types::OwnerLease {
+            key: key.clone(),
+            client_id: "owner".into(),
+            epoch: 1,
+            generation: 1,
+        };
+        let mut mirror = ThreadMirror::new(key.clone());
+        mirror.bind_hint_authority(super::super::hint_commit::HintLeaseAuthority::new(
+            lease.clone(),
+        ));
+        mirror
+            .apply(
+                &lease,
+                &serde_json::json!({"type":"snapshot","revision":1,"conversationState":{}}),
+            )
+            .unwrap();
+        adapter.ensure_interaction_hints(&key).await;
+        let authorized = adapter
+            .capture_hint_observation(&key, &mirror, &[hand_question()])
+            .expect("capture 必须可注册（写批来源）");
+        // 慢写在飞：占用真实 DB 锁（std::sync::Mutex guard）。
+        let guard = conn.lock().unwrap();
+        adapter.enqueue_persist_authorized_hints(authorized);
+        // 3s 等待上界窗口：无受控等待面（合同点未实现），期间任务不得被 abort。
+        adapter.begin_shutdown();
+        for _ in 0..30 {
+            tokio::task::yield_now().await;
+        }
+        drop(guard);
+        // 副作用在自然完成后完整可见（未被 abort/回滚）。
+        let reader = rusqlite::Connection::open(&path).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut rows = 0i64;
+        while std::time::Instant::now() < deadline {
+            rows = reader
+                .query_row("SELECT count(*) FROM codex_interaction_hints", [], |r| {
+                    r.get(0)
+                })
+                .unwrap_or(0);
+            if rows >= 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(rows >= 1, "在飞写任务不被 abort：副作用完整落库");
+        // 监督面（单写 worker）在 shutdown 后继续消费后续任务：第二次 capture
+        // 携带新事实（Answered）→ 新 dirty → 批次非空 → 同行 UPSERT 为 answered
+        //（store 每提示身份一行，行数不变、事实值更新）。
+        let mut answered_question = hand_question();
+        answered_question.state = super::super::async_question::InteractionState::Answered;
+        let authorized2 = adapter
+            .capture_hint_observation(&key, &mirror, &[answered_question])
+            .expect("二次 capture");
+        adapter.enqueue_persist_authorized_hints(authorized2);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut answered_rows = 0i64;
+        while std::time::Instant::now() < deadline {
+            answered_rows = reader
+                .query_row(
+                    "SELECT count(*) FROM codex_interaction_hints WHERE last_fact = 'answered'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+            if answered_rows >= 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            answered_rows >= 1,
+            "监督面（单写 worker）在 shutdown 后继续消费任务：新事实经 UPSERT 落库"
+        );
+        eprintln!("handoff-timeout: answered_rows_after_shutdown_write={answered_rows}");
     }
 }
