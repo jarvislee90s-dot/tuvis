@@ -69,13 +69,16 @@ The screenshot above shows the site's interactive demo.
 - **Codex APP per-operation adaptation** (F01–F08): Tuvis identifies the **running desktop
   contract** read-only and unlocks actions one by one — plain messages, blocking Q&A
   (multi-question / multi-value / free text), command and file approvals (approve / reject /
-  cancel the turn), targeted interrupt, and **idle async answers**. Desktop updates normally need
+  cancel the turn), targeted interrupt, and **async answers while idle or running**. Desktop updates normally need
   no version registration; when identification is uncertain the affected actions stay closed with
   a stated reason — no guessing, no blind writes.
-  - **Async questions**: while a turn is running the draft is kept and the card says it cannot be
-    submitted yet, with the reason; once idle you press "Submit answer" and it is delivered
-    **once** as the official envelope (never through the plain-message queue). If the related
-    history is incomplete the card shows "status unconfirmed" and will not answer for you.
+  - **Async questions**: once the separate running-answer contract matches and Auto-adapt is
+    enabled, you can submit the group while the model runs. The model keeps running, and the
+    existing queue pause and other queued messages stay unchanged. After acceptance, the group
+    closes only when the desktop's formal answer is confirmed; unknown results are checked
+    read-only under the original action and are never resent automatically. If state or history
+    is unconfirmed, or a native blocking request is present, the draft is kept: handle the stated
+    reason before submitting again.
   - **Approvals**: "Reject" rejects only this request (the turn continues); "Cancel the turn"
     interrupts the turn. When a file summary cannot be read there is no "Approve" entry — only
     reject or cancel.
@@ -125,7 +128,7 @@ Not just looking — you can **act**: send messages, approve tool calls, answer 
 
 **Mobile remote control status (v0.5.0, experimental)**: message viewing and file preview cover 7 of the 8 tools (OpenClaw's black-box build is not remotely readable yet); **sending messages to CLI sessions and creating sessions from your phone are experimental**, currently supporting Claude Code / Codex CLI / OpenCode / Kimi Code. Messages are injected as keystrokes into the terminal and verified by screen-reading receipts (no false "delivered"); queueing, interrupt-and-jump, remote approvals, question answering, permission-mode switching, and session creation are included. Illustrated walkthroughs live in the Chinese manual; per-tool statuses and limitations are listed below.
 
-**Codex Desktop adaptive control (0.6.3, experimental)**: Tuvis reads the running Desktop contract and unlocks actions per operation — plain messages, blocking Q&A (multi-question / multi-value / free text), command and file approvals (accept / decline / cancel), targeted interrupt, and idle async answers. An unknown build attempts sends under target/state/protocol guards; destructive actions stay evidence-gated. Desktop sessions never fall back to headless.
+**Codex Desktop adaptive control (experimental)**: Tuvis reads the running Desktop contract and unlocks actions per operation — plain messages, blocking Q&A (multi-question / multi-value / free text), command and file approvals (accept / decline / cancel), targeted interrupt, and async answers while idle or running. An unknown build attempts sends under target/state/protocol guards; destructive actions stay evidence-gated. Desktop sessions never fall back to headless.
 
 - **Archiving and submitting async questions**: formal answers on Desktop or the remote page dismiss the matching card on the other side. Fill drafts while a turn runs and submit once Desktop is idle. When an unanswered card is skipped or closed in Desktop, use the archive action in Tuvis to hide the group. “Restore” brings back the archived groups in the current list and keeps drafts on the page.
 - **Grouped async questions**: one card per source group; fill question by question, previous/next keeps drafts, and submit the whole group once from the last question. When several groups are waiting, the dock shows the current group only and a "{{count}} more group(s)" entry expands the list of the other waiting groups to switch between (answered groups are not counted). Long question stems collapse to three lines with "Show full question" / "Collapse question"; free-text input starts collapsed behind "Other answer"; the question, options and free-input text follow the session font-size setting while submit and other buttons keep their size. Answered groups close automatically and do not return after refresh.
