@@ -30,6 +30,8 @@ function question(
 const five = () => [0, 1, 2, 3, 4].map((i) => question(i));
 
 let fetchMock: ReturnType<typeof vi.fn>;
+let testSessionId = "";
+let testSessionSequence = 0;
 let respondStatus = 200;
 let respondBody: Record<string, unknown> = {};
 let verifyBody: Record<string, unknown> = {
@@ -44,6 +46,7 @@ let verifyBody: Record<string, unknown> = {
 };
 
 beforeEach(() => {
+  testSessionId = `async-card-case-${++testSessionSequence}`;
   respondStatus = 200;
   verifyBody = {
     actionId: "act-g",
@@ -110,7 +113,7 @@ describe("B02 统一蓝卡", () => {
 
 describe("C03/C04 可见选中与实发答案一致", () => {
   it("single_select_has_visible_selected_style_and_survives_return", () => {
-    render(<AsyncQuestionGroupCard sessionId="s1" questions={five()} />);
+    render(<AsyncQuestionGroupCard sessionId={testSessionId} questions={five()} />);
     fireEvent.click(screen.getByRole("button", { name: "甲" }));
     const selected = screen.getByRole("button", { name: "甲" });
     expect(selected.className).toContain("ring-1");
@@ -122,7 +125,7 @@ describe("C03/C04 可见选中与实发答案一致", () => {
   });
 
   it("last_option_click_overrides_old_free_text_in_submitted_answer", async () => {
-    render(<AsyncQuestionGroupCard sessionId="s1" questions={[question(0)]} />);
+    render(<AsyncQuestionGroupCard sessionId={testSessionId} questions={[question(0)]} />);
     // T04：自由填写默认收起——先展开再输入
     fireEvent.click(screen.getByTestId("codex-async-free-toggle"));
     fireEvent.change(screen.getByTestId("codex-async-free"), {
@@ -139,7 +142,7 @@ describe("C03/C04 可见选中与实发答案一致", () => {
   });
 
   it("free_text_after_option_click_wins_and_clears_visible_selection", async () => {
-    render(<AsyncQuestionGroupCard sessionId="s1" questions={[question(0)]} />);
+    render(<AsyncQuestionGroupCard sessionId={testSessionId} questions={[question(0)]} />);
     fireEvent.click(screen.getByRole("button", { name: "甲" }));
     // T04：自由填写默认收起——点「其他答案」展开后输入
     fireEvent.click(screen.getByTestId("codex-async-free-toggle"));
@@ -208,7 +211,11 @@ describe("B04/B05 同组多题单卡一次提交", () => {
       disabledReasonCode: "operation_queue_paused",
     }));
     render(
-      <AsyncQuestionGroupCard sessionId="s1" questions={paused} onChanged={() => undefined} />
+      <AsyncQuestionGroupCard
+        sessionId={testSessionId}
+        questions={paused}
+        onChanged={() => undefined}
+      />
     );
     expect(screen.getByTestId("codex-async-pause-note")).toBeTruthy();
     expect(screen.queryByTestId("codex-async-bypass")).toBeNull();
@@ -269,12 +276,14 @@ describe("B04/B05 同组多题单卡一次提交", () => {
 });
 
 function SessionDetailGroup() {
-  return <AsyncQuestionGroupCard sessionId="s1" questions={five()} />;
+  return <AsyncQuestionGroupCard sessionId={testSessionId} questions={five()} />;
 }
 
 describe("G03/G09 组身份与提交状态机", () => {
   it("g03_non_first_member_change_requires_reconfirmation", () => {
-    const { rerender } = render(<AsyncQuestionGroupCard sessionId="s1" questions={five()} />);
+    const { rerender } = render(
+      <AsyncQuestionGroupCard sessionId={testSessionId} questions={five()} />
+    );
     fireEvent.click(screen.getByRole("button", { name: "甲" })); // q0
     fireEvent.click(screen.getByTestId("codex-async-next"));
     fireEvent.click(screen.getByRole("button", { name: "甲" })); // q1
@@ -282,7 +291,7 @@ describe("G03/G09 组身份与提交状态机", () => {
     const changed = five().map((q, i) =>
       i === 1 ? { ...q, contextToken: "ctx:1-new", title: "问题2已更新" } : q
     );
-    rerender(<AsyncQuestionGroupCard sessionId="s1" questions={changed} />);
+    rerender(<AsyncQuestionGroupCard sessionId={testSessionId} questions={changed} />);
     expect(screen.getByTestId("codex-async-stale-note")).toBeTruthy();
     // q0 旧稿保留；q1 旧答案不得带入新题。
     expect(screen.getByTestId("codex-async-question").getAttribute("data-progress")).toBe("1/5");
@@ -297,7 +306,7 @@ describe("G03/G09 组身份与提交状态机", () => {
   });
 
   it("g09_accepted_is_not_completion_and_waits_for_answers", async () => {
-    render(<AsyncQuestionGroupCard sessionId="s1" questions={[question(0)]} />);
+    render(<AsyncQuestionGroupCard sessionId={testSessionId} questions={[question(0)]} />);
     fireEvent.click(screen.getByRole("button", { name: "甲" }));
     fireEvent.click(screen.getByTestId("codex-async-submit"));
     await waitFor(() =>
@@ -311,7 +320,7 @@ describe("G03/G09 组身份与提交状态机", () => {
 
   it("g09_unknown_cannot_resubmit", async () => {
     respondStatus = 500;
-    render(<AsyncQuestionGroupCard sessionId="s1" questions={[question(0)]} />);
+    render(<AsyncQuestionGroupCard sessionId={testSessionId} questions={[question(0)]} />);
     fireEvent.click(screen.getByRole("button", { name: "甲" }));
     fireEvent.click(screen.getByTestId("codex-async-submit"));
     await waitFor(() =>
@@ -341,7 +350,7 @@ describe("G03/G09 组身份与提交状态机", () => {
       }
       return new Response("{}", { status: 200 });
     });
-    render(<AsyncQuestionGroupCard sessionId="s1" questions={[question(0)]} />);
+    render(<AsyncQuestionGroupCard sessionId={testSessionId} questions={[question(0)]} />);
     fireEvent.click(screen.getByRole("button", { name: "甲" }));
     fireEvent.click(screen.getByTestId("codex-async-submit"));
     await act(async () => {
@@ -383,7 +392,9 @@ describe("G03/G09 组身份与提交状态机", () => {
 
 describe("J03—J09 核对/复核/草稿恢复", () => {
   it("j09_normal_group_has_no_pause_warning_and_paused_has_exactly_one", () => {
-    const { unmount } = render(<AsyncQuestionGroupCard sessionId="s1" questions={five()} />);
+    const { unmount } = render(
+      <AsyncQuestionGroupCard sessionId={testSessionId} questions={five()} />
+    );
     expect(screen.queryByTestId("codex-async-pause-note")).toBeNull();
     unmount();
     const paused = five().map((q) => ({
@@ -392,7 +403,7 @@ describe("J03—J09 核对/复核/草稿恢复", () => {
       state: "temporarily_blocked" as const,
       disabledReasonCode: "operation_queue_paused",
     }));
-    render(<AsyncQuestionGroupCard sessionId="s1" questions={paused} />);
+    render(<AsyncQuestionGroupCard sessionId={testSessionId} questions={paused} />);
     expect(screen.getAllByTestId("codex-async-pause-note")).toHaveLength(1);
     expect(screen.queryByTestId("codex-async-blocked-reason")).toBeNull();
   });
@@ -410,7 +421,7 @@ describe("J03—J09 核对/复核/草稿恢复", () => {
       }
       return new Response(JSON.stringify(respondBody), { status: 200 });
     });
-    render(<AsyncQuestionGroupCard sessionId="s1" questions={[question(0)]} />);
+    render(<AsyncQuestionGroupCard sessionId={testSessionId} questions={[question(0)]} />);
     fireEvent.click(screen.getByRole("button", { name: "甲" }));
     fireEvent.click(screen.getByTestId("codex-async-submit"));
     await act(async () => {
@@ -454,7 +465,7 @@ describe("J03—J09 核对/复核/草稿恢复", () => {
       }
       return new Response(JSON.stringify({ error: "internal" }), { status: 500 });
     });
-    render(<AsyncQuestionGroupCard sessionId="s1" questions={[question(0)]} />);
+    render(<AsyncQuestionGroupCard sessionId={testSessionId} questions={[question(0)]} />);
     fireEvent.click(screen.getByRole("button", { name: "甲" }));
     fireEvent.click(screen.getByTestId("codex-async-submit"));
     await waitFor(() =>
@@ -493,13 +504,19 @@ describe("J03—J09 核对/复核/草稿恢复", () => {
   it("j05_newly_answered_member_requires_its_own_confirmation", () => {
     const q0Answered = { ...question(0), state: "answered" as const, actionable: false };
     const { rerender } = render(
-      <AsyncQuestionGroupCard sessionId="s1" questions={[q0Answered, question(1), question(2)]} />
+      <AsyncQuestionGroupCard
+        sessionId={testSessionId}
+        questions={[q0Answered, question(1), question(2)]}
+      />
     );
     fireEvent.click(screen.getByTestId("codex-async-partial-confirm"));
     // 新增 q1 已答 → 旧确认不能覆盖新成员。
     const q1Answered = { ...question(1), state: "answered" as const, actionable: false };
     rerender(
-      <AsyncQuestionGroupCard sessionId="s1" questions={[q0Answered, q1Answered, question(2)]} />
+      <AsyncQuestionGroupCard
+        sessionId={testSessionId}
+        questions={[q0Answered, q1Answered, question(2)]}
+      />
     );
     const confirm = screen.getByTestId("codex-async-partial-confirm");
     expect(confirm.getAttribute("aria-pressed")).toBe("false");
@@ -511,12 +528,12 @@ describe("J03—J09 核对/复核/草稿恢复", () => {
 
   it("r01_removed_option_restores_as_visible_text_not_invisible_answer", async () => {
     const { rerender } = render(
-      <AsyncQuestionGroupCard sessionId="s1" questions={[question(0)]} />
+      <AsyncQuestionGroupCard sessionId={testSessionId} questions={[question(0)]} />
     );
     fireEvent.click(screen.getByRole("button", { name: "乙" }));
     rerender(
       <AsyncQuestionGroupCard
-        sessionId="s1"
+        sessionId={testSessionId}
         questions={[question(0, { contextToken: "ctx:0-new", options: ["丙", "丁"] })]}
       />
     );
@@ -533,12 +550,12 @@ describe("J03—J09 核对/复核/草稿恢复", () => {
 
   it("r01_restore_keeps_selected_when_old_option_still_exists", () => {
     const { rerender } = render(
-      <AsyncQuestionGroupCard sessionId="s1" questions={[question(0)]} />
+      <AsyncQuestionGroupCard sessionId={testSessionId} questions={[question(0)]} />
     );
     fireEvent.click(screen.getByRole("button", { name: "乙" }));
     rerender(
       <AsyncQuestionGroupCard
-        sessionId="s1"
+        sessionId={testSessionId}
         questions={[question(0, { contextToken: "ctx:0-reset" })]}
       />
     );
@@ -551,7 +568,9 @@ describe("J03—J09 核对/复核/草稿恢复", () => {
   });
 
   it("j06_changed_member_draft_can_be_viewed_and_restored", () => {
-    const { rerender } = render(<AsyncQuestionGroupCard sessionId="s1" questions={five()} />);
+    const { rerender } = render(
+      <AsyncQuestionGroupCard sessionId={testSessionId} questions={five()} />
+    );
     fireEvent.click(screen.getByTestId("codex-async-next")); // q0 未答，next 禁用
     fireEvent.click(screen.getByRole("button", { name: "甲" })); // q0
     fireEvent.click(screen.getByTestId("codex-async-next"));
@@ -563,7 +582,7 @@ describe("J03—J09 核对/复核/草稿恢复", () => {
     const changed = five().map((q, i) =>
       i === 1 ? { ...q, contextToken: "ctx:1-new", title: "问题2已更新" } : q
     );
-    rerender(<AsyncQuestionGroupCard sessionId="s1" questions={changed} />);
+    rerender(<AsyncQuestionGroupCard sessionId={testSessionId} questions={changed} />);
     expect(screen.getByTestId("codex-async-stale-note")).toBeTruthy();
     fireEvent.click(screen.getByTestId("codex-async-stale-toggle"));
     expect(screen.getByTestId("codex-async-stale-item").textContent).toContain("第二题的旧长答案");
@@ -588,12 +607,12 @@ describe("J03—J09 核对/复核/草稿恢复", () => {
 // ============================================================
 describe("T04 紧凑题卡", () => {
   it("t04_no_receipt_renders_no_placeholder_note_line", () => {
-    render(<AsyncQuestionGroupCard sessionId="s1" questions={five()} />);
+    render(<AsyncQuestionGroupCard sessionId={testSessionId} questions={five()} />);
     expect(screen.queryByTestId("codex-async-note")).toBeNull();
   });
 
   it("t04_free_answer_collapsed_by_default_toggle_keeps_draft_on_collapse", () => {
-    render(<AsyncQuestionGroupCard sessionId="s1" questions={[question(0)]} />);
+    render(<AsyncQuestionGroupCard sessionId={testSessionId} questions={[question(0)]} />);
     // 默认收起
     expect(screen.queryByTestId("codex-async-free")).toBeNull();
     // 点「其他答案」展开
@@ -616,7 +635,10 @@ describe("T04 紧凑题卡", () => {
     vi.spyOn(Element.prototype, "clientHeight", "get").mockReturnValue(42);
     const longTitle = "这是一个特别长的题干".repeat(12);
     render(
-      <AsyncQuestionGroupCard sessionId="s1" questions={[question(0, { title: longTitle })]} />
+      <AsyncQuestionGroupCard
+        sessionId={testSessionId}
+        questions={[question(0, { title: longTitle })]}
+      />
     );
     const title = screen.getByText(longTitle);
     expect(title.className).toContain("line-clamp-3");
@@ -635,7 +657,10 @@ describe("T04 紧凑题卡", () => {
     const shortTitle = "这是一个不到八十字符但窄屏会超过三行的题干";
     expect(shortTitle.length).toBeLessThanOrEqual(80);
     render(
-      <AsyncQuestionGroupCard sessionId="s1" questions={[question(0, { title: shortTitle })]} />
+      <AsyncQuestionGroupCard
+        sessionId={testSessionId}
+        questions={[question(0, { title: shortTitle })]}
+      />
     );
     // 恒三行收纳（展开前），实测溢出 → 展开入口在场
     const title = screen.getByText(shortTitle);
@@ -655,7 +680,7 @@ describe("T04 紧凑题卡", () => {
   });
 
   it("t04_short_title_has_no_expand_toggle_and_options_area_scrollable", () => {
-    render(<AsyncQuestionGroupCard sessionId="s1" questions={[question(0)]} />);
+    render(<AsyncQuestionGroupCard sessionId={testSessionId} questions={[question(0)]} />);
     expect(screen.queryByTestId("codex-async-title-toggle")).toBeNull();
     // 长选项组内部滚动（spec §3.6）
     const wrapper = screen.getByTestId("codex-async-current");
@@ -664,7 +689,7 @@ describe("T04 紧凑题卡", () => {
   });
 
   it("t04_single_question_hides_pagination_and_turn_hint", () => {
-    render(<AsyncQuestionGroupCard sessionId="s1" questions={[question(0)]} />);
+    render(<AsyncQuestionGroupCard sessionId={testSessionId} questions={[question(0)]} />);
     expect(screen.queryByTestId("codex-async-progress")).toBeNull();
     expect(screen.queryByTestId("codex-async-prev")).toBeNull();
     expect(screen.queryByTestId("codex-async-next")).toBeNull();
@@ -673,7 +698,13 @@ describe("T04 紧凑题卡", () => {
 
   it("t04_question_content_follows_font_scale_while_main_button_stays_fixed", () => {
     // 单题组：提交主按钮直接在场（多题组此处是「下一题」，属动作钮同样不跟随）
-    render(<AsyncQuestionGroupCard sessionId="s1" questions={[question(0)]} fontScale={1.25} />);
+    render(
+      <AsyncQuestionGroupCard
+        sessionId={testSessionId}
+        questions={[question(0)]}
+        fontScale={1.25}
+      />
+    );
     const current = screen.getByTestId("codex-async-current");
     // 内容作用域：题干/选项/自由输入在 [data-font-scale] 内（相对档位单位 text-sm）
     const scope = current.querySelector("[data-font-scale]");

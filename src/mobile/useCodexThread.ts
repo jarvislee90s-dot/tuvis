@@ -31,7 +31,14 @@ import {
   type ProjectedMessage,
   type ThreadProjection,
 } from "./codexIpcApi";
+import {
+  buildQuestionSkipFactsSnapshot,
+  createQuestionSkipFactsStore,
+  questionSkipFactsAttachment,
+  type QuestionSkipFactsStore,
+} from "./questionSkipOperations";
 import { shouldApplyProjection, type ProjectionApplyContext } from "./codex-projection-order";
+import { questionSkipFactFrameOf } from "./codexQuestionSkipApi";
 import {
   CODEX_HISTORY_PAGE_LIMIT,
   appendCodexHistoryPage,
@@ -165,6 +172,9 @@ export default function useCodexThread(sessionId: string, enabled: boolean): Use
    *  instance 拒绝即补票（再武装只可能被**补票后新发出**的请求捕获，单活 hub
    *  下它们只能解析到在世 instance，旧世界响应无法受益——见报告选型说明）。 */
   const crossInstanceRejectStreakRef = useRef(0);
+  /** 题卡跳过两账（展示/历史）的 FactLedger store：只在排序守卫批准落地后 advance
+   *  （迟到旧帧不进账）；会话切换/订阅禁用/卸载整体换新实例。 */
+  const skipFactsRef = useRef<QuestionSkipFactsStore>(createQuestionSkipFactsStore());
 
   /** 发放一张新握手票（单调新号、未消费；旧票号随即失效）。
    *  C01：仅在**没有未消费有效票**时发放——旧票请求的拒绝不得作废已有人在途
@@ -268,8 +278,23 @@ export default function useCodexThread(sessionId: string, enabled: boolean): Use
           setRetained(nextRetained);
         }
       }
-      stateRef.current = p;
-      setState(p);
+      // 题卡跳过两账 FactLedger（**排序守卫批准之后**才 advance——迟到旧帧不进账）：
+      // 高水位 (revision, acceptedSeq) 先比较再构造 next；合法全量成员增删与 absent
+      // 可区分；invalid 各账独立 sticky（本账合法帧才清）；display 合法帧同时配对
+      // gid↔题体观察（exclude token/runtime）。落地对象挂分层快照。
+      const skipFrame = questionSkipFactFrameOf(p);
+      if (skipFrame !== undefined) {
+        skipFactsRef.current.advance(skipFrame, p.asyncQuestions);
+      }
+      // 帧事实快照（回执由 SessionDetail 经会话订阅合并——刷新失败也不掩盖已知成功）。
+      const landed: ThreadProjection = {
+        ...p,
+        ...questionSkipFactsAttachment(
+          buildQuestionSkipFactsSnapshot(skipFactsRef.current.snapshot(), [])
+        ),
+      };
+      stateRef.current = landed;
+      setState(landed);
       // R03 握手票结算：跨 instance 建立消费当前票（先到先得，同票重叠响应随后
       // 全部失去建立权）；同 instance 落地保留未消费的票（它属于后续可能的重启）
       // 并打断连续拒绝计数。SSE snapshot 的跨 instance 建立同样消费（票只属于
@@ -307,6 +332,7 @@ export default function useCodexThread(sessionId: string, enabled: boolean): Use
       setTransport("off");
       invalidateHistory();
       tokenRef.current = "";
+      skipFactsRef.current = createQuestionSkipFactsStore();
       return;
     }
     sessionRef.current = sessionId;
@@ -321,6 +347,7 @@ export default function useCodexThread(sessionId: string, enabled: boolean): Use
     tokenRef.current = "";
     stateRef.current = null;
     setState(null);
+    skipFactsRef.current = createQuestionSkipFactsStore();
     setTransport("sse");
 
     const isCurrent = () => alive && sessionRef.current === sid;
@@ -384,6 +411,7 @@ export default function useCodexThread(sessionId: string, enabled: boolean): Use
       if (pollTimer !== null) clearInterval(pollTimer);
       ctrl.abort(); // 在途轮询 fetch 一并终止
       invalidateHistory();
+      skipFactsRef.current = createQuestionSkipFactsStore();
     };
   }, [
     sessionId,
