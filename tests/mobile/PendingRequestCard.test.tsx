@@ -1,4 +1,4 @@
-import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import i18n from "@/i18n";
 import PendingRequestCard, { CodexAvailabilityBanner } from "@/mobile/PendingRequestCard";
@@ -238,6 +238,399 @@ describe("PendingRequestCard：command / permissions 两按钮", () => {
     await waitFor(() =>
       expect(onReceipt).toHaveBeenCalledWith(expect.objectContaining({ delivery: "rejected" }))
     );
+  });
+});
+
+describe("PendingRequestCard：B6 即时问答", () => {
+  it("b6_next_uses_defined_mobile_primary_colors", () => {
+    render(
+      <PendingRequestCard
+        sessionId="s1"
+        request={userInputPending([question(), question({ id: "q2" })])}
+      />
+    );
+    const next = screen.getByTestId("codex-pending-next");
+    expect(next.classList.contains("bg-[var(--btnp)]")).toBe(true);
+    expect(next.classList.contains("text-[var(--btnpt)]")).toBe(true);
+  });
+
+  it("b6_write_locked_allows_local_next_but_blocks_final_submit", async () => {
+    installFetch();
+    const request = userInputPending([question(), question({ id: "q2" })]);
+    const card = (writeLocked: boolean) => (
+      <PendingRequestCard sessionId="s1" request={request} writeLocked={writeLocked} />
+    );
+    const { rerender } = render(card(false));
+    fireEvent.click(screen.getByTestId("codex-q-q1-opt-0"));
+    fireEvent.click(screen.getByTestId("codex-pending-next"));
+    fireEvent.click(screen.getByTestId("codex-q-q2-opt-1"));
+    fireEvent.click(screen.getByTestId("codex-pending-prev"));
+    expect(screen.getByTestId("codex-pending-progress")).toHaveTextContent("1／2");
+
+    rerender(card(true));
+    const next = screen.getByTestId("codex-pending-next");
+    expect(next).toBeEnabled();
+    fireEvent.click(next);
+    expect(screen.getByTestId("codex-pending-progress")).toHaveTextContent("2／2");
+    expect(respondBodies()).toEqual([]);
+    const submit = screen.getByTestId("codex-pending-submit");
+    expect(submit).toBeDisabled();
+    expect(screen.getByTestId("codex-pending-writelocked")).toBeVisible();
+    fireEvent.click(submit);
+    expect(respondBodies()).toEqual([]);
+
+    rerender(card(false));
+    expect(submit).toBeEnabled();
+    fireEvent.click(submit);
+    await waitFor(() => expect(screen.getByTestId("codex-pending-note")).toBeVisible());
+    expect(respondBodies()).toEqual([
+      expect.objectContaining({
+        requestKey: request.requestKey,
+        contextToken: request.contextToken,
+        answers: { q1: ["Staging"], q2: ["Production"] },
+      }),
+    ]);
+  });
+
+  const choiceModeRequest = () =>
+    userInputPending([
+      question({ answerPolicy: { allowMultiple: false, maxAnswers: 1, allowFreeText: false } }),
+      question({
+        id: "q2",
+        answerPolicy: { allowMultiple: true, maxAnswers: 2, allowFreeText: false },
+      }),
+    ]);
+
+  it("b6_choice_mode_is_visible_from_effective_policy", () => {
+    render(<PendingRequestCard sessionId="s1" request={choiceModeRequest()} />);
+    const [first, second] = screen.getAllByRole("radio");
+    fireEvent.click(first);
+    expect(first).toBeChecked();
+    fireEvent.click(second);
+    expect(first).not.toBeChecked();
+    expect(second).toBeChecked();
+    expect(screen.queryByText(/可多选/)).toBeNull();
+    fireEvent.click(screen.getByTestId("codex-pending-next"));
+
+    const [a, b] = screen.getAllByRole("checkbox");
+    fireEvent.click(a);
+    fireEvent.click(b);
+    expect(a).toBeChecked();
+    expect(b).toBeChecked();
+    expect(within(screen.getByTestId("codex-q-q2")).getByText(/可多选/)).toBeVisible();
+  });
+
+  it.each([
+    ["zh", "可多选"],
+    ["en", "Select multiple options"],
+  ])("b6_choice_mode_displays_the_multi_select_hint_in_%s", async (language, hint) => {
+    await i18n.changeLanguage(language);
+    try {
+      render(<PendingRequestCard sessionId="s1" request={choiceModeRequest()} />);
+      expect(within(screen.getByTestId("codex-q-q1")).queryByText(hint)).toBeNull();
+      fireEvent.click(screen.getByTestId("codex-q-q1-opt-0"));
+      fireEvent.click(screen.getByTestId("codex-pending-next"));
+      expect(within(screen.getByTestId("codex-q-q2")).getByText(hint)).toBeVisible();
+    } finally {
+      cleanup();
+      await i18n.changeLanguage("zh");
+    }
+  });
+
+  it("b6_choice_mode_accepts_one_answer_on_a_multiple_choice_page", async () => {
+    installFetch();
+    render(<PendingRequestCard sessionId="s1" request={choiceModeRequest()} />);
+    fireEvent.click(screen.getByTestId("codex-q-q1-opt-1"));
+    fireEvent.click(screen.getByTestId("codex-pending-next"));
+    fireEvent.click(screen.getByTestId("codex-q-q2-opt-0"));
+    fireEvent.click(screen.getByTestId("codex-pending-submit"));
+    await waitFor(() => expect(screen.getByTestId("codex-pending-note")).toBeVisible());
+    expect(respondBodies()).toEqual([
+      expect.objectContaining({ answers: { q1: ["Production"], q2: ["Staging"] } }),
+    ]);
+  });
+});
+
+describe("PendingRequestCard：M5 三题本地翻页与整组提交", () => {
+  function threeQuestionRequest() {
+    return userInputPending(
+      [
+        question({ id: "environment" }),
+        question({ id: "release-note", question: "补充发布说明", isOther: true, options: [] }),
+        question({ id: "rollout-mode", question: "选择发布方式" }),
+      ],
+      { contextToken: "tok-m5-current" }
+    );
+  }
+
+  function navigation(action: "next" | "prev" | "submit") {
+    return screen.getByTestId(`codex-pending-${action}`);
+  }
+
+  function captureAnswerHandler(): () => void {
+    // 直接调用 React 已提交的真实处理器，绕过 DOM disabled 和 React 的事件分发。
+    const submit = navigation("submit");
+    const propsKey = Object.getOwnPropertyNames(submit).find((key) =>
+      key.startsWith("__reactProps$")
+    );
+    if (!propsKey) throw new Error("提交按钮缺少 React DOM props");
+    const props = (submit as unknown as Record<string, { onClick?: () => void }>)[propsKey];
+    if (typeof props.onClick !== "function") throw new Error("提交按钮缺少 React onClick");
+    return props.onClick;
+  }
+
+  it("直接调用提交处理器时，同代连接写锁仍拦住完整答案", async () => {
+    installFetch();
+    const request = userInputPending([question()]);
+    const { rerender } = render(<PendingRequestCard sessionId="s1" request={request} />);
+    fireEvent.click(screen.getByTestId("codex-q-q1-opt-0"));
+    expect(navigation("submit")).toBeEnabled();
+    rerender(<PendingRequestCard sessionId="s1" request={request} writeLocked />);
+    expect(navigation("submit")).toBeDisabled();
+    const submit = captureAnswerHandler();
+    await act(async () => submit());
+    expect(respondBodies()).toEqual([]);
+  });
+
+  it("直接调用提交处理器时，当前代答案不齐仍不能写入", async () => {
+    installFetch();
+    render(<PendingRequestCard sessionId="s1" request={userInputPending([question()])} />);
+    expect(navigation("submit")).toBeDisabled();
+    const submit = captureAnswerHandler();
+    await act(async () => submit());
+    expect(respondBodies()).toEqual([]);
+  });
+
+  it("直接调用换代前保存的提交处理器时，旧令牌的完整答案仍不能写入", async () => {
+    installFetch();
+    const request = userInputPending([question()]);
+    const { rerender } = render(<PendingRequestCard sessionId="s1" request={request} />);
+    fireEvent.click(screen.getByTestId("codex-q-q1-opt-0"));
+    expect(navigation("submit")).toBeEnabled();
+    const oldSubmit = captureAnswerHandler();
+    rerender(
+      <PendingRequestCard sessionId="s1" request={{ ...request, contextToken: "tok-current" }} />
+    );
+    expect(navigation("submit")).toBeDisabled();
+    await act(async () => oldSubmit());
+    expect(respondBodies()).toEqual([]);
+  });
+
+  it("当前代完整答案通过普通点击发送一次", async () => {
+    installFetch();
+    const request = userInputPending([question()]);
+    render(<PendingRequestCard sessionId="s1" request={request} />);
+    fireEvent.click(screen.getByTestId("codex-q-q1-opt-0"));
+    fireEvent.click(navigation("submit"));
+    expect(await screen.findByTestId("codex-pending-note")).toHaveTextContent("已受理");
+    expect(respondBodies()).toEqual([
+      expect.objectContaining({
+        contextToken: request.contextToken,
+        action: "answer",
+        answers: { q1: ["Staging"] },
+      }),
+    ]);
+  });
+
+  function expectPage(position: number) {
+    expect(screen.getByTestId("codex-pending-progress")).toHaveTextContent(`${position}／3`);
+  }
+
+  function enterAnswers() {
+    fireEvent.click(screen.getByTestId("codex-q-environment-opt-0"));
+    fireEvent.click(navigation("next"));
+    fireEvent.change(screen.getByTestId("codex-q-release-note-free"), {
+      target: { value: "先做冒烟验证" },
+    });
+    fireEvent.click(navigation("next"));
+    fireEvent.click(screen.getByTestId("codex-q-rollout-mode-opt-1"));
+  }
+
+  function reviewAnswers() {
+    expectPage(3);
+    expect(navigation("prev")).toBeEnabled();
+    fireEvent.click(navigation("prev"));
+    expectPage(2);
+    expect(screen.getByTestId("codex-q-release-note-free")).toHaveValue("先做冒烟验证");
+    expect(navigation("prev")).toBeEnabled();
+    fireEvent.click(navigation("prev"));
+    expectPage(1);
+    expect(screen.getByTestId("codex-q-environment-opt-0")).toBeChecked();
+    expect(navigation("next")).toBeEnabled();
+    fireEvent.click(navigation("next"));
+    expectPage(2);
+    expect(screen.getByTestId("codex-q-release-note-free")).toHaveValue("先做冒烟验证");
+    expect(navigation("next")).toBeEnabled();
+    fireEvent.click(navigation("next"));
+    expectPage(3);
+    expect(screen.getByTestId("codex-q-rollout-mode-opt-1")).toBeChecked();
+  }
+
+  it("空白自由稿不能前进，有效选项和自由稿往返保留且无写请求", () => {
+    installFetch();
+    render(<PendingRequestCard sessionId="s1" request={threeQuestionRequest()} />);
+    expectPage(1);
+    expect(screen.queryByTestId("codex-pending-prev")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("codex-pending-submit")).not.toBeInTheDocument();
+    expect(navigation("next")).toBeDisabled();
+    fireEvent.click(screen.getByTestId("codex-q-environment-opt-0"));
+    fireEvent.click(navigation("next"));
+    expectPage(2);
+    fireEvent.change(screen.getByTestId("codex-q-release-note-free"), { target: { value: "   " } });
+    expect(navigation("next")).toBeDisabled();
+    fireEvent.click(navigation("next"));
+    expectPage(2);
+    fireEvent.change(screen.getByTestId("codex-q-release-note-free"), {
+      target: { value: "先做冒烟验证" },
+    });
+    fireEvent.click(navigation("next"));
+    expectPage(3);
+    expect(screen.queryByTestId("codex-pending-next")).not.toBeInTheDocument();
+    expect(navigation("submit")).toBeDisabled();
+    fireEvent.click(screen.getByTestId("codex-q-rollout-mode-opt-1"));
+    reviewAnswers();
+    expect(respondBodies()).toEqual([]);
+  });
+
+  it("同代连接写锁只拦末题提交，解锁后一次点击发送原题 ID 与当前令牌的整组答案", async () => {
+    installFetch();
+    const request = threeQuestionRequest();
+    const card = (writeLocked: boolean) => (
+      <PendingRequestCard sessionId="s1" request={request} writeLocked={writeLocked} />
+    );
+    const { rerender } = render(card(false));
+    enterAnswers();
+    rerender(card(true));
+    reviewAnswers();
+    expect(navigation("submit")).toBeDisabled();
+    expect(screen.getByTestId("codex-pending-writelocked")).toHaveTextContent("桌面端连接中断");
+    fireEvent.click(navigation("submit"));
+    expect(respondBodies()).toEqual([]);
+
+    rerender(card(false));
+    expect(navigation("submit")).toBeEnabled();
+    fireEvent.click(navigation("submit"));
+    expect(await screen.findByTestId("codex-pending-note")).toHaveTextContent("已受理");
+    expect(respondBodies()).toEqual([
+      {
+        sessionId: "s1",
+        requestKey: request.requestKey,
+        contextToken: request.contextToken,
+        actionId: expect.any(String),
+        frontBudgetMs: expect.any(Number),
+        action: "answer",
+        answers: {
+          environment: ["Staging"],
+          "release-note": ["先做冒烟验证"],
+          "rollout-mode": ["Production"],
+        },
+      },
+    ]);
+  });
+
+  it("提交在途允许回看与翻页，末题说明提交中且防止重复写入", () => {
+    installFetch();
+    routes.respondHang = true;
+    render(<PendingRequestCard sessionId="s1" request={threeQuestionRequest()} />);
+    enterAnswers();
+    fireEvent.click(navigation("submit"));
+    expect(respondBodies()).toHaveLength(1);
+    expect(navigation("submit")).toBeDisabled();
+    expect.soft(screen.getByTestId("codex-pending-card")).toHaveTextContent(/提交中|正在提交/);
+    reviewAnswers();
+    expect(navigation("submit")).toBeDisabled();
+    fireEvent.click(navigation("submit"));
+    expect(respondBodies()).toHaveLength(1);
+  });
+
+  it("回执核对中允许回看与翻页，末题说明核对中且不再写入", async () => {
+    installFetch();
+    routes.respondReject = true;
+    const respond = fetchMock.getMockImplementation()!;
+    let releaseVerify: ((response: Response) => void) | undefined;
+    fetchMock.mockImplementation((input: RequestInfo | URL) =>
+      String(input).includes("/codex/action/verify")
+        ? new Promise<Response>((resolve) => {
+            releaseVerify = resolve;
+          })
+        : respond(input)
+    );
+    render(<PendingRequestCard sessionId="s1" request={threeQuestionRequest()} />);
+    enterAnswers();
+    fireEvent.click(navigation("submit"));
+    try {
+      expect(await screen.findByTestId("codex-pending-note")).toHaveTextContent("结果核对中");
+      expect(navigation("submit")).toBeDisabled();
+      reviewAnswers();
+      expect(navigation("submit")).toBeDisabled();
+      fireEvent.click(navigation("submit"));
+      expect(respondBodies()).toHaveLength(1);
+    } finally {
+      await act(async () => {
+        releaseVerify?.(new Response(JSON.stringify(verifyView({ outcome: "not_delivered" }))));
+      });
+    }
+  });
+
+  it("同代投影收回应答资格后，旧末题入口不能写入", () => {
+    installFetch();
+    const request = threeQuestionRequest();
+    const { rerender } = render(<PendingRequestCard sessionId="s1" request={request} />);
+    enterAnswers();
+    const oldSubmit = navigation("submit");
+    expect(oldSubmit).toBeEnabled();
+    rerender(
+      <PendingRequestCard
+        sessionId="s1"
+        request={{ ...request, actionable: false, disabledReasonCode: "capability_unverified" }}
+      />
+    );
+    expect(screen.getByTestId("codex-pending-disabled")).toHaveTextContent("未验证");
+    expect(screen.queryByTestId("codex-pending-submit")).not.toBeInTheDocument();
+    fireEvent.click(oldSubmit);
+    expect(respondBodies()).toEqual([]);
+  });
+
+  it("令牌换代后旧末题入口不能发送，重新作答只使用新令牌", async () => {
+    installFetch();
+    const request = threeQuestionRequest();
+    const { rerender } = render(<PendingRequestCard sessionId="s1" request={request} />);
+    enterAnswers();
+    const oldSubmit = navigation("submit");
+    const currentRequest = { ...request, contextToken: "tok-m5-rotated" };
+    rerender(<PendingRequestCard sessionId="s1" request={currentRequest} />);
+    expectPage(1);
+    expect(navigation("next")).toBeDisabled();
+    fireEvent.click(oldSubmit);
+    expect(respondBodies()).toEqual([]);
+    enterAnswers();
+    fireEvent.click(navigation("submit"));
+    expect(await screen.findByTestId("codex-pending-note")).toHaveTextContent("已受理");
+    expect(respondBodies()).toEqual([
+      expect.objectContaining({ requestKey: request.requestKey, contextToken: "tok-m5-rotated" }),
+    ]);
+  });
+
+  it("同代投影出现未答题后，已有草稿不能作为完整答案提交", () => {
+    installFetch();
+    const request = threeQuestionRequest();
+    const { rerender } = render(<PendingRequestCard sessionId="s1" request={request} />);
+    enterAnswers();
+    expect(navigation("submit")).toBeEnabled();
+    rerender(
+      <PendingRequestCard
+        sessionId="s1"
+        request={{
+          ...request,
+          questions: [question({ id: "new-question" }), ...request.questions.slice(1)],
+        }}
+      />
+    );
+    expectPage(3);
+    expect(navigation("submit")).toBeDisabled();
+    expect(screen.getByTestId("codex-pending-incomplete")).toHaveTextContent("还有 1 题未作答");
+    fireEvent.click(navigation("submit"));
+    expect(respondBodies()).toEqual([]);
   });
 });
 

@@ -178,6 +178,14 @@ describe("mobile theme：mobile.html 内联脚本与 mobile.css 策略一致性"
   const html = readFileSync(resolve(__dirname, "../../mobile.html"), "utf8");
   const css = readFileSync(resolve(__dirname, "../../src/mobile/mobile.css"), "utf8");
 
+  it("b6_next_primary_colors_are_defined_in_both_mobile_themes", () => {
+    for (const rule of [/^:root\s*\{([^}]*)\}/m, /^\.dark\s*\{([^}]*)\}/m]) {
+      const declarations = css.match(rule)?.[1] ?? "";
+      expect(declarations).toMatch(/--btnp:\s*[^;]+;/);
+      expect(declarations).toMatch(/--btnpt:\s*[^;]+;/);
+    }
+  });
+
   // 提取 <head> 内的内联脚本正文（构建产物同款：vite 不改写内联脚本内容）
   function inlineScript(): string {
     const m = html.match(/<script>([\s\S]*?)<\/script>/);

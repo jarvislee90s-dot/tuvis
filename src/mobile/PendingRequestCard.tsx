@@ -20,7 +20,7 @@
 //
 // isSecret 的问题用 password 输入（不回显）；提交成功后立即清草稿——投影刷新
 // 换卡之前秘密也不残留在 DOM。
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import InteractiveCard, { toneTokens } from "./InteractiveCard";
 import i18n from "@/i18n";
 import {
@@ -193,6 +193,9 @@ interface PendingRequestCardProps {
   onReceipt?: (receipt: ActionReceipt) => void;
   /** 投影 stale（禁写）：卡可见但一切动作禁用（保留最后视图，不误答旧上下文） */
   writeLocked?: boolean;
+  /** T4（B6-04）：「跳过（仅 Tuvis）」回调（仅 kind=user_input 出现入口）——
+   *  本地收起展示行为，零写请求；与异步跳过/桌面关闭无关。 */
+  onLocalSkip?: () => void;
 }
 
 /** 不支持/不可操作的原因文案（disabledReasonCode → 用户可读；未知码落通用档） */
@@ -264,6 +267,7 @@ export default function PendingRequestCard({
   request,
   onReceipt,
   writeLocked = false,
+  onLocalSkip,
 }: PendingRequestCardProps) {
   /** N11：跨重挂的原动作锚（只读核对用；不恢复旧写资格）。 */
   const anchorStorageKey = `codex:pending:${sessionId}:${request.requestKey}:${request.contextToken}`;
@@ -281,28 +285,29 @@ export default function PendingRequestCard({
     free: Record<string, string>;
   } | null>(null);
   const draftVersionRef = useRef(0);
-  const draftsRef = useRef<{
-    picked: Record<string, string[]>;
-    freeTexts: Record<string, string>;
-  }>({ picked: {}, freeTexts: {} });
-  /** 记录各题在编辑时的 secret 属性（防 qid 复用把旧 secret 变普通题后回显）。 */
-  const secretFlagsRef = useRef<Record<string, boolean>>({});
+  const [draftContext, setDraftContext] = useState(anchorStorageKey);
+  // 保留编辑时的敏感性。同一代内题目属性更新也不能把旧敏感稿降为普通稿。
+  const [secretDraftIds, setSecretDraftIds] = useState<ReadonlySet<string>>(() => new Set());
+  const markSecretDraft = (q: QuestionView) => {
+    if (q.isSecret) setSecretDraftIds((ids) => (ids.has(q.id) ? ids : new Set([...ids, q.id])));
+  };
 
-  // N10/N14：草稿版本（提交时冻结；旧回执不得清掉版本已变的新稿）。
-  useEffect(() => {
-    draftsRef.current = { picked, freeTexts };
+  useLayoutEffect(() => {
     draftVersionRef.current += 1;
   }, [picked, freeTexts]);
   /** R12：结果核对中（提交网络异常后的只读核对在途）——动作锁定，防借新 ID 双投 */
   const [verifying, setVerifying] = useState(false);
   /** R12：核对完成但结果未知（查不到/未终态）——保持锁定（S5：绝不自动重试），
    *  等新投影换代（token 轮换）重置 */
-  const [outcomeUnknown, setOutcomeUnknown] = useState(false);
+  const [outcomeUnknown, setOutcomeUnknown] = useState(() =>
+    Boolean(window.sessionStorage.getItem(anchorStorageKey))
+  );
   /** R12：本次提交的 actionId——从「提交发出」保持到「结果核对完成」。网络异常
    *  后不换 ID 不解锁重投，改用 verifyCodexAction 只读核对原 action。 */
   const submitActionIdRef = useRef<string | null>(null);
   /** 渲染用的"是否有可用原动作锚"（ref 不能参与渲染）。 */
-  const [hasActionAnchor, setHasActionAnchor] = useState(false);
+  const [hasActionAnchor, setHasActionAnchor] = useState(outcomeUnknown);
+  const committedContext = useRef<string | null>(null);
   /** R12：上下文代际守卫——{requestKey, contextToken} 换代即 +1。旧代际的在途
    *  Promise（resolve/异常/核对结果）落地时比对代际，过期一律丢弃。 */
   const generationRef = useRef(0);
@@ -318,47 +323,21 @@ export default function PendingRequestCard({
     }
   };
 
-  // **上下文换代防线**：requestKey 不变但 contextToken 变化（owner 换代 / 请求
-  // 消失重现）= 服务端判定旧上下文作废——旧草稿、旧回执、旧错误一律清空，
-  // 绝不把旧态灌进新 token 的应答里（不误答）。requestKey 变化由父组件换 key
-  // 重挂兜底，这里覆盖「同 key 新 token」的路径。R12：换代同时推进代际并作废
-  // 旧提交 ID（旧代际在途响应此后不得回写新卡）。
-  useEffect(() => {
-    generationRef.current += 1;
-    submitActionIdRef.current = null;
-    setHasActionAnchor(false);
-    // N11：本上下文持久化的原动作锚（离开重进仍可继续只读核对；不恢复写资格）。
-    const anchor = window.sessionStorage.getItem(anchorStorageKey);
-    if (anchor) {
-      submitActionIdRef.current = anchor;
-      setHasActionAnchor(true);
-      setOutcomeUnknown(true);
-    } else {
-      setOutcomeUnknown(false);
-    }
-    // N14：旧稿按原题 secret 属性隔离——secret 一律丢弃；非 secret 仅存为待确认。
-    const prev = draftsRef.current;
-    const secretIds = Object.keys(secretFlagsRef.current).filter(
-      (id) => secretFlagsRef.current[id]
+  // 同键换 token 时在提交 DOM 前重置卡面。旧敏感稿丢弃，旧普通稿只可显式恢复。
+  if (draftContext !== anchorStorageKey) {
+    setDraftContext(anchorStorageKey);
+    const stalePicked = Object.fromEntries(
+      Object.entries(picked).filter(([id, labels]) => !secretDraftIds.has(id) && labels.length > 0)
     );
-    const stalePicked: Record<string, string[]> = {};
-    const staleFree: Record<string, string> = {};
-    let hasStale = false;
-    for (const [id, labels] of Object.entries(prev.picked)) {
-      if (secretIds.includes(id)) continue;
-      if (labels.length > 0) {
-        stalePicked[id] = labels;
-        hasStale = true;
-      }
-    }
-    for (const [id, text] of Object.entries(prev.freeTexts)) {
-      if (secretIds.includes(id)) continue;
-      if (text.trim().length > 0) {
-        staleFree[id] = text;
-        hasStale = true;
-      }
-    }
-    setStaleDraft(hasStale ? { picked: stalePicked, free: staleFree } : null);
+    const staleFree = Object.fromEntries(
+      Object.entries(freeTexts).filter(([id, text]) => !secretDraftIds.has(id) && text.trim())
+    );
+    setStaleDraft(
+      Object.keys(stalePicked).length || Object.keys(staleFree).length
+        ? { picked: stalePicked, free: staleFree }
+        : null
+    );
+    setSecretDraftIds(new Set());
     setPicked({});
     setFreeTexts({});
     setReceipt(null);
@@ -366,17 +345,23 @@ export default function PendingRequestCard({
     setBusy(false);
     setVerifying(false);
     setQuestionIndex(0);
-    if (deadlineRef.current !== null) {
-      window.clearTimeout(deadlineRef.current.timer);
-      deadlineRef.current = null;
-    }
-  }, [request.requestKey, request.contextToken, anchorStorageKey]);
+    const anchored = Boolean(window.sessionStorage.getItem(anchorStorageKey));
+    setHasActionAnchor(anchored);
+    setOutcomeUnknown(anchored);
+  }
 
-  useEffect(() => {
+  useLayoutEffect(() => {
+    committedContext.current = anchorStorageKey;
+    submitActionIdRef.current = window.sessionStorage.getItem(anchorStorageKey);
     return () => {
-      if (deadlineRef.current !== null) window.clearTimeout(deadlineRef.current.timer);
+      committedContext.current = null;
+      generationRef.current += 1;
+      if (deadlineRef.current !== null) {
+        window.clearTimeout(deadlineRef.current.timer);
+        deadlineRef.current = null;
+      }
     };
-  }, []);
+  }, [anchorStorageKey]);
 
   const isInput = request.kind === "user_input";
   const isApproval =
@@ -401,8 +386,8 @@ export default function PendingRequestCard({
         (q) => answerLabels(q, picked[q.id] ?? [], freeTexts[q.id] ?? "").length === 0
       )
     : [];
-  const canSubmit = isInput && unanswered.length === 0;
   const questions = request.questions ?? [];
+  const canSubmit = isInput && questions.length > 0 && unanswered.length === 0;
   const multiQuestion = isInput && questions.length > 1;
   const questionCount = questions.length;
   const safeIndex = Math.min(questionIndex, Math.max(0, questionCount - 1));
@@ -421,6 +406,7 @@ export default function PendingRequestCard({
   // 之前，任何再次提交都是双投窗口）。
   const locked = receipt !== null && receipt.delivery !== "not_sent";
   const disabled = busy || locked || verifying || outcomeUnknown || writeLocked || !operable;
+  const canSubmitCurrentPage = canSubmit && safeIndex === questionCount - 1;
 
   /** H11：只清 secret 题稿（防泄漏）；非 secret 稿在结果未确认前保留待复核。 */
   const clearSecretDrafts = () => {
@@ -464,10 +450,8 @@ export default function PendingRequestCard({
   };
 
   const respond = async (action: "approve" | "reject" | "cancel" | "answer") => {
-    // R12：核对中/结果未知/已回执锁定一律拦截（answer 也不例外——锁定就是锁定，
-    // 提交按钮自身的 disabled 只剩 UX 层意义）
-    if (busy || verifying || outcomeUnknown || locked) return;
-    if (disabled && action !== "answer") return;
+    if (committedContext.current !== anchorStorageKey || disabled) return;
+    if (action === "answer" && !canSubmitCurrentPage) return;
     setBusy(true);
     setError(null);
     const myGen = generationRef.current;
@@ -628,7 +612,7 @@ export default function PendingRequestCard({
   /** H11：Unknown 后**再次只读核对**（不重发、不换 ID；≤10 秒有界）。 */
   const reverify = async () => {
     const actionId = submitActionIdRef.current;
-    if (!actionId || verifying) return;
+    if (!actionId || verifying || committedContext.current !== anchorStorageKey) return;
     setVerifying(true);
     const myGen = generationRef.current;
     const mySubmit = ++submitGenRef.current;
@@ -713,8 +697,7 @@ export default function PendingRequestCard({
       title={i18n.t(titleKey)}
       titleSuffix={
         <span data-testid="codex-pending-request-key" className="text-xs text-[var(--mut)]">
-          {" "}
-          · Desktop
+          {request.requestKey} · Desktop
         </span>
       }
     >
@@ -808,6 +791,14 @@ export default function PendingRequestCard({
               <p className="text-xs font-medium">
                 {q.header ? `${q.header}｜` : ""}
                 {q.question}
+                {multi && (
+                  <span
+                    data-testid={`codex-q-${q.id}-multi`}
+                    className="ml-1 text-[10px] font-normal text-[var(--mut)]"
+                  >
+                    {i18n.t("mobile.codex.pending.multiSelect")}
+                  </span>
+                )}
               </p>
               <div className="mt-1 flex flex-col gap-1">
                 {q.options.map((o, i) => (
@@ -829,7 +820,7 @@ export default function PendingRequestCard({
                       disabled={disabled}
                       onChange={() => {
                         // R14：单值策略 = 选中即替换；多值策略 = 切换且不超上限。
-                        secretFlagsRef.current[q.id] = q.isSecret;
+                        markSecretDraft(q);
                         setPicked((prev) => {
                           const cur = prev[q.id] ?? [];
                           if (sel.includes(o.label)) {
@@ -869,7 +860,7 @@ export default function PendingRequestCard({
                     autoComplete={q.isSecret ? "new-password" : "off"}
                     maxLength={10000}
                     onChange={(e) => {
-                      secretFlagsRef.current[q.id] = q.isSecret;
+                      markSecretDraft(q);
                       const next = e.target.value.slice(0, 10000);
                       setPicked((prev) => {
                         // H13：单值下输入文本 = 替代已选选项；多值下已到上限时
@@ -907,6 +898,11 @@ export default function PendingRequestCard({
             {i18n.t("mobile.codex.pending.incomplete", { n: unanswered.length })}
           </p>
         )}
+      {isInput && busy && !verifying && (
+        <p role="status" className="mt-1 text-xs text-[var(--mut)]">
+          {i18n.t("mobile.codex.pending.submitting")}
+        </p>
+      )}
       {writeLocked && operable && (
         <p
           data-testid="codex-pending-writelocked"
@@ -917,100 +913,112 @@ export default function PendingRequestCard({
       )}
 
       {/* 动作区：command/permissions 两按钮；user_input 提交；unsupported 无按钮 */}
-      {operable && (
+      {(operable || (isInput && onLocalSkip)) && (
         <div className="mt-2 flex flex-wrap items-center gap-2">
-          {isInput ? (
-            <>
-              {multiQuestion && safeIndex > 0 && (
-                <button
-                  type="button"
-                  data-testid="codex-pending-prev"
-                  disabled={disabled || busy || verifying}
-                  onClick={() => setQuestionIndex((value) => Math.max(0, value - 1))}
-                  className="rounded-full border border-[var(--bd)] px-3 py-0.5 text-xs"
-                >
-                  {i18n.t("mobile.codex.pending.prev")}
-                </button>
-              )}
-              {multiQuestion && safeIndex < questionCount - 1 ? (
-                <button
-                  type="button"
-                  data-testid="codex-pending-next"
-                  disabled={disabled || !currentAnswered}
-                  onClick={() =>
-                    setQuestionIndex((value) => Math.min(questionCount - 1, value + 1))
-                  }
-                  className="rounded-full bg-[var(--ac)] px-3 py-0.5 text-xs text-white disabled:opacity-40"
-                >
-                  {i18n.t("mobile.codex.pending.next")}
-                </button>
-              ) : (
-                <button
-                  type="button"
-                  data-testid="codex-pending-submit"
-                  disabled={disabled || !canSubmit}
-                  onClick={() => {
-                    void respond("answer");
-                  }}
-                  className="rounded-full bg-emerald-500/15 px-3 py-0.5 text-xs text-emerald-800 disabled:opacity-40 dark:bg-emerald-400/15 dark:text-emerald-300"
-                >
-                  {multiQuestion
-                    ? i18n.t("mobile.codex.pending.submitAll", { count: questionCount })
-                    : i18n.t("mobile.codex.pending.submit")}
-                </button>
-              )}
-              {multiQuestion && (
-                <span className="text-[10px] text-[var(--mut)]">
-                  {i18n.t("mobile.codex.pending.groupHint")}
-                </span>
-              )}
-            </>
-          ) : (
-            <>
-              {showApprove && (
-                <button
-                  type="button"
-                  data-testid="codex-pending-approve"
-                  disabled={disabled}
-                  onClick={() => {
-                    void respond("approve");
-                  }}
-                  className="rounded-full bg-emerald-500/15 px-3 py-0.5 text-xs text-emerald-800 disabled:opacity-40 dark:bg-emerald-400/15 dark:text-emerald-300"
-                >
-                  {i18n.t("mobile.codex.pending.approve")}
-                </button>
-              )}
-              {showDecline && (
-                <button
-                  type="button"
-                  data-testid="codex-pending-reject"
-                  disabled={disabled}
-                  onClick={() => {
-                    void respond("reject");
-                  }}
-                  className="rounded-full bg-rose-500/15 px-3 py-0.5 text-xs text-rose-800 disabled:opacity-40 dark:bg-rose-400/15 dark:text-rose-300"
-                >
-                  {i18n.t("mobile.codex.pending.reject")}
-                </button>
-              )}
-              {/* 未知 build（无真机审批证据）只给「终止本轮」：cancel 语义 = 拒绝并立即
+          {operable &&
+            (isInput ? (
+              <>
+                {multiQuestion && safeIndex > 0 && (
+                  <button
+                    type="button"
+                    data-testid="codex-pending-prev"
+                    onClick={() => setQuestionIndex((value) => Math.max(0, value - 1))}
+                    className="rounded-full border border-[var(--bd)] px-3 py-0.5 text-xs"
+                  >
+                    {i18n.t("mobile.codex.pending.prev")}
+                  </button>
+                )}
+                {multiQuestion && safeIndex < questionCount - 1 ? (
+                  <button
+                    type="button"
+                    data-testid="codex-pending-next"
+                    disabled={!currentAnswered}
+                    onClick={() => {
+                      if (currentAnswered) {
+                        setQuestionIndex(Math.min(questionCount - 1, safeIndex + 1));
+                      }
+                    }}
+                    className="rounded-full bg-[var(--btnp)] px-3 py-0.5 text-xs text-[var(--btnpt)] disabled:opacity-40"
+                  >
+                    {i18n.t("mobile.codex.pending.next")}
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    data-testid="codex-pending-submit"
+                    disabled={disabled || !canSubmitCurrentPage}
+                    onClick={() => {
+                      void respond("answer");
+                    }}
+                    className="rounded-full bg-emerald-500/15 px-3 py-0.5 text-xs text-emerald-800 disabled:opacity-40 dark:bg-emerald-400/15 dark:text-emerald-300"
+                  >
+                    {multiQuestion
+                      ? i18n.t("mobile.codex.pending.submitAll", { count: questionCount })
+                      : i18n.t("mobile.codex.pending.submit")}
+                  </button>
+                )}
+                {multiQuestion && (
+                  <span className="text-[10px] text-[var(--mut)]">
+                    {i18n.t("mobile.codex.pending.groupHint")}
+                  </span>
+                )}
+              </>
+            ) : (
+              <>
+                {showApprove && (
+                  <button
+                    type="button"
+                    data-testid="codex-pending-approve"
+                    disabled={disabled}
+                    onClick={() => {
+                      void respond("approve");
+                    }}
+                    className="rounded-full bg-emerald-500/15 px-3 py-0.5 text-xs text-emerald-800 disabled:opacity-40 dark:bg-emerald-400/15 dark:text-emerald-300"
+                  >
+                    {i18n.t("mobile.codex.pending.approve")}
+                  </button>
+                )}
+                {showDecline && (
+                  <button
+                    type="button"
+                    data-testid="codex-pending-reject"
+                    disabled={disabled}
+                    onClick={() => {
+                      void respond("reject");
+                    }}
+                    className="rounded-full bg-rose-500/15 px-3 py-0.5 text-xs text-rose-800 disabled:opacity-40 dark:bg-rose-400/15 dark:text-rose-300"
+                  >
+                    {i18n.t("mobile.codex.pending.reject")}
+                  </button>
+                )}
+                {/* 未知 build（无真机审批证据）只给「终止本轮」：cancel 语义 = 拒绝并立即
                   中断，与服务端 allowedDecisions 一一对应 */}
-              {showCancel && (
-                <button
-                  type="button"
-                  data-testid="codex-pending-cancel-turn"
-                  disabled={disabled}
-                  onClick={() => {
-                    // R08：终止本轮必须发 cancel（后端 Reject→decline、Cancel→
-                    // interrupt 语义）；发 reject 只会拒绝请求、回合继续。
-                    void respond("cancel");
-                  }}
-                  className="rounded-full bg-rose-500/15 px-3 py-0.5 text-xs text-rose-800 disabled:opacity-40 dark:bg-rose-400/15 dark:text-rose-300"
-                >
-                  {i18n.t("mobile.codex.pending.cancelTurn")}
-                </button>
-              )}
-            </>
+                {showCancel && (
+                  <button
+                    type="button"
+                    data-testid="codex-pending-cancel-turn"
+                    disabled={disabled}
+                    onClick={() => {
+                      // R08：终止本轮必须发 cancel（后端 Reject→decline、Cancel→
+                      // interrupt 语义）；发 reject 只会拒绝请求、回合继续。
+                      void respond("cancel");
+                    }}
+                    className="rounded-full bg-rose-500/15 px-3 py-0.5 text-xs text-rose-800 disabled:opacity-40 dark:bg-rose-400/15 dark:text-rose-300"
+                  >
+                    {i18n.t("mobile.codex.pending.cancelTurn")}
+                  </button>
+                )}
+              </>
+            ))}
+          {isInput && onLocalSkip && (
+            <button
+              type="button"
+              data-testid="codex-pending-local-skip"
+              onClick={onLocalSkip}
+              className="rounded-full border border-[var(--bd)] px-3 py-0.5 text-xs text-[var(--mut)]"
+            >
+              {i18n.t("mobile.codex.pending.localSkip")}
+            </button>
           )}
         </div>
       )}
