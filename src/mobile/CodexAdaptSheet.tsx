@@ -19,7 +19,7 @@ import {
   type CodexAdaptDetails,
   type CodexEffectiveOperations,
 } from "./codexIpcApi";
-import { codexReasonText, codexSupportText } from "./CodexOperationToolbar";
+import { codexOperationLabel, codexReasonText, codexSupportText } from "./CodexOperationToolbar";
 
 export interface CodexAdaptSheetProps {
   sessionId: string;
@@ -163,7 +163,7 @@ export default function CodexAdaptSheet({
                 data-support={supportOf(status)}
                 className="flex flex-wrap items-center gap-x-2 gap-y-0.5"
               >
-                <span className="font-medium">{operation}</span>
+                <span className="font-medium">{codexOperationLabel(operation)}</span>
                 {/* T03：支持状态（稳定展示）与当前资格（allowed + 原因）分开说。 */}
                 <span className="text-[var(--mut)]">{codexSupportText(supportOf(status))}</span>
                 <span className={status.allowed ? "text-emerald-600" : "text-[var(--mut)]"}>
