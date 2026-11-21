@@ -66,10 +66,10 @@ impl<'a> HistoryView<'a> {
 
     /// canonical 引用键（`entry.value`），去重保序。entries 元素非对象 / value 非字符串
     /// → 跳过该条（引用失效不是证据来源，见 [`Self::turn_status`]）。
+    /// A1.3（round3 Major）：去重集为借用 `&str`、无逐条分配——**无上限**保持
+    /// 全程 O(1) 查重（超限历史的平方级线性回退消除；顺序与语义不变）。
     fn referenced_keys(&self) -> Vec<&'a str> {
         let mut keys: Vec<&'a str> = Vec::new();
-        // 额外索引只覆盖有限数量的引用；超限后退回原始线性查重，保留完整语义。
-        const MAX_INDEX_KEYS: usize = 4096;
         let mut seen = HashSet::new();
         let Some(islands) = self
             .history()
@@ -87,22 +87,8 @@ impl<'a> HistoryView<'a> {
                     continue;
                 };
                 #[cfg(test)]
-                REFERENCE_DEDUP_WORK.with(|count| {
-                    count.set(
-                        count.get()
-                            + if seen.len() < MAX_INDEX_KEYS {
-                                1
-                            } else {
-                                keys.len()
-                            },
-                    );
-                });
-                let new = if seen.len() < MAX_INDEX_KEYS {
-                    seen.insert(value)
-                } else {
-                    !seen.contains(value) && !keys.contains(&value)
-                };
-                if new {
+                REFERENCE_DEDUP_WORK.with(|count| count.set(count.get() + 1));
+                if seen.insert(value) {
                     keys.push(value);
                 }
             }

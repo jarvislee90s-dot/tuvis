@@ -8,6 +8,25 @@
 
 use super::types::{OwnerLease, ProtocolError, ThreadKey};
 use std::collections::{HashMap, HashSet};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+
+#[derive(Clone, Debug)]
+pub(crate) struct OwnerLeaseProof {
+    lease: OwnerLease,
+    live: Arc<AtomicBool>,
+}
+
+impl OwnerLeaseProof {
+    pub(crate) fn lease(&self) -> &OwnerLease {
+        &self.lease
+    }
+    pub(crate) fn is_live(&self) -> bool {
+        self.live.load(Ordering::Acquire)
+    }
+}
 use tokio::sync::watch;
 
 /// 单连接可跟随 Thread 上限（计划「有界资源」）。
@@ -18,16 +37,21 @@ struct LeaseEntry {
     epoch: u64,
     generation: u64,
     validity_tx: watch::Sender<bool>,
+    live: Arc<AtomicBool>,
     authority: std::sync::Arc<super::hint_commit::HintLeaseAuthority>,
 }
 
 /// owner 租约登记表。generation 按 Thread 单调增加；reset 后 epoch 增加。
+/// A4/T10：撤销的 gate 等待不再内联（同步阻塞提交等待会拖死 forwarder）——
+/// 变更点把待撤销 authority 收进 [`Self::pending_revocations`]，调用方在
+/// 临界区外 drain（async 后台撤销 / 同步测试就地撤销）。
 #[derive(Default)]
 pub struct OwnerRegistry {
     epoch: u64,
     threads: HashMap<ThreadKey, LeaseEntry>,
     by_client: HashMap<String, HashSet<ThreadKey>>,
     gens: HashMap<ThreadKey, u64>,
+    pending_revocations: Vec<Arc<super::hint_commit::HintLeaseAuthority>>,
 }
 
 impl OwnerRegistry {
@@ -52,13 +76,16 @@ impl OwnerRegistry {
             };
         }
         // 旧绑定失效（换代）
+        if let Some(old) = self.threads.get(&key) {
+            old.live.store(false, Ordering::Release);
+        }
         if let Some(old) = self.threads.remove(&key) {
-            old.authority.revoke_owner();
-            let _ = old.validity_tx.send(false);
-            if let Some(set) = self.by_client.get_mut(&old.client_id) {
+            let previous_client = old.client_id.clone();
+            self.retire_entry(old);
+            if let Some(set) = self.by_client.get_mut(&previous_client) {
                 set.remove(&key);
                 if set.is_empty() {
-                    self.by_client.remove(&old.client_id);
+                    self.by_client.remove(&previous_client);
                 }
             }
         }
@@ -75,6 +102,7 @@ impl OwnerRegistry {
                 epoch,
                 generation,
                 validity_tx,
+                live: Arc::new(AtomicBool::new(true)),
                 authority: super::hint_commit::HintLeaseAuthority::new(OwnerLease {
                     key: key.clone(),
                     client_id: client_id.clone(),
@@ -96,14 +124,21 @@ impl OwnerRegistry {
     }
 
     /// `client-status-changed(disconnected)`：清该 client 的全部映射。
+    /// A4/T10：gate 撤销不内联——authority 进 pending 列表，调用方 drain。
     pub fn invalidate_client(&mut self, client_id: &str) {
+        if let Some(keys) = self.by_client.get(client_id) {
+            for key in keys {
+                if let Some(entry) = self.threads.get(key) {
+                    entry.live.store(false, Ordering::Release);
+                }
+            }
+        }
         let Some(keys) = self.by_client.remove(client_id) else {
             return;
         };
         for key in keys {
             if let Some(entry) = self.threads.remove(&key) {
-                entry.authority.revoke_owner();
-                let _ = entry.validity_tx.send(false);
+                self.retire_entry(entry);
             }
         }
     }
@@ -111,13 +146,16 @@ impl OwnerRegistry {
     /// 单 thread 主动退场（2026-10-17 复审 C4：unfollow 最后一引用退出时回收——
     /// lease 移除 + validity false，后续该 owner 的帧不再有授权可套）。
     pub fn release(&mut self, key: &ThreadKey) {
+        if let Some(old) = self.threads.get(key) {
+            old.live.store(false, Ordering::Release);
+        }
         if let Some(old) = self.threads.remove(key) {
-            old.authority.revoke_owner();
-            let _ = old.validity_tx.send(false);
-            if let Some(set) = self.by_client.get_mut(&old.client_id) {
+            let previous_client = old.client_id.clone();
+            self.retire_entry(old);
+            if let Some(set) = self.by_client.get_mut(&previous_client) {
                 set.remove(key);
                 if set.is_empty() {
-                    self.by_client.remove(&old.client_id);
+                    self.by_client.remove(&previous_client);
                 }
             }
         }
@@ -130,12 +168,43 @@ impl OwnerRegistry {
         if new_epoch <= self.epoch {
             return;
         }
+        for entry in self.threads.values() {
+            entry.live.store(false, Ordering::Release);
+        }
         self.epoch = new_epoch;
-        for (_, entry) in self.threads.drain() {
-            entry.authority.revoke_owner();
-            let _ = entry.validity_tx.send(false);
+        let drained: Vec<LeaseEntry> = self.threads.drain().map(|(_, entry)| entry).collect();
+        for entry in drained {
+            self.retire_entry(entry);
         }
         self.by_client.clear();
+    }
+
+    /// A4/T10：登记退场（live/validity 立即失效关闭新准入；gate 撤销延后到
+    /// 调用方 drain——同步阻塞提交等待不得发生在 owners 临界区/forwarder 内）。
+    fn retire_entry(&mut self, entry: LeaseEntry) {
+        entry.live.store(false, Ordering::Release);
+        let _ = entry.validity_tx.send(false);
+        self.pending_revocations.push(entry.authority);
+    }
+
+    /// A4/T10：取走待撤销 authority（临界区外执行；async 调用方后台撤销，
+    /// 同步测试就地撤销）。旧实例的迟到撤销恒安全：换代 bind 已建新
+    /// HintLeaseAuthority 实例，旧实例 fence 不触碰新 lease。
+    pub(crate) fn take_pending_revocations(
+        &mut self,
+    ) -> Vec<Arc<super::hint_commit::HintLeaseAuthority>> {
+        std::mem::take(&mut self.pending_revocations)
+    }
+
+    pub(crate) fn live_proof(&self, lease: &OwnerLease) -> Option<OwnerLeaseProof> {
+        if lease.generation == 0 || !self.is_current(lease) {
+            return None;
+        }
+        let entry = self.threads.get(&lease.key)?;
+        Some(OwnerLeaseProof {
+            lease: lease.clone(),
+            live: entry.live.clone(),
+        })
     }
 
     pub(crate) fn authority(
@@ -192,6 +261,14 @@ impl OwnerRegistry {
         let (tx, rx) = watch::channel(false);
         let _ = tx; // 无发送端也可订阅（closed 即读 false？——watch 关闭后 borrow 返回最后值）
         rx
+    }
+}
+
+impl Drop for OwnerRegistry {
+    fn drop(&mut self) {
+        for entry in self.threads.values() {
+            entry.live.store(false, Ordering::Release);
+        }
     }
 }
 
@@ -420,11 +497,29 @@ pub async fn declare_following(
 }
 
 /// Step 4：等 owner 下发的 targeted snapshot（v11）。
+///
+/// **早快照契约（订阅时序是正确性的一部分）**：tokio broadcast 的新订阅者只收
+/// 订阅之后发布的事件（`new_receiver` 从当前 tail 起，无回放）。Desktop 的
+/// targeted snapshot 可能在 declare 回执之后、本任务恢复/订阅之前就由 reader
+/// 发布——迟到订阅会**永久丢失**唯一快照，15s 后按 Timeout 失败（回归
+/// `b1_follow_observes_snapshot_delivered_before_waiter_runs` 的根因）。因此
+/// 订阅必须发生在 declare（任何可能触发快照的写入）**之前**：
+/// [`discover_and_follow`] 与 adapter `follow_thread` 各自先
+/// `conn.subscribe()` 再 declare，然后把已订阅的接收器交给本函数。
 pub async fn wait_first_snapshot(
     conn: &super::connection::ConnectionHandle,
     key: &ThreadKey,
 ) -> Result<(), ProtocolError> {
     let mut rx = conn.subscribe();
+    wait_first_snapshot_rx(&mut rx, key).await
+}
+
+/// 已订阅形态的 Step 4（订阅时序由调用方保证先于 declare；见
+/// [`wait_first_snapshot`] 的早快照契约）。
+pub async fn wait_first_snapshot_rx(
+    rx: &mut tokio::sync::broadcast::Receiver<super::connection::ConnectionEvent>,
+    key: &ThreadKey,
+) -> Result<(), ProtocolError> {
     loop {
         match tokio::time::timeout(super::connection::RPC_TIMEOUT, rx.recv()).await {
             Ok(Ok(super::connection::ConnectionEvent::Broadcast { frame, .. })) => {
@@ -447,6 +542,31 @@ pub async fn wait_first_snapshot(
     }
 }
 
+#[cfg(test)]
+static SNAPSHOT_WAIT_TEST_GATE: std::sync::Mutex<
+    Option<(
+        String,
+        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    )>,
+> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+async fn test_gate_before_snapshot_wait(key: &ThreadKey) {
+    let gate = {
+        let mut gate = SNAPSHOT_WAIT_TEST_GATE.lock().unwrap();
+        if gate.as_ref().is_some_and(|(id, _, _)| id == &key.thread_id) {
+            gate.take()
+        } else {
+            None
+        }
+    };
+    if let Some((_, entered, resume)) = gate {
+        let _ = entered.send(());
+        let _ = resume.await;
+    }
+}
+
 /// 发现 owner 并声明 following，等到首帧 snapshot 才算完成（无 following 不允许
 /// 假装同步完成；重连恢复 = 重新 discovery → 重新 following → 等 snapshot）。
 /// adapter 等需要分步控制的调用方直接使用四个原语。
@@ -461,6 +581,9 @@ pub async fn discover_and_follow(
 ) -> Result<OwnerLease, ProtocolError> {
     let owner_id = discover_owner(conn, key).await?;
     let lease = bind_lease(owners, key, owner_id, conn.epoch());
+    // 早快照契约：先订阅再 declare（见 wait_first_snapshot 文档）——唯一快照
+    // 可能在 declare 回执后、本任务恢复前就被 reader 发布。
+    let mut snapshot_rx = conn.subscribe();
     declare_following(conn, key).await?;
     // 死 lease 复查：bind 即死的 lease（旧 epoch 迟到回执）与 declare 窗口内失活的
     // lease 都在此拦下，杜绝 Ok(死 lease)——调用方拿到它做写授权会全军覆没。
@@ -469,7 +592,9 @@ pub async fn discover_and_follow(
             "lease lost during follow (old epoch late receipt?)".into(),
         ));
     }
-    wait_first_snapshot(conn, key).await?;
+    #[cfg(test)]
+    test_gate_before_snapshot_wait(key).await;
+    wait_first_snapshot_rx(&mut snapshot_rx, key).await?;
     Ok(lease)
 }
 
@@ -507,12 +632,92 @@ mod tests {
         assert!(*validity.borrow_and_update());
         assert!(permit.lock().is_ok());
     }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn b1_follow_observes_snapshot_delivered_before_waiter_runs() {
+        use crate::services::codex_desktop_ipc::{
+            codec,
+            connection::{self, ConnectionEvent},
+            profile::profile_for,
+        };
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        async fn recv(peer: &mut tokio::io::DuplexStream) -> serde_json::Value {
+            let mut decoder = codec::FrameDecoder::new();
+            let mut bytes = vec![0; 16384];
+            loop {
+                let n = peer.read(&mut bytes).await.unwrap();
+                assert!(n > 0);
+                let mut frames = decoder.push(&bytes[..n]).unwrap();
+                if !frames.is_empty() {
+                    return frames.remove(0);
+                }
+            }
+        }
+        async fn send(peer: &mut tokio::io::DuplexStream, frame: serde_json::Value) {
+            peer.write_all(&codec::encode_frame(&frame).unwrap())
+                .await
+                .unwrap();
+        }
+        let (client, mut peer) = tokio::io::duplex(65536);
+        let conn = connection::spawn(
+            Box::new(client),
+            profile_for("macos", "26.1013.31256").unwrap(),
+            1,
+        );
+        let init = recv(&mut peer).await;
+        send(&mut peer, serde_json::json!({"type":"response","requestId":init["requestId"],"resultType":"success","method":"initialize","handledByClientId":"owner","result":{"clientId":"owner"}})).await;
+        let thread = key("b1-early-snapshot");
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+        *SNAPSHOT_WAIT_TEST_GATE.lock().unwrap() =
+            Some((thread.thread_id.clone(), entered_tx, resume_rx));
+        let mut tap = conn.subscribe();
+        let follow_conn = conn.clone();
+        let follow_key = thread.clone();
+        let mut follow = tokio::spawn(async move {
+            let mut registry = OwnerRegistry::default();
+            discover_and_follow(&follow_conn, &mut registry, &follow_key).await
+        });
+        let discovery = recv(&mut peer).await;
+        assert_eq!(discovery["method"], "thread-owner-discovery");
+        send(&mut peer, serde_json::json!({"type":"response","requestId":discovery["requestId"],"resultType":"success","method":"thread-owner-discovery","handledByClientId":"owner","result":{"supportsUntrustedAppInput":true}})).await;
+        let following = recv(&mut peer).await;
+        assert_eq!(following["method"], "thread-stream-following-changed");
+        entered_rx.await.unwrap();
+        send(&mut peer, serde_json::json!({"type":"broadcast","method":"thread-stream-state-changed","version":11,"sourceClientId":"owner","params":{"conversationId":thread.thread_id,"hostId":"local","change":{"type":"snapshot","revision":7,"conversationState":{}}}})).await;
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                if let Ok(ConnectionEvent::Broadcast { frame, .. }) = tap.recv().await {
+                    if frame["params"]["change"]["revision"] == 7 {
+                        break;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("reader must publish the sole snapshot before waiter resumes");
+        resume_tx.send(()).unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), &mut follow).await;
+        if result.is_err() {
+            follow.abort();
+            let _ = follow.await;
+        }
+        conn.shutdown().await;
+        assert!(
+            matches!(result, Ok(Ok(Ok(_)))),
+            "follow must observe the already delivered snapshot"
+        );
+    }
+
     #[test]
     fn b1_higher_epoch_bind_revokes_other_threads() {
         let mut r = OwnerRegistry::default();
         let old = r.bind(key("old"), "owner".into(), 1);
         let permit = r.authority(&old).unwrap().rotate_scope().unwrap();
         r.bind(key("new"), "other".into(), 2);
+        // A4/T10：撤销后台化——同步测试就地 drain 保持 fencing 即时性（意图不变）。
+        for authority in r.take_pending_revocations() {
+            authority.revoke_owner();
+        }
         assert!(!r.is_current(&old));
         assert!(permit.lock().is_err());
     }
@@ -531,6 +736,10 @@ mod tests {
                 1 => r.invalidate_client("owner"),
                 2 => r.release(&key("t")),
                 _ => r.reset(2),
+            }
+            // A4/T10：撤销后台化——同步测试就地 drain 保持 fencing 即时性（意图不变）。
+            for authority in r.take_pending_revocations() {
+                authority.revoke_owner();
             }
             assert!(permit.lock().is_err(), "entrypoint {mode} did not revoke");
         }

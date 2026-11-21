@@ -164,6 +164,10 @@ fn b1_sqlite_registry_revocations_fence_prepared_batch() {
             "reset" => registry.reset(2),
             _ => unreachable!(),
         }
+        // A4/T10：撤销后台化——同步测试就地 drain 保持 fencing 即时性（意图不变）。
+        for authority in registry.take_pending_revocations() {
+            authority.revoke_owner();
+        }
         assert_eq!(permit.lock().err(), Some(Fence::Owner), "{operation}");
         drop(batch);
         assert!(
@@ -320,6 +324,10 @@ fn b1_store_db_queue_allows_registry_revocation() {
     assert!(matches!(db_lock.try_lock(), Err(TryLockError::WouldBlock)));
     assert!(done_rx.try_recv().is_err());
     registry.invalidate_client("client");
+    // A4/T10：撤销后台化——同步测试就地 drain 保持 fencing 即时性（意图不变）。
+    for authority in registry.take_pending_revocations() {
+        authority.revoke_owner();
+    }
     assert_eq!(permit.lock().err(), Some(Fence::Owner));
     drop(held);
     assert_eq!(recv(&done_rx), Err(HintStoreError::OwnerFenced));
@@ -426,6 +434,11 @@ fn b1_store_post_sql_registry_revocation_rolls_back() {
                 "reset" => registry.reset(2),
                 _ => unreachable!(),
             }
+            // A4/T10：撤销后台化——同步测试在线程内就地 drain 保持 fencing
+            // 即时性（意图不变；registry 已移入本线程）。
+            for authority in registry.take_pending_revocations() {
+                authority.revoke_owner();
+            }
             let _ = revoked_tx.send(());
         }));
         recv(&revoked_rx);
@@ -505,6 +518,11 @@ fn b1_store_db_contention_precedes_gate() {
     let (revoked_tx, revoked_rx) = mpsc::channel();
     cleanup.threads.push(std::thread::spawn(move || {
         registry.invalidate_client("client");
+        // A4/T10：撤销后台化——同步测试在线程内就地 drain 保持 fencing
+        // 即时性（意图不变；registry 已移入本线程）。
+        for authority in registry.take_pending_revocations() {
+            authority.revoke_owner();
+        }
         let _ = revoked_tx.send(());
     }));
     recv(&revoked_rx);

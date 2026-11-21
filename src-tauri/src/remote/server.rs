@@ -818,6 +818,32 @@ fn api_router(state: Arc<RemoteState>) -> Router<Arc<RemoteState>> {
         // Codex Desktop IPC 远程控制：原生投影 / SSE / 动作查询 / 队列查看撤回 /
         // 原生审批与阻塞问答应答。**全部走既有 gated nest**——PIN 门禁内层 gate
         // 结构性覆盖，新端点不需要各自鉴权代码；所有响应 no-store。
+        // B3：题卡跳过四路（计划 wire 合同：prefix /m/api/v1/codex/question-skip）。
+        // 路由层 no-store 中间件覆盖 405/JSON 提取拒绝等非 handler 面（E8）。
+        .route(
+            "/codex/question-skip/pair-preview",
+            post(super::codex_question_skip::pair_preview).layer(axum::middleware::from_fn(
+                super::codex_question_skip::force_no_store,
+            )),
+        )
+        .route(
+            "/codex/question-skip/pair-confirm",
+            post(super::codex_question_skip::pair_confirm).layer(axum::middleware::from_fn(
+                super::codex_question_skip::force_no_store,
+            )),
+        )
+        .route(
+            "/codex/question-skip/skip",
+            post(super::codex_question_skip::skip).layer(axum::middleware::from_fn(
+                super::codex_question_skip::force_no_store,
+            )),
+        )
+        .route(
+            "/codex/question-skip/restore",
+            post(super::codex_question_skip::restore).layer(axum::middleware::from_fn(
+                super::codex_question_skip::force_no_store,
+            )),
+        )
         .route("/codex/thread", get(super::codex_ipc::thread_state))
         // 同代只读历史分页（计划任务 4）：镜像已取得的 canonical 历史里读取更早消息；
         // 只读、无写动作，门禁由本子路由内层 layer 结构性覆盖

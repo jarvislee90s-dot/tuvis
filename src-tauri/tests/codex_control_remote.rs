@@ -109,6 +109,39 @@ struct FakeDispatch {
     writes: Arc<Mutex<usize>>,
     /// T04：respond 门（模拟"已发出、回执未回"的在途状态）。
     respond_gate: Mutex<Option<Arc<tokio::sync::Notify>>>,
+    writer_probe: Arc<WriterProbe>,
+    fresh_gate: Mutex<Option<Arc<FreshGate>>>,
+}
+
+#[derive(Default)]
+struct FreshGate {
+    calls: std::sync::atomic::AtomicUsize,
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[derive(Default)]
+struct WriterProbe {
+    counts: Mutex<(usize, usize)>,
+    entered: tokio::sync::Notify,
+}
+
+struct WriterProbeGuard(Arc<WriterProbe>);
+
+impl WriterProbe {
+    fn enter(self: &Arc<Self>) -> WriterProbeGuard {
+        let mut counts = self.counts.lock().unwrap();
+        counts.0 += 1;
+        counts.1 = counts.1.max(counts.0);
+        self.entered.notify_one();
+        WriterProbeGuard(self.clone())
+    }
+}
+
+impl Drop for WriterProbeGuard {
+    fn drop(&mut self) {
+        self.0.counts.lock().unwrap().0 -= 1;
+    }
 }
 
 impl FakeDispatch {
@@ -129,6 +162,8 @@ impl FakeDispatch {
             revoke_check: Arc::new(Mutex::new(None)),
             writes: Arc::new(Mutex::new(0)),
             respond_gate: Mutex::new(None),
+            writer_probe: Arc::new(WriterProbe::default()),
+            fresh_gate: Mutex::new(None),
         }
     }
 
@@ -279,6 +314,23 @@ impl DesktopDispatch for FakeDispatch {
         SendGate::Clear
     }
 
+    fn send_gate_fresh(
+        &self,
+        key: &ThreadKey,
+    ) -> multi_agents_manager_lib::services::codex_control::BoxSendGateFut {
+        let gate = self.fresh_gate.lock().unwrap().clone();
+        let result = self.send_gate(key);
+        Box::pin(async move {
+            if let Some(gate) = gate {
+                if gate.calls.fetch_add(1, Ordering::SeqCst) == 1 {
+                    gate.entered.notify_one();
+                    gate.release.notified().await;
+                }
+            }
+            result
+        })
+    }
+
     /// S3：迟到结果轮询（预算内查注入缝；消费即取走——同一证据只收敛一次）。
     fn wait_late_result(
         &self,
@@ -346,7 +398,9 @@ impl DesktopDispatch for FakeDispatch {
         let revoke_slot = self.revoke_check.clone();
         let writes_counter = self.writes.clone();
         let action = action_id.to_string();
+        let writer_probe = self.writer_probe.clone();
         Box::pin(async move {
+            let _writer = writer_probe.enter();
             // 探测/在飞等待（生产 = ensure 阶段；停在探测的人工继续场景）
             if let Some(g) = gate {
                 g.notified().await;
@@ -532,48 +586,54 @@ fn projection_with_rev(thread_id: &str, status: &str, revision: u64) -> ThreadPr
     use multi_agents_manager_lib::services::codex_desktop_ipc::types::{
         CapabilitySet, ContentState, ControlAvailability, ProbeStatus, ProjectedMessage,
     };
-    ThreadProjection {
-        thread_id: thread_id.to_string(),
-        revision: Some(revision),
-        stale: false,
-        availability: ControlAvailability::Controllable,
-        capabilities: CapabilitySet {
-            send: true,
-            state: true,
-            command: false,
-            permissions: false,
-            blocking_input: false,
-            interrupt: false,
-        },
-        runtime_status: status.to_string(),
-        content_state: ContentState::Ready,
-        messages: vec![ProjectedMessage {
-            id: "m1".into(),
-            role: "user".into(),
-            kind: "message".into(),
-            text: "seed".into(),
-            ts: None,
-            turn_id: None,
-            artifacts: Vec::new(),
-            turn_image_count: 0,
-            omitted_artifact_count: 0,
-            interaction_answer: None,
-        }],
-        truncated: false,
-        history_token: String::new(),
-        pending: Vec::new(),
-        async_questions: Vec::new(),
-        effective_operations:
-            multi_agents_manager_lib::services::codex_desktop_ipc::capability::EffectiveOperations::unknown(),
-        probe_status: ProbeStatus::idle(),
-        queue_paused: false,
-        owner_epoch: 0,
-        owner_generation: 0,
-        local_seq: 0,
-        // T02：版本束由远程层发射点盖章（测试夹具不伪造）。
-        projection_version: None,
-        active_turn_id: None,
-    }
+    // B1b 机械适配：外部 crate 无法命名/构造 `display_stamp`（pub(crate)）——
+    // 结构体更新语法同样要求可访问全部字段（E0451）。故以合法基座
+    // `external_fixture_base()` 起手，再逐字段覆盖本夹具关注的公有字段；
+    // 所有既有字段值保持不变，不残留基座中性值进断言。
+    let mut projection = ThreadProjection::external_fixture_base();
+    projection.thread_id = thread_id.to_string();
+    projection.revision = Some(revision);
+    projection.stale = false;
+    projection.availability = ControlAvailability::Controllable;
+    projection.capabilities = CapabilitySet {
+        send: true,
+        state: true,
+        command: false,
+        permissions: false,
+        blocking_input: false,
+        interrupt: false,
+    };
+    projection.runtime_status = status.to_string();
+    projection.content_state = ContentState::Ready;
+    projection.messages = vec![ProjectedMessage {
+        id: "m1".into(),
+        role: "user".into(),
+        kind: "message".into(),
+        text: "seed".into(),
+        ts: None,
+        turn_id: None,
+        artifacts: Vec::new(),
+        turn_image_count: 0,
+        omitted_artifact_count: 0,
+        interaction_answer: None,
+    }];
+    projection.truncated = false;
+    projection.history_token = String::new();
+    projection.pending = Vec::new();
+    projection.async_questions = Vec::new();
+    projection.effective_operations =
+        multi_agents_manager_lib::services::codex_desktop_ipc::capability::EffectiveOperations::unknown();
+    projection.probe_status = ProbeStatus::idle();
+    projection.queue_paused = false;
+    projection.owner_epoch = 0;
+    projection.owner_generation = 0;
+    projection.local_seq = 0;
+    // T02：版本束由远程层发射点盖章（测试夹具不伪造）。
+    projection.projection_version = None;
+    projection.active_turn_id = None;
+    projection.question_display_groups = None;
+    projection.question_skip_history = None;
+    projection
 }
 
 // ============================================================
@@ -1007,6 +1067,146 @@ async fn retract_reserve_race_single_winner_and_no_redispatch() {
 // ============================================================
 // 计划场景 7：吊销设备
 // ============================================================
+
+async fn device_takeover_at_second_fresh_gate() -> (
+    Harness,
+    Arc<FreshGate>,
+    tokio::task::JoinHandle<multi_agents_manager_lib::services::codex_control::PrioritizeOutcome>,
+) {
+    use multi_agents_manager_lib::services::codex_control::Deadline;
+    let h = harness();
+    queued(
+        h.router
+            .send(
+                h.ctx("device-q", ActionKind::Send),
+                "排队原文".into(),
+                true,
+                false,
+            )
+            .await,
+    );
+    assert!(h.store.device_valid("dev-1"));
+    let gate = Arc::new(FreshGate::default());
+    *h.dispatch.fresh_gate.lock().unwrap() = Some(gate.clone());
+    let router = h.router.clone();
+    let key = h.key.clone();
+    let task = tokio::spawn(async move {
+        let lock = router.thread_dispatch_lock(&key).lock_owned().await;
+        router
+            .prioritize_queued("device-q", &key, Deadline::none(), lock)
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), gate.entered.notified())
+        .await
+        .expect("必须进入接管写前 fresh gate");
+    assert_eq!(gate.calls.load(Ordering::SeqCst), 2);
+    assert!(h.store.device_valid("dev-1"));
+    (h, gate, task)
+}
+
+fn device_takeover_assert_no_reserve(h: &Harness) {
+    assert_eq!(h.dispatch.send_count(), 0);
+    let conn = h.conn.lock().unwrap();
+    let grant: (i64, Option<i64>) = conn
+        .query_row(
+            "SELECT attempt, consumed_at FROM codex_bypass_grant WHERE action_id = 'device-q'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(grant, (1, None));
+    let explicit: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM codex_barrier_resolutions WHERE target_action_id = 'device-q'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(explicit, 0);
+    let reserved: i64 = conn.query_row("SELECT COUNT(*) FROM write_audit WHERE result = 'reserved' AND json_extract(summary, '$.actionId') = 'device-q'", [], |r| r.get(0)).unwrap();
+    assert_eq!(reserved, 0);
+}
+
+#[tokio::test]
+async fn idle_takeover_pre_reserve_device_revoked_persists_refusal() {
+    use multi_agents_manager_lib::services::codex_control::PrioritizeOutcome;
+    let (h, gate, task) = device_takeover_at_second_fresh_gate().await;
+    DeviceStore::Owned(h.conn.clone()).with(|c| revoke_device(c, "dev-1").unwrap());
+    gate.release.notify_one();
+    let outcome = tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .unwrap()
+        .unwrap();
+    device_takeover_assert_no_reserve(&h);
+    let view = h.view_of("device-q");
+    assert_eq!(
+        view.state,
+        ActionState::Rejected,
+        "拒发回执必须与持久终态一致"
+    );
+    let persisted = view.receipt.expect("拒发必须持久保存回执");
+    assert_eq!(persisted.delivery, Delivery::NotSent);
+    assert_eq!(persisted.reason_code.as_deref(), Some("device_revoked"));
+    match outcome {
+        PrioritizeOutcome::Completed(receipt) => {
+            assert_eq!(receipt.delivery, persisted.delivery);
+            assert_eq!(receipt.reason_code, persisted.reason_code);
+        }
+        other => panic!("应返回持久拒发回执：{other:?}"),
+    }
+}
+
+#[cfg(debug_assertions)]
+#[tokio::test]
+async fn idle_takeover_pre_reserve_device_refusal_sql_error_stays_queued() {
+    use multi_agents_manager_lib::services::codex_control::PrioritizeOutcome;
+    let (h, gate, task) = device_takeover_at_second_fresh_gate().await;
+    h.router.arm_takeover_error_probe();
+    h.conn.lock().unwrap().execute_batch("CREATE TEMP TRIGGER fail_device_refusal BEFORE UPDATE OF state ON codex_actions WHEN OLD.action_id = 'device-q' AND NEW.state = 'rejected' BEGIN SELECT RAISE(ABORT, 'queued_refusal_injected'); END;").unwrap();
+    DeviceStore::Owned(h.conn.clone()).with(|c| revoke_device(c, "dev-1").unwrap());
+    gate.release.notify_one();
+    let outcome = tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .unwrap()
+        .unwrap();
+    device_takeover_assert_no_reserve(&h);
+    assert_eq!(h.state_of("device-q"), ActionState::Queued);
+    assert!(
+        matches!(outcome, PrioritizeOutcome::StillQueued("store_error")),
+        "存储失败不得伪称拒发或离队：{outcome:?}"
+    );
+    let (target, error) = h
+        .router
+        .takeover_error_probe()
+        .expect("必须命中 queued 拒发事务的 SQL 错误");
+    assert_eq!(target, "device-q");
+    assert!(
+        error.contains("queued_refusal_injected"),
+        "错误必须来自指定触发器：{error}"
+    );
+}
+
+#[tokio::test]
+async fn idle_takeover_pre_reserve_device_retract_wins_without_overwrite() {
+    use multi_agents_manager_lib::services::codex_control::PrioritizeOutcome;
+    let (h, gate, task) = device_takeover_at_second_fresh_gate().await;
+    assert!(h.store.retract("device-q", "dev-1").unwrap());
+    let prior_receipt = format!("{:?}", h.view_of("device-q").receipt);
+    DeviceStore::Owned(h.conn.clone()).with(|c| revoke_device(c, "dev-1").unwrap());
+    gate.release.notify_one();
+    let outcome = tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .unwrap()
+        .unwrap();
+    device_takeover_assert_no_reserve(&h);
+    let view = h.view_of("device-q");
+    assert_eq!(view.state, ActionState::Cancelled);
+    assert_eq!(format!("{:?}", view.receipt), prior_receipt);
+    assert!(
+        matches!(outcome, PrioritizeOutcome::LeftQueue),
+        "撤回先胜应如实离队：{outcome:?}"
+    );
+}
 
 /// 设备被吊销后的 queued 动作拒绝而不派发（零写入），拒绝后队列不永久卡死。
 #[tokio::test]
@@ -2687,6 +2887,79 @@ async fn bypass_grant_sends_new_action_once_old_queue_untouched() {
     assert_eq!(h.dispatch.send_count(), 1, "只入队不再新增派发");
 }
 
+#[cfg(debug_assertions)]
+#[tokio::test]
+async fn idle_takeover_cas_false_state_read_error_is_storage_failure() {
+    use multi_agents_manager_lib::services::codex_control::{Deadline, PrioritizeOutcome};
+    let h = harness();
+    queued(
+        h.router
+            .send(h.ctx("cas-q", ActionKind::Send), "原文".into(), true, false)
+            .await,
+    );
+    h.conn.lock().unwrap().execute_batch("CREATE TEMP TRIGGER cas_ignore BEFORE UPDATE OF state ON codex_actions WHEN OLD.action_id = 'cas-q' AND NEW.state = 'reserved' BEGIN SELECT RAISE(IGNORE); END;").unwrap();
+    let hit = Arc::new(AtomicBool::new(false));
+    let hit_gate = hit.clone();
+    let conn = h.conn.clone();
+    h.router.set_takeover_lost_gate(Some(Arc::new(move || {
+        conn.lock()
+            .unwrap()
+            .execute_batch("ALTER TABLE codex_actions RENAME TO codex_actions_test_hidden;")
+            .unwrap();
+        hit_gate.store(true, Ordering::SeqCst);
+    })));
+    let lock = h.router.thread_dispatch_lock(&h.key).lock_owned().await;
+    let outcome = h
+        .router
+        .prioritize_queued("cas-q", &h.key, Deadline::none(), lock)
+        .await;
+    let read_failed = h
+        .conn
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT state FROM codex_actions WHERE action_id = 'cas-q'",
+            [],
+            |r| r.get::<_, String>(0),
+        )
+        .is_err();
+    h.conn.lock().unwrap().execute_batch("ALTER TABLE codex_actions_test_hidden RENAME TO codex_actions; DROP TRIGGER cas_ignore;").unwrap();
+    h.router.set_takeover_lost_gate(None);
+    assert!(
+        hit.load(Ordering::SeqCst),
+        "必须命中真实事务 CAS false 后的停点"
+    );
+    assert!(read_failed, "停点必须制造真实状态读取 SQL 错误");
+    assert_eq!(h.state_of("cas-q"), ActionState::Queued);
+    let grant: (i64, Option<i64>) = h
+        .conn
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT attempt, consumed_at FROM codex_bypass_grant WHERE action_id = 'cas-q'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(grant, (1, None));
+    assert_eq!(h.dispatch.send_count(), 0);
+    let lock = h.router.thread_dispatch_lock(&h.key).lock_owned().await;
+    let retry = h
+        .router
+        .prioritize_queued("cas-q", &h.key, Deadline::none(), lock)
+        .await;
+    assert!(
+        matches!(retry, PrioritizeOutcome::Completed(_)),
+        "恢复后可重试：{retry:?}"
+    );
+    assert_eq!(h.state_of("cas-q"), ActionState::Accepted);
+    assert_eq!(h.dispatch.send_count(), 1);
+    assert!(
+        matches!(outcome, PrioritizeOutcome::StillQueued("store_error")),
+        "读取失败必须报告 store_error，实际 {outcome:?}"
+    );
+}
+
 /// C05（队列展示收纳复审 Q01）：暂停 + 旧队列在场时的**普通新消息**必须能入队
 /// ——真实 `codex_queued`、零 start-turn、旧暂停原样保留，用户随后在统一队列区
 /// 对任一条显式「先处理这条」。修复前该路径 `finish_not_sent(queue_paused)` 把新
@@ -2997,6 +3270,135 @@ async fn bypass_grant_consumed_then_busy_requeue_keeps_fifo_order() {
     );
     assert_eq!(h.state_of("byp-1"), ActionState::Rejected);
     assert_eq!(h.state_of("byp-2"), ActionState::Accepted);
+}
+
+#[tokio::test]
+async fn takeover_lifecycle_late_old_receipt_preserves_verified_fence_and_new_owner() {
+    use multi_agents_manager_lib::services::codex_control::{Deadline, PrioritizeOutcome};
+    let h = harness_with(FakeDispatch::accepted());
+    seed_unknown_with_text(&h, "lifecycle-a", "旧消息");
+    assert!(h
+        .store
+        .resolve_barrier_verified(&h.key, "lifecycle-a", "old-complete", 123)
+        .unwrap());
+    h.dispatch.set_busy(true);
+    queued(
+        h.router
+            .send(
+                h.ctx("lifecycle-b", ActionKind::Send),
+                "新消息".into(),
+                true,
+                false,
+            )
+            .await,
+    );
+    h.dispatch.set_busy(false);
+    let result = h
+        .router
+        .prioritize_queued_bounded_for_test("lifecycle-b", &h.key, Deadline::after_ms(5_000))
+        .await;
+    assert!(
+        matches!(result, PrioritizeOutcome::Completed(ref receipt) if receipt.delivery == Delivery::Accepted),
+        "{result:?}"
+    );
+    let owner = h
+        .router
+        .observe_turn_owner(&h.key, "lifecycle-b")
+        .expect("B 必须拥有 turn");
+    h.dispatch.deliver_late(
+        "env-old",
+        DispatchOutcome {
+            delivery: Delivery::Accepted,
+            envelope_id: Some("env-old".into()),
+            turn_id: Some("late-a".into()),
+            reason_code: None,
+            revision: None,
+        },
+    );
+    let late = h
+        .dispatch
+        .wait_late_result("env-old", "lifecycle-a-client", Deadline::after_ms(1_000))
+        .await
+        .expect("必须消费真实迟到证据");
+    assert_eq!(late.delivery, Delivery::Accepted);
+    assert!(h
+        .store
+        .finish_late_result(&ActionReceipt {
+            action_id: "lifecycle-a".into(),
+            delivery: late.delivery,
+            route: ControlRoute::DesktopIpc,
+            turn_id: late.turn_id,
+            envelope_id: late.envelope_id,
+            reason_code: Some("late_result".into())
+        })
+        .unwrap());
+    assert!(
+        h.dispatch.late_results.lock().unwrap().is_empty(),
+        "迟到证据只消费一次"
+    );
+    assert_eq!(h.state_of("lifecycle-a"), ActionState::Accepted);
+    assert!(!h
+        .store
+        .compat_fences(&h.key)
+        .unwrap()
+        .iter()
+        .any(|f| f.action_id == "lifecycle-a"));
+    assert_eq!(
+        h.router.observe_turn_owner(&h.key, "lifecycle-b"),
+        Some(owner)
+    );
+    assert_eq!(h.dispatch.writes(), 1);
+    assert_eq!(h.dispatch.recorded_composed(), vec!["新消息"]);
+}
+
+#[tokio::test]
+async fn takeover_lifecycle_zero_delivery_allows_new_authorized_attempt() {
+    use multi_agents_manager_lib::services::codex_control::{
+        Deadline, PrioritizeOutcome, BUSY_BEFORE_WRITE_REASON,
+    };
+    let h = harness_with(FakeDispatch::accepted());
+    h.dispatch.set_busy(true);
+    for (id, text) in [
+        ("lifecycle-old", "旧消息"),
+        ("lifecycle-target", "目标消息"),
+    ] {
+        queued(
+            h.router
+                .send(h.ctx(id, ActionKind::Send), text.into(), true, false)
+                .await,
+        );
+    }
+    h.dispatch.set_busy(false);
+    h.store
+        .set_queue_pause(&h.key, "interrupt_accepted", "lifecycle-pause", None)
+        .unwrap();
+    h.dispatch.set_busy_before_write(true);
+    let first = h
+        .router
+        .prioritize_queued_bounded_for_test("lifecycle-target", &h.key, Deadline::after_ms(5_000))
+        .await;
+    assert!(
+        matches!(first, PrioritizeOutcome::StillQueued(ref reason) if *reason == BUSY_BEFORE_WRITE_REASON),
+        "{first:?}"
+    );
+    assert_eq!(h.state_of("lifecycle-target"), ActionState::Queued);
+    assert_eq!(h.dispatch.writes(), 0);
+    let first_attempt: i64 = h.conn.lock().unwrap().query_row("SELECT attempt FROM codex_bypass_grant WHERE action_id='lifecycle-target' AND consumed_at IS NOT NULL", [], |r| r.get(0)).unwrap();
+    h.dispatch.set_busy_before_write(false);
+    let second = h
+        .router
+        .prioritize_queued_bounded_for_test("lifecycle-target", &h.key, Deadline::after_ms(5_000))
+        .await;
+    assert!(
+        matches!(second, PrioritizeOutcome::Completed(ref receipt) if receipt.delivery == Delivery::Accepted),
+        "{second:?}"
+    );
+    let second_attempt: i64 = h.conn.lock().unwrap().query_row("SELECT attempt FROM codex_bypass_grant WHERE action_id='lifecycle-target' AND consumed_at IS NOT NULL", [], |r| r.get(0)).unwrap();
+    assert!(second_attempt > first_attempt);
+    assert_eq!(h.dispatch.writes(), 1);
+    assert_eq!(h.dispatch.recorded_composed(), vec!["目标消息"]);
+    assert_eq!(h.state_of("lifecycle-old"), ActionState::Queued);
+    assert!(h.store.queue_pause(&h.key).unwrap().is_some());
 }
 
 /// R06 反例：优先处理的授权在首次写出前被真实消费后遭遇写前忙（busy 回队、授权
@@ -3340,6 +3742,862 @@ use multi_agents_manager_lib::services::codex_control::{
 };
 use multi_agents_manager_lib::services::codex_desktop_ipc::budget::Deadline as S3Deadline;
 use std::time::Duration;
+
+async fn idle_takeover_writer_front_serial(cancel: bool) {
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let h = harness_with(FakeDispatch::accepted_gated(gate.clone()));
+    h.router.set_wrap_up_ms(10_000);
+    let ctx = h.ctx("writer-a", ActionKind::Send);
+    let router = h.router.clone();
+    let front = tokio::spawn(async move {
+        router
+            .send_bounded(
+                ctx,
+                "writer A".into(),
+                false,
+                false,
+                if cancel {
+                    S3Deadline::none()
+                } else {
+                    S3Deadline::after_ms(200)
+                },
+            )
+            .await
+    });
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        h.dispatch.writer_probe.entered.notified(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(*h.dispatch.writer_probe.counts.lock().unwrap(), (1, 1));
+    queued(
+        h.router
+            .send(
+                h.ctx("writer-q2", ActionKind::Send),
+                "writer Q2".into(),
+                false,
+                false,
+            )
+            .await,
+    );
+    if cancel {
+        front.abort();
+        assert!(front.await.unwrap_err().is_cancelled());
+    } else {
+        let receipt = completed(
+            tokio::time::timeout(Duration::from_secs(3), front)
+                .await
+                .unwrap()
+                .unwrap(),
+        );
+        assert_eq!(
+            receipt.reason_code.as_deref(),
+            Some(FRONT_BUDGET_ELAPSED_REASON)
+        );
+    }
+    assert_eq!(*h.dispatch.writer_probe.counts.lock().unwrap(), (1, 1));
+    let router = h.router.clone();
+    let key = h.key.clone();
+    let prioritize = tokio::spawn(async move {
+        let lock = router.thread_dispatch_lock(&key).lock_owned().await;
+        router
+            .prioritize_queued("writer-q2", &key, S3Deadline::none(), lock)
+            .await
+    });
+    // 让已排入运行队列的插队尝试推进；有界等待本身不充当 writer 计数。
+    let mut prioritize = prioritize;
+    let _ = tokio::time::timeout(Duration::from_millis(200), &mut prioritize).await;
+    assert_eq!(
+        *h.dispatch.writer_probe.counts.lock().unwrap(),
+        (1, 1),
+        "前台结束后后台 writer 仍独占"
+    );
+    assert_eq!(h.dispatch.send_count(), 1);
+    assert_eq!(h.dispatch.writes(), 0);
+    let consumed: i64 = h.conn.lock().unwrap().query_row("SELECT COUNT(*) FROM codex_bypass_grant WHERE action_id = 'writer-q2' AND consumed_at IS NOT NULL", [], |r| r.get(0)).unwrap();
+    assert_eq!(consumed, 0);
+    assert_eq!(h.state_of("writer-q2"), ActionState::Queued);
+    prioritize.abort();
+    h.dispatch.disarm_send();
+    gate.notify_one();
+    wait_for_state_for(&h.store, "writer-a", ActionState::Accepted).await;
+    assert_eq!(h.dispatch.writes(), 1);
+    assert_eq!(h.dispatch.send_count(), 1);
+    assert_eq!(*h.dispatch.writer_probe.counts.lock().unwrap(), (0, 1));
+}
+
+// Task7：同步回调只在测试 worker 上阻塞，且等待有上限；不持有 registry/DB 锁。
+struct PriorityStop {
+    entered: std::sync::mpsc::Sender<()>,
+    release: (Mutex<bool>, std::sync::Condvar),
+}
+
+impl PriorityStop {
+    fn stop(&self) {
+        self.entered.send(()).unwrap();
+        let (lock, cv) = &self.release;
+        let released = lock.lock().unwrap();
+        let (released, timeout) = cv
+            .wait_timeout_while(released, Duration::from_secs(10), |released| !*released)
+            .unwrap();
+        assert!(*released && !timeout.timed_out(), "测试停点未获释放");
+    }
+
+    fn release(&self) {
+        let (lock, cv) = &self.release;
+        *lock.lock().unwrap() = true;
+        cv.notify_all();
+    }
+}
+
+struct PrioritySendRelease(Arc<tokio::sync::Notify>);
+
+impl Drop for PrioritySendRelease {
+    fn drop(&mut self) {
+        self.0.notify_one();
+    }
+}
+
+struct PriorityStopCleanup(Arc<PriorityStop>);
+
+impl Drop for PriorityStopCleanup {
+    fn drop(&mut self) {
+        self.0.release();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn takeover_priority_db_wait_past_deadline_preserves_old_target_and_next_owner() {
+    use multi_agents_manager_lib::services::codex_control::router::PriorityTestPoint;
+    let h = harness();
+    for (id, text) in [("db-expired-q2", "old Q2"), ("db-expired-q3", "new Q3")] {
+        queued(
+            h.router
+                .send(h.ctx(id, ActionKind::Send), text.into(), true, false)
+                .await,
+        );
+    }
+    let baseline = {
+        let conn = h.conn.lock().unwrap();
+        let explicit: i64 = conn.query_row("SELECT COUNT(*) FROM codex_barrier_resolutions WHERE target_action_id = 'db-expired-q2'", [], |r| r.get(0)).unwrap();
+        let audit: i64 = conn.query_row("SELECT COUNT(*) FROM write_audit WHERE result = 'reserved' AND json_extract(summary, '$.actionId') = 'db-expired-q2'", [], |r| r.get(0)).unwrap();
+        (explicit, audit)
+    };
+    let (check_tx, check_rx) = std::sync::mpsc::channel();
+    let (intent_tx, intent_rx) = std::sync::mpsc::channel();
+    let stop = Arc::new(PriorityStop {
+        entered: check_tx,
+        release: (Mutex::new(false), std::sync::Condvar::new()),
+    });
+    let _stop_cleanup = PriorityStopCleanup(stop.clone());
+    let callback_stop = stop.clone();
+    h.router
+        .set_priority_interleave_gate(Some(Arc::new(move |point, _, action| match point {
+            PriorityTestPoint::AfterTakeoverIntentCheck if action == "db-expired-q2" => {
+                callback_stop.stop()
+            }
+            PriorityTestPoint::IntentRegistered if action == "db-expired-q3" => {
+                let _ = intent_tx.send(());
+            }
+            _ => {}
+        })));
+    let deadline = S3Deadline::after_ms(1000);
+    let expires = deadline.instant().unwrap();
+    let router = h.router.clone();
+    let key = h.key.clone();
+    let old = tokio::spawn(async move {
+        router
+            .prioritize_queued_bounded_for_test("db-expired-q2", &key, deadline)
+            .await
+    });
+    check_rx
+        .recv_timeout(Duration::from_secs(3))
+        .expect("Q2 未到达有效意图复核后停点");
+    let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let conn = h.conn.clone();
+    let locker = std::thread::spawn(move || {
+        let _guard = conn.lock().unwrap();
+        let _ = locked_tx.send(());
+        let _ = release_rx.recv_timeout(Duration::from_secs(10));
+    });
+    struct ReleaseDb(Option<std::sync::mpsc::Sender<()>>);
+    impl Drop for ReleaseDb {
+        fn drop(&mut self) {
+            if let Some(tx) = self.0.take() {
+                let _ = tx.send(());
+            }
+        }
+    }
+    let mut release_db = ReleaseDb(Some(release_tx));
+    locked_rx
+        .recv_timeout(Duration::from_secs(3))
+        .expect("独立线程未取得真实 DB 锁");
+    stop.release();
+    tokio::time::sleep_until(expires).await;
+    assert!(deadline.is_expired(), "必须越过原绝对截止");
+    let router = h.router.clone();
+    let key = h.key.clone();
+    let next = tokio::spawn(async move {
+        router
+            .prioritize_queued_bounded_for_test("db-expired-q3", &key, S3Deadline::after_ms(5000))
+            .await
+    });
+    intent_rx
+        .recv_timeout(Duration::from_secs(3))
+        .expect("旧意图到期后 Q3 未登记新 owner");
+    release_db.0.take().unwrap().send(()).unwrap();
+    locker.join().unwrap();
+    let old_result = tokio::time::timeout(Duration::from_secs(5), old)
+        .await
+        .unwrap()
+        .unwrap();
+    let next_result = tokio::time::timeout(Duration::from_secs(5), next)
+        .await
+        .unwrap()
+        .unwrap();
+    let records = h
+        .dispatch
+        .sends
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|record| (record.action_id.clone(), record.composed.clone()))
+        .collect::<Vec<_>>();
+    let (consumed, explicit, audit) = {
+        let conn = h.conn.lock().unwrap();
+        let consumed: i64 = conn.query_row("SELECT COUNT(*) FROM codex_bypass_grant WHERE action_id='db-expired-q2' AND consumed_at IS NOT NULL", [], |r| r.get(0)).unwrap();
+        let explicit: i64 = conn.query_row("SELECT COUNT(*) FROM codex_barrier_resolutions WHERE target_action_id='db-expired-q2'", [], |r| r.get(0)).unwrap();
+        let audit: i64 = conn.query_row("SELECT COUNT(*) FROM write_audit WHERE result='reserved' AND json_extract(summary, '$.actionId')='db-expired-q2'", [], |r| r.get(0)).unwrap();
+        (consumed, explicit, audit)
+    };
+    assert_eq!(
+        h.state_of("db-expired-q2"),
+        ActionState::Queued,
+        "超期旧目标不得 reserve：old={old_result:?}, next={next_result:?}, frames={records:?}"
+    );
+    assert_eq!(consumed, 0, "旧授权不得消费");
+    assert_eq!(
+        (explicit, audit),
+        baseline,
+        "旧目标不得新增接管记录或 reserve 审计"
+    );
+    assert!(
+        !records.iter().any(|(id, _)| id == "db-expired-q2"),
+        "旧目标不得写帧：{records:?}"
+    );
+    assert!(
+        records
+            .iter()
+            .any(|(id, text)| id == "db-expired-q3" && text == "new Q3"),
+        "新 owner 必须进展：{records:?}, {next_result:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn takeover_priority_post_lock_sql_error_is_not_left_queue() {
+    use multi_agents_manager_lib::services::codex_control::{
+        router::PriorityTestPoint, PrioritizeOutcome,
+    };
+    let h = harness();
+    queued(
+        h.router
+            .send(
+                h.ctx("sql-fault-q", ActionKind::Send),
+                "selected".into(),
+                true,
+                false,
+            )
+            .await,
+    );
+    let lock = h.router.thread_dispatch_lock(&h.key).lock_owned().await;
+    let (tx, rx) = std::sync::mpsc::channel();
+    h.router
+        .set_priority_interleave_gate(Some(Arc::new(move |point, _, action| {
+            if matches!(point, PriorityTestPoint::IntentRegistered) && action == "sql-fault-q" {
+                let _ = tx.send(());
+            }
+        })));
+    let router = h.router.clone();
+    let key = h.key.clone();
+    let task = tokio::spawn(async move {
+        router
+            .prioritize_queued_bounded_for_test("sql-fault-q", &key, S3Deadline::after_ms(3000))
+            .await
+    });
+    rx.recv_timeout(Duration::from_secs(3)).expect("意图未登记");
+    h.conn
+        .lock()
+        .unwrap()
+        .execute_batch("ALTER TABLE codex_actions RENAME TO codex_actions_fault_hidden")
+        .unwrap();
+    drop(lock);
+    let result = tokio::time::timeout(Duration::from_secs(5), task).await;
+    h.conn
+        .lock()
+        .unwrap()
+        .execute_batch("ALTER TABLE codex_actions_fault_hidden RENAME TO codex_actions")
+        .unwrap();
+    let result = result.unwrap().unwrap();
+    assert_eq!(h.state_of("sql-fault-q"), ActionState::Queued);
+    assert_eq!(h.dispatch.send_count(), 0);
+    let grants: i64 = h
+        .conn
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM codex_bypass_grant WHERE action_id='sql-fault-q'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(grants, 0);
+    assert!(
+        matches!(result, PrioritizeOutcome::StillQueued("store_error")),
+        "真实 SQL 错误不能冒充离队：{result:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn takeover_priority_next_target_registers_while_previous_writer_is_in_flight() {
+    use multi_agents_manager_lib::services::codex_control::router::PriorityTestPoint;
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let h = harness_with(FakeDispatch::accepted_gated(gate.clone()));
+    let _cleanup = PrioritySendRelease(gate.clone());
+    h.router.set_wrap_up_ms(10_000);
+    for (id, text) in [("handoff-q2", "Q2"), ("handoff-q3", "Q3")] {
+        queued(
+            h.router
+                .send(h.ctx(id, ActionKind::Send), text.into(), true, false)
+                .await,
+        );
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    h.router
+        .set_priority_interleave_gate(Some(Arc::new(move |point, _, action| {
+            if action == "handoff-q3" {
+                let event = match point {
+                    PriorityTestPoint::IntentRegistered => Some("registered"),
+                    PriorityTestPoint::IntentOccupied => Some("occupied"),
+                    _ => None,
+                };
+                if let Some(event) = event {
+                    let _ = tx.send(event);
+                }
+            }
+        })));
+    let router = h.router.clone();
+    let key = h.key.clone();
+    let q2 = tokio::spawn(async move {
+        router
+            .prioritize_queued_bounded_for_test("handoff-q2", &key, S3Deadline::after_ms(5000))
+            .await
+    });
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        h.dispatch.writer_probe.entered.notified(),
+    )
+    .await
+    .expect("Q2 未进入真实 writer");
+    assert_eq!(*h.dispatch.writer_probe.counts.lock().unwrap(), (1, 1));
+    let router = h.router.clone();
+    let key = h.key.clone();
+    let q3 = tokio::spawn(async move {
+        router
+            .prioritize_queued_bounded_for_test("handoff-q3", &key, S3Deadline::after_ms(4000))
+            .await
+    });
+    let event = rx
+        .recv_timeout(Duration::from_secs(3))
+        .expect("Q3 登记分支未观测");
+    let grants: i64 = h
+        .conn
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM codex_bypass_grant WHERE action_id='handoff-q3'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    h.dispatch.disarm_send();
+    gate.notify_one();
+    let q2_result = tokio::time::timeout(Duration::from_secs(5), q2)
+        .await
+        .unwrap()
+        .unwrap();
+    let q3_result = tokio::time::timeout(Duration::from_secs(5), q3)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        event, "registered",
+        "Q2 真正 writer 在途时 Q3 应登记并等待锁：Q2={q2_result:?}, Q3={q3_result:?}"
+    );
+    assert_eq!(grants, 0, "等锁期间不得提前铸造 Q3 授权");
+    let records = h.dispatch.recorded_composed();
+    assert_eq!(records, vec!["Q2", "Q3"]);
+    assert_eq!(*h.dispatch.writer_probe.counts.lock().unwrap(), (0, 1));
+}
+
+#[tokio::test]
+async fn takeover_priority_legacy_expired_budget_never_mints_grant() {
+    let h = harness();
+    queued(
+        h.router
+            .send(
+                h.ctx("expired-legacy-q", ActionKind::Send),
+                "selected".into(),
+                true,
+                false,
+            )
+            .await,
+    );
+    let lock = h.router.thread_dispatch_lock(&h.key).lock_owned().await;
+    let outcome = h
+        .router
+        .prioritize_queued("expired-legacy-q", &h.key, S3Deadline::after_ms(0), lock)
+        .await;
+    let grants: i64 = h
+        .conn
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM codex_bypass_grant WHERE action_id = 'expired-legacy-q'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(grants, 0, "预算已耗尽时不得铸造授权：{outcome:?}");
+    assert_eq!(h.state_of("expired-legacy-q"), ActionState::Queued);
+    assert_eq!(h.dispatch.send_count(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn takeover_priority_same_head_intent_excludes_other_batch_members() {
+    use multi_agents_manager_lib::services::codex_control::router::PriorityTestPoint;
+    let h = harness();
+    for (id, text) in [
+        ("same-head-q1", "selected only"),
+        ("same-head-q2", "other payload"),
+    ] {
+        queued(
+            h.router
+                .send(h.ctx(id, ActionKind::Send), text.into(), true, false)
+                .await,
+        );
+    }
+    let (stop_tx, stop_rx) = std::sync::mpsc::channel();
+    let (intent_tx, intent_rx) = std::sync::mpsc::channel();
+    let stop = Arc::new(PriorityStop {
+        entered: stop_tx,
+        release: (Mutex::new(false), std::sync::Condvar::new()),
+    });
+    let _cleanup = PriorityStopCleanup(stop.clone());
+    let callback_stop = stop.clone();
+    let once = Arc::new(AtomicBool::new(false));
+    h.router
+        .set_priority_interleave_gate(Some(Arc::new(move |point, _, action| match point {
+            PriorityTestPoint::BeforeReserve
+                if action == "same-head-q1" && !once.swap(true, Ordering::SeqCst) =>
+            {
+                callback_stop.stop()
+            }
+            PriorityTestPoint::IntentRegistered if action == "same-head-q1" => {
+                let _ = intent_tx.send(());
+            }
+            _ => {}
+        })));
+    let router = h.router.clone();
+    let key = h.key.clone();
+    let flush = tokio::spawn(async move { router.flush_thread(&key).await });
+    stop_rx
+        .recv_timeout(Duration::from_secs(3))
+        .expect("普通 flush 未进入队首 reserve 前停点");
+    let router = h.router.clone();
+    let key = h.key.clone();
+    let priority = tokio::spawn(async move {
+        router
+            .prioritize_queued_bounded_for_test("same-head-q1", &key, S3Deadline::after_ms(3000))
+            .await
+    });
+    intent_rx
+        .recv_timeout(Duration::from_secs(3))
+        .expect("队首意图未登记");
+    stop.release();
+    let flush_result = tokio::time::timeout(Duration::from_secs(5), flush)
+        .await
+        .unwrap()
+        .unwrap();
+    let priority_result = tokio::time::timeout(Duration::from_secs(5), priority)
+        .await
+        .unwrap()
+        .unwrap();
+    let records = h.dispatch.recorded_composed();
+    assert_eq!(records, vec!["selected only"], "只能派发选中原文，不得夹带其他队列载荷；flush={flush_result:?}, priority={priority_result:?}");
+    assert_eq!(h.state_of("same-head-q2"), ActionState::Queued);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn takeover_priority_registered_intent_wins_next_eligible_slot() {
+    use multi_agents_manager_lib::services::codex_control::router::PriorityTestPoint;
+    let writer_gate = Arc::new(tokio::sync::Notify::new());
+    let h = harness_with(FakeDispatch::accepted_gated(writer_gate.clone()));
+    h.router.set_wrap_up_ms(10_000);
+    let router = h.router.clone();
+    let ctx = h.ctx("priority-a", ActionKind::Send);
+    let first = tokio::spawn(async move {
+        router
+            .send_bounded(ctx, "A".into(), false, false, S3Deadline::none())
+            .await
+    });
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        h.dispatch.writer_probe.entered.notified(),
+    )
+    .await
+    .unwrap();
+    for (id, text) in [("priority-q1", "Q1"), ("priority-q2", "Q2")] {
+        queued(
+            h.router
+                .send(h.ctx(id, ActionKind::Send), text.into(), false, false)
+                .await,
+        );
+    }
+    h.dispatch.disarm_send();
+    writer_gate.notify_one();
+    tokio::time::timeout(Duration::from_secs(3), first)
+        .await
+        .unwrap()
+        .unwrap();
+    h.dispatch.set_terminal_turn("turn-1");
+    h.router
+        .release_turn_if_complete(&h.key, &minimal_projection(THREAD, "idle"));
+
+    let (flush_tx, flush_rx) = std::sync::mpsc::channel();
+    let (intent_tx, intent_rx) = std::sync::mpsc::channel();
+    let stop = Arc::new(PriorityStop {
+        entered: flush_tx,
+        release: (Mutex::new(false), std::sync::Condvar::new()),
+    });
+    let callback_stop = stop.clone();
+    let once = Arc::new(AtomicBool::new(false));
+    h.router
+        .set_priority_interleave_gate(Some(Arc::new(move |point, _key, action| match point {
+            PriorityTestPoint::FlushLocked if !once.swap(true, Ordering::SeqCst) => {
+                callback_stop.stop()
+            }
+            PriorityTestPoint::IntentRegistered if action == "priority-q2" => {
+                intent_tx.send(()).unwrap();
+            }
+            _ => {}
+        })));
+    let router = h.router.clone();
+    let key = h.key.clone();
+    let flush = tokio::spawn(async move { router.flush_thread(&key).await });
+    flush_rx
+        .recv_timeout(Duration::from_secs(3))
+        .expect("flush 未取得锁");
+    let router = h.router.clone();
+    let key = h.key.clone();
+    let priority = tokio::spawn(async move {
+        router
+            .prioritize_queued_bounded_for_test("priority-q2", &key, S3Deadline::after_ms(3000))
+            .await
+    });
+    intent_rx
+        .recv_timeout(Duration::from_secs(3))
+        .expect("Q2 意图未登记");
+    stop.release();
+    let priority_result = tokio::time::timeout(Duration::from_secs(5), priority)
+        .await
+        .unwrap()
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), flush)
+        .await
+        .unwrap()
+        .unwrap();
+    let ids: Vec<_> = h
+        .dispatch
+        .sends
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|s| s.action_id.clone())
+        .collect();
+    assert_eq!(
+        ids.get(1).map(String::as_str),
+        Some("priority-q2"),
+        "下一真实 writer 必须是 Q2，实际 {ids:?}，结果 {priority_result:?}"
+    );
+    assert_eq!(h.state_of("priority-q1"), ActionState::Queued);
+    h.dispatch.set_terminal_turn("turn-1");
+    h.router
+        .release_turn_if_complete(&h.key, &minimal_projection(THREAD, "idle"));
+    h.router.flush_thread(&h.key).await;
+    assert_eq!(
+        h.state_of("priority-q1"),
+        ActionState::Accepted,
+        "Q2 完成后普通队列继续"
+    );
+    assert_eq!(*h.dispatch.writer_probe.counts.lock().unwrap(), (0, 1));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn takeover_priority_wait_budget_returns_dispatch_in_flight() {
+    use multi_agents_manager_lib::services::codex_control::{
+        router::PriorityTestPoint, PrioritizeOutcome,
+    };
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let h = harness_with(FakeDispatch::accepted_gated(gate.clone()));
+    h.router.set_wrap_up_ms(10_000);
+    let router = h.router.clone();
+    let ctx = h.ctx("budget-a", ActionKind::Send);
+    let first = tokio::spawn(async move {
+        router
+            .send_bounded(ctx, "A".into(), false, false, S3Deadline::none())
+            .await
+    });
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        h.dispatch.writer_probe.entered.notified(),
+    )
+    .await
+    .unwrap();
+    queued(
+        h.router
+            .send(
+                h.ctx("budget-q2", ActionKind::Send),
+                "Q2".into(),
+                false,
+                false,
+            )
+            .await,
+    );
+    let (tx, rx) = std::sync::mpsc::channel();
+    h.router
+        .set_priority_interleave_gate(Some(Arc::new(move |point, _, action| {
+            if matches!(point, PriorityTestPoint::IntentRegistered) && action == "budget-q2" {
+                tx.send(()).unwrap();
+            }
+        })));
+    let router = h.router.clone();
+    let key = h.key.clone();
+    let started = std::time::Instant::now();
+    let priority = tokio::spawn(async move {
+        router
+            .prioritize_queued_bounded_for_test("budget-q2", &key, S3Deadline::after_ms(250))
+            .await
+    });
+    rx.recv_timeout(Duration::from_secs(3)).expect("意图未登记");
+    let result = tokio::time::timeout(Duration::from_secs(3), priority)
+        .await
+        .unwrap()
+        .unwrap();
+    let elapsed = started.elapsed();
+    let count = h.dispatch.send_count();
+    let consumed: i64 = h.conn.lock().unwrap().query_row("SELECT COUNT(*) FROM codex_bypass_grant WHERE action_id = 'budget-q2' AND consumed_at IS NOT NULL", [], |r| r.get(0)).unwrap();
+    let state = h.state_of("budget-q2");
+    h.dispatch.disarm_send();
+    gate.notify_one();
+    tokio::time::timeout(Duration::from_secs(3), first)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(result, PrioritizeOutcome::StillQueued("dispatch_in_flight")),
+        "{result:?}"
+    );
+    assert!(
+        elapsed >= Duration::from_millis(150),
+        "必须在同一预算内等待，实际 {elapsed:?}"
+    );
+    assert_eq!(count, 1, "Q2 零 frame");
+    assert_eq!(consumed, 0);
+    assert_eq!(state, ActionState::Queued);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn takeover_priority_other_target_does_not_steal_intent() {
+    use multi_agents_manager_lib::services::codex_control::{
+        router::PriorityTestPoint, PrioritizeOutcome,
+    };
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let h = harness_with(FakeDispatch::accepted_gated(gate.clone()));
+    h.router.set_wrap_up_ms(10_000);
+    let router = h.router.clone();
+    let ctx = h.ctx("owner-a", ActionKind::Send);
+    let first = tokio::spawn(async move {
+        router
+            .send_bounded(ctx, "A".into(), false, false, S3Deadline::none())
+            .await
+    });
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        h.dispatch.writer_probe.entered.notified(),
+    )
+    .await
+    .unwrap();
+    for (id, text) in [("owner-q2", "Q2"), ("owner-q3", "Q3")] {
+        queued(
+            h.router
+                .send(h.ctx(id, ActionKind::Send), text.into(), false, false)
+                .await,
+        );
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    h.router
+        .set_priority_interleave_gate(Some(Arc::new(move |point, _, action| {
+            let event = match (point, action) {
+                (PriorityTestPoint::IntentRegistered, "owner-q2") => Some("registered"),
+                (PriorityTestPoint::ReplayObserved, "owner-q2") => Some("replay"),
+                (PriorityTestPoint::IntentOccupied, "owner-q3") => Some("occupied"),
+                _ => None,
+            };
+            if let Some(event) = event {
+                tx.send(event).unwrap();
+            }
+        })));
+    let router = h.router.clone();
+    let key = h.key.clone();
+    let leader = tokio::spawn(async move {
+        router
+            .prioritize_queued_bounded_for_test("owner-q2", &key, S3Deadline::after_ms(3000))
+            .await
+    });
+    assert_eq!(
+        rx.recv_timeout(Duration::from_secs(3)).unwrap(),
+        "registered"
+    );
+    let router = h.router.clone();
+    let key = h.key.clone();
+    let replay = tokio::spawn(async move {
+        router
+            .prioritize_queued_bounded_for_test("owner-q2", &key, S3Deadline::after_ms(500))
+            .await
+    });
+    assert_eq!(rx.recv_timeout(Duration::from_secs(3)).unwrap(), "replay");
+    let replay = tokio::time::timeout(Duration::from_secs(1), replay)
+        .await
+        .unwrap()
+        .unwrap();
+    let router = h.router.clone();
+    let key = h.key.clone();
+    let other = tokio::spawn(async move {
+        router
+            .prioritize_queued_bounded_for_test("owner-q3", &key, S3Deadline::after_ms(500))
+            .await
+    });
+    assert_eq!(rx.recv_timeout(Duration::from_secs(3)).unwrap(), "occupied");
+    let other = tokio::time::timeout(Duration::from_secs(1), other)
+        .await
+        .unwrap()
+        .unwrap();
+    let sends_before_release = h.dispatch.send_count();
+    h.dispatch.disarm_send();
+    gate.notify_one();
+    tokio::time::timeout(Duration::from_secs(3), first)
+        .await
+        .unwrap()
+        .unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(5), leader)
+        .await
+        .unwrap()
+        .unwrap();
+    let ids: Vec<_> = h
+        .dispatch
+        .sends
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|s| s.action_id.clone())
+        .collect();
+    assert!(
+        matches!(replay, PrioritizeOutcome::StillQueued("dispatch_in_flight")),
+        "{replay:?}"
+    );
+    assert!(
+        matches!(other, PrioritizeOutcome::StillQueued("dispatch_in_flight")),
+        "{other:?}"
+    );
+    assert_eq!(sends_before_release, 1, "重放与其他目标不得新增帧");
+    assert_eq!(
+        ids.get(1).map(String::as_str),
+        Some("owner-q2"),
+        "{ids:?}, {result:?}"
+    );
+    assert_eq!(h.state_of("owner-q3"), ActionState::Queued);
+    assert_eq!(*h.dispatch.writer_probe.counts.lock().unwrap(), (0, 1));
+}
+
+#[tokio::test]
+async fn takeover_priority_real_writer_never_overlaps() {
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let h = harness_with(FakeDispatch::accepted_gated(gate.clone()));
+    h.router.set_wrap_up_ms(10_000);
+    let router = h.router.clone();
+    let ctx = h.ctx("priority-writer-a", ActionKind::Send);
+    let first = tokio::spawn(async move {
+        router
+            .send_bounded(ctx, "writer A".into(), false, false, S3Deadline::none())
+            .await
+    });
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        h.dispatch.writer_probe.entered.notified(),
+    )
+    .await
+    .unwrap();
+    queued(
+        h.router
+            .send(
+                h.ctx("priority-writer-q2", ActionKind::Send),
+                "writer Q2".into(),
+                false,
+                false,
+            )
+            .await,
+    );
+    let trying = Arc::new(tokio::sync::Notify::new());
+    let signal = trying.clone();
+    let router = h.router.clone();
+    let key = h.key.clone();
+    let second = tokio::spawn(async move {
+        signal.notify_one();
+        let lock = router.thread_dispatch_lock(&key).lock_owned().await;
+        router
+            .prioritize_queued("priority-writer-q2", &key, S3Deadline::none(), lock)
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(3), trying.notified())
+        .await
+        .unwrap();
+    assert_eq!(*h.dispatch.writer_probe.counts.lock().unwrap(), (1, 1));
+    assert_eq!(h.dispatch.send_count(), 1);
+    h.dispatch.disarm_send();
+    gate.notify_one();
+    tokio::time::timeout(Duration::from_secs(3), first)
+        .await
+        .unwrap()
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(3), second)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(h.dispatch.send_count(), 2, "两个真实 writer 均应完成");
+    assert_eq!(*h.dispatch.writer_probe.counts.lock().unwrap(), (0, 1));
+}
+
+#[tokio::test]
+async fn idle_takeover_writer_front_timeout_keeps_serial() {
+    idle_takeover_writer_front_serial(false).await;
+}
+
+#[tokio::test]
+async fn idle_takeover_writer_front_cancel_keeps_serial() {
+    idle_takeover_writer_front_serial(true).await;
+}
 
 /// R1c：前台预算到期返回「待确认」后，派发任务**已分离**——HTTP future 被取消
 /// 也不丢动作、不二次写入；账本最终收敛 accepted。
@@ -4675,6 +5933,273 @@ async fn p7_prioritize_passes_through_unbound_unknown_barrier_residue() {
         h.store.has_compat_fence(&h.key).unwrap(),
         "屏障本体保留（不假装核对通过）"
     );
+}
+
+#[tokio::test]
+async fn queue_owner_old_completion_keeps_new_active() {
+    let h = harness_with(FakeDispatch::accepted_turn("turn-owner-a", None));
+    let a = completed(
+        h.router
+            .send(h.ctx("owner-a", ActionKind::Send), "A".into(), false, false)
+            .await,
+    );
+    assert_eq!(a.delivery, Delivery::Accepted);
+    assert!(h.router.force_clear_turn_limit(&h.key, "owner-a"));
+    h.dispatch.set_outcome(DispatchOutcome {
+        delivery: Delivery::Accepted,
+        envelope_id: Some("env-owner-b".into()),
+        turn_id: Some("turn-owner-b".into()),
+        reason_code: None,
+        revision: None,
+    });
+    let b = completed(
+        h.router
+            .send(h.ctx("owner-b", ActionKind::Send), "B".into(), false, false)
+            .await,
+    );
+    assert_eq!(b.delivery, Delivery::Accepted);
+    assert!(h.router.is_turn_active_public(&h.key));
+    assert_eq!(h.dispatch.send_count(), 2);
+    assert_eq!(h.store.compat_fences(&h.key).unwrap().len(), 2);
+
+    h.dispatch.set_terminal_turn("turn-owner-a");
+    h.router
+        .release_turn_if_complete(&h.key, &projection_with_rev(THREAD, "idle", 9));
+    let fences = h.store.compat_fences(&h.key).unwrap();
+    assert_eq!(fences.len(), 1, "A 的终态屏障应被清除");
+    assert_eq!(fences[0].action_id, "owner-b", "B 的屏障必须保留");
+    assert!(
+        h.router.is_turn_active_public(&h.key),
+        "A 的终态不得清除仍在运行的 B"
+    );
+    queued(
+        h.router
+            .send(h.ctx("owner-c", ActionKind::Send), "C".into(), false, false)
+            .await,
+    );
+    assert_eq!(h.dispatch.send_count(), 2, "C 不得借 A 的证据并发写出");
+    assert_eq!(h.state_of("owner-b"), ActionState::Accepted);
+    assert_eq!(h.state_of("owner-c"), ActionState::Queued);
+}
+
+// 迟到回执已落账、内存尚未收敛；兼容屏障先构造为旧版无 turn 身份的形态。
+async fn converge_unbound_fence_harness() -> Harness {
+    let h = harness_with(FakeDispatch::new(DispatchOutcome {
+        delivery: Delivery::UnknownDelivery,
+        envelope_id: None,
+        turn_id: None,
+        reason_code: None,
+        revision: None,
+    }));
+    let receipt = completed(
+        h.router
+            .send(
+                h.ctx("converge-cas", ActionKind::Send),
+                "A".into(),
+                false,
+                false,
+            )
+            .await,
+    );
+    assert_eq!(receipt.delivery, Delivery::UnknownDelivery);
+    assert!(h
+        .store
+        .finish_late_result(&ActionReceipt {
+            action_id: "converge-cas".into(),
+            delivery: Delivery::Accepted,
+            route: ControlRoute::DesktopIpc,
+            turn_id: Some("turn-converge-cas".into()),
+            envelope_id: None,
+            reason_code: Some("late_result".into()),
+        })
+        .unwrap());
+    h.store
+        .set_compat_fence("converge-cas", None, None)
+        .unwrap();
+    h
+}
+
+#[tokio::test]
+async fn queue_owner_converge_binds_owned_memory_and_unbound_fence() {
+    let h = converge_unbound_fence_harness().await;
+    let before = h.store.compat_fences(&h.key).unwrap();
+    assert_eq!(before.len(), 1);
+    assert_eq!(before[0].turn_id, None);
+    let owner = h.router.observe_turn_owner(&h.key, "converge-cas").unwrap();
+    h.router.converge_with_ledger();
+    let after = h.store.compat_fences(&h.key).unwrap();
+    assert_eq!(after.len(), 1);
+    assert_eq!(after[0].turn_id.as_deref(), Some("turn-converge-cas"));
+    assert_eq!(
+        h.router.observe_turn_owner(&h.key, "converge-cas"),
+        Some(owner)
+    );
+    h.dispatch.set_terminal_turn("turn-converge-cas");
+    assert!(h
+        .router
+        .release_turn_if_complete(&h.key, &projection_with_rev(THREAD, "idle", 9)));
+    assert!(h.store.compat_fences(&h.key).unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn queue_owner_converge_does_not_recreate_cleared_fence() {
+    let h = converge_unbound_fence_harness().await;
+    h.store.clear_compat_fence("converge-cas").unwrap();
+    assert!(h.store.compat_fences(&h.key).unwrap().is_empty());
+    h.router.converge_with_ledger();
+    assert!(h.store.compat_fences(&h.key).unwrap().is_empty());
+    h.dispatch.set_terminal_turn("turn-converge-cas");
+    assert!(
+        h.router
+            .release_turn_if_complete(&h.key, &projection_with_rev(THREAD, "idle", 9)),
+        "仍在册的 owner 应取得回合身份"
+    );
+    assert!(h.store.compat_fences(&h.key).unwrap().is_empty());
+}
+
+#[cfg(debug_assertions)]
+#[tokio::test]
+async fn queue_owner_stale_converge_snapshot_keeps_new_active() {
+    use std::{sync::mpsc, time::Duration};
+
+    let h = harness_with(FakeDispatch::new(DispatchOutcome {
+        delivery: Delivery::UnknownDelivery,
+        envelope_id: None,
+        turn_id: None,
+        reason_code: None,
+        revision: None,
+    }));
+    let a = completed(
+        h.router
+            .send(
+                h.ctx("converge-a", ActionKind::Send),
+                "A".into(),
+                false,
+                false,
+            )
+            .await,
+    );
+    assert_eq!(a.delivery, Delivery::UnknownDelivery);
+    assert_eq!(h.state_of("converge-a"), ActionState::Unknown);
+    // 已有迟到回执接口将证据落到原动作；内存仍等待收敛补绑。
+    assert!(h
+        .store
+        .finish_late_result(&ActionReceipt {
+            action_id: "converge-a".into(),
+            delivery: Delivery::Accepted,
+            route: ControlRoute::DesktopIpc,
+            turn_id: Some("turn-converge-a".into()),
+            envelope_id: None,
+            reason_code: Some("late_result".into()),
+        })
+        .unwrap());
+    assert_eq!(h.state_of("converge-a"), ActionState::Accepted);
+    assert_eq!(
+        h.store
+            .action_terminal_state("converge-a")
+            .unwrap()
+            .1
+            .as_deref(),
+        Some("turn-converge-a")
+    );
+
+    let (observed_tx, observed_rx) = mpsc::sync_channel(1);
+    let (resume_tx, resume_rx) = mpsc::sync_channel::<()>(1);
+    let resume_rx = Mutex::new(resume_rx);
+    h.router
+        .set_converge_interleave_gate(Some(Arc::new(move |_, action, turn, owner| {
+            if action == "converge-a" {
+                if observed_tx.send((turn.map(str::to_string), owner)).is_ok() {
+                    let _ = resume_rx
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(10));
+                }
+            }
+        })));
+    let router = h.router.clone();
+    let converging = tokio::task::spawn_blocking(move || router.converge_with_ledger());
+    let (old_turn, old_owner) = observed_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("收敛未到达停点");
+    assert_eq!(old_turn, None, "快照必须尚未补绑回合");
+    assert_eq!(
+        h.router.observe_turn_owner(&h.key, "converge-a"),
+        Some(old_owner)
+    );
+
+    assert!(h
+        .router
+        .bind_turn_id(&h.key, "converge-a", "turn-converge-a"));
+    h.dispatch.set_terminal_turn("turn-converge-a");
+    assert!(h
+        .router
+        .release_turn_if_complete(&h.key, &projection_with_rev(THREAD, "idle", 9)));
+    assert!(
+        !h.store
+            .compat_fences(&h.key)
+            .unwrap()
+            .iter()
+            .any(|f| f.action_id == "converge-a"),
+        "放行旧收敛前，A 的终态屏障必须已经清除"
+    );
+    h.dispatch.set_outcome(DispatchOutcome {
+        delivery: Delivery::Accepted,
+        envelope_id: Some("env-converge-b".into()),
+        turn_id: Some("turn-converge-b".into()),
+        reason_code: None,
+        revision: None,
+    });
+    let b = completed(
+        h.router
+            .send(
+                h.ctx("converge-b", ActionKind::Send),
+                "B".into(),
+                false,
+                false,
+            )
+            .await,
+    );
+    assert_eq!(b.delivery, Delivery::Accepted);
+    let owner_b = h
+        .router
+        .observe_turn_owner(&h.key, "converge-b")
+        .expect("B 必须在册");
+    assert_ne!(owner_b, old_owner);
+    resume_tx.send(()).expect("放行旧收敛");
+    tokio::time::timeout(Duration::from_secs(5), converging)
+        .await
+        .expect("收敛未退出")
+        .unwrap();
+    h.router.set_converge_interleave_gate(None);
+
+    assert_eq!(
+        h.router.observe_turn_owner(&h.key, "converge-b"),
+        Some(owner_b)
+    );
+    assert!(h.router.is_turn_active_public(&h.key));
+    assert!(!h.router.force_clear_turn_limit(&h.key, "converge-a"));
+    let fences = h.store.compat_fences(&h.key).unwrap();
+    assert!(
+        !fences.iter().any(|f| f.action_id == "converge-a"),
+        "旧收敛不得重新置起已清除的 A 屏障"
+    );
+    assert!(
+        fences.iter().any(|f| f.action_id == "converge-b"),
+        "B 的屏障必须保留"
+    );
+    queued(
+        h.router
+            .send(
+                h.ctx("converge-c", ActionKind::Send),
+                "C".into(),
+                false,
+                false,
+            )
+            .await,
+    );
+    assert_eq!(h.dispatch.send_count(), 2, "旧快照不得使 C 并发写出");
+    assert!(h.router.force_clear_turn_limit(&h.key, "converge-b"));
 }
 
 /// P9b（2026-10-31 第五次实机）：同线程多条已受理屏障时，终态释放只清内存里

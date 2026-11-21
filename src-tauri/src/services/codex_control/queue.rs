@@ -16,9 +16,15 @@ use crate::database::dao::codex_actions::StopPauseRow;
 use crate::inject::headless::codex::{production_queue_holds, QueueEvidence};
 use crate::inject::normalize::compose_injection_flagged;
 use crate::remote::pairing::{self, DeviceStore};
+use crate::services::codex_desktop_ipc::async_question::AsyncAnswerRoute;
+use crate::services::codex_desktop_ipc::capability::ObservedTarget;
 use crate::services::codex_desktop_ipc::types::{
     new_uuid, ActionKind, ActionReceipt, ActionState, CodexActionView, ControlRoute, ProtocolError,
     ThreadKey, ThreadProjection,
+};
+use crate::services::codex_question_skip::live::{
+    Claim, ClaimKind, ClaimsLayer, ClaimsScope, ClaimsUpdate, FactUpdate, LiveFact, LiveFactKey,
+    LiveRefusal, QuestionSkipLive,
 };
 
 use super::ActionContext;
@@ -173,6 +179,14 @@ pub struct ActionSnapshot {
 
 pub struct ActionStore {
     store: DeviceStore,
+    /// Source/live 门禁共享事实（hub 装配点注入与 adapter 同一份 Arc；未装配 =
+    /// 权威事实 Unknown → 接点不提交任何事实）。
+    question_skip_live: std::sync::OnceLock<std::sync::Arc<QuestionSkipLive>>,
+    /// B-R2 复审：Stop 事实写点/装载的临界区串行——消除「新读越过在途旧写 →
+    /// 旧票 finish 被 epoch CAS 拒 → live 永久保留过期值」的交错窗口（Stop 的
+    /// 通用 epoch 协议不登记在途写，读可越过挂起的写）。stop 事件低频，全局
+    /// 单锁足够；锁序恒为 gate → store(with) → live 内部锁，无反向获取。
+    stop_facts_gate_lock: std::sync::Mutex<()>,
 }
 
 /// 人工解除保守屏障的结果（2026-10-19 无出口屏障修复；HTTP 映射在 remote::codex_ipc：
@@ -241,13 +255,48 @@ fn db_err(e: rusqlite::Error) -> StoreError {
     StoreError::Database(e.to_string())
 }
 
+/// B-R2：Stop 写点统一收尾——写+同连接读回成功 → 提交两项完整事实；
+/// 失败 → 保守 Unknown（不假恢复）。value = 各写点既有布尔语义。
+fn finish_stop_write(
+    ticket: Option<(
+        std::sync::Arc<crate::services::codex_question_skip::live::QuestionSkipLive>,
+        crate::services::codex_question_skip::live::FactUpdate,
+    )>,
+    result: Result<(bool, bool, bool), StoreError>,
+) -> Result<bool, StoreError> {
+    match result {
+        Ok((value, running, persistent)) => {
+            if let Some((live, update)) = ticket {
+                let _ = live.finish_gate_change(
+                    update,
+                    Ok(LiveFact::Stop {
+                        running: Some(running),
+                        persistent: Some(persistent),
+                    }),
+                );
+            }
+            Ok(value)
+        }
+        Err(e) => {
+            if let Some((live, update)) = ticket {
+                let _ = live.finish_gate_change(update, Err(LiveRefusal::Unknown));
+            }
+            Err(e)
+        }
+    }
+}
+
 impl ActionStore {
     /// 构造并执行启动恢复：reserved → unknown（writer 已接手而进程消失 = 投递结果
     /// 未知，绝不回 queued）；queued 行不受影响，仍按序可发。
     /// PR #165 复审 Important：启动恢复时同跑一轮终态行保留清理（墓碑化，批量分批，
     /// 快 SQL；超期存量由后续周期对账逐轮收敛）。
     pub fn new(store: DeviceStore) -> Self {
-        let s = Self { store };
+        let s = Self {
+            store,
+            question_skip_live: std::sync::OnceLock::new(),
+            stop_facts_gate_lock: std::sync::Mutex::new(()),
+        };
         match s.recover_reserved() {
             Ok(0) => {}
             Ok(n) => log::warn!("codex_actions: 启动恢复 {n} 条 reserved 动作为 unknown"),
@@ -258,6 +307,89 @@ impl ActionStore {
             log::info!("codex_actions: 启动墓碑化 {tombstoned} 条超期终态行（行保留，重载荷清空）");
         }
         s
+    }
+
+    /// B2 事实初装载读取面：底层 [`DeviceStore`] 只读访问（remote 装配初装载
+    /// Device/Claims/Stop 持久事实用；写路径仍走 ActionStore 自有方法，不经此面）。
+    pub fn device_store(&self) -> &DeviceStore {
+        &self.store
+    }
+
+    /// Source/live 门禁装配点：hub 用同一份 `Arc<QuestionSkipLive>` 注入本 store
+    /// 与 adapter（合同 §1：adapter / ActionStore / hub 的失效接点共享一份）。
+    pub(crate) fn set_question_skip_live(&self, live: std::sync::Arc<QuestionSkipLive>) {
+        let _ = self.question_skip_live.set(live);
+    }
+
+    /// 只读 claim 装载（合同 §6）：复用 DAO `question_claim_conn`；读取仅用于
+    /// 装载 Claims 持久层事实，**不在 final 调用**。Ok(None) = 已知无行。
+    pub fn question_claim(
+        &self,
+        thread_id: &str,
+        question_key: &str,
+    ) -> Result<Option<(String, String)>, StoreError> {
+        self.with(|c| {
+            crate::database::dao::codex_interactions::question_claim_conn(
+                c,
+                thread_id,
+                question_key,
+            )
+            .map_err(db_err)
+        })
+    }
+
+    /// Claims 持久层写票（修复合同 §2）：生产写入口走 typed
+    /// `begin_claims_change`（Persistent + 权威 Keys/Full）；begin 发生在等待 DB
+    /// 之前（失效先行，不能因 SQL 未开始而暂时视为 clear）。finish 必须仍在
+    /// **原连接闭包内**调用（同层同 key 旧写不能晚到覆盖新写）。
+    fn begin_persistent_claims(&self, thread_id: &str, scope: ClaimsScope) -> Option<ClaimsUpdate> {
+        let live = self.question_skip_live.get()?.clone();
+        let key = crate::services::codex_desktop_ipc::types::ThreadKey {
+            host_id: "local".into(),
+            thread_id: thread_id.to_string(),
+        };
+        live.begin_claims_change(&key, ClaimsLayer::Persistent, scope)
+            .ok()
+    }
+
+    /// Stop 持久屏障接点内部件：begin（stop 准备先失效）→ 调用方写 pause/stop
+    /// → finish 按真实结果提交。running 层（停止操作在途与否）不在此装载，
+    /// 保持 None = 未知（recheck 需两层已知 clear 才放行）。
+    fn begin_stop_ticket(
+        &self,
+        key: &ThreadKey,
+    ) -> Option<(std::sync::Arc<QuestionSkipLive>, FactUpdate)> {
+        let live = self.question_skip_live.get()?;
+        let update = live
+            .begin_gate_change(LiveFactKey::Stop(key.clone()))
+            .ok()?;
+        Some((live.clone(), update))
+    }
+
+    /// B-R2 复审：Stop 临界区门（写点与装载共用；持锁覆盖 begin→写→finish 全段）。
+    pub(crate) fn stop_facts_gate(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.stop_facts_gate_lock
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// B-R2 复审：装载侧入口（传 &Mutex 给共用装载体；锁在 Stop 段内获取）。
+    pub(crate) fn stop_facts_gate_mutex(&self) -> &std::sync::Mutex<()> {
+        &self.stop_facts_gate_lock
+    }
+
+    /// B-R2：动作行 → 所属 ThreadKey（StopAttempt 写点回读线程；行不在账 = None）。
+    fn action_thread(&self, action_id: &str) -> Result<Option<ThreadKey>, StoreError> {
+        self.with(|c| {
+            crate::database::dao::codex_actions::action_thread_conn(c, action_id)
+                .map(|t| {
+                    t.map(|tid| crate::services::codex_desktop_ipc::types::ThreadKey {
+                        host_id: "local".into(),
+                        thread_id: tid,
+                    })
+                })
+                .map_err(db_err)
+        })
     }
 
     /// 单次 `DeviceStore::with()`（不可重入；闭包内完成全部 SQL，不跨 await）。
@@ -401,6 +533,27 @@ impl ActionStore {
         self.with(|c| dao::reserve_conn(c, action_id, route, now_ms()).map_err(db_err))
     }
 
+    /// 路径与效果只由本次 reserve 胜者冻结，不在 CAS 前改写已有动作。
+    pub(crate) fn reserve_async_answer(
+        &self,
+        action_id: &str,
+        route: AsyncAnswerRoute,
+        target: Option<&ObservedTarget>,
+    ) -> Result<bool, StoreError> {
+        self.with(|c| {
+            dao::reserve_async_answer_conn(c, action_id, route, target, now_ms()).map_err(db_err)
+        })
+    }
+
+    pub(crate) fn is_active_async_answer(&self, action_id: &str) -> Result<bool, StoreError> {
+        self.with(|c| {
+            let row = dao::get_row(c, action_id)
+                .map_err(db_err)?
+                .ok_or(StoreError::Conflict)?;
+            Ok(row.is_active_async_answer())
+        })
+    }
+
     /// 自然空闲/明确恢复时一次原子领取并冻结普通消息批次。
     pub fn reserve_send_batch(&self, action_id: &str) -> Result<Option<String>, StoreError> {
         self.with(|c| dao::reserve_send_batch_conn(c, action_id, now_ms()).map_err(db_err))
@@ -458,6 +611,27 @@ impl ActionStore {
     /// 同一证据只收敛一次）。消费方：派发任务的迟到等待 + 调度循环对账兜底。
     pub fn finish_late_result(&self, receipt: &ActionReceipt) -> Result<bool, StoreError> {
         self.with(|c| dao::finish_late_result_conn(c, receipt, now_ms()).map_err(db_err))
+    }
+
+    /// 正式回显确认送达。`Some(true)` 表示持久屏障在册，可以向原 owner 补绑。
+    pub(crate) fn finish_formal_echo(
+        &self,
+        receipt: &ActionReceipt,
+        thread_id: &str,
+        client_message_id: &str,
+        allow_reserved: bool,
+    ) -> Result<Option<bool>, StoreError> {
+        self.with(|c| {
+            dao::finish_formal_echo_conn(
+                c,
+                receipt,
+                thread_id,
+                client_message_id,
+                allow_reserved,
+                now_ms(),
+            )
+            .map_err(db_err)
+        })
     }
 
     // ---- S4：人工继续 / 派发权撤销 / 补绑 ----
@@ -528,6 +702,14 @@ impl ActionStore {
     ) -> Option<crate::services::codex_desktop_ipc::capability::CodexOperation> {
         use crate::services::codex_desktop_ipc::capability::CodexOperation;
         self.with(|c| {
+            let Some(row) = dao::get_row(c, action_id).map_err(db_err)? else {
+                return Ok(None);
+            };
+            if row.is_active_async_answer() {
+                // 运行中答案本批不登记 observed success，残留目标也不能借 kind 记成 idle。
+                dao::clear_effect_target_conn(c, action_id).map_err(db_err)?;
+                return Ok(None);
+            }
             let target = crate::database::dao::codex_actions::take_effect_target_conn(c, action_id)
                 .map_err(db_err)?;
             let Some((probe_key, package_sha256, rule_version)) = target else {
@@ -634,8 +816,20 @@ impl ActionStore {
         entries: &[crate::database::dao::codex_interactions::GroupClaimEntry<'_>],
         facts: &crate::database::dao::codex_interactions::ClaimFacts<'_>,
     ) -> Result<crate::database::dao::codex_interactions::GroupClaimOutcome, StoreError> {
-        self.with(|c| {
-            crate::database::dao::codex_interactions::claim_question_group_conn(
+        // Source/live（修复合同 §2）：写事务前 begin Persistent Keys 更新（授权窗
+        // = 全部 entry keys）；事务后**在同一原连接内**对全部 scope keys 读
+        // question_claim_conn 真实行再 finish（Occupied/Answered 的部分结果不得
+        // 覆盖未观察 entry 的既有 blocker——如 qA；scope key 真实无行才已证空）。
+        let live = self.question_skip_live.get().cloned();
+        let scope_keys: Vec<String> = entries
+            .iter()
+            .map(|entry| entry.question_key.to_string())
+            .collect();
+        let ticket = live.as_ref().and_then(|_live| {
+            self.begin_persistent_claims(thread_id, ClaimsScope::Keys(scope_keys))
+        });
+        let result = self.with(|c| {
+            let result = crate::database::dao::codex_interactions::claim_question_group_conn(
                 c,
                 thread_id,
                 action_id,
@@ -646,8 +840,48 @@ impl ActionStore {
                     ..*facts
                 },
             )
-            .map_err(db_err)
-        })
+            .map_err(db_err);
+            if let (Some(live), Some(update)) = (live.as_ref(), ticket) {
+                let observed = match &result {
+                    Ok(_) => {
+                        // 同连接全 scope 真实读：无行 = 已证空（不入 observed），
+                        // 有行按真实状态记账；读失败 = 该范围保守 Unknown。
+                        let mut observed: Result<Vec<Claim>, LiveRefusal> = Ok(Vec::new());
+                        for entry in entries {
+                            if observed.is_err() {
+                                break;
+                            }
+                            match crate::database::dao::codex_interactions::question_claim_conn(
+                                c,
+                                thread_id,
+                                entry.question_key,
+                            ) {
+                                Ok(None) => {}
+                                Ok(Some((row_action, state))) => {
+                                    if let Ok(claims) = observed.as_mut() {
+                                        claims.push(Claim {
+                                            question_key: entry.question_key.to_string(),
+                                            action_id: Some(row_action),
+                                            kind: match state.as_str() {
+                                                "answered" => ClaimKind::Answered,
+                                                "unknown" => ClaimKind::Unknown,
+                                                _ => ClaimKind::InFlight,
+                                            },
+                                        });
+                                    }
+                                }
+                                Err(_) => observed = Err(LiveRefusal::Unknown),
+                            }
+                        }
+                        observed
+                    }
+                    Err(_) => Err(LiveRefusal::Unknown),
+                };
+                let _ = live.finish_claims_change(update, observed);
+            }
+            result
+        });
+        result
     }
 
     pub fn claim_question(
@@ -658,8 +892,17 @@ impl ActionStore {
         claim_owner: &str,
         facts: &crate::database::dao::codex_interactions::ClaimFacts<'_>,
     ) -> Result<crate::database::dao::codex_interactions::QuestionClaim, StoreError> {
-        self.with(|c| {
-            crate::database::dao::codex_interactions::claim_question_conn(
+        // Source/live（修复合同 §2）：写事务前 begin Persistent Keys 更新；事务后
+        // **仍持原连接**按实际结果提交权威 Keys（同层同 key 旧写不能晚到覆盖新写）。
+        let live = self.question_skip_live.get().cloned();
+        let ticket = live.as_ref().and_then(|_live| {
+            self.begin_persistent_claims(
+                thread_id,
+                ClaimsScope::Keys(vec![question_key.to_string()]),
+            )
+        });
+        let result = self.with(|c| {
+            let result = crate::database::dao::codex_interactions::claim_question_conn(
                 c,
                 thread_id,
                 question_key,
@@ -670,21 +913,68 @@ impl ActionStore {
                     ..*facts
                 },
             )
-            .map_err(db_err)
-        })
+            .map_err(db_err);
+            if let (Some(live), Some(update)) = (live.as_ref(), ticket) {
+                let observed = match &result {
+                    Ok(outcome) => {
+                        let kind = match outcome {
+                            crate::database::dao::codex_interactions::QuestionClaim::Claimed
+                            | crate::database::dao::codex_interactions::QuestionClaim::AlreadyMine => {
+                                ClaimKind::InFlight
+                            }
+                            crate::database::dao::codex_interactions::QuestionClaim::Occupied {
+                                state,
+                                ..
+                            } => {
+                                if state == "unknown" {
+                                    ClaimKind::Unknown
+                                } else {
+                                    ClaimKind::InFlight
+                                }
+                            }
+                            crate::database::dao::codex_interactions::QuestionClaim::Answered => {
+                                ClaimKind::Answered
+                            }
+                        };
+                        Ok(vec![Claim {
+                            question_key: question_key.to_string(),
+                            action_id: Some(action_id.to_string()),
+                            kind,
+                        }])
+                    }
+                    Err(_) => Err(LiveRefusal::Unknown),
+                };
+                let _ = live.finish_claims_change(update, observed);
+            }
+            result
+        });
+        result
     }
 
-    /// R02：按动作终态收尾占用（见 DAO 规则）。
+    /// R02：按动作终态收尾占用（见 DAO 规则）。Source/live（修复合同 §2）：写前
+    /// begin Persistent Full 更新（DAO 按 action_id 收尾、结果不带权威 keys →
+    /// 全范围保守 Unknown，不能恢复旧「无占位」）；仍在原连接闭包内 finish。
     pub fn settle_question_claim(&self, action_id: &str, delivery: &str) -> Result<(), StoreError> {
-        self.with(|c| {
-            crate::database::dao::codex_interactions::settle_question_claim_conn(
+        let live = self.question_skip_live.get().cloned();
+        let thread_hint = self.action_thread_and_cmid(action_id).map(|(t, _)| t);
+        let ticket = thread_hint
+            .as_deref()
+            .and_then(|t| self.begin_persistent_claims(t, ClaimsScope::Full));
+        let result = self.with(|c| {
+            let result = crate::database::dao::codex_interactions::settle_question_claim_conn(
                 c,
                 action_id,
                 delivery,
                 now_ms(),
             )
-            .map_err(db_err)
-        })
+            .map_err(db_err);
+            // 终态收尾改变占用事实但无法在此取得完整权威 keys：一律保守 Unknown。
+            if let (Some(live), Some(update)) = (live.as_ref(), ticket) {
+                let _ = live.finish_claims_change(update, Err(LiveRefusal::Unknown));
+            }
+            result
+        });
+        result
     }
 
     /// 读动作的归属 thread 与正式消息身份（`client_message_id`）——S4 核对/人工继续
@@ -703,6 +993,40 @@ impl ActionStore {
         })
         .ok()
         .flatten()
+    }
+
+    pub(crate) fn completion_source(
+        &self,
+        action_id: &str,
+    ) -> Result<Option<dao::ActionRow>, StoreError> {
+        self.with(|c| dao::get_row(c, action_id).map_err(db_err))
+    }
+
+    /// T1（B6-01/X0）：归账候选——本线程**已实际派发**（有正式消息身份）且仍处
+    /// Unknown 的普通 desktop_ipc 发送。只给正式回显归账用；`Reserved` 的自动
+    /// 提权、运行中异步答题、其他 route/kind 均不在候选集。
+    pub fn unknown_desktop_ipc_sends_for_thread(&self, thread_id: &str) -> Vec<(String, String)> {
+        self.with(|c| {
+            let mut stmt = c
+                .prepare(
+                    "SELECT action_id, client_message_id FROM codex_actions \
+                     WHERE thread_id = ?1 AND state = 'unknown' AND kind = 'send' \
+                     AND route = 'desktop_ipc' AND client_message_id != '' \
+                     ORDER BY created_at, action_id",
+                )
+                .map_err(db_err)?;
+            let rows = stmt
+                .query_map([thread_id], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                })
+                .map_err(db_err)?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row.map_err(db_err)?);
+            }
+            Ok(out)
+        })
+        .unwrap_or_default()
     }
 
     /// 读动作的持久 Turn 绑定槽位（`compat_turn_id`；核对 DTO 与 force-continue
@@ -823,9 +1147,135 @@ impl ActionStore {
         })
     }
 
-    /// 本设备的动作视图（其他设备 / 不存在 → None；HTTP 层 404 语义）。
+    /// Task2：auto verified 屏障核销（证据 Turn 确认的完成事实；上层负责实际终态
+    /// 证明）。单事务：唯一 verified 记录 + 清源运行屏障；`true` = 本次生效或幂等
+    /// 复核同一事实，scope/证据冲突与非法入参为 `Err`。生产接线在 Task3/5。
+    pub fn resolve_barrier_verified(
+        &self,
+        scope: &ThreadKey,
+        source_action_id: &str,
+        evidence_turn_id: &str,
+        resolved_at: i64,
+    ) -> Result<bool, StoreError> {
+        self.with(|c| {
+            dao::resolve_barrier_verified_conn(
+                c,
+                scope,
+                source_action_id,
+                evidence_turn_id,
+                resolved_at,
+            )
+            .map_err(db_err)
+        })
+    }
+
+    /// Task4：读源动作的 `verified_complete` 核销记录（host / thread / evidence）。
+    /// orphan book 对账输入缝：源 fence 已被核销事务消化时按记录事实条件补清旧
+    /// book——`reason='verified_complete'` 钉死，显式接管记录（explicit_takeover）
+    /// 绝不匹配。DB 错误上抛（对账侧保守不清、可重试）。crate 内对账缝，不入
+    /// 公共 API。
+    pub(crate) fn verified_complete_record(
+        &self,
+        source_action_id: &str,
+    ) -> Result<Option<(String, String, String)>, StoreError> {
+        self.with(|c| dao::verified_complete_record_conn(c, source_action_id).map_err(db_err))
+    }
+
+    /// Task2：显式强制插队接管。单事务：目标 queued→reserved + 对应 attempt 首次
+    /// 授权消费 + explicit 记录；`true` 仅本次取得新派发权（重复/已消费 `false`，
+    /// 事务回滚零效果）。不改源投递状态/暂停/其他 queue，不从这里发送任何 Frame
+    ///（真实串行权/设备权限由上层验证）。生产接线在 Task3/5。
+    pub fn reserve_with_barrier_takeover(
+        &self,
+        scope: &ThreadKey,
+        source_action_id: &str,
+        target_action_id: &str,
+        grant_attempt: i64,
+        route: ControlRoute,
+        resolved_at: i64,
+    ) -> Result<bool, StoreError> {
+        self.with(|c| {
+            dao::reserve_with_barrier_takeover_conn(
+                c,
+                scope,
+                source_action_id,
+                target_action_id,
+                grant_attempt,
+                route,
+                resolved_at,
+            )
+            .map_err(db_err)
+        })
+    }
+
+    /// Task5：多源显式强制插队接管（crate 内缝，不入公共 API）。源集合 **0..N**
+    /// （空切片合法 = 无历史限制）。单事务：非空源逐个存在 + thread 归属核对 →
+    /// 目标 queued→reserved（一次）→ 对应 attempt 首次授权消费（一次）→ 逐源
+    /// explicit 记录（空源 0 条，不伪造）→ reserve 审计（一次）；目标已离开
+    /// queued / 授权缺失或已消费 `false`，事务回滚零效果；非法源 `Err`（保留
+    /// Task2 原错误语义，不吞成 false）。不改源投递状态/暂停，不从这里发送任何
+    /// Frame（真实串行权由上层验证）。
+    pub(crate) fn reserve_with_barrier_takeover_sources(
+        &self,
+        scope: &ThreadKey,
+        source_action_ids: &[String],
+        target_action_id: &str,
+        grant_attempt: i64,
+        route: ControlRoute,
+        resolved_at: i64,
+    ) -> Result<bool, StoreError> {
+        self.with(|c| {
+            dao::reserve_with_barrier_takeover_sources_conn(
+                c,
+                scope,
+                source_action_ids,
+                target_action_id,
+                grant_attempt,
+                route,
+                resolved_at,
+            )
+            .map_err(db_err)
+        })
+    }
+
+    /// Task7：reserve 的 checked 闸（crate 内）——取得连接锁 + IMMEDIATE 写事务
+    /// 资格并完成全部源只读校验后、首条 UPDATE 前，调用 `validate`（最终闸）：
+    /// false = 意图已换代/到期 → `StaleIntent`（回滚零业务 mutation；grant 不
+    /// 消费、explicit/audit 无增量）。`validate` 内只做 registry 短锁读 + 现场
+    /// 单调时刻判定（无 DB/await/回调）。
+    pub(crate) fn reserve_with_barrier_takeover_sources_checked(
+        &self,
+        scope: &ThreadKey,
+        source_action_ids: &[String],
+        target_action_id: &str,
+        grant_attempt: i64,
+        route: ControlRoute,
+        validate: impl FnOnce() -> bool,
+    ) -> Result<dao::CheckedMutation<bool>, StoreError> {
+        self.with(|c| {
+            dao::reserve_with_barrier_takeover_sources_checked_conn(
+                c,
+                scope,
+                source_action_ids,
+                target_action_id,
+                grant_attempt,
+                route,
+                || validate().then(now_ms),
+            )
+            .map_err(db_err)
+        })
+    }
+
+    /// 本设备的动作视图（其他设备 / 不存在 → `Ok(None)`；HTTP 层 404 语义）。
     /// H04：同 ID 重放的**账本快照**（设备隔离；用于零预算/幂等判定，不写）。
-    pub fn snapshot_for_device(&self, action_id: &str, device_id: &str) -> Option<ActionSnapshot> {
+    /// Task5（Spec 复审 Gap1 返修）：**Result 保留读取**——DB 故障如实上抛
+    /// （接管事务 CAS false 后按目标真实状态分派 LeftQueue/仍 queued 的分类，
+    /// 不得把读取错误吞成「已离队」假报）。
+    pub(crate) fn snapshot_for_device_result(
+        &self,
+        action_id: &str,
+        device_id: &str,
+    ) -> Result<Option<ActionSnapshot>, StoreError> {
         self.with(|c| {
             let row = dao::get_row(c, action_id).map_err(db_err)?;
             Ok(row
@@ -839,8 +1289,14 @@ impl ActionStore {
                     state: row.state,
                 }))
         })
-        .ok()
-        .flatten()
+    }
+
+    /// 本设备的动作视图（旧公开 Option 口径，兼容保留）：读取失败按 `None`
+    /// （历史语义）。生产分类路径用 [`Self::snapshot_for_device_result`]。
+    pub fn snapshot_for_device(&self, action_id: &str, device_id: &str) -> Option<ActionSnapshot> {
+        self.snapshot_for_device_result(action_id, device_id)
+            .ok()
+            .flatten()
     }
 
     pub fn get_for_device(
@@ -1052,6 +1508,18 @@ impl ActionStore {
         })
     }
 
+    pub(crate) fn clear_unbound_native_send_fence(
+        &self,
+        key: &ThreadKey,
+        fence: &CompatFence,
+        observed_state: ActionState,
+    ) -> Result<bool, StoreError> {
+        self.with(|c| {
+            dao::clear_unbound_native_send_fence_conn(c, key, fence, observed_state, now_ms())
+                .map_err(db_err)
+        })
+    }
+
     /// 人工解除保守屏障（仅属主设备；CAS 安全 + 幂等 + 单调，DAO 侧同事务审计）。
     pub fn force_release_barrier(
         &self,
@@ -1110,8 +1578,15 @@ impl ActionStore {
         pause_token: &str,
         pause_turn_id: Option<&str>,
     ) -> Result<bool, StoreError> {
-        self.with(|c| {
-            dao::set_queue_pause_conn(
+        // Source/live（合同 §6 + B-R2）：stop 准备先 begin Stop 更新（失效先行），
+        // 写屏障后在**同一连接**内权威读回两项完整事实（running = 真实 claimed
+        // StopAttempt 行；persistent = 仍在册停止类屏障）再提交——不再以
+        // `running: None` 冒充，杜绝初装载健康值被写点整条洗成未知。DB 失败
+        // 保守 Unknown。
+        let _gate = self.stop_facts_gate();
+        let ticket = self.begin_stop_ticket(key);
+        let result = self.with(|c| {
+            let inserted = dao::set_queue_pause_conn(
                 c,
                 &key.thread_id,
                 pause_reason,
@@ -1119,8 +1594,14 @@ impl ActionStore {
                 pause_turn_id,
                 now_ms(),
             )
-            .map_err(db_err)
-        })
+            .map_err(db_err)?;
+            let running = dao::thread_stop_running_conn(c, &key.thread_id).map_err(db_err)?;
+            let persistent = !dao::stop_pause_rows_conn(c, &key.thread_id)
+                .map_err(db_err)?
+                .is_empty();
+            Ok((inserted, running, persistent))
+        });
+        finish_stop_write(ticket, result)
     }
 
     /// P3：该 Thread 的**停止类**暂停行 `(pause_token, pause_turn_id)`（按
@@ -1131,14 +1612,27 @@ impl ActionStore {
     }
 
     /// 终审 R3：撤回本次打断拥有的暂停（token 不匹配/行不存在 → false，不动他人）。
+    /// Source/live：先 begin Stop 更新；仅真实解除才提交 persistent=Some(false)。
     pub fn clear_queue_pause_owned(
         &self,
         key: &ThreadKey,
         pause_token: &str,
     ) -> Result<bool, StoreError> {
-        self.with(|c| {
-            dao::clear_queue_pause_owned_conn(c, &key.thread_id, pause_token).map_err(db_err)
-        })
+        // B-R2：清除后同一连接读回两项完整事实——token 不匹配/行不在/仍有其他
+        // 屏障时 persistent 按真实余量提交，不把「清除本次」误判为整线程已无
+        // 停止操作。
+        let _gate = self.stop_facts_gate();
+        let ticket = self.begin_stop_ticket(key);
+        let result = self.with(|c| {
+            let cleared = dao::clear_queue_pause_owned_conn(c, &key.thread_id, pause_token)
+                .map_err(db_err)?;
+            let running = dao::thread_stop_running_conn(c, &key.thread_id).map_err(db_err)?;
+            let persistent = !dao::stop_pause_rows_conn(c, &key.thread_id)
+                .map_err(db_err)?
+                .is_empty();
+            Ok((cleared, running, persistent))
+        });
+        finish_stop_write(ticket, result)
     }
 
     /// 读 Thread 暂停状态（None = 未暂停）。
@@ -1154,8 +1648,20 @@ impl ActionStore {
     }
 
     /// 用户显式「继续发送」：解除暂停（唯一出口）。返回是否确有暂停被解除。
+    /// Source/live：先 begin Stop 更新；仅真实解除才提交 persistent=Some(false)。
     pub fn clear_queue_pause(&self, key: &ThreadKey) -> Result<bool, StoreError> {
-        self.with(|c| dao::clear_queue_pause_conn(c, &key.thread_id).map_err(db_err))
+        // B-R2：与 clear_queue_pause_owned 同口径——清除后读回两项完整事实。
+        let _gate = self.stop_facts_gate();
+        let ticket = self.begin_stop_ticket(key);
+        let result = self.with(|c| {
+            let cleared = dao::clear_queue_pause_conn(c, &key.thread_id).map_err(db_err)?;
+            let running = dao::thread_stop_running_conn(c, &key.thread_id).map_err(db_err)?;
+            let persistent = !dao::stop_pause_rows_conn(c, &key.thread_id)
+                .map_err(db_err)?
+                .is_empty();
+            Ok((cleared, running, persistent))
+        });
+        finish_stop_write(ticket, result)
     }
 
     /// 建一次性越队授权（绑定具体 action + thread；同 action 重放幂等）。
@@ -1186,6 +1692,45 @@ impl ActionStore {
         })
     }
 
+    /// Task5：优先处理授权铸造的 attempt 返回变体（crate 内缝）——与
+    /// [`Self::mint_bypass_grant`] 同一幂等 CAS 语义（无行 → attempt 1；未消费行
+    /// 不动；已消费行 → 代际 +1、清消费位），并在同一事务内**返回真实 attempt**，
+    /// 供接管事务绑定消费与 explicit 记录（不猜测、不另查）。旧返回 `()` 的 mint
+    /// API 保持不变。
+    /// Task7：unchecked 旧入口——生产路径已改走 [`Self::
+    /// mint_bypass_grant_attempt_checked`]；本入口保留给单元测试（签名/语义
+    /// 不变）。
+    #[cfg(test)]
+    pub(crate) fn mint_bypass_grant_attempt(
+        &self,
+        action_id: &str,
+        key: &ThreadKey,
+    ) -> Result<i64, StoreError> {
+        self.with(|c| {
+            dao::mint_bypass_grant_attempt_conn(c, action_id, &key.thread_id, now_ms())
+                .map_err(db_err)
+        })
+    }
+
+    /// Task7：mint 的 checked 闸（crate 内）——连接锁 + IMMEDIATE 写事务资格就绪
+    /// 后、首条 grant INSERT/UPDATE 前，调用 `validate`（最终闸）：false = 意图已
+    /// 换代/到期 → `StaleIntent`（回滚零 mutation；此前合法 mint 的 grant 可保留
+    /// 未消费，不新增/不重铸 attempt）。`validate` 内只做 registry 短锁读 + 现场
+    /// 单调时刻判定（无 DB/await/回调）。
+    pub(crate) fn mint_bypass_grant_attempt_checked(
+        &self,
+        action_id: &str,
+        key: &ThreadKey,
+        validate: impl FnOnce() -> bool,
+    ) -> Result<dao::CheckedMutation<i64>, StoreError> {
+        self.with(|c| {
+            dao::mint_bypass_grant_attempt_checked_conn(c, action_id, &key.thread_id, || {
+                validate().then(now_ms)
+            })
+            .map_err(db_err)
+        })
+    }
+
     /// C02：读停止尝试的占有状态（SQLite 持久，与动作行同生命周期、重启不丢）。
     /// 重放进入时先读：`Claimed | Unknown(_)` → 不得再发停止帧（既有 Unknown 语义）。
     pub fn stop_attempt_phase(&self, action_id: &str) -> Result<dao::StopAttemptPhase, StoreError> {
@@ -1195,7 +1740,23 @@ impl ActionStore {
     /// C02：CAS 占有停止尝试（首帧可能写出之前调用）。false = 行不在账/已有活跃
     /// 占有/旧行未知记录——调用方**不得**发起新停止。
     pub fn claim_stop_attempt(&self, action_id: &str) -> Result<bool, StoreError> {
-        self.with(|c| dao::claim_stop_attempt_conn(c, action_id, now_ms()).map_err(db_err))
+        // B-R2：StopAttempt 写点纳入同一事实生命周期——先按动作行回读线程并取票
+        // （失效先行），写后在同一连接读回两项完整事实再提交。行不在账 = 既有
+        // Ok(false) 语义（无需失效）。
+        let Some(key) = self.action_thread(action_id)? else {
+            return Ok(false);
+        };
+        let _gate = self.stop_facts_gate();
+        let ticket = self.begin_stop_ticket(&key);
+        let result = self.with(|c| {
+            let claimed = dao::claim_stop_attempt_conn(c, action_id, now_ms()).map_err(db_err)?;
+            let running = dao::thread_stop_running_conn(c, &key.thread_id).map_err(db_err)?;
+            let persistent = !dao::stop_pause_rows_conn(c, &key.thread_id)
+                .map_err(db_err)?
+                .is_empty();
+            Ok((claimed, running, persistent))
+        });
+        finish_stop_write(ticket, result)
     }
 
     /// C02：升级占有的结果为未知原因（R05 语义保留：重放按记录返回）。
@@ -1204,20 +1765,57 @@ impl ActionStore {
         action_id: &str,
         reason: &str,
     ) -> Result<bool, StoreError> {
-        self.with(|c| {
-            dao::resolve_stop_attempt_unknown_conn(c, action_id, reason, now_ms()).map_err(db_err)
-        })
+        // B-R2：同 claim——写后同连接读回两项完整事实提交。
+        let Some(key) = self.action_thread(action_id)? else {
+            return Ok(false);
+        };
+        let _gate = self.stop_facts_gate();
+        let ticket = self.begin_stop_ticket(&key);
+        let result = self.with(|c| {
+            let resolved = dao::resolve_stop_attempt_unknown_conn(c, action_id, reason, now_ms())
+                .map_err(db_err)?;
+            let running = dao::thread_stop_running_conn(c, &key.thread_id).map_err(db_err)?;
+            let persistent = !dao::stop_pause_rows_conn(c, &key.thread_id)
+                .map_err(db_err)?
+                .is_empty();
+            Ok((resolved, running, persistent))
+        });
+        finish_stop_write(ticket, result)
     }
 
     /// C02：CAS 释放占有（仅首写前明确零投递出口调用）——之后的同 action 显式
     /// 重试可再次占有并发起停止。
     pub fn release_stop_attempt(&self, action_id: &str) -> Result<bool, StoreError> {
-        self.with(|c| dao::release_stop_attempt_conn(c, action_id, now_ms()).map_err(db_err))
+        // B-R2：同 claim——释放后读回：claimed 行清空 → running 恢复 false；
+        // 屏障余量独立判读。
+        let Some(key) = self.action_thread(action_id)? else {
+            return Ok(false);
+        };
+        let _gate = self.stop_facts_gate();
+        let ticket = self.begin_stop_ticket(&key);
+        let result = self.with(|c| {
+            let released =
+                dao::release_stop_attempt_conn(c, action_id, now_ms()).map_err(db_err)?;
+            let running = dao::thread_stop_running_conn(c, &key.thread_id).map_err(db_err)?;
+            let persistent = !dao::stop_pause_rows_conn(c, &key.thread_id)
+                .map_err(db_err)?
+                .is_empty();
+            Ok((released, running, persistent))
+        });
+        finish_stop_write(ticket, result)
     }
 
     /// 读取该 Thread 全部在册 fence（seq 序；reconcile 迭代输入）。
     pub fn compat_fences(&self, key: &ThreadKey) -> Result<Vec<CompatFence>, StoreError> {
         self.with(|c| dao::compat_fences_conn(c, &key.thread_id).map_err(db_err))
+    }
+
+    /// Task6-self-fence：单动作在册 fence 标志（**Result 保留**——接管 Lost 后的
+    /// 复读分类用；DB 故障如实上抛映射 store_error，不吞成布尔假象）。crate 内部
+    /// 使用，不扩公共 API。行不在由 DAO 侧保守返回 true（见
+    /// [`dao::compat_outstanding_conn`]）。
+    pub(crate) fn compat_outstanding(&self, action_id: &str) -> Result<bool, StoreError> {
+        self.with(|c| dao::compat_outstanding_conn(c, action_id).map_err(db_err))
     }
 
     /// **原子** compat 派发屏障（R9.1）：fence + 只读核对证据在单条 UPDATE 内持久化
@@ -1642,6 +2240,84 @@ mod tests {
     use super::*;
 
     const THREAD: &str = "0f1e2d3c-1111-4222-8333-444455556666";
+
+    #[test]
+    fn async_active_store_residual_effect_target_never_records_idle_success() {
+        use crate::services::codex_desktop_ipc::capability::{CodexOperation, ObservedTarget};
+        let store = ActionStore::new(DeviceStore::memory());
+        let target = ObservedTarget {
+            probe_key: "synthetic-probe".into(),
+            package_sha256: "synthetic-sha".into(),
+        };
+        store.with(|c| {
+            let columns: i64 = c.query_row("SELECT count(*) FROM pragma_table_info('codex_actions') WHERE name='async_answer_route'", [], |r| r.get(0)).map_err(db_err)?;
+            assert_eq!(columns, 1, "缺少持久异步答题路由列");
+            Ok(())
+        }).unwrap();
+        for (id, route) in [("active", "active_steer"), ("idle", "idle_start")] {
+            let ctx = ActionContext {
+                action_id: id.into(),
+                device_id: "d".into(),
+                device_name: "n".into(),
+                kind: ActionKind::AsyncQuestion,
+                key: key(),
+            };
+            store
+                .register(
+                    &ctx,
+                    ActionKind::AsyncQuestion,
+                    None,
+                    None,
+                    id,
+                    Some("answer"),
+                )
+                .unwrap();
+            store
+                .with(|c| {
+                    c.execute(
+                        "UPDATE codex_actions SET async_answer_route=?2 WHERE action_id=?1",
+                        rusqlite::params![id, route],
+                    )
+                    .map_err(db_err)?;
+                    Ok(())
+                })
+                .unwrap();
+            assert!(store.bind_effect_target(id, &target));
+        }
+        assert_eq!(store.settle_confirmed_effect("active"), None);
+        assert_eq!(
+            store.settle_confirmed_effect("active"),
+            None,
+            "重复核对不能产生证据"
+        );
+        store
+            .with(|c| {
+                let count: i64 = c
+                    .query_row("SELECT count(*) FROM codex_operation_success", [], |r| {
+                        r.get(0)
+                    })
+                    .map_err(db_err)?;
+                assert_eq!(count, 0, "active 残留目标不得产生任何成功证据");
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            store.settle_confirmed_effect("idle"),
+            Some(CodexOperation::AsyncAnswerIdle)
+        );
+        assert_eq!(store.settle_confirmed_effect("idle"), None);
+        store
+            .with(|c| {
+                let count: i64 = c
+                    .query_row("SELECT count(*) FROM codex_operation_success", [], |r| {
+                        r.get(0)
+                    })
+                    .map_err(db_err)?;
+                assert_eq!(count, 1, "idle 对照必须恰好记一次成功");
+                Ok(())
+            })
+            .unwrap();
+    }
 
     fn key() -> ThreadKey {
         ThreadKey {

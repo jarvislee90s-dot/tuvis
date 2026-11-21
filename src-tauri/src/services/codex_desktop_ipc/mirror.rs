@@ -71,6 +71,7 @@ use super::artifacts::{
     project_item_artifacts, TurnArtifacts,
 };
 use super::history_view::{HistoryView, ViewHealth};
+use super::owners::OwnerLeaseProof;
 use super::pending::{DecisionPolicy as PendingDecisionPolicy, PendingProjector};
 use super::types::{
     CapabilitySet, ContentState, ControlAvailability, MessagesPage, MessagesPageStatus, OwnerLease,
@@ -242,6 +243,12 @@ thread_local! {
     static FULL_STATE_CLONES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static FULL_TURN_CLONES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static COMPLETE_HISTORY_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static NEXT_INDEX_CONSTRUCTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static FORMAL_DIGEST_COMPUTATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// A1.3（终审 Minor）：现行在场扫描入口的计数——`scan_all_present_pairs`
+    /// 与惰性缓存的完整遍历证据（旧 `ANSWER_LOOKUP_SCANS` 监控已退出生产的
+    /// 回退路径，只作回归护栏）。
+    static CANONICAL_PRESENCE_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// 退役必须基于完整且身份唯一的 canonical 引用链。
@@ -324,6 +331,10 @@ thread_local! {
     static OLD_REFERENCE_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+/// A1.2 审查证据缝：逐 witness 全历史精确查找（超限回退的旧路径）。A1.3
+/// （round3 Major）后被惰性全量缓存取代——生产不再调用；保留作计数证据面
+/// （`ANSWER_LOOKUP_SCANS` 回归护栏：若有人重新引入逐证人重扫，计数用例即红）。
+#[allow(dead_code)]
 fn answer_in_canonical_history(
     state: &Value,
     witness: &super::async_question::AnswerWitness,
@@ -339,9 +350,13 @@ fn answer_in_canonical_history(
 }
 
 /// 单次更新共用的 canonical 答复身份索引；超限回退到原始精确查找。
+/// A1.3（round3 Major）：超限路径改**惰性一次性全量在场集**——首次 contains
+/// 触发一次全历史扫描并缓存（contains 恒 O(1)），取代旧的逐 witness 重扫；
+/// 完整遍历次数不随证人数增长。
 struct CanonicalPresence<'a> {
     state: &'a Value,
     items: Option<HashSet<(&'a str, &'a str)>>,
+    over_limit_found: std::cell::RefCell<Option<std::collections::HashSet<(String, String)>>>,
 }
 
 impl<'a> CanonicalPresence<'a> {
@@ -352,7 +367,11 @@ impl<'a> CanonicalPresence<'a> {
             for item in turn.items {
                 if let Some(id) = item.get("id").and_then(Value::as_str) {
                     if items.len() == MAX_INDEXED_ITEMS {
-                        return Self { state, items: None };
+                        return Self {
+                            state,
+                            items: None,
+                            over_limit_found: std::cell::RefCell::new(None),
+                        };
                     }
                     items.insert((turn.turn_id, id));
                 }
@@ -361,6 +380,7 @@ impl<'a> CanonicalPresence<'a> {
         Self {
             state,
             items: Some(items),
+            over_limit_found: std::cell::RefCell::new(None),
         }
     }
 
@@ -370,9 +390,32 @@ impl<'a> CanonicalPresence<'a> {
                 witness.answer_turn_id.as_str(),
                 witness.answer_item_id.as_str(),
             )),
-            None => answer_in_canonical_history(self.state, witness),
+            None => {
+                let mut cache = self.over_limit_found.borrow_mut();
+                let found = cache.get_or_insert_with(|| scan_all_present_pairs(self.state));
+                found.contains(&(
+                    witness.answer_turn_id.clone(),
+                    witness.answer_item_id.clone(),
+                ))
+            }
         }
     }
+}
+
+/// A1.3：一次遍历收集 canonical 历史中全部在场 (turn,item) 对（超限惰性缓存
+/// 与回退证人门共用同一形状）。
+fn scan_all_present_pairs(state: &Value) -> std::collections::HashSet<(String, String)> {
+    #[cfg(test)]
+    CANONICAL_PRESENCE_SCANS.with(|count| count.set(count.get() + 1));
+    let mut found = std::collections::HashSet::new();
+    for turn in HistoryView::new(state).turns() {
+        for item in turn.items {
+            if let Some(id) = item.get("id").and_then(Value::as_str) {
+                found.insert((turn.turn_id.to_owned(), id.to_owned()));
+            }
+        }
+    }
+    found
 }
 
 /// 仅用于本次更新的旧实体定位；重复 ID 或超额时退回原始逐项查找。
@@ -382,6 +425,53 @@ struct OldItemLocation<'a> {
     index: usize,
     item: &'a Value,
 }
+/// A1.2：旧态证人基座。分析派生时两个门同集；回退时按前态在场证明分门
+///（题目门 → 题目来源分支；答复门 → 答复来源分支）。
+enum OldWitnessBase<'a> {
+    Analyzed(HashMap<String, super::async_question::AnalyzedAnswer<'a>>),
+    Fallback {
+        by_question: HashMap<String, super::async_question::AnalyzedAnswer<'a>>,
+        answer_present: HashMap<String, super::async_question::AnalyzedAnswer<'a>>,
+    },
+}
+impl<'a> OldWitnessBase<'a> {
+    fn question_source(&self) -> &HashMap<String, super::async_question::AnalyzedAnswer<'a>> {
+        match self {
+            Self::Analyzed(map)
+            | Self::Fallback {
+                by_question: map, ..
+            } => map,
+        }
+    }
+    fn answer_source(&self) -> &HashMap<String, super::async_question::AnalyzedAnswer<'a>> {
+        match self {
+            Self::Analyzed(map)
+            | Self::Fallback {
+                answer_present: map,
+                ..
+            } => map,
+        }
+    }
+}
+
+/// A1.2/Major1：一次扫描前态 canonical 历史，命中目标答复在场集合。
+/// 超限历史不再逐证人重扫（回退证人按账本上限构造目标集）。
+fn scan_answer_presence(
+    state: &Value,
+    targets: &[(String, String)],
+) -> std::collections::HashSet<(String, String)> {
+    let wanted: std::collections::HashSet<(&str, &str)> = targets
+        .iter()
+        .map(|(turn, item)| (turn.as_str(), item.as_str()))
+        .collect();
+    // A1.3（round3 Major）：复用单次全量扫描，按目标集过滤——建门与超限缓存
+    // 同一形状，遍历次数不随证人数增长。
+    scan_all_present_pairs(state)
+        .into_iter()
+        .filter(|(turn, item)| wanted.contains(&(turn.as_str(), item.as_str())))
+        .collect()
+}
+
 struct OldItemIndex<'a> {
     items: Option<std::collections::HashMap<&'a str, OldItemLocation<'a>>>,
 }
@@ -391,6 +481,8 @@ impl<'a> OldItemIndex<'a> {
     }
 
     fn current(state: &'a Value) -> Self {
+        #[cfg(test)]
+        NEXT_INDEX_CONSTRUCTIONS.with(|count| count.set(count.get() + 1));
         Self::build(state, false)
     }
 
@@ -436,6 +528,42 @@ impl<'a> OldItemIndex<'a> {
             items: Some(indexed),
         }
     }
+}
+
+/// 同一批次每个正式条目只拼接、摘要一次；分组中的各题共用结果。
+fn indexed_formal_answer_digest<'a>(
+    item: &'a Value,
+    cache: &mut std::collections::HashMap<&'a str, Option<[u8; 32]>>,
+) -> Option<[u8; 32]> {
+    let id = item.get("id").and_then(Value::as_str)?;
+    *cache.entry(id).or_insert_with(|| {
+        #[cfg(test)]
+        FORMAL_DIGEST_COMPUTATIONS.with(|count| count.set(count.get() + 1));
+        super::async_question::formal_answer_text(item)
+            .map(|text| Sha256::digest(text.as_bytes()).into())
+    })
+}
+
+/// 数组增删可在批内移动来源；触及数组后仍按稳定 ID 比较前后正式语义。
+/// 单纯移位或元数据更新不会因此成为撤销证据。
+fn patch_touches_linked_item(location: &OldItemLocation<'_>, patches: &[Value]) -> bool {
+    let prefix = serde_json::json!([
+        "turnHistory",
+        "history",
+        "entitiesByKey",
+        location.entity_key,
+        "items"
+    ]);
+    let prefix = prefix.as_array().unwrap();
+    patches.iter().any(|op| {
+        matches!(
+            op.get("op").and_then(Value::as_str),
+            Some("add" | "remove" | "replace")
+        ) && op
+            .get("path")
+            .and_then(Value::as_array)
+            .is_some_and(|path| path.starts_with(prefix) || prefix.starts_with(path))
+    })
 }
 
 /// 旧 canonical 引用位置索引，保留重复引用和原数组次序；超限回退原遍历。
@@ -837,6 +965,15 @@ fn explicitly_removes_question(
     false
 }
 
+/// raw 原料的覆盖证明。`WholeInput` = 镜像当前保存的是 adopt 成功时**未裁剪的
+/// 整个 conversationState**（后续 patch 均基于该整份值原子应用）；`None` = 无
+/// 证明（clear/无 state/未装订）。unknown 不能当作完整或健康。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RawProvenance {
+    WholeInput,
+    None,
+}
+
 pub struct ThreadMirror {
     key: ThreadKey,
     answer_validity: Arc<super::answer_validity::AnswerValidityLedger>,
@@ -873,6 +1010,15 @@ pub struct ThreadMirror {
     /// 最近一次装订是否因镜像预算被拒。预算拒绝后可能没有可用 state；分页必须报
     /// `unavailable/mirror_capacity`，不得把「读不到」伪装成「没有更多」。
     budget_refused: bool,
+    /// 原料覆盖证明（Source/live 门禁）：只有「adopt 成功保留的是未裁剪的整个
+    /// conversationState」才记 [`RawProvenance::WholeInput`]；连续 patch 基于这一
+    /// 整份值原子应用才保留该证明。clear/invalidate/无 state 没有证明。展示尾窗
+    /// truncated 不能冒充 raw 本体截断。
+    raw_provenance: RawProvenance,
+    /// 镜像绑定的 owner 活性证明（owners.try_lock + is_current 同锁点取得）：
+    /// 冻结时要求 proof.lease 与 mirror.lease 全等、proof 仍 live；owner 失效
+    /// 清状态时一并清除。
+    owner_proof: Option<OwnerLeaseProof>,
     /// 已结算内容观察器：每次投影/分页在已算好的完整投影上顺带观察（不重投影）。
     /// 锁内只做一次指纹集合比较与交换，不跨 await、不记录正文或路径。
     content: Mutex<ContentObservation>,
@@ -888,6 +1034,12 @@ impl Drop for ThreadMirror {
                 .release(&self.key, self.size);
         }
     }
+}
+
+pub(crate) enum FormalEchoMatch {
+    Missing,
+    Unique(String),
+    Ambiguous,
 }
 
 impl ThreadMirror {
@@ -911,6 +1063,8 @@ impl ThreadMirror {
             interaction_hints: None,
             build_generation: 0,
             budget_refused: false,
+            raw_provenance: RawProvenance::None,
+            owner_proof: None,
             content: Mutex::new(ContentObservation::default()),
         }
     }
@@ -977,10 +1131,72 @@ impl ThreadMirror {
         if !unambiguous_loaded_history(next) {
             return;
         }
-        let current = super::async_question::answer_witnesses(&self.key.thread_id, next);
-        let old = previous
-            .map(|s| super::async_question::answer_witnesses(&self.key.thread_id, s))
+        let current = super::async_question::analyze_answer_witnesses(&self.key.thread_id, next)
             .unwrap_or_default();
+        // A1.2：分析拒绝 ≠ 合法空结果。旧态分析被拒（预算/歧义）时改用账本已知
+        // 证人作退役对照——显式删除、同 ID 改写与完整→完整缺席的退役判定不得
+        // 因拒绝被吞成空表，否则完整重放会复活已删除的旧 Answered。拒绝本身
+        // 不新增退役、不装新证人。
+        // 审查 round2 双门修正：回退证人是「待核对线索」，按前态在场证明分门
+        // ——题目门（题目依赖在前态在场）管题目来源分支（显式删题/题目缺席）；
+        // 答复门（答复项在前态在场）管答复来源分支（改写/同 ID/答复缺席）。
+        // Blocker 1：题目两侧缺席不构成删除事实；Blocker 2：答复缺页离场时
+        // 显式删在场题目仍须退役。无前态（首个 snapshot）回退为空。
+        // Major 1：答复在场门按账本证人目标集一次扫描前态，不逐证人重扫历史。
+        let previous_dependencies = previous.map(question_dependencies);
+        let old = match previous.and_then(|state| {
+            super::async_question::analyze_answer_witnesses(&self.key.thread_id, state)
+        }) {
+            Some(analyzed) => OldWitnessBase::Analyzed(analyzed),
+            None => match previous {
+                None => OldWitnessBase::Analyzed(HashMap::new()),
+                Some(state) => {
+                    let ledger_witnesses = self.answer_validity.witnesses_for_thread(&self.key);
+                    let targets: Vec<(String, String)> = ledger_witnesses
+                        .iter()
+                        .map(|(_, witness)| {
+                            (
+                                witness.answer_turn_id.clone(),
+                                witness.answer_item_id.clone(),
+                            )
+                        })
+                        .collect();
+                    let answer_present = scan_answer_presence(state, &targets);
+                    let mut by_question = HashMap::new();
+                    let mut present = HashMap::new();
+                    for (question, witness) in ledger_witnesses {
+                        if previous_dependencies
+                            .as_ref()
+                            .is_some_and(|deps| deps.contains_key(&question))
+                        {
+                            by_question.insert(
+                                question.clone(),
+                                super::async_question::AnalyzedAnswer {
+                                    physical: witness.clone(),
+                                    linked_steering: None,
+                                },
+                            );
+                        }
+                        if answer_present.contains(&(
+                            witness.answer_turn_id.clone(),
+                            witness.answer_item_id.clone(),
+                        )) {
+                            present.insert(
+                                question,
+                                super::async_question::AnalyzedAnswer {
+                                    physical: witness,
+                                    linked_steering: None,
+                                },
+                            );
+                        }
+                    }
+                    OldWitnessBase::Fallback {
+                        by_question,
+                        answer_present: present,
+                    }
+                }
+            },
+        };
         let dependencies = question_dependencies(next);
         let next_needs_hydration = HistoryView::new(next).needs_hydration();
         // 已在入口完成 unambiguous_loaded_history，避免再次扫描身份。
@@ -988,12 +1204,91 @@ impl ThreadMirror {
         let presence = CanonicalPresence::new(next);
         let previous_complete = previous.is_some_and(unambiguous_complete_history);
         let old_index = previous.map(OldItemIndex::new);
-        let next_index = old
-            .iter()
-            .any(|(question, witness)| {
-                dependencies.contains_key(question) && current.get(question) != Some(witness)
-            })
-            .then(|| OldItemIndex::current(next));
+        let linked_sources = if next_complete {
+            dependencies
+                .keys()
+                .filter_map(|question| {
+                    self.answer_validity
+                        .current_linked_steering(&self.key, question)
+                        .map(|linked| (question, linked))
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let next_index = (!linked_sources.is_empty()
+            || old.answer_source().iter().any(|(question, witness)| {
+                dependencies.contains_key(question)
+                    && current.get(question).map(|answer| &answer.physical)
+                        != Some(&witness.physical)
+            }))
+        .then(|| OldItemIndex::current(next));
+        let mut formal_digests = std::collections::HashMap::new();
+        let mut old_formal_digests = std::collections::HashMap::new();
+        let mut checked_links = std::collections::HashMap::new();
+        for (question, (observed, linked)) in &linked_sources {
+            let Some(Some(items)) = next_index.as_ref().map(|index| &index.items) else {
+                self.answer_validity
+                    .quarantine_linked_if_observed(&self.key, question, observed, linked);
+                continue;
+            };
+            let invalidated = *checked_links
+                .entry((
+                    linked.as_str(),
+                    observed.answer_turn_id.as_str(),
+                    observed.answer_item_id.as_str(),
+                ))
+                .or_insert_with(|| {
+                    let Some(source) = items.get(linked.as_str()) else {
+                        return false;
+                    };
+                    let Some(physical) = items.get(observed.answer_item_id.as_str()) else {
+                        return false;
+                    };
+                    if physical.turn_id != Some(observed.answer_turn_id.as_str())
+                        || !presence.contains(observed)
+                    {
+                        return false;
+                    }
+                    let Some(physical_digest) =
+                        indexed_formal_answer_digest(physical.item, &mut formal_digests)
+                    else {
+                        return false;
+                    };
+                    let source_digest =
+                        indexed_formal_answer_digest(source.item, &mut formal_digests);
+                    let source_canonical = source.turn_id.is_some_and(|turn| {
+                        presence
+                            .items
+                            .as_ref()
+                            .is_some_and(|items| items.contains(&(turn, linked.as_str())))
+                    });
+                    if !source_canonical {
+                        let Some(old_source) = old_index
+                            .as_ref()
+                            .and_then(|index| index.items.as_ref())
+                            .and_then(|items| items.get(linked.as_str()))
+                        else {
+                            return false;
+                        };
+                        if !patch_touches_linked_item(old_source, patches)
+                            || (old_source.item.get("type") == source.item.get("type")
+                                && indexed_formal_answer_digest(
+                                    old_source.item,
+                                    &mut old_formal_digests,
+                                ) == source_digest)
+                        {
+                            return false;
+                        }
+                    }
+                    source.item.get("type").and_then(Value::as_str) != Some("steeringUserMessage")
+                        || source_digest != Some(physical_digest)
+                });
+            if invalidated {
+                self.answer_validity
+                    .retire_linked_if_observed(&self.key, question, observed, linked);
+            }
+        }
         let old_references = previous.map(OldReferenceIndex::new);
         if snapshot && next_complete {
             for (question, witness) in self.answer_validity.witnesses_for_thread(&self.key) {
@@ -1004,8 +1299,11 @@ impl ThreadMirror {
             }
         }
         if let Some(state) = previous {
-            let old_dependencies = question_dependencies(state);
-            for (question, witness) in &old {
+            let old_dependencies = previous_dependencies
+                .as_ref()
+                .expect("previous state has dependencies");
+            for (question, answer) in old.question_source().iter() {
+                let witness = &answer.physical;
                 if dependencies.contains_key(question) {
                     continue;
                 }
@@ -1065,10 +1363,17 @@ impl ThreadMirror {
                 }
             }
             let mut retired = Vec::new();
-            if let (Some(state), Some(witness)) = (previous, old.get(question)) {
-                // 当前严格 witness 完全一致时，答复必在 canonical 引用链上，
-                // 无需逐题再次扫描；账本仍逐题重新核对。
-                if candidate != Some(witness)
+            if let (Some(state), Some(previous_answer)) =
+                (previous, old.answer_source().get(question))
+            {
+                let witness = &previous_answer.physical;
+                let physical = candidate.map(|answer| &answer.physical);
+                let handoff = candidate
+                    .and_then(|answer| answer.linked_steering.as_ref())
+                    .is_some_and(|linked| linked.matches(witness));
+                // 精确 S→U 接力不把元数据补齐误认成 S 改写；真实退役仍由账本优先拒绝。
+                if !handoff
+                    && physical != Some(witness)
                     && (explicitly_rewrites_answer(
                         state,
                         next,
@@ -1088,15 +1393,20 @@ impl ThreadMirror {
                         old_references
                             .as_ref()
                             .expect("previous state has reference index"),
-                    ) || candidate.is_some_and(|candidate| {
+                    ) || physical.is_some_and(|candidate| {
                         candidate.answer_item_id == witness.answer_item_id && candidate != witness
                     }) || (previous_complete && next_complete && !presence.contains(witness)))
                 {
                     retired.push(witness.answer_item_id.clone());
                 }
             }
-            self.answer_validity
-                .apply(&self.key, question, Some(&digest), candidate, &retired);
+            self.answer_validity.apply_analyzed(
+                &self.key,
+                question,
+                Some(&digest),
+                candidate,
+                &retired,
+            );
         }
     }
 
@@ -1130,6 +1440,26 @@ impl ThreadMirror {
     }
     pub(crate) fn build_generation(&self) -> u64 {
         self.build_generation
+    }
+
+    /// 镜像当前真实预算拒绝字段（Source/live 冻结出口用；未知不填 false——
+    /// 该字段本身是 bool，未装订镜像由 raw provenance/lease 缺失兜住）。
+    pub(crate) fn budget_refused(&self) -> bool {
+        self.budget_refused
+    }
+
+    /// raw 原料覆盖证明（WholeInput 才能给 truncated=Some(false)；None → 未知）。
+    pub(crate) fn raw_provenance(&self) -> RawProvenance {
+        self.raw_provenance
+    }
+
+    /// 绑定 owner 活性证明（owners.try_lock + is_current 同锁点取得后装订）。
+    pub(crate) fn bind_owner_proof(&mut self, proof: OwnerLeaseProof) {
+        self.owner_proof = Some(proof);
+    }
+
+    pub(crate) fn owner_proof(&self) -> Option<&OwnerLeaseProof> {
+        self.owner_proof.as_ref()
     }
 
     pub fn key(&self) -> &ThreadKey {
@@ -1269,6 +1599,40 @@ impl ThreadMirror {
             .collect()
     }
 
+    /// T1（B6-01/X0）：**实体级**唯一正式回显——canonical 全历史中恰好一个
+    /// `userMessage` 实体承载该 `clientId` 才返回所属 Turn。零实体、多实体
+    /// （跨 Turn 多义，或同 Turn 重复实体——按 Turn 去重不足以证明同一 Turn
+    /// 内只有一个实体）一律 `None`（调用方按「无证据」保守保持原状态）。
+    /// stale / 无镜像 → `None`。
+    pub fn unique_formal_echo_turn(&self, client_message_id: &str) -> Option<String> {
+        match self.formal_echo_match(client_message_id) {
+            FormalEchoMatch::Unique(turn) => Some(turn),
+            FormalEchoMatch::Missing | FormalEchoMatch::Ambiguous => None,
+        }
+    }
+
+    pub(crate) fn formal_echo_match(&self, client_message_id: &str) -> FormalEchoMatch {
+        let Some(state) = self.state.as_ref().filter(|_| !self.stale) else {
+            return FormalEchoMatch::Missing;
+        };
+        let mut found: Option<&str> = None;
+        for turn in HistoryView::new(state).turns() {
+            for item in turn.items {
+                if item.get("type").and_then(Value::as_str) == Some("userMessage")
+                    && item.get("clientId").and_then(Value::as_str) == Some(client_message_id)
+                {
+                    if found.is_some() {
+                        return FormalEchoMatch::Ambiguous;
+                    }
+                    found = Some(turn.turn_id);
+                }
+            }
+        }
+        found.map_or(FormalEchoMatch::Missing, |turn| {
+            FormalEchoMatch::Unique(turn.to_owned())
+        })
+    }
+
     /// 指定 Turn 是否已以终态出现在当前镜像（completed/failed/**interrupted**）。
     /// 不在场 / inProgress / 未知状态 / stale / 无镜像 → false（保守不释放）。
     ///
@@ -1352,6 +1716,9 @@ impl ThreadMirror {
 
     fn clear_state(&mut self) {
         self.complete_rebuild = false;
+        // owner 失效/清态：原料覆盖证明与绑定的 owner 活性证明一并撤销。
+        self.raw_provenance = RawProvenance::None;
+        self.owner_proof = None;
         self.revoke_hint_scope();
         if let Some(ledger) = &self.ledger {
             ledger
@@ -1406,8 +1773,11 @@ impl ThreadMirror {
     }
 
     fn install_hint_scope(&mut self) {
+        // 终审 Blocker 2：**非阻塞**换代——本函数在转发器持镜像锁期间调用，
+        // 绝不在慢 COMMIT 上等待。gate 忙 → 无新 permit（保守：该线程的持久写
+        // 资格暂缺，下一张状态帧重试），旧 permit 已由 revoke_hint_scope 即时 fence。
         if let Some(authority) = &self.hint_authority {
-            if let Some(permit) = authority.rotate_scope() {
+            if let Some(permit) = authority.try_rotate_scope() {
                 if self.lease.as_ref() == Some(permit.lease()) {
                     self.hint_permit = Some(permit);
                 } else {
@@ -1512,7 +1882,9 @@ impl ThreadMirror {
         self.complete_rebuild = self.complete_rebuild
             && (previous.get("turnHistory") == next.get("turnHistory")
                 || complete_history_preserves_prefix(&previous, next));
-        if recovering {
+        // 终审（补票）：仅在**恢复**或当前无有效 permit（前次争用失败）时补票——
+        // 普通有效 patch 已有 permit，不重复 rotate；缺票的普通 patch 也能补上。
+        if recovering || self.hint_permit.is_none() {
             self.install_hint_scope();
         }
         Ok(MirrorEffect {
@@ -1555,6 +1927,9 @@ impl ThreadMirror {
         self.revision = Some(rev);
         self.history_complete = HistoryView::new(&state).turn_list_complete();
         let previous = self.state.replace(state);
+        // Source/live 原料覆盖证明：adopt 成功保留的是未裁剪的整个
+        // conversationState（snapshot 本体 / patch 基于整份值的原子应用结果）。
+        self.raw_provenance = RawProvenance::WholeInput;
         self.stale = false;
         Ok(previous)
     }
@@ -1662,6 +2037,12 @@ impl ThreadMirror {
             &self.key.thread_id,
             state,
         );
+        let runtime_status = runtime_status(state);
+        let async_operation =
+            super::async_question::AsyncAnswerRoute::from_runtime(&runtime_status)
+                .map(|route| route.operation())
+                .unwrap_or(super::capability::CodexOperation::AsyncAnswerIdle);
+        let async_status = effective_operations.get(async_operation);
         let witness_analysis =
             super::async_question::analyze_answer_witnesses(&self.key.thread_id, state);
         let mut async_questions =
@@ -1670,7 +2051,7 @@ impl ThreadMirror {
                     &self.key,
                     self.lease.as_ref(),
                     state,
-                    &effective_operations,
+                    async_status,
                     self.interaction_hints
                         .as_deref()
                         .map(Vec::as_slice)
@@ -1684,10 +2065,10 @@ impl ThreadMirror {
                 current_witnesses
                     .get(&question.question_key)
                     .is_some_and(|witness| {
-                        !self.answer_validity.allows_candidate(
+                        !self.answer_validity.allows_analyzed(
                             &self.key,
                             &question.question_key,
-                            &witness.answer_item_id,
+                            witness,
                         )
                     });
             let status = self
@@ -1712,7 +2093,11 @@ impl ThreadMirror {
             }
         }
         if let Some(out) = witness_out {
-            *out = witness_analysis.unwrap_or_default();
+            *out = witness_analysis
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(question, answer)| (question, answer.physical))
+                .collect();
         }
         ThreadProjection {
             thread_id: self.key.thread_id.clone(),
@@ -1720,7 +2105,7 @@ impl ThreadMirror {
             stale: self.stale,
             availability: availability_of(&caps),
             capabilities: caps,
-            runtime_status: runtime_status(state),
+            runtime_status,
             content_state,
             truncated,
             messages,
@@ -1748,6 +2133,11 @@ impl ThreadMirror {
             projection_version: None,
             // T03：与投影**同次观察**的活动回合 id（stale/无活动回合 → None）。
             active_turn_id: self.active_turn_id(),
+            // 批次3（合同 §8）：展示 overlay 账/戳由 display::overlay_projection 在
+            // mirrors 同次观察装配；镜像层诚实缺省 None（不假填 []，不私签戳）。
+            question_display_groups: None,
+            question_skip_history: None,
+            display_stamp: None,
         }
     }
 
@@ -2909,6 +3299,749 @@ mod tests {
 
     fn b1_replay_patch(mirror: &mut ThreadMirror, revision: u64, patches: Value) {
         mirror.apply(&lease(), &serde_json::json!({"type":"patches","baseRevision":revision - 1,"revision":revision,"patches":patches})).unwrap();
+    }
+
+    // synthetic-from-static：仅使用合成题目与正式信封。
+    fn async_active_mirror(status: &str, ack: bool) -> ThreadMirror {
+        let mut state = b1_replay_mirror().observation_state().unwrap().clone();
+        state["turnHistory"]["history"]["entitiesByKey"]["turn:a"]["items"][0] = serde_json::json!({
+            "type":"steeringUserMessage", "id":"steer-1", "status":status,
+            "steerAcknowledged":ack, "clientUserMessageId":"client-1",
+            "input":[{"type":"text","text":b1_replay_envelope("A"),"text_elements":[]}]
+        });
+        let mut mirror = ThreadMirror::new(key());
+        mirror
+            .apply(
+                &lease(),
+                &serde_json::json!({"type":"snapshot","revision":1,"conversationState":state}),
+            )
+            .unwrap();
+        mirror
+    }
+
+    #[test]
+    fn async_active_patch_pending_to_accepted_creates_witness() {
+        use super::super::async_question::InteractionState;
+        let mut mirror = async_active_mirror("pending", false);
+        assert_ne!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Answered
+        );
+        b1_replay_patch(
+            &mut mirror,
+            2,
+            serde_json::json!([{"op":"replace","path":["turnHistory","history","entitiesByKey","turn:a","items",0,"status"],"value":"accepted"}]),
+        );
+        assert_eq!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Answered
+        );
+    }
+
+    #[test]
+    fn async_active_patch_pending_to_acknowledged_creates_witness() {
+        use super::super::async_question::InteractionState;
+        let mut mirror = async_active_mirror("pending", false);
+        b1_replay_patch(
+            &mut mirror,
+            2,
+            serde_json::json!([{"op":"replace","path":["turnHistory","history","entitiesByKey","turn:a","items",0,"steerAcknowledged"],"value":true}]),
+        );
+        assert_eq!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Answered
+        );
+    }
+
+    #[test]
+    fn async_active_patch_revoking_confirmation_retires_witness() {
+        use super::super::async_question::InteractionState;
+        let mut mirror = async_active_mirror("accepted", false);
+        assert_eq!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Answered
+        );
+        b1_replay_patch(
+            &mut mirror,
+            2,
+            serde_json::json!([{"op":"replace","path":["turnHistory","history","entitiesByKey","turn:a","items",0,"status"],"value":"pending"}]),
+        );
+        assert_ne!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Answered
+        );
+        b1_replay_patch(
+            &mut mirror,
+            3,
+            serde_json::json!([{"op":"replace","path":["turnHistory","history","entitiesByKey","turn:a","items",0,"status"],"value":"accepted"}]),
+        );
+        assert_ne!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Answered,
+            "退役来源不得原样复活"
+        );
+    }
+
+    #[test]
+    fn async_active_patch_rewriting_input_retires_witness() {
+        use super::super::async_question::InteractionState;
+        let mut mirror = async_active_mirror("accepted", false);
+        assert_eq!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Answered
+        );
+        b1_replay_patch(
+            &mut mirror,
+            2,
+            serde_json::json!([{"op":"replace","path":["turnHistory","history","entitiesByKey","turn:a","items",0,"input",0,"text"],"value":"普通消息"}]),
+        );
+        assert_ne!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Answered
+        );
+    }
+
+    #[test]
+    fn async_active_review_retired_steering_cannot_revive_through_linked_echo() {
+        use super::super::async_question::InteractionState;
+        for link in ["server", "client"] {
+            let mut state = async_active_mirror("accepted", false)
+                .observation_state()
+                .unwrap()
+                .clone();
+            if link == "server" {
+                state["turnHistory"]["history"]["entitiesByKey"]["turn:a"]["items"][0]
+                    ["serverUserMessageId"] = serde_json::json!("user-1");
+            }
+            let mut mirror = ThreadMirror::new(key());
+            mirror
+                .apply(
+                    &lease(),
+                    &serde_json::json!({"type":"snapshot","revision":1,"conversationState":state}),
+                )
+                .unwrap();
+            assert_eq!(
+                mirror.project(caps()).async_questions[0].state,
+                InteractionState::Answered
+            );
+            b1_replay_patch(
+                &mut mirror,
+                2,
+                serde_json::json!([{"op":"replace","path":["turnHistory","history","entitiesByKey","turn:a","items",0,"status"],"value":"pending"}]),
+            );
+            assert_ne!(
+                mirror.project(caps()).async_questions[0].state,
+                InteractionState::Answered
+            );
+            let mut user = serde_json::json!({"type":"userMessage","id":"user-1","content":[{"type":"text","text":b1_replay_envelope("A")}]});
+            if link == "client" {
+                user["clientId"] = serde_json::json!("client-1");
+            }
+            b1_replay_patch(
+                &mut mirror,
+                3,
+                serde_json::json!([
+                    {"op":"replace","path":["turnHistory","history","entitiesByKey","turn:a","items",0,"status"],"value":"accepted"},
+                    {"op":"add","path":["turnHistory","history","entitiesByKey","turn:a","items",1],"value":user}
+                ]),
+            );
+            assert_eq!(
+                mirror.project(caps()).async_questions[0].state,
+                InteractionState::Unknown,
+                "{link}: 退役来源不得经回显复活"
+            );
+            b1_replay_patch(
+                &mut mirror,
+                4,
+                serde_json::json!([{"op":"remove","path":["turnHistory","history","entitiesByKey","turn:a","items",0]}]),
+            );
+            assert_eq!(
+                mirror.project(caps()).async_questions[0].state,
+                InteractionState::Unknown,
+                "{link}: 删除退役来源后回显不得复活"
+            );
+        }
+    }
+
+    #[test]
+    fn async_active_review_rebuilt_mirror_cannot_revive_steering_after_question_deletion() {
+        use super::super::async_question::InteractionState;
+        let mut original = async_active_mirror("accepted", false)
+            .observation_state()
+            .unwrap()
+            .clone();
+        original["turnHistory"]["history"]["entitiesByKey"]["turn:a"]["items"][0]
+            ["serverUserMessageId"] = serde_json::json!("user-1");
+        let mut first = ThreadMirror::new(key());
+        first
+            .apply(
+                &lease(),
+                &serde_json::json!({"type":"snapshot","revision":1,"conversationState":original}),
+            )
+            .unwrap();
+        assert_eq!(
+            first.project(caps()).async_questions[0].state,
+            InteractionState::Answered
+        );
+        let user = serde_json::json!({"type":"userMessage","id":"user-1","content":[{"type":"text","text":b1_replay_envelope("A")}]});
+        b1_replay_patch(
+            &mut first,
+            2,
+            serde_json::json!([{"op":"add","path":["turnHistory","history","entitiesByKey","turn:a","items",1],"value":user}]),
+        );
+        assert_eq!(
+            first.project(caps()).async_questions[0].state,
+            InteractionState::Answered
+        );
+        let ledger = first.answer_validity.clone();
+        drop(first);
+
+        let mut empty = original.clone();
+        empty["turnHistory"]["history"]["entitiesByKey"]["turn:q"]["items"] = serde_json::json!([]);
+        empty["turnHistory"]["history"]["entitiesByKey"]["turn:a"]["items"] = serde_json::json!([]);
+        let mut rebuilt = ThreadMirror::new(key());
+        rebuilt.set_answer_validity_ledger(ledger);
+        rebuilt
+            .apply(
+                &lease(),
+                &serde_json::json!({"type":"snapshot","revision":1,"conversationState":empty}),
+            )
+            .unwrap();
+        rebuilt
+            .apply(
+                &lease(),
+                &serde_json::json!({"type":"snapshot","revision":2,"conversationState":original}),
+            )
+            .unwrap();
+        assert_eq!(
+            rebuilt.project(caps()).async_questions[0].state,
+            InteractionState::Unknown,
+            "新镜像完整删除题目后不得由旧 steering 复活"
+        );
+    }
+
+    #[test]
+    fn async_active_review_valid_linked_echo_survives_steering_removal() {
+        use super::super::async_question::InteractionState;
+        let mut state = async_active_mirror("accepted", false)
+            .observation_state()
+            .unwrap()
+            .clone();
+        state["turnHistory"]["history"]["entitiesByKey"]["turn:a"]["items"][0]
+            ["serverUserMessageId"] = serde_json::json!("user-1");
+        let mut mirror = ThreadMirror::new(key());
+        mirror
+            .apply(
+                &lease(),
+                &serde_json::json!({"type":"snapshot","revision":1,"conversationState":state}),
+            )
+            .unwrap();
+        assert_eq!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Answered
+        );
+        let user = serde_json::json!({"type":"userMessage","id":"user-1","content":[{"type":"text","text":b1_replay_envelope("A")}]});
+        b1_replay_patch(
+            &mut mirror,
+            2,
+            serde_json::json!([{"op":"add","path":["turnHistory","history","entitiesByKey","turn:a","items",1],"value":user}]),
+        );
+        assert_eq!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Answered
+        );
+        b1_replay_patch(
+            &mut mirror,
+            3,
+            serde_json::json!([{"op":"remove","path":["turnHistory","history","entitiesByKey","turn:a","items",0]}]),
+        );
+        assert_eq!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Answered
+        );
+    }
+
+    // synthetic-from-static：接力前后均核对投影及实际物理 witness。
+    fn async_active_post_handoff_fixture(split_turns: bool) -> ThreadMirror {
+        use super::super::async_question::InteractionState;
+        let mut state = async_active_mirror("accepted", false)
+            .observation_state()
+            .unwrap()
+            .clone();
+        state["turnHistory"]["history"]["entitiesByKey"]["turn:a"]["items"][0]
+            ["serverUserMessageId"] = serde_json::json!("user-1");
+        if split_turns {
+            state["turnHistory"]["history"]["entitiesByKey"]["turn:u"] =
+                serde_json::json!({"turnId":"u","status":"completed","items":[]});
+            state["turnHistory"]["history"]["islands"][0]["entries"]
+                .as_array_mut()
+                .unwrap()
+                .push(serde_json::json!({"value":"turn:u"}));
+        }
+        let mut mirror = ThreadMirror::new(key());
+        mirror
+            .apply(
+                &lease(),
+                &serde_json::json!({"type":"snapshot","revision":1,"conversationState":state}),
+            )
+            .unwrap();
+        assert_eq!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Answered,
+            "steering 前置必须成立"
+        );
+        let user = serde_json::json!({"type":"userMessage","id":"user-1","content":[{"type":"text","text":b1_replay_envelope("A")}]});
+        let path = if split_turns {
+            serde_json::json!([
+                "turnHistory",
+                "history",
+                "entitiesByKey",
+                "turn:u",
+                "items",
+                0
+            ])
+        } else {
+            serde_json::json!([
+                "turnHistory",
+                "history",
+                "entitiesByKey",
+                "turn:a",
+                "items",
+                1
+            ])
+        };
+        b1_replay_patch(
+            &mut mirror,
+            2,
+            serde_json::json!([{"op":"add","path":path,"value":user}]),
+        );
+        assert_eq!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Answered,
+            "接力后必须已答复"
+        );
+        let question = super::super::async_question::question_item_id("call-1", 0);
+        assert_eq!(
+            mirror
+                .answer_validity
+                .current_witness(&key(), &question)
+                .unwrap()
+                .answer_item_id,
+            "user-1",
+            "必须真正交接到 U"
+        );
+        mirror
+    }
+
+    fn async_active_orphan_patch_fixture(prepend_item: bool) -> ThreadMirror {
+        use super::super::async_question::InteractionState;
+        let mut mirror = async_active_post_handoff_fixture(true);
+        let mut patches = vec![
+            serde_json::json!({"op":"remove","path":["turnHistory","history","islands",0,"entries",1]}),
+        ];
+        if prepend_item {
+            patches.push(serde_json::json!({"op":"add","path":["turnHistory","history","entitiesByKey","turn:a","items",0],"value":{"type":"userMessage","id":"ordinary-1","content":[]}}));
+        }
+        b1_replay_patch(&mut mirror, 3, Value::Array(patches));
+        assert_eq!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Answered,
+            "移除 canonical 引用后交接仍有效"
+        );
+        let index = usize::from(prepend_item);
+        let state = mirror.observation_state().unwrap();
+        assert_eq!(
+            state["turnHistory"]["history"]["entitiesByKey"]["turn:a"]["items"][index]["id"],
+            "steer-1"
+        );
+        assert_eq!(
+            state["turnHistory"]["history"]["entitiesByKey"]["turn:a"]["items"][index]
+                ["steerAcknowledged"],
+            false
+        );
+        mirror
+    }
+
+    #[test]
+    fn async_active_orphan_patch_add_overwrites_confirmation_and_retires_echo() {
+        use super::super::async_question::InteractionState;
+        let mut mirror = async_active_orphan_patch_fixture(false);
+        b1_replay_patch(
+            &mut mirror,
+            4,
+            serde_json::json!([{"op":"add","path":["turnHistory","history","entitiesByKey","turn:a","items",0,"status"],"value":"pending"}]),
+        );
+        assert_ne!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Answered,
+            "add 覆盖确认后 U 不得生效"
+        );
+        b1_replay_patch(
+            &mut mirror,
+            5,
+            serde_json::json!([{"op":"replace","path":["turnHistory","history","entitiesByKey","turn:a","items",0,"status"],"value":"accepted"}]),
+        );
+        assert_ne!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Answered,
+            "恢复确认不得复活"
+        );
+        b1_replay_patch(
+            &mut mirror,
+            6,
+            serde_json::json!([{"op":"remove","path":["turnHistory","history","entitiesByKey","turn:a","items",0]}]),
+        );
+        assert_ne!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Answered,
+            "移除 S 后不得复活"
+        );
+    }
+
+    #[test]
+    fn async_active_orphan_patch_add_overwrites_text_and_retires_echo() {
+        use super::super::async_question::InteractionState;
+        let mut mirror = async_active_orphan_patch_fixture(false);
+        b1_replay_patch(
+            &mut mirror,
+            4,
+            serde_json::json!([{"op":"add","path":["turnHistory","history","entitiesByKey","turn:a","items",0,"input",0,"text"],"value":"ordinary synthetic message"}]),
+        );
+        assert_ne!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Answered,
+            "add 覆盖正文后 U 不得生效"
+        );
+        b1_replay_patch(
+            &mut mirror,
+            5,
+            serde_json::json!([{"op":"replace","path":["turnHistory","history","entitiesByKey","turn:a","items",0,"input",0,"text"],"value":b1_replay_envelope("A")} ]),
+        );
+        assert_ne!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Answered,
+            "恢复正文不得复活"
+        );
+        b1_replay_patch(
+            &mut mirror,
+            6,
+            serde_json::json!([{"op":"remove","path":["turnHistory","history","entitiesByKey","turn:a","items",0]}]),
+        );
+        assert_ne!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Answered,
+            "移除 S 后不得复活"
+        );
+    }
+
+    #[test]
+    fn async_active_orphan_patch_shift_then_revoke_in_same_batch_retires_echo() {
+        use super::super::async_question::InteractionState;
+        let mut mirror = async_active_orphan_patch_fixture(true);
+        b1_replay_patch(
+            &mut mirror,
+            4,
+            serde_json::json!([
+                {"op":"remove","path":["turnHistory","history","entitiesByKey","turn:a","items",0]},
+                {"op":"replace","path":["turnHistory","history","entitiesByKey","turn:a","items",0,"status"],"value":"pending"}
+            ]),
+        );
+        assert_ne!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Answered,
+            "同批移位后撤销确认必须使 U 失效"
+        );
+        b1_replay_patch(
+            &mut mirror,
+            5,
+            serde_json::json!([{"op":"replace","path":["turnHistory","history","entitiesByKey","turn:a","items",0,"status"],"value":"accepted"}]),
+        );
+        assert_ne!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Answered,
+            "恢复确认不得复活"
+        );
+        b1_replay_patch(
+            &mut mirror,
+            6,
+            serde_json::json!([{"op":"remove","path":["turnHistory","history","entitiesByKey","turn:a","items",0]}]),
+        );
+        assert_ne!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Answered,
+            "移除 S 后不得复活"
+        );
+    }
+
+    #[test]
+    fn async_active_orphan_patch_shift_without_semantic_change_remains_answered() {
+        use super::super::async_question::InteractionState;
+        let mut mirror = async_active_orphan_patch_fixture(true);
+        b1_replay_patch(
+            &mut mirror,
+            4,
+            serde_json::json!([{"op":"remove","path":["turnHistory","history","entitiesByKey","turn:a","items",0]}]),
+        );
+        assert_eq!(
+            mirror.observation_state().unwrap()["turnHistory"]["history"]["entitiesByKey"]
+                ["turn:a"]["items"][0]["id"],
+            "steer-1"
+        );
+        assert_eq!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Answered,
+            "纯移位不得退役答复"
+        );
+    }
+
+    #[test]
+    fn async_active_post_handoff_confirmation_revoked_cannot_revive_after_restore() {
+        use super::super::async_question::InteractionState;
+        let mut mirror = async_active_post_handoff_fixture(false);
+        b1_replay_patch(
+            &mut mirror,
+            3,
+            serde_json::json!([
+                {"op":"replace","path":["turnHistory","history","entitiesByKey","turn:a","items",0,"status"],"value":"pending"},
+                {"op":"replace","path":["turnHistory","history","entitiesByKey","turn:a","items",0,"steerAcknowledged"],"value":false}
+            ]),
+        );
+        assert_ne!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Answered,
+            "确认全部撤销后 U 不得继续生效"
+        );
+        b1_replay_patch(
+            &mut mirror,
+            4,
+            serde_json::json!([{"op":"replace","path":["turnHistory","history","entitiesByKey","turn:a","items",0,"status"],"value":"accepted"}]),
+        );
+        assert_ne!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Answered,
+            "恢复 S 和 U 不得复活退役答复"
+        );
+    }
+
+    #[test]
+    fn async_active_post_handoff_plain_text_rewrite_invalidates_user_echo() {
+        use super::super::async_question::InteractionState;
+        let mut mirror = async_active_post_handoff_fixture(false);
+        b1_replay_patch(
+            &mut mirror,
+            3,
+            serde_json::json!([{"op":"replace","path":["turnHistory","history","entitiesByKey","turn:a","items",0,"input",0,"text"],"value":"ordinary synthetic message"}]),
+        );
+        assert_ne!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Answered,
+            "S 正文改写后 U 不得继续生效"
+        );
+        b1_replay_patch(
+            &mut mirror,
+            4,
+            serde_json::json!([{"op":"replace","path":["turnHistory","history","entitiesByKey","turn:a","items",0,"input",0,"text"],"value":b1_replay_envelope("A")} ]),
+        );
+        assert_ne!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Answered,
+            "恢复原正文不得复活"
+        );
+    }
+
+    #[test]
+    fn async_active_post_handoff_changed_envelope_then_remove_cannot_revive_user_echo() {
+        use super::super::async_question::InteractionState;
+        let mut mirror = async_active_post_handoff_fixture(false);
+        b1_replay_patch(
+            &mut mirror,
+            3,
+            serde_json::json!([{"op":"replace","path":["turnHistory","history","entitiesByKey","turn:a","items",0,"input",0,"text"],"value":b1_replay_envelope("B")} ]),
+        );
+        assert_ne!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Answered,
+            "不同合法信封不得复用 U"
+        );
+        b1_replay_patch(
+            &mut mirror,
+            4,
+            serde_json::json!([{"op":"remove","path":["turnHistory","history","entitiesByKey","turn:a","items",0]}]),
+        );
+        assert_ne!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Answered,
+            "移除已改写 S 后 U 不得复活"
+        );
+    }
+
+    #[test]
+    fn async_active_post_handoff_orphan_steering_explicit_rewrite_invalidates_user_echo() {
+        use super::super::async_question::InteractionState;
+        let mut mirror = async_active_post_handoff_fixture(true);
+        b1_replay_patch(
+            &mut mirror,
+            3,
+            serde_json::json!([{"op":"remove","path":["turnHistory","history","islands",0,"entries",1]}]),
+        );
+        assert_eq!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Answered,
+            "滚窗移除引用不等于撤销来源"
+        );
+        assert_eq!(
+            mirror.observation_state().unwrap()["turnHistory"]["history"]["entitiesByKey"]
+                ["turn:a"]["items"][0]["id"],
+            "steer-1",
+            "孤儿实体仍可定位"
+        );
+        b1_replay_patch(
+            &mut mirror,
+            4,
+            serde_json::json!([{"op":"replace","path":["turnHistory","history","entitiesByKey","turn:a","items",0,"status"],"value":"pending"}]),
+        );
+        assert_ne!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Answered,
+            "显式改写可定位的孤儿来源必须使 U 失效"
+        );
+        b1_replay_patch(
+            &mut mirror,
+            5,
+            serde_json::json!([{"op":"replace","path":["turnHistory","history","entitiesByKey","turn:a","items",0,"status"],"value":"accepted"}]),
+        );
+        assert_ne!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Answered,
+            "恢复孤儿来源不得复活"
+        );
+    }
+
+    #[test]
+    fn async_active_post_handoff_rebuilt_mirror_rejects_rewritten_linked_steering() {
+        use super::super::async_question::InteractionState;
+        let first = async_active_post_handoff_fixture(false);
+        let ledger = first.answer_validity.clone();
+        let mut state = first.observation_state().unwrap().clone();
+        state["turnHistory"]["history"]["entitiesByKey"]["turn:a"]["items"][0]["input"][0]
+            ["text"] = serde_json::json!("ordinary synthetic message");
+        let mut rebuilt = ThreadMirror::new(key());
+        rebuilt.set_answer_validity_ledger(ledger);
+        assert!(rebuilt.observation_state().is_none(), "新镜像没有 previous");
+        rebuilt
+            .apply(
+                &lease(),
+                &serde_json::json!({"type":"snapshot","revision":1,"conversationState":state}),
+            )
+            .unwrap();
+        assert_ne!(
+            rebuilt.project(caps()).async_questions[0].state,
+            InteractionState::Answered,
+            "共享账本必须识别新镜像中已改写的关联 S"
+        );
+        b1_replay_patch(
+            &mut rebuilt,
+            2,
+            serde_json::json!([{"op":"remove","path":["turnHistory","history","entitiesByKey","turn:a","items",0]}]),
+        );
+        assert_ne!(
+            rebuilt.project(caps()).async_questions[0].state,
+            InteractionState::Answered,
+            "移除改写来源后 U 不得复活"
+        );
+    }
+
+    #[test]
+    fn async_active_post_handoff_oversized_entity_index_quarantines_without_reviving() {
+        use super::super::answer_validity::ValidityStatus;
+        use super::super::async_question::InteractionState;
+        let mut mirror = async_active_post_handoff_fixture(false);
+        let original = mirror.observation_state().unwrap().clone();
+        let mut oversized = original.clone();
+        let items: Vec<Value> = (0..4097)
+            .map(|index| serde_json::json!({"id":format!("orphan-{index}")}))
+            .collect();
+        oversized["turnHistory"]["history"]["entitiesByKey"]["turn:orphan"] =
+            serde_json::json!({"turnId":"orphan","status":"completed","items":items});
+        assert!(
+            OldItemIndex::current(&oversized).items.is_none(),
+            "必须触发实体索引预算拒绝"
+        );
+        let mut canonical_control = ThreadMirror::new(key());
+        canonical_control
+            .apply(
+                &lease(),
+                &serde_json::json!({"type":"snapshot","revision":1,"conversationState":oversized}),
+            )
+            .unwrap();
+        assert_eq!(
+            canonical_control.project(caps()).async_questions[0].state,
+            InteractionState::Answered,
+            "canonical 题目和 U 仍可严格分析"
+        );
+        mirror
+            .apply(
+                &lease(),
+                &serde_json::json!({"type":"snapshot","revision":3,"conversationState":oversized}),
+            )
+            .unwrap();
+        let question = super::super::async_question::question_item_id("call-1", 0);
+        assert_eq!(
+            mirror.answer_validity.status(&key(), &question),
+            ValidityStatus::Quarantined,
+            "索引预算拒绝须隔离而非假退役"
+        );
+        assert_ne!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Answered
+        );
+        mirror
+            .apply(
+                &lease(),
+                &serde_json::json!({"type":"snapshot","revision":4,"conversationState":original}),
+            )
+            .unwrap();
+        assert_ne!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Answered,
+            "缩回索引规模后不得复活"
+        );
+    }
+
+    #[test]
+    fn async_active_post_handoff_pending_with_acknowledgement_remains_answered() {
+        use super::super::async_question::InteractionState;
+        let mut mirror = async_active_post_handoff_fixture(false);
+        b1_replay_patch(
+            &mut mirror,
+            3,
+            serde_json::json!([
+                {"op":"replace","path":["turnHistory","history","entitiesByKey","turn:a","items",0,"steerAcknowledged"],"value":true},
+                {"op":"replace","path":["turnHistory","history","entitiesByKey","turn:a","items",0,"status"],"value":"pending"}
+            ]),
+        );
+        assert_eq!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Answered
+        );
+    }
+
+    #[test]
+    fn async_active_post_handoff_association_metadata_update_remains_answered() {
+        use super::super::async_question::InteractionState;
+        let mut mirror = async_active_post_handoff_fixture(false);
+        b1_replay_patch(
+            &mut mirror,
+            3,
+            serde_json::json!([
+                {"op":"replace","path":["turnHistory","history","entitiesByKey","turn:a","items",0,"clientUserMessageId"],"value":"client-2"},
+                {"op":"add","path":["turnHistory","history","entitiesByKey","turn:a","items",0,"extraMetadata"],"value":"synthetic"}
+            ]),
+        );
+        assert_eq!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Answered
+        );
     }
 
     #[test]
@@ -4546,6 +5679,37 @@ mod tests {
             mirror.project(caps()).async_questions[0].state,
             InteractionState::Answered,
             "消除身份多义后应允许原来源重新核验"
+        );
+    }
+
+    #[test]
+    fn b1_analysis_refusal_must_not_lose_retirement() {
+        use super::super::async_question::{InteractionState, FAIL_WITNESS_ANALYSIS_AFTER};
+        let mut mirror = b1_replay_mirror();
+        assert_eq!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Answered
+        );
+        let original = mirror.observation_state().unwrap().clone();
+        // 当前历史分析成功，旧历史分析受控拒绝，模拟预算不足。
+        FAIL_WITNESS_ANALYSIS_AFTER.with(|remaining| remaining.set(Some(1)));
+        b1_replay_patch(
+            &mut mirror,
+            2,
+            serde_json::json!([
+                {"op":"remove","path":["turnHistory","history","entitiesByKey","turn:a","items",0]}
+            ]),
+        );
+        mirror
+            .apply(
+                &lease(),
+                &serde_json::json!({"type":"snapshot","revision":3,"conversationState":original}),
+            )
+            .unwrap();
+        assert_eq!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Unknown,
+            "分析被拒绝后不能让已移除的旧答复复活"
         );
     }
 
@@ -6529,6 +7693,1036 @@ mod tests {
                 .map(|m| (&m.id, &m.text))
                 .collect::<Vec<_>>()
         );
+    }
+
+    // ------------------------------------------------------------------
+    // A1（R10 决策用例）：witness 分析拒绝 ≠ 合法空结果。
+    //
+    // `update_answer_validity` 把两次 `analyze_answer_witnesses` 的结果
+    // `unwrap_or_default()` 吞成空表（mirror.rs update_answer_validity 开头）：
+    // 旧态分析被拒（预算不足/歧义）时 `old` 变空，两个退役判定循环都拿不到
+    // 旧 witness，显式删除 / 同 ID 改写 / 完整→完整缺席的退役全部跳过，随后
+    // 完整重放会把已删除的旧 Answered 复活。
+    //
+    // 注入点（FAIL_WITNESS_ANALYSIS_AFTER = Some(1)）：`update_answer_validity`
+    // 先分析 next（放行，计数 1→0），再分析 previous（拒绝，自动复位）——
+    // 即「旧态分析」被拒而「新态分析」成功，与既有 R10 基线用例
+    // `b1_analysis_refusal_must_not_lose_retirement` 同一注入口径。
+    // WITNESS_ANALYSIS_PASSES 计的是 analyze_answer_witnesses 的进入次数
+    //（含被拒调用），每次 patch 恰好两次进入，用于钉住注入确实命中目标调用。
+    // ------------------------------------------------------------------
+
+    /// 决策用例 1：删除整个答复回合（题仍在 dependencies，退役走
+    /// 「遍历新 dependencies 对照旧 witness」循环的完整→完整缺席判定），
+    /// 旧态分析拒绝 → 快照重放原完整历史后旧 Answered 不得复活。
+    #[test]
+    fn b1_analysis_refusal_delete_whole_answer_turn_stays_retired() {
+        use super::super::async_question::{
+            InteractionState, FAIL_WITNESS_ANALYSIS_AFTER, WITNESS_ANALYSIS_PASSES,
+        };
+        let mut mirror = b1_replay_mirror();
+        assert_eq!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Answered
+        );
+        let original = mirror.observation_state().unwrap().clone();
+        WITNESS_ANALYSIS_PASSES.with(|count| count.set(0));
+        FAIL_WITNESS_ANALYSIS_AFTER.with(|remaining| remaining.set(Some(1)));
+        b1_replay_patch(
+            &mut mirror,
+            2,
+            serde_json::json!([
+                {"op":"remove","path":["turnHistory","history","islands",0,"entries",1]},
+                {"op":"remove","path":["turnHistory","history","entitiesByKey","turn:a"]}
+            ]),
+        );
+        assert_eq!(
+            WITNESS_ANALYSIS_PASSES.with(|count| count.get()),
+            2,
+            "patch 必须恰好尝试 next+previous 两次分析，第 2 次（旧态）为注入拒绝"
+        );
+        FAIL_WITNESS_ANALYSIS_AFTER.with(|remaining| remaining.set(None));
+        mirror
+            .apply(
+                &lease(),
+                &serde_json::json!({"type":"snapshot","revision":3,"conversationState":original}),
+            )
+            .unwrap();
+        assert_eq!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Unknown,
+            "旧态分析被拒不得丢失退役：已删除的旧答复不得在完整重放后复活"
+        );
+    }
+
+    /// 决策用例 2：删除题目（退役走「旧答案不在新依赖」循环的显式删除判定），
+    /// 旧态分析拒绝 → 快照重放原完整历史后不得复活。
+    #[test]
+    fn b1_analysis_refusal_question_deletion_stays_retired() {
+        use super::super::async_question::{
+            InteractionState, FAIL_WITNESS_ANALYSIS_AFTER, WITNESS_ANALYSIS_PASSES,
+        };
+        let mut mirror = b1_replay_mirror();
+        assert_eq!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Answered
+        );
+        let original = mirror.observation_state().unwrap().clone();
+        WITNESS_ANALYSIS_PASSES.with(|count| count.set(0));
+        FAIL_WITNESS_ANALYSIS_AFTER.with(|remaining| remaining.set(Some(1)));
+        b1_replay_patch(
+            &mut mirror,
+            2,
+            serde_json::json!([
+                {"op":"remove","path":["turnHistory","history","entitiesByKey","turn:q","items",0,"questions",0]}
+            ]),
+        );
+        assert_eq!(
+            WITNESS_ANALYSIS_PASSES.with(|count| count.get()),
+            2,
+            "patch 必须恰好尝试 next+previous 两次分析，第 2 次（旧态）为注入拒绝"
+        );
+        FAIL_WITNESS_ANALYSIS_AFTER.with(|remaining| remaining.set(None));
+        mirror
+            .apply(
+                &lease(),
+                &serde_json::json!({"type":"snapshot","revision":3,"conversationState":original}),
+            )
+            .unwrap();
+        assert_eq!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Unknown,
+            "旧态分析被拒不得丢失退役：已删除题目对应的旧答复不得在完整重放后复活"
+        );
+    }
+
+    /// 回归合同：拒绝只命中旧态分析，仍在历史中的旧答复不得被误退役。
+    #[test]
+    fn b1_analysis_refusal_does_not_retire_still_present_answer() {
+        use super::super::async_question::{
+            InteractionState, FAIL_WITNESS_ANALYSIS_AFTER, WITNESS_ANALYSIS_PASSES,
+        };
+        let mut mirror = b1_replay_mirror();
+        assert_eq!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Answered
+        );
+        WITNESS_ANALYSIS_PASSES.with(|count| count.set(0));
+        FAIL_WITNESS_ANALYSIS_AFTER.with(|remaining| remaining.set(Some(1)));
+        b1_replay_patch(
+            &mut mirror,
+            2,
+            serde_json::json!([
+                {"op":"add","path":["turnHistory","history","entitiesByKey","turn:a","items",1],
+                 "value":{"type":"userMessage","id":"unrelated","content":[{"type":"text","text":"hello"}]}}
+            ]),
+        );
+        assert_eq!(
+            WITNESS_ANALYSIS_PASSES.with(|count| count.get()),
+            2,
+            "patch 必须恰好尝试 next+previous 两次分析，第 2 次（旧态）为注入拒绝"
+        );
+        FAIL_WITNESS_ANALYSIS_AFTER.with(|remaining| remaining.set(None));
+        assert_eq!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Answered,
+            "分析拒绝不得把仍在历史中的旧答复误退役"
+        );
+    }
+
+    /// 回归合同：拒绝过后，真实新合法答复仍可成为 Answered（账本不得被拒绝钉死）。
+    ///
+    /// 注：严格分析下同一题并存两封正式信封构成身份歧义（analyze 的 answers
+    /// 同键双 userMessage → 无证人 → Unknown），故恢复帧先移除旧答复条目再
+    /// 提交新 ID 正式答复，使新证人唯一可核验；被验证的合同是「拒绝不得永久
+    /// 封锁新合法证人」。
+    #[test]
+    fn b1_analysis_refusal_then_new_legal_answer_still_answered() {
+        use super::super::async_question::{
+            InteractionState, FAIL_WITNESS_ANALYSIS_AFTER, WITNESS_ANALYSIS_PASSES,
+        };
+        let mut mirror = b1_replay_mirror();
+        assert_eq!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Answered
+        );
+        let new_answer = serde_json::json!({
+            "type":"userMessage","id":"answer-2",
+            "content":[{"type":"text","text":b1_replay_envelope("A2")}]
+        });
+        WITNESS_ANALYSIS_PASSES.with(|count| count.set(0));
+        FAIL_WITNESS_ANALYSIS_AFTER.with(|remaining| remaining.set(Some(1)));
+        b1_replay_patch(
+            &mut mirror,
+            2,
+            serde_json::json!([
+                {"op":"add","path":["turnHistory","history","entitiesByKey","turn:a","items",1],
+                 "value":{"type":"userMessage","id":"unrelated","content":[{"type":"text","text":"hello"}]}}
+            ]),
+        );
+        assert_eq!(
+            WITNESS_ANALYSIS_PASSES.with(|count| count.get()),
+            2,
+            "patch 必须恰好尝试 next+previous 两次分析，第 2 次（旧态）为注入拒绝"
+        );
+        FAIL_WITNESS_ANALYSIS_AFTER.with(|remaining| remaining.set(None));
+        b1_replay_patch(
+            &mut mirror,
+            3,
+            serde_json::json!([
+                {"op":"remove","path":["turnHistory","history","entitiesByKey","turn:a","items",0]},
+                {"op":"add","path":["turnHistory","history","entitiesByKey","turn:a","items",1],"value":new_answer}
+            ]),
+        );
+        assert_eq!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Answered,
+            "拒绝过后新合法正式答复仍须可成为 Answered"
+        );
+    }
+
+    /// 决策用例 5：同 ID 正文改写经拒绝帧提交，成功分析核验后即退役；
+    /// 重放同改写态退役保持（不得复活）。
+    #[test]
+    fn b1_analysis_refusal_same_item_rewrite_retires_on_recovery() {
+        use super::super::async_question::{
+            InteractionState, FAIL_WITNESS_ANALYSIS_AFTER, WITNESS_ANALYSIS_PASSES,
+        };
+        let mut mirror = b1_replay_mirror();
+        assert_eq!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Answered
+        );
+        let rewritten = b1_replay_envelope("A2");
+        WITNESS_ANALYSIS_PASSES.with(|count| count.set(0));
+        FAIL_WITNESS_ANALYSIS_AFTER.with(|remaining| remaining.set(Some(1)));
+        b1_replay_patch(
+            &mut mirror,
+            2,
+            serde_json::json!([
+                {"op":"replace","path":["turnHistory","history","entitiesByKey","turn:a","items",0,"content",0,"text"],"value":rewritten}
+            ]),
+        );
+        assert_eq!(
+            WITNESS_ANALYSIS_PASSES.with(|count| count.get()),
+            2,
+            "patch 必须恰好尝试 next+previous 两次分析，第 2 次（旧态）为注入拒绝"
+        );
+        FAIL_WITNESS_ANALYSIS_AFTER.with(|remaining| remaining.set(None));
+        // 成功分析核验帧：空 patch 亦可触发新旧两次分析。
+        b1_replay_patch(&mut mirror, 3, serde_json::json!([]));
+        assert_eq!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Unknown,
+            "同 ID 改文经成功分析核验即退役"
+        );
+        let rewritten_state = mirror.observation_state().unwrap().clone();
+        mirror
+            .apply(
+                &lease(),
+                &serde_json::json!({"type":"snapshot","revision":4,"conversationState":rewritten_state}),
+            )
+            .unwrap();
+        assert_eq!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Unknown,
+            "同 ID 改写态快照重放后退役必须保持"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // A1 审查跟进（独立审查 Blocker / Minor #5 / Major #4）。
+    // ------------------------------------------------------------------
+
+    /// 审查 Blocker：账本证人回退缺「前态在场证明」——前态结构完整但分析被真实
+    /// 歧义拒绝、且该证人**在前态并不在场**时，回退把账本旧证人参与「完整→完整
+    /// 缺席」判定，无任何删除事实也写出永久退役；随后完整重放被退役挡住。
+    ///
+    /// 拒绝形态实测依据（red-analysis 详述）：重复 clientId 不构成分析拒绝
+    /// （analyzer 的 client 计数仅用于 S/U 配对校验，async_question.rs:531/535），
+    /// 改用「单条消息正文含两个信封开启标记」的真实拒绝形态——结构完全合法
+    /// （id/引用链/实体唯一，unambiguous_loaded_history/complete 均通过），
+    /// 仅正式语义分析拒绝（`text.matches(ENVELOPE_OPEN).count() > 1`）。
+    #[test]
+    fn b1_refused_previous_without_w1_does_not_retire_on_unrelated_patch() {
+        use super::super::answer_validity::ValidityStatus;
+        use super::super::async_question::InteractionState;
+        let question = super::super::async_question::question_item_id("call-1", 0);
+        let mut mirror = b1_replay_mirror();
+        assert_eq!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Answered
+        );
+        let original = mirror.observation_state().unwrap().clone();
+        // 帧 2（snapshot）：缺页历史——islands 只剩 turn:q、实体无 turn:a、不完整。
+        let mut incomplete = mirror.observation_state().unwrap().clone();
+        incomplete["turnHistory"]["history"]["islands"][0]["entries"] =
+            serde_json::json!([{"value":"turn:q"}]);
+        if let Some(entity) = incomplete
+            .pointer_mut("/turnHistory/history/entitiesByKey")
+            .and_then(Value::as_object_mut)
+        {
+            entity.remove("turn:a");
+        }
+        incomplete["turnHistory"]["history"]["isComplete"] = serde_json::json!(false);
+        mirror
+            .apply(
+                &lease(),
+                &serde_json::json!({"type":"snapshot","revision":2,"conversationState":incomplete}),
+            )
+            .unwrap();
+        assert!(
+            mirror
+                .answer_validity
+                .current_witness(&key(), &question)
+                .is_some(),
+            "帧 2：缺页不构成任何退役，W1 证人必须仍在"
+        );
+        assert!(
+            mirror
+                .answer_validity
+                .allows_candidate(&key(), &question, "answer-1"),
+            "帧 2：W1 未退役"
+        );
+        // 帧 3（patch）：结构补全 + 加入真实歧义形态（单消息双信封标记）。
+        let mut ambiguous = mirror.observation_state().unwrap().clone();
+        ambiguous["turnHistory"]["history"]["isComplete"] = serde_json::json!(true);
+        ambiguous["turnHistory"]["history"]["entitiesByKey"]["turn:q"]["items"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({"type":"userMessage","id":"bogus-1",
+                "content":[{"type":"text","text":"<send_user_message_question_reply>junk<send_user_message_question_reply>"}]}));
+        // 实测形态护栏：结构合法但正式分析拒绝。
+        assert!(
+            unambiguous_loaded_history(&ambiguous),
+            "帧 3 形态护栏：歧义态必须结构合法"
+        );
+        assert!(
+            unambiguous_complete_history(&ambiguous),
+            "帧 3 形态护栏：歧义态必须结构完整（previous_complete=true 的前提）"
+        );
+        assert!(
+            super::super::async_question::analyze_answer_witnesses(&key().thread_id, &ambiguous)
+                .is_none(),
+            "帧 3 形态护栏：双信封标记必须构成真实分析拒绝"
+        );
+        b1_replay_patch(
+            &mut mirror,
+            3,
+            serde_json::json!([
+                {"op":"replace","path":["turnHistory","history","isComplete"],"value":true},
+                {"op":"add","path":["turnHistory","history","entitiesByKey","turn:q","items",1],
+                 "value":{"type":"userMessage","id":"bogus-1",
+                  "content":[{"type":"text","text":"<send_user_message_question_reply>junk<send_user_message_question_reply>"}]}}
+            ]),
+        );
+        assert!(
+            mirror
+                .answer_validity
+                .current_witness(&key(), &question)
+                .is_some(),
+            "帧 3：前态缺页（previous_complete=false）不退役，W1 仍在"
+        );
+        assert!(
+            mirror
+                .answer_validity
+                .allows_candidate(&key(), &question, "answer-1"),
+            "帧 3：W1 未退役"
+        );
+        // 帧 4（patch）：移除歧义消息 → 新态分析合法返回空表（答复回合仍缺席）；
+        // 前态结构完整但分析被拒 → 回退把账本 W1 参与「完整→完整缺席」判定
+        // → 无任何删除事实也退役（Blocker 命中点）。
+        b1_replay_patch(
+            &mut mirror,
+            4,
+            serde_json::json!([
+                {"op":"remove","path":["turnHistory","history","entitiesByKey","turn:q","items",1]}
+            ]),
+        );
+        assert!(
+            mirror
+                .answer_validity
+                .allows_candidate(&key(), &question, "answer-1"),
+            "帧 4：无删除事实的批次不得退役 W1（前态本就不在场，缺席不构成删除）"
+        );
+        assert_ne!(
+            mirror.answer_validity.status(&key(), &question),
+            ValidityStatus::Retired,
+            "帧 4：账本不得因回退进入 Retired"
+        );
+        assert!(
+            mirror
+                .answer_validity
+                .current_witness(&key(), &question)
+                .is_some(),
+            "帧 4：W1 证人仍在（语义 = 未被退役）"
+        );
+        // 帧 5：快照重放原完整历史 → W1 从未被退役 → 重新在场即 Answered。
+        mirror
+            .apply(
+                &lease(),
+                &serde_json::json!({"type":"snapshot","revision":5,"conversationState":original}),
+            )
+            .unwrap();
+        assert_eq!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Answered,
+            "帧 5：W1 未退役时完整重放必须恢复 Answered（误退役则为 Unknown）"
+        );
+    }
+
+    /// Minor #5（A1 跟进）：旧态分析被拒覆盖「同 ID 整条改写为非正式消息」批次
+    /// ——回退以账本 W1 对照，显式改写判定（replace 整条 → next 无同值实体）
+    /// 退役一次；重放原正式答复（同 id 同内容）不得复活。
+    #[test]
+    fn b1_refused_previous_same_item_rewrite_next_empty_retires_once() {
+        use super::super::answer_validity::ValidityStatus;
+        use super::super::async_question::{
+            InteractionState, FAIL_WITNESS_ANALYSIS_AFTER, WITNESS_ANALYSIS_PASSES,
+        };
+        let question = super::super::async_question::question_item_id("call-1", 0);
+        let mut mirror = b1_replay_mirror();
+        assert_eq!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Answered
+        );
+        let original = mirror.observation_state().unwrap().clone();
+        WITNESS_ANALYSIS_PASSES.with(|count| count.set(0));
+        FAIL_WITNESS_ANALYSIS_AFTER.with(|remaining| remaining.set(Some(1)));
+        b1_replay_patch(
+            &mut mirror,
+            2,
+            serde_json::json!([
+                {"op":"replace","path":["turnHistory","history","entitiesByKey","turn:a","items",0],
+                 "value":{"type":"userMessage","id":"answer-1","content":[{"type":"text","text":"普通消息"}]}}
+            ]),
+        );
+        assert_eq!(
+            WITNESS_ANALYSIS_PASSES.with(|count| count.get()),
+            2,
+            "改写帧必须恰好尝试 next+previous 两次分析，第 2 次（旧态）为注入拒绝"
+        );
+        FAIL_WITNESS_ANALYSIS_AFTER.with(|remaining| remaining.set(None));
+        assert!(
+            !mirror
+                .answer_validity
+                .allows_candidate(&key(), &question, "answer-1"),
+            "同 ID 改写批次结束即退役（回退以账本证人对照显式改写判定）"
+        );
+        assert_eq!(
+            mirror.answer_validity.status(&key(), &question),
+            ValidityStatus::Retired,
+            "改写批次结束时账本状态为 Retired（恰一次退役）"
+        );
+        // 下一帧：重放原正式答复正文（同 id 同内容）→ 已退役 id 不复活。
+        b1_replay_patch(
+            &mut mirror,
+            3,
+            serde_json::json!([
+                {"op":"replace","path":["turnHistory","history","entitiesByKey","turn:a","items",0],
+                 "value":{"type":"userMessage","id":"answer-1","content":[{"type":"text","text":b1_replay_envelope("A")}]}}
+            ]),
+        );
+        assert_eq!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Unknown,
+            "已退役的同 id 正式答复重放不得复活"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // A1 复审 round2（双 Blocker）：在场证明门只看「答复在场」——题目维度
+    // 缺第三种证明：题目缺席两侧时回退仍把 W1 交给「完整→完整缺席」（Blocker 1）；
+    // 答复因缺页离场时，「明确删除在场题目」的退役被答复在场过滤吞掉
+    // （Blocker 2）。拒绝形态沿用双信封歧义（实测依据见 a1/red2/red-analysis.md）。
+    // ------------------------------------------------------------------
+
+    /// Blocker 1：题目在前后态都缺席（题目回合在缺页窗口离场、答复回合保留）
+    /// 时，账本 W1 不得凭「完整→完整缺席」退役——回退只按「答复在场」过滤，
+    /// 题目缺席分支把「早已缺席的题目」当成本批删除事实。
+    #[test]
+    fn b1_refused_previous_question_absent_both_sides_does_not_retire() {
+        use super::super::answer_validity::ValidityStatus;
+        use super::super::async_question::InteractionState;
+        let question = super::super::async_question::question_item_id("call-1", 0);
+        let mut mirror = b1_replay_mirror();
+        assert_eq!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Answered
+        );
+        let original = mirror.observation_state().unwrap().clone();
+        // 帧 2（snapshot）：缺页形态但保留答复回合——题目回合缺席、isComplete:false。
+        let mut answer_only = mirror.observation_state().unwrap().clone();
+        answer_only["turnHistory"]["history"]["islands"][0]["entries"] =
+            serde_json::json!([{"value":"turn:a"}]);
+        if let Some(entity) = answer_only
+            .pointer_mut("/turnHistory/history/entitiesByKey")
+            .and_then(Value::as_object_mut)
+        {
+            entity.remove("turn:q");
+        }
+        answer_only["turnHistory"]["history"]["isComplete"] = serde_json::json!(false);
+        mirror
+            .apply(
+                &lease(),
+                &serde_json::json!({"type":"snapshot","revision":2,"conversationState":answer_only}),
+            )
+            .unwrap();
+        assert!(
+            mirror
+                .answer_validity
+                .current_witness(&key(), &question)
+                .is_some(),
+            "帧 2：缺页不构成任何退役，W1 证人必须仍在"
+        );
+        // 帧 3（patch）：结构补全 + 双信封歧义消息（放答复回合 items 尾部）。
+        // 题目仍缺席；前态缺页 → 不退役。
+        let mut ambiguous = mirror.observation_state().unwrap().clone();
+        ambiguous["turnHistory"]["history"]["isComplete"] = serde_json::json!(true);
+        ambiguous["turnHistory"]["history"]["entitiesByKey"]["turn:a"]["items"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({"type":"userMessage","id":"bogus-1",
+                "content":[{"type":"text","text":"<send_user_message_question_reply>junk<send_user_message_question_reply>"}]}));
+        assert!(
+            unambiguous_loaded_history(&ambiguous),
+            "帧 3 形态护栏：歧义态必须结构合法"
+        );
+        assert!(
+            unambiguous_complete_history(&ambiguous),
+            "帧 3 形态护栏：歧义态必须结构完整（previous_complete=true 的前提）"
+        );
+        assert!(
+            super::super::async_question::analyze_answer_witnesses(&key().thread_id, &ambiguous)
+                .is_none(),
+            "帧 3 形态护栏：双信封标记必须构成真实分析拒绝"
+        );
+        b1_replay_patch(
+            &mut mirror,
+            3,
+            serde_json::json!([
+                {"op":"replace","path":["turnHistory","history","isComplete"],"value":true},
+                {"op":"add","path":["turnHistory","history","entitiesByKey","turn:a","items",1],
+                 "value":{"type":"userMessage","id":"bogus-1",
+                  "content":[{"type":"text","text":"<send_user_message_question_reply>junk<send_user_message_question_reply>"}]}}
+            ]),
+        );
+        assert!(
+            mirror
+                .answer_validity
+                .current_witness(&key(), &question)
+                .is_some(),
+            "帧 3：前态缺页（previous_complete=false）不退役，W1 仍在"
+        );
+        // 帧 4（patch）：移除歧义消息 → 新态分析合法空表；前态结构完整但分析被拒
+        // → 回退按「答复在场」放行 W1（答复在前后都在场）→ 题目缺席分支
+        // （previous_complete && next_complete）误退役（Blocker 命中点）。
+        b1_replay_patch(
+            &mut mirror,
+            4,
+            serde_json::json!([
+                {"op":"remove","path":["turnHistory","history","entitiesByKey","turn:a","items",1]}
+            ]),
+        );
+        assert!(
+            mirror
+                .answer_validity
+                .allows_candidate(&key(), &question, "answer-1"),
+            "帧 4：题目两侧缺席不构成删除事实，W1 不得退役"
+        );
+        assert_ne!(
+            mirror.answer_validity.status(&key(), &question),
+            ValidityStatus::Retired,
+            "帧 4：账本不得因题目缺席分支进入 Retired"
+        );
+        // 帧 5：快照重放原完整历史 → W1 未退役 → 重新在场即 Answered。
+        mirror
+            .apply(
+                &lease(),
+                &serde_json::json!({"type":"snapshot","revision":5,"conversationState":original}),
+            )
+            .unwrap();
+        assert_eq!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Answered,
+            "帧 5：W1 未退役时完整重放必须恢复 Answered（误退役则为 Unknown）"
+        );
+    }
+
+    /// Blocker 2：答复已因缺页离场时，「明确删除在场题目」的退役不得被
+    /// 「答复在场过滤」吞掉——回退过滤把 W1 排除后，`explicitly_removes_question`
+    /// 收不到证人，显式删除被漏记，重放复活 Answered。
+    #[test]
+    fn b1_refused_previous_missing_answer_explicit_question_deletion_still_retires() {
+        use super::super::answer_validity::ValidityStatus;
+        use super::super::async_question::InteractionState;
+        let question = super::super::async_question::question_item_id("call-1", 0);
+        let mut mirror = b1_replay_mirror();
+        assert_eq!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Answered
+        );
+        let original = mirror.observation_state().unwrap().clone();
+        // 帧 2（snapshot 缺页）：答复回合离场、题目回合保留、isComplete:false。
+        let mut question_only = mirror.observation_state().unwrap().clone();
+        question_only["turnHistory"]["history"]["islands"][0]["entries"] =
+            serde_json::json!([{"value":"turn:q"}]);
+        if let Some(entity) = question_only
+            .pointer_mut("/turnHistory/history/entitiesByKey")
+            .and_then(Value::as_object_mut)
+        {
+            entity.remove("turn:a");
+        }
+        question_only["turnHistory"]["history"]["isComplete"] = serde_json::json!(false);
+        mirror
+            .apply(
+                &lease(),
+                &serde_json::json!({"type":"snapshot","revision":2,"conversationState":question_only}),
+            )
+            .unwrap();
+        assert!(
+            mirror
+                .answer_validity
+                .current_witness(&key(), &question)
+                .is_some(),
+            "帧 2：缺页不构成任何退役，W1 证人必须仍在（账本面）"
+        );
+        // 帧 3（patch）：结构补全 + 双信封歧义消息（题目在场回合 items 尾部）。
+        let mut ambiguous = mirror.observation_state().unwrap().clone();
+        ambiguous["turnHistory"]["history"]["isComplete"] = serde_json::json!(true);
+        ambiguous["turnHistory"]["history"]["entitiesByKey"]["turn:q"]["items"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({"type":"userMessage","id":"bogus-1",
+                "content":[{"type":"text","text":"<send_user_message_question_reply>junk<send_user_message_question_reply>"}]}));
+        assert!(
+            unambiguous_loaded_history(&ambiguous),
+            "帧 3 形态护栏：歧义态必须结构合法"
+        );
+        assert!(
+            unambiguous_complete_history(&ambiguous),
+            "帧 3 形态护栏：歧义态必须结构完整（previous_complete=true 的前提）"
+        );
+        assert!(
+            super::super::async_question::analyze_answer_witnesses(&key().thread_id, &ambiguous)
+                .is_none(),
+            "帧 3 形态护栏：双信封标记必须构成真实分析拒绝"
+        );
+        b1_replay_patch(
+            &mut mirror,
+            3,
+            serde_json::json!([
+                {"op":"replace","path":["turnHistory","history","isComplete"],"value":true},
+                {"op":"add","path":["turnHistory","history","entitiesByKey","turn:q","items",1],
+                 "value":{"type":"userMessage","id":"bogus-1",
+                  "content":[{"type":"text","text":"<send_user_message_question_reply>junk<send_user_message_question_reply>"}]}}
+            ]),
+        );
+        assert!(
+            mirror
+                .answer_validity
+                .current_witness(&key(), &question)
+                .is_some(),
+            "帧 3：前态缺页不退役，W1 仍在"
+        );
+        // 帧 4（patch）：移除歧义消息 + 显式删除在场题目（形状对照
+        // b1_complete_history_question_deletion_retires_w1 的第一帧）。
+        // 前态分析被拒且 W1 的答复不在前态 → 答复在场过滤把 W1 排除 →
+        // explicitly_removes_question 收不到证人 → 漏退役（Blocker 命中点）。
+        b1_replay_patch(
+            &mut mirror,
+            4,
+            serde_json::json!([
+                {"op":"remove","path":["turnHistory","history","entitiesByKey","turn:q","items",1]},
+                {"op":"remove","path":["turnHistory","history","entitiesByKey","turn:q","items",0,"questions",0]}
+            ]),
+        );
+        assert_eq!(
+            mirror.answer_validity.status(&key(), &question),
+            ValidityStatus::Retired,
+            "帧 4：明确删除在场题目必须退役（当前回退过滤漏记 → RED）"
+        );
+        assert!(
+            !mirror
+                .answer_validity
+                .allows_candidate(&key(), &question, "answer-1"),
+            "帧 4：已退役答复不得再被核验通过"
+        );
+        // 帧 5：快照重放原完整历史（题目与答复都回来）→ 已退役不复活 → Unknown。
+        mirror
+            .apply(
+                &lease(),
+                &serde_json::json!({"type":"snapshot","revision":5,"conversationState":original}),
+            )
+            .unwrap();
+        assert_eq!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Unknown,
+            "帧 5：明确删除的题目恢复后旧答复不得复活（漏退役则为 Answered）"
+        );
+    }
+
+    /// Major（A1 round3 计数）：next 态超 4096 item（CanonicalPresence 超限 →
+    /// items:None）+ 双信封歧义使 analyze 持续 None（回退路径）+ 账本预置 4 个
+    /// 证人（题目在场）。一次无关 patch 批内，退役判定的每次 `presence.contains`
+    /// 都退化为 `answer_in_canonical_history` 全历史重扫 → 计数随证人数线性。
+    /// 合同 = 单批 1 次惰性全量缓存（计数 ≤ 常数上界）。
+    #[test]
+    fn b1_over_limit_refusal_presence_scans_do_not_scale_with_witnesses() {
+        let question_count = 4usize;
+        let padding_count = 4100usize;
+        let envelope = |index: usize| {
+            let question =
+                serde_json::json!(["request_user_input_async", format!("call-{index}"), 0])
+                    .to_string();
+            format!(
+                "<send_user_message_question_reply>\n[{{\"questionItemId\":{},\"question\":\"Q\",\"answer\":\"A\"}}]\n</send_user_message_question_reply>",
+                serde_json::to_string(&question).unwrap()
+            )
+        };
+        let mut clean = serde_json::json!({"turnHistory":{"history":{"isComplete":true,
+            "entitiesByKey":{},"islands":[{"entries":[]}]}}});
+        let q_items: Vec<_> = (0..question_count)
+            .map(|index| {
+                serde_json::json!({"type":"agentMessage","id":format!("call-{index}"),"questions":[{"title":"Q"}]})
+            })
+            .collect();
+        let a_items: Vec<_> = (0..question_count)
+            .map(|index| {
+                serde_json::json!({"type":"userMessage","id":format!("answer-{index}"),
+                 "content":[{"type":"text","text":envelope(index)}]})
+            })
+            .collect();
+        let padding: Vec<_> = (0..padding_count)
+            .map(|index| {
+                serde_json::json!({"type":"userMessage","id":format!("pad-{index}"),
+                 "content":[{"type":"text","text":"pad"}]})
+            })
+            .collect();
+        clean["turnHistory"]["history"]["entitiesByKey"]["turn:q"] =
+            serde_json::json!({"turnId":"q","status":"completed","items":q_items});
+        clean["turnHistory"]["history"]["entitiesByKey"]["turn:a"] =
+            serde_json::json!({"turnId":"a","status":"completed","items":a_items});
+        clean["turnHistory"]["history"]["entitiesByKey"]["turn:p"] =
+            serde_json::json!({"turnId":"p","status":"completed","items":padding});
+        for key in ["turn:q", "turn:a", "turn:p"] {
+            clean["turnHistory"]["history"]["islands"][0]["entries"]
+                .as_array_mut()
+                .unwrap()
+                .push(serde_json::json!({"value": key}));
+        }
+        let mut mirror = ThreadMirror::new(key());
+        mirror
+            .apply(
+                &lease(),
+                &serde_json::json!({"type":"snapshot","revision":1,"conversationState":clean}),
+            )
+            .unwrap();
+        assert_eq!(mirror.project(caps()).async_questions.len(), question_count);
+        // 帧 2（patch）：加入双信封歧义消息 → 自此 analyze 持续 None（回退路径）。
+        b1_replay_patch(
+            &mut mirror,
+            2,
+            serde_json::json!([
+                {"op":"add","path":["turnHistory","history","entitiesByKey","turn:p","items",0],
+                 "value":{"type":"userMessage","id":"bogus-1","content":[
+                    {"type":"text","text":"<send_user_message_question_reply>junk<send_user_message_question_reply>"}]}}
+            ]),
+        );
+        for index in 0..question_count {
+            let qk = super::super::async_question::question_item_id(&format!("call-{index}"), 0);
+            assert!(
+                mirror
+                    .answer_validity
+                    .allows_candidate(&key(), &qk, &format!("answer-{index}")),
+                "前置护栏不成立：证人应完整在场"
+            );
+        }
+        // 帧 3（无关 patch：改写一条 padding 文本）——计数批。
+        // A1.3（终审 Minor）：计数迁到现行扫描入口 `CANONICAL_PRESENCE_SCANS`
+        //（`ANSWER_LOOKUP_SCANS` 监控的回退路径已退出生产，保留作回归护栏）。
+        NEXT_INDEX_CONSTRUCTIONS.with(|count| count.set(0));
+        ANSWER_LOOKUP_SCANS.with(|count| count.set(0));
+        CANONICAL_PRESENCE_SCANS.with(|count| count.set(0));
+        b1_replay_patch(
+            &mut mirror,
+            3,
+            serde_json::json!([
+                {"op":"replace","path":["turnHistory","history","entitiesByKey","turn:p","items",1,"content",0,"text"],
+                 "value":"pad-changed"}
+            ]),
+        );
+        let scans = CANONICAL_PRESENCE_SCANS.with(|count| count.get());
+        let legacy_scans = ANSWER_LOOKUP_SCANS.with(|count| count.get());
+        eprintln!("over-limit refusal batch: witness_count={question_count} presence_scans={scans} legacy_lookup_scans={legacy_scans}");
+        // 无关批不得退役任何证人（答案在前后都在场，缺席不成立）。
+        for index in 0..question_count {
+            let qk = super::super::async_question::question_item_id(&format!("call-{index}"), 0);
+            assert!(
+                mirror
+                    .answer_validity
+                    .allows_candidate(&key(), &qk, &format!("answer-{index}")),
+                "无关批不得退役任何证人"
+            );
+        }
+        assert!(
+            scans < question_count,
+            "回退在场证明的扫描不得随证人数线性增长：N={question_count}，实测 scans={scans} ≥ N（每证人 3 次全历史重扫：\
+             rewrites 的 shifted_removal、removes_reference 的在场门、缺席判定各一次）"
+        );
+        assert!(
+            scans <= 2,
+            "合同 = 1 次惰性全量缓存（单批至多 1 次全历史扫描；上界 2 容许批内新旧态各一次的余量）：实测 scans={scans}"
+        );
+    }
+
+    /// Major #4（A1 跟进）计数合同：多题共享同一 S/U 关联来源时，单批
+    /// next 索引至多构造一次、共享三元组的来源/物理实体摘要各至多一次
+    ///（`or_insert_with` 去重）；同 ID 改写共享来源正文 → 来源实体重新摘要
+    /// 且新摘要 ≠ 旧摘要（经关联退役行为对照）。
+    #[test]
+    fn b1_one_next_index_and_one_formal_digest_per_shared_item_in_batch() {
+        use super::super::async_question::InteractionState;
+        // 共享 S/U 关联来源：两题（call-1/call-2）由同一对 steering+user 消息作答，
+        // 双条目信封、同文同 clientId/server 绑定。
+        let envelope = super::super::async_question::compose_async_answers(&[
+            ("call-1".to_string(), 0, "Q".to_string(), "A".to_string()),
+            ("call-2".to_string(), 0, "Q2".to_string(), "A2".to_string()),
+        ]);
+        let state = serde_json::json!({"turnHistory":{"history":{"isComplete":true,"entitiesByKey":{
+            "turn:q":{"turnId":"q","status":"completed","items":[
+                {"type":"agentMessage","id":"call-1","questions":[{"title":"Q"}]},
+                {"type":"agentMessage","id":"call-2","questions":[{"title":"Q2"}]}
+            ]},
+            "turn:a":{"turnId":"a","status":"completed","items":[
+                {"type":"steeringUserMessage","id":"steer-1","status":"accepted",
+                 "clientUserMessageId":"client-1","serverUserMessageId":"user-1",
+                 "input":[{"type":"text","text":envelope,"text_elements":[]}]},
+                {"type":"userMessage","id":"user-1","clientId":"client-1",
+                 "content":[{"type":"text","text":envelope}]}
+            ]}
+        },"islands":[{"entries":[{"value":"turn:q"},{"value":"turn:a"}]}]}}});
+        let q1 = super::super::async_question::question_item_id("call-1", 0);
+        let q2 = super::super::async_question::question_item_id("call-2", 0);
+        let mut mirror = ThreadMirror::new(key());
+        mirror
+            .apply(
+                &lease(),
+                &serde_json::json!({"type":"snapshot","revision":1,"conversationState":state}),
+            )
+            .unwrap();
+        let projected = mirror.project(caps());
+        assert_eq!(projected.async_questions.len(), 2);
+        assert!(
+            projected
+                .async_questions
+                .iter()
+                .all(|q| q.state == InteractionState::Answered),
+            "前置：两题共享同一 S/U 来源且都被分析命中"
+        );
+        // 批次 1：空 patch + 投影（重置计数器后一次 b1_replay_patch + 一次投影）。
+        NEXT_INDEX_CONSTRUCTIONS.with(|count| count.set(0));
+        FORMAL_DIGEST_COMPUTATIONS.with(|count| count.set(0));
+        b1_replay_patch(&mut mirror, 2, serde_json::json!([]));
+        let _ = mirror.project(caps());
+        let index_builds = NEXT_INDEX_CONSTRUCTIONS.with(|count| count.get());
+        let digest_computations = FORMAL_DIGEST_COMPUTATIONS.with(|count| count.get());
+        assert!(
+            index_builds <= 1,
+            "单批 next 索引至多构造一次（实测 {index_builds}）"
+        );
+        assert_eq!(
+            digest_computations, 2,
+            "共享三元组摘要口径：物理实体（user-1）一次 + 共享 S 来源实体（steer-1）一次；\
+             两题若各自重复摘要同一实体则为 4（实测 {digest_computations}）"
+        );
+        // 批次 2：同 ID 改写共享来源正文 → 来源实体重新摘要且新摘要 ≠ 旧摘要
+        // （经关联退役行为对照：来源 id 进入两题的退役集合）。
+        let rewritten_envelope = super::super::async_question::compose_async_answers(&[
+            ("call-1".to_string(), 0, "Q".to_string(), "B1".to_string()),
+            ("call-2".to_string(), 0, "Q2".to_string(), "B2".to_string()),
+        ]);
+        NEXT_INDEX_CONSTRUCTIONS.with(|count| count.set(0));
+        FORMAL_DIGEST_COMPUTATIONS.with(|count| count.set(0));
+        b1_replay_patch(
+            &mut mirror,
+            3,
+            serde_json::json!([
+                {"op":"replace","path":["turnHistory","history","entitiesByKey","turn:a","items",0,"input",0,"text"],
+                 "value":rewritten_envelope}
+            ]),
+        );
+        let _ = mirror.project(caps());
+        let digest_computations_rewritten = FORMAL_DIGEST_COMPUTATIONS.with(|count| count.get());
+        assert_eq!(
+            digest_computations_rewritten, 2,
+            "改写批口径：物理实体摘要一次 + 改写后的 S 来源实体重新摘要一次（实测 {digest_computations_rewritten}）"
+        );
+        assert!(
+            !mirror
+                .answer_validity
+                .allows_candidate(&key(), &q1, "steer-1"),
+            "来源正文改写 → 新摘要 ≠ 旧摘要（经 retire_linked 退役行为对照：q1 拒绝 steer-1）"
+        );
+        assert!(
+            !mirror
+                .answer_validity
+                .allows_candidate(&key(), &q2, "steer-1"),
+            "共享来源退役对两题同时生效"
+        );
+        assert!(
+            NEXT_INDEX_CONSTRUCTIONS.with(|count| count.get()) <= 1,
+            "改写批 next 索引同样至多构造一次"
+        );
+    }
+
+    /// A1.3 测量：密集多回合（每回合一题一答）大历史在 snapshot / 非空 patch /
+    /// GET+重发布三个环节的实测开销与分析遍历次数。墙钟只记录不断言；
+    /// 断言仅限：单镜像预算（input_bytes < MIRROR_BUDGET）、patch 原子克隆 ==1、
+    /// 分析遍历不随题数线性增长（512 题档 ≤ 32 题档 ×2，依据写进断言信息）、
+    /// 密集样本每题都被分析命中（Answered）。
+    #[test]
+    fn b1_large_history_dense_multiturn_get_republish_measurement() {
+        use super::super::async_question::{InteractionState, WITNESS_ANALYSIS_PASSES};
+        use std::time::Instant;
+
+        // 每回合正文体积固定取 MIRROR_BUDGET/512，使 512 回合档接近 16 MiB 预算。
+        let base_pad = MIRROR_BUDGET / 512;
+        let envelope = |index: usize, answer: &str| {
+            let question =
+                serde_json::json!(["request_user_input_async", format!("call-{index}"), 0])
+                    .to_string();
+            format!(
+                "<send_user_message_question_reply>\n[{{\"questionItemId\":{},\"question\":\"Q\",\"answer\":{}}}]\n</send_user_message_question_reply>",
+                serde_json::to_string(&question).unwrap(),
+                serde_json::to_string(answer).unwrap()
+            )
+        };
+        let build = |count: usize, pad: usize| {
+            let mut entities = serde_json::Map::new();
+            let mut entries = Vec::with_capacity(count);
+            for index in 0..count {
+                let turn_key = format!("turn:t{index}");
+                entities.insert(
+                    turn_key.clone(),
+                    serde_json::json!({
+                        "turnId": format!("t{index}"),
+                        "status": "completed",
+                        "items": [
+                            {"type":"agentMessage","id":format!("call-{index}"),
+                             "text":"x".repeat(pad),"questions":[{"title":"Q"}]},
+                            {"type":"userMessage","id":format!("answer-{index}"),
+                             "content":[{"type":"text","text":envelope(index, "A")}]}
+                        ]
+                    }),
+                );
+                entries.push(serde_json::json!({"value": turn_key}));
+            }
+            serde_json::json!({"turnHistory":{"history":{"isComplete":true,
+                "entitiesByKey": serde_json::Value::Object(entities),
+                "islands":[{"entries": entries}]}}})
+        };
+
+        let mut passes_at_32: Option<usize> = None;
+        for question_count in [1usize, 32, 256, 512] {
+            let mut pad = base_pad;
+            let mut state = build(question_count, pad);
+            let mut input_bytes = serde_json::to_vec(&state).unwrap().len();
+            if input_bytes >= MIRROR_BUDGET {
+                // 超预算档位：按 MIRROR_BUDGET/question_count 收缩每回合文本。
+                pad = MIRROR_BUDGET / question_count;
+                state = build(question_count, pad);
+                input_bytes = serde_json::to_vec(&state).unwrap().len();
+                if input_bytes >= MIRROR_BUDGET {
+                    // 实测溢出按档位均摊精修一次，保证 < MIRROR_BUDGET。
+                    pad -= (input_bytes - MIRROR_BUDGET) / question_count + 1;
+                    state = build(question_count, pad);
+                    input_bytes = serde_json::to_vec(&state).unwrap().len();
+                }
+            }
+            assert!(
+                input_bytes < MIRROR_BUDGET,
+                "questions={question_count} 密集多回合样本必须落在单镜像预算内: {input_bytes} >= {MIRROR_BUDGET}"
+            );
+
+            WITNESS_ANALYSIS_PASSES.with(|count| count.set(0));
+            let change =
+                serde_json::json!({"type":"snapshot","revision":1,"conversationState":state});
+            let mut mirror = ThreadMirror::new(key());
+            let started = Instant::now();
+            mirror.apply(&lease(), &change).unwrap();
+            let snapshot_us = started.elapsed().as_micros();
+
+            let projected = mirror.project(caps());
+            assert_eq!(projected.async_questions.len(), question_count);
+            assert!(
+                projected
+                    .async_questions
+                    .iter()
+                    .all(|q| q.state == InteractionState::Answered),
+                "questions={question_count}: 密集多回合样本的每题都必须被分析命中为 Answered"
+            );
+
+            // 非空 patch：改写 turn:t0 答复条目正文（保留信封形态，同 ID 换答案值）。
+            let rewritten = envelope(0, "A2");
+            FULL_STATE_CLONES.with(|counter| counter.set(0));
+            let started = Instant::now();
+            b1_replay_patch(
+                &mut mirror,
+                2,
+                serde_json::json!([
+                    {"op":"replace","path":["turnHistory","history","entitiesByKey","turn:t0","items",1,"content",0,"text"],"value":rewritten}
+                ]),
+            );
+            let nonempty_patch_us = started.elapsed().as_micros();
+            let patch_clones = FULL_STATE_CLONES.with(|counter| counter.get());
+            assert_eq!(patch_clones, 1, "one atomic patch copy is sufficient");
+
+            // GET（observation 序列化）+ 重发布（新建镜像重放同 state）。
+            let before_republish_passes = WITNESS_ANALYSIS_PASSES.with(|count| count.get());
+            let started = Instant::now();
+            let observed = mirror.observation_state().unwrap().clone();
+            let get_bytes = serde_json::to_vec(&observed).unwrap().len();
+            let mut republished = ThreadMirror::new(key());
+            republished
+                .apply(
+                    &lease(),
+                    &serde_json::json!({"type":"snapshot","revision":2,"conversationState":observed}),
+                )
+                .unwrap();
+            let republish_us = started.elapsed().as_micros();
+            // 重发布前后（GET 序列化 + 新镜像 snapshot 应用）的分析遍历增量。
+            let republish_passes =
+                WITNESS_ANALYSIS_PASSES.with(|count| count.get()) - before_republish_passes;
+
+            let republished_projection = republished.project(caps());
+            assert_eq!(republished_projection.async_questions.len(), question_count);
+            assert!(
+                republished_projection
+                    .async_questions
+                    .iter()
+                    .all(|q| q.state == InteractionState::Answered),
+                "questions={question_count}: 重发布后每题仍须 Answered（重发布不得误退役）"
+            );
+
+            let cycle_passes = WITNESS_ANALYSIS_PASSES.with(|count| count.get());
+            if let Some(baseline) = passes_at_32 {
+                assert!(
+                    cycle_passes <= baseline * 2,
+                    "questions={question_count}: 分析遍历次数不得随题数线性增长：cycle_passes={cycle_passes}，32 题档基准={baseline}。\
+                     口径：WITNESS_ANALYSIS_PASSES 每 analyze_answer_witnesses 进入计 1 次（单次即全历史一遍），\
+                     本用例帧结构（snapshot+投影+非空patch+GET/重发布+投影）跨档位恒定，故该计数结构性恒定，\
+                     ×2 为留裕判定；与既有 b1_history_analysis_passes_do_not_scale_with_question_count \
+                     （每操作 STRICT_GAP_SCANS<=1）同口径或更宽松，未发明新语义"
+                );
+            }
+            if question_count == 32 {
+                passes_at_32 = Some(cycle_passes);
+            }
+            eprintln!(
+                "questions={question_count} input_bytes={input_bytes} snapshot_us={snapshot_us} nonempty_patch_us={nonempty_patch_us} republish_us={republish_us} analysis_passes={republish_passes} patch_clones={patch_clones} get_bytes={get_bytes} cycle_passes={cycle_passes} pad_bytes={pad}"
+            );
+        }
     }
 }
 

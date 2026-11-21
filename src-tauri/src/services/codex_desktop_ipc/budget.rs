@@ -56,6 +56,12 @@ impl Deadline {
         Self(None)
     }
 
+    /// Task7：自绝对时刻构造（crate 内）——意图绝对截止对写前 await 的硬约束
+    ///（有效 deadline = min(原 front, entry 期限)，只裁剪不续期）。
+    pub(crate) fn from_instant(instant: Option<tokio::time::Instant>) -> Self {
+        Self(instant)
+    }
+
     /// 剩余预算；`None` = 无预算（不限时）。
     pub fn remaining(&self) -> Option<Duration> {
         self.0

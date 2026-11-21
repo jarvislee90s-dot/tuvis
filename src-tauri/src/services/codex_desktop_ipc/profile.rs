@@ -116,6 +116,8 @@ fn method_table() -> BTreeMap<String, u32> {
         ("thread-stream-following-status-requested".to_string(), 1),
         ("thread-stream-state-changed".to_string(), 11),
         ("thread-follower-start-turn".to_string(), 2),
+        // 26.1106.6628.0 官方方法表及原生异步题 active 提交链静态核验。
+        ("thread-follower-steer-turn".to_string(), 1),
         ("thread-follower-load-complete-history".to_string(), 1),
         ("thread-follower-command-approval-decision".to_string(), 1),
         // 依据 = build `26.1016.6573.0` 真机方法表（2026-10-21 探测批，
@@ -351,6 +353,15 @@ pub fn compat_readonly_profile(platform: &str, build: &str) -> ProtocolProfile {
 mod tests {
     use super::*;
     use crate::services::codex_desktop_ipc::types::PendingRequestId;
+
+    #[test]
+    fn async_active_steer_method_has_version_one() {
+        let profile = ProtocolProfile::closed();
+        assert_eq!(
+            profile.version("thread-follower-steer-turn", None).unwrap(),
+            1
+        );
+    }
 
     #[test]
     fn closed_profile_has_zero_caps_but_standard_method_table() {
