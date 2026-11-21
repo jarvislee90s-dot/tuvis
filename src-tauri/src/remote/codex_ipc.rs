@@ -382,6 +382,8 @@ pub fn read_chain_verified(store: &DeviceStore) -> bool {
 
 /// 只有 production 构造显式启用真实工厂；测试构造缺省拒绝，避免触达桌面。
 struct HubDiscoveryFactories {
+    /// 仅 Windows 真实 UIA 工厂消费；非 Windows 平台装配恒走拒绝路径。
+    #[cfg(windows)]
     production: bool,
 }
 
@@ -409,7 +411,13 @@ impl DiscoveryFactories for HubDiscoveryFactories {
 }
 
 fn default_discovery_factories(production: bool) -> Arc<dyn DiscoveryFactories> {
-    Arc::new(HubDiscoveryFactories { production })
+    // 非 Windows 无真实工厂可装：production 仍按调用方语义接收，但不改变拒绝路径。
+    #[cfg(not(windows))]
+    let _ = production;
+    Arc::new(HubDiscoveryFactories {
+        #[cfg(windows)]
+        production,
+    })
 }
 
 impl CodexControlHub {

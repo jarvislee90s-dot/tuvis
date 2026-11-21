@@ -715,7 +715,7 @@ fn explicitly_removes_answer_reference(
             entry_index
         ]);
         let prefix = prefix.as_array().unwrap();
-        if patches.iter().any(|op| {
+        patches.iter().any(|op| {
             matches!(
                 op.get("op").and_then(Value::as_str),
                 Some("remove" | "replace")
@@ -729,10 +729,7 @@ fn explicitly_removes_answer_reference(
                             && path.len() == prefix.len()
                             && path.starts_with(&prefix[..prefix.len() - 1]))
                 })
-        }) {
-            return true;
-        }
-        false
+        })
     };
     if let Some(positions) = &old_references.positions {
         #[cfg(test)]
@@ -916,7 +913,7 @@ fn explicitly_removes_question(
             index
         ]);
         let prefix = prefix.as_array().unwrap();
-        if patches.iter().any(|op| {
+        patches.iter().any(|op| {
             matches!(
                 op.get("op").and_then(Value::as_str),
                 Some("remove" | "replace")
@@ -930,10 +927,7 @@ fn explicitly_removes_question(
                             && path.len() == prefix.len()
                             && path.starts_with(&prefix[..prefix.len() - 1]))
                 })
-        }) {
-            return true;
-        }
-        false
+        })
     };
     if let Some(items) = &old_index.items {
         #[cfg(test)]

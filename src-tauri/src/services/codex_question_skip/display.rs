@@ -25,7 +25,6 @@ pub(crate) struct FrozenHistory {
     entries: Arc<Vec<HistoryEntry>>,
 }
 
-#[cfg(test)]
 // 冻结快照的读取访问器只服务测试断言（生产经 overlay_projection 直接读字段）。
 #[cfg(test)]
 impl FrozenHistory {
@@ -43,7 +42,6 @@ pub(crate) struct DisplayObservationStamp {
     epoch: u64,
 }
 
-#[cfg(test)]
 // 同上：stamp 访问器仅测试使用（生产直接比较字段）。
 #[cfg(test)]
 impl DisplayObservationStamp {

@@ -97,6 +97,29 @@ pub(crate) fn owner_lease_encoding(lease: &OwnerLease) -> String {
     out
 }
 
+/// checked CAS 更新（`AtomicU64::fetch_update` 的等价手写实现）：仓库 MSRV 仍是
+/// 1.89，`try_update`（1.100 才提供的新名）不可用，而 1.100+ 工具链已弃用
+/// `fetch_update`。语义与 `fetch_update(success, failure, op)` 完全一致：成功
+/// ordering 用于写入、失败 ordering 用于重读；`op` 返回 None 时不写入并返回
+/// `Err(当前值)`；写入成功返回旧值。
+fn checked_update(
+    cell: &AtomicU64,
+    success: Ordering,
+    failure: Ordering,
+    mut op: impl FnMut(u64) -> Option<u64>,
+) -> Result<u64, u64> {
+    let mut current = cell.load(failure);
+    loop {
+        match op(current) {
+            Some(next) => match cell.compare_exchange_weak(current, next, success, failure) {
+                Ok(previous) => return Ok(previous),
+                Err(actual) => current = actual,
+            },
+            None => return Err(current),
+        }
+    }
+}
+
 /// 连续性 cell（每 ThreadKey source / 每 Claims layer 一份）：mutation 票强持。
 /// Drop **不借 live mutex**：先原子记 break，再注销在途——guard 在两步之间只能
 /// 看到 pending 或 break，不会短暂 clear；溢出置不可恢复失效位，不回绕。
@@ -119,10 +142,13 @@ impl ContinuityCell {
 
     /// 记一次不可丢的连续性断裂。
     fn record_break(&self) {
-        if self
-            .break_epoch
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |e| e.checked_add(1))
-            .is_err()
+        if checked_update(
+            &self.break_epoch,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |e| e.checked_add(1),
+        )
+        .is_err()
         {
             self.overflow.store(true, Ordering::Release);
         }
@@ -142,16 +168,16 @@ impl ContinuityCell {
     }
 
     fn enter(&self) {
-        let _ = self
-            .in_flight
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_add(1));
+        let _ = checked_update(&self.in_flight, Ordering::AcqRel, Ordering::Acquire, |n| {
+            n.checked_add(1)
+        });
     }
 
     /// 注销一个在途登记（begin/drop 配对由 completed 纪律保证）。
     fn leave(&self) {
-        let _ = self
-            .in_flight
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1));
+        let _ = checked_update(&self.in_flight, Ordering::AcqRel, Ordering::Acquire, |n| {
+            n.checked_sub(1)
+        });
     }
 
     fn in_flight_count(&self) -> u64 {

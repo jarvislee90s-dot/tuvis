@@ -25,11 +25,14 @@
 //! 本文件另含 Windows 离线纯校验缝（M2/M3/M4/M5/M6/M7）：Fake/离线测试与 Windows
 //! adapter 共用同一判定；全部缝已被 windows.rs 真实消费（audit/分类/基线/清单/长度）。
 
+#[cfg(any(windows, test))]
 use std::time::Instant;
 
 use sha2::{Digest, Sha256};
 
-use super::types::{UiError, WindowScope};
+#[cfg(any(windows, test))]
+use super::types::UiError;
+use super::types::WindowScope;
 
 /// v2 规范标签：与 v1（仅题文 tuple）严格区分。
 pub(crate) const V2_TAG: &str = "codex-question-card/v2";
@@ -85,11 +88,14 @@ pub(crate) fn card_fingerprint_v2(
 // ---- M2：枚举完整性审计 ----
 
 /// 树遍历深度上限（超过即 incomplete，不得静默 complete）。
+#[cfg(any(windows, test))]
 pub(crate) const MAX_TREE_DEPTH: usize = 32;
 /// 单节点直属兄弟枚举上限。
+#[cfg(any(windows, test))]
 pub(crate) const MAX_SIBLING_COUNT: usize = 64;
 
 /// 深度审计：`depth > MAX_TREE_DEPTH` 拒绝（incomplete/Err，不静默完成）。
+#[cfg(any(windows, test))]
 pub(crate) fn audit_depth(depth: usize) -> Result<(), UiError> {
     if depth > MAX_TREE_DEPTH {
         Err(UiError::Unavailable)
@@ -99,6 +105,7 @@ pub(crate) fn audit_depth(depth: usize) -> Result<(), UiError> {
 }
 
 /// 兄弟数量审计：超限拒绝。
+#[cfg(any(windows, test))]
 pub(crate) fn audit_siblings(sibling_count: usize) -> Result<(), UiError> {
     if sibling_count > MAX_SIBLING_COUNT {
         Err(UiError::Unavailable)
@@ -108,6 +115,7 @@ pub(crate) fn audit_siblings(sibling_count: usize) -> Result<(), UiError> {
 }
 
 /// 遍历预算审计：预算耗尽（remaining == 0）拒绝；节点/文本预算共用。
+#[cfg(any(windows, test))]
 pub(crate) fn audit_budget(remaining: usize) -> Result<(), UiError> {
     if remaining == 0 {
         Err(UiError::Unavailable)
@@ -123,6 +131,7 @@ pub(crate) fn audit_budget(remaining: usize) -> Result<(), UiError> {
 /// 测试共用同一判定语义（仅测试消费，故挂定向 allow）。
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(any(windows, test))]
 pub(crate) enum WalkerStep {
     /// 取到元素，继续遍历。
     Advanced,
@@ -135,6 +144,7 @@ pub(crate) enum WalkerStep {
 /// 纯分类：`underlying_call_failed` = 底层 HRESULT 是否真失败（区别于 S_OK+null 被
 /// 高层包装成 Err）；`element_present` = 调用成功时是否返回了元素。
 #[allow(dead_code)]
+#[cfg(any(windows, test))]
 pub(crate) fn classify_walker_step(
     underlying_call_failed: bool,
     element_present: bool,
@@ -153,6 +163,7 @@ pub(crate) fn classify_walker_step(
 /// 单进程身份事实：`creation_filetime` 为 GetProcessTimes 完整 creation FILETIME
 /// （100ns 刻度私存，非毫秒近似）；`image_path` 为 QueryFullProcessImageNameW 实际值。
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg(any(windows, test))]
 pub(crate) struct ProcessIdentityFact {
     pub(crate) pid: u32,
     pub(crate) creation_filetime: u64,
@@ -163,12 +174,14 @@ pub(crate) struct ProcessIdentityFact {
 /// 已证身份基线：宿主 + 渲染子进程（含 renderer→host 代际由调用方以事实链证明）
 /// + 窗口完整 RuntimeId。固定包/ASAR 白名单比对仍由 Windows adapter 承担。
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg(any(windows, test))]
 pub(crate) struct IdentityBaseline {
     pub(crate) host: ProcessIdentityFact,
     pub(crate) renderer: Option<ProcessIdentityFact>,
     pub(crate) window_rid: Vec<i32>,
 }
 
+#[cfg(any(windows, test))]
 impl IdentityBaseline {
     /// 逐字段严格重验：任何字段漂移都拒绝——尤其「同毫秒不同 FILETIME」（FILETIME
     /// 为 100ns 刻度，代表不同进程实例）也必须拒绝，不得按毫秒近似放行。
@@ -186,6 +199,7 @@ impl IdentityBaseline {
 /// creation FILETIME)`。FILETIME 为 100ns 刻度完整值（非毫秒近似），是同 PID 复用
 /// 下区分不同进程实例的唯一证据；Windows adapter 有界取材并前后核 stamps 后提供。
 #[derive(Clone, Debug)]
+#[cfg(any(windows, test))]
 pub(crate) struct ParentHop {
     pub(crate) child_pid: u32,
     pub(crate) child_filetime: u64,
@@ -194,6 +208,7 @@ pub(crate) struct ParentHop {
 }
 
 /// Windows 路径组件的离线相等（大小写不敏感；Windows 文件系统语义）。
+#[cfg(any(windows, test))]
 fn path_component_eq(left: &std::path::Component<'_>, right: &std::path::Component<'_>) -> bool {
     left.as_os_str().eq_ignore_ascii_case(right.as_os_str())
 }
@@ -203,6 +218,7 @@ fn path_component_eq(left: &std::path::Component<'_>, right: &std::path::Compone
 /// 可执行镜像（*.exe，进程镜像天然是 exe）。逐组件比较（非字符串 prefix）：
 /// `C:\Apps\Pkg` 下的路径不会被 `C:\Apps\PkgEvil\…` 相似前缀碰瓷。任意同包字符串
 ///（resources.pri 等非 exe）与包根本身一律拒绝。
+#[cfg(any(windows, test))]
 fn require_image_inside_package(package_root: &str, image_path: &str) -> Result<(), UiError> {
     let root = std::path::Path::new(package_root);
     let image = std::path::Path::new(image_path);
@@ -234,6 +250,7 @@ fn require_image_inside_package(package_root: &str, image_path: &str) -> Result<
 /// `(pid, 完整 FILETIME)` 全等匹配的 edge，走到 host 事实；同 PID 不同 FILETIME
 /// 不匹配（不同进程实例），父晚于子（FILETIME 比较）拒绝。未消费完的全部 hop、
 /// 走不到 host、材料成环均 = 证据不足 → 拒绝。
+#[cfg(any(windows, test))]
 fn connect_identity_chain(
     start: &ProcessIdentityFact,
     host: &ProcessIdentityFact,
@@ -286,6 +303,7 @@ fn connect_identity_chain(
 ///
 /// 返回基线的 `window_rid` 留空——由调用方以实读完整 RuntimeId 填充（helper 无
 /// COM 事实），基线重验仍逐字段强核对。
+#[cfg(any(windows, test))]
 pub(crate) fn validate_identity_chain(
     package_root: &str,
     host: &ProcessIdentityFact,
@@ -342,6 +360,7 @@ pub(crate) fn validate_identity_chain(
 /// 【状态提交合同由 `update_identity_baseline` 承担（SPEC6 窄事务缝）】：本函数
 /// 只做纯判定；Err 时的「保留旧基线 + 毒化」副作用在事务缝内完成，生产
 /// `read_frame` 直接调用事务缝，不自行拼装判定与提交。
+#[cfg(any(windows, test))]
 pub(crate) fn settle_identity_baseline(
     previous: Option<&IdentityBaseline>,
     current: &IdentityBaseline,
@@ -382,6 +401,7 @@ pub(crate) fn settle_identity_baseline(
 ///
 /// 判定复用 `settle_identity_baseline`（身份规则不重写）；`poison` 由调用方注入
 /// （windows 侧传 `shared.mark_poisoned` 闭合），本函数无存储假设。
+#[cfg(any(windows, test))]
 pub(crate) fn update_identity_baseline(
     slot: &mut Option<IdentityBaseline>,
     current: &IdentityBaseline,
@@ -406,6 +426,7 @@ pub(crate) fn update_identity_baseline(
 /// VT_ARRAY 0x2000 | VT_I4 0x0003）允许执行 read；BYREF（VT_BYREF 0x4000）/错元素
 /// 型/额外 flag/裸 VT_I4 一律拒绝——拒绝发生在访问 VARIANT union 之前，非法 tag
 /// 绝不触碰 union。拒绝隐式转换，隔离错误 union 分支。
+#[cfg(any(windows, test))]
 pub(crate) fn with_cached_i4_array<T>(
     vt: u16,
     read: impl FnOnce() -> Result<T, UiError>,
@@ -426,6 +447,7 @@ pub(crate) fn with_cached_i4_array<T>(
 /// 兜底）。Windows 侧 cache request 注册在【实现段】；Fake 的 live accessor 一被调
 /// 即失败由测试提供。
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg(any(windows, test))]
 pub(crate) enum RuntimeIdSource {
     Cached(Vec<i32>),
     /// 缓存不可用（= Unknown/poison）；仅测试直接构造该拒绝形态。
@@ -434,6 +456,7 @@ pub(crate) enum RuntimeIdSource {
 }
 
 /// 解码缓存 RuntimeId：仅 `Cached` 且非空合法；其余（LiveOnly / 空）= Unknown → 拒绝。
+#[cfg(any(windows, test))]
 pub(crate) fn decode_cached_runtime_id(source: &RuntimeIdSource) -> Result<Vec<i32>, UiError> {
     match source {
         RuntimeIdSource::Cached(rid) if !rid.is_empty() => Ok(rid.clone()),
@@ -446,6 +469,7 @@ pub(crate) fn decode_cached_runtime_id(source: &RuntimeIdSource) -> Result<Vec<i
 /// 订阅种类（M5 完整覆盖面）：结构变化、属性（Name/IsOffscreen/IsEnabled/Value）、
 /// Selection Invalidated、SelectionItem（selected/added/removed）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(any(windows, test))]
 pub(crate) enum SubscriptionKind {
     StructureChanged,
     PropertyChanged,
@@ -455,6 +479,7 @@ pub(crate) enum SubscriptionKind {
 
 /// 单条已注册订阅记录（目标 = 完整 RuntimeId）。
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg(any(windows, test))]
 pub(crate) struct SubscriptionEntry {
     pub(crate) kind: SubscriptionKind,
     pub(crate) target_rid: Vec<i32>,
@@ -465,10 +490,12 @@ pub(crate) struct SubscriptionEntry {
 /// 正常/异常退出逐项 unsubscribe 后释放 COM（M6）。Fake 断言成对计数/回滚顺序
 /// 直接消费本结构。
 #[derive(Default)]
+#[cfg(any(windows, test))]
 pub(crate) struct SubscriptionManifest {
     committed: Vec<SubscriptionEntry>,
 }
 
+#[cfg(any(windows, test))]
 impl SubscriptionManifest {
     pub(crate) fn new() -> Self {
         Self::default()
@@ -500,6 +527,7 @@ impl SubscriptionManifest {
 
 /// M5 订阅覆盖审计：清单必须同时覆盖结构 + 属性 + SelectionInvalidated +
 /// SelectionItem 四面，缺任一 = incomplete（不冒充结构/导航全覆盖）。
+#[cfg(any(windows, test))]
 pub(crate) fn audit_subscription_coverage(kinds: &[SubscriptionKind]) -> Result<(), UiError> {
     let required = [
         SubscriptionKind::StructureChanged,
@@ -521,6 +549,7 @@ pub(crate) fn audit_subscription_coverage(kinds: &[SubscriptionKind]) -> Result<
 /// 倒置（upper < lower）拒绝；i32 极值差在 i64 内不溢出；超过 `max_len` 拒绝；
 /// 结果经 try_from 受检转换。owned 数组由调用方 RAII 销毁、借用数组仅复制
 ///（所有权纪律在 windows.rs，本函数只管长度数值）。
+#[cfg(any(windows, test))]
 pub(crate) fn checked_array_len(lower: i32, upper: i32, max_len: usize) -> Result<usize, UiError> {
     if upper < lower {
         return Err(UiError::Unavailable);

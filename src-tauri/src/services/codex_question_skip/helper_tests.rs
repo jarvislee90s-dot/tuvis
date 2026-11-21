@@ -115,17 +115,25 @@ fn identity_revalidation_rejects_each_changed_process_or_window_fact() {
 
 #[test]
 fn valid_identity_chain_accepts_package_paths_and_matching_generations() {
+    use std::path::Path;
+
+    #[cfg(windows)]
+    let package_root = r"C:\Apps\Pkg";
+    #[cfg(not(windows))]
+    let package_root = "/Apps/Pkg";
+    let root = Path::new(package_root);
+
     let mut baseline = identity();
-    baseline.host.image_path = r"C:\Apps\Pkg\host.exe".into();
-    baseline.renderer.as_mut().unwrap().image_path = r"C:\Apps\Pkg\renderer.exe".into();
-    let child = baseline.renderer.as_ref().unwrap();
+    baseline.host.image_path = root.join("host.exe").display().to_string();
+    let child = baseline.renderer.as_mut().unwrap();
+    child.image_path = root.join("renderer.exe").display().to_string();
     let hop = ParentHop {
         child_pid: child.pid,
         child_filetime: child.creation_filetime,
         parent_pid: baseline.host.pid,
         parent_filetime: baseline.host.creation_filetime,
     };
-    assert!(validate_identity_chain(r"C:\Apps\Pkg", &baseline.host, Some(child), &[hop]).is_ok());
+    assert!(validate_identity_chain(package_root, &baseline.host, Some(child), &[hop]).is_ok());
 }
 
 #[test]
