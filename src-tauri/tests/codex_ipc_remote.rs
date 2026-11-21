@@ -29797,20 +29797,63 @@ async fn stopping_capture_does_not_deadlock_mirror_and_database() {
 
 #[tokio::test]
 async fn pr202_first_snapshot_reconciles_old_answer() {
-    use multi_agents_manager_lib::services::codex_desktop_ipc::async_question::InteractionState;
+    use multi_agents_manager_lib::{
+        database::dao::codex_interactions::StoredInteractionHint,
+        remote::codex_evidence::StoreInteractionHints,
+        services::codex_desktop_ipc::{
+            async_question::{
+                BatchWriteReport, HintStoreError, InteractionHintStore, InteractionState,
+            },
+            hint_commit::HintCommitPermit,
+            hint_state::VersionedHint,
+            types::ThreadProjection,
+        },
+    };
+
+    // 固定冷载窗口，确保只有后台重观察能触发收敛，实际读写仍走 SQLite。
+    struct GatedHintStore {
+        store: StoreInteractionHints,
+        load_gate: StdMutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    }
+
+    impl InteractionHintStore for GatedHintStore {
+        fn load(&self, thread_id: &str) -> Option<Vec<StoredInteractionHint>> {
+            let gate = self.load_gate.lock().unwrap().take();
+            if let Some(gate) = gate {
+                gate.blocking_recv().ok()?;
+            }
+            self.store.load(thread_id)
+        }
+
+        fn begin_epoch(&self) -> Result<i64, HintStoreError> {
+            self.store.begin_epoch()
+        }
+
+        fn write_batch(
+            &self,
+            epoch: i64,
+            hints: &[VersionedHint],
+            at_ms: i64,
+            permit: &HintCommitPermit,
+        ) -> Result<BatchWriteReport, HintStoreError> {
+            self.store.write_batch(epoch, hints, at_ms, permit)
+        }
+    }
+
     let mut f = fixture_ipc_unknown_interrupt(vec![codex_app_session(THREAD)], false);
     {
         let conn = f.conn.lock().unwrap();
         conn.execute("INSERT INTO codex_interaction_hints (thread_id, source_turn_id, source_item_id, question_index, last_fact, updated_at) VALUES (?1, 'old-turn', 'old-item', 0, 'pending', 1)", [THREAD]).unwrap();
     }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let (release_load, load_gate) = tokio::sync::oneshot::channel();
     f.state
         .codex_control
         .adapter
-        .set_interaction_hint_store(Some(Arc::new(
-            multi_agents_manager_lib::remote::codex_evidence::StoreInteractionHints::new(
-                DeviceStore::Owned(f.conn.clone()),
-            ),
-        )));
+        .set_interaction_hint_store(Some(Arc::new(GatedHintStore {
+            store: StoreInteractionHints::new(DeviceStore::Owned(f.conn.clone())),
+            load_gate: StdMutex::new(Some(load_gate)),
+        })));
     let mut published = f.state.codex_control.adapter.subscribe();
     let mut peer = f.peer.take().unwrap();
     let app = f.app.clone();
@@ -29824,65 +29867,74 @@ async fn pr202_first_snapshot_reconciles_old_answer() {
         .await
         .unwrap()
     });
-    handshake(&mut peer, "owner-1").await;
-    let disc = peer.recv().await;
-    peer.send(&discovery_response(
-        disc["requestId"].as_str().unwrap(),
-        "owner-1",
-    ))
-    .await;
-    let follow = peer.recv().await;
-    assert_eq!(follow["method"], "thread-stream-following-changed");
-    let old_key = r#"["request_user_input_async","old-item",0]"#;
-    let envelope = format!("<send_user_message_question_reply>\n[{{\"questionItemId\":{},\"question\":\"旧题\",\"answer\":\"甲\"}}]\n</send_user_message_question_reply>", serde_json::to_string(old_key).unwrap());
-    peer.send(&serde_json::json!({
-        "type":"broadcast", "method":"thread-stream-state-changed", "version":11,
-        "sourceClientId":"owner-1", "params": {"conversationId":THREAD,"hostId":"local",
-        "change":{"type":"snapshot","revision":9,"conversationState":{
-          "turns":[],"requests":[],"threadRuntimeStatus":{"type":"idle"},
-          "turnHistory":{"history":{"isComplete":true,"entitiesByKey":{
-            "turn:new":{"turnId":"new","status":"completed","items":[{"type":"agentMessage","id":"new-item","text":"新题","phase":"final_answer","delivery":"async","questions":[{"title":"新题","options":["甲"]}]}]},
-            "turn:answer":{"turnId":"answer","status":"completed","items":[{"type":"userMessage","id":"answer-item","content":[{"type":"text","text":envelope,"text_elements":[]}]}]}
-          },"islands":[{"id":"i","entries":[{"key":"turn:new","value":"turn:new"},{"key":"turn:answer","value":"turn:answer"}]}]}}
-        }}}})).await;
-    let first = tokio::time::timeout(Duration::from_secs(15), async {
+    tokio::time::timeout_at(deadline, async {
+        handshake(&mut peer, "owner-1").await;
+        let disc = peer.recv().await;
+        peer.send(&discovery_response(
+            disc["requestId"].as_str().unwrap(),
+            "owner-1",
+        ))
+        .await;
+        let follow = peer.recv().await;
+        assert_eq!(follow["method"], "thread-stream-following-changed");
+        let old_key = r#"["request_user_input_async","old-item",0]"#;
+        let envelope = format!("<send_user_message_question_reply>\n[{{\"questionItemId\":{},\"question\":\"旧题\",\"answer\":\"甲\"}}]\n</send_user_message_question_reply>", serde_json::to_string(old_key).unwrap());
+        peer.send(&serde_json::json!({
+            "type":"broadcast", "method":"thread-stream-state-changed", "version":11,
+            "sourceClientId":"owner-1", "params": {"conversationId":THREAD,"hostId":"local",
+            "change":{"type":"snapshot","revision":9,"conversationState":{
+              "turns":[],"requests":[],"threadRuntimeStatus":{"type":"idle"},
+              "turnHistory":{"history":{"isComplete":true,"entitiesByKey":{
+                "turn:new":{"turnId":"new","status":"completed","items":[{"type":"agentMessage","id":"new-item","text":"新题","phase":"final_answer","delivery":"async","questions":[{"title":"新题","options":["甲"]}]}]},
+                "turn:answer":{"turnId":"answer","status":"completed","items":[{"type":"userMessage","id":"answer-item","content":[{"type":"text","text":envelope,"text_elements":[]}]}]}
+              },"islands":[{"id":"i","entries":[{"key":"turn:new","value":"turn:new"},{"key":"turn:answer","value":"turn:answer"}]}]}}
+            }}}})).await;
+    })
+    .await
+    .expect("hint 冷载期间必须完成握手、发现、follow 和快照发送");
+    let check_published = |p: &ThreadProjection| {
+        assert!(
+            p.async_questions
+                .iter()
+                .filter(|q| q.source_item_id == "old-item")
+                .all(|q| q.state == InteractionState::Unknown),
+            "广播中的旧题必须保持 Unknown: {:?}",
+            p.async_questions
+        );
+        assert!(
+            p.async_questions
+                .iter()
+                .any(|q| q.source_item_id == "new-item"
+                    && q.state == InteractionState::TemporarilyBlocked),
+            "广播必须保留暂不可答的新题: {:?}",
+            p.async_questions
+        );
+    };
+    tokio::time::timeout_at(deadline, async {
         loop {
             let p = published.recv().await.unwrap();
-            if p.revision == Some(9) {
-                break p;
+            if p.thread_id == THREAD && p.revision == Some(9) {
+                check_published(&p);
+                break;
             }
         }
     })
     .await
-    .unwrap();
-    assert!(
-        first
-            .async_questions
-            .iter()
-            .any(|q| q.source_item_id == "old-item" && q.state == InteractionState::Unknown),
-        "first published: {:?}",
-        first.async_questions
-    );
-    assert!(
-        first
-            .async_questions
-            .iter()
-            .any(|q| q.source_item_id == "new-item"
-                && q.state == InteractionState::TemporarilyBlocked),
-        "首个快照必须同时保留新题: {:?}",
-        first.async_questions
-    );
-    let response = tokio::time::timeout(Duration::from_secs(15), task)
-        .await
-        .unwrap()
-        .unwrap();
-    let initial: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
+    .expect("hint 冷载期间必须发布 revision 9 首帧");
+    let initial: serde_json::Value = tokio::time::timeout_at(deadline, async {
+        let response = task.await.unwrap();
+        assert_eq!(response.status(), 200);
+        serde_json::from_str(&body_string(response).await).unwrap()
+    })
+    .await
+    .expect("首个 GET 必须在 hint 冷载期间返回");
     let initial_questions = initial["asyncQuestions"].as_array().unwrap();
     assert!(
         initial_questions
             .iter()
-            .any(|q| q["sourceItemId"] == "old-item" && q["state"] == "unknown"),
-        "initial={initial}"
+            .filter(|q| q["sourceItemId"] == "old-item")
+            .all(|q| q["state"] == "unknown"),
+        "首个 GET 中的旧题必须保持 Unknown: {initial}"
     );
     assert!(
         initial_questions
@@ -29890,13 +29942,49 @@ async fn pr202_first_snapshot_reconciles_old_answer() {
             .any(|q| q["sourceItemId"] == "new-item" && q["state"] == "temporarily_blocked"),
         "首个 GET 必须保留新题: {initial}"
     );
+
+    release_load.send(()).unwrap();
+    // 继续用原订阅，避免补取投影触发写穿并掩盖后台漏发或漏写。
+    tokio::time::timeout_at(deadline, async {
+        loop {
+            let p = published.recv().await.unwrap();
+            if p.thread_id == THREAD && p.revision == Some(9) {
+                check_published(&p);
+                if p.async_questions
+                    .iter()
+                    .any(|q| q.source_item_id == "old-item")
+                {
+                    break;
+                }
+            }
+        }
+    })
+    .await
+    .expect("hint 装载后必须主动重发同 revision 的旧题 Unknown");
+    tokio::time::timeout_at(deadline, async {
+        loop {
+            match f.conn.try_lock() {
+                Ok(conn) => {
+                    let fact: String = conn.query_row("SELECT last_fact FROM codex_interaction_hints WHERE thread_id=?1 AND source_turn_id='old-turn' AND source_item_id='old-item' AND question_index=0", [THREAD], |r| r.get(0)).unwrap();
+                    if fact == "unknown" {
+                        break;
+                    }
+                    assert_eq!(fact, "pending", "后台写入了意外的旧题状态");
+                }
+                Err(std::sync::TryLockError::WouldBlock) => {}
+                Err(err) => panic!("内存 SQLite 锁不可用: {err}"),
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("后台必须把旧题 Unknown 提交到 SQLite");
+
     install_async_answer_contract(&f);
-    let p = f
-        .state
-        .codex_control
-        .adapter
-        .projection(&f.thread_key())
-        .await;
+    let key = f.thread_key();
+    let p = tokio::time::timeout_at(deadline, f.state.codex_control.adapter.projection(&key))
+        .await
+        .expect("注入能力证据后必须返回投影");
     assert_eq!(
         p.async_questions
             .iter()
@@ -29905,9 +29993,14 @@ async fn pr202_first_snapshot_reconciles_old_answer() {
             .state,
         InteractionState::Pending
     );
-    let conn = f.conn.lock().unwrap();
-    let fact: String = conn.query_row("SELECT last_fact FROM codex_interaction_hints WHERE thread_id=?1 AND source_item_id='old-item'", [THREAD], |r| r.get(0)).unwrap();
-    assert_eq!(fact, "unknown");
+    assert_eq!(
+        p.async_questions
+            .iter()
+            .find(|q| q.source_item_id == "old-item")
+            .unwrap()
+            .state,
+        InteractionState::Unknown
+    );
 }
 
 // 运行中正式答题：只用合成快照、内存账本和 duplex 假 peer。
