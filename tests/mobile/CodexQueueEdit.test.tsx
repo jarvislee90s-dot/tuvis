@@ -64,6 +64,24 @@ it("failed CAS never fills a draft and stale session responses never transfer", 
   expect(onEdit).not.toHaveBeenCalled();
 });
 
+it("queue_resolution_reason_double_click_posts_once while edit is in flight", async () => {
+  vi.mocked(api.fetchCodexQueue).mockResolvedValue({
+    actions: [{ actionId: "a1", state: "queued", position: 1, receipt: null }],
+    blockedReasonCode: null,
+    blockedActionIds: [],
+  });
+  vi.mocked(api.editCodexQueueMessage).mockReturnValue(new Promise(() => {}));
+  vi.mocked(api.prioritizeCodexQueueMessage).mockClear();
+  render(<CodexQueuePanel sessionId="s1" onEditDraft={vi.fn()} />);
+  fireEvent.click(await screen.findByTestId("codex-queue-toggle"));
+  fireEvent.click(screen.getByTestId("codex-queue-edit-a1"));
+  expect((screen.getByTestId("codex-queue-prioritize-a1") as HTMLButtonElement).disabled).toBe(
+    true
+  );
+  fireEvent.click(screen.getByTestId("codex-queue-prioritize-a1"));
+  expect(api.prioritizeCodexQueueMessage).not.toHaveBeenCalled();
+});
+
 it("unmount invalidates an in-flight edit callback", async () => {
   vi.mocked(api.fetchCodexQueue).mockResolvedValue({
     actions: [{ actionId: "a1", state: "queued", position: 1, receipt: null }],

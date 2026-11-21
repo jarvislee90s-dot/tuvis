@@ -10,16 +10,18 @@
 //  （原消息仍可能迟到；再次发送产生新消息；本操作不是证明原消息未送达）；
 // - `POST /codex/queue/force-continue`（S4 扩展前置）：accepted 无 turnId 只解除运行
 //   限制（新鲜可输入前置，非 Clear 409 `target_not_inputtable`）——不重发原消息。
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import i18n from "@/i18n";
 import { ApiError } from "./api";
 import { formatInvokeError } from "../lib/invokeError";
 import {
+  fetchCodexAction,
   forceContinueCodexAction,
   manualResumeCodexAction,
   newActionId,
   verifyCodexAction,
   type CodexActionVerifyView,
+  type CodexActionView,
   type CodexManualResumeResult,
   type CodexSuccessorSend,
 } from "./codexIpcApi";
@@ -97,23 +99,80 @@ export default function CodexSendRecoveryPanel({
   const [resendArmed, setResendArmed] = useState(false);
   const [resendBusy, setResendBusy] = useState(false);
   const [releaseBusy, setReleaseBusy] = useState(false);
+  /** T1：本锚已确立 delivered 的单调镜像（自动/手动任一路径置位；换锚复位）。
+   *  runVerify 的交错守卫读取它——只防「delivered 被降级」，不拦 resumed/
+   *  converged 段的合法核对。 */
+  const deliveredRef = useRef(false);
+  const autoPollTerminal = useRef(false);
+  const checkAnchorRef = useRef(checkAnchor);
+  /** 换锚时同步废弃旧锚，防止旧回包在 effect 清理前落地。 */
+  const switchAnchor = useCallback((next: string) => {
+    if (checkAnchorRef.current === next) return;
+    checkAnchorRef.current = next;
+    deliveredRef.current = false;
+    setCheckAnchor(next);
+  }, []);
+
+  const confirmFromAction = useCallback((view: CodexActionView, anchor: string) => {
+    const receipt = view.receipt;
+    if (
+      anchor !== checkAnchorRef.current ||
+      view.actionId !== anchor ||
+      view.state !== "accepted" ||
+      receipt?.actionId !== anchor ||
+      receipt.delivery !== "accepted" ||
+      typeof receipt.turnId !== "string" ||
+      !receipt.turnId.trim()
+    ) {
+      return false;
+    }
+    if (!deliveredRef.current) {
+      deliveredRef.current = true;
+      setResult({
+        kind: "verify",
+        anchor,
+        view: {
+          actionId: anchor,
+          stage: view.stage ?? "settled",
+          outcome: "delivered",
+          turnId: receipt.turnId,
+          runLimitReleased: false,
+          reasonCode: receipt.reasonCode ?? null,
+          verifiedAt: Date.now(),
+        },
+      });
+    }
+    return true;
+  }, []);
 
   // ---- 只读核对（S4）：≤10s 服务端有界；「没找到」≠「没发送」----
   const runVerify = useCallback(async () => {
     if (verifying) return;
+    const anchorAtStart = checkAnchorRef.current;
     setVerifying(true);
     setNote(null);
     try {
-      const v = await verifyCodexAction(checkAnchor);
-      setResult({ kind: "verify", view: v, anchor: checkAnchor });
+      const v = await verifyCodexAction(anchorAtStart);
+      // T1：本锚已确立 delivered（单调收敛）时，迟到的手动核对结论不得把结果
+      // 覆盖回 unresolved/accepted_unbound；resumed/converged 段的核对不受影响。
+      if (deliveredRef.current) return;
+      // T1：回写前校验锚——核对在途期间换锚（already_resumed 切后继）时，旧锚
+      // 结论不得写进新锚面板（成功路径守卫）。
+      if (anchorAtStart !== checkAnchorRef.current) return;
+      deliveredRef.current = v.outcome === "delivered";
+      setResult({ kind: "verify", view: v, anchor: anchorAtStart });
     } catch {
-      // 核对未完成 ≠ 核对失败结论：保持待确认（可稍后再核对），绝不落「未送达」
-      setResult(null);
+      // T1：失败路径同锚守卫——换锚后旧核对的网络失败不得清空新锚状态。
+      if (anchorAtStart !== checkAnchorRef.current) return;
+      // 核对未完成 ≠ 核对失败结论：保持待确认（可稍后再核对），绝不落「未送达」。
+      // 异常路径同样不得降级——本锚自动轮询已确认 delivered 时保持结果
+      //（仅清 note；未确认时才回退到「无结果」待确认态）。
+      if (!deliveredRef.current) setResult(null);
       setNote(i18n.t("mobile.codex.composer.recoveryVerifyFailed"));
     } finally {
       setVerifying(false);
     }
-  }, [checkAnchor, verifying]);
+  }, [verifying]);
 
   // ---- 仅解除运行限制（accepted 无 turnId 出口；S4 新鲜可输入前置在服务端）----
   // W2：靶向 = 产生该结论的核对锚（核对后继 accepted_unbound 时沿后继解除）
@@ -181,7 +240,7 @@ export default function CodexSendRecoveryPanel({
           setResult({ kind: "resumed", successor: r.successorActionId });
         } else if (send === null || (receipt === undefined && send.queued !== true)) {
           // 无 send 信息（旧后端/空对象）：与 already 同面的「待查」——核对锚切后继
-          setCheckAnchor(r.successorActionId);
+          switchAnchor(r.successorActionId);
           setResult({ kind: "already", successor: r.successorActionId });
         }
         onSuccessorResolved?.({
@@ -191,6 +250,9 @@ export default function CodexSendRecoveryPanel({
           send,
         });
       } else if (r.status === "converged") {
+        // converged 没有后继。同锚的持久送达事实在 POST 期间可能已由 GET 确认。
+        if (checkAnchorRef.current !== actionId || deliveredRef.current) return;
+        if (confirmFromAction(r.action, actionId)) return;
         // 确认期间已收敛：显示最新结果，不重复发送（服务端不建后继不重发）。
         // 复审 round 4（V2）：converged 只能表达真实终态——unknown 防御性按
         // 「仍待确认」处理，绝不渲染「已有结果」（假收敛）。
@@ -207,7 +269,7 @@ export default function CodexSendRecoveryPanel({
         // W2：already_resumed **不凭存在关系宣称投递成功**——既有后继的真实状态
         // 未知，如实显示「此前已创建后继（ID…）状态待查」，并把核对锚切到后继
         //（对原动作的核对永远 unresolved，冒充不了后继结果）。
-        setCheckAnchor(r.successorActionId);
+        switchAnchor(r.successorActionId);
         setResult({ kind: "already", successor: r.successorActionId });
         onSuccessorResolved?.({
           originalActionId: actionId,
@@ -241,7 +303,7 @@ export default function CodexSendRecoveryPanel({
     } finally {
       setResendBusy(false);
     }
-  }, [actionId, text, resendBusy, onSuccessorResolved]);
+  }, [actionId, text, resendBusy, onSuccessorResolved, switchAnchor, confirmFromAction]);
 
   // 结论行的统一渲染（测试锚 codex-recovery-result；未知结论绝不渲染 raw i18n 键）
   const resultText = (() => {
@@ -277,6 +339,50 @@ export default function CodexSendRecoveryPanel({
   const terminal =
     result?.kind === "verify" &&
     (result.view.outcome === "not_delivered" || result.view.outcome === "delivered");
+  // T1（B6-01/X0）：待确认期间**自动**读取动作状态（只读 GET，零写）——同一锚的
+  // 持久 accepted + turn 即自动呈现「已确认送达」并撤下待确认标题。即时挂载读
+  // 一次，此后 2s 间隔、最多一条在途；单次 GET 10s 时限（AbortController，超时/
+  // 换锚/卸载/终态即取消，迟到的旧响应被锚+取消双保险丢弃）。人工继续（resumed/
+  // converged）停止对原动作的轮询——仍待查的后继由换锚后的新一轮跟踪。
+  const autoPollHalt = terminal || result?.kind === "resumed" || result?.kind === "converged";
+  // T1：停机镜像经 effect 同步（react-hooks/refs：不在渲染期写 ref）。
+  useEffect(() => {
+    autoPollTerminal.current = autoPollHalt;
+  }, [autoPollHalt]);
+  const autoPollInflight = useRef<AbortController | null>(null);
+  useEffect(() => {
+    if (autoPollHalt) return;
+    let cancelled = false;
+    const poll = async () => {
+      if (autoPollInflight.current || autoPollTerminal.current) return;
+      // T1（终审修正）：自动 GET 发出与回写都读**同一锚镜像** checkAnchorRef
+      //（switchAnchor 同步更新）——去掉独立 effect 同步的第二锚镜像，同 tick
+      //「切锚 → 旧锚在途 GET 返回」窗口内的旧锚回执不再通过守卫冒充新锚结论。
+      const anchorAtStart = checkAnchorRef.current;
+      const ctrl = new AbortController();
+      autoPollInflight.current = ctrl;
+      const budget = window.setTimeout(() => ctrl.abort(), 10_000);
+      try {
+        const view = await fetchCodexAction(anchorAtStart, ctrl.signal);
+        if (!cancelled && !ctrl.signal.aborted && !autoPollTerminal.current) {
+          confirmFromAction(view, anchorAtStart);
+        }
+      } catch {
+        // 取消（超时/换锚/卸载）或短暂网络失败：继续待确认，下一轮重试（绝不落「未送达」）
+      } finally {
+        window.clearTimeout(budget);
+        if (autoPollInflight.current === ctrl) autoPollInflight.current = null;
+      }
+    };
+    void poll();
+    const timer = window.setInterval(() => void poll(), 2000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+      autoPollInflight.current?.abort();
+      autoPollInflight.current = null;
+    };
+  }, [autoPollHalt, checkAnchor, confirmFromAction]);
   // W2：重试/解除靶向 = 产生该结论的核对锚（结论属于后继时沿后继，不再想当然用 actionId）
   const notDeliveredAnchor =
     result?.kind === "verify" && result.view.outcome === "not_delivered" ? result.anchor : null;
@@ -288,17 +394,24 @@ export default function CodexSendRecoveryPanel({
   // 属于后继自己的待确认面（原动作最多一个后继，再点只会幂等回弹，提供即误导）。
   const showResend =
     result?.kind === "verify" && result.view.outcome === "unresolved" && result.anchor === actionId;
+  // T1（B6-01/X0）：同锚持久 accepted+turn 的**已确认送达**成立时撤下待确认
+  // 标题（结果行保留「已确认送达」文案；手动核对路径同一呈现）。
+  const deliveredConfirmed = result?.kind === "verify" && result.view.outcome === "delivered";
 
   return (
     <div
       data-testid="codex-recovery-panel"
       className="rounded-lg bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:bg-amber-400/10 dark:text-amber-300"
     >
-      <p data-testid="codex-recovery-title" className="font-medium">
-        {i18n.t("mobile.codex.composer.recoveryTitle")}
-      </p>
-      <p className="mt-0.5">{i18n.t("mobile.codex.composer.recoveryBody")}</p>
-      {deadlineExceeded && (
+      {!deliveredConfirmed && (
+        <p data-testid="codex-recovery-title" className="font-medium">
+          {i18n.t("mobile.codex.composer.recoveryTitle")}
+        </p>
+      )}
+      {!deliveredConfirmed && (
+        <p className="mt-0.5">{i18n.t("mobile.codex.composer.recoveryBody")}</p>
+      )}
+      {!deliveredConfirmed && deadlineExceeded && (
         <p className="mt-0.5">{i18n.t("mobile.codex.composer.recoveryDeadline")}</p>
       )}
       {resumedFrom && (

@@ -11,6 +11,13 @@
 // - `unknown_delivery` 是 200 的**明确回执**（S5：不确定结果绝不自动重试、绝不
 //   自动 fallback），不是网络错误——调用方不得按可重试异常处理。
 import { ApiError } from "./api";
+import {
+  parseQuestionSkipFactFrame,
+  recordQuestionSkipFactFrame,
+  type QuestionDisplayGroupView,
+  type QuestionSkipFactsSnapshot,
+  type QuestionSkipHistoryView,
+} from "./codexQuestionSkipApi";
 
 // ==== DTO（与 types.rs 逐字段对齐，勿漂移）====
 
@@ -291,6 +298,7 @@ export type CodexOperation =
   | "file_change_approval"
   | "blocking_input"
   | "async_answer_idle"
+  | "async_answer_active"
   | "interrupt"
   | "request_cancel"
   | "permissions_approval"
@@ -477,6 +485,19 @@ export interface ThreadProjection {
   effectiveOperations?: CodexEffectiveOperations;
   /** T03：异步题视图。旧后端缺字段 → undefined（不据此清卡）。 */
   asyncQuestions?: CodexAsyncQuestionView[];
+  /** 题卡跳过展示账（附加只读字段；跨帧收敛后的**最新合法事实**——不是本帧原文：
+   *  缺字段/脏形状的帧保最后合法并置 questionSkipInvalid，绝不假清 []；收敛与
+   *  排序守卫在 useCodexThread，见 codexQuestionSkipApi 的账规则）。旧后端
+   *  → undefined（不渲染任何 skip UI）。 */
+  questionDisplayGroups?: QuestionDisplayGroupView[];
+  /** 题卡跳过历史账（同上纪律；restore 入口只来自这里——真实承接的跳过事件，
+   *  不来自 display 单独在场）。 */
+  questionSkipHistory?: QuestionSkipHistoryView[];
+  /** 任一帧出现「在场但非法」→ true：保最后合法展示并禁新 skip，直到合法帧恢复。 */
+  questionSkipInvalid?: boolean;
+  /** 分层事实快照（FactLedger：display/history 高水位账 + descriptor + gid↔题体
+   *  观察 + 统一决策；client-derived，见 questionSkipOperations）。 */
+  questionSkipFacts?: QuestionSkipFactsSnapshot;
   /** T02：增量版本束（投影落地守卫的排序事实）。旧后端缺字段/脏形状 → undefined
    *  （退化为既有 revision 规则；缺版本不获得新写资格）。 */
   projectionVersion?: ProjectionVersion;
@@ -585,6 +606,7 @@ const OPERATION_KEYS = new Set<string>([
   "file_change_approval",
   "blocking_input",
   "async_answer_idle",
+  "async_answer_active",
   "interrupt",
   "request_cancel",
   "permissions_approval",
@@ -742,7 +764,7 @@ function asThreadProjection(v: unknown): ThreadProjection {
   ) {
     throw new ApiError(200, "codex/thread: malformed projection payload");
   }
-  return {
+  const projection: ThreadProjection = {
     ...p,
     // 历史代际 token 是兼容扩展：旧载荷缺省补空串（服务端新载荷恒序列化）。
     historyToken: typeof p.historyToken === "string" ? p.historyToken : "",
@@ -783,6 +805,23 @@ function asThreadProjection(v: unknown): ThreadProjection {
       return typeof v === "string" && v.length > 0 ? v : undefined;
     })(),
   };
+  // 题卡跳过两账（附加只读字段）：本函数不直接透传原始字段——原始字段可能是脏形状
+  // （`...p` 已带出）。剥掉原键，把解析状态登记到 WeakMap；hook 落地时据此收敛
+  // （保最后合法 / 禁新 skip）并挂收敛后的数组。未收敛前消费方看不到任何字段。
+  const raw = v as Record<string, unknown>;
+  if (
+    raw.questionDisplayGroups !== undefined ||
+    raw.questionSkipHistory !== undefined ||
+    raw.questionSkipInvalid !== undefined
+  ) {
+    const skipFrame = parseQuestionSkipFactFrame(raw);
+    const record = projection as unknown as Record<string, unknown>;
+    delete record.questionDisplayGroups;
+    delete record.questionSkipHistory;
+    delete record.questionSkipInvalid;
+    recordQuestionSkipFactFrame(projection, skipFrame);
+  }
+  return projection;
 }
 
 /** 拉取 Thread 投影（useCodexThread 的轮询/refresh 通道）。
@@ -1053,11 +1092,17 @@ export async function respondCodexPending(body: PendingResponseBody): Promise<Ac
 
 // ==== 动作查询 / 队列 ====
 
-/** 查询动作状态（只读核对；404 = 其他设备的动作/不存在 → ApiError）。 */
-export async function fetchCodexAction(actionId: string): Promise<CodexActionView> {
+/** 查询动作状态（只读核对；404 = 其他设备的动作/不存在 → ApiError）。
+ *  `signal`：可选取消信号（T1 自动轮询的单次 10s 时限/换锚取消用）。 */
+export async function fetchCodexAction(
+  actionId: string,
+  signal?: AbortSignal
+): Promise<CodexActionView> {
   let r: Response;
   try {
-    r = await fetch(`${CODEX_ACTION_PATH}?${new URLSearchParams({ action_id: actionId })}`);
+    r = await fetch(`${CODEX_ACTION_PATH}?${new URLSearchParams({ action_id: actionId })}`, {
+      signal,
+    });
   } catch (e) {
     throw networkFail("codex/action", e);
   }

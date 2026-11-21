@@ -1771,7 +1771,7 @@ export default function MessageComposer({
           {/* F7：按 actionId 键控重挂——新动作不继承旧动作的核对结论 / 确认臂 /
               busy 态；旧面板实例卸载后其核对 promise 的迟到 setState 一并作废 */}
           <CodexSendRecoveryPanel
-            key={receipt.actionId}
+            key={JSON.stringify([session.id, receipt.actionId])}
             sessionId={session.id}
             actionId={receipt.actionId}
             text={receipt.text}

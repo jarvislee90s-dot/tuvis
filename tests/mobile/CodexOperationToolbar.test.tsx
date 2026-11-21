@@ -2,6 +2,7 @@ import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import i18n from "@/i18n";
 import CodexOperationToolbar from "@/mobile/CodexOperationToolbar";
+import CodexAdaptSheet from "@/mobile/CodexAdaptSheet";
 import type { CodexEffectiveOperations } from "@/mobile/codexIpcApi";
 
 beforeAll(async () => {
@@ -39,6 +40,95 @@ function operations(over: Partial<CodexEffectiveOperations> = {}): CodexEffectiv
     ...over,
   };
 }
+
+describe("运行中答题操作的可读名称", () => {
+  const rawOperations = JSON.parse(
+    JSON.stringify({
+      policyRevision: 9,
+      operations: {
+        async_answer_active: {
+          implemented: true,
+          allowed: true,
+          requiresAutoAdapt: true,
+          evidence: "contract_matched",
+          support: "supported",
+          reasonCode: null,
+        },
+        async_answer_idle: {
+          implemented: true,
+          allowed: false,
+          requiresAutoAdapt: true,
+          evidence: "contract_matched",
+          support: "supported",
+          reasonCode: "operation_runtime_active",
+        },
+      },
+    })
+  ) as CodexEffectiveOperations;
+
+  it.each([
+    ["zh", "运行中答题"],
+    ["en", "Answer while running"],
+  ])("工具栏在 %s 显示可读名称并保留空闲答题", async (language, label) => {
+    await i18n.changeLanguage(language);
+    const fetcher = vi.fn();
+    vi.stubGlobal("fetch", fetcher);
+    try {
+      render(<CodexOperationToolbar operations={rawOperations} />);
+      expect(screen.getByTestId("codex-ops-chip-async_answer_active").textContent).toBe(label);
+      expect(screen.getByTestId("codex-ops-chip-async_answer_idle").textContent).toBe(
+        i18n.t("mobile.codex.ops.labels.asyncAnswer")
+      );
+      expect(screen.getByTestId("codex-ops-row").textContent).not.toContain("async_answer_active");
+      expect(fetcher).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllGlobals();
+      await i18n.changeLanguage("zh");
+    }
+  });
+
+  it.each([
+    ["zh", "运行中答题"],
+    ["en", "Answer while running"],
+  ])("详情在 %s 显示可读名称且不发写请求", async (language, label) => {
+    await i18n.changeLanguage(language);
+    const fetcher = vi.fn(
+      async (_input: RequestInfo | URL, _init?: RequestInit) =>
+        new Response(
+          JSON.stringify({
+            sessionId: "s1",
+            systemVersion: "test",
+            tuvisVersion: "test",
+            desktopBuild: null,
+            autoAdaptEnabled: true,
+            hintSeen: true,
+            lastFailure: null,
+          }),
+          { status: 200 }
+        )
+    );
+    vi.stubGlobal("fetch", fetcher);
+    try {
+      render(
+        <CodexAdaptSheet
+          sessionId="s1"
+          open
+          onClose={() => undefined}
+          effectiveOperations={rawOperations}
+        />
+      );
+      const row = screen.getByTestId("codex-adapt-op-async_answer_active");
+      expect(row.textContent).toContain(label);
+      expect(row.textContent).not.toContain("async_answer_active");
+      expect(screen.getByTestId("codex-adapt-op-async_answer_idle")).toBeTruthy();
+      expect(fetcher.mock.calls.every(([, init]) => (init?.method ?? "GET") === "GET")).toBe(true);
+    } finally {
+      cleanup();
+      vi.unstubAllGlobals();
+      await i18n.changeLanguage("zh");
+    }
+  });
+});
 
 describe("F08/T10 一行操作工具栏", () => {
   it("row_shows_available_and_count_only：常态一行，不渲染未实现操作", () => {

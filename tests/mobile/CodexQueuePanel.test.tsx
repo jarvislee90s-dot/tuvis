@@ -50,6 +50,8 @@ interface Routes {
   forceContinueFailures?: Record<string, { status: number; body: Record<string, unknown> }>;
   /** R11：GET 挂起不响应（手动放行——乱序防护用例的在途响应） */
   queueHang?: boolean;
+  /** 首次加载后模拟队列查询失败。 */
+  queueFailAfterInitial?: boolean;
   /** POST /codex/turn/interrupt 的失败状态码（缺省 200） */
   interruptStatus?: number;
   /** POST /codex/turn/interrupt 的错误体覆盖（缺省 {error:"capability_unavailable"}） */
@@ -62,6 +64,9 @@ interface Routes {
   prioritizeBody?: Record<string, unknown>;
   /** T06：prioritize 的失败状态码（缺省 200） */
   prioritizeStatus?: number;
+  prioritizeErrorBody?: Record<string, unknown>;
+  prioritizeHang?: boolean;
+  prioritizeNetworkError?: boolean;
 }
 
 let routes: Routes;
@@ -156,8 +161,10 @@ function installFetch() {
       );
     }
     if (url.includes("/codex/queue/prioritize")) {
+      if (routes.prioritizeNetworkError) throw new Error("offline");
+      if (routes.prioritizeHang) return new Promise<Response>(() => {});
       if (routes.prioritizeStatus) {
-        return new Response(JSON.stringify({ error: "internal" }), {
+        return new Response(JSON.stringify(routes.prioritizeErrorBody ?? { error: "internal" }), {
           status: routes.prioritizeStatus,
         });
       }
@@ -181,6 +188,9 @@ function installFetch() {
       );
     }
     if (url.includes("/codex/queue")) {
+      if (routes.queueFailAfterInitial && routes.queue?.length === 0) {
+        return new Response(JSON.stringify({ error: "internal" }), { status: 500 });
+      }
       if (routes.queueHang) {
         // 只挂起**第一发**（会话切换后新会话的拉取照常返回——迟到的只有旧会话那份）
         routes.queueHang = false;
@@ -1160,5 +1170,740 @@ describe("CodexQueuePanel：T06 先处理这条", () => {
     await waitFor(() =>
       expect(screen.getByTestId("codex-queue-note").textContent).toContain("桌面正忙")
     );
+  });
+});
+
+// 响应直接取自 queue_prioritize 的判别联合；每项都经过真实面板及原确认臂。
+describe("queue resolution reason", () => {
+  afterEach(async () => {
+    await i18n.changeLanguage("zh");
+  });
+
+  async function submit(body: Record<string, unknown>, next = action()) {
+    installFetch();
+    routes.prioritizeBody = body;
+    routes.queue = [queueView([action()]), queueView([next])];
+    await renderAndExpand(<CodexQueuePanel sessionId="s1" />);
+    fireEvent.click(await screen.findByTestId("codex-queue-prioritize-a1"));
+    expect(prioritizeBodies()).toHaveLength(0);
+    fireEvent.click(screen.getByTestId("codex-queue-prioritize-yes-a1"));
+    await waitFor(() => expect(prioritizeBodies()).toHaveLength(1));
+    expect(JSON.parse(prioritizeBodies()[0])).toEqual({
+      sessionId: "s1",
+      actionId: "a1",
+      confirmInterrupt: false,
+    });
+    return await screen.findByTestId("codex-queue-note");
+  }
+
+  it.each([
+    ["zh", /仍在队列/, /(?:其他|另一|已有).*(?:进行中|在途|处理中|派发)/, /桌面正忙/],
+    [
+      "en",
+      /still queued/i,
+      /(?:another|other|existing).*(?:in flight|progress|dispatch)/i,
+      /desktop is busy/i,
+    ],
+  ])(
+    "queue_resolution_reason_dispatch_in_flight_is_not_generic_busy %s",
+    async (lang, queued, inFlight, busy) => {
+      await i18n.changeLanguage(lang);
+      const note = await submit({
+        result: "not_sent",
+        actionId: "a1",
+        reasonCode: "dispatch_in_flight",
+        receipt: null,
+        queued: true,
+      });
+      expect(note.textContent).toMatch(queued);
+      expect(note.textContent).toMatch(inFlight);
+      expect(note.textContent).not.toMatch(busy);
+    }
+  );
+
+  it.each([
+    ["zh", /撤回|取消/, /仍在队列|已优先发送|已接受/],
+    ["en", /withdrawn|cancelled|canceled/i, /still queued|sent this one first|accepted/i],
+  ])(
+    "queue_resolution_reason_not_sent_keeps_actual_queue_state cancelled %s",
+    async (lang, cancelled, forbidden) => {
+      await i18n.changeLanguage(lang);
+      const note = await submit(
+        {
+          result: "not_sent",
+          actionId: "a1",
+          reasonCode: "action_cancelled",
+          receipt: null,
+          queued: false,
+        },
+        action({ actionId: "a2", position: 1 })
+      );
+      expect(note.textContent).toMatch(cancelled);
+      expect(note.textContent).not.toMatch(forbidden);
+    }
+  );
+
+  it.each(["zh", "en"])(
+    "queue_resolution_reason_not_sent_keeps_actual_queue_state rejected receipt %s",
+    async (lang) => {
+      await i18n.changeLanguage(lang);
+      const receipt = {
+        actionId: "a1",
+        delivery: "rejected",
+        route: "desktop_ipc",
+        turnId: null,
+        envelopeId: "env-1",
+        reasonCode: "desktop_rejected",
+      };
+      const note = await submit(
+        {
+          result: "not_sent",
+          actionId: "a1",
+          reasonCode: "desktop_rejected",
+          receipt,
+          queued: false,
+        },
+        action({ actionId: "a2", position: 1 })
+      );
+      expect(note.textContent).toMatch(lang === "zh" ? /拒绝/ : /reject/i);
+      expect(note.textContent).not.toMatch(
+        lang === "zh" ? /仍在队列|已优先发送/ : /still queued|sent this one first/i
+      );
+    }
+  );
+
+  it.each([
+    ["state_unknown", /状态.*(?:无法|未知|确认)/, /state.*(?:unknown|confirm)/i],
+    ["native_pending", /原生请求|审批|提问/, /native request|approval|question/i],
+    [
+      "expected_turn_required",
+      /回合.*(?:确认|指定|目标)|(?:确认|指定|目标).*回合/,
+      /(?:turn.*(?:confirm|target|identif)|(?:confirm|target|identif).*turn)/i,
+    ],
+    ["interrupt_confirmation_required", /确认.*停止|停止.*确认/, /confirm.*stop|stop.*confirm/i],
+    ["stop_desktop_rejected", /停止.*拒绝|拒绝.*停止/, /stop.*reject|reject.*stop/i],
+    ["stop_disconnected", /断开|断连|连接/, /disconnect|connection/i],
+    ["stop_stale_context", /上下文|过期|变化/, /context|stale|changed/i],
+    [
+      "stop_claim_unavailable",
+      /(?:停止|操作).*(?:无法|不可|失败)|(?:无法|不可|失败).*(?:停止|操作)/,
+      /(?:stop|operation).*(?:unavailable|fail|unable)|(?:unavailable|fail|unable).*(?:stop|operation)/i,
+    ],
+  ])("queue_resolution_reason_stop_and_state_failures_are_distinct %s", async (reason, zh, en) => {
+    for (const [lang, expected] of [
+      ["zh", zh],
+      ["en", en],
+    ] as const) {
+      await i18n.changeLanguage(lang);
+      const note = await submit({
+        result: "not_sent",
+        actionId: "a1",
+        reasonCode: reason,
+        receipt: null,
+        queued: true,
+      });
+      expect(note.textContent).toMatch(expected);
+      expect(note.textContent).toMatch(lang === "zh" ? /仍在队列/ : /still queued/i);
+      expect(note.textContent).not.toContain(reason);
+      cleanup();
+    }
+  });
+
+  it.each(["stop_timeout", "stop_state_unavailable", "front_budget_elapsed"])(
+    "queue_resolution_reason_unknown_never_invites_resend %s",
+    async (reason) => {
+      for (const lang of ["zh", "en"]) {
+        await i18n.changeLanguage(lang);
+        const note = await submit({ result: "unknown", actionId: "a1", reasonCode: reason });
+        expect(note.textContent).toMatch(lang === "zh" ? /未知/ : /unknown/i);
+        expect(note.textContent).toMatch(
+          lang === "zh"
+            ? /桌面.*核对|核对.*桌面/
+            : /(?:desktop.*(?:check|verif)|(?:check|verif).*desktop)/i
+        );
+        expect(note.textContent).toMatch(
+          lang === "zh" ? /不会自动重试|不自动重发/ : /no automatic retry|will not automatically/i
+        );
+        expect(note.textContent).not.toMatch(
+          lang === "zh" ? /直接重发|立即重试/ : /resend now|retry immediately/i
+        );
+        expect(prioritizeBodies()).toHaveLength(1);
+        cleanup();
+      }
+    }
+  );
+
+  it.each([
+    [500, { error: "internal" }, /失败|错误/, /fail|error/i],
+    [403, { error: "forbidden" }, /权限|设备|拒绝/, /permission|device|forbidden|denied/i],
+    [503, { error: "capability_unavailable" }, /能力|不可用/, /capability|unavailable/i],
+  ])(
+    "queue_resolution_reason_stop_and_state_failures_are_distinct HTTP %s",
+    async (status, body, zh, en) => {
+      for (const [lang, expected] of [
+        ["zh", zh],
+        ["en", en],
+      ] as const) {
+        await i18n.changeLanguage(lang);
+        installFetch();
+        routes.prioritizeStatus = status;
+        routes.prioritizeErrorBody = body;
+        routes.queue = [queueView([action()]), queueView([action()])];
+        await renderAndExpand(<CodexQueuePanel sessionId="s1" />);
+        fireEvent.click(await screen.findByTestId("codex-queue-prioritize-a1"));
+        fireEvent.click(screen.getByTestId("codex-queue-prioritize-yes-a1"));
+        const note = await screen.findByTestId("codex-queue-note");
+        expect(note.textContent).toMatch(expected);
+        expect(note.textContent).not.toMatch(
+          lang === "zh"
+            ? /仍在队列|已优先发送|数据库|账本/
+            : /still queued|sent this one first|database|ledger|sql/i
+        );
+        expect(prioritizeBodies()).toHaveLength(1);
+        cleanup();
+      }
+    }
+  );
+
+  // Unknown 响应本身没有 queued/receipt；队列状态只能来自操作后的 GET。
+  // front_budget_elapsed 既可来自停止等待，也可来自消息投递，不能仅凭该码猜阶段。
+  it.each([
+    ["stop_timeout", "zh"],
+    ["stop_timeout", "en"],
+    ["stop_state_unavailable", "zh"],
+    ["stop_state_unavailable", "en"],
+    ["front_budget_elapsed", "zh"],
+    ["front_budget_elapsed", "en"],
+  ])(
+    "queue_resolution_reason_unknown_never_invites_resend queued snapshot %s %s",
+    async (reason, lang) => {
+      await i18n.changeLanguage(lang);
+      await submit({ result: "unknown", actionId: "a1", reasonCode: reason });
+      await waitFor(() => expect(queueGetCalls()).toBeGreaterThanOrEqual(2));
+      const note = screen.getByTestId("codex-queue-note").textContent ?? "";
+      if (reason !== "front_budget_elapsed") {
+        expect(note).toMatch(
+          lang === "zh"
+            ? /停止.*(?:未知|待确认|无法确认)|(?:未知|待确认).*停止/
+            : /stop.*(?:unknown|uncertain|unconfirmed)|(?:unknown|uncertain).*stop/i
+        );
+      } else {
+        expect(note).toMatch(
+          lang === "zh" ? /未知|未确认|无法确认/ : /unknown|uncertain|unconfirmed/i
+        );
+      }
+      expect(note).toMatch(lang === "zh" ? /仍在队列/ : /still queued/i);
+      expect(note).toMatch(
+        lang === "zh"
+          ? /桌面.*核对|核对.*桌面/
+          : /desktop.*(?:check|verif)|(?:check|verif).*desktop/i
+      );
+      expect(note).toMatch(
+        lang === "zh" ? /不会自动重试|不自动重发/ : /no automatic retry|will not automatically/i
+      );
+      expect(note).not.toMatch(
+        lang === "zh"
+          ? /(?:消息|这条|优先发送).*(?:可能已发送|可能已生效|可能已送达)/
+          : /(?:message|prioritized send).*(?:may have been sent|may have gone through|may.*taken effect)/i
+      );
+      expect(prioritizeBodies()).toHaveLength(1);
+    }
+  );
+
+  it.each([
+    ["front_budget_elapsed", "zh"],
+    ["front_budget_elapsed", "en"],
+    ["client_message_unverified", "zh"],
+    ["client_message_unverified", "en"],
+  ])(
+    "queue_resolution_reason_unknown_never_invites_resend empty queue remains visible %s %s",
+    async (reason, lang) => {
+      await i18n.changeLanguage(lang);
+      installFetch();
+      routes.prioritizeBody = { result: "unknown", actionId: "a1", reasonCode: reason };
+      routes.queue = [queueView([action()]), queueView([]), queueView([])];
+      await renderAndExpand(<CodexQueuePanel sessionId="s1" />);
+      fireEvent.click(await screen.findByTestId("codex-queue-prioritize-a1"));
+      expect(prioritizeBodies()).toHaveLength(0);
+      fireEvent.click(screen.getByTestId("codex-queue-prioritize-yes-a1"));
+      await waitFor(() => expect(queueGetCalls()).toBeGreaterThanOrEqual(2));
+      const note = (await screen.findByTestId("codex-queue-note")).textContent ?? "";
+      expect(note).toMatch(
+        lang === "zh" ? /未知|未确认|无法确认/ : /unknown|uncertain|unconfirmed/i
+      );
+      expect(note).toMatch(
+        lang === "zh"
+          ? /桌面.*核对|核对.*桌面/
+          : /desktop.*(?:check|verif)|(?:check|verif).*desktop/i
+      );
+      expect(note).toMatch(
+        lang === "zh" ? /不会自动重试|不自动重发/ : /no automatic retry|will not automatically/i
+      );
+      expect(note).not.toMatch(
+        lang === "zh"
+          ? /未(?:继续)?发送|没有发送|已送达|仍在队列/
+          : /(?:was|were) not sent|already delivered|still queued/i
+      );
+      expect(prioritizeBodies()).toHaveLength(1);
+    }
+  );
+
+  it.each(["zh", "en"])(
+    "queue_resolution_reason_unknown_never_invites_resend stop reason survives failed queue refresh %s",
+    async (lang) => {
+      await i18n.changeLanguage(lang);
+      installFetch();
+      routes.prioritizeBody = { result: "unknown", actionId: "a1", reasonCode: "stop_timeout" };
+      routes.queue = [queueView([action()])];
+      routes.queueFailAfterInitial = true;
+      await renderAndExpand(<CodexQueuePanel sessionId="s1" />);
+      fireEvent.click(await screen.findByTestId("codex-queue-prioritize-a1"));
+      fireEvent.click(screen.getByTestId("codex-queue-prioritize-yes-a1"));
+      await waitFor(() => expect(queueGetCalls()).toBeGreaterThanOrEqual(2));
+      const note = (await screen.findByTestId("codex-queue-note")).textContent ?? "";
+      expect(note).toMatch(
+        lang === "zh"
+          ? /停止.*(?:未知|待确认|无法确认)|(?:未知|待确认).*停止/
+          : /stop.*(?:unknown|uncertain|unconfirmed)|(?:unknown|uncertain).*stop/i
+      );
+      expect(note).toMatch(
+        lang === "zh"
+          ? /桌面.*核对|核对.*桌面/
+          : /desktop.*(?:check|verif)|(?:check|verif).*desktop/i
+      );
+      expect(note).not.toMatch(lang === "zh" ? /仍在队列/ : /still queued/i);
+      expect(prioritizeBodies()).toHaveLength(1);
+    }
+  );
+
+  // Unknown DTO 不含 queued/receipt；GET 只列 queued，a1 缺席不证明其投递状态。
+  // 重复合法快照只用于此用例观察文案，不改变其他用例对刷新次数的复现。
+  it.each([
+    ["front_budget_elapsed", "zh"],
+    ["front_budget_elapsed", "en"],
+    ["client_message_unverified", "zh"],
+    ["client_message_unverified", "en"],
+  ])(
+    "queue_resolution_reason_unknown_never_invites_resend generic does not assert not sent %s %s",
+    async (reason, lang) => {
+      await i18n.changeLanguage(lang);
+      installFetch();
+      routes.prioritizeBody = { result: "unknown", actionId: "a1", reasonCode: reason };
+      const remaining = queueView([action({ actionId: "a2", position: 1 })]);
+      routes.queue = [queueView([action()]), remaining, remaining, remaining];
+      await renderAndExpand(<CodexQueuePanel sessionId="s1" />);
+      fireEvent.click(await screen.findByTestId("codex-queue-prioritize-a1"));
+      expect(prioritizeBodies()).toHaveLength(0);
+      fireEvent.click(screen.getByTestId("codex-queue-prioritize-yes-a1"));
+      await waitFor(() => expect(queueGetCalls()).toBeGreaterThanOrEqual(2));
+      const note = (await screen.findByTestId("codex-queue-note")).textContent ?? "";
+      expect(note).toMatch(
+        lang === "zh" ? /未知|未确认|无法确认/ : /unknown|uncertain|unconfirmed/i
+      );
+      expect(note).toMatch(
+        lang === "zh"
+          ? /桌面.*核对|核对.*桌面/
+          : /desktop.*(?:check|verif)|(?:check|verif).*desktop/i
+      );
+      expect(note).toMatch(
+        lang === "zh" ? /不会自动重试|不自动重发/ : /no automatic retry|will not automatically/i
+      );
+      if (reason === "client_message_unverified")
+        expect(note).not.toMatch(/预算|budget|timed? out|timeout|超时/i);
+      expect(note).not.toMatch(
+        lang === "zh"
+          ? /未(?:继续)?发送|没有发送|尚未发送|零发送|未送达/
+          : /(?:was|were|has|have) not sent|no (?:message )?(?:was )?sent|never sent/i
+      );
+      expect(prioritizeBodies()).toHaveLength(1);
+    }
+  );
+
+  it.each(["unknown_delivery", "front_budget_elapsed"])(
+    "queue_resolution_reason_unknown_never_invites_resend message delivery unknown %s",
+    async (reason) => {
+      for (const lang of ["zh", "en"]) {
+        await i18n.changeLanguage(lang);
+        installFetch();
+        routes.prioritizeBody = { result: "unknown", actionId: "a1", reasonCode: reason };
+        routes.queue = [
+          queueView([action()]),
+          queueView([action({ actionId: "a2", position: 1 })], "native_delivery_unknown", ["a1"]),
+        ];
+        await renderAndExpand(<CodexQueuePanel sessionId="s1" />);
+        fireEvent.click(await screen.findByTestId("codex-queue-prioritize-a1"));
+        expect(prioritizeBodies()).toHaveLength(0);
+        fireEvent.click(screen.getByTestId("codex-queue-prioritize-yes-a1"));
+        await waitFor(() => expect(queueGetCalls()).toBeGreaterThanOrEqual(2));
+        const note = screen.getByTestId("codex-queue-note").textContent ?? "";
+        expect(note).toMatch(
+          lang === "zh" ? /未知|未确认|无法确认/ : /unknown|uncertain|unconfirmed/i
+        );
+        expect(note).toMatch(
+          lang === "zh"
+            ? /桌面.*核对|核对.*桌面/
+            : /desktop.*(?:check|verif)|(?:check|verif).*desktop/i
+        );
+        expect(note).not.toMatch(
+          lang === "zh"
+            ? /仍在队列|直接重发|立即重试|已接受|未(?:继续)?发送|没有发送/
+            : /still queued|resend now|retry immediately|accepted|(?:was|were) not sent/i
+        );
+        expect(prioritizeBodies()).toHaveLength(1);
+        cleanup();
+      }
+    }
+  );
+
+  it.each([
+    ["front_budget_elapsed", "zh", /超时|等待.*(?:到期|结束)/],
+    ["front_budget_elapsed", "en", /tim(?:e|ed) out|timeout|budget.*(?:elapsed|expired)/i],
+    [
+      "stop_not_effective",
+      "zh",
+      /(?:未|无法|尚未).*(?:确认|证明).*(?:目标|回合).*(?:停止|结束)|(?:目标|回合).*(?:停止|结束).*(?:未|无法|尚未).*(?:确认|证明)/,
+    ],
+    [
+      "stop_not_effective",
+      "en",
+      /(?:could not|cannot|not|unconfirmed).*(?:confirm|verify).*(?:turn|target).*(?:stopp|end)|(?:turn|target).*(?:stopp|end).*(?:not|unconfirmed)/i,
+    ],
+    ["store_error", "zh", /存储|保存|服务.*失败/],
+    ["store_error", "en", /stor(?:age|e)|sav(?:e|ing)|service.*(?:fail|error)/i],
+    ["stop_device_revoked", "zh", /设备.*(?:撤销|失效|权限)|(?:撤销|失效|权限).*设备/],
+    [
+      "stop_device_revoked",
+      "en",
+      /device.*(?:revok|permission|invalid)|(?:revok|permission|invalid).*device/i,
+    ],
+    [
+      "stop_capability_unavailable",
+      "zh",
+      /(?:停止|打断).*(?:能力|不可用)|(?:能力|不可用).*(?:停止|打断)/,
+    ],
+    [
+      "stop_capability_unavailable",
+      "en",
+      /(?:stop|interrupt).*(?:capability|unavailable)|(?:capability|unavailable).*(?:stop|interrupt)/i,
+    ],
+  ])(
+    "queue_resolution_reason_stop_and_state_failures_are_distinct not_sent %s %s",
+    async (reason, lang, expected) => {
+      await i18n.changeLanguage(lang);
+      const note = await submit({
+        result: "not_sent",
+        actionId: "a1",
+        reasonCode: reason,
+        receipt: null,
+        queued: true,
+      });
+      const text = note.textContent ?? "";
+      expect(text).toMatch(expected);
+      expect(text).toMatch(lang === "zh" ? /仍在队列/ : /still queued/i);
+      expect(text).not.toContain(reason);
+      expect(text).not.toMatch(/sql|database|ledger|数据库|账本/i);
+      if (reason === "front_budget_elapsed")
+        expect(text).not.toMatch(
+          lang === "zh"
+            ? /停止.*(?:未知|不确定)|(?:未知|不确定).*停止/
+            : /stop.*(?:unknown|uncertain)|(?:unknown|uncertain).*stop/i
+        );
+      if (reason === "stop_not_effective")
+        expect(text).not.toMatch(lang === "zh" ? /仍在运行|还在运行/ : /still running/i);
+    }
+  );
+
+  it.each([
+    ["queued", "zh"],
+    ["queued", "en"],
+    ["grant_consumed", "zh"],
+    ["grant_consumed", "en"],
+  ])("queue_resolution_reason_not_sent_keeps_actual_queue_state %s %s", async (reason, lang) => {
+    await i18n.changeLanguage(lang);
+    const note = await submit({
+      result: "not_sent",
+      actionId: "a1",
+      reasonCode: reason,
+      receipt: null,
+      queued: true,
+    });
+    const text = note.textContent ?? "";
+    expect(text).toMatch(lang === "zh" ? /仍在队列/ : /still queued/i);
+    expect(text).not.toMatch(/grant_consumed|[（(]\s*queued\s*[）)]/i);
+    if (lang === "zh") expect(text).not.toContain("queued");
+    expect(text).not.toMatch(
+      lang === "zh"
+        ? /已发送|已送达|已接受|停止结果|停止未知|设备.*(?:撤销|权限|失效)|授权(?:已|必然).*(?:消费|使用)/
+        : /(?:has been|was|already) (?:sent|delivered|accepted)|stop result|stop.*unknown|device.*(?:revoked|permission|invalid)|(?:grant|authorization).*(?:already|definitely).*(?:consumed|used)/i
+    );
+    if (reason === "grant_consumed") {
+      expect(text).toMatch(
+        lang === "zh"
+          ? /(?:无法|不能|未能).*(?:优先|继续)|(?:优先|请求).*(?:无法|不能|未能)/
+          : /(?:unable|cannot|could not|not).*(?:priorit|continu)|(?:priorit|request).*(?:unable|cannot|could not)/i
+      );
+      expect(text).toMatch(lang === "zh" ? /核对|确认/ : /check|verif/i);
+    }
+    expect(prioritizeBodies()).toHaveLength(1);
+  });
+
+  it.each(["zh", "en"])(
+    "queue_resolution_reason_not_sent_keeps_actual_queue_state device_revoked receipt %s",
+    async (lang) => {
+      await i18n.changeLanguage(lang);
+      const receipt = {
+        actionId: "a1",
+        delivery: "not_sent" as const,
+        route: "none" as const,
+        turnId: null,
+        envelopeId: null,
+        reasonCode: "device_revoked",
+      };
+      const note = await submit(
+        {
+          result: "not_sent",
+          actionId: "a1",
+          reasonCode: "device_revoked",
+          receipt,
+          queued: false,
+        },
+        action({ actionId: "a2", position: 1 })
+      );
+      expect(note.textContent).toMatch(
+        lang === "zh"
+          ? /设备.*(?:撤销|失效|权限)|(?:撤销|失效|权限).*设备/
+          : /device.*(?:revok|permission|invalid)|(?:revok|permission|invalid).*device/i
+      );
+      expect(note.textContent).not.toMatch(
+        /device_revoked|仍在队列|已接受|已优先发送|still queued|accepted|sent this one first/i
+      );
+    }
+  );
+
+  it.each(["zh", "en"])(
+    "queue_resolution_reason_stop_and_state_failures_are_distinct HTTP capability without disconnect inference %s",
+    async (lang) => {
+      await i18n.changeLanguage(lang);
+      installFetch();
+      routes.prioritizeStatus = 503;
+      routes.prioritizeErrorBody = { error: "capability_unavailable" };
+      routes.queue = [queueView([action()]), queueView([action()])];
+      await renderAndExpand(<CodexQueuePanel sessionId="s1" />);
+      fireEvent.click(await screen.findByTestId("codex-queue-prioritize-a1"));
+      fireEvent.click(screen.getByTestId("codex-queue-prioritize-yes-a1"));
+      const note = (await screen.findByTestId("codex-queue-note")).textContent ?? "";
+      expect(note).toMatch(
+        lang === "zh"
+          ? /(?:远程|桌面).*(?:停止|打断).*(?:不可用|未启用|无法)/
+          : /(?:remote|desktop).*(?:stop|interrupt).*(?:unavailable|not available|unable)/i
+      );
+      expect(note).not.toMatch(
+        lang === "zh" ? /断开|断连|连接中断/ : /disconnect|connection.*(?:lost|broken)/i
+      );
+    }
+  );
+
+  it.each(["zh", "en"])(
+    "queue_resolution_reason_stop_and_state_failures_are_distinct HTTP internal %s",
+    async (lang) => {
+      await i18n.changeLanguage(lang);
+      installFetch();
+      routes.prioritizeStatus = 500;
+      routes.prioritizeErrorBody = { error: "internal" };
+      routes.queue = [queueView([action()]), queueView([action()])];
+      await renderAndExpand(<CodexQueuePanel sessionId="s1" />);
+      fireEvent.click(await screen.findByTestId("codex-queue-prioritize-a1"));
+      fireEvent.click(screen.getByTestId("codex-queue-prioritize-yes-a1"));
+      const note = (await screen.findByTestId("codex-queue-note")).textContent ?? "";
+      expect(note).toMatch(
+        lang === "zh"
+          ? /服务.*(?:失败|错误)|(?:失败|错误).*服务/
+          : /(?:service|server).*(?:fail|error)|(?:fail|error).*(?:service|server)/i
+      );
+      expect(note).toMatch(lang === "zh" ? /核对|确认/ : /check|verif/i);
+      expect(note).not.toMatch(
+        /internal|sql|database|ledger|数据库|账本|仍在队列|未发送|still queued|not sent/i
+      );
+      expect(prioritizeBodies()).toHaveLength(1);
+    }
+  );
+
+  it.each([
+    ["unknown_stop", "zh"],
+    ["unknown_stop", "en"],
+    ["not_sent", "zh"],
+    ["not_sent", "en"],
+    ["http_error", "zh"],
+    ["http_error", "en"],
+  ])("queue_resolution_reason_post_feedback_survives_hung_refresh %s %s", async (kind, lang) => {
+    await i18n.changeLanguage(lang);
+    installFetch();
+    routes.queue = [queueView([action()])];
+    if (kind === "unknown_stop") {
+      routes.prioritizeBody = { result: "unknown", actionId: "a1", reasonCode: "stop_timeout" };
+    } else if (kind === "not_sent") {
+      routes.prioritizeBody = {
+        result: "not_sent",
+        actionId: "a1",
+        reasonCode: "action_cancelled",
+        receipt: null,
+        queued: false,
+      };
+    } else {
+      routes.prioritizeStatus = 500;
+      routes.prioritizeErrorBody = { error: "internal" };
+    }
+    await renderAndExpand(<CodexQueuePanel sessionId="s1" />);
+    expect(queueGetCalls()).toBe(1);
+    routes.queueHang = true; // 仅挂起 POST 收尾 GET；挂载 GET 已成功。
+    fireEvent.click(await screen.findByTestId("codex-queue-prioritize-a1"));
+    expect(prioritizeBodies()).toHaveLength(0);
+    vi.useFakeTimers(); // 确保收尾 GET 创建时，其期限也受假时钟控制。
+    await act(async () => {
+      fireEvent.click(screen.getByTestId("codex-queue-prioritize-yes-a1"));
+      for (let i = 0; i < 20; i += 1) await Promise.resolve();
+    });
+    expect(queueGetCalls()).toBe(2);
+    expect(releaseQueue).not.toBeNull(); // 确认 GET 真正挂起，而非缓慢完成。
+    expect(prioritizeBodies()).toHaveLength(1);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(5000);
+    });
+    const note = screen.getByTestId("codex-queue-note").textContent ?? "";
+    if (kind === "unknown_stop") {
+      expect(note).toMatch(
+        lang === "zh"
+          ? /停止.*(?:未知|待确认|无法确认)|(?:未知|待确认).*停止/
+          : /stop.*(?:unknown|uncertain|unconfirmed)|(?:unknown|uncertain).*stop/i
+      );
+      expect(note).toMatch(
+        lang === "zh"
+          ? /桌面.*核对|核对.*桌面/
+          : /desktop.*(?:check|verif)|(?:check|verif).*desktop/i
+      );
+      expect(note).toMatch(
+        lang === "zh" ? /不会自动重试|不自动重发/ : /no automatic retry|will not automatically/i
+      );
+    } else if (kind === "not_sent") {
+      expect(note).toMatch(lang === "zh" ? /撤回|取消/ : /withdrawn|cancelled|canceled/i);
+    } else {
+      expect(note).toMatch(
+        lang === "zh"
+          ? /服务.*(?:失败|错误)|(?:失败|错误).*服务/
+          : /(?:service|server).*(?:fail|error)|(?:fail|error).*(?:service|server)/i
+      );
+    }
+    expect(note).not.toMatch(lang === "zh" ? /仍在队列/ : /still queued/i);
+    expect((screen.getByTestId("codex-queue-prioritize-a1") as HTMLButtonElement).disabled).toBe(
+      false
+    );
+    expect((screen.getByTestId("codex-queue-retract-a1") as HTMLButtonElement).disabled).toBe(
+      false
+    );
+    expect(prioritizeBodies()).toHaveLength(1);
+    expect(queueGetCalls()).toBe(2);
+  });
+
+  it("queue_resolution_reason_post_feedback_survives_hung_refresh late GET cannot replace the current view or note", async () => {
+    installFetch();
+    routes.queue = [queueView([action()])];
+    routes.prioritizeBody = { result: "unknown", actionId: "a1", reasonCode: "stop_timeout" };
+    await renderAndExpand(<CodexQueuePanel sessionId="s1" />);
+    routes.queueHang = true;
+    fireEvent.click(await screen.findByTestId("codex-queue-prioritize-a1"));
+    vi.useFakeTimers();
+    await act(async () => {
+      fireEvent.click(screen.getByTestId("codex-queue-prioritize-yes-a1"));
+      for (let i = 0; i < 20; i += 1) await Promise.resolve();
+    });
+    expect(queueGetCalls()).toBe(2);
+    const release = releaseQueue;
+    expect(release).not.toBeNull();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(5000);
+    });
+    const note = screen.getByTestId("codex-queue-note").textContent;
+    expect(note).toMatch(/停止.*(?:未知|待确认|无法确认)|(?:未知|待确认).*停止/);
+    await act(async () => {
+      release!(queueView([action({ actionId: "a2", position: 1 })]));
+      for (let i = 0; i < 20; i += 1) await Promise.resolve();
+    });
+    expect(screen.getByTestId("codex-queue-note").textContent).toBe(note);
+    expect(screen.getByTestId("codex-queue-row-a1")).toBeTruthy();
+    expect(screen.queryByTestId("codex-queue-row-a2")).toBeNull();
+    expect(prioritizeBodies()).toHaveLength(1);
+    expect(queueGetCalls()).toBe(2);
+  });
+
+  it("queue_resolution_reason_post_feedback_survives_hung_refresh old GET cannot unlock a newer in-flight operation", async () => {
+    installFetch();
+    routes.queue = [queueView([action(), action({ actionId: "a2", position: 2 })])];
+    routes.prioritizeBody = { result: "unknown", actionId: "a1", reasonCode: "stop_timeout" };
+    await renderAndExpand(<CodexQueuePanel sessionId="s1" />);
+    routes.queueHang = true;
+    fireEvent.click(await screen.findByTestId("codex-queue-prioritize-a1"));
+    vi.useFakeTimers();
+    await act(async () => {
+      fireEvent.click(screen.getByTestId("codex-queue-prioritize-yes-a1"));
+      for (let i = 0; i < 20; i += 1) await Promise.resolve();
+    });
+    expect(queueGetCalls()).toBe(2);
+    const release = releaseQueue;
+    expect(release).not.toBeNull();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(5000);
+    });
+    expect(screen.getByTestId("codex-queue-note").textContent).toMatch(
+      /停止.*(?:未知|待确认|无法确认)|(?:未知|待确认).*停止/
+    );
+    routes.prioritizeHang = true;
+    fireEvent.click(screen.getByTestId("codex-queue-prioritize-a2"));
+    fireEvent.click(screen.getByTestId("codex-queue-prioritize-yes-a2"));
+    expect(prioritizeBodies()).toHaveLength(2); // 对另一条明确操作，POST 保持在途。
+    expect((screen.getByTestId("codex-queue-prioritize-a2") as HTMLButtonElement).disabled).toBe(
+      true
+    );
+    await act(async () => {
+      release!(queueView([action({ actionId: "a3", position: 1 })]));
+      for (let i = 0; i < 20; i += 1) await Promise.resolve();
+    });
+    expect((screen.getByTestId("codex-queue-prioritize-a2") as HTMLButtonElement).disabled).toBe(
+      true
+    );
+    expect(prioritizeBodies()).toHaveLength(2);
+    expect(queueGetCalls()).toBe(2);
+  });
+
+  it.each(["zh", "en"])(
+    "queue_resolution_reason_stop_and_state_failures_are_distinct network failure %s",
+    async (lang) => {
+      await i18n.changeLanguage(lang);
+      installFetch();
+      routes.prioritizeNetworkError = true;
+      routes.queue = [queueView([action()]), queueView([action()])];
+      await renderAndExpand(<CodexQueuePanel sessionId="s1" />);
+      fireEvent.click(await screen.findByTestId("codex-queue-prioritize-a1"));
+      fireEvent.click(screen.getByTestId("codex-queue-prioritize-yes-a1"));
+      const note = (await screen.findByTestId("codex-queue-note")).textContent ?? "";
+      expect(note).toMatch(lang === "zh" ? /网络|连接/ : /network|connection/i);
+      expect(note).toMatch(lang === "zh" ? /核对|确认/ : /check|verif/i);
+      expect(note).not.toMatch(
+        /MOBILE_NETWORK_FAIL|offline|仍在队列|未发送|still queued|not sent/i
+      );
+      expect(prioritizeBodies()).toHaveLength(1);
+    }
+  );
+
+  it("queue_resolution_reason_double_click_posts_once", async () => {
+    installFetch();
+    routes.prioritizeHang = true;
+    routes.queue = [queueView([action()])];
+    await renderAndExpand(<CodexQueuePanel sessionId="s1" />);
+    fireEvent.click(await screen.findByTestId("codex-queue-prioritize-a1"));
+    const yes = screen.getByTestId("codex-queue-prioritize-yes-a1");
+    fireEvent.click(yes);
+    fireEvent.click(yes);
+    expect(prioritizeBodies()).toHaveLength(1);
+    expect(interruptBodies()).toHaveLength(0);
   });
 });

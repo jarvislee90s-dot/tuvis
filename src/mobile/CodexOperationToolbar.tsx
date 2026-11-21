@@ -16,16 +16,17 @@ import i18n from "@/i18n";
 import type { CodexEffectiveOperations, CodexOperation, CodexSupportState } from "./codexIpcApi";
 import { supportOf } from "./codexIpcApi";
 
-function opLabel(operation: CodexOperation): string {
+export function codexOperationLabel(operation: string): string {
   const table: Partial<Record<CodexOperation, string>> = {
     send: i18n.t("mobile.codex.ops.labels.send"),
     command_approval: i18n.t("mobile.codex.ops.labels.approve"),
     file_change_approval: i18n.t("mobile.codex.ops.labels.fileApprove"),
     blocking_input: i18n.t("mobile.codex.ops.labels.answer"),
     async_answer_idle: i18n.t("mobile.codex.ops.labels.asyncAnswer"),
+    async_answer_active: i18n.t("mobile.codex.ops.labels.asyncAnswerActive"),
     interrupt: i18n.t("mobile.codex.ops.labels.stop"),
   };
-  return table[operation] ?? operation;
+  return table[operation as CodexOperation] ?? operation;
 }
 
 /** T03：支持态文案（zh/en 同步；单源，详情页复用）。 */
@@ -101,7 +102,7 @@ export default function CodexOperationToolbar({
                 data-testid={`codex-ops-chip-${operation}`}
                 className="shrink-0 rounded-full border border-[var(--bd)] px-2 py-0.5"
               >
-                {opLabel(operation)}
+                {codexOperationLabel(operation)}
               </span>
             ))}
             {supported.length === 0 && (
