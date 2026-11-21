@@ -126,6 +126,10 @@ impl OwnerRegistry {
     /// 重连/Desktop 重启：清全部 lease（epoch 由 supervisor 递增），generation
     /// 记忆保留（跨 reset 仍单调）。
     pub fn reset(&mut self, new_epoch: u64) {
+        // bind 可能先按新连接代际隐式重置并装订；迟到的同代或旧代清理不得撤销它。
+        if new_epoch <= self.epoch {
+            return;
+        }
         self.epoch = new_epoch;
         for (_, entry) in self.threads.drain() {
             entry.authority.revoke_owner();
@@ -480,6 +484,29 @@ mod tests {
         }
     }
 
+    #[test]
+    fn b1_late_same_epoch_reset_does_not_invalidate_new_lease() {
+        let mut owners = OwnerRegistry::default();
+        // 与 bind 先隐式重置、连接初始化随后执行同代 reset 的顺序一致。
+        let lease = owners.bind(key("t"), "owner".into(), 1);
+        let mut validity = owners.validity(&lease);
+        let permit = owners.authority(&lease).unwrap().rotate_scope().unwrap();
+        owners.reset(1);
+        assert!(owners.is_current(&lease));
+        assert!(*validity.borrow_and_update());
+        assert!(permit.lock().is_ok());
+    }
+    #[test]
+    fn b1_late_older_epoch_reset_cannot_revoke_new_lease() {
+        let mut owners = OwnerRegistry::default();
+        let lease = owners.bind(key("t"), "owner".into(), 2);
+        let mut validity = owners.validity(&lease);
+        let permit = owners.authority(&lease).unwrap().rotate_scope().unwrap();
+        owners.reset(1);
+        assert!(owners.is_current(&lease));
+        assert!(*validity.borrow_and_update());
+        assert!(permit.lock().is_ok());
+    }
     #[test]
     fn b1_higher_epoch_bind_revokes_other_threads() {
         let mut r = OwnerRegistry::default();

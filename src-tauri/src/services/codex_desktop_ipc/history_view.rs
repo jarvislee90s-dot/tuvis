@@ -23,6 +23,13 @@
 //! 只是读取侧的统一焦点，避免每个消费者再长出一套私有判断。
 
 use serde_json::Value;
+use std::collections::HashSet;
+
+#[cfg(test)]
+thread_local! {
+    pub(super) static STRICT_GAP_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static REFERENCE_DEDUP_WORK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 /// 原始 conversationState 的 canonical 历史视图（借用，零拷贝）。
 pub struct HistoryView<'a> {
@@ -61,6 +68,9 @@ impl<'a> HistoryView<'a> {
     /// → 跳过该条（引用失效不是证据来源，见 [`Self::turn_status`]）。
     fn referenced_keys(&self) -> Vec<&'a str> {
         let mut keys: Vec<&'a str> = Vec::new();
+        // 额外索引只覆盖有限数量的引用；超限后退回原始线性查重，保留完整语义。
+        const MAX_INDEX_KEYS: usize = 4096;
+        let mut seen = HashSet::new();
         let Some(islands) = self
             .history()
             .and_then(|h| h.get("islands"))
@@ -76,7 +86,23 @@ impl<'a> HistoryView<'a> {
                 let Some(value) = entry.get("value").and_then(Value::as_str) else {
                     continue;
                 };
-                if !keys.contains(&value) {
+                #[cfg(test)]
+                REFERENCE_DEDUP_WORK.with(|count| {
+                    count.set(
+                        count.get()
+                            + if seen.len() < MAX_INDEX_KEYS {
+                                1
+                            } else {
+                                keys.len()
+                            },
+                    );
+                });
+                let new = if seen.len() < MAX_INDEX_KEYS {
+                    seen.insert(value)
+                } else {
+                    !seen.contains(value) && !keys.contains(&value)
+                };
+                if new {
                     keys.push(value);
                 }
             }
@@ -123,6 +149,8 @@ impl<'a> HistoryView<'a> {
     /// 非对象/无 turnId，都计为缺口——非法引用同样可能藏着正式答复，不能当作
     /// "没有这条"。目标 turn 不需要本身合法（由调用方先确认题目回合）。
     pub fn strict_gap_after_turn(&self, turn_id: &str) -> Option<bool> {
+        #[cfg(test)]
+        STRICT_GAP_SCANS.with(|count| count.set(count.get() + 1));
         let entities = self.entities().and_then(Value::as_object);
         let islands = self
             .history()
@@ -331,6 +359,47 @@ mod tests {
 
     fn state_with(value: Value) -> Value {
         value
+    }
+
+    #[test]
+    fn b1_reference_dedup_work_is_linear_and_ordered() {
+        let mut entities = serde_json::Map::new();
+        let mut entries = Vec::new();
+        for index in 0..256 {
+            let id = format!("t-{index}");
+            entities.insert(id.clone(), json!({"turnId": id, "items": []}));
+            entries.push(json!({"value": id}));
+        }
+        entries.push(json!({"value":"t-0"}));
+        let state = json!({"turnHistory":{"history":{"entitiesByKey":entities,"islands":[{"entries":entries}]}}});
+        REFERENCE_DEDUP_WORK.with(|count| count.set(0));
+        let turns = HistoryView::new(&state).turns();
+        assert_eq!(turns.len(), 256);
+        assert_eq!(turns[0].turn_id, "t-0");
+        assert_eq!(turns[255].turn_id, "t-255");
+        let work = REFERENCE_DEDUP_WORK.with(|count| count.get());
+        assert!(
+            work <= 257,
+            "reference de-duplication work must be linear: {work}"
+        );
+    }
+
+    #[test]
+    fn b1_reference_dedup_over_index_budget_preserves_order() {
+        let mut entities = serde_json::Map::new();
+        let mut entries = Vec::new();
+        for index in 0..4100 {
+            let id = format!("t-{index}");
+            entities.insert(id.clone(), json!({"turnId": id, "items": []}));
+            entries.push(json!({"value": id}));
+        }
+        entries.push(json!({"value":"t-4099"}));
+        entries.push(json!({"value":"t-0"}));
+        let state = json!({"turnHistory":{"history":{"entitiesByKey":entities,"islands":[{"entries":entries}]}}});
+        let turns = HistoryView::new(&state).turns();
+        assert_eq!(turns.len(), 4100);
+        assert_eq!(turns[0].turn_id, "t-0");
+        assert_eq!(turns[4099].turn_id, "t-4099");
     }
 
     #[test]

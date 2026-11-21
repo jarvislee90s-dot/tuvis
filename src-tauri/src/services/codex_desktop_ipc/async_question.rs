@@ -217,11 +217,18 @@ pub struct AnswerWitness {
     pub answer_digest: String,
 }
 
+#[cfg(test)]
+thread_local! {
+    pub(super) static WITNESS_ANALYSIS_PASSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// 从原始 canonical 引用链取得唯一答复；任何引用或身份歧义均保守拒绝。
-fn analyze_answer_witnesses(
+pub(super) fn analyze_answer_witnesses(
     thread_id: &str,
     state: &Value,
 ) -> Option<HashMap<String, AnswerWitness>> {
+    #[cfg(test)]
+    WITNESS_ANALYSIS_PASSES.with(|count| count.set(count.get() + 1));
     if thread_id.is_empty() {
         return None;
     }
@@ -320,19 +327,17 @@ fn analyze_answer_witnesses(
     let mut result = HashMap::new();
     let view = HistoryView::new(state);
     let canonical_turns = view.turns();
+    let mut turn_indices = HashMap::with_capacity(canonical_turns.len());
+    for (index, turn) in canonical_turns.iter().enumerate() {
+        turn_indices.insert(turn.turn_id, index);
+    }
+    let complete_suffix = complete_coverage_suffix(&canonical_turns);
+    // 上面的原始引用链校验已拒绝非法、悬空及重复引用，故不存在严格缺口。
     for (key, (source_turn, source_position)) in questions {
-        let Some(turn_index) = canonical_turns
-            .iter()
-            .position(|turn| turn.turn_id == source_turn)
-        else {
+        let Some(&turn_index) = turn_indices.get(source_turn.as_str()) else {
             continue;
         };
-        if coverage_since(
-            &canonical_turns,
-            turn_index,
-            view.strict_gap_after_turn(&source_turn),
-        ) != AnswerCoverage::CompleteSinceQuestion
-        {
+        if !complete_suffix[turn_index] {
             continue;
         }
         let Some(entries) = answers.get(&key) else {
@@ -456,6 +461,8 @@ impl InteractionHint {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HintStoreError {
     Storage,
+    /// 观察版本或持久行格式无效；不能当作暂时故障反复重试。
+    InvalidData,
     VersionCollision,
     Fenced,
     OwnerFenced,
@@ -678,6 +685,17 @@ fn coverage_since(
     AnswerCoverage::CompleteSinceQuestion
 }
 
+/// 已验证引用链后，反向计算各回合到末尾的覆盖完整性。
+fn complete_coverage_suffix(turns: &[TurnRef<'_>]) -> Vec<bool> {
+    let mut suffix = vec![true; turns.len() + 1];
+    for (index, turn) in turns.iter().enumerate().rev() {
+        suffix[index] = suffix[index + 1]
+            && coverage_since(std::slice::from_ref(turn), 0, Some(false))
+                == AnswerCoverage::CompleteSinceQuestion;
+    }
+    suffix
+}
+
 /// 扫描正式答复：questionItemId（紧凑精确）→ 首次答复。
 fn answered_map(turns: &[TurnRef<'_>], known: &HashSet<String>) -> HashMap<String, AnswerEnvelope> {
     let mut answers = HashMap::new();
@@ -751,6 +769,20 @@ impl AsyncQuestionProjector {
         ops: &EffectiveOperations,
         hints: &[InteractionHint],
     ) -> Vec<AsyncQuestionView> {
+        let analysis = analyze_answer_witnesses(&key.thread_id, state);
+        self.project_with_hints_and_analysis(key, lease, state, ops, hints, &analysis)
+    }
+
+    /// 同一投影内复用严格内容分析；资格和退役账本仍由调用方现算。
+    pub(super) fn project_with_hints_and_analysis(
+        &self,
+        key: &ThreadKey,
+        lease: Option<&super::types::OwnerLease>,
+        state: &Value,
+        ops: &EffectiveOperations,
+        hints: &[InteractionHint],
+        analysis: &Option<HashMap<String, AnswerWitness>>,
+    ) -> Vec<AsyncQuestionView> {
         let view = HistoryView::new(state);
         if !view.readable() {
             return unknown_placeholders(key, lease, hints);
@@ -762,9 +794,11 @@ impl AsyncQuestionProjector {
         }
         let known: HashSet<String> = questions.iter().map(|q| q.question_key.clone()).collect();
         let answers = answered_map(&turns, &known);
-        let analysis = analyze_answer_witnesses(&key.thread_id, state);
         let invalid_history = analysis.is_none();
-        let witnesses = analysis.unwrap_or_default();
+        let empty_witnesses = HashMap::new();
+        let witnesses = analysis.as_ref().unwrap_or(&empty_witnesses);
+        // 仅合法的原始引用链可使用预计算覆盖；非法历史一律保持 Unknown。
+        let complete_suffix = (!invalid_history).then(|| complete_coverage_suffix(&turns));
         let malformed_envelope = turns.iter().flat_map(|turn| turn.items.iter()).any(|item| {
             item.as_object()
                 .filter(|object| object.get("type").and_then(Value::as_str) == Some("userMessage"))
@@ -785,11 +819,16 @@ impl AsyncQuestionProjector {
         for question in &questions {
             let answered = witnesses.contains_key(&question.question_key);
             let ambiguous_answer = answers.contains_key(&question.question_key) && !answered;
-            let coverage = coverage_since(
-                &turns,
-                question.turn_index,
-                view.strict_gap_after_turn(&question.source_turn_id),
-            );
+            let coverage = if complete_suffix
+                .as_ref()
+                .and_then(|suffix| suffix.get(question.turn_index))
+                .copied()
+                == Some(true)
+            {
+                AnswerCoverage::CompleteSinceQuestion
+            } else {
+                AnswerCoverage::Incomplete
+            };
             let (state, actionable, disabled_reason_code) = if answered {
                 (InteractionState::Answered, false, None)
             } else if ambiguous_answer || malformed_envelope || invalid_history {
@@ -1934,6 +1973,86 @@ mod r18_placeholder_tests {
             },
         );
         OperationPolicy.evaluate(&context)
+    }
+
+    #[test]
+    fn b1_history_analysis_passes_do_not_scale_with_question_count() {
+        use super::super::history_view::STRICT_GAP_SCANS;
+        let mut questions = Vec::new();
+        for index in 0..32 {
+            questions.push(question_item(&format!("q-{index}"), "Q", &[]));
+        }
+        let state = canonical(
+            &[("q", "completed", questions), ("tail", "completed", vec![])],
+            true,
+        );
+        STRICT_GAP_SCANS.with(|count| count.set(0));
+        let _ = answer_witnesses("th", &state);
+        let scans = STRICT_GAP_SCANS.with(|count| count.get());
+        assert!(
+            scans <= 1,
+            "strict history scans must not scale with questions: {scans}"
+        );
+    }
+
+    #[test]
+    fn b1_projection_history_passes_do_not_scale_with_question_count() {
+        use super::super::history_view::STRICT_GAP_SCANS;
+        let questions = (0..32)
+            .map(|index| question_item(&format!("q-{index}"), "Q", &[]))
+            .collect();
+        let state = canonical(
+            &[("q", "completed", questions), ("tail", "completed", vec![])],
+            true,
+        );
+        STRICT_GAP_SCANS.with(|count| count.set(0));
+        let projected = AsyncQuestionProjector.project(&key(), None, &state, &ops_allowing_async());
+        assert_eq!(projected.len(), 32);
+        assert!(projected
+            .iter()
+            .all(|q| q.state == InteractionState::Pending));
+        let scans = STRICT_GAP_SCANS.with(|count| count.get());
+        assert!(
+            scans <= 1,
+            "projection rescans strict history per question: {scans}"
+        );
+    }
+
+    #[test]
+    fn b1_coverage_measurement_matches_repeated_baseline() {
+        use std::time::Instant;
+        for turn_count in [16usize, 256] {
+            let mut state = canonical(
+                &[("q", "completed", vec![question_item("q", "Q", &[])])],
+                true,
+            );
+            for index in 1..turn_count {
+                let id = format!("t-{index}");
+                let key = format!("turn:{id}");
+                state["turnHistory"]["history"]["entitiesByKey"][&key] =
+                    json!({"turnId": id, "status":"completed", "items": []});
+                state["turnHistory"]["history"]["islands"][0]["entries"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(json!({"value": key}));
+            }
+            let view = HistoryView::new(&state);
+            let turns = view.turns();
+            for question_count in [1usize, 32, 256, 512] {
+                let started = Instant::now();
+                let baseline: Vec<_> = (0..question_count)
+                    .map(|_| coverage_since(&turns, 0, view.strict_gap_after_turn("q")))
+                    .collect();
+                let before = started.elapsed();
+                let started = Instant::now();
+                let suffix = complete_coverage_suffix(&turns);
+                let after = started.elapsed();
+                assert!(baseline.iter().all(|coverage| (*coverage
+                    == AnswerCoverage::CompleteSinceQuestion)
+                    == suffix[0]));
+                eprintln!("coverage turns={turn_count} questions={question_count} bytes={} old_scans={question_count} new_scans=1 old_us={} new_us={} clones=0", serde_json::to_vec(&state).unwrap().len(), before.as_micros(), after.as_micros());
+            }
+        }
     }
 
     #[test]

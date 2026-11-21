@@ -2340,7 +2340,10 @@ impl DesktopIpcAdapter {
         key: &ThreadKey,
         mirror: &mut super::mirror::ThreadMirror,
         caps: CapabilitySet,
-    ) -> ThreadProjection {
+    ) -> (
+        ThreadProjection,
+        HashMap<String, super::async_question::AnswerWitness>,
+    ) {
         // H02：暂停事实与投影/资格事实在**同一临界区**读取（调用方持镜像锁）——
         // 旧代码在锁外先读、锁内后写事实，旧观察会把新暂停事实覆盖回 false，
         // 让 writer 无越队就放行。锁序仍为 镜像 → 设置/账本单条读（既有纪律）。
@@ -2359,7 +2362,7 @@ impl DesktopIpcAdapter {
             .get(&key.thread_id)
             .cloned();
         mirror.set_interaction_hints(hints);
-        let mut projection = mirror.project(caps);
+        let (mut projection, witnesses) = mirror.project_with_witnesses(caps);
         // B01：可用性必须由**同一份逐操作结论**推导，而不是 profile caps 快照。
         // 契约匹配（或兼容档）让 Send 通过后，未知 build 也能进入可发送/可交互
         // 态；自动适配关闭时 send_gate_static 会否掉 Send，结论同步回退只读。
@@ -2396,7 +2399,7 @@ impl DesktopIpcAdapter {
         );
         facts.active_turn_id = mirror.active_turn_id();
         self.store_interaction_facts(key, facts);
-        projection
+        (projection, witnesses)
     }
 
     /// R01：写入资格事实快照（与 claim 共用资格闸——先失效先胜出）。
@@ -3201,11 +3204,26 @@ impl DesktopIpcAdapter {
         true
     }
 
+    #[cfg(test)]
     fn capture_hint_observation(
         &self,
         key: &ThreadKey,
         mirror: &ThreadMirror,
         questions: &[super::async_question::AsyncQuestionView],
+    ) -> Option<AuthorizedHintObservation> {
+        let witnesses = mirror
+            .observation_state()
+            .map(|state| super::async_question::answer_witnesses(&key.thread_id, state))
+            .unwrap_or_default();
+        self.capture_hint_observation_with_witnesses(key, mirror, questions, &witnesses)
+    }
+
+    fn capture_hint_observation_with_witnesses(
+        &self,
+        key: &ThreadKey,
+        mirror: &ThreadMirror,
+        questions: &[super::async_question::AsyncQuestionView],
+        current_witnesses: &HashMap<String, super::async_question::AnswerWitness>,
     ) -> Option<AuthorizedHintObservation> {
         if mirror.is_stale() {
             return None;
@@ -3236,10 +3254,6 @@ impl DesktopIpcAdapter {
             .unwrap_or_else(|e| e.into_inner())
             .get(&key.thread_id)
             .cloned()?;
-        let current_witnesses = mirror
-            .observation_state()
-            .map(|state| super::async_question::answer_witnesses(&key.thread_id, state))
-            .unwrap_or_default();
         let hints: Vec<_> = questions
             .iter()
             .map(|question| {
@@ -4727,8 +4741,13 @@ impl DesktopIpcAdapter {
                 .get_mut(key)
                 .filter(|m| !m.is_stale() && m.revision().is_some())
                 .map(|m| {
-                    let projection = self.project_mirror(key, m, caps);
-                    let hint = self.capture_hint_observation(key, m, &projection.async_questions);
+                    let (projection, witnesses) = self.project_mirror(key, m, caps);
+                    let hint = self.capture_hint_observation_with_witnesses(
+                        key,
+                        m,
+                        &projection.async_questions,
+                        &witnesses,
+                    );
                     (projection, hint)
                 });
             // Gate F Major 1：快路径首快照同样盖章（临界区内，见 seal_snapshot_seq）
@@ -4946,9 +4965,14 @@ impl DesktopIpcAdapter {
             match mirrors.get_mut(key) {
                 Some(m) => {
                     m.set_approval_policy(Some(policy));
-                    let mut p = self.project_mirror(key, m, caps);
+                    let (mut p, witnesses) = self.project_mirror(key, m, caps);
                     p.local_seq = sealed;
-                    let hint = self.capture_hint_observation(key, m, &p.async_questions);
+                    let hint = self.capture_hint_observation_with_witnesses(
+                        key,
+                        m,
+                        &p.async_questions,
+                        &witnesses,
+                    );
                     (p, hint)
                 }
                 // 无镜像回退分支同样以临界区内的基线盖章：revision=None 的空投影
@@ -7211,13 +7235,17 @@ async fn handle_state_changed(
                     // 经 Gate G/H/I 复核；反向序不存在——设置 DB 锁持有者是同步代
                     // 码，不可能再 await 镜像锁）。
                     let caps = adapter.effective_projection_caps();
-                    let mut proj = adapter.project_mirror(&key, mirror, caps);
+                    let (mut proj, witnesses) = adapter.project_mirror(&key, mirror, caps);
                     // 复审 round 5（W1）：发布路径的 payload 也以**镜像临界区内**
                     // 的盖章声明其内容版本（T3 快照同款边界）——发布点的 CAS 以
                     // 它为比较值，「内容观察」与「发布资格取得」才有共同的版本轴。
                     proj.local_seq = adapter.seal_snapshot_seq();
-                    let hint =
-                        adapter.capture_hint_observation(&key, mirror, &proj.async_questions);
+                    let hint = adapter.capture_hint_observation_with_witnesses(
+                        &key,
+                        mirror,
+                        &proj.async_questions,
+                        &witnesses,
+                    );
                     fresh = Some((proj, hint));
                     // 2026-10-19 复审 P2-2：触发判据 = 列表不完整 **或** items 未加载/
                     // 淘汰（itemsView）——列表完整不代表正文完整，不能等 Desktop
@@ -7365,11 +7393,16 @@ async fn publish_projection(adapter: &DesktopIpcAdapter, key: &ThreadKey) {
         // 窗内完成的禁用发布不得被锁外旧 caps 生成的 payload 覆盖。
         let caps = adapter.effective_projection_caps();
         mirrors.get_mut(key).map(|m| {
-            let mut p = adapter.project_mirror(key, m, caps);
+            let (mut p, witnesses) = adapter.project_mirror(key, m, caps);
             // 复审 round 5（W1）：发布 payload 以镜像临界区内的盖章声明内容版本
             //（handle_state_changed 同款）——发布点的 CAS 以它为比较值。
             p.local_seq = adapter.seal_snapshot_seq();
-            let hint = adapter.capture_hint_observation(key, m, &p.async_questions);
+            let hint = adapter.capture_hint_observation_with_witnesses(
+                key,
+                m,
+                &p.async_questions,
+                &witnesses,
+            );
             (p, hint)
         })
     };
@@ -7649,7 +7682,7 @@ async fn handle_client_status_changed(adapter: &DesktopIpcAdapter, frame: &Value
         for key in &affected {
             if let Some(m) = mirrors.get_mut(key) {
                 m.invalidate();
-                let mut p = adapter.project_mirror(key, m, caps);
+                let (mut p, _) = adapter.project_mirror(key, m, caps);
                 // 复审 round 5（W1）：发布 payload 以镜像临界区内的盖章声明内容
                 // 版本——发布点的 CAS 以它为比较值。
                 p.local_seq = adapter.seal_snapshot_seq();
@@ -7736,7 +7769,7 @@ async fn mark_all_mirrors_stale(adapter: &DesktopIpcAdapter, invalidate: bool) {
                 false
             };
             if publish {
-                let mut p = adapter.project_mirror(key, mirror, caps);
+                let (mut p, _) = adapter.project_mirror(key, mirror, caps);
                 // 复审 round 5（W1）：发布 payload 以镜像临界区内的盖章声明内容
                 // 版本——发布点的 CAS 以它为比较值。
                 p.local_seq = adapter.seal_snapshot_seq();
@@ -10345,14 +10378,26 @@ mod pr202_hint_init_tests {
                 &serde_json::json!({"type":"snapshot","revision":1,"conversationState":state}),
             )
             .unwrap();
-        let projection = mirror.project(adapter.current_caps());
+        super::super::async_question::WITNESS_ANALYSIS_PASSES.with(|count| count.set(0));
+        let (projection, witnesses) = mirror.project_with_witnesses(adapter.current_caps());
         assert_eq!(
             projection.async_questions[0].state,
             InteractionState::Answered
         );
         let old = adapter
-            .capture_hint_observation(&key, &mirror, &projection.async_questions)
+            .capture_hint_observation_with_witnesses(
+                &key,
+                &mirror,
+                &projection.async_questions,
+                &witnesses,
+            )
             .unwrap();
+        let analysis_passes =
+            super::super::async_question::WITNESS_ANALYSIS_PASSES.with(|count| count.get());
+        assert_eq!(
+            analysis_passes, 1,
+            "projection and capture must share one analysis"
+        );
         let old_observation = old.observation.clone();
         let old_scope = old.scope;
         adapter.persist_authorized_hints(old).await;

@@ -211,7 +211,7 @@ struct TurnObservation {
     active: bool,
 }
 
-fn question_dependencies(state: &Value) -> std::collections::HashMap<String, (String, Value)> {
+fn question_dependencies(state: &Value) -> std::collections::HashMap<String, (&str, &Value)> {
     let mut dependencies = std::collections::HashMap::new();
     for turn in HistoryView::new(state).turns() {
         for item in turn.items {
@@ -228,7 +228,7 @@ fn question_dependencies(state: &Value) -> std::collections::HashMap<String, (St
                 if let Ok(index) = u32::try_from(index) {
                     dependencies.insert(
                         super::async_question::question_item_id(id, index),
-                        (turn.turn_id.to_owned(), question.clone()),
+                        (turn.turn_id, question),
                     );
                 }
             }
@@ -237,8 +237,17 @@ fn question_dependencies(state: &Value) -> std::collections::HashMap<String, (St
     dependencies
 }
 
+#[cfg(test)]
+thread_local! {
+    static FULL_STATE_CLONES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static FULL_TURN_CLONES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static COMPLETE_HISTORY_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// 退役必须基于完整且身份唯一的 canonical 引用链。
 fn unambiguous_complete_history(state: &Value) -> bool {
+    #[cfg(test)]
+    COMPLETE_HISTORY_SCANS.with(|count| count.set(count.get() + 1));
     if HistoryView::new(state).needs_hydration() {
         return false;
     }
@@ -307,10 +316,20 @@ fn unambiguous_loaded_history(state: &Value) -> bool {
     true
 }
 
+#[cfg(test)]
+thread_local! {
+    static ANSWER_LOOKUP_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static OLD_ITEM_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static NEXT_ITEM_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static OLD_REFERENCE_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn answer_in_canonical_history(
     state: &Value,
     witness: &super::async_question::AnswerWitness,
 ) -> bool {
+    #[cfg(test)]
+    ANSWER_LOOKUP_SCANS.with(|count| count.set(count.get() + 1));
     HistoryView::new(state).turns().iter().any(|turn| {
         turn.turn_id == witness.answer_turn_id
             && turn.items.iter().any(|item| {
@@ -319,76 +338,284 @@ fn answer_in_canonical_history(
     })
 }
 
+/// 单次更新共用的 canonical 答复身份索引；超限回退到原始精确查找。
+struct CanonicalPresence<'a> {
+    state: &'a Value,
+    items: Option<HashSet<(&'a str, &'a str)>>,
+}
+
+impl<'a> CanonicalPresence<'a> {
+    fn new(state: &'a Value) -> Self {
+        const MAX_INDEXED_ITEMS: usize = 4096;
+        let mut items = HashSet::new();
+        for turn in HistoryView::new(state).turns() {
+            for item in turn.items {
+                if let Some(id) = item.get("id").and_then(Value::as_str) {
+                    if items.len() == MAX_INDEXED_ITEMS {
+                        return Self { state, items: None };
+                    }
+                    items.insert((turn.turn_id, id));
+                }
+            }
+        }
+        Self {
+            state,
+            items: Some(items),
+        }
+    }
+
+    fn contains(&self, witness: &super::async_question::AnswerWitness) -> bool {
+        match &self.items {
+            Some(items) => items.contains(&(
+                witness.answer_turn_id.as_str(),
+                witness.answer_item_id.as_str(),
+            )),
+            None => answer_in_canonical_history(self.state, witness),
+        }
+    }
+}
+
+/// 仅用于本次更新的旧实体定位；重复 ID 或超额时退回原始逐项查找。
+struct OldItemLocation<'a> {
+    turn_id: Option<&'a str>,
+    entity_key: &'a str,
+    index: usize,
+    item: &'a Value,
+}
+struct OldItemIndex<'a> {
+    items: Option<std::collections::HashMap<&'a str, OldItemLocation<'a>>>,
+}
+impl<'a> OldItemIndex<'a> {
+    fn new(state: &'a Value) -> Self {
+        Self::build(state, true)
+    }
+
+    fn current(state: &'a Value) -> Self {
+        Self::build(state, false)
+    }
+
+    fn build(state: &'a Value, #[allow(unused_variables)] is_old: bool) -> Self {
+        const MAX_INDEXED_ITEMS: usize = 4096;
+        let Some(entities) = state
+            .pointer("/turnHistory/history/entitiesByKey")
+            .and_then(Value::as_object)
+        else {
+            return Self { items: None };
+        };
+        let mut indexed = std::collections::HashMap::new();
+        for (key, turn) in entities {
+            let turn_id = turn.get("turnId").and_then(Value::as_str);
+            let Some(items) = turn.get("items").and_then(Value::as_array) else {
+                continue;
+            };
+            for (index, item) in items.iter().enumerate() {
+                #[cfg(test)]
+                if is_old {
+                    OLD_ITEM_VISITS.with(|count| count.set(count.get() + 1));
+                } else {
+                    NEXT_ITEM_VISITS.with(|count| count.set(count.get() + 1));
+                }
+                let Some(id) = item.get("id").and_then(Value::as_str) else {
+                    continue;
+                };
+                if indexed.len() >= MAX_INDEXED_ITEMS || indexed.contains_key(id) {
+                    return Self { items: None };
+                }
+                indexed.insert(
+                    id,
+                    OldItemLocation {
+                        turn_id,
+                        entity_key: key,
+                        index,
+                        item,
+                    },
+                );
+            }
+        }
+        Self {
+            items: Some(indexed),
+        }
+    }
+}
+
+/// 旧 canonical 引用位置索引，保留重复引用和原数组次序；超限回退原遍历。
+struct OldReferenceIndex<'a> {
+    positions: Option<std::collections::HashMap<&'a str, Vec<(usize, usize)>>>,
+}
+impl<'a> OldReferenceIndex<'a> {
+    fn new(state: &'a Value) -> Self {
+        const MAX_INDEXED_REFERENCES: usize = 4096;
+        let Some(history) = state.pointer("/turnHistory/history") else {
+            return Self { positions: None };
+        };
+        let Some(entities) = history.get("entitiesByKey").and_then(Value::as_object) else {
+            return Self { positions: None };
+        };
+        let Some(islands) = history.get("islands").and_then(Value::as_array) else {
+            return Self { positions: None };
+        };
+        let mut positions: std::collections::HashMap<&str, Vec<(usize, usize)>> =
+            std::collections::HashMap::new();
+        let mut visited = 0usize;
+        for (island_index, island) in islands.iter().enumerate() {
+            let Some(entries) = island.get("entries").and_then(Value::as_array) else {
+                continue;
+            };
+            for (entry_index, entry) in entries.iter().enumerate() {
+                #[cfg(test)]
+                OLD_REFERENCE_VISITS.with(|count| count.set(count.get() + 1));
+                if visited == MAX_INDEXED_REFERENCES {
+                    return Self { positions: None };
+                }
+                visited += 1;
+                let Some(turn_id) = entry
+                    .get("value")
+                    .and_then(Value::as_str)
+                    .and_then(|reference| entities.get(reference))
+                    .and_then(|turn| turn.get("turnId"))
+                    .and_then(Value::as_str)
+                else {
+                    continue;
+                };
+                positions
+                    .entry(turn_id)
+                    .or_default()
+                    .push((island_index, entry_index));
+            }
+        }
+        Self {
+            positions: Some(positions),
+        }
+    }
+}
+
 fn complete_history_preserves_prefix(previous: &Value, next: &Value) -> bool {
     if !unambiguous_complete_history(next) {
         return false;
     }
-    let ordered = |state: &Value| -> Option<Vec<Value>> {
+    // 与原顺序对比相同，但直接借用原始条目，避免为每个回合复制正文。
+    fn ordered(state: &Value) -> Option<impl Iterator<Item = Option<&Value>>> {
         let history = state.pointer("/turnHistory/history")?;
         let entities = history.get("entitiesByKey")?.as_object()?;
-        let mut result = Vec::new();
-        for island in history.get("islands")?.as_array()? {
-            for entry in island.get("entries")?.as_array()? {
-                result.push(entities.get(entry.get("value")?.as_str()?)?.clone());
-            }
+        let islands = history.get("islands")?.as_array()?;
+        if islands
+            .iter()
+            .any(|island| island.get("entries").and_then(Value::as_array).is_none())
+        {
+            return None;
         }
-        Some(result)
-    };
-    match (ordered(previous), ordered(next)) {
-        (Some(old), Some(new)) if new.len() >= old.len() => {
-            old.iter()
-                .zip(&new)
-                .enumerate()
-                .all(|(index, (before, after))| {
-                    let (Some(mut a), Some(mut b)) =
-                        (before.as_object().cloned(), after.as_object().cloned())
-                    else {
-                        return false;
-                    };
-                    a.remove("status");
-                    b.remove("status");
-                    a.remove("runtime");
-                    b.remove("runtime");
-                    let (Some(old_items), Some(new_items)) = (a.remove("items"), b.remove("items"))
-                    else {
-                        return false;
-                    };
-                    if a != b {
-                        return false;
-                    }
-                    let (Some(old_items), Some(new_items)) =
-                        (old_items.as_array(), new_items.as_array())
-                    else {
-                        return false;
-                    };
-                    if old_items == new_items {
-                        return true;
-                    }
-                    index + 1 == old.len()
-                        && new_items.starts_with(old_items)
-                        && new_items[old_items.len()..].iter().all(|item| {
-                            item.get("type").and_then(Value::as_str) == Some("userMessage")
-                                && !item
-                                    .to_string()
-                                    .contains(super::async_question::ENVELOPE_OPEN)
-                        })
+        Some(
+            islands
+                .iter()
+                .flat_map(|island| {
+                    island
+                        .get("entries")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
                 })
-        }
-        _ => false,
+                .map(move |entry| entities.get(entry.get("value")?.as_str()?)),
+        )
     }
+    let (Some(old), Some(mut new)) = (ordered(previous), ordered(next)) else {
+        return false;
+    };
+    let mut old = old.peekable();
+    while let Some(before) = old.next() {
+        let (Some(before), Some(Some(after))) = (before, new.next()) else {
+            return false;
+        };
+        let (Some(a), Some(b)) = (before.as_object(), after.as_object()) else {
+            return false;
+        };
+        let retained = |key: &str| !matches!(key, "status" | "runtime" | "items");
+        if a.iter().filter(|(key, _)| retained(key)).count()
+            != b.iter().filter(|(key, _)| retained(key)).count()
+            || a.iter()
+                .filter(|(key, _)| retained(key))
+                .any(|(key, value)| b.get(key) != Some(value))
+        {
+            return false;
+        }
+        let (Some(old_items), Some(new_items)) = (
+            a.get("items").and_then(Value::as_array),
+            b.get("items").and_then(Value::as_array),
+        ) else {
+            return false;
+        };
+        if old_items == new_items {
+            continue;
+        }
+        if old.peek().is_some()
+            || !new_items.starts_with(old_items)
+            || !new_items[old_items.len()..].iter().all(|item| {
+                item.get("type").and_then(Value::as_str) == Some("userMessage")
+                    && !item
+                        .to_string()
+                        .contains(super::async_question::ENVELOPE_OPEN)
+            })
+        {
+            return false;
+        }
+    }
+    // 旧实现即使只比较前缀，也要求新链剩余引用均可解析。
+    new.all(|turn| turn.is_some())
 }
 
 fn explicitly_removes_answer_reference(
     state: &Value,
-    next: &Value,
+    _next: &Value,
     witness: &super::async_question::AnswerWitness,
     patches: &[Value],
+    next_needs_hydration: bool,
+    presence: &CanonicalPresence<'_>,
+    old_references: &OldReferenceIndex<'_>,
 ) -> bool {
-    if HistoryView::new(next).needs_hydration() {
+    if next_needs_hydration {
         return false;
     }
-    if answer_in_canonical_history(next, witness) {
+    if presence.contains(witness) {
         return false;
+    }
+    let touched = |island_index: usize, entry_index: usize| -> bool {
+        let prefix = serde_json::json!([
+            "turnHistory",
+            "history",
+            "islands",
+            island_index,
+            "entries",
+            entry_index
+        ]);
+        let prefix = prefix.as_array().unwrap();
+        if patches.iter().any(|op| {
+            matches!(
+                op.get("op").and_then(Value::as_str),
+                Some("remove" | "replace")
+            ) && op
+                .get("path")
+                .and_then(Value::as_array)
+                .is_some_and(|path| {
+                    path.starts_with(prefix)
+                        || prefix.starts_with(path)
+                        || (op.get("op").and_then(Value::as_str) == Some("remove")
+                            && path.len() == prefix.len()
+                            && path.starts_with(&prefix[..prefix.len() - 1]))
+                })
+        }) {
+            return true;
+        }
+        false
+    };
+    if let Some(positions) = &old_references.positions {
+        #[cfg(test)]
+        OLD_REFERENCE_VISITS.with(|count| count.set(count.get() + 1));
+        return positions
+            .get(witness.answer_turn_id.as_str())
+            .is_some_and(|entries| {
+                entries
+                    .iter()
+                    .any(|(island, entry)| touched(*island, *entry))
+            });
     }
     let Some(history) = state.pointer("/turnHistory/history") else {
         return false;
@@ -404,6 +631,8 @@ fn explicitly_removes_answer_reference(
             continue;
         };
         for (entry_index, entry) in entries.iter().enumerate() {
+            #[cfg(test)]
+            OLD_REFERENCE_VISITS.with(|count| count.set(count.get() + 1));
             let Some(reference) = entry.get("value").and_then(Value::as_str) else {
                 continue;
             };
@@ -411,34 +640,9 @@ fn explicitly_removes_answer_reference(
                 .get(reference)
                 .and_then(|turn| turn.get("turnId"))
                 .and_then(Value::as_str)
-                != Some(witness.answer_turn_id.as_str())
+                == Some(witness.answer_turn_id.as_str())
+                && touched(island_index, entry_index)
             {
-                continue;
-            }
-            let prefix = serde_json::json!([
-                "turnHistory",
-                "history",
-                "islands",
-                island_index,
-                "entries",
-                entry_index
-            ]);
-            let prefix = prefix.as_array().unwrap();
-            if patches.iter().any(|op| {
-                matches!(
-                    op.get("op").and_then(Value::as_str),
-                    Some("remove" | "replace")
-                ) && op
-                    .get("path")
-                    .and_then(Value::as_array)
-                    .is_some_and(|path| {
-                        path.starts_with(prefix)
-                            || prefix.starts_with(path)
-                            || (op.get("op").and_then(Value::as_str) == Some("remove")
-                                && path.len() == prefix.len()
-                                && path.starts_with(&prefix[..prefix.len() - 1]))
-                    })
-            }) {
                 return true;
             }
         }
@@ -447,15 +651,89 @@ fn explicitly_removes_answer_reference(
 }
 
 /// 明确对已定位的正式答复项做删除或改写，才视为永久退役。
+#[allow(clippy::too_many_arguments)]
 fn explicitly_rewrites_answer(
     state: &Value,
     next: &Value,
     witness: &super::async_question::AnswerWitness,
     patches: &[Value],
+    next_needs_hydration: bool,
+    presence: &CanonicalPresence<'_>,
+    old_index: &OldItemIndex<'_>,
+    next_index: Option<&OldItemIndex<'_>>,
 ) -> bool {
     // 项被卸载时即使伴随 remove，也不能证明发生了语义删除。
-    if HistoryView::new(next).needs_hydration() {
+    if next_needs_hydration {
         return false;
+    }
+    let inspect = |key: &str, index: usize, item: &Value| -> Option<bool> {
+        let prefix = serde_json::json!([
+            "turnHistory",
+            "history",
+            "entitiesByKey",
+            key,
+            "items",
+            index
+        ]);
+        let prefix = prefix.as_array().unwrap();
+        let touched = patches.iter().any(|op| {
+            matches!(
+                op.get("op").and_then(Value::as_str),
+                Some("remove" | "replace")
+            ) && op
+                .get("path")
+                .and_then(Value::as_array)
+                .is_some_and(|path| path.starts_with(prefix) || prefix.starts_with(path))
+        });
+        // 数组中的前项可能在同一批中先被删除，使目标项移到较小索引。
+        // 对同一 items 数组的直接删除，结合最终 canonical 项是否消失判定。
+        let array_prefix = &prefix[..prefix.len() - 1];
+        let shifted_removal = !presence.contains(witness)
+            && patches.iter().any(|op| {
+                op.get("op").and_then(Value::as_str) == Some("remove")
+                    && op
+                        .get("path")
+                        .and_then(Value::as_array)
+                        .is_some_and(|path| {
+                            path.len() == prefix.len() && path.starts_with(array_prefix)
+                        })
+            });
+        if touched || shifted_removal {
+            let unchanged = if let Some(Some(items)) = next_index.map(|index| &index.items) {
+                #[cfg(test)]
+                NEXT_ITEM_VISITS.with(|count| count.set(count.get() + 1));
+                item.get("id").and_then(Value::as_str).is_some_and(|id| {
+                    items
+                        .get(id)
+                        .is_some_and(|location| location.entity_key == key && location.item == item)
+                })
+            } else {
+                next.pointer("/turnHistory/history/entitiesByKey")
+                    .and_then(Value::as_object)
+                    .and_then(|entities| entities.get(key))
+                    .and_then(|turn| turn.get("items"))
+                    .and_then(Value::as_array)
+                    .is_some_and(|items| {
+                        items.iter().any(|candidate| {
+                            #[cfg(test)]
+                            NEXT_ITEM_VISITS.with(|count| count.set(count.get() + 1));
+                            candidate == item
+                        })
+                    })
+            };
+            return Some(!unchanged);
+        }
+        None
+    };
+    if let Some(items) = &old_index.items {
+        #[cfg(test)]
+        OLD_ITEM_VISITS.with(|count| count.set(count.get() + 1));
+        return items
+            .get(witness.answer_item_id.as_str())
+            .is_some_and(|location| {
+                location.turn_id == Some(witness.answer_turn_id.as_str())
+                    && inspect(location.entity_key, location.index, location.item).unwrap_or(false)
+            });
     }
     let Some(entities) = state
         .pointer("/turnHistory/history/entitiesByKey")
@@ -471,68 +749,71 @@ fn explicitly_rewrites_answer(
             continue;
         };
         for (index, item) in items.iter().enumerate() {
+            #[cfg(test)]
+            OLD_ITEM_VISITS.with(|count| count.set(count.get() + 1));
             if item.get("id").and_then(Value::as_str) != Some(witness.answer_item_id.as_str()) {
                 continue;
             }
-            let prefix = serde_json::json!([
-                "turnHistory",
-                "history",
-                "entitiesByKey",
-                key,
-                "items",
-                index
-            ]);
-            let prefix = prefix.as_array().unwrap();
-            let touched = patches.iter().any(|op| {
-                matches!(
-                    op.get("op").and_then(Value::as_str),
-                    Some("remove" | "replace")
-                ) && op
-                    .get("path")
-                    .and_then(Value::as_array)
-                    .is_some_and(|path| path.starts_with(prefix) || prefix.starts_with(path))
-            });
-            // 数组中的前项可能在同一批中先被删除，使目标项移到较小索引。
-            // 对同一 items 数组的直接删除，结合最终 canonical 项是否消失判定。
-            let array_prefix = &prefix[..prefix.len() - 1];
-            let shifted_removal = !answer_in_canonical_history(next, witness)
-                && patches.iter().any(|op| {
-                    op.get("op").and_then(Value::as_str) == Some("remove")
-                        && op
-                            .get("path")
-                            .and_then(Value::as_array)
-                            .is_some_and(|path| {
-                                path.len() == prefix.len() && path.starts_with(array_prefix)
-                            })
-                });
-            if touched || shifted_removal {
-                let unchanged = next
-                    .pointer("/turnHistory/history/entitiesByKey")
-                    .and_then(Value::as_object)
-                    .and_then(|entities| entities.get(key))
-                    .and_then(|turn| turn.get("items"))
-                    .and_then(Value::as_array)
-                    .is_some_and(|items| items.iter().any(|candidate| candidate == item));
-                return !unchanged;
+            if let Some(result) = inspect(key, index, item) {
+                return result;
             }
         }
     }
     false
 }
-
 /// 完整历史中明确删除已定位的题目，不能将其视为暂时未加载。
 fn explicitly_removes_question(
     state: &Value,
-    next: &Value,
+    _next: &Value,
     question: &str,
     patches: &[Value],
+    next_needs_hydration: bool,
+    old_index: &OldItemIndex<'_>,
 ) -> bool {
-    if HistoryView::new(next).needs_hydration() {
+    if next_needs_hydration {
         return false;
     }
     let Some((item_id, index)) = super::async_question::parse_question_key(question) else {
         return false;
     };
+    let inspect = |key: &str, item_index: usize| -> bool {
+        let prefix = serde_json::json!([
+            "turnHistory",
+            "history",
+            "entitiesByKey",
+            key,
+            "items",
+            item_index,
+            "questions",
+            index
+        ]);
+        let prefix = prefix.as_array().unwrap();
+        if patches.iter().any(|op| {
+            matches!(
+                op.get("op").and_then(Value::as_str),
+                Some("remove" | "replace")
+            ) && op
+                .get("path")
+                .and_then(Value::as_array)
+                .is_some_and(|path| {
+                    path.starts_with(prefix)
+                        || prefix.starts_with(path)
+                        || (op.get("op").and_then(Value::as_str) == Some("remove")
+                            && path.len() == prefix.len()
+                            && path.starts_with(&prefix[..prefix.len() - 1]))
+                })
+        }) {
+            return true;
+        }
+        false
+    };
+    if let Some(items) = &old_index.items {
+        #[cfg(test)]
+        OLD_ITEM_VISITS.with(|count| count.set(count.get() + 1));
+        return items
+            .get(item_id.as_str())
+            .is_some_and(|location| inspect(location.entity_key, location.index));
+    }
     let Some(entities) = state
         .pointer("/turnHistory/history/entitiesByKey")
         .and_then(Value::as_object)
@@ -544,35 +825,11 @@ fn explicitly_removes_question(
             continue;
         };
         for (item_index, item) in items.iter().enumerate() {
-            if item.get("id").and_then(Value::as_str) != Some(item_id.as_str()) {
-                continue;
-            }
-            let prefix = serde_json::json!([
-                "turnHistory",
-                "history",
-                "entitiesByKey",
-                key,
-                "items",
-                item_index,
-                "questions",
-                index
-            ]);
-            let prefix = prefix.as_array().unwrap();
-            if patches.iter().any(|op| {
-                matches!(
-                    op.get("op").and_then(Value::as_str),
-                    Some("remove" | "replace")
-                ) && op
-                    .get("path")
-                    .and_then(Value::as_array)
-                    .is_some_and(|path| {
-                        path.starts_with(prefix)
-                            || prefix.starts_with(path)
-                            || (op.get("op").and_then(Value::as_str) == Some("remove")
-                                && path.len() == prefix.len()
-                                && path.starts_with(&prefix[..prefix.len() - 1]))
-                    })
-            }) {
+            #[cfg(test)]
+            OLD_ITEM_VISITS.with(|count| count.set(count.get() + 1));
+            if item.get("id").and_then(Value::as_str) == Some(item_id.as_str())
+                && inspect(key, item_index)
+            {
                 return true;
             }
         }
@@ -683,12 +940,13 @@ impl ThreadMirror {
 
     /// T03：运行的只读预览（供 adapter 在**同一临界区内**求值策略，不重建投影）。
     pub fn operation_preview(&self) -> (String, bool) {
-        let state = self.state.clone().unwrap_or(Value::Null);
+        let empty = Value::Null;
+        let state = self.state.as_ref().unwrap_or(&empty);
         let pending = state
             .get("requests")
             .and_then(Value::as_array)
             .is_some_and(|requests| !requests.is_empty());
-        (runtime_status(&state), pending)
+        (runtime_status(state), pending)
     }
 
     pub fn set_approval_policy(&mut self, policy: Option<PendingDecisionPolicy>) {
@@ -710,7 +968,7 @@ impl ThreadMirror {
 
     /// 只在整批状态采用之后登记证明；缺页不构成来源退役。
     fn update_answer_validity(
-        &mut self,
+        &self,
         previous: Option<&Value>,
         next: &Value,
         patches: &[Value],
@@ -724,7 +982,20 @@ impl ThreadMirror {
             .map(|s| super::async_question::answer_witnesses(&self.key.thread_id, s))
             .unwrap_or_default();
         let dependencies = question_dependencies(next);
-        if snapshot && unambiguous_complete_history(next) {
+        let next_needs_hydration = HistoryView::new(next).needs_hydration();
+        // 已在入口完成 unambiguous_loaded_history，避免再次扫描身份。
+        let next_complete = !next_needs_hydration;
+        let presence = CanonicalPresence::new(next);
+        let previous_complete = previous.is_some_and(unambiguous_complete_history);
+        let old_index = previous.map(OldItemIndex::new);
+        let next_index = old
+            .iter()
+            .any(|(question, witness)| {
+                dependencies.contains_key(question) && current.get(question) != Some(witness)
+            })
+            .then(|| OldItemIndex::current(next));
+        let old_references = previous.map(OldReferenceIndex::new);
+        if snapshot && next_complete {
             for (question, witness) in self.answer_validity.witnesses_for_thread(&self.key) {
                 if !dependencies.contains_key(&question) {
                     self.answer_validity
@@ -735,24 +1006,40 @@ impl ThreadMirror {
         if let Some(state) = previous {
             let old_dependencies = question_dependencies(state);
             for (question, witness) in &old {
-                let removed_reference =
-                    old_dependencies.get(question).is_some_and(|(turn_id, _)| {
+                if dependencies.contains_key(question) {
+                    continue;
+                }
+                let removed_question = explicitly_removes_question(
+                    state,
+                    next,
+                    question,
+                    patches,
+                    next_needs_hydration,
+                    old_index.as_ref().expect("previous state has index"),
+                );
+                let removed_reference = !removed_question
+                    && old_dependencies.get(question).is_some_and(|(turn_id, _)| {
                         let Some((item_id, _)) =
                             super::async_question::parse_question_key(question)
                         else {
                             return false;
                         };
                         let mut question_source = witness.clone();
-                        question_source.answer_turn_id = turn_id.clone();
+                        question_source.answer_turn_id = (*turn_id).to_owned();
                         question_source.answer_item_id = item_id;
-                        explicitly_removes_answer_reference(state, next, &question_source, patches)
+                        explicitly_removes_answer_reference(
+                            state,
+                            next,
+                            &question_source,
+                            patches,
+                            next_needs_hydration,
+                            &presence,
+                            old_references
+                                .as_ref()
+                                .expect("previous state has reference index"),
+                        )
                     });
-                if !dependencies.contains_key(question)
-                    && (explicitly_removes_question(state, next, question, patches)
-                        || removed_reference
-                        || (unambiguous_complete_history(state)
-                            && unambiguous_complete_history(next)))
-                {
+                if removed_question || removed_reference || (previous_complete && next_complete) {
                     self.answer_validity.apply(
                         &self.key,
                         question,
@@ -769,9 +1056,9 @@ impl ThreadMirror {
                 .map(|byte| format!("{byte:02x}"))
                 .collect::<String>();
             let candidate = current.get(question);
-            if snapshot && candidate.is_none() && unambiguous_complete_history(next) {
+            if snapshot && candidate.is_none() && next_complete {
                 if let Some(observed) = self.answer_validity.current_witness(&self.key, question) {
-                    if !answer_in_canonical_history(next, &observed) {
+                    if !presence.contains(&observed) {
                         self.answer_validity
                             .retire_if_observed(&self.key, question, &observed);
                     }
@@ -779,15 +1066,31 @@ impl ThreadMirror {
             }
             let mut retired = Vec::new();
             if let (Some(state), Some(witness)) = (previous, old.get(question)) {
-                if (current.get(question) != Some(witness)
-                    && explicitly_rewrites_answer(state, next, witness, patches))
-                    || explicitly_removes_answer_reference(state, next, witness, patches)
-                    || current.get(question).is_some_and(|candidate| {
+                // 当前严格 witness 完全一致时，答复必在 canonical 引用链上，
+                // 无需逐题再次扫描；账本仍逐题重新核对。
+                if candidate != Some(witness)
+                    && (explicitly_rewrites_answer(
+                        state,
+                        next,
+                        witness,
+                        patches,
+                        next_needs_hydration,
+                        &presence,
+                        old_index.as_ref().expect("previous state has index"),
+                        next_index.as_ref(),
+                    ) || explicitly_removes_answer_reference(
+                        state,
+                        next,
+                        witness,
+                        patches,
+                        next_needs_hydration,
+                        &presence,
+                        old_references
+                            .as_ref()
+                            .expect("previous state has reference index"),
+                    ) || candidate.is_some_and(|candidate| {
                         candidate.answer_item_id == witness.answer_item_id && candidate != witness
-                    })
-                    || (unambiguous_complete_history(state)
-                        && unambiguous_complete_history(next)
-                        && !answer_in_canonical_history(next, witness))
+                    }) || (previous_complete && next_complete && !presence.contains(witness)))
                 {
                     retired.push(witness.answer_item_id.clone());
                 }
@@ -1135,10 +1438,10 @@ impl ThreadMirror {
             .cloned()
             .unwrap_or(Value::Null);
         self.revoke_hint_scope();
-        let previous = self.state.clone();
-        self.adopt(rev, state.clone())?;
-        self.update_answer_validity(previous.as_ref(), &state, &[], true);
-        self.complete_rebuild = unambiguous_complete_history(&state);
+        let previous = self.adopt(rev, state)?;
+        let state = self.state.as_ref().expect("adopted snapshot");
+        self.update_answer_validity(previous.as_ref(), state, &[], true);
+        self.complete_rebuild = unambiguous_complete_history(state);
         self.install_hint_scope();
         // 镜像重建代：只在新 snapshot 装订成功时递增（patch 是增量，不动它）。
         self.build_generation = self.build_generation.saturating_add(1);
@@ -1182,15 +1485,15 @@ impl ThreadMirror {
             });
         }
         // 原子应用：clone 上逐条 op，任一失败整批作废
-        let Some(state) = self.state.clone() else {
+        #[cfg(test)]
+        FULL_STATE_CLONES.with(|count| count.set(count.get() + usize::from(self.state.is_some())));
+        let Some(mut next) = self.state.clone() else {
             self.mark_stale();
             return Ok(MirrorEffect {
                 changed: false,
                 need_snapshot: true,
             });
         };
-        let previous = state.clone();
-        let mut next = state;
         for op in &patches {
             if apply_op(&mut next, op).is_err() {
                 self.mark_stale();
@@ -1203,11 +1506,12 @@ impl ThreadMirror {
         // 2026-10-18 形态适配：完整性从**新 state** 派生（snapshot/patch 同一判定
         // 单点），不再沿用上一状态的缓存 bool
         let recovering = self.stale;
-        self.adopt(rev, next.clone())?;
-        self.update_answer_validity(Some(&previous), &next, &patches, false);
+        let previous = self.adopt(rev, next)?.expect("patch has previous state");
+        let next = self.state.as_ref().expect("adopted patch");
+        self.update_answer_validity(Some(&previous), next, &patches, false);
         self.complete_rebuild = self.complete_rebuild
             && (previous.get("turnHistory") == next.get("turnHistory")
-                || complete_history_preserves_prefix(&previous, &next));
+                || complete_history_preserves_prefix(&previous, next));
         if recovering {
             self.install_hint_scope();
         }
@@ -1221,7 +1525,7 @@ impl ThreadMirror {
     /// 不冒充无 owner）。完整性在此**单点派生**：`turnHistory.history.isComplete ===
     /// true` 才算 Turn 列表完整（真机形态在 history 层；缺字段 ≠ 完整——hydrate
     /// 触发判据不能缺省当完整）。
-    fn adopt(&mut self, rev: u64, state: Value) -> Result<(), ProtocolError> {
+    fn adopt(&mut self, rev: u64, state: Value) -> Result<Option<Value>, ProtocolError> {
         let size = serde_json::to_vec(&state)
             .map(|b| b.len())
             .unwrap_or(usize::MAX);
@@ -1250,9 +1554,9 @@ impl ThreadMirror {
         self.size = size;
         self.revision = Some(rev);
         self.history_complete = HistoryView::new(&state).turn_list_complete();
-        self.state = Some(state);
+        let previous = self.state.replace(state);
         self.stale = false;
-        Ok(())
+        Ok(previous)
     }
 
     /// 统一状态投影（远程 API / SSE / 移动端唯一消费形态）。
@@ -1264,6 +1568,29 @@ impl ThreadMirror {
     /// 被裁掉的前缀长度）：客户端用它 + 尾窗最早一条作为第一次更早分页的入参。
     /// 尾窗前移本身不换 token（R2）。
     pub fn project(&self, caps: CapabilitySet) -> ThreadProjection {
+        self.project_internal(caps, None)
+    }
+
+    /// 投影与其同次内容证明一并返回，供持镜像锁的观察路径立即使用。
+    pub(crate) fn project_with_witnesses(
+        &self,
+        caps: CapabilitySet,
+    ) -> (
+        ThreadProjection,
+        std::collections::HashMap<String, super::async_question::AnswerWitness>,
+    ) {
+        let mut witnesses = std::collections::HashMap::new();
+        let projection = self.project_internal(caps, Some(&mut witnesses));
+        (projection, witnesses)
+    }
+
+    fn project_internal(
+        &self,
+        caps: CapabilitySet,
+        witness_out: Option<
+            &mut std::collections::HashMap<String, super::async_question::AnswerWitness>,
+        >,
+    ) -> ThreadProjection {
         // 兼容：未由 adapter 盖过逐操作事实（`unknown()`）时，按 caps/策略推导，
         // 使历史直投影路径与生产投影一致（生产投影总会先 set_effective_operations）。
         // `&self`：只在投影内用局部变量，不回写（回写需 &mut，会破坏调用方借用）。
@@ -1278,7 +1605,7 @@ impl ThreadMirror {
         let compat = needs_compat.then(|| {
             crate::services::codex_desktop_ipc::pending::compat_operations(&caps, &policy)
         });
-        self.project_inner(caps, &policy, compat)
+        self.project_inner(caps, &policy, compat, witness_out)
     }
 
     /// 同上，但**显式**指定审批策略（adapter 在 respond 路径上直接用当前生效策略，
@@ -1288,7 +1615,7 @@ impl ThreadMirror {
         caps: CapabilitySet,
         policy: &PendingDecisionPolicy,
     ) -> ThreadProjection {
-        self.project_inner(caps, policy, None)
+        self.project_inner(caps, policy, None, None)
     }
 
     /// 内部：可覆盖逐操作事实（compat 路径用；生产投影由 adapter 预先 set）。
@@ -1299,14 +1626,18 @@ impl ThreadMirror {
         operations_override: Option<
             crate::services::codex_desktop_ipc::capability::EffectiveOperations,
         >,
+        witness_out: Option<
+            &mut std::collections::HashMap<String, super::async_question::AnswerWitness>,
+        >,
     ) -> ThreadProjection {
         // R1：state 即 conversationState 本体，按根直读
-        let state = self.state.clone().unwrap_or(Value::Null);
-        let mut all = project_full_messages(&state);
+        let empty = Value::Null;
+        let state = self.state.as_ref().unwrap_or(&empty);
+        let mut all = project_full_messages(state);
         // T03：正式答复在**同一份 canonical 投影**上标注（current 与历史分页同源）；
         // 元数据计入尾窗预算（先标注、后裁剪）。
         crate::services::codex_desktop_ipc::async_question::annotate_interaction_answers(
-            &mut all, &state,
+            &mut all, state,
         );
         // 已结算内容观察与投影共用同一次完整 canonical 投影（不额外投影）。
         let content_epoch = self.observe_content(&all);
@@ -1329,22 +1660,25 @@ impl ThreadMirror {
             policy,
             &effective_operations,
             &self.key.thread_id,
-            &state,
+            state,
         );
+        let witness_analysis =
+            super::async_question::analyze_answer_witnesses(&self.key.thread_id, state);
         let mut async_questions =
             crate::services::codex_desktop_ipc::async_question::AsyncQuestionProjector
-                .project_with_hints(
+                .project_with_hints_and_analysis(
                     &self.key,
                     self.lease.as_ref(),
-                    &state,
+                    state,
                     &effective_operations,
                     self.interaction_hints
                         .as_deref()
                         .map(Vec::as_slice)
                         .unwrap_or(&[]),
+                    &witness_analysis,
                 );
-        let current_witnesses =
-            super::async_question::answer_witnesses(&self.key.thread_id, &state);
+        let empty_witnesses = std::collections::HashMap::new();
+        let current_witnesses = witness_analysis.as_ref().unwrap_or(&empty_witnesses);
         for question in &mut async_questions {
             let candidate_blocked =
                 current_witnesses
@@ -1377,13 +1711,16 @@ impl ThreadMirror {
                     Some(super::reason_code::ASYNC_HISTORY_INCOMPLETE.to_string());
             }
         }
+        if let Some(out) = witness_out {
+            *out = witness_analysis.unwrap_or_default();
+        }
         ThreadProjection {
             thread_id: self.key.thread_id.clone(),
             revision: self.revision,
             stale: self.stale,
             availability: availability_of(&caps),
             capabilities: caps,
-            runtime_status: runtime_status(&state),
+            runtime_status: runtime_status(state),
             content_state,
             truncated,
             messages,
@@ -2572,6 +2909,522 @@ mod tests {
 
     fn b1_replay_patch(mirror: &mut ThreadMirror, revision: u64, patches: Value) {
         mirror.apply(&lease(), &serde_json::json!({"type":"patches","baseRevision":revision - 1,"revision":revision,"patches":patches})).unwrap();
+    }
+
+    #[test]
+    fn b1_question_dependencies_borrow_original_history() {
+        let state = b1_replay_mirror().observation_state().unwrap().clone();
+        let dependencies = question_dependencies(&state);
+        let key = super::super::async_question::question_item_id("call-1", 0);
+        let analyzed = dependencies[&key].1.as_object().unwrap();
+        let original = state["turnHistory"]["history"]["entitiesByKey"]["turn:q"]["items"][0]
+            ["questions"][0]
+            .as_object()
+            .unwrap();
+        assert!(
+            std::ptr::eq(analyzed, original),
+            "dependency analysis must not clone question content"
+        );
+        let (turn, question) = dependencies[&key];
+        let borrowed_bytes = serde_json::to_vec(&(turn, question)).unwrap();
+        let owned_bytes = serde_json::to_vec(&(turn.to_owned(), question.clone())).unwrap();
+        assert_eq!(
+            borrowed_bytes, owned_bytes,
+            "witness dependency digest encoding must remain identical"
+        );
+    }
+
+    #[test]
+    fn b1_mirror_validity_history_passes_do_not_scale_with_question_count() {
+        let mut state = b1_replay_mirror().observation_state().unwrap().clone();
+        let questions = state["turnHistory"]["history"]["entitiesByKey"]["turn:q"]["items"]
+            .as_array_mut()
+            .unwrap();
+        questions.clear();
+        for index in 0..32 {
+            questions.push(serde_json::json!({"type":"agentMessage","id":format!("q-{index}"),"questions":[{"title":"Q"}]}));
+        }
+        state["turnHistory"]["history"]["entitiesByKey"]["turn:a"]["items"] = serde_json::json!([]);
+        let mut mirror = ThreadMirror::new(key());
+        COMPLETE_HISTORY_SCANS.with(|count| count.set(0));
+        mirror
+            .apply(
+                &lease(),
+                &serde_json::json!({"type":"snapshot","revision":1,"conversationState":state}),
+            )
+            .unwrap();
+        let scans = COMPLETE_HISTORY_SCANS.with(|count| count.get());
+        assert!(
+            scans <= 3,
+            "mirror rescans complete history per question: {scans}"
+        );
+    }
+
+    #[test]
+    fn b1_mirror_answer_lookup_does_not_rescan_per_question() {
+        let mut state = b1_replay_mirror().observation_state().unwrap().clone();
+        let questions = state["turnHistory"]["history"]["entitiesByKey"]["turn:q"]["items"]
+            .as_array_mut()
+            .unwrap();
+        questions.clear();
+        for index in 0..32 {
+            questions.push(serde_json::json!({"type":"agentMessage","id":format!("call-{index}"),"questions":[{"title":"Q"}]}));
+        }
+        let answers = state["turnHistory"]["history"]["entitiesByKey"]["turn:a"]["items"]
+            .as_array_mut()
+            .unwrap();
+        answers.clear();
+        for index in 0..32 {
+            let question =
+                serde_json::json!(["request_user_input_async", format!("call-{index}"), 0])
+                    .to_string();
+            let text = format!("<send_user_message_question_reply>\n[{{\"questionItemId\":{},\"question\":\"Q\",\"answer\":\"A\"}}]\n</send_user_message_question_reply>", serde_json::to_string(&question).unwrap());
+            answers.push(serde_json::json!({"type":"userMessage","id":format!("answer-{index}"),"content":[{"type":"text","text":text}]}));
+        }
+        let mirror = ThreadMirror::new(key());
+        mirror.update_answer_validity(None, &state, &[], true);
+        assert_eq!(
+            super::super::async_question::answer_witnesses(&key().thread_id, &state).len(),
+            32
+        );
+        ANSWER_LOOKUP_SCANS.with(|count| count.set(0));
+        mirror.update_answer_validity(Some(&state), &state, &[], false);
+        let scans = ANSWER_LOOKUP_SCANS.with(|count| count.get());
+        assert!(
+            scans <= 1,
+            "answer lookups rescan canonical history per question: {scans}"
+        );
+        let mut rewritten = state.clone();
+        let mut patches = Vec::new();
+        for index in 0..32 {
+            let text = rewritten["turnHistory"]["history"]["entitiesByKey"]["turn:a"]["items"]
+                [index]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .replace("\"answer\":\"A\"", "\"answer\":\"B\"");
+            rewritten["turnHistory"]["history"]["entitiesByKey"]["turn:a"]["items"][index]
+                ["content"][0]["text"] = text.clone().into();
+            patches.push(serde_json::json!({"op":"replace","path":["turnHistory","history","entitiesByKey","turn:a","items",index,"content",0,"text"],"value":text}));
+        }
+        ANSWER_LOOKUP_SCANS.with(|count| count.set(0));
+        OLD_ITEM_VISITS.with(|count| count.set(0));
+        NEXT_ITEM_VISITS.with(|count| count.set(0));
+        mirror.update_answer_validity(Some(&state), &rewritten, &patches, false);
+        let scans = ANSWER_LOOKUP_SCANS.with(|count| count.get());
+        assert!(
+            scans <= 1,
+            "rewritten answers rescan canonical history per question: {scans}"
+        );
+        let old_visits = OLD_ITEM_VISITS.with(|count| count.get());
+        assert!(
+            old_visits <= 128,
+            "old items revisited per rewritten question: {old_visits}"
+        );
+        let next_visits = NEXT_ITEM_VISITS.with(|count| count.get());
+        assert!(
+            next_visits <= 128,
+            "new items revisited per rewritten question: {next_visits}"
+        );
+        for index in 0..32 {
+            let question =
+                super::super::async_question::question_item_id(&format!("call-{index}"), 0);
+            assert!(!mirror.answer_validity.allows_candidate(
+                &key(),
+                &question,
+                &format!("answer-{index}")
+            ));
+        }
+        let deleted_mirror = ThreadMirror::new(key());
+        deleted_mirror.update_answer_validity(None, &state, &[], true);
+        let mut deleted = state.clone();
+        deleted["turnHistory"]["history"]["entitiesByKey"]["turn:q"]["items"] =
+            serde_json::json!([]);
+        let deletion = vec![
+            serde_json::json!({"op":"replace","path":["turnHistory","history","entitiesByKey","turn:q","items"],"value":[]}),
+        ];
+        OLD_ITEM_VISITS.with(|count| count.set(0));
+        deleted_mirror.update_answer_validity(Some(&state), &deleted, &deletion, false);
+        let old_visits = OLD_ITEM_VISITS.with(|count| count.get());
+        assert!(
+            old_visits <= 128,
+            "old question items revisited per deletion: {old_visits}"
+        );
+        for index in 0..32 {
+            let question =
+                super::super::async_question::question_item_id(&format!("call-{index}"), 0);
+            assert!(!deleted_mirror.answer_validity.allows_candidate(
+                &key(),
+                &question,
+                &format!("answer-{index}")
+            ));
+        }
+        let mut ref_source = state.clone();
+        for index in 0..128 {
+            let reference = format!("old-{index}");
+            ref_source["turnHistory"]["history"]["entitiesByKey"][&reference] =
+                serde_json::json!({"turnId":reference,"items":[]});
+            ref_source["turnHistory"]["history"]["islands"][0]["entries"]
+                .as_array_mut()
+                .unwrap()
+                .insert(0, serde_json::json!({"value":reference}));
+        }
+        let ref_mirror = ThreadMirror::new(key());
+        ref_mirror.update_answer_validity(None, &ref_source, &[], true);
+        let mut ref_deleted = ref_source.clone();
+        ref_deleted["turnHistory"]["history"]["islands"][0]["entries"]
+            .as_array_mut()
+            .unwrap()
+            .remove(128);
+        let ref_patch = vec![
+            serde_json::json!({"op":"remove","path":["turnHistory","history","islands",0,"entries",128]}),
+        ];
+        OLD_REFERENCE_VISITS.with(|count| count.set(0));
+        ref_mirror.update_answer_validity(Some(&ref_source), &ref_deleted, &ref_patch, false);
+        let ref_visits = OLD_REFERENCE_VISITS.with(|count| count.get());
+        assert!(
+            ref_visits <= 256,
+            "old references revisited per deleted question: {ref_visits}"
+        );
+        for index in 0..32 {
+            let question =
+                super::super::async_question::question_item_id(&format!("call-{index}"), 0);
+            assert!(!ref_mirror.answer_validity.allows_candidate(
+                &key(),
+                &question,
+                &format!("answer-{index}")
+            ));
+        }
+    }
+
+    #[test]
+    fn b1_old_item_index_matches_fallback_on_ambiguous_and_large_history() {
+        let original = b1_replay_mirror().observation_state().unwrap().clone();
+        let question = super::super::async_question::question_item_id("call-1", 0);
+        let witness = super::super::async_question::answer_witnesses(&key().thread_id, &original)
+            [&question]
+            .clone();
+        let mut next = original.clone();
+        next["turnHistory"]["history"]["entitiesByKey"]["turn:a"]["items"][0]["content"][0]
+            ["text"] = b1_replay_envelope("B").into();
+        let patches = vec![
+            serde_json::json!({"op":"replace","path":["turnHistory","history","entitiesByKey","turn:a","items",0,"content",0,"text"]}),
+        ];
+        let presence = CanonicalPresence::new(&next);
+        let fallback = OldItemIndex { items: None };
+        let inspect = |old: &Value, index: &OldItemIndex<'_>| {
+            explicitly_rewrites_answer(
+                old, &next, &witness, &patches, false, &presence, index, None,
+            )
+        };
+        let index = OldItemIndex::new(&original);
+        assert!(index.items.is_some());
+        assert!(inspect(&original, &index));
+        assert_eq!(inspect(&original, &index), inspect(&original, &fallback));
+
+        let mut ambiguous = original.clone();
+        ambiguous["turnHistory"]["history"]["entitiesByKey"]["unreferenced"] =
+            serde_json::json!({"items":[{"id":"answer-1"}]});
+        let index = OldItemIndex::new(&ambiguous);
+        assert!(
+            index.items.is_none(),
+            "an unreferenced duplicate must force fallback"
+        );
+        assert_eq!(inspect(&ambiguous, &index), inspect(&ambiguous, &fallback));
+
+        let mut missing_turn = original.clone();
+        missing_turn["turnHistory"]["history"]["entitiesByKey"]["turn:a"]
+            .as_object_mut()
+            .unwrap()
+            .remove("turnId");
+        let index = OldItemIndex::new(&missing_turn);
+        assert!(index.items.is_some());
+        assert!(!inspect(&missing_turn, &index));
+        assert_eq!(
+            inspect(&missing_turn, &index),
+            inspect(&missing_turn, &fallback)
+        );
+
+        let mut large = original.clone();
+        let items = large["turnHistory"]["history"]["entitiesByKey"]["turn:a"]["items"]
+            .as_array_mut()
+            .unwrap();
+        for index in 0..4096 {
+            items.push(serde_json::json!({"id":format!("extra-{index}")}));
+        }
+        let index = OldItemIndex::new(&large);
+        assert!(
+            index.items.is_none(),
+            "exceeding the index budget must force fallback"
+        );
+        assert_eq!(inspect(&large, &index), inspect(&large, &fallback));
+
+        let question_patches = vec![
+            serde_json::json!({"op":"remove","path":["turnHistory","history","entitiesByKey","turn:q","items",0,"questions",0]}),
+        ];
+        let inspect_question = |old: &Value, index: &OldItemIndex<'_>| {
+            explicitly_removes_question(old, &next, &question, &question_patches, false, index)
+        };
+        for old in [&original, &ambiguous, &missing_turn, &large] {
+            let index = OldItemIndex::new(old);
+            assert!(inspect_question(old, &index));
+            assert_eq!(
+                inspect_question(old, &index),
+                inspect_question(old, &fallback)
+            );
+        }
+        let mut duplicate_question = original.clone();
+        duplicate_question["turnHistory"]["history"]["entitiesByKey"]["unreferenced"] =
+            serde_json::json!({"items":[{"id":"call-1"}]});
+        let index = OldItemIndex::new(&duplicate_question);
+        assert!(index.items.is_none());
+        assert!(inspect_question(&duplicate_question, &index));
+        assert_eq!(
+            inspect_question(&duplicate_question, &index),
+            inspect_question(&duplicate_question, &fallback)
+        );
+
+        let check_next = |candidate: &Value| {
+            let next_index = OldItemIndex::current(candidate);
+            let presence = CanonicalPresence::new(candidate);
+            let old_index = OldItemIndex::new(&original);
+            let indexed = explicitly_rewrites_answer(
+                &original,
+                candidate,
+                &witness,
+                &patches,
+                false,
+                &presence,
+                &old_index,
+                Some(&next_index),
+            );
+            let linear = explicitly_rewrites_answer(
+                &original, candidate, &witness, &patches, false, &presence, &old_index, None,
+            );
+            assert_eq!(indexed, linear);
+        };
+        check_next(&original);
+        check_next(&next);
+        let mut moved = next.clone();
+        let answer = moved["turnHistory"]["history"]["entitiesByKey"]["turn:a"]["items"]
+            .as_array_mut()
+            .unwrap()
+            .remove(0);
+        moved["turnHistory"]["history"]["entitiesByKey"]["unreferenced"] =
+            serde_json::json!({"items":[answer]});
+        check_next(&moved);
+        let mut duplicate = original.clone();
+        duplicate["turnHistory"]["history"]["entitiesByKey"]["unreferenced"] =
+            serde_json::json!({"items":[{"id":"answer-1"}]});
+        assert!(OldItemIndex::current(&duplicate).items.is_none());
+        check_next(&duplicate);
+        let mut oversized = next.clone();
+        let items = oversized["turnHistory"]["history"]["entitiesByKey"]["turn:a"]["items"]
+            .as_array_mut()
+            .unwrap();
+        for index in 0..4096 {
+            items.push(serde_json::json!({"id":format!("extra-next-{index}")}));
+        }
+        assert!(OldItemIndex::current(&oversized).items.is_none());
+        check_next(&oversized);
+    }
+
+    #[test]
+    fn b1_old_reference_index_matches_fallback_with_duplicates_and_budget() {
+        let mut old = b1_replay_mirror().observation_state().unwrap().clone();
+        old["turnHistory"]["history"]["entitiesByKey"]["shadow"] =
+            serde_json::json!({"turnId":"q","items":[]});
+        let entries = old["turnHistory"]["history"]["islands"][0]["entries"]
+            .as_array_mut()
+            .unwrap();
+        entries.push(serde_json::json!({"value":"turn:q"}));
+        entries.push(serde_json::json!({"value":"shadow"}));
+        entries.push(serde_json::json!({"value":"missing"}));
+        entries.push(serde_json::json!({"value":123}));
+        let mut next = old.clone();
+        next["turnHistory"]["history"]["islands"][0]["entries"] =
+            serde_json::json!([{"value":"turn:a"}]);
+        let witness = super::super::async_question::AnswerWitness {
+            proof_version: 1,
+            answer_turn_id: "q".into(),
+            answer_item_id: "call-1".into(),
+            answer_digest: String::new(),
+        };
+        let patch = vec![
+            serde_json::json!({"op":"remove","path":["turnHistory","history","islands",0,"entries",2]}),
+        ];
+        let presence = CanonicalPresence::new(&next);
+        let fallback = OldReferenceIndex { positions: None };
+        let check = |state: &Value, index: &OldReferenceIndex<'_>| {
+            explicitly_removes_answer_reference(
+                state, &next, &witness, &patch, false, &presence, index,
+            )
+        };
+        let indexed = OldReferenceIndex::new(&old);
+        assert_eq!(indexed.positions.as_ref().unwrap()["q"].len(), 3);
+        assert!(check(&old, &indexed));
+        assert_eq!(check(&old, &indexed), check(&old, &fallback));
+        let entries = old["turnHistory"]["history"]["islands"][0]["entries"]
+            .as_array_mut()
+            .unwrap();
+        for _ in 0..4096 {
+            entries.push(serde_json::json!({"value":"turn:q"}));
+        }
+        let indexed = OldReferenceIndex::new(&old);
+        assert!(indexed.positions.is_none());
+        assert_eq!(check(&old, &indexed), check(&old, &fallback));
+    }
+
+    #[test]
+    fn b1_canonical_presence_budget_falls_back_to_exact_lookup() {
+        let mut state = b1_replay_mirror().observation_state().unwrap().clone();
+        let items = state["turnHistory"]["history"]["entitiesByKey"]["turn:a"]["items"]
+            .as_array_mut()
+            .unwrap();
+        items.clear();
+        for index in 0..4096 {
+            items.push(
+                serde_json::json!({"type":"userMessage","id":format!("item-{index}"),"content":[]}),
+            );
+        }
+        let witness = super::super::async_question::AnswerWitness {
+            proof_version: 1,
+            answer_turn_id: "a".into(),
+            answer_item_id: "item-4095".into(),
+            answer_digest: String::new(),
+        };
+        // 题目回合也占一个索引项，刚好触发有界退路。
+        let presence = CanonicalPresence::new(&state);
+        assert!(presence.items.is_none());
+        assert!(presence.contains(&witness));
+        let absent = super::super::async_question::AnswerWitness {
+            answer_item_id: "missing".into(),
+            ..witness
+        };
+        assert!(!presence.contains(&absent));
+    }
+
+    #[test]
+    fn b1_projection_reuses_strict_witness_analysis() {
+        use super::super::async_question::{InteractionState, WITNESS_ANALYSIS_PASSES};
+        let mirror = b1_replay_mirror();
+        WITNESS_ANALYSIS_PASSES.with(|count| count.set(0));
+        let projection = mirror.project(caps());
+        assert_eq!(
+            projection.async_questions[0].state,
+            InteractionState::Answered
+        );
+        let passes = WITNESS_ANALYSIS_PASSES.with(|count| count.get());
+        assert_eq!(passes, 1, "projection should share strict witness analysis");
+        let question = super::super::async_question::question_item_id("call-1", 0);
+        let witness = mirror
+            .answer_validity
+            .current_witness(&key(), &question)
+            .unwrap();
+        assert!(mirror
+            .answer_validity
+            .retire_if_observed(&key(), &question, &witness));
+        assert_eq!(
+            mirror.project(caps()).async_questions[0].state,
+            InteractionState::Unknown
+        );
+        assert_eq!(
+            WITNESS_ANALYSIS_PASSES.with(|count| count.get()),
+            2,
+            "each projection must reanalyze and recheck retirement"
+        );
+    }
+
+    #[test]
+    fn b1_patch_and_projection_do_not_clone_full_history_repeatedly() {
+        let mut mirror = b1_replay_mirror();
+        FULL_STATE_CLONES.with(|count| count.set(0));
+        b1_replay_patch(&mut mirror, 2, serde_json::json!([]));
+        let patch_clones = FULL_STATE_CLONES.with(|count| count.get());
+        assert_eq!(patch_clones, 1, "one atomic patch copy is sufficient");
+        FULL_STATE_CLONES.with(|count| count.set(0));
+        let projected = mirror.project(caps());
+        assert_eq!(projected.async_questions.len(), 1);
+        let projection_clones = FULL_STATE_CLONES.with(|count| count.get());
+        assert_eq!(
+            projection_clones, 0,
+            "read-only projection should borrow history"
+        );
+    }
+
+    #[test]
+    fn b1_prefix_validation_does_not_clone_full_turns() {
+        let mut mirror = b1_replay_mirror();
+        FULL_TURN_CLONES.with(|count| count.set(0));
+        b1_replay_patch(
+            &mut mirror,
+            2,
+            serde_json::json!([
+                {"op":"add","path":["turnHistory","history","entitiesByKey","turn:a","items",1],
+                 "value":{"type":"userMessage","id":"unrelated","content":[{"type":"text","text":"hello"}]}}
+            ]),
+        );
+        let clones = FULL_TURN_CLONES.with(|count| count.get());
+        assert_eq!(clones, 0, "prefix comparison must borrow turn contents");
+        assert_eq!(
+            mirror.project(caps()).async_questions[0].state,
+            super::super::async_question::InteractionState::Answered
+        );
+    }
+
+    #[test]
+    fn b1_large_history_snapshot_patch_and_projection_measurement() {
+        use super::super::async_question::InteractionState;
+        use std::time::Instant;
+        for history_bytes in [128 * 1024, 15 * 1024 * 1024] {
+            for question_count in [1usize, 32, 256, 512] {
+                let mut state = b1_replay_mirror().observation_state().unwrap().clone();
+                let questions = state["turnHistory"]["history"]["entitiesByKey"]["turn:q"]["items"]
+                    .as_array_mut()
+                    .unwrap();
+                questions.clear();
+                questions.push(serde_json::json!({"type":"agentMessage","id":"padding","text":"x".repeat(history_bytes)}));
+                for index in 0..question_count {
+                    questions.push(serde_json::json!({"type":"agentMessage","id":format!("call-{index}"),"questions":[{"title":"Q"}]}));
+                }
+                let answers = state["turnHistory"]["history"]["entitiesByKey"]["turn:a"]["items"]
+                    .as_array_mut()
+                    .unwrap();
+                answers.clear();
+                for index in 0..question_count {
+                    let question =
+                        serde_json::json!(["request_user_input_async", format!("call-{index}"), 0])
+                            .to_string();
+                    let text = format!("<send_user_message_question_reply>\n[{{\"questionItemId\":{},\"question\":\"Q\",\"answer\":\"A\"}}]\n</send_user_message_question_reply>", serde_json::to_string(&question).unwrap());
+                    answers.push(serde_json::json!({"type":"userMessage","id":format!("answer-{index}"),"content":[{"type":"text","text":text}]}));
+                }
+                let input_bytes = serde_json::to_vec(&state).unwrap().len();
+                assert!(input_bytes < MIRROR_BUDGET);
+                let change =
+                    serde_json::json!({"type":"snapshot","revision":1,"conversationState":state});
+                let mut mirror = ThreadMirror::new(key());
+                let started = Instant::now();
+                mirror.apply(&lease(), &change).unwrap();
+                let snapshot_us = started.elapsed().as_micros();
+                FULL_STATE_CLONES.with(|counter| counter.set(0));
+                let started = Instant::now();
+                b1_replay_patch(&mut mirror, 2, serde_json::json!([]));
+                let patch_us = started.elapsed().as_micros();
+                let patch_clones = FULL_STATE_CLONES.with(|counter| counter.get());
+                FULL_STATE_CLONES.with(|counter| counter.set(0));
+                let started = Instant::now();
+                let projected = mirror.project(caps());
+                let project_us = started.elapsed().as_micros();
+                let projection_clones = FULL_STATE_CLONES.with(|counter| counter.get());
+                assert_eq!(projected.async_questions.len(), question_count);
+                assert!(projected
+                    .async_questions
+                    .iter()
+                    .all(|q| q.state == InteractionState::Answered));
+                assert_eq!(patch_clones, 1);
+                assert_eq!(projection_clones, 0);
+                eprintln!("history_bytes={input_bytes} questions={question_count} snapshot_us={snapshot_us} patch_us={patch_us} projection_us={project_us} patch_full_clones={patch_clones} projection_full_clones={projection_clones}");
+            }
+        }
     }
 
     #[test]

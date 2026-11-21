@@ -12149,46 +12149,47 @@ async fn r3_concurrent_interrupts_each_withdraw_own_token_only() {
 /// 红轮（单行主键：B 的前置落行冲突、不拥有保护；A 撤回清掉唯一行）：
 /// B Accepted 直接 `queuePaused=false`——已受理打断的旧队列失去暂停保护
 ///（无 resume 不自动恢复 = 旧队列失去冻结屏障）。
-#[tokio::test]
-async fn t2_a_rejected_b_accepted_pause_survives() {
+async fn t2_a_rejected_b_accepted_case(b_first: bool) {
     let mut f = fixture_ipc_interrupt(vec![codex_app_session(THREAD)]);
     let mut peer = f.peer.take().unwrap();
     let (sse, _) = sse_hold_ensure(&f, &mut peer, THREAD, vec![], "active").await;
 
-    // A/B 同时发起（各自 pause_pre 落自己的行；都在等 interrupt RPC 回执）
-    let app_a = f.app.clone();
-    let task_a = tokio::spawn(async move {
-        app_a
-            .oneshot(req(
+    // 显式选择前置落行和发帧顺序，两次请求均在收到回执前并发存活。
+    let start = |turn_id: &'static str| {
+        let app = f.app.clone();
+        tokio::spawn(async move {
+            app.oneshot(req(
                 "POST",
                 "/m/api/v1/codex/turn/interrupt",
                 Some(COOKIE),
-                Some(serde_json::json!({ "sessionId": THREAD, "turnId": "t-live" }).to_string()),
+                Some(serde_json::json!({ "sessionId": THREAD, "turnId": turn_id }).to_string()),
             ))
             .await
             .unwrap()
-    });
-    let app_b = f.app.clone();
-    let task_b = tokio::spawn(async move {
-        app_b
-            .oneshot(req(
-                "POST",
-                "/m/api/v1/codex/turn/interrupt",
-                Some(COOKIE),
-                Some(serde_json::json!({ "sessionId": THREAD, "turnId": "t-second" }).to_string()),
-            ))
-            .await
-            .unwrap()
-    });
-    let frame1 = recv_within(&mut peer, 10).await;
-    assert_eq!(frame1["method"], "thread-follower-interrupt-turn");
-    let frame2 = recv_within(&mut peer, 10).await;
-    assert_eq!(frame2["method"], "thread-follower-interrupt-turn");
+        })
+    };
+    let (task_a, task_b, frame_a, frame_b) = if b_first {
+        let task_b = start("t-second");
+        let frame_b = recv_within(&mut peer, 10).await;
+        let task_a = start("t-live");
+        let frame_a = recv_within(&mut peer, 10).await;
+        (task_a, task_b, frame_a, frame_b)
+    } else {
+        let task_a = start("t-live");
+        let frame_a = recv_within(&mut peer, 10).await;
+        let task_b = start("t-second");
+        let frame_b = recv_within(&mut peer, 10).await;
+        (task_a, task_b, frame_a, frame_b)
+    };
+    assert_eq!(frame_a["method"], "thread-follower-interrupt-turn");
+    assert_eq!(frame_a["params"]["expectedTurnId"], "t-live");
+    assert_eq!(frame_b["method"], "thread-follower-interrupt-turn");
+    assert_eq!(frame_b["params"]["expectedTurnId"], "t-second");
 
     // 反向定序：**A 先撤回**（error → Rejected → 只清自己 token 的行），
     // **B 后返回**（success → Accepted → 读暂停状态装配回执）
     peer.send(&serde_json::json!({
-        "type": "response", "requestId": frame1["requestId"],
+        "type": "response", "requestId": frame_a["requestId"],
         "resultType": "error", "method": "thread-follower-interrupt-turn",
         "error": { "message": "busy" }
     }))
@@ -12199,7 +12200,7 @@ async fn t2_a_rejected_b_accepted_pause_survives() {
         .unwrap();
     assert_eq!(r_a.status(), 409, "A 被桌面明确拒绝（撤回自己的保护）");
     peer.send(&serde_json::json!({
-        "type": "response", "requestId": frame2["requestId"],
+        "type": "response", "requestId": frame_b["requestId"],
         "resultType": "success", "method": "thread-follower-interrupt-turn",
         "result": { "interruptedTurnId": "t-second", "ok": true }
     }))
@@ -12244,6 +12245,16 @@ async fn t2_a_rejected_b_accepted_pause_survives() {
     let qv: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
     assert_eq!(qv["queuePaused"], serde_json::json!(true), "{qv}");
     drop(sse);
+}
+
+#[tokio::test]
+async fn t2_a_rejected_b_accepted_pause_survives() {
+    t2_a_rejected_b_accepted_case(false).await;
+}
+
+#[tokio::test]
+async fn t2_b_frame_first_a_rejected_b_accepted_pause_survives() {
+    t2_a_rejected_b_accepted_case(true).await;
 }
 
 /// R-T2 矩阵 · A 成功 / B 失败：A 受理留行；B 拒绝只撤自己的行 → A 的暂停存活。
@@ -24555,6 +24566,19 @@ async fn stop_reconnect_and_late_worker_preserve_other_consumers() {
     );
     adapter.ensure_thread(&key).await.unwrap();
     lease.release().await;
+    // 最后一个测速消费者释放会主动发 Lost。先确认并消费这个世代，
+    // 后续断链等待才不能误把它当作 EOF 已被观察。
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            match events.recv().await {
+                Some(BodyEvent::Lost) => break,
+                Some(_) => {}
+                None => panic!("body event stream closed before expected loss"),
+            }
+        }
+    })
+    .await
+    .expect("estimate release must invalidate its observation");
     assert!(
         !peer_has_traffic(&mut peer).await,
         "estimate release must preserve remote following"
@@ -24668,10 +24692,16 @@ async fn stop_reconnect_and_late_worker_preserve_other_consumers() {
     *connector.io.lock().unwrap() = Some(io2);
     peer.eof();
     tokio::time::timeout(Duration::from_secs(3), async {
-        while !matches!(events.recv().await, Some(BodyEvent::Lost)) {}
+        loop {
+            match events.recv().await {
+                Some(BodyEvent::Lost) => break,
+                Some(_) => {}
+                None => panic!("body event stream closed before expected loss"),
+            }
+        }
     })
     .await
-    .expect("disconnect must invalidate observation");
+    .expect("disconnect must invalidate observation after release generation");
     let a = adapter.clone();
     let k = key.clone();
     let follow = tokio::spawn(async move {
