@@ -164,30 +164,23 @@ enum BlockingTaskOutcome {
     Result(Result<(), String>),
 }
 
-/// A4/T10：阻塞任务**进程级监督槽**——drop 监督者不释放句柄；同一运行的两个
-/// 监督者经同一槽仲裁「旧阻塞事务在飞时替代 start 必须被拒」（连接占用守卫；
-/// `b1_dropped_supervisor_...` / `b1_replacement_writer_waits_...` 合同）。
+/// 测试用例持有任务槽，接替场景中的新旧监督器借用同一个槽。
+/// 旧监督器退出作用域后，在飞事务的句柄仍由用例持有。
 #[cfg(test)]
-fn blocking_task_slot(
-) -> &'static std::sync::Mutex<Option<tokio::task::JoinHandle<BlockingTaskOutcome>>> {
-    static SLOT: std::sync::OnceLock<
-        std::sync::Mutex<Option<tokio::task::JoinHandle<BlockingTaskOutcome>>>,
-    > = std::sync::OnceLock::new();
-    SLOT.get_or_init(|| std::sync::Mutex::new(None))
+type BlockingTaskSlot = std::sync::Mutex<Option<tokio::task::JoinHandle<BlockingTaskOutcome>>>;
+
+#[cfg(test)]
+struct BlockingSupervisor<'slot> {
+    slot: &'slot BlockingTaskSlot,
 }
 
 #[cfg(test)]
-struct BlockingSupervisor;
-
-#[cfg(test)]
-impl BlockingSupervisor {
-    fn new() -> Self {
-        Self
+impl<'slot> BlockingSupervisor<'slot> {
+    fn new(slot: &'slot BlockingTaskSlot) -> Self {
+        Self { slot }
     }
     fn start<F: FnOnce() + Send + 'static>(&mut self, transaction: F) -> bool {
-        let mut slot = blocking_task_slot()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut slot = self.slot.lock().unwrap_or_else(|e| e.into_inner());
         if slot.as_ref().is_some_and(|handle| !handle.is_finished()) {
             return false;
         }
@@ -201,9 +194,7 @@ impl BlockingSupervisor {
         &mut self,
         transaction: F,
     ) -> bool {
-        let mut slot = blocking_task_slot()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut slot = self.slot.lock().unwrap_or_else(|e| e.into_inner());
         if slot.as_ref().is_some_and(|handle| !handle.is_finished()) {
             return false;
         }
@@ -221,9 +212,7 @@ impl BlockingSupervisor {
     async fn wait_slot_finished(&self) -> Option<tokio::task::JoinHandle<BlockingTaskOutcome>> {
         loop {
             {
-                let mut slot = blocking_task_slot()
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
+                let mut slot = self.slot.lock().unwrap_or_else(|e| e.into_inner());
                 match slot.as_mut() {
                     None => return None,
                     Some(handle) if handle.is_finished() => return slot.take(),
@@ -335,7 +324,8 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn b1_supervisor_retains_blocking_transaction_after_stop_timeout() {
         use std::time::Duration;
-        let mut supervisor = BlockingSupervisor::new();
+        let slot = BlockingTaskSlot::default();
+        let mut supervisor = BlockingSupervisor::new(&slot);
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let started = supervisor.start(move || {
@@ -364,7 +354,8 @@ mod tests {
     }
     #[tokio::test]
     async fn b1_canceled_finish_keeps_blocking_handle() {
-        let mut supervisor = BlockingSupervisor::new();
+        let slot = BlockingTaskSlot::default();
+        let mut supervisor = BlockingSupervisor::new(&slot);
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
@@ -399,8 +390,9 @@ mod tests {
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let (done_tx, done_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let slot = BlockingTaskSlot::default();
         {
-            let mut old = BlockingSupervisor::new();
+            let mut old = BlockingSupervisor::new(&slot);
             let db = conn.clone();
             old.start(move || {
                 let c = db.lock().unwrap();
@@ -413,7 +405,7 @@ mod tests {
             });
             started_rx.await.unwrap();
         }
-        let mut replacement = BlockingSupervisor::new();
+        let mut replacement = BlockingSupervisor::new(&slot);
         let db2 = conn.clone();
         let accepted = replacement.start(move || {
             db2.lock()
@@ -428,8 +420,16 @@ mod tests {
     }
     #[tokio::test]
     async fn b1_supervisor_reports_real_sqlite_transaction_failure() {
-        let mut supervisor = BlockingSupervisor::new();
-        supervisor.start_result(|| { let c = rusqlite::Connection::open_in_memory().map_err(|e| e.to_string())?; c.execute_batch("CREATE TABLE t(v INTEGER UNIQUE); INSERT INTO t VALUES(1); INSERT INTO t VALUES(1)").map_err(|e| e.to_string()) });
+        let slot = BlockingTaskSlot::default();
+        let mut supervisor = BlockingSupervisor::new(&slot);
+        let started = supervisor.start_result(|| {
+            let c = rusqlite::Connection::open_in_memory().map_err(|e| e.to_string())?;
+            c.execute_batch(
+                "CREATE TABLE t(v INTEGER UNIQUE); INSERT INTO t VALUES(1); INSERT INTO t VALUES(1)",
+            )
+            .map_err(|e| e.to_string())
+        });
+        assert!(started, "the SQLite transaction must be scheduled");
         let result = supervisor.finish_result().await;
         assert!(
             matches!(result, Some(Err(_))),
@@ -788,7 +788,8 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn b1_writer_stop_timeout_preserves_task_ownership() {
         use std::time::Duration;
-        let mut supervisor = BlockingSupervisor::new();
+        let slot = BlockingTaskSlot::default();
+        let mut supervisor = BlockingSupervisor::new(&slot);
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let (done_tx, done_rx) = tokio::sync::oneshot::channel();
@@ -842,7 +843,8 @@ mod tests {
             .unwrap();
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let mut old = BlockingSupervisor::new();
+        let slot = BlockingTaskSlot::default();
+        let mut old = BlockingSupervisor::new(&slot);
         let db = conn.clone();
         old.start(move || {
             let c = db.lock().unwrap();
@@ -854,7 +856,7 @@ mod tests {
         });
         started_rx.await.unwrap();
         // 替代 writer（新监督者、同连接）：旧事务在飞时必须等待/被拒。
-        let mut replacement = BlockingSupervisor::new();
+        let mut replacement = BlockingSupervisor::new(&slot);
         let db2 = conn.clone();
         let accepted = replacement.start(move || {
             db2.lock()
