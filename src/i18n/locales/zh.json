@@ -2852,7 +2852,7 @@
         "restored": "已恢复显示",
         "effect_closed_verified": "已跳过；原生卡已关闭",
         "effect_not_present_verified": "已跳过；当前核对范围未显示该原生卡",
-        "effect_unresolved": "Tuvis 已跳过；原生关闭未完成",
+        "effect_unresolved": "Tuvis 已跳过，原生关闭结果未确认",
         "effect_unsupported": "Tuvis 已跳过；原生关闭不支持",
         "readRestoredRecord": "该题跳过已恢复（历史记录，只读）",
         "questionFallback": "已跳过的题目",

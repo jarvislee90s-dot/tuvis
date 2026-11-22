@@ -2852,7 +2852,7 @@
         "restored": "Display restored",
         "effect_closed_verified": "Skipped; native card closed",
         "effect_not_present_verified": "Skipped; the native card is not shown in the verified scope",
-        "effect_unresolved": "Tuvis skipped it; native close was not completed",
+        "effect_unresolved": "Skipped in Tuvis. Native close is unconfirmed.",
         "effect_unsupported": "Tuvis skipped it; native close is not supported",
         "readRestoredRecord": "This skip was restored (read-only history record)",
         "questionFallback": "Skipped question",

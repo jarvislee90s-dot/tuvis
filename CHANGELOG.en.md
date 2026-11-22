@@ -13,6 +13,28 @@ English · [中文](CHANGELOG.md)
 _Only versions translated so far are listed here; the full history lives in the
 [Chinese changelog](CHANGELOG.md)._
 
+## [0.6.7] - 2026-11-22
+
+### Added
+
+- **Skip and restore Codex async questions**. Skip and restore single-question cards in Tuvis. Eligible Windows sessions can attempt to close the desktop card, with separate results shown for Tuvis and Desktop.
+- **Answer while Codex is running**. In supported sessions, submit an async answer while the current task continues.
+- **Remote file previews**. Paired devices can preview regular files the operating system allows Tuvis to read.
+
+### Fixed
+
+- **Codex blocking question cards**. Navigation between questions is clearer, and you can collapse and reopen the whole card in the current tab.
+- **Codex messages and queues**. Delivery confirmation, feedback when prioritizing a message, and queue progression are clearer. Formal answers dismiss the matching card more reliably, and question states are more stable in long sessions.
+- **Remote message list**. Expand and load-history controls follow the visible message source, with more consistent links back to file references and the latest message.
+
+### Upgrade notes
+
+- **Windows Codex Desktop**. The latest package confirmed for remote control is `OpenAI.Codex 26.1106.6628.0`, with a [public installation record](https://github.com/openai/codex/issues/60812) by November 11, 2026. Later releases changed IPC, and some may fail to connect or accept remote actions. Tuvis is working on support for newer releases. If affected, temporarily return to that package or another version you have verified.
+
+### Engineering
+
+- Extended regression coverage for question-state migration, background recovery, message delivery and queues. Consolidated duplicate test fixtures and design specs.
+
 ## [0.6.6] - 2026-11-06
 
 ### Fixed
