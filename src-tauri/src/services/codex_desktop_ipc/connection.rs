@@ -181,6 +181,10 @@ struct FrameCmd {
     /// N03：**首次写出硬截止**——writer 授予写权与 write_all 前都要检查；到点即
     /// 强零投递（不再保留“未发帧的永久首写资格”）。
     first_write_deadline: Option<tokio::time::Instant>,
+    /// Task7：调度准入伴随（crate 内 request_with_admission 注入；`None` = 无
+    /// 优先伴随，writer 预 claim 准入点直通）。经私有载体（FrameWriteContext）
+    /// 而非 public `RpcRequest` 字段传递。
+    admission: Option<std::sync::Arc<crate::services::codex_desktop_ipc::types::AttemptAdmission>>,
 }
 
 impl std::fmt::Debug for RpcRequest {
@@ -205,6 +209,7 @@ impl FrameCmd {
             interaction_recheck: None,
             async_write_recheck: None,
             first_write_deadline: None,
+            admission: None,
         }
     }
     fn is_shutdown(&self) -> bool {
@@ -251,6 +256,10 @@ impl Budget {
     }
 }
 
+/// Task7 测试缝门形态（action_id 精确过滤 + entered/release Notify 对）。
+#[cfg(debug_assertions)]
+type ClaimGrantedGate = Option<(String, Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>;
+
 struct ConnectionShared {
     epoch: u64,
     profile: super::profile::ProtocolProfile,
@@ -294,6 +303,13 @@ struct ConnectionShared {
     /// J01 测试缝：异步组复核之后、最终写权 claim 之前。
     final_claim_gate: std::sync::Mutex<Option<Arc<tokio::sync::Notify>>>,
     final_claim_reached: AtomicBool,
+    /// Task7 测试缝（仅 debug 构建）：真实 Claimed **之后**的停点门（元组 =
+    /// action_id 精确过滤 / entered / release；默认 None = NoOp）。writer 在
+    /// claim 实际返回 Claimed 并 mark_claimed（生产保留）后 clone 匹配项并释放
+    /// 字段短锁，再 notify/await——不持任何 registry/DB 锁，不改变 claim 资格
+    /// 与派发语义。
+    #[cfg(debug_assertions)]
+    claim_granted_gate: std::sync::Mutex<ClaimGrantedGate>,
 }
 
 /// 终审 R2：写右判定闭包形状（action_id + 是否依赖兼容授权）——直接复用
@@ -384,6 +400,7 @@ impl ConnectionHandle {
                 interaction_recheck: None,
                 async_write_recheck: None,
                 first_write_deadline: None,
+                admission: None,
             };
             match this.main_tx.try_send(cmd) {
                 Ok(()) => Ok(()),
@@ -405,7 +422,18 @@ impl ConnectionHandle {
         req: RpcRequest,
     ) -> Pin<Box<dyn std::future::Future<Output = RpcOutcome> + Send + '_>> {
         let this = self.clone();
-        Box::pin(async move { this.request_inner(req).await })
+        Box::pin(async move { this.request_inner(req, None).await })
+    }
+
+    /// Task7：携带调度准入伴随的 crate 内请求入口（public `RpcRequest` 字段与
+    /// `request` 签名不扩——admission 经本私有参数随帧进 writer）。
+    pub(crate) fn request_with_admission(
+        &self,
+        req: RpcRequest,
+        admission: std::sync::Arc<crate::services::codex_desktop_ipc::types::AttemptAdmission>,
+    ) -> Pin<Box<dyn std::future::Future<Output = RpcOutcome> + Send + '_>> {
+        let this = self.clone();
+        Box::pin(async move { this.request_inner(req, Some(admission)).await })
     }
 
     /// 终审 R2：注入写右判定（生产 = remote 层；`None` = 放行）。连接建立后设置。
@@ -462,7 +490,25 @@ impl ConnectionHandle {
         self.shared.final_claim_reached.load(Ordering::SeqCst)
     }
 
-    async fn request_inner(&self, req: RpcRequest) -> RpcOutcome {
+    /// Task7 测试缝（仅 debug 构建）：真实 Claimed 后置停点注入/清除（按
+    /// FrameCmd.action_id 精确匹配）。
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub(crate) fn set_claim_granted_gate(&self, gate: ClaimGrantedGate) {
+        *self
+            .shared
+            .claim_granted_gate
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = gate;
+    }
+
+    async fn request_inner(
+        &self,
+        req: RpcRequest,
+        admission: Option<
+            std::sync::Arc<crate::services::codex_desktop_ipc::types::AttemptAdmission>,
+        >,
+    ) -> RpcOutcome {
         let envelope_id = super::types::new_uuid();
         // 等握手成功（initialized）或连接死亡；握手超时由 handshake 任务执行
         let mut init = self.shared.init.clone();
@@ -581,6 +627,7 @@ impl ConnectionHandle {
             interaction_recheck: req.interaction_recheck.clone(),
             async_write_recheck: req.async_write_recheck.clone(),
             first_write_deadline: req.deadline,
+            admission,
         };
         if let Err(e) = self.main_tx.try_send(cmd) {
             self.shared.pending.lock().await.remove(&envelope_id);
@@ -757,6 +804,8 @@ pub fn spawn_with_tuning(
         write_right_reached: AtomicBool::new(false),
         final_claim_gate: std::sync::Mutex::new(None),
         final_claim_reached: AtomicBool::new(false),
+        #[cfg(debug_assertions)]
+        claim_granted_gate: std::sync::Mutex::new(None),
     });
     let handle = ConnectionHandle {
         shared: shared.clone(),
@@ -946,6 +995,24 @@ async fn writer_task<W: tokio::io::AsyncWrite + Unpin + Send>(
             gate.notified().await;
             shared.final_claim_reached.store(false, Ordering::SeqCst);
         }
+        // Task7：调度准入（原 AsyncWriteRecheck 与 final gate 之后、原 claim 之前）
+        // ——未准入帧在此被拒（busy_before_write 同源，明确零投递收尾：动作按既有
+        // known-zero 臂回队不丢消息）；已准入（Admitted/Claimed）不重查——此后新
+        // 登记的意图等待已准入 writer，不能倒追回撤。原 native/remote generation/
+        // 预算分支不跳过、不重排。
+        if let Some(admission) = cmd.admission.as_ref() {
+            if let Some(reason) = admission.try_admit() {
+                shared.budget.release(cmd.frame.len());
+                shared.late.release(&cmd.envelope_id);
+                complete_pending(
+                    &shared,
+                    &cmd.envelope_id,
+                    RpcOutcome::not_sent(cmd.envelope_id.clone(), &reason),
+                )
+                .await;
+                continue;
+            }
+        }
         // 复审 R-T1：**取得首次写出权**（原子线性化点）——单条持久 CAS 与人工
         // 继续/撤销事务竞争同一两态行：撤销先到 → 零首次写出；claim 先到 → 撤销
         // 必输（只收尾取证）。只读判定（上方）释放 DB 锁后到 write_all 之间的
@@ -959,7 +1026,31 @@ async fn writer_task<W: tokio::io::AsyncWrite + Unpin + Send>(
             if let Some(claim) = claim {
                 let outcome = (claim)(cmd.action_id.as_deref().unwrap_or(""), cmd.compat_licensed);
                 match outcome {
-                    crate::services::codex_control::WriteRightClaimOutcome::Claimed => {}
+                    crate::services::codex_control::WriteRightClaimOutcome::Claimed => {
+                        // Task7：真实首写权取得——先标 Claimed（Release store；仅原
+                        // 回调实际返回 Claimed 才标记，其他 claim 结果不标记、不改
+                        // 原拒绝语义；生产保留），再过默认关闭的观测门（仅 debug
+                        // 构建；按 cmd.action_id 精确匹配；clone 后字段短锁即释放，
+                        // notify/await 不持任何锁），最后走原 InteractionRecheck——
+                        // 资格与派发语义不变。
+                        if let Some(admission) = cmd.admission.as_ref() {
+                            admission.mark_claimed();
+                        }
+                        #[cfg(debug_assertions)]
+                        {
+                            let granted = shared
+                                .claim_granted_gate
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .clone();
+                            if let Some((gate_action, entered, release)) = granted {
+                                if cmd.action_id.as_deref() == Some(gate_action.as_str()) {
+                                    entered.notify_one();
+                                    release.notified().await;
+                                }
+                            }
+                        }
+                    }
                     crate::services::codex_control::WriteRightClaimOutcome::LostToRevoke => {
                         shared.budget.release(cmd.frame.len());
                         shared.late.release(&cmd.envelope_id);
@@ -1210,6 +1301,7 @@ async fn handle_frame(
                     interaction_recheck: None,
                     async_write_recheck: None,
                     first_write_deadline: None,
+                    admission: None,
                 });
             }
         }
@@ -1334,6 +1426,7 @@ async fn initialize_handshake(handle: ConnectionHandle, shared: Arc<ConnectionSh
             interaction_recheck: None,
             async_write_recheck: None,
             first_write_deadline: None,
+            admission: None,
         })
         .is_err()
     {
@@ -1418,6 +1511,8 @@ mod tests {
             write_right_reached: AtomicBool::new(false),
             final_claim_gate: std::sync::Mutex::new(None),
             final_claim_reached: AtomicBool::new(false),
+            #[cfg(debug_assertions)]
+            claim_granted_gate: std::sync::Mutex::new(None),
         });
         let (main_tx, main_rx) = mpsc::channel::<FrameCmd>(64);
         drop(main_rx);

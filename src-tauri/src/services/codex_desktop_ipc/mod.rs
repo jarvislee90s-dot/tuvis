@@ -37,3 +37,5 @@ pub mod hint_state;
 
 #[cfg(test)]
 pub(crate) mod hint_test_probe;
+
+mod hint_writer;

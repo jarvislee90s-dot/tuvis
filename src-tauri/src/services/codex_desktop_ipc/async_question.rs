@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use super::capability::{CodexOperation, EffectiveOperations};
+use super::capability::{CodexOperation, EffectiveOperations, OperationStatus};
 use super::history_view::{HistoryView, TurnRef};
 use super::types::{InteractionAnswerSummary, ProjectedMessage, ThreadKey};
 
@@ -111,6 +111,55 @@ pub enum AnswerCoverage {
     Incomplete,
     /// 无法判定（历史不可读／题目回合不在已加载范围）。
     Unknown,
+}
+
+/// 一次答题冻结的内部路径；不能由远程请求指定，也不随后续运行态自动改路由。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AsyncAnswerRoute {
+    IdleStart,
+    ActiveSteer,
+}
+
+impl AsyncAnswerRoute {
+    pub(crate) fn from_runtime(runtime: &str) -> Option<Self> {
+        if runtime.eq_ignore_ascii_case("idle") {
+            Some(Self::IdleStart)
+        } else if runtime.eq_ignore_ascii_case("active") {
+            Some(Self::ActiveSteer)
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn parse(word: &str) -> Option<Self> {
+        match word {
+            "idle_start" => Some(Self::IdleStart),
+            "active_steer" => Some(Self::ActiveSteer),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::IdleStart => "idle_start",
+            Self::ActiveSteer => "active_steer",
+        }
+    }
+
+    pub(crate) fn operation(self) -> CodexOperation {
+        match self {
+            Self::IdleStart => CodexOperation::AsyncAnswerIdle,
+            Self::ActiveSteer => CodexOperation::AsyncAnswerActive,
+        }
+    }
+
+    pub(crate) fn opens_turn(self) -> bool {
+        self == Self::IdleStart
+    }
+
+    pub(crate) fn runtime_matches(self, runtime: &str) -> bool {
+        Self::from_runtime(runtime) == Some(self)
+    }
 }
 
 /// F03／T07：异步正式答题命令（后端构造信封；**不接受**客户端 raw／owner／method／
@@ -217,11 +266,99 @@ pub struct AnswerWitness {
     pub answer_digest: String,
 }
 
+/// 单次严格分析的临时关联，不进入 hint、持久 witness 或其物理 Eq。
+pub(super) struct AnalyzedAnswer<'a> {
+    pub physical: AnswerWitness,
+    pub linked_steering: Option<LinkedSteeringProof<'a>>,
+}
+
+pub(super) struct LinkedSteeringProof<'a> {
+    pub item_id: &'a str,
+    pub physical_digest: [u8; 32],
+}
+
+impl LinkedSteeringProof<'_> {
+    pub(super) fn matches(&self, witness: &AnswerWitness) -> bool {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let expected = witness.answer_digest.as_bytes();
+        witness.proof_version == 1
+            && witness.answer_item_id == self.item_id
+            && expected.len() == 64
+            && self
+                .physical_digest
+                .iter()
+                .enumerate()
+                .all(|(index, byte)| {
+                    expected[index * 2] == HEX[(byte >> 4) as usize]
+                        && expected[index * 2 + 1] == HEX[(byte & 15) as usize]
+                })
+    }
+}
+
+fn physical_answer_digest(
+    thread: &str,
+    question_key: &str,
+    source_turn: &str,
+    answer_turn: &str,
+    answer_item: &str,
+    question: &str,
+    answer: &str,
+) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    for field in [
+        thread,
+        question_key,
+        source_turn,
+        answer_turn,
+        answer_item,
+        question,
+        answer,
+    ] {
+        digest.update((field.len() as u64).to_be_bytes());
+        digest.update(field.as_bytes());
+    }
+    digest.finalize().into()
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(super) static FAIL_WITNESS_ANALYSIS_AFTER: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    pub(super) static WITNESS_ANALYSIS_PASSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// 正式消息的关联身份；整条正文只摘要一次，不随每道题重复扫描。
+struct FormalAnswerIdentity<'a> {
+    item_id: &'a str,
+    steering: bool,
+    client_id: Option<&'a str>,
+    server_id: Option<&'a str>,
+    text_digest: [u8; 32],
+}
+
+/// 候选的回合、条目、canonical 序位、结构化答案与消息关联索引。
+type AnswerCandidate = (String, String, usize, AnswerEnvelope, usize);
+
 /// 从原始 canonical 引用链取得唯一答复；任何引用或身份歧义均保守拒绝。
-fn analyze_answer_witnesses(
+pub(super) fn analyze_answer_witnesses<'a>(
     thread_id: &str,
-    state: &Value,
-) -> Option<HashMap<String, AnswerWitness>> {
+    state: &'a Value,
+) -> Option<HashMap<String, AnalyzedAnswer<'a>>> {
+    #[cfg(test)]
+    WITNESS_ANALYSIS_PASSES.with(|count| count.set(count.get() + 1));
+    #[cfg(test)]
+    if FAIL_WITNESS_ANALYSIS_AFTER.with(|remaining| match remaining.get() {
+        Some(0) => {
+            remaining.set(None);
+            true
+        }
+        Some(n) => {
+            remaining.set(Some(n - 1));
+            false
+        }
+        None => false,
+    }) {
+        return None;
+    }
     if thread_id.is_empty() {
         return None;
     }
@@ -232,7 +369,11 @@ fn analyze_answer_witnesses(
     let mut turns = HashSet::new();
     let mut items = HashSet::new();
     let mut questions: HashMap<String, (String, usize)> = HashMap::new();
-    let mut answers: HashMap<String, Vec<(String, String, usize, AnswerEnvelope)>> = HashMap::new();
+    let mut answers: HashMap<String, Vec<AnswerCandidate>> = HashMap::new();
+    let mut messages = Vec::new();
+    let mut user_clients: HashMap<&str, usize> = HashMap::new();
+    let mut steering_clients: HashMap<&str, usize> = HashMap::new();
+    let mut steering_servers: HashMap<&str, usize> = HashMap::new();
     let mut position = 0usize;
     for island in islands {
         let entries = island.get("entries").and_then(Value::as_array)?;
@@ -291,13 +432,48 @@ fn analyze_answer_witnesses(
                             }
                         }
                     }
-                    Some("userMessage") => {
-                        if let Some(text) = user_message_text(object) {
+                    Some("userMessage" | "steeringUserMessage") => {
+                        let steering = object.get("type").and_then(Value::as_str)
+                            == Some("steeringUserMessage");
+                        let client_id = object
+                            .get(if steering {
+                                "clientUserMessageId"
+                            } else {
+                                "clientId"
+                            })
+                            .and_then(Value::as_str)
+                            .filter(|id| !id.is_empty());
+                        let server_id = object
+                            .get("serverUserMessageId")
+                            .and_then(Value::as_str)
+                            .filter(|id| !id.is_empty());
+                        if let Some(client) = client_id {
+                            let counts = if steering {
+                                &mut steering_clients
+                            } else {
+                                &mut user_clients
+                            };
+                            *counts.entry(client).or_default() += 1;
+                        }
+                        if steering {
+                            if let Some(server) = server_id {
+                                *steering_servers.entry(server).or_default() += 1;
+                            }
+                        }
+                        if let Some(text) = formal_answer_text(item) {
                             if text.matches(ENVELOPE_OPEN).count() > 1 {
                                 return None;
                             }
                             if text.contains(ENVELOPE_OPEN) {
                                 let entries = parse_answer_envelope(&text)?;
+                                let message_index = messages.len();
+                                messages.push(FormalAnswerIdentity {
+                                    item_id: id,
+                                    steering,
+                                    client_id,
+                                    server_id,
+                                    text_digest: Sha256::digest(text.as_bytes()).into(),
+                                });
                                 for answer in entries {
                                     answers
                                         .entry(answer.question_item_id.clone())
@@ -307,6 +483,7 @@ fn analyze_answer_witnesses(
                                             id.to_string(),
                                             position,
                                             answer,
+                                            message_index,
                                         ));
                                 }
                             }
@@ -320,58 +497,97 @@ fn analyze_answer_witnesses(
     let mut result = HashMap::new();
     let view = HistoryView::new(state);
     let canonical_turns = view.turns();
+    let mut turn_indices = HashMap::with_capacity(canonical_turns.len());
+    for (index, turn) in canonical_turns.iter().enumerate() {
+        turn_indices.insert(turn.turn_id, index);
+    }
+    let complete_suffix = complete_coverage_suffix(&canonical_turns);
+    // 上面的原始引用链校验已拒绝非法、悬空及重复引用，故不存在严格缺口。
     for (key, (source_turn, source_position)) in questions {
-        let Some(turn_index) = canonical_turns
-            .iter()
-            .position(|turn| turn.turn_id == source_turn)
-        else {
+        let Some(&turn_index) = turn_indices.get(source_turn.as_str()) else {
             continue;
         };
-        if coverage_since(
-            &canonical_turns,
-            turn_index,
-            view.strict_gap_after_turn(&source_turn),
-        ) != AnswerCoverage::CompleteSinceQuestion
-        {
+        if !complete_suffix[turn_index] {
             continue;
         }
         let Some(entries) = answers.get(&key) else {
             continue;
         };
-        if entries.len() != 1 {
+        if entries.iter().any(|entry| entry.2 <= source_position) {
             continue;
         }
-        let (answer_turn, answer_item, answer_position, answer) = &entries[0];
-        if *answer_position <= source_position {
-            continue;
-        }
-        // v1: 线程、题目标识、来源回合、答复回合、答复条目、question、answer；
-        // 每项先写 UTF-8 字节长度的 u64 大端，再写字节本身。
-        let mut digest = Sha256::new();
-        for field in [
+        let (chosen, linked) = match entries.as_slice() {
+            [only] => (only, None),
+            [left, right] => {
+                let (steering, user) = match (messages[left.4].steering, messages[right.4].steering)
+                {
+                    (true, false) => (left, right),
+                    (false, true) => (right, left),
+                    _ => continue,
+                };
+                let steering_id = &messages[steering.4];
+                let user_id = &messages[user.4];
+                let server_link = steering_id.server_id == Some(user.1.as_str())
+                    && steering_servers.get(user.1.as_str()) == Some(&1);
+                let client_link = steering_id.client_id.is_some()
+                    && steering_id.client_id == user_id.client_id
+                    && steering_id.client_id.is_some_and(|id| {
+                        user_clients.get(id) == Some(&1) && steering_clients.get(id) == Some(&1)
+                    });
+                let contradictory_link = steering_id
+                    .server_id
+                    .is_some_and(|id| id != user.1.as_str())
+                    || matches!(
+                        (steering_id.client_id, user_id.client_id),
+                        (Some(a), Some(b)) if a != b
+                    );
+                if (!server_link && !client_link)
+                    || contradictory_link
+                    || steering.2 >= user.2
+                    || steering_id.text_digest != user_id.text_digest
+                {
+                    continue;
+                }
+                // 物理 witness 选正式 userMessage，同时携带已核验的 steering 同伴。
+                (user, Some(steering))
+            }
+            _ => continue,
+        };
+        let (answer_turn, answer_item, _, answer, _) = chosen;
+        let answer_digest = physical_answer_digest(
             thread_id,
-            key.as_str(),
-            source_turn.as_str(),
-            answer_turn.as_str(),
-            answer_item.as_str(),
-            answer.question.as_str(),
-            answer.answer.as_str(),
-        ] {
-            digest.update((field.len() as u64).to_be_bytes());
-            digest.update(field.as_bytes());
-        }
-        let answer_digest = digest
-            .finalize()
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect();
+            &key,
+            &source_turn,
+            answer_turn,
+            answer_item,
+            &answer.question,
+            &answer.answer,
+        )
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+        let linked_steering = linked.map(|steering| LinkedSteeringProof {
+            item_id: messages[steering.4].item_id,
+            physical_digest: physical_answer_digest(
+                thread_id,
+                &key,
+                &source_turn,
+                &steering.0,
+                &steering.1,
+                &steering.3.question,
+                &steering.3.answer,
+            ),
+        });
         result.insert(
             key,
-            AnswerWitness {
-                proof_version: 1,
-                answer_turn_id: answer_turn.clone(),
-                answer_item_id: answer_item.clone(),
-                answer_digest,
+            AnalyzedAnswer {
+                physical: AnswerWitness {
+                    proof_version: 1,
+                    answer_turn_id: answer_turn.clone(),
+                    answer_item_id: answer_item.clone(),
+                    answer_digest,
+                },
+                linked_steering,
             },
         );
     }
@@ -379,7 +595,11 @@ fn analyze_answer_witnesses(
 }
 
 pub fn answer_witnesses(thread_id: &str, state: &Value) -> HashMap<String, AnswerWitness> {
-    analyze_answer_witnesses(thread_id, state).unwrap_or_default()
+    analyze_answer_witnesses(thread_id, state)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(question, answer)| (question, answer.physical))
+        .collect()
 }
 
 /// 持久提示（DB 事实的只读副本；**不含正文**）。
@@ -456,6 +676,8 @@ impl InteractionHint {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HintStoreError {
     Storage,
+    /// 观察版本或持久行格式无效；不能当作暂时故障反复重试。
+    InvalidData,
     VersionCollision,
     Fenced,
     OwnerFenced,
@@ -678,18 +900,23 @@ fn coverage_since(
     AnswerCoverage::CompleteSinceQuestion
 }
 
+/// 已验证引用链后，反向计算各回合到末尾的覆盖完整性。
+fn complete_coverage_suffix(turns: &[TurnRef<'_>]) -> Vec<bool> {
+    let mut suffix = vec![true; turns.len() + 1];
+    for (index, turn) in turns.iter().enumerate().rev() {
+        suffix[index] = suffix[index + 1]
+            && coverage_since(std::slice::from_ref(turn), 0, Some(false))
+                == AnswerCoverage::CompleteSinceQuestion;
+    }
+    suffix
+}
+
 /// 扫描正式答复：questionItemId（紧凑精确）→ 首次答复。
 fn answered_map(turns: &[TurnRef<'_>], known: &HashSet<String>) -> HashMap<String, AnswerEnvelope> {
     let mut answers = HashMap::new();
     for turn in turns {
         for item in turn.items {
-            let Some(object) = item.as_object() else {
-                continue;
-            };
-            if object.get("type").and_then(Value::as_str) != Some("userMessage") {
-                continue;
-            }
-            let Some(text) = user_message_text(object) else {
+            let Some(text) = formal_answer_text(item) else {
                 continue;
             };
             let Some(envelopes) = parse_answer_envelope(&text) else {
@@ -709,14 +936,26 @@ fn answered_map(turns: &[TurnRef<'_>], known: &HashSet<String>) -> HashMap<Strin
     answers
 }
 
-/// `userMessage.content[]` 里的文本块拼接（与 mirror 的读法一致）。
-fn user_message_text(item: &serde_json::Map<String, Value>) -> Option<String> {
-    let blocks = item.get("content")?.as_array()?;
+/// 正式答复正文：普通消息读 content，只有已接受/确认的 steering 才读 input。
+/// 同一判据供全量分析、投影与镜像增量依赖复用；pending 不提供已答事实。
+pub(super) fn formal_answer_text(item: &Value) -> Option<String> {
+    let field = match item.get("type").and_then(Value::as_str) {
+        Some("userMessage") => "content",
+        Some("steeringUserMessage")
+            if item.get("status").and_then(Value::as_str) == Some("accepted")
+                || item.get("steerAcknowledged").and_then(Value::as_bool) == Some(true) =>
+        {
+            "input"
+        }
+        _ => return None,
+    };
+    let blocks = item.get(field)?.as_array()?;
     let text = blocks
         .iter()
         .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
         .filter_map(|block| block.get("text").and_then(Value::as_str))
-        .collect::<String>();
+        .collect::<Vec<_>>()
+        .join("\n");
     (!text.is_empty()).then_some(text)
 }
 
@@ -751,6 +990,27 @@ impl AsyncQuestionProjector {
         ops: &EffectiveOperations,
         hints: &[InteractionHint],
     ) -> Vec<AsyncQuestionView> {
+        let analysis = analyze_answer_witnesses(&key.thread_id, state);
+        self.project_with_hints_and_analysis(
+            key,
+            lease,
+            state,
+            ops.get(CodexOperation::AsyncAnswerIdle),
+            hints,
+            &analysis,
+        )
+    }
+
+    /// 同一投影内复用严格内容分析；资格和退役账本仍由调用方现算。
+    pub(super) fn project_with_hints_and_analysis(
+        &self,
+        key: &ThreadKey,
+        lease: Option<&super::types::OwnerLease>,
+        state: &Value,
+        async_status: Option<&OperationStatus>,
+        hints: &[InteractionHint],
+        analysis: &Option<HashMap<String, AnalyzedAnswer<'_>>>,
+    ) -> Vec<AsyncQuestionView> {
         let view = HistoryView::new(state);
         if !view.readable() {
             return unknown_placeholders(key, lease, hints);
@@ -762,20 +1022,18 @@ impl AsyncQuestionProjector {
         }
         let known: HashSet<String> = questions.iter().map(|q| q.question_key.clone()).collect();
         let answers = answered_map(&turns, &known);
-        let analysis = analyze_answer_witnesses(&key.thread_id, state);
         let invalid_history = analysis.is_none();
-        let witnesses = analysis.unwrap_or_default();
-        let malformed_envelope = turns.iter().flat_map(|turn| turn.items.iter()).any(|item| {
-            item.as_object()
-                .filter(|object| object.get("type").and_then(Value::as_str) == Some("userMessage"))
-                .and_then(user_message_text)
-                .is_some_and(|text| {
-                    text.contains(ENVELOPE_OPEN) && parse_answer_envelope(&text).is_none()
-                })
-        });
+        let empty_witnesses = HashMap::new();
+        let witnesses = analysis.as_ref().unwrap_or(&empty_witnesses);
+        // 仅合法的原始引用链可使用预计算覆盖；非法历史一律保持 Unknown。
+        let complete_suffix = (!invalid_history).then(|| complete_coverage_suffix(&turns));
+        let malformed_envelope = turns
+            .iter()
+            .flat_map(|turn| turn.items.iter())
+            .filter_map(formal_answer_text)
+            .any(|text| text.contains(ENVELOPE_OPEN) && parse_answer_envelope(&text).is_none());
         let epoch = lease.map(|lease| lease.epoch).unwrap_or(0);
         let generation = lease.map(|lease| lease.generation).unwrap_or(0);
-        let async_status = ops.get(CodexOperation::AsyncAnswerIdle);
         let policy_allows = async_status.is_some_and(|status| status.implemented && status.allowed);
         let policy_reason = async_status
             .and_then(|status| status.reason_code.clone())
@@ -785,11 +1043,16 @@ impl AsyncQuestionProjector {
         for question in &questions {
             let answered = witnesses.contains_key(&question.question_key);
             let ambiguous_answer = answers.contains_key(&question.question_key) && !answered;
-            let coverage = coverage_since(
-                &turns,
-                question.turn_index,
-                view.strict_gap_after_turn(&question.source_turn_id),
-            );
+            let coverage = if complete_suffix
+                .as_ref()
+                .and_then(|suffix| suffix.get(question.turn_index))
+                .copied()
+                == Some(true)
+            {
+                AnswerCoverage::CompleteSinceQuestion
+            } else {
+                AnswerCoverage::Incomplete
+            };
             let (state, actionable, disabled_reason_code) = if answered {
                 (InteractionState::Answered, false, None)
             } else if ambiguous_answer || malformed_envelope || invalid_history {
@@ -1911,6 +2174,212 @@ mod r18_placeholder_tests {
         })
     }
 
+    // 合成自规格中的 canonical 载体，不含真实会话内容。
+    fn async_active_steering(id: &str, status: &str, ack: bool, text: &str) -> Value {
+        json!({"type":"steeringUserMessage", "id":id, "status":status,
+            "steerAcknowledged":ack, "clientUserMessageId":"client-1",
+            "serverUserMessageId":"user-1", "input":[{"type":"text","text":text,"text_elements":[]}]})
+    }
+
+    #[test]
+    fn async_active_review_split_inside_json_string_is_not_formal_answer() {
+        let text = compose_async_answer("call-q", 0, "题", "splitvalue");
+        let cut = text.find("splitvalue").unwrap() + "split".len();
+        let mut steering = async_active_steering("s", "accepted", false, &text);
+        steering["input"] = json!([
+            {"type":"text", "text":&text[..cut]},
+            {"type":"text", "text":&text[cut..]}
+        ]);
+        let state = canonical(
+            &[(
+                "a",
+                "inProgress",
+                vec![question_item("call-q", "题", &[]), steering],
+            )],
+            true,
+        );
+        assert!(!answer_witnesses("th", &state).contains_key(&question_item_id("call-q", 0)));
+        let views = AsyncQuestionProjector.project(&key(), None, &state, &ops_allowing_async());
+        assert_ne!(views[0].state, InteractionState::Answered);
+    }
+
+    #[test]
+    fn async_active_review_split_at_json_whitespace_keeps_formal_answer() {
+        let text = compose_async_answer("call-q", 0, "题", "答");
+        let cut = text.find("[{\"").unwrap() + 1;
+        let mut steering = async_active_steering("s", "accepted", false, &text);
+        steering["input"] = json!([
+            {"type":"text", "text":&text[..cut]},
+            {"type":"text", "text":&text[cut..]}
+        ]);
+        let state = canonical(
+            &[(
+                "a",
+                "inProgress",
+                vec![question_item("call-q", "题", &[]), steering],
+            )],
+            true,
+        );
+        assert_eq!(
+            answer_witnesses("th", &state)[&question_item_id("call-q", 0)].answer_item_id,
+            "s"
+        );
+    }
+
+    #[test]
+    fn async_active_review_user_before_linked_steering_is_not_a_witness() {
+        let text = compose_async_answer("call-q", 0, "题", "答");
+        let state = canonical(
+            &[(
+                "a",
+                "inProgress",
+                vec![
+                    question_item("call-q", "题", &[]),
+                    user_item("user-1", &text),
+                    async_active_steering("s", "accepted", false, &text),
+                ],
+            )],
+            true,
+        );
+        assert!(!answer_witnesses("th", &state).contains_key(&question_item_id("call-q", 0)));
+    }
+
+    #[test]
+    fn async_active_same_turn_accepted_steering_proves_answer() {
+        let text = compose_async_answer("call-q", 0, "题", "答");
+        let state = canonical(
+            &[(
+                "a",
+                "inProgress",
+                vec![
+                    question_item("call-q", "题", &[]),
+                    async_active_steering("s", "accepted", false, &text),
+                ],
+            )],
+            true,
+        );
+        let witnesses = answer_witnesses("th", &state);
+        assert_eq!(
+            witnesses[&question_item_id("call-q", 0)].answer_item_id,
+            "s"
+        );
+    }
+
+    #[test]
+    fn async_active_cross_turn_acknowledged_steering_proves_answer() {
+        let text = compose_async_answer("call-q", 0, "题", "答");
+        let state = canonical(
+            &[
+                ("q", "completed", vec![question_item("call-q", "题", &[])]),
+                (
+                    "a",
+                    "inProgress",
+                    vec![async_active_steering("s", "pending", true, &text)],
+                ),
+            ],
+            true,
+        );
+        assert_eq!(
+            answer_witnesses("th", &state)[&question_item_id("call-q", 0)].answer_item_id,
+            "s"
+        );
+    }
+
+    #[test]
+    fn async_active_pending_steering_does_not_prove_answer() {
+        let text = compose_async_answer("call-q", 0, "题", "答");
+        let state = canonical(
+            &[(
+                "a",
+                "inProgress",
+                vec![
+                    question_item("call-q", "题", &[]),
+                    async_active_steering("s", "pending", false, &text),
+                ],
+            )],
+            true,
+        );
+        assert!(!answer_witnesses("th", &state).contains_key(&question_item_id("call-q", 0)));
+    }
+
+    #[test]
+    fn async_active_steering_before_question_cannot_prove_answer() {
+        let text = compose_async_answer("call-q", 0, "题", "答");
+        let state = canonical(
+            &[(
+                "a",
+                "inProgress",
+                vec![
+                    async_active_steering("s", "accepted", false, &text),
+                    question_item("call-q", "题", &[]),
+                ],
+            )],
+            true,
+        );
+        assert!(!answer_witnesses("th", &state).contains_key(&question_item_id("call-q", 0)));
+    }
+
+    #[test]
+    fn async_active_stable_server_link_deduplicates_equal_echoes() {
+        let text = compose_async_answer("call-q", 0, "题", "答");
+        let state = canonical(
+            &[(
+                "a",
+                "inProgress",
+                vec![
+                    question_item("call-q", "题", &[]),
+                    async_active_steering("s", "accepted", false, &text),
+                    user_item("user-1", &text),
+                ],
+            )],
+            true,
+        );
+        assert_eq!(
+            answer_witnesses("th", &state)[&question_item_id("call-q", 0)].answer_item_id,
+            "user-1"
+        );
+    }
+
+    #[test]
+    fn async_active_unlinked_equal_echoes_are_ambiguous() {
+        let text = compose_async_answer("call-q", 0, "题", "答");
+        let mut steering = async_active_steering("s", "accepted", false, &text);
+        steering["serverUserMessageId"] = Value::Null;
+        steering["clientUserMessageId"] = Value::Null;
+        let state = canonical(
+            &[(
+                "a",
+                "inProgress",
+                vec![
+                    question_item("call-q", "题", &[]),
+                    steering,
+                    user_item("user-1", &text),
+                ],
+            )],
+            true,
+        );
+        assert!(!answer_witnesses("th", &state).contains_key(&question_item_id("call-q", 0)));
+    }
+
+    #[test]
+    fn async_active_linked_different_echoes_are_ambiguous() {
+        let first = compose_async_answer("call-q", 0, "题", "答一");
+        let second = compose_async_answer("call-q", 0, "题", "答二");
+        let state = canonical(
+            &[(
+                "a",
+                "inProgress",
+                vec![
+                    question_item("call-q", "题", &[]),
+                    async_active_steering("s", "accepted", false, &first),
+                    user_item("user-1", &second),
+                ],
+            )],
+            true,
+        );
+        assert!(!answer_witnesses("th", &state).contains_key(&question_item_id("call-q", 0)));
+    }
+
     /// 策略允许异步答题的 ops（`OperationContext::default()` 会让题落
     /// TemporarilyBlocked，掩盖「真待答」的断言）。
     fn ops_allowing_async() -> EffectiveOperations {
@@ -1934,6 +2403,86 @@ mod r18_placeholder_tests {
             },
         );
         OperationPolicy.evaluate(&context)
+    }
+
+    #[test]
+    fn b1_history_analysis_passes_do_not_scale_with_question_count() {
+        use super::super::history_view::STRICT_GAP_SCANS;
+        let mut questions = Vec::new();
+        for index in 0..32 {
+            questions.push(question_item(&format!("q-{index}"), "Q", &[]));
+        }
+        let state = canonical(
+            &[("q", "completed", questions), ("tail", "completed", vec![])],
+            true,
+        );
+        STRICT_GAP_SCANS.with(|count| count.set(0));
+        let _ = answer_witnesses("th", &state);
+        let scans = STRICT_GAP_SCANS.with(|count| count.get());
+        assert!(
+            scans <= 1,
+            "strict history scans must not scale with questions: {scans}"
+        );
+    }
+
+    #[test]
+    fn b1_projection_history_passes_do_not_scale_with_question_count() {
+        use super::super::history_view::STRICT_GAP_SCANS;
+        let questions = (0..32)
+            .map(|index| question_item(&format!("q-{index}"), "Q", &[]))
+            .collect();
+        let state = canonical(
+            &[("q", "completed", questions), ("tail", "completed", vec![])],
+            true,
+        );
+        STRICT_GAP_SCANS.with(|count| count.set(0));
+        let projected = AsyncQuestionProjector.project(&key(), None, &state, &ops_allowing_async());
+        assert_eq!(projected.len(), 32);
+        assert!(projected
+            .iter()
+            .all(|q| q.state == InteractionState::Pending));
+        let scans = STRICT_GAP_SCANS.with(|count| count.get());
+        assert!(
+            scans <= 1,
+            "projection rescans strict history per question: {scans}"
+        );
+    }
+
+    #[test]
+    fn b1_coverage_measurement_matches_repeated_baseline() {
+        use std::time::Instant;
+        for turn_count in [16usize, 256] {
+            let mut state = canonical(
+                &[("q", "completed", vec![question_item("q", "Q", &[])])],
+                true,
+            );
+            for index in 1..turn_count {
+                let id = format!("t-{index}");
+                let key = format!("turn:{id}");
+                state["turnHistory"]["history"]["entitiesByKey"][&key] =
+                    json!({"turnId": id, "status":"completed", "items": []});
+                state["turnHistory"]["history"]["islands"][0]["entries"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(json!({"value": key}));
+            }
+            let view = HistoryView::new(&state);
+            let turns = view.turns();
+            for question_count in [1usize, 32, 256, 512] {
+                let started = Instant::now();
+                let baseline: Vec<_> = (0..question_count)
+                    .map(|_| coverage_since(&turns, 0, view.strict_gap_after_turn("q")))
+                    .collect();
+                let before = started.elapsed();
+                let started = Instant::now();
+                let suffix = complete_coverage_suffix(&turns);
+                let after = started.elapsed();
+                assert!(baseline.iter().all(|coverage| (*coverage
+                    == AnswerCoverage::CompleteSinceQuestion)
+                    == suffix[0]));
+                eprintln!("coverage turns={turn_count} questions={question_count} bytes={} old_scans={question_count} new_scans=1 old_us={} new_us={} clones=0", serde_json::to_vec(&state).unwrap().len(), before.as_micros(), after.as_micros());
+            }
+        }
     }
 
     #[test]

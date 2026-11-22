@@ -5836,7 +5836,7 @@ dependencies = [
 
 [[package]]
 name = "tuvis"
-version = "0.6.6"
+version = "0.6.7"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -5882,6 +5882,7 @@ dependencies = [
  "trash",
  "wait-timeout",
  "windows 0.62.2",
+ "windows-core 0.62.2",
  "winreg",
  "zip 8.6.0",
  "zstd 0.14.0",

@@ -504,19 +504,103 @@ fn persist_and_cookie(
         via: via.to_string(),
         paired_at: now,
     };
-    let effective_id = st.store.with(|c| {
-        // 显式传指纹输入（**不是** origin_ip）：两个职责在 DAO 入口处分离
-        let effective =
-            crate::remote::pairing::persist_device_with_fingerprint(c, &dev, origin_fingerprint)
-                .unwrap_or_else(|_| device_id.to_string());
-        // 三终端语言自适应（L2 / §6.4-3）：**配对完成即清零该设备的手动语言记录**——
-        // 重新配对 = 回到自动跟随。upsert 命中旧行时设备 id 不变（同一浏览器不吊销
-        // 直接重配复用同一身份），不清零旧记录会穿越重配幸存。只影响语言跟随，
-        // 配对身份/名额语义零改动（全局约束 12）；与 persist 同一 with 闭包
-        // （DeviceStore 锁不可重入，勿拆两段）
-        crate::remote::language::clear_manual_language(c, &effective);
-        effective
-    });
+    // Source/live（B2/F6.26 + M4 审查修复·round3）：正常分支严格「先票后读」——
+    // ① 用与 persist 完全相同的已计算指纹（`fingerprint_for(ua, origin_fingerprint)`，
+    //    **不是**原始 IP）在存储临界区内探测实际目标；② 对目标取票（失效先行）；
+    // ③ 同一存储临界区 persist + 读回真实行；④ 按读回提交。探测→persist 之间的
+    // 并发（指纹行被吊销/他人新建）由 persist 权威裁决：effective ≠ 目标票 id 时，
+    // 本票保守 Unknown（不覆盖他人事实）并对实际 id 补一轮「票→读→提交」。
+    // persist 失败/读失败 → 保守 Unknown（持久化失败不阻断配对，cookie 兜底既有）。
+    let live = st.codex_control.question_skip_live();
+    let fingerprint = crate::remote::pairing::fingerprint_for(ua, origin_fingerprint);
+    // ① 探测实际目标（与 persist 同指纹判据）
+    let target_id = st
+        .store
+        .with(|c| crate::remote::pairing::fingerprint_target_conn(c, fingerprint.as_str()))
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| device_id.clone());
+    // ② 失效先行：对真实目标取票
+    let device_update = live
+        .begin_gate_change(
+            crate::services::codex_question_skip::live::LiveFactKey::Device(target_id.clone()),
+        )
+        .ok();
+    // ③ persist + 读回（同一存储临界区；票已先行）
+    let (effective_id, revoked_read) = st
+        .store
+        .with(|c| -> Result<(String, Option<i64>), String> {
+            use rusqlite::OptionalExtension;
+            // 显式传指纹输入（**不是** origin_ip）：两个职责在 DAO 入口处分离
+            let effective = crate::remote::pairing::persist_device_with_fingerprint(
+                c,
+                &dev,
+                origin_fingerprint,
+            )
+            .unwrap_or_else(|_| device_id.to_string());
+            // 三终端语言自适应（L2 / §6.4-3）：**配对完成即清零该设备的手动语言记录**——
+            // 重新配对 = 回到自动跟随。upsert 命中旧行时设备 id 不变（同一浏览器不吊销
+            // 直接重配复用同一身份），不清零旧记录会穿越重配幸存。只影响语言跟随，
+            // 配对身份/名额语义零改动（全局约束 12）；与 persist 同一 with 闭包
+            // （DeviceStore 锁不可重入，勿拆两段）
+            crate::remote::language::clear_manual_language(c, &effective);
+            let revoked: Option<i64> = c
+                .query_row(
+                    "SELECT revoked FROM remote_devices WHERE id = ?1",
+                    [&effective],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(|e| e.to_string())?;
+            Ok((effective, revoked))
+        })
+        .unwrap_or_else(|_| (device_id.clone(), None));
+    // ④ 提交：目标与实际身份一致 → 按读回提交；不一致（探测后并发改写）→ 本票
+    // 保守 Unknown（不覆盖他人事实）并对实际 id 补一轮「票→读→提交」。
+    let observed_for = |revoked: Option<i64>| {
+        revoked
+            .map(
+                |revoked| crate::services::codex_question_skip::live::LiveFact::Device {
+                    paired: true,
+                    revoked: revoked != 0,
+                    control_right: revoked == 0,
+                },
+            )
+            .ok_or(crate::services::codex_question_skip::live::LiveRefusal::Unknown)
+    };
+    if let Some(update) = device_update {
+        if target_id == effective_id {
+            let _ = live.finish_gate_change(update, observed_for(revoked_read));
+        } else {
+            let _ = live.finish_gate_change(
+                update,
+                Err(crate::services::codex_question_skip::live::LiveRefusal::Unknown),
+            );
+            if let Ok(update2) = live.begin_gate_change(
+                crate::services::codex_question_skip::live::LiveFactKey::Device(
+                    effective_id.clone(),
+                ),
+            ) {
+                use rusqlite::OptionalExtension;
+                let observed = st
+                    .store
+                    .with(|c| -> rusqlite::Result<Option<i64>> {
+                        c.query_row(
+                            "SELECT revoked FROM remote_devices WHERE id = ?1",
+                            [&effective_id],
+                            |r| r.get(0),
+                        )
+                        .optional()
+                    })
+                    .ok()
+                    .map(observed_for)
+                    .unwrap_or_else(|| {
+                        Err(crate::services::codex_question_skip::live::LiveRefusal::Unknown)
+                    });
+                let _ = live.finish_gate_change(update2, observed);
+            }
+        }
+    }
     (
         [(
             axum::http::header::SET_COOKIE,
@@ -933,12 +1017,13 @@ enum FileReadOutcome {
 }
 
 /// GET /m/api/v1/file?session_id=&path=（M3 Task 8；M5 P2-a 全盘语义）
-/// 安全文件只读读取（read_file_safe：任意路径、敏感目录黑名单、只读、
-/// 双阈值 500KB/5MB——2026-09-18 用户裁决放开项目外文件预览）。
+/// 安全文件只读读取（read_file_safe：任意路径可读、只读、双阈值 500KB/5MB，
+/// 实际读取同样有界——2026-11-12 note §三（宪法 D22）取消目录级准入，
+/// 信任边界回到已授权总闸门；`SENSITIVE_DIRS` 仅创建域消费）。
 /// - 缺参 / 空白 → 400；session_id 不在会话快照 → 404；
 /// - 图片 mime → 二进制响应 + Content-Type；文本 → JSON `{content, mime, size}`；
-/// - 拒绝（敏感目录/不存在/超限/目录/IO）→ 403 + `{"error":"<reason>"}`（snake_case
-///   原因码：sensitive/too_large/not_found/not_file/io，前端据此分診文案）+ log::warn；
+/// - 拒绝（不存在/超限/目录/IO）→ 403 + `{"error":"<reason>"}`（snake_case
+///   原因码：too_large/not_found/not_file/io，前端据此分診文案）+ log::warn；
 /// - cwd 查找与文件读取同在一个 `spawn_blocking` 里：会话快照源是同步阻塞调用
 ///   （sysinfo 全进程刷新，实机教训见 commands/session.rs），文件 IO 同为重活。
 pub async fn read_file(
@@ -1174,7 +1259,7 @@ pub(crate) fn json_no_store(status: StatusCode, body: serde_json::Value) -> Resp
 }
 
 /// 400 bad_request（缺参 / 空 text / 超长）
-fn bad_request() -> Response {
+pub(crate) fn bad_request() -> Response {
     json_no_store(
         StatusCode::BAD_REQUEST,
         serde_json::json!({ "error": "bad_request" }),
@@ -1182,7 +1267,7 @@ fn bad_request() -> Response {
 }
 
 /// 403 防御（gate 已拦设备，理论不可达——handler 直取 cookie 失败时兜底）
-fn forbidden_defense() -> Response {
+pub(crate) fn forbidden_defense() -> Response {
     json_no_store(
         StatusCode::FORBIDDEN,
         serde_json::json!({ "error": "forbidden" }),
@@ -1192,7 +1277,10 @@ fn forbidden_defense() -> Response {
 /// 设备侧公共前置：cookie 提取（防御 403 的判定源）+ 花名查询（查无回落 unknown）。
 /// 返回 `None` = 无有效 cookie（调用方统一给 403 防御响应；不在此构造 Response，
 /// 规避 clippy::result_large_err 的大 Err 变体）
-fn device_identity(st: &RemoteState, headers: &axum::http::HeaderMap) -> Option<(String, String)> {
+pub(crate) fn device_identity(
+    st: &RemoteState,
+    headers: &axum::http::HeaderMap,
+) -> Option<(String, String)> {
     let device_id = super::gate::extract_device(headers)?;
     let device_name = st
         .store

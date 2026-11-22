@@ -69,13 +69,16 @@ The screenshot above shows the site's interactive demo.
 - **Codex APP per-operation adaptation** (F01–F08): Tuvis identifies the **running desktop
   contract** read-only and unlocks actions one by one — plain messages, blocking Q&A
   (multi-question / multi-value / free text), command and file approvals (approve / reject /
-  cancel the turn), targeted interrupt, and **idle async answers**. Desktop updates normally need
+  cancel the turn), targeted interrupt, and **async answers while idle or running**. Desktop updates normally need
   no version registration; when identification is uncertain the affected actions stay closed with
   a stated reason — no guessing, no blind writes.
-  - **Async questions**: while a turn is running the draft is kept and the card says it cannot be
-    submitted yet, with the reason; once idle you press "Submit answer" and it is delivered
-    **once** as the official envelope (never through the plain-message queue). If the related
-    history is incomplete the card shows "status unconfirmed" and will not answer for you.
+  - **Async questions**: once the separate running-answer contract matches and Auto-adapt is
+    enabled, you can submit the group while the model runs. The model keeps running, and the
+    existing queue pause and other queued messages stay unchanged. After acceptance, the group
+    closes only when the desktop's formal answer is confirmed; unknown results are checked
+    read-only under the original action and are never resent automatically. If state or history
+    is unconfirmed, or a native blocking request is present, the draft is kept: handle the stated
+    reason before submitting again.
   - **Approvals**: "Reject" rejects only this request (the turn continues); "Cancel the turn"
     interrupts the turn. When a file summary cannot be read there is no "Approve" entry — only
     reject or cancel.
@@ -99,7 +102,7 @@ The session detail page (ZCode-style conversation view, unified across all eight
 - Expand details while running (thinking / tool calls are collapsible), auto-collapse to the final summary once a turn completes
 - Markdown rendering (headings / lists / tables / code highlighting); project file paths in the text become clickable links
 - **File panel**: aggregates the files a session touched, newest first, with document/image filters and a **200 / 500 / 1000 message** look-back range; **modified** files are highlighted and **read-only** ones are neutral (both previewable), and tapping the secondary line reveals the full path. The four sources — including "**Session artifacts**" — are described under "What your phone can do" above
-- **File preview**: markdown / syntax highlighting / inline images; three switchable layouts — side-by-side (chat left, file right), stacked, and fullscreen overlay — with a draggable splitter; readable scope is the session project directory plus your home directory (sensitive directories such as keys are always refused)
+- **File preview**. View Markdown, syntax-highlighted code and images. Choose side-by-side, stacked or fullscreen, and drag the splitter to resize. Paired devices can preview regular files the operating system allows Tuvis to read, up to 500 KiB for text and 5 MiB for images.
 - **Transfer progress and honest bandwidth disclosure**: uploads and downloads both show a **progress bar** (bytes transferred / percentage / instantaneous rate / ETA); **when the rate or the total size is unknown it shows bytes transferred only and never invents a percentage**. On a bandwidth-limited tunnel channel the file panel and the attachment area say **in place** that this is a channel limit, not a malfunction, with time estimates based on this channel's measured rate (about 1.5 minutes to download and 3.3 minutes to upload a 20 MB attachment) and a **full-speed upgrade path** (install Tailscale on your phone and join the tailnet to connect directly, 1–2 orders of magnitude faster)
 - **Message bookmarks**: mark a spot to revisit with a colored dot (up to 10, one per color), jump back by tapping it, delete individually or clear all; stored in the browser — refresh-proof, cleared when Tuvis restarts or the tab is closed
 - **Font size**: 50% / 75% / 100% / 125% for message text, file content, and the question / options / free-input text of Codex async question cards; interface controls and buttons such as submit do not scale
@@ -125,9 +128,10 @@ Not just looking — you can **act**: send messages, approve tool calls, answer 
 
 **Mobile remote control status (v0.5.0, experimental)**: message viewing and file preview cover 7 of the 8 tools (OpenClaw's black-box build is not remotely readable yet); **sending messages to CLI sessions and creating sessions from your phone are experimental**, currently supporting Claude Code / Codex CLI / OpenCode / Kimi Code. Messages are injected as keystrokes into the terminal and verified by screen-reading receipts (no false "delivered"); queueing, interrupt-and-jump, remote approvals, question answering, permission-mode switching, and session creation are included. Illustrated walkthroughs live in the Chinese manual; per-tool statuses and limitations are listed below.
 
-**Codex Desktop adaptive control (0.6.3, experimental)**: Tuvis reads the running Desktop contract and unlocks actions per operation — plain messages, blocking Q&A (multi-question / multi-value / free text), command and file approvals (accept / decline / cancel), targeted interrupt, and idle async answers. An unknown build attempts sends under target/state/protocol guards; destructive actions stay evidence-gated. Desktop sessions never fall back to headless.
+**Codex Desktop adaptive control (experimental)**: Tuvis reads the running Desktop contract and unlocks actions per operation — plain messages, blocking Q&A (multi-question / multi-value / free text), command and file approvals (accept / decline / cancel), targeted interrupt, and async answers while idle or running. An unknown build attempts sends under target/state/protocol guards; destructive actions stay evidence-gated. Desktop sessions never fall back to headless.
 
-- **Archiving and submitting async questions**: formal answers on Desktop or the remote page dismiss the matching card on the other side. Fill drafts while a turn runs and submit once Desktop is idle. When an unanswered card is skipped or closed in Desktop, use the archive action in Tuvis to hide the group. “Restore” brings back the archived groups in the current list and keeps drafts on the page.
+- **Skip and restore async questions**. In a single-question group, select “Skip this question” and choose to skip it in Tuvis only. Eligible Windows sessions can pair with the desktop card and attempt to close it. Tuvis shows the two results separately. “Restore display” brings back the Tuvis card. Handle the desktop card on Desktop. Groups with multiple questions can still be archived and restored.
+- **Blocking question cards**. Use “Previous” and “Next” to move between questions, then submit once from the last question. “Skip (Tuvis only)” collapses the whole card in this tab. Select “Still pending · expand” to reopen it. The page keeps your place and draft until you refresh, when you start again at the first question. Pending desktop questions still restrict ordinary sends.
 - **Grouped async questions**: one card per source group; fill question by question, previous/next keeps drafts, and submit the whole group once from the last question. When several groups are waiting, the dock shows the current group only and a "{{count}} more group(s)" entry expands the list of the other waiting groups to switch between (answered groups are not counted). Long question stems collapse to three lines with "Show full question" / "Collapse question"; free-text input starts collapsed behind "Other answer"; the question, options and free-input text follow the session font-size setting while submit and other buttons keep their size. Answered groups close automatically and do not return after refresh.
 - **Answer mode**: options and free text are mutually exclusive. Choosing an option clears old text; typing text clears the visible option. A restored old option that no longer exists is placed in the visible text field — Tuvis never submits an invisible answer.
 - **Limits**: fully verified = current-package contract matches and the action has local observed success; compatible = unknown build sends under guards (destructive actions still require evidence); unsupported = Plan-mode approval, permissions switching, and interrupt without an active turn. Windows and 360/390 screenshots remain per-item acceptance; macOS `26.1021.31345` is probe-backed.

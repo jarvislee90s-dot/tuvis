@@ -26,7 +26,22 @@ import {
   type CodexAsyncQuestionView,
   type CodexActionVerifyView,
 } from "./codexIpcApi";
+import { groupIdentityKey, type GroupDisplayView } from "./codexQuestionSkipApi";
 import { ApiError } from "./api";
+import {
+  commitDraftEnvelope,
+  convertDraftEnvelope,
+  isolatedDraftRecords,
+  loadDraftEnvelope,
+  peekVerifiedDraftGroup,
+  rememberVerifiedDraftGroup,
+  transferDraftValue,
+  withDraftValue,
+  withoutDraftRecord,
+  type DraftEnvelope,
+  type DraftRecord,
+  type DraftScope,
+} from "./draftEnvelope";
 import InteractiveCard from "./InteractiveCard";
 import QuestionChoiceRow from "./QuestionChoiceRow";
 
@@ -38,12 +53,10 @@ const PAUSE_REASON = "operation_queue_paused";
 
 type Phase = "idle" | "submitting" | "submitted" | "unknown" | "confirmed";
 
-type StaleDraft = {
-  id: string;
-  questionKey: string;
-  title: string;
-  selected: string | null;
-  text: string;
+const EMPTY_ENVELOPE: DraftEnvelope = {
+  version: 1,
+  scope: { sessionId: "", sourceTurnId: "", sourceItemId: "" },
+  records: [],
 };
 
 type VerifyResult =
@@ -60,10 +73,6 @@ function memberIdentity(question: CodexAsyncQuestionView): string {
     question.title,
     question.options,
   ]);
-}
-
-function draftKey(question: CodexAsyncQuestionView): string {
-  return `${question.questionKey}\u0000${question.contextToken}`;
 }
 
 function groupStorageKey(sessionId: string, members: CodexAsyncQuestionView[]): string {
@@ -83,6 +92,13 @@ export interface AsyncQuestionGroupCardProps {
    * 保持稳定操作尺寸。默认 1（主题原值）。
    */
   fontScale?: number;
+  /**
+   * 服务端投影确证的组展示事实（questionDisplayGroups 中本组的最新条目）。
+   * 在场 = 组归属已验证：同组 + 同题体时 **token 轮换自动回填稿**（不隔离）；
+   * 缺省（旧后端/无事实）= 保持旧行为（token 变化即隔离旧稿）。草稿归属与
+   * skip 资格判定分开：本 prop 不授予任何 skip 资格。
+   */
+  questionDisplayGroup?: GroupDisplayView;
 }
 
 export default function AsyncQuestionGroupCard({
@@ -91,6 +107,7 @@ export default function AsyncQuestionGroupCard({
   onChanged,
   onArchive,
   fontScale = 1,
+  questionDisplayGroup,
 }: AsyncQuestionGroupCardProps) {
   const members = useMemo(
     () => [...questions].sort((a, b) => a.questionIndex - b.questionIndex),
@@ -113,12 +130,66 @@ export default function AsyncQuestionGroupCard({
     () => (members.length > 0 ? groupStorageKey(sessionId, members) : ""),
     [sessionId, members]
   );
-  const [index, setIndex] = useState(0);
-  const [drafts, setDrafts] = useState<Record<string, { selected: string | null; text: string }>>(
-    {}
+  // ===== DraftEnvelope（唯一 SSOT）=====
+  // 组件只持仓库的镜像（envelope + 成员→记录 id）；所有草稿写操作都在事件处理器 /
+  // layout effect 中同步 commit 到仓库，render 期不写仓库（防 Suspense 污染）。
+  const scope = useMemo<DraftScope | null>(
+    () =>
+      members.length > 0
+        ? {
+            sessionId,
+            sourceTurnId: members[0].sourceTurnId,
+            sourceItemId: members[0].sourceItemId,
+          }
+        : null,
+    [sessionId, members]
   );
+  // descriptor 两组分离：matchGroup（含 lastKnown memo）只用于**旧稿匹配**；seed
+  // /升级 origin 只认**当前帧确证**（prop 缺席时新 body seed 一律 unverified——
+  // lastKnown 不得认领新 body）。prop 缺席 ≠ 已证换代：已 verified 非空稿不丢。
+  const matchGroup = useMemo(
+    () => (scope !== null ? peekVerifiedDraftGroup(scope, questionDisplayGroup?.group) : null),
+    [scope, questionDisplayGroup]
+  );
+  const seedGroup = questionDisplayGroup?.group ?? null;
+  const verifiedKey = matchGroup !== null ? groupIdentityKey(matchGroup) : "";
+  const scopeKey =
+    scope !== null
+      ? `${scope.sessionId}\u0000${scope.sourceTurnId}\u0000${scope.sourceItemId}`
+      : "";
+  const [envelope, setEnvelope] = useState<DraftEnvelope>(() =>
+    scope !== null ? loadDraftEnvelope(scope) : EMPTY_ENVELOPE
+  );
+  /** 成员（排序后）到活动记录 id 的并行表（layout effect 转换产物；render 只读）。 */
+  const [memberIds, setMemberIds] = useState<string[]>([]);
+  const envelopeRef = useRef(envelope);
+  /** null = 尚未落槽（首挂载按换槽处理：读锚、建引用表）。 */
+  const scopeKeyRef = useRef<string | null>(null);
+  /** 内容指纹（verified = 组身份+题体，不含 token；unverified = 旧行为含 token）。
+   *  仅用于判定「内容真变」（推进轮次/复核现场重置），token 轮换不触发。 */
+  const contentFingerprintRef = useRef<string | null>(null);
+  /** 成员内容指纹：确证匹配组不含 token（轮换回填、不隔离）；无匹配组 = 旧行为。 */
+  const contentFingerprint = useMemo(
+    () =>
+      members.length === 0
+        ? ""
+        : `${verifiedKey}|${members
+            .map((question) =>
+              matchGroup !== null
+                ? JSON.stringify([
+                    question.questionKey,
+                    question.questionIndex,
+                    question.title,
+                    question.options,
+                  ])
+                : memberIdentity(question)
+            )
+            .join("|")}`,
+    [members, matchGroup, verifiedKey]
+  );
+  const [index, setIndex] = useState(0);
   // T04（spec §3.5）：自由填写默认收起；用户的显式展开/收起按题记忆，覆盖自动行为
-  // （undefined = 未显式操作 → 有自由稿自动展开）。显式收起**不丢稿**——稿在 drafts。
+  // （undefined = 未显式操作 → 有自由稿自动展开）。显式收起**不丢稿**——稿在信封。
   const [freeExplicit, setFreeExplicit] = useState<Record<string, boolean>>({});
   // T04（spec §3.6，集中审查 D4 修订）：长题干三行收纳按**实测布局溢出**判定——
   // line-clamp-3 恒开（展开态除外），「展开全文」入口只在量得 scrollHeight >
@@ -128,7 +199,6 @@ export default function AsyncQuestionGroupCard({
   const titleRef = useRef<HTMLParagraphElement | null>(null);
   const [titleOverflow, setTitleOverflow] = useState<Record<string, boolean>>({});
   const [titleExpanded, setTitleExpanded] = useState<Record<string, boolean>>({});
-  const [staleDrafts, setStaleDrafts] = useState<StaleDraft[]>([]);
   const [staleOpen, setStaleOpen] = useState(false);
   const [phase, setPhase] = useState<Phase>("idle");
   const [receipt, setReceipt] = useState<ActionReceipt | null>(null);
@@ -146,7 +216,6 @@ export default function AsyncQuestionGroupCard({
   const pollRef = useRef<number | null>(null);
   const pollTokenRef = useRef(0);
   const aliveRef = useRef(true);
-  const membersRef = useRef(members);
   const currentKey = live[Math.min(index, Math.max(0, live.length - 1))]?.questionKey;
   const currentIndex = Math.max(
     0,
@@ -190,53 +259,58 @@ export default function AsyncQuestionGroupCard({
     }
   };
 
-  // J06：任一成员换代 → 推进轮次，旧稿移到独立隔离区（可查看/恢复/丢弃）。
-  useEffect(() => {
-    submitEpochRef.current += 1;
-    setIndex(0);
-    setPhase("idle");
-    setReceipt(null);
-    setError(null);
-    setTimedOut(false);
-    setConfirmedAnsweredKeys([]);
-    clearPoll();
-    const previousMembers = new Map(
-      membersRef.current.map((question) => [draftKey(question), question])
-    );
-    setDrafts((prev) => {
-      const valid = new Map(members.map((q) => [draftKey(q), q]));
-      const next: Record<string, { selected: string | null; text: string }> = {};
-      const stale: StaleDraft[] = [];
-      for (const [key, draft] of Object.entries(prev)) {
-        if (valid.has(key)) {
-          next[key] = draft;
-          continue;
-        }
-        if ((draft.text ?? "").trim().length > 0 || draft.selected !== null) {
-          const source = previousMembers.get(key);
-          stale.push({
-            id: key,
-            questionKey: source?.questionKey ?? key,
-            title: source?.title ?? key,
-            selected: draft.selected,
-            text: draft.text,
-          });
-        }
+  // J06（DraftEnvelope 版）：成员/组变化 → **一次纯转换**（seed 新成员、verified 组
+  // 回填 observedToken、旧记录原样保留为隔离态——绝不先清后隔离），layout 内同步
+  // commit 完整 next（仓库 + state 镜像 + 引用表）。内容真变（verified 组不含
+  // token；无确证组 = 旧行为含 token）才推进轮次并重读锚；纯 token 轮换不重置。
+  useLayoutEffect(() => {
+    if (scope === null) return;
+    // descriptor memo 写入只在 layout（render 纯读）：显式服务端确证在场即刷新 lastKnown。
+    if (questionDisplayGroup?.group != null)
+      rememberVerifiedDraftGroup(scope, questionDisplayGroup.group);
+    let current = envelopeRef.current;
+    const scopeChanged = scopeKeyRef.current !== scopeKey;
+    if (scopeChanged) {
+      scopeKeyRef.current = scopeKey;
+      current = loadDraftEnvelope(scope); // 换槽位：旧会话镜像不跨槽
+    }
+    const {
+      envelope: next,
+      changed,
+      memberRecordIds,
+    } = convertDraftEnvelope(current, scope, members, matchGroup, seedGroup);
+    const contentChanged =
+      contentFingerprintRef.current !== null &&
+      contentFingerprintRef.current !== contentFingerprint;
+    contentFingerprintRef.current = contentFingerprint;
+    // 同一完整 next 一次提交：仓库 → 镜像 state → 引用表（顺序固定）。
+    if (changed || scopeChanged) {
+      if (commitDraftEnvelope(scope, next)) {
+        envelopeRef.current = next;
+        setEnvelope(next);
       }
-      if (stale.length > 0) setStaleDrafts((old) => [...stale, ...old]);
-      return next;
-    });
-    membersRef.current = members;
-    const anchor = window.sessionStorage.getItem(storageKey);
-    actionIdRef.current = anchor;
-    setHasAnchor(anchor !== null && !retiredActionsRef.current.has(anchor));
-    if (anchor && !retiredActionsRef.current.has(anchor)) setPhase("unknown");
-    if (deadlineRef.current !== null) {
-      window.clearTimeout(deadlineRef.current.timer);
-      deadlineRef.current = null;
+    }
+    setMemberIds(memberRecordIds);
+    if (contentChanged || scopeChanged) {
+      submitEpochRef.current += 1;
+      setIndex(0);
+      setPhase("idle");
+      setReceipt(null);
+      setError(null);
+      setTimedOut(false);
+      setConfirmedAnsweredKeys([]);
+      clearPoll();
+      const anchor = window.sessionStorage.getItem(storageKey);
+      actionIdRef.current = anchor;
+      setHasAnchor(anchor !== null && !retiredActionsRef.current.has(anchor));
+      if (anchor && !retiredActionsRef.current.has(anchor)) setPhase("unknown");
+      if (deadlineRef.current !== null) {
+        window.clearTimeout(deadlineRef.current.timer);
+        deadlineRef.current = null;
+      }
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [fingerprint, storageKey]);
+  }, [fingerprint, verifiedKey, storageKey]);
 
   // 全部成员正式回答 → 立即核销（投影 answered 即 Desktop 已收下答案；
   // 不再要求本卡先经历 submitted 阶段，否则 Unknown 恢复的卡会永远堆在底部）。
@@ -256,8 +330,27 @@ export default function AsyncQuestionGroupCard({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [members, phase]);
 
+  // ==== 草稿读写（信封镜像派生；render 只读，写只在事件处理器内同步 commit）====
+  /** UI 记忆键（展开/收起等按题记忆；沿用旧 qkey+token 形态，不含草稿值）。 */
+  const draftKey = (question: CodexAsyncQuestionView): string =>
+    `${question.questionKey}\u0000${question.contextToken}`;
+  const recordFor = (question: CodexAsyncQuestionView): DraftRecord | null => {
+    const memberIndex = members.indexOf(question);
+    if (memberIndex < 0) return null;
+    const id = memberIds[memberIndex];
+    if (id === undefined) return null;
+    return envelope.records.find((record) => record.id === id) ?? null;
+  };
+  /** 同步草稿写：完整 next 一次提交（仓库 → 镜像 state 同拍；scope 守卫在 commit 内）。 */
+  const writeDraft = (next: DraftEnvelope) => {
+    if (scope === null) return;
+    if (commitDraftEnvelope(scope, next)) {
+      envelopeRef.current = next;
+      setEnvelope(next);
+    }
+  };
   const draftFor = (question: CodexAsyncQuestionView) =>
-    drafts[draftKey(question)] ?? { selected: null, text: "" };
+    recordFor(question)?.value ?? { selected: null, text: "" };
   const answerFor = (question: CodexAsyncQuestionView): string => {
     const draft = draftFor(question);
     if (draft.text.trim().length > 0) return draft.text.trim();
@@ -271,16 +364,15 @@ export default function AsyncQuestionGroupCard({
     question: CodexAsyncQuestionView,
     patch: Partial<{ selected: string | null; text: string }>
   ) => {
-    const key = draftKey(question);
-    setDrafts((prev) => ({
-      ...prev,
-      [key]: {
-        selected: prev[key]?.selected ?? null,
-        text: prev[key]?.text ?? "",
-        ...patch,
-      },
-    }));
+    const record = recordFor(question);
+    if (record === null) return;
+    writeDraft(withDraftValue(envelopeRef.current, record.id, patch));
   };
+  /** 隔离旧稿（有非空值且不属于任何当前成员的活动记录）。 */
+  const staleRecords = useMemo(
+    () => isolatedDraftRecords(envelope, memberIds),
+    [envelope, memberIds]
+  );
 
   const allLiveAnswered = live.length > 0 && live.every((q) => answerFor(q).length > 0);
   /** T04：自由填写展开态——显式操作优先；未显式操作时，有自由稿自动展开。 */
@@ -541,23 +633,37 @@ export default function AsyncQuestionGroupCard({
     }
   };
 
-  const restoreStale = (stale: StaleDraft) => {
-    const target = members.find((q) => q.questionKey === stale.questionKey);
-    if (!target) return;
-    const hasText = (stale.text ?? "").trim().length > 0;
+  const restoreStale = (stale: DraftRecord) => {
+    const meta = stale.question;
+    // 元数据不可知的旧记录无处恢复——不猜目标。
+    if (meta === null || scope === null) return;
+    const matches = members.filter(
+      (question) =>
+        question.questionKey === meta.questionKey && question.questionIndex === meta.questionIndex
+    );
+    // 恢复目标 = 当前同 source 的真实 qkey/index **唯一**成员；不唯一即放弃（不猜）。
+    if (matches.length !== 1) return;
+    const target = matches[0];
+    const targetRecord = recordFor(target);
+    if (targetRecord === null) return;
+    // 不覆盖非空：目标已有可见稿时不做任何迁移（用户可先清空再恢复）。
+    if (targetRecord.value.text.trim().length > 0 || targetRecord.value.selected !== null) return;
+    const hasText = (stale.value.text ?? "").trim().length > 0;
     // R01：旧选项可能已被新题移除。只有仍存在时才恢复为选中；否则把旧标签
     // 落到**可见自由输入**，保证“看见什么就提交什么”，绝不留下隐形 selected。
-    const optionExists = stale.selected !== null && target.options.includes(stale.selected);
-    setDrafts((prev) => ({
-      ...prev,
-      [draftKey(target)]: hasText
-        ? { selected: null, text: stale.text }
-        : optionExists
-          ? { selected: stale.selected, text: "" }
-          : { selected: null, text: stale.selected ?? "" },
-    }));
-    setStaleDrafts((prev) => prev.filter((item) => item.id !== stale.id));
+    const optionExists =
+      stale.value.selected !== null && target.options.includes(stale.value.selected);
+    const value = hasText
+      ? { selected: null, text: stale.value.text }
+      : optionExists
+        ? { selected: stale.value.selected, text: "" }
+        : { selected: null, text: stale.value.selected ?? "" };
+    writeDraft(transferDraftValue(envelopeRef.current, stale.id, targetRecord.id, value));
     setIndex(0);
+  };
+  const discardStale = (stale: DraftRecord) => {
+    if (scope === null) return;
+    writeDraft(withoutDraftRecord(envelopeRef.current, stale.id));
   };
 
   if (members.length === 0) return null;
@@ -610,7 +716,7 @@ export default function AsyncQuestionGroupCard({
           {i18n.t("mobile.codex.async.queuePausedNote")}
         </p>
       )}
-      {staleDrafts.length > 0 && (
+      {staleRecords.length > 0 && (
         <div
           data-testid="codex-async-stale-note"
           className="mt-2 rounded-lg bg-amber-500/10 px-2 py-1 text-xs text-amber-800 dark:text-amber-300"
@@ -621,33 +727,33 @@ export default function AsyncQuestionGroupCard({
             onClick={() => setStaleOpen((value) => !value)}
             className="underline"
           >
-            {i18n.t("mobile.codex.async.staleDraft", { count: staleDrafts.length })}
+            {i18n.t("mobile.codex.async.staleDraft", { count: staleRecords.length })}
           </button>
           {staleOpen &&
-            staleDrafts.map((stale) => (
+            staleRecords.map((stale) => (
               <div
                 key={stale.id}
                 data-testid="codex-async-stale-item"
                 className="mt-1 flex flex-wrap items-center justify-between gap-2"
               >
                 <span className="min-w-0 truncate">
-                  {stale.title}: {stale.text || stale.selected}
+                  {stale.question?.title ?? stale.id}: {stale.value.text || stale.value.selected}
                 </span>
                 <span className="flex shrink-0 gap-2">
-                  <button
-                    type="button"
-                    data-testid="codex-async-stale-restore"
-                    onClick={() => restoreStale(stale)}
-                    className="underline"
-                  >
-                    {i18n.t("mobile.codex.async.restoreDraft")}
-                  </button>
+                  {stale.question !== null && (
+                    <button
+                      type="button"
+                      data-testid="codex-async-stale-restore"
+                      onClick={() => restoreStale(stale)}
+                      className="underline"
+                    >
+                      {i18n.t("mobile.codex.async.restoreDraft")}
+                    </button>
+                  )}
                   <button
                     type="button"
                     data-testid="codex-async-stale-discard"
-                    onClick={() =>
-                      setStaleDrafts((prev) => prev.filter((item) => item.id !== stale.id))
-                    }
+                    onClick={() => discardStale(stale)}
                     className="underline"
                   >
                     {i18n.t("mobile.codex.async.discardDraft")}

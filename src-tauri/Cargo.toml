@@ -1,6 +1,6 @@
 [package]
 name = "tuvis"
-version = "0.6.6"
+version = "0.6.7"
 description = "你的桌面多 Agent 指挥台"
 authors = ["jarvis"]
 edition = "2021"
@@ -153,7 +153,10 @@ junction = "2.1"
 # Win32_UI_Input_KeyboardAndMouse（M9R：VkKeyScanW/MapVirtualKeyW 真实键位布局）；
 # Win32_UI_WindowsAndMessaging：win32（窗口枚举）/ tuvis-marker（跳转 marker）/
 # deep_link（深链）
-windows = { version = "0.62", features = ["Win32_Security", "Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Accessibility", "Win32_UI_Shell", "Win32_System_Com", "Win32_System_Threading", "Win32_System_Console", "Win32_Storage_FileSystem", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Power", "Win32_System_Registry", "Win32_NetworkManagement_IpHelper", "Win32_Networking_WinSock", "Win32_System_JobObjects", "Win32_System_Pipes", "Win32_Security_Credentials"] }
+windows = { version = "0.62", features = ["Win32_Security", "Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Accessibility", "Win32_UI_Shell", "Win32_System_Com", "Win32_System_Threading", "Win32_System_Console", "Win32_Storage_FileSystem", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Power", "Win32_System_Registry", "Win32_NetworkManagement_IpHelper", "Win32_Networking_WinSock", "Win32_System_JobObjects", "Win32_System_Pipes", "Win32_Security_Credentials", "Win32_System_Ole", "Win32_System_Variant", "Win32_Storage_Packaging_Appx"] }
+# windows::core::implement 宏展开引用 ::windows_core 绝对路径（事件 handler 实现
+# 必需）；与 windows 0.62.2 同链路，仅使 crate 名可直接寻址，不改版本。
+windows-core = "0.62"
 winreg = "0.55"
 
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]

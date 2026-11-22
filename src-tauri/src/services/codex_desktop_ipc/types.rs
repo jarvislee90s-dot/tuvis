@@ -28,6 +28,137 @@ pub type AsyncWriteRecheck = std::sync::Arc<
         + Sync,
 >;
 
+// ============================================================
+// Task7：调度准入标记与私有 Frame 写出伴随（crate 内通用；不依赖 router/业务）
+// ============================================================
+
+/// [`AttemptAdmission`] 准入相位（单调推进，绝不回退）。
+const ADMISSION_PHASE_PENDING: u8 = 0;
+const ADMISSION_PHASE_ADMITTED: u8 = 1;
+const ADMISSION_PHASE_CLAIMED: u8 = 2;
+
+/// 调度准入判定闭包：`Some(reason)` = 有更优先的意图在册（busy_before_write 同
+/// 源拒绝）；`None` = 可准入。实现方（router）只在唯一 registry **短锁内**检查
+/// 有效意图并调用 [`AttemptAdmission::mark_admitted`] 完成线性化——短锁内无
+/// DB/await/native 回调。
+pub(crate) type AdmissionCheck =
+    std::sync::Arc<dyn Fn(&AttemptAdmission) -> Option<String> + Send + Sync>;
+
+/// Task7：**单次真实派发 attempt** 的调度准入标记。每个真实派发 attempt 新建
+/// 一个，不跨 attempt 复用；字段私有，经 crate 内方法推进：
+/// * `Pending → Admitted`：writer 在原 AsyncWriteRecheck 与 final gate 之后、原
+///   claim 之前调用 [`Self::try_admit`]；准入点由 registry 短锁内的 check 闭包
+///   `compare_exchange(Pending, Admitted, AcqRel, Acquire)` 线性化。**Admitted
+///   只是调度准入，不等于实际写出或活跃 writer 计数**——此后新登记的意图等待
+///   已准入 writer，不能倒追回撤；
+/// * `Admitted → Claimed`：仅原 claim 真实返回 Claimed 时由 connection 在该臂
+///   [`Self::mark_claimed`]（Release store）；其他 claim 结果不标记、不改原拒绝
+///   语义。
+///
+/// 绝不读历史 claimed_at 推断本 Frame 已取得许可（相位只由本 attempt 自身推进）。
+#[derive(Clone)]
+pub(crate) struct AttemptAdmission {
+    inner: std::sync::Arc<AttemptAdmissionInner>,
+}
+
+struct AttemptAdmissionInner {
+    phase: std::sync::atomic::AtomicU8,
+    check: std::sync::Mutex<Option<AdmissionCheck>>,
+}
+
+impl std::fmt::Debug for AttemptAdmission {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AttemptAdmission")
+            .field("phase", &self.phase_name())
+            .finish_non_exhaustive()
+    }
+}
+
+impl AttemptAdmission {
+    /// 新建 Pending 相位的准入标记（check 由 router 注入；无 registry 面
+    /// 可传 `None` = 直通准入）。
+    pub(crate) fn new(check: Option<AdmissionCheck>) -> Self {
+        Self {
+            inner: std::sync::Arc::new(AttemptAdmissionInner {
+                phase: std::sync::atomic::AtomicU8::new(ADMISSION_PHASE_PENDING),
+                check: std::sync::Mutex::new(check),
+            }),
+        }
+    }
+
+    fn phase(&self) -> u8 {
+        // is_admitted 同纪律：Acquire 读取
+        self.inner.phase.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn phase_name(&self) -> &'static str {
+        match self.phase() {
+            ADMISSION_PHASE_ADMITTED => "admitted",
+            ADMISSION_PHASE_CLAIMED => "claimed",
+            _ => "pending",
+        }
+    }
+
+    /// 调度准入：仅在尚未准入时调用 check 闭包（check 在 registry 短锁内检查
+    /// 意图并 mark_admitted）。`Some(reason)` = 准入被拒（busy_before_write 同
+    /// 源，writer 按明确零投递收尾）；`None` = 已准入（或本就 Admitted/Claimed
+    /// ——late 查询不撤已准入）。check 缺席时按可准入直通 CAS。
+    pub(crate) fn try_admit(&self) -> Option<String> {
+        if self.phase() != ADMISSION_PHASE_PENDING {
+            return None;
+        }
+        let check = self
+            .inner
+            .check
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some(check) = check {
+            // check 返回 None 即已同锁 mark_admitted（线性化点在 registry 短锁内）
+            return check(self);
+        }
+        self.mark_admitted();
+        None
+    }
+
+    /// 标记调度准入（由 check 闭包在 registry 短锁内调用；CAS 单调 Pending→
+    /// Admitted，并发竞争失败臂视作已准入——两侧都不再拒）。
+    pub(crate) fn mark_admitted(&self) {
+        let _ = self.inner.phase.compare_exchange(
+            ADMISSION_PHASE_PENDING,
+            ADMISSION_PHASE_ADMITTED,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        );
+    }
+
+    /// 标记真实首写权取得（仅 connection 原始 claim 臂调用；Release store——
+    /// 后续观察者 Acquire 读取可见）。
+    pub(crate) fn mark_claimed(&self) {
+        self.inner.phase.store(
+            ADMISSION_PHASE_CLAIMED,
+            std::sync::atomic::Ordering::Release,
+        );
+    }
+
+    /// 是否已调度准入（Admitted ∨ Claimed；Acquire 读取）。
+    pub(crate) fn is_admitted(&self) -> bool {
+        self.phase() != ADMISSION_PHASE_PENDING
+    }
+}
+
+/// Task7：私有 Frame 写出伴随（crate 内可见、可 Clone）——租约 keepalive 钩子
+/// 与调度准入标记成组传递（adapter 私有 start-turn/dispatch → connection crate
+/// 内 `request_with_admission`）。不进 public 协议面：`RpcRequest` 字段与 public
+/// `request` 签名不变。
+#[derive(Clone, Default)]
+pub(crate) struct FrameWriteContext {
+    /// 原 interaction_hook 参数位内容（租约 keepalive ∨ priority recheck 合成钩子）。
+    pub(crate) interaction_hook: Option<InteractionRecheck>,
+    /// 本帧的调度准入标记；`None` = 无优先调度伴随（普通读 RPC/假体路径）。
+    pub(crate) admission: Option<std::sync::Arc<AttemptAdmission>>,
+}
+
 /// 投递结果。`NotSent` = 保守判定**零投递**（写尝试开始前即失败）；`UnknownDelivery`
 /// = 已发出但结果未知——**禁止**自动重试、禁止自动 fallback（spec S5）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -293,6 +424,88 @@ pub struct ProjectionVersion {
     pub local_seq: u64,
 }
 
+// ===== 批次3（合同 §8）：题卡展示冻结 overlay 的 wire DTO（与 FE
+// codexQuestionSkipApi.ts 的 GroupDisplayView / QuestionDisplayGroupView /
+// QuestionSkipHistoryView / QuestionSkipHistoryQuestion 逐字段相同；camelCase 键 /
+// snake_case 枚举值；不下发时整个字段省略 = 前端按 absent 保 lastlegal）=====
+
+/// group4 wire 身份（FE `GroupIdentity4`）。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QuestionGroupIdentity4 {
+    pub thread_id: String,
+    pub source_turn_id: String,
+    pub source_item_id: String,
+    pub content_generation: String,
+}
+
+/// 展示决策（FE `"active" | "skipped"`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QuestionDisplayDecision {
+    Active,
+    Skipped,
+}
+
+/// 原生效果（FE `QuestionNativeEffect`；`closed_verified` 之外任何值都不得宣称已关闭）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QuestionNativeEffect {
+    ClosedVerified,
+    NotPresentVerified,
+    Unresolved,
+    Unsupported,
+}
+
+/// current 展示组视图（FE `QuestionDisplayGroupView`；skip 资格判定用）。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QuestionDisplayGroupView {
+    pub group: QuestionGroupIdentity4,
+    /// DB 当前展示 revision（known 无行读视图 = 0；active/0 只用于该读视图）。
+    pub revision: i64,
+    pub decision: QuestionDisplayDecision,
+    /// 该组最新 skip 动作落账 native（restore 不遮蔽；无动作行 = None）。
+    #[serde(rename = "latestNativeEffect")]
+    pub latest_native_effect: Option<QuestionNativeEffect>,
+    /// 机器码（`SkipReason::None` → null，不伪造原因）。
+    #[serde(rename = "reasonCode")]
+    pub reason_code: Option<String>,
+    /// 来源完整性证明（raw source proof；与投影尾窗 truncated 无关）。
+    pub source_complete: bool,
+    /// 来源声明题数（source builder declared_count，不数 filtered asyncQuestions）。
+    #[serde(rename = "sourceQuestionCount")]
+    pub source_question_count: usize,
+}
+
+/// 历史条目附带的题文快照（FE `QuestionSkipHistoryQuestion`；恢复入口展示事实）。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QuestionSkipHistoryQuestion {
+    #[serde(rename = "questionKey")]
+    pub question_key: String,
+    #[serde(rename = "questionIndex")]
+    pub question_index: i64,
+    pub title: String,
+    pub options: Vec<String>,
+}
+
+/// 历史视图（FE `QuestionSkipHistoryView`；真实承接的跳过事件，restore 只来自这里）。
+/// 外层 decision/revision 是该组 DB 当前展示态（restore 后 active 历史保留），
+/// 与 latest native 分开表达；旧行 NULL 快照 → `question = null`（不借新代题文）。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QuestionSkipHistoryView {
+    pub group: QuestionGroupIdentity4,
+    pub revision: i64,
+    pub decision: QuestionDisplayDecision,
+    #[serde(rename = "latestNativeEffect")]
+    pub latest_native_effect: Option<QuestionNativeEffect>,
+    #[serde(rename = "reasonCode")]
+    pub reason_code: Option<String>,
+    pub question: Option<QuestionSkipHistoryQuestion>,
+}
+
 /// Thread 状态投影（spec 3.3：IPC 原始 state 不直接进入远程 API）。正文尾窗
 /// 1 MiB / 500 条，超出标 `truncated`。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -367,6 +580,29 @@ pub struct ThreadProjection {
     /// 不存在"投影新、回合旧"的错位窗口。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_turn_id: Option<String>,
+    /// 批次3（合同 §8/§9 首批聚合⑦）：题卡展示冻结 overlay 的 current 账
+    /// （每 source group 恰一组）。`None` = 该账省略（history 未装载 / 无健康
+    /// current raw）——旧 fixture/旧载荷缺省 None，绝不假填 []。GREEN 由
+    /// `display::overlay_projection` 在 mirrors 同次观察装配。
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "questionDisplayGroups"
+    )]
+    pub question_display_groups: Option<Vec<QuestionDisplayGroupView>>,
+    /// 批次3：整线程冻结 skip 历史账（restore 入口的展示事实）。`None` = 账省略；
+    /// 已知无行是 `Some(vec![])`，二者不可混。
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "questionSkipHistory"
+    )]
+    pub question_skip_history: Option<Vec<QuestionSkipHistoryView>>,
+    /// 批次3：同观察戳（display 模块私签，携带该次冻结缓存 epoch）。**不上线**
+    /// （serde skip）；发布点经 `with_publish_eligibility` 按它核验资格。
+    #[serde(skip, default)]
+    pub(crate) display_stamp:
+        Option<crate::services::codex_question_skip::display::DisplayObservationStamp>,
 }
 
 impl ThreadProjection {
@@ -378,6 +614,51 @@ impl ThreadProjection {
             owner_generation: self.owner_generation,
             revision: self.revision,
             local_seq: self.local_seq,
+        }
+    }
+
+    /// 外部集成 fixture 的合法补全基座（B1）：外部测试 crate 无法命名 `pub(crate)`
+    /// 的 [`ThreadProjection::display_stamp`]，新增展示扩展字段后旧字面量必然
+    /// 缺字段编译失败。本基座给全字段中性值；调用方以 `external_fixture_base()`
+    /// 起手**逐字段赋值**覆盖其关注的公有字段（结构体更新语法 `..base` 因
+    /// FRU 对私有字段可见性要求在外部 crate 不可用，R4 实测）。
+    /// `display_stamp` 是 display 模块私签，恒 `None`——外部不能伪造同观察
+    /// 资格，`with_publish_eligibility` 的核验语义不受影响。
+    ///
+    /// 中性值取向：能力全 false / 不可控 / Loading / 队列保守暂停；生产路径
+    /// 禁用本基座（仅 fixture 组装用，覆盖后不残留任何占位值进断言）。
+    pub fn external_fixture_base() -> Self {
+        Self {
+            thread_id: String::new(),
+            revision: None,
+            stale: false,
+            availability: ControlAvailability::Unavailable,
+            capabilities: CapabilitySet {
+                send: false,
+                state: false,
+                command: false,
+                permissions: false,
+                blocking_input: false,
+                interrupt: false,
+            },
+            runtime_status: String::new(),
+            content_state: ContentState::Loading,
+            messages: Vec::new(),
+            truncated: false,
+            history_token: String::new(),
+            pending: Vec::new(),
+            async_questions: Vec::new(),
+            effective_operations: super::capability::EffectiveOperations::unknown(),
+            probe_status: ProbeStatus::idle(),
+            queue_paused: true,
+            owner_epoch: 0,
+            owner_generation: 0,
+            local_seq: 0,
+            projection_version: None,
+            active_turn_id: None,
+            question_display_groups: None,
+            question_skip_history: None,
+            display_stamp: None,
         }
     }
 }
@@ -1033,6 +1314,10 @@ mod tests {
             local_seq: 0,
             projection_version: None,
             active_turn_id: None,
+            // 批次3（合同 §8）：展示 overlay 账/戳由 display 模块装配；诚实缺省 None。
+            question_display_groups: None,
+            question_skip_history: None,
+            display_stamp: None,
         };
         // None：字段整个省略。
         let raw = serde_json::to_value(base()).unwrap();
@@ -1081,6 +1366,10 @@ mod tests {
             local_seq: 7,
             projection_version: None,
             active_turn_id: None,
+            // 批次3（合同 §8）：展示 overlay 账/戳由 display 模块装配；诚实缺省 None。
+            question_display_groups: None,
+            question_skip_history: None,
+            display_stamp: None,
         };
         // 未盖章：字段整个省略（不给前端可误信的半截版本束）
         let raw = serde_json::to_value(&p).unwrap();

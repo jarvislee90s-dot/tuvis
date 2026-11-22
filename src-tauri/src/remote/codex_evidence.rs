@@ -5,7 +5,7 @@
 //! 测试里注入内存实现。
 
 use std::collections::BTreeMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use crate::database::dao::codex_interactions::StoredInteractionHint;
 use crate::database::dao::codex_ipc_probe::StoredContractEvidence;
@@ -93,14 +93,132 @@ type ObservedCacheEntry = (
 pub struct TargetObservedOperations {
     store: DeviceStore,
     cache: Mutex<Option<ObservedCacheEntry>>,
+    /// A2.2/T8：后台刷新自引用（装配点 `Arc` 包装后 `arm_background_refresh` 注入；
+    /// 未注入 = 同步刷新回退，保持既有同步测试行为）。
+    self_ref: Mutex<Option<std::sync::Weak<TargetObservedOperations>>>,
+    /// A2.2/T8：刷新完成且事实变化时的回调（变化 → 重发布；None = 不通知）。
+    on_refreshed: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// A2.2/T8：后台刷新在飞去重。
+    refreshing: std::sync::atomic::AtomicBool,
+    /// A2/M3：最近一次查询的目标（install 只接受它——换目标后旧目标的迟到
+    /// 结果不得覆盖；新目标自己的刷新结果必须可安装）。
+    request_state: Mutex<ObservedRequestState>,
 }
+
+/// 终审 M3：目标代次 + 待接续请求（与安装资格同一把锁）。
+#[derive(Default)]
+struct ObservedRequestState {
+    target: Option<ObservedTarget>,
+    generation: u64,
+    pending: Option<ObservedTarget>,
+}
+
+const OBSERVED_TTL: std::time::Duration = std::time::Duration::from_secs(10);
 
 impl TargetObservedOperations {
     pub fn new(store: DeviceStore) -> Self {
         Self {
             store,
             cache: Mutex::new(None),
+            self_ref: Mutex::new(None),
+            on_refreshed: Mutex::new(None),
+            refreshing: std::sync::atomic::AtomicBool::new(false),
+            request_state: Mutex::new(ObservedRequestState::default()),
         }
+    }
+
+    /// A2.2/T8：装配点在 `Arc` 包装后调用——后台刷新需要克隆自身 Arc；
+    /// 回调在 adapter 装配完成后由 `set_on_refreshed` 注入。
+    pub fn arm_background_refresh(self: &Arc<Self>) {
+        *self.self_ref.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::downgrade(self));
+    }
+
+    /// A2.2/T8：刷新完成且事实变化时的重发布回调（sync Fn；内部自行 spawn）。
+    /// A2/M3：回调持 adapter **弱引用**（upgrade 失败即跳过）——不形成
+    /// adapter → source → adapter 强引用环。
+    pub fn set_on_refreshed(&self, callback: Option<Arc<dyn Fn() + Send + Sync>>) {
+        *self.on_refreshed.lock().unwrap_or_else(|e| e.into_inner()) = callback;
+    }
+
+    fn install(
+        &self,
+        target: &crate::services::codex_desktop_ipc::capability::ObservedTarget,
+        generation: u64,
+        value: BTreeMap<CodexOperation, bool>,
+    ) -> bool {
+        // 终审 M3：目标代次/身份核对与 cache 写入在同一锁序内完成
+        //（request_state → cache），换目标后旧结果无法越过窗口写入；
+        // 目标身份也计入「变化」判定（目标换了即使 map 相同也要重发布）。
+        let request = self.request_state.lock().unwrap_or_else(|e| e.into_inner());
+        if request.generation != generation || request.target.as_ref() != Some(target) {
+            return false;
+        }
+        let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+        let changed = cache
+            .as_ref()
+            .is_none_or(|(cached, _, v)| *cached != *target || *v != value);
+        *cache = Some((target.clone(), std::time::Instant::now(), value));
+        changed
+    }
+
+    fn spawn_background_refresh(self: &Arc<Self>, target: ObservedTarget, generation: u64) {
+        // A2/M3：在飞去重由调用方（observed）的 swap 负责——本函数只派发任务。
+        let job = self.clone();
+        tokio::spawn(async move {
+            let value = {
+                let job_read = job.clone();
+                let target_read = target.clone();
+                tokio::task::spawn_blocking(move || job_read.refresh(&target_read))
+                    .await
+                    .ok()
+            };
+            if let Some(value) = value {
+                let changed = job.install(&target, generation, value);
+                if changed {
+                    if let Some(callback) = job
+                        .on_refreshed
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .clone()
+                    {
+                        callback();
+                    }
+                }
+            }
+            // 终审 M3：单飞期间登记的新目标在此接续（不丢失最新请求）。
+            let pending = {
+                let mut request = job.request_state.lock().unwrap_or_else(|e| e.into_inner());
+                match request.pending.take() {
+                    Some(next) => (Some(next), request.generation),
+                    None => {
+                        job.refreshing
+                            .store(false, std::sync::atomic::Ordering::Release);
+                        (None, request.generation)
+                    }
+                }
+            };
+            if let (Some(next), generation) = pending {
+                job.spawn_background_refresh(next, generation);
+            }
+        });
+    }
+
+    /// 终审 M3：按当前请求状态发起（必要时接续的）后台刷新。
+    fn request_refresh(self: &Arc<Self>, target: ObservedTarget) {
+        if self
+            .refreshing
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            // 单飞中：登记为待接续（同一状态锁）。
+            let mut request = self.request_state.lock().unwrap_or_else(|e| e.into_inner());
+            request.pending = Some(target);
+            return;
+        }
+        let generation = {
+            let request = self.request_state.lock().unwrap_or_else(|e| e.into_inner());
+            request.generation
+        };
+        self.spawn_background_refresh(target, generation);
     }
 
     fn refresh(
@@ -137,17 +255,83 @@ impl ObservedOperationsSource for TargetObservedOperations {
         let Some(target) = target
             .filter(|target| !target.probe_key.is_empty() && !target.package_sha256.is_empty())
         else {
+            // 终审 Major 3：切到无目标也推进代次（旧目标迟到结果不得安装）。
+            let mut request = self.request_state.lock().unwrap_or_else(|e| e.into_inner());
+            if request.target.is_some() {
+                request.generation = request.generation.wrapping_add(1);
+                request.target = None;
+                request.pending = None;
+            }
             return BTreeMap::new();
         };
-        let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+        // 终审 M3：登记目标 + 推进代次（install 的授权基准，同一把锁）。
+        let generation = {
+            let mut request = self.request_state.lock().unwrap_or_else(|e| e.into_inner());
+            if request.target.as_ref() != Some(target) {
+                request.generation = request.generation.wrapping_add(1);
+                request.target = Some(target.clone());
+            }
+            request.generation
+        };
+        let cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
         if let Some((cached, at, value)) = cache.as_ref() {
-            if cached == target && at.elapsed() < std::time::Duration::from_secs(10) {
+            if cached == target && at.elapsed() < OBSERVED_TTL {
                 return value.clone();
             }
         }
-        let value = self.refresh(target);
-        *cache = Some((target.clone(), std::time::Instant::now(), value.clone()));
-        value
+        // A2.2/T8：TTL 过期/无缓存 → 有缓存值就如实返回旧事实（只读成功历史，
+        // 迟到只意味着少报新成功，保守方向），并触发后台刷新——镜像临界区内
+        // 不再等待慢存储。无自引用（同步测试上下文/未装配）保持原同步刷新。
+        let stale = cache
+            .as_ref()
+            .filter(|(cached, _, _)| *cached == *target)
+            .map(|(_, _, value)| value.clone());
+        drop(cache);
+        let armed = self
+            .self_ref
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .and_then(|weak| weak.upgrade());
+        match armed {
+            Some(self_arc) => {
+                // 终审 M3：仅运行时在位时后台刷新；无运行时（同步测试）就地
+                // 同步刷新并放回去重旗标（回调经 safe_notify 调度，不裸 spawn）。
+                match tokio::runtime::Handle::try_current() {
+                    Ok(_) => self_arc.request_refresh(target.clone()),
+                    Err(_) => {
+                        if !self_arc
+                            .refreshing
+                            .swap(true, std::sync::atomic::Ordering::AcqRel)
+                        {
+                            self_arc
+                                .refreshing
+                                .store(false, std::sync::atomic::Ordering::Release);
+                            let value = self.refresh(target);
+                            let changed = self.install(target, generation, value.clone());
+                            if changed {
+                                if let Some(callback) = self
+                                    .on_refreshed
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .clone()
+                                {
+                                    callback();
+                                }
+                            }
+                            return value;
+                        }
+                    }
+                }
+                stale.unwrap_or_default()
+            }
+            None => {
+                let value = self.refresh(target);
+                // 同步回退同样经 install（目标代次/身份与写入同锁序）。
+                let _ = self.install(target, generation, value.clone());
+                value
+            }
+        }
     }
 }
 
@@ -216,8 +400,12 @@ impl InteractionHintStore for StoreInteractionHints {
     ) -> Result<i64, crate::services::codex_desktop_ipc::async_question::HintStoreError> {
         self.store
             .with(crate::database::dao::codex_interactions::next_hint_epoch_conn)
-            .map_err(|_| {
-                crate::services::codex_desktop_ipc::async_question::HintStoreError::Storage
+            .map_err(|error| match error {
+                // 单例缺失、损坏或 epoch 已耗尽都不会因定时重试自行恢复。
+                rusqlite::Error::QueryReturnedNoRows => {
+                    crate::services::codex_desktop_ipc::async_question::HintStoreError::InvalidData
+                }
+                _ => crate::services::codex_desktop_ipc::async_question::HintStoreError::Storage,
             })
     }
 
@@ -254,7 +442,11 @@ impl InteractionHintStore for StoreInteractionHints {
         let map_error = |e| match e {
             HintWriteError::Fenced => HintStoreError::Fenced,
             HintWriteError::VersionCollision => HintStoreError::VersionCollision,
-            _ => HintStoreError::Storage,
+            HintWriteError::InvalidVersion => HintStoreError::InvalidData,
+            HintWriteError::Storage(rusqlite::Error::InvalidColumnType(..)) => {
+                HintStoreError::InvalidData
+            }
+            HintWriteError::Storage(_) => HintStoreError::Storage,
         };
         let write = |conn: &rusqlite::Connection| {
             let batch = prepare_versioned_hints_conn(conn, epoch, &rows).map_err(map_error)?;
@@ -389,6 +581,330 @@ mod tests {
         assert_eq!(
             ledger.write_batch(epoch, &[hint], 7, &permit),
             Err(crate::services::codex_desktop_ipc::async_question::HintStoreError::Fenced)
+        );
+    }
+
+    #[test]
+    fn b1_hint_batch_real_lock_retry_is_idempotent() {
+        use crate::services::codex_desktop_ipc::{
+            async_question::HintStoreError,
+            hint_commit::HintLeaseAuthority,
+            hint_state::{HintVersion, VersionedHint, WriteOutcome},
+            types::{OwnerLease, ThreadKey},
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("isolated-hints.sqlite");
+        let first = rusqlite::Connection::open(&path).unwrap();
+        crate::database::schema::init(&first);
+        crate::database::migration::migrate(&first).unwrap();
+        let second = rusqlite::Connection::open(&path).unwrap();
+        second.busy_timeout(std::time::Duration::ZERO).unwrap();
+        let shared = Arc::new(Mutex::new(second));
+        let ledger = StoreInteractionHints::new(DeviceStore::Owned(shared.clone()));
+        let epoch = ledger.begin_epoch().unwrap();
+        let authority = HintLeaseAuthority::new(OwnerLease {
+            key: ThreadKey {
+                host_id: "h".into(),
+                thread_id: "t".into(),
+            },
+            client_id: "c".into(),
+            epoch: 1,
+            generation: 1,
+        });
+        let permit = authority.rotate_scope().unwrap();
+        let hint = VersionedHint {
+            hint: InteractionHint {
+                thread_id: "t".into(),
+                source_turn_id: "turn".into(),
+                source_item_id: "item".into(),
+                question_index: 0,
+                last_fact: "unknown".into(),
+                witness: None,
+                evidence_state: None,
+            },
+            version: HintVersion { epoch, sequence: 1 },
+        };
+        first.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let lock_error = shared
+            .lock()
+            .unwrap()
+            .execute_batch("BEGIN IMMEDIATE")
+            .unwrap_err();
+        assert!(
+            matches!(lock_error, rusqlite::Error::SqliteFailure(ref error, _) if error.code == rusqlite::ErrorCode::DatabaseBusy)
+        );
+        let blocked = ledger.write_batch(epoch, std::slice::from_ref(&hint), 1, &permit);
+        first.execute_batch("ROLLBACK").unwrap();
+        assert_eq!(blocked, Err(HintStoreError::Storage));
+        assert!(ledger.load("t").unwrap().is_empty());
+        assert_eq!(
+            ledger
+                .write_batch(epoch, std::slice::from_ref(&hint), 2, &permit)
+                .unwrap(),
+            vec![WriteOutcome::Applied(hint.clone())]
+        );
+        assert_eq!(
+            ledger
+                .write_batch(epoch, std::slice::from_ref(&hint), 3, &permit)
+                .unwrap(),
+            vec![WriteOutcome::AlreadyCurrent(hint)]
+        );
+        let rows = ledger.load("t").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].last_fact, "unknown");
+        assert_eq!(
+            rows[0].updated_at, 2,
+            "idempotent repeat must not rewrite timestamp"
+        );
+        assert_eq!(rows[0].observation_epoch, Some(epoch));
+        assert_eq!(rows[0].observation_seq, Some(1));
+    }
+
+    #[test]
+    fn b1_store_latest_invalidation_survives_lock_and_late_retry() {
+        use crate::services::codex_desktop_ipc::{
+            async_question::HintStoreError,
+            hint_commit::HintLeaseAuthority,
+            hint_state::{HintVersion, VersionedHint, WriteOutcome},
+            types::{OwnerLease, ThreadKey},
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("isolated-invalidation.sqlite");
+        let first = rusqlite::Connection::open(&path).unwrap();
+        crate::database::schema::init(&first);
+        crate::database::migration::migrate(&first).unwrap();
+        let second = rusqlite::Connection::open(&path).unwrap();
+        second.busy_timeout(std::time::Duration::ZERO).unwrap();
+        let ledger = StoreInteractionHints::new(DeviceStore::Owned(Arc::new(Mutex::new(second))));
+        let epoch = ledger.begin_epoch().unwrap();
+        let authority = HintLeaseAuthority::new(OwnerLease {
+            key: ThreadKey {
+                host_id: "h".into(),
+                thread_id: "t".into(),
+            },
+            client_id: "c".into(),
+            epoch: 1,
+            generation: 1,
+        });
+        let permit = authority.rotate_scope().unwrap();
+        let answered = VersionedHint {
+            hint: InteractionHint {
+                thread_id: "t".into(),
+                source_turn_id: "turn".into(),
+                source_item_id: "item".into(),
+                question_index: 0,
+                last_fact: "answered".into(),
+                witness: None,
+                evidence_state: None,
+            },
+            version: HintVersion {
+                epoch,
+                sequence: 10,
+            },
+        };
+        let mut unknown = answered.clone();
+        unknown.hint.last_fact = "unknown".into();
+        unknown.version.sequence = 11;
+        assert_eq!(
+            ledger
+                .write_batch(epoch, std::slice::from_ref(&answered), 1, &permit)
+                .unwrap(),
+            vec![WriteOutcome::Applied(answered.clone())]
+        );
+        first.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let blocked = ledger.write_batch(epoch, &[unknown.clone()], 2, &permit);
+        first.execute_batch("ROLLBACK").unwrap();
+        assert_eq!(blocked, Err(HintStoreError::Storage));
+        let before_retry = ledger.load("t").unwrap();
+        assert_eq!(before_retry.len(), 1);
+        assert_eq!(before_retry[0].last_fact, "answered");
+        assert_eq!(before_retry[0].observation_seq, Some(10));
+        assert_eq!(
+            ledger
+                .write_batch(epoch, &[unknown.clone()], 3, &permit)
+                .unwrap(),
+            vec![WriteOutcome::Applied(unknown.clone())]
+        );
+        let late = ledger.write_batch(epoch, &[answered], 4, &permit).unwrap();
+        assert!(
+            matches!(late.as_slice(), [WriteOutcome::Superseded(row)] if row.hint.last_fact == "unknown" && row.version == unknown.version)
+        );
+        let rows = ledger.load("t").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].last_fact, "unknown");
+        assert_eq!(rows[0].observation_seq, Some(11));
+    }
+
+    #[test]
+    fn b1_epoch_real_sqlite_lock_is_storage_and_retryable_after_release() {
+        use crate::services::codex_desktop_ipc::async_question::HintStoreError;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("isolated.sqlite");
+        let first = rusqlite::Connection::open(&path).unwrap();
+        crate::database::schema::init(&first);
+        crate::database::migration::migrate(&first).unwrap();
+        let second = rusqlite::Connection::open(&path).unwrap();
+        second.busy_timeout(std::time::Duration::ZERO).unwrap();
+        let ledger = StoreInteractionHints::new(DeviceStore::Owned(Arc::new(Mutex::new(second))));
+        first.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let while_locked = ledger.begin_epoch();
+        first.execute_batch("ROLLBACK").unwrap();
+        assert_eq!(while_locked, Err(HintStoreError::Storage));
+        assert_eq!(
+            ledger.begin_epoch(),
+            Ok(1),
+            "release allows a fresh local attempt"
+        );
+    }
+
+    #[test]
+    fn b1_epoch_invalid_state_is_not_transient_storage_failure() {
+        use crate::services::codex_desktop_ipc::async_question::HintStoreError;
+        for sql in [
+            "UPDATE codex_hint_writer_state SET epoch=9223372036854775807 WHERE singleton=1",
+            "DELETE FROM codex_hint_writer_state WHERE singleton=1",
+        ] {
+            let db = store();
+            db.with(|conn| conn.execute_batch(sql).unwrap());
+            let ledger = StoreInteractionHints::new(db.clone());
+            assert_eq!(
+                ledger.begin_epoch(),
+                Err(HintStoreError::InvalidData),
+                "invalid writer state must not be treated as a transient DB error"
+            );
+            let rows: i64 = db.with(|conn| {
+                conn.query_row("SELECT count(*) FROM codex_interaction_hints", [], |row| {
+                    row.get(0)
+                })
+                .unwrap()
+            });
+            assert_eq!(rows, 0);
+        }
+        let db = store();
+        db.with(|conn| {
+            conn.execute_batch("DROP TABLE codex_hint_writer_state")
+                .unwrap()
+        });
+        let ledger = StoreInteractionHints::new(db);
+        assert_eq!(
+            ledger.begin_epoch(),
+            Err(HintStoreError::Storage),
+            "SQL failure must remain distinguishable from invalid singleton state"
+        );
+    }
+
+    #[test]
+    fn b1_store_malformed_persisted_value_is_not_retryable_storage_error() {
+        use crate::services::codex_desktop_ipc::{
+            async_question::HintStoreError,
+            hint_commit::HintLeaseAuthority,
+            hint_state::{HintVersion, VersionedHint},
+            types::{OwnerLease, ThreadKey},
+        };
+        let db = store();
+        let ledger = StoreInteractionHints::new(db.clone());
+        let epoch = ledger.begin_epoch().unwrap();
+        db.with(|conn| conn.execute_batch("INSERT INTO codex_interaction_hints(thread_id,source_turn_id,source_item_id,question_index,last_fact,updated_at) VALUES('t','turn','broken',0,'pending','not-an-integer')").unwrap());
+        let authority = HintLeaseAuthority::new(OwnerLease {
+            key: ThreadKey {
+                host_id: "h".into(),
+                thread_id: "t".into(),
+            },
+            client_id: "c".into(),
+            epoch: 1,
+            generation: 1,
+        });
+        let permit = authority.rotate_scope().unwrap();
+        let make_hint = |item: &str, sequence| VersionedHint {
+            hint: InteractionHint {
+                thread_id: "t".into(),
+                source_turn_id: "turn".into(),
+                source_item_id: item.into(),
+                question_index: 0,
+                last_fact: "unknown".into(),
+                witness: None,
+                evidence_state: None,
+            },
+            version: HintVersion { epoch, sequence },
+        };
+        let result = ledger.write_batch(
+            epoch,
+            &[make_hint("good", 1), make_hint("broken", 2)],
+            1,
+            &permit,
+        );
+        assert_eq!(
+            result,
+            Err(HintStoreError::InvalidData),
+            "malformed stored type must not be retried as transient storage failure"
+        );
+        let (count, original): (i64, String) = db.with(|conn| {
+            let count = conn
+                .query_row("SELECT count(*) FROM codex_interaction_hints", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            let original = conn
+                .query_row(
+                    "SELECT updated_at FROM codex_interaction_hints WHERE source_item_id='broken'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            (count, original)
+        });
+        assert_eq!(count, 1, "the earlier staged row must roll back");
+        assert_eq!(
+            original, "not-an-integer",
+            "invalid legacy data must not be enhanced or overwritten"
+        );
+    }
+
+    #[test]
+    fn b1_store_invalid_version_is_not_transient_storage_failure() {
+        use crate::services::codex_desktop_ipc::{
+            async_question::HintStoreError,
+            hint_commit::HintLeaseAuthority,
+            hint_state::{HintVersion, VersionedHint},
+            types::{OwnerLease, ThreadKey},
+        };
+        let ledger = StoreInteractionHints::new(store());
+        let authority = HintLeaseAuthority::new(OwnerLease {
+            key: ThreadKey {
+                host_id: "h".into(),
+                thread_id: "t".into(),
+            },
+            client_id: "c".into(),
+            epoch: 1,
+            generation: 1,
+        });
+        let permit = authority.rotate_scope().unwrap();
+        let epoch = ledger.begin_epoch().unwrap();
+        let hint = VersionedHint {
+            hint: InteractionHint {
+                thread_id: "t".into(),
+                source_turn_id: "turn".into(),
+                source_item_id: "item".into(),
+                question_index: 0,
+                last_fact: "pending".into(),
+                witness: None,
+                evidence_state: None,
+            },
+            version: HintVersion { epoch, sequence: 0 },
+        };
+        let mut valid = hint.clone();
+        valid.hint.source_item_id = "valid-first".into();
+        valid.version.sequence = 1;
+        let result = ledger.write_batch(epoch, &[valid, hint], 1, &permit);
+        assert!(result.is_err());
+        assert_eq!(
+            result,
+            Err(HintStoreError::InvalidData),
+            "invalid version must be classified as permanent data failure"
+        );
+        assert!(
+            ledger.load("t").unwrap().is_empty(),
+            "invalid batch must not persist"
         );
     }
 

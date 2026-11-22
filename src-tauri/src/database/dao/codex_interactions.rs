@@ -1073,6 +1073,29 @@ pub fn question_keys_for_action_conn(
     rows.collect()
 }
 
+/// B2 事实初装载：有 claim 行的 thread 集合（无行 = 已证空，不进装载名单）。
+pub(crate) fn threads_with_claims_conn(conn: &Connection) -> rusqlite::Result<Vec<String>> {
+    let mut stmt =
+        conn.prepare("SELECT DISTINCT thread_id FROM codex_interaction_claims ORDER BY thread_id")?;
+    let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+    rows.collect()
+}
+
+/// B2 事实初装载：单 thread 全部持久 claim 行 `(question_key, action_id, state)`。
+/// action_id 允许 NULL（未来占位扩展），快照装载原样保留——不能把无动作占位
+/// 当空（合同：未知不能当空）。
+pub(crate) fn claims_for_thread_conn(
+    conn: &Connection,
+    thread_id: &str,
+) -> rusqlite::Result<Vec<(String, Option<String>, String)>> {
+    let mut stmt = conn.prepare(
+        "SELECT question_key, action_id, state FROM codex_interaction_claims \
+         WHERE thread_id = ?1 ORDER BY question_key",
+    )?;
+    let rows = stmt.query_map([thread_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+    rows.collect()
+}
+
 #[cfg(test)]
 mod j02_claim_owner_tests {
     use super::*;

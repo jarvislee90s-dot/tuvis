@@ -1723,3 +1723,577 @@ describe("CodexSendFlow：Q2 round 7 提交时点冻结草稿版本（等待期�
     expect(screen.getByTestId("send-receipt-codex-queued").textContent).toContain("第2位");
   });
 });
+
+describe("B6 X0 后到送达证据", () => {
+  function actionStatusPath(actionId: string) {
+    return `/m/api/v1/codex/action?${new URLSearchParams({ action_id: actionId })}`;
+  }
+
+  function actionView(actionId: string, turnId: string | null) {
+    return {
+      actionId,
+      state: turnId ? "accepted" : "unknown",
+      position: null,
+      stage: "settled",
+      receipt: ipcReceipt({ actionId, turnId, delivery: turnId ? "accepted" : "unknown_delivery" }),
+    };
+  }
+
+  function installActionStatus(
+    read: (url: string) => Response | Promise<Response>,
+    observeSignal?: (signal: AbortSignal | null | undefined) => void
+  ) {
+    installFetch();
+    const existing = fetchMock.getMockImplementation()!;
+    fetchMock.mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.startsWith("/m/api/v1/codex/action?")) {
+        expect(init?.method ?? "GET").toBe("GET");
+        observeSignal?.(init?.signal);
+        return read(url);
+      }
+      if (url === "/m/api/v1/session-send" && init?.method === "POST") {
+        const { actionId } = JSON.parse(String(init.body)) as { actionId: string };
+        sendBodies.push(String(init.body));
+        return json({ status: "desktop_ipc", receipt: actionView(actionId, null).receipt });
+      }
+      return existing(input, init);
+    });
+  }
+
+  async function sendToRecovery(text: string) {
+    fireEvent.change(screen.getByTestId("composer-input"), { target: { value: text } });
+    await flushAsync();
+    fireEvent.click(screen.getByTestId("composer-send"));
+    await flushAsync();
+    expect(screen.getByTestId("codex-recovery-title")).toBeTruthy();
+    const { actionId } = JSON.parse(sendBodies.at(-1) ?? "{}") as { actionId: string };
+    expect(panelActionShort()).toBe(actionId.slice(0, 8));
+    return actionId;
+  }
+
+  function postCount() {
+    return fetchMock.mock.calls.filter(([, init]) => init?.method === "POST").length;
+  }
+
+  it.each(["wrong_view_action", "wrong_receipt_action", "missing_turn", "network_failure"])(
+    "T1-E keeps the orange pending title after %s and retries with GET only",
+    async (invalidEvidence) => {
+      vi.useFakeTimers();
+      const read = vi.fn((url: string) => {
+        const id = new URL(url, "http://localhost").searchParams.get("action_id")!;
+        const accepted = actionView(id, "turn-confirmed");
+        switch (invalidEvidence) {
+          case "wrong_view_action":
+            return json({ ...accepted, actionId: "other-action" });
+          case "wrong_receipt_action":
+            return json({
+              ...accepted,
+              receipt: { ...accepted.receipt, actionId: "other-action" },
+            });
+          case "missing_turn":
+            return json({ ...accepted, receipt: { ...accepted.receipt, turnId: null } });
+          default:
+            return Promise.reject(new TypeError("network unavailable"));
+        }
+      });
+      installActionStatus(read);
+      render(<MessageComposer session={{ id: "sess-1" }} />);
+      await flushAsync();
+      const actionId = await sendToRecovery("等待持久证据");
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(2_000);
+      });
+
+      expect(screen.getByTestId("codex-recovery-panel")).toHaveClass("bg-amber-500/10");
+      expect(screen.getByTestId("codex-recovery-title")).toHaveTextContent("发送结果待确认");
+      expect(screen.queryByText(/^已确认送达/)).toBeNull();
+      expect(read.mock.calls).toEqual([[actionStatusPath(actionId)], [actionStatusPath(actionId)]]);
+      expect(verifyUrls).toEqual([]);
+      expect(postCount()).toBe(1);
+    }
+  );
+
+  it("T1-E keeps same-anchor delivery after a late converged response to explicit manual resume", async () => {
+    vi.useFakeTimers();
+    const read = vi.fn((url: string) => {
+      const id = new URL(url, "http://localhost").searchParams.get("action_id")!;
+      return json(actionView(id, hangingResumes.length ? "turn-confirmed" : null));
+    });
+    installActionStatus(read);
+    render(<MessageComposer session={{ id: "sess-1" }} />);
+    await flushAsync();
+    const actionId = await sendToRecovery("正在等待人工继续回执");
+    routes.verifyQueue = [{ actionId, outcome: "unresolved", stage: "settled" }];
+    routes.resumeHang = true;
+    fireEvent.click(screen.getByTestId("codex-recovery-check"));
+    await flushAsync();
+    fireEvent.click(screen.getByTestId("codex-recovery-resend"));
+    expect(screen.getByTestId("codex-recovery-resend-risks")).toBeVisible();
+    expect(postCount()).toBe(1);
+    fireEvent.click(screen.getByTestId("codex-recovery-resend-confirm"));
+    await flushAsync();
+    expect(hangingResumes).toHaveLength(1);
+    expect(JSON.parse(resumeBodies[0])).toMatchObject({ actionId });
+    expect(postCount()).toBe(2);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2_000);
+    });
+    expect(read.mock.calls).toEqual([[actionStatusPath(actionId)], [actionStatusPath(actionId)]]);
+    expect(screen.getByTestId("codex-recovery-result")).toHaveTextContent(/^已确认送达/);
+    expect(screen.queryByTestId("codex-recovery-title")).toBeNull();
+
+    await act(async () => {
+      hangingResumes[0].resolve(
+        json({ status: "converged", action: actionView(actionId, "turn-confirmed") })
+      );
+    });
+    await flushAsync();
+    expect(postCount()).toBe(2);
+    expect(sendBodies).toHaveLength(1);
+    expect(screen.getByTestId("codex-recovery-result")).toHaveTextContent(/^已确认送达/);
+    expect(screen.queryByTestId("codex-recovery-title")).toBeNull();
+  });
+
+  it("T1-E confirms delivery when durable converged wins the race with the same-anchor GET", async () => {
+    vi.useFakeTimers();
+    let releaseRead!: (response: Response) => void;
+    const pendingRead = new Promise<Response>((resolve) => {
+      releaseRead = resolve;
+    });
+    const read = vi.fn((url: string) => {
+      const id = new URL(url, "http://localhost").searchParams.get("action_id")!;
+      return hangingResumes.length > 0 ? pendingRead : json(actionView(id, null));
+    });
+    const observeSignal = vi.fn();
+    installActionStatus(read, observeSignal);
+    render(<MessageComposer session={{ id: "sess-1" }} />);
+    await flushAsync();
+    const actionId = await sendToRecovery("等待同锚人工继续结果");
+    routes.verifyQueue = [{ actionId, outcome: "unresolved", stage: "settled" }];
+    routes.resumeHang = true;
+    fireEvent.click(screen.getByTestId("codex-recovery-check"));
+    await flushAsync();
+    fireEvent.click(screen.getByTestId("codex-recovery-resend"));
+    expect(screen.getByTestId("codex-recovery-resend-risks")).toBeVisible();
+    expect(postCount()).toBe(1);
+    fireEvent.click(screen.getByTestId("codex-recovery-resend-confirm"));
+    await flushAsync();
+    expect(hangingResumes).toHaveLength(1);
+    expect(JSON.parse(resumeBodies[0])).toMatchObject({ actionId });
+    expect(postCount()).toBe(2);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2_000);
+    });
+    const statusPath = actionStatusPath(actionId);
+    expect(read.mock.calls).toEqual([[statusPath], [statusPath]]);
+    const pendingSignal = observeSignal.mock.calls[1][0] as AbortSignal;
+    expect(pendingSignal.aborted).toBe(false);
+    expect(screen.getByTestId("codex-recovery-title")).toBeVisible();
+
+    await act(async () => {
+      hangingResumes[0].resolve(
+        json({ status: "converged", action: actionView(actionId, "durable-turn") })
+      );
+    });
+    await flushAsync();
+    expect(screen.getByTestId("codex-recovery-result")).toHaveTextContent(/^已确认送达/);
+    expect(screen.queryByTestId("codex-recovery-title")).toBeNull();
+    expect(pendingSignal.aborted).toBe(true);
+
+    await act(async () => {
+      releaseRead(json(actionView(actionId, null)));
+      await vi.advanceTimersByTimeAsync(2_000);
+    });
+    expect(screen.getByTestId("codex-recovery-result")).toHaveTextContent(/^已确认送达/);
+    expect(screen.queryByTestId("codex-recovery-title")).toBeNull();
+    expect(read.mock.calls).toEqual([[statusPath], [statusPath]]);
+    expect(sendBodies).toHaveLength(1);
+    expect(postCount()).toBe(2);
+  });
+
+  it("T1-E keeps same-anchor delivery after a late unresolved manual verify", async () => {
+    vi.useFakeTimers();
+    const read = vi.fn((url: string) => {
+      const id = new URL(url, "http://localhost").searchParams.get("action_id")!;
+      return json(actionView(id, verifyUrls.length > 0 ? "turn-confirmed" : null));
+    });
+    installActionStatus(read);
+    const fetchWithActionStatus = fetchMock.getMockImplementation()!;
+    let releaseVerify!: (response: Response) => void;
+    const pendingVerify = new Promise<Response>((resolve) => {
+      releaseVerify = resolve;
+    });
+    fetchMock.mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.startsWith("/m/api/v1/codex/action/verify?")) {
+        expect(init?.method ?? "GET").toBe("GET");
+        verifyUrls.push(url);
+        return pendingVerify;
+      }
+      return fetchWithActionStatus(input, init);
+    });
+    render(<MessageComposer session={{ id: "sess-1" }} />);
+    await flushAsync();
+    const actionId = await sendToRecovery("等待手动核对回执");
+    const check = screen.getByTestId("codex-recovery-check");
+    fireEvent.click(check);
+    await flushAsync();
+    expect(verifyUrls).toEqual([
+      `/m/api/v1/codex/action/verify?${new URLSearchParams({ action_id: actionId })}`,
+    ]);
+    expect(check).toBeDisabled();
+    expect(postCount()).toBe(1);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2_000);
+    });
+    expect(read.mock.calls).toEqual([[actionStatusPath(actionId)], [actionStatusPath(actionId)]]);
+    expect(screen.getByTestId("codex-recovery-result")).toHaveTextContent(/^已确认送达/);
+    expect(screen.queryByTestId("codex-recovery-title")).toBeNull();
+
+    await act(async () => {
+      releaseVerify(json({ actionId, outcome: "unresolved", stage: "settled" }));
+    });
+    await flushAsync();
+    expect(screen.getByTestId("codex-recovery-result")).toHaveTextContent(/^已确认送达/);
+    expect(screen.queryByTestId("codex-recovery-title")).toBeNull();
+    expect(postCount()).toBe(1);
+  });
+
+  it("T1-E aborts the only in-flight GET at its budget and aborts the next GET on unmount", async () => {
+    vi.useFakeTimers();
+    const signals: AbortSignal[] = [];
+    const read = vi.fn(
+      () =>
+        new Promise<Response>((_, reject) => {
+          const signal = signals.at(-1)!;
+          signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+        })
+    );
+    installActionStatus(read, (signal) => {
+      expect(signal).toBeInstanceOf(AbortSignal);
+      signals.push(signal!);
+    });
+    const view = render(<MessageComposer session={{ id: "sess-1" }} />);
+    await flushAsync();
+    const actionId = await sendToRecovery("长时间等待读取");
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(9_999);
+    });
+    expect(read).toHaveBeenCalledTimes(1);
+    expect(signals[0].aborted).toBe(false);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1);
+    });
+    expect(signals[0].aborted).toBe(true);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2_000);
+    });
+    expect(read.mock.calls).toEqual([[actionStatusPath(actionId)], [actionStatusPath(actionId)]]);
+    expect(signals[1].aborted).toBe(false);
+    expect(screen.getByTestId("codex-recovery-title")).toBeVisible();
+
+    view.unmount();
+    expect(signals[1].aborted).toBe(true);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(12_000);
+    });
+    expect(read).toHaveBeenCalledTimes(2);
+    expect(postCount()).toBe(1);
+    expect(verifyUrls).toEqual([]);
+  });
+
+  it("T1-E defense: ignores a successful GET that returns after its signal is aborted by timeout", async () => {
+    vi.useFakeTimers();
+    let releaseExpired!: (response: Response) => void;
+    const expiredResponse = new Promise<Response>((resolve) => {
+      releaseExpired = resolve;
+    });
+    const read = vi.fn((url: string): Response | Promise<Response> => {
+      const id = new URL(url, "http://localhost").searchParams.get("action_id")!;
+      return json(actionView(id, null));
+    });
+    read.mockImplementationOnce(() => expiredResponse);
+    const observeSignal = vi.fn();
+    installActionStatus(read, observeSignal);
+    render(<MessageComposer session={{ id: "sess-1" }} />);
+    await flushAsync();
+    const actionId = await sendToRecovery("等待读取预算到期");
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(10_000);
+    });
+    expect(read).toHaveBeenCalledTimes(1);
+    expect(observeSignal.mock.calls[0][0].aborted).toBe(true);
+    // 模拟底层忽略取消，仍成功返回同一动作的持久 Accepted。
+    await act(async () => {
+      releaseExpired(json(actionView(actionId, "expired-turn")));
+    });
+    await flushAsync();
+    expect(screen.getByTestId("codex-recovery-title")).toBeVisible();
+    expect(screen.queryByText(/^已确认送达/)).toBeNull();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2_000);
+    });
+    expect(read.mock.calls).toEqual([[actionStatusPath(actionId)], [actionStatusPath(actionId)]]);
+    expect(postCount()).toBe(1);
+  });
+
+  it("T1-E defense: keeps the pending title for a whitespace-only Accepted turn", async () => {
+    vi.useFakeTimers();
+    const read = vi.fn((url: string) => {
+      const id = new URL(url, "http://localhost").searchParams.get("action_id")!;
+      return json(actionView(id, " \t\n"));
+    });
+    installActionStatus(read);
+    render(<MessageComposer session={{ id: "sess-1" }} />);
+    await flushAsync();
+    const actionId = await sendToRecovery("等待读到有效回合");
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2_000);
+    });
+
+    expect(screen.getByTestId("codex-recovery-title")).toHaveTextContent("发送结果待确认");
+    expect(screen.queryByText(/^已确认送达/)).toBeNull();
+    expect(read.mock.calls).toEqual([[actionStatusPath(actionId)], [actionStatusPath(actionId)]]);
+    expect(postCount()).toBe(1);
+  });
+
+  it("T1-E defense: changing session with the same actionId discards the old GET", async () => {
+    vi.useFakeTimers();
+    let releaseOldSession!: (response: Response) => void;
+    const oldSessionResponse = new Promise<Response>((resolve) => {
+      releaseOldSession = resolve;
+    });
+    const read = vi.fn((url: string): Response | Promise<Response> => {
+      const id = new URL(url, "http://localhost").searchParams.get("action_id")!;
+      return json(actionView(id, null));
+    });
+    read.mockImplementationOnce(() => oldSessionResponse);
+    const observeSignal = vi.fn();
+    installActionStatus(read, observeSignal);
+    const view = render(<MessageComposer session={{ id: "sess-1" }} />);
+    await flushAsync();
+    const actionId = await sendToRecovery("保持动作标识并切换会话");
+    const oldPanel = screen.getByTestId("codex-recovery-panel");
+    expect(observeSignal.mock.calls[0][0].aborted).toBe(false);
+
+    view.rerender(<MessageComposer session={{ id: "sess-2" }} />);
+    await flushAsync();
+    expect(screen.getByTestId("codex-recovery-panel")).not.toBe(oldPanel);
+    expect(panelActionShort()).toBe(actionId.slice(0, 8));
+    expect(read.mock.calls.length).toBeGreaterThan(1);
+    for (const [url] of read.mock.calls) {
+      expect(url).toBe(actionStatusPath(actionId));
+    }
+    expect(observeSignal.mock.calls[0][0].aborted).toBe(true);
+    expect(observeSignal.mock.calls.at(-1)?.[0].aborted).toBe(false);
+
+    await act(async () => {
+      releaseOldSession(json(actionView(actionId, "old-session-turn")));
+    });
+    await flushAsync();
+    expect(screen.getByTestId("codex-recovery-title")).toBeVisible();
+    expect(screen.queryByText(/^已确认送达/)).toBeNull();
+    expect(postCount()).toBe(1);
+  });
+
+  it("T1-E b6_x0_panel_auto_confirms_from_action_state", async () => {
+    vi.useFakeTimers();
+    let first = true;
+    const read = vi.fn((url: string) => {
+      const id = new URL(url, "http://localhost").searchParams.get("action_id")!;
+      const turnId = first ? null : "t-a";
+      first = false;
+      return json(actionView(id, turnId));
+    });
+    installActionStatus(read);
+    render(<MessageComposer session={{ id: "sess-1" }} />);
+    await flushAsync();
+    const actionId = await sendToRecovery("第一条消息");
+    expect(JSON.parse(sendBodies[0])).toMatchObject({ sessionId: "sess-1", actionId });
+    expect(postCount()).toBe(1);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2_000);
+    });
+    await flushAsync();
+    expect(postCount()).toBe(1);
+    expect(verifyUrls).toEqual([]);
+    expect(screen.queryByText(/^已确认送达/)).not.toBeNull();
+    expect(screen.queryByText("发送结果待确认", { exact: true })).toBeNull();
+    expect(read.mock.calls).toEqual([[actionStatusPath(actionId)], [actionStatusPath(actionId)]]);
+  });
+
+  it("T1-E b6_x0_late_action_state_for_a_cannot_confirm_b", async () => {
+    vi.useFakeTimers();
+    let releaseA!: (response: Response) => void;
+    const delayed = new Promise<Response>((resolve) => {
+      releaseA = resolve;
+    });
+    let firstActionId: string | undefined;
+    const read = vi.fn((url: string) => {
+      const id = new URL(url, "http://localhost").searchParams.get("action_id")!;
+      firstActionId ??= id;
+      return id === firstActionId ? delayed : json(actionView(id, null));
+    });
+    const observeSignal = vi.fn();
+    installActionStatus(read, observeSignal);
+    render(<MessageComposer session={{ id: "sess-1" }} />);
+    await flushAsync();
+    const a = await sendToRecovery("第一条消息");
+    const firstSignal = observeSignal.mock.calls[0][0] as AbortSignal;
+    expect(firstSignal.aborted).toBe(false);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2_000);
+    });
+    const b = await sendToRecovery("第二条消息");
+    expect(a).not.toBe(b);
+    expect(firstSignal.aborted).toBe(true);
+    expect((observeSignal.mock.calls[1][0] as AbortSignal).aborted).toBe(false);
+    await act(async () => {
+      releaseA(json(actionView(a, "t-a")));
+    });
+    await flushAsync();
+
+    expect(panelActionShort()).toBe(b.slice(0, 8));
+    expect(screen.getByTestId("codex-recovery-title")).toBeTruthy();
+    expect(screen.queryByText(/^已确认送达/)).toBeNull();
+    expect(postCount()).toBe(2);
+    expect(verifyUrls).toEqual([]);
+    expect(read.mock.calls).toEqual([[actionStatusPath(a)], [actionStatusPath(b)]]);
+  });
+
+  it("b6_x0_switch_anchor_discards_inflight_verify", async () => {
+    vi.useFakeTimers();
+    for (const outcome of ["delivered", "unresolved", "response_error"] as const) {
+      const b = "successor-b";
+      // eslint prefer-const 的作用域判定对本用例的跨 it 回调赋值形态误报——
+      // 用对象持有者承载「在途自动 GET 归属锚」标记（语义等价，满足规则）。
+      const pendingAutoReadFor: { current: string | undefined } = { current: undefined };
+      let releaseAutoRead!: (response: Response) => void;
+      // 模拟已在途的响应仍会抵达，即使切锚已取消请求。
+      const pendingAutoRead = new Promise<Response>((resolve) => {
+        releaseAutoRead = resolve;
+      });
+      const read = vi.fn((url: string) => {
+        const id = new URL(url, "http://localhost").searchParams.get("action_id")!;
+        return id === pendingAutoReadFor.current ? pendingAutoRead : json(actionView(id, null));
+      });
+      installActionStatus(read);
+      const view = render(<MessageComposer session={{ id: "sess-1" }} />);
+      await flushAsync();
+      const a = await sendToRecovery("等待核对的消息");
+      const panel = screen.getByTestId("codex-recovery-panel");
+      const check = screen.getByTestId("codex-recovery-check");
+      const verifyPath = `/m/api/v1/codex/action/verify?${new URLSearchParams({ action_id: a })}`;
+      const unresolved = { actionId: a, outcome: "unresolved", stage: "settled" };
+      routes.verifyQueue = [unresolved];
+      routes.resume = {
+        status: "already_resumed",
+        predecessor: actionView(a, null),
+        successorActionId: b,
+      };
+      fireEvent.click(check);
+      await flushAsync();
+      const resend = screen.getByTestId("codex-recovery-resend");
+
+      let resolveVerify!: (body: unknown) => void;
+      let rejectVerify!: (reason: Error) => void;
+      const verifyBody = new Promise((resolve, reject) => {
+        resolveVerify = resolve;
+        rejectVerify = reject;
+      });
+      let resolveResume!: (body: unknown) => void;
+      const resumeBody = new Promise((resolve) => {
+        resolveResume = resolve;
+      });
+      const verifyResponse = json(null);
+      const verifyRead = vi.spyOn(verifyResponse, "json").mockReturnValue(verifyBody);
+      const resumeBodyRead = vi.fn(() => resumeBody);
+      const existing = fetchMock.getMockImplementation()!;
+      fetchMock.mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        if (url.includes("/codex/action/verify")) {
+          verifyUrls.push(url);
+          return verifyResponse;
+        }
+        const response = await existing(input, init);
+        if (url.includes("/codex/action/manual-resume")) {
+          vi.spyOn(response, "json").mockImplementation(resumeBodyRead);
+        }
+        return response;
+      });
+
+      fireEvent.click(check);
+      await flushAsync();
+      expect(verifyUrls.slice(-2)).toEqual([verifyPath, verifyPath]);
+      expect(verifyRead).toHaveBeenCalledTimes(1);
+      expect(check).toBeDisabled();
+      fireEvent.click(resend);
+      expect(screen.getByTestId("codex-recovery-resend-risks")).toBeVisible();
+      expect(postCount()).toBe(1);
+      fireEvent.click(screen.getByTestId("codex-recovery-resend-confirm"));
+      await flushAsync();
+      expect(resumeBodyRead).toHaveBeenCalledTimes(1);
+      expect(JSON.parse(resumeBodies.at(-1)!)).toMatchObject({ actionId: a });
+      expect(postCount()).toBe(2);
+      expect(read.mock.calls).toEqual([[actionStatusPath(a)]]);
+      pendingAutoReadFor.current = a;
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(2_000);
+      });
+      expect(read.mock.calls).toEqual([[actionStatusPath(a)], [actionStatusPath(a)]]);
+
+      // 两个 API 都在等 JSON。先释放人工继续，再在同一个 act 内释放旧核对，
+      // 让两个组件回调依序执行，中间没有一次 act 提交来刷换锚 effect。
+      await act(async () => {
+        resolveResume(routes.resume);
+        if (outcome === "response_error") {
+          rejectVerify(new SyntaxError("invalid JSON"));
+        } else {
+          resolveVerify({ ...unresolved, outcome, turnId: outcome === "delivered" ? "t-a" : null });
+        }
+      });
+
+      expect(screen.getByTestId("codex-recovery-panel")).toBe(panel);
+      expect(screen.getByTestId("codex-recovery-title")).toBeVisible();
+      expect(screen.getByTestId("codex-recovery-result")).toHaveTextContent(
+        i18n.t("mobile.codex.composer.recoveryAlreadyResumed", { short: b.slice(0, 8) })
+      );
+      expect(screen.queryByText(/^已确认送达/)).toBeNull();
+      expect(screen.queryByTestId("codex-recovery-resend")).toBeNull();
+      expect(screen.queryByTestId("codex-recovery-note")).toBeNull();
+      expect(check).toBeEnabled();
+      expect(read.mock.calls).toEqual([
+        [actionStatusPath(a)],
+        [actionStatusPath(a)],
+        [actionStatusPath(b)],
+      ]);
+
+      await act(async () => {
+        releaseAutoRead(json(actionView(a, "t-a")));
+      });
+      expect(screen.queryByText(/^已确认送达/)).toBeNull();
+      expect(screen.getByTestId("codex-recovery-title")).toBeVisible();
+      expect(screen.getByTestId("codex-recovery-result")).toHaveTextContent(
+        i18n.t("mobile.codex.composer.recoveryAlreadyResumed", { short: b.slice(0, 8) })
+      );
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(2_000);
+      });
+      expect(read.mock.calls).toEqual([
+        [actionStatusPath(a)],
+        [actionStatusPath(a)],
+        [actionStatusPath(b)],
+        [actionStatusPath(b)],
+      ]);
+      expect(postCount()).toBe(2);
+      view.unmount();
+    }
+  });
+});

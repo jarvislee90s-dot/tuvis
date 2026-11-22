@@ -280,9 +280,19 @@ pub async fn gate(State(state): State<Arc<RemoteState>>, req: Request, next: Nex
     }
 }
 
-/// 统一拒绝响应：403 且响应体为空——不泄露"未配对 / 设备失效"的区分
+/// 统一拒绝响应：403 且响应体为空——不泄露"未配对 / 设备失效"的区分。
+/// E8（B3 计划）：auth gate 拒绝面同样 no-store——gate 在 nest 层早退，
+/// route 级 no-store layer 不经过此处，必须在响应上显式加盖（R4
+/// e8_auth_failures_carry_no_store 缺陷修复：gated 端点 403 曾可被中间层缓存）。
 fn unauthorized() -> Response {
-    axum::http::StatusCode::FORBIDDEN.into_response()
+    (
+        axum::http::StatusCode::FORBIDDEN,
+        [(
+            axum::http::header::CACHE_CONTROL,
+            axum::http::HeaderValue::from_static("no-store"),
+        )],
+    )
+        .into_response()
 }
 
 #[cfg(test)]

@@ -31,6 +31,9 @@ pub const CAP_SCHEMA: &str = "schema";
 /// `codex_ipc_probe` 既有测试里的 "send" 一致，单一出处在此，remote 层只做别名）。
 pub const CAP_SEND: &str = "send";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProbeLedgerReadError;
+
 /// 探测账本接口（#172）：由 remote 层用 `DeviceStore` 实现注入 adapter；测试可注入
 /// 内存实现。语义 = `codex_ipc_probe` 表的读写（见 `database::dao::codex_ipc_probe`）。
 ///
@@ -39,6 +42,14 @@ pub const CAP_SEND: &str = "send";
 pub trait ProbeLedger: Send + Sync {
     /// 读某 `(probe_key, capability)` 的结论；无行 → `None`。
     fn get(&self, probe_key: &str, capability: &str) -> Option<ProbeLedgerEntry>;
+    /// 展示缓存需区分读取失败和成功但无记录；旧的内存实现沿用 get 语义。
+    fn try_get(
+        &self,
+        probe_key: &str,
+        capability: &str,
+    ) -> Result<Option<ProbeLedgerEntry>, ProbeLedgerReadError> {
+        Ok(self.get(probe_key, capability))
+    }
     /// 落账（upsert；`attempts` 累加、`next_retry_at` 按退避算）。
     ///
     /// `fingerprint`：**证据指纹**——只对 `capability = "schema"` 的行有意义（官方

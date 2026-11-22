@@ -44,7 +44,9 @@ use super::types::ProtocolError;
 ///   必须作废重识别。
 /// * 4 — 拒绝内联题目标识中回调形参遮蔽来源标识；旧证据须重新识别。
 /// * 5 — 26.1103.3517.0 内联题目标识改为守卫后直接遍历题目；重新识别 v4 的未匹配结果。
-pub const CONTRACT_RULE_VERSION: u32 = 5;
+/// * 6 — 运行中异步答题独立识别 steer v1 及已接受的正式 steering 答复。
+/// * 7 — 收紧 active 解析接收者与命名作用域绑定；旧 v6 证据必须重新识别。
+pub const CONTRACT_RULE_VERSION: u32 = 7;
 
 /// 逐操作键（spec §3.1：消息、命令审批、文件审批、阻塞答题、异步空闲答题、
 /// 请求级取消、回合打断、权限与模式分别判断）。
@@ -63,6 +65,8 @@ pub enum CodexOperation {
     BlockingInput,
     /// 异步 Question 的空闲正式答题（start-turn 承载已核验信封）。
     AsyncAnswerIdle,
+    /// 异步 Question 的运行中正式答题（独立契约的 steer v1）。
+    AsyncAnswerActive,
     /// 定向回合打断（`thread-follower-interrupt-turn` v4 + expectedTurnId）。
     Interrupt,
     /// 单请求取消（本阶段无已核验专用 RPC → 恒不放行）。
@@ -81,12 +85,13 @@ pub enum CodexOperation {
 
 impl CodexOperation {
     /// 全部操作键（稳定顺序 = 声明顺序，供详情页遍历与测试穷举）。
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 13] = [
         Self::Send,
         Self::CommandApproval,
         Self::FileChangeApproval,
         Self::BlockingInput,
         Self::AsyncAnswerIdle,
+        Self::AsyncAnswerActive,
         Self::Interrupt,
         Self::RequestCancel,
         Self::PermissionsApproval,
@@ -104,6 +109,7 @@ impl CodexOperation {
             Self::FileChangeApproval => "file_change_approval",
             Self::BlockingInput => "blocking_input",
             Self::AsyncAnswerIdle => "async_answer_idle",
+            Self::AsyncAnswerActive => "async_answer_active",
             Self::Interrupt => "interrupt",
             Self::RequestCancel => "request_cancel",
             Self::PermissionsApproval => "permissions_approval",
@@ -609,10 +615,12 @@ impl OperationPolicy {
             };
         }
 
-        let shipped = context.shipped_for(operation);
-        let observed = context.observed_for(operation);
+        // ActiveSteer 本批只认当前包的独立契约，不借旧 idle 成功或相邻能力授权。
+        let active_answer = operation == CodexOperation::AsyncAnswerActive;
+        let shipped = !active_answer && context.shipped_for(operation);
+        let observed = !active_answer && context.observed_for(operation);
         let contract = context.contract_for(operation).is_some();
-        let schema = context.schema_for(operation);
+        let schema = !active_answer && context.schema_for(operation);
         let evidence = if shipped {
             EvidenceSource::Shipped
         } else if observed {
@@ -724,6 +732,17 @@ impl OperationPolicy {
                         Some(codes::OPERATION_RUNTIME_UNKNOWN)
                     } else {
                         Some(codes::OPERATION_RUNTIME_ACTIVE)
+                    }
+                }
+                CodexOperation::AsyncAnswerActive => {
+                    if context.blocking_pending {
+                        Some(codes::OPERATION_BLOCKING_PENDING)
+                    } else if context.queue_paused {
+                        Some(codes::OPERATION_QUEUE_PAUSED)
+                    } else if context.runtime_is("active") {
+                        None
+                    } else {
+                        Some(codes::OPERATION_RUNTIME_UNKNOWN)
                     }
                 }
                 _ => Some(codes::OPERATION_NOT_IMPLEMENTED),
@@ -890,6 +909,112 @@ mod tests {
             display_support: Default::default(),
             display_identity_verified: false,
         }
+    }
+
+    fn async_active_operation() -> CodexOperation {
+        CodexOperation::parse("async_answer_active").expect("active 异步答题须有独立操作键")
+    }
+
+    fn async_active_context() -> (CodexOperation, OperationContext) {
+        let operation = async_active_operation();
+        let mut context = idle_context();
+        context.runtime_status = "active".into();
+        context.contract.clear();
+        context.contract.insert(
+            operation,
+            ContractMatch {
+                method: "thread-follower-steer-turn".into(),
+                base_version: 1,
+                request_rule: "conversationId+steer".into(),
+                response_rule: "result".into(),
+                semantic_rule: "async answer steer".into(),
+            },
+        );
+        (operation, context)
+    }
+
+    #[test]
+    fn async_active_operation_is_distinct_and_implemented() {
+        let operation = async_active_operation();
+        assert_ne!(operation, CodexOperation::AsyncAnswerIdle);
+        assert!(operation.is_implemented_in_phase());
+        assert!(
+            OperationPolicy
+                .evaluate(&idle_context())
+                .get(operation)
+                .unwrap()
+                .implemented
+        );
+    }
+
+    #[test]
+    fn async_active_steer_contract_allows_active() {
+        let (operation, context) = async_active_context();
+        let ops = OperationPolicy.evaluate(&context);
+        assert!(ops.allows(operation), "active 的独立 steer 契约应允许答题");
+        assert_eq!(
+            ops.get(operation).unwrap().evidence,
+            EvidenceSource::ContractMatched
+        );
+    }
+
+    #[test]
+    fn async_active_idle_contract_does_not_authorize_active() {
+        let (operation, mut context) = async_active_context();
+        context.contract.remove(&operation);
+        context.contract.insert(
+            CodexOperation::AsyncAnswerIdle,
+            match_for(CodexOperation::AsyncAnswerIdle),
+        );
+        assert!(!OperationPolicy.evaluate(&context).allows(operation));
+    }
+
+    #[test]
+    fn async_active_blocking_pending_prevents_answer() {
+        let (operation, mut context) = async_active_context();
+        context.blocking_pending = true;
+        let ops = OperationPolicy.evaluate(&context);
+        assert!(!ops.allows(operation));
+        assert_eq!(
+            ops.get(operation).unwrap().reason_code.as_deref(),
+            Some(codes::OPERATION_BLOCKING_PENDING)
+        );
+    }
+
+    #[test]
+    fn async_active_stale_target_prevents_answer() {
+        let (operation, mut context) = async_active_context();
+        context.target_fresh = false;
+        let ops = OperationPolicy.evaluate(&context);
+        assert!(!ops.allows(operation));
+        assert_eq!(
+            ops.get(operation).unwrap().reason_code.as_deref(),
+            Some(codes::OPERATION_TARGET_STALE)
+        );
+    }
+
+    #[test]
+    fn async_active_disabled_adaptation_prevents_contract_answer() {
+        let (operation, mut context) = async_active_context();
+        context.auto_adapt_enabled = false;
+        let ops = OperationPolicy.evaluate(&context);
+        assert!(!ops.allows(operation));
+        assert_eq!(
+            ops.get(operation).unwrap().reason_code.as_deref(),
+            Some(codes::OPERATION_AUTO_ADAPT_OFF)
+        );
+    }
+
+    #[test]
+    fn async_active_paused_queue_prevents_answer() {
+        let (operation, mut context) = async_active_context();
+        context.queue_paused = true;
+        let ops = OperationPolicy.evaluate(&context);
+        assert!(!ops.allows(operation));
+        assert_eq!(
+            ops.get(operation).unwrap().reason_code.as_deref(),
+            Some(codes::OPERATION_QUEUE_PAUSED)
+        );
     }
 
     /// 只读证据不得解锁任何写操作（读链成功 ≠ 可写）。
@@ -1143,7 +1268,7 @@ mod tests {
     /// v2 证据行对该 build 落账为"不匹配"。
     #[test]
     fn contract_rule_version_bumped_for_structural_async_rule() {
-        assert_eq!(CONTRACT_RULE_VERSION, 5);
+        assert_eq!(CONTRACT_RULE_VERSION, 7);
     }
 
     /// 已识别（包已读、规则已跑）但本操作无匹配 → `operation_contract_unmatched`

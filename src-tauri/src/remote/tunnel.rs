@@ -203,18 +203,16 @@ pub fn download_url_for() -> Result<String, String> {
 
 /// 二进制就绪判定（macOS 需可执行位；Windows 只查存在）
 fn binary_ready(p: &Path) -> bool {
-    if !p.is_file() {
-        return false;
-    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::metadata(p)
-            .map(|m| m.permissions().mode() & 0o111 != 0)
-            .unwrap_or(false)
+        p.is_file()
+            && std::fs::metadata(p)
+                .map(|m| m.permissions().mode() & 0o111 != 0)
+                .unwrap_or(false)
     }
     #[cfg(not(unix))]
-    true
+    p.is_file()
 }
 
 /// 下载器注入缝形态（生产 download_to / 测试闭包共用；只收落盘 dest——候选循环 +

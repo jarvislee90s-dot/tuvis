@@ -25,10 +25,12 @@
 //
 // 本层全部为 `*_conn(&Connection, …)` 形态（与 sibling DAO 一致）；调用方
 // `services::codex_control::ActionStore` 在 DeviceStore 锁内调用，绝不跨 await 持锁。
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 
+use crate::services::codex_desktop_ipc::async_question::AsyncAnswerRoute;
+use crate::services::codex_desktop_ipc::capability::{ObservedTarget, CONTRACT_RULE_VERSION};
 use crate::services::codex_desktop_ipc::types::{
-    ActionReceipt, ActionState, ControlRoute, Delivery,
+    ActionReceipt, ActionState, ControlRoute, Delivery, ThreadKey,
 };
 
 /// SELECT 列清单（顺序与 [`row_action`] 对齐）
@@ -36,7 +38,10 @@ const COLS: &str = "seq, action_id, device_id, device_name, thread_id, kind, req
      context_token, payload_hash, client_message_id, state, route, queued_text, created_at, \
      updated_at, receipt_json, compat_outstanding, compat_message_id, compat_turn_id, \
      compat_rollout_path, compat_rollout_baseline, compat_wire_hash, barrier_force_released_at, \
-     signature_applied";
+     signature_applied, async_answer_route";
+/// 只允许开回合路径建立顺序屏障；未知新词也不能按旧 idle 放行。
+const TURN_FENCE_ELIGIBLE: &str = "(kind <> 'async_question' OR async_answer_route IS NULL \
+     OR async_answer_route = 'idle_start')";
 // ============================================================
 // 枚举 ⇄ 存储串（serde snake_case 同形；手工映射保证坏值显式报错不静默）
 // ============================================================
@@ -124,6 +129,15 @@ pub(crate) struct ActionRow {
     /// 签名开关冻结值：Some(true)=正文已带签名，Some(false)=裸正文，
     /// None=本列上线前的旧行（按升级前语义恒带签名派发）。
     pub signature_applied: Option<bool>,
+    /// 显式运行中答案不产生新回合；旧 NULL 保留 legacy idle 语义。
+    pub async_answer_route: Option<AsyncAnswerRoute>,
+}
+
+impl ActionRow {
+    pub(crate) fn is_active_async_answer(&self) -> bool {
+        self.kind == "async_question"
+            && self.async_answer_route == Some(AsyncAnswerRoute::ActiveSteer)
+    }
 }
 
 /// PR #117 兼容兜底 fence（服务端内部类型，计划 Task 7 明文）：桥接前记录 rollout
@@ -142,6 +156,18 @@ fn row_action(row: &rusqlite::Row) -> rusqlite::Result<ActionRow> {
     let state: String = row.get(10)?;
     let route: String = row.get(11)?;
     let receipt_json: Option<String> = row.get(15)?;
+    let async_answer_route: Option<String> = row.get(24)?;
+    let async_answer_route = async_answer_route
+        .map(|word| {
+            AsyncAnswerRoute::parse(&word).ok_or_else(|| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    24,
+                    rusqlite::types::Type::Text,
+                    format!("unknown codex_actions.async_answer_route: {word}").into(),
+                )
+            })
+        })
+        .transpose()?;
     Ok(ActionRow {
         seq: row.get(0)?,
         action_id: row.get(1)?,
@@ -178,6 +204,7 @@ fn row_action(row: &rusqlite::Row) -> rusqlite::Result<ActionRow> {
         compat_wire_hash: row.get(21)?,
         barrier_force_released_at: row.get(22)?,
         signature_applied: row.get::<_, Option<i64>>(23)?.map(|v| v != 0),
+        async_answer_route,
     })
 }
 
@@ -345,10 +372,18 @@ pub(crate) fn mark_stale_reserved_unknown_conn(
         //（ack/落账丢失），重启后顺序限制同样保守在册（无身份不自动释放；与
         // finish_with_turn_barrier 的 Unknown 口径一致）。kind='send' 限定普通
         // 消息（审批行无 Turn 顺序语义）。
+        // Task2 单调守卫：verified 核销在册的源动作收敛状态但**不**重置屏障
+        //（CASE 保持原列值——核销事实已消化屏障，收尾事实照常落账）。
         tx.execute(
-            "UPDATE codex_actions SET state='unknown', queued_text=NULL, updated_at=?2,
- receipt_json=?3, compat_outstanding=1, compat_turn_id=NULL
+            &format!(
+                "UPDATE codex_actions SET state='unknown', queued_text=NULL, updated_at=?2,
+ receipt_json=?3,
+ compat_outstanding = CASE WHEN {eligible} AND NOT {p} THEN 1 ELSE compat_outstanding END,
+ compat_turn_id = CASE WHEN {eligible} AND NOT {p} THEN NULL ELSE compat_turn_id END
  WHERE seq=?1 AND state='reserved'",
+                eligible = TURN_FENCE_ELIGIBLE,
+                p = VERIFIED_RESOLVED_PREDICATE
+            ),
             rusqlite::params![
                 seq,
                 now_ms,
@@ -414,18 +449,25 @@ fn recover_one_conn(conn: &Connection, action_id: &str, now_ms: i64) -> rusqlite
     //（RPC 可能已到达 Desktop、落账前崩溃——重启后顺序限制保守在册）
     // `barrier_force_released_at IS NULL` 守卫（2026-10-19）：人工解除过的行不回置
     // 屏障（单调性；解除行必为终态，正常不可达，守卫使不变量结构化）。
-    let n = conn.execute(
+    // Task2 单调守卫（第 6 写点）：verified 核销在册的源动作恢复 state/receipt
+    // 照常落账（不抹旧动作事实），但两处屏障列 CASE 不重置（屏障已随核销消化，
+    // 重启恢复不得 out0→1）。
+    let sql = format!(
         "UPDATE codex_actions SET state = 'unknown', receipt_json = ?2, updated_at = ?3,
  compat_outstanding = CASE WHEN route = 'desktop_ipc'
- AND kind IN ('send', 'async_question')
+ AND kind IN ('send', 'async_question') AND {eligible}
+ AND NOT {p}
  THEN 1 ELSE compat_outstanding END,
  compat_turn_id = CASE WHEN route = 'desktop_ipc'
- AND kind IN ('send', 'async_question')
+ AND kind IN ('send', 'async_question') AND {eligible}
+ AND NOT {p}
  THEN NULL ELSE compat_turn_id END
  WHERE action_id = ?1 AND state = 'reserved'
  AND barrier_force_released_at IS NULL",
-        params![action_id, receipt_json, now_ms],
-    )?;
+        eligible = TURN_FENCE_ELIGIBLE,
+        p = VERIFIED_RESOLVED_PREDICATE
+    );
+    let n = conn.execute(&sql, params![action_id, receipt_json, now_ms])?;
     // 复审 round 4（V2）：重启恢复 reserved → unknown 同为收尾——claim 演进（清除）
     clear_write_claim_conn(conn, action_id)?;
     Ok(n)
@@ -456,6 +498,55 @@ pub(crate) fn reserve_conn(
     let Some(row) = get_row(&tx, action_id)? else {
         return Ok(false);
     };
+    super::write_audit::record_conn_checked(
+        &tx,
+        now_ms,
+        &row.device_id,
+        &row.device_name,
+        "codex",
+        &row.thread_id,
+        "codex_desktop_ipc",
+        audit_action_of(&row.kind),
+        &audit_summary(&row),
+        "reserved",
+    )?;
+    tx.commit()?;
+    Ok(true)
+}
+
+/// 异步答题的 reserve 胜者同事务冻结路径、效果归属与起始审计；重放不能改写。
+pub(crate) fn reserve_async_answer_conn(
+    conn: &Connection,
+    action_id: &str,
+    answer_route: AsyncAnswerRoute,
+    target: Option<&ObservedTarget>,
+    now_ms: i64,
+) -> rusqlite::Result<bool> {
+    let target = target.filter(|_| answer_route.opens_turn());
+    let tx = conn.unchecked_transaction()?;
+    // 在覆盖冻结词前严格读取原行；未知非 NULL 词不能被本次参数静默洗成合法路径。
+    if get_row(&tx, action_id)?.is_none() {
+        return Ok(false);
+    }
+    let n = tx.execute(
+        "UPDATE codex_actions SET state='reserved', route='desktop_ipc', queued_text=NULL, \
+         async_answer_route=?2, updated_at=?3, effect_probe_key=?4, \
+         effect_package_sha256=?5, effect_rule_version=?6 \
+         WHERE action_id=?1 AND state='queued' AND kind='async_question' \
+         AND compat_outstanding=0",
+        params![
+            action_id,
+            answer_route.as_str(),
+            now_ms,
+            target.map(|target| target.probe_key.as_str()),
+            target.map(|target| target.package_sha256.as_str()),
+            target.map(|_| i64::from(CONTRACT_RULE_VERSION)),
+        ],
+    )?;
+    if n == 0 {
+        return Ok(false);
+    }
+    let row = get_row(&tx, action_id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
     super::write_audit::record_conn_checked(
         &tx,
         now_ms,
@@ -695,6 +786,82 @@ pub(crate) fn mint_bypass_grant_conn(
     Ok(())
 }
 
+/// Task5：优先处理授权铸造的 **attempt 返回变体**——与 [`mint_bypass_grant_conn`]
+/// 同一幂等 CAS 语句形态（无行 → attempt 1；未消费行不动；已消费行 → 代际 +1、
+/// 清消费位），并在**同一事务内**读回真实 attempt。接管事务须绑定该 attempt 消费
+/// 授权与登记 explicit 记录（不得猜测/另查），返回值即
+/// [`reserve_with_barrier_takeover_sources_conn`] 的 `grant_attempt` 入参。旧返回
+/// `()` 的 mint API 保持不变。
+/// Task7：unchecked 旧入口——生产路径已改走 `mint_bypass_grant_attempt_checked_conn`
+/// checked 闸；本入口保留给单元测试（签名/语义不变；SQL 主体经
+/// `mint_bypass_grant_attempt_in_tx` 与生产共用）。
+#[cfg(test)]
+pub(crate) fn mint_bypass_grant_attempt_conn(
+    conn: &Connection,
+    action_id: &str,
+    thread_id: &str,
+    now_ms: i64,
+) -> rusqlite::Result<i64> {
+    let tx = conn.unchecked_transaction()?;
+    let attempt = mint_bypass_grant_attempt_in_tx(&tx, action_id, thread_id, now_ms)?;
+    tx.commit()?;
+    Ok(attempt)
+}
+
+/// Task7：mint 的 SQL 主体（事务内复用；checked/unchecked 两路共用同一套语句，
+/// 不复制两套事务逻辑）。
+fn mint_bypass_grant_attempt_in_tx(
+    tx: &Transaction,
+    action_id: &str,
+    thread_id: &str,
+    granted_at: i64,
+) -> rusqlite::Result<i64> {
+    tx.execute(
+        "INSERT INTO codex_bypass_grant (action_id, thread_id, granted_at, attempt) \
+ VALUES (?1, ?2, ?3, 1) \
+ ON CONFLICT(action_id) DO UPDATE SET \
+ thread_id = ?2, granted_at = ?3, consumed_at = NULL, \
+ attempt = codex_bypass_grant.attempt + 1 \
+ WHERE codex_bypass_grant.consumed_at IS NOT NULL",
+        params![action_id, thread_id, granted_at],
+    )?;
+    let attempt: i64 = tx.query_row(
+        "SELECT attempt FROM codex_bypass_grant WHERE action_id = ?1",
+        [action_id],
+        |r| r.get(0),
+    )?;
+    Ok(attempt)
+}
+
+/// Task7：最终 mutation 闸的返回分类——`Applied(T)` = validator 通过、mutation
+/// 已原子提交（携带原返回值语义）；`StaleIntent` = IMMEDIATE 写事务就绪且前置
+/// 只读校验结束后，最终 authorize 现场判定意图已换代/到期 → **回滚零业务
+/// mutation**（grant 不新增/不重铸/不消费，explicit/audit 无增量）。
+pub(crate) enum CheckedMutation<T> {
+    Applied(T),
+    StaleIntent,
+}
+
+/// Task7：mint 的 checked 变体——取得连接锁 + `BEGIN IMMEDIATE` 等写事务资格
+/// 后、首条 grant INSERT/UPDATE 前执行 `authorize`（最终闸；`None` = 意图已
+/// 换代/到期 → `StaleIntent`）。`authorize` 返回的时间戳只作本事务 granted_at
+/// 审计，不作期限判据（期限由上层 validator 现场单调时刻判定）。旧入口
+/// [`mint_bypass_grant_attempt_conn`] 语义/签名不变。
+pub(crate) fn mint_bypass_grant_attempt_checked_conn(
+    conn: &Connection,
+    action_id: &str,
+    thread_id: &str,
+    authorize: impl FnOnce() -> Option<i64>,
+) -> rusqlite::Result<CheckedMutation<i64>> {
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    let Some(granted_at) = authorize() else {
+        return Ok(CheckedMutation::StaleIntent);
+    };
+    let attempt = mint_bypass_grant_attempt_in_tx(&tx, action_id, thread_id, granted_at)?;
+    tx.commit()?;
+    Ok(CheckedMutation::Applied(attempt))
+}
+
 /// CAS 消费授权（写出前恰好一次）：action 与 thread **必须同时匹配**——授权跨
 /// thread / 跨 action 一律 false（不存在的授权）。已消费（consumed_at 非 NULL）
 /// 再取 = false（重复消费拒绝）。行保留作审计，不删除。
@@ -873,38 +1040,83 @@ pub(crate) fn finish_queued_refusal_conn(
     Ok(n > 0)
 }
 
+/// Task2（2026-11-11 队列占位与强制插队 TDD）：verified 核销在册谓词——源动作已有
+/// `verified_complete` 核销事实 = 其运行屏障（compat_outstanding 槽位）已随核销**永久
+/// 消化**。与 `barrier_force_released_at` 同类的**单调守卫**：所有会把 out 0→1 的既有
+/// 写点必须带 `NOT EXISTS` 本谓词（已核销源不得复活屏障；真实回执事实仍可补记）。
+/// explicit takeover 记录**不**匹配本谓词（仅对目标 attempt 生效，不是全局豁免）。
+const VERIFIED_RESOLVED_PREDICATE: &str = "EXISTS (SELECT 1 FROM codex_barrier_resolutions r \
+     WHERE r.source_action_id = codex_actions.action_id AND r.reason = 'verified_complete')";
+
 /// S3 迟到证据归账（设计 §5.3「迟到证据只更新对应原动作、同一证据只收敛一次」）：
 /// RPC 超时后迟到的有效回执，把**仍可收敛**的动作（reserved / unknown）CAS 到真实
 /// 终态。已终态（accepted/rejected/cancelled）→ `false`（证据已被消费过一次，不覆盖
 /// 不改写）。Accepted with turnId / unknown 升级臂同步重绑 Turn 屏障（保守屏障 →
 /// 绑定身份）；Rejected 臂清屏障（无 Turn 产生）。人工解除过的行不回置屏障（单调性，
-/// 与 [`finish_with_turn_barrier_conn`] 同守卫）。
+/// 与 [`finish_with_turn_barrier_conn`] 同守卫）；verified 核销在册的源动作同样不回置
+/// （Task2 单调守卫），其真实回执走核销补记臂（事实不丢，屏障列不动）。
 pub(crate) fn finish_late_result_conn(
     conn: &Connection,
     receipt: &ActionReceipt,
     now_ms: i64,
 ) -> rusqlite::Result<bool> {
+    let active_answer =
+        get_row(conn, &receipt.action_id)?.is_some_and(|row| row.is_active_async_answer());
     let receipt_json = serde_json::to_string(receipt)
         .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
     let state = state_to_str(delivery_to_state(receipt.delivery));
-    // 主臂：屏障可动（未人工解除）——S3 原语义原样
+    if active_answer {
+        let n = conn.execute(
+            "UPDATE codex_actions SET state=?2, receipt_json=?3, updated_at=?4 \
+             WHERE action_id=?1 AND state IN ('reserved','unknown')",
+            params![receipt.action_id, state, receipt_json, now_ms],
+        )?;
+        if receipt.delivery == Delivery::UnknownDelivery {
+            clear_write_claim_conn(conn, &receipt.action_id)?;
+        }
+        return Ok(n > 0);
+    }
+    // 同文兼容核对只清屏障，不改变 Unknown。迟到回执可补投递事实，已清的普通发送屏障保持清除。
+    const CLEARED_NATIVE_SEND: &str =
+        "kind = 'send' AND route = 'desktop_ipc' AND state = 'unknown' AND compat_outstanding = 0";
     let n = match receipt.delivery {
         // 明确拒绝（迟到才知道的拒绝）：无 Turn 产生，清屏障
         Delivery::Rejected => conn.execute(
             "UPDATE codex_actions SET state = ?2, receipt_json = ?3, updated_at = ?4, compat_outstanding = 0, compat_turn_id = NULL WHERE action_id = ?1 AND state IN ('reserved', 'unknown') AND barrier_force_released_at IS NULL",
             params![receipt.action_id, state, receipt_json, now_ms],
         )?,
-        // Accepted / Unknown：accepted 绑 Turn 身份（unknown 保守屏障语义不变）
-        _ => conn.execute(
-            "UPDATE codex_actions SET state = ?2, receipt_json = ?3, updated_at = ?4, compat_outstanding = 1, compat_turn_id = ?5 WHERE action_id = ?1 AND state IN ('reserved', 'unknown') AND barrier_force_released_at IS NULL",
-            params![
-                receipt.action_id,
-                state,
-                receipt_json,
-                now_ms,
-                receipt.turn_id
-            ],
-        )?,
+        // Accepted / Unknown：accepted 绑 Turn 身份（unknown 保守屏障语义不变）；
+        // verified 核销在册的源动作被主臂排除（不得 out0→1）
+        _ => {
+            let main_arm = format!(
+                "UPDATE codex_actions SET state = ?2, receipt_json = ?3, updated_at = ?4, compat_outstanding = 1, compat_turn_id = ?5 WHERE action_id = ?1 AND state IN ('reserved', 'unknown') AND barrier_force_released_at IS NULL AND NOT ({CLEARED_NATIVE_SEND}) AND NOT {}",
+                VERIFIED_RESOLVED_PREDICATE
+            );
+            let n = conn.execute(
+                &main_arm,
+                params![
+                    receipt.action_id,
+                    state,
+                    receipt_json,
+                    now_ms,
+                    receipt.turn_id
+                ],
+            )?;
+            if n == 0 {
+                // 已清障的普通发送和 verified 核销只补投递事实，保留屏障及绑定槽原值。
+                let resolved_arm = format!(
+                    "UPDATE codex_actions SET state = ?2, receipt_json = ?3, updated_at = ?4 \
+                     WHERE action_id = ?1 AND state IN ('reserved', 'unknown') \
+                     AND ({CLEARED_NATIVE_SEND} OR {VERIFIED_RESOLVED_PREDICATE})"
+                );
+                conn.execute(
+                    &resolved_arm,
+                    params![receipt.action_id, state, receipt_json, now_ms],
+                )?
+            } else {
+                n
+            }
+        }
     };
     // 复审 round 4（V2）：迟到回执把动作收成 unknown（reserved → unknown）同为
     // 收尾——claim 演进（清除）；accepted/rejected 终态无后继需求、不清（幂等无害）
@@ -921,7 +1133,99 @@ pub(crate) fn finish_late_result_conn(
         "UPDATE codex_actions SET state = ?2, receipt_json = ?3, updated_at = ?4 WHERE action_id = ?1 AND state IN ('reserved', 'unknown') AND barrier_force_released_at IS NOT NULL",
         params![receipt.action_id, state, receipt_json, now_ms],
     )?;
-    Ok(n2 > 0)
+    if n2 > 0 {
+        return Ok(true);
+    }
+    // 同动作、同回合的正式回显可补记一次真实 RPC 信封，保留屏障与绑定。
+    // 返回 false，调用方无需重新结算或通知。
+    if receipt.delivery == Delivery::Accepted
+        && receipt
+            .envelope_id
+            .as_deref()
+            .is_some_and(|id| !id.is_empty())
+    {
+        if let Some(turn_id) = receipt
+            .turn_id
+            .as_deref()
+            .filter(|turn| !turn.trim().is_empty())
+        {
+            conn.execute(
+                "UPDATE codex_actions SET receipt_json = ?3, updated_at = ?4 \
+                 WHERE action_id = ?1 AND kind = 'send' AND route = 'desktop_ipc' \
+                 AND state = 'accepted' AND json_valid(receipt_json) \
+                 AND json_extract(receipt_json, '$.actionId') = ?1 \
+                 AND json_extract(receipt_json, '$.turnId') = ?2 \
+                 AND json_extract(receipt_json, '$.reasonCode') = ?5 \
+                 AND json_extract(receipt_json, '$.envelopeId') IS NULL",
+                params![
+                    receipt.action_id,
+                    turn_id,
+                    receipt_json,
+                    now_ms,
+                    crate::services::codex_control::READ_VERIFY_REASON
+                ],
+            )?;
+        }
+    }
+    Ok(false)
+}
+
+/// 正式回显按动作、线程、客户端消息身份和回合归属执行 CAS。
+/// Unknown 可确认送达，只补绑仍在册的屏障。显式核对已取写权的 Reserved 时，
+/// 与回执一起登记原派发的屏障。人工解除及 verified_complete 核销行由真实 RPC 补记。
+/// 返回 `Some` 表示本次确认写入成功，布尔值表示写入时是否有屏障可补绑。
+pub(crate) fn finish_formal_echo_conn(
+    conn: &Connection,
+    receipt: &ActionReceipt,
+    thread_id: &str,
+    client_message_id: &str,
+    allow_reserved: bool,
+    now_ms: i64,
+) -> rusqlite::Result<Option<bool>> {
+    let Some(turn_id) = receipt
+        .turn_id
+        .as_deref()
+        .filter(|turn| !turn.trim().is_empty())
+    else {
+        return Ok(None);
+    };
+    let receipt_json = serde_json::to_string(receipt)
+        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+    let (barrier_update, state_guard) = if allow_reserved {
+        (
+            "compat_turn_id = ?4, compat_outstanding = 1",
+            "state = 'reserved' AND EXISTS (SELECT 1 FROM codex_write_revoke w \
+             WHERE w.action_id = codex_actions.action_id AND w.claimed_at IS NOT NULL AND w.revoked_at IS NULL)",
+        )
+    } else {
+        (
+            "compat_turn_id = CASE WHEN compat_outstanding = 1 THEN ?4 ELSE compat_turn_id END",
+            "state = 'unknown'",
+        )
+    };
+    let sql = format!(
+        "UPDATE codex_actions SET state = 'accepted', receipt_json = ?2, updated_at = ?3, \
+         {barrier_update} WHERE action_id = ?1 \
+         AND thread_id = ?5 AND client_message_id = ?6 AND kind = 'send' \
+         AND route = 'desktop_ipc' AND client_message_id != '' AND ({state_guard}) \
+         AND (compat_turn_id IS NULL OR compat_turn_id = ?4) \
+         AND barrier_force_released_at IS NULL AND NOT {VERIFIED_RESOLVED_PREDICATE} \
+         RETURNING compat_outstanding = 1"
+    );
+    // 读到 RETURNING 首行后仍须执行到 SQLITE_DONE，才能确认提交成功。
+    conn.prepare(&sql)?
+        .query_one(
+            params![
+                receipt.action_id,
+                receipt_json,
+                now_ms,
+                turn_id,
+                thread_id,
+                client_message_id
+            ],
+            |row| row.get(0),
+        )
+        .optional()
 }
 
 /// 落账回执**与** Turn 顺序屏障同一 UPDATE 原子持久化（2026-10-17 复审 C1.3）：
@@ -929,7 +1233,9 @@ pub(crate) fn finish_late_result_conn(
 /// UnknownDelivery 存未知关联的保守屏障。单语句原子性确保「已接受/未知但无屏障」
 /// 窗口不存在（等待者取消/进程退出均不再丢屏障）。仅 reserved 可落账。
 /// `barrier_force_released_at IS NULL` 守卫（2026-10-19）：人工解除过的行不再回置
-/// 屏障（单调性；该行必为终态，正常不可达，守卫使不变量结构化）。
+/// 屏障（单调性；该行必为终态，正常不可达，守卫使不变量结构化）；verified 核销
+/// 在册的源动作同样被主臂排除（Task2 单调守卫），其真实回执走核销补记臂（事实
+/// 不丢，屏障列不动）。
 pub(crate) fn finish_with_turn_barrier_conn(
     conn: &Connection,
     receipt: &ActionReceipt,
@@ -942,22 +1248,403 @@ pub(crate) fn finish_with_turn_barrier_conn(
     if row.state != ActionState::Reserved {
         return Err(rusqlite::Error::InvalidQuery);
     }
+    if row.is_active_async_answer() {
+        return finish_conn(conn, receipt, now_ms);
+    }
     let receipt_json = serde_json::to_string(receipt)
         .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
     let state = state_to_str(delivery_to_state(receipt.delivery));
-    conn.execute(
+    let main_arm = format!(
         "UPDATE codex_actions SET state = ?2, receipt_json = ?3, updated_at = ?4, \
  compat_outstanding = 1, compat_message_id = NULL, compat_turn_id = ?5 \
  WHERE action_id = ?1 AND state = 'reserved' \
- AND barrier_force_released_at IS NULL",
+ AND barrier_force_released_at IS NULL AND NOT {}",
+        VERIFIED_RESOLVED_PREDICATE
+    );
+    let n = conn.execute(
+        &main_arm,
         params![receipt.action_id, state, receipt_json, now_ms, turn_id],
     )?;
+    if n == 0 {
+        // Task2 核销补记臂：verified 在册（未人工解除）的源动作——落账事实保留，
+        // 运行屏障列一律不动（out 不复活、turn 绑定不改）。
+        let resolved_arm = format!(
+            "UPDATE codex_actions SET state = ?2, receipt_json = ?3, updated_at = ?4 \
+ WHERE action_id = ?1 AND state = 'reserved' AND {}",
+            VERIFIED_RESOLVED_PREDICATE
+        );
+        conn.execute(
+            &resolved_arm,
+            params![receipt.action_id, state, receipt_json, now_ms],
+        )?;
+    }
     // 复审 round 4（V2）：Unknown 收尾 ⇒ 在途尝试结束——claim 演进（清除），
     // 人工继续的唯一后继出口不被已收尾的旧尝试永久堵死
     if receipt.delivery == Delivery::UnknownDelivery {
         clear_write_claim_conn(conn, &receipt.action_id)?;
     }
     Ok(())
+}
+
+// ============================================================
+// Task2（2026-11-11 队列占位与强制插队 TDD）：屏障核销 / 强制插队接管
+// ============================================================
+// 两入口均为**单事务**（unchecked_transaction + 全 SQL 在闭包内，不嵌套锁不跨
+// await）：任何一步失败整事务回滚（含 SQLite 注入故障——rusqlite 错误原样传播，
+// 不 map 掩盖）。核销事实不含正文/题干/答案/原始帧；真实终态证明与设备权限由
+// 上层负责（DAO 不 RPC 不查 book，不从这里发送任何 Frame）。
+
+/// auto verified 屏障核销：证据 Turn 确认的完成事实（上层负责实际终态证明）。
+///
+/// 单事务语义：核对源存在 + thread 归属一致（`scope` = 本机 Thread 复合键）+
+/// 非空真实证据 Turn → 写**唯一** verified 记录（同源唯一，partial unique index
+/// 兜底并发）→ 同事务清该源运行屏障（仅 `compat_outstanding`；state、人工 force
+/// 时间、receipt 一律不动）。`true` = 本次核销生效，**或**幂等复核到同一已核销
+/// 事实（同 thread 同证据 Turn；不覆写旧记录的 host/evidence/时间）。源不存在 /
+/// thread 不符 / 证据为空 / 同源不同证据或 scope 的冲突记录 → `Err`（不得冒当
+/// 成功）。已取得写权且仍 Reserved 的普通 IPC 发送暂缓首次核销，返回 `false`。
+pub(crate) fn resolve_barrier_verified_conn(
+    conn: &Connection,
+    scope: &ThreadKey,
+    source_action_id: &str,
+    evidence_turn_id: &str,
+    resolved_at: i64,
+) -> rusqlite::Result<bool> {
+    // 前置：证据 Turn 非空（「真实」由上层证明，DAO 只挡结构性空值）
+    if evidence_turn_id.is_empty() {
+        return Err(rusqlite::Error::InvalidQuery);
+    }
+    let tx = conn.unchecked_transaction()?;
+    // scope 有效：源存在且归属给定 thread
+    let source: Option<(String, bool)> = tx
+        .query_row(
+            "SELECT thread_id, kind = 'send' AND route = 'desktop_ipc' AND state = 'reserved' \
+             AND EXISTS (SELECT 1 FROM codex_write_revoke w WHERE w.action_id = codex_actions.action_id \
+                         AND w.claimed_at IS NOT NULL AND w.revoked_at IS NULL) \
+             FROM codex_actions WHERE action_id = ?1",
+            [source_action_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let Some((source_thread, reserved_writer)) = source else {
+        return Err(rusqlite::Error::InvalidQuery);
+    };
+    if source_thread != scope.thread_id {
+        return Err(rusqlite::Error::InvalidQuery);
+    }
+    // 幂等 / 冲突核对：同一源动作的既有 verified 记录，按**完整既存 scope** 比
+    // 对（host + thread + 证据；source 由 WHERE 钉死）——任一不同都是不同核销
+    // 事实：不得冒当成功，也不得覆写旧记录的 host/evidence/时间。
+    let existing: Option<(String, String, String)> = tx
+        .query_row(
+            "SELECT host_id, thread_id, evidence_turn_id FROM codex_barrier_resolutions \
+ WHERE source_action_id = ?1 AND reason = 'verified_complete'",
+            [source_action_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?;
+    if let Some((rec_host, rec_thread, rec_turn)) = existing {
+        return if rec_host == scope.host_id
+            && rec_thread == scope.thread_id
+            && rec_turn == evidence_turn_id
+        {
+            Ok(true) // 同一已核销事实幂等成立：零写入（tx 丢弃即回滚，无副作用）
+        } else {
+            // scope / 证据冲突：不得覆写旧事实，也不得冒当成功
+            Err(rusqlite::Error::InvalidQuery)
+        };
+    }
+    if reserved_writer {
+        // 等原 ACK 或显式核对落账，保留回显确认入口和原书本身份。
+        return Ok(false);
+    }
+    tx.execute(
+        "INSERT INTO codex_barrier_resolutions \
+ (host_id, thread_id, source_action_id, reason, evidence_turn_id, target_action_id, \
+ grant_attempt, resolved_at) VALUES (?1, ?2, ?3, 'verified_complete', ?4, NULL, NULL, ?5)",
+        params![
+            scope.host_id,
+            scope.thread_id,
+            source_action_id,
+            evidence_turn_id,
+            resolved_at
+        ],
+    )?;
+    // 清源 fence 同事务：不动 state / receipt / barrier_force_released_at
+    tx.execute(
+        "UPDATE codex_actions SET compat_outstanding = 0 \
+ WHERE action_id = ?1 AND thread_id = ?2",
+        params![source_action_id, scope.thread_id],
+    )?;
+    tx.commit()?;
+    Ok(true)
+}
+
+/// Task4（2026-11-11 队列占位与强制插队 TDD）：读源动作的 `verified_complete`
+/// 核销记录（host / thread / evidence_turn）——orphan book 对账的输入缝：内存
+/// book 残留而源 fence 已被核销事务消化（提交后中断 / 旧版清理）时，按记录事实
+/// 条件补清旧 book，不依赖 fence 在册、不重新推导另一证据覆写原记录。
+/// `reason = 'verified_complete'` 钉死——**显式接管记录（explicit_takeover）绝不
+/// 匹配**（仅对目标 attempt 生效，不是全局完成）。无记录 → `None`。
+pub(crate) fn verified_complete_record_conn(
+    conn: &Connection,
+    source_action_id: &str,
+) -> rusqlite::Result<Option<(String, String, String)>> {
+    conn.query_row(
+        "SELECT host_id, thread_id, evidence_turn_id FROM codex_barrier_resolutions \
+ WHERE source_action_id = ?1 AND reason = 'verified_complete'",
+        [source_action_id],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )
+    .optional()
+}
+
+/// Task5（2026-11-11 队列占位与强制插队 TDD）：多源显式强制插队接管——选中
+/// queued 行独立越过历史 book/DB fence，无需证明旧源完成。
+///
+/// 源集合为 **0..N**（空切片合法）：空 = 本线程无历史限制，仍完成目标 reserve +
+/// attempt 授权消费 + reserve 审计（各恰一次），只是 **0 条 explicit 记录**——
+/// 不伪造 record（接管权只来自真实在册源）。重复源入参（如 `[a,b,a]`）由核心
+/// 内部按**首次出现顺序**去重一次：⓪ 校验与 ③ explicit INSERT 使用同一独特源
+/// 列表——既不得触发 UNIQUE 冲突，也不得以 INSERT OR IGNORE 吞掉真实 SQL 故障；
+/// 「书签源优先」的相对顺序由调用方收集顺序保证，本层去重不重排。
+///
+/// 单事务语义（顺序即依赖）：
+/// ⓪ 非空独特源逐个存在 + thread 归属核对（先于一切副作用：任一非法源——空串 /
+///    不存在 / 跨 thread → `Err`，零部分 reserve/consume/record/audit 效果；
+///    保留 Task2 原错误语义，不吞成 `false`）；
+/// ① 目标 queued→reserved CAS（一次；thread 归属一致才可预约）；
+/// ② 对应 attempt 的首次授权消费 CAS（一次；跨 action / 跨 thread / attempt
+///    代际不符 / 已消费全部无效）；
+/// ③ 逐独特源 explicit 记录（0..N 条；同源同目标同 attempt 唯一，冲突即失败——
+///    第 N 源失败时事务整体回滚，先前源不留痕迹）；
+/// ④ 审计起始行（一次；与 reserve 同事务，reserve 硬约束）。
+///
+/// `true` 仅本次取得新派发权；非法源 → `Err`；目标已离开 queued / 授权缺失或
+/// 已消费 / **目标自身持有未解 compat fence**（`compat_outstanding = 1`——自己的
+/// 屏障不是可越对象，Task6-self-fence）→ `Ok(false)`（事务回滚零效果——不得成为
+/// 第二次派发许可；其他目标 / 下一 attempt 不能借用）。外部源（Queued/Unknown
+/// 历史行）的 fence 不在本条件内——可越性由 explicit 记录让渡语义承载。
+/// 不改源动作投递状态 / force 时间 / 队列暂停 / 其他 queue，不自动重发
+/// Unknown/Accepted；源历史状态不硬等同真实 writer（后续上层验证）；
+/// 不从本方法发送任何 Frame。
+pub(crate) fn reserve_with_barrier_takeover_sources_conn(
+    conn: &Connection,
+    scope: &ThreadKey,
+    source_action_ids: &[String],
+    target_action_id: &str,
+    grant_attempt: i64,
+    route: ControlRoute,
+    resolved_at: i64,
+) -> rusqlite::Result<bool> {
+    let unique_sources = dedupe_sources(source_action_ids);
+    let tx = conn.unchecked_transaction()?;
+    reserve_sources_validity_in_tx(&tx, scope, &unique_sources)?;
+    // false = CAS 失败：不 commit（事务随后 drop 回滚 ② 一并撤销）——与升级前
+    // 「return Ok(false) → tx drop 回滚」语义逐字一致。
+    let resolved = reserve_with_barrier_takeover_in_tx(
+        &tx,
+        scope,
+        &unique_sources,
+        target_action_id,
+        grant_attempt,
+        route,
+        resolved_at,
+    )?;
+    if resolved {
+        tx.commit()?;
+    }
+    Ok(resolved)
+}
+
+/// Task7：源列表按首次出现顺序去重（纯计算，先于一切 DB 副作用）。
+fn dedupe_sources(source_action_ids: &[String]) -> Vec<&str> {
+    let mut unique_sources: Vec<&str> = Vec::with_capacity(source_action_ids.len());
+    for source_action_id in source_action_ids {
+        let id: &str = source_action_id.as_str();
+        if !unique_sources.contains(&id) {
+            unique_sources.push(id);
+        }
+    }
+    unique_sources
+}
+
+/// Task7：⓪ 非空独特源逐个存在 + thread 归属核对（任一非法源 → Err 零部分
+/// 效果；空集合合法——无历史限制，跳过）。
+fn reserve_sources_validity_in_tx(
+    tx: &Transaction,
+    scope: &ThreadKey,
+    unique_sources: &[&str],
+) -> rusqlite::Result<()> {
+    for source_action_id in unique_sources {
+        let src_thread: Option<String> = tx
+            .query_row(
+                "SELECT thread_id FROM codex_actions WHERE action_id = ?1",
+                [source_action_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if src_thread.as_deref() != Some(scope.thread_id.as_str()) {
+            return Err(rusqlite::Error::InvalidQuery);
+        }
+    }
+    Ok(())
+}
+
+/// Task7：② 目标 queued→reserved CAS → ③ 授权消费 CAS → ④ 逐源 explicit →
+/// ⑤ reserve 审计（SQL 主体，事务内复用）。`false` = CAS 失败：**调用方不得
+/// commit**（事务 drop 回滚全部效果——与升级前逐字一致）。
+fn reserve_with_barrier_takeover_in_tx(
+    tx: &Transaction,
+    scope: &ThreadKey,
+    unique_sources: &[&str],
+    target_action_id: &str,
+    grant_attempt: i64,
+    route: ControlRoute,
+    resolved_at: i64,
+) -> rusqlite::Result<bool> {
+    // ② 目标 queued→reserved CAS（一次，含 thread 归属）。Task6-self-fence（review
+    // 720 确认回归）：并入 `compat_outstanding = 0`——**目标自身**的未解屏障不是
+    // 任何源集合（空/含自身/仅外部）可越过的对象；条件与预约同语句 = 读查后
+    // race 的权威兜底（不先读后写）。命中时回滚零效果：grant 不消费、无 explicit、
+    // 无审计、claim/源行原样。
+    let n = tx.execute(
+        "UPDATE codex_actions SET state = 'reserved', route = ?2, queued_text = NULL, \
+ updated_at = ?3 WHERE action_id = ?1 AND thread_id = ?4 AND state = 'queued' \
+ AND compat_outstanding = 0",
+        params![
+            target_action_id,
+            route_to_str(route),
+            resolved_at,
+            scope.thread_id
+        ],
+    )?;
+    if n == 0 {
+        return Ok(false); // 重复 / 已离开 queued / 目标自身 fence 在场：回滚零效果，不再许可派发
+    }
+    // ③ 对应 attempt 的首次授权消费 CAS（一次）
+    let n = tx.execute(
+        "UPDATE codex_bypass_grant SET consumed_at = ?4 \
+ WHERE action_id = ?1 AND thread_id = ?2 AND attempt = ?3 AND consumed_at IS NULL",
+        params![
+            target_action_id,
+            scope.thread_id,
+            grant_attempt,
+            resolved_at
+        ],
+    )?;
+    if n == 0 {
+        return Ok(false); // 授权缺失 / 已消费 / attempt 代际不符：回滚（② 一并撤销）
+    }
+    // ④ 逐独特源 explicit 记录（0..N；同源同目标同 attempt 唯一，冲突即失败——
+    // 与 ⓪ 校验同一独特源列表，重复入参不产生重复 INSERT）
+    for source_action_id in unique_sources {
+        tx.execute(
+            "INSERT INTO codex_barrier_resolutions \
+ (host_id, thread_id, source_action_id, reason, evidence_turn_id, target_action_id, \
+ grant_attempt, resolved_at) VALUES (?1, ?2, ?3, 'explicit_takeover', NULL, ?4, ?5, ?6)",
+            params![
+                scope.host_id,
+                scope.thread_id,
+                source_action_id,
+                target_action_id,
+                grant_attempt,
+                resolved_at
+            ],
+        )?;
+    }
+    // ⑤ 审计起始行与 reserve 同事务（reserve 硬约束）
+    let Some(row) = get_row(tx, target_action_id)? else {
+        return Ok(false);
+    };
+    super::write_audit::record_conn_checked(
+        tx,
+        resolved_at,
+        &row.device_id,
+        &row.device_name,
+        "codex",
+        &row.thread_id,
+        "codex_desktop_ipc",
+        audit_action_of(&row.kind),
+        &audit_summary(&row),
+        "reserved",
+    )?;
+    Ok(true)
+}
+
+/// Task7：reserve 的 checked 变体——取得连接锁 + `BEGIN IMMEDIATE` 等写事务资格、
+/// 完成全部源只读合法性校验后、首条业务 UPDATE 前执行 `authorize`（最终闸；
+/// `None` = 意图已换代/到期 → `StaleIntent`，回滚零业务 mutation）。authorize
+/// 返回的时间戳只作本事务 reserve/consume/explicit/audit 时间，不作期限判据。
+/// 旧入口 [`reserve_with_barrier_takeover_sources_conn`] 语义/签名不变。
+pub(crate) fn reserve_with_barrier_takeover_sources_checked_conn(
+    conn: &Connection,
+    scope: &ThreadKey,
+    source_action_ids: &[String],
+    target_action_id: &str,
+    grant_attempt: i64,
+    route: ControlRoute,
+    authorize: impl FnOnce() -> Option<i64>,
+) -> rusqlite::Result<CheckedMutation<bool>> {
+    let unique_sources = dedupe_sources(source_action_ids);
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    reserve_sources_validity_in_tx(&tx, scope, &unique_sources)?;
+    let Some(resolved_at) = authorize() else {
+        return Ok(CheckedMutation::StaleIntent);
+    };
+    let resolved = reserve_with_barrier_takeover_in_tx(
+        &tx,
+        scope,
+        &unique_sources,
+        target_action_id,
+        grant_attempt,
+        route,
+        resolved_at,
+    )?;
+    if resolved {
+        tx.commit()?;
+    }
+    Ok(CheckedMutation::Applied(resolved))
+}
+
+/// 显式强制插队接管（Task2 单源 API，语义逐字不变）：多源实现的单元素切片
+/// 包装——预约目标动作 + 消费对应 attempt 的首次授权 + 登记
+/// explicit 事实（evidence 为空——不伪造完成证据），**同一事务**。
+///
+/// 单事务语义（顺序即依赖）：
+/// ⓪ 源存在 + thread 归属核对（先于一切副作用：非法源不得留下任何部分
+///    reserve/consume/record/audit 效果）；
+/// ① 目标 queued→reserved CAS（thread 归属一致才可预约）；
+/// ② 对应 attempt 的首次授权消费 CAS（跨 action / 跨 thread / attempt 代际不符 /
+///    已消费全部无效）；
+/// ③ 源→目标 attempt 的 explicit 记录（同源同目标同 attempt 唯一）；
+/// ④ 审计起始行（reserve 硬约束：CAS 与审计同事务）。
+///
+/// `true` 仅本次取得新派发权；源不存在 / 归属他 thread → `Err`；目标已离开
+/// queued / 授权缺失或已消费 → `Ok(false)`（事务回滚零效果——不得成为第二次
+/// 派发许可；其他目标 / 下一 attempt 不能借用）。
+/// 不改源动作投递状态 / force 时间 / 队列暂停 / 其他 queue，不自动重发
+/// Unknown/Accepted；源历史状态不硬等同真实 writer（后续上层验证）；
+/// 不从本方法发送任何 Frame。
+pub(crate) fn reserve_with_barrier_takeover_conn(
+    conn: &Connection,
+    scope: &ThreadKey,
+    source_action_id: &str,
+    target_action_id: &str,
+    grant_attempt: i64,
+    route: ControlRoute,
+    resolved_at: i64,
+) -> rusqlite::Result<bool> {
+    let sources = [source_action_id.to_string()];
+    reserve_with_barrier_takeover_sources_conn(
+        conn,
+        scope,
+        &sources,
+        target_action_id,
+        grant_attempt,
+        route,
+        resolved_at,
+    )
 }
 
 /// 撤回：CAS queued→cancelled（仅属主设备），保留 actionId 墓碑、清正文并审计。
@@ -1002,7 +1689,8 @@ pub(crate) fn retract_conn(
 
 /// 置 fence（bridge 在 compat 发送前调用：持久 reserved + fence）。
 /// `barrier_force_released_at IS NULL` 守卫（2026-10-19）：人工解除过的行不回置
-/// 屏障（单调性——解除后任何路径不得再置 1）。
+/// 屏障（单调性——解除后任何路径不得再置 1）；verified 核销在册的源动作同守卫
+/// （Task2：屏障已随核销消化，不得复活）。
 pub(crate) fn set_compat_fence_conn(
     conn: &Connection,
     action_id: &str,
@@ -1010,12 +1698,14 @@ pub(crate) fn set_compat_fence_conn(
     turn_id: Option<&str>,
     now_ms: i64,
 ) -> rusqlite::Result<()> {
-    conn.execute(
+    let sql = format!(
         "UPDATE codex_actions SET compat_outstanding = 1, compat_message_id = ?2, \
  compat_turn_id = ?3, updated_at = ?4 \
- WHERE action_id = ?1 AND barrier_force_released_at IS NULL",
-        params![action_id, message_id, turn_id, now_ms],
-    )?;
+ WHERE action_id = ?1 AND barrier_force_released_at IS NULL AND NOT {resolved} AND {eligible}",
+        resolved = VERIFIED_RESOLVED_PREDICATE,
+        eligible = TURN_FENCE_ELIGIBLE
+    );
+    conn.execute(&sql, params![action_id, message_id, turn_id, now_ms])?;
     Ok(())
 }
 
@@ -1121,7 +1811,8 @@ pub(crate) fn outstanding_native_turn_id_conn(
 /// **原子** compat 派发屏障（R9.1，2026-10-17 审计）：fence 与只读核对证据在**同一条
 /// UPDATE** 内持久化（单语句原子性）——持久化成功是 compat bridge 调用真实 helper 的
 /// 前提；写失败时 helper 不被调用，动作如实落账。
-/// `barrier_force_released_at IS NULL` 守卫（2026-10-19）：人工解除过的行不回置屏障。
+/// `barrier_force_released_at IS NULL` 守卫（2026-10-19）：人工解除过的行不回置屏障；
+/// verified 核销在册的源动作同守卫（Task2：屏障已随核销消化，不得复活）。
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn set_compat_dispatch_barrier_conn(
     conn: &Connection,
@@ -1133,11 +1824,16 @@ pub(crate) fn set_compat_dispatch_barrier_conn(
     wire_hash: Option<&str>,
     now_ms: i64,
 ) -> rusqlite::Result<()> {
-    conn.execute(
+    let sql = format!(
         "UPDATE codex_actions SET compat_outstanding = 1, compat_message_id = ?2, \
  compat_turn_id = ?3, compat_rollout_path = ?4, compat_rollout_baseline = ?5, \
  compat_wire_hash = ?6, updated_at = ?7 \
- WHERE action_id = ?1 AND barrier_force_released_at IS NULL",
+ WHERE action_id = ?1 AND barrier_force_released_at IS NULL AND NOT {resolved} AND {eligible}",
+        resolved = VERIFIED_RESOLVED_PREDICATE,
+        eligible = TURN_FENCE_ELIGIBLE
+    );
+    conn.execute(
+        &sql,
         params![
             action_id,
             message_id,
@@ -1240,6 +1936,53 @@ pub(crate) fn compat_fences_conn(
         }
     }
     Ok(out)
+}
+
+/// Task6-self-fence：读单个动作的在册 fence 标志（接管 Lost 后的复读分类用）。
+/// 行不在 → 保守 `true`：该查询只被「快照仍 Queued」之后调用，行不在属并发撤回
+/// 窄窗，按屏障在场的如实方向处理，不冒充任何业务原因。
+pub(crate) fn compat_outstanding_conn(
+    conn: &Connection,
+    action_id: &str,
+) -> rusqlite::Result<bool> {
+    let flag: Option<bool> = conn
+        .query_row(
+            "SELECT compat_outstanding FROM codex_actions WHERE action_id = ?1",
+            [action_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(flag.unwrap_or(true))
+}
+
+/// 清除由唯一同文证明的未绑定屏障，保留取证后由其他入口改变的屏障。
+pub(crate) fn clear_unbound_native_send_fence_conn(
+    conn: &Connection,
+    key: &ThreadKey,
+    fence: &CompatFence,
+    observed_state: ActionState,
+    now_ms: i64,
+) -> rusqlite::Result<bool> {
+    let changed = conn.execute(
+        "UPDATE codex_actions SET compat_outstanding = 0, compat_message_id = NULL, \
+         compat_turn_id = NULL, compat_rollout_path = NULL, compat_rollout_baseline = NULL, \
+         compat_wire_hash = NULL, updated_at = ?1 \
+         WHERE action_id = ?2 AND thread_id = ?3 AND kind = 'send' AND route = 'desktop_ipc' \
+         AND compat_outstanding = 1 AND compat_turn_id IS NULL AND state = ?4 AND state NOT IN ('queued', 'reserved') \
+         AND compat_wire_hash = ?5 AND compat_message_id IS ?6 \
+         AND compat_rollout_path IS ?7 AND compat_rollout_baseline IS ?8",
+        params![
+            now_ms,
+            fence.action_id,
+            key.thread_id,
+            state_to_str(observed_state),
+            fence.wire_hash,
+            fence.queued_message_id,
+            fence.rollout_path,
+            fence.rollout_baseline.map(|baseline| baseline as i64),
+        ],
+    )?;
+    Ok(changed > 0)
 }
 
 /// 清 fence：**仅终态动作允许**（queued/reserved → false，上层映射 Conflict）——
@@ -1908,6 +2651,51 @@ pub(crate) fn reserve_send_batch_conn(
     Ok(Some(wire))
 }
 
+/// B2 事实初装载：有 stop 相关持久事实的 thread 集合（stop attempt 行 ∪ 停止类
+/// 暂停屏障行）。无行 = 已证无 stop 事实，不进装载名单。
+pub(crate) fn threads_with_stop_facts_conn(conn: &Connection) -> rusqlite::Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT thread_id FROM codex_actions \
+         WHERE stop_attempt_state IS NOT NULL OR stop_attempt_reason IS NOT NULL \
+         UNION \
+         SELECT DISTINCT thread_id FROM codex_queue_pause \
+         WHERE pause_reason IN \
+         ('interrupt_pending','interrupt_accepted','interrupt_uncertain','cancel_pending') \
+         ORDER BY 1",
+    )?;
+    let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+    rows.collect()
+}
+
+/// B2 事实初装载：thread 级 stop attempt 在途判读——有 `claimed` 行 = 停止操作
+/// 正在进行（running=true）；无任何 claimed 行 = 已证无在途（running=false）。
+/// 只读真实 StopAttempt 行，不拿 modelActive/queuePaused 冒充。
+pub(crate) fn thread_stop_running_conn(
+    conn: &Connection,
+    thread_id: &str,
+) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM codex_actions \
+         WHERE thread_id = ?1 AND stop_attempt_state = 'claimed')",
+        [thread_id],
+        |r| r.get(0),
+    )
+}
+
+/// B-R2（main review）：动作行 → 所属 thread（StopAttempt 写点回读线程用；
+/// 行不在账 = None，调用方保留既有 Ok(false) 语义）。
+pub(crate) fn action_thread_conn(
+    conn: &Connection,
+    action_id: &str,
+) -> rusqlite::Result<Option<String>> {
+    conn.query_row(
+        "SELECT thread_id FROM codex_actions WHERE action_id = ?1",
+        [action_id],
+        |r| r.get(0),
+    )
+    .optional()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1921,12 +2709,1126 @@ mod tests {
 
     const THREAD: &str = "0f1e2d3c-1111-4222-8333-444455556666";
 
+    fn async_active_store_fixture(route: Option<&str>) -> Connection {
+        let c = mem();
+        let has_route: i64 = c.query_row(
+            "SELECT count(*) FROM pragma_table_info('codex_actions') WHERE name='async_answer_route'",
+            [], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(has_route, 1, "缺少持久异步答题路由列");
+        resolution_source(&c);
+        set_compat_dispatch_barrier_conn(
+            &c,
+            "source-a",
+            Some("message-a"),
+            Some("turn-a"),
+            None,
+            None,
+            None,
+            1300,
+        )
+        .unwrap();
+        insert_action_conn(
+            &c,
+            "answer-b",
+            "dev-1",
+            "iPhone",
+            THREAD,
+            "async_question",
+            None,
+            None,
+            "hash-b",
+            Some("answer"),
+            "cm-b",
+            1400,
+        )
+        .unwrap();
+        assert!(reserve_conn(&c, "answer-b", ControlRoute::DesktopIpc, 1500).unwrap());
+        c.execute(
+            "UPDATE codex_actions SET async_answer_route=?2 WHERE action_id=?1",
+            params!["answer-b", route],
+        )
+        .unwrap();
+        c
+    }
+
+    fn async_active_store_fence(c: &Connection, id: &str) -> (i64, Option<String>, Option<String>) {
+        c.query_row(
+            "SELECT compat_outstanding, compat_turn_id, compat_message_id FROM codex_actions WHERE action_id=?1",
+            [id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        ).unwrap()
+    }
+
+    type AsyncActiveStoreRawState = (
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<i64>,
+        Option<String>,
+        i64,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    );
+
+    fn async_active_store_raw_state(c: &Connection, id: &str) -> AsyncActiveStoreRawState {
+        c.query_row(
+            "SELECT state, route, async_answer_route, effect_probe_key, effect_package_sha256, effect_rule_version, queued_text, compat_outstanding, compat_turn_id, compat_message_id, receipt_json FROM codex_actions WHERE action_id=?1",
+            [id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?, r.get(9)?, r.get(10)?)),
+        ).unwrap()
+    }
+
+    fn async_active_store_audit_count(c: &Connection) -> i64 {
+        c.query_row("SELECT count(*) FROM write_audit", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    fn async_active_store_queued() -> Connection {
+        let c = mem();
+        insert_action_conn(
+            &c,
+            "answer-b",
+            "dev-1",
+            "iPhone",
+            THREAD,
+            "async_question",
+            None,
+            None,
+            "hash-b",
+            Some("answer"),
+            "cm-b",
+            1400,
+        )
+        .unwrap();
+        c
+    }
+
+    fn async_active_store_target() -> ObservedTarget {
+        ObservedTarget {
+            probe_key: "synthetic-probe".into(),
+            package_sha256: "synthetic-sha".into(),
+        }
+    }
+
+    #[test]
+    fn async_active_review_unknown_queued_route_cannot_be_overwritten_by_reserve() {
+        let c = async_active_store_queued();
+        c.execute("UPDATE codex_actions SET async_answer_route='future_route', effect_probe_key='old', effect_package_sha256='old-sha', effect_rule_version=1 WHERE action_id='answer-b'", []).unwrap();
+        let before = async_active_store_raw_state(&c, "answer-b");
+        let audits = async_active_store_audit_count(&c);
+        let result = reserve_async_answer_conn(
+            &c,
+            "answer-b",
+            AsyncAnswerRoute::IdleStart,
+            Some(&async_active_store_target()),
+            1500,
+        );
+        assert!(result.is_err(), "未知非 NULL 路由不得被 reserve 覆盖");
+        assert_eq!(async_active_store_raw_state(&c, "answer-b"), before);
+        assert_eq!(async_active_store_audit_count(&c), audits);
+    }
+
+    #[test]
+    fn async_active_store_reserve_audit_failure_rolls_back_route_effect_and_state() {
+        let c = async_active_store_queued();
+        let before = async_active_store_raw_state(&c, "answer-b");
+        let audits = async_active_store_audit_count(&c);
+        c.execute_batch("CREATE TEMP TRIGGER fail_async_reserve_audit BEFORE INSERT ON write_audit BEGIN SELECT RAISE(ABORT, 'synthetic audit failure'); END;").unwrap();
+        assert!(reserve_async_answer_conn(
+            &c,
+            "answer-b",
+            AsyncAnswerRoute::IdleStart,
+            Some(&async_active_store_target()),
+            1500
+        )
+        .is_err());
+        assert_eq!(async_active_store_raw_state(&c, "answer-b"), before);
+        assert_eq!(async_active_store_audit_count(&c), audits);
+    }
+
+    #[test]
+    fn async_active_store_idle_reserve_freezes_effect_target() {
+        let c = async_active_store_queued();
+        let target = async_active_store_target();
+        let audits = async_active_store_audit_count(&c);
+        assert!(reserve_async_answer_conn(
+            &c,
+            "answer-b",
+            AsyncAnswerRoute::IdleStart,
+            Some(&target),
+            1500
+        )
+        .unwrap());
+        let row = async_active_store_raw_state(&c, "answer-b");
+        assert_eq!(row.0, "reserved");
+        assert_eq!(row.1, "desktop_ipc");
+        assert_eq!(row.2.as_deref(), Some("idle_start"));
+        assert_eq!(row.3.as_deref(), Some(target.probe_key.as_str()));
+        assert_eq!(row.4.as_deref(), Some(target.package_sha256.as_str()));
+        assert_eq!(row.5, Some(i64::from(CONTRACT_RULE_VERSION)));
+        assert_eq!(async_active_store_audit_count(&c), audits + 1);
+    }
+
+    #[test]
+    fn async_active_store_active_reserve_clears_existing_effect_target() {
+        let c = async_active_store_queued();
+        c.execute("UPDATE codex_actions SET effect_probe_key='old', effect_package_sha256='old-sha', effect_rule_version=1 WHERE action_id='answer-b'", []).unwrap();
+        let audits = async_active_store_audit_count(&c);
+        assert!(reserve_async_answer_conn(
+            &c,
+            "answer-b",
+            AsyncAnswerRoute::ActiveSteer,
+            Some(&async_active_store_target()),
+            1500
+        )
+        .unwrap());
+        let row = async_active_store_raw_state(&c, "answer-b");
+        assert_eq!(row.0, "reserved");
+        assert_eq!(row.2.as_deref(), Some("active_steer"));
+        assert_eq!((row.3, row.4, row.5), (None, None, None));
+        assert_eq!(async_active_store_audit_count(&c), audits + 1);
+    }
+
+    #[test]
+    fn async_active_store_losing_reserve_cannot_replace_winner_route_or_effect() {
+        let c = async_active_store_queued();
+        assert!(reserve_async_answer_conn(
+            &c,
+            "answer-b",
+            AsyncAnswerRoute::IdleStart,
+            Some(&async_active_store_target()),
+            1500
+        )
+        .unwrap());
+        let before = async_active_store_raw_state(&c, "answer-b");
+        let audits = async_active_store_audit_count(&c);
+        assert!(!reserve_async_answer_conn(
+            &c,
+            "answer-b",
+            AsyncAnswerRoute::ActiveSteer,
+            None,
+            1600
+        )
+        .unwrap());
+        assert_eq!(async_active_store_raw_state(&c, "answer-b"), before);
+        assert_eq!(async_active_store_audit_count(&c), audits);
+    }
+
+    #[test]
+    fn async_active_store_retracted_action_cannot_freeze_route_or_effect() {
+        let c = async_active_store_queued();
+        assert!(retract_conn(&c, "answer-b", "dev-1", 1500).unwrap());
+        let before = async_active_store_raw_state(&c, "answer-b");
+        let audits = async_active_store_audit_count(&c);
+        assert!(!reserve_async_answer_conn(
+            &c,
+            "answer-b",
+            AsyncAnswerRoute::IdleStart,
+            Some(&async_active_store_target()),
+            1600
+        )
+        .unwrap());
+        assert_eq!(async_active_store_raw_state(&c, "answer-b"), before);
+        assert_eq!(async_active_store_audit_count(&c), audits);
+    }
+
+    fn async_active_store_receipt(delivery: Delivery) -> ActionReceipt {
+        ActionReceipt {
+            action_id: "answer-b".into(),
+            delivery,
+            route: ControlRoute::DesktopIpc,
+            turn_id: Some("turn-a".into()),
+            envelope_id: None,
+            reason_code: None,
+        }
+    }
+
+    #[test]
+    fn async_active_store_finish_results_preserve_old_fence() {
+        for delivery in [
+            Delivery::Accepted,
+            Delivery::UnknownDelivery,
+            Delivery::Rejected,
+            Delivery::NotSent,
+        ] {
+            let c = async_active_store_fixture(Some("active_steer"));
+            let old = async_active_store_fence(&c, "source-a");
+            finish_and_settle_claim_conn(
+                &c,
+                &async_active_store_receipt(delivery),
+                Some("turn-a"),
+                2000,
+            )
+            .unwrap();
+            assert_eq!(
+                async_active_store_fence(&c, "answer-b"),
+                (0, None, None),
+                "{delivery:?}"
+            );
+            assert_eq!(
+                async_active_store_fence(&c, "source-a"),
+                old,
+                "{delivery:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn async_active_store_direct_finish_and_late_results_do_not_bind_turn() {
+        for late in [false, true] {
+            let c = async_active_store_fixture(Some("active_steer"));
+            let old = async_active_store_fence(&c, "source-a");
+            let receipt = async_active_store_receipt(Delivery::Accepted);
+            if late {
+                assert_eq!(recover_reserved_conn(&c, 2000).unwrap(), 1);
+                assert!(finish_late_result_conn(&c, &receipt, 2100).unwrap());
+            } else {
+                finish_with_turn_barrier_conn(&c, &receipt, Some("turn-a"), 2100).unwrap();
+            }
+            assert_eq!(
+                async_active_store_fence(&c, "answer-b"),
+                (0, None, None),
+                "late={late}"
+            );
+            assert_eq!(async_active_store_fence(&c, "source-a"), old);
+        }
+    }
+
+    #[test]
+    fn async_active_store_recovery_preserves_idle_and_legacy_fences() {
+        for route in [Some("active_steer"), Some("idle_start"), None] {
+            for stale in [false, true] {
+                let c = async_active_store_fixture(route);
+                let old = async_active_store_fence(&c, "source-a");
+                if stale {
+                    assert_eq!(
+                        mark_stale_reserved_unknown_conn(&c, 1000, 3000)
+                            .unwrap()
+                            .len(),
+                        1
+                    );
+                } else {
+                    assert_eq!(recover_reserved_conn(&c, 3000).unwrap(), 1);
+                }
+                assert_eq!(
+                    get_row(&c, "answer-b").unwrap().unwrap().state,
+                    ActionState::Unknown
+                );
+                let expected = if route == Some("active_steer") { 0 } else { 1 };
+                assert_eq!(
+                    async_active_store_fence(&c, "answer-b").0,
+                    expected,
+                    "route={route:?}, stale={stale}"
+                );
+                assert_eq!(async_active_store_fence(&c, "source-a"), old);
+            }
+        }
+    }
+
+    #[test]
+    fn async_active_store_compat_turn_rebinding_cannot_create_fence() {
+        let c = async_active_store_fixture(Some("active_steer"));
+        let old = async_active_store_fence(&c, "source-a");
+        set_compat_dispatch_barrier_conn(
+            &c,
+            "answer-b",
+            None,
+            Some("turn-a"),
+            None,
+            None,
+            None,
+            2000,
+        )
+        .unwrap();
+        assert_eq!(async_active_store_fence(&c, "answer-b"), (0, None, None));
+        assert_eq!(async_active_store_fence(&c, "source-a"), old);
+    }
+
+    #[test]
+    fn async_active_store_unknown_route_cannot_settle_as_idle() {
+        let c = async_active_store_fixture(Some("idle_start"));
+        c.execute(
+            "UPDATE codex_actions SET async_answer_route='future_route' WHERE action_id='answer-b'",
+            [],
+        )
+        .unwrap();
+        let before = async_active_store_raw_state(&c, "answer-b");
+        let old_fence = async_active_store_fence(&c, "source-a");
+        let audit_before = async_active_store_audit_count(&c);
+        let result = finish_and_settle_claim_conn(
+            &c,
+            &async_active_store_receipt(Delivery::Accepted),
+            Some("turn-a"),
+            2000,
+        );
+        assert!(result.is_err(), "未知路由不得按 idle 落账");
+        assert_eq!(async_active_store_raw_state(&c, "answer-b"), before);
+        assert_eq!(async_active_store_fence(&c, "source-a"), old_fence);
+        assert_eq!(async_active_store_audit_count(&c), audit_before);
+    }
+
+    #[test]
+    fn checked_mint_waiting_for_sqlite_write_lock_rejects_expired_intent() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::{Duration, Instant};
+
+        static WRITE_LOCK_OBSERVED: AtomicBool = AtomicBool::new(false);
+        fn observe_busy(_: i32) -> bool {
+            WRITE_LOCK_OBSERVED.store(true, Ordering::SeqCst);
+            std::thread::yield_now();
+            true
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("checked-mint.db");
+        let conn = Connection::open(&path).unwrap();
+        crate::database::schema::init(&conn);
+        crate::database::migration::migrate(&conn).unwrap();
+        insert(&conn, "mint-expired-q", Some("selected"), 1000);
+        let audit_before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM write_audit", [], |r| r.get(0))
+            .unwrap();
+        conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        WRITE_LOCK_OBSERVED.store(false, Ordering::SeqCst);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let mut contender = Connection::open(path).unwrap();
+            contender.busy_handler(Some(observe_busy)).unwrap();
+            started_tx.send(Instant::now() < deadline).unwrap();
+            mint_bypass_grant_attempt_checked_conn(&contender, "mint-expired-q", THREAD, || {
+                (Instant::now() < deadline).then_some(2000)
+            })
+        });
+        assert!(
+            started_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            "入口时意图仍有效"
+        );
+        while !WRITE_LOCK_OBSERVED.load(Ordering::SeqCst) {
+            assert!(Instant::now() < deadline, "未观察到真实 SQLite 写锁争用");
+            std::thread::yield_now();
+        }
+        // 等待固定单调截止，而非以任意延时猜测锁争用已经发生。
+        std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+        assert!(Instant::now() >= deadline);
+        conn.execute_batch("COMMIT").unwrap();
+        assert!(matches!(
+            worker.join().unwrap().unwrap(),
+            CheckedMutation::StaleIntent
+        ));
+        let grants: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM codex_bypass_grant WHERE action_id='mint-expired-q'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let audit_after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM write_audit", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(grants, 0, "过期意图不得新增 grant");
+        assert_eq!(audit_after, audit_before, "过期意图不得新增业务审计");
+        assert!(
+            matches!(
+                mint_bypass_grant_attempt_checked_conn(&conn, "mint-expired-q", THREAD, || Some(
+                    3000
+                ))
+                .unwrap(),
+                CheckedMutation::Applied(1)
+            ),
+            "后继有效授权仍可推进"
+        );
+    }
+
     fn insert(conn: &Connection, action_id: &str, text: Option<&str>, now: i64) -> ActionRow {
         insert_action_conn(
             conn, action_id, "dev-1", "iPhone", THREAD, "send", None, None, "hash", text, "cm-1",
             now,
         )
         .unwrap()
+    }
+
+    const RESOLUTION_HOST: &str = "host-1";
+
+    fn resolution_scope() -> ThreadKey {
+        ThreadKey {
+            host_id: RESOLUTION_HOST.into(),
+            thread_id: THREAD.into(),
+        }
+    }
+
+    fn resolution_source(c: &Connection) {
+        insert(c, "source-a", Some("source"), 1000);
+        assert!(reserve_conn(c, "source-a", ControlRoute::DesktopIpc, 1100).unwrap());
+        let unknown = ActionReceipt {
+            action_id: "source-a".into(),
+            delivery: Delivery::UnknownDelivery,
+            route: ControlRoute::DesktopIpc,
+            turn_id: None,
+            envelope_id: None,
+            reason_code: Some("timeout".into()),
+        };
+        finish_with_turn_barrier_conn(c, &unknown, None, 1200).unwrap();
+    }
+
+    #[test]
+    fn formal_echo_returning_reports_busy_until_the_update_can_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("formal-echo.sqlite");
+        let writer = Connection::open(&path).unwrap();
+        let journal: String = writer
+            .query_row("PRAGMA journal_mode = DELETE", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(journal, "delete");
+        writer.busy_timeout(std::time::Duration::ZERO).unwrap();
+        crate::database::schema::init(&writer);
+        crate::database::migration::migrate(&writer).unwrap();
+        resolution_source(&writer);
+        let original = get_row(&writer, "source-a").unwrap().unwrap();
+        assert_eq!(original.state, ActionState::Unknown);
+        assert!(original.compat_outstanding);
+        assert_eq!(original.compat_turn_id, None);
+        let receipt = ActionReceipt {
+            action_id: original.action_id.clone(),
+            delivery: Delivery::Accepted,
+            route: ControlRoute::DesktopIpc,
+            turn_id: Some("turn-a".into()),
+            envelope_id: None,
+            reason_code: Some("read_verify".into()),
+        };
+
+        let reader = Connection::open(&path).unwrap();
+        let read_tx = reader.unchecked_transaction().unwrap();
+        assert_eq!(
+            get_row(&read_tx, "source-a").unwrap().unwrap().state,
+            ActionState::Unknown
+        );
+        // DELETE journal 允许 writer 先更新，提交时才因读事务的共享锁返回 BUSY。
+        let attempt = || {
+            finish_formal_echo_conn(
+                &writer,
+                &receipt,
+                THREAD,
+                &original.client_message_id,
+                false,
+                1300,
+            )
+        };
+        let blocked = attempt();
+        read_tx.commit().unwrap();
+        let after_busy = get_row(&reader, "source-a").unwrap().unwrap();
+        assert_eq!(after_busy.state, ActionState::Unknown);
+        assert!(after_busy.compat_outstanding);
+        assert_eq!(after_busy.compat_turn_id, None);
+        assert_eq!(
+            after_busy.receipt.unwrap().delivery,
+            Delivery::UnknownDelivery
+        );
+        assert!(
+            matches!(&blocked, Err(rusqlite::Error::SqliteFailure(error, _))
+                if error.extended_code == rusqlite::ffi::SQLITE_BUSY),
+            "提交失败必须如实返回 SQLITE_BUSY，账本仍是 Unknown，实际返回 {blocked:?}"
+        );
+
+        assert_eq!(attempt().unwrap(), Some(true));
+        let persisted = get_row(&reader, "source-a").unwrap().unwrap();
+        assert_eq!(persisted.state, ActionState::Accepted);
+        assert!(persisted.compat_outstanding);
+        assert_eq!(persisted.compat_turn_id.as_deref(), Some("turn-a"));
+        let persisted_receipt = persisted.receipt.unwrap();
+        assert_eq!(persisted_receipt.action_id, receipt.action_id);
+        assert_eq!(persisted_receipt.delivery, receipt.delivery);
+        assert_eq!(persisted_receipt.turn_id, receipt.turn_id);
+    }
+
+    fn resolution_count(c: &Connection, reason: &str) -> i64 {
+        c.query_row(
+            "SELECT count(*) FROM codex_barrier_resolutions WHERE reason = ?1",
+            [reason],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    fn resolve_verified(c: &Connection) -> rusqlite::Result<bool> {
+        resolve_barrier_verified_conn(c, &resolution_scope(), "source-a", "turn-a", 2000)
+    }
+
+    fn takeover(c: &Connection, target: &str, attempt: i64) -> rusqlite::Result<bool> {
+        reserve_with_barrier_takeover_conn(
+            c,
+            &resolution_scope(),
+            "source-a",
+            target,
+            attempt,
+            ControlRoute::DesktopIpc,
+            2000,
+        )
+    }
+
+    fn reserved_audit_count(c: &Connection, action_id: &str) -> i64 {
+        c.query_row(
+            "SELECT count(*) FROM write_audit WHERE result = 'reserved' AND json_extract(summary, '$.actionId') = ?1",
+            [action_id],
+            |r| r.get(0),
+        ).unwrap()
+    }
+
+    fn sources_fixture(c: &Connection) {
+        resolution_source(c);
+        insert(c, "source-b", Some("source-b"), 1250);
+        c.execute("UPDATE codex_actions SET state = 'unknown', compat_outstanding = 1 WHERE action_id = 'source-b'", []).unwrap();
+        insert(c, "target-b", Some("target"), 1300);
+        mint_bypass_grant_conn(c, "target-b", THREAD, 1400).unwrap();
+    }
+
+    fn takeover_sources(c: &Connection, sources: &[String]) -> rusqlite::Result<bool> {
+        reserve_with_barrier_takeover_sources_conn(
+            c,
+            &resolution_scope(),
+            sources,
+            "target-b",
+            1,
+            ControlRoute::DesktopIpc,
+            2000,
+        )
+    }
+
+    fn assert_target_fence_rejects(sources: &[String]) {
+        let c = mem();
+        resolution_source(&c);
+        insert(&c, "target-b", Some("target wire"), 1300);
+        set_compat_fence_conn(&c, "target-b", Some("cm-fence"), Some("turn-fence"), 1350).unwrap();
+        assert!(claim_stop_attempt_conn(&c, "target-b", 1360).unwrap());
+        assert_eq!(
+            mint_bypass_grant_attempt_conn(&c, "target-b", THREAD, 1400).unwrap(),
+            1
+        );
+        let before = get_row(&c, "target-b").unwrap().unwrap();
+        assert_eq!(before.state, ActionState::Queued);
+        assert!(before.compat_outstanding);
+        let source_before = get_row(&c, "source-a").unwrap().unwrap();
+        let result = takeover_sources(&c, sources).unwrap();
+        let after = get_row(&c, "target-b").unwrap().unwrap();
+        let source_after = get_row(&c, "source-a").unwrap().unwrap();
+        assert_eq!(
+            (
+                result,
+                after.state,
+                after.route,
+                after.queued_text,
+                after.compat_outstanding,
+                after.compat_message_id,
+                after.compat_turn_id,
+                stop_attempt_phase_conn(&c, "target-b").unwrap(),
+                grant_attempt_and_consumed(&c, "target-b"),
+                reserved_audit_count(&c, "target-b"),
+                resolution_count(&c, "explicit_takeover"),
+                (source_after.state, source_after.compat_outstanding),
+            ),
+            (
+                false,
+                before.state,
+                before.route,
+                before.queued_text,
+                before.compat_outstanding,
+                before.compat_message_id,
+                before.compat_turn_id,
+                StopAttemptPhase::Claimed,
+                (1, None),
+                0,
+                0,
+                (source_before.state, source_before.compat_outstanding),
+            ),
+            "目标自身 fence 不得被任何源集合越过: {sources:?}"
+        );
+    }
+
+    #[test]
+    fn barrier_takeover_target_fence_empty_sources_preserves_target_and_grant() {
+        assert_target_fence_rejects(&[]);
+    }
+
+    #[test]
+    fn barrier_takeover_target_fence_self_source_preserves_target_and_grant() {
+        assert_target_fence_rejects(&["target-b".into()]);
+    }
+
+    #[test]
+    fn barrier_takeover_target_fence_external_source_preserves_target_and_grant() {
+        assert_target_fence_rejects(&["source-a".into()]);
+    }
+
+    #[test]
+    fn barrier_takeover_target_fence_clean_target_zero_delivery_can_retry_with_new_grant() {
+        let c = mem();
+        resolution_source(&c);
+        insert(&c, "target-b", Some("target wire"), 1300);
+        let sources = vec!["source-a".to_string()];
+        let first = mint_bypass_grant_attempt_conn(&c, "target-b", THREAD, 1400).unwrap();
+        assert_eq!(first, 1);
+        assert!(takeover_sources(&c, &sources).unwrap());
+        assert!(requeue_after_busy_conn(&c, "target-b", "target wire", false, 2100).unwrap());
+        let queued = get_row(&c, "target-b").unwrap().unwrap();
+        assert_eq!(queued.state, ActionState::Queued);
+        assert_eq!(queued.queued_text.as_deref(), Some("target wire"));
+        assert!(!queued.compat_outstanding);
+        let second = mint_bypass_grant_attempt_conn(&c, "target-b", THREAD, 2200).unwrap();
+        assert_eq!(second, 2);
+        assert_eq!(grant_attempt_and_consumed(&c, "target-b"), (2, None));
+        assert!(reserve_with_barrier_takeover_sources_conn(
+            &c,
+            &resolution_scope(),
+            &sources,
+            "target-b",
+            second,
+            ControlRoute::DesktopIpc,
+            2300,
+        )
+        .unwrap());
+        assert_eq!(
+            get_row(&c, "target-b").unwrap().unwrap().state,
+            ActionState::Reserved
+        );
+        assert_eq!(grant_attempt_and_consumed(&c, "target-b"), (2, Some(2300)));
+        assert_eq!(reserved_audit_count(&c, "target-b"), 2);
+        assert_eq!(resolution_count(&c, "explicit_takeover"), 2);
+        let source = get_row(&c, "source-a").unwrap().unwrap();
+        assert_eq!(source.state, ActionState::Unknown);
+        assert!(source.compat_outstanding);
+    }
+
+    #[test]
+    fn barrier_takeover_sources_reserves_once_and_records_every_source() {
+        let c = mem();
+        sources_fixture(&c);
+        let sources = vec!["source-a".into(), "source-b".into(), "source-a".into()];
+        assert!(
+            takeover_sources(&c, &sources).unwrap(),
+            "首次授权必须成功预留"
+        );
+        assert_eq!(
+            get_row(&c, "target-b").unwrap().unwrap().state,
+            ActionState::Reserved
+        );
+        assert_eq!(grant_attempt_and_consumed(&c, "target-b"), (1, Some(2000)));
+        assert_eq!(reserved_audit_count(&c, "target-b"), 1);
+        let rows: Vec<(String, String, i64)> = c.prepare("SELECT source_action_id, target_action_id, grant_attempt FROM codex_barrier_resolutions WHERE reason = 'explicit_takeover' ORDER BY source_action_id").unwrap()
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap().map(Result::unwrap).collect();
+        assert_eq!(
+            rows,
+            vec![
+                ("source-a".into(), "target-b".into(), 1),
+                ("source-b".into(), "target-b".into(), 1)
+            ]
+        );
+        for id in ["source-a", "source-b"] {
+            let row = get_row(&c, id).unwrap().unwrap();
+            assert_eq!(row.state, ActionState::Unknown);
+            assert!(row.compat_outstanding);
+        }
+        assert!(!takeover_sources(&c, &sources).unwrap());
+        assert_eq!(reserved_audit_count(&c, "target-b"), 1);
+        assert_eq!(resolution_count(&c, "explicit_takeover"), 2);
+        assert_eq!(grant_attempt_and_consumed(&c, "target-b"), (1, Some(2000)));
+    }
+
+    #[test]
+    fn barrier_takeover_sources_empty_reserves_without_fake_resolution() {
+        let c = mem();
+        insert(&c, "target-b", Some("target"), 1300);
+        mint_bypass_grant_conn(&c, "target-b", THREAD, 1400).unwrap();
+        assert!(takeover_sources(&c, &[]).unwrap(), "空源也须处理选中动作");
+        assert_eq!(
+            get_row(&c, "target-b").unwrap().unwrap().state,
+            ActionState::Reserved
+        );
+        assert_eq!(grant_attempt_and_consumed(&c, "target-b"), (1, Some(2000)));
+        assert_eq!(reserved_audit_count(&c, "target-b"), 1);
+        assert_eq!(resolution_count(&c, "explicit_takeover"), 0);
+        assert!(!takeover_sources(&c, &[]).unwrap());
+    }
+
+    #[test]
+    fn barrier_takeover_sources_later_insert_failure_rolls_back_every_source() {
+        let c = mem();
+        sources_fixture(&c);
+        c.execute_batch("CREATE TEMP TRIGGER fail_second_source BEFORE INSERT ON codex_barrier_resolutions WHEN NEW.reason = 'explicit_takeover' AND NEW.source_action_id = 'source-b' BEGIN SELECT RAISE(ABORT, 'second_source_injected'); END;").unwrap();
+        let result = takeover_sources(&c, &["source-a".into(), "source-b".into()]);
+        assert_eq!(
+            get_row(&c, "target-b").unwrap().unwrap().state,
+            ActionState::Queued
+        );
+        assert_eq!(grant_attempt_and_consumed(&c, "target-b"), (1, None));
+        assert_eq!(reserved_audit_count(&c, "target-b"), 0);
+        assert_eq!(resolution_count(&c, "explicit_takeover"), 0);
+        for id in ["source-a", "source-b"] {
+            let row = get_row(&c, id).unwrap().unwrap();
+            assert_eq!(row.state, ActionState::Unknown);
+            assert!(row.compat_outstanding);
+        }
+        let error = result.expect_err("必须真正命中第二源触发器，不能用未执行当作回滚");
+        assert!(
+            error.to_string().contains("second_source_injected"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn barrier_resolution_verified_conflicting_scope_or_evidence_is_not_idempotent() {
+        let c = mem();
+        resolution_source(&c);
+        assert!(resolve_verified(&c).unwrap());
+        let mut wrongly_accepted = Vec::new();
+        for (host, thread, evidence) in [
+            ("other-host", THREAD, "turn-a"),
+            (RESOLUTION_HOST, "other-thread", "turn-a"),
+            (RESOLUTION_HOST, THREAD, "turn-other"),
+        ] {
+            let scope = ThreadKey {
+                host_id: host.into(),
+                thread_id: thread.into(),
+            };
+            if matches!(
+                resolve_barrier_verified_conn(&c, &scope, "source-a", evidence, 2100),
+                Ok(true)
+            ) {
+                wrongly_accepted.push((host, thread, evidence));
+            }
+        }
+        assert_eq!(resolution_count(&c, "verified_complete"), 1);
+        assert!(!get_row(&c, "source-a").unwrap().unwrap().compat_outstanding);
+        assert!(
+            wrongly_accepted.is_empty(),
+            "冲突不得视作相同事实: {wrongly_accepted:?}"
+        );
+    }
+
+    #[test]
+    fn barrier_resolution_verified_rejects_missing_or_foreign_source() {
+        let c = mem();
+        resolution_source(&c);
+        let foreign = ThreadKey {
+            host_id: RESOLUTION_HOST.into(),
+            thread_id: "other-thread".into(),
+        };
+        for (scope, source) in [(&resolution_scope(), "missing"), (&foreign, "source-a")] {
+            assert!(!matches!(
+                resolve_barrier_verified_conn(&c, scope, source, "turn-a", 2000),
+                Ok(true)
+            ));
+        }
+        assert_eq!(resolution_count(&c, "verified_complete"), 0);
+        assert!(get_row(&c, "source-a").unwrap().unwrap().compat_outstanding);
+    }
+
+    #[test]
+    fn barrier_resolution_takeover_rejects_missing_or_foreign_source() {
+        let mut violations = Vec::new();
+        for source in ["missing", "foreign-source"] {
+            let c = mem();
+            insert(&c, "foreign-source", None, 1000);
+            c.execute("UPDATE codex_actions SET thread_id = 'foreign-thread', state = 'unknown', compat_outstanding = 1 WHERE action_id = 'foreign-source'", []).unwrap();
+            insert(&c, "target-b", Some("b"), 1300);
+            mint_bypass_grant_conn(&c, "target-b", THREAD, 1400).unwrap();
+            let result = reserve_with_barrier_takeover_conn(
+                &c,
+                &resolution_scope(),
+                source,
+                "target-b",
+                1,
+                ControlRoute::DesktopIpc,
+                2000,
+            );
+            let state = get_row(&c, "target-b").unwrap().unwrap().state;
+            let grant = grant_attempt_and_consumed(&c, "target-b");
+            let resolutions = resolution_count(&c, "explicit_takeover");
+            let audits = reserved_audit_count(&c, "target-b");
+            if matches!(result, Ok(true))
+                || state != ActionState::Queued
+                || grant != (1, None)
+                || resolutions != 0
+                || audits != 0
+            {
+                violations.push(format!("{source}: result={result:?}, state={state:?}, grant={grant:?}, resolutions={resolutions}, audits={audits}"));
+            }
+        }
+        assert!(
+            violations.is_empty(),
+            "无效源不得放行或产生副作用: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn barrier_resolution_takeover_rejects_foreign_target() {
+        let c = mem();
+        resolution_source(&c);
+        insert(&c, "target-b", Some("b"), 1300);
+        c.execute(
+            "UPDATE codex_actions SET thread_id = 'foreign-thread' WHERE action_id = 'target-b'",
+            [],
+        )
+        .unwrap();
+        mint_bypass_grant_conn(&c, "target-b", THREAD, 1400).unwrap();
+        assert!(!matches!(takeover(&c, "target-b", 1), Ok(true)));
+        assert_eq!(
+            get_row(&c, "target-b").unwrap().unwrap().state,
+            ActionState::Queued
+        );
+        assert_eq!(grant_attempt_and_consumed(&c, "target-b"), (1, None));
+        assert_eq!(resolution_count(&c, "explicit_takeover"), 0);
+        assert_eq!(reserved_audit_count(&c, "target-b"), 0);
+    }
+
+    #[test]
+    fn barrier_resolution_audit_failure_rolls_back_takeover() {
+        let c = mem();
+        resolution_source(&c);
+        insert(&c, "target-b", Some("b"), 1300);
+        mint_bypass_grant_conn(&c, "target-b", THREAD, 1400).unwrap();
+        c.execute_batch("CREATE TEMP TRIGGER fail_takeover_audit BEFORE INSERT ON write_audit BEGIN SELECT RAISE(ABORT, 'takeover audit failure'); END;").unwrap();
+        let err = takeover(&c, "target-b", 1).expect_err("必须触发审计写失败");
+        assert!(err.to_string().contains("takeover audit failure"));
+        assert_eq!(
+            get_row(&c, "target-b").unwrap().unwrap().state,
+            ActionState::Queued
+        );
+        assert_eq!(grant_attempt_and_consumed(&c, "target-b"), (1, None));
+        assert_eq!(resolution_count(&c, "explicit_takeover"), 0);
+        assert_eq!(reserved_audit_count(&c, "target-b"), 0);
+    }
+
+    #[test]
+    fn barrier_resolution_verified_is_atomic_and_idempotent() {
+        let c = mem();
+        resolution_source(&c);
+        let before = get_row(&c, "source-a")
+            .unwrap()
+            .unwrap()
+            .barrier_force_released_at;
+        resolve_verified(&c).unwrap();
+        resolve_verified(&c).unwrap();
+        assert_eq!(resolution_count(&c, "verified_complete"), 1);
+        let source = get_row(&c, "source-a").unwrap().unwrap();
+        assert!(!source.compat_outstanding);
+        assert_eq!(source.state, ActionState::Unknown);
+        assert_eq!(source.barrier_force_released_at, before);
+        let scope: (String, Option<String>, Option<i64>) = c.query_row(
+            "SELECT evidence_turn_id, target_action_id, grant_attempt FROM codex_barrier_resolutions WHERE reason = 'verified_complete'",
+            [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        ).unwrap();
+        assert_eq!(scope, ("turn-a".into(), None, None));
+        let duplicate = c.execute(
+            "INSERT INTO codex_barrier_resolutions (host_id, thread_id, source_action_id, reason, evidence_turn_id, target_action_id, grant_attempt, resolved_at) VALUES (?1, ?2, 'source-a', 'verified_complete', 'turn-a', NULL, NULL, 2001)",
+            params![RESOLUTION_HOST, THREAD],
+        );
+        assert!(duplicate.is_err(), "NULL 列不得使 verified 唯一性失效");
+    }
+
+    #[test]
+    fn barrier_resolution_takeover_is_target_attempt_scoped() {
+        let c = mem();
+        resolution_source(&c);
+        insert(&c, "target-b", Some("b"), 1300);
+        insert(&c, "target-c", Some("c"), 1300);
+        mint_bypass_grant_conn(&c, "target-b", THREAD, 1400).unwrap();
+        assert!(
+            takeover(&c, "target-b", 1).unwrap(),
+            "仅本次成功预留并消费授权可返回 true"
+        );
+        assert_eq!(reserved_audit_count(&c, "target-b"), 1);
+        let consumed_before = grant_attempt_and_consumed(&c, "target-b");
+        assert!(
+            !takeover(&c, "target-b", 1).unwrap(),
+            "重复调用不得再次许可派发"
+        );
+        assert_eq!(reserved_audit_count(&c, "target-b"), 1);
+        assert_eq!(grant_attempt_and_consumed(&c, "target-b"), consumed_before);
+        assert_eq!(resolution_count(&c, "explicit_takeover"), 1);
+        let scope: (String, i64, Option<String>) = c.query_row(
+            "SELECT target_action_id, grant_attempt, evidence_turn_id FROM codex_barrier_resolutions WHERE reason = 'explicit_takeover'",
+            [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        ).unwrap();
+        assert_eq!(scope, ("target-b".into(), 1, None));
+        assert_eq!(
+            get_row(&c, "target-b").unwrap().unwrap().state,
+            ActionState::Reserved
+        );
+        assert_eq!(grant_attempt_and_consumed(&c, "target-b").0, 1);
+        assert!(grant_attempt_and_consumed(&c, "target-b").1.is_some());
+        assert_eq!(
+            get_row(&c, "source-a").unwrap().unwrap().state,
+            ActionState::Unknown
+        );
+        assert!(get_row(&c, "source-a").unwrap().unwrap().compat_outstanding);
+        assert!(!takeover(&c, "target-c", 1).unwrap());
+        assert!(!takeover(&c, "target-b", 2).unwrap());
+        assert_eq!(
+            get_row(&c, "target-c").unwrap().unwrap().state,
+            ActionState::Queued
+        );
+        let duplicate = c.execute(
+            "INSERT INTO codex_barrier_resolutions (host_id, thread_id, source_action_id, reason, evidence_turn_id, target_action_id, grant_attempt, resolved_at) VALUES (?1, ?2, 'source-a', 'explicit_takeover', NULL, 'target-b', 1, 2001)",
+            params![RESOLUTION_HOST, THREAD],
+        );
+        assert!(duplicate.is_err(), "同源、目标和 attempt 不得重复");
+    }
+
+    #[test]
+    fn barrier_resolution_late_result_cannot_revive_verified_fence() {
+        let c = mem();
+        resolution_source(&c);
+        // 模拟先前已持久化的核销前提，不借助待测写入入口。
+        c.execute("INSERT INTO codex_barrier_resolutions (host_id, thread_id, source_action_id, reason, evidence_turn_id, target_action_id, grant_attempt, resolved_at) VALUES (?1, ?2, 'source-a', 'verified_complete', 'turn-a', NULL, NULL, 2000)", params![RESOLUTION_HOST, THREAD]).unwrap();
+        c.execute(
+            "UPDATE codex_actions SET compat_outstanding = 0 WHERE action_id = 'source-a'",
+            [],
+        )
+        .unwrap();
+        let receipt = ActionReceipt {
+            action_id: "source-a".into(),
+            delivery: Delivery::Accepted,
+            route: ControlRoute::DesktopIpc,
+            turn_id: Some("turn-a".into()),
+            envelope_id: Some("late-envelope".into()),
+            reason_code: None,
+        };
+        assert!(finish_late_result_conn(&c, &receipt, 2100).unwrap());
+        let source = get_row(&c, "source-a").unwrap().unwrap();
+        assert_eq!(source.state, ActionState::Accepted);
+        assert_eq!(source.receipt.unwrap().turn_id.as_deref(), Some("turn-a"));
+        assert!(!source.compat_outstanding, "迟到结果不得复活已核销屏障");
+        assert_eq!(source.barrier_force_released_at, None);
+    }
+
+    #[test]
+    fn barrier_resolution_transaction_failure_rolls_back_all_effects() {
+        let c = mem();
+        resolution_source(&c);
+        c.execute_batch("CREATE TEMP TRIGGER fail_verified BEFORE UPDATE OF compat_outstanding ON codex_actions WHEN OLD.action_id = 'source-a' BEGIN SELECT RAISE(ABORT, 'test failure'); END;").unwrap();
+        let verified_error = resolve_verified(&c);
+        assert_eq!(resolution_count(&c, "verified_complete"), 0);
+        assert!(get_row(&c, "source-a").unwrap().unwrap().compat_outstanding);
+        c.execute_batch("DROP TRIGGER fail_verified;").unwrap();
+        insert(&c, "target-b", Some("b"), 1300);
+        mint_bypass_grant_conn(&c, "target-b", THREAD, 1400).unwrap();
+        c.execute_batch("CREATE TEMP TRIGGER fail_reserve BEFORE UPDATE OF state ON codex_actions WHEN OLD.action_id = 'target-b' BEGIN SELECT RAISE(ABORT, 'test failure'); END;").unwrap();
+        let takeover_error = takeover(&c, "target-b", 1);
+        assert_eq!(resolution_count(&c, "explicit_takeover"), 0);
+        assert_eq!(
+            get_row(&c, "target-b").unwrap().unwrap().state,
+            ActionState::Queued
+        );
+        assert_eq!(grant_attempt_and_consumed(&c, "target-b"), (1, None));
+        for (operation, result) in [("verified", verified_error), ("takeover", takeover_error)] {
+            let error = result.expect_err("预期事务执行到 SQLite 注入故障");
+            assert!(
+                error.to_string().contains("test failure"),
+                "{operation} 返回了非注入错误: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn barrier_resolution_reopen_preserves_reason_and_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("resolution.sqlite");
+        {
+            let c = Connection::open(&path).unwrap();
+            crate::database::schema::init(&c);
+            crate::database::migration::migrate(&c).unwrap();
+            resolution_source(&c);
+            resolve_verified(&c).unwrap();
+            insert(&c, "source-b", Some("source"), 1300);
+            c.execute("UPDATE codex_actions SET state = 'unknown', compat_outstanding = 1 WHERE action_id = 'source-b'", []).unwrap();
+            insert(&c, "target-b", Some("b"), 1400);
+            mint_bypass_grant_conn(&c, "target-b", THREAD, 1500).unwrap();
+            reserve_with_barrier_takeover_conn(
+                &c,
+                &resolution_scope(),
+                "source-b",
+                "target-b",
+                1,
+                ControlRoute::DesktopIpc,
+                2000,
+            )
+            .unwrap();
+        }
+        let c = Connection::open(&path).unwrap();
+        assert_eq!(resolution_count(&c, "verified_complete"), 1);
+        assert_eq!(resolution_count(&c, "explicit_takeover"), 1);
+        resolve_verified(&c).unwrap();
+        assert_eq!(
+            resolution_count(&c, "verified_complete"),
+            1,
+            "重开后重放保持幂等"
+        );
+        let scope: (String, String, i64) = c.query_row("SELECT source_action_id, target_action_id, grant_attempt FROM codex_barrier_resolutions WHERE reason = 'explicit_takeover'", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap();
+        assert_eq!(scope, ("source-b".into(), "target-b".into(), 1));
+        let target_before = get_row(&c, "target-b").unwrap().unwrap();
+        let grant_before = grant_attempt_and_consumed(&c, "target-b");
+        let audit_before = reserved_audit_count(&c, "target-b");
+        assert_eq!(target_before.state, ActionState::Reserved);
+        assert_eq!(grant_before, (1, Some(2000)));
+        assert_eq!(audit_before, 1);
+        assert!(!reserve_with_barrier_takeover_conn(
+            &c,
+            &resolution_scope(),
+            "source-b",
+            "target-b",
+            1,
+            ControlRoute::DesktopIpc,
+            2100,
+        )
+        .unwrap());
+        let target_after = get_row(&c, "target-b").unwrap().unwrap();
+        assert_eq!(target_after.state, target_before.state);
+        assert_eq!(target_after.route, target_before.route);
+        assert_eq!(target_after.queued_text, target_before.queued_text);
+        assert_eq!(grant_attempt_and_consumed(&c, "target-b"), grant_before);
+        assert_eq!(reserved_audit_count(&c, "target-b"), audit_before);
+        assert_eq!(resolution_count(&c, "explicit_takeover"), 1);
+    }
+
+    #[test]
+    fn barrier_resolution_restart_recovery_cannot_revive_verified_fence() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("recovery.sqlite");
+        {
+            let c = Connection::open(&path).unwrap();
+            crate::database::schema::init(&c);
+            crate::database::migration::migrate(&c).unwrap();
+            insert(&c, "source-a", Some("source"), 1000);
+            assert!(reserve_conn(&c, "source-a", ControlRoute::DesktopIpc, 1100).unwrap());
+            assert!(resolve_verified(&c).unwrap());
+            let source = get_row(&c, "source-a").unwrap().unwrap();
+            assert_eq!(source.state, ActionState::Reserved);
+            assert!(!source.compat_outstanding);
+            assert_eq!(resolution_count(&c, "verified_complete"), 1);
+        }
+        let c = Connection::open(&path).unwrap();
+        assert_eq!(recover_reserved_conn(&c, 3000).unwrap(), 1);
+        assert!(resolve_verified(&c).unwrap(), "同一完成证据重放应保持幂等");
+        let source = get_row(&c, "source-a").unwrap().unwrap();
+        assert_eq!(source.state, ActionState::Unknown);
+        assert_eq!(resolution_count(&c, "verified_complete"), 1);
+        assert!(!source.compat_outstanding, "启动恢复不得复活已核销屏障");
+    }
+
+    #[test]
+    fn barrier_resolution_migration_does_not_infer_completion() {
+        let c = mem();
+        insert(&c, "legacy", None, 1);
+        c.execute("UPDATE codex_actions SET state = 'unknown', compat_outstanding = 0 WHERE action_id = 'legacy'", []).unwrap();
+        c.execute_batch("DROP TABLE IF EXISTS codex_barrier_resolutions;")
+            .unwrap();
+        crate::database::migration::migrate(&c).unwrap();
+        assert_eq!(resolution_count(&c, "verified_complete"), 0);
+        let row = get_row(&c, "legacy").unwrap().unwrap();
+        assert_eq!(row.state, ActionState::Unknown);
+        assert!(!row.compat_outstanding);
     }
 
     /// 相同毫秒仍按 seq 排序（FIFO 按 seq 不按时间戳）

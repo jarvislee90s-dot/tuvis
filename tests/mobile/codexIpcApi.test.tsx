@@ -13,6 +13,7 @@ import {
   fetchCodexQueue,
   fetchCodexThread,
   newActionId,
+  prioritizeCodexQueueMessage,
   reconcileCodexQueuedReceipt,
   respondCodexPending,
   retractCodexAction,
@@ -201,6 +202,88 @@ function lastRespondBody(): Record<string, unknown> {
   expect(call).toBeTruthy();
   return JSON.parse(String((call![1] as RequestInit).body)) as Record<string, unknown>;
 }
+
+describe("queue_resolution_reason_api_preserves_backend_result", () => {
+  const request = {
+    sessionId: "s1",
+    actionId: "a1",
+    expectedTurnId: "turn-A",
+    confirmInterrupt: true,
+  };
+  const accepted = {
+    actionId: "a1",
+    delivery: "accepted",
+    route: "desktop_ipc",
+    turnId: "turn-A",
+    envelopeId: "env-1",
+    reasonCode: null,
+  };
+  it.each([
+    {
+      result: "not_sent",
+      actionId: "a1",
+      reasonCode: "dispatch_in_flight",
+      receipt: null,
+      queued: true,
+    },
+    {
+      result: "not_sent",
+      actionId: "a1",
+      reasonCode: "action_cancelled",
+      receipt: null,
+      queued: false,
+    },
+    {
+      result: "not_sent",
+      actionId: "a1",
+      reasonCode: "desktop_rejected",
+      receipt: { ...accepted, delivery: "rejected", reasonCode: "desktop_rejected" },
+      queued: false,
+    },
+    { result: "unknown", actionId: "a1", reasonCode: "stop_timeout" },
+    { result: "prioritized", actionId: "a1", receipt: accepted },
+    {
+      result: "already_dispatched",
+      actionId: "a1",
+      action: { actionId: "a1", state: "accepted", position: null, receipt: accepted },
+    },
+  ])("preserves $result and its actual fields", async (body) => {
+    const fetch = vi.fn().mockResolvedValue(new Response(JSON.stringify(body), { status: 200 }));
+    vi.stubGlobal("fetch", fetch);
+    expect(await prioritizeCodexQueueMessage(request)).toEqual(body);
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(String(fetch.mock.calls[0][1].body))).toEqual(request);
+  });
+
+  it("queue_resolution_reason_api_preserves_backend_result HTTP 500 retains status and internal code", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi
+        .fn()
+        .mockResolvedValue(new Response(JSON.stringify({ error: "internal" }), { status: 500 }))
+    );
+    try {
+      await prioritizeCodexQueueMessage(request);
+      throw new Error("expected failure");
+    } catch (error) {
+      expect(error).toBeInstanceOf(ApiError);
+      expect((error as ApiError).status).toBe(500);
+      expect((error as ApiError).data).toEqual({ error: "internal" });
+    }
+  });
+
+  it("propagates network failure without inventing queued or a reason", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new Error("offline")));
+    try {
+      await prioritizeCodexQueueMessage(request);
+      throw new Error("expected failure");
+    } catch (error) {
+      expect(error).toBeInstanceOf(ApiError);
+      expect((error as ApiError).status).toBeNull();
+      expect((error as ApiError).data).toBeNull();
+    }
+  });
+});
 
 describe("codexIpcApi：Thread 投影拉取", () => {
   it("fetch_codex_thread_get：GET /m/api/v1/codex/thread?session_id=，载荷逐字段透传", async () => {
@@ -590,6 +673,36 @@ function legacyMessage(id: string) {
 }
 
 describe("codexIpcApi：T03 支持状态/能力身份/活动回合 增量字段", () => {
+  it("保留运行中与空闲异步答题操作及各自状态，只发 GET", async () => {
+    installFetch();
+    const active = {
+      implemented: true,
+      allowed: true,
+      requiresAutoAdapt: true,
+      evidence: "contract_matched",
+      support: "supported",
+      reasonCode: null,
+    };
+    const idle = { ...active, allowed: false, reasonCode: "operation_runtime_active" };
+    routes.thread = JSON.parse(
+      JSON.stringify({
+        ...projection(),
+        effectiveOperations: {
+          policyRevision: 9,
+          operations: { async_answer_active: active, async_answer_idle: idle },
+        },
+      })
+    ) as ThreadProjection;
+
+    const result = await fetchCodexThread("s1");
+    expect(result?.effectiveOperations?.operations).toMatchObject({
+      async_answer_active: active,
+      async_answer_idle: idle,
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect((fetchMock.mock.calls[0][1] as RequestInit | undefined)?.method ?? "GET").toBe("GET");
+  });
+
   it("t03_support_capability_identity_active_turn_parsed：新字段逐字段透出", async () => {
     installFetch();
     routes.thread = projection({

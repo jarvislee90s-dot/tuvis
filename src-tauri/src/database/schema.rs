@@ -197,6 +197,8 @@ pub fn init(conn: &Connection) {
             client_message_id       TEXT NOT NULL,
             state                   TEXT NOT NULL,
             route                   TEXT NOT NULL DEFAULT 'none',
+            -- 异步答案的冻结路径；NULL 仅表示升级前的空闲答题动作。
+            async_answer_route      TEXT,
             queued_text             TEXT,
             created_at              INTEGER NOT NULL,
             updated_at              INTEGER NOT NULL,
@@ -438,6 +440,48 @@ pub fn init(conn: &Connection) {
             resumed_at         INTEGER NOT NULL,
             reason             TEXT
         );
+        -- ===== Task2（2026-11-11 队列占位与强制插队 TDD）：Turn 屏障核销事实账本 =====
+        -- 只存「屏障为何已被核销」的最小事实，reason ∈ verified_complete（证据 Turn
+        -- 确认的自动核销）/ explicit_takeover（显式强制插队接管）。两类形态互斥，
+        -- 用 CHECK 钉死；唯一性用 **partial UNIQUE INDEX**（SQLite 表级 UNIQUE 与
+        -- 复合主键都不折叠 NULL，nullable 列上的 UNIQUE 陷阱——verified 行的
+        -- target/attempt 全 NULL 会让表级 UNIQUE 永不冲突——与 usage_model_config
+        -- 同款规避）：
+        --   * verified_complete：evidence_turn_id 必填、target/attempt 必空，
+        --     按源动作唯一（一个动作至多一次 verified 核销事实）；
+        --   * explicit_takeover：target_action_id + grant_attempt 必填、evidence 为空
+        --     （不伪造完成证据），按（源, 目标, attempt）唯一（同一接管事实不重复
+        --     授予派发许可）。
+        -- 不存正文/题干/答案/原始帧；resolved_at 是真实提交时间。迁移只创建空表，
+        -- 绝不从旧 fence=0/idle/年龄回填任何「已完成」事实（推导即伪造）。
+        -- Source/Target 外键与 thread 归属的行为校验由后续真实业务实现层负责。
+        CREATE TABLE IF NOT EXISTS codex_barrier_resolutions (
+            host_id          TEXT NOT NULL,
+            thread_id        TEXT NOT NULL,
+            source_action_id TEXT NOT NULL,
+            reason           TEXT NOT NULL CHECK(reason IN ('verified_complete','explicit_takeover')),
+            evidence_turn_id TEXT,
+            target_action_id TEXT,
+            grant_attempt    INTEGER,
+            resolved_at      INTEGER NOT NULL,
+            CHECK (
+                (reason = 'verified_complete'
+                    AND evidence_turn_id IS NOT NULL
+                    AND target_action_id IS NULL
+                    AND grant_attempt IS NULL)
+                OR
+                (reason = 'explicit_takeover'
+                    AND evidence_turn_id IS NULL
+                    AND target_action_id IS NOT NULL
+                    AND grant_attempt IS NOT NULL)
+            )
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_codex_barrier_resolutions_verified
+            ON codex_barrier_resolutions(source_action_id)
+            WHERE reason = 'verified_complete';
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_codex_barrier_resolutions_takeover
+            ON codex_barrier_resolutions(source_action_id, target_action_id, grant_attempt)
+            WHERE reason = 'explicit_takeover';
         CREATE TABLE IF NOT EXISTS write_audit (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
             ts          INTEGER NOT NULL,
@@ -958,6 +1002,64 @@ pub fn init(conn: &Connection) {
             file_decisions    TEXT NOT NULL,
             evidence_at       INTEGER NOT NULL
         );
+        -- ===== 单题 skip 展示域（codex_question_skip）：展示态权威 =====
+        -- PK group4(thread/turn/item/gen)；decision ∈ active|skipped；revision 持久
+        -- 单调（正 SafeInt，写侧守住 JS MAX_SAFE_INTEGER 上界，回执直接给前端）；
+        -- 无行 = 默认 active/revision 0（仅读视图，不落行）。
+        -- source_snapshot_json **可空**：原题快照（question_key/index/title/options，
+        -- 无 token/answer/draft/scope）只写一次，绝不覆盖非 NULL 存量——NULL 旧行
+        -- （老库升级）保守兼容，首次重新 prepare 才允许补写一次。快照独立于请求
+        -- 正文，不改变动作行的幂等语义。
+        CREATE TABLE IF NOT EXISTS codex_question_display (
+            thread_id            TEXT NOT NULL,
+            source_turn_id       TEXT NOT NULL,
+            source_item_id       TEXT NOT NULL,
+            content_generation   TEXT NOT NULL,
+            decision             TEXT NOT NULL CHECK(decision IN ('active','skipped')),
+            revision             INTEGER NOT NULL CHECK(revision >= 0),
+            device_id            TEXT NOT NULL,
+            updated_at           INTEGER NOT NULL,
+            source_snapshot_json TEXT,
+            PRIMARY KEY (thread_id, source_turn_id, source_item_id, content_generation)
+        );
+        -- ===== 单题 skip 展示域：动作账本（幂等/冲突/状态机的持久底座）=====
+        -- action_id PK + 稳定 seq（MAX+1 事务内分配；动作行不删除，seq 单调不回收）；
+        -- kind 强词表 skip|restore（跨 kind 复用同 id 双向 Conflict）；完整规范请求
+        -- 正文**逐字落库**（幂等/冲突按 kind/device/session/ThreadKey/group4/正文/
+        -- 摘要逐字段核对，摘要不能替代正文）；state 单向状态机
+        -- prepared→claimed→finished（CAS 推进，CHECK 同词表钉死）；
+        -- revision_at_start = 动作起点时的展示 revision；command_digest 在 claim 时
+        -- 恰好绑定一次（落盘成功后上层才允许 Native Invoke）；native_effect/
+        -- native_reason 只在终定（finish/settle/recover）时落账，restore 行保持
+        -- NULL（restore 无原生面，读取层映射保守 Unresolved，不伪造核证）。
+        CREATE TABLE IF NOT EXISTS codex_question_skip_actions (
+            action_id         TEXT PRIMARY KEY,
+            seq               INTEGER NOT NULL UNIQUE,
+            kind              TEXT NOT NULL CHECK(kind IN ('skip','restore')),
+            device_id         TEXT NOT NULL,
+            session_id        TEXT NOT NULL,
+            thread_host_id    TEXT NOT NULL,
+            thread_id         TEXT NOT NULL,
+            group_turn_id     TEXT NOT NULL,
+            group_item_id     TEXT NOT NULL,
+            group_generation  TEXT NOT NULL,
+            canonical_payload TEXT NOT NULL,
+            payload_digest    TEXT NOT NULL,
+            state             TEXT NOT NULL CHECK(state IN ('prepared','claimed','finished')),
+            revision_at_start INTEGER NOT NULL,
+            command_digest    TEXT,
+            claimed_at        INTEGER,
+            settled_at        INTEGER,
+            native_effect     TEXT,
+            native_reason     TEXT,
+            created_at        INTEGER NOT NULL
+        );
+        -- history 线程批量取 + 各组 latest skip（按 seq 最新）走 group 前缀；
+        -- recover 枚举遗留作业走 open partial index。
+        CREATE INDEX IF NOT EXISTS idx_codex_question_skip_actions_group
+            ON codex_question_skip_actions(thread_id, group_turn_id, group_item_id, group_generation, seq);
+        CREATE INDEX IF NOT EXISTS idx_codex_question_skip_actions_open
+            ON codex_question_skip_actions(state) WHERE state IN ('prepared','claimed');
         "#,
     )
     .expect("Failed to initialize database schema");

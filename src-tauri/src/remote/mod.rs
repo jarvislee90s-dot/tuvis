@@ -8,6 +8,7 @@ pub mod attachments;
 pub mod codex_adapt;
 pub mod codex_evidence;
 pub mod codex_ipc;
+pub mod codex_question_skip;
 pub mod content;
 pub mod events;
 pub mod files;
@@ -2114,9 +2115,32 @@ pub fn remote_devices() -> serde_json::Value {
 
 /// 单设备吊销：DB 置位 + SSE 即时断连（Task 1 注册表接线）+ 审计。
 /// M5 A3：审批队列清理随审批制下线——旧审批路径已不存在，无「重 poll 复活」面
+/// Source/live（合同 §6）：revoke SQL 与 SSE disconnect 之前 begin Device 更新；
+/// 撤销结果持有拒绝事实，SQL 失败也保守 Unknown——不能依赖 SSE 稍后断线；
+/// 较早鉴权刷新票不能复活设备。
 #[tauri::command]
 pub fn remote_revoke_device(id: String) -> Result<(), String> {
-    STATE.store.with(|c| pairing::revoke_device(c, &id))?;
+    let live = STATE.codex_control.question_skip_live();
+    let update = live
+        .begin_gate_change(
+            crate::services::codex_question_skip::live::LiveFactKey::Device(id.clone()),
+        )
+        .ok();
+    let result = STATE.store.with(|c| pairing::revoke_device(c, &id));
+    if let Some(update) = update {
+        let observed = match &result {
+            Ok(_) => Ok(
+                crate::services::codex_question_skip::live::LiveFact::Device {
+                    paired: true,
+                    revoked: true,
+                    control_right: false,
+                },
+            ),
+            Err(_) => Err(crate::services::codex_question_skip::live::LiveRefusal::Unknown),
+        };
+        let _ = live.finish_gate_change(update, observed);
+    }
+    result?;
     let n = STATE.sse_registry.disconnect_device(&id);
     events::audit("device_revoked", &format!("id={id} closed_sse={n}"));
     events::emit_ui("remote-roster-changed", serde_json::json!({"id": id}));
@@ -2125,12 +2149,51 @@ pub fn remote_revoke_device(id: String) -> Result<(), String> {
 
 /// 吊销全部设备 + SSE 即时断连（M5 A4 单一实现）：`remote_revoke_all_devices` /
 /// `remote_reset_devices` / `remote_set_pin`（改值）三入口共用，杜绝「吊销+断连」
-/// 逻辑两份漂移。返回 (吊销数, 断连数) 供各入口按自身语义审计
+/// 逻辑两份漂移。返回 (吊销数, 断连数) 供各入口按自身语义审计。
+/// Source/live（合同 §6）：先读花名册取设备 ids、逐台 begin Device 票，再执行
+/// revoke_all；SQL 失败也保守 Unknown。
 fn revoke_all_and_disconnect() -> Result<(usize, usize), String> {
-    let n = STATE
+    use crate::services::codex_question_skip::live::{
+        LiveFact as QSLiveFact, LiveFactKey as QSLiveFactKey, LiveRefusal as QSLiveRefusal,
+    };
+    let device_ids: Vec<String> = STATE
+        .store
+        .with(|c| {
+            let mut stmt = c.prepare("SELECT id FROM remote_devices")?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            let mut ids = Vec::new();
+            for id in rows {
+                ids.push(id?);
+            }
+            Ok::<Vec<String>, rusqlite::Error>(ids)
+        })
+        .unwrap_or_default();
+    let live = STATE.codex_control.question_skip_live();
+    let tickets: Vec<_> = device_ids
+        .iter()
+        .filter_map(|id| {
+            live.begin_gate_change(QSLiveFactKey::Device(id.clone()))
+                .ok()
+        })
+        .collect();
+    let result = STATE
         .store
         .with(pairing::revoke_all)
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| e.to_string());
+    let revoked_ok = result.is_ok();
+    for update in tickets {
+        let observed = if revoked_ok {
+            Ok(QSLiveFact::Device {
+                paired: true,
+                revoked: true,
+                control_right: false,
+            })
+        } else {
+            Err(QSLiveRefusal::Unknown)
+        };
+        let _ = live.finish_gate_change(update, observed);
+    }
+    let n = result?;
     let closed = STATE.sse_registry.disconnect_all();
     Ok((n, closed))
 }

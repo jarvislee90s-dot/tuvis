@@ -58,6 +58,11 @@ const QUEUE_REFRESH_DEBOUNCE_MS = 250;
  *  都重置去抖，入队回执触发的刷新会被无限推后（条目直到输出暂停才可见/可撤）。
  *  自首个未处理触发起超过本上限即立即重拉——合并与及时性两头保住。 */
 const QUEUE_REFRESH_MAX_WAIT_MS = 2000;
+/** 操作收尾刷新预算（毫秒）：prioritize 两臂唯一收尾 GET 的有界等待——POST
+ *  结论已收到，提示与锁清理不得被一次挂起的 GET 无界阻塞。到期按「无快照」
+ *  处理（保 POST 阶段事实 + 桌面核对 + 不自动重试），迟到响应由 seq/session
+ *  哨兵作废。仅操作收尾使用；挂载/手动刷新/其他操作保持原等待语义。 */
+const QUEUE_OP_REFRESH_TIMEOUT_MS = 2000;
 
 /** 动作状态 → 展示词（snake_case wire 词 → 用户可读；unknown 如实「结果未知」） */
 function stateLabel(s: CodexActionState): string {
@@ -109,9 +114,31 @@ function queueRowLength(textPreview: string): number {
 // T06：已入队消息的显式优先处理（「插队」）
 // ============================================================
 
-/** T06 not_sent 理由码的可读化（词表内映射；词表外原样透出——与 composer
- *  notSentReasonCopy 同款兜底纪律，不虚构语义）。 */
-function prioritizeRefusalCopy(reasonCode: string): string | null {
+/** T06 not_sent 理由码的可读化（词表内映射；词表外保守可读兜底——不裸码、不
+ *  臆测精确原因/是否写出，wire 的 queued 事实由外层 wrapper 如实陈述）。
+ *
+ *  Task9（队列结论分型 RED→GREEN）：拒绝/失败原因必须说**本条实际发生了什么**，
+ *  不能把互斥忙、停止链路各环节失败全部吞成一句「桌面正忙」。分型对照后端
+ *  `queue_prioritize` 的真实 reasonCode 词表（codex_ipc.rs / router.rs）：
+ *  - `dispatch_in_flight`：**其他**发送/接管在途（并发派发互斥），本条仍 queued——
+ *    与「桌面正忙」分型（后者指向「等一会儿就好」，对并发互斥是误导）；
+ *  - `action_cancelled`：动作已被撤回离队（queued=false），不宣称仍在队列；
+ *  - `desktop_rejected`：桌面明确拒绝（receipt.delivery=rejected 的最终回执）；
+ *  - `device_revoked`：设备授权失效——两形态分文案（queued=false 落账回执 =
+ *    已发送失败且离队；queued=true = 接管复核竞态留队，不断言已离队）；
+ *  - `expected_turn_required`：确认停止缺目标回合阀值（零停止零越队）；
+ *  - `stop_desktop_rejected` / `stop_disconnected` / `stop_stale_context` /
+ *    `stop_claim_unavailable` / `stop_device_revoked` /
+ *    `stop_capability_unavailable`：停止链路各失败点（桌面拒绝 / 连接断开 /
+ *    上下文换代 / 占有登记失败 / 设备失效 / 能力未启用），各给对应文案；
+ *  - `stop_not_effective`：未证明目标回合终态——**不断言回合仍在运行**（缺的
+ *    是终态证据，回合可能已换代），只说「未能确认已停止」；
+ *  - `front_budget_elapsed`：预算等待超时——**不带停止语义**（该码也可来自
+ *    消息派发阶段的新鲜门等待，idle 零停止场景同样会产生）；
+ *  - `store_error`：本地账本读写暂时失败（保守留队）；
+ *  - `queued`：本轮未轮到执行（不臆测原因）；`grant_consumed`：授权缺失或已
+ *    消费两义并存——保守「暂无法继续 + 核对」，不断言已发送/必然已消费。 */
+function prioritizeRefusalCopy(reasonCode: string, queued: boolean): string {
   switch (reasonCode) {
     case "interrupt_confirmation_required":
       return i18n.t("mobile.codex.queue.prioritizeNeedsStopConfirm");
@@ -119,9 +146,13 @@ function prioritizeRefusalCopy(reasonCode: string): string | null {
       return i18n.t("mobile.codex.queue.prioritizeNativePending");
     case "state_unknown":
       return i18n.t("mobile.codex.queue.prioritizeStateUnknown");
+    case "expected_turn_required":
+      return i18n.t("mobile.codex.queue.prioritizeExpectedTurn");
     case "stop_not_effective":
       return i18n.t("mobile.codex.queue.prioritizeStopNotEffective");
     case "front_budget_elapsed":
+      // 不带停止语义：消息派发阶段的新鲜门等待超时同样产生此码（idle 零停止）
+      return i18n.t("mobile.codex.queue.prioritizeBudgetTimeout");
     case "stop_timeout":
       return i18n.t("mobile.codex.queue.prioritizeStopUncertain");
     case "unknown_delivery_barrier":
@@ -131,15 +162,96 @@ function prioritizeRefusalCopy(reasonCode: string): string | null {
       return i18n.t("mobile.codex.queue.prioritizeUnknownBarrier");
     case "barrier_outstanding":
     case "busy_before_write":
-    case "dispatch_in_flight":
+      // 这两码才是「桌面忙、稍后再试」语义（barrier_outstanding=未解屏障挡队列，
+      // busy_before_write=写前冻结回队）；dispatch_in_flight 已分型拆出。
       return i18n.t("mobile.codex.queue.prioritizeBusy");
+    case "dispatch_in_flight":
+      return i18n.t("mobile.codex.queue.prioritizeDispatchInFlight");
+    case "action_cancelled":
+      return i18n.t("mobile.codex.queue.prioritizeActionCancelled");
+    case "desktop_rejected":
+      return i18n.t("mobile.codex.queue.prioritizeDesktopRejected");
+    case "device_revoked":
+      return queued
+        ? i18n.t("mobile.codex.queue.prioritizeDeviceRevokedQueue")
+        : i18n.t("mobile.codex.queue.prioritizeDeviceRevoked");
+    case "stop_desktop_rejected":
+      return i18n.t("mobile.codex.queue.prioritizeStopDesktopRejected");
+    case "stop_disconnected":
+      return i18n.t("mobile.codex.queue.prioritizeStopDisconnected");
+    case "stop_stale_context":
+      return i18n.t("mobile.codex.queue.prioritizeStopStaleContext");
+    case "stop_claim_unavailable":
+      return i18n.t("mobile.codex.queue.prioritizeStopClaimUnavailable");
+    case "stop_device_revoked":
+      return i18n.t("mobile.codex.queue.prioritizeStopDeviceRevoked");
+    case "stop_capability_unavailable":
+      return i18n.t("mobile.codex.queue.prioritizeStopCapabilityUnavailable");
+    case "store_error":
+      return i18n.t("mobile.codex.queue.prioritizeStoreError");
+    case "queued":
+      // 字面「queued」码：只说「本次未优先执行」，不臆测原因（排队事实由
+      // wrapper 的「仍在队列」按 wire queued=true 如实陈述）
+      return i18n.t("mobile.codex.queue.prioritizeQueuedNotExecuted");
+    case "grant_consumed":
+      // 授权缺失/已消费两义并存：保守「暂无法继续 + 核对」，不断言已发送或
+      // 必然已消费
+      return i18n.t("mobile.codex.queue.prioritizeGrantUnavailable");
     default:
-      return null;
+      // 词表外拒绝码：保守可读兜底（不裸示机器码、不编造语义）
+      return i18n.t("mobile.codex.queue.prioritizeRefusalUnknownReason");
   }
 }
 
+/** Unknown 结果的「阶段事实」文案：`unknown_delivery` = 投递结果未知；已知
+ *  `stop_` 前缀 = 停止结果未确认（与投递未知明确区分——两者都「不自动重试」，
+ *  但用户要核对的桌面状态不同）；其余（`front_budget_elapsed` 等无法凭码定性
+ *  阶段的）→ 保守「结果未知」。绝不凭码 + 排队快照反推「一定是停止等待」。 */
+function prioritizeUnknownPhaseCopy(reasonCode: string): string {
+  if (reasonCode === "unknown_delivery") {
+    return i18n.t("mobile.codex.queue.prioritizeDeliveryUnknown");
+  }
+  if (reasonCode.startsWith("stop_")) {
+    return i18n.t("mobile.codex.queue.prioritizeStopUnknownPhase");
+  }
+  return i18n.t("mobile.codex.queue.prioritizeResultUncertain");
+}
+
+/** 操作后成功 GET 的同 scope/action 快照 → 本条排队**正**事实。
+ *
+ *  真实 /codex/queue 只 list_queued：快照只能正面证明「同 action 仍排队 + 队
+ *  位」。目标缺席（操作后离队或列表滞后）与刷新失败/乱序一律返回空串——缺席
+ *  **不**证明已投递/未投递/已离队，也不从 thread blockedReasonCode 反推本条
+ *  delivery；不编造 wire 不存在的 queued/receipt，不用旧闭包视图补状态。 */
+function queueFactFromSnapshot(view: CodexQueueView | null, actionId: string): string {
+  const mine = view?.actions.find((a) => a.actionId === actionId);
+  if (!mine || mine.state !== "queued") return "";
+  return mine.position !== null && mine.position >= 1
+    ? i18n.t("mobile.codex.queue.noteQueuedPosition", { n: mine.position })
+    : i18n.t("mobile.codex.queue.noteQueued");
+}
+
+/** prioritize HTTP/网络错误 → 可读保守分型（Task9）：网络异常（status=null）、
+ *  服务端失败（internal / 5xx）按人类可读「服务/连接失败 + 先回桌面核对」陈述，
+ *  **不宣称队列状态**（HTTP 错误缺 queued 事实，不默认「仍在队列/未写出/已送
+ *  达」），不建议直接重发；`forbidden`（权限/设备门）与 `capability_unavailable`
+ *  （能力门，**不附会「连接中断」**）按码换文案；词表外也走保守可读兜底，
+ *  绝不裸示机器码。wire 的 status/code 由 ApiError 原样保留（诊断不丢）。 */
+function prioritizeHttpErrorCopy(e: ApiError): string {
+  if (e.status === null) return i18n.t("mobile.codex.queue.prioritizeErrNetwork");
+  const code = typeof e.data?.error === "string" ? e.data.error : "";
+  if (code === "forbidden") return i18n.t("mobile.codex.queue.prioritizeErrForbidden");
+  if (code === "capability_unavailable")
+    return i18n.t("mobile.codex.queue.prioritizeErrCapability");
+  if (code === "internal" || e.status >= 500)
+    return i18n.t("mobile.codex.queue.prioritizeErrInternal");
+  return i18n.t("mobile.codex.queue.prioritizeErrGeneric");
+}
+
 /** T06：优先处理回执四态 → 可读 note（全部关联**原 actionId**；queued=true 的
- *  拒绝如实说明「仍在队列」，unknown 不诱导重按、不自动重试）。 */
+ *  拒绝如实说明「仍在队列」，unknown 不诱导重按、不自动重试——unknown 臂在
+ *  prioritize() 内组 note：先取操作后快照再拼「阶段事实 + 排队状态 + 核对指引」，
+ *  本函数到不了 unknown 的完整形态，仅保留其阶段事实作穷尽兜底）。 */
 function prioritizeResultCopy(res: CodexPrioritizeResult): string {
   switch (res.result) {
     case "prioritized":
@@ -151,14 +263,14 @@ function prioritizeResultCopy(res: CodexPrioritizeResult): string {
     case "not_sent":
       if (res.queued) {
         return i18n.t("mobile.codex.queue.prioritizeRefused", {
-          reason: prioritizeRefusalCopy(res.reasonCode) ?? res.reasonCode,
+          reason: prioritizeRefusalCopy(res.reasonCode, true),
         });
       }
       return i18n.t("mobile.codex.queue.prioritizeFailed", {
-        message: prioritizeRefusalCopy(res.reasonCode) ?? res.reasonCode,
+        message: prioritizeRefusalCopy(res.reasonCode, false),
       });
     case "unknown":
-      return i18n.t("mobile.codex.queue.prioritizeUnknown");
+      return prioritizeUnknownPhaseCopy(res.reasonCode);
   }
 }
 
@@ -239,19 +351,63 @@ export default function CodexQueuePanel({
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   /** C6：首个未处理触发的时刻（maxWait 基准；重拉完成即清） */
   const firstPendingAtRef = useRef<number | null>(null);
+  /** T06：prioritize 操作代际（有效 armed 确认 +1；scope 卸载/换会话 +1）。
+   *  当前操作判据 = sessionRef===sid && prioritizeOpRef===op 双验：只有当前 op
+   *  可 setNote/清 busy/通知父；旧 op 直接失权——新 scope setup 已同步重置其
+   *  锁与状态，不依赖已失权旧 op 的清理，避免残锁带进新 scope。 */
+  const prioritizeOpRef = useRef(0);
 
-  const load = useCallback(async () => {
-    const sid = sessionId;
-    const seq = ++seqRef.current;
-    try {
-      const v = await fetchCodexQueue(sid);
-      // 乱序防护：会话已切换 / 已有更新的请求发出 → 本次响应作废（不回灌旧数据）
-      if (sessionRef.current !== sid || seq !== seqRef.current) return;
-      if (v !== null) setView(v); // 403（设备失效）静默保留现有视图，全局判废通道处理
-    } catch {
-      /* 拉取失败静默：保留上一份（面板是增强信息，不阻塞对话） */
-    }
-  }, [sessionId]);
+  /** 拉取队列视图；返回本次**成功 GET 的新视图**（403 设备失效 → null；网络失败
+   *  / 乱序/到期 → null）供操作后组 note 引用——调用方只把非 null 返回值当作
+   *  「同 scope 成功快照」使用，绝不拿旧闭包视图做状态承诺。
+   *
+   *  有界收尾（仅 prioritize 两臂传 QUEUE_OP_REFRESH_TIMEOUT_MS）：raw 是完整
+   *  fetchCodexQueue（含 fetch、错误正文读取与成功 json），不挂任何 UI 层
+   *  then/catch/finally；与到期 null promise 竞速。到期先置本次 expired，仅在
+   *  本调用仍拥有最新 seq 时 ++seqRef（作废自己、不误伤已开始的新请求），再
+   *  resolve(null)。提交护栏：!expired && sessionRef===sid && seqRef===seq 且
+   *  值非 null 才 setView/返回。到期后即使没有新请求，raw 的迟到 resolve/reject
+   *  也没有可提交的续体——不回灌 view/note/error、不清任何 busy。finally 仅清
+   *  本次 timer，不 await raw；无预算调用保持原等待语义。 */
+  const load = useCallback(
+    async (options?: { timeoutMs?: number }): Promise<CodexQueueView | null> => {
+      const sid = sessionId;
+      const seq = ++seqRef.current;
+      const timeoutMs = options?.timeoutMs;
+      let expired = false;
+      let timer: ReturnType<typeof setTimeout> | null = null;
+      try {
+        const raw = fetchCodexQueue(sid);
+        let v: CodexQueueView | null;
+        if (timeoutMs === undefined) {
+          v = await raw;
+        } else {
+          v = await Promise.race([
+            raw,
+            new Promise<null>((resolveDeadline) => {
+              timer = setTimeout(() => {
+                expired = true;
+                if (seq === seqRef.current) seqRef.current += 1;
+                resolveDeadline(null);
+              }, timeoutMs);
+            }),
+          ]);
+          if (expired) return null;
+        }
+        // 乱序防护：会话已切换 / 已有更新的请求或操作发出 → 本次响应作废
+        if (sessionRef.current !== sid || seq !== seqRef.current) return null;
+        if (v !== null) setView(v); // 403（设备失效）静默保留现有视图，全局判废通道处理
+        return v;
+      } catch {
+        /* 拉取失败静默：保留上一份（面板是增强信息，不阻塞对话）；返回 null =
+        「无可用快照」，调用方不得据此宣称任何排队状态 */
+        return null;
+      } finally {
+        if (timer !== null) clearTimeout(timer);
+      }
+    },
+    [sessionId]
+  );
 
   // 挂载/换会话拉取；换会话先清（防串台），并作废在途的去抖定时器与旧响应
   useEffect(() => {
@@ -266,6 +422,8 @@ export default function CodexQueuePanel({
     void load();
     return () => {
       sessionRef.current = ""; // 卸载（key 随会话变化）同样作废旧编辑回执。
+      prioritizeOpRef.current += 1; // 在途 prioritize 操作失权：旧 op 无权 setNote/清锁/通知
+      seqRef.current += 1; // 在途 load（含有界竞速收尾）响应一律作废
       if (debounceRef.current !== null) {
         clearTimeout(debounceRef.current);
         debounceRef.current = null;
@@ -413,26 +571,64 @@ export default function CodexQueuePanel({
       const turnRunning = turnControl?.turnRunning === true;
       const confirmInterrupt = turnControl ? turnRunning : false;
       const frozenTurnId = turnControl?.activeTurnId ?? undefined;
+      // 有效 armed 确认：递增操作代际（旧 op 全部失权），并作废开始前仍在途的
+      // 旧刷新快照，再上锁、清 note。
+      const op = ++prioritizeOpRef.current;
+      ++seqRef.current;
+      const sid = sessionId;
       setPrioritizeBusyId(actionId);
       setNote(null);
+      // note 在其后**所有**到达尾部的路径上都被穷尽分支赋值（try/catch 各自的
+      // 归属守卫失权时直接 return），故不做无用初值赋值（no-useless-assignment）。
+      let note: string | null;
       try {
         const res = await prioritizeCodexQueueMessage({
-          sessionId,
+          sessionId: sid,
           actionId,
           expectedTurnId: confirmInterrupt ? (frozenTurnId ?? undefined) : undefined,
           confirmInterrupt,
         });
-        setNote(prioritizeResultCopy(res));
+        // POST 返回：仅当前 scope+当前 op 有权继续——旧 op 直接退出（新 scope
+        // setup 已同步重置其锁；不发旧 scope 的收尾 GET，不写 note/busy）。
+        if (sessionRef.current !== sid || prioritizeOpRef.current !== op) return;
+        // 成功臂唯一收尾 GET（有界预算）：note 与面板视图收在同一返回快照上。
+        // 到期/失败/乱序 → null → 保 POST 阶段事实 + 桌面核对 + 不自动重试，
+        // 不用旧 view 补 Queue，不发第二确认 GET。
+        const fresh = await load({ timeoutMs: QUEUE_OP_REFRESH_TIMEOUT_MS });
+        // GET 返回后再次验证归属，才允许清锁/通知/写 note。
+        if (sessionRef.current !== sid || prioritizeOpRef.current !== op) return;
+        note =
+          res.result === "unknown"
+            ? [
+                // Unknown 响应没有 queued/receipt 字段：已知 stop_ 前缀 =
+                // 停止结果未确认（与投递未知分型，可说本次未继续目标派发）；
+                // 其余（front_budget_elapsed / client_message_unverified 等
+                // 无法凭码定性）→ 保守「结果未知」，不归因预算、不断言未发。
+                prioritizeUnknownPhaseCopy(res.reasonCode),
+                queueFactFromSnapshot(fresh, actionId),
+                i18n.t("mobile.codex.queue.prioritizeUnknownGuide"),
+              ]
+                .filter(Boolean)
+                .join(" ")
+            : prioritizeResultCopy(res);
       } catch (e) {
-        const message = e instanceof ApiError ? apiErrorReason(e) : String(e);
-        setNote(i18n.t("mobile.codex.queue.prioritizeFailed", { message }));
-      } finally {
-        setPrioritizeBusyId(null);
-        // 重拉以服务端账本为唯一权威（prioritized → 该行状态推进；其余行不动）；
-        // 停止受理会置暂停/改变 send-info 可用性 → 通知上层（与打断臂同口径）
-        await load();
-        onQueueStateChanged?.();
+        // catch 入口同样先验归属：旧 op 不得写 note/发旧 scope 收尾 GET。
+        if (sessionRef.current !== sid || prioritizeOpRef.current !== op) return;
+        // HTTP/网络错误按状态/码保守可读化（不裸码、不宣称队列状态、不建议直接
+        // 重发，指引先回桌面核对实际状态）；wire 的 status/code 由 ApiError 原样
+        // 保留（诊断不丢）。
+        note = i18n.t("mobile.codex.queue.prioritizeFailed", {
+          message: e instanceof ApiError ? prioritizeHttpErrorCopy(e) : String(e),
+        });
+        // 错误臂唯一收尾 GET（有界预算；load 自身归 null，不因 GET 失败/超时
+        // 进入另一条补确认 GET 的路径）。
+        await load({ timeoutMs: QUEUE_OP_REFRESH_TIMEOUT_MS });
+        if (sessionRef.current !== sid || prioritizeOpRef.current !== op) return;
       }
+      setPrioritizeBusyId(null);
+      // 停止受理会置暂停/改变 send-info 可用性 → 通知上层（与打断臂同口径）
+      onQueueStateChanged?.();
+      if (note !== null) setNote(note);
     },
     [
       busyId,
@@ -440,7 +636,6 @@ export default function CodexQueuePanel({
       prioritizeBusyId,
       prioritizeArmedId,
       turnControl,
-      view,
       sessionId,
       load,
       onQueueStateChanged,
@@ -454,11 +649,27 @@ export default function CodexQueuePanel({
   // 时不再出长说明与打断臂：停止入口由 composer 主按钮/紧凑入口承担（同一共享
   // 控制器）。真实 Unknown（native_delivery_unknown，无自动恢复路径）与在途投递
   // 屏障（native_turn_pending/compat_outstanding）不在此列——核对/解除入口保留。
-  if (
+  const emptyHidden =
     view.actions.length === 0 &&
-    (view.blockedReasonCode === null || view.blockedReasonCode === "native_turn_active")
-  ) {
-    return null;
+    (view.blockedReasonCode === null || view.blockedReasonCode === "native_turn_active");
+  // 操作收尾的反馈（Unknown 核对提示 / HTTP·网络保守错误）不随空视图被吞：
+  // 收尾 GET [] 把队列清空时，复用同一 note 反馈区域最小呈现（未操作空队列
+  // note 为空仍按原自隐，不加壳不加新入口）。
+  if (emptyHidden) {
+    if (note === null) return null;
+    return (
+      <div
+        data-testid="codex-queue-panel"
+        className="rounded-xl border border-[var(--cb)] bg-[var(--cbg)] px-3 py-2"
+      >
+        <p
+          data-testid="codex-queue-note"
+          className="mt-1 text-xs text-slate-600 first:mt-0 dark:text-slate-300"
+        >
+          {note}
+        </p>
+      </div>
+    );
   }
   // 人工解除按钮仅两类**无自动恢复路径**的阻塞态可见（native_turn_pending 等待
   // Turn 终态自动继续，不提供）；靶向清单来自服务端 blockedActionIds
