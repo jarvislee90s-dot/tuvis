@@ -397,27 +397,24 @@ async fn first_attach_none_capture_then_live_attach_writes_b_through_current_liv
         "actor must apply B to the real mirror"
     );
     // cache 不能仍 Ready A：B 新 seq（写穿当前世代）或 Unknown。
-    match live.try_source(&key) {
-        Ok(frozen) => {
-            assert_eq!(
-                frozen.generation,
-                live.current_generation().expect("live stays open"),
-                "actor write-through records in the current generation"
-            );
-            assert_ne!(
-                frozen.snapshot.fence.source_seq, a.snapshot.fence.source_seq,
-                "write-through must advance source continuity beyond parked A"
-            );
-            assert!(
-                frozen.snapshot.groups.iter().all(|g| g
-                    .selector
-                    .members
-                    .iter()
-                    .all(|m| m.title != "A")),
-                "cache must not stay Ready A"
-            );
-        }
-        Err(_) => {}
+    if let Ok(frozen) = live.try_source(&key) {
+        assert_eq!(
+            frozen.generation,
+            live.current_generation().expect("live stays open"),
+            "actor write-through records in the current generation"
+        );
+        assert_ne!(
+            frozen.snapshot.fence.source_seq, a.snapshot.fence.source_seq,
+            "write-through must advance source continuity beyond parked A"
+        );
+        assert!(
+            frozen.snapshot.groups.iter().all(|g| g
+                .selector
+                .members
+                .iter()
+                .all(|m| m.title != "A")),
+            "cache must not stay Ready A"
+        );
     }
     assert_eq!(
         guard.recheck(&ctx),

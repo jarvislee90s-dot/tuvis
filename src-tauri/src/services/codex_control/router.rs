@@ -778,6 +778,33 @@ mod book {
             .contains_key(key)
     }
 
+    /// 把接受回执的 Turn 身份补绑到在飞限制（幂等；Task1 owner 精确化：仅当在册
+    /// 限制仍属于**观察到的 owner** 且动作未变时更新）。**不新建、不覆盖**——
+    /// 旧代际的绑定在 book 为 None / 属于不同 owner 时一律 no-op；重建或恢复场景
+    /// 的新身份由 [`mark`] / 簿记重建自行签发，补绑不凭空造限制。
+    /// 返回是否实际匹配并更新：false = book 空 / 已换代（同动作重新派发的新占位）/
+    /// 动作不符——调用方（收敛路径）据此**放弃该快照的一切后续应用副作用**
+    ///（含持久屏障回写），过期 owner 快照不得再「修当前运行限制」。
+    pub(super) fn bind(
+        book: &TurnBook,
+        key: &ThreadKey,
+        owner: &TurnOwner,
+        action_id: &str,
+        turn_id: Option<&str>,
+    ) -> bool {
+        let mut turns = book.lock().unwrap_or_else(|e| e.into_inner());
+        match turns
+            .get_mut(key)
+            .filter(|t| t.owner == *owner && t.action_id == action_id)
+        {
+            Some(t) => {
+                t.turn_id = turn_id.map(str::to_string);
+                true
+            }
+            None => false,
+        }
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -894,33 +921,6 @@ mod book {
             assert!(!forget_if(&book, &key, &owner2, "same-action"));
             bind(&book, &key, &owner1, "same-action", Some("old-turn"));
             assert!(!held(&book, &key), "旧绑定不得复活已释放的占位");
-        }
-    }
-
-    /// 把接受回执的 Turn 身份补绑到在飞限制（幂等；Task1 owner 精确化：仅当在册
-    /// 限制仍属于**观察到的 owner** 且动作未变时更新）。**不新建、不覆盖**——
-    /// 旧代际的绑定在 book 为 None / 属于不同 owner 时一律 no-op；重建或恢复场景
-    /// 的新身份由 [`mark`] / 簿记重建自行签发，补绑不凭空造限制。
-    /// 返回是否实际匹配并更新：false = book 空 / 已换代（同动作重新派发的新占位）/
-    /// 动作不符——调用方（收敛路径）据此**放弃该快照的一切后续应用副作用**
-    ///（含持久屏障回写），过期 owner 快照不得再「修当前运行限制」。
-    pub(super) fn bind(
-        book: &TurnBook,
-        key: &ThreadKey,
-        owner: &TurnOwner,
-        action_id: &str,
-        turn_id: Option<&str>,
-    ) -> bool {
-        let mut turns = book.lock().unwrap_or_else(|e| e.into_inner());
-        match turns
-            .get_mut(key)
-            .filter(|t| t.owner == *owner && t.action_id == action_id)
-        {
-            Some(t) => {
-                t.turn_id = turn_id.map(str::to_string);
-                true
-            }
-            None => false,
         }
     }
 }

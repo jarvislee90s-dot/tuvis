@@ -543,13 +543,15 @@ pub async fn wait_first_snapshot_rx(
 }
 
 #[cfg(test)]
-static SNAPSHOT_WAIT_TEST_GATE: std::sync::Mutex<
-    Option<(
-        String,
-        tokio::sync::oneshot::Sender<()>,
-        tokio::sync::oneshot::Receiver<()>,
-    )>,
-> = std::sync::Mutex::new(None);
+type SnapshotWaitTestGate = (
+    String,
+    tokio::sync::oneshot::Sender<()>,
+    tokio::sync::oneshot::Receiver<()>,
+);
+
+#[cfg(test)]
+static SNAPSHOT_WAIT_TEST_GATE: std::sync::Mutex<Option<SnapshotWaitTestGate>> =
+    std::sync::Mutex::new(None);
 
 #[cfg(test)]
 async fn test_gate_before_snapshot_wait(key: &ThreadKey) {

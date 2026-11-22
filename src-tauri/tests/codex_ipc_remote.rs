@@ -11428,11 +11428,13 @@ async fn takeover_lifecycle_prewrite_exit_releases_intent() {
                     .router
                     .set_priority_interleave_gate(None);
                 assert_eq!(count_start_turn_frames(&mut peer).await, 0);
-                let conn = f.conn.lock().unwrap();
-                let consumed: i64 = conn.query_row("SELECT COUNT(*) FROM codex_bypass_grant WHERE action_id='take-q2' AND consumed_at IS NOT NULL", [], |r| r.get(0)).unwrap();
-                let resolutions: i64 = conn.query_row("SELECT COUNT(*) FROM codex_barrier_resolutions WHERE reason='explicit_takeover' AND target_action_id='take-q2'", [], |r| r.get(0)).unwrap();
+                let (consumed, resolutions) = {
+                    let conn = f.conn.lock().unwrap();
+                    let consumed: i64 = conn.query_row("SELECT COUNT(*) FROM codex_bypass_grant WHERE action_id='take-q2' AND consumed_at IS NOT NULL", [], |r| r.get(0)).unwrap();
+                    let resolutions: i64 = conn.query_row("SELECT COUNT(*) FROM codex_barrier_resolutions WHERE reason='explicit_takeover' AND target_action_id='take-q2'", [], |r| r.get(0)).unwrap();
+                    (consumed, resolutions)
+                };
                 assert_eq!((consumed, resolutions), (0, 0), "{exit} 不得留下半事务");
-                drop(conn);
                 lifecycle_accept_selected(&f, &mut peer, "take-q3", "原文丙", 10).await;
                 continue;
             } else {
@@ -11451,17 +11453,19 @@ async fn takeover_lifecycle_prewrite_exit_releases_intent() {
                 .set_priority_interleave_gate(None);
         }
         assert_eq!(count_start_turn_frames(&mut peer).await, 0, "{exit}");
-        let conn = f.conn.lock().unwrap();
-        let consumed: i64 = conn.query_row("SELECT COUNT(*) FROM codex_bypass_grant WHERE action_id='take-q2' AND consumed_at IS NOT NULL", [], |r| r.get(0)).unwrap();
-        let resolutions: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM codex_barrier_resolutions WHERE reason='explicit_takeover'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
+        let (consumed, resolutions) = {
+            let conn = f.conn.lock().unwrap();
+            let consumed: i64 = conn.query_row("SELECT COUNT(*) FROM codex_bypass_grant WHERE action_id='take-q2' AND consumed_at IS NOT NULL", [], |r| r.get(0)).unwrap();
+            let resolutions: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM codex_barrier_resolutions WHERE reason='explicit_takeover'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            (consumed, resolutions)
+        };
         assert_eq!((consumed, resolutions), (0, 0), "{exit}");
-        drop(conn);
         lifecycle_accept_selected(&f, &mut peer, "take-q2", "原文乙", 10).await;
     }
 }
@@ -30538,7 +30542,7 @@ async fn async_active_http_late_steer_ack_settles_without_touching_old_turn() {
     assert_eq!(front["actionId"], "act-active-late", "{front}");
     assert_eq!(client_message_id_of(&f, "act-active-late"), cmid);
     tokio::time::timeout(Duration::from_secs(5), async {
-        while f.state.codex_control.adapter.late_registry().len() == 0 {
+        while f.state.codex_control.adapter.late_registry().is_empty() {
             tokio::task::yield_now().await;
         }
     })
@@ -32175,7 +32179,7 @@ async fn b6_closeout_r1_late_ack_preserves_cleared_barrier_and_successor_ownersh
     wait_snapshot_applied(&f, 11, true).await;
     b6_rework_ack(&mut peer, &frame, "local-turn").await;
     b6_rework_wait(
-        || hub.adapter.late_registry().len() == 0,
+        || hub.adapter.late_registry().is_empty(),
         "Hub 必须消费 A 的迟到槽位",
     )
     .await;

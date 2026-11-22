@@ -930,12 +930,11 @@ mod tests {
             "最新事实（重启后 unknown）不得被旧 ACK 清除或改写"
         );
         assert!(entry.dirty, "旧 ACK 不得清除新观察的 dirty");
-        match &entry.durable {
-            Some(durable) => assert!(
+        if let Some(durable) = &entry.durable {
+            assert!(
                 durable.version < restarted.hints[0].version,
                 "旧 ACK 至多推进 durable 到其自身旧版本，不得指向新观察版本"
-            ),
-            None => {}
+            );
         }
         assert_eq!(
             s.prepare_batch(&restarted),
@@ -996,7 +995,7 @@ mod tests {
         assert_eq!(restored_entries, 1, "重建态只含 store 已提交行对应条目");
         assert!(
             state2.durable_for_test(&uncommitted).is_none()
-                && state2.entries.get(&fact_key(&uncommitted)).is_none(),
+                && !state2.entries.contains_key(&fact_key(&uncommitted)),
             "未提交的内存 dirty 不得被恢复为 durable（条目都不存在）"
         );
     }

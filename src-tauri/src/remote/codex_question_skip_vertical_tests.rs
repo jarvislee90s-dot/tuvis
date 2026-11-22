@@ -630,7 +630,7 @@ fn publish_source(live: &QuestionSkipLive) -> SourceRig {
         raw_complete: Some(true),
         display_local_seq: 0,
     };
-    let snapshot = build_source_snapshot(&THREAD, &source_raw(), &stamp)
+    let snapshot = build_source_snapshot(THREAD, &source_raw(), &stamp)
         .expect("canonical raw builds a complete source");
     let frozen = live
         .finish_source_refresh(
@@ -1385,7 +1385,7 @@ async fn b2_hot_restart_preserves_inflight_adapter_claims() {
     });
     let mut claimed = false;
     for _ in 0..300 {
-        if f.hub.adapter.inflight_claimed(&THREAD, &observe_key) {
+        if f.hub.adapter.inflight_claimed(THREAD, &observe_key) {
             claimed = true;
             break;
         }

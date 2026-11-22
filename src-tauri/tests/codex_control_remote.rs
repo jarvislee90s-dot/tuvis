@@ -3378,7 +3378,7 @@ async fn takeover_lifecycle_zero_delivery_allows_new_authorized_attempt() {
         .prioritize_queued_bounded_for_test("lifecycle-target", &h.key, Deadline::after_ms(5_000))
         .await;
     assert!(
-        matches!(first, PrioritizeOutcome::StillQueued(ref reason) if *reason == BUSY_BEFORE_WRITE_REASON),
+        matches!(first, PrioritizeOutcome::StillQueued(reason) if reason == BUSY_BEFORE_WRITE_REASON),
         "{first:?}"
     );
     assert_eq!(h.state_of("lifecycle-target"), ActionState::Queued);
@@ -6108,13 +6108,12 @@ async fn queue_owner_stale_converge_snapshot_keeps_new_active() {
     let resume_rx = Mutex::new(resume_rx);
     h.router
         .set_converge_interleave_gate(Some(Arc::new(move |_, action, turn, owner| {
-            if action == "converge-a" {
-                if observed_tx.send((turn.map(str::to_string), owner)).is_ok() {
-                    let _ = resume_rx
-                        .lock()
-                        .unwrap()
-                        .recv_timeout(Duration::from_secs(10));
-                }
+            if action == "converge-a" && observed_tx.send((turn.map(str::to_string), owner)).is_ok()
+            {
+                let _ = resume_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(10));
             }
         })));
     let router = h.router.clone();

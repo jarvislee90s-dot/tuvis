@@ -8080,7 +8080,7 @@ mod tests {
             mirror.project(caps()).async_questions[0].state,
             InteractionState::Answered
         );
-        let original = mirror.observation_state().unwrap().clone();
+        let _original = mirror.observation_state().unwrap().clone();
         WITNESS_ANALYSIS_PASSES.with(|count| count.set(0));
         FAIL_WITNESS_ANALYSIS_AFTER.with(|remaining| remaining.set(Some(1)));
         b1_replay_patch(

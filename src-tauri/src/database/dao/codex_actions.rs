@@ -2759,10 +2759,7 @@ mod tests {
         ).unwrap()
     }
 
-    fn async_active_store_raw_state(
-        c: &Connection,
-        id: &str,
-    ) -> (
+    type AsyncActiveStoreRawState = (
         String,
         String,
         Option<String>,
@@ -2774,7 +2771,9 @@ mod tests {
         Option<String>,
         Option<String>,
         Option<String>,
-    ) {
+    );
+
+    fn async_active_store_raw_state(c: &Connection, id: &str) -> AsyncActiveStoreRawState {
         c.query_row(
             "SELECT state, route, async_answer_route, effect_probe_key, effect_package_sha256, effect_rule_version, queued_text, compat_outstanding, compat_turn_id, compat_message_id, receipt_json FROM codex_actions WHERE action_id=?1",
             [id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?, r.get(9)?, r.get(10)?)),

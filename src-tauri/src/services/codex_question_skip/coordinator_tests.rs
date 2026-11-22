@@ -1408,7 +1408,7 @@ async fn bound_skip_runs_original_core_once_and_releases_router_lock_after_durab
         b_invoke + 1,
         "the original core must invoke exactly once"
     );
-    assert!(readbacks >= b_readback + 1, "at least one bounded readback");
+    assert!(readbacks > b_readback, "at least one bounded readback");
     rig.assert_no_dispatch();
 
     // durable 后释放最后 guard：竞争者能立即取得同一 Arc mutex。
@@ -1495,7 +1495,7 @@ async fn bound_skip_without_context_witness_never_reports_closed_verified() {
         b_invoke + 1,
         "the original core must invoke exactly once"
     );
-    assert!(readbacks >= b_readback + 1, "at least one bounded readback");
+    assert!(readbacks > b_readback, "at least one bounded readback");
     rig.assert_no_dispatch();
 
     // durable 后释放最后 guard。

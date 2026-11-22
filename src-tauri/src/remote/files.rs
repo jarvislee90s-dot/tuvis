@@ -212,15 +212,18 @@ pub fn read_file_safe(
 }
 
 #[cfg(test)]
+type StatReadMutator = std::rc::Rc<dyn Fn(&Path)>;
+
+#[cfg(test)]
 thread_local! {
     /// A5.2/F7：stat→read 之间的可控变更缝（None = 直通）。
-    static STAT_READ_MUTATOR: std::cell::RefCell<Option<std::rc::Rc<dyn Fn(&Path)>>> =
+    static STAT_READ_MUTATOR: std::cell::RefCell<Option<StatReadMutator>> =
         const { std::cell::RefCell::new(None) };
 }
 
 /// A5.2/F7（测试缝）：安装 stat→read 之间的文件变更回调；返回清除守卫。
 #[cfg(test)]
-pub(crate) fn install_stat_read_mutator(mutator: Option<std::rc::Rc<dyn Fn(&Path)>>) -> impl Drop {
+pub(crate) fn install_stat_read_mutator(mutator: Option<StatReadMutator>) -> impl Drop {
     struct Guard;
     impl Drop for Guard {
         fn drop(&mut self) {
@@ -1626,7 +1629,7 @@ mod tests {
         std::fs::write(home.join(".ssh").join("id_rsa"), "PRIVATE").unwrap();
         std::fs::write(
             home.join("Downloads").join("trip.png"),
-            &[0x89, 0x50, 0x4e, 0x47],
+            [0x89, 0x50, 0x4e, 0x47],
         )
         .unwrap();
         let home_s = home.to_str().unwrap();

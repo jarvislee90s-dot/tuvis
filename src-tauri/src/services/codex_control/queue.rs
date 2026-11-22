@@ -1701,6 +1701,7 @@ impl ActionStore {
     /// mint_bypass_grant_attempt_checked`]；本入口保留给单元测试（签名/语义
     /// 不变）。
     #[cfg(test)]
+    #[expect(dead_code, reason = "保留单元测试用的 unchecked 入口")]
     pub(crate) fn mint_bypass_grant_attempt(
         &self,
         action_id: &str,

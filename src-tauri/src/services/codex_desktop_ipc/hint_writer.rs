@@ -399,19 +399,20 @@ mod tests {
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let (done_tx, done_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let mut old = BlockingSupervisor::new();
-        let db = conn.clone();
-        old.start(move || {
-            let c = db.lock().unwrap();
-            c.execute_batch("BEGIN IMMEDIATE; INSERT INTO t VALUES(1)")
-                .unwrap();
-            let _ = started_tx.send(());
-            let _ = release_rx.recv();
-            c.execute_batch("COMMIT").unwrap();
-            let _ = done_tx.send(());
-        });
-        started_rx.await.unwrap();
-        drop(old);
+        {
+            let mut old = BlockingSupervisor::new();
+            let db = conn.clone();
+            old.start(move || {
+                let c = db.lock().unwrap();
+                c.execute_batch("BEGIN IMMEDIATE; INSERT INTO t VALUES(1)")
+                    .unwrap();
+                let _ = started_tx.send(());
+                let _ = release_rx.recv();
+                c.execute_batch("COMMIT").unwrap();
+                let _ = done_tx.send(());
+            });
+            started_rx.await.unwrap();
+        }
         let mut replacement = BlockingSupervisor::new();
         let db2 = conn.clone();
         let accepted = replacement.start(move || {

@@ -9041,13 +9041,15 @@ async fn handle_broadcast(
 // ------------------------------------------------------------
 
 #[cfg(test)]
-static SOURCE_ACTOR_PAUSE_GATE: std::sync::Mutex<
-    Option<(
-        String,
-        tokio::sync::oneshot::Sender<()>,
-        tokio::sync::oneshot::Receiver<()>,
-    )>,
-> = std::sync::Mutex::new(None);
+type SourceActorPauseGate = (
+    String,
+    tokio::sync::oneshot::Sender<()>,
+    tokio::sync::oneshot::Receiver<()>,
+);
+
+#[cfg(test)]
+static SOURCE_ACTOR_PAUSE_GATE: std::sync::Mutex<Option<SourceActorPauseGate>> =
+    std::sync::Mutex::new(None);
 
 /// 驻停点：仅命中 armed 的 thread_id；一次性取走 gate 后等待 resume。
 #[cfg(test)]
@@ -10149,6 +10151,7 @@ mod dispatch_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[expect(clippy::await_holding_lock)]
     async fn b1_probe_stamp_does_not_wait_for_real_device_store() {
         use crate::remote::codex_ipc::StoreProbeLedger;
         use crate::remote::pairing::DeviceStore;
@@ -10169,6 +10172,7 @@ mod dispatch_tests {
             thread_id: "probe-test".into(),
         })
         .project(adapter.current_caps());
+        // 持锁等待 stamp 完成，验证真实设备库忙时读取状态仍能返回。
         let guard = db.lock().unwrap();
         let worker = adapter.clone();
         let mut stamp = tokio::spawn(async move { worker.stamp_probe_status(projection) });
@@ -10330,6 +10334,7 @@ mod dispatch_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[expect(clippy::await_holding_lock)]
     async fn b1_probe_record_db_wait_does_not_block_projection() {
         use crate::remote::codex_ipc::StoreProbeLedger;
         use crate::remote::pairing::DeviceStore;
@@ -10378,6 +10383,7 @@ mod dispatch_tests {
             thread_id: "probe-test".into(),
         })
         .project(adapter.current_caps());
+        // 让探针写入卡在数据库锁上，再验证 stamp 仍能完成。
         let guard = db.lock().unwrap();
         let writing = adapter.clone();
         let writer = tokio::task::spawn_blocking(move || {
@@ -14119,6 +14125,7 @@ mod b1_a22_contract_tests {
     /// `persist_authorized_hints`（调用方写穿）——首帧带待写事实 → 落库阻塞在
     /// 被占用的 DeviceStore 连接锁上 → 广播停滞。预期 RED。
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[expect(clippy::await_holding_lock)]
     async fn b1_slow_store_does_not_drop_broadcasts() {
         let (_dir, conn) = a22_isolated_db();
         let store = Arc::new(StoreInteractionHints::new(DeviceStore::Owned(conn.clone())));
@@ -14172,6 +14179,7 @@ mod b1_a22_contract_tests {
         });
 
         // 持有真实共享 DB 锁（std::sync::Mutex guard）期间投递 300 帧发布 + 尾标记。
+        // 保持落库受阻，直到记录广播和尾标记的接收结果。
         let guard = conn.lock().unwrap();
         let publisher = adapter.clone();
         let burst_key = key.clone();
@@ -14215,6 +14223,7 @@ mod b1_a22_contract_tests {
     /// `ensure_interaction_hints` 内联 await 冷加载，两条都会被占用的 DB 锁拖死。
     /// 预期 RED。
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[expect(clippy::await_holding_lock)]
     async fn b1_projection_never_waits_for_hint_db_lock() {
         let (_dir, conn) = a22_isolated_db();
         let store = Arc::new(StoreInteractionHints::new(DeviceStore::Owned(conn.clone())));
@@ -14240,6 +14249,7 @@ mod b1_a22_contract_tests {
         // 热线程占锁前装载；冷线程保持未装载。
         adapter.ensure_interaction_hints(&hot).await;
 
+        // 让热、冷线程的 projection 都在 hints 数据库锁被占用时完成。
         let guard = conn.lock().unwrap();
         let hot_done = tokio::time::timeout(Duration::from_secs(1), adapter.projection(&hot)).await;
         let cold_done =
@@ -14841,7 +14851,7 @@ mod b1_t101_handoff_tests {
             .await
             .insert(key.clone(), pre_mirror);
         let bootstrap_adapter = adapter.clone();
-        let bootstrap = tokio::spawn(async move { bootstrap_adapter.ensure_connection().await });
+        let _bootstrap = tokio::spawn(async move { bootstrap_adapter.ensure_connection().await });
         let mut peer = Peer::new(server);
         bootstrap_epoch(
             &adapter,
@@ -14917,7 +14927,7 @@ mod b1_t101_handoff_tests {
             .await
             .insert(key.clone(), pre_mirror);
         let bootstrap_adapter = adapter.clone();
-        let bootstrap = tokio::spawn(async move { bootstrap_adapter.ensure_connection().await });
+        let _bootstrap = tokio::spawn(async move { bootstrap_adapter.ensure_connection().await });
         let mut peer = Peer::new(server);
         bootstrap_epoch(
             &adapter,
@@ -15042,7 +15052,7 @@ mod b1_t101_handoff_tests {
             .await
             .insert(key.clone(), pre_mirror);
         let bootstrap_adapter = adapter.clone();
-        let bootstrap = tokio::spawn(async move { bootstrap_adapter.ensure_connection().await });
+        let _bootstrap = tokio::spawn(async move { bootstrap_adapter.ensure_connection().await });
         let mut peer = Peer::new(server);
         bootstrap_epoch(
             &adapter,
@@ -15113,6 +15123,7 @@ mod b1_t101_handoff_tests {
     /// 在 red-analysis.md 记录为未实现面；本用例钉住可观察面：在飞写不被
     /// abort、效果完整、worker 在 shutdown 后仍继续消费。
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[expect(clippy::await_holding_lock)]
     async fn b1_handoff_timeout_keeps_old_tasks_supervised() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("a4-handoff.sqlite");
@@ -15151,6 +15162,7 @@ mod b1_t101_handoff_tests {
             .capture_hint_observation(&key, &mirror, &[hand_question()])
             .expect("capture 必须可注册（写批来源）");
         // 慢写在飞：占用真实 DB 锁（std::sync::Mutex guard）。
+        // 让旧写入在关闭和任务让步期间仍卡在数据库锁上。
         let guard = conn.lock().unwrap();
         adapter.enqueue_persist_authorized_hints(authorized);
         // 3s 等待上界窗口：无受控等待面（合同点未实现），期间任务不得被 abort。

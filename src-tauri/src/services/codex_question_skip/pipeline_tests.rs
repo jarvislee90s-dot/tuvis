@@ -785,7 +785,10 @@ fn callback_in_flight_before_cached_identity_is_decoded_blocks_final_admission()
     assert_eq!(result.unwrap().native_effect, NativeEffect::Unresolved);
 }
 
-struct TokioGuardOwner(tokio::sync::OwnedMutexGuard<()>);
+struct TokioGuardOwner(
+    #[expect(dead_code, reason = "仅靠持有 guard 延续分发锁的生命周期")]
+    tokio::sync::OwnedMutexGuard<()>,
+);
 impl AttemptOwner for TokioGuardOwner {}
 
 #[test]

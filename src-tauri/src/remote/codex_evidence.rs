@@ -633,19 +633,19 @@ mod tests {
         assert!(
             matches!(lock_error, rusqlite::Error::SqliteFailure(ref error, _) if error.code == rusqlite::ErrorCode::DatabaseBusy)
         );
-        let blocked = ledger.write_batch(epoch, &[hint.clone()], 1, &permit);
+        let blocked = ledger.write_batch(epoch, std::slice::from_ref(&hint), 1, &permit);
         first.execute_batch("ROLLBACK").unwrap();
         assert_eq!(blocked, Err(HintStoreError::Storage));
         assert!(ledger.load("t").unwrap().is_empty());
         assert_eq!(
             ledger
-                .write_batch(epoch, &[hint.clone()], 2, &permit)
+                .write_batch(epoch, std::slice::from_ref(&hint), 2, &permit)
                 .unwrap(),
             vec![WriteOutcome::Applied(hint.clone())]
         );
         assert_eq!(
             ledger
-                .write_batch(epoch, &[hint.clone()], 3, &permit)
+                .write_batch(epoch, std::slice::from_ref(&hint), 3, &permit)
                 .unwrap(),
             vec![WriteOutcome::AlreadyCurrent(hint)]
         );
@@ -707,7 +707,7 @@ mod tests {
         unknown.version.sequence = 11;
         assert_eq!(
             ledger
-                .write_batch(epoch, &[answered.clone()], 1, &permit)
+                .write_batch(epoch, std::slice::from_ref(&answered), 1, &permit)
                 .unwrap(),
             vec![WriteOutcome::Applied(answered.clone())]
         );

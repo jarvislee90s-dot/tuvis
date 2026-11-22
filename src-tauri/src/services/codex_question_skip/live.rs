@@ -63,6 +63,7 @@ pub(crate) enum LiveRefusal {
     ScopeChanged,
     /// 目标题存在持久或在途占位（含无 actionId 占位）。
     #[cfg(test)]
+    #[expect(dead_code, reason = "保留测试专用的占位拒绝变体")]
     Blocked,
     /// 来源原料不健康：stale/预算拒绝/覆盖未知/解析拒绝。
     SourceIncomplete,
