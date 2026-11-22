@@ -505,32 +505,39 @@ fn codex_session(id: &str) -> Session {
     }
 }
 
+/// 两种会话源共读同一份夹具，B-R1 可在 hub 启动后更新会话。
+type SessionHolder = Arc<StdMutex<Vec<Session>>>;
+
 fn remote_state(
     conn: &SharedConn,
     hub: Arc<CodexControlHub>,
     sessions: Vec<Session>,
 ) -> Arc<RemoteState> {
+    remote_state_with_holder(conn, hub, &Arc::new(StdMutex::new(sessions)))
+}
+
+fn remote_state_with_holder(
+    conn: &SharedConn,
+    hub: Arc<CodexControlHub>,
+    sessions: &SessionHolder,
+) -> Arc<RemoteState> {
+    let read = |holder: &SessionHolder| {
+        let list = holder.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        SessionsResponse {
+            total_count: list.len(),
+            sessions: list,
+            waiting_count: 0,
+        }
+    };
+    let sessions_for_source = sessions.clone();
+    let sessions_for_fresh = sessions.clone();
     Arc::new(RemoteState {
         ui_config_source: Box::new(|| None),
         subagent_source: std::collections::HashMap::new(),
         subagent_message_source: std::collections::HashMap::new(),
         capability_table: crate::inject::capability::new_table(),
-        session_source: {
-            let sessions = sessions.clone();
-            Box::new(move || SessionsResponse {
-                total_count: sessions.len(),
-                sessions: sessions.clone(),
-                waiting_count: 0,
-            })
-        },
-        fresh_session_source: {
-            let sessions = sessions.clone();
-            Box::new(move || SessionsResponse {
-                total_count: sessions.len(),
-                sessions: sessions.clone(),
-                waiting_count: 0,
-            })
-        },
+        session_source: Box::new(move || read(&sessions_for_source)),
+        fresh_session_source: Box::new(move || read(&sessions_for_fresh)),
         pairing_counter: Box::new(Vec::new),
         board_hidden_ids: Box::new(Vec::new),
         board_hidden_hide: Arc::new(|_| 0usize),
@@ -898,6 +905,16 @@ fn profile_macos() -> ProtocolProfile {
 }
 
 fn fixture_with_fake(emit_removal: bool, witness: bool) -> VerticalFixture {
+    let sessions = Arc::new(StdMutex::new(vec![codex_session(THREAD)]));
+    fixture_with_fake_holder(emit_removal, witness, &sessions)
+}
+
+/// Fake 工厂 + holder 会话源变体（B-R1 用）：初始会话表为空，start 之后再注入。
+fn fixture_with_fake_holder(
+    emit_removal: bool,
+    witness: bool,
+    sessions: &SessionHolder,
+) -> VerticalFixture {
     let conn = shared_conn();
     seed_device(&conn, DEVICE);
     let probe = Arc::new(NativeProbe::default());
@@ -913,8 +930,7 @@ fn fixture_with_fake(emit_removal: bool, witness: bool) -> VerticalFixture {
         witness,
         probe: Arc::clone(&probe),
     });
-    // 私有装配缝（B3 注入点）：本模块是 codex_ipc 的子模块，可直接调用私有
-    // `with_parts_inner`——Fake 工厂由此进入 NativeDiscovery。
+    // 私有装配缝：Fake 工厂经 `with_parts_inner` 进入 NativeDiscovery。
     let hub = Arc::new(CodexControlHub::with_parts_inner(
         DeviceStore::Owned(conn.clone()),
         adapter,
@@ -924,7 +940,7 @@ fn fixture_with_fake(emit_removal: bool, witness: bool) -> VerticalFixture {
         Some(factories),
     ));
     let live = hub.question_skip_live();
-    let state = remote_state(&conn, Arc::clone(&hub), vec![codex_session(THREAD)]);
+    let state = remote_state_with_holder(&conn, Arc::clone(&hub), sessions);
     let app = router(Arc::clone(&state));
     VerticalFixture {
         conn,
@@ -1898,109 +1914,6 @@ async fn m4b_pair_writes_device_fact_on_real_upsert_target() {
 // ===========================================================================
 // B-R1（main review）：真实 start 后新线程的全事实装载 → 绑定 skip 可达
 // ===========================================================================
-
-/// 会话集共享单元：启动后注入会话用（与 tests/codex_question_skip_remote.rs 的
-/// `set_sessions` 手法同源——session_source/fresh_session_source 读同一 holder）。
-type SessionHolder = Arc<StdMutex<Vec<Session>>>;
-
-/// 与 `remote_state` 同形，但会话两源改读共享 holder（启动后可注入）。
-fn remote_state_with_holder(
-    conn: &SharedConn,
-    hub: Arc<CodexControlHub>,
-    sessions: &SessionHolder,
-) -> Arc<RemoteState> {
-    let read = |holder: &SessionHolder| {
-        let list = holder.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        SessionsResponse {
-            total_count: list.len(),
-            sessions: list,
-            waiting_count: 0,
-        }
-    };
-    let sessions_for_source = sessions.clone();
-    let sessions_for_fresh = sessions.clone();
-    Arc::new(RemoteState {
-        ui_config_source: Box::new(|| None),
-        subagent_source: std::collections::HashMap::new(),
-        subagent_message_source: std::collections::HashMap::new(),
-        capability_table: crate::inject::capability::new_table(),
-        session_source: Box::new(move || read(&sessions_for_source)),
-        fresh_session_source: Box::new(move || read(&sessions_for_fresh)),
-        pairing_counter: Box::new(Vec::new),
-        board_hidden_ids: Box::new(Vec::new),
-        board_hidden_hide: Arc::new(|_| 0usize),
-        board_hidden_unhide: Arc::new(|_| 0usize),
-        unread_mark_read: Arc::new(|_, _| ()),
-        session_close: Arc::new(|_| Ok(())),
-        store: DeviceStore::Owned(conn.clone()),
-        host_source: Box::new(|| json!({ "host": { "name": "t" } })),
-        message_source: Box::new(|_, _, _| Err("test stub: no content".to_string())),
-        path_source: Box::new(|_, _, _| (Vec::new(), false)),
-        watcher_tx: tokio::sync::broadcast::channel(64).0,
-        sse_registry: Arc::new(SseRegistry::default()),
-        max_devices_source: Box::new(|| 3),
-        pin_limiter: StdMutex::new(crate::remote::pin::PinRateLimiter::new()),
-        global_pin_limiter: StdMutex::new(crate::remote::pin::PinRateLimiter::global()),
-        pin_source: Box::new(|| Some("1234".to_string())),
-        now_source: Box::new(|| chrono::Utc::now().timestamp_millis()),
-        via_hosts_source: Box::new(|| None),
-        rate_bucket_channels_source: Box::new(Vec::new),
-        home_source: Box::new(|| None),
-        injector: Arc::new(crate::inject::engine::RealInjector),
-        resume_spawner: Arc::new(|_: &crate::inject::resume::SpawnSpec| Ok(())),
-        create_hub: Arc::new(CreateTaskHub::stub()),
-        archive_source: Box::new(Vec::new),
-        archive_delete: Arc::new(|_: Option<&str>| 0usize),
-        confirm_probe: Arc::new(|_, _, _| true),
-        dialog_probe: Arc::new(|_, _| None),
-        screen_probe: Arc::new(|_, _| None),
-        codex_control: hub,
-        desktop_language: Default::default(),
-    })
-}
-
-/// Fake 工厂 + holder 会话源变体（B-R1 用）：初始会话表为空，start 之后再注入。
-fn fixture_with_fake_holder(
-    emit_removal: bool,
-    witness: bool,
-    sessions: &SessionHolder,
-) -> VerticalFixture {
-    let conn = shared_conn();
-    seed_device(&conn, DEVICE);
-    let probe = Arc::new(NativeProbe::default());
-    let dispatch = Arc::new(CountingDispatch::default());
-    let adapter = Arc::new(DesktopIpcAdapter::new(
-        Arc::new(NoopConnector),
-        profile_macos(),
-    ));
-    let factories: Arc<dyn DiscoveryFactories> = Arc::new(FakeNative {
-        windows: vec![discovered_window()],
-        card: weather_card(),
-        emit_removal,
-        witness,
-        probe: Arc::clone(&probe),
-    });
-    let hub = Arc::new(CodexControlHub::with_parts_inner(
-        DeviceStore::Owned(conn.clone()),
-        adapter,
-        dispatch.clone(),
-        None,
-        true,
-        Some(factories),
-    ));
-    let live = hub.question_skip_live();
-    let state = remote_state_with_holder(&conn, Arc::clone(&hub), sessions);
-    let app = router(Arc::clone(&state));
-    VerticalFixture {
-        conn,
-        hub,
-        state,
-        app,
-        live,
-        probe,
-        dispatch,
-    }
-}
 
 /// B-R1 主锁（main review 验收）：**真实 `hub.start`**（空会话表）之后出现的新
 /// codex 线程，其 Claims/Stop 事实必须在权威解析/首次使用时装载——绑定 skip 全链

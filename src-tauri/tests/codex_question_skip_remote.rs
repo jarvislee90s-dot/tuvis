@@ -24,6 +24,12 @@
 
 mod support;
 
+#[path = "support/codex_ipc_peer.rs"]
+mod codex_ipc_peer;
+use codex_ipc_peer::{
+    discovery_response, peer_has_traffic, ScriptedPeer, StaticConnector, TEST_BUILD,
+};
+
 #[path = "support/codex_fixture.rs"]
 mod codex_fixture;
 
@@ -32,15 +38,9 @@ use multi_agents_manager_lib::remote::pairing::{
     persist_device, revoke_device, DeviceStore, NewDevice,
 };
 use multi_agents_manager_lib::remote::server::{router, CreateTaskHub, RemoteState, SseRegistry};
-use multi_agents_manager_lib::services::codex_desktop_ipc::adapter::{
-    Connector, DesktopIpcAdapter,
-};
-use multi_agents_manager_lib::services::codex_desktop_ipc::codec::{encode_frame, FrameDecoder};
+use multi_agents_manager_lib::services::codex_desktop_ipc::adapter::DesktopIpcAdapter;
 use multi_agents_manager_lib::services::codex_desktop_ipc::profile::{
     profile_for, ProtocolProfile,
-};
-use multi_agents_manager_lib::services::codex_desktop_ipc::transport::{
-    BoxIo, DesktopEndpoint, IpcIo,
 };
 use multi_agents_manager_lib::session::{
     AgentType, ProcessForm, Session, SessionStatus, SessionsResponse,
@@ -48,7 +48,6 @@ use multi_agents_manager_lib::session::{
 use sha2::{Digest, Sha256};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 use tower::ServiceExt as _;
 
 // ===========================================================================
@@ -168,116 +167,8 @@ fn confirm_body(group: &serde_json::Value, challenge: &str) -> serde_json::Value
     })
 }
 
-// ===========================================================================
-// 假 Desktop IPC（duplex 帧级 peer；与 codex_ipc_remote 同构，绝不触真机）
-// ===========================================================================
-
-struct ScriptedPeer {
-    io: DuplexStream,
-    backlog: std::collections::VecDeque<serde_json::Value>,
-}
-
-impl ScriptedPeer {
-    fn new() -> (Box<dyn IpcIo>, Self) {
-        let (client, server) = tokio::io::duplex(64 * 1024);
-        (
-            Box::new(client),
-            Self {
-                io: server,
-                backlog: std::collections::VecDeque::new(),
-            },
-        )
-    }
-
-    async fn recv(&mut self) -> serde_json::Value {
-        if let Some(f) = self.backlog.pop_front() {
-            return f;
-        }
-        let mut decoder = FrameDecoder::new();
-        let mut buf = vec![0u8; 16 * 1024];
-        loop {
-            let n = self.io.read(&mut buf).await.expect("peer read");
-            assert!(n > 0, "peer EOF");
-            let mut frames = decoder.push(&buf[..n]).expect("decode");
-            if frames.is_empty() {
-                continue;
-            }
-            let first = frames.remove(0);
-            for f in frames {
-                self.backlog.push_back(f);
-            }
-            return first;
-        }
-    }
-
-    async fn send(&mut self, value: &serde_json::Value) {
-        let frame = encode_frame(value).expect("encode");
-        self.io.write_all(&frame).await.expect("peer write");
-    }
-}
-
-/// R3 起 adapter 每次连接按 endpoint 重算 profile：假 Desktop 自报已验证 build。
-const TEST_BUILD: &str = "26.1013.3656.0";
-
-struct StaticConnector {
-    endpoint: DesktopEndpoint,
-    io: StdMutex<Option<Box<dyn IpcIo>>>,
-}
-
-impl StaticConnector {
-    fn new(io: Box<dyn IpcIo>) -> Self {
-        Self {
-            endpoint: DesktopEndpoint {
-                platform: "windows".into(),
-                path: "\\\\.\\pipe\\codex-ipc-test-fixture".into(),
-                build: Some(TEST_BUILD.into()),
-            },
-            io: StdMutex::new(Some(io)),
-        }
-    }
-}
-
-impl Connector for StaticConnector {
-    fn connect_endpoint(
-        &self,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<
-                    Output = Result<
-                        (BoxIo, DesktopEndpoint),
-                        multi_agents_manager_lib::services::codex_desktop_ipc::types::ProtocolError,
-                    >,
-                > + Send
-                + '_,
-        >,
-    > {
-        Box::pin(async move {
-            let io = self
-                .io
-                .lock()
-                .expect("lock")
-                .take()
-                .ok_or_else(|| {
-                    multi_agents_manager_lib::services::codex_desktop_ipc::types::ProtocolError::Disconnected(
-                        "no io".into(),
-                    )
-                })?;
-            Ok((io, self.endpoint.clone()))
-        })
-    }
-}
-
 fn caps_open_profile() -> ProtocolProfile {
     profile_for("windows", TEST_BUILD).expect("shipped build profile")
-}
-
-async fn discovery_response(request_id: &str, owner: &str) -> serde_json::Value {
-    serde_json::json!({
-        "type": "response", "requestId": request_id,
-        "resultType": "success", "method": "thread-owner-discovery",
-        "handledByClientId": owner,
-        "result": { "supportsUntrustedAppInput": true }
-    })
 }
 
 /// 单题 agentMessage 的真实 canonical 历史（isComplete=true）。
@@ -522,8 +413,11 @@ impl Fixture {
         .await;
         let disc = peer.recv().await;
         assert_eq!(disc["method"], "thread-owner-discovery");
-        peer.send(&discovery_response(disc["requestId"].as_str().unwrap(), "owner-1").await)
-            .await;
+        peer.send(&discovery_response(
+            disc["requestId"].as_str().unwrap(),
+            "owner-1",
+        ))
+        .await;
         let follow = peer.recv().await;
         assert_eq!(follow["method"], "thread-stream-following-changed");
         peer.send(&snapshot_frame(entities, turn_ids)).await;
@@ -605,48 +499,13 @@ fn single_group(projection: &serde_json::Value) -> (serde_json::Value, i64) {
     )
 }
 
-/// 有界收帧（容忍对端 EOF：连接已关时读到 EOF = 此后不会再有任何帧；用于
-/// `hub.stop()` 之后的「零 Invoke」断言，不让 EOF 伪装成测试骨架崩溃）。
-async fn recv_or_eof(peer: &mut ScriptedPeer) -> Option<serde_json::Value> {
-    if let Some(f) = peer.backlog.pop_front() {
-        return Some(f);
-    }
-    let mut decoder = FrameDecoder::new();
-    let mut buf = vec![0u8; 16 * 1024];
-    loop {
-        match tokio::time::timeout(Duration::from_millis(150), peer.io.read(&mut buf)).await {
-            Err(_) | Ok(Err(_)) | Ok(Ok(0)) => return None,
-            Ok(Ok(n)) => {
-                let mut frames = decoder.push(&buf[..n]).ok()?;
-                if frames.is_empty() {
-                    continue;
-                }
-                let first = frames.remove(0);
-                for f in frames {
-                    peer.backlog.push_back(f);
-                }
-                return Some(first);
-            }
-        }
-    }
-}
-
 /// 有界排空假 Desktop 已到达的帧（用于「零写入帧」断言）。
 async fn drain_frames(peer: &mut ScriptedPeer) -> Vec<serde_json::Value> {
     let mut frames = Vec::new();
-    while let Some(frame) = recv_or_eof(peer).await {
+    while let Some(frame) = peer.recv_or_eof().await {
         frames.push(frame);
     }
     frames
-}
-
-/// 有界探测 peer 是否收到任何字节。
-async fn peer_has_traffic(peer: &mut ScriptedPeer) -> bool {
-    let mut buf = vec![0u8; 1024];
-    matches!(
-        tokio::time::timeout(Duration::from_millis(300), peer.io.read(&mut buf)).await,
-        Ok(Ok(n)) if n > 0
-    )
 }
 
 /// 出现即视为「额外原生/消息副作用」的 IPC 方法（E7）。

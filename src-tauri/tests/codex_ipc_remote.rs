@@ -12,6 +12,13 @@ use multi_agents_manager_lib::remote::codex_ipc::CodexControlHub;
 #[path = "support/codex_fixture.rs"]
 mod codex_fixture;
 mod support;
+
+#[path = "support/codex_ipc_peer.rs"]
+mod codex_ipc_peer;
+use codex_ipc_peer::{
+    count_start_turn_frames, discovery_response, peer_has_traffic, ScriptedPeer, StaticConnector,
+    TEST_BUILD,
+};
 use multi_agents_manager_lib::database::dao::codex_ipc_probe::ProbeState;
 use multi_agents_manager_lib::remote::pairing::{
     persist_device, revoke_device, DeviceStore, NewDevice,
@@ -24,158 +31,18 @@ use multi_agents_manager_lib::services::codex_control::{
 use multi_agents_manager_lib::services::codex_desktop_ipc::adapter::{
     Connector, DesktopIpcAdapter,
 };
-use multi_agents_manager_lib::services::codex_desktop_ipc::codec::{encode_frame, FrameDecoder};
 use multi_agents_manager_lib::services::codex_desktop_ipc::probe::runner::ProbeOutcome;
 use multi_agents_manager_lib::services::codex_desktop_ipc::probe::{ProbeLedger, ProbeLedgerEntry};
 use multi_agents_manager_lib::services::codex_desktop_ipc::profile::{
     profile_for, ProtocolProfile,
 };
-use multi_agents_manager_lib::services::codex_desktop_ipc::transport::{BoxIo, IpcIo};
 use multi_agents_manager_lib::session::{
     AgentType, ProcessForm, Session, SessionStatus, SessionsResponse,
 };
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
+use tokio::io::DuplexStream;
 use tower::ServiceExt as _;
-
-// ============================================================
-// 假 Desktop IPC：duplex 帧级 peer（与 codex_desktop_ipc 测试同构）
-// ============================================================
-
-struct ScriptedPeer {
-    io: DuplexStream,
-    backlog: std::collections::VecDeque<serde_json::Value>,
-}
-
-impl ScriptedPeer {
-    fn new() -> (Box<dyn IpcIo>, Self) {
-        let (client, server) = tokio::io::duplex(64 * 1024);
-        (
-            Box::new(client),
-            Self {
-                io: server,
-                backlog: std::collections::VecDeque::new(),
-            },
-        )
-    }
-
-    async fn recv(&mut self) -> serde_json::Value {
-        if let Some(f) = self.backlog.pop_front() {
-            return f;
-        }
-        let mut decoder = FrameDecoder::new();
-        let mut buf = vec![0u8; 16 * 1024];
-        loop {
-            let n = self.io.read(&mut buf).await.expect("peer read");
-            assert!(n > 0, "peer EOF");
-            let mut frames = decoder.push(&buf[..n]).expect("decode");
-            if frames.is_empty() {
-                continue;
-            }
-            let first = frames.remove(0);
-            for f in frames {
-                self.backlog.push_back(f);
-            }
-            return first;
-        }
-    }
-
-    async fn send(&mut self, value: &serde_json::Value) {
-        let frame = encode_frame(value).expect("encode");
-        self.io.write_all(&frame).await.expect("peer write");
-    }
-
-    fn close(self) {
-        drop(self.io);
-    }
-
-    /// 对端断链（EOF）——**保留 peer 本体**：断链后仍可断言「没有第二帧」
-    /// （`close` 消费 self，断链后就没法再读帧了）。
-    fn eof(&mut self) {
-        let (client, server) = tokio::io::duplex(64 * 1024);
-        drop(server); // 对端消失 → 本端读到 EOF
-        self.io = client; // 旧 io 随赋值丢弃 → 适配器那侧同步见 EOF
-    }
-}
-
-struct StaticConnector {
-    endpoint: multi_agents_manager_lib::services::codex_desktop_ipc::transport::DesktopEndpoint,
-    io: StdMutex<Option<Box<dyn IpcIo>>>,
-}
-
-/// R3 起 adapter 每次连接按 endpoint 重算 profile——假 Desktop 必须自报**已验证
-/// build** 的 endpoint 身份，能力由生产 `profile_for(platform, build)` 派生（绝不注入
-/// 固定 profile 替代 resolver 链）。选 windows 已验证 build：send+state+command+
-/// blocking_input 全开（本套件的审批/作答分派链全覆盖；permissions 未实测档与本
-/// 套件无分派交集）。
-const TEST_BUILD: &str = "26.1013.3656.0";
-
-impl StaticConnector {
-    fn new(io: Box<dyn IpcIo>) -> Self {
-        Self::with_build(io, TEST_BUILD)
-    }
-
-    /// 自报 build 身份（未知 build 用例用）：能力由生产 `profile_for` 派生——
-    /// 未命中 shipped 表 → 「尚无证据」档（写能力未取证）。
-    fn with_build(io: Box<dyn IpcIo>, build: &str) -> Self {
-        Self {
-            endpoint:
-                multi_agents_manager_lib::services::codex_desktop_ipc::transport::DesktopEndpoint {
-                    platform: "windows".into(),
-                    path: "\\\\.\\pipe\\codex-ipc-test-fixture".into(),
-                    build: Some(build.into()),
-                },
-            io: StdMutex::new(Some(io)),
-        }
-    }
-
-    /// 打断能力 fixture 用：自报**已开启 `interrupt` 的**已验证 build
-    /// （macOS `26.1013.40934`——2026-10-21 真机协议取证：直连真实 Desktop 的
-    /// `thread-follower-interrupt-turn` v4，回包 `{interruptedTurnId:null, ok:true}`
-    /// 且安全阀生效未打断任何回合 → 方法名/版本/参数形态/owner 路由全对）。
-    /// 能力由生产 `profile_for(platform, build)` 派生，**不注入固定 profile**。
-    fn new_interrupt(io: Box<dyn IpcIo>) -> Self {
-        Self {
-            endpoint:
-                multi_agents_manager_lib::services::codex_desktop_ipc::transport::DesktopEndpoint {
-                    platform: "macos".into(),
-                    path: "/tmp/codex-ipc-test-fixture.sock".into(),
-                    build: Some("26.1013.40934".into()),
-                },
-            io: StdMutex::new(Some(io)),
-        }
-    }
-}
-
-impl Connector for StaticConnector {
-    fn connect_endpoint(
-        &self,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<
-                    Output = Result<
-                        (
-                            BoxIo,
-                            multi_agents_manager_lib::services::codex_desktop_ipc::transport::DesktopEndpoint,
-                        ),
-                        multi_agents_manager_lib::services::codex_desktop_ipc::types::ProtocolError,
-                    >,
-                > + Send
-                + '_,
-        >,
-    >{
-        Box::pin(async move {
-            let io = self
-                .io
-                .lock()
-                .expect("lock")
-                .take()
-                .ok_or_else(|| multi_agents_manager_lib::services::codex_desktop_ipc::types::ProtocolError::Disconnected("no io".into()))?;
-            Ok((io, self.endpoint.clone()))
-        })
-    }
-}
 
 /// 构造期基线 profile（R3：仅首个连接前生效，连接后按 endpoint 重算——同值）。
 fn caps_open_profile(
@@ -192,15 +59,6 @@ async fn handshake(peer: &mut ScriptedPeer, client_id: &str) {
         "handledByClientId": client_id, "result": { "clientId": client_id }
     }))
     .await;
-}
-
-fn discovery_response(request_id: &str, owner: &str) -> serde_json::Value {
-    serde_json::json!({
-        "type": "response", "requestId": request_id,
-        "resultType": "success", "method": "thread-owner-discovery",
-        "handledByClientId": owner,
-        "result": { "supportsUntrustedAppInput": true }
-    })
 }
 
 /// 驱动 ensure_thread 全程：initialize → discovery → following → snapshot。
@@ -251,15 +109,6 @@ async fn drive_ensure_before_snapshot(
         }
     }))
     .await;
-}
-
-/// 有界探测 peer 是否收到任何字节（true = 有流量；「零写入」断言要求 false）。
-async fn peer_has_traffic(peer: &mut ScriptedPeer) -> bool {
-    let mut buf = vec![0u8; 1024];
-    matches!(
-        tokio::time::timeout(Duration::from_millis(300), peer.io.read(&mut buf)).await,
-        Ok(Ok(n)) if n > 0
-    )
 }
 
 /// 排空当前已到达的帧（有界）；用于"没有某类写帧"的断言（握手/快照帧不算）。
@@ -5256,7 +5105,7 @@ async fn hub_stop_closes_connection_and_blocks_reconnect_until_start() {
     );
     tokio::time::sleep(Duration::from_millis(300)).await;
     let mut buf = vec![0u8; 64];
-    let n = tokio::time::timeout(Duration::from_secs(5), peer.io.read(&mut buf))
+    let n = tokio::time::timeout(Duration::from_secs(5), peer.read_bytes(&mut buf))
         .await
         .expect("eof in time")
         .expect("read ok");
@@ -5671,7 +5520,7 @@ async fn lower_revision_from_new_owner_still_releases() {
         first["method"], "thread-follower-start-turn",
         "业务先到序首帧不符：{first}"
     );
-    peer.backlog.push_front(first);
+    peer.unread_frame(first);
     let frame2 = recv_frame_servicing_reconcile_discovery(
         &mut peer,
         "thread-follower-start-turn",
@@ -6892,35 +6741,6 @@ fn send_probe_rows(f: &Fixture) -> Vec<(String, String, Option<String>)> {
     .unwrap()
     .filter_map(|r| r.ok())
     .collect()
-}
-
-/// peer 后续还会收到的 `thread-follower-start-turn` 帧数（backlog + 新帧，读到
-/// EOF/超时为止）——「不得重发」的帧数断言。
-async fn count_start_turn_frames(peer: &mut ScriptedPeer) -> usize {
-    let mut count = 0;
-    for f in peer.backlog.drain(..) {
-        if f["method"] == "thread-follower-start-turn" {
-            count += 1;
-        }
-    }
-    let mut decoder = FrameDecoder::new();
-    let mut buf = vec![0u8; 16 * 1024];
-    loop {
-        let n = match tokio::time::timeout(Duration::from_millis(300), peer.io.read(&mut buf)).await
-        {
-            Ok(Ok(n)) => n,
-            _ => break,
-        };
-        if n == 0 {
-            break; // EOF
-        }
-        for f in decoder.push(&buf[..n]).expect("decode") {
-            if f["method"] == "thread-follower-start-turn" {
-                count += 1;
-            }
-        }
-    }
-    count
 }
 
 #[tokio::test]
@@ -9871,10 +9691,7 @@ async fn idle_takeover_writer_frame_pending_after_router_settlement_keeps_serial
     let mut f = fixture_with(
         vec![codex_app_session(THREAD)],
         move |store| Arc::new(CodexControlHub::with_adapter(store, adapter, true)),
-        Some(ScriptedPeer {
-            io: server,
-            backlog: Default::default(),
-        }),
+        Some(ScriptedPeer::from_stream(server)),
     );
     let mut peer = f.peer.take().unwrap();
     let (sse, _) = sse_hold_ensure(&f, &mut peer, THREAD, vec![], "idle").await;
@@ -11518,10 +11335,7 @@ async fn takeover_lifecycle_postwrite_front_cancel_keeps_single_writer() {
     let mut f = fixture_with(
         vec![codex_app_session(THREAD)],
         move |store| Arc::new(CodexControlHub::with_adapter(store, adapter, true)),
-        Some(ScriptedPeer {
-            io: server,
-            backlog: Default::default(),
-        }),
+        Some(ScriptedPeer::from_stream(server)),
     );
     let (mut peer, _) = verified_prepare_unknown(&mut f).await;
     for (id, text) in [
@@ -12440,7 +12254,8 @@ async fn orphan_book_commit_memory_gap_recovers_idempotently() {
                 };
                 let mut probe = [0u8; 1];
                 let peer_status =
-                    tokio::time::timeout(Duration::from_millis(20), peer.io.read(&mut probe)).await;
+                    tokio::time::timeout(Duration::from_millis(20), peer.read_bytes(&mut probe))
+                        .await;
                 panic!("B frame timeout: settle_done={done} result={result:?} action={action:?} grants={grants} pause={pause:?} fence={fence:?} owner_a={:?} owner_b={:?} projection_revision={:?} stale={} runtime={} active_turn={:?} pending={:?} peer_read={peer_status:?}",
                     f.state.codex_control.router.observe_turn_owner(&key, "act-verified-old"),
                     f.state.codex_control.router.observe_turn_owner(&key, "act-verified-next"),
@@ -19921,7 +19736,7 @@ async fn b6_assert_one_formal_blocking_answer(answers: serde_json::Value) {
     assert_eq!(response.status(), 200);
     let receipt: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
     assert_eq!(receipt["delivery"], "accepted", "{receipt}");
-    assert!(peer.backlog.is_empty(), "答题帧后有合并读取的额外帧");
+    assert!(peer.backlog_is_empty(), "答题帧后有合并读取的额外帧");
     assert!(!peer_has_traffic(&mut peer).await, "只应有一个正式答题帧");
 }
 
@@ -19968,7 +19783,7 @@ async fn b6_blocking_unverified_submit_authority_rejects_with_zero_frames() {
         receipt["reasonCode"], "operation_contract_unmatched",
         "{receipt}"
     );
-    assert!(peer.backlog.is_empty(), "未核验路径存在合并读取的额外帧");
+    assert!(peer.backlog_is_empty(), "未核验路径存在合并读取的额外帧");
     assert!(
         !peer_has_traffic(&mut peer).await,
         "未核验的答题能力必须零派发"
@@ -29322,7 +29137,7 @@ async fn stop_reconnect_and_late_worker_preserve_other_consumers() {
         .unwrap()
         .unwrap());
     let (io2, mut peer2) = ScriptedPeer::new();
-    *connector.io.lock().unwrap() = Some(io2);
+    connector.replace_io(io2);
     peer.eof();
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {

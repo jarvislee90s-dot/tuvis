@@ -4,105 +4,28 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import i18n from "@/i18n";
 import SessionDetail from "@/mobile/SessionDetail";
 import type { PendingView } from "@/mobile/codexIpcApi";
-import type { Session } from "@/types/session";
 import { MockEventSource } from "./eventSourceMock";
+import { questionSkipDetailFixture, questionSkipViews } from "./questionSkipFixtures";
 
-const session: Session = {
-  id: "skip-session",
-  agentType: "codex",
-  projectName: "proj",
-  projectPath: "/tmp/proj",
-  title: "codex",
-  gitBranch: null,
-  githubUrl: null,
-  status: "idle",
-  lastMessage: null,
-  lastMessageRole: null,
-  lastMessageSubagentReport: false,
-  flapFromSubagentActivity: false,
-  lastActivityAt: "2026-10-20T00:00:00Z",
-  pid: 1,
-  cpuUsage: 0,
-  activeSubagentCount: 0,
-  form: "app",
-  jumpSupported: false,
-  unread: false,
-};
-const group = {
-  threadId: "thread-1",
-  sourceTurnId: "turn",
-  sourceItemId: "item",
-  contentGeneration: "gen-1",
-};
-const q = {
+const { group, active, skipped: display } = questionSkipViews("thread-1", "gen-1", 1);
+const {
+  question: q,
+  session: makeSession,
+  projection,
+  detailFetch,
+} = questionSkipDetailFixture(group, {
   questionKey: "q",
-  contextToken: "token",
-  sourceTurnId: "turn",
-  sourceItemId: "item",
-  questionIndex: 0,
   title: "Skip test question",
   options: ["A"],
-  state: "pending",
-  actionable: true,
-  disabledReasonCode: null,
-};
-const display = {
-  group,
-  revision: 1,
-  decision: "skipped",
-  latestNativeEffect: "unresolved",
-  reasonCode: null,
-  sourceComplete: true,
-  sourceQuestionCount: 1,
-};
-const projection = (extra: Record<string, unknown>) =>
-  Object.assign(
-    {
-      threadId: "thread-1",
-      revision: 5,
-      stale: false,
-      availability: "controllable",
-      capabilities: {
-        send: true,
-        state: true,
-        command: true,
-        permissions: false,
-        blockingInput: true,
-      },
-      runtimeStatus: "idle",
-      contentState: "ready",
-      messages: [],
-      truncated: false,
-      pending: [],
-      asyncQuestions: [q],
-    },
-    extra
-  );
+});
+const session = makeSession("skip-session");
 
 beforeEach(() => {
   MockEventSource.reset();
   vi.stubGlobal("EventSource", MockEventSource as unknown as typeof EventSource);
   vi.stubGlobal(
     "fetch",
-    vi.fn(async (input: RequestInfo | URL) => {
-      const url = String(input);
-      const body = url.includes("/codex/thread")
-        ? projection({})
-        : url.includes("/codex/queue")
-          ? { actions: [], blockedReasonCode: null }
-          : url.includes("/session-messages")
-            ? { messages: [], truncated: false }
-            : url.includes("/session-subagents")
-              ? { subagents: [] }
-              : url.includes("/session-files")
-                ? { files: [], truncated: false }
-                : url.includes("/session-queue")
-                  ? { items: [] }
-                  : url.includes("/session-send-info")
-                    ? { injectable: true, channels: [], visibility: "realtime" }
-                    : {};
-      return new Response(JSON.stringify(body), { status: 200 });
-    })
+    vi.fn(async (input: RequestInfo | URL) => detailFetch(input))
   );
 });
 afterEach(() => {
@@ -140,7 +63,7 @@ describe("skip projection in the real session detail", () => {
       <SessionDetail session={{ ...session, id: "detail-invalid-overlay" }} onBack={() => {}} />
     );
     const es = await waitFor(() => MockEventSource.latest());
-    const activeDisplay = { ...display, revision: 0, decision: "active", latestNativeEffect: null };
+    const activeDisplay = active;
     act(() =>
       es.emit(
         "snapshot",
@@ -167,13 +90,7 @@ describe("skip projection in the real session detail", () => {
       <SessionDetail session={{ ...session, id: "detail-old-generation" }} onBack={() => {}} />
     );
     const es = await waitFor(() => MockEventSource.latest());
-    const newDisplay = {
-      ...display,
-      group: { ...group, contentGeneration: "gen-2" },
-      revision: 0,
-      decision: "active",
-      latestNativeEffect: null,
-    };
+    const newDisplay = { ...active, group: { ...group, contentGeneration: "gen-2" } };
     act(() =>
       es.emit(
         "snapshot",
@@ -254,7 +171,7 @@ describe("skip projection in the real session detail", () => {
   it("keeps higher display revisions over lower history and permits newer equal-revision observations", async () => {
     render(<SessionDetail session={{ ...session, id: "ledger-display-high" }} onBack={() => {}} />);
     const es = await waitFor(() => MockEventSource.latest());
-    const current = { ...display, revision: 5, decision: "active", latestNativeEffect: null };
+    const current = { ...active, revision: 5 };
     const old = { ...display, revision: 2, question: null };
     act(() =>
       es.emit(
@@ -292,7 +209,7 @@ describe("skip projection in the real session detail", () => {
   it("keeps higher history revisions over a lower display and ignores a lower-revision native update", async () => {
     render(<SessionDetail session={{ ...session, id: "ledger-history-high" }} onBack={() => {}} />);
     const es = await waitFor(() => MockEventSource.latest());
-    const oldActive = { ...display, revision: 2, decision: "active", latestNativeEffect: null };
+    const oldActive = { ...active, revision: 2 };
     const high = { ...display, revision: 5, latestNativeEffect: "closed_verified", question: null };
     act(() =>
       es.emit(
@@ -320,7 +237,7 @@ describe("skip projection in the real session detail", () => {
       <SessionDetail session={{ ...session, id: "ledger-invalid-sticky" }} onBack={() => {}} />
     );
     const es = await waitFor(() => MockEventSource.latest());
-    const current = { ...display, revision: 0, decision: "active", latestNativeEffect: null };
+    const current = active;
     act(() =>
       es.emit("snapshot", projection({ questionDisplayGroups: [current], questionSkipHistory: [] }))
     );
@@ -367,13 +284,7 @@ describe("skip projection in the real session detail", () => {
       )
     );
     expect(await screen.findByText("New source body")).toBeTruthy();
-    const next = {
-      ...display,
-      group: { ...group, contentGeneration: "gen-2" },
-      revision: 0,
-      decision: "active",
-      latestNativeEffect: null,
-    };
+    const next = { ...active, group: { ...group, contentGeneration: "gen-2" } };
     act(() =>
       es.emit(
         "state",
@@ -394,13 +305,7 @@ describe("skip projection in the real session detail", () => {
       <SessionDetail session={{ ...session, id: "history-distinct-labels" }} onBack={() => {}} />
     );
     const es = await waitFor(() => MockEventSource.latest());
-    const newer = {
-      ...display,
-      group: { ...group, contentGeneration: "gen-2" },
-      revision: 0,
-      decision: "active",
-      latestNativeEffect: null,
-    };
+    const newer = { ...active, group: { ...group, contentGeneration: "gen-2" } };
     const other = {
       ...display,
       group: { ...group, sourceItemId: "other-item", contentGeneration: "gen-other" },
@@ -448,15 +353,7 @@ describe("skip projection in the real session detail", () => {
         "snapshot",
         projection({
           asyncQuestions: [q, { ...q, questionKey: "q2", questionIndex: 1, title: "Second" }],
-          questionDisplayGroups: [
-            {
-              ...display,
-              revision: 0,
-              decision: "active",
-              latestNativeEffect: null,
-              sourceQuestionCount: 2,
-            },
-          ],
+          questionDisplayGroups: [{ ...active, sourceQuestionCount: 2 }],
         })
       )
     );
