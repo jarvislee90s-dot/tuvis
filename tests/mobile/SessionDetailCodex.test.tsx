@@ -569,7 +569,7 @@ describe("SessionDetail × Codex IPC：R-T4 投影 queuePaused 驱动 send-info 
     );
   });
 
-  it("T4-2 resume 反向帧：queuePaused=true 挂载 → SSE 帧只翻 queuePaused=false → composer 恢复正常且无暂停件", async () => {
+  it("T4-2 resume 反向帧：queuePaused=true 挂载（空队列保留手动恢复入口）→ SSE 帧只翻 queuePaused=false → composer 重拉 send-info", async () => {
     installFetch();
     queueResponse = { actions: [], blockedReasonCode: null, queuePaused: true };
     sendInfoResponse = {
@@ -581,10 +581,13 @@ describe("SessionDetail × Codex IPC：R-T4 投影 queuePaused 驱动 send-info 
     render(<SessionDetail session={makeSession()} onBack={() => {}} />);
     const es = await waitFor(() => MockEventSource.latest());
     emit(es, "snapshot", projection({ revision: 5, queuePaused: true }));
-    // 暂停中：空队列面板自隐，composer 无暂停件（C04）
-    await act(async () => {});
+    // 线程级暂停（stopPauseAutoResumes 缺省 = 无自动恢复路径）：空队列不得自隐，
+    // 手动恢复入口是唯一解除出口，挂载即应可见；composer 侧无暂停件（C04 收敛）。
+    const resume = await screen.findByTestId("codex-queue-resume");
+    expect(resume).toBeVisible();
+    expect(screen.getByTestId("codex-queue-summary")).toHaveAttribute("data-paused", "true");
     expect(screen.queryByTestId("send-queue-paused")).toBeNull();
-    expect(screen.queryByTestId("codex-queue-panel")).toBeNull();
+    const infoCallsBefore = sendInfoCalls();
     // 设备 B 显式恢复（跨设备起源）→ T4 resume republish 反向帧：只翻 queuePaused
     sendInfoResponse = {
       injectable: true,
@@ -593,11 +596,42 @@ describe("SessionDetail × Codex IPC：R-T4 投影 queuePaused 驱动 send-info 
     };
     queueResponse = { actions: [], blockedReasonCode: null, queuePaused: false };
     emit(es, "state", projection({ revision: 5, queuePaused: false }));
-    await waitFor(() => expect(screen.queryByTestId("send-queue-paused")).toBeNull(), {
+    // 关注点仍是 SSE 帧驱动的 send-info 重拉（去抖有界等待）——不断言队列 GET
+    // 是否被该帧驱动，也不强断面板消失（那是手动点击出口用例的职责）。
+    await waitFor(() => expect(sendInfoCalls()).toBeGreaterThan(infoCallsBefore), {
       timeout: 2000,
     });
+    expect(screen.queryByTestId("send-queue-paused")).toBeNull();
     // 恢复后输入区不被误置灰
     expect((screen.getByTestId("composer-input") as HTMLTextAreaElement).disabled).toBe(false);
+  });
+
+  it("T4-2b manual resume：空队列手动暂停 → 点击恢复入口打 POST /codex/queue/resume → 重拉后面板消失", async () => {
+    installFetch();
+    queueResponse = { actions: [], blockedReasonCode: null, queuePaused: true };
+    sendInfoResponse = {
+      injectable: true,
+      channels: ["headless_codex_queue"],
+      visibility: "realtime",
+      queuePaused: true,
+    };
+    render(<SessionDetail session={makeSession()} onBack={() => {}} />);
+    const es = await waitFor(() => MockEventSource.latest());
+    emit(es, "snapshot", projection({ revision: 5, queuePaused: true }));
+    const resume = await screen.findByTestId("codex-queue-resume");
+    // 恢复落地后权威快照翻为未暂停（操作后重拉即得此形状）
+    sendInfoResponse = {
+      injectable: true,
+      channels: ["headless_codex_queue"],
+      visibility: "realtime",
+    };
+    queueResponse = { actions: [], blockedReasonCode: null, queuePaused: false };
+    const queueCallsBefore = queueCalls.length;
+    fireEvent.click(resume);
+    // 队列 GET 前进：恢复后的操作后重拉（暂停态以服务端为唯一权威）
+    await waitFor(() => expect(queueCalls.length).toBeGreaterThan(queueCallsBefore));
+    await waitFor(() => expect(screen.queryByTestId("codex-queue-panel")).toBeNull());
+    expect(screen.queryByTestId("codex-queue-resume")).toBeNull();
   });
 });
 
