@@ -5389,7 +5389,7 @@ mod tests {
     }
 
     fn handle_form_reply(world: &mut World) -> (u16, String) {
-        let Some(entry) = world.forms.iter_mut().next() else {
+        let Some(entry) = world.forms.first_mut() else {
             return (404, "{}".to_string());
         };
         match entry.reply {
