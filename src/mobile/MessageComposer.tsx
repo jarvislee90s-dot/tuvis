@@ -114,7 +114,12 @@ interface MessageComposerProps {
   editDraft?: ComposerDraftRequest | null;
   onEditDraftConsumed?: (actionId: string) => void;
   draftText?: string;
-  onDraftTextChange?: (value: import("react").SetStateAction<string>) => void;
+  /** 受控正文的版本跨 Composer 重挂，由草稿持有方原子比较并清理。 */
+  draftTextRevision?: number;
+  onDraftTextChange?: (
+    value: import("react").SetStateAction<string>,
+    expectedRevision?: number
+  ) => void;
   /** 发送回执触发的队列刷新信号（2026-10-20 复审 P2）：本地队列可见性不依赖
    *  Desktop 必须产生新帧——queued / desktop_ipc 回执都会让队列视图变化。 */
   onQueueChanged?: () => void;
@@ -334,6 +339,7 @@ export default function MessageComposer({
   editDraft,
   onEditDraftConsumed,
   draftText,
+  draftTextRevision,
   onDraftTextChange,
 }: MessageComposerProps) {
   // 可用性：sendInfo=null 且未就绪 → 不渲染（加载中 / 拉取失败 / 403）
@@ -412,11 +418,24 @@ export default function MessageComposer({
     actionId: string;
     epoch: number;
     draftVersion: number;
+    textVersion: number;
   } | null>(null);
   /** Q2：草稿版本号——用户编辑正文/附件即前移。后继实际提交的是原动作的原文，
    *  只有「发起人工继续后未再编辑」的草稿（= 仍是实际提交的那份）才允许被
    *  成功/入队清理；在途编辑出的新草稿绝不代清。 */
   const draftVersionRef = useRef(0);
+  // 成功回执独立核对正文版本，附件改动不会影响已发送正文的清理。
+  const textVersionRef = useRef(0);
+  const clearTextAtVersion = useCallback(
+    (version: number) => {
+      if (draftTextRevision !== undefined && onDraftTextChange) {
+        onDraftTextChange("", version);
+      } else if (textVersionRef.current === version) {
+        setText("");
+      }
+    },
+    [draftTextRevision, onDraftTextChange, setText]
+  );
   const [pendingEdits, setPendingEdits] = useState<ComposerDraftRequest[]>([]);
   const pendingEdit = onEditDraftConsumed
     ? editDraft?.sessionId === session.id && text.length > 0
@@ -432,6 +451,7 @@ export default function MessageComposer({
       if (!onEditDraftConsumed) setPendingEdits((current) => [...current, editDraft]);
     } else {
       draftVersionRef.current += 1;
+      textVersionRef.current += 1;
       setText(editDraft.text);
       onEditDraftConsumed?.(editDraft.actionId);
       inputRef.current?.focus();
@@ -756,10 +776,9 @@ export default function MessageComposer({
     // 计时器、转圈与回执槽（finally 一并承担所有出口的计时器清理）。
     // 附件标记行与 actionId 在点击时一次算定（handleSend 闭包已把 text/attachments
     // 定格在点击帧——与探测后计算逐字等价）。
-    const markup = attachments
-      .filter((a) => a.status === "ready" && a.path)
-      .map((a) => (a.isImage ? `<image path="${a.path}">` : `<file path="${a.path}">`))
-      .join("\n");
+    const submittedAttachments = attachments.filter((a) => a.status === "ready" && a.path);
+    const markup = attachmentMarkup(submittedAttachments);
+    const submittedTextVersion = draftTextRevision ?? textVersionRef.current;
     const fullText = markup ? `${text}\n${markup}` : text;
     // Q2（复审 round 7）：草稿版本在**提交时点**冻结（与 fullText 同刻定格）——
     // textarea 在发送等待期间仍可编辑，回执/计时器落地时再采样 draftVersionRef
@@ -815,6 +834,7 @@ export default function MessageComposer({
           actionId,
           epoch: myEpoch,
           draftVersion: submittedDraftVersion,
+          textVersion: submittedTextVersion,
         };
       }, FRONT_DEADLINE_MS);
       deadlineTimerRef.current = { epoch: myEpoch, timer: myTimer };
@@ -895,7 +915,8 @@ export default function MessageComposer({
           //   回执」，卡内也如实显示）。
           // 两种都算「已投递」→ 与 delivered 同口径清空输入框（留着会让用户以为
           // 没发出去）。**不提供重试语义**（TUI 那份无法撤回，重按 = 重发）。
-          setText("");
+          if (draftTextRevision === undefined) setText("");
+          else clearTextAtVersion(submittedTextVersion);
           setReceipt(res.verified === true ? { kind: "delivered" } : { kind: "submitted" });
         } else {
           // failed：分诊与卡内同源——`aborted:true` 是阶段机中止（带段名，卡内
@@ -905,10 +926,6 @@ export default function MessageComposer({
         }
         return;
       }
-      // 附件标记行（文件池既有约定 <image|file path>）：拼在正文之后随消息注入，
-      // agent 据路径读文件；failed 附件不拼（未落盘，拼了 agent 也读不到）
-      const markup = attachmentMarkup(attachments);
-      const fullText = markup ? `${text}\n${markup}` : text;
       // D6：修改重发的下一次发送带 queueOnly=true 强制入队，消费即清——本次发送
       // 失败的话，用户重试走的是普通发送语义（后端失败行已退出 pending，可重发）
       const forceQueue = queueOnlyNext;
@@ -922,20 +939,25 @@ export default function MessageComposer({
       // 作废不回写（计时器清理在 finally，按闭包归属——碰不到新动作的计时器）
       if (staleEpoch()) return;
       if (myExpired) return;
+      const clearSubmittedDraft = () => {
+        clearTextAtVersion(submittedTextVersion);
+        if (submittedAttachments.length === 0) return;
+        const submittedIds = new Set(submittedAttachments.map((attachment) => attachment.id));
+        setAttachments((current) =>
+          current.filter((attachment) => !submittedIds.has(attachment.id))
+        );
+      };
       if (res.status === "delivered") {
-        setText("");
-        setAttachments([]);
+        clearSubmittedDraft();
         setReceipt({ kind: "delivered" });
       } else if (res.status === "submitted") {
         // D7/T3 中性回执：注入 Ok + 戳未中 + 屏读无滞留草稿 = 已被 TUI 收进内部
         // 队列。消息已离开前端 → 输入框/附件清空对齐 delivered 口径；不提供重试
         // （TUI 那份无法撤回，重按发送 = 双发——可重试语义仅属于 failed 态）
-        setText("");
-        setAttachments([]);
+        clearSubmittedDraft();
         setReceipt({ kind: "submitted" });
       } else if (res.status === "queued") {
-        setText("");
-        setAttachments([]);
+        clearSubmittedDraft();
         // I1：本地「该条在队」认知自此成立——此前发起的在途 tick 快照可能不含
         // 本条，不得据此判 gone / 整表覆盖（时序防御见 queueMutatedAtRef 声明处）
         queueMutatedAtRef.current = Date.now();
@@ -962,8 +984,7 @@ export default function MessageComposer({
         //   报告问题；绝不普通重试——结果未知重试 = 双投窗口）；
         // - not_sent/rejected = 明确未送达（保留草稿；重试 = 建新动作并展示关联）。
         if (res.receipt.delivery === "accepted") {
-          setText("");
-          setAttachments([]);
+          clearSubmittedDraft();
         }
         // 2026-10-20 复审 P2：Unknown 的「待核对动作」与「下一条新草稿」生命周期
         // 分离——保留回执里的 actionId 供核对，但**新一次发送必须生成新 ID**，
@@ -983,6 +1004,7 @@ export default function MessageComposer({
             actionId: res.receipt.actionId,
             epoch: myEpoch,
             draftVersion: submittedDraftVersion,
+            textVersion: submittedTextVersion,
           };
         } else {
           const linkedFrom = retriedFromRef.current;
@@ -995,8 +1017,7 @@ export default function MessageComposer({
         // actionId 存入回执（B1）：轮询对齐 codex 队列视图真值的对账锚。
         // 先前移对账时刻（复审 Important-1）：在途旧 tick 快照不得清掉新 chip。
         codexReceiptSetAtRef.current = Date.now();
-        setText("");
-        setAttachments([]);
+        clearSubmittedDraft();
         codexActionIdRef.current = null;
         codexActionPayloadRef.current = null;
         setReceipt({
@@ -1008,8 +1029,7 @@ export default function MessageComposer({
       } else if (res.status === "headless") {
         // 兼容通道回执（每回合 spawn）：ok/queued 即消息已交给 CLI；失败如实展示原因
         if (res.receipt.status === "ok" || res.receipt.status === "queued") {
-          setText("");
-          setAttachments([]);
+          clearSubmittedDraft();
           codexActionIdRef.current = null;
           codexActionPayloadRef.current = null;
         }
@@ -1049,6 +1069,7 @@ export default function MessageComposer({
             actionId: armedCodexActionId,
             epoch: myEpoch,
             draftVersion: submittedDraftVersion,
+            textVersion: submittedTextVersion,
           };
           return;
         }
@@ -1080,6 +1101,7 @@ export default function MessageComposer({
           actionId: armedCodexActionId,
           epoch: myEpoch,
           draftVersion: submittedDraftVersion,
+          textVersion: submittedTextVersion,
         };
       } else {
         setReceipt({ kind: "failed", error: String(e) });
@@ -1095,6 +1117,8 @@ export default function MessageComposer({
   }, [
     setText,
     text,
+    draftTextRevision,
+    clearTextAtVersion,
     attachments,
     sending,
     busy,
@@ -1163,7 +1187,7 @@ export default function MessageComposer({
         // Q2：清正文/附件只针对仍是实际提交草稿的现场（版本门）
         codexReceiptSetAtRef.current = Date.now();
         if (draftUnchanged) {
-          setText("");
+          clearTextAtVersion(owner.textVersion);
           setAttachments([]);
         }
         setReceipt({
@@ -1194,12 +1218,13 @@ export default function MessageComposer({
           actionId: info.successorActionId,
           epoch: sendEpochRef.current,
           draftVersion: owner.draftVersion,
+          textVersion: owner.textVersion,
         };
       }
       // accepted：面板保留「已重新发送」；send 无 receipt 且未排队：面板呈现
       // 「此前已创建后继…待查」——两种都不在此换回执
     },
-    [onQueueChanged, setText]
+    [onQueueChanged, clearTextAtVersion]
   );
 
   // S5/F6：卸载清理当前发送的 30 秒计时器（挂起 promise 的迟到回调经代际/闭包
@@ -1385,6 +1410,7 @@ export default function MessageComposer({
       await retractWithOutcome(item.id, item.position, item.content, () => {
         // Q2：「修改」回填 = 草稿被整体替换（版本前移）
         draftVersionRef.current += 1;
+        textVersionRef.current += 1;
         setText(stripMobileSignature(item.content).slice(0, MAX_SEND_CHARS));
         setQueueOnlyNext(true);
         setReceipt(null);
@@ -1539,6 +1565,7 @@ export default function MessageComposer({
             type="button"
             onClick={() => {
               draftVersionRef.current += 1;
+              textVersionRef.current += 1;
               setText(pendingEdit.text);
               if (onEditDraftConsumed) onEditDraftConsumed(pendingEdit.actionId);
               else setPendingEdits((current) => current.filter((draft) => draft !== pendingEdit));
@@ -1551,6 +1578,7 @@ export default function MessageComposer({
             type="button"
             onClick={() => {
               draftVersionRef.current += 1;
+              textVersionRef.current += 1;
               setText((current) =>
                 current ? `${current}\n\n${pendingEdit.text}` : pendingEdit.text
               );
@@ -2025,6 +2053,7 @@ export default function MessageComposer({
           onChange={(e) => {
             // Q2：用户编辑即前移草稿版本（在途人工继续的迟到入队不得代清新草稿）
             draftVersionRef.current += 1;
+            textVersionRef.current += 1;
             setText(e.target.value.slice(0, MAX_SEND_CHARS));
           }}
           onPaste={handlePaste}

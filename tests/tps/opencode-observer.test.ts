@@ -17,10 +17,27 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, onTestFinished, vi } from "vitest";
 // 被测模块：插件源文件本身就是分发产物（嵌入 Tuvis 的同一份字节）
 import { createTpsObserver } from "../../resources/tps/opencode/tuvis-tps-observer.ts";
 import defaultObserver from "../../resources/tps/opencode/tuvis-tps-observer.ts";
+
+const { append } = vi.hoisted(() => ({
+  append:
+    vi.fn<
+      (
+        file: fs.PathOrFileDescriptor,
+        data: string,
+        encoding: "utf8",
+        callback: (error: NodeJS.ErrnoException | null) => void
+      ) => void
+    >(),
+}));
+
+vi.mock("node:fs", async (importOriginal) => ({
+  ...(await importOriginal<typeof fs>()),
+  appendFile: append,
+}));
 
 // ==== 假宿主 harness ====
 
@@ -30,7 +47,9 @@ function factsPath(home: string): string {
 }
 
 function makeTempHome(): string {
-  return fs.mkdtempSync(path.join(os.tmpdir(), "tps-opencode-test-"));
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "tps-opencode-test-"));
+  onTestFinished(() => fs.rmSync(home, { recursive: true, force: true }));
+  return home;
 }
 
 /** 独立注入的测试依赖：临时 home / 固定时钟 / 即时落盘 / identity hash */
@@ -53,41 +72,73 @@ function ev(
   return { id, created, type, data };
 }
 
+type TestHost = {
+  event: { subscribe: () => Promise<unknown> };
+  isDrained?: () => boolean;
+};
+
 /** 假宿主：subscribe 返回一个**自身没有 next** 的合法 AsyncIterable（acceptance 关卡） */
-function fakeHost(events: Array<Record<string, unknown>>) {
+function fakeHost(events: Array<Record<string, unknown>>): TestHost {
   const queue = [...events];
-  const stream: Record<symbol, unknown> = {
+  let drained = false;
+  const stream = {
     [Symbol.asyncIterator]() {
       let i = 0;
       return {
-        next: async () =>
-          i < queue.length ? { value: queue[i++]!, done: false } : { value: undefined, done: true },
+        async next() {
+          if (i < queue.length) return { value: queue[i++]!, done: false };
+          drained = true;
+          return { value: undefined, done: true };
+        },
       };
     },
   };
   return {
-    event: {
-      subscribe: async () => stream,
-    },
+    event: { subscribe: async () => stream },
+    isDrained: () => drained,
   };
 }
 
-/** 跑完一轮观察并读回事实行（teardown 即冲刷；文件读回为 JSON 行数组） */
+/** 等事件流读完，再冲刷并等到实际写盘回调完成。 */
 async function observe(
   home: string,
-  events: Array<Record<string, unknown>>,
-  host: ReturnType<typeof fakeHost>,
+  host: TestHost,
   depsOverride?: Record<string, unknown>
 ): Promise<Array<Record<string, unknown>>> {
-  const observer = createTpsObserver({ ...testDeps(home), ...depsOverride });
-  const teardown = await observer.setup(host as never);
-  await new Promise((r) => setTimeout(r, 20)); // 让消费循环吃完全部队列
-  await teardown?.();
-  const text = fs.readFileSync(factsPath(home), "utf8");
-  return text
-    .split("\n")
-    .filter((l) => l.trim().length > 0)
-    .map((l) => JSON.parse(l) as Record<string, unknown>);
+  const { appendFile } = await vi.importActual<typeof fs>("node:fs");
+  const writes: Array<Promise<NodeJS.ErrnoException | null>> = [];
+  append.mockImplementation((file, data, encoding, callback) => {
+    writes.push(
+      new Promise((resolve) => {
+        appendFile(file, data, encoding, (error) => {
+          callback(error);
+          resolve(error);
+        });
+      })
+    );
+  });
+  try {
+    const observer = createTpsObserver({ ...testDeps(home), ...depsOverride });
+    const teardown = await observer.setup(host as never);
+    const { isDrained } = host;
+    let writeErrors: Array<NodeJS.ErrnoException | null>;
+    try {
+      if (isDrained) await vi.waitFor(() => expect(isDrained()).toBe(true));
+    } finally {
+      await teardown?.();
+      writeErrors = await Promise.all(writes);
+    }
+    for (const error of writeErrors) {
+      if (error) throw error;
+    }
+    const text = fs.readFileSync(factsPath(home), "utf8");
+    return text
+      .split("\n")
+      .filter((l) => l.trim().length > 0)
+      .map((l) => JSON.parse(l) as Record<string, unknown>);
+  } finally {
+    append.mockReset();
+  }
 }
 
 const S1 = "sess-1";
@@ -122,7 +173,7 @@ describe("OpenCode 观察插件（Task 6）", () => {
         tokens: { input: 10, output: 300, reasoning: 0, cache: { read: 0, write: 0 } },
       }),
     ];
-    const rows = factRows(await observe(home, events, fakeHost(events)));
+    const rows = factRows(await observe(home, fakeHost(events)));
 
     const types = rows.map((r) => r.type);
     expect(types).toEqual(expect.arrayContaining(["start", "delta", "end"]));
@@ -161,7 +212,7 @@ describe("OpenCode 观察插件（Task 6）", () => {
         delta: "x",
       }),
     ];
-    const rows = factRows(await observe(home, events, fakeHost(events)));
+    const rows = factRows(await observe(home, fakeHost(events)));
     // 空 delta 行如实记录（hasNonEmptyDelta=false）
     const emptyRow = rows.find((r) => r.eventKey === "d-empty")!;
     expect(emptyRow.hasNonEmptyDelta).toBe(false);
@@ -180,13 +231,12 @@ describe("OpenCode 观察插件（Task 6）", () => {
         delta: "x",
       });
     const events = [deltaOf("e1"), deltaOf("e2"), deltaOf("e1")]; // e1 重复投递
-    const rows = await observe(home, events, fakeHost(events));
+    const rows = await observe(home, fakeHost(events));
     const observed = rows.filter((r) => r.type === "delta");
     expect(observed.map((e) => e.eventKey)).toEqual(["e1", "e2"]);
   });
 
   it("订阅失败有诊断：subscribe 抛错与不可迭代返回值都不静默", async () => {
-    const home = makeTempHome();
     // subscribe 抛错 → 诊断行，setup 本身不向宿主抛
     const throwing = {
       event: {
@@ -195,12 +245,12 @@ describe("OpenCode 观察插件（Task 6）", () => {
         },
       },
     };
-    const rows1 = await observe(home, [], throwing as never);
+    const rows1 = await observe(makeTempHome(), throwing);
     expect(rows1.some((r) => String(r.type).startsWith("diag:"))).toBe(true);
 
     // 返回值既不可迭代也不是回调 → 诊断行（不猜接口、不静默吞）
     const unsupported = { event: { subscribe: async () => 42 } };
-    const rows2 = await observe(home, [], unsupported as never);
+    const rows2 = await observe(makeTempHome(), unsupported);
     expect(rows2.some((r) => r.type === "diag:stream-unsupported")).toBe(true);
   });
 
@@ -225,7 +275,7 @@ describe("OpenCode 观察插件（Task 6）", () => {
       step("b2", "s2", "m2", 130, "y"),
       step("a3", "s1", "m1", 140, "z"),
     ];
-    const rows = factRows(await observe(home, events, fakeHost(events)));
+    const rows = factRows(await observe(home, fakeHost(events)));
     expect(rows).toHaveLength(5);
     // 每行键与自身事件一致（交错不串）
     for (const r of rows) {
@@ -273,7 +323,7 @@ describe("OpenCode 观察插件（Task 6）", () => {
         tokens: { input: 20, output: 250, reasoning: 0, cache: { read: 0, write: 0 } },
       }),
     ];
-    const rows = factRows(await observe(home, events, fakeHost(events)));
+    const rows = factRows(await observe(home, fakeHost(events)));
     const endRows = rows.filter((r) => r.type === "end");
     // 两步各自成行，tokens 是各自事件自带的数值（插件从不安加）
     expect(endRows.map((r) => r.tokens)).toEqual([100, 150]);
@@ -291,7 +341,7 @@ describe("OpenCode 观察插件（Task 6）", () => {
         delta: secret,
       }),
     ];
-    const rows = factRows(await observe(home, events, fakeHost(events)));
+    const rows = factRows(await observe(home, fakeHost(events)));
     expect(rows[0]!.deltaChars).toBe(secret.length);
     expect(rows[0]!.hasNonEmptyDelta).toBe(true);
     const raw = fs.readFileSync(factsPath(home), "utf8");
@@ -318,7 +368,7 @@ describe("OpenCode 观察插件（Task 6）", () => {
         error: { name: "MessageAbortedError", data: { message: "interrupted" } },
       }),
     ];
-    const rows = factRows(await observe(home, events, fakeHost(events)));
+    const rows = factRows(await observe(home, fakeHost(events)));
     const retry = rows.find((r) => r.type === "retry")!;
     expect(retry.attempt).toBe(2);
     // 中止 = 用户取消形态 → type=cancelled（outcome 面留给 Rust 读取器映射）
@@ -341,7 +391,7 @@ describe("OpenCode 观察插件（Task 6）", () => {
       }),
     ];
     const rows = factRows(
-      await observe(home, events, fakeHost(events), {
+      await observe(home, fakeHost(events), {
         hash: undefined,
       })
     );

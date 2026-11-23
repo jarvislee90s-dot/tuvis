@@ -157,6 +157,7 @@ pub(crate) struct FrameWriteContext {
     pub(crate) interaction_hook: Option<InteractionRecheck>,
     /// 本帧的调度准入标记；`None` = 无优先调度伴随（普通读 RPC/假体路径）。
     pub(crate) admission: Option<std::sync::Arc<AttemptAdmission>>,
+    pub(crate) first_write_deadline: Option<tokio::time::Instant>,
 }
 
 /// 投递结果。`NotSent` = 保守判定**零投递**（写尝试开始前即失败）；`UnknownDelivery`
@@ -375,18 +376,19 @@ pub struct CodexQueueView {
     /// P2-2：无能力 build 的按钮在源头隐藏；`#[serde(default)]` 兼容旧载荷消费方。
     #[serde(default)]
     pub can_interrupt: bool,
-    /// S2：该 Thread 队列是否处于打断后的持久暂停（旧队列冻结，恢复只经用户显式
-    /// 「继续发送」）。`#[serde(default)]` 兼容旧载荷消费方。
+    /// 该线程是否存在暂停行。`#[serde(default)]` 兼容旧载荷消费方。
     #[serde(default, rename = "queuePaused")]
     pub queue_paused: bool,
-    /// S2：暂停原因（机器码：`interrupt_accepted` / `interrupt_uncertain`；未暂停
-    /// 为 None）。S5 据此区分文案。
+    /// 最早一条暂停行的原因。未暂停时为 None。
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
         rename = "queuePauseReason"
     )]
     pub queue_pause_reason: Option<String>,
+    /// 所有暂停行都可在绑定回合到达终态后自动解除。
+    #[serde(default)]
+    pub stop_pause_auto_resumes: bool,
 }
 
 /// 官方 Desktop 持有租约：owner 身份随连接生命周期变化（spec F6），epoch 由
@@ -785,12 +787,12 @@ pub struct ProjectedMessage {
     /// 仅服务端数量／字节预算省略；与 UI 展示限额分开，不保证已进入文件池。
     #[serde(default)]
     pub omitted_artifact_count: usize,
-    /// T03：正式答复的"问题／答案"摘要（正文不再重复内部信封标记）。
-    ///
-    /// 计入尾窗 1 MiB／500 条预算（序列化体积一部分）——不能靠塞进 metadata
-    /// 绕开限额。
+    /// 首条正式答复摘要，供旧客户端显示。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interaction_answer: Option<InteractionAnswerSummary>,
+    /// 多题信封的完整答复，按信封顺序排列。单题只下发首条，两个字段均计入消息预算。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub interaction_answers: Vec<InteractionAnswerSummary>,
 }
 
 /// 正式答复的安全呈现摘要（T03；`correlated=false` 表示未配对到已知题）。
@@ -1273,6 +1275,7 @@ mod tests {
             can_interrupt: false,
             queue_paused: false,
             queue_pause_reason: None,
+            stop_pause_auto_resumes: false,
         };
         let v = serde_json::to_value(&view).unwrap();
         assert!(v["actions"][0]["actionId"].is_string());

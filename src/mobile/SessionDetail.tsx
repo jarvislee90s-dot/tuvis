@@ -413,7 +413,111 @@ function groupCodexQuestions(questions: CodexAsyncQuestionView[]): CodexQuestion
   });
 }
 
-export default function SessionDetail({ session, onBack }: SessionDetailProps) {
+export default function SessionDetail(props: SessionDetailProps) {
+  // 阅读偏好跨会话保留，离开详情页后按原有生命周期重置。
+  const [fontScale, setFontScale] = useState(1);
+  const [fileRatioV, setFileRatioV] = useState(0.5);
+  const [fileRatioH, setFileRatioH] = useState(0.5);
+  const { agentType, id, form } = props.session;
+  const appForm = agentType === "codex" && form === "app";
+  // 同线程切换 App/CLI 时保留发送组件；跨会话才重挂。
+  const sessionKey = JSON.stringify([agentType, id]);
+  const [composerDrafts, setComposerDrafts] = useState<
+    Record<string, { text: string; revision: number }>
+  >({});
+  const [editDrafts, setEditDrafts] = useState<Record<string, ComposerDraftRequest[]>>({});
+  const enqueueEditDraft = useCallback(
+    (draft: ComposerDraftRequest) => {
+      setEditDrafts((current) => ({
+        ...current,
+        [sessionKey]: [...(current[sessionKey] ?? []), draft],
+      }));
+    },
+    [sessionKey]
+  );
+  const consumeEditDraft = useCallback(
+    (actionId: string) => {
+      setEditDrafts((current) => ({
+        ...current,
+        [sessionKey]: (current[sessionKey] ?? []).filter((draft) => draft.actionId !== actionId),
+      }));
+    },
+    [sessionKey]
+  );
+  const changeDraftText = useCallback(
+    (value: import("react").SetStateAction<string>, expectedRevision?: number) => {
+      setComposerDrafts((current) => {
+        const { text = "", revision = 0 } = current[sessionKey] ?? {};
+        // 旧 Composer 的回执仍可清理原稿，但不能覆盖新实例已编辑的稿件。
+        if (expectedRevision !== undefined && expectedRevision !== revision) return current;
+        return {
+          ...current,
+          [sessionKey]: {
+            text: typeof value === "function" ? value(text) : value,
+            revision: revision + 1,
+          },
+        };
+      });
+    },
+    [sessionKey]
+  );
+  return (
+    <SessionDetailContent
+      key={sessionKey}
+      {...props}
+      appForm={appForm}
+      fontScale={fontScale}
+      setFontScale={setFontScale}
+      fileRatioV={fileRatioV}
+      setFileRatioV={setFileRatioV}
+      fileRatioH={fileRatioH}
+      setFileRatioH={setFileRatioH}
+      draftText={composerDrafts[sessionKey]?.text ?? ""}
+      draftTextRevision={composerDrafts[sessionKey]?.revision ?? 0}
+      editDraft={editDrafts[sessionKey]?.[0]}
+      changeDraftText={changeDraftText}
+      enqueueEditDraft={enqueueEditDraft}
+      consumeEditDraft={consumeEditDraft}
+    />
+  );
+}
+
+interface SessionDetailContentProps extends SessionDetailProps {
+  appForm: boolean;
+  fontScale: number;
+  setFontScale: (scale: number) => void;
+  fileRatioV: number;
+  setFileRatioV: (ratio: number) => void;
+  fileRatioH: number;
+  setFileRatioH: (ratio: number) => void;
+  draftText: string;
+  draftTextRevision: number;
+  editDraft: ComposerDraftRequest | undefined;
+  changeDraftText: (
+    value: import("react").SetStateAction<string>,
+    expectedRevision?: number
+  ) => void;
+  enqueueEditDraft: (draft: ComposerDraftRequest) => void;
+  consumeEditDraft: (actionId: string) => void;
+}
+
+function SessionDetailContent({
+  session,
+  onBack,
+  appForm,
+  fontScale,
+  setFontScale,
+  fileRatioV,
+  setFileRatioV,
+  fileRatioH,
+  setFileRatioH,
+  draftText,
+  draftTextRevision,
+  editDraft,
+  changeDraftText,
+  enqueueEditDraft,
+  consumeEditDraft,
+}: SessionDetailContentProps) {
   const [messages, setMessages] = useState<SessionMessage[] | null>(null);
   // ===== Codex Desktop IPC 投影（A snapshot）=====
   // 仅 Codex 会话订阅（其余工具 enabled=false 零开销）。可用性按服务端数据渲染：
@@ -427,19 +531,20 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
   // stale：保留最后视图但禁写。
   // H12：**来源随形态**——只有 Desktop(App) 形态的 codex 会话才订阅投影；
   // CLI/TUI 同 thread 即使被 Desktop 认识，也必须走终端卡路径，不能取得投影。
-  const codex = useCodexThread(session.id, session.agentType === "codex" && session.form === "app");
+  const codex = useCodexThread(session.id, appForm);
+  const codexState = appForm && codex.stateSessionId === session.id ? codex.state : null;
   /** 附件图片资源控制器（Task 6）：整页共用一份，保证同会话消费者共享请求与
    *  object URL、全局最多两个在途；换会话时 hook 内部销毁旧 store。 */
   const artifactImages = useArtifactImages(session.id);
   // T05：页面共享停止控制器——**单例在本层持有**，composer 主按钮/紧凑入口与
   // 队列面板打断确认共用（stopping 互斥闸防多按钮各发一次破坏性打断；结果分诊、
   // 30 秒预算、Unknown 纪律都在 hook 内）。非 App 形态投影恒 null → 惰性控制器。
-  const codexTurnControl = useCodexTurnControl(codex.state, session.id);
+  const codexTurnControl = useCodexTurnControl(codexState, session.id, codex.refresh);
   /** 每条消息的附件上下文（同回合提示词 / 每回合 12 图预算）：以 canonical 合并顺序
    *  的 loadedMessages 为准，翻页合并后仍只按真实回合取提示词，不借上一回合。 */
   const artifactContexts = useMemo(
-    () => buildArtifactMessageContexts(codex.loadedMessages),
-    [codex.loadedMessages]
+    () => buildArtifactMessageContexts(codexState === null ? [] : codex.loadedMessages),
+    [codexState, codex.loadedMessages]
   );
   /** 队列刷新独立信号（2026-10-20 复审 P2）：不依赖 Desktop 必须产生新帧——
    *  投影 revision 变化与发送回执各推进一次；旧会话的回调随组件卸载丢弃。 */
@@ -515,30 +620,6 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
   //    首个未处理触发起超过上限即立即重拉——与 CodexQueuePanel 的 refreshSignal
   //    同款节奏）。
   const [sendInfoTick, setSendInfoTick] = useState(0);
-  // 草稿正文和待回填队列归详情页持有，布局切换重挂 composer 不丢稿、不重放。
-  const [editDrafts, setEditDrafts] = useState<ComposerDraftRequest[]>([]);
-  const [composerDrafts, setComposerDrafts] = useState<Record<string, string>>({});
-  const editDraft = editDrafts.find((draft) => draft.sessionId === session.id);
-  const enqueueEditDraft = useCallback((draft: ComposerDraftRequest) => {
-    setEditDrafts((current) => [...current, draft]);
-  }, []);
-  const consumeEditDraft = useCallback(
-    (actionId: string) => {
-      setEditDrafts((current) =>
-        current.filter((draft) => draft.sessionId !== session.id || draft.actionId !== actionId)
-      );
-    },
-    [session.id]
-  );
-  const changeDraftText = useCallback(
-    (value: import("react").SetStateAction<string>) => {
-      setComposerDrafts((current) => ({
-        ...current,
-        [session.id]: typeof value === "function" ? value(current[session.id] ?? "") : value,
-      }));
-    },
-    [session.id]
-  );
   const bumpSendInfo = useCallback(() => setSendInfoTick((t) => t + 1), []);
   // R02：消息进入 codex 队列后也必须重拉 send-info——空暂停在发送前自隐，
   // 但新消息留队后暂停会冻结接力，必须立即显示“队列已暂停，恢复后发送”。
@@ -552,22 +633,22 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
     if (codexTurnControl.result === null) return;
     bumpQueue();
   }, [codexTurnControl.result, bumpQueue]);
-  const codexAvailability = codex.state?.availability ?? null;
-  const codexRuntime = codex.state?.runtimeStatus ?? null;
-  const codexPendingCount = codex.state?.pending.length ?? -1;
-  const codexRevisionNow = codex.state?.revision ?? null;
+  const codexAvailability = codexState?.availability ?? null;
+  const codexRuntime = codexState?.runtimeStatus ?? null;
+  const codexPendingCount = codexState?.pending.length ?? -1;
+  const codexRevisionNow = codexState?.revision ?? null;
   // R-T4：队列暂停事实（旧载荷缺省 undefined → 与 false 同签——只有真实翻转才触发）
-  const codexQueuePaused = codex.state?.queuePaused === true;
+  const codexQueuePaused = codexState?.queuePaused === true;
   const prevFrameSigRef = useRef<string | null>(null);
   const sendInfoDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const sendInfoFirstPendingAtRef = useRef<number | null>(null);
   useEffect(() => {
     // 帧签名：档位 / 运行态 / pending 数 / revision / 队列暂停任一变化 = 一帧事件。
     // 首拍（null → 首帧）不触发——composer 挂载时本来就会拉一次。
-    // Gate F 修正：挂载渲染（codex.state=null）**不是帧**——不写哨兵。此前哨兵在
+    // Gate F 修正：挂载渲染（codexState=null）**不是帧**——不写哨兵。此前哨兵在
     // 挂载即被写成 null 态签名字符串，导致首帧（snapshot）被误判为变化：去抖
     // 250ms 后必然多拉一次 send-info（浪费请求；对照测试里会拉到过渡期响应）。
-    // availability=null ⇔ codex.state=null（投影未达），据此判定「非帧」。
+    // availability=null ⇔ codexState=null（投影未达），据此判定「非帧」。
     const sig =
       codexAvailability === null
         ? null
@@ -609,7 +690,6 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
   );
   // R16：**稳定来源路由**——Codex App 会话只走投影+新控件，断链也不回旧 TUI 卡；
   // CLI 会话保持旧的终端卡路径。
-  const appForm = session.agentType === "codex" && session.form === "app";
   useEffect(() => {
     if (!appForm) return;
     let alive = true;
@@ -631,12 +711,11 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
       () => undefined
     );
   }, [session.id]);
-  const codexReady = codex.state !== null;
-  const codexRevision = codex.state?.revision ?? null;
+  const codexReady = codexState !== null;
+  const codexRevision = codexState?.revision ?? null;
   useEffect(() => {
     if (codexReady) bumpQueue();
   }, [codexRevision, codexReady, bumpQueue]);
-  const codexState = codex.state;
   // ===== 题卡跳过分层事实（useCodexThread 的 FactLedger 快照；SessionDetail 只派生）=====
   // descriptor（每 source 唯一 canonical gid）、unified（display/history/已受理回执
   // 按 (rev, 同钟 seq) 同 gid 择新）、observation（gid↔题体，exclude token/runtime）
@@ -1049,13 +1128,15 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
   // 也不参与。
   const fileReferenceRange = useMemo(
     () =>
-      boundedCodexHistoryWindow(
-        codex.state?.messages ?? [],
-        codex.historyPages,
-        codex.state?.historyToken ?? "",
-        codex.retained
-      ),
-    [codex.state, codex.historyPages, codex.retained]
+      codexState === null
+        ? []
+        : boundedCodexHistoryWindow(
+            codexState.messages,
+            codex.historyPages,
+            codexState.historyToken ?? "",
+            codex.retained
+          ),
+    [codexState, codex.historyPages, codex.retained]
   );
   /** 文件面板视图：后端条目 + 缺失结构化引用；来源优先级/已修改标志保持后端口径，
    *  排序按本次范围内的最近引用倒序（其余条目保持后端相对顺序）。 */
@@ -1066,14 +1147,12 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
   /** 五页定位状态机（纯逻辑在 useArtifactJump；本组件只接线、切布局与高亮）。 */
   const artifactJump = useArtifactJump({
     sessionId: session.id,
-    state: codex.state,
-    historyPages: codex.historyPages,
-    retained: codex.retained,
+    state: codexState,
+    historyPages: codexState === null ? [] : codex.historyPages,
+    retained: codexState === null ? [] : codex.retained,
     loadEarlier: codex.loadEarlier,
     fileEntries,
   });
-  // 字号档位（默认 100%）
-  const [fontScale, setFontScale] = useState<number>(1);
   // 书签表（M3+）：初值从模块级 store 读——SessionDetail 卸载重挂后仍恢复
   const [bookmarks, setBookmarks] = useState<Bookmark[]>(() => listBookmarks(session.id));
   // 跳转失败提示（书签指向更早范围，当前窗口内找不到）
@@ -1092,10 +1171,6 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
   /** Task 7：命中高亮的计时器与已标记 DOM 节点（清理时逐个摘属性）。 */
   const jumpHighlightTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const jumpHighlightNodesRef = useRef<HTMLElement[]>([]);
-  // 文件栏占比（可拖分隔条，需求 2026-09-16）：两形态各自保留用户拖出的比例，
-  // 初值 0.5（对半分，与旧版 h-1/2 / w-1/2 观感一致）
-  const [fileRatioV, setFileRatioV] = useState(0.5);
-  const [fileRatioH, setFileRatioH] = useState(0.5);
   // 分屏容器 ref：拖动换算的尺寸来源（SplitHandle 内取 getBoundingClientRect）
   const splitRef = useRef<HTMLDivElement>(null);
   // 消息区 ref（滚动到底 / 加载更早的位置锚定）
@@ -1854,7 +1929,7 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
       onRemove={handleRemoveBookmark}
       onClear={handleClearBookmarks}
       processToggle={
-        toggleableMessages.length > 0
+        !codexProjectionActive && toggleableMessages.length > 0
           ? {
               allCollapsed: collapsedCount === toggleableMessages.length,
               onToggle: collapsedCount === toggleableMessages.length ? expandAll : collapseAll,
@@ -2242,6 +2317,7 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
             refreshSignal={queueTick}
             onQueueStateChanged={bumpSendInfo}
             onEditDraft={enqueueEditDraft}
+            keepEditDraftOnUnmount
             turnControl={appForm ? codexTurnControl : undefined}
           />
           {!codexProjectionActive && !isSummary && !appForm && (
@@ -2299,7 +2375,8 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
       <MessageComposer
         editDraft={editDraft}
         onEditDraftConsumed={consumeEditDraft}
-        draftText={composerDrafts[session.id] ?? ""}
+        draftText={draftText}
+        draftTextRevision={draftTextRevision}
         onDraftTextChange={changeDraftText}
         key={`composer-${session.id}`}
         session={session}
@@ -2376,8 +2453,8 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
                       isUser ? "flex flex-col items-end" : "flex flex-col items-start"
                     } data-[jump-hit=true]:rounded-xl data-[jump-hit=true]:bg-amber-500/10 data-[jump-hit=true]:ring-2 data-[jump-hit=true]:ring-amber-500/70`}
                   >
-                    {m.interactionAnswer ? (
-                      <AnswerBubble answer={m.interactionAnswer} messageId={m.id} />
+                    {m.interactionAnswers && m.interactionAnswers.length > 0 ? (
+                      <AnswerBubble answers={m.interactionAnswers} messageId={m.id} />
                     ) : null}
                     {m.text !== "" && (
                       <div

@@ -6845,6 +6845,84 @@ impl DesktopIpcAdapter {
         found.map(str::to_owned)
     }
 
+    /// 同时读取入口运行态并绑定显式插队的 owner 与回合观察。
+    pub(crate) async fn priority_turn_scope(
+        &self,
+        key: &ThreadKey,
+        requested_stop: Option<&str>,
+    ) -> Option<(
+        crate::services::codex_control::SendGate,
+        Arc<super::mirror::PriorityTurnScope>,
+    )> {
+        use crate::services::codex_control::SendGate;
+        let mut mirrors = self.inner.mirrors.lock().await;
+        let mirror = mirrors.get_mut(key)?;
+        let (runtime, pending) = mirror.operation_preview();
+        let gate = if mirror.is_stale() {
+            SendGate::StateUnknown
+        } else if pending {
+            SendGate::NativePending
+        } else {
+            match runtime.as_str() {
+                // 新鲜镜像的 unknown 沿用入口的停止确认语义。发送仍须通过下方的写前门。
+                "active" | "unknown" => SendGate::Busy,
+                "idle" | "failed" => SendGate::Clear,
+                _ => SendGate::StateUnknown,
+            }
+        };
+        let expected_stop = requested_stop.filter(|_| gate == SendGate::Busy);
+        Some((gate, mirror.watch_priority_turns(expected_stop)?))
+    }
+
+    /// 无法读取镜像时等待。若连接刚换代，或曾有新回合，本次授权失效。
+    pub(crate) fn priority_scope_gate(
+        &self,
+        key: &ThreadKey,
+        scope: &super::mirror::PriorityTurnScope,
+        stopped_turn: Option<&str>,
+        remote_generation: u64,
+    ) -> Option<crate::services::codex_control::SendGate> {
+        use crate::services::codex_control::SendGate;
+        let lease = &scope.lease;
+        if !self.inner.remote_write_generation.valid(remote_generation)
+            || self.inner.epoch.load(Ordering::SeqCst) != lease.epoch
+        {
+            return None;
+        }
+        {
+            let Ok(owners) = self.inner.owners.try_lock() else {
+                return Some(SendGate::StateUnknown);
+            };
+            if !owners.is_current(lease) {
+                return None;
+            }
+        }
+        let Ok(mirrors) = self.inner.mirrors.try_lock() else {
+            return Some(SendGate::StateUnknown);
+        };
+        let mirror = mirrors.get(key)?;
+        if scope.invalid()
+            || mirror.lease() != Some(lease)
+            || mirror.is_stale()
+            || stopped_turn.is_some_and(|turn| {
+                // 已核对的目标终态可跨历史窗口裁剪，仍在窗口内的目标必须继续通过终态校验。
+                !mirror.turn_is_terminal(turn)
+                    && (!scope.observed_stop_terminal(turn) || mirror.turn_ids().contains(turn))
+            })
+        {
+            return None;
+        }
+        let (runtime, pending) = mirror.operation_preview();
+        if pending {
+            return Some(SendGate::NativePending);
+        }
+        match runtime.as_str() {
+            "active" => None,
+            "idle" | "failed" => Some(SendGate::Clear),
+            _ => Some(SendGate::StateUnknown),
+        }
+    }
+
     /// **派发边界快照**（2026-10-20 复审 P1）：ensure 之后、start-turn 之前的忙态与
     /// 已存在 Turn 集合，**同一把镜像锁**取出（保证两判据来自同一时刻状态）。
     /// 忙 = active/unknown **或任一 pending 在场**（S2：入队与写出之间新出现的原生
@@ -7531,6 +7609,7 @@ impl DesktopIpcAdapter {
             Some(super::types::FrameWriteContext {
                 interaction_hook: Some(recheck),
                 admission: None,
+                first_write_deadline: None,
             }),
             None,
             None,
@@ -8359,7 +8438,12 @@ impl DesktopIpcAdapter {
             wire_text,
         };
         if let Some(admission) = frame_admission {
-            conn.request_with_admission(request, admission).await
+            conn.request_with_admission(
+                request,
+                admission,
+                write_context.and_then(|context| context.first_write_deadline),
+            )
+            .await
         } else {
             conn.request(request).await
         }

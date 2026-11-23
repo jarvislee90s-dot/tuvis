@@ -93,6 +93,23 @@ describe("useArtifactImages：视口门与共享", () => {
     expect(MockIntersectionObserver.instances[0].elements.has(el)).toBe(true);
   });
 
+  it.each(["permission_denied", "io"])("保留 /file 返回的 %s 原因码", async (reason) => {
+    fetchMock.mockResolvedValueOnce(
+      new Response(JSON.stringify({ error: reason }), {
+        status: 403,
+        headers: { "content-type": "application/json" },
+      })
+    );
+    const { result } = mount();
+    act(() => {
+      result.current.attach("/tmp/a.png", document.createElement("div"));
+      MockIntersectionObserver.triggerAll(true);
+    });
+    await waitFor(() =>
+      expect(result.current.stateFor("/tmp/a.png")).toEqual({ status: "error", url: null, reason })
+    );
+  });
+
   it("进入视口才读取；同一路径的两个消费者共享一次请求与同一个 object URL", async () => {
     const d = deferred<Response>();
     fetchMock.mockImplementation(async () => d.promise);

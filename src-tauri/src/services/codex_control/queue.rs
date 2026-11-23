@@ -257,13 +257,13 @@ fn db_err(e: rusqlite::Error) -> StoreError {
 
 /// B-R2：Stop 写点统一收尾——写+同连接读回成功 → 提交两项完整事实；
 /// 失败 → 保守 Unknown（不假恢复）。value = 各写点既有布尔语义。
-fn finish_stop_write(
+fn finish_stop_write<T>(
     ticket: Option<(
         std::sync::Arc<crate::services::codex_question_skip::live::QuestionSkipLive>,
         crate::services::codex_question_skip::live::FactUpdate,
     )>,
-    result: Result<(bool, bool, bool), StoreError>,
-) -> Result<bool, StoreError> {
+    result: Result<(T, bool, bool), StoreError>,
+) -> Result<T, StoreError> {
     match result {
         Ok((value, running, persistent)) => {
             if let Some((live, update)) = ticket {
@@ -301,6 +301,9 @@ impl ActionStore {
             Ok(0) => {}
             Ok(n) => log::warn!("codex_actions: 启动恢复 {n} 条 reserved 动作为 unknown"),
             Err(e) => log::error!("codex_actions: 启动恢复失败: {e}"),
+        }
+        if let Err(e) = s.clear_accepted_priority_holds(None) {
+            log::error!("codex_actions: 启动清理已受理动作的插队暂停失败: {e}");
         }
         let tombstoned = s.tombstone_expired_terminal();
         if tombstoned > 0 {
@@ -1169,6 +1172,24 @@ impl ActionStore {
         })
     }
 
+    pub(crate) fn resolve_stopped_send_verified(
+        &self,
+        scope: &ThreadKey,
+        source_action_id: &str,
+        evidence_turn_id: &str,
+    ) -> Result<bool, StoreError> {
+        self.with(|c| {
+            dao::resolve_stopped_send_verified_conn(
+                c,
+                scope,
+                source_action_id,
+                evidence_turn_id,
+                now_ms(),
+            )
+            .map_err(db_err)
+        })
+    }
+
     /// Task4：读源动作的 `verified_complete` 核销记录（host / thread / evidence）。
     /// orphan book 对账输入缝：源 fence 已被核销事务消化时按记录事实条件补清旧
     /// book——`reason='verified_complete'` 钉死，显式接管记录（explicit_takeover）
@@ -1578,6 +1599,18 @@ impl ActionStore {
         pause_token: &str,
         pause_turn_id: Option<&str>,
     ) -> Result<bool, StoreError> {
+        self.set_queue_pauses(key, pause_reason, pause_token, pause_turn_id, None)
+            .map(|(inserted, _)| inserted)
+    }
+
+    pub(crate) fn set_queue_pauses(
+        &self,
+        key: &ThreadKey,
+        pause_reason: &str,
+        pause_token: &str,
+        pause_turn_id: Option<&str>,
+        priority_token: Option<&str>,
+    ) -> Result<(bool, bool), StoreError> {
         // Source/live（合同 §6 + B-R2）：stop 准备先 begin Stop 更新（失效先行），
         // 写屏障后在**同一连接**内权威读回两项完整事实（running = 真实 claimed
         // StopAttempt 行；persistent = 仍在册停止类屏障）再提交——不再以
@@ -1586,8 +1619,9 @@ impl ActionStore {
         let _gate = self.stop_facts_gate();
         let ticket = self.begin_stop_ticket(key);
         let result = self.with(|c| {
+            let tx = c.unchecked_transaction().map_err(db_err)?;
             let inserted = dao::set_queue_pause_conn(
-                c,
+                &tx,
                 &key.thread_id,
                 pause_reason,
                 pause_token,
@@ -1595,11 +1629,24 @@ impl ActionStore {
                 now_ms(),
             )
             .map_err(db_err)?;
-            let running = dao::thread_stop_running_conn(c, &key.thread_id).map_err(db_err)?;
-            let persistent = !dao::stop_pause_rows_conn(c, &key.thread_id)
+            let priority_inserted = match priority_token {
+                Some(token) => dao::set_queue_pause_conn(
+                    &tx,
+                    &key.thread_id,
+                    "priority_hold",
+                    token,
+                    None,
+                    now_ms(),
+                )
+                .map_err(db_err)?,
+                None => false,
+            };
+            let running = dao::thread_stop_running_conn(&tx, &key.thread_id).map_err(db_err)?;
+            let persistent = !dao::stop_pause_rows_conn(&tx, &key.thread_id)
                 .map_err(db_err)?
                 .is_empty();
-            Ok((inserted, running, persistent))
+            tx.commit().map_err(db_err)?;
+            Ok(((inserted, priority_inserted), running, persistent))
         });
         finish_stop_write(ticket, result)
     }
@@ -1633,6 +1680,45 @@ impl ActionStore {
             Ok((cleared, running, persistent))
         });
         finish_stop_write(ticket, result)
+    }
+
+    pub(crate) fn queue_pause_view(
+        &self,
+        key: &ThreadKey,
+    ) -> Result<Option<(String, bool)>, StoreError> {
+        self.with(|c| dao::queue_pause_view_conn(c, &key.thread_id).map_err(db_err))
+    }
+
+    /// Accepted 已提交但暂停还在时，对账只回收该动作的自有暂停。
+    pub(crate) fn clear_accepted_priority_holds(
+        &self,
+        key: Option<&ThreadKey>,
+    ) -> Result<bool, StoreError> {
+        self.with(|c| {
+            c.execute(
+                "DELETE FROM codex_queue_pause AS p WHERE (?1 IS NULL OR p.thread_id=?1)
+                 AND p.pause_reason='priority_hold' AND EXISTS(
+                     SELECT 1 FROM codex_actions a WHERE a.thread_id=p.thread_id AND a.state='accepted'
+                       AND a.action_id=substr(p.pause_token, length('priority:')+1)
+                       AND p.pause_token='priority:' || a.action_id
+                 )",
+                [key.map(|key| key.thread_id.as_str())],
+            ).map(|count| count != 0).map_err(db_err)
+        })
+    }
+
+    pub(crate) fn queue_pause_owned(
+        &self,
+        key: &ThreadKey,
+        token: &str,
+    ) -> Result<bool, StoreError> {
+        self.with(|c| {
+            c.query_row(
+                "SELECT EXISTS(SELECT 1 FROM codex_queue_pause WHERE thread_id=?1 AND pause_token=?2)",
+                rusqlite::params![&key.thread_id, token],
+                |row| row.get(0),
+            ).map_err(db_err)
+        })
     }
 
     /// 读 Thread 暂停状态（None = 未暂停）。
@@ -1722,12 +1808,17 @@ impl ActionStore {
         &self,
         action_id: &str,
         key: &ThreadKey,
+        previous_attempt: Option<i64>,
         validate: impl FnOnce() -> bool,
     ) -> Result<dao::CheckedMutation<i64>, StoreError> {
         self.with(|c| {
-            dao::mint_bypass_grant_attempt_checked_conn(c, action_id, &key.thread_id, || {
-                validate().then(now_ms)
-            })
+            dao::mint_bypass_grant_attempt_checked_conn(
+                c,
+                action_id,
+                &key.thread_id,
+                previous_attempt,
+                || validate().then(now_ms),
+            )
             .map_err(db_err)
         })
     }

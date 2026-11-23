@@ -90,6 +90,8 @@ export interface CodexHistoryLoadResult {
 export interface UseCodexThreadResult {
   /** 当前实时投影（`messages` 是**实时尾窗**，语义与既有消费方不变）。 */
   state: ThreadProjection | null;
+  /** 快照所属的订阅会话。订阅禁用后撤销归属，直至新订阅收到首帧。 */
+  stateSessionId: string | null;
   /**
    * 缓存页（旧→新）+ 已展示保留缓冲（去重）+ 尾窗（去重），canonical 旧→新、
    * 最新在最后。保留缓冲装「已滚出尾窗、尚未被页覆盖」的消息（≤2000 条 / ≤1 MiB，
@@ -135,7 +137,11 @@ interface InflightPageRequest {
 }
 
 export default function useCodexThread(sessionId: string, enabled: boolean): UseCodexThreadResult {
-  const [state, setState] = useState<ThreadProjection | null>(null);
+  const [snapshot, setSnapshot] = useState<{
+    state: ThreadProjection;
+    sessionId: string | null;
+  } | null>(null);
+  const state = snapshot?.state ?? null;
   const [transport, setTransport] = useState<CodexTransport>("off");
   const [historyPages, setHistoryPages] = useState<CodexHistoryPage[]>([]);
   /** R2 已展示保留缓冲（旧→新；与 ref 同步，供 applyProjection 同步读写） */
@@ -294,7 +300,7 @@ export default function useCodexThread(sessionId: string, enabled: boolean): Use
         ),
       };
       stateRef.current = landed;
-      setState(landed);
+      setSnapshot({ state: landed, sessionId: context.sessionId });
       // R03 握手票结算：跨 instance 建立消费当前票（先到先得，同票重叠响应随后
       // 全部失去建立权）；同 instance 落地保留未消费的票（它属于后续可能的重启）
       // 并打断连续拒绝计数。SSE snapshot 的跨 instance 建立同样消费（票只属于
@@ -328,7 +334,8 @@ export default function useCodexThread(sessionId: string, enabled: boolean): Use
     handshakeTicketRef.current = null;
     crossInstanceRejectStreakRef.current = 0;
     if (!enabled) {
-      // 禁用订阅：清历史分页状态（保留最后投影视图——现有 state 语义不变）
+      // 保留最后投影，但重新启用时必须等待新订阅的首帧。
+      setSnapshot((prev) => (prev === null ? null : { ...prev, sessionId: null }));
       setTransport("off");
       invalidateHistory();
       tokenRef.current = "";
@@ -346,7 +353,7 @@ export default function useCodexThread(sessionId: string, enabled: boolean): Use
     invalidateHistory();
     tokenRef.current = "";
     stateRef.current = null;
-    setState(null);
+    setSnapshot(null);
     skipFactsRef.current = createQuestionSkipFactsStore();
     setTransport("sse");
 
@@ -424,6 +431,7 @@ export default function useCodexThread(sessionId: string, enabled: boolean): Use
 
   const refresh = useCallback(async () => {
     const sid = sessionId;
+    if (!enabledRef.current || sessionRef.current !== sid) return;
     // 请求发出时的代际：在途期间已有更新帧落地则丢弃本次响应（旧 token 不覆盖新状态）
     const startedToken = tokenRef.current;
     // T02：响应必须带回发出时的订阅代际才可落地
@@ -614,5 +622,14 @@ export default function useCodexThread(sessionId: string, enabled: boolean): Use
     [state, historyPages, retained]
   );
 
-  return { state, loadedMessages, historyPages, retained, loadEarlier, refresh, transport };
+  return {
+    state,
+    stateSessionId: snapshot?.sessionId ?? null,
+    loadedMessages,
+    historyPages,
+    retained,
+    loadEarlier,
+    refresh,
+    transport,
+  };
 }

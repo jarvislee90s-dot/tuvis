@@ -64,11 +64,12 @@ function reasonFromError(error: unknown): string {
       code === "sensitive" ||
       code === "not_found" ||
       code === "too_large" ||
-      code === "not_file"
+      code === "not_file" ||
+      code === "permission_denied" ||
+      code === "io"
     ) {
       return code;
     }
-    if (code === "io") return "io";
     // 403 无结构化原因（旧后端/代理页）不可区分具体原因：按通用不可读处理，
     // 不把「可能是删除/越界/超限」中的任意一项冒充为确定结论。
     return "unreadable";

@@ -1031,6 +1031,50 @@ describe("移动端附件上传（2026-09-20）", () => {
     expect(attachOpens.some((u) => u.includes("name=shot.png"))).toBe(true);
   });
 
+  it("迟到的成功回执清理已发送正文和附件，保留之后新增的上传", async () => {
+    installFetch();
+    routes.info = sendInfo();
+    routes.sendHang = true;
+    const originalPath = "E:/proj/.tuvis-attachments/s-1/original.png";
+    const nextPath = "E:/proj/.tuvis-attachments/s-1/next.png";
+    routes.attach = { path: originalPath, size: 2 };
+    render(<MessageComposer session={{ id: "sess-1" }} />);
+    const input = await screen.findByTestId("composer-input");
+    fireEvent.change(input, { target: { value: "正文 A" } });
+    fireEvent.change(screen.getByTestId("attach-file-input"), {
+      target: { files: [pngFile("original.png")] },
+    });
+    await screen.findByText("original.png");
+    fireEvent.click(screen.getByTestId("composer-send"));
+    await waitFor(() => expect(releaseSend).toBeTypeOf("function"));
+
+    routes.attachHang = true;
+    fireEvent.change(screen.getByTestId("attach-file-input"), {
+      target: { files: [pngFile("next.png")] },
+    });
+    await waitFor(() => expect(pendingAttachXhr).not.toBeNull());
+    await act(async () => {
+      releaseSend!(new Response(JSON.stringify({ status: "delivered" })));
+    });
+    expect(await screen.findByTestId("send-receipt-delivered")).toBeVisible();
+    expect(screen.queryByText("original.png")).toBeNull();
+    expect(input).toHaveValue("");
+
+    await act(async () => {
+      releaseAttach!(new Response(JSON.stringify({ path: nextPath, size: 2 })));
+    });
+    expect(await screen.findByText("next.png")).toBeVisible();
+    routes.sendHang = false;
+    fireEvent.change(input, { target: { value: "正文 B" } });
+    fireEvent.click(screen.getByTestId("composer-send"));
+    await waitFor(() => expect(sendCalls()).toHaveLength(2));
+    const sent = sendCalls().map(([, init]) => JSON.parse(String((init as RequestInit).body)).text);
+    expect(sent).toEqual([
+      `正文 A\n<image path="${originalPath}">`,
+      `正文 B\n<image path="${nextPath}">`,
+    ]);
+  });
+
   it("文档附件（非图片）发送拼 <file path> 标记行", async () => {
     installFetch();
     routes.info = sendInfo();

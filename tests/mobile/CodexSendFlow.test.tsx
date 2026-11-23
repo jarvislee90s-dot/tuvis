@@ -685,7 +685,7 @@ describe("CodexSendFlow：队列暂停展示收敛（C04）", () => {
     expect(screen.queryByTestId("queue-resume")).toBeNull();
   });
 
-  it("queue_panel_empty_pause：无排队条目也无屏障 → 只有陈旧暂停行时面板自隐", async () => {
+  it("queue_panel_empty_pause_manual_resume：无排队条目也无屏障、线程级暂停需手动恢复 → 面板保留恢复队列入口", async () => {
     installFetch();
     routes.queueView = {
       actions: [],
@@ -694,12 +694,17 @@ describe("CodexSendFlow：队列暂停展示收敛（C04）", () => {
       queuePauseReason: "interrupt_uncertain",
     };
     render(<CodexQueuePanel sessionId="sess-1" />);
-    await flushAsync();
-    expect(screen.queryByTestId("codex-queue-panel")).toBeNull();
-    expect(screen.queryByTestId("codex-queue-paused")).toBeNull();
+    // 空队列不是「陈旧暂停」：stopPauseAutoResumes 缺省 = 无自动恢复路径，
+    // 手动 Resume 是唯一出口，不得被空队列自隐吞掉。
+    const resume = await screen.findByTestId("codex-queue-resume");
+    expect(resume).toBeVisible();
+    expect(screen.getByTestId("codex-queue-summary").getAttribute("data-paused")).toBe("true");
+    fireEvent.click(resume);
+    await waitFor(() => expect(queueResumeBodies).toHaveLength(1));
+    expect(JSON.parse(queueResumeBodies[0])).toEqual({ sessionId: "sess-1" });
   });
 
-  it("queue_panel_paused：队列视图 queuePaused=true → 展开后出暂停说明与唯一恢复队列入口（同一解除出口）", async () => {
+  it("queue_panel_paused：队列视图 queuePaused=true → 默认显示暂停说明与唯一恢复队列入口（同一解除出口）", async () => {
     installFetch();
     routes.queueView = {
       actions: [
@@ -710,10 +715,7 @@ describe("CodexSendFlow：队列暂停展示收敛（C04）", () => {
       queuePauseReason: "interrupt_uncertain",
     };
     render(<CodexQueuePanel sessionId="sess-1" />);
-    await waitFor(() => expect(screen.getByTestId("codex-queue-panel")).toBeTruthy());
-    // C04：默认折叠（摘要行）；展开后才出暂停说明与恢复入口
-    fireEvent.click(screen.getByTestId("codex-queue-toggle"));
-    expect(screen.getByTestId("codex-queue-paused")).toBeTruthy();
+    expect(await screen.findByTestId("codex-queue-paused")).toBeTruthy();
     fireEvent.click(screen.getByTestId("codex-queue-resume"));
     await flushAsync();
     expect(queueResumeBodies).toHaveLength(1);

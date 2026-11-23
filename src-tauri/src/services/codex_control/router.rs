@@ -334,6 +334,8 @@ pub(crate) struct LeasedAnswerContext {
 /// mark_claimed）。
 pub(crate) struct LeasedSendContext {
     pub(crate) lease: WriterLease,
+    pub(crate) first_write_deadline: Option<tokio::time::Instant>,
+    pub(crate) scope_recheck: Option<crate::services::codex_desktop_ipc::types::InteractionRecheck>,
     pub(crate) priority_recheck: crate::services::codex_desktop_ipc::types::InteractionRecheck,
     pub(crate) admission:
         std::sync::Arc<crate::services::codex_desktop_ipc::types::AttemptAdmission>,
@@ -605,6 +607,14 @@ struct TakeoverReservation {
 struct ReservationIntent<'a> {
     reservation: Option<&'a TakeoverReservation>,
     intent: Option<&'a PriorityIntentGuard>,
+    priority: Option<&'a PriorityDispatchScope>,
+}
+
+/// 显式 HTTP 插队的持久暂停与连接、回合复核。Resume 删除 token 即撤掉重试资格。
+pub(crate) struct PriorityDispatchScope {
+    pub(crate) pause_token: String,
+    pub(crate) gate: Arc<dyn Fn() -> Option<SendGate> + Send + Sync>,
+    pub(crate) on_pause_cleared: Arc<dyn Fn() + Send + Sync>,
 }
 
 /// Task1 交错验证停点回调类型（仅 debug/test 构建存在）——参数依次为停点上下文：
@@ -950,6 +960,7 @@ enum HeadOutcome {
     /// A5.1/F5.21：携带写前新鲜门的真实原因（native_pending/state_unknown 不再
     /// 误报 busy_before_write）；仅限「确证零写、原项留队」路径。
     Busy(&'static str),
+    RequeuedBusy,
     /// Task7：接管事务授权点前意图已换代/到期（IMMEDIATE 就绪+源校验后最终
     /// validator 拒绝）——事务回滚零业务 mutation，映射 dispatch_in_flight
     ///（不冒充 grant_consumed/LeftQueue/DBErr）。
@@ -1826,7 +1837,9 @@ impl CodexControlRouter {
             HeadOutcome::Refused(r) | HeadOutcome::Lost(r) => RouterOutcome::Completed(r),
             HeadOutcome::DbBlocked => not_sent_completed(&ctx.action_id, "store_error"),
             // 最终复核仍忙/无法确认状态：只排队（reserve 尚未发生，账本无残留）
-            HeadOutcome::Busy(_) => queued_outcome(&ctx.action_id, &view),
+            HeadOutcome::Busy(_) | HeadOutcome::RequeuedBusy => {
+                queued_outcome(&ctx.action_id, &view)
+            }
             // Task7：StaleIntent 仅源自接管路径（intent=Some）；本路径无意图伴随
             //（防御臂，不可达）——零 mutation 留队。
             HeadOutcome::StaleIntent => queued_outcome(&ctx.action_id, &view),
@@ -1922,7 +1935,9 @@ impl CodexControlRouter {
             HeadOutcome::Terminal(o) => o,
             HeadOutcome::Refused(r) | HeadOutcome::Lost(r) => RouterOutcome::Completed(r),
             HeadOutcome::DbBlocked => not_sent_completed(&ctx.action_id, "store_error"),
-            HeadOutcome::Busy(_) => queued_outcome(&ctx.action_id, view),
+            HeadOutcome::Busy(_) | HeadOutcome::RequeuedBusy => {
+                queued_outcome(&ctx.action_id, view)
+            }
             // Task7：StaleIntent 仅源自接管路径（intent=Some）；本路径无意图伴随
             //（防御臂，不可达）——零 mutation 留队（授权保留）。
             HeadOutcome::StaleIntent => queued_outcome(&ctx.action_id, view),
@@ -2229,6 +2244,7 @@ impl CodexControlRouter {
         front: Deadline,
         thread_lock: tokio::sync::OwnedMutexGuard<()>,
         intent: PriorityIntentGuard,
+        priority: Option<PriorityDispatchScope>,
     ) -> PrioritizeOutcome {
         // Task7：获锁后复核（owner/期限/Queued，Result 保真）后直进共享 core
         //（不经 public 兼容包装）。DBErr 如实 store_error，不伪装离队。
@@ -2246,7 +2262,7 @@ impl CodexControlRouter {
                 return PrioritizeOutcome::StillQueued("store_error");
             }
         }
-        self.prioritize_queued_core(action_id, key, front, thread_lock, intent)
+        self.prioritize_queued_core(action_id, key, front, thread_lock, intent, priority)
             .await
     }
 
@@ -2264,8 +2280,15 @@ impl CodexControlRouter {
         match self.begin_priority_intent(key, action_id, front) {
             PriorityRegistration::Leader(intent) => match self.wait_priority_turn(&intent).await {
                 Ok(thread_lock) => {
-                    self.prioritize_queued_with_intent(action_id, key, front, thread_lock, intent)
-                        .await
+                    self.prioritize_queued_with_intent(
+                        action_id,
+                        key,
+                        front,
+                        thread_lock,
+                        intent,
+                        None,
+                    )
+                    .await
                 }
                 Err(outcome) => outcome,
             },
@@ -2282,15 +2305,14 @@ impl CodexControlRouter {
         }
     }
 
-    /// Task7：mint 出的真实 attempt 按 key/action/**owner** 三比对绑定进 registry
-    /// entry（bind-once——同一次意图至多铸造一次；已绑定不覆盖；旧 token 不得
-    /// 污染换代后的同 action 新 entry）。短锁内无 DB/await。
+    /// 绑定实际授权 attempt。重试只允许替换同一 owner 的上一笔确定零写 attempt。
     fn priority_registry_bind_attempt(
         &self,
         key: &ThreadKey,
         intent: &PriorityIntentGuard,
         action_id: &str,
         attempt: i64,
+        previous_attempt: Option<i64>,
     ) {
         let mut reg = self
             .priority_intents
@@ -2299,7 +2321,7 @@ impl CodexControlRouter {
         if let Some(entry) = reg.get_mut(key) {
             if entry.action_id == action_id
                 && entry.owner == intent.owner
-                && entry.attempt.is_none()
+                && entry.attempt == previous_attempt
             {
                 entry.attempt = Some(attempt);
             }
@@ -2352,7 +2374,7 @@ impl CodexControlRouter {
     ) -> PrioritizeOutcome {
         match self.begin_priority_intent(key, action_id, front) {
             PriorityRegistration::Leader(intent_guard) => {
-                self.prioritize_queued_core(action_id, key, front, thread_lock, intent_guard)
+                self.prioritize_queued_core(action_id, key, front, thread_lock, intent_guard, None)
                     .await
             }
             PriorityRegistration::Replay(replay) => {
@@ -2368,9 +2390,7 @@ impl CodexControlRouter {
         }
     }
 
-    /// Task7 共享私有 core：mint（恰一次）→ 按当前 token 绑定真实 attempt 进
-    /// registry → pending 新鲜守卫 → 0..N 源接管事务派发（原 Task5 正文逐字保留）。
-    /// Leader 句柄活到本函数结束（含派发全程），Drop 按 key+token 条件注销并唤醒。
+    /// 同一 writer 锁内执行选中动作，只有确证零写且仍在原授权期限内才重试。
     async fn prioritize_queued_core(
         &self,
         action_id: &str,
@@ -2378,6 +2398,7 @@ impl CodexControlRouter {
         front: Deadline,
         thread_lock: tokio::sync::OwnedMutexGuard<()>,
         intent_guard: PriorityIntentGuard,
+        priority: Option<PriorityDispatchScope>,
     ) -> PrioritizeOutcome {
         // Task7：core 入口复核（owner/期限/Queued，Result 保真）——Leader 两条
         // 入口路径（HTTP 伴随 / 旧 public 直调）统一覆盖；句柄活到本函数结束
@@ -2402,22 +2423,95 @@ impl CodexControlRouter {
             Some(instant) if instant <= intent_guard.expires_at => front,
             _ => Deadline::from_instant(Some(intent_guard.expires_at)),
         };
-        let mut lease: Option<WriterLease> = Some(Arc::new(thread_lock));
+        const RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(25);
+        let lease = Arc::new(thread_lock);
+        let mut previous_attempt = None;
+        loop {
+            if let Some(scope) = &priority {
+                loop {
+                    match self.store.queue_pause_owned(key, &scope.pause_token) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            return PrioritizeOutcome::StillQueued(BUSY_BEFORE_WRITE_REASON)
+                        }
+                        Err(_) => return PrioritizeOutcome::StillQueued("store_error"),
+                    }
+                    match (scope.gate)() {
+                        Some(SendGate::Clear) => break,
+                        Some(SendGate::StateUnknown) if previous_attempt.is_some() => {
+                            if front
+                                .within(tokio::time::sleep(RETRY_INTERVAL))
+                                .await
+                                .is_err()
+                                || !self.intent_token_valid(key, &intent_guard)
+                            {
+                                return PrioritizeOutcome::StillQueued(BUSY_BEFORE_WRITE_REASON);
+                            }
+                        }
+                        gate => {
+                            return PrioritizeOutcome::StillQueued(
+                                gate.map_or(BUSY_BEFORE_WRITE_REASON, send_gate_blocked_reason),
+                            )
+                        }
+                    }
+                }
+            }
+            let outcome = self
+                .prioritize_queued_attempt(
+                    action_id,
+                    key,
+                    front,
+                    &mut Some(lease.clone()),
+                    &intent_guard,
+                    priority.as_ref(),
+                    previous_attempt,
+                )
+                .await;
+            match outcome {
+                Ok(outcome) => return outcome,
+                Err(grant_attempt) if priority.is_some() => {
+                    previous_attempt = Some(grant_attempt);
+                    // Writer 租约与意图截止不变。原 attempt 已消费，下一次必须重新 CAS。
+                    if front
+                        .within(tokio::time::sleep(RETRY_INTERVAL))
+                        .await
+                        .is_err()
+                    {
+                        return PrioritizeOutcome::StillQueued(BUSY_BEFORE_WRITE_REASON);
+                    }
+                }
+                Err(_) => return PrioritizeOutcome::StillQueued(BUSY_BEFORE_WRITE_REASON),
+            }
+        }
+    }
+
+    /// Err 仅表示本次授权已消费、writer 确认零字节且回队事务已提交。
+    #[allow(clippy::too_many_arguments)]
+    async fn prioritize_queued_attempt(
+        &self,
+        action_id: &str,
+        key: &ThreadKey,
+        front: Deadline,
+        lease: &mut Option<WriterLease>,
+        intent_guard: &PriorityIntentGuard,
+        priority: Option<&PriorityDispatchScope>,
+        previous_attempt: Option<i64>,
+    ) -> Result<PrioritizeOutcome, i64> {
         // Task7 Major5：Result 三臂——DBErr 如实 store_error（不吞为 LeftQueue）。
         let head = match self.store.queued_action_by_id(action_id) {
             Ok(Some(head)) => head,
-            Ok(None) => return PrioritizeOutcome::LeftQueue,
+            Ok(None) => return Ok(PrioritizeOutcome::LeftQueue),
             Err(e) => {
                 log::error!(
-                    "codex_control: 优先处理目标读取失败（保守 store_error）action={action_id} err={e}"
-                );
-                return PrioritizeOutcome::StillQueued("store_error");
+                "codex_control: 优先处理目标读取失败（保守 store_error）action={action_id} err={e}"
+            );
+                return Ok(PrioritizeOutcome::StillQueued("store_error"));
             }
         };
         // R01 接缝防御（不信任调用方）：行归属线程必须与请求线程一致——不一致
         // 零 mutation（不建授权、不派发、不停任何回合），动作原样留队。
         if head.ctx.key != *key {
-            return PrioritizeOutcome::StillQueued("thread_mismatch");
+            return Ok(PrioritizeOutcome::StillQueued("thread_mismatch"));
         }
         // 插队不要求「队列已暂停」（2026-10-31 用户裁决：「插队的行为就是停止进程
         // 之后，直接把这个消息打出去」）。
@@ -2440,8 +2534,8 @@ impl CodexControlRouter {
         // 都用它，不猜测/不另查）。
         // Task7：mint 前 owner/期限显式复核（早退省一次 DB 触达）——过期/换代 →
         // 让位；权威闸在下方 checked mint 的最终 validator。
-        if !self.intent_token_valid(key, &intent_guard) {
-            return PrioritizeOutcome::StillQueued(DISPATCH_IN_FLIGHT_REASON);
+        if !self.intent_token_valid(key, intent_guard) {
+            return Ok(PrioritizeOutcome::StillQueued(DISPATCH_IN_FLIGHT_REASON));
         }
         // Task7：mint 走 checked 闸——连接锁 + IMMEDIATE 写事务就绪、grant 行
         // mutation 前最终 validator（registry 短锁内 owner/期限现场判定）。此前
@@ -2449,34 +2543,41 @@ impl CodexControlRouter {
         let grant_attempt = match self.store.mint_bypass_grant_attempt_checked(
             action_id,
             key,
-            || self.intent_token_valid(key, &intent_guard),
+            previous_attempt,
+            || self.intent_token_valid(key, intent_guard),
         ) {
             Ok(crate::database::dao::codex_actions::CheckedMutation::Applied(a)) => a,
             Ok(crate::database::dao::codex_actions::CheckedMutation::StaleIntent) => {
                 log::info!(
-                    "codex_control: mint 前 DB 等待跨期（意图已换代/到期，零授权 mutation）action={action_id}"
-                );
-                return PrioritizeOutcome::StillQueued(DISPATCH_IN_FLIGHT_REASON);
+                "codex_control: mint 前 DB 等待跨期（意图已换代/到期，零授权 mutation）action={action_id}"
+            );
+                return Ok(PrioritizeOutcome::StillQueued(DISPATCH_IN_FLIGHT_REASON));
             }
             Err(e) => {
                 log::error!(
                     "codex_control: 优先处理授权写入失败（零投递）action={action_id} err={e}"
                 );
-                return PrioritizeOutcome::StillQueued("store_error");
+                return Ok(PrioritizeOutcome::StillQueued("store_error"));
             }
         };
         // Task7：真实 attempt 按 key/action/**owner** 三比对绑定（bind-once）——
         // 旧 token 不污染换代后的新 entry。
-        self.priority_registry_bind_attempt(key, &intent_guard, action_id, grant_attempt);
+        self.priority_registry_bind_attempt(
+            key,
+            intent_guard,
+            action_id,
+            grant_attempt,
+            previous_attempt,
+        );
         // pending 守卫：授权不穿透（与越队路径同源；拒绝时不消费授权，零落账——
         // 已入队消息不因一次未执行的优先处理而作废）。
         let gate_fut = self.dispatch.send_gate_fresh(key);
         let gate_state = match front.within(gate_fut).await {
             Ok(g) => g,
-            Err(_) => return PrioritizeOutcome::StillQueued(FRONT_BUDGET_ELAPSED_REASON),
+            Err(_) => return Ok(PrioritizeOutcome::StillQueued(FRONT_BUDGET_ELAPSED_REASON)),
         };
         if matches!(gate_state, SendGate::NativePending) {
-            return PrioritizeOutcome::StillQueued(NATIVE_PENDING_REASON);
+            return Ok(PrioritizeOutcome::StillQueued(NATIVE_PENDING_REASON));
         }
         // Task5（GREEN 返修统一，2026-11-12）：所有合法 idle 显式优先处理一律走
         // **0..N 源真实接管事务**——源集合 = 真实 book（Task4 快照优先）+ 实际
@@ -2491,8 +2592,15 @@ impl CodexControlRouter {
         // Lost 仅来自接管事务 Ok(false)（回滚零效果）——按目标**真实状态**分派：
         // 已离开 queued（撤回/并发赢者已处理）走 LeftQueue（调用方按账本实际状态
         // 回应，不复活）；仍 queued = 授权缺失或已消费（入口保留可重试）。
-        return match self
-            .dispatch_head_takeover(&head, front, grant_attempt, &mut lease, Some(&intent_guard))
+        let outcome = match self
+            .dispatch_head_takeover(
+                &head,
+                front,
+                grant_attempt,
+                lease,
+                Some(intent_guard),
+                priority,
+            )
             .await
         {
             HeadOutcome::Terminal(RouterOutcome::Completed(receipt)) => {
@@ -2532,9 +2640,9 @@ impl CodexControlRouter {
                         Ok(false) => GRANT_CONSUMED_REASON,
                         Err(e) => {
                             log::error!(
-                                "codex_control: 接管 Lost 复读目标 fence 失败（保守 store_error）action={} err={e}",
-                                head.ctx.action_id
-                            );
+                        "codex_control: 接管 Lost 复读目标 fence 失败（保守 store_error）action={} err={e}",
+                        head.ctx.action_id
+                    );
                             "store_error"
                         }
                     },
@@ -2553,7 +2661,9 @@ impl CodexControlRouter {
             HeadOutcome::Refused(receipt) => PrioritizeOutcome::Completed(receipt),
             HeadOutcome::DbBlocked => PrioritizeOutcome::StillQueued("store_error"),
             HeadOutcome::Busy(reason) => PrioritizeOutcome::StillQueued(reason),
+            HeadOutcome::RequeuedBusy => return Err(grant_attempt),
         };
+        Ok(outcome)
     }
 
     /// 审批 / 阻塞问答作答。只走主路径，绝不降级为普通消息；不取 Thread 派发锁
@@ -3244,7 +3354,7 @@ impl CodexControlRouter {
                 HeadOutcome::Lost(_) => continue,
                 HeadOutcome::DbBlocked => return None,
                 // 最终复核仍忙/无法确认状态：留队等下一事件
-                HeadOutcome::Busy(_) => return None,
+                HeadOutcome::Busy(_) | HeadOutcome::RequeuedBusy => return None,
                 // Task7：StaleIntent 仅源自接管路径（intent=Some）；本路径无意图
                 // 伴随（防御臂，不可达）——停止接力，零 mutation。
                 HeadOutcome::StaleIntent => return None,
@@ -3356,6 +3466,7 @@ impl CodexControlRouter {
             ReservationIntent {
                 reservation: None,
                 intent: None,
+                priority: None,
             },
         )
         .await
@@ -3381,6 +3492,7 @@ impl CodexControlRouter {
         grant_attempt: i64,
         lease: &mut Option<WriterLease>,
         intent: Option<&PriorityIntentGuard>,
+        priority: Option<&PriorityDispatchScope>,
     ) -> HeadOutcome {
         // 写前新鲜复核（持真实 writer 锁后的复查；与普通派发同源判据）。Task7：
         // `front` 已由 core 裁剪为 min(原 front, 意图期限)——Deadline::none 亦受
@@ -3580,6 +3692,7 @@ impl CodexControlRouter {
             ReservationIntent {
                 reservation: Some(&reservation),
                 intent,
+                priority,
             },
         )
         .await
@@ -3708,7 +3821,49 @@ impl CodexControlRouter {
         // = 非 selected，任何有效意图在册即拒绝准入。
         let priority_admission =
             self.create_priority_admission(&head.ctx.key, ctx.reservation.is_some());
-        let priority_recheck = Self::create_priority_recheck(&priority_admission);
+        let mut priority_recheck = Self::create_priority_recheck(&priority_admission);
+        let mut scope_recheck = None;
+        if let (Some(scope), Some(intent), Some(reservation)) =
+            (ctx.priority, ctx.intent, ctx.reservation)
+        {
+            let registry = self.priority_intents.clone();
+            let store = self.store.clone();
+            let key = head.ctx.key.clone();
+            let action_id = head.ctx.action_id.clone();
+            let owner = intent.owner;
+            let attempt = reservation.grant_attempt;
+            let pause_token = scope.pause_token.clone();
+            let gate = scope.gate.clone();
+            let verify: crate::services::codex_desktop_ipc::types::InteractionRecheck =
+                Arc::new(move || {
+                    if !matches!(store.queue_pause_owned(&key, &pause_token), Ok(true))
+                        || gate() != Some(SendGate::Clear)
+                    {
+                        return Some(BUSY_BEFORE_WRITE_REASON.to_string());
+                    }
+                    let current = registry
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .get(&key)
+                        .is_some_and(|entry| {
+                            entry.owner == owner
+                                && entry.action_id == action_id
+                                && entry.attempt == Some(attempt)
+                                && entry.expires_at > tokio::time::Instant::now()
+                        });
+                    if !current {
+                        return Some(BUSY_BEFORE_WRITE_REASON.to_string());
+                    }
+                    None
+                });
+            let admission_recheck = priority_recheck;
+            scope_recheck = Some(verify.clone());
+            priority_recheck = Arc::new(move || verify().or_else(|| admission_recheck()));
+        }
+        let first_write_deadline = ctx.priority.and_then(|_| front.instant());
+        let priority_pause = ctx
+            .priority
+            .map(|scope| (scope.pause_token.clone(), scope.on_pause_cleared.clone()));
         let task = tokio::spawn(async move {
             // 派发全程受收尾预算约束；到期按「可能已写出」收尾（unknown），绝不 NotSent
             let _lease_keepalive = lease_taken.clone();
@@ -3721,8 +3876,10 @@ impl CodexControlRouter {
                     wrap,
                     LeasedSendContext {
                         lease: l.clone(),
+                        first_write_deadline,
                         priority_recheck: priority_recheck.clone(),
                         admission: std::sync::Arc::clone(&priority_admission),
+                        scope_recheck,
                     },
                 ),
                 _ => dispatch.send_text(
@@ -3815,13 +3972,27 @@ impl CodexControlRouter {
             // 的占位，不同步清掉并发重新登记的新占位。
             let settle =
                 settle_dispatch_outcome(&book, &store, &owner, &head2, &composed2, &mut receipt);
+            if receipt.delivery == Delivery::Accepted && settle == SettleOutcome::Persisted {
+                if let Some((token, on_cleared)) = priority_pause {
+                    match store.clear_queue_pause_owned(&head2.ctx.key, &token) {
+                        Ok(true) => on_cleared(),
+                        Ok(false) => {}
+                        Err(e) => log::error!(
+                            "codex_control: 清除插队暂停失败 action={} err={e}",
+                            head2.ctx.action_id
+                        ),
+                    }
+                }
+            }
             (receipt, settle)
         });
         // Task7 Major6：实际 reserve→book→spawn 交接已过、前台等待 task 之前——
         // 解除调度意图（短锁外 wake；串行责任由 BG 任务与 Frame 强捕 WriterLease
         // 继续承担）。此后 guard Drop 因 entry 已在而 no-op（token 比对保护）。
-        if let Some(intent) = ctx.intent {
-            self.dissolve_priority_intent(&head.ctx.key, &intent.owner);
+        if ctx.priority.is_none() {
+            if let Some(intent) = ctx.intent {
+                self.dissolve_priority_intent(&head.ctx.key, &intent.owner);
+            }
         }
         // 前台预算内等待结果；到期 = 前台等待结束（T 已分离、自结算）
         let (receipt, settle) = match front.within(task).await {
@@ -3853,7 +4024,7 @@ impl CodexControlRouter {
         };
         // B1：DispatchOutcome.revision 不再作释放基线（保留字段供回执/日志语义）
         match settle {
-            SettleOutcome::RequeuedBusy => HeadOutcome::Busy(BUSY_BEFORE_WRITE_REASON),
+            SettleOutcome::RequeuedBusy => HeadOutcome::RequeuedBusy,
             SettleOutcome::BusyRequeueLost => HeadOutcome::Terminal(RouterOutcome::Completed(
                 not_sent_receipt(&head.ctx.action_id, ControlRoute::None, "busy_requeue_lost"),
             )),
@@ -4181,7 +4352,7 @@ mod priority_owner_tests {
                 _ => panic!("已过期意图不得阻止新 owner"),
             };
         assert_ne!(old.owner, new.owner);
-        router.priority_registry_bind_attempt(&key, &old, "same-action", 17);
+        router.priority_registry_bind_attempt(&key, &old, "same-action", 17, None);
         {
             let reg = router.priority_intents.lock().unwrap();
             let entry = reg.get(&key).unwrap();
@@ -4197,7 +4368,7 @@ mod priority_owner_tests {
             assert_eq!(entry.owner, new.owner);
             assert_eq!(entry.attempt, None);
         }
-        router.priority_registry_bind_attempt(&key, &new, "same-action", 23);
+        router.priority_registry_bind_attempt(&key, &new, "same-action", 23, None);
         assert_eq!(
             router
                 .priority_intents

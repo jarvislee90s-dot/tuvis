@@ -151,12 +151,18 @@ export function UpdaterDialog({ manualCheck = false, autoOpen = true }: UpdaterD
   }, [manualCheck, autoOpen, checking, result, openDialog]);
 
   // note 限高滚动提示：内容超出可视高度才显示
-  const notesRef = useRef<HTMLDivElement>(null);
+  const [notesElement, setNotesElement] = useState<HTMLDivElement | null>(null);
   const [notesScrollable, setNotesScrollable] = useState(false);
   useLayoutEffect(() => {
-    const el = notesRef.current;
-    if (el) setNotesScrollable(el.scrollHeight > el.clientHeight + 4);
-  }, [update?.notes, dialogOpen]);
+    if (!notesElement) return;
+    const measure = () =>
+      setNotesScrollable(notesElement.scrollHeight > notesElement.clientHeight + 4);
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(notesElement);
+    if (notesElement.firstElementChild) observer.observe(notesElement.firstElementChild);
+    return () => observer.disconnect();
+  }, [notesElement]);
 
   // 评审 I2：安装失败必须给用户可操作反馈（如「此构建未启用应用内升级」），
   // 而不是按钮灰一下又亮回来
@@ -196,11 +202,13 @@ export function UpdaterDialog({ manualCheck = false, autoOpen = true }: UpdaterD
       // 下载中禁关：无取消下载手段，ESC/遮罩误关只会留下进度黑洞（评审 Minor）
       onOpenChange={(open) => !open && !downloading && closeDialog()}
     >
-      {/* 基座是 text-center sm:text-left：About 窗口宽约 500px，视口永远命不中
-          sm: ⇒ 全弹窗居中显业余，压回恒左对齐 */}
-      <DialogContent className="text-left">
-        <DialogHeader>
-          <DialogTitle className="flex items-center gap-2">
+      {/* 窗口高度不足时优先压缩发布说明，按钮组留在可视区。
+          窄且矮（<440×480）时再收一档间距/内边距/按钮高度：360×360 下说明区与滚动
+          提示必须同处描述区可视范围内（此前提示被描述区下沿裁掉，需先滚外层才能看见，
+          构成「滚动提示自身要滚动」的自指）。极端低高度仍由外层 overflow-y-auto 兜底。 */}
+      <DialogContent className="flex max-h-[calc(100dvh-2rem)] flex-col overflow-y-auto [@media(max-height:480px)]:gap-3 [@media(max-height:480px)]:p-4 [@media(max-width:439px)_and_(max-height:480px)]:gap-2 [@media(max-width:439px)_and_(max-height:480px)]:p-3">
+        <DialogHeader className="min-h-0 text-left [@media(max-height:270px)]:shrink-0 [@media(max-width:439px)_and_(max-height:480px)]:gap-1">
+          <DialogTitle className="flex shrink-0 items-center gap-2 pr-6">
             {downloading ? t("updater.downloading") : t("updater.updateAvailable")}
             {!downloading && update?.prerelease && (
               <span className="rounded-full border border-amber-500 px-2 py-px text-[11px] font-medium text-amber-500">
@@ -209,7 +217,7 @@ export function UpdaterDialog({ manualCheck = false, autoOpen = true }: UpdaterD
             )}
           </DialogTitle>
           <DialogDescription asChild>
-            <div className="space-y-2">
+            <div className="flex min-h-0 flex-col gap-2 overflow-y-auto [@media(max-width:439px)_and_(max-height:480px)]:gap-1.5">
               {downloading ? (
                 <div className="space-y-2">
                   <p>{t("updater.installingVersion", { version: update?.version })}</p>
@@ -217,7 +225,7 @@ export function UpdaterDialog({ manualCheck = false, autoOpen = true }: UpdaterD
                 </div>
               ) : (
                 <>
-                  <p>
+                  <p className="shrink-0">
                     {t("updater.versionAvailable", {
                       version: update?.version,
                       currentVersion: result?.status === "available" ? result.currentVersion : "",
@@ -231,23 +239,29 @@ export function UpdaterDialog({ manualCheck = false, autoOpen = true }: UpdaterD
                   </p>
                   <button
                     onClick={handleOpenGithub}
-                    className="text-muted-foreground hover:text-foreground underline underline-offset-2 transition-colors"
+                    className="text-muted-foreground hover:text-foreground shrink-0 self-start underline underline-offset-2 transition-colors"
                   >
                     {t("updater.viewOnGithub")}
                   </button>
                   {update?.notes && (
                     <>
-                      <p className="mt-2 font-semibold">{t("updater.releaseNotes")}</p>
+                      <p className="shrink-0 font-semibold">{t("updater.releaseNotes")}</p>
                       <div
-                        ref={notesRef}
-                        className="bg-muted max-h-56 overflow-y-auto rounded-md p-3 text-sm leading-relaxed"
+                        ref={setNotesElement}
+                        className="bg-muted max-h-56 min-h-12 overflow-y-auto rounded-md p-3 text-sm leading-relaxed [@media(max-width:439px)_and_(max-height:480px)]:min-h-8 [@media(max-width:439px)_and_(max-height:480px)]:p-2"
+                        tabIndex={notesScrollable ? 0 : undefined}
                       >
-                        <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
-                          {update.notes}
-                        </ReactMarkdown>
+                        <div>
+                          <ReactMarkdown
+                            remarkPlugins={[remarkGfm]}
+                            components={markdownComponents}
+                          >
+                            {update.notes}
+                          </ReactMarkdown>
+                        </div>
                       </div>
                       {notesScrollable && (
-                        <p className="text-muted-foreground text-center text-[11px]">
+                        <p className="text-muted-foreground shrink-0 text-center text-[11px]">
                           {t("updater.scrollHint")}
                         </p>
                       )}
@@ -259,7 +273,7 @@ export function UpdaterDialog({ manualCheck = false, autoOpen = true }: UpdaterD
           </DialogDescription>
         </DialogHeader>
         {!downloading && (
-          <DialogFooter>
+          <DialogFooter className="shrink-0 [@media(max-width:439px)_and_(max-height:480px)]:gap-1 [@media(max-width:439px)_and_(max-height:480px)]:[&_[data-slot=button]]:h-7 [@media(max-width:439px)_and_(max-height:480px)]:[&_[data-slot=button]]:px-3 [@media(max-width:439px)_and_(max-height:480px)]:[&_[data-slot=button]]:text-[13px] [@media(min-width:440px)_and_(max-height:480px)]:flex-row [@media(min-width:440px)_and_(max-height:480px)]:justify-end">
             <Button variant="ghost" onClick={handleSkip}>
               {t("updater.skipVersion")}
             </Button>

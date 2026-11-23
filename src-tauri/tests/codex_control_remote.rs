@@ -616,6 +616,7 @@ fn projection_with_rev(thread_id: &str, status: &str, revision: u64) -> ThreadPr
         turn_image_count: 0,
         omitted_artifact_count: 0,
         interaction_answer: None,
+        interaction_answers: Vec::new(),
     }];
     projection.truncated = false;
     projection.history_token = String::new();

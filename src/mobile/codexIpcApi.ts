@@ -203,9 +203,11 @@ export interface CodexQueueView {
   blockedReasonCode: string | null;
   blockedActionIds?: string[];
   canInterrupt?: boolean;
-  /** S2：打断后持久暂停状态（serde default 向后兼容；唯一解除出口 = /codex/queue/resume）。 */
+  /** 当前线程存在暂停行。旧后端可能省略暂停字段。 */
   queuePaused?: boolean;
   queuePauseReason?: string | null;
+  /** 所有暂停行都可在绑定回合到达终态后自动解除。 */
+  stopPauseAutoResumes?: boolean;
 }
 
 /** 「已进入桌面队列」发送回执 chip（MessageComposer 持有；actionId 是对账锚）。 */
@@ -287,8 +289,10 @@ export interface ProjectedMessage {
   turnImageCount?: number;
   /** 仅服务端预算省略的附件数；与 UI 的 12 图／6 chip 展示限额无关。 */
   omittedArtifactCount?: number;
-  /** T03：正式答复摘要（正文不再重复内部信封标记）。 */
+  /** 兼容旧载荷和客户端的首条正式答复。 */
   interactionAnswer?: CodexInteractionAnswerSummary | null;
+  /** 同一用户消息内的正式答复，按信封顺序排列。 */
+  interactionAnswers?: CodexInteractionAnswerSummary[];
 }
 
 /** T02：逐操作键（serde snake_case）。 */
@@ -580,8 +584,14 @@ const CONTENT_STATES = new Set(["loading", "ready", "partial", "unsupported"]);
  *  缺省 ≠ 服务端省略：`omittedArtifactCount` 只由后端预算给出，旧载荷不会被伪造成
  *  「有附件被省略」。 */
 function normalizeProjectedMessage(message: ProjectedMessage): ProjectedMessage {
+  const { interactionAnswer, interactionAnswers, ...rest } = message;
+  const legacyAnswer = asInteractionAnswer(interactionAnswer);
+  const group = Array.isArray(interactionAnswers)
+    ? interactionAnswers.map(asInteractionAnswer).filter((answer) => answer !== null)
+    : [];
+  if (group.length === 0 && legacyAnswer) group.push(legacyAnswer);
   return {
-    ...message,
+    ...rest,
     turnId: message.turnId ?? null,
     artifacts: Array.isArray(message.artifacts) ? message.artifacts : [],
     turnImageCount:
@@ -592,11 +602,8 @@ function normalizeProjectedMessage(message: ProjectedMessage): ProjectedMessage 
       typeof message.omittedArtifactCount === "number" && message.omittedArtifactCount >= 0
         ? message.omittedArtifactCount
         : 0,
-    // T03：正式答复摘要（缺省保持 undefined——不改变旧载荷的字段形状；
-    // 有值时归一化，脏值丢弃不半渲染）。
-    ...(message.interactionAnswer === undefined
-      ? {}
-      : { interactionAnswer: asInteractionAnswer(message.interactionAnswer) }),
+    ...(interactionAnswer === undefined ? {} : { interactionAnswer: legacyAnswer }),
+    ...(group.length > 0 ? { interactionAnswers: group } : {}),
   };
 }
 
@@ -1112,11 +1119,14 @@ export async function fetchCodexAction(
 
 /** 拉取本设备在该 Thread 的队列视图（FIFO 位置/暂停原因）。
  *  403（设备失效）→ null（fetchCodexThread 同口径）；其余非 2xx → ApiError。 */
-export async function fetchCodexQueue(sessionId: string): Promise<CodexQueueView | null> {
+export async function fetchCodexQueue(
+  sessionId: string,
+  signal?: AbortSignal
+): Promise<CodexQueueView | null> {
   const q = new URLSearchParams({ session_id: sessionId });
   let r: Response;
   try {
-    r = await fetch(`${CODEX_QUEUE_PATH}?${q}`);
+    r = await fetch(`${CODEX_QUEUE_PATH}?${q}`, signal ? { signal } : undefined);
   } catch (e) {
     throw networkFail("codex/queue", e);
   }

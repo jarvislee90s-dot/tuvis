@@ -1162,19 +1162,12 @@ fn unknown_placeholders(
 
 /// 在当前消息列表上做正式答复标注（current 投影与历史分页同源）。
 ///
-/// 行为：
-/// * 用户消息里的合法信封 → `interactionAnswer` 元数据；正文**去掉信封原文**
-///   （不把内部标记当正文刷屏）；未知标识 `correlated=false`（不假称已解决）；
-/// * 同一题多条答复 → 只渲染首条元数据（`rendered_answer_count == 1`）；
-/// * 返回渲染的答复条数（测试与诊断用）。
+/// 用户消息里的正式答复按信封顺序生成摘要，同一题仅首条匹配项标为已关联。
+/// 正文保留信封前的文字，返回成功关联的答复条数（测试与诊断用）。
 pub fn annotate_interaction_answers(messages: &mut [ProjectedMessage], state: &Value) -> usize {
-    let questions = found_questions(state);
-    if questions.is_empty() {
-        return 0;
-    }
-    let known: HashMap<String, &FoundQuestion> = questions
-        .iter()
-        .map(|question| (question.question_key.clone(), question))
+    let known: HashSet<String> = found_questions(state)
+        .into_iter()
+        .map(|question| question.question_key)
         .collect();
     let mut rendered: HashSet<String> = HashSet::new();
     let mut count = 0;
@@ -1188,31 +1181,33 @@ pub fn annotate_interaction_answers(messages: &mut [ProjectedMessage], state: &V
         let Some(envelopes) = parse_answer_envelope(&message.text) else {
             continue;
         };
-        let Some(first) = envelopes.first() else {
-            continue;
-        };
-        let correlated = known.contains_key(&first.question_item_id);
-        if correlated && !rendered.insert(first.question_item_id.clone()) {
-            // 同题重复答复：正文照旧去标记，但不再产出第二条"已答"呈递。
-            message.text = message.text[..open].trim_end().to_string();
-            message.interaction_answer = Some(InteractionAnswerSummary {
-                question_key: first.question_item_id.clone(),
-                question: first.question.clone(),
-                answer: first.answer.clone(),
-                correlated: false,
-            });
+        // 即使来源题尚未加载，正式答复也必须使用官方紧凑题目标识。
+        if !envelopes.iter().all(|entry| {
+            parse_question_key(&entry.question_item_id).is_some_and(|(item_id, index)| {
+                question_item_id(&item_id, index) == entry.question_item_id
+            })
+        }) {
             continue;
         }
-        if correlated {
-            count += 1;
+        let answers: Vec<_> = envelopes
+            .into_iter()
+            .map(|entry| {
+                let correlated = known.contains(&entry.question_item_id)
+                    && rendered.insert(entry.question_item_id.clone());
+                count += usize::from(correlated);
+                InteractionAnswerSummary {
+                    question_key: entry.question_item_id,
+                    question: entry.question,
+                    answer: entry.answer,
+                    correlated,
+                }
+            })
+            .collect();
+        message.text.truncate(message.text[..open].trim_end().len());
+        message.interaction_answer = answers.first().cloned();
+        if answers.len() > 1 {
+            message.interaction_answers = answers;
         }
-        message.text = message.text[..open].trim_end().to_string();
-        message.interaction_answer = Some(InteractionAnswerSummary {
-            question_key: first.question_item_id.clone(),
-            question: first.question.clone(),
-            answer: first.answer.clone(),
-            correlated,
-        });
     }
     count
 }
@@ -1575,6 +1570,7 @@ mod tests {
                 turn_image_count: 0,
                 omitted_artifact_count: 0,
                 interaction_answer: None,
+                interaction_answers: Vec::new(),
             },
             crate::services::codex_desktop_ipc::types::ProjectedMessage {
                 id: "u-answer-echo".into(),
@@ -1587,6 +1583,7 @@ mod tests {
                 turn_image_count: 0,
                 omitted_artifact_count: 0,
                 interaction_answer: None,
+                interaction_answers: Vec::new(),
             },
         ];
         let rendered = annotate_interaction_answers(&mut messages, &state);
@@ -1596,10 +1593,146 @@ mod tests {
             messages[0].interaction_answer.as_ref().unwrap().answer,
             "甲"
         );
-        assert!(
-            !messages[0].interaction_answer.as_ref().unwrap().correlated
-                || messages[0].interaction_answer.as_ref().unwrap().correlated
+        assert!(messages[0].interaction_answer.as_ref().unwrap().correlated);
+        assert!(!messages[1].interaction_answer.as_ref().unwrap().correlated);
+        assert!(serde_json::to_value(&messages[0])
+            .unwrap()
+            .get("interactionAnswers")
+            .is_none());
+    }
+
+    #[test]
+    fn transcript_preserves_two_ordered_three_answer_envelopes() {
+        use crate::services::codex_desktop_ipc::mirror::ThreadMirror;
+        use crate::services::codex_desktop_ipc::types::{
+            CapabilitySet, MessagesPageStatus, OwnerLease,
+        };
+
+        let entries = |ids: [&str; 3]| {
+            ids.map(|id| {
+                (
+                    id.to_string(),
+                    0,
+                    format!("题目 {id}"),
+                    format!("答案 {id}"),
+                )
+            })
+        };
+        let first = compose_async_answers(&entries(["c", "a", "b"]));
+        // 第二组首项已经出现过，后面的独立题仍要关联和展示。
+        let second = compose_async_answers(&entries(["c", "e", "d"]));
+        let state = canonical(
+            &[
+                (
+                    "turn-1",
+                    "completed",
+                    ["a", "b", "c", "d", "e"]
+                        .iter()
+                        .map(|id| question_item(id, &format!("题目 {id}"), &["选项"]))
+                        .collect(),
+                    None,
+                    None,
+                ),
+                (
+                    "turn-2",
+                    "completed",
+                    vec![
+                        user_item("u-first", &first),
+                        user_item("u-second", &second),
+                        user_item("u-anchor", "后续消息"),
+                    ],
+                    None,
+                    None,
+                ),
+            ],
+            true,
         );
+        let mut messages: Vec<ProjectedMessage> = serde_json::from_value(json!([
+            {"id": "u-first", "role": "user", "kind": "userMessage", "text": first},
+            {"id": "u-second", "role": "user", "kind": "userMessage", "text": second}
+        ]))
+        .unwrap();
+
+        assert_eq!(annotate_interaction_answers(&mut messages, &state), 5);
+        let lease = OwnerLease {
+            key: key(),
+            client_id: "client".into(),
+            epoch: 1,
+            generation: 1,
+        };
+        let mut mirror = ThreadMirror::new(key());
+        mirror
+            .apply(
+                &lease,
+                &json!({"type": "snapshot", "revision": 1, "conversationState": state}),
+            )
+            .unwrap();
+        let current = mirror.project(CapabilitySet {
+            state: true,
+            send: false,
+            command: false,
+            permissions: false,
+            blocking_input: false,
+            interrupt: false,
+        });
+        let anchor = current.messages.last().unwrap();
+        let page = mirror.messages_page(Some(&anchor.id), &current.history_token, 2);
+        assert_eq!(page.status, MessagesPageStatus::Ready);
+        assert_eq!(
+            page.messages,
+            current.messages[current.messages.len() - 3..current.messages.len() - 1]
+        );
+
+        for (message, (id, expected)) in page.messages.iter().zip([
+            ("u-first", [("c", true), ("a", true), ("b", true)]),
+            ("u-second", [("c", false), ("e", true), ("d", true)]),
+        ]) {
+            let wire = serde_json::to_value(message).unwrap();
+            assert_eq!(wire["id"], id);
+            assert_eq!(wire["text"], "");
+            assert_eq!(
+                wire["interactionAnswers"],
+                json!(expected.map(|(id, correlated)| json!({
+                    "questionKey": question_item_id(id, 0),
+                    "question": format!("题目 {id}"),
+                    "answer": format!("答案 {id}"),
+                    "correlated": correlated,
+                })))
+            );
+            assert_eq!(wire["interactionAnswer"], wire["interactionAnswers"][0]);
+        }
+    }
+
+    #[test]
+    fn transcript_without_source_questions_only_formats_canonical_async_replies() {
+        let formal = compose_async_answer("not-loaded", 0, "题目", "答案");
+        let other = format!(
+            "{ENVELOPE_OPEN}\n[{{\"questionItemId\":\"ordinary-id\",\"question\":\"题目\",\"answer\":\"答案\"}}]\n{ENVELOPE_CLOSE}"
+        );
+        let messages: Vec<ProjectedMessage> = serde_json::from_value(json!([
+            {"id": "u-formal", "role": "user", "kind": "userMessage", "text": formal},
+            {"id": "u-other", "role": "user", "kind": "userMessage", "text": other}
+        ]))
+        .unwrap();
+        let unrelated = canonical(
+            &[(
+                "turn-1",
+                "completed",
+                vec![question_item("unrelated", "另一题", &["选项"])],
+                None,
+                None,
+            )],
+            true,
+        );
+
+        for state in [Value::Null, unrelated] {
+            let mut messages = messages.clone();
+            assert_eq!(annotate_interaction_answers(&mut messages, &state), 0);
+            assert_eq!(messages[0].text, "");
+            assert!(!messages[0].interaction_answer.as_ref().unwrap().correlated);
+            assert_eq!(messages[1].text, other);
+            assert!(messages[1].interaction_answer.is_none());
+        }
     }
 
     /// 重启后相关历史不完整：不清卡、不解锁（保持 Unknown）。

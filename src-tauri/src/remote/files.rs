@@ -115,12 +115,24 @@ pub(crate) const SENSITIVE_DIRS: &[&str] = &[
 pub enum FileRejectReason {
     /// 超过预览大小上限
     TooLarge,
-    /// 路径不存在 / 不可解析
+    /// 路径不存在或为空
     NotFound,
     /// 非常规文件（目录等）
     NotFile,
+    /// 操作系统拒绝访问
+    PermissionDenied,
     /// 其它读取失败
     Io,
+}
+
+impl From<std::io::Error> for FileRejectReason {
+    fn from(error: std::io::Error) -> Self {
+        match error.kind() {
+            std::io::ErrorKind::NotFound => Self::NotFound,
+            std::io::ErrorKind::PermissionDenied => Self::PermissionDenied,
+            _ => Self::Io,
+        }
+    }
 }
 
 impl FileRejectReason {
@@ -132,8 +144,9 @@ impl FileRejectReason {
                 MAX_TEXT_BYTES / 1024,
                 MAX_IMAGE_BYTES / 1024 / 1024
             ),
-            FileRejectReason::NotFound => "文件不存在或路径不可解析".into(),
+            FileRejectReason::NotFound => "文件不存在或路径为空".into(),
             FileRejectReason::NotFile => "目标不是常规文件".into(),
+            FileRejectReason::PermissionDenied => "操作系统拒绝读取文件".into(),
             FileRejectReason::Io => "文件读取失败".into(),
         }
     }
@@ -161,15 +174,11 @@ pub fn read_file_safe(
     // 相对路径仍按会话 cwd 解析（cwd 本身不构成边界——全盘语义下仅作解析基准）
     let mut full = PathBuf::from(path.trim());
     if full.is_relative() {
-        let cwd = Path::new(session_cwd)
-            .canonicalize()
-            .map_err(|_| FileRejectReason::NotFound)?;
+        let cwd = Path::new(session_cwd).canonicalize()?;
         full = cwd.join(full);
     }
-    let canon = full
-        .canonicalize()
-        .map_err(|_| FileRejectReason::NotFound)?;
-    let meta = canon.metadata().map_err(|_| FileRejectReason::NotFound)?;
+    let canon = full.canonicalize()?;
+    let meta = canon.metadata()?;
     if !meta.is_file() {
         return Err(FileRejectReason::NotFile);
     }
@@ -191,20 +200,18 @@ pub fn read_file_safe(
     if let Some(mutator) = STAT_READ_MUTATOR.with(|cell| cell.borrow().clone()) {
         mutator(&canon);
         // 变更后重新 stat：仅当仍是常规文件才继续（增长形态）。
-        let grown = canon.metadata().map_err(|_| FileRejectReason::NotFound)?;
+        let grown = canon.metadata()?;
         if !grown.is_file() {
             return Err(FileRejectReason::NotFile);
         }
     }
     // A5.2/F7：实际读取亦有界——stat 与读取之间的增长不得绕过上限
     //（take(max+1) 截断 + 多读一字节探测超限；恰好上限完整可读、无空成功）。
-    let file = std::fs::File::open(&canon).map_err(|_| FileRejectReason::Io)?;
+    let file = std::fs::File::open(&canon)?;
     let mut limited = file.take(max + 1);
     let mut bytes = Vec::new();
     use std::io::Read as _;
-    limited
-        .read_to_end(&mut bytes)
-        .map_err(|_| FileRejectReason::Io)?;
+    limited.read_to_end(&mut bytes)?;
     if bytes.len() as u64 > max {
         return Err(FileRejectReason::TooLarge);
     }
@@ -1040,6 +1047,97 @@ mod tests {
         assert_eq!(
             read_file_safe(cwd, "  ", Some(cwd)).unwrap_err(),
             FileRejectReason::NotFound
+        );
+    }
+
+    #[test]
+    fn read_file_safe_reports_invalid_target_as_io() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().to_str().unwrap();
+        assert_eq!(
+            read_file_safe(cwd, "invalid\0target.txt", None).unwrap_err(),
+            FileRejectReason::Io
+        );
+    }
+
+    #[test]
+    fn read_file_safe_reports_invalid_cwd_as_io() {
+        assert_eq!(
+            read_file_safe("invalid\0cwd", "hello.txt", None).unwrap_err(),
+            FileRejectReason::Io
+        );
+    }
+
+    #[test]
+    fn read_file_safe_reports_missing_cwd_as_not_found() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("missing-cwd");
+        assert_eq!(
+            read_file_safe(missing.to_str().unwrap(), "hello.txt", None).unwrap_err(),
+            FileRejectReason::NotFound
+        );
+    }
+
+    #[test]
+    fn read_file_safe_reports_removal_after_stat_as_not_found() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("removed.txt");
+        std::fs::write(&file, b"preview").unwrap();
+        let _guard = install_stat_read_mutator(Some(std::rc::Rc::new(|path| {
+            std::fs::remove_file(path).unwrap();
+        })));
+        assert_eq!(
+            read_file_safe(tmp.path().to_str().unwrap(), file.to_str().unwrap(), None).unwrap_err(),
+            FileRejectReason::NotFound
+        );
+    }
+
+    #[test]
+    fn permission_denied_io_error_serializes_as_permission_denied() {
+        let error = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        let reason = FileRejectReason::from(error);
+        assert_eq!(serde_json::to_value(reason).unwrap(), "permission_denied");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "需要临时目录所在卷支持 Windows ACL"]
+    fn read_file_safe_reports_windows_acl_read_denial() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().to_str().unwrap();
+        let file = tmp.path().join("denied.txt");
+        std::fs::write(&file, b"preview").unwrap();
+        // 仅拒绝此文件的读取数据权限；保留 ACL 修改权限以便恢复。
+        let deny = std::process::Command::new("icacls.exe")
+            .arg(&file)
+            .args(["/deny", "*S-1-1-0:(RD)"])
+            .status()
+            .unwrap();
+        let reads = std::panic::catch_unwind(|| {
+            let os_result = std::fs::File::open(&file).map(|_| ());
+            let preview_result = read_file_safe(cwd, "denied.txt", None);
+            (os_result, preview_result)
+        });
+        let restore = std::process::Command::new("icacls.exe")
+            .arg(&file)
+            .args(["/remove:d", "*S-1-1-0"])
+            .status()
+            .unwrap();
+        assert!(deny.success(), "设置临时文件 ACL 失败");
+        assert!(restore.success(), "恢复临时文件 ACL 失败");
+        assert_eq!(std::fs::read(&file).unwrap(), b"preview");
+        tmp.close().unwrap();
+        let (os_result, preview_result) = match reads {
+            Ok(results) => results,
+            Err(panic) => std::panic::resume_unwind(panic),
+        };
+        assert_eq!(
+            os_result.unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            serde_json::to_value(preview_result.unwrap_err()).unwrap(),
+            "permission_denied"
         );
     }
 

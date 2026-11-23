@@ -58,11 +58,11 @@ const QUEUE_REFRESH_DEBOUNCE_MS = 250;
  *  都重置去抖，入队回执触发的刷新会被无限推后（条目直到输出暂停才可见/可撤）。
  *  自首个未处理触发起超过本上限即立即重拉——合并与及时性两头保住。 */
 const QUEUE_REFRESH_MAX_WAIT_MS = 2000;
-/** 操作收尾刷新预算（毫秒）：prioritize 两臂唯一收尾 GET 的有界等待——POST
- *  结论已收到，提示与锁清理不得被一次挂起的 GET 无界阻塞。到期按「无快照」
- *  处理（保 POST 阶段事实 + 桌面核对 + 不自动重试），迟到响应由 seq/session
- *  哨兵作废。仅操作收尾使用；挂载/手动刷新/其他操作保持原等待语义。 */
+/** 插队收尾和核对读取的时限，超时的快照由 seq/session 哨兵作废。 */
 const QUEUE_OP_REFRESH_TIMEOUT_MS = 2000;
+const QUEUE_OBSERVE_INTERVAL_MS = 2000;
+const QUEUE_OBSERVE_WINDOW_MS = 12000;
+const MANUAL_STOP_PAUSE_RECOVERY_MS = 30_000;
 
 /** 动作状态 → 展示词（snake_case wire 词 → 用户可读；unknown 如实「结果未知」） */
 function stateLabel(s: CodexActionState): string {
@@ -248,10 +248,7 @@ function prioritizeHttpErrorCopy(e: ApiError): string {
   return i18n.t("mobile.codex.queue.prioritizeErrGeneric");
 }
 
-/** T06：优先处理回执四态 → 可读 note（全部关联**原 actionId**；queued=true 的
- *  拒绝如实说明「仍在队列」，unknown 不诱导重按、不自动重试——unknown 臂在
- *  prioritize() 内组 note：先取操作后快照再拼「阶段事实 + 排队状态 + 核对指引」，
- *  本函数到不了 unknown 的完整形态，仅保留其阶段事实作穷尽兜底）。 */
+/** 插队回执文案。调用方核对 actionId 和当前队列快照后再选用。 */
 function prioritizeResultCopy(res: CodexPrioritizeResult): string {
   switch (res.result) {
     case "prioritized":
@@ -312,8 +309,11 @@ export default function CodexQueuePanel({
   onQueueStateChanged,
   turnControl,
   onEditDraft,
+  keepEditDraftOnUnmount = false,
 }: {
   onEditDraft?: (draft: { sessionId: string; actionId: string; text: string }) => void;
+  /** 由按会话持有草稿的父组件接收已成功取回的正文。 */
+  keepEditDraftOnUnmount?: boolean;
   sessionId: string;
   /** R11：外部刷新信号（单调递增 tick）。每次递增 → 去抖重拉一次队列视图；
    *  触发源：a) 投影跃迁（SessionDetail）；b) 发送入队回执（MessageComposer）。
@@ -327,6 +327,14 @@ export default function CodexQueuePanel({
   turnControl?: CodexTurnControl;
 }) {
   const [view, setView] = useState<CodexQueueView | null>(null);
+  const [manualStopPauseRecovery, setManualStopPauseRecovery] = useState(false);
+  const stopPauseAutoResumes = view?.queuePaused === true && view.stopPauseAutoResumes === true;
+  useEffect(() => {
+    setManualStopPauseRecovery(false);
+    if (!stopPauseAutoResumes) return;
+    const timer = setTimeout(() => setManualStopPauseRecovery(true), MANUAL_STOP_PAUSE_RECOVERY_MS);
+    return () => clearTimeout(timer);
+  }, [sessionId, stopPauseAutoResumes]);
   const [busyId, setBusyId] = useState<string | null>(null);
   const [note, setNote] = useState<string | null>(null);
   /** 人工解除的二次确认臂（未确认不发任何请求——与 ModeBarCli 同款前端防线） */
@@ -337,12 +345,12 @@ export default function CodexQueuePanel({
   const [resumeBusy, setResumeBusy] = useState(false);
   /** T06：优先处理的确认臂（哪个 queued 行处于确认态；未确认不发任何请求） */
   const [prioritizeArmedId, setPrioritizeArmedId] = useState<string | null>(null);
-  /** C04（队列展示收纳）：默认折叠成一行摘要；展开才渲染消息行/暂停说明/恢复/
-   *  解除臂。收起只隐藏界面——armed 确认、在途操作、note 都保留在组件状态里，
-   *  切换本身不触发任何请求、不清暂停。新消息入队只经 refreshSignal 更新计数。 */
-  const [expanded, setExpanded] = useState(false);
+  /** 每次挂载默认展开。收起只隐藏界面，刷新和空队列自隐都保留用户选择，
+   *  确认状态、在途操作和提示也继续保存在组件中。 */
+  const [expanded, setExpanded] = useState(true);
   /** T06：优先处理请求在飞（按行禁用；回执关联原 actionId） */
   const [prioritizeBusyId, setPrioritizeBusyId] = useState<string | null>(null);
+  const operationBusy = busyId !== null || forceBusy || resumeBusy || prioritizeBusyId !== null;
   /** 乱序防护（R11）：请求序号——每次发起 +1，响应落地时不再是最新序号即作废
    *  （先发后至的响应不得覆盖后发请求的结果） */
   const seqRef = useRef(0);
@@ -356,28 +364,38 @@ export default function CodexQueuePanel({
    *  可 setNote/清 busy/通知父；旧 op 直接失权——新 scope setup 已同步重置其
    *  锁与状态，不依赖已失权旧 op 的清理，避免残锁带进新 scope。 */
   const prioritizeOpRef = useRef(0);
+  // 已受理是终态。仅用匹配原 actionId 的回执记账，挡住同一会话的旧排队快照。
+  const acceptedIdsRef = useRef(new Set<string>());
+  const prioritySnapshotRef = useRef<((view: CodexQueueView) => void) | null>(null);
+  const observationTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const observationReadRef = useRef<number | null>(null);
+  const queueReadRef = useRef<AbortController | null>(null);
 
-  /** 拉取队列视图；返回本次**成功 GET 的新视图**（403 设备失效 → null；网络失败
-   *  / 乱序/到期 → null）供操作后组 note 引用——调用方只把非 null 返回值当作
-   *  「同 scope 成功快照」使用，绝不拿旧闭包视图做状态承诺。
-   *
-   *  有界收尾（仅 prioritize 两臂传 QUEUE_OP_REFRESH_TIMEOUT_MS）：raw 是完整
-   *  fetchCodexQueue（含 fetch、错误正文读取与成功 json），不挂任何 UI 层
-   *  then/catch/finally；与到期 null promise 竞速。到期先置本次 expired，仅在
-   *  本调用仍拥有最新 seq 时 ++seqRef（作废自己、不误伤已开始的新请求），再
-   *  resolve(null)。提交护栏：!expired && sessionRef===sid && seqRef===seq 且
-   *  值非 null 才 setView/返回。到期后即使没有新请求，raw 的迟到 resolve/reject
-   *  也没有可提交的续体——不回灌 view/note/error、不清任何 busy。finally 仅清
-   *  本次 timer，不 await raw；无预算调用保持原等待语义。 */
+  const stopQueueObservation = useCallback(() => {
+    prioritySnapshotRef.current = null;
+    if (observationTimerRef.current !== null) clearTimeout(observationTimerRef.current);
+    observationTimerRef.current = null;
+    if (observationReadRef.current === seqRef.current) {
+      seqRef.current += 1;
+      queueReadRef.current?.abort();
+    }
+    observationReadRef.current = null;
+  }, []);
+
+  /** 仅将当前会话的最新成功快照提交到面板和插队反馈。超时作废该次查询的响应。 */
   const load = useCallback(
-    async (options?: { timeoutMs?: number }): Promise<CodexQueueView | null> => {
+    async (options?: { timeoutMs?: number }): Promise<void> => {
       const sid = sessionId;
+      if (sessionRef.current !== sid) return;
       const seq = ++seqRef.current;
+      queueReadRef.current?.abort();
+      const controller = new AbortController();
+      queueReadRef.current = controller;
       const timeoutMs = options?.timeoutMs;
       let expired = false;
       let timer: ReturnType<typeof setTimeout> | null = null;
       try {
-        const raw = fetchCodexQueue(sid);
+        const raw = fetchCodexQueue(sid, controller.signal);
         let v: CodexQueueView | null;
         if (timeoutMs === undefined) {
           v = await raw;
@@ -388,21 +406,26 @@ export default function CodexQueuePanel({
               timer = setTimeout(() => {
                 expired = true;
                 if (seq === seqRef.current) seqRef.current += 1;
+                controller.abort();
                 resolveDeadline(null);
               }, timeoutMs);
             }),
           ]);
-          if (expired) return null;
+          if (expired) return;
         }
         // 乱序防护：会话已切换 / 已有更新的请求或操作发出 → 本次响应作废
-        if (sessionRef.current !== sid || seq !== seqRef.current) return null;
-        if (v !== null) setView(v); // 403（设备失效）静默保留现有视图，全局判废通道处理
-        return v;
+        if (sessionRef.current !== sid || seq !== seqRef.current) return;
+        if (v === null) return; // 403 由全局判废通道处理
+        const accepted = acceptedIdsRef.current;
+        const fresh = accepted.size
+          ? { ...v, actions: v.actions.filter((action) => !accepted.has(action.actionId)) }
+          : v;
+        setView(fresh);
+        prioritySnapshotRef.current?.(fresh);
       } catch {
-        /* 拉取失败静默：保留上一份（面板是增强信息，不阻塞对话）；返回 null =
-        「无可用快照」，调用方不得据此宣称任何排队状态 */
-        return null;
+        // 查询失败时保留上次画面，队列说明只取成功快照。
       } finally {
+        if (queueReadRef.current === controller) queueReadRef.current = null;
         if (timer !== null) clearTimeout(timer);
       }
     },
@@ -413,6 +436,7 @@ export default function CodexQueuePanel({
   useEffect(() => {
     sessionRef.current = sessionId;
     firstPendingAtRef.current = null;
+    acceptedIdsRef.current.clear();
     setView(null);
     setNote(null);
     setForceArmed(false);
@@ -424,12 +448,14 @@ export default function CodexQueuePanel({
       sessionRef.current = ""; // 卸载（key 随会话变化）同样作废旧编辑回执。
       prioritizeOpRef.current += 1; // 在途 prioritize 操作失权：旧 op 无权 setNote/清锁/通知
       seqRef.current += 1; // 在途 load（含有界竞速收尾）响应一律作废
+      stopQueueObservation();
+      queueReadRef.current?.abort();
       if (debounceRef.current !== null) {
         clearTimeout(debounceRef.current);
         debounceRef.current = null;
       }
     };
-  }, [sessionId, load]);
+  }, [sessionId, load, stopQueueObservation]);
 
   // R11 + C6：外部触发 → 去抖合并重拉（信号为 0 = 尚无外部触发，不拉）。
   // 去抖带 maxWait 上限：流式 revision 每 ~100ms 推进会不断重置去抖——自首个
@@ -453,13 +479,14 @@ export default function CodexQueuePanel({
   }, [refreshSignal, load]);
 
   const edit = async (actionId: string) => {
-    if (busyId !== null || forceBusy || prioritizeBusyId !== null) return;
+    if (operationBusy) return;
     const sid = sessionId;
+    stopQueueObservation();
     setBusyId(actionId);
     setNote(null);
     try {
       const result = await editCodexQueueMessage(sid, actionId);
-      if (sessionRef.current !== sid) return;
+      if (sessionRef.current !== sid && !keepEditDraftOnUnmount) return;
       onEditDraft?.({ sessionId: sid, ...result });
     } catch (e) {
       if (sessionRef.current !== sid) return;
@@ -478,7 +505,8 @@ export default function CodexQueuePanel({
 
   const retract = useCallback(
     async (actionId: string) => {
-      if (busyId !== null || forceBusy) return;
+      if (operationBusy) return;
+      stopQueueObservation();
       setBusyId(actionId);
       setNote(null);
       try {
@@ -500,7 +528,7 @@ export default function CodexQueuePanel({
         await load();
       }
     },
-    [busyId, forceBusy, load]
+    [operationBusy, load, stopQueueObservation]
   );
 
   // 人工解除无出口屏障（确认后调用）：逐个解除在册屏障并重拉。单个 id 的确定性
@@ -509,10 +537,11 @@ export default function CodexQueuePanel({
   // （2026-10-19 复审 Minor：一败全停修复）；仅真失败（网络/5xx/403 等）→
   // 显示错误不静默（已成功的保留——重拉以服务端账本为权威）。
   const forceContinue = useCallback(async () => {
-    if (busyId !== null || forceBusy) return;
+    if (operationBusy) return;
     const ids = view?.blockedActionIds ?? [];
     setForceArmed(false);
     if (ids.length === 0) return;
+    stopQueueObservation();
     setForceBusy(true);
     setNote(null);
     try {
@@ -530,12 +559,13 @@ export default function CodexQueuePanel({
       setForceBusy(false);
       await load();
     }
-  }, [busyId, forceBusy, view, load]);
+  }, [operationBusy, view, load, stopQueueObservation]);
 
   // S5：恢复被打断暂停的队列（唯一解除出口；幂等——未暂停同样 200 paused:false）。
   // 成功/失败都重拉：暂停态以服务端为唯一权威。
   const resumeQueue = useCallback(async () => {
-    if (resumeBusy) return;
+    if (operationBusy) return;
+    stopQueueObservation();
     setResumeBusy(true);
     setNote(null);
     try {
@@ -549,7 +579,31 @@ export default function CodexQueuePanel({
       // F8：暂停解除 → 同页 composer 的 send-info（queuePaused）已过期，通知重拉
       onQueueStateChanged?.();
     }
-  }, [resumeBusy, sessionId, load, onQueueStateChanged]);
+  }, [operationBusy, sessionId, load, onQueueStateChanged, stopQueueObservation]);
+
+  const observeQueue = useCallback(
+    (isCurrent: () => boolean) => {
+      const deadline = Date.now() + QUEUE_OBSERVE_WINDOW_MS;
+      const schedule = () => {
+        const remaining = deadline - Date.now();
+        if (!isCurrent() || remaining <= QUEUE_OBSERVE_INTERVAL_MS) return;
+        observationTimerRef.current = setTimeout(async () => {
+          observationTimerRef.current = null;
+          if (!isCurrent()) return;
+          const timeoutMs = Math.min(QUEUE_OP_REFRESH_TIMEOUT_MS, deadline - Date.now());
+          if (timeoutMs <= 0) return;
+          const seq = seqRef.current + 1;
+          observationReadRef.current = seq;
+          await load({ timeoutMs });
+          if (observationReadRef.current !== seq) return;
+          observationReadRef.current = null;
+          schedule();
+        }, QUEUE_OBSERVE_INTERVAL_MS);
+      };
+      schedule();
+    },
+    [load]
+  );
 
   // T06：已入队消息的显式优先处理（POST /codex/queue/prioritize，两步确认）——
   // 「插队」越队派发的是**原 queued 行**（原 actionId/原文/原 cmid；后端
@@ -560,7 +614,7 @@ export default function CodexQueuePanel({
   // 的行；本入口只对单条显式触发，不提供/不暗示 FIFO 拖动排序。
   const prioritize = useCallback(
     async (actionId: string) => {
-      if (busyId !== null || forceBusy || prioritizeBusyId !== null) return;
+      if (operationBusy) return;
       const armedId = prioritizeArmedId;
       setPrioritizeArmedId(null);
       if (armedId !== actionId) return; // 确认臂与执行按钮必须同一条
@@ -573,9 +627,11 @@ export default function CodexQueuePanel({
       const frozenTurnId = turnControl?.activeTurnId ?? undefined;
       // 有效 armed 确认：递增操作代际（旧 op 全部失权），并作废开始前仍在途的
       // 旧刷新快照，再上锁、清 note。
+      stopQueueObservation();
       const op = ++prioritizeOpRef.current;
       ++seqRef.current;
       const sid = sessionId;
+      const isCurrent = () => sessionRef.current === sid && prioritizeOpRef.current === op;
       setPrioritizeBusyId(actionId);
       setNote(null);
       // note 在其后**所有**到达尾部的路径上都被穷尽分支赋值（try/catch 各自的
@@ -588,32 +644,85 @@ export default function CodexQueuePanel({
           expectedTurnId: confirmInterrupt ? (frozenTurnId ?? undefined) : undefined,
           confirmInterrupt,
         });
-        // POST 返回：仅当前 scope+当前 op 有权继续——旧 op 直接退出（新 scope
-        // setup 已同步重置其锁；不发旧 scope 的收尾 GET，不写 note/busy）。
-        if (sessionRef.current !== sid || prioritizeOpRef.current !== op) return;
-        // 成功臂唯一收尾 GET（有界预算）：note 与面板视图收在同一返回快照上。
-        // 到期/失败/乱序 → null → 保 POST 阶段事实 + 桌面核对 + 不自动重试，
-        // 不用旧 view 补 Queue，不发第二确认 GET。
-        const fresh = await load({ timeoutMs: QUEUE_OP_REFRESH_TIMEOUT_MS });
-        // GET 返回后再次验证归属，才允许清锁/通知/写 note。
-        if (sessionRef.current !== sid || prioritizeOpRef.current !== op) return;
-        note =
-          res.result === "unknown"
-            ? [
-                // Unknown 响应没有 queued/receipt 字段：已知 stop_ 前缀 =
-                // 停止结果未确认（与投递未知分型，可说本次未继续目标派发）；
-                // 其余（front_budget_elapsed / client_message_unverified 等
-                // 无法凭码定性）→ 保守「结果未知」，不归因预算、不断言未发。
-                prioritizeUnknownPhaseCopy(res.reasonCode),
-                queueFactFromSnapshot(fresh, actionId),
-                i18n.t("mobile.codex.queue.prioritizeUnknownGuide"),
-              ]
-                .filter(Boolean)
-                .join(" ")
-            : prioritizeResultCopy(res);
+        if (!isCurrent()) return;
+        const matches = res.actionId === actionId;
+        const accepted =
+          matches &&
+          ((res.result === "prioritized" &&
+            res.receipt.actionId === actionId &&
+            res.receipt.delivery === "accepted") ||
+            (res.result === "already_dispatched" &&
+              res.action.actionId === actionId &&
+              res.action.state === "accepted"));
+        if (accepted) {
+          acceptedIdsRef.current.add(actionId);
+          setView(
+            (current) =>
+              current && {
+                ...current,
+                actions: current.actions.filter((a) => a.actionId !== actionId),
+              }
+          );
+        }
+
+        const queuedRefusal = res.result === "not_sent" && res.queued;
+        const feedback = { snapshot: null as CodexQueueView | null, ready: false };
+        const copy = (snapshot: CodexQueueView | null) => {
+          if (
+            !matches ||
+            (res.result === "prioritized" && !accepted) ||
+            (res.result === "already_dispatched" && res.action.actionId !== actionId)
+          ) {
+            return i18n.t("mobile.codex.queue.prioritizeResultUncertain");
+          }
+          if (queuedRefusal) {
+            if (snapshot && !queueFactFromSnapshot(snapshot, actionId)) return null;
+            if (snapshot === null) {
+              return i18n.t("mobile.codex.queue.prioritizeFailed", {
+                message: prioritizeRefusalCopy(res.reasonCode, true),
+              });
+            }
+          }
+          if (res.result === "unknown") {
+            return [
+              prioritizeUnknownPhaseCopy(res.reasonCode),
+              queueFactFromSnapshot(snapshot, actionId),
+              i18n.t("mobile.codex.queue.prioritizeUnknownGuide"),
+            ]
+              .filter(Boolean)
+              .join(" ");
+          }
+          return prioritizeResultCopy(res);
+        };
+        if (matches && (queuedRefusal || res.result === "unknown")) {
+          prioritySnapshotRef.current = (snapshot) => {
+            feedback.snapshot = snapshot;
+            if (!feedback.ready) return;
+            const updated = copy(snapshot);
+            setNote(updated);
+            if (updated === null) prioritySnapshotRef.current = null;
+          };
+        }
+
+        await load({ timeoutMs: QUEUE_OP_REFRESH_TIMEOUT_MS });
+        if (!isCurrent()) return;
+        feedback.ready = true;
+        note = copy(feedback.snapshot);
+        if (note === null) prioritySnapshotRef.current = null;
+        // 自动 FIFO 可在插队被拒或派发结果未知后接手。短窗只观察队列，仍可见后续回队。
+        if (
+          matches &&
+          ((queuedRefusal &&
+            ["busy_before_write", "barrier_outstanding", "dispatch_in_flight"].includes(
+              res.reasonCode
+            )) ||
+            (res.result === "unknown" && !res.reasonCode.startsWith("stop_")))
+        ) {
+          observeQueue(isCurrent);
+        }
       } catch (e) {
         // catch 入口同样先验归属：旧 op 不得写 note/发旧 scope 收尾 GET。
-        if (sessionRef.current !== sid || prioritizeOpRef.current !== op) return;
+        if (!isCurrent()) return;
         // HTTP/网络错误按状态/码保守可读化（不裸码、不宣称队列状态、不建议直接
         // 重发，指引先回桌面核对实际状态）；wire 的 status/code 由 ApiError 原样
         // 保留（诊断不丢）。
@@ -623,7 +732,7 @@ export default function CodexQueuePanel({
         // 错误臂唯一收尾 GET（有界预算；load 自身归 null，不因 GET 失败/超时
         // 进入另一条补确认 GET 的路径）。
         await load({ timeoutMs: QUEUE_OP_REFRESH_TIMEOUT_MS });
-        if (sessionRef.current !== sid || prioritizeOpRef.current !== op) return;
+        if (!isCurrent()) return;
       }
       setPrioritizeBusyId(null);
       // 停止受理会置暂停/改变 send-info 可用性 → 通知上层（与打断臂同口径）
@@ -631,27 +740,26 @@ export default function CodexQueuePanel({
       if (note !== null) setNote(note);
     },
     [
-      busyId,
-      forceBusy,
-      prioritizeBusyId,
+      operationBusy,
       prioritizeArmedId,
       turnControl,
       sessionId,
       load,
       onQueueStateChanged,
+      stopQueueObservation,
+      observeQueue,
     ]
   );
 
   if (view === null) return null;
-  // 全空且无暂停原因：面板自隐（不渲染空壳）。
-  // T05（spec §5 细则 2）：没有排队消息、没有真实未知投递屏障时，**不因正在运行
-  // 就展开整段队列提醒**——仅 native_turn_active（桌面回合在跑、无屏障、无待发）
-  // 时不再出长说明与打断臂：停止入口由 composer 主按钮/紧凑入口承担（同一共享
-  // 控制器）。真实 Unknown（native_delivery_unknown，无自动恢复路径）与在途投递
-  // 屏障（native_turn_pending/compat_outstanding）不在此列——核对/解除入口保留。
+  // 零条待发时，普通运行态由发送区显示；只保留需人工核对或解除的屏障。
+  const needsManualResume = view.queuePaused === true && !stopPauseAutoResumes;
   const emptyHidden =
+    !needsManualResume &&
     view.actions.length === 0 &&
-    (view.blockedReasonCode === null || view.blockedReasonCode === "native_turn_active");
+    (view.blockedReasonCode === null ||
+      view.blockedReasonCode === "native_turn_active" ||
+      view.blockedReasonCode === "native_turn_pending");
   // 操作收尾的反馈（Unknown 核对提示 / HTTP·网络保守错误）不随空视图被吞：
   // 收尾 GET [] 把队列清空时，复用同一 note 反馈区域最小呈现（未操作空队列
   // note 为空仍按原自隐，不加壳不加新入口）。
@@ -712,21 +820,22 @@ export default function CodexQueuePanel({
       view.blockedReasonCode === "native_turn_active");
   const summaryStatusKey = needsManualVerify
     ? "mobile.codex.queue.summaryVerify"
-    : awaitingTurn
-      ? "mobile.codex.queue.summaryAwaitTurn"
-      : view.queuePaused === true
-        ? "mobile.codex.queue.summaryPaused"
-        : queuedCount > 0
-          ? "mobile.codex.queue.summaryQueued"
-          : "mobile.codex.queue.summaryIdle";
+    : stopPauseAutoResumes
+      ? "mobile.codex.queue.summaryStopPause"
+      : awaitingTurn
+        ? "mobile.codex.queue.summaryAwaitTurn"
+        : view.queuePaused === true
+          ? "mobile.codex.queue.summaryPaused"
+          : queuedCount > 0
+            ? "mobile.codex.queue.summaryQueued"
+            : "mobile.codex.queue.summaryIdle";
 
   return (
     <div
       data-testid="codex-queue-panel"
       className="rounded-xl border border-[var(--cb)] bg-[var(--cbg)] px-3 py-2"
     >
-      {/* C04：折叠摘要（默认只占一行）。Unknown 待人工核对在折叠行明确提示，
-          点「查看」即进入处理；新消息入队只经 refreshSignal 更新这里的计数。
+      {/* 收起时仍显示摘要，包括待人工核对状态。新消息入队时刷新计数。
           data-* 供测试做语言无关断言。 */}
       <div className="flex flex-wrap items-center gap-2">
         <span
@@ -743,6 +852,7 @@ export default function CodexQueuePanel({
         <button
           type="button"
           data-testid="codex-queue-toggle"
+          aria-expanded={expanded}
           onClick={() => setExpanded((v) => !v)}
           className="ml-auto rounded-full border border-[var(--bd)] px-2 py-0.5 text-xs text-[var(--mut)] underline"
         >
@@ -760,28 +870,35 @@ export default function CodexQueuePanel({
               {i18n.t(blockedBannerKey())}
             </p>
           )}
-          {/* S5：打断后持久暂停（S2）——按序派发冻结，等用户显式选择；恢复是唯一
-          解除出口，二选一中的「本条先发送」（一次性越队）在发送区提供 */}
-          {(view.actions.length > 0 || (view.blockedActionIds?.length ?? 0) > 0) &&
-            view.queuePaused === true && (
+          {/* 停止产生的临时冻结会随目标终态解除，其他暂停需要手动恢复。 */}
+          {view.queuePaused === true &&
+            (needsManualResume ||
+              view.actions.length > 0 ||
+              (view.blockedActionIds?.length ?? 0) > 0) && (
               <div data-testid="codex-queue-paused-block" className="mt-1">
                 <p
                   data-testid="codex-queue-paused"
                   className="text-xs text-amber-700 dark:text-amber-400"
                 >
-                  {i18n.t("mobile.codex.queue.pausedNote")}
+                  {i18n.t(
+                    stopPauseAutoResumes
+                      ? "mobile.codex.queue.stopPauseNote"
+                      : "mobile.codex.queue.pausedNote"
+                  )}
                 </p>
-                <button
-                  type="button"
-                  data-testid="codex-queue-resume"
-                  disabled={resumeBusy || forceBusy}
-                  onClick={() => {
-                    void resumeQueue();
-                  }}
-                  className="mt-1 rounded-full bg-amber-500/20 px-2 py-0.5 text-xs text-amber-700 disabled:opacity-40 dark:bg-amber-400/20 dark:text-amber-300"
-                >
-                  {i18n.t("mobile.codex.queue.resume")}
-                </button>
+                {(!stopPauseAutoResumes || manualStopPauseRecovery) && (
+                  <button
+                    type="button"
+                    data-testid="codex-queue-resume"
+                    disabled={operationBusy}
+                    onClick={() => {
+                      void resumeQueue();
+                    }}
+                    className="mt-1 rounded-full bg-amber-500/20 px-2 py-0.5 text-xs font-semibold text-amber-700 disabled:opacity-40 dark:bg-amber-400/20 dark:text-amber-300"
+                  >
+                    {i18n.t("mobile.codex.queue.resume")}
+                  </button>
+                )}
               </div>
             )}
           {/* 人工解除（无出口屏障复审 Important）：两步确认——未确认不发任何请求；
@@ -791,7 +908,7 @@ export default function CodexQueuePanel({
             <button
               type="button"
               data-testid="codex-queue-force-continue"
-              disabled={busyId !== null || forceBusy}
+              disabled={operationBusy}
               onClick={() => {
                 setNote(null);
                 setForceArmed(true);
@@ -810,7 +927,7 @@ export default function CodexQueuePanel({
               <button
                 type="button"
                 data-testid="codex-queue-force-yes"
-                disabled={busyId !== null || forceBusy}
+                disabled={operationBusy}
                 onClick={() => {
                   void forceContinue();
                 }}
@@ -821,7 +938,7 @@ export default function CodexQueuePanel({
               <button
                 type="button"
                 data-testid="codex-queue-force-no"
-                disabled={busyId !== null || forceBusy}
+                disabled={operationBusy}
                 onClick={() => {
                   setForceArmed(false);
                 }}
@@ -878,13 +995,7 @@ export default function CodexQueuePanel({
                   <button
                     type="button"
                     data-testid={`codex-queue-prioritize-${a.actionId}`}
-                    disabled={
-                      busyId !== null ||
-                      forceBusy ||
-                      prioritizeBusyId !== null ||
-                      stopGated ||
-                      resumeBusy
-                    }
+                    disabled={operationBusy || stopGated}
                     onClick={() => {
                       setNote(null);
                       setPrioritizeArmedId(a.actionId);
@@ -898,7 +1009,7 @@ export default function CodexQueuePanel({
                   <button
                     type="button"
                     data-testid={`codex-queue-edit-${a.actionId}`}
-                    disabled={busyId !== null || forceBusy || prioritizeBusyId !== null}
+                    disabled={operationBusy}
                     onClick={() => {
                       void edit(a.actionId);
                     }}
@@ -912,7 +1023,7 @@ export default function CodexQueuePanel({
                   <button
                     type="button"
                     data-testid={`codex-queue-retract-${a.actionId}`}
-                    disabled={busyId !== null || forceBusy || prioritizeBusyId !== null}
+                    disabled={operationBusy}
                     onClick={() => {
                       void retract(a.actionId);
                     }}
@@ -945,13 +1056,7 @@ export default function CodexQueuePanel({
                 <button
                   type="button"
                   data-testid={`codex-queue-prioritize-yes-${armedRow.actionId}`}
-                  disabled={
-                    busyId !== null ||
-                    forceBusy ||
-                    prioritizeBusyId !== null ||
-                    stopGated ||
-                    resumeBusy
-                  }
+                  disabled={operationBusy || stopGated}
                   onClick={() => {
                     void prioritize(armedRow.actionId);
                   }}

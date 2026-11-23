@@ -29,6 +29,7 @@
   --cbg: #fffdf8;
   --cb: #eae2cf;
   --tx: #2b2417;
+  --link: #1e40af;
   --mut: #97907e;
   --sh: 0 1px 2px rgba(80, 60, 20, 0.06), 0 3px 10px rgba(80, 60, 20, 0.05);
   --bub: #efe8d8;
@@ -46,6 +47,7 @@
   --cbg: #3a2c1a;
   --cb: #6e5836;
   --tx: #f0e9dc;
+  --link: #93c5fd;
   --mut: #b0a896;
   --sh: 0 1px 3px rgba(0, 0, 0, 0.35);
   --bub: #564427;
@@ -189,6 +191,12 @@ html[data-radius="22"] {
 }
 .md-body p {
   margin: 0.625em 0;
+}
+.md-body a:any-link,
+.approval-plan-markdown a:any-link {
+  color: var(--link);
+  text-decoration: underline;
+  text-underline-offset: 0.15em;
 }
 .md-body ul,
 .md-body ol {
