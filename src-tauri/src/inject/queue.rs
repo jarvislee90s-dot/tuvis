@@ -157,6 +157,9 @@ pub(crate) fn try_flush_with(
     confirm_timeout_override: Option<u64>,
     turn_stop_mode: TurnStopMode,
 ) -> FlushOutcome {
+    if crate::services::opencode_native::policy::legacy_retired() && item.agent_type == "opencode" {
+        return FlushOutcome::Deferred;
+    }
     // 会话 id 只在工具内唯一（watcher/dedup 同口径）：必须按 (tool, id) 复合匹配，
     // 跨工具撞 id 时裸 id 匹配会向错误会话的 pid 注入
     // 动作路径：取新鲜快照（龄超窗补扫并等待），绝不按陈旧快照的会话定位去投递
@@ -583,6 +586,23 @@ pub(crate) fn settle(
     }
 }
 
+fn queue_policy_permit(
+    st: &crate::remote::server::RemoteState,
+    item: &QueueRow,
+) -> Result<crate::services::opencode_native::policy::Permit, ()> {
+    // 派发内核只按持久行的 (agent_type, session_id) 复合键选目标。
+    // 策略沿用同一工具归属；其它工具的同名会话不能冻结本行，也无需额外扫描。
+    if item.agent_type == "opencode" {
+        crate::services::opencode_native::policy::acquire_legacy(
+            &st.store,
+            crate::session::AgentType::OpenCode,
+        )
+        .map_err(|_| ())
+    } else {
+        Ok(None)
+    }
+}
+
 /// 单次投递内核（循环与端点共用）：jump=true 越过「仍在运行」复核（裁决 12 插队语义），
 /// 但仍要求快照中会话存在（红·中断挂起，W2）。成功/失败都写审计（DB + events::audit
 /// 日志并行）。
@@ -594,7 +614,9 @@ pub(crate) fn settle(
 /// - `Failed(e)` = 注入失败原因（行已 mark_failed 退出 pending——失败不留残留，重试安全，W1）；
 /// - `Suspended` = 快照中无此会话（行保持 pending 等会话回来）；
 /// - `Deferred` = 仍在运行非插队 / 无 pending（行保持 pending 等下个跃迁，**非失败**——
-///   端点按 queued 回执，挂起项由 flush 循环/对账接力）。
+///   端点按 queued 回执，挂起项由 flush 循环/对账接力）；**任务 8 起**还包括
+///   「切路由进行中」（取不到旧写许可）与「该会话已归 OpenCode Native」（旧 FIFO 永不
+///   向终端投递）两种让位情形——两者都不投递、不消费队首、不落终端键。
 ///
 /// DB 依赖经 `st.store`：生产 `DeviceStore::Global`（即全局 DB 同锁同连接），
 /// 测试注入内存库（端点测试零接触真实 ~/.tuvis）。
@@ -643,18 +665,50 @@ pub(crate) fn flush_one_full(
     confirm_timeout_override: Option<u64>,
     turn_stop_mode: TurnStopMode,
 ) -> FlushOutcome {
-    // 1) 取队首：短临界区，临界区内只做 SQL（M4 死锁教训；DeviceStore::with 即锁语义）
-    let pending = st
-        .store
-        .with(|conn| inject_queue::next_pending_conn(conn, session_id));
-    // 2) 无待发：无可投递亦非失败（编排裁决：与黄态同形 Deferred，端点按 queued 回执）
+    // 1) 任务 8 旧路径写屏障（flush 侧）：本内核跑在 spawn_blocking（无 async 上下文），
+    //    故取**同步**许可（`try_legacy_permit_now`）；许可**持到本轮写入与结果记录
+    //    全部结束**（函数尾部才释放）。切路由（write permit）在场时本轮整轮让位——
+    //    不投递、不消费队首、不落终端键，下个跃迁/兜底 tick 重试（队列行原样保留）。
+    //    未登记路由的会话永远能取到（读者共享），故其他工具行为零变化。
+    let Some(_native_permit) = st.opencode_native.try_legacy_permit_now(session_id) else {
+        log::debug!("旧队列 flush 让位原生路由切换（会话 {session_id}）——本轮不投递不消费队首");
+        return FlushOutcome::Deferred;
+    };
+    // 2) 取队首 + 原生归属复查：**同一 DB 临界区**（不得拆成两次 with——两次之间路由
+    //    可能刚被认领）。已归 Native 的会话，旧 FIFO 永不向终端投递（不消费、不落账，
+    //    行留待用户处理；归属判定与旧写入口/认领事务同源 DAO）。
+    //    M-2：归属读取失败**不得**当成「未归原生」——fail-closed 让位本轮（不投递、
+    //    不消费队首），由下个 tick 重试并留下告警。
+    let pending = match st.store.with(|conn| -> rusqlite::Result<Option<_>> {
+        if crate::database::dao::opencode_actions::owns_session_conn(conn, session_id)? {
+            return Ok(None);
+        }
+        if crate::services::opencode_native::policy::legacy_retired() {
+            // 已冻结的 OpenCode 行仍参与原生认领，但不占用其他工具的派发队首。
+            return inject_queue::next_non_opencode_pending_conn(conn, session_id);
+        }
+        Ok(inject_queue::next_pending_conn(conn, session_id))
+    }) {
+        Ok(pending) => pending,
+        Err(e) => {
+            log::warn!("旧队列 flush 归属读取失败（会话 {session_id}）: {e}——本轮让位");
+            return FlushOutcome::Deferred;
+        }
+    };
+    // 3) 无待发（或已归 Native）：无可投递亦非失败（与黄态同形 Deferred，端点按 queued
+    //    回执；许可在本臂随函数返回释放）
     let Some(item) = pending else {
         return FlushOutcome::Deferred;
     };
-    // 3+4) 快照复核 + 注入 + 确认：零 DB 锁（session_source 生产实现内部会锁同一把
+    // 4+5) 快照复核 + 注入 + 确认：零 DB 锁（session_source 生产实现内部会锁同一把
     //      全局 DB，锁内调用即自锁死锁——见模块头锁纪律）
+    // 按旧行的复合目标检查工具策略，旧 pending 不迁移、不消费。
+    let _policy_permit = match queue_policy_permit(st, &item) {
+        Ok(permit) => permit,
+        Err(_) => return FlushOutcome::Deferred,
+    };
     let outcome = try_flush_with(st, &item, jump, confirm_timeout_override, turn_stop_mode);
-    // 5) 落账：再次短临界区（mark + 审计双通道，锁内只 SQL）。settle 的 Err 与
+    // 6) 落账：再次短临界区（mark + 审计双通道，锁内只 SQL）。settle 的 Err 与
     //    Failed(e) 同源同因（只在 Failed 分支产生），随 outcome 原样上抛不丢
     let _ = st
         .store
@@ -686,6 +740,11 @@ pub(crate) fn flush_given_with(
     jump: bool,
     turn_stop_mode: TurnStopMode,
 ) -> FlushOutcome {
+    // 按旧行的复合目标检查工具策略，旧 pending 不迁移、不消费。
+    let _policy_permit = match queue_policy_permit(st, item) {
+        Ok(permit) => permit,
+        Err(_) => return FlushOutcome::Deferred,
+    };
     let outcome = try_flush_with(st, item, jump, None, turn_stop_mode);
     // settle 的 Err 与 Failed(e) 同源同因，随 outcome 上抛（见 flush_one_with 同注）
     let _ = st
@@ -702,17 +761,36 @@ pub(crate) fn flush_given_with(
 ///   守卫——不复查会对已 sent 条目再注入，双投）：`store.with` 短临界区，锁内只 SQL；
 /// - 仍 pending → [`flush_given`]（注入与确认零 DB 锁，锁纪律不破坏）；
 /// - 已被消费 → [`FlushOutcome::Deferred`]（端点按 queued/position=0 回执，语义
-///   「已不在队列，由投递循环接力」，前端须容忍 0）。
+///   「已不在队列，由投递循环接力」，前端须容忍 0）；
+/// - 该会话已归 OpenCode Native → 同样 [`FlushOutcome::Deferred`]（任务 8 屏障：
+///   旧 FIFO 行不投递、不消费、不落账——行留给用户按旧项处理，绝不代迁或重发）。
 pub(crate) fn flush_given_if_pending(
     st: &crate::remote::server::RemoteState,
     item: &QueueRow,
     jump: bool,
 ) -> FlushOutcome {
-    let still_pending = st.store.with(|c| {
-        inject_queue::pending_for_session_conn(c, &item.session_id)
+    let still_pending = match st.store.with(|c| -> rusqlite::Result<bool> {
+        // 任务 8：同临界区复查原生归属——已归 Native 的会话，点名投递（jump）同样
+        // 不得把旧 FIFO 行送上终端。端点已持 read permit（屏障第一半），这里是与
+        // 「读 pending + 归属」同一把锁的第二道（纵深防御，口径同 `flush_one_full`）。
+        // M-2：归属读失败 fail-closed（当作「不可投递」→ 本轮 Deferred），不冒充
+        // 「未归原生」把行送出去。
+        if crate::database::dao::opencode_actions::owns_session_conn(c, &item.session_id)? {
+            return Ok(false);
+        }
+        Ok(inject_queue::pending_for_session_conn(c, &item.session_id)
             .iter()
-            .any(|i| i.id == item.id)
-    });
+            .any(|i| i.id == item.id))
+    }) {
+        Ok(v) => v,
+        Err(e) => {
+            log::warn!(
+                "旧队列点名投递归属读取失败（会话 {}）: {e}——本轮让位",
+                item.session_id
+            );
+            return FlushOutcome::Deferred;
+        }
+    };
     if !still_pending {
         return FlushOutcome::Deferred;
     }
@@ -1130,6 +1208,9 @@ mod tests {
         injector: std::sync::Arc<dyn Injector>,
         confirm_probe: std::sync::Arc<crate::remote::server::ConfirmProbeFn>,
     ) -> crate::remote::server::RemoteState {
+        // 任务 8：state.store 与原生 hub 共用同一内存库——旧路径屏障（归属判定）读
+        // state.store，认领路由写 hub 的库，两者必须同库同锁才构成同一道屏障。
+        let store = crate::remote::pairing::DeviceStore::memory();
         crate::remote::server::RemoteState {
             ui_config_source: Box::new(|| None),
             subagent_source: std::collections::HashMap::new(),
@@ -1147,7 +1228,7 @@ mod tests {
                 total_count: sessions.len(),
                 waiting_count: 0,
             }),
-            store: crate::remote::pairing::DeviceStore::memory(),
+            store: store.clone(),
             host_source: Box::new(|| serde_json::Value::Null),
             message_source: Box::new(|_, _, _| Err("测试桩：未注入内容源".to_string())),
             path_source: Box::new(|_, _, _| (Vec::new(), false)),
@@ -1184,17 +1265,152 @@ mod tests {
             // Codex Desktop IPC：fixture 显式 disabled hub（一切能力关闭）
             codex_control: crate::remote::codex_ipc::CodexControlHub::disabled_arc(),
             desktop_language: Default::default(),
+            // 任务 8：OpenCode 原生交互中枢——与 state.store 同库（屏障同一道）；
+            // 惰性容器零 IO，本模块用例不触原生路由（屏障只读归属，无路由即放行）
+            opencode_native: std::sync::Arc::new(crate::services::opencode_native::NativeHub::new(
+                store,
+            )),
         }
     }
 
     fn mem() -> rusqlite::Connection {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
-        crate::database::schema::init(&conn);
+        crate::database::schema::init(&conn).unwrap();
         conn
     }
 
     fn enq(conn: &rusqlite::Connection, sid: &str, content: &str) -> i64 {
         inject_queue::enqueue_conn(conn, sid, "claude", "dev-1", "测试设备", content, 1000)
+    }
+
+    #[test]
+    fn native_only_queue_guard_uses_composite_target() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        for agent in [AgentType::Claude, AgentType::Codex, AgentType::Kimi] {
+            for given in [false, true] {
+                let sid = format!("same-id-{}-{given}", agent.tool_id());
+                let mut oc = sess(&sid, SessionStatus::Idle, 901);
+                oc.agent_type = AgentType::OpenCode;
+                let mut target = sess(&sid, SessionStatus::Idle, 902);
+                target.agent_type = agent.clone();
+                let fake = FakeInjector::ok();
+                let mut st = state_with(vec![oc, target], fake.clone());
+                let screens = Arc::new(AtomicUsize::new(0));
+                let probe = screens.clone();
+                st.screen_probe = Arc::new(move |_, _| {
+                    probe.fetch_add(1, Ordering::SeqCst);
+                    None
+                });
+                st.store.with(|c| {
+                    inject_queue::enqueue_conn(
+                        c,
+                        &sid,
+                        agent.tool_id(),
+                        "dev-1",
+                        "test",
+                        "other tool",
+                        1000,
+                    )
+                });
+                let item = st
+                    .store
+                    .with(|c| inject_queue::next_pending_conn(c, &sid).unwrap());
+                let outcome = if given {
+                    flush_given_with(&st, &item, false, TurnStopMode::Production)
+                } else {
+                    flush_one(&st, &sid, false)
+                };
+                assert_eq!(
+                    outcome,
+                    FlushOutcome::Sent,
+                    "{} given={given}",
+                    agent.tool_id()
+                );
+                assert_eq!(fake.recorded(), vec![(902, "other tool".to_string())]);
+                let operations_before = fake.ops();
+                let screens_before = screens.load(Ordering::SeqCst);
+                st.store.with(|c| {
+                    inject_queue::enqueue_conn(
+                        c,
+                        &sid,
+                        "opencode",
+                        "dev-1",
+                        "test",
+                        "must stay",
+                        1001,
+                    )
+                });
+                let item = st
+                    .store
+                    .with(|c| inject_queue::next_pending_conn(c, &sid).unwrap());
+                let outcome = if given {
+                    flush_given_with(&st, &item, false, TurnStopMode::Production)
+                } else {
+                    flush_one(&st, &sid, false)
+                };
+                assert_eq!(outcome, FlushOutcome::Deferred);
+                assert_eq!(fake.ops(), operations_before, "OpenCode 不新增正文或键序");
+                assert_eq!(
+                    screens.load(Ordering::SeqCst),
+                    screens_before,
+                    "OpenCode 不读屏"
+                );
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn flush_one_delivers_other_cli_behind_frozen_opencode_with_same_id() {
+        let sid = "shared-opencode-claude-id";
+        let mut oc = sess(sid, SessionStatus::Idle, 901);
+        oc.agent_type = AgentType::OpenCode;
+        let mut claude = sess(sid, SessionStatus::Idle, 902);
+        claude.agent_type = AgentType::Claude;
+        let fake = FakeInjector::ok();
+        let st = state_with(vec![oc, claude], fake.clone());
+        let (frozen_id, claude_id) = st.store.with(|c| {
+            let frozen_id = inject_queue::enqueue_conn(
+                c,
+                sid,
+                "opencode",
+                "dev-1",
+                "测试设备",
+                "冻结消息",
+                999,
+            );
+            let claude_id = enq(c, sid, "Claude 消息");
+            assert_eq!(
+                inject_queue::next_pending_conn(c, sid).unwrap().id,
+                frozen_id
+            );
+            (frozen_id, claude_id)
+        });
+
+        assert_eq!(flush_one(&st, sid, false), FlushOutcome::Sent);
+        assert_eq!(fake.recorded(), vec![(902, "Claude 消息".to_string())]);
+        assert_eq!(fake.ops(), vec!["text:Claude 消息".to_string()]);
+        assert_eq!(flush_one(&st, sid, false), FlushOutcome::Deferred);
+        assert_eq!(fake.ops(), vec!["text:Claude 消息".to_string()]);
+
+        st.store.with(|c| {
+            let frozen = inject_queue::next_pending_conn(c, sid).unwrap();
+            assert_eq!(frozen.id, frozen_id);
+            assert_eq!(frozen.content, "冻结消息");
+            assert_eq!(frozen.sent_at, None);
+            assert_eq!(frozen.failed_reason, None);
+            let sent = inject_queue::get_conn(c, claude_id).unwrap();
+            assert!(sent.sent_at.is_some());
+            assert_eq!(sent.failed_reason, None);
+            let audits = write_audit::recent_conn(c, 10);
+            assert_eq!(audits.len(), 1, "冻结项不应产生额外审计");
+            assert_eq!(audits[0].action, "flush");
+            assert_eq!(audits[0].channel, "fake");
+            assert_eq!(audits[0].result, "ok");
+        });
     }
 
     /// 黄态（Processing）常规路径不消费：不投递、队首仍在、不写审计
@@ -1282,6 +1498,87 @@ mod tests {
         assert_eq!(audits[0].action, "flush", "常规路径审计 action=flush");
         assert_eq!(audits[0].result, "ok");
         assert!(inject_queue::next_pending_conn(&c, "s-wait").is_none());
+    }
+
+    // ==== 任务 8：旧路径写屏障（flush 侧）====
+
+    /// 让事务（屏障第一半）：切路由进行中（同会话 write permit 在场）→ 本轮整轮让位
+    /// （不投递、不消费队首、不落账）；释放后下一轮照常投递——让位是暂时的，不是
+    /// 永久禁用，也不是失败。
+    #[tokio::test]
+    async fn flush_yields_while_route_switch_holds_write_permit() {
+        let fake = FakeInjector::ok();
+        let st = state_with(
+            vec![sess("s-race", SessionStatus::Waiting, 21)],
+            fake.clone(),
+        );
+        st.store.with(|c| {
+            enq(c, "s-race", "屏障消息");
+        });
+        // 生产侧 = `NativeHub::select_native_route` 持有同一把锁的 write permit
+        let switching = st.opencode_native.legacy_lock("s-race").write_owned().await;
+
+        assert_eq!(
+            flush_one(&st, "s-race", false),
+            FlushOutcome::Deferred,
+            "切路由进行中必须让位（Deferred，非失败）"
+        );
+        assert!(
+            fake.recorded().is_empty(),
+            "切路由进行中不得向终端投递任何正文"
+        );
+        let left = st
+            .store
+            .with(|c| inject_queue::pending_for_session_conn(c, "s-race").len());
+        assert_eq!(left, 1, "让位轮不得消费队首");
+
+        drop(switching);
+        assert_eq!(
+            flush_one(&st, "s-race", false),
+            FlushOutcome::Sent,
+            "切换结束后下一轮照常投递"
+        );
+        assert_eq!(fake.recorded(), vec![(21, "屏障消息".to_string())]);
+    }
+
+    /// 归属（屏障第二半）：已归 OpenCode Native 的会话，旧 FIFO 永不向终端投递——
+    /// 零注入、不消费队首、不落账（行留给用户处理，绝不代迁或重发）。
+    #[test]
+    fn native_owned_session_never_flushes_to_terminal() {
+        let fake = FakeInjector::ok();
+        let st = state_with(
+            vec![sess("s-owned", SessionStatus::Waiting, 22)],
+            fake.clone(),
+        );
+        st.store.with(|c| {
+            enq(c, "s-owned", "旧待发");
+            c.execute(
+                "INSERT INTO opencode_native_routes (session_id, service_id, runtime_pid, \
+                 runtime_started_at_ms, directory, route_state, claimed_at, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'active', ?6, ?6)",
+                rusqlite::params![
+                    "s-owned",
+                    "svc-fixture",
+                    4242_i64,
+                    1_000_i64,
+                    "/tmp/p",
+                    2_000_i64
+                ],
+            )
+            .expect("标记原生归属");
+        });
+
+        assert_eq!(flush_one(&st, "s-owned", false), FlushOutcome::Deferred);
+        assert!(
+            fake.recorded().is_empty(),
+            "已归 Native 的会话绝不从旧 FIFO 出终端键"
+        );
+        let left = st
+            .store
+            .with(|c| inject_queue::pending_for_session_conn(c, "s-owned").len());
+        assert_eq!(left, 1, "不消费队首（不 mark_sent / 不 mark_failed）");
+        let audits = st.store.with(|c| write_audit::recent_conn(c, 10));
+        assert!(audits.is_empty(), "让位轮零审计（未投递即无终态）");
     }
 
     /// 快照无该会话（红·中断）不消费：jump=true 也不发（pid 无从定位），行挂起
@@ -1943,12 +2240,23 @@ mod tests {
                 1000,
             )
         });
-        assert_eq!(flush_one(&st2, "s-oc", true), FlushOutcome::Sent);
-        assert_eq!(
-            inj2.ops(),
-            vec!["key:esc".to_string(), "text:opencode 插队".to_string(),],
-            "opencode 键序必须是 Esc×1 → 正文（打断+直插）"
-        );
+        // 专测缺省禁旧；原有键序验收须显式选择兼容策略。
+        assert_eq!(flush_one(&st2, "s-oc", true), FlushOutcome::Deferred);
+        assert!(inj2.ops().is_empty());
+        #[cfg(not(target_os = "macos"))]
+        {
+            crate::services::opencode_native::policy::write_policy(
+                &st2.store,
+                crate::services::opencode_native::policy::OpenCodeInteractionPolicy::LegacyCompatible,
+            )
+            .unwrap();
+            assert_eq!(flush_one(&st2, "s-oc", true), FlushOutcome::Sent);
+            assert_eq!(
+                inj2.ops(),
+                vec!["key:esc".to_string(), "text:opencode 插队".to_string(),],
+                "opencode 键序必须是 Esc×1 → 正文（打断+直插）"
+            );
+        }
 
         // kimi：仅正文（排队制，无 Esc/Tab）；回执 = Submitted（已投递未确认——
         // 消息进 kimi 排队态、尚未进入回合，不谎报 delivered，裁16 排队回执锁）

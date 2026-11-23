@@ -1,4 +1,4 @@
-//! 新建会话路径校验纯核（spec §2）。只判不建；创建（create_dir_all）在状态机校验段执行。
+//! 新建会话路径校验及正式提交时的本机目录准备。
 //! 黑名单 = 两张表：
 //! ① remote::files::SENSITIVE_DIRS（读侧凭据表）——create 域**策略扩展**为全局段匹配
 //!    （读侧原语义是「仅主目录内」，见 files.rs 表注释：「黑名单仅作用于**用户主目录
@@ -80,6 +80,167 @@ pub fn validate(path: &str, platform: &str) -> Result<(), PathReject> {
         ));
     }
     Ok(())
+}
+
+/// 原生新建固定首次核验的规范目录及文件系统身份。
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct CreateDirectory {
+    pub path: String,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+impl CreateDirectory {
+    pub(crate) fn still_current(&self) -> bool {
+        validate_existing(&self.path).is_ok_and(|current| current == *self)
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn stat_key(&self) -> String {
+        format!("{}:{}", self.device, self.inode)
+    }
+}
+
+/// 原生新建的预览与回读只核对既有目录。原始路径和真实落点均过 D21 校验链。
+pub(crate) fn validate_existing(path: &str) -> Result<CreateDirectory, PathReject> {
+    validate(path, std::env::consts::OS)?;
+    let canonical = std::fs::canonicalize(path.trim()).map_err(|_| unresolved())?;
+    if !canonical.is_dir() {
+        return Err(unresolved());
+    }
+    let directory = canonical
+        .to_str()
+        .ok_or_else(|| rej("non_ascii_path", "ASCII project paths are required"))?;
+    validate(directory, std::env::consts::OS)?;
+    if directory != directory.trim() {
+        return Err(unresolved());
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let path =
+            std::ffi::CString::new(canonical.as_os_str().as_bytes()).map_err(|_| unresolved())?;
+        let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
+        // SAFETY: path 以 NUL 结尾，stat 指向可写的 statfs；成功时内核完整初始化。
+        if unsafe { libc::statfs(path.as_ptr(), stat.as_mut_ptr()) } != 0 {
+            return Err(unresolved());
+        }
+        if unsafe { stat.assume_init() }.f_flags & libc::MNT_LOCAL as u32 == 0 {
+            return Err(rej("not_local_volume", "Only local volumes are supported"));
+        }
+    }
+    #[cfg(unix)]
+    let (device, inode) = {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = canonical.metadata().map_err(|_| unresolved())?;
+        if !metadata.is_dir() {
+            return Err(unresolved());
+        }
+        (metadata.dev(), metadata.ino())
+    };
+    Ok(CreateDirectory {
+        path: directory.to_owned(),
+        #[cfg(unix)]
+        device,
+        #[cfg(unix)]
+        inode,
+    })
+}
+
+/// 仅在正式提交中准备合法的缺失目录；不沿符号链接创建新目录。
+pub(crate) fn prepare_native_create_directory(path: &str) -> Result<CreateDirectory, PathReject> {
+    #[cfg(target_os = "macos")]
+    {
+        use std::ffi::CString;
+        use std::fs::{self, File};
+        use std::os::fd::{AsRawFd, FromRawFd};
+        use std::os::unix::{ffi::OsStrExt, fs::MetadataExt};
+        use std::path::{Component, Path, PathBuf};
+
+        let existing_error = match validate_existing(path) {
+            Ok(existing) => return Ok(existing),
+            Err(error) => error,
+        };
+        validate(path, std::env::consts::OS)?;
+        let requested = Path::new(path.trim());
+        // 已有目标（含链接）必须保留原有 D21 拒绝结果，不进入建目录分支。
+        if !fs::symlink_metadata(requested)
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+        {
+            return Err(existing_error);
+        }
+        // 在第一次落盘前确认整个路径不含上级跳转或 NUL。
+        let components = requested
+            .components()
+            .skip(1)
+            .map(|part| match part {
+                Component::Normal(name) => CString::new(name.as_bytes()).map_err(|_| unresolved()),
+                _ => Err(unresolved()),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut parent = File::open("/").map_err(|_| unresolved())?;
+        let mut resolved = PathBuf::from("/");
+        for part in components {
+            let open = || {
+                // SAFETY: parent fd 和 NUL 结尾的单个组件在调用期间有效。
+                let fd = unsafe {
+                    libc::openat(
+                        parent.as_raw_fd(),
+                        part.as_ptr(),
+                        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                    )
+                };
+                if fd < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                // SAFETY: fd 成功打开，所有权交给 File。
+                Ok(unsafe { File::from_raw_fd(fd) })
+            };
+            let next = match open() {
+                Ok(directory) => directory,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    let visible = validate_existing(resolved.to_str().ok_or_else(unresolved)?)?;
+                    let opened = parent.metadata().map_err(|_| unresolved())?;
+                    if visible.device != opened.dev() || visible.inode != opened.ino() {
+                        return Err(unresolved());
+                    }
+                    // SAFETY: mkdirat 相对已经复核的父目录 fd；part 不是路径或链接。
+                    let rc = unsafe { libc::mkdirat(parent.as_raw_fd(), part.as_ptr(), 0o700) };
+                    if rc != 0
+                        && std::io::Error::last_os_error().kind()
+                            != std::io::ErrorKind::AlreadyExists
+                    {
+                        return Err(unresolved());
+                    }
+                    open().map_err(|_| unresolved())?
+                }
+                Err(_) => return Err(unresolved()),
+            };
+            let name = std::ffi::OsStr::from_bytes(part.as_bytes());
+            resolved.push(name);
+            parent = next;
+        }
+        if fs::canonicalize(requested).map_err(|_| unresolved())? != resolved {
+            return Err(unresolved());
+        }
+        let result = validate_existing(path)?;
+        let opened = parent.metadata().map_err(|_| unresolved())?;
+        if result.device != opened.dev() || result.inode != opened.ino() {
+            return Err(unresolved());
+        }
+        Ok(result)
+    }
+    #[cfg(not(target_os = "macos"))]
+    validate_existing(path)
+}
+
+fn unresolved() -> PathReject {
+    rej(
+        "directory_unresolved",
+        "The canonical project directory is unavailable",
+    )
 }
 
 /// 黑名单命中详情（评审修复③）：命中的段名 + 所属表（凭据表/系统目录表）——

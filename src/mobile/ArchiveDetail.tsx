@@ -57,6 +57,9 @@ export default function ArchiveDetail({
   const [limit, setLimit] = useState(ARCHIVE_PAGE_LIMIT);
   const [contentError, setContentError] = useState(false);
   const [opening, setOpening] = useState(false);
+  // F4 项 4A：待确认态（回执=真实窗口观察——电脑侧已出手但窗口未核实，不冒充
+  // 成功）。按钮态随 pending：再次点击 = 复查观察（命中即核销）；放弃入口显式清态。
+  const [restorePending, setRestorePending] = useState(false);
   const [openError, setOpenError] = useState<string | null>(null);
   const [confirmRemove, setConfirmRemove] = useState(false);
   // 移除失败行内反馈（终审 Finding 3：Promise 拒绝无 .catch → 按钮无反应 +
@@ -213,7 +216,20 @@ export default function ArchiveDetail({
         if (r.trustPromptExpected) {
           toast(i18n.t("mobile.archive.trustPrompt"));
         }
+        setRestorePending(false);
         onActivated(); // 乐观回看板：活板 3s 内出卡，归档条目下次拉取自然消失
+        return;
+      }
+      if (r.status === "pending") {
+        // F4 项 4A：待确认态（真实窗口观察未核实——不假成功）。按钮态随 pending：
+        // 再次点击 = 复查观察（命中即核销）；提示行引导人工核对/放弃
+        setRestorePending(true);
+        return;
+      }
+      if (r.status === "abandoned") {
+        // 显式放弃完成：pending 解除，可重新发起
+        setRestorePending(false);
+        toast(i18n.t("mobile.archive.restoreAbandoned"));
         return;
       }
       setOpenError(openFailureCopy(r.error));
@@ -228,6 +244,34 @@ export default function ArchiveDetail({
       );
     } finally {
       setOpening(false);
+    }
+  };
+
+  // F4 项 4A：显式放弃在途待确认恢复（pending 核销路径之二——观察确认或用户
+  // 显式放弃才流转）。放弃是零出手动作（后端清 pending，不产生任何新窗口）。
+  const handleAbandon = async () => {
+    setOpenError(null);
+    try {
+      const r = await sessionOpen(session.sessionId, { abandon: true });
+      if (r.status === "abandoned") {
+        setRestorePending(false);
+        toast(i18n.t("mobile.archive.restoreAbandoned"));
+        return;
+      }
+      if (r.status === "pending") {
+        // 放弃请求被 pending 门拒绝（竞态：另一请求刚出手）——保持待确认态
+        setRestorePending(true);
+        return;
+      }
+      if (r.status === "opening") {
+        // 放弃请求恰好触发复查核验并命中 → 已确认，走 opening 语义
+        setRestorePending(false);
+        onActivated();
+        return;
+      }
+      setOpenError(openFailureCopy(r.error));
+    } catch (e) {
+      setOpenError(i18n.t("mobile.archive.openFailed", { reason: String(e) }));
     }
   };
 
@@ -430,8 +474,32 @@ export default function ArchiveDetail({
               onClick={handleOpen}
               className="w-full rounded-lg bg-green-700 px-3 py-2 text-sm text-white enabled:hover:bg-green-800 disabled:opacity-50"
             >
-              {i18n.t(opening ? "mobile.archive.opening" : "mobile.archive.open")}
+              {i18n.t(
+                opening
+                  ? "mobile.archive.opening"
+                  : restorePending
+                    ? "mobile.archive.restorePending"
+                    : "mobile.archive.open"
+              )}
             </button>
+            {restorePending && (
+              <p
+                data-testid="session-open-pending-hint"
+                className="mt-1 text-center text-xs text-[var(--mut)]"
+              >
+                {i18n.t("mobile.archive.restorePendingHint")}
+              </p>
+            )}
+            {restorePending && (
+              <button
+                type="button"
+                data-testid="session-abandon"
+                onClick={handleAbandon}
+                className="mt-1 w-full rounded-lg border border-[var(--mut)] px-3 py-1.5 text-xs text-[var(--mut)]"
+              >
+                {i18n.t("mobile.archive.restoreAbandon")}
+              </button>
+            )}
             {reason && <p className="mt-1 text-center text-xs text-[var(--mut)]">{reason}</p>}
             {openError && (
               <p data-testid="session-open-error" className="mt-1 text-center text-xs text-red-600">

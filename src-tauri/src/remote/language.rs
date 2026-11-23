@@ -122,7 +122,7 @@ mod tests {
     /// 内存库（真机调用序：schema::init → migration::migrate，见 DeviceStore::memory 注释）
     fn memory_conn() -> rusqlite::Connection {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
-        crate::database::schema::init(&conn);
+        crate::database::schema::init(&conn).unwrap();
         crate::database::migration::migrate(&conn).unwrap();
         conn
     }

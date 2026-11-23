@@ -1,0 +1,21 @@
+{
+  "x-evidence": {
+    "run_id": "20261029-233614",
+    "source": "docs/engineering/evidence/opencode-native/followup/fixtures/permission.pending.json",
+    "note": "真实工具调用（read .env）产生的 pending 审批，仅保留字段形态；无认证值"
+  },
+  "data": [
+    {
+      "id": "per_1885ff74b001eVON1mD7l6P3Se",
+      "sessionID": "ses_e77a75f50ffe4ZcyQUoGpdpdpK",
+      "action": "read",
+      "resources": [".env"],
+      "save": ["*"],
+      "source": {
+        "type": "tool",
+        "messageID": "msg_1885fdfcc001M5doOh7uHy8hog",
+        "id": "call_f04fcdfb6b6342d5be73e50d"
+      }
+    }
+  ]
+}

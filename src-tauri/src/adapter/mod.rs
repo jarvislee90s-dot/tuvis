@@ -2214,6 +2214,8 @@ mod candidate_whitelist_tests {
     /// 工具进程，明确记录「未覆盖」；空集合不作为兼容通过证据。
     #[test]
     fn two_stage_refresh_preserves_all_adapter_discovery() {
+        use crate::monitor::dsh::cmdline_is_dsh_host;
+
         let adapters = all_adapters();
         // 直调生产白名单入口（全部注册 adapter），与 get_all_sessions_inner 同源
         let wanted_names = refresh_candidate_process_names();
@@ -2279,16 +2281,31 @@ mod candidate_whitelist_tests {
             // 旧路径发现、且新快照仍存活的进程必须在新路径同样被覆盖；
             // 同时其名字必须在白名单内（否则即白名单漏名——第二段不会读它的 exe/cmd）。
             // 对稳定存活的同一个进程逐字段比较身份，不只比较 PID。
-            let actual_pids: HashSet<u32> = actual.iter().map(|p| p.pid).collect();
             for p in &expected {
-                let Some(proc) = two_stage.process(sysinfo::Pid::from_u32(p.pid)) else {
+                let pid = sysinfo::Pid::from_u32(p.pid);
+                let Some(proc) = two_stage.process(pid) else {
                     continue; // 两次扫描间隙退出：不判定
                 };
-                let Some(old_proc) = full.process(sysinfo::Pid::from_u32(p.pid)) else {
+                let Some(old_proc) = full.process(pid) else {
                     continue;
                 };
                 if old_proc.start_time() != proc.start_time() {
                     continue; // 同 PID 已复用：全量快照与新快照不是同一进程
+                }
+                let new_process = actual.iter().find(|candidate| candidate.pid == p.pid);
+                if new_process.is_none() {
+                    // 两段式明细刷新保留第一段的表项，缺失时用独立快照确认进程代际。
+                    let mut current = System::new();
+                    current.refresh_processes_specifics(
+                        ProcessesToUpdate::Some(&[pid]),
+                        true,
+                        ProcessRefreshKind::nothing(),
+                    );
+                    if !current.process(pid).is_some_and(|live| {
+                        live.exists() && live.start_time() == old_proc.start_time()
+                    }) {
+                        continue; // 已退出或 PID 已复用
+                    }
                 }
                 let name = bare_name(&proc.name().to_string_lossy());
                 assert!(
@@ -2298,19 +2315,38 @@ mod candidate_whitelist_tests {
                     name,
                     p.pid
                 );
-                assert!(
-                    actual_pids.contains(&p.pid),
-                    "{} 两段式丢失存活进程 pid={}",
-                    adapter.name(),
-                    p.pid
-                );
-                let new_process = actual
-                    .iter()
-                    .find(|candidate| candidate.pid == p.pid)
-                    .expect("稳定存活的旧路径进程必须出现在两段式结果");
+                let new_identity = if let Some(new_process) = new_process {
+                    process_identity(new_process)
+                } else {
+                    // dsh 从无序进程表取首个宿主。两个快照都识别到这两个宿主时，
+                    // 用两段式快照中同一 PID 的字段比较身份。
+                    assert!(
+                        adapter.agent_type() == AgentType::Dsh
+                            && cmdline_is_dsh_host(proc.cmd())
+                            && actual.iter().any(|selected| {
+                                let selected_pid = sysinfo::Pid::from_u32(selected.pid);
+                                full.process(selected_pid)
+                                    .zip(two_stage.process(selected_pid))
+                                    .is_some_and(|(old, new)| {
+                                        old.start_time() == new.start_time()
+                                            && cmdline_is_dsh_host(old.cmd())
+                                    })
+                            }),
+                        "{} 两段式丢失存活进程 pid={}",
+                        adapter.name(),
+                        p.pid
+                    );
+                    eprintln!("dsh: 两个快照选中不同宿主，核对同一 pid={}", p.pid);
+                    ProcessIdentity {
+                        pid: proc.pid().as_u32(),
+                        cwd: proc.cwd().map(std::path::Path::to_path_buf),
+                        exe: proc.exe().map(std::path::Path::to_path_buf),
+                        form: actual[0].form,
+                    }
+                };
                 assert_eq!(
                     process_identity(p),
-                    process_identity(new_process),
+                    new_identity,
                     "{} 两段式进程身份字段不匹配 pid={}",
                     adapter.name(),
                     p.pid
@@ -3128,7 +3164,7 @@ mod tests {
     fn wait_mark_overlay_forces_waiting_then_falls_back_on_clear_event() {
         use crate::database::dao::approval_wait;
         let conn = rusqlite::Connection::open_in_memory().unwrap();
-        crate::database::schema::init(&conn);
+        crate::database::schema::init(&conn).unwrap();
         let now = 20_000;
         let mut grace = HashMap::new();
         // 文件推导态：审批等待期 CLI 会话文件判 Processing（issue #74 根因①）
@@ -3389,7 +3425,7 @@ mod tests {
     fn question_entry_clears_preexisting_approval_mark() {
         use crate::database::dao::{approval_wait, question_wait};
         let conn = rusqlite::Connection::open_in_memory().unwrap();
-        crate::database::schema::init(&conn);
+        crate::database::schema::init(&conn).unwrap();
         let now = 20_000;
         let mut grace = HashMap::new();
 
@@ -3466,7 +3502,7 @@ mod tests {
     fn approval_and_question_marks_guard_isolation_both_ways() {
         use crate::database::dao::{approval_wait, question_wait};
         let conn = rusqlite::Connection::open_in_memory().unwrap();
-        crate::database::schema::init(&conn);
+        crate::database::schema::init(&conn).unwrap();
         let (tool, sid) = ("claude".to_string(), "s-iso".to_string());
         // 问答在场：审批端点判据 = approval 表命中 → false
         question_wait::mark(&conn, &tool, &sid, 1000, "等待回答", None);
@@ -3493,7 +3529,7 @@ mod tests {
     fn plain_notification_while_question_inflight_is_ignored() {
         use crate::database::dao::{approval_wait, question_wait};
         let conn = rusqlite::Connection::open_in_memory().unwrap();
-        crate::database::schema::init(&conn);
+        crate::database::schema::init(&conn).unwrap();
         let now = 30_000;
         let mut s = hook_sess(SessionStatus::Processing);
         let tool = s.agent_type.tool_id().to_string();
@@ -3548,7 +3584,7 @@ mod tests {
     fn plain_notification_without_question_still_marks_approval() {
         use crate::database::dao::approval_wait;
         let conn = rusqlite::Connection::open_in_memory().unwrap();
-        crate::database::schema::init(&conn);
+        crate::database::schema::init(&conn).unwrap();
         let now = 40_000;
         let mut s = hook_sess(SessionStatus::Processing);
         let tool = s.agent_type.tool_id().to_string();
@@ -3625,7 +3661,7 @@ mod tests {
     fn question_mark_waits_overlay_then_clear_family_clears_both() {
         use crate::database::dao::{approval_wait, question_wait};
         let conn = rusqlite::Connection::open_in_memory().unwrap();
-        crate::database::schema::init(&conn);
+        crate::database::schema::init(&conn).unwrap();
         let now = 20_000;
         let mut grace = HashMap::new();
         let mut s = hook_sess(SessionStatus::Processing);
@@ -5027,7 +5063,7 @@ mod unread_card_tests {
 
         // 模拟重启：新连接 + 建表 + 新内存状态从 pending 文件恢复
         let conn = rusqlite::Connection::open(&db_path).unwrap();
-        crate::database::schema::init(&conn);
+        crate::database::schema::init(&conn).unwrap();
         let loaded2 = AtomicBool::new(false);
         let dirty2 = AtomicBool::new(false);
         let retries2 = Mutex::new(HashMap::new());
@@ -5061,7 +5097,7 @@ mod unread_card_tests {
         drop(conn);
 
         let conn = rusqlite::Connection::open(&db_path).unwrap();
-        crate::database::schema::init(&conn);
+        crate::database::schema::init(&conn).unwrap();
         let loaded3 = AtomicBool::new(false);
         let dirty3 = AtomicBool::new(false);
         let retries3 = Mutex::new(HashMap::new());

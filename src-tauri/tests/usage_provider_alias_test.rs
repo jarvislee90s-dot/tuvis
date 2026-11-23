@@ -156,7 +156,7 @@ fn schema_creates_alias_table_and_partial_unique_indexes() {
     .unwrap();
 
     // 再次 init 不得重复建表/建索引或报错。
-    multi_agents_manager_lib::database::schema::init(&conn);
+    multi_agents_manager_lib::database::schema::init(&conn).unwrap();
     let tables: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM sqlite_master

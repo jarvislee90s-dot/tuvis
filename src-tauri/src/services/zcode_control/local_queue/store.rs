@@ -1705,7 +1705,7 @@ mod tests {
         let path = dir.path().join("queue.sqlite");
         let open = || {
             let conn = rusqlite::Connection::open(&path).unwrap();
-            crate::database::schema::init(&conn);
+            let _ = crate::database::schema::init(&conn);
             crate::database::migration::migrate(&conn).unwrap();
             SqlLocalQueueStore::new(DeviceStore::Owned(std::sync::Arc::new(
                 std::sync::Mutex::new(conn),
@@ -3084,7 +3084,7 @@ mod tests {
         let path = dir.path().join("queue.sqlite");
         let open = || {
             let conn = rusqlite::Connection::open(&path).unwrap();
-            crate::database::schema::init(&conn);
+            let _ = crate::database::schema::init(&conn);
             crate::database::migration::migrate(&conn).unwrap();
             SqlLocalQueueStore::new(DeviceStore::Owned(std::sync::Arc::new(
                 std::sync::Mutex::new(conn),
@@ -3138,7 +3138,7 @@ mod tests {
         let path = dir.path().join("queue.sqlite");
         let open = || {
             let conn = rusqlite::Connection::open(&path).unwrap();
-            crate::database::schema::init(&conn);
+            let _ = crate::database::schema::init(&conn);
             crate::database::migration::migrate(&conn).unwrap();
             SqlLocalQueueStore::new(DeviceStore::Owned(std::sync::Arc::new(
                 std::sync::Mutex::new(conn),
@@ -3783,7 +3783,7 @@ mod tests {
         let path = dir.path().join("queue.sqlite");
         let open = || {
             let c = rusqlite::Connection::open(&path).unwrap();
-            crate::database::schema::init(&c);
+            let _ = crate::database::schema::init(&c);
             crate::database::migration::migrate(&c).unwrap();
             DeviceStore::Owned(std::sync::Arc::new(std::sync::Mutex::new(c)))
         };
@@ -4335,7 +4335,7 @@ mod tests {
     #[test]
     fn migration_adds_queue_tables_without_changing_existing_actions() {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
-        crate::database::schema::init(&conn);
+        let _ = crate::database::schema::init(&conn);
         conn.execute_batch("DROP TABLE zcode_queue_operations; DROP TABLE zcode_send_queue; DROP TABLE zcode_queue_state;").unwrap();
         conn.execute("INSERT INTO zcode_actions(action_id,device_id,device_name,session_id,generation,kind,payload_hash,state,summary,created_at,updated_at) VALUES ('a','d','n','s',1,'send','hash','unknown','send',1,1)", []).unwrap();
         crate::database::migration::migrate(&conn).unwrap();
@@ -4362,7 +4362,7 @@ mod tests {
     #[test]
     fn migration_adds_input_hash_without_erasing_legacy_queue() {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
-        crate::database::schema::init(&conn);
+        let _ = crate::database::schema::init(&conn);
         conn.execute_batch("ALTER TABLE zcode_send_queue DROP COLUMN request_input_hash;")
             .unwrap();
         conn.execute("INSERT INTO zcode_send_queue(request_id,item_id,payload_hash,device_id,session_id,device_name,workspace_path,prepared,receipt_queue_version,receipt_position) VALUES ('old','item','hash','device','session','name','/synthetic','synthetic',1,1)", []).unwrap();
@@ -4385,7 +4385,7 @@ mod tests {
             let conn = rusqlite::Connection::open(&path).unwrap();
             conn.busy_timeout(std::time::Duration::from_secs(3))
                 .unwrap();
-            crate::database::schema::init(&conn);
+            let _ = crate::database::schema::init(&conn);
             crate::database::migration::migrate(&conn).unwrap();
             SqlLocalQueueStore::new(DeviceStore::Owned(std::sync::Arc::new(
                 std::sync::Mutex::new(conn),

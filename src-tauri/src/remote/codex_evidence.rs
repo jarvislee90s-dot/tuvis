@@ -528,7 +528,7 @@ mod tests {
 
     fn store() -> DeviceStore {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
-        crate::database::schema::init(&conn);
+        let _ = crate::database::schema::init(&conn);
         crate::database::migration::migrate(&conn).unwrap();
         DeviceStore::Owned(Arc::new(Mutex::new(conn)))
     }
@@ -595,7 +595,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("isolated-hints.sqlite");
         let first = rusqlite::Connection::open(&path).unwrap();
-        crate::database::schema::init(&first);
+        let _ = crate::database::schema::init(&first);
         crate::database::migration::migrate(&first).unwrap();
         let second = rusqlite::Connection::open(&path).unwrap();
         second.busy_timeout(std::time::Duration::ZERO).unwrap();
@@ -671,7 +671,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("isolated-invalidation.sqlite");
         let first = rusqlite::Connection::open(&path).unwrap();
-        crate::database::schema::init(&first);
+        let _ = crate::database::schema::init(&first);
         crate::database::migration::migrate(&first).unwrap();
         let second = rusqlite::Connection::open(&path).unwrap();
         second.busy_timeout(std::time::Duration::ZERO).unwrap();
@@ -741,7 +741,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("isolated.sqlite");
         let first = rusqlite::Connection::open(&path).unwrap();
-        crate::database::schema::init(&first);
+        let _ = crate::database::schema::init(&first);
         crate::database::migration::migrate(&first).unwrap();
         let second = rusqlite::Connection::open(&path).unwrap();
         second.busy_timeout(std::time::Duration::ZERO).unwrap();

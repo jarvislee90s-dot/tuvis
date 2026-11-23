@@ -147,6 +147,31 @@ describe("createSession（C10 新建会话投递）", () => {
     });
   });
 
+  it("409 OC_LEGACY_DISABLED → {kind:'conflict', reasonCode, reason}（策略门拒绝分診，H14 O1）", async () => {
+    // 实测形态（H14 §3.2）：reason 带「OC_LEGACY_DISABLED: 」机器前缀——上屏分診在
+    // 面板层按码走 i18n，api 层只负责把字段带出（与 400 同构）
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        async () =>
+          new Response(
+            JSON.stringify({
+              error: "OC_LEGACY_DISABLED",
+              reasonCode: "OC_LEGACY_DISABLED",
+              reason: "OC_LEGACY_DISABLED: OpenCode 当前仅允许原生交互，旧终端交互已停用",
+            }),
+            { status: 409 }
+          )
+      )
+    );
+    const r = await createSession({ tool: "opencode", projectPath: "/tmp/p" });
+    expect(r).toEqual({
+      kind: "conflict",
+      reasonCode: "OC_LEGACY_DISABLED",
+      reason: "OC_LEGACY_DISABLED: OpenCode 当前仅允许原生交互，旧终端交互已停用",
+    });
+  });
+
   it("403 → 抛 ApiError(403)（设备失效，非 400/409 走既有 POST 异常惯例）", async () => {
     vi.stubGlobal(
       "fetch",

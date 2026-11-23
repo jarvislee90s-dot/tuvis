@@ -14,8 +14,9 @@
 //   刷新会话内容（F6 评审裁决：hidden 暂停、恢复可见立即补刷，页头刷新按钮保留）。
 //   轮询刷新仅在「贴底」（距底 <120px）时自动跟随落底，上翻阅读历史不被动拽回
 //   （P2-B 评审修复）；首次加载与手动刷新仍无条件落底。
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode, Ref } from "react";
+import type { PublicNativeView } from "./opencodeNativeApi";
 import {
   ArrowDownToLine,
   ArrowLeft,
@@ -29,7 +30,7 @@ import {
 import i18n from "@/i18n";
 import ApproveCard from "./ApproveCard";
 import PlanFeedbackBar from "./PlanFeedbackBar";
-import { collapsedLabel, isProcessKind } from "./message-fold";
+import { collapsedLabel, isProcessKind, nativeProcessKeys } from "./message-fold";
 import { useMessageRenderers } from "./message-render";
 import ModeBar from "./ModeBar";
 import SubagentChips from "./SubagentChips";
@@ -603,9 +604,48 @@ function SessionDetailContent({
   // send_gate_static 的展示面单点；本组件不另发请求不另判）。能力横幅据此在
   // 可尝试时不再宣称「暂不能远程发送」（设计 §3.4）。换会话由 composer 重报。
   const [codexSendGate, setCodexSendGate] = useState<boolean | undefined>(undefined);
+  /** 任务 9：交互路由（唯一来源 = MessageComposer 读到的 send-info 可选字段）。
+   *  原生路由下**不挂**旧终端写控件（QuestionCard / ApproveCard / ModeBar）——
+   *  这些控件的写动作在服务端已被 409 挡下，挂在界面上只会制造「点了没反应」的
+   *  假象；未接入的能力由 OpenCodeNativePanel 如实说明。null = 旧流程（零变化）。 */
+  const [routeObservation, setRouteObservation] = useState<{
+    sessionId: string;
+    route: "opencode_native" | "legacy" | null;
+  } | null>(null);
+  const routeDecided = routeObservation?.sessionId === session.id;
+  const interactionRoute = routeDecided ? routeObservation.route : null;
+  const [conversationTarget, setConversationTarget] = useState<HTMLDivElement | null>(null);
+  const [showNativeHistory, setShowNativeHistory] = useState<boolean | null>(null);
+  const [nativeSnapshot, setNativeSnapshot] = useState<PublicNativeView | null>(null);
+  // 原生和旧历史的 seq 属于不同投影，不共用折叠覆盖。
+  const [nativeFold, setNativeFold] = useState<{
+    sessionId: string;
+    bindingToken: string;
+    collapsed: boolean;
+    overrides: Map<string, boolean>;
+  } | null>(null);
+  const previousNativeSnapshot = useRef<PublicNativeView | null>(null);
+  const nativeRoute = interactionRoute === "opencode_native";
+  const currentNative = nativeSnapshot?.sessionId === session.id ? nativeSnapshot : null;
+  const nativeConversation =
+    nativeRoute &&
+    showNativeHistory !== true &&
+    (showNativeHistory === false || currentNative?.complete === true);
+  /** 该会话是否可能走原生路由（与 MessageComposer 同一判据：只有 OpenCode 被原生接口服务）。 */
+  const couldBeNative = session.agentType === "opencode";
+  const handleInteractionRoute = useCallback(
+    (route: "opencode_native" | "legacy" | null) => {
+      setRouteObservation({ sessionId: session.id, route });
+    },
+    [session.id]
+  );
+  const routeSessionRef = useRef(session.id);
   useEffect(() => {
-    // 换会话即失效（等新 composer 的 send-info 重报；undefined = 不猜）
+    if (routeSessionRef.current === session.id) return;
+    routeSessionRef.current = session.id;
+    // 换会话即失效（等新 composer 的 send-info 重报；null = 不猜）
     setCodexSendGate(undefined);
+    setShowNativeHistory(null);
   }, [session.id]);
   // F8/R6：send-info 外部刷新信号——三类**后端真实状态变化**都推进此 tick，
   // composer 据此事件驱动重拉（不做时刻轮询、不引 Tauri channel）：
@@ -1236,9 +1276,71 @@ function SessionDetailContent({
   const isZcodeSession = session.agentType === "zcode";
   const approveMounted = !isZcodeSession && (session.status === "waiting" || planPending);
 
+  const nativeHistoryReload = useRef<(() => void) | null>(null);
+  const handleNativeSnapshot = useCallback((next: PublicNativeView) => {
+    const area = messageAreaRef.current;
+    if (previousNativeSnapshot.current?.sessionId === next.sessionId && area) {
+      pollFollowRef.current = isNearBottom(area);
+    }
+    previousNativeSnapshot.current = next;
+    setNativeSnapshot(next);
+    // 不完整原生读可能只有最早前缀：同次 SSE 立即刷新可靠尾部。
+    if (!next.complete) nativeHistoryReload.current?.();
+  }, []);
+
+  // OpenCode 的高频原生通知只合并为一次待刷新；当前有效尾部必须先落地。
+  // 会话/limit 改变才淘汰这一读取代际，其它 CLI 保留原有刷新语义。
+  const lastNativeHistoryTick = useRef(refreshTick);
+  useEffect(() => {
+    if (session.agentType !== "opencode") return;
+    let alive = true;
+    let inflight = false;
+    let pending = false;
+    const load = () => {
+      if (!alive) return;
+      if (inflight) {
+        pending = true;
+        return;
+      }
+      inflight = true;
+      setLoading(true);
+      setError(null);
+      fetchSessionMessages(session.agentType, session.id, limit)
+        .then((pg) => {
+          if (!alive) return;
+          setMessages(pg.messages);
+          setTruncated(pg.truncated);
+        })
+        .catch((e: unknown) => {
+          if (alive) setError({ status: e instanceof ApiError ? e.status : null });
+        })
+        .finally(() => {
+          if (!alive) return;
+          inflight = false;
+          setLoading(false);
+          if (pending) {
+            pending = false;
+            load();
+          }
+        });
+    };
+    nativeHistoryReload.current = load;
+    load();
+    return () => {
+      alive = false;
+      pending = false;
+      nativeHistoryReload.current = null;
+    };
+  }, [session.agentType, session.id, limit]);
+
   // 消息流拉取：挂载 / limit 变化 / 手动刷新时重拉（整页替换；M3 不做增量追加
   // 与滚动位置保持——「加载更多」按钮替代无限滚动的裁决即含此简化）
   useEffect(() => {
+    if (session.agentType === "opencode") {
+      if (lastNativeHistoryTick.current !== refreshTick) nativeHistoryReload.current?.();
+      lastNativeHistoryTick.current = refreshTick;
+      return;
+    }
     let alive = true;
     setLoading(true);
     setError(null);
@@ -1270,7 +1372,7 @@ function SessionDetailContent({
       // 数据落地后跟随落底；上翻阅读时刷新不改变滚动位置（ref 为 null 时按
       // 贴底处理，保留旧版无条件落底行为）
       const el = messageAreaRef.current;
-      pollFollowRef.current = el === null || isNearBottom(el);
+      if (!nativeConversation) pollFollowRef.current = el === null || isNearBottom(el);
       setRefreshTick((t) => t + 1);
     };
     let timer: ReturnType<typeof setInterval> | null = null;
@@ -1296,7 +1398,7 @@ function SessionDetailContent({
       stop();
       document.removeEventListener("visibilitychange", onVisibility);
     };
-  }, [session.agentType, session.id]);
+  }, [session.agentType, session.id, nativeConversation]);
 
   // 文件表拉取（M3+）：挂载 / 切档时重拉。挂载那次（scope=200）即面板首次打开
   // 复用的数据（一次拉取两用，用户裁决 3 的附带口径）；失败已由 api 层静默降级
@@ -1710,28 +1812,42 @@ function SessionDetailContent({
 
   // 取锚：当前视口顶部可见的那条消息。消息 li 挂 data-seq，取第一个
   // 「底边越过容器顶边」的条目即视口首条
-  const topVisibleMessage = useCallback((): SessionMessage | null => {
+  const topVisibleMessage = useCallback((): { message: SessionMessage; anchor: string } | null => {
     const el = messageAreaRef.current;
-    if (!el || messages === null) return null;
+    if (!el) return null;
     const areaTop = el.getBoundingClientRect().top;
+    if (nativeConversation && currentNative) {
+      for (const row of el.querySelectorAll<HTMLElement>("[data-native-id]")) {
+        if (row.getBoundingClientRect().bottom <= areaTop) continue;
+        const message = currentNative.messages.find((m) => m.seq === Number(row.dataset.nativeSeq));
+        if (message && row.dataset.nativeId)
+          return { message, anchor: `opencode:${row.dataset.nativeId}` };
+      }
+      return null;
+    }
     const items = el.querySelectorAll<HTMLElement>("[data-seq]");
     for (const it of items) {
       if (it.getBoundingClientRect().bottom > areaTop) {
         const seq = Number(it.dataset.seq);
-        return messages.find((m) => m.seq === seq) ?? null;
+        const message = messages?.find((m) => m.seq === seq);
+        return message ? { message, anchor: messageAnchor(message) } : null;
       }
     }
     return null;
-  }, [messages]);
+  }, [messages, currentNative, nativeConversation]);
 
   const handleAddBookmark = useCallback(
     (color: string) => {
-      const m = topVisibleMessage();
-      if (m === null) return;
+      const found = topVisibleMessage();
+      if (found === null) {
+        setBookmarkJumpMiss(true);
+        return;
+      }
+      const { message: m, anchor } = found;
       addBookmark(session.id, {
         color,
         seq: m.seq,
-        anchor: messageAnchor(m),
+        anchor,
         preview: bookmarkPreview(m.content),
       });
       setBookmarks(listBookmarks(session.id));
@@ -1762,21 +1878,41 @@ function SessionDetailContent({
 
   const scrollAnchorIntoView = useCallback(
     (anchor: string): boolean => {
+      if (anchor.startsWith("opencode:")) {
+        const row = Array.from(
+          messageAreaRef.current?.querySelectorAll<HTMLElement>("[data-native-id]") ?? []
+        ).find((el) => `opencode:${el.dataset.nativeId}` === anchor);
+        if (!row) return false;
+        row.scrollIntoView({ block: "start" });
+        return true;
+      }
       if (messages === null) return false;
       const target = messages.find((m) => messageAnchor(m) === anchor);
       if (!target) return false;
-      messageAreaRef.current
-        ?.querySelector<HTMLElement>(`[data-seq="${target.seq}"]`)
-        ?.scrollIntoView({ block: "start" });
+      const row = messageAreaRef.current?.querySelector<HTMLElement>(`[data-seq="${target.seq}"]`);
+      if (!row) return false;
+      row.scrollIntoView({ block: "start" });
       return true;
     },
     [messages]
   );
 
+  const pendingSourceJump = useRef<string | null>(null);
   const handleJumpBookmark = useCallback(
     (anchor: string) => {
       setBookmarkJumpMiss(false);
+      const nativeAnchor = anchor.startsWith("opencode:");
+      if (nativeRoute && nativeAnchor !== nativeConversation) {
+        pendingSourceJump.current = anchor;
+        pollFollowRef.current = false;
+        setShowNativeHistory(!nativeAnchor);
+        return;
+      }
       if (scrollAnchorIntoView(anchor)) {
+        return;
+      }
+      if (nativeAnchor) {
+        setBookmarkJumpMiss(true);
         return;
       }
       // 目标不在当前窗口：能扩则登记自动扩窗（逐级 200，至多 1000），否则 miss。
@@ -1795,8 +1931,15 @@ function SessionDetailContent({
     },
     // setLimit 是 useState 稳定 setter（恒等），列入 deps 只为如实申报引用，
     // 不改变本回调随 limit/scrollAnchorIntoView 变化的重建时机。
-    [limit, scrollAnchorIntoView, setLimit]
+    [limit, scrollAnchorIntoView, setLimit, nativeRoute, nativeConversation, setShowNativeHistory]
   );
+
+  useEffect(() => {
+    const anchor = pendingSourceJump.current;
+    if (anchor === null) return;
+    pendingSourceJump.current = null;
+    handleJumpBookmark(anchor);
+  }, [nativeConversation, handleJumpBookmark]);
 
   // 自动加载跳转的续查：**仅随 messages 变化重查**（deps 不含 limit）——
   // setLimit 引起的中间渲染不会误触发；命中滚动收尾；未命中且还能扩继续扩；
@@ -1830,7 +1973,7 @@ function SessionDetailContent({
   // 依赖 messages（而非 limit）：只在数据真正落地后执行一次对齐
   useEffect(() => {
     const el = messageAreaRef.current;
-    if (!el || messages === null) return;
+    if (!el || messages === null || nativeConversation) return;
     const pending = pendingScrollRef.current;
     if (pending !== null) {
       // 回补：新高度 - 旧高度 = 顶部插入量，往下偏移同等距离保持视线
@@ -1841,7 +1984,13 @@ function SessionDetailContent({
     }
     if (!pollFollowRef.current) return; // P2-B：上翻阅读中的轮询刷新不动滚动位置
     el.scrollTop = el.scrollHeight; // 首次（或手动刷新后）落到底部
-  }, [messages]);
+  }, [messages, nativeConversation]);
+
+  useLayoutEffect(() => {
+    const el = messageAreaRef.current;
+    if (nativeConversation && currentNative && el && pollFollowRef.current)
+      el.scrollTop = el.scrollHeight;
+  }, [currentNative, nativeConversation]);
 
   // 是否渲染折叠切换头：过程消息 + 总结模式下的「更早 assistant」；
   // 最终 assistant 总结直显正文（不给「更早的回复」头）。
@@ -1916,6 +2065,50 @@ function SessionDetailContent({
     setShowJumpTop(false);
   }, []);
 
+  const nativeProcessMessages = useMemo(
+    () => currentNative?.messages.filter((message) => isProcessKind(message.kind)) ?? [],
+    [currentNative]
+  );
+  const nativeFoldKeys = useMemo(() => nativeProcessKeys(currentNative), [currentNative]);
+  const currentNativeFold =
+    nativeFold?.sessionId === session.id && nativeFold.bindingToken === currentNative?.bindingToken
+      ? nativeFold
+      : null;
+  const isNativeProcessCollapsed = (message: SessionMessage) => {
+    const key = nativeFoldKeys.get(message.seq);
+    const override = key === undefined ? undefined : currentNativeFold?.overrides.get(key);
+    return override ?? currentNativeFold?.collapsed ?? true;
+  };
+  const allNativeProcessCollapsed = nativeProcessMessages.every(isNativeProcessCollapsed);
+  const nativeProcessFold = {
+    isCollapsed: isNativeProcessCollapsed,
+    onToggle: (message: SessionMessage) => {
+      const key = nativeFoldKeys.get(message.seq);
+      if (!currentNative || key === undefined) return;
+      const overrides = new Map(currentNativeFold?.overrides);
+      overrides.set(key, !isNativeProcessCollapsed(message));
+      setNativeFold({
+        sessionId: currentNative.sessionId,
+        bindingToken: currentNative.bindingToken,
+        collapsed: currentNativeFold?.collapsed ?? true,
+        overrides,
+      });
+    },
+  };
+  const nativeProcessToggle =
+    currentNative && nativeProcessMessages.length > 0
+      ? {
+          allCollapsed: allNativeProcessCollapsed,
+          onToggle: () =>
+            setNativeFold({
+              sessionId: currentNative.sessionId,
+              bindingToken: currentNative.bindingToken,
+              collapsed: !allNativeProcessCollapsed,
+              overrides: new Map(),
+            }),
+        }
+      : undefined;
+
   // 书签条（两个布局分支共用同一份 JSX）。processToggle：过程一键折叠开关
   // （2026-09-20）——运行态与总结态都可用（与 summary-banner 的差别就在不看 isSummary）；
   // 无可折叠过程消息时不渲染。allCollapsed = 当前全部折叠 → 按钮动作变为全部展开
@@ -1929,12 +2122,14 @@ function SessionDetailContent({
       onRemove={handleRemoveBookmark}
       onClear={handleClearBookmarks}
       processToggle={
-        !codexProjectionActive && toggleableMessages.length > 0
-          ? {
-              allCollapsed: collapsedCount === toggleableMessages.length,
-              onToggle: collapsedCount === toggleableMessages.length ? expandAll : collapseAll,
-            }
-          : undefined
+        nativeConversation
+          ? nativeProcessToggle
+          : !codexProjectionActive && toggleableMessages.length > 0
+            ? {
+                allCollapsed: collapsedCount === toggleableMessages.length,
+                onToggle: collapsedCount === toggleableMessages.length ? expandAll : collapseAll,
+              }
+            : undefined
       }
     />
   );
@@ -2012,7 +2207,17 @@ function SessionDetailContent({
   // （M9R P3），key 必须互异（approve-/question-/mode-/composer- 前缀）——同 key
   // 兄弟在红卡「停留期间插入/卸载」时会让 React 同 key 复用错乱（duplicate key
   // 警告 + 红卡卸不掉）。
-  const cardDock = (
+  /** 任务 9（R-2）：旧写控件区的挂载规则——
+   *  - 不可能是原生的会话（Codex / Claude / Kimi…）：**首帧就挂**，与历史行为逐字一致
+   *    （绝不因为一条 send-info 而延后审批 UI）；
+   *  - 可能是原生的会话（OpenCode）：等路由判定。已归原生 → 不挂；判定为 legacy → 挂；
+   *    send-info 失败或策略未知时保留原生入口并禁旧；成功重读后按公开 RoutingView
+   *    的策略、实际归属和 legacyAllowed 决定是否挂载。
+   *  未判定期间不挂的唯一原因：QuestionCard / ApproveCard 挂载即各打一发探针，
+   *  「路由未知就先探」会在原生会话上留下无意义的旧链路请求（复审 F6）。 */
+  const dockMounted =
+    !nativeRoute && (!couldBeNative || (routeDecided && interactionRoute === "legacy"));
+  const cardDock = dockMounted ? (
     <div
       data-testid="card-dock"
       className="flex max-h-[35dvh] shrink-0 flex-col gap-2 overflow-y-auto"
@@ -2357,7 +2562,7 @@ function SessionDetailContent({
         )}
       </div>
     </div>
-  );
+  ) : null;
 
   // ===== 发送区（T7.2 集成，2026-10-25）=====
   // **ZCode 会话挂统一控制面板**，不再挂旧终端 composer：
@@ -2382,6 +2587,11 @@ function SessionDetailContent({
         session={session}
         onQueueChanged={bumpQueue}
         onSendGate={setCodexSendGate}
+        onInteractionRoute={handleInteractionRoute}
+        conversationTarget={conversationTarget}
+        showConversation={nativeConversation}
+        nativeProcessFold={nativeProcessFold}
+        onNativeSnapshot={handleNativeSnapshot}
         refreshSendInfoSignal={sendInfoTick}
         disableTerminalProbes={appForm}
         turnControl={appForm ? codexTurnControl : undefined}
@@ -2431,10 +2641,9 @@ function SessionDetailContent({
             // 列表以 loadedMessages 为准（Task 5：尾窗 + 已合并更早页，最新在最后），
             // 翻页合并后自然出现，不在这里另造无界「加载更多」循环（Task 7 拥有
             // 有界查找，且 Task 5 没有终点信号）。
-            // 注意（Task 6 复审 I1）：split/split-h 与 fullscreen 是不同 React 子树，
-            // 切换布局会卸载并重建本消息列——图片资源随之释放并在重建后重新读取，
-            // FilePreview 也会重挂载再读一次。这是既有布局结构的行为，本任务按
-            // 「沿用现状」保留；消除需布局级提升资源，已登记为后续项。
+            // 注意（2026-11-12 布局重构）：消息列所在的对话子树现在**跨布局稳定挂载**——
+            // split/split-h/fullscreen 切换只增删分屏把手与文件窗格，不卸载消息列，
+            // 草稿、附件与原生面板状态因此跨布局保留（复审曾要求的后续项已落地）。
             <ul className="space-y-2 pb-4">
               {codex.loadedMessages.map((m) => {
                 const ctx = artifactContexts.get(m.id);
@@ -2490,39 +2699,41 @@ function SessionDetailContent({
         </div>
       )}
       {/* 总结模式提示行（Bug 8）：仅总结模式且有可折叠过程消息时出现。
-          F9（2026-11-12 note §五）：Codex 投影激活时通用消息源被投影取代——
-          通用展开/收起控件与通用 ul 同规则隐藏，不得操作隐藏源 */}
-      {!codexProjectionActive && isSummary && toggleableMessages.length > 0 && (
-        <div
-          data-testid="summary-banner"
-          className="mb-2 flex items-center gap-2 rounded-lg bg-[var(--btnp)]/10 px-3 py-2 text-xs text-[var(--tx)]"
-        >
-          <span>{i18n.t("mobile.detail.summaryBanner", { count: collapsedCount })}</span>
-          <span className="ml-auto flex shrink-0 gap-1">
-            {collapsedCount > 0 && (
-              <button
-                type="button"
-                data-testid="expand-all"
-                onClick={expandAll}
-                className="rounded-full bg-[var(--btnp)]/20 px-2 py-0.5 text-xs text-[var(--tx)]"
-              >
-                {i18n.t("mobile.detail.expandAll")}
-              </button>
-            )}
-            {collapsedCount < toggleableMessages.length && (
-              <button
-                type="button"
-                data-testid="collapse-all"
-                onClick={collapseAll}
-                className="rounded-full bg-[var(--cb)] px-2 py-0.5 text-xs text-[var(--mut)]"
-              >
-                {i18n.t("mobile.detail.collapseAll")}
-              </button>
-            )}
-          </span>
-        </div>
-      )}
-      {loading && messages === null && (
+          原生投影取代通用消息源时，通用折叠控件一并隐藏，不得操作隐藏源 */}
+      {!codexProjectionActive &&
+        !nativeConversation &&
+        isSummary &&
+        toggleableMessages.length > 0 && (
+          <div
+            data-testid="summary-banner"
+            className="mb-2 flex items-center gap-2 rounded-lg bg-[var(--btnp)]/10 px-3 py-2 text-xs text-[var(--tx)]"
+          >
+            <span>{i18n.t("mobile.detail.summaryBanner", { count: collapsedCount })}</span>
+            <span className="ml-auto flex shrink-0 gap-1">
+              {collapsedCount > 0 && (
+                <button
+                  type="button"
+                  data-testid="expand-all"
+                  onClick={expandAll}
+                  className="rounded-full bg-[var(--btnp)]/20 px-2 py-0.5 text-xs text-[var(--tx)]"
+                >
+                  {i18n.t("mobile.detail.expandAll")}
+                </button>
+              )}
+              {collapsedCount < toggleableMessages.length && (
+                <button
+                  type="button"
+                  data-testid="collapse-all"
+                  onClick={collapseAll}
+                  className="rounded-full bg-[var(--cb)] px-2 py-0.5 text-xs text-[var(--mut)]"
+                >
+                  {i18n.t("mobile.detail.collapseAll")}
+                </button>
+              )}
+            </span>
+          </div>
+        )}
+      {!nativeConversation && loading && messages === null && (
         <p className="py-16 text-center text-sm text-[var(--mut)]">
           {i18n.t("mobile.detail.loading")}
         </p>
@@ -2542,11 +2753,15 @@ function SessionDetailContent({
           </button>
         </div>
       )}
-      {!codexProjectionActive && messages !== null && !error && messages.length === 0 && (
-        <p className="py-16 text-center text-sm text-[var(--mut)]">
-          {i18n.t("mobile.detail.noMessages")}
-        </p>
-      )}
+      {!nativeConversation &&
+        !codexProjectionActive &&
+        messages !== null &&
+        !error &&
+        messages.length === 0 && (
+          <p className="py-16 text-center text-sm text-[var(--mut)]">
+            {i18n.t("mobile.detail.noMessages")}
+          </p>
+        )}
       {/* 书签跳转：自动加载中提示（M5 P3-c）与到顶未命中 miss 提示（M3+） */}
       {jumpLoading && (
         <p
@@ -2568,7 +2783,22 @@ function SessionDetailContent({
           「往前翻到头再加一段更早的」，与阅读方向一致；此前放在列表末尾，
           与「更早」的空间直觉相反。F9：Codex 投影激活时隐藏（通用消息源
           不在显示面；「跳到最新」仅滚动语义不受影响） */}
-      {!codexProjectionActive && hasLoadMore && (
+      {nativeRoute && (
+        <button
+          type="button"
+          data-testid="native-history-switch"
+          className="mb-2 rounded-full bg-[var(--cb)] px-4 py-1.5 text-xs"
+          onClick={() => setShowNativeHistory(nativeConversation)}
+        >
+          {i18n.t(
+            !nativeConversation
+              ? "mobile.openCodeNative.messages.current"
+              : "mobile.openCodeNative.messages.history"
+          )}
+        </button>
+      )}
+      <div ref={setConversationTarget} />
+      {!codexProjectionActive && !nativeConversation && hasLoadMore && (
         <div className="pt-1 pb-3 text-center">
           <button
             type="button"
@@ -2586,62 +2816,69 @@ function SessionDetailContent({
           </button>
         </div>
       )}
-      {!codexProjectionActive && messages !== null && messages.length > 0 && (
-        <ul className="space-y-2 pb-4">
-          {messages.map((m) => {
-            const collapsed = isCollapsed(m);
-            const toggleable = isToggleable(m);
-            const isUser = m.kind === "user";
-            const msgBookmark = bookmarkByAnchor.get(messageAnchor(m));
-            return (
-              <li
-                key={m.seq}
-                data-testid={`msg-${m.seq}`}
-                data-kind={m.kind}
-                data-seq={m.seq}
-                className={
-                  isUser ? "relative flex flex-col items-end" : "relative flex flex-col items-start"
-                }
-              >
-                {/* 书签角标（M3+）：该消息命中书签时在气泡左上显示色点 */}
-                {msgBookmark && (
-                  <span
-                    data-testid={`msg-bookmark-${m.seq}`}
-                    title={i18n.t("mobile.detail.bookmarkTitle", { preview: msgBookmark.preview })}
-                    className="absolute -top-1 -left-1 h-2.5 w-2.5 rounded-full ring-2 ring-[var(--pg)]"
-                    style={{ backgroundColor: msgBookmark.color }}
-                  />
-                )}
-                <div
+      {!nativeConversation &&
+        !codexProjectionActive &&
+        messages !== null &&
+        messages.length > 0 && (
+          <ul className="space-y-2 pb-4">
+            {messages.map((m) => {
+              const collapsed = isCollapsed(m);
+              const toggleable = isToggleable(m);
+              const isUser = m.kind === "user";
+              const msgBookmark = bookmarkByAnchor.get(messageAnchor(m));
+              return (
+                <li
+                  key={m.seq}
+                  data-testid={`msg-${m.seq}`}
+                  data-kind={m.kind}
+                  data-seq={m.seq}
                   className={
                     isUser
-                      ? "max-w-[85%] rounded-2xl rounded-br-sm border border-[var(--cb)] bg-[var(--bub)] px-3 py-2"
-                      : "w-full rounded-2xl rounded-bl-sm border border-[var(--cb)] bg-[var(--cbg)] px-3 py-2"
+                      ? "relative flex flex-col items-end"
+                      : "relative flex flex-col items-start"
                   }
                 >
-                  {toggleable ? (
-                    <>
-                      <button
-                        type="button"
-                        data-testid={`msg-${m.seq}-toggle`}
-                        aria-expanded={!collapsed}
-                        onClick={() => toggleCollapsed(m)}
-                        className="-mx-1 flex w-[calc(100%+8px)] items-center gap-1 rounded-lg px-1 py-0.5 text-left text-xs text-[var(--mut)] hover:bg-[var(--cb)]/60 dark:hover:bg-[var(--btnp)]"
-                      >
-                        {collapsed ? <ChevronRight size={13} /> : <ChevronDown size={13} />}
-                        <span className="truncate">{collapsedLabel(m)}</span>
-                      </button>
-                      {!collapsed && <div className="mt-1">{renderBody(m)}</div>}
-                    </>
-                  ) : (
-                    renderBody(m)
+                  {/* 书签角标（M3+）：该消息命中书签时在气泡左上显示色点 */}
+                  {msgBookmark && (
+                    <span
+                      data-testid={`msg-bookmark-${m.seq}`}
+                      title={i18n.t("mobile.detail.bookmarkTitle", {
+                        preview: msgBookmark.preview,
+                      })}
+                      className="absolute -top-1 -left-1 h-2.5 w-2.5 rounded-full ring-2 ring-[var(--pg)]"
+                      style={{ backgroundColor: msgBookmark.color }}
+                    />
                   )}
-                </div>
-              </li>
-            );
-          })}
-        </ul>
-      )}
+                  <div
+                    className={
+                      isUser
+                        ? "max-w-[85%] rounded-2xl rounded-br-sm border border-[var(--cb)] bg-[var(--bub)] px-3 py-2"
+                        : "w-full rounded-2xl rounded-bl-sm border border-[var(--cb)] bg-[var(--cbg)] px-3 py-2"
+                    }
+                  >
+                    {toggleable ? (
+                      <>
+                        <button
+                          type="button"
+                          data-testid={`msg-${m.seq}-toggle`}
+                          aria-expanded={!collapsed}
+                          onClick={() => toggleCollapsed(m)}
+                          className="-mx-1 flex w-[calc(100%+8px)] items-center gap-1 rounded-lg px-1 py-0.5 text-left text-xs text-[var(--mut)] hover:bg-[var(--cb)]/60 dark:hover:bg-[var(--btnp)]"
+                        >
+                          {collapsed ? <ChevronRight size={13} /> : <ChevronDown size={13} />}
+                          <span className="truncate">{collapsedLabel(m)}</span>
+                        </button>
+                        {!collapsed && <div className="mt-1">{renderBody(m)}</div>}
+                      </>
+                    ) : (
+                      renderBody(m)
+                    )}
+                  </div>
+                </li>
+              );
+            })}
+          </ul>
+        )}
     </>
   );
 
@@ -2981,7 +3218,6 @@ function SessionDetailContent({
           {composerArea}
         </div>
       )}
-
       {/* fullscreen = 全屏浮层（覆盖对话，关闭回到原位——sheet 状态由本组件持有）。
           顶栏 sheet bar 在浮层顶部（S5 唯一实例在全屏态的可达位）；看板与内容互斥
           单栏整宽（既有互斥语义保留） */}

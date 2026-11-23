@@ -1712,7 +1712,7 @@ mod tests {
         let c = Connection::open_in_memory().unwrap();
         // 仅构造旧库形态；新行由生产 DAO 写入。
         c.execute_batch("CREATE TABLE codex_question_display (thread_id TEXT NOT NULL, source_turn_id TEXT NOT NULL, source_item_id TEXT NOT NULL, content_generation TEXT NOT NULL, decision TEXT NOT NULL, revision INTEGER NOT NULL, device_id TEXT NOT NULL, updated_at INTEGER NOT NULL, PRIMARY KEY(thread_id,source_turn_id,source_item_id,content_generation)); INSERT INTO codex_question_display VALUES ('thread','turn','legacy','gen1','skipped',7,'device',42);").unwrap();
-        schema::init(&c);
+        let _ = schema::init(&c);
         migration::migrate(&c).unwrap();
         let thread = ThreadKey {
             host_id: "local".into(),
@@ -1758,7 +1758,7 @@ mod tests {
     #[test]
     fn fresh_schema_and_migration_create_both_tables_with_nullable_snapshot() {
         let c = Connection::open_in_memory().unwrap();
-        schema::init(&c);
+        let _ = schema::init(&c);
         migration::migrate(&c).unwrap();
         let display = columns(&c, "codex_question_display");
         assert!(

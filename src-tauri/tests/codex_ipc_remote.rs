@@ -138,7 +138,7 @@ type SharedConn = Arc<StdMutex<rusqlite::Connection>>;
 
 fn shared_conn() -> SharedConn {
     let conn = rusqlite::Connection::open_in_memory().expect("open memory db");
-    multi_agents_manager_lib::database::schema::init(&conn);
+    multi_agents_manager_lib::database::schema::init(&conn).unwrap();
     multi_agents_manager_lib::database::migration::migrate(&conn).expect("migrate");
     Arc::new(StdMutex::new(conn))
 }
@@ -545,6 +545,13 @@ fn fixture_on(
         screen_probe: Arc::new(|_, _| None),
         codex_control: hub_builder(DeviceStore::Owned(conn.clone())),
         desktop_language: Default::default(),
+        // 任务 8：OpenCode 原生交互中枢——与 state.store 同库同连接（Owned 是 Arc，
+        // 克隆共享）；本套件不触原生路由，只补禁用默认（业务断言不变）
+        opencode_native: Arc::new(
+            multi_agents_manager_lib::services::opencode_native::NativeHub::new(
+                DeviceStore::Owned(conn.clone()),
+            ),
+        ),
     });
     let app = router(state.clone());
     Fixture {

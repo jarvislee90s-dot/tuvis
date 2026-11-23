@@ -485,7 +485,7 @@ fn discovered_window() -> DiscoveredWindow {
 /// 一律 ABORT（模拟「finish SQL 失败/提交未知」），清零后放行重试。
 fn triggered_store() -> DeviceStore {
     let conn = Connection::open_in_memory().expect("打开内存库失败");
-    schema::init(&conn);
+    let _ = schema::init(&conn);
     migration::migrate(&conn).expect("内存库建表失败");
     conn.execute(
         "CREATE TABLE qs_finish_block (on_flag INTEGER NOT NULL)",

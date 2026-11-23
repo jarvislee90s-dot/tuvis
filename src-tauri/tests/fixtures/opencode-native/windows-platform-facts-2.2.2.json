@@ -1,0 +1,1063 @@
+{
+  "source": "results.json#round4, #round5, #events, #inboxQueue, #shell, #locationAndPathSemantics, #service, #isolation",
+  "isolation": {
+    "OPENCODE_TEST_HOME": {
+      "supported": true,
+      "effect": "changes only the reported home path; data/cache/config/state/tmp/db remain under the real user profile/temp",
+      "sufficientForIsolation": false
+    },
+    "XDG": {
+      "supported": true,
+      "vars": [
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+        "XDG_STATE_HOME",
+        "XDG_CACHE_HOME"
+      ],
+      "effect": "relocates config/data/state/cache/bin/log/repos/db under the test root",
+      "proof": "opencode debug paths under full env; all paths under E:/LLMproject/oc-probe-20261030T0126"
+    },
+    "TEMP_TMP": {
+      "supported": true,
+      "effect": "tmp resolves under the test root when TEMP/TMP are set"
+    },
+    "residualLeakage": [
+      "HOME remains the real user home; the test server watched %USERPROFILE%/.claude/skills and %USERPROFILE%/.agents/skills (read-only).",
+      "The executable and auto-updater are shared; XDG does not isolate the binary or the updater."
+    ]
+  },
+  "service": {
+    "topology": "TUI CLI process spawns a child `opencode serve --service`; the TUI process supervises and auto-restarts the service.",
+    "initialPids": {
+      "cmd": 13544,
+      "tui": 9836,
+      "service": 23396
+    },
+    "defaultPort": 28894,
+    "defaultPortConflict": {
+      "observed": "starting an isolated instance without a port override attempted 127.0.0.1:28894 and failed with `Managed service port 28894 on 127.0.0.1 is already in use by another process`",
+      "conclusion": "default port is fixed, not dynamic"
+    },
+    "configuredTestPort": 28931,
+    "configFile": {
+      "path": "xdg-config/opencode/service.json",
+      "fields": [
+        "port",
+        "password"
+      ],
+      "note": "port+password; persistent password. Mac report also uses config/opencode/service.json for service set port; Mac config password presence not stated."
+    },
+    "stateFile": {
+      "path": "xdg-state/opencode/service.json",
+      "fields": [
+        "id",
+        "version",
+        "url",
+        "pid",
+        "password"
+      ],
+      "note": "runtime registration; Mac report says state service.json is 0600; Windows DACL is not protected (see acl)."
+    },
+    "infoEndpoint": {
+      "path": "/api/info",
+      "status": 200,
+      "fields": [
+        "version",
+        "pid",
+        "hostname",
+        "urls",
+        "paths.tmp",
+        "capabilities.persistentPty"
+      ],
+      "noStartTime": true,
+      "apiInfoPidPath": "/api/info.pid -> 404; Mac report also uses GET /api/info pid, so this is not a platform difference."
+    },
+    "auth": {
+      "scheme": "HTTP Basic",
+      "username": "opencode",
+      "noAuth": "401, WWW-Authenticate: Basic realm=<redacted>, body {\"_tag\":\"UnauthorizedError\",\"message\":\"Authentication required\"}",
+      "wrongPassword": "401 same shape",
+      "wrongUserCorrectPassword": "401 same shape",
+      "bearerCorrectPassword": "401 same shape",
+      "correct": "200 /api/info"
+    },
+    "acl": {
+      "testStateAndConfig": "owner current user, DACL not protected; inherited Authenticated Users:Modify from the E: test root; any authenticated local user could read/modify the test service.json",
+      "defaultStateFile": "owner current user, DACL not protected; two non-current-user/non-current-group local-or-domain SIDs have ReadAndExecute; otherPrincipalCanRead=true",
+      "defaultDataDir": "same two other SIDs ReadAndExecute",
+      "defaultConfigDir": "current user/SYSTEM/<USER>istrators only",
+      "note": "OpenCode does not set a protected owner-only DACL; exposure is inherited from the containing profile/test directory. SIDs/account names were not printed."
+    }
+  },
+  "events": {
+    "endpoint": "GET /api/event",
+    "status": 200,
+    "contentType": "text/event-stream",
+    "heartbeat": ": heartbeat",
+    "capturedEvents": 53,
+    "eventTypes": [
+      "server.connected",
+      "session.created",
+      "session.inbox.enqueued",
+      "session.inbox.delivered",
+      "session.inbox.cancelled",
+      "session.execution.started",
+      "session.execution.succeeded",
+      "session.execution.failed",
+      "session.step.started",
+      "session.step.ended",
+      "session.step.failed",
+      "session.tool.input.started",
+      "session.tool.input.ended",
+      "session.tool.called",
+      "session.tool.progress",
+      "session.tool.success",
+      "session.reasoning.started",
+      "session.reasoning.delta",
+      "session.reasoning.ended",
+      "session.thinking... (subset)",
+      "form.created",
+      "form.replied",
+      "form.cancelled",
+      "shell.created",
+      "session.shell.started",
+      "session.shell.ended",
+      "shell.exited",
+      "session.usage.updated",
+      "project.updated"
+    ],
+    "locationCoverage": "events included location E:/LLMproject/oc-probe-20261030T0126/测试 项目/proj-a, not only HOME",
+    "sseAcrossRestart": "not tested (no long-lived SSE connection was kept across the restart); old-connection mixing remains C"
+  },
+  "inboxQueue": {
+    "steer": "POST /api/session/{id}/prompt {text,delivery:\"steer\"} -> 200; inbox item delivered",
+    "queue": "POST ... {delivery:\"queue\"} -> 200 {data: Session.Inbox.User}; inbox list shows the item",
+    "cancel": "DELETE /api/session/{id}/inbox/{inboxID} -> 204; inbox empty; the queued text does not appear in message list",
+    "repeatCancel": "DELETE same id -> 204 (idempotent)",
+    "conclusion": "native queue and unconsumed cancel work on Windows 2.2.x"
+  },
+  "shellAndToolActions": {
+    "implementation": "/usr/bin/bash (Git Bash)",
+    "pwd": "/e/LLMproject/oc-probe-20261030T0126/测试 项目/proj-a",
+    "cat": "exit 0, returned marker + second line",
+    "type": "exit 1, `/usr/bin/bash: line 1: type: probe-file.txt: not found`",
+    "conclusion": "Windows native shell tool is Git Bash, not cmd/PowerShell; command semantics/paths differ from macOS."
+  },
+  "pathSemantics": {
+    "deepObjectParameter": "GET /api/location, /api/form, /api/permission/request, /api/fs/* use query style deepObject: location[directory]=<value>; a plain location=<value> is 400.",
+    "noParameterDefault": "C:/Users/<user> (HOME), not the TUI launch directory",
+    "variants": {
+      "exactBackslash": {
+        "sessionListCount": 1,
+        "locationProjectID": "892fab529810f2d046a240ce188e20e25c37fc3d",
+        "status": 200
+      },
+      "forwardSlash": {
+        "sessionListCount": 1,
+        "projectID": "892fab529810f2d046a240ce188e20e25c37fc3d",
+        "status": 200,
+        "note": "normalized to backslash"
+      },
+      "trailingBackslash": {
+        "sessionListCount": 0,
+        "status": 200,
+        "note": "not normalized by session.list"
+      },
+      "lowercaseDrive": {
+        "sessionListCount": 0,
+        "projectID": "ee3e7ddc73d08cbc3d6bd624baed5737bf3529b9",
+        "status": 200,
+        "note": "same physical directory produced a different projectID"
+      },
+      "fileUri": {
+        "sessionList": 500,
+        "fsRead": 404,
+        "locationResolvedAsLiteral": "file:\\E:\\...",
+        "projectCanonical": "C:\\Users\\<user>\\file:\\E:\\..."
+      }
+    },
+    "sessionScoping": "API operations are session-ID scoped; two sessions in the same directory had independent forms; POST /api/session/{B2}/view {idle:0} returned 204 and did not change A2's form.",
+    "foregroundPointer": "GET /api/session/active returned {\"data\":{}} throughout; no desktop foreground pointer was observed."
+  },
+  "round4": {
+    "forms": "见 08",
+    "permissions": {
+      "evidence": [
+        "logs/ext2_permission.json",
+        "logs/ext2b_permission.json",
+        "logs/ext7_real_turn.json"
+      ],
+      "pendingWithoutModel": "POST /api/session/{id}/permission {action,resources,save} 在会话规则命中 ask 时 → 200 {id,effect:\"ask\"} 并出现在 GET .../permission；once/always/reject 与 saved 全部可无模型取证",
+      "alwaysLifecycle": {
+        "reply": "always → 204，pending 清空",
+        "savedList": "GET /api/permission/saved?projectID=<id> → {id:\"psv_*\",projectID,action:\"shell\",resource:<save 模式>,time:{created,updated}}",
+        "autoAllowAfter": "之后同命令 → effect:\"allow\" 且**不产生 pending**",
+        "patch": "PATCH /api/permission/saved/{id} → 200，resource 改变、time.updated 变化、id 保持",
+        "delete": "DELETE /api/permission/saved/{id} → 204；之后回到 effect:\"ask\" → **always 可完整回滚**",
+        "persistence": "once 与 reject 都不写持久规则；saved 规则不在任何 *permission* 文件中，位于 opencode.db"
+      },
+      "criticalSafety": {
+        "savedRecordIsSavePattern": "保存的是 save[] 的模式串，不是 resources[0]",
+        "realTurnProof": "真实 shell 请求 resources:[\"cat go-probe-always.txt\"] 但 save:[\"cat *\"] → always 后 saved resource = \"cat *\"，随后 cat OTHER.txt（不相干命令）→ effect:\"allow\"",
+        "globMatching": "save:[\"cat GLOB-B *\"] 命中 \"cat GLOB-B hello.txt\"（allow），而不匹配的 \"cat EXACT-A.txt\" 仍 ask",
+        "scope": "project 级（psv_*.projectID），不是会话级",
+        "uiConsequence": "手机展示“总是允许”时必须显示 save 模式本身并说明覆盖范围；这为“首批只放 once/reject”提供硬证据"
+      },
+      "rulesetEvaluation": {
+        "sessionOverridesAgent": "会话 shell:*:ask 始终胜过 agent 的 *:allow",
+        "mostSpecificResourceWins": "agent 内 cat ok.txt:allow 覆盖 shell:*:ask → allow；其他资源仍 ask",
+        "uncoveredActionDefaultsAllow": "只有 shell:*:ask 时 edit/read/webfetch/task **以及未知 action 名**都返回 allow → 设一条规则不等于收紧",
+        "agentIsThePermissionMode": "GET /api/agent 每个 agent 自带 permissions（build 7 条含 read:*.env=ask 与 browser:deny、plan 9 条使 edit=deny、explore 18 条、subagent general 禁 question/subagent）",
+        "buildVsPlanRealEffect": "切 build↔plan 后 edit:a/file.ts 在 allow↔deny 之间翻转（会话规则未变）"
+      },
+      "errorShapes": {
+        "secondReplySameRequest": "404 PermissionNotFoundError（**不是 409**；与“请求不存在/会话已删”同码）",
+        "invalidDecision": "400 InvalidRequestError \"Expected Permission.Reply at [\\\"decision\\\"]\"",
+        "missingDecision": "400 \"Missing key at [\\\"decision\\\"]\"",
+        "extraFields": "忽略（204）",
+        "unknownSession": "404 SessionNotFoundError",
+        "unknownMessage": "404 MessageNotFoundError（GET .../message/{messageID} 可用）",
+        "globalScope": "GET /api/permission/request 不带 location → 0；带 location[directory] → 1",
+        "openApiFieldNames": "command 端点字段是 name（不是 command）；compact 需要显式 {} body"
+      },
+      "unresolved": "删除带 pending 的会话后该 pending 是否从全局列表消失：本轮全局同窗返回 2 条但那 2 条属于另一仍存在的会话，**两可，需专门对照**"
+    },
+    "syntheticInboxAndControl": {
+      "evidence": [
+        "logs/ext3_synthetic_inbox.json",
+        "logs/ext7_real_turn.json"
+      ],
+      "synthetic": {
+        "idleBehaviour": "200 返回完整消息记录（type:\"synthetic\"，delivery 缺省 \"steer\"）**并触发一个真实回合**（随后出现 assistant/idle）→ 不是零成本注释",
+        "idempotent": "自带 id 逐字回显；同 id 再提交不同文本 → 200 返回原始记录、不覆盖、不报错（消费后仍如此）",
+        "emptyText": "text:\"\" → 200；缺 text → 400；未知会话 → 404",
+        "resumeTrue": "触发执行：session.active 变 running；该回合消费 inbox 中所有 steer 项、只留 queue 项"
+      },
+      "inbox": {
+        "patchDelivery": "PATCH .../inbox/{id} {delivery} → 204 且 delivery 真实翻转（queue↔steer）",
+        "patchInvalid": "400 \"Expected Session.Inbox.Delivery\"",
+        "patchUnknownId": "409 ConflictError \"Pending input cannot change to queue: msg_*\"",
+        "deleteUnknownId": "204（与 PATCH 的 409 不一致）",
+        "variants": "Session.Inbox.Info 有 user/synthetic/compaction/move 四种"
+      },
+      "control": {
+        "interruptWhileIdle": "200 {\"interrupted\":true} ← **空闲也返回 true**，不能当证据",
+        "interruptResumeWhileIdle": "200 {\"interrupted\":false}",
+        "backgroundWhileIdle": "204 空操作",
+        "moveSession": "POST .../move {directory} → 204 且 location 真实改变；目录不存在 → 400 \"Directory does not exist\"",
+        "viewSession": "POST .../view {idle:0} → 204 但 time.viewed 变成 0、无客户端身份 → 仍无法判定桌面前台会话",
+        "terminalRead": "GET /api/experimental/session/{id}/terminal/read → 200 {\"data\":null}；.../terminal → {\"data\":[]} → 只读它自己控制的 pty，读不到用户 TUI 屏幕",
+        "command": "POST .../command 需要 name 字段 → 400 \"Missing key at [\\\"name\\\"]\"",
+        "compact": "空 body → 400 \"Expected object\"",
+        "experimentalLog": "200 但 86 字节非 JSON 负载，内容不可用"
+      },
+      "realTurnInterrupt": {
+        "sampleSize": 1,
+        "runningTool": "打断 sleep 20 的 shell 工具：200 {interrupted:true}/14ms；session.active 立刻空；assistant finish:\"error\" + idle outcome:\"interrupted\"；inbox 空",
+        "queueAcrossInterrupt": "queue 项被打断后 12s 仍在 inbox，**不会自动开新回合**；消息列表只有第一条 user → 打断不清队列也不续跑队列",
+        "resumeParam": "interrupt?resume=true 与不带 resume 终态完全相同（未见续跑）→ resume 语义仍未证",
+        "endRace": "短回合后每 ~150ms 连续 4 次打断：第 1 次（86ms）true，其后 3 次 false；终态 idle:\"interrupted\"、无 ALPHA 回答；下一次发送正常 → 本次观察未误杀下一回合"
+      }
+    },
+    "pagination": {
+      "evidence": [
+        "logs/ext6a_cursor.json",
+        "logs/ext6b_paging.json",
+        "logs/ext8c_scalar_cursor.json",
+        "logs/ext8d_big_history.json",
+        "logs/ext8b_paging_log.json"
+      ],
+      "tokenShape": "cursor 是对象 {previous,next}，每个值是 base64(JSON {id:<锚点消息 id>, order:\"asc|desc\", direction:\"previous|next\"})",
+      "workingProtocol": "标量 `?limit=N&cursor=<token>`，**不带 order**，以 data.length===0 判停（空页仍返回 token，不能靠 token 消失判停）",
+      "proof": [
+        "20 条历史 / limit=3 → 7 页覆盖 20/20",
+        "260 条历史 / limit=200 → 两页覆盖 260/260；limit=5 → 52 页 260/260",
+        "翻页途中并发写入 → 261/261，不丢不重"
+      ],
+      "traps": [
+        "cursor[previous]= / cursor[next]= 的 deepObject 形态被**静默忽略**：每页返回同一默认页且不报错（本轮前两次走查即被此误导）",
+        "cursor 与 order 同时给 → 400 InvalidCursorError \"Cursor cannot be combined with order\"（与 Mac 2.0.22 一致）",
+        "锚点不存在（msg_nonexi…_000）→ 200 返回最近一页，不报错 → 非法游标不可依赖服务端校验",
+        "limit>200 → 400 \"Expected a value less than or equal to 200\"；0/-1 → 400；1.5 → 400 \"Expected an integer\"",
+        "order 只有小写 asc/desc；ASC/bogus → 400",
+        "types=user 等类型过滤参数被接受但**完全不过滤**（返回全部类型）"
+      ]
+    },
+    "events": {
+      "evidence": [
+        "logs/ext6_cursor_sse.json",
+        "logs/ext10_events.json"
+      ],
+      "wireFormat": "type 在 JSON 负载内（无 event: 行）；心跳是注释行 \": heartbeat\"（≈10s）；无 retry: 指令",
+      "observedTypes": [
+        "server.connected",
+        "form.created",
+        "form.replied",
+        "permission.asked",
+        "permission.replied",
+        "session.inbox.enqueued",
+        "session.inbox.delivered",
+        "session.execution.started",
+        "session.execution.interrupted",
+        "session.execution.failed",
+        "session.step.started",
+        "session.step.failed",
+        "session.renamed",
+        "session.agent.selected",
+        "session.instructions.updated"
+      ],
+      "permissionEvents": {
+        "exists": true,
+        "askedPayload": "{id,sessionID,action,resources,save} —— **没有 source/messageID**，工具关联仍需回读 pending",
+        "repliedPayload": "{sessionID,requestID,reply}"
+      },
+      "durable": {
+        "onlyOnSessionEvents": "durable{aggregateID,seq,version} 只挂在 session.* 事件；form.*/permission.*/server.connected 为 null",
+        "monotonic": "每会话从 seq=1 单调递增（观察到 1→14），且跨连接连续",
+        "use": "可对 session.* 做缺口检测；form/permission 必须回读或轮询兜底"
+      },
+      "lastEventId": "带真实历史 id 重连 → 只收到重连之后的事件，历史不重放（与 Mac 一致）",
+      "locationOnEvents": "session.execution.* / session.renamed / session.agent.selected **没有 location 字段** → 归属必须按 data.sessionID 键",
+      "params": "types=<单值> 可建流（过滤未证）；types 重复传 → 400；location[directory]= 可建流（作用域未证）",
+      "failureReasons": "session.execution.failed{error:{type:\"provider.free-limit\",…}} → 失败原因可直接从事件取"
+    },
+    "startupForms": {
+      "evidence": [
+        "logs/ext8_server.json",
+        "logs/ext9_serve_mode.json"
+      ],
+      "dashServer": "opencode --server http://127.0.0.1:<port>：不 fork serve --service、**不修改 state/config 的 service.json**（stateChanged:false，id/pid 不变），只是客户端",
+      "manualServe": "opencode serve --port 28934 --hostname 127.0.0.1：监听正常；用 OPENCODE_SERVER_PASSWORD 环境变量作 Basic 密码 → /api/info 200；无认证 401；错密码 401；**/openapi.json 也需认证（401）**；**完全不写任何登记文件**；只杀自己启动的 PID，端口释放，托管服务不受影响",
+      "standalone": "（第二轮）私有 serve --stdio --port 0 随机端口，不写 service.json，无认证 401",
+      "conclusion": "自动发现（service.json + Basic）只对**默认后台 service**成立；serve/--standalone 需要用户手交 URL+密码，属另外的范围决定"
+    },
+    "miscNewFacts": {
+      "apiInfo": "2.2.2 的 /api/info 增加 hostname（已脱敏 <HOST>）与 capabilities:{persistentPty:true}、paths.tmp；代际核对应使用 pid/version/urls；hostname 不应下发手机",
+      "openapiPaths": "2.2.2 共 134 条（Mac 2.0.22 报告为 116 条）",
+      "configEndpoints": "GET /api/config 只返回配置**目录**列表（不是设置值）；GET /api/config/shell 只列 powershell/cmd（acceptable:true），**不含 bash**，而 shell 工具实际用 /usr/bin/bash → 不能用该端点推断工具用哪个 shell",
+      "agents": "build/general/explore/compaction/title/summary/plan；compaction/title/summary 是 primary 但 hidden:true，仍可被 API 切换；general/explore 是 subagent 也可切换",
+      "unvalidatedWrites": "POST .../agent 与 POST .../model 对不存在的值返回 **204** 并真的写入；随后 prompt 200 但回合 idle outcome:\"failed\"、记录里留着 model-switched 的非法值；fork 同样不校验并继承非法模型",
+      "newTerminalOutcome": "idle.outcome 观测到 succeeded / interrupted / **failed** 三值",
+      "patchSession": "PATCH 可改 title（读回一致）与 permissions（deny 真的阻止工具，create 返回 effect:\"deny\"）；PATCH time.archived 204 后会话**仍在列表**中",
+      "projectIdentity": "GET /api/project 返回 {id, canonical, time:{created,updated,active}, sandboxes}；canonical 才是身份依据",
+      "locationPathVariants": "POST /api/session 的相对路径与小写盘符 → **HTTP 500 且空 body（非 JSON）**；尾 \\ 与正斜杠在 create 和 location[directory] 查询都归一；小写盘符下 /api/session 命中 4 条而 /api/form、/api/model → 404（同一非法路径在不同端点结果不同）",
+      "directoryFilterOnSession": "GET /api/session?directory=<path> 可用（与 location[directory] 并存）",
+      "authMatrix": "无认证/Bearer/错密码/错用户名 → 401 UnauthorizedError + WWW-Authenticate: Basic realm=<redacted>；/openapi.json 与 /api/info 也需认证"
+    }
+  },
+  "round5": {
+    "alwaysPersistenceAcrossRestart": {
+      "controlledFlow": "新会话 → native create pending → reply always → 校验 saved → 制造孤儿 pending（另一会话的 pending + DELETE 该会话）→ 只杀本轮隔离 service PID（校验 serve --service 且持有 28935）→ TUI 监督自动拉起新代际 → 复查",
+      "newGeneration": {
+        "id": "73272d5a-0f3d-4cad-b7d8-db330cf99997",
+        "pid": 27924,
+        "url": "http://127.0.0.1:28935",
+        "version": "2.2.2",
+        "passwordHash12": "<redacted-sha256-prefix-not-shipped>"
+      },
+      "portUnchanged": true,
+      "passwordHashUnchanged": true,
+      "oldPasswordStillWorks": 200,
+      "ruleSurvived": true,
+      "ruleStorageFiles": {
+        "before": [
+          "xdg-data\\opencode\\opencode.db-wal"
+        ],
+        "after": [
+          "xdg-data\\opencode\\opencode.db",
+          "xdg-data\\opencode\\opencode.db-wal"
+        ]
+      },
+      "stillAutoAllowsAfterRestart": {
+        "data": {
+          "id": "per_18b5a2…",
+          "effect": "allow"
+        }
+      },
+      "orphanPendingSurvivedRestart": 0,
+      "orphanEverOnDisk": false,
+      "cleanup": {
+        "ruleDeleted": [
+          {
+            "id": "psv_18b59f…",
+            "delete": 204
+          }
+        ],
+        "savedFinal": {
+          "data": []
+        },
+        "sessionsDeleted": [
+          {
+            "id": "ses_e74a60…",
+            "status": 204
+          },
+          {
+            "id": "ses_e74a60…",
+            "status": 404
+          }
+        ],
+        "pendingGlobalFinal": {
+          "location": {
+            "directory": "E:\\LLMproject\\oc-probe-r5-20261030T0543\\project"
+          },
+          "data": []
+        }
+      }
+    },
+    "orphanPendingOnSessionDelete": {
+      "globalBaselineAtDirA": 0,
+      "afterCreateGlobal": 1,
+      "sessionDeletedStatus": 204,
+      "globalAfterDelete": 1,
+      "sessionReadAfterDelete": 404,
+      "replyAfterDelete": {
+        "status": 404,
+        "body": {
+          "_tag": "SessionNotFoundError",
+          "sessionID": "ses_e74a98…",
+          "message": "Session not found: ses_e74a98…"
+        }
+      },
+      "verdict": "session delete does NOT clear its pending; the orphan is unrepliable (404 SessionNotFoundError) and only a service restart clears it"
+    },
+    "savedScopeWithoutProjectId": {
+      "noProject": {
+        "status": 200,
+        "rules": []
+      },
+      "projectA": {
+        "status": 200,
+        "rules": [
+          {
+            "id": "psv_18b567…",
+            "projectID": "32180754",
+            "resource": "cat r5-saved-A.txt"
+          }
+        ]
+      },
+      "projectB": {
+        "status": 200,
+        "rules": [
+          {
+            "id": "psv_18b567…",
+            "projectID": "17a31d90",
+            "resource": "cat r5-saved-B.txt"
+          }
+        ]
+      },
+      "unknownProject": 200,
+      "verdict": "GET /api/permission/saved without projectID returns [] even when two projects each hold a rule → not aggregated, defaults to HOME (same trap as form/permission/model/agent)"
+    },
+    "eventStreamScope": {
+      "typesFilterHonoured": [
+        "server.connected",
+        "form.created"
+      ],
+      "unfilteredObserved": [
+        "server.connected",
+        "integration.updated",
+        "provider.updated",
+        "model.updated",
+        "agent.updated",
+        "command.updated",
+        "skill.updated",
+        "websearch.updated",
+        "reference.updated",
+        "plugin.updated",
+        "integration.updated",
+        "provider.updated",
+        "model.updated",
+        "agent.updated",
+        "command.updated",
+        "skill.updated",
+        "websearch.updated",
+        "reference.updated",
+        "plugin.updated",
+        "form.created",
+        "permission.asked",
+        "session.inbox.enqueued",
+        "session.execution.started",
+        "session.instructions.updated",
+        "session.inbox.delivered",
+        "form.cancelled",
+        "permission.replied",
+        "session.step.started",
+        "session.step.failed",
+        "session.execution.failed"
+      ],
+      "typesRepeated": "400 (from round 4)",
+      "locationScoping": "location-scope-IGNORED (received events for the other directory)",
+      "locationObserved": [
+        {
+          "type": "server.connected",
+          "sessionID": null,
+          "location": null
+        },
+        {
+          "type": "form.created",
+          "sessionID": null,
+          "location": "project"
+        },
+        {
+          "type": "form.created",
+          "sessionID": null,
+          "location": "projectB"
+        },
+        {
+          "type": "form.cancelled",
+          "sessionID": "ses_e74a98…",
+          "location": "projectB"
+        }
+      ],
+      "startupNoiseTypes": [
+        "server.connected",
+        "integration.updated",
+        "provider.updated",
+        "model.updated",
+        "agent.updated",
+        "command.updated",
+        "skill.updated",
+        "websearch.updated",
+        "reference.updated",
+        "plugin.updated",
+        "session.instructions.updated"
+      ],
+      "newTypesThisRound": [
+        "form.cancelled",
+        "integration.updated",
+        "provider.updated",
+        "model.updated",
+        "agent.updated",
+        "command.updated",
+        "skill.updated",
+        "websearch.updated",
+        "reference.updated",
+        "plugin.updated"
+      ],
+      "verdict": "types=<single> genuinely filters; location[directory]= does NOT scope; the stream is instance-wide, so attribution must be client-side by data.sessionID"
+    },
+    "concurrency": {
+      "threeWayFormReply": {
+        "statuses": [
+          204,
+          409,
+          409
+        ],
+        "errors": [
+          null,
+          "FormAlreadySettledError",
+          "FormAlreadySettledError"
+        ],
+        "ms": [
+          5,
+          8,
+          9
+        ],
+        "finalState": {
+          "status": "answered",
+          "answer": {
+            "q0": "CLIENT-1"
+          }
+        },
+        "exactlyOneAccepted": 1
+      },
+      "threeWayPermissionReply": {
+        "requestId": "per_18b569…",
+        "statuses": [
+          204,
+          404,
+          404
+        ],
+        "errors": [
+          null,
+          "PermissionNotFoundError:Permission request not found: per_18b569…",
+          "PermissionNotFoundError:Permission request not found: per_18b569…"
+        ],
+        "ms": [
+          3,
+          5,
+          6
+        ],
+        "pendingAfter": 0,
+        "savedRulesAfter": [
+          "cat r5-saved-A.txt"
+        ],
+        "note": "which decision won is only knowable from effects: pending cleared + whether an always rule appeared"
+      },
+      "cancelVersusReply": {
+        "reply": {
+          "status": 204
+        },
+        "cancel": {
+          "status": 409,
+          "error": "FormAlreadySettledError"
+        },
+        "finalState": {
+          "status": "answered",
+          "answer": {
+            "q0": "REPLY-WINS?"
+          }
+        }
+      },
+      "verdicts": [
+        "form: exactly one 204, the rest 409 FormAlreadySettledError, final answer = winner, no mixing (extends the Mac two-client result to three)",
+        "permission: exactly one 204, the rest 404 PermissionNotFoundError; the losing `always` did NOT write a saved rule",
+        "status codes alone never reveal who won — read back pending/saved/state",
+        "after settle, even DELETE (cancel) is rejected with 409"
+      ]
+    },
+    "attachmentLimits": {
+      "exactLimitBytes": 20971520,
+      "ladder": [
+        {
+          "name": "size-8MiB",
+          "status": 200,
+          "ms": 591,
+          "error": null
+        },
+        {
+          "name": "size-16MiB",
+          "status": 200,
+          "ms": 2195,
+          "error": null
+        },
+        {
+          "name": "size-24MiB",
+          "status": 400,
+          "ms": 10,
+          "error": "InvalidRequestError:Attachment exceeds the 20971520 byte limit: file:///E:/LLMproject/oc-probe-r5-20261030T0543/project/r5-size-24mib.txt"
+        },
+        {
+          "name": "size-48MiB",
+          "status": 400,
+          "ms": 8,
+          "error": "InvalidRequestError:Attachment exceeds the 20971520 byte limit: file:///E:/LLMproject/oc-probe-r5-20261030T0543/project/r5-size-48mib.txt"
+        }
+      ],
+      "dataUri": [
+        {
+          "name": "data-uri-8MiB",
+          "status": 200,
+          "error": null
+        },
+        {
+          "name": "data-uri-24MiB",
+          "status": 400,
+          "error": "InvalidRequestError:Attachment exceeds the 20971520 byte limit: inline attachment"
+        }
+      ],
+      "responseWeight16MiB": 22369990,
+      "aclDenied": {
+        "promptStatus": 400,
+        "error": "InvalidRequestError:Unable to read attachment: file:///E:/LLMproject/oc-probe-r5-20261030T0543/project/r5-acl-denied.txt",
+        "powershellConfirmedDenied": "DENIED: UnauthorizedAccessException"
+      },
+      "aclRestore": {
+        "note": "icacls /remove:d is NOT enough after /inheritance:r (leaves the file with no ACE at all); icacls /reset restores inheritance",
+        "restoredReadable": "see follow-up entry",
+        "followUp": {
+          "name": "acl-reset-followup",
+          "note": "上一行的 /remove:d 只删掉 Deny ACE，但 /inheritance:r 已移除继承的 Allow ACE，文件变成无任何权限；补 /reset 恢复继承",
+          "icaclsReset": "done",
+          "readableAfterReset": "see console",
+          "productImplication": "ACL 拒绝读取与文件不存在返回同一个 400 Unable to read attachment，兔维斯无法区分两种原因；另外对测试文件改 ACL 必须用 /reset 而不是 /remove:d 才能复原"
+        }
+      },
+      "deliveredInboxItem": {
+        "queuedId": "msg_18b5c1…",
+        "deliveredAfterMs": 1869,
+        "messageReadable": 200,
+        "patchStatus": 409,
+        "patchError": "ConflictError:Pending input cannot change to steer: msg_18b5c1…",
+        "deleteStatus": 204
+      },
+      "verdicts": [
+        "hard limit 20,971,520 bytes for BOTH file:// and data: channels (corrects round 4 “no ceiling observed”)",
+        "the prompt response echoes the full inline base64 (~1.33x raw), and it stays in the message record → read budgets must account for it; a 4 MiB response cap breaks on any >3 MiB attachment",
+        "ACL-denied read and missing file return the identical 400 Unable to read attachment",
+        "PATCH on a delivered inbox item is 409 ConflictError while DELETE is a silent 204 no-op → 204 is never evidence of retraction"
+      ]
+    },
+    "realTurnSamples": {
+      "rounds": 3,
+      "note": "n raised from 1 to 3 for interrupt / resume / queue-across-interrupt / handover-race",
+      "summary": [
+        {
+          "round": 1,
+          "A_interruptRunningTool": {
+            "status": 200,
+            "body": {
+              "interrupted": true
+            },
+            "activeRightAfter": false,
+            "activeLater": false,
+            "outcomes": [
+              "interrupted"
+            ],
+            "inboxAfter": []
+          },
+          "B_interruptResume": {
+            "status": 200,
+            "body": {
+              "interrupted": true
+            },
+            "activeRightAfter": false,
+            "activeAfter12s": false,
+            "outcomes": [
+              "interrupted"
+            ],
+            "inboxAfter": [],
+            "outcomesAfterFollowUp": [
+              "interrupted"
+            ]
+          },
+          "C_queueAcrossInterrupt": {
+            "interruptBody": {
+              "interrupted": true
+            },
+            "inboxRightAfter": [
+              {
+                "id": "msg_18b5cd…",
+                "delivery": "queue"
+              }
+            ],
+            "inboxAfter15s": [
+              {
+                "id": "msg_18b5cd…",
+                "delivery": "queue"
+              }
+            ],
+            "activeAfter15s": false,
+            "userTexts": [
+              "Use the shell tool to run exactly: sleep 12 ; cat "
+            ]
+          },
+          "D_handoverRace": {
+            "totalFires": 30,
+            "lastFires": [
+              {
+                "at": 19095,
+                "interrupted": false,
+                "wasActive": false
+              },
+              {
+                "at": 19886,
+                "interrupted": false,
+                "wasActive": false
+              },
+              {
+                "at": 20676,
+                "interrupted": false,
+                "wasActive": false
+              },
+              {
+                "at": 21470,
+                "interrupted": false,
+                "wasActive": false
+              },
+              {
+                "at": 22262,
+                "interrupted": false,
+                "wasActive": false
+              },
+              {
+                "at": 23060,
+                "interrupted": false,
+                "wasActive": false
+              }
+            ],
+            "finalOutcomes": [
+              "interrupted"
+            ],
+            "t2Delivered": false
+          },
+          "E_nativeQuestionForm": {
+            "formsSeen": 1,
+            "fieldTypes": [
+              [
+                "string",
+                "multiselect"
+              ]
+            ]
+          }
+        },
+        {
+          "round": 2,
+          "A_interruptRunningTool": {
+            "status": 200,
+            "body": {
+              "interrupted": true
+            },
+            "activeRightAfter": false,
+            "activeLater": false,
+            "outcomes": [
+              "interrupted"
+            ],
+            "inboxAfter": []
+          },
+          "B_interruptResume": {
+            "status": 200,
+            "body": {
+              "interrupted": true
+            },
+            "activeRightAfter": false,
+            "activeAfter12s": false,
+            "outcomes": [
+              "interrupted"
+            ],
+            "inboxAfter": [],
+            "outcomesAfterFollowUp": [
+              "interrupted"
+            ]
+          },
+          "C_queueAcrossInterrupt": {
+            "interruptBody": {
+              "interrupted": true
+            },
+            "inboxRightAfter": [
+              {
+                "id": "msg_18b5e3…",
+                "delivery": "queue"
+              }
+            ],
+            "inboxAfter15s": [
+              {
+                "id": "msg_18b5e3…",
+                "delivery": "queue"
+              }
+            ],
+            "activeAfter15s": false,
+            "userTexts": [
+              "Use the shell tool to run exactly: sleep 12 ; cat "
+            ]
+          },
+          "D_handoverRace": {
+            "totalFires": 30,
+            "lastFires": [
+              {
+                "at": 19138,
+                "interrupted": false,
+                "wasActive": false
+              },
+              {
+                "at": 19932,
+                "interrupted": false,
+                "wasActive": false
+              },
+              {
+                "at": 20725,
+                "interrupted": false,
+                "wasActive": false
+              },
+              {
+                "at": 21517,
+                "interrupted": false,
+                "wasActive": false
+              },
+              {
+                "at": 22312,
+                "interrupted": false,
+                "wasActive": false
+              },
+              {
+                "at": 23100,
+                "interrupted": false,
+                "wasActive": false
+              }
+            ],
+            "finalOutcomes": [
+              "interrupted"
+            ],
+            "t2Delivered": false
+          },
+          "E_nativeQuestionForm": null
+        },
+        {
+          "round": 3,
+          "A_interruptRunningTool": {
+            "status": 200,
+            "body": {
+              "interrupted": true
+            },
+            "activeRightAfter": false,
+            "activeLater": false,
+            "outcomes": [
+              "interrupted"
+            ],
+            "inboxAfter": []
+          },
+          "B_interruptResume": {
+            "status": 200,
+            "body": {
+              "interrupted": true
+            },
+            "activeRightAfter": false,
+            "activeAfter12s": false,
+            "outcomes": [
+              "interrupted"
+            ],
+            "inboxAfter": [],
+            "outcomesAfterFollowUp": [
+              "interrupted",
+              "succeeded"
+            ]
+          },
+          "C_queueAcrossInterrupt": {
+            "interruptBody": {
+              "interrupted": true
+            },
+            "inboxRightAfter": [
+              {
+                "id": "msg_18b5f7…",
+                "delivery": "queue"
+              }
+            ],
+            "inboxAfter15s": [
+              {
+                "id": "msg_18b5f7…",
+                "delivery": "queue"
+              }
+            ],
+            "activeAfter15s": false,
+            "userTexts": [
+              "Use the shell tool to run exactly: sleep 12 ; cat "
+            ]
+          },
+          "D_handoverRace": {
+            "totalFires": 30,
+            "lastFires": [
+              {
+                "at": 19035,
+                "interrupted": false,
+                "wasActive": false
+              },
+              {
+                "at": 19827,
+                "interrupted": false,
+                "wasActive": false
+              },
+              {
+                "at": 20618,
+                "interrupted": false,
+                "wasActive": false
+              },
+              {
+                "at": 21409,
+                "interrupted": false,
+                "wasActive": false
+              },
+              {
+                "at": 22200,
+                "interrupted": false,
+                "wasActive": false
+              },
+              {
+                "at": 22996,
+                "interrupted": false,
+                "wasActive": false
+              }
+            ],
+            "finalOutcomes": [
+              "interrupted"
+            ],
+            "t2Delivered": false
+          },
+          "E_nativeQuestionForm": null
+        }
+      ],
+      "cleanup": {
+        "remainingDeleted": 50,
+        "cmdFileRemoval": "removed"
+      }
+    },
+    "handoverModel": {
+      "finding": "a queued item is consumed inside the SAME execution as the turn before it: the session record holds only ONE idle for two prompts, and session.active never falls back to false between them",
+      "evidence": "logs/ext17_handover_race.json (3/3 rounds identical; turn2AutoStart never observed because there is no boundary)",
+      "consequence": "there is no \"old turn ended, new turn not yet started\" window to interrupt safely"
+    },
+    "lateInterruptKillsNewerTurn": {
+      "rounds": 3,
+      "method": "wait until turn 1 assistant answer text exists (so the queued turn 2 is already running its sleep 20), confirm GET .../message/{queuedId} == 200, then fire interrupt",
+      "perRound": [
+        {
+          "round": 1,
+          "turn1AnsweredAtMs": 4260,
+          "queuedTurnAlreadyInMessages": 200,
+          "activeBeforeInterrupt": true,
+          "interruptBody": {
+            "interrupted": true
+          },
+          "interruptAtMs": 6285,
+          "turn2ProducedAnswer": false,
+          "idleOutcomes": [
+            "interrupted"
+          ],
+          "sequence": [
+            "user",
+            "assistant[stop]",
+            "user(queued-turn)",
+            "assistant[error]",
+            "idle:interrupted"
+          ]
+        },
+        {
+          "round": 2,
+          "turn1AnsweredAtMs": 2580,
+          "queuedTurnAlreadyInMessages": 200,
+          "activeBeforeInterrupt": true,
+          "interruptBody": {
+            "interrupted": true
+          },
+          "interruptAtMs": 4589,
+          "turn2ProducedAnswer": false,
+          "idleOutcomes": [
+            "interrupted"
+          ],
+          "sequence": [
+            "user",
+            "assistant[stop]",
+            "user(queued-turn)",
+            "assistant[error]",
+            "idle:interrupted"
+          ]
+        },
+        {
+          "round": 3,
+          "turn1AnsweredAtMs": 2754,
+          "queuedTurnAlreadyInMessages": 200,
+          "activeBeforeInterrupt": true,
+          "interruptBody": {
+            "interrupted": true
+          },
+          "interruptAtMs": 4805,
+          "turn2ProducedAnswer": false,
+          "idleOutcomes": [
+            "interrupted"
+          ],
+          "sequence": [
+            "user",
+            "assistant[stop]",
+            "user(queued-turn)",
+            "assistant[error]",
+            "idle:interrupted"
+          ]
+        }
+      ],
+      "verdict": "CONFIRMED (3/3): an interrupt intended for turn 1 kills turn 2 instead; turn 2 leaves no answer, its user message stays permanently in the record followed by an empty assistant[error] and idle:\"interrupted\"",
+      "why": "POST /api/session/{id}/interrupt accepts only sessionID (+resume query) - there is no turn/message identifier, so it always acts on whatever the session is running now",
+      "productRequirement": [
+        "label interrupt as \"stop the current execution (possibly the message that was just queued)\"",
+        "re-read which user message is currently executing before sending interrupt",
+        "after an interrupt, honestly show queued-but-unanswered turns instead of implying they were never sent"
+      ],
+      "cleanup": {
+        "leftoverDeleted": 5,
+        "testFileRemoved": "removed"
+      }
+    }
+  },
+  "round6": {
+    "multiFileAttachments": "见 06-attachments.json",
+    "replyShape": "见 06-attachments.json#nativeReplyShape"
+  }
+}

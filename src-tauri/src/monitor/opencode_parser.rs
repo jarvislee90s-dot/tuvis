@@ -1,13 +1,24 @@
 // OpenCode 会话解析器 — 基于 SQLite 数据库（opencode.db）
 // OpenCode 1.17+ 使用 SQLite 替代分散 JSON 文件，此模块查询数据库获取会话状态
+//
+// R1（2026-11-10）：活跃卡来源从「归一化 cwd 配最新 200 行 + project worktree 回退」的
+// 目录猜测改为「已核验窗口观察」——观察由异步采集层（monitor::opencode_observation，
+// TUI 只读插件按需同步读 router.current()）预先采好，本解析器只消费快照：
+// - `Opened{session_id}`（新鲜确认态）→ 按 ID 点读 DB 行出卡（元数据读取复用既有
+//   v1/v2 读路径）；
+// - `Retained{session_id}`（过期的最后确认记录）→ 保留观察但不产活跃卡；
+// - `Home`（首页）→ 不产卡（权威「无会话」）；
+// - `Unknown`（无观察/进程退出/同 PID 换代/过期且无确认打开历史）→ 不产卡也不冒充
+//   旧会话（读不到保持未知；代际守卫在观察解析层逐拍校验进程身份）。
+// cwd / 最新历史行 / project worktree / active API 一律不再用于产活跃卡
+// （历史与未读语义保留：历史会话仍可按确认 ID 读取，未读卡由 adapter 层合并不变）。
 
-use super::cwd::{cwd_equivalent, normalize_cwd_for_match};
 use crate::adapter::AgentProcess;
+use crate::monitor::opencode_observation::ResolvedObservation;
 use crate::session::{jump_supported_for, AgentType, Session, SessionStatus};
 use log::{debug, info};
 use rusqlite::Connection;
 use serde::Deserialize;
-use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 /// message.data JSON 结构（1.x）
@@ -120,23 +131,34 @@ struct SessionRow {
 }
 
 /// 获取 OpenCode 会话（生产入口：DB 固定在 ~/.local/share/opencode/opencode.db）。
-/// 扫描预算豁免说明（monitor::session_scan）：SQLite 查询即按 cwd 过滤、零进程已
-/// 空判早退（L1），无"全量历史重扫"问题，故不接 L2/L3
+/// 扫描预算豁免说明（monitor::session_scan）：SQLite 查询即按会话 ID 点查、零进程已
+/// 空判早退（L1），无"全量历史重扫"问题，故不接 L2/L3。
+///
+/// R1：活跃卡只能来自「已核验窗口观察的 sessionID」——观察由异步采集层
+/// （monitor::opencode_observation）预先采好，本入口只同步消费快照。
 pub fn get_opencode_sessions(processes: &[AgentProcess]) -> Vec<Session> {
     let Some(h) = dirs::home_dir() else {
         return Vec::new();
     };
+    let observations = crate::monitor::opencode_observation::resolved_for_processes(processes);
     get_opencode_sessions_with_db(
         &h.join(".local")
             .join("share")
             .join("opencode")
             .join("opencode.db"),
         processes,
+        &observations,
     )
 }
 
-/// DB 路径注入版（单测用）：与生产入口同逻辑
-fn get_opencode_sessions_with_db(db_path: &Path, processes: &[AgentProcess]) -> Vec<Session> {
+/// DB 路径注入版（单测用）：与生产入口同逻辑。
+/// `observations` = 各 TUI 进程（按 pid）的已核验窗口观察；
+/// Opened → 按 ID 出卡；Retained/Home/Unknown/无观察 → 不产活跃卡。
+fn get_opencode_sessions_with_db(
+    db_path: &Path,
+    processes: &[AgentProcess],
+    observations: &[(u32, ResolvedObservation)],
+) -> Vec<Session> {
     if processes.is_empty() {
         return Vec::new();
     }
@@ -155,14 +177,6 @@ fn get_opencode_sessions_with_db(db_path: &Path, processes: &[AgentProcess]) -> 
         }
     };
 
-    // 归一化 cwd -> process 映射（统一分隔符、去尾部、Windows 下小写）
-    let mut cwd_to_process: HashMap<String, &AgentProcess> = HashMap::new();
-    for process in processes {
-        if let Some(cwd) = &process.cwd {
-            cwd_to_process.insert(normalize_cwd_for_match(&cwd.to_string_lossy()), process);
-        }
-    }
-
     // schema 分派（D0-4 定案）：2.x（session_v2 在场）走 v2 表（超集，两时代通吃）；
     // 纯 1.x 环境走旧表。此后所有 SQL 的表名经 schema 取，分派一次贯穿全程。
     let schema = Schema::detect(&conn);
@@ -172,94 +186,51 @@ fn get_opencode_sessions_with_db(db_path: &Path, processes: &[AgentProcess]) -> 
         schema.session_table()
     );
 
-    // 最近会话行（主匹配数据源，归一化比较在 Rust 侧做）
-    let recent: Vec<SessionRow> = conn
-        .prepare(&format!(
-            "SELECT id, directory, title, time_updated FROM {} ORDER BY time_updated DESC LIMIT 200",
-            schema.session_table()
-        ))
-        .ok()
-        .map(|mut stmt| {
-            stmt.query_map([], |row| {
-                Ok(SessionRow {
-                    id: row.get(0)?,
-                    directory: row.get(1)?,
-                    title: row.get(2)?,
-                    time_updated: row.get(3)?,
-                })
-            })
-            .ok()
-            .map(|rows| rows.filter_map(|r| r.ok()).collect())
-            .unwrap_or_default()
-        })
-        .unwrap_or_default();
-
     let mut sessions = Vec::new();
-    let mut matched_pids: HashSet<u32> = HashSet::new();
-    // 已被某进程认领的 session 行下标（同目录双开防遮蔽：recent 按 time_updated DESC，
-    // 最新行配第一个进程、次新行配第二个——借鉴 kimi_parser Phase 1 的 matched 集合）
-    let mut matched_rows: HashSet<usize> = HashSet::new();
-
-    // ---- 主匹配：session.directory（会话启动目录）与进程 cwd 归一化相等 ----
-    // （含 global 会话；取代原按 directory 精确 SQL 的 global 回退——SQL 精确匹配无法
-    //   处理分隔符/大小写差异，归一化比较必须在 Rust 侧做）
     for process in processes {
-        let Some(cwd) = &process.cwd else { continue };
-        let cwd_str = cwd.to_string_lossy();
-        if let Some((row_idx, row)) = recent
-            .iter()
-            .enumerate()
-            .find(|(i, r)| !matched_rows.contains(i) && cwd_equivalent(&r.directory, &cwd_str))
-        {
-            if let Some(session) = build_session_from_row(&conn, schema, row, None, process) {
-                sessions.push(session);
-                // 构造成功才认领行与 pid（与 kimi Phase 1 同时序）：若将来构造可能
-                // 过滤返回 None，失败时不烧掉行/pid，该进程仍可走回退匹配
-                matched_rows.insert(row_idx);
-                matched_pids.insert(process.pid);
-            }
-        }
-    }
-
-    // ---- 回退匹配：project worktree 前缀（进程 cwd 等于或在 worktree 之下）----
-    let projects: Vec<(String, String, Option<String>)> = conn
-        .prepare("SELECT id, worktree, name FROM project WHERE id != 'global'")
-        .ok()
-        .map(|mut stmt| {
-            stmt.query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                ))
-            })
+        // R1：活跃卡唯一来源 = 已核验窗口观察，按 pid 对位。
+        // 无观察项（未登记/采集层失败）与 Unknown 同义：不产卡、不猜。
+        let Some((_, obs)) = observations.iter().find(|(pid, _)| *pid == process.pid) else {
+            continue;
+        };
+        // 只有新鲜观察可作为活跃卡来源。Retained 只是最后确认的记录，
+        // 不能证明窗口仍停留在该会话；采集层继续保留它以便后续恢复。
+        let (session_id, _obs_directory) = match obs {
+            ResolvedObservation::Opened {
+                session_id,
+                directory,
+            } => (session_id, directory),
+            // Home = 权威「无会话」（确认 Home 才移除卡）；Unknown = 未知/退出/换代。
+            // 两者都不产卡，也不得从同目录/最新历史补造当前会话（R1 附件约束 3/6/8）
+            _ => continue,
+        };
+        // 按 ID 点读会话行（历史读路径回归保留：v1/v2 schema 分派与行构造不变）
+        let row = conn
+            .prepare(&format!(
+                "SELECT id, directory, title, time_updated FROM {} WHERE id = ?1",
+                schema.session_table()
+            ))
             .ok()
-            .map(|rows| rows.filter_map(|r| r.ok()).collect())
-            .unwrap_or_default()
-        })
-        .unwrap_or_default();
-
-    for (project_id, worktree, name) in &projects {
-        let wt = normalize_cwd_for_match(worktree);
-        let matching_process = cwd_to_process
-            .iter()
-            .find(|(cwd, proc)| {
-                !matched_pids.contains(&proc.pid)
-                    && (*cwd == wt.as_str() || cwd.starts_with(&format!("{}/", wt)))
-            })
-            .map(|(_, p)| *p);
-
-        if let Some(process) = matching_process {
+            .and_then(|mut stmt| {
+                stmt.query_row([session_id.as_str()], |row| {
+                    Ok(SessionRow {
+                        id: row.get(0)?,
+                        directory: row.get(1)?,
+                        title: row.get(2)?,
+                        time_updated: row.get(3)?,
+                    })
+                })
+                .ok()
+            });
+        let Some(row) = row else {
             debug!(
-                "OpenCode project {} matched to pid={}",
-                worktree, process.pid
+                "OpenCode observed session not found in db (pid={}): {session_id}",
+                process.pid
             );
-            matched_pids.insert(process.pid);
-            if let Some(session) =
-                get_latest_session_for_project(&conn, schema, project_id, name.as_deref(), process)
-            {
-                sessions.push(session);
-            }
+            continue;
+        };
+        if let Some(session) = build_session_from_row(&conn, schema, &row, None, process) {
+            sessions.push(session);
         }
     }
 
@@ -269,34 +240,6 @@ fn get_opencode_sessions_with_db(db_path: &Path, processes: &[AgentProcess]) -> 
         processes.len()
     );
     sessions
-}
-
-/// 获取项目的最新会话
-fn get_latest_session_for_project(
-    conn: &Connection,
-    schema: Schema,
-    project_id: &str,
-    project_name: Option<&str>,
-    process: &AgentProcess,
-) -> Option<Session> {
-    let row = conn
-        .prepare(&format!(
-            "SELECT id, directory, title, time_updated FROM {} WHERE project_id = ? ORDER BY time_updated DESC LIMIT 1",
-            schema.session_table()
-        ))
-        .ok()?
-        .query_row([project_id], |row| {
-            Ok(SessionRow {
-                id: row.get(0)?,
-                directory: row.get(1)?,
-                // title 为 String（NOT NULL 列），转 Option 统一行形态
-                title: Some(row.get::<_, String>(2)?),
-                time_updated: row.get(3)?,
-            })
-        })
-        .ok()?;
-
-    build_session_from_row(conn, schema, &row, project_name, process)
 }
 
 /// 由会话行构造 Session（主匹配与项目匹配共用）
@@ -1526,6 +1469,23 @@ mod v2_tests {
         }
     }
 
+    /// 观察辅助：确认窗口 pid 打开着会话 sid（R1 观察驱动匹配的测试输入）
+    fn opened(
+        pid: u32,
+        sid: &str,
+    ) -> (
+        u32,
+        crate::monitor::opencode_observation::ResolvedObservation,
+    ) {
+        (
+            pid,
+            crate::monitor::opencode_observation::ResolvedObservation::Opened {
+                session_id: sid.to_string(),
+                directory: None,
+            },
+        )
+    }
+
     /// 建 v2 库：session_v2 + session_message（+ project 供兜底段安静退场）
     fn v2_db(path: &std::path::Path) {
         let conn = Connection::open(path).unwrap();
@@ -1814,7 +1774,7 @@ mod v2_tests {
         )
         .unwrap();
         let procs = vec![fake_process(4343, "E:/proj/u")];
-        let sessions = get_opencode_sessions_with_db(&db, &procs);
+        let sessions = get_opencode_sessions_with_db(&db, &procs, &[opened(4343, "ses_u")]);
         assert_eq!(sessions.len(), 1);
         let s = &sessions[0];
         // 高 CPU 护栏走 determine_opencode_status：role=assistant 时 Fallback 信号
@@ -1872,7 +1832,7 @@ mod v2_tests {
             );
         }
         let procs = vec![fake_process(4242, "E:/proj/a")];
-        let sessions = get_opencode_sessions_with_db(&db, &procs);
+        let sessions = get_opencode_sessions_with_db(&db, &procs, &[opened(4242, "ses_a")]);
         assert_eq!(
             sessions.len(),
             1,
@@ -1991,7 +1951,15 @@ mod v2_tests {
             fake_process(4344, "E:/proj/f2"),
             fake_process(4345, "E:/proj/f3"),
         ];
-        let mut sessions = get_opencode_sessions_with_db(&db, &procs);
+        let mut sessions = get_opencode_sessions_with_db(
+            &db,
+            &procs,
+            &[
+                opened(4343, "ses_noev"),
+                opened(4344, "ses_pverr"),
+                opened(4345, "ses_abort"),
+            ],
+        );
         sessions.sort_by(|a, b| a.id.cmp(&b.id));
         assert_eq!(sessions.len(), 3);
         let by = |id: &str| sessions.iter().find(|s| s.id == id).unwrap();
@@ -2046,7 +2014,7 @@ mod v2_tests {
             );
         }
         let procs = vec![fake_process(99, "E:/proj/legacy")];
-        let sessions = get_opencode_sessions_with_db(&db, &procs);
+        let sessions = get_opencode_sessions_with_db(&db, &procs, &[opened(99, "ses_legacy")]);
         assert_eq!(sessions.len(), 1, "混合库须走 v2 且 1.x 历史会话可读");
         assert_eq!(sessions[0].id, "ses_legacy");
         assert_eq!(sessions[0].status, crate::session::SessionStatus::Idle);
@@ -2115,7 +2083,11 @@ mod v2_tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let sessions = crate::monitor::test_env::with_home(&anchor_home, || {
-            get_opencode_sessions_with_db(&main, &[fake_process(11, "E:/proj/r")])
+            get_opencode_sessions_with_db(
+                &main,
+                &[fake_process(11, "E:/proj/r")],
+                &[opened(11, sid)],
+            )
         });
         drop(guard);
         assert_eq!(sessions.len(), 1);
@@ -2145,13 +2117,21 @@ mod v2_tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let stale = crate::monitor::test_env::with_home(&stale_home, || {
-            get_opencode_sessions_with_db(&main, &[fake_process(11, "E:/proj/r")])
+            get_opencode_sessions_with_db(
+                &main,
+                &[fake_process(11, "E:/proj/r")],
+                &[opened(11, sid)],
+            )
         });
         // 无锚库（空 HOME）
         let empty_home = tmp.path().join("emptyhome");
         std::fs::create_dir_all(&empty_home).unwrap();
         let none = crate::monitor::test_env::with_home(&empty_home, || {
-            get_opencode_sessions_with_db(&main, &[fake_process(11, "E:/proj/r")])
+            get_opencode_sessions_with_db(
+                &main,
+                &[fake_process(11, "E:/proj/r")],
+                &[opened(11, sid)],
+            )
         });
         drop(guard);
         assert_eq!(stale.len(), 1);
@@ -2180,6 +2160,36 @@ mod matching_tests {
             form: ProcessForm::Cli,
             exe: None,
         }
+    }
+
+    /// 观察辅助：确认窗口 pid 打开着会话 sid（R1 观察驱动匹配的测试输入）
+    fn opened(
+        pid: u32,
+        sid: &str,
+    ) -> (
+        u32,
+        crate::monitor::opencode_observation::ResolvedObservation,
+    ) {
+        (
+            pid,
+            crate::monitor::opencode_observation::ResolvedObservation::Opened {
+                session_id: sid.to_string(),
+                directory: None,
+            },
+        )
+    }
+
+    /// 观察辅助：窗口未知（未装插件 / 读失败 / 过期）
+    fn unknown(
+        pid: u32,
+    ) -> (
+        u32,
+        crate::monitor::opencode_observation::ResolvedObservation,
+    ) {
+        (
+            pid,
+            crate::monitor::opencode_observation::ResolvedObservation::Unknown,
+        )
     }
 
     /// 最小 schema 夹具 DB：仅建解析器 SQL 引用的表/列；message/part 允许为空。
@@ -2245,7 +2255,11 @@ mod matching_tests {
             fake_process(11, "C:\\Users\\x\\F"),
             fake_process(22, "C:\\Users\\x\\G"),
         ];
-        let sessions = get_opencode_sessions_with_db(&db, &procs);
+        let sessions = get_opencode_sessions_with_db(
+            &db,
+            &procs,
+            &[opened(11, "ses_fail"), opened(22, "ses_abort")],
+        );
         assert_eq!(sessions.len(), 2, "两会话各一张卡");
         for s in &sessions {
             match s.id.as_str() {
@@ -2271,8 +2285,9 @@ mod matching_tests {
         }
     }
 
-    /// 2026-09-09 事故回归锁：同目录双开两会话，两进程必须各得一张卡（id 各异）。
-    /// 修复前红：两进程 find() 命中同一条最新行，另一会话被遮蔽
+    /// 2026-09-09 事故回归锁（R1 观察驱动版）：同目录双开两会话，两窗各得**真实打开**
+    /// 的那张卡（pid↔id 绑定逐一对位，不再靠「最新行配第一个进程」的目录猜测）。
+    /// 旧规则红：proc11 会被配给最新行 ses_new，而窗口 11 实际打开的是 ses_old
     #[test]
     fn same_dir_dual_sessions_both_surfaced() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2293,17 +2308,24 @@ mod matching_tests {
             fake_process(11, "C:\\Users\\x\\Desktop\\苏州"),
             fake_process(22, "C:\\Users\\x\\Desktop\\苏州"),
         ];
-        let sessions = get_opencode_sessions_with_db(&db, &procs);
+        // 窗口 11 打开旧会话 ses_old，窗口 22 打开新会话 ses_new（与历史新旧无关）
+        let observations = &[opened(11, "ses_old"), opened(22, "ses_new")];
+        let sessions = get_opencode_sessions_with_db(&db, &procs, observations);
         assert_eq!(sessions.len(), 2, "两个终端两张卡");
-        let ids: HashSet<&str> = sessions.iter().map(|s| s.id.as_str()).collect();
+        let by_pid = |pid: u32| sessions.iter().find(|s| s.pid == pid).unwrap();
         assert_eq!(
-            ids,
-            ["ses_new", "ses_old"].into_iter().collect(),
-            "两会话都出现，不再互相遮蔽"
+            by_pid(11).id,
+            "ses_old",
+            "窗口 11 必须出它真实打开的 ses_old（不是目录最新）"
+        );
+        assert_eq!(
+            by_pid(22).id,
+            "ses_new",
+            "窗口 22 必须出它真实打开的 ses_new"
         );
     }
 
-    /// 回归：不同目录双开各配各的（既有行为不回退）
+    /// 回归：不同目录双开各配各的（观察驱动，既有「各得一张卡」不回退）
     #[test]
     fn distinct_dirs_each_matched() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2319,15 +2341,18 @@ mod matching_tests {
             fake_process(11, "C:\\Users\\x\\A"),
             fake_process(22, "C:\\Users\\x\\B"),
         ];
-        let sessions = get_opencode_sessions_with_db(&db, &procs);
+        let sessions =
+            get_opencode_sessions_with_db(&db, &procs, &[opened(11, "ses_a"), opened(22, "ses_b")]);
         assert_eq!(sessions.len(), 2);
         assert!(sessions.iter().any(|s| s.id == "ses_a"));
         assert!(sessions.iter().any(|s| s.id == "ses_b"));
     }
 
-    /// 回归：单进程 + 同目录多会话 → 取最新（配对顺序语义）
+    /// R1 替换「单进程取同目录最新」旧断言（附件约束 6/8）：未装插件的 TUI（无观察 =
+    /// 未知）**不得**用目录/最新历史补活跃卡——旧规则会捡 ses_new（红）；历史会话
+    /// 仍按 ID 可读（观察确认后出卡），历史读路径不回退
     #[test]
-    fn single_process_gets_newest_same_dir_session() {
+    fn no_observation_never_picks_newest_and_history_stays_readable() {
         let tmp = tempfile::tempdir().unwrap();
         let db = tmp.path().join("opencode.db");
         fixture_db(
@@ -2342,10 +2367,22 @@ mod matching_tests {
                 ),
             ],
         );
+        let proc = fake_process(11, "C:\\Users\\x\\Desktop\\苏州");
+        // 未知观察（未装插件 / 读失败 / 过期）：零活跃卡，不冒充旧会话
         let sessions =
-            get_opencode_sessions_with_db(&db, &[fake_process(11, "C:\\Users\\x\\Desktop\\苏州")]);
-        assert_eq!(sessions.len(), 1);
-        assert_eq!(sessions[0].id, "ses_new");
+            get_opencode_sessions_with_db(&db, std::slice::from_ref(&proc), &[unknown(11)]);
+        assert!(
+            sessions.is_empty(),
+            "未知观察不得用目录猜测补卡（旧规则会捡 ses_new）"
+        );
+        // 同一历史会话按确认的观察仍可读（历史读路径回归）
+        let sessions = get_opencode_sessions_with_db(
+            &db,
+            std::slice::from_ref(&proc),
+            &[opened(11, "ses_old")],
+        );
+        assert_eq!(sessions.len(), 1, "按确认 ID 历史会话仍可读");
+        assert_eq!(sessions[0].id, "ses_old");
     }
 
     // ==== 丁T1 · 待决 question 端到端（DB fixture）====
@@ -2381,7 +2418,11 @@ mod matching_tests {
         .unwrap();
         drop(conn);
 
-        let sessions = get_opencode_sessions_with_db(&db, &[fake_process(11, "C:\\Users\\x\\Q")]);
+        let sessions = get_opencode_sessions_with_db(
+            &db,
+            &[fake_process(11, "C:\\Users\\x\\Q")],
+            &[opened(11, "ses_q")],
+        );
         assert_eq!(sessions.len(), 1);
         assert_eq!(
             sessions[0].status,
@@ -2453,6 +2494,7 @@ mod matching_tests {
                 fake_process(11, "C:\\Users\\x\\D"),
                 fake_process(22, "C:\\Users\\x\\B"),
             ],
+            &[opened(11, "ses_done"), opened(22, "ses_bash")],
         );
         assert_eq!(sessions.len(), 2);
         for s in &sessions {
@@ -2463,6 +2505,247 @@ mod matching_tests {
                 s.id
             );
         }
+    }
+}
+
+/// R1 窗口观察驱动匹配（TDD）：活跃卡只能来自「已核验窗口观察的 sessionID」。
+/// 证据与设计约束见 monitor::opencode_observation 模块文档与 R0/R0b 探测证据；
+/// 本模块锁**解析器消费侧**的看板行为（采集侧测试在 observation 模块内）。
+#[cfg(test)]
+mod window_observation_tests {
+    use super::*;
+    use crate::monitor::opencode_observation::ResolvedObservation;
+    use crate::session::ProcessForm;
+
+    fn fake_process(pid: u32, cwd: &str) -> AgentProcess {
+        AgentProcess {
+            pid,
+            cpu_usage: 0.0,
+            cwd: Some(std::path::PathBuf::from(cwd)),
+            form: ProcessForm::Cli,
+            exe: None,
+        }
+    }
+
+    fn opened(pid: u32, sid: &str) -> (u32, ResolvedObservation) {
+        (
+            pid,
+            ResolvedObservation::Opened {
+                session_id: sid.to_string(),
+                directory: None,
+            },
+        )
+    }
+
+    /// 保留态观察（复审 M2）：读失败超阈值时解析层给出的「最后确认打开态」
+    fn retained(pid: u32, sid: &str) -> (u32, ResolvedObservation) {
+        (
+            pid,
+            ResolvedObservation::Retained {
+                session_id: sid.to_string(),
+                directory: None,
+            },
+        )
+    }
+
+    fn home(pid: u32) -> (u32, ResolvedObservation) {
+        (pid, ResolvedObservation::Home)
+    }
+
+    fn unknown(pid: u32) -> (u32, ResolvedObservation) {
+        (pid, ResolvedObservation::Unknown)
+    }
+
+    /// R1 夹具（任务简报原文）：同目录存 A、B，B 更新更晚**且仍待答**（pending
+    /// question part → 旧规则会把它当「目录最新会话」捡上板，且是红灯卡）。
+    /// A 是更旧的空闲会话（assistant finish 收尾）。
+    fn obs_fixture_db(path: &std::path::Path) {
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE session (id TEXT PRIMARY KEY, project_id TEXT, directory TEXT, title TEXT, time_updated INTEGER);
+             CREATE TABLE project (id TEXT PRIMARY KEY, worktree TEXT, name TEXT);
+             CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, data TEXT);
+             CREATE TABLE part (id TEXT, message_id TEXT, session_id TEXT, data TEXT, time_created INTEGER);",
+        )
+        .unwrap();
+        for (id, title, ts) in [("ses_a", "空闲会话A", 1000), ("ses_b", "待答会话B", 2000)]
+        {
+            conn.execute(
+                "INSERT INTO session (id, project_id, directory, title, time_updated) VALUES (?1,'p1',?2,?3,?4)",
+                rusqlite::params![id, "C:/Users/x/Desktop/苏州", title, ts],
+            )
+            .unwrap();
+        }
+        // A：assistant 文本回复收尾（无 step 部件 → Fallback → 完成即绿 Idle）
+        conn.execute(
+            "INSERT INTO message (id, session_id, time_created, data) VALUES ('ma1','ses_a',1000,'{\"role\":\"assistant\"}')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO part (id, message_id, session_id, data, time_created) VALUES ('pa1','ma1','ses_a','{\"type\":\"text\",\"text\":\"已回复\"}',1001)",
+            [],
+        )
+        .unwrap();
+        // B：pending question part（待答红灯证据，形态取 2026-09-21 实测样本）
+        conn.execute(
+            "INSERT INTO message (id, session_id, time_created, data) VALUES ('mb1','ses_b',2000,'{\"role\":\"assistant\"}')",
+            [],
+        )
+        .unwrap();
+        let question = serde_json::json!({
+            "type": "tool",
+            "callID": "call_r1_pending",
+            "tool": "question",
+            "state": {
+                "status": "running",
+                "input": {"questions": [{"question": "Which folder?", "options": [{"label": "dist"}, {"label": "out"}]}]}
+            }
+        });
+        conn.execute(
+            "INSERT INTO part (id, message_id, session_id, data, time_created) VALUES ('pb1','mb1','ses_b',?1,2001)",
+            rusqlite::params![question.to_string()],
+        )
+        .unwrap();
+        drop(conn);
+    }
+
+    const DIR_WIN: &str = "C:\\Users\\x\\Desktop\\苏州";
+
+    /// R1 主判据一（任务简报）：首页/未知观察 → 零活跃卡——空窗口**不得**捡同目录的
+    /// 旧会话冒充当前。旧规则红：cwd 匹配会给 11 配最新行 ses_b（待答红卡）、22 配 ses_a
+    #[test]
+    fn empty_window_does_not_claim_old_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("opencode.db");
+        obs_fixture_db(&db);
+        let procs = vec![fake_process(11, DIR_WIN), fake_process(22, DIR_WIN)];
+        // 窗口 11 停在首页（权威「无」）；窗口 22 读失败/未装插件（未知 ≠ 首页）
+        let observations = &[home(11), unknown(22)];
+        let sessions = get_opencode_sessions_with_db(&db, &procs, observations);
+        assert!(
+            sessions.is_empty(),
+            "首页/未知观察必须零活跃卡，实际出了 {} 张：{:?}",
+            sessions.len(),
+            sessions.iter().map(|s| (&s.id, s.pid)).collect::<Vec<_>>()
+        );
+    }
+
+    /// R1 主判据二（任务简报）：打开空闲 A 时**只出 A 卡**——已打开会话即使空闲也出卡，
+    /// 且更新更晚、仍待答的历史 B 不得反客为主（旧规则按「同目录最新」会捡 B）
+    #[test]
+    fn opened_idle_session_wins_over_newer_history() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("opencode.db");
+        obs_fixture_db(&db);
+        let sessions = get_opencode_sessions_with_db(
+            &db,
+            &[fake_process(11, DIR_WIN)],
+            &[opened(11, "ses_a")],
+        );
+        assert_eq!(sessions.len(), 1, "只出打开的那张卡");
+        assert_eq!(
+            sessions[0].id, "ses_a",
+            "出的是被打开的空闲 A，不是最新历史 B"
+        );
+        assert_eq!(sessions[0].pid, 11);
+        assert_eq!(
+            sessions[0].status,
+            SessionStatus::Idle,
+            "空闲的已打开会话出绿卡（空闲也出卡）"
+        );
+    }
+
+    /// 切换 / 回首页 / 退出的确定性快照序列：同库同进程，三拍各按真实打开情况更新
+    #[test]
+    fn switch_home_exit_sequence_updates_cards() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("opencode.db");
+        obs_fixture_db(&db);
+        let proc = fake_process(11, DIR_WIN);
+
+        // 拍 1：打开 A → 出 A
+        let s1 =
+            get_opencode_sessions_with_db(&db, std::slice::from_ref(&proc), &[opened(11, "ses_a")]);
+        assert_eq!(s1.len(), 1);
+        assert_eq!(s1[0].id, "ses_a");
+
+        // 拍 2：切到 B → 出 B（A 卡消失，不是两张并存）
+        let s2 =
+            get_opencode_sessions_with_db(&db, std::slice::from_ref(&proc), &[opened(11, "ses_b")]);
+        assert_eq!(s2.len(), 1, "切换后只出当前会话");
+        assert_eq!(s2[0].id, "ses_b");
+        assert_eq!(
+            s2[0].status,
+            SessionStatus::Waiting,
+            "待答的已打开会话复用既有状态解析（红灯）"
+        );
+
+        // 拍 3：关掉最后一个会话标签回首页 → 无卡
+        let s3 = get_opencode_sessions_with_db(&db, std::slice::from_ref(&proc), &[home(11)]);
+        assert!(s3.is_empty(), "首页不冒充旧会话");
+
+        // 拍 4：退出（进程消失）→ 无卡（L1 零进程早退）
+        let s4 = get_opencode_sessions_with_db(&db, &[], &[opened(11, "ses_a")]);
+        assert!(s4.is_empty(), "退出的窗口不出卡");
+    }
+
+    /// 迟到观察不复活旧卡：观察按 pid 对位，pid 不在进程列表（窗口已退）时观察作废；
+    /// 同 pid 的新窗口在新鲜观察到达前是未知 → 无卡（不沿用上一窗的会话）
+    #[test]
+    fn late_observation_does_not_resurrect_card() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("opencode.db");
+        obs_fixture_db(&db);
+        // pid 11 已退出（进程列表只有 22）：给 11 的观察不得为 22 产卡
+        let procs = vec![fake_process(22, DIR_WIN)];
+        let observations = &[opened(11, "ses_a"), unknown(22)];
+        let sessions = get_opencode_sessions_with_db(&db, &procs, observations);
+        assert!(
+            sessions.is_empty(),
+            "迟到/错位观察不得复活旧窗口的卡（pid 对位是唯一依据）"
+        );
+    }
+
+    /// 超过新鲜度的最后确认记录不能作为活跃窗口观察输出。
+    #[test]
+    fn stale_retained_observation_does_not_produce_active_card() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("opencode.db");
+        obs_fixture_db(&db);
+        let proc = fake_process(11, DIR_WIN);
+
+        let fresh =
+            get_opencode_sessions_with_db(&db, std::slice::from_ref(&proc), &[opened(11, "ses_a")]);
+        assert_eq!(fresh.len(), 1, "前置：新鲜打开观察出卡");
+        assert_eq!(fresh[0].id, "ses_a");
+
+        let stale = get_opencode_sessions_with_db(
+            &db,
+            std::slice::from_ref(&proc),
+            &[retained(11, "ses_a")],
+        );
+        assert!(stale.is_empty(), "过期的最后确认记录不可冒充活跃卡");
+    }
+
+    /// 重新获得新鲜观察后，同一会话可以再次上板。
+    #[test]
+    fn fresh_observation_after_retained_restores_active_card() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("opencode.db");
+        obs_fixture_db(&db);
+        let proc = fake_process(11, DIR_WIN);
+
+        let _ = get_opencode_sessions_with_db(
+            &db,
+            std::slice::from_ref(&proc),
+            &[retained(11, "ses_a")],
+        );
+        let restored =
+            get_opencode_sessions_with_db(&db, std::slice::from_ref(&proc), &[opened(11, "ses_a")]);
+        assert_eq!(restored.len(), 1, "恢复新鲜观察后重新出卡");
+        assert_eq!(restored[0].id, "ses_a");
+        assert_eq!(restored[0].pid, 11);
     }
 }
 /// 复评 M-2：**实机验证占位**（`#[ignore]`——常规门禁只编译不跑）。

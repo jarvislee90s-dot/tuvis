@@ -5,6 +5,8 @@ pub mod codex_desktop_ipc;
 pub(crate) mod codex_question_skip;
 pub mod manifest;
 pub mod mcp;
+// OpenCode 原生交互（macOS 首批）：契约/发现/传输/投影/动作/答题校验
+pub mod opencode_native;
 pub mod pet;
 pub mod plugin;
 pub mod preset;

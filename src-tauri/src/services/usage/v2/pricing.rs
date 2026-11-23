@@ -1815,7 +1815,7 @@ mod tests {
 
     fn mem_db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
-        crate::database::schema::init(&conn);
+        crate::database::schema::init(&conn).unwrap();
         conn
     }
 
@@ -1823,7 +1823,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("pricing.db");
         let conn = Connection::open(&path).unwrap();
-        crate::database::schema::init(&conn);
+        crate::database::schema::init(&conn).unwrap();
         (dir, path)
     }
 

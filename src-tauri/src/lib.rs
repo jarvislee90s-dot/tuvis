@@ -1,4 +1,5 @@
 pub mod adapter;
+pub mod candidate_guard;
 pub mod commands;
 pub mod database;
 pub mod errcode;
@@ -86,6 +87,19 @@ fn refresh_tray(
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // 候选隔离启动守卫（2026-11-13 裁决）：先取 Tauri Context 识别 identifier，
+    // 候选构建在任何日志/数据库/资源/Hook/桥接/远程恢复**之前**核验隔离启动条件；
+    // 不满足 → 「请通过候选启动脚本打开」并立即退出。真实构建 identifier 不同，
+    // 本分支恒跳过（行为零变化）。
+    let context = tauri::generate_context!();
+    if context.config().identifier == candidate_guard::CANDIDATE_IDENTIFIER {
+        let env = candidate_guard::CandidateStartupEnv::from_process_env();
+        if let Err(error) =
+            candidate_guard::verify_candidate_startup(&env, std::env::current_exe().ok())
+        {
+            candidate_guard::exit_as_candidate(&error);
+        }
+    }
     // 日志**写文件**而非 stderr（2026-10-03 终端污染事故）：debug exe 以分离方式
     // 启动时没有自己的控制台，AttachConsole 读屏/注入期间其它线程的 stderr 写入
     // 会落进**被附加的外部终端**（活体实证：claude TUI 表单行被 兔维斯 WARN 日志
@@ -199,6 +213,10 @@ pub fn run() {
             // 会话扫描总线必须早于远控 listener 恢复：首个远程读取即使撞上首扫，
             // 也会等待成功快照，而不会把初始化中的 degraded 空结果当成真实空列表。
             crate::adapter::scan_bus::start(app.handle().clone());
+            // R1（OpenCode 看板窗口观察）：异步采集 TUI 只读插件的路由读数入快照缓存
+            // （monitor::opencode_observation），find_sessions 同步消费——失败静默降级
+            // 为无观察，不影响扫描主链路
+            crate::monitor::opencode_observation::spawn_runtime();
             // 尽早启动事件监控；首拍会额外做一次 Event 对账，覆盖冷扫读取事件之后、
             // wakeup 基线落位之前的写入，且不被远控恢复等后续启动工作延后。
             crate::adapter::wakeup::spawn_runtime();
@@ -356,6 +374,16 @@ pub fn run() {
         commands::plugin::toggle_plugin_for_tool,
         commands::settings::get_setting,
         commands::settings::set_setting,
+        commands::settings::opencode_interaction_policy_get,
+        commands::settings::opencode_interaction_policy_status,
+        commands::settings::opencode_interaction_policy_set,
+        commands::settings::opencode_tui_observer_status,
+        commands::settings::opencode_tui_observer_install,
+        commands::settings::opencode_tui_observer_uninstall,
+        commands::settings::opencode_bridge_status,
+        commands::settings::opencode_bridge_install,
+        commands::settings::opencode_bridge_uninstall,
+        commands::settings::opencode_bridge_reload,
         commands::settings::set_theme,
         commands::settings::detect_tools,
         commands::settings::detect_subagents,
@@ -498,7 +526,7 @@ pub fn run() {
     // §C1 tailscale::stop_all；kill_on_drop 兜不住进程级退出）与电源锁（caffeinate
     // kill / 执行状态清除 + 磁盘代设还原），不留孤儿进程、不失电源锁
     let app = builder
-        .build(tauri::generate_context!())
+        .build(context)
         .expect("error while building tauri application");
     app.run(|_app, event| {
         if let tauri::RunEvent::Exit = event {
@@ -539,6 +567,8 @@ pub(crate) fn exit_cleanup() {
 }
 
 #[cfg(test)]
+#[cfg(test)]
+mod candidate_guard_tests;
 mod scan_bus_start_order_tests {
     #[test]
     fn scan_bus_starts_after_app_handle_and_before_remote_listener_restore() {

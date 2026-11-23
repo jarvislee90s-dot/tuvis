@@ -1645,7 +1645,7 @@ mod tests {
 
     fn shared_conn() -> SharedConn {
         let conn = Connection::open_in_memory().expect("打开内存库");
-        schema::init(&conn);
+        let _ = schema::init(&conn);
         migration::migrate(&conn).expect("迁移");
         Arc::new(Mutex::new(conn))
     }
@@ -1784,6 +1784,11 @@ mod tests {
                 rate_bucket_channels_source: Box::new(Vec::new),
                 home_source: Box::new(|| None),
                 injector: injector.clone(),
+                opencode_native: std::sync::Arc::new(
+                    crate::services::opencode_native::NativeHub::new(
+                        crate::remote::pairing::DeviceStore::global(),
+                    ),
+                ),
                 resume_spawner: Arc::new(|_: &crate::inject::resume::SpawnSpec| Ok(())),
                 create_hub: Arc::new(CreateTaskHub::stub()),
                 archive_source: Box::new(Vec::new),

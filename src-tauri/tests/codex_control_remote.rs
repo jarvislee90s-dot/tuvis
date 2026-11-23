@@ -30,7 +30,7 @@ type SharedConn = Arc<Mutex<rusqlite::Connection>>;
 /// 但保留 Arc 以便模拟「进程重启仍在同一 DB 上」）。
 fn shared_conn() -> SharedConn {
     let conn = rusqlite::Connection::open_in_memory().expect("open memory db");
-    multi_agents_manager_lib::database::schema::init(&conn);
+    multi_agents_manager_lib::database::schema::init(&conn).unwrap();
     multi_agents_manager_lib::database::migration::migrate(&conn).expect("migrate");
     Arc::new(Mutex::new(conn))
 }

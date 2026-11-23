@@ -2789,7 +2789,7 @@ mod tests {
 
     fn mem() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
-        crate::database::schema::init(&conn);
+        crate::database::schema::init(&conn).unwrap();
         crate::database::migration::migrate(&conn).unwrap();
         conn
     }
@@ -3171,7 +3171,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("checked-mint.db");
         let conn = Connection::open(&path).unwrap();
-        crate::database::schema::init(&conn);
+        let _ = crate::database::schema::init(&conn);
         crate::database::migration::migrate(&conn).unwrap();
         insert(&conn, "mint-expired-q", Some("selected"), 1000);
         let audit_before: i64 = conn
@@ -3278,7 +3278,7 @@ mod tests {
             .unwrap();
         assert_eq!(journal, "delete");
         writer.busy_timeout(std::time::Duration::ZERO).unwrap();
-        crate::database::schema::init(&writer);
+        let _ = crate::database::schema::init(&writer);
         crate::database::migration::migrate(&writer).unwrap();
         resolution_source(&writer);
         let original = get_row(&writer, "source-a").unwrap().unwrap();
@@ -3832,7 +3832,7 @@ mod tests {
         let path = dir.path().join("resolution.sqlite");
         {
             let c = Connection::open(&path).unwrap();
-            crate::database::schema::init(&c);
+            let _ = crate::database::schema::init(&c);
             crate::database::migration::migrate(&c).unwrap();
             resolution_source(&c);
             resolve_verified(&c).unwrap();
@@ -3893,7 +3893,7 @@ mod tests {
         let path = dir.path().join("recovery.sqlite");
         {
             let c = Connection::open(&path).unwrap();
-            crate::database::schema::init(&c);
+            let _ = crate::database::schema::init(&c);
             crate::database::migration::migrate(&c).unwrap();
             insert(&c, "source-a", Some("source"), 1000);
             assert!(reserve_conn(&c, "source-a", ControlRoute::DesktopIpc, 1100).unwrap());

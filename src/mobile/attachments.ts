@@ -19,6 +19,8 @@ export type PendingAttachment = {
   total?: number | null;
   /** 瞬时速率估算（字节/秒；仅 MessageComposer 使用，ZCode 面板不带）。 */
   rateBps?: number | null;
+  /** 上传成功但本地排除规则未确认追加（服务端回执给的提示文本；缺省 = 无告警）。 */
+  excludeWarning?: string;
 };
 
 /** 图片判定：与 MessageComposer/服务端 read_zcode_attachment_refs 同一口径。 */

@@ -240,7 +240,7 @@ type SharedConn = Arc<StdMutex<rusqlite::Connection>>;
 
 fn shared_conn() -> SharedConn {
     let conn = rusqlite::Connection::open_in_memory().expect("open memory db");
-    multi_agents_manager_lib::database::schema::init(&conn);
+    let _ = multi_agents_manager_lib::database::schema::init(&conn);
     multi_agents_manager_lib::database::migration::migrate(&conn).expect("migrate");
     Arc::new(StdMutex::new(conn))
 }
@@ -367,6 +367,11 @@ fn fixture() -> Fixture {
         rate_bucket_channels_source: Box::new(Vec::new),
         home_source: Box::new(|| None),
         injector: Arc::new(multi_agents_manager_lib::inject::engine::RealInjector),
+        opencode_native: std::sync::Arc::new(
+            multi_agents_manager_lib::services::opencode_native::NativeHub::new(
+                multi_agents_manager_lib::remote::pairing::DeviceStore::global(),
+            ),
+        ),
         resume_spawner: Arc::new(|_: &multi_agents_manager_lib::inject::resume::SpawnSpec| Ok(())),
         create_hub: Arc::new(CreateTaskHub::stub()),
         archive_source: Box::new(Vec::new),

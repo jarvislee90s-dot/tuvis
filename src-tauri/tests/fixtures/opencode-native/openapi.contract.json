@@ -1,0 +1,921 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "opencode HttpApi",
+    "version": "2.0.22",
+    "description": "Trimmed OpenAPI for the Tuvis native batch. Only the paths and schemas the native contract consumes are kept; prose is abbreviated, structure is unchanged."
+  },
+  "x-evidence": {
+    "run_id": "20261029-233614",
+    "paths": "docs/engineering/evidence/opencode-native/20261029-openapi-paths.json",
+    "schemas": "docs/engineering/evidence/opencode-native/20261029-schema-fragments.json",
+    "requests": [
+      "docs/engineering/evidence/opencode-native/followup/fixtures/send.request.json",
+      "docs/engineering/evidence/opencode-native/followup/fixtures/form.reply.request.json",
+      "docs/engineering/evidence/opencode-native/followup/fixtures/permission.reply.json"
+    ]
+  },
+  "paths": {
+    "/api/session/{sessionID}/prompt": {
+      "post": {
+        "operationId": "session.prompt",
+        "description": "Admit a user message. The caller may supply its own msg_ id.",
+        "parameters": [
+          {
+            "name": "sessionID",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "id": {
+                    "type": "string",
+                    "pattern": "^msg_"
+                  },
+                  "text": {
+                    "type": "string"
+                  },
+                  "delivery": {
+                    "type": "string",
+                    "enum": [
+                      "queue",
+                      "steer"
+                    ]
+                  },
+                  "files": {
+                    "type": "array",
+                    "items": {
+                      "type": "object"
+                    }
+                  }
+                },
+                "required": [
+                  "text"
+                ],
+                "additionalProperties": false
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "admitted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Session.Inbox.User"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "invalid request"
+          }
+        }
+      }
+    },
+    "/api/session/{sessionID}/interrupt": {
+      "post": {
+        "operationId": "session.interrupt",
+        "summary": "Interrupt session execution",
+        "responses": {
+          "200": {
+            "description": "SessionInterruptResponse",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "interrupted": {
+                      "type": "boolean"
+                    }
+                  },
+                  "required": [
+                    "interrupted"
+                  ]
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/session/{sessionID}/message": {
+      "get": {
+        "operationId": "session.message",
+        "description": "Paged message history with cursor.",
+        "parameters": [
+          {
+            "name": "sessionID",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "messages",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "data": {
+                      "type": "array",
+                      "items": {
+                        "type": "object"
+                      }
+                    },
+                    "cursor": {
+                      "type": "object"
+                    }
+                  },
+                  "required": [
+                    "data"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/session/{sessionID}/inbox": {
+      "get": {
+        "operationId": "session.inbox",
+        "description": "Native inbox (queue/steer items not yet consumed).",
+        "parameters": [
+          {
+            "name": "sessionID",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "inbox items",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "data": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/Session.Inbox.User"
+                      }
+                    }
+                  },
+                  "required": [
+                    "data"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/session/{sessionID}/inbox/{inboxID}": {
+      "delete": {
+        "operationId": "session.inbox.delete",
+        "description": "204 for both unknown and already delivered ids: never evidence of retraction by itself.",
+        "parameters": [
+          {
+            "name": "sessionID",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "inboxID",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "accepted"
+          }
+        }
+      },
+      "patch": {
+        "operationId": "session.inbox.update",
+        "description": "Update an inbox item's delivery (queue <-> steer).",
+        "parameters": [
+          {
+            "name": "sessionID",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "inboxID",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "delivery": {
+                    "type": "string",
+                    "enum": [
+                      "queue",
+                      "steer"
+                    ]
+                  }
+                },
+                "required": [
+                  "delivery"
+                ],
+                "additionalProperties": false
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "updated"
+          }
+        }
+      }
+    },
+    "/api/session/{sessionID}/form": {
+      "get": {
+        "operationId": "session.form.list",
+        "description": "Session-scoped pending forms.",
+        "parameters": [
+          {
+            "name": "sessionID",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "forms",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "data": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/Form.Detail"
+                      }
+                    }
+                  },
+                  "required": [
+                    "data"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/session/{sessionID}/form/{formID}": {
+      "get": {
+        "operationId": "session.form.get",
+        "parameters": [
+          {
+            "name": "sessionID",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "formID",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "form detail",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/Form.Detail"
+                    }
+                  },
+                  "required": [
+                    "data"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/session/{sessionID}/form/{formID}/reply": {
+      "post": {
+        "operationId": "session.form.reply",
+        "description": "Answer a pending form. Missing required / inactive / unknown keys are 400; settled forms are 409.",
+        "parameters": [
+          {
+            "name": "sessionID",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "formID",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Form.Reply"
+              }
+            }
+          }
+        },
+        "responses": {
+          "204": {
+            "description": "answered"
+          },
+          "400": {
+            "description": "invalid answer"
+          },
+          "409": {
+            "description": "already settled"
+          }
+        }
+      }
+    },
+    "/api/session/{sessionID}/permission": {
+      "get": {
+        "operationId": "session.permission.list",
+        "description": "Session-scoped pending permission requests.",
+        "parameters": [
+          {
+            "name": "sessionID",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "permission requests",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "data": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/Permission.Request"
+                      }
+                    }
+                  },
+                  "required": [
+                    "data"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/session/{sessionID}/permission/{requestID}/reply": {
+      "post": {
+        "operationId": "session.permission.reply",
+        "description": "Decide a pending permission request.",
+        "parameters": [
+          {
+            "name": "sessionID",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "requestID",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "decision": {
+                    "$ref": "#/components/schemas/Permission.Reply"
+                  }
+                },
+                "required": [
+                  "decision"
+                ],
+                "additionalProperties": false
+              }
+            }
+          }
+        },
+        "responses": {
+          "204": {
+            "description": "decided"
+          },
+          "400": {
+            "description": "invalid decision"
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "Form.Detail": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^frm_"
+          },
+          "sessionID": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          },
+          "metadata": {
+            "type": "object"
+          },
+          "fields": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Form.Field"
+            }
+          },
+          "state": {
+            "$ref": "#/components/schemas/Form.State"
+          }
+        },
+        "required": [
+          "id",
+          "sessionID",
+          "title",
+          "fields",
+          "state"
+        ],
+        "additionalProperties": false
+      },
+      "Form.Field": {
+        "anyOf": [
+          {
+            "$ref": "#/components/schemas/Form.StringField"
+          },
+          {
+            "$ref": "#/components/schemas/Form.MultiselectField"
+          }
+        ]
+      },
+      "Form.StringField": {
+        "type": "object",
+        "properties": {
+          "key": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "required": {
+            "type": "boolean"
+          },
+          "hidden": {
+            "type": "boolean"
+          },
+          "when": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Form.When"
+            }
+          },
+          "type": {
+            "type": "string",
+            "enum": [
+              "string"
+            ]
+          },
+          "format": {
+            "type": "string",
+            "enum": [
+              "email",
+              "uri",
+              "date",
+              "date-time"
+            ]
+          },
+          "minLength": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "maxLength": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "pattern": {
+            "type": "string"
+          },
+          "placeholder": {
+            "type": "string"
+          },
+          "default": {
+            "type": "string"
+          },
+          "options": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Form.Option"
+            }
+          },
+          "custom": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "key",
+          "type"
+        ],
+        "additionalProperties": false
+      },
+      "Form.MultiselectField": {
+        "type": "object",
+        "properties": {
+          "key": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "required": {
+            "type": "boolean"
+          },
+          "hidden": {
+            "type": "boolean"
+          },
+          "when": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Form.When"
+            }
+          },
+          "type": {
+            "type": "string",
+            "enum": [
+              "multiselect"
+            ]
+          },
+          "options": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Form.Option"
+            }
+          },
+          "minItems": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "maxItems": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "custom": {
+            "type": "boolean"
+          },
+          "default": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "required": [
+          "key",
+          "type",
+          "options"
+        ],
+        "additionalProperties": false
+      },
+      "Form.Option": {
+        "type": "object",
+        "properties": {
+          "value": {
+            "type": "string"
+          },
+          "label": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "value"
+        ],
+        "additionalProperties": false
+      },
+      "Form.When": {
+        "type": "object",
+        "properties": {
+          "key": {
+            "type": "string"
+          },
+          "op": {
+            "type": "string",
+            "enum": [
+              "eq",
+              "neq"
+            ]
+          },
+          "value": {
+            "type": [
+              "string",
+              "number",
+              "boolean"
+            ]
+          }
+        },
+        "required": [
+          "key",
+          "op",
+          "value"
+        ],
+        "additionalProperties": false
+      },
+      "Form.State": {
+        "anyOf": [
+          {
+            "type": "object",
+            "properties": {
+              "status": {
+                "type": "string",
+                "enum": [
+                  "pending"
+                ]
+              }
+            },
+            "required": [
+              "status"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "status": {
+                "type": "string",
+                "enum": [
+                  "answered"
+                ]
+              },
+              "answer": {
+                "$ref": "#/components/schemas/Form.Answer"
+              }
+            },
+            "required": [
+              "status",
+              "answer"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "status": {
+                "type": "string",
+                "enum": [
+                  "cancelled"
+                ]
+              },
+              "message": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "status"
+            ],
+            "additionalProperties": false
+          }
+        ]
+      },
+      "Form.Reply": {
+        "type": "object",
+        "properties": {
+          "answer": {
+            "$ref": "#/components/schemas/Form.Answer"
+          }
+        },
+        "required": [
+          "answer"
+        ],
+        "additionalProperties": false
+      },
+      "Form.Answer": {
+        "type": "object",
+        "additionalProperties": {
+          "$ref": "#/components/schemas/Form.Value"
+        }
+      },
+      "Form.Value": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        ]
+      },
+      "Permission.Request": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^per"
+          },
+          "sessionID": {
+            "type": "string",
+            "pattern": "^ses"
+          },
+          "action": {
+            "type": "string"
+          },
+          "resources": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "save": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "metadata": {
+            "type": "object"
+          },
+          "message": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "sessionID",
+          "action",
+          "resources"
+        ],
+        "additionalProperties": false
+      },
+      "Permission.Reply": {
+        "type": "string",
+        "enum": [
+          "once",
+          "always",
+          "reject"
+        ]
+      },
+      "Session.Inbox.Delivery": {
+        "type": "string",
+        "enum": [
+          "steer",
+          "queue"
+        ]
+      },
+      "Session.Inbox.User": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^msg_"
+          },
+          "sessionID": {
+            "type": "string",
+            "pattern": "^ses"
+          },
+          "time": {
+            "type": "object",
+            "properties": {
+              "created": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "created"
+            ],
+            "additionalProperties": false
+          },
+          "type": {
+            "type": "string",
+            "enum": [
+              "user"
+            ]
+          },
+          "payload": {
+            "type": "object",
+            "properties": {
+              "text": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "text"
+            ],
+            "additionalProperties": false
+          },
+          "delivery": {
+            "$ref": "#/components/schemas/Session.Inbox.Delivery"
+          }
+        },
+        "required": [
+          "id",
+          "sessionID",
+          "time",
+          "type",
+          "payload",
+          "delivery"
+        ],
+        "additionalProperties": false
+      }
+    }
+  }
+}

@@ -219,7 +219,7 @@ fn source_snapshot_question(source: &FrozenSource) -> QuestionSnapshot {
 /// （与 coordinator_tests::triggered_store 同脉，旗由本文件测试自管。）
 fn blocked_store() -> (DeviceStore, Arc<Mutex<Connection>>) {
     let conn = Connection::open_in_memory().expect("打开内存库失败");
-    schema::init(&conn);
+    let _ = schema::init(&conn);
     migration::migrate(&conn).expect("内存库建表失败");
     conn.execute(
         "CREATE TABLE qs_finish_block (on_flag INTEGER NOT NULL)",
@@ -442,7 +442,7 @@ async fn t3_tail_window_truncation_keeps_current_descriptor_from_complete_source
 async fn t4_refused_source_drops_current_only_and_history_stays_readable_without_db_access() {
     // 自建内存连接（Owned），测试可持锁证明 overlay 绝不 DeviceStore.with。
     let conn = Connection::open_in_memory().expect("打开内存库失败");
-    schema::init(&conn);
+    let _ = schema::init(&conn);
     migration::migrate(&conn).expect("内存库建表失败");
     let conn_arc = Arc::new(Mutex::new(conn));
     let store = DeviceStore::Owned(Arc::clone(&conn_arc));

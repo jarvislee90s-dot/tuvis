@@ -682,7 +682,7 @@ mod tests {
         let path = dir.path().join("ledger.db");
         let open = || {
             let c = Connection::open(&path).unwrap();
-            schema::init(&c);
+            let _ = schema::init(&c);
             crate::database::migration::migrate(&c).unwrap();
             DeviceStore::Owned(std::sync::Arc::new(std::sync::Mutex::new(c)))
         };
@@ -1501,10 +1501,10 @@ mod tests {
             VALUES (1, 'd', 'iPhone', 'claude', 's', 'tmux', 'send', 'sum', 'ok');",
         )
         .unwrap();
-        schema::init(&conn);
-        schema::init(&conn); // 幂等：重复初始化不报错
+        let _ = schema::init(&conn);
+        let _ = schema::init(&conn); // 幂等：重复初始化不报错
         crate::database::migration::migrate(&conn).unwrap();
-        crate::database::schema::init(&conn);
+        let _ = crate::database::schema::init(&conn);
 
         let legacy: i64 = conn
             .query_row("SELECT COUNT(*) FROM write_audit", [], |r| r.get(0))

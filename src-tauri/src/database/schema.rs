@@ -1,7 +1,10 @@
 use rusqlite::Connection;
 
 /// 初始化基础数据库 schema；部分增量表由独立迁移事务创建。
-pub fn init(conn: &Connection) {
+///
+/// M4：撞锁（`DatabaseBusy`）不再内部 panic——让调用方的有界重试内核决定恢复或诚实失败。
+/// 全部语句 `IF NOT EXISTS` 幂等，整批重试安全。
+pub fn init(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute_batch(
         r#"
         CREATE TABLE IF NOT EXISTS session_status_cache (
@@ -1060,7 +1063,150 @@ pub fn init(conn: &Connection) {
             ON codex_question_skip_actions(thread_id, group_turn_id, group_item_id, group_generation, seq);
         CREATE INDEX IF NOT EXISTS idx_codex_question_skip_actions_open
             ON codex_question_skip_actions(state) WHERE state IN ('prepared','claimed');
+        -- ===== OpenCode 原生交互：持久动作账本（计划任务 5）=====
+        -- 每个远程原生写动作（发给 OpenCode 默认后台 service 的 send/answer/decide/retract）
+        -- 一行，action_id 主键 = 最多一次派发（同 id 同指纹 = 同一次派发，绝不第二次写）。
+        -- state 状态机见 database/dao/opencode_actions.rs 头注释：
+        --   not_sent → dispatching → acknowledged / confirmed / unconfirmed / not_accepted / settled。
+        -- 可 claim 的是 `not_sent` 或 `queued` 且 reason_code 为空的行；queued 还须通过暂停/FIFO；`finish(not_sent, …,
+        -- reason)` 落下的是墓碑（reason_code 非空），碑文一旦写完就不可再派发、也不再算未决。
+        -- claim 在同事务内清除 outbox 可重放载荷，必须在真正网络写之前提交：此后无论
+        -- 崩溃、超时还是重启，本行都不会再派发一次。
+        -- 只存**指纹与结果元数据**：payload_sha256 由客户端原始意图算出；不存消息正文、表单答案、
+        -- 密码或认证头。runtime_*/directory 是目标代际与已归一目录（同端口换 PID 即新代际）。
+        -- occupancy_key 非 NULL 表示该动作绑定一个未决请求占用（见 opencode_native_claims）。
+        -- 已确认待发意图单独保存；不向动作账本写正文，也不迁移旧 inject_queue。
+        CREATE TABLE IF NOT EXISTS opencode_outbox_sessions (
+            session_id TEXT PRIMARY KEY,
+            revision INTEGER NOT NULL DEFAULT 0,
+            paused INTEGER NOT NULL DEFAULT 0
+        );
+        -- 目标状态按会话与已归一目录隔离；旧表保留用于兼容和迁移。
+        CREATE TABLE IF NOT EXISTS opencode_outbox_targets (
+            session_id TEXT NOT NULL,
+            directory TEXT NOT NULL,
+            revision INTEGER NOT NULL DEFAULT 0 CHECK (revision >= 0),
+            paused INTEGER NOT NULL DEFAULT 0 CHECK (paused IN (0, 1)),
+            PRIMARY KEY (session_id, directory)
+        );
+        -- 正文仅在 queued 期间存在；claim 与撤回同事务清除。
+        CREATE TABLE IF NOT EXISTS opencode_outbox (
+            seq INTEGER PRIMARY KEY AUTOINCREMENT,
+            action_id TEXT NOT NULL UNIQUE,
+            session_id TEXT NOT NULL,
+            command_json TEXT,
+            text_summary TEXT NOT NULL,
+            attachment_count INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_opencode_outbox_session
+            ON opencode_outbox(session_id, seq);
+        CREATE TABLE IF NOT EXISTS opencode_native_reselections (
+            device_id TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            request_id TEXT NOT NULL,
+            state TEXT NOT NULL,
+            receipt TEXT,
+            PRIMARY KEY (device_id, session_id, request_id)
+        );
+        -- 原生新建请求在写上游前持久登记，避免回执丢失后重复创建。
+        CREATE TABLE IF NOT EXISTS opencode_native_creates (
+            device_id TEXT NOT NULL,
+            request_id TEXT NOT NULL,
+            session_id TEXT,
+            record_json TEXT NOT NULL,
+            PRIMARY KEY (device_id, request_id)
+        );
+        CREATE TABLE IF NOT EXISTS opencode_native_directory_intents (
+            device_id TEXT NOT NULL,
+            request_id TEXT NOT NULL,
+            intent_sha256 BLOB NOT NULL,
+            PRIMARY KEY (device_id, request_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_opencode_native_creates_session
+            ON opencode_native_creates(session_id);
+        CREATE INDEX IF NOT EXISTS idx_opencode_native_creates_first_action
+            ON opencode_native_creates(device_id, json_extract(record_json, '$.first_action_id'));
+        -- 前置确定拒绝的 ID 必须跨重启保留，防止同 ID 稍后重新取得写出权。
+        -- 只存身份与意图摘要，不存正文、答案或凭据。
+        CREATE TABLE IF NOT EXISTS opencode_native_rejections (
+            action_id TEXT PRIMARY KEY,
+            device_id TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            directory TEXT NOT NULL,
+            payload_sha256 TEXT NOT NULL,
+            reason_code TEXT NOT NULL,
+            created_at INTEGER NOT NULL
+        );
+        -- H5 分段计时账本（每笔动作链尝试一行；同 action 重试 INSERT OR REPLACE 覆盖为
+        -- 最后一次尝试）。五段 = 排队（含单飞等待）/归属核对/数据库等待/原生派发/回读；
+        -- total_ms = 服务端动作链接收 → 正式回执。不存正文/答案/凭据，只存耗时与
+        -- 「派发前预算拒绝」标记（测量账本，绝不参与任何判定）。
+        CREATE TABLE IF NOT EXISTS opencode_native_action_timings (
+            action_id      TEXT PRIMARY KEY,
+            session_id     TEXT NOT NULL,
+            operation      TEXT NOT NULL,
+            queue_ms       INTEGER NOT NULL,
+            ownership_ms   INTEGER NOT NULL,
+            database_ms    INTEGER NOT NULL,
+            dispatch_ms    INTEGER NOT NULL,
+            readback_ms    INTEGER NOT NULL,
+            total_ms       INTEGER NOT NULL,
+            budget_refused INTEGER NOT NULL DEFAULT 0,
+            created_at     INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS opencode_native_actions (
+            action_id             TEXT PRIMARY KEY,
+            device_id             TEXT NOT NULL,
+            session_id            TEXT NOT NULL,
+            service_id            TEXT NOT NULL,
+            runtime_pid           INTEGER NOT NULL,
+            runtime_started_at_ms INTEGER NOT NULL,
+            directory             TEXT NOT NULL,
+            operation             TEXT NOT NULL,
+            request_key           TEXT,
+            payload_sha256        TEXT NOT NULL,
+            occupancy_key         TEXT,
+            state                 TEXT NOT NULL,
+            native_id             TEXT,
+            reason_code           TEXT,
+            -- 派发代次：claim 时写入**本进程**代次。重启恢复只把「代次不是本进程」的
+            -- dispatching 改写成 unconfirmed——同进程内另建的 store 实例绝不篡改在飞动作。
+            dispatch_epoch        TEXT,
+            created_at            INTEGER NOT NULL,
+            updated_at            INTEGER NOT NULL
+        );
+        -- 重启恢复/未决判定按会话取其状态；设备维度供属主校验（不给存在性预言机）
+        CREATE INDEX IF NOT EXISTS idx_opencode_native_actions_session
+            ON opencode_native_actions(session_id, state);
+        CREATE INDEX IF NOT EXISTS idx_opencode_native_actions_device
+            ON opencode_native_actions(device_id, action_id);
+        -- 未决请求占用：**每个待答表单/审批恰好一个活占用**，由主键在库内强制（不靠 Rust 判定）。
+        -- occupancy_key = "form:<session>:<id>" / "permission:<session>:<id>"；action_id 唯一 =
+        -- 一个动作最多占用一个未决请求。只在「从未派发的放弃」或「带整份未生效证据的拒绝」时
+        -- 删除行（释放），其余终态保留——同一表单不会出现第二个在途写出。
+        CREATE TABLE IF NOT EXISTS opencode_native_claims (
+            occupancy_key TEXT PRIMARY KEY,
+            action_id     TEXT NOT NULL UNIQUE,
+            session_id    TEXT NOT NULL,
+            created_at    INTEGER NOT NULL,
+            updated_at    INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_opencode_native_claims_session
+            ON opencode_native_claims(session_id);
+        -- 归属路由：一个会话最多一条（session_id 主键），记录本端认领的原生服务代际与目录。
+        -- route_state ∈ active / draining：验证开关关闭只降级为 draining（归属与代际保留、
+        -- 可原地重新启用）；**任何路径都不删除仍有未决 native 动作的路由行**。
+        CREATE TABLE IF NOT EXISTS opencode_native_routes (
+            session_id            TEXT PRIMARY KEY,
+            service_id            TEXT NOT NULL,
+            runtime_pid           INTEGER NOT NULL,
+            runtime_started_at_ms INTEGER NOT NULL,
+            directory             TEXT NOT NULL,
+            route_state           TEXT NOT NULL,
+            claimed_at            INTEGER NOT NULL,
+            updated_at            INTEGER NOT NULL,
+            route_version         INTEGER NOT NULL DEFAULT 1
+        );
         "#,
     )
-    .expect("Failed to initialize database schema");
 }

@@ -141,7 +141,8 @@ jobs:
       # 互相踩踏 → 随机数十例 FAILED（本机实测：默认并行 51 failed，-j 1 只有既有的
       # 5 例 HOME 隔离基线，且串行更快）。这是既有测试脆弱性，与业务代码无关；
       # 限并行度让门禁稳定，真正的根治（共享锁串行化建链用例）另立。
-      - run: cd src-tauri && cargo test --features marker-helper -j 2
+      # opencode-coordinator-tests：保留底层成功回归；同套 B1 用例仍走生产未知归属门。
+      - run: cd src-tauri && cargo test --features marker-helper,opencode-coordinator-tests -j 2
 
       # cfg(windows) 编译门禁（issue #45）：CI host 是 linux，win32.rs 等整模块
       # #[cfg(windows)] 代码在上述步骤中不可达、破损静默通过（detector.rs:732 一例）。

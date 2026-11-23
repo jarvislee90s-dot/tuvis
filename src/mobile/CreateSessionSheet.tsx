@@ -17,6 +17,16 @@ import {
   fetchCreateStatus,
   type CreateProjectView,
 } from "./api";
+import {
+  createOpenCodeNativeSession,
+  fetchOpenCodePolicy,
+  newOpenCodeCreateRequestId,
+  previewOpenCodeCreateRecovery,
+  readOpenCodeCreateReceipt,
+  recoverOpenCodeCreatedSession,
+  type OpenCodeCreatePreview,
+  type OpenCodeCreateReceipt,
+} from "./opencodeNativeApi";
 import { formatRelativeTime, toolLabel } from "./board-logic";
 import type { AgentType, Session } from "@/types/session";
 
@@ -75,6 +85,21 @@ const CREATE_REJECT_LABEL_KEYS: Record<string, string> = {
 /** reasonCode → 分诊文案（渲染/提交期现取）：码不在表内 → null（调用侧通用兜底） */
 function createRejectLabel(reasonCode: string): string | null {
   const key = CREATE_REJECT_LABEL_KEYS[reasonCode];
+  return key !== undefined ? i18n.t(key) : null;
+}
+
+/** POST /session-create 409 的 reasonCode → 分诊文案的 i18n 键（H14 O1 修复：
+ *  此前所有 409 一律折叠为「创建任务进行中」——策略门拒绝 OC_LEGACY_DISABLED
+ *  的明确原因未直达用户，误导性进行时态。与 400 码表同构分诊；码不在表内
+ *  （含裸单飞 {"error":"conflict"}）→ 调用侧按既有单飞文案兜底不变） */
+const CREATE_CONFLICT_LABEL_KEYS: Record<string, string> = {
+  OC_LEGACY_DISABLED: "mobile.create.conflictLegacyDisabled",
+};
+
+/** 409 reasonCode → 分诊文案（提交期现取）：码不在表内 → null（单飞兜底） */
+function createConflictLabel(reasonCode: string | undefined): string | null {
+  if (reasonCode === undefined) return null;
+  const key = CREATE_CONFLICT_LABEL_KEYS[reasonCode];
   return key !== undefined ? i18n.t(key) : null;
 }
 
@@ -157,6 +182,17 @@ interface CreateSessionSheetProps {
   onClose: () => void;
 }
 
+const OPENCODE_CREATE_REQUEST_STORAGE = "tuvis.opencode.createRequest";
+
+function readStoredOpenCodeRequest(): string | null {
+  try {
+    const value = globalThis.localStorage.getItem(OPENCODE_CREATE_REQUEST_STORAGE);
+    return value && /^[a-f0-9]{32}$/.test(value) ? value : null;
+  } catch {
+    return null;
+  }
+}
+
 export default function CreateSessionSheet({
   enabledTools,
   installedTools,
@@ -174,6 +210,19 @@ export default function CreateSessionSheet({
   const [manualPath, setManualPath] = useState("");
   const [firstMessage, setFirstMessage] = useState("");
   const [submitting, setSubmitting] = useState(false);
+  const [nativeRequestId, setNativeRequestId] = useState(readStoredOpenCodeRequest);
+  const [nativeReceipt, setNativeReceipt] = useState<OpenCodeCreateReceipt | null>(null);
+  const [nativeMissing, setNativeMissing] = useState(false);
+  const [nativePreview, setNativePreview] = useState<OpenCodeCreatePreview | null>(null);
+  const nativeWriteInFlight = useRef(false);
+  const policyRequest = useRef<AbortController | null>(null);
+  useEffect(
+    () => () => {
+      policyRequest.current?.abort();
+      policyRequest.current = null;
+    },
+    []
+  );
   const [formError, setFormError] = useState<string | null>(null);
   // 中性提示（取消跟踪等），与红色错误分列——用户须能区分「出错」与「如实告知」
   const [notice, setNotice] = useState<string | null>(null);
@@ -245,8 +294,79 @@ export default function CreateSessionSheet({
     [manualMode]
   );
 
+  const clearNativeRequest = useCallback(() => {
+    globalThis.localStorage.removeItem(OPENCODE_CREATE_REQUEST_STORAGE);
+    setNativeRequestId(null);
+    setNativeReceipt(null);
+    setNativePreview(null);
+    setNativeMissing(false);
+    setFormError(null);
+  }, []);
+
+  useEffect(() => {
+    const requestId = readStoredOpenCodeRequest();
+    if (!requestId) return;
+    let current = true;
+    readOpenCodeCreateReceipt(requestId)
+      .then((receipt) => {
+        if (!current || nativeWriteInFlight.current) return;
+        setNativeReceipt(receipt);
+        setNativeMissing(receipt === null);
+      })
+      .catch(() => {
+        if (current) setFormError(i18n.t("mobile.create.nativeCheckFailed"));
+      });
+    return () => {
+      current = false;
+    };
+  }, []);
+
+  const checkNativeRequest = async (
+    recover: boolean,
+    candidateToken?: string,
+    verifyOnly = false
+  ) => {
+    if (!nativeRequestId || nativeWriteInFlight.current) return;
+    nativeWriteInFlight.current = true;
+    setSubmitting(true);
+    setFormError(null);
+    try {
+      const receipt = recover
+        ? await recoverOpenCodeCreatedSession(nativeRequestId, candidateToken, verifyOnly)
+        : await readOpenCodeCreateReceipt(nativeRequestId);
+      setNativeReceipt(receipt);
+      setNativeMissing(receipt === null);
+    } catch (error) {
+      setFormError(
+        i18n.t(
+          error instanceof ApiError && error.status === 403
+            ? "mobile.create.deviceInvalid"
+            : "mobile.create.nativeCheckFailed"
+        )
+      );
+    } finally {
+      nativeWriteInFlight.current = false;
+      setSubmitting(false);
+    }
+  };
+
+  const previewNativeRecovery = async () => {
+    if (!nativeRequestId || nativeWriteInFlight.current) return;
+    nativeWriteInFlight.current = true;
+    setSubmitting(true);
+    setFormError(null);
+    try {
+      setNativePreview(await previewOpenCodeCreateRecovery(nativeRequestId));
+    } catch {
+      setFormError(i18n.t("mobile.create.nativeCheckFailed"));
+    } finally {
+      nativeWriteInFlight.current = false;
+      setSubmitting(false);
+    }
+  };
+
   const handleSubmit = useCallback(async () => {
-    if (tool === null || !effectivePath) return;
+    if (tool === null || !effectivePath || nativeWriteInFlight.current) return;
     // 首句预检（评审修复⑥）：与后端 MAX_SEND_CHARS 同标尺（10k）——后端超长回裸
     // bad_request（无 reasonCode），预检给可读提示且免一次必然失败的往返
     if (firstMessage.trim().length > 10000) {
@@ -257,6 +377,47 @@ export default function CreateSessionSheet({
     setFormError(null);
     setNotice(null);
     try {
+      if (tool === "opencode") {
+        // 在发出任一创建 POST 前确定路径；原生失败后不得改走旧创建。
+        nativeWriteInFlight.current = true;
+        const preflight = new AbortController();
+        policyRequest.current = preflight;
+        const timer = setTimeout(() => preflight.abort(), 5_000);
+        const routing = await fetchOpenCodePolicy(preflight.signal).finally(() =>
+          clearTimeout(timer)
+        );
+        if (policyRequest.current !== preflight) return;
+        policyRequest.current = null;
+        if (preflight.signal.aborted) {
+          setFormError(i18n.t("mobile.create.createRequestFailed"));
+          return;
+        }
+        const useNative =
+          routing?.platform === "macos" &&
+          routing.policy === "native_only" &&
+          routing.createRoute === "opencode_native";
+        const useLegacy =
+          routing?.platform === "windows" &&
+          routing.policy === "legacy_compatible" &&
+          routing.createRoute === "legacy";
+        if (!useNative && !useLegacy) {
+          setFormError(i18n.t("mobile.create.conflictLegacyDisabled"));
+          return;
+        }
+        if (useNative) {
+          const requestId = newOpenCodeCreateRequestId();
+          globalThis.localStorage.setItem(OPENCODE_CREATE_REQUEST_STORAGE, requestId);
+          setNativeRequestId(requestId);
+          setNativeMissing(false);
+          const receipt = await createOpenCodeNativeSession(
+            requestId,
+            effectivePath,
+            firstMessage.trim()
+          );
+          setNativeReceipt(receipt);
+          return;
+        }
+      }
       const r = await createSession({
         tool,
         projectPath: effectivePath,
@@ -266,7 +427,12 @@ export default function CreateSessionSheet({
       if ("kind" in r) {
         // 400/409 是类型化返回值（业务流，非异常）——分診文案后留在表单可改可重试
         if (r.kind === "conflict") {
-          setFormError(i18n.t("mobile.create.conflictTaskActive"));
+          // H14 O1：按 reasonCode 分诊（码表映射的明确文案，如策略门禁旧链的
+          // 原因 + 指向桌面端）——码表外（裸单飞占用）回落既有「进行中」文案；
+          // 服务端 reason 原串含机器前缀，不直接上屏（H05 纪律）
+          setFormError(
+            createConflictLabel(r.reasonCode) ?? i18n.t("mobile.create.conflictTaskActive")
+          );
         } else {
           // 后端 reason（定位详情，如黑名单命中段+所属表）优先于本地码表——
           // 修复批 I1：定位信息直达用户，缺省再按码表/兜底（评审建议形态）
@@ -293,6 +459,23 @@ export default function CreateSessionSheet({
       startedAtRef.current = Date.now();
       setTaskId(r.taskId);
     } catch (e) {
+      if (
+        tool === "opencode" &&
+        e instanceof ApiError &&
+        (e.status === 400 || e.status === 409) &&
+        !e.data?.requestId
+      ) {
+        // 结构化前置拒绝发生在创建账本占位前，表单可修改后重新提交。
+        if (typeof e.data?.reasonCode === "string") {
+          clearNativeRequest();
+          setFormError(
+            e.data.reasonCode === "OC_STORE_FAILED"
+              ? i18n.t("mobile.create.nativeCheckFailed")
+              : String(e.data.reason ?? i18n.t("mobile.create.createRequestFailed"))
+          );
+          return;
+        }
+      }
       if (e instanceof ApiError && e.status === 403) {
         // 评审修复④：设备失效在本面板可辨（cookie 判废）——如实指向重新配对
         setFormError(i18n.t("mobile.create.deviceInvalid"));
@@ -301,9 +484,11 @@ export default function CreateSessionSheet({
         setFormError(i18n.t("mobile.create.createRequestFailed"));
       }
     } finally {
+      policyRequest.current = null;
+      nativeWriteInFlight.current = false;
       setSubmitting(false);
     }
-  }, [tool, effectivePath, firstMessage]);
+  }, [tool, effectivePath, firstMessage, clearNativeRequest]);
 
   // 进度轮询（2s，挂入即拍）：终态（done/failed）与失效（no_task）即停；
   // 单拍网络异常不终止——任务在主机侧继续跑，兔维斯 重启会以 404 no_task 判定，
@@ -417,7 +602,132 @@ export default function CreateSessionSheet({
         </button>
       </header>
       <div className="flex-1 overflow-y-auto px-4 py-4">
-        {taskId === null ? (
+        {nativeRequestId ? (
+          <section className="space-y-3" data-testid="opencode-create-receipt">
+            <p role="status" className="font-medium">
+              {i18n.t(
+                `mobile.create.nativeWindow.${
+                  nativeReceipt?.creation === "unconfirmed" && nativeReceipt.window === "created"
+                    ? "pending"
+                    : (nativeReceipt?.window ?? "pending")
+                }`
+              )}
+            </p>
+            {nativeReceipt?.directory && (
+              <p className="text-sm break-all">{nativeReceipt.directory}</p>
+            )}
+            {nativeReceipt?.sessionId && (
+              <p className="text-xs break-all text-[var(--mut)]">{nativeReceipt.sessionId}</p>
+            )}
+            {nativeReceipt?.reason && <p className="text-sm">{nativeReceipt.reason}</p>}
+            {nativeReceipt?.firstSentenceStatus && (
+              <p className="text-sm">
+                {i18n.t(
+                  nativeReceipt.firstSentenceStatus === "confirmed"
+                    ? "mobile.create.nativeFirstSent"
+                    : "mobile.create.nativeFirstPending"
+                )}
+              </p>
+            )}
+            {nativeReceipt?.sessionId &&
+              nativeReceipt.reasonCode === "OC_GENERATION_MISMATCH" &&
+              !nativePreview && (
+                <button
+                  type="button"
+                  disabled={submitting}
+                  className="block text-sm underline"
+                  onClick={() => void previewNativeRecovery()}
+                >
+                  {i18n.t("mobile.create.nativePreview")}
+                </button>
+              )}
+            {nativePreview && (
+              <div className="space-y-2 rounded-[var(--rr)] border border-[var(--cb)] p-3 text-sm">
+                <p>
+                  {i18n.t("mobile.create.nativePreviewTarget", {
+                    serviceId: nativePreview.serviceId,
+                    pid: nativePreview.servicePid,
+                  })}
+                </p>
+                <p className="break-all">{nativePreview.directory}</p>
+                <button
+                  type="button"
+                  disabled={submitting}
+                  className="underline"
+                  onClick={() => {
+                    const token = nativePreview.previewToken;
+                    setNativePreview(null);
+                    void checkNativeRequest(true, token);
+                  }}
+                >
+                  {i18n.t("mobile.create.nativeConfirmTarget")}
+                </button>
+              </div>
+            )}
+            {nativeMissing && <p className="text-sm">{i18n.t("mobile.create.nativeMissing")}</p>}
+            {formError && (
+              <p className="text-sm text-red-600" role="alert">
+                {formError}
+              </p>
+            )}
+            <button
+              type="button"
+              disabled={submitting}
+              onClick={() =>
+                void checkNativeRequest(
+                  nativeReceipt?.creation === "unconfirmed" && nativeReceipt.window !== "blocked",
+                  undefined,
+                  true
+                )
+              }
+              className="rounded-[var(--rr)] border border-[var(--cb)] px-3 py-2 text-sm"
+            >
+              {i18n.t("mobile.create.nativeCheck")}
+            </button>
+            {nativeReceipt?.sessionId && nativeReceipt.window !== "blocked" && (
+              <button
+                type="button"
+                disabled={submitting}
+                onClick={() => void checkNativeRequest(true)}
+                className="ml-2 rounded-[var(--rr)] border border-[var(--cb)] px-3 py-2 text-sm"
+              >
+                {i18n.t("mobile.create.nativeCheckWindow")}
+              </button>
+            )}
+            {nativeReceipt?.sessionId &&
+              boardSessions.find(
+                (session) =>
+                  session.id === nativeReceipt.sessionId && session.agentType === "opencode"
+              ) && (
+                <button
+                  type="button"
+                  className="block text-sm underline"
+                  onClick={() => {
+                    const session = boardSessions.find(
+                      (item) => item.id === nativeReceipt.sessionId && item.agentType === "opencode"
+                    );
+                    if (session) {
+                      onOpenSession?.(session);
+                      onClose();
+                    }
+                  }}
+                >
+                  {i18n.t("mobile.create.nativeViewSession")}
+                </button>
+              )}
+            {nativeReceipt?.window === "opened" &&
+              (!nativeReceipt.firstSentenceStatus ||
+                nativeReceipt.firstSentenceStatus === "confirmed") && (
+                <button
+                  type="button"
+                  className="block text-sm underline"
+                  onClick={clearNativeRequest}
+                >
+                  {i18n.t("mobile.create.nativeNew")}
+                </button>
+              )}
+          </section>
+        ) : taskId === null ? (
           <>
             {/* 最近项目快捷 chips：页面最顶的加速器行（进度态不渲染；候选为空
                 整节不渲染——候选区已有加载/空态文案，chips 再占位属重复） */}

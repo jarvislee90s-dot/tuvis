@@ -1,5 +1,5 @@
 {
-  "description": "PR #158 五轮：Rust 生产裸中文字符串在错误上下文 ±3 行的候选数；已排除测试、日志调用参数、UsageError/PetRpcError 参数。不是可达上屏错误总数，不与旧逐行口径 172 混比。口径固定：±3 行启发式命中时须添加错误码，后续迁移只降低各文件预算。五轮修复了剔除器「cfg(test) 项类型位顶层逗号」缺陷，本表随之由 452 收紧至 446（remote/attachment_fixtures.rs 的 6 条测试夹具候选归零）。PR #181 增记 updater.rs 4→7：安装层两跳回退（89ca9364）的三个纯拼接片段——「{host}: DoH 未给出可用地址」「；其余域: {}」「{}；DoH 钉 IP 直连兜底也失败: {}」，均为已带码顶层报文的内嵌明细/连接拷贝（与发现层基线内既有片段同构，发现层对应拷贝为基线原 4 项之一），顶层码本体（UPDATER_MANIFEST_VERIFY/UPDATER_INSTALL_FAIL/UPDATER_DOH_FAIL）均已恢复/新增码形态并配齐 i18n 键。",
+  "description": "PR #158 五轮：Rust 生产裸中文字符串在错误上下文 ±3 行的候选数；已排除测试、日志调用参数、UsageError/PetRpcError 参数。不是可达上屏错误总数，不与旧逐行口径 172 混比。口径固定：±3 行启发式命中时须添加错误码，后续迁移只降低各文件预算。五轮修复了剔除器「cfg(test) 项类型位顶层逗号」缺陷，本表随之由 452 收紧至 446（remote/attachment_fixtures.rs 的 6 条测试夹具候选归零）。PR #181 增记 updater.rs 4→7：安装层两跳回退（89ca9364）的三个纯拼接片段——「{host}: DoH 未给出可用地址」「；其余域: {}」「{}；DoH 钉 IP 直连兜底也失败: {}」，均为已带码顶层报文的内嵌明细/连接拷贝（与发现层基线内既有片段同构，发现层对应拷贝为基线原 4 项之一），顶层码本体（UPDATER_MANIFEST_VERIFY/UPDATER_INSTALL_FAIL/UPDATER_DOH_FAIL）均已恢复/新增码形态并配齐 i18n 键。；2026-11-15 H15 统一重建门禁增记：候选阶段新增两文件按棘轮现势冻结——candidate_guard.rs 13（直开拒绝守卫的 stderr/osascript 启动诊断文案，其形态已被 candidate-entry-smoke §14.3 负例证据逐字锁定，冻结不改文案）、opencode_native/actions.rs 1（同轮新增，后续迁移批可下调）。；2026-11-16 N7 冻结门禁增记 projection_route_race_tests.rs 0→2：路由竞速回归测试（H13-era 未提交工作区新文件）的 assert!/expect_err 中文断言说明文案，非生产上屏错误——按 candidate_guard.rs 先例冻结入账，文案被测试语义锁定不改；2026-11-16 M9 冻结门禁增记 inject/resume.rs 6→17：M7（B1 恢复起窗工程修复）新增的三路解析/版本门诊断文案（规范位/显式配置/PATH 回退与 OPENCODE_VERSION_MISMATCH/PROBE_FAILED 上下文），其形态已被 M7 隔离活体（真 Terminal 窗三断言 + 桩拒绝零起窗）逐字锁定，冻结不改文案——按 candidate_guard.rs 先例冻结入账；同批新增 DB_* 错误码族（M4）已补齐 zh/en i18n 键并把 connection.rs 三处裸 {e} 体改为带语义区分文案（同串多码对账修复），非基线项；2026-11-17 R2（F4 fix round 1）增记：connection.rs 0→1（F3 init-complete 标记写入的 fail-closed 诊断「本进程启动时刻不可读（sysinfo）…」，ok_or_else 非 log 语境、标记格式契约锁定不改文案，按 candidate_guard.rs 先例冻结入账）、opencode_route_migration_tests.rs 0→2（F12 路由迁移回归测试的 assert 中文断言说明文案，非生产上屏错误，按 projection_route_race_tests.rs 先例冻结入账）；同批 i18n 对账修复：DB_INIT_FATAL/DB_INIT_FATAL_EXIT/RESTORE_PENDING 三码补齐 zh/en errors 键（restorePending 文案与 ArchiveDetail 待确认态同源），DB_BUSY_TIMEOUT_FAIL/DB_SCHEMA_INIT_FAIL/DB_SEED_DEFAULTS_FAIL 三孤儿键删除——三码仅作 InitStepError 内嵌 step 名存在（非 CODE: 形态，检查器不可提取），恒以 DB_INIT_FATAL 族前缀上屏且前端 mapper（invokeError.ts）只认前导码，键已死，按孤儿规则修剪；2026-11-17 G 轮增记 opencode_window_cas_tests.rs 0→3（G1 窗口 CAS DAO 回归测试的 assert 中文断言说明文案，非生产上屏错误，按 projection_route_race_tests.rs / opencode_route_migration_tests.rs 先例冻结入账）；2026-11-17 G 轮（GC 收门）增记 inject/resume.rs 17→23、inject/restore_pending.rs 0→1：G2 受控启动链新增六条诊断——env 秘密落盘三处（目录创建/文件写入/收紧 0600 失败，结构化 Err 非上屏链路）、起窗前三核对两处哨兵前缀串（OC_RESUME_ENDPOINT_NOT_LOOPBACK / OC_RESUME_REGISTRATION_UNVERIFIED 的 format! 内联常量捕获，前导码为小写哨兵词、检查器码形不可提取）与 restore_pending 的 OC_RESUME_DIRECTORY_UNRESOLVED 占位插值串——其形态已被 GB 隔离活体（RED b 哨兵 starts_with 断言 + 五媒介零明文断言）逐字锁定，冻结不改文案，按 candidate_guard.rs / M9 resume.rs 先例冻结入账；2026-11-17 G 轮（GE 重冻结）修复 GB fix1 遗漏的模块门：session.rs `g2_restore_error_translation_tests` 缺 `#[cfg(test)]` 致测试体编译进生产 lib（clippy unused-imports 活体、棘轮假上升 3→17）——补门后回归基线 3，零文案零基线变化；2026-11-18 H 轮（HA）增记 opencode_window_cas_tests.rs 3→6：H1 队列入队窗口 CAS DAO 一致性回归测试（enqueue/rebind 与 G1 claim 同判定面）的 assert 中文断言说明文案，非生产上屏错误，按 projection_route_race_tests.rs / G 轮同文件先例冻结入账；2026-11-18 H 轮（HF 收门补记）增记 inject/resume.rs 23→40：H3（HC）凭据私有加固链新增的结构化诊断串——目录五异常校验（symlink/owner/权限）、路径白名单、独占创建冲突/写失败清理、交付处置分类（OSASCRIPT 超时/等待失败前缀常量）与 OC_RESUME_* 哨兵 format! 捕获——均为受控 Err/哨兵前缀形态（非上屏码链），其文案被 HC RED a–d 用例逐字锁定；H3 收门时漏跑本检查，工作区现势实为 40，按同轮先例冻结入账（不改动任何文案）；2026-11-18 I 轮（IG 重冻结门禁增记）增记 inject/resume.rs 40→41：HD 交付回查族新添一条内部诊断聚合串「resume {name} 出手后回查未命中（死窗/会话未建立）」（errs.push(format!) 聚合，log::warn! 同文在案）——确定性失败转次选通道的既有语义文案，非上屏码链，按 candidate_guard.rs / M9 resume.rs / H3 同文件先例冻结入账（不改动任何文案）",
   "files": {
     "src-tauri/src/bin/tuvis-marker.rs": 8,
     "src-tauri/src/commands/autostart.rs": 1,
@@ -21,7 +21,8 @@
     "src-tauri/src/inject/mode.rs": 34,
     "src-tauri/src/inject/question.rs": 157,
     "src-tauri/src/inject/queue.rs": 1,
-    "src-tauri/src/inject/resume.rs": 6,
+    "src-tauri/src/inject/resume.rs": 41,
+    "src-tauri/src/inject/restore_pending.rs": 1,
     "src-tauri/src/inject/windows_console.rs": 13,
     "src-tauri/src/linker/layer3.rs": 1,
     "src-tauri/src/monitor/hooks.rs": 4,
@@ -49,6 +50,12 @@
     "src-tauri/src/services/usage/query.rs": 4,
     "src-tauri/src/services/usage/collectors/opencode.rs": 4,
     "src-tauri/src/services/usage/collectors/workbuddy.rs": 1,
-    "src-tauri/src/services/usage/collectors/zcode.rs": 2
+    "src-tauri/src/services/usage/collectors/zcode.rs": 2,
+    "src-tauri/src/candidate_guard.rs": 13,
+    "src-tauri/src/services/opencode_native/actions.rs": 1,
+    "src-tauri/src/services/opencode_native/projection_route_race_tests.rs": 2,
+    "src-tauri/src/database/connection.rs": 1,
+    "src-tauri/src/database/dao/opencode_route_migration_tests.rs": 2,
+    "src-tauri/src/database/dao/opencode_window_cas_tests.rs": 6
   }
 }

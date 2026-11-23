@@ -533,7 +533,7 @@ mod tests {
 
     fn mem() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
-        crate::database::schema::init(&conn);
+        crate::database::schema::init(&conn).unwrap();
         conn
     }
 

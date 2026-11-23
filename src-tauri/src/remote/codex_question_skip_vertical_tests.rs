@@ -462,7 +462,7 @@ type SharedConn = Arc<StdMutex<Connection>>;
 
 fn shared_conn() -> SharedConn {
     let conn = Connection::open_in_memory().expect("open memory db");
-    schema::init(&conn);
+    let _ = schema::init(&conn);
     migration::migrate(&conn).expect("migrate");
     Arc::new(StdMutex::new(conn))
 }
@@ -559,6 +559,9 @@ fn remote_state_with_holder(
         rate_bucket_channels_source: Box::new(Vec::new),
         home_source: Box::new(|| None),
         injector: Arc::new(crate::inject::engine::RealInjector),
+        opencode_native: std::sync::Arc::new(crate::services::opencode_native::NativeHub::new(
+            crate::remote::pairing::DeviceStore::global(),
+        )),
         resume_spawner: Arc::new(|_: &crate::inject::resume::SpawnSpec| Ok(())),
         create_hub: Arc::new(CreateTaskHub::stub()),
         archive_source: Box::new(Vec::new),
@@ -2434,7 +2437,7 @@ async fn br2c_stop_write_failure_then_db_recovery_restores_bound_skip() {
     // ③ 恢复 DB：schema::init（IF NOT EXISTS）重建暂停表——不重启、不换代。
     {
         let conn = f.conn.lock().unwrap_or_else(|e| e.into_inner());
-        crate::database::schema::init(&conn);
+        let _ = crate::database::schema::init(&conn);
     }
 
     // ④ 首用重装合同：preview/confirm 200 → 绑定 skip 必须 closed_verified +

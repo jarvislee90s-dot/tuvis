@@ -3976,7 +3976,7 @@ mod signal_health_tests {
     /// 内存库（settings 表就绪），供 KV 一次性通知标志断言
     fn mem_conn() -> rusqlite::Connection {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
-        crate::database::schema::init(&conn);
+        crate::database::schema::init(&conn).unwrap();
         conn
     }
 

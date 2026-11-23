@@ -61,16 +61,17 @@ pub use dao::usage::{
     SessionDimRow,
 };
 
-/// 初始化数据库（兼容旧 store::init() 调用）
+/// 初始化数据库（兼容旧 store::init() 调用）。
+///
+/// M4+F3：**全量初始化**（open→schema→seed→migrate→工具行种子）整体在
+/// [`connection::DB`] 的有界初始化内完成（`open_and_init_with_backoff`）——
+/// 短暂锁争用预算内自动恢复；持续占锁 → `DB_INIT_RETRY_EXHAUSTED` exit 3；
+/// 迁移/schema/约束等持续错误 → `DB_INIT_FATAL`（步骤名+原因）exit 3，
+/// 绝不带病继续（此前迁移失败只记日志、种子错误被吞，属「假完成」）。
+/// 全部成功后才写 init-complete 标记（F3：PID+started 绑定，候选语境）。
 pub fn init() {
     connection::init();
-    if let Ok(conn) = connection::open() {
-        if let Err(e) = migration::migrate(&conn) {
-            // 迁移失败会让新列查询全线报错（如 codex_actions 的屏障列）——
-            // 不能静默：至少留一条可诊断的错误日志。
-            log::error!("数据库迁移失败: {e}");
-        }
-    }
-    // 种子工具启用行（全部 enabled=1，幂等；缺行视为启用）
-    dao::agent_tool::ensure_tool_rows();
+    // F3：全量初始化成功的进程才写标记（脚本就绪判定 = 本次 spawn 的候选 PID
+    // 对应的标记）；此处到达即意味着有界初始化已完整走完。
+    connection::mark_init_complete_if_candidate();
 }

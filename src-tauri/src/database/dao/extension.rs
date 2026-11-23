@@ -358,7 +358,7 @@ mod delete_tests {
 
     fn mem_conn() -> rusqlite::Connection {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
-        schema::init(&conn);
+        schema::init(&conn).unwrap();
         conn
     }
 
@@ -418,7 +418,7 @@ mod migration_tests {
 
     fn mem_conn() -> rusqlite::Connection {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
-        schema::init(&conn);
+        schema::init(&conn).unwrap();
         conn
     }
 

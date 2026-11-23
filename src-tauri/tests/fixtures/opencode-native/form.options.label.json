@@ -1,0 +1,29 @@
+{
+  "x-evidence": {
+    "run_id": "20261029-233614",
+    "sources": [
+      "docs/engineering/evidence/opencode-native/20261029-schema-fragments.json (Form.Option: value/label 独立)",
+      "docs/engineering/evidence/opencode-native/followup/fixtures/form.pending.json (字段形态)"
+    ],
+    "note": "选项 shape 夹具：任务 0 实际样本的 label 恰与 value 相同，此处按 Form.Option 契约取 label≠value，用于断言提交值不被展示标签覆盖。"
+  },
+  "data": {
+    "id": "frm_fixture_label_0001",
+    "sessionID": "ses_e77aec5e9ffez0Bwhj2OAQgQja",
+    "title": "label-vs-value",
+    "fields": [
+      {
+        "key": "q0",
+        "title": "COLOR",
+        "required": true,
+        "type": "string",
+        "options": [
+          { "value": "q0-red", "label": "Red", "description": "warm" },
+          { "value": "q0-blue", "label": "Blue" }
+        ],
+        "custom": true
+      }
+    ],
+    "state": { "status": "pending" }
+  }
+}

@@ -90,6 +90,31 @@ pub fn next_pending_conn(conn: &Connection, session_id: &str) -> Option<QueueRow
         .flatten()
 }
 
+pub(crate) fn next_non_opencode_pending_conn(
+    conn: &Connection,
+    session_id: &str,
+) -> rusqlite::Result<Option<QueueRow>> {
+    let sql = format!(
+        "SELECT {COLS} FROM inject_queue WHERE session_id = ?1 AND agent_type != 'opencode' AND {PENDING_PREDICATE} ORDER BY id ASC LIMIT 1"
+    );
+    conn.query_row(&sql, [session_id], row_to_queue).optional()
+}
+
+pub(crate) fn frozen_opencode_pending_metadata(
+    conn: &Connection,
+    session_id: &str,
+    device_id: &str,
+) -> rusqlite::Result<Vec<(i64, i64)>> {
+    let sql = format!(
+        "SELECT id, enqueued_at FROM inject_queue WHERE session_id = ?1 AND device_id = ?2 AND agent_type = 'opencode' AND {PENDING_PREDICATE} ORDER BY id ASC"
+    );
+    let mut statement = conn.prepare(&sql)?;
+    let rows = statement.query_map(params![session_id, device_id], |row| {
+        Ok((row.get(0)?, row.get(1)?))
+    })?;
+    rows.collect()
+}
+
 /// 标记已发送（落 sent_at，行保留作审计痕迹）
 pub fn mark_sent_conn(conn: &Connection, id: i64, now: i64) {
     if let Err(e) = conn.execute(
@@ -169,13 +194,26 @@ pub fn count_pending_sessions_conn(conn: &Connection) -> i64 {
     })
 }
 
+/// 某会话未决行数（native 路由切换屏障用）。**口径同源**：谓词仍是
+/// [`PENDING_PREDICATE`]。与上面几个消费方不同，这里**把错误交还调用方**：查询失败
+/// 不能被当成「没有未决」（空 pending 是「无阻塞」的证据，不是失败的默认值）。
+pub(crate) fn count_opencode_pending_for_session_conn(
+    conn: &Connection,
+    session_id: &str,
+) -> rusqlite::Result<i64> {
+    let sql = format!(
+        "SELECT COUNT(*) FROM inject_queue WHERE session_id = ?1 AND agent_type = 'opencode' AND {PENDING_PREDICATE}"
+    );
+    conn.query_row(&sql, [session_id], |r| r.get(0))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn mem() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
-        crate::database::schema::init(&conn);
+        crate::database::schema::init(&conn).unwrap();
         conn
     }
 
