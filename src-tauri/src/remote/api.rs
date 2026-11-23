@@ -2855,10 +2855,11 @@ pub async fn session_attachment(
             }
         }
     }
-    // cwd 的唯一来源 = 会话自身 project_path（与 main 同口径）。
-    // 原生路由的 fixed_target 只用于**归属/目录校验**，不能用它替换写盘目录：
-    // 非原生会话没有 fixed_target，取空值会让后续 canonicalize 失败并返回 500。
-    let cwd = session.project_path.trim().to_string();
+    // 原生附件必须写入已核验的精确路径，路径结尾的空格是目录名的一部分。
+    let cwd = fixed_target.as_ref().map_or_else(
+        || session.project_path.trim().to_owned(),
+        |target| target.directory.to_string_lossy().into_owned(),
+    );
     if cwd.is_empty() {
         // 与 resume 的 no_cwd 同源口径（该会话没有项目目录信息）
         return json_no_store(
