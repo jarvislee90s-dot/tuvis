@@ -13916,6 +13916,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(target_os = "macos"),
+        ignore = "requires macOS OpenCode ownership or process semantics"
+    )]
     async fn created_first_sentence_loses_window_authorization_before_claim() {
         use crate::database::dao::opencode_creates::{self, CreateRecord, CreateWindow};
 
@@ -13989,6 +13993,10 @@ mod tests {
     /// 换窗（伴表行 pid/boot/version 变化）⇒ 派发零写拒绝：outbox 无新投递、无新
     /// 消息、待发项保留、拒绝码 OC_ROUTE_WINDOW_MISMATCH。
     #[tokio::test]
+    #[cfg_attr(
+        not(target_os = "macos"),
+        ignore = "requires macOS OpenCode ownership or process semantics"
+    )]
     async fn window_reselect_between_echo_and_claim_refuses_dispatch() {
         let (rig, hold) = boot_g1(World::new()).await;
         let (_binding, version_before, pin_before) = g1_seed_queued_action(&rig, "act_g1a").await;
@@ -14076,6 +14084,10 @@ mod tests {
     /// G1 RED b（伴表读取失败 fail-closed）：回声验证后、取得派发权前伴表不可读
     /// ⇒ 提交被阻断（STORE_FAILED，不得因读失败放行），零写、待发保留。
     #[tokio::test]
+    #[cfg_attr(
+        not(target_os = "macos"),
+        ignore = "requires macOS OpenCode ownership or process semantics"
+    )]
     async fn companion_table_read_failure_blocks_dispatch_commit() {
         let (rig, hold) = boot_g1(World::new()).await;
         let (_binding, _version, _pin) = g1_seed_queued_action(&rig, "act_g1b").await;
@@ -14115,6 +14127,10 @@ mod tests {
     /// G1 RED c（正常链回归）：回声与派发之间绑定未变 ⇒ 窗口 CAS 全等 ⇒ 照常派发
     /// （换窗守卫不误伤正常链）。
     #[tokio::test]
+    #[cfg_attr(
+        not(target_os = "macos"),
+        ignore = "requires macOS OpenCode ownership or process semantics"
+    )]
     async fn unchanged_window_between_echo_and_claim_dispatches_normally() {
         let (rig, hold) = boot_g1(World::new()).await;
         let (_binding, version_before, _pin) = g1_seed_queued_action(&rig, "act_g1c").await;
@@ -14240,6 +14256,10 @@ mod tests {
     /// H1 RED a（新入队路径）：回声验证完成后、入队事务提交前切到同服务另一窗口
     /// ⇒ 项不入队（outbox 零新行）、拒绝原因留存、零原生写。
     #[tokio::test]
+    #[cfg_attr(
+        not(target_os = "macos"),
+        ignore = "requires macOS OpenCode ownership or process semantics"
+    )]
     async fn h1_enqueue_refused_after_window_switch_leaves_zero_outbox_rows() {
         let (rig, hold) = boot_g1(World::new()).await;
         let (view, claim) = rig
@@ -14286,6 +14306,10 @@ mod tests {
     /// H1 RED b（重绑替换路径）：回声验证后、入队事务提交前切窗 ⇒ 原项不撤回
     /// 不替换（冻结载荷原样）、替换项零新行、拒绝原因留存。
     #[tokio::test]
+    #[cfg_attr(
+        not(target_os = "macos"),
+        ignore = "requires macOS OpenCode ownership or process semantics"
+    )]
     async fn h1_rebind_refused_after_window_switch_keeps_original_intact() {
         let (rig, hold) = boot_g1(World::new()).await;
         let (binding, _version, _pin) = g1_seed_queued_action(&rig, "act_h1b").await;
@@ -14335,6 +14359,10 @@ mod tests {
     /// H1 RED c（恢复派发路径）：回声验证后、恢复事务提交前切窗 ⇒ 恢复被拒
     /// （paused 保持 true）、队列态不变、零投递、拒绝原因留存。
     #[tokio::test]
+    #[cfg_attr(
+        not(target_os = "macos"),
+        ignore = "requires macOS OpenCode ownership or process semantics"
+    )]
     async fn h1_resume_refused_after_window_switch_keeps_paused_state() {
         let (rig, hold) = boot_g1(World::new()).await;
         let (binding, _version, _pin) = g1_seed_queued_action(&rig, "act_h1c").await;
@@ -14392,6 +14420,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(target_os = "macos"),
+        ignore = "requires macOS OpenCode ownership or process semantics"
+    )]
     async fn budget_exhausted_before_resume_storage_keeps_outbox_paused() {
         let (rig, hold) = boot_g1(World::new()).await;
         let (binding, _, _) = g1_seed_queued_action(&rig, "act_budget_resume_queued").await;
@@ -14442,6 +14474,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(target_os = "macos"),
+        ignore = "requires macOS OpenCode ownership or process semantics"
+    )]
     async fn budget_exhausted_before_send_storage_leaves_no_outbox_row() {
         let (rig, hold) = boot_g1(World::new()).await;
         let (view, claim) = rig.hub.view_and_claim(&rig.card, true).await.unwrap();
@@ -14476,6 +14512,10 @@ mod tests {
     /// 排队项）；显式重选回 W1 后 ≥2 轮后台派发循环：原项内容不变、暂停标志不变、
     /// 原生零投递、拒绝原因未被清除——后台绝不能清除拒绝原因后悄悄投递。
     #[tokio::test]
+    #[cfg_attr(
+        not(target_os = "macos"),
+        ignore = "requires macOS OpenCode ownership or process semantics"
+    )]
     async fn h1_background_loop_skips_window_rejected_item_until_explicit_handling() {
         let (rig, hold) = boot_g1(World::new()).await;
         let (_binding, _version, _pin) = g1_seed_queued_action(&rig, "act_h1d").await;
@@ -14535,6 +14575,10 @@ mod tests {
     /// → 用户 rebind_outbox 重新确认 ⇒ 消息只送达一次（零重投），旧项由显式
     /// 重选替换（撤回、载荷销毁）。
     #[tokio::test]
+    #[cfg_attr(
+        not(target_os = "macos"),
+        ignore = "requires macOS OpenCode ownership or process semantics"
+    )]
     async fn h1_explicit_rebind_after_rejection_delivers_exactly_once() {
         let (rig, hold) = boot_g1(World::new()).await;
         let (_binding, _version, _pin) = g1_seed_queued_action(&rig, "act_h1e").await;
@@ -14707,6 +14751,10 @@ mod tests {
     /// 轮次零投递、拒绝原因不被清除；用户显式重绑后恢复投递恰一次（RED d 的既有
     /// 语义在同一闸内回归）。
     #[tokio::test]
+    #[cfg_attr(
+        not(target_os = "macos"),
+        ignore = "requires macOS OpenCode ownership or process semantics"
+    )]
     async fn i1_background_pick_race_keeps_rejection_until_explicit_rebind_delivers_once() {
         let (rig, hold) = boot_g1(World::new()).await;
         let (_binding, _version, _pin) = g1_seed_queued_action(&rig, "act_i1a").await;
@@ -14780,6 +14828,10 @@ mod tests {
     /// 队首后队列按 seq 序恢复流动（既有重绑尾随语义：干净项先发、重确认替换
     /// 随后，恰各一次）——选取与派发同一谓词，行为由本测试钉住。
     #[tokio::test]
+    #[cfg_attr(
+        not(target_os = "macos"),
+        ignore = "requires macOS OpenCode ownership or process semantics"
+    )]
     async fn i1_blocked_head_stops_queue_without_reverification_and_recovery_keeps_fifo_order() {
         let (rig, hold) = boot_g1(World::new()).await;
         let (binding, _version, _pin) = g1_seed_queued_action(&rig, "act_i1c_a").await;
@@ -15697,6 +15749,10 @@ mod tests {
     /// 授权写出：零 interrupt 写出、not_sent 墓碑（碑文 budget_exhausted）、
     /// 墓碑后 claim 恒拒、计时行 budget_refused=1。
     #[tokio::test]
+    #[cfg_attr(
+        not(target_os = "macos"),
+        ignore = "requires macOS OpenCode ownership or process semantics"
+    )]
     async fn he_budget_exhausted_before_claim_blocks_late_dispatch_authority() {
         let (rig, hold) = boot_g1(World::new()).await;
         let (view, claim) = rig

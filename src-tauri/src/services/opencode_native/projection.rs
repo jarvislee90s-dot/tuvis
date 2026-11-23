@@ -12762,6 +12762,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        not(target_os = "macos"),
+        ignore = "requires macOS OpenCode ownership or process semantics"
+    )]
     fn admission_accepts_registered_combination_and_caches_per_generation() {
         let fixture = fixture();
         let (knob, calls, value) = counting_sha_knob();
@@ -12789,6 +12793,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        not(target_os = "macos"),
+        ignore = "requires macOS OpenCode ownership or process semantics"
+    )]
     fn admission_generation_swap_recomputes_and_refuses_stale_verdicts() {
         let fixture = fixture();
         let (knob, calls, value) = counting_sha_knob();
@@ -12823,6 +12831,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        not(target_os = "macos"),
+        ignore = "requires macOS OpenCode ownership or process semantics"
+    )]
     fn admission_resolution_failure_is_fail_closed_and_not_cached() {
         let fixture = fixture();
         let (knob, calls, value) = counting_sha_knob();
@@ -12851,6 +12863,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        not(target_os = "macos"),
+        ignore = "requires macOS OpenCode ownership or process semantics"
+    )]
     fn admission_covers_explicit_launch_form_of_the_registered_entry() {
         let fixture = fixture();
         let hub = admission_hub(
@@ -12900,6 +12916,10 @@ mod tests {
     /// M2「服务 SHA 解析失败」：取不到服务构建身份 → 按不适用拒绝；失败不入缓存
     ///（解析恢复后同代际立即重算并准入），惯例与 TUI SHA 缓存逐字同源。
     #[test]
+    #[cfg_attr(
+        not(target_os = "macos"),
+        ignore = "requires macOS OpenCode ownership or process semantics"
+    )]
     fn admission_service_sha_resolution_failure_is_fail_closed_and_not_cached() {
         let fixture = fixture();
         let (knob, calls, value) = counting_sha_knob();
@@ -12933,6 +12953,10 @@ mod tests {
     /// M2 服务 SHA 每代际缓存：服务描述符（RuntimeKey）同代际只解析一次；服务
     /// 换代（pid 同、启动毫秒换）必须重算，不得复用旧代际判定。
     #[test]
+    #[cfg_attr(
+        not(target_os = "macos"),
+        ignore = "requires macOS OpenCode ownership or process semantics"
+    )]
     fn admission_service_sha_is_cached_per_service_generation() {
         let fixture = fixture();
         let (knob, calls, value) = counting_sha_knob();

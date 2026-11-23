@@ -156,6 +156,30 @@ jobs:
       - run: cd src-tauri && cargo check --target x86_64-pc-windows-gnu --all-targets --features marker-helper
       - run: cd src-tauri && cargo clippy --target x86_64-pc-windows-gnu --all-targets --features marker-helper -- -D warnings
 
+  opencode-macos:
+    name: OpenCode macOS regression
+    runs-on: macos-latest
+    needs: changes
+    if: github.event_name != 'pull_request' || needs.changes.outputs.backend == 'true'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build:mobile
+      - name: Run macOS OpenCode tests
+        working-directory: src-tauri
+        run: |
+          cargo test --locked --features opencode-coordinator-tests --lib opencode_native -- --test-threads=4
+          cargo test --locked --features opencode-coordinator-tests --lib close_does_not_kill_opencode
+          cargo test --locked --features opencode-coordinator-tests --test opencode_native_remote --test opencode_pin_readonly --test opencode_attachment_binding_regression
+
   build:
     name: Build verification
     runs-on: ubuntu-latest

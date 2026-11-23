@@ -800,6 +800,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(target_os = "macos"),
+        ignore = "requires macOS OpenCode ownership or process semantics"
+    )]
     async fn bridge_confirms_session_only_after_hello_and_rejects_after_disconnect() {
         let temp = tempfile::tempdir().unwrap();
         let project = temp.path().join("project");
@@ -926,6 +930,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(target_os = "macos"),
+        ignore = "requires macOS OpenCode ownership or process semantics"
+    )]
     async fn shutdown_closes_authenticated_connection() {
         let temp = tempfile::tempdir().unwrap();
         let project = temp.path().join("project");
@@ -983,6 +991,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(target_os = "macos"),
+        ignore = "requires macOS OpenCode ownership or process semantics"
+    )]
     async fn stale_reader_eof_does_not_clear_new_connection() {
         let temp = tempfile::tempdir().unwrap();
         let project = temp.path().join("project");
@@ -1028,6 +1040,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(target_os = "macos"),
+        ignore = "requires macOS OpenCode ownership or process semantics"
+    )]
     async fn shutdown_closes_connection_and_same_process_restart_reaccepts_plugin() {
         let temp = tempfile::tempdir().unwrap();
         let project = temp.path().join("project");
@@ -1127,6 +1143,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(target_os = "macos"),
+        ignore = "requires macOS OpenCode ownership or process semantics"
+    )]
     async fn bridge_rejects_wrong_directory_and_unknown_session() {
         let temp = tempfile::tempdir().unwrap();
         let project = temp.path().join("project");

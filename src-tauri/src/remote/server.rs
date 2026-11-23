@@ -13320,11 +13320,19 @@ mod tests {
         }
 
         #[tokio::test]
+        #[cfg_attr(
+            not(target_os = "macos"),
+            ignore = "requires macOS OpenCode ownership or process semantics"
+        )]
         async fn close_does_not_kill_opencode_without_trusted_binding() {
             assert_opencode_close_does_not_kill(&[("opencode-target", 4242)]).await;
         }
 
         #[tokio::test]
+        #[cfg_attr(
+            not(target_os = "macos"),
+            ignore = "requires macOS OpenCode ownership or process semantics"
+        )]
         async fn close_does_not_kill_opencode_with_shared_pid() {
             assert_opencode_close_does_not_kill(&[
                 ("opencode-target", 4242),
@@ -13334,6 +13342,10 @@ mod tests {
         }
 
         #[tokio::test]
+        #[cfg_attr(
+            not(target_os = "macos"),
+            ignore = "requires macOS OpenCode ownership or process semantics"
+        )]
         async fn close_does_not_kill_opencode_with_ambiguous_session_id() {
             assert_opencode_close_does_not_kill(&[
                 ("opencode-target", 4242),

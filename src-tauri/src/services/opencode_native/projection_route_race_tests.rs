@@ -578,6 +578,7 @@ async fn pinned_window_write_failure_rolls_back_route_claim_atomically() {
 /// 不是提交时刻的重新取样。回声结束后（最后一次通道终验处挂起）、提交前把新鲜
 /// 观察切到另一扇窗口：伴表必须仍是回声验证的那个窗口，另一窗不入绑定。
 #[tokio::test]
+#[cfg_attr(not(target_os = "macos"), ignore = "requires macOS OpenCode ownership or process semantics")]
 async fn reselect_commits_the_echo_verified_window_identity() {
     let fixture = fixture();
     let peer = Peer::start(Script::new(&fixture.project.canonicalize().unwrap())).await;
