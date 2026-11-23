@@ -211,7 +211,7 @@ pub fn write_attachment_with_exclude_warning(
         ensure_git_exclude(cwd, GIT_EXCLUDE_LINE);
         use std::io::Write;
         let (path, file) = unique_target(&dir, &sanitize_file_name(raw_name))?;
-        write_owned(file, path, |file| file.write_all(bytes))?;
+        write_owned(file, path.clone(), |file| file.write_all(bytes))?;
         Ok((path, None))
     }
 }

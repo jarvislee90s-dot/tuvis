@@ -1062,6 +1062,9 @@ pub struct OpenCodeBridgeView {
 }
 
 fn bridge_installer() -> Result<crate::services::opencode_native::BridgeInstall, String> {
+    if !opencode_native::native_platform_supported() {
+        return Err(opencode_native::OC_PLATFORM_UNVERIFIED_REASON.to_owned());
+    }
     let home = dirs::home_dir()
         .ok_or_else(|| "OPENCODE_BRIDGE_HOME_UNAVAILABLE: 无法解析用户目录".to_string())?;
     let xdg = std::env::var_os("XDG_CONFIG_HOME").map(std::path::PathBuf::from);

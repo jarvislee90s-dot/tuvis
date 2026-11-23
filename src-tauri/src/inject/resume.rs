@@ -1108,7 +1108,7 @@ pub(crate) fn probe_opencode_version(bin: &str) -> Result<String, String> {
 /// `state_file_for(home, xdg_state_home)` 同一路径）——登记在场且形状合法 ⇒
 /// **显式连接形态**（`--server <登记端点>`，连接已有外部 serve，不自托管）；
 /// 登记缺失/不可读 ⇒ 自托管形态（M7 原载荷，零回退）。
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn prepare_opencode_resume_with(
     home: Option<&std::path::Path>,
     path_env: Option<&str>,
@@ -3386,6 +3386,7 @@ mod tests {
 
     /// 闭包升级为 'static 引用（G2 依赖束测试装配专用：进程生命周期泄漏，量级
     /// 可忽略；restore_pending 测试同名先例）。
+    #[cfg(unix)]
     fn leak_box<T: 'static>(value: T) -> &'static T {
         Box::leak(Box::new(value))
     }
@@ -3639,6 +3640,7 @@ mod tests {
     // ==== F4（Ruling 4）+ G2：显式连接形态（登记在场）+ 密码脱离命令文本 ====
 
     /// 全缝版登记读取（测试内真实 fs 读 tempdir，零接触真实状态根）。
+    #[cfg(unix)]
     fn fs_reader() -> impl Fn(&std::path::Path) -> Result<Vec<u8>, String> {
         |path: &std::path::Path| std::fs::read(path).map_err(|e| format!("unreadable: {e}"))
     }
@@ -4147,6 +4149,7 @@ mod tests {
     //   cargo test --lib live_opencode_resume_isolated_three_assertions -- --ignored --nocapture
     #[ignore = "M7 隔离活体：需隔离 env（HOME/PATH/M7_ISO_ROOT）+ 真 Terminal 窗，显式运行"]
     #[test]
+    #[cfg(target_os = "macos")]
     fn live_opencode_resume_isolated_three_assertions() {
         let root = std::env::var_os("M7_ISO_ROOT")
             .map(std::path::PathBuf::from)
@@ -4292,6 +4295,7 @@ mod tests {
 
     /// 活体断言辅助：窗口桩流水中不得出现消息文本形态（`--session` 之外的第二
     /// 位置参数）。resume 零注入的机器可查形态。
+    #[cfg(target_os = "macos")]
     fn window_text_has_message(journal: &str) -> bool {
         journal
             .lines()

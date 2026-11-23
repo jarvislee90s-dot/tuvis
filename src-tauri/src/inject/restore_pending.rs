@@ -1959,6 +1959,7 @@ mod tests {
 
     /// HC 结算夹具：prepare 携带受控入口秘密（tempdir 内路径，假凭据）；execute
     /// 模拟生产交付语义（交付回调在场即调）；观察就绪与否由 ready 参数定。
+    #[cfg(unix)]
     fn hc_deps_with_env_secret(
         secret_path: std::path::PathBuf,
         ready: bool,

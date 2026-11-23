@@ -230,6 +230,7 @@ fn remove_observer_dir(plugin: &Path) {
 
 /// 跨进程 flock（阻塞获取）。锁文件位于 `opencode/` 下、卸载不删——
 /// 删除再创建会出现两组互不约束的锁。
+#[cfg(unix)]
 fn acquire_observer_lock(root: &Path) -> Result<ObserverLock, String> {
     let lock_path = root.join("opencode/.tuvis-route-observer.lock");
     if let Some(parent) = lock_path.parent() {
@@ -243,23 +244,21 @@ fn acquire_observer_lock(root: &Path) -> Result<ObserverLock, String> {
         .read(true)
         .open(&lock_path)
         .map_err(|e| format!("open observer lock: {e}"))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::io::AsRawFd;
-        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
-        if rc != 0 {
-            return Err(format!(
-                "lock observer: errno {}",
-                std::io::Error::last_os_error()
-            ));
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        // 非 Unix 平台暂无跨进程锁实现：显式拒绝，不静默退化为无锁写。
-        return Err("observer install lock is unsupported on this platform".into());
+    use std::os::fd::AsRawFd;
+    // SAFETY: the lock file remains open for the lifetime of ObserverLock.
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+    if rc != 0 {
+        return Err(format!(
+            "lock observer: errno {}",
+            std::io::Error::last_os_error()
+        ));
     }
     Ok(ObserverLock(file))
+}
+
+#[cfg(not(unix))]
+fn acquire_observer_lock(_root: &Path) -> Result<ObserverLock, String> {
+    Err("observer install lock is unsupported on this platform".into())
 }
 
 /// 首次发布：create-only 硬链接（目标已在即失败，绝不覆盖外来文件）。
