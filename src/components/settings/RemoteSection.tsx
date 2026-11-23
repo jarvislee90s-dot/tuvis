@@ -957,19 +957,6 @@ export function RemoteSection() {
             </Button>
           </div>
 
-          {/* ⑤ Codex 自动适配（S5 换装）：开关 = remote.codex_auto_adapt（S1 新设置键，
-              三态缺省开；命令 remote_toggle_codex_auto_adapt）。状态详情卡 =
-              codex_adapt_status DTO（attemptable/evidenced 两维度，前端只展示）。
-              旧「兼容发送（实验）」开关已随 S1 退出所有门，本批起不再渲染为可用开关
-              （键与命令保留至 S6 同步旧契约）。 */}
-          <CodexAdaptSection
-            enabled={status?.codexAutoAdaptEnabled ?? true}
-            explicit={status?.codexAutoAdaptExplicit ?? null}
-            loaded={status !== null}
-            busy={busy}
-            onToggle={(v) => void applyCodexAdapt(v)}
-          />
-
           {/* ② 通道（开关各自独立，可同时开启；点卡片在下方展开详情） */}
           <h3 data-group="channels" className={`${SETTINGS_SECTION_TITLE} mt-4`}>
             {t("settings.remote.groupChannels")}

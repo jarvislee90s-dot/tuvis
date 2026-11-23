@@ -98,7 +98,6 @@ describe("设置页排版层级（C1）", () => {
   });
 
   it("② 设置面的每个 h2/h3 都走档位常量，且**没有一个**内联类名", () => {
-    let checked = 0;
     const headingsByFile: Record<string, number> = {};
     for (const f of SURFACE) {
       const src = readFileSync(f, "utf8");
@@ -115,35 +114,20 @@ describe("设置页排版层级（C1）", () => {
           /SETTINGS_(PAGE_TITLE|CARD_TITLE|SECTION_TITLE)/
         );
       }
-      checked += tiered.length;
       if (tiered.length > 0) headingsByFile[rel(f)] = tiered.length;
     }
-    // 设置面标题总数：L2 卡片 h2 13 个（settings.tsx 6 张 + 组件卡 7 张）+
-    // L3 卡内小节 h3 10 个（远程 5 + 远程端外观 4 + 用量采集状态 1）= 23。
-    // L1 页面块标题是 h1，单独由 settings.tsx 的色条标题承担，不计入本锁。
-    // 2026-10-07 D4 把「快捷键」整节移除 ⇒ 账曾由 14 降为 13；2026-10-11（a）开机自启
-    // 分区加入、（b）远程端外观卡头条化并补 h2 语义（原折叠壳无 h2）⇒ 14 → 15；
-    // 2026-11-04 层级收口：页面标题 h2→h1、卡内小节统一 h3 + SETTINGS_SECTION_TITLE ⇒ 23。
-    // **本锁当场抓到过多次变化**：分区/卡增删时它先红，逼我们把数字与新事实对齐，而不是让计数悄悄漂。
-    expect(checked, "设置面标题总数（少一个就说明有标题漏掉了档位）").toBe(23);
-    // 原设置面标题总数：settings.tsx 7（1 一级色条 + 6 卡头条 h2）+ 7 个组件卡头条各 1
-    //（Remote/Audit/Signal/DataMgmt/Usage/UsageStatus/RemoteAppearance）+ UsageStatusSection 的 h3 1 = 15。
-    // 2026-10-07 D4 把「快捷键」整节移除 ⇒ 账曾由 14 降为 13；2026-10-11（a）开机自启
-    // 分区加入、（b）远程端外观卡头条化并补 h2 语义（原折叠壳无 h2）⇒ 14 → 15（**本锁
-    // 当场抓到过多次变化**：分区/卡增删时它先红，逼我们把数字与新事实对齐，而不是让计数悄悄漂）。
-    // OpenCodeNativeSection 新增卡内 h3 ⇒ 15 → 16；逐文件清单防止增删相抵掩盖漏检。
+    // 逐文件登记可检测新增或遗漏的标题，避免不同文件的变化相抵。
     expect(headingsByFile, "设置面标题按文件登记，新增分区必须同步核对").toEqual({
-      "src/pages/settings.tsx": 7,
+      "src/pages/settings.tsx": 6,
       "src/components/settings/AuditLogSection.tsx": 1,
       "src/components/settings/DataManagementSection.tsx": 1,
       "src/components/settings/OpenCodeNativeSection.tsx": 1,
-      "src/components/settings/RemoteAppearanceSection.tsx": 1,
-      "src/components/settings/RemoteSection.tsx": 1,
+      "src/components/settings/RemoteAppearanceSection.tsx": 5,
+      "src/components/settings/RemoteSection.tsx": 6,
       "src/components/settings/SignalHealthSection.tsx": 1,
       "src/components/settings/UsageSection.tsx": 1,
       "src/components/settings/UsageStatusSection.tsx": 2,
     });
-    expect(checked, "设置面标题总数（少一个就说明有标题漏掉了档位）").toBe(16);
   });
 
   it("③ 字号按值登记：未登记值在任何文件都红；登记小字号的裸字面量不得外溢豁免面", () => {
