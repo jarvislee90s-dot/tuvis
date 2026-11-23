@@ -6759,6 +6759,7 @@ mod tests {
         oversize_from_cursor: usize,
         /// 超限剧本追加的填充字节数（测试预算比它小即可触发）。
         oversize_padding_bytes: usize,
+        oversized_message_content_length: bool,
         /// `/api/info` 的状态码：非 200 用来制造一次真实的 401 作废。
         info_status: u16,
         event_status: u16,
@@ -6821,6 +6822,7 @@ mod tests {
                 oversize_trigger_limit: None,
                 oversize_from_cursor: 0,
                 oversize_padding_bytes: 0,
+                oversized_message_content_length: false,
                 info_status: 200,
                 event_status: 200,
                 session_forms_status: 200,
@@ -7006,6 +7008,20 @@ mod tests {
                 if let Some(hold) = hold {
                     hold.pass().await;
                 }
+            }
+            let oversized_message = {
+                let script = shared.script.lock().unwrap();
+                script.oversized_message_content_length
+                    && path == format!("/api/session/{}/message", script.session_id)
+            };
+            if oversized_message {
+                // The client must stop at the production length cap without reading the body.
+                let length = MAX_RESPONSE_BYTES + 1;
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n"
+                );
+                let _ = stream.write_all(header.as_bytes()).await;
+                return;
             }
             let (status, body) = reply(&shared, &path, &query);
             if write_json(stream, status, &body).await.is_err() {
@@ -8904,18 +8920,11 @@ mod tests {
     /// 任何把超限读面重新变成整体错误的改动都会在本用例变红。
     #[tokio::test]
     async fn oversize_message_page_degrades_view_with_honest_annotation() {
-        // 40 MB > 32 MiB 预算：任何 limit 档（含 1）都超限（N5 的「单条 20 MiB base64
-        // ≈27 MB 级记录」在更小预算下的同构放大，正文内存生成、不提交夹具）。
-        let data = "QUJDREVGR0gAAAA=".repeat(40_000_000 / 16);
+        // 每个档位由真实 HTTP 长度头触发生产限制，避免模拟服务反复序列化数十 MiB。
         let fixture = fixture();
         let project = fixture.project.canonicalize().unwrap();
         let peer = Peer::start(Script::new(&project)).await;
-        let mut record = user_message("msg_huge", "恰 20 MiB 合计", 1);
-        record["files"] = json!([{ "name": "a.bin", "data": data }]);
-        peer.set(|script| {
-            script.pages = vec![vec![record]];
-            script.cursor_shape = CursorShape::Scalar;
-        });
+        peer.set(|script| script.oversized_message_content_length = true);
         let hub = hub(&fixture, peer.port);
         let view = hub
             .view(&fixture.card)
