@@ -5004,67 +5004,10 @@ pub async fn session_close(
             return Err((String::new(), "no_session".to_string()));
         };
         let tool = s.agent_type.tool_id().to_string();
-        if policy::legacy_retired() && s.agent_type == crate::session::AgentType::OpenCode {
-            use crate::database::dao::{opencode_actions, opencode_pinned_windows};
-            use crate::monitor::opencode_observation::{
-                fresh_opened_window_for_pid, production_process_fact,
-            };
-            let unverified = || (tool.clone(), "OC_CLOSE_TARGET_UNVERIFIED".to_owned());
-            if matching.next().is_some()
-                || snapshot
-                    .sessions
-                    .iter()
-                    .any(|other| other.pid == s.pid && other.id != s.id)
-            {
-                return Err(unverified());
-            }
-            let binding = st2.store.with(|conn| {
-                let route = opencode_actions::route_conn(conn, &sid2)?;
-                let window = opencode_pinned_windows::pinned_window_conn(conn, &sid2)?;
-                Ok::<_, rusqlite::Error>(route.zip(window))
-            });
-            let Ok(Some((route, pinned))) = binding else {
-                return Err(unverified());
-            };
-            let Some(live) = fresh_opened_window_for_pid(&sid2, s.pid) else {
-                return Err(unverified());
-            };
-            let Ok(service) = st2
-                .opencode_native
-                .discover_create_service(std::path::Path::new(&route.directory))
-            else {
-                return Err(unverified());
-            };
-            let Some(port) = service.endpoint.port_or_known_default() else {
-                return Err(unverified());
-            };
-            if service.runtime.service_id != route.service_id
-                || i64::from(service.runtime.pid) != route.runtime_pid
-                || service.runtime.started_at_ms != route.runtime_started_at_ms
-                || !crate::services::opencode_native::projection::desktop_process_connected(
-                    s.pid, port,
-                )
-                || route.route_state != opencode_actions::ROUTE_ACTIVE
-                || route.service_id != pinned.service_id
-                || route.runtime_pid != pinned.runtime_pid
-                || route.runtime_started_at_ms != pinned.runtime_started_at_ms
-                || route.directory != pinned.directory
-                || !same_project_dir(&s.project_path, &pinned.directory)
-                || pinned.window_pid != i64::from(s.pid)
-                || pinned.runtime_pid == pinned.window_pid
-                || pinned.window_started_at_ms != live.started_at_ms
-                || pinned.window_boot.is_none()
-                || pinned.window_boot != live.boot
-                || u32::try_from(pinned.runtime_pid)
-                    .ok()
-                    .and_then(production_process_fact)
-                    != Some(pinned.runtime_started_at_ms)
-                || production_process_fact(s.pid) != Some(live.started_at_ms)
-            {
-                return Err(unverified());
-            }
-        } else if policy::legacy_retired()
-            && matching.any(|other| other.agent_type == crate::session::AgentType::OpenCode)
+        // macOS 的按 PID 终止无法把进程代际核验与发信号绑定为原子操作。
+        if policy::legacy_retired()
+            && (s.agent_type == crate::session::AgentType::OpenCode
+                || matching.any(|other| other.agent_type == crate::session::AgentType::OpenCode))
         {
             return Err(("opencode".into(), "OC_CLOSE_TARGET_UNVERIFIED".into()));
         }

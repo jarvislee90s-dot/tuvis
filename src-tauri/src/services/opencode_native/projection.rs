@@ -1048,7 +1048,7 @@ pub(crate) fn desktop_client_bound(session_id: &str, endpoint: &str) -> bool {
 
 /// 在进程 argv 匹配后，再要求该 PID 到固定服务端口存在 ESTABLISHED 连接。
 /// 仅凭同名/同参数进程不构成绑定；lsof 失败按未绑定处理（fail closed）。
-pub(crate) fn desktop_process_connected(pid: u32, port: u16) -> bool {
+fn desktop_process_connected(pid: u32, port: u16) -> bool {
     let pid_arg = pid.to_string();
     let network_arg = format!("-iTCP:{port}");
     let args = [
