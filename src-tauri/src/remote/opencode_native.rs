@@ -180,6 +180,10 @@ fn expected_binding_header(headers: &HeaderMap) -> Result<Option<&str>, Response
         .transpose()
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "HTTP 拒绝直接返回既有状态、响应头和 JSON 响应体"
+)]
 async fn resolve_native_context(
     st: &Arc<RemoteState>,
     headers: &HeaderMap,
@@ -196,6 +200,10 @@ async fn resolve_native_context(
 /// 「测不了」。把判据变成参数后，集成测试可以走同一个函数体验证该分支的受控码
 /// 与「零原生请求」性质；真实非 macOS 主机的运行行为仍需在那台机器上验（宿主事实，
 /// 不是逻辑缺口）。
+#[allow(
+    clippy::result_large_err,
+    reason = "HTTP 拒绝直接返回既有状态、响应头和 JSON 响应体"
+)]
 async fn resolve_native_context_with(
     st: &Arc<RemoteState>,
     headers: &HeaderMap,
@@ -205,6 +213,10 @@ async fn resolve_native_context_with(
     resolve_native_context_mode(st, headers, sid, platform_supported, false, None).await
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "HTTP 拒绝直接返回既有状态、响应头和 JSON 响应体"
+)]
 async fn resolve_native_context_mode(
     st: &Arc<RemoteState>,
     headers: &HeaderMap,

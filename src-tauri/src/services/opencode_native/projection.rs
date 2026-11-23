@@ -167,6 +167,7 @@ enum FactSighting {
     /// libproc = `ESRCH`）。
     Absent,
     /// 机制对该 pid 无法给出可区分回答（未识别错误/机制级失败）。
+    #[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
     Unavailable,
 }
 

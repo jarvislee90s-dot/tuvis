@@ -1388,6 +1388,10 @@ pub(crate) fn legacy_disabled_response() -> Response {
     )
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "HTTP 拒绝直接返回既有状态、响应头和 JSON 响应体"
+)]
 async fn legacy_policy_permit(
     st: &Arc<RemoteState>,
     sid: &str,
