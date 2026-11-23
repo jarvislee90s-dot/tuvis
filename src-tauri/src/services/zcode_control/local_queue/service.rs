@@ -5506,7 +5506,7 @@ mod tests {
         let path = dir.path().join("queue.sqlite");
         let open = || {
             let conn = rusqlite::Connection::open(&path).unwrap();
-            crate::database::schema::init(&conn);
+            let _ = crate::database::schema::init(&conn);
             crate::database::migration::migrate(&conn).unwrap();
             SqlLocalQueueStore::new(DeviceStore::Owned(Arc::new(std::sync::Mutex::new(conn))))
         };
@@ -6743,7 +6743,7 @@ mod tests {
         let path = dir.path().join("queue.sqlite");
         let open = || {
             let conn = rusqlite::Connection::open(&path).unwrap();
-            crate::database::schema::init(&conn);
+            let _ = crate::database::schema::init(&conn);
             crate::database::migration::migrate(&conn).unwrap();
             DeviceStore::Owned(Arc::new(std::sync::Mutex::new(conn)))
         };

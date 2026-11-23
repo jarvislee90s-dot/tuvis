@@ -254,7 +254,7 @@ fn migration_adds_response_elapsed_ms_and_preserves_old_data() {
     )
     .unwrap();
     // 与生产启动序一致：老形状表由 IF NOT EXISTS 原样保留，其余表按新 DDL 建齐
-    schema::init(&conn);
+    schema::init(&conn).unwrap();
     // 旧 usage 四桶播种（与 tps_store_test::seed_old_usage 同款，锁「迁移不碰旧账本」）
     conn.execute_batch(
         "INSERT INTO usage_detail

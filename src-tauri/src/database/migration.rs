@@ -156,7 +156,8 @@ pub fn migrate(conn: &Connection) -> Result<(), String> {
     // 先幂等重放 schema.rs 全量 DDL（全部 IF NOT EXISTS）：老库/裸连接补建新表，
     // 已存在的表保持原样（缺列由下方 ALTER 迁移补齐），与生产启动顺序（schema::init → migrate）一致。
     // 上面 DROP 掉的预览版账本四表，由这次 init 按新 DDL 重建为空表。
-    crate::database::schema::init(conn);
+    crate::database::schema::init(conn)
+        .map_err(|e| format!("MIGRATE_SCHEMA_REPLAY_FAIL: 幂等重放全量 DDL 失败: {e}"))?;
     migrate_b1_hint_schema(conn)
         .map_err(|e| format!("MIGRATE_B1_HINT_SCHEMA_FAIL: 迁移 Codex 答题提示表失败: {e}"))?;
 
@@ -193,6 +194,39 @@ pub fn migrate(conn: &Connection) -> Result<(), String> {
             [],
         )
         .map_err(|e| format!("MIGRATE_FAIL: {}", e))?;
+    }
+
+    // ===== OpenCode 原生：路由版本与旧队列迁移（我方新增）=====
+    if !column_exists(conn, "opencode_native_routes", "route_version") {
+        conn.execute("ALTER TABLE opencode_native_routes ADD COLUMN route_version INTEGER NOT NULL DEFAULT 1", [])
+            .map_err(|e| format!("MIGRATE_OPENCODE_ROUTE_VERSION: 迁移 OpenCode 路由版本失败: {e}"))?;
+    }
+
+    // 旧队列只从匹配动作行提取目录；无法证明归属的旧状态保留但不猜测。
+    // 迁移完成前 queued 不可 claim；迁入的待发项默认暂停，须显式恢复。
+    {
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| format!("MIGRATE_OPENCODE_OUTBOX: 迁移 OpenCode 待发表失败: {e}"))?;
+        let ready: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM settings WHERE key='opencode.outbox_target_schema_version' AND value='1')",
+            [], |row| row.get(0),
+        ).map_err(|e| format!("MIGRATE_OPENCODE_OUTBOX: 迁移 OpenCode 待发表失败: {e}"))?;
+        if !ready {
+            tx.execute(
+                "INSERT INTO opencode_outbox_targets(session_id,directory,revision,paused)
+                 SELECT a.session_id,a.directory,COALESCE(MAX(s.revision),0)+1,1
+                 FROM opencode_outbox o JOIN opencode_native_actions a ON a.action_id=o.action_id AND a.session_id=o.session_id
+                 LEFT JOIN opencode_outbox_sessions s ON s.session_id=a.session_id
+                 WHERE a.state='queued' AND o.command_json IS NOT NULL AND a.directory<>''
+                 GROUP BY a.session_id,a.directory
+                 ON CONFLICT(session_id,directory) DO NOTHING", [],
+            ).map_err(|e| format!("MIGRATE_OPENCODE_OUTBOX: 迁移 OpenCode 待发表失败: {e}"))?;
+            tx.execute("INSERT OR REPLACE INTO settings(key,value) VALUES('opencode.outbox_target_schema_version','1')", [])
+                .map_err(|e| format!("MIGRATE_OPENCODE_OUTBOX: 迁移 OpenCode 待发表失败: {e}"))?;
+        }
+        tx.commit()
+            .map_err(|e| format!("MIGRATE_OPENCODE_OUTBOX: 迁移 OpenCode 待发表失败: {e}"))?;
     }
 
     // tps_point.cadence_ms（独立复核 R11）：老库的点表无此列 → 补加可空列（旧行 NULL = 无节奏信息，
@@ -771,6 +805,19 @@ pub fn migrate(conn: &Connection) -> Result<(), String> {
         }
     }
 
+    // 计划任务 5 修订 R1（I-3）：动作账本需要「进程代次」列，只用来判定遗留 dispatching
+    // 行是否属于**当前进程**。本表只在本计划内出现过（未随任何发布版出库），故对已有库
+    // 只做一次幂等补列；新库由 schema::init 直接带列建立。
+    if column_exists(conn, "opencode_native_actions", "action_id")
+        && !column_exists(conn, "opencode_native_actions", "dispatch_epoch")
+    {
+        conn.execute(
+            "ALTER TABLE opencode_native_actions ADD COLUMN dispatch_epoch TEXT",
+            [],
+        )
+        .map_err(|e| format!("MIGRATE_OPENCODE_ACTION_EPOCH_FAIL: 补列失败: {e}"))?;
+    }
+
     Ok(())
 }
 
@@ -781,7 +828,7 @@ mod tests {
     #[test]
     fn async_active_store_fresh_schema_has_one_nullable_route_column() {
         let c = Connection::open_in_memory().unwrap();
-        crate::database::schema::init(&c);
+        let _ = crate::database::schema::init(&c);
         let columns: Vec<(String, String, i64, Option<String>)> = c
             .prepare("PRAGMA table_info(codex_actions)")
             .unwrap()
@@ -805,7 +852,7 @@ mod tests {
     #[test]
     fn async_active_store_legacy_migration_preserves_null_and_facts_idempotently() {
         let c = Connection::open_in_memory().unwrap();
-        crate::database::schema::init(&c);
+        let _ = crate::database::schema::init(&c);
         let exists: i64 = c.query_row("SELECT count(*) FROM pragma_table_info('codex_actions') WHERE name='async_answer_route'", [], |r| r.get(0)).unwrap();
         if exists != 0 {
             c.execute_batch("ALTER TABLE codex_actions DROP COLUMN async_answer_route")
@@ -949,7 +996,7 @@ mod tests {
     fn fresh_remote_devices_table_includes_fingerprint_and_via() {
         let conn = Connection::open_in_memory().unwrap();
         // 真机调用序：schema::init 建全部表 → migration::migrate 增量迁移
-        crate::database::schema::init(&conn);
+        crate::database::schema::init(&conn).unwrap();
         migrate(&conn).unwrap();
         let cols: Vec<String> = conn
             .prepare("PRAGMA table_info(remote_devices)")
@@ -1062,7 +1109,7 @@ mod tests {
     #[test]
     fn usage_tables_created_with_expected_columns() {
         let conn = Connection::open_in_memory().unwrap();
-        crate::database::schema::init(&conn);
+        crate::database::schema::init(&conn).unwrap();
         migrate(&conn).unwrap();
         migrate(&conn).unwrap(); // 幂等：跑两遍不报错
 
@@ -1199,7 +1246,7 @@ mod tests {
     #[test]
     fn usage_detail_unique_key_is_hourly() {
         let conn = Connection::open_in_memory().unwrap();
-        crate::database::schema::init(&conn);
+        crate::database::schema::init(&conn).unwrap();
         let ins = |hour: &str, project: &str| {
             conn.execute(
                 "INSERT INTO usage_detail
@@ -1242,7 +1289,7 @@ mod tests {
     #[test]
     fn migrate_rebuilds_preview_ledger_shape() {
         let conn = Connection::open_in_memory().unwrap();
-        crate::database::schema::init(&conn);
+        crate::database::schema::init(&conn).unwrap();
         // 造一个预览版形状（旧 DDL：无 project_key、user_est NOT NULL DEFAULT 0），并塞入残留数据
         conn.execute_batch(
             "DROP TABLE usage_detail;
@@ -1310,7 +1357,7 @@ mod tests {
     #[test]
     fn migrate_adds_missing_ledger_columns_without_data_loss() {
         let conn = Connection::open_in_memory().unwrap();
-        crate::database::schema::init(&conn);
+        crate::database::schema::init(&conn).unwrap();
         // 造「新形状但缺列」的老库：SQLite 3.35+ 支持 DROP COLUMN，但**被索引引用的列删不掉**
         // （day_key / project_key 都进了索引），故这里只删不进任何索引的列
         conn.execute_batch(
@@ -1420,7 +1467,7 @@ mod tests {
         }
 
         let conn = Connection::open_in_memory().unwrap();
-        crate::database::schema::init(&conn);
+        crate::database::schema::init(&conn).unwrap();
         // 模拟“当前形状的旧库”：用量四表已是新形状，但 billing/pricing/alias/override/
         // model-config 七张新表尚未出现。
         conn.execute_batch(
@@ -2050,7 +2097,7 @@ mod b1_hint_migration_tests {
             INSERT INTO codex_interaction_hints VALUES ('th','turn','item',0,'answered',1);",
         )
         .unwrap();
-        crate::database::schema::init(&conn);
+        let _ = crate::database::schema::init(&conn);
         migrate(&conn).unwrap();
         migrate(&conn).unwrap();
         for column in [
@@ -2170,7 +2217,7 @@ mod b1_hint_migration_tests {
         for shape in 0..3 {
             for fault in 1..=3 {
                 let conn = Connection::open_in_memory().unwrap();
-                crate::database::schema::init(&conn);
+                let _ = crate::database::schema::init(&conn);
                 conn.execute("INSERT INTO codex_interaction_hints VALUES ('th','turn','item',0,'answered',7)", []).unwrap();
                 if shape == 1 {
                     conn.execute_batch("CREATE TABLE codex_hint_writer_state (singleton INTEGER PRIMARY KEY CHECK(singleton=1), epoch INTEGER NOT NULL CHECK(epoch>=0)); INSERT INTO codex_hint_writer_state VALUES(1,7);").unwrap();
@@ -2217,7 +2264,7 @@ mod b1_hint_migration_tests {
     fn b1_fresh_database_uses_atomic_migration() {
         for fault in 1..=3 {
             let conn = Connection::open_in_memory().unwrap();
-            crate::database::schema::init(&conn);
+            let _ = crate::database::schema::init(&conn);
             let before = b1_shape(&conn);
             assert!(!table_exists(&conn, "codex_hint_writer_state"));
             assert!(!column_exists(

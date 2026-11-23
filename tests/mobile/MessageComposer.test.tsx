@@ -2,6 +2,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testi
 import { afterEach, afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import MessageComposer from "@/mobile/MessageComposer";
 import type { QueueItemView, SendInfo } from "@/mobile/api";
+import { OPENCODE_RESELECT_POST_TIMEOUT_MS } from "@/mobile/opencodeNativeApi";
 // T05：停止控制器（Harness 挂真实 hook——SessionDetail 持有单例的组件级等价）
 import { useCodexTurnControl } from "@/mobile/useCodexTurnControl";
 import type { ThreadProjection } from "@/mobile/codexIpcApi";
@@ -115,7 +116,21 @@ interface Routes {
   interruptErrorBody?: Record<string, unknown>;
   /** T05：interrupt 挂起不响应（定序/30 秒预算场景；releaseInterrupt 放行） */
   interruptHang?: boolean;
+  /** GET /opencode/view 载荷（评审 Blocker 1：候选路由挂面板后的首次投影） */
+  nativeView?: Record<string, unknown>;
+  /** POST /opencode/route/native 的应答码（评审 R-2：显式重新进入；缺省 200） */
+  routeNativeStatus?: number;
+  routeNativeBinding?: string;
+  routeNativeReject?: boolean;
+  routeNativeHang?: boolean;
+  routeNativeInProgress?: boolean;
+  routePreviewReject?: boolean;
+  /** send-info 的**序列**载荷（评审 R-2 多设备：首次给候选，重拉给退回态） */
+  infoQueue?: SendInfo[];
 }
+
+/** POST /opencode/route/native 的调用次数（评审 R-2：绝不能有隐式重新进入） */
+let routeNativeCalls = 0;
 
 let routes: Routes;
 let fetchMock: ReturnType<typeof vi.fn>;
@@ -130,6 +145,7 @@ let releaseInterrupt: ((r: Response) => void) | null = null;
 
 beforeEach(() => {
   routes = {};
+  routeNativeCalls = 0;
   releaseSend = null;
   releaseAttach = null;
   releaseQueue = null;
@@ -139,11 +155,24 @@ afterEach(() => {
   cleanup();
   vi.useRealTimers();
   vi.unstubAllGlobals();
+  vi.restoreAllMocks();
 });
 
 /** 按 URL 分路的 fetch stub（判序：长路径在前，避免前缀误吞） */
 function installFetch() {
-  fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+  const nativeRoute = "/m/api/v1/opencode/route/native";
+  let nativeRequestId: string | undefined;
+  const committedReceipt = (requestId: string) => ({
+    sessionId: "sess-1",
+    route: "opencode_native",
+    requestId,
+    state: "committed",
+    current: true,
+    bindingToken: routes.routeNativeBinding ?? "bind_1",
+    routeVersion: 1,
+    window: { pid: 123, startedAtMs: 123, boot: "boot" },
+  });
+  fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input);
     // §C5 带宽提示（装饰）：缺省 = 局域网直连不限速（不出横幅）；403/网络异常
     // 由 fetchChannel 内部静默降级为 null
@@ -178,7 +207,81 @@ function installFetch() {
     }
     if (url.includes("/session-send-info")) {
       if (routes.infoStatus) return new Response("no", { status: routes.infoStatus });
-      return new Response(JSON.stringify(routes.info ?? sendInfo()), { status: 200 });
+      const queued = routes.infoQueue?.shift();
+      return new Response(JSON.stringify(queued ?? routes.info ?? sendInfo()), { status: 200 });
+    }
+    if (url.includes("/opencode/route/preview?")) {
+      if (routes.routePreviewReject) throw new TypeError("preview network");
+      return new Response(
+        JSON.stringify({
+          sessionId: "sess-1",
+          candidate: {
+            sessionId: "sess-1",
+            directory: "/project",
+            serviceId: "service",
+            pid: 1,
+            startedAtMs: 1,
+            bindingToken: "bind_1",
+          },
+          previewToken: "preview-token",
+          expiresAtMs: 9999999999999,
+        }),
+        { status: 200 }
+      );
+    }
+    if (url.startsWith(`${nativeRoute}/status?`) && (init?.method ?? "GET") === "GET") {
+      const query = new URL(url, "http://localhost").searchParams;
+      if (
+        !nativeRequestId ||
+        query.get("requestId") !== nativeRequestId ||
+        query.get("sessionId") !== "sess-1"
+      ) {
+        return new Response(null, { status: 404 });
+      }
+      const receipt = routes.routeNativeInProgress
+        ? { sessionId: "sess-1", requestId: nativeRequestId, state: "in_progress" }
+        : committedReceipt(nativeRequestId);
+      return new Response(JSON.stringify(receipt));
+    }
+    // 评审 R-2：显式重新进入原生（只有用户点按钮才会打到这里）
+    if (url === nativeRoute && init?.method === "POST") {
+      const { candidateToken, requestId } = JSON.parse(String(init.body));
+      expect(candidateToken).toBe("preview-token");
+      routeNativeCalls += 1;
+      if (routes.routeNativeReject) throw new TypeError("route network");
+      if (routes.routeNativeStatus && routes.routeNativeStatus !== 200) {
+        return new Response(JSON.stringify({ error: "OC_ROUTE_CHANGED", reason: "旧队列未清" }), {
+          status: routes.routeNativeStatus,
+        });
+      }
+      nativeRequestId = requestId;
+      if (routes.routeNativeHang) {
+        return new Promise<Response>((_, reject) => {
+          init.signal?.addEventListener("abort", () => reject(init.signal?.reason), { once: true });
+        });
+      }
+      return new Response(JSON.stringify(committedReceipt(requestId)));
+    }
+    // 评审 Blocker 1：候选路由挂上面板后，面板的首次投影（认领动作）走这里
+    if (url.includes("/opencode/view")) {
+      return new Response(
+        JSON.stringify(
+          routes.nativeView ?? {
+            sessionId: "sess-1",
+            bindingToken: "bind_1",
+            revision: 1,
+            complete: true,
+            capabilities: {},
+            messages: [],
+            pending: [],
+            inbox: [],
+            runtimeState: "ready",
+            route: "legacy",
+            routeReasonCode: null,
+          }
+        ),
+        { status: 200 }
+      );
     }
     // 丁T3 接入②：卡片在场探针（两条 GET，判序在 /session-send 之前——长路径优先）
     if (url.includes("/session-approve-options")) {
@@ -2772,4 +2875,336 @@ it("parent-owned edit queue survives composer remount and acknowledges consumed 
   view.rerender(<MessageComposer key="sent" {...props()} />);
   expect(((await screen.findByTestId("composer-input")) as HTMLTextAreaElement).value).toBe("");
   expect(screen.queryByTestId("composer-edit-choice")).toBeNull();
+});
+// 评审 Blocker 1：候选路由必须有「挂面板 → 认领被拒 → 回旧输入区」的完整出口
+// ============================================================
+describe("评审 Blocker 1：候选路由的进入与退回", () => {
+  it("候选挂面板；视图返回 legacy 时立刻回旧输入区（原因一次），旧发送立即可用", async () => {
+    installFetch();
+    routes.info = sendInfo({
+      interactionRoute: "opencode_native",
+      interactionRouteCandidate: true,
+    });
+    routes.nativeView = {
+      sessionId: "sess-1",
+      bindingToken: "bind_1",
+      revision: 1,
+      complete: true,
+      capabilities: {},
+      messages: [],
+      pending: [],
+      inbox: [],
+      runtimeState: "ready",
+      route: "legacy",
+      routeReasonCode: "legacy_pending",
+    };
+    const onRoute = vi.fn();
+    render(<MessageComposer session={{ id: "sess-1" }} onInteractionRoute={onRoute} />);
+
+    // 候选必须真的挂上原生面板（这是唯一能触发认领的入口）
+    await screen.findByTestId("opencode-native-panel");
+    // 认领被拒：立刻回到旧输入区，并把原因说一次
+    const notice = await screen.findByTestId("native-route-fallback");
+    expect(notice.textContent).toContain("旧队列");
+    expect(screen.queryByTestId("opencode-native-panel")).toBeNull();
+
+    // 旧写入口本来就没被认领 → 旧发送必须立刻可用（不是 409 死区）
+    const input = (await screen.findByTestId("composer-input")) as HTMLTextAreaElement;
+    fireEvent.change(input, { target: { value: "退回后的旧消息" } });
+    fireEvent.click(screen.getByTestId("composer-send"));
+    expect(await screen.findByTestId("send-receipt-delivered")).toBeTruthy();
+    expect(sendCalls()).toHaveLength(1);
+
+    // 同页必须收到 legacy（否则旧写控件区仍被卸下）
+    await waitFor(() => expect(onRoute).toHaveBeenLastCalledWith("legacy"));
+  });
+
+  it("H05 小补丁④：认领被拒的门码退回提示用门码专属短语（不落通用句/机器串）", async () => {
+    installFetch();
+    routes.info = sendInfo({
+      interactionRoute: "opencode_native",
+      interactionRouteCandidate: true,
+    });
+    routes.nativeView = {
+      sessionId: "sess-1",
+      bindingToken: "bind_1",
+      revision: 1,
+      complete: true,
+      capabilities: {},
+      messages: [],
+      pending: [],
+      inbox: [],
+      runtimeState: "ready",
+      route: "legacy",
+      routeReasonCode: "OC_GATE_PROBE_TARGET",
+    };
+    render(<MessageComposer session={{ id: "sess-1" }} />);
+
+    const notice = await screen.findByTestId("native-route-fallback");
+    // 门码经 opencodeNativeApi 的 nativeErrorKey 单点映射 → 专属短语
+    expect(notice.textContent).toContain(i18n.t("mobile.openCodeNative.errors.gateProbeTarget"));
+    // 不落「当前无法进入原生交互」通用兜底句，机器串不上屏
+    expect(notice.textContent).not.toContain(
+      i18n.t("mobile.openCodeNative.route.declinedUnavailable")
+    );
+    expect(notice.textContent).not.toContain("OC_GATE_");
+  });
+
+  it("已显式退回（draining）不自动复活；只有点「重新进入」才打 route/native", async () => {
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    installFetch();
+    // 服务端三态：draining = 用户上次点过「交回旧路径」
+    routes.info = sendInfo({
+      interactionRoute: "legacy",
+      routeState: "draining",
+    });
+    render(<MessageComposer session={{ id: "sess-1" }} />);
+
+    // 关键：不得自动挂原生面板（挂上就会认领，等于把退回操作静默撤销）
+    const reenter = await screen.findByTestId("native-route-reenter");
+    expect(screen.queryByTestId("opencode-native-panel")).toBeNull();
+    expect(routeNativeCalls).toBe(0);
+    // 旧输入区照常可用
+    expect(await screen.findByTestId("composer-input")).toBeTruthy();
+    expect(reenter.textContent).toContain("重新进入原生交互");
+
+    // 用户显式点击 → 恰好一次 POST /opencode/route/native
+    fireEvent.click(screen.getByTestId("native-route-reenter-button"));
+    await waitFor(() => expect(routeNativeCalls).toBe(1));
+  });
+
+  it("刷新后重新进入先从 view 恢复绑定和版本，再预览确认并提交", async () => {
+    sessionStorage.clear();
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
+    installFetch();
+    routes.info = sendInfo({ interactionRoute: "legacy", routeState: "draining" });
+    routes.nativeView = {
+      sessionId: "sess-1",
+      bindingToken: "recovered-binding",
+      routeVersion: 17,
+      revision: 1,
+      complete: true,
+      capabilities: {},
+      messages: [],
+      pending: [],
+      inbox: [],
+      runtimeState: "ready",
+      route: "legacy",
+      routeReasonCode: "returned_to_legacy",
+    };
+    render(<MessageComposer session={{ id: "sess-1" }} />);
+    const button = await screen.findByTestId("native-route-reenter-button");
+    await act(async () => fireEvent.click(button));
+    expect(routeNativeCalls).toBe(1);
+    expect(button).toHaveTextContent(i18n.t("mobile.openCodeNative.route.reenter"));
+    const calls = fetchMock.mock.calls;
+    const viewIndex = calls.findIndex(([url]) => String(url).includes("/opencode/view"));
+    const previewIndex = calls.findIndex(([url]) =>
+      String(url).includes("/opencode/route/preview?")
+    );
+    const postIndex = calls.findIndex(
+      ([url, init]) => String(url).endsWith("/opencode/route/native") && init?.method === "POST"
+    );
+    expect(viewIndex).toBeGreaterThanOrEqual(0);
+    expect(previewIndex).toBeGreaterThan(viewIndex);
+    expect(postIndex).toBeGreaterThan(previewIndex);
+    expect(confirm).toHaveBeenCalledOnce();
+    expect(JSON.parse(String((calls[postIndex][1] as RequestInit).body))).toEqual({
+      sessionId: "sess-1",
+      bindingToken: "recovered-binding",
+      routeVersion: 17,
+      candidateToken: "preview-token",
+      requestId: expect.stringMatching(/\S/),
+    });
+  });
+
+  it("重新进入 POST 超时后只按原请求 ID 核对，直到收到已提交回执", async () => {
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
+    installFetch();
+    routes.info = sendInfo({ interactionRoute: "legacy", routeState: "draining" });
+    routes.routeNativeHang = true;
+    routes.routeNativeInProgress = true;
+    render(<MessageComposer session={{ id: "sess-1" }} />);
+    const button = await screen.findByTestId("native-route-reenter-button");
+
+    vi.useFakeTimers();
+    await act(async () => fireEvent.click(button));
+    const post = fetchMock.mock.calls.find(
+      ([url, init]) => String(url).endsWith("/opencode/route/native") && init?.method === "POST"
+    );
+    expect(post).toBeDefined();
+    const { requestId } = JSON.parse(String(post?.[1]?.body));
+    expect(requestId).toEqual(expect.stringMatching(/\S/));
+    const statusCalls = () =>
+      fetchMock.mock.calls.filter(([url]) =>
+        String(url).includes("/opencode/route/native/status?")
+      );
+    const statusUrl = `/m/api/v1/opencode/route/native/status?${new URLSearchParams({ sessionId: "sess-1", requestId })}`;
+    expect(statusCalls()).toHaveLength(0);
+    expect(button).toBeDisabled();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(OPENCODE_RESELECT_POST_TIMEOUT_MS);
+    });
+    expect(screen.getByTestId("native-route-reenter-unconfirmed")).toBeVisible();
+    expect(button).toHaveTextContent(i18n.t("mobile.openCodeNative.reselectCheckRequest"));
+    expect(statusCalls().map(([url, init]) => [url, init?.method ?? "GET"])).toEqual([
+      [statusUrl, "GET"],
+    ]);
+    expect(screen.getByTestId("composer-input")).toBeInTheDocument();
+
+    routes.routeNativeInProgress = false;
+    await act(async () => fireEvent.click(button));
+    expect(statusCalls().map(([url, init]) => [url, init?.method ?? "GET"])).toEqual([
+      [statusUrl, "GET"],
+      [statusUrl, "GET"],
+    ]);
+    expect(screen.queryByTestId("native-route-reenter-unconfirmed")).toBeNull();
+    expect(button).toHaveTextContent(i18n.t("mobile.openCodeNative.route.reenter"));
+    expect(routeNativeCalls).toBe(1);
+    expect(confirm).toHaveBeenCalledOnce();
+    expect(
+      fetchMock.mock.calls.filter(([url]) => String(url).includes("/opencode/route/preview?"))
+    ).toHaveLength(1);
+  });
+
+  it("预览后取消重新进入时展示目标且不提交", async () => {
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+    installFetch();
+    routes.info = sendInfo({ interactionRoute: "legacy", routeState: "draining" });
+    render(<MessageComposer session={{ id: "sess-1" }} />);
+    fireEvent.click(await screen.findByTestId("native-route-reenter-button"));
+    await waitFor(() => expect(confirm).toHaveBeenCalledOnce());
+    expect(confirm.mock.calls[0][0]).toEqual(expect.stringContaining("/project"));
+    expect(confirm.mock.calls[0][0]).toEqual(expect.stringContaining("service"));
+    expect(confirm.mock.calls[0][0]).toEqual(expect.stringContaining("1"));
+    await waitFor(() => expect(screen.getByTestId("native-route-reenter-button")).toBeEnabled());
+    expect(routeNativeCalls).toBe(0);
+    expect(screen.getByTestId("composer-input")).toBeInTheDocument();
+  });
+
+  it.each(["目标不符", "网络失败"] as const)("重新进入%s时提示未确认且不重发", async (kind) => {
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    installFetch();
+    routes.info = sendInfo({ interactionRoute: "legacy", routeState: "draining" });
+    if (kind === "目标不符") routes.routeNativeBinding = "bind_other";
+    else routes.routeNativeReject = true;
+    render(<MessageComposer session={{ id: "sess-1" }} />);
+    fireEvent.click(await screen.findByTestId("native-route-reenter-button"));
+    expect(
+      await screen.findByText(i18n.t("mobile.openCodeNative.route.reenterUnconfirmed"))
+    ).toBeVisible();
+    expect(routeNativeCalls).toBe(1);
+    expect(screen.getByTestId("composer-input")).toBeInTheDocument();
+    expect(screen.queryByTestId("opencode-native-panel")).toBeNull();
+  });
+
+  it("重新进入预览网络失败时提示失败且不提交", async () => {
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
+    installFetch();
+    routes.info = sendInfo({ interactionRoute: "legacy", routeState: "draining" });
+    routes.routePreviewReject = true;
+    render(<MessageComposer session={{ id: "sess-1" }} />);
+    fireEvent.click(await screen.findByTestId("native-route-reenter-button"));
+    expect(await screen.findByTestId("native-route-reenter-failed")).toBeVisible();
+    expect(confirm).not.toHaveBeenCalled();
+    expect(routeNativeCalls).toBe(0);
+  });
+
+  it("另一台设备交回后：本端如实说「已被交回」并给出重入口", async () => {
+    installFetch();
+    // 首次 send-info：仍是候选（本端不知道已被交回）；点开面板后被拒，重拉变 draining
+    routes.infoQueue = [
+      sendInfo({ interactionRoute: "opencode_native", interactionRouteCandidate: true }),
+      sendInfo({ interactionRoute: "legacy", routeState: "draining" }),
+    ];
+    routes.nativeView = {
+      sessionId: "sess-1",
+      bindingToken: "bind_1",
+      revision: 1,
+      complete: true,
+      capabilities: {},
+      messages: [],
+      pending: [],
+      inbox: [],
+      runtimeState: "ready",
+      route: "legacy",
+      routeReasonCode: "returned_to_legacy",
+    };
+    render(<MessageComposer session={{ id: "sess-1" }} />);
+
+    // 被拒原因必须是「已交回旧路径」，不是「当前无法进入原生交互」
+    const notice = await screen.findByTestId("native-route-fallback");
+    expect(notice.textContent).toContain("交回旧路径");
+    expect(notice.textContent).not.toContain("当前无法进入原生交互");
+    // 重拉后进入退回态：重入口必须出现（否则该设备上没有回到原生的路）
+    expect(await screen.findByTestId("native-route-reenter")).toBeTruthy();
+    expect(screen.queryByTestId("opencode-native-panel")).toBeNull();
+    expect(routeNativeCalls).toBe(0);
+  });
+
+  it("B1 归属未证时保留原生只读面板，禁用写入且不回旧路径", async () => {
+    installFetch();
+    routes.info = sendInfo({
+      interactionRoute: "opencode_native",
+      interactionRouteCandidate: true,
+    });
+    routes.nativeView = {
+      sessionId: "sess-1",
+      bindingToken: "bind_1",
+      revision: 1,
+      complete: true,
+      capabilities: {
+        send: { allowed: false, evidence: "", reasonCode: "OC_INSTANCE_OWNERSHIP_UNVERIFIED" },
+      },
+      messages: [],
+      pending: [],
+      inbox: [],
+      runtimeState: "ready",
+      route: "legacy",
+      routeReasonCode: "OC_INSTANCE_OWNERSHIP_UNVERIFIED",
+    };
+    render(<MessageComposer session={{ id: "sess-1" }} />);
+
+    const gate = await screen.findByTestId("native-binding-gate");
+    expect(gate.textContent).toContain("尚无法验证此终端与原生服务属于同一实例");
+    expect(gate.textContent).toContain("本会话当前仅供只读查看");
+    expect(screen.getByTestId("opencode-native-panel")).toBeTruthy();
+    expect(screen.getByTestId("native-messages-toggle")).toBeTruthy();
+    fireEvent.change(screen.getByTestId("native-input"), { target: { value: "待发送草稿" } });
+    expect(screen.getByTestId("native-send")).toBeDisabled();
+    expect(screen.queryByTestId("native-route-fallback")).toBeNull();
+    expect(screen.queryByTestId("composer-input")).toBeNull();
+    expect(screen.queryByTestId("composer-send")).toBeNull();
+    expect(sendCalls()).toHaveLength(0);
+  });
+
+  it("重新进入被拒时留在旧输入区并说明原因（服务端零变更）", async () => {
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    installFetch();
+    routes.info = sendInfo({ interactionRoute: "legacy", routeState: "draining" });
+    routes.routeNativeStatus = 409;
+    render(<MessageComposer session={{ id: "sess-1" }} />);
+
+    fireEvent.click(await screen.findByTestId("native-route-reenter-button"));
+    const failed = await screen.findByTestId("native-route-reenter-failed");
+    expect(failed.textContent).toContain("重新进入失败");
+    // 仍不挂面板、仍可用旧输入区
+    expect(screen.queryByTestId("opencode-native-panel")).toBeNull();
+    expect(screen.getByTestId("composer-input")).toBeTruthy();
+  });
+});
+
+describe("OpenCode 原生默认入口", () => {
+  it("send-info 失败时展示原生连接状态且不探测旧交互", async () => {
+    installFetch();
+    routes.infoStatus = 500;
+    render(<MessageComposer session={{ id: "sess-1", agentType: "opencode" }} />);
+    expect(await screen.findByTestId("opencode-native-panel")).toBeTruthy();
+    expect(screen.queryByTestId("composer-input")).toBeNull();
+    const probes = fetchMock.mock.calls.filter(([u]) =>
+      /session-approve-options|session-question/.test(String(u))
+    );
+    expect(probes).toHaveLength(0);
+  });
 });

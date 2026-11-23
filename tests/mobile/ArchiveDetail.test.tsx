@@ -105,10 +105,68 @@ describe("ArchiveDetail：归档详情与激活", () => {
   it("failed 回执 → 错误文案上屏、不回调（可重试）", async () => {
     const activated = vi.fn();
     installFetch({ sessionOpen: { status: "failed", error: "终端启动失败（模拟）" } });
-    render(<ArchiveDetail session={card} onBack={() => {}} onActivated={() => {}} />);
+    render(<ArchiveDetail session={card} onBack={() => {}} onActivated={activated} />);
     fireEvent.click(screen.getByTestId("session-open"));
     expect(await screen.findByTestId("session-open-error")).toBeTruthy();
     expect(activated).not.toHaveBeenCalled();
+  });
+
+  // ==== F4 项 4A：pending 待确认态（回执=真实窗口观察，不冒充成功）====
+
+  it("pending 回执 → 按钮态转待确认 + 提示行，不回调 onActivated（不假成功）", async () => {
+    const activated = vi.fn();
+    installFetch({
+      sessionOpen: { status: "pending", code: "OC_RESTORE_PENDING" },
+    });
+    render(<ArchiveDetail session={card} onBack={() => {}} onActivated={activated} />);
+    fireEvent.click(screen.getByTestId("session-open"));
+    // 按钮态随 pending：文案切换为待确认（不再显示「正在打开终端…」这类成功态）
+    expect(await screen.findByTestId("session-open")).toBeTruthy();
+    expect(screen.getByTestId("session-open").textContent).toBe("恢复待确认…");
+    // 提示行（人工核对指引）在场
+    expect(screen.getByTestId("session-open-pending-hint").textContent).toContain("不会重复开窗");
+    // pending 不是成功：乐观回看板不触发
+    expect(activated).not.toHaveBeenCalled();
+  });
+
+  it("pending 态下放弃入口 → POST 携 abandon:true → abandoned 回执解除 pending", async () => {
+    const calls: Array<Record<string, unknown>> = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        if (url.includes("/session-open")) {
+          const body = JSON.parse((init?.body as string) ?? "{}");
+          calls.push(body);
+          // 第一次请求 → pending；带 abandon 的请求 → abandoned
+          return new Response(
+            JSON.stringify(
+              body.abandon
+                ? { status: "abandoned" }
+                : { status: "pending", code: "OC_RESTORE_PENDING" }
+            ),
+            { status: 200, headers: { "content-type": "application/json" } }
+          );
+        }
+        if (url.includes("/session-messages")) {
+          return new Response(JSON.stringify(DEFAULT_PAGE), {
+            headers: { "content-type": "application/json" },
+          });
+        }
+        return new Response("{}", { status: 404 });
+      })
+    );
+    render(<ArchiveDetail session={card} onBack={() => {}} onActivated={() => {}} />);
+    fireEvent.click(screen.getByTestId("session-open"));
+    await screen.findByTestId("session-open-pending-hint");
+    // 放弃入口在 pending 态在场
+    fireEvent.click(screen.getByTestId("session-abandon"));
+    // pending 解除：按钮回到「在桌面端打开」，提示行消失
+    await waitFor(() =>
+      expect(screen.getByTestId("session-open").textContent).toBe("在桌面端打开")
+    );
+    expect(screen.queryByTestId("session-open-pending-hint")).toBeNull();
+    expect(calls[1]?.abandon).toBe(true);
   });
 
   it("打开失败哨兵分诊：no_session（404 载荷）→ 归档不存在文案", async () => {

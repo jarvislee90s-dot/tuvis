@@ -10240,7 +10240,7 @@ mod dispatch_tests {
         use crate::remote::codex_ipc::StoreProbeLedger;
         use crate::remote::pairing::DeviceStore;
         let conn = rusqlite::Connection::open_in_memory().unwrap();
-        crate::database::schema::init(&conn);
+        let _ = crate::database::schema::init(&conn);
         crate::database::migration::migrate(&conn).unwrap();
         let db = Arc::new(std::sync::Mutex::new(conn));
         let adapter = DesktopIpcAdapter::new(
@@ -10448,7 +10448,7 @@ mod dispatch_tests {
             }
         }
         let conn = rusqlite::Connection::open_in_memory().unwrap();
-        crate::database::schema::init(&conn);
+        let _ = crate::database::schema::init(&conn);
         crate::database::migration::migrate(&conn).unwrap();
         let db = Arc::new(std::sync::Mutex::new(conn));
         let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
@@ -10524,7 +10524,7 @@ mod dispatch_tests {
             .is_none());
         {
             let conn = db.lock().unwrap();
-            crate::database::schema::init(&conn);
+            let _ = crate::database::schema::init(&conn);
             crate::database::migration::migrate(&conn).unwrap();
         }
         assert_eq!(
@@ -12941,7 +12941,7 @@ mod pr202_hint_init_tests {
         use crate::remote::codex_evidence::StoreInteractionHints;
         use crate::remote::pairing::DeviceStore;
         let conn = rusqlite::Connection::open_in_memory().unwrap();
-        crate::database::schema::init(&conn);
+        let _ = crate::database::schema::init(&conn);
         crate::database::migration::migrate(&conn).unwrap();
         let store = Arc::new(StoreInteractionHints::new(DeviceStore::Owned(Arc::new(
             std::sync::Mutex::new(conn),
@@ -13691,7 +13691,7 @@ mod b1_transition_forwarder_tests {
         let writer = rusqlite::Connection::open(&path).unwrap();
         writer.execute_batch("PRAGMA journal_mode=DELETE").unwrap();
         writer.busy_timeout(Duration::from_secs(20)).unwrap();
-        crate::database::schema::init(&writer);
+        let _ = crate::database::schema::init(&writer);
         crate::database::migration::migrate(&writer).unwrap();
         let epoch =
             crate::database::dao::codex_interactions::next_hint_epoch_conn(&writer).unwrap();
@@ -14140,7 +14140,7 @@ mod b1_a22_contract_tests {
         let path = dir.path().join("a22-isolated.sqlite");
         let conn = rusqlite::Connection::open(&path).unwrap();
         conn.execute_batch("PRAGMA journal_mode=DELETE").unwrap();
-        crate::database::schema::init(&conn);
+        let _ = crate::database::schema::init(&conn);
         crate::database::migration::migrate(&conn).unwrap();
         (dir, Arc::new(std::sync::Mutex::new(conn)))
     }
@@ -15213,7 +15213,7 @@ mod b1_t101_handoff_tests {
         let path = dir.path().join("a4-handoff.sqlite");
         let conn = rusqlite::Connection::open(&path).unwrap();
         conn.execute_batch("PRAGMA journal_mode=DELETE").unwrap();
-        crate::database::schema::init(&conn);
+        let _ = crate::database::schema::init(&conn);
         crate::database::migration::migrate(&conn).unwrap();
         let conn = Arc::new(std::sync::Mutex::new(conn));
         let store = Arc::new(crate::remote::codex_evidence::StoreInteractionHints::new(

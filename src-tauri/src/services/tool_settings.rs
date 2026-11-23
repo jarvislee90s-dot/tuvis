@@ -681,8 +681,8 @@ mod ensure_guard_tests {
     #[test]
     fn ensure_tool_enabled_conn_blocks_disabled_tool() {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
-        crate::database::schema::init(&conn);
-        agent_tool::ensure_tool_rows_conn(&conn);
+        crate::database::schema::init(&conn).unwrap();
+        let _ = agent_tool::ensure_tool_rows_conn(&conn);
         agent_tool::set_tool_enabled_conn(&conn, "opencode", false);
         let err = ensure_tool_enabled_conn(&conn, "opencode").unwrap_err();
         assert_eq!(

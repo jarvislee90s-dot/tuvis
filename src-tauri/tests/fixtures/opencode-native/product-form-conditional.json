@@ -1,0 +1,30 @@
+{
+  "data": {
+    "id": "frm_198274425001G0xMNarnHvMj8u",
+    "sessionID": "ses_e67d8bc13ffeCsOt9aoplX2fkH",
+    "title": "T3 conditional",
+    "fields": [
+      {
+        "key": "q0",
+        "title": "CHOICE",
+        "required": true,
+        "type": "string"
+      },
+      {
+        "key": "q1",
+        "required": true,
+        "when": [
+          {
+            "key": "q0",
+            "op": "eq",
+            "value": "yes"
+          }
+        ],
+        "type": "string"
+      }
+    ],
+    "state": {
+      "status": "pending"
+    }
+  }
+}

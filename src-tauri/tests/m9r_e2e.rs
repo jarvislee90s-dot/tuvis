@@ -1123,6 +1123,14 @@ async fn e2e_http_full_chain() {
 
         codex_control: multi_agents_manager_lib::remote::codex_ipc::CodexControlHub::disabled_arc(),
         desktop_language: Default::default(),
+        // 任务 8：OpenCode 原生交互中枢——禁用默认（惰性容器零 IO；本 E2E 不触原生
+        // 路由，业务断言不变）。本文件 #![cfg(windows)]——macOS 上编译为空，漏补会在
+        // Windows 测试构建上 E0063 missing fields
+        opencode_native: Arc::new(
+            multi_agents_manager_lib::services::opencode_native::NativeHub::new(
+                DeviceStore::memory(),
+            ),
+        ),
     });
 
     // 配对设备（server.rs 既有 persist_named_device 先例）：cookie 直指内存库设备行

@@ -60,6 +60,7 @@ import { NamedDomainWizard } from "@/components/settings/NamedDomainWizard";
 import { ChannelQr } from "@/components/settings/ChannelQr";
 import { ProcessHint } from "@/components/settings/ProcessHint";
 // S5：Codex 自动适配卡（开关 + 状态详情 + 首次一次轻提示 + 报告入口）
+import { OpenCodeNativeSection } from "./OpenCodeNativeSection";
 import { CodexAdaptSection } from "@/components/settings/CodexAdaptSection";
 import { ToolConfigCard } from "@/components/settings/ToolConfigCard";
 import { ToolRemoteSettingsSection } from "@/components/settings/ToolRemoteSettingsSection";
@@ -1328,7 +1329,7 @@ export function RemoteSection() {
             )}
           </div>
 
-          {/* ③ 工具特殊配置（Codex APP / ZCode 各一张折叠卡，默认收起） */}
+          {/* ③ 工具特殊配置（Codex APP / ZCode / OpenCode） */}
           <h3 data-group="tools" className={`${SETTINGS_SECTION_TITLE} mt-4`}>
             {t("settings.remote.groupTools")}
           </h3>
@@ -1342,6 +1343,7 @@ export function RemoteSection() {
             />
           </ToolConfigCard>
           <ToolRemoteSettingsSection />
+          <OpenCodeNativeSection />
           {/* ④ 访问与安全 */}
           <h3 data-group="security" className={`${SETTINGS_SECTION_TITLE} mt-4`}>
             {t("settings.remote.groupSecurity")}

@@ -913,6 +913,46 @@ pub async fn dismiss_session_cards(
 /// （audit_write 需设备身份，审计口径 = 远端设备动作留痕，见 inject::resume 模块注释）。
 /// 评审 M3：快照读取 + 核心并进同一 spawn_blocking——核心内 `where wt` 首调探测是
 /// 同步进程等待，留在闭包里不占 tokio worker（冷启动兜底扫描同样不进主线程）。
+/// F4 项 4A：恢复流转 → 桌面命令结果映射（纯函数可测）。桌面命令无 pending
+/// 状态面板：待确认/被拒都以可读 Err 承载（前端 toast 直展），语义与移动端
+/// pending 回执同源（同一状态机，不同 surface）。
+fn map_restore_flow_to_result(
+    flow: Result<crate::inject::restore_pending::RestoreFlow, String>,
+) -> Result<(), String> {
+    match flow {
+        Ok(crate::inject::restore_pending::RestoreFlow::Dispatched { confirmed: true })
+        | Ok(crate::inject::restore_pending::RestoreFlow::PendingConfirmed) => Ok(()),
+        Ok(crate::inject::restore_pending::RestoreFlow::Dispatched { confirmed: false }) => Err(
+            "RESTORE_PENDING: 恢复已出手但窗口观察未核实（待确认态）——请人工核对主机终端；确认前不会重复开窗"
+                .to_string(),
+        ),
+        Ok(crate::inject::restore_pending::RestoreFlow::PendingRefused) => Err(
+            "RESTORE_PENDING: 恢复待确认中（上次请求未核实）——请人工核对主机终端；确认前不会重复开窗"
+                .to_string(),
+        ),
+        Ok(crate::inject::restore_pending::RestoreFlow::Abandoned) => Ok(()),
+        // IC fix round 1（P1-B）：起窗权在途（准备/交付仍在执行）——放弃暂缓，
+        // 占位保持（诚实回执：交付进行中无法放弃，请等待核对；执行收口后放弃
+        // 走 Abandoned 既有语义）
+        Ok(crate::inject::restore_pending::RestoreFlow::AbandonDeferred) => Err(
+            "RESTORE_DELIVERY_IN_FLIGHT: 恢复交付进行中，暂无法放弃（起窗权在途，占位保持）\
+             ——请等待窗口核对完成后再试"
+                .to_string(),
+        ),
+        Err(e) => Err(e),
+    }
+}
+
+/// R5 一键 resume（桌面卡「在电脑上打开」）：按 session_id 在当前快照里找会话，
+/// 交 inject::restore_pending 状态机开终端恢复（Windows wt/conhost、macOS
+/// iTerm2/Terminal；F4 项 4A 起 opencode 回执=真实窗口观察——pending 待确认态，
+/// 未核实不冒充成功）。数据同源：动作路径经扫描总线的 ensure_fresh 取新鲜快照
+/// （龄超 2s 则补扫并等待，上限 3s；超时按现有快照降级继续），与看板同一份数据；
+/// id 跨工具撞名取第一个匹配（远端 session-open 端点同口径）。命令表未收录的
+/// 工具 / 无 cwd 由核心返回哨兵串，转译为前端可展示的中文文案；本机路径不写审计
+/// （audit_write 需设备身份，审计口径 = 远端设备动作留痕，见 inject::resume 模块注释）。
+/// 评审 M3：快照读取 + 核心并进同一 spawn_blocking——核心内 `where wt` 首调探测是
+/// 同步进程等待，留在闭包里不占 tokio worker（冷启动兜底扫描同样不进主线程）。
 #[tauri::command]
 pub async fn session_open(app: tauri::AppHandle, session_id: String) -> Result<(), String> {
     let sid = session_id.trim().to_string();
@@ -939,7 +979,12 @@ pub async fn session_open(app: tauri::AppHandle, session_id: String) -> Result<(
         let home = dirs::home_dir();
         let trust_prompt =
             crate::inject::resume::normalize_cwd_for_trust(&mut session, home.as_deref());
-        let r = crate::inject::resume::open_session_terminal(&session);
+        let flow = crate::inject::restore_pending::open_restore_with_pending(
+            &session,
+            &crate::inject::resume::spawn_terminal,
+            false,
+        );
+        let r = map_restore_flow_to_result(flow);
         if trust_prompt && r.is_ok() {
             log::warn!(
                 "一键打开未信任预检（session={}）：{}",
@@ -962,12 +1007,34 @@ pub async fn session_open(app: tauri::AppHandle, session_id: String) -> Result<(
     })
     .await
     .map_err(|e| format!("SESSION_SCAN_FAIL: 会话扫描任务异常: {e}"))?
-    .map_err(|e| match e.as_str() {
-        // 哨兵串转译（前端 toast 直展；与移动端禁用原因文案同义）
-        "no_resume_command" => "该工具 resume 命令待查证，暂不支持一键打开".to_string(),
-        "no_cwd" => "该会话没有项目目录信息，无法在电脑上打开".to_string(),
-        other => other.to_string(),
-    })
+    .map_err(|e| translate_restore_error(&e))
+}
+
+/// 一键恢复错误 → 桌面 toast 文案转译（session_open 专用；GB fix round 1 从命令
+/// 内联 match fn 化可测——GR1 GB-1：G2 三核对哨兵以**带前缀形态**
+/// `"哨兵: 中文…"` 产出，旧裸哨兵 `==` 转译臂恒 miss = 死码，toast 直展带前缀
+/// 原文）。哨兵（裸码或带前缀）→ 可读中文；其余原文透传。
+pub(crate) fn translate_restore_error(e: &str) -> String {
+    // 旧裸哨兵（既有契约面，精确等值保持）
+    match e {
+        "no_resume_command" => return "该工具 resume 命令待查证，暂不支持一键打开".to_string(),
+        "no_cwd" => return "该会话没有项目目录信息，无法在电脑上打开".to_string(),
+        _ => {}
+    }
+    // G2 起窗前三核对哨兵（前缀形态识别，零起窗零 pending，toast 直展中文文案）
+    match crate::inject::resume::resume_validation_error_code(e) {
+        Some(code) if code == crate::inject::resume::OC_RESUME_ENDPOINT_NOT_LOOPBACK => {
+            "恢复登记端点非回环（只允许连接本机 serve），已拒绝打开".to_string()
+        }
+        Some(code) if code == crate::inject::resume::OC_RESUME_REGISTRATION_UNVERIFIED => {
+            "恢复登记进程已不在运行（旧代际登记残迹），已拒绝打开；请重启 opencode 服务后重试"
+                .to_string()
+        }
+        Some(code) if code == crate::inject::resume::OC_RESUME_DIRECTORY_UNRESOLVED => {
+            "目标会话目录不存在或不可解析，已拒绝打开".to_string()
+        }
+        _ => e.to_string(),
+    }
 }
 
 /// 从进程快照收集运行会话的 (工具id, 项目目录名)——仅进程扫描，无文件解析开销
@@ -1004,10 +1071,16 @@ pub(crate) fn running_projects_from_processes(system: &sysinfo::System) -> Vec<(
 pub fn kill_pid(pid: u32) -> Result<(), String> {
     use sysinfo::{Pid, Signal};
     if let Some(process) = sysinfo::System::new_all().process(Pid::from_u32(pid)) {
-        if process.kill_with(Signal::Term).is_none() {
-            process.kill();
+        if process
+            .kill_with(Signal::Term)
+            .unwrap_or_else(|| process.kill())
+        {
+            Ok(())
+        } else {
+            Err(format!(
+                "SESSION_TERMINATION_FAILED:{pid}: 无法终止进程 {pid}"
+            ))
         }
-        Ok(())
     } else {
         Err(format!("SESSION_PID_GONE:{pid}: 进程 {} 不存在", pid))
     }
@@ -1180,5 +1253,138 @@ mod marker_literal_tests {
                 .collect::<String>()
         );
         assert_eq!(marker, "TUVIS:01a080835ca0");
+    }
+}
+
+#[cfg(test)]
+mod f4_restore_pending_mapping_tests {
+    use super::map_restore_flow_to_result;
+    use crate::inject::restore_pending::RestoreFlow;
+
+    /// F4 项 4A 桌面面：pending 未核销（观察未核实）不得冒充成功——待确认态以
+    /// 可读 Err 承载（RESTORE_PENDING 前缀 + 人工核对指引），与移动端 pending
+    /// 回执同一状态机产物。
+    #[test]
+    fn pending_unsettled_maps_to_readable_error_not_ok() {
+        let r = map_restore_flow_to_result(Ok(RestoreFlow::Dispatched { confirmed: false }))
+            .unwrap_err();
+        assert!(
+            r.starts_with("RESTORE_PENDING:") && r.contains("人工核对"),
+            "待确认必须显性化（不假成功）：{r}"
+        );
+        let r2 = map_restore_flow_to_result(Ok(RestoreFlow::PendingRefused)).unwrap_err();
+        assert!(
+            r2.starts_with("RESTORE_PENDING:") && r2.contains("不会重复开窗"),
+            "复请求被拒同形（不重复开窗语义在文案）：{r2}"
+        );
+    }
+
+    /// 确认面（出手后观察确认 / 复查核销）与放弃面 → Ok（零行为变更面）。
+    #[test]
+    fn confirmed_and_abandoned_map_to_ok() {
+        for flow in [
+            RestoreFlow::Dispatched { confirmed: true },
+            RestoreFlow::PendingConfirmed,
+            RestoreFlow::Abandoned,
+        ] {
+            assert!(
+                map_restore_flow_to_result(Ok(flow.clone())).is_ok(),
+                "确认/核销/放弃必须是 Ok：{flow:?}"
+            );
+        }
+        // 出手失败原样透传（哨兵串转译在命令层既有臂）
+        let e = map_restore_flow_to_result(Err("no_cwd".to_string())).unwrap_err();
+        assert_eq!(e, "no_cwd");
+    }
+
+    /// IC fix round 1（P1-B）桌面面：起窗权在途（准备/交付仍在执行）时放弃被
+    /// 暂缓——不得 Ok（放弃未发生，不冒充成功），以 RESTORE_DELIVERY_IN_FLIGHT
+    /// 前缀 + 等待核对指引诚实承载。
+    #[test]
+    fn abandon_deferred_maps_to_honest_deferred_error() {
+        let r = map_restore_flow_to_result(Ok(RestoreFlow::AbandonDeferred)).unwrap_err();
+        assert!(
+            r.starts_with("RESTORE_DELIVERY_IN_FLIGHT:") && r.contains("等待"),
+            "放弃暂缓必须显性化（不假成功不假放弃）：{r}"
+        );
+    }
+}
+
+/// GB fix round 1（GR1 GB-1）：G2 三核对哨兵的桌面 toast 转译臂测试——哨兵以
+/// **带前缀形态** `"哨兵: 中文…"` 产出，旧裸哨兵 `==` 转译臂恒 miss（死码），
+/// toast 直展带前缀原文。断言恢复：三种带前缀形态（+ 裸码防御形态）→ 申报文案；
+/// 非哨兵失败原文透传。
+/// （GE 重冻结补 `#[cfg(test)]`：fix1 遗漏模块门导致测试体编译进生产 lib
+/// （clippy unused-imports 活体）——补门零行为变化，测试仍随 `cargo test` 运行。）
+#[cfg(test)]
+mod g2_restore_error_translation_tests {
+    use super::translate_restore_error;
+    use crate::inject::resume::{
+        OC_RESUME_DIRECTORY_UNRESOLVED, OC_RESUME_ENDPOINT_NOT_LOOPBACK,
+        OC_RESUME_REGISTRATION_UNVERIFIED,
+    };
+
+    /// 三种带前缀形态 → 各自申报文案（GR1 指出的死码臂逐臂锁定）。
+    #[test]
+    fn prefixed_g2_sentinels_translate_to_declared_toasts() {
+        let endpoint_prefixed = format!(
+            "{OC_RESUME_ENDPOINT_NOT_LOOPBACK}: 登记端点非回环（http://192.168.1.10:49374），拒绝起窗"
+        );
+        assert_eq!(
+            translate_restore_error(&endpoint_prefixed),
+            "恢复登记端点非回环（只允许连接本机 serve），已拒绝打开",
+            "带前缀形态必须命中转译臂（修复前恒 miss 直展原文）"
+        );
+        let registration_prefixed = format!(
+            "{OC_RESUME_REGISTRATION_UNVERIFIED}: 登记进程（pid 99）已不在运行或启动事实不可读——登记为旧代际残迹，拒绝起窗；请重启 opencode 服务后重试"
+        );
+        assert_eq!(
+            translate_restore_error(&registration_prefixed),
+            "恢复登记进程已不在运行（旧代际登记残迹），已拒绝打开；请重启 opencode 服务后重试"
+        );
+        let directory_prefixed = format!(
+            "{OC_RESUME_DIRECTORY_UNRESOLVED}: 目标会话目录不可解析（/tmp/gone），拒绝起窗"
+        );
+        assert_eq!(
+            translate_restore_error(&directory_prefixed),
+            "目标会话目录不存在或不可解析，已拒绝打开"
+        );
+    }
+
+    /// 裸码形态同样命中（防御：上游若回退裸码产出不致再死码）；旧裸哨兵既有
+    /// 转译保持。
+    #[test]
+    fn bare_g2_codes_and_legacy_sentinels_still_translate() {
+        assert_eq!(
+            translate_restore_error(OC_RESUME_ENDPOINT_NOT_LOOPBACK),
+            "恢复登记端点非回环（只允许连接本机 serve），已拒绝打开"
+        );
+        assert_eq!(
+            translate_restore_error(OC_RESUME_REGISTRATION_UNVERIFIED),
+            "恢复登记进程已不在运行（旧代际登记残迹），已拒绝打开；请重启 opencode 服务后重试"
+        );
+        assert_eq!(
+            translate_restore_error(OC_RESUME_DIRECTORY_UNRESOLVED),
+            "目标会话目录不存在或不可解析，已拒绝打开"
+        );
+        assert_eq!(
+            translate_restore_error("no_resume_command"),
+            "该工具 resume 命令待查证，暂不支持一键打开"
+        );
+        assert_eq!(
+            translate_restore_error("no_cwd"),
+            "该会话没有项目目录信息，无法在电脑上打开"
+        );
+    }
+
+    /// 非哨兵失败（出手后错误）原文透传——不得被误吞。
+    #[test]
+    fn non_sentinel_failures_pass_through_unchanged() {
+        let raw = "RESUME_ALL_CHANNELS_FAIL: 全部 resume 通道失败：Terminal.app: osascript 失败";
+        assert_eq!(translate_restore_error(raw), raw);
+        assert_eq!(
+            translate_restore_error("osascript 执行失败（退出码 1）"),
+            "osascript 执行失败（退出码 1）"
+        );
     }
 }

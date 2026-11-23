@@ -218,6 +218,16 @@ export function useMessageRenderers({
               {renderLinkifiedText(m.content)}
             </div>
           );
+        // 2026-11-22 任务 A：OpenCode 的 synthetic 系统提醒（切 agent 时注入的
+        // Plan mode 等提示）。后端已剥掉 `<system-reminder>` 标签、默认 collapsed；
+        // 这里用弱化样式呈现提醒原文——**不走** assistant 气泡 / markdown 排版，
+        // 它不是模型的正式回答。
+        case "system-note":
+          return (
+            <div className="text-xs break-words whitespace-pre-wrap text-[var(--mut)]">
+              {m.content}
+            </div>
+          );
         case "tool-result":
           return (
             <pre className="overflow-x-auto rounded-lg border border-[var(--cb)] bg-[var(--cbg)] p-2 text-xs break-words whitespace-pre-wrap text-[var(--tx)]">

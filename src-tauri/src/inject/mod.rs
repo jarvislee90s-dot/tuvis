@@ -45,6 +45,8 @@ pub mod question;
 pub mod queue;
 // R5 一键 resume 窗口（M6R–M9R Task 11）：命令表 + 终端 spawn 核心（spawner 缝）
 pub mod resume;
+// B1 一键恢复 pending 状态机（F4 项 4A）：回执=真实窗口观察，待确认态零重复开窗
+pub mod restore_pending;
 pub mod routing;
 // 注入时序常量族（**单一事实源**，D20 / 计划 §2.9）：注入后屏读轮询的步长与各阶段
 // 总窗 + 文本分块/提交延迟；模块文档含 D20 三条规则与 (c) 例外、以及每条自裁值

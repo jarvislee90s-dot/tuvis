@@ -1,0 +1,13 @@
+{
+  "x-evidence": {
+    "run_id": "20261029-233614",
+    "source": "docs/engineering/evidence/opencode-native/followup/fixtures/g1.binding.json",
+    "note": "GET /api/info 响应形态；paths.tmp 已脱敏为占位路径，无凭据、无认证头"
+  },
+  "version": "2.0.22",
+  "pid": 60541,
+  "urls": ["http://127.0.0.1:49617"],
+  "paths": {
+    "tmp": "/private/tmp/<run>/tmp/opencode"
+  }
+}

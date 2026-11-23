@@ -2130,6 +2130,30 @@ describe("RemoteSection Codex 自动适配（S5 换装）", () => {
     expect(state.textContent).not.toMatch(/settings\.remote\./);
     expect(state.textContent).not.toMatch(/codexAdapt[A-Z]/);
   });
+  it("工具组按 Codex APP → ZCode → OpenCode 的顺序渲染", async () => {
+    installAdaptInvoke();
+    const { container } = render(<RemoteSection />);
+    await screen.findByTestId("opencode-native-details-toggle");
+
+    const markers = container.querySelectorAll(
+      '[data-group="tools"], [data-testid="tool-config-header-codex"], ' +
+        '[data-testid="zcode-card-header"], [data-testid="opencode-native-details-toggle"], ' +
+        '[data-group="security"]'
+    );
+    expect(
+      Array.from(
+        markers,
+        (node) => node.getAttribute("data-group") ?? node.getAttribute("data-testid")
+      )
+    ).toEqual([
+      "tools",
+      "tool-config-header-codex",
+      "zcode-card-header",
+      "opencode-native-details-toggle",
+      "security",
+    ]);
+  });
+
   it("分区顺序 1→2→3→4，工具卡默认折叠且点击才展开", async () => {
     installAdaptInvoke();
     const { container } = render(<RemoteSection />);
@@ -2147,7 +2171,11 @@ describe("RemoteSection Codex 自动适配（S5 换装）", () => {
     expect(numbered).toEqual([true, true, true, true]);
 
     const cards = [...container.querySelectorAll("[data-tool-card]")];
-    expect(cards.map((card) => card.getAttribute("data-tool-card"))).toEqual(["codex", "zcode"]);
+    expect(cards.map((card) => card.getAttribute("data-tool-card"))).toEqual([
+      "codex",
+      "zcode",
+      "opencode",
+    ]);
 
     const codexHeader = screen.getByTestId("tool-config-header-codex");
     expect(codexHeader).toHaveAttribute("aria-expanded", "false");

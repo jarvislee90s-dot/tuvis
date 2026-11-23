@@ -103,6 +103,22 @@ import type { CodexTurnControl } from "./useCodexTurnControl";
 import { previewBody, stripMobileSignature } from "./messagePreview";
 // S5：统一报告入口（R5 前身）——payload 只含安全引用
 import { reportIssue, reportIssueSummary, type ReportIssueRef } from "@/lib/reportIssue";
+// 任务 9：OpenCode 原生交互区（原生路由下**取代**整条旧终端写链）
+import OpenCodeNativePanel, { type NativeDeclineInfo } from "./OpenCodeNativePanel";
+import type { NativeProcessFold } from "./message-fold";
+// 评审 R-2：显式「重新进入原生交互」（退回旧路径后不得被刷新自动撤销）
+import {
+  enterOpenCodeNative,
+  newOpenCodeCreateRequestId,
+  readOpenCodeReselectReceipt,
+  OPENCODE_RESELECT_POST_TIMEOUT_MS,
+  fetchOpenCodeView,
+  isOwnershipRefusalCode,
+  nativeErrorKey,
+  OC_RESPONSE_INVALID_MARKER,
+  previewOpenCodeCandidate,
+  type PublicNativeView,
+} from "./opencodeNativeApi";
 
 export interface ComposerDraftRequest {
   sessionId: string;
@@ -120,6 +136,10 @@ interface MessageComposerProps {
     value: import("react").SetStateAction<string>,
     expectedRevision?: number
   ) => void;
+  conversationTarget?: HTMLElement | null;
+  onNativeSnapshot?: (view: PublicNativeView) => void;
+  showConversation?: boolean;
+  nativeProcessFold?: NativeProcessFold;
   /** 发送回执触发的队列刷新信号（2026-10-20 复审 P2）：本地队列可见性不依赖
    *  Desktop 必须产生新帧——queued / desktop_ipc 回执都会让队列视图变化。 */
   onQueueChanged?: () => void;
@@ -132,14 +152,18 @@ interface MessageComposerProps {
    *  同页打断受理/恢复队列（队列暂停态可能翻转）与投影能力档位翻转（设置页
    *  关闭/重开自动适配）——事件驱动重拉，不做时刻轮询、不引 Tauri channel。 */
   refreshSendInfoSignal?: number;
-  /** 会话（本组件只消费 id；结构化类型，完整 Session 可直接传入） */
-  session: { id: string };
+  /** 会话（本组件只消费 id；`agentType` 仅在「是否可能走原生路由」判定里用一下）。 */
+  session: { id: string; agentType?: string };
   /** H12：Desktop(App) 形态禁用终端审批/问答探针（App 发送期间零 TUI 请求）。 */
   disableTerminalProbes?: boolean;
   /** T05：页面共享停止控制器（SessionDetail 持有单例，composer/队列面板共用——
    *  stopping 期间多入口互斥，不会各发一次打断）。未提供 = 非 Codex App 会话，
    *  无停止面（行为与既有版本完全一致）。 */
   turnControl?: CodexTurnControl;
+  /** 任务 9：交互路由上报（send-info 的 `interactionRoute`，null = 旧流程）——
+   *  SessionDetail 据此卸下旧写控件（QuestionCard / ApproveCard / ModeBar），
+   *  路由的真实来源仍是服务端，本回调只是把已读到的事实同步给同页。 */
+  onInteractionRoute?: (route: "opencode_native" | "legacy" | null) => void;
 }
 
 /** 待发附件条目（组件内态）：status=uploading → ready/failed；
@@ -329,10 +353,74 @@ function upsertQueueItem(items: QueueItemView[], item: QueueItemView): QueueItem
   return next;
 }
 
+/** 原生路由「退回旧输入区」的事实（每个会话只记一次；换会话即失效）。 */
+interface RouteFallback {
+  sessionId: string;
+  kind: "declined" | "returned";
+  code: string | null;
+  reason: string | null;
+  /** 仅 `returned` 有意义：本次显式 force 作废的动作条数。 */
+  abandoned: number;
+}
+
+/** 上报给同页的**有效**路由（评审 Blocker 1）：本会话已退回旧输入区时一律报 `legacy`
+ *  ——否则同页会按「候选/已归原生」继续卸下旧写控件，而输入区已经回到旧路径。 */
+function effectiveRouteFor(
+  sessionId: string,
+  fallback: RouteFallback | null,
+  route: "opencode_native" | "legacy" | null | undefined
+): "opencode_native" | "legacy" | null {
+  if (fallback !== null && fallback.sessionId === sessionId) return "legacy";
+  return route ?? null;
+}
+
+/** 退回提示文案（一次；受控码走本地化句，后端 reason 只做兜底）。 */
+function fallbackNotice(f: RouteFallback | null): string | null {
+  if (f === null) return null;
+  if (f.kind === "returned") {
+    return f.abandoned > 0
+      ? i18n.t("mobile.openCodeNative.route.abandonedNotice", { n: f.abandoned })
+      : i18n.t("mobile.openCodeNative.route.returnedNotice");
+  }
+  // 评审 R-2：`returned_to_legacy` = 该会话已被（本端或另一台设备）显式交回。
+  // 这不是「不可用」，而是「用户退回过」——必须如实说，并按退回态给出重入口。
+  if (f.code === "returned_to_legacy") {
+    return i18n.t("mobile.openCodeNative.route.declinedReturned");
+  }
+  // B1 同实例归属未证：不能复用“发送、答题、审批与队列派发已暂停”的原生面板文案——
+  // 本提示出现在**旧输入区已恢复**的分支，旧通道按既有规则仍可能可发送。
+  // 只说明「原生写入被暂停」，并保留「已回到旧输入区」的上下文。
+  if (f.code === "OC_INSTANCE_OWNERSHIP_UNVERIFIED") {
+    return i18n.t("mobile.openCodeNative.route.declinedNotice", {
+      reason: i18n.t("mobile.openCodeNative.route.declinedOwnership"),
+    });
+  }
+  // H05 小补丁④：其余归属未证族码（`OC_GATE_*` / `OC_INSTANCE_AMBIGUOUS` /
+  // `OC_DESKTOP_BINDING_REQUIRED`）经 opencodeNativeApi 的 nativeErrorKey 单点
+  // 映射出门码专属短语——同一阻断只解释一处，不落「不可用」通用句、机器串不上屏
+  // （与上方 OC_INSTANCE 分支同一呈现槽：declinedNotice 模板 + 本地化 reason）。
+  if (isOwnershipRefusalCode(f.code)) {
+    const mapped = nativeErrorKey(f.code);
+    if (mapped !== null) {
+      return i18n.t("mobile.openCodeNative.route.declinedNotice", { reason: i18n.t(mapped) });
+    }
+  }
+  const reason =
+    f.code === "legacy_pending"
+      ? i18n.t("mobile.openCodeNative.route.declinedPending")
+      : (f.reason ?? i18n.t("mobile.openCodeNative.route.declinedUnavailable"));
+  return i18n.t("mobile.openCodeNative.route.declinedNotice", { reason });
+}
+
 export default function MessageComposer({
   session,
   onQueueChanged,
+  conversationTarget,
+  onNativeSnapshot,
+  showConversation,
+  nativeProcessFold,
   onSendGate,
+  onInteractionRoute,
   refreshSendInfoSignal = 0,
   disableTerminalProbes = false,
   turnControl,
@@ -342,12 +430,100 @@ export default function MessageComposer({
   draftTextRevision,
   onDraftTextChange,
 }: MessageComposerProps) {
-  // 可用性：sendInfo=null 且未就绪 → 不渲染（加载中 / 拉取失败 / 403）
+  // OpenCode 策略未知时保留原生入口，旧工具等待 send-info。
   const [sendInfo, setSendInfo] = useState<SendInfo | null>(null);
   const [infoReady, setInfoReady] = useState(false);
   const [localText, setLocalText] = useState("");
   const text = draftText ?? localText;
   const setText = onDraftTextChange ?? setLocalText;
+  /** 仅未退役且明确授权的 Windows 保留旧链；缺字段不能作为授权。 */
+  const routing = sendInfo?.openCodeRouting;
+  const nativeOnly =
+    session.agentType === "opencode" &&
+    !(routing?.platform === "windows" && routing.policy === "legacy_compatible");
+
+  /** 原生面板「交回旧路径」成功后的 send-info 重拉信号（路由以服务端为准） */
+  const [routeReloadTick, setRouteReloadTick] = useState(0);
+  /** 原生面板「退回旧输入区」的事实（每个会话只记一次）：
+   *  - `declined`：候选被拒（旧队列未清等）或不可恢复错误 → 立刻恢复旧输入区 + 原因；
+   *  - `returned`：用户显式交回成功（`abandoned` = 本次作废条数，0 = 普通交回）。 */
+  const [routeFallback, setRouteFallback] = useState<RouteFallback | null>(null);
+  /** 「重新进入原生交互」的在途/失败态（成功则重拉 send-info，路由以服务端为准） */
+  const [reentry, setReentry] = useState<"idle" | "pending" | "failed" | "unconfirmed">("idle");
+  const [reentryBinding, setReentryBinding] = useState<{
+    sessionId: string;
+    token: string;
+    routeVersion: number;
+  } | null>(null);
+  const reentryRequestRef = useRef<{ requestId: string; bindingToken: string } | null>(null);
+  const reentryBusyRef = useRef(false);
+  const reentryEpochRef = useRef(0);
+  useEffect(() => {
+    reentryEpochRef.current += 1;
+    reentryBusyRef.current = false;
+    reentryRequestRef.current = null;
+    // 会话切换：旧会话在途重入的迟到回执已被 epoch 隔离；展示态也必须复位，
+    // 否则新会话的重入按钮被上一会话的 pending 卡死、失败/未确认提示跨会话遗留。
+    setReentry("idle");
+    return () => {
+      reentryEpochRef.current += 1;
+    };
+  }, [session.id]);
+  const fallenBack = routeFallback !== null && routeFallback.sessionId === session.id;
+  const useLegacyRoute =
+    !nativeOnly &&
+    routing?.legacyAllowed === true &&
+    !routing.nativeOwned &&
+    (sendInfo?.interactionRoute !== "opencode_native" || fallenBack);
+  const uiRoute =
+    session.agentType === "opencode"
+      ? useLegacyRoute
+        ? "legacy"
+        : "opencode_native"
+      : effectiveRouteFor(session.id, routeFallback, sendInfo?.interactionRoute);
+  const nativeRoute = uiRoute === "opencode_native";
+  const routeReturned = sendInfo?.routeState === "draining" && !nativeRoute;
+  const nativeCandidate = nativeRoute && sendInfo?.interactionRouteCandidate === true;
+  useEffect(() => {
+    onInteractionRoute?.(uiRoute);
+  }, [uiRoute, onInteractionRoute]);
+  // 策略事件仅失效并重读；断流和迟到结果不得放行旧链。
+  const routingGeneration = useRef(0);
+  useEffect(() => {
+    if (session.agentType !== "opencode") return;
+    let events: EventSource;
+    const invalidate = () => {
+      routingGeneration.current += 1;
+      setSendInfo(null);
+      setInfoReady(false);
+      setRouteFallback(null);
+    };
+    try {
+      events = new EventSource("/m/api/v1/opencode/policy/events");
+    } catch {
+      return;
+    }
+    events.addEventListener("policy", () => {
+      invalidate();
+      setRouteReloadTick((t) => t + 1);
+    });
+    events.onerror = invalidate;
+    return () => events.close();
+  }, [session.id, session.agentType]);
+  /** 换会话：退回事实必须失效（它属于上一个会话） */
+  useEffect(() => {
+    setRouteFallback(null);
+  }, [session.id]);
+  /** 该会话**是否可能**走原生路由：只有 OpenCode 会话会被原生接口服务（后端
+   *  `not_opencode` 400）。判据只用工具名，不做任何路由猜测——它只用来决定
+   *  「旧的队列/卡片探针要不要等到 send-info 回来再发」：
+   *  - 不可能是原生（其他工具 / 调用方没给 agentType）→ 与历史行为完全一致（挂载即探）；
+   *  - 可能是原生 → 路由未判定前一律不探，避免在原生会话上打无意义的旧链路请求（F6）。 */
+  const couldBeNative = session.agentType === "opencode";
+  /** 旧链路的等待条件（派生布尔量）：只有「可能是原生的会话且路由还没判定」才等。
+   *  用布尔量而不是 `infoReady` 本身做依赖——否则非 OpenCode 会话也会在 send-info
+   *  到达时让 effect 重跑一次（挂载期队列请求会变成两次）。 */
+  const waitForRoute = couldBeNative && !infoReady;
   /** 输入框 ref：「修改」确认出队后把正文放回输入框时聚焦（移动端直接可改） */
   const inputRef = useRef<HTMLTextAreaElement>(null);
   /** 在途上传的中断器（id → controller）：上传中移除 chip 时中断传输（XHR abort） */
@@ -554,9 +730,10 @@ export default function MessageComposer({
       clearTimeout(deadlineTimerRef.current.timer);
       deadlineTimerRef.current = null;
     }
+    const generation = routingGeneration.current;
     fetchSendInfo(session.id)
       .then((info) => {
-        if (!alive) return;
+        if (!alive || generation !== routingGeneration.current) return;
         setSendInfo(info);
         setInfoReady(info !== null);
         // S5：静态门结论上报（能力横幅的「可尝试」唯一来源）
@@ -565,23 +742,30 @@ export default function MessageComposer({
         }
       })
       .catch(() => {
-        if (alive) setInfoReady(false);
+        if (!alive || generation !== routingGeneration.current) return;
+        setInfoReady(false);
+        // 原生策略未知时保持禁旧；这里只决定入口，不宣称原生已经认领。
+        setSendInfo(null);
       });
     return () => {
       alive = false;
     };
-  }, [session.id, onSendGate]);
+  }, [session.id, session.agentType, onSendGate, onInteractionRoute]);
 
   // F8：外部信号（同页打断受理 / 恢复队列 / 投影能力档位翻转）→ 事件驱动重拉
   // send-info（队列暂停态、静态门结论都可能已变）。失败静默——下一次信号或重挂
   // 自愈；403（设备失效）返回 null 跳过（全局判废通道处理）。
+  // 任务 9：`routeReloadTick` 与之同一条重拉通道——原生面板「交回旧路径」成功后
+  // 推一次，路由翻转的唯一权威仍是服务端 send-info（前端不自行改判）。
   useEffect(() => {
-    if (refreshSendInfoSignal <= 0) return;
+    if (refreshSendInfoSignal <= 0 && routeReloadTick <= 0) return;
     let alive = true;
+    const generation = routingGeneration.current;
     fetchSendInfo(session.id)
       .then((info) => {
-        if (!alive || info === null) return;
+        if (!alive || generation !== routingGeneration.current || info === null) return;
         setSendInfo(info);
+        setInfoReady(true);
         onSendGate?.(sendGateAttemptable(info));
       })
       .catch(() => {
@@ -590,12 +774,22 @@ export default function MessageComposer({
     return () => {
       alive = false;
     };
-  }, [refreshSendInfoSignal, session.id, onSendGate]);
+  }, [
+    refreshSendInfoSignal,
+    routeReloadTick,
+    session.id,
+    session.agentType,
+    onSendGate,
+    onInteractionRoute,
+  ]);
 
   // D8：挂载/换会话拉一次完整队列——进入会话即见既有队列（桌面端/他端排的队也要
   // 能看到）；换会话先清列表防串台。拉取失败静默（列表留空），排队回执在场的 3s
   // 轮询通道随后自愈
   useEffect(() => {
+    // 任务 9（F6）：可能走原生的会话在路由**未判定**或已归原生时不读旧本机队列——
+    // 「未知路由就先打一发旧请求」会在原生会话上留下无意义的旧链路流量。
+    if (nativeRoute || waitForRoute) return;
     let alive = true;
     setQueueItems([]);
     fetchQueue(session.id)
@@ -608,7 +802,7 @@ export default function MessageComposer({
     return () => {
       alive = false;
     };
-  }, [session.id]);
+  }, [session.id, nativeRoute, waitForRoute]);
 
   // 丁T3 接入②：挂载/换会话探一次卡片在场（placeholder 分流的数据源）。
   // 成本申报：本组件因此每次挂载/换会话多打**两发** GET（/session-approve-options
@@ -620,6 +814,10 @@ export default function MessageComposer({
   // 行为，不会因多打而误判）。发送时刻另有复探（见 handleSend）——两发探针的成本
   // 换来「对话框出现后不必等重挂即被发现」。
   useEffect(() => {
+    // 任务 9（F6）：原生路由不探旧终端卡片（旧写入口在该路由下本就会 409，探针只会
+    // 误导占位文案；原生待处理项由 OpenCodeNativePanel 展示）；可能是原生的会话在
+    // 路由判定前也不探（判定前探针 = 在原生会话上打旧链路请求）。
+    if (nativeRoute || waitForRoute) return;
     let alive = true;
     setCardPresence("none");
     void probeCardPresence().then((p) => {
@@ -628,7 +826,7 @@ export default function MessageComposer({
     return () => {
       alive = false;
     };
-  }, [probeCardPresence]);
+  }, [probeCardPresence, nativeRoute, waitForRoute]);
 
   // D8 排队列 3s 轮询（复用既有 3s 通道，不另起轮询）：有排队回执 **或** 列表非空
   // 即持续；列表变空（且无排队回执）→ 停轮询。依赖是布尔量而非列表本体——位次
@@ -636,6 +834,7 @@ export default function MessageComposer({
   const queueTracked = receipt?.kind === "queued" || queueItems.length > 0;
   useEffect(() => {
     if (!queueTracked) return;
+    if (nativeRoute) return; // 任务 9：原生路由不轮询旧本机队列
     // I2：换会话/停轮询触发 effect 重建时置 false——此前会话的在途 tick 响应
     // 一律作废（旧会话的行不得经无条件 setQueueItems 落入新会话，与挂载 effect
     // 的 alive 守卫同款）
@@ -673,7 +872,7 @@ export default function MessageComposer({
       alive = false;
       clearInterval(iv);
     };
-  }, [queueTracked, session.id]);
+  }, [queueTracked, session.id, nativeRoute]);
 
   // codexQueued 回执收敛（2026-10-22 B1）：通用 session-queue 不含 codex 动作，
   // 该 chip 的权威真值在 /codex/queue——单独按 actionId 对齐该视图。动作离开
@@ -1467,7 +1666,11 @@ export default function MessageComposer({
           uploadFirstSampleRef.current.delete(id);
           if (res === null) throw new ApiError(403, i18n.t("mobile.composer.deviceInvalid"));
           setAttachments((prev) =>
-            prev.map((a) => (a.id === id ? { ...a, status: "ready", path: res.path } : a))
+            prev.map((a) =>
+              a.id === id
+                ? { ...a, status: "ready", path: res.path, excludeWarning: res.excludeWarning }
+                : a
+            )
           );
         } catch (e) {
           uploadFirstSampleRef.current.delete(id);
@@ -1517,7 +1720,59 @@ export default function MessageComposer({
     [addFiles]
   );
 
-  // 拉取未就绪 / 失败 / 403：不渲染（详情页正文照常）
+  // OpenCode 默认保留原生连接与错误入口；旧流程仍等待 send-info。
+
+  // 任务 9：原生路由 → 输入区整体换成原生交互区（旧终端写链在这条路由上已不可用：
+  // 服务端对 send/approve/question-answer/mode-switch 一律 409）。原生面板自己负责
+  // 上传、草稿、恢复锚与只读核对；本组件不再渲染任何旧发送/队列控件。
+  if (nativeRoute) {
+    return (
+      <OpenCodeNativePanel
+        key={`opencode-native-${session.id}`}
+        sessionId={session.id}
+        initialBindingToken={reentryBinding?.sessionId === session.id ? reentryBinding.token : null}
+        initialRouteVersion={
+          reentryBinding?.sessionId === session.id ? reentryBinding.routeVersion : undefined
+        }
+        conversationTarget={conversationTarget}
+        onSnapshot={onNativeSnapshot}
+        showConversation={showConversation}
+        processFold={nativeProcessFold}
+        // 候选形态没有「已归原生」的说明句（后端只在已归时才给）
+        allowLegacy={!nativeOnly}
+        routeReason={nativeCandidate ? null : (sendInfo?.interactionRouteReason ?? null)}
+        onRouteChanged={({ abandoned, bindingToken, routeVersion }) => {
+          setReentryBinding({ sessionId: session.id, token: bindingToken, routeVersion });
+          setRouteFallback({
+            sessionId: session.id,
+            kind: "returned",
+            code: null,
+            reason: null,
+            abandoned,
+          });
+          setRouteReloadTick((t) => t + 1);
+        }}
+        onDeclined={(info: NativeDeclineInfo) => {
+          if (nativeOnly) return;
+          // 认领被拒 / 不可恢复错误：**立刻**退回旧输入区（路由从未被认领，
+          // 旧写入口本来就不会 409，所以旧发送立刻可用）
+          setRouteFallback({
+            sessionId: session.id,
+            kind: "declined",
+            code: info.code,
+            reason: info.reason,
+            abandoned: 0,
+          });
+          // 评审 R-2：如果是「已被显式交回」被拒（多设备场景），必须重拉 send-info，
+          // 让 routeState 变成 draining —— 否则本端不知道这是退回态，也就没有重入口。
+          if (info.code === "returned_to_legacy") {
+            setRouteReloadTick((t) => t + 1);
+          }
+        }}
+      />
+    );
+  }
+
   if (!infoReady || sendInfo === null) return null;
 
   const canSend =
@@ -1548,6 +1803,120 @@ export default function MessageComposer({
   const handleStopTurn = () => {
     if (!turnControl) return;
     void turnControl.stop();
+  };
+  const fallbackNoticeText = fallenBack ? fallbackNotice(routeFallback) : null;
+
+  /** 评审 R-2：显式重新进入原生。成功 → 清掉本页的退回事实并重拉 send-info；
+   *  失败 → 只改本地提示（服务端零变更，旧路径照常可用）。 */
+  const checkReentry = async (epoch: number): Promise<void> => {
+    const request = reentryRequestRef.current;
+    if (!request) return;
+    const receipt = await readOpenCodeReselectReceipt(session.id, request.requestId).catch(
+      () => null
+    );
+    if (reentryEpochRef.current !== epoch || reentryRequestRef.current !== request) return;
+    if (receipt?.state === "not_applied" || (receipt?.state === "committed" && !receipt.current)) {
+      reentryRequestRef.current = null;
+      setReentry("failed");
+      return;
+    }
+    if (receipt?.state !== "committed" || receipt.bindingToken !== request.bindingToken) {
+      setReentry("unconfirmed");
+      return;
+    }
+    setReentryBinding({
+      sessionId: session.id,
+      token: receipt.bindingToken,
+      routeVersion: receipt.routeVersion,
+    });
+    reentryRequestRef.current = null;
+    setRouteFallback(null);
+    setReentry("idle");
+    setRouteReloadTick((tick) => tick + 1);
+  };
+
+  const reenterNative = async (): Promise<void> => {
+    if (reentryBusyRef.current) return;
+    reentryBusyRef.current = true;
+    const epoch = reentryEpochRef.current;
+    let remembered = reentryBinding?.sessionId === session.id ? reentryBinding : null;
+    setReentry("pending");
+    try {
+      if (reentryRequestRef.current) {
+        await checkReentry(epoch);
+        return;
+      }
+      if (!remembered) {
+        // 刷新/他端交回后本地没有旧绑定与版本：先只读恢复 draining 路由行状态。
+        // 已显式退回的会话不会被 view 重新认领（评审 R-2），返回的绑定/版本即路由行现状。
+        const view = await fetchOpenCodeView(session.id);
+        if (reentryEpochRef.current !== epoch) return;
+        if (
+          view.routeReasonCode === "returned_to_legacy" &&
+          typeof view.bindingToken === "string" &&
+          view.bindingToken &&
+          typeof view.routeVersion === "number" &&
+          Number.isSafeInteger(view.routeVersion) &&
+          view.routeVersion >= 1
+        ) {
+          remembered = {
+            sessionId: session.id,
+            token: view.bindingToken,
+            routeVersion: view.routeVersion,
+          };
+        }
+      }
+      // 先预览固定候选（只读、零副作用），用户确认的就是这个 previewToken；
+      // 服务端在提交点复核候选未变（B→C 拒绝零变更）。
+      const preview = await previewOpenCodeCandidate(session.id);
+      if (reentryEpochRef.current !== epoch) return;
+      if (
+        !window.confirm(
+          i18n.t("mobile.openCodeNative.route.reenterConfirmTarget", {
+            directory: preview.candidate.directory,
+            service: preview.candidate.serviceId,
+            pid: preview.candidate.pid,
+          })
+        )
+      ) {
+        setReentry("idle");
+        return;
+      }
+      if (reentryEpochRef.current !== epoch) return;
+      const requestId = newOpenCodeCreateRequestId();
+      reentryRequestRef.current = { requestId, bindingToken: preview.candidate.bindingToken };
+      await enterOpenCodeNative(
+        session.id,
+        preview.previousRoute === undefined
+          ? (remembered?.token ?? null)
+          : (preview.previousRoute?.bindingToken ?? null),
+        preview.previousRoute === undefined
+          ? (remembered?.routeVersion ?? null)
+          : (preview.previousRoute?.routeVersion ?? null),
+        preview.previewToken,
+        undefined,
+        OPENCODE_RESELECT_POST_TIMEOUT_MS,
+        requestId
+      );
+      if (reentryEpochRef.current === epoch) await checkReentry(epoch);
+    } catch (e) {
+      if (reentryEpochRef.current !== epoch) return;
+      if (
+        reentryRequestRef.current &&
+        (!(e instanceof ApiError) ||
+          e.status === null ||
+          e.status >= 500 ||
+          [OC_RESPONSE_INVALID_MARKER, "OC_STORE_FAILED"].includes(String(e.data?.reasonCode)))
+      ) {
+        setReentry("unconfirmed");
+        await checkReentry(epoch);
+      } else {
+        reentryRequestRef.current = null;
+        setReentry("failed");
+      }
+    } finally {
+      if (reentryEpochRef.current === epoch) reentryBusyRef.current = false;
+    }
   };
 
   return (
@@ -1589,6 +1958,55 @@ export default function MessageComposer({
           >
             {i18n.t("mobile.codex.queue.editDraftAppend")}
           </button>
+        </div>
+      )}
+      {/* 评审 Blocker 1/2：退回旧输入区的原因只展示一次（候选被拒 / 显式交回 /
+          动作已作废 + 重复发送风险） */}
+      {fallbackNoticeText !== null && (
+        <p
+          data-testid="native-route-fallback"
+          className="mb-2 rounded-lg bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300"
+        >
+          {fallbackNoticeText}
+        </p>
+      )}
+      {/* 评审 R-2：该会话已被显式交回旧路径——重新进入必须由用户再点一次，
+          绝不由刷新/换端自动撤销（旧输入区此时照常可用）。 */}
+      {routeReturned && (
+        <div
+          data-testid="native-route-reenter"
+          className="mb-2 flex flex-wrap items-center gap-2 rounded-lg bg-[var(--cb)]/40 px-3 py-2 text-xs text-[var(--mut)]"
+        >
+          <span>{i18n.t("mobile.openCodeNative.route.returnedHint")}</span>
+          <button
+            type="button"
+            data-testid="native-route-reenter-button"
+            disabled={reentry === "pending"}
+            onClick={() => void reenterNative()}
+            className="rounded-md border border-[var(--cb)] px-2 py-1 text-xs font-medium text-[var(--fg)] disabled:opacity-50"
+          >
+            {reentry === "pending"
+              ? i18n.t("mobile.openCodeNative.route.reentering")
+              : reentry === "unconfirmed"
+                ? i18n.t("mobile.openCodeNative.reselectCheckRequest")
+                : i18n.t("mobile.openCodeNative.route.reenter")}
+          </button>
+          {reentry === "failed" && (
+            <span
+              data-testid="native-route-reenter-failed"
+              className="text-amber-700 dark:text-amber-300"
+            >
+              {i18n.t("mobile.openCodeNative.route.reenterFailed")}
+            </span>
+          )}
+          {reentry === "unconfirmed" && (
+            <span
+              data-testid="native-route-reenter-unconfirmed"
+              className="text-amber-700 dark:text-amber-300"
+            >
+              {i18n.t("mobile.openCodeNative.route.reenterUnconfirmed")}
+            </span>
+          )}
         </div>
       )}
       {/* 不可注入：输入区整体禁用，仅留 reason 展示（输入行保留占位但不可用） */}
@@ -1926,6 +2344,7 @@ export default function MessageComposer({
                 uploading && a.loaded !== undefined && a.total != null
                   ? Math.min(100, Math.floor((a.loaded / a.total) * 100))
                   : null;
+              const excludeWarning = a.status === "ready" ? a.excludeWarning : undefined;
               return (
                 // 包裹层用 div（块级 flex 项）：chip 是 span、进度条是 div，
                 // 包在 span 里属非法嵌套（span 只能含短语内容）——换 div 即合法
@@ -1946,6 +2365,14 @@ export default function MessageComposer({
                             error: a.error ?? "",
                           })
                         : a.name}
+                    {excludeWarning && (
+                      <span
+                        data-testid="attach-exclude-warning"
+                        className="text-amber-700 dark:text-amber-300"
+                      >
+                        {i18n.t("mobile.openCodeNative.composer.excludeWarning")}
+                      </span>
+                    )}
                     {uploading && a.loaded !== undefined && (
                       <span
                         data-testid={`attach-progress-${a.id}`}

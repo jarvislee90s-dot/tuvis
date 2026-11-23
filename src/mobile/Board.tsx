@@ -431,7 +431,7 @@ export default function Board({
         : i18n.t("mobile.board.confirmArchiveApp");
       if (!window.confirm(msg)) return;
       if (isCli) {
-        void closeSession(s.id)
+        void closeSession(s.id, s.agentType)
           .then(() => {
             const current = dataRef.current;
             if (!current) return;

@@ -141,7 +141,8 @@ jobs:
       # 互相踩踏 → 随机数十例 FAILED（本机实测：默认并行 51 failed，-j 1 只有既有的
       # 5 例 HOME 隔离基线，且串行更快）。这是既有测试脆弱性，与业务代码无关；
       # 限并行度让门禁稳定，真正的根治（共享锁串行化建链用例）另立。
-      - run: cd src-tauri && cargo test --features marker-helper -j 2
+      # opencode-coordinator-tests：保留底层成功回归；同套 B1 用例仍走生产未知归属门。
+      - run: cd src-tauri && cargo test --features marker-helper,opencode-coordinator-tests -j 2
 
       # cfg(windows) 编译门禁（issue #45）：CI host 是 linux，win32.rs 等整模块
       # #[cfg(windows)] 代码在上述步骤中不可达、破损静默通过（detector.rs:732 一例）。
@@ -154,6 +155,30 @@ jobs:
       # --features marker-helper：让 tuvis-marker bin（Windows-only helper）进入门禁
       - run: cd src-tauri && cargo check --target x86_64-pc-windows-gnu --all-targets --features marker-helper
       - run: cd src-tauri && cargo clippy --target x86_64-pc-windows-gnu --all-targets --features marker-helper -- -D warnings
+
+  opencode-macos:
+    name: OpenCode macOS regression
+    runs-on: macos-15-intel
+    needs: changes
+    if: github.event_name != 'pull_request' || needs.changes.outputs.backend == 'true'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build:mobile
+      - name: Run macOS OpenCode tests
+        working-directory: src-tauri
+        run: |
+          cargo test --locked --features opencode-coordinator-tests --lib opencode_native -- --test-threads=4
+          cargo test --locked --features opencode-coordinator-tests --lib close_does_not_kill_opencode
+          cargo test --locked --features opencode-coordinator-tests --test opencode_native_remote --test opencode_pin_readonly --test opencode_attachment_binding_regression
 
   build:
     name: Build verification

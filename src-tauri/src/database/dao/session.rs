@@ -168,7 +168,8 @@ mod tests {
 
     fn mem() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
-        crate::database::schema::init(&conn);
+        // M4：schema::init 改返回 Result（不再内部 panic）；测试分支行为不变（失败仍 panic）
+        crate::database::schema::init(&conn).unwrap();
         conn
     }
 

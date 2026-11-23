@@ -204,15 +204,25 @@ export async function fetchUiConfig(): Promise<UiConfig | null> {
 
 /** 统一消息条目 — 与 Rust `remote::content::SessionMessage`（camelCase 序列化）逐字段
  *  对应，勿漂移：seq / role / content / kind / ts / toolName? / toolArgs? / collapsed。
- *  kind ∈ user / assistant / thinking / tool-call / tool-result / plan；
+ *  kind ∈ user / assistant / thinking / tool-call / tool-result / plan / system-note；
  *  thinking 与 tool-call 的 collapsed 恒 true（wire 语义，运行中态的默认折叠依据）；
  *  plan 是 T1 升格的一等计划消息（content = 计划 markdown 原文，collapsed 恒 false，
- *  toolName 保留供辨识、toolArgs 恒空——不透传参数串） */
+ *  toolName 保留供辨识、toolArgs 恒空——不透传参数串）；
+ *  system-note 是 OpenCode synthetic 系统提醒（如切 agent 的 Plan mode 提示），
+ *  content 已剥掉 `<system-reminder>` 标签，collapsed 恒 true */
 export interface SessionMessage {
   seq: number;
   role: string;
   content: string;
-  kind: "user" | "assistant" | "thinking" | "tool-call" | "tool-result" | "plan" | string;
+  kind:
+    | "user"
+    | "assistant"
+    | "thinking"
+    | "tool-call"
+    | "tool-result"
+    | "plan"
+    | "system-note"
+    | string;
   ts: number | null;
   toolName?: string | null;
   toolArgs?: string | null;
@@ -492,7 +502,17 @@ export function connectEvents(
  *  RouteOutcome::NotInjectable 分支只给 {injectable,reasonCode,reason}）→ 前端
  *  类型须 optional（M9R P2-10 对齐）；injectable=true 时 channels 为候选注入
  *  通道（tmux/iterm2/…），visibility=after_refresh 表示注入后需刷新才见回显 */
+export interface OpenCodeRoutingView {
+  policy: "native_only" | "legacy_compatible";
+  /** 桌面服务端的实际平台；缺省不构成兼容授权。 */
+  platform?: string;
+  connection: "probing" | "ready" | "unavailable";
+  nativeOwned: boolean;
+  legacyAllowed: boolean;
+  reasonCode: string | null;
+}
 export interface SendInfo {
+  openCodeRouting?: OpenCodeRoutingView;
   injectable: boolean;
   reasonCode?: string;
   reason?: string;
@@ -504,6 +524,32 @@ export interface SendInfo {
    * 或「本条先发送」（一次性越队授权 bypassPausedQueue）。
    */
   queuePaused?: boolean;
+  /**
+   * 任务 8（OpenCode 原生交互首批）：会话的交互路由提示——**可选字段**，只有已归原生的
+   * OpenCode 会话才带 `opencode_native`（其余工具与旧后端缺席 = 前端零分支走原流程）。
+   * 判定与旧写入口的 409 `OC_ROUTE_CHANGED` 同源（持久归属），前端据此把输入区切到
+   * 原生面板并卸下旧终端写控件；**读请求不会因此改变任何状态**。
+   */
+  interactionRoute?: "opencode_native" | "legacy";
+  /**
+   * 原生路由三态（后端 Task 8 / 评审 R-2 下发，仅 OpenCode 会话有值）：
+   * `none` = 从未接入；`active` = 已归原生；`draining` = 用户**显式退回**。
+   *
+   * 区分后两者的意义：`none` 可以按候选自动进入（面板首次 `GET /opencode/view`
+   * 即认领），`draining` 绝不能被一次刷新/换端自动撤销——必须由用户点
+   * 「重新进入原生交互」显式调 `POST /opencode/route/native`。
+   */
+  routeState?: "none" | "active" | "draining";
+  /** 上者的人类可读说明（后端固定句，终端侧原文，不翻译；缺席 = 不显示） */
+  interactionRouteReason?: string;
+  /**
+   * **候选**路由（评审 Blocker 1）：`true` = 该会话此刻满足进入原生的全部前置
+   *（macOS + 验证开关开 + 可唯一绑定），但归属**还没登记**。
+   *
+   * 前端必须照常挂原生面板：面板第一次 `GET /opencode/view` 才是认领动作；认领被拒
+   *（旧队列未清等）或不可恢复错误时，面板必须退回旧输入区。缺席 = 已归原生（或非原生）。
+   */
+  interactionRouteCandidate?: boolean;
 }
 
 /** 拉取输入区可用性（W4：输入区挂载时一次）。403（设备失效，与 fetchSessions
@@ -723,13 +769,17 @@ export async function sessionSend(
  *  signal 语义保留：已中止 → 不发请求直接拒绝；中止事件 → xhr.abort()。
  *  错误契约：403 → null（设备失效，与 fetchSendInfo 同口径）；404 →
  *  ApiError(404, "no_session"|"no_cwd")（composer 据后者禁用上传钮）；
- *  413 → ApiError(413, "too_large")；其余非 2xx → ApiError(status) */
+ *  413 → ApiError(413, "too_large")——超限响应体是服务端契约 JSON
+ *  {"error":"too_large"}（H07 D1 后由 handler 限长读取单点保证，不再是 axum
+ *  框架兜底的通用 413 体），下面的 JSON 解析因此**总能**取到该错误码；
+ *  其余非 2xx → ApiError(status) */
 export async function uploadAttachment(
   sessionId: string,
   file: File,
   signal?: AbortSignal,
-  onProgress?: (loaded: number, total: number) => void
-): Promise<{ path: string; size: number } | null> {
+  onProgress?: (loaded: number, total: number) => void,
+  context?: { route: "opencode_native"; bindingToken: string } | { route: "legacy" }
+): Promise<{ path: string; size: number; excludeWarning?: string } | null> {
   if (signal?.aborted) {
     throw new ApiError(
       null,
@@ -737,62 +787,73 @@ export async function uploadAttachment(
     );
   }
   const q = new URLSearchParams({ session_id: sessionId, name: file.name });
-  return new Promise<{ path: string; size: number } | null>((resolve, reject) => {
-    const xhr = new XMLHttpRequest();
-    xhr.open("POST", `/m/api/v1/session-attachment?${q}`);
-    xhr.setRequestHeader("content-type", "application/octet-stream");
-    const onAbort = () => xhr.abort(); // 既有取消语义：上传中移除 chip = 中断上传
-    signal?.addEventListener("abort", onAbort, { once: true });
-    // 终态收尾：摘掉 abort 监听（removeEventListener 幂等；resolve/reject 对已
-    // 结算 promise 是 no-op，晚到的 onload/onabort 无需额外旗标）
-    const finish = () => signal?.removeEventListener("abort", onAbort);
-    // 上传进度（§C5）：先于 send() 注册——顺序错收不到事件
-    xhr.upload.onprogress = (e) => {
-      onProgress?.(e.loaded, e.total);
-    };
-    xhr.onload = () => {
-      finish();
-      if (xhr.status === 403) return resolve(null); // 设备失效 → 回配对页
-      if (xhr.status >= 200 && xhr.status < 300) {
-        try {
-          resolve(JSON.parse(xhr.responseText) as { path: string; size: number });
-        } catch {
-          reject(new ApiError(xhr.status, `session-attachment ${xhr.status}`));
+  if (context) q.set("interaction_route", context.route);
+  return new Promise<{ path: string; size: number; excludeWarning?: string } | null>(
+    (resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open("POST", `/m/api/v1/session-attachment?${q}`);
+      xhr.setRequestHeader("content-type", "application/octet-stream");
+      if (context?.route === "opencode_native")
+        xhr.setRequestHeader("x-opencode-expected-binding", context.bindingToken);
+      const onAbort = () => xhr.abort(); // 既有取消语义：上传中移除 chip = 中断上传
+      signal?.addEventListener("abort", onAbort, { once: true });
+      // 终态收尾：摘掉 abort 监听（removeEventListener 幂等；resolve/reject 对已
+      // 结算 promise 是 no-op，晚到的 onload/onabort 无需额外旗标）
+      const finish = () => signal?.removeEventListener("abort", onAbort);
+      // 上传进度（§C5）：先于 send() 注册——顺序错收不到事件
+      xhr.upload.onprogress = (e) => {
+        onProgress?.(e.loaded, e.total);
+      };
+      xhr.onload = () => {
+        finish();
+        if (xhr.status === 403) return resolve(null); // 设备失效 → 回配对页
+        if (xhr.status >= 200 && xhr.status < 300) {
+          try {
+            resolve(
+              JSON.parse(xhr.responseText) as {
+                path: string;
+                size: number;
+                excludeWarning?: string;
+              }
+            );
+          } catch {
+            reject(new ApiError(xhr.status, `session-attachment ${xhr.status}`));
+          }
+          return;
         }
-        return;
-      }
-      // 非 2xx：错误码在响应体 error 字段（no_cwd / too_large 等），对齐 fetch 版
-      let reason = `session-attachment ${xhr.status}`;
-      try {
-        const j = JSON.parse(xhr.responseText) as { error?: unknown };
-        if (typeof j?.error === "string") reason = j.error;
-      } catch {
-        /* 响应体非 JSON：保留默认 reason */
-      }
-      reject(new ApiError(xhr.status, reason));
-    };
-    xhr.onerror = () => {
-      finish();
-      reject(
-        new ApiError(
-          null,
-          // M5 Task 7（g5）：补齐 errcode 码——无码原文会绕过 formatInvokeError
-          // （英文界面下裸显中文），有码则映射 errors.mobileNetworkFail 双语模板
-          `MOBILE_NETWORK_FAIL:session-attachment: session-attachment 网络异常: ${String(xhr.statusText || "network error")}`
-        )
-      );
-    };
-    xhr.onabort = () => {
-      finish();
-      reject(
-        new ApiError(
-          null,
-          `MOBILE_NETWORK_FAIL:session-attachment: session-attachment 网络异常: AbortError（上传已取消）`
-        )
-      );
-    };
-    xhr.send(file); // File 直传——XHR 原生跟踪 Blob 的上传字节
-  });
+        // 非 2xx：错误码在响应体 error 字段（no_cwd / too_large 等），对齐 fetch 版
+        let reason = `session-attachment ${xhr.status}`;
+        try {
+          const j = JSON.parse(xhr.responseText) as { error?: unknown };
+          if (typeof j?.error === "string") reason = j.error;
+        } catch {
+          /* 响应体非 JSON：保留默认 reason */
+        }
+        reject(new ApiError(xhr.status, reason));
+      };
+      xhr.onerror = () => {
+        finish();
+        reject(
+          new ApiError(
+            null,
+            // M5 Task 7（g5）：补齐 errcode 码——无码原文会绕过 formatInvokeError
+            // （英文界面下裸显中文），有码则映射 errors.mobileNetworkFail 双语模板
+            `MOBILE_NETWORK_FAIL:session-attachment: session-attachment 网络异常: ${String(xhr.statusText || "network error")}`
+          )
+        );
+      };
+      xhr.onabort = () => {
+        finish();
+        reject(
+          new ApiError(
+            null,
+            `MOBILE_NETWORK_FAIL:session-attachment: session-attachment 网络异常: AbortError（上传已取消）`
+          )
+        );
+      };
+      xhr.send(file); // File 直传——XHR 原生跟踪 Blob 的上传字节
+    }
+  );
 }
 
 /** 排队条目视图（GET /session-queue 的 items 元素，camelCase 契约）：position =
@@ -1599,21 +1660,31 @@ export async function fetchSessionModeMenu(sessionId: string): Promise<ModeMenuR
 /** 一键 resume 回执（POST /session-open）：200 {status:"opening"} 表示电脑侧正在
  *  打开终端恢复该会话；`trustPromptExpected`（T3）：会话目录命中 ~/.claude.json
  *  未信任条款——claude 将在终端弹信任提示，需人工应答否则会话挂起（调用方据此
- *  toast 提醒）；spawn 出手失败 → 200 {status:"failed",error}（可重试） */
+ *  toast 提醒）；spawn 出手失败 → 200 {status:"failed",error}（可重试）。
+ *  F4 项 4A：{status:"pending",code:"OC_RESTORE_PENDING"} = 待确认态——电脑侧已
+ *  出手但真实窗口观察未核实，不冒充成功；再次请求将先复查观察（命中即核销），
+ *  {status:"abandoned"} = 已放弃（可重新发起）。 */
 export type SessionOpenResult =
-  { status: "opening"; trustPromptExpected?: boolean } | { status: "failed"; error: string };
+  | { status: "opening"; trustPromptExpected?: boolean }
+  | { status: "pending"; code?: string; trustPromptExpected?: boolean }
+  | { status: "abandoned" }
+  | { status: "failed"; error: string };
 
-/** 一键 resume（R5）：请求电脑本机打开终端 + cd 项目目录 + 恢复会话 + 聚焦。
+/** 一键 resume（R5；F4：`opts.abandon` = 显式放弃在途待确认恢复）：
+ *  请求电脑本机打开终端 + cd 项目目录 + 恢复会话 + 聚焦。
  *  404 {error:"no_session"|"no_cwd"|"no_resume_command"} → 非 2xx 抛 ApiError
  *  （错误码解析进 data.error，调用方分診禁用/失败文案——后端命令表未收录的工具
  *  前端按钮本就禁用，404 是挂载后会话漂移的兜底） */
-export async function sessionOpen(sessionId: string): Promise<SessionOpenResult> {
+export async function sessionOpen(
+  sessionId: string,
+  opts?: { abandon?: boolean }
+): Promise<SessionOpenResult> {
   let r: Response;
   try {
     r = await fetch("/m/api/v1/session-open", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ sessionId }),
+      body: JSON.stringify({ sessionId, abandon: opts?.abandon === true }),
     });
   } catch (e) {
     throw new ApiError(
@@ -1681,11 +1752,11 @@ function sessionActionBody(sessionId: string): string {
 
 /** 远程硬杀 CLI 会话终端（桌面 kill_session 同内核）：进程死 → 3s 内下板 → 进历史归档。
  *  App 形态端点拒绝（400 form_not_supported）——软归档走 hideSession */
-export async function closeSession(sessionId: string): Promise<void> {
+export async function closeSession(sessionId: string, agentType?: string): Promise<void> {
   const r = await fetch("/m/api/v1/session-close", {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: sessionActionBody(sessionId),
+    body: JSON.stringify({ sessionId, agentType }),
   });
   if (!r.ok) throw new ApiError(r.status, `session-close ${r.status}`);
 }
@@ -1766,9 +1837,13 @@ export interface CreateSessionAccepted {
  *    CREATE_REJECT_LABEL_KEYS 同步维护——M5 Task 6 起该表值为 i18n 键）；reason 为后端定位详情（黑名单命中段+所属表等，修复批 I1——
  *    展示层 reason 优先于本地码表）；裸 bad_request（入参超长等）无该二键；
  *  - conflict（409）：全局单飞占用（已有非终态创建任务——终态 done/failed
- *    不占额度）。 */
+ *    不占额度，`{"error":"conflict"}` 无二键）；策略门拒绝（如 H14 实测
+ *    OC_LEGACY_DISABLED「OpenCode 当前仅允许原生交互」）带 reasonCode/reason
+ *    与 400 同构带出——展示层按码分診（CreateSessionSheet 冲突码表），**reason
+ *    原串含「OC_LEGACY_DISABLED: 」机器前缀，禁止直接上屏（H05 纪律）**。 */
 export type CreateSessionError =
-  { kind: "bad_request"; reasonCode?: string; reason?: string } | { kind: "conflict" };
+  | { kind: "bad_request"; reasonCode?: string; reason?: string }
+  | { kind: "conflict"; reasonCode?: string; reason?: string };
 
 /** 发起远程新建会话任务（异步管线：起窗 → 处置弹窗 → 注入首句 → 等物化；管线
  *  detached 推进，不依赖手机持续在线）。200 → 任务已占单飞并立即回执，进度轮询
@@ -1811,7 +1886,24 @@ export async function createSession(body: {
       reason: typeof rawReason === "string" ? rawReason : undefined,
     };
   }
-  if (r.status === 409) return { kind: "conflict" };
+  if (r.status === 409) {
+    // 409 二态（H14 O1 补）：单飞占用（{"error":"conflict"}，无二键）与策略门
+    // 拒绝（如 OC_LEGACY_DISABLED，带 reasonCode/reason）——与 400 同构解析带出，
+    // 解析失败缺省（调用方按单飞占用文案兜底，不猜）
+    let data: Record<string, unknown> | null = null;
+    try {
+      data = (await r.json()) as Record<string, unknown>;
+    } catch {
+      /* 非 JSON 错误体（代理注入页等）：reasonCode 缺省 */
+    }
+    const raw = data?.reasonCode;
+    const rawReason = data?.reason;
+    return {
+      kind: "conflict",
+      reasonCode: typeof raw === "string" ? raw : undefined,
+      reason: typeof rawReason === "string" ? rawReason : undefined,
+    };
+  }
   if (!r.ok) {
     let data: Record<string, unknown> | null = null;
     try {

@@ -323,6 +323,143 @@ pub fn remove_entry(content: &str, section: &str, key: &str) -> Result<String, S
     Ok(out)
 }
 
+/// 顶层字符串数组的读取/插入/删除（OpenCode `plugins` 用）。
+type StringArrayScan = (Vec<(String, Span)>, usize, bool);
+
+fn read_string_array(content: &str, value: Span) -> Result<StringArrayScan, String> {
+    let mut cur = Cursor::new(content);
+    cur.pos = value.start;
+    cur.skip_trivia();
+    if cur.pos >= cur.b.len() || cur.b[cur.pos] != b'[' {
+        return Err("MCPC_EDIT_ARRAY: 无法安全编辑字符串数组".to_string());
+    }
+    cur.pos += 1;
+    let mut items = Vec::new();
+    let mut trailing_comma = false;
+    loop {
+        cur.skip_trivia();
+        if cur.pos >= cur.b.len() {
+            return Err("MCPC_EDIT_ARRAY: 无法安全编辑字符串数组".to_string());
+        }
+        if cur.b[cur.pos] == b']' {
+            let close = cur.pos;
+            return Ok((items, close, trailing_comma));
+        }
+        let start = cur.pos;
+        let value = cur
+            .read_string()
+            .ok_or_else(|| "MCPC_EDIT_ARRAY: 无法安全编辑字符串数组".to_string())?;
+        let end = cur.pos;
+        items.push((value, Span { start, end }));
+        cur.skip_trivia();
+        trailing_comma = false;
+        if cur.pos < cur.b.len() && cur.b[cur.pos] == b',' {
+            trailing_comma = true;
+            cur.pos += 1;
+        }
+    }
+}
+
+/// 在顶层对象的字符串数组中追加一个值；已存在则原样返回。保留注释/格式。
+pub fn upsert_string_array(content: &str, key: &str, value: &str) -> Result<String, String> {
+    let (root, root_entries) = parse_root(content)?;
+    let encoded = serde_json::to_string(value)
+        .map_err(|_| "MCPC_EDIT_ARRAY: 无法安全编辑字符串数组".to_string())?;
+    match root_entries.iter().find(|entry| entry.key == key) {
+        Some(entry) => {
+            let (items, close, trailing) = read_string_array(content, entry.value)?;
+            if items.iter().any(|(item, _)| item == value) {
+                return Ok(content.to_string());
+            }
+            let mut out = String::new();
+            out.push_str(&content[..close]);
+            if !items.is_empty() && !trailing {
+                out.push(',');
+            }
+            out.push_str(&format!(" {encoded} "));
+            out.push_str(&content[close..]);
+            Ok(out)
+        }
+        None => {
+            let close = root.end - 1;
+            let mut out = String::new();
+            out.push_str(&content[..close]);
+            if let Some(last) = root_entries.last() {
+                let mut cursor = Cursor::new(content);
+                cursor.pos = last.value.end;
+                cursor.skip_trivia();
+                if cursor.b.get(cursor.pos) != Some(&b',') {
+                    out.push(',');
+                }
+            }
+            out.push_str(&format!(" \"{}\": [{encoded}] ", key));
+            out.push_str(&content[close..]);
+            Ok(out)
+        }
+    }
+}
+
+/// 顶层字符串数组是否包含某值；JSONC（注释/尾逗号）安全。
+pub fn string_array_contains(content: &str, key: &str, value: &str) -> Result<bool, String> {
+    let (_, root_entries) = parse_root(content)?;
+    let Some(entry) = root_entries.iter().find(|entry| entry.key == key) else {
+        return Ok(false);
+    };
+    let (items, _, _) = read_string_array(content, entry.value)?;
+    Ok(items.iter().any(|(item, _)| item == value))
+}
+
+/// 从顶层字符串数组删除一个值；不存在视为成功。保留注释/格式。
+pub fn remove_string_array(content: &str, key: &str, value: &str) -> Result<String, String> {
+    let (_, root_entries) = parse_root(content)?;
+    let Some(entry) = root_entries.iter().find(|entry| entry.key == key) else {
+        return Ok(content.to_string());
+    };
+    let (items, _close, _) = read_string_array(content, entry.value)?;
+    let Some((_, span)) = items.iter().find(|(item, _)| item == value) else {
+        return Ok(content.to_string());
+    };
+    // 删除元素本身；若其后有逗号则吃到逗号，否则向左吃一个逗号。
+    let mut start = span.start;
+    let mut end = span.end;
+    let mut cur = Cursor::new(content);
+    cur.pos = span.end;
+    cur.skip_trivia();
+    if cur.pos < cur.b.len() && cur.b[cur.pos] == b',' {
+        end = cur.pos + 1;
+    } else {
+        let mut before = Cursor::new(content);
+        before.pos = entry.value.start;
+        before.skip_trivia();
+        before.pos += 1; // '['
+        let mut previous_comma = None;
+        while before.pos < span.start {
+            before.skip_trivia();
+            if before.pos >= span.start {
+                break;
+            }
+            if before.b[before.pos] == b',' {
+                previous_comma = Some(before.pos);
+                before.pos += 1;
+                continue;
+            }
+            if before.b[before.pos] == b'"' {
+                before.read_string();
+                continue;
+            }
+            before.pos += 1;
+        }
+        if let Some(comma) = previous_comma {
+            start = comma;
+        }
+    }
+    // 只吃掉一个元素方向上的空白，保留注释。
+    let mut out = String::new();
+    out.push_str(content[..start].trim_end_matches([' ', '\t']));
+    out.push_str(&content[end..]);
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -362,6 +499,40 @@ mod tests {
         assert!(out.contains("\"old\": {\"x\":1}"));
         assert!(!out.contains("\"command\": [\"a\"]"));
         assert!(out.contains("// top comment"));
+    }
+
+    #[test]
+    fn string_array_edit_preserves_comments_and_handles_trailing_comma() {
+        let input = "{\n  // keep me\n  \"plugins\": [\"a\", // item\n  ],\n  \"x\": 1\n}\n";
+        let inserted = upsert_string_array(input, "plugins", "b").unwrap();
+        assert!(inserted.contains("// keep me"));
+        assert!(inserted.contains("// item"));
+        let parsed: serde_json::Value =
+            serde_json::from_str(&inserted.replace("// keep me", "").replace("// item", ""))
+                .unwrap();
+        assert_eq!(parsed["plugins"], serde_json::json!(["a", "b"]));
+        assert!(string_array_contains(&inserted, "plugins", "b").unwrap());
+        let removed = remove_string_array(&inserted, "plugins", "a").unwrap();
+        assert!(!string_array_contains(&removed, "plugins", "a").unwrap());
+        assert!(string_array_contains(&removed, "plugins", "b").unwrap());
+    }
+
+    #[test]
+    fn string_array_upsert_handles_root_trailing_comma() {
+        let input = "{\n  \"x\": 1, // keep\n}\n";
+        let out = upsert_string_array(input, "plugins", "p").unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&out.replace("// keep", "")).unwrap();
+        assert_eq!(parsed["plugins"], serde_json::json!(["p"]));
+        assert!(out.contains("// keep"));
+    }
+
+    #[test]
+    fn string_array_upsert_adds_missing_key_without_reformatting() {
+        let input = "{\n  \"x\": 1 // keep\n}\n";
+        let out = upsert_string_array(input, "plugins", "p").unwrap();
+        assert!(out.contains("// keep"));
+        let parsed: serde_json::Value = serde_json::from_str(&out.replace("// keep", "")).unwrap();
+        assert_eq!(parsed["plugins"], serde_json::json!(["p"]));
     }
 
     #[test]

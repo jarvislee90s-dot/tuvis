@@ -9,8 +9,19 @@ pub fn get_setting(key: String) -> Option<String> {
 }
 
 #[tauri::command]
-pub fn set_setting(key: String, value: String) {
+pub fn set_setting(key: String, value: String) -> Result<(), String> {
+    use crate::services::opencode_native::policy::{
+        write_policy, OpenCodeInteractionPolicy, POLICY_KEY,
+    };
+    if key == POLICY_KEY {
+        let policy: OpenCodeInteractionPolicy =
+            serde_json::from_value(serde_json::Value::String(value))
+                .map_err(|_| "OC_POLICY_INVALID: 无效的 OpenCode 交互策略".to_string())?;
+        return write_policy(&crate::remote::pairing::DeviceStore::global(), policy)
+            .map_err(|error| error.message);
+    }
     crate::database::set_setting(&key, &value);
+    Ok(())
 }
 
 /// 主题 SSOT 写入（issue #3）：主题事实源是 DB settings KV（`ui_theme`），
@@ -289,4 +300,92 @@ mod action_path_snapshot_lock_tests {
             "mark_session_read 不得同步跑完整扫描"
         );
     }
+}
+
+#[tauri::command]
+pub fn opencode_interaction_policy_get(
+) -> crate::services::opencode_native::policy::OpenCodeInteractionPolicy {
+    crate::services::opencode_native::policy::read_policy(
+        &crate::remote::pairing::DeviceStore::global(),
+    )
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenCodeInteractionPolicyStatus {
+    policy: crate::services::opencode_native::policy::OpenCodeInteractionPolicy,
+    legacy_configurable: bool,
+}
+
+#[tauri::command]
+pub fn opencode_interaction_policy_status() -> OpenCodeInteractionPolicyStatus {
+    OpenCodeInteractionPolicyStatus {
+        policy: opencode_interaction_policy_get(),
+        legacy_configurable: !crate::services::opencode_native::policy::legacy_retired(),
+    }
+}
+
+fn opencode_tui_observer_config_root() -> Result<std::path::PathBuf, String> {
+    if let Some(path) = std::env::var_os("XDG_CONFIG_HOME").filter(|p| !p.is_empty()) {
+        return Ok(path.into());
+    }
+    dirs::home_dir()
+        .map(|home| home.join(".config"))
+        .ok_or_else(|| "无法解析 OpenCode 配置目录".to_string())
+}
+
+#[tauri::command]
+pub fn opencode_tui_observer_status(
+) -> Result<crate::monitor::opencode_tui_observer_install::InstallStatus, String> {
+    use crate::monitor::opencode_tui_observer_install::{status_at, PLUGIN};
+    status_at(&opencode_tui_observer_config_root()?, PLUGIN)
+}
+
+#[tauri::command]
+pub fn opencode_tui_observer_install(
+) -> Result<crate::monitor::opencode_tui_observer_install::InstallStatus, String> {
+    use crate::monitor::opencode_tui_observer_install::{install_at, PLUGIN};
+    install_at(&opencode_tui_observer_config_root()?, PLUGIN)
+}
+
+#[tauri::command]
+pub fn opencode_tui_observer_uninstall(
+) -> Result<crate::monitor::opencode_tui_observer_install::InstallStatus, String> {
+    crate::monitor::opencode_tui_observer_install::uninstall_at(
+        &opencode_tui_observer_config_root()?
+    )
+}
+
+#[tauri::command]
+pub async fn opencode_bridge_status() -> crate::remote::OpenCodeBridgeView {
+    crate::remote::opencode_bridge_view().await
+}
+
+#[tauri::command]
+pub async fn opencode_bridge_install() -> Result<crate::remote::OpenCodeBridgeView, String> {
+    crate::remote::opencode_bridge_install().await
+}
+
+#[tauri::command]
+pub async fn opencode_bridge_uninstall() -> Result<crate::remote::OpenCodeBridgeView, String> {
+    crate::remote::opencode_bridge_uninstall().await
+}
+
+#[tauri::command]
+pub async fn opencode_bridge_reload() -> Result<crate::remote::OpenCodeBridgeView, String> {
+    crate::remote::opencode_bridge_reload().await
+}
+
+#[tauri::command]
+pub fn opencode_interaction_policy_set(
+    app: tauri::AppHandle,
+    policy: crate::services::opencode_native::policy::OpenCodeInteractionPolicy,
+) -> Result<(), String> {
+    crate::services::opencode_native::policy::write_policy(
+        &crate::remote::pairing::DeviceStore::global(),
+        policy,
+    )
+    .map_err(|error| error.message)?;
+    let _ = app.emit("opencode-interaction-policy-changed", policy);
+    Ok(())
 }

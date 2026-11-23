@@ -4,6 +4,7 @@ import Board from "@/mobile/Board";
 import CreateSessionSheet from "@/mobile/CreateSessionSheet";
 import { MockEventSource } from "./eventSourceMock";
 import type { CreateProjectView } from "@/mobile/api";
+import type { OpenCodeCreateReceipt } from "@/mobile/opencodeNativeApi";
 import type { Session } from "@/types/session";
 
 // 文案走 mobile.* 双语键后按 zh 断言（Board.test 同款：显式引入并固定中文）。
@@ -59,7 +60,14 @@ function boardSession(overrides: Partial<Session> & Pick<Session, "id" | "agentT
   };
 }
 
+const nativeCreatePath = "/m/api/v1/opencode/create-native";
+const nativeRequestKey = "tuvis.opencode.createRequest";
+const nativeDirectory = "/projects/alpha";
+const nativeSessionId = "ses_native_alpha";
+
 interface Routes {
+  openCodePolicy?: () => Response | Promise<Response>;
+  nativeCreate?: (url: string, init?: RequestInit) => Response | Promise<Response>;
   projects?: CreateProjectView[];
   projectsStatus?: number;
   /** POST /session-create 的 200 回执 */
@@ -85,8 +93,21 @@ let routes: Routes;
 let fetchMock: ReturnType<typeof vi.fn>;
 
 function installFetch() {
-  fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+  fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input);
+    if (url === "/m/api/v1/opencode/policy") {
+      return (
+        routes.openCodePolicy?.() ??
+        Response.json({
+          policy: "native_only",
+          platform: "macos",
+          createRoute: "opencode_native",
+        })
+      );
+    }
+    if (url.startsWith(nativeCreatePath) && routes.nativeCreate) {
+      return routes.nativeCreate(url, init);
+    }
     if (url.includes("/session-create/status")) {
       if (routes.statusReject) throw new TypeError("network down");
       if (routes.statusStatus) {
@@ -169,6 +190,254 @@ afterEach(() => {
   cleanup();
   vi.useRealTimers();
   vi.unstubAllGlobals();
+  localStorage.removeItem(nativeRequestKey);
+});
+
+describe("CreateSessionSheet OpenCode 原生创建", () => {
+  function renderNativeSheet(onOpenSession = vi.fn()) {
+    return render(
+      <CreateSessionSheet
+        enabledTools={new Set(["opencode"])}
+        installedTools={new Set(["opencode"])}
+        boardSessions={[boardSession({ id: nativeSessionId, agentType: "opencode" })]}
+        onClose={vi.fn()}
+        onOpenSession={onOpenSession}
+      />
+    );
+  }
+
+  async function prepareSubmit() {
+    const sheet = renderNativeSheet();
+    await advance(0);
+    fireEvent.click(screen.getByTestId("create-tool-opencode"));
+    fireEvent.click(screen.getByTestId("create-manual-toggle"));
+    fireEvent.change(screen.getByTestId("create-manual-input"), {
+      target: { value: nativeDirectory },
+    });
+    return sheet;
+  }
+
+  function receipt(requestId: string, window: OpenCodeCreateReceipt["window"]) {
+    return Response.json({
+      requestId,
+      sessionId: window === "pending" ? null : nativeSessionId,
+      directory: nativeDirectory,
+      creation: window === "pending" ? "unconfirmed" : "created",
+      window,
+      reasonCode: null,
+      reason: null,
+      firstSentenceStatus: null,
+    } satisfies OpenCodeCreateReceipt);
+  }
+
+  function nativeCalls() {
+    return fetchMock.mock.calls
+      .filter(([url]) => String(url).startsWith(nativeCreatePath))
+      .map(([url, init]) => [String(url), init?.method ?? "GET"]);
+  }
+
+  it("Windows 获得明确兼容授权后只提交旧创建入口，不调用原生创建", async () => {
+    routes.openCodePolicy = () =>
+      Response.json({
+        policy: "legacy_compatible",
+        platform: "windows",
+        createRoute: "legacy",
+      });
+    installFetch();
+    await prepareSubmit();
+    await advance(0);
+    fireEvent.click(screen.getByTestId("create-submit"));
+    await advance(0);
+
+    const createCalls = fetchMock.mock.calls
+      .filter(
+        ([url]) => url === "/m/api/v1/session-create" || String(url).startsWith(nativeCreatePath)
+      )
+      .map(([url, init]) => [String(url), init?.method ?? "GET"]);
+    expect(createCalls).toEqual([["/m/api/v1/session-create", "POST"]]);
+  });
+
+  function createPosts() {
+    return fetchMock.mock.calls.filter(
+      ([url, init]) =>
+        init?.method === "POST" &&
+        (url === "/m/api/v1/session-create" || String(url).startsWith(nativeCreatePath))
+    );
+  }
+
+  it("旧表单在等待策略时卸载，策略返回后不提交创建", async () => {
+    const pending = Promise.withResolvers<Response>();
+    const readPolicy = vi.fn(() => pending.promise);
+    routes.openCodePolicy = readPolicy;
+    installFetch();
+    const sheet = await prepareSubmit();
+    fireEvent.click(screen.getByTestId("create-submit"));
+    await advance(0);
+    expect(readPolicy).toHaveBeenCalledTimes(1);
+    expect(createPosts()).toEqual([]);
+
+    sheet.unmount();
+    pending.resolve(
+      Response.json({
+        policy: "legacy_compatible",
+        platform: "windows",
+        createRoute: "legacy",
+      })
+    );
+    await advance(0);
+
+    expect(createPosts()).toEqual([]);
+  });
+
+  it.each([
+    ["403", () => new Response(null, { status: 403 })],
+    ["无效 JSON", () => new Response("{", { status: 200 })],
+    [
+      "未知路由",
+      () =>
+        Response.json({
+          policy: "native_only",
+          platform: "macos",
+          createRoute: "future_route",
+        }),
+    ],
+    ["缺少路由", () => Response.json({ policy: "native_only" })],
+  ] as const)("策略返回%s时不提交创建", async (_label, response) => {
+    const readPolicy = vi.fn(response);
+    routes.openCodePolicy = readPolicy;
+    installFetch();
+    await prepareSubmit();
+    fireEvent.click(screen.getByTestId("create-submit"));
+    await advance(0);
+
+    expect(readPolicy).toHaveBeenCalledTimes(1);
+    expect(createPosts()).toEqual([]);
+  });
+
+  it("连续点击提交只发送一次原生创建请求", async () => {
+    const pending = Promise.withResolvers<Response>();
+    routes.nativeCreate = () => pending.promise;
+    installFetch();
+    await prepareSubmit();
+
+    const submit = screen.getByTestId("create-submit");
+    act(() => {
+      fireEvent.click(submit);
+      fireEvent.click(submit);
+    });
+    await advance(0); // 等写前策略读取完成，原生请求 ID 持久化后再核对。
+    const requestId = localStorage.getItem(nativeRequestKey)!;
+    expect(requestId).toMatch(/^[a-f0-9]{32}$/);
+    pending.resolve(receipt(requestId, "pending"));
+    await advance(0);
+
+    expect(nativeCalls().filter(([, method]) => method === "POST")).toEqual([
+      [nativeCreatePath, "POST"],
+    ]);
+  });
+
+  it.each([
+    ["failed", "起窗失败"],
+    ["pending", "结果待确认"],
+  ] as const)("收到 %s 回执时按实际状态显示", async (window, statusText) => {
+    routes.nativeCreate = (_url, init) => {
+      const { requestId } = JSON.parse(String(init?.body));
+      return receipt(requestId, window);
+    };
+    installFetch();
+    await prepareSubmit();
+
+    fireEvent.click(screen.getByTestId("create-submit"));
+    await advance(0);
+
+    expect(screen.getByText(nativeDirectory)).toBeInTheDocument();
+    expect(screen.getByRole("status")).toHaveTextContent(statusText);
+    expect(screen.queryByText("桌面窗口已打开")).not.toBeInTheDocument();
+  });
+
+  it("读取到创建未确认且窗口状态为 created 时显示「结果待确认」", async () => {
+    const requestId = "a".repeat(32);
+    const readUrl = `${nativeCreatePath}?requestId=${requestId}`;
+    localStorage.setItem(nativeRequestKey, requestId);
+    routes.nativeCreate = (url, init) =>
+      url === readUrl && (init?.method ?? "GET") === "GET"
+        ? Response.json({
+            requestId,
+            sessionId: nativeSessionId,
+            directory: nativeDirectory,
+            creation: "unconfirmed",
+            window: "created",
+            reasonCode: null,
+            reason: null,
+            firstSentenceStatus: null,
+          } satisfies OpenCodeCreateReceipt)
+        : new Response(null, { status: 404 });
+    installFetch();
+    renderNativeSheet();
+    await advance(0);
+
+    expect(nativeCalls()).toEqual([[readUrl, "GET"]]);
+    expect(screen.getByRole("status")).toHaveTextContent("结果待确认");
+  });
+
+  it("已确认会话的窗口待处理时提供「继续窗口与首句」操作", async () => {
+    routes.nativeCreate = (_url, init) => {
+      const { requestId } = JSON.parse(String(init?.body));
+      return Response.json({
+        requestId,
+        sessionId: nativeSessionId,
+        directory: nativeDirectory,
+        creation: "created",
+        window: "pending",
+        reasonCode: null,
+        reason: null,
+        firstSentenceStatus: "pending",
+      } satisfies OpenCodeCreateReceipt);
+    };
+    installFetch();
+    await prepareSubmit();
+    fireEvent.change(screen.getByTestId("create-first-message"), {
+      target: { value: "首句" },
+    });
+    fireEvent.click(screen.getByTestId("create-submit"));
+    await advance(0);
+
+    expect(screen.getByRole("button", { name: "继续窗口与首句" })).toBeEnabled();
+  });
+
+  it("重新挂载后按保存的请求 ID 仅读取并查看原会话", async () => {
+    routes.nativeCreate = (_url, init) => {
+      const { requestId } = JSON.parse(String(init?.body));
+      return receipt(requestId, "failed");
+    };
+    installFetch();
+    const sheet = await prepareSubmit();
+    fireEvent.click(screen.getByTestId("create-submit"));
+    await advance(0);
+    expect(screen.getByText(nativeSessionId)).toBeInTheDocument();
+    sheet.unmount();
+
+    const requestId = localStorage.getItem(nativeRequestKey)!;
+    expect(requestId).toMatch(/^[a-f0-9]{32}$/);
+    const readUrl = `${nativeCreatePath}?requestId=${requestId}`;
+    routes.nativeCreate = (url, init) =>
+      url === readUrl && (init?.method ?? "GET") === "GET"
+        ? receipt(requestId, "opened")
+        : new Response(null, { status: 404 });
+    fetchMock.mockClear();
+
+    const onOpenSession = vi.fn();
+    renderNativeSheet(onOpenSession);
+    await advance(0);
+
+    expect(nativeCalls()).toEqual([[readUrl, "GET"]]);
+    expect(fetchMock.mock.calls.some(([, init]) => init?.method === "POST")).toBe(false);
+    expect(screen.getByRole("status")).toHaveTextContent("桌面窗口已打开");
+    fireEvent.click(screen.getByRole("button", { name: "查看会话" }));
+    expect(onOpenSession).toHaveBeenCalledWith(
+      expect.objectContaining({ id: nativeSessionId, agentType: "opencode" })
+    );
+  });
 });
 
 // ==== 表单（工具四选 / 目录候选 / 手填 / 黄字）====
@@ -421,6 +690,31 @@ describe("CreateSessionSheet 提交错误分診", () => {
     expect(screen.getByTestId("create-error").textContent).toBe("已有创建任务进行中");
     // 仍停留表单态（未进入进度轮询）
     expect(screen.getByTestId("create-submit")).toBeInTheDocument();
+    expect(statusCalls()).toBe(0);
+  });
+
+  it("409 OC_LEGACY_DISABLED → 明确原因 + 指向桌面端（H14 O1：不再折叠为进行时态）", async () => {
+    // 实测形态（H14 §3.2）：策略门 409 带 reasonCode + reason（机器前缀串）——
+    // 呈现按码走 i18n 明确文案；服务端 reason 原串含机器前缀不上屏（H05 纪律）
+    routes.createStatus = 409;
+    routes.createBody = {
+      error: "OC_LEGACY_DISABLED",
+      reasonCode: "OC_LEGACY_DISABLED",
+      reason: "OC_LEGACY_DISABLED: OpenCode 当前仅允许原生交互，旧终端交互已停用",
+    };
+    installFetch();
+    await submitWithManualPath();
+    const text = screen.getByTestId("create-error").textContent ?? "";
+    // 明确原因 + 可执行下一步（去桌面端），确定态措辞
+    expect(text).toBe(
+      "远程新建当前不可用：OpenCode 原生专测期间旧终端交互已停用，请在桌面端打开 OpenCode 新建会话"
+    );
+    // 无进行时态残留、无机器串上屏
+    expect(text).not.toContain("进行中");
+    expect(text).not.toContain("OC_LEGACY_DISABLED");
+    // 仍停留表单态（未进入进度轮询；关闭按钮即「返回」出路）
+    expect(screen.getByTestId("create-submit")).toBeInTheDocument();
+    expect(screen.getByTestId("create-close")).toBeInTheDocument();
     expect(statusCalls()).toBe(0);
   });
 

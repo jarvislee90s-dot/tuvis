@@ -1,0 +1,47 @@
+{
+  "x-evidence": {
+    "run_id": "20261029-233614",
+    "sources": [
+      "docs/engineering/evidence/opencode-native/followup/fixtures/form.rules.matrix.json (cases when-false-required-omitted / hidden-required-omitted)",
+      "docs/engineering/evidence/opencode-native/20261029-schema-fragments.json (Form.StringField.format)"
+    ],
+    "note": "同一 form 引擎的未覆盖规则形态：when 条件、hidden 字段、format 约束。字段值取自任务 0 夹具，未新增契约。"
+  },
+  "data": {
+    "id": "frm_18856ff60001XpLIhqzffgrygg",
+    "sessionID": "ses_e77ad72c2ffepQn7p3puw4Vc6y",
+    "title": "G2-when-required",
+    "fields": [
+      {
+        "key": "q0",
+        "title": "COLOR",
+        "type": "string",
+        "options": [
+          { "value": "red", "label": "red" },
+          { "value": "blue", "label": "blue" }
+        ]
+      },
+      {
+        "key": "q1",
+        "title": "WHY-RED",
+        "type": "string",
+        "required": true,
+        "when": [{ "key": "q0", "op": "eq", "value": "red" }]
+      },
+      {
+        "key": "q2",
+        "title": "HIDDEN",
+        "type": "string",
+        "hidden": true,
+        "required": true
+      },
+      {
+        "key": "q3",
+        "title": "CONTACT",
+        "type": "string",
+        "format": "email"
+      }
+    ],
+    "state": { "status": "pending" }
+  }
+}

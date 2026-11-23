@@ -231,7 +231,7 @@ mod tests {
 
     fn mem() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
-        crate::database::schema::init(&conn);
+        let _ = crate::database::schema::init(&conn);
         crate::database::migration::migrate(&conn).unwrap();
         conn
     }
@@ -257,7 +257,7 @@ mod tests {
     #[test]
     fn b12_evidence_round_trip_and_collision() {
         let c = Connection::open_in_memory().unwrap();
-        crate::database::schema::init(&c);
+        let _ = crate::database::schema::init(&c);
         crate::database::migration::migrate(&c).unwrap();
         let epoch = next_hint_epoch_conn(&c).unwrap();
         let mut h = versioned(epoch, 1, "answered");
@@ -674,7 +674,7 @@ mod question_claim_tests {
 
     fn conn() -> Connection {
         let c = Connection::open_in_memory().unwrap();
-        schema::init(&c);
+        schema::init(&c).unwrap();
         c
     }
 
@@ -1102,7 +1102,7 @@ mod j02_claim_owner_tests {
 
     fn db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
-        crate::database::schema::init(&conn);
+        crate::database::schema::init(&conn).unwrap();
         conn
     }
 
@@ -1186,7 +1186,7 @@ mod b1_epoch_tests {
     use std::time::Duration;
 
     fn ready(conn: &Connection) {
-        crate::database::schema::init(conn);
+        let _ = crate::database::schema::init(conn);
         crate::database::migration::migrate(conn).unwrap();
     }
 
@@ -1253,7 +1253,7 @@ mod b1_epoch_tests {
     #[test]
     fn b1_begin_epoch_rejects_incomplete_schema() {
         let conn = Connection::open_in_memory().unwrap();
-        crate::database::schema::init(&conn);
+        let _ = crate::database::schema::init(&conn);
         conn.execute_batch("CREATE TABLE codex_hint_writer_state(singleton INTEGER PRIMARY KEY, epoch INTEGER NOT NULL); INSERT INTO codex_hint_writer_state VALUES(1,7)").unwrap();
         assert!(begin(&conn).is_err());
         let epoch: i64 = conn
@@ -1278,7 +1278,7 @@ mod b1_epoch_tests {
             "INSERT INTO codex_hint_writer_state VALUES(1,'invalid');",
         ] {
             let conn = Connection::open_in_memory().unwrap();
-            crate::database::schema::init(&conn);
+            let _ = crate::database::schema::init(&conn);
             conn.execute_batch("ALTER TABLE codex_interaction_hints ADD COLUMN observation_epoch INTEGER; ALTER TABLE codex_interaction_hints ADD COLUMN observation_seq INTEGER; CREATE TABLE codex_hint_writer_state(singleton INTEGER, epoch);").unwrap();
             conn.execute_batch(rows).unwrap();
             assert!(
@@ -1291,7 +1291,7 @@ mod b1_epoch_tests {
     #[test]
     fn b1_existing_writer_epoch_survives_failed_migration() {
         let conn = Connection::open_in_memory().unwrap();
-        crate::database::schema::init(&conn);
+        let _ = crate::database::schema::init(&conn);
         conn.execute_batch("CREATE TABLE codex_hint_writer_state(singleton INTEGER PRIMARY KEY, epoch INTEGER NOT NULL); INSERT INTO codex_hint_writer_state VALUES(1,7)").unwrap();
         crate::database::migration::migrate(&conn).unwrap();
         crate::database::migration::migrate(&conn).unwrap();

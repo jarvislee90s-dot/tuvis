@@ -541,7 +541,7 @@ async fn new_id_reaches_remote_reading() {
     // ===== RemoteState 假源装配（zcode_config_remote.rs 同款风格）=====
     let conn: SharedConn = {
         let c = Connection::open_in_memory().expect("open memory db");
-        multi_agents_manager_lib::database::schema::init(&c);
+        let _ = multi_agents_manager_lib::database::schema::init(&c);
         multi_agents_manager_lib::database::migration::migrate(&c).expect("migrate");
         Arc::new(Mutex::new(c))
     };
@@ -637,6 +637,11 @@ async fn new_id_reaches_remote_reading() {
         rate_bucket_channels_source: Box::new(Vec::new),
         home_source: Box::new(|| None),
         injector: Arc::new(multi_agents_manager_lib::inject::engine::RealInjector),
+        opencode_native: std::sync::Arc::new(
+            multi_agents_manager_lib::services::opencode_native::NativeHub::new(
+                multi_agents_manager_lib::remote::pairing::DeviceStore::global(),
+            ),
+        ),
         resume_spawner: Arc::new(|_: &multi_agents_manager_lib::inject::resume::SpawnSpec| Ok(())),
         create_hub: Arc::new(multi_agents_manager_lib::remote::server::CreateTaskHub::stub()),
         archive_source: Box::new(Vec::new),

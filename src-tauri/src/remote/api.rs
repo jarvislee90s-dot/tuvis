@@ -5,7 +5,6 @@
 // + session-approve-options / session-approve（M8 Task 11 审批选项与一键应答）
 // + session-open（M6R–M9R Task 11 一键 resume，R5）
 
-use axum::body::Bytes;
 use axum::{
     extract::{ConnectInfo, Query, State},
     http::StatusCode,
@@ -20,6 +19,7 @@ use std::sync::Arc;
 use tokio_stream::wrappers::BroadcastStream;
 
 use super::server::{CleanupStream, RemoteState, SseConnGuard};
+use crate::services::opencode_native::policy;
 
 /// 看板隐藏过滤（APP 软归档=「叉」语义，2026-09-20 体验批二修订）：hidden →
 /// 一律从响应剔除（仅手机看板；桌面走 invoke 不经此端点）。**无自动回归**——
@@ -1259,6 +1259,8 @@ pub(crate) fn json_no_store(status: StatusCode, body: serde_json::Value) -> Resp
 }
 
 /// 400 bad_request（缺参 / 空 text / 超长）
+/// 400 参数错（trim 判空、形态非法、DTO 拒未知字段的统一出口）。
+/// `pub(crate)`：opencode_native 路由层（兄弟模块）共用同一形状。
 pub(crate) fn bad_request() -> Response {
     json_no_store(
         StatusCode::BAD_REQUEST,
@@ -1266,7 +1268,8 @@ pub(crate) fn bad_request() -> Response {
     )
 }
 
-/// 403 防御（gate 已拦设备，理论不可达——handler 直取 cookie 失败时兜底）
+/// 403 防御（gate 已拦设备，理论不可达——handler 直取 cookie 失败时兜底）。
+/// `pub(crate)`：opencode_native 路由层共用。
 pub(crate) fn forbidden_defense() -> Response {
     json_no_store(
         StatusCode::FORBIDDEN,
@@ -1276,7 +1279,8 @@ pub(crate) fn forbidden_defense() -> Response {
 
 /// 设备侧公共前置：cookie 提取（防御 403 的判定源）+ 花名查询（查无回落 unknown）。
 /// 返回 `None` = 无有效 cookie（调用方统一给 403 防御响应；不在此构造 Response，
-/// 规避 clippy::result_large_err 的大 Err 变体）
+/// 规避 clippy::result_large_err 的大 Err 变体）。
+/// `pub(crate)`：opencode_native 路由层（任务 8）与 codex_ipc 端点共用。
 pub(crate) fn device_identity(
     st: &RemoteState,
     headers: &axum::http::HeaderMap,
@@ -1319,8 +1323,13 @@ fn endpoint_audit(
 /// 快照中按 session_id 找会话（spawn_blocking 内调用：session_source 是同步阻塞扫描）。
 /// 数据同源铁律：直调注入源（与看板/内容读取同一份快照），不另立查找函数。
 /// 动作路径口径（Task 4）：走 fresh_session_source——会话定位之后紧跟写终端动作，
-/// 不能按陈旧快照的 pid/cwd 动手
-fn find_session_sync(st: &Arc<RemoteState>, session_id: &str) -> Option<crate::session::Session> {
+/// 不能按陈旧快照的 pid/cwd 动手。
+/// `pub(crate)`：opencode_native 路由层（任务 8）经同一缝解析会话——原生会话
+/// **只**由本服务器 session_source 查，不自立第二套查找。
+pub(crate) fn find_session_sync(
+    st: &Arc<RemoteState>,
+    session_id: &str,
+) -> Option<crate::session::Session> {
     (st.fresh_session_source)()
         .sessions
         .into_iter()
@@ -1369,6 +1378,66 @@ fn ensure_project_matches_bound_workspace(
         axum::http::StatusCode::CONFLICT,
         serde_json::json!({ "error": WORKSPACE_MISMATCH }),
     ))
+}
+
+pub(crate) fn legacy_disabled_response() -> Response {
+    let error = policy::legacy_disabled();
+    json_no_store(
+        StatusCode::CONFLICT,
+        serde_json::json!({"error": error.code, "reasonCode": error.code, "reason": error.message}),
+    )
+}
+
+#[allow(
+    clippy::result_large_err,
+    reason = "HTTP 拒绝直接返回既有状态、响应头和 JSON 响应体"
+)]
+async fn legacy_policy_permit(
+    st: &Arc<RemoteState>,
+    sid: &str,
+) -> Result<(policy::Permit, Option<crate::session::Session>), Response> {
+    let source = st.clone();
+    let id = sid.to_string();
+    let session = tokio::task::spawn_blocking(move || {
+        let mut matches = (source.fresh_session_source)()
+            .sessions
+            .into_iter()
+            .filter(|session| session.id == id);
+        let first = matches.next();
+        if policy::legacy_retired() {
+            // 裸 ID 可能跨工具撞名。只要同 ID 有已退役的 OpenCode 目标，旧入口不猜。
+            matches
+                .find(|session| session.agent_type == crate::session::AgentType::OpenCode)
+                .or(first)
+        } else {
+            first
+        }
+    })
+    .await
+    .map_err(|_| {
+        json_no_store(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            serde_json::json!({"error":"internal"}),
+        )
+    })?;
+    // 缺会话沿用各旧端点自身的错误形状，不改变其他工具的查询语义。
+    let permit = match &session {
+        Some(session) => policy::acquire_legacy(&st.store, session.agent_type.clone())
+            .map_err(|_| legacy_disabled_response())?,
+        None => None,
+    };
+    // 策略校验和后续屏读/写入共用同一目标；不得再次扫描换成未获许可的目标。
+    Ok((permit, session))
+}
+
+/// 原生归属读取（任务 8 屏障的**唯一**读口，M-2）。
+///
+/// 纪律：**读不出来 ≠ 未归原生**。DB 读失败必须由调用方 fail-closed（500 / 本轮让位），
+/// 绝不能 `.unwrap_or(false)` 把故障当成「旧路径可用」——那正是屏障在存储抖动时会静默
+/// 失效的形态。
+pub(crate) fn native_owned(st: &RemoteState, session_id: &str) -> Result<bool, rusqlite::Error> {
+    st.store
+        .with(|c| crate::database::dao::opencode_actions::owns_session_conn(c, session_id))
 }
 
 /// 端点审计 action 选择（丁T3 裁2，**单点**）：`/` 开头消息记 `slash`，其余按投递
@@ -1540,6 +1609,7 @@ pub async fn session_send(
 ) -> Response {
     // ① 参数校验（trim 判空，原文上送——归一在入队时统一做）
     let sid = req.session_id.trim().to_string();
+
     if sid.is_empty() || req.text.trim().is_empty() || req.text.chars().count() > MAX_SEND_CHARS {
         return bad_request();
     }
@@ -1547,27 +1617,31 @@ pub async fn session_send(
     let Some((device_id, device_name)) = device_identity(&st, &headers) else {
         return forbidden_defense();
     };
+    let (_policy_permit, _policy_session) = match legacy_policy_permit(&st, &sid).await {
+        Ok(permit) => permit,
+        Err(response) => return response,
+    };
     // ③ 会话查找（spawn_blocking：扫描是重活）+ 路由判定
     let probe_st = st.clone();
-    let probe_sid = sid.clone();
-    let (session, pairing_ambiguous) = match tokio::task::spawn_blocking(move || {
-        let session = find_session_sync(&probe_st, &probe_sid);
-        // C7：配对不确定集合与快照同段取得（缝 = 运行进程表；生产为 sysinfo 全量
-        // 扫描，与 session_source 同为同步重活，不留在 async worker）
-        let ambiguous = pairing_ambiguous_set(&probe_st);
-        (session, ambiguous)
-    })
-    .await
-    {
-        Ok(v) => v,
-        Err(e) => {
-            log::error!("session-send 会话扫描任务异常: {e}");
-            return json_no_store(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                serde_json::json!({ "error": "internal" }),
-            );
-        }
-    };
+    let (session, pairing_ambiguous) =
+        match policy::spawn_blocking(_policy_permit.clone(), move || {
+            let session = _policy_session;
+            // C7：配对不确定集合与快照同段取得（缝 = 运行进程表；生产为 sysinfo 全量
+            // 扫描，与 session_source 同为同步重活，不留在 async worker）
+            let ambiguous = pairing_ambiguous_set(&probe_st);
+            (session, ambiguous)
+        })
+        .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                log::error!("session-send 会话扫描任务异常: {e}");
+                return json_no_store(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    serde_json::json!({ "error": "internal" }),
+                );
+            }
+        };
     let Some(session) = session else {
         return json_no_store(
             StatusCode::NOT_FOUND,
@@ -1587,6 +1661,12 @@ pub async fn session_send(
     //    兼容分支受 H3（A 可用时 H3 关闭不挡 IPC）。判据：codex APP 形态 ∧ thread 可
     //    解析。hub 分支内自管 actionId 契约 / desktop_ipc/codex_queued 回执 / 兜底交接
     //    （兜底分支内部再受 H3）。
+    // ③.5 任务 8 旧路径防双投屏障：取同会话旧写 read permit（与原生
+    //   `select_native_route` 的 write permit 互斥），**持有到本次写入与结果记录
+    //   （入队/直发/审计）全部结束**——在飞旧写期间切换路由必须等待，杜绝
+    //   「守卫检查后才切路由」的竞态。归属复查在 ⑤ 入队的同一 DB 临界区内。
+    // 许可不可失败（M-1）：锁等待不是错误，没有需要兜底的 500 死臂。
+    let _native_permit = st.opencode_native.try_legacy_permit(&sid).await;
     // ④ Codex APP → Desktop IPC control hub：**必须在 H3 门之前交给 hub**（H3 与
     //    hub 面无关——S2 起 Desktop 会话没有任何兜底分支）。判据：codex APP 形态 ∧
     //    thread 可解析。hub 分支内自管 actionId 契约 / desktop_ipc/codex_queued 回执 /
@@ -1684,7 +1764,15 @@ pub async fn session_send(
     // queueOnly 项与普通队列项同权（转闲按序自动放行），队列存储不携带该标志
     let queue_only = req.queue_only.unwrap_or(false);
     let now = chrono::Utc::now().timestamp_millis();
-    let (item_id, position) = st.store.with(|c| {
+    // 任务 8 屏障的第二半：**同一 DB 临界区**内先查原生归属再入旧队列（read permit
+    // 已挡住切路由并持到落账，这里的复查挡住一切残余交错）。已归 Native 的会话旧
+    // 客户端不得再入队——409 OC_ROUTE_CHANGED，零写出。
+    // M-2：归属读取出错**不得**当作「未归原生」（那会静默放旧路径通过）——整个临界区
+    // 以 `rusqlite::Result` 出栈，失败一律 500 且零入队。
+    let enqueued = st.store.with(|c| {
+        if crate::database::dao::opencode_actions::owns_session_conn(c, &sid)? {
+            return Ok::<_, rusqlite::Error>((0, 0, true));
+        }
         let id = crate::database::dao::inject_queue::enqueue_conn(
             c,
             &sid,
@@ -1696,8 +1784,21 @@ pub async fn session_send(
         );
         let pos =
             crate::database::dao::inject_queue::pending_for_session_conn(c, &sid).len() as i64;
-        (id, pos)
+        Ok((id, pos, false))
     });
+    let (item_id, position, route_changed) = match enqueued {
+        Ok(v) => v,
+        Err(e) => {
+            log::error!("session-send 旧队列入队临界区失败（会话 {sid}）: {e}");
+            return json_no_store(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                serde_json::json!({ "error": "internal" }),
+            );
+        }
+    };
+    if route_changed {
+        return super::opencode_native::route_changed_response();
+    }
     if item_id == 0 {
         // DAO 写失败哨兵（enqueue_conn 失败返回 0 并 log）：不下发 delivered 谎报
         return json_no_store(
@@ -1730,7 +1831,7 @@ pub async fn session_send(
         let probe_st = st.clone();
         let probe_tool = tool.clone();
         let probe_pid = session.pid;
-        input_ready = tokio::task::spawn_blocking(move || {
+        input_ready = policy::spawn_blocking(_policy_permit.clone(), move || {
             matches!(
                 crate::inject::confirm::poll_turn_stopped(
                     crate::inject::timing::poll_rounds(
@@ -1761,7 +1862,7 @@ pub async fn session_send(
     if !queue_only && input_ready {
         let flush_st = st.clone();
         let flush_sid = sid.clone();
-        let outcome = tokio::task::spawn_blocking(move || {
+        let outcome = policy::spawn_blocking(_policy_permit.clone(), move || {
             // 守卫必须是闭包第一条语句：宿主与投递同栈，handler future 因断连被 drop
             // 也不会提前释放——detached 旧投递全程占位，新触发取不到名额即让位
             let Some(_guard) = crate::inject::queue::try_acquire_inflight(&flush_sid) else {
@@ -1980,8 +2081,9 @@ pub async fn session_send_info(
         return bad_request();
     };
     let probe_st = st.clone();
+    let probe_sid = sid.clone();
     let session =
-        match tokio::task::spawn_blocking(move || find_session_sync(&probe_st, &sid)).await {
+        match tokio::task::spawn_blocking(move || find_session_sync(&probe_st, &probe_sid)).await {
             Ok(v) => v,
             Err(e) => {
                 log::error!("session-send-info 会话扫描任务异常: {e}");
@@ -1996,6 +2098,32 @@ pub async fn session_send_info(
             StatusCode::NOT_FOUND,
             serde_json::json!({ "error": "no_session" }),
         );
+    };
+    if !policy::legacy_interaction_allowed(&st.store, session.agent_type.clone()) {
+        let owned = match native_owned(&st, &sid) {
+            Ok(owned) => owned,
+            Err(_) => {
+                return json_no_store(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    serde_json::json!({"error":"internal"}),
+                )
+            }
+        };
+        let available = super::opencode_native::is_native_candidate(&st, &session).await;
+        return json_no_store(
+            StatusCode::OK,
+            serde_json::json!({
+                "injectable": false, "reasonCode": "OC_LEGACY_DISABLED",
+                "interactionRoute": "opencode_native",
+                "openCodeRouting": {"policy":"native_only", "platform":std::env::consts::OS, "connection":if available {"ready"} else {"unavailable"},
+                    "nativeOwned":owned, "legacyAllowed":false,
+                    "reasonCode":if available {None::<&str>} else {Some("OC_NATIVE_UNAVAILABLE")}}
+            }),
+        );
+    }
+    let _policy_permit = match policy::acquire_legacy(&st.store, session.agent_type.clone()) {
+        Ok(permit) => permit,
+        Err(_) => return legacy_disabled_response(),
     };
     let tool = session.agent_type.tool_id().to_string();
     // **ZCode 边界（T7.1）**：只广告官方控制路径（旧注入入口不可用），携带本机
@@ -2017,6 +2145,35 @@ pub async fn session_send_info(
             }),
         );
     }
+    // 任务 8：原生路由提示（**可选字段**）——仅 OpenCode 会话且已归 Native 时附
+    // `interactionRoute=opencode_native` + 路由说明；其他工具与旧后端缺省走原流程
+    // （字段缺席 = 前端零分支）。判定 = 持久归属（路由 active），与旧写入口 409
+    // OC_ROUTE_CHANGED 同源。
+    // 任务 8 / 评审 R-2：路由**三态**——`none`（从未接入）/ `active`（已归原生）/
+    // `draining`（用户显式退回）。前端据此区分「没进过」与「退回过」：前者可以按候选
+    // 自动进入，后者必须由用户点「重新进入原生交互」显式回来（否则一次刷新/换端/第二台
+    // 设备就会把退回操作静默撤销）。
+    let native_route_state = if tool == "opencode" {
+        // M-2：读不出归属就**不要**下发路由提示（客户端会按旧流程渲染），而不是把故障
+        // 当成「肯定没归原生」悄悄继续；这里按内部错误如实回执，避免前后端口径漂移。
+        match st
+            .store
+            .with(|c| crate::database::dao::opencode_actions::route_state_conn(c, &sid))
+        {
+            Ok(state) => state,
+            Err(e) => {
+                log::error!("session-send-info 原生归属读取失败（会话 {sid}）: {e}");
+                return json_no_store(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    serde_json::json!({ "error": "internal" }),
+                );
+            }
+        }
+    } else {
+        None
+    };
+    let native_route =
+        native_route_state.as_deref() == Some(crate::database::dao::opencode_actions::ROUTE_ACTIVE);
     // S2：**与 session-send 同源的静态门（单点 `hub.send_gate_static`）**——桌面
     // 归属会话不可尝试（未取证/自动适配关闭/已取证 build 瞬时断链）→ 输入区置灰 +
     // 同一理由码同一句文案（两端口径不一致面在 S2 收敛为单点函数）。旧的
@@ -2097,7 +2254,7 @@ pub async fn session_send_info(
     // 无头归属 + 无终端候选 = 本条只能经兼容通道投递（判据与 session-send ⑤b 同源）
     let headless_only = crate::inject::routing::headless_kind_of(&outcome)
         .filter(|_| !crate::inject::routing::has_terminal_candidate(&outcome));
-    let body = if let Some(_kind) = headless_only {
+    let mut body = if let Some(_kind) = headless_only {
         // Codex APP 已真分派（H8）→ 输入区可用 + **路由表给出的候选与可见性档原样
         // 透出**（单源：`[headless_codex_queue, headless_codex_exec]`，首选 = queue）。
         // 与 session-send 的实发口径同源；APP 在场性是每回合运行期事实，dispatch 侧判定。
@@ -2142,6 +2299,61 @@ pub async fn session_send_info(
             }
         }
     };
+    // 任务 8 / 评审 Blocker 1：路由提示有两种形态，前端据此决定「是否先挂原生面板」——
+    //
+    // * **已归原生**（`interactionRoute=opencode_native` + `interactionRouteReason`）：
+    //   旧写入口已被 409 挡住，面板是唯一写入口；
+    // * **候选**（同一 route 词 + `interactionRouteCandidate:true`）：该会话此刻满足进入
+    //   原生的全部前置（macOS + 开关开 + 可唯一绑定），但**归属还没登记**。面板挂载后
+    //   第一次 `GET /opencode/view` 才是认领动作；认领被拒（旧队列未清等）时面板必须
+    //   退回旧输入区。
+    //
+    // 为什么需要候选形态：认领只发生在打开视图时，而面板只在「已归原生」时才挂——
+    // 没有候选就永远没人打开视图，路由永远认领不了（评审给出的死锁）。本端点**绝不**
+    // 认领：它只读探测，写归属仍只在 `view_and_claim`。
+    // 候选只在**从未接入**（`routeState == none`）时成立：`draining` 是用户的显式退回，
+    // 绝不能再被自动认领（评审 R-2）。
+    // 连接事实与自动进入资格分开：active/draining 仍可能健康；只读绑定复核不认领。
+    let native_connection_ready =
+        tool == "opencode" && super::opencode_native::is_native_candidate(&st, &session).await;
+    let native_candidate = native_connection_ready && native_route_state.is_none();
+    if tool == "opencode" {
+        if let Some(obj) = body.as_object_mut() {
+            obj.insert(
+                "openCodeRouting".into(),
+                serde_json::json!({
+                    "policy": "legacy_compatible", "platform": std::env::consts::OS,
+                    "connection": if native_connection_ready { "ready" } else { "unavailable" },
+                    "nativeOwned": native_route, "legacyAllowed": !native_route,
+                    "reasonCode": if native_route { Some("OC_ROUTE_CHANGED") } else { None::<&str> }
+                }),
+            );
+            // 三态始终下发（OpenCode 会话）：`none` / `active` / `draining`
+            obj.insert(
+                "routeState".to_string(),
+                serde_json::json!(native_route_state.as_deref().unwrap_or("none")),
+            );
+        }
+    }
+    if native_route || native_candidate {
+        if let Some(obj) = body.as_object_mut() {
+            obj.insert(
+                "interactionRoute".to_string(),
+                serde_json::json!(super::opencode_native::ROUTE_NATIVE),
+            );
+            if native_route {
+                obj.insert(
+                    "interactionRouteReason".to_string(),
+                    serde_json::json!(super::opencode_native::NATIVE_ROUTE_REASON),
+                );
+            } else {
+                obj.insert(
+                    "interactionRouteCandidate".to_string(),
+                    serde_json::json!(true),
+                );
+            }
+        }
+    }
     json_no_store(StatusCode::OK, body)
 }
 
@@ -2164,6 +2376,7 @@ pub async fn session_queue(
         .with(|c| crate::database::dao::inject_queue::pending_for_session_conn(c, &sid));
     let views: Vec<serde_json::Value> = items
         .iter()
+        .filter(|item| !policy::legacy_retired() || item.agent_type != "opencode")
         .enumerate()
         .map(|(i, it)| {
             serde_json::json!({
@@ -2198,12 +2411,35 @@ pub async fn session_queue_jump(
     Json(req): Json<QueueItemReq>,
 ) -> Response {
     let sid = req.session_id.trim().to_string();
+
     if sid.is_empty() || req.item_id.is_none_or(|id| id <= 0) {
         return bad_request();
     }
     let item_id = req.item_id.unwrap_or(0);
     if device_identity(&st, &headers).is_none() {
         return forbidden_defense();
+    }
+    let (_policy_permit, _policy_session) = match legacy_policy_permit(&st, &sid).await {
+        Ok(permit) => permit,
+        Err(response) => return response,
+    };
+    // 任务 8 旧路径防双投屏障：取同会话旧写 read permit 并持到投递与落账结束
+    // （jump 是旧写入口之一——插队投递同样不得越过原生归属）。
+    // 许可不可失败（M-1）：锁等待不是错误，没有需要兜底的 500 死臂。
+    let _native_permit = st.opencode_native.try_legacy_permit(&sid).await;
+    // 归属复查在 pending 前查之前：已归 Native 的会话旧客户端不得再点名投递
+    // （409 OC_ROUTE_CHANGED，零注入）。投递内核（flush_given_if_pending）的同一
+    // 临界区还有第二道复查（纵深防御）。M-2：读失败按内部错误回执，不当「未归原生」。
+    match native_owned(&st, &sid) {
+        Ok(true) => return super::opencode_native::route_changed_response(),
+        Ok(false) => {}
+        Err(e) => {
+            log::error!("session-queue/jump 原生归属读取失败（会话 {sid}）: {e}");
+            return json_no_store(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                serde_json::json!({ "error": "internal" }),
+            );
+        }
     }
     let failed_body = |e: String| {
         json_no_store(
@@ -2225,7 +2461,7 @@ pub async fn session_queue_jump(
     };
     let flush_st = st.clone();
     let flush_sid = sid.clone();
-    let outcome = match tokio::task::spawn_blocking(move || {
+    let outcome = match policy::spawn_blocking(_policy_permit.clone(), move || {
         // 守卫必须是闭包第一条语句（fff9c29 flush 循环事件臂同款，F1 断连双投修复）：
         // 宿主与投递同栈，handler 断连（弱网/隧道掐断慢投递）不再提前释放守卫——
         // detached 旧投递全程占位，新触发取不到名额即让位
@@ -2298,6 +2534,9 @@ pub async fn session_queue_jump(
 /// POST /m/api/v1/session-queue/retract（W4 撤回）：前查该会话 pending 中的目标条目
 /// （取审计字段）→ DAO retract_conn（内部再按 (session_id, id) 二次校验，防竞态误删）
 /// → 审计 action=retract → 200 {ok:true}；无此 pending 项 → 404 not_found。
+/// **原生归属豁免（任务 8 / 评审 I-3）**：本端点是「切换前遗留旧项」的唯一出口，
+/// 归 Native 的会话同样**允许**撤回（只删本机行，不碰终端/不入队/不 flush），
+/// 与 send/jump 的 409 OC_ROUTE_CHANGED 刻意不对称；见 handler 内的注释。
 /// P2-6：撤回与投递共守卫（照 jump 先例，device_identity 校验后、pending 前查之前取
 /// in-flight 名额）——撤回正删的行可能正是投递内核已取走待落账的队首，共守卫使两者
 /// 串行化，杜绝「撤回成功回执但消息仍被注入」的竞态；忙时短回执（200 failed 提示重试）。
@@ -2317,6 +2556,16 @@ pub async fn session_queue_retract(
     let Some((device_id, device_name)) = device_identity(&st, &headers) else {
         return forbidden_defense();
     };
+    // 任务 8 旧路径防双投屏障：撤回也是旧写入口——取 read permit 持到删除与审计结束。
+    // 许可不可失败（M-1）：锁等待不是错误，没有需要兜底的 500 死臂。
+    let _native_permit = st.opencode_native.try_legacy_permit(&sid).await;
+    // ===== 任务 8 / 评审 I-3：**撤回对原生归属会话仍然放行** =====
+    //
+    // 与 session-send / session-queue/jump 的 409 OC_ROUTE_CHANGED **刻意不对称**：
+    // 撤回只删本机 `inject_queue` 行（不碰终端、不入队、不 flush、不触发任何投递），
+    // 是「切换前遗留旧项」唯一的用户出口——若一并挡住，遗留行既投不出去也删不掉，
+    // 用户没有退路。防双投由投递侧承担：jump 与 flush 内核各自在同一 DB 临界区复查
+    // 归属，归 Native 的行永远不会被送去终端。
     let failed_body = |e: String| {
         json_no_store(
             StatusCode::OK,
@@ -2339,6 +2588,11 @@ pub async fn session_queue_retract(
             serde_json::json!({ "error": "not_found" }),
         );
     };
+    // macOS 的历史 OpenCode 待发项不能被旧普通撤回直接删掉：
+    // 它可能已写出，显式本地处置必须走单独的核对流程。
+    if policy::legacy_retired() && item.agent_type == "opencode" {
+        return legacy_disabled_response();
+    }
     let removed = st
         .store
         .with(|c| crate::database::dao::inject_queue::retract_conn(c, &sid, item_id));
@@ -2368,16 +2622,74 @@ pub async fn session_queue_retract(
 // （本地管理区，非 .gitignore 跟踪文件）；非 git 项目跳过。消息侧以
 // <image|file path> 内联标记引用（文件池既有约定，自动入池「我上传的」）。
 
+#[cfg(test)]
+pub(crate) mod attachment_test_hook {
+    use std::collections::HashMap;
+    use std::sync::{mpsc, LazyLock, Mutex};
+    use tokio::sync::oneshot;
+
+    pub struct Hook {
+        pub entered: oneshot::Sender<()>,
+        pub release: mpsc::Receiver<()>,
+        pub finished: oneshot::Sender<()>,
+    }
+    static HOOKS: LazyLock<Mutex<HashMap<String, Hook>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    pub fn install(cwd: String, hook: Hook) {
+        assert!(HOOKS.lock().unwrap().insert(cwd, hook).is_none());
+    }
+
+    pub struct Completion(Option<oneshot::Sender<()>>);
+
+    impl Drop for Completion {
+        fn drop(&mut self) {
+            if let Some(finished) = self.0.take() {
+                let _ = finished.send(());
+            }
+        }
+    }
+
+    pub(super) fn before_write(cwd: &str) -> Option<Completion> {
+        #[cfg(unix)]
+        crate::remote::attachments::tests::arm_upload_exclude_hardlink(cwd);
+        let hook = HOOKS.lock().unwrap().remove(cwd)?;
+        let _ = hook.entered.send(());
+        hook.release
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("测试必须放行写任务");
+        Some(Completion(Some(hook.finished)))
+    }
+}
+
 /// 移动端附件上传（query 传 session_id + 文件名；body = 原始字节）。
 /// 错误契约（与既有端点同族）：400 参数空；403 防御；404 {"error":"no_session"|"no_cwd"}
 /// （no_cwd 与 resume 同源口径）；413 {"error":"too_large"}；200 {path,size}。
 /// 安全边界：cwd 由服务端解析（客户端零路径输入），文件名服务端消毒——杜绝任意写。
+/// H07 D1：容量上限在 handler 内以**限长读取**（`axum::body::to_bytes`）单点收口——
+/// 超限（含缺 Content-Length 的流式体）在读取过程中即拒绝，响应契约 JSON 413 体；
+/// 不再挂 `DefaultBodyLimit` 层（框架兜底的通用 413 体不可辨错误码，且会让
+/// handler 的结构化预检对 >MAX 永不可达）。
 pub async fn session_attachment(
     State(st): State<Arc<RemoteState>>,
     headers: axum::http::HeaderMap,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
     Query(params): Query<HashMap<String, String>>,
-    body: Bytes,
+    body: axum::body::Body,
 ) -> Response {
+    // 保留重复键信息，防止授权路径或目标参数被最后一个值覆盖。
+    let query_url = format!("http://localhost/?{}", raw_query.as_deref().unwrap_or(""));
+    let Ok(query_url) = reqwest::Url::parse(&query_url) else {
+        return bad_request();
+    };
+    let mut seen = std::collections::HashSet::new();
+    for (key, _) in query_url.query_pairs() {
+        if matches!(key.as_ref(), "interaction_route" | "session_id" | "name")
+            && !seen.insert(key.into_owned())
+        {
+            return bad_request();
+        }
+    }
     // ① 参数校验（trim 判空——与 session-send 同口径）
     let sid = params.get("session_id").map(|s| s.trim().to_string());
     let Some(sid) = sid.filter(|s| !s.is_empty()) else {
@@ -2390,38 +2702,168 @@ pub async fn session_attachment(
     else {
         return bad_request();
     };
-    // ② 容量上限（结构化 413；Content-Length 预检可测，DefaultBodyLimit 为硬兜底）
-    if body.len() > crate::remote::attachments::MAX_ATTACHMENT_BYTES {
-        return json_no_store(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            serde_json::json!({ "error": "too_large" }),
-        );
-    }
+    // ② 容量上限（H07 D1 收口）：限长读取——超过 MAX_ATTACHMENT_BYTES 的请求体在
+    // **读取过程**中即被拒绝（内存占用有界），响应契约 JSON 错误体；恰好等于上限
+    // 的边界（to_bytes 允许 ≤limit）与超限（>limit 才 Err）同旧 `body.len() > MAX`
+    // 口径逐字节一致。参数校验（①）仍先行，错误优先级不变。
+    let body =
+        match axum::body::to_bytes(body, crate::remote::attachments::MAX_ATTACHMENT_BYTES).await {
+            Ok(body) => body,
+            Err(_) => {
+                return json_no_store(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    serde_json::json!({ "error": "too_large" }),
+                );
+            }
+        };
     // ③ 设备身份（防御 403 + 花名）
     let Some((device_id, device_name)) = device_identity(&st, &headers) else {
         return forbidden_defense();
     };
-    // ④ 会话查找（spawn_blocking：扫描是重活）——cwd 服务端解析的唯一来源
-    let probe_st = st.clone();
-    let probe_sid = sid.clone();
-    let session =
-        match tokio::task::spawn_blocking(move || find_session_sync(&probe_st, &probe_sid)).await {
-            Ok(Some(s)) => s,
-            Ok(None) => {
+    // 原生路径先恢复已选目标，不能因看板下卡或同 ID 新卡改变目录。
+    let requested_route = params
+        .get("interaction_route")
+        .map(String::as_str)
+        .unwrap_or("legacy");
+    let binding = headers
+        .get("x-opencode-expected-binding")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty());
+    if !matches!(requested_route, "legacy" | "opencode_native")
+        || (requested_route == "legacy" && binding.is_some())
+        || (requested_route == "opencode_native" && binding.is_none())
+    {
+        return bad_request();
+    }
+    let (session, fixed_target) = if requested_route == "opencode_native" {
+        let restored = match st.opencode_native.restore_active_target(&sid) {
+            Ok(restored) => restored,
+            Err(error) => {
                 return json_no_store(
-                    StatusCode::NOT_FOUND,
-                    serde_json::json!({ "error": "no_session" }),
-                );
-            }
-            Err(e) => {
-                log::error!("session-attachment 会话扫描任务异常: {e}");
-                return json_no_store(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    serde_json::json!({ "error": "internal" }),
-                );
+                    StatusCode::CONFLICT,
+                    serde_json::json!({ "error": error.code }),
+                )
             }
         };
-    let cwd = session.project_path.trim().to_string();
+        let Some((session, target)) = restored else {
+            // 无 active 路由的 fallback 一律受控拒绝（409 + 零副作用不变）。
+            // 复审 fix3：拒绝路径**不发起 echo 探针轮**——原实现在这里对缓存目标跑
+            // 完整写权链后仍返回 BINDING_STALE（成功臂纯浪费，且读取路径带远端写）。
+            // D-N5-1（码面判定，见 task-patch5 报告）：门未装配的注入构造里，投影的
+            // bindingRequired/能力禁用/恢复派发统一报「归属未证」——该会话从未有过
+            // 绑定，上传口报「绑定已变」是误传，与既有归属未证面同码；生产门恒装配，
+            // 保持 OC_BINDING_STALE 契约。判定为纯构造检查，零远端读、零状态写。
+            let code = if st.opencode_native.ownership_display_unverified() {
+                "OC_INSTANCE_OWNERSHIP_UNVERIFIED"
+            } else {
+                "OC_BINDING_STALE"
+            };
+            return json_no_store(StatusCode::CONFLICT, serde_json::json!({ "error": code }));
+        };
+        if !st
+            .opencode_native
+            .binding_matches(&target, binding.unwrap_or_default())
+        {
+            return json_no_store(
+                StatusCode::CONFLICT,
+                serde_json::json!({ "error": "OC_BINDING_STALE" }),
+            );
+        }
+        (session, Some(target))
+    } else {
+        let probe_st = st.clone();
+        let probe_sid = sid.clone();
+        let session =
+            match tokio::task::spawn_blocking(move || find_session_sync(&probe_st, &probe_sid))
+                .await
+            {
+                Ok(Some(session)) => session,
+                Ok(None) => {
+                    return json_no_store(
+                        StatusCode::NOT_FOUND,
+                        serde_json::json!({ "error": "no_session" }),
+                    )
+                }
+                Err(error) => {
+                    log::error!("session-attachment 会话扫描任务异常: {error}");
+                    return json_no_store(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        serde_json::json!({ "error": "internal" }),
+                    );
+                }
+            };
+        (session, None)
+    };
+    let policy_permit = if requested_route == "legacy" {
+        match crate::services::opencode_native::policy::acquire_legacy(
+            &st.store,
+            session.agent_type.clone(),
+        ) {
+            Ok(permit) => permit,
+            Err(_) => return legacy_disabled_response(),
+        }
+    } else {
+        None
+    };
+    let route_permit = if session.agent_type == crate::session::AgentType::OpenCode {
+        Some(st.opencode_native.legacy_lock(&sid).read_owned().await)
+    } else {
+        None
+    };
+    if session.agent_type == crate::session::AgentType::OpenCode {
+        let route = match st
+            .store
+            .with(|conn| crate::database::dao::opencode_actions::route_conn(conn, &sid))
+        {
+            Ok(route) => route,
+            Err(_) => {
+                return json_no_store(
+                    StatusCode::CONFLICT,
+                    serde_json::json!({ "error": "OC_ROUTE_CHANGED" }),
+                )
+            }
+        };
+        if requested_route == "legacy" {
+            if route.as_ref().is_some_and(|row| {
+                row.route_state == crate::database::dao::opencode_actions::ROUTE_ACTIVE
+            }) {
+                return super::opencode_native::route_changed_response();
+            }
+        } else {
+            let Some(target) = fixed_target.as_ref() else {
+                return json_no_store(
+                    StatusCode::CONFLICT,
+                    serde_json::json!({ "error": "OC_BINDING_STALE" }),
+                );
+            };
+            // 复审 fix3：先判**本地拒绝条件**（路由 active + 同代际 + 目录有效），
+            // 拒绝路径零远端写（不发起探针轮）；echo 写权链只在实际放行前跑一轮。
+            let route_ok = route.as_ref().is_some_and(|row| {
+                row.route_state == crate::database::dao::opencode_actions::ROUTE_ACTIVE
+                    && row.same_runtime(target)
+            });
+            let directory_ok = std::fs::canonicalize(&target.directory).ok().as_ref()
+                == Some(&target.directory)
+                && target.directory.is_dir();
+            if !route_ok || !directory_ok {
+                return json_no_store(
+                    StatusCode::CONFLICT,
+                    serde_json::json!({ "error": "OC_BINDING_STALE" }),
+                );
+            }
+            if let Err(error) = st.opencode_native.verify_target_identity(target).await {
+                return json_no_store(
+                    StatusCode::CONFLICT,
+                    serde_json::json!({ "error": error.code }),
+                );
+            }
+        }
+    }
+    // 原生附件必须写入已核验的精确路径，路径结尾的空格是目录名的一部分。
+    let cwd = fixed_target.as_ref().map_or_else(
+        || session.project_path.trim().to_owned(),
+        |target| target.directory.to_string_lossy().into_owned(),
+    );
     if cwd.is_empty() {
         // 与 resume 的 no_cwd 同源口径（该会话没有项目目录信息）
         return json_no_store(
@@ -2437,22 +2879,81 @@ pub async fn session_attachment(
     }
     let tool = session.agent_type.tool_id().to_string();
     // ⑤ 写盘（spawn_blocking：同步 IO）+ 审计
-    let write_cwd = cwd.clone();
+    let write_cwd = std::path::PathBuf::from(&cwd);
     let write_sid = sid.clone();
     let write_name = raw_name.clone();
     let write_body = body;
     let size = write_body.len();
-    let written = tokio::task::spawn_blocking(move || {
-        crate::remote::attachments::write_attachment(
-            std::path::Path::new(&write_cwd),
-            &write_sid,
-            &write_name,
-            &write_body,
-        )
-    })
+    let write_state = Arc::clone(&st);
+    let written = tokio::task::spawn_blocking(
+        move || -> std::io::Result<Option<(std::path::PathBuf, Option<String>)>> {
+            let _policy_permit = policy_permit;
+            let _route_permit = route_permit;
+            #[cfg(test)]
+            let _hook = attachment_test_hook::before_write(&write_cwd.to_string_lossy());
+            let valid = write_state.store.with(|conn| {
+                crate::remote::pairing::device_valid(
+                    conn,
+                    &device_id,
+                    chrono::Utc::now().timestamp_millis(),
+                )
+            });
+            if !valid {
+                return Ok(None);
+            }
+            let (path, exclude_warning) =
+                match crate::remote::attachments::write_attachment_with_exclude_warning(
+                    &write_cwd,
+                    &write_sid,
+                    &write_name,
+                    &write_body,
+                ) {
+                    Ok(result) => result,
+                    Err(error) => {
+                        endpoint_audit(
+                            &write_state,
+                            &device_id,
+                            &device_name,
+                            &tool,
+                            &write_sid,
+                            &write_name,
+                            "attachment",
+                            "failed",
+                        );
+                        return Err(error);
+                    }
+                };
+            endpoint_audit(
+                &write_state,
+                &device_id,
+                &device_name,
+                &tool,
+                &write_sid,
+                &write_name,
+                "attachment",
+                "ok",
+            );
+            if let Some(home) = (write_state.home_source)() {
+                crate::remote::attachments::append_index_entry(
+                    std::path::Path::new(&home),
+                    &crate::remote::attachments::AttachmentIndexEntry {
+                        project: write_cwd.to_string_lossy().into_owned(),
+                        session: write_sid,
+                        tool,
+                        name: crate::remote::attachments::sanitize_file_name(&write_name),
+                        path: path.to_string_lossy().into_owned(),
+                        size: size as u64,
+                        ts: (write_state.now_source)(),
+                    },
+                );
+            }
+            Ok(Some((path, exclude_warning)))
+        },
+    )
     .await;
-    let path = match written {
-        Ok(Ok(p)) => p,
+    let (path, exclude_warning) = match written {
+        Ok(Ok(Some(result))) => result,
+        Ok(Ok(None)) => return forbidden_defense(),
         Ok(Err(e)) => {
             log::error!("session-attachment 落盘失败: {e}");
             return json_no_store(
@@ -2468,39 +2969,16 @@ pub async fn session_attachment(
             );
         }
     };
-    endpoint_audit(
-        &st,
-        &device_id,
-        &device_name,
-        &tool,
-        &sid,
-        &raw_name,
-        "attachment",
-        "ok",
-    );
-    // 数据管理索引（C5）：追加一条（服务端写入；home 不可得则跳过——索引只服务
-    // 桌面管理面，丢失不影响附件本身）。测试态 home_source=None 自动跳过
-    if let Some(home) = (st.home_source)() {
-        crate::remote::attachments::append_index_entry(
-            std::path::Path::new(&home),
-            &crate::remote::attachments::AttachmentIndexEntry {
-                project: cwd,
-                session: sid,
-                tool,
-                name: crate::remote::attachments::sanitize_file_name(&raw_name),
-                path: path.to_string_lossy().into_owned(),
-                size: size as u64,
-                ts: (st.now_source)(),
-            },
-        );
+    let mut response = serde_json::json!({
+        "path": path.to_string_lossy(),
+        "size": size,
+    });
+    // 附件已成功落盘；本地排除规则未确认追加时如实告知（用户可自行补写
+    // `.git/info/exclude` 或排查并发修改），不把警告冒称成功。
+    if let Some(warning) = exclude_warning {
+        response["excludeWarning"] = serde_json::Value::String(warning);
     }
-    json_no_store(
-        StatusCode::OK,
-        serde_json::json!({
-            "path": path.to_string_lossy(),
-            "size": size,
-        }),
-    )
+    json_no_store(StatusCode::OK, response)
 }
 
 // ==== M8 Task 11：审批端点（session-approve-options / session-approve）====
@@ -2877,7 +3355,11 @@ fn read_dialog_options_render_wait_with(
 /// 严格档 reason。
 /// 复合键说明（Task 5 教训）：本端点无 agent_type 入参，快照里按 id 找**第一个**匹配；
 /// id 跨工具撞名时取第一个匹配——契约如此。
-fn approve_options_scan(st: &Arc<RemoteState>, session_id: &str) -> Option<ApproveScanHit> {
+fn approve_options_scan(
+    st: &Arc<RemoteState>,
+    session_id: &str,
+    _session: Option<crate::session::Session>,
+) -> Option<ApproveScanHit> {
     // 动作路径：问答载荷组装前先取新鲜快照（按钮按下即写终端）
     let session = (st.fresh_session_source)()
         .sessions
@@ -3297,18 +3779,26 @@ pub async fn session_approve_options(
     else {
         return bad_request();
     };
+    let (_policy_permit, _policy_session) = match legacy_policy_permit(&st, &sid).await {
+        Ok(permit) => permit,
+        Err(response) => return response,
+    };
+
     let probe_st = st.clone();
-    let scan =
-        match tokio::task::spawn_blocking(move || approve_options_scan(&probe_st, &sid)).await {
-            Ok(v) => v,
-            Err(e) => {
-                log::error!("session-approve-options 会话扫描任务异常: {e}");
-                return json_no_store(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    serde_json::json!({ "error": "internal" }),
-                );
-            }
-        };
+    let scan = match policy::spawn_blocking(_policy_permit.clone(), move || {
+        approve_options_scan(&probe_st, &sid, _policy_session)
+    })
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            log::error!("session-approve-options 会话扫描任务异常: {e}");
+            return json_no_store(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                serde_json::json!({ "error": "internal" }),
+            );
+        }
+    };
     let (
         available,
         options,
@@ -3357,7 +3847,7 @@ pub async fn session_approve_options(
             let probe_tool = t.to_string();
             match tokio::time::timeout(
                 std::time::Duration::from_secs(5),
-                tokio::task::spawn_blocking(move || {
+                policy::spawn_blocking(_policy_permit.clone(), move || {
                     crate::inject::approve::cached_cli_version(&probe_tool)
                 }),
             )
@@ -3543,6 +4033,7 @@ pub async fn session_approve(
     Json(req): Json<SessionApproveReq>,
 ) -> Response {
     let sid = req.session_id.trim().to_string();
+
     let option_id = req.option_id.trim().to_string();
     if sid.is_empty() || option_id.is_empty() {
         return bad_request();
@@ -3550,22 +4041,37 @@ pub async fn session_approve(
     let Some((device_id, device_name)) = device_identity(&st, &headers) else {
         return forbidden_defense();
     };
+    let (_policy_permit, _policy_session) = match legacy_policy_permit(&st, &sid).await {
+        Ok(permit) => permit,
+        Err(response) => return response,
+    };
+    // 任务 8 旧路径防双投屏障：审批也是旧写入口（终端键序）——取同会话 read permit
+    // 持到注入与落账结束；归属复查在会话查找的**同一 spawn_blocking 临界区**内
+    // （先于任何屏读与键位组装）。
+    // 许可不可失败（M-1）：锁等待不是错误，没有需要兜底的 500 死臂。
+    let _native_permit = st.opencode_native.try_legacy_permit(&sid).await;
     // 会话查找 + Waiting 复核 + 映射/选项解析（一个 spawn_blocking：扫描与 KV 读取
     // 均为同步阻塞；session_source 与 store.with 顺序执行不嵌套——生产 session_source
     // 内部自取全局 DB 锁，嵌套即自锁死锁，M4 纪律）
     let probe_st = st.clone();
     let probe_sid = sid.clone();
     let probe_opt = option_id.clone();
-    let lookup = match tokio::task::spawn_blocking(move || {
-        // 复合键说明（Task 5 教训）：本端点无 agent_type 入参，快照里按 id 找第一个匹配；
-        // id 跨工具撞名时取第一个匹配——契约如此。动作路径取新鲜快照（Task 4）
-        let Some(session) = (probe_st.fresh_session_source)()
-            .sessions
-            .into_iter()
-            .find(|s| s.id == probe_sid)
-        else {
+    let lookup = match policy::spawn_blocking(_policy_permit.clone(), move || {
+        // 只能使用已通过旧交互准入的新鲜快照；不能再扫到另一个目标。
+        let Some(session) = _policy_session else {
             return Err("no_session");
         };
+        // ===== 任务 8：原生归属屏障（同临界区复查，先于一切屏读/键位）=====
+        // 已归 Native 的会话：键位永不交付给旧 FIFO（409 OC_ROUTE_CHANGED）。
+        // M-2：归属读失败按内部错误上行（不得当成「未归原生」放行）。
+        match native_owned(&probe_st, &probe_sid) {
+            Ok(true) => return Err(super::opencode_native::ROUTE_CHANGED_ERR),
+            Ok(false) => {}
+            Err(e) => {
+                log::error!("session-approve 原生归属读取失败（会话 {probe_sid}）: {e}");
+                return Err("internal");
+            }
+        }
         // ===== Task 15 止血门（I2 复评，2026-10-12 P0）：**同根因的兄弟写路径** =====
         //
         // 根因与三写入口（session-mode/switch・session-mode/menu・
@@ -3777,6 +4283,18 @@ pub async fn session_approve(
                 );
                 return app_form_pending_response();
             }
+            // 任务 8：原生归属屏障拒绝——统一 409 OC_ROUTE_CHANGED 回执（零注入零审计，
+            // 与其余校验失败同口径）
+            if code == super::opencode_native::ROUTE_CHANGED_ERR {
+                return super::opencode_native::route_changed_response();
+            }
+            // M-2：归属读失败（fail-closed）——按内部错误回执，绝不按「未归原生」继续
+            if code == "internal" {
+                return json_no_store(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    serde_json::json!({ "error": "internal" }),
+                );
+            }
             let status = if code == "not_waiting" {
                 StatusCode::CONFLICT
             } else {
@@ -3799,7 +4317,7 @@ pub async fn session_approve(
     // 断连双投修复）：handler 断连（弱网/隧道掐断慢投递）不再提前释放守卫——detached
     // 投递全程占位，新触发取不到名额即让位。忙 → None 哨兵：让位不投递亦不落审计
     // （无投递发生不写审计——retract/jump 忙让位同口径）
-    let attempt = tokio::task::spawn_blocking(move || {
+    let attempt = policy::spawn_blocking(_policy_permit.clone(), move || {
         // `?` = 守卫忙（try_acquire_inflight 得 None）→ 闭包哨兵返回 None：让位不投递
         let _guard = crate::inject::queue::try_acquire_inflight(&approve_sid)?;
         // 逐键投递（导航确认是多键序列：↓×k + Enter）；首错即停
@@ -4126,12 +4644,17 @@ pub async fn session_plan_feedback(
     Json(req): Json<SessionPlanFeedbackReq>,
 ) -> Response {
     let sid = req.session_id.trim().to_string();
+
     let action = req.action.trim().to_string();
     if sid.is_empty() || action.is_empty() {
         return bad_request();
     }
     let Some((device_id, device_name)) = device_identity(&st, &headers) else {
         return forbidden_defense();
+    };
+    let (_policy_permit, _policy_session) = match legacy_policy_permit(&st, &sid).await {
+        Ok(permit) => permit,
+        Err(response) => return response,
     };
     // 动作解析（端点层判参，内核吃枚举）
     let op = match action.as_str() {
@@ -4145,16 +4668,9 @@ pub async fn session_plan_feedback(
     if matches!(&op, PlanFeedbackOp::Type { text, submit: false } if text.trim().is_empty()) {
         return bad_request(); // 覆盖写入空文本无意义（前端已禁用，防御）
     }
-    // 会话查找（同 session_approve 的复合键契约：快照按 id 找第一个匹配）；
-    // 动作路径取新鲜快照（Task 4）
-    let probe_st = st.clone();
-    let probe_sid = sid.clone();
-    let lookup = match tokio::task::spawn_blocking(move || {
-        let Some(session) = (probe_st.fresh_session_source)()
-            .sessions
-            .into_iter()
-            .find(|s| s.id == probe_sid)
-        else {
+    // 使用准入时固定的目标，不在组装旧操作时重新扫描。
+    let lookup = match policy::spawn_blocking(_policy_permit.clone(), move || {
+        let Some(session) = _policy_session else {
             return Err("no_session");
         };
         let tool = session.agent_type.tool_id().to_string();
@@ -4191,18 +4707,21 @@ pub async fn session_plan_feedback(
     let op_for_audit = op.clone();
     let closure_st = st.clone();
     let closure_tool = tool.clone();
-    let attempt = tokio::task::spawn_blocking(move || -> Option<Result<(), String>> {
-        // 守卫忙 → None 哨兵：让位不投递（同 session-approve）
-        let _guard = crate::inject::queue::try_acquire_inflight(&fb_sid)?;
-        let mut terminal = PlanFeedbackClosures {
-            pid,
-            spec: &spec,
-            injector: &*injector,
-            screen_probe: &closure_st.screen_probe,
-            tool: &closure_tool,
-        };
-        Some(run_plan_feedback_stages(&op, &mut terminal))
-    })
+    let attempt = policy::spawn_blocking(
+        _policy_permit.clone(),
+        move || -> Option<Result<(), String>> {
+            // 守卫忙 → None 哨兵：让位不投递（同 session-approve）
+            let _guard = crate::inject::queue::try_acquire_inflight(&fb_sid)?;
+            let mut terminal = PlanFeedbackClosures {
+                pid,
+                spec: &spec,
+                injector: &*injector,
+                screen_probe: &closure_st.screen_probe,
+                tool: &closure_tool,
+            };
+            Some(run_plan_feedback_stages(&op, &mut terminal))
+        },
+    )
     .await;
     let sent = match attempt {
         Ok(Some(v)) => v,
@@ -4450,6 +4969,7 @@ pub async fn sessions_archived_delete(
 pub struct SessionActionReq {
     #[serde(default)]
     pub session_id: String,
+    pub agent_type: Option<String>,
 }
 
 /// POST /session-close {sessionId}：CLI 会话硬杀（桌面 kill_session 同内核）。
@@ -4470,18 +4990,31 @@ pub async fn session_close(
         return forbidden_defense();
     };
     let st2 = st.clone();
+    let expected_tool = req.agent_type;
+    let close_guard = st.opencode_native.legacy_lock(&sid).write_owned().await;
     let sid2 = sid.clone(); // 移动副本进闭包，原值保留给审计（session-open 同一写法）
                             // Err 携带 (工具串, 原因)：工具串供审计（活快照命中才有，no_session 为空串）
     let outcome: Result<(String, ()), (String, String)> = tokio::task::spawn_blocking(move || {
         // 动作路径（远程杀进程前定位 pid）：取新鲜快照，绝不按旧 pid 杀进程
-        let Some(s) = (st2.fresh_session_source)()
-            .sessions
-            .into_iter()
-            .find(|s| s.id == sid2)
-        else {
+        let _close_guard = close_guard;
+        let snapshot = (st2.fresh_session_source)();
+        let mut matching = snapshot.sessions.iter().filter(|s| {
+            s.id == sid2
+                && expected_tool
+                    .as_deref()
+                    .is_none_or(|tool| s.agent_type.tool_id() == tool)
+        });
+        let Some(s) = matching.next() else {
             return Err((String::new(), "no_session".to_string()));
         };
         let tool = s.agent_type.tool_id().to_string();
+        // macOS 的按 PID 终止无法把进程代际核验与发信号绑定为原子操作。
+        if policy::legacy_retired()
+            && (s.agent_type == crate::session::AgentType::OpenCode
+                || matching.any(|other| other.agent_type == crate::session::AgentType::OpenCode))
+        {
+            return Err(("opencode".into(), "OC_CLOSE_TARGET_UNVERIFIED".into()));
+        }
         if matches!(s.form, crate::session::ProcessForm::App) {
             return Err((tool, "form_not_supported".to_string()));
         }
@@ -4523,6 +5056,13 @@ pub async fn session_close(
                 StatusCode::NOT_FOUND,
                 serde_json::json!({ "error": "no_session" }),
             ),
+            "OC_CLOSE_TARGET_UNVERIFIED" => {
+                audit(&tool, "failed");
+                json_no_store(
+                    StatusCode::CONFLICT,
+                    serde_json::json!({"error": "OC_CLOSE_TARGET_UNVERIFIED"}),
+                )
+            }
             "form_not_supported" => {
                 audit(&tool, "failed");
                 json_no_store(
@@ -4693,8 +5233,9 @@ struct QuestionScanHit {
 fn question_scan_sync(
     st: &Arc<RemoteState>,
     session_id: &str,
+    session: Option<crate::session::Session>,
 ) -> Option<(crate::session::Session, QuestionScanHit)> {
-    let session = find_session_sync(st, session_id)?;
+    let session = session?;
     let tool = session.agent_type.tool_id().to_string();
     // 硬约束①：审批等待标记在场 → 问答卡不可用（审批会话的键位面只有审批端点承载）
     let approval_marked = st
@@ -4886,8 +5427,16 @@ pub async fn session_question(
     else {
         return bad_request();
     };
+    let (_policy_permit, _policy_session) = match legacy_policy_permit(&st, &sid).await {
+        Ok(permit) => permit,
+        Err(response) => return response,
+    };
+
     let probe_st = st.clone();
-    let scan = match tokio::task::spawn_blocking(move || question_scan_sync(&probe_st, &sid)).await
+    let scan = match policy::spawn_blocking(_policy_permit.clone(), move || {
+        question_scan_sync(&probe_st, &sid, _policy_session)
+    })
+    .await
     {
         Ok(v) => v,
         Err(e) => {
@@ -4956,7 +5505,7 @@ pub async fn session_question(
             } else {
                 let st2 = st.clone();
                 let tool2 = tool_id.clone();
-                tokio::task::spawn_blocking(move || {
+                policy::spawn_blocking(_policy_permit.clone(), move || {
                     (st2.screen_probe)(&tool2, pid).and_then(|lines| {
                         // opencode 方言解析（题页锚 `enter toggle`；Confirm 页 → review）
                         if tool2 == "opencode" {
@@ -5289,6 +5838,7 @@ pub async fn session_question_answer(
     Json(req): Json<SessionQuestionAnswerReq>,
 ) -> Response {
     let sid = req.session_id.trim().to_string();
+
     let action = match crate::inject::question::AnswerAction::parse(req.action.trim()) {
         Some(a) => a,
         None => return bad_request(),
@@ -5343,16 +5893,37 @@ pub async fn session_question_answer(
     let Some((device_id, device_name)) = device_identity(&st, &headers) else {
         return forbidden_defense();
     };
+    let (_policy_permit, _policy_session) = match legacy_policy_permit(&st, &sid).await {
+        Ok(permit) => permit,
+        Err(response) => return response,
+    };
+    // 任务 8 旧路径防双投屏障：问答也是旧写入口（终端键序）——取同会话 read permit
+    // 持到注入与落账结束；归属复查在会话查找的**同一 spawn_blocking 临界区**内
+    // （先于任何屏读与键序构造）。
+    // 许可不可失败（M-1）：锁等待不是错误，没有需要兜底的 500 死臂。
+    let _native_permit = st.opencode_native.try_legacy_permit(&sid).await;
     // 会话查找 + 双通道复核 + 序列构造（一个 spawn_blocking；锁纪律同 approve）
     // 止血门拒绝臂的审计摘要要 `req.index`（Copy），而 `req` 整体被 move 进闭包——
     // 闭包前备份一份
     let answer_index = req.index;
     let probe_st = st.clone();
     let probe_sid = sid.clone();
-    let lookup = match tokio::task::spawn_blocking(move || {
-        let Some((session, hit)) = question_scan_sync(&probe_st, &probe_sid) else {
+    let lookup = match policy::spawn_blocking(_policy_permit.clone(), move || {
+        let Some((session, hit)) = question_scan_sync(&probe_st, &probe_sid, _policy_session)
+        else {
             return Err("no_question");
         };
+        // ===== 任务 8：原生归属屏障（同临界区复查，先于一切屏读/键序）=====
+        // 已归 Native 的会话：问答键序永不交付给旧 FIFO（409 OC_ROUTE_CHANGED）。
+        // M-2：归属读失败按内部错误上行（不得当成「未归原生」放行）。
+        match native_owned(&probe_st, &probe_sid) {
+            Ok(true) => return Err(super::opencode_native::ROUTE_CHANGED_ERR),
+            Ok(false) => {}
+            Err(e) => {
+                log::error!("session-question/answer 原生归属读取失败（会话 {probe_sid}）: {e}");
+                return Err("internal");
+            }
+        }
         // codex APP 止血门（Task 3）：问答在场 ∧ codex APP 形态 → 零键序零屏读拒绝
         //（门在键序构造与阶段机之前）。错误码经 Err 串上行，审计 + 409 回执在
         // lookup 的拒绝分支。
@@ -5520,6 +6091,17 @@ pub async fn session_question_answer(
                 audit_app_form_pending(&st, &device_id, &device_name, &sid, &audit_label, "answer");
                 return app_form_pending_response();
             }
+            // 任务 8：原生归属屏障拒绝——统一 409 OC_ROUTE_CHANGED 回执（零注入零审计）
+            if code == super::opencode_native::ROUTE_CHANGED_ERR {
+                return super::opencode_native::route_changed_response();
+            }
+            // M-2：归属读失败（fail-closed）——内部错误，绝不按「未归原生」继续
+            if code == "internal" {
+                return json_no_store(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    serde_json::json!({ "error": "internal" }),
+                );
+            }
             // 校验失败零注入零审计（approve guards 同口径）：
             // - no_question（409）：会话不在快照 / 审批标记隔离 / 双通道均未命中
             //   ——统一 409（不给存在性预言机；审批标记在场时本就不得出问答键）
@@ -5568,7 +6150,7 @@ pub async fn session_question_answer(
     // 让位，不投递亦不落审计（无投递发生，approve/retract/jump 忙让位同口径）
     // 闭包外回执 JSON 也要用（StageDone 的 text 字段）——闭包 move 前克隆一份
     let free_text_for_json = free_text.clone();
-    let attempt = tokio::task::spawn_blocking(move || {
+    let attempt = policy::spawn_blocking(_policy_permit.clone(), move || {
         let _guard = crate::inject::queue::try_acquire_inflight(&answer_sid)?;
         Some(dispatch_question_action(
             &probe_st2,
@@ -7775,17 +8357,48 @@ where
 // 归一（命中已信任条款复用其精确 casing；测试注入 tempdir/None 零接触真实主目录）。
 
 /// POST /m/api/v1/session-open 请求体（camelCase；缺参不触发 axum 提取器 422，
-/// 由 handler 统一按契约给 400 bad_request）
+/// 由 handler 统一按契约给 400 bad_request）。F4：`abandon` = 显式放弃在途的
+/// 待确认恢复（pending 核销路径之二——观察确认或用户显式放弃才流转）。
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionOpenReq {
     #[serde(default)]
     pub session_id: String,
+    #[serde(default)]
+    pub abandon: bool,
 }
 
-/// POST /m/api/v1/session-open（R5 一键 resume）：查找会话 → inject::resume 核心
-/// （spawner 缝消费 RemoteState.resume_spawner）→ 按错误契约分诊。查找与 spawn
-/// 出手同在一个 spawn_blocking（会话扫描是重活，sessions handler 同一先例）。
+/// session-open 单次请求的终态（F4 pending 状态机扩展；`Failed` 承载既有
+/// Err 语义——哨兵串 404 分诊在响应层）。
+enum OpenOutcome {
+    /// 回执成功：出手后观察确认，或 pending 复查核销（后者零出手）。
+    Opened { trust_prompt: bool },
+    /// 待确认态保留：出手了但观察窗内未就绪（fail-closed，不冒充成功）。
+    Pending { trust_prompt: bool },
+    /// 复请求被拒：pending 未核销且复查未命中（零出手、零审计）。
+    PendingRefused,
+    /// 显式放弃（或幂等放弃）：pending 清空。
+    Abandoned,
+    /// IC fix round 1（P1-B）：放弃暂缓——起窗权在途（准备/交付仍在执行，交付链
+    /// 无法确认取消），占位保持；诚实回执 pending 形态 + 专用码（零出手、零状态
+    /// 变化，审计留痕）。
+    AbandonDeferred,
+    /// 出手失败（哨兵串/人类可读文案，既有分诊）。
+    Failed(String),
+}
+
+/// POST /m/api/v1/session-open（R5 一键 resume；F4 项 4A 起为**待确认态**）：
+/// 查找会话 → inject::restore_pending 核心（回执=真实窗口观察：进程面+登记面；
+/// pending 未核销时重复请求零出手，显式放弃清态）→ 按错误契约分诊。
+/// 查找与 spawn 出手同在一个 spawn_blocking（会话扫描是重活，sessions handler
+/// 同一先例）。
+///
+/// F4 响应契约增量：`200 {"status":"pending","code":"OC_RESTORE_PENDING"}`（待
+/// 确认——请手动核对主机窗口；再次请求将先复查观察，命中即核销）、
+/// `200 {"status":"abandoned"}`（已放弃，可重新发起）。审计口径：spawn 出手的
+/// 请求照旧落账（确认=ok；未确认=`pending:OC_RESTORE_PENDING`）；复查核销落
+/// `ok`（完成一次 open）；放弃落 `abandoned`；复查未命中（零出手零状态变化）
+/// 不落账（与 404 校验失败同口径）。
 pub async fn session_open(
     State(st): State<Arc<RemoteState>>,
     headers: axum::http::HeaderMap,
@@ -7800,12 +8413,39 @@ pub async fn session_open(
     let Some((device_id, device_name)) = device_identity(&st, &headers) else {
         return forbidden_defense();
     };
+    // 创建账本中的会话只能沿原创建记录核对，避免通用恢复重新发现另一服务。
+    match st
+        .store
+        .with(|conn| crate::database::dao::opencode_creates::contains_session(conn, &sid))
+    {
+        Ok(false) => {}
+        Ok(true) => {
+            return json_no_store(
+                StatusCode::CONFLICT,
+                serde_json::json!({
+                    "error": "OC_RESTORE_PENDING",
+                    "reasonCode": "OC_RESTORE_PENDING",
+                    "reason": "Check the window and first message in the original creation record",
+                }),
+            )
+        }
+        Err(_) => {
+            return json_no_store(
+                StatusCode::CONFLICT,
+                serde_json::json!({
+                    "error": "OC_STORE_FAILED",
+                    "reasonCode": "OC_STORE_FAILED",
+                }),
+            )
+        }
+    }
     // ③ 查找 + 核心（spawn_blocking：扫描是同步阻塞调用；核心内 wt 探测进程级缓存）。
     // sid 移动副本进闭包，原值保留给审计（session-send 同一写法）
     let probe_st = st.clone();
     let probe_sid = sid.clone();
-    let outcome = match tokio::task::spawn_blocking(
-        move || -> Result<(String, Result<(), String>, bool), String> {
+    let abandon = req.abandon;
+    let outcome =
+        match tokio::task::spawn_blocking(move || -> Result<(String, OpenOutcome), String> {
             // 复合键口径（Task 5 教训）：快照里按 id 找第一个匹配——契约如此
             // （mut：T3 信任归一在 spawn 前原地改写 project_path）。
             // 动作路径（远程 resume 开终端）：取新鲜快照，避免按已退出会话的旧记录开窗
@@ -7864,25 +8504,113 @@ pub async fn session_open(
             let home = (probe_st.home_source)().map(std::path::PathBuf::from);
             let trust_prompt =
                 crate::inject::resume::normalize_cwd_for_trust(&mut session, home.as_deref());
-            let r = crate::inject::resume::open_session_terminal_with(
-                &session,
-                probe_st.resume_spawner.as_ref(),
-            );
-            Ok((tool, r, trust_prompt))
-        },
-    )
-    .await
-    {
-        Ok(v) => v,
-        Err(e) => {
-            log::error!("session-open 会话扫描任务异常: {e}");
-            return json_no_store(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                serde_json::json!({ "error": "internal" }),
-            );
-        }
-    };
-    let (tool, result, trust_prompt) = match outcome {
+            // F4 项 4A：恢复进 pending 状态机（回执=真实窗口观察；opencode 专属
+            // 待确认态，其余工具既有链零行为变更）
+            let spawner = probe_st.resume_spawner.clone();
+            let guarded_store = probe_st.store.clone();
+            let guarded_sid = probe_sid.clone();
+            let guard_delivery = move |spec: &crate::inject::resume::SpawnSpec| {
+                use crate::database::dao::opencode_creates;
+                let _delivery = opencode_creates::WINDOW_DELIVERY
+                    .lock()
+                    .unwrap_or_else(|err| err.into_inner());
+                match guarded_store
+                    .with(|conn| opencode_creates::contains_session(conn, &guarded_sid))
+                {
+                    Ok(false) => spawner(spec),
+                    _ => Err("OC_RESTORE_PENDING: Check the original creation record".to_owned()),
+                }
+            };
+            let flow = if policy::legacy_retired()
+                && session.agent_type == crate::session::AgentType::OpenCode
+            {
+                use crate::services::opencode_native::{
+                    client::NativeClient, discovery::bind_session, projection::segment,
+                };
+                let verified = (|| -> Result<_, String> {
+                    let directory =
+                        crate::inject::create_path::validate_existing(&session.project_path)
+                            .map_err(|error| {
+                                format!(
+                                    "{}: {}",
+                                    crate::inject::resume::OC_RESUME_DIRECTORY_UNRESOLVED,
+                                    error.message
+                                )
+                            })?;
+                    session.project_path.clone_from(&directory.path);
+                    let path = std::path::Path::new(&directory.path);
+                    let hub = &probe_st.opencode_native;
+                    let service = hub
+                        .discover_create_service(path)
+                        .map_err(|error| error.message)?;
+                    let client =
+                        NativeClient::for_create(service.clone()).map_err(|error| error.message)?;
+                    let sid = segment(&session.id).map_err(|error| error.message)?;
+                    let native = tokio::runtime::Handle::current()
+                        .block_on(async {
+                            let info = client.read_json("/api/info", &[]).await?;
+                            let record = client
+                                .read_json(&format!("/api/session/{sid}"), &[])
+                                .await?;
+                            bind_session(&session, &service, &info, &record)
+                        })
+                        .map_err(|error| error.message)?;
+                    if native.directory != path || !directory.still_current() {
+                        return Err("OC_DIRECTORY_MISMATCH: OpenCode 项目目录发生变化".into());
+                    }
+                    crate::inject::restore_pending::open_verified_opencode(
+                        &session,
+                        &guard_delivery,
+                        abandon,
+                        hub,
+                        &service,
+                        &directory,
+                    )
+                })();
+                verified
+            } else {
+                crate::inject::restore_pending::open_restore_with_pending(
+                    &session,
+                    &guard_delivery,
+                    abandon,
+                )
+            };
+            let outcome = match flow {
+                Ok(crate::inject::restore_pending::RestoreFlow::Dispatched { confirmed }) => {
+                    if confirmed {
+                        OpenOutcome::Opened { trust_prompt }
+                    } else {
+                        OpenOutcome::Pending { trust_prompt }
+                    }
+                }
+                Ok(crate::inject::restore_pending::RestoreFlow::PendingConfirmed) => {
+                    OpenOutcome::Opened { trust_prompt }
+                }
+                Ok(crate::inject::restore_pending::RestoreFlow::PendingRefused) => {
+                    OpenOutcome::PendingRefused
+                }
+                Ok(crate::inject::restore_pending::RestoreFlow::Abandoned) => {
+                    OpenOutcome::Abandoned
+                }
+                Ok(crate::inject::restore_pending::RestoreFlow::AbandonDeferred) => {
+                    OpenOutcome::AbandonDeferred
+                }
+                Err(e) => OpenOutcome::Failed(e),
+            };
+            Ok((tool, outcome))
+        })
+        .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                log::error!("session-open 会话扫描任务异常: {e}");
+                return json_no_store(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    serde_json::json!({ "error": "internal" }),
+                );
+            }
+        };
+    let (tool, outcome) = match outcome {
         Ok(v) => v,
         Err(code) => {
             // 会话不在快照：无工具可审计（session-send 的 no_session 同口径不落账）
@@ -7891,8 +8619,8 @@ pub async fn session_open(
     };
     // ④ 错误契约分诊：哨兵串映射 404（校验失败不写审计、spawner 未被调用）；
     // 其余为 spawn 出手后的失败 → 200 failed（可重试回执）+ 审计 failed
-    match result {
-        Ok(()) => {
+    match outcome {
+        OpenOutcome::Opened { trust_prompt } => {
             // 审计 content = resume 命令摘要（audit_write 内 summarize 截断）
             endpoint_audit(
                 &st,
@@ -7916,10 +8644,96 @@ pub async fn session_open(
             }
             json_no_store(StatusCode::OK, body)
         }
-        Err(e) if e == "no_resume_command" || e == "no_cwd" => {
-            json_no_store(StatusCode::NOT_FOUND, serde_json::json!({ "error": e }))
+        OpenOutcome::Pending { trust_prompt } => {
+            // F4：出手了但观察未就绪 → 待确认态保留（fail-closed）。审计诚实留痕
+            // pending（不记 ok——「audit open ok 但窗未核实」正是 M2 要堵的账实背离）
+            endpoint_audit(
+                &st,
+                &device_id,
+                &device_name,
+                &tool,
+                &sid,
+                &resume_command_for_audit(&tool, &sid),
+                "open",
+                "pending:OC_RESTORE_PENDING",
+            );
+            log::warn!(
+                "session-open 待确认（session={sid}）：窗口观察未就绪，已保留待确认态——\
+                 请手动核对主机终端；再次请求将先复查观察，命中即核销"
+            );
+            let mut body = serde_json::json!({
+                "status": "pending",
+                "code": "OC_RESTORE_PENDING",
+            });
+            if trust_prompt {
+                body["trustPromptExpected"] = serde_json::Value::Bool(true);
+            }
+            json_no_store(StatusCode::OK, body)
         }
-        Err(e) => {
+        OpenOutcome::PendingRefused => {
+            // 复请求被拒（零出手、零状态变化）：不落账（404 校验失败同口径），
+            // 幂等返回同一 pending 形态
+            log::info!("session-open 复请求被拒（session={sid}）：待确认态未核销，零出手");
+            json_no_store(
+                StatusCode::OK,
+                serde_json::json!({ "status": "pending", "code": "OC_RESTORE_PENDING" }),
+            )
+        }
+        OpenOutcome::Abandoned => {
+            // 显式放弃：清 pending；审计 abandoned（状态变化的设备动作留痕）
+            endpoint_audit(
+                &st,
+                &device_id,
+                &device_name,
+                &tool,
+                &sid,
+                &resume_command_for_audit(&tool, &sid),
+                "open",
+                "abandoned",
+            );
+            json_no_store(StatusCode::OK, serde_json::json!({ "status": "abandoned" }))
+        }
+        OpenOutcome::AbandonDeferred => {
+            // IC fix round 1（P1-B）：起窗权在途（准备/交付仍在执行）——放弃暂缓，
+            // 占位保持（修复前：放弃直接删占位 ⇒ 原请求仍可交付 + 新请求可取得
+            // 占位 = 两窗）。回执复用既有 pending 诚实形态（移动端放弃臂已按
+            // 「保持待确认态」消费 status:pending）+ 专用码区分诊断面；审计留痕
+            // deferred（状态变化的设备动作留痕同口径——本次放弃未发生）。
+            endpoint_audit(
+                &st,
+                &device_id,
+                &device_name,
+                &tool,
+                &sid,
+                &resume_command_for_audit(&tool, &sid),
+                "open",
+                "deferred:OC_RESTORE_DELIVERY_IN_FLIGHT",
+            );
+            log::warn!(
+                "session-open 放弃暂缓（session={sid}）：恢复交付仍在执行，无法确认取消\
+                 ——占位保持，请等待窗口核对完成后再放弃"
+            );
+            json_no_store(
+                StatusCode::OK,
+                serde_json::json!({
+                    "status": "pending",
+                    "code": "OC_RESTORE_DELIVERY_IN_FLIGHT",
+                }),
+            )
+        }
+        OpenOutcome::Failed(e)
+            // G2 起窗前三核对失败（零起窗零 pending，spawner 未被调用）→ 与既有哨兵
+            // 同口径映射 404（校验失败，非出手后失败，零审计）。GB fix round 1
+            // （GR1 GB-1）：预备链/目录核对产出「哨兵: 中文…」带前缀形态，裸哨兵
+            // `==` 恒 miss = 404 臂死码 → 改前缀匹配（resume_validation_error_code）
+            // 且回执归一为裸哨兵码。
+            if crate::inject::resume::resume_validation_error_code(&e).is_some() =>
+        {
+            let code = crate::inject::resume::resume_validation_error_code(&e)
+                .unwrap_or(e.as_str());
+            json_no_store(StatusCode::NOT_FOUND, serde_json::json!({ "error": code }))
+        }
+        OpenOutcome::Failed(e) => {
             endpoint_audit(
                 &st,
                 &device_id,
@@ -7970,7 +8784,11 @@ struct ModeScanHit {
 /// **屏读只做一次**（阻塞 FFI 的代价不可重复付）：四家的**模式组**共用这一份行集；
 /// 权限组（codex 回执行 / kimi 底栏）不走这份快照——GET 组装处经
 /// [`read_axis_from_screen`] 单独读（权限组 current 见 `session_mode` 组载荷段）。
-fn mode_scan_sync(st: &Arc<RemoteState>, session_id: &str) -> Option<ModeScanHit> {
+fn mode_scan_sync(
+    st: &Arc<RemoteState>,
+    session_id: &str,
+    _session: Option<crate::session::Session>,
+) -> Option<ModeScanHit> {
     // 动作路径（模式/审批控制前定位会话）：取新鲜快照
     let session = (st.fresh_session_source)()
         .sessions
@@ -8167,9 +8985,17 @@ pub async fn session_mode(
     else {
         return bad_request();
     };
+    let (_policy_permit, _policy_session) = match legacy_policy_permit(&st, &sid).await {
+        Ok(permit) => permit,
+        Err(response) => return response,
+    };
+
     let scan_sid = sid.clone();
     let probe_st = st.clone();
-    let scan = match tokio::task::spawn_blocking(move || mode_scan_sync(&probe_st, &scan_sid)).await
+    let scan = match policy::spawn_blocking(_policy_permit.clone(), move || {
+        mode_scan_sync(&probe_st, &scan_sid, _policy_session)
+    })
+    .await
     {
         Ok(v) => v,
         Err(e) => {
@@ -8264,7 +9090,7 @@ pub async fn session_mode(
         let ms = st.clone();
         let p_sid = sid.clone();
         let p_tool = hit.tool.clone();
-        tokio::task::spawn_blocking(move || {
+        policy::spawn_blocking(_policy_permit.clone(), move || {
             (ms.message_source)(&p_tool, &p_sid, QUESTION_SCAN_TAIL_LIMIT)
                 .map(|p| pending_question_tail_index(&p.messages).is_some())
                 .unwrap_or(false)
@@ -8500,6 +9326,7 @@ pub async fn session_mode_menu(
     Json(req): Json<SessionModeMenuReq>,
 ) -> Response {
     let sid = req.session_id.trim().to_string();
+
     if sid.is_empty() {
         return bad_request();
     }
@@ -8510,23 +9337,12 @@ pub async fn session_mode_menu(
     let Some((device_id, device_name)) = device_identity(&st, &headers) else {
         return forbidden_defense();
     };
-    // 会话查找（与 switch 端点同纪律：一个 spawn_blocking；动作路径取新鲜快照）
-    let probe_st = st.clone();
-    let probe_sid = sid.clone();
-    let found = tokio::task::spawn_blocking(move || {
-        (probe_st.fresh_session_source)()
-            .sessions
-            .into_iter()
-            .find(|s| s.id == probe_sid)
-    })
-    .await;
-    let session = match found {
-        Ok(Some(s)) => s,
-        Ok(None) => return mode_menu_err(StatusCode::NOT_FOUND, "no_session", None),
-        Err(e) => {
-            log::error!("session-mode/menu 会话扫描任务异常: {e}");
-            return mode_menu_err(StatusCode::INTERNAL_SERVER_ERROR, "internal", None);
-        }
+    let (_policy_permit, _policy_session) = match legacy_policy_permit(&st, &sid).await {
+        Ok(permit) => permit,
+        Err(response) => return response,
+    };
+    let Some(session) = _policy_session else {
+        return mode_menu_err(StatusCode::NOT_FOUND, "no_session", None);
     };
     let tool = session.agent_type.tool_id().to_string();
     // ===== codex APP 止血门（Task 3）=====
@@ -8564,7 +9380,7 @@ pub async fn session_mode_menu(
     let pid = session.pid;
     let guard_st = st.clone();
     let guard_sid = sid.clone();
-    let guard = tokio::task::spawn_blocking(move || {
+    let guard = policy::spawn_blocking(_policy_permit.clone(), move || {
         let dialog = (guard_st.dialog_probe)(guard_sid.as_str(), pid);
         let screen = (guard_st.screen_probe)(guard_sid.as_str(), pid);
         (dialog, screen)
@@ -8608,7 +9424,8 @@ pub async fn session_mode_menu(
         let do_sid = sid.clone();
         // 闭包返回 `Result<Result<Vec<..>, String>, String>`：外 Err = 忙让位（哨兵），
         // 内 Err = 真失败（与 `menu_stages` 的两层语义同源）
-        let r = tokio::task::spawn_blocking(
+        let r = policy::spawn_blocking(
+            _policy_permit.clone(),
             move || -> Result<Result<Vec<crate::inject::dialog::DialogOption>, String>, String> {
                 let Some(_guard) = crate::inject::queue::try_acquire_inflight(&do_sid) else {
                     return Ok(Err(String::new())); // 忙让位：空文案，外层据此给 busy 回执
@@ -8727,146 +9544,163 @@ pub async fn session_mode_menu(
     };
     let pick_sid = sid.clone();
     let pick_tool = tool.clone();
-    let r = tokio::task::spawn_blocking(move || -> Result<PickOutcome, String> {
-        let Some(_guard) = crate::inject::queue::try_acquire_inflight(&pick_sid) else {
-            return Err("RAPI_DELIVERY_BUSY: 投递进行中，请稍后重试".to_string());
-        };
-        let key_delay = || {
-            std::thread::sleep(std::time::Duration::from_millis(
-                crate::inject::families::SUBMIT_DELAY_MS,
-            ))
-        };
-        // **T4-F4 基线**（spec §3.2 pick 前读闸「记基线」）：发键前的屏 capture——
-        // Done 路的核验判据升级为内容集差分（`event_line_is_new`）：回执行必须
-        // **新于基线**才算本次成功的证据（旧行留存/重复选择不作证据——R1c）。
-        let baseline = crate::inject::mode::capture_mode_switch_baseline(
-            &read_screen_lines(pid).unwrap_or_default(),
-        );
-        let mut terminal = crate::inject::mode::Closures {
-            read: || read_screen_lines(pid),
-            send: |key: &str| {
-                let r = injector.locate_and_send_key_spec(pid, key, &spec);
-                if r.is_ok() {
-                    key_delay();
-                }
-                r
-            },
-            settle: key_delay,
-        };
-        let pick = crate::inject::mode::run_codex_menu_pick(
-            number,
-            || read_screen_lines(pid),
-            || poll_confirm_cluster(pid),
-            || {
+    let r = policy::spawn_blocking(
+        _policy_permit.clone(),
+        move || -> Result<PickOutcome, String> {
+            let Some(_guard) = crate::inject::queue::try_acquire_inflight(&pick_sid) else {
+                return Err("RAPI_DELIVERY_BUSY: 投递进行中，请稍后重试".to_string());
+            };
+            let key_delay = || {
                 std::thread::sleep(std::time::Duration::from_millis(
-                    crate::inject::timing::MODE_STEP_MIN_GAP_MS,
+                    crate::inject::families::SUBMIT_DELAY_MS,
                 ))
-            },
-            &mut terminal,
-        )?;
-        match pick {
-            crate::inject::mode::MenuPick::Confirm(cluster) => {
-                if cluster.is_empty() {
-                    // 确认框在屏但选项读不到 → 如实回执（前端提示重新读取）
-                    return Ok(PickOutcome::ConfirmUnreadable);
+            };
+            // **T4-F4 基线**（spec §3.2 pick 前读闸「记基线」）：发键前的屏 capture——
+            // Done 路的核验判据升级为内容集差分（`event_line_is_new`）：回执行必须
+            // **新于基线**才算本次成功的证据（旧行留存/重复选择不作证据——R1c）。
+            let baseline = crate::inject::mode::capture_mode_switch_baseline(
+                &read_screen_lines(pid).unwrap_or_default(),
+            );
+            let mut terminal = crate::inject::mode::Closures {
+                read: || read_screen_lines(pid),
+                send: |key: &str| {
+                    let r = injector.locate_and_send_key_spec(pid, key, &spec);
+                    if r.is_ok() {
+                        key_delay();
+                    }
+                    r
+                },
+                settle: key_delay,
+            };
+            let pick = crate::inject::mode::run_codex_menu_pick(
+                number,
+                || read_screen_lines(pid),
+                || poll_confirm_cluster(pid),
+                || {
+                    std::thread::sleep(std::time::Duration::from_millis(
+                        crate::inject::timing::MODE_STEP_MIN_GAP_MS,
+                    ))
+                },
+                &mut terminal,
+            )?;
+            match pick {
+                crate::inject::mode::MenuPick::Confirm(cluster) => {
+                    if cluster.is_empty() {
+                        // 确认框在屏但选项读不到 → 如实回执（前端提示重新读取）
+                        return Ok(PickOutcome::ConfirmUnreadable);
+                    }
+                    let opts: Vec<crate::inject::dialog::DialogOption> = cluster;
+                    Ok(PickOutcome::Confirm(opts))
                 }
-                let opts: Vec<crate::inject::dialog::DialogOption> = cluster;
-                Ok(PickOutcome::Confirm(opts))
-            }
-            crate::inject::mode::MenuPick::Done {
-                screen,
-                from_confirm_box,
-            } => {
-                if from_confirm_box {
-                    // **确认框阶段**（T4-F4）：发的是确认框里的键。按 number 分判：
-                    // 1（Yes）→ 确认框已消失 = Full Access 生效，回执核验走
-                    // **基线差分**（重读一屏找新于基线的回执行——内核 Done 时 screen
-                    // 为空集，此处重读）；2（Cancel）→ 预期 = 回菜单 + 无新行，读屏
-                    // 分「回菜单」/「仍在确认框」/「读不到」三态如实回执
-                    // （confirm-cancelled 形态供前端重开菜单表）。
-                    if number == 1 {
-                        // **有界轮询**（2026-10-10 用户指令：单拍读屏升级为与模式
-                        // toggle 同款核验窗——100ms/拍 × `MODE_SWITCH_VERIFY_POLL_TOTAL_MS`
-                        // 换算拍数；T6 实测时延 ≤124ms，轮询只为重绘慢的拍兜住，
-                        // 命中即停不多等）：每拍找「新于基线的回执行」，队首拍可能
-                        // 还是旧态（确认框消失/回执行打印有延迟），命中即收。
-                        let rounds = crate::inject::timing::poll_rounds(
-                            crate::inject::timing::MODE_SWITCH_VERIFY_POLL_TOTAL_MS,
-                        );
-                        let (new_receipt, after) = crate::inject::mode::poll_screen_until(
-                            rounds,
-                            || read_screen_lines(pid),
-                            || std::thread::sleep(std::time::Duration::from_millis(POLL_STEP_MS)),
-                            |ls| crate::inject::mode::latest_new_permission_receipt(ls, &baseline),
-                        );
-                        return Ok(PickOutcome::Done {
-                            receipt: new_receipt,
-                            screen_tail: after.iter().rev().take(6).cloned().collect(),
-                        });
-                    }
-                    // Cancel（number == 2）：确认框消失后屏上是什么——同款有界轮询：
-                    // 每拍先判「异常新回执行」（Cancel 却打了行 → 如实上交），再判
-                    // 「菜单回到屏上」（预期形态 → 已取消）；窗尽（确认框仍在/读不到
-                    // 屏/无菜单）→ 不装「已取消」，按不确定态交回用户。
-                    let rounds = crate::inject::timing::poll_rounds(
-                        crate::inject::timing::MODE_SWITCH_VERIFY_POLL_TOTAL_MS,
-                    );
-                    enum CancelPoll {
-                        Cancelled,
-                        NewReceipt(String),
-                    }
-                    let (poll, after) = crate::inject::mode::poll_screen_until(
-                        rounds,
-                        || read_screen_lines(pid),
-                        || std::thread::sleep(std::time::Duration::from_millis(POLL_STEP_MS)),
-                        |ls| {
-                            if let Some(seen) =
-                                crate::inject::mode::latest_new_permission_receipt(ls, &baseline)
-                            {
-                                return Some(CancelPoll::NewReceipt(seen));
-                            }
-                            let low: Vec<String> = ls.iter().map(|l| l.to_lowercase()).collect();
-                            if crate::inject::mode::codex_overlay_kind(&low)
-                                == Some(crate::inject::mode::CodexOverlay::PermissionMenu)
-                            {
-                                return Some(CancelPoll::Cancelled);
-                            }
-                            None
-                        },
-                    );
-                    match poll {
-                        // 预期形态：确认框消失、菜单回到屏上、无新回执行 → 已取消
-                        Some(CancelPoll::Cancelled) => return Ok(PickOutcome::ConfirmCancelled),
-                        // 异常：Cancel 却打了新回执行——如实上交，不装「已取消」
-                        Some(CancelPoll::NewReceipt(seen)) => {
+                crate::inject::mode::MenuPick::Done {
+                    screen,
+                    from_confirm_box,
+                } => {
+                    if from_confirm_box {
+                        // **确认框阶段**（T4-F4）：发的是确认框里的键。按 number 分判：
+                        // 1（Yes）→ 确认框已消失 = Full Access 生效，回执核验走
+                        // **基线差分**（重读一屏找新于基线的回执行——内核 Done 时 screen
+                        // 为空集，此处重读）；2（Cancel）→ 预期 = 回菜单 + 无新行，读屏
+                        // 分「回菜单」/「仍在确认框」/「读不到」三态如实回执
+                        // （confirm-cancelled 形态供前端重开菜单表）。
+                        if number == 1 {
+                            // **有界轮询**（2026-10-10 用户指令：单拍读屏升级为与模式
+                            // toggle 同款核验窗——100ms/拍 × `MODE_SWITCH_VERIFY_POLL_TOTAL_MS`
+                            // 换算拍数；T6 实测时延 ≤124ms，轮询只为重绘慢的拍兜住，
+                            // 命中即停不多等）：每拍找「新于基线的回执行」，队首拍可能
+                            // 还是旧态（确认框消失/回执行打印有延迟），命中即收。
+                            let rounds = crate::inject::timing::poll_rounds(
+                                crate::inject::timing::MODE_SWITCH_VERIFY_POLL_TOTAL_MS,
+                            );
+                            let (new_receipt, after) = crate::inject::mode::poll_screen_until(
+                                rounds,
+                                || read_screen_lines(pid),
+                                || {
+                                    std::thread::sleep(std::time::Duration::from_millis(
+                                        POLL_STEP_MS,
+                                    ))
+                                },
+                                |ls| {
+                                    crate::inject::mode::latest_new_permission_receipt(
+                                        ls, &baseline,
+                                    )
+                                },
+                            );
                             return Ok(PickOutcome::Done {
-                                receipt: Some(seen),
+                                receipt: new_receipt,
                                 screen_tail: after.iter().rev().take(6).cloned().collect(),
                             });
                         }
-                        // 窗尽：键被吞或状态不明——如实交回用户
-                        // （Confirm 空表 → 前端提示重新读取）
-                        None => return Ok(PickOutcome::ConfirmCancelledUncertain),
+                        // Cancel（number == 2）：确认框消失后屏上是什么——同款有界轮询：
+                        // 每拍先判「异常新回执行」（Cancel 却打了行 → 如实上交），再判
+                        // 「菜单回到屏上」（预期形态 → 已取消）；窗尽（确认框仍在/读不到
+                        // 屏/无菜单）→ 不装「已取消」，按不确定态交回用户。
+                        let rounds = crate::inject::timing::poll_rounds(
+                            crate::inject::timing::MODE_SWITCH_VERIFY_POLL_TOTAL_MS,
+                        );
+                        enum CancelPoll {
+                            Cancelled,
+                            NewReceipt(String),
+                        }
+                        let (poll, after) = crate::inject::mode::poll_screen_until(
+                            rounds,
+                            || read_screen_lines(pid),
+                            || std::thread::sleep(std::time::Duration::from_millis(POLL_STEP_MS)),
+                            |ls| {
+                                if let Some(seen) =
+                                    crate::inject::mode::latest_new_permission_receipt(
+                                        ls, &baseline,
+                                    )
+                                {
+                                    return Some(CancelPoll::NewReceipt(seen));
+                                }
+                                let low: Vec<String> =
+                                    ls.iter().map(|l| l.to_lowercase()).collect();
+                                if crate::inject::mode::codex_overlay_kind(&low)
+                                    == Some(crate::inject::mode::CodexOverlay::PermissionMenu)
+                                {
+                                    return Some(CancelPoll::Cancelled);
+                                }
+                                None
+                            },
+                        );
+                        match poll {
+                            // 预期形态：确认框消失、菜单回到屏上、无新回执行 → 已取消
+                            Some(CancelPoll::Cancelled) => {
+                                return Ok(PickOutcome::ConfirmCancelled)
+                            }
+                            // 异常：Cancel 却打了新回执行——如实上交，不装「已取消」
+                            Some(CancelPoll::NewReceipt(seen)) => {
+                                return Ok(PickOutcome::Done {
+                                    receipt: Some(seen),
+                                    screen_tail: after.iter().rev().take(6).cloned().collect(),
+                                });
+                            }
+                            // 窗尽：键被吞或状态不明——如实交回用户
+                            // （Confirm 空表 → 前端提示重新读取）
+                            None => return Ok(PickOutcome::ConfirmCancelledUncertain),
+                        }
                     }
+                    // 菜单阶段 Done：回执核验 = **新于基线**的回执行（内容集差分；
+                    // 目标档未知——用户点的是屏上编号——故按「锚在屏」取最新，但旧行
+                    // 不作本次证据）
+                    let seen =
+                        crate::inject::mode::latest_new_permission_receipt(&screen, &baseline)
+                            .or_else(|| {
+                                // 差分判据全空时退回「锚在屏」（双代词形兼容通道：0.154 旧锚
+                                // `permissions updated to` 不进事件行解析、0.160.0 新词形
+                                // 行若因基线差分竞态漏判也在此兜回——见
+                                // `mode::permission_receipt_seen`）
+                                crate::inject::mode::permission_receipt_seen(&pick_tool, &screen)
+                            });
+                    Ok(PickOutcome::Done {
+                        receipt: seen,
+                        screen_tail: screen.iter().rev().take(6).cloned().collect::<Vec<_>>(),
+                    })
                 }
-                // 菜单阶段 Done：回执核验 = **新于基线**的回执行（内容集差分；
-                // 目标档未知——用户点的是屏上编号——故按「锚在屏」取最新，但旧行
-                // 不作本次证据）
-                let seen = crate::inject::mode::latest_new_permission_receipt(&screen, &baseline)
-                    .or_else(|| {
-                        // 差分判据全空时退回「锚在屏」（双代词形兼容通道：0.154 旧锚
-                        // `permissions updated to` 不进事件行解析、0.160.0 新词形
-                        // 行若因基线差分竞态漏判也在此兜回——见
-                        // `mode::permission_receipt_seen`）
-                        crate::inject::mode::permission_receipt_seen(&pick_tool, &screen)
-                    });
-                Ok(PickOutcome::Done {
-                    receipt: seen,
-                    screen_tail: screen.iter().rev().take(6).cloned().collect::<Vec<_>>(),
-                })
             }
-        }
-    })
+        },
+    )
     .await;
     let (result_str, response) = match r {
         Ok(Ok(o)) => {
@@ -9030,18 +9864,15 @@ pub async fn session_mode_menu_read(
     else {
         return bad_request();
     };
+
     if device_identity(&st, &headers).is_none() {
         return forbidden_defense();
     }
-    let probe_st = st.clone();
-    let probe_sid = sid.clone();
-    let found = tokio::task::spawn_blocking(move || {
-        (probe_st.session_source)()
-            .sessions
-            .into_iter()
-            .find(|s| s.id == probe_sid)
-    })
-    .await;
+    let (_policy_permit, _policy_session) = match legacy_policy_permit(&st, &sid).await {
+        Ok(permit) => permit,
+        Err(response) => return response,
+    };
+    let found = policy::spawn_blocking(_policy_permit.clone(), move || _policy_session).await;
     let session = match found {
         Ok(Some(s)) => s,
         Ok(None) => return mode_menu_err(StatusCode::NOT_FOUND, "no_session", None),
@@ -9060,52 +9891,55 @@ pub async fn session_mode_menu_read(
     let pid = session.pid;
     let read_sid = sid.clone();
     let read_st = st.clone();
-    let r = tokio::task::spawn_blocking(move || -> (String, Vec<serde_json::Value>) {
-        let Some(lines) = (read_st.screen_probe)(read_sid.as_str(), pid) else {
-            return ("none".to_string(), Vec::new());
-        };
-        let lowered: Vec<String> = lines.iter().map(|l| l.to_lowercase()).collect();
-        match crate::inject::mode::codex_overlay_kind(&lowered) {
-            Some(crate::inject::mode::CodexOverlay::PermissionMenu) => {
-                let items = crate::inject::mode::codex_menu_options(&lines, &lowered)
-                    .unwrap_or_default()
-                    .iter()
-                    .map(|o| {
-                        serde_json::json!({
-                            "number": o.number,
-                            "label": o.label,
-                            "highlighted": o.highlighted,
+    let r = policy::spawn_blocking(
+        _policy_permit.clone(),
+        move || -> (String, Vec<serde_json::Value>) {
+            let Some(lines) = (read_st.screen_probe)(read_sid.as_str(), pid) else {
+                return ("none".to_string(), Vec::new());
+            };
+            let lowered: Vec<String> = lines.iter().map(|l| l.to_lowercase()).collect();
+            match crate::inject::mode::codex_overlay_kind(&lowered) {
+                Some(crate::inject::mode::CodexOverlay::PermissionMenu) => {
+                    let items = crate::inject::mode::codex_menu_options(&lines, &lowered)
+                        .unwrap_or_default()
+                        .iter()
+                        .map(|o| {
+                            serde_json::json!({
+                                "number": o.number,
+                                "label": o.label,
+                                "highlighted": o.highlighted,
+                            })
                         })
-                    })
-                    .collect();
-                ("menu".to_string(), items)
+                        .collect();
+                    ("menu".to_string(), items)
+                }
+                Some(crate::inject::mode::CodexOverlay::FullAccessConfirm) => {
+                    // 确认框：用簇解析（与 poll_confirm_cluster 同源）
+                    let items = crate::inject::dialog::parse_dialog_clusters(&lines)
+                        .into_iter()
+                        .find(|c| {
+                            c.iter().any(|o| {
+                                o.label
+                                    .to_lowercase()
+                                    .contains(crate::inject::mode::FULL_ACCESS_AFFIRMATIVE_KEYWORD)
+                            })
+                        })
+                        .unwrap_or_default()
+                        .iter()
+                        .map(|o| {
+                            serde_json::json!({
+                                "number": o.number,
+                                "label": o.label,
+                                "highlighted": o.highlighted,
+                            })
+                        })
+                        .collect();
+                    ("confirm".to_string(), items)
+                }
+                None => ("none".to_string(), Vec::new()),
             }
-            Some(crate::inject::mode::CodexOverlay::FullAccessConfirm) => {
-                // 确认框：用簇解析（与 poll_confirm_cluster 同源）
-                let items = crate::inject::dialog::parse_dialog_clusters(&lines)
-                    .into_iter()
-                    .find(|c| {
-                        c.iter().any(|o| {
-                            o.label
-                                .to_lowercase()
-                                .contains(crate::inject::mode::FULL_ACCESS_AFFIRMATIVE_KEYWORD)
-                        })
-                    })
-                    .unwrap_or_default()
-                    .iter()
-                    .map(|o| {
-                        serde_json::json!({
-                            "number": o.number,
-                            "label": o.label,
-                            "highlighted": o.highlighted,
-                        })
-                    })
-                    .collect();
-                ("confirm".to_string(), items)
-            }
-            None => ("none".to_string(), Vec::new()),
-        }
-    })
+        },
+    )
     .await;
     match r {
         Ok((status, items)) => json_no_store(
@@ -9125,6 +9959,7 @@ pub async fn session_mode_switch(
     Json(req): Json<SessionModeReq>,
 ) -> Response {
     let sid = req.session_id.trim().to_string();
+
     let target = req.target.trim().to_string();
     // 裁7：退役档在此**不可解析**（MamMode::parse 无对应 wire 词）→ 400
     let Some(mode) = crate::inject::mode::MamMode::parse(&target) else {
@@ -9143,63 +9978,78 @@ pub async fn session_mode_switch(
     let Some((device_id, device_name)) = device_identity(&st, &headers) else {
         return forbidden_defense();
     };
-    // 会话查找 + 组推断 + 序列构造（一个 spawn_blocking；锁纪律同 approve）；
-    // 动作路径（写终端换模式）：取新鲜快照
+    let (_policy_permit, _policy_session) = match legacy_policy_permit(&st, &sid).await {
+        Ok(permit) => permit,
+        Err(response) => return response,
+    };
+    // 任务 8 旧路径防双投屏障：切档也是旧写入口（终端键序）——取同会话 read permit
+    // 持到注入与落账结束；归属复查在会话查找的**同一 spawn_blocking 临界区**内
+    // （先于组推断与任何屏读）。
+    let _native_permit = st.opencode_native.try_legacy_permit(&sid).await;
+    // 会话查找 + 组推断 + 序列构造（一个 spawn_blocking；锁纪律同 approve）
     let probe_st = st.clone();
     let probe_sid = sid.clone();
-    let lookup = match tokio::task::spawn_blocking(move || -> Result<_, String> {
-        let session = (probe_st.fresh_session_source)()
-            .sessions
-            .into_iter()
-            .find(|s| s.id == probe_sid)
-            .ok_or_else(|| "no_session".to_string())?;
-        let tool = session.agent_type.tool_id().to_string();
-        // codex APP 止血门（Task 3）：门位 = 会话定位后、组推断与**任何屏读/注入之前**
-        //（下方的 read_mode_from_screen 对 APP 会话就是 AttachConsole 0x80070006 的
-        // 错误通道）。错误码经 Err 串上行，审计 + 409 回执在 lookup 的拒绝分支。
-        if codex_app_form(&session) {
-            return Err(APP_FORM_PENDING_CODE.to_string());
-        }
-        // 组推断（旧客户端不带 group 的兼容口径；显式 group 必须存在于结构）
-        let group = crate::inject::mode::resolve_group(&tool, requested_group, mode)
-            .map_err(|_| "no_mechanism".to_string())?;
-        // 该组里这一档是否可选（不可选 = 如实拒绝，附组内给出的原因）
-        let spec = crate::inject::mode::mode_structure(&tool)
-            .group(group)
-            .ok_or_else(|| "no_mechanism".to_string())?;
-        if let Some(tier) = spec.tiers.iter().find(|t| t.mode == mode) {
-            if !tier.selectable {
-                log::debug!("切档不可选（{tool}/{}）：{mode:?}", group.wire());
-                return Err("no_mechanism".to_string());
+    let lookup =
+        match policy::spawn_blocking(_policy_permit.clone(), move || -> Result<_, String> {
+            let session = _policy_session.ok_or_else(|| "no_session".to_string())?;
+            // ===== 任务 8：原生归属屏障（同临界区复查，先于组推断/屏读/注入）=====
+            // 已归 Native 的会话：切档键序永不交付给旧 FIFO（409 OC_ROUTE_CHANGED）。
+            // M-2：归属读失败按内部错误上行（不得当成「未归原生」放行）。
+            match native_owned(&probe_st, &probe_sid) {
+                Ok(true) => return Err(super::opencode_native::ROUTE_CHANGED_ERR.to_string()),
+                Ok(false) => {}
+                Err(e) => {
+                    log::error!("session-mode/switch 原生归属读取失败（会话 {probe_sid}）: {e}");
+                    return Err("internal".to_string());
+                }
             }
-        }
-        let plan = crate::inject::mode::mode_switch_plan(&tool, group, mode).map_err(|r| {
-            log::debug!("切档不可用（{tool}/{}）：{r:?}", group.wire());
-            "no_mechanism".to_string()
-        })?;
-        // 组内目标档的**屏显标签**（回执与按钮标签同源）
-        let label = spec
-            .tiers
-            .iter()
-            .find(|t| t.mode == mode)
-            .map(|t| t.label)
-            .unwrap_or_else(|| mode.label());
-        let readback = crate::inject::mode::mode_readback_supported(&tool);
-        // 切档前的当前档（步进组的预期档要按环序算）——屏读一次
-        let before = read_mode_from_screen(&probe_st, &session, &tool, readback);
-        Ok((session, tool, group, plan, readback, label, before))
-    })
-    .await
-    {
-        Ok(v) => v,
-        Err(e) => {
-            log::error!("session-mode 会话扫描任务异常: {e}");
-            return json_no_store(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                serde_json::json!({ "error": "internal" }),
-            );
-        }
-    };
+            let tool = session.agent_type.tool_id().to_string();
+            // codex APP 止血门（Task 3）：门位 = 会话定位后、组推断与**任何屏读/注入之前**
+            //（下方的 read_mode_from_screen 对 APP 会话就是 AttachConsole 0x80070006 的
+            // 错误通道）。错误码经 Err 串上行，审计 + 409 回执在 lookup 的拒绝分支。
+            if codex_app_form(&session) {
+                return Err(APP_FORM_PENDING_CODE.to_string());
+            }
+            // 组推断（旧客户端不带 group 的兼容口径；显式 group 必须存在于结构）
+            let group = crate::inject::mode::resolve_group(&tool, requested_group, mode)
+                .map_err(|_| "no_mechanism".to_string())?;
+            // 该组里这一档是否可选（不可选 = 如实拒绝，附组内给出的原因）
+            let spec = crate::inject::mode::mode_structure(&tool)
+                .group(group)
+                .ok_or_else(|| "no_mechanism".to_string())?;
+            if let Some(tier) = spec.tiers.iter().find(|t| t.mode == mode) {
+                if !tier.selectable {
+                    log::debug!("切档不可选（{tool}/{}）：{mode:?}", group.wire());
+                    return Err("no_mechanism".to_string());
+                }
+            }
+            let plan = crate::inject::mode::mode_switch_plan(&tool, group, mode).map_err(|r| {
+                log::debug!("切档不可用（{tool}/{}）：{r:?}", group.wire());
+                "no_mechanism".to_string()
+            })?;
+            // 组内目标档的**屏显标签**（回执与按钮标签同源）
+            let label = spec
+                .tiers
+                .iter()
+                .find(|t| t.mode == mode)
+                .map(|t| t.label)
+                .unwrap_or_else(|| mode.label());
+            let readback = crate::inject::mode::mode_readback_supported(&tool);
+            // 切档前的当前档（步进组的预期档要按环序算）——屏读一次
+            let before = read_mode_from_screen(&probe_st, &session, &tool, readback);
+            Ok((session, tool, group, plan, readback, label, before))
+        })
+        .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                log::error!("session-mode 会话扫描任务异常: {e}");
+                return json_no_store(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    serde_json::json!({ "error": "internal" }),
+                );
+            }
+        };
     let (session, tool, group, plan, readback, label, before) = match lookup {
         Ok(v) => v,
         Err(code) => {
@@ -9224,6 +10074,17 @@ pub async fn session_mode_switch(
                 let audit_content = mode_audit_content(group, label);
                 audit_app_form_pending(&st, &device_id, &device_name, &sid, &audit_content, "mode");
                 return app_form_pending_response();
+            }
+            // 任务 8：原生归属屏障拒绝——统一 409 OC_ROUTE_CHANGED 回执（零注入零审计）
+            if code == super::opencode_native::ROUTE_CHANGED_ERR {
+                return super::opencode_native::route_changed_response();
+            }
+            // M-2：归属读失败（fail-closed）——内部错误，绝不按「未归原生」继续
+            if code == "internal" {
+                return json_no_store(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    serde_json::json!({ "error": "internal" }),
+                );
             }
             let status = if code == "no_session" {
                 StatusCode::NOT_FOUND
@@ -9250,7 +10111,7 @@ pub async fn session_mode_switch(
     let probe_st = st.clone();
     let probe_pid = session.pid;
     let probe_sid_for_log = sid.clone();
-    let dialog_options = match tokio::task::spawn_blocking(move || {
+    let dialog_options = match policy::spawn_blocking(_policy_permit.clone(), move || {
         (probe_st.dialog_probe)(probe_sid_for_log.as_str(), probe_pid)
     })
     .await
@@ -9270,7 +10131,7 @@ pub async fn session_mode_switch(
         let ms = st.clone();
         let p_sid = sid.clone();
         let p_tool = tool.clone();
-        match tokio::task::spawn_blocking(move || {
+        match policy::spawn_blocking(_policy_permit.clone(), move || {
             (ms.message_source)(&p_tool, &p_sid, QUESTION_SCAN_TAIL_LIMIT)
                 .map(|p| pending_question_tail_index(&p.messages).is_some())
                 .unwrap_or(false)
@@ -9352,7 +10213,7 @@ pub async fn session_mode_switch(
     //
     // 忙让位（None 哨兵）表达为外层 Option 的 `?`：None = 忙（不投递亦不落审计），
     // Some(inner) = 真投递（inner 是投递结果）
-    let attempt = tokio::task::spawn_blocking(move || {
+    let attempt = policy::spawn_blocking(_policy_permit.clone(), move || {
         let _guard = crate::inject::queue::try_acquire_inflight(&switch_sid)?;
         Some(match plan {
             crate::inject::mode::ModeSwitchPlan::Key(key) => {
@@ -9547,7 +10408,7 @@ pub async fn session_mode_switch(
                         crate::inject::timing::MODE_READBACK_POLL_TOTAL_MS,
                     );
                     let settle_ms = crate::inject::timing::POLL_STEP_MS;
-                    let outcome = match tokio::task::spawn_blocking(move || {
+                    let outcome = match policy::spawn_blocking(_policy_permit.clone(), move || {
                         crate::inject::mode::poll_mode_readback(
                             verify_tool.as_str(),
                             group,
@@ -10280,7 +11141,7 @@ fn bad_request_reason(reason: &str) -> Response {
 /// 段与所属表等。修复批 I1：定位信息必须可达消费方（响应体 + 服务端日志双通道），
 /// 不能只存在于单元测试；`reason` 与 403 not_injectable 的 {reason, reasonCode}
 /// 配对形态同族）
-fn bad_request_reason_detail(reason: &str, detail: &str) -> Response {
+pub(crate) fn bad_request_reason_detail(reason: &str, detail: &str) -> Response {
     json_no_store(
         StatusCode::BAD_REQUEST,
         serde_json::json!({ "error": "bad_request", "reasonCode": reason, "reason": detail }),
@@ -10355,6 +11216,15 @@ pub async fn session_create(
     };
     // ② 工具门（三道：白名单 ∧ enabledTools ∧ 安装探测）
     let tool = req.tool.trim().to_lowercase();
+    let _policy_permit = if tool == "opencode" {
+        match policy::acquire_legacy(&st.store, crate::session::AgentType::OpenCode) {
+            Ok(permit) => permit,
+            Err(_) => return legacy_disabled_response(),
+        }
+    } else {
+        None
+    };
+
     let hub = st.create_hub.clone();
     if !crate::inject::create::CREATE_TOOLS.contains(&tool.as_str())
         || !tool_enabled(&st, &tool)
@@ -10379,6 +11249,7 @@ pub async fn session_create(
         log::warn!("session-create 路径拒绝（{dir}）: {}", rej.message);
         return bad_request_reason_detail(rej.code, &rej.message);
     }
+
     if let Err(e) = std::fs::create_dir_all(&dir) {
         log::warn!("session-create mkdir 失败（{dir}）: {e}");
         return bad_request_reason("mkdir_failed");
@@ -10446,7 +11317,9 @@ pub async fn session_create(
     // 非终态任务 → 单飞额度被永久占用（后续 create 恒 409）。监视 JoinHandle，
     // panic（JoinError）时把任务置 failed——正常路径已自置终态，此处只兜异常中止。
     let pipeline_st = st.clone();
-    let handle = tokio::task::spawn_blocking(move || run_create_pipeline(pipeline_st, run));
+    let handle = policy::spawn_blocking(_policy_permit, move || {
+        run_create_pipeline(pipeline_st, run)
+    });
     let watch_st = st.clone();
     tokio::spawn(async move {
         if handle.await.is_err() {

@@ -243,7 +243,9 @@ impl DeviceStore {
     /// （真机调用序见 `src/database/mod.rs` 的 `init()`）
     pub fn memory() -> Self {
         let conn = rusqlite::Connection::open_in_memory().expect("打开内存库失败");
-        crate::database::schema::init(&conn);
+        // M4：schema::init 改返回 Result（不再内部 panic）；内存库建表失败与下行 migrate
+        // 同语义 expect（测试构造器的既有失败面不变）
+        crate::database::schema::init(&conn).expect("内存库建表失败");
         crate::database::migration::migrate(&conn).expect("内存库建表失败");
         Self::Owned(std::sync::Arc::new(std::sync::Mutex::new(conn)))
     }
@@ -317,7 +319,7 @@ mod tests {
     fn device_ttl_180d() {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         // 同上：schema::init → migration::migrate（控制者裁决）
-        crate::database::schema::init(&conn);
+        crate::database::schema::init(&conn).unwrap();
         crate::database::migration::migrate(&conn).unwrap();
         persist_device(
             &conn,
@@ -385,7 +387,7 @@ mod tests {
     /// 内存库构造（真机调用序：schema::init → migration::migrate，见 DeviceStore::memory 注释）
     fn memory_conn() -> rusqlite::Connection {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
-        crate::database::schema::init(&conn);
+        crate::database::schema::init(&conn).unwrap();
         crate::database::migration::migrate(&conn).unwrap();
         conn
     }

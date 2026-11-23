@@ -16,6 +16,7 @@ pub mod gate;
 // 三终端语言自适应（2026-10-22）：桌面语言内存源（C-3）+ 配对设备语言手动记账（C-5）
 pub mod language;
 pub mod named;
+pub mod opencode_native;
 pub mod pairing;
 pub mod pin;
 pub mod power;
@@ -706,7 +707,7 @@ pub fn is_online_now() -> bool {
 
 /// 16 字节随机 hex（设备 id 生成器，M5 A3 起 /pair/pin 落行消费）：零参随机形态，
 /// 不可位置式（生成器消费后复用会让不同设备撞行）
-fn random_hex_16() -> String {
+pub(crate) fn random_hex_16() -> String {
     let mut b = [0u8; 16];
     rand::fill(&mut b);
     b.iter().map(|x| format!("{x:02x}")).collect()
@@ -949,11 +950,16 @@ static STATE: Lazy<std::sync::Arc<server::RemoteState>> = Lazy::new(|| {
         // 三终端语言自适应（C-3）：桌面当前语言内存源（前端经 set_desktop_language
         // 命令推送；STATE 单例持有，推送与 /host 下发同源）
         desktop_language: language::LanguageSource::default(),
+        // 任务 8：OpenCode 原生交互中枢——生产惰性容器（`new` 零 IO：不发现服务、
+        // 不建连接、不起任务；首次 view/watch 才按需工作）。与 state.store 同一
+        // 全局库：路由归属（opencode_native_routes）与旧路径屏障同库同锁。
+        opencode_native: std::sync::Arc::new(crate::services::opencode_native::NativeHub::new(
+            pairing::DeviceStore::global(),
+        )),
     })
 });
 
-// ============================================================
-// ZCode 统一控制 Hub 装配（T7.1 C2b）
+// =====================================================// ZCode 统一控制 Hub 装配（T7.1 C2b）
 // ============================================================
 
 /// 装配内核（可测）：构造**唯一** Hub，先交给远程 HTTP 状态（`/m/api/v1`），
@@ -1045,6 +1051,74 @@ async fn finish_zcode_hub(
     }
 }
 
+/// OpenCode 服务插件桥的安装/运行状态（GUI 只读展示 + 一次性安装引导）。
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenCodeBridgeView {
+    pub install: crate::services::opencode_native::BridgeInstallStatus,
+    pub bridge: Option<crate::services::opencode_native::BridgeStatus>,
+    pub reload_triggered: bool,
+    pub reload_error: Option<String>,
+}
+
+fn bridge_installer() -> Result<crate::services::opencode_native::BridgeInstall, String> {
+    if !opencode_native::native_platform_supported() {
+        return Err(opencode_native::OC_PLATFORM_UNVERIFIED_REASON.to_owned());
+    }
+    let home = dirs::home_dir()
+        .ok_or_else(|| "OPENCODE_BRIDGE_HOME_UNAVAILABLE: 无法解析用户目录".to_string())?;
+    let xdg = std::env::var_os("XDG_CONFIG_HOME").map(std::path::PathBuf::from);
+    Ok(crate::services::opencode_native::BridgeInstall::production(
+        &home,
+        xdg.as_deref(),
+    ))
+}
+
+fn opencode_binary(home: &std::path::Path) -> Option<std::path::PathBuf> {
+    if let Some(path) = std::env::var_os("OPENCODE_BINARY") {
+        let path = std::path::PathBuf::from(path);
+        if path.exists() {
+            return Some(path);
+        }
+    }
+    let local = home.join(".opencode").join("bin").join("opencode");
+    if local.exists() {
+        return Some(local);
+    }
+    None
+}
+
+/// 触发 OpenCode 配置 revalidation（`opencode debug config`，只读命令）。
+/// OpenCode 2.2.5 的服务插件在 revalidation 时加载；不重启用户服务。
+async fn trigger_opencode_reload() -> Result<(), String> {
+    let home = dirs::home_dir()
+        .ok_or_else(|| "OPENCODE_BRIDGE_HOME_UNAVAILABLE: 无法解析用户目录".to_string())?;
+    let bin = opencode_binary(&home)
+        .ok_or_else(|| "OPENCODE_BRIDGE_BINARY_MISSING: 未找到 opencode 可执行文件".to_string())?;
+    let mut child = tokio::process::Command::new(bin)
+        .args(["debug", "config"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .stdin(std::process::Stdio::null())
+        .spawn()
+        .map_err(|error| {
+            format!("OPENCODE_BRIDGE_RELOAD_SPAWN: 启动 opencode debug config 失败: {error}")
+        })?;
+    match tokio::time::timeout(std::time::Duration::from_secs(10), child.wait()).await {
+        Ok(Ok(status)) if status.success() => Ok(()),
+        Ok(Ok(status)) => Err(format!(
+            "OPENCODE_BRIDGE_RELOAD_FAILED: opencode debug config 退出: {status}"
+        )),
+        Ok(Err(error)) => Err(format!(
+            "OPENCODE_BRIDGE_RELOAD_WAIT: 等待 opencode debug config 失败: {error}"
+        )),
+        Err(_) => {
+            let _ = child.kill().await;
+            Err("OPENCODE_BRIDGE_RELOAD_TIMEOUT: opencode debug config 超时".to_string())
+        }
+    }
+}
+
 /// 关停任务上限：兜住后台断开不无限悬住（relay 断开自身另有界）。
 const ZCODE_HUB_SHUTDOWN_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -1081,6 +1155,62 @@ fn disconnect_zcode_hub_with(wake: bool) {
     }
     let (_view, guard) = hub.begin_disconnect();
     tauri::async_runtime::spawn(finish_zcode_hub(hub, guard, ZCODE_HUB_SHUTDOWN_WAIT, wake));
+}
+
+pub async fn opencode_bridge_view() -> OpenCodeBridgeView {
+    let (install, install_error) = match bridge_installer() {
+        Ok(installer) => (installer.status(), None),
+        Err(error) => (
+            crate::services::opencode_native::BridgeInstallStatus::default(),
+            Some(error),
+        ),
+    };
+    OpenCodeBridgeView {
+        install,
+        bridge: STATE.opencode_native.bridge_status().await,
+        reload_triggered: false,
+        reload_error: install_error,
+    }
+}
+
+pub async fn opencode_bridge_install() -> Result<OpenCodeBridgeView, String> {
+    let installer = bridge_installer()?;
+    let install = installer.install()?;
+    STATE.opencode_native.start_production_bridge().await?;
+    let reload = trigger_opencode_reload().await;
+    Ok(OpenCodeBridgeView {
+        install,
+        bridge: STATE.opencode_native.bridge_status().await,
+        reload_triggered: reload.is_ok(),
+        reload_error: reload.err(),
+    })
+}
+
+pub async fn opencode_bridge_uninstall() -> Result<OpenCodeBridgeView, String> {
+    let installer = bridge_installer()?;
+    let install = installer.uninstall()?;
+    // 卸载即撤销本进程的 B1 证明：即使服务里的插件还没被 reload 卸掉，写门也已关闭。
+    // 同一进程可再次安装：桥会重启并复用 token。
+    STATE.opencode_native.stop_bridge().await;
+    let reload = trigger_opencode_reload().await;
+    Ok(OpenCodeBridgeView {
+        install,
+        bridge: STATE.opencode_native.bridge_status().await,
+        reload_triggered: reload.is_ok(),
+        reload_error: reload.err(),
+    })
+}
+
+pub async fn opencode_bridge_reload() -> Result<OpenCodeBridgeView, String> {
+    STATE.opencode_native.start_production_bridge().await?;
+    let reload = trigger_opencode_reload().await;
+    let installer = bridge_installer()?;
+    Ok(OpenCodeBridgeView {
+        install: installer.status(),
+        bridge: STATE.opencode_native.bridge_status().await,
+        reload_triggered: reload.is_ok(),
+        reload_error: reload.err(),
+    })
 }
 
 /// 从看板地址抽域名（纯函数）：快照 url 契约恒为含 /m 的完整地址（board_url 归一），
@@ -1335,9 +1465,14 @@ fn start_server() -> Result<(), String> {
             // setup 线程无 tokio runtime 上下文）；其 JoinHandle 同样支持 abort
             // （stop_server 语义不变）
             tauri::async_runtime::spawn(async move {
-                // M5 A5：隧道随监听 spawn 逐通道恢复（原 start_if_configured 单通道位；
-                // 幂等——restart_listener 路径隧道未被停，已存活句柄在此自然短路）
-                restore_enabled_tunnels(port);
+                // B1：先启动服务插件桥的认证端；插件未安装/未连接时写门保持关闭。
+                // 失败只记日志，不阻塞远程服务与只读能力。
+                if let Err(error) = STATE.opencode_native.start_production_bridge().await {
+                    log::warn!("OpenCode 服务插件桥启动失败: {error}");
+                }
+                // 先让 HTTP 监听进入 serve，再并发恢复隧道：隧道探测/cloudflared 输出
+                // 可能阻塞数十秒，不能把「本地远程页面是否可用」绑在外部通道上。
+                tauri::async_runtime::spawn_blocking(move || restore_enabled_tunnels(port));
                 if let Err(e) = server::serve(&bind, port, STATE.clone()).await {
                     log::error!("远程服务器退出: {e}");
                     // serve 失败退出任务时对外通道留着无意义（代理目标已无人监听）：
@@ -1411,20 +1546,27 @@ fn stop_server_core(
 /// 模块删除——吊销 = `revoke_all` 一条即足够，已配对设备下次过闸即 403。
 /// 锁纪律：**两把锁从不嵌套持有，各自独立短临界区**——SERVER_HANDLE 短锁取走句柄
 /// 即释放；store/registry 经 Arc 克隆在锁外的闭包里触达（M5 A5 修正表述：
-/// 原注释「registry 永远最后进最先出」与实际顺序不符）
-fn stop_server_with(revoke: bool, stop_channels: impl FnOnce()) {
-    let handle = SERVER_HANDLE.lock().unwrap().take();
-    let st_reg = STATE.clone();
-    let st_store = STATE.clone();
-    let st_hub = STATE.clone();
+/// 原注释「registry 永远最后进最先出」与实际顺序不符）。
+///
+/// R2：显式接收 `state` 与 `handle` 而不是直读全局——生产调用点传 `STATE` 与
+/// `SERVER_HANDLE` 取出的句柄；装配层测试用同一函数 + 测试 state 走真实 stop 接线。
+fn stop_server_with(
+    state: &server::RemoteState,
+    handle: Option<tauri::async_runtime::JoinHandle<()>>,
+    revoke: bool,
+    stop_channels: impl FnOnce(),
+) {
+    state.opencode_native.stop_outbox();
+    let st_reg = state.sse_registry.clone();
+    let st_store = state.store.clone();
     stop_server_core(
         handle,
         revoke,
         move || {
-            st_reg.sse_registry.disconnect_all();
+            st_reg.disconnect_all();
         },
         move || {
-            let _ = st_store.store.with(pairing::revoke_all); // 吊销失败仅忽略，不阻断停机
+            let _ = st_store.with(pairing::revoke_all); // 吊销失败仅忽略，不阻断停机
         },
         stop_channels,
         // M4 T3：电源锁随远程关闭释放（caffeinate kill / 执行状态清除 + 磁盘代设还原）
@@ -1432,13 +1574,18 @@ fn stop_server_with(revoke: bool, stop_channels: impl FnOnce()) {
     );
     // Codex Desktop IPC：停掉 hub 调度循环（不订阅/不调度未派发项）。已派发任务
     // （IPC 在途 RPC / detached 兜底回合）不取消——留至落账或 unknown。
-    st_hub.codex_control.stop();
+    state.codex_control.stop();
+    // 任务 8 / R2：OpenCode 原生交互——停远程 = **可恢复的 pause**，不是永久 shutdown。
+    // 取消旧上游、关闭旧 watch、作废旧凭据；动作账本、路由归属、设备都留在共享存储，
+    // 重开/热重启后 view/watch 重新发现即可恢复（旧在途投影由 hub 的代际检查拦住）。
+    state.opencode_native.pause();
 }
 
 /// 停止远程服务（通用停机）：revoke 按调用方语义 + 对外通道全停（M5 A5 双隧道
 /// stop_all + §C1 tailscale::stop_all——修复轮 1 Finding 2①）
 fn stop_server(revoke: bool) {
-    stop_server_with(revoke, || {
+    let handle = SERVER_HANDLE.lock().unwrap().take();
+    stop_server_with(STATE.as_ref(), handle, revoke, || {
         tunnel::stop_all();
         tailscale::stop_all();
     });
@@ -1465,7 +1612,8 @@ fn stop_server_explicit_close() {
 /// hot_restart_without_revoke_keeps_device_cookie_valid 必红；误塞隧道停止（如
 /// `tunnel::stop_all`）→ lan 开关弹掉 quick 隧道换址（通道开关独立语义破坏）
 fn stop_server_hot_restart() {
-    stop_server_with(false, || {});
+    let handle = SERVER_HANDLE.lock().unwrap().take();
+    stop_server_with(STATE.as_ref(), handle, false, || {});
 }
 
 /// 热重启内核（可测核心）：仅运行中才有「重启」语义——未运行空转（下次
@@ -2882,7 +3030,7 @@ mod tests {
     fn remote_devices_table_idempotent_and_shaped() {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         // 真机调用序：schema::init 建全部表 → migration::migrate 增量迁移（见 database/mod.rs）
-        crate::database::schema::init(&conn);
+        crate::database::schema::init(&conn).unwrap();
         // 迁移两遍（幂等）
         crate::database::migration::migrate(&conn).unwrap();
         crate::database::migration::migrate(&conn).unwrap();
@@ -2945,7 +3093,7 @@ mod tests {
 
         // 同一个内存库：两键各自读取，缺键各取默认；写其中一个不影响另一个。
         let conn = rusqlite::Connection::open_in_memory().unwrap();
-        crate::database::schema::init(&conn);
+        let _ = crate::database::schema::init(&conn);
         crate::database::migration::migrate(&conn).unwrap();
         assert!(headless_enabled_conn(&conn), "两键均缺 → 各取默认开");
         assert!(compat_send_enabled_conn(&conn), "两键均缺 → 各取默认开");
@@ -2996,7 +3144,7 @@ mod tests {
     #[test]
     fn compat_send_status_payload_shape() {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
-        crate::database::schema::init(&conn);
+        crate::database::schema::init(&conn).unwrap();
         let mut st = serde_json::json!({});
         apply_compat_send_status(&mut st, &conn, false);
         assert_eq!(st["compatSendEnabled"], serde_json::json!(true));
@@ -3028,7 +3176,7 @@ mod tests {
         assert_eq!(auto_adapt_setting_from(Some("")), None);
         // 生效值：未写 → 开（缺省开的口径单点在 unwrap_or(true)）
         let conn = rusqlite::Connection::open_in_memory().unwrap();
-        crate::database::schema::init(&conn);
+        crate::database::schema::init(&conn).unwrap();
         assert!(
             auto_adapt_enabled_conn(&conn),
             "缺省开：旧实验开关的缺值/false 不迁怒到新设置"
@@ -3050,7 +3198,7 @@ mod tests {
     #[test]
     fn codex_auto_adapt_status_payload_shape() {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
-        crate::database::schema::init(&conn);
+        crate::database::schema::init(&conn).unwrap();
         let mut st = serde_json::json!({});
         apply_codex_auto_adapt_status(&mut st, &conn);
         assert_eq!(
@@ -3070,7 +3218,7 @@ mod tests {
     #[test]
     fn toggle_codex_auto_adapt_writes_explicit_value_and_audits() {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
-        crate::database::schema::init(&conn);
+        crate::database::schema::init(&conn).unwrap();
         let log = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
         let log2 = log.clone();
         toggle_codex_auto_adapt_core(
@@ -3109,7 +3257,7 @@ mod tests {
     #[test]
     fn toggle_core_notifies_adapter_with_true_value() {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
-        crate::database::schema::init(&conn);
+        crate::database::schema::init(&conn).unwrap();
         let notified = std::rc::Rc::new(std::cell::RefCell::new(Vec::<bool>::new()));
         let n1 = notified.clone();
         toggle_codex_auto_adapt_core(&conn, false, |_, _| {}, |en| n1.borrow_mut().push(en));
@@ -4024,7 +4172,7 @@ mod tests {
     /// 内存库连接（真机调用序：schema::init → migration::migrate，见 DeviceStore::memory 注释）
     fn memory_conn() -> rusqlite::Connection {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
-        crate::database::schema::init(&conn);
+        crate::database::schema::init(&conn).unwrap();
         crate::database::migration::migrate(&conn).unwrap();
         conn
     }

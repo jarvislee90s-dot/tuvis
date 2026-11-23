@@ -1,0 +1,79 @@
+{
+  "data": [
+    {
+      "id": "msg_198274464001kDmqQsV7LvqKpg",
+      "time": {
+        "created": 1793554072676
+      },
+      "type": "idle",
+      "outcome": "failed",
+      "error": {
+        "type": "provider.no-route",
+        "message": "Model unavailable: t3-unavailable/t3-unavailable"
+      }
+    },
+    {
+      "id": "msg_19827444d001wO95b4bpyi5A1B",
+      "time": {
+        "created": 1793554072671
+      },
+      "text": "",
+      "files": [
+        {
+          "data": "VDMgYXR0YWNobWVudA==",
+          "mime": "text/plain",
+          "source": {
+            "type": "inline"
+          }
+        }
+      ],
+      "type": "user"
+    },
+    {
+      "id": "msg_198274413001ury1jVkELRuSxp",
+      "time": {
+        "created": 1793554072670
+      },
+      "text": "<system-reminder>\nYou are NO LONGER in Plan mode. The previous Plan restrictions no longer apply. Any Plan mode instructions from earlier in this conversation are no longer active.\n</system-reminder>",
+      "type": "synthetic"
+    },
+    {
+      "id": "msg_198274406001i89M1mCRp3oHTE",
+      "time": {
+        "created": 1793554072669
+      },
+      "text": "<system-reminder>\nYou are in Plan mode. Discuss the plan with the user directly in the conversation. Do not create or update plan files unless the user explicitly asks you to; when they do, write them only in:\n<home>/.opencode/plan\n\nDo not modify any other files or ask a subagent to do so.\n\nYou remain in Plan mode until the user switches agents. If the user asks you to implement changes, do not do so. Tell them they need to switch agents.\n</system-reminder>",
+      "type": "synthetic"
+    },
+    {
+      "id": "msg_19827441c001FiW8dku4j6HqOy",
+      "time": {
+        "created": 1793554072604
+      },
+      "type": "agent-switched",
+      "agent": "build",
+      "previous": "t3-nonexistent"
+    },
+    {
+      "id": "msg_198274410001k1PfN7cVugkbTK",
+      "time": {
+        "created": 1793554072592
+      },
+      "type": "agent-switched",
+      "agent": "t3-nonexistent",
+      "previous": "plan"
+    },
+    {
+      "id": "msg_1982744000010j1CNfujsn5vzx",
+      "time": {
+        "created": 1793554072576
+      },
+      "type": "agent-switched",
+      "agent": "plan"
+    }
+  ],
+  "cursor": {
+    "previous": "eyJpZCI6Im1zZ18xOTgyNzQ0NjQwMDFrRG1xUXNWN0x2cUtwZyIsIm9yZGVyIjoiZGVzYyIsImRpcmVjdGlvbiI6InByZXZpb3VzIn0",
+    "next": "eyJpZCI6Im1zZ18xOTgyNzQ0MDAwMDEwajFDTmZ1anNuNXZ6eCIsIm9yZGVyIjoiZGVzYyIsImRpcmVjdGlvbiI6Im5leHQifQ"
+  }
+}

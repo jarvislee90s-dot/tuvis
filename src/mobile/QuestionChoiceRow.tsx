@@ -11,6 +11,8 @@ export interface QuestionChoiceRowProps {
   multiSelect?: boolean;
   disabled?: boolean;
   testId?: string;
+  /** 额外 `data-*` 钩子：挂在**按钮本身**上，调用方的既有定位语义不变。 */
+  dataAttributes?: Record<string, string | undefined>;
   onClick: () => void;
 }
 
@@ -22,12 +24,16 @@ export default function QuestionChoiceRow({
   multiSelect = false,
   disabled = false,
   testId,
+  dataAttributes,
   onClick,
 }: QuestionChoiceRowProps) {
   return (
     <button
       type="button"
       data-testid={testId}
+      {...Object.fromEntries(
+        Object.entries(dataAttributes ?? {}).filter(([, value]) => value !== undefined)
+      )}
       data-checked={multiSelect && checked ? "true" : undefined}
       aria-pressed={checked}
       disabled={disabled}

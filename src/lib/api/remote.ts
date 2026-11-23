@@ -453,3 +453,55 @@ export async function remoteNamedSetAddress(address: string): Promise<NamedWizar
 export async function remoteNamedVerify(): Promise<NamedWizardProbe> {
   return await invoke<NamedWizardProbe>("remote_named_verify");
 }
+
+export type OpenCodeInteractionPolicy = "native_only" | "legacy_compatible";
+export interface OpenCodeInteractionPolicyStatus {
+  policy: OpenCodeInteractionPolicy;
+  legacyConfigurable: boolean;
+}
+export const getOpenCodeInteractionPolicyStatus = () =>
+  invoke<OpenCodeInteractionPolicyStatus>("opencode_interaction_policy_status");
+export const setOpenCodeInteractionPolicy = (policy: OpenCodeInteractionPolicy) =>
+  invoke<void>("opencode_interaction_policy_set", { policy });
+
+export type OpenCodeObserverStatus = "absent" | "current" | "outdated" | "conflict";
+export const getOpenCodeObserverStatus = () =>
+  invoke<OpenCodeObserverStatus>("opencode_tui_observer_status");
+export const installOpenCodeObserver = () =>
+  invoke<OpenCodeObserverStatus>("opencode_tui_observer_install");
+export const uninstallOpenCodeObserver = () =>
+  invoke<OpenCodeObserverStatus>("opencode_tui_observer_uninstall");
+
+/** OpenCode 服务插件桥：一次性安装状态 + 当前认证连接（B1）。 */
+export interface OpenCodeBridgeInstallStatus {
+  pluginPath: string;
+  configPath: string;
+  pluginInstalled: boolean;
+  configRegistered: boolean;
+  backupPath: string;
+}
+
+export interface OpenCodeBridgeRuntimeStatus {
+  attested: boolean;
+  runtime: { serviceId: string; pid: number; startedAtMs: number } | null;
+  incarnation: string | null;
+  location: string | null;
+  peerPid: number | null;
+  lastError: string | null;
+}
+
+export interface OpenCodeBridgeView {
+  install: OpenCodeBridgeInstallStatus;
+  bridge: OpenCodeBridgeRuntimeStatus | null;
+  reloadTriggered: boolean;
+  reloadError: string | null;
+}
+
+export const getOpenCodeBridgeStatus = () => invoke<OpenCodeBridgeView>("opencode_bridge_status");
+
+export const installOpenCodeBridge = () => invoke<OpenCodeBridgeView>("opencode_bridge_install");
+
+export const uninstallOpenCodeBridge = () =>
+  invoke<OpenCodeBridgeView>("opencode_bridge_uninstall");
+
+export const reloadOpenCodeBridge = () => invoke<OpenCodeBridgeView>("opencode_bridge_reload");

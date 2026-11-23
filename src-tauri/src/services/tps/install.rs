@@ -540,7 +540,13 @@ fn open_state_db(home: &Path) -> Result<Connection, UsageError> {
         )?;
     }
     // 幂等建表：生产库已初始化时无副作用；测试私有库靠它建齐 tps_state
-    schema::init(&conn);
+    // （M4：schema::init 改返回 Result——此前内部 panic，现经本函数既有 UsageError 通道上浮）
+    schema::init(&conn).map_err(|e| {
+        UsageError::new(
+            "usage-db-failed",
+            format!("tps: failed to initialize schema: {e}"),
+        )
+    })?;
     Ok(conn)
 }
 

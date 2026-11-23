@@ -1,0 +1,38 @@
+{
+  "x-evidence": {
+    "run_id": "20261029-233614",
+    "source": "docs/engineering/evidence/opencode-native/followup/fixtures/form.pending.json",
+    "note": "原生 create 端点产生的 pending 表单，仅保留字段形态（无凭据、无认证头）"
+  },
+  "data": {
+    "id": "frm_1885e0f80001c8MGey3q0pVMBD",
+    "sessionID": "ses_e77aec5e9ffez0Bwhj2OAQgQja",
+    "title": "G2-fixture-required",
+    "fields": [
+      {
+        "key": "q0",
+        "title": "COLOR",
+        "description": "Pick a color",
+        "required": true,
+        "type": "string",
+        "options": [
+          { "value": "red", "label": "red" },
+          { "value": "blue", "label": "blue" }
+        ],
+        "custom": true
+      },
+      {
+        "key": "q1",
+        "title": "NAME",
+        "required": true,
+        "type": "string"
+      },
+      {
+        "key": "q2",
+        "title": "NOTE",
+        "type": "string"
+      }
+    ],
+    "state": { "status": "pending" }
+  }
+}

@@ -982,6 +982,9 @@ async fn review_r2_same_hub_restart_watermark_advances_across_two_cycles() {
             rate_bucket_channels_source: Box::new(Vec::new),
             home_source: Box::new(|| None),
             injector: Arc::new(crate::inject::engine::RealInjector),
+            opencode_native: std::sync::Arc::new(crate::services::opencode_native::NativeHub::new(
+                crate::remote::pairing::DeviceStore::global(),
+            )),
             resume_spawner: Arc::new(|_| Ok(())),
             create_hub: Arc::new(CreateTaskHub::stub()),
             archive_source: Box::new(Vec::new),
@@ -1096,6 +1099,9 @@ async fn run_hub_restart_check(check_sequence: bool) {
         rate_bucket_channels_source: Box::new(Vec::new),
         home_source: Box::new(|| None),
         injector: Arc::new(crate::inject::engine::RealInjector),
+        opencode_native: std::sync::Arc::new(crate::services::opencode_native::NativeHub::new(
+            crate::remote::pairing::DeviceStore::global(),
+        )),
         resume_spawner: Arc::new(|_| Ok(())),
         create_hub: Arc::new(CreateTaskHub::stub()),
         archive_source: Box::new(Vec::new),

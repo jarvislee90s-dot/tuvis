@@ -41,7 +41,7 @@ fn fact(turn: &str) -> EstimateFact {
 #[test]
 fn estimate_commit_is_idempotent_and_does_not_touch_usage() {
     let mut conn = Connection::open_in_memory().unwrap();
-    schema::init(&conn);
+    schema::init(&conn).unwrap();
     migration::migrate(&conn).unwrap();
     migration::migrate(&conn).unwrap();
     store::save_state(&conn, "cursor:test", &serde_json::json!({"offset":42})).unwrap();
@@ -80,7 +80,7 @@ fn saved_master_disable_reenable_rejects_old_capture_permit() {
         model::UsageSettings, settings::save_to_conn_with_gate,
     };
     let mut conn = Connection::open_in_memory().unwrap();
-    schema::init(&conn);
+    schema::init(&conn).unwrap();
     migration::migrate(&conn).unwrap();
     let gate = CaptureGate::new(true);
     let old = gate.permit().unwrap();
@@ -111,7 +111,7 @@ fn saved_source_disable_reenable_rejects_old_capture_permit() {
         set_estimate_enabled_with_gate, ENABLED_KEY,
     };
     let mut conn = Connection::open_in_memory().unwrap();
-    schema::init(&conn);
+    schema::init(&conn).unwrap();
     migration::migrate(&conn).unwrap();
     let gate = CaptureGate::new(true);
     let old = gate.permit().unwrap();
@@ -129,7 +129,7 @@ fn saved_source_disable_reenable_rejects_old_capture_permit() {
 fn saved_switch_transitions_notify_observer_even_before_tick() {
     use multi_agents_manager_lib::services::tps::estimate_store::set_estimate_enabled_with_gate;
     let conn = Connection::open_in_memory().unwrap();
-    schema::init(&conn);
+    schema::init(&conn).unwrap();
     migration::migrate(&conn).unwrap();
     let gate = CaptureGate::new(true);
     let mut notifications = gate.subscribe().unwrap();
@@ -143,7 +143,7 @@ fn saved_switch_transitions_notify_observer_even_before_tick() {
 #[test]
 fn estimate_rejects_raw_session_identity() {
     let mut conn = Connection::open_in_memory().unwrap();
-    schema::init(&conn);
+    schema::init(&conn).unwrap();
     migration::migrate(&conn).unwrap();
     let gate = CaptureGate::new(true);
     let mut value = fact("turn-a");
@@ -160,7 +160,7 @@ fn estimate_rejects_raw_session_identity() {
 #[test]
 fn positive_submillisecond_window_is_not_truncated_to_zero() {
     let mut conn = Connection::open_in_memory().unwrap();
-    schema::init(&conn);
+    schema::init(&conn).unwrap();
     migration::migrate(&conn).unwrap();
     let gate = CaptureGate::new(true);
     let mut value = fact("short-window");
@@ -171,7 +171,7 @@ fn positive_submillisecond_window_is_not_truncated_to_zero() {
 #[test]
 fn estimate_retention_uses_same_24_hour_cutoff() {
     let mut conn = Connection::open_in_memory().unwrap();
-    schema::init(&conn);
+    schema::init(&conn).unwrap();
     migration::migrate(&conn).unwrap();
     let gate = CaptureGate::new(true);
     let permit = gate.permit().unwrap();
@@ -424,7 +424,7 @@ async fn late_tokenization_cannot_cross_saved_master_disable_reenable() {
         Arc, Condvar, Mutex,
     };
     let conn = Connection::open_in_memory().unwrap();
-    schema::init(&conn);
+    schema::init(&conn).unwrap();
     migration::migrate(&conn).unwrap();
     let db = Arc::new(Mutex::new(conn));
     let gate = CaptureGate::new(true);
@@ -522,7 +522,7 @@ async fn disabling_source_drains_waiting_worker_text_even_when_worker_is_blocked
         Arc, Condvar, Mutex,
     };
     let conn = Connection::open_in_memory().unwrap();
-    schema::init(&conn);
+    schema::init(&conn).unwrap();
     migration::migrate(&conn).unwrap();
     let db = Arc::new(Mutex::new(conn));
     let gate = CaptureGate::new(true);
@@ -672,7 +672,7 @@ async fn disable_waits_for_active_plaintext_to_be_released() {
     };
     use std::sync::{Arc, Condvar, Mutex};
     let conn = Connection::open_in_memory().unwrap();
-    schema::init(&conn);
+    schema::init(&conn).unwrap();
     migration::migrate(&conn).unwrap();
     let db = Arc::new(Mutex::new(conn));
     let gate = CaptureGate::new(true);
@@ -750,7 +750,7 @@ async fn database_retry_uses_only_redacted_fact_and_is_bounded() {
         Arc, Mutex,
     };
     let conn = Connection::open_in_memory().unwrap();
-    schema::init(&conn);
+    schema::init(&conn).unwrap();
     migration::migrate(&conn).unwrap();
     let db = Arc::new(Mutex::new(conn));
     let attempts = Arc::new(AtomicUsize::new(0));
@@ -803,7 +803,7 @@ async fn late_tokenization_cannot_cross_saved_source_disable_reenable() {
         Arc, Condvar, Mutex,
     };
     let conn = Connection::open_in_memory().unwrap();
-    schema::init(&conn);
+    schema::init(&conn).unwrap();
     migration::migrate(&conn).unwrap();
     let db = Arc::new(Mutex::new(conn));
     let gate = CaptureGate::new(true);
@@ -875,7 +875,7 @@ async fn late_tokenization_cannot_cross_saved_source_disable_reenable() {
 #[test]
 fn ending_capture_invalidates_old_jobs_without_disabling_future_capture() {
     let mut conn = Connection::open_in_memory().unwrap();
-    schema::init(&conn);
+    schema::init(&conn).unwrap();
     migration::migrate(&conn).unwrap();
     let gate = CaptureGate::new(true);
     let old = gate.permit().unwrap();
@@ -889,7 +889,7 @@ async fn shutdown_waits_for_inflight_job_and_rejects_old_commit() {
     use multi_agents_manager_lib::services::tps::body_runtime::{BeforeCommitHook, BodyRuntime};
     use std::sync::{Arc, Condvar, Mutex};
     let conn = Connection::open_in_memory().unwrap();
-    schema::init(&conn);
+    schema::init(&conn).unwrap();
     migration::migrate(&conn).unwrap();
     let db = Arc::new(Mutex::new(conn));
     let gate = CaptureGate::new(true);
@@ -1002,7 +1002,7 @@ fn concurrent_stop_and_restart_persist_in_transition_order() {
     use std::sync::{Arc, Mutex};
     for master in [true, false] {
         let conn = Connection::open_in_memory().unwrap();
-        schema::init(&conn);
+        schema::init(&conn).unwrap();
         migration::migrate(&conn).unwrap();
         let db = Arc::new(Mutex::new(conn));
         let gate = CaptureGate::new(true);
@@ -1068,7 +1068,7 @@ fn failed_stop_persistence_keeps_old_permit_invalid() {
     use std::sync::Mutex;
     for master in [true, false] {
         let conn = Connection::open_in_memory().unwrap();
-        schema::init(&conn);
+        schema::init(&conn).unwrap();
         migration::migrate(&conn).unwrap();
         if master {
             conn.execute_batch("CREATE TRIGGER reject_stop BEFORE INSERT ON settings BEGIN SELECT RAISE(ABORT, 'rejected'); END;").unwrap();

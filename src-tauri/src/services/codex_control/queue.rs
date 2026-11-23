@@ -2607,7 +2607,7 @@ mod tests {
             [],
         )
         .unwrap();
-        crate::database::schema::init(&conn);
+        crate::database::schema::init(&conn).unwrap();
         crate::database::migration::migrate(&conn).unwrap();
         // 新表可用 + 旧数据不丢
         let n: i64 = conn
@@ -2621,7 +2621,7 @@ mod tests {
         )
         .unwrap();
         // 幂等：重复 init 不炸
-        crate::database::schema::init(&conn);
+        crate::database::schema::init(&conn).unwrap();
     }
 
     /// DeviceStore::memory 路径（schema::init → migration::migrate）上 ActionStore 可用

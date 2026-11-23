@@ -36,6 +36,12 @@ codex-ipc-e2e-stop = []
 # （编译门在 zcode_control/mod.rs，release + 该 feature 直接编译失败）。
 # 验收构建：`pnpm tauri dev --features hook-listener,zcode-bridge-evidence`。
 zcode-bridge-evidence = []
+# B1 底层协调器回归专用；默认关闭，release 编译拒绝，不构成实例归属证明。
+opencode-coordinator-tests = []
+
+[[test]]
+name = "opencode_native_remote"
+required-features = ["opencode-coordinator-tests"]
 
 [[bin]]
 name = "tuvis"
@@ -79,6 +85,9 @@ log = "0.4"
 env_logger = "0.11"
 chrono = { version = "0.4", features = ["serde"] }
 once_cell = "1.19"
+# macOS Unix-domain peer identity (LOCAL_PEERPID / getpeereid / proc_pidpath) for
+# the OpenCode service-plugin bridge; already present transitively, declared direct.
+libc = "0.2"
 rusqlite = { version = "0.41", features = ["bundled"] }
 dashmap = "6"
 tokio = { version = "1", features = ["full"] }
@@ -102,6 +111,8 @@ zstd = "0.14"
 tauri-plugin-dialog = "2"
 # M2（远程接入）：主进程内嵌 axum 服务器 + 看板静态资源内嵌
 axum = "0.8"
+# 新建只使用通过身份核验的连接。复用 HTTP 集成已有的 Tower 版本。
+tower = { version = "0.5", features = ["filter", "util"] }
 # include-exclude：支持 #[exclude = ".gitkeep"]（占位文件不嵌入二进制，终审修复轮）
 rust-embed = { version = "8", features = ["include-exclude"] }
 # 配对码 / deviceId 生成
@@ -178,8 +189,7 @@ tempfile = "3"
 filetime = "0.2"
 # preset_v2 集成测试直接取家目录（stash 测试用）；与主依赖同版本
 dirs = "7.0"
-# M2 axum 集成测试：tower ServiceExt::oneshot + http-body-util 读响应体
-tower = { version = "0.5", features = ["util"] }
+# M2 axum 集成测试：读取响应体
 http-body-util = "0.1"
 # codex_desktop_ipc 集成测试：start_paused 虚拟时间（RPC 超时用例不真等 15s）
 tokio = { version = "1", features = ["test-util"] }

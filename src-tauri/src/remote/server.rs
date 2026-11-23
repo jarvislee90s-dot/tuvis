@@ -702,6 +702,13 @@ pub struct RemoteState {
     /// （未推送），下发如实给 null。Clone 共享内部态；测试各自独立实例防互踩
     /// （capability_table 同款纪律）。
     pub desktop_language: super::language::LanguageSource,
+    /// **OpenCode 原生交互中枢**（任务 8）：只读投影 + 动作账本 + 旧路径写屏障
+    /// （每会话 read/write permit）。生产 = `remote/mod.rs` STATE 的
+    /// `NativeHub::new(DeviceStore::global())`（惰性容器——首次 view 才发现服务）；
+    /// 测试夹具 = `NativeHub::new(DeviceStore::memory())`（禁用默认）或
+    /// `with_sources` 注入临时登记文件。停远程时经 `stop_server_with` pause
+    /// （关闭原生 watch）。
+    pub opencode_native: std::sync::Arc<crate::services::opencode_native::NativeHub>,
 }
 
 /// API 子路由：业务端点 + /pair/pin + 内层 fallback（未知 API 路径直接 403）+ gate 内层 layer。
@@ -928,13 +935,11 @@ fn api_router(state: Arc<RemoteState>) -> Router<Arc<RemoteState>> {
         .route("/session-mode/menu", get(api::session_mode_menu_read))
         // 2026-09-20：移动端附件上传（落盘会话工作目录 .tuvis-attachments/<会话>/，
         // 路径随消息内联标记注入；PIN 门禁内层 gate 结构性覆盖；20MB 显式上限——
-        // axum 默认 2MB；超限时 handler 先按 Content-Length 预检给结构化 413）
-        .route(
-            "/session-attachment",
-            post(api::session_attachment).layer(axum::extract::DefaultBodyLimit::max(
-                crate::remote::attachments::MAX_ATTACHMENT_BYTES,
-            )),
-        )
+        // H07 D1：上限在 handler 内以限长读取（axum::body::to_bytes）单点收口，
+        // 超限响应契约 JSON 413 体（{"error":"too_large"}）；不挂 DefaultBodyLimit
+        // 层——框架兜底的通用 413 体不可辨错误码，且会把 handler 的结构化拒绝
+        // 挡成不可达）
+        .route("/session-attachment", post(api::session_attachment))
         // M6R–M9R Task 11：一键 resume 端点（R5，PIN 门禁内层 gate 结构性覆盖，
         // 新端点不需要各自鉴权代码；spawn 缝注入使测试零真开窗）
         .route("/session-open", post(api::session_open))
@@ -958,6 +963,10 @@ fn api_router(state: Arc<RemoteState>) -> Router<Arc<RemoteState>> {
         // /pair/pin 精确相等；旧 /pair 直通与 /pair/* 审批路由已删除，未知路径落
         // 内层 fallback 403）
         .route("/pair/pin", post(api::pair_pin))
+        // 任务 8：OpenCode 原生交互候选路由（view/events/actions/verify）——与既有
+        // 端点同一 api_router、同一配对门内层 gate（结构性覆盖，无需各自鉴权代码）。
+        // 生产门禁在 handler 内（macOS + 验证开关 + 唯一绑定 + 契约可读）。
+        .merge(super::opencode_native::routes())
         // 内层 fallback：nest 前缀下的未知/多余路径不得裸奔——没有它，
         // `/m/api/v1/nope` 会落到外层 fallback（Task 7 的静态兜底 → 200 静态内容），
         // 绕开"所有 /m/api/* 过 gate（403）"这条安全不变量（评审实测确认）
@@ -1008,19 +1017,20 @@ pub async fn serve(bind: &str, port: u16, state: Arc<RemoteState>) -> Result<(),
     // spawn 一次）。放在 bind 之后：端口被占等启动失败不遗留 2s 会话扫描（扫描是重活，
     // 单飞与节奏见 adapter::scan_bus）；watcher 生命周期随进程结束，
     // stop_server 不显式停止（关闭远程后循环仍扫描，为已有取舍）
-    super::watcher::SessionWatcher::start();
-    // M7 Task 6：注入 flush 循环接线（Task 5 交付的循环体在此合入编译）——订阅同一
-    // watcher 跃迁通道（broadcast 多订阅端各自独立游标，与 SSE 消费互不影响），
-    // 会话回到可输入态时逐条投递该会话的待发队列；与 session-send 直发共用
-    // in-flight 守卫（同会话并发双投防护）
-    crate::inject::queue::spawn_flush_loop(state.clone());
-    // Codex Desktop IPC：装配调度循环（启动恢复 + 周期对账 + 事件接力）。
-    // disabled hub（测试夹具）短路；stop（remote 关闭/热重启）后不再订阅/调度。
-    state.codex_control.start(state.clone());
-    // M5 A3：来源 IP 记录——into_make_service_with_connect_info 注入 ConnectInfo
-    // extension。**消费方只有 pair_pin**（限速分桶键 + 落库来源），且**不参与放行判定**
-    // （不变量 G1：来源地址/请求头/进程归属不得影响鉴权；原 gate 本机豁免已整块删除，
-    // gate 不再消费它）。oneshot 测试在请求侧自补同一 extension。
+    // 重活（会话扫描、Codex 调度恢复、outbox 消费者）在监听绑定后另起任务装配：
+    // 真实账本/大量历史可能让初始化阻塞数十秒，不能把 HTTP 可用性绑在它后面。
+    let setup_state = state.clone();
+    tokio::spawn(async move {
+        super::watcher::SessionWatcher::start();
+        crate::inject::queue::spawn_flush_loop(setup_state.clone());
+        setup_state.codex_control.start(setup_state.clone());
+        let weak = Arc::downgrade(&setup_state);
+        setup_state.opencode_native.start_outbox(Arc::new(move || {
+            weak.upgrade()
+                .map(|st| (st.session_source)().sessions)
+                .unwrap_or_default()
+        }));
+    });
     axum::serve(
         listener,
         router_with_static(state).into_make_service_with_connect_info::<std::net::SocketAddr>(),
@@ -1106,7 +1116,168 @@ mod tests {
 
             codex_control: crate::remote::codex_ipc::CodexControlHub::disabled_arc(),
             desktop_language: Default::default(),
+            // 任务 8：OpenCode 原生交互中枢——测试禁用默认（惰性容器，零 IO；本组用例不触原生路由）
+            opencode_native: Arc::new(crate::services::opencode_native::NativeHub::new(
+                crate::remote::pairing::DeviceStore::memory(),
+            )),
         })
+    }
+
+    /// R2 / F2 生产装配层回归：真实 `stop_server_with` + `start_server_core` 接线
+    /// 复用同一个 `NativeHub`（生产 STATE 单例形态），停→开之后 view/watch 仍可恢复。
+    /// 临时目录 + 回环最小假 peer + 内存设备库；SERVER_HANDLE/STATE 全局不被触碰。
+    /// 唯一进程级共享是 flush-loop 句柄：用 `LOOP_HANDLE_TEST_LOCK` 与其它用例串行，
+    /// 因此必须跨 await 持 std guard（clippy 明确 allow，不能改成 async mutex——
+    /// 别的测试也按 std 锁取它）。
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn production_stop_start_restores_the_shared_native_hub() {
+        use crate::services::opencode_native::types::DiscoveryInput;
+        use crate::services::opencode_native::NativeHub;
+
+        const PEER_PID: u32 = 4321;
+        const STARTED_AT_MS: i64 = 1_700_000_000_000;
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let project = project.canonicalize().unwrap();
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind 假 peer");
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let urls = endpoint.clone();
+        let directory = project.to_string_lossy().into_owned();
+        let app = axum::Router::new()
+            .route(
+                "/openapi.json",
+                axum::routing::get(|| async {
+                    axum::Json(serde_json::json!({ "openapi": "3.1.0", "paths": {} }))
+                }),
+            )
+            .route(
+                "/api/info",
+                axum::routing::get(move || {
+                    let urls = urls.clone();
+                    async move {
+                        axum::Json(serde_json::json!({
+                            "version": "2.0.22",
+                            "pid": PEER_PID,
+                            "urls": [urls],
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/api/session/{id}",
+                axum::routing::get(
+                    move |axum::extract::Path(id): axum::extract::Path<String>| {
+                        let directory = directory.clone();
+                        async move {
+                            axum::Json(serde_json::json!({
+                                "id": id,
+                                "location": { "directory": directory },
+                            }))
+                        }
+                    },
+                ),
+            );
+        let peer = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let state_file = tmp.path().join("state/opencode/service.json");
+        std::fs::create_dir_all(state_file.parent().unwrap()).unwrap();
+        std::fs::write(
+            &state_file,
+            format!(
+                r#"{{"id":"svc-r2","version":"2.0.22","url":"{endpoint}","pid":{PEER_PID},"password":"pw-r2"}}"#
+            ),
+        )
+        .unwrap();
+
+        let mut state = test_state();
+        let hub = Arc::new(NativeHub::with_coordinator_sources(
+            crate::remote::pairing::DeviceStore::memory(),
+            DiscoveryInput {
+                state_file,
+                home: tmp.path().to_path_buf(),
+            },
+            Arc::new(|pid: u32| (pid == PEER_PID).then_some(STARTED_AT_MS)),
+        ));
+        // test_state 返回唯一 Arc；替换成可注入发现的同一 hub——此后所有请求都走它，
+        // 与生产 STATE 单例跨停/开复用同一个 hub 的形态一致。
+        Arc::get_mut(&mut state)
+            .expect("test_state 必须唯一")
+            .opencode_native = hub.clone();
+
+        let session = crate::session::Session {
+            id: "ses-native".into(),
+            agent_type: crate::session::AgentType::OpenCode,
+            project_name: "project".into(),
+            project_path: project.to_string_lossy().into_owned(),
+            title: None,
+            git_branch: None,
+            github_url: None,
+            status: crate::session::SessionStatus::Idle,
+            last_message: None,
+            last_message_role: None,
+            last_message_subagent_report: false,
+            flap_from_subagent_activity: false,
+            last_activity_at: "2026-10-30T00:00:00Z".into(),
+            pid: 1,
+            cpu_usage: 0.0,
+            active_subagent_count: 0,
+            form: crate::session::ProcessForm::Cli,
+            jump_supported: false,
+            unread: false,
+            unread_turned_green_at_ms: None,
+        };
+
+        // 真实 stop_server_with 会 abort 进程级 FLUSH_LOOP_HANDLE：与其它操作
+        // flush-loop 的测试共用同一把串行锁（inject/queue.rs 的纪律），避免跨测试竞态。
+        let _serial = crate::inject::queue::LOOP_HANDLE_TEST_LOCK.lock().unwrap();
+        let first = hub.view(&session).await.expect("停之前投影必须成功");
+        assert_eq!(first.revision, 1);
+        let mut watch = hub.watch(&session.id);
+
+        // 生产停机：与 stop_server(false) / 热重启完全同一条 stop_server_with 接线。
+        crate::remote::stop_server_with(state.as_ref(), None, false, || {});
+        tokio::time::timeout(std::time::Duration::from_secs(5), watch.changed())
+            .await
+            .expect("生产停机必须在时限内关闭旧 watch")
+            .expect_err("生产停机后旧 watch 必须关闭");
+
+        // 生产启动内核：真实分支（查重 → bind → 安全门 → spawn），spawn 用假任务。
+        let mut slot = None;
+        let mut spawned = 0usize;
+        let started = crate::remote::start_server_core(
+            &mut slot,
+            || Ok(("127.0.0.1".to_string(), 0)),
+            || None,
+            |_, _| {
+                spawned += 1;
+                tauri::async_runtime::spawn(async {})
+            },
+        )
+        .expect("start_server_core 必须成功");
+        assert!(started && spawned == 1, "停→开必须重新 spawn");
+        slot.as_ref().unwrap().abort();
+
+        let reopened = hub
+            .view(&session)
+            .await
+            .expect("停→开后同一个 hub 必须恢复 view");
+        assert_eq!(reopened.revision, 1, "新监听代际重新计数");
+        let fresh = hub.watch(&session.id);
+        assert_eq!(
+            *fresh.borrow(),
+            reopened.revision,
+            "重开后的 watch 必须能订阅到当前修订（内容未变不产生新事件）"
+        );
+        let third = hub.view(&session).await.expect("新监听第二次投影");
+        assert_eq!(third.revision, 1, "纯读取且内容未变不得推进修订");
+
+        peer.abort();
     }
 
     async fn body_string(b: axum::http::Response<Body>) -> String {
@@ -1763,6 +1934,10 @@ mod tests {
 
             codex_control: crate::remote::codex_ipc::CodexControlHub::disabled_arc(),
             desktop_language: Default::default(),
+            // 任务 8：OpenCode 原生交互中枢——测试禁用默认（惰性容器，零 IO；本组用例不触原生路由）
+            opencode_native: Arc::new(crate::services::opencode_native::NativeHub::new(
+                crate::remote::pairing::DeviceStore::memory(),
+            )),
         });
         // 预置有效设备，令 gate 放行（否则不会走到 session_source，测试失去意义）
         let now = chrono::Utc::now().timestamp_millis();
@@ -2315,6 +2490,10 @@ mod tests {
 
             codex_control: crate::remote::codex_ipc::CodexControlHub::disabled_arc(),
             desktop_language: Default::default(),
+            // 任务 8：OpenCode 原生交互中枢——测试禁用默认（惰性容器，零 IO；本组用例不触原生路由）
+            opencode_native: Arc::new(crate::services::opencode_native::NativeHub::new(
+                crate::remote::pairing::DeviceStore::memory(),
+            )),
         });
         let app = router(state.clone());
         let now = chrono::Utc::now().timestamp_millis();
@@ -2782,6 +2961,10 @@ mod tests {
 
             codex_control: crate::remote::codex_ipc::CodexControlHub::disabled_arc(),
             desktop_language: Default::default(),
+            // 任务 8：OpenCode 原生交互中枢——测试禁用默认（惰性容器，零 IO；本组用例不触原生路由）
+            opencode_native: Arc::new(crate::services::opencode_native::NativeHub::new(
+                crate::remote::pairing::DeviceStore::memory(),
+            )),
         });
         let app = router(state.clone());
         let now = chrono::Utc::now().timestamp_millis();
@@ -2995,6 +3178,10 @@ mod tests {
 
             codex_control: crate::remote::codex_ipc::CodexControlHub::disabled_arc(),
             desktop_language: Default::default(),
+            // 任务 8：OpenCode 原生交互中枢——测试禁用默认（惰性容器，零 IO；本组用例不触原生路由）
+            opencode_native: Arc::new(crate::services::opencode_native::NativeHub::new(
+                crate::remote::pairing::DeviceStore::memory(),
+            )),
         });
         let app = router(state.clone());
         persist_device(&state, "fe");
@@ -3304,6 +3491,10 @@ mod tests {
 
             codex_control: crate::remote::codex_ipc::CodexControlHub::disabled_arc(),
             desktop_language: Default::default(),
+            // 任务 8：OpenCode 原生交互中枢——测试禁用默认（惰性容器，零 IO；本组用例不触原生路由）
+            opencode_native: Arc::new(crate::services::opencode_native::NativeHub::new(
+                crate::remote::pairing::DeviceStore::memory(),
+            )),
         });
         let app = router(state.clone());
         persist_device(&state, "fe");
@@ -3505,6 +3696,10 @@ mod tests {
 
                 codex_control: crate::remote::codex_ipc::CodexControlHub::disabled_arc(),
                 desktop_language: Default::default(),
+                // 任务 8：OpenCode 原生交互中枢——测试禁用默认（惰性容器，零 IO；本组用例不触原生路由）
+                opencode_native: Arc::new(crate::services::opencode_native::NativeHub::new(
+                    crate::remote::pairing::DeviceStore::memory(),
+                )),
             }),
             t,
         )
@@ -4728,6 +4923,10 @@ mod tests {
 
                     codex_control: crate::remote::codex_ipc::CodexControlHub::disabled_arc(),
                     desktop_language: Default::default(),
+                    // 任务 8：OpenCode 原生交互中枢——测试禁用默认（惰性容器，零 IO；本组用例不触原生路由）
+                    opencode_native: Arc::new(crate::services::opencode_native::NativeHub::new(
+                        crate::remote::pairing::DeviceStore::memory(),
+                    )),
                 }),
                 t,
             )
@@ -5092,6 +5291,10 @@ mod tests {
 
             codex_control: crate::remote::codex_ipc::CodexControlHub::disabled_arc(),
             desktop_language: Default::default(),
+            // 任务 8：OpenCode 原生交互中枢——测试禁用默认（惰性容器，零 IO；本组用例不触原生路由）
+            opencode_native: Arc::new(crate::services::opencode_native::NativeHub::new(
+                crate::remote::pairing::DeviceStore::memory(),
+            )),
         })
     }
 
@@ -5346,6 +5549,10 @@ mod tests {
 
             codex_control: crate::remote::codex_ipc::CodexControlHub::disabled_arc(),
             desktop_language: Default::default(),
+            // 任务 8：OpenCode 原生交互中枢——测试禁用默认（惰性容器，零 IO；本组用例不触原生路由）
+            opencode_native: Arc::new(crate::services::opencode_native::NativeHub::new(
+                crate::remote::pairing::DeviceStore::memory(),
+            )),
         })
     }
 
@@ -7533,6 +7740,10 @@ mod tests {
 
             codex_control: crate::remote::codex_ipc::CodexControlHub::disabled_arc(),
             desktop_language: Default::default(),
+            // 任务 8：OpenCode 原生交互中枢——测试禁用默认（惰性容器，零 IO；本组用例不触原生路由）
+            opencode_native: Arc::new(crate::services::opencode_native::NativeHub::new(
+                crate::remote::pairing::DeviceStore::memory(),
+            )),
         })
     }
 
@@ -8580,6 +8791,10 @@ mod tests {
 
             codex_control: crate::remote::codex_ipc::CodexControlHub::disabled_arc(),
             desktop_language: Default::default(),
+            // 任务 8：OpenCode 原生交互中枢——测试禁用默认（惰性容器，零 IO；本组用例不触原生路由）
+            opencode_native: Arc::new(crate::services::opencode_native::NativeHub::new(
+                crate::remote::pairing::DeviceStore::memory(),
+            )),
         });
         persist_named_device(&state, "mm", "测试设备");
         (state, inner, script)
@@ -8589,6 +8804,7 @@ mod tests {
     /// /codex（Tab 备注）/opencode（own answer）均已升格走各自阶段机。本用例改钉
     /// opencode freeText 的**阶段机中止**：喂无 opencode 锚的屏（claude free_row 形态）
     /// → 第 1 段定位不到 own answer 行 → 200 failed{aborted:true}（零投递）。
+    #[cfg(not(target_os = "macos"))]
     #[tokio::test]
     async fn question_free_text_refused_for_unverified_tools() {
         for (tool, tool_id, sid, pid) in [(
@@ -8600,6 +8816,12 @@ mod tests {
             let (state, inner, _s) =
                 single_tool_scripted_state(tool, sid, pid, vec![screen_fixtures::free_row()]);
             mark_question(&state, tool_id, sid, Q_SINGLE_PAYLOAD);
+            // 本用例验证旧屏读/注入契约，明确选择兼容策略。
+            crate::services::opencode_native::policy::write_policy(
+                &state.store,
+                crate::services::opencode_native::policy::OpenCodeInteractionPolicy::LegacyCompatible,
+            )
+            .unwrap();
             let app = router(state.clone());
             let r = app
                 .oneshot(req(
@@ -9318,6 +9540,7 @@ mod tests {
     /// **opencode 屏读快照**（2026-10-05 推广批 F3）：opencode 会话 + 屏读探针返回
     /// 题页夹具（用户实测屏面形态）→ GET 载荷带 `screen.checked`（勾选态按屏上序）
     /// + `multiFreeText=true` 旗标；Confirm 页形态 → `screen.review=true`。
+    #[cfg(not(target_os = "macos"))]
     #[tokio::test]
     async fn question_get_carries_opencode_screen_snapshot() {
         let fake = FakeInjector::ok();
@@ -9353,6 +9576,12 @@ mod tests {
                 Some(payload1.as_str()),
             )
         });
+        // 本用例验证旧屏读/注入契约，明确选择兼容策略。
+        crate::services::opencode_native::policy::write_policy(
+            &state.store,
+            crate::services::opencode_native::policy::OpenCodeInteractionPolicy::LegacyCompatible,
+        )
+        .unwrap();
         let app = router(state.clone());
         let r = app
             .clone()
@@ -9409,6 +9638,11 @@ mod tests {
                 Some(payload2.as_str()),
             )
         });
+        crate::services::opencode_native::policy::write_policy(
+            &state2.store,
+            crate::services::opencode_native::policy::OpenCodeInteractionPolicy::LegacyCompatible,
+        )
+        .unwrap();
         let app2 = router(state2);
         let r2 = app2
             .oneshot(req(
@@ -9783,6 +10017,7 @@ mod tests {
     /// 读屏核对目标行勾选翻转 → 回执 checked=Some(true)/verified=true。
     /// 屏剧本：f0（目标行未勾）→ 守卫探针翻+还原 → 数字落（目标行勾上）。
     /// 守卫 id 立规：sess_ocflip 独占。
+    #[cfg(not(target_os = "macos"))]
     #[tokio::test]
     async fn opencode_toggle_flip_verified_by_screen() {
         let page = |mark: &str| {
@@ -9806,6 +10041,12 @@ mod tests {
             "sess_ocflip",
             r#"{"questions":[{"header":"h","multiSelect":true,"question":"q?","options":[{"label":"a"},{"label":"b"},{"label":"c"},{"label":"d"},{"label":"e"},{"label":"f"}]}]}"#,
         );
+        // 本用例验证旧屏读/注入契约，明确选择兼容策略。
+        crate::services::opencode_native::policy::write_policy(
+            &state.store,
+            crate::services::opencode_native::policy::OpenCodeInteractionPolicy::LegacyCompatible,
+        )
+        .unwrap();
         let app = router(state.clone());
         let r = app
             .oneshot(req(
@@ -9828,6 +10069,7 @@ mod tests {
     /// ① 屏变化 = 到达 → AdvanceDone（advanced:true + 到达后快照）；
     /// ② 屏相同 = tab 未生效 → Failed「tab 未生效」可重试。
     /// 守卫 id 立规：sess_ocadv / sess_ocadv2 独占。
+    #[cfg(not(target_os = "macos"))]
     #[tokio::test]
     async fn opencode_advance_arrival_verified_by_screen() {
         let q1_page = vec![
@@ -9852,6 +10094,12 @@ mod tests {
             "sess_ocadv",
             r#"{"questions":[{"header":"优化重点","multiSelect":true,"question":"你希望这次优化重点放在哪些方面？","options":[{"label":"画面美感与细节"},{"label":"交互动效"}]},{"header":"想加的动效","multiSelect":true,"question":"如果加动效，你希望加哪些？","options":[{"label":"角色动态"},{"label":"海面与云动效"}]}]}"#,
         );
+        // 本用例验证旧屏读/注入契约，明确选择兼容策略。
+        crate::services::opencode_native::policy::write_policy(
+            &state.store,
+            crate::services::opencode_native::policy::OpenCodeInteractionPolicy::LegacyCompatible,
+        )
+        .unwrap();
         let app = router(state.clone());
         let r = app
             .oneshot(req(
@@ -9877,6 +10125,11 @@ mod tests {
             "sess_ocadv2",
             r#"{"questions":[{"header":"优化重点","multiSelect":true,"question":"你希望这次优化重点放在哪些方面？","options":[{"label":"画面美感与细节"},{"label":"交互动效"}]}]}"#,
         );
+        crate::services::opencode_native::policy::write_policy(
+            &state2.store,
+            crate::services::opencode_native::policy::OpenCodeInteractionPolicy::LegacyCompatible,
+        )
+        .unwrap();
         let app2 = router(state2.clone());
         let r2 = app2
             .oneshot(req(
@@ -10151,6 +10404,13 @@ mod tests {
         let fake = FakeInjector::ok();
         let state = question_state(fake.clone());
         persist_named_device(&state, "mm", "测试设备");
+        // 本用例验证旧屏读/注入契约，明确选择兼容策略。
+        #[cfg(not(target_os = "macos"))]
+        crate::services::opencode_native::policy::write_policy(
+            &state.store,
+            crate::services::opencode_native::policy::OpenCodeInteractionPolicy::LegacyCompatible,
+        )
+        .unwrap();
         let app = router(state.clone());
         for sid in ["sess_al", "sess_am"] {
             // 审批 GET：不可用（问题文本不含审批 marker → detect miss）
@@ -10164,6 +10424,13 @@ mod tests {
                 ))
                 .await
                 .unwrap();
+            #[cfg(target_os = "macos")]
+            if sid == "sess_am" {
+                assert_eq!(r.status(), 409);
+                let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+                assert_eq!(v["reasonCode"], "OC_LEGACY_DISABLED");
+                continue;
+            }
             assert_eq!(r.status(), 200);
             let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
             assert_eq!(
@@ -10240,6 +10507,11 @@ mod tests {
                 ))
                 .await
                 .unwrap();
+            if cfg!(target_os = "macos") && sid == "sess_ao" {
+                assert_eq!(r.status(), 409);
+                assert!(body_string(r).await.contains("OC_LEGACY_DISABLED"));
+                continue;
+            }
             assert_eq!(r.status(), 200);
             let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
             assert_eq!(
@@ -11276,6 +11548,7 @@ mod tests {
     /// 夹具（2026-09-21 本机 part 表实测形态）：sess_ap = running（待决）、
     /// sess_aq = completed + metadata.answers（已答）。message_source 经
     /// `read_session_messages_impl` 指向 tempdir home（零接触真实 ~/.local）。
+    #[cfg(not(target_os = "macos"))]
     #[tokio::test]
     async fn opencode_question_availability_follows_part_status() {
         let tmp = tempfile::tempdir().unwrap();
@@ -11330,6 +11603,12 @@ mod tests {
             }),
         );
         persist_named_device(&state, "mm", "测试设备");
+        // 本用例验证旧屏读/注入契约，明确选择兼容策略。
+        crate::services::opencode_native::policy::write_policy(
+            &state.store,
+            crate::services::opencode_native::policy::OpenCodeInteractionPolicy::LegacyCompatible,
+        )
+        .unwrap();
         let app = router(state.clone());
 
         // 待决（running）→ available=true（卡该出，且不得被自己误销）
@@ -11705,9 +11984,15 @@ mod tests {
         if !cfg!(target_os = "macos") {
             return;
         }
+        // F4 修正（活体实测）：旧形态 `sleep 5 # {sig}` 会被 /bin/sh **exec 替换**
+        // （单简单命令优化 → 进程 argv 变为 `sleep 5`，特征从进程表消失——效果回查
+        // 恒假阴性；此前测试「时过时不过」实为外层 shell 命令行偶含特征串的污染，
+        // 2026-11-17 F4 轮以 ps 实拍定案）。改用 M7 隔离活体已验证的复合命令形态
+        // （`sleep N & wait # sig`：复合命令不可 exec 优化，sh fork+wait 存活，
+        // 原始 argv（含特征）全程在进程表——resume.rs live 测试注释同款结论）。
         let _ = std::process::Command::new("/bin/sh")
             .arg("-c")
-            .arg(format!("sleep 5 # {resume_cmd}"))
+            .arg(format!("sleep 5 & wait # {resume_cmd}"))
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -11804,6 +12089,10 @@ mod tests {
 
             codex_control: crate::remote::codex_ipc::CodexControlHub::disabled_arc(),
             desktop_language: Default::default(),
+            // 任务 8：OpenCode 原生交互中枢——测试禁用默认（惰性容器，零 IO；本组用例不触原生路由）
+            opencode_native: Arc::new(crate::services::opencode_native::NativeHub::new(
+                crate::remote::pairing::DeviceStore::memory(),
+            )),
         })
     }
 
@@ -11872,7 +12161,7 @@ mod tests {
                 // 评审 I1：cwd 进 spec（conhost 分支的 current_dir 消费点）
                 assert_eq!(cwd, "/tmp/proj-m", "spawn 计划必须携带项目目录");
             }
-            crate::inject::resume::SpawnSpec::MacosApplescript { script } => {
+            crate::inject::resume::SpawnSpec::MacosApplescript { script, .. } => {
                 // 平台对等：macOS 断言脚本载荷（cwd + resume 命令，对齐
                 // dead_session_opens_from_archive 的 macOS 断言先例），Windows 臂原样。
                 // 原此处 panic!（「Windows 运行时不得派发 AppleScript 变体」）在 macOS
@@ -11918,6 +12207,73 @@ mod tests {
             .store
             .with(|c| crate::database::dao::write_audit::recent_conn(c, 10));
         assert!(audits.is_empty(), "校验失败不写审计");
+    }
+
+    /// GB fix round 1（GR1 GB-1）：**带前缀哨兵形态 → 404 免审计**。G2 目录核对
+    /// （restore_pending ④）产出 `"session_directory_unresolved: 中文…"` 带前缀
+    /// Err；修复前分诊臂用裸哨兵 `==` 恒 miss = 死码 → 落通用 Failed 臂（写审计
+    /// + 200 failed），违背「校验失败不写审计」+ 404 契约。断言恢复：404 + 回执
+    /// 归一裸哨兵码 + 零出手 + 零审计行。夹具 = 不存在的 project_path（确定性
+    /// 触发目录核对失败，零机器状态依赖）。
+    #[tokio::test]
+    async fn session_open_endpoint_prefixed_g2_sentinel_maps_404_without_audit() {
+        let spawner_rec = RecordingSpawner::new();
+        let state = open_state_oc_with_path(
+            spawner_rec.seam(),
+            "sess_gb_prefixed_404",
+            "/tmp/gb-no-such-project-dir-for-sure",
+        );
+        persist_named_device(&state, "mm", "测试设备");
+        let app = router(state.clone());
+        let r = app
+            .clone()
+            .oneshot(req(
+                "POST",
+                "/m/api/v1/session-open",
+                Some("mam_device=mm"),
+                Some(r#"{"sessionId":"sess_gb_prefixed_404"}"#),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 404, "带前缀 G2 哨兵必须映射 404（校验失败）");
+        assert_eq!(
+            body_string(r).await,
+            "{\"error\":\"session_directory_unresolved\"}",
+            "回执归一为裸哨兵码（客户端契约面与旧哨兵同形，不带中文前缀）"
+        );
+        assert!(
+            spawner_rec.recorded().is_empty(),
+            "校验失败零出手（spawner 未被调用）"
+        );
+        let audits = state
+            .store
+            .with(|c| crate::database::dao::write_audit::recent_conn(c, 10));
+        assert!(audits.is_empty(), "校验失败不写审计（GB-1 断言恢复）");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn session_open_unverified_opencode_does_not_spawn() {
+        let spawner = RecordingSpawner::new();
+        let project = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+        let state = open_state_oc_with_path(
+            spawner.seam(),
+            "sess-unverified-history",
+            project.path().to_str().unwrap(),
+        );
+        persist_named_device(&state, "mm", "测试设备");
+        let response = router(state)
+            .oneshot(req(
+                "POST",
+                "/m/api/v1/session-open",
+                Some("mam_device=mm"),
+                Some(r#"{"sessionId":"sess-unverified-history"}"#),
+            ))
+            .await
+            .unwrap();
+        let body = body_string(response).await;
+        assert!(body.contains("failed"), "{body}");
+        assert!(spawner.recorded().is_empty());
     }
 
     /// T3 未信任预检（远程/手机回执面）：命中 ~/.claude.json projects 条款但全部
@@ -11968,7 +12324,7 @@ mod tests {
             crate::inject::resume::SpawnSpec::Windows { cwd, .. } => {
                 assert_eq!(cwd, "/tmp/proj-m", "全 false 不得改写 cwd");
             }
-            crate::inject::resume::SpawnSpec::MacosApplescript { script } => {
+            crate::inject::resume::SpawnSpec::MacosApplescript { script, .. } => {
                 assert!(
                     script.contains("/tmp/proj-m"),
                     "全 false 不得改写 cwd：{script}"
@@ -12019,7 +12375,7 @@ mod tests {
             crate::inject::resume::SpawnSpec::Windows { cwd, .. } => {
                 assert_eq!(cwd, "/TMP/PROJ-M", "spawn cwd 必须是真条款的精确 casing");
             }
-            crate::inject::resume::SpawnSpec::MacosApplescript { script } => {
+            crate::inject::resume::SpawnSpec::MacosApplescript { script, .. } => {
                 assert!(
                     script.contains("/TMP/PROJ-M"),
                     "spawn 载荷必须携带真条款精确 casing：{script}"
@@ -12084,6 +12440,291 @@ mod tests {
             .unwrap();
         assert_eq!(r.status(), 400);
         assert!(spawner_rec.recorded().is_empty());
+    }
+
+    // ==== F4 项 4A：session-open pending 状态机（待确认态端点契约）====
+
+    /// F4 pending 端点测试串行闸：三个用例共享进程级全局（pending 注册表 + 观察覆盖
+    /// + 预算覆盖）——并行执行时 reset/覆盖会互踩（实测竞态），tokio Mutex 串行化。
+    static F4_PENDING_SERIALIZER: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// F4 专用 state：opencode 会话夹具独占 id（sess_f4_oc_*，防串键纪律同源）。
+    /// prepare 链走真实环境（M7 真机锚同款门控：本机无规范安装位/版本≠登记时跳过
+    /// ——注入式核心测试已锁状态机全部分支，端点面锁 HTTP 契约）。
+    fn open_state_oc(
+        spawner: std::sync::Arc<crate::inject::resume::SpawnFn>,
+        sid: &str,
+    ) -> Arc<RemoteState> {
+        // G2 起窗前目录核对（realpath + is_dir）：夹具目录必须真实存在——幂等创建
+        // （F4 轮同路径先例；/tmp 下测试夹具，零接触真实项目目录）
+        std::fs::create_dir_all("/tmp/f4-oc-proj").expect("创建夹具项目目录");
+        open_state_oc_with_path(spawner, sid, "/tmp/f4-oc-proj")
+    }
+
+    /// open_state_oc 的 cwd 注入变体（GB fix round 1）：目录核对失败面测试用——
+    /// 传不存在路径即可在 restore_pending ④ 前置核对处产出**带前缀哨兵**
+    /// `"session_directory_unresolved: …"`（零机器状态依赖，确定性触发）。
+    fn open_state_oc_with_path(
+        spawner: std::sync::Arc<crate::inject::resume::SpawnFn>,
+        sid: &str,
+        project_path: &str,
+    ) -> Arc<RemoteState> {
+        let mut sess = inj_sess(
+            sid,
+            crate::session::AgentType::OpenCode,
+            40,
+            crate::session::SessionStatus::Waiting,
+        );
+        sess.project_path = project_path.into();
+        let sessions = vec![sess];
+        Arc::new(RemoteState {
+            ui_config_source: Box::new(|| None),
+            subagent_source: std::collections::HashMap::new(),
+            subagent_message_source: std::collections::HashMap::new(),
+            capability_table: crate::inject::capability::new_table(),
+            session_source: Box::new({
+                let sessions = sessions.clone();
+                move || crate::session::SessionsResponse {
+                    sessions: sessions.clone(),
+                    total_count: sessions.len(),
+                    waiting_count: 0,
+                }
+            }),
+            fresh_session_source: Box::new(move || crate::session::SessionsResponse {
+                sessions: sessions.clone(),
+                total_count: sessions.len(),
+                waiting_count: 0,
+            }),
+            store: crate::remote::pairing::DeviceStore::memory(),
+            injector: std::sync::Arc::new(crate::inject::engine::RealInjector),
+            resume_spawner: spawner,
+            create_hub: create_hub_stub(),
+            archive_source: Box::new(Vec::new),
+            archive_delete: std::sync::Arc::new(|_: Option<&str>| 0usize),
+            confirm_probe: std::sync::Arc::new(|_, _, _| true),
+            dialog_probe: std::sync::Arc::new(|_, _| None),
+            screen_probe: std::sync::Arc::new(|_, _| None),
+            host_source: Box::new(|| serde_json::Value::Null),
+            message_source: Box::new(|_, _, _| Err("测试桩：未注入内容源".to_string())),
+            path_source: Box::new(|_, _, _| (Vec::new(), false)),
+            watcher_tx: tokio::sync::broadcast::channel(64).0,
+            board_hidden_ids: Box::new(Vec::new),
+            board_hidden_hide: std::sync::Arc::new(|_| 0usize),
+            board_hidden_unhide: std::sync::Arc::new(|_| 0usize),
+            unread_mark_read: std::sync::Arc::new(|_, _| ()),
+            session_close: std::sync::Arc::new(|_| Ok(())),
+            sse_registry: Arc::new(SseRegistry::default()),
+            max_devices_source: Box::new(|| 3),
+            pin_limiter: std::sync::Mutex::new(crate::remote::pin::PinRateLimiter::new()),
+            global_pin_limiter: std::sync::Mutex::new(crate::remote::pin::PinRateLimiter::global()),
+            pin_source: Box::new(|| Some("1234".to_string())),
+            now_source: Box::new(|| chrono::Utc::now().timestamp_millis()),
+            via_hosts_source: Box::new(|| None),
+            rate_bucket_channels_source: Box::new(Vec::new),
+            home_source: Box::new(|| None),
+            pairing_counter: Box::new(Vec::new),
+            codex_control: crate::remote::codex_ipc::CodexControlHub::disabled_arc(),
+            desktop_language: Default::default(),
+            opencode_native: Arc::new(crate::services::opencode_native::NativeHub::new(
+                crate::remote::pairing::DeviceStore::memory(),
+            )),
+        })
+    }
+
+    /// 环境门控 + 出手暗桩（M7 真机锚 / spawn_effect_decoy 同款）：opencode 的
+    /// 生产 prepare 链（规范二进制解析 + 版本门 + 登记发现分支）须在本机可解析，
+    /// 且 macOS 出手后效果回查需 argv 携特征的暗桩进程命中（无桩双通道按死窗
+    /// 级联 failed，pending 永不建立）。返回效果特征串；环境不满足 → None（跳过）。
+    fn opencode_pending_decoy(sid: &str) -> Option<String> {
+        let prepared = crate::inject::resume::prepare_opencode_resume(sid).ok()?;
+        let sig = prepared.payload.windows_payload;
+        spawn_effect_decoy(&sig);
+        Some(sig)
+    }
+
+    /// RED→GREEN（brief 4A.4①端点面）：pending 未核销时第二次恢复请求被拒——
+    /// 200 pending + `OC_RESTORE_PENDING` 明确码，spawner 恰一次（零重复开窗）；
+    /// 首请求审计诚实落 `pending:` 前缀（不记 ok——账实一致），复请求零审计。
+    #[tokio::test]
+    #[cfg_attr(
+        not(any(windows, target_os = "macos")),
+        ignore = "注入平台门（inject/routing.rs）：仅 Windows/macOS 可注入，本测走注入链"
+    )]
+    #[cfg(not(target_os = "macos"))]
+    async fn session_open_endpoint_opencode_pending_refuses_second_request() {
+        let _serial = F4_PENDING_SERIALIZER.lock().await;
+        let sid = "sess_f4_oc_r1";
+        crate::inject::restore_pending::reset_for_tests();
+        if opencode_pending_decoy(sid).is_none() {
+            eprintln!("跳过：本机 opencode 恢复链预备门不可解析（无规范安装位/版本≠登记）");
+            crate::inject::restore_pending::reset_for_tests();
+            return;
+        }
+        crate::inject::restore_pending::set_observe_budget_for_tests(
+            std::time::Duration::from_millis(50),
+        );
+        // 观察恒未就绪（窗口观察未核）→ 待确认态保留
+        crate::inject::restore_pending::set_observer_for_tests(
+            sid,
+            std::sync::Arc::new(|_: &_| Vec::new()),
+        );
+        let spawner_rec = RecordingSpawner::new();
+        let state = open_state_oc(spawner_rec.seam(), sid);
+        persist_named_device(&state, "mm", "测试设备");
+        let app = router(state.clone());
+        let body = req_body(&app, sid, false).await;
+        assert!(
+            body.contains("\"status\":\"pending\"") && body.contains("OC_RESTORE_PENDING"),
+            "观察未就绪必须回执 pending + 明确码（不冒充成功）：{body}"
+        );
+        assert_eq!(spawner_rec.recorded().len(), 1, "首请求恰一次出手");
+        // 复请求：pending 未核销 → 零出手、同形 pending 回执
+        let body2 = req_body(&app, sid, false).await;
+        assert!(
+            body2.contains("\"status\":\"pending\"") && body2.contains("OC_RESTORE_PENDING"),
+            "复请求幂等返回 pending：{body2}"
+        );
+        assert_eq!(
+            spawner_rec.recorded().len(),
+            1,
+            "pending 未核销：第二次恢复请求被拒（不再开窗）"
+        );
+        // 审计：首请求 pending 留痕；复请求（零出手零状态变化）不新增审计行
+        let audits = state
+            .store
+            .with(|c| crate::database::dao::write_audit::recent_conn(c, 10));
+        assert_eq!(audits.len(), 1, "复请求零出手不落账：{audits:?}");
+        assert_eq!(audits[0].result, "pending:OC_RESTORE_PENDING");
+        crate::inject::restore_pending::reset_for_tests();
+    }
+
+    /// brief 4A.4②端点面：复请求先复查观察——就绪（窗口真开了）→ 200 opening
+    /// 核销，**spawner 恰一次**（确认流转零重复开窗）。
+    #[tokio::test]
+    #[cfg_attr(
+        not(any(windows, target_os = "macos")),
+        ignore = "注入平台门（inject/routing.rs）：仅 Windows/macOS 可注入，本测走注入链"
+    )]
+    #[cfg(not(target_os = "macos"))]
+    async fn session_open_endpoint_opencode_recheck_confirms_without_new_window() {
+        let _serial = F4_PENDING_SERIALIZER.lock().await;
+        let sid = "sess_f4_oc_r2";
+        crate::inject::restore_pending::reset_for_tests();
+        if opencode_pending_decoy(sid).is_none() {
+            eprintln!("跳过：本机 opencode 恢复链预备门不可解析");
+            crate::inject::restore_pending::reset_for_tests();
+            return;
+        }
+        crate::inject::restore_pending::set_observe_budget_for_tests(
+            std::time::Duration::from_millis(50),
+        );
+        crate::inject::restore_pending::set_observer_for_tests(
+            sid,
+            std::sync::Arc::new(|_: &_| Vec::new()),
+        );
+        let spawner_rec = RecordingSpawner::new();
+        let state = open_state_oc(spawner_rec.seam(), sid);
+        persist_named_device(&state, "mm", "测试设备");
+        let app = router(state.clone());
+        let body = req_body(&app, sid, false).await;
+        assert!(
+            body.contains("\"status\":\"pending\""),
+            "首请求 pending：{body}"
+        );
+        // 观察此刻就绪（真实窗口已开）→ 复请求核销。I3 起：观察器返回候选窗口集，
+        // 核销还要求窗口 ∉ 起窗前基线——注入一扇假 pid 候选（不在任何真实基线内，
+        // 等价「本次新起窗口」）。
+        crate::inject::restore_pending::set_observer_for_tests(
+            sid,
+            std::sync::Arc::new(|_: &_| {
+                vec![crate::inject::restore_pending::ObservedWindow {
+                    pid: 424_242,
+                    cmd: "recheck-confirm --session sess_f4_oc_r2".to_string(),
+                }]
+            }),
+        );
+        let body2 = req_body(&app, sid, false).await;
+        assert!(
+            body2.contains("\"status\":\"opening\""),
+            "复查命中必须核销回执 opening：{body2}"
+        );
+        assert_eq!(
+            spawner_rec.recorded().len(),
+            1,
+            "复查核销零出手——绝不自动再开第二个窗口"
+        );
+        crate::inject::restore_pending::reset_for_tests();
+    }
+
+    /// brief 4A.4③端点面：显式放弃（abandon:true）→ 200 abandoned 清 pending；
+    /// 此后新请求重新出手（放弃后允许重新恢复）。观察恒未就绪的失败面不假成功。
+    #[tokio::test]
+    #[cfg_attr(
+        not(any(windows, target_os = "macos")),
+        ignore = "注入平台门（inject/routing.rs）：仅 Windows/macOS 可注入，本测走注入链"
+    )]
+    #[cfg(not(target_os = "macos"))]
+    async fn session_open_endpoint_opencode_abandon_clears_pending() {
+        let _serial = F4_PENDING_SERIALIZER.lock().await;
+        let sid = "sess_f4_oc_r3";
+        crate::inject::restore_pending::reset_for_tests();
+        if opencode_pending_decoy(sid).is_none() {
+            eprintln!("跳过：本机 opencode 恢复链预备门不可解析");
+            crate::inject::restore_pending::reset_for_tests();
+            return;
+        }
+        crate::inject::restore_pending::set_observe_budget_for_tests(
+            std::time::Duration::from_millis(50),
+        );
+        crate::inject::restore_pending::set_observer_for_tests(
+            sid,
+            std::sync::Arc::new(|_: &_| Vec::new()),
+        );
+        let spawner_rec = RecordingSpawner::new();
+        let state = open_state_oc(spawner_rec.seam(), sid);
+        persist_named_device(&state, "mm", "测试设备");
+        let app = router(state.clone());
+        let body = req_body(&app, sid, false).await;
+        assert!(
+            body.contains("\"status\":\"pending\""),
+            "首请求 pending：{body}"
+        );
+        // 显式放弃
+        let body2 = req_body(&app, sid, true).await;
+        assert!(
+            body2.contains("\"status\":\"abandoned\""),
+            "显式放弃回执 abandoned：{body2}"
+        );
+        assert_eq!(spawner_rec.recorded().len(), 1, "放弃路径零出手");
+        // 放弃后新请求：重新出手（fresh dispatch）
+        let body3 = req_body(&app, sid, false).await;
+        assert!(
+            body3.contains("\"status\":\"pending\""),
+            "放弃后新请求重新出手（观察仍未就绪 → pending）：{body3}"
+        );
+        assert_eq!(spawner_rec.recorded().len(), 2, "放弃后允许重新恢复");
+        crate::inject::restore_pending::reset_for_tests();
+    }
+
+    /// 端点测试辅助：POST session-open 并返回响应体字符串。
+    async fn req_body(app: &axum::Router, sid: &str, abandon: bool) -> String {
+        let payload = if abandon {
+            format!(r#"{{"sessionId":"{sid}","abandon":true}}"#)
+        } else {
+            format!(r#"{{"sessionId":"{sid}"}}"#)
+        };
+        let r = app
+            .clone()
+            .oneshot(req(
+                "POST",
+                "/m/api/v1/session-open",
+                Some("mam_device=mm"),
+                Some(payload.as_str()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200, "session-open 契约 200 语义分诊");
+        body_string(r).await
     }
 
     /// 评审 I3：spawn 出手失败 → 200 {"status":"failed","error"}（HTTP 200 恒定，
@@ -12641,6 +13282,78 @@ mod tests {
             assert_eq!(audits[0].session_id, "cli-1");
         }
 
+        async fn assert_opencode_close_does_not_kill(sessions: &[(&str, u32)]) {
+            let mut state = state_with_sessions(
+                sessions
+                    .iter()
+                    .map(|&(id, pid)| {
+                        inj_sess(
+                            id,
+                            crate::session::AgentType::OpenCode,
+                            pid,
+                            crate::session::SessionStatus::Processing,
+                        )
+                    })
+                    .collect(),
+            );
+            let killed = Arc::new(std::sync::Mutex::new(Vec::<u32>::new()));
+            let calls = killed.clone();
+            Arc::get_mut(&mut state).expect("独占").session_close = Arc::new(move |pid| {
+                calls.lock().unwrap().push(pid);
+                Ok(())
+            });
+            let response = router(state)
+                .oneshot(req(
+                    "POST",
+                    "/m/api/v1/session-close",
+                    Some("mam_device=bh"),
+                    Some(r#"{"sessionId":"opencode-target"}"#),
+                ))
+                .await
+                .unwrap();
+            let calls = killed.lock().unwrap();
+            assert!(
+                calls.is_empty(),
+                "OpenCode 关闭不得调用 OS kill，实际 PID: {calls:?}，HTTP: {}",
+                response.status()
+            );
+        }
+
+        #[tokio::test]
+        #[cfg_attr(
+            not(target_os = "macos"),
+            ignore = "requires macOS OpenCode ownership or process semantics"
+        )]
+        async fn close_does_not_kill_opencode_without_trusted_binding() {
+            assert_opencode_close_does_not_kill(&[("opencode-target", 4242)]).await;
+        }
+
+        #[tokio::test]
+        #[cfg_attr(
+            not(target_os = "macos"),
+            ignore = "requires macOS OpenCode ownership or process semantics"
+        )]
+        async fn close_does_not_kill_opencode_with_shared_pid() {
+            assert_opencode_close_does_not_kill(&[
+                ("opencode-target", 4242),
+                ("opencode-peer", 4242),
+            ])
+            .await;
+        }
+
+        #[tokio::test]
+        #[cfg_attr(
+            not(target_os = "macos"),
+            ignore = "requires macOS OpenCode ownership or process semantics"
+        )]
+        async fn close_does_not_kill_opencode_with_ambiguous_session_id() {
+            assert_opencode_close_does_not_kill(&[
+                ("opencode-target", 4242),
+                ("opencode-target", 4243),
+            ])
+            .await;
+        }
+
         #[tokio::test]
         async fn close_rejects_app_form() {
             let sessions = vec![app_session("app-1", crate::session::SessionStatus::Idle)];
@@ -12976,7 +13689,8 @@ mod tests {
                         }
                     } else {
                         // macOS 分支：断言 AppleScript 脚本全文携带归档 cwd/resume 命令
-                        let crate::inject::resume::SpawnSpec::MacosApplescript { script } = spec
+                        let crate::inject::resume::SpawnSpec::MacosApplescript { script, .. } =
+                            spec
                         else {
                             return Err("macOS 应收 MacosApplescript spec".into());
                         };
@@ -13102,6 +13816,10 @@ mod tests {
 
             codex_control: crate::remote::codex_ipc::CodexControlHub::disabled_arc(),
             desktop_language: Default::default(),
+            // 任务 8：OpenCode 原生交互中枢——测试禁用默认（惰性容器，零 IO；本组用例不触原生路由）
+            opencode_native: Arc::new(crate::services::opencode_native::NativeHub::new(
+                crate::remote::pairing::DeviceStore::memory(),
+            )),
         })
     }
 
@@ -13124,6 +13842,210 @@ mod tests {
         let d = crate::test_support::temp_dir("mam-attach-e2e");
         std::fs::create_dir_all(d.join(".git").join("info")).unwrap();
         d
+    }
+
+    fn attachment_write_gate(
+        project: &std::path::Path,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    ) {
+        let (entered, entered_rx) = tokio::sync::oneshot::channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        let (finished, finished_rx) = tokio::sync::oneshot::channel();
+        crate::remote::api::attachment_test_hook::install(
+            project.to_string_lossy().into_owned(),
+            crate::remote::api::attachment_test_hook::Hook {
+                entered,
+                release: release_rx,
+                finished,
+            },
+        );
+        (entered_rx, release, finished_rx)
+    }
+
+    #[tokio::test]
+    async fn attachment_revoked_while_write_waits_is_rejected_without_side_effects() {
+        let project = attach_tempdir();
+        let home = crate::test_support::temp_dir("attachment-revoke-home");
+        let mut state = attach_state(project.path().to_path_buf(), false);
+        let home_path = home.path().to_path_buf();
+        Arc::get_mut(&mut state).unwrap().home_source =
+            Box::new(move || Some(home_path.to_string_lossy().into_owned()));
+        persist_named_device(&state, "mm", "测试设备");
+        let (entered, release, finished) = attachment_write_gate(project.path());
+        let request = tokio::spawn(router(state.clone()).oneshot(attach_req(
+            "/m/api/v1/session-attachment?session_id=sess_att&name=a.txt",
+            Some("mam_device=mm"),
+            Body::from("payload"),
+        )));
+        tokio::time::timeout(std::time::Duration::from_secs(10), entered)
+            .await
+            .unwrap()
+            .unwrap();
+        state
+            .store
+            .with(|c| crate::remote::pairing::revoke_device(c, "mm").unwrap());
+        release.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), finished)
+            .await
+            .unwrap()
+            .unwrap();
+        let response = request.await.unwrap().unwrap();
+        let audits: i64 = state.store.with(|c| {
+            c.query_row(
+                "SELECT COUNT(*) FROM write_audit WHERE action='attachment'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        });
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::FORBIDDEN,
+            "写前撤销须拒绝"
+        );
+        assert!(!project.join(".tuvis-attachments").exists());
+        assert!(!project.join(".git/info/exclude").exists());
+        assert!(crate::remote::attachments::read_index(&home).is_empty());
+        assert_eq!(audits, 0);
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[tokio::test]
+    async fn attachment_http_cancellation_keeps_permits_and_finishes_accounting() {
+        use crate::services::opencode_native::policy::{self, OpenCodeInteractionPolicy};
+        let project = attach_tempdir();
+        let home = crate::test_support::temp_dir("attachment-cancel-home");
+        let mut state = attach_state(project.path().to_path_buf(), false);
+        let mut session = (state.fresh_session_source)().sessions.remove(0);
+        session.agent_type = crate::session::AgentType::OpenCode;
+        let state_mut = Arc::get_mut(&mut state).unwrap();
+        state_mut.fresh_session_source = Box::new(move || crate::session::SessionsResponse {
+            sessions: vec![session.clone()],
+            total_count: 1,
+            waiting_count: 0,
+        });
+        let home_path = home.path().to_path_buf();
+        state_mut.home_source = Box::new(move || Some(home_path.to_string_lossy().into_owned()));
+        policy::write_policy(&state.store, OpenCodeInteractionPolicy::LegacyCompatible).unwrap();
+        persist_named_device(&state, "mm", "测试设备");
+        let (entered, release, finished) = attachment_write_gate(project.path());
+        let request = tokio::spawn(router(state.clone()).oneshot(attach_req(
+            "/m/api/v1/session-attachment?session_id=sess_att&name=a.txt",
+            Some("mam_device=mm"),
+            Body::from("payload"),
+        )));
+        tokio::time::timeout(std::time::Duration::from_secs(10), entered)
+            .await
+            .unwrap()
+            .unwrap();
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+        let lock = state.opencode_native.legacy_lock("sess_att");
+        assert!(lock.try_write().is_err(), "取消后写任务仍持路由许可");
+        assert!(
+            policy::write_policy(&state.store, OpenCodeInteractionPolicy::NativeOnly).is_err(),
+            "取消后写任务仍持策略许可"
+        );
+        release.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), finished)
+            .await
+            .unwrap()
+            .unwrap();
+        let _completed = tokio::time::timeout(std::time::Duration::from_secs(10), lock.write())
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read(project.join(".tuvis-attachments/sess_att/a.txt")).unwrap(),
+            b"payload"
+        );
+        let entries = crate::remote::attachments::read_index(&home);
+        let audits: i64 = state.store.with(|c| {
+            c.query_row(
+                "SELECT COUNT(*) FROM write_audit WHERE action='attachment' AND result='ok'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        });
+        assert_eq!(
+            (entries.len(), audits),
+            (1, 1),
+            "落盘后的索引与审计必须完整"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn attachment_write_failure_is_recorded_in_audit() {
+        use std::os::unix::fs::symlink;
+        let project = attach_tempdir();
+        let external = crate::test_support::temp_dir("attachment-failure-external");
+        symlink(external.path(), project.join(".tuvis-attachments")).unwrap();
+        let state = attach_state(project.path().to_path_buf(), false);
+        persist_named_device(&state, "mm", "测试设备");
+        let response = router(state.clone())
+            .oneshot(attach_req(
+                "/m/api/v1/session-attachment?session_id=sess_att&name=a.txt",
+                Some("mam_device=mm"),
+                Body::from("payload"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        );
+        let failures: i64 = state.store.with(|c| {
+            c.query_row(
+                "SELECT COUNT(*) FROM write_audit WHERE action='attachment' AND result != 'ok'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        });
+        assert_eq!(failures, 1, "写入失败必须留下审计记录");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn attachment_late_exclude_identity_failure_returns_warning_and_indexes_saved_file() {
+        let project = attach_tempdir();
+        let home = crate::test_support::temp_dir("attachment-late-warning-home");
+        let external = crate::test_support::temp_dir("attachment-late-warning-external");
+        let exclude = project.join(".git/info/exclude");
+        std::fs::write(&exclude, b"original\n").unwrap();
+        let sentinel = external.join("sentinel");
+        crate::remote::attachments::tests::register_upload_exclude_hardlink(
+            project.path(),
+            sentinel.clone(),
+        );
+        let mut state = attach_state(project.path().to_path_buf(), false);
+        let home_path = home.path().to_path_buf();
+        Arc::get_mut(&mut state).unwrap().home_source =
+            Box::new(move || Some(home_path.to_string_lossy().into_owned()));
+        persist_named_device(&state, "mm", "测试设备");
+        let response = router(state)
+            .oneshot(attach_req(
+                "/m/api/v1/session-attachment?session_id=sess_att&name=a.txt",
+                Some("mam_device=mm"),
+                Body::from("payload"),
+            ))
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = body_string(response).await;
+        assert_eq!(status, 200, "已落盘附件必须成功返回：{body}");
+        let receipt: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(receipt["excludeWarning"].as_str().is_some());
+        let path = receipt["path"].as_str().unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), b"payload");
+        let entries = crate::remote::attachments::read_index(&home);
+        assert_eq!(entries.len(), 1, "重试之前已保存文件必须入索引");
+        assert_eq!(entries[0].path, path);
+        assert_eq!(std::fs::read(sentinel).unwrap(), b"original\n");
     }
 
     #[tokio::test]
@@ -13221,7 +14143,8 @@ mod tests {
             .unwrap();
         assert_eq!(r.status(), 404);
         assert!(body_string(r).await.contains("no_cwd"));
-        // 413 too_large：超 20MB（DefaultBodyLimit 硬兜底）；复用已注册设备的 state
+        // 413 too_large：超 20MB；H07 D1 回归——超限响应必须是**契约 JSON 错误体**
+        // {"error":"too_large"}（可辨错误码），不是 axum 通用 413 裸体；复用已注册设备的 state
         let big = vec![0u8; crate::remote::attachments::MAX_ATTACHMENT_BYTES + 1];
         let r = router(state.clone())
             .oneshot(attach_req(
@@ -13232,6 +14155,14 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r.status(), 413);
+        let body = body_string(r).await;
+        let parsed: serde_json::Value =
+            serde_json::from_str(&body).expect("超限 413 必须返回 JSON 契约体");
+        assert_eq!(
+            parsed.get("error").and_then(|e| e.as_str()),
+            Some("too_large"),
+            "413 体必须带可辨错误码 too_large: {body}"
+        );
     }
 
     // ===== 丁T3 接入①：模式切换的对话框在场守卫（§2.7 裁8/9，问题 5）=====
@@ -13395,6 +14326,10 @@ mod tests {
 
             codex_control: crate::remote::codex_ipc::CodexControlHub::disabled_arc(),
             desktop_language: Default::default(),
+            // 任务 8：OpenCode 原生交互中枢——测试禁用默认（惰性容器，零 IO；本组用例不触原生路由）
+            opencode_native: Arc::new(crate::services::opencode_native::NativeHub::new(
+                crate::remote::pairing::DeviceStore::memory(),
+            )),
         });
         persist_named_device(&state2, "mm", "测试设备");
         let app = router(state2.clone());
@@ -13889,6 +14824,10 @@ mod tests {
 
             codex_control: crate::remote::codex_ipc::CodexControlHub::disabled_arc(),
             desktop_language: Default::default(),
+            // 任务 8：OpenCode 原生交互中枢——测试禁用默认（惰性容器，零 IO；本组用例不触原生路由）
+            opencode_native: Arc::new(crate::services::opencode_native::NativeHub::new(
+                crate::remote::pairing::DeviceStore::memory(),
+            )),
         });
         (state, sid_out)
     }
@@ -13955,6 +14894,10 @@ mod tests {
 
             codex_control: crate::remote::codex_ipc::CodexControlHub::disabled_arc(),
             desktop_language: Default::default(),
+            // 任务 8：OpenCode 原生交互中枢——测试禁用默认（惰性容器，零 IO；本组用例不触原生路由）
+            opencode_native: Arc::new(crate::services::opencode_native::NativeHub::new(
+                crate::remote::pairing::DeviceStore::memory(),
+            )),
         });
         (state, sid_out)
     }
@@ -14051,6 +14994,10 @@ mod tests {
 
             codex_control: crate::remote::codex_ipc::CodexControlHub::disabled_arc(),
             desktop_language: Default::default(),
+            // 任务 8：OpenCode 原生交互中枢——测试禁用默认（惰性容器，零 IO；本组用例不触原生路由）
+            opencode_native: Arc::new(crate::services::opencode_native::NativeHub::new(
+                crate::remote::pairing::DeviceStore::memory(),
+            )),
         });
         (state, sid_out)
     }
@@ -14449,6 +15396,7 @@ mod tests {
     }
 
     /// GET：单轴家（opencode）只有一组，且档位标签已按裁6 术语对齐
+    #[cfg(not(target_os = "macos"))]
     #[tokio::test]
     async fn session_mode_reports_single_axis_for_opencode() {
         let (state, sid) = mode_state_with_status(
@@ -14458,6 +15406,12 @@ mod tests {
             crate::session::SessionStatus::Idle,
         );
         persist_named_device(&state, "mm", "测试设备");
+        // 本用例验证旧屏读/注入契约，明确选择兼容策略。
+        crate::services::opencode_native::policy::write_policy(
+            &state.store,
+            crate::services::opencode_native::policy::OpenCodeInteractionPolicy::LegacyCompatible,
+        )
+        .unwrap();
         let app = router(state);
         let r = app
             .oneshot(req(
@@ -15382,6 +16336,10 @@ mod tests {
 
             codex_control: crate::remote::codex_ipc::CodexControlHub::disabled_arc(),
             desktop_language: Default::default(),
+            // 任务 8：OpenCode 原生交互中枢——测试禁用默认（惰性容器，零 IO；本组用例不触原生路由）
+            opencode_native: Arc::new(crate::services::opencode_native::NativeHub::new(
+                crate::remote::pairing::DeviceStore::memory(),
+            )),
         })
     }
 
@@ -16354,6 +17312,10 @@ mod tests {
 
             codex_control: crate::remote::codex_ipc::CodexControlHub::disabled_arc(),
             desktop_language: Default::default(),
+            // 任务 8：OpenCode 原生交互中枢——测试禁用默认（惰性容器，零 IO；本组用例不触原生路由）
+            opencode_native: Arc::new(crate::services::opencode_native::NativeHub::new(
+                crate::remote::pairing::DeviceStore::memory(),
+            )),
         })
     }
 
@@ -16523,6 +17485,10 @@ mod tests {
 
             codex_control: crate::remote::codex_ipc::CodexControlHub::disabled_arc(),
             desktop_language: Default::default(),
+            // 任务 8：OpenCode 原生交互中枢——测试禁用默认（惰性容器，零 IO；本组用例不触原生路由）
+            opencode_native: Arc::new(crate::services::opencode_native::NativeHub::new(
+                crate::remote::pairing::DeviceStore::memory(),
+            )),
         })
     }
 

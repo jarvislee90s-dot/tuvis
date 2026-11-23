@@ -300,7 +300,7 @@ mod tests {
         // 模拟下一次启动：init + migrate 幂等重放
         store
             .with(|conn| {
-                crate::database::schema::init(conn);
+                let _ = crate::database::schema::init(conn);
                 crate::database::migration::migrate(conn)
             })
             .unwrap();

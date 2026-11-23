@@ -35,7 +35,7 @@ pub struct SessionMessage {
     /// user / assistant（thinking、tool-call、tool-result、plan 属 agent 侧工作产物，
     /// 归 assistant）
     pub role: String,
-    /// user / assistant / thinking / tool-call / tool-result / plan
+    /// user / assistant / thinking / tool-call / tool-result / plan / system-note
     pub kind: String,
     /// 文本内容或工具摘要（kind = plan 时为计划 markdown 原文）
     pub content: String,
@@ -2343,6 +2343,24 @@ fn read_opencode_messages_v2(
                             .filter(|s| !s.trim().is_empty())
                             .unwrap_or_else(|| "问题已作答".to_string());
                         out.push(SessionMessage::text("tool-result", text, *ts));
+                    } else if c.pointer("/state/status").and_then(|v| v.as_str())
+                        == Some("completed")
+                    {
+                        // 仅投影终态输出字段，不展开整个 state/metadata（可能含内部信息）。
+                        let output = c
+                            .pointer("/state/output")
+                            .filter(|v| !v.is_null())
+                            .or_else(|| c.pointer("/state/content"));
+                        let text = output
+                            .and_then(|value| match value {
+                                serde_json::Value::String(text) => Some(text.clone()),
+                                serde_json::Value::Null => None,
+                                other => serde_json::to_string(other).ok(),
+                            })
+                            .filter(|text| !text.trim().is_empty());
+                        if let Some(text) = text {
+                            out.push(SessionMessage::text("tool-result", text, *ts));
+                        }
                     }
                 }
                 _ => {}
@@ -4439,6 +4457,65 @@ mod tests {
             .unwrap_or_default()
             .contains("\"cmd\":\"ls\""));
         assert_eq!(msgs[3].content, "结论");
+    }
+
+    #[test]
+    fn opencode2_real_sqlite_tail_preserves_completed_tool_outputs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join(".local/share/opencode/opencode.db");
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch("CREATE TABLE session_v2 (id TEXT PRIMARY KEY); CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT, type TEXT, seq INTEGER, time_created INTEGER, time_updated INTEGER, data TEXT);").unwrap();
+        for n in 0..405 {
+            conn.execute(
+                "INSERT INTO session_message VALUES (?1, ?2, 'assistant', ?3, ?3, ?3, ?4)",
+                rusqlite::params![
+                    format!("old_{n}"),
+                    SID,
+                    n,
+                    serde_json::json!({"content":[{"type":"text","text":format!("old-{n}")}]})
+                        .to_string()
+                ],
+            )
+            .unwrap();
+        }
+        let data = serde_json::json!({"content": [
+            {"type":"text", "text":"latest-assistant"},
+            {"type":"tool","name":"bash","state":{"status":"completed","input":{"command":"pwd"},"output":"latest-bash-output","metadata":{"authorization":"must-not-leak"}}},
+            {"type":"tool","name":"read","state":{"status":"completed","content":"latest-read-content"}},
+            {"type":"tool","name":"json","state":{"status":"completed","output":{"result":[1,2]}}},
+            {"type":"tool","name":"pending","state":{"status":"running","output":"not-final"}},
+            {"type":"tool","name":"empty","state":{"status":"completed","output":null}},
+            {"type":"tool","name":"whitespace","state":{"status":"completed","output":"  "}}
+        ]});
+        conn.execute(
+            "INSERT INTO session_message VALUES ('tail', ?1, 'assistant', 406, 406, 406, ?2)",
+            rusqlite::params![SID, data.to_string()],
+        )
+        .unwrap();
+        let page = read_session_messages_with(tmp.path(), "opencode", SID, 200).unwrap();
+        assert!(page
+            .messages
+            .iter()
+            .any(|m| m.content == "latest-assistant"));
+        let outputs: Vec<&str> = page
+            .messages
+            .iter()
+            .filter(|m| m.kind == "tool-result")
+            .map(|m| m.content.as_str())
+            .collect();
+        assert_eq!(
+            outputs,
+            vec![
+                "latest-bash-output",
+                "latest-read-content",
+                "{\"result\":[1,2]}"
+            ]
+        );
+        let public = serde_json::to_string(&page).unwrap();
+        assert!(!public.contains("must-not-leak"));
+        assert!(!public.contains("not-final"));
+        assert!(!public.contains("old-0\""), "确实读取尾窗而不是最早前缀");
     }
 
     /// 2.x 问答类部件终态 → 补 tool-result 销卡（与 1.x 路径同判据；F-3 兼容）

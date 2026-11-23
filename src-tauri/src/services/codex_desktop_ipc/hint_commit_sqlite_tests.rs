@@ -22,7 +22,7 @@ fn authority() -> Arc<HintLeaseAuthority> {
 }
 fn db() -> (Connection, i64) {
     let c = Connection::open_in_memory().unwrap();
-    crate::database::schema::init(&c);
+    let _ = crate::database::schema::init(&c);
     crate::database::migration::migrate(&c).unwrap();
     let epoch = next_hint_epoch_conn(&c).unwrap();
     (c, epoch)
@@ -203,7 +203,7 @@ fn b1_store_sqlite_commit_first_blocks_real_owner_revocation() {
         .unwrap();
     assert_eq!(mode.to_lowercase(), "delete");
     writer.busy_timeout(Duration::from_secs(30)).unwrap();
-    crate::database::schema::init(&writer);
+    let _ = crate::database::schema::init(&writer);
     crate::database::migration::migrate(&writer).unwrap();
     let epoch = next_hint_epoch_conn(&writer).unwrap();
     let reader = Connection::open(&path).unwrap();

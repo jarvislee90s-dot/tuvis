@@ -12,7 +12,10 @@
 
 - [项目宪法](MASTER-PLAN.md)：最高设计依据；未经用户明确同意不得修改。
 - [规格与设计](engineering/specs/)：需求、设计、行为与验收口径。
-- [DSH Desktop 远程连接统一 Spec](engineering/specs/2026-10-29-dsh-desktop-remote-design.md)：八类功能、支撑证据、逐操作版本兼容与验收条件。
+- [OpenCode 原生功能总表](engineering/specs/2026-11-01-OpenCode原生功能总表.md)：存量、增量与完整产品验收分开；逐启动形态的证据范围与未闭合项。
+- [OpenCode 远程写入原生化收口与复查标准](engineering/specs/2026-11-23-OpenCode远程写入原生化收口与复查标准.md)：写入、队列、恢复契约与逐操作通道矩阵；旧路径退役与双向复查口径。
+- [CLI 整组答题与双端一致性顶层设计](engineering/specs/2026-10-29-CLI整组答题与双端一致性顶层设计.md)：跨 CLI 的答题卡语义与双端一致性公共规格（公共规格，非 OpenCode 专用）。
+- [DSH 代际路径缓存](engineering/specs/2026-11-01-f9-dsh-generation-path-cache.md) / [dsh 监控适配器计划](engineering/plans/2026-09-14-m1-dsh-monitoring-adapter.md)：dsh 会话扫描缓存预算与适配器实施口径。
 - [WorkBuddy 5.9.3 子代理与看板 Spec](engineering/specs/2026-10-30-workbuddy-5.9.3-subagents-and-board-spec.md) / [设计](engineering/specs/2026-10-30-workbuddy-5.9.3-subagents-and-board-design.md)：5.9.3 子代理漏采与心跳冻结掉线。
 - [实施计划](engineering/plans/)：当前/历史执行计划；executor prompt 不入库。
 - [Codex 答题卡修复与升级兼容执行手册](engineering/plans/2026-11-05-codex-答题卡修复与升级兼容执行手册.md)：PR #202 三项缺陷的修法、回归与验收，以及后续持久化、历史核对和版本兼容工作单。
@@ -23,6 +26,10 @@
 - [Codex B1.2 进度与剩余项](engineering/reviews/2026-11-05-codex-b1-2-progress-review.md)：多次撤销重放的真实 Rust 失败证据、B1.2 收口与 B1.3 未实施范围。
 - [Codex B1.2 验收](engineering/acceptance/2026-11-05-codex-b1-2-acceptance.md)：历史答复证据、重放防护、测试结果及后续边界。
 - [探测与取证](engineering/evidence/)：脱敏的 probe/复探证据。
+- [OpenCode 归属回声 challenge（H02 摘要）](engineering/evidence/opencode-native/2026-11-14-h02-echo-challenge-attribution.md)：写前归属判据、窗口参数与升级复验要求；代码登记表直接引用此路径。
+- [OpenCode 旧 A 存活 / 新 B 可写（M6 摘要）](engineering/evidence/opencode-native/2026-11-16-m6-old-a-alive-new-b-writable.md)：双服务拓扑下的写归属与窗口绑定边界。
+- [OpenCode 实名普通启动写正例（C5 摘要）](engineering/evidence/opencode-native/2026-11-17-c5-realname-normal-startup-write-positive.md)：托管服务单实例正例与三方对账。
+- [OpenCode macOS 原生复审核验交接（R9 摘要）](engineering/evidence/opencode-native/2026-11-20-macos-native-closure-handoff.md)：五项工程验收、实际 LAN 产品活验与遗留边界。
 - [WorkBuddy 5.9.3 证据](engineering/evidence/2026-10-30-workbuddy-5.9.3/evidence.md)：真机核算、心跳/DB/TPS 探针。
 - [验收](engineering/acceptance/)：最终验收；`history/` 为历史验收材料。
 - [Codex B1.1 验收收口](engineering/acceptance/2026-11-05-codex-b1-1-acceptance.md)：生产 Store 窗口证据、自动检查结果与后续阶段边界。

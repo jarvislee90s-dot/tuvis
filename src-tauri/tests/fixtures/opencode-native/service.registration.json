@@ -1,0 +1,12 @@
+{
+  "x-evidence": {
+    "run_id": "20261029-233614",
+    "source": "docs/engineering/evidence/opencode-native/followup/fixtures/g1.binding.json",
+    "note": "默认后台 service 登记文件形态（state/opencode/service.json），仅保留发现所需字段；password 为占位符，非真实凭据"
+  },
+  "id": "87bd7e45-27bf-490d-bced-58d79c108910",
+  "version": "2.0.22",
+  "url": "http://127.0.0.1:49617",
+  "pid": 60541,
+  "password": "redacted-not-a-credential"
+}
