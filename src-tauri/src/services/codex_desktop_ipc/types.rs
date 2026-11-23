@@ -375,18 +375,19 @@ pub struct CodexQueueView {
     /// P2-2：无能力 build 的按钮在源头隐藏；`#[serde(default)]` 兼容旧载荷消费方。
     #[serde(default)]
     pub can_interrupt: bool,
-    /// S2：该 Thread 队列是否处于打断后的持久暂停（旧队列冻结，恢复只经用户显式
-    /// 「继续发送」）。`#[serde(default)]` 兼容旧载荷消费方。
+    /// 该线程是否存在暂停行。`#[serde(default)]` 兼容旧载荷消费方。
     #[serde(default, rename = "queuePaused")]
     pub queue_paused: bool,
-    /// S2：暂停原因（机器码：`interrupt_accepted` / `interrupt_uncertain`；未暂停
-    /// 为 None）。S5 据此区分文案。
+    /// 最早一条暂停行的原因。未暂停时为 None。
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
         rename = "queuePauseReason"
     )]
     pub queue_pause_reason: Option<String>,
+    /// 所有暂停行都可在绑定回合到达终态后自动解除。
+    #[serde(default)]
+    pub stop_pause_auto_resumes: bool,
 }
 
 /// 官方 Desktop 持有租约：owner 身份随连接生命周期变化（spec F6），epoch 由
@@ -1273,6 +1274,7 @@ mod tests {
             can_interrupt: false,
             queue_paused: false,
             queue_pause_reason: None,
+            stop_pause_auto_resumes: false,
         };
         let v = serde_json::to_value(&view).unwrap();
         assert!(v["actions"][0]["actionId"].is_string());

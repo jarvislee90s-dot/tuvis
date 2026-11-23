@@ -262,3 +262,79 @@ describe("useCodexTurnControl：stop() 资格门（R02）", () => {
     expect(result.current.result).toEqual({ kind: "interrupted", turnId: "turn-A" });
   });
 });
+
+describe("useCodexTurnControl stop reconciliation", () => {
+  it.each([{ kind: "interrupted", turnId: "turn-A" }, { kind: "no_active_turn" }] as const)(
+    "$kind suppresses immediate repeat stops and preserves a newly projected turn",
+    async (outcome) => {
+      vi.mocked(interruptCodexTurn).mockResolvedValueOnce({
+        ...OK_RESULT,
+        interruptedTurnId: outcome.kind === "interrupted" ? outcome.turnId : null,
+      });
+      const refreshProjection = vi.fn(async () => {});
+      const { result, rerender } = renderHook(
+        ({ projection }) => useCodexTurnControl(projection, "s1", refreshProjection),
+        { initialProps: { projection: stopProjection() } }
+      );
+
+      expect(result.current.canStop).toBe(true);
+      await act(async () => {
+        expect(await result.current.stop()).toEqual(outcome);
+      });
+      expect(result.current.canStop).toBe(false);
+      expect(refreshProjection).toHaveBeenCalledTimes(1);
+
+      rerender({ projection: stopProjection({ revision: 8 }) });
+      expect(result.current.canStop).toBe(false);
+      await act(async () => {
+        await result.current.stop();
+        await result.current.stop();
+      });
+      expect(interruptCalls()).toEqual([["s1", "turn-A"]]);
+      expect(refreshProjection).toHaveBeenCalledTimes(1);
+
+      await act(async () => vi.advanceTimersByTimeAsync(4_000));
+      expect(result.current.canStop).toBe(outcome.kind === "interrupted");
+      expect(result.current.turnRunning).toBe(outcome.kind === "interrupted");
+      expect(interruptCalls()).toEqual([["s1", "turn-A"]]);
+      expect(refreshProjection).toHaveBeenCalledTimes(1);
+
+      rerender({ projection: stopProjection({ revision: 9, activeTurnId: "turn-B" }) });
+      expect(result.current.canStop).toBe(true);
+      vi.mocked(interruptCodexTurn).mockResolvedValueOnce({
+        ...OK_RESULT,
+        interruptedTurnId: "turn-B",
+        expectedTurnId: "turn-B",
+      });
+      await act(async () => {
+        await result.current.stop();
+      });
+      expect(interruptCalls()).toEqual([
+        ["s1", "turn-A"],
+        ["s1", "turn-B"],
+      ]);
+    }
+  );
+
+  it("keeps the projected turn stoppable after an uncertain receipt", async () => {
+    vi.mocked(interruptCodexTurn).mockResolvedValueOnce({
+      ...OK_RESULT,
+      ok: false,
+      uncertain: true,
+      interruptedTurnId: null,
+      reasonCode: "timeout",
+    });
+    const refreshProjection = vi.fn(async () => {});
+    const { result } = renderHook(() =>
+      useCodexTurnControl(stopProjection(), "s1", refreshProjection)
+    );
+
+    await act(async () => {
+      await result.current.stop();
+    });
+    expect(result.current.result).toEqual({ kind: "uncertain", reasonCode: "timeout" });
+    expect(result.current.turnRunning).toBe(true);
+    expect(result.current.canStop).toBe(true);
+    expect(interruptCalls()).toEqual([["s1", "turn-A"]]);
+  });
+});

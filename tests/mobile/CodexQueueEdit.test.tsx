@@ -60,7 +60,9 @@ it("failed CAS never fills a draft and stale session responses never transfer", 
   fireEvent.click(screen.getByTestId("codex-queue-edit-a1"));
   rerender(<CodexQueuePanel sessionId="s2" onEditDraft={onEdit} />);
   resolve({ actionId: "a1", text: "old" });
-  await waitFor(() => expect(api.fetchCodexQueue).toHaveBeenCalledWith("s2"));
+  await waitFor(() =>
+    expect(api.fetchCodexQueue).toHaveBeenCalledWith("s2", expect.any(AbortSignal))
+  );
   expect(onEdit).not.toHaveBeenCalled();
 });
 

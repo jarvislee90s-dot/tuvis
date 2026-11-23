@@ -863,17 +863,8 @@ describe("CodexQueuePanel：T06 先处理这条", () => {
         true,
         true
       ),
-      // 操作后重拉：a2 已派发终态；a1 原样 queued（位次不变）
-      queueView(
-        [
-          action({ actionId: "a1", position: 1 }),
-          action({ actionId: "a2", state: "accepted", position: null, receipt }),
-        ],
-        null,
-        [],
-        true,
-        true
-      ),
+      // 服务端队列只返回 queued 行。
+      queueView([action({ actionId: "a1", position: 1 })], null, [], true, true),
     ];
     await renderAndExpand(<CodexQueuePanel sessionId="s1" />);
     fireEvent.click(await screen.findByTestId("codex-queue-prioritize-a2"));
@@ -892,13 +883,11 @@ describe("CodexQueuePanel：T06 先处理这条", () => {
       actionId: "a2",
       confirmInterrupt: false,
     });
-    // 回执：已优先发送；重拉后 a2 状态推进为已接受，a1 原样在队
+    // 回执：已优先发送；a2 移出待发列表，a1 原样在队。
     await waitFor(() =>
       expect(screen.getByTestId("codex-queue-note").textContent).toContain("已优先发送")
     );
-    await waitFor(() =>
-      expect(screen.getByTestId("codex-queue-position-a2").textContent).toContain("已接受")
-    );
+    expect(screen.queryByTestId("codex-queue-row-a2")).toBeNull();
     expect(screen.getByTestId("codex-queue-position-a1").textContent).toContain("第1位");
     // 零独立打断帧（单条编排请求；停止只会在编排内部按需发生）
     expect(interruptBodies()).toEqual([]);
@@ -1171,6 +1160,191 @@ describe("CodexQueuePanel：T06 先处理这条", () => {
       expect(screen.getByTestId("codex-queue-note").textContent).toContain("桌面正忙")
     );
   });
+});
+
+describe("priority queue reconciliation", () => {
+  const target = action({ textPreview: "same text" });
+  const other = action({ actionId: "a2", position: 2, textPreview: "same text" });
+  const both = queueView([target, other]);
+  const remaining = queueView([{ ...other, position: 1 }]);
+
+  async function confirmPriority() {
+    fireEvent.click(screen.getByTestId("codex-queue-prioritize-a1"));
+    expect(prioritizeBodies()).toHaveLength(0);
+    await act(async () => {
+      fireEvent.click(screen.getByTestId("codex-queue-prioritize-yes-a1"));
+      expect(screen.getByTestId("codex-queue-row-a1")).toBeTruthy();
+    });
+  }
+
+  it.each(["prioritized", "already_dispatched"])(
+    "%s acceptance removes only the confirmed action before a delayed GET, and a stale GET cannot restore it",
+    async (result) => {
+      installFetch();
+      routes.queue = [both];
+      if (result === "already_dispatched") {
+        routes.prioritizeBody = {
+          result,
+          actionId: "a1",
+          action: action({ state: "accepted", position: null }),
+        };
+      }
+      const panel = await renderAndExpand(<CodexQueuePanel sessionId="s1" />);
+      vi.useFakeTimers();
+      routes.queueHang = true;
+      await confirmPriority();
+      expect(queueGetCalls()).toBe(2);
+      expect(screen.queryByTestId("codex-queue-row-a1")).toBeNull();
+      expect(screen.getByTestId("codex-queue-row-a2")).toBeTruthy();
+
+      await act(async () => releaseQueue?.(both));
+      expect(screen.queryByTestId("codex-queue-row-a1")).toBeNull();
+      expect(screen.getByTestId("codex-queue-row-a2")).toBeTruthy();
+
+      routes.queueFailAfterInitial = true;
+      panel.rerender(<CodexQueuePanel sessionId="s1" refreshSignal={1} />);
+      await act(async () => vi.advanceTimersByTimeAsync(500));
+      expect(queueGetCalls()).toBe(3);
+      expect(screen.queryByTestId("codex-queue-row-a1")).toBeNull();
+      expect(screen.getByTestId("codex-queue-row-a2")).toBeTruthy();
+    }
+  );
+
+  it.each([
+    ["not_sent", "busy_before_write"],
+    ["not_sent", "dispatch_in_flight"],
+    ["unknown", "front_budget_elapsed"],
+  ])("reconciles a later departure after %s %s without a projection tick", async (result, code) => {
+    installFetch();
+    routes.queue = [both, both, both, remaining];
+    routes.prioritizeBody = {
+      result,
+      actionId: "a1",
+      reasonCode: code,
+      ...(result === "not_sent" ? { queued: true, receipt: null } : {}),
+    };
+    await renderAndExpand(<CodexQueuePanel sessionId="s1" />);
+    vi.useFakeTimers();
+    await confirmPriority();
+    expect(queueGetCalls()).toBe(2);
+    expect(screen.getByTestId("codex-queue-row-a1")).toBeTruthy();
+    expect(screen.getByTestId("codex-queue-note").textContent).toMatch(/仍在队列|仍在排队/);
+
+    await act(async () => vi.advanceTimersByTimeAsync(2000));
+    expect(queueGetCalls()).toBe(3);
+    expect(screen.getByTestId("codex-queue-row-a1")).toBeTruthy();
+
+    await act(async () => vi.advanceTimersByTimeAsync(2000));
+    expect(queueGetCalls()).toBe(4);
+    expect(screen.queryByTestId("codex-queue-row-a1")).toBeNull();
+    expect(screen.getByTestId("codex-queue-row-a2")).toBeTruthy();
+    expect(screen.queryByTestId("codex-queue-note")?.textContent ?? "").not.toMatch(
+      /仍在队列|仍在排队|已优先发送|已接受/
+    );
+    // 短窗内继续观察可能的回队，但截止后不再读。
+    routes.queue = [remaining, remaining, remaining, remaining];
+    await act(async () => vi.advanceTimersByTimeAsync(15000));
+    expect(queueGetCalls()).toBe(7);
+    expect(screen.getByTestId("codex-queue-row-a2")).toBeTruthy();
+    expect(prioritizeBodies()).toHaveLength(1);
+  });
+
+  function mockBusyRefusal() {
+    routes.prioritizeBody = {
+      result: "not_sent",
+      actionId: "a1",
+      reasonCode: "busy_before_write",
+      queued: true,
+      receipt: null,
+    };
+  }
+
+  it("requires a successful snapshot to claim the action is still queued and recovers from GET failures", async () => {
+    installFetch();
+    routes.queue = [both];
+    routes.queueFailAfterInitial = true;
+    mockBusyRefusal();
+    await renderAndExpand(<CodexQueuePanel sessionId="s1" />);
+    vi.useFakeTimers();
+    await confirmPriority();
+    expect(screen.getByTestId("codex-queue-note").textContent).not.toMatch(/仍在队列|仍在排队/);
+    expect(screen.getByTestId("codex-queue-row-a1")).toBeTruthy();
+    await act(async () => vi.advanceTimersByTimeAsync(2000));
+    expect(queueGetCalls()).toBe(3);
+
+    routes.queue = [remaining];
+    await act(async () => vi.advanceTimersByTimeAsync(2000));
+    expect(queueGetCalls()).toBe(4);
+    expect(screen.queryByTestId("codex-queue-row-a1")).toBeNull();
+    expect(screen.queryByTestId("codex-queue-note")).toBeNull();
+  });
+
+  it("aborts a hanging GET and continues the observation without applying its late response", async () => {
+    installFetch();
+    routes.queue = [both, both, remaining];
+    mockBusyRefusal();
+    await renderAndExpand(<CodexQueuePanel sessionId="s1" />);
+    vi.useFakeTimers();
+    await confirmPriority();
+    routes.queueHang = true;
+    await act(async () => vi.advanceTimersByTimeAsync(2000));
+    expect(queueGetCalls()).toBe(3);
+    const observation = fetchMock.mock.calls.at(-1)?.[1] as RequestInit;
+    expect(observation.signal?.aborted).toBe(false);
+    await act(async () => vi.advanceTimersByTimeAsync(2000));
+    expect(queueGetCalls()).toBe(3);
+    expect(observation.signal?.aborted).toBe(true);
+    await act(async () => vi.advanceTimersByTimeAsync(2000));
+    expect(queueGetCalls()).toBe(4);
+    expect(screen.queryByTestId("codex-queue-row-a1")).toBeNull();
+    await act(async () => releaseQueue?.(both));
+    expect(screen.queryByTestId("codex-queue-row-a1")).toBeNull();
+    expect(screen.getByTestId("codex-queue-row-a2")).toBeTruthy();
+  });
+
+  it("restores a nonterminal action that returns to the queue", async () => {
+    installFetch();
+    routes.queue = [both, both, remaining, both];
+    mockBusyRefusal();
+    await renderAndExpand(<CodexQueuePanel sessionId="s1" />);
+    vi.useFakeTimers();
+    await confirmPriority();
+    await act(async () => vi.advanceTimersByTimeAsync(2000));
+    expect(screen.queryByTestId("codex-queue-row-a1")).toBeNull();
+    await act(async () => vi.advanceTimersByTimeAsync(2000));
+    expect(screen.getByTestId("codex-queue-row-a1")).toBeTruthy();
+  });
+
+  it.each(["scope change", "unmount", "new operation"])(
+    "%s aborts an in-flight observation and prevents further observation reads",
+    async (event) => {
+      installFetch();
+      routes.queue = [both, both, remaining];
+      mockBusyRefusal();
+      const panel = await renderAndExpand(<CodexQueuePanel sessionId="s1" />);
+      vi.useFakeTimers();
+      await confirmPriority();
+      routes.queueHang = true;
+      await act(async () => vi.advanceTimersByTimeAsync(2000));
+      expect(queueGetCalls()).toBe(3);
+      const observation = fetchMock.mock.calls.at(-1)?.[1] as RequestInit;
+      expect(observation.signal?.aborted).toBe(false);
+
+      if (event === "scope change") {
+        panel.rerender(<CodexQueuePanel sessionId="s2" />);
+      } else if (event === "unmount") {
+        panel.unmount();
+      } else {
+        await act(async () => fireEvent.click(screen.getByTestId("codex-queue-retract-a2")));
+      }
+      expect(observation.signal?.aborted).toBe(true);
+      await act(async () => releaseQueue?.(both));
+      await act(async () => vi.advanceTimersByTimeAsync(15000));
+      expect(queueGetCalls()).toBe(event === "unmount" ? 3 : 4);
+      expect(screen.queryByTestId("codex-queue-row-a1")).toBeNull();
+      expect(screen.queryByTestId("codex-queue-note")).toBeNull();
+    }
+  );
 });
 
 // 响应直接取自 queue_prioritize 的判别联合；每项都经过真实面板及原确认臂。
@@ -1905,5 +2079,46 @@ describe("queue resolution reason", () => {
     fireEvent.click(yes);
     expect(prioritizeBodies()).toHaveLength(1);
     expect(interruptBodies()).toHaveLength(0);
+  });
+});
+
+describe("CodexQueuePanel stop pause", () => {
+  const paused = queueView([action()], null, [], true, true);
+  const automaticPause = { ...paused, stopPauseAutoResumes: true };
+
+  it("describes an automatically released stop pause as temporary", async () => {
+    installFetch();
+    routes.queue = [automaticPause];
+    await renderAndExpand(<CodexQueuePanel sessionId="s1" />);
+
+    expect(screen.getByTestId("codex-queue-summary").textContent).toMatch(/临时|暂时|短暂|暂缓/);
+    expect(screen.getByTestId("codex-queue-paused").textContent).toMatch(/自动(?:恢复|继续)/);
+  });
+
+  it("offers manual resume only when a stop pause persists", async () => {
+    vi.useFakeTimers();
+    installFetch();
+    routes.queue = [automaticPause];
+    await act(async () => {
+      render(<CodexQueuePanel sessionId="s1" />);
+    });
+    fireEvent.click(screen.getByTestId("codex-queue-toggle"));
+
+    expect(screen.queryByTestId("codex-queue-resume")).toBeNull();
+    await act(async () => vi.advanceTimersByTimeAsync(30_000));
+    expect(screen.getByTestId("codex-queue-resume")).toBeVisible();
+  });
+
+  it.each([
+    { name: "mixed pause", view: { ...paused, stopPauseAutoResumes: false } },
+    { name: "legacy pause", view: paused },
+  ])("retains manual recovery for a $name", async ({ view }) => {
+    installFetch();
+    routes.queue = [view];
+    await renderAndExpand(<CodexQueuePanel sessionId="s1" />);
+
+    expect(screen.getByTestId("codex-queue-summary").textContent).toContain("已暂停");
+    expect(screen.getByTestId("codex-queue-paused").textContent).toContain("等待你的选择");
+    expect(screen.getByTestId("codex-queue-resume")).toBeTruthy();
   });
 });

@@ -3,6 +3,7 @@
 // - 队列刷新由**本地信号**驱动（投影 revision 变化 / 发送回执），不要求 Desktop 出新帧；
 // - revision=null 的兼容模式同样成立；换会话不串台。
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { useLayoutEffect } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import SessionDetail from "@/mobile/SessionDetail";
 import type { Session } from "@/types/session";
@@ -54,7 +55,9 @@ function projection(over: Record<string, unknown> = {}) {
 }
 
 let queueResponse: unknown;
+let queueEditResponse: unknown;
 let messagesResponse: unknown;
+let filesResponse: unknown;
 let queueCalls: string[];
 let fetchMock: ReturnType<typeof vi.fn> | null = null;
 let retractBodies: string[];
@@ -76,7 +79,9 @@ function json(body: unknown, status = 200) {
 
 function installFetch() {
   queueResponse = { actions: [], blockedReasonCode: null };
+  queueEditResponse = null;
   messagesResponse = { messages: [], truncated: false };
+  filesResponse = { files: [], truncated: false };
   queueCalls = [];
   retractBodies = [];
   sendCalls = [];
@@ -96,6 +101,9 @@ function installFetch() {
     if (url.includes("/codex/queue/retract")) {
       retractBodies.push(String(init?.body ?? ""));
       return json({ actionId: "act-q", state: "cancelled", position: null, receipt: null });
+    }
+    if (url.includes("/codex/queue/edit")) {
+      return queueEditResponse instanceof Promise ? queueEditResponse : json(queueEditResponse);
     }
     if (url.includes("/codex/queue")) {
       queueCalls.push(url);
@@ -127,14 +135,16 @@ function installFetch() {
       sendCalls.push(String(init?.body ?? ""));
       if (nextSend) {
         compatSent = true;
-        return json(nextSend);
+        return nextSend instanceof Promise ? nextSend : json(nextSend);
       }
       return json({ status: "codex_queued", actionId: "act-q", position: 1 });
     }
     if (url.includes("/session-messages")) {
-      return json(messagesResponse ?? { messages: [], truncated: false });
+      return messagesResponse instanceof Promise ? messagesResponse : json(messagesResponse);
     }
-    if (url.includes("/session-files")) return json({ files: [], truncated: false });
+    if (url.includes("/session-files")) {
+      return filesResponse instanceof Promise ? filesResponse : json(filesResponse);
+    }
     if (url.includes("/session-queue")) return json({ items: [] });
     if (url.includes("/session-approve-options")) {
       return json({
@@ -339,9 +349,18 @@ describe("SessionDetail × Codex IPC：恢复入口与队列刷新", () => {
     fireEvent.click(await screen.findByTestId("codex-queue-toggle"));
     expect(await screen.findByTestId("codex-queue-row-old-a")).toBeTruthy();
 
-    queueResponse = { actions: [], blockedReasonCode: null };
+    queueResponse = {
+      actions: [{ actionId: "new-b", state: "queued", position: 1, receipt: null }],
+      blockedReasonCode: null,
+    };
     rerender(<SessionDetail session={makeSession({ id: "sess-b" })} onBack={() => {}} />);
-    await waitFor(() => expect(queueCalls.some((u) => u.includes("sess-b"))).toBe(true));
+    expect(screen.queryByTestId("codex-queue-row-old-a")).toBeNull();
+    const esB = MockEventSource.latest();
+    expect(esB).not.toBe(esA);
+    emit(esB, "snapshot", projection({ threadId: "thread-b" }));
+    fireEvent.click(await screen.findByTestId("codex-queue-toggle"));
+    expect(await screen.findByTestId("codex-queue-row-new-b")).toBeVisible();
+    expect(queueCalls.some((u) => u.includes("sess-b"))).toBe(true);
     expect(screen.queryByTestId("codex-queue-row-old-a")).toBeNull();
   });
 });
@@ -1776,37 +1795,415 @@ describe("SessionDetail × Codex IPC：A5.3 Codex/通用消息源切换", () => 
     },
   ];
 
-  it("A5.3-a：可见 Codex 投影隐藏通用摘要与加载更早；回到通用源恢复", async () => {
-    installFetch();
-    queueResponse = {
-      actions: [{ actionId: "a1", state: "queued", position: 1, receipt: null }],
-      blockedReasonCode: null,
-    };
-    // 通用面先在场：200 条消息（混入过程消息 → toggleableMessages > 0，
-    // summary-banner 阳性前置——终审 Minor）+ truncated → 摘要横幅/加载更早可渲染。
+  function cacheGenericHistory() {
     messagesResponse = {
-      messages: Array.from({ length: 200 }, (_, i) => ({
+      messages: Array.from({ length: 220 }, (_, i) => ({
         seq: i,
         kind: i % 10 === 5 ? "thinking" : "user",
-        content: `m${i}`,
+        content: `通用消息 ${i}`,
       })),
       truncated: true,
     };
-    render(<SessionDetail session={makeSession({ status: "idle" })} onBack={() => {}} />);
+  }
+
+  it.each([
+    { layout: "普通", split: false },
+    { layout: "分屏", split: true },
+  ])("A5.3-a：$layout 布局通用消息控件随可见消息源切换", { timeout: 15_000 }, async ({ split }) => {
+    installFetch();
+    cacheGenericHistory();
+    render(<SessionDetail session={makeSession()} onBack={() => {}} />);
+    if (split) {
+      fireEvent.click(screen.getByTestId("file-panel-button"));
+      fireEvent.click(screen.getByTestId("preview-toggle-split"));
+    }
+    const layout = split ? within(screen.getByTestId("split-container")) : screen;
+    const processText = "通用消息 215";
+    const processMessage = () => within(layout.getByTestId("msg-215"));
     const es = await waitFor(() => MockEventSource.latest());
-    // 通用相：尚未收到 Codex 快照（codexState=null）→ 通用源激活
-    // （F9：加载更早 + 摘要横幅均可见——阳性前置，缺席断言不空过）。
-    expect(await screen.findByTestId("load-more")).toBeTruthy();
-    expect(await screen.findByTestId("summary-banner")).toBeTruthy();
-    // Codex 投影激活（controllable + asyncQuestions）→ 通用面隐藏（F9 合同）。
+
+    expect(await layout.findByTestId("load-more")).toBeVisible();
+    expect(layout.getByTestId("summary-banner")).toBeVisible();
+    const toggle = await layout.findByTestId("process-collapse-toggle");
+    expect(toggle).toBeVisible();
+    expect(processMessage().queryByText(processText)).toBeNull();
+    fireEvent.click(toggle);
+    expect(processMessage().getByText(processText)).toBeVisible();
+    fireEvent.click(toggle);
+    expect(processMessage().queryByText(processText)).toBeNull();
+
     emit(es, "snapshot", projection({ asyncQuestions: codexQuestions }));
-    await waitFor(() => expect(screen.queryByTestId("load-more")).toBeNull());
-    expect(screen.queryByTestId("summary-banner")).toBeNull();
-    // 回到通用源：Codex 投影撤（compat_only 非 controllable 面）→ 通用面恢复。
+    await waitFor(() => expect(layout.queryByTestId("load-more")).toBeNull());
+    expect(layout.getByTestId("codex-projection")).toBeVisible();
+    expect(layout.queryByTestId("summary-banner")).toBeNull();
+    expect(screen.queryByTestId("process-collapse-toggle")).toBeNull();
+    expect(layout.getByTestId("bookmark-add")).toBeVisible();
+
     emit(es, "snapshot", projection({ availability: "compat_only" }));
-    // 恢复相：加载更早**与**摘要横幅都回来（终审 Minor：横幅永久消失也不得通过）。
-    await waitFor(() => expect(screen.getByTestId("load-more")).toBeTruthy());
-    expect(screen.getByTestId("summary-banner")).toBeTruthy();
+    expect(await layout.findByTestId("load-more")).toBeVisible();
+    expect(layout.getByTestId("summary-banner")).toBeVisible();
+    const restoredToggle = layout.getByTestId("process-collapse-toggle");
+    expect(restoredToggle).toBeVisible();
+    fireEvent.click(restoredToggle);
+    expect(processMessage().getByText(processText)).toBeVisible();
+  });
+
+  function projectedMessage(id: string, text: string) {
+    return { id, text, role: "assistant", kind: "message", ts: null, turnId: "turn-1" };
+  }
+
+  it.each(["codex", "zcode"] as const)(
+    "A5.3：App 投影切到 %s 通用会话后，过程开关展开当前会话正文",
+    async (agentType) => {
+      installFetch();
+      const oldText = "仅存在于旧 App 投影中的正文";
+      const processText = "仅存在于新会话中的过程正文";
+      messagesResponse = {
+        messages: [{ seq: 1, kind: "thinking", content: processText }],
+        truncated: false,
+      };
+      const { rerender } = render(<SessionDetail session={makeSession()} onBack={() => {}} />);
+      await screen.findByTestId("process-collapse-toggle");
+      const es = await waitFor(() => MockEventSource.latest());
+      emit(es, "snapshot", projection({ messages: [projectedMessage("old", oldText)] }));
+      expect(await screen.findByText(oldText)).toBeVisible();
+
+      rerender(
+        <SessionDetail session={makeSession({ agentType, form: "cli" })} onBack={() => {}} />
+      );
+      expect(screen.queryByText(oldText)).toBeNull();
+      expect(screen.queryByTestId("codex-projection")).toBeNull();
+      const toggle = await screen.findByTestId("process-collapse-toggle");
+      expect(toggle).toBeVisible();
+      expect(screen.queryByText(processText)).toBeNull();
+      fireEvent.click(toggle);
+      expect(screen.getByText(processText)).toBeVisible();
+    }
+  );
+
+  it("A5.3：同 ID App → CLI 保留未发送正文，切换工具或 ID 后输入框为空", async () => {
+    installFetch();
+    const session = makeSession();
+    const { rerender } = render(<SessionDetail session={session} onBack={() => {}} />);
+    const draft = "这段正文还没有发送";
+    fireEvent.change(await screen.findByTestId("composer-input"), { target: { value: draft } });
+    expect(screen.getByTestId("composer-input")).toHaveValue(draft);
+
+    const cli = { ...session, form: "cli" } as const;
+    rerender(<SessionDetail session={cli} onBack={() => {}} />);
+    expect(await screen.findByTestId("composer-input")).toHaveValue(draft);
+
+    rerender(<SessionDetail session={{ ...cli, agentType: "claude" }} onBack={() => {}} />);
+    expect(await screen.findByTestId("composer-input")).toHaveValue("");
+    rerender(<SessionDetail session={{ ...cli, id: "other-draft-session" }} onBack={() => {}} />);
+    expect(await screen.findByTestId("composer-input")).toHaveValue("");
+    expect(sendCalls).toEqual([]);
+  });
+
+  it("A5.3：同 ID App → CLI 保留待回填的队列编辑草稿", async () => {
+    const fetcher = installFetch();
+    queueResponse = {
+      actions: [{ actionId: "edit-a", state: "queued", position: 1, receipt: null }],
+      blockedReasonCode: null,
+    };
+    let releaseEdit!: (response: Response) => void;
+    queueEditResponse = new Promise<Response>((resolve) => {
+      releaseEdit = resolve;
+    });
+    const session = makeSession();
+    const { rerender } = render(<SessionDetail session={session} onBack={() => {}} />);
+    const es = await waitFor(() => MockEventSource.latest());
+    emit(es, "snapshot", projection());
+    fireEvent.change(await screen.findByTestId("composer-input"), {
+      target: { value: "输入框原有正文" },
+    });
+    fireEvent.click(await screen.findByTestId("codex-queue-toggle"));
+    fireEvent.click(await screen.findByTestId("codex-queue-edit-edit-a"));
+    expect(screen.queryByTestId("composer-edit-choice")).toBeNull();
+
+    const cli = { ...session, form: "cli" } as const;
+    rerender(<SessionDetail session={cli} onBack={() => {}} />);
+    expect(screen.queryByTestId("codex-queue-toggle")).toBeNull();
+    await act(async () => {
+      releaseEdit(json({ actionId: "edit-a", text: "刚从队列取出的正文" }));
+    });
+    expect(await screen.findByTestId("composer-edit-choice")).toBeVisible();
+    rerender(<SessionDetail session={{ ...cli, id: "other-draft-session" }} onBack={() => {}} />);
+    expect(await screen.findByTestId("composer-input")).toHaveValue("");
+    expect(screen.queryByTestId("composer-edit-choice")).toBeNull();
+
+    rerender(<SessionDetail session={cli} onBack={() => {}} />);
+    const choice = await screen.findByTestId("composer-edit-choice");
+    fireEvent.click(within(choice).getAllByRole("button")[0]);
+    expect(screen.getByTestId("composer-input")).toHaveValue("刚从队列取出的正文");
+    expect(screen.queryByTestId("composer-edit-choice")).toBeNull();
+    rerender(<SessionDetail session={session} onBack={() => {}} />);
+    const next = MockEventSource.latest();
+    expect(next).not.toBe(es);
+    emit(next, "snapshot", projection());
+    rerender(<SessionDetail session={cli} onBack={() => {}} />);
+    expect(screen.getByTestId("composer-input")).toHaveValue("刚从队列取出的正文");
+    expect(screen.queryByTestId("composer-edit-choice")).toBeNull();
+    expect(
+      fetcher.mock.calls.filter(([url]) => String(url).includes("/codex/queue/edit"))
+    ).toHaveLength(1);
+    expect(sendCalls).toEqual([]);
+  });
+
+  it("A5.3：同线程换形态时，在途发送仍由同一个 Composer 接收回执", async () => {
+    installFetch();
+    let releaseSend!: (response: Response) => void;
+    nextSend = new Promise<Response>((resolve) => {
+      releaseSend = resolve;
+    });
+    const session = makeSession();
+    const { rerender } = render(<SessionDetail session={session} onBack={() => {}} />);
+    const input = await screen.findByTestId("composer-input");
+    fireEvent.change(input, { target: { value: "正在发送的正文" } });
+    fireEvent.click(screen.getByTestId("composer-send"));
+    await waitFor(() => expect(sendCalls).toHaveLength(1));
+
+    rerender(<SessionDetail session={{ ...session, form: "cli" }} onBack={() => {}} />);
+    expect(screen.getByTestId("composer-input")).toBe(input);
+    await act(async () => {
+      releaseSend(json({ status: "codex_queued", actionId: "in-flight", position: 1 }));
+    });
+    expect(screen.getByTestId("composer-input")).toHaveValue("");
+    expect(sendCalls).toHaveLength(1);
+  });
+
+  it.each([
+    {
+      response: { status: "codex_queued", actionId: "in-flight", position: 1 },
+      receipt: "codex-queued",
+    },
+    { response: { status: "submitted" }, receipt: "submitted" },
+    { response: { status: "delivered" }, receipt: "delivered" },
+  ])("A5.3：在途切形态后，$response.status 回执保留下一稿", async ({ response, receipt }) => {
+    installFetch();
+    let releaseSend!: (response: Response) => void;
+    nextSend = new Promise<Response>((resolve) => {
+      releaseSend = resolve;
+    });
+    const session = makeSession();
+    const { rerender } = render(<SessionDetail session={session} onBack={() => {}} />);
+    fireEvent.change(await screen.findByTestId("composer-input"), {
+      target: { value: "正在发送的正文" },
+    });
+    fireEvent.click(screen.getByTestId("composer-send"));
+    await waitFor(() => expect(sendCalls).toHaveLength(1));
+
+    rerender(<SessionDetail session={{ ...session, form: "cli" }} onBack={() => {}} />);
+    const nextDraft = "等待回执时输入的下一稿";
+    fireEvent.change(screen.getByTestId("composer-input"), { target: { value: nextDraft } });
+    expect(screen.getByTestId("composer-input")).toHaveValue(nextDraft);
+    await act(async () => {
+      releaseSend(json(response));
+    });
+    expect(screen.getByTestId(`send-receipt-${receipt}`)).toBeVisible();
+    expect(screen.getByTestId("composer-input")).toHaveValue(nextDraft);
+    expect(sendCalls).toHaveLength(1);
+  });
+
+  it.each([
+    { transition: "分屏", edit: true },
+    { transition: "会话往返", edit: true },
+    { transition: "分屏", edit: false },
+    { transition: "会话往返", edit: false },
+  ])("A5.3：$transition 重挂后按草稿归属处理旧回执（编辑=$edit）", async ({ transition, edit }) => {
+    installFetch();
+    let releaseSend!: (response: Response) => void;
+    nextSend = new Promise<Response>((resolve) => {
+      releaseSend = resolve;
+    });
+    const session = makeSession();
+    const { rerender } = render(<SessionDetail session={session} onBack={() => {}} />);
+    const original = await screen.findByTestId("composer-input");
+    fireEvent.change(original, { target: { value: "已提交的正文 A" } });
+    fireEvent.click(screen.getByTestId("composer-send"));
+    await waitFor(() => expect(sendCalls).toHaveLength(1));
+
+    if (transition === "分屏") {
+      fireEvent.click(screen.getByTestId("file-panel-button"));
+      fireEvent.click(await screen.findByTestId("preview-toggle-split"));
+    } else {
+      rerender(<SessionDetail session={makeSession({ id: "other-session" })} onBack={() => {}} />);
+      expect(await screen.findByTestId("composer-input")).toHaveValue("");
+      rerender(<SessionDetail session={session} onBack={() => {}} />);
+    }
+    const current = await screen.findByTestId("composer-input");
+    expect(current).not.toBe(original);
+    expect(original).not.toBeInTheDocument();
+    expect(current).toHaveValue("已提交的正文 A");
+    if (edit) fireEvent.change(current, { target: { value: "新实例输入的正文 B" } });
+
+    const acknowledgement = json({ status: "delivered" });
+    const readAcknowledgement = vi.spyOn(acknowledgement, "json");
+    await act(async () => {
+      releaseSend(acknowledgement);
+    });
+    expect(readAcknowledgement).toHaveBeenCalledTimes(1);
+    expect(current).toHaveValue(edit ? "新实例输入的正文 B" : "");
+    expect(sendCalls).toHaveLength(1);
+  });
+
+  function DetailWithCommitProbe({
+    session,
+    onCommit,
+  }: {
+    session: Session;
+    onCommit: (sessionId: string) => void;
+  }) {
+    useLayoutEffect(() => {
+      onCommit(session.id);
+    }, [session.id, session.form, onCommit]);
+    return <SessionDetail session={session} onBack={() => {}} />;
+  }
+
+  it("A5.3：同线程回到 App 时，首个提交不复用上次订阅的投影", async () => {
+    installFetch();
+    const oldText = "上次订阅的正文";
+    const newText = "新订阅的正文";
+    const session = makeSession();
+    const firstCommit = vi.fn(() => screen.queryByText(oldText));
+    const { rerender } = render(<DetailWithCommitProbe session={session} onCommit={firstCommit} />);
+    const es = await waitFor(() => MockEventSource.latest());
+    emit(es, "snapshot", projection({ messages: [projectedMessage("old", oldText)] }));
+    expect(await screen.findByText(oldText)).toBeVisible();
+
+    rerender(
+      <DetailWithCommitProbe session={{ ...session, form: "cli" }} onCommit={firstCommit} />
+    );
+    expect(screen.queryByTestId("codex-queue-panel")).toBeNull();
+    rerender(<DetailWithCommitProbe session={session} onCommit={firstCommit} />);
+    expect(firstCommit).toHaveLastReturnedWith(null);
+    const next = MockEventSource.latest();
+    expect(next).not.toBe(es);
+    emit(next, "snapshot", projection({ messages: [projectedMessage("new", newText)] }));
+    expect(await screen.findByText(newText)).toBeVisible();
+  });
+
+  it("A5.3：原地切换 App 会话时，首个提交不显示上个会话的投影", async () => {
+    installFetch();
+    const oldText = "App A 的投影正文";
+    const nextText = "App B 的投影正文";
+    const firstCommit = vi.fn((sessionId: string) => ({
+      sessionId,
+      oldText: screen.queryByText(oldText),
+    }));
+    const { rerender } = render(
+      <DetailWithCommitProbe session={makeSession()} onCommit={firstCommit} />
+    );
+    const esA = await waitFor(() => MockEventSource.latest());
+    emit(esA, "snapshot", projection({ messages: [projectedMessage("app-a", oldText)] }));
+    expect(await screen.findByText(oldText)).toBeVisible();
+
+    rerender(
+      <DetailWithCommitProbe session={makeSession({ id: "sess-app-b" })} onCommit={firstCommit} />
+    );
+    expect(firstCommit).toHaveLastReturnedWith({ sessionId: "sess-app-b", oldText: null });
+    const esB = MockEventSource.latest();
+    expect(esB).not.toBe(esA);
+    emit(
+      esB,
+      "snapshot",
+      projection({ threadId: "thread-2", messages: [projectedMessage("app-b", nextText)] })
+    );
+    expect(await screen.findByText(nextText)).toBeVisible();
+    expect(screen.queryByText(oldText)).toBeNull();
+  });
+
+  it("A5.3：新会话首帧不沿用旧通用历史、滚动位置或文件清单", async () => {
+    const fetcher = installFetch();
+    vi.stubGlobal("matchMedia", (query: string) => ({
+      matches: query.includes("aspect-ratio"),
+      addEventListener: () => {},
+      removeEventListener: () => {},
+    }));
+    const oldText = "App A 的通用正文";
+    const oldFile = "only-a.md";
+    const nextText = "App B 的通用正文";
+    const nextFile = "only-b.md";
+    const filesPage = (name: string, truncated: boolean) => ({
+      files: [{ path: `/tmp/proj/${name}`, lastSeq: 1, lastTs: null, hits: 1, modified: true }],
+      truncated,
+    });
+    messagesResponse = {
+      messages: [
+        { seq: 1, kind: "user", content: oldText },
+        { seq: 2, kind: "thinking", content: "App A 的过程" },
+      ],
+      truncated: true,
+    };
+    filesResponse = filesPage(oldFile, true);
+    const requestLimits = (endpoint: string, sessionId: string) =>
+      fetcher.mock.calls.flatMap(([url]) => {
+        const request = new URL(String(url), "http://localhost");
+        return request.pathname.endsWith(endpoint) &&
+          request.searchParams.get("session_id") === sessionId
+          ? [request.searchParams.get("limit")]
+          : [];
+      });
+    const firstCommit = vi.fn((sessionId: string) => ({
+      sessionId,
+      oldText: screen.queryByText(oldText),
+      oldFile: screen.queryByText(oldFile),
+      loadMore: screen.queryByTestId("load-more"),
+      summary: screen.queryByTestId("summary-banner"),
+      processToggle: screen.queryByTestId("process-collapse-toggle"),
+      filesTruncated: screen.queryByTestId("panel-truncated-hint"),
+      scrollTop: screen.getByTestId("message-area").scrollTop,
+    }));
+    const sessionA = makeSession();
+    const sessionB = makeSession({ id: "sess-app-b" });
+    const { rerender } = render(
+      <DetailWithCommitProbe session={sessionA} onCommit={firstCommit} />
+    );
+    expect(await screen.findByText(oldText)).toBeVisible();
+    expect(await screen.findByText(oldFile)).toBeVisible();
+    expect(screen.getByTestId("process-collapse-toggle")).toBeVisible();
+    expect(screen.getByTestId("panel-truncated-hint")).toBeVisible();
+    fireEvent.click(screen.getByTestId("load-more"));
+    expect(requestLimits("/session-messages", sessionA.id)).toEqual(["200", "400"]);
+    const area = screen.getByTestId("message-area");
+    area.scrollTop = 150;
+    fireEvent.change(screen.getByTestId("font-scale-select"), { target: { value: "0.75" } });
+    const esA = MockEventSource.latest();
+    rerender(
+      <DetailWithCommitProbe session={{ ...sessionA, status: "finished" }} onCommit={firstCommit} />
+    );
+    expect(screen.getByTestId("message-area")).toBe(area);
+    expect(MockEventSource.latest()).toBe(esA);
+    expect(requestLimits("/session-messages", sessionA.id)).toEqual(["200", "400"]);
+    let releaseResponses!: () => void;
+    const responseGate = new Promise<void>((resolve) => {
+      releaseResponses = resolve;
+    });
+    messagesResponse = responseGate.then(() =>
+      json({ messages: [{ seq: 1, kind: "user", content: nextText }] })
+    );
+    filesResponse = responseGate.then(() => json(filesPage(nextFile, false)));
+    rerender(<DetailWithCommitProbe session={sessionB} onCommit={firstCommit} />);
+    expect(firstCommit).toHaveLastReturnedWith({
+      sessionId: sessionB.id,
+      oldText: null,
+      oldFile: null,
+      loadMore: null,
+      summary: null,
+      processToggle: null,
+      filesTruncated: null,
+      scrollTop: 0,
+    });
+    expect(requestLimits("/session-messages", sessionB.id)).toEqual(["200"]);
+    expect(requestLimits("/session-files", sessionB.id)).toEqual(["200"]);
+    expect(screen.getByTestId("font-scale-select")).toHaveValue("0.75");
+    expect(screen.queryByText(oldText)).toBeNull();
+    expect(screen.queryByText(oldFile)).toBeNull();
+    await act(async () => {
+      releaseResponses();
+    });
+    expect(screen.getByText(nextText)).toBeVisible();
+    expect(screen.getByText(nextFile)).toBeVisible();
   });
 
   it("A5.3-b：Codex 投影激活期间零通用历史请求（加载更早不触发 session-messages）", async () => {
@@ -1815,14 +2212,7 @@ describe("SessionDetail × Codex IPC：A5.3 Codex/通用消息源切换", () => 
       actions: [{ actionId: "a1", state: "queued", position: 1, receipt: null }],
       blockedReasonCode: null,
     };
-    messagesResponse = {
-      messages: Array.from({ length: 200 }, (_, i) => ({
-        seq: i,
-        kind: i % 10 === 5 ? "thinking" : "user",
-        content: `m${i}`,
-      })),
-      truncated: true,
-    };
+    cacheGenericHistory();
     render(<SessionDetail session={makeSession({ status: "idle" })} onBack={() => {}} />);
     const es = await waitFor(() => MockEventSource.latest());
     // 通用相：尚未收到 Codex 快照 → 通用源激活（横幅阳性前置）。

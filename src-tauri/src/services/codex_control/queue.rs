@@ -1169,6 +1169,24 @@ impl ActionStore {
         })
     }
 
+    pub(crate) fn resolve_stopped_send_verified(
+        &self,
+        scope: &ThreadKey,
+        source_action_id: &str,
+        evidence_turn_id: &str,
+    ) -> Result<bool, StoreError> {
+        self.with(|c| {
+            dao::resolve_stopped_send_verified_conn(
+                c,
+                scope,
+                source_action_id,
+                evidence_turn_id,
+                now_ms(),
+            )
+            .map_err(db_err)
+        })
+    }
+
     /// Task4：读源动作的 `verified_complete` 核销记录（host / thread / evidence）。
     /// orphan book 对账输入缝：源 fence 已被核销事务消化时按记录事实条件补清旧
     /// book——`reason='verified_complete'` 钉死，显式接管记录（explicit_takeover）
@@ -1633,6 +1651,13 @@ impl ActionStore {
             Ok((cleared, running, persistent))
         });
         finish_stop_write(ticket, result)
+    }
+
+    pub(crate) fn queue_pause_view(
+        &self,
+        key: &ThreadKey,
+    ) -> Result<Option<(String, bool)>, StoreError> {
+        self.with(|c| dao::queue_pause_view_conn(c, &key.thread_id).map_err(db_err))
     }
 
     /// 读 Thread 暂停状态（None = 未暂停）。

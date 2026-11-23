@@ -57,7 +57,7 @@ type LoadState =
   | {
       phase: "error";
       status: number | null;
-      /** 403 响应体的结构化原因码（M5 P2-a：sensitive/too_large/not_found/not_file/io） */
+      /** 403 响应体的结构化原因码。 */
       errorData: Record<string, unknown> | null;
     }
   | { phase: "ok"; payload: FilePayload };
@@ -218,9 +218,7 @@ export default function FilePreview({
   // 路径末段作标题（分隔符双态：win 反斜杠 / unix 斜杠）
   const baseName = filePath.split(/[\\/]/).pop() || filePath;
 
-  // M5 P2-a：403 原因分診——后端响应体 error ∈ sensitive/too_large/not_found/
-  // not_file/io（snake_case），已过闸设备可见原因便于排障；404 会话级与网络异常
-  // 保留原兜底文案
+  // 已认证请求的 403 响应可携带文件读取原因码；会话 404 与网络异常保留兜底文案。
   const errorReason =
     state.phase === "error"
       ? typeof (state.errorData ?? {})?.error === "string"
@@ -235,6 +233,8 @@ export default function FilePreview({
     if (errorReason === "too_large") return i18n.t("mobile.preview.errTooLarge");
     if (errorReason === "not_found") return i18n.t("mobile.preview.errNotFound");
     if (errorReason === "not_file") return i18n.t("mobile.preview.errNotFile");
+    if (errorReason === "permission_denied") return i18n.t("mobile.preview.errPermissionDenied");
+    if (errorReason === "io") return i18n.t("mobile.preview.errIo");
     if (state.status === 403 || state.status === 404)
       return i18n.t("mobile.preview.errUnpreviewable");
     return i18n.t("mobile.preview.errLoadFailed");

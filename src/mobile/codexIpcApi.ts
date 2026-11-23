@@ -203,9 +203,11 @@ export interface CodexQueueView {
   blockedReasonCode: string | null;
   blockedActionIds?: string[];
   canInterrupt?: boolean;
-  /** S2：打断后持久暂停状态（serde default 向后兼容；唯一解除出口 = /codex/queue/resume）。 */
+  /** 当前线程存在暂停行。旧后端可能省略暂停字段。 */
   queuePaused?: boolean;
   queuePauseReason?: string | null;
+  /** 所有暂停行都可在绑定回合到达终态后自动解除。 */
+  stopPauseAutoResumes?: boolean;
 }
 
 /** 「已进入桌面队列」发送回执 chip（MessageComposer 持有；actionId 是对账锚）。 */
@@ -1112,11 +1114,14 @@ export async function fetchCodexAction(
 
 /** 拉取本设备在该 Thread 的队列视图（FIFO 位置/暂停原因）。
  *  403（设备失效）→ null（fetchCodexThread 同口径）；其余非 2xx → ApiError。 */
-export async function fetchCodexQueue(sessionId: string): Promise<CodexQueueView | null> {
+export async function fetchCodexQueue(
+  sessionId: string,
+  signal?: AbortSignal
+): Promise<CodexQueueView | null> {
   const q = new URLSearchParams({ session_id: sessionId });
   let r: Response;
   try {
-    r = await fetch(`${CODEX_QUEUE_PATH}?${q}`);
+    r = await fetch(`${CODEX_QUEUE_PATH}?${q}`, signal ? { signal } : undefined);
   } catch (e) {
     throw networkFail("codex/queue", e);
   }

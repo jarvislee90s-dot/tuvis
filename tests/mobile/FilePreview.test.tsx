@@ -248,6 +248,14 @@ describe("FilePreview 403 原因分診（M5 P2-a）", () => {
     expect((await screen.findByTestId("preview-error")).textContent).toContain("不存在或已被移动");
   });
 
+  it.each([
+    ["permission_denied", "没有权限读取该文件"],
+    ["io", "文件读取失败"],
+  ])("%s → 显示具体读取错误", async (reason, text) => {
+    case403(reason);
+    expect((await screen.findByTestId("preview-error")).textContent).toContain(text);
+  });
+
   it("空错误体（旧后端/代理）→ 兜底文案「无法预览该文件」", async () => {
     installFileFetch(() => new Response("", { status: 403 }));
     renderPreview();

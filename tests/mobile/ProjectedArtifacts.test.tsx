@@ -498,43 +498,34 @@ describe("ProjectedArtifacts：不可用引用与外链", () => {
 });
 
 describe("ProjectedArtifacts：读取失败与解码失败占位", () => {
-  it("文件不存在 / 超限 → 可理解占位；sensitive 旧值按通用读取失败占位（D22）", async () => {
-    const reasons = [
-      // D22（2026-11-12 note §三）：后端已取消目录准入不再产生 sensitive；
-      // 旧服务端残留值归并到通用读取失败占位（不再展示安全策略文案）
-      { error: "sensitive", text: "无法读取该文件" },
-      { error: "not_found", text: "不存在或已被移动" },
-      { error: "too_large", text: "超过预览上限" },
-    ];
-    for (const r of reasons) {
-      fetchMock.mockImplementation(
-        async () =>
-          new Response(JSON.stringify({ error: r.error }), {
-            status: 403,
-            headers: { "content-type": "application/json" },
-          })
-      );
-      const m = message({
-        id: `m-${r.error}`,
-        role: "system",
-        kind: "imageGeneration",
-        artifacts: [
-          artifact({
-            artifactId: `img-${r.error}`,
-            path: `/p/${r.error}.png`,
-            imageIndexInTurn: 1,
-          }),
-        ],
-        turnImageCount: 1,
-      });
-      const { unmount } = render(<Harness msg={m} openFile={() => {}} />);
-      act(() => MockIntersectionObserver.triggerAll(true));
-      const ph = await screen.findByTestId(`artifact-placeholder-img-${r.error}`);
-      expect(ph.textContent).toContain(r.text);
-      unmount();
-      MockIntersectionObserver.reset();
-      cleanup();
-    }
+  it.each([
+    // D22：旧服务端的 sensitive 原因码使用通用读取失败文案。
+    { error: "sensitive", text: "无法读取该文件" },
+    { error: "not_found", text: "不存在或已被移动" },
+    { error: "too_large", text: "超过预览上限" },
+    { error: "permission_denied", text: "没有权限读取该文件" },
+    { error: "io", text: "文件读取失败" },
+  ])("$error → 显示对应的读取失败占位", async ({ error, text }) => {
+    fetchMock.mockImplementation(
+      async () =>
+        new Response(JSON.stringify({ error }), {
+          status: 403,
+          headers: { "content-type": "application/json" },
+        })
+    );
+    const m = message({
+      id: `m-${error}`,
+      role: "system",
+      kind: "imageGeneration",
+      artifacts: [
+        artifact({ artifactId: `img-${error}`, path: `/p/${error}.png`, imageIndexInTurn: 1 }),
+      ],
+      turnImageCount: 1,
+    });
+    render(<Harness msg={m} openFile={() => {}} />);
+    act(() => MockIntersectionObserver.triggerAll(true));
+    const ph = await screen.findByTestId(`artifact-placeholder-img-${error}`);
+    expect(ph.textContent).toContain(text);
   });
 
   it("图片解码失败 → 占位并回收 object URL", async () => {

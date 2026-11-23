@@ -679,6 +679,9 @@ pub(crate) fn set_queue_pause_conn(
 /// [`stop_pause_rows_conn`]）。
 pub(crate) type StopPauseRow = (Option<String>, Option<String>);
 
+const STOP_PAUSE_REASONS: &str =
+    "('interrupt_pending','interrupt_accepted','interrupt_uncertain','cancel_pending')";
+
 /// P3（2026-10-30）：该 Thread 的**停止类**暂停行 `(pause_token, pause_turn_id)`，
 /// 按 paused_at 升序。停止类档位 = stop/cancel 端点写入的原因码；settle 路径对
 /// 每行按其绑定 Turn 的终态证据逐行自动清除（清仍走 [`clear_queue_pause_owned_conn`]
@@ -687,12 +690,11 @@ pub(crate) fn stop_pause_rows_conn(
     conn: &Connection,
     thread_id: &str,
 ) -> rusqlite::Result<Vec<StopPauseRow>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare(&format!(
         "SELECT pause_token, pause_turn_id FROM codex_queue_pause \
- WHERE thread_id = ?1 AND pause_reason IN \
- ('interrupt_pending','interrupt_accepted','interrupt_uncertain','cancel_pending') \
- ORDER BY paused_at ASC, rowid ASC",
-    )?;
+ WHERE thread_id = ?1 AND pause_reason IN {STOP_PAUSE_REASONS} \
+ ORDER BY paused_at ASC, rowid ASC"
+    ))?;
     let rows = stmt.query_map([thread_id], |r| {
         Ok((
             r.get::<_, Option<String>>(0)?,
@@ -718,6 +720,27 @@ pub(crate) fn queue_pause_conn(
         Some(row) => row.map(Some),
         None => Ok(None),
     }
+}
+
+/// 在同一快照中读取最早暂停原因及该线程是否只剩可随目标终态解除的停止暂停。
+pub(crate) fn queue_pause_view_conn(
+    conn: &Connection,
+    thread_id: &str,
+) -> rusqlite::Result<Option<(String, bool)>> {
+    conn.query_row(
+        &format!(
+            "SELECT pause_reason, NOT EXISTS (
+                SELECT 1 FROM codex_queue_pause AS pending WHERE pending.thread_id = ?1 AND (
+                    pending.pause_reason NOT IN {STOP_PAUSE_REASONS}
+                    OR COALESCE(TRIM(pending.pause_token), '') = ''
+                    OR COALESCE(TRIM(pending.pause_turn_id), '') = ''
+                )
+            ) FROM codex_queue_pause WHERE thread_id = ?1 ORDER BY paused_at ASC, rowid ASC LIMIT 1"
+        ),
+        [thread_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+    .optional()
 }
 
 /// 用户显式「继续发送」：删该 Thread **全部**暂停行（解除唯一出口，无视归属
@@ -1310,6 +1333,42 @@ pub(crate) fn resolve_barrier_verified_conn(
     evidence_turn_id: &str,
     resolved_at: i64,
 ) -> rusqlite::Result<bool> {
+    resolve_barrier_verified_inner(
+        conn,
+        scope,
+        source_action_id,
+        evidence_turn_id,
+        resolved_at,
+        false,
+    )
+}
+
+/// 仅消费显式停止时保存的证据。写事务内重新核对已接受的原生发送及其回合绑定。
+pub(crate) fn resolve_stopped_send_verified_conn(
+    conn: &Connection,
+    scope: &ThreadKey,
+    source_action_id: &str,
+    evidence_turn_id: &str,
+    resolved_at: i64,
+) -> rusqlite::Result<bool> {
+    resolve_barrier_verified_inner(
+        conn,
+        scope,
+        source_action_id,
+        evidence_turn_id,
+        resolved_at,
+        true,
+    )
+}
+
+fn resolve_barrier_verified_inner(
+    conn: &Connection,
+    scope: &ThreadKey,
+    source_action_id: &str,
+    evidence_turn_id: &str,
+    resolved_at: i64,
+    require_bound_send: bool,
+) -> rusqlite::Result<bool> {
     // 前置：证据 Turn 非空（「真实」由上层证明，DAO 只挡结构性空值）
     if evidence_turn_id.is_empty() {
         return Err(rusqlite::Error::InvalidQuery);
@@ -1356,6 +1415,21 @@ pub(crate) fn resolve_barrier_verified_conn(
     }
     if reserved_writer {
         // 等原 ACK 或显式核对落账，保留回显确认入口和原书本身份。
+        return Ok(false);
+    }
+    if require_bound_send
+        && !get_row(&tx, source_action_id)?.is_some_and(|row| {
+            row.kind == "send"
+                && row.state == ActionState::Accepted
+                && row.route == ControlRoute::DesktopIpc
+                && row.compat_outstanding
+                && row.compat_turn_id.as_deref() == Some(evidence_turn_id)
+                && row.receipt.is_some_and(|receipt| {
+                    receipt.delivery == Delivery::Accepted
+                        && receipt.turn_id.as_deref() == Some(evidence_turn_id)
+                })
+        })
+    {
         return Ok(false);
     }
     tx.execute(

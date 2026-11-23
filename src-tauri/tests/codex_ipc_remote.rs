@@ -4488,6 +4488,9 @@ async fn p3_stop_pause_auto_releases_on_turn_terminal_and_relays_fifo() {
         Some("t-live"),
         "暂停行必须绑定本次停止等待的目标回合"
     );
+    let queue = queue_view_json(&f).await;
+    assert_eq!(queue["queuePaused"], true, "{queue}");
+    assert_eq!(queue["stopPauseAutoResumes"], true, "{queue}");
 
     // ③ 被停回合终态到场（interrupted + runtime idle）→ settle 自动解除 + FIFO 接力
     peer.send(&serde_json::json!({
@@ -4535,6 +4538,15 @@ async fn p3_stop_pause_auto_releases_on_turn_terminal_and_relays_fifo() {
             .unwrap()
             .is_none(),
         "全部暂停行已清除（queuePaused 翻 false，无 resume 参与）"
+    );
+    let queue = queue_view_json(&f).await;
+    assert_eq!(queue["queuePaused"], false, "{queue}");
+    assert!(
+        matches!(
+            queue.get("stopPauseAutoResumes"),
+            None | Some(serde_json::Value::Bool(false))
+        ),
+        "{queue}"
     );
     // ④ FIFO 自然接力：队首 act-p3-old-1 派发（无「恢复队列」调用）
     let frame = recv_within(&mut peer, 10).await;
@@ -4662,6 +4674,15 @@ async fn p3_auto_release_only_stop_class_pauses() {
     store
         .set_queue_pause(&f.thread_key(), "user_hold", "tok-p3-user", None)
         .unwrap();
+    let queue = queue_view_json(&f).await;
+    assert_eq!(queue["queuePaused"], true, "{queue}");
+    assert!(
+        matches!(
+            queue.get("stopPauseAutoResumes"),
+            None | Some(serde_json::Value::Bool(false))
+        ),
+        "{queue}"
+    );
     // 回合终态到场
     peer.send(&serde_json::json!({
         "type": "broadcast", "method": "thread-stream-state-changed", "version": 11,
@@ -10879,6 +10900,159 @@ async fn takeover_priority_http_waits_for_writer_budget_without_frame() {
             .state,
         ActionState::Queued
     );
+}
+
+#[cfg(debug_assertions)]
+async fn prioritize_with_delayed_history_case(active: bool, interrupt_ack: Option<&str>) {
+    let (f, mut peer, client_id) = if active {
+        active_takeover_fixture(true).await
+    } else {
+        idle_takeover_fixture(true, false).await
+    };
+    f.hub_store()
+        .set_queue_pause(&f.thread_key(), "user_hold", "take-user-pause", None)
+        .unwrap();
+    let hub = &f.state.codex_control;
+    let (background_arrived, release_background) =
+        hub.gate_next_settlement_before_completion_for_test(THREAD);
+    hub.start(f.state.clone());
+    tokio::time::timeout(Duration::from_secs(5), background_arrived)
+        .await
+        .expect("后台对账未进入闸门")
+        .unwrap();
+    // 调度器仍停在第一道闸；第二道闸专门拦截回归时由 HTTP 触发的同步对账。
+    let (mut foreground_arrived, release_foreground) =
+        hub.gate_next_settlement_before_completion_for_test(THREAD);
+
+    let body = prioritize_body("take-q2", active.then_some("turn-t"), active).await;
+    let mut request = std::pin::pin!(post_prioritize(&f, body));
+    let mut frames = Vec::new();
+    if active {
+        let stop = tokio::select! {
+            response = &mut request => panic!("停止前提前返回: {}", body_string(response).await),
+            frame = tokio::time::timeout(Duration::from_secs(5), peer.recv()) => frame.expect("等定向停止帧"),
+        };
+        assert_eq!(stop["method"], "thread-follower-interrupt-turn", "{stop}");
+        assert_eq!(stop["params"]["expectedTurnId"], "turn-t", "{stop}");
+        peer.send(&serde_json::json!({
+            "type":"response", "requestId":stop["requestId"], "resultType":"success",
+            "method":"thread-follower-interrupt-turn",
+            "result":{"interruptedTurnId":interrupt_ack, "ok":true}
+        }))
+        .await;
+        frames.push(stop);
+        let ack_only = tokio::select! {
+            response = &mut request => panic!("仅有 ACK 时提前返回: {}", body_string(response).await),
+            frames = drain_frames(&mut peer) => frames,
+        };
+        active_takeover_assert_frames(&ack_only, 0, 0);
+
+        active_takeover_snapshot(&f, &mut peer, 10, "other-turn", "completed", "idle").await;
+        assert!(!hub
+            .adapter
+            .turn_evidence_terminal(&f.thread_key(), "turn-t"));
+        let wrong_turn = tokio::select! {
+            response = &mut request => panic!("只有其他回合终态时提前返回: {}", body_string(response).await),
+            frames = drain_frames(&mut peer) => frames,
+        };
+        active_takeover_assert_frames(&wrong_turn, 0, 0);
+        active_takeover_assert_queued(&f);
+        active_takeover_snapshot(&f, &mut peer, 11, "turn-t", "interrupted", "idle").await;
+        assert!(hub
+            .adapter
+            .turn_evidence_terminal(&f.thread_key(), "turn-t"));
+    }
+
+    let start = tokio::select! {
+        response = &mut request => panic!("历史对账阻塞时未派发: {}", body_string(response).await),
+        reached = &mut foreground_arrived => panic!("派发前同步进入了历史对账: {reached:?}"),
+        frame = tokio::time::timeout(Duration::from_secs(5), peer.recv()) => frame.expect("历史对账仍阻塞时应派发目标"),
+    };
+    assert_eq!(start["method"], "thread-follower-start-turn", "{start}");
+    assert_eq!(start_turn_text(&start), "原文乙");
+    assert_eq!(
+        start["params"]["turnStart"]["request"]["clientUserMessageId"],
+        client_id
+    );
+    confirm_client_message_identity_for(
+        &mut peer,
+        THREAD,
+        &start,
+        "take-turn",
+        "原文乙",
+        12,
+        "owner-1",
+    )
+    .await;
+    peer.send(&serde_json::json!({
+        "type":"response", "requestId":start["requestId"], "resultType":"success",
+        "method":"thread-follower-start-turn", "handledByClientId":"owner-1",
+        "result":{"turn":{"id":"take-turn", "status":"inProgress"}}
+    }))
+    .await;
+    frames.push(start);
+    let response = tokio::time::timeout(Duration::from_secs(10), &mut request)
+        .await
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
+    assert_eq!(value["result"], "prioritized", "{value}");
+    assert_eq!(value["actionId"], "take-q2");
+    assert_eq!(value["receipt"]["delivery"], "accepted", "{value}");
+    frames.extend(drain_frames(&mut peer).await);
+    active_takeover_assert_frames(&frames, usize::from(active), 1);
+    for id in ["take-q1", "take-q3"] {
+        assert_eq!(
+            f.hub_store()
+                .get_for_device(id, "dev-1")
+                .unwrap()
+                .unwrap()
+                .state,
+            ActionState::Queued,
+            "{id}"
+        );
+    }
+    let pause_token: String = f
+        .conn
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT pause_token FROM codex_queue_pause WHERE thread_id = ?1 AND pause_reason = 'user_hold'",
+            [THREAD],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(pause_token, "take-user-pause");
+    orphan_assert_unknown(&f);
+    let old_resolutions: Vec<String> = f.conn.lock().unwrap().prepare(
+        "SELECT reason FROM codex_barrier_resolutions WHERE source_action_id = 'act-verified-old'",
+    ).unwrap().query_map([], |row| row.get(0)).unwrap().map(Result::unwrap).collect();
+    assert_eq!(old_resolutions, vec!["explicit_takeover"]);
+    assert!(matches!(
+        foreground_arrived.try_recv(),
+        Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+    ));
+    release_foreground.send(()).unwrap();
+    release_background
+        .send(())
+        .expect("后台对账在所有断言完成前仍被阻塞");
+}
+
+#[cfg(debug_assertions)]
+#[tokio::test]
+async fn prioritize_with_delayed_history_dispatches_idle_target() {
+    prioritize_with_delayed_history_case(false, None).await;
+}
+
+#[cfg(debug_assertions)]
+#[tokio::test]
+async fn prioritize_with_delayed_history_waits_for_exact_turn_after_nonempty_ack() {
+    prioritize_with_delayed_history_case(true, Some("turn-t")).await;
+}
+
+#[cfg(debug_assertions)]
+#[tokio::test]
+async fn prioritize_with_delayed_history_waits_for_exact_turn_after_empty_ack() {
+    prioritize_with_delayed_history_case(true, None).await;
 }
 
 async fn idle_takeover_success(paused: bool, empty_fence: bool) {
@@ -26307,7 +26481,7 @@ async fn t06_prioritize_stop_claim_write_failure_never_sends_stop() {
 }
 
 #[tokio::test]
-async fn queue_edit_priority_phone_turn_reconciles_before_dispatch() {
+async fn queue_edit_priority_phone_turn_reconciles_in_background() {
     let mut f = fixture_ipc_interrupt(vec![codex_app_session(THREAD)]);
     let mut peer = f.peer.take().unwrap();
     let (_sse, _) = sse_hold_ensure(&f, &mut peer, THREAD, vec![], "idle").await;
@@ -26346,6 +26520,8 @@ async fn queue_edit_priority_phone_turn_reconciles_before_dispatch() {
         .codex_control
         .router
         .is_turn_active_public(&f.thread_key()));
+    assert_eq!(b6_rework_dispatch_state(&f, "act-original").0, 1);
+    b6_rework_start_scheduler(&f, 60_000).await;
 
     // ① 三条入队（忙态 FIFO）：Q1、Q2 旧队列 + Q3 目标
     t06_enqueue_busy(&f, "队列消息甲", "act-q1").await;
@@ -26401,6 +26577,17 @@ async fn queue_edit_priority_phone_turn_reconciles_before_dispatch() {
         "result": { "interruptedTurnId": "t-live", "ok": true }
     }))
     .await;
+    let hub = &f.state.codex_control;
+    #[cfg(debug_assertions)]
+    let resume_background = {
+        let (arrived, resume) = hub.gate_next_settlement_before_completion_for_test(THREAD);
+        active_takeover_snapshot(&f, &mut peer, 12, "t-live", "inProgress", "active").await;
+        tokio::time::timeout(Duration::from_secs(5), arrived)
+            .await
+            .unwrap()
+            .unwrap();
+        resume
+    };
     // 精确确认被停回合的终态。
     active_takeover_snapshot(&f, &mut peer, 13, "t-live", "interrupted", "idle").await;
     // 第二帧：Q3 恰好一帧 start-turn（原正文、原 actionId 的持久 cmid）
@@ -26442,6 +26629,60 @@ async fn queue_edit_priority_phone_turn_reconciles_before_dispatch() {
     assert_eq!(v["result"], "prioritized", "{v}");
     assert_eq!(v["actionId"], "act-q3", "{v}");
     assert_eq!(v["receipt"]["delivery"], "accepted", "{v}");
+
+    let successor_owner = hub
+        .router
+        .observe_turn_owner(&f.thread_key(), "act-q3")
+        .unwrap();
+    #[cfg(debug_assertions)]
+    {
+        assert!(!hub
+            .adapter
+            .turn_evidence_terminal(&f.thread_key(), "t-live"));
+        assert_eq!(b6_rework_dispatch_state(&f, "act-original").0, 1);
+        f.conn.lock().unwrap().execute_batch(
+            "CREATE TEMP TRIGGER fail_original_verified BEFORE INSERT ON codex_barrier_resolutions
+             WHEN NEW.source_action_id = 'act-original' AND NEW.reason = 'verified_complete'
+             BEGIN SELECT RAISE(ABORT, 'original_verified_sentinel'); END;",
+        ).unwrap();
+        let (retry_arrived, resume_retry) =
+            hub.gate_next_settlement_before_completion_for_test(THREAD);
+        resume_background.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), retry_arrived)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(b6_rework_dispatch_state(&f, "act-original").0, 1);
+        f.conn
+            .lock()
+            .unwrap()
+            .execute_batch("DROP TRIGGER fail_original_verified")
+            .unwrap();
+        resume_retry.send(()).unwrap();
+    }
+    b6_rework_wait(
+        || {
+            f.conn
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT EXISTS (SELECT 1 FROM codex_barrier_resolutions
+                 WHERE source_action_id = 'act-original' AND reason = 'verified_complete'
+                   AND evidence_turn_id = 't-live')",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        },
+        "后台调度必须核销已终态的原手机回合",
+    )
+    .await;
+    assert_eq!(b6_rework_dispatch_state(&f, "act-original").0, 0);
+    assert_eq!(b6_rework_dispatch_state(&f, "act-q3").0, 1);
+    assert_eq!(
+        hub.router.observe_turn_owner(&f.thread_key(), "act-q3"),
+        Some(successor_owner)
+    );
 
     // 帧分别计数：恰一次 interrupt + Q3 恰一帧；Q1/Q2 零帧
     frames.extend(drain_frames(&mut peer).await);

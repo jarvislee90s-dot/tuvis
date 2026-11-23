@@ -2891,7 +2891,7 @@ mod tests {
 
     /// file / session-files 端点矩阵：gate 403 → 缺参 400 → 会话不存在 404 →
     /// cwd 内文本 200（JSON 载荷 + no-store）→ 图片 200（二进制 + Content-Type）→
-    /// 越界 403 → 超限 403（与越界不可区分，探测面最小化，进度台账 #12）
+    /// 文件不存在、目录、超限和 I/O 错误各返回 403 与对应原因码。
     #[tokio::test]
     async fn file_endpoints_are_gated_and_safe() {
         let tmp = tempfile::tempdir().unwrap();
@@ -3016,6 +3016,8 @@ mod tests {
         for uri in [
             "/m/api/v1/file?path=hello.txt",
             "/m/api/v1/file?session_id=sess_file",
+            "/m/api/v1/file?session_id=sess_file&path=",
+            "/m/api/v1/file?session_id=sess_file&path=%20",
             "/m/api/v1/file?session_id=%20&path=hello.txt",
         ] {
             let r = app
@@ -3118,38 +3120,27 @@ mod tests {
         );
         assert_eq!(header(&r, "x-content-type-options"), "nosniff");
 
-        // (6) 不存在（两平台都不存在的人造路径——勿用 /etc/passwd 之类真实系统
-        // 路径：Linux CI 上它真实存在，全盘放开语义下 200 是正确行为而非失败）
-        // → 403 + 原因码 not_found（M5 P2-a：原因写在报错处，仅已过闸设备可见）
-        let r = app
-            .clone()
-            .oneshot(req(
-                "GET",
-                "/m/api/v1/file?session_id=sess_file&path=/no-such-mam-fixture/nope.txt",
-                Some("mam_device=fe"),
-                None,
-            ))
-            .await
-            .unwrap();
-        assert_eq!(r.status(), 403, "不存在必须 403");
-        let b = body_string(r).await;
-        assert!(b.contains("not_found"), "403 体必须带原因码 not_found: {b}");
-
-        // (7) 超限 → 403 + 原因码 too_large（与 (6) 可区分——M5 P2-a 裁决：
-        // 原因写在报错处，替代旧「空体不可区分」口径）
-        let r = app
-            .clone()
-            .oneshot(req(
-                "GET",
-                "/m/api/v1/file?session_id=sess_file&path=big.txt",
-                Some("mam_device=fe"),
-                None,
-            ))
-            .await
-            .unwrap();
-        assert_eq!(r.status(), 403, "超限必须 403");
-        let b = body_string(r).await;
-        assert!(b.contains("too_large"), "403 体必须带原因码 too_large: {b}");
+        // (6–7) 已认证请求的文件读取失败 → 403 + 结构化原因码。
+        for (path, reason) in [
+            ("nope.txt", "not_found"),
+            (".", "not_file"),
+            ("big.txt", "too_large"),
+            ("invalid%00name.txt", "io"),
+        ] {
+            let r = app
+                .clone()
+                .oneshot(req(
+                    "GET",
+                    &format!("/m/api/v1/file?session_id=sess_file&path={path}"),
+                    Some("mam_device=fe"),
+                    None,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(r.status(), 403, "{path} 必须返回 403");
+            let body: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+            assert_eq!(body["error"], reason, "{path} 必须返回对应的原因码");
+        }
 
         // (8) /session-files：缺参 400 → 命中 200 {files:[...]} + no-store
         let r = app

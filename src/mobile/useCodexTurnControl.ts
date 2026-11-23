@@ -72,6 +72,7 @@ export interface CodexTurnControl {
  *  停止指令的 RPC 响应挂起不能无限转圈；到期按「结果不确定」呈现（指令可能已
  *  到达桌面端，重按 = 双发破坏性指令）。 */
 const STOP_DEADLINE_MS = 30_000;
+const STOP_RECONCILE_MS = 4_000;
 
 /** InterruptTurnResult → 停止结果分诊（照抄 CodexQueuePanel.interruptTurn 的三分支；
  *  单源导出：共享控制器与面板的非共享回退路径共用，不复制分诊逻辑）。 */
@@ -115,10 +116,16 @@ function readableStopError(e: ApiError): string {
 
 export function useCodexTurnControl(
   projection: ThreadProjection | null | undefined,
-  sessionId: string
+  sessionId: string,
+  refreshProjection?: () => Promise<void>
 ): CodexTurnControl {
   const [stopping, setStopping] = useState(false);
   const [result, setResult] = useState<CodexTurnStopResult | null>(null);
+  const [resolvedTarget, setResolvedTarget] = useState<{
+    sessionId: string;
+    turnId: string;
+    awaitingProjection: boolean;
+  } | null>(null);
   /** stopping 的同步镜像（双击在同一渲染帧内进入两次 stop() 时，state 闭包里
    *  的旧值仍是 false——ref 同步读写，第二次必然命中第一次写入的闸） */
   const stoppingRef = useRef(false);
@@ -142,13 +149,27 @@ export function useCodexTurnControl(
   // 执行停止；turnRunning 而 canStop=false 的组合（断链/目标不明/能力不足）由
   // 消费方就近显示短状态（spec §5 最后行）。
   const fresh = projection != null && projection.stale !== true;
-  const turnRunning = projection?.runtimeStatus === "active";
   const interruptAllowed = projection?.effectiveOperations?.operations?.interrupt?.allowed === true;
+  const projectedTurnId = projection?.activeTurnId;
+  // 停止回执只否定本次目标，不能否定后来启动的其他回合。
+  const targetResolved =
+    resolvedTarget?.sessionId === sessionId && resolvedTarget.turnId === projectedTurnId;
+  const targetMissing = targetResolved && !resolvedTarget.awaitingProjection;
+  const turnRunning = projection?.runtimeStatus === "active" && !targetMissing;
   const activeTurnId =
-    fresh && typeof projection.activeTurnId === "string" && projection.activeTurnId.length > 0
-      ? projection.activeTurnId
+    fresh && !targetMissing && typeof projectedTurnId === "string" && projectedTurnId.length > 0
+      ? projectedTurnId
       : null;
-  const canStop = turnRunning && fresh && interruptAllowed && activeTurnId !== null;
+  const canStop = !targetResolved && turnRunning && interruptAllowed && activeTurnId !== null;
+
+  useEffect(() => {
+    if (!resolvedTarget?.awaitingProjection) return;
+    // 受理回执不是终态。短暂等待投影更新，缺帧时允许重新操作仍然活跃的回合。
+    const timer = setTimeout(() => {
+      setResolvedTarget((current) => (current === resolvedTarget ? null : current));
+    }, STOP_RECONCILE_MS);
+    return () => clearTimeout(timer);
+  }, [resolvedTarget]);
 
   const clearResult = useCallback(() => setResult(null), []);
 
@@ -189,6 +210,17 @@ export function useCodexTurnControl(
       // 预算已到期 / 代际已前进 / 会话已切换 → 迟到响应作废（不覆盖已呈现状态）
       if (timedOut || epochRef.current !== myEpoch || sessionRef.current !== sid) return null;
       const triaged = triageInterruptResult(res);
+      if (
+        triaged.kind === "no_active_turn" ||
+        (triaged.kind === "interrupted" && triaged.turnId === frozenTurnId)
+      ) {
+        setResolvedTarget({
+          sessionId: sid,
+          turnId: frozenTurnId,
+          awaitingProjection: triaged.kind === "interrupted",
+        });
+        void refreshProjection?.().catch(() => undefined);
+      }
       setResult(triaged);
       return triaged;
     } catch (e) {
@@ -209,7 +241,7 @@ export function useCodexTurnControl(
         setStopping(false);
       }
     }
-  }, [activeTurnId, canStop, sessionId]);
+  }, [activeTurnId, canStop, refreshProjection, sessionId]);
 
   // 换会话：清结果与在飞标记（旧会话的停止现场不带入新会话；在途响应经会话哨兵
   // 作废），并前移会话哨兵（渲染期不写 ref——react-hooks/refs 纪律；effect 先于
@@ -220,6 +252,7 @@ export function useCodexTurnControl(
     stoppingRef.current = false;
     setStopping(false);
     setResult(null);
+    setResolvedTarget(null);
     return () => {
       if (timerRef.current !== null) {
         clearTimeout(timerRef.current);
