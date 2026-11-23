@@ -345,10 +345,9 @@ export default function CodexQueuePanel({
   const [resumeBusy, setResumeBusy] = useState(false);
   /** T06：优先处理的确认臂（哪个 queued 行处于确认态；未确认不发任何请求） */
   const [prioritizeArmedId, setPrioritizeArmedId] = useState<string | null>(null);
-  /** C04（队列展示收纳）：默认折叠成一行摘要；展开才渲染消息行/暂停说明/恢复/
-   *  解除臂。收起只隐藏界面——armed 确认、在途操作、note 都保留在组件状态里，
-   *  切换本身不触发任何请求、不清暂停。新消息入队只经 refreshSignal 更新计数。 */
-  const [expanded, setExpanded] = useState(false);
+  /** 每次挂载默认展开。收起只隐藏界面，刷新和空队列自隐都保留用户选择，
+   *  确认状态、在途操作和提示也继续保存在组件中。 */
+  const [expanded, setExpanded] = useState(true);
   /** T06：优先处理请求在飞（按行禁用；回执关联原 actionId） */
   const [prioritizeBusyId, setPrioritizeBusyId] = useState<string | null>(null);
   const operationBusy = busyId !== null || forceBusy || resumeBusy || prioritizeBusyId !== null;
@@ -669,10 +668,11 @@ export default function CodexQueuePanel({
         const queuedRefusal = res.result === "not_sent" && res.queued;
         const feedback = { snapshot: null as CodexQueueView | null, ready: false };
         const copy = (snapshot: CodexQueueView | null) => {
-          if (!matches || (res.result === "prioritized" && !accepted)) {
-            return i18n.t("mobile.codex.queue.prioritizeResultUncertain");
-          }
-          if (res.result === "already_dispatched" && res.action.actionId !== actionId) {
+          if (
+            !matches ||
+            (res.result === "prioritized" && !accepted) ||
+            (res.result === "already_dispatched" && res.action.actionId !== actionId)
+          ) {
             return i18n.t("mobile.codex.queue.prioritizeResultUncertain");
           }
           if (queuedRefusal) {
@@ -722,7 +722,7 @@ export default function CodexQueuePanel({
         }
       } catch (e) {
         // catch 入口同样先验归属：旧 op 不得写 note/发旧 scope 收尾 GET。
-        if (sessionRef.current !== sid || prioritizeOpRef.current !== op) return;
+        if (!isCurrent()) return;
         // HTTP/网络错误按状态/码保守可读化（不裸码、不宣称队列状态、不建议直接
         // 重发，指引先回桌面核对实际状态）；wire 的 status/code 由 ApiError 原样
         // 保留（诊断不丢）。
@@ -732,7 +732,7 @@ export default function CodexQueuePanel({
         // 错误臂唯一收尾 GET（有界预算；load 自身归 null，不因 GET 失败/超时
         // 进入另一条补确认 GET 的路径）。
         await load({ timeoutMs: QUEUE_OP_REFRESH_TIMEOUT_MS });
-        if (sessionRef.current !== sid || prioritizeOpRef.current !== op) return;
+        if (!isCurrent()) return;
       }
       setPrioritizeBusyId(null);
       // 停止受理会置暂停/改变 send-info 可用性 → 通知上层（与打断臂同口径）
@@ -752,15 +752,14 @@ export default function CodexQueuePanel({
   );
 
   if (view === null) return null;
-  // 全空且无暂停原因：面板自隐（不渲染空壳）。
-  // T05（spec §5 细则 2）：没有排队消息、没有真实未知投递屏障时，**不因正在运行
-  // 就展开整段队列提醒**——仅 native_turn_active（桌面回合在跑、无屏障、无待发）
-  // 时不再出长说明与打断臂：停止入口由 composer 主按钮/紧凑入口承担（同一共享
-  // 控制器）。真实 Unknown（native_delivery_unknown，无自动恢复路径）与在途投递
-  // 屏障（native_turn_pending/compat_outstanding）不在此列——核对/解除入口保留。
+  // 零条待发时，普通运行态由发送区显示；只保留需人工核对或解除的屏障。
+  const needsManualResume = view.queuePaused === true && !stopPauseAutoResumes;
   const emptyHidden =
+    !needsManualResume &&
     view.actions.length === 0 &&
-    (view.blockedReasonCode === null || view.blockedReasonCode === "native_turn_active");
+    (view.blockedReasonCode === null ||
+      view.blockedReasonCode === "native_turn_active" ||
+      view.blockedReasonCode === "native_turn_pending");
   // 操作收尾的反馈（Unknown 核对提示 / HTTP·网络保守错误）不随空视图被吞：
   // 收尾 GET [] 把队列清空时，复用同一 note 反馈区域最小呈现（未操作空队列
   // note 为空仍按原自隐，不加壳不加新入口）。
@@ -836,8 +835,7 @@ export default function CodexQueuePanel({
       data-testid="codex-queue-panel"
       className="rounded-xl border border-[var(--cb)] bg-[var(--cbg)] px-3 py-2"
     >
-      {/* C04：折叠摘要（默认只占一行）。Unknown 待人工核对在折叠行明确提示，
-          点「查看」即进入处理；新消息入队只经 refreshSignal 更新这里的计数。
+      {/* 收起时仍显示摘要，包括待人工核对状态。新消息入队时刷新计数。
           data-* 供测试做语言无关断言。 */}
       <div className="flex flex-wrap items-center gap-2">
         <span
@@ -854,6 +852,7 @@ export default function CodexQueuePanel({
         <button
           type="button"
           data-testid="codex-queue-toggle"
+          aria-expanded={expanded}
           onClick={() => setExpanded((v) => !v)}
           className="ml-auto rounded-full border border-[var(--bd)] px-2 py-0.5 text-xs text-[var(--mut)] underline"
         >
@@ -872,8 +871,10 @@ export default function CodexQueuePanel({
             </p>
           )}
           {/* 停止产生的临时冻结会随目标终态解除，其他暂停需要手动恢复。 */}
-          {(view.actions.length > 0 || (view.blockedActionIds?.length ?? 0) > 0) &&
-            view.queuePaused === true && (
+          {view.queuePaused === true &&
+            (needsManualResume ||
+              view.actions.length > 0 ||
+              (view.blockedActionIds?.length ?? 0) > 0) && (
               <div data-testid="codex-queue-paused-block" className="mt-1">
                 <p
                   data-testid="codex-queue-paused"

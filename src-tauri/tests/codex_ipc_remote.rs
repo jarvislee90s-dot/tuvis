@@ -26295,7 +26295,7 @@ async fn t06_prioritize_stop_pre_write_failure_releases_claim_for_retry() {
     let (_, client_id) = f.hub_store().action_thread_and_cmid("act-q3").unwrap();
     {
         let c = conn.lock().unwrap();
-        c.execute_batch("CREATE TEMP TABLE prewrite_claim_evidence(state TEXT); CREATE TEMP TRIGGER prewrite_pause_failure BEFORE INSERT ON codex_queue_pause WHEN NEW.pause_reason = 'interrupt_pending' AND NEW.pause_turn_id = 't-live' BEGIN INSERT INTO prewrite_claim_evidence SELECT stop_attempt_state FROM codex_actions WHERE action_id = 'act-q3'; SELECT RAISE(FAIL, 'prewrite_pause_sentinel'); END;").unwrap();
+        c.execute_batch("CREATE TEMP TRIGGER prewrite_pause_failure BEFORE INSERT ON codex_queue_pause WHEN NEW.pause_reason = 'interrupt_pending' AND NEW.pause_turn_id = 't-live' AND (SELECT stop_attempt_state FROM codex_actions WHERE action_id = 'act-q3') = 'claimed' BEGIN SELECT RAISE(FAIL, 'prewrite_pause_sentinel'); END;").unwrap();
     }
     let r = post_prioritize(&f, prioritize_body("act-q3", Some("t-live"), true).await).await;
     assert_eq!(r.status(), axum::http::StatusCode::INTERNAL_SERVER_ERROR);
@@ -26307,14 +26307,6 @@ async fn t06_prioritize_stop_pre_write_failure_releases_claim_for_retry() {
         .contains("CODEX_INTERRUPT_PAUSE_WRITE_FAILED"));
     {
         let c = conn.lock().unwrap();
-        let evidence: Vec<String> = c
-            .prepare("SELECT state FROM prewrite_claim_evidence")
-            .unwrap()
-            .query_map([], |row| row.get(0))
-            .unwrap()
-            .map(Result::unwrap)
-            .collect();
-        assert_eq!(evidence, vec!["claimed"], "失败发生时目标已取得停止占有");
         c.execute_batch("DROP TRIGGER prewrite_pause_failure;")
             .unwrap();
     }
@@ -26419,6 +26411,317 @@ async fn t06_prioritize_stop_pre_write_failure_releases_claim_for_retry() {
         let consumed: i64 = c.query_row("SELECT count(*) FROM codex_bypass_grant WHERE action_id = 'act-q3' AND consumed_at IS NOT NULL", [], |row| row.get(0)).unwrap();
         assert_eq!(consumed, 1);
     }
+    f.state.codex_control.adapter.shutdown().await;
+}
+
+/// 精确停止后写前忙，原请求应单条重试，期间普通接力不得把两项合并。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn t06_exact_stop_priority_retries_known_zero_without_batching() {
+    priority_retries_known_zero_without_batching(true, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn t06_idle_priority_retries_known_zero_without_batching() {
+    priority_retries_known_zero_without_batching(false, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn t06_priority_cannot_cross_a_replaced_active_turn() {
+    priority_retries_known_zero_without_batching(false, true).await;
+}
+
+async fn priority_retries_known_zero_without_batching(stop_first: bool, replace_turn: bool) {
+    use multi_agents_manager_lib::services::codex_control::router::PriorityTestPoint;
+
+    let mut f = fixture_ipc_interrupt(vec![codex_app_session(THREAD)]);
+    let mut peer = f.peer.take().unwrap();
+    let (_sse, _) = sse_hold_ensure(&f, &mut peer, THREAD, vec![], "active").await;
+    t06_enqueue_busy(&f, "选中消息", "retry-selected").await;
+    t06_enqueue_busy(&f, "后续消息", "retry-other").await;
+
+    let checked = Arc::new(tokio::sync::Notify::new());
+    let (release, wait) = std::sync::mpsc::sync_channel(1);
+    let wait = StdMutex::new(Some(wait));
+    let checked_by_hook = checked.clone();
+    f.state
+        .codex_control
+        .router
+        .set_priority_interleave_gate(Some(Arc::new(move |point, _, action| {
+            if point == PriorityTestPoint::AfterTakeoverIntentCheck && action == "retry-selected" {
+                if let Some(wait) = wait.lock().unwrap().take() {
+                    checked_by_hook.notify_one();
+                    wait.recv_timeout(Duration::from_secs(5)).unwrap();
+                }
+            }
+        })));
+    if !stop_first {
+        f.hub_store()
+            .set_queue_pause(&f.thread_key(), "user_hold", "idle-retry-test", None)
+            .unwrap();
+        active_takeover_snapshot(&f, &mut peer, 11, "t-live", "completed", "idle").await;
+    }
+    let body = prioritize_body("retry-selected", stop_first.then_some("t-live"), stop_first).await;
+    let app = f.app.clone();
+    let mut task = tokio::spawn(async move {
+        app.oneshot(req(
+            "POST",
+            "/m/api/v1/codex/queue/prioritize",
+            Some(COOKIE),
+            Some(body),
+        ))
+        .await
+        .unwrap()
+    });
+    if stop_first {
+        let stop = recv_within(&mut peer, 5).await;
+        assert_eq!(stop["method"], "thread-follower-interrupt-turn", "{stop}");
+        assert_eq!(stop["params"]["expectedTurnId"], "t-live");
+        peer.send(&serde_json::json!({"type":"response","requestId":stop["requestId"],"resultType":"success","method":"thread-follower-interrupt-turn","result":{"interruptedTurnId":"t-live","ok":true}})).await;
+        active_takeover_snapshot(&f, &mut peer, 11, "t-live", "interrupted", "idle").await;
+    }
+    tokio::time::timeout(Duration::from_secs(5), checked.notified())
+        .await
+        .unwrap();
+    active_takeover_snapshot(&f, &mut peer, 12, "t-live", "interrupted", "unknown").await;
+    assert!(
+        f.state
+            .codex_control
+            .adapter
+            .pre_write_snapshot(&f.thread_key())
+            .0
+    );
+    if replace_turn {
+        active_takeover_snapshot(&f, &mut peer, 13, "new-local-turn", "inProgress", "active").await;
+        active_takeover_snapshot(&f, &mut peer, 14, "t-live", "completed", "idle").await;
+        release.send(()).unwrap();
+        let response = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap();
+        let payload: serde_json::Value =
+            serde_json::from_str(&body_string(response).await).unwrap();
+        assert_eq!(payload["result"], "not_sent", "{payload}");
+        assert_eq!(payload["queued"], true, "{payload}");
+        assert!(
+            drain_frames(&mut peer).await.is_empty(),
+            "见过的新回合即使已消失也不得沿用旧插队授权"
+        );
+        f.state.codex_control.adapter.shutdown().await;
+        return;
+    }
+    release.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let requeued: bool = f.conn.lock().unwrap().query_row(
+                "SELECT EXISTS(SELECT 1 FROM codex_actions a JOIN codex_bypass_grant g USING(action_id) WHERE a.action_id='retry-selected' AND a.state='queued' AND g.attempt=1 AND g.consumed_at IS NOT NULL)",
+                [], |row| row.get(0),
+            ).unwrap();
+            if requeued { break; }
+            tokio::task::yield_now().await;
+        }
+    }).await.expect("第一次授权消费后的确定零写回队");
+    active_takeover_snapshot(&f, &mut peer, 13, "t-live", "interrupted", "idle").await;
+    let start = tokio::select! {
+        response = &mut task => panic!("选中项重试前返回: {}", body_string(response.unwrap()).await),
+        frame = tokio::time::timeout(Duration::from_secs(5), peer.recv()) => frame.unwrap(),
+    };
+    assert_eq!(start["method"], "thread-follower-start-turn", "{start}");
+    assert_eq!(start_turn_text(&start), "选中消息");
+    confirm_client_message_identity_for(
+        &mut peer,
+        THREAD,
+        &start,
+        "turn-selected",
+        "选中消息",
+        14,
+        "owner-1",
+    )
+    .await;
+    peer.send(&serde_json::json!({"type":"response","requestId":start["requestId"],"resultType":"success","method":"thread-follower-start-turn","handledByClientId":"owner-1","result":{"turn":{"id":"turn-selected","status":"inProgress"}}})).await;
+    let response = tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .unwrap()
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
+    assert_eq!(payload["result"], "prioritized", "{payload}");
+    assert_eq!(
+        f.hub_store()
+            .get_for_device("retry-other", "dev-1")
+            .unwrap()
+            .unwrap()
+            .state,
+        ActionState::Queued
+    );
+    assert!(
+        drain_frames(&mut peer).await.is_empty(),
+        "恰好一个停止帧和一个发送帧"
+    );
+    f.state.codex_control.adapter.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn t06_resume_during_exact_stop_revokes_selected_dispatch() {
+    let mut f = fixture_ipc_interrupt(vec![codex_app_session(THREAD)]);
+    let mut peer = f.peer.take().unwrap();
+    let (_sse, _) = sse_hold_ensure(&f, &mut peer, THREAD, vec![], "active").await;
+    f.state.codex_control.set_reconcile_period_ms(100);
+    f.state.codex_control.start(f.state.clone());
+    t06_enqueue_busy(&f, "先入队消息", "resume-first").await;
+    t06_enqueue_busy(&f, "选中后入队消息", "resume-selected").await;
+    let app = f.app.clone();
+    let body = prioritize_body("resume-selected", Some("t-live"), true).await;
+    let priority = tokio::spawn(async move {
+        app.oneshot(req(
+            "POST",
+            "/m/api/v1/codex/queue/prioritize",
+            Some(COOKIE),
+            Some(body),
+        ))
+        .await
+        .unwrap()
+    });
+    let stop = recv_within(&mut peer, 5).await;
+    assert_eq!(stop["method"], "thread-follower-interrupt-turn", "{stop}");
+    let response = f
+        .app
+        .clone()
+        .oneshot(req(
+            "POST",
+            "/m/api/v1/codex/queue/resume",
+            Some(COOKIE),
+            Some(serde_json::json!({"sessionId": THREAD}).to_string()),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    peer.send(&serde_json::json!({"type":"response","requestId":stop["requestId"],"resultType":"success","method":"thread-follower-interrupt-turn","result":{"interruptedTurnId":"t-live","ok":true}})).await;
+    active_takeover_snapshot(&f, &mut peer, 11, "t-live", "interrupted", "idle").await;
+    let response = tokio::time::timeout(Duration::from_secs(5), priority)
+        .await
+        .unwrap()
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
+    assert_eq!(payload["result"], "not_sent", "{payload}");
+    assert!(f
+        .hub_store()
+        .queue_pause(&f.thread_key())
+        .unwrap()
+        .is_none());
+    let start = recv_within(&mut peer, 5).await;
+    assert_eq!(start["method"], "thread-follower-start-turn", "{start}");
+    let text = start_turn_text(&start);
+    assert!(
+        text.find("先入队消息").unwrap() < text.find("选中后入队消息").unwrap(),
+        "{start}"
+    );
+    f.state.codex_control.adapter.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn t06_idle_priority_writer_deadline_leaves_queue_held_for_resume() {
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let gate = Arc::new(TakeoverWriteGate::default());
+    let adapter = Arc::new(DesktopIpcAdapter::new(
+        Arc::new(StaticConnector::new(Box::new(TakeoverGatedIo {
+            io: client,
+            gate: gate.clone(),
+        }))),
+        caps_open_profile(),
+    ));
+    let mut f = fixture_with(
+        vec![codex_app_session(THREAD)],
+        move |store| Arc::new(CodexControlHub::with_adapter(store, adapter, true)),
+        Some(ScriptedPeer::from_stream(server)),
+    );
+    let mut peer = f.peer.take().unwrap();
+    let (_sse, _) = sse_hold_ensure(&f, &mut peer, THREAD, vec![], "active").await;
+    t06_enqueue_busy(&f, "先入队消息", "deadline-first").await;
+    t06_enqueue_busy(&f, "选中后入队消息", "deadline-selected").await;
+    f.hub_store()
+        .set_queue_pause(&f.thread_key(), "user_hold", "deadline-test", None)
+        .unwrap();
+    active_takeover_snapshot(&f, &mut peer, 11, "t-live", "completed", "idle").await;
+    gate.arm();
+    let app = f.app.clone();
+    let body = serde_json::json!({"sessionId":THREAD,"actionId":"deadline-selected","confirmInterrupt":false,"frontBudgetMs":2000}).to_string();
+    let mut priority = tokio::spawn(async move {
+        app.oneshot(req(
+            "POST",
+            "/m/api/v1/codex/queue/prioritize",
+            Some(COOKIE),
+            Some(body),
+        ))
+        .await
+        .unwrap()
+    });
+    tokio::select! {
+        reached = tokio::time::timeout(Duration::from_secs(5), gate.entered.notified()) => {
+            reached.expect("真实 IPC writer 应在首字节前遇到背压");
+        }
+        response = &mut priority => panic!("首字节背压前提前返回: {}", body_string(response.unwrap()).await),
+    }
+    f.hub_store()
+        .clear_queue_pause_owned(&f.thread_key(), "deadline-test")
+        .unwrap();
+    let response = tokio::time::timeout(Duration::from_secs(5), priority)
+        .await
+        .unwrap()
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
+    assert!(
+        payload["result"] == "unknown"
+            || (payload["result"] == "not_sent" && payload["queued"] == true),
+        "{payload}"
+    );
+    wait_action_state(
+        &f,
+        "deadline-selected",
+        ActionState::Queued,
+        Duration::from_secs(5),
+    )
+    .await;
+    // 不唤醒 transport 也必须先回队，放开后不得写出过期帧。
+    gate.release();
+    assert_eq!(
+        f.hub_store()
+            .queue_pause(&f.thread_key())
+            .unwrap()
+            .unwrap()
+            .pause_reason,
+        "priority_hold"
+    );
+    assert!(
+        drain_frames(&mut peer).await.is_empty(),
+        "截止后零帧且不自动接力"
+    );
+    assert!(f
+        .state
+        .codex_control
+        .router
+        .flush_thread(&f.thread_key())
+        .await
+        .is_none());
+    f.state.codex_control.set_reconcile_period_ms(100);
+    f.state.codex_control.start(f.state.clone());
+    let response = f
+        .app
+        .clone()
+        .oneshot(req(
+            "POST",
+            "/m/api/v1/codex/queue/resume",
+            Some(COOKIE),
+            Some(serde_json::json!({"sessionId": THREAD}).to_string()),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let start = recv_within(&mut peer, 5).await;
+    assert_eq!(start["method"], "thread-follower-start-turn", "{start}");
+    let text = start_turn_text(&start);
+    assert!(
+        text.find("先入队消息").unwrap() < text.find("选中后入队消息").unwrap(),
+        "{start}"
+    );
     f.state.codex_control.adapter.shutdown().await;
 }
 

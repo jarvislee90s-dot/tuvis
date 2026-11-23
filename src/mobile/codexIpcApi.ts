@@ -289,8 +289,10 @@ export interface ProjectedMessage {
   turnImageCount?: number;
   /** 仅服务端预算省略的附件数；与 UI 的 12 图／6 chip 展示限额无关。 */
   omittedArtifactCount?: number;
-  /** T03：正式答复摘要（正文不再重复内部信封标记）。 */
+  /** 兼容旧载荷和客户端的首条正式答复。 */
   interactionAnswer?: CodexInteractionAnswerSummary | null;
+  /** 同一用户消息内的正式答复，按信封顺序排列。 */
+  interactionAnswers?: CodexInteractionAnswerSummary[];
 }
 
 /** T02：逐操作键（serde snake_case）。 */
@@ -582,8 +584,14 @@ const CONTENT_STATES = new Set(["loading", "ready", "partial", "unsupported"]);
  *  缺省 ≠ 服务端省略：`omittedArtifactCount` 只由后端预算给出，旧载荷不会被伪造成
  *  「有附件被省略」。 */
 function normalizeProjectedMessage(message: ProjectedMessage): ProjectedMessage {
+  const { interactionAnswer, interactionAnswers, ...rest } = message;
+  const legacyAnswer = asInteractionAnswer(interactionAnswer);
+  const group = Array.isArray(interactionAnswers)
+    ? interactionAnswers.map(asInteractionAnswer).filter((answer) => answer !== null)
+    : [];
+  if (group.length === 0 && legacyAnswer) group.push(legacyAnswer);
   return {
-    ...message,
+    ...rest,
     turnId: message.turnId ?? null,
     artifacts: Array.isArray(message.artifacts) ? message.artifacts : [],
     turnImageCount:
@@ -594,11 +602,8 @@ function normalizeProjectedMessage(message: ProjectedMessage): ProjectedMessage 
       typeof message.omittedArtifactCount === "number" && message.omittedArtifactCount >= 0
         ? message.omittedArtifactCount
         : 0,
-    // T03：正式答复摘要（缺省保持 undefined——不改变旧载荷的字段形状；
-    // 有值时归一化，脏值丢弃不半渲染）。
-    ...(message.interactionAnswer === undefined
-      ? {}
-      : { interactionAnswer: asInteractionAnswer(message.interactionAnswer) }),
+    ...(interactionAnswer === undefined ? {} : { interactionAnswer: legacyAnswer }),
+    ...(group.length > 0 ? { interactionAnswers: group } : {}),
   };
 }
 

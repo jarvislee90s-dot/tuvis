@@ -1013,6 +1013,7 @@ pub struct ThreadMirror {
     /// 冻结时要求 proof.lease 与 mirror.lease 全等、proof 仍 live；owner 失效
     /// 清状态时一并清除。
     owner_proof: Option<OwnerLeaseProof>,
+    priority_turn_scope: std::sync::Weak<PriorityTurnScope>,
     /// 已结算内容观察器：每次投影/分页在已算好的完整投影上顺带观察（不重投影）。
     /// 锁内只做一次指纹集合比较与交换，不跨 await、不记录正文或路径。
     content: Mutex<ContentObservation>,
@@ -1026,6 +1027,56 @@ impl Drop for ThreadMirror {
                 .lock()
                 .expect("ledger lock")
                 .release(&self.key, self.size);
+        }
+    }
+}
+
+/// 插队期间观察通过镜像验证的每一帧，记录本线程曾出现新回合的事实。
+pub(crate) struct PriorityTurnScope {
+    pub(crate) lease: OwnerLease,
+    expected_stop: Option<String>,
+    stop_terminal_seen: std::sync::atomic::AtomicBool,
+    invalid: std::sync::atomic::AtomicBool,
+}
+
+impl PriorityTurnScope {
+    pub(crate) fn invalid(&self) -> bool {
+        self.invalid.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn invalidate(&self) {
+        self.invalid
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    pub(crate) fn observed_stop_terminal(&self, turn_id: &str) -> bool {
+        self.expected_stop.as_deref() == Some(turn_id)
+            && self
+                .stop_terminal_seen
+                .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn observe(&self, mirror: &ThreadMirror) {
+        use std::sync::atomic::Ordering;
+        if self.invalid() {
+            return;
+        }
+        let expected = self.expected_stop.as_deref();
+        let (runtime, _) = mirror.operation_preview();
+        let expected_is_terminal = expected.is_some_and(|turn| mirror.turn_is_terminal(turn));
+        let old_turn_can_still_be_active = expected.is_some()
+            && !self.stop_terminal_seen.load(Ordering::Acquire)
+            && !expected_is_terminal;
+        // 补拉的历史可以包含陌生终态项。只有运行态或 inProgress 才能证明出现活动回合。
+        let conflicting_turn = mirror
+            .active_turn_ids()
+            .iter()
+            .any(|turn| !old_turn_can_still_be_active || expected != Some(*turn));
+        if conflicting_turn || (runtime == "active" && !old_turn_can_still_be_active) {
+            self.invalidate();
+        }
+        if expected_is_terminal {
+            self.stop_terminal_seen.store(true, Ordering::Release);
         }
     }
 }
@@ -1059,6 +1110,7 @@ impl ThreadMirror {
             budget_refused: false,
             raw_provenance: RawProvenance::None,
             owner_proof: None,
+            priority_turn_scope: std::sync::Weak::new(),
             content: Mutex::new(ContentObservation::default()),
         }
     }
@@ -1084,6 +1136,20 @@ impl ThreadMirror {
         >,
     ) {
         self.interaction_hints = hints;
+    }
+
+    pub(crate) fn watch_priority_turns(
+        &mut self,
+        expected_stop: Option<&str>,
+    ) -> Option<Arc<PriorityTurnScope>> {
+        let scope = Arc::new(PriorityTurnScope {
+            lease: self.lease()?.clone(),
+            expected_stop: expected_stop.map(str::to_owned),
+            stop_terminal_seen: std::sync::atomic::AtomicBool::new(false),
+            invalid: std::sync::atomic::AtomicBool::new(false),
+        });
+        self.priority_turn_scope = Arc::downgrade(&scope);
+        Some(scope)
     }
 
     /// T03：运行的只读预览（供 adapter 在**同一临界区内**求值策略，不重建投影）。
@@ -1697,6 +1763,9 @@ impl ThreadMirror {
 
     /// 标记过期（连接断开/缺口/预算超限）。保留最后视图但禁写（adapter 侧门）。
     pub fn mark_stale(&mut self) {
+        if let Some(scope) = self.priority_turn_scope.upgrade() {
+            scope.invalidate();
+        }
         self.revoke_hint_scope();
         self.stale = true;
     }
@@ -1709,6 +1778,9 @@ impl ThreadMirror {
     }
 
     fn clear_state(&mut self) {
+        if let Some(scope) = self.priority_turn_scope.upgrade() {
+            scope.invalidate();
+        }
         self.complete_rebuild = false;
         // owner 失效/清态：原料覆盖证明与绑定的 owner 活性证明一并撤销。
         self.raw_provenance = RawProvenance::None;
@@ -1762,6 +1834,10 @@ impl ThreadMirror {
         };
         if result.is_err() || self.stale {
             self.revoke_hint_scope();
+        } else if result.as_ref().is_ok_and(|effect| effect.changed) {
+            if let Some(scope) = self.priority_turn_scope.upgrade() {
+                scope.observe(self);
+            }
         }
         result
     }
@@ -2186,7 +2262,7 @@ impl ThreadMirror {
         }
         let mut all = project_full_messages(state);
         // H09：与 current 投影**同一份规范化产物**——先标注正式答复（剥离信封、
-        // 附 interactionAnswer），再做内容观察与分页；否则两条路径会对同一消息
+        // 附答复摘要），再做内容观察与分页；否则两条路径会对同一消息
         // 观察到不同的已结算内容，分页 token 被误判为 history_rewritten，且更早
         // 气泡仍显示原始信封。
         crate::services::codex_desktop_ipc::async_question::annotate_interaction_answers(
@@ -2634,11 +2710,12 @@ fn fingerprint_message(hash: &mut Fnv64, message: &ProjectedMessage) {
     serde_json::to_writer(&mut *hash, &message.artifacts).expect("附件只含 JSON 可序列化字段");
     // 正式答复规范化后 text 可能为空：答案/问题/关联状态改变同样改变用户可见内容，
     // 必须进入内容指纹（否则同 id 的 A→B 改写不会使旧分页 token 失效）。
-    if let Some(answer) = &message.interaction_answer {
-        hash.push_str(&answer.question_key);
-        hash.push_str(&answer.question);
-        hash.push_str(&answer.answer);
-        hash.write_bytes(&[u8::from(answer.correlated)]);
+    if message.interaction_answer.is_some() || !message.interaction_answers.is_empty() {
+        serde_json::to_writer(
+            hash,
+            &(&message.interaction_answer, &message.interaction_answers),
+        )
+        .expect("正式答复只含 JSON 可序列化字段");
     }
 }
 
@@ -2871,6 +2948,7 @@ fn project_full_messages(state: &Value) -> Vec<ProjectedMessage> {
                         omitted_artifact_count: batch.omitted,
                         turn_image_count: 0,
                         interaction_answer: None,
+                        interaction_answers: Vec::new(),
                     });
                 }
             }
@@ -2966,6 +3044,7 @@ fn project_full_messages(state: &Value) -> Vec<ProjectedMessage> {
                 omitted_artifact_count: batch.omitted,
                 turn_image_count: 0,
                 interaction_answer: None,
+                interaction_answers: Vec::new(),
             });
         }
     }
@@ -8742,6 +8821,7 @@ mod h09_review_fingerprint_tests {
                 answer: answer.into(),
                 correlated: true,
             }),
+            interaction_answers: Vec::new(),
         }
     }
 
@@ -8756,5 +8836,41 @@ mod h09_review_fingerprint_tests {
         let mut a2 = Fnv64::offset();
         fingerprint_message(&mut a2, &message("A"));
         assert_eq!(a.finish(), a2.finish(), "无变化读取指纹稳定");
+    }
+
+    #[test]
+    fn fingerprint_tracks_non_first_answer_content_order_and_length() {
+        let fingerprint = |answers: Value| {
+            let mut wire = serde_json::to_value(message("A")).unwrap();
+            wire["interactionAnswers"] = answers;
+            let decoded: ProjectedMessage = serde_json::from_value(wire).unwrap();
+            let mut hash = Fnv64::offset();
+            fingerprint_message(&mut hash, &decoded);
+            hash.finish()
+        };
+        let first = serde_json::to_value(message("A").interaction_answer).unwrap();
+        let second = serde_json::json!({
+            "questionKey": "q2", "question": "选第二个", "answer": "B", "correlated": true
+        });
+        let base = fingerprint(serde_json::json!([first, second]));
+        for (field, other) in [
+            ("questionKey", serde_json::json!("different")),
+            ("question", serde_json::json!("新题干")),
+            ("answer", serde_json::json!("C")),
+            ("correlated", serde_json::json!(false)),
+        ] {
+            let mut changed = second.clone();
+            changed[field] = other;
+            assert_ne!(
+                base,
+                fingerprint(serde_json::json!([first, changed])),
+                "{field}"
+            );
+        }
+        assert_ne!(base, fingerprint(serde_json::json!([second, first])));
+        assert_ne!(
+            base,
+            fingerprint(serde_json::json!([first, second, second]))
+        );
     }
 }

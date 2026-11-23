@@ -2107,6 +2107,14 @@ async fn settle_thread(hub: &Arc<CodexControlHub>, key: &ThreadKey) {
     // 队列按 FIFO 自然接力（下方 flush）。回合未终态（打断未生效/仍在跑）→ 暂停
     // 保持不动（「停止未生效就不要放行」的保护保留）；非停止类暂停行不受影响。
     auto_release_stop_pauses(hub, key, &projection).await;
+    match hub.router.store().clear_accepted_priority_holds(Some(key)) {
+        Ok(true) => hub.adapter.republish_thread_projection(key).await,
+        Ok(false) => {}
+        Err(e) => log::error!(
+            "codex_ipc: 插队暂停对账失败 thread={} err={e}",
+            key.thread_id
+        ),
+    }
     // ③ 接力下一条（try-lock 让路：在飞派发占锁时本函数直接 no-op）。
     // S2：UseFallback 消费臂随兜底臂删除——派发结果（含 NotSent 终态）都在
     // router 内落账，调用方无需再做任何「交接」消费。
@@ -2505,8 +2513,17 @@ impl AdapterDispatch {
         composed_text: &str,
         client_message_id: &str,
         deadline: crate::services::codex_desktop_ipc::budget::Deadline,
-        write_context: Option<crate::services::codex_desktop_ipc::types::FrameWriteContext>,
+        context: Option<crate::services::codex_control::router::LeasedSendContext>,
     ) -> crate::services::codex_control::BoxDispatchFut {
+        let scope_recheck = context.as_ref().and_then(|ctx| ctx.scope_recheck.clone());
+        let write_context = context.map(|ctx| {
+            Self::compose_frame_write_context(
+                Self::lease_keepalive_hook(ctx.lease),
+                ctx.priority_recheck,
+                ctx.admission,
+                ctx.first_write_deadline,
+            )
+        });
         let adapter = self.adapter.clone();
         let key = key.clone();
         let composed = composed_text.to_string();
@@ -2530,6 +2547,9 @@ impl AdapterDispatch {
             // 回队）。此刻按
             // ensure 后的最新镜像状态判定；忙 → 明确「写前零投递」原因码，router 会把
             // 动作放回队首（不消耗正文、不 fallback、不换 actionId）。
+            if let Some(reason) = scope_recheck.as_ref().and_then(|check| check()) {
+                return not_sent_outcome(&reason);
+            }
             let (busy, existing_turns) = adapter.pre_write_snapshot(&key);
             if busy {
                 return DispatchOutcome {
@@ -2568,6 +2588,14 @@ impl AdapterDispatch {
             // R6.3：回执时投影 revision 基线（完成证据的严格后续判定基准）
             let revision = adapter.projection(&key).await.revision;
             let mut out = outcome_of(outcome);
+            if scope_recheck.is_some()
+                && out.delivery == Delivery::NotSent
+                && out.reason_code.as_deref() == Some("front_budget_exhausted")
+            {
+                // writer 已证明零字节，前台预算到期后仍须将选中行保留在队中。
+                out.reason_code =
+                    Some(crate::services::codex_control::BUSY_BEFORE_WRITE_REASON.to_string());
+            }
             out.revision = revision;
             // **Turn 关联有效性**（2026-10-20 复审 P1）：Windows 证据表明忙态
             // start-turn 可能返回 success + 旧 Turn ID，而本次消息并未落进新 Turn。
@@ -2658,24 +2686,16 @@ impl AdapterDispatch {
     /// generation 链独立保留。
     fn compose_frame_write_context(
         keepalive: crate::services::codex_desktop_ipc::types::InteractionRecheck,
-        priority_recheck: Option<crate::services::codex_desktop_ipc::types::InteractionRecheck>,
-        admission: Option<
-            std::sync::Arc<crate::services::codex_desktop_ipc::types::AttemptAdmission>,
-        >,
+        priority_recheck: crate::services::codex_desktop_ipc::types::InteractionRecheck,
+        admission: std::sync::Arc<crate::services::codex_desktop_ipc::types::AttemptAdmission>,
+        first_write_deadline: Option<tokio::time::Instant>,
     ) -> crate::services::codex_desktop_ipc::types::FrameWriteContext {
-        let hook: crate::services::codex_desktop_ipc::types::InteractionRecheck =
-            match priority_recheck {
-                Some(priority) => std::sync::Arc::new(move || {
-                    if let Some(reason) = priority() {
-                        return Some(reason);
-                    }
-                    keepalive()
-                }),
-                None => keepalive,
-            };
         crate::services::codex_desktop_ipc::types::FrameWriteContext {
-            interaction_hook: Some(hook),
-            admission,
+            interaction_hook: Some(std::sync::Arc::new(move || {
+                priority_recheck().or_else(|| keepalive())
+            })),
+            admission: Some(admission),
+            first_write_deadline,
         }
     }
 }
@@ -2883,18 +2903,13 @@ impl crate::services::codex_control::router::LeasedDispatch for AdapterDispatch 
         deadline: crate::services::codex_desktop_ipc::budget::Deadline,
         context: crate::services::codex_control::router::LeasedSendContext,
     ) -> crate::services::codex_control::BoxDispatchFut {
-        let write_context = Self::compose_frame_write_context(
-            Self::lease_keepalive_hook(context.lease),
-            Some(context.priority_recheck),
-            Some(context.admission),
-        );
         self.send_text_with_hook(
             key,
             action_id,
             composed_text,
             client_message_id,
             deadline,
-            Some(write_context),
+            Some(context),
         )
     }
     fn answer_async_ordinary(
@@ -2914,8 +2929,9 @@ impl crate::services::codex_control::router::LeasedDispatch for AdapterDispatch 
         // Task7：keepalive 与调度准入伴随合成私有载体（租约强捕 + marker 随帧）。
         let write_context = Self::compose_frame_write_context(
             Self::lease_keepalive_hook(context.lease),
-            Some(context.priority_recheck),
-            Some(context.admission),
+            context.priority_recheck,
+            context.admission,
+            None,
         );
         let bypass_paused_queue = context.bypass_paused_queue;
         let route = context.route;
@@ -5515,6 +5531,7 @@ async fn stop_current_turn(
     device_name: &str,
     requested_turn_id: Option<String>,
     front: crate::services::codex_desktop_ipc::budget::Deadline,
+    priority_pause: Option<&str>,
 ) -> Result<StopTurnOutcome, Response> {
     // expectedTurnId：调用方给了就用；否则取在册原生屏障绑定的 turnId（安全阀）。
     // 复审 P1-1：两路都取不到 → 409 拒发；DB 读失败 → 500。**不得**降级为 None
@@ -5599,12 +5616,19 @@ async fn stop_current_turn(
     // T05：与 cancel 共用同一个**终止类前置暂停**辅助（单一出处；归属 token 语义一致）。
     // 终审 F3（Gate C 收紧）：暂停保护在**打断指令发出之前**建立（与队列派发互斥）；
     // **写失败 → 不发出打断指令**（保护建立不了就不开工），如实回 5xx。
-    let (pause_token, pause_pre_inserted) = match st
+    // 同一事务保护 Stop 与选中派发，Resume 同时解除两者。
+    let pause_token = crate::services::codex_desktop_ipc::types::new_uuid();
+    let (pause_pre_inserted, priority_pause_inserted) = match st
         .codex_control
-        // P3：暂停行绑定本次停止的目标回合——settle 按该 Turn 的终态证据自动
-        // 解除停止类暂停（回合未终态 = 停止未生效，暂停保持）。
-        .prepare_turn_stop_pause(key, "interrupt_pending", expected_turn_id.as_deref())
-    {
+        .router
+        .store()
+        .set_queue_pauses(
+            key,
+            "interrupt_pending",
+            &pause_token,
+            expected_turn_id.as_deref(),
+            priority_pause,
+        ) {
         Ok(result) => result,
         Err(e) => {
             log::error!("打断前置暂停写入失败（放弃本次打断，未向桌面发送任何指令）: {e}");
@@ -5619,7 +5643,7 @@ async fn stop_current_turn(
     };
     // 复审 R-T4：暂停状态变化有自己的可靠传播——前置**新落行**即重发布该线程
     // 投影（local_seq 决胜穿透），手机端不依赖 Desktop 状态帧做必然触发器。
-    if pause_pre_inserted {
+    if pause_pre_inserted || priority_pause_inserted {
         st.codex_control
             .adapter
             .republish_thread_projection(key)
@@ -5640,12 +5664,13 @@ async fn stop_current_turn(
     // 队列冻结」）；`queue_pause_set` 回执读**实际持久行**，读失败按 true 保守。
     let queue_pause_set = match outcome.delivery {
         Delivery::NotSent | Delivery::Rejected => {
-            match st
-                .codex_control
-                .router
-                .store()
-                .clear_queue_pause_owned(key, &pause_token)
-            {
+            let store = st.codex_control.router.store();
+            if let Some(token) = priority_pause.filter(|_| priority_pause_inserted) {
+                if let Err(e) = store.clear_queue_pause_owned(key, token) {
+                    log::error!("codex/queue/prioritize 未停止时解除选中派发暂停失败: {e}");
+                }
+            }
+            match store.clear_queue_pause_owned(key, &pause_token) {
                 Ok(removed) => {
                     if removed {
                         let still = st
@@ -5811,6 +5836,7 @@ pub async fn interrupt_turn(
         &device_name,
         req.turn_id.clone(),
         front_deadline,
+        None,
     )
     .await
     {
@@ -6228,10 +6254,7 @@ pub async fn queue_prioritize(
     // 让路——不重复发停止帧（同一逻辑动作的重放至多一次 interrupt）、不并发越队
     //（授权 CAS 仍兜底恰好一次写出）。与 send/flush 共用同一线程锁。
     let registration = hub.router.begin_priority_intent(&key, &action_id, front);
-    let (thread_lock, intent): (
-        tokio::sync::OwnedMutexGuard<()>,
-        Option<crate::services::codex_control::router::PriorityIntentGuard>,
-    ) = match registration {
+    let (thread_lock, intent) = match registration {
         crate::services::codex_control::router::PriorityRegistration::Leader(leader) => {
             match hub.router.wait_priority_turn(&leader).await {
                 Ok(guard) => {
@@ -6244,7 +6267,7 @@ pub async fn queue_prioritize(
                         .reverify_priority_intent(&key, &action_id, &leader)
                     {
                         crate::services::codex_control::router::PriorityReverify::Valid => {
-                            (guard, Some(leader))
+                            (guard, leader)
                         }
                         crate::services::codex_control::router::PriorityReverify::StaleIntent => {
                             return json_no_store(
@@ -6386,10 +6409,30 @@ pub async fn queue_prioritize(
     // Task6：本次停止自建前置暂停行的归属（Accepted 且确为本次插入才有值）；
     // 端点在确认目标回合精确终态后持线程锁按归属清除（见 prioritize_queued 之前）。
     let mut stop_pause_release: Option<String> = None;
+    let pause_token = format!("priority:{action_id}");
+    let mut stopped_turn = None;
+    let stop_generation = hub.adapter.remote_generation();
     // 新鲜门分类（同一前台预算）：决定「直接越队」还是「先停止当前回合」。
     let gate = match front.within(fresh_send_gate(hub, &key)).await {
         Ok(g) => g,
         Err(_) => SendGate::StateUnknown,
+    };
+    let (gate, turn_scope) = match gate {
+        SendGate::Clear | SendGate::Busy => {
+            let expected = req
+                .expected_turn_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|turn| !turn.is_empty());
+            match front
+                .within(hub.adapter.priority_turn_scope(&key, expected))
+                .await
+            {
+                Ok(Some((gate, scope))) => (gate, Some(scope)),
+                _ => (SendGate::StateUnknown, None),
+            }
+        }
+        gate => (gate, None),
     };
     match gate {
         // 原生 pending 在场：授权不穿透（与越队/派发路径同源守卫）
@@ -6429,7 +6472,14 @@ pub async fn queue_prioritize(
         // 未解屏障由 `prioritize_queued` 的 `barrier_outstanding` 判定、原生 pending
         // 由上面的 NativePending 臂挡、停止结果未知由 stop_attempt 状态机挡——
         // 这些门一律不动。
-        SendGate::Clear => {}
+        SendGate::Clear => match store.set_queue_pause(&key, "priority_hold", &pause_token, None) {
+            Ok(true) => hub.adapter.republish_thread_projection(&key).await,
+            Ok(false) => {}
+            Err(e) => {
+                log::error!("codex/queue/prioritize 无法保护选中动作的派发: {e}");
+                return prioritize_not_sent_response(&action_id, "store_error", true);
+            }
+        },
         SendGate::Busy => {
             if !req.confirm_interrupt {
                 // 无确认：零停止、零越队（Q3 原样留队）
@@ -6494,7 +6544,6 @@ pub async fn queue_prioritize(
             // 真实定向停止（复用打断编排核心：阀值/能力门/前置暂停/有界打断/暂停收尾）。
             // Task6-exactT：恒传显式 Some(非空)——prio 路径不触发共享 stop 的
             // current/outstanding fallback（错靶防护，见上方校验）。
-            let stop_generation = hub.adapter.remote_generation();
             match stop_current_turn(
                 &st,
                 &key,
@@ -6503,6 +6552,7 @@ pub async fn queue_prioritize(
                 &device_name,
                 Some(expected_turn_id),
                 front,
+                Some(&pause_token),
             )
             .await
             {
@@ -6710,6 +6760,7 @@ pub async fn queue_prioritize(
                         // 与既有语义把关。
                         release_stop_claim(store, &action_id).await;
                     }
+                    stopped_turn = Some(expected_turn_id);
                 }
             }
         }
@@ -6746,23 +6797,33 @@ pub async fn queue_prioritize(
             }
         }
     }
-    // 越队派发既有 queued 行（授权绑定原 action、写出前 CAS 恰好消费一次；其他
-    // 来源的暂停行原样——本次停止的自建行已在上方交接点定向清除，resume 仍是
-    // 它们的唯一恢复出口）。全程锁延续传入（不可重入）。Task7：Leader 登记在场
-    // 时走伴随入口（壳期仅保活意图句柄并委托旧 public 正文，guard 返回时条件
-    // 注销）；无登记（Replay/Occupied 壳期降级原路径）走旧 public 直调。
-    let prioritize_outcome = match intent {
-        Some(leader) => {
-            hub.router
-                .prioritize_queued_with_intent(&action_id, &key, front, thread_lock, leader)
-                .await
-        }
-        None => {
-            hub.router
-                .prioritize_queued(&action_id, &key, front, thread_lock)
-                .await
-        }
+    let scope_adapter = hub.adapter.clone();
+    let scope_key = key.clone();
+    let release_hub = hub.clone();
+    let release_key = key.clone();
+    let scope = crate::services::codex_control::router::PriorityDispatchScope {
+        pause_token,
+        gate: Arc::new(move || {
+            scope_adapter.priority_scope_gate(
+                &scope_key,
+                turn_scope.as_deref()?,
+                stopped_turn.as_deref(),
+                stop_generation,
+            )
+        }),
+        on_pause_cleared: Arc::new(move || {
+            let hub = release_hub.clone();
+            let key = release_key.clone();
+            tokio::spawn(async move {
+                hub.adapter.republish_thread_projection(&key).await;
+                hub.notify_settled(&key);
+            });
+        }),
     };
+    let prioritize_outcome = hub
+        .router
+        .prioritize_queued_with_intent(&action_id, &key, front, thread_lock, intent, Some(scope))
+        .await;
     match prioritize_outcome {
         PrioritizeOutcome::Completed(receipt) => match receipt.delivery {
             Delivery::Accepted => json_no_store(

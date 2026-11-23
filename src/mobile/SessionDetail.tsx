@@ -2453,8 +2453,8 @@ function SessionDetailContent({
                       isUser ? "flex flex-col items-end" : "flex flex-col items-start"
                     } data-[jump-hit=true]:rounded-xl data-[jump-hit=true]:bg-amber-500/10 data-[jump-hit=true]:ring-2 data-[jump-hit=true]:ring-amber-500/70`}
                   >
-                    {m.interactionAnswer ? (
-                      <AnswerBubble answer={m.interactionAnswer} messageId={m.id} />
+                    {m.interactionAnswers && m.interactionAnswers.length > 0 ? (
+                      <AnswerBubble answers={m.interactionAnswers} messageId={m.id} />
                     ) : null}
                     {m.text !== "" && (
                       <div

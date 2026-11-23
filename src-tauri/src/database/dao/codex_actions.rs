@@ -874,9 +874,22 @@ pub(crate) fn mint_bypass_grant_attempt_checked_conn(
     conn: &Connection,
     action_id: &str,
     thread_id: &str,
+    previous_attempt: Option<i64>,
     authorize: impl FnOnce() -> Option<i64>,
 ) -> rusqlite::Result<CheckedMutation<i64>> {
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    if let Some(previous_attempt) = previous_attempt {
+        let retryable: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM codex_actions a JOIN codex_bypass_grant g USING(action_id)
+             WHERE a.action_id=?1 AND a.thread_id=?2 AND a.state='queued' AND g.thread_id=?2
+               AND g.attempt=?3 AND g.consumed_at IS NOT NULL)",
+            params![action_id, thread_id, previous_attempt],
+            |row| row.get(0),
+        )?;
+        if !retryable {
+            return Ok(CheckedMutation::StaleIntent);
+        }
+    }
     let Some(granted_at) = authorize() else {
         return Ok(CheckedMutation::StaleIntent);
     };
@@ -3172,9 +3185,13 @@ mod tests {
             let mut contender = Connection::open(path).unwrap();
             contender.busy_handler(Some(observe_busy)).unwrap();
             started_tx.send(Instant::now() < deadline).unwrap();
-            mint_bypass_grant_attempt_checked_conn(&contender, "mint-expired-q", THREAD, || {
-                (Instant::now() < deadline).then_some(2000)
-            })
+            mint_bypass_grant_attempt_checked_conn(
+                &contender,
+                "mint-expired-q",
+                THREAD,
+                None,
+                || (Instant::now() < deadline).then_some(2000),
+            )
         });
         assert!(
             started_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
@@ -3206,9 +3223,13 @@ mod tests {
         assert_eq!(audit_after, audit_before, "过期意图不得新增业务审计");
         assert!(
             matches!(
-                mint_bypass_grant_attempt_checked_conn(&conn, "mint-expired-q", THREAD, || Some(
-                    3000
-                ))
+                mint_bypass_grant_attempt_checked_conn(
+                    &conn,
+                    "mint-expired-q",
+                    THREAD,
+                    None,
+                    || Some(3000)
+                )
                 .unwrap(),
                 CheckedMutation::Applied(1)
             ),

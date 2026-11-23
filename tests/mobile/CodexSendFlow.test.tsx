@@ -699,7 +699,7 @@ describe("CodexSendFlow：队列暂停展示收敛（C04）", () => {
     expect(screen.queryByTestId("codex-queue-paused")).toBeNull();
   });
 
-  it("queue_panel_paused：队列视图 queuePaused=true → 展开后出暂停说明与唯一恢复队列入口（同一解除出口）", async () => {
+  it("queue_panel_paused：队列视图 queuePaused=true → 默认显示暂停说明与唯一恢复队列入口（同一解除出口）", async () => {
     installFetch();
     routes.queueView = {
       actions: [
@@ -710,10 +710,7 @@ describe("CodexSendFlow：队列暂停展示收敛（C04）", () => {
       queuePauseReason: "interrupt_uncertain",
     };
     render(<CodexQueuePanel sessionId="sess-1" />);
-    await waitFor(() => expect(screen.getByTestId("codex-queue-panel")).toBeTruthy());
-    // C04：默认折叠（摘要行）；展开后才出暂停说明与恢复入口
-    fireEvent.click(screen.getByTestId("codex-queue-toggle"));
-    expect(screen.getByTestId("codex-queue-paused")).toBeTruthy();
+    expect(await screen.findByTestId("codex-queue-paused")).toBeTruthy();
     fireEvent.click(screen.getByTestId("codex-queue-resume"));
     await flushAsync();
     expect(queueResumeBodies).toHaveLength(1);

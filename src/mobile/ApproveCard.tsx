@@ -83,7 +83,7 @@ function PlanBody({ plan }: { plan: { content: string; isFile: boolean } }) {
             {plan.content}
           </p>
         ) : (
-          <div className="prose-sm max-w-none">
+          <div className="approval-plan-markdown prose-sm max-w-none">
             <ReactMarkdown remarkPlugins={[remarkGfm]}>{plan.content}</ReactMarkdown>
           </div>
         )}

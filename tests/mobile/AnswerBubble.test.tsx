@@ -13,7 +13,9 @@ describe("F03/F06 R15 正式答复气泡", () => {
     render(
       <AnswerBubble
         messageId="u-1"
-        answer={{ questionKey: "q", question: "部署到哪？", answer: "Staging", correlated: true }}
+        answers={[
+          { questionKey: "q", question: "部署到哪？", answer: "Staging", correlated: true },
+        ]}
       />
     );
     const bubble = screen.getByTestId("codex-answer-u-1");
@@ -25,11 +27,32 @@ describe("F03/F06 R15 正式答复气泡", () => {
     expect(bubble.textContent).not.toContain("request_user_input_async");
   });
 
+  it("renders all pairs in envelope order inside one bubble", () => {
+    const answers = [3, 1, 2].map((n) => ({
+      questionKey: `q-${n}`,
+      question: `Question ${n}`,
+      answer: `Answer ${n}`,
+      correlated: n !== 1,
+    }));
+    render(<AnswerBubble messageId="group" answers={answers} />);
+    const bubble = screen.getByTestId("codex-answer-group");
+    const content = bubble.textContent ?? "";
+    const positions = answers.flatMap(({ question, answer }) => [
+      content.indexOf(question),
+      content.indexOf(answer),
+    ]);
+    expect(positions[0]).toBeGreaterThanOrEqual(0);
+    for (let i = 1; i < positions.length; i++) {
+      expect(positions[i]).toBeGreaterThan(positions[i - 1]);
+    }
+    expect(screen.getAllByTestId("codex-answer-uncorrelated-group")).toHaveLength(1);
+  });
+
   it("marks uncorrelated answers honestly", () => {
     render(
       <AnswerBubble
         messageId="u-2"
-        answer={{ questionKey: "q", question: "选一个", answer: "甲", correlated: false }}
+        answers={[{ questionKey: "q", question: "选一个", answer: "甲", correlated: false }]}
       />
     );
     expect(screen.getByTestId("codex-answer-u-2").getAttribute("data-correlated")).toBe("false");

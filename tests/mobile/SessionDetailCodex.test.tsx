@@ -77,7 +77,7 @@ function json(body: unknown, status = 200) {
   return new Response(JSON.stringify(body), { status });
 }
 
-function installFetch() {
+function installFetch(onInterruptSuccess?: () => void) {
   queueResponse = { actions: [], blockedReasonCode: null };
   queueEditResponse = null;
   messagesResponse = { messages: [], truncated: false };
@@ -116,14 +116,14 @@ function installFetch() {
           releaseInterrupt = resolve;
         });
       }
-      return json(
-        interruptResponse ?? {
-          ok: true,
-          uncertain: false,
-          interruptedTurnId: "t-9",
-          expectedTurnId: "t-9",
-        }
-      );
+      if (interruptResponse != null) return json(interruptResponse);
+      onInterruptSuccess?.();
+      return json({
+        ok: true,
+        uncertain: false,
+        interruptedTurnId: "t-9",
+        expectedTurnId: "t-9",
+      });
     }
     if (url.includes("/codex/thread/events")) return new Response("", { status: 200 });
     if (url.includes("/codex/thread")) return json(projection());
@@ -190,8 +190,6 @@ describe("SessionDetail × Codex IPC：恢复入口与队列刷新", () => {
     const es = await waitFor(() => MockEventSource.latest());
     emit(es, "snapshot", projection());
     expect(await screen.findByTestId("codex-queue-panel")).toBeTruthy();
-    // C04：面板默认折叠——行级断言先展开
-    fireEvent.click(await screen.findByTestId("codex-queue-toggle"));
     const btn = await screen.findByTestId("codex-queue-force-continue");
     expect(btn).toBeTruthy();
     // R16：App 会话不再挂"总能力徽标"（逐操作工具栏承担解释）；队列入口仍在。
@@ -251,8 +249,6 @@ describe("SessionDetail × Codex IPC：恢复入口与队列刷新", () => {
     expect(
       await screen.findByTestId("send-receipt-codex-queued", undefined, { timeout: 3000 })
     ).toBeTruthy();
-    // C04：面板折叠摘要出现，展开后行可见
-    fireEvent.click(await screen.findByTestId("codex-queue-toggle"));
     const row = await screen.findByTestId("codex-queue-row-act-q");
     expect(row).toBeTruthy();
 
@@ -302,8 +298,6 @@ describe("SessionDetail × Codex IPC：恢复入口与队列刷新", () => {
     render(<SessionDetail session={makeSession({ status: "idle" })} onBack={() => {}} />);
     const es = await waitFor(() => MockEventSource.latest());
     emit(es, "snapshot", projection({ revision: null, stale: true, availability: "compat_only" }));
-    // C04：面板默认折叠——行级断言先展开
-    fireEvent.click(await screen.findByTestId("codex-queue-toggle"));
     expect(await screen.findByTestId("codex-queue-row-compat-a")).toBeTruthy();
     expect(screen.getByTestId("codex-queue-retract-compat-a")).toBeTruthy();
     expect(screen.getByTestId("codex-stale-note")).toBeTruthy();
@@ -329,8 +323,6 @@ describe("SessionDetail × Codex IPC：恢复入口与队列刷新", () => {
     expect(await screen.findByTestId("send-receipt-headless")).toBeTruthy();
     // 没有任何新投影帧：队列刷新由 headless 回执独立触发
     expect(await screen.findByTestId("codex-queue-panel")).toBeTruthy();
-    // C04：面板默认折叠——操作断言先展开
-    fireEvent.click(await screen.findByTestId("codex-queue-toggle"));
     expect(await screen.findByTestId("codex-queue-force-continue")).toBeTruthy();
   });
 
@@ -345,9 +337,9 @@ describe("SessionDetail × Codex IPC：恢复入口与队列刷新", () => {
     );
     const esA = await waitFor(() => MockEventSource.latest());
     emit(esA, "snapshot", projection());
-    // C04：面板默认折叠——行级断言先展开
-    fireEvent.click(await screen.findByTestId("codex-queue-toggle"));
-    expect(await screen.findByTestId("codex-queue-row-old-a")).toBeTruthy();
+    expect(await screen.findByTestId("codex-queue-row-old-a")).toBeVisible();
+    fireEvent.click(screen.getByTestId("codex-queue-toggle"));
+    expect(screen.queryByTestId("codex-queue-row-old-a")).toBeNull();
 
     queueResponse = {
       actions: [{ actionId: "new-b", state: "queued", position: 1, receipt: null }],
@@ -358,7 +350,6 @@ describe("SessionDetail × Codex IPC：恢复入口与队列刷新", () => {
     const esB = MockEventSource.latest();
     expect(esB).not.toBe(esA);
     emit(esB, "snapshot", projection({ threadId: "thread-b" }));
-    fireEvent.click(await screen.findByTestId("codex-queue-toggle"));
     expect(await screen.findByTestId("codex-queue-row-new-b")).toBeVisible();
     expect(queueCalls.some((u) => u.includes("sess-b"))).toBe(true);
     expect(screen.queryByTestId("codex-queue-row-old-a")).toBeNull();
@@ -377,12 +368,26 @@ describe("SessionDetail × Codex IPC：恢复入口与队列刷新", () => {
 // ============================================================
 describe("SessionDetail × Codex IPC：R6 后端真实状态变化驱动 send-info 刷新", () => {
   it("R6-1 同页：先 queuePaused=false 挂载 → composer 停止受理（真实操作）→ 暂停展示收敛到队列区摘要", async () => {
-    installFetch();
-    queueResponse = {
+    const queue = {
       actions: [{ actionId: "a1", state: "queued", position: 1, receipt: null }],
       blockedReasonCode: "native_turn_pending",
       canInterrupt: true,
+      queuePaused: false,
     };
+    let queueCallsAtSuccess = 0;
+    let sendInfoCallsAtSuccess = 0;
+    installFetch(() => {
+      queueCallsAtSuccess = queueCalls.length;
+      sendInfoCallsAtSuccess = sendInfoCalls();
+      queueResponse = { ...queue, queuePaused: true };
+      sendInfoResponse = {
+        injectable: true,
+        channels: ["headless_codex_queue"],
+        visibility: "realtime",
+        queuePaused: true,
+      };
+    });
+    queueResponse = queue;
     render(<SessionDetail session={makeSession()} onBack={() => {}} />);
     const es = await waitFor(() => MockEventSource.latest());
     emit(
@@ -394,26 +399,18 @@ describe("SessionDetail × Codex IPC：R6 后端真实状态变化驱动 send-in
         effectiveOperations: interruptAllowedOps(),
       })
     );
-    // 挂载时（打断前）：无暂停件——queuePaused=false 的真实初值（复审明文：
-    // 不可渲染前预置 true；打断是「真实操作」，服务端暂停在其受理后才成立）
-    await screen.findByTestId("composer-input");
+    const stop = await screen.findByTestId("composer-stop");
+    const summary = await screen.findByTestId("codex-queue-summary");
+    expect(summary).not.toHaveAttribute("data-paused");
     expect(screen.queryByTestId("send-queue-paused")).toBeNull();
-    // 打断受理后服务端置持久暂停（send-info 与队列视图随之翻转——真实操作后的
-    // 服务端真值；队列视图的 queuePaused 是面板摘要的数据源）
-    sendInfoResponse = {
-      injectable: true,
-      channels: ["headless_codex_queue"],
-      visibility: "realtime",
-      queuePaused: true,
-    };
-    queueResponse.queuePaused = true;
-    fireEvent.click(await screen.findByTestId("codex-queue-toggle"));
     expect(screen.queryByTestId("codex-queue-interrupt")).toBeNull();
-    fireEvent.click(await screen.findByTestId("composer-stop"));
+    fireEvent.click(stop);
     await waitFor(() => expect(interruptBodies).toHaveLength(1));
-    await waitFor(() =>
-      expect(screen.getByTestId("codex-queue-summary").getAttribute("data-paused")).toBe("true")
-    );
+    await waitFor(() => {
+      expect(queueCalls.length).toBeGreaterThan(queueCallsAtSuccess);
+      expect(sendInfoCalls()).toBeGreaterThan(sendInfoCallsAtSuccess);
+      expect(screen.getByTestId("codex-queue-summary")).toHaveAttribute("data-paused", "true");
+    });
     expect(screen.queryByTestId("send-queue-paused")).toBeNull();
     expect(screen.queryByTestId("queue-bypass-arm")).toBeNull();
   });
@@ -1241,8 +1238,7 @@ describe("SessionDetail × Codex IPC：T05 composer 停止与共享控制器", (
     const stop = await screen.findByTestId("composer-stop", undefined, { timeout: 3000 });
     expect(stop).toBeEnabled();
     expect(interruptBodies).toEqual([]);
-    // C04：面板默认折叠——展开后共享闸的渲染面才可观察（打断臂随 stopping 禁用）
-    fireEvent.click(await screen.findByTestId("codex-queue-toggle"));
+    await screen.findByTestId("codex-queue-row-a1");
     // 打断挂起：stopping 期间面板打断臂同闸禁用（同一共享单例）
     interruptResponse = "hang";
     const queueCallsBefore = queueCalls.length;
@@ -1346,8 +1342,7 @@ describe("SessionDetail × Codex IPC：T05 composer 停止与共享控制器", (
     });
     // 紧凑「排队第 N 位」（zh/en 各有措辞，断言位次数字）
     expect(chip.textContent).toMatch(/第1位|position 1/);
-    // 展开入口：队列面板折叠摘要（计数更新不自动展开）→ 展开（撤回入口）
-    fireEvent.click(await screen.findByTestId("codex-queue-toggle", undefined, { timeout: 3000 }));
+    // 默认展开的队列面板直接显示新入队条目及撤回入口。
     expect(
       await screen.findByTestId("codex-queue-row-act-q", undefined, { timeout: 3000 })
     ).toBeTruthy();
@@ -1378,7 +1373,6 @@ describe("SessionDetail × Codex IPC：T05 composer 停止与共享控制器", (
       await screen.findByTestId("codex-queue-summary", undefined, { timeout: 3000 })
     ).toBeTruthy();
     expect(screen.getByTestId("codex-queue-summary").getAttribute("data-paused")).toBe("true");
-    fireEvent.click(screen.getByTestId("codex-queue-toggle"));
     expect(
       await screen.findByTestId("codex-queue-resume", undefined, { timeout: 3000 })
     ).toBeTruthy();
@@ -1917,7 +1911,6 @@ describe("SessionDetail × Codex IPC：A5.3 Codex/通用消息源切换", () => 
     fireEvent.change(await screen.findByTestId("composer-input"), {
       target: { value: "输入框原有正文" },
     });
-    fireEvent.click(await screen.findByTestId("codex-queue-toggle"));
     fireEvent.click(await screen.findByTestId("codex-queue-edit-edit-a"));
     expect(screen.queryByTestId("composer-edit-choice")).toBeNull();
 

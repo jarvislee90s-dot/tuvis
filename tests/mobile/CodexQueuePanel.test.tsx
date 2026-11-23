@@ -1,5 +1,4 @@
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { useEffect, useRef } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import i18n from "@/i18n";
 import CodexQueuePanel from "@/mobile/CodexQueuePanel";
@@ -76,12 +75,10 @@ let releaseQueue: ((v: CodexQueueView) => void) | null = null;
 /** T05：interruptHang 挂起请求的放行器 */
 let _releaseInterrupt: ((r: Response) => void) | null = null;
 
-/** C04（队列展示收纳）：默认折叠成一行摘要——行级/操作断言先等面板挂载再点
- *  「查看」展开。空面板（自隐）用例不适用本辅助（findBy 会超时），自行处理。 */
-async function renderAndExpand(jsx: React.ReactElement) {
+/** 等待队列载入面板后再断言行和操作。空队列自隐的用例直接渲染。 */
+async function renderLoadedPanel(jsx: React.ReactElement) {
   const result = render(jsx);
   await screen.findByTestId("codex-queue-toggle");
-  fireEvent.click(screen.getByTestId("codex-queue-toggle"));
   return result;
 }
 
@@ -237,12 +234,70 @@ function interruptBodies(): string[] {
 }
 
 describe("CodexQueuePanel（Task 9）", () => {
+  it("默认展开并按队列顺序显示所有消息行", async () => {
+    installFetch();
+    const actions = Array.from({ length: 5 }, (_, index) =>
+      action({ actionId: `a${index + 1}`, position: index + 1 })
+    );
+    routes.queue = [queueView(actions)];
+
+    render(<CodexQueuePanel sessionId="s1" />);
+
+    const toggle = await screen.findByTestId("codex-queue-toggle");
+    expect(toggle.textContent).toBe(i18n.t("mobile.codex.queue.summaryHide"));
+    expect(toggle).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getAllByTestId(/^codex-queue-row-/).map((row) => row.dataset.testid)).toEqual(
+      actions.map(({ actionId }) => `codex-queue-row-${actionId}`)
+    );
+  });
+
+  it("手动收起后，同一挂载中的刷新、入队和清空后重新入队都保持收起", async () => {
+    installFetch();
+    routes.queue = [queueView([action()])];
+    const { rerender } = render(<CodexQueuePanel sessionId="s1" />);
+
+    await screen.findByTestId("codex-queue-row-a1");
+    fireEvent.click(screen.getByTestId("codex-queue-toggle"));
+    expect(screen.queryByTestId("codex-queue-row-a1")).toBeNull();
+
+    // 普通刷新改动摘要状态，用摘要确认这次响应已落地。
+    routes.queue = [queueView([action()], "native_turn_pending")];
+    rerender(<CodexQueuePanel sessionId="s1" refreshSignal={1} />);
+    await waitFor(() =>
+      expect(screen.getByTestId("codex-queue-summary").getAttribute("data-awaiting-turn")).toBe(
+        "true"
+      )
+    );
+    expect(screen.queryByTestId("codex-queue-row-a1")).toBeNull();
+
+    routes.queue = [queueView([action(), action({ actionId: "a2", position: 2 })])];
+    rerender(<CodexQueuePanel sessionId="s1" refreshSignal={2} />);
+    await waitFor(() =>
+      expect(screen.getByTestId("codex-queue-summary").getAttribute("data-count")).toBe("2")
+    );
+    expect(screen.queryAllByTestId(/^codex-queue-row-/)).toHaveLength(0);
+
+    routes.queue = [queueView([])];
+    rerender(<CodexQueuePanel sessionId="s1" refreshSignal={3} />);
+    await waitFor(() => expect(screen.queryByTestId("codex-queue-panel")).toBeNull());
+
+    routes.queue = [queueView([action({ actionId: "a3" })])];
+    rerender(<CodexQueuePanel sessionId="s1" refreshSignal={4} />);
+    const toggle = await screen.findByTestId("codex-queue-toggle");
+    expect(toggle.textContent).toBe(i18n.t("mobile.codex.queue.summaryView"));
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByTestId("codex-queue-row-a3")).toBeNull();
+    fireEvent.click(toggle);
+    expect(toggle).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByTestId("codex-queue-row-a3")).toBeTruthy();
+  });
+
   it("renders_fifo_positions：挂载拉取显示待发与实际 FIFO 位置；无插队按钮", async () => {
     installFetch();
     routes.queue = [
       queueView([action({ actionId: "a1", position: 1 }), action({ actionId: "a2", position: 2 })]),
     ];
-    await renderAndExpand(<CodexQueuePanel sessionId="s1" />);
+    await renderLoadedPanel(<CodexQueuePanel sessionId="s1" />);
     const row1 = await screen.findByTestId("codex-queue-row-a1");
     expect(row1.textContent).toContain("第1位");
     expect(screen.getByTestId("codex-queue-row-a2").textContent).toContain("第2位");
@@ -261,7 +316,7 @@ describe("CodexQueuePanel（Task 9）", () => {
       queueView([action({ actionId: "a1", position: 1 })]),
       queueView([]), // 操作后重拉：已撤条目不在队
     ];
-    await renderAndExpand(<CodexQueuePanel sessionId="s1" />);
+    await renderLoadedPanel(<CodexQueuePanel sessionId="s1" />);
     await screen.findByTestId("codex-queue-row-a1");
     fireEvent.click(screen.getByTestId("codex-queue-retract-a1"));
     await waitFor(() => expect(screen.queryByTestId("codex-queue-row-a1")).toBeNull());
@@ -281,7 +336,7 @@ describe("CodexQueuePanel（Task 9）", () => {
       queueView([action({ actionId: "a1", state: "reserved", position: null })]), // 重拉：已派发
     ];
     routes.retractStatus = 409;
-    await renderAndExpand(<CodexQueuePanel sessionId="s1" />);
+    await renderLoadedPanel(<CodexQueuePanel sessionId="s1" />);
     await screen.findByTestId("codex-queue-row-a1");
     fireEvent.click(screen.getByTestId("codex-queue-retract-a1"));
     // 409 → 说明出现（不谎报撤回成功）
@@ -312,7 +367,7 @@ describe("CodexQueuePanel（Task 9）", () => {
         }),
       ]),
     ];
-    await renderAndExpand(<CodexQueuePanel sessionId="s1" />);
+    await renderLoadedPanel(<CodexQueuePanel sessionId="s1" />);
     await screen.findByTestId("codex-queue-row-a3");
     expect(screen.getByTestId("codex-queue-row-a3").textContent).toContain("已取消");
     expect(screen.queryByTestId("codex-queue-retract-a3")).toBeNull();
@@ -322,7 +377,7 @@ describe("CodexQueuePanel（Task 9）", () => {
   it("compat_outstanding_banner：blockedReasonCode 非空 → 暂停派发说明条（compat_outstanding）", async () => {
     installFetch();
     routes.queue = [queueView([action({ actionId: "a1" })], "compat_outstanding")];
-    await renderAndExpand(<CodexQueuePanel sessionId="s1" />);
+    await renderLoadedPanel(<CodexQueuePanel sessionId="s1" />);
     const banner = await screen.findByTestId("codex-queue-blocked");
     expect(banner.textContent).toContain("兼容");
     expect(banner.textContent).toContain("暂停");
@@ -331,7 +386,7 @@ describe("CodexQueuePanel（Task 9）", () => {
   it("native_delivery_unknown_banner：原生 Unknown 屏障 → 如实说无自动恢复（不得承诺自动继续）", async () => {
     installFetch();
     routes.queue = [queueView([action({ actionId: "a3" })], "native_delivery_unknown")];
-    await renderAndExpand(<CodexQueuePanel sessionId="s1" />);
+    await renderLoadedPanel(<CodexQueuePanel sessionId="s1" />);
     const banner = await screen.findByTestId("codex-queue-blocked");
     expect(banner.getAttribute("data-reason")).toBe("native_delivery_unknown");
     expect(banner.textContent).toContain("未知");
@@ -342,7 +397,7 @@ describe("CodexQueuePanel（Task 9）", () => {
   it("native_turn_pending_banner：原生 Turn 屏障 → 分文案（不得说成兼容模式/回 Desktop 手工解除）", async () => {
     installFetch();
     routes.queue = [queueView([action({ actionId: "a2" })], "native_turn_pending")];
-    await renderAndExpand(<CodexQueuePanel sessionId="s1" />);
+    await renderLoadedPanel(<CodexQueuePanel sessionId="s1" />);
     expect(screen.queryByTestId("codex-queue-blocked")).toBeNull();
     expect(screen.queryByTestId("codex-queue-interrupt")).toBeNull();
   });
@@ -359,14 +414,12 @@ describe("CodexQueuePanel（Task 9）", () => {
   it("external_refresh_signal_refetches：外部触发（投影跃迁/发送回执）→ 去抖重拉，新入队条目不离页可见", async () => {
     installFetch();
     routes.queue = [queueView([])];
-    // C04：空队列面板自隐（折叠摘要也不出）；条目到达后以折叠摘要出现，展开可见行
     const { rerender } = render(<CodexQueuePanel sessionId="s1" />);
     await act(async () => {});
     expect(screen.queryByTestId("codex-queue-panel")).toBeNull();
     // 发送入队回执/投影跃迁 → 父级 bump refreshSignal → 面板重拉到新条目
     routes.queue = [queueView([action({ actionId: "a9", position: 1 })])];
     rerender(<CodexQueuePanel sessionId="s1" refreshSignal={1} />);
-    fireEvent.click(await screen.findByTestId("codex-queue-toggle"));
     const row = await screen.findByTestId("codex-queue-row-a9", undefined, { timeout: 3000 });
     expect(row.textContent).toContain("第1位");
   });
@@ -393,7 +446,6 @@ describe("CodexQueuePanel（Task 9）", () => {
   it("rapid_refresh_signals_coalesce：同会话密集触发去抖合并为一次重拉", async () => {
     installFetch();
     routes.queue = [queueView([]), queueView([action({ actionId: "a1", position: 1 })])];
-    // C04：首个视图为空 → 面板自隐；合并重拉到条目后以折叠摘要出现，展开可见行
     const { rerender } = render(<CodexQueuePanel sessionId="s1" />);
     await act(async () => {});
     expect(queueGetCalls()).toBe(1); // 挂载拉取
@@ -405,7 +457,6 @@ describe("CodexQueuePanel（Task 9）", () => {
     // 去抖窗口内不发请求：两次触发尚未合并落地
     expect(queueGetCalls()).toBe(1);
     // 窗口过后恰好一次合并重拉（去抖尾部定时器）
-    fireEvent.click(await screen.findByTestId("codex-queue-toggle"));
     const row = await screen.findByTestId("codex-queue-row-a1", undefined, { timeout: 3000 });
     expect(row.textContent).toContain("第1位");
     expect(queueGetCalls()).toBe(2);
@@ -415,7 +466,6 @@ describe("CodexQueuePanel（Task 9）", () => {
     vi.useFakeTimers();
     installFetch();
     routes.queue = [queueView([])];
-    // C04：空起步 → 面板自隐；条目落地后展开断言行可见
     const { rerender } = render(<CodexQueuePanel sessionId="s1" />);
     const advance = async (ms: number) => {
       await act(async () => {
@@ -433,7 +483,6 @@ describe("CodexQueuePanel（Task 9）", () => {
     }
     // 2.5s > maxWait(2s)：刷新必然已落地（条目可见可撤），不是等流式停歇
     expect(queueGetCalls()).toBeGreaterThanOrEqual(2);
-    fireEvent.click(screen.getByTestId("codex-queue-toggle"));
     expect(screen.getByTestId("codex-queue-row-a1")).toBeTruthy();
     vi.useRealTimers();
   });
@@ -444,23 +493,23 @@ describe("CodexQueuePanel（Task 9）", () => {
     installFetch();
     // native_delivery_unknown：按钮可见
     routes.queue = [queueView([action({ actionId: "a1" })], "native_delivery_unknown", ["u-1"])];
-    const { unmount } = await renderAndExpand(<CodexQueuePanel sessionId="s1" />);
+    const { unmount } = await renderLoadedPanel(<CodexQueuePanel sessionId="s1" />);
     expect(await screen.findByTestId("codex-queue-force-continue")).toBeTruthy();
     unmount();
     // compat_outstanding：按钮同样可见
     routes.queue = [queueView([action({ actionId: "a2" })], "compat_outstanding", ["c-1"])];
-    const r2 = await renderAndExpand(<CodexQueuePanel sessionId="s1" />);
+    const r2 = await renderLoadedPanel(<CodexQueuePanel sessionId="s1" />);
     expect(await screen.findByTestId("codex-queue-force-continue")).toBeTruthy();
     r2.unmount();
     // native_turn_pending（等待 Turn 完成**自动**继续）：不提供人工解除
     routes.queue = [queueView([action({ actionId: "a3" })], "native_turn_pending", ["t-1"])];
-    const r3 = await renderAndExpand(<CodexQueuePanel sessionId="s1" />);
+    const r3 = await renderLoadedPanel(<CodexQueuePanel sessionId="s1" />);
     expect(screen.queryByTestId("codex-queue-blocked")).toBeNull();
     expect(screen.queryByTestId("codex-queue-force-continue")).toBeNull();
     r3.unmount();
     // 无靶向清单（旧后端/无在册屏障）：不显示
     routes.queue = [queueView([action({ actionId: "a4" })], "native_delivery_unknown")];
-    const r4 = await renderAndExpand(<CodexQueuePanel sessionId="s1" />);
+    const r4 = await renderLoadedPanel(<CodexQueuePanel sessionId="s1" />);
     await screen.findByTestId("codex-queue-blocked");
     expect(screen.queryByTestId("codex-queue-force-continue")).toBeNull();
     r4.unmount();
@@ -469,7 +518,7 @@ describe("CodexQueuePanel（Task 9）", () => {
   it("force_continue_requires_confirmation：点击按钮先出确认条（含风险文案），确认前不发任何请求；取消不打请求", async () => {
     installFetch();
     routes.queue = [queueView([action({ actionId: "a1" })], "native_delivery_unknown", ["u-1"])];
-    await renderAndExpand(<CodexQueuePanel sessionId="s1" />);
+    await renderLoadedPanel(<CodexQueuePanel sessionId="s1" />);
     fireEvent.click(await screen.findByTestId("codex-queue-force-continue"));
     // 确认条出现，风险文案如实（重复内容风险）
     const strip = screen.getByTestId("codex-queue-force-confirm");
@@ -489,7 +538,7 @@ describe("CodexQueuePanel（Task 9）", () => {
       queueView([action({ actionId: "a1" })], "native_delivery_unknown", ["u-1"]),
       queueView([]), // 解除后重拉：阻塞清空
     ];
-    await renderAndExpand(<CodexQueuePanel sessionId="s1" />);
+    await renderLoadedPanel(<CodexQueuePanel sessionId="s1" />);
     fireEvent.click(await screen.findByTestId("codex-queue-force-continue"));
     fireEvent.click(screen.getByTestId("codex-queue-force-yes"));
     // 请求体只带 actionId
@@ -507,7 +556,7 @@ describe("CodexQueuePanel（Task 9）", () => {
       queueView([action({ actionId: "a1" })], "native_delivery_unknown", ["u-1"]),
       queueView([action({ actionId: "a1" })], "native_delivery_unknown", ["u-1"]),
     ];
-    await renderAndExpand(<CodexQueuePanel sessionId="s1" />);
+    await renderLoadedPanel(<CodexQueuePanel sessionId="s1" />);
     fireEvent.click(await screen.findByTestId("codex-queue-force-continue"));
     fireEvent.click(screen.getByTestId("codex-queue-force-yes"));
     // 失败 → note 出现（不静默）
@@ -526,7 +575,7 @@ describe("CodexQueuePanel（Task 9）", () => {
       queueView([action({ actionId: "a1" })], "native_delivery_unknown", ["u-1", "u-2"]),
       queueView([action({ actionId: "a1" })], "native_delivery_unknown", ["u-1", "u-2"]),
     ];
-    await renderAndExpand(<CodexQueuePanel sessionId="s1" />);
+    await renderLoadedPanel(<CodexQueuePanel sessionId="s1" />);
     fireEvent.click(await screen.findByTestId("codex-queue-force-continue"));
     fireEvent.click(screen.getByTestId("codex-queue-force-yes"));
     // 一败（no_barrier）不停：两个 id 都被逐个请求（面板保持可见，note 断言才有效）
@@ -554,7 +603,7 @@ describe("CodexQueuePanel（Task 9）", () => {
       queueView([action({ actionId: "a1" })], "native_delivery_unknown", ["u-1", "u-2"]),
       queueView([action({ actionId: "a1" })], "native_delivery_unknown", ["u-1", "u-2"]),
     ];
-    await renderAndExpand(<CodexQueuePanel sessionId="s1" />);
+    await renderLoadedPanel(<CodexQueuePanel sessionId="s1" />);
     fireEvent.click(await screen.findByTestId("codex-queue-force-continue"));
     fireEvent.click(screen.getByTestId("codex-queue-force-yes"));
     // 一败（barrier_in_flight）不停：两个 id 都被逐个请求
@@ -576,7 +625,7 @@ describe("CodexQueuePanel（Task 9）", () => {
       queueView([action({ actionId: "a1" })], "native_delivery_unknown", ["u-1", "u-2", "u-3"]),
       queueView([action({ actionId: "a1" })], "native_delivery_unknown", ["u-1", "u-2", "u-3"]),
     ];
-    await renderAndExpand(<CodexQueuePanel sessionId="s1" />);
+    await renderLoadedPanel(<CodexQueuePanel sessionId="s1" />);
     fireEvent.click(await screen.findByTestId("codex-queue-force-continue"));
     fireEvent.click(screen.getByTestId("codex-queue-force-yes"));
     await waitFor(() => expect(screen.getByTestId("codex-queue-note")).toBeTruthy());
@@ -604,7 +653,7 @@ describe("CodexQueuePanel（Task 9）", () => {
       queueView([action({ actionId: "a1" })], "compat_outstanding", ["u-1"]),
       queueView([action({ actionId: "a1" })], "compat_outstanding", ["u-1"]),
     ];
-    await renderAndExpand(<CodexQueuePanel sessionId="s1" />);
+    await renderLoadedPanel(<CodexQueuePanel sessionId="s1" />);
     fireEvent.click(await screen.findByTestId("codex-queue-force-continue"));
     fireEvent.click(screen.getByTestId("codex-queue-force-yes"));
     await waitFor(() => expect(screen.getByTestId("codex-queue-note")).toBeTruthy());
@@ -623,7 +672,7 @@ describe("CodexQueuePanel（Task 9）", () => {
     routes.queue = [
       queueView([action({ actionId: "a1" })], "native_delivery_unknown", ["u-1", "t-1"]),
     ];
-    await renderAndExpand(<CodexQueuePanel sessionId="s1" />);
+    await renderLoadedPanel(<CodexQueuePanel sessionId="s1" />);
     fireEvent.click(await screen.findByTestId("codex-queue-force-continue"));
     const strip = screen.getByTestId("codex-queue-force-confirm");
     expect(strip.textContent).toContain("Turn");
@@ -657,17 +706,15 @@ describe("CodexQueuePanel（Task 9）", () => {
     ];
     render(<CodexQueuePanel sessionId="s1" />);
     const summary = await screen.findByTestId("codex-queue-summary");
-    // 折叠行如实说「等待回合完成」——不能让用户以为有需要人工解除的东西
+    // 摘要如实说「等待回合完成」——不能让用户以为有需要人工解除的东西
     expect(summary.getAttribute("data-verify-pending")).toBeNull();
     expect(summary.getAttribute("data-awaiting-turn")).toBe("true");
     expect(summary.textContent).toContain("等待");
     expect(summary.textContent).not.toContain("人工核对");
-    // 展开后同样不存在「人工核对/继续队列」出口（本来就无自动恢复路径之外的活）
-    fireEvent.click(screen.getByTestId("codex-queue-toggle"));
     expect(screen.queryByTestId("codex-queue-force-continue")).toBeNull();
   });
 
-  it("c05_summary_manual_verify_for_true_unknown：真实 Unknown / 兼容屏障 → 摘要明示待人工核对（折叠可见可进入）", async () => {
+  it("c05_summary_manual_verify_for_true_unknown：真实 Unknown / 兼容屏障 → 摘要明示待人工核对，处理入口直接可见", async () => {
     installFetch();
     for (const reason of ["native_delivery_unknown", "compat_outstanding"]) {
       routes.queue = [queueView([action({ actionId: "a1" })], reason, ["u-1"], true, false)];
@@ -676,8 +723,6 @@ describe("CodexQueuePanel（Task 9）", () => {
       expect(summary.getAttribute("data-verify-pending"), reason).toBe("true");
       expect(summary.getAttribute("data-awaiting-turn"), reason).toBeNull();
       expect(summary.textContent, reason).toContain("人工核对");
-      // 折叠即可见状态 → 展开必有处理入口（不是只提示不给出口）
-      fireEvent.click(screen.getByTestId("codex-queue-toggle"));
       expect(await screen.findByTestId("codex-queue-force-continue"), reason).toBeTruthy();
       unmount();
     }
@@ -710,15 +755,27 @@ describe("CodexQueuePanel（Task 9）", () => {
   it("running_queue_has_no_duplicate_stop_or_long_banner", async () => {
     installFetch();
     routes.queue = [queueView([action()], "native_turn_pending", ["t-1"])];
-    await renderAndExpand(<CodexQueuePanel sessionId="s1" />);
+    await renderLoadedPanel(<CodexQueuePanel sessionId="s1" />);
     expect(screen.queryByTestId("codex-queue-title")).toBeNull();
     expect(screen.queryByTestId("codex-queue-blocked")).toBeNull();
     expect(screen.queryByTestId("codex-queue-interrupt")).toBeNull();
   });
+  it("hides the queue panel when an accepted turn is running and nothing is queued", async () => {
+    installFetch();
+    routes.queue = [queueView([], "native_turn_pending", ["act-accepted"])];
+
+    await act(async () => {
+      render(<CodexQueuePanel sessionId="s1" />);
+    });
+
+    expect(queueGetCalls()).toBe(1);
+    expect(screen.queryByTestId("codex-queue-panel")).toBeNull();
+  });
+
   it("empty_unknown_keeps_check_entry", async () => {
     installFetch();
     routes.queue = [queueView([], "native_delivery_unknown", ["u1"])];
-    await renderAndExpand(<CodexQueuePanel sessionId="s1" />);
+    await renderLoadedPanel(<CodexQueuePanel sessionId="s1" />);
     expect(screen.getByTestId("codex-queue-force-continue")).toBeTruthy();
   });
 });
@@ -765,8 +822,7 @@ function stopProjection(over: Record<string, unknown> = {}): ThreadProjection {
   } as ThreadProjection;
 }
 
-/** 挂真实共享控制器的 Harness（SessionDetail 持有方式的组件级等价）。
- *  C04：面板默认折叠——harness 用例要打打断/队列按钮，挂载后自动展开一次。 */
+/** 挂真实共享控制器的 Harness（SessionDetail 持有方式的组件级等价）。 */
 function PanelHarness({
   sessionId = "s1",
   projection,
@@ -775,27 +831,6 @@ function PanelHarness({
   projection: ThreadProjection | null;
 }) {
   const control = useCodexTurnControl(projection, sessionId);
-  const autoExpandedRef = useRef(false);
-  // 面板的 view 由子组件自己的 fetch 填充（父组件不因此重渲染）——轮询等 toggle
-  // 出现后自动展开一次（测试专用缝；真实页面由用户点「查看」）。
-  useEffect(() => {
-    if (autoExpandedRef.current) return;
-    const timer = window.setInterval(() => {
-      if (autoExpandedRef.current) {
-        window.clearInterval(timer);
-        return;
-      }
-      const toggle = document.querySelector<HTMLButtonElement>(
-        '[data-testid="codex-queue-toggle"]'
-      );
-      if (toggle !== null) {
-        autoExpandedRef.current = true;
-        window.clearInterval(timer);
-        toggle.click();
-      }
-    }, 25);
-    return () => window.clearInterval(timer);
-  }, []);
   return (
     <div>
       <CodexQueuePanel sessionId={sessionId} turnControl={control} />
@@ -821,7 +856,7 @@ describe("CodexQueuePanel：T06 先处理这条", () => {
         action({ actionId: "a2", state: "cancelled", position: null }),
       ]),
     ];
-    await renderAndExpand(<CodexQueuePanel sessionId="s1" />);
+    await renderLoadedPanel(<CodexQueuePanel sessionId="s1" />);
     expect(await screen.findByTestId("codex-queue-prioritize-a1")).toBeTruthy();
     expect(screen.queryByTestId("codex-queue-prioritize-a2")).toBeNull();
     // 入口是显式单条触发，不是 FIFO 拖动排序（无任何拖动/排序 UI）
@@ -831,7 +866,7 @@ describe("CodexQueuePanel：T06 先处理这条", () => {
   it("t06_confirm_before_request：确认前零请求；取消不打请求", async () => {
     installFetch();
     routes.queue = [queueView([action({ actionId: "a1", position: 1 })], null, [], true, true)];
-    await renderAndExpand(<CodexQueuePanel sessionId="s1" />);
+    await renderLoadedPanel(<CodexQueuePanel sessionId="s1" />);
     fireEvent.click(await screen.findByTestId("codex-queue-prioritize-a1"));
     // 确认臂出现；确认前零请求
     expect(screen.getByTestId("codex-queue-prioritize-confirm-a1").textContent).toContain(
@@ -866,7 +901,7 @@ describe("CodexQueuePanel：T06 先处理这条", () => {
       // 服务端队列只返回 queued 行。
       queueView([action({ actionId: "a1", position: 1 })], null, [], true, true),
     ];
-    await renderAndExpand(<CodexQueuePanel sessionId="s1" />);
+    await renderLoadedPanel(<CodexQueuePanel sessionId="s1" />);
     fireEvent.click(await screen.findByTestId("codex-queue-prioritize-a2"));
     // 暂停空闲：确认文案不含停止风险（仅越队确认）
     expect(screen.getByTestId("codex-queue-prioritize-confirm-a2").textContent).toContain(
@@ -934,7 +969,7 @@ describe("CodexQueuePanel：T06 先处理这条", () => {
       queueView([action({ actionId: "a1", position: 1 })], null, [], true, true),
       queueView([action({ actionId: "a1", position: 1 })], null, [], true, true),
     ];
-    await renderAndExpand(<CodexQueuePanel sessionId="s1" />);
+    await renderLoadedPanel(<CodexQueuePanel sessionId="s1" />);
     fireEvent.click(await screen.findByTestId("codex-queue-prioritize-a1"));
     fireEvent.click(screen.getByTestId("codex-queue-prioritize-yes-a1"));
     await waitFor(() =>
@@ -953,7 +988,7 @@ describe("CodexQueuePanel：T06 先处理这条", () => {
       queueView([action({ actionId: "a1", position: 1 })], null, [], true, true),
       queueView([action({ actionId: "a1", position: 1 })], null, [], true, true),
     ];
-    await renderAndExpand(<CodexQueuePanel sessionId="s1" />);
+    await renderLoadedPanel(<CodexQueuePanel sessionId="s1" />);
     fireEvent.click(await screen.findByTestId("codex-queue-prioritize-a1"));
     fireEvent.click(screen.getByTestId("codex-queue-prioritize-yes-a1"));
     await waitFor(() =>
@@ -987,7 +1022,7 @@ describe("CodexQueuePanel：T06 先处理这条", () => {
         true
       ),
     ];
-    await renderAndExpand(<CodexQueuePanel sessionId="s1" />);
+    await renderLoadedPanel(<CodexQueuePanel sessionId="s1" />);
     fireEvent.click(await screen.findByTestId("codex-queue-prioritize-a1"));
     fireEvent.click(screen.getByTestId("codex-queue-prioritize-yes-a1"));
     await waitFor(() =>
@@ -1012,7 +1047,7 @@ describe("CodexQueuePanel：T06 先处理这条", () => {
         }),
       ]),
     ];
-    await renderAndExpand(<CodexQueuePanel sessionId="s1" />);
+    await renderLoadedPanel(<CodexQueuePanel sessionId="s1" />);
     const preview = await screen.findByTestId("codex-queue-preview-a1");
     // 尾部 [mobile …] 签名剥离；预览是普通文本节点（不 aria-hidden，可被读屏读到）
     expect(preview.textContent).toBe("帮我看看这个报错");
@@ -1036,7 +1071,7 @@ describe("CodexQueuePanel：T06 先处理这条", () => {
         }),
       ]),
     ];
-    await renderAndExpand(<CodexQueuePanel sessionId="s1" />);
+    await renderLoadedPanel(<CodexQueuePanel sessionId="s1" />);
     await screen.findByTestId("codex-queue-row-a1");
     expect(screen.queryByTestId("codex-queue-preview-a1")).toBeNull();
     expect(screen.queryByTestId("codex-queue-preview-a2")).toBeNull();
@@ -1047,7 +1082,7 @@ describe("CodexQueuePanel：T06 先处理这条", () => {
   it("queue_row_text_preview_truncate：剥签名后超过 40 字符 → 截前 40 字符 + 省略号（按字符数）", async () => {
     installFetch();
     routes.queue = [queueView([action({ actionId: "a1", textPreview: "字".repeat(50) })])];
-    await renderAndExpand(<CodexQueuePanel sessionId="s1" />);
+    await renderLoadedPanel(<CodexQueuePanel sessionId="s1" />);
     const preview = await screen.findByTestId("codex-queue-preview-a1");
     expect(preview.textContent).toBe("字".repeat(40) + "…");
   });
@@ -1062,7 +1097,7 @@ describe("CodexQueuePanel：T06 先处理这条", () => {
         }),
       ]),
     ];
-    await renderAndExpand(<CodexQueuePanel sessionId="s1" />);
+    await renderLoadedPanel(<CodexQueuePanel sessionId="s1" />);
     const preview = await screen.findByTestId("codex-queue-preview-a1");
     // 单行归一（无换行）；<image …> → [附件]（mobile.composer.attachMark 同文案）；
     // 尾部签名剥离
@@ -1085,7 +1120,7 @@ describe("CodexQueuePanel：T06 先处理这条", () => {
         }),
       ]),
     ];
-    await renderAndExpand(<CodexQueuePanel sessionId="s1" />);
+    await renderLoadedPanel(<CodexQueuePanel sessionId="s1" />);
     const row = await screen.findByTestId("codex-queue-row-a1");
     // 行容器必须禁换行（nowrap）：单行排版的前提
     expect(row.className).toContain("flex-nowrap");
@@ -1128,7 +1163,7 @@ describe("CodexQueuePanel：T06 先处理这条", () => {
       queueView([action({ actionId: "a1", position: 1 })], null, [], true, true),
       queueView([action({ actionId: "a1", position: 1 })], null, [], true, true),
     ];
-    await renderAndExpand(<CodexQueuePanel sessionId="s1" />);
+    await renderLoadedPanel(<CodexQueuePanel sessionId="s1" />);
     fireEvent.click(await screen.findByTestId("codex-queue-prioritize-a1"));
     fireEvent.click(screen.getByTestId("codex-queue-prioritize-yes-a1"));
     await waitFor(() =>
@@ -1153,7 +1188,7 @@ describe("CodexQueuePanel：T06 先处理这条", () => {
       queueView([action({ actionId: "a1", position: 1 })], null, [], true, true),
       queueView([action({ actionId: "a1", position: 1 })], null, [], true, true),
     ];
-    await renderAndExpand(<CodexQueuePanel sessionId="s1" />);
+    await renderLoadedPanel(<CodexQueuePanel sessionId="s1" />);
     fireEvent.click(await screen.findByTestId("codex-queue-prioritize-a1"));
     fireEvent.click(screen.getByTestId("codex-queue-prioritize-yes-a1"));
     await waitFor(() =>
@@ -1189,7 +1224,7 @@ describe("priority queue reconciliation", () => {
           action: action({ state: "accepted", position: null }),
         };
       }
-      const panel = await renderAndExpand(<CodexQueuePanel sessionId="s1" />);
+      const panel = await renderLoadedPanel(<CodexQueuePanel sessionId="s1" />);
       vi.useFakeTimers();
       routes.queueHang = true;
       await confirmPriority();
@@ -1223,7 +1258,7 @@ describe("priority queue reconciliation", () => {
       reasonCode: code,
       ...(result === "not_sent" ? { queued: true, receipt: null } : {}),
     };
-    await renderAndExpand(<CodexQueuePanel sessionId="s1" />);
+    await renderLoadedPanel(<CodexQueuePanel sessionId="s1" />);
     vi.useFakeTimers();
     await confirmPriority();
     expect(queueGetCalls()).toBe(2);
@@ -1264,7 +1299,7 @@ describe("priority queue reconciliation", () => {
     routes.queue = [both];
     routes.queueFailAfterInitial = true;
     mockBusyRefusal();
-    await renderAndExpand(<CodexQueuePanel sessionId="s1" />);
+    await renderLoadedPanel(<CodexQueuePanel sessionId="s1" />);
     vi.useFakeTimers();
     await confirmPriority();
     expect(screen.getByTestId("codex-queue-note").textContent).not.toMatch(/仍在队列|仍在排队/);
@@ -1283,7 +1318,7 @@ describe("priority queue reconciliation", () => {
     installFetch();
     routes.queue = [both, both, remaining];
     mockBusyRefusal();
-    await renderAndExpand(<CodexQueuePanel sessionId="s1" />);
+    await renderLoadedPanel(<CodexQueuePanel sessionId="s1" />);
     vi.useFakeTimers();
     await confirmPriority();
     routes.queueHang = true;
@@ -1306,7 +1341,7 @@ describe("priority queue reconciliation", () => {
     installFetch();
     routes.queue = [both, both, remaining, both];
     mockBusyRefusal();
-    await renderAndExpand(<CodexQueuePanel sessionId="s1" />);
+    await renderLoadedPanel(<CodexQueuePanel sessionId="s1" />);
     vi.useFakeTimers();
     await confirmPriority();
     await act(async () => vi.advanceTimersByTimeAsync(2000));
@@ -1321,7 +1356,7 @@ describe("priority queue reconciliation", () => {
       installFetch();
       routes.queue = [both, both, remaining];
       mockBusyRefusal();
-      const panel = await renderAndExpand(<CodexQueuePanel sessionId="s1" />);
+      const panel = await renderLoadedPanel(<CodexQueuePanel sessionId="s1" />);
       vi.useFakeTimers();
       await confirmPriority();
       routes.queueHang = true;
@@ -1357,7 +1392,7 @@ describe("queue resolution reason", () => {
     installFetch();
     routes.prioritizeBody = body;
     routes.queue = [queueView([action()]), queueView([next])];
-    await renderAndExpand(<CodexQueuePanel sessionId="s1" />);
+    await renderLoadedPanel(<CodexQueuePanel sessionId="s1" />);
     fireEvent.click(await screen.findByTestId("codex-queue-prioritize-a1"));
     expect(prioritizeBodies()).toHaveLength(0);
     fireEvent.click(screen.getByTestId("codex-queue-prioritize-yes-a1"));
@@ -1523,7 +1558,7 @@ describe("queue resolution reason", () => {
         routes.prioritizeStatus = status;
         routes.prioritizeErrorBody = body;
         routes.queue = [queueView([action()]), queueView([action()])];
-        await renderAndExpand(<CodexQueuePanel sessionId="s1" />);
+        await renderLoadedPanel(<CodexQueuePanel sessionId="s1" />);
         fireEvent.click(await screen.findByTestId("codex-queue-prioritize-a1"));
         fireEvent.click(screen.getByTestId("codex-queue-prioritize-yes-a1"));
         const note = await screen.findByTestId("codex-queue-note");
@@ -1596,7 +1631,7 @@ describe("queue resolution reason", () => {
       installFetch();
       routes.prioritizeBody = { result: "unknown", actionId: "a1", reasonCode: reason };
       routes.queue = [queueView([action()]), queueView([]), queueView([])];
-      await renderAndExpand(<CodexQueuePanel sessionId="s1" />);
+      await renderLoadedPanel(<CodexQueuePanel sessionId="s1" />);
       fireEvent.click(await screen.findByTestId("codex-queue-prioritize-a1"));
       expect(prioritizeBodies()).toHaveLength(0);
       fireEvent.click(screen.getByTestId("codex-queue-prioritize-yes-a1"));
@@ -1630,7 +1665,7 @@ describe("queue resolution reason", () => {
       routes.prioritizeBody = { result: "unknown", actionId: "a1", reasonCode: "stop_timeout" };
       routes.queue = [queueView([action()])];
       routes.queueFailAfterInitial = true;
-      await renderAndExpand(<CodexQueuePanel sessionId="s1" />);
+      await renderLoadedPanel(<CodexQueuePanel sessionId="s1" />);
       fireEvent.click(await screen.findByTestId("codex-queue-prioritize-a1"));
       fireEvent.click(screen.getByTestId("codex-queue-prioritize-yes-a1"));
       await waitFor(() => expect(queueGetCalls()).toBeGreaterThanOrEqual(2));
@@ -1665,7 +1700,7 @@ describe("queue resolution reason", () => {
       routes.prioritizeBody = { result: "unknown", actionId: "a1", reasonCode: reason };
       const remaining = queueView([action({ actionId: "a2", position: 1 })]);
       routes.queue = [queueView([action()]), remaining, remaining, remaining];
-      await renderAndExpand(<CodexQueuePanel sessionId="s1" />);
+      await renderLoadedPanel(<CodexQueuePanel sessionId="s1" />);
       fireEvent.click(await screen.findByTestId("codex-queue-prioritize-a1"));
       expect(prioritizeBodies()).toHaveLength(0);
       fireEvent.click(screen.getByTestId("codex-queue-prioritize-yes-a1"));
@@ -1704,7 +1739,7 @@ describe("queue resolution reason", () => {
           queueView([action()]),
           queueView([action({ actionId: "a2", position: 1 })], "native_delivery_unknown", ["a1"]),
         ];
-        await renderAndExpand(<CodexQueuePanel sessionId="s1" />);
+        await renderLoadedPanel(<CodexQueuePanel sessionId="s1" />);
         fireEvent.click(await screen.findByTestId("codex-queue-prioritize-a1"));
         expect(prioritizeBodies()).toHaveLength(0);
         fireEvent.click(screen.getByTestId("codex-queue-prioritize-yes-a1"));
@@ -1862,7 +1897,7 @@ describe("queue resolution reason", () => {
       routes.prioritizeStatus = 503;
       routes.prioritizeErrorBody = { error: "capability_unavailable" };
       routes.queue = [queueView([action()]), queueView([action()])];
-      await renderAndExpand(<CodexQueuePanel sessionId="s1" />);
+      await renderLoadedPanel(<CodexQueuePanel sessionId="s1" />);
       fireEvent.click(await screen.findByTestId("codex-queue-prioritize-a1"));
       fireEvent.click(screen.getByTestId("codex-queue-prioritize-yes-a1"));
       const note = (await screen.findByTestId("codex-queue-note")).textContent ?? "";
@@ -1885,7 +1920,7 @@ describe("queue resolution reason", () => {
       routes.prioritizeStatus = 500;
       routes.prioritizeErrorBody = { error: "internal" };
       routes.queue = [queueView([action()]), queueView([action()])];
-      await renderAndExpand(<CodexQueuePanel sessionId="s1" />);
+      await renderLoadedPanel(<CodexQueuePanel sessionId="s1" />);
       fireEvent.click(await screen.findByTestId("codex-queue-prioritize-a1"));
       fireEvent.click(screen.getByTestId("codex-queue-prioritize-yes-a1"));
       const note = (await screen.findByTestId("codex-queue-note")).textContent ?? "";
@@ -1927,7 +1962,7 @@ describe("queue resolution reason", () => {
       routes.prioritizeStatus = 500;
       routes.prioritizeErrorBody = { error: "internal" };
     }
-    await renderAndExpand(<CodexQueuePanel sessionId="s1" />);
+    await renderLoadedPanel(<CodexQueuePanel sessionId="s1" />);
     expect(queueGetCalls()).toBe(1);
     routes.queueHang = true; // 仅挂起 POST 收尾 GET；挂载 GET 已成功。
     fireEvent.click(await screen.findByTestId("codex-queue-prioritize-a1"));
@@ -1982,7 +2017,7 @@ describe("queue resolution reason", () => {
     installFetch();
     routes.queue = [queueView([action()])];
     routes.prioritizeBody = { result: "unknown", actionId: "a1", reasonCode: "stop_timeout" };
-    await renderAndExpand(<CodexQueuePanel sessionId="s1" />);
+    await renderLoadedPanel(<CodexQueuePanel sessionId="s1" />);
     routes.queueHang = true;
     fireEvent.click(await screen.findByTestId("codex-queue-prioritize-a1"));
     vi.useFakeTimers();
@@ -2013,7 +2048,7 @@ describe("queue resolution reason", () => {
     installFetch();
     routes.queue = [queueView([action(), action({ actionId: "a2", position: 2 })])];
     routes.prioritizeBody = { result: "unknown", actionId: "a1", reasonCode: "stop_timeout" };
-    await renderAndExpand(<CodexQueuePanel sessionId="s1" />);
+    await renderLoadedPanel(<CodexQueuePanel sessionId="s1" />);
     routes.queueHang = true;
     fireEvent.click(await screen.findByTestId("codex-queue-prioritize-a1"));
     vi.useFakeTimers();
@@ -2055,7 +2090,7 @@ describe("queue resolution reason", () => {
       installFetch();
       routes.prioritizeNetworkError = true;
       routes.queue = [queueView([action()]), queueView([action()])];
-      await renderAndExpand(<CodexQueuePanel sessionId="s1" />);
+      await renderLoadedPanel(<CodexQueuePanel sessionId="s1" />);
       fireEvent.click(await screen.findByTestId("codex-queue-prioritize-a1"));
       fireEvent.click(screen.getByTestId("codex-queue-prioritize-yes-a1"));
       const note = (await screen.findByTestId("codex-queue-note")).textContent ?? "";
@@ -2072,7 +2107,7 @@ describe("queue resolution reason", () => {
     installFetch();
     routes.prioritizeHang = true;
     routes.queue = [queueView([action()])];
-    await renderAndExpand(<CodexQueuePanel sessionId="s1" />);
+    await renderLoadedPanel(<CodexQueuePanel sessionId="s1" />);
     fireEvent.click(await screen.findByTestId("codex-queue-prioritize-a1"));
     const yes = screen.getByTestId("codex-queue-prioritize-yes-a1");
     fireEvent.click(yes);
@@ -2089,7 +2124,7 @@ describe("CodexQueuePanel stop pause", () => {
   it("describes an automatically released stop pause as temporary", async () => {
     installFetch();
     routes.queue = [automaticPause];
-    await renderAndExpand(<CodexQueuePanel sessionId="s1" />);
+    await renderLoadedPanel(<CodexQueuePanel sessionId="s1" />);
 
     expect(screen.getByTestId("codex-queue-summary").textContent).toMatch(/临时|暂时|短暂|暂缓/);
     expect(screen.getByTestId("codex-queue-paused").textContent).toMatch(/自动(?:恢复|继续)/);
@@ -2102,7 +2137,6 @@ describe("CodexQueuePanel stop pause", () => {
     await act(async () => {
       render(<CodexQueuePanel sessionId="s1" />);
     });
-    fireEvent.click(screen.getByTestId("codex-queue-toggle"));
 
     expect(screen.queryByTestId("codex-queue-resume")).toBeNull();
     await act(async () => vi.advanceTimersByTimeAsync(30_000));
@@ -2115,10 +2149,47 @@ describe("CodexQueuePanel stop pause", () => {
   ])("retains manual recovery for a $name", async ({ view }) => {
     installFetch();
     routes.queue = [view];
-    await renderAndExpand(<CodexQueuePanel sessionId="s1" />);
+    await renderLoadedPanel(<CodexQueuePanel sessionId="s1" />);
 
     expect(screen.getByTestId("codex-queue-summary").textContent).toContain("已暂停");
     expect(screen.getByTestId("codex-queue-paused").textContent).toContain("等待你的选择");
     expect(screen.getByTestId("codex-queue-resume")).toBeTruthy();
+  });
+
+  // 线程级暂停只存在于本设备 actions=[] 时，空队列自隐不得吞掉唯一的人工出口。
+  it.each([
+    { name: "no barrier code", blockedReasonCode: null },
+    { name: "native turn pending", blockedReasonCode: "native_turn_pending" },
+  ])(
+    "shows manual Resume for a thread-level pause with an empty queue and $name",
+    async ({ blockedReasonCode }) => {
+      installFetch();
+      routes.queue = [
+        {
+          ...queueView([], blockedReasonCode, [], true, true),
+          stopPauseAutoResumes: false,
+        },
+      ];
+      await renderLoadedPanel(<CodexQueuePanel sessionId="s1" />);
+
+      expect(screen.getByTestId("codex-queue-summary").getAttribute("data-paused")).toBe("true");
+      expect(screen.getByTestId("codex-queue-paused").textContent).toContain("等待你的选择");
+      expect(screen.getByTestId("codex-queue-resume")).toBeVisible();
+    }
+  );
+
+  it("keeps an auto-resuming stop pause with an empty queue hidden", async () => {
+    installFetch();
+    routes.queue = [
+      {
+        ...queueView([], null, [], true, true),
+        stopPauseAutoResumes: true,
+      },
+    ];
+    render(<CodexQueuePanel sessionId="s1" />);
+    await act(async () => {});
+
+    expect(screen.queryByTestId("codex-queue-panel")).toBeNull();
+    expect(screen.queryByTestId("codex-queue-resume")).toBeNull();
   });
 });

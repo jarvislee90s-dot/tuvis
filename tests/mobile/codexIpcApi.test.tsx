@@ -1017,6 +1017,41 @@ describe("codexIpcApi：historyToken 归一化（Task 5）", () => {
   });
 });
 
+describe("正式答复消息归一化", () => {
+  it("keeps the ordered group once in both current snapshots and older pages", async () => {
+    installFetch();
+    const answers = [3, 1, 2].map((n) => ({
+      questionKey: `q-${n}`,
+      question: `Question ${n}`,
+      answer: `Answer ${n}`,
+      correlated: n !== 3,
+    }));
+    const message = {
+      ...legacyMessage("group"),
+      text: "",
+      interactionAnswer: answers[0],
+      interactionAnswers: answers,
+    };
+    routes.thread = projection({ messages: [message] });
+    routes.messages = messagesPage({ status: "ready", messages: [message] });
+
+    const current = await fetchCodexThread("s1");
+    const older = await fetchCodexMessagesPage({ sessionId: "s1", historyToken: "v1-curr" });
+    expect(current?.messages[0]?.interactionAnswers).toEqual(answers);
+    expect(older.messages[0]).toEqual(current?.messages[0]);
+  });
+
+  it("normalizes the legacy singular field to a one-answer group", async () => {
+    installFetch();
+    const answer = { questionKey: "q", question: "Question", answer: "Answer", correlated: true };
+    routes.thread = projection({
+      messages: [{ ...legacyMessage("single"), text: "", interactionAnswer: answer }],
+    });
+    const current = await fetchCodexThread("s1");
+    expect(current?.messages[0]?.interactionAnswers).toEqual([answer]);
+  });
+});
+
 describe("codexIpcApi：fetchCodexMessagesPage（同代只读历史页）", () => {
   it("messages_page_query_contract：session_id/history_token/before_id/limit 与 AbortSignal 原样上送", async () => {
     installFetch();

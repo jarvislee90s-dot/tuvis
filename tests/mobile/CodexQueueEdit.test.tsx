@@ -20,7 +20,7 @@ it("running queue has only row controls and re-edits only after server success",
   });
   const onEdit = vi.fn();
   render(<CodexQueuePanel sessionId="s1" onEditDraft={onEdit} />);
-  fireEvent.click(await screen.findByTestId("codex-queue-toggle"));
+  const editButton = await screen.findByTestId("codex-queue-edit-a1");
   expect(screen.queryByTestId("codex-queue-title")).toBeNull();
   expect(screen.queryByTestId("codex-queue-blocked")).toBeNull();
   expect(screen.queryByTestId("codex-queue-interrupt")).toBeNull();
@@ -30,7 +30,7 @@ it("running queue has only row controls and re-edits only after server success",
       resolve = r;
     })
   );
-  fireEvent.click(screen.getByTestId("codex-queue-edit-a1"));
+  fireEvent.click(editButton);
   expect(onEdit).not.toHaveBeenCalled();
   resolve({ actionId: "a1", text: "original" });
   await waitFor(() =>
@@ -47,8 +47,8 @@ it("failed CAS never fills a draft and stale session responses never transfer", 
   vi.mocked(api.editCodexQueueMessage).mockRejectedValueOnce(new Error("already dispatched"));
   const onEdit = vi.fn();
   const { rerender } = render(<CodexQueuePanel sessionId="s1" onEditDraft={onEdit} />);
-  fireEvent.click(await screen.findByTestId("codex-queue-toggle"));
-  fireEvent.click(screen.getByTestId("codex-queue-edit-a1"));
+  const editButton = await screen.findByTestId("codex-queue-edit-a1");
+  fireEvent.click(editButton);
   await screen.findByTestId("codex-queue-note");
   expect(onEdit).not.toHaveBeenCalled();
   let resolve!: (v: { actionId: string; text: string }) => void;
@@ -57,7 +57,7 @@ it("failed CAS never fills a draft and stale session responses never transfer", 
       resolve = r;
     })
   );
-  fireEvent.click(screen.getByTestId("codex-queue-edit-a1"));
+  fireEvent.click(editButton);
   rerender(<CodexQueuePanel sessionId="s2" onEditDraft={onEdit} />);
   resolve({ actionId: "a1", text: "old" });
   await waitFor(() =>
@@ -75,8 +75,8 @@ it("queue_resolution_reason_double_click_posts_once while edit is in flight", as
   vi.mocked(api.editCodexQueueMessage).mockReturnValue(new Promise(() => {}));
   vi.mocked(api.prioritizeCodexQueueMessage).mockClear();
   render(<CodexQueuePanel sessionId="s1" onEditDraft={vi.fn()} />);
-  fireEvent.click(await screen.findByTestId("codex-queue-toggle"));
-  fireEvent.click(screen.getByTestId("codex-queue-edit-a1"));
+  const editButton = await screen.findByTestId("codex-queue-edit-a1");
+  fireEvent.click(editButton);
   expect((screen.getByTestId("codex-queue-prioritize-a1") as HTMLButtonElement).disabled).toBe(
     true
   );
@@ -98,8 +98,8 @@ it("unmount invalidates an in-flight edit callback", async () => {
   );
   const onEdit = vi.fn();
   const { unmount } = render(<CodexQueuePanel sessionId="s1" onEditDraft={onEdit} />);
-  fireEvent.click(await screen.findByTestId("codex-queue-toggle"));
-  fireEvent.click(screen.getByTestId("codex-queue-edit-a1"));
+  const editButton = await screen.findByTestId("codex-queue-edit-a1");
+  fireEvent.click(editButton);
   unmount();
   resolve({ actionId: "a1", text: "old" });
   await Promise.resolve();

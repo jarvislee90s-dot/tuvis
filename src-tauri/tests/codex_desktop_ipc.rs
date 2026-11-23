@@ -5204,6 +5204,7 @@ fn artifacts_serialized_window_counts_commas_for_retained_non_newest_message() {
         turn_image_count: 0,
         omitted_artifact_count: 0,
         interaction_answer: None,
+        interaction_answers: Vec::new(),
     })
     .unwrap()
     .len();

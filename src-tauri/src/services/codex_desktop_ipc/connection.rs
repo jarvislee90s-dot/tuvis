@@ -181,6 +181,7 @@ struct FrameCmd {
     /// N03：**首次写出硬截止**——writer 授予写权与 write_all 前都要检查；到点即
     /// 强零投递（不再保留“未发帧的永久首写资格”）。
     first_write_deadline: Option<tokio::time::Instant>,
+    scoped_first_write: bool,
     /// Task7：调度准入伴随（crate 内 request_with_admission 注入；`None` = 无
     /// 优先伴随，writer 预 claim 准入点直通）。经私有载体（FrameWriteContext）
     /// 而非 public `RpcRequest` 字段传递。
@@ -209,6 +210,7 @@ impl FrameCmd {
             interaction_recheck: None,
             async_write_recheck: None,
             first_write_deadline: None,
+            scoped_first_write: false,
             admission: None,
         }
     }
@@ -400,6 +402,7 @@ impl ConnectionHandle {
                 interaction_recheck: None,
                 async_write_recheck: None,
                 first_write_deadline: None,
+                scoped_first_write: false,
                 admission: None,
             };
             match this.main_tx.try_send(cmd) {
@@ -422,7 +425,7 @@ impl ConnectionHandle {
         req: RpcRequest,
     ) -> Pin<Box<dyn std::future::Future<Output = RpcOutcome> + Send + '_>> {
         let this = self.clone();
-        Box::pin(async move { this.request_inner(req, None).await })
+        Box::pin(async move { this.request_inner(req, None, None).await })
     }
 
     /// Task7：携带调度准入伴随的 crate 内请求入口（public `RpcRequest` 字段与
@@ -431,9 +434,13 @@ impl ConnectionHandle {
         &self,
         req: RpcRequest,
         admission: std::sync::Arc<crate::services::codex_desktop_ipc::types::AttemptAdmission>,
+        first_write_deadline: Option<tokio::time::Instant>,
     ) -> Pin<Box<dyn std::future::Future<Output = RpcOutcome> + Send + '_>> {
         let this = self.clone();
-        Box::pin(async move { this.request_inner(req, Some(admission)).await })
+        Box::pin(async move {
+            this.request_inner(req, Some(admission), first_write_deadline)
+                .await
+        })
     }
 
     /// 终审 R2：注入写右判定（生产 = remote 层；`None` = 放行）。连接建立后设置。
@@ -508,6 +515,7 @@ impl ConnectionHandle {
         admission: Option<
             std::sync::Arc<crate::services::codex_desktop_ipc::types::AttemptAdmission>,
         >,
+        first_write_deadline: Option<tokio::time::Instant>,
     ) -> RpcOutcome {
         let envelope_id = super::types::new_uuid();
         // 等握手成功（initialized）或连接死亡；握手超时由 handshake 任务执行
@@ -626,7 +634,8 @@ impl ConnectionHandle {
             compat_licensed: req.compat_licensed,
             interaction_recheck: req.interaction_recheck.clone(),
             async_write_recheck: req.async_write_recheck.clone(),
-            first_write_deadline: req.deadline,
+            first_write_deadline: first_write_deadline.or(req.deadline),
+            scoped_first_write: first_write_deadline.is_some(),
             admission,
         };
         if let Err(e) = self.main_tx.try_send(cmd) {
@@ -837,6 +846,32 @@ pub fn spawn_with_tuning(
 /// 写右最终判定（只读）→ 测试缝 → **claim 取得首次写出权**（复审 R-T1 原子线性
 /// 化点）；
 /// 一旦越过 claim 开始尝试写帧即越过保守投递边界（此后一切非明确回执 = Unknown）。
+async fn write_scoped_frame<W: tokio::io::AsyncWrite + Unpin>(
+    io: &mut W,
+    frame: &[u8],
+    recheck: Option<&crate::services::codex_desktop_ipc::types::InteractionRecheck>,
+    deadline: tokio::time::Instant,
+) -> Result<std::io::Result<()>, String> {
+    use std::task::Poll;
+    let first_write = std::future::poll_fn(|cx| {
+        if let Some(reason) = recheck.and_then(|check| check()) {
+            return Poll::Ready(Err(reason));
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Poll::Ready(Err("front_budget_exhausted".into()));
+        }
+        std::pin::Pin::new(&mut *io).poll_write(cx, frame).map(Ok)
+    });
+    let written = tokio::time::timeout_at(deadline, first_write)
+        .await
+        .map_err(|_| "front_budget_exhausted".to_string())??;
+    Ok(match written {
+        Ok(0) => Err(std::io::ErrorKind::WriteZero.into()),
+        Ok(written) => io.write_all(&frame[written..]).await,
+        Err(error) => Err(error),
+    })
+}
+
 async fn writer_task<W: tokio::io::AsyncWrite + Unpin + Send>(
     mut io: W,
     shared: Arc<ConnectionShared>,
@@ -1149,8 +1184,34 @@ async fn writer_task<W: tokio::io::AsyncWrite + Unpin + Send>(
             .await;
             continue;
         }
-        // 跨越保守投递边界
-        let written = io.write_all(&cmd.frame).await;
+        // 显式插队的帧在 transport 返回 Pending 时仍未写入。独立计时保证没有
+        // transport 唤醒时也能按绝对截止退出。
+        let written = if cmd.scoped_first_write {
+            let deadline = cmd.first_write_deadline.expect("scoped write has deadline");
+            match write_scoped_frame(
+                &mut io,
+                &cmd.frame,
+                cmd.interaction_recheck.as_ref(),
+                deadline,
+            )
+            .await
+            {
+                Ok(written) => written,
+                Err(reason) => {
+                    shared.budget.release(cmd.frame.len());
+                    shared.late.release(&cmd.envelope_id);
+                    complete_pending(
+                        &shared,
+                        &cmd.envelope_id,
+                        RpcOutcome::not_sent(cmd.envelope_id.clone(), &reason),
+                    )
+                    .await;
+                    continue;
+                }
+            }
+        } else {
+            io.write_all(&cmd.frame).await
+        };
         shared.budget.release(cmd.frame.len());
         if written.is_err() {
             complete_pending(
@@ -1301,6 +1362,7 @@ async fn handle_frame(
                     interaction_recheck: None,
                     async_write_recheck: None,
                     first_write_deadline: None,
+                    scoped_first_write: false,
                     admission: None,
                 });
             }
@@ -1426,6 +1488,7 @@ async fn initialize_handshake(handle: ConnectionHandle, shared: Arc<ConnectionSh
             interaction_recheck: None,
             async_write_recheck: None,
             first_write_deadline: None,
+            scoped_first_write: false,
             admission: None,
         })
         .is_err()
