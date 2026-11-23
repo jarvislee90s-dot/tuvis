@@ -1,7 +1,6 @@
 //! OpenCode TUI 窗口观察（R1：看板会话匹配的事实来源）。
 //!
-//! 证据：`docs/engineering/evidence/opencode-native/product-completion/
-//! 2026-11-10-window-session-binding-probe.md` §2/§5/§9（R0/R0b）——免配置来源全部
+//! 窗口观察的 R0/R0b 探测中，免配置来源全部
 //! 不可用（`/api/tui/*` 不存在、`session/active` 空闲恒空、DB time 族不变、argv/env
 //! 无会话、tabs.json 集合级且跨窗覆盖）；**一次配置可用** = TUI 侧只读插件按需同步读
 //! `ctx.ui.router.current()`（`GET /current`），插件与 TUI 共亡（端口拒绝 = 窗口消失）。

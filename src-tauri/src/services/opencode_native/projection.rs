@@ -869,9 +869,7 @@ fn text_of(value: &Value) -> Option<&str> {
         .or_else(|| value.pointer("/payload/text").and_then(Value::as_str))
 }
 
-/// 系统提醒的 XML 包裹标签（OpenCode 的 `session.synthetic` 注入形态，
-/// 实证见 `docs/engineering/evidence/opencode-native/product-completion/
-/// runtime-responses.json`）。
+/// OpenCode `session.synthetic` 记录的系统提醒 XML 包裹标签。
 const SYSTEM_REMINDER_OPEN: &str = "<system-reminder>";
 const SYSTEM_REMINDER_CLOSE: &str = "</system-reminder>";
 
@@ -7719,8 +7717,7 @@ mod tests {
     /// 必须留在**正文区**，作为默认折叠的过程消息（`kind="system-note"`）出现，
     /// 且 XML 包裹标签**不得**原样显示给用户。
     ///
-    /// 现场形态（`docs/engineering/evidence/opencode-native/product-completion/
-    /// runtime-responses.json` records[21]）：`{id, time.created, type:"synthetic",
+    /// 现场记录形态：`{id, time.created, type:"synthetic",
     /// text:"<system-reminder>\nYou are in Plan mode. …\n</system-reminder>"}`。
     #[test]
     fn system_note_projection_strips_reminder_tags_and_collapses() {

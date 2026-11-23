@@ -1,6 +1,6 @@
 //! 整组答题的可信完整性校验（计划任务 6）。
 //!
-//! 纪律（任务 0 已证，见 `docs/engineering/evidence/opencode-native/followup/`）：
+//! 表单规则由本模块的原生契约回归覆盖：
 //!
 //! * **合法跳过 = 省略键**：`DraftAnswer::Skip` 编码成「不写入 answer 对象」；
 //!   `""` 对 `required:true` 字段是 400 `Missing required`，因此空串不是跳过编码，

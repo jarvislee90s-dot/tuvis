@@ -3377,8 +3377,7 @@ async fn view_claims_the_route_when_the_switch_is_on() {
 }
 
 // O-M9-2 ①（patch6）：view 认领拒绝体携带路由行版本——「尚未接管」面重选自愈。
-// M9 交付入口链实测（docs/engineering/acceptance/2026-11-16-m9-freeze-delivery-chain.md
-// §6 O-M9-2）：候选重启后路由行 active v1 指向死亡代际，页面刷新的 view 认领 409
+// 候选重启后路由行 active v1 指向死亡代际，页面刷新的 view 认领 409
 // 拒绝体不携带 routeVersion → 面板重选 POST 缺 routeVersion 必再 409（结构性循环；
 // N7 场景 12 能走通的前提是「页面不刷新」）。修复：路由行在场时，`view_and_claim_bound`
 // 的拒绝体追加只读的 `routeVersion`（数据库事实，零凭据零副作用）；无路由行（缺省态）

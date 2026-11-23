@@ -2,7 +2,7 @@
 //!
 //! 本模块只承载 OpenCode 默认后台 service 的原生读写：发现、传输、投影、动作与
 //! 答题校验按计划逐任务拆分到独立文件。设计依据
-//! `docs/engineering/plans/2026-10-29-OpenCode-macOS原生交互首批实施计划.md`。
+//! `docs/engineering/specs/2026-11-01-OpenCode原生功能总表.md`。
 
 #[cfg(all(feature = "opencode-coordinator-tests", not(debug_assertions)))]
 compile_error!("opencode-coordinator-tests is forbidden in release builds");
