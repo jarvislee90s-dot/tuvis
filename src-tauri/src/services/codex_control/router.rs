@@ -4352,7 +4352,7 @@ mod priority_owner_tests {
                 _ => panic!("已过期意图不得阻止新 owner"),
             };
         assert_ne!(old.owner, new.owner);
-        router.priority_registry_bind_attempt(&key, &old, "same-action", 17);
+        router.priority_registry_bind_attempt(&key, &old, "same-action", 17, None);
         {
             let reg = router.priority_intents.lock().unwrap();
             let entry = reg.get(&key).unwrap();
@@ -4368,7 +4368,7 @@ mod priority_owner_tests {
             assert_eq!(entry.owner, new.owner);
             assert_eq!(entry.attempt, None);
         }
-        router.priority_registry_bind_attempt(&key, &new, "same-action", 23);
+        router.priority_registry_bind_attempt(&key, &new, "same-action", 23, None);
         assert_eq!(
             router
                 .priority_intents
