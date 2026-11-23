@@ -1381,12 +1381,10 @@ fn ensure_project_matches_bound_workspace(
 }
 
 pub(crate) fn legacy_disabled_response() -> Response {
+    let error = policy::legacy_disabled();
     json_no_store(
         StatusCode::CONFLICT,
-        serde_json::json!({
-            "error": "OC_LEGACY_DISABLED", "reasonCode": "OC_LEGACY_DISABLED",
-            "reason": "OC_LEGACY_DISABLED: OpenCode 当前仅允许原生交互，旧终端交互已停用"
-        }),
+        serde_json::json!({"error": error.code, "reasonCode": error.code, "reason": error.message}),
     )
 }
 

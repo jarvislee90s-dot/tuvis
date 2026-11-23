@@ -144,15 +144,16 @@ export function OpenCodeNativeSection() {
     }
   };
 
-  /** 观察插件一步：成功用回执定状态；异常如实记因并回读真实状态。 */
-  const installObserverStep = async () => {
+  const updateObserver = async (
+    operation: () => Promise<OpenCodeObserverStatus>,
+    changedStatus: OpenCodeObserverStatus
+  ) => {
     try {
-      const result = await installOpenCodeObserver();
+      const result = await operation();
       setObserver(result);
       setObserverQueryError(false);
-      // 成功即清掉上一次失败原因：否则修复成功后卡面仍停在「失败」，属谎报。
       setObserverActionError(null);
-      setObserverChanged(result === "current");
+      setObserverChanged(result === changedStatus);
     } catch (e) {
       setObserverActionError(describe(e));
       setObserverChanged(false);
@@ -160,34 +161,9 @@ export function OpenCodeNativeSection() {
     }
   };
 
-  const uninstallObserverStep = async () => {
+  const updateBridge = async (operation: () => Promise<OpenCodeBridgeView>) => {
     try {
-      const result = await uninstallOpenCodeObserver();
-      setObserver(result);
-      setObserverQueryError(false);
-      setObserverActionError(null);
-      setObserverChanged(result === "absent");
-    } catch (e) {
-      setObserverActionError(describe(e));
-      setObserverChanged(false);
-      await refreshObserver();
-    }
-  };
-
-  const installBridgeStep = async () => {
-    try {
-      setBridge(await installOpenCodeBridge());
-      setBridgeQueryError(false);
-      setBridgeActionError(null);
-    } catch (e) {
-      setBridgeActionError(describe(e));
-      await refreshBridge();
-    }
-  };
-
-  const uninstallBridgeStep = async () => {
-    try {
-      setBridge(await uninstallOpenCodeBridge());
+      setBridge(await operation());
       setBridgeQueryError(false);
       setBridgeActionError(null);
     } catch (e) {
@@ -204,11 +180,11 @@ export function OpenCodeNativeSection() {
     setBridgeActionError(null);
     try {
       if (target === "on") {
-        await installObserverStep();
-        await installBridgeStep();
+        await updateObserver(installOpenCodeObserver, "current");
+        await updateBridge(installOpenCodeBridge);
       } else {
-        await uninstallObserverStep();
-        await uninstallBridgeStep();
+        await updateObserver(uninstallOpenCodeObserver, "absent");
+        await updateBridge(uninstallOpenCodeBridge);
       }
     } finally {
       setBusy(false);
@@ -223,16 +199,13 @@ export function OpenCodeNativeSection() {
     setBridgeActionError(null);
     try {
       if (conflict) {
-        await installObserverStep();
+        await updateObserver(installOpenCodeObserver, "current");
         return;
       }
       const needObserver = observer !== "current";
-      let needBridge = !(
-        bridge?.install.pluginInstalled === true && bridge.install.configRegistered === true
-      );
-      if (!needObserver && !needBridge) needBridge = true;
-      if (needObserver) await installObserverStep();
-      if (needBridge) await installBridgeStep();
+      const needBridge = !installed || !needObserver;
+      if (needObserver) await updateObserver(installOpenCodeObserver, "current");
+      if (needBridge) await updateBridge(installOpenCodeBridge);
     } finally {
       setBusy(false);
     }
@@ -245,7 +218,7 @@ export function OpenCodeNativeSection() {
       setBusy(true);
       setObserverActionError(null);
       try {
-        await uninstallObserverStep();
+        await updateObserver(uninstallOpenCodeObserver, "absent");
       } finally {
         setBusy(false);
       }
@@ -259,12 +232,7 @@ export function OpenCodeNativeSection() {
     setBusy(true);
     setBridgeActionError(null);
     try {
-      setBridge(await reloadOpenCodeBridge());
-      setBridgeQueryError(false);
-      setBridgeActionError(null);
-    } catch (e) {
-      setBridgeActionError(describe(e));
-      await refreshBridge();
+      await updateBridge(reloadOpenCodeBridge);
     } finally {
       setBusy(false);
     }

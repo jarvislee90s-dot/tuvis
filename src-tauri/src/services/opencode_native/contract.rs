@@ -839,7 +839,10 @@ mod tests {
         let with_description = fixture("form.pending.json");
         let form = parse_form(&with_description).expect("金样可解析");
         assert_eq!(form.fields[0].description.as_deref(), Some("Pick a color"));
-        assert!(form.fields[1].description.is_none(), "未声明 description = None");
+        assert!(
+            form.fields[1].description.is_none(),
+            "未声明 description = None"
+        );
         assert!(form.fields[2].description.is_none());
 
         let mut legacy = with_description.clone();

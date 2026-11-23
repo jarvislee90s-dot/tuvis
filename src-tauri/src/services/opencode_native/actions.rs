@@ -1784,6 +1784,7 @@ impl NativeHub {
     }
 
     /// 条件交回：同会话路由写锁与数据库事务内都核对原目标。
+    #[cfg(any(test, feature = "opencode-coordinator-tests"))]
     pub async fn return_route_for_target(
         &self,
         target: &NativeTarget,
@@ -1793,32 +1794,7 @@ impl NativeHub {
             .await
     }
 
-    pub(crate) fn force_candidates_for_target(
-        &self,
-        target: &NativeTarget,
-    ) -> Result<(i64, Vec<String>), NativeError> {
-        let current = self.current_runtime();
-        let store = self.action_store();
-        self.store().with(|conn| {
-            let route = dao::route_conn(conn, &target.session_id)
-                .map_err(store_error)?
-                .filter(|route| route.same_runtime(target))
-                .ok_or_else(|| {
-                    NativeError::new(codes::OC_BINDING_STALE, "the selected native route changed")
-                })?;
-            let ids = dao::force_candidates_conn(
-                conn,
-                &target.session_id,
-                current.as_ref(),
-                &store.epoch,
-                &self.active_in_flight(),
-                Some(target),
-            )
-            .map_err(store_error)?;
-            Ok((route.route_version, ids))
-        })
-    }
-
+    #[cfg(any(test, feature = "opencode-coordinator-tests"))]
     pub(crate) async fn return_route_for_target_confirmed(
         &self,
         target: &NativeTarget,

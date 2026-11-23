@@ -1077,7 +1077,9 @@ pub fn kill_pid(pid: u32) -> Result<(), String> {
         {
             Ok(())
         } else {
-            Err(format!("SESSION_TERMINATION_FAILED:{pid}: 无法终止进程 {pid}"))
+            Err(format!(
+                "SESSION_TERMINATION_FAILED:{pid}: 无法终止进程 {pid}"
+            ))
         }
     } else {
         Err(format!("SESSION_PID_GONE:{pid}: 进程 {} 不存在", pid))

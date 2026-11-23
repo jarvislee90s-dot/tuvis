@@ -412,17 +412,6 @@ export default function OpenCodeNativePanel({
   );
   const readBinding = view?.sessionId === sessionId ? view.bindingToken : null;
 
-  if (typeof window !== "undefined" && (window as unknown as Record<string, unknown>).__OC_DIAG) {
-    console.log(
-      "PANEL_DIAG",
-      JSON.stringify({
-        sid: sessionId,
-        viewSid: view?.sessionId,
-        hasView: view !== null,
-        token: view?.bindingToken,
-      })
-    );
-  }
   const readBindingRef = useRef(readBinding);
   const readRouteVersion = view?.sessionId === sessionId ? view.routeVersion : undefined;
   const sessionIdRef = useRef(sessionId);

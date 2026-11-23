@@ -1071,22 +1071,9 @@ impl Fixture {
 
 // ---- 请求样板 ----
 
-fn req(
-    method: &str,
-    uri: &str,
-    cookie: Option<&str>,
-    body: Option<String>,
-) -> axum::http::Request<axum::body::Body> {
-    let mut b = axum::http::Request::builder().method(method).uri(uri);
-    if body.is_some() {
-        b = b.header("content-type", "application/json");
-    }
-    if let Some(c) = cookie {
-        b = b.header("cookie", c);
-    }
-    b.body(axum::body::Body::from(body.unwrap_or_default()))
-        .unwrap()
-}
+#[path = "support/opencode_http.rs"]
+mod opencode_http;
+use opencode_http::req;
 
 async fn body_of(resp: axum::http::Response<axum::body::Body>) -> String {
     use http_body_util::BodyExt;

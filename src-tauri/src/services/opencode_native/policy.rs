@@ -14,16 +14,6 @@ pub enum OpenCodeInteractionPolicy {
     LegacyCompatible,
 }
 
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct OpenCodeRoutingView {
-    pub policy: OpenCodeInteractionPolicy,
-    pub connection: &'static str,
-    pub native_owned: bool,
-    pub legacy_allowed: bool,
-    pub reason_code: Option<String>,
-}
-
 pub(crate) const fn legacy_retired() -> bool {
     cfg!(target_os = "macos")
 }
@@ -87,7 +77,7 @@ pub fn acquire_legacy(store: &DeviceStore, agent: AgentType) -> Result<Permit, N
     drop(active);
     Ok(Some(Arc::new(LegacyPermit { gate })))
 }
-fn legacy_disabled() -> NativeError {
+pub(crate) fn legacy_disabled() -> NativeError {
     NativeError::new(
         LEGACY_DISABLED,
         "OC_LEGACY_DISABLED: OpenCode 当前仅允许原生交互，旧终端交互已停用",

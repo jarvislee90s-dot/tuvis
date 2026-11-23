@@ -1671,22 +1671,9 @@ impl Fixture {
 
 // ---- 请求样板 ----
 
-fn req(
-    method: &str,
-    uri: &str,
-    cookie: Option<&str>,
-    body: Option<String>,
-) -> axum::http::Request<axum::body::Body> {
-    let mut b = axum::http::Request::builder().method(method).uri(uri);
-    if body.is_some() {
-        b = b.header("content-type", "application/json");
-    }
-    if let Some(c) = cookie {
-        b = b.header("cookie", c);
-    }
-    b.body(axum::body::Body::from(body.unwrap_or_default()))
-        .unwrap()
-}
+#[path = "support/opencode_http.rs"]
+mod opencode_http;
+use opencode_http::req;
 
 fn bound_get(uri: &str, token: &str) -> axum::http::Request<axum::body::Body> {
     let (mut parts, body) = req("GET", uri, Some(COOKIE), None).into_parts();
@@ -2248,7 +2235,8 @@ mod native_create_tests {
             tokio::time::timeout(Duration::from_secs(5), f.peer.info_reached.notified())
                 .await
                 .expect("赢家请求须抵达模拟服务的 GET /api/info");
-            let reply = tokio::time::timeout(Duration::from_secs(5), submit(&loser_directory)).await;
+            let reply =
+                tokio::time::timeout(Duration::from_secs(5), submit(&loser_directory)).await;
             f.peer.release_info.notify_one();
             reply.expect("冲突请求须在首个请求暂停时返回")
         };
@@ -3046,7 +3034,9 @@ async fn concurrent_same_name_uploads_send_distinct_files_over_http() {
     let url = "/m/api/v1/session-attachment?session_id=ses-1&name=same.txt&interaction_route=opencode_native";
     let upload = |text: &str| {
         let mut request = req("POST", url, Some(COOKIE), Some(text.to_owned()));
-        request.headers_mut().insert("x-opencode-expected-binding", token.parse().unwrap());
+        request
+            .headers_mut()
+            .insert("x-opencode-expected-binding", token.parse().unwrap());
         let app = f.app.clone();
         async move {
             let response = app.oneshot(request).await.unwrap();
@@ -3639,7 +3629,10 @@ async fn retract_preserves_native_owned_rows() {
 #[tokio::test]
 async fn retired_switch_keeps_legacy_disabled_and_native_available() {
     let f = Fixture::new(Switch::On, |dir| {
-        vec![opencode_session("ses-1", dir), opencode_session("ses-legacy", dir)]
+        vec![
+            opencode_session("ses-1", dir),
+            opencode_session("ses-legacy", dir),
+        ]
     })
     .await;
     let item = f.seed_pending_row("ses-legacy", "退役开关不得释放历史待发项");
@@ -3657,7 +3650,10 @@ async fn retired_switch_keeps_legacy_disabled_and_native_available() {
         assert_legacy_disabled(status, &body);
         assert_eq!(f.pending_rows("ses-1"), 0);
         assert_eq!(f.route_state("ses-1"), None);
-        assert_eq!(flush_one(&f.state, "ses-legacy", false), FlushOutcome::Deferred);
+        assert_eq!(
+            flush_one(&f.state, "ses-legacy", false),
+            FlushOutcome::Deferred
+        );
         assert_eq!(legacy_queue_row(&f, item), row);
         assert_eq!(f.pending_rows("ses-legacy"), 1);
         assert_eq!(f.route_state("ses-legacy"), None);
@@ -3862,8 +3858,12 @@ async fn explicit_legacy_return_preserves_active_and_historical_draining_routes(
         let before = route_version_snapshot(&f);
         assert_eq!(before.4, route);
         // 重放原请求和携带当前版本的请求都不能写入或推进版本。
-        for request in [initial_request.clone(), f.route_request("ses-1", token, false)] {
-            let (status, text) = post(&f.app, "/m/api/v1/opencode/route/legacy", COOKIE, request).await;
+        for request in [
+            initial_request.clone(),
+            f.route_request("ses-1", token, false),
+        ] {
+            let (status, text) =
+                post(&f.app, "/m/api/v1/opencode/route/legacy", COOKIE, request).await;
             assert_legacy_disabled(status, &text);
             assert_eq!(route_version_snapshot(&f), before);
             assert_eq!(legacy_queue_row(&f, item), row);
@@ -4008,7 +4008,10 @@ async fn old_send_racing_route_switch_yields_at_most_one_writer() {
 #[tokio::test]
 async fn flush_cannot_bypass_the_native_barrier() {
     let f = Fixture::new(Switch::On, |dir| {
-        vec![opencode_session("ses-1", dir), opencode_session("ses-legacy", dir)]
+        vec![
+            opencode_session("ses-1", dir),
+            opencode_session("ses-legacy", dir),
+        ]
     })
     .await;
     let (status, view) = f.view("ses-1").await;
@@ -4602,7 +4605,6 @@ async fn assert_legacy_blocked_before_screen_or_keys(f: Fixture, check_route_swi
     let (status, info) = f.get("/m/api/v1/session-send-info?session_id=ses-1").await;
     assert_eq!(status, 200);
     assert_eq!(info["openCodeRouting"]["legacyAllowed"], false);
-    assert!(multi_agents_manager_lib::remote::opencode_native::native_enabled(&f.state));
     if let Some(token) = route_token {
         let route_before = route_version_snapshot(&f);
         for force in [false, true] {
@@ -5227,8 +5229,7 @@ async fn t10_conditional_answers_validate_at_http_boundary_before_dispatch() {
     let (status, view) = f.view("ses-1").await;
     assert_eq!(status, 200);
     assert_eq!(
-        view["pending"][0]["fields"][0]["description"],
-        "确认要发布吗？",
+        view["pending"][0]["fields"][0]["description"], "确认要发布吗？",
         "字段题干必须出现在公开视图的字段上"
     );
     assert!(
@@ -7081,7 +7082,10 @@ async fn assert_old_route_version_rejected_after_aba(path: &str, force: bool) {
     assert!(f.injector.texts().is_empty() && f.injector.keys().is_empty());
     assert_eq!(status, 409, "旧路由版本应作为冲突拒绝：{body}");
     if path.ends_with("/native") {
-        assert!(body.contains("OC_BINDING_STALE"), "原生 ABA 必须由版本门拒绝：{body}");
+        assert!(
+            body.contains("OC_BINDING_STALE"),
+            "原生 ABA 必须由版本门拒绝：{body}"
+        );
     }
 }
 
@@ -7113,7 +7117,8 @@ async fn assert_retired_force_preserves_historical_candidates(replace: bool) {
     let request = serde_json::json!({
         "sessionId":"ses-1", "bindingToken":token, "routeVersion":view["routeVersion"],
         "force":true, "confirmedActionIds":["act_dead"]
-    }).to_string();
+    })
+    .to_string();
     if replace {
         f.state.store.with(|c| {
             c.execute(
@@ -9888,19 +9893,29 @@ async fn legacy_outbox_lists_only_own_frozen_pending_metadata_without_side_effec
     let item = f.seed_pending_row("ses-1", "private-legacy-message");
     let other_session = f.seed_pending_row("ses-2", "private-other-session");
     let other_rows = f.state.store.with(|c| {
-        [("opencode", "dev-2", None), ("claude", "dev-1", None), ("opencode", "dev-1", Some(2000_i64))]
-            .map(|(agent, device, sent_at)| {
-                c.execute(
-                    "INSERT INTO inject_queue (session_id, agent_type, device_id, device_name, \
+        [
+            ("opencode", "dev-2", None),
+            ("claude", "dev-1", None),
+            ("opencode", "dev-1", Some(2000_i64)),
+        ]
+        .map(|(agent, device, sent_at)| {
+            c.execute(
+                "INSERT INTO inject_queue (session_id, agent_type, device_id, device_name, \
                      content, enqueued_at, sent_at) VALUES ('ses-1', ?1, ?2, 'private-name', \
                      'private-other-message', 1000, ?3)",
-                    rusqlite::params![agent, device, sent_at],
-                )
-                .unwrap();
-                c.last_insert_rowid()
-            })
+                rusqlite::params![agent, device, sent_at],
+            )
+            .unwrap();
+            c.last_insert_rowid()
+        })
     });
-    let ids = [item, other_session, other_rows[0], other_rows[1], other_rows[2]];
+    let ids = [
+        item,
+        other_session,
+        other_rows[0],
+        other_rows[1],
+        other_rows[2],
+    ];
     let before = ids.map(|id| legacy_queue_row(&f, id));
 
     let (status, body) = f.get(LEGACY_OUTBOX_URI).await;
@@ -9933,5 +9948,8 @@ async fn legacy_outbox_reports_storage_read_failure_instead_of_empty_success() {
     let (status, body) = f.get(LEGACY_OUTBOX_URI).await;
 
     assert_no_legacy_write_side_effects(&f);
-    assert!(status.is_server_error(), "存储读失败必须显式报错：{status} {body}");
+    assert!(
+        status.is_server_error(),
+        "存储读失败必须显式报错：{status} {body}"
+    );
 }

@@ -470,15 +470,16 @@ export default function MessageComposer({
     };
   }, [session.id]);
   const fallenBack = routeFallback !== null && routeFallback.sessionId === session.id;
+  const useLegacyRoute =
+    !nativeOnly &&
+    routing?.legacyAllowed === true &&
+    !routing.nativeOwned &&
+    (sendInfo?.interactionRoute !== "opencode_native" || fallenBack);
   const uiRoute =
     session.agentType === "opencode"
-      ? nativeOnly ||
-        routing?.nativeOwned ||
-        (sendInfo?.interactionRoute === "opencode_native" && !fallenBack)
-        ? "opencode_native"
-        : routing?.legacyAllowed === true
-          ? "legacy"
-          : "opencode_native"
+      ? useLegacyRoute
+        ? "legacy"
+        : "opencode_native"
       : effectiveRouteFor(session.id, routeFallback, sendInfo?.interactionRoute);
   const nativeRoute = uiRoute === "opencode_native";
   const routeReturned = sendInfo?.routeState === "draining" && !nativeRoute;

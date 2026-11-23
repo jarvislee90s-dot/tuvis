@@ -72,10 +72,6 @@ pub const OC_ROUTE_HELD_LEGACY_REASON: &str =
 /// 指路同时覆盖两条出口：只读核对收敛，或对死代际动作显式「确认终态未知」。
 pub const OC_ROUTE_HELD_NATIVE_ACTION_REASON: &str =
     "该会话仍有结果未确认的原生动作：请先只读核对收敛，或对已不可核对的动作显式确认终态未知，再重新进入原生交互";
-/// 「交回旧路径」被拒（409，复用路由码 [`OC_ROUTE_CHANGED`]）：仍有结果未明的原生动作。
-/// 不复用上句文案——拒绝的理由是「还有未决动作」，不是「该走原生入口」。
-pub const OC_ROUTE_HELD_REASON: &str =
-    "该会话仍有结果未明的原生动作，请先完成只读核对后再交回旧路径";
 /// 平台未验证（409）：本批候选路由只在 macOS 启用；其他平台原流程不变。
 pub const OC_PLATFORM_UNVERIFIED: &str = "OC_PLATFORM_UNVERIFIED";
 /// 同上，用户可读文案。
@@ -85,8 +81,6 @@ pub const ROUTE_CHANGED_ERR: &str = "oc_route_changed";
 /// send-info 的原生路由说明（`interactionRouteReason`，固定句）。
 pub const NATIVE_ROUTE_REASON: &str =
     "该会话已切换至 OpenCode 原生交互，消息、审批与问答走原生通道";
-/// 验证开关键（settings KV）：缺省 false；只认显式 `"true"`（与兼容发送开关同口径）。
-pub const SWITCH_KEY: &str = "remote.opencode_native_enabled";
 /// 路由词（DTO）：已归原生 / 保持旧流程。
 pub const ROUTE_NATIVE: &str = "opencode_native";
 pub const ROUTE_LEGACY: &str = "legacy";
@@ -290,18 +284,13 @@ pub fn native_platform_supported() -> bool {
     cfg!(target_os = "macos")
 }
 
-/// 两种交互策略均允许原生；旧验证键仅是历史配置，不再作为第二道总开关。
-pub fn native_enabled(_st: &RemoteState) -> bool {
-    true
-}
-
-/// `session-send-info` 的**候选**判定（评审 Blocker 1）：平台 + 验证开关 + 该会话此刻
+/// `session-send-info` 的**候选**判定（评审 Blocker 1）：平台 + 该会话此刻
 /// 可唯一绑定（与 `GET /opencode/view` 的投影前半段同源）。
 ///
 /// 纪律：**只读**。本函数不认领、不写路由行、不发任何写请求；它只回答「现在打开视图
 /// 大概率能进原生」。任一条件不成立即 `false`（候选判定永远不是错误响应）。
 pub async fn is_native_candidate(st: &Arc<RemoteState>, session: &Session) -> bool {
-    if !native_platform_supported() || !native_enabled(st) {
+    if !native_platform_supported() {
         return false;
     }
     st.opencode_native.can_bind(session).await
@@ -504,29 +493,15 @@ pub struct RouteLegacyReq {
     pub session_id: String,
     pub binding_token: String,
     pub route_version: i64,
-    #[serde(default)]
-    pub confirmed_action_ids: Option<Vec<String>>,
+    #[serde(default, rename = "confirmedActionIds")]
+    _confirmed_action_ids: Option<Vec<String>>,
     /// **显式运维决定**（评审 Blocker 2，缺省 false）：作废「代际已不可核对」的动作后再
     /// 交回。未知字段仍然拒绝；不传 = 老行为（有未决动作就 409，零变更）。
     #[serde(default)]
     pub force: bool,
 }
 
-/// POST /m/api/v1/opencode/route/legacy（**显式交回旧路径**，评审 I-1）。
-///
-/// 契约：
-/// - 与其余五条路由同一配对门（cookie/设备上下文缺失 → 403）、同一会话解析（404/400）
-///   与同一平台门（非 macOS → 409 [`OC_PLATFORM_UNVERIFIED`]）；请求体只认 `sessionId`
-///   （未知字段 → 400）；
-/// - 服务层 `NativeHub::disengage_route`：持同会话 write permit，把 `active` 降级为
-///   `draining`；**有结果未明的原生动作就拒绝**（复用 DAO 既有判断，不另立规则），
-///   拒绝时零变更；
-/// - **幂等**：从未接入 Native 的会话（无路由行）同样返回成功——「现在归旧路径」这个
-///   事实成立即为成功，不区分「刚降级」与「本来就没接」；
-/// - 不删除任何动作行、不迁移旧 `inject_queue` 行；既有动作此后仍可只读核对。
-///
-/// 成功 → `200 { sessionId, route: "legacy" }`；拒绝 → `409 OC_ROUTE_CHANGED`
-/// （文案用 [`OC_ROUTE_HELD_REASON`]，与「旧入口被挡」的 409 同码不同因）。
+/// 旧客户端的稳定拒绝响应。保留设备、平台、绑定和请求形状核对。
 pub async fn native_route_legacy(
     State(st): State<Arc<RemoteState>>,
     headers: HeaderMap,
@@ -543,9 +518,9 @@ pub async fn native_route_legacy(
     if req.binding_token.is_empty() || req.route_version < 1 {
         return bad_request();
     }
-    let Some(returned_version) = req.route_version.checked_add(1) else {
+    if req.route_version.checked_add(1).is_none() {
         return bad_request();
-    };
+    }
     let mut ctx = match resolve_native_context_mode(
         &st,
         &headers,
@@ -564,9 +539,9 @@ pub async fn native_route_legacy(
     {
         return response;
     }
-    let Some(target) = ctx.expected_target else {
+    if ctx.expected_target.is_none() {
         return bad_request();
-    };
+    }
     // 全局登记换向不能证明原服务已不可核对；在来源失效证据闭合前禁止 force 作废。
     if req.force {
         return json_error(
@@ -576,29 +551,7 @@ pub async fn native_route_legacy(
             "强制交回的确认范围尚不可验证",
         );
     }
-    let _policy_permit = match crate::services::opencode_native::policy::acquire_legacy(
-        &st.store,
-        crate::session::AgentType::OpenCode,
-    ) {
-        Ok(permit) => permit,
-        Err(_) => return super::api::legacy_disabled_response(),
-    };
-    match st
-        .opencode_native
-        .return_route_for_target_confirmed(
-            &target,
-            req.force,
-            Some(req.route_version),
-            req.confirmed_action_ids.as_deref(),
-        )
-        .await
-    {
-        Ok((true, abandoned)) => {
-            legacy_returned(&sid, &req.binding_token, returned_version, abandoned)
-        }
-        Ok((false, _)) => route_held_response(&st, &target),
-        Err(err) => native_error_response(&err),
-    }
+    super::api::legacy_disabled_response()
 }
 
 /// `POST /opencode/route/native` 请求体：只允许会话 id。
@@ -1716,15 +1669,6 @@ async fn execute_native_reselect(
         Ok(ctx) => ctx,
         Err(resp) => return resp,
     };
-    // 重新进入原生 = 打开**写**通道：与 `POST /opencode/actions` 同一道开关门。
-    if !native_enabled(st) {
-        return json_error(
-            StatusCode::CONFLICT,
-            codes::OC_ROUTE_NOT_OWNED,
-            codes::OC_ROUTE_NOT_OWNED,
-            "opencode 原生写入口当前未启用",
-        );
-    }
     let has_route = match st
         .store
         .with(|conn| crate::database::dao::opencode_actions::route_conn(conn, &sid))
@@ -1861,54 +1805,6 @@ pub async fn native_route_preview(
     }
 }
 
-/// 交回成功：`abandoned` = 本次**作废**的「代际已不可核对」动作条数（非 force 恒 0）。
-/// 客户端据此给出「N 条无法核对的动作已作废；若上一次写入其实成功了，可能导致重复发送」。
-fn legacy_returned(
-    session_id: &str,
-    binding_token: &str,
-    route_version: i64,
-    abandoned: usize,
-) -> Response {
-    json_no_store(
-        StatusCode::OK,
-        serde_json::json!({
-            "sessionId": session_id,
-            "route": ROUTE_LEGACY,
-            "bindingToken": binding_token,
-            "routeVersion": route_version,
-            "abandoned": abandoned,
-        }),
-    )
-}
-
-/// 交回被拒：`unverifiableActions` > 0 表示「显式 force 可以作废它们后交回」——
-/// 前端据此给出带**重复发送风险**的二次确认（绝不静默强推）。
-fn route_held_response(
-    st: &RemoteState,
-    target: &crate::services::opencode_native::types::NativeTarget,
-) -> Response {
-    let (version, ids) = match st.opencode_native.force_candidates_for_target(target) {
-        Ok(value) => value,
-        Err(err) => {
-            // 预读失败不影响拒绝，但不能提供可执行的强制确认。
-            log::error!("opencode 路由交回预读失败: {err:?}");
-            (0, Vec::new())
-        }
-    };
-    json_no_store(
-        StatusCode::CONFLICT,
-        serde_json::json!({
-            "error": OC_ROUTE_CHANGED,
-            "reasonCode": OC_ROUTE_CHANGED,
-            "reason": OC_ROUTE_HELD_REASON,
-            "unverifiableActions": ids.len(),
-            "unverifiableActionIds": ids,
-            "routeVersion": version,
-            "forceAvailable": false,
-        }),
-    )
-}
-
 /// GET /m/api/v1/opencode/agents?session_id=：只读 agent 视图（当前 + primary 选项）。
 ///
 /// 与 view 相同的会话/平台门；不认领路由、不发写请求。读不到就返回受控错误，
@@ -2014,12 +1910,11 @@ pub async fn native_view_with(
     if let Err(response) = check_expected_binding(&st, &mut ctx, token, false, false) {
         return response;
     }
-    let claim = native_enabled(&st);
     match st
         .opencode_native
         .view_and_claim_bound(
             &ctx.session,
-            claim,
+            true,
             ctx.expected_target.as_ref(),
             ctx.expected_requires_active,
         )
@@ -2319,15 +2214,6 @@ pub async fn native_action_execute(
         };
         ctx.session.project_path = target.directory.to_string_lossy().into_owned();
         ctx.expected_target = Some(target);
-    }
-    // 验证开关关闭：撤回**新**原生写权限（已发动作的只读核对不受影响）。
-    if !native_enabled(&st) {
-        return json_error(
-            StatusCode::CONFLICT,
-            codes::OC_ROUTE_NOT_OWNED,
-            codes::OC_ROUTE_NOT_OWNED,
-            "opencode 原生写入口当前未启用",
-        );
     }
     // 签名设置经既有单点现读（remote_message_signature，缺省 off）。
     let signature_enabled = st
