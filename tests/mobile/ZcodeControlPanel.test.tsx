@@ -1996,8 +1996,10 @@ describe("ZCode 控制面板：模型/档位按能力开放", () => {
     expect([...thought.options].map((option) => option.value)).toEqual(["low", "high"]);
     expect(thought.value).toBe("high");
 
-    fireEvent.change(thought, { target: { value: "low" } });
-    await waitFor(() => expect(thought.value).toBe("low"));
+    // 首次宿主选择加载后，先让清空待选的 effect 完成。
+    await act(async () => {});
+    fireEvent.change(screen.getByTestId("zcode-thought-select"), { target: { value: "low" } });
+    await waitFor(() => expect(screen.getByTestId("zcode-thought-select")).toHaveValue("low"));
     // 只会改本地待选：确认前零 POST。
     expect(postedActions()).toHaveLength(0);
     fireEvent.click(screen.getByTestId("zcode-selection-apply"));
