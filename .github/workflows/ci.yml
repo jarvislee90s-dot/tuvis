@@ -216,6 +216,10 @@ jobs:
           cargo test --locked --features opencode-coordinator-tests --lib close_does_not_kill_opencode
           cargo test --locked --features opencode-coordinator-tests --test opencode_native_remote --test opencode_pin_readonly --test opencode_attachment_binding_regression
 
+      - name: Run macOS DSH Web identity tests
+        working-directory: src-tauri
+        run: cargo test --locked --test dsh_web_home_r01_test -- --test-threads=1
+
   build:
     name: Build verification
     runs-on: ubuntu-latest

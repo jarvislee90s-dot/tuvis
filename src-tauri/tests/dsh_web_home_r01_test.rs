@@ -2,7 +2,8 @@
 //!
 //! 独立 Node 子进程各持有真实 TCP；PID/启动时刻/exe/监听属主取自生产 OS 适配器，
 //! 仅按本测试的子 PID 过滤，绝不读写真实用户 home。环境证据由夹具显式注入，
-//! 不验证 OS 的环境读取完整性。插件 BindingSession 负责 Ed25519 签名，服务端走
+//! 不验证 OS 的环境读取完整性。绑定用例额外要求 macOS 内核进程代次。
+//! 插件 BindingSession 负责 Ed25519 签名，服务端走
 //! 生产 UDS、发现和审批。没有 verified/指纹/Bound 行预置。
 //!
 //! 这是隔离测试宿主，不宣称官方 DSH 的配置优先级或 Windows 已验收；覆盖两种
@@ -416,6 +417,7 @@ async fn bind(web: &mut Web, svc: &Arc<DshAuthService>, rv: &Value) -> String {
 
 /// R01 晋升：批准后**该实例的 Web 归属必须已核验**，使凭据交付不再被
 /// `INSTANCE_UNVERIFIED` 挡住；撤权后证明作废（重新绑定需再证明）。
+#[cfg(target_os = "macos")]
 #[tokio::test]
 async fn approval_promotes_the_observed_web_host_for_this_generation() {
     let mut b = Bench::new("default", false).await;
@@ -432,6 +434,7 @@ async fn approval_promotes_the_observed_web_host_for_this_generation() {
 }
 
 /// 撤权必须作废 Web 归属证明：重新绑定要重新走环境证明，不能沿用旧结论。
+#[cfg(target_os = "macos")]
 #[tokio::test]
 async fn revocation_clears_the_promoted_web_proof() {
     let mut b = Bench::new("default", false).await;
@@ -599,6 +602,7 @@ async fn discovery_does_not_assign_custom_web_to_an_unrelated_marked_env_home() 
     }
 }
 
+#[cfg(target_os = "macos")]
 #[tokio::test]
 async fn unset_dsh_home_can_bind_the_default_profile_using_real_peer_and_plugin_signature() {
     let mut b = Bench::new("default", false).await;
@@ -606,6 +610,7 @@ async fn unset_dsh_home_can_bind_the_default_profile_using_real_peer_and_plugin_
     bind(&mut b.webs[0], &svc, &rv).await;
 }
 
+#[cfg(target_os = "macos")]
 #[tokio::test]
 async fn custom_home_can_enter_first_binding_when_tuvis_home_points_elsewhere() {
     let mut b = Bench::new("custom", true).await;
@@ -670,11 +675,13 @@ async fn other_home_refused(from: usize, to: usize) {
     b.webs[from].stop("cross-home").await;
 }
 
+#[cfg(target_os = "macos")]
 #[tokio::test]
 async fn default_web_cannot_claim_custom_web_home_even_with_a_valid_plugin_signature() {
     other_home_refused(0, 1).await;
 }
 
+#[cfg(target_os = "macos")]
 #[tokio::test]
 async fn custom_web_cannot_claim_default_web_home_even_with_a_valid_plugin_signature() {
     other_home_refused(1, 0).await;
@@ -706,6 +713,7 @@ async fn rejected_after_valid_binding(changes: Value, expect_valid_signature: bo
     b.webs[0].stop("invalid-proof").await;
 }
 
+#[cfg(target_os = "macos")]
 #[tokio::test]
 async fn signed_home_binding_with_another_pid_is_refused_after_a_valid_binding() {
     // 自报 PID 整份伪造（rv + homeBinding 同步），才能到达服务端核验点。
@@ -716,6 +724,7 @@ async fn signed_home_binding_with_another_pid_is_refused_after_a_valid_binding()
     .await;
 }
 
+#[cfg(target_os = "macos")]
 #[tokio::test]
 async fn signed_home_binding_with_another_start_generation_is_refused_after_a_valid_binding() {
     rejected_after_valid_binding(
@@ -725,6 +734,7 @@ async fn signed_home_binding_with_another_start_generation_is_refused_after_a_va
     .await;
 }
 
+#[cfg(target_os = "macos")]
 #[tokio::test]
 async fn hello_cannot_replace_the_kernel_peer_pid_with_a_signed_claim() {
     rejected_after_valid_binding(
@@ -738,6 +748,7 @@ async fn hello_cannot_replace_the_kernel_peer_pid_with_a_signed_claim() {
     .await;
 }
 
+#[cfg(target_os = "macos")]
 #[tokio::test]
 async fn correct_home_and_kernel_identity_cannot_bind_with_an_invalid_plugin_signature() {
     rejected_after_valid_binding(json!({ "breakSignature": true }), false).await;
