@@ -105,6 +105,10 @@ jobs:
   backend:
     name: Backend Checks
     runs-on: ubuntu-latest
+    env:
+      # Keep both feature variants' test binaries small on the hosted runner.
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
     needs: changes
     if: github.event_name != 'pull_request' || needs.changes.outputs.backend == 'true'
     steps:
@@ -160,7 +164,7 @@ jobs:
           trap 'rm -rf "$TEST_ROOT"' EXIT
           export TUVIS_HOME="$TEST_ROOT/tuvis" DSH_HOME="$TEST_ROOT/dsh" TUVIS_DSH_STATE_DIR="$TEST_ROOT/state"
           cd src-tauri
-          cargo test --features dsh-test-probes \
+          cargo test --features dsh-test-probes -j 2 \
             --test dsh_hello_registered_race_test \
             --test dsh_ipc_late_console_credential_test \
             --test h09_console_ws_pending_test \
