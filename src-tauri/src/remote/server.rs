@@ -1010,7 +1010,10 @@ fn api_router(
         // 超限响应契约 JSON 413 体（{"error":"too_large"}）；不挂 DefaultBodyLimit
         // 层——框架兜底的通用 413 体不可辨错误码，且会把 handler 的结构化拒绝
         // 挡成不可达）
-        .route("/session-attachment", post(api::session_attachment))
+        .route(
+            "/session-attachment",
+            post(api::session_attachment).layer(axum::Extension(roots)),
+        )
         // M6R–M9R Task 11：一键 resume 端点（R5，PIN 门禁内层 gate 结构性覆盖，
         // 新端点不需要各自鉴权代码；spawn 缝注入使测试零真开窗）
         .route("/session-open", post(api::session_open))

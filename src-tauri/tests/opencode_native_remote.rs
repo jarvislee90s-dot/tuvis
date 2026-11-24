@@ -7868,6 +7868,12 @@ async fn gate_upload_path_passes_and_rejects_fail_closed() {
         .join("ses-1")
         .join("gate-upload.txt");
     assert!(!reject_path.exists(), "拒绝路径零本地落盘");
+    // The failed round can leave an unexpired challenge in the remote slot.
+    // Wait out its lease before testing the next independent upload.
+    tokio::time::sleep(std::time::Duration::from_millis(
+        gate_arm().window_ms.try_into().unwrap(),
+    ))
+    .await;
     // 正例：ack 武装 → 上传轮过门（1 创建 + 1 挑战）→ 本地落盘成功。
     f.peer.arm_gate_ack(GATE_LOCKED_PID, None);
     let (status, reply) = upload(f.app.clone(), "过门上传内容".to_string()).await;
