@@ -5,7 +5,6 @@ import { cleanup, fireEvent, render, screen, within } from "@testing-library/rea
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import i18n from "@/i18n";
 import SessionDetail from "@/mobile/SessionDetail";
-import type { Session } from "@/types/session";
 
 const session = dshSession({
   id: "h08-parent",

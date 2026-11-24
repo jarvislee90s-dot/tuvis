@@ -3,7 +3,6 @@ import { act, cleanup, fireEvent, render, screen, within } from "@testing-librar
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { DshActionReceipt, QueueItemView } from "@/mobile/api";
 import SessionDetail from "@/mobile/SessionDetail";
-import type { Session } from "@/types/session";
 import { MockEventSource } from "./eventSourceMock";
 import { pinZhNavigator } from "./pinZhNavigator";
 

@@ -4,7 +4,6 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } 
 import MessageComposer from "@/mobile/MessageComposer";
 import SessionDetail from "@/mobile/SessionDetail";
 import type { SendInfo } from "@/mobile/api";
-import type { Session } from "@/types/session";
 import { pinZhNavigator } from "./pinZhNavigator";
 
 // 只替换 HTTP；真实详情页、composer 与 API 转换共同消费同一实例的预检结果。
