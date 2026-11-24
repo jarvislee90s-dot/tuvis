@@ -1340,6 +1340,7 @@ impl ProcessEnvironmentEvidence {
 
 /// 只消除已核验的无链接 `..` 差异；不把任意文件系统别名提升为身份凭据。
 pub(crate) fn same_executable_path(left: &Path, right: &Path) -> bool {
+    #[cfg(unix)]
     if left == right {
         return true;
     }
@@ -1382,7 +1383,7 @@ pub(crate) fn same_executable_path(left: &Path, right: &Path) -> bool {
     }
     #[cfg(not(unix))]
     {
-        false
+        left == right
     }
 }
 

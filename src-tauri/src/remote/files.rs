@@ -90,6 +90,7 @@ fn artifact_ext_allowed(path: &str) -> bool {
 /// （firmlink 非 symlink）——不折叠会被误判为「主目录外」而整段跳过黑名单
 /// （2026-09-18 复核实锤：该别名可读 `~/.ssh/known_hosts`，194 字节泄露）。
 /// 纯函数、平台中立（非 macOS 上该前缀不出现，调用为恒等变换）。
+#[cfg(any(unix, test))]
 fn fold_data_volume_alias(p: &Path) -> PathBuf {
     const PREFIX: &str = "/System/Volumes/Data/";
     let s = p.to_string_lossy();
@@ -132,6 +133,7 @@ pub(crate) const SENSITIVE_DIRS: &[&str] = &[
 /// 接住任意前缀下的 `.dsh`、`.tuvis`，又不会因为路径绝对形态不同而漏。
 ///
 /// 仍然放行的是普通文件（桌面/下载/临时目录）：它们不含这些段序列。
+#[cfg(unix)]
 fn has_credential_root_segment(child: &Path, windows: bool) -> bool {
     const CREDENTIAL_ROOTS: &[&str] = &[
         ".dsh", ".tuvis", ".ssh", ".aws", ".gnupg", ".kube", ".docker",
@@ -414,6 +416,7 @@ fn open_verified_components(
 }
 
 /// 路径包含判定（canonicalize 之后的双方）：Windows 语义自动分派
+#[cfg(unix)]
 fn path_within(child: &Path, ancestor: &Path) -> bool {
     path_within_semantics(
         &child.to_string_lossy(),
@@ -427,6 +430,7 @@ fn path_within(child: &Path, ancestor: &Path) -> bool {
 ///   去尾部分隔符；Windows 语义整体转小写（文件系统大小写不敏感）；
 /// - 前缀命中后剩余必须为空或以 `/` 开头（`/ab` 不在 `/a` 之下——分隔符边界）；
 /// - 祖先为根（`/`）时任意绝对路径都包含（根即一切）。
+#[cfg(any(unix, test))]
 fn path_within_semantics(child: &str, ancestor: &str, windows: bool) -> bool {
     let norm = |s: &str| -> String {
         // 剥 verbatim 前缀（UNC 形态还原为 `\\server\share` 常规形态再统一分隔符）
