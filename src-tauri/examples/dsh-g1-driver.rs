@@ -1,4 +1,5 @@
 //! G1-Mac 真机驱动（证据工具，非产品功能）。
+//! 使用 `cargo run --example dsh-g1-driver` 单独启动。
 //!
 //! 只调用生产入口（`production_env/manager/auth` + `identity::discover` +
 //! `transport::connect`），用于在真实官方 Desktop 上执行计划 T06 的 G1 门槛：

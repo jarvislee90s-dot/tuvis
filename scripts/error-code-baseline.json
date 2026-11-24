@@ -57,7 +57,6 @@
     "src-tauri/src/database/connection.rs": 1,
     "src-tauri/src/database/dao/opencode_route_migration_tests.rs": 2,
     "src-tauri/src/database/dao/opencode_window_cas_tests.rs": 6,
-    "src-tauri/src/bin/dsh-g1-driver.rs": 12,
     "src-tauri/src/services/dsh_control/switch_tests.rs": 51,
     "src-tauri/src/services/dsh_control/switch_console_entry_tests.rs": 1
   }
