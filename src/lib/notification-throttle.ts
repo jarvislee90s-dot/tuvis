@@ -12,8 +12,15 @@ export function directionKey(from: string, to: string): string {
 
 /** 会话通知记账键：id 只在工具内唯一、跨工具可撞 id（types/session.ts 唯一性
  *  约定），跨表记账必须取 (agentType, sessionId) 二元组 */
-export function sessionNotifyKey(agentType: string, sessionId: string): string {
-  return `${agentType}-${sessionId}`;
+/** 会话通知身份键（H04 审查 I4②）：多实例下 DSH 同名/同 ID 会话不串——
+ *  dshInstanceId 在场时纳入键；缺席（非 DSH / 未核验）回落 (agentType, sessionId)
+ *  既有口径。 */
+export function sessionNotifyKey(
+  agentType: string,
+  sessionId: string,
+  dshInstanceId?: string
+): string {
+  return `${agentType}:${dshInstanceId ?? ""}:${sessionId}`;
 }
 
 /** F2a 同方向节流判定：该会话该方向上次实际提醒距今 < 60s → 节流。

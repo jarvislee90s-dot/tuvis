@@ -62,6 +62,8 @@ import { ProcessHint } from "@/components/settings/ProcessHint";
 // S5：Codex 自动适配卡（开关 + 状态详情 + 首次一次轻提示 + 报告入口）
 import { OpenCodeNativeSection } from "./OpenCodeNativeSection";
 import { CodexAdaptSection } from "@/components/settings/CodexAdaptSection";
+// T05：DSH 桌面端远控管理卡（安装/修复/卸载 + 进度/取消 + 绑定/撤权 + 自动适配开关）
+import { DshRemoteSection } from "@/components/settings/DshRemoteSection";
 import { ToolConfigCard } from "@/components/settings/ToolConfigCard";
 import { ToolRemoteSettingsSection } from "@/components/settings/ToolRemoteSettingsSection";
 
@@ -1342,6 +1344,9 @@ export function RemoteSection() {
               onToggle={(v) => void applyCodexAdapt(v)}
             />
           </ToolConfigCard>
+          {/* DSH 远控（T01）：与 Codex APP 同款工具卡——单开关推进安装/授权/卸载，
+              步骤、就绪、修复与自动适配全在卡内正文；移动端无本卡入口。 */}
+          <DshRemoteSection />
           <ToolRemoteSettingsSection />
           <OpenCodeNativeSection />
           {/* ④ 访问与安全 */}

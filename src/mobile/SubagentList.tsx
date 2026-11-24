@@ -39,7 +39,7 @@ export default function SubagentList({
         {list.map((s) => {
           const running = s.status === "running";
           const selected = s.id === selectedId;
-          const ms = now !== null ? subagentElapsedMs(s, now) : null;
+          const ms = s.status !== "unknown" && now !== null ? subagentElapsedMs(s, now) : null;
           return (
             <li key={s.id}>
               <button
@@ -61,6 +61,11 @@ export default function SubagentList({
                 />
                 <span className="min-w-0 flex-1 truncate text-sm text-[var(--tx)]">
                   {s.name}
+                  {s.status === "unknown" ? (
+                    <span className="ml-1 text-xs text-[var(--mut)]">
+                      {i18n.t("mobile.subagent.statusUnknown")}
+                    </span>
+                  ) : null}
                   {s.description ? (
                     <span className="ml-1 text-xs text-[var(--mut)]" title={s.description}>
                       {s.description}

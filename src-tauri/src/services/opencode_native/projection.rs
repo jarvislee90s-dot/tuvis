@@ -340,6 +340,8 @@ fn project_records_with_seq(records: &[Value]) -> Result<MessageProjection, Nati
         match record.get("type").and_then(Value::as_str) {
             Some("user") => {
                 messages.push(SessionMessage {
+                    blocks: Vec::new(),
+                    media: Vec::new(),
                     seq: 0,
                     role: "user".to_string(),
                     kind: "user".to_string(),
@@ -371,6 +373,8 @@ fn project_records_with_seq(records: &[Value]) -> Result<MessageProjection, Nati
                     let body = strip_system_reminder_tags(text);
                     if !body.is_empty() {
                         messages.push(SessionMessage {
+                            blocks: Vec::new(),
+                            media: Vec::new(),
                             seq: 0,
                             role: "assistant".to_string(),
                             kind: "system-note".to_string(),
@@ -568,6 +572,8 @@ fn project_assistant(
                     continue;
                 };
                 messages.push(SessionMessage {
+                    blocks: Vec::new(),
+                    media: Vec::new(),
                     seq: 0,
                     role: "assistant".to_string(),
                     kind: "thinking".to_string(),
@@ -614,6 +620,8 @@ fn project_assistant(
                     }
                 }
                 messages.push(SessionMessage {
+                    blocks: Vec::new(),
+                    media: Vec::new(),
                     seq: 0,
                     role: "assistant".to_string(),
                     kind: "tool-call".to_string(),
@@ -634,6 +642,8 @@ fn project_assistant(
                         .or_else(|| block.pointer("/state/content"));
                     if let Some(text) = render_tool_output(output) {
                         messages.push(SessionMessage {
+                            blocks: Vec::new(),
+                            media: Vec::new(),
                             seq: 0,
                             role: "assistant".to_string(),
                             kind: "tool-result".to_string(),
@@ -850,6 +860,8 @@ fn render_tool_output(output: Option<&Value>) -> Option<String> {
 
 fn assistant_text(text: &str, ts: Option<i64>) -> SessionMessage {
     SessionMessage {
+        blocks: Vec::new(),
+        media: Vec::new(),
         seq: 0,
         role: "assistant".to_string(),
         kind: "assistant".to_string(),
@@ -7329,6 +7341,8 @@ mod tests {
         std::fs::create_dir_all(&home).unwrap();
         let state_file = tmp.path().join("state/opencode/service.json");
         let card = Session {
+            dsh_instance_id: None,
+            dsh_subagent: None,
             id: SESSION_ID.to_string(),
             agent_type: AgentType::OpenCode,
             project_name: "project".to_string(),

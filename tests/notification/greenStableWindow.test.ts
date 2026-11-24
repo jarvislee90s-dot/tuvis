@@ -91,6 +91,26 @@ afterEach(() => {
 });
 
 describe("绿灯稳定窗（GREEN_STABLE_MS）", () => {
+  it("DSH 同 ID 不同实例的稳定窗各自触发并播报正确卡片", async () => {
+    renderHook(() => useNotification());
+    await drain();
+    const mk = (instance: string, status: string) => ({
+      ...mkSession("same", status),
+      agentType: "dsh",
+      dshInstanceId: instance,
+      projectName: instance,
+    });
+    setSessions([mk("A", "processing"), mk("B", "processing")]);
+    await drain();
+    setSessions([mk("A", "idle"), mk("B", "idle")]);
+    await advance(GREEN_STABLE_MS);
+    await drain();
+    const notices = sendNotificationMock.mock.calls
+      .map(([n]) => n)
+      .filter((n) => String(n.body).startsWith("空闲"));
+    expect(notices).toHaveLength(2);
+    expect(notices.map((n) => n.title.split(" — ").at(-1)).sort()).toEqual(["A", "B"]);
+  });
   it("转绿不立即播；持续满窗才播一次绿", async () => {
     renderHook(() => useNotification());
     await drain();

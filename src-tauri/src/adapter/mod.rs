@@ -367,15 +367,19 @@ static STOP_GRACE: Lazy<Mutex<HashMap<u32, (i64, i64)>>> = Lazy::new(|| Mutex::n
 /// 首次转绿/补插入池失败、等待下一轮重试的 (tool, session) 集合。
 /// 只用于数据驱动绿卡的预过滤：**池无行不等于用户已读**，可能是 INSERT 失败；
 /// 不能用“池无行”一概补插（会复活已读/过期卡）。
-static PENDING_UNREAD_RETRIES: Lazy<Mutex<HashMap<(String, String), i64>>> =
+static PENDING_UNREAD_RETRIES: Lazy<Mutex<PendingRetries>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 const PENDING_TTL_MS: i64 = 24 * 3600 * 1000;
 static PENDING_LOADED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// 持久化失败（含旧快照暂不可读）后置位；待加载恢复后自动补写一次。
 static PENDING_DIRTY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-fn pending_key(tool: &str, sid: &str) -> String {
-    format!("{tool}\u{1f}{sid}")
+/// 待重试标记：键 = (tool, instance, sid)——R05 实例段隔离 A/B 同 ID。
+type PendingRetries = HashMap<(String, String, String), i64>;
+
+/// R05：三段键（tool、instance、sid）——instance 空串 = 非 DSH。
+fn pending_key3(tool: &str, instance: &str, sid: &str) -> String {
+    format!("{tool}\u{1f}{instance}\u{1f}{sid}")
 }
 
 /// 独立于 SQLite 的小文件：SQLite 写失败时仍尽量保留跨重启恢复标记。
@@ -390,7 +394,7 @@ fn persist_pending_unread_retries_into(
     path: &std::path::Path,
     loaded: &std::sync::atomic::AtomicBool,
     dirty: &std::sync::atomic::AtomicBool,
-    retries: &Mutex<HashMap<(String, String), i64>>,
+    retries: &Mutex<PendingRetries>,
 ) -> bool {
     use std::sync::atomic::Ordering;
     // 启动恢复未完成时内存集合可能不含磁盘旧项：禁止覆盖，等加载成功合并后补写。
@@ -403,7 +407,7 @@ fn persist_pending_unread_retries_into(
         .lock()
         .unwrap()
         .iter()
-        .map(|((tool, sid), since)| (pending_key(tool, sid), *since))
+        .map(|((tool, instance, sid), since)| (pending_key3(tool, instance, sid), *since))
         .collect();
     let ok = persist_pending_map(path, &map);
     dirty.store(!ok, Ordering::Release);
@@ -659,7 +663,7 @@ fn replace_pending_file_with_backup(tmp: &std::path::Path, path: &std::path::Pat
 fn load_pending_unread_retries_into(
     path: &std::path::Path,
     loaded: &std::sync::atomic::AtomicBool,
-    retries: &Mutex<HashMap<(String, String), i64>>,
+    retries: &Mutex<PendingRetries>,
 ) {
     use std::sync::atomic::Ordering;
     if loaded.load(Ordering::Acquire) {
@@ -673,9 +677,16 @@ fn load_pending_unread_retries_into(
                 if now.saturating_sub(since) > PENDING_TTL_MS {
                     continue;
                 }
-                if let Some((tool, sid)) = key.split_once('\u{1f}') {
+                // R05：键为三段（tool\u{1f}instance\u{1f}sid）；两段 = legacy 旧条目
+                //（instance 空串），逐字保留语义。
+                let parts: Vec<&str> = key.split('\u{1f}').collect();
+                if let [tool, instance, sid] = parts[..] {
                     guard
-                        .entry((tool.to_string(), sid.to_string()))
+                        .entry((tool.to_string(), instance.to_string(), sid.to_string()))
+                        .or_insert(since);
+                } else if let [tool, sid] = parts[..] {
+                    guard
+                        .entry((tool.to_string(), String::new(), sid.to_string()))
                         .or_insert(since);
                 }
             }
@@ -719,7 +730,7 @@ struct PendingRetryStore<'a> {
     path: std::path::PathBuf,
     loaded: &'a std::sync::atomic::AtomicBool,
     dirty: &'a std::sync::atomic::AtomicBool,
-    retries: &'a Mutex<HashMap<(String, String), i64>>,
+    retries: &'a Mutex<PendingRetries>,
 }
 
 impl<'a> PendingRetryStore<'a> {
@@ -728,7 +739,7 @@ impl<'a> PendingRetryStore<'a> {
         path: std::path::PathBuf,
         loaded: &'a std::sync::atomic::AtomicBool,
         dirty: &'a std::sync::atomic::AtomicBool,
-        retries: &'a Mutex<HashMap<(String, String), i64>>,
+        retries: &'a Mutex<PendingRetries>,
     ) -> Self {
         Self {
             path,
@@ -747,10 +758,22 @@ impl<'a> PendingRetryStore<'a> {
         }
     }
 
-    fn mark(&self, tool: &str, sid: &str, since_ms: i64, persist: bool) -> bool {
+    /// R05（复审 P2）：键含实例段——A/B 同 ID 的重试互不借用。
+    fn mark_with_instance(
+        &self,
+        tool: &str,
+        sid: &str,
+        instance: Option<&str>,
+        since_ms: i64,
+        persist: bool,
+    ) -> bool {
         let changed = {
             let mut guard = self.retries.lock().unwrap();
-            match guard.entry((tool.to_string(), sid.to_string())) {
+            match guard.entry((
+                tool.to_string(),
+                instance.unwrap_or("").to_string(),
+                sid.to_string(),
+            )) {
                 std::collections::hash_map::Entry::Occupied(_) => false,
                 std::collections::hash_map::Entry::Vacant(e) => {
                     e.insert(since_ms);
@@ -769,12 +792,23 @@ impl<'a> PendingRetryStore<'a> {
         changed
     }
 
-    fn clear(&self, tool: &str, sid: &str, persist: bool) -> bool {
+    /// R05：键含实例段的清除。
+    fn clear_with_instance(
+        &self,
+        tool: &str,
+        sid: &str,
+        instance: Option<&str>,
+        persist: bool,
+    ) -> bool {
         let changed = self
             .retries
             .lock()
             .unwrap()
-            .remove(&(tool.to_string(), sid.to_string()))
+            .remove(&(
+                tool.to_string(),
+                instance.unwrap_or("").to_string(),
+                sid.to_string(),
+            ))
             .is_some();
         if persist && changed {
             let _ = persist_pending_unread_retries_into(
@@ -787,22 +821,34 @@ impl<'a> PendingRetryStore<'a> {
         changed
     }
 
-    fn since(&self, tool: &str, sid: &str) -> Option<i64> {
+    /// R05：键含实例段的读取。
+    fn since_with_instance(&self, tool: &str, sid: &str, instance: Option<&str>) -> Option<i64> {
         self.retries
             .lock()
             .unwrap()
-            .get(&(tool.to_string(), sid.to_string()))
+            .get(&(
+                tool.to_string(),
+                instance.unwrap_or("").to_string(),
+                sid.to_string(),
+            ))
             .copied()
     }
 }
 
 #[cfg(test)]
 fn mark_unread_retry(tool: &str, sid: &str, since_ms: i64, persist: bool) -> bool {
-    PendingRetryStore::global().mark(tool, sid, since_ms, persist)
+    PendingRetryStore::global().mark_with_instance(tool, sid, None, since_ms, persist)
 }
 
-fn clear_unread_retry(tool: &str, sid: &str, persist: bool) -> bool {
-    PendingRetryStore::global().clear(tool, sid, persist)
+/// R05（复审残留）：键含实例段的清除——A/B 同 ID 的旧 pending 互不影响。
+fn clear_unread_retry_with_instance(
+    tool: &str,
+    sid: &str,
+    instance: Option<&str>,
+    persist: bool,
+) -> bool {
+    // R05：与单卡路径同源——global store 的 clear_with_instance（含持久化）。
+    PendingRetryStore::global().clear_with_instance(tool, sid, instance, persist)
 }
 
 /// 首次转绿入池（生产同步入口的可注入核心）：
@@ -820,15 +866,16 @@ fn insert_first_green_unread(
     now_ms: i64,
     upsert: &dyn Fn(&crate::database::dao::unread::UnreadSessionRecord) -> bool,
 ) -> bool {
+    let instance = record.dsh_instance_id.as_deref();
     if !unread_insert_allowed(prev_status, read_at, activity, pending_since) {
-        pending.clear(tool, sid, true);
+        pending.clear_with_instance(tool, sid, instance, true);
         return false;
     }
     if upsert(record) {
-        pending.clear(tool, sid, true);
+        pending.clear_with_instance(tool, sid, instance, true);
         true
     } else {
-        pending.mark(tool, sid, now_ms, true);
+        pending.mark_with_instance(tool, sid, instance, now_ms, true);
         false
     }
 }
@@ -846,43 +893,56 @@ fn retry_pending_unread(
     refresh: &dyn Fn(&crate::database::dao::unread::UnreadSessionRecord) -> bool,
 ) -> bool {
     // 无 pending 时只做一次 UPDATE；有 pending 才读墓碑，避免常态绿卡多一次 DB 查询。
-    if pending.since(tool, sid).is_none() {
+    // R05：store 键含实例段（record 携带）。
+    let instance = record.dsh_instance_id.as_deref();
+    if pending.since_with_instance(tool, sid, instance).is_none() {
         refresh(record);
         return false;
     }
     let since = pending
-        .since(tool, sid)
+        .since_with_instance(tool, sid, instance)
         .expect("pending existence checked above");
     if !retry_insert_allowed(since, read_at_of(sid)) {
-        pending.clear(tool, sid, true);
+        pending.clear_with_instance(tool, sid, instance, true);
         return false;
     }
     // UPDATE 命中 = 池行已在；展示字段照常刷新，但不得重复插入。
     if refresh(record) {
-        pending.clear(tool, sid, true);
+        pending.clear_with_instance(tool, sid, instance, true);
         return false;
     }
     if upsert(record) {
-        pending.clear(tool, sid, true);
+        pending.clear_with_instance(tool, sid, instance, true);
         true
     } else {
-        pending.mark(tool, sid, since, true);
+        pending.mark_with_instance(tool, sid, instance, since, true);
         false
     }
 }
 
-fn unread_retry_pending(tool: &str, sid: &str) -> bool {
-    PENDING_UNREAD_RETRIES
-        .lock()
-        .unwrap()
-        .contains_key(&(tool.to_string(), sid.to_string()))
+/// R05：含实例段的待重试查询（A/B 同 ID 互不借用）。
+fn unread_retry_pending_with_instance(tool: &str, instance: &str, sid: &str) -> bool {
+    PENDING_UNREAD_RETRIES.lock().unwrap().contains_key(&(
+        tool.to_string(),
+        instance.to_string(),
+        sid.to_string(),
+    ))
 }
 
-fn unread_retry_pending_since(tool: &str, sid: &str) -> Option<i64> {
+/// R05：含实例段的待重试 since 查询。
+fn unread_retry_pending_since_with_instance(
+    tool: &str,
+    sid: &str,
+    instance: Option<&str>,
+) -> Option<i64> {
     PENDING_UNREAD_RETRIES
         .lock()
         .unwrap()
-        .get(&(tool.to_string(), sid.to_string()))
+        .get(&(
+            tool.to_string(),
+            instance.unwrap_or("").to_string(),
+            sid.to_string(),
+        ))
         .copied()
 }
 
@@ -1004,6 +1064,15 @@ pub trait AgentAdapter: Send + Sync {
         Vec::new()
     }
 
+    /// 取走本实例暂存的心跳观测（pid → sessionId）。NEEDS_FIX Important-B 终验：
+    /// WorkBuddy 解析期只暂存到 **per-call 实例槽**（adapter 实例随
+    /// `enabled_adapters()` 每轮新建，归属边界 = 本次扫描调用），遍历段在解析后
+    /// 统一取走并入 WalkedScan，提交段（有效扫描）落 LAST_SEEN 表。默认空——
+    /// 无观测机制的 adapter 不实现。
+    fn take_heartbeat_observations(&self) -> Vec<(u32, String)> {
+        Vec::new()
+    }
+
     fn hook_supported(&self) -> bool {
         false
     }
@@ -1075,7 +1144,7 @@ pub fn adapter_by_id(tool_id: &str) -> Option<Box<dyn AgentAdapter>> {
         "opencode" => Some(Box::new(opencode::OpenCodeAdapter)),
         "openclaw" => Some(Box::new(openclaw::OpenClawAdapter)),
         "kimi" => Some(Box::new(kimi::KimiAdapter)),
-        "workbuddy" => Some(Box::new(workbuddy::WorkBuddyAdapter)),
+        "workbuddy" => Some(Box::new(workbuddy::WorkBuddyAdapter::new())),
         "zcode" => Some(Box::new(zcode::ZCodeAdapter)),
         "dsh" => Some(Box::new(dsh::DshAdapter)),
         _ => None,
@@ -1136,10 +1205,15 @@ static LAST_PROCESS_REFRESH_MS: AtomicU64 = AtomicU64::new(0);
 const DISPLAY_CPU_SAMPLE_INTERVAL: Duration = Duration::from_secs(30);
 
 /// 最近一轮扫描中「有进程在跑」的工具 id（升序去重）。
-/// **唯一写入点**是 `get_all_sessions_inner` Phase 1：记录 `find_processes` 结果，并
+/// **唯一写入点**是 `get_all_sessions_commit`：记录 `find_processes` 结果，并
 /// 对 WorkBuddy 合并同一轮共享 `System` 快照中的宿主判定。只复用本轮已刷新的进程事实；
 /// 禁止为「未覆盖工具是否在跑」另起第二套进程刷新器（2026-10-31 用户裁决）。
 static RUNNING_TOOL_IDS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// 单测哨兵（Important-2）：历史会话登记（状态提交）的调用计数——提交段专属。
+/// `walk_phase_alone_performs_no_state_commits` 据此断言遍历段零登记。
+#[cfg(test)]
+static COMMIT_REGISTER_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// 最近一轮在跑工具 id（升序去重；未扫描时为空）
 pub(crate) fn running_tool_ids() -> Vec<String> {
@@ -1197,8 +1271,26 @@ pub fn cached_codex_app_ids() -> Option<Vec<String>> {
 /// 全局防线：任何解析器的"文件级/进程级复制"型 bug（如 opencode 多进程同会话、
 /// codex 每轮新 rollout）在这里统一兜住，一处修复覆盖全部工具
 pub fn dedup_sessions(sessions: &mut Vec<Session>) {
-    let mut seen: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
-    sessions.retain(|s| seen.insert((s.agent_type.tool_id().to_string(), s.id.clone())));
+    // R05（复审 P2）：DSH 卡的内部身份含实例段——A/B 同 ID 两卡共存；其他工具
+    // 二元键语义逐字保留（实例段恒空串）。
+    let mut seen: std::collections::HashSet<(String, String, String)> =
+        std::collections::HashSet::new();
+    sessions.retain(|s| {
+        seen.insert((
+            s.agent_type.tool_id().to_string(),
+            s.dsh_instance_id.clone().unwrap_or_default(),
+            s.id.clone(),
+        ))
+    });
+}
+
+/// R05（复审 P2）：状态缓存键——DSH 会话含实例段（同 ID 跨实例不串上一轮
+/// 状态）；其他工具原样 session id。
+pub(crate) fn status_cache_key(s: &Session) -> String {
+    match &s.dsh_instance_id {
+        Some(inst) => format!("{inst}\u{1f}{}", s.id),
+        None => s.id.clone(),
+    }
 }
 
 /// 兼容入口：委托扫描总线读共享快照（冷启动无快照时同步首扫）。
@@ -2362,10 +2454,33 @@ mod candidate_whitelist_tests {
     }
 }
 
-/// 实际扫描（单飞壳内执行；成功路径与原实现一致）
-pub(crate) fn get_all_sessions_inner() -> SessionsResponse {
-    load_pending_unread_retries();
-    prune_pending_unread_retries(chrono::Utc::now().timestamp_millis());
+/// 遍历段产物（纯数据）。预算超时的 detached 线程只持有它——没有任何状态提交
+/// 能力，恢复完成后产物随通道一起丢弃（Important-2 结构保证）。原
+/// `get_all_sessions_inner` 组合入口已拆为 walk/commit 两段（Important-2）。
+pub(crate) struct WalkedScan {
+    /// 已去重、宿主存活过滤后的会话集（遍历段终态，交提交段定型）
+    pub(crate) sessions: Vec<Session>,
+    /// 本轮有进程的工具 id（提交段记录 RUNNING_TOOLS 节奏信号用）
+    pub(crate) running_tools: Vec<&'static str>,
+    /// WorkBuddy 宿主哨兵判定（提交段并入在跑工具记录用）
+    pub(crate) workbuddy_host_alive: bool,
+    /// 本轮心跳观测（pid → sessionId；解析期只投递、提交段落 LAST_SEEN 表——
+    /// Important-2：业务观测落表是提交段专属）
+    pub(crate) observations: Vec<(u32, String)>,
+    /// Hook 事件快照（预算内的目录枚举 + 文件读取产物；提交段只做标记写删与
+    /// 状态叠加——Important-2b：预算外不留目录遍历）
+    pub(crate) hook_events: HashMap<String, crate::monitor::hooks::HookEvent>,
+    /// WorkBuddy 心跳消失补偿计划（预算内的读取/计算产物；提交段只做落库与
+    /// 观测消费——Important-2b）
+    pub(crate) workbuddy_compensation: crate::monitor::workbuddy_parser::WorkbuddyCompensationPlan,
+}
+
+/// 遍历段（可 detached 的纯遍历）：进程刷新 + 会话解析 + 去重/宿主存活过滤 +
+/// hook 事件快照 + 补偿计划计算（全部只读）。只允许写「活体事实缓存」——
+/// SHARED_SYSTEM / CPU 采样 / 解析 memo 缓存（内容自当下事实派生，旧轮回写
+/// 无害）；**状态提交一律不得进本函数**（Important-2 哨兵测试
+/// `walk_phase_alone_performs_no_state_commits` 钉住）。
+pub(crate) fn get_all_sessions_walk() -> WalkedScan {
     // W5：未勾选工具不参与会话扫描（看板卡/通知随之静默）
     let adapters: Vec<Box<dyn AgentAdapter>> = enabled_adapters();
 
@@ -2426,14 +2541,14 @@ pub(crate) fn get_all_sessions_inner() -> SessionsResponse {
     // 记录「本轮在跑的工具」：覆盖表中的无事件工具据本信号把节奏下限锁在 Idle 10s
     //（不进 Away 30s 盲区）。直接复用 Phase 1 的 adapter 进程结果与 WorkBuddy 宿主
     // 判定，不额外刷新进程快照（用户裁决 2026-10-31）。
-    record_running_tools_with_workbuddy_host(
-        adapters
-            .iter()
-            .zip(all_processes.iter())
-            .filter(|(_, processes)| !processes.is_empty())
-            .map(|(adapter, _)| adapter.agent_type().tool_id()),
-        workbuddy_host_alive,
-    );
+    // Important-2：本函数是遍历段——记录动作本身（RUNNING_TOOLS 写）属状态提交，
+    // 留给提交段执行；这里只把工具 id 与宿主哨兵随产物带走。
+    let running_tools: Vec<&'static str> = adapters
+        .iter()
+        .zip(all_processes.iter())
+        .filter(|(_, processes)| !processes.is_empty())
+        .map(|(adapter, _)| adapter.agent_type().tool_id())
+        .collect();
     // 已知取舍（2026-10-30 评审 Minor）：上面这一行在 **SHARED_SYSTEM 锁内**执行
     // `find_processes`，而 WorkBuddy 的发现逻辑在「没有可用心跳、要发宿主哨兵」时会做一次
     // `workbuddy.db` 只读查询（`recent_db_sessions`，17 行的库、实测 0.03ms；打开有
@@ -2464,9 +2579,6 @@ pub(crate) fn get_all_sessions_inner() -> SessionsResponse {
         all_sessions.extend(sessions);
     }
 
-    // W4：WorkBuddy 心跳消失补偿（转绿未被观测的会话补插未读，随本轮合并为绿卡）
-    crate::monitor::workbuddy_parser::compensate_vanished_heartbeats();
-
     // 会话级去重（见 dedup_sessions 注释）
     dedup_sessions(&mut all_sessions);
 
@@ -2494,6 +2606,60 @@ pub(crate) fn get_all_sessions_inner() -> SessionsResponse {
         });
     }
 
+    // 心跳观测收集（Important-B 终验）：各 adapter 实例槽 per-call 暂存，
+    // 遍历段统一取走并入产物（落表在提交段）。
+    let mut observations = Vec::new();
+    for adapter in &adapters {
+        observations.extend(adapter.take_heartbeat_observations());
+    }
+    // 遍历段终点：产物打包（Important-2——超时 detached 后只持有这些纯数据）。
+    // hook 事件快照与补偿计划是**只读**的预算内准备（Important-2b：目录枚举/
+    // 文件读取不留预算外）。
+    let hook_events = crate::monitor::hooks::read_hook_events();
+    let workbuddy_compensation =
+        crate::monitor::workbuddy_parser::compensate_vanished_heartbeats_prepare();
+    WalkedScan {
+        sessions: all_sessions,
+        running_tools,
+        workbuddy_host_alive,
+        observations,
+        hook_events,
+        workbuddy_compensation,
+    }
+}
+
+/// 提交段（状态写入：未读池/审批·问题等待标记/状态缓存/历史登记/在跑工具节奏
+/// 信号）。**必须在等待线程执行**（scan_bus 单飞内天然串行）；预算超时轮整段
+/// 跳过（Important-2：detached 旧线程绝不进入本函数）。SQLite 读写是本段的
+/// 固有阻塞边界（明示保留）；普通目录遍历已在预算内的遍历段完成（Important-2b）。
+pub(crate) fn get_all_sessions_commit(walked: WalkedScan) -> SessionsResponse {
+    let WalkedScan {
+        sessions: mut all_sessions,
+        running_tools,
+        workbuddy_host_alive,
+        observations,
+        hook_events,
+        workbuddy_compensation,
+    } = walked;
+    load_pending_unread_retries();
+    prune_pending_unread_retries(chrono::Utc::now().timestamp_millis());
+    // 记录「本轮在跑的工具」（节奏信号写 = 状态提交，提交段专属；遍历段只采集）
+    record_running_tools_with_workbuddy_host(running_tools.into_iter(), workbuddy_host_alive);
+    // 心跳观测落表（Important-2）：解析期只投递交接缓冲，提交段统一写入
+    // LAST_SEEN（pid 复用时本轮观测胜出，语义与原解析期直写一致）。
+    if !observations.is_empty() {
+        let mut last_seen = crate::monitor::workbuddy_parser::LAST_SEEN_SESSIONS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for (pid, sid) in observations {
+            last_seen.insert(pid, ("workbuddy".to_string(), sid));
+        }
+    }
+    // W4：WorkBuddy 心跳消失补偿应用（转绿未被观测的会话补插未读，随本轮合并
+    // 为绿卡）——计划在遍历段预算内计算（Important-2b：目录枚举/JSONL 尾读不
+    // 留预算外），落库/观测消费/影子表同步在此执行。
+    crate::monitor::workbuddy_parser::apply_workbuddy_compensation(workbuddy_compensation);
+
     // P1-3（review）：Codex APP 聚合卡由 rollout mtime 驱动、完成态持续存在（最长 24h），
     // 已读信号（未读池删行）无法清除它——违反 spec §5「被已读信号清除」与 §8 手动验证项
     // 「点击跳转后消失」；且池行 24h 边界比聚合窗晚，会闪现迟到的真未读卡。
@@ -2504,9 +2670,16 @@ pub(crate) fn get_all_sessions_inner() -> SessionsResponse {
     // 进程退出后未读卡接管，语义本就自洽，不动
     {
         let now_ms = chrono::Utc::now().timestamp_millis();
-        let pool: HashSet<(String, String)> = crate::database::dao::unread::list(now_ms)
+        // R05（复审 P2）：池集合含实例段——A/B 同 ID 的首绿/已读互不影响
+        let pool: HashSet<(String, String, String)> = crate::database::dao::unread::list(now_ms)
             .into_iter()
-            .map(|r| (r.tool_id, r.session_id))
+            .map(|r| {
+                (
+                    r.tool_id,
+                    r.dsh_instance_id.clone().unwrap_or_default(),
+                    r.session_id,
+                )
+            })
             .collect();
         all_sessions.retain(|s| {
             let is_data_driven_green = green_card_is_data_driven(&s.agent_type)
@@ -2516,14 +2689,16 @@ pub(crate) fn get_all_sessions_inner() -> SessionsResponse {
                 return true;
             }
             let was_green_prev = matches!(
-                crate::database::find_status(&s.id).as_deref(),
+                crate::database::find_status(&status_cache_key(s)).as_deref(),
                 Some("Idle") | Some("Finished")
             );
             let tool = s.agent_type.tool_id().to_string();
+            let instance = s.dsh_instance_id.clone().unwrap_or_default();
             keep_green_card(
                 was_green_prev,
-                pool.contains(&(tool.clone(), s.id.clone())),
-                unread_retry_pending(&tool, &s.id),
+                pool.contains(&(tool.clone(), instance.clone(), s.id.clone())),
+                // 上一轮状态缓存同样按实例段隔离（A/B 同 ID 互不借用上一轮状态）
+                unread_retry_pending_with_instance(&tool, &instance, &s.id),
             )
         });
     }
@@ -2545,7 +2720,8 @@ pub(crate) fn get_all_sessions_inner() -> SessionsResponse {
     // T8 起问题等待同样持久化（question_wait_marks，与审批标记分表隔离）：进入=
     // PreToolUse∧AskUserQuestion（探测档案定案——问题 UI 期间 pending tool_use 不
     // 落盘，文件推导实时不可达）；清除族**同时清两类标记**（回合推进=问题已答/已取消）
-    let hook_events = crate::monitor::hooks::read_hook_events();
+    // NEEDS_FIX Important-2b：事件目录枚举与文件读取在预算内的遍历段完成，这里
+    // 只消费快照（hook_events）做标记写删与状态叠加（预算外不留目录遍历）。
     let now_ts = chrono::Utc::now().timestamp();
     let mut grace = STOP_GRACE.lock().unwrap();
     let mut wait_marks: HashMap<(String, String), i64> =
@@ -2690,11 +2866,15 @@ pub(crate) fn get_all_sessions_inner() -> SessionsResponse {
     // 预过滤会把“池无行 + 上一轮绿”当已读，重试永久失效。
     for session in &all_sessions {
         let tool = session.agent_type.tool_id();
-        if unread_retry_pending(tool, &session.id) {
+        if unread_retry_pending_with_instance(
+            tool,
+            &session.dsh_instance_id.clone().unwrap_or_default(),
+            &session.id,
+        ) {
             continue;
         }
         let _ = crate::database::update_session_status(
-            &session.id,
+            &status_cache_key(session),
             &format!("{:?}", session.agent_type),
             &format!("{:?}", session.status),
         );
@@ -2703,9 +2883,11 @@ pub(crate) fn get_all_sessions_inner() -> SessionsResponse {
     // 挂在产物定序/过滤/排序全部完成之后——all_sessions 已定型，本调用纯读消费，
     // 扫描产物（SessionsResponse）在登记前后逐字节一致（预算契约零触碰）。
     // 无 cwd 会话与写放大守卫在 DAO 内处理
+    #[cfg(test)]
+    COMMIT_REGISTER_CALLS.fetch_add(1, Ordering::SeqCst);
     crate::database::register_sessions(&all_sessions);
     // 清理不再活跃的会话缓存
-    let active_ids: HashSet<String> = all_sessions.iter().map(|s| s.id.clone()).collect();
+    let active_ids: HashSet<String> = all_sessions.iter().map(status_cache_key).collect();
     crate::database::cleanup_stale_sessions(&active_ids);
 
     SessionsResponse {
@@ -2718,6 +2900,74 @@ pub(crate) fn get_all_sessions_inner() -> SessionsResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// NEEDS_FIX Important-2 结构回归：遍历段（可 detached 段）不得执行任何状态
+    /// 提交。提交全部收敛在 `get_all_sessions_commit`（等待线程、单飞内串行）——
+    /// 超时的 detached 旧线程只持有 `WalkedScan` 纯数据，自愈恢复后**无处提交**，
+    /// 不会把旧轮的会话状态回写（未读池/等待标记/状态缓存/历史登记零副作用）。
+    /// 哨兵：历史登记调用计数（提交段专属）+ 在跑工具记录（提交段专属）。
+    #[test]
+    fn walk_phase_alone_performs_no_state_commits() {
+        let _bus_guard = crate::adapter::scan_bus::test_guard();
+        // 种子在跑工具记录：遍历段若执行 record_running_tools（提交段专属）会覆盖它
+        record_running_tools(std::iter::once("codex"));
+        // NEEDS_FIX 终验（Important-B 哨兵扩展）：LAST_SEEN **内容快照**对比
+        //（不只长度——同 PID 值覆盖也必须检出）
+        let last_seen_before: std::collections::BTreeMap<u32, (String, String)> =
+            crate::monitor::workbuddy_parser::LAST_SEEN_SESSIONS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .map(|(pid, v)| (*pid, v.clone()))
+                .collect();
+        let register_calls_before = COMMIT_REGISTER_CALLS.load(Ordering::SeqCst);
+        let walked = get_all_sessions_walk();
+        // 观测随产物携带（WalkedScan.observations）：机器无 WorkBuddy 会话时为空，
+        // 断言不依赖真机数据——丢弃产物即零落表
+        let _ = &walked.observations;
+        assert_eq!(
+            COMMIT_REGISTER_CALLS.load(Ordering::SeqCst),
+            register_calls_before,
+            "遍历段不得登记历史会话（register_sessions 是提交段专属）"
+        );
+        assert!(
+            running_tool_ids().contains(&"codex".to_string()),
+            "遍历段不得改写在跑工具记录（提交段专属）"
+        );
+        let last_seen_after_walk: std::collections::BTreeMap<u32, (String, String)> =
+            crate::monitor::workbuddy_parser::LAST_SEEN_SESSIONS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .map(|(pid, v)| (*pid, v.clone()))
+                .collect();
+        assert_eq!(
+            last_seen_after_walk, last_seen_before,
+            "遍历段不得写心跳观测表（LAST_SEEN 落表是提交段专属；同 PID 值覆盖也算）"
+        );
+        // 模拟超时：产物直接丢弃（detached 线程恢复后只持有这些数据，无处提交）
+        drop(walked);
+        assert_eq!(
+            COMMIT_REGISTER_CALLS.load(Ordering::SeqCst),
+            register_calls_before,
+            "超时丢弃产物后历史登记零变化"
+        );
+        assert!(
+            running_tool_ids().contains(&"codex".to_string()),
+            "超时丢弃产物后在跑工具记录零变化"
+        );
+        let last_seen_after_drop: std::collections::BTreeMap<u32, (String, String)> =
+            crate::monitor::workbuddy_parser::LAST_SEEN_SESSIONS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .map(|(pid, v)| (*pid, v.clone()))
+                .collect();
+        assert_eq!(
+            last_seen_after_drop, last_seen_before,
+            "超时丢弃产物后心跳观测表**逐键逐值**零变化（同 PID 值覆盖也算泄漏）"
+        );
+    }
 
     #[test]
     fn poisoned_shared_system_lock_discards_state_and_is_reusable() {
@@ -2827,6 +3077,8 @@ mod tests {
             jump_supported: false,
             unread: false,
             unread_turned_green_at_ms: None,
+            dsh_instance_id: None,
+            dsh_subagent: None,
         }
     }
 
@@ -3879,7 +4131,7 @@ fn retain_read_completed_cards(
 /// 生产入口：墓碑来自 unread DAO。
 fn drop_read_completed_workbuddy_cards(active: &mut Vec<Session>) {
     retain_read_completed_cards(active, &|sid| {
-        crate::database::dao::unread::read_tombstone_at("workbuddy", sid)
+        crate::database::dao::unread::read_tombstone_at("workbuddy", sid, None)
     });
 }
 
@@ -3909,7 +4161,7 @@ fn sync_unread_sessions(active: &mut Vec<Session>, deleted_workbuddy: &HashSet<S
     // 0) 删除状态贯穿未读池：先物理删除已删会话的池行，再做本轮合并。
     //    deleted_workbuddy 为空（DB 不可读/无删除）时不动任何行。
     for sid in deleted_workbuddy {
-        crate::database::dao::unread::delete("workbuddy", sid);
+        crate::database::dao::unread::delete("workbuddy", sid, None);
     }
 
     // 1) 活跃会话驱动未读池变更
@@ -3923,10 +4175,11 @@ fn sync_unread_sessions(active: &mut Vec<Session>, deleted_workbuddy: &HashSet<S
             // review F1：迁移触发——状态缓存此刻存的是上一轮状态（回合末尾才统一更新），
             // 仅「上一轮非绿 → 本轮绿」才插入；持续绿色只刷新在场行展示字段，
             // 「跳转已读」删掉的行不再被电平 upsert 复活
-            let prev = crate::database::find_status(&s.id);
+            let prev = crate::database::find_status(&status_cache_key(s));
             let record = crate::database::dao::unread::UnreadSessionRecord {
                 tool_id: tool.clone(),
                 session_id: s.id.clone(),
+                dsh_instance_id: s.dsh_instance_id.clone(),
                 project_name: s.project_name.clone(),
                 title: s.title.clone(),
                 last_message: s.last_message.clone(),
@@ -3935,8 +4188,16 @@ fn sync_unread_sessions(active: &mut Vec<Session>, deleted_workbuddy: &HashSet<S
             };
             match unread_pool_action(prev.as_deref(), true) {
                 UnreadPoolAction::Insert => {
-                    let read_at = crate::database::dao::unread::read_tombstone_at(&tool, &s.id);
-                    let pending_since = unread_retry_pending_since(&tool, &s.id);
+                    let read_at = crate::database::dao::unread::read_tombstone_at(
+                        &tool,
+                        &s.id,
+                        s.dsh_instance_id.as_deref(),
+                    );
+                    let pending_since = unread_retry_pending_since_with_instance(
+                        &tool,
+                        &s.id,
+                        s.dsh_instance_id.as_deref(),
+                    );
                     let inserted = insert_first_green_unread(
                         &pending,
                         &tool,
@@ -3949,7 +4210,11 @@ fn sync_unread_sessions(active: &mut Vec<Session>, deleted_workbuddy: &HashSet<S
                         now_ms,
                         &|r| crate::database::dao::unread::try_upsert(r),
                     );
-                    if !inserted && pending.since(&tool, &s.id).is_some() {
+                    if !inserted
+                        && pending
+                            .since_with_instance(&tool, &s.id, s.dsh_instance_id.as_deref())
+                            .is_some()
+                    {
                         log::warn!("unread: 首次转绿入池失败（{} {}），下轮重试", tool, s.id);
                     }
                 }
@@ -3960,11 +4225,21 @@ fn sync_unread_sessions(active: &mut Vec<Session>, deleted_workbuddy: &HashSet<S
                         &tool,
                         &s.id,
                         &record,
-                        &|sid| crate::database::dao::unread::read_tombstone_at(&tool, sid),
+                        &|sid| {
+                            crate::database::dao::unread::read_tombstone_at(
+                                &tool,
+                                sid,
+                                s.dsh_instance_id.as_deref(),
+                            )
+                        },
                         &|r| crate::database::dao::unread::try_upsert(r),
                         &|r| crate::database::dao::unread::refresh_display(r),
                     );
-                    if !retried && pending.since(&tool, &s.id).is_some() {
+                    if !retried
+                        && pending
+                            .since_with_instance(&tool, &s.id, s.dsh_instance_id.as_deref())
+                            .is_some()
+                    {
                         log::warn!("unread: 转绿补插失败（{} {}），下轮重试", tool, s.id);
                     }
                 }
@@ -3978,8 +4253,8 @@ fn sync_unread_sessions(active: &mut Vec<Session>, deleted_workbuddy: &HashSet<S
             }
         } else {
             // 变黄/红：删未读（状态迁移，非重置机制）；新工作开始，清待重试标记
-            clear_unread_retry(&tool, &s.id, true);
-            crate::database::dao::unread::delete(&tool, &s.id);
+            clear_unread_retry_with_instance(&tool, &s.id, s.dsh_instance_id.as_deref(), true);
+            crate::database::dao::unread::delete(&tool, &s.id, s.dsh_instance_id.as_deref());
         }
     }
 
@@ -4072,13 +4347,24 @@ fn build_unread_cards(
     active: &[Session],
     tool_enabled: &dyn Fn(&str) -> bool,
 ) -> Vec<Session> {
-    let active_keys: HashSet<(String, String)> = active
+    // I5 终审：合并键含实例段——A 活跃不得遮掉 B 的同 ID 未读卡
+    let active_keys: HashSet<(String, String, String)> = active
         .iter()
-        .map(|s| (s.agent_type.tool_id().to_string(), s.id.clone()))
+        .map(|s| {
+            (
+                s.agent_type.tool_id().to_string(),
+                s.id.clone(),
+                s.dsh_instance_id.clone().unwrap_or_default(),
+            )
+        })
         .collect();
     let mut cards = Vec::new();
     for r in pool {
-        if active_keys.contains(&(r.tool_id.clone(), r.session_id.clone())) {
+        if active_keys.contains(&(
+            r.tool_id.clone(),
+            r.session_id.clone(),
+            r.dsh_instance_id.clone().unwrap_or_default(),
+        )) {
             continue;
         }
         // W5 门禁：停用工具（彻底隐藏/通知静音）的池行不得合并为未读卡
@@ -4112,6 +4398,8 @@ fn build_unread_cards(
             jump_supported: jump_supported_for(ProcessForm::App),
             unread: true,
             unread_turned_green_at_ms: Some(r.turned_green_at_ms),
+            dsh_instance_id: r.dsh_instance_id.clone(),
+            dsh_subagent: None,
         });
     }
     cards
@@ -4210,6 +4498,8 @@ mod host_liveness_filter_tests {
             jump_supported: true,
             unread,
             unread_turned_green_at_ms: None,
+            dsh_instance_id: None,
+            dsh_subagent: None,
         }
     }
 
@@ -4502,6 +4792,8 @@ mod dedup_tests {
             jump_supported: true,
             unread: false,
             unread_turned_green_at_ms: None,
+            dsh_instance_id: None,
+            dsh_subagent: None,
         }
     }
 
@@ -4581,6 +4873,8 @@ mod sort_tests {
             jump_supported: true,
             unread,
             unread_turned_green_at_ms: None,
+            dsh_instance_id: None,
+            dsh_subagent: None,
         }
     }
 
@@ -4614,13 +4908,14 @@ mod sort_tests {
 #[cfg(test)]
 mod unread_card_tests {
     use super::{
-        build_unread_cards, clear_unread_retry, filter_deleted_unread, insert_first_green_unread,
-        insert_should_skip_for_read, keep_green_card, load_pending_map,
+        build_unread_cards, clear_unread_retry_with_instance, filter_deleted_unread,
+        insert_first_green_unread, insert_should_skip_for_read, keep_green_card, load_pending_map,
         load_pending_unread_retries_into, mark_active_unread_cards, mark_unread_retry,
-        pending_backup_path, pending_key, persist_pending_map, persist_pending_unread_retries_into,
-        replace_pending_file_with_backup, retain_read_completed_cards, retry_insert_allowed,
-        retry_pending_unread, unread_insert_allowed, unread_retry_pending,
-        unread_retry_pending_since, PendingLoad, PendingRetryStore,
+        pending_backup_path, pending_key3, persist_pending_map,
+        persist_pending_unread_retries_into, replace_pending_file_with_backup,
+        retain_read_completed_cards, retry_insert_allowed, retry_pending_unread,
+        unread_insert_allowed, unread_retry_pending_since_with_instance,
+        unread_retry_pending_with_instance, PendingLoad, PendingRetryStore,
     };
     use crate::database::dao::unread::UnreadSessionRecord;
     use crate::session::model::{AgentType, ProcessForm, Session, SessionStatus};
@@ -4637,6 +4932,7 @@ mod unread_card_tests {
 
     fn record(tool: &str, sid: &str) -> UnreadSessionRecord {
         UnreadSessionRecord {
+            dsh_instance_id: None,
             tool_id: tool.into(),
             session_id: sid.into(),
             project_name: "proj".into(),
@@ -4669,6 +4965,8 @@ mod unread_card_tests {
             jump_supported: true,
             unread: false,
             unread_turned_green_at_ms: None,
+            dsh_instance_id: None,
+            dsh_subagent: None,
         }
     }
 
@@ -4691,9 +4989,13 @@ mod unread_card_tests {
             !mark_unread_retry("codex", "retry-test", 2_000, false),
             "重复失败且 since 未变不得再次写入"
         );
-        assert!(unread_retry_pending("codex", "retry-test"));
+        assert!(unread_retry_pending_with_instance(
+            "codex",
+            "",
+            "retry-test"
+        ));
         assert_eq!(
-            unread_retry_pending_since("codex", "retry-test"),
+            unread_retry_pending_since_with_instance("codex", "retry-test", None),
             Some(2_000)
         );
         // 旧回合墓碑（< since）不得取消新回合补插；本次转绿后的已读才取消
@@ -4753,9 +5055,23 @@ mod unread_card_tests {
             Some(10_000_300),
             Some(10_000_000)
         ));
-        assert!(clear_unread_retry("codex", "retry-test", false));
-        assert!(!clear_unread_retry("codex", "retry-test", false));
-        assert!(!unread_retry_pending("codex", "retry-test"));
+        assert!(clear_unread_retry_with_instance(
+            "codex",
+            "retry-test",
+            None,
+            false
+        ));
+        assert!(!clear_unread_retry_with_instance(
+            "codex",
+            "retry-test",
+            None,
+            false
+        ));
+        assert!(!unread_retry_pending_with_instance(
+            "codex",
+            "",
+            "retry-test"
+        ));
     }
 
     /// 文件持久化：正常替换 + 主文件缺失时回退 .bak，保证替换崩溃窗口可恢复。
@@ -4875,7 +5191,7 @@ mod unread_card_tests {
             retries
                 .lock()
                 .unwrap()
-                .get(&("codex".to_string(), "s2".to_string())),
+                .get(&("codex".to_string(), String::new(), "s2".to_string())),
             Some(&now)
         );
     }
@@ -4904,7 +5220,7 @@ mod unread_card_tests {
         let loaded = AtomicBool::new(false);
         let dirty = AtomicBool::new(false);
         let retries = Mutex::new(HashMap::from([(
-            ("codex".to_string(), "s2".to_string()),
+            ("codex".to_string(), String::new(), "s2".to_string()),
             now,
         )]));
         assert!(!persist_pending_unread_retries_into(
@@ -4920,8 +5236,8 @@ mod unread_card_tests {
         ));
         assert!(!dirty.load(Ordering::Acquire));
         let stored = loaded_map(&path).unwrap();
-        assert!(stored.contains_key("workbuddy\u{1f}s1"));
-        assert!(stored.contains_key("codex\u{1f}s2"));
+        assert!(stored.contains_key("workbuddy\u{1f}\u{1f}s1"));
+        assert!(stored.contains_key("codex\u{1f}\u{1f}s2"));
     }
 
     /// 入口级保护：主文件暂时不可读（用目录模拟 I/O 错误）时，
@@ -4946,7 +5262,7 @@ mod unread_card_tests {
         std::fs::write(&path, serde_json::to_string(&old_mark).unwrap()).unwrap();
         let loaded = AtomicBool::new(false);
         let retries = Mutex::new(HashMap::from([(
-            ("codex".to_string(), "s2".to_string()),
+            ("codex".to_string(), String::new(), "s2".to_string()),
             now,
         )]));
         load_pending_unread_retries_into(&path, &loaded, &retries);
@@ -4955,13 +5271,13 @@ mod unread_card_tests {
             .lock()
             .unwrap()
             .iter()
-            .map(|((tool, sid), since)| (pending_key(tool, sid), *since))
+            .map(|((tool, instance, sid), since)| (pending_key3(tool, instance, sid), *since))
             .collect();
         assert_eq!(merged.len(), 2);
         assert!(persist_pending_map(&path, &merged));
         let stored = loaded_map(&path).unwrap();
-        assert!(stored.contains_key("workbuddy\u{1f}s1"));
-        assert!(stored.contains_key("codex\u{1f}s2"));
+        assert!(stored.contains_key("workbuddy\u{1f}\u{1f}s1"));
+        assert!(stored.contains_key("codex\u{1f}\u{1f}s2"));
     }
 
     /// 入口级保护（真实权限故障）：主文件不可读时，B 的持久化不得覆盖含 A 的旧文件；
@@ -4997,7 +5313,7 @@ mod unread_card_tests {
 
         let loaded = AtomicBool::new(false);
         let retries = Mutex::new(HashMap::from([(
-            ("codex".to_string(), "s2".to_string()),
+            ("codex".to_string(), String::new(), "s2".to_string()),
             now,
         )]));
         load_pending_unread_retries_into(&path, &loaded, &retries);
@@ -5005,13 +5321,13 @@ mod unread_card_tests {
             .lock()
             .unwrap()
             .iter()
-            .map(|((tool, sid), since)| (pending_key(tool, sid), *since))
+            .map(|((tool, instance, sid), since)| (pending_key3(tool, instance, sid), *since))
             .collect();
         assert_eq!(merged.len(), 2);
         assert!(persist_pending_map(&path, &merged));
         let stored = loaded_map(&path).unwrap();
-        assert!(stored.contains_key("workbuddy\u{1f}s1"));
-        assert!(stored.contains_key("codex\u{1f}s2"));
+        assert!(stored.contains_key("workbuddy\u{1f}\u{1f}s1"));
+        assert!(stored.contains_key("codex\u{1f}\u{1f}s2"));
     }
 
     /// 跨重启模拟（真实 SQLite 文件）：首次 INSERT 失败 → pending 落盘 → 重开连接/建表
@@ -5025,6 +5341,7 @@ mod unread_card_tests {
         let path = dir.path().join("unread_pending_retries.json");
         let now = chrono::Utc::now().timestamp_millis();
         let record = UnreadSessionRecord {
+            dsh_instance_id: None,
             tool_id: "workbuddy".into(),
             session_id: "s-restart".into(),
             project_name: "p".into(),
@@ -5053,11 +5370,14 @@ mod unread_card_tests {
             &|r| unread::upsert_unread(&conn, r),
         );
         assert!(!inserted, "缺表时必须真实插入失败");
-        assert_eq!(store.since("workbuddy", "s-restart"), Some(now));
         assert_eq!(
-            loaded_map(&path).and_then(|m| m.get("workbuddy\u{1f}s-restart").copied()),
+            store.since_with_instance("workbuddy", "s-restart", None),
+            Some(now)
+        );
+        assert_eq!(
+            loaded_map(&path).and_then(|m| m.get("workbuddy\u{1f}\u{1f}s-restart").copied()),
             Some(now),
-            "pending 必须由生产 helper 自动落盘"
+            "pending 必须由生产 helper 自动落盘（三段键：instance 段为空串）"
         );
         drop(conn);
 
@@ -5080,8 +5400,16 @@ mod unread_card_tests {
             &|r| unread::refresh_display_unread(&conn, r),
         );
         assert!(retried, "恢复后补插应成功");
-        assert_eq!(store2.since("workbuddy", "s-restart"), None);
-        assert!(unread::exists_unread_conn(&conn, "workbuddy", "s-restart"));
+        assert_eq!(
+            store2.since_with_instance("workbuddy", "s-restart", None),
+            None
+        );
+        assert!(unread::exists_unread_conn(
+            &conn,
+            "workbuddy",
+            "s-restart",
+            None
+        ));
         assert_eq!(loaded_map(&path), Some(HashMap::new()));
 
         // 失败后用户已读再重启：墓碑覆盖本回合 → 生产 helper 清 pending 且不建行
@@ -5092,8 +5420,8 @@ mod unread_card_tests {
             expires_at_ms: read_since + 24 * 3600 * 1000,
             ..record.clone()
         };
-        assert!(store2.mark("workbuddy", "s-read", read_since, true));
-        unread::mark_read_tombstone_conn(&conn, "workbuddy", "s-read", read_since + 1);
+        assert!(store2.mark_with_instance("workbuddy", "s-read", None, read_since, true));
+        unread::mark_read_tombstone_conn(&conn, "workbuddy", "s-read", None, read_since + 1);
         drop(conn);
 
         let conn = rusqlite::Connection::open(&db_path).unwrap();
@@ -5113,8 +5441,16 @@ mod unread_card_tests {
             &|r| unread::refresh_display_unread(&conn, r),
         );
         assert!(!retried_read, "已读覆盖 since 时不得补插");
-        assert_eq!(store3.since("workbuddy", "s-read"), None);
-        assert!(!unread::exists_unread_conn(&conn, "workbuddy", "s-read"));
+        assert_eq!(
+            store3.since_with_instance("workbuddy", "s-read", None),
+            None
+        );
+        assert!(!unread::exists_unread_conn(
+            &conn,
+            "workbuddy",
+            "s-read",
+            None
+        ));
         assert_eq!(loaded_map(&path), Some(HashMap::new()));
     }
 
@@ -5305,6 +5641,8 @@ mod stale_mark_expiry_tests {
             jump_supported: false,
             unread: false,
             unread_turned_green_at_ms: None,
+            dsh_instance_id: None,
+            dsh_subagent: None,
         }
     }
 

@@ -24,6 +24,7 @@ pub mod session_scan;
 pub mod sqlite;
 pub mod status;
 pub mod subagents;
+pub mod walk_budget;
 pub mod workbuddy_parser;
 pub mod zcode_parser;
 
@@ -81,6 +82,8 @@ mod dismissed_filter_tests {
             jump_supported: true,
             unread: false,
             unread_turned_green_at_ms: None,
+            dsh_instance_id: None,
+            dsh_subagent: None,
         }
     }
 

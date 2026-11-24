@@ -316,6 +316,14 @@ mod tests {
     /// （路径仍由生产代码拼 `/api/v1/remote/ws2`）。合成值纪律同本文件：不读真实
     /// 账号/DB/外网；解析不了的帧一律忽略。
     fn spawn_ws_handshake(listener: tokio::net::TcpListener) -> FakeWsHandshake {
+        spawn_ws_handshake_with_workspace(listener, SYNTHETIC_WORKSPACE_PATH)
+    }
+
+    fn spawn_ws_handshake_with_workspace(
+        listener: tokio::net::TcpListener,
+        workspace_path: &str,
+    ) -> FakeWsHandshake {
+        let workspace_path: Arc<str> = Arc::from(workspace_path);
         let origin = format!(
             "ws://{}",
             listener.local_addr().expect("回环 WS 地址应可读")
@@ -360,6 +368,7 @@ mod tests {
                     stream,
                     echo_counter.clone(),
                     FakeHostState {
+                        workspace_path: workspace_path.clone(),
                         log: app_log.clone(),
                         commands: command_log.clone(),
                         ack: ack_mode.clone(),
@@ -709,6 +718,7 @@ mod tests {
         payload: &serde_json::Value,
     ) {
         let FakeHostState {
+            workspace_path,
             log,
             commands,
             ack,
@@ -868,7 +878,7 @@ mod tests {
                                 "kind": "snapshot",
                                 "snapshot": {"tasks": [{
                                     "address": {
-                                        "workspacePath": SYNTHETIC_WORKSPACE_PATH,
+                                        "workspacePath": workspace_path.as_ref(),
                                         "taskId": SYNTHETIC_TASK_ID,
                                     },
                                 }]},
@@ -1011,14 +1021,14 @@ mod tests {
         let _ = socket.send(Message::text(frame.to_string())).await;
     }
 
-    /// 合成 listing 回执：回显 `requestId`，单 workspace（`/tmp/travel`，无 identity）。
-    fn app_listing_reply(payload: &serde_json::Value) -> serde_json::Value {
+    /// 合成 listing 回执：回显 `requestId`，单 workspace（无 identity）。
+    fn app_listing_reply(payload: &serde_json::Value, workspace_path: &str) -> serde_json::Value {
         serde_json::json!({
             "requestId": payload.get("requestId").cloned().unwrap_or_default(),
             "result": {
                 "activeWorkspaceKey": "ws-synthetic",
                 "workspaces": [{
-                    "workspacePath": SYNTHETIC_WORKSPACE_PATH,
+                    "workspacePath": workspace_path,
                     "workspaceIdentity": null,
                 }],
             },
@@ -1041,6 +1051,7 @@ mod tests {
     /// 假宿主跨连接共享的注入态/账本（每条连接克隆一份 Arc 句柄）。
     #[derive(Clone)]
     struct FakeHostState {
+        workspace_path: Arc<str>,
         log: Arc<Mutex<Vec<String>>>,
         commands: Arc<Mutex<Vec<serde_json::Value>>>,
         ack: Arc<Mutex<AckMode>>,
@@ -1162,7 +1173,7 @@ mod tests {
                             .push(zcode_type.to_owned());
                         let reply = match zcode_type {
                             BOOTSTRAP_REQUEST | WORKSPACE_LIST_REQUEST => {
-                                Some(app_listing_reply(payload))
+                                Some(app_listing_reply(payload, &host.workspace_path))
                             }
                             WORKSPACE_BRIDGE_OPEN => Some(app_bridge_ready(payload)),
                             _ => None,
@@ -1692,6 +1703,8 @@ mod tests {
             jump_supported: false,
             unread: false,
             unread_turned_green_at_ms: None,
+            dsh_instance_id: None,
+            dsh_subagent: None,
         }
     }
 
@@ -1767,7 +1780,7 @@ mod tests {
                 board_hidden_ids: Box::new(Vec::new),
                 board_hidden_hide: Arc::new(|_| 0usize),
                 board_hidden_unhide: Arc::new(|_| 0usize),
-                unread_mark_read: Arc::new(|_, _| ()),
+                unread_mark_read: Arc::new(|_, _, _| ()),
                 session_close: Arc::new(|_| Ok(())),
                 store: store.clone(),
                 host_source: Box::new(|| serde_json::json!({ "host": { "name": "test-host" } })),
@@ -1798,6 +1811,12 @@ mod tests {
                 screen_probe: Arc::new(|_, _| None),
                 codex_control: Arc::new(CodexControlHub::disabled_with_store(store)),
                 desktop_language: Default::default(),
+                dsh_control: crate::services::dsh_control::disabled_arc(),
+                dsh_auto_adapt_source: std::sync::Arc::new(
+                    crate::services::dsh_control::production::dsh_auto_adapt_enabled,
+                ),
+                dsh_console_mount: None,
+                dsh_console_upstream_source: None,
             })
         };
         state.set_zcode_hub(hub);
@@ -2034,6 +2053,10 @@ mod tests {
     }
 
     async fn full_chain(policy: CapabilityView) -> Chain {
+        full_chain_with_workspace(policy, SYNTHETIC_WORKSPACE_PATH).await
+    }
+
+    async fn full_chain_with_workspace(policy: CapabilityView, workspace_path: &str) -> Chain {
         let fake = FakeOfficialHttp::start().await;
         // 显式禁用系统代理（macOS 系统代理会把 127.0.0.1 也转发出去）。
         let http = reqwest::Client::builder()
@@ -2045,7 +2068,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await
             .expect("回环 WS 端口应可绑定");
-        let ws = spawn_ws_handshake(listener);
+        let ws = spawn_ws_handshake_with_workspace(listener, workspace_path);
 
         let conn = shared_conn();
         seed(&conn);
@@ -2090,6 +2113,13 @@ mod tests {
     /// 与生产 `ZcodeHub::new` 同一拼法），宿主 build 探针由调用方注入——未知 build
     /// 用例的确定性来源（真实探针读本机 plist，跨机器/跨时间不可复现）。
     async fn resolver_chain(host_build: HostBuildProbe) -> Chain {
+        resolver_chain_with_workspace(host_build, SYNTHETIC_WORKSPACE_PATH).await
+    }
+
+    async fn resolver_chain_with_workspace(
+        host_build: HostBuildProbe,
+        workspace_path: &str,
+    ) -> Chain {
         let fake = FakeOfficialHttp::start().await;
         // 显式禁用系统代理（macOS 系统代理会把 127.0.0.1 也转发出去）。
         let http = reqwest::Client::builder()
@@ -2100,7 +2130,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await
             .expect("回环 WS 端口应可绑定");
-        let ws = spawn_ws_handshake(listener);
+        let ws = spawn_ws_handshake_with_workspace(listener, workspace_path);
 
         let conn = shared_conn();
         seed(&conn);
@@ -3203,16 +3233,34 @@ mod tests {
         assert_eq!(rows, 0, "已知 build shipped confirmed 零账本行");
     }
 
+    // HTTP 附件与队列路由会实际解析项目目录，不能依赖机器上恰好存在 /tmp/travel。
+    fn temporary_workspace() -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().expect("创建独立测试工作区");
+        let path = dir.path().canonicalize().expect("解析测试工作区");
+        (
+            dir,
+            path.to_str()
+                .expect("测试工作区路径必须为 UTF-8")
+                .to_owned(),
+        )
+    }
+
     /// 三轮 C 回环 e2e：附件上传走通用通道落进绑定工作区，send 正文按
     /// `<file path>` 约定携带落盘路径，经官方 actions/sendText 发送（**零终端注入
     /// 回落**）；工作区不一致的上传被 409 `workspace_mismatch` 拒绝。
     #[tokio::test]
     async fn attachment_uploads_to_bound_workspace_and_flows_into_send_body() {
-        let chain = resolver_chain(Arc::new(|| Some("9.9.9.9999".to_owned()))).await;
-        let app = router(remote_state(
+        let (_workspace_dir, workspace_path) = temporary_workspace();
+        let chain = resolver_chain_with_workspace(
+            Arc::new(|| Some("9.9.9.9999".to_owned())),
+            &workspace_path,
+        )
+        .await;
+        let app = router(remote_state_with_project(
             &chain.conn,
             chain.hub.clone(),
             chain.injector.clone(),
+            &workspace_path,
         ));
         let _session = bind_and_wait_ready(&app, SYNTHETIC_TASK_ID).await;
 
@@ -3240,9 +3288,11 @@ mod tests {
             .expect("上传必须返回落盘路径")
             .to_owned();
         assert!(
-            path.starts_with(&format!(
-                "{SYNTHETIC_WORKSPACE_PATH}/.tuvis-attachments/{SYNTHETIC_TASK_ID}/"
-            )),
+            std::path::Path::new(&path).starts_with(
+                std::path::Path::new(&workspace_path)
+                    .join(".tuvis-attachments")
+                    .join(SYNTHETIC_TASK_ID)
+            ),
             "落盘必须在绑定工作区的附件目录：{path}"
         );
 
@@ -3271,7 +3321,7 @@ mod tests {
         // ---- 4) 绑定工作区访问器：桥绑定的精确 workspacePath ----
         assert_eq!(
             chain.hub.bound_workspace_path(SYNTHETIC_TASK_ID).as_deref(),
-            Some(SYNTHETIC_WORKSPACE_PATH),
+            Some(workspace_path.as_str()),
             "绑定会话必须能取到精确工作区（一致性闸的对照值）"
         );
         assert_eq!(chain.hub.bound_workspace_path("sess_unknown"), None);
@@ -3302,7 +3352,7 @@ mod tests {
         assert_eq!(body["error"], "workspace_mismatch", "{body}");
         let rendered = body.to_string();
         assert!(
-            !rendered.contains("/tmp/travel"),
+            !rendered.contains(&workspace_path) && !rendered.contains("/tmp/travel-elsewhere"),
             "409 响应不得透传任何一侧路径原文：{rendered}"
         );
 
@@ -4112,21 +4162,23 @@ mod tests {
     #[tokio::test]
     async fn outbox_http_priority_stop_and_send_cross_production_wire() {
         use crate::services::zcode_control::command::STOP_TYPE;
+        let (_workspace_dir, workspace_path) = temporary_workspace();
         let mut policy = send_policy();
         policy.interrupt = CapabilityFlag {
             enabled: true,
             reason_code: None,
         };
-        let chain = full_chain(policy).await;
+        let chain = full_chain_with_workspace(policy, &workspace_path).await;
         chain
             .store
             .with(|c| try_set_setting_conn(c, KEY_ENABLED, "true").unwrap());
         let (queue, _) = chain.hub.install_queue();
         queue.recover().await.expect("queue recovery");
-        let app = router(remote_state(
+        let app = router(remote_state_with_project(
             &chain.conn,
             chain.hub.clone(),
             chain.injector.clone(),
+            &workspace_path,
         ));
         bind_and_wait_ready(&app, SYNTHETIC_TASK_ID).await;
         queue.start();

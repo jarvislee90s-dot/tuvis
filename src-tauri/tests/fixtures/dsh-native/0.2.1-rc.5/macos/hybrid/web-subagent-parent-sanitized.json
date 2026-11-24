@@ -1,0 +1,104 @@
+{
+  "evidence": "实际 Web 宿主（0.2.1-rc.5，app.asar sha256 与 rc.3 记录一致 8dad52f295bd…）真实子任务父会话的脱敏关联结构；消息正文以占位符保留形状，关联 ID（parentId/childId/callId）跨文件一致",
+  "hostShape": "dsh web --no-open --host 127.0.0.1 --port 0；隔离 DSH_HOME；自定义 provider（OpenAI Chat Completions 兼容）",
+  "correlationTable": {
+    "session-<parent-id>": "父主会话 id（id 字段自带 session- 前缀）",
+    "<child-id>": "子会话 id（裸 UUID，无 session- 前缀）",
+    "<callId-delegate>": "父侧 subagent 工具调用 callId（toolCallId 同值）"
+  },
+  "header": {
+    "type": "session",
+    "version": 4,
+    "id": "session-<parent-id>",
+    "createdAt": "<epoch-ms>",
+    "cwd": "<test-cwd>",
+    "parentSession": null,
+    "isSeeded": false,
+    "delegationDepth": 0,
+    "agentPreset": "standard"
+  },
+  "delegationChain": {
+    "toolCall": {
+      "type": "tool/call",
+      "seq": 58,
+      "time": 1793799610239,
+      "data": {
+        "turn": 3,
+        "step": 1,
+        "callId": "<callId-delegate>",
+        "name": "subagent",
+        "arguments": "{\"cwd\":\"<test-cwd>\",\"description\":\"<task-label>\",\"prompt\":\"<task-prompt 多行文本>\"}"
+      }
+    },
+    "subagentCatalog": {
+      "type": "subagent/catalog",
+      "seq": 59,
+      "time": 1793799610271,
+      "data": {
+        "version": 0,
+        "childId": "<child-id>",
+        "childCreatedAt": 1793799610255,
+        "mode": "continuable",
+        "label": "<task-label>"
+      }
+    },
+    "toolResult": {
+      "type": "tool/result",
+      "seq": 60,
+      "time": 1793799610273,
+      "data": {
+        "turn": 3,
+        "step": 1,
+        "message": {
+          "role": "tool",
+          "source": { "kind": "tool", "callId": "<callId-delegate>" },
+          "toolCallId": "<callId-delegate>",
+          "content": [{ "type": "text", "text": "started subagent <child-id>" }],
+          "isError": false,
+          "id": "<assistant-message-id>"
+        }
+      },
+      "sourceEventSeqs": [58],
+      "surfaceOp": "append"
+    },
+    "childReportArrival": {
+      "type": "agent/inbox/spliced",
+      "seq": 66,
+      "time": 1793799669008,
+      "data": {
+        "target": "next-step",
+        "start": 0,
+        "inserted": [
+          { "content": [{ "type": "text", "text": "Agent <child-id> sent a message: " }, { "type": "text", "text": "<child-report-text 含目录统计与文件名列表>" }] }
+        ]
+      }
+    },
+    "childReportUserMessage": {
+      "type": "user/message",
+      "seq": 70,
+      "time": 1793799669025,
+      "data": {
+        "content": [
+          { "type": "text", "text": "Agent <child-id> sent a message: " },
+          { "type": "text", "text": "<child-report-text>" }
+        ],
+        "source": { "kind": "user", "rpcId": "<rpc-id>", "clientTimeZone": "Asia/Shanghai" },
+        "role": "user",
+        "id": "<message-id>"
+      }
+    }
+  },
+  "observedEventTypes": [
+    "session", "permission/preset", "sandbox/mode", "approval/policy",
+    "agent/inbox/spliced", "turn/start", "step/start", "system/message",
+    "user/message", "request/header", "request/context", "session/title",
+    "session/title-llm-request", "assistant/message", "tool/call", "tool/result",
+    "step/end", "job/registered", "job/settled", "turn/end", "subagent/catalog"
+  ],
+  "jobStatusShape": {
+    "registered": { "jobId": "<jobId>", "owner": "session-<parent-id>", "kind": "bash", "label": "<command>", "startedAt": "<epoch-ms>", "toolCall": { "callId": "<callId>", "rootCallId": "<callId>" } },
+    "settledAdds": ["finishedAt", "<status fields>"]
+  },
+  "packageSha256": "8dad52f295bdbe9fa71948fdf38ac2ce3c910213d3b89c37174b2af77db9fb31",
+  "packageNote": "Info.plist 版本 0.2.1-rc.5；app.asar 与 rc.3 记录同指纹（未重打包）"
+}

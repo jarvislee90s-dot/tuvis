@@ -11,6 +11,7 @@
 
 pub(crate) mod claude;
 pub(crate) mod codex;
+pub mod dsh;
 pub(crate) mod kimi;
 pub(crate) mod opencode;
 
@@ -45,6 +46,7 @@ impl TokenUsage {
 pub enum SubagentStatus {
     Running,
     Idle,
+    Unknown,
 }
 
 /// 端点载荷单条（spec §5.2 + 观察台 §二）。spawnTs=None：首条时间戳尚未落盘

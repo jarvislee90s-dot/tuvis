@@ -1,6 +1,15 @@
+packages:
+  - packages/*
 verifyDepsBeforeRun: false
 onlyBuiltDependencies:
   - esbuild
 allowBuilds:
   esbuild: true
   msw: true
+  # 以下均来自 @deepseek-ai/dsh 的 devDependencies 子树（仅类型基线，不运行 DSH），
+  # 本仓库明确不构建这些原生/可选依赖：
+  '@deepseek-ai/dsh-subprocess-local': false
+  '@google/genai': false
+  koffi: false
+  node-pty: false
+  protobufjs: false

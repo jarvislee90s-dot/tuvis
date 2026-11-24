@@ -36,6 +36,12 @@ export interface Session {
   unread: boolean;
   /** 未读池首次转绿时间（epoch ms）；通知新鲜度用它，不用业务 lastActivityAt */
   unreadTurnedGreenAtMs?: number | null;
+  /** DSH 实例归属（H04，仅 DSH 用）：卡片归属的稳定实例 ID。多宿主/多实例时
+   * 同名会话不串，DSH 卡片/缓存身份不得只以原生 sessionId 去重；归属不可证或
+   * 其他工具时该键缺席（后端 skip_serializing_if） */
+  dshInstanceId?: string;
+  /** DSH 会话头确认的子 Agent 状态，未知时缺席。 */
+  dshSubagent?: boolean;
 }
 
 export interface SessionsResponse {
@@ -62,6 +68,9 @@ export interface TransitionEvent {
   /** 「跃迁由子 agent 活动引发」打标（T4 F2b / 决策 4，取 curr 会话同名会话字段）：
    *  移动端横幅/提示音/振动入口按本字段默认静默 */
   flapFromSubagentActivity: boolean;
+  /** DSH 实例归属（H04 审查 I4②）：取 curr 会话的 dshInstanceId——多实例下
+   * 同名/同 ID 会话的跃迁不串；非 DSH / 未核验时该键缺席 */
+  dshInstanceId?: string;
   /** 事件产生时刻（服务端毫秒时间戳） */
   ts: number;
 }

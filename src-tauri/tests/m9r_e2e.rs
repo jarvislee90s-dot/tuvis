@@ -1022,6 +1022,8 @@ async fn e2e_http_full_chain() {
         jump_supported: false,
         unread: false,
         unread_turned_green_at_ms: None,
+        dsh_instance_id: None,
+        dsh_subagent: None,
     };
     let sessions = vec![session];
     let total = sessions.len();
@@ -1075,7 +1077,7 @@ async fn e2e_http_full_chain() {
         board_hidden_ids: Box::new(Vec::new),
         board_hidden_hide: std::sync::Arc::new(|_| 0usize),
         board_hidden_unhide: std::sync::Arc::new(|_| 0usize),
-        unread_mark_read: std::sync::Arc::new(|_, _| ()),
+        unread_mark_read: std::sync::Arc::new(|_, _, _| ()),
         session_close: std::sync::Arc::new(|_| Ok(())),
         sse_registry: Arc::new(SseRegistry::default()),
         max_devices_source: Box::new(|| 3),
@@ -1122,6 +1124,10 @@ async fn e2e_http_full_chain() {
         },
 
         codex_control: multi_agents_manager_lib::remote::codex_ipc::CodexControlHub::disabled_arc(),
+        dsh_control: multi_agents_manager_lib::services::dsh_control::disabled_arc(),
+        dsh_console_mount: None,
+        dsh_console_upstream_source: None,
+        dsh_auto_adapt_source: std::sync::Arc::new(|| true),
         desktop_language: Default::default(),
         // 任务 8：OpenCode 原生交互中枢——禁用默认（惰性容器零 IO；本 E2E 不触原生
         // 路由，业务断言不变）。本文件 #![cfg(windows)]——macOS 上编译为空，漏补会在

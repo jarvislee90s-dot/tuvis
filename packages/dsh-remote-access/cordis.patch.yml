@@ -1,0 +1,7 @@
+# 兔维斯远控接入：单一外部插件包。安装进 dsh profile
+# （`dsh plugin --profile desktop add <tgz>`）后，补丁层把本包挂进
+# 宿主 Cordis 入口表：宿主半区（index，注入 connection/webServer）
+# 与客户端半区（./client，本机授权入口）同包交付。
+- insert:
+    - id: tuvis-remote-access
+      name: "@tuvis/dsh-remote-access"

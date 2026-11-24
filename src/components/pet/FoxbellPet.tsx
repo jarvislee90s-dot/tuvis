@@ -446,11 +446,13 @@ export function FoxbellPet() {
         ? await invoke<SessionMutationOutcome>("mark_session_read", {
             agentType: session.agentType,
             sessionId: session.id,
+            instanceId: session.dshInstanceId,
           })
         : await invoke<SessionMutationOutcome>("dismiss_session_card", {
             agentType: session.agentType,
             sessionId: session.id,
             status: session.status,
+            instanceId: session.dshInstanceId,
           });
     } catch (error) {
       commandFailed = true;

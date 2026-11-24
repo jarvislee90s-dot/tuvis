@@ -30,6 +30,9 @@ export function validateMatrix(data) {
       throw new Error(`缺少工具名称：${tool}`);
   }
   validateBilingual(data.notes?.codex, "Codex 说明");
+  if (data.notes?.dshPlatform !== undefined) {
+    validateBilingual(data.notes.dshPlatform, "dsh 平台说明");
+  }
   for (const group of data.groups) {
     if (!Array.isArray(group.rows) || !group.rows.length) throw new Error("能力矩阵分组为空");
     for (const row of group.rows) {
@@ -91,7 +94,7 @@ export function renderMatrix(data, language) {
   const source = zh
     ? "数据唯一维护源：[`docs/capabilities.json`](docs/capabilities.json)，与官网同源。"
     : "Single maintained source: [`docs/capabilities.json`](docs/capabilities.json), shared with the website.";
-  return `<!-- capabilities:start (generated; run pnpm sync:capabilities) -->\n\n${intro}\n\n${source}\n\n${table}\n\n${data.notes.codex[language]}\n\n<!-- capabilities:end -->`;
+  return `<!-- capabilities:start (generated; run pnpm sync:capabilities) -->\n\n${intro}\n\n${source}\n\n${table}\n\n${data.notes.codex[language]}${data.notes?.dshPlatform ? `\n\n${data.notes.dshPlatform[language]}` : ""}\n\n<!-- capabilities:end -->`;
 }
 
 export function replaceMatrix(readme, data, language) {

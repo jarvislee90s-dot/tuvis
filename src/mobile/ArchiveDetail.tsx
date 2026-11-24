@@ -87,7 +87,13 @@ export default function ArchiveDetail({
 
   useEffect(() => {
     let alive = true;
-    fetchSessionMessages(session.agentType, session.sessionId, limit)
+    fetchSessionMessages(
+      session.agentType,
+      session.sessionId,
+      limit,
+      session.instanceId,
+      !session.hiddenAlive
+    )
       .then((p) => {
         if (!alive) return;
         setMessages(p.messages);
@@ -99,7 +105,7 @@ export default function ArchiveDetail({
     return () => {
       alive = false;
     };
-  }, [session.agentType, session.sessionId, limit]);
+  }, [session.agentType, session.sessionId, session.instanceId, session.hiddenAlive, limit]);
 
   // 加载更早消息（活会话同款）：limit 翻倍整页重拉，锚定原顶部消息不甩屏
   const hasLoadMore =
@@ -520,7 +526,7 @@ export default function ArchiveDetail({
                 className="flex-1 rounded-lg border border-red-300 px-3 py-1.5 text-xs text-red-600"
                 onClick={() => {
                   setRemoveError(false);
-                  deleteArchivedSession(session.sessionId)
+                  deleteArchivedSession(session.sessionId, session.instanceId)
                     .then(onBack)
                     .catch(() => setRemoveError(true));
                 }}

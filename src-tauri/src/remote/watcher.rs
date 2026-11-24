@@ -35,6 +35,10 @@ pub struct TransitionEvent {
     /// `flap_from_subagent_activity`——移动端 Board 横幅/提示音/振动入口按本字段
     /// 默认静默（桌面端经 /sessions 快照的同名字段消费，两路同一权威源）
     pub flap_from_subagent_activity: bool,
+    /// DSH 实例归属（H04 审查 I4②）：取 curr 会话的 `dsh_instance_id`——多宿主
+    /// 下同名/同 ID 会话不串；None（非 DSH / 未核验）时整个键缺席（wire 兼容）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dsh_instance_id: Option<String>,
     pub ts: i64,
 }
 
@@ -149,13 +153,28 @@ fn now_ms() -> i64 {
 /// 不同工具撞 id 不得互相顶掉基线。
 /// `now` 由调用方注入毫秒时间戳（生产 = now_ms；测试注入固定值做确定性断言）
 pub fn diff_transitions(prev: &[Session], curr: &[Session], now: i64) -> Vec<TransitionEvent> {
-    let prev_map: HashMap<(&'static str, &str), &Session> = prev
+    // 键取 (工具, 会话 id, DSH 实例)：审查 I4②——多实例下同名/同 ID 会话不串
+    // （实例归属变化视为不同卡，不发伪跃迁；非 DSH 恒 None 不影响既有键）。
+    let prev_map: HashMap<(&'static str, &str, Option<&str>), &Session> = prev
         .iter()
-        .map(|s| ((s.agent_type.tool_id(), s.id.as_str()), s))
+        .map(|s| {
+            (
+                (
+                    s.agent_type.tool_id(),
+                    s.id.as_str(),
+                    s.dsh_instance_id.as_deref(),
+                ),
+                s,
+            )
+        })
         .collect();
     curr.iter()
         .filter_map(|c| {
-            let p = prev_map.get(&(c.agent_type.tool_id(), c.id.as_str()))?;
+            let p = prev_map.get(&(
+                c.agent_type.tool_id(),
+                c.id.as_str(),
+                c.dsh_instance_id.as_deref(),
+            ))?;
             if p.status != c.status {
                 Some(TransitionEvent {
                     session_id: c.id.clone(),
@@ -165,6 +184,7 @@ pub fn diff_transitions(prev: &[Session], curr: &[Session], now: i64) -> Vec<Tra
                     project_name: c.project_name.clone(),
                     last_message: c.last_message.clone(),
                     flap_from_subagent_activity: c.flap_from_subagent_activity,
+                    dsh_instance_id: c.dsh_instance_id.clone(),
                     ts: now,
                 })
             } else {
@@ -221,6 +241,8 @@ mod tests {
             jump_supported: false,
             unread: false,
             unread_turned_green_at_ms: None,
+            dsh_instance_id: None,
+            dsh_subagent: None,
         }
     }
 
@@ -233,6 +255,7 @@ mod tests {
             project_name: "p".into(),
             last_message: None,
             flap_from_subagent_activity: false,
+            dsh_instance_id: None,
             ts: 1,
         }
     }

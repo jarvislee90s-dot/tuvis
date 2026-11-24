@@ -1,0 +1,21 @@
+{
+  "evidence": "实际 Web 宿主（0.2.1-rc.5）通过 UI「在新对话中分支」创建的 fork 会话头（脱敏）；与子 Agent 的判别依据：有 parentSession 但无 origin 字段、isSeeded=true、delegationDepth=0",
+  "header": {
+    "type": "session",
+    "version": 4,
+    "id": "session-<fork-id>",
+    "createdAt": "<epoch-ms>",
+    "cwd": "<test-cwd>",
+    "parentSession": "session-<parent-id>",
+    "isSeeded": true,
+    "delegationDepth": 0,
+    "agentPreset": "standard"
+  },
+  "originFieldPresent": false,
+  "contrastWithSubagent": {
+    "subagentChild": { "origin": "subagent", "delegationDepth": 1, "isSeeded": false, "idShape": "裸 UUID" },
+    "fork": { "origin": null, "delegationDepth": 0, "isSeeded": true, "idShape": "session-<uuid>" },
+    "rule": "单凭 parentSession 不足以认定子 Agent；必须 origin=subagent（或等价字段组合）参与判定"
+  },
+  "packageSha256": "8dad52f295bdbe9fa71948fdf38ac2ce3c910213d3b89c37174b2af77db9fb31"
+}

@@ -1,0 +1,23 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "types": ["node"],
+    "rootDir": "src",
+    "outDir": "lib",
+    "declaration": true,
+    "sourceMap": false,
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "skipLibCheck": true,
+    "noEmitOnError": true,
+    "forceConsistentCasingInFileNames": true
+  },
+  // 客户端半区（src/client/**）是「经典脚本」，由 tsconfig.client.json 单独编译：
+  // 混在本项目里会同时产出 lib/client/client.js 并污染 NodeNext 语义。
+  "include": ["src"],
+  "exclude": ["src/client"]
+}

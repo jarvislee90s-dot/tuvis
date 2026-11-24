@@ -13,6 +13,30 @@ English · [中文](CHANGELOG.md)
 _Only versions translated so far are listed here; the full history lives in the
 [Chinese changelog](CHANGELOG.md)._
 
+## [0.6.8] - 2026-11-24
+
+### Added
+
+- **DeepSeek Harness (DSH) remote control.** Select a Desktop or Web instance in the desktop remote settings. One switch guides plugin installation, host restart, and authorization. Turning it off revokes access before waiting for the host to exit and uninstalling the plugin. A failed close can be retried.
+- **Native DSH sessions on mobile.** Send text and file or image attachments, check delivery receipts, stop the current turn, and submit answers to an ordinary question group. Navigate with Previous and Next, preview files and deliverables, and browse read-only subagent details on macOS.
+- **Official DSH session settings and console.** View and change permission, model, and reasoning settings while the session is idle. Open the selected instance's official console in a new tab through the existing remote entry while keeping the original draft and scroll position.
+- **Native OpenCode controls on macOS.** The official native route handles sending, stopping, interaction, and uploads with the bound workspace and native queue state. Native writes are unavailable on Windows.
+
+### Fixed
+
+- Codex Desktop remote stops and queue state reconcile more reliably. Priority sends, resuming an empty paused queue, and switching message sources give clearer results.
+- OpenCode attachments use the exact verified workspace. Process termination is rejected when process ownership cannot be established.
+
+### Upgrade notes
+
+- To start using DSH on mobile, select and enable a host in the desktop remote settings, then follow the installation and authorization status. Changing the model or reasoning effort also changes the host profile default. Handle execution and plan approvals in the official console.
+- Isolated macOS Desktop verification covered sending and settings readback. Windows Web instance attribution is unavailable. Native Windows behavior, macOS Web writes, and real console round trips across the four remote channels await validation.
+- Remote OpenCode writes on macOS use the native route. See the product manual for setup.
+
+### Engineering
+
+- Consolidated DSH sending and revocation fixtures, removed the retired console listener and business filters, and updated the bilingual manuals, capability matrix, and release notes.
+
 ## [0.6.7] - 2026-11-22
 
 ### Added

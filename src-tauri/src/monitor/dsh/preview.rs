@@ -208,6 +208,32 @@ mod tests {
     }
 
     #[test]
+    fn golden_v4_completed_preview_and_title() {
+        // v4 夹具：真人输入（source.kind=user）+ 助手回复 + 注入（agent-instructions /
+        // skill-catalog / system-message 不在 user/message 流）——语义与 v3 完全同套
+        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/dsh/sample7-v4-completed.sanitized.jsonl");
+        let events = crate::monitor::dsh::log::parse_events(&std::fs::read_to_string(&p).unwrap());
+        let (role, text) = extract(&events);
+        assert_eq!(role.as_deref(), Some("assistant"));
+        assert_eq!(text.as_deref(), Some("v4 done"));
+        // 标题：session/title 最新事件（provider 生成 "v4 done" 覆盖 fallback "v4 hello"）
+        let t = title(&events, None);
+        assert_eq!(t.as_deref(), Some("v4 done"));
+    }
+
+    #[test]
+    fn golden_v4_running_preview_prefers_real_user_input() {
+        // 运行中 v4：末条可见消息 = 真人输入（agent-instructions 注入 seq 更新也不覆盖）
+        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/dsh/sample8-v4-running.sanitized.jsonl");
+        let events = crate::monitor::dsh::log::parse_events(&std::fs::read_to_string(&p).unwrap());
+        let (role, text) = extract(&events);
+        assert_eq!(role.as_deref(), Some("user"));
+        assert_eq!(text.as_deref(), Some("v4 keep going"));
+    }
+
+    #[test]
     fn title_prefers_projcache() {
         let events = vec![ev("session/title", 3, json!({ "title": "from-log" }))];
         let cache = crate::monitor::dsh::projcache::ProjcacheView {

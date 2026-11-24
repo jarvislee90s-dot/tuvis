@@ -1,0 +1,59 @@
+{
+  "source": "official session/projections (isolated web host, DSH 0.2.2-rc.5)",
+  "rpc": {
+    "method": "session/projections",
+    "args_shape": {
+      "request": {
+        "sessionId": "<redacted>"
+      }
+    }
+  },
+  "response": {
+    "kind": "sequenced",
+    "asOfSeq": 2
+  },
+  "modelSelection": {
+    "lastUsed": null,
+    "next": null
+  },
+  "tokenUsage": {
+    "uncachedInputTokens": 0,
+    "outputTokens": 0,
+    "cacheReadTokens": 0,
+    "cacheWriteTokens": 0
+  },
+  "agentPreset": "standard",
+  "keys": [
+    "agentPreset",
+    "agentTeam",
+    "contextBreakdown",
+    "contextPressure",
+    "conversationContinuation",
+    "goal",
+    "imageLimits",
+    "inbox",
+    "modelSelection",
+    "permissions",
+    "plan",
+    "sessionListMetadata",
+    "sessionStats",
+    "subagent",
+    "subagentCatalog",
+    "subagentTiming",
+    "title",
+    "todos",
+    "tokenUsage",
+    "turnOutline",
+    "userQuestions",
+    "workingDirectory"
+  ],
+  "modelCatalog": {
+    "default": {
+      "provider": "deepseek-official",
+      "model": "deepseek-flash"
+    },
+    "groups": [],
+    "routableProviders": []
+  },
+  "limitation": "隔离宿主无路由供应商与模型凭据，未产生真实回合；modelSelection 保持 null，当前模型/档位未取得实证。"
+}

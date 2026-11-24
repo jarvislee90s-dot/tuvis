@@ -1,4 +1,4 @@
-import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import App from "@/mobile/App";
 import { MockEventSource } from "./eventSourceMock";
@@ -140,6 +140,43 @@ afterEach(() => {
 });
 
 describe("App 路由：看板卡片 ↔ 会话详情", () => {
+  it("DSH 同 ID 换实例时详情保留原实例", async () => {
+    const a = sessionFixture({
+      id: "same",
+      agentType: "dsh",
+      dshInstanceId: "A",
+      projectName: "project-A",
+      title: "title-A",
+    });
+    const b = sessionFixture({
+      ...a,
+      dshInstanceId: "B",
+      projectName: "project-B",
+      title: "title-B",
+    });
+    installSse(okSessions([a]));
+    installFetch();
+    render(<App />);
+    fireEvent.click((await screen.findByText("project-A")).closest("li") as HTMLLIElement);
+    const back = await screen.findByTestId("detail-back");
+    expect(back.parentElement?.textContent).toContain("title-A");
+    await waitFor(() =>
+      expect(
+        vi
+          .mocked(fetch)
+          .mock.calls.some(
+            ([url]) =>
+              String(url).includes("session-messages?") && String(url).includes("instanceId=A")
+          )
+      ).toBe(true)
+    );
+    act(() => MockEventSource.latest().emit("snapshot", okSessions([b])));
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(back.parentElement?.textContent).toContain("title-A");
+    expect(back.parentElement?.textContent).not.toContain("title-B");
+  });
   it("卡片点击进入详情（消息可见），返回回到看板且卡片数据保持", async () => {
     installSse(okSessions([sessionFixture()]));
     installFetch();

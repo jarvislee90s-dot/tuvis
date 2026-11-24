@@ -364,7 +364,7 @@ export default function Board({
       if (ev.flapFromSubagentActivity) return;
       // F2a 同方向节流：同会话同一 from→to 颜色对 60s 内不重复提醒（横幅/提示音/
       // 振动三件套同门）；红/waiting 双向豁免在 isSameDirectionThrottled 内
-      const flapKey = sessionNotifyKey(ev.agentType, ev.sessionId);
+      const flapKey = sessionNotifyKey(ev.agentType, ev.sessionId, ev.dshInstanceId);
       const fromColor = STATUS_COLOR_KIND[ev.from];
       const toColor = STATUS_COLOR_KIND[ev.to];
       const nowMs = Date.now();

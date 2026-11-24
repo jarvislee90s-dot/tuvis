@@ -699,6 +699,19 @@ pub fn discover_workbuddy_processes(system: &sysinfo::System) -> Vec<AgentProces
 /// （`adapter/mod.rs::all_adapters_yield_no_sessions_without_processes` 锁死该契约；
 /// 单测也因此不会读真实 home）。
 pub fn get_workbuddy_sessions(processes: &[AgentProcess]) -> Vec<Session> {
+    let mut observations = Vec::new();
+    let sessions = get_workbuddy_sessions_collecting(processes, &mut observations);
+    // 兼容薄包装：观测在此丢弃（生产走 collecting 版由 adapter 暂存）
+    let _ = observations;
+    sessions
+}
+
+/// 生产入口（NEEDS_FIX Important-B 终验）：观测经调用级 collector 返回——
+/// 归属边界 = 本次调用（adapter 实例每轮新建，无进程级跨轮共享槽）。
+pub fn get_workbuddy_sessions_collecting(
+    processes: &[AgentProcess],
+    observations: &mut Vec<(u32, String)>,
+) -> Vec<Session> {
     if processes.is_empty() {
         return Vec::new();
     }
@@ -710,9 +723,14 @@ pub fn get_workbuddy_sessions(processes: &[AgentProcess]) -> Vec<Session> {
     let recent = recent_db_session_map(&home, now as i64 - SESSION_ACTIVE_WINDOW_MS);
     // 心跳候选的 status/标题走**按 id 查询**（I1）：不受 300s 约束，
     // 否则 `working + 父静默 >300s` 会查不到行 → 卡片在子代理运行期掉线
-    get_workbuddy_sessions_with(&home, processes, now, &recent, &|ids| {
-        db_sessions_by_ids(&home, ids)
-    })
+    get_workbuddy_sessions_with(
+        &home,
+        processes,
+        now,
+        &recent,
+        &|ids| db_sessions_by_ids(&home, ids),
+        observations,
+    )
 }
 
 /// 看板候选（心跳候选与 DB-only 候选的统一形状）。
@@ -782,6 +800,9 @@ pub fn get_workbuddy_sessions_with(
     now: u64,
     recent: &HashMap<String, WbDbSession>,
     by_id: &dyn Fn(&[String]) -> HashMap<String, WbDbSession>,
+    // NEEDS_FIX Important-B 终验：调用级观测 collector——解析结果直接携带本次
+    // 调用的观测，随 WalkedScan 返回，无进程级交接槽（归属边界 = 本次调用）。
+    observations: &mut Vec<(u32, String)>,
 ) -> Vec<Session> {
     // **L1（纵深防御）**：空进程列表不读 DB、不出卡
     if processes.is_empty() {
@@ -963,15 +984,16 @@ pub fn get_workbuddy_sessions_with(
             jump_supported: jump_supported_for(ProcessForm::App),
             unread: false, // 扫描出的活跃卡默认非未读；未读卡由 adapter 层合并
             unread_turned_green_at_ms: None,
+            dsh_instance_id: None,
+            dsh_subagent: None,
         });
 
         // 记录本轮 pid→(tool, session)（心跳消失补偿依据）。**只记有心跳文件的候选**：
-        // DB-only 卡没有真实 pid（pid=0），记进去会让补偿逻辑对着 0 干活
+        // DB-only 卡没有真实 pid（pid=0），记进去会让补偿逻辑对着 0 干活。
+        // NEEDS_FIX Important-B 终验：观测写入调用级 collector（随 WalkedScan 返回，
+        // 落表在提交段执行）——解析段不直写 LAST_SEEN，也无进程级交接槽。
         if c.last_heartbeat_ms.is_some() {
-            LAST_SEEN_SESSIONS
-                .lock()
-                .unwrap()
-                .insert(c.pid, ("workbuddy".to_string(), c.sid.clone()));
+            observations.push((c.pid, c.sid.clone()));
         }
     }
     sessions
@@ -1072,7 +1094,65 @@ pub fn compensate_vanished_heartbeats_in_with_read_at(
     is_live: &dyn Fn(&str) -> bool,
     deleted_ids: &std::collections::HashSet<String>,
 ) -> Vec<crate::database::dao::unread::UnreadSessionRecord> {
+    let plan = compensate_vanished_heartbeats_plan_with_read_at(
+        home,
+        now_ms,
+        last_seen,
+        read_at_of,
+        is_live,
+        deleted_ids,
+    );
+    // 兼容形态：立即消费计算中判定的观测（生产走 plan/apply 拆分——消费在落库后）
+    if !plan.consumed.is_empty() {
+        let consumed_pids: std::collections::HashSet<u32> =
+            plan.consumed.iter().map(|(pid, _, _)| *pid).collect();
+        last_seen
+            .lock()
+            .unwrap()
+            .retain(|pid, _| !consumed_pids.contains(pid));
+    }
+    plan.records
+}
+
+/// 补偿计划（NEEDS_FIX Important-2b）：读取/计算部分的产物，**不含任何状态变更**
+/// ——可在预算保护的准备段（遍历段）执行；状态变更（落库/消费观测/影子表同步）
+/// 全部在 [`apply_workbuddy_compensation`]（提交段）执行。
+pub struct WorkbuddyCompensationPlan {
+    /// DB 明确删除的会话 id（提交段：贯穿 LAST_SEEN 与未读池删除）
+    pub deleted_ids: Vec<String>,
+    /// 待落库的补偿行（提交段：upsert 成功才消费对应观测——事务语义不变）
+    pub records: Vec<crate::database::dao::unread::UnreadSessionRecord>,
+    /// 计算中判定「消费观测」的条目，携带**完整预期身份** (pid, tool, session_id)
+    /// （防御性他工具条目 / 非完成态 / 已读覆盖；提交段统一从 LAST_SEEN 移除）。
+    /// NEEDS_FIX Important-C 终验：按完整身份匹配消费而非按 pid——计划基于旧
+    /// 观测（会话 A）计算，提交段落本轮观测（同 PID P → 会话 B）后，身份不匹配
+    /// 的条目**不得**误删。消失但 JSONL 暂缺的条目**不在**其中（保留观测重试）。
+    pub consumed: Vec<(u32, String, String)>,
+}
+
+impl WorkbuddyCompensationPlan {
+    pub fn empty() -> Self {
+        Self {
+            deleted_ids: Vec::new(),
+            records: Vec::new(),
+            consumed: Vec::new(),
+        }
+    }
+}
+
+/// 补偿计划核心（携带已读时间；**非变异**）：判定与产物计算原样保留，
+/// 原实现中对 last_seen 的四处移除改记入 `consumed`（完整身份），由提交段统一执行
+/// （NEEDS_FIX Important-2/2b：超时的 detached 准备段不得改任何共享状态）。
+pub fn compensate_vanished_heartbeats_plan_with_read_at(
+    home: &Path,
+    now_ms: u64,
+    last_seen: &Mutex<HashMap<u32, (String, String)>>,
+    read_at_of: &dyn Fn(&str) -> Option<i64>,
+    is_live: &dyn Fn(&str) -> bool,
+    deleted_ids: &std::collections::HashSet<String>,
+) -> WorkbuddyCompensationPlan {
     let mut compensated = Vec::new();
+    let mut consumed = Vec::new();
 
     // 锁内只做纯内存快照（锁 hygiene：绝不持锁跨文件 I/O），判定消失在锁外进行
     let candidates: Vec<(u32, (String, String))> = {
@@ -1107,9 +1187,9 @@ pub fn compensate_vanished_heartbeats_in_with_read_at(
     };
 
     for (pid, (tool_id, session_id)) in vanished {
-        // 防御：观测条目不属于本工具（未来多工具接入）→ 移除并跳过，不代他工具补偿
+        // 防御：观测条目不属于本工具（未来多工具接入）→ 消费观测并跳过，不代他工具补偿
         if tool_id != "workbuddy" {
-            last_seen.lock().unwrap().remove(&pid);
+            consumed.push((pid, tool_id.clone(), session_id.clone()));
             continue;
         }
         // 找该会话的 JSONL（与主路径共用 find_session_jsonl）：
@@ -1139,7 +1219,7 @@ pub fn compensate_vanished_heartbeats_in_with_read_at(
         let (status, _, last_work_ms) = derive_tail_facts(&lines);
         if status != SessionStatus::Idle {
             // 非完成态（运行中被杀/仍在跑）→ 无完成通知可发，消费观测
-            last_seen.lock().unwrap().remove(&pid);
+            consumed.push((pid, tool_id.clone(), session_id.clone()));
             continue;
         }
         // 已读归属：只有已读时间覆盖“最后一次明确新工作”时，才认为本轮完成已处理；
@@ -1147,12 +1227,13 @@ pub fn compensate_vanished_heartbeats_in_with_read_at(
         if let Some(read_at) = read_at_of(&session_id) {
             let last_work = last_work_ms.map(|t| t as i64);
             if last_work.is_none_or(|work| read_at >= work) {
-                last_seen.lock().unwrap().remove(&pid);
+                consumed.push((pid, tool_id.clone(), session_id.clone()));
                 continue;
             }
         }
         let last_message = lines.iter().rev().find_map(|l| extract_message_text(l));
         compensated.push(crate::database::dao::unread::UnreadSessionRecord {
+            dsh_instance_id: None,
             tool_id: "workbuddy".into(),
             session_id: session_id.clone(),
             project_name: if cwd.is_empty() {
@@ -1168,10 +1249,14 @@ pub fn compensate_vanished_heartbeats_in_with_read_at(
             turned_green_at_ms: now_ms as i64,
             expires_at_ms: now_ms as i64 + 24 * 3600 * 1000,
         });
-        // 记录产出后**不在此消费观测**：由调用方在 unread 落库成功后移除；
+        // 记录产出后**不在此消费观测**：由提交段在 unread 落库成功后移除；
         // 落库失败则保留，下一轮重试（补偿事务语义）。
     }
-    compensated
+    WorkbuddyCompensationPlan {
+        deleted_ids: deleted_ids.iter().cloned().collect(),
+        records: compensated,
+        consumed,
+    }
 }
 
 /// 观测还原窗口（issue #35-2）：与未读池 24h 窗口一致——更老的完成早已超出
@@ -1337,22 +1422,22 @@ fn session_is_live(
     )
 }
 
-/// 主入口：真实 home / 真实时钟 / 全局 LAST_SEEN_SESSIONS 的薄包装（补偿行在此落库）。
-/// 注：DAO upsert 冲突时仅刷新展示字段、保留原 turned_green_at/expires_at（见
-/// `upsert_unread`）——对已存在的行此处只起补展示快照作用；仅当行不存在（转绿从未
-/// 被观测）时插入值生效，符合 spec §5「转绿时间」语义
-pub fn compensate_vanished_heartbeats() {
+/// 准备段主入口（NEEDS_FIX Important-2b）：真实 home / 真实时钟 / 只读计算——
+/// 心跳目录扫描、存活判定、补偿行推导全部在此完成（可预算保护、可 detached：
+/// 超时的 detached 准备段只产出计划，不改任何共享状态）。状态变更走
+/// [`apply_workbuddy_compensation`]（提交段，有效扫描专属）。
+pub fn compensate_vanished_heartbeats_prepare() -> WorkbuddyCompensationPlan {
     // W5 门禁：工具已停用则不做补偿（enabled 是 W5 单一事实源）。否则停用后任务随即完成、
     // prewarm 回池删除心跳文件时，本函数会为已停用工具 upsert 未读行，「复活」未读卡并
     // 触发完成通知，违反 spec W5「彻底隐藏/通知静音」。读 DB 真实启用态；集成级路径
     // （GUI 阶段验证），纯函数层 compensate_vanished_heartbeats_in 保持不触库
     if !crate::database::dao::agent_tool::get_tool_enabled("workbuddy") {
-        return;
+        return WorkbuddyCompensationPlan::empty();
     }
-    let Some(home) = dirs::home_dir() else { return };
+    let Some(home) = dirs::home_dir() else {
+        return WorkbuddyCompensationPlan::empty();
+    };
     let now = now_ms();
-    // issue #35-2：重启后还原近期观测，跨重启补偿「停机期间完成」的会话
-    load_persisted_observations_once(now as i64);
     // R2 / D5：补偿与看板在场判据**同源**——运行中的 5.9.3 会话（心跳冻结）不得被补成未读。
     // 三项都是廉价只读：一次心跳目录扫描（含单 pid 定向存活检查）+ 一次小 DB 查询 + 少量 stat。
     // 单轮心跳快照：present/live 两视图来自同一次扫描，避免两份过滤规则漂移
@@ -1387,24 +1472,45 @@ pub fn compensate_vanished_heartbeats() {
         .filter(|row| row.deleted)
         .map(|row| row.id.clone())
         .collect();
-    if !deleted_ids.is_empty() {
-        LAST_SEEN_SESSIONS
-            .lock()
-            .unwrap()
-            .retain(|_, (tool, sid)| !(tool == "workbuddy" && deleted_ids.contains(sid)));
-        for sid in &deleted_ids {
-            crate::database::dao::unread::delete("workbuddy", sid);
-        }
-    }
-    for record in compensate_vanished_heartbeats_in_with_read_at(
+    compensate_vanished_heartbeats_plan_with_read_at(
         &home,
         now,
         &LAST_SEEN_SESSIONS,
         // issue #35-1：已读墓碑时间（不依赖状态缓存）；补偿按“已读是否覆盖最后新工作”判定
-        &|sid| crate::database::dao::unread::read_tombstone_at("workbuddy", sid),
+        &|sid| crate::database::dao::unread::read_tombstone_at("workbuddy", sid, None),
         &is_live,
         &deleted_ids,
-    ) {
+    )
+}
+
+/// 提交段应用（NEEDS_FIX Important-2b）：计划的状态变更全部在此执行——**只能在
+/// 等待线程**（scan_bus 单飞内串行）调用；预算超时的 detached 准备段绝不进入。
+/// 注：DAO upsert 冲突时仅刷新展示字段、保留原 turned_green_at/expires_at（见
+/// `upsert_unread`）——对已存在的行此处只起补展示快照作用；仅当行不存在（转绿从未
+/// 被观测）时插入值生效，符合 spec §5「转绿时间」语义
+pub fn apply_workbuddy_compensation(plan: WorkbuddyCompensationPlan) {
+    // issue #35-2：重启后还原近期观测，跨重启补偿「停机期间完成」的会话。
+    // 一次性引导放**提交段**（NEEDS_FIX Important-2：还原是 LAST_SEEN 的状态
+    // 写入，遍历段零状态写入；代价是重启后首轮不补偿停机期完成、第二轮起恢复，
+    // 延迟 ≤ 一个扫描档位）。
+    load_persisted_observations_once(now_ms() as i64);
+    let WorkbuddyCompensationPlan {
+        deleted_ids,
+        records,
+        consumed,
+    } = plan;
+    // 删除状态贯穿补偿：DB 明确删除的会话清观测 + 删未读行。
+    if !deleted_ids.is_empty() {
+        let deleted: std::collections::HashSet<String> = deleted_ids.iter().cloned().collect();
+        LAST_SEEN_SESSIONS
+            .lock()
+            .unwrap()
+            .retain(|_, (tool, sid)| !(tool == "workbuddy" && deleted.contains(sid)));
+        for sid in &deleted_ids {
+            crate::database::dao::unread::delete("workbuddy", sid, None);
+        }
+    }
+    for record in records {
         // 补偿事务：落库成功后才消费观测；失败保留，下一轮重试（不丢完成通知）。
         if crate::database::dao::unread::try_upsert(&record) {
             LAST_SEEN_SESSIONS
@@ -1418,8 +1524,29 @@ pub fn compensate_vanished_heartbeats() {
             );
         }
     }
+    // 计算中判定「消费观测」的条目统一移除（Important-C：按完整身份匹配）。
+    retain_unconsumed_observations(&LAST_SEEN_SESSIONS, &consumed);
     // issue #35-2：本轮终态落库（upsert 在场观测 + 删除已被补偿消费的 pid + 超龄清理）
-    sync_observations_to_db(now);
+    sync_observations_to_db(now_ms());
+}
+
+/// 按**完整预期身份**消费观测（NEEDS_FIX Important-C 终验核心，纯函数可测）：
+/// 仅移除与计划条目 (pid, tool, session_id) 完全匹配的 LAST_SEEN 行——本轮观测
+/// 可能已把同 PID 覆盖成新会话（A→B），按 pid 无条件删会误删新观测；身份不
+/// 匹配（pid 已被新会话占用）的条目保留。
+fn retain_unconsumed_observations(
+    last_seen: &Mutex<HashMap<u32, (String, String)>>,
+    consumed: &[(u32, String, String)],
+) {
+    if consumed.is_empty() {
+        return;
+    }
+    let consumed_set: std::collections::HashSet<(u32, String, String)> =
+        consumed.iter().cloned().collect();
+    last_seen
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|pid, (tool, sid)| !consumed_set.contains(&(*pid, tool.clone(), sid.clone())));
 }
 
 /// 补偿用：会话 cwd 反查（共享连接版，issue #35 nit：与标题查询同轮复用连接）
@@ -1434,6 +1561,42 @@ fn workbuddy_cwd_from_conn(conn: &rusqlite::Connection, session_id: &str) -> Opt
 
 #[cfg(test)]
 mod tests {
+
+    /// NEEDS_FIX Important-C 终验回归：补偿消费按**完整预期身份**匹配而非按 pid。
+    /// 计划基于旧观测（PID P → 会话 A）计算；提交段先落本轮观测（同 PID P →
+    /// 会话 B）后再消费——身份不匹配 ⇒ B 的有效观测不得被旧身份（A）的消费计划
+    /// 误删（旧按 pid 无条件删会清掉 B，让心跳消失补偿丢依据）。
+    #[test]
+    fn compensation_consumption_matches_full_identity_not_pid_only() {
+        let last_seen: Mutex<HashMap<u32, (String, String)>> = Mutex::new(HashMap::from([(
+            8084u32,
+            ("workbuddy".to_string(), "session-B".to_string()),
+        )]));
+        // 计划的预期身份 = 旧观测（PID P → 会话 A）：身份不匹配 → B 保留
+        retain_unconsumed_observations(
+            &last_seen,
+            &[(8084u32, "workbuddy".to_string(), "session-A".to_string())],
+        );
+        assert_eq!(
+            last_seen
+                .lock()
+                .unwrap()
+                .get(&8084)
+                .map(|(_, sid)| sid.as_str()),
+            Some("session-B"),
+            "同 PID 切换后的新观测（B）不得被旧身份（A）的消费计划误删"
+        );
+        // 对照：身份完全匹配（PID P → B）时才消费
+        retain_unconsumed_observations(
+            &last_seen,
+            &[(8084u32, "workbuddy".to_string(), "session-B".to_string())],
+        );
+        assert!(
+            last_seen.lock().unwrap().get(&8084).is_none(),
+            "身份完全匹配的观测必须被消费"
+        );
+    }
+
     use super::*;
 
     const HEARTBEAT_ACTIVE: &str = r#"{
@@ -3283,9 +3446,18 @@ mod board_tests {
     /// **生产数据通路**：与 `get_workbuddy_sessions` 完全相同的两条查询 + 同一个核心
     fn run_board(home: &Path, processes: &[AgentProcess], now: u64) -> Vec<Session> {
         let recent = recent_db_session_map(home, now as i64 - SESSION_ACTIVE_WINDOW_MS);
-        get_workbuddy_sessions_with(home, processes, now, &recent, &|ids| {
-            db_sessions_by_ids(home, ids)
-        })
+        let mut observations = Vec::new();
+        let sessions = get_workbuddy_sessions_with(
+            home,
+            processes,
+            now,
+            &recent,
+            &|ids| db_sessions_by_ids(home, ids),
+            &mut observations,
+        );
+        // 观测经 collector 返回（Important-B）：测试可按需断言，这里默认丢弃
+        let _ = observations;
+        sessions
     }
 
     fn process(pid: u32) -> AgentProcess {

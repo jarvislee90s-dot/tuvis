@@ -1182,6 +1182,8 @@ mod tests {
             jump_supported: false,
             unread: false,
             unread_turned_green_at_ms: None,
+            dsh_instance_id: None,
+            dsh_subagent: None,
         }
     }
 
@@ -1236,7 +1238,7 @@ mod tests {
             board_hidden_ids: Box::new(Vec::new),
             board_hidden_hide: std::sync::Arc::new(|_| 0usize),
             board_hidden_unhide: std::sync::Arc::new(|_| 0usize),
-            unread_mark_read: std::sync::Arc::new(|_, _| ()),
+            unread_mark_read: std::sync::Arc::new(|_, _, _| ()),
             session_close: std::sync::Arc::new(|_| Ok(())),
             sse_registry: std::sync::Arc::new(crate::remote::server::SseRegistry::default()),
             max_devices_source: Box::new(|| 3),
@@ -1264,6 +1266,12 @@ mod tests {
             archive_delete: std::sync::Arc::new(|_: Option<&str>| 0usize),
             // Codex Desktop IPC：fixture 显式 disabled hub（一切能力关闭）
             codex_control: crate::remote::codex_ipc::CodexControlHub::disabled_arc(),
+            dsh_control: crate::services::dsh_control::disabled_arc(),
+            dsh_auto_adapt_source: std::sync::Arc::new(
+                crate::services::dsh_control::production::dsh_auto_adapt_enabled,
+            ),
+            dsh_console_mount: None,
+            dsh_console_upstream_source: None,
             desktop_language: Default::default(),
             // 任务 8：OpenCode 原生交互中枢——与 state.store 同库（屏障同一道）；
             // 惰性容器零 IO，本模块用例不触原生路由（屏障只读归属，无路由即放行）

@@ -497,6 +497,8 @@ mod tests {
     /// 卡片：`Session.id` 即 `session_v2.id`（`monitor/opencode_parser.rs` 直接取值）。
     fn card(id: &str, directory: &Path) -> Session {
         Session {
+            dsh_instance_id: None,
+            dsh_subagent: None,
             id: id.to_string(),
             agent_type: AgentType::OpenCode,
             project_name: "project".to_string(),

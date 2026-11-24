@@ -1,0 +1,131 @@
+#!/usr/bin/env node
+// R01 测试宿主：真实独立 PID/TCP/UDS，加载当前插件源码的 BindingSession。
+// 只构造临时 profile，不启动官方 DSH、模型、采集器或真实用户数据目录。
+import { mkdirSync, readFileSync, writeFileSync, existsSync, realpathSync, rmSync } from "node:fs";
+import { registerHooks, stripTypeScriptTypes } from "node:module";
+import { createServer } from "node:net";
+import { homedir } from "node:os";
+import { dirname, join, resolve } from "node:path";
+import { createInterface } from "node:readline";
+import { fileURLToPath, pathToFileURL } from "node:url";
+
+if (process.argv[2] !== "web") throw new Error("expected web fixture mode");
+const sourceRoot = pathToFileURL(resolve(process.argv[3]) + "/").href;
+// 原位只读加载当前 TS；不使用可能滞后的 lib/，也不改生产源码或构建产物。
+registerHooks({
+  resolve(specifier, context, nextResolve) {
+    if (context.parentURL?.startsWith(sourceRoot) && specifier.endsWith(".js")) {
+      const ts = new URL(specifier.slice(0, -3) + ".ts", context.parentURL);
+      if (existsSync(ts)) return { url: ts.href, shortCircuit: true };
+    }
+    return nextResolve(specifier, context);
+  },
+  load(url, context, nextLoad) {
+    if (url.startsWith(sourceRoot) && url.endsWith(".ts")) {
+      return {
+        format: "module",
+        source: stripTypeScriptTypes(readFileSync(fileURLToPath(url), "utf8"), { mode: "strip" }),
+        shortCircuit: true,
+      };
+    }
+    return nextLoad(url, context);
+  },
+});
+const { BindingSession } = await import(new URL("auth.ts", sourceRoot));
+const { NodeIpcTransport } = await import(new URL("ipc.ts", sourceRoot));
+const requestedHome = resolve(process.env.DSH_HOME ?? join(homedir(), ".dsh"));
+mkdirSync(join(requestedHome, "profiles", "web"), { recursive: true });
+const home = realpathSync(requestedHome);
+const profile = join(home, "profiles", "web");
+writeFileSync(join(profile, "package.json"), JSON.stringify({ private: true, name: "r01-isolated-web" }));
+const identityPath = join(profile, "tuvis-remote", "identity.json");
+const storage = {
+  async read() {
+    try { return readFileSync(identityPath, "utf8"); }
+    catch (error) { if (error.code === "ENOENT") return null; throw error; }
+  },
+  async write(data) {
+    mkdirSync(dirname(identityPath), { recursive: true });
+    writeFileSync(identityPath, data, { mode: 0o600 });
+  },
+};
+const emit = (event) => process.stdout.write(JSON.stringify(event) + "\n");
+const sessions = new Map();
+const listener = createServer((socket) => socket.end());
+await new Promise((ok, fail) => {
+  listener.once("error", fail);
+  listener.listen(0, "127.0.0.1", ok);
+});
+emit({ event: "ready", pid: process.pid, authority: `127.0.0.1:${listener.address().port}`, home,
+  dshHomeSet: Object.hasOwn(process.env, "DSH_HOME") });
+
+const commands = createInterface({ input: process.stdin });
+for await (const line of commands) {
+  const cmd = JSON.parse(line);
+  if (cmd.op === "stop") {
+    sessions.get(cmd.attempt)?.dispose();
+    sessions.delete(cmd.attempt);
+    emit({ event: "stopped", attempt: cmd.attempt });
+    continue;
+  }
+  if (cmd.op !== "begin") throw new Error("unknown fixture command");
+  // 同一 attempt 重开：先释放旧会话，避免旧连接/重连定时器吞掉新握手。
+  sessions.get(cmd.attempt)?.dispose();
+  sessions.delete(cmd.attempt);
+  // 模拟「同一宿主上的新插件实例」：清掉本地身份与信任锚，确保本次 begin
+  // 真的走 hello 握手（已绑定身份会直接进读循环，不发帧，测试会假超时）。
+  if (cmd.freshIdentity === true) rmSync(identityPath, { force: true });
+  const rv = structuredClone(cmd.rendezvous);
+  // 攻击面：整份 rendezvous 都可被替换（自报 PID/启动时刻），因此声明字段与
+  // rv.processIdentity 必须同步伪造，才能构成「签名有效但自报身份不实」。
+  // 两个层次分开：
+  // * claimPeerPid/claimStartedAtMs = 客户端声明的宿主身份（homeBinding），
+  //   故意与 rv 的真实事实不一致 → 必须由服务端拒绝；
+  // * forgeRendezvousIdentity = 连 rendezvous 自报身份一起伪造（整份替换）。
+  if (cmd.forgeRendezvousIdentity === true) {
+    if (cmd.claimPeerPid !== undefined) rv.processIdentity.pid = cmd.claimPeerPid;
+    if (cmd.claimStartedAtMs !== undefined) rv.processIdentity.startedAtMs = cmd.claimStartedAtMs;
+  }
+  const transport = new NodeIpcTransport();
+  const session = new BindingSession({
+    rendezvous: { async read() { return rv; } },
+    storage,
+    clock: () => Date.now(),
+    homeBinding: {
+      homeRoot: cmd.claimHome ?? home,
+      hostPid: cmd.claimBindingPid ?? process.pid,
+      hostStartedAtMs: cmd.claimStartedAtMs ?? rv.processIdentity.startedAtMs,
+    },
+    transport: {
+      async connect(address) {
+        const conn = await transport.connect(address);
+        return {
+          async send(line) {
+            const frame = JSON.parse(line);
+            if (frame.type === "hello" && cmd.breakSignature) {
+              const signature = Buffer.from(frame.signature, "base64url");
+              signature[0] ^= 1;
+              frame.signature = signature.toString("base64url");
+            }
+            // 报告的是实际发送帧；Rust 用独立消息编码验签，不信夹具的 verdict。
+            emit({ event: "sent", attempt: cmd.attempt, frame });
+            await conn.send(JSON.stringify(frame));
+          },
+          async recv() {
+            const line = await conn.recv();
+            emit({ event: "reply", attempt: cmd.attempt, frame: JSON.parse(line) });
+            return line;
+          },
+          close() { conn.close(); },
+          get closed() { return conn.closed; },
+        };
+      },
+    },
+    // 本套只测归属/绑定。批准后在兑换前停住，避免触发凭据交付和全局 hub。
+    exchange: { async exchange() { return await new Promise(() => {}); } },
+  });
+  sessions.set(cmd.attempt, session);
+  session.start();
+}
+for (const session of sessions.values()) session.dispose();
+listener.close();

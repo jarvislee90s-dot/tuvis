@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import SubagentList from "@/mobile/SubagentList";
 import type { SubagentView } from "@/mobile/api";
@@ -61,7 +61,9 @@ describe("SubagentList（子 Agent sheet 清单）", () => {
     expect(screen.getByTestId("subagent-dot-b1").className).toContain("bg-gray-400");
     // 灰点冻结：时钟前进 60s，b1 不动、a1 继续走（Async 版：等 React 调度刷新 DOM——
     // 同步 advance 不让出宏任务队列，重渲染不落地；与 SubagentChips 自走用例同法）
-    await vi.advanceTimersByTimeAsync(60_000);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(60_000);
+    });
     expect(screen.getByTestId("subagent-card-b1").textContent).toContain("30:00");
     expect(screen.getByTestId("subagent-card-a1").textContent).toContain("6:38");
   });
@@ -99,6 +101,47 @@ describe("SubagentList（子 Agent sheet 清单）", () => {
     fireEvent.click(screen.getByTestId("subagent-card-a1"));
     fireEvent.click(screen.getByTestId("subagent-card-b1"));
     expect(onOpen.mock.calls.map((c) => c[0])).toEqual(["a1", "b1"]);
+  });
+
+  // H08：后端可返回 unknown；在生产 DTO 扩展前只在测试输入边界适配，
+  // 不把未知状态夹具降成 idle，以便真实渲染路径暴露错误的二态分支。
+  function unknownChild(endTs: string | null = null): SubagentView {
+    return {
+      ...sa("dsh-child", "Worker", "idle", "2026-10-08T07:00:00Z", endTs),
+      status: "unknown",
+    } as SubagentView;
+  }
+
+  it("H08：unknown 子任务明确显示中性未知，不标为完成", () => {
+    vi.setSystemTime(new Date("2026-10-08T07:36:45Z"));
+    render(<SubagentList list={[unknownChild()]} onOpen={() => {}} />);
+    const card = screen.getByTestId("subagent-card-dsh-child");
+    expect(card.textContent).toMatch(/未知/);
+    expect(card.textContent).not.toMatch(/已完成|已结束|定格|completed|finished/i);
+    expect(screen.getByTestId("subagent-dot-dsh-child").className).not.toContain("bg-emerald-500");
+  });
+
+  it.each([
+    { label: "无结束证据", endTs: null },
+    { label: "残留旧结束时间", endTs: "2026-10-08T07:30:00Z" },
+  ])("H08：unknown（$label）不展示推算或冻结的完成时长", async ({ endTs }) => {
+    vi.setSystemTime(new Date("2026-10-08T07:36:45Z"));
+    render(<SubagentList list={[unknownChild(endTs)]} onOpen={() => {}} />);
+    const card = screen.getByTestId("subagent-card-dsh-child");
+    // 未证运行/结束时隐藏运行时长，不能用 now 或旧 endTs 冒充可信的完成锚。
+    // 先推进时钟，避免仅靠初始帧尚未建立 now 的空白误过。
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(60_000);
+    });
+    expect(card.textContent).not.toMatch(/\d+:\d{2}/);
+    expect(card.textContent).toContain("7.09万");
+  });
+
+  it("H08：unknown 卡仍可打开详情，不因未知状态被当成空列表", () => {
+    const onOpen = vi.fn();
+    render(<SubagentList list={[unknownChild()]} onOpen={onOpen} />);
+    fireEvent.click(screen.getByTestId("subagent-card-dsh-child"));
+    expect(onOpen).toHaveBeenCalledExactlyOnceWith("dsh-child");
   });
 
   // T1 sheet 化：清单升格为独立 sheet 看板，分屏主从布局下左清单需要选中态高亮

@@ -4,7 +4,26 @@
 use super::*;
 use crate::monitor;
 
-pub struct WorkBuddyAdapter;
+/// WorkBuddy 适配器。实例随 `enabled_adapters()` 每轮扫描新建——`heartbeat_
+/// observations` 槽因此天然归属**本次扫描调用**（NEEDS_FIX Important-B 终验：
+/// 观测经调用级 collector 暂存在此，遍历段解析后统一取走，无进程级交接槽）。
+pub struct WorkBuddyAdapter {
+    heartbeat_observations: std::sync::Mutex<Vec<(u32, String)>>,
+}
+
+impl Default for WorkBuddyAdapter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl WorkBuddyAdapter {
+    pub fn new() -> Self {
+        Self {
+            heartbeat_observations: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+}
 
 impl AgentAdapter for WorkBuddyAdapter {
     fn name(&self) -> &'static str {
@@ -27,7 +46,29 @@ impl AgentAdapter for WorkBuddyAdapter {
     }
 
     fn find_sessions(&self, processes: &[AgentProcess]) -> Vec<Session> {
-        monitor::workbuddy_parser::get_workbuddy_sessions(processes)
+        // NEEDS_FIX Important-B 终验：观测进调用级 collector（随 WalkedScan 返回、
+        // 提交段落表），解析段不直写 LAST_SEEN 业务观测表。
+        let mut observations = Vec::new();
+        let sessions = monitor::workbuddy_parser::get_workbuddy_sessions_collecting(
+            processes,
+            &mut observations,
+        );
+        if !observations.is_empty() {
+            self.heartbeat_observations
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .extend(observations);
+        }
+        sessions
+    }
+
+    fn take_heartbeat_observations(&self) -> Vec<(u32, String)> {
+        std::mem::take(
+            &mut self
+                .heartbeat_observations
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+        )
     }
 
     fn base_dir(&self) -> std::path::PathBuf {

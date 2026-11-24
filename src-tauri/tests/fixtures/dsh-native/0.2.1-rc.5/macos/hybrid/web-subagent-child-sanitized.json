@@ -1,0 +1,145 @@
+{
+  "evidence": "实际 Web 宿主（0.2.1-rc.5）真实子会话的脱敏关联结构；与 web-subagent-parent-sanitized.json 共用关联 ID；消息正文以占位符保留形状",
+  "correlationTable": {
+    "session-<parent-id>": "父主会话 id（子会话 parentSession 与 send_message agent_id 指向它）",
+    "<child-id>": "子会话 id（header.id 裸 UUID；父 catalog.childId 与父收件箱文本引用它）",
+    "<callId-glob>": "子侧 glob 调用 callId（result.toolCallId 同值）",
+    "<callId-send>": "子侧 send_message 调用 callId（回报父会话）"
+  },
+  "header": {
+    "type": "session",
+    "version": 4,
+    "id": "<child-id>",
+    "createdAt": 1793799610255,
+    "cwd": "<test-cwd>",
+    "parentSession": "session-<parent-id>",
+    "isSeeded": false,
+    "origin": "subagent",
+    "delegationDepth": 1,
+    "agentPreset": "standard"
+  },
+  "descriptor": {
+    "type": "subagent/descriptor",
+    "seq": 0,
+    "time": 1793799610256,
+    "data": {
+      "version": 3,
+      "mode": "continuable",
+      "provider": "spawn",
+      "label": "<task-label>",
+      "agentProvider": "<custom-provider-id>",
+      "agentModel": "<model-id>",
+      "agentReasoningEffort": "high"
+    }
+  },
+  "seededTask": {
+    "type": "user/message",
+    "seq": 8,
+    "time": 1793799610299,
+    "data": {
+      "content": [
+        {
+          "type": "text",
+          "text": "<任务简报多行文本：角色、工作目录、目标目录 .tuvis-attachments/session-<parent-id>/、只读约束、汇报要求>"
+        }
+      ],
+      "source": { "kind": "user", "rpcId": "<rpc-id>", "clientTimeZone": "Asia/Shanghai" },
+      "role": "user",
+      "id": "<message-id>"
+    }
+  },
+  "toolCalls": [
+    {
+      "type": "tool/call",
+      "seq": 16,
+      "time": 1793799628288,
+      "data": {
+        "turn": 1,
+        "step": 1,
+        "callId": "<callId-glob>",
+        "name": "glob",
+        "arguments": "{\"path\":\"<test-cwd>/.tuvis-attachments/session-<parent-id>\",\"pattern\":\"*\"}"
+      }
+    },
+    {
+      "type": "tool/result",
+      "seq": 17,
+      "time": 1793799628309,
+      "data": {
+        "turn": 1,
+        "step": 1,
+        "message": {
+          "role": "tool",
+          "source": { "kind": "tool", "callId": "<callId-glob>" },
+          "toolCallId": "<callId-glob>",
+          "content": [
+            { "type": "text", "text": "<相对路径列表：chain-note.txt 与 tuvis-square.png>" }
+          ],
+          "isError": false,
+          "id": "<message-id>"
+        }
+      }
+    },
+    {
+      "type": "tool/call",
+      "seq": 32,
+      "time": 1793799668998,
+      "data": {
+        "turn": 1,
+        "step": 3,
+        "callId": "<callId-send>",
+        "name": "send_message",
+        "arguments": "{\"agent_id\":\"session-<parent-id>\",\"message\":\"<统计结果汇报文本>\"}"
+      }
+    },
+    {
+      "type": "tool/result",
+      "seq": 33,
+      "time": 1793799669014,
+      "data": {
+        "turn": 1,
+        "step": 3,
+        "message": {
+          "role": "tool",
+          "source": { "kind": "tool", "callId": "<callId-send>" },
+          "toolCallId": "<callId-send>",
+          "content": [{ "type": "text", "text": "message delivered to agent session-<parent-id>" }],
+          "isError": false,
+          "id": "<message-id>"
+        }
+      }
+    }
+  ],
+  "termination": {
+    "type": "turn/end",
+    "seq": 38,
+    "time": 1793799713415,
+    "data": { "turn": 1, "reason": { "kind": "completed" } }
+  },
+  "observedEventTypes": [
+    "session",
+    "subagent/descriptor",
+    "sandbox/mode",
+    "approval/policy",
+    "agent/inbox/spliced",
+    "turn/start",
+    "step/start",
+    "system/message",
+    "user/message",
+    "request/header",
+    "request/context",
+    "session/title",
+    "assistant/message",
+    "tool/call",
+    "tool/result",
+    "job/registered",
+    "job/settled",
+    "step/end",
+    "turn/end"
+  ],
+  "crossReference": {
+    "childToParent": "send_message.arguments.agent_id = session-<parent-id>；result 文本 message delivered to agent session-<parent-id>",
+    "parentToChild": "子 header.parentSession = session-<parent-id>；父 catalog.childId = <child-id>；父收件箱文本 \"Agent <child-id> sent a message\""
+  },
+  "packageSha256": "8dad52f295bdbe9fa71948fdf38ac2ce3c910213d3b89c37174b2af77db9fb31"
+}

@@ -395,3 +395,61 @@ describe("台账檐色两表（TOOL_BRAND_COLORS / TOOL_BRAND_COLORS_DARK）", (
     expect(TOOL_BRAND_COLORS_DARK.dsh).toBe(TOOL_BRAND_COLORS.dsh);
   });
 });
+
+describe("applyTransition：DSH 实例归属严格相等（H04 审查 N2）", () => {
+  const makeTransition = (overrides: Partial<TransitionEvent> = {}): TransitionEvent => ({
+    sessionId: "s1",
+    agentType: "claude",
+    from: "processing",
+    to: "waiting",
+    projectName: "mam",
+    lastMessage: null,
+    flapFromSubagentActivity: false,
+    ts: 42,
+    ...overrides,
+  });
+
+  it("带实例 A 的迟到事件不得覆盖未核验（无实例）卡；已绑定 B 的卡不得被无实例事件覆盖", () => {
+    // 错向覆盖 1：事件带实例 A → 无实例卡不套用。
+    const unverified = makeSession({ id: "s1", status: "processing", lastActivityAt: "t" });
+    const outA = applyTransition([unverified], makeTransition({ dshInstanceId: "inst-a" }));
+    expect(outA[0]).toBe(unverified);
+    expect(outA[0].status).toBe("processing");
+    // 错向覆盖 2：无实例事件 → 已绑定 B 的卡不套用。
+    const boundB = makeSession({
+      id: "s1",
+      status: "processing",
+      lastActivityAt: "t",
+      dshInstanceId: "inst-b",
+    });
+    const outNone = applyTransition([boundB], makeTransition({}));
+    expect(outNone[0]).toBe(boundB);
+    expect(outNone[0].status).toBe("processing");
+    // 错向覆盖 3：实例不同（A vs B）→ 不套用（同名/同 ID 卡不串）。
+    const outAB = applyTransition([boundB], makeTransition({ dshInstanceId: "inst-a" }));
+    expect(outAB[0]).toBe(boundB);
+    expect(outAB[0].status).toBe("processing");
+  });
+
+  it("双方均缺席保留旧行为（按 (工具, 会话 id) 套用）；双方在场且相等才套用", () => {
+    // 双缺席（非 DSH / 旧事件）：旧行为照常。
+    const plain = makeSession({ id: "s1", status: "processing", lastActivityAt: "t" });
+    const outPlain = applyTransition([plain], makeTransition({ lastMessage: "done" }));
+    expect(outPlain[0].status).toBe("waiting");
+    expect(outPlain[0].lastMessage).toBe("done");
+    // 双方在场且相等：套用。
+    const bound = makeSession({
+      id: "s1",
+      status: "processing",
+      lastActivityAt: "t",
+      dshInstanceId: "inst-a",
+    });
+    const outBound = applyTransition([bound], makeTransition({ dshInstanceId: "inst-a" }));
+    expect(outBound[0].status).toBe("waiting");
+    expect(outBound[0]).not.toBe(bound);
+    // 双方在场但不等：不套用。
+    const outMismatch = applyTransition([bound], makeTransition({ dshInstanceId: "inst-z" }));
+    expect(outMismatch[0]).toBe(bound);
+    expect(outMismatch[0].status).toBe("processing");
+  });
+});

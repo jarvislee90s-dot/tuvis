@@ -730,6 +730,8 @@ fn session_from_digest(
         jump_supported: jump_supported_for(ProcessForm::Cli), // 由调用方按进程形态覆盖
         unread: false, // 扫描出的活跃卡默认非未读；未读卡由 adapter 层合并
         unread_turned_green_at_ms: None,
+        dsh_instance_id: None,
+        dsh_subagent: None,
         title: Some(codex_title),
     })
 }

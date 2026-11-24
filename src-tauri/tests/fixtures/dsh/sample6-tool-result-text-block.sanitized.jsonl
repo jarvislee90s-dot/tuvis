@@ -1,0 +1,6 @@
+{"type": "session", "version": 3, "id": "session-6b1d4f2e-9c3a-4d51-8f77-2a0e5c9b1d34", "createdAt": 1789400000000, "cwd": "<redacted text: 49 chars>", "isSeeded": false, "delegationDepth": 0}
+{"type": "turn/start", "seq": 1, "time": 1789400000100, "data": {}}
+{"type": "user/message", "seq": 2, "time": 1789400000200, "data": {"content": [{"type": "text", "text": "看看这个文件"}], "source": {"kind": "user"}}}
+{"type": "assistant/message", "seq": 3, "time": 1789400000300, "data": {"message": {"role": "assistant", "content": [{"type": "tool_use", "id": "call-text-1", "name": "Read", "input": {"path": "/tmp/demo.txt"}}]}}}
+{"type": "tool/result", "seq": 4, "time": 1789400000400, "data": {"turn": 1, "step": 1, "message": {"source": {"kind": "tool", "callId": "call-text-1"}, "content": [{"type": "tool-result", "toolCallId": "call-text-1", "content": {"type": "text", "text": "文件里的真实内容：hello from the bare text block"}, "isError": false}], "role": "user", "id": "e11c8a52-7f3d-4b09-9a61-5c2d8e4f1b70"}}, "sourceEventSeqs": [3], "surfaceOp": "append"}
+{"type": "turn/end", "seq": 5, "time": 1789400000500, "data": {"reason": {"kind": "completed"}}}

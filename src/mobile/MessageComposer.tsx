@@ -61,9 +61,12 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { formatInvokeError } from "@/lib/invokeError";
 import i18n from "@/i18n";
 import type { ClipboardEvent as ReactClipboardEvent } from "react";
-import { CircleHelp, Plus } from "lucide-react";
+import { ArrowUp, CircleHelp, Plus, Square } from "lucide-react";
+import { hash } from "fast-sha256";
+import { DshSendReceipt, useDshSendReceipts } from "./DshSendReceipt";
 import {
   ApiError,
+  dshReasonCopy,
   fetchApproveOptions,
   fetchChannel,
   fetchQueue,
@@ -126,6 +129,8 @@ export interface ComposerDraftRequest {
   text: string;
 }
 
+import type { DshTurnControl } from "./useDshTurnControl";
+
 interface MessageComposerProps {
   editDraft?: ComposerDraftRequest | null;
   onEditDraftConsumed?: (actionId: string) => void;
@@ -153,7 +158,7 @@ interface MessageComposerProps {
    *  关闭/重开自动适配）——事件驱动重拉，不做时刻轮询、不引 Tauri channel。 */
   refreshSendInfoSignal?: number;
   /** 会话（本组件只消费 id；`agentType` 仅在「是否可能走原生路由」判定里用一下）。 */
-  session: { id: string; agentType?: string };
+  session: { id: string; agentType?: string; dshInstanceId?: string };
   /** H12：Desktop(App) 形态禁用终端审批/问答探针（App 发送期间零 TUI 请求）。 */
   disableTerminalProbes?: boolean;
   /** T05：页面共享停止控制器（SessionDetail 持有单例，composer/队列面板共用——
@@ -164,6 +169,7 @@ interface MessageComposerProps {
    *  SessionDetail 据此卸下旧写控件（QuestionCard / ApproveCard / ModeBar），
    *  路由的真实来源仍是服务端，本回调只是把已读到的事实同步给同页。 */
   onInteractionRoute?: (route: "opencode_native" | "legacy" | null) => void;
+  dshTurnControl?: DshTurnControl;
 }
 
 /** 待发附件条目（组件内态）：status=uploading → ready/failed；
@@ -342,6 +348,22 @@ function notSentReasonCopy(reasonCode: string | null): string | null {
   }
 }
 
+/** T3：不可发送原因的可读文案——DSH 机器码走 `errors.*` 双语词表
+ *  （dshReasonCopy，每码一句准确原因），其余回落服务端 reason / 通用文案。 */
+function sendDisabledCopy(info: SendInfo): string {
+  const mapped = info.reasonCode ? dshReasonCopy(info.reasonCode) : null;
+  return mapped ?? info.reason ?? i18n.t("mobile.composer.sendDisabledFallback");
+}
+
+/** T3：DSH 发送失败的回执文案——已知 DSH 码给按码映射的可操作文案（词表外
+ *  原样显示机器码，不猜）；DSH_ACTION_WRITE_GATED 保留既有专属文案。 */
+function dshSendFailureCopy(dshCode: string): string {
+  if (dshCode === "DSH_ACTION_WRITE_GATED") {
+    return i18n.t("mobile.composer.dshWriteGated");
+  }
+  return dshReasonCopy(dshCode) ?? dshCode;
+}
+
 /** 行按 id upsert（乐观插入/更新共用的收敛入口）：命中替换、未命中尾部追加——
  *  发送入队的即时反馈与复核保守恢复都经它把行放回列表，3s 轮询随后以服务端
  *  权威列表整表覆盖 */
@@ -412,6 +434,12 @@ function fallbackNotice(f: RouteFallback | null): string | null {
   return i18n.t("mobile.openCodeNative.route.declinedNotice", { reason });
 }
 
+function digestDshSend(value: string): string {
+  return Array.from(hash(new TextEncoder().encode(value)), (byte) =>
+    byte.toString(16).padStart(2, "0")
+  ).join("");
+}
+
 export default function MessageComposer({
   session,
   onQueueChanged,
@@ -424,6 +452,7 @@ export default function MessageComposer({
   refreshSendInfoSignal = 0,
   disableTerminalProbes = false,
   turnControl,
+  dshTurnControl,
   editDraft,
   onEditDraftConsumed,
   draftText,
@@ -433,6 +462,15 @@ export default function MessageComposer({
   // OpenCode 策略未知时保留原生入口，旧工具等待 send-info。
   const [sendInfo, setSendInfo] = useState<SendInfo | null>(null);
   const [infoReady, setInfoReady] = useState(false);
+  const [localSendInfoTick, setLocalSendInfoTick] = useState(0);
+  const sendInfoRequestRef = useRef(0);
+  const seenSendInfoSignalsRef = useRef({
+    external: refreshSendInfoSignal,
+    local: 0,
+    route: 0,
+    sessionId: session.id,
+    instanceId: session.dshInstanceId,
+  });
   const [localText, setLocalText] = useState("");
   const text = draftText ?? localText;
   const setText = onDraftTextChange ?? setLocalText;
@@ -559,6 +597,19 @@ export default function MessageComposer({
   // 插队/撤回进行中（与发送互斥，防连点）
   const [busy, setBusy] = useState(false);
   const [receipt, setReceipt] = useState<Receipt>(null);
+  const dshReceipts = useDshSendReceipts(
+    session.id,
+    session.dshInstanceId,
+    sendInfo?.dshRetryScope
+  );
+  const {
+    arm: armDshReceipt,
+    record: recordDshReceipt,
+    discardArmed: discardDshArm,
+    findRetry: findDshRetry,
+    releaseSettled: releaseSettledDsh,
+  } = dshReceipts;
+  const dshSendingRef = useRef(false);
   /** **本次用户动作的 actionId**（Codex APP 原生发送的账本锚）。
    *
    *  一次用户动作生成一次：用 ref 而非 state——双击在同一渲染帧内会两次进入
@@ -731,9 +782,15 @@ export default function MessageComposer({
       deadlineTimerRef.current = null;
     }
     const generation = routingGeneration.current;
-    fetchSendInfo(session.id)
+    const request = ++sendInfoRequestRef.current;
+    fetchSendInfo(session.id, session.dshInstanceId)
       .then((info) => {
-        if (!alive || generation !== routingGeneration.current) return;
+        if (
+          !alive ||
+          request !== sendInfoRequestRef.current ||
+          generation !== routingGeneration.current
+        )
+          return;
         setSendInfo(info);
         setInfoReady(info !== null);
         // S5：静态门结论上报（能力横幅的「可尝试」唯一来源）
@@ -742,7 +799,12 @@ export default function MessageComposer({
         }
       })
       .catch(() => {
-        if (!alive || generation !== routingGeneration.current) return;
+        if (
+          !alive ||
+          generation !== routingGeneration.current ||
+          request !== sendInfoRequestRef.current
+        )
+          return;
         setInfoReady(false);
         // 原生策略未知时保持禁旧；这里只决定入口，不宣称原生已经认领。
         setSendInfo(null);
@@ -750,7 +812,7 @@ export default function MessageComposer({
     return () => {
       alive = false;
     };
-  }, [session.id, session.agentType, onSendGate, onInteractionRoute]);
+  }, [session.id, session.dshInstanceId, session.agentType, onSendGate, onInteractionRoute]);
 
   // F8：外部信号（同页打断受理 / 恢复队列 / 投影能力档位翻转）→ 事件驱动重拉
   // send-info（队列暂停态、静态门结论都可能已变）。失败静默——下一次信号或重挂
@@ -758,12 +820,35 @@ export default function MessageComposer({
   // 任务 9：`routeReloadTick` 与之同一条重拉通道——原生面板「交回旧路径」成功后
   // 推一次，路由翻转的唯一权威仍是服务端 send-info（前端不自行改判）。
   useEffect(() => {
-    if (refreshSendInfoSignal <= 0 && routeReloadTick <= 0) return;
+    const previous = seenSendInfoSignalsRef.current;
+    const targetChanged =
+      previous.sessionId !== session.id || previous.instanceId !== session.dshInstanceId;
+    seenSendInfoSignalsRef.current = {
+      external: refreshSendInfoSignal,
+      local: localSendInfoTick,
+      route: routeReloadTick,
+      sessionId: session.id,
+      instanceId: session.dshInstanceId,
+    };
+    if (
+      targetChanged ||
+      (previous.external === refreshSendInfoSignal &&
+        previous.local === localSendInfoTick &&
+        previous.route === routeReloadTick)
+    )
+      return;
     let alive = true;
     const generation = routingGeneration.current;
-    fetchSendInfo(session.id)
+    const request = ++sendInfoRequestRef.current;
+    fetchSendInfo(session.id, session.dshInstanceId)
       .then((info) => {
-        if (!alive || generation !== routingGeneration.current || info === null) return;
+        if (
+          !alive ||
+          request !== sendInfoRequestRef.current ||
+          generation !== routingGeneration.current ||
+          info === null
+        )
+          return;
         setSendInfo(info);
         setInfoReady(true);
         onSendGate?.(sendGateAttemptable(info));
@@ -777,6 +862,8 @@ export default function MessageComposer({
   }, [
     refreshSendInfoSignal,
     routeReloadTick,
+    localSendInfoTick,
+    session.dshInstanceId,
     session.id,
     session.agentType,
     onSendGate,
@@ -960,10 +1047,14 @@ export default function MessageComposer({
     }
   }, [lastReportRef, session.id]);
 
+  const dshRunning = dshTurnControl?.running === true;
   const handleSend = useCallback(async () => {
+    if (dshRunning) return;
     const body = text.trim();
     if (!body || sending || busy || sendInfo === null || !sendInfo.injectable) return;
     if (attachments.some((a) => a.status === "uploading")) return; // 上传中禁发（防消息先于落盘）
+    const dshChannel = sendInfo.channels?.includes("dsh_desktop") ?? false;
+    if (dshChannel && dshSendingRef.current) return;
     setSending(true);
     // S5：本次发送的代际（迟到响应作废判据；见 sendEpochRef 声明处）
     const myEpoch = ++sendEpochRef.current;
@@ -986,12 +1077,34 @@ export default function MessageComposer({
     // onChange/addFiles/removeAttachment/handleEdit），此刻读到的就是提交内容
     // 对应的版本；四个 Unknown 登记点一律携带本值。
     const submittedDraftVersion = draftVersionRef.current;
-    const needsActionId = sendInfo?.channels?.some((c) => c.startsWith("headless_codex_")) ?? false;
+    // DSH Desktop（T10）同样要求 actionId（账本幂等键：同 ID 同载荷 = 运输重试，
+    // 换载荷 = 新逻辑发送）；send-info 的 channels 携 "dsh_desktop"。
+    const needsActionId = sendInfo.channels?.some((c) => c.startsWith("headless_codex_"));
+    const dshIdentity = dshChannel
+      ? {
+          payload: digestDshSend(JSON.stringify({ text: fullText, queueOnly: queueOnlyNext })),
+          // 分屏重挂后附件与一次性选项可能未恢复，同正文不能因此变成新动作。
+          draft: markup || queueOnlyNext ? digestDshSend(text) : undefined,
+        }
+      : undefined;
     // F6：actionId 按逻辑发送的载荷键控（见 codexActionPayloadRef 声明处）——
     // 上一动作结果未知（核对锚在 ref）时：同载荷重按 = 运输重试（同 ID）；换正文
     // = 新逻辑发送（新 ID——否则撞 action_conflict 且旧锚死锁）。
     let actionId: string | undefined;
-    if (needsActionId) {
+    if (dshIdentity !== undefined) {
+      const retry = findDshRetry(
+        dshIdentity.payload,
+        markup || queueOnlyNext ? undefined : digestDshSend(text),
+        sendInfo.dshRetryScope
+      );
+      if (retry === null) {
+        setReceipt({ kind: "blocked", message: i18n.t("mobile.composer.dshVerifyPending") });
+        setSending(false);
+        return;
+      }
+      actionId = retry ?? newActionId();
+      dshSendingRef.current = true;
+    } else if (needsActionId) {
       const prevId = codexActionIdRef.current;
       if (prevId !== null && codexActionPayloadRef.current === fullText) {
         actionId = prevId;
@@ -1013,7 +1126,9 @@ export default function MessageComposer({
       }
       if (deadlineTimerRef.current?.epoch === myEpoch) deadlineTimerRef.current = null;
     };
-    if (actionId !== undefined) {
+    // M1（复审）：DSH 不进 Codex 的 30 秒预算/恢复面板——挂出 codexUnknown 后
+    // 核对端点固定为 /codex/action/*，对 DSH 必 404，用户无出路。
+    if (actionId !== undefined && !dshChannel) {
       myTimer = setTimeout(() => {
         myTimer = null;
         if (deadlineTimerRef.current?.epoch === myEpoch) deadlineTimerRef.current = null;
@@ -1128,12 +1243,44 @@ export default function MessageComposer({
       // D6：修改重发的下一次发送带 queueOnly=true 强制入队，消费即清——本次发送
       // 失败的话，用户重试走的是普通发送语义（后端失败行已退出 pending，可重发）
       const forceQueue = queueOnlyNext;
-      setQueueOnlyNext(false);
+      if (!dshChannel) setQueueOnlyNext(false);
       // 多行原样上行（trim 只用于判空，不改写正文——归一在服务端）。
       // **actionId / fullText 已在点击时算定**（F6：预算与载荷键控见函数头）。
       // C04：「本条先发送」的越队授权已收敛到队列区（T06 按行两步确认）——composer
       // 发送不再携带 bypassPausedQueue。
-      const res = await sessionSend(session.id, fullText, forceQueue ? true : undefined, actionId);
+      if (
+        dshIdentity !== undefined &&
+        actionId &&
+        !armDshReceipt(actionId, dshIdentity.payload, dshIdentity.draft, sendInfo.dshRetryScope)
+      ) {
+        setReceipt({
+          kind: "blocked",
+          message: i18n.t("mobile.composer.dshRetryStorageUnavailable"),
+        });
+        return;
+      }
+      const dshController = dshChannel ? new AbortController() : undefined;
+      const request = sessionSend(
+        session.id,
+        fullText,
+        forceQueue ? true : undefined,
+        actionId,
+        undefined,
+        session.dshInstanceId,
+        dshController?.signal,
+        sendInfo.dshRetryScope
+      );
+      const res = dshController
+        ? await Promise.race([
+            request,
+            new Promise<never>((_, reject) => {
+              myTimer = setTimeout(() => {
+                dshController.abort();
+                reject(new ApiError(null, "DSH send receipt timeout"));
+              }, FRONT_DEADLINE_MS);
+            }),
+          ])
+        : await request;
       // S5：代际已前进（新发送已开）或本次预算已到期移交面板的，本响应一律
       // 作废不回写（计时器清理在 finally，按闭包归属——碰不到新动作的计时器）
       if (staleEpoch()) return;
@@ -1146,6 +1293,8 @@ export default function MessageComposer({
           current.filter((attachment) => !submittedIds.has(attachment.id))
         );
       };
+
+      if (dshChannel && actionId && res.status !== "dsh") discardDshArm(actionId);
       if (res.status === "delivered") {
         clearSubmittedDraft();
         setReceipt({ kind: "delivered" });
@@ -1241,6 +1390,41 @@ export default function MessageComposer({
         // 屏障；revision=null 时没有新帧，必须主动刷新恢复面板，否则用户看不到
         // 「核对后继续」。
         onQueueChanged?.();
+      } else if (res.status === "dsh") {
+        // 回执和运输重试锚独立；只有未确认的动作继续占用原载荷身份。
+        setReceipt(null);
+        if (actionId && res.receipt.actionId !== actionId) {
+          recordDshReceipt({
+            actionId,
+            state: "unknown_delivery",
+            nativeId: null,
+            reasonCode: null,
+          });
+          return;
+        }
+        if (
+          res.receipt.reasonCode !== "identity_unverified" &&
+          res.receipt.state !== "unknown_delivery" &&
+          res.receipt.state !== "reserved"
+        ) {
+          setQueueOnlyNext(false);
+        }
+        recordDshReceipt(
+          res.receipt.reasonCode === "identity_unverified"
+            ? { ...res.receipt, state: "unknown_delivery" }
+            : res.receipt
+        );
+        if (
+          draftVersionRef.current === submittedDraftVersion &&
+          res.receipt.reasonCode !== "identity_unverified" &&
+          (res.receipt.state === "queued" ||
+            res.receipt.state === "accepted" ||
+            res.receipt.state === "running" ||
+            res.receipt.state === "succeeded")
+        ) {
+          setText("");
+          setAttachments([]);
+        }
       } else {
         setReceipt({ kind: "failed", error: formatInvokeError(res.error, i18n.t) });
       }
@@ -1254,6 +1438,59 @@ export default function MessageComposer({
         // 已处理后返回错误）= 提交结果未知 → 待确认面板（沿同 ID 只读核对，绝不
         // 换 ID 重投）；确定性拒绝（4xx 状态码在响应在手）才落 failed 可重试。
         const definiteRefusal = e.status !== null && e.status < 500 && e.status !== 408;
+        if (dshChannel) {
+          // HTTP 拒绝只描述当前请求。若同 ID 仍可能在受理中，保留原动作供重试。
+          if (e.data?.error === "dsh_retry_scope_changed") {
+            if (actionId) discardDshArm(actionId);
+            setLocalSendInfoTick((tick) => tick + 1);
+            setReceipt({ kind: "blocked", message: i18n.t("mobile.composer.deviceInvalid") });
+            return;
+          }
+          const dshCode = typeof e.data?.reasonCode === "string" ? e.data.reasonCode : null;
+          if (dshCode !== null) {
+            setLocalSendInfoTick((tick) => tick + 1);
+            if (actionId && !definiteRefusal) {
+              setReceipt(null);
+              recordDshReceipt({
+                actionId,
+                state: "unknown_delivery",
+                nativeId: null,
+                reasonCode: dshCode,
+              });
+              return;
+            }
+            const retrySameAction =
+              e.data?.retrySameAction === true ||
+              (e.status === 403 &&
+                (dshCode === "DSH_SESSION_OWNERSHIP_UNPROVEN" ||
+                  dshCode === "DSH_INSTANCE_SWITCHED"));
+            if (actionId) {
+              if (retrySameAction) {
+                recordDshReceipt({
+                  actionId,
+                  state: "unknown_delivery",
+                  nativeId: null,
+                  reasonCode: null,
+                });
+              } else discardDshArm(actionId);
+            }
+            setReceipt({ kind: "failed", error: dshSendFailureCopy(dshCode) });
+            return;
+          }
+          if (actionId && !definiteRefusal) {
+            setReceipt(null);
+            recordDshReceipt({
+              actionId,
+              state: "unknown_delivery",
+              nativeId: null,
+              reasonCode: null,
+            });
+          } else {
+            if (actionId) discardDshArm(actionId);
+            setReceipt({ kind: "failed", error: i18n.t("mobile.composer.dshNetworkUnknown") });
+          }
+          return;
+        }
         if (armedCodexActionId !== null && !definiteRefusal) {
           // 结果未知：核对锚保留（同载荷重按 = 运输重试，服务端账本去重防双投）
           setReceipt({
@@ -1285,7 +1522,10 @@ export default function MessageComposer({
           code === "headless_disabled" ? i18n.t("mobile.composer.headlessDisabled") : null;
         const reason = typeof e.data?.reason === "string" ? e.data.reason : null;
         setReceipt({ kind: "failed", error: localized ?? reason ?? e.message });
-      } else if (armedCodexActionId !== null) {
+      } else if (dshChannel && actionId) {
+        setReceipt(null);
+        recordDshReceipt({ actionId, state: "unknown_delivery", nativeId: null, reasonCode: null });
+      } else if (armedCodexActionId !== null && !dshChannel) {
         // 非 ApiError 异常（网络层断开等）：Codex 路径提交结果未知 → 待确认面板
         //（核对锚保留：同载荷重按 = 运输重试，绝不换 ID 重投）
         setReceipt({
@@ -1311,7 +1551,10 @@ export default function MessageComposer({
       // 碰不到新动作的计时器。sending 同理归当前发送所有：代际已前进的迟到
       // finally 不得关掉新动作的转圈。
       clearMyDeadline();
-      if (!staleEpoch()) setSending(false);
+      if (!staleEpoch()) {
+        if (dshChannel) dshSendingRef.current = false;
+        setSending(false);
+      }
     }
   }, [
     setText,
@@ -1323,9 +1566,15 @@ export default function MessageComposer({
     busy,
     sendInfo,
     session.id,
+    session.dshInstanceId,
+    dshRunning,
     queueOnlyNext,
     probeCardPresence,
     onQueueChanged,
+    armDshReceipt,
+    discardDshArm,
+    recordDshReceipt,
+    findDshRetry,
   ]);
 
   // S5：明确未送达后的「重试」——创建**关联的新动作**（新 actionId），不永远重放
@@ -1430,6 +1679,11 @@ export default function MessageComposer({
   // 作废；这里只兜底清掉真实挂在事件循环上的那一个）
   useEffect(
     () => () => {
+      if (dshSendingRef.current) {
+        // 父页草稿会跨分屏重挂保留，卸载的发送闭包不能再调用其清空回调。
+        sendEpochRef.current += 1;
+        dshSendingRef.current = false;
+      }
       if (deadlineTimerRef.current !== null) {
         clearTimeout(deadlineTimerRef.current.timer);
         deadlineTimerRef.current = null;
@@ -1623,8 +1877,14 @@ export default function MessageComposer({
   // 404 no_cwd 一次即置 noCwd（会话无项目目录，+ 钮禁用——与 R5 禁用口径同源）；
   // 403 设备失效抛 ApiError(403, "设备已失效…") → failed chip（Board 侧另有 403
   // 全局判废通道，此处不重复处理）
+  const attachmentUnavailable =
+    sendInfo?.attachmentUnavailableReasonCode === "DSH_ATTACHMENT_MACOS_UNSAFE";
+  const attachmentUnavailableCopy = attachmentUnavailable
+    ? i18n.t("errors.dshAttachmentMacosUnsafe")
+    : null;
   const addFiles = useCallback(
     async (files: File[]) => {
+      if (attachmentUnavailable) return;
       for (const f of files) {
         // Q2：附件增补也是草稿变更（版本前移）
         draftVersionRef.current += 1;
@@ -1646,23 +1906,29 @@ export default function MessageComposer({
         try {
           // §C5 上行进度：onProgress 是 uploadAttachment 的**第 4 参**（第 3 参是
           // 既有 signal）。进度落 chip：已传字节 + 百分比（有 total 才有）+ 预估剩余
-          const res = await uploadAttachment(session.id, f, ctrl.signal, (loaded, total) => {
-            const atMs = Date.now();
-            const first = uploadFirstSampleRef.current.get(id) ?? { loaded, atMs };
-            uploadFirstSampleRef.current.set(id, first);
-            setAttachments((prev) =>
-              prev.map((a) =>
-                a.id === id
-                  ? {
-                      ...a,
-                      loaded,
-                      total: total > 0 ? total : null, // 事件报 0 = 未知，不编百分比
-                      rateBps: transferRateBps(first, { loaded, atMs }),
-                    }
-                  : a
-              )
-            );
-          });
+          const res = await uploadAttachment(
+            session.id,
+            f,
+            ctrl.signal,
+            (loaded, total) => {
+              const atMs = Date.now();
+              const first = uploadFirstSampleRef.current.get(id) ?? { loaded, atMs };
+              uploadFirstSampleRef.current.set(id, first);
+              setAttachments((prev) =>
+                prev.map((a) =>
+                  a.id === id
+                    ? {
+                        ...a,
+                        loaded,
+                        total: total > 0 ? total : null, // 事件报 0 = 未知，不编百分比
+                        rateBps: transferRateBps(first, { loaded, atMs }),
+                      }
+                    : a
+                )
+              );
+            },
+            session.dshInstanceId ? { instanceId: session.dshInstanceId } : undefined
+          );
           uploadFirstSampleRef.current.delete(id);
           if (res === null) throw new ApiError(403, i18n.t("mobile.composer.deviceInvalid"));
           setAttachments((prev) =>
@@ -1693,7 +1959,7 @@ export default function MessageComposer({
         }
       }
     },
-    [session.id]
+    [attachmentUnavailable, session.id, session.dshInstanceId]
   );
 
   const removeAttachment = useCallback((id: string) => {
@@ -1773,7 +2039,20 @@ export default function MessageComposer({
     );
   }
 
-  if (!infoReady || sendInfo === null) return null;
+  const dshReceiptCards = dshReceipts.actions
+    .filter((item) => !item.awaitingPost && !item.hidden)
+    .map((item) => (
+      <DshSendReceipt
+        key={`${dshReceipts.key}:${item.receipt.actionId}`}
+        item={item}
+        sessionId={session.id}
+        instanceId={session.dshInstanceId}
+        update={dshReceipts.update}
+      />
+    ));
+  // 发送预检失败只隐藏输入；账本读不依赖当前写权限。
+  if ((!infoReady || sendInfo === null) && !dshRunning)
+    return dshReceiptCards.length ? dshReceiptCards : null;
 
   const canSend =
     injectable &&
@@ -1781,7 +2060,6 @@ export default function MessageComposer({
     !busy &&
     text.trim().length > 0 &&
     !attachments.some((a) => a.status === "uploading");
-
   // ===== T05：composer 主按钮按状态切换（spec §5 状态表）=====
   // - 「模型回合运行中」（控制器的新鲜投影事实）与「HTTP 投递中」（sending）是
   //   **两个状态**：停止按钮的可用性只看回合运行态 + canStop，**绝不看 sending/busy**；
@@ -2009,11 +2287,13 @@ export default function MessageComposer({
           )}
         </div>
       )}
-      {/* 不可注入：输入区整体禁用，仅留 reason 展示（输入行保留占位但不可用） */}
-      {!injectable && (
+      {/* 不可注入：输入区整体禁用，仅留 reason 展示（输入行保留占位但不可用）。
+          T3：DSH 机器码优先走 errors.* 词表（可操作文案），服务端 reason 次之，
+          机器码原样保留在码位（诊断面）。 */}
+      {!injectable && sendInfo && (
         <p data-testid="send-disabled-reason" className="mb-2 text-xs text-[var(--mut)]">
           {i18n.t("mobile.composer.sendDisabledPrefix")}
-          {sendInfo.reason ?? i18n.t("mobile.composer.sendDisabledFallback")}
+          {sendDisabledCopy(sendInfo)}
           {sendInfo.reasonCode
             ? i18n.t("mobile.composer.sendDisabledCode", { code: sendInfo.reasonCode })
             : ""}
@@ -2063,6 +2343,7 @@ export default function MessageComposer({
           delivered/submitted/failed/gone。queued 态不再渲染 chip（由下方多列队
           列表取代），回执状态本身保留——乐观行即时反馈、失败对账与 3s 轮询仍以
           其驱动。codexUnknown 由待确认面板接管（下方独立块），不进 chip 容器 */}
+      {dshReceiptCards}
       {receipt !== null && receipt.kind !== "queued" && receipt.kind !== "codexUnknown" && (
         <div className="mb-2 flex flex-wrap items-center gap-2">
           {receipt.kind === "delivered" && (
@@ -2428,6 +2709,11 @@ export default function MessageComposer({
           <ChannelBwNote channel={channel} testId="composer-bw-note" className="mt-1" />
         </div>
       )}
+      {attachmentUnavailableCopy && (
+        <p id="composer-attachment-unavailable" className="text-xs text-[var(--mut)]">
+          {attachmentUnavailableCopy}
+        </p>
+      )}
       <div className="flex items-end gap-2">
         {/* 附件入口（2026-09-20）：+ 选择文件；「?」知情披露（存储到用户项目目录）。
             2026-10-04 用户裁决：两钮横排占横向空间 → 改上下竖排（+ 大在上、? 小在下） */}
@@ -2449,11 +2735,13 @@ export default function MessageComposer({
             data-testid="attach-add"
             aria-label={i18n.t("mobile.composer.attachAddAria")}
             aria-expanded={attachHintOpen}
-            disabled={!injectable || noCwd}
+            disabled={!injectable || noCwd || attachmentUnavailable}
+            aria-describedby={attachmentUnavailable ? "composer-attachment-unavailable" : undefined}
             title={
-              noCwd
+              attachmentUnavailableCopy ??
+              (noCwd
                 ? i18n.t("mobile.composer.attachAddTitleNoCwd")
-                : i18n.t("mobile.composer.attachAddTitle")
+                : i18n.t("mobile.composer.attachAddTitle"))
             }
             onClick={() => fileInputRef.current?.click()}
             className="shrink-0 rounded-full p-1 text-[var(--mut)] hover:bg-[var(--cb)] disabled:opacity-40 dark:hover:bg-[var(--btnp)]"
@@ -2481,6 +2769,7 @@ export default function MessageComposer({
             // Q2：用户编辑即前移草稿版本（在途人工继续的迟到入队不得代清新草稿）
             draftVersionRef.current += 1;
             textVersionRef.current += 1;
+            if (sendInfo?.channels?.includes("dsh_desktop")) releaseSettledDsh();
             setText(e.target.value.slice(0, MAX_SEND_CHARS));
           }}
           onPaste={handlePaste}
@@ -2499,7 +2788,30 @@ export default function MessageComposer({
           }
           className="min-h-0 flex-1 resize-none rounded-lg border border-[var(--cb)] px-3 py-2 text-sm text-[var(--tx)] placeholder:text-[var(--mut)] focus:ring-2 focus:ring-[var(--btnp)] focus:outline-none disabled:opacity-50"
         />
-        {stopAsPrimary ? (
+        {dshTurnControl ? (
+          <button
+            type="button"
+            data-testid={dshRunning ? "dsh-composer-stop" : "composer-send"}
+            aria-label={i18n.t(
+              dshRunning
+                ? dshTurnControl.phase === "stopping"
+                  ? "mobile.composer.stopStopping"
+                  : "mobile.dshQuestions.stopTurn"
+                : sending
+                  ? "mobile.composer.sending"
+                  : "mobile.composer.send"
+            )}
+            disabled={dshRunning ? !dshTurnControl.ready : !canSend}
+            onClick={dshRunning ? () => void dshTurnControl.stop() : handleSend}
+            className="inline-flex size-[30px] shrink-0 items-center justify-center rounded-full bg-[#4175ef] text-white transition-colors hover:bg-[#3266dc] focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:ring-offset-2 focus-visible:outline-none disabled:opacity-40"
+          >
+            {dshRunning ? (
+              <Square size={14} fill="currentColor" aria-hidden="true" />
+            ) : (
+              <ArrowUp size={16} strokeWidth={2.5} aria-hidden="true" />
+            )}
+          </button>
+        ) : stopAsPrimary ? (
           // T05：运行中 + 空稿 + 有可确认停止目标 → 主按钮 = 停止（点击才调既有
           // 定向打断；stopping 期间禁用——30 秒预算内不重按，双击 = 双发破坏性指令）
           <button
@@ -2543,6 +2855,16 @@ export default function MessageComposer({
       </div>
       {/* T05：就近短状态（spec §5 最后行）。仅运行中且不可执行停止时出现一次；
           停止结果（不确定/无回合/失败）复用队列面板既有键，同一事实不两套措辞 */}
+      {dshTurnControl?.phase === "unknown" && (
+        <p role="status" className="text-xs text-[var(--mut)]">
+          {i18n.t("mobile.codex.queue.interruptUncertain")}
+        </p>
+      )}
+      {dshTurnControl?.phase === "failed" && (
+        <p role="status" className="text-xs text-[var(--mut)]">
+          {i18n.t("mobile.composer.stopUnavailable")}
+        </p>
+      )}
       {turnControl?.turnRunning && !turnControl.canStop && (
         <p data-testid="composer-stop-unavailable" className="mt-1 text-[11px] text-[var(--mut)]">
           {i18n.t("mobile.composer.stopUnavailable")}

@@ -1,0 +1,5 @@
+{
+  "type": "server-response",
+  "rpcId": "ok",
+  "result": { "ok": true, "value": { "items": [] } }
+}

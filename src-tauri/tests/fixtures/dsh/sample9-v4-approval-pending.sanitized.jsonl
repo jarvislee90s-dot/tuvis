@@ -1,0 +1,13 @@
+{"type": "session", "version": 4, "id": "session-v4-approval", "createdAt": 1789312074926, "cwd": "/tmp/v4-proj", "isSeeded": false, "delegationDepth": 0}
+{"type": "permission/preset", "seq": 0, "time": 1789312074936, "data": {"preset": "workspace-write"}}
+{"type": "sandbox/mode", "seq": 1, "time": 1789312074938, "data": {"mode": "workspace-write"}}
+{"type": "approval/policy", "seq": 2, "time": 1789312074938, "data": {"policy": "ask"}}
+{"type": "agent/inbox/spliced", "seq": 3, "time": 1789312074941, "data": {"target": "next-turn", "start": 0, "inserted": [{"content": [{"type": "text", "text": "run a v4 command"}], "source": {"kind": "user"}, "role": "user", "id": "fc184e58-dada-481b-8761-f90c7635e57a"}]}}
+{"type": "turn/start", "seq": 4, "time": 1789312074942, "data": {"turn": 1}}
+{"type": "agent/inbox/spliced", "seq": 5, "time": 1789312074943, "data": {"target": "next-turn", "start": 0, "removedCount": 1, "inserted": []}}
+{"type": "step/start", "seq": 6, "time": 1789312075016, "data": {"turn": 1, "step": 1}}
+{"type": "user/message", "seq": 7, "time": 1789312075019, "data": {"content": [{"type": "text", "text": "run a v4 command"}], "source": {"kind": "user"}, "role": "user", "id": "fc184e58-dada-481b-8761-f90c7635e57a"}, "surfaceOp": "append"}
+{"type": "session/title", "seq": 8, "time": 1789312075024, "data": {"title": "run a v4 command", "messageSeqs": [7], "source": {"kind": "fallback"}}}
+{"type": "assistant/message", "seq": 9, "time": 1789312075090, "data": {"turn": 1, "step": 1, "message": {"role": "assistant", "content": [{"type": "tool-call", "id": "mock-call-1", "name": "bash", "arguments": "<redacted text: 141 chars>"}], "source": {"kind": "model", "provider": "deepseek-official", "model": "deepseek-flash"}, "id": "023cc3c8-5c14-4450-9721-32cd659f96db"}, "usage": {"inputTokens": 3, "outputTokens": 2, "totalTokens": 5}}, "surfaceOp": "append"}
+{"type": "tool/call", "seq": 10, "time": 1789312075091, "data": {"turn": 1, "step": 1, "callId": "mock-call-1", "name": "bash", "arguments": "<redacted text: 141 chars>"}}
+{"type": "approval/asked", "seq": 11, "time": 1789312075099, "data": {"id": "6513241d-2d17-4104-a25f-ee115140f8e6", "toolName": "bash", "callId": "mock-call-1", "reason": "escalate sandbox to danger-full-access: v4 probe pending approval"}}

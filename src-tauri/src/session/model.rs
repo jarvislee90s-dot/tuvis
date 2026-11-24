@@ -100,6 +100,15 @@ pub struct Session {
     /// 前端首见未读卡的新鲜度必须用它判断，不能用旧业务活动时间误杀补偿通知。
     #[serde(default)]
     pub unread_turned_green_at_ms: Option<i64>,
+    /// DSH 实例归属（H04，仅 DSH 用）：卡片归属的稳定实例 ID
+    /// （`instances::instance_id_for` 派生；多宿主/多实例时同名会话不串，
+    /// 缓存身份不得只以原生 sessionId 去重——§3.1）。其他工具恒 None；
+    /// 归属不可证（web 宿主 argv 无 home，H02）时为 None，不猜。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dsh_instance_id: Option<String>,
+    /// DSH 会话头判定的子 Agent 状态；未知或非 DSH 时不提供。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dsh_subagent: Option<bool>,
 }
 
 /// 全部会话的聚合响应
@@ -173,6 +182,8 @@ mod jump_tests {
             jump_supported: false,
             unread: false,
             unread_turned_green_at_ms: Some(42),
+            dsh_instance_id: None,
+            dsh_subagent: None,
         };
         let v = serde_json::to_value(&s).unwrap();
         assert_eq!(
@@ -186,6 +197,47 @@ mod jump_tests {
         assert!(
             v.get("flap_from_subagent_activity").is_none(),
             "不得出现 snake_case 键（前端契约 camelCase）"
+        );
+    }
+
+    /// H04 wire 契约：`dsh_instance_id` 仅 DSH 用——None 时**整个键缺席**
+    /// （老工具 JSON 逐字不变，老路径零影响）；Some 时按 camelCase 下发。
+    #[test]
+    fn dsh_instance_id_serializes_only_when_present() {
+        let mut s = Session {
+            id: "s1".into(),
+            agent_type: AgentType::Dsh,
+            project_name: "p".into(),
+            project_path: "/p".into(),
+            title: None,
+            git_branch: None,
+            github_url: None,
+            status: SessionStatus::Idle,
+            last_message: None,
+            last_message_role: None,
+            last_message_subagent_report: false,
+            flap_from_subagent_activity: false,
+            last_activity_at: String::new(),
+            pid: 1,
+            cpu_usage: 0.0,
+            active_subagent_count: 0,
+            form: ProcessForm::App,
+            jump_supported: false,
+            unread: false,
+            unread_turned_green_at_ms: None,
+            dsh_instance_id: None,
+            dsh_subagent: None,
+        };
+        let v = serde_json::to_value(&s).unwrap();
+        assert!(
+            v.get("dshInstanceId").is_none(),
+            "None 时键必须缺席（老工具 JSON 不变）"
+        );
+        s.dsh_instance_id = Some("instance-abc".into());
+        let v = serde_json::to_value(&s).unwrap();
+        assert_eq!(
+            v["dshInstanceId"], "instance-abc",
+            "Some 时按 camelCase 下发，前端缓存身份消费"
         );
     }
 }

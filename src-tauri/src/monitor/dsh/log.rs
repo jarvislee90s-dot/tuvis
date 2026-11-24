@@ -11,6 +11,59 @@ use std::time::{Duration, Instant};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::decode::decode_zstd_frames;
+use crate::monitor::session_scan::SessionFileScan;
+use std::sync::Arc;
+
+pub(crate) const READONLY_HEADER_SCAN: SessionFileScan =
+    SessionFileScan::new("dsh-readonly-header");
+pub(crate) const MAX_READONLY_HEADER_BYTES: u64 = 64 * 1024;
+const MAX_READONLY_HEADER_INPUT: u64 = 512 * 1024;
+pub(crate) const READONLY_ZSTD_WINDOW_LOG: u32 = 26;
+
+/// 仅流式读取首行；无法完整读取或超预算时，身份保持未知。
+pub(crate) fn read_readonly_header(path: &Path) -> Option<String> {
+    use std::io::{BufRead, BufReader, Read};
+    let file = std::fs::File::open(path).ok()?;
+    let reader: Box<dyn Read> = if path.extension().is_some_and(|e| e == "zstd") {
+        let mut decoder =
+            zstd::stream::read::Decoder::new(file.take(MAX_READONLY_HEADER_INPUT)).ok()?;
+        decoder.window_log_max(READONLY_ZSTD_WINDOW_LOG).ok()?;
+        Box::new(decoder)
+    } else {
+        Box::new(file)
+    };
+    let mut reader = BufReader::new(reader.take(MAX_READONLY_HEADER_BYTES + 1));
+    let mut line = Vec::new();
+    reader.read_until(b'\n', &mut line).ok()?;
+    if line.len() as u64 > MAX_READONLY_HEADER_BYTES || !line.ends_with(b"\n") {
+        return None;
+    }
+    parse_header(std::str::from_utf8(&line).ok()?)
+        .map(|h| h.id)
+        .filter(|id| !id.trim().is_empty())
+}
+
+pub(crate) fn cached_readonly_header<F>(
+    scan: &SessionFileScan,
+    path: &Path,
+    parse: F,
+) -> Arc<Option<String>>
+where
+    F: FnOnce(&Path) -> Option<String>,
+{
+    if std::fs::metadata(path).and_then(|m| m.modified()).is_err() {
+        return Arc::new(None);
+    }
+    scan.parse_checked_identity(path, |p| {
+        std::fs::metadata(p).and_then(|m| m.modified()).ok()?;
+        parse(p)
+    })
+    .unwrap_or_else(|| Arc::new(None))
+}
+
+pub(crate) fn readonly_header_identity(path: &Path) -> Arc<Option<String>> {
+    cached_readonly_header(&READONLY_HEADER_SCAN, path, read_readonly_header)
+}
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct DshHeader {
@@ -115,7 +168,8 @@ pub fn is_subagent(h: &DshHeader) -> bool {
     h.origin.as_deref() == Some("subagent") || h.delegation_depth > 0
 }
 
-/// 文件名 → 代际号；不识别的文件名忽略（版本门：未来 v4 只需放宽正则）
+/// 文件名 → 代际号；不识别的文件名忽略（版本门在 mod.rs 摘要侧按 header.version
+/// 收敛；本解析本身版本泛化，v4 已在已知集，未来新代际由版本门统一拦截）
 fn parse_generation(name: &str) -> Option<i64> {
     if name == "session.jsonl" || name == "session.jsonl.zstd" {
         return Some(0);
@@ -145,6 +199,7 @@ pub fn generation_logs(dir: &Path) -> Vec<(i64, PathBuf)> {
     out
 }
 
+#[derive(Clone)]
 pub struct GenerationRead {
     pub version: i64,
     pub text: String,
@@ -230,6 +285,34 @@ mod tests {
         h.origin = None;
         h.delegation_depth = 1;
         assert!(is_subagent(&h));
+    }
+
+    #[test]
+    fn golden_v4_header_and_generation_selection() {
+        // v4 夹具（2026-11 落盘代际已证事实）：header version=4，非子 Agent
+        let text = fixture("sample7-v4-completed.sanitized.jsonl");
+        let h = parse_header(&text).expect("v4 header 可解析");
+        assert_eq!(h.version, Some(4));
+        assert!(!is_subagent(&h));
+        // 代际文件名识别：session.v4.jsonl.zstd 是合法代际（多代并存时取最大者）
+        assert_eq!(
+            parse_generation("session.v4.jsonl.zstd"),
+            Some(4),
+            "v4 代际文件名必须被识别"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let v3 = zstd::stream::encode_all(
+            b"{\"type\":\"session\",\"version\":3,\"id\":\"a\"}\n".as_slice(),
+            3,
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("session.v3.jsonl.zstd"), &v3).unwrap();
+        let v4 = zstd::stream::encode_all(text.as_bytes(), 3).unwrap();
+        std::fs::write(dir.path().join("session.v4.jsonl.zstd"), &v4).unwrap();
+        let read = read_best_generation(dir.path()).expect("应读到");
+        assert_eq!(read.version, 4, "v3/v4 并存时取代际最大者（v4）");
+        let h4 = parse_header(&read.text).unwrap();
+        assert_eq!(h4.id, "session-v4-completed");
     }
 
     #[test]

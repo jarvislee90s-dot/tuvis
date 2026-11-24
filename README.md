@@ -40,24 +40,24 @@ English · [中文](README.zh-CN.md)
 
 Step-by-step documentation lives in the **[user manual](docs/product/manual/en/01-overview.md)** (13 chapters). The README is the porch; the manual is the house.
 
-| Feature                              |                                                                                                                                                   | Manual                                                  |
-| ------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------- |
-| 🎛️ **Session monitoring dashboard**  | Adaptive traffic-light board: status, project, branch, last message, CPU — click a card to jump straight to the session's terminal or app window | [Ch. 4](docs/product/manual/en/04-dashboard.md)            |
-| 📶 **Remote access & mobile board**  | The same board on your phone, over four simultaneous channels with per-channel setup wizards and one permanent address option                     | [Ch. 8](docs/product/manual/en/08-mobile-remote.md)        |
-| 📱 **Remote control** (experimental) | Send and queue messages, approve requests, answer questions, switch permissions, and create sessions. **0.6.7 improves Codex Desktop questions and queues**. ZCode uses the official bridge | [Ch. 8](docs/product/manual/en/08-mobile-remote.md)        |
-| 🕵️ **Sub-agent observatory**         | Live sub-agent chips, a dedicated sub-agent board and execution details in the session view (Claude Code)                                         | [Ch. 5](docs/product/manual/en/05-subagent-observatory.md) |
-| 🐰 **Desktop pets**                  | tuvis-3D & Foxbell watch your sessions with status cards and voice alerts; open pet format for custom imports                                     | [Ch. 7](docs/product/manual/en/07-pet.md)                  |
-| 🧮 **Token usage ledger**            | One ledger for seven tools: overview, trends, distribution, API-equivalent cost estimates, CSV export                                             | [Ch. 11](docs/product/manual/en/11-usage.md)               |
-| ⚡ **Output speed (TPS)**            | Locally sampled streaming TPS + inclusive response throughput, four-range chart with hover readouts; zero speed-test requests                     | [Ch. 11](docs/product/manual/en/11-usage.md)               |
-| 🖥️ **Four-tab desktop workspace**    | Main window tabs: Messages / Resources / Usage / Output Speed — each tab keeps its own state                                                      | [Ch. 11](docs/product/manual/en/11-usage.md)               |
-| 🔔 **Notifications & sound**         | Change-based desktop notifications with deduplication + Web Audio chimes, clickable to jump to the terminal                                       | [Ch. 6](docs/product/manual/en/06-notifications.md)        |
-| 🚀 **Launch at login**               | Shows the real OS-side state (no local cache); silent tray start when auto-launched                                                               | [Ch. 6](docs/product/manual/en/06-notifications.md)        |
-| ⚡ **Quick terminal jump**           | Click a card, land in the right terminal tab — even with the same project open twice                                                              | [Ch. 4](docs/product/manual/en/04-dashboard.md)            |
-| 🧩 **Extension resource management** | Skills / MCP servers / Plugins in one SSOT repository, auto-imported and format-converted per tool                                                | [Ch. 9](docs/product/manual/en/09-resources.md)            |
-| 🎚️ **Preset groups**                 | Bundle skills + MCP + plugins into named presets, apply or revert in one click from the tray                                                      | [Ch. 10](docs/product/manual/en/10-presets.md)             |
-| 👥 **Sub-agent resource allocation** | Allocate resource subsets to sub-agents; tool-level disable cascades down automatically                                                           | [Ch. 9](docs/product/manual/en/09-resources.md)            |
-| ✅ **Tool toggle management**        | Decide which tools Tuvis monitors and manages; unchecking fully restores and hides the tool                                                       | [Ch. 9](docs/product/manual/en/09-resources.md)            |
-| 🩺 **Signal health**                 | Hook trust-gate self-check per tool, with honest per-tool reasons instead of a bare "unregistered"                                                | [Ch. 12](docs/product/manual/en/12-troubleshooting.md)     |
+| Feature                              |                                                                                                                                                                                                                            | Manual                                                     |
+| ------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------- |
+| 🎛️ **Session monitoring dashboard**  | Adaptive traffic-light board: status, project, branch, last message, CPU — click a card to jump straight to the session's terminal or app window                                                                           | [Ch. 4](docs/product/manual/en/04-dashboard.md)            |
+| 📶 **Remote access & mobile board**  | The same board on your phone, over four simultaneous channels with per-channel setup wizards and one permanent address option                                                                                              | [Ch. 8](docs/product/manual/en/08-mobile-remote.md)        |
+| 📱 **Remote control** (experimental) | Send and queue messages, approve requests, answer questions, switch permissions, and create sessions. **0.6.8 adds DSH native controls and its official console**. OpenCode on macOS and ZCode use their official channels | [Ch. 8](docs/product/manual/en/08-mobile-remote.md)        |
+| 🕵️ **Sub-agent observatory**         | Live sub-agent chips, a dedicated sub-agent board and execution details in the session view (Claude Code)                                                                                                                  | [Ch. 5](docs/product/manual/en/05-subagent-observatory.md) |
+| 🐰 **Desktop pets**                  | tuvis-3D & Foxbell watch your sessions with status cards and voice alerts; open pet format for custom imports                                                                                                              | [Ch. 7](docs/product/manual/en/07-pet.md)                  |
+| 🧮 **Token usage ledger**            | One ledger for seven tools: overview, trends, distribution, API-equivalent cost estimates, CSV export                                                                                                                      | [Ch. 11](docs/product/manual/en/11-usage.md)               |
+| ⚡ **Output speed (TPS)**            | Locally sampled streaming TPS + inclusive response throughput, four-range chart with hover readouts; zero speed-test requests                                                                                              | [Ch. 11](docs/product/manual/en/11-usage.md)               |
+| 🖥️ **Four-tab desktop workspace**    | Main window tabs: Messages / Resources / Usage / Output Speed — each tab keeps its own state                                                                                                                               | [Ch. 11](docs/product/manual/en/11-usage.md)               |
+| 🔔 **Notifications & sound**         | Change-based desktop notifications with deduplication + Web Audio chimes, clickable to jump to the terminal                                                                                                                | [Ch. 6](docs/product/manual/en/06-notifications.md)        |
+| 🚀 **Launch at login**               | Shows the real OS-side state (no local cache); silent tray start when auto-launched                                                                                                                                        | [Ch. 6](docs/product/manual/en/06-notifications.md)        |
+| ⚡ **Quick terminal jump**           | Click a card, land in the right terminal tab — even with the same project open twice                                                                                                                                       | [Ch. 4](docs/product/manual/en/04-dashboard.md)            |
+| 🧩 **Extension resource management** | Skills / MCP servers / Plugins in one SSOT repository, auto-imported and format-converted per tool                                                                                                                         | [Ch. 9](docs/product/manual/en/09-resources.md)            |
+| 🎚️ **Preset groups**                 | Bundle skills + MCP + plugins into named presets, apply or revert in one click from the tray                                                                                                                               | [Ch. 10](docs/product/manual/en/10-presets.md)             |
+| 👥 **Sub-agent resource allocation** | Allocate resource subsets to sub-agents; tool-level disable cascades down automatically                                                                                                                                    | [Ch. 9](docs/product/manual/en/09-resources.md)            |
+| ✅ **Tool toggle management**        | Decide which tools Tuvis monitors and manages; unchecking fully restores and hides the tool                                                                                                                                | [Ch. 9](docs/product/manual/en/09-resources.md)            |
+| 🩺 **Signal health**                 | Hook trust-gate self-check per tool, with honest per-tool reasons instead of a bare "unregistered"                                                                                                                         | [Ch. 12](docs/product/manual/en/12-troubleshooting.md)     |
 
 ## See it in action
 
@@ -78,7 +78,7 @@ Step-by-step documentation lives in the **[user manual](docs/product/manual/en/0
 
 <!-- capabilities:start (generated; run pnpm sync:capabilities) -->
 
-15 capability rows × 8 tools (✅ supported / ◐ partial / 🧪 experimental / ❌ not supported).
+18 capability rows × 8 tools (✅ supported / ◐ partial / 🧪 experimental / ❌ not supported).
 
 Single maintained source: [`docs/capabilities.json`](docs/capabilities.json), shared with the website.
 
@@ -95,12 +95,17 @@ Single maintained source: [`docs/capabilities.json`](docs/capabilities.json), sh
 | Mobile · message injection | 🧪 | 🧪 | 🧪 | 🧪 | ❌ | ✅ | ❌ | ❌ |
 | Mobile · session creation | 🧪 | 🧪 | 🧪 | 🧪 | ❌ | ❌ | ❌ | ❌ |
 | Token usage collection | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
-| Mobile · sub-agent observatory | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| Mobile · sub-agent observatory | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ◐ | ❌ |
 | Codex APP remote control (Desktop IPC) | ❌ | 🧪 | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
 | ZCode remote control (official bridge) | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ | ❌ | ❌ |
+| Mobile · DSH native controls | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ◐ | ❌ |
+| Mobile · OpenCode native controls | ❌ | ❌ | ◐ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| Mobile · DSH console | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ◐ | ❌ |
 | Output speed (TPS sampling) | ◐ approximate | ◐ response only | ◐ plugin | ✅ | ✅ | ✅ | ✅ | ❌ |
 
 The Codex column covers both CLI and APP; Desktop APP control has its own row and is gated per operation by contract evidence. Bidirectional idle async answers are verified on Windows 26.1103.3517.0.
+
+Tuvis 0.6.8 adds DSH native controls and the official console. Isolated macOS Desktop tests verified sending and settings readback, and macOS offers read-only subagent lists and details. Native behavior on Windows remains unverified, Windows Web instance attribution is unavailable, and macOS Web writes and real console round trips across all four channels await validation. DSH uses its native channel for sending.
 
 <!-- capabilities:end -->
 

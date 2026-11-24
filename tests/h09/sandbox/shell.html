@@ -1,0 +1,16 @@
+<!doctype html>
+<html lang="zh">
+  <meta charset="utf-8" />
+  <title>H09 第二候选：opaque sandbox</title>
+  <h1>H09 第二候选机制测试</h1>
+  <p>仅本地临时设备、内存上传与测试下载。不要选择真实文件或复用日常浏览器配置。</p>
+  <button id="launch">在可信新标签页打开测试</button>
+  <button id="start" hidden>临时登录、正对照并建立 sandbox</button>
+  <button id="refresh" hidden>刷新服务端证据</button>
+  <button id="download-confirm" hidden>我已核对实际下载文件中的 H09 测试文字</button>
+  <button id="expiry" hidden>检查能力是否已到期（120秒）</button>
+  <p id="instructions"></p>
+  <div id="frames"></div>
+  <pre id="output">尚未执行；准备好的测试不等于机制通过。</pre>
+  <script type="module" src="/m/fixture/sandbox/trusted.mjs"></script>
+</html>

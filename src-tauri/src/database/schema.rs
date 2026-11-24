@@ -121,18 +121,23 @@ pub fn init(conn: &Connection) -> Result<(), rusqlite::Error> {
         CREATE TABLE IF NOT EXISTS unread_sessions (
             tool_id          TEXT NOT NULL,
             session_id       TEXT NOT NULL,
+            -- 实例限定键（H05/H07）：非 DSH 一律空串；DSH 为已核验实例 ID——
+            -- 同 ID 跨实例的未读行互不覆盖（空串参与主键，旧行为逐字保留）
+            instance_key     TEXT NOT NULL DEFAULT '',
             project_name     TEXT NOT NULL DEFAULT '',
             title            TEXT,
             last_message     TEXT,
             turned_green_at  INTEGER NOT NULL,
             expires_at       INTEGER NOT NULL,
-            PRIMARY KEY (tool_id, session_id)
+            PRIMARY KEY (tool_id, session_id, instance_key)
         );
         CREATE TABLE IF NOT EXISTS unread_read_tombstones (
-            tool_id     TEXT NOT NULL,
-            session_id  TEXT NOT NULL,
-            read_at     INTEGER NOT NULL,
-            PRIMARY KEY (tool_id, session_id)
+            tool_id       TEXT NOT NULL,
+            session_id    TEXT NOT NULL,
+            -- 同上：空串 = 非 DSH（旧行为）；DSH 为实例 ID
+            instance_key  TEXT NOT NULL DEFAULT '',
+            read_at       INTEGER NOT NULL,
+            PRIMARY KEY (tool_id, session_id, instance_key)
         );
         CREATE TABLE IF NOT EXISTS heartbeat_observations (
             pid           INTEGER PRIMARY KEY,
@@ -498,7 +503,8 @@ pub fn init(conn: &Connection) -> Result<(), rusqlite::Error> {
             result      TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS session_archive (
-            session_id   TEXT PRIMARY KEY,
+            session_id   TEXT NOT NULL,
+            instance_key TEXT NOT NULL DEFAULT '',
             agent_type   TEXT NOT NULL,
             project_path TEXT NOT NULL,
             project_name TEXT NOT NULL,
@@ -506,7 +512,8 @@ pub fn init(conn: &Connection) -> Result<(), rusqlite::Error> {
             last_status  TEXT NOT NULL,
             first_seen   TEXT NOT NULL,
             last_seen    TEXT NOT NULL,
-            updated_at   TEXT NOT NULL
+            updated_at   TEXT NOT NULL,
+            PRIMARY KEY (session_id, instance_key)
         );
         CREATE TABLE IF NOT EXISTS session_board_hidden (
             session_id   TEXT PRIMARY KEY,
@@ -998,6 +1005,83 @@ pub fn init(conn: &Connection) -> Result<(), rusqlite::Error> {
             observed_at     INTEGER NOT NULL,
             PRIMARY KEY (probe_key, operation, rule_version, package_sha256)
         );
+        -- ============================================================
+        -- DSH Desktop 远控（T09）：专用动作账本 / claim / 契约证据
+        -- 与 Codex 表完全独立（计划 T09「不共用 Codex 表」）。绑定秘密与
+        -- owner Cookie **不入**这些表——只用 payload 摘要做关联。
+        -- ============================================================
+
+        -- 远程动作账本：actionId 全局唯一（手机侧重试靠查重 + 唯一约束兜底）。
+        -- 状态机：queued → reserved → accepted/running → succeeded；reserved 挂掉
+        -- 只能恢复为 unknown_delivery（crash 不自动重投），成功仅由效果证据提升。
+        CREATE TABLE IF NOT EXISTS dsh_actions (
+            seq            INTEGER PRIMARY KEY AUTOINCREMENT,
+            action_id      TEXT NOT NULL UNIQUE,
+            device_id      TEXT NOT NULL,
+            device_name    TEXT NOT NULL,
+            host_id        TEXT NOT NULL,
+            -- epoch 是 u64（identity 的 64 位指纹截断），**不得**用 INTEGER
+            -- 存：超过 i64::MAX 的代际会被 SQLite 饱和/变形（复审 B1）。
+            -- TEXT 十进制是 u64 的完整可逆表示。
+            epoch          TEXT NOT NULL,
+            session_id     TEXT NOT NULL,
+            operation      TEXT NOT NULL,
+            payload_hash   TEXT NOT NULL,
+            -- T10：排队消息自动推进需要**载荷本体**（只存 hash 无法重投）。
+            -- 保留纪律（M7）：正文只在 queued/reserved 期间持有，受理/终态即清空
+            -- （重启对在途收口 unknown 不重投）。
+            payload_json   TEXT,
+            -- P1-a（第四轮复审）：**载荷身份**（换代无关的操作+载荷摘要）——
+            -- 同 ID 重试核对本列（session+payload_identity），异载荷/异会话报
+            -- 冲突；与 payload_hash（含 host/epoch 的完整身份摘要）分层。
+            payload_identity TEXT,
+            send_acceptance TEXT,
+            state          TEXT NOT NULL,
+            native_id      TEXT,
+            reason_code    TEXT,
+            evidence_json  TEXT,
+            created_at_ms  INTEGER NOT NULL,
+            updated_at_ms  INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_dsh_actions_device_seq
+            ON dsh_actions (device_id, seq DESC);
+        CREATE INDEX IF NOT EXISTS idx_dsh_actions_state_seq
+            ON dsh_actions (state, seq);
+        -- 占用/队序查询（host/epoch/session × 状态）的复合过滤索引：
+        -- 无此索引时该查询走 (state, seq) 全状态扫描再过滤（复审 m3）。
+        CREATE INDEX IF NOT EXISTS idx_dsh_actions_session_state
+            ON dsh_actions (host_id, epoch, session_id, state);
+
+        -- 原生请求占用：一个动作最多一份 claim（waterfall 事件 + 代际 + 修订号），
+        -- 多端抢答由 action_id 唯一 + 上层 CAS 收敛。
+        CREATE TABLE IF NOT EXISTS dsh_claims (
+            claim_id      TEXT PRIMARY KEY,
+            action_id     TEXT NOT NULL UNIQUE,
+            epoch         TEXT NOT NULL,
+            client_id     TEXT NOT NULL,
+            event_id      TEXT NOT NULL,
+            revision      TEXT NOT NULL,
+            claimed_at_ms INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_dsh_claims_event
+            ON dsh_claims (epoch, event_id);
+
+        -- 契约证据：按 (host, 平台, 包内容指纹, 规则版本, 操作) 归因；包或规则
+        -- 换代后旧证据不得解锁写能力，由 capability 求值再核一次。
+        CREATE TABLE IF NOT EXISTS dsh_contract_evidence (
+            host_id         TEXT NOT NULL,
+            platform        TEXT NOT NULL,
+            package_sha256  TEXT NOT NULL,
+            rule_version    INTEGER NOT NULL,
+            operation       TEXT NOT NULL,
+            method          TEXT NOT NULL,
+            structural_rule TEXT NOT NULL,
+            semantic_rule   TEXT NOT NULL,
+            evidenced_at_ms INTEGER NOT NULL,
+            PRIMARY KEY (host_id, platform, package_sha256, rule_version, operation)
+        );
+        CREATE INDEX IF NOT EXISTS idx_dsh_contract_evidence_package
+            ON dsh_contract_evidence (package_sha256, rule_version);
         CREATE TABLE IF NOT EXISTS codex_ipc_schema_evidence (
             probe_key         TEXT PRIMARY KEY,
             fingerprint       TEXT NOT NULL,

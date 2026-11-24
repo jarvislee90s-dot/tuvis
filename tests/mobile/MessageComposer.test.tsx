@@ -1,7 +1,7 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import MessageComposer from "@/mobile/MessageComposer";
-import type { QueueItemView, SendInfo } from "@/mobile/api";
+import type { DshActionReceipt, QueueItemView, SendInfo } from "@/mobile/api";
 import { OPENCODE_RESELECT_POST_TIMEOUT_MS } from "@/mobile/opencodeNativeApi";
 // T05：停止控制器（Harness 挂真实 hook——SessionDetail 持有单例的组件级等价）
 import { useCodexTurnControl } from "@/mobile/useCodexTurnControl";
@@ -79,6 +79,9 @@ interface Routes {
   answerStatus?: number;
   answerBody?: Record<string, unknown>;
   send?: Record<string, unknown>;
+  dshSend?: (actionId: string) => DshActionReceipt;
+  dshDuplicate?: true;
+  dshAction?: (actionId: string, init?: RequestInit) => Promise<Response>;
   sendStatus?: number;
   /** 非 2xx 时响应体 JSON（403 not_injectable{reason,reasonCode} 等，P2-10） */
   sendBody?: Record<string, unknown>;
@@ -99,6 +102,7 @@ interface Routes {
   attach?: { path: string; size: number };
   attachStatus?: number;
   attachError?: string;
+  attachReasonCode?: string;
   /** 附件上传挂起不响应（上传中禁发测试） */
   attachHang?: boolean;
   /** 上传进度事件（Task 10 §C5）：FakeXHR 在 send 时先发一发 onprogress（loaded,total） */
@@ -144,6 +148,7 @@ let releaseQueue: ((r: Response) => void) | null = null;
 let releaseInterrupt: ((r: Response) => void) | null = null;
 
 beforeEach(() => {
+  sessionStorage.clear();
   routes = {};
   routeNativeCalls = 0;
   releaseSend = null;
@@ -174,6 +179,12 @@ function installFetch() {
   });
   fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input);
+    const dshAction = /^\/m\/api\/v1\/dsh\/action\/([^/]+)$/.exec(
+      new URL(url, window.location.href).pathname
+    );
+    if (dshAction && routes.dshAction) {
+      return routes.dshAction(decodeURIComponent(dshAction[1]), init);
+    }
     // §C5 带宽提示（装饰）：缺省 = 局域网直连不限速（不出横幅）；403/网络异常
     // 由 fetchChannel 内部静默降级为 null
     if (url.includes("/m/api/v1/channel")) {
@@ -206,6 +217,10 @@ function installFetch() {
       );
     }
     if (url.includes("/session-send-info")) {
+      // R05：捕获 send-info 请求 URL（Composer 实际请求断言实例在场用）
+      (globalThis as unknown as { __sendInfoUrls?: string[] }).__sendInfoUrls =
+        (globalThis as unknown as { __sendInfoUrls?: string[] }).__sendInfoUrls ?? [];
+      (globalThis as unknown as { __sendInfoUrls?: string[] }).__sendInfoUrls.push(url);
       if (routes.infoStatus) return new Response("no", { status: routes.infoStatus });
       const queued = routes.infoQueue?.shift();
       return new Response(JSON.stringify(queued ?? routes.info ?? sendInfo()), { status: 200 });
@@ -345,6 +360,14 @@ function installFetch() {
           status: routes.sendStatus,
         });
       }
+      if (routes.dshSend) {
+        const { actionId } = JSON.parse(String(init?.body)) as { actionId: string };
+        return Response.json({
+          status: "dsh",
+          receipt: routes.dshSend(actionId),
+          ...(routes.dshDuplicate && { duplicate: true }),
+        });
+      }
       return new Response(JSON.stringify(routes.send ?? { status: "delivered" }), { status: 200 });
     }
     if (url.includes("/session-queue")) {
@@ -403,7 +426,10 @@ class FakeXHR {
       routes.attachStatus ?? 200,
       JSON.stringify(
         routes.attachStatus
-          ? { error: routes.attachError ?? "too_large" }
+          ? {
+              error: routes.attachError ?? "too_large",
+              ...(routes.attachReasonCode ? { reasonCode: routes.attachReasonCode } : {}),
+            }
           : (routes.attach ?? { path: "E:/proj/.tuvis-attachments/s-1/1-a.bin", size: 0 })
       )
     );
@@ -599,6 +625,422 @@ describe("MessageComposer：发送与回执（W4）", () => {
   });
 });
 
+describe("MessageComposer：T04 DSH 账本回执", () => {
+  const targetA = { hostId: "instance-A", epoch: 1, sessionId: "session-dsh" };
+  const instanceA = { id: targetA.sessionId, dshInstanceId: targetA.hostId };
+  const accepted = /DSH 已受理/;
+  const succeeded = /已进入 DSH 会话/;
+  const unverified = /待核实/;
+
+  function receipt(actionId: string, state: DshActionReceipt["state"]): DshActionReceipt {
+    return {
+      actionId,
+      state,
+      nativeId: state === "queued" ? null : actionId,
+      reasonCode: null,
+    };
+  }
+
+  function installDsh() {
+    vi.useFakeTimers();
+    installFetch();
+    routes.info = sendInfo({ channels: ["dsh_desktop"] });
+    const queries: Array<{
+      actionId: string;
+      method: string;
+      signal: AbortSignal | null | undefined;
+      resolve: (response: Response) => void;
+      reject: (error: Error) => void;
+    }> = [];
+    // 故意不随 AbortSignal 自动拒绝：测试仍可放行已取消的旧响应，验证 UI 的过期保护。
+    routes.dshAction = (actionId, init) =>
+      new Promise<Response>((resolve, reject) => {
+        queries.push({
+          actionId,
+          method: init?.method ?? "GET",
+          signal: init?.signal,
+          resolve,
+          reject,
+        });
+      });
+    return queries;
+  }
+
+  async function advance(ms: number) {
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(ms);
+    });
+  }
+
+  async function submitDsh(text: string) {
+    fireEvent.change(screen.getByTestId("composer-input"), { target: { value: text } });
+    fireEvent.click(screen.getByTestId("composer-send"));
+    await flushAsync();
+    const body = JSON.parse(String((sendCalls().at(-1)?.[1] as RequestInit)?.body)) as {
+      actionId: string;
+      text: string;
+    };
+    expect(body.text).toBe(text);
+    expect(body.actionId).toBeTruthy();
+    return body.actionId;
+  }
+
+  async function sendDsh(state: "queued" | "accepted", text = "同一句话") {
+    routes.dshSend = (actionId) => receipt(actionId, state);
+    return submitDsh(text);
+  }
+
+  async function reply(
+    query: ReturnType<typeof installDsh>[number],
+    state: "accepted" | "succeeded",
+    target = targetA
+  ) {
+    await act(async () => {
+      query.resolve(
+        Response.json({
+          receipt: receipt(query.actionId, state),
+          target,
+          updatedAtMs: Date.now(),
+          evidence:
+            state === "succeeded"
+              ? {
+                  operation: "send",
+                  nativeId: query.actionId,
+                  epoch: target.epoch,
+                  effectKind: "message",
+                }
+              : null,
+        })
+      );
+    });
+  }
+
+  function postCount() {
+    return fetchMock.mock.calls.filter((call) => (call[1] as RequestInit)?.method === "POST")
+      .length;
+  }
+
+  beforeEach(() => {
+    sessionStorage.clear();
+  });
+
+  it("按动作 GET 推进排队、受理和宿主确认；DSH 成功仅保留 3 秒", async () => {
+    const queries = installDsh();
+    render(<MessageComposer session={instanceA} />);
+    await flushAsync();
+    const actionId = await sendDsh("queued");
+    expect(screen.getByText(/排队中/)).toBeTruthy();
+    expect(screen.queryByText(succeeded)).toBeNull();
+
+    await advance(999);
+    expect(queries).toHaveLength(0);
+    await advance(1);
+    expect(queries).toMatchObject([{ actionId, method: "GET" }]);
+    await reply(queries[0], "accepted");
+    expect(screen.getByText(accepted)).toBeTruthy();
+    expect(screen.queryByText(succeeded)).toBeNull();
+
+    await advance(5_000);
+    expect(queries).toMatchObject([
+      { actionId, method: "GET" },
+      { actionId, method: "GET" },
+    ]);
+    await reply(queries[1], "succeeded");
+    expect(screen.getByText(succeeded)).toBeTruthy();
+    expect(screen.queryByText(accepted)).toBeNull();
+    expect(screen.queryByText("已送达终端")).toBeNull();
+    await advance(2_999);
+    expect(screen.getByText(succeeded)).toBeTruthy();
+    await advance(1);
+    expect(screen.queryByText(succeeded)).toBeNull();
+    await advance(5_000);
+    expect(queries).toHaveLength(2);
+    expect(postCount()).toBe(1);
+  });
+
+  it("先发动作的迟到成功独立显示 3 秒，不盖掉同正文后发动作的受理态", async () => {
+    const queries = installDsh();
+    render(<MessageComposer session={instanceA} />);
+    await flushAsync();
+    const first = await sendDsh("queued");
+    await advance(1_000); // 第一笔查询已发出，在第二笔发送后才返回。
+    expect(queries).toMatchObject([{ actionId: first, method: "GET" }]);
+    const second = await sendDsh("accepted");
+    expect(first).not.toBe(second);
+    await advance(1_000);
+    expect(queries).toMatchObject([
+      { actionId: first, method: "GET" },
+      { actionId: second, method: "GET" },
+    ]);
+    expect(screen.getByText(accepted)).toBeTruthy();
+
+    await reply(queries[0], "succeeded");
+    expect(screen.getByText(succeeded)).toBeVisible();
+    expect(screen.getByText(accepted)).toBeVisible();
+    await advance(2_999);
+    expect(screen.getByText(succeeded)).toBeVisible();
+    await advance(1);
+    expect(screen.queryByText(succeeded)).toBeNull();
+    expect(screen.getByText(accepted)).toBeVisible();
+
+    await reply(queries[1], "succeeded");
+    expect(screen.queryByText(accepted)).toBeNull();
+    expect(screen.getByText(succeeded)).toBeVisible();
+    expect(postCount()).toBe(2);
+  });
+
+  it("身份未核实的重复 POST 不采信旧成功，即使查询回执与动作 ID 和目标吻合", async () => {
+    const queries = installDsh();
+    routes.dshDuplicate = true;
+    routes.dshSend = (actionId) => ({
+      ...receipt(actionId, "succeeded"),
+      reasonCode: "identity_unverified",
+    });
+    render(<MessageComposer session={instanceA} />);
+    await flushAsync();
+    const draft = "这条消息与旧动作的载荷未能核实";
+    const actionId = await submitDsh(draft);
+    expect(screen.getByText(unverified)).toBeVisible();
+    expect(screen.queryByText(succeeded)).toBeNull();
+
+    await advance(5_000);
+    // 可以从一开始就禁查；若发了 GET，旧账本会给出看似完整的成功证据。
+    for (const query of queries) {
+      expect(query).toMatchObject({ actionId, method: "GET" });
+      await reply(query, "succeeded");
+    }
+    expect(screen.queryByText(succeeded)).toBeNull();
+    expect(screen.getByText(unverified)).toBeVisible();
+    expect(screen.getByTestId("composer-input")).toHaveValue(draft);
+    expect(postCount()).toBe(1);
+  });
+
+  it.each(["挂起", "丢响应"] as const)(
+    "身份未核实后手动同 ID 重试%s，不恢复查询资格或显示旧成功",
+    async (failure) => {
+      const queries = installDsh();
+      routes.dshDuplicate = true;
+      routes.dshSend = (actionId) => ({
+        ...receipt(actionId, "succeeded"),
+        reasonCode: "identity_unverified",
+      });
+      render(<MessageComposer session={instanceA} />);
+      await flushAsync();
+      const draft = "同文重试仍不能确认旧动作的身份";
+      const actionId = await submitDsh(draft);
+      expect(screen.getByText(unverified)).toBeVisible();
+
+      if (failure === "挂起") routes.sendHang = true;
+      else {
+        routes.dshSend = () => {
+          throw new TypeError("connection lost on same-ID retry");
+        };
+      }
+      expect(await submitDsh(draft)).toBe(actionId);
+      expect(postCount()).toBe(2);
+      if (failure === "挂起") await advance(30_000);
+      await advance(1_000);
+
+      // 若错误地恢复了查账，返回与目标、动作 ID 均吻合的旧成功证据。
+      for (const query of queries) await reply(query, "succeeded");
+      expect(screen.queryByText(succeeded)).toBeNull();
+      expect(queries).toHaveLength(0);
+      expect(screen.getByText(unverified)).toBeVisible();
+      expect(screen.getByTestId("composer-input")).toHaveValue(draft);
+      expect(postCount()).toBe(2);
+    }
+  );
+
+  it("拒绝 actionId 不匹配的 DSH POST 成功回执，保留原草稿和重试锚", async () => {
+    const queries = installDsh();
+    // 故意模拟串回执：只有这个负例不回显 POST 的 actionId。
+    const wrongId = "0f000000-0000-4000-8000-000000000001";
+    routes.dshSend = () => receipt(wrongId, "succeeded");
+    render(<MessageComposer session={instanceA} />);
+    await flushAsync();
+    const draft = "不采信其他动作的成功回执";
+    const originalId = await submitDsh(draft);
+    expect(originalId).not.toBe(wrongId);
+    expect(screen.queryByText(succeeded)).toBeNull();
+    expect(screen.getByText(unverified)).toBeVisible();
+    expect(screen.getByTestId("composer-input")).toHaveValue(draft);
+    await advance(1_000);
+    expect(queries).toMatchObject([{ actionId: originalId, method: "GET" }]);
+    expect(postCount()).toBe(1);
+
+    routes.dshDuplicate = true;
+    routes.dshSend = (actionId) => receipt(actionId, "accepted");
+    expect(await submitDsh(draft)).toBe(originalId);
+    expect(postCount()).toBe(2);
+    expect(screen.getByText(accepted)).toBeVisible();
+  });
+
+  it("DSH POST 丢响应保持中性，沿提交生成的 ID 查原动作，不自动再 POST", async () => {
+    const queries = installDsh();
+    routes.dshSend = () => {
+      throw new TypeError("connection lost after sending POST");
+    };
+    render(<MessageComposer session={instanceA} />);
+    await flushAsync();
+    const draft = "响应丢失前可能已送达";
+    const actionId = await submitDsh(draft);
+    expect(screen.getByTestId("composer-input")).toHaveValue(draft);
+    expect(screen.getByText(unverified)).toBeVisible();
+    expect(screen.queryByTestId("send-receipt-failed")).toBeNull();
+    expect(screen.queryByText(succeeded)).toBeNull();
+
+    await advance(1_000);
+    expect(queries).toMatchObject([{ actionId, method: "GET" }]);
+    await reply(queries[0], "succeeded");
+    expect(screen.getByText(succeeded)).toBeVisible();
+    expect(screen.queryByText(unverified)).toBeNull();
+    await advance(30_000);
+    expect(postCount()).toBe(1);
+  });
+
+  it("DSH POST 尚未返回时刷新同一目标，1 秒后只查原动作，不重发", async () => {
+    const queries = installDsh();
+    routes.sendHang = true;
+    const original = render(<MessageComposer session={instanceA} />);
+    await flushAsync();
+    const actionId = await submitDsh("请求已发出，响应尚未到达");
+    expect(screen.getByTestId("send-receipt-delivering")).toBeVisible();
+    expect(postCount()).toBe(1);
+    original.unmount();
+
+    // 模拟同一标签页刷新：不放行 POST，也不预填会话存储。
+    render(<MessageComposer session={instanceA} />);
+    await flushAsync();
+    await advance(999);
+    expect(queries).toHaveLength(0);
+    await advance(1);
+    expect(queries).toMatchObject([{ actionId, method: "GET" }]);
+    await reply(queries[0], "succeeded");
+    expect(screen.getByText(succeeded)).toBeVisible();
+    expect(postCount()).toBe(1);
+  });
+
+  it("DSH POST 挂起 30 秒后显示待核实，只查原动作而不自动重发", async () => {
+    const queries = installDsh();
+    routes.sendHang = true;
+    render(<MessageComposer session={instanceA} />);
+    await flushAsync();
+    const draft = "未收到响应，先核对是否送达";
+    const actionId = await submitDsh(draft);
+    await advance(29_999);
+    expect(screen.getByTestId("send-receipt-delivering")).toBeVisible();
+
+    await advance(1);
+    expect(screen.getByText(unverified)).toBeVisible();
+    expect(screen.queryByTestId("send-receipt-delivering")).toBeNull();
+    expect(screen.queryByTestId("send-receipt-failed")).toBeNull();
+    expect(screen.queryByText(succeeded)).toBeNull();
+    expect(screen.getByTestId("composer-input")).toHaveValue(draft);
+
+    await advance(1_000);
+    expect(queries).toMatchObject([{ actionId, method: "GET" }]);
+    await reply(queries[0], "succeeded");
+    expect(screen.getByText(succeeded)).toBeVisible();
+    expect(postCount()).toBe(1);
+  });
+
+  it.each([
+    ["实例", { id: "session-dsh", dshInstanceId: "instance-B" }],
+    ["会话", { id: "session-other", dshInstanceId: "instance-A" }],
+  ] as const)("切换%s取消旧查询；即使响应随后到达也不显示旧成功", async (_scope, next) => {
+    const queries = installDsh();
+    const view = render(<MessageComposer session={instanceA} />);
+    await flushAsync();
+    const oldId = await sendDsh("accepted");
+    await advance(1_000);
+    expect(queries).toMatchObject([{ actionId: oldId, method: "GET" }]);
+
+    view.rerender(<MessageComposer session={next} />);
+    await flushAsync();
+    expect(queries[0].signal?.aborted).toBe(true);
+    await reply(queries[0], "succeeded");
+    expect(screen.queryByText(succeeded)).toBeNull();
+    await advance(5_000);
+    expect(queries).toHaveLength(1);
+    expect(postCount()).toBe(1);
+  });
+
+  it("查账断网或挂起最多消耗 30 秒前台窗口，回到前台只续查而不重发", async () => {
+    const queries = installDsh();
+    let visibility: DocumentVisibilityState = "visible";
+    const visibilityState = vi
+      .spyOn(document, "visibilityState", "get")
+      .mockImplementation(() => visibility);
+    const hidden = vi
+      .spyOn(document, "hidden", "get")
+      .mockImplementation(() => visibility === "hidden");
+    try {
+      render(<MessageComposer session={instanceA} />);
+      await flushAsync();
+      const actionId = await sendDsh("accepted");
+      await advance(1_000);
+      expect(queries).toMatchObject([{ actionId, method: "GET" }]);
+      await act(async () => queries[0].reject(new TypeError("network unavailable")));
+      expect(screen.getByText(unverified)).toBeTruthy();
+      expect(screen.queryByText(succeeded)).toBeNull();
+      expect(screen.queryByTestId("send-receipt-failed")).toBeNull();
+
+      await advance(29_000); // 下一次 GET 挂起；前台窗口仍须结束。
+      expect(queries.length).toBeGreaterThan(1);
+      const countAtDeadline = queries.length;
+      expect(queries.at(-1)?.signal?.aborted).toBe(true);
+      await advance(10_000);
+      expect(queries).toHaveLength(countAtDeadline);
+      expect(screen.getByText(unverified)).toBeTruthy();
+      expect(postCount()).toBe(1);
+
+      visibility = "hidden";
+      fireEvent(document, new Event("visibilitychange"));
+      visibility = "visible";
+      fireEvent(document, new Event("visibilitychange"));
+      await advance(1_000);
+      expect(queries.slice(countAtDeadline)).toMatchObject([{ actionId, method: "GET" }]);
+      await reply(queries[countAtDeadline], "succeeded");
+      expect(screen.getByText(succeeded)).toBeTruthy();
+      expect(postCount()).toBe(1);
+    } finally {
+      visibilityState.mockRestore();
+      hidden.mockRestore();
+    }
+  });
+
+  it("刷新同一目标补查未决动作，读到宿主结果但不重发", async () => {
+    const queries = installDsh();
+    const original = render(<MessageComposer session={instanceA} />);
+    await flushAsync();
+    const actionId = await sendDsh("accepted");
+    original.unmount();
+
+    // 重挂组件保留标签页会话存储，不预填实现专用键。
+    render(<MessageComposer session={instanceA} />);
+    await flushAsync();
+    await advance(1_000);
+    expect(queries).toMatchObject([{ actionId, method: "GET" }]);
+    await reply(queries[0], "succeeded");
+    expect(screen.getByText(succeeded)).toBeTruthy();
+    expect(postCount()).toBe(1);
+  });
+
+  it("普通终端投递继续显示原回执，不查询 DSH 账本", async () => {
+    const queries = installDsh();
+    routes.info = sendInfo();
+    render(<MessageComposer session={{ id: "terminal-session" }} />);
+    await flushAsync();
+    fireEvent.change(screen.getByTestId("composer-input"), { target: { value: "普通终端" } });
+    fireEvent.click(screen.getByTestId("composer-send"));
+    await flushAsync();
+    expect(screen.getByText("已送达终端")).toBeTruthy();
+    await advance(30_000);
+    expect(queries).toHaveLength(0);
+    expect(postCount()).toBe(1);
+  });
+});
+
 describe("MessageComposer：排队轮询（3s 定时器，unmount 清理）", () => {
   it("排队态 3s 轮询刷新队位；条目从队列消失则行收敛；卸载后停止轮询", async () => {
     vi.useFakeTimers();
@@ -738,6 +1180,71 @@ describe("MessageComposer：M9R 注入加固（P2-7 / 灰3 / P2-10）", () => {
     fireEvent.click(screen.getByTestId("composer-send"));
     const chip = await screen.findByTestId("send-receipt-failed");
     expect(chip.textContent).toContain("会话形态已漂移为黑盒，无法注入");
+  });
+
+  // R05（复审）：Composer 实际请求断言——DSH 会话 send-info 携带 instanceId；
+  // 非 DSH 不携带。URL 经 fetch 捕获钩子核验（不是只测后端传参）。
+  it("send-info request carries instanceId for dsh sessions", async () => {
+    installFetch();
+    (globalThis as unknown as { __sendInfoUrls?: string[] }).__sendInfoUrls = [];
+    routes.info = sendInfo({ channels: ["dsh_desktop"] });
+    // 唯一 session id 定位本用例请求（前序用例的迟到捕获不污染断言）
+    const uniqueId = "sess-instance-scope-check";
+    render(<MessageComposer session={{ id: uniqueId, dshInstanceId: "instance-A" }} />);
+    await screen.findByTestId("composer-input");
+    const urls = (globalThis as unknown as { __sendInfoUrls?: string[] }).__sendInfoUrls ?? [];
+    const mine = urls.filter(
+      (u) => u.includes("session-send-info") && u.includes(`session_id=${uniqueId}`)
+    );
+    expect(mine.length).toBeGreaterThan(0);
+    expect(mine.every((u) => u.includes("instanceId=instance-A"))).toBe(true);
+
+    // 非 DSH 对照：同机制渲染不携带 instanceId
+    const uniqueNonDsh = "sess-non-dsh-check";
+    render(<MessageComposer session={{ id: uniqueNonDsh }} />);
+    await screen.findByTestId("composer-input");
+    const mine2 = (
+      (globalThis as unknown as { __sendInfoUrls?: string[] }).__sendInfoUrls ?? []
+    ).filter((u) => u.includes("session-send-info") && u.includes(`session_id=${uniqueNonDsh}`));
+    expect(mine2.length).toBeGreaterThan(0);
+    expect(mine2.every((u) => !u.includes("instanceId"))).toBe(true);
+  });
+
+  it("DSH 会话可以添加通用附件", async () => {
+    installFetch();
+    routes.info = sendInfo({ channels: ["dsh_desktop"] });
+    render(<MessageComposer session={{ id: "sess-1" }} />);
+    await screen.findByTestId("composer-input");
+    expect((screen.getByTestId("attach-add") as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it("dsh_unknown_keeps_action_id：unknown_delivery 回执保留幂等键——重按同 ID（不双投）（P1-C 复审）", async () => {
+    installFetch();
+    routes.info = sendInfo({ channels: ["dsh_desktop"] });
+    // 第一次发送：原生已受理但落库失败 → 服务端按执行相位回 unknown_delivery。
+    routes.dshSend = (actionId) => ({
+      actionId,
+      state: "unknown_delivery",
+      nativeId: null,
+      reasonCode: "dsh_ledger_write_failed",
+    });
+    render(<MessageComposer session={{ id: "sess-1" }} />);
+    const input = await screen.findByTestId("composer-input");
+    fireEvent.change(input, { target: { value: "同一句话" } });
+    fireEvent.click(screen.getByTestId("composer-send"));
+    await screen.findByText(/待核实|投递结果未知/);
+    // 草稿保留（unknown 不清稿），锚保留。
+    expect((input as HTMLTextAreaElement).value).toBe("同一句话");
+    fireEvent.click(screen.getByTestId("composer-send"));
+    await waitFor(() => {
+      expect(sendCalls().length).toBe(2);
+    });
+    const bodyOf = (call: unknown[]) => JSON.parse(String((call[1] as RequestInit)?.body ?? "{}"));
+    const firstBody = bodyOf(sendCalls()[0]);
+    const secondBody = bodyOf(sendCalls()[1]);
+    expect(firstBody.actionId).toBeTruthy();
+    // 重按必须复用同幂等键（防双投）
+    expect(secondBody.actionId).toBe(firstBody.actionId);
   });
 
   it("queued position=0 容忍：并发消费窗口返回位次 0 → 行显示「排队中」不带位次数字，按钮保留", async () => {
@@ -1122,6 +1629,31 @@ describe("移动端附件上传（2026-09-20）", () => {
     await screen.findByTestId("send-receipt-delivered");
   }
 
+  it("DSH 上传与标记发送都绑定卡片实例", async () => {
+    installFetch();
+    routes.info = sendInfo({ channels: ["dsh_desktop"] });
+    routes.dshSend = (actionId) => ({
+      actionId,
+      state: "accepted",
+      nativeId: "n",
+      reasonCode: null,
+    });
+    routes.attach = { path: "/project/.tuvis-attachments/sess-1/note.png", size: 2 };
+    render(<MessageComposer session={{ id: "sess-1", dshInstanceId: "instance-A" }} />);
+    const input = await screen.findByTestId("composer-input");
+    fireEvent.change(input, { target: { value: "请看" } });
+    fireEvent.change(screen.getByTestId("attach-file-input"), {
+      target: { files: [pngFile("note.png")] },
+    });
+    await screen.findByText("note.png");
+    expect(attachOpens.some((url) => url.includes("instanceId=instance-A"))).toBe(true);
+    fireEvent.click(screen.getByTestId("composer-send"));
+    await waitFor(() => expect(sendCalls().length).toBe(1));
+    const body = JSON.parse(String((sendCalls()[0]![1] as RequestInit).body));
+    expect(body.instanceId).toBe("instance-A");
+    expect(body.text).toContain('<image path="/project/.tuvis-attachments/sess-1/note.png">');
+  });
+
   it("选文件上传：chip 状态机 uploading→ready；发送文本含 <image path> 标记行", async () => {
     await sendIntoQueuedWithAttachment();
     const sendCall = sendCalls()[0];
@@ -1435,6 +1967,58 @@ describe("移动端附件上传（2026-09-20）", () => {
     expect(screen.queryByTestId("composer-bw-note")).toBeNull();
     // 输入区照常可用（不因装饰失败而禁用）
     expect((screen.getByTestId("composer-input") as HTMLTextAreaElement).disabled).toBe(false);
+  });
+
+  describe("A05：macOS DSH 附件不可用", () => {
+    async function renderDshComposerWithAttachmentRefusal() {
+      installFetch();
+      const info = {
+        ...sendInfo({ channels: ["dsh_desktop"] }),
+        attachmentUnavailableReasonCode: "DSH_ATTACHMENT_MACOS_UNSAFE",
+      };
+      routes.info = info;
+      render(<MessageComposer session={{ id: "sess-1", dshInstanceId: "instance-A" }} />);
+      return (await screen.findByTestId("composer-input")) as HTMLTextAreaElement;
+    }
+
+    it("在选择文件前禁用添加附件，同时保留文字输入", async () => {
+      const input = await renderDshComposerWithAttachmentRefusal();
+      expect(screen.getByTestId("attach-add")).toBeDisabled();
+      expect(input).toBeEnabled();
+    });
+
+    it("在选择文件前显示 macOS 无法保证写入目录归属的原因", async () => {
+      await renderDshComposerWithAttachmentRefusal();
+      expect(screen.getByText(/macOS.*(?:目录|路径).*(?:归属|安全)/i)).toBeVisible();
+    });
+
+    it("粘贴图片时不发起上传", async () => {
+      const input = await renderDshComposerWithAttachmentRefusal();
+      const opensBeforePaste = attachOpens.length;
+      fireEvent.paste(input, { clipboardData: { files: [pngFile("a05-paste.png")] } });
+      expect(attachOpens.length - opensBeforePaste).toBe(0);
+    });
+  });
+
+  it.each([
+    ["DSH_INSTANCE_SWITCHED", "所选实例已变化"],
+    ["DSH_HOST_NOT_RUNNING", "DeepSeek Harness 桌面端未在运行"],
+    ["DSH_SESSION_OWNERSHIP_UNPROVEN", "无法证明该会话由所选实例提供"],
+    ["DSH_SUBAGENT_READONLY", "子 Agent 会话只读"],
+  ])("附件错误 %s 显示正确恢复提示", async (code, expected) => {
+    installFetch();
+    routes.info = sendInfo({ channels: ["dsh_desktop"] });
+    routes.attachStatus = 403;
+    routes.attachError = "dsh_attachment_unavailable";
+    routes.attachReasonCode = code;
+    render(<MessageComposer session={{ id: "sess-1", dshInstanceId: "instance-A" }} />);
+    await screen.findByTestId("composer-input");
+    fireEvent.change(screen.getByTestId("attach-file-input"), {
+      target: { files: [pngFile("bad.png")] },
+    });
+    const chip = await screen.findByText("失败：bad.png", { exact: false });
+    expect(chip.textContent).toContain(expected);
+    expect(chip.textContent).not.toContain("设备失效");
   });
 
   it("404 no_cwd：chip 标失败 + 「+」钮禁用（与 resume 禁用口径同源）", async () => {
@@ -3207,4 +3791,149 @@ describe("OpenCode 原生默认入口", () => {
     );
     expect(probes).toHaveLength(0);
   });
+});
+
+// ============================================================
+// P2（第四轮复审）：锚三行为连续操作——
+// ① failed（明确拒绝）→ 重按 = 新 ID 真重试（不清锚会永远重放旧失败）；
+// ② duplicate accepted（重放已终结）→ 之后同文再发 = 新 ID 新动作
+//    （不清锚会命中旧动作静默不发送）。
+// ============================================================
+
+it.each([
+  { status: 403, reasonCode: "DSH_SESSION_OWNERSHIP_UNPROVEN" },
+  { status: 403, reasonCode: "DSH_INSTANCE_SWITCHED" },
+  { status: 503, reasonCode: "DSH_SWITCH_OFF", retrySameAction: true },
+])(
+  "DSH 发送遇 $status $reasonCode 后保留草稿与原 actionId",
+  async ({ status, reasonCode, retrySameAction }) => {
+    installFetch();
+    routes.info = sendInfo({ channels: ["dsh_desktop"] });
+    routes.sendStatus = status;
+    routes.sendBody = { error: reasonCode, reasonCode, retrySameAction };
+    render(<MessageComposer session={{ id: "sess-1" }} />);
+    const input = (await screen.findByTestId("composer-input")) as HTMLTextAreaElement;
+    const draft = "保留这条尚未确认的消息";
+    fireEvent.change(input, { target: { value: draft } });
+    fireEvent.click(screen.getByTestId("composer-send"));
+    if (status === 503) {
+      expect(
+        await screen.findByText("DSH 投递待核实，不会自动重发", { selector: '[role="status"]' })
+      ).toBeVisible();
+      expect(screen.queryByTestId("send-receipt-failed")).toBeNull();
+    } else {
+      await screen.findByTestId("send-receipt-failed");
+    }
+    expect(input.value).toBe(draft);
+    const firstBody = String((sendCalls()[0][1] as RequestInit).body);
+    expect(JSON.parse(firstBody)).toMatchObject({ actionId: expect.any(String) });
+
+    await waitFor(() => expect(screen.getByTestId("composer-send")).toBeEnabled());
+    fireEvent.click(screen.getByTestId("composer-send"));
+    await waitFor(() => expect(sendCalls()).toHaveLength(2));
+    expect((sendCalls()[1][1] as RequestInit).body).toBe(firstBody);
+    expect(input.value).toBe(draft);
+  }
+);
+
+it("dsh_failed_retry_gets_fresh_id：明确失败清锚——重按 = 新 actionId 真重试（P2）", async () => {
+  installFetch();
+  routes.info = sendInfo({ channels: ["dsh_desktop"] });
+  // 第一次：明确失败（服务端拒绝）。
+  routes.dshSend = (actionId) => ({
+    actionId,
+    state: "failed",
+    nativeId: null,
+    reasonCode: "gateway/arguments-invalid",
+  });
+  render(<MessageComposer session={{ id: "sess-1" }} />);
+  const input = await screen.findByTestId("composer-input");
+  fireEvent.change(input, { target: { value: "同一句话" } });
+  fireEvent.click(screen.getByTestId("composer-send"));
+  await screen.findByTestId("send-receipt-failed");
+  // 草稿保留（failed 不清稿），重按 = 新 actionId 真重试。
+  expect(input).toHaveValue("同一句话");
+  expect(sendCalls()).toHaveLength(1);
+  const firstBody = JSON.parse(String((sendCalls()[0][1] as RequestInit).body));
+  expect(firstBody).toMatchObject({ text: "同一句话", actionId: expect.any(String) });
+  fireEvent.click(screen.getByTestId("composer-send"));
+  await waitFor(() => expect(sendCalls()).toHaveLength(2));
+  const secondBody = JSON.parse(String((sendCalls()[1][1] as RequestInit).body));
+  expect(secondBody).toMatchObject({ text: firstBody.text, actionId: expect.any(String) });
+  expect(secondBody.actionId).not.toBe(firstBody.actionId);
+});
+
+it("dsh_duplicate_accepted_then_resend：duplicate 已终结态清锚——同文再发 = 新 ID 新动作（P2）", async () => {
+  installFetch();
+  routes.info = sendInfo({ channels: ["dsh_desktop"] });
+  routes.dshSend = () => {
+    throw new TypeError("宿主受理后连接断开");
+  };
+  render(<MessageComposer session={{ id: "sess-1" }} />);
+  const input = await screen.findByTestId("composer-input");
+  const draft = "重放后的新发送";
+  fireEvent.change(input, { target: { value: draft } });
+  fireEvent.click(screen.getByTestId("composer-send"));
+  await screen.findByText(/待核实/);
+  expect(sendCalls()).toHaveLength(1);
+  expect(input).toHaveValue(draft);
+  const firstBody = JSON.parse(String((sendCalls()[0][1] as RequestInit).body));
+  expect(firstBody.actionId).toEqual(expect.any(String));
+
+  // 重放回执应回显同一 POST 的 ID；受理清稿后，用户再输入同文才是新动作。
+  routes.dshDuplicate = true;
+  routes.dshSend = (actionId) => ({
+    actionId,
+    state: "accepted",
+    nativeId: "n-old",
+    reasonCode: null,
+  });
+  fireEvent.click(screen.getByTestId("composer-send"));
+  await screen.findByText(/DSH 已受理/);
+  expect(sendCalls()).toHaveLength(2);
+  expect(JSON.parse(String((sendCalls()[1][1] as RequestInit).body))).toEqual(firstBody);
+  expect(input).toHaveValue("");
+
+  routes.dshDuplicate = undefined;
+  routes.dshSend = (actionId) => ({
+    actionId,
+    state: "accepted",
+    nativeId: "n-new",
+    reasonCode: null,
+  });
+  fireEvent.change(input, { target: { value: draft } });
+  fireEvent.click(screen.getByTestId("composer-send"));
+  await waitFor(() => expect(sendCalls()).toHaveLength(3));
+  const thirdBody = JSON.parse(String((sendCalls()[2][1] as RequestInit).body));
+  expect(thirdBody).toMatchObject({ text: draft, actionId: expect.any(String) });
+  expect(thirdBody.actionId).not.toBe(firstBody.actionId);
+});
+
+it("dsh_identity_unverified_keeps_anchor：旧终态行身份无法确证——duplicate 保留原锚（P2 第六轮）", async () => {
+  installFetch();
+  routes.info = sendInfo({ channels: ["dsh_desktop"] });
+  // 服务端对 identity_unverified 的旧行回 duplicate（保守语义）。
+  routes.dshDuplicate = true;
+  routes.dshSend = (actionId) => ({
+    actionId,
+    state: "accepted",
+    nativeId: "n-old",
+    reasonCode: "identity_unverified",
+  });
+  render(<MessageComposer session={{ id: "sess-1" }} />);
+  const input = await screen.findByTestId("composer-input");
+  fireEvent.change(input, { target: { value: "旧动作的重放" } });
+  fireEvent.click(screen.getByTestId("composer-send"));
+  await waitFor(() => {
+    expect(sendCalls().length).toBe(1);
+  });
+  const firstBody = JSON.parse(String((sendCalls()[0][1] as RequestInit)?.body ?? "{}"));
+  // 草稿保留（identity_unverified 不清稿不清锚）→ 重按 = 同 ID 幂等重放（零双投）。
+  expect((input as HTMLTextAreaElement).value).toBe("旧动作的重放");
+  fireEvent.click(screen.getByTestId("composer-send"));
+  await waitFor(() => {
+    expect(sendCalls().length).toBe(2);
+  });
+  const secondBody = JSON.parse(String((sendCalls()[1][1] as RequestInit)?.body ?? "{}"));
+  expect(secondBody.actionId).toBe(firstBody.actionId);
 });

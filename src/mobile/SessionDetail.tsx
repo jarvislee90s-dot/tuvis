@@ -23,6 +23,7 @@ import {
   ArrowUpToLine,
   ChevronDown,
   ChevronRight,
+  ExternalLink,
   PanelLeft,
   RotateCw,
   X,
@@ -37,6 +38,9 @@ import SubagentChips from "./SubagentChips";
 import SubagentDetail from "./SubagentDetail";
 import SubagentList from "./SubagentList";
 import QuestionCard from "./QuestionCard";
+import DshSessionSettings from "./DshSessionSettings";
+import { useDshTurnControl } from "./useDshTurnControl";
+import { useDshSessionQuestions } from "./DshSessionQuestions";
 // Codex Desktop IPC：原生投影接管内容源与交互卡（Codex APP 会话）
 import CodexQueuePanel from "./CodexQueuePanel";
 import PendingRequestCard, { CodexAvailabilityBanner } from "./PendingRequestCard";
@@ -89,16 +93,20 @@ import MessageComposer, { type ComposerDraftRequest } from "./MessageComposer";
 import ZcodeControlPanel from "./ZcodeControlPanel";
 // T05：页面共享停止控制器（composer 主按钮/紧凑入口与队列面板打断共用同一实例）
 import { useCodexTurnControl } from "./useCodexTurnControl";
+import DshInlineMedia from "./DshInlineMedia";
+import type { DshMediaReference, DshModelSummary } from "./api";
 import PreviewModeSwitcher, { type PreviewMode } from "./PreviewModeSwitcher";
 import SplitHandle from "./SplitHandle";
 import {
   ApiError,
+  consoleEntryErrorCopy,
   fetchSessionFiles,
   fetchSessionMessages,
   fetchSessionSubagents,
   type SessionFileEntry,
   type SessionMessage,
   type SubagentView,
+  fetchConsoleEntry,
 } from "./api";
 import { STATUS_DOT_COLOR, TOOL_LABEL_KEYS } from "./board-logic";
 import {
@@ -150,7 +158,10 @@ interface SessionDetailProps {
  *    从消息正文链接 / chip 直达进入 → 无返回按钮，既有行为不变） */
 type PreviewState = {
   sheet: "files" | "subagents";
-  open: { kind: "none" } | { kind: "file"; path: string } | { kind: "subagent"; id: string };
+  open:
+    | { kind: "none" }
+    | { kind: "file"; path: string; mediaRefId?: string }
+    | { kind: "subagent"; id: string };
   mode: PreviewMode;
   backToList: boolean;
   /** 显式打开计数（Task 6）：每次用户显式打开文件 +1，作为 FilePreview 的刷新键
@@ -422,7 +433,7 @@ export default function SessionDetail(props: SessionDetailProps) {
   const { agentType, id, form } = props.session;
   const appForm = agentType === "codex" && form === "app";
   // 同线程切换 App/CLI 时保留发送组件；跨会话才重挂。
-  const sessionKey = JSON.stringify([agentType, id]);
+  const sessionKey = JSON.stringify([agentType, props.session.dshInstanceId, id]);
   const [composerDrafts, setComposerDrafts] = useState<
     Record<string, { text: string; revision: number }>
   >({});
@@ -1147,12 +1158,19 @@ function SessionDetailContent({
   // 该会话涉及的文件（/session-files 提取结果，M3+）：一份数据两用——
   // fileEntries 驱动文件面板列表，派生 Set 驱动正文路径链接化
   const [fileEntries, setFileEntries] = useState<SessionFileEntry[]>([]);
+  const [fileMedia, setFileMedia] = useState<DshMediaReference[]>([]);
   const [fileTruncated, setFileTruncated] = useState(false);
   // 子 agent 全量名单（观察台 §二）：单一数据源供三处消费——chip（过滤 running）/
   // 文件面板卡区（全量绿灰点）/ 详情对话框（status 查询）。拉取 effect 在下方
   // 文件表拉取旁；**finished 只付首拉一次**（tick 冻结为 0，见 effect 注）；
   // 失败静默保留上一份（不闪断），首拉失败维持 null（卡区/chip 不渲染）
   const [subagentList, setSubagentList] = useState<SubagentView[] | null>(null);
+  // H11：控制台入口——**新浏览上下文**打开，原页面 URL/滚动/草稿一律不变。
+  // 打开失败如实提示，不假装已打开；弹窗被拦截时给出可操作说明。
+  const [consoleOpening, setConsoleOpening] = useState(false);
+  const [consoleError, setConsoleError] = useState<string | null>(null);
+  // T3（spec §5.1）：弹窗被拦截时的「在新页面打开」兜底链接（相对能力路径）。
+  const [consoleFallback, setConsoleFallback] = useState<string | null>(null);
   const subagentTick = session.status === "finished" ? 0 : refreshTick;
   // 追溯档位（M3+ 用户裁决 3）：面板三档 200/500/1000，切档重拉
   const [fileScope, setFileScope] = useState<number>(FILE_DEFAULT_SCOPE);
@@ -1202,6 +1220,8 @@ function SessionDetailContent({
   const viewportKind = useViewportKind();
   // 预览态初值按当前方向给默认（U2/U3）：横屏 = 右栏文件看板 + 左右分屏；竖屏 = null = 聊天框。
   // 用 lazy initializer 而非「先 null 再 effect 补齐」——后者会先画一帧纯聊天再弹出右栏
+  // N06：该会话的只读模型摘要（DSH 专属；缺失 = 无证不显示）。
+  const [dshModelSummary, setDshModelSummary] = useState<DshModelSummary | null>(null);
   const [preview, setPreview] = useState<PreviewState | null>(() =>
     defaultPreviewFor(viewportKind)
   );
@@ -1344,11 +1364,12 @@ function SessionDetailContent({
     let alive = true;
     setLoading(true);
     setError(null);
-    fetchSessionMessages(session.agentType, session.id, limit)
+    fetchSessionMessages(session.agentType, session.id, limit, session.dshInstanceId)
       .then((pg) => {
         if (!alive) return;
         setMessages(pg.messages);
         setTruncated(pg.truncated);
+        setDshModelSummary(pg.dshModelSummary ?? null);
       })
       .catch((e: unknown) => {
         if (alive) setError({ status: e instanceof ApiError ? e.status : null });
@@ -1359,7 +1380,7 @@ function SessionDetailContent({
     return () => {
       alive = false;
     };
-  }, [session.agentType, session.id, limit, refreshTick]);
+  }, [session.agentType, session.id, session.dshInstanceId, limit, refreshTick]);
 
   // F6：页面可见期间每 10s 静默轮询刷新会话内容。复用 refreshTick 信号走上方既有
   // 重拉链路（拉取 / alive 清理 / 错误态单点），手动刷新与看板 SSE 均零改动。
@@ -1374,6 +1395,10 @@ function SessionDetailContent({
       const el = messageAreaRef.current;
       if (!nativeConversation) pollFollowRef.current = el === null || isNearBottom(el);
       setRefreshTick((t) => t + 1);
+      // P1-4：同一拍推进 send-info 刷新信号（复用既有信号与轮询面，不新增轮询）——
+      // DSH 恢复等后端真实状态变化在一个轮询周期内反映到发送就绪态（输入框不再
+      // 停在灰色直到手动刷新）；composer 侧仍以 send-info 响应为唯一权威。
+      setSendInfoTick((t) => t + 1);
     };
     let timer: ReturnType<typeof setInterval> | null = null;
     const stop = () => {
@@ -1401,23 +1426,54 @@ function SessionDetailContent({
   }, [session.agentType, session.id, nativeConversation]);
 
   // 文件表拉取（M3+）：挂载 / 切档时重拉。挂载那次（scope=200）即面板首次打开
-  // 复用的数据（一次拉取两用，用户裁决 3 的附带口径）；失败已由 api 层静默降级
+  // 复用的数据（一次拉取两用，用户裁决 3 的附带口径）；失败已由 api 层静默降级。
+  //
+  // N04：面板**已打开**时，宿主在会话里写入新文件（工具改写）也必须自己出现——
+  // 旧实现只在挂载/切档时拉一次，用户得切追溯档或重开面板才看得到。这里复用既有
+  // 正文刷新周期（`refreshTick`，10s + 可见性补拍，不新增定时器），并且只在面板
+  // 打开（或首次挂载/切档）时拉取，隐藏与关闭零增量请求。
+  //
+  // 迟到响应防串：请求序号 + 目标哨兵（实例/会话/档位）。只有最新一次请求且目标
+  // 未变才落地；换实例、换会话、换档位后旧回包一律丢弃，不会把 B 的列表写进 A。
+  const filePanelOpen = preview !== null && preview.sheet === "files";
+  // 面板打开期间跟随正文刷新周期；关闭时钉在 0（依赖数组需可静态分析的标量）。
+  const fileRefreshTick = filePanelOpen ? refreshTick : 0;
+  const fileRequestSeq = useRef(0);
+  const fileTargetRef = useRef<string>("");
   useEffect(() => {
+    const target = JSON.stringify([
+      session.agentType,
+      session.dshInstanceId ?? null,
+      session.id,
+      fileScope,
+    ]);
+    fileTargetRef.current = target;
+    const seq = ++fileRequestSeq.current;
     let alive = true;
     setFileLoading(true);
-    fetchSessionFiles(session.agentType, session.id, fileScope)
+    fetchSessionFiles(session.agentType, session.id, fileScope, session.dshInstanceId)
       .then((pg) => {
         if (!alive) return;
+        // 双重哨兵：卸载/目标变化 + 请求序号（并发时只认最后一次）。
+        if (fileTargetRef.current !== target || seq !== fileRequestSeq.current) return;
         setFileEntries(pg.files);
+        setFileMedia(pg.media ?? []);
         setFileTruncated(pg.truncated);
       })
       .finally(() => {
-        if (alive) setFileLoading(false);
+        if (alive && seq === fileRequestSeq.current) setFileLoading(false);
       });
     return () => {
       alive = false;
     };
-  }, [session.agentType, session.id, fileScope]);
+  }, [
+    session.agentType,
+    session.id,
+    session.dshInstanceId,
+    fileScope,
+    // 面板打开期间跟随正文刷新周期（隐藏时 refreshTick 本身停拍，零增量请求）。
+    fileRefreshTick,
+  ]);
 
   // 子 agent 全量名单拉取（观察台 §二，state 见上方 subagentList）：挂载 +
   // subagentTick 变化时重拉。subagentTick = refreshTick（10s 轮询 + 手动刷新
@@ -1427,7 +1483,7 @@ function SessionDetailContent({
   // 停拍；chip 的 finished 挂载门仍在 cardDock）
   useEffect(() => {
     let alive = true;
-    fetchSessionSubagents(session.agentType, session.id)
+    fetchSessionSubagents(session.agentType, session.id, session.dshInstanceId)
       .then((v) => {
         if (alive) setSubagentList(v);
       })
@@ -1437,7 +1493,53 @@ function SessionDetailContent({
     return () => {
       alive = false;
     };
-  }, [session.agentType, session.id, subagentTick]);
+  }, [session.agentType, session.id, session.dshInstanceId, subagentTick]);
+
+  // H11：打开 DSH 控制台。
+  //
+  // 语义要点（与 spec §4/N06 对齐）：
+  // * 入口 URL 是**相对能力路径**，由浏览器按当前渠道 origin 解析；
+  // * `window.open` 只开新上下文，当前页不导航、不改 URL、不丢滚动与草稿；
+  // * 控制台自身跑在 opaque sandbox 里，拿不到兔维斯的设备权限；
+  // * 被拦截或入口不可用时如实报错，绝不静默失败。
+  //
+  // T3（spec §5.1）：弹窗被拦截时仍完成签发+兑换，并给出可点击的
+  // 「在新页面打开」兜底链接（target=_blank + noopener——链接点击是新的用户
+  // 手势，不会再被拦截；原页不导航、草稿与阅读位置保留）。入口/兑换失败按
+  // 安全错误码映射可操作文案（设备授权过期 / 实例不可用 / 网页凭据未就绪 /
+  // 换代失效分开呈现），不折叠成一句通用失败。
+  const openConsole = useCallback(async () => {
+    if (consoleOpening) return;
+    setConsoleOpening(true);
+    setConsoleError(null);
+    setConsoleFallback(null);
+    // 同步开空白页：必须发生在用户手势内，否则浏览器按弹窗拦截。
+    // 不能传 `noopener`——带 noopener 时 `window.open` 恒返回 null，
+    // 用它判断「是否被拦截」会把成功打开误报成拦截。因此先开 about:blank，
+    // 拿到句柄后再 `opener = null` 断链并导航到能力路径。
+    const opened = window.open("about:blank", "_blank");
+    // 断链必须**同步**完成（签发/兑换的网络等待之前）——about:blank 继承本页
+    // origin，句柄不能在等待期间带着 opener 悬置。
+    if (opened !== null) opened.opener = null;
+    try {
+      const entry = await fetchConsoleEntry(session.id, session.dshInstanceId);
+      if (opened === null) {
+        // 弹窗被拦截：不导航原页；签发/兑换已就绪 → 兜底链接接手。
+        setConsoleError(i18n.t("mobile.console.popupBlocked"));
+        setConsoleFallback(entry.url);
+        return;
+      }
+      opened.location.replace(entry.url);
+    } catch (e) {
+      // 入口不可用：关掉刚开的空白页，不留空白标签，也不假装已打开。
+      opened?.close();
+      const err = e instanceof ApiError ? e : null;
+      const code = typeof err?.data?.error === "string" ? err.data.error : null;
+      setConsoleError(consoleEntryErrorCopy(code));
+    } finally {
+      setConsoleOpening(false);
+    }
+  }, [consoleOpening, session.id, session.dshInstanceId]);
 
   // 链接化 Set（派生自面板条目，单一数据源）：正文路径匹配用
   const files = useMemo(() => new Set(fileEntries.map((e) => e.path)), [fileEntries]);
@@ -1533,6 +1635,16 @@ function SessionDetailContent({
       openSeq: (p?.openSeq ?? 0) + 1,
     }));
   }, []);
+
+  const openDshMedia = (item: DshMediaReference, backToList = false) => {
+    setPreview((previous) => ({
+      sheet: "files",
+      open: { kind: "file", path: item.name, mediaRefId: item.refId },
+      mode: (backToList ? previous?.mode : undefined) ?? defaultPreviewMode(),
+      backToList,
+      openSeq: (previous?.openSeq ?? 0) + 1,
+    }));
+  };
 
   // chip 直达子 agent 详情（观察台 §二.4）：切到 subagents sheet 并选中该 agent。
   // 2026-10-09 sheet 两层级导航裁决：子 Agent sheet 不做预览区内分屏，清单与详情
@@ -1788,7 +1900,8 @@ function SessionDetailContent({
     // P2-B：手动刷新（页头刷新按钮 / 错误重试）无条件落底，保留既有行为
     pollFollowRef.current = true;
     setRefreshTick((t) => t + 1);
-  }, []);
+    if (session.agentType === "dsh") bumpSendInfo();
+  }, [session.agentType, bumpSendInfo]);
 
   // ---- R5 一键 resume（在电脑上打开，Task 11）----
   // 2026-09-20 归档区裁决 2（spec 2026-09-20-mobile-archive-history，验收 E-6）：
@@ -1964,6 +2077,33 @@ function SessionDetailContent({
     setBookmarkJumpMiss(true);
   }, [messages, scrollAnchorIntoView]);
 
+  const dshQuestionInstance = session.agentType === "dsh" ? session.dshInstanceId : undefined;
+  const lastDshInput = dshQuestionInstance
+    ? messages
+        ?.slice()
+        .reverse()
+        .find((message) => message.kind !== "thinking")
+    : undefined;
+  const dshTranscriptWaiting =
+    !isSummary &&
+    lastDshInput?.kind === "tool-call" &&
+    lastDshInput.toolName === "ask_user_question";
+  const { renderQuestions: renderDshQuestions, groupKey: dshQuestionKey } = useDshSessionQuestions(
+    dshQuestionInstance,
+    session.id,
+    refreshTick,
+    dshTranscriptWaiting ? (lastDshInput?.seq ?? null) : null
+  );
+  const dshQuestionCard =
+    dshQuestionInstance &&
+    renderDshQuestions(
+      dshTranscriptWaiting && (
+        <p className="px-3 text-xs text-[var(--mut)]">
+          {i18n.t("mobile.dshQuestions.consoleFallback")}
+        </p>
+      ),
+      !isSummary
+    );
   // 进入详情默认滚到最底部（最新消息在下方，用户裁决 2026-09-16）；且
   // 「加载更早消息」重拉后**保持原阅读位置**——记录重拉前的滚动高度差，
   // 新内容（更早消息）插在顶部后把差值补回去，视线不跳。
@@ -1984,7 +2124,7 @@ function SessionDetailContent({
     }
     if (!pollFollowRef.current) return; // P2-B：上翻阅读中的轮询刷新不动滚动位置
     el.scrollTop = el.scrollHeight; // 首次（或手动刷新后）落到底部
-  }, [messages, nativeConversation]);
+  }, [messages, nativeConversation, dshQuestionKey]);
 
   useLayoutEffect(() => {
     const el = messageAreaRef.current;
@@ -2207,6 +2347,7 @@ function SessionDetailContent({
   // （M9R P3），key 必须互异（approve-/question-/mode-/composer- 前缀）——同 key
   // 兄弟在红卡「停留期间插入/卸载」时会让 React 同 key 复用错乱（duplicate key
   // 警告 + 红卡卸不掉）。
+  const dshTurnControl = useDshTurnControl(session, refreshTick);
   /** 任务 9（R-2）：旧写控件区的挂载规则——
    *  - 不可能是原生的会话（Codex / Claude / Kimi…）：**首帧就挂**，与历史行为逐字一致
    *    （绝不因为一条 send-info 而延后审批 UI）；
@@ -2525,7 +2666,7 @@ function SessionDetailContent({
             keepEditDraftOnUnmount
             turnControl={appForm ? codexTurnControl : undefined}
           />
-          {!codexProjectionActive && !isSummary && !appForm && (
+          {!codexProjectionActive && !isSummary && !appForm && !dshQuestionInstance && (
             <QuestionCard key={`question-${session.id}`} session={session} fontScale={fontScale} />
           )}
         </>
@@ -2541,7 +2682,8 @@ function SessionDetailContent({
         // ZCode：原生 pending 只在 `ZcodeControlPanel` 里渲染（R1）；旧终端问答卡
         // 一律不挂载——它不是原生降级卡，残留只会与官方卡并存。
         !isSummary &&
-        !isZcodeSession && (
+        !isZcodeSession &&
+        !dshQuestionInstance && (
           <QuestionCard key={`question-${session.id}`} session={session} fontScale={fontScale} />
         )
       )}
@@ -2559,6 +2701,46 @@ function SessionDetailContent({
             list={subagentList}
             onOpenDetail={openSubagent}
           />
+        )}
+        {session.agentType === "dsh" && (
+          <button
+            type="button"
+            data-testid="open-dsh-console"
+            disabled={consoleOpening}
+            onClick={() => void openConsole()}
+            className="inline-flex shrink-0 items-center gap-1.5 rounded-full border border-blue-500/70 bg-blue-50 px-2.5 py-1 text-xs font-medium text-blue-700 transition-colors hover:bg-blue-100 focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:outline-none disabled:opacity-50 dark:border-blue-400/60 dark:bg-blue-400/10 dark:text-blue-300 dark:hover:bg-blue-400/20"
+          >
+            <ExternalLink aria-hidden="true" size={12} />
+            {i18n.t("mobile.console.open")}
+          </button>
+        )}
+        {dshQuestionInstance && (
+          <DshSessionSettings
+            key={JSON.stringify([dshQuestionInstance, session.id])}
+            instanceId={dshQuestionInstance}
+            sessionId={session.id}
+            refreshTick={refreshTick}
+            running={dshTurnControl.running}
+            history={dshModelSummary}
+          />
+        )}
+        {session.agentType === "dsh" && consoleError !== null && (
+          <span data-testid="dsh-console-error" className="text-xs text-rose-600">
+            {consoleError}
+          </span>
+        )}
+        {/* T3（spec §5.1）：弹窗被拦截后的兜底入口——新上下文打开控制台，
+            noopener 断开 opener 控制，原页不导航。 */}
+        {session.agentType === "dsh" && consoleFallback !== null && (
+          <a
+            data-testid="dsh-console-fallback"
+            href={consoleFallback}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="text-xs text-[var(--tx)] underline underline-offset-2"
+          >
+            {i18n.t("mobile.console.fallbackLink")}
+          </a>
         )}
       </div>
     </div>
@@ -2583,7 +2765,7 @@ function SessionDetailContent({
         draftText={draftText}
         draftTextRevision={draftTextRevision}
         onDraftTextChange={changeDraftText}
-        key={`composer-${session.id}`}
+        key={`composer-${session.agentType}-${session.dshInstanceId ?? ""}-${session.id}`}
         session={session}
         onQueueChanged={bumpQueue}
         onSendGate={setCodexSendGate}
@@ -2595,6 +2777,7 @@ function SessionDetailContent({
         refreshSendInfoSignal={sendInfoTick}
         disableTerminalProbes={appForm}
         turnControl={appForm ? codexTurnControl : undefined}
+        dshTurnControl={session.agentType === "dsh" ? dshTurnControl : undefined}
       />
     );
 
@@ -2826,6 +3009,46 @@ function SessionDetailContent({
               const toggleable = isToggleable(m);
               const isUser = m.kind === "user";
               const msgBookmark = bookmarkByAnchor.get(messageAnchor(m));
+              const renderMedia = (item: DshMediaReference) => (
+                <DshInlineMedia
+                  key={JSON.stringify([session.dshInstanceId, session.id, item.refId])}
+                  media={item}
+                  instanceId={session.dshInstanceId}
+                  sessionId={session.id}
+                  onOpen={() => openDshMedia(item)}
+                />
+              );
+              const dshMedia = session.agentType === "dsh" ? (m.media ?? []) : [];
+              // 交付件是阅读入口，不属于可折叠的工具参数或执行过程。
+              const isDelivery = (item: DshMediaReference) =>
+                toggleable &&
+                m.kind === "tool-call" &&
+                m.toolName === "present" &&
+                item.kind === "file";
+              const deliveries = dshMedia.filter(isDelivery);
+              const inlineMedia = dshMedia.filter((item) => !isDelivery(item));
+              const mediaByRef = new Map(inlineMedia.map((media) => [media.refId, media]));
+              const body = !inlineMedia.length ? (
+                renderBody(m)
+              ) : m.blocks?.length ? (
+                <div>
+                  {m.blocks.map((block, index) => {
+                    if (block.kind === "text")
+                      return (
+                        <div key={index} className="whitespace-pre-wrap">
+                          {renderLinkifiedText(block.text)}
+                        </div>
+                      );
+                    const item = mediaByRef.get(block.refId);
+                    return item ? renderMedia(item) : null;
+                  })}
+                </div>
+              ) : (
+                <>
+                  {renderBody(m)}
+                  {inlineMedia.map(renderMedia)}
+                </>
+              );
               return (
                 <li
                   key={m.seq}
@@ -2868,11 +3091,12 @@ function SessionDetailContent({
                           {collapsed ? <ChevronRight size={13} /> : <ChevronDown size={13} />}
                           <span className="truncate">{collapsedLabel(m)}</span>
                         </button>
-                        {!collapsed && <div className="mt-1">{renderBody(m)}</div>}
+                        {!collapsed && <div className="mt-1">{body}</div>}
                       </>
                     ) : (
-                      renderBody(m)
+                      body
                     )}
+                    {deliveries.map(renderMedia)}
                   </div>
                 </li>
               );
@@ -2954,10 +3178,21 @@ function SessionDetailContent({
   ) : null;
 
   // sheet 看板（左栏）：文件面板 / 子 Agent 清单（分屏主从布局下选中卡高亮）
+  const dshFileMedia = (() => {
+    if (session.agentType !== "dsh") return [];
+    const references = new Map<string, DshMediaReference>();
+    for (const item of fileMedia) references.set(item.refId, item);
+    for (const message of messages ?? []) {
+      for (const item of message.media ?? []) references.set(item.refId, item);
+    }
+    return [...references.values()];
+  })();
   const sheetBoard = preview ? (
     preview.sheet === "files" ? (
       <FilePanel
         entries={fileView}
+        media={dshFileMedia}
+        onOpenMedia={(item) => openDshMedia(item, true)}
         truncated={fileTruncated}
         scope={fileScope}
         loading={fileLoading}
@@ -2990,6 +3225,7 @@ function SessionDetailContent({
       <FilePreview
         session={session}
         filePath={preview.open.path}
+        mediaRefId={preview.open.mediaRefId}
         mode={preview.mode}
         fontScale={fontScale}
         refreshKey={preview.openSeq}
@@ -3007,6 +3243,7 @@ function SessionDetailContent({
         subagentId={subagentDetailId}
         subagentName={subagentList?.find((s) => s.id === subagentDetailId)?.name ?? null}
         running={subagentList?.find((s) => s.id === subagentDetailId)?.status === "running"}
+        statusUnknown={subagentList?.find((s) => s.id === subagentDetailId)?.status === "unknown"}
         onBack={preview.backToList ? backToBoard : undefined}
         openFile={openFile}
         fontScale={fontScale}
@@ -3140,6 +3377,7 @@ function SessionDetailContent({
               ref={messageAreaRef}
             >
               {messageArea}
+              {dshQuestionCard}
             </MessageScrollArea>
             {cardDock}
             {composerArea}
@@ -3208,6 +3446,7 @@ function SessionDetailContent({
             ref={messageAreaRef}
           >
             {messageArea}
+            {dshQuestionCard}
           </MessageScrollArea>
           {cardDock}
           {/* 发送输入区（M7 Task 7，W4）：**全布局态挂载**（正文 / split / split-h，

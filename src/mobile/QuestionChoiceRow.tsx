@@ -7,6 +7,7 @@ export interface QuestionChoiceRowProps {
   index: number;
   label: string;
   description?: string;
+  inlineDescription?: boolean;
   checked?: boolean;
   multiSelect?: boolean;
   disabled?: boolean;
@@ -20,6 +21,7 @@ export default function QuestionChoiceRow({
   index,
   label,
   description,
+  inlineDescription = false,
   checked = false,
   multiSelect = false,
   disabled = false,
@@ -56,9 +58,18 @@ export default function QuestionChoiceRow({
         </span>
       )}
       <span className="min-w-0">
-        <span className="block font-medium">{label}</span>
+        <span className={inlineDescription ? "font-medium" : "block font-medium"}>{label}</span>
         {description && (
-          <span className="mt-0.5 block text-xs text-[var(--mut)]">{description}</span>
+          <span
+            className={
+              inlineDescription
+                ? "text-xs text-[var(--mut)]"
+                : "mt-0.5 block text-xs text-[var(--mut)]"
+            }
+          >
+            {inlineDescription && " "}
+            {description}
+          </span>
         )}
       </span>
     </button>

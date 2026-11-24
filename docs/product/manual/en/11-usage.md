@@ -58,7 +58,7 @@ The big board gains a standalone "Recent TPS" block: a sampled-throughput curve 
 
 ## Output speed (three separate metrics)
 
-![Output speed board](img/output-speed-board.png)
+![Output speed board](../img/output-speed-board.png)
 
 This image shows the previous layout; the current page also has a "Tokenizer estimate" tab, described below.
 

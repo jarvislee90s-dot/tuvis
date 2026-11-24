@@ -1,0 +1,232 @@
+<!doctype html>
+<html lang="zh">
+  <meta charset="utf-8" />
+  <title>H09 实际 Rust gate 测试</title>
+  <h1>H09 实际 Rust gate 测试</h1>
+  <p>
+    此服务直接调用实际 gate，设备仅存于内存 DeviceStore。管理处理器只计数，WS
+    只返回测试文本。不连接真实 Tuvis 服务、宿主、终端或账本。
+  </p>
+  <p>使用全新浏览器配置，在同一浏览器先完成主站正对照，再逐个打开控制台链接。</p>
+  <p>当前 origin：<code id="origin"></code></p>
+  <p>主站 origin：<code id="main"></code></p>
+  <p>实际 Cookie 格式（值已脱敏）：<code id="cookie"></code></p>
+  <button id="run">执行</button>
+  <button id="refresh">刷新本轮服务端计数</button>
+  <p><a id="same-host" target="_blank" rel="noopener">同主机不同端口反例</a></p>
+  <p><a id="cross-site" target="_blank" rel="noopener">不同站点候选（IPv6 回环）</a></p>
+  <p>
+    CORS 报错、opaque 响应或 WS error 均不能单独证明拒绝。缺少服务端记录时判证据不足。 HTTP
+    回环结果不覆盖 HTTPS、同站点子域、Lax 顶层导航或四渠道入口。
+  </p>
+  <pre id="output">未执行。此页与旧 Cookie 语义夹具的结果独立记录。</pre>
+  <script>
+    const config = __FIXTURE_CONFIG__;
+    const output = document.getElementById("output");
+    const button = document.getElementById("run");
+    const results = [];
+    document.getElementById("origin").textContent = location.origin;
+    document.getElementById("main").textContent = config.origins.main;
+    document.getElementById("cookie").textContent = config.cookieTemplate;
+    document.getElementById("same-host").href = config.origins.sameHostConsole + "/m/fixture";
+    document.getElementById("cross-site").href = config.origins.crossSiteConsole + "/m/fixture";
+    button.textContent =
+      config.mode === "main"
+        ? "临时登录并执行同源 GET、POST、WS 正对照"
+        : "执行当前控制台跨 origin 请求";
+
+    // 单独保持纯函数，便于不启动 Cargo 时验证报告不会把零命中/预检误报成通过。
+    function verdict(mode, rows, browserResults, baselineReady, cookieVisible) {
+      const authorized = rows.filter((row) => row.authorized).length;
+      if (mode === "main") {
+        const expected = { "positive-get": 200, "positive-post": 200, "positive-ws": 101 };
+        const serverReady =
+          rows.length === 3 &&
+          Object.entries(expected).every(([kind, status]) =>
+            rows.some((row) => row.case === kind && row.authorized && row.status === status)
+          );
+        const clientReady =
+          ["positive-get", "positive-post"].every((kind) =>
+            browserResults.some((row) => row.kind === kind && row.status === 200)
+          ) && browserResults.some((row) => row.kind === "positive-ws" && row.opened);
+        return serverReady && clientReady && !cookieVisible
+          ? "同浏览器临时登录正对照成立：实际 gate 后 GET、POST、WS 均命中，Cookie 对脚本不可见"
+          : "正对照未成立；不能据后续零命中判隔离通过";
+      }
+      if (!baselineReady) return "缺少本服务的登录正对照；不能判隔离通过";
+      if (authorized > 0) return "反例成立：当前控制台 origin 已命中实际 gate 后的假管理处理器";
+      const required = ["cors-get", "simple-post", "no-cors-post", "form-post", "cross-ws"];
+      const rejected = required.every((kind) =>
+        rows.some((row) => row.case === kind && row.status === 403 && !row.authorized)
+      );
+      const preflightRejected = rows.some(
+        (row) =>
+          row.case === "json-post-preflight" &&
+          row.method === "OPTIONS" &&
+          row.status === 403 &&
+          !row.authorized
+      );
+      const postAbsent = !rows.some(
+        (row) => row.case === "json-post-preflight" && row.method === "POST"
+      );
+      return rejected && preflightRejected && postAbsent
+        ? "本轮所列请求均有实际 gate 拒绝记录，JSON POST 止于预检；仅本地测试拓扑，不代表 H09 验收"
+        : "证据不完整：请求缺失或状态不符；浏览器错误/零授权命中不能单独证明服务端拒绝";
+    }
+
+    const endpoint = (kind) => config.origins.main + "/m/api/v1/probe/" + config.run + "/" + kind;
+    async function getEvidence() {
+      const response = await fetch("/m/fixture/evidence", {
+        cache: "no-store",
+        signal: AbortSignal.timeout(5000),
+      });
+      if (!response.ok) throw new Error("服务端计数读取失败：" + response.status);
+      return response.json();
+    }
+    async function report() {
+      const data = await getEvidence();
+      const rows = data.attempts.filter((row) => row.run === config.run);
+      const authorized = rows.filter((row) => row.authorized).length;
+      const cookieVisible = document.cookie.includes("mam_device=");
+      output.textContent = JSON.stringify(
+        {
+          observedAt: new Date().toISOString(),
+          browser: navigator.userAgent,
+          pageOrigin: location.origin,
+          run: config.run,
+          verdict: verdict(config.mode, rows, results, data.baselineReady, cookieVisible),
+          currentRun: { attempted: rows.length, authorized, rejected: rows.length - authorized },
+          cookieVisibleToScript: cookieVisible,
+          results,
+          server: data,
+        },
+        null,
+        2
+      );
+    }
+    async function request(kind, init = {}) {
+      try {
+        const response = await fetch(endpoint(kind), {
+          ...init,
+          credentials: "include",
+          signal: AbortSignal.timeout(5000),
+        });
+        results.push({ kind, status: response.status, type: response.type });
+      } catch (error) {
+        results.push({ kind, browserError: String(error) });
+      }
+    }
+    async function websocket(kind) {
+      await new Promise((resolve) => {
+        const url = new URL(config.origins.main);
+        url.protocol = "ws:";
+        url.pathname = "/m/api/v1/ws/" + config.run + "/" + kind;
+        const ws = new WebSocket(url);
+        const timer = setTimeout(() => {
+          results.push({ kind, timeout: true });
+          ws.close();
+          resolve();
+        }, 5000);
+        ws.onopen = () => results.push({ kind, opened: true });
+        ws.onmessage = (event) => results.push({ kind, text: String(event.data) });
+        ws.onerror = () =>
+          results.push({ kind, browserError: "WS error; inspect server evidence" });
+        ws.onclose = (event) => {
+          clearTimeout(timer);
+          results.push({ kind, closeCode: event.code });
+          resolve();
+        };
+      });
+    }
+    async function formPost() {
+      const frame = document.createElement("iframe");
+      frame.name = "h09-" + config.run;
+      frame.hidden = true;
+      let form;
+      try {
+        await new Promise((resolve, reject) => {
+          const timer = setTimeout(() => reject(new Error("测试 iframe 初始化超时")), 5000);
+          frame.onload = () => {
+            clearTimeout(timer);
+            resolve();
+          };
+          document.body.append(frame);
+        });
+        form = document.createElement("form");
+        form.method = "POST";
+        form.action = endpoint("form-post");
+        form.target = frame.name;
+        const input = document.createElement("input");
+        input.name = "fixture";
+        input.value = "counter-only";
+        form.append(input);
+        document.body.append(form);
+        await new Promise((resolve) => {
+          const timer = setTimeout(() => {
+            results.push({ kind: "form-post", timeout: true });
+            resolve();
+          }, 5000);
+          frame.onload = () => {
+            clearTimeout(timer);
+            results.push({ kind: "form-post", frameLoaded: true });
+            resolve();
+          };
+          form.submit();
+        });
+      } finally {
+        form?.remove();
+        frame.remove();
+      }
+    }
+    document.getElementById("refresh").onclick = () =>
+      report().catch((error) => {
+        output.textContent = String(error);
+      });
+    button.onclick = async () => {
+      button.disabled = true;
+      try {
+        if (config.mode === "main") {
+          const paired = await fetch("/m/fixture/pair", {
+            method: "POST",
+            signal: AbortSignal.timeout(5000),
+          });
+          if (!paired.ok) throw new Error("临时配对失败");
+          await request("positive-get");
+          await request("positive-post", {
+            method: "POST",
+            headers: { "Content-Type": "text/plain" },
+            body: "counter-only",
+          });
+          await websocket("positive-ws");
+        } else {
+          if (!(await getEvidence()).baselineReady) {
+            button.disabled = false;
+            throw new Error("先在同一浏览器完成主站临时登录及正对照，再执行控制台探测");
+          }
+          await request("cors-get");
+          await request("json-post-preflight", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: "{}",
+          });
+          await request("simple-post", {
+            method: "POST",
+            headers: { "Content-Type": "text/plain" },
+            body: "counter-only",
+          });
+          await request("no-cors-post", {
+            mode: "no-cors",
+            method: "POST",
+            headers: { "Content-Type": "text/plain" },
+            body: "counter-only",
+          });
+          await formPost();
+          await websocket("cross-ws");
+        }
+        await report();
+      } catch (error) {
+        output.textContent = String(error);
+      }
+    };
+  </script>
+</html>

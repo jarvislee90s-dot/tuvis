@@ -200,6 +200,34 @@ mod tests {
     }
 
     #[test]
+    fn golden_v4_fixtures_status_mapping() {
+        // v4 夹具三态（已证事实覆盖面）：completed→绿、开回合→黄（Held）、审批未决→红。
+        // 状态判定是版本无关的事件语义，与 v0–v3 共用同一映射；无真实形状证据的
+        // 状态（如 v4 特有中断形态）不在此扩展映射
+        let completed = fixture_events("sample7-v4-completed.sanitized.jsonl");
+        assert_eq!(
+            derive(&input(&completed, LockState::Held)).status,
+            SessionStatus::Finished
+        );
+        assert_eq!(
+            derive(&input(&completed, LockState::Held))
+                .end_kind
+                .as_deref(),
+            Some("completed")
+        );
+        let running = fixture_events("sample8-v4-running.sanitized.jsonl");
+        assert_eq!(
+            derive(&input(&running, LockState::Held)).status,
+            SessionStatus::Processing
+        );
+        let pending = fixture_events("sample9-v4-approval-pending.sanitized.jsonl");
+        assert_eq!(
+            derive(&input(&pending, LockState::Held)).status,
+            SessionStatus::Waiting
+        );
+    }
+
+    #[test]
     fn golden_approval_pending_is_waiting() {
         let e = fixture_events("sample5-approval-pending.sanitized.jsonl");
         // turn 打开 + 审批未决 → 红（优先于"运行中"）

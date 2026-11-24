@@ -16,6 +16,8 @@ use super::cadence::{Cadence, Mode, Signals};
 use super::wakeup_coverage::{
     is_tool_uncovered, runtime_hook_coverage_snapshot, RuntimeHookCoverage,
 };
+use crate::adapter::WalkedScan;
+use crate::monitor::walk_budget::{self, WalkError};
 use crate::session::{SessionStatus, SessionsResponse};
 
 /// 一次扫描的不可变产物；消费方只读，不做原地修改
@@ -391,6 +393,10 @@ const SUPERVISOR_PERIOD: Duration = Duration::from_secs(5);
 const WATCH_TTL: Duration = Duration::from_secs(90);
 /// 扫描轮次 panic 后的固定退避：连续 panic 时每轮至少间隔这么久（防 panic 风暴）
 const PANIC_BACKOFF: Duration = Duration::from_millis(500);
+/// walk 失败轮（超时/Busy/Spawn → 降级 Ok(None)）的固定退避（NEEDS_FIX Important-1）：
+/// 与 panic 同型的有界重试节奏——过期 Event 批次会让 wait_event_batch 每圈立即
+/// 放行，不退避就是每圈立即失败立即重试的风暴（实测 1.6s 内 84 万次）。
+const WALK_FAILURE_BACKOFF: Duration = Duration::from_millis(500);
 /// F1 门禁：panic 后最迟该时点必须已经发起下一次扫描
 const RECOVERY_BOUND: Duration = Duration::from_secs(30);
 /// 托盘无状态变化时的最长刷新间隔
@@ -929,6 +935,35 @@ fn scan_once_authorized_until(
     expected_generation: Option<u64>,
     event_watermark: Option<u64>,
 ) -> Option<Arc<Snapshot>> {
+    scan_once_authorized_until_impl(
+        reason,
+        deadline,
+        expected_generation,
+        event_watermark,
+        walk_budget::SCAN_WALK_BUDGET,
+    )
+}
+
+/// 单测用：预算参数注入（NEEDS_FIX Important-4——取消全局预算覆写缝，
+/// 预算走参数，杜绝跨用例互抢）。
+#[cfg(test)]
+fn scan_once_with_walk_budget_for_test(
+    reason: ScanReason,
+    wait_limit: Duration,
+    walk_budget: Duration,
+) -> Arc<Snapshot> {
+    scan_once_authorized_until_impl(reason, Instant::now() + wait_limit, None, None, walk_budget)
+        .expect("非 worker 扫描没有 generation，不能被执行权检查拒绝")
+}
+
+/// 单飞内核实现（预算参数化；生产入口用 [`walk_budget::SCAN_WALK_BUDGET`]）。
+fn scan_once_authorized_until_impl(
+    reason: ScanReason,
+    deadline: Instant,
+    expected_generation: Option<u64>,
+    event_watermark: Option<u64>,
+    walk_budget: Duration,
+) -> Option<Arc<Snapshot>> {
     let flight = match try_start_scan(expected_generation) {
         ScanAdmission::Started(flight) => {
             record_scan_reason(reason);
@@ -951,11 +986,12 @@ fn scan_once_authorized_until(
                 Some(s) => return Some(s),
                 // 上一次扫描在首次发布前 panic：重新竞争单飞；失效 worker 会在准入处退出。
                 None => {
-                    return scan_once_authorized_until(
+                    return scan_once_authorized_until_impl(
                         reason,
                         deadline,
                         expected_generation,
                         event_watermark,
+                        walk_budget,
                     )
                 }
             }
@@ -966,7 +1002,39 @@ fn scan_once_authorized_until(
     let captured_event_watermark = event_watermark.unwrap_or_else(current_event_watermark);
     let _flight = flight;
     let started = Instant::now();
-    let data = super::get_all_sessions_inner();
+    // 发现②加固（2026-11-16 真机证据：scan_bus 扫描线 readdir 楔死 getdirentries
+    // 数分钟）：FS 遍历装进请求级死线（见 walk_budget::SCAN_WALK_BUDGET 注）。
+    // 超时/Busy → 本轮按「无新数据」处理：不发布新快照（上一轮缓存结果保留）、
+    // 记 degraded 诊断窗口，worker 继续节拍；卡住的遍历线程 detached 保留
+    // （内核操作不可中断，自愈完成后自行释放计数）。
+    let walked = match walk_budget::run_bounded("scan-bus", walk_budget, scan_walk_walker()) {
+        Ok(walked) => walked,
+        Err(failure) => {
+            match failure {
+                WalkError::Panicked(payload) => std::panic::resume_unwind(payload),
+                WalkError::TimedOut(t) => log::warn!(
+                    "scan_bus: 扫描遍历超预算（线 {}，预算 {:?}），本轮按「无新数据」处理，保留上一轮快照",
+                    t.name,
+                    t.budget
+                ),
+                WalkError::Busy => log::warn!(
+                    "scan_bus: 在飞 FS 遍历达上限（许可 {}/8 或 detached 线程 {}/6），本轮跳过（快失败，不无限堆积）",
+                    walk_budget::active_walks(),
+                    walk_budget::detached_walk_threads()
+                ),
+                WalkError::Spawn(e) => log::warn!(
+                    "scan_bus: 遍历线程启动失败（{e}），本轮按「无新数据」处理"
+                ),
+            }
+            note_timeout();
+            let duration = started.elapsed();
+            LAST_SCAN_DURATION_MS.store(duration.as_millis() as u64, Ordering::Relaxed);
+            return Some(degraded_snapshot());
+        }
+    };
+    // 提交段在**等待线程**执行（单飞内串行）；超时的 detached 旧线程只持有
+    // 纯遍历产物 WalkedScan，自愈恢复后无处提交（Important-2 结构保证）。
+    let data = super::get_all_sessions_commit(walked);
     let duration = started.elapsed();
     LAST_SCAN_DURATION_MS.store(duration.as_millis() as u64, Ordering::Relaxed);
     let snap = publish(data, started_ms, epoch);
@@ -1598,6 +1666,8 @@ fn spawn_worker_thread(
                 break;
             }
             let panicked = outcome.is_err();
+            // NEEDS_FIX Important-1：降级轮判定须在 match 移动 outcome 前完成。
+            let degraded_round = matches!(&outcome, Ok(None));
             match outcome {
                 Ok(Some(scanned_at)) => {
                     last_scan_completed = scanned_at;
@@ -1613,11 +1683,22 @@ fn spawn_worker_thread(
             refresh_stats_runtime_file();
             // 6.2：panic 后只退避 500ms 就立即恢复扫描（不叠加档位间隔）；连续 panic
             // 时每轮仍隔 500ms，保留防风暴能力。恢复路径最坏 ≤30s 的论证见 next_scan_wait。
-            if panicked {
+            // NEEDS_FIX Important-1：walk 失败轮（超时/Busy/Spawn → Ok(None)，Event
+            // watermark 不确认）与未确认 Event 批次组合会形成**无等待重试风暴**——
+            // 批次 5s 期限已过时 wait_event_batch 每圈立即放行（实测 1.6s 内 84 万次
+            // 重试）。降级轮同样按 500ms 有界退避：dirty watermark 保留（下轮重取
+            // 同一批次），重试时刻经 RETRY_BACKOFF_UNTIL_MS 独立记录。
+            let retry_backoff = if panicked {
+                Some(next_scan_wait(true, cadence.mode().interval()))
+            } else if degraded_round {
+                Some(WALK_FAILURE_BACKOFF)
+            } else {
+                None
+            };
+            if let Some(backoff) = retry_backoff {
                 if !heartbeat(gen) {
                     break;
                 }
-                let backoff = next_scan_wait(true, cadence.mode().interval());
                 RETRY_BACKOFF_UNTIL_MS.store(
                     mono_now_ms().saturating_add(backoff.as_millis() as u64),
                     Ordering::SeqCst,
@@ -1996,6 +2077,8 @@ pub fn reset_for_test() {
     *MUTATION_IDLE_PROBE
         .lock()
         .unwrap_or_else(|e| e.into_inner()) = None;
+    // 遍历注入缝同理（发现②预算回归用；预算已改参数注入，无全局覆写）
+    *WALK_OVERRIDE.lock().unwrap_or_else(|e| e.into_inner()) = None;
     // 6.1：清工作线程记账。丢掉槽内 sender ⇒ 用例遗留的 worker 因通道断开而自行退出
     // （`WORKERS_ALIVE` 是活体计数，不在此清零——由线程体自己减）
     *WORKER_TX.lock().unwrap_or_else(|e| e.into_inner()) = None;
@@ -2136,6 +2219,38 @@ fn fire_scan_start_probe(epoch: u64) {
     }
 }
 
+/// 单测用：扫描遍历注入缝（2026-11-16 真机发现②预算回归；A06 IO 探针预算族
+/// 夹具同型）：默认真实遍历段 `get_all_sessions_walk`；注入慢遍历验证「超时轮
+/// 保留上一轮快照、worker 不死、下一轮恢复」，不依赖真实慢盘/内核楔死形态。
+#[cfg(test)]
+type ScanWalkOverride = Box<dyn Fn() -> WalkedScan + Send>;
+
+#[cfg(test)]
+static WALK_OVERRIDE: Lazy<Mutex<Option<ScanWalkOverride>>> = Lazy::new(|| Mutex::new(None));
+
+#[cfg(test)]
+fn set_scan_walk_override_for_test(walk: Option<ScanWalkOverride>) {
+    *WALK_OVERRIDE.lock().unwrap_or_else(|e| e.into_inner()) = walk;
+}
+
+/// 遍历执行体：cfg(test) 注入缝优先（take 消费，慢遍历只咬一轮），生产 =
+/// 真实遍历段 `get_all_sessions_walk`（NEEDS_FIX Important-2：detached 段纯遍历，
+/// 提交段 `get_all_sessions_commit` 由等待线程执行）。Box 形态满足 run_bounded
+/// 的 `Send + 'static`。
+fn scan_walk_walker() -> Box<dyn FnOnce() -> WalkedScan + Send> {
+    #[cfg(test)]
+    {
+        let override_walk: Option<ScanWalkOverride> = WALK_OVERRIDE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        if let Some(walk) = override_walk {
+            return Box::new(walk);
+        }
+    }
+    Box::new(super::get_all_sessions_walk)
+}
+
 /// 单测用：获取全局测试锁（本模块测试与 `remote::server` SSE 测试共用同一把，
 /// 避免任一侧的 reset/seed 插进另一侧「种子 → 断言」窗口，见 test_guard 使用方）
 #[cfg(test)]
@@ -2177,6 +2292,8 @@ mod tests {
             flap_from_subagent_activity: false,
             last_activity_at: String::new(),
             unread_turned_green_at_ms: None,
+            dsh_instance_id: None,
+            dsh_subagent: None,
             pid: 1,
             cpu_usage: 0.0,
             active_subagent_count: 0,
@@ -2289,6 +2406,113 @@ mod tests {
         assert!(response.sessions.is_empty(), "本用例的成功扫描结果应为空");
         assert_eq!(response.total_count, published.data.total_count);
         assert!(!snapshot().unwrap().degraded);
+    }
+
+    #[test]
+    fn scan_walk_timeout_keeps_previous_snapshot_and_recovers_next_round() {
+        // NEEDS_FIX Important-4：接线测试共用生产容量计数器 → 统一隔离锁串行
+        let _walk_isolation = crate::monitor::walk_budget::walk_test_guard();
+        let _guard = test_guard();
+        reset_for_test();
+        // 上一轮缓存：正常发布 seed（v1）
+        let seed = publish_for_test(|| resp(SessionStatus::Idle));
+        std::thread::sleep(Duration::from_millis(5));
+        // 注入慢遍历（1.2s）+ 150ms 预算（参数注入，Important-4）：本轮必然超预算
+        set_scan_walk_override_for_test(Some(Box::new(|| {
+            std::thread::sleep(Duration::from_millis(1200));
+            crate::adapter::WalkedScan {
+                sessions: vec![],
+                running_tools: Vec::new(),
+                workbuddy_host_alive: false,
+                observations: Vec::new(),
+                hook_events: std::collections::HashMap::new(),
+                workbuddy_compensation:
+                    crate::monitor::workbuddy_parser::WorkbuddyCompensationPlan::empty(),
+            }
+        })));
+        let started = Instant::now();
+        let snap = scan_once_with_walk_budget_for_test(
+            ScanReason::Periodic,
+            Duration::from_millis(2000),
+            Duration::from_millis(150),
+        );
+        let elapsed = started.elapsed();
+        assert!(snap.degraded, "超时轮必须按降级快照返回");
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "超时轮必须有界返回（实际 {elapsed:?}）"
+        );
+        let kept = snapshot().unwrap();
+        assert_eq!(
+            kept.version, seed.version,
+            "超时轮不得发布新快照——保留上一轮缓存结果"
+        );
+        // 下一轮恢复：撤掉慢遍历，新轮正常发布（worker 不死、节拍继续）
+        set_scan_walk_override_for_test(None);
+        let next = scan_once_with_limit(ScanReason::Event, Duration::from_millis(2000));
+        assert!(!next.degraded, "撤掉慢遍历后下一轮必须恢复正常");
+        assert!(next.version > seed.version, "恢复轮必须发布新版本");
+    }
+
+    /// NEEDS_FIX Important-1 回归：walk 失败轮（降级 Ok(None)、Event watermark 不确认）
+    /// 必须获得**有界重试退避**。否则「过期 Event 批次 + 降级轮」组合成无等待重试风暴：
+    /// 批次 5s 期限已过 → wait_event_batch 每圈立即放行 → 立即扫描 → 立即再降级 → 循环。
+    #[test]
+    fn degraded_rounds_back_off_event_batch_retries() {
+        let _guard = test_guard();
+        reset_for_test();
+        assert!(wait_until_for_test(
+            || WORKERS_ALIVE.load(Ordering::SeqCst) == 0,
+            Duration::from_secs(3)
+        ));
+        let (tx, rx) = mpsc::channel::<ScanRequest>();
+        set_worker_tx_for_test(Some(tx.clone()));
+        let round_starts: Arc<Mutex<Vec<Instant>>> = Arc::new(Mutex::new(Vec::new()));
+        let starts_for_round = Arc::clone(&round_starts);
+        let round: WorkerRound = Box::new(move |_gen, _cadence, _rx, _request| {
+            starts_for_round
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(Instant::now());
+            // 模拟 walk 失败轮：不发布新快照（Ok(None)）、不确认 Event watermark
+            None
+        });
+        // 过期 Event 批次（first_arrived 早于 5s 窗口 8s）→ 每圈立即放行
+        let expired_event =
+            scan_request_at_for_test(ScanReason::Event, Instant::now() - Duration::from_secs(8));
+        tx.send(expired_event).unwrap();
+        spawn_worker(rx, ScanReason::Periodic, round);
+        // Minor 复审：断言按**实际相邻间隔**计，不按固定采样窗计数（慢 CI 脆）。
+        // 观测窗 3s：至少两轮失败重试（退避不得停止重试），且全部相邻间隔 ≥ 400ms
+        //（标称退避 500ms；快 CI 间隔只会更大，慢 CI 轮次更少但间隔判据不变）。
+        // 修复前一次性运行证据：同窗形态 1.6s 采样 846,410 轮（间隔 ≈ 0）。
+        std::thread::sleep(Duration::from_millis(3000));
+        let starts = round_starts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        assert!(
+            starts.len() >= 2,
+            "退避不得停止重试（3s 观测窗内仅 {} 轮）",
+            starts.len()
+        );
+        for pair in starts.windows(2) {
+            let gap = pair[1].saturating_duration_since(pair[0]);
+            assert!(
+                gap >= Duration::from_millis(400),
+                "降级轮之间必须有退避间隔（实际 {gap:?} = 无退避重试风暴）"
+            );
+        }
+        // 收尾：模拟接管（代次推进）让 worker 退出——降级轮退避循环与 panic 恢复
+        // 循环同型，通道断开只在回到 recv 分支时可见，接管检查（worker_is_current）
+        // 是循环内每圈必经的退出缝。
+        set_worker_tx_for_test(None);
+        drop(tx);
+        WORKER_GEN.fetch_add(1, Ordering::SeqCst);
+        assert!(wait_until_for_test(
+            || WORKERS_ALIVE.load(Ordering::SeqCst) == 0,
+            Duration::from_secs(3)
+        ));
     }
 
     #[test]

@@ -9,6 +9,10 @@ use crate::database::connection::DB;
 pub struct UnreadSessionRecord {
     pub tool_id: String,
     pub session_id: String,
+    /// DSH 实例限定（H07 最终批 I5）：None = 非 DSH（落库 instance_key=''，
+    /// 旧行为逐字保留）；Some = 已核验实例 ID——同 ID 跨实例互不覆盖。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dsh_instance_id: Option<String>,
     pub project_name: String,
     pub title: Option<String>,
     pub last_message: Option<String>,
@@ -16,22 +20,28 @@ pub struct UnreadSessionRecord {
     pub expires_at_ms: i64,
 }
 
-/// 插入或覆盖（同 tool_id + session_id 直接更新，无软删标记）
+/// 实例限定键：None → ''（非 DSH 旧行为）；Some(id) → id。
+fn ikey(instance: Option<&str>) -> &str {
+    instance.unwrap_or("")
+}
+
+/// 插入或覆盖（同 tool_id + session_id + instance_key 直接更新，无软删标记）
 /// 冲突时仅刷新展示快照（project_name/title/last_message）；
 /// turned_green_at/expires_at 保留首次转绿值——spec §5 口径：turned_green_at＝转绿时间、
 /// expires_at＝首绿 +24h 兜底，若随每轮轮询刷新会让 24h 窗口无限滑动、永不过期
 pub fn upsert_unread(conn: &Connection, r: &UnreadSessionRecord) -> bool {
     conn.execute(
         "INSERT INTO unread_sessions
-            (tool_id, session_id, project_name, title, last_message, turned_green_at, expires_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-         ON CONFLICT(tool_id, session_id) DO UPDATE SET
+            (tool_id, session_id, instance_key, project_name, title, last_message, turned_green_at, expires_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+         ON CONFLICT(tool_id, session_id, instance_key) DO UPDATE SET
             project_name = excluded.project_name,
             title = excluded.title,
             last_message = excluded.last_message",
         params![
             r.tool_id,
             r.session_id,
+            ikey(r.dsh_instance_id.as_deref()),
             r.project_name,
             r.title,
             r.last_message,
@@ -43,41 +53,48 @@ pub fn upsert_unread(conn: &Connection, r: &UnreadSessionRecord) -> bool {
 }
 
 /// 未读池是否已有该行（首次转绿写失败后的下一轮重试判据）。
-pub fn exists_unread_conn(conn: &Connection, tool_id: &str, session_id: &str) -> bool {
+pub fn exists_unread_conn(
+    conn: &Connection,
+    tool_id: &str,
+    session_id: &str,
+    instance: Option<&str>,
+) -> bool {
     conn.query_row(
-        "SELECT 1 FROM unread_sessions WHERE tool_id = ?1 AND session_id = ?2 LIMIT 1",
-        params![tool_id, session_id],
+        "SELECT 1 FROM unread_sessions WHERE tool_id = ?1 AND session_id = ?2 AND instance_key = ?3 LIMIT 1",
+        params![tool_id, session_id, ikey(instance)],
         |_| Ok(()),
     )
     .is_ok()
 }
 
 /// 单条物理删除（已读 / 手动关闭等终态直接删行）
-pub fn delete_unread(conn: &Connection, tool_id: &str, session_id: &str) {
+pub fn delete_unread(conn: &Connection, tool_id: &str, session_id: &str, instance: Option<&str>) {
     let _ = conn.execute(
-        "DELETE FROM unread_sessions WHERE tool_id = ?1 AND session_id = ?2",
-        params![tool_id, session_id],
+        "DELETE FROM unread_sessions WHERE tool_id = ?1 AND session_id = ?2 AND instance_key = ?3",
+        params![tool_id, session_id, ikey(instance)],
     );
 }
 
 /// 未过期未读列表（按转绿时间倒序）
 pub fn list_unread(conn: &Connection, now_ms: i64) -> Vec<UnreadSessionRecord> {
     let Ok(mut stmt) = conn.prepare(
-        "SELECT tool_id, session_id, project_name, title, last_message, turned_green_at, expires_at
+        "SELECT tool_id, session_id, instance_key, project_name, title, last_message, turned_green_at, expires_at
          FROM unread_sessions WHERE expires_at > ?1
          ORDER BY turned_green_at DESC",
     ) else {
         return Vec::new();
     };
     stmt.query_map(params![now_ms], |row| {
+        let key: String = row.get(2)?;
         Ok(UnreadSessionRecord {
             tool_id: row.get(0)?,
             session_id: row.get(1)?,
-            project_name: row.get(2)?,
-            title: row.get(3)?,
-            last_message: row.get(4)?,
-            turned_green_at_ms: row.get(5)?,
-            expires_at_ms: row.get(6)?,
+            dsh_instance_id: if key.is_empty() { None } else { Some(key) },
+            project_name: row.get(3)?,
+            title: row.get(4)?,
+            last_message: row.get(5)?,
+            turned_green_at_ms: row.get(6)?,
+            expires_at_ms: row.get(7)?,
         })
     })
     .map(|rows| rows.filter_map(Result::ok).collect())
@@ -91,13 +108,14 @@ pub fn refresh_display_unread(conn: &Connection, r: &UnreadSessionRecord) -> boo
     conn.execute(
         "UPDATE unread_sessions
          SET project_name = ?3, title = ?4, last_message = ?5
-         WHERE tool_id = ?1 AND session_id = ?2",
+         WHERE tool_id = ?1 AND session_id = ?2 AND instance_key = ?6",
         params![
             r.tool_id,
             r.session_id,
             r.project_name,
             r.title,
-            r.last_message
+            r.last_message,
+            ikey(r.dsh_instance_id.as_deref())
         ],
     )
     .is_ok_and(|rows| rows > 0)
@@ -133,21 +151,27 @@ pub fn mark_read_tombstone_conn(
     conn: &Connection,
     tool_id: &str,
     session_id: &str,
+    instance: Option<&str>,
     read_at_ms: i64,
 ) {
     let _ = conn.execute(
-        "INSERT OR REPLACE INTO unread_read_tombstones (tool_id, session_id, read_at)
-         VALUES (?1, ?2, ?3)",
-        params![tool_id, session_id, read_at_ms],
+        "INSERT OR REPLACE INTO unread_read_tombstones (tool_id, session_id, instance_key, read_at)
+         VALUES (?1, ?2, ?3, ?4)",
+        params![tool_id, session_id, ikey(instance), read_at_ms],
     );
 }
 
 /// 读取已读墓碑时间（epoch ms）；无墓碑 → None。
 /// 看板用它判断“DB-only completed 卡是否已被用户读掉、且没有新工作”。
-pub fn read_tombstone_at_conn(conn: &Connection, tool_id: &str, session_id: &str) -> Option<i64> {
+pub fn read_tombstone_at_conn(
+    conn: &Connection,
+    tool_id: &str,
+    session_id: &str,
+    instance: Option<&str>,
+) -> Option<i64> {
     conn.query_row(
-        "SELECT read_at FROM unread_read_tombstones WHERE tool_id = ?1 AND session_id = ?2",
-        params![tool_id, session_id],
+        "SELECT read_at FROM unread_read_tombstones WHERE tool_id = ?1 AND session_id = ?2 AND instance_key = ?3",
+        params![tool_id, session_id, ikey(instance)],
         |r| r.get::<_, i64>(0),
     )
     .ok()
@@ -158,9 +182,10 @@ pub fn was_read_recently_conn(
     conn: &Connection,
     tool_id: &str,
     session_id: &str,
+    instance: Option<&str>,
     now_ms: i64,
 ) -> bool {
-    read_tombstone_at_conn(conn, tool_id, session_id)
+    read_tombstone_at_conn(conn, tool_id, session_id, instance)
         .is_some_and(|read_at| read_at > now_ms - READ_TOMBSTONE_TTL_MS)
 }
 
@@ -180,15 +205,15 @@ pub fn try_upsert(r: &UnreadSessionRecord) -> bool {
     upsert_unread(&conn, r)
 }
 
-pub fn delete(tool_id: &str, session_id: &str) {
+pub fn delete(tool_id: &str, session_id: &str, instance: Option<&str>) {
     let conn = DB.lock().unwrap();
-    delete_unread(&conn, tool_id, session_id);
+    delete_unread(&conn, tool_id, session_id, instance);
 }
 
 /// 未读池是否已有该行（全局连接包装）。
-pub fn exists(tool_id: &str, session_id: &str) -> bool {
+pub fn exists(tool_id: &str, session_id: &str, instance: Option<&str>) -> bool {
     let conn = DB.lock().unwrap();
-    exists_unread_conn(&conn, tool_id, session_id)
+    exists_unread_conn(&conn, tool_id, session_id, instance)
 }
 
 pub fn list(now_ms: i64) -> Vec<UnreadSessionRecord> {
@@ -207,16 +232,16 @@ pub fn clear_tool(tool_id: &str) {
 }
 
 /// 记录已读墓碑（读取当前时钟；跳转已读 / 手动关闭未读卡的命令层调用）
-pub fn mark_read(tool_id: &str, session_id: &str) {
+pub fn mark_read(tool_id: &str, session_id: &str, instance: Option<&str>) {
     let now = chrono::Utc::now().timestamp_millis();
     let conn = DB.lock().unwrap();
-    mark_read_tombstone_conn(&conn, tool_id, session_id, now);
+    mark_read_tombstone_conn(&conn, tool_id, session_id, instance, now);
 }
 
 /// 读取已读墓碑时间（全局连接包装）；无墓碑 → None。
-pub fn read_tombstone_at(tool_id: &str, session_id: &str) -> Option<i64> {
+pub fn read_tombstone_at(tool_id: &str, session_id: &str, instance: Option<&str>) -> Option<i64> {
     let conn = DB.lock().unwrap();
-    read_tombstone_at_conn(&conn, tool_id, session_id)
+    read_tombstone_at_conn(&conn, tool_id, session_id, instance)
 }
 
 /// TTL 内是否已读过该会话（Insert 边沿的防复活判据）
@@ -233,6 +258,7 @@ mod tests {
 
     fn rec(tool: &str, sid: &str, at: i64) -> UnreadSessionRecord {
         UnreadSessionRecord {
+            dsh_instance_id: None,
             tool_id: tool.into(),
             session_id: sid.into(),
             project_name: "proj".into(),
@@ -243,12 +269,49 @@ mod tests {
         }
     }
 
+    /// H07 最终批 I5 回归锁：同 ID 跨实例（DSH A/B）与 legacy 行互不覆盖；
+    /// 按实例删除只动本实例行。已读墓碑同理隔离。
+    #[test]
+    fn dsh_unread_same_session_keeps_distinct_instance_rows_and_legacy() {
+        let conn = mem();
+        let mk = |instance: Option<&str>| {
+            let mut r = rec("dsh", "session-same", 1000);
+            r.dsh_instance_id = instance.map(|s| s.to_string());
+            r
+        };
+        for instance in [Some("A"), Some("B"), None] {
+            assert!(upsert_unread(&conn, &mk(instance)), "各行必须独立落库");
+        }
+        assert_eq!(list_unread(&conn, 2000).len(), 3, "A/B/legacy 三行共存");
+        delete_unread(&conn, "dsh", "session-same", Some("A"));
+        let left = list_unread(&conn, 2000);
+        assert_eq!(left.len(), 2);
+        assert!(left
+            .iter()
+            .all(|r| r.dsh_instance_id.as_deref() != Some("A")));
+        // 已读墓碑同理：A 的墓碑不得覆盖 B / legacy
+        mark_read_tombstone_conn(&conn, "dsh", "session-same", Some("A"), 5000);
+        assert_eq!(
+            read_tombstone_at_conn(&conn, "dsh", "session-same", Some("B")),
+            None,
+            "A 的已读不得遮蔽 B"
+        );
+        assert_eq!(
+            read_tombstone_at_conn(&conn, "dsh", "session-same", None),
+            None
+        );
+        assert_eq!(
+            read_tombstone_at_conn(&conn, "dsh", "session-same", Some("A")),
+            Some(5000)
+        );
+    }
+
     #[test]
     fn upsert_then_list_and_dedupe() {
         let conn = mem();
-        assert!(!exists_unread_conn(&conn, "workbuddy", "s1"));
+        assert!(!exists_unread_conn(&conn, "workbuddy", "s1", None));
         assert!(upsert_unread(&conn, &rec("workbuddy", "s1", 1000)));
-        assert!(exists_unread_conn(&conn, "workbuddy", "s1"));
+        assert!(exists_unread_conn(&conn, "workbuddy", "s1", None));
         // 二次 upsert 仅刷新展示字段；turned_green_at/expires_at 保留首绿值
         // （spec §5：turned_green_at＝转绿时间，24h 兜底过期自首绿起算，禁止逐轮滑动）
         let mut updated = rec("workbuddy", "s1", 2000);
@@ -269,7 +332,7 @@ mod tests {
         upsert_unread(&conn, &rec("workbuddy", "s1", 1000));
         upsert_unread(&conn, &rec("workbuddy", "s2", 1000));
         upsert_unread(&conn, &rec("codex", "s3", 1000));
-        delete_unread(&conn, "workbuddy", "s1");
+        delete_unread(&conn, "workbuddy", "s1", None);
         clear_unread_for_tool(&conn, "codex");
         let left = list_unread(&conn, 2000);
         assert_eq!(left.len(), 1);
@@ -298,7 +361,7 @@ mod tests {
         let conn = mem();
         let mut r = rec("workbuddy", "s1", 1000);
         upsert_unread(&conn, &r);
-        delete_unread(&conn, "workbuddy", "s1"); // 跳转已读 → 删行
+        delete_unread(&conn, "workbuddy", "s1", None); // 跳转已读 → 删行
         r.title = Some("刷新后的标题".into());
         refresh_display_unread(&conn, &r);
         assert!(list_unread(&conn, 2000).is_empty(), "已删行不得复活");
@@ -322,20 +385,35 @@ mod tests {
     fn read_tombstone_lifecycle() {
         let conn = mem();
         let now = 10_000_000i64;
-        assert!(!was_read_recently_conn(&conn, "workbuddy", "s1", now));
-        assert_eq!(read_tombstone_at_conn(&conn, "workbuddy", "s1"), None);
-        mark_read_tombstone_conn(&conn, "workbuddy", "s1", now);
-        assert!(was_read_recently_conn(&conn, "workbuddy", "s1", now));
-        assert_eq!(read_tombstone_at_conn(&conn, "workbuddy", "s1"), Some(now));
+        assert!(!was_read_recently_conn(&conn, "workbuddy", "s1", None, now));
+        assert_eq!(read_tombstone_at_conn(&conn, "workbuddy", "s1", None), None);
+        mark_read_tombstone_conn(&conn, "workbuddy", "s1", None, now);
+        assert!(was_read_recently_conn(&conn, "workbuddy", "s1", None, now));
+        assert_eq!(
+            read_tombstone_at_conn(&conn, "workbuddy", "s1", None),
+            Some(now)
+        );
         // 其他会话 / 其他工具不受影响
-        assert!(!was_read_recently_conn(&conn, "workbuddy", "s2", now));
-        assert!(!was_read_recently_conn(&conn, "codex", "s1", now));
+        assert!(!was_read_recently_conn(&conn, "workbuddy", "s2", None, now));
+        assert!(!was_read_recently_conn(&conn, "codex", "s1", None, now));
         // 二次已读刷新时间戳（重复已读不产生第二行，TTL 自刷新时刻重新起算）
-        mark_read_tombstone_conn(&conn, "workbuddy", "s1", now + 1000);
-        assert!(was_read_recently_conn(&conn, "workbuddy", "s1", now + 1000));
+        mark_read_tombstone_conn(&conn, "workbuddy", "s1", None, now + 1000);
+        assert!(was_read_recently_conn(
+            &conn,
+            "workbuddy",
+            "s1",
+            None,
+            now + 1000
+        ));
         // TTL 过期 → 不再算已读，物理清理后行数归零（过期点自刷新时刻起算）
         let beyond = now + 1000 + READ_TOMBSTONE_TTL_MS + 1;
-        assert!(!was_read_recently_conn(&conn, "workbuddy", "s1", beyond));
+        assert!(!was_read_recently_conn(
+            &conn,
+            "workbuddy",
+            "s1",
+            None,
+            beyond
+        ));
         cleanup_expired_read_tombstones_conn(&conn, beyond);
         let n: i64 = conn
             .query_row("SELECT COUNT(*) FROM unread_read_tombstones", [], |r| {
