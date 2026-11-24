@@ -120,6 +120,7 @@ export function FoxbellPet() {
   const animRef = useRef<PetAnimKey>("idle");
   const frameRef = useRef(0);
   const stepTimer = useRef<number | null>(null);
+  const stepGeneration = useRef(0);
   const stateRef = useRef<{
     drag: PetAnimKey | null;
     transient: PetAnimKey | null;
@@ -147,6 +148,7 @@ export function FoxbellPet() {
   }).current;
 
   const cancelStep = () => {
+    stepGeneration.current += 1;
     if (stepTimer.current !== null) {
       window.clearTimeout(stepTimer.current);
       stepTimer.current = null;
@@ -157,7 +159,9 @@ export function FoxbellPet() {
     const def = ANIM[(animRef.current === "look" ? "idle" : animRef.current) as keyof typeof ANIM];
     const i = frameRef.current;
     const ms = def.d[i] ?? 160;
+    const generation = stepGeneration.current;
     stepTimer.current = window.setTimeout(() => {
+      if (generation !== stepGeneration.current || typeof window === "undefined") return;
       frameRef.current = (i + 1) % def.d.length;
       setFrame(frameRef.current);
       stepLoop();

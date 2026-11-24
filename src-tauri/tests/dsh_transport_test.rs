@@ -510,12 +510,12 @@ async fn mux_route(ws: WebSocketUpgrade, headers: HeaderMap, State(st): State<Sh
 /// WS 会话：收到 open 后按注入步骤应答；会话结束即宣告 Peer 失效。
 async fn handle_socket(mut sock: WebSocket, st: Shared) {
     // M6-e：kill_ws 一响即服务端断开（走既有会话结束路径：Peer 失效 + cookie 终态）。
-    while let Some(Ok(msg)) = {
-        tokio::select! {
+    loop {
+        let next = tokio::select! {
             _ = st.kill_ws.notified() => None,
             m = sock.recv() => m,
-        }
-    } {
+        };
+        let Some(Ok(msg)) = next else { break };
         let text = match msg.into_text() {
             Ok(text) => text,
             Err(_) => continue,
