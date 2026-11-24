@@ -14,7 +14,12 @@ import { useEffect, useMemo, useState } from "react";
 import { Crosshair, FileText, Image as ImageIcon, X } from "lucide-react";
 import i18n from "@/i18n";
 import { formatRelativeTime } from "./board-logic";
-import { fetchChannel, type ChannelInfo, type SessionFileEntry } from "./api";
+import {
+  fetchChannel,
+  type ChannelInfo,
+  type DshMediaReference,
+  type SessionFileEntry,
+} from "./api";
 import { artifactSourceLabel } from "./ProjectedArtifacts";
 import type { ArtifactSource } from "./codexIpcApi";
 
@@ -130,6 +135,8 @@ export interface FilePanelEntry extends SessionFileEntry {
 interface FilePanelProps {
   /** 已按 lastSeq 降序（后端契约，本组件不再排序；Task 7 合并视图已按最近引用排好） */
   entries: FilePanelEntry[];
+  media?: DshMediaReference[];
+  onOpenMedia?: (media: DshMediaReference) => void;
   /** 该档位下还有更早文件未纳入（档位提示依据） */
   truncated: boolean;
   scope: number;
@@ -146,6 +153,8 @@ interface FilePanelProps {
 
 export default function FilePanel({
   entries,
+  media = [],
+  onOpenMedia,
   truncated,
   scope,
   loading,
@@ -200,6 +209,13 @@ export default function FilePanel({
     }
     return list;
   }, [entries, kind, origin, activeSearch]);
+
+  const visibleMedia = media.filter(
+    (item) =>
+      (kind === "all" || (item.kind === "image" ? "image" : fileKindOf(item.name)) === kind) &&
+      (origin === "all" || origin === (item.kind === "image" ? "user" : "session_artifact")) &&
+      (!activeSearch || item.name.toLowerCase().includes(activeSearch.toLowerCase()))
+  );
 
   // 到顶判定（用户裁决 3）：1000 = MAX_LIMIT，到顶后不再提示"还有更早文件"
   const atTop = scope >= FILE_SCOPES[FILE_SCOPES.length - 1];
@@ -326,7 +342,7 @@ export default function FilePanel({
         data-font-scale={fontScale}
         className="min-h-0 flex-1 overflow-y-auto px-3 py-2"
       >
-        {visible.length === 0 && !loading && (
+        {visible.length === 0 && visibleMedia.length === 0 && !loading && (
           <p data-testid="panel-empty" className="py-12 text-center text-sm text-[var(--mut)]">
             {i18n.t(
               activeSearch || origin !== "all" ? "mobile.file.noMatch" : "mobile.file.emptyInRange"
@@ -334,6 +350,17 @@ export default function FilePanel({
           </p>
         )}
         <ul className={`space-y-1 ${loading && entries.length > 0 ? "opacity-60" : ""}`}>
+          {visibleMedia.map((item) => (
+            <li key={item.refId} className="rounded-lg border border-[var(--cb)] px-2 py-1">
+              <button
+                type="button"
+                className="block max-w-full truncate text-left text-sm"
+                onClick={() => onOpenMedia?.(item)}
+              >
+                {item.name}
+              </button>
+            </li>
+          ))}
           {visible.map((e, i) => (
             <li
               key={`${e.path}-${i}`}

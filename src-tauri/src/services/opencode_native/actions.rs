@@ -3600,6 +3600,8 @@ fn records_contain(records: &[Value], id: &str) -> bool {
 /// 从账本行重建会话卡（只用于重新绑定：卡片 id + 已归一目录）。
 pub(super) fn session_card(session_id: &str, directory: &str) -> Session {
     Session {
+        dsh_instance_id: None,
+        dsh_subagent: None,
         id: session_id.to_string(),
         agent_type: AgentType::OpenCode,
         project_name: String::new(),
@@ -4497,6 +4499,8 @@ mod tests {
 
     fn card_for(session_id: &str, project: &std::path::Path) -> Session {
         Session {
+            dsh_instance_id: None,
+            dsh_subagent: None,
             id: session_id.to_string(),
             agent_type: AgentType::OpenCode,
             project_name: "project".to_string(),

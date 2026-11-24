@@ -1,0 +1,26 @@
+<!doctype html><html><body><pre id="out">pending</pre>
+<script>
+const results = [];
+function probe(mode, sandbox) {
+  return new Promise((resolve) => {
+    const fr = document.createElement('iframe');
+    fr.sandbox = sandbox;
+    fr.srcdoc = `<script>
+      let r='';
+      try { const v = window.localStorage.getItem('k'); r = 'NO_THROW (value=' + JSON.stringify(v) + ')'; }
+      catch (e) { r = e.name + ': ' + e.message; }
+      parent.postMessage({mode:'${mode}', result:r}, '*');
+    <\/script>`;
+    window.addEventListener('message', function h(e){
+      if (e.data && e.data.mode === mode) { window.removeEventListener('message', h); resolve(e.data.result); }
+    });
+    document.body.appendChild(fr);
+    setTimeout(()=>resolve('TIMEOUT'), 3000);
+  });
+}
+(async () => {
+  const opaque = await probe('opaque', 'allow-scripts');
+  const same = await probe('same', 'allow-scripts allow-same-origin');
+  document.getElementById('out').textContent = JSON.stringify({opaque, same}, null, 2);
+})();
+</script></body></html>

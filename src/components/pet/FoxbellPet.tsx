@@ -120,6 +120,7 @@ export function FoxbellPet() {
   const animRef = useRef<PetAnimKey>("idle");
   const frameRef = useRef(0);
   const stepTimer = useRef<number | null>(null);
+  const stepGeneration = useRef(0);
   const stateRef = useRef<{
     drag: PetAnimKey | null;
     transient: PetAnimKey | null;
@@ -134,12 +135,20 @@ export function FoxbellPet() {
   const lookStop = useRef<(() => void) | null>(null);
   const genRef = useRef({ transient: 0, look: 0 });
 
+  const deferredTimers = useRef(new Set<number>());
   const later = useRef((fn: () => void, ms: number) => {
-    const id = window.setTimeout(fn, ms);
-    return () => window.clearTimeout(id);
+    const id = window.setTimeout(() => {
+      if (deferredTimers.current.delete(id)) fn();
+    }, ms);
+    deferredTimers.current.add(id);
+    return () => {
+      deferredTimers.current.delete(id);
+      window.clearTimeout(id);
+    };
   }).current;
 
   const cancelStep = () => {
+    stepGeneration.current += 1;
     if (stepTimer.current !== null) {
       window.clearTimeout(stepTimer.current);
       stepTimer.current = null;
@@ -150,7 +159,9 @@ export function FoxbellPet() {
     const def = ANIM[(animRef.current === "look" ? "idle" : animRef.current) as keyof typeof ANIM];
     const i = frameRef.current;
     const ms = def.d[i] ?? 160;
+    const generation = stepGeneration.current;
     stepTimer.current = window.setTimeout(() => {
+      if (generation !== stepGeneration.current || typeof window === "undefined") return;
       frameRef.current = (i + 1) % def.d.length;
       setFrame(frameRef.current);
       stepLoop();
@@ -446,11 +457,13 @@ export function FoxbellPet() {
         ? await invoke<SessionMutationOutcome>("mark_session_read", {
             agentType: session.agentType,
             sessionId: session.id,
+            instanceId: session.dshInstanceId,
           })
         : await invoke<SessionMutationOutcome>("dismiss_session_card", {
             agentType: session.agentType,
             sessionId: session.id,
             status: session.status,
+            instanceId: session.dshInstanceId,
           });
     } catch (error) {
       commandFailed = true;
@@ -533,7 +546,10 @@ export function FoxbellPet() {
   useEffect(() => {
     stepLoop();
     scheduleNextLook();
+    const timers = deferredTimers.current;
     return () => {
+      for (const id of timers) window.clearTimeout(id);
+      timers.clear();
       cancelStep();
       stopLook();
       invalidateLookChain();

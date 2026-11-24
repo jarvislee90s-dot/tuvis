@@ -32,6 +32,10 @@ use super::content::SessionMessage;
 /// 文件路径源函数形态（RemoteState 注入缝的类型别名，生产 = extract_file_paths）
 pub type PathSourceFn = dyn Fn(&str, &str, usize) -> (Vec<FileEntry>, bool) + Send + Sync;
 
+/// 受保护数据根来源；读取失败不能退化为空集合。
+pub type ProtectedFileRoots =
+    std::sync::Arc<dyn Fn() -> Result<Vec<PathBuf>, String> + Send + Sync>;
+
 /// 文本类文件大小上限：500KB（Global Constraints）
 const MAX_TEXT_BYTES: u64 = 500 * 1024;
 /// 图片类文件大小上限：5MB（Global Constraints，mime 分支）
@@ -81,9 +85,23 @@ fn artifact_ext_allowed(path: &str) -> bool {
 // 安全读取（read_file_safe）
 // ============================================================
 
-/// 敏感目录清单（2026-09-16 用户裁决；2026-11-12 note §三/D22 起**仅创建域**
-/// 继续引用——`inject/create_path.rs` 的黑名单判定读本表；文件预览链的目录
-/// 准入已整体取消，读侧不再引用）
+/// macOS APFS 数据卷 firmlink 前缀折叠：`/System/Volumes/Data/Users/x` 与
+/// `/Users/x` 是同一 inode 的两个字面形态，而 `canonicalize` **不解析 firmlink**
+/// （firmlink 非 symlink）——不折叠会被误判为「主目录外」而整段跳过黑名单
+/// （2026-09-18 复核实锤：该别名可读 `~/.ssh/known_hosts`，194 字节泄露）。
+/// 纯函数、平台中立（非 macOS 上该前缀不出现，调用为恒等变换）。
+#[cfg(any(unix, test))]
+fn fold_data_volume_alias(p: &Path) -> PathBuf {
+    const PREFIX: &str = "/System/Volumes/Data/";
+    let s = p.to_string_lossy();
+    match s.strip_prefix(PREFIX) {
+        Some(rest) => PathBuf::from(format!("/{rest}")),
+        None if s == "/System/Volumes/Data" => PathBuf::from("/"),
+        None => p.to_path_buf(),
+    }
+}
+
+/// 会话创建使用的目录段名单。文件预览按 D22 执行。
 pub(crate) const SENSITIVE_DIRS: &[&str] = &[
     ".ssh",
     ".aws",
@@ -102,10 +120,41 @@ pub(crate) const SENSITIVE_DIRS: &[&str] = &[
     ".git-credentials",
     "AppData", // Windows 应用数据（含浏览器 profile / 凭据库）
     "Library", // macOS 应用支持与凭据（~/Library/Keychains）
-               // 历史注记（2026-09-16 裁决）：预览链曾仅作用于用户主目录范围内；
-               // D22（2026-11-12 note §三）起预览读侧引用解除，本表仅创建域
-               // （inject/create_path.rs）按其自身策略（全局段匹配）消费
+               // 黑名单仅作用于**用户主目录范围内**（凭据高价值区）；主目录之外不设
+               // 路径级防线（M5 P2-a 全盘放开——系统目录本就低敏，且全路径黑名单会
+               // 误伤 AppData 下的临时文件）
 ];
+
+/// **主目录之外的凭据根**（常见工具数据目录的绝对落点，按段序列匹配）。
+///
+/// 原规则只在主目录内生效，所以用户把 DSH/Tuvis 数据根放到别的盘（如
+/// `D:\tuvis-data`、`/Volumes/x/.dsh`）时，那里的密钥与会话数据对预览**全开**。
+/// 裁决要求「定位实际敏感根」——这里按**相对路径的连续段序列**匹配，因而既能
+/// 接住任意前缀下的 `.dsh`、`.tuvis`，又不会因为路径绝对形态不同而漏。
+///
+/// 仍然放行的是普通文件（桌面/下载/临时目录）：它们不含这些段序列。
+#[cfg(unix)]
+fn has_credential_root_segment(child: &Path, windows: bool) -> bool {
+    const CREDENTIAL_ROOTS: &[&str] = &[
+        ".dsh", ".tuvis", ".ssh", ".aws", ".gnupg", ".kube", ".docker",
+    ];
+    let text = child.to_string_lossy();
+    let normalized = if windows {
+        text.replace('\\', "/").to_ascii_lowercase()
+    } else {
+        text.replace('\\', "/")
+    };
+    let segments: Vec<&str> = normalized.split('/').filter(|s| !s.is_empty()).collect();
+    segments.iter().any(|segment| {
+        CREDENTIAL_ROOTS.iter().any(|root| {
+            if windows {
+                segment.eq_ignore_ascii_case(root)
+            } else {
+                *segment == *root
+            }
+        })
+    })
+}
 
 /// 预览拒绝原因（M5 P2-a：403 细分——原因仅暴露给已过闸设备，便于用户自助排障；
 /// 原设计「一律空体 403 防探测」随边界放开退役：PIN + cookie 已是门槛，原因文案
@@ -113,6 +162,9 @@ pub(crate) const SENSITIVE_DIRS: &[&str] = &[
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FileRejectReason {
+    /// 命中敏感目录黑名单（基准可用时仅主目录内路径参与判定；基准不可用时
+    /// 退化为全段匹配——见 `read_file_safe` 的 fail-closed 分支）
+    Sensitive,
     /// 超过预览大小上限
     TooLarge,
     /// 路径不存在或为空
@@ -139,6 +191,7 @@ impl FileRejectReason {
     /// 日志用中文明细（reason 字段本身走 snake_case 序列化）
     pub fn message(&self) -> String {
         match self {
+            FileRejectReason::Sensitive => "路径命中敏感目录黑名单，不可预览".into(),
             FileRejectReason::TooLarge => format!(
                 "文件超过预览上限（文本 {}KB / 图片 {}MB）",
                 MAX_TEXT_BYTES / 1024,
@@ -152,21 +205,49 @@ impl FileRejectReason {
     }
 }
 
-/// 安全读取文件（全盘语义）：任意路径可读，仅两道约束——① 只读；② 双阈值
-/// 大小上限。目录级准入（主目录内敏感黑名单 + 产物子路径豁免 + 基准缺失
-/// fail-closed 凭据段）已按 2026-11-12 note §三（宪法 D22）**整体取消**：信任
-/// 边界统一回到已授权总闸门（PIN + 设备 cookie），读取以 OS 实际权限为准，
-/// 不再伪报目录策略拒绝；`SENSITIVE_DIRS` 仍由 `inject/create_path.rs` 的
-/// 创建域判定引用（读侧引用已解除，原表值保留）。
-/// 返回 (字节, mime)；拒绝一律 Err(FileRejectReason)（file 端点统一 403 并把
-/// reason 序列化进响应体）。`path` 支持绝对路径与相对路径（相对者按会话 cwd
-/// 解析——部分工具 toolArgs 记录项目内相对路径）。
-///
-/// `home` 参数保留仅为调用方签名稳定（预览链已不再消费）。
+/// 读取普通文件，保留句柄核验与大小上限。相对路径按会话项目目录解析。
 pub fn read_file_safe(
     session_cwd: &str,
     path: &str,
+    home: Option<&str>,
+) -> Result<(Vec<u8>, String), FileRejectReason> {
+    read_file_safe_with_roots(session_cwd, path, home, &[])
+}
+
+#[cfg(all(unix, feature = "dsh-test-probes"))]
+type FileReadHook = std::sync::Arc<dyn Fn(&str, &Path) + Send + Sync>;
+
+#[cfg(all(unix, feature = "dsh-test-probes"))]
+static FILE_READ_HOOK: std::sync::OnceLock<FileReadHook> = std::sync::OnceLock::new();
+
+#[cfg(all(unix, feature = "dsh-test-probes"))]
+#[doc(hidden)]
+pub fn install_file_read_hook_for_test(hook: FileReadHook) -> Result<(), FileReadHook> {
+    FILE_READ_HOOK.set(hook)
+}
+
+#[cfg(unix)]
+pub(super) fn protected_attachment_metadata_path(path: &Path, roots: &[PathBuf]) -> bool {
+    let path = fold_data_volume_alias(path);
+    has_credential_root_segment(&path, false)
+        || roots.iter().any(|root| {
+            !root.is_absolute()
+                || path_within(&path, &fold_data_volume_alias(root))
+                || match root.canonicalize() {
+                    Ok(root) => path_within(&path, &fold_data_volume_alias(&root)),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        !matches!(std::fs::symlink_metadata(root), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+                    }
+                    Err(_) => true,
+                }
+        })
+}
+
+pub fn read_file_safe_with_roots(
+    session_cwd: &str,
+    path: &str,
     _home: Option<&str>,
+    _protected_roots: &[PathBuf],
 ) -> Result<(Vec<u8>, String), FileRejectReason> {
     if path.trim().is_empty() {
         return Err(FileRejectReason::NotFound);
@@ -178,7 +259,24 @@ pub fn read_file_safe(
         full = cwd.join(full);
     }
     let canon = full.canonicalize()?;
-    let meta = canon.metadata()?;
+    #[cfg(unix)]
+    let verified_components = snapshot_file_components(&canon)?;
+    // 目录准入：D22（2026-11-12 用户裁决，见 MASTER-PLAN §0.2）起**取消**——
+    // 通过总闸门认证并绑定的设备视为本人使用，预览不再按项目目录、主目录、
+    // 临时目录或敏感目录黑白名单二次拒绝；合法路径解析、普通文件检查、只读
+    // 语义与操作系统实际访问控制继续生效。`SENSITIVE_DIRS` 仅供创建域
+    // （`inject/create_path.rs`）消费。下文的句柄级组件校验属于**正确性**
+    // （防止核验后目录被替换的 TOCTOU），不是对本人追加的授权门槛。
+    use std::io::Read;
+    #[cfg(all(unix, feature = "dsh-test-probes"))]
+    if let Some(hook) = FILE_READ_HOOK.get() {
+        hook("before_open", &canon);
+    }
+    #[cfg(unix)]
+    let file = open_verified_components(&verified_components)?;
+    #[cfg(not(unix))]
+    let file = std::fs::File::open(&canon).map_err(|_| FileRejectReason::NotFound)?;
+    let meta = file.metadata().map_err(|_| FileRejectReason::Io)?;
     if !meta.is_file() {
         return Err(FileRejectReason::NotFile);
     }
@@ -193,25 +291,26 @@ pub fn read_file_safe(
     if meta.len() > max {
         return Err(FileRejectReason::TooLarge);
     }
+    #[cfg(all(unix, feature = "dsh-test-probes"))]
+    if let Some(hook) = FILE_READ_HOOK.get() {
+        hook("before_read", &canon);
+    }
     // A5.2/F7（终审 Minor）：stat 与读取之间的**可控变更缝**（仅测试）——
-    // 增长用例经此在 stat 通过后、读取前把文件追加到超限，真实覆盖
-    // 「读取时有界」分支（而非 stat 可见的超限回归）。
+    // 增长用例经此在 stat 通过后、读取前把文件追加到超限，真实覆盖「读取时
+    // 有界」分支（而非 stat 可见的超限回归）。HEAD 侧的 `take(max + 1)` 已经
+    // 保证读取有界；本缝只负责制造该窗口。
     #[cfg(test)]
     if let Some(mutator) = STAT_READ_MUTATOR.with(|cell| cell.borrow().clone()) {
         mutator(&canon);
-        // 变更后重新 stat：仅当仍是常规文件才继续（增长形态）。
-        let grown = canon.metadata()?;
+        let grown = canon.metadata().map_err(|_| FileRejectReason::NotFound)?;
         if !grown.is_file() {
             return Err(FileRejectReason::NotFile);
         }
     }
-    // A5.2/F7：实际读取亦有界——stat 与读取之间的增长不得绕过上限
-    //（take(max+1) 截断 + 多读一字节探测超限；恰好上限完整可读、无空成功）。
-    let file = std::fs::File::open(&canon)?;
-    let mut limited = file.take(max + 1);
     let mut bytes = Vec::new();
-    use std::io::Read as _;
-    limited.read_to_end(&mut bytes)?;
+    file.take(max + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| FileRejectReason::Io)?;
     if bytes.len() as u64 > max {
         return Err(FileRejectReason::TooLarge);
     }
@@ -229,7 +328,9 @@ thread_local! {
 }
 
 /// A5.2/F7（测试缝）：安装 stat→read 之间的文件变更回调；返回清除守卫。
+/// 目前由集成用例直接驱动线程局部量；保留此公开安装口供后续用例复用。
 #[cfg(test)]
+#[allow(dead_code)]
 pub(crate) fn install_stat_read_mutator(mutator: Option<StatReadMutator>) -> impl Drop {
     struct Guard;
     impl Drop for Guard {
@@ -239,6 +340,129 @@ pub(crate) fn install_stat_read_mutator(mutator: Option<StatReadMutator>) -> imp
     }
     STAT_READ_MUTATOR.with(|cell| *cell.borrow_mut() = mutator);
     Guard
+}
+
+#[cfg(unix)]
+fn snapshot_file_components(
+    path: &Path,
+) -> Result<Vec<(std::ffi::OsString, u64, u64)>, FileRejectReason> {
+    use std::os::unix::fs::MetadataExt;
+    let mut prefix = PathBuf::from("/");
+    let mut result = Vec::new();
+    for component in path.components() {
+        if let std::path::Component::Normal(name) = component {
+            prefix.push(name);
+            let meta =
+                std::fs::symlink_metadata(&prefix).map_err(|_| FileRejectReason::NotFound)?;
+            if meta.file_type().is_symlink() {
+                return Err(FileRejectReason::Sensitive);
+            }
+            result.push((name.to_os_string(), meta.dev(), meta.ino()));
+        }
+    }
+    if result.is_empty() {
+        return Err(FileRejectReason::NotFile);
+    }
+    Ok(result)
+}
+
+#[cfg(unix)]
+fn open_verified_components(
+    components: &[(std::ffi::OsString, u64, u64)],
+) -> Result<std::fs::File, FileRejectReason> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
+
+    let mut directory = std::fs::File::open("/").map_err(|_| FileRejectReason::Io)?;
+    for (index, (name, dev, ino)) in components.iter().enumerate() {
+        let name = CString::new(name.as_bytes()).map_err(|_| FileRejectReason::NotFound)?;
+        let mut flags = libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK;
+        if index + 1 < components.len() {
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            {
+                flags |= libc::O_SEARCH;
+            }
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            {
+                flags |= libc::O_PATH | libc::O_DIRECTORY;
+            }
+            #[cfg(not(any(
+                target_os = "macos",
+                target_os = "ios",
+                target_os = "linux",
+                target_os = "android"
+            )))]
+            {
+                flags |= libc::O_RDONLY | libc::O_DIRECTORY;
+            }
+        } else {
+            flags |= libc::O_RDONLY;
+        }
+        // SAFETY: name is NUL-terminated, directory remains open and a successful fd is owned below.
+        let fd = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), flags) };
+        if fd < 0 {
+            return Err(FileRejectReason::Sensitive);
+        }
+        let opened = unsafe { std::fs::File::from_raw_fd(fd) };
+        let meta = opened.metadata().map_err(|_| FileRejectReason::Io)?;
+        if meta.dev() != *dev || meta.ino() != *ino {
+            return Err(FileRejectReason::Sensitive);
+        }
+        directory = opened;
+    }
+    Ok(directory)
+}
+
+/// 路径包含判定（canonicalize 之后的双方）：Windows 语义自动分派
+#[cfg(unix)]
+fn path_within(child: &Path, ancestor: &Path) -> bool {
+    path_within_semantics(
+        &child.to_string_lossy(),
+        &ancestor.to_string_lossy(),
+        cfg!(windows),
+    )
+}
+
+/// 路径包含判定内核（字符串级、平台语义可注入——darwin 上可测全分支）：
+/// - 剥 Windows verbatim 前缀（`\\?\UNC\` → `\\`、`\\?\` → 空），统一分隔符为 `/`，
+///   去尾部分隔符；Windows 语义整体转小写（文件系统大小写不敏感）；
+/// - 前缀命中后剩余必须为空或以 `/` 开头（`/ab` 不在 `/a` 之下——分隔符边界）；
+/// - 祖先为根（`/`）时任意绝对路径都包含（根即一切）。
+#[cfg(any(unix, test))]
+fn path_within_semantics(child: &str, ancestor: &str, windows: bool) -> bool {
+    let norm = |s: &str| -> String {
+        // 剥 verbatim 前缀（UNC 形态还原为 `\\server\share` 常规形态再统一分隔符）
+        let s = if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+            format!(r"\\{rest}")
+        } else if let Some(rest) = s.strip_prefix(r"\\?\") {
+            rest.to_string()
+        } else {
+            s.to_string()
+        };
+        let mut s = s.replace('\\', "/");
+        while s.len() > 1 && s.ends_with('/') {
+            s.pop();
+        }
+        if windows {
+            s.to_lowercase()
+        } else {
+            s
+        }
+    };
+    let c = norm(child);
+    let a = norm(ancestor);
+    if a.is_empty() {
+        return false;
+    }
+    if a == "/" {
+        return c.starts_with('/');
+    }
+    match c.strip_prefix(&a) {
+        Some(rest) => rest.is_empty() || rest.starts_with('/'),
+        None => false,
+    }
 }
 
 /// 按扩展名给 MIME（预览渲染分支依据；未知扩展回落 text/plain——按纯文本
@@ -321,6 +545,61 @@ pub fn extract_file_paths_with(
 /// 双参——dsh/kimi 数据根重定向可注入（env 值作参，测试锁重定向链路，零真实 env
 /// 接触）。生产薄壳不走 None：extract_file_paths 经 content::read_env_homes 读真实值。
 ///
+pub(super) fn dsh_file_views(
+    home: &Path,
+    dsh_root: &str,
+    session_id: &str,
+    limit: usize,
+) -> (Vec<FileEntry>, bool, Vec<super::content::SessionMedia>) {
+    let Ok(page) = super::content::read_session_messages_impl(
+        home,
+        Some(dsh_root),
+        None,
+        "dsh",
+        session_id,
+        limit,
+        0,
+    ) else {
+        return (Vec::new(), false, Vec::new());
+    };
+    let mut merger = EntryMerger::new(cfg!(windows));
+    merger.absorb_messages(&page.messages);
+    merger.merge_artifact_fallback(
+        &extract_artifact_candidates(&page.messages),
+        page.cwd.as_deref(),
+    );
+    let mut files = merger.finish();
+    filter_artifacts_by_existence(&mut files, page.cwd.as_deref(), &|path| path.exists());
+    let mut seen = std::collections::HashSet::new();
+    let mut delivered_paths = std::collections::HashSet::new();
+    let mut media = Vec::new();
+    for item in page
+        .messages
+        .into_iter()
+        .rev()
+        .flat_map(|message| message.media)
+    {
+        if seen.insert(item.ref_id.clone()) {
+            if let Some(path) = &item.present_path {
+                delivered_paths.insert(crate::file_identity::file_identity_key(
+                    path,
+                    page.cwd.as_deref(),
+                    cfg!(windows),
+                ));
+            }
+            media.push(item);
+        }
+    }
+    files.retain(|file| {
+        !delivered_paths.contains(&crate::file_identity::file_identity_key(
+            &file.path,
+            page.cwd.as_deref(),
+            cfg!(windows),
+        ))
+    });
+    (files, page.truncated, media)
+}
+
 /// M3+（用户裁决 2）：limit 直接**透传** read_session_messages_impl——条数窗、
 /// 字节窗（512KB×⌈limit/200⌉ 封顶 4MB）与 truncated 全部复用主会话同一套机制，
 /// 本层零新增预算代码；返回值第二项即该 truncated（前端据此提示「还有更早文件」）
@@ -333,7 +612,8 @@ pub(crate) fn extract_file_paths_with_env(
     limit: usize,
 ) -> (Vec<FileEntry>, bool) {
     // 复用 Task 7 的八工具统一出口（数据同源：与详情页读的是同一份消息流），
-    // 不另立 per-tool 查询（控制者裁决）；派发核 pub(crate) 同源复用
+    // 不另立 per-tool 查询（控制者裁决）；派发核 pub(crate) 同源复用。
+    // skip = 0：文件提取永远吃最新窗口（续页游标是详情页协议，与文件面无关）。
     match super::content::read_session_messages_impl(
         home,
         dsh_env_home,
@@ -341,18 +621,16 @@ pub(crate) fn extract_file_paths_with_env(
         agent_type,
         session_id,
         limit,
+        0,
     ) {
         Ok(pg) => {
             let mut merger = EntryMerger::new(cfg!(windows));
             merger.absorb_messages(&pg.messages);
             // M5 B2：zcode 用户附件第二抽取源——part 表 type=file（B1 调研）。
             // 该形态不在统一消息流的文本里（content.rs 只拼 text parts），故走
-            // content 层专用查询拿「(显示序号, 路径或 artifact URI, ts)」。
-            // A7 同源锚点：序号出自与正文同一个 bounded-window／finalize 投影
-            // （read_zcode_projection_with）的所属消息最终显示 seq，与本页
-            // SessionMessage.seq 同刻度；所属消息无显示条目（file-only／被过滤）
-            // 时取中性 0 仅作排序占位。其它工具用户附件已随 user 正文内联标记
-            // 覆盖（absorb_messages）。
+            // content 层专用查询拿「(窗口序号, 路径或 artifact URI, ts)」，序号与
+            // SessionMessage.seq 同刻度（同一窗口查询），合并排序语义一致。
+            // 其它工具用户附件已随 user 正文内联标记覆盖（absorb_messages）。
             if agent_type == "zcode" {
                 for (seq, r#ref, ts) in
                     super::content::read_zcode_attachment_refs_with(home, session_id, limit)
@@ -981,6 +1259,8 @@ mod tests {
             tool_name: Some("Write".into()),
             tool_args: Some(args.into()),
             collapsed: true,
+            media: Vec::new(),
+            blocks: Vec::new(),
         }
     }
 
@@ -994,6 +1274,8 @@ mod tests {
             tool_name: None,
             tool_args: None,
             collapsed: kind == "thinking",
+            media: Vec::new(),
+            blocks: Vec::new(),
         }
     }
 
@@ -1172,94 +1454,6 @@ mod tests {
         );
     }
 
-    /// A5.2（F7）增长场景：小文件创建 → 复制引用 → 追加至超限 → read_file_safe
-    /// → TooLarge 且无字节返回（无空成功）。有界读取（File::take(max+1)）下
-    /// stat 后增长在读侧被截断探测（超过 max+1 即 TooLarge，无需外部时序缝）。
-    #[test]
-    fn read_file_safe_rejects_growth_beyond_cap_after_stat() {
-        // A5.2（终审 Minor）：经 stat→read 定序缝的真实「读取时增长」覆盖——
-        // 调用前文件恰在上限内（stat 可见通过），缝内在读取前追加超限，
-        // 断言有界读取在读侧截断探测为 TooLarge 且无字节返回。
-        let tmp = tempfile::tempdir().unwrap();
-        let cwd = tmp.path().to_str().unwrap();
-        let txt = tmp.path().join("grow.txt");
-        std::fs::write(&txt, vec![b'a'; MAX_TEXT_BYTES as usize]).unwrap();
-        {
-            let grown = txt.clone();
-            let _guard = install_stat_read_mutator(Some(std::rc::Rc::new(move |_| {
-                let bigger: Vec<u8> = vec![b'a'; MAX_TEXT_BYTES as usize + 1];
-                let _ = std::fs::write(&grown, bigger);
-            })));
-            match read_file_safe(cwd, txt.to_str().unwrap(), Some(cwd)) {
-                Err(FileRejectReason::TooLarge) => {}
-                Err(other) => panic!("stat 后增长超限必须 TooLarge，实际 {other:?}"),
-                Ok((bytes, _)) => panic!(
-                    "stat 后增长超限必须拒绝且无字节返回，实际返回 {} 字节",
-                    bytes.len()
-                ),
-            }
-        }
-        // 图片阈值同理（5 MiB + 1，缝内追加）。
-        let png = tmp.path().join("grow.png");
-        std::fs::write(&png, vec![0u8; MAX_IMAGE_BYTES as usize]).unwrap();
-        {
-            let grown = png.clone();
-            let _guard = install_stat_read_mutator(Some(std::rc::Rc::new(move |_| {
-                let bigger: Vec<u8> = vec![0u8; MAX_IMAGE_BYTES as usize + 1];
-                let _ = std::fs::write(&grown, bigger);
-            })));
-            match read_file_safe(cwd, png.to_str().unwrap(), Some(cwd)) {
-                Err(FileRejectReason::TooLarge) => {}
-                Err(other) => panic!("图片 stat 后增长超限必须 TooLarge，实际 {other:?}"),
-                Ok((bytes, _)) => panic!(
-                    "图片 stat 后增长超限必须拒绝且无字节返回，实际返回 {} 字节",
-                    bytes.len()
-                ),
-            }
-        }
-    }
-
-    /// A5.2（F7）：实际读取硬上限合同。
-    /// 合同点 = stat 后增长超限明确拒绝（读后 bytes.len() > max → TooLarge）；
-    /// 可观察面 = 当前实现 stat 与 `fs::read` 为相邻 syscall 且无注入缝（外部
-    /// 时序不可控），故本用例钉住可达面（恰上限完整可读 / stat 可见超限明确
-    /// 拒绝 TooLarge / 非空文件无空成功）；stat 后增长的注入形态留待实现侧
-    /// 补缝（读后上限校验）后以同形样本转 RED→GREEN。
-    /// 既有回归面（不重写断言，仅名称核对）：`read_file_safe_enforces_dual_size_thresholds`
-    /// （双阈值两侧样本）、`read_file_safe_allows_outside_project_and_home`
-    /// （原限制目录隔离已取消、普通文件可读）；认证/响应头（CSP/nosniff/
-    /// no-store）/HTML iframe 沙箱/D21 创建路径保护由 codex_ipc_remote 集成面
-    /// 既有用例覆盖（file 端点统一 403 + reason 序列化）。
-    #[test]
-    fn read_file_safe_f7_hard_cap_contract() {
-        let tmp = tempfile::tempdir().unwrap();
-        let cwd = tmp.path().to_str().unwrap();
-        // 恰上限：可读且读取字节数 == stat 尺寸（实际读取有限）。
-        let txt = tmp.path().join("exact.txt");
-        std::fs::write(&txt, vec![b'a'; MAX_TEXT_BYTES as usize]).unwrap();
-        let (bytes, _) = read_file_safe(cwd, txt.to_str().unwrap(), Some(cwd)).unwrap();
-        assert_eq!(bytes.len(), MAX_TEXT_BYTES as usize, "恰上限完整可读");
-        assert!(!bytes.is_empty(), "非空文件无空成功");
-        // 上限 + 1（stat 可见）：明确 TooLarge（非 Io/NotFound 误报）。
-        std::fs::write(&txt, vec![b'a'; MAX_TEXT_BYTES as usize + 1]).unwrap();
-        assert_eq!(
-            read_file_safe(cwd, txt.to_str().unwrap(), Some(cwd)).unwrap_err(),
-            FileRejectReason::TooLarge,
-            "stat 可见超限明确拒绝（TooLarge）"
-        );
-        // 图片阈值同理（5 MiB 恰上限 / +1）。
-        let png = tmp.path().join("exact.png");
-        std::fs::write(&png, vec![0u8; MAX_IMAGE_BYTES as usize]).unwrap();
-        let (bytes, mime) = read_file_safe(cwd, png.to_str().unwrap(), Some(cwd)).unwrap();
-        assert_eq!(bytes.len(), MAX_IMAGE_BYTES as usize);
-        assert_eq!(mime, "image/png");
-        std::fs::write(&png, vec![0u8; MAX_IMAGE_BYTES as usize + 1]).unwrap();
-        assert_eq!(
-            read_file_safe(cwd, png.to_str().unwrap(), Some(cwd)).unwrap_err(),
-            FileRejectReason::TooLarge
-        );
-    }
-
     /// 全盘放开（2026-09-18 用户裁决）：项目外 / 主目录外的文件**放行**——
     /// 经常需要查看/参考项目目录外文件（微信目录附件等实测场景）；
     /// 访问门槛 = PIN + 设备 cookie，路径级防线收敛为敏感目录黑名单
@@ -1299,127 +1493,122 @@ mod tests {
             read_file_safe(cwd, outside.to_str().unwrap(), Some(home.to_str().unwrap()))
                 .unwrap_or_else(|e| panic!("全盘语义下主目录外文件必须放行: {e:?}"));
         assert_eq!(bytes, b"x");
-        // home=None ⇒ 无任何预览边界（D22：准入取消；OS 权限为准）
+        // home=None ⇒ 基准不可用 → 全段保守匹配分支：outside.txt 不含敏感段，
+        // 故仍可读（全盘语义不变；黑名单对含敏感段路径照拒——见
+        // sensitive_check_still_applies_when_home_base_unusable）
         let r = read_file_safe(cwd, outside.to_str().unwrap(), None);
         assert!(r.is_ok(), "home=None 不再构成边界（全盘语义）");
     }
 
-    /// D22（2026-11-12 note §三）：预览目录准入取消后的新行为锁——原敏感清单
-    /// 目录下的普通文件沿现有预览入口可读（OS 权限为准），不再伪报目录策略
-    /// 拒绝；前缀相似目录本就不误伤。创建域（create_path）仍引用原表，不在本锁。
+    /// MASTER-PLAN §0.2〔D22〕：预览不再按目录或凭据名称限制普通文件。
     #[test]
-    fn sensitive_dirs_preview_like_any_other_file_after_d22() {
+    fn read_file_safe_allows_sensitive_dirs_inside_home_after_d22() {
         let tmp = tempfile::tempdir().unwrap();
-        let home = tmp.path().join("home");
-        let proj = home.join("Desktop").join("proj");
-        std::fs::create_dir_all(&proj).unwrap();
-        let cwd = proj.to_str().unwrap();
-        let home_s = home.to_str().unwrap();
-
-        for dir in [".ssh", ".aws", ".config", ".codex", ".kimi-code"] {
-            let d = home.join(dir);
-            std::fs::create_dir_all(&d).unwrap();
-            let f = d.join("notes.txt");
-            std::fs::write(&f, "content").unwrap();
-            let r = read_file_safe(cwd, f.to_str().unwrap(), Some(home_s));
-            assert!(
-                r.is_ok(),
-                "D22 后敏感目录 {dir} 下普通文件必须可预览（准入已取消）"
+        let home = tmp.path();
+        let project = home.join("Desktop/proj");
+        std::fs::create_dir_all(&project).unwrap();
+        let cwd = project.to_str().unwrap();
+        let home = home.to_str().unwrap();
+        for dir in [
+            ".ssh",
+            ".aws",
+            ".gnupg",
+            ".tuvis",
+            ".claude",
+            ".codex",
+            ".kimi-code",
+            ".zcode",
+            ".dsh",
+            ".config",
+            ".docker",
+            ".kube",
+            ".npmrc",
+            ".ssh2",
+        ] {
+            let dir = Path::new(home).join(dir);
+            std::fs::create_dir(&dir).unwrap();
+            let file = dir.join("id_rsa");
+            std::fs::write(&file, b"fixture").unwrap();
+            assert_eq!(
+                read_file_safe(cwd, file.to_str().unwrap(), Some(home))
+                    .unwrap()
+                    .0,
+                b"fixture"
+            );
+            assert_eq!(
+                read_file_safe(cwd, dir.to_str().unwrap(), Some(home)).unwrap_err(),
+                FileRejectReason::NotFile
             );
         }
-        // 前缀相似目录（.ssh2）与普通文件一样可读（回归不变量保持）
-        let lookalike = home.join(".ssh2");
-        std::fs::create_dir_all(&lookalike).unwrap();
-        let f = lookalike.join("notes.txt");
-        std::fs::write(&f, "ok").unwrap();
-        assert!(
-            read_file_safe(cwd, f.to_str().unwrap(), Some(home_s)).is_ok(),
-            "前缀相似目录（.ssh2）必须可读"
-        );
     }
 
-    /// D22 后：home 基准缺失/坏基准不再构成任何预览边界——原 fail-closed 分支
-    /// 已随准入取消退役；坏基准不得把读取打成 NotFound（回归不变量保持）。
+    /// MASTER-PLAN §0.2〔D22〕：预览不再按目录或凭据名称限制普通文件。
     #[test]
-    fn sensitive_paths_readable_even_when_home_base_unusable() {
+    fn read_file_safe_allows_files_without_usable_home_after_d22() {
         let tmp = tempfile::tempdir().unwrap();
-        let proj = tmp.path().join("proj");
-        std::fs::create_dir_all(&proj).unwrap();
-        let cwd = proj.to_str().unwrap();
-
-        // tmpdir 下造敏感段路径（不触真实主目录）
-        let secret = tmp.path().join(".ssh").join("id_rsa");
-        std::fs::create_dir_all(secret.parent().unwrap()).unwrap();
-        std::fs::write(&secret, "PRIVATE").unwrap();
-        let ok = tmp.path().join("notes.txt");
-        std::fs::write(&ok, "ok").unwrap();
-
-        // (1) home 未注入 → 敏感段普通文件可读（准入已取消；OS 权限为准）
-        assert!(
-            read_file_safe(cwd, secret.to_str().unwrap(), None).is_ok(),
-            "home 未知不再构成预览边界（D22）"
-        );
-        // (2) 坏基准（canonicalize 失败）同样可读，且不得误报 NotFound
-        assert!(
-            read_file_safe(cwd, secret.to_str().unwrap(), Some("/no-such-mam-home")).is_ok(),
-            "坏基准不得构成预览边界（D22）"
-        );
-        // (3) 普通文件照常可读（回归不变量保持）
-        assert!(read_file_safe(cwd, ok.to_str().unwrap(), None).is_ok());
-        assert!(read_file_safe(cwd, ok.to_str().unwrap(), Some("/no-such-mam-home")).is_ok());
+        std::fs::create_dir(tmp.path().join(".ssh")).unwrap();
+        std::fs::write(tmp.path().join(".ssh/id_rsa"), b"fixture").unwrap();
+        std::fs::write(tmp.path().join("notes.txt"), b"fixture").unwrap();
+        let missing_home = tmp.path().join("missing-home");
+        let cwd = tmp.path().to_str().unwrap();
+        for home in [None, Some(missing_home.to_str().unwrap())] {
+            for path in [".ssh/id_rsa", "notes.txt"] {
+                assert_eq!(read_file_safe(cwd, path, home).unwrap().0, b"fixture");
+            }
+            assert_eq!(
+                read_file_safe(cwd, ".ssh/missing", home).unwrap_err(),
+                FileRejectReason::NotFound
+            );
+        }
     }
 
-    /// macOS firmlink 别名旁路回归锁（2026-09-18 复核阻塞项）：
-    /// `canonicalize` 不解析 APFS firmlink（firmlink 非 symlink），
-    /// `/System/Volumes/Data/<home>` 与 `<home>` 是**同 inode** 的两个字面形态——
-    /// 只做字符串前缀比较会把主目录内路径误判为「主目录外」，按全盘裁决整段跳过
-    /// 黑名单（2026-09-18 实测：别名可读 ~/.ssh/known_hosts，194 字节泄露）。
-    /// 夹具走 tmpdir + 前缀合成（零真实主目录接触，M5 红线）。
-    ///
-    /// 夹具配方要点：tmpdir 原始形态是 `/var/...`，而 `/var` **不在** firmlink
-    /// 清单（`/usr/share/firmlinks` 只有 `/private`）；必须先 `canonicalize()`
-    /// 拿到 `/private/var/...` 再加前缀，别名才真实存在且同 inode（已实测）。
+    /// MASTER-PLAN §0.2〔D22〕：预览不再按目录或凭据名称限制普通文件。
     #[cfg(target_os = "macos")]
     #[test]
-    fn firmlink_alias_still_hits_sensitive_blacklist() {
+    fn firmlink_alias_previews_regular_files_after_d22() {
         let tmp = tempfile::tempdir().unwrap();
+        // 先解析 /var 符号链接，再构造实际存在的 APFS Data 卷别名。
         let home = tmp.path().canonicalize().unwrap();
-        std::fs::create_dir_all(home.join(".ssh")).unwrap();
-        std::fs::write(home.join(".ssh").join("id_rsa"), "PRIVATE").unwrap();
-        std::fs::write(home.join("ok.txt"), "ok").unwrap();
-        let h = home.to_str().unwrap();
-        let alias = |tail: &str| format!("/System/Volumes/Data{h}/{tail}");
-
-        // 夹具自检：别名必须真实存在（否则本锁是空转——把「存在性」也锁住）
-        assert!(
-            std::path::Path::new(&alias(".ssh/id_rsa")).exists(),
-            "夹具别名必须真实存在（先 canonicalize 再加前缀，见本测试文档）"
-        );
-
-        // (1) 别名形态凭据文件可读（D22：准入已取消，OS 权限为准）
-        assert!(
-            read_file_safe(h, &alias(".ssh/id_rsa"), Some(h)).is_ok(),
-            "firmlink 别名形态文件必须可预览（D22）"
-        );
-        // (2) 别名形态的普通文件仍可读（回归不变量保持）
-        assert!(
-            read_file_safe(h, &alias("ok.txt"), Some(h)).is_ok(),
-            "别名形态普通文件必须放行"
-        );
-        // (3) 主目录**外**别名路径可读（回归不变量保持）
-        let out = tempfile::tempdir().unwrap();
-        let op = out.path().canonicalize().unwrap().join(".ssh");
-        std::fs::create_dir_all(&op).unwrap();
-        std::fs::write(op.join("n.txt"), "x").unwrap();
-        let outside = format!("/System/Volumes/Data{}", op.join("n.txt").display());
-        assert!(
-            read_file_safe(h, &outside, Some(h)).is_ok(),
-            "主目录外路径可读"
+        std::fs::create_dir(home.join(".ssh")).unwrap();
+        let home = home.to_str().unwrap();
+        let alias = |tail: &str| format!("/System/Volumes/Data{home}/{tail}");
+        for path in [".ssh/id_rsa", "ok.txt"] {
+            std::fs::write(Path::new(home).join(path), b"fixture").unwrap();
+            assert!(Path::new(&alias(path)).is_file());
+            assert_eq!(
+                read_file_safe(home, &alias(path), Some(home)).unwrap().0,
+                b"fixture"
+            );
+        }
+        assert_eq!(
+            read_file_safe(home, &alias(".ssh"), Some(home)).unwrap_err(),
+            FileRejectReason::NotFile
         );
     }
 
-    /// 2026-10-20 快速接入：消息流读不到时，Codex APP 生成图仍进「会话产物」池，
-    /// 且可预览（D22 后沿全盘语义可读，不再依赖豁免表）。
+    /// firmlink 前缀折叠纯函数锁（跨平台——CI 只有 ubuntu 跑 `cargo test`，
+    /// `#[cfg(target_os = "macos")]` 的端到端锁在 CI 永不执行，2026-09-18 复核
+    /// Important）：别名形态折叠、恒等形态原样、挂载点本身归根。
+    #[test]
+    fn fold_data_volume_alias_folds_prefix_and_keeps_others() {
+        // 别名形态 → 折叠为主目录字面
+        assert_eq!(
+            fold_data_volume_alias(Path::new("/System/Volumes/Data/Users/u/.ssh/id_rsa")),
+            Path::new("/Users/u/.ssh/id_rsa")
+        );
+        // 恒等：非前缀路径原样返回
+        assert_eq!(
+            fold_data_volume_alias(Path::new("/Users/u/.ssh/id_rsa")),
+            Path::new("/Users/u/.ssh/id_rsa")
+        );
+        // 挂载点本身 → 根
+        assert_eq!(
+            fold_data_volume_alias(Path::new("/System/Volumes/Data")),
+            Path::new("/")
+        );
+    }
+
+    /// Codex 生成图可从文件池打开，读取沿用 D22。
     #[test]
     fn codex_generated_images_appear_in_file_pool_and_are_previewable() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1444,9 +1633,58 @@ mod tests {
             hit.path.as_str(),
             Some(home.to_str().unwrap()),
         )
-        .expect("生成的 PNG 预览可读（D22 全盘语义）");
+        .expect("生成的 PNG 可按 D22 预览");
         assert_eq!(mime, "image/png");
         assert_eq!(bytes, b"\x89PNG\r\n\x1a\n");
+    }
+
+    /// MASTER-PLAN §0.2〔D22〕：预览不再按目录或凭据名称限制普通文件。
+    #[test]
+    fn plan_subtrees_need_no_preview_exemption_after_d22() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().to_str().unwrap();
+        for relative in [
+            ".claude/plans/plan.md",
+            ".claude/plans-x/plan.md",
+            ".codex/plans/nested/plan.md",
+            ".codex/generated_images/thread/image.png",
+            ".codex/generated_images-x/thread/image.png",
+            ".kimi-code/sessions/workdir/session/agents/main/plans/plan.md",
+            ".kimi-code/x/y/agents/main/plans/plan.md",
+            ".kimi-code/sessions/workdir/agents/main/plans/plan.md",
+            ".config/agents/main/plans/report.md",
+            "notes.md",
+        ] {
+            let path = tmp.path().join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, b"fixture").unwrap();
+            assert_eq!(
+                read_file_safe(home, relative, Some(home)).unwrap().0,
+                b"fixture"
+            );
+        }
+        assert_eq!(
+            read_file_safe(home, ".claude/plans", Some(home)).unwrap_err(),
+            FileRejectReason::NotFile
+        );
+    }
+
+    /// MASTER-PLAN §0.2〔D22〕：预览不再按目录或凭据名称限制普通文件。
+    #[test]
+    fn env_files_and_examples_are_readable_after_d22() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().to_str().unwrap();
+        for name in [".env.example", "env.example", ".env", ".env.local"] {
+            std::fs::write(tmp.path().join(name), b"fixture").unwrap();
+            assert_eq!(
+                read_file_safe(home, name, Some(home)).unwrap().0,
+                b"fixture"
+            );
+        }
+        assert_eq!(
+            read_file_safe(home, ".env.missing", Some(home)).unwrap_err(),
+            FileRejectReason::NotFound
+        );
     }
 
     #[test]
@@ -1525,6 +1763,54 @@ mod tests {
 
     // ==== path_within_semantics（Windows 语义注入，darwin 全分支可测）====
 
+    #[test]
+    fn path_within_unix_semantics_with_boundary() {
+        assert!(path_within_semantics("/a/b/c", "/a/b", false));
+        assert!(
+            path_within_semantics("/a/b", "/a/b", false),
+            "自身包含自身（目录拒绝由 is_file 兜）"
+        );
+        assert!(
+            path_within_semantics("/a/x", "/", false),
+            "根包含一切绝对路径"
+        );
+        // 分隔符边界：/ab 不在 /a 之下
+        assert!(!path_within_semantics("/ab", "/a", false));
+        assert!(!path_within_semantics("/a/b", "/a/c", false));
+        assert!(
+            !path_within_semantics("/a/b", "", false),
+            "空祖先不含任何路径"
+        );
+        // 相对路径形态不误判（canonicalize 后不会出现，防御性只判字面）
+        assert!(!path_within_semantics("a/b", "/a", false));
+    }
+
+    #[test]
+    fn path_within_windows_semantics_strips_verbatim_and_case_insensitive() {
+        // verbatim 前缀剥离 + 大小写不敏感（canonicalize 恒返 \\?\ 形态 vs 字面 cwd）
+        assert!(path_within_semantics(
+            r"\\?\C:\proj\src\m.rs",
+            r"C:\proj",
+            true
+        ));
+        assert!(path_within_semantics(
+            r"C:\proj\src\m.rs",
+            r"\\?\C:\PROJ",
+            true
+        ));
+        // UNC 形态还原
+        assert!(path_within_semantics(
+            r"\\?\UNC\server\share\x.txt",
+            r"\\server\share",
+            true
+        ));
+        // 边界：C:\proj2 不在 C:\proj 之下
+        assert!(!path_within_semantics(r"\\?\C:\proj2\a", r"C:\proj", true));
+        assert!(!path_within_semantics(r"\\?\D:\proj\a", r"C:\proj", true));
+        // 尾部分隔符的祖先
+        assert!(path_within_semantics(r"\\?\C:\proj\a", r"C:\proj\", true));
+    }
+
     // ==== extract_paths_from_messages ====
 
     #[test]
@@ -1586,6 +1872,8 @@ mod tests {
             tool_name: Some("ExitPlanMode".into()),
             tool_args: None,
             collapsed: false,
+            media: Vec::new(),
+            blocks: Vec::new(),
         };
         // 纯 plan 流：无条目、不 panic
         assert!(extract_paths_from_messages(std::slice::from_ref(&plan)).is_empty());
@@ -1716,38 +2004,23 @@ mod tests {
         }
     }
 
-    /// D22 后：cwd==home（在 ~ 下启动 agent 的常见场景）时，~/.ssh 与
-    /// ~/Downloads 一视同仁可读（目录准入已取消）。
+    /// MASTER-PLAN §0.2〔D22〕：预览不再按目录或凭据名称限制普通文件。
     #[test]
-    fn read_file_safe_cwd_equals_home_reads_sensitive_dirs_after_d22() {
+    fn read_file_safe_resolves_relative_paths_from_home_after_d22() {
         let tmp = tempfile::tempdir().unwrap();
-        let home = tmp.path().join("home");
-        std::fs::create_dir_all(home.join(".ssh")).unwrap();
-        std::fs::create_dir_all(home.join("Downloads")).unwrap();
-        std::fs::write(home.join(".ssh").join("id_rsa"), "PRIVATE").unwrap();
-        std::fs::write(
-            home.join("Downloads").join("trip.png"),
-            [0x89, 0x50, 0x4e, 0x47],
-        )
-        .unwrap();
-        let home_s = home.to_str().unwrap();
-        assert!(
-            read_file_safe(
-                home_s,
-                home.join(".ssh").join("id_rsa").to_str().unwrap(),
-                Some(home_s)
-            )
-            .is_ok(),
-            "cwd==home 时 ~/.ssh 文件必须可预览（D22）"
-        );
-        assert!(
-            read_file_safe(
-                home_s,
-                home.join("Downloads").join("trip.png").to_str().unwrap(),
-                Some(home_s)
-            )
-            .is_ok(),
-            "cwd==home 时 Downloads 普通文件仍可读"
+        let home = tmp.path().to_str().unwrap();
+        for relative in [".ssh/id_rsa", "Downloads/trip.png"] {
+            let path = tmp.path().join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, b"fixture").unwrap();
+            assert_eq!(
+                read_file_safe(home, relative, Some(home)).unwrap().0,
+                b"fixture"
+            );
+        }
+        assert_eq!(
+            read_file_safe(home, ".ssh/missing", Some(home)).unwrap_err(),
+            FileRejectReason::NotFound
         );
     }
 
@@ -3245,5 +3518,51 @@ mod tests {
                 .is_empty(),
             "env 未设形态回落 ~/.kimi-code → 无数据 → 空表"
         );
+    }
+    /// MASTER-PLAN §0.2〔D22〕：预览不再按目录或凭据名称限制普通文件。
+    #[test]
+    fn credential_named_and_ordinary_files_are_readable_after_d22() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let cwd = tmp.path().to_str().unwrap();
+        let home = home.to_str().unwrap();
+        for relative in [
+            "home/work/myproj/.env",
+            "home/work/myproj/.env.production",
+            "home/work/myproj/deploy.pem",
+            "home/work/myproj/server.key",
+            "home/work/myproj/id_ed25519",
+            "other-volume/.dsh/authorization.key",
+            "other-volume/.tuvis/tuvis.db",
+            "home/Desktop/notes.md",
+            "home/Downloads/report.txt",
+            "elsewhere/screenshot.png",
+            "home/work/myproj/env.example",
+            "home/work/myproj/credentials-notes.md",
+        ] {
+            let path = tmp.path().join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, b"fixture").unwrap();
+            assert_eq!(
+                read_file_safe(cwd, path.to_str().unwrap(), Some(home))
+                    .unwrap()
+                    .0,
+                b"fixture"
+            );
+        }
+        for (relative, limit) in [
+            ("other-volume/.dsh/oversize.txt", 500 * 1024),
+            ("other-volume/.dsh/oversize.png", 5 * 1024 * 1024),
+        ] {
+            let path = tmp.path().join(relative);
+            std::fs::File::create(&path)
+                .unwrap()
+                .set_len(limit + 1)
+                .unwrap();
+            assert_eq!(
+                read_file_safe(cwd, relative, Some(home)).unwrap_err(),
+                FileRejectReason::TooLarge
+            );
+        }
     }
 }

@@ -558,6 +558,8 @@ fn seed_device(conn: &SharedConn, id: &str, name: &str) {
 
 fn opencode_session(id: &str, dir: &Path) -> Session {
     Session {
+        dsh_instance_id: None,
+        dsh_subagent: None,
         id: id.to_string(),
         agent_type: AgentType::OpenCode,
         project_name: "proj".into(),
@@ -592,7 +594,11 @@ fn codex_session(id: &str, dir: &Path) -> Session {
 fn question_page() -> multi_agents_manager_lib::remote::content::MessagesPage {
     use multi_agents_manager_lib::remote::content::{MessagesPage, SessionMessage};
     MessagesPage {
+        older_before: None,
+        dsh_model_summary: None,
         messages: vec![SessionMessage {
+            blocks: Vec::new(),
+            media: Vec::new(),
             seq: 0,
             role: "assistant".into(),
             kind: "tool-call".into(),
@@ -750,6 +756,10 @@ impl Fixture {
         let index_home = temp.path().join("index-home");
         std::fs::create_dir_all(&index_home).unwrap();
         let state = Arc::new(RemoteState {
+            dsh_control: multi_agents_manager_lib::services::dsh_control::disabled_arc(),
+            dsh_auto_adapt_source: Arc::new(|| true),
+            dsh_console_mount: None,
+            dsh_console_upstream_source: None,
             ui_config_source: Box::new(|| None),
             subagent_source: std::collections::HashMap::new(),
             subagent_message_source: std::collections::HashMap::new(),
@@ -802,7 +812,7 @@ impl Fixture {
             board_hidden_ids: Box::new(Vec::new),
             board_hidden_hide: Arc::new(|_| 0usize),
             board_hidden_unhide: Arc::new(|_| 0usize),
-            unread_mark_read: Arc::new(|_, _| ()),
+            unread_mark_read: Arc::new(|_, _, _| ()),
             session_close: Arc::new(|_| Ok(())),
             store,
             host_source: Box::new(|| serde_json::json!({ "host": { "name": "t" } })),

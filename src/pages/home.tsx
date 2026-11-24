@@ -98,6 +98,7 @@ export default function HomePage() {
           agentType: s.agentType,
           sessionId: s.id,
           status: s.status,
+          instanceId: s.dshInstanceId,
         })),
       });
       if (!outcome?.applied) {

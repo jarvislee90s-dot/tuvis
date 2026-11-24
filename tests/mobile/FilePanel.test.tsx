@@ -191,7 +191,9 @@ describe("FilePanel 追溯范围下拉（用户裁决 3，下拉形态）", () =
 
   it("truncated 且未到顶 → 显示提示", () => {
     renderPanel([entry("/p/a.rs")], { truncated: true, scope: 200 });
-    expect(screen.getByTestId("panel-truncated-hint").textContent).toContain("还有更早文件");
+    expect(screen.getByTestId("panel-truncated-hint").textContent).toContain(
+      "更早消息尚未纳入，扩大追溯范围可能发现更多文件"
+    );
   });
 
   it("scope=1000 到顶 → 不显示提示（即使 truncated 为真）", () => {

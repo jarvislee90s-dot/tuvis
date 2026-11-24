@@ -144,6 +144,13 @@ async fn mobile_index() -> Response {
 
 /// 活跃连接句柄表（clippy::type_complexity 门禁适配：复杂类型抽别名，语义同原稿内联形）
 type DeviceConns = std::collections::HashMap<String, Vec<(u64, tokio::sync::oneshot::Sender<()>)>>;
+type DshConsoleUpstreamSource = dyn Fn(
+        &str,
+    ) -> Result<
+        crate::remote::console_upstream::ConsoleUpstream,
+        crate::services::dsh_control::error::DshError,
+    > + Send
+    + Sync;
 
 /// 活跃 SSE 连接计数（Task 4 评审修订）：扫描线程的「远控在线」口径只需一个全局布尔，
 /// **不得**为它解引用 `remote::STATE`——那会在扫描线程上首次触发 DeviceStore /
@@ -348,7 +355,7 @@ pub type ArchiveDeleteFn = dyn Fn(Option<&str>) -> usize + Send + Sync;
 /// 未读已读缝类型（体验批二修订，clippy type_complexity 收敛别名，对齐
 /// [`ArchiveDeleteFn`] 先例）：参数 = (tool_id, session_id)，与桌面端「叉」
 /// 共用 dao::unread::mark_read。
-pub type UnreadMarkReadFn = dyn Fn(&str, &str) + Send + Sync;
+pub type UnreadMarkReadFn = dyn Fn(&str, &str, Option<&str>) + Send + Sync;
 
 /// C7 配对计数缝类型（spec §5，clippy type_complexity 收敛别名，对齐
 /// [`ConfirmProbeFn`] 先例）：返回运行进程的 (工具, 项目) 表——端点层计同键
@@ -553,13 +560,23 @@ impl CreateTaskHub {
 /// 测试注入假源（零真实磁盘/DB）。**端点契约冻结**：kimi/opencode 校准只改
 /// 各自 source 实现，不动端点与载荷。
 pub type SubagentSourceFn =
-    dyn Fn(&str, &str) -> Vec<crate::monitor::subagents::SubagentView> + Send + Sync;
+    dyn Fn(&str, &str, Option<&str>) -> Vec<crate::monitor::subagents::SubagentView> + Send + Sync;
 
 /// 子 agent 详情源注入缝（观察台 §三）：键 = agent_type；闭包 (session_id,
-/// subagent_id, limit) → MessagesPage。生产仅 claude；未装配 → 端点回
-/// supported:false（其余工具转写格式未普查，spec §三.6 如实申报——清单照常）。
-pub type SubagentMessageSourceFn =
-    dyn Fn(&str, &str, usize) -> Result<crate::remote::content::MessagesPage, String> + Send + Sync;
+/// subagent_id, limit, skip, instance) → MessagesPage。生产 = claude + dsh；
+/// 未装配 → 端点回 supported:false（其余工具转写格式未普查，spec §三.6 如实
+/// 申报——清单照常）。`skip` = 受限续页游标（2026-11-18 销项批：子详情面
+/// 接入 `before` 起始索引游标，与根会话读取面同一口径；不消费游标的工具
+/// 照旧忽略该参，older_before 恒 None → 响应键恒缺席）。
+pub type SubagentMessageSourceFn = dyn Fn(
+        &str,
+        &str,
+        usize,
+        usize,
+        Option<&str>,
+    ) -> Result<crate::remote::content::MessagesPage, String>
+    + Send
+    + Sync;
 
 pub struct RemoteState {
     /// 会话数据源（P8 同源）：生产 = scan_bus::current_or_scan（读共享快照）；
@@ -696,6 +713,22 @@ pub struct RemoteState {
     /// CompatOnly/拒绝、不装配调度循环）；生产 = `remote/mod.rs` STATE 的
     /// [`crate::remote::codex_ipc::CodexControlHub::production`]。
     pub codex_control: std::sync::Arc<super::codex_ipc::CodexControlHub>,
+    /// **DSH 远控控制面 hub**（T09）：与 Tauri `manage` 同一进程级 Arc
+    /// （`services::dsh_control::production_hub()`）；未接线的业务入口仍显式
+    /// `DSH_UNSUPPORTED`。测试注入 `disabled_arc()`。
+    pub dsh_control: std::sync::Arc<crate::services::dsh_control::DshControlHub>,
+    /// 控制台挂载注入槽（`None` = 生产用 `console_mount::production()` 单例）。
+    ///
+    /// 测试必须能指向**自己的** mount 实例：否则 `/m/api/v1/dsh-console-redeem`
+    /// 会打进程单例、与测试里登记的票据毫无关系（我第一版就掉进这个坑——变异
+    /// 删掉设备比对测试仍绿，因为请求根本没到那个 mount）。
+    pub dsh_console_mount: Option<std::sync::Arc<crate::remote::console_mount::ConsoleMount>>,
+    /// 控制台上游解析注入槽（`None` = 生产走真实活体核验；测试注入合成上游）。
+    pub dsh_console_upstream_source: Option<std::sync::Arc<DshConsoleUpstreamSource>>,
+    /// P1-2/B2（第三轮复审）：DSH 自动适配开关源注入缝——生产 =
+    /// `dsh_control::production::dsh_auto_adapt_enabled`（全局影子库同一键）；
+    /// 测试注入独立 AtomicBool 闭包（用例间零共享，竞态根治）。
+    pub dsh_auto_adapt_source: std::sync::Arc<dyn Fn() -> bool + Send + Sync>,
     /// **桌面当前语言内存源**（三终端语言自适应 C-3，2026-10-22）：真值来自前端
     /// 推送（tauri 命令 `set_desktop_language`，启动初始化后 + 每次切换触发），
     /// Rust **只存不判**；消费方 = `api::host` 的 C-4 下发。`None` = 未知态
@@ -714,10 +747,33 @@ pub struct RemoteState {
 /// API 子路由：业务端点 + /pair/pin + 内层 fallback（未知 API 路径直接 403）+ gate 内层 layer。
 /// 注意：gate 在 `with_state` 之前 `layer`，故它包裹的是**本子路由已注册的全部端点与 fallback**；
 /// 之后 Task 7 从外部追加的静态路由不在本子路由内，天然不过闸（结构隔离，非顺序巧合）。
-fn api_router(state: Arc<RemoteState>) -> Router<Arc<RemoteState>> {
+fn api_router(
+    state: Arc<RemoteState>,
+    roots: super::files::ProtectedFileRoots,
+) -> Router<Arc<RemoteState>> {
     Router::new()
         .route("/sessions", get(api::sessions))
         .route("/host", get(api::host))
+        // T09：DSH 动作只读查询（hub 在远程层的真实消费点）
+        .route("/dsh/action/{action_id}", get(api::dsh_action))
+        .route(
+            "/dsh/current-turn",
+            get(api::dsh_current_turn).post(api::dsh_stop_current),
+        )
+        // T03：原生问答——只读题组查询与整组作答提交（同一门禁 + 设备鉴权）
+        .route(
+            "/dsh/session-settings",
+            get(api::dsh_session_settings).post(api::dsh_change_session_settings),
+        )
+        .route("/dsh/questions", get(api::dsh_questions))
+        .route("/dsh/questions/answer", post(api::dsh_question_answer))
+        // T-live：实时问答 waterfall——待答查询与 `$events/result` 回执。
+        // 与上面两条投影（continued 补答）路径互斥，别混用（见 question_events 模块文档）
+        .route("/dsh/questions/live", get(api::dsh_live_questions))
+        .route(
+            "/dsh/questions/live/answer",
+            post(api::dsh_live_question_answer),
+        )
         // /device-language（三终端语言自适应 C-5，2026-10-22）：远程端手动语言
         // 切换写账（仅已配对会话可调——本子路由整体过 gate，全局约束 4）
         .route("/device-language", post(api::device_language))
@@ -807,6 +863,14 @@ fn api_router(state: Arc<RemoteState>) -> Router<Arc<RemoteState>> {
         // agent 视图（四工具 source 注入缝；PIN 门禁内层 gate 结构性覆盖——新端点
         // 不需要各自鉴权代码；空态唯一权威）
         .route("/session-subagents", get(api::session_subagents))
+        // H09/H11：控制台入口（设备 + 会话归属 + 实例核验 → 同源能力路径）。
+        // 与 `/console/<capability>/` 挂载配套：入口只发**相对 URL**，由浏览器按
+        // 当前渠道 origin 解析（四渠道共用，不硬编码地址）。
+        .route("/dsh-console-entry", get(api::dsh_console_entry))
+        .route(
+            "/dsh-console-redeem",
+            axum::routing::post(api::dsh_console_redeem),
+        )
         // /session-subagent-messages（2026-10-09 观察台 §三）：子 agent 执行过程
         // 详情（claude 复用消息映射；其余工具 supported=false 如实申报）
         .route(
@@ -814,7 +878,14 @@ fn api_router(state: Arc<RemoteState>) -> Router<Arc<RemoteState>> {
             get(api::session_subagent_messages),
         )
         // /file（M3 Task 8）：会话 cwd 内安全文件读取（预览）
-        .route("/file", get(api::read_file))
+        .route(
+            "/file",
+            get(api::read_file).layer(axum::Extension(roots.clone())),
+        )
+        .route(
+            "/dsh/media",
+            get(api::dsh_media).layer(axum::Extension(roots.clone())),
+        )
         // M7 Task 6：注入三端点（PIN 门禁内层 gate 结构性覆盖——新端点不需要各自
         // 鉴权代码；session-send 直发/入队 + send-info 可用性 + queue 视图/插队/撤回）
         .route("/session-send", post(api::session_send))
@@ -939,7 +1010,10 @@ fn api_router(state: Arc<RemoteState>) -> Router<Arc<RemoteState>> {
         // 超限响应契约 JSON 413 体（{"error":"too_large"}）；不挂 DefaultBodyLimit
         // 层——框架兜底的通用 413 体不可辨错误码，且会把 handler 的结构化拒绝
         // 挡成不可达）
-        .route("/session-attachment", post(api::session_attachment))
+        .route(
+            "/session-attachment",
+            post(api::session_attachment).layer(axum::Extension(roots)),
+        )
         // M6R–M9R Task 11：一键 resume 端点（R5，PIN 门禁内层 gate 结构性覆盖，
         // 新端点不需要各自鉴权代码；spawn 缝注入使测试零真开窗）
         .route("/session-open", post(api::session_open))
@@ -981,8 +1055,15 @@ fn api_router(state: Arc<RemoteState>) -> Router<Arc<RemoteState>> {
 /// API 结构化嵌套（Important 1）：`nest` 使 gate 只作用于 `/m/api/v1/*` 且覆盖其全子树；
 /// 未知 API 路径由内层 fallback 403 收口，外层（Task 7 静态资源）永不可见 API 路径。
 pub fn router(state: Arc<RemoteState>) -> Router {
+    router_with_file_roots(state, Arc::new(|| Ok(Vec::new())))
+}
+
+pub fn router_with_file_roots(
+    state: Arc<RemoteState>,
+    roots: super::files::ProtectedFileRoots,
+) -> Router {
     Router::new()
-        .nest("/m/api/v1", api_router(state.clone()))
+        .nest("/m/api/v1", api_router(state.clone(), roots))
         // 裸前缀带尾斜杠 `/m/api/v1/` 实测**不**匹配 nest 的 catch-all（matchit 的 `{*rest}`
         // 要求至少一个非空段，也不做尾斜杠归一化），会落到外层静态 fallback → 200。
         // 与"所有 /m/api/* 过 gate（403）"冲突，故显式 403 收口（any：方法无关一律 403）。
@@ -997,6 +1078,71 @@ pub fn router(state: Arc<RemoteState>) -> Router {
         .with_state(state)
 }
 
+fn production_file_roots() -> Result<Vec<std::path::PathBuf>, String> {
+    use crate::services::dsh_control::{instances, production};
+    let env = production::production_env();
+    let state_dir = production::resolve_state_dir(
+        &production::DshEnvSnapshot {
+            dsh_state_dir: env.dsh_state_dir.clone(),
+        },
+        &env.tuvis_home,
+    );
+    let mut roots = vec![env.tuvis_home.clone(), state_dir, env.home.clone()];
+    let registry = production::production_registry().map_err(|error| error.code.to_owned())?;
+    for instance in registry
+        .registered_all()
+        .map_err(|error| error.code.to_owned())?
+    {
+        let profile = &instance.profile_dir;
+        if !profile.is_absolute() {
+            return Err("invalid registered DSH profile".into());
+        }
+        // 物理落点恒保护（复审 P1）：登记保存的 profile 可能是链接的物理
+        // 落点，不可由其名字反推 home；目录不存在的根不产生包含命中，无副作用。
+        roots.push(profile.clone());
+        // 已登记 home（复审 P1）：绝对且存在即保护——外链物理 profile 被移走
+        // 后，登记 home（内含会话/配置）不再失去保护。登记值失效方向的错误
+        // 只会过保护（多封一棵树），不会漏保护。
+        if let Some(home) = instance.dsh_home.as_ref() {
+            if home.is_absolute() && home.is_dir() {
+                roots.push(home.clone());
+            }
+        }
+        match std::fs::canonicalize(profile) {
+            Ok(physical) => {
+                // 物理落点在场：补入**已证明**的实际 dsh_home（登记值自洽，或
+                // 经可信绑定账本唯一恢复）。证据不足的旧登记不猜测、不补根。
+                match instances::resolve_registered_home(Some(env.as_ref()), &instance, &physical) {
+                    instances::RegisteredHomeResolution::Proven(home) => roots.push(home),
+                    instances::RegisteredHomeResolution::Unproven(_) => {}
+                }
+            }
+            Err(_) => {
+                // 物理落点已移走：凭绑定账本记录的原始逻辑 profile 入口保守
+                // 保护推导出的 home（home 存在才补；宁过保护不漏保护）。
+                if let Some(rows) = crate::services::dsh_control::auth::bound_rows_for(
+                    env.as_ref(),
+                    &instance.instance_id,
+                ) {
+                    for (_, entry) in rows {
+                        if let Some(home) =
+                            instances::logical_home_of_profile_entry(std::path::Path::new(&entry))
+                        {
+                            if home.is_dir() {
+                                roots.push(home);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // 物理落点 / 登记值 / 账本恢复可能指向同一目录：字面去重。
+    roots.sort();
+    roots.dedup();
+    Ok(roots)
+}
+
 /// 生产装配：`router()`（gate 结构不变量）+ /m 静态入口 + 顶层静态 fallback。
 /// 结构契约（评审裁决 2，勿退化）：静态侧**只**以「在 `router()` 返回的 Router 上追加
 /// `.route("/m", ...)` 与顶层 `.fallback(...)`」的形态存在——**绝对不要**改成 catch-all
@@ -1004,8 +1150,16 @@ pub fn router(state: Arc<RemoteState>) -> Router {
 /// fallback 命中，让未知 API 路径 200 裸奔
 /// （task7_static_routes_do_not_uncover_unknown_api_paths 复刻的正是本函数的追加动作）
 pub fn router_with_static(state: Arc<RemoteState>) -> Router {
-    router(state)
+    let mount = state
+        .dsh_console_mount
+        .clone()
+        .unwrap_or_else(|| Arc::clone(super::console_mount::production()));
+    router_with_file_roots(state, Arc::new(production_file_roots))
         .route("/m", get(mobile_index))
+        // H09：控制台同源挂载。**独立子树**，不经过 `/m/api/v1` 的 gate，也不认
+        // `mam_device` cookie——授权只由 `/console/<capability>/` 的路径令牌承担，
+        // 且所有响应强制 opaque sandbox CSP（见 `console_mount` 模块文档）。
+        .merge(super::console_mount::router(mount))
         .fallback(static_fallback)
 }
 
@@ -1096,7 +1250,7 @@ mod tests {
             board_hidden_ids: Box::new(Vec::new),
             board_hidden_hide: std::sync::Arc::new(|_| 0usize),
             board_hidden_unhide: std::sync::Arc::new(|_| 0usize),
-            unread_mark_read: std::sync::Arc::new(|_, _| ()),
+            unread_mark_read: std::sync::Arc::new(|_, _, _| ()),
             session_close: std::sync::Arc::new(|_| Ok(())),
             // M4 T0a（brief 指定）：本任务新增字段，测试用空注册表即可
             sse_registry: Arc::new(SseRegistry::default()),
@@ -1115,11 +1269,17 @@ mod tests {
             pairing_counter: Box::new(Vec::new),
 
             codex_control: crate::remote::codex_ipc::CodexControlHub::disabled_arc(),
+            dsh_control: crate::services::dsh_control::disabled_arc(),
+            dsh_auto_adapt_source: std::sync::Arc::new(
+                crate::services::dsh_control::production::dsh_auto_adapt_enabled,
+            ),
             desktop_language: Default::default(),
             // 任务 8：OpenCode 原生交互中枢——测试禁用默认（惰性容器，零 IO；本组用例不触原生路由）
             opencode_native: Arc::new(crate::services::opencode_native::NativeHub::new(
                 crate::remote::pairing::DeviceStore::memory(),
             )),
+            dsh_console_mount: None,
+            dsh_console_upstream_source: None,
         })
     }
 
@@ -1211,6 +1371,8 @@ mod tests {
             .opencode_native = hub.clone();
 
         let session = crate::session::Session {
+            dsh_instance_id: None,
+            dsh_subagent: None,
             id: "ses-native".into(),
             agent_type: crate::session::AgentType::OpenCode,
             project_name: "project".into(),
@@ -1240,8 +1402,39 @@ mod tests {
         assert_eq!(first.revision, 1);
         let mut watch = hub.watch(&session.id);
 
-        // 生产停机：与 stop_server(false) / 热重启完全同一条 stop_server_with 接线。
+        // 同一个停机入口也要清除 DSH 生产挂载及进程内的上游凭据。
+        use crate::remote::{
+            console_capability::ConsoleCapability, console_lifecycle, console_mount,
+        };
+        let mount = console_mount::production();
+        let instance = "fixture-stop-restart";
+        let authority = "127.0.0.1:1";
+        let token = crate::remote::random_hex_16();
+        console_lifecycle::install_upstream_credentials(
+            instance,
+            "api=fixture".into(),
+            "browser=fixture".into(),
+            1,
+            authority,
+        )
+        .unwrap();
+        mount
+            .register(ConsoleCapability {
+                token: token.clone(),
+                device_id: "fixture-device".into(),
+                instance_id: instance.into(),
+                authority: authority.into(),
+                epoch: 1,
+                bootstrap: false,
+                expires_at_ms: mount.now() + 60_000,
+            })
+            .unwrap();
+        assert!(mount.has_capability_for_test(&token));
+        assert!(console_lifecycle::upstream_browser_cookie_for(instance, 1, authority).is_some());
+
         crate::remote::stop_server_with(state.as_ref(), None, false, || {});
+        assert!(!mount.has_capability_for_test(&token));
+        assert!(console_lifecycle::upstream_browser_cookie_for(instance, 1, authority).is_none());
         tokio::time::timeout(std::time::Duration::from_secs(5), watch.changed())
             .await
             .expect("生产停机必须在时限内关闭旧 watch")
@@ -1786,6 +1979,25 @@ mod tests {
         assert_eq!(r.status(), 200, "嵌入产物 {asset} 应可伺服");
         assert_eq!(header(&r, "content-type"), "text/javascript");
 
+        // (3b) N02：**实际下发的 JS** 必须含当前源码的新版 DSH 标识——只改 tsx
+        // 而不重建 dist-mobile 时这条会红（旧产物冒充新版正是线上事故形态）。
+        // 判据取源码里唯一的两个字符串常量：`dshRetryScope`（F02 设备作用域重试
+        // 锚）与 `dshCloseWaitingHint`（关闭未收敛提示键）；二者在 2026-11-21 的
+        // 旧产物里均为 0 次。
+        let js = body_string(
+            app.clone()
+                .oneshot(req("GET", &format!("/m/{asset}"), None, None))
+                .await
+                .unwrap(),
+        )
+        .await;
+        for marker in ["dshRetryScope", "dshCloseWaitingHint"] {
+            assert!(
+                js.contains(marker),
+                "下发的 /m JS 缺少新版标识 {marker}——dist-mobile 是旧产物，请先 pnpm build:mobile（N02）"
+            );
+        }
+
         // (4) 未知 /m/* 路径 → SPA 兜底回落入口 HTML（200，非 404）
         let r = app
             .clone()
@@ -1914,7 +2126,7 @@ mod tests {
             board_hidden_ids: Box::new(Vec::new),
             board_hidden_hide: std::sync::Arc::new(|_| 0usize),
             board_hidden_unhide: std::sync::Arc::new(|_| 0usize),
-            unread_mark_read: std::sync::Arc::new(|_, _| ()),
+            unread_mark_read: std::sync::Arc::new(|_, _, _| ()),
             session_close: std::sync::Arc::new(|_| Ok(())),
             // M4 T0a：本组测试不触 SSE 断连，空注册表即可
             sse_registry: Arc::new(SseRegistry::default()),
@@ -1933,11 +2145,17 @@ mod tests {
             pairing_counter: Box::new(Vec::new),
 
             codex_control: crate::remote::codex_ipc::CodexControlHub::disabled_arc(),
+            dsh_control: crate::services::dsh_control::disabled_arc(),
+            dsh_auto_adapt_source: std::sync::Arc::new(
+                crate::services::dsh_control::production::dsh_auto_adapt_enabled,
+            ),
             desktop_language: Default::default(),
             // 任务 8：OpenCode 原生交互中枢——测试禁用默认（惰性容器，零 IO；本组用例不触原生路由）
             opencode_native: Arc::new(crate::services::opencode_native::NativeHub::new(
                 crate::remote::pairing::DeviceStore::memory(),
             )),
+            dsh_console_mount: None,
+            dsh_console_upstream_source: None,
         });
         // 预置有效设备，令 gate 放行（否则不会走到 session_source，测试失去意义）
         let now = chrono::Utc::now().timestamp_millis();
@@ -2118,6 +2336,7 @@ mod tests {
                 project_name: "proj".into(),
                 last_message: Some("hello".into()),
                 flap_from_subagent_activity: false,
+                dsh_instance_id: None,
                 ts: 42,
             })
             .unwrap();
@@ -2470,7 +2689,7 @@ mod tests {
             board_hidden_ids: Box::new(Vec::new),
             board_hidden_hide: std::sync::Arc::new(|_| 0usize),
             board_hidden_unhide: std::sync::Arc::new(|_| 0usize),
-            unread_mark_read: std::sync::Arc::new(|_, _| ()),
+            unread_mark_read: std::sync::Arc::new(|_, _, _| ()),
             session_close: std::sync::Arc::new(|_| Ok(())),
             // M4 T0a：本组测试不触 SSE 断连，空注册表即可
             sse_registry: Arc::new(SseRegistry::default()),
@@ -2489,11 +2708,17 @@ mod tests {
             pairing_counter: Box::new(Vec::new),
 
             codex_control: crate::remote::codex_ipc::CodexControlHub::disabled_arc(),
+            dsh_control: crate::services::dsh_control::disabled_arc(),
+            dsh_auto_adapt_source: std::sync::Arc::new(
+                crate::services::dsh_control::production::dsh_auto_adapt_enabled,
+            ),
             desktop_language: Default::default(),
             // 任务 8：OpenCode 原生交互中枢——测试禁用默认（惰性容器，零 IO；本组用例不触原生路由）
             opencode_native: Arc::new(crate::services::opencode_native::NativeHub::new(
                 crate::remote::pairing::DeviceStore::memory(),
             )),
+            dsh_console_mount: None,
+            dsh_console_upstream_source: None,
         });
         let app = router(state.clone());
         let now = chrono::Utc::now().timestamp_millis();
@@ -2916,6 +3141,8 @@ mod tests {
                                 tool_name: None,
                                 tool_args: None,
                                 collapsed: false,
+                                media: Vec::new(),
+                                blocks: Vec::new(),
                             },
                             crate::remote::content::SessionMessage {
                                 seq: 1,
@@ -2926,10 +3153,14 @@ mod tests {
                                 tool_name: Some("Bash".into()),
                                 tool_args: Some(r#"{"cmd":"ls"}"#.into()),
                                 collapsed: true,
+                                media: Vec::new(),
+                                blocks: Vec::new(),
                             },
                         ],
                         truncated: false,
                         cwd: None,
+                        older_before: None,
+                        dsh_model_summary: None,
                     })
                 } else {
                     Err("内部路径细节不应出现在响应里".to_string())
@@ -2941,7 +3172,7 @@ mod tests {
             board_hidden_ids: Box::new(Vec::new),
             board_hidden_hide: std::sync::Arc::new(|_| 0usize),
             board_hidden_unhide: std::sync::Arc::new(|_| 0usize),
-            unread_mark_read: std::sync::Arc::new(|_, _| ()),
+            unread_mark_read: std::sync::Arc::new(|_, _, _| ()),
             session_close: std::sync::Arc::new(|_| Ok(())),
             // M4 T0a：本组测试不触 SSE 断连，空注册表即可
             sse_registry: Arc::new(SseRegistry::default()),
@@ -2960,11 +3191,17 @@ mod tests {
             pairing_counter: Box::new(Vec::new),
 
             codex_control: crate::remote::codex_ipc::CodexControlHub::disabled_arc(),
+            dsh_control: crate::services::dsh_control::disabled_arc(),
+            dsh_auto_adapt_source: std::sync::Arc::new(
+                crate::services::dsh_control::production::dsh_auto_adapt_enabled,
+            ),
             desktop_language: Default::default(),
             // 任务 8：OpenCode 原生交互中枢——测试禁用默认（惰性容器，零 IO；本组用例不触原生路由）
             opencode_native: Arc::new(crate::services::opencode_native::NativeHub::new(
                 crate::remote::pairing::DeviceStore::memory(),
             )),
+            dsh_console_mount: None,
+            dsh_console_upstream_source: None,
         });
         let app = router(state.clone());
         let now = chrono::Utc::now().timestamp_millis();
@@ -3052,7 +3289,7 @@ mod tests {
             .clone()
             .oneshot(req(
                 "GET",
-                "/m/api/v1/session-messages?agent_type=dsh&session_id=sess_miss&limit=50",
+                "/m/api/v1/session-messages?agent_type=claude&session_id=sess_miss&limit=50",
                 Some("mam_device=cm"),
                 None,
             ))
@@ -3063,9 +3300,280 @@ mod tests {
         assert!(!body.contains("内部路径细节"), "错误细节只进日志不外泄");
         assert_eq!(
             captured.lock().unwrap().last().cloned(),
-            Some(("dsh".to_string(), "sess_miss".to_string(), 50)),
+            Some(("claude".to_string(), "sess_miss".to_string(), 50)),
             "limit 查询参数应透传"
         );
+    }
+
+    /// A06 fix（2026-11-15 审查 Important-1）路由层键缺席契约：`olderBefore`
+    /// 只允许在真实存在续页游标时出现在 HTTP 载荷——非 DSH 面（不支持续页）
+    /// 与 DSH 最旧页（已到头）都必须**键缺席**（`null` 也算在场：按键存在性
+    /// 判断续页支持的消费端会把 null 当作错误信号）。组装点在手写 json!，
+    /// 本用例钉住真实路由层而非仅 MessagesPage 序列化。
+    #[tokio::test]
+    async fn session_messages_omit_older_before_key_when_unsupported_or_oldest() {
+        // (a) 非 DSH 面：假 message_source 恒 older_before=None → 键缺席
+        let state = Arc::new(RemoteState {
+            opencode_native: Arc::new(crate::services::opencode_native::NativeHub::new(
+                crate::remote::pairing::DeviceStore::memory(),
+            )),
+            ui_config_source: Box::new(|| None),
+            subagent_source: std::collections::HashMap::new(),
+            subagent_message_source: std::collections::HashMap::new(),
+            capability_table: crate::inject::capability::new_table(),
+            session_source: Box::new(|| crate::session::SessionsResponse {
+                sessions: vec![],
+                total_count: 0,
+                waiting_count: 0,
+            }),
+            fresh_session_source: Box::new(|| crate::session::SessionsResponse {
+                sessions: vec![],
+                total_count: 0,
+                waiting_count: 0,
+            }),
+            store: crate::remote::pairing::DeviceStore::memory(),
+            injector: std::sync::Arc::new(crate::inject::engine::RealInjector),
+            resume_spawner: std::sync::Arc::new(|_: &crate::inject::resume::SpawnSpec| Ok(())),
+            create_hub: create_hub_stub(),
+            archive_source: Box::new(Vec::new),
+            archive_delete: std::sync::Arc::new(|_: Option<&str>| 0usize),
+            confirm_probe: std::sync::Arc::new(|_, _, _| true),
+            dialog_probe: std::sync::Arc::new(|_, _| None),
+            screen_probe: std::sync::Arc::new(|_, _| None),
+            host_source: Box::new(|| serde_json::Value::Null),
+            message_source: Box::new(|_agent: &str, sid: &str, _limit: usize| {
+                if sid == "sess_hit" {
+                    Ok(crate::remote::content::MessagesPage {
+                        messages: vec![crate::remote::content::SessionMessage {
+                            seq: 0,
+                            role: "user".into(),
+                            kind: "user".into(),
+                            content: "你好".into(),
+                            ts: Some(1000),
+                            tool_name: None,
+                            tool_args: None,
+                            collapsed: false,
+                            media: Vec::new(),
+                            blocks: Vec::new(),
+                        }],
+                        truncated: false,
+                        cwd: None,
+                        older_before: None,
+                        dsh_model_summary: None,
+                    })
+                } else {
+                    Err("内部路径细节不应出现在响应里".to_string())
+                }
+            }),
+            path_source: Box::new(|_, _, _| (Vec::new(), false)),
+            watcher_tx: tokio::sync::broadcast::channel(64).0,
+            board_hidden_ids: Box::new(Vec::new),
+            board_hidden_hide: std::sync::Arc::new(|_| 0usize),
+            board_hidden_unhide: std::sync::Arc::new(|_| 0usize),
+            unread_mark_read: std::sync::Arc::new(|_, _, _| ()),
+            session_close: std::sync::Arc::new(|_| Ok(())),
+            sse_registry: Arc::new(SseRegistry::default()),
+            max_devices_source: Box::new(|| 3),
+            pin_limiter: std::sync::Mutex::new(crate::remote::pin::PinRateLimiter::new()),
+            global_pin_limiter: std::sync::Mutex::new(crate::remote::pin::PinRateLimiter::global()),
+            pin_source: Box::new(|| Some("1234".to_string())),
+            now_source: Box::new(|| chrono::Utc::now().timestamp_millis()),
+            via_hosts_source: Box::new(|| None),
+            rate_bucket_channels_source: Box::new(Vec::new),
+            home_source: Box::new(|| None),
+            pairing_counter: Box::new(Vec::new),
+            codex_control: crate::remote::codex_ipc::CodexControlHub::disabled_arc(),
+            dsh_control: crate::services::dsh_control::disabled_arc(),
+            dsh_auto_adapt_source: std::sync::Arc::new(
+                crate::services::dsh_control::production::dsh_auto_adapt_enabled,
+            ),
+            desktop_language: Default::default(),
+            dsh_console_mount: None,
+            dsh_console_upstream_source: None,
+        });
+        {
+            let st = state.clone();
+            st.store.with(|c| {
+                crate::remote::pairing::persist_device(
+                    c,
+                    &crate::remote::pairing::NewDevice {
+                        id: "cm".into(),
+                        name: String::new(),
+                        ua: String::new(),
+                        origin_ip: String::new(),
+                        via: String::new(),
+                        paired_at: chrono::Utc::now().timestamp_millis(),
+                    },
+                )
+                .unwrap();
+            });
+        }
+        let r = router(state.clone())
+            .oneshot(req(
+                "GET",
+                "/m/api/v1/session-messages?agent_type=zcode&session_id=sess_hit",
+                Some("mam_device=cm"),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+        let body = body_string(r).await;
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(
+            v.get("olderBefore").is_none(),
+            "非 DSH 面不得出现 olderBefore 键（null 也算在场）: {body}"
+        );
+
+        // (b) DSH 面：真实整读路径走到底（truncated=false 的最旧页）→ 键缺席。
+        // 归属核验经 resolver 缝直通隔离 home（非本用例变量）。
+        let dir = tempfile::tempdir().unwrap();
+        let dsh_root = dir.path().to_path_buf();
+        let header = r#"{"type":"session","version":3,"id":"session-pg","cwd":"/tmp/p","createdAt":1000,"isSeeded":false}"#;
+        let mut events = String::new();
+        for i in 0..5 {
+            events.push_str(&format!(
+                r#"{{"type":"user/message","seq":{i},"time":{i},"data":{{"content":[{{"type":"text","text":"m{i}"}}],"source":{{"kind":"user"}}}}}}
+"#
+            ));
+        }
+        let frame = zstd::stream::encode_all(format!("{header}\n{events}").as_bytes(), 3).unwrap();
+        let sess = dsh_root.join("sessions").join("--proj--").join("pg");
+        std::fs::create_dir_all(&sess).unwrap();
+        std::fs::write(sess.join("session.v3.jsonl.zstd"), &frame).unwrap();
+
+        let hub = crate::services::dsh_control::DshControlHub::disabled_arc();
+        let resolver_root = dsh_root.clone();
+        hub.set_readonly_root_resolver(Arc::new(move |_id: &str, _sid: &str| {
+            Ok(resolver_root.clone())
+        }));
+        let dsh_state = Arc::new(RemoteState {
+            opencode_native: Arc::new(crate::services::opencode_native::NativeHub::new(
+                crate::remote::pairing::DeviceStore::memory(),
+            )),
+            fresh_session_source: Box::new(|| crate::session::SessionsResponse {
+                sessions: vec![{
+                    let mut s = inj_sess(
+                        "session-pg",
+                        crate::session::AgentType::Dsh,
+                        7,
+                        crate::session::SessionStatus::Finished,
+                    );
+                    s.dsh_instance_id = Some("inst-pg".into());
+                    s
+                }],
+                total_count: 1,
+                waiting_count: 0,
+            }),
+            session_source: Box::new(|| crate::session::SessionsResponse {
+                sessions: vec![],
+                total_count: 0,
+                waiting_count: 0,
+            }),
+            store: crate::remote::pairing::DeviceStore::memory(),
+            injector: std::sync::Arc::new(crate::inject::engine::RealInjector),
+            resume_spawner: std::sync::Arc::new(|_: &crate::inject::resume::SpawnSpec| Ok(())),
+            create_hub: create_hub_stub(),
+            archive_source: Box::new(Vec::new),
+            archive_delete: std::sync::Arc::new(|_: Option<&str>| 0usize),
+            confirm_probe: std::sync::Arc::new(|_, _, _| true),
+            dialog_probe: std::sync::Arc::new(|_, _| None),
+            screen_probe: std::sync::Arc::new(|_, _| None),
+            host_source: Box::new(|| serde_json::Value::Null),
+            message_source: Box::new(|_, _, _| Err("DSH 分支不经该缝".to_string())),
+            path_source: Box::new(|_, _, _| (Vec::new(), false)),
+            watcher_tx: tokio::sync::broadcast::channel(64).0,
+            board_hidden_ids: Box::new(Vec::new),
+            board_hidden_hide: std::sync::Arc::new(|_| 0usize),
+            board_hidden_unhide: std::sync::Arc::new(|_| 0usize),
+            unread_mark_read: std::sync::Arc::new(|_, _, _| ()),
+            session_close: std::sync::Arc::new(|_| Ok(())),
+            sse_registry: Arc::new(SseRegistry::default()),
+            max_devices_source: Box::new(|| 3),
+            pin_limiter: std::sync::Mutex::new(crate::remote::pin::PinRateLimiter::new()),
+            global_pin_limiter: std::sync::Mutex::new(crate::remote::pin::PinRateLimiter::global()),
+            pin_source: Box::new(|| Some("1234".to_string())),
+            now_source: Box::new(|| chrono::Utc::now().timestamp_millis()),
+            via_hosts_source: Box::new(|| None),
+            rate_bucket_channels_source: Box::new(Vec::new),
+            home_source: Box::new(|| None),
+            pairing_counter: Box::new(Vec::new),
+            codex_control: crate::remote::codex_ipc::CodexControlHub::disabled_arc(),
+            dsh_control: hub,
+            dsh_auto_adapt_source: std::sync::Arc::new(
+                crate::services::dsh_control::production::dsh_auto_adapt_enabled,
+            ),
+            desktop_language: Default::default(),
+            dsh_console_mount: None,
+            dsh_console_upstream_source: None,
+            ui_config_source: Box::new(|| None),
+            subagent_source: std::collections::HashMap::new(),
+            subagent_message_source: std::collections::HashMap::new(),
+            capability_table: crate::inject::capability::new_table(),
+        });
+        {
+            let st = dsh_state.clone();
+            st.store.with(|c| {
+                crate::remote::pairing::persist_device(
+                    c,
+                    &crate::remote::pairing::NewDevice {
+                        id: "cm".into(),
+                        name: String::new(),
+                        ua: String::new(),
+                        origin_ip: String::new(),
+                        via: String::new(),
+                        paired_at: chrono::Utc::now().timestamp_millis(),
+                    },
+                )
+                .unwrap();
+            });
+        }
+        let app = router(dsh_state);
+        // 尾窗首页（5 条取 2 → 截断，游标在场）
+        let r = app
+            .clone()
+            .oneshot(req(
+                "GET",
+                "/m/api/v1/session-messages?agent_type=dsh&session_id=session-pg&instanceId=inst-pg&limit=2",
+                Some("mam_device=cm"),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+        let body = body_string(r).await;
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["truncated"], serde_json::json!(true), "{body}");
+        let mut cursor = v["olderBefore"].as_i64().expect("截断首页必须携带游标");
+        // 沿游标推进到最旧页：中间页带键，末页 truncated=false 且键缺席
+        for _ in 0..8 {
+            let r = app
+                .clone()
+                .oneshot(req(
+                    "GET",
+                    &format!(
+                        "/m/api/v1/session-messages?agent_type=dsh&session_id=session-pg&instanceId=inst-pg&limit=2&before={cursor}"
+                    ),
+                    Some("mam_device=cm"),
+                    None,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(r.status(), 200);
+            let body = body_string(r).await;
+            let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+            if v["truncated"] == serde_json::json!(false) {
+                assert!(
+                    v.get("olderBefore").is_none(),
+                    "DSH 最旧页不得出现 olderBefore 键（null 也算在场）: {body}"
+                );
+                return;
+            }
+            cursor = v["olderBefore"]
+                .as_i64()
+                .expect("truncated 页必须携带游标（键缺席即失败）");
+        }
+        panic!("游标未在 8 跳内收敛到最旧页");
     }
 
     // ==== M3 Task 8：GET /m/api/v1/file + /session-files（安全文件读取与路径提取） ====
@@ -3103,6 +3611,8 @@ mod tests {
             jump_supported: false,
             unread: false,
             unread_turned_green_at_ms: None,
+            dsh_instance_id: None,
+            dsh_subagent: None,
         };
         let state = Arc::new(RemoteState {
             ui_config_source: Box::new(|| None),
@@ -3158,7 +3668,7 @@ mod tests {
             board_hidden_ids: Box::new(Vec::new),
             board_hidden_hide: std::sync::Arc::new(|_| 0usize),
             board_hidden_unhide: std::sync::Arc::new(|_| 0usize),
-            unread_mark_read: std::sync::Arc::new(|_, _| ()),
+            unread_mark_read: std::sync::Arc::new(|_, _, _| ()),
             session_close: std::sync::Arc::new(|_| Ok(())),
             // M4 T0a：本组测试不触 SSE 断连，空注册表即可
             sse_registry: Arc::new(SseRegistry::default()),
@@ -3177,11 +3687,17 @@ mod tests {
             pairing_counter: Box::new(Vec::new),
 
             codex_control: crate::remote::codex_ipc::CodexControlHub::disabled_arc(),
+            dsh_control: crate::services::dsh_control::disabled_arc(),
+            dsh_auto_adapt_source: std::sync::Arc::new(
+                crate::services::dsh_control::production::dsh_auto_adapt_enabled,
+            ),
             desktop_language: Default::default(),
             // 任务 8：OpenCode 原生交互中枢——测试禁用默认（惰性容器，零 IO；本组用例不触原生路由）
             opencode_native: Arc::new(crate::services::opencode_native::NativeHub::new(
                 crate::remote::pairing::DeviceStore::memory(),
             )),
+            dsh_console_mount: None,
+            dsh_console_upstream_source: None,
         });
         let app = router(state.clone());
         persist_device(&state, "fe");
@@ -3428,6 +3944,8 @@ mod tests {
             jump_supported: false,
             unread: false,
             unread_turned_green_at_ms: None,
+            dsh_instance_id: None,
+            dsh_subagent: None,
         };
         let hit = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let h = hit.clone();
@@ -3471,7 +3989,7 @@ mod tests {
             board_hidden_ids: Box::new(Vec::new),
             board_hidden_hide: std::sync::Arc::new(|_| 0usize),
             board_hidden_unhide: std::sync::Arc::new(|_| 0usize),
-            unread_mark_read: std::sync::Arc::new(|_, _| ()),
+            unread_mark_read: std::sync::Arc::new(|_, _, _| ()),
             session_close: std::sync::Arc::new(|_| Ok(())),
             sse_registry: Arc::new(SseRegistry::default()),
             max_devices_source: Box::new(|| 3),
@@ -3490,11 +4008,17 @@ mod tests {
             pairing_counter: Box::new(Vec::new),
 
             codex_control: crate::remote::codex_ipc::CodexControlHub::disabled_arc(),
+            dsh_control: crate::services::dsh_control::disabled_arc(),
+            dsh_auto_adapt_source: std::sync::Arc::new(
+                crate::services::dsh_control::production::dsh_auto_adapt_enabled,
+            ),
             desktop_language: Default::default(),
             // 任务 8：OpenCode 原生交互中枢——测试禁用默认（惰性容器，零 IO；本组用例不触原生路由）
             opencode_native: Arc::new(crate::services::opencode_native::NativeHub::new(
                 crate::remote::pairing::DeviceStore::memory(),
             )),
+            dsh_console_mount: None,
+            dsh_console_upstream_source: None,
         });
         let app = router(state.clone());
         persist_device(&state, "fe");
@@ -3549,10 +4073,7 @@ mod tests {
             .unwrap();
         assert_eq!(r.status(), 200, "主目录内普通文件必须放行");
 
-        // (3) 主目录**外**含敏感段名的路径必须放行（回归不变量保持）。
-        // 注：D22 后 read_file_safe 不再用 home 做目录判定，本条不再构成
-        // 「基准被真正消费」的区分度判据（接线判据由探针 hit 断言独担），
-        // 但「主目录外不设路径级防线」（2026-09-18 裁决）仍是行为锁。
+        // (3) D22 不再按目录名拒绝本人预览；home 接线由 (1) 的 hit 探针验证。
         let outside_secret = tmp.path().join("outside").join(".ssh").join("id_rsa");
         std::fs::create_dir_all(outside_secret.parent().unwrap()).unwrap();
         std::fs::write(&outside_secret, "PRIVATE").unwrap();
@@ -3569,11 +4090,61 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert_eq!(
-            r.status(),
-            200,
-            "主目录外路径不设路径级防线（2026-09-18 裁决；D22 后全盘同口径）"
-        );
+        assert_eq!(r.status(), 200, "D22 后主目录外凭据根按本人预览放行");
+
+        // (4) D22 同样保留主目录外普通文件的预览。
+        let outside_plain = tmp.path().join("outside").join("notes.md");
+        std::fs::write(&outside_plain, "# ok\n").unwrap();
+        let r = app
+            .clone()
+            .oneshot(req(
+                "GET",
+                &format!(
+                    "/m/api/v1/file?session_id=sess_home&path={}",
+                    uri_encode(&outside_plain.to_string_lossy())
+                ),
+                Some("mam_device=fe"),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200, "D22 后主目录外普通文件仍可预览");
+
+        // D22：同一预览路由不再按文件名或目录名区分普通文件。
+        for relative in [
+            "Desktop/readme.md",
+            "Downloads/readme.md",
+            "Desktop/.env.example",
+            "Desktop/env.example",
+            "Desktop/.env",
+            "Desktop/.env.local",
+            ".claude/plans/plan.md",
+            ".claude/plans-x/plan.md",
+            ".codex/plans/plan.md",
+            ".codex/generated_images/thread/image.png",
+            ".codex/generated_images-x/thread/image.png",
+            ".kimi-code/sessions/workdir/session/agents/main/plans/plan.md",
+            ".kimi-code/x/y/agents/main/plans/plan.md",
+            ".config/agents/main/plans/report.md",
+        ] {
+            let path = home.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, b"fixture").unwrap();
+            let response = app
+                .clone()
+                .oneshot(req(
+                    "GET",
+                    &format!(
+                        "/m/api/v1/file?session_id=sess_home&path={}",
+                        uri_encode(&path.to_string_lossy())
+                    ),
+                    Some("mam_device=fe"),
+                    None,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 200, "{relative}");
+        }
     }
 
     /// 查询参数值的最小 URL 编码（测试助手：空格 → %20；其余字符测试数据不含）
@@ -3678,7 +4249,7 @@ mod tests {
                 board_hidden_ids: Box::new(Vec::new),
                 board_hidden_hide: std::sync::Arc::new(|_| 0usize),
                 board_hidden_unhide: std::sync::Arc::new(|_| 0usize),
-                unread_mark_read: std::sync::Arc::new(|_, _| ()),
+                unread_mark_read: std::sync::Arc::new(|_, _, _| ()),
                 session_close: std::sync::Arc::new(|_| Ok(())),
                 sse_registry: Arc::new(SseRegistry::default()),
                 max_devices_source: Box::new(move || max_devices),
@@ -3695,11 +4266,17 @@ mod tests {
                 pairing_counter: Box::new(Vec::new),
 
                 codex_control: crate::remote::codex_ipc::CodexControlHub::disabled_arc(),
+                dsh_control: crate::services::dsh_control::disabled_arc(),
+                dsh_auto_adapt_source: std::sync::Arc::new(
+                    crate::services::dsh_control::production::dsh_auto_adapt_enabled,
+                ),
                 desktop_language: Default::default(),
                 // 任务 8：OpenCode 原生交互中枢——测试禁用默认（惰性容器，零 IO；本组用例不触原生路由）
                 opencode_native: Arc::new(crate::services::opencode_native::NativeHub::new(
                     crate::remote::pairing::DeviceStore::memory(),
                 )),
+                dsh_console_mount: None,
+                dsh_console_upstream_source: None,
             }),
             t,
         )
@@ -4905,7 +5482,7 @@ mod tests {
                     board_hidden_ids: Box::new(Vec::new),
                     board_hidden_hide: std::sync::Arc::new(|_| 0usize),
                     board_hidden_unhide: std::sync::Arc::new(|_| 0usize),
-                    unread_mark_read: std::sync::Arc::new(|_, _| ()),
+                    unread_mark_read: std::sync::Arc::new(|_, _, _| ()),
                     session_close: std::sync::Arc::new(|_| Ok(())),
                     sse_registry: Arc::new(SseRegistry::default()),
                     max_devices_source: Box::new(|| 3),
@@ -4922,11 +5499,17 @@ mod tests {
                     pairing_counter: Box::new(Vec::new),
 
                     codex_control: crate::remote::codex_ipc::CodexControlHub::disabled_arc(),
+                    dsh_control: crate::services::dsh_control::disabled_arc(),
+                    dsh_auto_adapt_source: std::sync::Arc::new(
+                        crate::services::dsh_control::production::dsh_auto_adapt_enabled,
+                    ),
                     desktop_language: Default::default(),
                     // 任务 8：OpenCode 原生交互中枢——测试禁用默认（惰性容器，零 IO；本组用例不触原生路由）
                     opencode_native: Arc::new(crate::services::opencode_native::NativeHub::new(
                         crate::remote::pairing::DeviceStore::memory(),
                     )),
+                    dsh_console_mount: None,
+                    dsh_console_upstream_source: None,
                 }),
                 t,
             )
@@ -5112,6 +5695,8 @@ mod tests {
             jump_supported: false,
             unread: false,
             unread_turned_green_at_ms: None,
+            dsh_instance_id: None,
+            dsh_subagent: None,
         }
     }
 
@@ -5275,7 +5860,7 @@ mod tests {
             board_hidden_ids: Box::new(Vec::new),
             board_hidden_hide: std::sync::Arc::new(|_| 0usize),
             board_hidden_unhide: std::sync::Arc::new(|_| 0usize),
-            unread_mark_read: std::sync::Arc::new(|_, _| ()),
+            unread_mark_read: std::sync::Arc::new(|_, _, _| ()),
             session_close: std::sync::Arc::new(|_| Ok(())),
             sse_registry: Arc::new(SseRegistry::default()),
             max_devices_source: Box::new(|| 3),
@@ -5290,11 +5875,17 @@ mod tests {
             pairing_counter: Box::new(Vec::new),
 
             codex_control: crate::remote::codex_ipc::CodexControlHub::disabled_arc(),
+            dsh_control: crate::services::dsh_control::disabled_arc(),
+            dsh_auto_adapt_source: std::sync::Arc::new(
+                crate::services::dsh_control::production::dsh_auto_adapt_enabled,
+            ),
             desktop_language: Default::default(),
             // 任务 8：OpenCode 原生交互中枢——测试禁用默认（惰性容器，零 IO；本组用例不触原生路由）
             opencode_native: Arc::new(crate::services::opencode_native::NativeHub::new(
                 crate::remote::pairing::DeviceStore::memory(),
             )),
+            dsh_console_mount: None,
+            dsh_console_upstream_source: None,
         })
     }
 
@@ -5525,6 +6116,8 @@ mod tests {
                     messages: p.clone(),
                     truncated: false,
                     cwd: None,
+                    older_before: None,
+                    dsh_model_summary: None,
                 }),
                 None => Err("测试桩：未注入内容源".to_string()),
             }),
@@ -5533,7 +6126,7 @@ mod tests {
             board_hidden_ids: Box::new(Vec::new),
             board_hidden_hide: std::sync::Arc::new(|_| 0usize),
             board_hidden_unhide: std::sync::Arc::new(|_| 0usize),
-            unread_mark_read: std::sync::Arc::new(|_, _| ()),
+            unread_mark_read: std::sync::Arc::new(|_, _, _| ()),
             session_close: std::sync::Arc::new(|_| Ok(())),
             sse_registry: Arc::new(SseRegistry::default()),
             max_devices_source: Box::new(|| 3),
@@ -5548,11 +6141,17 @@ mod tests {
             pairing_counter: Box::new(Vec::new),
 
             codex_control: crate::remote::codex_ipc::CodexControlHub::disabled_arc(),
+            dsh_control: crate::services::dsh_control::disabled_arc(),
+            dsh_auto_adapt_source: std::sync::Arc::new(
+                crate::services::dsh_control::production::dsh_auto_adapt_enabled,
+            ),
             desktop_language: Default::default(),
             // 任务 8：OpenCode 原生交互中枢——测试禁用默认（惰性容器，零 IO；本组用例不触原生路由）
             opencode_native: Arc::new(crate::services::opencode_native::NativeHub::new(
                 crate::remote::pairing::DeviceStore::memory(),
             )),
+            dsh_console_mount: None,
+            dsh_console_upstream_source: None,
         })
     }
 
@@ -7268,6 +7867,8 @@ mod tests {
             tool_name: Some("AskUserQuestion".into()),
             tool_args: Some(args.into()),
             collapsed: true,
+            media: Vec::new(),
+            blocks: Vec::new(),
         }
     }
 
@@ -7282,6 +7883,8 @@ mod tests {
             tool_name: None,
             tool_args: None,
             collapsed: true,
+            media: Vec::new(),
+            blocks: Vec::new(),
         }
     }
 
@@ -7295,6 +7898,8 @@ mod tests {
             tool_name: None,
             tool_args: None,
             collapsed: false,
+            media: Vec::new(),
+            blocks: Vec::new(),
         }
     }
 
@@ -7723,7 +8328,7 @@ mod tests {
             board_hidden_ids: Box::new(Vec::new),
             board_hidden_hide: std::sync::Arc::new(|_| 0usize),
             board_hidden_unhide: std::sync::Arc::new(|_| 0usize),
-            unread_mark_read: std::sync::Arc::new(|_, _| ()),
+            unread_mark_read: std::sync::Arc::new(|_, _, _| ()),
             session_close: std::sync::Arc::new(|_| Ok(())),
             watcher_tx: tokio::sync::broadcast::channel(64).0,
             sse_registry: Arc::new(SseRegistry::default()),
@@ -7739,11 +8344,17 @@ mod tests {
             pairing_counter: Box::new(Vec::new),
 
             codex_control: crate::remote::codex_ipc::CodexControlHub::disabled_arc(),
+            dsh_control: crate::services::dsh_control::disabled_arc(),
+            dsh_auto_adapt_source: std::sync::Arc::new(
+                crate::services::dsh_control::production::dsh_auto_adapt_enabled,
+            ),
             desktop_language: Default::default(),
             // 任务 8：OpenCode 原生交互中枢——测试禁用默认（惰性容器，零 IO；本组用例不触原生路由）
             opencode_native: Arc::new(crate::services::opencode_native::NativeHub::new(
                 crate::remote::pairing::DeviceStore::memory(),
             )),
+            dsh_console_mount: None,
+            dsh_console_upstream_source: None,
         })
     }
 
@@ -8774,7 +9385,7 @@ mod tests {
             board_hidden_ids: Box::new(Vec::new),
             board_hidden_hide: std::sync::Arc::new(|_| 0usize),
             board_hidden_unhide: std::sync::Arc::new(|_| 0usize),
-            unread_mark_read: std::sync::Arc::new(|_, _| ()),
+            unread_mark_read: std::sync::Arc::new(|_, _, _| ()),
             session_close: std::sync::Arc::new(|_| Ok(())),
             watcher_tx: tokio::sync::broadcast::channel(64).0,
             sse_registry: Arc::new(SseRegistry::default()),
@@ -8790,11 +9401,17 @@ mod tests {
             pairing_counter: Box::new(Vec::new),
 
             codex_control: crate::remote::codex_ipc::CodexControlHub::disabled_arc(),
+            dsh_control: crate::services::dsh_control::disabled_arc(),
+            dsh_auto_adapt_source: std::sync::Arc::new(
+                crate::services::dsh_control::production::dsh_auto_adapt_enabled,
+            ),
             desktop_language: Default::default(),
             // 任务 8：OpenCode 原生交互中枢——测试禁用默认（惰性容器，零 IO；本组用例不触原生路由）
             opencode_native: Arc::new(crate::services::opencode_native::NativeHub::new(
                 crate::remote::pairing::DeviceStore::memory(),
             )),
+            dsh_console_mount: None,
+            dsh_console_upstream_source: None,
         });
         persist_named_device(&state, "mm", "测试设备");
         (state, inner, script)
@@ -9276,12 +9893,16 @@ mod tests {
                     messages: vec![auq_tool_call(0, Q_TWO_QUESTIONS_PAYLOAD)],
                     truncated: false,
                     cwd: None,
+                    older_before: None,
+                    dsh_model_summary: None,
                 }),
                 // kimi：同形（本机 wire 的 3 问题实录缩录为 2 题）
                 "sess_az" => Ok(crate::remote::content::MessagesPage {
                     messages: vec![auq_tool_call(0, KIMI_TWO_Q_PAYLOAD)],
                     truncated: false,
                     cwd: None,
+                    older_before: None,
+                    dsh_model_summary: None,
                 }),
                 _ => Err("无消息".to_string()),
             }),
@@ -10481,6 +11102,8 @@ mod tests {
             messages: vec![user_msg(0), auq_tool_call(1, Q_SINGLE_PAYLOAD)],
             truncated: false,
             cwd: None,
+            older_before: None,
+            dsh_model_summary: None,
         };
         let state = question_state_with_msgs(
             fake.clone(),
@@ -10558,6 +11181,8 @@ mod tests {
             ],
             truncated: false,
             cwd: None,
+            older_before: None,
+            dsh_model_summary: None,
         };
         let state = question_state_with_msgs(
             fake.clone(),
@@ -10624,6 +11249,8 @@ mod tests {
             messages: vec![auq_tool_call(0, Q_SINGLE_PAYLOAD)],
             truncated: false,
             cwd: None,
+            older_before: None,
+            dsh_model_summary: None,
         };
         let state = question_state_with_msgs(
             fake.clone(),
@@ -10670,6 +11297,8 @@ mod tests {
             messages: vec![user_msg(0), auq_tool_call(1, Q_SINGLE_PAYLOAD)],
             truncated: false,
             cwd: None,
+            older_before: None,
+            dsh_model_summary: None,
         };
         // 2026-10-03：select 走焦点守卫编排 → 需要屏读缝（焦点在选项行 → 守卫不触发）
         let probe_screen = screen_fixtures::multi_option_focus();
@@ -10734,6 +11363,8 @@ mod tests {
             ],
             truncated: false,
             cwd: None,
+            older_before: None,
+            dsh_model_summary: None,
         };
         let state = question_state_with_msgs(
             fake.clone(),
@@ -10791,6 +11422,8 @@ mod tests {
             tool_name: None,
             tool_args: None,
             collapsed: false,
+            media: Vec::new(),
+            blocks: Vec::new(),
         }
     }
 
@@ -10805,6 +11438,8 @@ mod tests {
             tool_name: None,
             tool_args: None,
             collapsed: false,
+            media: Vec::new(),
+            blocks: Vec::new(),
         }
     }
 
@@ -10818,6 +11453,8 @@ mod tests {
             ],
             truncated: false,
             cwd: None,
+            older_before: None,
+            dsh_model_summary: None,
         }
     }
 
@@ -10827,6 +11464,8 @@ mod tests {
             messages: vec![user_msg(0), plan_msg(1, "# 计划"), user_msg(2), user_msg(3)],
             truncated: false,
             cwd: None,
+            older_before: None,
+            dsh_model_summary: None,
         }
     }
 
@@ -10846,11 +11485,15 @@ mod tests {
                     tool_name: Some("ExitPlanMode".into()),
                     tool_args: Some("{}".into()),
                     collapsed: true,
+                    media: Vec::new(),
+                    blocks: Vec::new(),
                 },
                 tool_result_msg(4, "Exited plan mode."),
             ],
             truncated: false,
             cwd: None,
+            older_before: None,
+            dsh_model_summary: None,
         }
     }
 
@@ -10954,6 +11597,8 @@ mod tests {
                     ],
                     truncated: false,
                     cwd: None,
+                    older_before: None,
+                    dsh_model_summary: None,
                 }),
                 "sess_av" => Ok(plan_then_tool_event_page()),
                 _ => Err("无消息".to_string()),
@@ -11052,10 +11697,14 @@ mod tests {
                             tool_name: Some("Write".into()),
                             tool_args: Some(r#"{"path":"hi.txt"}"#.into()),
                             collapsed: true,
+                            media: Vec::new(),
+                            blocks: Vec::new(),
                         },
                     ],
                     truncated: false,
                     cwd: None,
+                    older_before: None,
+                    dsh_model_summary: None,
                 }),
                 _ => Err("无消息".to_string()),
             }),
@@ -11263,6 +11912,8 @@ mod tests {
                     messages: vec![user_msg(0), plan_msg(1, "# 执行计划")],
                     truncated: false,
                     cwd: None,
+                    older_before: None,
+                    dsh_model_summary: None,
                 }),
                 _ => Err("无消息".to_string()),
             }),
@@ -11459,6 +12110,8 @@ mod tests {
                     ],
                     truncated: false,
                     cwd: None,
+                    older_before: None,
+                    dsh_model_summary: None,
                 }),
                 // 审批已关：计划之后有工具事件（ExitPlanMode 回执）→ 预期态清除
                 "sess_ax" => Ok(plan_then_tool_event_page()),
@@ -11598,7 +12251,7 @@ mod tests {
             fake.clone(),
             Box::new(move |tool: &str, sid: &str, limit: usize| {
                 crate::remote::content::read_session_messages_impl(
-                    &home, None, None, tool, sid, limit,
+                    &home, None, None, tool, sid, limit, 0,
                 )
             }),
         );
@@ -12072,7 +12725,7 @@ mod tests {
             board_hidden_ids: Box::new(Vec::new),
             board_hidden_hide: std::sync::Arc::new(|_| 0usize),
             board_hidden_unhide: std::sync::Arc::new(|_| 0usize),
-            unread_mark_read: std::sync::Arc::new(|_, _| ()),
+            unread_mark_read: std::sync::Arc::new(|_, _, _| ()),
             session_close: std::sync::Arc::new(|_| Ok(())),
             sse_registry: Arc::new(SseRegistry::default()),
             max_devices_source: Box::new(|| 3),
@@ -12088,11 +12741,17 @@ mod tests {
             pairing_counter: Box::new(Vec::new),
 
             codex_control: crate::remote::codex_ipc::CodexControlHub::disabled_arc(),
+            dsh_control: crate::services::dsh_control::disabled_arc(),
+            dsh_auto_adapt_source: std::sync::Arc::new(
+                crate::services::dsh_control::production::dsh_auto_adapt_enabled,
+            ),
             desktop_language: Default::default(),
             // 任务 8：OpenCode 原生交互中枢——测试禁用默认（惰性容器，零 IO；本组用例不触原生路由）
             opencode_native: Arc::new(crate::services::opencode_native::NativeHub::new(
                 crate::remote::pairing::DeviceStore::memory(),
             )),
+            dsh_console_mount: None,
+            dsh_console_upstream_source: None,
         })
     }
 
@@ -12478,6 +13137,12 @@ mod tests {
         sess.project_path = project_path.into();
         let sessions = vec![sess];
         Arc::new(RemoteState {
+            dsh_control: crate::services::dsh_control::disabled_arc(),
+            dsh_auto_adapt_source: Arc::new(
+                crate::services::dsh_control::production::dsh_auto_adapt_enabled,
+            ),
+            dsh_console_mount: None,
+            dsh_console_upstream_source: None,
             ui_config_source: Box::new(|| None),
             subagent_source: std::collections::HashMap::new(),
             subagent_message_source: std::collections::HashMap::new(),
@@ -12511,7 +13176,7 @@ mod tests {
             board_hidden_ids: Box::new(Vec::new),
             board_hidden_hide: std::sync::Arc::new(|_| 0usize),
             board_hidden_unhide: std::sync::Arc::new(|_| 0usize),
-            unread_mark_read: std::sync::Arc::new(|_, _| ()),
+            unread_mark_read: std::sync::Arc::new(|_, _, _| ()),
             session_close: std::sync::Arc::new(|_| Ok(())),
             sse_registry: Arc::new(SseRegistry::default()),
             max_devices_source: Box::new(|| 3),
@@ -12840,6 +13505,7 @@ mod tests {
             let seen = (chrono::Utc::now() - chrono::Duration::seconds(seen_secs_ago)).to_rfc3339();
             SessionArchiveRow {
                 session_id: id.into(),
+                dsh_instance_id: None,
                 agent_type: tool.into(),
                 project_path: format!("/tmp/{proj}"),
                 project_name: proj.into(),
@@ -12863,6 +13529,275 @@ mod tests {
             // 与全文件先例一致：persist_device 播种 + req 带 cookie 过闸（评审追记）
             persist_device(&st, "arch");
             crate::remote::server::router(st)
+        }
+
+        #[cfg(unix)]
+        mod dsh_off_history {
+            use super::*;
+            use crate::database::dao::archive::{query_archive_all_conn, register_sessions_conn};
+            use crate::remote::pairing::{self, DeviceStore};
+            use crate::services::dsh_control::{
+                auth,
+                instances::{HostKind, InstanceRegistry},
+                model::{
+                    DshEnvironment, DshListener, DshProcess, DshProcessSource,
+                    TestUnobservableEnvironments,
+                },
+                production::{CliRunner, FsFileSource, SystemClock},
+            };
+            use axum::http::StatusCode;
+            use std::path::{Path, PathBuf};
+
+            const SESSION_ID: &str = "session-archived-dsh";
+            const DEVICE_ID: &str = "dsh-history-test-device";
+            const COOKIE: &str = "mam_device=dsh-history-test-device";
+            const ORIGINAL_TEXT: &str = "archived transcript from original Desktop";
+            const OTHER_TEXT: &str = "same session ID in another Desktop home";
+            const TRANSCRIPT_URI: &str =
+                "/m/api/v1/session-messages?agent_type=dsh&session_id=session-archived-dsh&history=1";
+
+            struct NoProcesses;
+
+            impl DshProcessSource for NoProcesses {
+                fn list_processes(&self) -> Vec<DshProcess> {
+                    Vec::new()
+                }
+
+                fn listening_sockets(&self) -> Vec<DshListener> {
+                    Vec::new()
+                }
+            }
+
+            struct Fixture {
+                _root: tempfile::TempDir,
+                env: Arc<DshEnvironment>,
+                registry_path: PathBuf,
+                device_db: PathBuf,
+                original_profile: PathBuf,
+                original_id: String,
+                other_id: String,
+            }
+
+            impl Fixture {
+                fn new() -> Self {
+                    let root = tempfile::tempdir().unwrap();
+                    let dir = root.path().canonicalize().unwrap();
+                    let home = dir.join("original-home");
+                    let other_home = dir.join("other-home");
+                    let profile = dir.join("original-profile");
+                    std::fs::create_dir_all(&profile).unwrap();
+                    std::fs::create_dir_all(home.join("profiles")).unwrap();
+                    std::os::unix::fs::symlink(&profile, home.join("profiles/desktop")).unwrap();
+                    std::fs::create_dir_all(other_home.join("profiles/desktop")).unwrap();
+                    Self::write_transcript(&home, ORIGINAL_TEXT);
+                    Self::write_transcript(&other_home, OTHER_TEXT);
+                    let env = Arc::new(DshEnvironment {
+                        home: dir.join("user-home"),
+                        tuvis_home: dir.join("tuvis"),
+                        dsh_state_dir: Some(dir.join("dsh-state")),
+                        processes: Arc::new(NoProcesses),
+                        files: Arc::new(FsFileSource),
+                        runner: Arc::new(CliRunner),
+                        clock: Arc::new(SystemClock),
+                        environments: Arc::new(TestUnobservableEnvironments),
+                    });
+                    let registry_path = dir.join("instances.json");
+                    let registry =
+                        InstanceRegistry::open_with_env(&registry_path, Some(env.clone())).unwrap();
+                    let original_id = Self::register_retired(&registry, &env, &home);
+                    let other_id = Self::register_retired(&registry, &env, &other_home);
+                    registry.select(&original_id).unwrap();
+                    let device_db = dir.join("tuvis.sqlite");
+                    let db = rusqlite::Connection::open(&device_db).unwrap();
+                    crate::database::schema::init(&db).unwrap();
+                    crate::database::migration::migrate(&db).unwrap();
+                    let mut session = inj_sess(
+                        SESSION_ID,
+                        crate::session::AgentType::Dsh,
+                        42,
+                        crate::session::SessionStatus::Idle,
+                    );
+                    session.dsh_instance_id = Some(original_id.clone());
+                    session.project_path = "/fixture/project".into();
+                    assert_eq!(register_sessions_conn(&db, &[session]), 1);
+                    pairing::persist_device(
+                        &db,
+                        &pairing::NewDevice {
+                            id: DEVICE_ID.into(),
+                            name: "test device".into(),
+                            ua: "test browser".into(),
+                            origin_ip: "127.0.0.1".into(),
+                            via: "lan".into(),
+                            paired_at: chrono::Utc::now().timestamp_millis(),
+                        },
+                    )
+                    .unwrap();
+                    Self {
+                        _root: root,
+                        env,
+                        registry_path,
+                        device_db,
+                        original_profile: home.join("profiles/desktop"),
+                        original_id,
+                        other_id,
+                    }
+                }
+
+                fn write_transcript(home: &Path, text: &str) {
+                    let session = home.join("sessions/project").join(SESSION_ID);
+                    std::fs::create_dir_all(&session).unwrap();
+                    let header = serde_json::json!({"type":"session", "version":3, "id":SESSION_ID, "cwd":"/fixture/project"});
+                    let message = serde_json::json!({
+                        "type": "user/message", "seq": 1, "time": 1112,
+                        "data": {"content": [{"type": "text", "text": text}], "source": {"kind": "user"}}
+                    });
+                    std::fs::write(
+                        session.join("session.v3.jsonl"),
+                        format!("{header}\n{message}\n"),
+                    )
+                    .unwrap();
+                }
+
+                fn register_retired(
+                    registry: &InstanceRegistry,
+                    env: &DshEnvironment,
+                    home: &Path,
+                ) -> String {
+                    let entry = home.join("profiles/desktop");
+                    let key = format!("synthetic origin for {}", home.display());
+                    registry
+                        .register_candidate_with_home(HostKind::Desktop, &entry, Some(home))
+                        .unwrap();
+                    let instance = registry
+                        .register(HostKind::Desktop, &entry, &auth::key_digest(key.as_bytes()))
+                        .unwrap();
+                    let state = auth::instance_state_dir(env, &instance.instance_id).unwrap();
+                    std::fs::create_dir_all(&state).unwrap();
+                    let ledger = serde_json::json!({"bindings":[{
+                        "bindingId":"fixture", "publicKeySpki":"",
+                        "revokedKeySpki":auth::b64url_encode(key.as_bytes()),
+                        "executable":"/fixture/dsh", "pid":1, "startedAtMs":100,
+                        "profileDir":entry, "createdAtMs":101, "state":"revoked"
+                    }]});
+                    std::fs::write(
+                        state.join("bindings.json"),
+                        serde_json::to_vec(&ledger).unwrap(),
+                    )
+                    .unwrap();
+                    registry
+                        .retire_identity_fingerprint(&instance.instance_id)
+                        .unwrap();
+                    instance.instance_id
+                }
+
+                fn restart(&self) -> axum::Router {
+                    let registry = InstanceRegistry::open_with_env(
+                        &self.registry_path,
+                        Some(self.env.clone()),
+                    )
+                    .unwrap();
+                    let mut state = test_state();
+                    let st = Arc::get_mut(&mut state).unwrap();
+                    st.store = DeviceStore::Owned(Arc::new(std::sync::Mutex::new(
+                        rusqlite::Connection::open(&self.device_db).unwrap(),
+                    )));
+                    let archive_store = st.store.clone();
+                    st.archive_source =
+                        Box::new(move || archive_store.with(query_archive_all_conn));
+                    st.dsh_control
+                        .set_readonly_root_resolver(Arc::new(move |id, sid| {
+                            registry.resolve_readonly_root(id, sid)
+                        }));
+                    router(state)
+                }
+            }
+
+            async fn get(app: &axum::Router, uri: &str) -> axum::response::Response {
+                app.clone()
+                    .oneshot(req("GET", uri, Some(COOKIE), None))
+                    .await
+                    .unwrap()
+            }
+
+            fn scoped_transcript(instance_id: &str) -> String {
+                format!("{TRANSCRIPT_URI}&instanceId={instance_id}")
+            }
+
+            #[tokio::test]
+            async fn paired_device_reads_original_dsh_transcript_from_history_after_off_restart() {
+                let fixture = Fixture::new();
+                let app = fixture.restart();
+                let history = get(&app, "/m/api/v1/sessions-archived").await;
+                assert_eq!(history.status(), StatusCode::OK, "重启后原设备配对仍有效");
+                let history: serde_json::Value =
+                    serde_json::from_str(&body_string(history).await).unwrap();
+                let row = &history["archived"][0];
+                assert_eq!(row["sessionId"], SESSION_ID);
+                assert_eq!(
+                    row["instanceId"], fixture.original_id,
+                    "历史条目必须携带原实例归属"
+                );
+                let uri = scoped_transcript(row["instanceId"].as_str().unwrap());
+                let response = get(&app, &uri).await;
+                assert_eq!(response.status(), StatusCode::OK);
+                let body = body_string(response).await;
+                assert!(body.contains(ORIGINAL_TEXT), "回应应包含原始转写：{body}");
+                assert!(!body.contains(OTHER_TEXT));
+            }
+
+            #[tokio::test]
+            async fn dsh_history_refuses_same_session_id_in_another_instance() {
+                let fixture = Fixture::new();
+                let app = fixture.restart();
+                assert_eq!(
+                    get(&app, &scoped_transcript(&fixture.original_id))
+                        .await
+                        .status(),
+                    StatusCode::OK
+                );
+                let registry = InstanceRegistry::open_with_env(
+                    &fixture.registry_path,
+                    Some(fixture.env.clone()),
+                )
+                .unwrap();
+                registry.select(&fixture.other_id).unwrap();
+                assert!(registry
+                    .resolve_readonly_root(&fixture.other_id, SESSION_ID)
+                    .is_ok());
+                let restarted = fixture.restart();
+                let uri = scoped_transcript(&fixture.other_id);
+                for route in [&uri, &uri.replace("&history=1", "")] {
+                    assert_eq!(get(&restarted, route).await.status(), StatusCode::FORBIDDEN);
+                }
+            }
+
+            #[tokio::test]
+            async fn dsh_history_refuses_a_changed_home() {
+                let fixture = Fixture::new();
+                let app = fixture.restart();
+                let uri = scoped_transcript(&fixture.original_id);
+                assert_eq!(get(&app, &uri).await.status(), StatusCode::OK);
+                let other_profile = fixture._root.path().join("other-home/profiles/desktop");
+                std::fs::remove_file(&fixture.original_profile).unwrap();
+                std::os::unix::fs::symlink(other_profile, &fixture.original_profile).unwrap();
+                assert_eq!(
+                    get(&fixture.restart(), &uri).await.status(),
+                    StatusCode::FORBIDDEN
+                );
+            }
+
+            #[tokio::test]
+            async fn dsh_history_refuses_the_same_cookie_after_device_revocation() {
+                let fixture = Fixture::new();
+                let uri = scoped_transcript(&fixture.original_id);
+                assert_eq!(get(&fixture.restart(), &uri).await.status(), StatusCode::OK);
+                let db = rusqlite::Connection::open(&fixture.device_db).unwrap();
+                pairing::revoke_device(&db, DEVICE_ID).unwrap();
+                assert_eq!(
+                    get(&fixture.restart(), &uri).await.status(),
+                    StatusCode::FORBIDDEN
+                );
+            }
         }
 
         #[tokio::test]
@@ -13208,6 +14143,7 @@ mod tests {
                 s.archive_source = Box::new(move || {
                     vec![crate::database::SessionArchiveRow {
                         session_id: "dead-old".into(),
+                        dsh_instance_id: None,
                         agent_type: "kimi".into(),
                         project_path: "/tmp/d".into(),
                         project_name: "dead-proj".into(),
@@ -13408,8 +14344,11 @@ mod tests {
                 let mut state = state_with_sessions(sessions);
                 let hid = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
                 let h2 = hid.clone();
-                let reads =
-                    std::sync::Arc::new(std::sync::Mutex::new(Vec::<(String, String)>::new()));
+                let reads = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(
+                    String,
+                    String,
+                    Option<String>,
+                )>::new()));
                 let r2 = reads.clone();
                 {
                     let s = std::sync::Arc::get_mut(&mut state).expect("独占");
@@ -13417,9 +14356,14 @@ mod tests {
                         h2.lock().unwrap().push(id.to_string());
                         1
                     });
-                    s.unread_mark_read = std::sync::Arc::new(move |tool, id| {
-                        r2.lock().unwrap().push((tool.to_string(), id.to_string()));
-                    });
+                    s.unread_mark_read =
+                        std::sync::Arc::new(move |tool: &str, id: &str, instance: Option<&str>| {
+                            r2.lock().unwrap().push((
+                                tool.to_string(),
+                                id.to_string(),
+                                instance.map(|s| s.to_string()),
+                            ));
+                        });
                 }
                 let app = router(state);
                 for sid in ["app-g", "app-y"] {
@@ -13444,8 +14388,8 @@ mod tests {
                 assert_eq!(
                     reads.lock().unwrap().as_slice(),
                     [
-                        ("codex".to_string(), "app-g".to_string()),
-                        ("codex".to_string(), "app-y".to_string())
+                        ("codex".to_string(), "app-g".to_string(), None::<String>),
+                        ("codex".to_string(), "app-y".to_string(), None::<String>)
                     ]
                 );
             });
@@ -13519,7 +14463,7 @@ mod tests {
                 let hide_writes = writes.clone();
                 {
                     let state = std::sync::Arc::get_mut(&mut state).expect("独占");
-                    state.unread_mark_read = std::sync::Arc::new(move |_, _| {
+                    state.unread_mark_read = std::sync::Arc::new(move |_, _, _| {
                         read_writes.lock().unwrap().push("read");
                     });
                     state.board_hidden_hide = std::sync::Arc::new(move |_| {
@@ -13659,6 +14603,7 @@ mod tests {
         async fn dead_session_opens_from_archive() {
             let row = SessionArchiveRow {
                 session_id: "dead-9".into(),
+                dsh_instance_id: None,
                 agent_type: "codex".into(),
                 project_path: "/tmp/proj-dead".into(),
                 project_name: "proj-dead".into(),
@@ -13799,7 +14744,7 @@ mod tests {
             board_hidden_ids: Box::new(Vec::new),
             board_hidden_hide: std::sync::Arc::new(|_| 0usize),
             board_hidden_unhide: std::sync::Arc::new(|_| 0usize),
-            unread_mark_read: std::sync::Arc::new(|_, _| ()),
+            unread_mark_read: std::sync::Arc::new(|_, _, _| ()),
             session_close: std::sync::Arc::new(|_| Ok(())),
             watcher_tx: tokio::sync::broadcast::channel(64).0,
             sse_registry: Arc::new(SseRegistry::default()),
@@ -13815,11 +14760,17 @@ mod tests {
             pairing_counter: Box::new(Vec::new),
 
             codex_control: crate::remote::codex_ipc::CodexControlHub::disabled_arc(),
+            dsh_control: crate::services::dsh_control::disabled_arc(),
+            dsh_auto_adapt_source: std::sync::Arc::new(
+                crate::services::dsh_control::production::dsh_auto_adapt_enabled,
+            ),
             desktop_language: Default::default(),
             // 任务 8：OpenCode 原生交互中枢——测试禁用默认（惰性容器，零 IO；本组用例不触原生路由）
             opencode_native: Arc::new(crate::services::opencode_native::NativeHub::new(
                 crate::remote::pairing::DeviceStore::memory(),
             )),
+            dsh_console_mount: None,
+            dsh_console_upstream_source: None,
         })
     }
 
@@ -14048,6 +14999,147 @@ mod tests {
         assert_eq!(std::fs::read(sentinel).unwrap(), b"original\n");
     }
 
+    // 暂停钩子和选中实例镜像均为进程级状态，复用实例边界测试锁，防止相互串扰。
+    use crate::services::dsh_control::production::tests::TEST_BOUNDARY_SERIAL as ATTACHMENT_TEST_LOCK;
+
+    #[tokio::test]
+    async fn attachment_rejects_dsh_child_and_unowned_session() {
+        let project = attach_tempdir();
+        for child in [true, false] {
+            let mut state = attach_state(project.path().to_path_buf(), false);
+            let mut session = inj_sess(
+                "sess_att",
+                crate::session::AgentType::Dsh,
+                21,
+                crate::session::SessionStatus::Processing,
+            );
+            session.project_path = project.path().to_string_lossy().into_owned();
+            session.dsh_subagent = Some(child);
+            session.dsh_instance_id = None;
+            Arc::get_mut(&mut state).unwrap().fresh_session_source =
+                Box::new(move || crate::session::SessionsResponse {
+                    sessions: vec![session.clone()],
+                    total_count: 1,
+                    waiting_count: 0,
+                });
+            persist_named_device(&state, "mm", "测试设备");
+            let r = router(state)
+                .oneshot(attach_req(
+                    "/m/api/v1/session-attachment?session_id=sess_att&name=a.txt",
+                    Some("mam_device=mm"),
+                    Body::from("test"),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(r.status(), 403, "child={child}");
+            let body: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+            let expected = if child {
+                "DSH_SUBAGENT_READONLY"
+            } else {
+                "DSH_SESSION_OWNERSHIP_UNPROVEN"
+            };
+            assert_eq!(body["reasonCode"], expected);
+            assert!(!project.join(".tuvis-attachments").exists());
+            assert!(!project.join(".git/info/exclude").exists());
+        }
+    }
+
+    /// A06 写入口锁（2026-11-15 补证批）：发送面 DSH 子会话必须 403
+    /// `subagent_read_only`（门在 dsh_send_via_hub 首行，先于 hub 接线核对）。
+    /// 与附件面同款锁；真实行为锁定，无生产改动。
+    #[tokio::test]
+    async fn send_rejects_dsh_child_session() {
+        let proj = attach_tempdir();
+        let mut state = attach_state(proj.path().to_path_buf(), false);
+        let mut session = inj_sess(
+            "sess_att",
+            crate::session::AgentType::Dsh,
+            21,
+            crate::session::SessionStatus::Processing,
+        );
+        session.project_path = proj.path().to_string_lossy().into_owned();
+        session.dsh_subagent = Some(true);
+        session.dsh_instance_id = Some("inst-child".into());
+        Arc::get_mut(&mut state).unwrap().fresh_session_source =
+            Box::new(move || crate::session::SessionsResponse {
+                sessions: vec![session.clone()],
+                total_count: 1,
+                waiting_count: 0,
+            });
+        persist_named_device(&state, "mm", "测试设备");
+        let r = router(state)
+            .oneshot(req(
+                "POST",
+                "/m/api/v1/session-send",
+                Some("mam_device=mm"),
+                Some(r#"{"sessionId":"sess_att","text":"子会话写尝试","actionId":"act-child-1"}"#),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 403, "子会话发送必须拒绝");
+        let body = body_string(r).await;
+        assert!(
+            body.contains("subagent_read_only"),
+            "拒绝必须携带子会话只读错误码: {body}"
+        );
+    }
+
+    /// A06 写入口锁（2026-11-15 补证批）：控制台入口面此前只靠「子 Agent 不出卡」
+    /// 的扫描侧结构保证（scanner 契约有测），端点本身没有与发送/附件同款的
+    /// 子会话执行门。补齐同款门：dsh_subagent=Some(true) → 403 subagent_read_only
+    /// （先于开关门与票据签发）。
+    #[tokio::test]
+    async fn console_entry_rejects_dsh_child_session() {
+        let proj = attach_tempdir();
+        let mut state = attach_dsh_state(proj.path().to_path_buf(), Arc::new(|_: &str| Ok(())));
+        {
+            let s = Arc::get_mut(&mut state).unwrap();
+            s.fresh_session_source = {
+                let mut session = inj_sess(
+                    "sess_att",
+                    crate::session::AgentType::Dsh,
+                    21,
+                    crate::session::SessionStatus::Processing,
+                );
+                session.project_path = proj.path().to_string_lossy().into_owned();
+                session.dsh_subagent = Some(true);
+                session.dsh_instance_id = Some("inst-gate".into());
+                let session = session;
+                Box::new(move || crate::session::SessionsResponse {
+                    sessions: vec![session.clone()],
+                    total_count: 1,
+                    waiting_count: 0,
+                })
+            };
+            let mut mount = crate::remote::console_mount::ConsoleMount::new();
+            mount.device_valid = Box::new(|_| true);
+            s.dsh_console_mount = Some(Arc::new(mount));
+            s.dsh_console_upstream_source = Some(Arc::new(|instance_id: &str| {
+                Ok(crate::remote::console_upstream::ConsoleUpstream {
+                    instance_id: instance_id.to_string(),
+                    authority: "127.0.0.1:9".into(),
+                    epoch: 3,
+                })
+            }));
+        }
+        persist_named_device(&state, "mm", "测试设备");
+        let r = router(state)
+            .oneshot(req(
+                "GET",
+                "/m/api/v1/dsh-console-entry?session_id=sess_att&instanceId=inst-gate",
+                Some("mam_device=mm"),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 403, "子会话控制台入口必须拒绝（写面对称）");
+        let body = body_string(r).await;
+        assert!(
+            body.contains("subagent_read_only"),
+            "拒绝必须携带子会话只读错误码: {body}"
+        );
+    }
+
     #[tokio::test]
     async fn attachment_upload_lands_in_project_dir_and_excludes_from_git() {
         let proj = attach_tempdir();
@@ -14119,6 +15211,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r.status(), 403);
+        assert!(body_string(r).await.contains("\"error\":\"forbidden\""));
         // 404 no_session：未知会话
         let r = router(state.clone())
             .oneshot(attach_req(
@@ -14163,6 +15256,1495 @@ mod tests {
             Some("too_large"),
             "413 体必须带可辨错误码 too_large: {body}"
         );
+    }
+
+    // ===== P1-1 开关执行门（附件写盘 + 控制台准入；生产执行点的拒绝面）=====
+
+    /// DSH 附件用例基座：attach_state 换 DSH 会话 + 注入带 host/会话解析与开关门
+    /// 的 hub（`resolve_owned_session` 可过、仅门可判）。`gate` = 附件/控制台共用的
+    /// 执行门注入（Err = 模拟开关关闭）。
+    fn attach_dsh_state(
+        project: std::path::PathBuf,
+        gate: crate::services::dsh_control::SwitchExecutionGate,
+    ) -> Arc<RemoteState> {
+        attach_dsh_state_with_instance(project, gate, "inst-gate")
+    }
+
+    /// 代次边界用例（销项复审 P1-3）变体：自定义实例 id——关闭旗标/实例代次是
+    /// **进程级全局静态**，本族用例各用独立实例 id，避免与并行用例（及族内
+    /// 用例互间）在共享 "inst-gate" 上串扰。
+    fn attach_dsh_state_with_instance(
+        project: std::path::PathBuf,
+        gate: crate::services::dsh_control::SwitchExecutionGate,
+        instance: &str,
+    ) -> Arc<RemoteState> {
+        attach_dsh_state_with_resolver(project, gate, instance, Arc::new(attachment_test_target))
+    }
+
+    fn attachment_test_target(
+        instance_id: &str,
+        session_id: &str,
+    ) -> Result<
+        crate::services::dsh_control::model::Target,
+        crate::services::dsh_control::error::DshError,
+    > {
+        Ok(crate::services::dsh_control::model::Target {
+            host_id: instance_id.to_string(),
+            epoch: 3,
+            session_id: session_id.to_string(),
+        })
+    }
+
+    fn attach_dsh_state_with_resolver(
+        project: std::path::PathBuf,
+        gate: crate::services::dsh_control::SwitchExecutionGate,
+        instance: &str,
+        resolver: crate::services::dsh_control::SessionResolver,
+    ) -> Arc<RemoteState> {
+        let proj = project.clone();
+        let mut session = inj_sess(
+            "sess_att",
+            crate::session::AgentType::Dsh,
+            21,
+            crate::session::SessionStatus::Processing,
+        );
+        session.project_path = proj.to_string_lossy().into_owned();
+        session.dsh_instance_id = Some(instance.to_owned());
+        let state = attach_state(project, false);
+        let mut state = Arc::try_unwrap(state).ok().expect("state 独占");
+        state.fresh_session_source = Box::new(move || crate::session::SessionsResponse {
+            sessions: vec![session.clone()],
+            total_count: 1,
+            waiting_count: 0,
+        });
+        // hub：host/会话解析可过（归属核验非本用例变量），开关门注入。
+        // hub 的 sqlite 落在夹具项目目录内（生命周期与夹具同寿）。
+        let db_path = proj.join("hub-gate.db");
+        {
+            let conn = rusqlite::Connection::open(&db_path).expect("建库");
+            crate::database::schema::init(&conn).unwrap();
+        }
+        struct UnusedNative;
+        impl crate::services::dsh_control::actions::NativeDispatch for UnusedNative {
+            fn send_message<'a>(
+                &'a self,
+                _target: &'a crate::services::dsh_control::model::Target,
+                _payload: &'a crate::services::dsh_control::model::SendPayload,
+                _action_id: &'a str,
+            ) -> futures::future::BoxFuture<
+                'a,
+                Result<
+                    crate::services::dsh_control::actions::NativeSendOutcome,
+                    crate::services::dsh_control::error::DshError,
+                >,
+            > {
+                Box::pin(async move {
+                    Err(crate::services::dsh_control::error::DshError::new(
+                        crate::services::dsh_control::error::codes::UNSUPPORTED,
+                        "not used in gate tests",
+                    ))
+                })
+            }
+        }
+        let host = crate::services::dsh_control::model::LocalHost {
+            host_id: instance.to_owned(),
+            platform: "macos".into(),
+            profile_dir: Default::default(),
+            executable: Default::default(),
+            pid: 42,
+            started_at_ms: 1,
+            epoch: 3,
+            authority: "127.0.0.1:9".into(),
+            package_sha256: String::new(),
+        };
+        let probe: crate::services::dsh_control::actions::HostProbe =
+            Arc::new(move || Ok(host.clone()));
+        let hub = crate::services::dsh_control::DshControlHub::with_native(
+            crate::services::dsh_control::DshDb::Owned(Arc::new(std::sync::Mutex::new(
+                rusqlite::Connection::open(&db_path).expect("连接"),
+            ))),
+            Arc::new(UnusedNative),
+            probe,
+            Some(resolver),
+        );
+        hub.set_switch_gate(Some(gate));
+        hub.open_write_gate();
+        state.dsh_control = hub;
+        Arc::new(state)
+    }
+
+    enum AttachmentLifecycleCycle {
+        CloseReopen,
+        SelectAwayAndBack,
+    }
+
+    #[tokio::test]
+    async fn f01_explicit_upload_from_before_close_reopen_is_rejected() {
+        assert_f01_attachment_lifecycle(true, AttachmentLifecycleCycle::CloseReopen).await;
+    }
+
+    #[tokio::test]
+    async fn f01_compat_upload_from_before_close_reopen_is_rejected() {
+        assert_f01_attachment_lifecycle(false, AttachmentLifecycleCycle::CloseReopen).await;
+    }
+
+    #[tokio::test]
+    async fn f01_explicit_upload_from_before_selection_roundtrip_is_rejected() {
+        assert_f01_attachment_lifecycle(true, AttachmentLifecycleCycle::SelectAwayAndBack).await;
+    }
+
+    #[tokio::test]
+    async fn f01_compat_upload_from_before_selection_roundtrip_is_rejected() {
+        assert_f01_attachment_lifecycle(false, AttachmentLifecycleCycle::SelectAwayAndBack).await;
+    }
+
+    async fn assert_f01_attachment_lifecycle(explicit: bool, cycle: AttachmentLifecycleCycle) {
+        use crate::services::dsh_control::{error::codes, production};
+        use std::time::Duration;
+
+        const TIMEOUT: Duration = Duration::from_secs(5);
+        const A: &str = "inst-f01-a";
+        const B: &str = "inst-f01-b";
+        const ORIGINAL_EXCLUDE: &[u8] = b"# fixture\nlocal-cache/\n";
+        const FRESH: &[u8] = b"fresh attachment fixture";
+
+        let _serial = ATTACHMENT_TEST_LOCK.lock().await;
+        struct RestoreSelection(Option<String>);
+        impl Drop for RestoreSelection {
+            fn drop(&mut self) {
+                production::set_selected_mirror(self.0.as_deref());
+            }
+        }
+        let _restore = RestoreSelection(production::selected_mirror());
+        production::set_selected_mirror(Some(A));
+        let initial_generation = production::instance_generation(A);
+        let project = attach_tempdir();
+        let exclude = project.join(".git/info/exclude");
+        std::fs::write(&exclude, ORIGINAL_EXCLUDE).unwrap();
+
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let barrier = std::sync::Mutex::new(Some((entered_tx, release_rx)));
+        let pause_once = move || {
+            let waiting = barrier.lock().unwrap().take();
+            if let Some((entered, release)) = waiting {
+                if entered.send(()).is_ok() {
+                    // 断言失败时发送端析构也会解锁，避免挂住测试进程。
+                    let _ = release.recv_timeout(TIMEOUT);
+                }
+            }
+        };
+        let state = match cycle {
+            AttachmentLifecycleCycle::CloseReopen => {
+                let state = attach_dsh_state_with_instance(
+                    project.path().to_path_buf(),
+                    Arc::new(|_| Ok(())),
+                    A,
+                );
+                let mut state = Arc::try_unwrap(state).ok().expect("state 独占");
+                let scan = state.fresh_session_source;
+                state.fresh_session_source = Box::new(move || {
+                    let snapshot = scan();
+                    pause_once();
+                    snapshot
+                });
+                Arc::new(state)
+            }
+            AttachmentLifecycleCycle::SelectAwayAndBack => attach_dsh_state_with_resolver(
+                project.path().to_path_buf(),
+                Arc::new(|_| Ok(())),
+                A,
+                Arc::new(move |instance, session| {
+                    let target = attachment_test_target(instance, session);
+                    pause_once();
+                    target
+                }),
+            ),
+        };
+        persist_named_device(&state, "mm", "测试设备");
+        let request = move |name: &str, bytes: &'static [u8]| {
+            let mut uri = format!("/m/api/v1/session-attachment?session_id=sess_att&name={name}");
+            if explicit {
+                uri.push_str(&format!("&instanceId={A}"));
+            }
+            attach_req(&uri, Some("mam_device=mm"), Body::from(bytes))
+        };
+        let app = router(state);
+        let pending = tokio::spawn(app.clone().oneshot(request("old.txt", b"old fixture")));
+        tokio::time::timeout(TIMEOUT, entered_rx)
+            .await
+            .expect("旧请求须到达扫描或核验屏障")
+            .unwrap();
+        let expected_reason = match cycle {
+            AttachmentLifecycleCycle::CloseReopen => {
+                let epoch = production::mark_closing(A);
+                let reopened = production::clear_closing_and_advance(A, epoch);
+                if !reopened {
+                    production::clear_closing_if(A, epoch);
+                }
+                assert!(reopened, "夹具须完成重开");
+                codes::SWITCH_OFF
+            }
+            AttachmentLifecycleCycle::SelectAwayAndBack => {
+                production::record_instance_selection(Some(A), B);
+                assert_eq!(production::selected_mirror().as_deref(), Some(B));
+                production::record_instance_selection(Some(B), A);
+                codes::INSTANCE_SWITCHED
+            }
+        };
+        assert_eq!(production::selected_mirror().as_deref(), Some(A));
+        assert!(!production::is_closing(A));
+        assert!(production::instance_generation(A) > initial_generation);
+        release_tx.send(()).expect("夹具须等到周期完成才继续");
+
+        let old = tokio::time::timeout(TIMEOUT, pending)
+            .await
+            .expect("旧请求须结束")
+            .unwrap()
+            .unwrap();
+        let old_status = old.status();
+        let old_body = body_string(old).await;
+        let root = project.join(".tuvis-attachments");
+        let formal_count = attachment_entry_count(&root.join("sess_att"));
+        let staging_count = attachment_entry_count(&root.join(".staging"));
+        let unchanged_exclude = std::fs::read(&exclude).unwrap() == ORIGINAL_EXCLUDE;
+
+        // 先保存拒绝路径的副作用，再单独跑正例；后者允许正常追加 Git exclude。
+        let fresh = tokio::time::timeout(TIMEOUT, app.oneshot(request("fresh.txt", FRESH)))
+            .await
+            .expect("新请求须结束")
+            .unwrap();
+        assert_eq!(fresh.status(), 200, "新请求须正常受理");
+        assert_eq!(
+            std::fs::read(root.join("sess_att/fresh.txt")).unwrap(),
+            FRESH
+        );
+
+        let reason = serde_json::from_str::<serde_json::Value>(&old_body).unwrap();
+        assert!(
+            matches!(old_status.as_u16(), 403 | 409)
+                && (reason["reasonCode"] == expected_reason
+                    || reason["reasonCode"] == codes::SWITCH_OFF)
+                && formal_count == 0
+                && staging_count == 0
+                && unchanged_exclude,
+            "旧请求须拒绝且不改磁盘：status={old_status}, reason={reason}, \
+             formal={formal_count}, staging={staging_count}, exclude_unchanged={unchanged_exclude}"
+        );
+    }
+
+    /// 写任务进入发布点后「关闭首步旗标」落地，仍不得发布文件或遗留临时物
+    /// （销项复审 P1 关闭面：关闭先发生 → 本次上传在创建正式文件之前被拒，
+    /// 409 instance_closing）；无关闭对照照常落盘（文件名字节一致）。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn close_before_publish_no_file_no_temp() {
+        use crate::services::dsh_control::error::codes;
+
+        let _serial = ATTACHMENT_TEST_LOCK.lock().await;
+        let proj = attach_tempdir();
+        let root = std::fs::canonicalize(proj.path()).unwrap();
+        let state = attach_dsh_state(proj.path().to_path_buf(), Arc::new(|_| Ok(())));
+        persist_named_device(&state, "mm", "测试设备");
+        // 全局面清理守卫：断言失败也清旗标与暂停钩子，不毒化同进程其他用例。
+        // P1-2 起旗标带纪元：清理按 mark_closing 返回的纪元条件清除（纪元槽在
+        // 测试体标记时回填；断言失败时槽空 = 尚未标记，无需清）。
+        let closing_epoch: Arc<std::sync::Mutex<Option<usize>>> = Default::default();
+        struct Cleanup(Arc<std::sync::Mutex<Option<usize>>>);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                if let Some(epoch) = *self.0.lock().unwrap() {
+                    crate::services::dsh_control::production::clear_closing_if("inst-gate", epoch);
+                }
+                *crate::remote::attachments::TEST_BEFORE_ATTACHMENT_PUBLISH
+                    .lock()
+                    .unwrap() = None;
+            }
+        }
+        let _cleanup = Cleanup(Arc::clone(&closing_epoch));
+        // 对照（无关闭、无暂停钩子）：照常落盘，文件名与字节一致。
+        let ok = router(Arc::clone(&state))
+            .oneshot(attach_req(
+                "/m/api/v1/session-attachment?session_id=sess_att&instanceId=inst-gate&name=control.txt",
+                Some("mam_device=mm"),
+                Body::from("对照字节".as_bytes().to_vec()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(ok.status(), 200, "无关闭对照必须照常落盘");
+        let control = proj
+            .path()
+            .join(".tuvis-attachments")
+            .join("sess_att")
+            .join("control.txt");
+        assert_eq!(
+            std::fs::read(&control).unwrap(),
+            "对照字节".as_bytes(),
+            "对照文件名字节一致"
+        );
+        // 竞态：写任务停在发布点 → 关闭首步旗标落地 → 释放 → 409，零正式文件。
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let entered_tx = std::sync::Mutex::new(Some(entered_tx));
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = std::sync::Mutex::new(release_rx);
+        *crate::remote::attachments::TEST_BEFORE_ATTACHMENT_PUBLISH
+            .lock()
+            .unwrap() = Some((
+            root,
+            Arc::new(move || {
+                if let Some(tx) = entered_tx.lock().unwrap().take() {
+                    let _ = tx.send(());
+                }
+                let _ = release_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(std::time::Duration::from_secs(5));
+            }),
+        ));
+        let state_for_upload = Arc::clone(&state);
+        let upload = tokio::spawn(async move {
+            router(state_for_upload)
+                .oneshot(attach_req(
+                    "/m/api/v1/session-attachment?session_id=sess_att&instanceId=inst-gate&name=race.txt",
+                    Some("mam_device=mm"), Body::from("竞态字节"),
+                ))
+                .await
+                .unwrap()
+        });
+        let entered = tokio::time::timeout(std::time::Duration::from_secs(3), entered_rx).await;
+        let epoch = crate::services::dsh_control::production::mark_closing("inst-gate");
+        *closing_epoch.lock().unwrap() = Some(epoch);
+        let _ = release_tx.send(());
+        let response = tokio::time::timeout(std::time::Duration::from_secs(5), upload).await;
+        assert!(matches!(entered, Ok(Ok(()))), "写任务必须到达发布屏障");
+        let response = response.expect("上传须结束").unwrap();
+        let status = response.status();
+        let body = body_string(response).await;
+        let entries = std::fs::read_dir(proj.path().join(".tuvis-attachments").join("sess_att"))
+            .map(|it| it.count())
+            .unwrap_or(0);
+        assert_eq!(entries, 1, "发布点拒绝不得创建正式文件（目录内仅对照文件）");
+        assert!(
+            status == 409 && body.contains("instance_closing") && body.contains(codes::SWITCH_OFF),
+            "关闭面发布点拒绝须 409 instance_closing + 机器码: status={status}, body={body}"
+        );
+    }
+
+    // ===== P1-3 附件上传原子代次边界（销项复审）：受理捕获实例代次，发布点比对 =====
+    //
+    // 关闭三层检查是无状态布尔 is_closing——最后检查通过后 create_new 前关闭仍可
+    // 落地（①）；关闭+重开（旗标清除）后排队旧上传按**新开关状态**继续写（②）。
+    // 修法：受理时捕获 `instance_generation(id)`，发布点比对「受理代次 == 当前
+    // 代次」，失配 → `StaleUploadGeneration`（409 + 机器码同族）。代次推进点 =
+    // mark_closing（关闭）与 enable/重开（重开），与旗标同锁域（原子边界）。
+    //
+    // 测试用生产原语（mark_closing / clear_closing_if）驱动生命周期终态——与既有
+    // 关闭面用例同一惯例（静态全局直接驱动 + 守卫清理）；enable 真实路径的代次
+    // 推进另在 switch_tests 用 Fixture 驱动锁定。
+
+    /// RED a：受理在先（入口捕获代次），关闭在发布点前落地 → 旧上传拒绝
+    /// （409 instance_closing 关闭面），零正式文件零残留。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn upload_refused_when_close_lands_at_publish_zero_file() {
+        use crate::services::dsh_control::error::codes;
+
+        let _serial = ATTACHMENT_TEST_LOCK.lock().await;
+        const INSTANCE: &str = "inst-stale-a";
+        let proj = attach_tempdir();
+        let root = std::fs::canonicalize(proj.path()).unwrap();
+        let state = attach_dsh_state_with_instance(
+            proj.path().to_path_buf(),
+            Arc::new(|_| Ok(())),
+            INSTANCE,
+        );
+        persist_named_device(&state, "mm", "测试设备");
+        // 全局面清理守卫：断言失败也清旗标与暂停钩子，不毒化同进程其他用例。
+        let closing_epoch: Arc<std::sync::Mutex<Option<usize>>> = Default::default();
+        struct Cleanup(Arc<std::sync::Mutex<Option<usize>>>);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                if let Some(epoch) = *self.0.lock().unwrap() {
+                    crate::services::dsh_control::production::clear_closing_if(INSTANCE, epoch);
+                }
+                *crate::remote::attachments::TEST_BEFORE_ATTACHMENT_PUBLISH
+                    .lock()
+                    .unwrap() = None;
+            }
+        }
+        let _cleanup = Cleanup(Arc::clone(&closing_epoch));
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let entered_tx = std::sync::Mutex::new(Some(entered_tx));
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = std::sync::Mutex::new(release_rx);
+        *crate::remote::attachments::TEST_BEFORE_ATTACHMENT_PUBLISH
+            .lock()
+            .unwrap() = Some((
+            root,
+            Arc::new(move || {
+                if let Some(tx) = entered_tx.lock().unwrap().take() {
+                    let _ = tx.send(());
+                }
+                let _ = release_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(std::time::Duration::from_secs(5));
+            }),
+        ));
+        let state_for_upload = Arc::clone(&state);
+        let upload = tokio::spawn(async move {
+            router(state_for_upload)
+                .oneshot(attach_req(
+                    &format!("/m/api/v1/session-attachment?session_id=sess_att&instanceId={INSTANCE}&name=race.txt"),
+                    Some("mam_device=mm"), Body::from("旧上传字节"),
+                ))
+                .await
+                .unwrap()
+        });
+        // 受理完成（入口捕获代次）且写任务已停在发布点，然后关闭落地。
+        let entered = tokio::time::timeout(std::time::Duration::from_secs(3), entered_rx).await;
+        assert!(
+            matches!(entered, Ok(Ok(()))),
+            "写任务必须到达发布屏障（受理在先）"
+        );
+        let epoch = crate::services::dsh_control::production::mark_closing(INSTANCE);
+        *closing_epoch.lock().unwrap() = Some(epoch);
+        let _ = release_tx.send(());
+        let response = tokio::time::timeout(std::time::Duration::from_secs(5), upload).await;
+        let response = response.expect("上传须结束").unwrap();
+        let status = response.status();
+        let body = body_string(response).await;
+        let entries = std::fs::read_dir(proj.path().join(".tuvis-attachments").join("sess_att"))
+            .map(|it| it.count())
+            .unwrap_or(0);
+        assert_eq!(entries, 0, "关闭落地后的旧上传零正式文件零残留");
+        assert!(
+            status == 409 && body.contains("instance_closing") && body.contains(codes::SWITCH_OFF),
+            "关闭面拒绝须 409 instance_closing + 机器码: status={status}, body={body}"
+        );
+    }
+
+    /// 销项审查发现 1（P1）：发布点复核（publish_check）与文件创建**无共同临界
+    /// 区**——比对通过后、create_new 完成之间关闭仍可落地，旧实现直接创建文件
+    /// 不再复核（本用例 RED：文件留存）。写任务停在创建前屏障（此时发布点复核
+    /// **已通过**），关闭在此落地 → 释放 → 文件被创建；修法 = 创建前 + 创建后
+    /// 各一次 is_closing 复核，后检删除刚创建的文件并拒绝（409 + 正式目录无
+    /// 文件——「文件创建后被清理」）。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn attachment_publish_then_close_cleanup() {
+        use crate::services::dsh_control::error::codes;
+
+        let _serial = ATTACHMENT_TEST_LOCK.lock().await;
+        const INSTANCE: &str = "inst-pub-close";
+        let proj = attach_tempdir();
+        let root = std::fs::canonicalize(proj.path()).unwrap();
+        let state = attach_dsh_state_with_instance(
+            proj.path().to_path_buf(),
+            Arc::new(|_| Ok(())),
+            INSTANCE,
+        );
+        persist_named_device(&state, "mm", "测试设备");
+        // 全局面清理守卫：断言失败也清旗标与暂停钩子，不毒化同进程其他用例。
+        let closing_epoch: Arc<std::sync::Mutex<Option<usize>>> = Default::default();
+        struct Cleanup(Arc<std::sync::Mutex<Option<usize>>>);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                if let Some(epoch) = *self.0.lock().unwrap() {
+                    crate::services::dsh_control::production::clear_closing_if(INSTANCE, epoch);
+                }
+                *crate::remote::attachments::TEST_BEFORE_ATTACHMENT_COMMIT
+                    .lock()
+                    .unwrap() = None;
+            }
+        }
+        let _cleanup = Cleanup(Arc::clone(&closing_epoch));
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let entered_tx = std::sync::Mutex::new(Some(entered_tx));
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = std::sync::Mutex::new(release_rx);
+        *crate::remote::attachments::TEST_BEFORE_ATTACHMENT_COMMIT
+            .lock()
+            .unwrap() = Some((
+            root,
+            Arc::new(move || {
+                if let Some(tx) = entered_tx.lock().unwrap().take() {
+                    let _ = tx.send(());
+                }
+                let _ = release_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(std::time::Duration::from_secs(5));
+            }),
+        ));
+        let state_for_upload = Arc::clone(&state);
+        let upload = tokio::spawn(async move {
+            router(state_for_upload)
+                .oneshot(attach_req(
+                    &format!("/m/api/v1/session-attachment?session_id=sess_att&instanceId={INSTANCE}&name=race.txt"),
+                    Some("mam_device=mm"), Body::from("发布通过后关闭落地字节"),
+                ))
+                .await
+                .unwrap()
+        });
+        // 写任务已越过发布点复核（比对通过），停在正式文件创建前。
+        let entered = tokio::time::timeout(std::time::Duration::from_secs(3), entered_rx).await;
+        assert!(
+            matches!(entered, Ok(Ok(()))),
+            "写任务必须到达创建前屏障（发布点复核已通过）"
+        );
+        // 关闭在此落地（旗标 + 代次推进）——精确覆盖「比对通过 → 创建完成」竞态窗。
+        let epoch = crate::services::dsh_control::production::mark_closing(INSTANCE);
+        *closing_epoch.lock().unwrap() = Some(epoch);
+        let _ = release_tx.send(());
+        let response = tokio::time::timeout(std::time::Duration::from_secs(5), upload).await;
+        let response = response.expect("上传须结束").unwrap();
+        let status = response.status();
+        let body = body_string(response).await;
+        assert_attachment_dirs_empty(proj.path());
+        assert!(
+            status == 409 && body.contains("instance_closing") && body.contains(codes::SWITCH_OFF),
+            "创建后关闭拒绝须 409 instance_closing + 机器码: status={status}, body={body}"
+        );
+    }
+
+    /// 预检后经历关闭重开，旧上传拒绝，新代次上传正常发布。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn attachment_publish_close_reopen_cycle_rejected() {
+        use crate::services::dsh_control::error::codes;
+
+        let _serial = ATTACHMENT_TEST_LOCK.lock().await;
+        const INSTANCE: &str = "inst-pub-close-reopen";
+        let proj = attach_tempdir();
+        let root = std::fs::canonicalize(proj.path()).unwrap();
+        let state = attach_dsh_state_with_instance(
+            proj.path().to_path_buf(),
+            Arc::new(|_| Ok(())),
+            INSTANCE,
+        );
+        persist_named_device(&state, "mm", "测试设备");
+        // 全局面清理守卫：断言失败也清旗标与暂停钩子，不毒化同进程其他用例
+        // （本用例旗标在屏障内已随重开退场，clear_closing_if 按纪元失配 no-op）。
+        let closing_epoch: Arc<std::sync::Mutex<Option<usize>>> = Default::default();
+        struct Cleanup(Arc<std::sync::Mutex<Option<usize>>>);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                if let Some(epoch) = *self.0.lock().unwrap() {
+                    crate::services::dsh_control::production::clear_closing_if(INSTANCE, epoch);
+                }
+                *crate::remote::attachments::TEST_BEFORE_ATTACHMENT_COMMIT
+                    .lock()
+                    .unwrap() = None;
+            }
+        }
+        let _cleanup = Cleanup(Arc::clone(&closing_epoch));
+        let gen_before = crate::services::dsh_control::production::instance_generation(INSTANCE);
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let entered_tx = std::sync::Mutex::new(Some(entered_tx));
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = std::sync::Mutex::new(release_rx);
+        *crate::remote::attachments::TEST_BEFORE_ATTACHMENT_COMMIT
+            .lock()
+            .unwrap() = Some((
+            root,
+            Arc::new(move || {
+                if let Some(tx) = entered_tx.lock().unwrap().take() {
+                    let _ = tx.send(());
+                }
+                let _ = release_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(std::time::Duration::from_secs(5));
+            }),
+        ));
+        let state_for_upload = Arc::clone(&state);
+        let upload = tokio::spawn(async move {
+            router(state_for_upload)
+                .oneshot(attach_req(
+                    &format!("/m/api/v1/session-attachment?session_id=sess_att&instanceId={INSTANCE}&name=race-reopen.txt"),
+                    Some("mam_device=mm"), Body::from("关闭重开周期内到达的旧上传字节"),
+                ))
+                .await
+                .unwrap()
+        });
+        // 写任务已越过发布点复核（比对通过），停在正式文件创建前。
+        let entered = tokio::time::timeout(std::time::Duration::from_secs(3), entered_rx).await;
+        assert!(
+            matches!(entered, Ok(Ok(()))),
+            "写任务必须到达创建前屏障（发布点复核已通过）"
+        );
+        // **完整关闭+重开周期**在屏障内落地：mark_closing（旗标 + 代次 +1）→
+        // enable 复合清旗+推进（代次再 +1）——旗标退场、代次共推进两次。
+        let epoch = crate::services::dsh_control::production::mark_closing(INSTANCE);
+        *closing_epoch.lock().unwrap() = Some(epoch);
+        assert!(
+            crate::services::dsh_control::production::clear_closing_and_advance(INSTANCE, epoch),
+            "前提：重开复合清除按观察纪元成功"
+        );
+        assert!(
+            !crate::services::dsh_control::production::is_closing(INSTANCE),
+            "前提：重开后旗标必须退场（旧实现的后检在此放行）"
+        );
+        let _ = release_tx.send(());
+        let response = tokio::time::timeout(std::time::Duration::from_secs(5), upload).await;
+        let response = response.expect("上传须结束").unwrap();
+        let status = response.status();
+        let body = body_string(response).await;
+        assert_eq!(
+            crate::services::dsh_control::production::instance_generation(INSTANCE),
+            gen_before + 2,
+            "周期必须恰好推进两次代次（mark_closing +1、复合清除+推进 +1）"
+        );
+        assert_attachment_dirs_empty(proj.path());
+        assert!(
+            status == 409
+                && body.contains("stale_upload_generation")
+                && body.contains(codes::SWITCH_OFF),
+            "重开周期拒绝须 409 stale_upload_generation + 机器码: status={status}, body={body}"
+        );
+        // 清除单次屏障，新请求重新捕获受理代次。
+        *crate::remote::attachments::TEST_BEFORE_ATTACHMENT_COMMIT
+            .lock()
+            .unwrap() = None;
+        let fresh = b"bytes accepted after reopen";
+        let response = publish_test_upload(state, INSTANCE, "race-reopen.txt", fresh).await;
+        assert_eq!(response.status(), 200);
+        let files: Vec<_> = std::fs::read_dir(proj.path().join(".tuvis-attachments/sess_att"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(files.len(), 1);
+        assert_eq!(std::fs::read(&files[0]).unwrap(), fresh);
+        assert_eq!(
+            attachment_entry_count(&proj.path().join(".tuvis-attachments/.staging")),
+            0
+        );
+    }
+
+    fn attachment_entry_count(dir: &std::path::Path) -> usize {
+        match std::fs::read_dir(dir) {
+            Ok(entries) => entries.count(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(error) => panic!("读取附件目录 {} 失败: {error}", dir.display()),
+        }
+    }
+
+    fn assert_attachment_dirs_empty(project: &std::path::Path) {
+        let root = project.join(".tuvis-attachments");
+        assert_eq!(
+            attachment_entry_count(&root.join("sess_att")),
+            0,
+            "正式目录"
+        );
+        assert_eq!(
+            attachment_entry_count(&root.join(".staging")),
+            0,
+            "暂存目录"
+        );
+    }
+
+    async fn publish_test_upload(
+        state: Arc<RemoteState>,
+        instance: &str,
+        name: &str,
+        bytes: &'static [u8],
+    ) -> axum::response::Response {
+        router(state)
+            .oneshot(attach_req(
+                &format!("/m/api/v1/session-attachment?session_id=sess_att&instanceId={instance}&name={name}"),
+                Some("mam_device=mm"),
+                Body::from(bytes),
+            ))
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn attachment_publish_pause_close_never_appears_staging_cleaned() {
+        assert_attachment_commit_refused("inst-pub-pause-close", true, "instance_closing").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn attachment_publish_refused_after_instance_switch() {
+        assert_attachment_commit_refused("A", false, "stale_upload_generation").await;
+    }
+
+    async fn assert_attachment_commit_refused(instance: &'static str, close: bool, error: &str) {
+        use crate::services::dsh_control::{error::codes, production};
+
+        let _serial = ATTACHMENT_TEST_LOCK.lock().await;
+        let proj = attach_tempdir();
+        let state = attach_dsh_state_with_instance(
+            proj.path().to_path_buf(),
+            Arc::new(|_| Ok(())),
+            instance,
+        );
+        persist_named_device(&state, "mm", "测试设备");
+        struct Cleanup(&'static str, Option<usize>);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                if let Some(epoch) = self.1 {
+                    production::clear_closing_if(self.0, epoch);
+                }
+                *crate::remote::attachments::TEST_BEFORE_ATTACHMENT_COMMIT
+                    .lock()
+                    .unwrap() = None;
+            }
+        }
+        let mut cleanup = Cleanup(instance, None);
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let entered_tx = std::sync::Mutex::new(Some(entered_tx));
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = std::sync::Mutex::new(release_rx);
+        *crate::remote::attachments::TEST_BEFORE_ATTACHMENT_COMMIT
+            .lock()
+            .unwrap() = Some((
+            std::fs::canonicalize(proj.path()).unwrap(),
+            Arc::new(move || {
+                if let Some(tx) = entered_tx.lock().unwrap().take() {
+                    let _ = tx.send(());
+                }
+                let _ = release_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(std::time::Duration::from_secs(5));
+            }),
+        ));
+        let upload = tokio::spawn(publish_test_upload(
+            state,
+            instance,
+            "paused.txt",
+            b"staged bytes",
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(3), entered_rx)
+            .await
+            .expect("上传须到达提交屏障")
+            .unwrap();
+        let root = proj.path().join(".tuvis-attachments");
+        assert_eq!(attachment_entry_count(&root.join("sess_att")), 0);
+        assert_eq!(attachment_entry_count(&root.join(".staging")), 1);
+        if close {
+            cleanup.1 = Some(production::mark_closing(instance));
+        } else {
+            production::advance_instance_generation(instance);
+        }
+        release_tx.send(()).unwrap();
+        let response = tokio::time::timeout(std::time::Duration::from_secs(5), upload)
+            .await
+            .expect("上传须结束")
+            .unwrap();
+        let status = response.status();
+        let body = body_string(response).await;
+        assert!(
+            status == 409 && body.contains(error) && body.contains(codes::SWITCH_OFF),
+            "status={status}, body={body}"
+        );
+        assert_attachment_dirs_empty(proj.path());
+        assert!(!proj.join(".git/info/exclude").exists());
+    }
+
+    #[test]
+    fn attachment_cancel_before_commit_never_publishes_and_cleans_staging() {
+        const INSTANCE: &str = "inst-pub-cancel";
+        const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+        let _serial = ATTACHMENT_TEST_LOCK.blocking_lock();
+        let proj = attach_tempdir();
+        let state = attach_dsh_state_with_instance(
+            proj.path().to_path_buf(),
+            Arc::new(|_| Ok(())),
+            INSTANCE,
+        );
+        persist_named_device(&state, "mm", "测试设备");
+        let exclude = proj.join(".git/info/exclude");
+        let original_exclude = b"# existing patterns\nlocal-cache/\n";
+        std::fs::write(&exclude, original_exclude).unwrap();
+
+        struct ClearCommitHook;
+        impl Drop for ClearCommitHook {
+            fn drop(&mut self) {
+                *crate::remote::attachments::TEST_BEFORE_ATTACHMENT_COMMIT
+                    .lock()
+                    .unwrap() = None;
+            }
+        }
+        let _clear_hook = ClearCommitHook;
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let entered_tx = std::sync::Mutex::new(Some(entered_tx));
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = std::sync::Mutex::new(release_rx);
+        *crate::remote::attachments::TEST_BEFORE_ATTACHMENT_COMMIT
+            .lock()
+            .unwrap() = Some((
+            std::fs::canonicalize(proj.path()).unwrap(),
+            Arc::new(move || {
+                if let Some(tx) = entered_tx.lock().unwrap().take() {
+                    let _ = tx.send(());
+                }
+                release_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(TIMEOUT + TIMEOUT)
+                    .expect("须在请求取消后放行 worker");
+            }),
+        ));
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let root = &proj.path().join(".tuvis-attachments");
+        runtime.block_on(async move {
+            let upload = tokio::spawn(publish_test_upload(
+                state,
+                INSTANCE,
+                "cancelled.txt",
+                b"staged bytes",
+            ));
+            tokio::time::timeout(TIMEOUT, entered_rx)
+                .await
+                .expect("上传须到达提交屏障")
+                .unwrap();
+            assert_eq!(attachment_entry_count(&root.join("sess_att")), 0);
+            assert_eq!(attachment_entry_count(&root.join(".staging")), 1);
+
+            upload.abort();
+            let error = tokio::time::timeout(TIMEOUT, upload)
+                .await
+                .expect("请求任务须结束")
+                .expect_err("上传请求须在放行前取消");
+            assert!(error.is_cancelled());
+            release_tx.send(()).unwrap();
+        });
+        // 请求已经取消，但关闭专用 runtime 仍会等待阻塞 worker 退出。
+        drop(runtime);
+
+        assert_eq!(
+            attachment_entry_count(&root.join(".staging")),
+            0,
+            "暂存目录"
+        );
+        assert_eq!(
+            attachment_entry_count(&root.join("sess_att")),
+            0,
+            "请求取消后不得发布正式附件"
+        );
+        assert_eq!(std::fs::read(exclude).unwrap(), original_exclude);
+    }
+
+    #[tokio::test]
+    async fn attachment_publish_normal_upload_bytes_and_dedup() {
+        let _serial = ATTACHMENT_TEST_LOCK.lock().await;
+        const INSTANCE: &str = "inst-pub-dedup";
+        let proj = attach_tempdir();
+        let state = attach_dsh_state_with_instance(
+            proj.path().to_path_buf(),
+            Arc::new(|_| Ok(())),
+            INSTANCE,
+        );
+        persist_named_device(&state, "mm", "测试设备");
+        let dir = proj.path().join(".tuvis-attachments/sess_att");
+        let first = b"first\0\xff";
+        let second = b"second\0\xfe";
+        let response = publish_test_upload(Arc::clone(&state), INSTANCE, "same.txt", first).await;
+        assert_eq!(response.status(), 200);
+        assert_eq!(std::fs::read(dir.join("same.txt")).unwrap(), first);
+        let response = publish_test_upload(state, INSTANCE, "same.txt", second).await;
+        assert_eq!(response.status(), 200);
+        assert_eq!(attachment_entry_count(&dir), 2);
+        assert_eq!(std::fs::read(dir.join("same.txt")).unwrap(), first);
+        assert_eq!(std::fs::read(dir.join("same (1).txt")).unwrap(), second);
+        assert_eq!(
+            attachment_entry_count(&proj.path().join(".tuvis-attachments/.staging")),
+            0
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn attachment_publish_ownership_failure_no_final_no_staging() {
+        let _serial = ATTACHMENT_TEST_LOCK.lock().await;
+        const INSTANCE: &str = "inst-pub-symlink";
+        let proj = attach_tempdir();
+        let root = proj.path().join(".tuvis-attachments");
+        let target = proj.path().join("symlink-target");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&target).unwrap();
+        std::os::unix::fs::symlink(&target, root.join("sess_att")).unwrap();
+        let state = attach_dsh_state_with_instance(
+            proj.path().to_path_buf(),
+            Arc::new(|_| Ok(())),
+            INSTANCE,
+        );
+        persist_named_device(&state, "mm", "测试设备");
+        let response = publish_test_upload(state, INSTANCE, "refused.txt", b"refused bytes").await;
+        assert_eq!(response.status(), 500);
+        let body: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
+        assert_eq!(body["error"], "io");
+        assert_attachment_dirs_empty(proj.path());
+        assert!(!proj.join(".git/info/exclude").exists());
+    }
+
+    /// 销项审查发现 2（P2）：enable 清旗与推进代次必须是**同锁复合操作**
+    /// （`clear_closing_and_advance`）——复合完成后受理的上传捕获推进后代次，
+    /// 发布点比对相等 → 照常落盘。两步分开锁的旧实现存在「已清旗、未推进」
+    /// 窗口：其间受理的上传会被 enable 推进**误拒** stale_upload_generation。
+    /// 该竞态窗口单线程无法确定性复现，原子语义另在
+    /// `production::tests::clear_closing_and_advance_is_atomic` 单元锁定；本用例
+    /// 锁定复合完成后的流转：非 macOS 上传成功，macOS 到达平台拒绝。
+    #[tokio::test]
+    async fn enable_clear_advance_atomic_no_false_rejection() {
+        // 本用例直接驱动 DSH 进程级代次/关闭旗标全局量（instance_generation /
+        // mark_closing / clear_closing_and_advance），与其它附件用例共享同一全局
+        // 面——必须持串行门，否则并行下会读到别的用例留下的旗标而误判 409。
+        let _serial = ATTACHMENT_TEST_LOCK.lock().await;
+        use crate::services::dsh_control::production;
+        const INSTANCE: &str = "inst-clear-adv-e2e";
+        let proj = attach_tempdir();
+        let state = attach_dsh_state_with_instance(
+            proj.path().to_path_buf(),
+            Arc::new(|_| Ok(())),
+            INSTANCE,
+        );
+        persist_named_device(&state, "mm", "测试设备");
+        // 关闭落地（代次 g0→g0+1、旗标在场），随后 enable 的复合清旗+推进。
+        let gen_before = production::instance_generation(INSTANCE);
+        let epoch = production::mark_closing(INSTANCE);
+        assert!(production::is_closing(INSTANCE), "前提：关闭旗标在场");
+        // P2 修法：清旗与推进同锁原子——返回 true = 本次 enable 完成关闭+重开
+        // 完整周期的后半程（旗标退场 + 代次恰好再推进 +1）。
+        assert!(
+            production::clear_closing_and_advance(INSTANCE, epoch),
+            "复合清除+推进必须按观察纪元成功"
+        );
+        assert!(!production::is_closing(INSTANCE), "复合调用后旗标必须退场");
+        assert_eq!(
+            production::instance_generation(INSTANCE),
+            gen_before + 2,
+            "复合调用后代次必须恰好推进两次（mark_closing +1、复合 +1）"
+        );
+        // 复合完成后，新上传通过关闭检查，再按平台拒绝或进入发布流程。
+        let r = router(state)
+            .oneshot(attach_req(
+                &format!("/m/api/v1/session-attachment?session_id=sess_att&instanceId={INSTANCE}&name=after-enable.txt"),
+                Some("mam_device=mm"),
+                Body::from("重开后的新受理字节"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200, "复合完成后的新受理必须照常落盘（无误拒）");
+        let uploaded = proj
+            .path()
+            .join(".tuvis-attachments")
+            .join("sess_att")
+            .join("after-enable.txt");
+        assert_eq!(
+            std::fs::read(&uploaded).unwrap(),
+            "重开后的新受理字节".as_bytes()
+        );
+    }
+
+    /// RED b（本轮真红）：受理代次 g0 → 关闭（g1）→ **重开完整周期**（旗标清除、
+    /// is_closing=false、开关门放行）→ 排队旧上传到达发布点**仍须拒绝**——
+    /// 旧上传不得按新开关状态写盘（409 stale_upload_generation + 机器码同族）。
+    /// 旧实现发布点只查 is_closing 布尔 → 重开后旧上传照写（本用例 RED）。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stale_upload_refused_after_close_then_reopen_cycle() {
+        use crate::services::dsh_control::error::codes;
+
+        let _serial = ATTACHMENT_TEST_LOCK.lock().await;
+        const INSTANCE: &str = "inst-stale-b";
+        let proj = attach_tempdir();
+        let root = std::fs::canonicalize(proj.path()).unwrap();
+        let state = attach_dsh_state_with_instance(
+            proj.path().to_path_buf(),
+            Arc::new(|_| Ok(())),
+            INSTANCE,
+        );
+        persist_named_device(&state, "mm", "测试设备");
+        let closing_epoch: Arc<std::sync::Mutex<Option<usize>>> = Default::default();
+        struct Cleanup(Arc<std::sync::Mutex<Option<usize>>>);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                if let Some(epoch) = *self.0.lock().unwrap() {
+                    crate::services::dsh_control::production::clear_closing_if(INSTANCE, epoch);
+                }
+                *crate::remote::attachments::TEST_BEFORE_ATTACHMENT_PUBLISH
+                    .lock()
+                    .unwrap() = None;
+            }
+        }
+        let _cleanup = Cleanup(Arc::clone(&closing_epoch));
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let entered_tx = std::sync::Mutex::new(Some(entered_tx));
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = std::sync::Mutex::new(release_rx);
+        *crate::remote::attachments::TEST_BEFORE_ATTACHMENT_PUBLISH
+            .lock()
+            .unwrap() = Some((
+            root,
+            Arc::new(move || {
+                if let Some(tx) = entered_tx.lock().unwrap().take() {
+                    let _ = tx.send(());
+                }
+                let _ = release_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(std::time::Duration::from_secs(5));
+            }),
+        ));
+        let state_for_upload = Arc::clone(&state);
+        let upload = tokio::spawn(async move {
+            router(state_for_upload)
+                .oneshot(attach_req(
+                    &format!("/m/api/v1/session-attachment?session_id=sess_att&instanceId={INSTANCE}&name=race.txt"),
+                    Some("mam_device=mm"), Body::from("跨周期旧上传字节"),
+                ))
+                .await
+                .unwrap()
+        });
+        let entered = tokio::time::timeout(std::time::Duration::from_secs(3), entered_rx).await;
+        assert!(
+            matches!(entered, Ok(Ok(()))),
+            "写任务必须到达发布屏障（受理在先）"
+        );
+        // 关闭落地（代次推进），随后重开完成：旗标按本关闭纪元条件清除——
+        // 生产 enable 在此同时再推进一次代次（真实路径由 switch_tests 锁定）；
+        // 本用例断言的是**生命周期终态**（is_closing=false、门放行）下的拒绝。
+        let epoch = crate::services::dsh_control::production::mark_closing(INSTANCE);
+        *closing_epoch.lock().unwrap() = Some(epoch);
+        assert!(
+            crate::services::dsh_control::production::clear_closing_if(INSTANCE, epoch),
+            "重开清旗必须按本关闭纪元成功"
+        );
+        assert!(
+            !crate::services::dsh_control::production::is_closing(INSTANCE),
+            "重开后旗标必须已退场（新开关状态在场）"
+        );
+        let _ = release_tx.send(());
+        let response = tokio::time::timeout(std::time::Duration::from_secs(5), upload).await;
+        let response = response.expect("上传须结束").unwrap();
+        let status = response.status();
+        let body = body_string(response).await;
+        let entries = std::fs::read_dir(proj.path().join(".tuvis-attachments").join("sess_att"))
+            .map(|it| it.count())
+            .unwrap_or(0);
+        assert_eq!(entries, 0, "旧上传不得按新开关状态写盘（零正式文件）");
+        assert!(
+            status == 409
+                && body.contains("stale_upload_generation")
+                && body.contains(codes::SWITCH_OFF),
+            "代次失配拒绝须 409 stale_upload_generation + 机器码同族: status={status}, body={body}"
+        );
+    }
+
+    /// RED c（正例锚）：关闭+重开完整周期后，**新受理**的上传捕获新代次 →
+    /// 发布点比对相等 → 照常落盘（无误伤）。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fresh_upload_after_reopen_cycle_uploads_normally() {
+        let _serial = ATTACHMENT_TEST_LOCK.lock().await;
+        const INSTANCE: &str = "inst-stale-c";
+        let proj = attach_tempdir();
+        let state = attach_dsh_state_with_instance(
+            proj.path().to_path_buf(),
+            Arc::new(|_| Ok(())),
+            INSTANCE,
+        );
+        persist_named_device(&state, "mm", "测试设备");
+        // 完整周期先行（生产原语驱动；终态 = 旗标退场，代次已推进）。
+        let epoch = crate::services::dsh_control::production::mark_closing(INSTANCE);
+        assert!(crate::services::dsh_control::production::clear_closing_if(
+            INSTANCE, epoch
+        ));
+        assert!(!crate::services::dsh_control::production::is_closing(
+            INSTANCE
+        ));
+        // 新受理（无暂停）：发布点比对相等 → 200 落盘。
+        let r = router(state)
+            .oneshot(attach_req(
+                &format!("/m/api/v1/session-attachment?session_id=sess_att&instanceId={INSTANCE}&name=fresh.txt"),
+                Some("mam_device=mm"),
+                Body::from("新受理字节"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200, "重开后的新受理必须照常落盘");
+        let uploaded = proj
+            .path()
+            .join(".tuvis-attachments")
+            .join("sess_att")
+            .join("fresh.txt");
+        assert_eq!(std::fs::read(&uploaded).unwrap(), "新受理字节".as_bytes());
+    }
+
+    /// RED d：无 dsh_instance_id 的既有非实例路径零回归——代次门只作用于实例
+    /// 作用域（Claude 会话上传照常 200 落盘）。
+    #[tokio::test]
+    async fn non_instance_upload_unaffected_by_generation_gate() {
+        let proj = attach_tempdir();
+        let state = attach_state(proj.path().to_path_buf(), false);
+        persist_named_device(&state, "mm", "测试设备");
+        let r = router(state)
+            .oneshot(attach_req(
+                "/m/api/v1/session-attachment?session_id=sess_att&name=plain.txt",
+                Some("mam_device=mm"),
+                Body::from("非实例字节"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200, "非实例路径必须零回归");
+        let uploaded = proj
+            .path()
+            .join(".tuvis-attachments")
+            .join("sess_att")
+            .join("plain.txt");
+        assert_eq!(std::fs::read(&uploaded).unwrap(), "非实例字节".as_bytes());
+    }
+
+    /// 写任务进入发布点后开关门关闭，仍不得发布文件或遗留临时物。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn attachment_gate_closes_before_publish_no_file_no_temp() {
+        use crate::services::dsh_control::error::{codes, DshError};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let _serial = ATTACHMENT_TEST_LOCK.lock().await;
+        let proj = attach_tempdir();
+        let root = std::fs::canonicalize(proj.path()).unwrap();
+        let enabled = Arc::new(AtomicBool::new(true));
+        let gate_state = Arc::clone(&enabled);
+        let state = attach_dsh_state(
+            proj.path().to_path_buf(),
+            Arc::new(move |_| {
+                if gate_state.load(Ordering::SeqCst) {
+                    Ok(())
+                } else {
+                    Err(DshError::new(codes::SWITCH_OFF, "closing"))
+                }
+            }),
+        );
+        persist_named_device(&state, "mm", "测试设备");
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let entered_tx = std::sync::Mutex::new(Some(entered_tx));
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = std::sync::Mutex::new(release_rx);
+        *crate::remote::attachments::TEST_BEFORE_ATTACHMENT_PUBLISH
+            .lock()
+            .unwrap() = Some((
+            root,
+            Arc::new(move || {
+                if let Some(tx) = entered_tx.lock().unwrap().take() {
+                    let _ = tx.send(());
+                }
+                let _ = release_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(std::time::Duration::from_secs(5));
+            }),
+        ));
+        let upload = tokio::spawn(async move {
+            router(state).oneshot(attach_req(
+                "/m/api/v1/session-attachment?session_id=sess_att&instanceId=inst-gate&name=race.txt",
+                Some("mam_device=mm"), Body::from("附件字节"),
+            )).await.unwrap()
+        });
+        let entered = tokio::time::timeout(std::time::Duration::from_secs(3), entered_rx).await;
+        enabled.store(false, Ordering::SeqCst);
+        let _ = release_tx.send(());
+        let response = tokio::time::timeout(std::time::Duration::from_secs(5), upload).await;
+        *crate::remote::attachments::TEST_BEFORE_ATTACHMENT_PUBLISH
+            .lock()
+            .unwrap() = None;
+        assert!(matches!(entered, Ok(Ok(()))), "写任务必须到达发布屏障");
+        let response = response.expect("上传须结束").unwrap();
+        let status = response.status();
+        let body = body_string(response).await;
+        let dir = proj.path().join(".tuvis-attachments").join("sess_att");
+        let entries = std::fs::read_dir(dir).map(|it| it.count()).unwrap_or(0);
+        assert!(
+            status == 403 && body.contains(codes::SWITCH_OFF) && entries == 0,
+            "关闭后须带机器码拒绝且无文件残留: status={status}, entries={entries}, body={body}"
+        );
+    }
+
+    /// P1-1（回归 d/附件侧）：开关执行门拒绝 → 附件写盘入口拒绝（403 + reasonCode
+    /// `DSH_SWITCH_OFF`），磁盘零写入；门放行后须正常落盘。
+    #[tokio::test]
+    async fn attachment_refused_when_switch_gate_refuses() {
+        let _serial = ATTACHMENT_TEST_LOCK.lock().await;
+        let proj = attach_tempdir();
+        let state = attach_dsh_state(
+            proj.path().to_path_buf(),
+            Arc::new(|_: &str| {
+                Err(crate::services::dsh_control::error::DshError::new(
+                    crate::services::dsh_control::error::codes::SWITCH_OFF,
+                    "remote-control switch is off",
+                ))
+            }),
+        );
+        persist_named_device(&state, "mm", "测试设备");
+        let r = router(state.clone())
+            .oneshot(attach_req(
+                "/m/api/v1/session-attachment?session_id=sess_att&instanceId=inst-gate&name=a.txt",
+                Some("mam_device=mm"),
+                Body::from("test"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 403, "开关关闭：附件写盘必须被拒绝");
+        let body = body_string(r).await;
+        assert!(
+            body.contains("DSH_SWITCH_OFF"),
+            "拒绝必须携带开关错误码: {body}"
+        );
+        assert!(
+            !proj.path().join(".tuvis-attachments").exists(),
+            "拒绝路径必须零写盘"
+        );
+
+        assert!(!proj.join(".git/info/exclude").exists());
+
+        // 门放行后必须正常落盘。
+        let proj2 = attach_tempdir();
+        let state = attach_dsh_state(proj2.path().to_path_buf(), Arc::new(|_: &str| Ok(())));
+        persist_named_device(&state, "mm", "测试设备");
+        let r = router(state)
+            .oneshot(attach_req(
+                "/m/api/v1/session-attachment?session_id=sess_att&instanceId=inst-gate&name=a.txt",
+                Some("mam_device=mm"),
+                Body::from("test"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200, "门放行必须照常落盘");
+        let uploaded = proj2
+            .path()
+            .join(".tuvis-attachments")
+            .join("sess_att")
+            .join("a.txt");
+        assert_eq!(
+            std::fs::read(uploaded).unwrap(),
+            b"test",
+            "名称与字节保持一致"
+        );
+    }
+
+    #[tokio::test]
+    async fn close_disables_new_sends_attachments_console_while_response_held() {
+        use crate::services::dsh_control::{
+            actions::PeerChannel,
+            error::codes,
+            model::{AuthorizedPeer, Target},
+            production,
+            transport::UnaryFailure,
+        };
+        use std::time::Duration;
+
+        let posts = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = posts.clone();
+        let arrived = Arc::new(tokio::sync::Notify::new());
+        let arrival = arrived.clone();
+        let host = axum::Router::new()
+            .route(
+                "/api/remote.mux",
+                axum::routing::get(|ws: axum::extract::ws::WebSocketUpgrade| async {
+                    ws.on_upgrade(
+                        |mut socket| async move { while socket.recv().await.is_some() {} },
+                    )
+                }),
+            )
+            .route(
+                "/api/{*path}",
+                axum::routing::post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+                    let captured = captured.clone();
+                    let arrival = arrival.clone();
+                    async move {
+                        captured.lock().unwrap().push(body["rpcId"].clone());
+                        arrival.notify_one();
+                        std::future::pending::<axum::http::StatusCode>().await
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let authority = listener.local_addr().unwrap().to_string();
+        let server = tokio::spawn(async move { axum::serve(listener, host).await.unwrap() });
+        let _serial = production::tests::TEST_BOUNDARY_SERIAL.lock().await;
+        struct RestoreSelection(Option<String>);
+        impl Drop for RestoreSelection {
+            fn drop(&mut self) {
+                production::set_selected_mirror(self.0.as_deref());
+            }
+        }
+        let _selection = RestoreSelection(production::selected_mirror());
+        let instance = "inst-console-closing";
+        production::set_selected_mirror(Some(instance));
+        let proj = attach_tempdir();
+        let state = attach_dsh_state_with_instance(
+            proj.path().to_path_buf(),
+            Arc::new(|_| Ok(())),
+            instance,
+        );
+        persist_named_device(&state, "mm", "测试设备");
+        let target = Target {
+            host_id: instance.into(),
+            epoch: 5,
+            session_id: "sess_att".into(),
+        };
+        let channel = || {
+            PeerChannel::from_static_peer(AuthorizedPeer::with_authority(
+                instance,
+                b"fixture=cookie".to_vec(),
+                &authority,
+                5,
+            ))
+        };
+        let first = tokio::spawn({
+            let held = channel();
+            let target = target.clone();
+            async move {
+                held.request_classified(
+                    "held",
+                    "session/prompt",
+                    &serde_json::json!({}),
+                    Some(&target),
+                )
+                .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(5), arrived.notified())
+            .await
+            .unwrap();
+        let epoch = production::mark_closing(instance);
+        let refused_channel = channel();
+        let refused = tokio::time::timeout(
+            Duration::from_secs(1),
+            refused_channel.request_classified(
+                "refused",
+                "session/prompt",
+                &serde_json::json!({}),
+                Some(&target),
+            ),
+        )
+        .await;
+        let attachment =
+            publish_test_upload(state.clone(), instance, "closed.txt", b"refused").await;
+        let response = router(state)
+            .oneshot(req(
+                "GET",
+                "/m/api/v1/dsh-console-entry?session_id=sess_att&instanceId=inst-console-closing",
+                Some("mam_device=mm"),
+                None,
+            ))
+            .await;
+        let still_held = !first.is_finished();
+        assert!(production::clear_closing_if(instance, epoch));
+        assert!(still_held, "入口必须在首个 HTTP 响应超时前拒绝");
+        assert_eq!(refused.unwrap().unwrap_err().code, codes::SWITCH_OFF);
+        let attachment_status = attachment.status();
+        let attached: serde_json::Value =
+            serde_json::from_str(&body_string(attachment).await).unwrap();
+        assert_eq!(attachment_status, 409, "{attached}");
+        assert_eq!(attached["error"], "instance_closing");
+        assert_eq!(attached["reasonCode"], "DSH_SWITCH_OFF");
+        assert!(!proj.join(".git/info/exclude").exists());
+        assert_attachment_dirs_empty(proj.path());
+        let first = tokio::time::timeout(Duration::from_secs(12), first)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(first, Ok(Err(UnaryFailure::DeliveryUnknown(_)))),
+            "首个请求须以投递未知收口: {first:?}"
+        );
+        assert_eq!(*posts.lock().unwrap(), vec![serde_json::json!("held")]);
+        server.abort();
+        let response = response.unwrap();
+        assert_eq!(response.status(), 409);
+        let body: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
+        assert_eq!(body["error"], "instance_closing");
+        assert_eq!(body["reasonCode"], "DSH_SWITCH_OFF");
+    }
+
+    /// P1-1（回归 d/控制台侧）：开关执行门拒绝 → 控制台入口不签发票据（503 +
+    /// `DSH_SWITCH_OFF`）；门放行 → 照常签发（无误伤对照）。
+    #[tokio::test]
+    async fn console_entry_refused_when_switch_gate_refuses() {
+        let proj = attach_tempdir();
+        let mut state = attach_dsh_state(
+            proj.path().to_path_buf(),
+            Arc::new(|_: &str| {
+                Err(crate::services::dsh_control::error::DshError::new(
+                    crate::services::dsh_control::error::codes::SWITCH_OFF,
+                    "remote-control switch is off",
+                ))
+            }),
+        );
+        persist_named_device(&state, "mm", "测试设备");
+        {
+            let s = Arc::get_mut(&mut state).unwrap();
+            let mut mount = crate::remote::console_mount::ConsoleMount::new();
+            // 设备库校验默认拒绝（fail-closed）——本用例聚焦开关门，放行设备面。
+            mount.device_valid = Box::new(|_| true);
+            s.dsh_console_mount = Some(Arc::new(mount));
+            s.dsh_console_upstream_source = Some(Arc::new(|instance_id: &str| {
+                Ok(crate::remote::console_upstream::ConsoleUpstream {
+                    instance_id: instance_id.to_string(),
+                    authority: "127.0.0.1:9".into(),
+                    epoch: 3,
+                })
+            }));
+        }
+        let r = router(state.clone())
+            .oneshot(req(
+                "GET",
+                "/m/api/v1/dsh-console-entry?session_id=sess_att&instanceId=inst-gate",
+                Some("mam_device=mm"),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 503, "开关关闭：控制台准入必须拒绝");
+        let body = body_string(r).await;
+        assert!(
+            body.contains("DSH_SWITCH_OFF"),
+            "拒绝必须携带开关错误码: {body}"
+        );
+
+        // 无误伤对照：门放行 → 照常签发一次性票据。
+        let proj2 = attach_tempdir();
+        let mut state = attach_dsh_state(proj2.path().to_path_buf(), Arc::new(|_: &str| Ok(())));
+        persist_named_device(&state, "mm", "测试设备");
+        {
+            let s = Arc::get_mut(&mut state).unwrap();
+            let mut mount = crate::remote::console_mount::ConsoleMount::new();
+            mount.device_valid = Box::new(|_| true);
+            // register_if_current 要求当代凭据副本在场（签发面契约）。
+            mount
+                .install_browser_credential(
+                    "inst-gate",
+                    3,
+                    "127.0.0.1:9",
+                    "browser=test".into(),
+                    crate::services::dsh_control::transport::PeerGate::new(),
+                )
+                .unwrap();
+            s.dsh_console_mount = Some(Arc::new(mount));
+            s.dsh_console_upstream_source = Some(Arc::new(|instance_id: &str| {
+                Ok(crate::remote::console_upstream::ConsoleUpstream {
+                    instance_id: instance_id.to_string(),
+                    authority: "127.0.0.1:9".into(),
+                    epoch: 3,
+                })
+            }));
+        }
+        let r = router(state)
+            .oneshot(req(
+                "GET",
+                "/m/api/v1/dsh-console-entry?session_id=sess_att&instanceId=inst-gate",
+                Some("mam_device=mm"),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200, "门放行必须照常签发票据");
+        let body = body_string(r).await;
+        assert!(body.contains("ticket"), "应答必须含一次性票据: {body}");
     }
 
     // ===== 丁T3 接入①：模式切换的对话框在场守卫（§2.7 裁8/9，问题 5）=====
@@ -14309,7 +16891,7 @@ mod tests {
             board_hidden_ids: Box::new(Vec::new),
             board_hidden_hide: std::sync::Arc::new(|_| 0usize),
             board_hidden_unhide: std::sync::Arc::new(|_| 0usize),
-            unread_mark_read: std::sync::Arc::new(|_, _| ()),
+            unread_mark_read: std::sync::Arc::new(|_, _, _| ()),
             session_close: std::sync::Arc::new(|_| Ok(())),
             watcher_tx: tokio::sync::broadcast::channel(64).0,
             sse_registry: Arc::new(SseRegistry::default()),
@@ -14325,11 +16907,17 @@ mod tests {
             pairing_counter: Box::new(Vec::new),
 
             codex_control: crate::remote::codex_ipc::CodexControlHub::disabled_arc(),
+            dsh_control: crate::services::dsh_control::disabled_arc(),
+            dsh_auto_adapt_source: std::sync::Arc::new(
+                crate::services::dsh_control::production::dsh_auto_adapt_enabled,
+            ),
             desktop_language: Default::default(),
             // 任务 8：OpenCode 原生交互中枢——测试禁用默认（惰性容器，零 IO；本组用例不触原生路由）
             opencode_native: Arc::new(crate::services::opencode_native::NativeHub::new(
                 crate::remote::pairing::DeviceStore::memory(),
             )),
+            dsh_console_mount: None,
+            dsh_console_upstream_source: None,
         });
         persist_named_device(&state2, "mm", "测试设备");
         let app = router(state2.clone());
@@ -14634,6 +17222,8 @@ mod tests {
                     tool_name: None,
                     tool_args: None,
                     collapsed: false,
+                    media: Vec::new(),
+                    blocks: Vec::new(),
                 },
                 crate::remote::content::SessionMessage {
                     seq: 1,
@@ -14644,6 +17234,8 @@ mod tests {
                     tool_name: Some("ExitPlanMode".into()),
                     tool_args: None,
                     collapsed: false,
+                    media: Vec::new(),
+                    blocks: Vec::new(),
                 },
             ]),
         );
@@ -14691,6 +17283,8 @@ mod tests {
                 tool_name: Some("ExitPlanMode".into()),
                 tool_args: None,
                 collapsed: false,
+                media: Vec::new(),
+                blocks: Vec::new(),
             }]),
         );
         persist_named_device(&state, "mm", "测试设备");
@@ -14807,7 +17401,7 @@ mod tests {
             board_hidden_ids: Box::new(Vec::new),
             board_hidden_hide: std::sync::Arc::new(|_| 0usize),
             board_hidden_unhide: std::sync::Arc::new(|_| 0usize),
-            unread_mark_read: std::sync::Arc::new(|_, _| ()),
+            unread_mark_read: std::sync::Arc::new(|_, _, _| ()),
             session_close: std::sync::Arc::new(|_| Ok(())),
             watcher_tx: tokio::sync::broadcast::channel(64).0,
             sse_registry: Arc::new(SseRegistry::default()),
@@ -14823,11 +17417,17 @@ mod tests {
             pairing_counter: Box::new(Vec::new),
 
             codex_control: crate::remote::codex_ipc::CodexControlHub::disabled_arc(),
+            dsh_control: crate::services::dsh_control::disabled_arc(),
+            dsh_auto_adapt_source: std::sync::Arc::new(
+                crate::services::dsh_control::production::dsh_auto_adapt_enabled,
+            ),
             desktop_language: Default::default(),
             // 任务 8：OpenCode 原生交互中枢——测试禁用默认（惰性容器，零 IO；本组用例不触原生路由）
             opencode_native: Arc::new(crate::services::opencode_native::NativeHub::new(
                 crate::remote::pairing::DeviceStore::memory(),
             )),
+            dsh_console_mount: None,
+            dsh_console_upstream_source: None,
         });
         (state, sid_out)
     }
@@ -14877,7 +17477,7 @@ mod tests {
             board_hidden_ids: Box::new(Vec::new),
             board_hidden_hide: std::sync::Arc::new(|_| 0usize),
             board_hidden_unhide: std::sync::Arc::new(|_| 0usize),
-            unread_mark_read: std::sync::Arc::new(|_, _| ()),
+            unread_mark_read: std::sync::Arc::new(|_, _, _| ()),
             session_close: std::sync::Arc::new(|_| Ok(())),
             watcher_tx: tokio::sync::broadcast::channel(64).0,
             sse_registry: Arc::new(SseRegistry::default()),
@@ -14893,11 +17493,17 @@ mod tests {
             pairing_counter: Box::new(Vec::new),
 
             codex_control: crate::remote::codex_ipc::CodexControlHub::disabled_arc(),
+            dsh_control: crate::services::dsh_control::disabled_arc(),
+            dsh_auto_adapt_source: std::sync::Arc::new(
+                crate::services::dsh_control::production::dsh_auto_adapt_enabled,
+            ),
             desktop_language: Default::default(),
             // 任务 8：OpenCode 原生交互中枢——测试禁用默认（惰性容器，零 IO；本组用例不触原生路由）
             opencode_native: Arc::new(crate::services::opencode_native::NativeHub::new(
                 crate::remote::pairing::DeviceStore::memory(),
             )),
+            dsh_console_mount: None,
+            dsh_console_upstream_source: None,
         });
         (state, sid_out)
     }
@@ -14977,7 +17583,7 @@ mod tests {
             board_hidden_ids: Box::new(Vec::new),
             board_hidden_hide: std::sync::Arc::new(|_| 0usize),
             board_hidden_unhide: std::sync::Arc::new(|_| 0usize),
-            unread_mark_read: std::sync::Arc::new(|_, _| ()),
+            unread_mark_read: std::sync::Arc::new(|_, _, _| ()),
             session_close: std::sync::Arc::new(|_| Ok(())),
             watcher_tx: tokio::sync::broadcast::channel(64).0,
             sse_registry: Arc::new(SseRegistry::default()),
@@ -14993,11 +17599,17 @@ mod tests {
             pairing_counter: Box::new(Vec::new),
 
             codex_control: crate::remote::codex_ipc::CodexControlHub::disabled_arc(),
+            dsh_control: crate::services::dsh_control::disabled_arc(),
+            dsh_auto_adapt_source: std::sync::Arc::new(
+                crate::services::dsh_control::production::dsh_auto_adapt_enabled,
+            ),
             desktop_language: Default::default(),
             // 任务 8：OpenCode 原生交互中枢——测试禁用默认（惰性容器，零 IO；本组用例不触原生路由）
             opencode_native: Arc::new(crate::services::opencode_native::NativeHub::new(
                 crate::remote::pairing::DeviceStore::memory(),
             )),
+            dsh_console_mount: None,
+            dsh_console_upstream_source: None,
         });
         (state, sid_out)
     }
@@ -16316,7 +18928,7 @@ mod tests {
             board_hidden_ids: Box::new(Vec::new),
             board_hidden_hide: std::sync::Arc::new(|_| 0usize),
             board_hidden_unhide: std::sync::Arc::new(|_| 0usize),
-            unread_mark_read: std::sync::Arc::new(|_, _| ()),
+            unread_mark_read: std::sync::Arc::new(|_, _, _| ()),
             session_close: std::sync::Arc::new(|_| Ok(())),
             sse_registry: Arc::new(SseRegistry::default()),
             max_devices_source: Box::new(|| 3),
@@ -16335,11 +18947,17 @@ mod tests {
             subagent_message_source: std::collections::HashMap::new(),
 
             codex_control: crate::remote::codex_ipc::CodexControlHub::disabled_arc(),
+            dsh_control: crate::services::dsh_control::disabled_arc(),
+            dsh_auto_adapt_source: std::sync::Arc::new(
+                crate::services::dsh_control::production::dsh_auto_adapt_enabled,
+            ),
             desktop_language: Default::default(),
             // 任务 8：OpenCode 原生交互中枢——测试禁用默认（惰性容器，零 IO；本组用例不触原生路由）
             opencode_native: Arc::new(crate::services::opencode_native::NativeHub::new(
                 crate::remote::pairing::DeviceStore::memory(),
             )),
+            dsh_console_mount: None,
+            dsh_console_upstream_source: None,
         })
     }
 
@@ -17069,6 +19687,7 @@ mod tests {
         let archive = vec![
             crate::database::SessionArchiveRow {
                 session_id: "a1".into(),
+                dsh_instance_id: None,
                 agent_type: "claude".into(),
                 project_path: pa.into(),
                 project_name: "pa".into(),
@@ -17081,6 +19700,7 @@ mod tests {
             // 8 天前 → 出窗
             crate::database::SessionArchiveRow {
                 session_id: "a2".into(),
+                dsh_instance_id: None,
                 agent_type: "codex".into(),
                 project_path: pb.into(),
                 project_name: "pb".into(),
@@ -17093,6 +19713,7 @@ mod tests {
             // 非 ASCII 路径 → 过滤（v1 同规）
             crate::database::SessionArchiveRow {
                 session_id: "a3".into(),
+                dsh_instance_id: None,
                 agent_type: "claude".into(),
                 project_path: "E:\\项目".into(),
                 project_name: "cjk".into(),
@@ -17105,6 +19726,7 @@ mod tests {
             // 同目录另一工具（tools 并集来源）
             crate::database::SessionArchiveRow {
                 session_id: "a5".into(),
+                dsh_instance_id: None,
                 agent_type: "codex".into(),
                 project_path: pa.into(),
                 project_name: "pa".into(),
@@ -17117,6 +19739,7 @@ mod tests {
             // 次新目录（排序第二位）
             crate::database::SessionArchiveRow {
                 session_id: "a4".into(),
+                dsh_instance_id: None,
                 agent_type: "kimi".into(),
                 project_path: pc.into(),
                 project_name: "pc".into(),
@@ -17195,6 +19818,7 @@ mod tests {
             vec![],
             vec![crate::database::SessionArchiveRow {
                 session_id: "a9".into(),
+                dsh_instance_id: None,
                 agent_type: "claude".into(),
                 project_path: pz.into(),
                 project_name: "pz".into(),
@@ -17233,7 +19857,7 @@ mod tests {
             std::collections::HashMap::new();
         fakes.insert(
             "claude",
-            Box::new(|_: &str, sid: &str| {
+            Box::new(|_: &str, sid: &str, _i: Option<&str>| {
                 vec![
                     crate::monitor::subagents::SubagentView {
                         id: format!("late-{sid}"),
@@ -17297,7 +19921,7 @@ mod tests {
             board_hidden_ids: Box::new(Vec::new),
             board_hidden_hide: std::sync::Arc::new(|_| 0usize),
             board_hidden_unhide: std::sync::Arc::new(|_| 0usize),
-            unread_mark_read: std::sync::Arc::new(|_, _| ()),
+            unread_mark_read: std::sync::Arc::new(|_, _, _| ()),
             session_close: std::sync::Arc::new(|_| Ok(())),
             sse_registry: Arc::new(SseRegistry::default()),
             max_devices_source: Box::new(|| 3),
@@ -17311,11 +19935,17 @@ mod tests {
             pairing_counter: Box::new(Vec::new),
 
             codex_control: crate::remote::codex_ipc::CodexControlHub::disabled_arc(),
+            dsh_control: crate::services::dsh_control::disabled_arc(),
+            dsh_auto_adapt_source: std::sync::Arc::new(
+                crate::services::dsh_control::production::dsh_auto_adapt_enabled,
+            ),
             desktop_language: Default::default(),
             // 任务 8：OpenCode 原生交互中枢——测试禁用默认（惰性容器，零 IO；本组用例不触原生路由）
             opencode_native: Arc::new(crate::services::opencode_native::NativeHub::new(
                 crate::remote::pairing::DeviceStore::memory(),
             )),
+            dsh_console_mount: None,
+            dsh_console_upstream_source: None,
         })
     }
 
@@ -17470,7 +20100,7 @@ mod tests {
             board_hidden_ids: Box::new(Vec::new),
             board_hidden_hide: std::sync::Arc::new(|_| 0usize),
             board_hidden_unhide: std::sync::Arc::new(|_| 0usize),
-            unread_mark_read: std::sync::Arc::new(|_, _| ()),
+            unread_mark_read: std::sync::Arc::new(|_, _, _| ()),
             session_close: std::sync::Arc::new(|_| Ok(())),
             sse_registry: Arc::new(SseRegistry::default()),
             max_devices_source: Box::new(|| 3),
@@ -17484,11 +20114,17 @@ mod tests {
             pairing_counter: Box::new(Vec::new),
 
             codex_control: crate::remote::codex_ipc::CodexControlHub::disabled_arc(),
+            dsh_control: crate::services::dsh_control::disabled_arc(),
+            dsh_auto_adapt_source: std::sync::Arc::new(
+                crate::services::dsh_control::production::dsh_auto_adapt_enabled,
+            ),
             desktop_language: Default::default(),
             // 任务 8：OpenCode 原生交互中枢——测试禁用默认（惰性容器，零 IO；本组用例不触原生路由）
             opencode_native: Arc::new(crate::services::opencode_native::NativeHub::new(
                 crate::remote::pairing::DeviceStore::memory(),
             )),
+            dsh_console_mount: None,
+            dsh_console_upstream_source: None,
         })
     }
 
@@ -17500,22 +20136,28 @@ mod tests {
             std::collections::HashMap::new();
         fakes.insert(
             "claude",
-            Box::new(|_sid: &str, _sub: &str, _limit: usize| {
-                Ok(crate::remote::content::MessagesPage {
-                    messages: vec![crate::remote::content::SessionMessage {
-                        seq: 0,
-                        role: "user".into(),
-                        kind: "user".into(),
-                        content: "设计新方案".into(),
-                        ts: Some(1760000000000),
-                        tool_name: None,
-                        tool_args: None,
-                        collapsed: false,
-                    }],
-                    truncated: false,
-                    cwd: None,
-                })
-            }),
+            Box::new(
+                |_sid: &str, _sub: &str, _limit: usize, _skip: usize, _i: Option<&str>| {
+                    Ok(crate::remote::content::MessagesPage {
+                        messages: vec![crate::remote::content::SessionMessage {
+                            seq: 0,
+                            role: "user".into(),
+                            kind: "user".into(),
+                            content: "设计新方案".into(),
+                            ts: Some(1760000000000),
+                            tool_name: None,
+                            tool_args: None,
+                            collapsed: false,
+                            media: Vec::new(),
+                            blocks: Vec::new(),
+                        }],
+                        truncated: false,
+                        cwd: None,
+                        older_before: None,
+                        dsh_model_summary: None,
+                    })
+                },
+            ),
         );
         let st = state_with_subagent_msg_fakes(fakes);
         let app = crate::remote::server::router(st.clone());
@@ -17588,6 +20230,154 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r.status(), 403);
+    }
+
+    /// 子详情续页游标契约（2026-11-18 销项批，A06）：端点把 `before` 起始索引
+    /// 透传进 SubagentMessageSourceFn 的 skip 位；`olderBefore` 键**仅真实存在
+    /// 续页游标时在场**（与 session-messages 同一 Important-1 纪律：None 键
+    /// 缺席，非游标面/最旧页不得出现 null）。假源持有 1001 条窗口，独立实现
+    /// 起始索引窗口——本测锁定「端点 → 缝」的传参与键契约，窗口语义本身由
+    /// content.rs / dsh_subagent_test.rs（真实读取面）锁定。
+    #[tokio::test]
+    async fn session_subagent_messages_cursor_matrix() {
+        const TOTAL: usize = 1001;
+        let seen: std::sync::Arc<std::sync::Mutex<Vec<usize>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut fakes: std::collections::HashMap<&'static str, Box<SubagentMessageSourceFn>> =
+            std::collections::HashMap::new();
+        let skips = seen.clone();
+        fakes.insert(
+            "dsh",
+            Box::new(
+                move |_sid: &str, _sub: &str, limit: usize, skip: usize, _i: Option<&str>| {
+                    skips.lock().unwrap().push(skip);
+                    // 起始索引窗口：[skip−limit, skip) ∩ [0, TOTAL)（与生产读取面同式）
+                    let end = if skip == 0 { TOTAL } else { skip.min(TOTAL) };
+                    let start = end.saturating_sub(limit);
+                    let truncated = start > 0;
+                    let messages = (start..end)
+                        .map(|i| crate::remote::content::SessionMessage {
+                            seq: (i - start) as i64,
+                            role: "user".into(),
+                            kind: "user".into(),
+                            content: format!("m{i}"),
+                            ts: None,
+                            tool_name: None,
+                            tool_args: None,
+                            collapsed: false,
+                            media: Vec::new(),
+                            blocks: Vec::new(),
+                        })
+                        .collect::<Vec<_>>();
+                    Ok(crate::remote::content::MessagesPage {
+                        messages,
+                        truncated,
+                        cwd: None,
+                        older_before: if truncated {
+                            i64::try_from(start).ok()
+                        } else {
+                            None
+                        },
+                        dsh_model_summary: None,
+                    })
+                },
+            ) as Box<SubagentMessageSourceFn>,
+        );
+        // 非 DSH 面：truncated=true 但 older_before 恒 None → 键必须缺席
+        fakes.insert(
+            "claude",
+            Box::new(
+                |_sid: &str, _sub: &str, limit: usize, _skip: usize, _i: Option<&str>| {
+                    Ok(crate::remote::content::MessagesPage {
+                        messages: (0..limit)
+                            .map(|i| crate::remote::content::SessionMessage {
+                                seq: i as i64,
+                                role: "user".into(),
+                                kind: "user".into(),
+                                content: format!("c{i}"),
+                                ts: None,
+                                tool_name: None,
+                                tool_args: None,
+                                collapsed: false,
+                                media: Vec::new(),
+                                blocks: Vec::new(),
+                            })
+                            .collect::<Vec<_>>(),
+                        truncated: true,
+                        cwd: None,
+                        older_before: None,
+                        dsh_model_summary: None,
+                    })
+                },
+            ) as Box<SubagentMessageSourceFn>,
+        );
+        let st = state_with_subagent_msg_fakes(fakes);
+        let app = crate::remote::server::router(st.clone());
+        let cookie = paired_cookie(&st, "sub-det-cur");
+        let base = |query: &str| {
+            format!("/m/api/v1/session-subagent-messages?agent_type=dsh&session_id=s1&subagent_id=a1&limit=1000{query}")
+        };
+        // ① 首页（无 before）：skip 透传 0、吃满 1000、truncated、游标在场
+        let r = app
+            .clone()
+            .oneshot(req("GET", &base(""), Some(&cookie), None))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+        let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+        assert_eq!(v["messages"].as_array().map(Vec::len), Some(1000));
+        assert_eq!(v["truncated"], serde_json::json!(true));
+        assert_eq!(
+            v["olderBefore"],
+            serde_json::json!(1),
+            "游标 = 本页最旧消息起始索引（1001 取尾 1000 → 1）"
+        );
+        // ② 续页（before=1）：skip 透传 1、余量 1 条、键缺席（到头即停）
+        let r = app
+            .clone()
+            .oneshot(req("GET", &base("&before=1"), Some(&cookie), None))
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+        assert_eq!(v["messages"].as_array().map(Vec::len), Some(1));
+        assert_eq!(v["truncated"], serde_json::json!(false));
+        assert!(
+            v.get("olderBefore").is_none(),
+            "最旧页不得出现 olderBefore 键（null 也算在场）"
+        );
+        // ③ 非数字 before → 静默缺省 0（与 session-messages 同款语义）
+        let r = app
+            .clone()
+            .oneshot(req(
+                "GET",
+                &base("&before=not-a-number"),
+                Some(&cookie),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+        // ④ claude（游标不消费面）：truncated=true 但键缺席（null 泄漏即失败）
+        let r = app
+            .clone()
+            .oneshot(req(
+                "GET",
+                "/m/api/v1/session-subagent-messages?agent_type=claude&session_id=s1&subagent_id=a1&limit=2",
+                Some(&cookie),
+                None,
+            ))
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+        assert_eq!(v["truncated"], serde_json::json!(true));
+        assert!(
+            v.get("olderBefore").is_none(),
+            "非游标面不得出现 olderBefore 键: {}",
+            v
+        );
+        // 传参核对：首页 0 → 续页 1 → 非数字 0
+        let skips = seen.lock().unwrap();
+        assert_eq!(skips.as_slice(), &[0, 1, 0], "before 必须逐请求透传进缝");
     }
 
     // ==== Task 3（2026-10-12 P0）：codex APP 止血门——三写入口 409 app_form_pending ====

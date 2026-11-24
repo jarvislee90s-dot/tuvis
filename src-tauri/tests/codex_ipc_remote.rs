@@ -182,6 +182,8 @@ fn codex_app_session(id: &str) -> Session {
         jump_supported: false,
         unread: false,
         unread_turned_green_at_ms: None,
+        dsh_instance_id: None,
+        dsh_subagent: None,
     }
 }
 
@@ -244,9 +246,13 @@ fn question_message_page(
                     .into(),
             ),
             collapsed: false,
+            media: Vec::new(),
+            blocks: Vec::new(),
         }],
         truncated: false,
         cwd: None,
+        older_before: None,
+        dsh_model_summary: None,
     }
 }
 
@@ -511,7 +517,7 @@ fn fixture_on(
         board_hidden_ids: Box::new(Vec::new),
         board_hidden_hide: Arc::new(|_| 0usize),
         board_hidden_unhide: Arc::new(|_| 0usize),
-        unread_mark_read: Arc::new(|_, _| ()),
+        unread_mark_read: Arc::new(|_, _, _| ()),
         session_close: Arc::new(|_| Ok(())),
         store,
         host_source: Box::new(|| serde_json::json!({ "host": { "name": "t" } })),
@@ -544,6 +550,10 @@ fn fixture_on(
         dialog_probe: Arc::new(|_, _| None),
         screen_probe: Arc::new(|_, _| None),
         codex_control: hub_builder(DeviceStore::Owned(conn.clone())),
+        dsh_control: multi_agents_manager_lib::services::dsh_control::disabled_arc(),
+        dsh_console_mount: None,
+        dsh_console_upstream_source: None,
+        dsh_auto_adapt_source: std::sync::Arc::new(|| true),
         desktop_language: Default::default(),
         // 任务 8：OpenCode 原生交互中枢——与 state.store 同库同连接（Owned 是 Arc，
         // 克隆共享）；本套件不触原生路由，只补禁用默认（业务断言不变）
@@ -29564,6 +29574,7 @@ async fn stop_reconnect_and_late_worker_preserve_other_consumers() {
         "remote release must preserve estimate following"
     );
     adapter.ensure_thread(&key).await.unwrap();
+    assert!(lease.is_current().await);
     lease.release().await;
     // 最后一个测速消费者释放会主动发 Lost。先确认并消费这个世代，
     // 后续断链等待才不能误把它当作 EOF 已被观察。
@@ -29578,6 +29589,10 @@ async fn stop_reconnect_and_late_worker_preserve_other_consumers() {
     })
     .await
     .expect("estimate release must invalidate its observation");
+    assert!(
+        !lease.is_current().await,
+        "released estimate ticket must be invalid"
+    );
     assert!(
         !peer_has_traffic(&mut peer).await,
         "estimate release must preserve remote following"
@@ -29780,23 +29795,10 @@ async fn stop_reconnect_and_late_worker_preserve_other_consumers() {
             .unwrap(),
         1
     );
-    while let Ok(request) = tokio::time::timeout(Duration::from_millis(300), peer2.recv()).await {
-        match request["method"].as_str() {
-            Some("thread-owner-discovery") => {
-                peer2
-                    .send(&discovery_response(
-                        request["requestId"].as_str().unwrap(),
-                        "owner-1",
-                    ))
-                    .await
-            }
-            Some("thread-stream-following-changed") => {
-                assert_eq!(request["params"]["following"], true)
-            }
-            method => panic!("unexpected write or control frame {method:?}"),
-        }
-    }
+    assert!(lease2.is_current().await, "重连后的 estimate 票据必须有效");
     lease2.release().await;
+    // release 完成后给 wire 一个观察窗口，确认没有误撤销或其他控制帧。
+    tokio::time::sleep(Duration::from_millis(300)).await;
     runtime.shutdown().await;
     adapter.shutdown().await;
 }

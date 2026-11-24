@@ -1014,12 +1014,16 @@ mod tests {
             tool_name: None,
             tool_args: None,
             collapsed: kind != "user",
+            media: Vec::new(),
+            blocks: Vec::new(),
         };
         // user 正文命中
         let pg = crate::remote::content::MessagesPage {
             messages: vec![msg("user", "user", "[mobile t] body…")],
             truncated: false,
             cwd: None,
+            older_before: None,
+            dsh_model_summary: None,
         };
         assert!(stamp_hit_in_page(&pg, stamp));
         // 同文只在 assistant 侧（tool-result 回显）→ 不命中
@@ -1027,6 +1031,8 @@ mod tests {
             messages: vec![msg("assistant", "tool-result", "[mobile t] body…")],
             truncated: false,
             cwd: None,
+            older_before: None,
+            dsh_model_summary: None,
         };
         assert!(!stamp_hit_in_page(&pg2, stamp));
         // 混合页：assistant 在前 user 在后 → 命中
@@ -1037,6 +1043,8 @@ mod tests {
             ],
             truncated: false,
             cwd: None,
+            older_before: None,
+            dsh_model_summary: None,
         };
         assert!(stamp_hit_in_page(&pg3, stamp));
     }
@@ -1057,6 +1065,8 @@ mod tests {
             tool_name: None,
             tool_args: None,
             collapsed: false,
+            media: Vec::new(),
+            blocks: Vec::new(),
         };
         // plan 正文含戳 → 不命中（role=assistant 过滤）
         let pg = crate::remote::content::MessagesPage {
@@ -1067,6 +1077,8 @@ mod tests {
             )],
             truncated: false,
             cwd: None,
+            older_before: None,
+            dsh_model_summary: None,
         };
         assert!(!stamp_hit_in_page(&pg, stamp));
         // 对照格：同流加一条 user 正文命中 → 照常命中（user 过滤通道无回归）
@@ -1077,6 +1089,8 @@ mod tests {
             ],
             truncated: false,
             cwd: None,
+            older_before: None,
+            dsh_model_summary: None,
         };
         assert!(stamp_hit_in_page(&pg2, stamp));
     }

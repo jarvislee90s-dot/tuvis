@@ -31,6 +31,8 @@ export interface JumpTarget {
   unread?: boolean;
   // 进程形态：CLI 会话在 TTY 聚焦失败走 APP 级保底时给出 UX 提示（review M3）
   form?: "cli" | "app";
+  // H07 最终批 I5：DSH 卡已读按实例限定（非 DSH 省略）
+  dshInstanceId?: string;
 }
 
 export function useSessionJump() {
@@ -78,6 +80,8 @@ export function useSessionJump() {
       outcome = await invoke<SessionMutationOutcome>("mark_session_read", {
         agentType: target.agentType,
         sessionId: target.id,
+        // H07 最终批 I5：DSH 卡已读按实例限定（undefined = 非 DSH）
+        instanceId: target.dshInstanceId,
       });
     } catch (error) {
       console.error("mark_session_read after jump failed:", error);
@@ -108,6 +112,8 @@ export function useSessionJump() {
       // P1-1：进程形态/未读标记传入后端，Windows App 会话优先深度链接直达（T8）
       form: target.form,
       unread: target.unread,
+      // H07 最终批 I5：DSH 卡已读按实例限定
+      instanceId: target.dshInstanceId,
     });
     const ambiguous = result.type === "ambiguous" && result.windows ? result.windows : null;
     const isAmbiguous = ambiguous !== null && ambiguous.length > 0;

@@ -1,0 +1,5 @@
+# tsc 构建产物不入库：发行载体是 resources/dsh/remote-access.tgz（内含 lib/）
+lib/
+
+# 根 .gitignore 的 TEST/（测试截图目录）在大小写不敏感文件系统上会误伤本包 test/，显式豁免
+!test/

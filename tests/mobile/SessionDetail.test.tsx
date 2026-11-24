@@ -1422,6 +1422,63 @@ describe("SessionDetail：详情页 10s 轮询（F6）", () => {
   });
 });
 
+// ==== P1-4（Round-7 Task 4）：轮询周期内同步刷新发送就绪态 ====
+// DSH 恢复后发送就绪态必须在一个轮询周期内自动恢复（复用既有 10s 轮询与
+// send-info 刷新信号，不新增轮询面）；恢复前输入区保持禁用 + reason 展示。
+describe("SessionDetail：轮询同步刷新发送就绪态（P1-4）", () => {
+  /** 只数 /session-send-info 调用（证明就绪态确实被轮询重拉，断言不空转） */
+  function sendInfoCalls(): number {
+    return fetchMock.mock.calls.filter((c: unknown[]) =>
+      String(c[0]).includes("/session-send-info")
+    ).length;
+  }
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("DSH 恢复后：输入区在下一个轮询周期内自动恢复可用（无需手动刷新）", async () => {
+    installFetch();
+    // 初始 DSH 不可用：composer 禁用（send-disabled-reason 在场 + 输入框 disabled）
+    routes.sendInfo = { injectable: false, channels: [], visibility: "realtime" };
+    render(<SessionDetail session={makeSession()} onBack={() => {}} />);
+    await act(async () => {}); // 挂载首拉（messages + send-info）落地
+    expect(sendInfoCalls()).toBe(1);
+    expect(screen.getByTestId("send-disabled-reason")).toBeInTheDocument();
+    expect(screen.getByTestId("composer-input")).toBeDisabled();
+
+    // 服务端 DSH 恢复（send-info 变为可注入）；页面未做任何手动操作。
+    routes.sendInfo = { injectable: true, channels: ["tmux"], visibility: "realtime" };
+
+    // 一个轮询周期内：就绪态随轮询重拉自动翻转（RED：旧实现轮询只刷消息，
+    // send-info 不重拉 → 输入区保持禁用直到手动刷新）。
+    await act(async () => {
+      vi.advanceTimersByTime(10_000);
+    });
+    expect(sendInfoCalls()).toBe(2);
+    expect(screen.queryByTestId("send-disabled-reason")).not.toBeInTheDocument();
+    expect(screen.getByTestId("composer-input")).toBeEnabled();
+  });
+
+  it("恢复前不误启用：轮询照跑但服务端仍不可用时输入区保持禁用", async () => {
+    installFetch();
+    routes.sendInfo = { injectable: false, channels: [], visibility: "realtime" };
+    render(<SessionDetail session={makeSession()} onBack={() => {}} />);
+    await act(async () => {});
+    expect(screen.getByTestId("send-disabled-reason")).toBeInTheDocument();
+    await act(async () => {
+      vi.advanceTimersByTime(10_000);
+    });
+    // 轮询确实重拉了 send-info（前提自证），但结论仍是不可注入。
+    expect(sendInfoCalls()).toBe(2);
+    expect(screen.getByTestId("send-disabled-reason")).toBeInTheDocument();
+    expect(screen.getByTestId("composer-input")).toBeDisabled();
+  });
+});
+
 // ==== P2-B（评审修复批）：轮询滚动跟随条件化 ====
 // 轮询刷新数据落地时，仅在刷新前采样为「贴底」（距底 <120px）才跟随落底；
 // 上翻阅读历史不被每 10s 拽回底部。假计时器 + 滚动容器几何量 mock

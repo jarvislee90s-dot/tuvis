@@ -1361,6 +1361,8 @@ mod live_tests {
         let _ = pid;
         let _ = project;
         let session = crate::session::Session {
+            dsh_instance_id: None,
+            dsh_subagent: None,
             id: session_id.clone(),
             agent_type: crate::session::AgentType::OpenCode,
             project_name: "bridge-live".into(),

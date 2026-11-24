@@ -9,7 +9,12 @@ pub mod codex_adapt;
 pub mod codex_evidence;
 pub mod codex_ipc;
 pub mod codex_question_skip;
+pub mod console_capability;
+pub mod console_lifecycle;
+pub mod console_mount;
+pub mod console_upstream;
 pub mod content;
+pub mod dsh_subagent_source;
 pub mod events;
 pub mod files;
 pub mod gate;
@@ -746,6 +751,30 @@ static PAIRING_PROJECTS_CACHE: Lazy<Mutex<Option<PairingProjectsCache>>> =
     Lazy::new(|| Mutex::new(None));
 
 /// 共享状态单例：服务器任务与 tauri 命令共用同一份 pairing / 会话源 / 设备存储
+/// 测试边界：远程层真实使用的 `RemoteState`（生产装配路径，不另建实例）。
+///
+/// 复审 Ma4：B3「Tauri 与 RemoteState 共用同一 hub」必须有**结构性**断言——
+/// 从真实取用点（本函数背后的 `STATE`）取字段，与 `production_hub()` 比指针，
+/// 而不是在测试里两次调用同一函数（那样字段没人读也会绿）。
+#[cfg(test)]
+pub(crate) fn state_for_test() -> std::sync::Arc<server::RemoteState> {
+    std::sync::Arc::clone(&STATE)
+}
+
+/// 供控制台挂载取设备库（同一进程单例的 store，不新建连接）。
+/// `DeviceStore::clone()` 共享同一连接（Global 单位变体 / Owned 共享 Arc），
+/// 不产生第二个库——因此这里直接克隆即可。
+///
+/// `let _ = &*STATE;` 是**刻意的**：它强制 `STATE` 完成惰性初始化。
+/// 没有这一句，若控制台挂载先于其他远程路径初始化，读 `STATE.store` 会以
+/// 未初始化的静态引用访问——那是不安全前提。这里主动触发一次，保证任何
+/// 调用点拿到的都是已经构造好的 store（因此实际不会返回 `None`；
+/// `Option` 只是给未来的「设备库不可用」留出显式失败面）。
+pub(crate) fn pairing_device_store() -> Option<pairing::DeviceStore> {
+    let _ = &*STATE;
+    Some(STATE.store.clone())
+}
+
 static STATE: Lazy<std::sync::Arc<server::RemoteState>> = Lazy::new(|| {
     std::sync::Arc::new(server::RemoteState {
         // 远程端外观配置读源（2026-10-05 UI 改版）：生产 = settings KV 单行 JSON
@@ -807,6 +836,13 @@ static STATE: Lazy<std::sync::Arc<server::RemoteState>> = Lazy::new(|| {
         codex_control: std::sync::Arc::new(codex_ipc::CodexControlHub::production(
             pairing::DeviceStore::Global,
         )),
+        // DSH 远控控制面 hub：与 Tauri `manage` 同一进程级 Arc（T09 验收⑤）。
+        dsh_control: crate::services::dsh_control::production_hub(),
+        dsh_console_mount: None,
+        dsh_console_upstream_source: None,
+        dsh_auto_adapt_source: std::sync::Arc::new(
+            crate::services::dsh_control::production::dsh_auto_adapt_enabled,
+        ),
         // M7 Task 5（方案 A）：注入器生产装配——消费方 flush_one / session-send 直发；
         // Task 6 已接线：api_router 注册 session-send 等路由 + serve() 挂 spawn_flush_loop
         injector: std::sync::Arc::new(crate::inject::engine::RealInjector),
@@ -885,34 +921,60 @@ static STATE: Lazy<std::sync::Arc<server::RemoteState>> = Lazy::new(|| {
         subagent_source: [
             (
                 "claude",
-                Box::new(|_a: &str, sid: &str| crate::monitor::subagents::claude::collect(sid))
-                    as Box<server::SubagentSourceFn>,
+                Box::new(|_a: &str, sid: &str, _i: Option<&str>| {
+                    crate::monitor::subagents::claude::collect(sid)
+                }) as Box<server::SubagentSourceFn>,
             ),
             (
                 "opencode",
-                Box::new(|_a: &str, sid: &str| crate::monitor::subagents::opencode::collect(sid))
-                    as Box<server::SubagentSourceFn>,
+                Box::new(|_a: &str, sid: &str, _i: Option<&str>| {
+                    crate::monitor::subagents::opencode::collect(sid)
+                }) as Box<server::SubagentSourceFn>,
             ),
             (
                 "kimi",
-                Box::new(|_a: &str, sid: &str| crate::monitor::subagents::kimi::collect(sid))
-                    as Box<server::SubagentSourceFn>,
+                Box::new(|_a: &str, sid: &str, _i: Option<&str>| {
+                    crate::monitor::subagents::kimi::collect(sid)
+                }) as Box<server::SubagentSourceFn>,
             ),
             (
                 "codex",
-                Box::new(|_a: &str, sid: &str| crate::monitor::subagents::codex::collect(sid))
-                    as Box<server::SubagentSourceFn>,
+                Box::new(|_a: &str, sid: &str, _i: Option<&str>| {
+                    crate::monitor::subagents::codex::collect(sid)
+                }) as Box<server::SubagentSourceFn>,
+            ),
+            (
+                "dsh",
+                Box::new(|_a: &str, sid: &str, instance: Option<&str>| {
+                    crate::remote::dsh_subagent_source::list_for_instance(sid, instance)
+                }) as Box<server::SubagentSourceFn>,
             ),
         ]
         .into_iter()
         .collect(),
-        // 2026-10-09 观察台 §三：详情源仅 claude（其余工具 supported=false；
-        // 转写格式普查后另批补，spec §五）
-        subagent_message_source: [(
-            "claude",
-            Box::new(crate::remote::content::read_claude_subagent_messages)
-                as Box<server::SubagentMessageSourceFn>,
-        )]
+        // 2026-10-09 观察台 §三：详情源 claude + dsh（其余工具 supported=false；
+        // 转写格式普查后另批补，spec §五）。2026-11-18 销项批：缝签名加 skip
+        // 游标——claude 不消费（older_before 恒 None），dsh 消费（子详情续页）。
+        subagent_message_source: [
+            (
+                "claude",
+                Box::new(
+                    |sid: &str, sub: &str, limit: usize, _skip: usize, _i: Option<&str>| {
+                        crate::remote::content::read_claude_subagent_messages(sid, sub, limit)
+                    },
+                ) as Box<server::SubagentMessageSourceFn>,
+            ),
+            (
+                "dsh",
+                Box::new(
+                    |parent: &str, sub: &str, limit: usize, skip: usize, instance: Option<&str>| {
+                        crate::remote::content::read_dsh_subagent_messages_for_instance(
+                            parent, sub, limit, skip, instance,
+                        )
+                    },
+                ) as Box<server::SubagentMessageSourceFn>,
+            ),
+        ]
         .into_iter()
         .collect(),
         // M3 Task 5：跃迁事件通道与扫描循环同源（watcher::event_sender 与
@@ -933,7 +995,9 @@ static STATE: Lazy<std::sync::Arc<server::RemoteState>> = Lazy::new(|| {
         board_hidden_unhide: std::sync::Arc::new(crate::database::board_hidden_unhide),
         // 未读已读缝：与桌面端「叉」（mark_session_read）同源 dao 函数——远程归档
         // 等同远程叉掉（删未读池行 + 已读 tombstone）
-        unread_mark_read: std::sync::Arc::new(crate::database::dao::unread::mark_read),
+        unread_mark_read: std::sync::Arc::new(|tool: &str, sid: &str, instance: Option<&str>| {
+            crate::database::dao::unread::mark_read(tool, sid, instance)
+        }),
         // CLI 会话硬杀缝（/session-close 与桌面 kill_session 同内核）
         session_close: std::sync::Arc::new(crate::commands::session::kill_pid),
         now_source: Box::new(|| chrono::Utc::now().timestamp_millis()),
@@ -1579,6 +1643,9 @@ fn stop_server_with(
     // 取消旧上游、关闭旧 watch、作废旧凭据；动作账本、路由归属、设备都留在共享存储，
     // 重开/热重启后 view/watch 重新发现即可恢复（旧在途投影由 hub 的代际检查拦住）。
     state.opencode_native.pause();
+    // H09/H12：控制台网关随远程关闭一并停止——否则其会话与上游凭据会脱离
+    // 设备授权生命周期继续存活（撤权/关远程后仍可访问）。
+    crate::remote::console_lifecycle::revoke_console_access();
 }
 
 /// 停止远程服务（通用停机）：revoke 按调用方语义 + 对外通道全停（M5 A5 双隧道
@@ -2290,6 +2357,9 @@ pub fn remote_revoke_device(id: String) -> Result<(), String> {
     }
     result?;
     let n = STATE.sse_registry.disconnect_device(&id);
+    // H09：撤设备必须同时作废该设备签发的控制台能力及其活连接——否则旧令牌
+    // 在过期前仍可打开/继续使用控制台（能力不依赖设备 cookie，查不到 DB 状态）。
+    console_mount::revoke_device(&id);
     events::audit("device_revoked", &format!("id={id} closed_sse={n}"));
     events::emit_ui("remote-roster-changed", serde_json::json!({"id": id}));
     Ok(())
@@ -2343,6 +2413,8 @@ fn revoke_all_and_disconnect() -> Result<(usize, usize), String> {
     }
     let n = result?;
     let closed = STATE.sse_registry.disconnect_all();
+    // H09：全量吊销同样作废所有控制台能力与活连接。
+    console_mount::revoke_all();
     Ok((n, closed))
 }
 

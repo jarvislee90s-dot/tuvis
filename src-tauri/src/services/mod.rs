@@ -2,7 +2,9 @@
 
 pub mod codex_control;
 pub mod codex_desktop_ipc;
+// DSH Desktop 远控控制面（T01：契约样本、领域 DTO 与错误边界）
 pub(crate) mod codex_question_skip;
+pub mod dsh_control;
 pub mod manifest;
 pub mod mcp;
 // OpenCode 原生交互（macOS 首批）：契约/发现/传输/投影/动作/答题校验

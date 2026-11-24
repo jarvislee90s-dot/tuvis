@@ -2170,12 +2170,20 @@ describe("RemoteSection Codex 自动适配（S5 换装）", () => {
     );
     expect(numbered).toEqual([true, true, true, true]);
 
+    // T01：DSH 卡并入 ③ 工具特殊配置，与 Codex APP / ZCode 并列（默认收起）
     const cards = [...container.querySelectorAll("[data-tool-card]")];
     expect(cards.map((card) => card.getAttribute("data-tool-card"))).toEqual([
       "codex",
+      "dsh",
       "zcode",
       "opencode",
     ]);
+    const dshHeader = screen.getByTestId("tool-config-header-dsh");
+    expect(dshHeader).toHaveAttribute("aria-expanded", "false");
+    expect(dshHeader).toHaveAttribute("aria-controls", "tool-config-panel-dsh");
+    // 收起时正文不挂载：零实例发现、零开关查询
+    expect(screen.queryByTestId("tool-config-panel-dsh")).toBeNull();
+    expect(screen.queryByTestId("dsh-switch")).toBeNull();
 
     const codexHeader = screen.getByTestId("tool-config-header-codex");
     expect(codexHeader).toHaveAttribute("aria-expanded", "false");

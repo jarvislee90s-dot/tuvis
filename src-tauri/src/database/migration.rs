@@ -103,6 +103,315 @@ pub fn migrate(conn: &Connection) -> Result<(), String> {
         log::warn!("usage: 检测到预览版账本形状，已重建（四表清空，下次采集重算）");
     }
 
+    // ---- 未读池/已读墓碑（H07 最终批 I5）：主键补 instance_key（实例限定） ----
+    // 复审 I5：同 ID 跨实例（DSH A/B）的未读行与已读墓碑此前按 (tool_id, session_id)
+    // 冲突——互相覆盖、互相清除。SQLite 改不了主键，整表重建转存：
+    //   * 仅在表存在且缺 instance_key 列时触发（新库由 schema.rs 直接建新形状，跳过）；
+    //   * 旧行 instance_key 一律 ''（非 DSH 语义逐字保留；DSH 旧行身份未知 → 空串
+    //     保守保留，不自动归给当前实例）。
+    //   * schema::init 若已建过旧形状表，migrate 在其后运行照样触发重建。
+    // 终审 I5 残留：重建必须**可续跑**——事务包裹（rename/建表/转存/删旧表原子），
+    // 并先清理上次中断遗留的 `_legacy_nokey` 中间态（事务失败自动回滚后旧表仍在，
+    // 下次进入本分支重跑；若 rename 已提交而进程死在中途，旧行在 `_legacy_nokey`
+    // 里，这里完成收尾转存后再重建）。
+    for table in ["unread_sessions", "unread_read_tombstones"] {
+        let legacy = format!("{table}_legacy_nokey");
+        if table_exists(conn, &legacy) {
+            // 中间态：旧行还在 legacy 表里 → 转存进现行表（若现行表也是旧形状，
+            // 随后的常规重建分支会补 instance_key；先原样并入，不丢行）。
+            let recover = if table == "unread_read_tombstones" {
+                format!(
+                    "INSERT OR IGNORE INTO {table} (tool_id, session_id, read_at)
+                     SELECT tool_id, session_id, read_at FROM {legacy};
+                     DROP TABLE {legacy};"
+                )
+            } else {
+                format!(
+                    "INSERT OR IGNORE INTO {table}
+                         (tool_id, session_id, project_name, title, last_message, turned_green_at, expires_at)
+                     SELECT tool_id, session_id, project_name, title, last_message, turned_green_at, expires_at
+                     FROM {legacy};
+                     DROP TABLE {legacy};"
+                )
+            };
+            if table_exists(conn, table) {
+                conn.execute_batch(&recover).map_err(|e| {
+                    format!(
+                        "MIGRATE_UNREAD_INSTANCE_KEY_FAIL: {table} 中间态收尾失败: {}",
+                        e
+                    )
+                })?;
+            } else {
+                // 现行表不存在（rename 后才死）→ 把 legacy 改回原名，走常规重建
+                conn.execute_batch(&format!("ALTER TABLE {legacy} RENAME TO {table};"))
+                    .map_err(|e| {
+                        format!(
+                            "MIGRATE_UNREAD_INSTANCE_KEY_FAIL: {table} 复原名失败: {}",
+                            e
+                        )
+                    })?;
+            }
+        }
+        if table_exists(conn, table) && !column_exists(conn, table, "instance_key") {
+            let tx = conn.unchecked_transaction().map_err(|e| {
+                format!(
+                    "MIGRATE_UNREAD_INSTANCE_KEY_FAIL: {table} 开事务失败: {}",
+                    e
+                )
+            })?;
+            let sql = if table == "unread_read_tombstones" {
+                format!(
+                    "ALTER TABLE {table} RENAME TO {table}_legacy_nokey;
+                     CREATE TABLE {table} (
+                         tool_id       TEXT NOT NULL,
+                         session_id    TEXT NOT NULL,
+                         instance_key  TEXT NOT NULL DEFAULT '',
+                         read_at       INTEGER NOT NULL,
+                         PRIMARY KEY (tool_id, session_id, instance_key)
+                     );
+                     INSERT INTO {table}
+                         (tool_id, session_id, instance_key, read_at)
+                     SELECT tool_id, session_id, '', read_at
+                     FROM {table}_legacy_nokey;
+                     DROP TABLE {table}_legacy_nokey;"
+                )
+            } else {
+                format!(
+                    "ALTER TABLE {table} RENAME TO {table}_legacy_nokey;
+                     CREATE TABLE {table} (
+                         tool_id          TEXT NOT NULL,
+                         session_id       TEXT NOT NULL,
+                         instance_key     TEXT NOT NULL DEFAULT '',
+                         project_name     TEXT NOT NULL DEFAULT '',
+                         title            TEXT,
+                         last_message     TEXT,
+                         turned_green_at  INTEGER NOT NULL,
+                         expires_at       INTEGER NOT NULL,
+                         PRIMARY KEY (tool_id, session_id, instance_key)
+                     );
+                     INSERT INTO {table}
+                         (tool_id, session_id, instance_key, project_name, title, last_message, turned_green_at, expires_at)
+                     SELECT tool_id, session_id, '', project_name, title, last_message, turned_green_at, expires_at
+                     FROM {table}_legacy_nokey;
+                     DROP TABLE {table}_legacy_nokey;"
+                )
+            };
+            tx.execute_batch(&sql).map_err(|e| {
+                format!("MIGRATE_UNREAD_INSTANCE_KEY_FAIL: {table} 重建失败: {}", e)
+            })?;
+            tx.commit().map_err(|e| {
+                format!("MIGRATE_UNREAD_INSTANCE_KEY_FAIL: {table} 提交失败: {}", e)
+            })?;
+            log::warn!("unread: {table} 已重建并补 instance_key（旧行归空串实例键）");
+        }
+    }
+
+    // DSH 归档按实例分开。旧行保留空键，不能据此推测其原实例。
+    if table_exists(conn, "session_archive")
+        && !column_exists(conn, "session_archive", "instance_key")
+    {
+        let rebuild = || -> rusqlite::Result<()> {
+            let tx = conn.unchecked_transaction()?;
+            tx.execute_batch(
+                "ALTER TABLE session_archive RENAME TO session_archive_legacy;
+                 CREATE TABLE session_archive (
+                     session_id TEXT NOT NULL,
+                     instance_key TEXT NOT NULL DEFAULT '',
+                     agent_type TEXT NOT NULL,
+                     project_path TEXT NOT NULL,
+                     project_name TEXT NOT NULL,
+                     title TEXT,
+                     last_status TEXT NOT NULL,
+                     first_seen TEXT NOT NULL,
+                     last_seen TEXT NOT NULL,
+                     updated_at TEXT NOT NULL,
+                     PRIMARY KEY (session_id, instance_key)
+                 );
+                 INSERT INTO session_archive
+                   (session_id, agent_type, project_path, project_name, title, last_status,
+                    first_seen, last_seen, updated_at)
+                 SELECT session_id, agent_type, project_path, project_name, title, last_status,
+                        first_seen, last_seen, updated_at
+                 FROM session_archive_legacy;
+                 DROP TABLE session_archive_legacy;",
+            )?;
+            tx.commit()
+        };
+        rebuild().map_err(|e| {
+            format!("MIGRATE_DSH_ARCHIVE_INSTANCE_KEY_FAIL: 迁移历史归档实例键失败: {e}")
+        })?;
+    }
+
+    // ---- DSH 动作账本（T09）：epoch/revision 由 INTEGER 改 TEXT ----
+    // 复审 Ma3：`CREATE TABLE IF NOT EXISTS` 不会改动已存在的表。早期原型（5e1b1e46
+    // ~ 273ea403 之间建过表的开发/狗粮机）的 `dsh_actions.epoch` 是 INTEGER——
+    // 写入超过 i64::MAX 的 u64 会被 SQLite 存成 REAL，随后按 TEXT 读会
+    // `InvalidColumnType` 让整行不可读。这里做形状探测 + 重建转存：
+    //   * 只在该表存在且 `epoch` 列声明类型不是 TEXT 时触发；
+    //   * 旧 INTEGER 值按十进制无损转成 TEXT（i64 范围内原值保真）；
+    //   * 表为空时直接重建（无数据风险）。
+    if column_exists(conn, "dsh_actions", "epoch") {
+        let needs_rebuild = conn
+            .prepare("PRAGMA table_info(dsh_actions)")
+            .and_then(|mut stmt| {
+                let rows = stmt.query_map([], |row| {
+                    Ok((row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+                })?;
+                let mut epoch_is_text = true;
+                for row in rows {
+                    let (name, decl) = row?;
+                    if name == "epoch" {
+                        epoch_is_text = decl.eq_ignore_ascii_case("TEXT");
+                    }
+                }
+                Ok(!epoch_is_text)
+            })
+            .unwrap_or(false);
+        if needs_rebuild {
+            conn.execute_batch(
+                "ALTER TABLE dsh_actions RENAME TO dsh_actions_legacy_epoch;
+                 CREATE TABLE dsh_actions (
+                     seq            INTEGER PRIMARY KEY AUTOINCREMENT,
+                     action_id      TEXT NOT NULL UNIQUE,
+                     device_id      TEXT NOT NULL,
+                     device_name    TEXT NOT NULL,
+                     host_id        TEXT NOT NULL,
+                     epoch          TEXT NOT NULL,
+                     session_id     TEXT NOT NULL,
+                     operation      TEXT NOT NULL,
+                     payload_hash   TEXT NOT NULL,
+                     state          TEXT NOT NULL,
+                     native_id      TEXT,
+                     reason_code    TEXT,
+                     evidence_json  TEXT,
+                     created_at_ms  INTEGER NOT NULL,
+                     updated_at_ms  INTEGER NOT NULL
+                 );
+                 INSERT INTO dsh_actions (seq, action_id, device_id, device_name, host_id,
+                     epoch, session_id, operation, payload_hash, state, native_id,
+                     reason_code, evidence_json, created_at_ms, updated_at_ms)
+                 SELECT seq, action_id, device_id, device_name, host_id,
+                     CAST(epoch AS TEXT), session_id, operation, payload_hash, state,
+                     native_id, reason_code, evidence_json, created_at_ms, updated_at_ms
+                 FROM dsh_actions_legacy_epoch;
+                 DROP TABLE dsh_actions_legacy_epoch;
+                 CREATE INDEX IF NOT EXISTS idx_dsh_actions_device_seq
+                     ON dsh_actions (device_id, seq DESC);
+                 CREATE INDEX IF NOT EXISTS idx_dsh_actions_state_seq
+                     ON dsh_actions (state, seq);",
+            )
+            .map_err(|e| {
+                format!("MIGRATE_DSH_EPOCH_TEXT_FAIL: 重建 dsh_actions 为 TEXT epoch 失败: {e}")
+            })?;
+            log::warn!("dsh: dsh_actions.epoch 由 INTEGER 迁移为 TEXT（u64 可逆存储）");
+        }
+    }
+    // T10：payload 本体列（排队消息自动推进的前提）。IF NOT EXISTS 幂等补列。
+    if column_exists(conn, "dsh_actions", "operation")
+        && !column_exists(conn, "dsh_actions", "payload_json")
+    {
+        conn.execute_batch("ALTER TABLE dsh_actions ADD COLUMN payload_json TEXT;")
+            .map_err(|e| format!("MIGRATE_DSH_PAYLOAD_JSON_FAIL: 补 payload_json 列失败: {e}"))?;
+    }
+    // P1-a/P2（第六轮复审）：载荷身份列——**事务化迁移**：ALTER 与回填同一事务，
+    // 中途失败整体回滚（列消失 → 下次启动重跑，不存在「列已存在但回填未完」的
+    // 悬挂态）；回填以「存在 NULL 行」为条件（幂等、可续跑）。
+    if column_exists(conn, "dsh_actions", "operation")
+        && column_exists(conn, "dsh_actions", "payload_json")
+    {
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| format!("MIGRATE_DSH_PAYLOAD_IDENTITY_FAIL: 开事务失败: {e}"))?;
+        let column_present = column_exists(&tx, "dsh_actions", "payload_identity");
+        if !column_present {
+            tx.execute_batch("ALTER TABLE dsh_actions ADD COLUMN payload_identity TEXT;")
+                .map_err(|e| {
+                    format!("MIGRATE_DSH_PAYLOAD_IDENTITY_FAIL: 补 payload_identity 列失败: {e}")
+                })?;
+        }
+        // 回填：Rust 侧算摘要（SQL 无 sha256）；以 NULL 行为驱动（幂等可续跑）。
+        let rows: Vec<(String, String)> = {
+            let mut stmt = tx
+                .prepare(
+                    "SELECT action_id, payload_json FROM dsh_actions \
+                     WHERE payload_identity IS NULL AND payload_json IS NOT NULL",
+                )
+                .map_err(|e| format!("MIGRATE_DSH_PAYLOAD_IDENTITY_FAIL: 读回填行失败: {e}"))?;
+            let rows = stmt
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .map_err(|e| format!("MIGRATE_DSH_PAYLOAD_IDENTITY_FAIL: 映射回填行失败: {e}"))?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("MIGRATE_DSH_PAYLOAD_IDENTITY_FAIL: 遍历回填行失败: {e}"))?
+        };
+        for (action_id, payload_json) in rows {
+            let identity =
+                crate::services::dsh_control::store::payload_identity_digest(&payload_json);
+            tx.execute(
+                "UPDATE dsh_actions SET payload_identity = ?1 WHERE action_id = ?2",
+                rusqlite::params![identity, action_id],
+            )
+            .map_err(|e| {
+                format!("MIGRATE_DSH_PAYLOAD_IDENTITY_FAIL: 回填 {action_id} 失败: {e}")
+            })?;
+        }
+        tx.commit()
+            .map_err(|e| format!("MIGRATE_DSH_PAYLOAD_IDENTITY_FAIL: 提交失败: {e}"))?;
+    }
+    // 复合过滤索引（复审 m3）：占用/队序查询按 (host, epoch, session, state) 命中，
+    // 旧库没有该索引——IF NOT EXISTS 幂等补建。
+    if column_exists(conn, "dsh_actions", "operation")
+        && !column_exists(conn, "dsh_actions", "send_acceptance")
+    {
+        conn.execute_batch("ALTER TABLE dsh_actions ADD COLUMN send_acceptance TEXT;")
+            .map_err(|e| {
+                format!("MIGRATE_DSH_SEND_ACCEPTANCE_FAIL: 添加 DSH 发送受理证据列失败: {e}")
+            })?;
+    }
+
+    if column_exists(conn, "dsh_actions", "session_id") {
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_dsh_actions_session_state \
+             ON dsh_actions (host_id, epoch, session_id, state);",
+        )
+        .map_err(|e| format!("MIGRATE_DSH_SESSION_INDEX_FAIL: 建占用索引失败: {e}"))?;
+    }
+    // `dsh_claims.epoch/revision` 同批改 TEXT；claims 是短期占用记录，旧形状无保留价值。
+    if column_exists(conn, "dsh_claims", "epoch") {
+        let claims_epoch_is_text = conn
+            .prepare("PRAGMA table_info(dsh_claims)")
+            .and_then(|mut stmt| {
+                let rows = stmt.query_map([], |row| {
+                    Ok((row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+                })?;
+                let mut is_text = true;
+                for row in rows {
+                    let (name, decl) = row?;
+                    if name == "epoch" {
+                        is_text = decl.eq_ignore_ascii_case("TEXT");
+                    }
+                }
+                Ok(is_text)
+            })
+            .unwrap_or(true);
+        if !claims_epoch_is_text {
+            conn.execute_batch(
+                "DROP TABLE dsh_claims;
+                 CREATE TABLE dsh_claims (
+                     claim_id      TEXT PRIMARY KEY,
+                     action_id     TEXT NOT NULL UNIQUE,
+                     epoch         TEXT NOT NULL,
+                     client_id     TEXT NOT NULL,
+                     event_id      TEXT NOT NULL,
+                     revision      TEXT NOT NULL,
+                     claimed_at_ms INTEGER NOT NULL
+                 );
+                 CREATE INDEX IF NOT EXISTS idx_dsh_claims_event
+                     ON dsh_claims (epoch, event_id);",
+            )
+            .map_err(|e| format!("MIGRATE_DSH_CLAIMS_TEXT_FAIL: 重建 dsh_claims 失败: {e}"))?;
+            log::warn!("dsh: dsh_claims epoch/revision 迁移为 TEXT");
+        }
+    }
     let claims_exists = conn
         .prepare("SELECT 1 FROM codex_interaction_claims LIMIT 0")
         .is_ok();

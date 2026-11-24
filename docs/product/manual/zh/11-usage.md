@@ -58,7 +58,7 @@
 
 ## 输出速度（区间三种口径）
 
-![输出速度看板](img/output-speed-board.png)
+![输出速度看板](../img/output-speed-board.png)
 
 上图为旧版布局示意；当前页面另有「分词器估算」标签，具体口径见下文。
 

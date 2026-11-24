@@ -17,7 +17,7 @@ import { ArrowLeft, Crosshair, X } from "lucide-react";
 import i18n from "@/i18n";
 import PreviewModeSwitcher, { type PreviewMode } from "./PreviewModeSwitcher";
 import { fileKindOf } from "./FilePanel";
-import { ApiError, fetchFile, type FilePayload } from "./api";
+import { ApiError, fetchDshMedia, fetchFile, type FilePayload } from "./api";
 import { etaRemainingText, formatBytes, transferRateBps, type TransferSample } from "./board-logic";
 import type { Session } from "@/types/session";
 
@@ -26,6 +26,7 @@ interface FilePreviewProps {
   session: Session;
   /** 待预览的文件路径（绝对或相对项目目录，端点侧 read_file_safe 解析） */
   filePath: string;
+  mediaRefId?: string;
   /** 呈现形态：split=上对话下文件 / split-h=左对话右文件 / fullscreen=全屏浮层
    *  （只影响容器布局语义，布局本身由 SessionDetail 承担） */
   mode: PreviewMode;
@@ -109,6 +110,7 @@ function highlightText(content: string, filePath: string): string {
 export default function FilePreview({
   session,
   filePath,
+  mediaRefId,
   mode,
   onModeChange,
   onBack,
@@ -179,18 +181,17 @@ export default function FilePreview({
     setState({ phase: "loading" });
     setProgress(null); // 换文件/重试先清上一份进度（UI 不得串场）
     firstSampleRef.current = null;
-    fetchFile(
-      session.id,
-      filePath,
-      (loaded, total) => {
-        if (!alive) return;
-        const atMs = Date.now(); // 事件回调里取样（非渲染期），供剩余时间估算
-        const first = firstSampleRef.current ?? { loaded, atMs };
-        firstSampleRef.current = first;
-        setProgress({ loaded, total, rateBps: transferRateBps(first, { loaded, atMs }) });
-      },
-      ctrl.signal
-    )
+    const onProgress = (loaded: number, total: number | null) => {
+      if (!alive) return;
+      const atMs = Date.now();
+      const first = firstSampleRef.current ?? { loaded, atMs };
+      firstSampleRef.current = first;
+      setProgress({ loaded, total, rateBps: transferRateBps(first, { loaded, atMs }) });
+    };
+    const read = mediaRefId
+      ? fetchDshMedia(session.dshInstanceId, session.id, mediaRefId, onProgress, ctrl.signal)
+      : fetchFile(session.id, filePath, onProgress, ctrl.signal, session.dshInstanceId);
+    read
       .then((p) => {
         if (!alive) {
           if (p.kind === "image") URL.revokeObjectURL(p.url); // 迟到的图片响应直接释放
@@ -213,7 +214,7 @@ export default function FilePreview({
       ctrl.abort();
       if (objectUrl) URL.revokeObjectURL(objectUrl);
     };
-  }, [session.id, filePath, retryTick, refreshKey]);
+  }, [session.id, session.dshInstanceId, filePath, mediaRefId, retryTick, refreshKey]);
 
   // 路径末段作标题（分隔符双态：win 反斜杠 / unix 斜杠）
   const baseName = filePath.split(/[\\/]/).pop() || filePath;
@@ -230,6 +231,8 @@ export default function FilePreview({
     // 403 原因分诊文案走 i18n 键（M5 双语）；未列原因保留兜底。
     // D22（2026-11-12 note §三/§六）：sensitive 原因码已随预览目录准入取消退役，
     // 后端不再产生该分支（旧服务端残留值走 errUnpreviewable 兜底）
+    // DSH 原生媒体：对象已不可读（被替换/删除/换代）——与通用「不可预览」区分开。
+    if (errorReason === "media_unavailable") return i18n.t("mobile.preview.dshMediaUnavailable");
     if (errorReason === "too_large") return i18n.t("mobile.preview.errTooLarge");
     if (errorReason === "not_found") return i18n.t("mobile.preview.errNotFound");
     if (errorReason === "not_file") return i18n.t("mobile.preview.errNotFile");

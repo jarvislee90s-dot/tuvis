@@ -227,11 +227,15 @@ pub fn tmux_enter_args(target: &str) -> Vec<String> {
         .collect()
 }
 
-/// 构造 tmux 单键参数："enter"→Enter 键名；"esc"→Escape 键名；其余一律 `-l` 字面。
+/// 构造 tmux 单键参数：Enter、Escape 和 Shift+Tab 走键名；其余走 `-l` 字面。
 pub fn tmux_key_args(target: &str, key: &str) -> Vec<String> {
     match key {
         "enter" => tmux_enter_args(target),
         "esc" => ["send-keys", "-t", target, "Escape"]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+        "shift+tab" => ["send-keys", "-t", target, "BTab"]
             .into_iter()
             .map(str::to_string)
             .collect(),
@@ -310,8 +314,7 @@ pub fn iterm_write_script(tty_suffix: &str, text: &str) -> String {
     )
 }
 
-/// 构造 iTerm2 单键脚本：enter→`keystroke return`；esc→`key code 53`；
-/// 其余（单字符/未知多字符）→`keystroke "<key>"` 字面（内部完成转义）。
+/// 构造 iTerm2 单键脚本，按 [`key_action_line`] 转换按键。
 /// tty 匹配为**全路径相等**（P2-3，同 [`iterm_write_script`]）。
 pub fn iterm_send_key_script(tty_suffix: &str, key: &str) -> String {
     format!(
@@ -409,12 +412,13 @@ pub fn terminal_send_key_script(tty_suffix: &str, key: &str) -> String {
     )
 }
 
-/// 单键动作行（iTerm2/Terminal 通用派发）：enter→`keystroke return`；
-/// esc→`key code 53`；其余→`keystroke "<key>"` 字面（内部完成转义）。
+/// 单键动作行（iTerm2/Terminal 通用派发）：Enter、Esc 和 Shift+Tab 走按键事件；
+/// 其余走 `keystroke "<key>"` 字面（内部完成转义）。
 fn key_action_line(key: &str) -> String {
     match key {
         "enter" => "keystroke return".to_string(),
         "esc" => "key code 53".to_string(),
+        "shift+tab" => "key code 48 using {shift down}".to_string(),
         _ => format!("keystroke \"{}\"", applescript_escape(key)),
     }
 }
@@ -557,7 +561,7 @@ impl Injector for RealInjector {
         let suffix = tty.rsplit('/').next().unwrap_or(&tty);
         let mut errs: Vec<String> = Vec::new();
 
-        // ① tmux：单键参数派发（enter/esc 键名，其余字面）
+        // ① tmux：单键参数派发（已知控制键走键名）
         if let Some(target) = find_tmux_pane(&tty) {
             match run_tmux(&tmux_key_args(&target, key)) {
                 Ok(()) => return Ok(()),
@@ -707,6 +711,10 @@ mod tests {
             tmux_key_args("t", "enter"),
             vec!["send-keys", "-t", "t", "Enter"]
         );
+        assert_eq!(
+            tmux_key_args("t", "shift+tab"),
+            vec!["send-keys", "-t", "t", "BTab"]
+        );
         // 未知一律字面
         assert_eq!(
             tmux_key_args("t", "bad!"),
@@ -735,6 +743,9 @@ mod tests {
         assert!(s.contains(r#"keystroke "1""#));
         // esc 键码
         assert!(iterm_send_key_script("ttys005", "esc").contains("key code 53"));
+        let shift_tab = iterm_send_key_script("ttys005", "shift+tab");
+        assert!(shift_tab.contains("key code 48 using {shift down}"));
+        assert!(!shift_tab.contains(r#"keystroke "shift+tab""#));
     }
 
     #[test]
@@ -752,6 +763,9 @@ mod tests {
         assert!(s.contains(r#"keystroke "1""#));
         assert!(terminal_send_key_script("ttys005", "enter").contains("keystroke return"));
         assert!(terminal_send_key_script("ttys005", "esc").contains("key code 53"));
+        let shift_tab = terminal_send_key_script("ttys005", "shift+tab");
+        assert!(shift_tab.contains("key code 48 using {shift down}"));
+        assert!(!shift_tab.contains(r#"keystroke "shift+tab""#));
     }
 
     #[test]

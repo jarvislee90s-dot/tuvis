@@ -47,7 +47,13 @@ export default function App() {
   const handleSessionsChanged = useCallback((sessions: Session[]) => {
     setSelected((prev) => {
       if (prev === null) return prev;
-      const live = sessions.find((s) => s.agentType === prev.agentType && s.id === prev.id);
+      const live = sessions.find(
+        (s) =>
+          s.agentType === prev.agentType &&
+          s.id === prev.id &&
+          (s.agentType !== "dsh" ||
+            (prev.dshInstanceId !== undefined && s.dshInstanceId === prev.dshInstanceId))
+      );
       if (live === undefined || shallowEqualSession(live, prev)) return prev;
       return live;
     });
@@ -71,7 +77,13 @@ export default function App() {
           />
         </div>
       )}
-      {paired === true && selected && <SessionDetail session={selected} onBack={onBackToBoard} />}
+      {paired === true && selected && (
+        <SessionDetail
+          key={`${selected.agentType}:${selected.dshInstanceId ?? ""}:${selected.id}`}
+          session={selected}
+          onBack={onBackToBoard}
+        />
+      )}
       {paired === true && historyOpen && !archiveSelected && (
         <ArchiveBoard
           onBack={() => setHistoryOpen(false)}

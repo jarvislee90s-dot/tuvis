@@ -1,0 +1,28 @@
+{
+  "evidence": "实际 Desktop 测试会话的脱敏结构；标识符、时间和路径已替换，消息正文未保留",
+  "header": {
+    "type": "session",
+    "version": 4,
+    "id": "<child-id>",
+    "createdAt": "<redacted>",
+    "cwd": "<test-cwd>",
+    "parentSession": "session-<parent-id>",
+    "isSeeded": false,
+    "origin": "subagent",
+    "delegationDepth": 1,
+    "agentPreset": "standard"
+  },
+  "observedEventTypes": [
+    "subagent/descriptor",
+    "sandbox/mode",
+    "approval/policy",
+    "turn/start",
+    "step/start",
+    "user/message",
+    "assistant/message",
+    "tool/call",
+    "tool/result",
+    "step/end"
+  ],
+  "packageSha256": "8dad52f295bdbe9fa71948fdf38ac2ce3c910213d3b89c37174b2af77db9fb31"
+}

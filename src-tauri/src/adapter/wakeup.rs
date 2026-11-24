@@ -245,6 +245,14 @@ struct EventDirectorySnapshot {
     uncertain: bool,
 }
 
+/// 快照预算：生产用 `walk_budget::WAKEUP_SNAPSHOT_BUDGET`（9s）。NEEDS_FIX
+/// Important-4：不设任何全局测试覆写——预算与 walker 都走按调用注入
+/// （`event_directory_snapshot_scoped` 的 budget/walk 参数），杜绝跨用例互抢。
+/// 超时返回 uncertain 快照——本拍按「不可证明」处理（清理不删文件）。
+fn snapshot_budget() -> Duration {
+    crate::monitor::walk_budget::WAKEUP_SNAPSHOT_BUDGET
+}
+
 fn event_file_stamp(
     path: &Path,
     identity_of: &dyn Fn(&std::fs::File, &std::fs::Metadata) -> Option<FileIdentity>,
@@ -265,9 +273,64 @@ fn event_file_stamp(
     })
 }
 
+/// 事件目录快照（发现②加固壳，2026-11-16 真机证据：wakeup 快照线 readdir 楔死
+/// getdirentries → 清理拍/签名折叠全停）：遍历装进请求级死线（9s 口径，见
+/// [`crate::monitor::walk_budget::WAKEUP_SNAPSHOT_BUDGET`]）。超时/Busy → 返回
+/// uncertain 快照——本拍按「不可证明」处理（保守语义：清理不删文件、不发错误
+/// 唤醒信号）；卡住的遍历线程 detached 保留（内核操作不可中断，自愈完成后
+/// 自行释放计数）。
 fn event_directory_snapshot(
     dir: &Path,
-    identity_of: &dyn Fn(&std::fs::File, &std::fs::Metadata) -> Option<FileIdentity>,
+    identity_of: &'static (dyn Fn(&std::fs::File, &std::fs::Metadata) -> Option<FileIdentity>
+                  + Send
+                  + Sync),
+) -> EventDirectorySnapshot {
+    event_directory_snapshot_scoped(dir, snapshot_budget(), move |d| {
+        event_directory_snapshot_blocking(d, identity_of)
+    })
+}
+
+/// 单测用：预算与 walker 均按调用注入（NEEDS_FIX Important-4——取消全局预算/
+/// walker 覆写缝，杜绝跨用例互抢/泄漏毒害并行测试）。
+#[cfg(test)]
+fn event_directory_snapshot_scoped_for_test(
+    dir: &Path,
+    budget: Duration,
+    walk: impl Fn(&Path) -> EventDirectorySnapshot + Send + 'static,
+) -> EventDirectorySnapshot {
+    event_directory_snapshot_scoped(dir, budget, walk)
+}
+
+/// 快照遍历内核（预算与遍历体参数化；遍历体默认 = 真实目录遍历）。
+fn event_directory_snapshot_scoped(
+    dir: &Path,
+    budget: Duration,
+    walk: impl Fn(&Path) -> EventDirectorySnapshot + Send + 'static,
+) -> EventDirectorySnapshot {
+    let dir = dir.to_path_buf();
+    match crate::monitor::walk_budget::run_bounded("wakeup-snapshot", budget, move || walk(&dir)) {
+        Ok(snapshot) => snapshot,
+        // panic 保持原语义：载荷原样 resume（快照层的既有失败形态，不静默吞）。
+        Err(crate::monitor::walk_budget::WalkError::Panicked(payload)) => {
+            std::panic::resume_unwind(payload)
+        }
+        Err(failure) => {
+            log::warn!(
+                "wakeup: 事件目录快照遍历未按时完成（{failure}），本拍按 uncertain 继续（清理不删文件）"
+            );
+            EventDirectorySnapshot {
+                directory_stamp: None,
+                uncertain: true,
+                ..EventDirectorySnapshot::default()
+            }
+        }
+    }
+}
+
+/// 快照遍历体（原实现原样搬移；在预算线程内执行——预算判的就是本函数耗时）。
+fn event_directory_snapshot_blocking(
+    dir: &Path,
+    identity_of: &(dyn Fn(&std::fs::File, &std::fs::Metadata) -> Option<FileIdentity> + Send),
 ) -> EventDirectorySnapshot {
     let directory_stamp = stamp(dir);
     let mut snapshot = EventDirectorySnapshot {
@@ -475,7 +538,11 @@ fn cleanup_old_events_with(
     mut after_enumeration: impl FnMut(),
     mut after_candidate_stat: impl FnMut(&Path),
     mut after_quarantine_move: impl FnMut(&Path, &Path),
-    identity_of: &dyn Fn(&std::fs::File, &std::fs::Metadata) -> Option<FileIdentity>,
+    // 'static + Send：before/after 快照经预算线程遍历（发现②加固）；全部调用面
+    // 传的都是顶层 fn item（`&identity_from_file`），自动满足。
+    identity_of: &'static (dyn Fn(&std::fs::File, &std::fs::Metadata) -> Option<FileIdentity>
+                  + Send
+                  + Sync),
 ) -> CleanupReport {
     let before = event_directory_snapshot(dir, identity_of);
     let mut report = CleanupReport {
@@ -658,6 +725,8 @@ mod tests {
             flap_from_subagent_activity: false,
             last_activity_at: String::new(),
             unread_turned_green_at_ms: None,
+            dsh_instance_id: None,
+            dsh_subagent: None,
             pid: 1,
             cpu_usage: 0.0,
             active_subagent_count: 0,
@@ -892,6 +961,48 @@ mod tests {
         assert!(
             baseline.observe(&signature_with_fixed(dir.path(), &only_b, &[])),
             "仍在集合内的 b 文件变化必须触发"
+        );
+    }
+
+    /// 发现②预算回归 + NEEDS_FIX Important-4 隔离：快照遍历超预算必须按时放弃并
+    /// 返回 uncertain（「不可证明」），且快走基线不受影响（wakeup 线程不死）。
+    /// 预算与 walker 均**按调用注入**（scoped_for_test）——无任何全局覆写缝，
+    /// 不持锁也不与其他测试互抢。
+    #[test]
+    fn event_directory_snapshot_times_out_as_uncertain_within_budget() {
+        // NEEDS_FIX Important-4：接线测试共用生产容量计数器 → 统一隔离锁串行
+        // （walker/预算已按调用注入，无全局覆写缝）
+        let _walk_isolation = crate::monitor::walk_budget::walk_test_guard();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("e.json"), br#"{"event":"Stop"}"#).unwrap();
+        // 快走基线：真实遍历返回在场文件（预算参数注入 5s）
+        let fast =
+            event_directory_snapshot_scoped_for_test(dir.path(), Duration::from_secs(5), |d| {
+                event_directory_snapshot_blocking(d, &identity_from_file)
+            });
+        assert!(!fast.uncertain, "快走基线必须正常遍历");
+        assert_eq!(fast.files.len(), 1);
+
+        // 慢遍历（1.2s）+ 150ms 预算：必须按时放弃并返回 uncertain（walker 按调用注入）
+        let slow = |_d: &Path| {
+            std::thread::sleep(Duration::from_millis(1200));
+            EventDirectorySnapshot::default()
+        };
+        let started = std::time::Instant::now();
+        let snap =
+            event_directory_snapshot_scoped_for_test(dir.path(), Duration::from_millis(150), slow);
+        let elapsed = started.elapsed();
+        assert!(
+            snap.uncertain,
+            "超时快照必须按「不可证明」降级（uncertain）"
+        );
+        assert!(
+            snap.files.is_empty(),
+            "超时快照不得携带任何文件（未看到的 = 未证明）"
+        );
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "超时返回必须有界（实际 {elapsed:?}）"
         );
     }
 

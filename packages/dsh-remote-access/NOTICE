@@ -1,0 +1,22 @@
+NOTICE
+
+Copyright (c) 2026 Tuvis contributors
+This package is licensed under the MIT License (see LICENSE).
+
+1. Original code. All source files in src/ and test/ are original works
+   written for the Tuvis project. This package incorporates no source code
+   from any Apache-2.0 licensed third party, and therefore carries no
+   Apache-2.0 attribution obligation.
+
+2. Interface shape, not code. The package manifest fields under "dsh"
+   (engines / bundle.patch / client.inject / client.platform) and the
+   cordis.patch.yml insert form follow the public, factual interface that
+   DeepSeek Harness (DSH) documents and consumes for external plugin bundles.
+   Interface shapes and field names are not copyrightable; no DSH or
+   third-party implementation code was copied, derived, or embedded.
+
+3. Peer dependencies, not distribution. @deepseek-ai/cordis, @deepseek-ai/dsh,
+   and the other @deepseek-ai/* packages referenced in peerDependencies or
+   devDependencies are NOT bundled or redistributed in the release artifact
+   (resources/dsh/remote-access.tgz contains no node_modules). They are
+   provided at runtime by the official DSH host under their own licenses.

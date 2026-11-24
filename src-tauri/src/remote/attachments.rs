@@ -13,10 +13,17 @@
 
 use std::path::{Path, PathBuf};
 
+#[path = "attachments/anchored.rs"]
+mod anchored;
+
 /// 附件目录名（项目根下、点前缀隐藏目录）
 pub const ATTACHMENT_DIR_NAME: &str = ".tuvis-attachments";
-/// 单附件字节上限（20MB；H07 D1 起由上传端点 handler 的限长读取单点执行，
-/// 超限响应契约 JSON 413 体）
+/// 暂存目录名（目标 1 暂存方案）：`<cwd>/.tuvis-attachments/.staging/`——
+/// 同卷、git 排除与数据管理清理被父目录规则覆盖、不进任何远程列表或
+/// 消息标记（文件面板只认消息里显式标记的路径）。暂存文件在发布临界区
+/// hard_link 后即删；拒绝/失败/取消路径同样即刻清理。
+pub const STAGING_DIR_NAME: &str = ".staging";
+/// 单附件字节上限（20MB；端点同时显式 DefaultBodyLimit 硬兜底）
 pub const MAX_ATTACHMENT_BYTES: usize = 20 * 1024 * 1024;
 /// git/info/exclude 里追加的排除行（尾斜杠 = 目录整体排除）
 pub const GIT_EXCLUDE_LINE: &str = ".tuvis-attachments/";
@@ -141,20 +148,8 @@ pub fn ensure_git_exclude(cwd: &Path, line: &str) {
 /// 括号在消毒白名单内，标记路径 `path="X"` 引用安全。原子独占创建并持有句柄。
 #[cfg(any(test, not(unix)))]
 fn unique_target(dir: &Path, base: &str) -> std::io::Result<(PathBuf, std::fs::File)> {
-    let stem = Path::new(base)
-        .file_stem()
-        .unwrap_or_default()
-        .to_string_lossy();
-    let ext = Path::new(base)
-        .extension()
-        .map(|s| format!(".{}", s.to_string_lossy()))
-        .unwrap_or_default();
     for n in 0..=u32::MAX {
-        let candidate = dir.join(if n == 0 {
-            base.to_string()
-        } else {
-            format!("{stem} ({n}){ext}")
-        });
+        let candidate = dir.join(target_name(base, n));
         #[cfg(test)]
         tests::before_create();
         match std::fs::OpenOptions::new()
@@ -170,6 +165,71 @@ fn unique_target(dir: &Path, base: &str) -> std::io::Result<(PathBuf, std::fs::F
     Err(std::io::Error::other("attachment name space exhausted"))
 }
 
+/// 括号在消毒白名单内，标记路径 `path="X"` 引用安全。纯函数。
+fn target_name(base: &str, n: u32) -> String {
+    if n == 0 {
+        return base.to_string();
+    }
+    let stem = Path::new(base)
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy();
+    let ext = Path::new(base)
+        .extension()
+        .map(|s| format!(".{}", s.to_string_lossy()))
+        .unwrap_or_default();
+    format!("{stem} ({n}){ext}")
+}
+
+/// 测试专用：按项目目录暂停在正式文件创建前，供关闭竞争用例使用。
+#[cfg(test)]
+type BeforePublishHook = Option<(PathBuf, std::sync::Arc<dyn Fn() + Send + Sync>)>;
+#[cfg(test)]
+pub(crate) static TEST_BEFORE_ATTACHMENT_PUBLISH: std::sync::Mutex<BeforePublishHook> =
+    std::sync::Mutex::new(None);
+/// 测试专用：按项目目录暂停在**发布临界区前**（预检通过、暂存写入完成后）
+/// ——比 TEST_BEFORE_ATTACHMENT_PUBLISH 更晚的暂停窗（预检**已通过**），
+/// 供「预检通过 → 发布完成之间关闭/重开/切走落地」竞争用例使用。
+#[cfg(test)]
+pub(crate) static TEST_BEFORE_ATTACHMENT_COMMIT: std::sync::Mutex<BeforePublishHook> =
+    std::sync::Mutex::new(None);
+
+/// 发布点拒绝（目标 1 暂存方案）：发布临界区与预检的拒绝来源。
+#[derive(Debug)]
+pub enum PublishRefusal {
+    /// 实例「正在关闭」（关闭首步旗标；预检或临界区内命中 → 正式文件从未
+    /// 出现，暂存已清理）。
+    InstanceClosing,
+    /// 受理后代次失配：上传入口受理时捕获的实例代次 ≠ 发布临界区内当前
+    /// 代次——期间关闭落地过、关闭+重开完整周期推进过、或实例被切走
+    /// （切走推进源实例代次）。旗标可能已退场（重开后），但旧上传不得按
+    /// **新开关状态**写盘。响应与 InstanceClosing 同族（409 + 机器码）。
+    StaleUploadGeneration,
+    /// 进程内选择镜像指向别的实例（翻转落盘后到达的旧上传）。
+    InstanceSwitched,
+    /// 开关执行门拒绝（持久化开关记录不在开启窗口；携带门的原始错误）。
+    SwitchGate(crate::services::dsh_control::error::DshError),
+}
+
+/// 附件写入结局（IO 失败与发布点拒绝分开——调用方各自映射）。
+#[derive(Debug)]
+pub enum AttachmentWriteError {
+    /// 文件系统失败。
+    Io(std::io::Error),
+    /// 发布点复核拒绝（正式文件未创建）。
+    Refused(PublishRefusal),
+}
+
+impl AttachmentWriteError {
+    /// io 错误类别（既有调用面/测试按 kind 断言时用；拒绝面无 io kind）。
+    pub fn io_kind(&self) -> Option<std::io::ErrorKind> {
+        match self {
+            AttachmentWriteError::Io(e) => Some(e.kind()),
+            AttachmentWriteError::Refused(_) => None,
+        }
+    }
+}
+
 // 失败也不删除路径：其他请求只能创建新路径；避免清理与用户目录删除/重建竞争时
 // unlink 到另一个上传。未完成的文件没有成功回执，不会进入手机发送意图。
 #[cfg(any(test, not(unix)))]
@@ -180,6 +240,318 @@ fn write_owned(
 ) -> std::io::Result<PathBuf> {
     write(&mut file)?;
     Ok(path)
+}
+
+impl std::fmt::Display for AttachmentWriteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AttachmentWriteError::Io(e) => write!(f, "attachment io error: {e}"),
+            AttachmentWriteError::Refused(PublishRefusal::InstanceClosing) => {
+                write!(f, "attachment publish refused: instance is closing")
+            }
+            AttachmentWriteError::Refused(PublishRefusal::StaleUploadGeneration) => {
+                write!(
+                    f,
+                    "attachment publish refused: stale upload generation (instance lifecycle advanced since acceptance)"
+                )
+            }
+            AttachmentWriteError::Refused(PublishRefusal::InstanceSwitched) => {
+                write!(
+                    f,
+                    "attachment publish refused: instance switched since acceptance"
+                )
+            }
+            AttachmentWriteError::Refused(PublishRefusal::SwitchGate(e)) => {
+                write!(f, "attachment publish refused: switch gate ({})", e.code)
+            }
+        }
+    }
+}
+
+impl std::error::Error for AttachmentWriteError {}
+
+impl From<std::io::Error> for AttachmentWriteError {
+    fn from(e: std::io::Error) -> Self {
+        AttachmentWriteError::Io(e)
+    }
+}
+
+/// DSH 落盘：发布预检 →
+/// **暂存写入**（同卷隐藏目录，临界区外完成大文件 IO）→ **发布临界区**
+/// （代次复核 + 选择镜像复核 + 原子不覆盖发布，与关闭注册表同一次加锁）
+/// → 锁外尽力维护项目内 Git 排除 → 返回绝对路径。拒绝/失败不更新 Git 排除。
+///
+/// `publish_check`：预检闭包（生产 = 开关执行门盘读；None = 不复核）。
+/// Send+Sync 界限使本函数可直接进 spawn_blocking 写任务。
+///
+/// `claim`：发布认领 `Some((实例 id, 受理代次))`——受理时核验并捕获的目标
+/// （目标 1：受理保留已核验实例与代次，写任务沿用，无二次解析）。发布走
+/// 暂存+临界区；`None` = 非 DSH 路径（本地数据管理面），直接按原始名创建
+/// （行为与暂存方案之前一致），跳过全部实例复核。
+///
+/// 暂存位置：`<cwd>/.tuvis-attachments/.staging/`——同卷（rename/hard_link
+/// 不跨设备）、git 排除被 `.tuvis-attachments/` 行覆盖、数据管理清理覆盖、
+/// 且不进任何远程列表/消息标记（文件面板只认消息里显式标记的路径）。
+pub fn write_dsh_attachment(
+    cwd: &Path,
+    session_id: &str,
+    raw_name: &str,
+    bytes: &[u8],
+    publish_check: Option<&(dyn Fn() -> Option<PublishRefusal> + Send + Sync)>,
+    claim: Option<(&str, u64)>,
+) -> Result<PathBuf, AttachmentWriteError> {
+    write_attachment_with_cancellation(
+        cwd,
+        session_id,
+        raw_name,
+        bytes,
+        publish_check,
+        claim,
+        AttachmentWriteContext::default(),
+    )
+}
+
+#[derive(Default)]
+pub(super) struct AttachmentWriteContext<'a> {
+    pub(super) cancelled: Option<&'a std::sync::atomic::AtomicBool>,
+    pub(super) selection_revision: Option<u64>,
+    #[cfg(unix)]
+    pub(super) protected_roots: Option<&'a super::files::ProtectedFileRoots>,
+}
+
+pub(super) fn write_attachment_with_cancellation(
+    cwd: &Path,
+    session_id: &str,
+    raw_name: &str,
+    bytes: &[u8],
+    publish_check: Option<&(dyn Fn() -> Option<PublishRefusal> + Send + Sync)>,
+    claim: Option<(&str, u64)>,
+    context: AttachmentWriteContext<'_>,
+) -> Result<PathBuf, AttachmentWriteError> {
+    use std::io::{Error, ErrorKind, Write};
+    use std::path::Component;
+
+    if !matches!(
+        Path::new(session_id)
+            .components()
+            .collect::<Vec<_>>()
+            .as_slice(),
+        [Component::Normal(_)]
+    ) || session_id.contains('\\')
+        || session_id.contains("..")
+        || session_id.chars().any(char::is_whitespace)
+    {
+        return Err(AttachmentWriteError::Io(Error::new(
+            ErrorKind::InvalidInput,
+            "invalid session id",
+        )));
+    }
+    let root = std::fs::canonicalize(cwd).map_err(AttachmentWriteError::Io)?;
+    let legacy_dir = if claim.is_none() {
+        let path = legacy_directory(&root, session_id)?;
+        ensure_git_exclude(&root, GIT_EXCLUDE_LINE);
+        Some(path)
+    } else {
+        None
+    };
+    #[cfg(test)]
+    {
+        let pause = TEST_BEFORE_ATTACHMENT_PUBLISH
+            .lock()
+            .unwrap()
+            .as_ref()
+            .filter(|(project, _)| project == &root)
+            .map(|(_, pause)| std::sync::Arc::clone(pause));
+        if let Some(pause) = pause {
+            pause();
+        }
+    }
+    // 发布预检（临界区外的第一道复核）：入口检查与写任务之间的翻转在此收口。
+    // 开关执行门的盘读只在这里（临界区锁外）——临界区只做内存复核 + 原子
+    // 发布（本实例的 disable/enable 分别经由关闭旗标/代次推进被临界区捕获）。
+    if let Some(check) = publish_check {
+        if let Some(refusal) = check() {
+            return Err(AttachmentWriteError::Refused(refusal));
+        }
+    }
+    let Some((instance_id, accepted_generation)) = claim else {
+        // 非 DSH 路径（本地数据管理面）：无发布语义，按原始名直接创建
+        // （同名追加序号不覆盖），行为与暂存方案之前完全一致。
+        let dir = legacy_dir.expect("legacy upload directory was verified");
+        let base = sanitize_file_name(raw_name);
+        for n in 0..=u32::MAX {
+            let path = dir.join(target_name(&base, n));
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(mut file) => {
+                    file.write_all(bytes).map_err(AttachmentWriteError::Io)?;
+                    return Ok(attachment_dir(cwd, session_id).join(target_name(&base, n)));
+                }
+                Err(e) if e.kind() == ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(AttachmentWriteError::Io(e)),
+            }
+        }
+        return Err(AttachmentWriteError::Io(Error::new(
+            ErrorKind::AlreadyExists,
+            "attachment names exhausted",
+        )));
+    };
+    // 目录校验、正文写入和清理用同一组句柄，正文不占用关闭锁。
+    let check_cancellation = || {
+        if context
+            .cancelled
+            .is_some_and(|cancelled| cancelled.load(std::sync::atomic::Ordering::SeqCst))
+        {
+            return Err(Error::new(
+                ErrorKind::Interrupted,
+                "attachment request cancelled",
+            ));
+        }
+        Ok(())
+    };
+    check_cancellation()?;
+    let directories = anchored::Directories::open(&root, session_id)?;
+    let mut staged = directories.stage()?;
+    staged.file.write_all(bytes)?;
+    #[cfg(test)]
+    {
+        let pause = TEST_BEFORE_ATTACHMENT_COMMIT
+            .lock()
+            .unwrap()
+            .as_ref()
+            .filter(|(project, _)| project == &root)
+            .map(|(_, pause)| std::sync::Arc::clone(pause));
+        if let Some(pause) = pause {
+            pause();
+        }
+    }
+    // 拒绝已替换的目录。发布仍通过原句柄，校验之后的路径变化无法改变目标。
+    let permit = if context.selection_revision.is_some() {
+        Some(
+            crate::services::dsh_control::production::try_commit_permit().ok_or(
+                AttachmentWriteError::Refused(PublishRefusal::InstanceSwitched),
+            )?,
+        )
+    } else {
+        None
+    };
+    let publish_out = crate::services::dsh_control::production::publish_under_upload_admission(
+        instance_id,
+        accepted_generation,
+        context.selection_revision,
+        || -> Result<String, Error> {
+            directories.verify()?;
+            let base = sanitize_file_name(raw_name);
+            for n in 0..=u32::MAX {
+                let name = target_name(&base, n);
+                check_cancellation()?;
+                match staged.publish(&name) {
+                    Ok(()) => return Ok(name),
+                    Err(e) if e.kind() == ErrorKind::AlreadyExists => continue,
+                    Err(e) => return Err(e),
+                }
+            }
+            Err(Error::new(
+                ErrorKind::AlreadyExists,
+                "attachment names exhausted",
+            ))
+        },
+    );
+    drop(permit);
+    match publish_out {
+        Ok(Ok(name)) => {
+            // 正式文件已经可见，清理错误不能把成功发布报成失败。
+            if let Err(error) = staged.cleanup() {
+                log::warn!("published attachment; staging cleanup failed: {error}");
+            }
+            #[cfg(unix)]
+            if let Some(Ok(roots)) = context.protected_roots.map(|get| get()) {
+                let exclude = root.join(".git/info/exclude");
+                if !super::files::protected_attachment_metadata_path(&exclude, &roots) {
+                    if let Err(error) = directories.append_git_exclude(GIT_EXCLUDE_LINE) {
+                        if error.kind() != ErrorKind::NotFound {
+                            log::debug!("skipped attachment Git exclude: {:?}", error.kind());
+                        }
+                    }
+                }
+            }
+            Ok(attachment_dir(cwd, session_id).join(name))
+        }
+        Ok(Err(error)) => Err(AttachmentWriteError::Io(error)),
+        Err(decision) => {
+            use crate::services::dsh_control::production::PublishDecisionError;
+            Err(AttachmentWriteError::Refused(match decision {
+                PublishDecisionError::InstanceClosing => PublishRefusal::InstanceClosing,
+                PublishDecisionError::StaleUploadGeneration => {
+                    PublishRefusal::StaleUploadGeneration
+                }
+                PublishDecisionError::InstanceSwitched => PublishRefusal::InstanceSwitched,
+            }))
+        }
+    }
+}
+
+fn legacy_directory(root: &Path, session_id: &str) -> Result<PathBuf, AttachmentWriteError> {
+    use std::io::{Error, ErrorKind};
+    let attachments = root.join(ATTACHMENT_DIR_NAME);
+    match std::fs::symlink_metadata(&attachments) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            return Err(AttachmentWriteError::Io(Error::new(
+                ErrorKind::PermissionDenied,
+                "attachment root is a symlink",
+            )));
+        }
+        Ok(_) => {}
+        Err(e) if e.kind() == ErrorKind::NotFound => {
+            if let Err(e) = std::fs::create_dir(&attachments) {
+                if e.kind() != ErrorKind::AlreadyExists {
+                    return Err(AttachmentWriteError::Io(e));
+                }
+            }
+            if std::fs::symlink_metadata(&attachments)?
+                .file_type()
+                .is_symlink()
+            {
+                return Err(AttachmentWriteError::Io(Error::new(
+                    ErrorKind::PermissionDenied,
+                    "attachment root is a symlink",
+                )));
+            }
+        }
+        Err(e) => return Err(AttachmentWriteError::Io(e)),
+    }
+    let dir = attachments.join(session_id);
+    std::fs::create_dir_all(&dir).map_err(AttachmentWriteError::Io)?;
+    // R06（复审 P2）：会话子目录若是符号链接，即使仍在项目 cwd 内（指到
+    // other-session/.git 等）也拒绝——落盘范围必须逐字等于约定的
+    // `<cwd>/.tuvis-attachments/<session_id>/`。
+    if std::fs::symlink_metadata(&dir)?.file_type().is_symlink() {
+        return Err(AttachmentWriteError::Io(Error::new(
+            ErrorKind::PermissionDenied,
+            "attachment session directory is a symlink",
+        )));
+    }
+    let dir = std::fs::canonicalize(dir).map_err(AttachmentWriteError::Io)?;
+    if !dir.starts_with(root) {
+        return Err(AttachmentWriteError::Io(Error::new(
+            ErrorKind::PermissionDenied,
+            "attachment directory escapes project",
+        )));
+    }
+    // 防御纵深：canonicalize 后父目录与末段组件都必须逐字等于约定位置
+    // （root 内深层符号链接以外的绕行已被上面 symlink 检查拦住；此处锁死
+    // 「canonicalize 结果 == canonicalize(attachments)/<session_id>」）。
+    let expected = std::fs::canonicalize(&attachments)?.join(session_id);
+    if dir != expected {
+        return Err(AttachmentWriteError::Io(Error::new(
+            ErrorKind::PermissionDenied,
+            "attachment session directory deviates from the agreed location",
+        )));
+    }
+    Ok(dir)
 }
 
 /// 落盘（IO）：建目录 → 幂等确保本地排除 → 写 **原始文件名**（同名追加序号，
@@ -546,20 +918,8 @@ fn write_attachment_unix(
     let attachment_root = directory(&root, ATTACHMENT_DIR_NAME, true)?;
     let session_dir = directory(&attachment_root, session_id, true)?;
     let base = sanitize_file_name(raw_name);
-    let stem = Path::new(&base)
-        .file_stem()
-        .unwrap_or_default()
-        .to_string_lossy();
-    let extension = Path::new(&base)
-        .extension()
-        .map(|s| format!(".{}", s.to_string_lossy()))
-        .unwrap_or_default();
     for n in 0..=u32::MAX {
-        let filename = if n == 0 {
-            base.clone()
-        } else {
-            format!("{stem} ({n}){extension}")
-        };
+        let filename = target_name(&base, n);
         #[cfg(test)]
         tests::before_create();
         match open_at(
@@ -765,6 +1125,10 @@ pub fn clean_project_attachments(project: &Path) -> std::io::Result<()> {
         Err(e) => Err(e),
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "attachment_publish_tests.rs"]
+mod attachment_publish_tests;
 
 #[cfg(test)]
 pub(crate) mod tests {
@@ -1638,7 +2002,7 @@ pub(crate) mod tests {
         let root = tempdir();
         std::fs::create_dir_all(root.join(".git").join("info")).unwrap();
         let bytes = b"\x89PNG fake image bytes";
-        let path = write_attachment(&root, "sess_abc", "截图.png", bytes).unwrap();
+        let path = write_dsh_attachment(&root, "sess_abc", "截图.png", bytes, None, None).unwrap();
         let parent = path.parent().unwrap();
         assert_eq!(
             parent,
@@ -1656,11 +2020,54 @@ pub(crate) mod tests {
         assert!(content.contains(".tuvis-attachments/"));
     }
 
+    /// R06（复审 P2）回归锁：会话子目录为**同 cwd 内**符号链接（指到
+    /// other-session / .git）→ 拒绝且目标无新文件——落盘范围逐字等于约定的
+    /// `<cwd>/.tuvis-attachments/<session>/`，不因未逃出项目根而放行。
+    #[cfg(unix)]
+    #[test]
+    fn session_dir_symlink_within_project_is_refused() {
+        use std::os::unix::fs::symlink;
+        let root = tempdir();
+        // 项目内的合法目录（未逃出 cwd——旧规则只查 contains(root) 会放行）
+        std::fs::create_dir_all(root.join("other-session")).unwrap();
+        std::fs::create_dir_all(root.join(".git").join("info")).unwrap();
+        let att = root.join(".tuvis-attachments");
+        std::fs::create_dir_all(&att).unwrap();
+        // 会话目录 → 同 cwd 内 other-session 的链接
+        symlink(root.join("other-session"), att.join("sess-link")).unwrap();
+        let err =
+            write_dsh_attachment(&root, "sess-link", "evil.txt", b"x", None, None).unwrap_err();
+        assert_eq!(
+            err.io_kind(),
+            Some(std::io::ErrorKind::PermissionDenied),
+            "{err}"
+        );
+        // 目标目录无新文件（拒绝发生在写入前）
+        assert!(
+            std::fs::read_dir(root.join("other-session"))
+                .unwrap()
+                .count()
+                == 0,
+            "拒绝后不得在目标目录留下文件"
+        );
+        // 同 cwd 内指向 .git 的第二形态
+        symlink(root.join(".git"), att.join("sess-git")).unwrap();
+        let err2 =
+            write_dsh_attachment(&root, "sess-git", "evil.txt", b"x", None, None).unwrap_err();
+        assert_eq!(err2.io_kind(), Some(std::io::ErrorKind::PermissionDenied));
+        assert!(std::fs::read_dir(root.join(".git").join("info"))
+            .unwrap()
+            .all(|e| e.unwrap().file_name().to_string_lossy() == "exclude"));
+        // 正常目录对照：非链接会话目录照常落盘
+        let ok = write_dsh_attachment(&root, "sess-normal", "ok.txt", b"ok", None, None).unwrap();
+        assert_eq!(std::fs::read(&ok).unwrap(), b"ok");
+    }
+
     #[test]
     fn write_same_name_twice_no_overwrite() {
         let root = tempdir();
-        let p1 = write_attachment(&root, "s", "a.txt", b"one").unwrap();
-        let p2 = write_attachment(&root, "s", "a.txt", b"two").unwrap();
+        let p1 = write_dsh_attachment(&root, "s", "a.txt", b"one", None, None).unwrap();
+        let p2 = write_dsh_attachment(&root, "s", "a.txt", b"two", None, None).unwrap();
         assert_ne!(p1, p2, "同名二次落盘追加序号，不覆盖首份");
         // 微信语义：同名追加 (1) 尾缀，原名保留可读
         assert_eq!(

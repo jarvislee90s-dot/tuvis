@@ -1,0 +1,26 @@
+{
+  "source": "real DSH Desktop transcript (read-only decode, no credentials used)",
+  "host": "DSH 0.2.2-rc.5",
+  "protocol_from_official_package": {
+    "package": "@deepseek-ai/dsh-user-questions",
+    "methods": [
+      "userQuestions/answer (Remote)",
+      "userQuestions/attachWait (Remote, mode stream)"
+    ],
+    "answer_args": "(agent, callId, answer{answers:[{id, selected:[string], custom?:string}]}) -> boolean",
+    "validation": [
+      "每题 id 必须恰好出现一次 (BAD_ANSWER)",
+      "同一 callId 已排队应答 -> REPLY_QUEUED",
+      "只有 state=continued 可答；返回 false = 不在待答集"
+    ],
+    "attach_wait": "只为 foreground callId 挂实时倒计时；关流释放 claim，不影响持久题组状态",
+    "projection": "key=userQuestions, shape={active:[{callId,questions[],state}],settled:[...]}, stateVersion=2",
+    "question_schema": "id, question, detail?, header?, options?[{label,description?}], multiSelect?"
+  },
+  "real_sample": {
+    "callId": "chatcmpl-tool-91156c651ba05bd2",
+    "arguments": "{\"questions\":[{\"id\":\"remote_settings_merge\",\"header\":\"设置页合并\",\"question\":\"main 已移除旧「无头注入/兼容发送」设置段并改为 Codex 自动适配；本分支设置页仍有旧段。合并时采用哪种？\",\"options\":[{\"label\":\"跟随 main，删除旧段，只接 ZCode 卡（推荐）\",\"description\":\"保留 main 的 CodexAdaptSection 与 S1/S2 语义，移除已退役的 HeadlessSettingsSection/兼容发送 UI；ZCode 官方链接与工具卡仍保留。\"},{\"label\":\"保留旧六段并叠加 main 新结构\",\"description\":\"保留本分支旧无头/兼容发送 UI，同时加入 main 的 Codex 自动适配；可能出现两个重叠入口，且旧开关已不再参与发送门。\"}]}]}",
+    "result": "{\"answers\":[{\"id\":\"remote_settings_merge\",\"selected\":[\"跟随 main，删除旧段，只接 ZCode 卡（推荐）\"]}]}"
+  },
+  "not_covered": "隔离宿主无模型凭据，未产生新的活体回合；多选/自由输入/多题活体样本待补。"
+}

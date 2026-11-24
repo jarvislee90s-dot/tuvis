@@ -1054,6 +1054,8 @@ fn set_create_error(
 
 fn created_session(sid: &str, directory: &str) -> Session {
     Session {
+        dsh_instance_id: None,
+        dsh_subagent: None,
         id: sid.to_owned(),
         agent_type: crate::session::AgentType::OpenCode,
         project_name: crate::monitor::project::project_name_from_path(directory),

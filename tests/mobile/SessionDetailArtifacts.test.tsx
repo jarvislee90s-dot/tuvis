@@ -4,11 +4,12 @@
 // 任务 7：文件池来源合并/排序、来源按钮与文件名预览两个独立热区、五页有界定位
 // （当前页零请求 / 五页未命中四次更早读取）、窄屏先回消息区、滚动高亮两秒、失败可返回预览。
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import i18n from "@/i18n";
 import SessionDetail from "@/mobile/SessionDetail";
 import type { ProjectedArtifact, ProjectedMessage, ThreadProjection } from "@/mobile/codexIpcApi";
-import type { SessionFileEntry } from "@/mobile/api";
+import type { SessionFileEntry, SessionMessage } from "@/mobile/api";
 import type { Session } from "@/types/session";
 import { MockEventSource } from "./eventSourceMock";
 import { MockIntersectionObserver } from "./intersectionObserverMock";
@@ -108,6 +109,7 @@ function projection(messages: ProjectedMessage[]): ThreadProjection {
 
 let files: SessionFileEntry[];
 let fileCalls: string[];
+let fileListCalls: string[];
 let fileVersion = 0;
 // Task 7：同代历史页请求（五页定位）
 let pageCalls: string[];
@@ -137,16 +139,30 @@ function pageBody(
   });
 }
 
-function installFetch() {
+type TestModelSummary = { model: string; reasoningEffort?: string; source: "next" | "last_used" };
+
+function installFetch(dsh?: {
+  modelSummary?: TestModelSummary;
+  messages: (limit: number) => { messages: SessionMessage[]; truncated: boolean };
+  media: TestDshMedia[];
+  read: (url: URL, method: string) => Response;
+}) {
   files = [];
   fileCalls = [];
+  fileListCalls = [];
   fileVersion = 0;
   pageCalls = [];
   pageHandler = () => json({ status: "end", messages: [], historyToken: "", nextBefore: null });
   vi.stubGlobal(
     "fetch",
-    vi.fn(async (input: RequestInfo | URL) => {
-      const url = String(input);
+    vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = input instanceof Request ? input.url : String(input);
+      if (dsh && url.includes("/dsh/media?")) {
+        return dsh.read(
+          new URL(url, "http://localhost"),
+          init?.method ?? (input instanceof Request ? input.method : "GET")
+        );
+      }
       if (url.includes("/codex/thread/events")) return new Response("", { status: 200 });
       if (url.includes("/codex/queue")) return json({ actions: [], blockedReasonCode: null });
       if (url.includes("/codex/thread/messages")) {
@@ -155,8 +171,17 @@ function installFetch() {
         return pageHandler(index);
       }
       if (url.includes("/codex/thread")) return json(projection([]));
-      if (url.includes("/session-messages")) return json({ messages: [], truncated: false });
-      if (url.includes("/session-files")) return json({ files, truncated: false });
+      if (url.includes("/session-messages")) {
+        const limit = Number(new URL(url, "http://localhost").searchParams.get("limit"));
+        return json({
+          ...(dsh?.messages(limit) ?? { messages: [], truncated: false }),
+          ...(dsh?.modelSummary ? { dshModelSummary: dsh.modelSummary } : {}),
+        });
+      }
+      if (url.includes("/session-files")) {
+        fileListCalls.push(url);
+        return json({ files, truncated: false, media: dsh?.media });
+      }
       if (url.includes("/session-subagents")) return json({ subagents: [] });
       if (url.includes("/session-queue")) return json({ items: [] });
       if (url.includes("/session-approve-options")) {
@@ -546,5 +571,688 @@ describe("SessionDetail × 文件池来源与反向定位（Task 7）", () => {
       expect(banner.textContent).not.toContain("最近五页消息中未找到");
     }
     expect(pageCalls).toHaveLength(3);
+  });
+});
+
+// T03：在 HTTP 边界描述尚未落地的可选字段，RED 时也能运行真实详情组件。
+type TestDshMedia = { refId: string; kind: "image" | "file"; name: string };
+type TestDshMessage = SessionMessage & {
+  media?: TestDshMedia[];
+  blocks?: ({ kind: "text"; text: string } | { kind: "media"; refId: string })[];
+};
+
+const pureImage = { refId: "ref-pure", kind: "image", name: "pure.png" } as const;
+const mixedImage = { refId: "ref-mixed", kind: "image", name: "mixed.png" } as const;
+const presentFile = { refId: "ref-present", kind: "file", name: "report.txt" } as const;
+const presentToolArgs = JSON.stringify({
+  files: [{ path: `/tmp/proj/${presentFile.name}`, description: "交付报告" }],
+});
+// 两个接口可提供不同显示名；文件池以 refId 而非文件名合并。
+const indexedPresentFile = { ...presentFile, name: "indexed-report.txt" };
+const olderPoolFile = { refId: "ref-old", kind: "file", name: "earlier.txt" } as const;
+const dshSession = makeSession({
+  id: "dsh-session-t03",
+  dshInstanceId: "dsh-instance-t03",
+  agentType: "dsh",
+  status: "processing",
+});
+const ordinaryPath = "/tmp/proj/notes.md";
+
+function dshMessage(seq: number, over: Partial<TestDshMessage>): TestDshMessage {
+  return { seq, role: "user", kind: "user", content: "", ts: null, collapsed: false, ...over };
+}
+
+function mountDsh({
+  failMixedImage = false,
+  status = dshSession.status,
+  dshInstanceId = dshSession.dshInstanceId,
+  modelSummary,
+}: {
+  failMixedImage?: boolean;
+  status?: Session["status"];
+  dshInstanceId?: Session["dshInstanceId"];
+  modelSummary?: TestModelSummary;
+} = {}) {
+  const reads = vi.fn((url: URL, _method: string) => {
+    const refId = url.searchParams.get("refId");
+    if (refId === mixedImage.refId && failMixedImage) {
+      return json({ error: "not_found" }, 404);
+    }
+    if (refId === pureImage.refId || refId === mixedImage.refId) {
+      return new Response("png-bytes", { headers: { "content-type": "image/png" } });
+    }
+    if (refId === presentFile.refId) {
+      return json({ content: "交付文件正文", mime: "text/plain" });
+    }
+    return json({ error: "not_found" }, 404);
+  });
+  const tail = [
+    dshMessage(2, { media: [pureImage] }),
+    dshMessage(3, {
+      content: "图片前面的文字 图片后面的文字",
+      media: [mixedImage],
+      blocks: [
+        { kind: "text", text: "图片前面的文字" },
+        { kind: "media", refId: mixedImage.refId },
+        { kind: "text", text: "图片后面的文字" },
+      ],
+    }),
+    dshMessage(4, {
+      role: "assistant",
+      kind: "tool-call",
+      toolName: "present",
+      toolArgs: presentToolArgs,
+      collapsed: true,
+      media: [presentFile],
+    }),
+    dshMessage(5, { content: `普通路径：${ordinaryPath}` }),
+  ];
+  installFetch({
+    modelSummary,
+    messages: (limit) =>
+      limit > 200
+        ? { messages: [dshMessage(1, { content: "更早的普通消息" }), ...tail], truncated: false }
+        : { messages: tail, truncated: true },
+    media: [pureImage, mixedImage, indexedPresentFile, olderPoolFile],
+    read: reads,
+  });
+  files = [fileEntry(ordinaryPath)];
+  render(<SessionDetail session={{ ...dshSession, status, dshInstanceId }} onBack={() => {}} />);
+  return reads;
+}
+
+function precedes(first: HTMLElement, second: HTMLElement) {
+  expect(first.compareDocumentPosition(second) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+}
+
+function expectReferenceGet(url: URL, method: string, refId: string) {
+  expect(method.toUpperCase()).toBe("GET");
+  expect(url.pathname).toBe("/m/api/v1/dsh/media");
+  expect([...url.searchParams.entries()].sort()).toEqual([
+    ["instanceId", dshSession.dshInstanceId],
+    ["refId", refId],
+    ["sessionId", dshSession.id],
+  ]);
+}
+
+async function revealDshImage(row: HTMLElement, name: string) {
+  const button = within(row).getByRole("button", { name });
+  const observer = await waitFor(() => {
+    const current = MockIntersectionObserver.instances.find((item) => item.elements.has(button));
+    expect(current).toBeDefined();
+    return current!;
+  });
+  act(() => observer.trigger(button));
+}
+
+describe("SessionDetail × DSH 媒体引用（T03）", () => {
+  beforeEach(() => {
+    vi.stubGlobal("innerWidth", 390);
+    vi.stubGlobal("innerHeight", 844);
+  });
+
+  it("纯图片消息在自身气泡渲染，并可打开图片预览", async () => {
+    const reads = mountDsh();
+    const row = await screen.findByTestId("msg-2");
+    await revealDshImage(row, pureImage.name);
+    await within(row).findByRole("img", { name: pureImage.name });
+
+    fireEvent.click(within(row).getByRole("button", { name: /pure\.png/ }));
+    expect(await screen.findByTestId("preview-image")).toBeTruthy();
+    const pureReads = reads.mock.calls.filter(
+      ([url]) => url.searchParams.get("refId") === pureImage.refId
+    );
+    expect(pureReads.length).toBeGreaterThan(0);
+    for (const [url, method] of pureReads) expectReferenceGet(url, method, pureImage.refId);
+    expect(fileCalls).toEqual([]);
+  });
+
+  it("图文气泡按 blocks 顺序显示文字、图片、文字，不重复显示兼容正文", async () => {
+    mountDsh();
+    const message = await screen.findByTestId("msg-3");
+    await revealDshImage(message, mixedImage.name);
+    const row = within(message);
+    const image = await row.findByRole("img", { name: mixedImage.name });
+    precedes(row.getByText("图片前面的文字"), image);
+    precedes(image, row.getByText("图片后面的文字"));
+    expect(row.queryByText("图片前面的文字 图片后面的文字")).toBeNull();
+  });
+
+  it("图片引用读取失败时以可读说明替代图片，保留该条图文气泡的两段文字", async () => {
+    mountDsh({ failMixedImage: true });
+    const message = await screen.findByTestId("msg-3");
+    await revealDshImage(message, mixedImage.name);
+    const row = within(message);
+    const placeholder = await row.findByText(/无法|失败|不可用|未找到|不存在/);
+    precedes(row.getByText("图片前面的文字"), placeholder);
+    precedes(placeholder, row.getByText("图片后面的文字"));
+    expect(row.queryByRole("img", { name: mixedImage.name })).toBeNull();
+  });
+
+  describe.each([
+    { mode: "运行中默认模式", status: "processing", summary: false },
+    { mode: "总结模式", status: "idle", summary: true },
+  ] as const)("F04 · $mode", ({ status, summary }) => {
+    it("不展开 present 工具详情就能看到交付卡并打开预览", async () => {
+      const user = userEvent.setup();
+      const reads = mountDsh({ status });
+      const row = within(await screen.findByTestId("msg-4"));
+      expect(screen.queryByTestId("summary-banner") !== null).toBe(summary);
+      const toggle = row.getByRole("button", { name: /present/, expanded: false });
+      const card = row.getByRole("button", { name: presentFile.name });
+      expect(card).toBeVisible();
+
+      await user.click(card);
+      expect((await screen.findByTestId("preview-code")).textContent).toContain("交付文件正文");
+      expect(toggle).toHaveAttribute("aria-expanded", "false");
+      expect(reads).toHaveBeenCalledTimes(1);
+      expectReferenceGet(...reads.mock.calls[0], presentFile.refId);
+      expect(fileCalls).toEqual([]);
+    });
+
+    it("present 参数只在展开后可见，交付卡不重复", async () => {
+      const user = userEvent.setup();
+      mountDsh({ status });
+      const row = within(await screen.findByTestId("msg-4"));
+      expect(screen.queryByTestId("summary-banner") !== null).toBe(summary);
+      const toggle = row.getByRole("button", { name: /present/, expanded: false });
+      expect(row.queryByText(presentToolArgs)).toBeNull();
+      const card = row.getByRole("button", { name: presentFile.name });
+      expect(card).toBeVisible();
+
+      await user.click(toggle);
+      expect(toggle).toHaveAttribute("aria-expanded", "true");
+      expect(row.getByText(presentToolArgs)).toBeVisible();
+      const cards = row.getAllByRole("button", { name: presentFile.name });
+      expect(cards).toHaveLength(1);
+      expect(cards[0]).toBeVisible();
+    });
+  });
+
+  it("右侧文件池按 refId 合并不同显示名的 present 交付件，只保留一项并按引用打开", async () => {
+    const user = userEvent.setup();
+    const reads = mountDsh();
+    await screen.findByTestId("msg-4");
+    await user.click(screen.getByTestId("file-panel-button"));
+    const pool = within(await screen.findByTestId("file-panel"));
+    await pool.findByRole("button", { name: olderPoolFile.name });
+    for (const media of [pureImage, mixedImage]) {
+      expect(pool.getAllByRole("button", { name: media.name })).toHaveLength(1);
+    }
+    const deliveryRows = pool.getAllByRole("button", { name: /^(indexed-)?report\.txt$/ });
+    expect(deliveryRows).toHaveLength(1);
+    await user.click(deliveryRows[0]);
+    expect((await screen.findByTestId("preview-code")).textContent).toContain("交付文件正文");
+    expect(reads).toHaveBeenCalledTimes(1);
+    expectReferenceGet(...reads.mock.calls[0], presentFile.refId);
+    expect(fileCalls).toEqual([]);
+  });
+
+  it("同页普通正文链接继续走原文件预览，关闭后回到消息", async () => {
+    const reads = mountDsh();
+    fireEvent.click(await within(await screen.findByTestId("msg-5")).findByTestId("file-link"));
+    expect((await screen.findByTestId("preview-code")).textContent).toContain("版本 1");
+    expect(fileCalls).toHaveLength(1);
+    expect(new URL(fileCalls[0], "http://localhost").searchParams.get("path")).toBe(ordinaryPath);
+    expect(reads).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByTestId("preview-close"));
+    expect(screen.queryByTestId("preview-code")).toBeNull();
+    expect(within(screen.getByTestId("msg-5")).getByTestId("file-link")).toBeTruthy();
+  });
+
+  it("加载更早消息会将其放在已有含媒体消息前，并补偿顶部插入的滚动高度", async () => {
+    mountDsh();
+    await screen.findByTestId("msg-2");
+    // 首拉对齐 effect 可能迟于 DOM 提交；先冲刷再设置当前阅读位置。
+    await act(async () => {});
+    const area = screen.getByTestId("message-area");
+    Object.defineProperty(area, "scrollHeight", {
+      get: () => (area.querySelector('[data-seq="1"]') ? 8000 : 5000),
+      configurable: true,
+    });
+    area.scrollTop = 1000;
+
+    fireEvent.click(screen.getByTestId("load-more"));
+    precedes(await screen.findByTestId("msg-1"), screen.getByTestId("msg-2"));
+    await waitFor(() => expect(area.scrollTop).toBe(4000));
+  });
+});
+
+// N04：DSH 文件池随正文刷新。面板已打开时，宿主在会话里新写一个文件（工具改写），
+// 用户不必切追溯档或重开面板，下一个正文刷新周期就应看到该条并可预览真实内容。
+describe("DSH 实时待答", () => {
+  const session = makeSession({
+    agentType: "dsh",
+    id: "session-dsh-live",
+    dshInstanceId: "instance-live",
+    form: undefined,
+    status: "processing",
+  });
+  const question = {
+    eventId: "host-event-1",
+    questions: [{ id: "q1", question: "保留哪份？", options: [{ label: "保留两份" }] }],
+  };
+
+  function mockQuestions(
+    live: () => Response,
+    answer = () => json({ receiptAccepted: true, receiptOnly: true })
+  ) {
+    installFetch();
+    const fallback = fetch;
+    const submissions: unknown[] = [];
+    vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input), "http://localhost");
+      if (url.pathname === "/m/api/v1/dsh/questions/live/answer") {
+        submissions.push(JSON.parse(String(init?.body)));
+        return answer();
+      }
+      if (url.pathname === "/m/api/v1/dsh/questions/live") return live();
+      if (url.pathname === "/m/api/v1/dsh/questions") {
+        return json({ verified: true, snapshot: { groups: [] } });
+      }
+      return fallback(input, init);
+    });
+    return submissions;
+  }
+
+  it("DSH 运行时以停止替换发送，回执受理后保留草稿直到宿主确认结束", async () => {
+    mockQuestions(() => json({ live: true, pending: [] }));
+    const fallback = fetch;
+    let turn: string | null = "7:1:42";
+    const stopRequests: unknown[] = [];
+    vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input), "http://localhost");
+      if (url.pathname === "/m/api/v1/session-send-info")
+        return json({ injectable: true, channels: ["dsh_desktop"], visibility: "after_refresh" });
+      if (url.pathname === "/m/api/v1/dsh/current-turn") {
+        if (init?.method === "POST") {
+          stopRequests.push(JSON.parse(String(init.body)));
+          return json({ receipt: { state: "accepted" } });
+        }
+        return json({ turn });
+      }
+      return fallback(input, init);
+    });
+    render(<SessionDetail session={session} onBack={vi.fn()} />);
+    const stop = await screen.findByTestId("dsh-composer-stop");
+    await waitFor(() => expect(stop).toBeEnabled());
+    const input = screen.getByTestId("composer-input");
+    fireEvent.change(input, { target: { value: "保留这个草稿" } });
+    expect(screen.queryByTestId("composer-send")).not.toBeInTheDocument();
+    fireEvent.click(stop);
+    fireEvent.click(stop);
+    await waitFor(() => expect(stopRequests).toHaveLength(1));
+    expect(stopRequests[0]).toMatchObject({
+      instanceId: session.dshInstanceId,
+      sessionId: session.id,
+      turn,
+    });
+    expect(stop).toBeDisabled();
+    expect(input).toHaveValue("保留这个草稿");
+    turn = null;
+    fireEvent.click(screen.getByTestId("detail-refresh"));
+    expect(await screen.findByTestId("composer-send")).toBeInTheDocument();
+    expect(input).toHaveValue("保留这个草稿");
+  });
+
+  it("实时事件优先于只读回退，可整组提交且以回执文案确认送达", async () => {
+    const submissions = mockQuestions(() => json({ live: true, pending: [question] }));
+    render(<SessionDetail session={session} onBack={vi.fn()} />);
+    const card = await screen.findByTestId("dsh-question-group");
+    expect(screen.getByTestId("message-area")).toContainElement(card);
+    fireEvent.click(within(card).getByTestId("dsh-question-option-0"));
+    fireEvent.click(within(card).getByTestId("dsh-question-submit"));
+    await waitFor(() =>
+      expect(submissions).toEqual([
+        {
+          instanceId: "instance-live",
+          sessionId: "session-dsh-live",
+          eventId: "host-event-1",
+          answers: [{ id: "q1", selected: ["保留两份"] }],
+        },
+      ])
+    );
+    expect(await screen.findByText("已提交，等待宿主确认")).toBeInTheDocument();
+  });
+
+  it("正文收到答题结果后，移除等待宿主确认提示", async () => {
+    let pending = [question];
+    mockQuestions(() => json({ live: true, pending }));
+    const fallback = fetch;
+    const call: SessionMessage = {
+      seq: 9,
+      kind: "tool-call",
+      role: "assistant",
+      content: "选哪一份？",
+      toolName: "ask_user_question",
+      ts: null,
+      collapsed: false,
+    };
+    let messages = [call];
+    vi.stubGlobal("fetch", (input: RequestInfo | URL, init?: RequestInit) =>
+      String(input).includes("/session-messages")
+        ? Promise.resolve(json({ messages, truncated: false }))
+        : fallback(input, init)
+    );
+    render(<SessionDetail session={session} onBack={vi.fn()} />);
+    await screen.findByTestId("msg-9");
+    const card = await screen.findByTestId("dsh-question-group");
+    fireEvent.click(within(card).getByTestId("dsh-question-option-0"));
+    fireEvent.click(within(card).getByTestId("dsh-question-submit"));
+    expect(await screen.findByText("已提交，等待宿主确认")).toBeInTheDocument();
+    pending = [];
+    messages = [
+      call,
+      {
+        seq: 10,
+        kind: "tool-result",
+        role: "assistant",
+        content: "已保留两份",
+        ts: null,
+        collapsed: false,
+      },
+    ];
+    fireEvent.click(screen.getByTestId("detail-refresh"));
+    await screen.findByTestId("msg-10");
+    expect(screen.queryByText("已提交，等待宿主确认")).not.toBeInTheDocument();
+  });
+
+  it("空闲会话的补答回执不显示等待宿主确认", async () => {
+    mockQuestions(() => json({ live: true, pending: [] }));
+    const fallback = fetch;
+    const request = vi.fn();
+    vi.stubGlobal("fetch", (input: RequestInfo | URL, init?: RequestInit) => {
+      const path = new URL(String(input), "http://localhost").pathname;
+      if (path === "/m/api/v1/dsh/questions")
+        return Promise.resolve(
+          json({
+            verified: true,
+            snapshot: {
+              revisionToken: "r1",
+              groups: [
+                { callId: "continued-1", state: "continued", questions: question.questions },
+              ],
+            },
+          })
+        );
+      if (path === "/m/api/v1/dsh/questions/answer") {
+        request();
+        return Promise.resolve(json({ hostAccepted: true }));
+      }
+      return fallback(input, init);
+    });
+    render(<SessionDetail session={{ ...session, status: "idle" }} onBack={vi.fn()} />);
+    const card = await screen.findByTestId("dsh-question-group");
+    fireEvent.click(within(card).getByTestId("dsh-question-option-0"));
+    fireEvent.click(within(card).getByTestId("dsh-question-submit"));
+    await waitFor(() => expect(request).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(within(card).getByTestId("dsh-question-submit")).toBeEnabled());
+    expect(screen.queryByText("已提交，等待宿主确认")).not.toBeInTheDocument();
+  });
+
+  it("另一个设备提交中时保留题目，直到宿主快照确认它已结束", async () => {
+    let pending = [question];
+    mockQuestions(
+      () => json({ live: true, generation: 1, pending }),
+      () => json({ error: "DSH_ACTION_STATE_CONFLICT", reasonCode: "receipt in flight" }, 409)
+    );
+    render(<SessionDetail session={session} onBack={vi.fn()} />);
+    const card = await screen.findByTestId("dsh-question-group");
+    fireEvent.click(within(card).getByTestId("dsh-question-option-0"));
+    fireEvent.click(within(card).getByTestId("dsh-question-submit"));
+    expect(await screen.findByText("已请求刷新题组状态，请稍后重试。")).toBeInTheDocument();
+    expect(card).toBeInTheDocument();
+    pending = [];
+    fireEvent.click(screen.getByTestId("detail-refresh"));
+    expect(await screen.findByText("该提问已在别处回答或取消。")).toBeInTheDocument();
+    expect(card).not.toBeInTheDocument();
+  });
+
+  it("临时读取失败期间保留题面和草稿，恢复后可以继续提交", async () => {
+    let ready = true;
+    mockQuestions(() =>
+      ready ? json({ live: true, generation: 1, pending: [question] }) : json({}, 503)
+    );
+    render(<SessionDetail session={session} onBack={vi.fn()} />);
+    const card = await screen.findByTestId("dsh-question-group");
+    const submit = within(card).getByTestId("dsh-question-submit");
+    fireEvent.click(within(card).getByTestId("dsh-question-option-0"));
+    expect(submit).toBeEnabled();
+    ready = false;
+    fireEvent.click(screen.getByTestId("detail-refresh"));
+    await waitFor(() => expect(submit).toBeDisabled());
+    expect(card).toBeInTheDocument();
+    ready = true;
+    fireEvent.click(screen.getByTestId("detail-refresh"));
+    await waitFor(() => expect(submit).toBeEnabled());
+  });
+
+  it("把携带操作意图的待答交给官方控制台", async () => {
+    const submissions = mockQuestions(() =>
+      json({
+        live: true,
+        pending: [
+          {
+            ...question,
+            questions: [{ ...question.questions[0], intent: { kind: "plan-review" } }],
+          },
+        ],
+      })
+    );
+    render(<SessionDetail session={session} onBack={vi.fn()} />);
+    expect(await screen.findByTestId("dsh-question-console-only")).toBeInTheDocument();
+    expect(screen.queryByTestId("dsh-question-submit")).not.toBeInTheDocument();
+    expect(submissions).toEqual([]);
+  });
+});
+
+describe("N04 DSH 文件池随正文刷新", () => {
+  it("面板打开时新文件在下一个刷新周期出现并可预览，无需切档或重开", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      mountDsh();
+      await screen.findByTestId("msg-2");
+      // 明确打开文件池（N04 场景：面板**已打开**时宿主写入新文件）。
+      fireEvent.click(await screen.findByTestId("file-panel-button"));
+      const panel = await screen.findByTestId("file-panel");
+      expect(within(panel).getAllByTestId(/^file-row-\d+$/)).toHaveLength(1);
+      const before = fileListCalls.length;
+
+      // 宿主在会话里写入新文件：文件端点随后会返回这条「工具改写」。
+      const written = "/tmp/proj/note.md";
+      files = [
+        fileEntry(ordinaryPath),
+        { ...fileEntry(written), changeKind: "tool-write" } as SessionFileEntry,
+      ];
+
+      // 不切档、不重开：推进既有 10s 正文刷新周期（复用同一轮询，不新增定时器）。
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(10_500);
+      });
+
+      // 文件端点被重拉，且新条目出现在同一个已打开的面板里。
+      await waitFor(() => expect(fileListCalls.length).toBeGreaterThan(before));
+      await waitFor(() =>
+        expect(
+          within(screen.getByTestId("file-panel")).getAllByTestId(/^file-row-\d+$/)
+        ).toHaveLength(2)
+      );
+      const rows = within(screen.getByTestId("file-panel")).getAllByTestId(/^file-row-\d+$/);
+      expect(rows.some((r) => (r.textContent ?? "").includes("note.md"))).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("面板关闭或页面隐藏时，刷新周期不产生文件列表请求", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      mountDsh();
+      await screen.findByTestId("msg-2");
+      // 打开再关闭面板：回到「无面板」态。
+      fireEvent.click(await screen.findByTestId("file-panel-button"));
+      await screen.findByTestId("file-panel");
+      fireEvent.click(screen.getByTestId("file-panel-button"));
+      await waitFor(() => expect(screen.queryByTestId("file-panel")).toBeNull());
+
+      const closedBefore = fileListCalls.length;
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(31_000);
+      });
+      expect(fileListCalls.length, "面板关闭后不得随正文刷新拉文件列表").toBe(closedBefore);
+
+      // 隐藏页面：正文轮询停拍，文件列表同样零增量。
+      fireEvent.click(screen.getByTestId("file-panel-button"));
+      await screen.findByTestId("file-panel");
+      Object.defineProperty(document, "visibilityState", {
+        configurable: true,
+        get: () => "hidden",
+      });
+      document.dispatchEvent(new Event("visibilitychange"));
+      const hiddenBefore = fileListCalls.length;
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(31_000);
+      });
+      expect(fileListCalls.length, "页面隐藏时不得拉文件列表").toBe(hiddenBefore);
+      Object.defineProperty(document, "visibilityState", {
+        configurable: true,
+        get: () => "visible",
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe("N06 只读模型摘要", () => {
+  const model = "deepseek-v4.1-flash";
+
+  it("last_used_summary_is_labelled_as_previous_use", async () => {
+    mountDsh({ modelSummary: { model, reasoningEffort: "low", source: "last_used" } });
+    await screen.findByText(`上次使用 · ${model}`);
+    const summary = screen.getByTestId("dsh-model");
+    expect(summary.textContent).toContain("上次使用");
+    expect(summary.textContent).toContain(model);
+    expect(screen.getByTestId("dsh-effort")).toHaveTextContent("上次思考强度 · low");
+    expect(summary.textContent).not.toContain("当前");
+  });
+
+  it("missing_effort_is_omitted", async () => {
+    mountDsh({ modelSummary: { model, source: "last_used" } });
+    const summary = await screen.findByText(`上次使用 · ${model}`);
+    expect(summary.textContent).toBe(`上次使用 · ${model}`);
+  });
+
+  it("absent_summary_renders_nothing", async () => {
+    mountDsh();
+    await screen.findByTestId("msg-3");
+    expect(screen.queryByTestId("dsh-model")?.textContent).not.toContain("上次使用");
+  });
+
+  it("summary_does_not_leak_across_instances", async () => {
+    mountDsh({ modelSummary: { model, source: "last_used" } });
+    await screen.findByText(`上次使用 · ${model}`);
+    cleanup();
+
+    mountDsh({ dshInstanceId: "dsh-instance-n06-other" });
+    await screen.findByTestId("msg-3");
+    expect(screen.queryByTestId("dsh-model")?.textContent).not.toContain("上次使用");
+  });
+});
+
+describe("DSH 官方会话设置", () => {
+  const session = makeSession({
+    id: "options",
+    agentType: "dsh",
+    dshInstanceId: "host-options",
+    status: "idle",
+  });
+  const path = "/m/api/v1/dsh/session-settings";
+  const next = { provider: "p", model: "new-model", reasoningEffort: "high" };
+  const old = { provider: "p", model: "old-model", reasoningEffort: "low" };
+  function mock() {
+    installFetch();
+    const base = fetch;
+    const requests: Record<string, unknown>[] = [];
+    vi.stubGlobal("fetch", (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input), "http://localhost");
+      if (url.pathname !== path) return base(input, init);
+      if (init?.method === "POST") {
+        requests.push(JSON.parse(String(init.body)));
+        return Promise.resolve(json({ state: "accepted", confirmed: true }));
+      }
+      return Promise.resolve(
+        json({
+          model: {
+            next,
+            lastUsed: old,
+            default: null,
+            groups: [
+              {
+                id: "p",
+                name: "Provider",
+                models: [
+                  {
+                    id: "new-model",
+                    name: "New model",
+                    reasoning: {
+                      efforts: [
+                        { id: "low", name: "Low" },
+                        { id: "high", name: "High" },
+                      ],
+                    },
+                  },
+                ],
+              },
+            ],
+          },
+          permission: {
+            currentValue: "workspace-write",
+            options: [
+              { value: "workspace-write", name: "Workspace" },
+              { value: "danger-full-access", name: "Full" },
+            ],
+          },
+        })
+      );
+    });
+    return requests;
+  }
+
+  it("shows the verified next settings and sends full access only after acknowledgement", async () => {
+    const requests = mock();
+    render(<SessionDetail session={session} onBack={vi.fn()} />);
+    const permission = await screen.findByText("权限 · 工作区内修改");
+    expect(screen.getByTestId("dsh-model")).toHaveTextContent("模型 · New model");
+    expect(screen.getByTestId("dsh-effort")).toHaveTextContent("思考强度 · high");
+    fireEvent.click(permission);
+    fireEvent.change(screen.getByTestId("dsh-setting-choice"), {
+      target: { value: "danger-full-access" },
+    });
+    const apply = screen.getByTestId("dsh-setting-apply");
+    expect(apply).toBeDisabled();
+    fireEvent.click(screen.getByRole("checkbox", { name: /我确认更改权限/ }));
+    fireEvent.click(apply);
+    await waitFor(() => expect(requests).toHaveLength(1));
+    expect(requests[0]).toMatchObject({
+      instanceId: session.dshInstanceId,
+      sessionId: session.id,
+      change: { type: "permission", preset: "danger-full-access", acknowledged: true },
+    });
+  });
+
+  it("limits effort to the current model and discloses the default side effect", async () => {
+    const requests = mock();
+    render(<SessionDetail session={session} onBack={vi.fn()} />);
+    fireEvent.click(await screen.findByText("思考强度 · high"));
+    const choice = screen.getByTestId("dsh-setting-choice");
+    expect(within(choice).getAllByRole("option")).toHaveLength(3);
+    fireEvent.change(choice, { target: { value: "low" } });
+    expect(screen.getByText(/保存为该配置的默认模型/)).toBeVisible();
+    fireEvent.click(screen.getByTestId("dsh-setting-apply"));
+    await waitFor(() => expect(requests).toHaveLength(1));
+    expect(requests[0]).toMatchObject({
+      change: { type: "model", provider: "p", model: "new-model", reasoningEffort: "low" },
+    });
   });
 });

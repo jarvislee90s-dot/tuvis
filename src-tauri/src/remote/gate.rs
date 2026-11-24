@@ -255,7 +255,7 @@ pub async fn gate(State(state): State<Arc<RemoteState>>, req: Request, next: Nex
         return next.run(req).await; // PIN 即凭据的换 cookie 入口放行
     }
     let Some(device) = extract_device(req.headers()) else {
-        return unauthorized();
+        return unauthorized_for(req.uri().path());
     };
     let now = chrono::Utc::now().timestamp_millis();
     // 有效判定与滑动续期合并进**同一个** with 闭包（`with` 持锁不可重入，且两段之间
@@ -274,10 +274,35 @@ pub async fn gate(State(state): State<Arc<RemoteState>>, req: Request, next: Nex
         // 完全不变，只是心跳不再采信未认证流量（/pair/pin 放行分支同样不记——
         // 换 cookie 不算「有人在看」，与线上口径一致）
         crate::remote::note_api_request();
-        next.run(req).await
+        let dsh_action = req.uri().path().starts_with("/dsh/action/");
+        let mut response = next.run(req).await;
+        if dsh_action {
+            response.headers_mut().insert(
+                axum::http::header::CACHE_CONTROL,
+                axum::http::HeaderValue::from_static("no-store"),
+            );
+        }
+        response
     } else {
-        unauthorized()
+        unauthorized_for(req.uri().path())
     }
+}
+
+fn unauthorized_for(path: &str) -> Response {
+    if path == "/session-attachment" {
+        return super::api::json_no_store(
+            axum::http::StatusCode::FORBIDDEN,
+            serde_json::json!({"error":"forbidden"}),
+        );
+    }
+    let mut response = unauthorized();
+    if path.starts_with("/dsh/action/") {
+        response.headers_mut().insert(
+            axum::http::header::CACHE_CONTROL,
+            axum::http::HeaderValue::from_static("no-store"),
+        );
+    }
+    response
 }
 
 /// 统一拒绝响应：403 且响应体为空——不泄露"未配对 / 设备失效"的区分。

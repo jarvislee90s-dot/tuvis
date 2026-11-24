@@ -23,6 +23,7 @@ pub use status::LockState;
 // 零解码零解析。M1 实测真机 77 会话/解压 155MB 每轮全量重扫 12.5s（debug），
 // 远超 3s 轮询间隔且跑在 IPC 线程上，是 dev 模式整机卡顿的根因
 const DSH_LOG_SCAN: SessionFileScan = SessionFileScan::new("dsh-log");
+const DSH_CONTROL_LOG_SCAN: SessionFileScan = SessionFileScan::new("dsh-control-log");
 static DSH_GENERATION_PATHS: Lazy<log::GenerationPathCache> =
     Lazy::new(log::GenerationPathCache::default);
 
@@ -95,6 +96,16 @@ fn load_digest(
     gen_path: &std::path::Path,
 ) -> std::sync::Arc<Option<DshSessionDigest>> {
     scan.parse(gen_path, build_digest)
+}
+
+/// 返回已匹配主会话的回合事实，复用看板的代际解析缓存。
+pub(crate) fn root_turn_facts(
+    path: &std::path::Path,
+    session_id: &str,
+) -> Option<status::TurnFacts> {
+    let digest = DSH_CONTROL_LOG_SCAN.parse_checked_identity(path, build_digest)?;
+    let digest = digest.as_ref().as_ref()?;
+    (digest.header.id == session_id && !digest.is_subagent).then(|| digest.facts.clone())
 }
 
 // 纯内容解析（session_scan.rs 要求：时间叠加绝不在此函数内）。
@@ -221,8 +232,9 @@ pub fn find_dsh_processes(system: &sysinfo::System) -> Vec<AgentProcess> {
                 exe: process.exe().map(|p| p.to_path_buf()),
                 form: ProcessForm::App,
             });
-            // 只需一个宿主（卡片 pid 用）——命中即取第一个，后续同名进程不再收集
-            break;
+            // R03（复审 P1）：收集**全部** dsh 宿主进程（esbuild 等子进程无此
+            // 二令牌不会误入）——多实例扫描需要每个实例各自的宿主 pid；单实例
+            // 场景下游取首个的行为不变（顺序保持）。
         }
     }
     out
@@ -251,10 +263,73 @@ fn probe_lock_state(session_dir: &std::path::Path) -> LockState {
 /// 出现周期对齐 zcode/codex（用户 2026-09-14 验收裁决）：仅最近 24h 有活动的
 /// 会话出卡，历史超窗会话不主动上板
 pub fn get_dsh_sessions(processes: &[AgentProcess]) -> Vec<Session> {
+    get_dsh_sessions_at(&dsh_home(), processes)
+}
+
+/// 聚合内核（R03 复审返工：默认 home 注入，测试可隔离真实数据）。
+/// **可信 root 优先**——每个已核验实例的 home 用其对应宿主 PID 扫描（归属器
+/// 枚举；同 home 多实例已被降级不返回；pid 不在 processes = 该实例宿主未运行
+/// → 无卡）。仅归属器未装配时保留默认 home 的旧兼容扫描；已装配时，
+/// 缺失或多义的 root 不借用其他宿主 PID。
+pub fn get_dsh_sessions_at(
+    default_home: &std::path::Path,
+    processes: &[AgentProcess],
+) -> Vec<Session> {
+    let mut cards = Vec::new();
+    let mut scanned: std::collections::HashSet<std::path::PathBuf> =
+        std::collections::HashSet::new();
+    let attributor = INSTANCE_ATTRIBUTOR
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    let roots = attributor
+        .as_ref()
+        .map(|a| a.attributed_scan_roots())
+        .unwrap_or_default();
+    for (home, host_pid, instance_id) in &roots {
+        if !scanned.insert(home.clone()) {
+            continue;
+        }
+        let Some(host) = processes.iter().find(|p| p.pid == *host_pid) else {
+            continue;
+        };
+        cards.extend(scan_sessions(
+            home,
+            host,
+            &DSH_LOG_SCAN,
+            Some(instance_id.as_str()),
+        ));
+    }
+    // 默认 home 兼容卡判据（R02 复审：不得借用别的实例 PID）：
+    // * 未装配归属器（旧单实例语义）→ 保留兼容卡；
+    // * 归属器在场但**完全没有已核验实例**（roots 为空）→ 保留只读兼容卡，
+    //   且卡上 dsh_instance_id 恒为 None（这是「未知单宿主」的既有产品语义）；
+    // * 归属器已产出任何 root 时，默认 home 不得再走回退——多义/无核验的 home
+    //   若回退，就会拿 processes.first() 冒充该 home 的宿主 PID。
+    //
+    // P1-3：`roots` 为空**不等于**「唯一未知宿主」——它也可能是「多宿主但一个都
+    // 没核验」。后者回退到 `processes.first()` 就是凭空贴 PID（卡片 pid 会被
+    // 写路径当成归属线索）。因此兼容卡只在**恰好一个宿主进程**时保留。
+    let have_verified_roots = !roots.is_empty();
+    let sole_unknown_host = processes.len() == 1;
+    if ((!have_verified_roots && sole_unknown_host) || attributor.is_none())
+        && !scanned.contains(default_home)
+    {
+        cards.extend(get_dsh_sessions_in(default_home, processes));
+    }
+    cards
+}
+
+/// home 注入版聚合（审查 I4① 测试面；生产语义同 [`get_dsh_sessions`]）。
+pub fn get_dsh_sessions_in(home: &std::path::Path, processes: &[AgentProcess]) -> Vec<Session> {
     let Some(host) = processes.first() else {
         return Vec::new();
     };
-    scan_sessions(&dsh_home(), host, &DSH_LOG_SCAN)
+    // 卡片实例归属（审查 I4①）：生产装配的归属器只回**已核验**实例；未装配
+    // （测试）/ 多义 / 未核验 → None，卡片不带实例 ID，不猜。写路径的归属门在
+    // hub（resolve_session），本扫描面只读、不开放新写。
+    let instance_id = attributed_instance_id(home);
+    scan_sessions(home, host, &DSH_LOG_SCAN, instance_id.as_deref())
 }
 
 /// 卡片出现窗口（对齐 zcode `CARD_WINDOW_MS` 语义）：最近 24h 内有活动的会话
@@ -263,15 +338,55 @@ const CARD_WINDOW_MS: i64 = 24 * 3600 * 1000;
 /// 出卡上限（对齐 zcode `RECENT_SESSIONS_LIMIT`）：按活跃度倒序取最近 N 张
 const RECENT_SESSIONS_LIMIT: usize = 100;
 
+/// 卡片归属钩子槽（审查 I4①）：生产装配安装
+/// `services::dsh_control::instances::InstanceAttributor` 实现；`None`
+/// （测试/未装配）= 卡片实例 ID 恒 None。RwLock 只在 setup 写一次、扫描线程读。
+static INSTANCE_ATTRIBUTOR: std::sync::RwLock<
+    Option<std::sync::Arc<dyn crate::services::dsh_control::instances::InstanceAttributor>>,
+> = std::sync::RwLock::new(None);
+
+/// 生产装配入口（`production::install_instance_attributor` 调用；幂等覆盖）。
+pub fn set_dsh_instance_attributor(
+    attributor: std::sync::Arc<dyn crate::services::dsh_control::instances::InstanceAttributor>,
+) {
+    *INSTANCE_ATTRIBUTOR
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(attributor);
+}
+
+/// 归属器测试互斥（R03）：安装/拆除全局态的两个测试串行执行，防并行互踩。
+#[cfg(test)]
+static ATTRIBUTOR_TEST_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
+
+/// 拆除归属钩子（测试恢复全局态用；生产装配不调用）。
+#[cfg(test)]
+pub fn clear_dsh_instance_attributor() {
+    *INSTANCE_ATTRIBUTOR
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+}
+
+/// 该 home 的已核验实例 ID（钩子缺席 / 多义 / 未核验 → None）。
+fn attributed_instance_id(home: &std::path::Path) -> Option<String> {
+    INSTANCE_ATTRIBUTOR
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_ref()
+        .and_then(|a| a.verified_instance_for_home(home))
+}
+
 /// 内部扫描（home 注入，测试直调——避免 DSH_HOME 环境变量在并行测试中互踩）。
 /// scan 注入式（R1 同思路）：测试用私有 SessionFileScan，防全局 namespace 被
-/// 并行测试的 retain_existing 互踩（含本测试注入条目被别处清掉的时序问题）
+/// 并行测试的 retain_existing 互踩（含本测试注入条目被别处清掉的时序问题）。
+/// `instance_id` = 归属钩子给出的已核验实例 ID（None = 未核验，不猜）。
 fn scan_sessions(
     home: &std::path::Path,
     host: &AgentProcess,
     scan: &SessionFileScan,
+    instance_id: Option<&str>,
 ) -> Vec<Session> {
-    scan_sessions_with_path_cache(home, host, scan, &DSH_GENERATION_PATHS)
+    scan_sessions_with_path_cache(home, host, scan, &DSH_GENERATION_PATHS, instance_id)
 }
 
 fn scan_sessions_with_path_cache(
@@ -279,16 +394,26 @@ fn scan_sessions_with_path_cache(
     host: &AgentProcess,
     scan: &SessionFileScan,
     path_cache: &log::GenerationPathCache,
+    instance_id: Option<&str>,
 ) -> Vec<Session> {
-    scan_sessions_with_path_cache_at(home, host, scan, path_cache, std::time::Instant::now())
+    scan_sessions_with_path_cache_at(
+        home,
+        host,
+        scan,
+        path_cache,
+        std::time::Instant::now(),
+        instance_id,
+    )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn scan_sessions_with_path_cache_at(
     home: &std::path::Path,
     host: &AgentProcess,
     scan: &SessionFileScan,
     path_cache: &log::GenerationPathCache,
     now: std::time::Instant,
+    instance_id: Option<&str>,
 ) -> Vec<Session> {
     #[cfg(test)]
     TEST_SELECTED_GENERATION_VERSION.with(|v| v.set(None));
@@ -356,10 +481,13 @@ fn scan_sessions_with_path_cache_at(
             if digest.is_subagent {
                 continue; // 子 Agent 不出卡（M0 F7）
             }
-            // 版本门（设计 P5 + 备忘 A8）：header.version 超出已知集（0..=3）→
-            // 降级卡"格式待适配"（未知语义不猜——探测红线），不影响其他会话
+            // 版本门（设计 P5 + 备忘 A8）：header.version 超出已知集（0..=4）→
+            // 降级卡"格式待适配"（未知语义不猜——探测红线），不影响其他会话。
+            // v4 纳入（2026-11-13 补齐）：真实 test 会话落盘代际已是 session.v4.jsonl.zstd
+            // （事件协议与 v3 同名同形，详情读链 remote::content 已实证可读；事件语义
+            // 版本无关，复用 v0–v3 同一套 preview/status/projcache 管线）
             if let Some(v) = header.version {
-                if !(0..=3).contains(&v) {
+                if !(0..=4).contains(&v) {
                     live_unknown_generations.insert((header.id.clone(), version));
                     if DSH_UNKNOWN_GENERATION_WARNINGS.should_warn(
                         &header.id,
@@ -402,6 +530,10 @@ fn scan_sessions_with_path_cache_at(
                             jump_supported: crate::session::jump_supported_for(ProcessForm::App),
                             unread: false,
                             unread_turned_green_at_ms: None,
+                            // 卡片实例归属（I4①）：归属钩子给出的已核验实例 ID；
+                            // 未装配/多义/未核验 → None（不猜）。
+                            dsh_instance_id: instance_id.map(str::to_owned),
+                            dsh_subagent: Some(digest.is_subagent),
                         },
                     ));
                     continue;
@@ -468,6 +600,9 @@ fn scan_sessions_with_path_cache_at(
                     // 与 codex/zcode 数据驱动绿卡同一套出现周期
                     unread: false,
                     unread_turned_green_at_ms: None,
+                    // 卡片实例归属（I4①）：同上，只写已核验实例 ID。
+                    dsh_instance_id: instance_id.map(str::to_owned),
+                    dsh_subagent: Some(digest.is_subagent),
                 },
             ));
         }
@@ -700,7 +835,7 @@ mod integration_tests {
              {\"type\":\"assistant/message\",\"seq\":9,\"data\":{\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"done\"}]}}}\n\
              {\"type\":\"turn/end\",\"seq\":10,\"data\":{\"reason\":{\"kind\":\"completed\"}}}\n",
         );
-        let sessions = scan_sessions(home.path(), &fake_host(), &test_scan());
+        let sessions = scan_sessions(home.path(), &fake_host(), &test_scan(), None);
         assert_eq!(sessions.len(), 1);
         let s = &sessions[0];
         assert_eq!(s.id, "session-abc");
@@ -715,6 +850,200 @@ mod integration_tests {
         assert!(!s.unread, "扫描侧不自判未读（池管线统一标记）");
     }
 
+    // ===== v4 会话看板（2026-11-13 补齐任务；夹具 = 脱敏 v4 形态，事件协议与 v3 同名同形）=====
+
+    /// 读取脱敏夹具（tests/fixtures/dsh/，纯文本 JSONL；zstd 帧编码在测试内现做）
+    fn dsh_fixture(name: &str) -> String {
+        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/dsh")
+            .join(name);
+        std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("读取夹具失败 {p:?}: {e}"))
+    }
+
+    /// 造一个隔离 dsh home：脱敏夹具内容按 zstd 单帧落成 `session.v4.jsonl.zstd`
+    /// （会话 id 取自夹具 header）
+    fn make_v4_home(fixture_name: &str) -> tempfile::TempDir {
+        let text = dsh_fixture(fixture_name);
+        let header = log::parse_header(&text).expect("夹具 header 可解析");
+        let dir = tempfile::tempdir().unwrap();
+        let sess = dir
+            .path()
+            .join("sessions/--tmp-proj--")
+            .join(format!("{}-dir", header.id));
+        std::fs::create_dir_all(&sess).unwrap();
+        let frame = zstd::stream::encode_all(text.as_bytes(), 3).unwrap();
+        std::fs::write(sess.join("session.v4.jsonl.zstd"), &frame).unwrap();
+        dir
+    }
+
+    #[test]
+    fn v4_completed_session_emits_full_card() {
+        // 已证事实：真实 test 会话的 v4 日志有标题、真人消息、助手回复和回合结束事件。
+        // 修复前：版本门把 v4 挡进「格式待适配（v4）」降级卡（Idle / 无消息 / 无标题）
+        let home = make_v4_home("sample7-v4-completed.sanitized.jsonl");
+        let sessions = scan_sessions(home.path(), &fake_host(), &test_scan(), None);
+        assert_eq!(sessions.len(), 1, "v4 会话必须出卡");
+        let s = &sessions[0];
+        assert_eq!(s.id, "session-v4-completed");
+        assert_eq!(s.agent_type, crate::session::AgentType::Dsh);
+        assert_eq!(s.project_name, "v4-proj", "项目名来自 header.cwd");
+        // 标题取 session/title 最新事件（provider 生成覆盖 fallback，与 v3 同语义）
+        assert_eq!(s.title.as_deref(), Some("v4 done"));
+        // 末条可见消息 = 助手回复（注入已过滤）
+        assert_eq!(s.last_message.as_deref(), Some("v4 done"));
+        assert_eq!(s.last_message_role.as_deref(), Some("assistant"));
+        // turn/end reason.kind=completed → 绿
+        assert_eq!(s.status, SessionStatus::Finished);
+        // 活动时间 = 事件流最大 time（1789311220650 = 末条 session/title），非文件 mtime
+        assert_eq!(
+            s.last_activity_at,
+            chrono::DateTime::from_timestamp_millis(1789311220650)
+                .unwrap()
+                .to_rfc3339()
+        );
+        // 未读态仍由 adapter 层未读池管线统一标记，扫描侧恒 false
+        assert!(!s.unread, "扫描侧不自判未读");
+        // 子 Agent 数缺活跃证据 → 不显示（0）
+        assert_eq!(s.active_subagent_count, 0);
+    }
+
+    #[test]
+    fn v4_running_session_maps_processing() {
+        // 开回合（turn/start 无 turn/end）+ 无锁文件（Unknown）+ 刚落盘（静默极短）
+        // → 黄·运行中（与 v0–v3 同一套判定，lock/静默兜底语义不变）
+        let home = make_v4_home("sample8-v4-running.sanitized.jsonl");
+        let sessions = scan_sessions(home.path(), &fake_host(), &test_scan(), None);
+        assert_eq!(sessions.len(), 1);
+        let s = &sessions[0];
+        assert_eq!(s.id, "session-v4-running");
+        assert_eq!(s.status, SessionStatus::Processing);
+        // 末条可见消息 = 真人输入（注入 agent-instructions 已过滤）
+        assert_eq!(s.last_message.as_deref(), Some("v4 keep going"));
+        assert_eq!(s.last_message_role.as_deref(), Some("user"));
+    }
+
+    #[test]
+    fn v4_approval_pending_maps_waiting() {
+        // 开回合 + approval/asked 未 decided → 红·等待批准（优先于运行中，P2 映射）
+        let home = make_v4_home("sample9-v4-approval-pending.sanitized.jsonl");
+        let sessions = scan_sessions(home.path(), &fake_host(), &test_scan(), None);
+        assert_eq!(sessions.len(), 1);
+        let s = &sessions[0];
+        assert_eq!(s.id, "session-v4-approval");
+        assert_eq!(s.status, SessionStatus::Waiting);
+    }
+
+    #[test]
+    fn v4_projcache_identity_gate_still_applies() {
+        // projcache 与 v4 日志的 identity 校验按 formatVersion==header.version 等值判定
+        // （版本无关）；formatVersion=4 通过 → 缓存标题优先；不匹配 → 回落日志标题
+        let home = make_v4_home("sample7-v4-completed.sanitized.jsonl");
+        let cache_dir = home.path().join("storages/session_projcache/sessions");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        let record = |fv: i64| {
+            format!(
+                r#"{{"version":7,"record":{{"identity":{{"formatVersion":{fv},"createdAt":1789311220326,"cwd":"/tmp/v4-proj","isSeeded":false}},"rows":{{"title":{{"val":"cache title"}}}}}}}}"#
+            )
+        };
+        std::fs::write(cache_dir.join("session-v4-completed.json"), record(4)).unwrap();
+        let sessions = scan_sessions(home.path(), &fake_host(), &test_scan(), None);
+        assert_eq!(sessions[0].title.as_deref(), Some("cache title"));
+
+        // formatVersion=3 与 v4 日志不匹配 → 弃缓存，回落日志标题（防张冠李戴）
+        std::fs::write(cache_dir.join("session-v4-completed.json"), record(3)).unwrap();
+        let sessions = scan_sessions(home.path(), &fake_host(), &test_scan(), None);
+        assert_eq!(sessions[0].title.as_deref(), Some("v4 done"));
+    }
+
+    #[test]
+    fn unknown_future_version_still_degrades_safely() {
+        // 未知后续版本（v5）仍安全降级：出「格式待适配」卡（未知语义不猜），
+        // 不影响其他会话——放宽 v4 不得连带放开 v5
+        let dir = tempfile::tempdir().unwrap();
+        let sess = dir.path().join("sessions/--tmp-proj--/session-future");
+        std::fs::create_dir_all(&sess).unwrap();
+        let frame = zstd::stream::encode_all(
+            b"{\"type\":\"session\",\"version\":5,\"id\":\"session-future\",\"cwd\":\"/tmp/proj\"}\n".as_slice(),
+            3,
+        )
+        .unwrap();
+        std::fs::write(sess.join("session.v5.jsonl.zstd"), &frame).unwrap();
+        let sessions = scan_sessions(dir.path(), &fake_host(), &test_scan(), None);
+        assert_eq!(sessions.len(), 1, "降级卡仍出板");
+        let s = &sessions[0];
+        assert_eq!(s.id, "session-future");
+        assert_eq!(s.title.as_deref(), Some("dsh 格式待适配（v5）"));
+        assert_eq!(s.status, SessionStatus::Idle);
+        assert_eq!(s.last_message, None);
+        assert_eq!(s.last_message_role, None);
+    }
+
+    #[test]
+    fn v4_subagent_still_excluded_from_main_list() {
+        // 子会话不上主列表（M0 F7）对 v4 同样生效：origin=subagent / delegationDepth>0
+        let dir = tempfile::tempdir().unwrap();
+        let sess = dir.path().join("sessions/--tmp-proj--/session-v4-sub");
+        std::fs::create_dir_all(&sess).unwrap();
+        let frame = zstd::stream::encode_all(
+            b"{\"type\":\"session\",\"version\":4,\"id\":\"session-v4-sub\",\"cwd\":\"/tmp/proj\",\"origin\":\"subagent\",\"delegationDepth\":1}\n".as_slice(),
+            3,
+        )
+        .unwrap();
+        std::fs::write(sess.join("session.v4.jsonl.zstd"), &frame).unwrap();
+        let sessions = scan_sessions(dir.path(), &fake_host(), &test_scan(), None);
+        assert!(sessions.is_empty(), "v4 子 Agent 会话不出卡");
+    }
+
+    #[test]
+    fn v4_detail_and_summary_attribute_messages_identically() {
+        // 详情读链（remote::content）与摘要（preview::extract）对同一份 v4 夹具的
+        // 消息归属必须一致：真人输入归 user、助手回复归 assistant、注入两侧都过滤
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join(".dsh"); // 详情读链按 home/.dsh 定位数据根
+        let text = dsh_fixture("sample7-v4-completed.sanitized.jsonl");
+        let sess = home.join("sessions/v4-proj/session-v4-completed");
+        std::fs::create_dir_all(&sess).unwrap();
+        let frame = zstd::stream::encode_all(text.as_bytes(), 3).unwrap();
+        std::fs::write(sess.join("session.v4.jsonl.zstd"), &frame).unwrap();
+
+        // 摘要（扫描侧）
+        let sessions =
+            crate::monitor::dsh::scan_sessions(home.as_path(), &fake_host(), &test_scan(), None);
+        assert_eq!(sessions.len(), 1);
+        let summary = &sessions[0];
+        assert_eq!(summary.last_message.as_deref(), Some("v4 done"));
+        assert_eq!(summary.last_message_role.as_deref(), Some("assistant"));
+
+        // 详情（remote 读链，注入核 tempdir home 直调）
+        let page = crate::remote::content::read_session_messages_with(
+            tmp.path(),
+            "dsh",
+            "session-v4-completed",
+            50,
+        )
+        .expect("v4 详情可读");
+        let visible: Vec<(String, String)> = page
+            .messages
+            .iter()
+            .map(|m| (m.kind.clone(), m.content.clone()))
+            .collect();
+        assert_eq!(
+            visible,
+            vec![
+                ("user".to_string(), "v4 hello".to_string()),
+                ("assistant".to_string(), "v4 done".to_string()),
+            ],
+            "详情可见消息：真人输入 + 助手回复，注入（system/agent-instructions/skill-catalog）两侧都不出"
+        );
+        // 归属一致：摘要末条 ≡ 详情末条
+        let last = page.messages.last().unwrap();
+        assert_eq!(summary.last_message.as_deref(), Some(last.content.as_str()));
+        assert_eq!(
+            summary.last_message_role.as_deref(),
+            Some(last.role.as_str())
+        );
+    }
+
     #[test]
     fn skips_subagent_and_missing_host() {
         // 子 Agent 会话不出卡
@@ -727,7 +1056,7 @@ mod integration_tests {
             b"{\"type\":\"session\",\"version\":0,\"id\":\"sub-1\",\"cwd\":\"/tmp\",\"origin\":\"subagent\",\"delegationDepth\":1}\n".as_slice(),
             3).unwrap();
         std::fs::write(sess.join("session.jsonl.zstd"), &frame).unwrap();
-        let with_host = scan_sessions(dir.path(), &fake_host(), &test_scan());
+        let with_host = scan_sessions(dir.path(), &fake_host(), &test_scan(), None);
         assert!(with_host.is_empty(), "子 Agent 过滤");
         // 宿主不在 → 无卡（与其他工具一致；不入扫描，无需 home）
         assert!(get_dsh_sessions(&[]).is_empty());
@@ -776,10 +1105,10 @@ mod integration_tests {
         let host = fake_host();
         TEST_GENERATION_STAT_CALLS.with(|c| c.set(0));
 
-        let first = scan_sessions_with_path_cache(home.path(), &host, &scan, &path_cache);
+        let first = scan_sessions_with_path_cache(home.path(), &host, &scan, &path_cache, None);
         assert_eq!(first.len(), 1);
         let first_stat_count = TEST_GENERATION_STAT_CALLS.with(std::cell::Cell::get);
-        let second = scan_sessions_with_path_cache(home.path(), &host, &scan, &path_cache);
+        let second = scan_sessions_with_path_cache(home.path(), &host, &scan, &path_cache, None);
         let hot_stat_count = TEST_GENERATION_STAT_CALLS.with(std::cell::Cell::get);
 
         assert_eq!(second.len(), 1);
@@ -810,7 +1139,7 @@ mod integration_tests {
         let host = fake_host();
         let base = std::time::Instant::now();
 
-        scan_sessions_with_path_cache_at(home.path(), &host, &scan, &path_cache, base);
+        scan_sessions_with_path_cache_at(home.path(), &host, &scan, &path_cache, base, None);
         assert_eq!(
             TEST_SELECTED_GENERATION_VERSION.with(std::cell::Cell::get),
             Some(3)
@@ -823,6 +1152,7 @@ mod integration_tests {
             &scan,
             &path_cache,
             base + std::time::Duration::from_secs(2),
+            None,
         );
         assert_eq!(
             TEST_SELECTED_GENERATION_VERSION.with(std::cell::Cell::get),
@@ -835,6 +1165,7 @@ mod integration_tests {
             &scan,
             &path_cache,
             base + std::time::Duration::from_secs(4),
+            None,
         );
         assert_eq!(
             TEST_SELECTED_GENERATION_VERSION.with(std::cell::Cell::get),
@@ -849,6 +1180,7 @@ mod integration_tests {
             &scan,
             &path_cache,
             base + std::time::Duration::from_secs(14),
+            None,
         );
         assert_eq!(
             TEST_SELECTED_GENERATION_VERSION.with(std::cell::Cell::get),
@@ -867,13 +1199,15 @@ mod integration_tests {
         let scan = test_scan();
         let host = fake_host();
         std::fs::write(&generation_path, b"broken").unwrap();
-        assert!(scan_sessions_with_path_cache(home.path(), &host, &scan, &path_cache).is_empty());
+        assert!(
+            scan_sessions_with_path_cache(home.path(), &host, &scan, &path_cache, None).is_empty()
+        );
         let enum_after_failure = path_cache.enumeration_count();
 
         let valid = "{\"type\":\"session\",\"version\":3,\"id\":\"session-recovery\",\"cwd\":\"/tmp/proj\"}\n{\"type\":\"turn/end\",\"seq\":2,\"data\":{\"reason\":{\"kind\":\"completed\"}}}\n";
         let frame = zstd::stream::encode_all(valid.as_bytes(), 3).unwrap();
         std::fs::write(&generation_path, frame).unwrap();
-        let recovered = scan_sessions_with_path_cache(home.path(), &host, &scan, &path_cache);
+        let recovered = scan_sessions_with_path_cache(home.path(), &host, &scan, &path_cache, None);
 
         assert_eq!(recovered.len(), 1, "文件内容修复后 L2 缓存失效并恢复出卡");
         assert_eq!(
@@ -897,10 +1231,10 @@ mod integration_tests {
         let scan = test_scan();
         TEST_DIGEST_CALLS.with(|c| c.set(0));
         assert!(
-            scan_sessions(home.path(), &host, &scan).is_empty(),
+            scan_sessions(home.path(), &host, &scan, None).is_empty(),
             "解析失败不出卡"
         );
-        let second = scan_sessions(home.path(), &host, &scan);
+        let second = scan_sessions(home.path(), &host, &scan, None);
         assert!(second.is_empty(), "两轮均不出卡");
         TEST_DIGEST_CALLS.with(|c| {
             assert_eq!(
@@ -930,6 +1264,365 @@ mod integration_tests {
         dir
     }
 
+    /// 持有同一把全局锁，并在断言 panic 时恢复安装前归属器。
+    struct AttributorTestGuard {
+        previous:
+            Option<std::sync::Arc<dyn crate::services::dsh_control::instances::InstanceAttributor>>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl AttributorTestGuard {
+        fn acquire() -> Self {
+            let lock = ATTRIBUTOR_TEST_LOCK
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let previous = INSTANCE_ATTRIBUTOR
+                .read()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone();
+            Self {
+                previous,
+                _lock: lock,
+            }
+        }
+    }
+
+    impl Drop for AttributorTestGuard {
+        fn drop(&mut self) {
+            *INSTANCE_ATTRIBUTOR
+                .write()
+                .unwrap_or_else(|p| p.into_inner()) = self.previous.take();
+        }
+    }
+
+    struct TestHost(std::process::Child);
+
+    impl TestHost {
+        fn id(&self) -> u32 {
+            self.0.id()
+        }
+
+        fn stop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    impl Drop for TestHost {
+        fn drop(&mut self) {
+            self.stop();
+        }
+    }
+
+    /// roots 会随活体发现变化；失去可信归属或多义时，不返回该 home 的 root。
+    #[derive(Default)]
+    struct DynamicRootAttributor {
+        roots: std::sync::RwLock<Vec<(std::path::PathBuf, u32, String)>>,
+    }
+
+    impl crate::services::dsh_control::instances::InstanceAttributor for DynamicRootAttributor {
+        fn verified_instance_for_home(&self, home: &std::path::Path) -> Option<String> {
+            let roots = self.roots.read().unwrap();
+            let mut matching = roots.iter().filter(|(root, _, _)| root == home);
+            let first = matching.next()?;
+            matching.next().is_none().then(|| first.2.clone())
+        }
+
+        fn attributed_scan_roots(&self) -> Vec<(std::path::PathBuf, u32, String)> {
+            let roots = self.roots.read().unwrap();
+            roots
+                .iter()
+                .filter(|(home, _, _)| {
+                    roots.iter().filter(|(other, _, _)| other == home).count() == 1
+                })
+                .cloned()
+                .collect()
+        }
+    }
+
+    #[test]
+    fn unknown_single_host_still_emits_default_home_card() {
+        let _attributor_guard = AttributorTestGuard::acquire();
+        let home = make_home_timed(
+            "session-unknown-single-host",
+            chrono::Utc::now().timestamp_millis(),
+        );
+        let mut host = fake_host();
+        host.pid = 41004;
+        // 生产会装配归属器；尚无可信 root 的未知单宿主仍须保留默认 home 只读兼容卡。
+        set_dsh_instance_attributor(std::sync::Arc::new(DynamicRootAttributor::default()));
+        let cards = get_dsh_sessions_at(home.path(), std::slice::from_ref(&host));
+        assert_eq!(cards.len(), 1, "未知单宿主应出一张兼容卡，不能空集合通过");
+        assert_eq!(cards[0].id, "session-unknown-single-host");
+        assert_eq!(cards[0].pid, 41004, "兼容卡归属唯一运行宿主");
+        assert_eq!(cards[0].dsh_instance_id, None, "未知归属不得编造实例 ID");
+    }
+
+    #[test]
+    fn default_home_with_ambiguous_owners_does_not_borrow_custom_host_pid() {
+        let _attributor_guard = AttributorTestGuard::acquire();
+        let now = chrono::Utc::now().timestamp_millis();
+        let home_a = make_home_timed("session-ambiguous-a", now);
+        let home_b = make_home_timed("session-unambiguous-b", now);
+        let mut host_a = fake_host();
+        host_a.pid = 41001;
+        let mut host_b = fake_host();
+        host_b.pid = 41002;
+        let mut other_owner_a = fake_host();
+        other_owner_a.pid = 41003;
+        // 同一默认 home 有两个归属；符合生产归属器契约，仅 B 留在扫描 roots。
+        set_dsh_instance_attributor(std::sync::Arc::new(DynamicRootAttributor {
+            roots: std::sync::RwLock::new(vec![
+                (
+                    home_a.path().to_path_buf(),
+                    host_a.pid,
+                    "inst-a-desktop".into(),
+                ),
+                (
+                    home_a.path().to_path_buf(),
+                    other_owner_a.pid,
+                    "inst-a-web".into(),
+                ),
+                (home_b.path().to_path_buf(), host_b.pid, "inst-b".into()),
+            ]),
+        }));
+        // 故意让 B 排第一，捕获默认 home 回退误用 processes.first()。
+        let cards = get_dsh_sessions_at(home_a.path(), &[host_b, host_a, other_owner_a]);
+        assert!(
+            cards.iter().all(|s| s.id != "session-ambiguous-a"),
+            "默认 home 归属多义时不得任取其他宿主 PID，实际 {:?}",
+            cards
+                .iter()
+                .map(|s| (&s.id, s.pid, &s.dsh_instance_id))
+                .collect::<Vec<_>>()
+        );
+        assert!(cards.iter().any(|s| s.id == "session-unambiguous-b"
+            && s.pid == 41002
+            && s.dsh_instance_id.as_deref() == Some("inst-b")));
+    }
+
+    /// 审查 I4①：归属钩子接线后 DSH 卡片携带已核验实例 ID；未装配/拆除 → None。
+    /// 假归属器按 home 作用域返回（不影响并行测试的其他临时 home）。
+    /// R03（复审 P1）回归锁：归属器枚举非全局 home 扫描根——自定义 B home 的
+    /// 卡片出板且带 B 实例 ID、宿主 pid 归属正确；pid 不在 processes = B 未运行
+    /// → 无卡。
+    /// R03（复审 P1）验收：**真实发现入口 → 聚合出卡**——spawn 真实 node 宿主
+    /// 进程（cmdline 带 dsh+web 令牌），find_dsh_processes 收集全部（不截断首项），
+    /// 聚合（注入默认 home 隔离真实数据）按可信 root 的 PID 对位出卡；进程顺序
+    /// 置换不改变归属；A 消失后 A 卡不再出现。
+    #[test]
+    fn real_discovery_feeds_multi_instance_aggregation() {
+        let _attributor_guard = AttributorTestGuard::acquire();
+        use std::process::{Command, Stdio};
+        // 两个真实 node 宿主进程（长驻，cmdline 含 dsh+web 令牌）
+        let node = std::env::var("NODE_BIN").unwrap_or_else(|_| "node".into());
+        let spawn_host = || {
+            Command::new(&node)
+                .args(["-e", "setInterval(()=>{},1000)"])
+                // 令牌放 `--` 之后的 argv（node 不解析为选项；进程存活且
+                // cmdline 含 dsh+web 二令牌供发现判定）
+                .args(["--", "dsh", "web"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("node 可启动")
+        };
+        let mut host_a = TestHost(spawn_host());
+        let host_b = TestHost(spawn_host());
+        std::thread::sleep(std::time::Duration::from_millis(300)); // 等 ps 可见
+        let mut system = sysinfo::System::new();
+        // cmd 信息必须显式收集（nothing() 不含 cmd——与适配器生产刷新同口径）
+        system.refresh_processes_specifics(
+            sysinfo::ProcessesToUpdate::All,
+            true,
+            sysinfo::ProcessRefreshKind::nothing().with_cmd(sysinfo::UpdateKind::Always),
+        );
+        let discovered = find_dsh_processes(&system);
+        let pids: Vec<u32> = discovered.iter().map(|p| p.pid).collect();
+        assert!(
+            pids.contains(&host_a.id()) && pids.contains(&host_b.id()),
+            "发现必须收集全部宿主（A/B 均在列），实际: {pids:?}"
+        );
+
+        // 两个 temp home（A=默认、B=自定义），各挂一个会话目录
+        let temp = tempfile::tempdir().unwrap();
+        let default_home = temp.path().join("default");
+        let custom_b = temp.path().join("custom-b");
+        for (home, sid) in [(&default_home, "session-a"), (&custom_b, "session-b")] {
+            let dir = home.join("sessions/project").join(sid);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("session.jsonl"),
+                format!(
+                    r#"{{"id":"{sid}"}}
+"#
+                ),
+            )
+            .unwrap();
+        }
+        let pid_a = host_a.id();
+        let pid_b = host_b.id();
+        let attributor = std::sync::Arc::new(DynamicRootAttributor {
+            roots: std::sync::RwLock::new(vec![
+                (default_home.clone(), pid_a, "inst-a".into()),
+                (custom_b.clone(), pid_b, "inst-b".into()),
+            ]),
+        });
+        set_dsh_instance_attributor(attributor.clone());
+
+        // 场景 1：A/B 并存（进程顺序置换——B 在前）。
+        let mut procs = discovered.clone();
+        procs.reverse(); // 顺序置换：first = B，若首项截断/错位即失败
+        let cards = get_dsh_sessions_at(&default_home, &procs);
+        let a_card = cards
+            .iter()
+            .find(|s| s.dsh_instance_id.as_deref() == Some("inst-a"))
+            .expect("A 卡必须出板");
+        let b_card = cards
+            .iter()
+            .find(|s| s.dsh_instance_id.as_deref() == Some("inst-b"))
+            .expect("B 卡必须出板（不得被首项截断）");
+        assert_eq!(
+            a_card.pid, pid_a,
+            "A 卡 pid 归属 A 宿主（默认 home 不附 B PID）"
+        );
+        assert_eq!(b_card.pid, pid_b, "B 卡 pid 归属 B 宿主");
+
+        // A 真退出后重跑发现；roots 同步失去 A，保留其新鲜历史文件。
+        host_a.stop();
+        system.refresh_processes_specifics(
+            sysinfo::ProcessesToUpdate::All,
+            true,
+            sysinfo::ProcessRefreshKind::nothing().with_cmd(sysinfo::UpdateKind::Always),
+        );
+        let procs_b = find_dsh_processes(&system);
+        assert!(
+            !procs_b.iter().any(|p| p.pid == pid_a),
+            "A 已从真实发现消失"
+        );
+        assert!(procs_b.iter().any(|p| p.pid == pid_b), "B 仍在真实发现中");
+        attributor
+            .roots
+            .write()
+            .unwrap()
+            .retain(|(_, pid, _)| *pid != pid_a);
+        let cards = get_dsh_sessions_at(&default_home, &procs_b);
+        assert!(
+            cards.iter().all(|s| s.id != "session-a"),
+            "默认 home A 同时从 processes/roots 消失后不得借 B PID 出卡，实际 {:?}",
+            cards
+                .iter()
+                .map(|s| (&s.id, s.pid, &s.dsh_instance_id))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            cards.iter().any(|s| s.id == "session-b"
+                && s.pid == pid_b
+                && s.dsh_instance_id.as_deref() == Some("inst-b")),
+            "B 照常出卡"
+        );
+        // TestHost / AttributorTestGuard 在正常返回与 panic 时均回收现场。
+    }
+
+    #[test]
+    fn attributed_scan_roots_extend_cards_to_custom_instance_homes() {
+        let _attributor_guard = AttributorTestGuard::acquire();
+        use crate::services::dsh_control::instances::InstanceAttributor;
+        struct MultiRootAttributor {
+            root_a: std::path::PathBuf,
+            root_b: std::path::PathBuf,
+            pid_b: u32,
+        }
+        impl InstanceAttributor for MultiRootAttributor {
+            fn verified_instance_for_home(&self, home: &std::path::Path) -> Option<String> {
+                if home == self.root_a {
+                    Some("inst-a".into())
+                } else if home == self.root_b {
+                    Some("inst-b".into())
+                } else {
+                    None
+                }
+            }
+            fn attributed_scan_roots(&self) -> Vec<(std::path::PathBuf, u32, String)> {
+                vec![
+                    (self.root_a.clone(), 41001, "inst-a".into()),
+                    (self.root_b.clone(), self.pid_b, "inst-b".into()),
+                ]
+            }
+        }
+        let home_b = make_home_timed(
+            "session-r03-b",
+            chrono::Utc::now().timestamp_millis() - 60_000,
+        );
+        let root_b = home_b.path().to_path_buf();
+        let default_home = tempfile::tempdir().unwrap();
+        // 宿主进程 pid 必须在 processes 里才能出卡
+        let mut host_b = fake_host();
+        host_b.pid = 424_242;
+        set_dsh_instance_attributor(std::sync::Arc::new(MultiRootAttributor {
+            root_a: std::path::PathBuf::from("/nonexistent-a"),
+            root_b: root_b.clone(),
+            pid_b: 424_242,
+        }));
+        let cards = get_dsh_sessions_at(default_home.path(), std::slice::from_ref(&host_b));
+        let b_card = cards
+            .iter()
+            .find(|s| s.dsh_instance_id.as_deref() == Some("inst-b"));
+        assert!(b_card.is_some(), "B home 的卡片必须出板且带 B 实例 ID");
+        assert_eq!(b_card.unwrap().pid, 424_242, "卡片 pid 归属 B 宿主进程");
+        // 拆除后以有真实会话的 B home 作为默认根，验证旧兼容扫描确实出卡。
+        clear_dsh_instance_attributor();
+        let cards = get_dsh_sessions_at(&root_b, std::slice::from_ref(&host_b));
+        assert_eq!(cards.len(), 1, "拆除归属器后仍须保留默认 home 的只读卡");
+        assert_eq!(cards[0].id, "session-r03-b");
+        assert_eq!(cards[0].pid, 424_242);
+        assert_eq!(cards[0].dsh_instance_id, None, "拆除后不再声明实例归属");
+    }
+
+    #[test]
+    fn dsh_cards_carry_verified_instance_id_when_attributor_installed() {
+        let _attributor_guard = AttributorTestGuard::acquire();
+        use crate::services::dsh_control::instances::InstanceAttributor;
+        struct ScopedAttributor(std::path::PathBuf, &'static str);
+        impl InstanceAttributor for ScopedAttributor {
+            fn verified_instance_for_home(&self, home: &std::path::Path) -> Option<String> {
+                if home == self.0 {
+                    Some(self.1.to_string())
+                } else {
+                    None
+                }
+            }
+        }
+        let home = make_home_timed(
+            "session-inst",
+            chrono::Utc::now().timestamp_millis() - 60_000,
+        );
+        let host = fake_host();
+        // 未装配：卡片不带实例 ID。
+        let cards = get_dsh_sessions_in(home.path(), std::slice::from_ref(&host));
+        assert_eq!(cards.len(), 1);
+        assert!(
+            cards[0].dsh_instance_id.is_none(),
+            "未装配归属器时卡片不得带实例 ID"
+        );
+        // 装配（仅本 home 作用域）：卡片带已核验实例 ID。
+        set_dsh_instance_attributor(std::sync::Arc::new(ScopedAttributor(
+            home.path().to_path_buf(),
+            "inst-verified",
+        )));
+        let cards = get_dsh_sessions_in(home.path(), std::slice::from_ref(&host));
+        assert_eq!(cards.len(), 1);
+        assert_eq!(
+            cards[0].dsh_instance_id.as_deref(),
+            Some("inst-verified"),
+            "接线后卡片必须携带已核验实例 ID"
+        );
+        // 拆除：恢复全局 None（并行测试零影响）。
+        clear_dsh_instance_attributor();
+        let cards = get_dsh_sessions_in(home.path(), &[host]);
+        assert!(cards[0].dsh_instance_id.is_none());
+    }
+
     #[test]
     fn sessions_outside_card_window_do_not_emit() {
         // 出现周期（对齐 zcode 24h 窗口，用户 2026-09-14 验收裁决）：超窗历史
@@ -948,11 +1641,11 @@ mod integration_tests {
         let fresh_home = make_home_timed("session-fresh", now - 3600 * 1000);
         let host = fake_host();
         assert!(
-            scan_sessions(old_home.path(), &host, &test_scan()).is_empty(),
+            scan_sessions(old_home.path(), &host, &test_scan(), None).is_empty(),
             "超窗历史会话不出卡"
         );
         assert_eq!(
-            scan_sessions(fresh_home.path(), &host, &test_scan()).len(),
+            scan_sessions(fresh_home.path(), &host, &test_scan(), None).len(),
             1,
             "窗内会话出卡"
         );
@@ -992,7 +1685,7 @@ mod integration_tests {
         // 两次 scan 共用同一私有实例（缓存例外跨 scan 验证的前提）
         let scan = test_scan();
         TEST_DIGEST_CALLS.with(|c| c.set(0));
-        let cards = scan_sessions(home.path(), &host, &scan);
+        let cards = scan_sessions(home.path(), &host, &scan, None);
         assert_eq!(cards.len(), 1, "仅窗内会话出卡");
         assert_eq!(cards[0].id, "session-fresh");
         // 机器证明（评审 Minor）：冷扫描只解析窗内 fresh 一次——超窗 stale 未被
@@ -1009,7 +1702,7 @@ mod integration_tests {
         // 一条（键=48h 前 mtime，与 peek 比对键一致），再扫应例外出卡
         scan.parse(&stale_gen, build_digest);
         TEST_DIGEST_CALLS.with(|c| c.set(0));
-        let cards2 = scan_sessions(home.path(), &host, &scan);
+        let cards2 = scan_sessions(home.path(), &host, &scan, None);
         let ids: Vec<String> = cards2.iter().map(|c| c.id.clone()).collect();
         assert_eq!(
             cards2.len(),
@@ -1052,6 +1745,8 @@ mod integration_tests {
             jump_supported: true,
             unread: false,
             unread_turned_green_at_ms: None,
+            dsh_instance_id: None,
+            dsh_subagent: None,
         };
         let cards = vec![(100, mk("old")), (300, mk("new")), (200, mk("mid"))];
         let out = take_recent(cards, 2);
@@ -1069,7 +1764,7 @@ mod integration_tests {
         );
         let host = fake_host();
         assert_eq!(
-            scan_sessions(home.path(), &host, &test_scan())[0].status,
+            scan_sessions(home.path(), &host, &test_scan(), None)[0].status,
             SessionStatus::Finished
         );
         let dir = home.path().join("sessions/--tmp-proj--/session-abc");
@@ -1084,11 +1779,66 @@ mod integration_tests {
             .unwrap(),
         );
         std::fs::write(&gen, &bytes).unwrap();
-        let cards = scan_sessions(home.path(), &host, &test_scan());
+        let cards = scan_sessions(home.path(), &host, &test_scan(), None);
         assert_eq!(
             cards[0].status,
             SessionStatus::Waiting,
             "追加 error 帧后应重扫"
+        );
+    }
+    /// P1-3：`roots` 为空且**多个**宿主进程在场时，不得用 `processes.first()`
+    /// 给默认 home 贴任何 PID。
+    ///
+    /// 为什么这是安全相关：`roots` 为空有两种含义——「唯一未知宿主」和「多宿主
+    /// 但一个都没核验」。前者回退是既有产品语义（无选择时的只读兼容卡）；后者
+    /// 回退等于凭进程表顺序编造归属，卡片上的 pid 又会被写路径当成线索。
+    /// 这里用真实会话文件 + 多进程表把二者区分开。
+    #[test]
+    fn default_home_does_not_borrow_a_pid_when_multiple_hosts_are_unattributed() {
+        let _attributor_guard = AttributorTestGuard::acquire();
+        use crate::services::dsh_control::instances::InstanceAttributor;
+
+        /// 归属器在场但**一个实例都认不出来**（roots 为空）。
+        struct NothingVerified;
+        impl InstanceAttributor for NothingVerified {
+            fn verified_instance_for_home(&self, _home: &std::path::Path) -> Option<String> {
+                None
+            }
+            fn attributed_scan_roots(&self) -> Vec<(std::path::PathBuf, u32, String)> {
+                Vec::new()
+            }
+        }
+
+        let home = make_home_timed(
+            "session-p13",
+            chrono::Utc::now().timestamp_millis() - 60_000,
+        );
+        // 多宿主：两个进程都在表里，归属器一个都不认。
+        let mut host_a = fake_host();
+        host_a.pid = 5_101;
+        let mut host_b = fake_host();
+        host_b.pid = 5_102;
+        set_dsh_instance_attributor(std::sync::Arc::new(NothingVerified));
+
+        let cards = get_dsh_sessions_at(home.path(), &[host_a.clone(), host_b.clone()]);
+        assert!(
+            cards.is_empty(),
+            "多宿主且无核验归属时不得借任一 PID 出卡（不猜测归属）；实际 {} 张，pid={:?}",
+            cards.len(),
+            cards.iter().map(|c| c.pid).collect::<Vec<_>>()
+        );
+
+        // 对照：**唯一**宿主时保留只读兼容卡（既有产品语义，pid 就是那唯一一个）。
+        let cards = get_dsh_sessions_at(home.path(), std::slice::from_ref(&host_a));
+        assert_eq!(
+            cards.len(),
+            1,
+            "唯一未知宿主的只读兼容卡语义必须保留（否则单实例用户开局就见不到历史卡）"
+        );
+        assert_eq!(cards[0].pid, 5_101);
+        assert_eq!(
+            cards[0].dsh_instance_id, None,
+            "未核验归属的兼容卡不得声明实例 ID"
         );
     }
 }

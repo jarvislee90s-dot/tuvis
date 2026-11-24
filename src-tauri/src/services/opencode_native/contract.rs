@@ -1536,6 +1536,8 @@ mod tests {
             complete: true,
             capabilities,
             messages: vec![SessionMessage {
+                blocks: Vec::new(),
+                media: Vec::new(),
                 seq: 0,
                 role: "user".into(),
                 kind: "user".into(),

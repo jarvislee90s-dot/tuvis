@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import SubagentChips, {
   chipTokenText,
@@ -51,6 +51,19 @@ describe("SubagentChips（纯展示）", () => {
     expect(screen.queryByTestId("subagent-chip-b1")).toBeNull();
   });
 
+  it("H08：unknown 不冒充 running chip，也不影响同列 running/idle 的过滤", () => {
+    const unknown = { ...sa("dsh-child", "idle", null), status: "unknown" } as SubagentView;
+    render(
+      <SubagentChips
+        list={[unknown, sa("active", "running", null), sa("done", "idle", null)]}
+        onOpenDetail={() => {}}
+      />
+    );
+    expect(screen.getByTestId("subagent-chip-active")).toBeTruthy();
+    expect(screen.queryByTestId("subagent-chip-done")).toBeNull();
+    expect(screen.queryByTestId("subagent-chip-dsh-child")).toBeNull();
+  });
+
   it("list=null / 全 idle / 空 → 不渲染", () => {
     const { container, rerender } = render(<SubagentChips list={null} onOpenDetail={() => {}} />);
     expect(container.querySelector('[data-testid="subagent-chips"]')).toBeNull();
@@ -72,7 +85,9 @@ describe("SubagentChips（纯展示）", () => {
     };
     render(<Probe />);
     expect(screen.getByTestId("subagent-chip-a1").textContent).toContain("0:00");
-    await vi.advanceTimersByTimeAsync(61_000);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(61_000);
+    });
     expect(screen.getByTestId("subagent-chip-a1").textContent).toContain("1:01");
     expect(parentRenders).toBe(1, "1s tick 只重渲染本组件");
     fireEvent.click(screen.getByTestId("subagent-chip-a1"));

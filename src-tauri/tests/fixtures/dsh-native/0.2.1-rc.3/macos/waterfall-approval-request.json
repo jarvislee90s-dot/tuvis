@@ -1,0 +1,12 @@
+{
+  "type": "waterfall",
+  "event": "approval/request",
+  "eventId": "evt-17",
+  "agentId": "agent-probe-1",
+  "request": {
+    "toolName": "bash",
+    "callId": "call-probe-1",
+    "reason": "probe sentinel command",
+    "displayReason": "执行探针哨兵命令"
+  }
+}

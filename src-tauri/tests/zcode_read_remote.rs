@@ -618,7 +618,7 @@ async fn new_id_reaches_remote_reading() {
         board_hidden_ids: Box::new(move || hidden_src.lock().unwrap().clone()),
         board_hidden_hide: Arc::new(|_| 0usize),
         board_hidden_unhide: Arc::new(|_| 0usize),
-        unread_mark_read: Arc::new(|_, _| ()),
+        unread_mark_read: Arc::new(|_, _, _| ()),
         session_close: Arc::new(|_| Ok(())),
         store: DeviceStore::Owned(conn.clone()),
         host_source: Box::new(|| serde_json::json!({ "host": { "name": "test-host" } })),
@@ -653,6 +653,12 @@ async fn new_id_reaches_remote_reading() {
             conn.clone(),
         ))),
         desktop_language: Default::default(),
+        dsh_control: multi_agents_manager_lib::services::dsh_control::disabled_arc(),
+        dsh_auto_adapt_source: std::sync::Arc::new(
+            multi_agents_manager_lib::services::dsh_control::production::dsh_auto_adapt_enabled,
+        ),
+        dsh_console_mount: None,
+        dsh_console_upstream_source: None,
     });
     let app = router(state);
 

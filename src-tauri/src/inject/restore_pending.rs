@@ -1301,6 +1301,8 @@ mod tests {
     /// （起窗前目录核对 realpath 化）——夹具用 tempdir，项目目录零伪造。
     fn oc_sess(id: &str, cwd: &std::path::Path) -> Session {
         Session {
+            dsh_instance_id: None,
+            dsh_subagent: None,
             id: id.into(),
             agent_type: AgentType::OpenCode,
             project_name: "proj".into(),

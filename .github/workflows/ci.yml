@@ -36,6 +36,8 @@ jobs:
               - "README.md"
               - "README.zh-CN.md"
               - "src/**"
+              - "packages/dsh-remote-access/**"
+              - "resources/dsh/**"
               # 错误码门禁在 frontend job 同时消费 Rust/TS 源；后端独改也必须触发。
               - "src-tauri/src/**"
               - "scripts/**"
@@ -56,6 +58,7 @@ jobs:
               - ".github/workflows/**"
             backend:
               - "src-tauri/**"
+              - "resources/dsh/**"
               - "rust-toolchain.toml"
               - ".github/workflows/**"
 
@@ -96,10 +99,16 @@ jobs:
       - run: node scripts/check-error-codes.mjs
       - run: pnpm build
       - run: pnpm test
+      - run: pnpm --filter @tuvis/dsh-remote-access test
+      - run: node scripts/build-dsh-plugin.mjs --check
 
   backend:
     name: Backend Checks
     runs-on: ubuntu-latest
+    env:
+      # Keep both feature variants' test binaries small on the hosted runner.
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
     needs: changes
     if: github.event_name != 'pull_request' || needs.changes.outputs.backend == 'true'
     steps:
@@ -141,8 +150,39 @@ jobs:
       # 互相踩踏 → 随机数十例 FAILED（本机实测：默认并行 51 failed，-j 1 只有既有的
       # 5 例 HOME 隔离基线，且串行更快）。这是既有测试脆弱性，与业务代码无关；
       # 限并行度让门禁稳定，真正的根治（共享锁串行化建链用例）另立。
+      # 注意：此步骤**不** export TUVIS_HOME/DSH_HOME/TUVIS_DSH_STATE_DIR——
+      # lib 守卫用例（database::connection::real_entry_point_is_isolated_in_this_process）
+      # 验证 lib 单测进程不读用户环境；需要隔离数据根的 DSH 回归（含 m05 生产根
+      # 来源测试）统一在下方 security probes 步骤的显式清单里跑。
       # opencode-coordinator-tests：保留底层成功回归；同套 B1 用例仍走生产未知归属门。
       - run: cd src-tauri && cargo test --features marker-helper,opencode-coordinator-tests -j 2
+
+      # 关键 DSH 竞态探针默认不编译；显式启用并隔离三个数据根。
+      - name: DSH security regression probes
+        run: |
+          TEST_ROOT="$(mktemp -d)"
+          trap 'rm -rf "$TEST_ROOT"' EXIT
+          export TUVIS_HOME="$TEST_ROOT/tuvis" DSH_HOME="$TEST_ROOT/dsh" TUVIS_DSH_STATE_DIR="$TEST_ROOT/state"
+          cd src-tauri
+          cargo test --features dsh-test-probes -j 2 \
+            --test dsh_hello_registered_race_test \
+            --test dsh_ipc_late_console_credential_test \
+            --test h09_console_ws_pending_test \
+            --test dsh_auth_event_proofs_barrier_test \
+            --test dsh_m04_auth_rendezvous_race_test \
+            --test dsh_m04_rendezvous_multiround_uds_test \
+            --test dsh_m04_real_ipc_pressure_test \
+            --test dsh_m04_peer_channel_blocking_test \
+            --test dsh_m06_arm_intent_regression_test \
+            --test dsh_close_pending_failclosed_recovery_test \
+            --test dsh_switch_upgrade_rejoin_console_test \
+            --test dsh_install_test \
+            --test dsh_macos_desktop_cli_web_discovery_test \
+            --test dsh_management_cross_process_lock_test \
+            --test m05_file_replacement_race_test \
+            --test m05_file_protected_roots_test \
+            --test dsh_media_route_test \
+            -- --test-threads=1
 
       # cfg(windows) 编译门禁（issue #45）：CI host 是 linux，win32.rs 等整模块
       # #[cfg(windows)] 代码在上述步骤中不可达、破损静默通过（detector.rs:732 一例）。
@@ -179,6 +219,10 @@ jobs:
           cargo test --locked --features opencode-coordinator-tests --lib opencode_native -- --test-threads=4
           cargo test --locked --features opencode-coordinator-tests --lib close_does_not_kill_opencode
           cargo test --locked --features opencode-coordinator-tests --test opencode_native_remote --test opencode_pin_readonly --test opencode_attachment_binding_regression
+
+      - name: Run macOS DSH Web identity tests
+        working-directory: src-tauri
+        run: cargo test --locked --test dsh_web_home_r01_test -- --test-threads=1
 
   build:
     name: Build verification

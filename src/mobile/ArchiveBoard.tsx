@@ -198,7 +198,7 @@ export default function ArchiveBoard({
       <div className="flex flex-col gap-2 pb-8">
         {rows.map((s) => (
           <button
-            key={s.sessionId}
+            key={JSON.stringify([s.sessionId, s.instanceId])}
             type="button"
             onClick={() => onOpenCard(s)}
             className="rounded-xl border border-[var(--cb)] px-3 py-2.5 text-left enabled:hover:bg-[var(--cbg)]"

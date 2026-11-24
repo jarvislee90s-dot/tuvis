@@ -274,6 +274,15 @@ impl DeviceStore {
         self.with_core(f, probe)
     }
 
+    pub(crate) fn try_with<R>(&self, f: impl FnOnce(&rusqlite::Connection) -> R) -> Option<R> {
+        let mutex = match self {
+            Self::Global => &*crate::database::connection::DB,
+            Self::Owned(arc) => &**arc,
+        };
+        let guard = mutex.try_lock().ok()?;
+        Some(f(&guard))
+    }
+
     fn with_core<R>(
         &self,
         f: impl FnOnce(&rusqlite::Connection) -> R,

@@ -1,0 +1,5 @@
+{
+  "type": "server-response",
+  "rpcId": "invalid-request",
+  "result": { "ok": false, "error": { "code": "unpaired" } }
+}

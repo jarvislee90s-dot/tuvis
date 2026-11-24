@@ -15,6 +15,7 @@ const ARCHIVE_REFRESH_SECS: i64 = 60;
 #[derive(Debug, Clone)]
 pub struct SessionArchiveRow {
     pub session_id: String,
+    pub dsh_instance_id: Option<String>,
     pub agent_type: String,
     pub project_path: String,
     pub project_name: String,
@@ -52,7 +53,7 @@ fn last_seen_stale(last_seen: &str) -> bool {
     }
 }
 
-/// 批量登记（全局 DB；挂点：adapter::get_all_sessions_inner 尾部）。
+/// 批量登记（全局 DB；挂点：adapter::get_all_sessions_commit 尾部——Important-2 提交段专属）。
 /// 返回实际写入行数（测试与调试观测用）。**纯读消费入参，不改扫描产物**。
 pub fn register_sessions(sessions: &[Session]) {
     let conn = DB.lock().unwrap();
@@ -66,10 +67,19 @@ pub fn register_sessions_conn(conn: &Connection, sessions: &[Session]) -> usize 
         if s.project_path.trim().is_empty() {
             continue;
         }
+        let instance_key = if s.agent_type == AgentType::Dsh {
+            let Some(id) = s.dsh_instance_id.as_deref().filter(|id| !id.is_empty()) else {
+                continue;
+            };
+            id
+        } else {
+            ""
+        };
         let existing: Option<(Option<String>, String, String, String)> = conn
             .query_row(
-                "SELECT title, last_status, project_path, last_seen FROM session_archive WHERE session_id = ?",
-                [&s.id],
+                "SELECT title, last_status, project_path, last_seen FROM session_archive
+                 WHERE session_id = ?1 AND instance_key = ?2",
+                params![s.id, instance_key],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .ok();
@@ -90,7 +100,8 @@ pub fn register_sessions_conn(conn: &Connection, sessions: &[Session]) -> usize 
         if existing.is_some() {
             conn.execute(
                 "UPDATE session_archive SET title=?1, last_status=?2, project_path=?3,
-                 project_name=?4, agent_type=?5, last_seen=?6, updated_at=?6 WHERE session_id=?7",
+                 project_name=?4, agent_type=?5, last_seen=?6, updated_at=?6
+                 WHERE session_id=?7 AND instance_key=?8",
                 params![
                     s.title,
                     status,
@@ -98,7 +109,8 @@ pub fn register_sessions_conn(conn: &Connection, sessions: &[Session]) -> usize 
                     s.project_name,
                     s.agent_type.tool_id(),
                     now,
-                    s.id
+                    s.id,
+                    instance_key
                 ],
             )
             .map(|_| written += 1)
@@ -107,8 +119,8 @@ pub fn register_sessions_conn(conn: &Connection, sessions: &[Session]) -> usize 
             conn.execute(
                 "INSERT INTO session_archive
                  (session_id, agent_type, project_path, project_name, title, last_status,
-                  first_seen, last_seen, updated_at)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?7,?7)",
+                  first_seen, last_seen, updated_at, instance_key)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?7,?7,?8)",
                 params![
                     s.id,
                     s.agent_type.tool_id(),
@@ -116,7 +128,8 @@ pub fn register_sessions_conn(conn: &Connection, sessions: &[Session]) -> usize 
                     s.project_name,
                     s.title,
                     status,
-                    now
+                    now,
+                    instance_key
                 ],
             )
             .map(|_| written += 1)
@@ -137,7 +150,7 @@ pub fn query_archive_all() -> Vec<SessionArchiveRow> {
 pub fn query_archive_all_conn(conn: &Connection) -> Vec<SessionArchiveRow> {
     let mut stmt = match conn.prepare(
         "SELECT session_id, agent_type, project_path, project_name, title, last_status,
-                first_seen, last_seen, updated_at
+                first_seen, last_seen, updated_at, NULLIF(instance_key, '')
          FROM session_archive ORDER BY last_seen DESC",
     ) {
         Ok(s) => s,
@@ -154,6 +167,7 @@ pub fn query_archive_all_conn(conn: &Connection) -> Vec<SessionArchiveRow> {
             first_seen: row.get(6)?,
             last_seen: row.get(7)?,
             updated_at: row.get(8)?,
+            dsh_instance_id: row.get(9)?,
         })
     })
     .map(|rows| rows.filter_map(Result::ok).collect())
@@ -167,10 +181,25 @@ pub fn delete_archive(session_id: Option<&str>) -> usize {
 }
 
 /// 同上（连接注入版）
+pub(crate) fn delete_instance_archive_conn(
+    conn: &Connection,
+    session_id: &str,
+    instance_id: &str,
+) -> usize {
+    conn.execute(
+        "DELETE FROM session_archive WHERE session_id = ?1 AND instance_key = ?2 AND agent_type = 'dsh'",
+        params![session_id, instance_id],
+    )
+    .unwrap_or(0)
+}
+
 pub fn delete_archive_conn(conn: &Connection, session_id: Option<&str>) -> usize {
     match session_id {
         Some(id) => conn
-            .execute("DELETE FROM session_archive WHERE session_id = ?", [id])
+            .execute(
+                "DELETE FROM session_archive WHERE session_id = ? AND instance_key = ''",
+                [id],
+            )
             .unwrap_or(0),
         None => conn.execute("DELETE FROM session_archive", []).unwrap_or(0),
     }
@@ -209,6 +238,8 @@ mod tests {
             jump_supported: false,
             unread: false,
             unread_turned_green_at_ms: None,
+            dsh_instance_id: None,
+            dsh_subagent: None,
         }
     }
 

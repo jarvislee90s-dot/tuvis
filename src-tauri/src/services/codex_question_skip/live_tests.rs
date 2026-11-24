@@ -965,7 +965,7 @@ async fn review_r2_same_hub_restart_watermark_advances_across_two_cycles() {
             board_hidden_ids: Box::new(Vec::new),
             board_hidden_hide: Arc::new(|_| 0),
             board_hidden_unhide: Arc::new(|_| 0),
-            unread_mark_read: Arc::new(|_, _| ()),
+            unread_mark_read: Arc::new(|_, _, _| ()),
             session_close: Arc::new(|_| Ok(())),
             store: store.clone(),
             host_source: Box::new(|| json!({})),
@@ -994,6 +994,12 @@ async fn review_r2_same_hub_restart_watermark_advances_across_two_cycles() {
             screen_probe: Arc::new(|_, _| None),
             codex_control: hub.clone(),
             desktop_language: Default::default(),
+            dsh_control: crate::services::dsh_control::disabled_arc(),
+            dsh_auto_adapt_source: std::sync::Arc::new(
+                crate::services::dsh_control::production::dsh_auto_adapt_enabled,
+            ),
+            dsh_console_mount: None,
+            dsh_console_upstream_source: None,
         })
     };
     hub.start(make_state());
@@ -1082,7 +1088,7 @@ async fn run_hub_restart_check(check_sequence: bool) {
         board_hidden_ids: Box::new(Vec::new),
         board_hidden_hide: Arc::new(|_| 0),
         board_hidden_unhide: Arc::new(|_| 0),
-        unread_mark_read: Arc::new(|_, _| ()),
+        unread_mark_read: Arc::new(|_, _, _| ()),
         session_close: Arc::new(|_| Ok(())),
         store,
         host_source: Box::new(|| json!({})),
@@ -1111,6 +1117,12 @@ async fn run_hub_restart_check(check_sequence: bool) {
         screen_probe: Arc::new(|_, _| None),
         codex_control: hub.clone(),
         desktop_language: Default::default(),
+        dsh_control: crate::services::dsh_control::disabled_arc(),
+        dsh_auto_adapt_source: std::sync::Arc::new(
+            crate::services::dsh_control::production::dsh_auto_adapt_enabled,
+        ),
+        dsh_console_mount: None,
+        dsh_console_upstream_source: None,
     });
     hub.start(state.clone());
     let mut f = GuardFixture::with_live(live.clone()).await;

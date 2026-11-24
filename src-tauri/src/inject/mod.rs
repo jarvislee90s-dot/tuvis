@@ -97,7 +97,7 @@ pub fn inject_list_audit(limit: Option<usize>) -> serde_json::Value {
 /// 原 Task 5 的 queue.rs 私有版提升至此（Task 6）：flush/jump/fail 落账（queue::settle）
 /// 与 session-send / queue / retract 端点审计两处共用，单一出口防词表漂移。
 /// 字段化入参而非 QueueRow：端点侧审计（send/queue/retract）没有整行可传。
-/// action 词表（W5）：send|queue|flush|jump|retract|approve|reject|fail|key|open
+/// action 词表（W5）：send|queue|flush|jump|retract|approve|reject|fail|key|open|dialog|dsh_action_reserve
 /// （open = Task 11 一键 resume，Task 7 的预留标注已兑现）。Phase C 追加
 /// `create|dialog`（远程新建会话：create=任务终态行、dialog=弹窗处置逐条留痕）。
 /// 批次乙 T8 追加

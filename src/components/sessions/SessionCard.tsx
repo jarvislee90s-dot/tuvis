@@ -90,10 +90,12 @@ export function SessionCard({
               agentType: session.agentType,
               sessionId: session.id,
               status: session.status,
+              instanceId: session.dshInstanceId,
             })
           : await invoke<SessionMutationOutcome>("mark_session_read", {
               agentType: session.agentType,
               sessionId: session.id,
+              instanceId: session.dshInstanceId,
             });
       if (!outcome?.applied) {
         console.warn(

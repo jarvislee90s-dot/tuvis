@@ -1,0 +1,19 @@
+{
+  "type": "waterfall",
+  "event": "user-questions/request",
+  "eventId": "evt-17",
+  "agentId": "agent-probe-1",
+  "request": {
+    "questions": [
+      {
+        "id": "fruit_choice",
+        "question": "选苹果还是香蕉？",
+        "header": "水果选择",
+        "options": [
+          { "label": "苹果", "description": "红富士（合成描述）" },
+          { "label": "香蕉", "description": "进口香蕉（合成描述）" }
+        ]
+      }
+    ]
+  }
+}

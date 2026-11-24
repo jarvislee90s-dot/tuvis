@@ -1,22 +1,13 @@
 {
   "$comment": "能力矩阵唯一维护源。中英 README 由 pnpm sync:capabilities 生成；官网按同名应用 tag 同步此文件。支持状态、名称、备注和单元格说明只在此修改。",
-  "updated": "2026-11-22",
+  "updated": "2026-11-24",
   "legend": {
     "yes": "✅ 支持",
     "partial": "◐ 部分",
     "experimental": "🧪 试验性",
     "no": "❌ 不支持"
   },
-  "tools": [
-    "claude",
-    "codex",
-    "opencode",
-    "kimi",
-    "workbuddy",
-    "zcode",
-    "dsh",
-    "openclaw"
-  ],
+  "tools": ["claude", "codex", "opencode", "kimi", "workbuddy", "zcode", "dsh", "openclaw"],
   "groups": [
     {
       "key": "desktop",
@@ -177,8 +168,8 @@
             "zcode": "yes",
             "dsh": "no"
           },
-          "note": "四家试验性：OpenClaw/WorkBuddy 黑盒无外部写通道，dsh 写通道另评；ZCode 走官方桥接（见下行），非终端注入",
-          "noteEn": "Experimental for four CLI tools. OpenClaw and WorkBuddy have no external write channel, and dsh writing requires a separate review; ZCode rides the official bridge (see next row), not terminal injection."
+          "note": "四家试验性：OpenClaw/WorkBuddy 黑盒无外部写通道。dsh 不走终端按键注入，另经 Desktop 通道（受实例/授权/契约门控）；ZCode 走官方桥接（见下行），非终端注入",
+          "noteEn": "Experimental for four CLI tools. OpenClaw and WorkBuddy have no external write channel. dsh does not use terminal keystroke injection; it uses the Desktop channel, gated by instance, authorization and contract. ZCode rides the official bridge (see next row), not terminal injection."
         },
         {
           "name": "手机 · 新建会话",
@@ -222,8 +213,10 @@
             "kimi": "no",
             "workbuddy": "no",
             "zcode": "no",
-            "dsh": "no"
-          }
+            "dsh": "partial"
+          },
+          "note": "dsh 的 Windows 实现已就位（句柄锚定 + 拒绝重解析点），但**无运行证据**，暂按部分支持申报",
+          "noteEn": "the dsh Windows implementation is in place (handle-anchored, reparse points refused) but has no runtime evidence, so it is reported as partial"
         },
         {
           "name": "Codex APP 会话远程控制（Desktop IPC）",
@@ -258,6 +251,57 @@
           },
           "note": "**0.6.5 重磅：ZCode 全面功能接入**。ZCode 桌面端经官方桥接（单条 relay，BigModel OAuth）把 workspace / 会话投影到看板，手机端可：发送消息（含运行中排队）、应答阻塞问答（单选/多选/自由文本）、批准命令与文件、计划审批（批准或反馈修改意见）、定向打断、切换供应商/模型/思维档位（显式确认修改）、切换协作模式（计划/自动编辑/变更前确认/完全访问）、本地待发队列（入队/插队/再编辑/撤回/继续）。控制走动作账本 + actionId 幂等，按宿主 build 证据逐项开闸（能力 key 随 build/协议变化自动失效重算），账号 JWT 只在系统凭据保险箱与受控内存。**Windows 实机验证**（3.17.2.9661：发送/问答/打断/模型档位/协作模式全通过，队列在 Windows 3.17.2 亦有实机链路）；ZAI 通道仅源码与模拟证据，暂不开放授权。",
           "noteEn": "**0.6.5 flagship: ZCode full feature integration**. The ZCode desktop app projects its workspace and sessions onto the board over the official bridge (single relay, BigModel OAuth); from the phone you can send messages (queued while a turn runs), answer blocking Q&A (single/multi-select, free text), approve commands and files, review plans (approve or send change feedback), interrupt a running turn, switch provider/model/thinking level (explicit apply), switch collaboration modes (Plan / Auto edit / Confirm-before-changes / Full access), and manage the local outbox (enqueue, prioritise, edit, retract, resume). Control runs on an action ledger with idempotent actionIds, gated per host build evidence (capability keys auto-invalidate on build/protocol changes), and the account JWT lives only in the system credential vault and controlled memory. **Verified on Windows** (3.17.2.9661: send / Q&A / interrupt / model & level / collaboration mode all pass; the outbox is also exercised against Windows 3.17.2). The ZAI channel has source-and-simulation evidence only; authorisation stays closed for now."
+        },
+        {
+          "key": "dsh_native_control",
+          "name": "手机 · DSH 原生操控",
+          "nameEn": "Mobile · DSH native controls",
+          "support": {
+            "claude": "no",
+            "codex": "no",
+            "opencode": "no",
+            "openclaw": "no",
+            "kimi": "no",
+            "workbuddy": "no",
+            "zcode": "no",
+            "dsh": "partial"
+          },
+          "note": "发送文本与附件、停止、整组答题和会话设置。macOS Desktop 有隔离实测，其他组合按宿主能力开放。",
+          "noteEn": "Send text and attachments, stop turns, answer question groups, and change session settings. Isolated macOS Desktop evidence is available. Other combinations depend on host capabilities."
+        },
+        {
+          "key": "opencode_native_control",
+          "name": "手机 · OpenCode 原生操控",
+          "nameEn": "Mobile · OpenCode native controls",
+          "support": {
+            "claude": "no",
+            "codex": "no",
+            "opencode": "partial",
+            "openclaw": "no",
+            "kimi": "no",
+            "workbuddy": "no",
+            "zcode": "no",
+            "dsh": "no"
+          },
+          "note": "macOS 支持官方原生路径，Windows 尚未接入原生写入。",
+          "noteEn": "The official native route is available on macOS. Native writes are unavailable on Windows."
+        },
+        {
+          "name": "手机 · DSH 控制台",
+          "nameEn": "Mobile · DSH console",
+          "key": "dsh_console",
+          "support": {
+            "claude": "no",
+            "codex": "no",
+            "opencode": "no",
+            "openclaw": "no",
+            "kimi": "no",
+            "workbuddy": "no",
+            "zcode": "no",
+            "dsh": "partial"
+          },
+          "note": "隔离走 opaque sandbox（控制台脚本无同源权限）；LAN/quick/自有域名/Tailscale 共用同一入口，真实网络回程与 Windows 运行未验收",
+          "noteEn": "Isolated via opaque sandbox (console scripts get no same-origin privileges); one entry shared by LAN/quick/named/Tailscale, with real network round-trips and Windows runtime not yet accepted"
         },
         {
           "name": "输出速度（TPS 采样）",
@@ -349,6 +393,10 @@
     "codex": {
       "zh": "Codex 列同时涵盖 CLI 与 APP；桌面 APP 的远程控制见独立行，按操作契约证据开放。Windows 26.1103.3517.0 已验证空闲异步答题双向同步。",
       "en": "The Codex column covers both CLI and APP; Desktop APP control has its own row and is gated per operation by contract evidence. Bidirectional idle async answers are verified on Windows 26.1103.3517.0."
+    },
+    "dshPlatform": {
+      "zh": "DSH 0.6.8 新增原生操控和官方控制台。macOS Desktop 已有隔离宿主发送和设置回读证据，子 Agent 提供只读列表与详情。Windows 原生运行待验证，Windows Web 实例归属尚未实现，macOS Web 写入及四渠道真实控制台往返仍待复验。DSH 通过原生通道发送，终端注入不适用。",
+      "en": "Tuvis 0.6.8 adds DSH native controls and the official console. Isolated macOS Desktop tests verified sending and settings readback, and macOS offers read-only subagent lists and details. Native behavior on Windows remains unverified, Windows Web instance attribution is unavailable, and macOS Web writes and real console round trips across all four channels await validation. DSH uses its native channel for sending."
     }
   }
 }

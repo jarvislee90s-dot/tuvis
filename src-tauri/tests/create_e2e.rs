@@ -950,7 +950,7 @@ async fn e2e_create_http_full_chain() {
         board_hidden_ids: Box::new(Vec::new),
         board_hidden_hide: std::sync::Arc::new(|_| 0usize),
         board_hidden_unhide: std::sync::Arc::new(|_| 0usize),
-        unread_mark_read: std::sync::Arc::new(|_, _| ()),
+        unread_mark_read: std::sync::Arc::new(|_, _, _| ()),
         session_close: std::sync::Arc::new(|_| Ok(())),
         sse_registry: Arc::new(SseRegistry::default()),
         max_devices_source: Box::new(|| 3),
@@ -968,6 +968,10 @@ async fn e2e_create_http_full_chain() {
         screen_probe: Arc::new(|_sid: &str, pid: u32| read_screen_lines(pid)),
 
         codex_control: multi_agents_manager_lib::remote::codex_ipc::CodexControlHub::disabled_arc(),
+        dsh_control: multi_agents_manager_lib::services::dsh_control::disabled_arc(),
+        dsh_console_mount: None,
+        dsh_console_upstream_source: None,
+        dsh_auto_adapt_source: std::sync::Arc::new(|| true),
         desktop_language: Default::default(),
         // 任务 8：OpenCode 原生交互中枢——禁用默认（惰性容器零 IO；本 E2E 不触原生
         // 路由，业务断言不变）

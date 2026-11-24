@@ -210,6 +210,15 @@ export async function fetchUiConfig(): Promise<UiConfig | null> {
  *  toolName 保留供辨识、toolArgs 恒空——不透传参数串）；
  *  system-note 是 OpenCode synthetic 系统提醒（如切 agent 的 Plan mode 提示），
  *  content 已剥掉 `<system-reminder>` 标签，collapsed 恒 true */
+export interface DshMediaReference {
+  refId: string;
+  kind: "image" | "file";
+  name: string;
+  unavailable?: boolean;
+}
+
+type DshMessageBlock = { kind: "text"; text: string } | { kind: "media"; refId: string };
+
 export interface SessionMessage {
   seq: number;
   role: string;
@@ -227,14 +236,27 @@ export interface SessionMessage {
   toolName?: string | null;
   toolArgs?: string | null;
   collapsed: boolean;
+  media?: DshMediaReference[];
+  blocks?: DshMessageBlock[];
 }
 
-/** 会话消息页（Bug 1，M3 验收）：messages + truncated（文件头部被字节窗截断的
- *  标记——SQLite 系与 dsh 恒 false）。truncated=true 表示存在更早未在本页的内容，
- *  即使条数 < limit 也应显示「加载更早消息」 */
+/** 会话消息页：truncated 表示存在更早未在本页的内容。DSH 按可见消息数判断，
+ *  其他读取器可能按字节窗口判断；即使条数 < limit 也应显示「加载更早消息」。 */
 export interface SessionMessagesPage {
   messages: SessionMessage[];
   truncated: boolean;
+  /** N06：只读模型/思考强度摘要（DSH 专属可选键）。缺失 = 无证，不显示。 */
+  dshModelSummary?: DshModelSummary;
+}
+
+/** N06：控制台按钮旁展示的只读模型摘要（Rust `content::DshModelSummary` 镜像）。
+ *  `source` 决定文案：`next` = 当前下一步选择；`last_used` = 同会话最近一次实际调用
+ *  （必须标「上次使用」，不得冒充当前）。 */
+export interface DshModelSummary {
+  model: string;
+  displayName?: string;
+  reasoningEffort?: string;
+  source: "next" | "last_used";
 }
 
 /** 拉取单会话消息流尾部（八工具统一出口）。读取失败（会话不存在 / 存储不可读）
@@ -244,13 +266,17 @@ export interface SessionMessagesPage {
 export async function fetchSessionMessages(
   agentType: string,
   sessionId: string,
-  limit: number
+  limit: number,
+  instanceId?: string,
+  history = false
 ): Promise<SessionMessagesPage> {
   const q = new URLSearchParams({
     agent_type: agentType,
     session_id: sessionId,
     limit: String(limit),
   });
+  if (instanceId !== undefined) q.set("instanceId", instanceId);
+  if (history && agentType === "dsh") q.set("history", "1");
   let r: Response;
   try {
     r = await fetch(`/m/api/v1/session-messages?${q}`);
@@ -261,10 +287,15 @@ export async function fetchSessionMessages(
     );
   }
   if (!r.ok) throw new ApiError(r.status, `session-messages ${r.status}`);
-  const j = (await r.json()) as { messages?: SessionMessage[]; truncated?: boolean };
+  const j = (await r.json()) as {
+    messages?: SessionMessage[];
+    truncated?: boolean;
+    dshModelSummary?: DshModelSummary;
+  };
   return {
     messages: Array.isArray(j.messages) ? j.messages : [],
     truncated: j.truncated === true,
+    ...(j.dshModelSummary ? { dshModelSummary: j.dshModelSummary } : {}),
   };
 }
 
@@ -297,19 +328,26 @@ export interface SessionFileEntry {
 export async function fetchSessionFiles(
   agentType: string,
   sessionId: string,
-  limit: number
-): Promise<{ files: SessionFileEntry[]; truncated: boolean }> {
+  limit: number,
+  instanceId?: string
+): Promise<{ files: SessionFileEntry[]; truncated: boolean; media?: DshMediaReference[] }> {
   const q = new URLSearchParams({
     agent_type: agentType,
     session_id: sessionId,
     limit: String(limit),
   });
+  if (instanceId !== undefined) q.set("instanceId", instanceId);
   try {
     const r = await fetch(`/m/api/v1/session-files?${q}`);
     if (!r.ok) return { files: [], truncated: false };
-    const j = (await r.json()) as { files?: SessionFileEntry[]; truncated?: boolean };
+    const j = (await r.json()) as {
+      files?: SessionFileEntry[];
+      truncated?: boolean;
+      media?: DshMediaReference[];
+    };
     return {
       files: Array.isArray(j.files) ? j.files : [],
+      ...(agentType === "dsh" && Array.isArray(j.media) ? { media: j.media } : {}),
       truncated: j.truncated === true,
     };
   } catch {
@@ -336,16 +374,38 @@ export async function fetchFile(
   sessionId: string,
   filePath: string,
   onProgress?: (loaded: number, total: number | null) => void,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  // R05（复审 P2）：DSH 会话按实例限定文件归属（非 DSH / 旧调用省略）
+  instanceId?: string
 ): Promise<FilePayload> {
   if (signal?.aborted) throw new DOMException("aborted", "AbortError");
   const q = new URLSearchParams({ session_id: sessionId, path: filePath });
+  if (instanceId) q.set("instanceId", instanceId);
+  return fetchFilePayload(`/m/api/v1/file?${q}`, onProgress, signal);
+}
+
+export function fetchDshMedia(
+  instanceId: string | undefined,
+  sessionId: string,
+  refId: string,
+  onProgress?: (loaded: number, total: number | null) => void,
+  signal?: AbortSignal
+): Promise<FilePayload> {
+  if (!instanceId) return Promise.reject(new ApiError(403, "missing DSH instance"));
+  const q = new URLSearchParams({ instanceId, sessionId, refId });
+  return fetchFilePayload(`/m/api/v1/dsh/media?${q}`, onProgress, signal);
+}
+
+async function fetchFilePayload(
+  url: string,
+  onProgress?: (loaded: number, total: number | null) => void,
+  signal?: AbortSignal
+): Promise<FilePayload> {
+  if (signal?.aborted) throw new DOMException("aborted", "AbortError");
   let r: Response;
   try {
     // 无 signal 时保持旧调用形态（单参 fetch；既有契约测试逐参断言）
-    r = signal
-      ? await fetch(`/m/api/v1/file?${q}`, { signal })
-      : await fetch(`/m/api/v1/file?${q}`);
+    r = signal ? await fetch(url, { signal }) : await fetch(url);
   } catch (e) {
     if (signal?.aborted) throw e; // 主动中止：交给调用方按取消处理
     throw new ApiError(null, `MOBILE_NETWORK_FAIL:file: file 网络异常: ${String(e)}`);
@@ -518,6 +578,9 @@ export interface SendInfo {
   reason?: string;
   channels?: string[];
   visibility?: "realtime" | "after_refresh";
+  attachmentUnavailableReasonCode?: string;
+  /** 配对设备的重试分区，不是授权凭据。 */
+  dshRetryScope?: string;
   /**
    * S2：打断后持久暂停（serde default 向后兼容——旧后端缺省 undefined）。
    * 暂停**不置灰**：用户仍可选「恢复队列」（POST /codex/queue/resume，唯一解除出口）
@@ -555,8 +618,13 @@ export interface SendInfo {
 /** 拉取输入区可用性（W4：输入区挂载时一次）。403（设备失效，与 fetchSessions
  *  同语义）→ null；其余失败（404 会话不在快照 / 网络异常）→ 抛 ApiError，
  *  由调用方静默降级（不渲染输入区，详情页正文照常） */
-export async function fetchSendInfo(sessionId: string): Promise<SendInfo | null> {
+export async function fetchSendInfo(
+  sessionId: string,
+  // R05（复审残留）：DSH 会话按实例限定 send-info 归属（非 DSH / 旧调用省略）
+  instanceId?: string
+): Promise<SendInfo | null> {
   const q = new URLSearchParams({ session_id: sessionId });
+  if (instanceId) q.set("instanceId", instanceId);
   let r: Response;
   try {
     r = await fetch(`/m/api/v1/session-send-info?${q}`);
@@ -567,6 +635,13 @@ export async function fetchSendInfo(sessionId: string): Promise<SendInfo | null>
     );
   }
   if (r.status === 403) return null; // 设备失效 → 回配对页
+  if (r.status === 404 && instanceId) {
+    const unavailable: unknown = await r.json().catch(() => null);
+    if (unavailable && typeof unavailable === "object" && "dshRetryScope" in unavailable) {
+      const scope = unavailable.dshRetryScope;
+      if (typeof scope === "string") return { injectable: false, dshRetryScope: scope };
+    }
+  }
   if (!r.ok) throw new ApiError(r.status, `session-send-info ${r.status}`);
   return (await r.json()) as SendInfo;
 }
@@ -685,6 +760,42 @@ export interface HeadlessReceipt {
   reason?: string;
 }
 
+/** DSH 动作回执（与 Rust `dsh_control::model::ActionReceipt` 逐字段对应，勿漂移）。
+ *  state 是 dsh 动作账本的 9 档状态（snake_case）；nativeId = 原生 rpcId 归因。 */
+export interface DshActionReceipt {
+  actionId: string;
+  state:
+    | "reserved"
+    | "queued"
+    | "accepted"
+    | "running"
+    | "succeeded"
+    | "rejected"
+    | "failed"
+    | "unknown_delivery"
+    | "cancelled";
+  nativeId: string | null;
+  reasonCode: string | null;
+}
+
+export interface DshActionView {
+  receipt: DshActionReceipt;
+  target: { hostId: string; epoch: number; sessionId: string | null };
+  updatedAtMs: number;
+}
+
+export async function fetchDshAction(
+  actionId: string,
+  signal?: AbortSignal
+): Promise<DshActionView> {
+  const response = await fetch(`/m/api/v1/dsh/action/${encodeURIComponent(actionId)}`, {
+    signal,
+    cache: "no-store",
+  });
+  if (!response.ok) throw new ApiError(response.status, `dsh/action ${response.status}`);
+  return (await response.json()) as DshActionView;
+}
+
 export type SendResult =
   | { status: "delivered" }
   | { status: "submitted" }
@@ -705,6 +816,18 @@ export type SendResult =
    *  unknown_delivery=投递结果未知（**绝不自动重试**）；not_sent=零投递（同 actionId
    *  重试安全）；rejected=明确拒绝。 */
   | { status: "desktop_ipc"; receipt: ActionReceipt }
+  /** **DSH Desktop 原生回执**（T10）：receipt 与 Rust `dsh_control::model::ActionReceipt`
+   *  逐字段对应（camelCase）。queued=忙态排队（同会话效果落地后自动推进，客户端零
+   *  重试）；accepted=宿主受理（≠成功）；failed=明确失败（同 actionId 换 payload 前
+   *  可重试）；unknown_delivery=投递结果未知（**绝不自动重试**，与 desktop_ipc 同
+   *  纪律）。回执卡片渲染归 T19 移动 UI。 */
+  | {
+      status: "dsh";
+      receipt: DshActionReceipt;
+      /** M1：幂等重放标记——本回执是既有动作的重放（非新接单）；客户端锚
+       *  生命周期据此判定（duplicate 时以回执状态为准，不冒充新发送）。 */
+      duplicate?: true;
+    }
   /** **忙 Thread 留队**：Desktop 忙时普通消息进 codex_actions FIFO，空闲按序自动派发。 */
   | { status: "codex_queued"; actionId: string; position: number };
 
@@ -723,19 +846,27 @@ export async function sessionSend(
   text: string,
   queueOnly?: boolean,
   actionId?: string,
-  bypassPausedQueue?: boolean
+  bypassPausedQueue?: boolean,
+  instanceId?: string,
+  signal?: AbortSignal,
+  dshRetryScope?: string
 ): Promise<SendResult> {
   let r: Response;
   try {
     r = await fetch("/m/api/v1/session-send", {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      ...(signal ? { signal } : {}),
+      headers: {
+        "content-type": "application/json",
+        ...(dshRetryScope === undefined ? {} : { "x-tuvis-dsh-retry-scope": dshRetryScope }),
+      },
       body: JSON.stringify({
         sessionId,
         text,
         ...(queueOnly ? { queueOnly: true } : {}),
         ...(actionId !== undefined ? { actionId } : {}),
         ...(bypassPausedQueue ? { bypassPausedQueue: true } : {}),
+        ...(instanceId !== undefined ? { instanceId } : {}),
       }),
     });
   } catch (e) {
@@ -778,7 +909,10 @@ export async function uploadAttachment(
   file: File,
   signal?: AbortSignal,
   onProgress?: (loaded: number, total: number) => void,
-  context?: { route: "opencode_native"; bindingToken: string } | { route: "legacy" }
+  context?:
+    | { route: "opencode_native"; bindingToken: string }
+    | { route: "legacy" }
+    | { instanceId: string; route?: never }
 ): Promise<{ path: string; size: number; excludeWarning?: string } | null> {
   if (signal?.aborted) {
     throw new ApiError(
@@ -787,7 +921,8 @@ export async function uploadAttachment(
     );
   }
   const q = new URLSearchParams({ session_id: sessionId, name: file.name });
-  if (context) q.set("interaction_route", context.route);
+  if (context?.route) q.set("interaction_route", context.route);
+  if (context && "instanceId" in context) q.set("instanceId", context.instanceId);
   return new Promise<{ path: string; size: number; excludeWarning?: string } | null>(
     (resolve, reject) => {
       const xhr = new XMLHttpRequest();
@@ -806,7 +941,6 @@ export async function uploadAttachment(
       };
       xhr.onload = () => {
         finish();
-        if (xhr.status === 403) return resolve(null); // 设备失效 → 回配对页
         if (xhr.status >= 200 && xhr.status < 300) {
           try {
             resolve(
@@ -823,13 +957,17 @@ export async function uploadAttachment(
         }
         // 非 2xx：错误码在响应体 error 字段（no_cwd / too_large 等），对齐 fetch 版
         let reason = `session-attachment ${xhr.status}`;
+        let data: Record<string, unknown> | null = null;
         try {
-          const j = JSON.parse(xhr.responseText) as { error?: unknown };
-          if (typeof j?.error === "string") reason = j.error;
+          data = JSON.parse(xhr.responseText) as Record<string, unknown>;
+          if (typeof data?.reasonCode === "string") reason = data.reasonCode;
+          else if (typeof data?.error === "string") reason = data.error;
         } catch {
           /* 响应体非 JSON：保留默认 reason */
         }
-        reject(new ApiError(xhr.status, reason));
+        if (xhr.status === 403 && data?.error === "forbidden" && !data.reasonCode)
+          return resolve(null);
+        reject(new ApiError(xhr.status, reason, data));
       };
       xhr.onerror = () => {
         finish();
@@ -1708,6 +1846,7 @@ export async function sessionOpen(
 // ==== 历史会话区（spec 2026-09-20-mobile-archive-history §6.1）====
 export interface ArchivedSession {
   sessionId: string;
+  instanceId?: string;
   agentType: string;
   projectPath: string;
   projectName: string;
@@ -1735,9 +1874,13 @@ export async function fetchArchivedSessions(days: 1 | 3 | 7): Promise<ArchivedPa
 }
 
 /** 归档手动管理（spec 裁决 8）：带 id = 单条移除；缺省 = 清空全部 */
-export async function deleteArchivedSession(sessionId?: string): Promise<number> {
-  const qs = sessionId ? `?session_id=${encodeURIComponent(sessionId)}` : "?all=1";
-  const r = await fetch(`/m/api/v1/sessions-archived${qs}`, { method: "DELETE" });
+export async function deleteArchivedSession(
+  sessionId?: string,
+  instanceId?: string
+): Promise<number> {
+  const query = new URLSearchParams(sessionId ? { session_id: sessionId } : { all: "1" });
+  if (sessionId && instanceId) query.set("instanceId", instanceId);
+  const r = await fetch(`/m/api/v1/sessions-archived?${query}`, { method: "DELETE" });
   if (!r.ok) throw new ApiError(r.status, `sessions-archived DELETE ${r.status}`);
   const data = (await r.json()) as { deleted: number };
   return data.deleted;
@@ -1967,7 +2110,7 @@ export interface SubagentView {
   description: string | null;
   spawnTs: string | null;
   tokens: { input: number; cacheRead: number; cacheCreation: number; output: number };
-  status: "running" | "idle";
+  status: "running" | "idle" | "unknown";
   endTs: string | null;
 }
 
@@ -1976,9 +2119,11 @@ export interface SubagentView {
  *  ApiError（调用方静默，ModeBar 同惯例） */
 export async function fetchSessionSubagents(
   agentType: string,
-  sessionId: string
+  sessionId: string,
+  instanceId?: string
 ): Promise<SubagentView[]> {
   const q = new URLSearchParams({ agent_type: agentType, session_id: sessionId });
+  if (instanceId) q.set("instanceId", instanceId);
   let r: Response;
   try {
     r = await fetch(`/m/api/v1/session-subagents?${q}`);
@@ -1993,24 +2138,145 @@ export async function fetchSessionSubagents(
   return data.subagents;
 }
 
+/**
+ * 打开 DSH 控制台：后端返回**相对**能力路径（`/console/<token>/`）。
+ *
+ * 相对路径是刻意的：四渠道（LAN / quick 随机域名 / 自有域名 / Tailscale）
+ * 由浏览器按当前渠道 origin 解析，后端不硬编码任何地址，换渠道无需改入口。
+ * 控制台在 opaque sandbox 中运行，与兔维斯管理面不共享浏览器权限域。
+ *
+ * T3：失败响应体里的**安全机器码**（`{error: code}`）原样放进 `ApiError.data`，
+ * 由 `consoleEntryErrorCopy` 按码映射可操作文案（弹窗拦截/设备授权过期/
+ * 实例不可用/网页凭据未就绪分开呈现，不再折叠成一句通用失败）。
+ */
+export async function fetchConsoleEntry(
+  sessionId: string,
+  instanceId?: string
+): Promise<{ url: string }> {
+  const q = new URLSearchParams({ session_id: sessionId });
+  if (instanceId) q.set("instanceId", instanceId);
+  let r: Response;
+  try {
+    r = await fetch(`/m/api/v1/dsh-console-entry?${q}`);
+  } catch (e) {
+    throw new ApiError(null, `MOBILE_NETWORK_FAIL:console-entry: 控制台入口网络异常: ${String(e)}`);
+  }
+  if (!r.ok) {
+    throw new ApiError(r.status, `console-entry ${r.status}`, await errorBodyJson(r));
+  }
+  const issued: unknown = await r.json();
+  if (
+    !issued ||
+    typeof issued !== "object" ||
+    !("ticket" in issued) ||
+    typeof issued.ticket !== "string" ||
+    !issued.ticket.trim()
+  ) {
+    throw new ApiError(null, "console-entry invalid ticket");
+  }
+  const redeemed = await fetch("/m/api/v1/dsh-console-redeem", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ticket: issued.ticket }),
+  });
+  if (!redeemed.ok) {
+    throw new ApiError(
+      redeemed.status,
+      `console-redeem ${redeemed.status}`,
+      await errorBodyJson(redeemed)
+    );
+  }
+  const result: unknown = await redeemed.json();
+  if (
+    !result ||
+    typeof result !== "object" ||
+    !("url" in result) ||
+    typeof result.url !== "string" ||
+    !/^\/console\/[a-f0-9]{32}\/$/.test(result.url)
+  ) {
+    throw new ApiError(null, "console-redeem invalid url");
+  }
+  return { url: result.url };
+}
+
+/** 错误响应体 JSON（`{error: 机器码}` 等）；非 JSON/非对象 → null（不假装有码）。 */
+async function errorBodyJson(r: Response): Promise<Record<string, unknown> | null> {
+  try {
+    const body: unknown = await r.json();
+    return body && typeof body === "object" && !Array.isArray(body)
+      ? (body as Record<string, unknown>)
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+/** DSH 机器码（`DSH_*`）→ `errors.*` 双语词表文案（与 formatInvokeError 的
+ *  camel 规则同源）；非 DSH 码或词表未登记 → null（调用方自定回退，不猜）。 */
+export function dshReasonCopy(code: string): string | null {
+  if (!code.startsWith("DSH_")) return null;
+  const key = `errors.${code
+    .toLowerCase()
+    .split("_")
+    .map((w, i) => (i === 0 ? w : w.charAt(0).toUpperCase() + w.slice(1)))
+    .join("")}`;
+  const text = i18n.t(key, { defaultValue: "" });
+  return text ? text : null;
+}
+
+/** 控制台入口/兑换失败 → 用户可操作文案（T3 四态映射；弹窗拦截由组件在
+ *  `window.open` 处另行判走，不经过本函数）。**映射键 = 响应体里的安全机器码**，
+ *  HTTP 状态只做诊断不参与分流（入口端点把挂载拒绝统一回 503——按状态分流会让
+ *  `console_device_invalid` 永远不可达，复审 Important-1）：
+ *  - 设备授权过期（gate 层 device_unpaired / 挂载设备校验拒绝
+ *    console_device_invalid）→ 引导重新配对；
+ *  - 网页凭据未就绪（挂载凭据表缺当代凭据）→ 引导在电脑上确认实例已连接；
+ *  - 换代（签发与当代代际不符）→ 引导稍后重试（活体跟踪拍恢复后重开即可）；
+ *  - 其余 DSH 码 → 「实例不可用」前缀 + errors.* 词表文案（每码一句准确原因）；
+ *  - 未知形态 → 既有通用文案（不静默吞）。 */
+export function consoleEntryErrorCopy(code: string | null): string {
+  if (code === "device_unpaired" || code === "console_device_invalid") {
+    return i18n.t("mobile.console.deviceExpired");
+  }
+  if (code === "console_credential_invalid") {
+    return i18n.t("mobile.console.credentialNotReady");
+  }
+  if (code === "console_target_invalid") {
+    return i18n.t("mobile.console.generationChanged");
+  }
+  if (code) {
+    const reason = dshReasonCopy(code);
+    if (reason) return i18n.t("mobile.console.unavailablePrefix", { reason });
+  }
+  return i18n.t("mobile.console.openFailed");
+}
+
 // ==== 2026-10-09 观察台 §三：子 agent 详情（/session-subagent-messages）====
 
 /** 详情载荷：messages/truncated 与 /session-messages 同形（渲染器零适配）；
  *  supported=false = 该工具暂不支持查看详情（opencode/kimi/codex——spec §三.6，
- *  如实申报不空白页不假数据），前端显示明确提示态 */
+ *  如实申报不空白页不假数据），前端显示明确提示态。
+ *  olderBefore（2026-11-18 销项批）：受限续页游标——**键缺席 = 无续页或该面
+ *  不支持游标**（后端仅真实存在续页游标时插入键，非 DSH 面与最旧页键恒缺席，
+ *  消费端按键存在性判别游标面，与 /session-messages 同一判别法） */
 export interface SubagentMessagesPage {
   messages: SessionMessage[];
   truncated: boolean;
   supported: boolean;
+  olderBefore?: number;
 }
 
-/** 拉取子 agent 执行过程（claude）。404（会话/转写不存在）与非 2xx → ApiError；
- *  supported=false 是 200 正常载荷不是错误 */
+/** 拉取子 agent 执行过程（claude / dsh）。404（会话/转写不存在）与非 2xx →
+ *  ApiError；supported=false 是 200 正常载荷不是错误。`before` = 受限续页
+ *  游标（已展示窗口最旧消息的起始索引，从最旧数起；0/缺省 = 尾窗首页）——
+ *  仅游标面消费，其余面忽略 */
 export async function fetchSubagentMessages(
   agentType: string,
   sessionId: string,
   subagentId: string,
-  limit = 200
+  limit = 200,
+  instanceId?: string,
+  before?: number
 ): Promise<SubagentMessagesPage> {
   const q = new URLSearchParams({
     agent_type: agentType,
@@ -2018,6 +2284,8 @@ export async function fetchSubagentMessages(
     subagent_id: subagentId,
     limit: String(limit),
   });
+  if (instanceId) q.set("instanceId", instanceId);
+  if (before !== undefined) q.set("before", String(before));
   let r: Response;
   try {
     r = await fetch(`/m/api/v1/session-subagent-messages?${q}`);
@@ -2029,4 +2297,167 @@ export async function fetchSubagentMessages(
   }
   if (!r.ok) throw new ApiError(r.status, `session-subagent-messages ${r.status}`);
   return (await r.json()) as SubagentMessagesPage;
+}
+
+// ============================================================
+// T03/T04：DSH 原生问答（官方 userQuestions 投影 + 整组作答）
+// ============================================================
+
+/** 官方题目（Rust `dsh_control::questions::DshQuestion` 镜像）。 */
+export interface DshQuestion {
+  id: string;
+  question: string;
+  detail?: string;
+  header?: string;
+  options?: { label: string; description?: string }[];
+  multiSelect?: boolean;
+  intent?: unknown;
+}
+
+/** 一个待答题组（`callId` 是整组作答主键；只有 `continued` 可提交）。 */
+export interface DshQuestionGroup {
+  callId: string;
+  questions: DshQuestion[];
+  state: string;
+}
+
+/** 题组查询结果：`verified=false` 表示没有已核验投影（前端回退只读卡）。 */
+export interface DshQuestionSnapshot {
+  verified: boolean;
+  instanceId?: string;
+  sessionId?: string;
+  groups?: DshQuestionGroup[];
+  revisionToken?: string | null;
+  asOfSeq?: number;
+}
+
+/** 单题答案（`selected` 为空且无 `custom` = 显式跳过）。 */
+export interface DshQuestionAnswerItem {
+  id: string;
+  selected: string[];
+  custom?: string;
+}
+
+/** 查询当前可作答的 DSH 题组（只读；需已配对设备）。 */
+export async function fetchDshQuestions(
+  instanceId: string,
+  sessionId: string,
+  signal?: AbortSignal
+): Promise<DshQuestionSnapshot> {
+  const q = new URLSearchParams({ instanceId, sessionId });
+  const r = await fetch(`/m/api/v1/dsh/questions?${q}`, { signal });
+  // 非 2xx = **读取失败**（503/403 等），由调用方保留上一份快照；
+  // 只有 200 且 verified=true 才是「已核验」的结论（groups 可空）。
+  if (!r.ok) throw new ApiError(r.status, `dsh/questions ${r.status}`);
+  const j = (await r.json()) as DshQuestionSnapshot & {
+    snapshot?: {
+      groups?: DshQuestionGroup[];
+      revisionToken?: string;
+      asOfSeq?: number;
+    };
+  };
+  if (j.verified === false) return { verified: false, groups: [] };
+  // 已验证形态：服务端把快照放在 `snapshot` 内
+  return {
+    verified: true,
+    instanceId,
+    sessionId,
+    groups: j.snapshot?.groups ?? j.groups ?? [],
+    revisionToken: j.snapshot?.revisionToken ?? j.revisionToken ?? null,
+    asOfSeq: j.snapshot?.asOfSeq ?? j.asOfSeq ?? 0,
+  };
+}
+
+/** 提交一整组答案（一次动作；不改普通发送队列）。 */
+export async function answerDshQuestionGroup(input: {
+  instanceId: string;
+  sessionId: string;
+  groupId: string;
+  revisionToken: string;
+  actionId: string;
+  answers: DshQuestionAnswerItem[];
+}): Promise<{ hostAccepted: boolean; action?: DshActionView }> {
+  const r = await fetch("/m/api/v1/dsh/questions/answer", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(input),
+  });
+  if (!r.ok) {
+    const body = (await r.json().catch(() => ({}))) as { error?: string; reasonCode?: string };
+    throw new ApiError(r.status, body.error ?? `dsh/questions/answer ${r.status}`);
+  }
+  return (await r.json()) as { hostAccepted: boolean; action?: DshActionView };
+}
+
+export interface DshLiveQuestion {
+  eventId: string;
+  questions: DshQuestion[];
+}
+
+export interface DshLiveQuestionSnapshot {
+  generation?: number;
+  live: boolean;
+  pending: DshLiveQuestion[];
+}
+
+export async function fetchDshLiveQuestions(
+  instanceId: string,
+  sessionId: string,
+  signal: AbortSignal
+): Promise<DshLiveQuestionSnapshot> {
+  const q = new URLSearchParams({ instanceId, sessionId });
+  const r = await fetch(`/m/api/v1/dsh/questions/live?${q}`, { signal });
+  if (!r.ok) throw new ApiError(r.status, `dsh/questions/live ${r.status}`);
+  const snapshot: Partial<DshLiveQuestionSnapshot> = await r.json();
+  if (typeof snapshot.live !== "boolean" || !Array.isArray(snapshot.pending)) {
+    throw new ApiError(null, "Invalid DSH live question snapshot");
+  }
+  return { live: snapshot.live, pending: snapshot.pending, generation: snapshot.generation };
+}
+
+export async function answerDshLiveQuestion(input: {
+  instanceId: string;
+  sessionId: string;
+  eventId: string;
+  answers: DshQuestionAnswerItem[];
+}): Promise<{ receiptAccepted: boolean; receiptOnly: boolean }> {
+  const r = await fetch("/m/api/v1/dsh/questions/live/answer", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(input),
+  });
+  const body = await r.json().catch(() => null);
+  if (!r.ok || body?.receiptAccepted !== true || body.receiptOnly !== true) {
+    throw new ApiError(r.status, `dsh/questions/live/answer ${r.status}`, body);
+  }
+  return body;
+}
+
+export async function fetchDshCurrentTurn(
+  instanceId: string,
+  sessionId: string,
+  signal: AbortSignal
+): Promise<string | null> {
+  const query = new URLSearchParams({ instanceId, sessionId });
+  const response = await fetch(`/m/api/v1/dsh/current-turn?${query}`, { signal });
+  if (!response.ok) throw new ApiError(response.status, "DSH current turn unavailable");
+  const body = await response.json();
+  if (body.turn !== null && typeof body.turn !== "string")
+    throw new ApiError(null, "DSH current turn invalid");
+  return body.turn;
+}
+
+export async function stopDshCurrentTurn(
+  instanceId: string,
+  sessionId: string,
+  turn: string,
+  actionId: string
+): Promise<DshActionView> {
+  const response = await fetch("/m/api/v1/dsh/current-turn", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ instanceId, sessionId, turn, actionId }),
+  });
+  if (!response.ok) throw new ApiError(response.status, "DSH stop unavailable");
+  return response.json();
 }

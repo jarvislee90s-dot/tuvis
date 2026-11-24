@@ -369,6 +369,8 @@ fn build_session_from_row(
         jump_supported: jump_supported_for(process.form),
         unread: false, // 扫描出的活跃卡默认非未读；未读卡由 adapter 层合并
         unread_turned_green_at_ms: None,
+        dsh_instance_id: None,
+        dsh_subagent: None,
         title: Some(title),
     })
 }

@@ -211,7 +211,21 @@ export function formatTransition(ev: TransitionEvent): string {
 export function applyTransition(sessions: Session[], ev: TransitionEvent): Session[] {
   // 未知状态串（wire 损坏）不写入：否则卡片状态点取色会渲染出 undefined 类名
   if ((STATUS_PRIORITY as Record<string, number | undefined>)[ev.to] === undefined) return sessions;
-  const idx = sessions.findIndex((s) => s.agentType === ev.agentType && s.id === ev.sessionId);
+  // H04 审查 I4② / 修复轮 2 N2：实例归属**严格相等**才套用——任一侧缺失都不是
+  // 通配：带实例 A 的迟到事件不得覆盖未核验（无实例）卡，无实例事件不得覆盖已
+  // 绑定 B 的卡（与 watcher 把 None/Some(A) 视为不同身份同口径）。双方均缺席
+  // （非 DSH / 旧事件）保留 (agentType, id) 既有行为。
+  const idx = sessions.findIndex(
+    (s) =>
+      s.agentType === ev.agentType &&
+      s.id === ev.sessionId &&
+      // 双方均缺席 = 通配；其余情况要求严格相等（任一侧缺失 → 放弃套用）。
+      (s.dshInstanceId === undefined && ev.dshInstanceId === undefined
+        ? true
+        : s.dshInstanceId !== undefined &&
+          ev.dshInstanceId !== undefined &&
+          s.dshInstanceId === ev.dshInstanceId)
+  );
   if (idx === -1) return sessions;
   const next = sessions.slice();
   // lastMessage 空值保护（评审 Important 修复）：watcher 的跃迁事件可能不带消息

@@ -47,6 +47,40 @@ pub struct SessionMessage {
     /// 计划正文已升格进 content，参数串不再透传）
     pub tool_args: Option<String>,
     pub collapsed: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub media: Vec<SessionMedia>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub blocks: Vec<SessionMessageBlock>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionMedia {
+    pub ref_id: String,
+    pub kind: MediaKind,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unavailable: Option<bool>,
+    #[serde(skip)]
+    pub(super) present_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum MediaKind {
+    Image,
+    File,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum SessionMessageBlock {
+    Text { text: String },
+    Media { ref_id: String },
 }
 
 /// 计划标签（批次丙 T4）：codex 的「计划」是**含 `<proposed_plan>…</proposed_plan>`
@@ -85,7 +119,7 @@ fn split_proposed_plan(text: &str) -> Option<(String, String)> {
 /// **为何需要**：kimi 的计划是一等文件（`~/.kimi-code/sessions/…/agents/main/plans/
 /// x.md`），写入动作在消息流里只留一行工具结果（"Wrote 4263 bytes to …"）——手机端
 /// 因此只见一行而读不到计划全文（图1 诉求）。识别该引用后出卡，卡片经既有文件预览
-/// 端点打开（豁免面见 `files::EXEMPT_SUBPATHS` 的 T7 尾段序列匹配）。
+/// 端点打开，文件读取遵循 D22。
 ///
 /// **识别判据（实测形态，勿凭想象扩面）**：本机 kimi wire 实录的三种引用都含
 /// `plans/<name>.md` 路径片段——
@@ -155,6 +189,8 @@ impl SessionMessage {
             seq: 0,
             role: role.to_string(),
             collapsed: kind == "thinking",
+            media: Vec::new(),
+            blocks: Vec::new(),
             kind,
             content: content.into(),
             ts,
@@ -176,6 +212,8 @@ impl SessionMessage {
             tool_name,
             tool_args: None,
             collapsed: false,
+            media: Vec::new(),
+            blocks: Vec::new(),
         }
     }
 
@@ -249,14 +287,15 @@ impl SessionMessage {
             tool_name: name,
             tool_args: args,
             collapsed: true,
+            media: Vec::new(),
+            blocks: Vec::new(),
         }
     }
 }
 
 /// 会话内容读取结果：消息页 + 头部截断标记（Bug 1，M3 验收）。
-/// truncated = 文件头部被字节窗截断（存在更早但未在本页的内容）——移动端据此
-/// 显示「加载更早消息」；SQLite 系（zcode/opencode/openclaw/codex thread）与 dsh
-/// （自有 zstd 代际读取）恒 false
+/// truncated 表示存在更早但未在本页的内容，移动端据此显示「加载更早消息」。
+/// DSH 整读代际后按可见消息数量计算；SQLite 系沿用各自的查询窗口语义。
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MessagesPage {
@@ -267,6 +306,41 @@ pub struct MessagesPage {
     /// 相对路径的存在性校验基准。skip 序列化：/session-messages 载荷零变化
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
+    /// 受限续页游标（A06 2026-11-15 补强；fix round 审查 Important-2 重定锚；
+    /// 2026-11-18 销项批接入子 Agent 详情面）：truncated=true 时 = 下一次请求
+    /// 应携带的 `before` 值（语义：**本页最旧消息的起始索引，从最旧数起**；
+    /// 0 = 尾窗首页。起始索引在同代际追加下稳定，续页不随尾部增长漂移）；
+    /// None = 该读取面不支持续页或已到最旧。真实触发面：**普通 DSH 会话读取
+    /// 面**（根会话映射消息最多 12877 条）与 **DSH 子 Agent 详情面**
+    /// （/session-subagent-messages，同一 0958dc93 口径——不泄漏 null 键、
+    /// 不随尾部漂移）；其余读取面键恒缺席。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub older_before: Option<i64>,
+    /// N06：只读模型摘要（可选键；无证**省略**，不透传官方投影全文或凭据）。
+    /// 当前来源未证时回退到**已核验的同会话历史**，且 `source` 明确标
+    /// `last_used`——不把历史或目录默认冒充当前选择。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dsh_model_summary: Option<DshModelSummary>,
+}
+
+/// N06：控制台按钮旁展示的只读模型/思考强度摘要。
+///
+/// 数据来源限定为**该会话自己的转写**（`request/header.header.config`），
+/// 按实例与会话归属核验后读取；不读全局模型目录、不读其它会话、不新增写入口。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DshModelSummary {
+    /// provider/model 的展示名（如 `deepseek-v4.1-flash`）。
+    pub model: String,
+    /// 可选的更友好显示名（当前与 model 同源；保留给上游提供 displayName 时使用）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    /// 思考强度档位；缺失就省略（不猜）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    /// `next` = 官方投影里已证实的下一步选择；`last_used` = 同会话历史最近一次
+    /// 实际调用。当前实现只产出 `last_used`（当前值需实时投影，未证不冒报）。
+    pub source: String,
 }
 
 /// 会话内容源函数形态（RemoteState 注入缝的类型别名，生产 = read_session_messages）
@@ -304,6 +378,7 @@ pub fn read_session_messages(
         agent_type,
         session_id,
         limit,
+        0,
     )
 }
 
@@ -314,7 +389,7 @@ pub fn read_session_messages_with(
     session_id: &str,
     limit: usize,
 ) -> Result<MessagesPage, String> {
-    read_session_messages_impl(home, None, None, agent_type, session_id, limit)
+    read_session_messages_impl(home, None, None, agent_type, session_id, limit, 0)
 }
 
 /// 派发核（env 双参注入，dsh/kimi 消费；kimi 的 resolve_data_root 双参模式同款）。
@@ -327,11 +402,15 @@ pub(crate) fn read_session_messages_impl(
     agent_type: &str,
     session_id: &str,
     limit: usize,
+    skip: usize,
 ) -> Result<MessagesPage, String> {
     // 防御：空 session_id 直接拒绝（各工具文件名/SQL 均以 id 拼 key，空串会形成
     // ".jsonl" 这类危险形态）；路径分隔符与 ".." 拒绝——claude/workbuddy 的文件
     // 定位是 `目录.join(format!("{sid}.jsonl"))`，穿越字符会逃出项目根（端点在
-    // 设备门禁之后，但内容层自身 fail-closed）；limit 夹取 [1, 1000]
+    // 设备门禁之后，但内容层自身 fail-closed）；limit 夹取 [1, 1000]。
+    // skip = 受限续页游标（已展示窗口最旧消息的起始索引，从最旧数起；0 =
+    // 尾窗首页）；仅 DSH 整读面消费——其余读取面保持既有窗口语义（游标不
+    // 透传，older_before 恒 None、响应键恒缺席）。
     if session_id.trim().is_empty() {
         return Err("CONTENT_SESSION_ID_EMPTY: session_id 为空".to_string());
     }
@@ -343,7 +422,7 @@ pub(crate) fn read_session_messages_impl(
     let limit = limit.clamp(1, 1000);
     match agent_type {
         "zcode" => read_zcode_messages_with(home, session_id, limit),
-        "dsh" => read_dsh_messages_with(home, dsh_env_home, session_id, limit),
+        "dsh" => read_dsh_messages_with(home, dsh_env_home, session_id, limit, skip),
         "claude" => read_claude_messages_with(home, session_id, limit),
         "codex" => read_codex_messages_with(home, session_id, limit),
         "kimi" => read_kimi_messages_with(home, kimi_env_home, session_id, limit),
@@ -376,6 +455,8 @@ fn page(msgs: Vec<SessionMessage>, limit: usize, truncated: bool) -> MessagesPag
         messages: finalize(msgs, limit),
         truncated,
         cwd: None,
+        older_before: None,
+        dsh_model_summary: None,
     }
 }
 
@@ -415,8 +496,15 @@ fn join_text_parts(v: &serde_json::Value) -> String {
         .unwrap_or_default()
 }
 
-/// content[] 里第一个非空字符串字段值（Claude tool_result 的 block.content 双形态：
-/// 字符串直取；数组取 text 拼接）
+/// `content` 字段的取值归一（三种真实形态）：
+///
+/// 1. **字符串**（Claude `tool_result.content` 的简写形态）→ 直取；
+/// 2. **块数组** → 拼接各块的 `text`（既有形态）；
+/// 3. **单个块对象** `{type:"text", text:...}` → 取该块正文。
+///
+/// 第 3 种是复审抓到的漏读：DSH 的 `tool-result.content` 在部分工具下是一个
+/// **裸文本块**而非数组，旧的 `Array` 分支不匹配、`String` 分支也不匹配，于是
+/// 整段工具输出被静默丢掉（详情里只剩一个「工具结果」占位）。
 fn content_block_text(v: &serde_json::Value) -> Option<String> {
     match v {
         serde_json::Value::String(s) => Some(s.clone()),
@@ -424,6 +512,11 @@ fn content_block_text(v: &serde_json::Value) -> Option<String> {
             let t = join_text_parts(v);
             (!t.is_empty()).then_some(t)
         }
+        serde_json::Value::Object(_) => v
+            .get("text")
+            .and_then(|t| t.as_str())
+            .filter(|t| !t.is_empty())
+            .map(str::to_owned),
         _ => None,
     }
 }
@@ -682,6 +775,9 @@ fn read_zcode_projection_with(
             messages,
             truncated: false,
             cwd: None,
+            // ZCode SQLite 读取面不支持续页游标（键缺席，与同文件其它非 DSH 面一致）
+            older_before: None,
+            dsh_model_summary: None,
         },
         source_anchors,
     };
@@ -793,8 +889,70 @@ fn read_dsh_messages_with(
     env_home: Option<&str>,
     session_id: &str,
     limit: usize,
+    skip: usize,
 ) -> Result<MessagesPage, String> {
-    use crate::monitor::dsh::log;
+    read_dsh_messages_with_reader(
+        home,
+        env_home,
+        session_id,
+        limit,
+        skip,
+        crate::monitor::dsh::log::read_best_generation,
+    )
+}
+
+/// N06：从该会话**自己的转写**提取只读模型摘要（纯函数，独立可测）。
+///
+/// 来源 = `request/header` 事件的 `data.header.config`
+/// （`{provider, model, reasoningEffort, maxTokens}`），取**最后一次**实际调用——
+/// 这些字段已在隔离宿主的两份会话转写中核对。
+///
+/// 纪律：
+/// * 只读；不读全局模型目录、不读其它会话、不新增任何写入口；
+/// * 当前选择（`next`）需要实时官方投影，本实现不冒报——`source` 恒为
+///   `last_used`，UI 据此标注「上次使用」；
+/// * `reasoningEffort` 缺失就**省略**，不猜、不借用其它字段；
+/// * 无任何 `request/header` → `None`（UI 不显示，而不是显示未知值）。
+fn dsh_model_summary_from_events(
+    events: &[crate::monitor::dsh::log::DshEvent],
+) -> Option<DshModelSummary> {
+    let mut latest: Option<DshModelSummary> = None;
+    for event in events {
+        if event.kind != "request/header" {
+            continue;
+        }
+        let config = event.data.pointer("/header/config")?;
+        let model = config.get("model").and_then(|v| v.as_str())?.trim();
+        if model.is_empty() {
+            continue;
+        }
+        let reasoning_effort = config
+            .get("reasoningEffort")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string);
+        latest = Some(DshModelSummary {
+            model: model.to_string(),
+            display_name: None,
+            reasoning_effort,
+            source: "last_used".to_string(),
+        });
+    }
+    latest
+}
+
+fn read_dsh_messages_with_reader<F>(
+    home: &Path,
+    env_home: Option<&str>,
+    session_id: &str,
+    limit: usize,
+    skip: usize,
+    read_generation: F,
+) -> Result<MessagesPage, String>
+where
+    F: Fn(&Path) -> Option<crate::monitor::dsh::log::GenerationRead>,
+{
     // 数据根（fix round 1 Important 1）：$DSH_HOME 覆盖优先（M0 F14：env 非空 >
     // ~/.dsh），与看板生产扫描 scan_sessions(&dsh_home()) **同源**——否则设了
     // DSH_HOME 的机器上会话卡在板、详情 404。env 值由生产薄壳作参数传入
@@ -803,14 +961,82 @@ fn read_dsh_messages_with(
         Some(v) if !v.trim().is_empty() => std::path::PathBuf::from(v),
         _ => home.join(".dsh"),
     };
-    let sessions_root = dsh_root.join("sessions");
+    visit_dsh_generations(&dsh_root, session_id, false, |canonical_dir, _, _| {
+        use crate::monitor::dsh::log;
+        let read = read_generation(canonical_dir)?;
+        let header = log::parse_header(&read.text)?;
+        if header.id != session_id {
+            return None;
+        }
+        // 命中：事件流映射（纯函数，独立可测）
+        let events = log::parse_events(&read.text);
+        // 整读后可准确判断本页是否省略了更早的可见消息。
+        let messages = map_dsh_events(&events);
+        // 受限续页（A06 2026-11-15；fix round 审查 Important-2 重定锚）：
+        // skip = **已展示窗口最旧消息的起始索引**（从最旧数起）；0 = 尾窗
+        // 首页（最新 limit 条）。起始索引在同代际追加下稳定——两页请求之间
+        // 日志增长不会让续页漂移（旧「相对当前尾部的 skip」会随追加重复/
+        // 卡页）。窗口 = [skip−limit, skip) ∩ [0, total)；older_before = 本页
+        // 起始索引（下一页 skip），到最旧 → None。单页预算不变：limit 已在
+        // 派发核入口 clamp [1, 1000]。代际切换（日志重写）属列表整体更换，
+        // 起始索引语义不保证跨代——此时按新列表钳制（如实申报）。
+        let total = messages.len();
+        let end = if skip == 0 { total } else { skip.min(total) };
+        let start = end.saturating_sub(limit);
+        let truncated = start > 0;
+        let mut window = messages;
+        if end < window.len() {
+            window.truncate(end);
+        }
+        if start > 0 {
+            window.drain(..start.min(window.len()));
+        }
+        let mut pg = page(window, limit, truncated);
+        pg.cwd = header.cwd;
+        pg.older_before = if truncated {
+            i64::try_from(start).ok()
+        } else {
+            None
+        };
+        // N06：只读模型摘要取自**同一份已核验转写**（同会话归属已在
+        // `visit_dsh_generations` + header.id 校验中确认）。缺字段/无历史 → 省略。
+        pg.dsh_model_summary = dsh_model_summary_from_events(&events);
+        Some(pg)
+    })
+}
+
+pub(crate) fn dsh_open_turn(root: &Path, session_id: &str) -> Result<Option<String>, String> {
+    visit_dsh_generations(root, session_id, true, |_, version, path| {
+        let facts = crate::monitor::dsh::root_turn_facts(path, session_id)?;
+        Some(
+            facts
+                .last_start
+                .filter(|_| facts.has_open_turn())
+                .map(|seq| format!("{version}:{seq}")),
+        )
+    })
+}
+
+fn visit_dsh_generations<T>(
+    root: &Path,
+    session_id: &str,
+    unique: bool,
+    mut visit: impl FnMut(&Path, i64, &Path) -> Option<T>,
+) -> Result<T, String> {
+    use crate::monitor::dsh::log;
+    let sessions_root = root.join("sessions");
+    let canonical_root = std::fs::canonicalize(&sessions_root)
+        .map_err(|_| "CONTENT_DSH_DIR_MISSING: dsh sessions 目录不存在".to_string())?;
     let Ok(entries) = std::fs::read_dir(&sessions_root) else {
         return Err("CONTENT_DSH_DIR_MISSING: dsh sessions 目录不存在".to_string());
     };
+    let mut matched = None;
     // 目录名是转义形态不可反解 id（M0 评审漏项 #3）——必须逐会话读 header 匹配
     for project_dir in entries.flatten() {
         let ppath = project_dir.path();
-        if !ppath.is_dir() {
+        if !std::fs::canonicalize(&ppath)
+            .is_ok_and(|p| p.is_dir() && p.starts_with(&canonical_root))
+        {
             continue;
         }
         let Ok(session_dirs) = std::fs::read_dir(&ppath) else {
@@ -818,33 +1044,279 @@ fn read_dsh_messages_with(
         };
         for sdir in session_dirs.flatten() {
             let spath = sdir.path();
-            if !spath.is_dir() {
-                continue;
-            }
-            // 代际选择：取版本最大者（scan_sessions 同款）；读不到（0 字节/损坏）跳过。
-            // 先探测代际存在（与 read_best_generation 重复枚举，但让「无代际文件」与
-            // 「解码失败」同走 continue，分支语义清晰）
-            if log::generation_logs(&spath).is_empty() {
-                continue;
-            }
-            let Some(read) = log::read_best_generation(&spath) else {
+            let Ok(canonical_dir) = std::fs::canonicalize(&spath) else {
                 continue;
             };
-            let Some(header) = log::parse_header(&read.text) else {
-                continue;
-            };
-            if header.id != session_id {
+            if !canonical_dir.is_dir() || !canonical_dir.starts_with(&canonical_root) {
                 continue;
             }
-            // 命中：事件流映射（纯函数，独立可测）
-            let events = log::parse_events(&read.text);
-            // dsh 走自有 zstd 代际整读，无字节尾窗（truncated 恒 false，Bug 1 契约）
-            return Ok(page(map_dsh_events(&events), limit, false));
+            let Some((version, generation)) = log::generation_logs(&canonical_dir).pop() else {
+                continue;
+            };
+            if !std::fs::canonicalize(&generation).is_ok_and(|p| p.starts_with(&canonical_dir)) {
+                continue;
+            }
+            // 与归属核验共享首行缓存；只完整读取身份匹配的会话。
+            if log::readonly_header_identity(&generation)
+                .as_ref()
+                .as_deref()
+                != Some(session_id)
+            {
+                continue;
+            }
+            if unique && matched.is_some() {
+                return Err("CONTENT_DSH_SESSION_AMBIGUOUS".into());
+            }
+            if let Some(result) = visit(&canonical_dir, version, &generation) {
+                if !unique {
+                    return Ok(result);
+                }
+                matched = Some(result);
+            }
         }
     }
-    Err(format!(
-        "CONTENT_DSH_SESSION_MISSING: dsh 会话不存在或日志不可读: {session_id}"
-    ))
+    matched.ok_or_else(|| {
+        format!("CONTENT_DSH_SESSION_MISSING: dsh 会话不存在或日志不可读: {session_id}")
+    })
+}
+
+#[path = "dsh_media_index.rs"]
+mod dsh_media_index;
+pub(super) use dsh_media_index::ResolvedMedia;
+
+// 引用重验必须覆盖已显示的历史页，不使用浏览器路径或对象目录兜底。
+pub(super) fn read_dsh_media_reference(
+    root: &Path,
+    instance_id: &str,
+    session_id: &str,
+    ref_id: &str,
+) -> Result<Option<ResolvedMedia>, String> {
+    let scope = dsh_media_index::Scope {
+        root,
+        instance_id,
+        session_id,
+    };
+    visit_dsh_generations(root, session_id, true, |dir, version, generation| {
+        // 匹配会话但不可读或超预算时直接失败，不退回另一个同名会话。
+        Some(dsh_media_index::lookup(
+            &scope, dir, version, generation, ref_id,
+        ))
+    })
+}
+
+#[cfg(feature = "dsh-test-probes")]
+fn media_parse_probe(root: &Path, session_id: &str, increment: bool) -> usize {
+    use std::{
+        collections::HashMap,
+        path::PathBuf,
+        sync::{LazyLock, Mutex},
+    };
+    #[allow(clippy::type_complexity)]
+    static COUNTS: LazyLock<Mutex<HashMap<(PathBuf, String), usize>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+    let mut counts = COUNTS.lock().unwrap_or_else(|error| error.into_inner());
+    let key = (root.to_path_buf(), session_id.to_owned());
+    if increment {
+        *counts.entry(key).or_default() += 1;
+        return 0;
+    }
+    counts.get(&key).copied().unwrap_or(0)
+}
+
+#[cfg(feature = "dsh-test-probes")]
+#[doc(hidden)]
+pub fn dsh_media_parse_count_for_probe(root: &Path, session_id: &str) -> usize {
+    media_parse_probe(root, session_id, false)
+}
+
+const MEDIA_LOG_INPUT: u64 = 32 * 1024 * 1024;
+const MEDIA_LOG_OUTPUT: u64 = 64 * 1024 * 1024;
+
+fn limited_media_read(input: impl std::io::Read, max_bytes: u64) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    input.take(max_bytes + 1).read_to_end(&mut bytes).ok()?;
+    (bytes.len() as u64 <= max_bytes).then_some(bytes)
+}
+
+fn read_media_transcript(file: std::fs::File, compressed: bool) -> Option<String> {
+    let input = limited_media_read(file, MEDIA_LOG_INPUT)?;
+    let bytes = if compressed {
+        decode_media_prefix(&input, MEDIA_LOG_OUTPUT)?.0
+    } else {
+        input
+    };
+    String::from_utf8(bytes).ok()
+}
+
+// 宿主追加日志时可暂有不完整尾帧；只消费已完整解码的前缀。
+fn decode_media_prefix(input: &[u8], output_limit: u64) -> Option<(Vec<u8>, usize)> {
+    const MAX_MEDIA_FRAMES: usize = 16_384;
+    let mut end = 0;
+    let mut frames = 0;
+    while end < input.len() {
+        let Ok(size) = zstd::zstd_safe::find_frame_compressed_size(&input[end..]) else {
+            break;
+        };
+        frames += 1;
+        if size == 0 || size > input.len() - end || frames > MAX_MEDIA_FRAMES {
+            return None;
+        }
+        end += size;
+    }
+    if end == 0 {
+        return None;
+    }
+    let mut decoder = zstd::stream::read::Decoder::new(&input[..end]).ok()?;
+    decoder
+        .window_log_max(crate::monitor::dsh::log::READONLY_ZSTD_WINDOW_LOG)
+        .ok()?;
+    let bytes = limited_media_read(decoder, output_limit)?;
+    Some((bytes, usize::from(end < input.len())))
+}
+
+#[cfg(test)]
+#[test]
+fn media_lookup_rejects_streams_over_the_byte_budget() {
+    let input = &b"letters"[..];
+    assert_eq!(limited_media_read(input, 7).as_deref(), Some(input));
+    assert!(limited_media_read(input, 6).is_none());
+    let compressed = zstd::stream::encode_all(input, 1).unwrap();
+    let decoder = zstd::stream::read::Decoder::new(compressed.as_slice()).unwrap();
+    assert!(limited_media_read(decoder, 6).is_none());
+}
+
+#[cfg(test)]
+fn media_lookup_two_frame_fixture() -> Vec<u8> {
+    let mut input = zstd::stream::encode_all(&b"abc"[..], 1).unwrap();
+    input.extend(zstd::stream::encode_all(&b"def"[..], 1).unwrap());
+    input
+}
+
+#[cfg(test)]
+#[test]
+fn media_lookup_returns_all_frame_bytes_at_the_output_limit() {
+    let input = media_lookup_two_frame_fixture();
+    assert_eq!(
+        decode_media_prefix(&input, 6),
+        Some((b"abcdef".to_vec(), 0))
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn media_lookup_rejects_cumulative_frame_output_over_the_limit() {
+    let input = media_lookup_two_frame_fixture();
+    assert!(decode_media_prefix(&input, 5).is_none());
+}
+
+#[cfg(test)]
+#[test]
+fn media_lookup_rejects_more_than_16384_complete_frames() {
+    let mut input = zstd::stream::encode_all(&b"a"[..], 1).unwrap();
+    let empty_frame = zstd::stream::encode_all(&b""[..], 1).unwrap();
+    input.extend(empty_frame.repeat(16_384));
+
+    // 输出只有一个字节；拒绝必须与输入、输出字节上限无关。
+    assert!(input.len() < 256 * 1024);
+    assert!(decode_media_prefix(&input, 1).is_none());
+}
+
+fn dsh_media_ref(domain: &str, fields: &[&str]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hash = Sha256::new();
+    hash.update(domain.as_bytes());
+    for field in fields {
+        hash.update((field.len() as u64).to_be_bytes());
+        hash.update(field.as_bytes());
+    }
+    let digest: String = hash
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    format!("dsh-{digest}")
+}
+
+fn dsh_display_name(value: &str) -> Option<String> {
+    let name = value.rsplit(['/', '\\']).next()?.trim();
+    if name.is_empty() || name == "." || name == ".." || name.chars().any(char::is_control) {
+        return None;
+    }
+    Some(name.chars().take(256).collect())
+}
+
+fn dsh_present_media(call_id: &str, file: &serde_json::Value) -> Option<SessionMedia> {
+    let path = file
+        .get("path")?
+        .as_str()
+        .filter(|value| value.len() <= 4096)?;
+    Some(SessionMedia {
+        ref_id: dsh_media_ref("present", &[call_id, path]),
+        kind: MediaKind::File,
+        unavailable: None,
+        name: dsh_display_name(path)?,
+        present_path: Some(path.to_owned()),
+    })
+}
+
+fn dsh_image(block: &serde_json::Value) -> Option<SessionMedia> {
+    let attachment = block.get("attachment")?;
+    let id = attachment.get("attachmentId")?.as_str()?;
+    if id.trim().is_empty() || id.len() > 256 || id.chars().any(char::is_control) {
+        return None;
+    }
+    if !attachment.get("mediaType")?.as_str()?.starts_with("image/") {
+        return None;
+    }
+    Some(SessionMedia {
+        ref_id: dsh_media_ref("image", &[id]),
+        kind: MediaKind::Image,
+        unavailable: Some(true),
+        present_path: None,
+        name: attachment
+            .get("name")
+            .and_then(|name| name.as_str())
+            .and_then(dsh_display_name)
+            .unwrap_or_else(|| "image".into()),
+    })
+}
+
+fn dsh_user_message(content: &serde_json::Value, ts: Option<i64>) -> Option<SessionMessage> {
+    let text = join_text_parts(content);
+    let mut message = SessionMessage::text("user", text, ts);
+    if let Some(parts) = content.as_array() {
+        let mut seen = std::collections::HashSet::new();
+        for part in parts {
+            match part.get("type").and_then(|kind| kind.as_str()) {
+                Some("text") => {
+                    if let Some(text) = part.get("text").and_then(|text| text.as_str()) {
+                        message.blocks.push(SessionMessageBlock::Text {
+                            text: text.to_owned(),
+                        });
+                    }
+                }
+                Some("image") => {
+                    if let Some(media) = dsh_image(part) {
+                        if seen.insert(media.ref_id.clone()) {
+                            message.blocks.push(SessionMessageBlock::Media {
+                                ref_id: media.ref_id.clone(),
+                            });
+                            message.media.push(media);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    if message.media.is_empty() {
+        message.blocks.clear();
+        if message.content.trim().is_empty() {
+            return None;
+        }
+    }
+    Some(message)
 }
 
 /// dsh 事件流 → 统一条目（纯函数）。跳过注入与记账事件（M0 F8：user/message 仅
@@ -858,6 +1330,8 @@ fn map_dsh_events(events: &[crate::monitor::dsh::log::DshEvent]) -> Vec<SessionM
     let mut out = Vec::new();
     // 已出条的调用 id 集（内嵌块 id 与 tool/call callId 同一 id 空间）
     let mut seen_calls: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut present_calls = std::collections::HashMap::new();
+    let mut seen_delivery = std::collections::HashSet::new();
     for e in events {
         let ts = e.time;
         match e.kind.as_str() {
@@ -865,10 +1339,12 @@ fn map_dsh_events(events: &[crate::monitor::dsh::log::DshEvent]) -> Vec<SessionM
                 if e.data.pointer("/source/kind").and_then(|v| v.as_str()) != Some("user") {
                     continue; // agent-instructions / plugin / skill-catalog 注入，过滤（M0 F8）
                 }
-                let text =
-                    join_text_parts(e.data.get("content").unwrap_or(&serde_json::Value::Null));
-                if !text.trim().is_empty() {
-                    out.push(SessionMessage::text("user", text, ts));
+                if let Some(message) = e
+                    .data
+                    .get("content")
+                    .and_then(|content| dsh_user_message(content, ts))
+                {
+                    out.push(message);
                 }
             }
             "assistant/message" => {
@@ -902,9 +1378,13 @@ fn map_dsh_events(events: &[crate::monitor::dsh::log::DshEvent]) -> Vec<SessionM
                                 _ => None,
                             };
                             // 同 id 去重（保留先出现者）；id 缺失保守保留
-                            match c.get("id").and_then(|i| i.as_str()) {
-                                Some(id) if !seen_calls.insert(id.to_string()) => continue,
-                                _ => {}
+                            if let Some(id) = c.get("id").and_then(|i| i.as_str()) {
+                                if !seen_calls.insert(id.to_string()) {
+                                    continue;
+                                }
+                                if name == Some("present") {
+                                    present_calls.insert(id, out.len());
+                                }
                             }
                             out.push(SessionMessage::tool_call(
                                 tool_summary(name),
@@ -926,9 +1406,13 @@ fn map_dsh_events(events: &[crate::monitor::dsh::log::DshEvent]) -> Vec<SessionM
                     _ => None,
                 };
                 // 同 id 去重（保留先出现者）；id 缺失保守保留
-                match e.data.get("callId").and_then(|i| i.as_str()) {
-                    Some(id) if !seen_calls.insert(id.to_string()) => continue,
-                    _ => {}
+                if let Some(id) = e.data.get("callId").and_then(|i| i.as_str()) {
+                    if !seen_calls.insert(id.to_string()) {
+                        continue;
+                    }
+                    if name == Some("present") {
+                        present_calls.insert(id, out.len());
+                    }
                 }
                 out.push(SessionMessage::tool_call(
                     tool_summary(name),
@@ -936,6 +1420,22 @@ fn map_dsh_events(events: &[crate::monitor::dsh::log::DshEvent]) -> Vec<SessionM
                     name.map(String::from),
                     args,
                 ));
+            }
+            "deliverables/presented" => {
+                let Some(call_id) = e.data.get("callId").and_then(|value| value.as_str()) else {
+                    continue;
+                };
+                let Some(&row) = present_calls.get(call_id) else {
+                    continue;
+                };
+                let files = e.data.get("files").and_then(|value| value.as_array());
+                for file in files.into_iter().flatten() {
+                    if let Some(media) = dsh_present_media(call_id, file) {
+                        if seen_delivery.insert(media.ref_id.clone()) {
+                            out[row].media.push(media);
+                        }
+                    }
+                }
             }
             "tool/result" => {
                 // 实测形态：data.message.content[] = [{type:"tool-result", content:[{type:"text",...}]}]
@@ -947,7 +1447,11 @@ fn map_dsh_events(events: &[crate::monitor::dsh::log::DshEvent]) -> Vec<SessionM
                 let mut texts = Vec::new();
                 if let Some(arr) = blocks.as_array() {
                     for b in arr {
-                        if let Some(t) = b.get("content").and_then(content_block_text) {
+                        if let Some(t) = b
+                            .get("content")
+                            .and_then(content_block_text)
+                            .or_else(|| content_block_text(b))
+                        {
                             texts.push(t);
                         }
                     }
@@ -1085,8 +1589,122 @@ fn map_claude_lines(lines: &[String]) -> Vec<SessionMessage> {
     out
 }
 
-/// 子 agent 详情（观察台 §三，仅 claude）：会话 subagents/agent-<id>.jsonl 尾窗 →
-/// `map_claude_lines` 复用（与会话消息同一映射——乙.3.1 实证两机制子转写格式一致，
+/// DSH 子任务详情（H08）：只读父会话根下的子日志。
+///
+/// 父子关系以子日志自身 `parentSession` 与父会话在同一 home 内存在为准；
+/// 外父、孤儿、fork 与不可归属日志一律拒绝——不接受调用方自称的父 ID。
+pub fn read_dsh_subagent_messages(
+    parent_session_id: &str,
+    subagent_id: &str,
+    limit: usize,
+) -> Result<MessagesPage, String> {
+    // `dsh_home()` 已是数据根；直接以 env 覆盖形态传入，不再拼 `.dsh`。
+    let home = crate::monitor::dsh::dsh_home();
+    let root = home.to_string_lossy().to_string();
+    read_dsh_subagent_messages_with(&home, Some(&root), parent_session_id, subagent_id, limit, 0)
+}
+
+/// 注入核（测试 tempdir home；不触真实 `~/.dsh`）。可见性用于集成测试复用真实父子核验。
+/// `skip` = 受限续页游标（2026-11-18 销项批接入子详情面）：已展示窗口最旧消息
+/// 的起始索引（从最旧数起；0 = 尾窗首页），窗口语义与根会话读取面同一口径。
+pub fn read_dsh_subagent_messages_with(
+    home: &Path,
+    env_home: Option<&str>,
+    parent_session_id: &str,
+    subagent_id: &str,
+    limit: usize,
+    skip: usize,
+) -> Result<MessagesPage, String> {
+    use crate::monitor::dsh::log;
+    for id in [parent_session_id, subagent_id] {
+        if id.trim().is_empty() || id.contains(['/', '\\', '\0']) || id.contains("..") {
+            return Err(format!("CONTENT_SESSION_ID_INVALID: {id}"));
+        }
+    }
+    let limit = limit.clamp(1, 1000);
+    let dsh_root = match env_home {
+        Some(value) if !value.trim().is_empty() => std::path::PathBuf::from(value),
+        _ => home.join(".dsh"),
+    };
+    // 列表与详情共用同一关系核验：完整扫描、父/子/祖先唯一、循环拒绝；
+    // 正文只从核验时绑定的实体句柄读取，不再按路径重开。
+    // （归属核验先于游标消费：skip 只是窗口参数，不参与也不绕过父子链证明。）
+    let (text, header) = crate::monitor::subagents::dsh::read_verified_content(
+        &dsh_root,
+        parent_session_id,
+        subagent_id,
+        DSH_SUBAGENT_CONTENT_BUDGET,
+    )
+    .map_err(str::to_owned)?;
+    if header.id != subagent_id {
+        return Err("CONTENT_SUBAGENT_CHANGED: 核验后目标身份变化".to_string());
+    }
+    let events = log::parse_events(&text);
+    let messages = map_dsh_events(&events);
+    // 受限续页（2026-11-18 销项批）：与根会话读取面（read_dsh_messages_with_
+    // reader）同一口径——skip = 已展示窗口最旧消息的起始索引（从最旧数起；
+    // 0 = 尾窗首页）。窗口 = [skip−limit, skip) ∩ [0, total)；older_before =
+    // 本页起始索引（下一页 skip），到最旧 → None。起始索引在同代际追加下
+    // 稳定，续页不随尾部增长漂移（0958dc93 修复口径）；代际切换属列表整体
+    // 更换，按新列表钳制（如实申报）。单页预算不变：limit 已在入口 clamp
+    // [1, 1000]。
+    let total = messages.len();
+    let end = if skip == 0 { total } else { skip.min(total) };
+    let start = end.saturating_sub(limit);
+    let truncated = start > 0;
+    let mut window = messages;
+    if end < window.len() {
+        window.truncate(end);
+    }
+    if start > 0 {
+        window.drain(..start.min(window.len()));
+    }
+    let mut pg = page(window, limit, truncated);
+    pg.older_before = if truncated {
+        i64::try_from(start).ok()
+    } else {
+        None
+    };
+    Ok(pg)
+}
+
+/// 详情正文读取预算（解压后字节）：足够覆盖典型子任务转写，超出如实拒绝。
+const DSH_SUBAGENT_CONTENT_BUDGET: u64 = 64 * 1024 * 1024;
+
+/// 生产详情入口：实例 ID 必须给出且归属核验通过；未给出或核验失败一律拒绝，
+/// 绝不回落全局 home 或别的实例。
+pub fn read_dsh_subagent_messages_for_instance(
+    parent_session_id: &str,
+    subagent_id: &str,
+    limit: usize,
+    skip: usize,
+    instance_id: Option<&str>,
+) -> Result<MessagesPage, String> {
+    let Some(instance_id) = instance_id.filter(|id| !id.trim().is_empty()) else {
+        return Err("CONTENT_DSH_INSTANCE_REQUIRED: 子任务详情必须携带实例身份".to_string());
+    };
+    let registry = crate::services::dsh_control::production::production_registry()
+        .map_err(|e| format!("{}: {e}", e.code))?;
+    let home = crate::remote::dsh_subagent_source::readonly_session_home(
+        &registry,
+        instance_id,
+        parent_session_id,
+    )
+    .map_err(|e| format!("{}: {e}", e.code))?;
+    // `home` 即该实例的 DSH 数据根（`sessions/` 的上级），按 env 覆盖形态传入，
+    // 避免注入核再拼一层 `.dsh`。
+    let root = home.to_string_lossy().to_string();
+    read_dsh_subagent_messages_with(
+        &home,
+        Some(&root),
+        parent_session_id,
+        subagent_id,
+        limit,
+        skip,
+    )
+}
+
+/// 子 agent 详情（观察台 §三，仅 claude）：会话 subagents/agent-<id>.jsonl 尾窗 →/// `map_claude_lines` 复用（与会话消息同一映射——乙.3.1 实证两机制子转写格式一致，
 /// 单一渲染器通吃）。发现层复用 `subagents::claude::locate`（同一 projects 扫描，
 /// 不造第二份路径推导）；预算与 session-messages 同口径（line_budget/byte_budget）。
 pub fn read_claude_subagent_messages(
@@ -1868,7 +2486,7 @@ pub(crate) fn map_kimi_lines(lines: &[String]) -> Vec<SessionMessage> {
             // 故直接吃内联正文、无需读盘；文件卡给出可预览路径）：
             // - `display.plan` 非空白 → `kind="plan"`（正文卡，markdown 原文）；
             // - `display.path` 非空白 → **追加** `kind="plan-file"`（文件卡，前端「查看
-            //   计划」按钮走既有文件预览；路径豁免见 files::EXEMPT_SUBPATHS 的
+            //   计划」按钮走既有文件预览。下方
             //   agents/main/plans）；
             // - 两者皆缺 → 零产出（不产空卡，§2.8 兜底）。
             "interaction.request" => {
@@ -2487,6 +3105,80 @@ mod tests {
     use super::*;
     use rusqlite::Connection;
 
+    fn model_summary_event(
+        kind: &str,
+        seq: i64,
+        config: serde_json::Value,
+    ) -> crate::monitor::dsh::log::DshEvent {
+        crate::monitor::dsh::log::DshEvent {
+            kind: kind.into(),
+            seq: Some(seq),
+            time: None,
+            data: serde_json::json!({ "header": { "config": config } }),
+        }
+    }
+
+    #[test]
+    fn dsh_model_summary_takes_the_last_request_header() {
+        let summary = dsh_model_summary_from_events(&[
+            model_summary_event(
+                "request/header",
+                1,
+                serde_json::json!({ "model": "A", "reasoningEffort": "low" }),
+            ),
+            model_summary_event(
+                "request/header",
+                2,
+                serde_json::json!({ "model": "B", "reasoningEffort": "max" }),
+            ),
+        ])
+        .unwrap();
+        assert_eq!(summary.model, "B");
+        assert_eq!(summary.reasoning_effort.as_deref(), Some("max"));
+        assert_eq!(summary.source, "last_used");
+    }
+
+    #[test]
+    fn dsh_model_summary_labels_history_as_last_used() {
+        let event = model_summary_event("request/header", 1, serde_json::json!({ "model": "A" }));
+        assert_eq!(
+            dsh_model_summary_from_events(&[event]).unwrap().source,
+            "last_used"
+        );
+    }
+
+    #[test]
+    fn dsh_model_summary_omits_missing_effort() {
+        let event = model_summary_event("request/header", 1, serde_json::json!({ "model": "A" }));
+        assert_eq!(
+            dsh_model_summary_from_events(&[event])
+                .unwrap()
+                .reasoning_effort,
+            None
+        );
+    }
+
+    #[test]
+    fn dsh_model_summary_is_absent_without_request_header() {
+        let config = serde_json::json!({ "model": "A" });
+        assert!(dsh_model_summary_from_events(&[
+            model_summary_event("user/message", 1, config.clone()),
+            model_summary_event("assistant/message", 2, config),
+        ])
+        .is_none());
+    }
+
+    #[test]
+    fn dsh_model_summary_ignores_empty_model() {
+        for config in [serde_json::json!({ "model": "" }), serde_json::json!({})] {
+            let event = model_summary_event("request/header", 1, config.clone());
+            assert!(
+                dsh_model_summary_from_events(&[event]).is_none(),
+                "config: {config}"
+            );
+        }
+    }
+
     // ==== 公共小件 ====
 
     const SID: &str = "sess_0f1e2d3c-4b5a-4948-8276-9a0b8c7d6e5f";
@@ -2510,6 +3202,377 @@ mod tests {
                 "穿越形态 {evil:?} 必须被拒绝"
             );
         }
+    }
+
+    /// 受限续页游标（A06 2026-11-15 补强）：DSH 整读面在 truncated 页必须给出
+    /// `olderBefore`（= 下一次请求的 before 游标，语义为「已展示窗口最旧消息的
+    /// 起始索引，从最旧数起」）。真实触发证据：Desktop home 根会话映射消息最多
+    /// 12877 条（远超 1000 clamp）。本用例走既有读取签名（协议面以 serde 键
+    /// 存在性判 RED——旧代码无此键）。
+    #[test]
+    fn dsh_stop_target_tracks_open_turns_in_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let start = r#"{"type":"turn/start","seq":7,"time":1,"data":{}}"#;
+        let end = r#"{"type":"turn/end","seq":8,"time":2,"data":{"reason":{"kind":"cancelled"}}}"#;
+        let next = r#"{"type":"turn/start","seq":9,"time":3,"data":{}}"#;
+        let sid = "session-stop";
+        write_dsh_session_text(tmp.path(), sid, &format!("{start}\n"));
+        let first = dsh_open_turn(tmp.path(), sid).unwrap().unwrap();
+        assert!(first.ends_with(":7"));
+        write_dsh_session_text(tmp.path(), sid, &format!("{start}\n{end}\n"));
+        assert_eq!(dsh_open_turn(tmp.path(), sid).unwrap(), None);
+        write_dsh_session_text(tmp.path(), sid, &format!("{start}\n{end}\n{next}\n"));
+        assert!(dsh_open_turn(tmp.path(), sid)
+            .unwrap()
+            .unwrap()
+            .ends_with(":9"));
+    }
+
+    #[test]
+    fn dsh_session_messages_page_emits_older_before_cursor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dsh_root = tmp.path().join(".dsh");
+        let mut events = String::new();
+        for i in 0..5 {
+            events.push_str(&format!(
+                r#"{{"type":"user/message","seq":{i},"time":{i},"data":{{"content":[{{"type":"text","text":"m{i}"}}],"source":{{"kind":"user"}}}}}}"#
+            ));
+            events.push('\n');
+        }
+        write_dsh_session_text(&dsh_root, "session-page", &events);
+        let page = read_session_messages_with(tmp.path(), "dsh", "session-page", 2).unwrap();
+        assert_eq!(page.messages.len(), 2);
+        assert!(page.truncated, "5 条取尾 2 条必须报头部截断");
+        let v = serde_json::to_value(&page).unwrap();
+        assert_eq!(
+            v["olderBefore"],
+            serde_json::json!(3),
+            "truncated 页必须携带续页游标 olderBefore（= 本页最旧消息的起始索引，\
+             fix round 审查 Important-2 重定锚）: {v}"
+        );
+    }
+
+    /// 无漏序无重复：逐页续读拼回全量（文件序）必须与整读一致——分区性质锁。
+    /// 页预算恒 limit；最旧页 truncated=false 且 older_before 缺席（到头即停）。
+    #[test]
+    fn dsh_session_messages_continuation_partitions_without_gap_or_dup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dsh_root = tmp.path().join(".dsh");
+        let n = 7usize;
+        let mut events = String::new();
+        for i in 0..n {
+            events.push_str(&format!(
+                r#"{{"type":"user/message","seq":{i},"time":{i},"data":{{"content":[{{"type":"text","text":"m{i}"}}],"source":{{"kind":"user"}}}}}}"#
+            ));
+            events.push('\n');
+        }
+        write_dsh_session_text(&dsh_root, "session-part", &events);
+        let limit = 3usize;
+        let mut pages: Vec<Vec<String>> = Vec::new();
+        let mut skip = 0usize;
+        let mut rounds = 0;
+        loop {
+            let pg = read_session_messages_impl(
+                tmp.path(),
+                None,
+                None,
+                "dsh",
+                "session-part",
+                limit,
+                skip,
+            )
+            .unwrap();
+            assert!(pg.messages.len() <= limit, "单页预算不得超过 limit");
+            pages.push(pg.messages.iter().map(|m| m.content.clone()).collect());
+            match pg.older_before {
+                Some(next) => {
+                    assert!(pg.truncated, "带游标的页必须同时报 truncated");
+                    assert!(
+                        (skip == 0 && next as usize + pg.messages.len() == n)
+                            || next as usize == skip.saturating_sub(pg.messages.len()),
+                        "游标 = 本页最旧消息的起始索引（首页锚定尾部，其余严格回退）"
+                    );
+                    assert!(next < skip as i64 || skip == 0, "游标必须单调回退");
+                    skip = next as usize;
+                }
+                None => {
+                    assert!(!pg.truncated, "无游标的末页不得再报 truncated");
+                    break;
+                }
+            }
+            rounds += 1;
+            assert!(rounds < 10, "游标必须收敛，不得死循环");
+        }
+        // 页序 = 最新页在前；倒页序拼接必须还原完整文件序（无漏序无重复）。
+        let mut collected: Vec<String> = Vec::new();
+        for page in pages.iter().rev() {
+            collected.extend(page.iter().cloned());
+        }
+        let expect: Vec<String> = (0..n).map(|i| format!("m{i}")).collect();
+        assert_eq!(
+            collected, expect,
+            "倒页序拼接必须还原完整文件序：无漏序无重复"
+        );
+    }
+
+    /// 真实触发形态的结构锁（**普通 DSH 会话读取面** read_session_messages_impl，
+    /// 非 /session-subagent-messages 子详情面——子详情面仍未接游标，继续受原
+    /// 单页上限约束，见 Minor-1 收窄申报）：映射条数超过 1000 clamp 时，首页
+    /// 吃满预算 1000 条、olderBefore 指向本页起始索引 2，续页取到最旧 2 条。
+    /// DSH 根会话实测 12877 条即此形态（结构性覆盖，未在本机真实文件上跑）。
+    #[test]
+    fn dsh_session_messages_over_thousand_entries_page_within_budget() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dsh_root = tmp.path().join(".dsh");
+        let n = 1002usize;
+        let mut events = String::new();
+        for i in 0..n {
+            events.push_str(&format!(
+                r#"{{"type":"user/message","seq":{i},"time":{i},"data":{{"content":[{{"type":"text","text":"m{i}"}}],"source":{{"kind":"user"}}}}}}"#
+            ));
+            events.push('\n');
+        }
+        write_dsh_session_text(&dsh_root, "session-big", &events);
+        let first =
+            read_session_messages_impl(tmp.path(), None, None, "dsh", "session-big", 2000, 0)
+                .unwrap();
+        assert_eq!(
+            first.messages.len(),
+            1000,
+            "limit=2000 请求仍被既有 clamp 封顶 1000（单页预算保持）"
+        );
+        assert!(first.truncated);
+        assert_eq!(
+            first.older_before,
+            Some(2),
+            "游标 = 尾窗起始索引（fix round 重定锚）"
+        );
+        let older =
+            read_session_messages_impl(tmp.path(), None, None, "dsh", "session-big", 1000, 2)
+                .unwrap();
+        assert_eq!(older.messages.len(), 2, "最旧 2 条全量到位");
+        assert!(
+            !older.truncated && older.older_before.is_none(),
+            "到最旧即停"
+        );
+        // 拼接还原（older=最旧页在前，first=尾窗在后 → 文件序）
+        let mut all: Vec<String> = older.messages.iter().map(|m| m.content.clone()).collect();
+        all.extend(first.messages.iter().map(|m| m.content.clone()));
+        assert_eq!(all.len(), n);
+        assert_eq!(all[0], "m0", "续页拿到 clamp 窗口外的最旧内容");
+        assert_eq!(all[1], "m1");
+        assert_eq!(all[2], "m2", "首尾页边界不重叠（尾窗从 m2 起）");
+        assert_eq!(all[1001], "m1001", "最新条目仍在尾窗末位");
+    }
+
+    /// 审查 Important-2 fix（2026-11-15）：游标必须绑定**首页读取时的稳定边界**
+    /// （已展示窗口的最旧消息起始索引，从最旧数起）——两页请求之间日志追加
+    /// 不得引起跨页重复/漏读。回归场景：首页 → 追加 N 条 → 续页，断言无重复、
+    /// 无漏、且能继续向最旧推进至 truncated=false。旧行为（游标=相对当前尾部
+    /// 的 skip）在「首页后追加」下重复 m3——本用例 RED 于旧行为。
+    #[test]
+    fn dsh_session_messages_cursor_survives_tail_growth_between_pages() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dsh_root = tmp.path().join(".dsh");
+        let build_events = |n: usize| {
+            let mut events = String::new();
+            for i in 0..n {
+                events.push_str(&format!(
+                    r#"{{"type":"user/message","seq":{i},"time":{i},"data":{{"content":[{{"type":"text","text":"m{i}"}}],"source":{{"kind":"user"}}}}}}"#
+                ));
+                events.push('\n');
+            }
+            events
+        };
+        write_dsh_session_text(&dsh_root, "session-grow", &build_events(5));
+        let limit = 2usize;
+        let first =
+            read_session_messages_impl(tmp.path(), None, None, "dsh", "session-grow", limit, 0)
+                .unwrap();
+        let got0: Vec<String> = first.messages.iter().map(|m| m.content.clone()).collect();
+        assert_eq!(got0, ["m3", "m4"], "尾窗首页");
+        let cursor = first.older_before.expect("截断首页必须携带游标");
+        assert_eq!(
+            cursor, 3,
+            "游标 = 已展示窗口最旧消息的起始索引（m3 的索引）"
+        );
+
+        // 两页请求之间：日志追加 1 条（m5）——同代际追加，起始索引不变。
+        write_dsh_session_text(&dsh_root, "session-grow", &build_events(6));
+        let second = read_session_messages_impl(
+            tmp.path(),
+            None,
+            None,
+            "dsh",
+            "session-grow",
+            limit,
+            cursor as usize,
+        )
+        .unwrap();
+        let got1: Vec<String> = second.messages.iter().map(|m| m.content.clone()).collect();
+        assert!(
+            got0.iter().all(|m| !got1.contains(m)),
+            "追加后续页不得与首页重复（旧游标语义会重出 m3）: 首页={got0:?} 续页={got1:?}"
+        );
+        assert_eq!(got1, ["m1", "m2"], "续页必须落在首页紧邻的更早窗口");
+        assert_eq!(second.older_before, Some(1));
+
+        // 推进到最旧：truncated=false、游标缺席
+        let last =
+            read_session_messages_impl(tmp.path(), None, None, "dsh", "session-grow", limit, 1)
+                .unwrap();
+        let got2: Vec<String> = last.messages.iter().map(|m| m.content.clone()).collect();
+        assert_eq!(got2, ["m0"]);
+        assert!(!last.truncated && last.older_before.is_none(), "到最旧即停");
+        // 三页拼接还原「首页锚定时的全部历史」（文件序）：无漏序无重复。
+        // 追加进来的 m5 属于锚定之后的新尾部——续页协议只负责向最旧方向的
+        // 完整推进，新尾部由常规刷新面获取（不混入本拼接期望）。
+        let mut all = got2.clone();
+        all.extend(got1);
+        all.extend(got0);
+        assert_eq!(all, (0..5).map(|i| format!("m{i}")).collect::<Vec<_>>());
+    }
+
+    // ==== DSH 子详情面（/session-subagent-messages）受限续页（2026-11-18 销项批）====
+
+    /// 子详情夹具：父会话 + 直属子任务（origin=subagent + parentSession 指向父），
+    /// 子日志正文 = n 条真人 user/message（source.kind=user → 全部映射为可见
+    /// 消息）。严格扫描要求全树身份可读——父与子都要有可读日志。未压缩 v4
+    /// （与 H08 集成夹具同形态）。
+    fn write_dsh_subagent_fixture(home: &Path, n: usize) {
+        let dsh_root = home.join(".dsh");
+        let sess = dsh_root.join("sessions").join("--proj--");
+        let parent_dir = sess.join("parent-dir");
+        std::fs::create_dir_all(&parent_dir).unwrap();
+        std::fs::write(
+            parent_dir.join("session.v4.jsonl"),
+            concat!(
+                r#"{"type":"session","version":4,"id":"session-parent","cwd":"/tmp/proj","createdAt":1000}"#,
+                "\n",
+                r#"{"type":"user/message","seq":0,"time":1,"data":{"content":[{"type":"text","text":"parent-task"}],"source":{"kind":"user"}}}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+        let child_dir = sess.join("child-dir");
+        std::fs::create_dir_all(&child_dir).unwrap();
+        let mut text = String::from(
+            r#"{"type":"session","version":4,"id":"child-1","cwd":"/tmp/proj","origin":"subagent","delegationDepth":1,"parentSession":"session-parent","createdAt":1000}"#,
+        );
+        text.push('\n');
+        for i in 0..n {
+            text.push_str(&format!(
+                r#"{{"type":"user/message","seq":{i},"time":{i},"data":{{"content":[{{"type":"text","text":"m{i}"}}],"source":{{"kind":"user"}}}}}}"#
+            ));
+            text.push('\n');
+        }
+        std::fs::write(child_dir.join("session.v4.jsonl"), text).unwrap();
+    }
+
+    /// 子详情续页分区性质锁：1001 条夹具（>1000 clamp，真实触发形态的结构性
+    /// 覆盖——Desktop home 根会话实测 12877 条、子任务最高 951 条，上限只是
+    /// 时间问题），首页吃满 1000、次页按游标取余，倒页序拼接必须还原完整
+    /// 文件序（无漏序无重复）。窗口语义与根会话读取面同一口径（0958dc93）。
+    #[test]
+    fn dsh_subagent_messages_continuation_partitions_without_gap_or_dup() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_dsh_subagent_fixture(tmp.path(), 1001);
+        let first =
+            read_dsh_subagent_messages_with(tmp.path(), None, "session-parent", "child-1", 1000, 0)
+                .unwrap();
+        assert_eq!(first.messages.len(), 1000, "首页吃满单页预算 1000");
+        assert!(first.truncated);
+        assert_eq!(
+            first.older_before,
+            Some(1),
+            "游标 = 本页最旧消息起始索引（1001 取尾 1000 → 1）"
+        );
+        let rest =
+            read_dsh_subagent_messages_with(tmp.path(), None, "session-parent", "child-1", 1000, 1)
+                .unwrap();
+        assert_eq!(rest.messages.len(), 1, "游标 1 之前的余量恰 1 条");
+        assert!(!rest.truncated && rest.older_before.is_none(), "到最旧即停");
+        // 倒页序拼接还原完整文件序：无重复、无跳号
+        let mut all: Vec<String> = rest.messages.iter().map(|m| m.content.clone()).collect();
+        all.extend(first.messages.iter().map(|m| m.content.clone()));
+        assert_eq!(all, (0..1001).map(|i| format!("m{i}")).collect::<Vec<_>>());
+    }
+
+    /// 超预算 limit 仍被既有 clamp 封顶（单页预算保持——与根会话读取面同款
+    /// [1,1000] 夹取，入口在 read_dsh_subagent_messages_with）。
+    #[test]
+    fn dsh_subagent_messages_limit_stays_clamped() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_dsh_subagent_fixture(tmp.path(), 1002);
+        let first =
+            read_dsh_subagent_messages_with(tmp.path(), None, "session-parent", "child-1", 2000, 0)
+                .unwrap();
+        assert_eq!(
+            first.messages.len(),
+            1000,
+            "limit=2000 请求仍被 clamp 封顶 1000"
+        );
+        assert_eq!(first.older_before, Some(2), "游标 = 尾窗起始索引");
+        let older =
+            read_dsh_subagent_messages_with(tmp.path(), None, "session-parent", "child-1", 1000, 2)
+                .unwrap();
+        assert_eq!(older.messages.len(), 2, "最旧 2 条全量到位");
+        assert!(!older.truncated && older.older_before.is_none());
+        let mut all: Vec<String> = older.messages.iter().map(|m| m.content.clone()).collect();
+        all.extend(first.messages.iter().map(|m| m.content.clone()));
+        assert_eq!(all.len(), 1002);
+        assert_eq!(all[0], "m0", "续页拿到 clamp 窗口外的最旧内容");
+        assert_eq!(all[2], "m2", "首尾页边界不重叠");
+        assert_eq!(all[1001], "m1001", "最新条目仍在尾窗末位");
+    }
+
+    /// 游标越界钳制：skip 超过 total 时按新列表钳制到末尾（= 尾窗），与根会话
+    /// 读取面同一 `skip.min(total)` 语义（代际切换后的如实申报口径）。钳制页
+    /// 按窗口位置如实报 truncated 并携带游标——沿游标推进仍收敛到最旧（协议
+    /// 不死循环）。
+    #[test]
+    fn dsh_subagent_messages_overrun_skip_clamps_to_total() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_dsh_subagent_fixture(tmp.path(), 5);
+        let pg =
+            read_dsh_subagent_messages_with(tmp.path(), None, "session-parent", "child-1", 3, 99)
+                .unwrap();
+        let got: Vec<String> = pg.messages.iter().map(|m| m.content.clone()).collect();
+        assert_eq!(
+            got,
+            ["m2", "m3", "m4"],
+            "skip 越界 → 钳制到末尾尾窗（与根面同语义）"
+        );
+        assert!(
+            pg.truncated && pg.older_before == Some(2),
+            "钳制页按窗口位置如实报截断+游标"
+        );
+        let last =
+            read_dsh_subagent_messages_with(tmp.path(), None, "session-parent", "child-1", 3, 2)
+                .unwrap();
+        let rest: Vec<String> = last.messages.iter().map(|m| m.content.clone()).collect();
+        assert_eq!(rest, ["m0", "m1"], "沿游标推进到最旧");
+        assert!(
+            !last.truncated && last.older_before.is_none(),
+            "收敛即停（不死循环）"
+        );
+    }
+
+    /// 生产详情入口的实例身份门（确认断言，A06 归属链）：缺实例 / 空白实例
+    /// 一律拒绝——绝不回落全局 `~/.dsh` 或猜测实例。既有行为锁定（本批不改）。
+    #[test]
+    fn dsh_subagent_detail_requires_instance_identity() {
+        let err = read_dsh_subagent_messages_for_instance("p", "c", 200, 0, None).unwrap_err();
+        assert!(
+            err.contains("CONTENT_DSH_INSTANCE_REQUIRED"),
+            "缺实例身份必须拒绝: {err}"
+        );
+        let err =
+            read_dsh_subagent_messages_for_instance("p", "c", 200, 0, Some("   ")).unwrap_err();
+        assert!(
+            err.contains("CONTENT_DSH_INSTANCE_REQUIRED"),
+            "空白实例身份必须拒绝: {err}"
+        );
     }
 
     /// camelCase 序列化契约（移动端字段名，勿漂移）：toolName/toolArgs/collapsed
@@ -2542,6 +3605,8 @@ mod tests {
             messages: vec![],
             truncated: false,
             cwd: None,
+            older_before: None,
+            dsh_model_summary: None,
         };
         let obj = serde_json::to_value(&none_page).unwrap();
         let obj = obj.as_object().unwrap();
@@ -2555,6 +3620,8 @@ mod tests {
             messages: vec![],
             truncated: false,
             cwd: Some("/w".to_string()),
+            older_before: None,
+            dsh_model_summary: None,
         };
         let v = serde_json::to_value(&some_page).unwrap();
         assert_eq!(v["cwd"], serde_json::json!("/w"), "cwd 按原样透出");
@@ -2780,7 +3847,7 @@ mod tests {
                 &format!(r#"{{"type":"text","text":"big{i}"}}"#),
             );
         }
-        let r = read_session_messages_impl(big.path(), None, None, "zcode", SID, 999_999)
+        let r = read_session_messages_impl(big.path(), None, None, "zcode", SID, 999_999, 0)
             .unwrap()
             .messages;
         assert_eq!(r.len(), 1000, "limit 上限截回 1000");
@@ -2948,6 +4015,55 @@ mod tests {
         std::fs::write(sess.join("session.v3.jsonl.zstd"), &frame).unwrap();
     }
 
+    /// 分页用例共享助手：header + 任意事件文本 → zstd 代际会话（与
+    /// `write_dsh_generation` 同落盘形态，事件集可参数化）。
+    fn write_dsh_session_text(dsh_root: &Path, session_id: &str, events: &str) {
+        let header = format!(
+            r#"{{"type":"session","version":3,"id":"{session_id}","cwd":"/tmp/proj","createdAt":1000,"isSeeded":false}}"#
+        );
+        let frame = zstd::stream::encode_all(format!("{header}\n{events}").as_bytes(), 3).unwrap();
+        let sess = dsh_root.join("sessions").join("--proj--").join("paged-dir");
+        std::fs::create_dir_all(&sess).unwrap();
+        std::fs::write(sess.join("session.v3.jsonl.zstd"), &frame).unwrap();
+    }
+
+    #[test]
+    fn dsh_content_only_fully_reads_the_matching_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join(".dsh");
+        let project = root.join("sessions/--proj--");
+        std::fs::create_dir_all(project.join("first")).unwrap();
+        std::fs::create_dir_all(project.join("second")).unwrap();
+        let dirs: Vec<_> = std::fs::read_dir(&project)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        let other = &dirs[0];
+        let target = std::fs::canonicalize(&dirs[1]).unwrap();
+        let mut bytes = b"{\"id\":\"session-other\"}\n".to_vec();
+        bytes.extend(std::iter::repeat_n(b'x', 4 * 1024 * 1024));
+        std::fs::write(
+            other.join("session.v3.jsonl.zstd"),
+            zstd::stream::encode_all(bytes.as_slice(), 1).unwrap(),
+        )
+        .unwrap();
+        let target_text = concat!("{\"id\":\"session-target\"}\n", "{\"type\":\"user/message\",\"seq\":8,\"data\":{\"content\":[{\"type\":\"text\",\"text\":\"hi\"}],\"source\":{\"kind\":\"user\"}}}\n");
+        std::fs::write(target.join("session.jsonl"), target_text).unwrap();
+        let reads = std::sync::Mutex::new(Vec::new());
+        for _ in 0..2 {
+            let page =
+                read_dsh_messages_with_reader(tmp.path(), None, "session-target", 200, 0, |dir| {
+                    reads.lock().unwrap().push(dir.to_path_buf());
+                    crate::monitor::dsh::log::read_best_generation(dir)
+                })
+                .unwrap();
+            assert!(!page.messages.is_empty());
+        }
+        let reads = reads.lock().unwrap();
+        assert_eq!(reads.len(), 2);
+        assert!(reads.iter().all(|p| p == &target));
+    }
+
     /// tmp home 上的代际文件读取：header.id 匹配路由到会话；未知 id → Err。
     /// 默认根 = home/.dsh（home 为 dsh 数据根，与 dsh_home_with 的回落分支同形）
     #[test]
@@ -2978,12 +4094,12 @@ mod tests {
         write_dsh_generation(env_dir.path(), "session-abc");
         let env = env_dir.path().to_str().unwrap().to_string();
 
-        let msgs = read_dsh_messages_with(tmp.path(), Some(env.as_str()), "session-abc", 200)
+        let msgs = read_dsh_messages_with(tmp.path(), Some(env.as_str()), "session-abc", 200, 0)
             .unwrap()
             .messages;
         assert_eq!(msgs[0].content, "hi dsh", "env 根指向必须生效");
         // env 未设（None）→ 回落 home/.dsh → 找不到（数据只在 env 根下）
-        assert!(read_dsh_messages_with(tmp.path(), None, "session-abc", 200).is_err());
+        assert!(read_dsh_messages_with(tmp.path(), None, "session-abc", 200, 0).is_err());
     }
 
     // ==== Claude（合成 JSONL 行）====
@@ -3048,14 +4164,16 @@ mod tests {
         .unwrap();
 
         // limit=200：字节窗 512KB → truncated=true，头部行缺席（旧实现的静默截断）
-        let page = read_session_messages_impl(tmp.path(), None, None, "claude", UUID, 200).unwrap();
+        let page =
+            read_session_messages_impl(tmp.path(), None, None, "claude", UUID, 200, 0).unwrap();
         assert!(page.truncated, "超窗文件必须报告头部截断");
         assert!(
             !page.messages.iter().any(|m| m.content == "首条指令"),
             "窗外的头部行本页不可见"
         );
         // limit=400：字节窗放大到 1MB → 全文件进窗，头部行回归
-        let page = read_session_messages_impl(tmp.path(), None, None, "claude", UUID, 400).unwrap();
+        let page =
+            read_session_messages_impl(tmp.path(), None, None, "claude", UUID, 400, 0).unwrap();
         assert!(!page.truncated, "放大窗后不得再报告截断");
         assert_eq!(page.messages[0].content, "首条指令", "头部行必须可见");
     }
@@ -4835,5 +5953,136 @@ mod tests {
             .unwrap_or_default()
             .contains("\"command\":\"ls\""));
         assert_eq!(msgs[3].content, "完成");
+    }
+    // 将归档外壳中的原始 header 和工具结果事件投影成临时 JSONL，经过真实内容入口。
+    fn dsh_web_child_tool_results() -> Vec<SessionMessage> {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/dsh-native/0.2.1-rc.5/macos/hybrid/web-subagent-child-sanitized.json"
+        ))
+        .unwrap();
+        let results: Vec<_> = fixture["toolCalls"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|event| event["type"] == "tool/result")
+            .collect();
+        assert_eq!(results.len(), 2, "夹具必须保留两条原始工具结果事件");
+
+        let mut lines = vec![serde_json::to_string(&fixture["header"]).unwrap()];
+        lines.extend(
+            results
+                .into_iter()
+                .map(|event| serde_json::to_string(event).unwrap()),
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let session_dir = tmp.path().join(".dsh/sessions/project/child");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        std::fs::write(session_dir.join("session.jsonl"), lines.join("\n") + "\n").unwrap();
+
+        let messages = read_session_messages_with(tmp.path(), "dsh", "<child-id>", 200)
+            .unwrap()
+            .messages;
+        assert_eq!(messages.len(), 2, "两条工具结果都应进入内容页");
+        assert!(messages.iter().all(|message| message.kind == "tool-result"));
+        messages
+    }
+
+    #[test]
+    fn dsh_web_child_glob_result_includes_text_attachment() {
+        let messages = dsh_web_child_tool_results();
+        assert!(
+            messages[0].content.contains("chain-note.txt"),
+            "实际正文：{:?}",
+            messages[0].content
+        );
+    }
+
+    #[test]
+    fn dsh_web_child_glob_result_includes_image_attachment() {
+        let messages = dsh_web_child_tool_results();
+        assert!(
+            messages[0].content.contains("tuvis-square.png"),
+            "实际正文：{:?}",
+            messages[0].content
+        );
+    }
+
+    #[test]
+    fn dsh_web_child_send_result_includes_parent_delivery_receipt() {
+        let messages = dsh_web_child_tool_results();
+        assert!(
+            messages[1]
+                .content
+                .contains("message delivered to agent session-<parent-id>"),
+            "实际正文：{:?}",
+            messages[1].content
+        );
+    }
+
+    /// 复审抓到的漏读：DSH `tool-result.content` 是**裸文本块对象**时，正文必须
+    /// 保留（旧实现只认字符串与数组，对象形态整段丢掉，详情里只剩占位文案）。
+    #[test]
+    fn dsh_tool_result_with_a_bare_text_block_keeps_its_body() {
+        let raw = concat!(
+            r#"{"type":"tool/result","seq":9,"time":1789311270808,"data":{"message":{"content":["#,
+            r#"{"type":"tool-result","toolCallId":"c1","content":{"type":"text","text":"写在裸块里的真实工具输出"},"isError":false}"#,
+            r#"]}}}"#,
+            "\n"
+        );
+        let events = crate::monitor::dsh::log::parse_events(raw);
+        let messages = map_dsh_events(&events);
+        let rendered = format!("{messages:?}");
+        assert!(
+            rendered.contains("写在裸块里的真实工具输出"),
+            "裸文本块形态的工具结果正文不得丢失：{rendered}"
+        );
+    }
+
+    /// **真实夹具**（不是合成输入）覆盖裸文本块形态。
+    ///
+    /// 为什么必须补夹具：前面的用例是手写 JSON——它能证明分支存在，但不能证明
+    /// 「真实宿主写出来的样子」就是这个形状。`sample6` 是按官方 `tool/result`
+    /// 帧结构落的样（`content` 为单个 `{type:"text"}` 对象），断言正文进 content。
+    #[test]
+    fn dsh_sample6_bare_text_block_fixture_reaches_the_message_body() {
+        let text = dsh_fixture("sample6-tool-result-text-block.sanitized.jsonl");
+        let events = crate::monitor::dsh::log::parse_events(&text);
+        let msgs = map_dsh_events(&events);
+        let results: Vec<&SessionMessage> =
+            msgs.iter().filter(|m| m.kind == "tool-result").collect();
+        assert_eq!(results.len(), 1, "夹具应恰有一条工具结果");
+        assert!(
+            results[0]
+                .content
+                .contains("hello from the bare text block"),
+            "裸文本块形态的工具结果正文必须进 content，实际：{:?}",
+            results[0].content
+        );
+        assert_ne!(results[0].content, "工具结果", "不得退化成占位文案");
+    }
+
+    /// 对照：字符串与块数组两种旧形态仍然可用（不得因修复而回退）。
+    #[test]
+    fn dsh_tool_result_string_and_array_shapes_still_work() {
+        for content in [
+            r#""字符串形态的工具输出""#,
+            r#"[{"type":"text","text":"数组形态的工具输出"}]"#,
+        ] {
+            let raw = format!(
+                concat!(
+                    r#"{{"type":"tool/result","seq":9,"time":1789311270808,"data":{{"message":{{"content":["#,
+                    r#"{{"type":"tool-result","toolCallId":"c1","content":{},"isError":false}}"#,
+                    r#"]}}}}}}"#,
+                    "\n"
+                ),
+                content
+            );
+            let events = crate::monitor::dsh::log::parse_events(&raw);
+            let rendered = format!("{:?}", map_dsh_events(&events));
+            assert!(
+                rendered.contains("工具输出"),
+                "旧形态必须保持可用（content={content}）：{rendered}"
+            );
+        }
     }
 }

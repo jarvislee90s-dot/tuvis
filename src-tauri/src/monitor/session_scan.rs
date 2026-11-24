@@ -54,8 +54,7 @@ pub(crate) fn fresh_within(mtime: SystemTime, now: SystemTime) -> bool {
 
 #[derive(Clone)]
 struct CacheEntry {
-    mtime: SystemTime,
-    size: u64,
+    stamp: FileStamp,
     value: Arc<dyn Any + Send + Sync>,
 }
 
@@ -65,7 +64,10 @@ fn registry() -> &'static Mutex<HashMap<(&'static str, PathBuf), CacheEntry>> {
     REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// 按 namespace 隔离的文件解析缓存（同一文件在不同工具/用途下的产物互不串扰）
+/// 按 namespace 隔离的文件解析缓存（同一文件在不同工具/用途下的产物互不串扰）。
+/// Clone = 句柄克隆（ns 是 'static 字符串；缓存数据在全局 registry 按 ns 共享，
+/// 克隆不复制条目、不损失记忆化）。
+#[derive(Clone)]
 pub(crate) struct FileParseCache {
     ns: &'static str,
 }
@@ -86,19 +88,37 @@ impl FileParseCache {
         T: Send + Sync + 'static,
         F: FnOnce(&Path) -> T,
     {
-        let Some((mtime, size)) = stat_key(path) else {
-            return Arc::new(parse(path));
+        self.read_cached(path, false, parse)
+            .expect("unverified cache accepts changes")
+    }
+
+    fn read_cached<T, F>(&self, path: &Path, checked_identity: bool, parse: F) -> Option<Arc<T>>
+    where
+        T: Send + Sync + 'static,
+        F: FnOnce(&Path) -> T,
+    {
+        let Some(stamp) = FileStamp::read(path, checked_identity) else {
+            return Some(Arc::new(parse(path)));
         };
         if let Some(hit) = self.locked().get(&(self.ns, path.to_path_buf())) {
-            if hit.mtime == mtime && hit.size == size {
+            if hit.stamp == stamp {
                 // 存入时 Arc<T> 上转，胖指针指向的具体类型是 T——用 Arc::downcast 还原
                 if let Ok(v) = hit.value.clone().downcast::<T>() {
-                    return v;
+                    return if checked_identity
+                        && FileStamp::read(path, true).as_ref() != Some(&stamp)
+                    {
+                        None
+                    } else {
+                        Some(v)
+                    };
                 }
                 // 类型不匹配 = namespace 被误用（同 ns 存了不同 T），按未命中覆盖
             }
         }
         let value = Arc::new(parse(path));
+        if checked_identity && FileStamp::read(path, true).as_ref() != Some(&stamp) {
+            return None;
+        }
         let mut map = self.locked();
         if map.len() >= EVICT_HARD_CAP {
             map.retain(|k, _| k.0 != self.ns);
@@ -106,12 +126,11 @@ impl FileParseCache {
         map.insert(
             (self.ns, path.to_path_buf()),
             CacheEntry {
-                mtime,
-                size,
+                stamp,
                 value: value.clone() as Arc<dyn Any + Send + Sync>,
             },
         );
-        value
+        Some(value)
     }
 
     /// 只读缓存不解析：L3 窗口外的陈旧文件用它取"曾经解析过的摘要"参与匹配；
@@ -142,6 +161,8 @@ impl FileParseCache {
 /// 会话文件扫描流水线：文件类解析器的统一入口（模块文档含接入模板）。
 /// 以 namespace 隔离缓存；`collect` 全量收集，L3 窗口分流由调用方用
 /// `fresh_within` 完成（新鲜 → `parse`，陈旧 → `peek`，匹配失败 → `fill_uncached`）。
+/// Clone = 句柄克隆（发现②预算线程携带用；缓存数据全局共享，克隆零成本）。
+#[derive(Clone)]
 pub(crate) struct SessionFileScan {
     cache: FileParseCache,
 }
@@ -196,6 +217,15 @@ impl SessionFileScan {
         self.cache.get_or_parse(file, parse_fn)
     }
 
+    /// 用于授权依据的首行缓存不能只按大小和 mtime 判断文件相同。
+    pub(crate) fn parse_checked_identity<T, F>(&self, file: &Path, parse_fn: F) -> Option<Arc<T>>
+    where
+        T: Send + Sync + 'static,
+        F: FnOnce(&Path) -> T,
+    {
+        self.cache.read_cached(file, true, parse_fn)
+    }
+
     /// L3：窗口外陈旧文件只读缓存不解析；从未解析过 → None
     pub(crate) fn peek<T>(&self, file: &Path) -> Option<Arc<T>>
     where
@@ -228,9 +258,31 @@ impl SessionFileScan {
     }
 }
 
-fn stat_key(path: &Path) -> Option<(SystemTime, u64)> {
-    let meta = std::fs::metadata(path).ok()?;
-    Some((meta.modified().ok()?, meta.len()))
+#[derive(Clone, PartialEq, Eq)]
+struct FileStamp {
+    mtime: SystemTime,
+    size: u64,
+    #[cfg(unix)]
+    identity: Option<(u64, u64, i64, i64)>,
+}
+
+impl FileStamp {
+    fn read(path: &Path, checked_identity: bool) -> Option<Self> {
+        #[cfg(not(unix))]
+        if checked_identity {
+            return None;
+        }
+        let meta = std::fs::metadata(path).ok()?;
+        Some(Self {
+            mtime: meta.modified().ok()?,
+            size: meta.len(),
+            #[cfg(unix)]
+            identity: checked_identity.then(|| {
+                use std::os::unix::fs::MetadataExt;
+                (meta.dev(), meta.ino(), meta.ctime(), meta.ctime_nsec())
+            }),
+        })
+    }
 }
 
 #[cfg(test)]

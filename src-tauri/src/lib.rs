@@ -225,6 +225,48 @@ pub fn run() {
             // KV，此处句柄就绪后消费：pending 且未销账（shown）才弹；销账只发生在
             // 用户点「复制命令」/「不再提醒」（codex_trust_notice_ack 命令）
             monitor::hooks::consume_codex_trust_notice(app.handle());
+            // H04（审查 I4①）：安装 DSH 卡片实例归属器（monitor 扫描从此给已核验
+            // 实例的卡片写 dshInstanceId；多义/未核验 → None 不猜）。失败不影响启动。
+            services::dsh_control::production::install_instance_attributor();
+            // T09 启动恢复门（必须在远程服务开放**之前**）：先把崩溃遗留的
+            // `reserved` 动作恢复为 `unknown_delivery`（不自动重投），成功才放行
+            // DSH 写入口；失败则关闭写入口并继续启动（读路径仍可服务、远控卡显示
+            // 不可写）。这样远程服务开放时不存在「恢复窗口」——新请求要么看到
+            // 已恢复状态，要么被写门显式拒绝（DSH_ACTION_WRITE_GATED）。
+            match services::dsh_control::production_hub().startup_recovery() {
+                Ok(0) => {}
+                Ok(n) => log::info!(
+                    "dsh action ledger: recovered {n} reserved action(s) to unknown_delivery"
+                ),
+                Err(e) => log::warn!(
+                    "dsh action ledger recovery failed; DSH write entry stays closed: {}: {}",
+                    e.code,
+                    e.detail
+                ),
+            }
+            // B2/P1-D（T10 复审）：恢复完成后全量推进排队消息——崩溃前从未发送的
+            // queued 逐条送出（在途残留已被恢复收口为 unknown_delivery，不自动重
+            // 投）。**P1-D**：先等本代凭据就绪（插件经本机 IPC 交付 cookie 的节奏
+            // 与应用启动异步）——就绪前推进会把排队消息误标 Failed；上限 120 秒，
+            // 超时即放行（泵内部每轮预检就绪，仍不可用 → 保留 Queued 等下一次
+            // 触发：效果/派发/重启）。
+            tauri::async_runtime::spawn(async move {
+                let hub = services::dsh_control::production_hub();
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+                while !hub.native_ready().await && std::time::Instant::now() < deadline {
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                }
+                hub.advance_all_queues().await;
+            });
+            // P1-B 收刈循环：效果源超期未确认的 accepted 动作 → unknown_delivery
+            //（不自动重投），随后全量推进被释放会话的排队。60s 一扫（预算 15 分钟）。
+            tauri::async_runtime::spawn(async move {
+                let hub = services::dsh_control::production_hub();
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                    hub.reap_unconfirmed_effects().await;
+                }
+            });
             // T7.1 C2b：进程内唯一 ZCode 控制 Hub——Tauri managed state（桌面 IPC）
             // 与远程 STATE（/m/api/v1）共用同一 Arc（无第二 Hub、无第二 relay）。
             // `ZcodeHub::new` 必须在 Tokio runtime 内构造（relay 事件泵/桥 actor）；
@@ -246,6 +288,38 @@ pub fn run() {
             // 用量兜底 ticker：每「采集间隔 + 2 分钟」后台采一次，不依赖任何页面
             // （debug 构建默认关闭，TUVIS_USAGE_TICKER=1 可开，见 ticker.rs 文档）
             crate::services::usage::ticker::spawn_runtime();
+            // P1-3（Round-7 Task 3）启动即恢复：扫描已登记实例的非终态开关记录，
+            // 逐实例拉起本代驱动器（同代幂等；不依赖任何 UI 查询）——等待卸载/
+            // 授权中的开关作业随应用启动续跑，不需要用户打开设置页。fail-soft：
+            // 坏记录/装配失败只记日志，绝不阻断应用启动（设置页 view() 仍是次级
+            // 恢复点）。经 tauri::async_runtime 包装：spawn_driver 内部 tokio::spawn
+            // 需要运行时上下文，setup 主线程没有。
+            tauri::async_runtime::spawn(async move {
+                services::dsh_control::production::resume_switch_drivers_at_startup();
+            });
+            // T06 + R09：DSH 本机授权 IPC 服务随应用启动（发布 rendezvous，等插件
+            // 主动连接；未绑定的连接只会得到待批挑战，零凭据——批准权在本机设置卡）。
+            //
+            // **失败隔离**：DSH 控制域是可选能力（坏了只影响远控卡，不影响其它
+            // 工具），所以初始化失败一律只记日志、留降级标记——由
+            // `dsh_remote_status()` 把原因码（如 DSH_IPC_STATE）如实显示为「域不可用
+            // + 修复出口」，绝不 `expect` 拖垮整个应用启动（2026-10-29 审查 R09）。
+            match services::dsh_control::production::production_auth_state() {
+                Ok(auth) => {
+                    tauri::async_runtime::spawn(async move {
+                        if let Err(e) = auth.serve().await {
+                            log::warn!("dsh local ipc serve failed: {}", e.detail);
+                        }
+                    });
+                }
+                Err(failure) => {
+                    // production_auth_state 内部已 warn 过（含具体码与 detail），
+                    // 这里只记一行说明「应用继续启动」这一事实，不重复刷屏。
+                    log::info!(
+                        "dsh control domain unavailable at startup; app continues: {failure}"
+                    );
+                }
+            }
             // TPS 短时抽样（2026-10-24 计划 Task 7）：调度/接收随 usage.enabled 总授权
             // 启停——关闭时每拍只读一行 settings（惯性，不改旧 usage 采集的启动时序）
             crate::services::tps::collector::spawn_runtime();
@@ -273,6 +347,9 @@ pub fn run() {
         .plugin(plugins::system_tray::init())
         // 四页工作区导航（2026-10-26 计划 Task 7）：待导航目标队列（revision/ACK 语义见
         // services/workspace_navigation.rs；纯内存，不落盘）
+        // DSH 远控控制面 hub（T09）：进程级单例——Tauri 与 RemoteState 取同一 Arc
+        // （验收⑤由 dsh_store_test::production_hub_is_shared_by_tauri_and_remote 锁定）。
+        .manage(services::dsh_control::production_hub())
         .manage(services::workspace_navigation::NavigationQueue::default());
     let builder = builder.invoke_handler(tauri::generate_handler![
         greet,
@@ -391,6 +468,30 @@ pub fn run() {
         // 清理目标必须命中上传索引，不接受客户端任意路径）
         commands::data_management::list_attachment_projects,
         commands::data_management::clean_attachment_project,
+        // DSH 本机管理 IPC（2026-10-29 计划 T05）：§2.4 九命令逐字
+        //（管理命令不接受包名/命令/任意安装路径，目标由 identity 单源解析；
+        // 绑定两命令 T06 前显式返回未接入。锁：commands/dsh.rs 自检 +
+        // tests/dsh_commands_test.rs）
+        commands::dsh::dsh_instance_list,
+        commands::dsh::dsh_instance_select,
+        commands::dsh::dsh_instance_status,
+        commands::dsh::dsh_restart_host,
+        commands::dsh::dsh_remote_status,
+        commands::dsh::dsh_plugin_install,
+        commands::dsh::dsh_plugin_repair,
+        commands::dsh::dsh_plugin_uninstall,
+        commands::dsh::dsh_plugin_job,
+        commands::dsh::dsh_plugin_cancel,
+        commands::dsh::dsh_binding_start,
+        commands::dsh::dsh_binding_arm_intent,
+        commands::dsh::dsh_binding_approve,
+        commands::dsh::dsh_binding_rebind,
+        commands::dsh::dsh_binding_revoke,
+        commands::dsh::dsh_set_auto_adapt,
+        commands::dsh::dsh_switch_get,
+        commands::dsh::dsh_switch_enable,
+        commands::dsh::dsh_switch_disable,
+        commands::dsh::dsh_switch_repair,
         commands::settings::list_sub_agents,
         commands::settings::mark_session_read,
         commands::settings::get_tool_settings,
@@ -597,6 +698,33 @@ mod scan_bus_start_order_tests {
         assert!(
             src.contains("commands::session::get_sessions_snapshot"),
             "前端读取 versioned snapshot 的 Tauri command 必须注册"
+        );
+    }
+
+    /// P1-3（Round-7 Task 3）：开关驱动器启动恢复必须挂在 setup 装配段（归属器
+    /// 安装之后、授权 IPC serve 之前），且经 tauri::async_runtime 包装（spawn_driver
+    /// 内部 tokio::spawn 需要运行时上下文）。源码级锁：拆掉装配即红。
+    #[test]
+    fn switch_driver_startup_resume_is_wired_in_setup() {
+        let src = include_str!("lib.rs");
+        let attributor = src
+            .find("install_instance_attributor()")
+            .expect("归属器安装（setup 段锚点）必须存在");
+        let resume = src
+            .find("resume_switch_drivers_at_startup()")
+            .expect("开关驱动器启动恢复必须接线");
+        let async_wrap =
+            src[resume.saturating_sub(120)..resume].contains("tauri::async_runtime::spawn");
+        assert!(
+            async_wrap,
+            "启动恢复必须经 tauri::async_runtime 包装（tokio 运行时上下文）"
+        );
+        let auth_serve = src
+            .find("production_auth_state()")
+            .expect("授权域启动装配（setup 段锚点）必须存在");
+        assert!(
+            attributor < resume && resume < auth_serve,
+            "启动恢复必须先于授权域装配段（attributor 之后）：{attributor} < {resume} < {auth_serve}"
         );
     }
 }

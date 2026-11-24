@@ -62,6 +62,8 @@ fn target_view_reads_only_the_selected_directory() {
     add(&conn, "b", "/b");
     let hub = NativeHub::new(DeviceStore::Owned(Arc::new(Mutex::new(conn))));
     let card = Session {
+        dsh_instance_id: None,
+        dsh_subagent: None,
         id: "s".into(),
         agent_type: AgentType::OpenCode,
         project_name: String::new(),

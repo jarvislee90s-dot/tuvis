@@ -168,6 +168,7 @@ mod r1_mutation_scan_tests {
             .map(|i| DismissItem {
                 agent_type: "claude".to_string(),
                 session_id: format!("r1-batch-{i}"),
+                instance_id: None,
                 status: "idle".to_string(),
             })
             .collect();
@@ -212,6 +213,7 @@ mod r1_mutation_scan_tests {
         let now = chrono::Utc::now().timestamp_millis();
         crate::database::dao::unread::try_upsert(
             &crate::database::dao::unread::UnreadSessionRecord {
+                dsh_instance_id: None,
                 tool_id: "claude".to_string(),
                 session_id: "f5-epoch-order".to_string(),
                 project_name: "p".to_string(),
@@ -229,6 +231,7 @@ mod r1_mutation_scan_tests {
                 agent_type: "claude".to_string(),
                 session_id: "f5-epoch-order".to_string(),
                 status: "idle".to_string(),
+                instance_id: None,
             }],
             move |_, _| {
                 // 变更进行中另一轮扫描启动（emit_read 只在未读分支调用）：
@@ -263,7 +266,7 @@ mod r1_mutation_scan_tests {
             result.gate_epoch >= before,
             "门槛不得早于命令入口纪元（{before}）"
         );
-        crate::database::dao::unread::delete("claude", "f5-epoch-order");
+        crate::database::dao::unread::delete("claude", "f5-epoch-order", None);
     }
 
     /// 复核 R-2（结构锁）：`mark_session_read` 的门槛必须在**未读写入之后**现取。
@@ -400,12 +403,13 @@ fn mark_read_on_jump(
     app: &tauri::AppHandle,
     session_id: &Option<String>,
     agent_type: &Option<String>,
+    instance: Option<&str>,
 ) -> Option<u64> {
     if let (Some(sid), Some(agent)) = (session_id, agent_type) {
-        crate::database::dao::unread::delete(&agent.to_lowercase(), sid);
+        crate::database::dao::unread::delete(&agent.to_lowercase(), sid, instance);
         // issue #35-1：已读墓碑——缓存失忆（长间隙清缓存 / 兔维斯 重启）后
         // Insert 边沿与补偿据此不再复活已读未读卡
-        crate::database::dao::unread::mark_read(&agent.to_lowercase(), sid);
+        crate::database::dao::unread::mark_read(&agent.to_lowercase(), sid, instance);
         let _ = app.emit(
             "session-read",
             serde_json::json!({ "agentType": agent, "sessionId": sid }),
@@ -432,9 +436,13 @@ fn focus_success_payload(
     app: &tauri::AppHandle,
     session_id: &Option<String>,
     agent_type: &Option<String>,
+    instance: Option<&str>,
     payload: serde_json::Value,
 ) -> serde_json::Value {
-    add_read_gate(payload, mark_read_on_jump(app, session_id, agent_type))
+    add_read_gate(
+        payload,
+        mark_read_on_jump(app, session_id, agent_type, instance),
+    )
 }
 
 // 参数即 Tauri IPC 契约（前端 invoke 逐名传参），不宜打包为结构体
@@ -450,6 +458,8 @@ pub fn focus_session(
     title: Option<String>,
     form: Option<String>,
     unread: Option<bool>,
+    // H07 最终批 I5：DSH 卡按实例限定已读（None = 非 DSH / 旧客户端）
+    instance_id: Option<String>,
 ) -> Result<serde_json::Value, String> {
     // dsh（H1）：桌面端宿主在场 → 聚焦桌面 APP 窗口；不在场才回落 web 宿主路径。
     // 插入点在平台 cfg 分派之前（跨平台前置）；macOS web 回落路径与 Windows
@@ -465,6 +475,7 @@ pub fn focus_session(
                             &app,
                             &session_id,
                             &agent_type,
+                            instance_id.as_deref(),
                             serde_json::json!({ "via": "dsh-desktop" }),
                         ));
                     }
@@ -487,6 +498,7 @@ pub fn focus_session(
                                     &app,
                                     &session_id,
                                     &agent_type,
+                                    instance_id.as_deref(),
                                     serde_json::json!({ "via": "dsh-desktop" }),
                                 ));
                             }
@@ -535,6 +547,7 @@ pub fn focus_session(
                                     &app,
                                     &session_id,
                                     &agent_type,
+                                    instance_id.as_deref(),
                                     serde_json::json!({
                                         "type": "focused",
                                         "via": "deep-link"
@@ -618,6 +631,7 @@ pub fn focus_session(
                     &app,
                     &session_id,
                     &agent_type,
+                    instance_id.as_deref(),
                     serde_json::json!({ "type": "focused" }),
                 ))
             }
@@ -635,6 +649,7 @@ pub fn focus_session(
                         &app,
                         &session_id,
                         &agent_type,
+                        instance_id.as_deref(),
                         serde_json::json!({ "type": "focused" }),
                     ))
                 } else {
@@ -663,7 +678,13 @@ pub fn focus_session(
                         let _ = w.hide();
                     }
                     out["via"] = serde_json::Value::String("dsh".into());
-                    return Ok(focus_success_payload(&app, &session_id, &agent_type, out));
+                    return Ok(focus_success_payload(
+                        &app,
+                        &session_id,
+                        &agent_type,
+                        instance_id.as_deref(),
+                        out,
+                    ));
                 }
                 Err(e) => {
                     return Err(format!(
@@ -678,6 +699,7 @@ pub fn focus_session(
                 &app,
                 &session_id,
                 &agent_type,
+                instance_id.as_deref(),
                 serde_json::json!({ "type": "focused", "via": "tty" }),
             ));
         }
@@ -693,7 +715,13 @@ pub fn focus_session(
             let via = out.get("via").and_then(|v| v.as_str());
             if macos_deep_link_marks_read(via) {
                 out["via"] = serde_json::Value::String("app-fallback".into());
-                out = focus_success_payload(&app, &session_id, &agent_type, out);
+                out = focus_success_payload(
+                    &app,
+                    &session_id,
+                    &agent_type,
+                    instance_id.as_deref(),
+                    out,
+                );
             }
             return Ok(out);
         }
@@ -771,6 +799,9 @@ pub struct DismissItem {
     pub agent_type: String,
     pub session_id: String,
     pub status: String,
+    /// H07 最终批 I5：DSH 卡的已读按实例限定（None = 非 DSH / 旧客户端）
+    #[serde(default)]
+    pub instance_id: Option<String>,
 }
 
 /// 批量变更内核（R1，测试可直调）：逐项按**未读池权威**分流——
@@ -786,18 +817,33 @@ fn apply_dismissals(
     emit_read: impl Fn(&str, &str),
 ) -> crate::adapter::scan_bus::MutationScan {
     let now = chrono::Utc::now().timestamp_millis();
-    let unread: std::collections::HashSet<(String, String)> =
+    let unread: std::collections::HashSet<(String, String, String)> =
         crate::database::dao::unread::list(now)
             .into_iter()
-            .map(|r| (r.tool_id, r.session_id))
+            .map(|r| {
+                (
+                    r.tool_id,
+                    r.session_id,
+                    r.dsh_instance_id.unwrap_or_default(),
+                )
+            })
             .collect();
     let mut to_dismiss = Vec::new();
     for it in items {
         let tool = it.agent_type.to_lowercase();
-        if unread.contains(&(tool.clone(), it.session_id.clone())) {
-            crate::database::dao::unread::delete(&tool, &it.session_id);
+        let key = (
+            tool.clone(),
+            it.session_id.clone(),
+            it.instance_id.clone().unwrap_or_default(),
+        );
+        if unread.contains(&key) {
+            crate::database::dao::unread::delete(&tool, &it.session_id, it.instance_id.as_deref());
             // issue #35-1：已读墓碑，防止缓存失忆后未读卡复活
-            crate::database::dao::unread::mark_read(&tool, &it.session_id);
+            crate::database::dao::unread::mark_read(
+                &tool,
+                &it.session_id,
+                it.instance_id.as_deref(),
+            );
             emit_read(&it.agent_type, &it.session_id);
         } else {
             to_dismiss.push((tool, it.session_id, it.status.to_lowercase()));
@@ -830,6 +876,8 @@ pub async fn dismiss_session_card(
     agent_type: String,
     session_id: String,
     status: String,
+    // H07 最终批 I5：DSH 卡按实例限定已读
+    instance_id: Option<String>,
 ) -> MutationOutcome {
     // R9：单卡与批量共用 apply_dismissals（未读池权威分流 + 一次补扫），
     // 避免两条路径对「未读卡 X = 已读」的判定漂移
@@ -837,6 +885,7 @@ pub async fn dismiss_session_card(
         agent_type,
         session_id,
         status,
+        instance_id,
     };
     // F5：门槛纪元由 apply_dismissals 在变更落地后捕获；命令入口不取（复核 R-2：
     // 入口值偏小，会放行写入之前启动的扫描）

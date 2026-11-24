@@ -49,11 +49,437 @@ fn apply_board_hidden(
 /// GET /m/api/v1/sessions：数据源注入（生产 = `scan_bus::current_or_scan`，读共享快照），
 /// `SessionsResponse` 已 camelCase 序列化（前端约定 totalCount）。
 ///
+/// DSH 动作查询（T09 只读面；T18 完整远程路由的前置）：经 `RemoteState.dsh_control`
+/// 读动作账本——这是 hub 在远程层的**真实消费点**（T09 验收⑤的「两边接上」）。
+///
+/// 语义：设备身份由 gate 保证；hub 的 `view` 再做一次归属校验（别人的动作按
+/// 「不存在」回答）。未装配（disabled hub）→ 501，不冒充支持。
+pub async fn dsh_action(
+    State(st): State<Arc<RemoteState>>,
+    axum::extract::Path(action_id): axum::extract::Path<String>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    let Some(device_id) = super::gate::extract_device(&headers) else {
+        return json_no_store(
+            StatusCode::FORBIDDEN,
+            serde_json::json!({"error": "device_unpaired"}),
+        );
+    };
+    let device = crate::services::dsh_control::model::DeviceContext {
+        device_id: device_id.clone(),
+        device_name: device_id,
+    };
+    let hub = Arc::clone(&st.dsh_control);
+    match hub.action(&device, &action_id).await {
+        Ok(view) => json_no_store(
+            StatusCode::OK,
+            serde_json::to_value(view).unwrap_or(serde_json::Value::Null),
+        ),
+        Err(e) if e.code == crate::services::dsh_control::error::codes::UNSUPPORTED => {
+            json_no_store(
+                StatusCode::NOT_IMPLEMENTED,
+                serde_json::json!({"error": "dsh_control_unwired"}),
+            )
+        }
+        Err(e) => json_no_store(
+            StatusCode::NOT_FOUND,
+            serde_json::json!({"error": e.code, "reasonCode": e.detail}),
+        ),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DshTurnTarget {
+    instance_id: String,
+    session_id: String,
+}
+
+pub async fn dsh_current_turn(
+    State(st): State<Arc<RemoteState>>,
+    Query(target): Query<DshTurnTarget>,
+) -> Response {
+    let hub = Arc::clone(&st.dsh_control);
+    match tokio::task::spawn_blocking(move || {
+        hub.check_switch_gate(&target.instance_id)?;
+        let owned = hub.resolve_owned_session(&target.instance_id, &target.session_id)?;
+        let root = hub.resolve_readonly_root(&target.instance_id, &target.session_id)?;
+        super::content::dsh_open_turn(&root, &target.session_id)
+            .map(|turn| turn.map(|turn| format!("{}:{turn}", owned.epoch)))
+            .map_err(|_| {
+                crate::services::dsh_control::error::DshError::new(
+                    crate::services::dsh_control::error::codes::ACTION_STATE_CONFLICT,
+                    "dsh turn unavailable",
+                )
+            })
+    })
+    .await
+    {
+        Ok(Ok(turn)) => json_no_store(StatusCode::OK, serde_json::json!({"turn": turn})),
+        Ok(Err(error)) => dsh_turn_error_response(error),
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DshStopRequest {
+    instance_id: String,
+    session_id: String,
+    action_id: String,
+    turn: String,
+}
+
+pub async fn dsh_stop_current(
+    State(st): State<Arc<RemoteState>>,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<DshStopRequest>,
+) -> Response {
+    let Some((device_id, device_name)) = device_identity(&st, &headers) else {
+        return StatusCode::FORBIDDEN.into_response();
+    };
+    let device = crate::services::dsh_control::model::DeviceContext {
+        device_name,
+        device_id,
+    };
+    match st
+        .dsh_control
+        .stop_current_turn(
+            device,
+            req.instance_id,
+            req.session_id,
+            req.action_id,
+            req.turn,
+        )
+        .await
+    {
+        Ok(view) => json_no_store(StatusCode::OK, serde_json::json!(view)),
+        Err(error) => dsh_turn_error_response(error),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DshSettingsQuery {
+    instance_id: String,
+    session_id: String,
+    #[serde(default)]
+    catalogs: bool,
+}
+
+pub async fn dsh_session_settings(
+    State(st): State<Arc<RemoteState>>,
+    Query(query): Query<DshSettingsQuery>,
+) -> Response {
+    let target = crate::services::dsh_control::session_settings::SettingsTarget {
+        instance_id: query.instance_id,
+        session_id: query.session_id,
+    };
+    match st
+        .dsh_control
+        .dsh_session_settings(target, query.catalogs)
+        .await
+    {
+        Ok(settings) => json_no_store(StatusCode::OK, serde_json::json!(settings)),
+        Err(error) => dsh_turn_error_response(error),
+    }
+}
+
+pub async fn dsh_change_session_settings(
+    State(st): State<Arc<RemoteState>>,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<crate::services::dsh_control::session_settings::ChangeRequest>,
+) -> Response {
+    let Some((device_id, device_name)) = device_identity(&st, &headers) else {
+        return StatusCode::FORBIDDEN.into_response();
+    };
+    let device = crate::services::dsh_control::model::DeviceContext {
+        device_id,
+        device_name,
+    };
+    match st
+        .dsh_control
+        .change_dsh_session_settings(device, st.store.clone(), req)
+        .await
+    {
+        Ok(receipt) => json_no_store(StatusCode::OK, serde_json::json!(receipt)),
+        Err(error) => dsh_turn_error_response(error),
+    }
+}
+
+fn dsh_turn_error_response(mut error: crate::services::dsh_control::error::DshError) -> Response {
+    error.detail = error.code.to_owned();
+    dsh_error_response(error)
+}
+
 /// 扫描必须在 `spawn_blocking` 里跑：生产源是**同步阻塞**调用
 /// （读快照通常即时；冷启动无成功快照时等待首扫发布：sysinfo 全进程刷新 + 各工具会话解析，
 /// 可达数秒），直接放在 async handler 里会周期性堵死 tokio worker——移动端 3s 轮询下
 /// 即为持续拖垮（桌面侧同一函数已按此包，实机教训见 `commands/session.rs` 的
 /// `get_all_sessions`）。
+/// T03：GET /m/api/v1/dsh/questions — 当前可作答的 DSH 题组（只读）。
+///
+/// 需已配对设备（gate 已在子路由层整体覆盖，这里再取 device 用于归属上下文）。
+/// 查询按 `instanceId + sessionId` 核验归属后读官方投影；投影不可读 → 返回
+/// `groups: []` 且 `verified: false`，前端据此回退只读卡（不冒充可作答）。
+pub async fn dsh_questions(
+    State(st): State<Arc<RemoteState>>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    let Some(device_id) = super::gate::extract_device(&headers) else {
+        return json_no_store(
+            StatusCode::FORBIDDEN,
+            serde_json::json!({"error": "device_unpaired"}),
+        );
+    };
+    let (instance_id, session_id) = match dsh_question_target(&params) {
+        Ok(target) => target,
+        Err(response) => return response,
+    };
+    let hub = Arc::clone(&st.dsh_control);
+    match hub.read_question_snapshot(instance_id, session_id).await {
+        // 读取成功：verified=true 表示这份结论来自**已核验投影**（groups 可空 = 确证无题组）。
+        Ok(snapshot) => json_no_store(
+            StatusCode::OK,
+            serde_json::json!({
+                "verified": true,
+                "device": device_id,
+                "snapshot": snapshot,
+            }),
+        ),
+        // 读取本身失败：**区别于「没有题组」**——用 503 让前端保留上一份快照并显示
+        // 可诊断状态，而不是卸载卡片（否则一次槽位占用就让卡片闪一下消失）。
+        Err(e) => {
+            let mut response = dsh_error_response(e);
+            if response.status() == StatusCode::INTERNAL_SERVER_ERROR
+                || response.status() == StatusCode::CONFLICT
+            {
+                *response.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
+            }
+            response
+        }
+    }
+}
+
+#[allow(clippy::result_large_err)]
+fn dsh_question_target(params: &HashMap<String, String>) -> Result<(&str, &str), Response> {
+    let required = |key, error| {
+        params
+            .get(key)
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                json_no_store(StatusCode::BAD_REQUEST, serde_json::json!({"error": error}))
+            })
+    };
+    Ok((
+        required("instanceId", "instanceId_required")?,
+        required("sessionId", "sessionId_required")?,
+    ))
+}
+
+/// T03：POST /m/api/v1/dsh/questions/answer — 提交一整组答案。
+///
+/// 请求体见 [`crate::services::dsh_control::questions::DshQuestionAnswerRequest`]。
+/// 一次请求 = 一个原生整组动作，不进普通消息队列；同 actionId 幂等，异载荷冲突。
+pub async fn dsh_question_answer(
+    State(st): State<Arc<RemoteState>>,
+    headers: axum::http::HeaderMap,
+    axum::Json(request): axum::Json<
+        crate::services::dsh_control::questions::DshQuestionAnswerRequest,
+    >,
+) -> axum::response::Response {
+    let Some(device_id) = super::gate::extract_device(&headers) else {
+        return json_no_store(
+            StatusCode::FORBIDDEN,
+            serde_json::json!({"error": "device_unpaired"}),
+        );
+    };
+    if request.action_id.trim().is_empty() {
+        return json_no_store(
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({"error": "action_id_required"}),
+        );
+    }
+    let device = crate::services::dsh_control::model::DeviceContext {
+        device_id: device_id.clone(),
+        device_name: device_id,
+    };
+    let hub = Arc::clone(&st.dsh_control);
+    match hub.dispatch_question_answer(&device, &request).await {
+        Ok(outcome) => json_no_store(
+            StatusCode::OK,
+            serde_json::json!({
+                "hostAccepted": outcome.host_accepted,
+                "action": outcome.view,
+            }),
+        ),
+        Err(e) => dsh_error_response(e),
+    }
+}
+
+/// T-live：GET /m/api/v1/dsh/questions/live — **实时**待答列表。
+///
+/// 与 `GET /dsh/questions`（投影 `continued` 补答）是**两条不同通道**，别混用：
+/// 本端点读的是 `user-questions/request` waterfall 推送来的待答项（回合仍在跑、
+/// `ask_user_question` 尚未返回），投影路径看不到这类提问。详见
+/// [`crate::services::dsh_control::question_events`] 模块文档。
+///
+/// 需已配对设备（子路由层 gate 已整体覆盖；这里再取 device 便于归属上下文）。
+/// 归属核验失败 → 403/409（`resolve_owned_session` 的错误码原样映射）；
+/// 成功 → `{verified:true, instanceId, sessionId, pending:[{eventId,questions,…}]}`
+/// （`pending` 为空 = 已核验且当前没有实时待答）。
+pub async fn dsh_live_questions(
+    State(st): State<Arc<RemoteState>>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    let Some(_device_id) = super::gate::extract_device(&headers) else {
+        return json_no_store(
+            StatusCode::FORBIDDEN,
+            serde_json::json!({"error": "device_unpaired"}),
+        );
+    };
+    let (instance_id, session_id) = match dsh_question_target(&params) {
+        Ok(target) => target,
+        Err(response) => return response,
+    };
+    let hub = Arc::clone(&st.dsh_control);
+    match hub.live_questions(instance_id, session_id).await {
+        // 成功：`live` 与 `pending` 来自**同一次**状态快照（P2-1），不会混代次。
+        // `live` 区分「确证没有实时待答」（live:true + pending 空）与「实时通道
+        // 尚未就绪」（live:false）——前端不得把后者当成「用户没在等」。
+        Ok(snapshot) => json_no_store(
+            StatusCode::OK,
+            serde_json::json!({
+                "verified": true,
+                "instanceId": instance_id,
+                "sessionId": session_id,
+                "live": snapshot.live,
+                "generation": snapshot.generation,
+                "pending": snapshot.pending,
+            }),
+        ),
+        // 归属/装配失败：与投影端点同口径（失败 ≠ 没有待答，故不返回空数组冒充）。
+        Err(e) => {
+            let mut response = dsh_error_response(e);
+            if response.status() == StatusCode::INTERNAL_SERVER_ERROR {
+                *response.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
+            }
+            response
+        }
+    }
+}
+
+/// T-live：POST /m/api/v1/dsh/questions/live/answer — 实时待答回执。
+///
+/// 请求体：`{instanceId, sessionId, eventId, answers:[{id,selected[],custom?}]}`。
+/// 回执经 `$events/result` 发宿主（必须与开流同一个 PeerChannel）。
+///
+/// **成功语义（P1-4，别误读）**：`{"receiptAccepted":true,"receiptOnly":true}` 只表示
+/// **宿主接受了这次回执 RPC**——它**不证明答案已生效**。答案是否落到会话上只能从
+/// 投影/消息流观测（live 路径本来就不写动作账本）。前端最多显示「已提交」。
+///
+/// 失败码：`eventId` 已答/不在待答集/正在提交 → 409；带 `intent` 的动作确认类
+/// → 403（`DSH_CAPABILITY_DENIED`）；归属不符 → 403；写门/开关关闭 → 403；
+/// 未装配 → 501；送达未知 → 500（`DSH_WRITE_TIMEOUT`，可安全重试）。
+///
+/// **与 `/dsh/questions/answer` 的区别**：那是投影 `continued` 补答
+/// （`userQuestions/answer` + `actionId` 账本），这是实时 waterfall 回执
+/// （`eventId` 幂等）。前端按收到的待答项来源选端点。
+pub async fn dsh_live_question_answer(
+    State(st): State<Arc<RemoteState>>,
+    headers: axum::http::HeaderMap,
+    axum::Json(request): axum::Json<
+        crate::services::dsh_control::question_events::DshLiveQuestionAnswerRequest,
+    >,
+) -> axum::response::Response {
+    let Some(device_id) = super::gate::extract_device(&headers) else {
+        return json_no_store(
+            StatusCode::FORBIDDEN,
+            serde_json::json!({"error": "device_unpaired"}),
+        );
+    };
+    if request.event_id.trim().is_empty() {
+        return json_no_store(
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({"error": "event_id_required"}),
+        );
+    }
+    let device = crate::services::dsh_control::model::DeviceContext {
+        device_id: device_id.clone(),
+        device_name: device_id,
+    };
+    let hub = Arc::clone(&st.dsh_control);
+    match hub
+        .answer_live_question(
+            &device,
+            &request.instance_id,
+            &request.session_id,
+            &request.event_id,
+            &request.answers,
+        )
+        .await
+    {
+        Ok(outcome) => json_no_store(
+            StatusCode::OK,
+            serde_json::json!({
+                // P1-4：`hostAccepted` 只曾表示「回执 RPC 被接受」，容易误读成
+                // 「答案已生效」。新字段语义精确；`hostAccepted` 保留为同值别名，
+                // 兼容既有读取点（前端切换后再删）。
+                "receiptAccepted": outcome.receipt_accepted,
+                "receiptOnly": true,
+                "hostAccepted": outcome.receipt_accepted,
+            }),
+        ),
+        Err(e) => dsh_error_response(e),
+    }
+}
+
+/// DSH 错误 → HTTP（P2-4：归属不符/实例切换映射到 403/409，而不是落到 500）。
+///
+/// | 错误 | 状态 | 语义 |
+/// | --- | --- | --- |
+/// | `DSH_UNSUPPORTED` | 501 | 未装配 |
+/// | 动作冲突/载荷非法 | 409 | 可重读后重试 |
+/// | `DSH_INSTANCE_SWITCHED` | 409 | 选中的实例变了（客户端应刷新实例列表） |
+/// | 未找到 | 404 | 目标不存在 |
+/// | `DSH_ACTION_WRITE_GATED` / 开关关闭 | 403 | 边界拒绝 |
+/// | `DSH_CAPABILITY_DENIED` | 403 | 能力门拒绝（含 intent 动作确认类） |
+/// | `DSH_SESSION_OWNERSHIP_UNPROVEN` | 403 | 归属不可证 |
+/// | `DSH_PEER_*` / `DSH_SEND_*` | 403 | 凭据/通道层拒绝 |
+/// | 其余 | 500 | 真实内部错误 |
+fn dsh_error_response(
+    e: crate::services::dsh_control::error::DshError,
+) -> axum::response::Response {
+    use crate::services::dsh_control::error::codes;
+    let status = match e.code {
+        codes::UNSUPPORTED => StatusCode::NOT_IMPLEMENTED,
+        codes::ACTION_STATE_CONFLICT
+        | codes::ACTION_ID_CONFLICT
+        | codes::ACTION_INVALID
+        | codes::INSTANCE_SWITCHED => StatusCode::CONFLICT,
+        codes::ACTION_NOT_FOUND => StatusCode::NOT_FOUND,
+        codes::ACTION_WRITE_GATED
+        | codes::SWITCH_OFF
+        | codes::SWITCH_ACTIVE
+        | codes::SWITCH_REVOKE_PENDING
+        | codes::CAPABILITY_DENIED
+        | codes::SESSION_OWNERSHIP_UNPROVEN
+        | codes::PEER_UNAUTHORIZED
+        | codes::PEER_CONFLICT
+        | codes::PEER_REVOKED
+        | codes::SEND_NOT_AUTHORIZED
+        | codes::SEND_RECONNECTING => StatusCode::FORBIDDEN,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    json_no_store(
+        status,
+        serde_json::json!({"error": e.code, "reasonCode": e.detail}),
+    )
+}
+
 pub async fn sessions(State(st): State<Arc<RemoteState>>) -> impl IntoResponse {
     // 闭包捕获 state 的 Arc（Send + Sync + 'static）：`session_source` 是 Box<dyn Fn> 不可
     // clone，故整体 move 进阻塞线程池，在池内调用注入源
@@ -837,18 +1263,37 @@ pub async fn session_files(
         .unwrap_or(200);
     // path_source 不可 clone（Box<dyn Fn>）：整体 move 进阻塞线程池调用（与
     // session_messages handler 的写法一致）
+    let instance_id = params.get("instanceId").cloned();
     let st = st.clone();
-    let (files, truncated) = tokio::task::spawn_blocking(move || {
-        let (mut files, truncated) = (st.path_source)(agent.as_str(), sid.as_str(), limit);
+    let (files, truncated, media) = tokio::task::spawn_blocking(move || {
+        let session = find_request_session(&st, &sid, instance_id.as_deref())
+            .map_err(|_| StatusCode::FORBIDDEN)?;
+        let (mut files, truncated, media) = if agent == "dsh" {
+            let id = instance_id
+                .as_deref()
+                .or_else(|| {
+                    session
+                        .as_ref()
+                        .filter(|s| s.agent_type == crate::session::AgentType::Dsh)
+                        .and_then(|s| s.dsh_instance_id.as_deref())
+                })
+                .ok_or(StatusCode::FORBIDDEN)?;
+            let root = st
+                .dsh_control
+                .resolve_readonly_root(id, &sid)
+                .map_err(|_| StatusCode::FORBIDDEN)?;
+            let root_str = root.to_str().ok_or(StatusCode::FORBIDDEN)?;
+            let home = dirs::home_dir().ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+            super::files::dsh_file_views(&home, root_str, &sid, limit)
+        } else {
+            let (files, truncated) = (st.path_source)(agent.as_str(), sid.as_str(), limit);
+            (files, truncated, Vec::new())
+        };
         // 列表/preview 的 cwd 基准与 /file 读取**不同源**（如实申报，勿再声称同一份）：
         // 本端点算 file_key 用动作路径的**新鲜**快照（cwd 变更后旧快照会把 file_key
         // 算错），而 /file（api::read_file）仍用显示快照 session_source 定 cwd——
         // 分歧已接受，待后续收敛；两者都不使用消息流里的 pg.cwd
-        let preview_cwd = (st.fresh_session_source)()
-            .sessions
-            .into_iter()
-            .find(|s| s.id == sid)
-            .map(|s| s.project_path);
+        let preview_cwd = session.map(|s| s.project_path);
         for entry in &mut files {
             entry.file_key = Some(crate::file_identity::file_identity_key(
                 &entry.path,
@@ -856,17 +1301,21 @@ pub async fn session_files(
                 cfg!(windows),
             ));
         }
-        (files, truncated)
+        Ok::<_, StatusCode>((files, truncated, media))
     })
     .await
     .map_err(|e| {
         log::error!("文件路径提取任务异常: {e}");
         StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    })??;
+    let mut body = serde_json::json!({ "files": files, "truncated": truncated });
+    if !media.is_empty() {
+        body["media"] = serde_json::json!(media);
+    }
     Ok((
         // 门禁下的私有数据（会话涉及的文件路径），禁止中间层缓存（sessions 同规）
         [(axum::http::header::CACHE_CONTROL, "no-store")],
-        Json(serde_json::json!({ "files": files, "truncated": truncated })),
+        Json(body),
     )
         .into_response())
 }
@@ -895,12 +1344,17 @@ pub async fn session_subagents(
     else {
         return Err(StatusCode::BAD_REQUEST);
     };
+    // 可选实例身份：旧客户端/非 DSH 工具省略；DSH 生产源自行拒绝缺省。
+    let instance = params
+        .get("instanceId")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
     let st = st.clone();
     // 观测日志用副本（agent/sid 已 move 进阻塞闭包——T4 同款 use-after-move 规避）
     let (agent_for_log, sid_for_log) = (agent.clone(), sid.clone());
     let mut subagents = tokio::task::spawn_blocking(move || {
         match st.subagent_source.get(agent.as_str()) {
-            Some(f) => f(agent.as_str(), sid.as_str()),
+            Some(f) => f(agent.as_str(), sid.as_str(), instance.as_deref()),
             None => Vec::new(), // 未知工具/未装配：空态唯一权威
         }
     })
@@ -930,17 +1384,22 @@ pub async fn session_subagents(
         .into_response())
 }
 
-/// GET /m/api/v1/session-subagent-messages?agent_type=&session_id=&subagent_id=&limit=
+/// GET /m/api/v1/session-subagent-messages?agent_type=&session_id=&subagent_id=&limit=&before=
 /// （观察台 §三）`{messages: SessionMessage[], truncated: bool, supported: bool}`
 /// - 载荷与 /session-messages 同形（SessionMessage 逐字段同构）+ supported 标志
 ///   ——前端消息渲染器零适配；
 /// - source 未装配（opencode/kimi/codex）→ 200 `{messages:[], truncated:false,
 ///   supported:false}`（「暂不支持查看详情」是正常态不是错误，不给 404）；
-/// - claude 读取失败（会话/转写不存在）→ 404（session_messages 同映射：细节只进日志）；
+/// - 读取失败（会话/转写不存在）→ 404（session_messages 同映射：细节只进日志）；
 /// - 缺参/空白 → 400；subagent_id 含 `/`、`\`、`..`、`\0` → 400（该 id 直接拼
 ///   `subagents/agent-<id>.jsonl` 文件名——content.rs 会话守卫同款）；
-/// - limit 缺省 200（clamp [1,1000] 在注入核 `read_claude_subagent_messages_with`
-///   入口——本端点不经 session-messages 的派发核，评审 P1-2）；no-store；spawn_blocking。
+/// - limit 缺省 200（clamp [1,1000] 在注入核入口——本端点不经 session-messages
+///   的派发核，评审 P1-2）；no-store；spawn_blocking；
+/// - `before` 游标（2026-11-18 销项批：子详情续页接通）：值 = 已展示窗口最旧
+///   消息的起始索引（0/缺省/非数字 → 0，与 session-messages 同款静默缺省）；
+///   仅消费游标的读取面生效（DSH 子详情面；claude 等忽略）。`olderBefore` 键
+///   **仅真实存在续页游标时插入**（审查 Important-1 同款：手写 json! 恒含键会把
+///   None 序列化成 null——非游标面与最旧页必须键缺席）。
 pub async fn session_subagent_messages(
     State(st): State<Arc<RemoteState>>,
     Query(params): Query<HashMap<String, String>>,
@@ -967,16 +1426,34 @@ pub async fn session_subagent_messages(
         .get("limit")
         .and_then(|s| s.parse().ok())
         .unwrap_or(200);
+    // 受限续页游标（与 session-messages 同款静默缺省语义）：缺省/非数字 → 0
+    let before = params
+        .get("before")
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(0);
+    let instance = params
+        .get("instanceId")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
     let st = st.clone();
     let agent_for_log = agent.clone(); // 闭包 move 后日志仍可用
     let result = tokio::task::spawn_blocking(move || {
         match st.subagent_message_source.get(agent.as_str()) {
-            Some(f) => f(sid.as_str(), sub.as_str(), limit).map(|pg| (pg, true)), // supported=true（装配即支持）
+            Some(f) => f(
+                sid.as_str(),
+                sub.as_str(),
+                limit,
+                before,
+                instance.as_deref(),
+            )
+            .map(|pg| (pg, true)), // supported=true（装配即支持）
             None => Ok((
                 crate::remote::content::MessagesPage {
                     messages: Vec::new(),
                     truncated: false,
                     cwd: None,
+                    older_before: None,
+                    dsh_model_summary: None,
                 },
                 false,
             )),
@@ -988,15 +1465,23 @@ pub async fn session_subagent_messages(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
     match result {
-        Ok((pg, supported)) => Ok((
-            [(axum::http::header::CACHE_CONTROL, "no-store")],
-            Json(serde_json::json!({
+        Ok((pg, supported)) => {
+            // olderBefore = 受限续页游标；**仅 Some 时插入键**（与 session-messages
+            // 同一纪律：None 键缺席，消费端按键存在性判断续页支持）
+            let mut payload = serde_json::json!({
                 "messages": pg.messages,
                 "truncated": pg.truncated,
                 "supported": supported,
-            })),
-        )
-            .into_response()),
+            });
+            if let Some(cursor) = pg.older_before {
+                payload["olderBefore"] = serde_json::json!(cursor);
+            }
+            Ok((
+                [(axum::http::header::CACHE_CONTROL, "no-store")],
+                Json(payload),
+            )
+                .into_response())
+        }
         Err(e) => {
             log::warn!("session-subagent-messages 读取失败（agent={agent_for_log}）: {e}");
             Err(StatusCode::NOT_FOUND)
@@ -1028,6 +1513,7 @@ enum FileReadOutcome {
 ///   （sysinfo 全进程刷新，实机教训见 commands/session.rs），文件 IO 同为重活。
 pub async fn read_file(
     State(st): State<Arc<RemoteState>>,
+    axum::Extension(roots): axum::Extension<crate::remote::files::ProtectedFileRoots>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Response, StatusCode> {
     let Some(sid) = params
@@ -1044,18 +1530,51 @@ pub async fn read_file(
     else {
         return Err(StatusCode::BAD_REQUEST);
     };
+    // R05（复审 P2）：DSH 文件预览按实例限定——同 ID 跨实例不串 cwd。
+    let instance = params
+        .get("instanceId")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
     let st = st.clone();
     let outcome = tokio::task::spawn_blocking(move || {
         // 数据同源铁律 3：cwd 直调注入的会话源（生产 = scan_bus::current_or_scan，
         // 与看板同一份快照），不另立查找函数
         let resp = (st.session_source)();
-        let Some(session) = resp.sessions.into_iter().find(|s| s.id == sid) else {
-            return FileReadOutcome::NoSession;
+        // DSH 会话：按 (dsh, instance, sid) 三元组精确定位——缺 instanceId 且
+        // 快照唯一 → 兼容放行；多义 → 拒绝（不取首卡）。
+        // R05 复审残留：**非 DSH 工具忽略实例参数**——其他工具无实例语义，
+        // 跨工具同 ID 时不得因携带实例参数而错误命中非 DSH 卡。
+        let matches = |s: &crate::session::Session| {
+            if s.agent_type.tool_id() != "dsh" {
+                return instance.is_none() && s.id == sid;
+            }
+            match (&instance, &s.dsh_instance_id) {
+                (Some(i), Some(si)) => i == si && s.id == sid,
+                (Some(_), None) => false,
+                (None, _) => s.id == sid,
+            }
+        };
+        let mut hits: Vec<_> = resp.sessions.iter().filter(|s| matches(s)).collect();
+        let session = match hits.len() {
+            0 => return FileReadOutcome::NoSession,
+            1 => hits.pop().unwrap().clone(),
+            _ => return FileReadOutcome::NoSession, // 多义 = 归属不明，拒绝
         };
         // 敏感黑名单基准：经注入缝取真实 home（M5 P2-a 追记——直接传 None 曾使
         // 主目录内黑名单整段失效，见 read_file_safe 文档）
         let home = (st.home_source)();
-        match crate::remote::files::read_file_safe(&session.project_path, &path, home.as_deref()) {
+        let roots = match roots() {
+            Ok(roots) => roots,
+            Err(_) => {
+                return FileReadOutcome::Rejected(crate::remote::files::FileRejectReason::Sensitive)
+            }
+        };
+        match crate::remote::files::read_file_safe_with_roots(
+            &session.project_path,
+            &path,
+            home.as_deref(),
+            &roots,
+        ) {
             Ok((bytes, mime)) => FileReadOutcome::Found(bytes, mime),
             Err(e) => FileReadOutcome::Rejected(e),
         }
@@ -1065,6 +1584,10 @@ pub async fn read_file(
         log::error!("文件读取任务异常: {e}");
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
+    file_read_response(outcome)
+}
+
+fn file_read_response(outcome: FileReadOutcome) -> Result<Response, StatusCode> {
     match outcome {
         FileReadOutcome::Found(bytes, mime) if mime.starts_with("image/") => Ok((
             // 门禁下的私有文件内容，禁止中间层缓存（sessions 同规）
@@ -1113,6 +1636,167 @@ pub async fn read_file(
     }
 }
 
+/// 媒体引用只在已核验的实例、会话与当前转写中解析；客户端不提供文件路径。
+pub async fn dsh_media(
+    State(st): State<Arc<RemoteState>>,
+    axum::Extension(roots): axum::Extension<crate::remote::files::ProtectedFileRoots>,
+    headers: axum::http::HeaderMap,
+    Query(mut params): Query<HashMap<String, String>>,
+) -> Response {
+    let forbidden = || {
+        json_no_store(
+            StatusCode::FORBIDDEN,
+            serde_json::json!({"error":"forbidden"}),
+        )
+    };
+    let Some(device) = super::gate::extract_device(&headers) else {
+        return forbidden();
+    };
+    let valid = || {
+        st.store.with(|conn| {
+            super::pairing::device_valid(conn, &device, chrono::Utc::now().timestamp_millis())
+        })
+    };
+    if !valid() {
+        return forbidden();
+    }
+    let invalid = || {
+        json_no_store(
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({"error":"bad_request"}),
+        )
+    };
+    let Some(instance) = params
+        .remove("instanceId")
+        .filter(|id| !id.trim().is_empty() && id.len() <= 256)
+    else {
+        return invalid();
+    };
+    let Some(sid) = params
+        .remove("sessionId")
+        .filter(|id| !id.trim().is_empty() && id.len() <= 256)
+    else {
+        return invalid();
+    };
+    let Some(reference) = params.remove("refId") else {
+        return invalid();
+    };
+    if !reference.strip_prefix("dsh-").is_some_and(|digest| {
+        digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+    }) {
+        return invalid();
+    }
+    // 每次按已核验的转写重新定位；限制并发，超时不会释放仍在执行的阻塞名额。
+    static READ_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+    let unavailable = || {
+        json_no_store(
+            StatusCode::SERVICE_UNAVAILABLE,
+            serde_json::json!({"error":"media_unavailable"}),
+        )
+    };
+    let budget = std::time::Duration::from_secs(5);
+    let Ok(Ok(permit)) = tokio::time::timeout(budget, READ_SLOTS.acquire()).await else {
+        return unavailable();
+    };
+    let check_st = st.clone();
+    let task = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let archived = (check_st.archive_source)().iter().any(|row| {
+            row.agent_type == "dsh"
+                && row.session_id == sid
+                && row.dsh_instance_id.as_deref() == Some(instance.as_str())
+        });
+        if !archived
+            && !find_request_session(&check_st, &sid, Some(&instance))
+                .ok()
+                .flatten()
+                .is_some_and(|session| {
+                    session.agent_type == crate::session::AgentType::Dsh
+                        && session.dsh_subagent != Some(true)
+                })
+        {
+            return Err((StatusCode::FORBIDDEN, "forbidden"));
+        }
+        let root = check_st
+            .dsh_control
+            .resolve_readonly_root(&instance, &sid)
+            .map_err(|error| (readonly_root_error_status(&error), "media_unavailable"))?;
+        let Some(resolved) =
+            crate::remote::content::read_dsh_media_reference(&root, &instance, &sid, &reference)
+                .map_err(|_| (StatusCode::NOT_FOUND, "media_unavailable"))?
+        else {
+            return Err((StatusCode::NOT_FOUND, "media_unavailable"));
+        };
+        let Some(path) = resolved.media.present_path.as_deref() else {
+            // 当前宿主的原生对象读取授权未验，不能从全局对象目录推断。
+            return Err((StatusCode::NOT_FOUND, "media_unavailable"));
+        };
+        let roots = roots().map_err(|_| (StatusCode::FORBIDDEN, "sensitive"))?;
+        let cwd = resolved
+            .cwd
+            .as_deref()
+            .filter(|value| std::path::Path::new(value).is_absolute());
+        if cwd.is_none() && !std::path::Path::new(&path).is_absolute() {
+            return Err((StatusCode::NOT_FOUND, "media_unavailable"));
+        }
+        let home = (check_st.home_source)();
+        let outcome = match crate::remote::files::read_file_safe_with_roots(
+            cwd.unwrap_or(""),
+            path,
+            home.as_deref(),
+            &roots,
+        ) {
+            Ok((bytes, mime)) => FileReadOutcome::Found(bytes, mime),
+            Err(error) => return Ok(FileReadOutcome::Rejected(error)),
+        };
+        // 字节已读出但未交给客户端：重新证明该实例根及相同转写代次仍有效。
+        let current_root = check_st
+            .dsh_control
+            .resolve_readonly_root(&instance, &sid)
+            .map_err(|error| (readonly_root_error_status(&error), "media_unavailable"))?;
+        if current_root != root || !resolved.still_current() {
+            return Err((StatusCode::NOT_FOUND, "media_unavailable"));
+        }
+        Ok(outcome)
+    });
+    let Ok(outcome) = tokio::time::timeout(budget, task).await else {
+        return unavailable();
+    };
+    // 无续期复核：耗时读取期间撤销的设备不能拿到已读出的私有内容。
+    if !valid() {
+        return forbidden();
+    }
+    match outcome {
+        Ok(Ok(outcome)) => {
+            let mut response =
+                file_read_response(outcome).unwrap_or_else(IntoResponse::into_response);
+            response.headers_mut().insert(
+                axum::http::header::CACHE_CONTROL,
+                axum::http::HeaderValue::from_static("no-store"),
+            );
+            response
+        }
+        Ok(Err((status, reason))) => json_no_store(status, serde_json::json!({"error":reason})),
+        Err(_) => json_no_store(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            serde_json::json!({"error":"media_unavailable"}),
+        ),
+    }
+}
+
+/// 只读根解析错误 → HTTP 状态（发现②加固，2026-11-16 真机证据：只读解析无预算
+/// 时内核楔死 → 手机面「加载中」永不完成）：`DSH_READ_TIMEOUT`（预算内未完成）
+/// → 504 GATEWAY_TIMEOUT（前端「读取超时，点重试」语义，可重试）；其余（归属
+/// 不可证明 / 实例歧义等）→ 403 FORBIDDEN（细节只进日志，不外泄内部形态）。
+/// 纯函数可测；超时 ≠ 通过——映射只改 HTTP 语义，不动只读门硬下界。
+fn readonly_root_error_status(err: &crate::services::dsh_control::error::DshError) -> StatusCode {
+    if err.code == crate::services::dsh_control::error::codes::READ_TIMEOUT {
+        StatusCode::GATEWAY_TIMEOUT
+    } else {
+        StatusCode::FORBIDDEN
+    }
+}
+
 /// 「按 (agent, session) 读消息」聚合内核（M9R Task 5 抽取）：session-messages
 /// 端点与注入确认层（`inject::confirm::session_stamp_hit`）——**数据同源（同一
 /// content 读路径）**：同走 `RemoteState.message_source` 缝；生产 confirm_probe
@@ -1133,7 +1817,10 @@ pub(crate) fn read_session_messages_core(
 /// - 缺参（agent_type / session_id）或空串 → 400 BAD_REQUEST；
 /// - 读取失败（会话不存在 / 存储不可读 / 未知工具）→ 404 NOT_FOUND，错误细节只进
 ///   日志不外泄（不向外部暴露内部路径/存储布局）；
-/// - `before` 游标不做（Task 7 裁决）：M3 不做向上翻页，更早内容由前端以更大 limit 重拉；
+/// - `before` 游标（A06 2026-11-15 补强，取代 M3「不做游标」裁决）：仅 DSH 整读面
+///   支持——值 = 已展示窗口最旧消息的起始索引（0/缺省 = 尾窗首页）；载荷仅在
+///   真实存在续页游标时携带 `olderBefore` 键（None 键缺席，审查 Important-1）。
+///   其余工具维持「更大 limit 重拉」，更早内容仍由前端扩窗；
 /// - 文件/SQLite IO 是重活，`spawn_blocking` 包读取（sessions handler 同一先例），
 ///   不堵 tokio worker。
 pub async fn session_messages(
@@ -1158,15 +1845,67 @@ pub async fn session_messages(
         .get("limit")
         .and_then(|s| s.parse().ok())
         .unwrap_or(200);
+    // 受限续页游标（A06 2026-11-15）：before = 已展示窗口最旧消息的起始索引
+    // （从最旧数起，0 = 尾窗首页）；缺省/非数字 → 0（与 limit 同款静默缺省
+    // 语义）。仅 DSH 整读面消费（真实落点：根会话映射消息实测最多 12877 条
+    // > 1000 clamp）；其余工具忽略（olderBefore 键恒缺席）。
+    let before = params
+        .get("before")
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(0);
     // message_source 不可 clone（Box<dyn Fn>）：整体 move 进阻塞线程池调用（与
     // sessions handler 捕获 session_source 的写法一致）；agent/sid 移动副本进闭包，
     // 原值保留给失败分支的日志
     let st = st.clone();
     let agent_ref = agent.clone();
+    let instance_id = params.get("instanceId").cloned();
+    let history = params.get("history").is_some_and(|flag| flag == "1");
     let result = tokio::task::spawn_blocking(move || {
-        // M9R Task 5：改调聚合内核 read_session_messages_core（端点与确认层共用，
-        // 行为不变——内核即原 message_source 直调）
-        read_session_messages_core(&st, agent_ref.as_str(), sid.as_str(), limit)
+        if agent_ref == "dsh" {
+            // 归档已记录实例时，离线读不能绕过该记录改读同名会话。
+            let (mut archived, mut another_instance) = (false, false);
+            if let Some(id) = instance_id.as_deref() {
+                for row in (st.archive_source)() {
+                    if row.agent_type == "dsh" && row.session_id == sid {
+                        if let Some(saved) = row.dsh_instance_id {
+                            archived |= saved == id;
+                            another_instance |= saved != id;
+                        }
+                    }
+                }
+            }
+            let id = match instance_id {
+                Some(id) if archived => id,
+                _ if history => return Err(StatusCode::FORBIDDEN),
+                instance_id => {
+                    let live = find_request_session(&st, &sid, instance_id.as_deref())
+                        .map_err(|_| StatusCode::FORBIDDEN)?;
+                    // 兼容早期显式实例的只读入口，仍由登记、历史绑定及会话头三重核验。
+                    live.and_then(|session| session.dsh_instance_id)
+                        .or(instance_id.filter(|_| !another_instance))
+                        .ok_or(StatusCode::FORBIDDEN)?
+                }
+            };
+            let root = st
+                .dsh_control
+                .resolve_readonly_root(&id, &sid)
+                .map_err(|e| readonly_root_error_status(&e))?;
+            let root = root.to_str().ok_or(StatusCode::FORBIDDEN)?;
+            let home = dirs::home_dir().ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+            crate::remote::content::read_session_messages_impl(
+                &home,
+                Some(root),
+                None,
+                "dsh",
+                &sid,
+                limit,
+                before,
+            )
+            .map_err(|_| StatusCode::NOT_FOUND)
+        } else {
+            read_session_messages_core(&st, agent_ref.as_str(), sid.as_str(), limit)
+                .map_err(|_| StatusCode::NOT_FOUND)
+        }
     })
     .await
     .map_err(|e| {
@@ -1174,20 +1913,29 @@ pub async fn session_messages(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
     match result {
-        Ok(pg) => Ok((
+        Ok(pg) => {
             // 门禁下的私有会话正文，禁止中间层缓存（sessions/host 同规）
-            [(axum::http::header::CACHE_CONTROL, "no-store")],
             // Bug 1（M3 验收）：truncated = 头部截断标记，移动端据此提供
-            // 「加载更早消息」（放大 limit 重拉时后端字节窗同放大）
-            Json(serde_json::json!({
+            // 「加载更早消息」（放大 limit 重拉时后端字节窗同放大）。
+            // olderBefore = 受限续页游标；**仅 Some 时插入键**（审查 Important-1：
+            // 手写 json! 恒含键会把 None 序列化成 null，按键存在性判断续页支持
+            // 的消费端拿到错误信号——非 DSH 面与最旧页必须键缺席）。
+            let mut payload = serde_json::json!({
                 "messages": pg.messages,
                 "truncated": pg.truncated,
-            })),
-        )
-            .into_response()),
-        Err(e) => {
-            log::warn!("session-messages 读取失败（agent={agent}）: {e}");
-            Err(StatusCode::NOT_FOUND)
+            });
+            if let Some(cursor) = pg.older_before {
+                payload["olderBefore"] = serde_json::json!(cursor);
+            }
+            Ok((
+                [(axum::http::header::CACHE_CONTROL, "no-store")],
+                Json(payload),
+            )
+                .into_response())
+        }
+        Err(status) => {
+            log::warn!("session-messages 读取失败（agent={agent}）: {status}");
+            Err(status)
         }
     }
 }
@@ -1215,6 +1963,8 @@ pub const MAX_SEND_CHARS: usize = 10_000;
 pub struct SessionSendReq {
     #[serde(default)]
     pub session_id: String,
+    #[serde(default)]
+    pub instance_id: Option<String>,
     #[serde(default)]
     pub text: String,
     /// 只入队标志（D6 修改重发）：语义为——**queueOnly 仅影响入队决策**（true 时
@@ -1292,11 +2042,23 @@ pub(crate) fn device_identity(
     Some((device_id, device_name))
 }
 
+fn dsh_retry_device_scope(device: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut scope = Sha256::new();
+    scope.update(b"tuvis:dsh-retry-device:v1\0");
+    scope.update(device);
+    scope
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 /// 端点侧审计（send / queue / retract 共用）：统一走 inject::audit_write
 /// （DB 落库 + events::audit 日志并行，M4 T2e 惯例）
 #[allow(clippy::too_many_arguments)]
 fn endpoint_audit(
-    st: &Arc<RemoteState>,
+    st: &RemoteState,
     device_id: &str,
     device_name: &str,
     agent_type: &str,
@@ -1334,6 +2096,57 @@ pub(crate) fn find_session_sync(
         .sessions
         .into_iter()
         .find(|s| s.id == session_id)
+}
+
+/// DSH 写入按实例与会话同时定位；未携实例的旧请求仅在快照唯一时兼容。
+fn find_request_session(
+    st: &Arc<RemoteState>,
+    session_id: &str,
+    instance_id: Option<&str>,
+) -> Result<Option<crate::session::Session>, ()> {
+    find_request_session_with_policy(st, session_id, instance_id, false)
+}
+
+fn find_request_session_with_policy(
+    st: &Arc<RemoteState>,
+    session_id: &str,
+    instance_id: Option<&str>,
+    prefer_retired_opencode: bool,
+) -> Result<Option<crate::session::Session>, ()> {
+    let sessions: Vec<_> = (st.fresh_session_source)()
+        .sessions
+        .into_iter()
+        .filter(|s| s.id == session_id)
+        .collect();
+    if let Some(id) = instance_id {
+        let mut matches = sessions.into_iter().filter(|s| {
+            s.agent_type == crate::session::AgentType::Dsh
+                && s.dsh_instance_id.as_deref() == Some(id)
+        });
+        let first = matches.next();
+        return if matches.next().is_some() {
+            Err(())
+        } else {
+            Ok(first)
+        };
+    }
+    if sessions.len() > 1
+        && sessions
+            .iter()
+            .any(|s| s.agent_type == crate::session::AgentType::Dsh)
+    {
+        return Err(());
+    }
+    if prefer_retired_opencode && policy::legacy_retired() {
+        // 同 ID 有已退役的 OpenCode 目标时，旧发送口沿用主线的拒绝优先级。
+        if let Some(index) = sessions
+            .iter()
+            .position(|session| session.agent_type == crate::session::AgentType::OpenCode)
+        {
+            return Ok(sessions.into_iter().nth(index));
+        }
+    }
+    Ok(sessions.into_iter().next())
 }
 
 /// 附件上传拒绝码：扫描快照的项目目录与 ZCode 桥的精确绑定工作区不一致。
@@ -1578,6 +2391,218 @@ fn audit_app_form_pending(
     );
 }
 
+/// DSH 发送经 dsh_control hub（T10/P1-1c；委派点见 `session_send` ④c）。
+///
+/// 错误映射：未装配 → 501；校验类（载荷/ID 冲突）→ 400；写门未开 → 503；
+/// 其余（宿主未启动/探针失败/授权缺失等环境类）→ 503 + reasonCode（手机端可展示）。
+/// 成功（含排队/受理/终态——都是「账本已接单」的诚实状态）→ 200
+/// `{"status":"dsh","receipt":{actionId,state,nativeId,reasonCode}}`。
+#[allow(clippy::too_many_arguments)]
+async fn dsh_send_via_hub(
+    st: &Arc<RemoteState>,
+    session: &crate::session::Session,
+    device_id: &str,
+    device_name: &str,
+    text: &str,
+    action_id: &str,
+    queue_only: bool,
+    bypass_paused_queue: bool,
+    admission: crate::services::dsh_control::production::SendAdmission,
+) -> Response {
+    use crate::services::dsh_control::error::codes as dsh_codes;
+    use crate::services::dsh_control::model::{ActionState, DeviceContext, SendPayload};
+    if session.dsh_subagent == Some(true) {
+        return json_no_store(
+            StatusCode::FORBIDDEN,
+            serde_json::json!({"error": "subagent_read_only", "reasonCode": "DSH_SUBAGENT_READONLY"}),
+        );
+    }
+    let hub = Arc::clone(&st.dsh_control);
+    if !hub.is_wired() {
+        return json_no_store(
+            StatusCode::NOT_IMPLEMENTED,
+            serde_json::json!({
+                "error": "dsh_control_unwired",
+                "reasonCode": dsh_codes::UNSUPPORTED,
+            }),
+        );
+    }
+    let payload = SendPayload {
+        text: text.to_string(),
+        receipt_ids: Vec::new(),
+        queue_only,
+        bypass_paused_queue,
+    };
+    let device = DeviceContext {
+        device_id: device_id.to_string(),
+        device_name: device_name.to_string(),
+    };
+    // P1-A/B2/P1-2（第三轮复审）：自动适配开关经 **RemoteState 注入缝**读取
+    // （生产 = DSH 键 remote.dsh_auto_adapt 同一实现；测试注入独立 AtomicBool
+    // ——用例间零共享，竞态根治）。spawn_blocking：生产实现读库。
+    let source = std::sync::Arc::clone(&st.dsh_auto_adapt_source);
+    let auto_adapt = tokio::task::spawn_blocking(move || source())
+        .await
+        .unwrap_or(true);
+    match hub
+        .dispatch_session_send_with_admission(
+            device,
+            &session.id,
+            action_id,
+            payload,
+            auto_adapt,
+            session.dsh_instance_id.as_deref(),
+            admission,
+        )
+        .await
+    {
+        Ok((receipt, replayed)) => {
+            // 审计 result 按账本状态（accepted/queued/…），与回执同源。
+            let state = match receipt.state {
+                ActionState::Reserved => "reserved",
+                ActionState::Queued => "queued",
+                ActionState::Accepted => "accepted",
+                ActionState::Running => "running",
+                ActionState::Succeeded => "succeeded",
+                ActionState::Rejected => "rejected",
+                ActionState::Failed => "failed",
+                ActionState::UnknownDelivery => "unknown_delivery",
+                ActionState::Cancelled => "cancelled",
+            };
+            endpoint_audit(
+                st,
+                device_id,
+                device_name,
+                "dsh",
+                &session.id,
+                text,
+                "send",
+                &format!("dsh:{state}"),
+            );
+            // B1：replayed = 账本幂等重放（同 ID 同载荷命中既有动作）——duplicate
+            // 供 UI 区分「重放既有动作」与「本次新接单」（本条不是新发送）。
+            let mut body = serde_json::json!({
+                "status": "dsh",
+                "receipt": serde_json::to_value(&receipt)
+                    .unwrap_or(serde_json::Value::Null),
+            });
+            if replayed {
+                body["duplicate"] = serde_json::Value::Bool(true);
+            }
+            json_no_store(StatusCode::OK, body)
+        }
+        Err(e) => {
+            endpoint_audit(
+                st,
+                device_id,
+                device_name,
+                "dsh",
+                &session.id,
+                text,
+                "send",
+                &format!("refused:{}", e.code),
+            );
+            let status = match e.code {
+                dsh_codes::UNSUPPORTED => StatusCode::NOT_IMPLEMENTED,
+                dsh_codes::CAPABILITY_DENIED
+                | dsh_codes::SESSION_OWNERSHIP_UNPROVEN
+                | dsh_codes::INSTANCE_SWITCHED => StatusCode::FORBIDDEN,
+                dsh_codes::ACTION_INVALID
+                | dsh_codes::ACTION_ID_CONFLICT
+                | dsh_codes::ACTION_NOT_FOUND => StatusCode::BAD_REQUEST,
+                _ => StatusCode::SERVICE_UNAVAILABLE,
+            };
+            // P1-A：能力门拒绝时 detail = capability 细分原因（ASCII 机器码，
+            // 如 operation_auto_adapt_off——非本机路径，可安全外发）。
+            let reason = (e.code == dsh_codes::CAPABILITY_DENIED).then(|| e.detail.clone());
+            // M4（复审）：detail 可能含本机路径/PID（identity/授权域错误）——计划
+            // §2.2「路径/PID 仅本机」；远程侧只回 reasonCode（移动端按码本地化）。
+            let mut body = serde_json::json!({
+                "error": e.code,
+                "reasonCode": e.code,
+            });
+            // 当前请求的准入拒绝不能证明另一个同 ID 的请求已经终结。
+            if status != StatusCode::BAD_REQUEST {
+                body["retrySameAction"] = serde_json::Value::Bool(true);
+            }
+            if let Some(r) = reason {
+                body["reason"] = serde_json::Value::String(r);
+            }
+            json_no_store(status, body)
+        }
+    }
+}
+
+/// 首次查账和扫描失败后复核共用同一设备、载荷和动作 ID。
+async fn replay_dsh_send_at_entry(
+    st: &RemoteState,
+    req: &SessionSendReq,
+    sid: &str,
+    device_id: &str,
+    device_name: &str,
+    scan_failed: bool,
+) -> Option<Response> {
+    use crate::services::dsh_control::error::codes;
+    use crate::services::dsh_control::model::{
+        ActionReceipt, ActionState, DeviceContext, SendPayload,
+    };
+    let action_id = req.action_id.as_deref().filter(|id| !id.is_empty())?;
+    if !st.dsh_control.is_wired() {
+        return None;
+    }
+    let dsh_target = req.instance_id.is_some()
+        || crate::services::dsh_control::instances::is_native_session_id(sid);
+    if scan_failed && !dsh_target {
+        return None;
+    }
+    let result = st
+        .dsh_control
+        .replay_session_send(
+            DeviceContext {
+                device_id: device_id.to_owned(),
+                device_name: device_name.to_owned(),
+            },
+            sid,
+            action_id,
+            SendPayload {
+                text: req.text.clone(),
+                receipt_ids: Vec::new(),
+                queue_only: req.queue_only.unwrap_or(false),
+                bypass_paused_queue: req.bypass_paused_queue.unwrap_or(false),
+            },
+            req.instance_id.as_deref(),
+        )
+        .await;
+    match result {
+        Ok(Some(receipt)) => Some(json_no_store(
+            StatusCode::OK,
+            serde_json::json!({"status":"dsh", "receipt":receipt, "duplicate":true}),
+        )),
+        Err(error) if error.code == codes::ACTION_ID_CONFLICT => Some(json_no_store(
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({"error":error.code,"reasonCode":error.code}),
+        )),
+        Ok(None) if !scan_failed => None,
+        _ if dsh_target => {
+            // 未取得确定性拒绝。另一路同 ID 请求可能还没写入账本，原 ID 必须可重试。
+            let receipt = ActionReceipt {
+                action_id: action_id.to_owned(),
+                state: ActionState::UnknownDelivery,
+                native_id: None,
+                reason_code: Some("dsh_admission_unconfirmed".into()),
+            };
+            Some(json_no_store(
+                StatusCode::OK,
+                serde_json::json!({"status":"dsh", "receipt":receipt}),
+            ))
+        }
+        _ => Some(json_no_store(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            serde_json::json!({"error":"internal"}),
+        )),
+    }
+}
+
 /// POST /m/api/v1/session-send（W4 直发/入队分派）：
 /// - 缺参 / 空 text / 超 MAX_SEND_CHARS → 400 bad_request；
 /// - 设备 cookie 缺失 → 403 防御（gate 已拦，理论不可达）；
@@ -1605,48 +2630,95 @@ fn audit_app_form_pending(
 pub async fn session_send(
     State(st): State<Arc<RemoteState>>,
     headers: axum::http::HeaderMap,
-    Json(req): Json<SessionSendReq>,
+    Json(mut req): Json<SessionSendReq>,
 ) -> Response {
-    // ① 参数校验（trim 判空，原文上送——归一在入队时统一做）
-    let sid = req.session_id.trim().to_string();
-
-    if sid.is_empty() || req.text.trim().is_empty() || req.text.chars().count() > MAX_SEND_CHARS {
+    // 正文原样保留。动作 ID 与实例 ID 在首次查账前规范化，后续复核沿用同一值。
+    let sid = req.session_id.trim().to_owned();
+    req.action_id = req.action_id.map(|id| id.trim().to_owned());
+    req.instance_id = req.instance_id.map(|id| id.trim().to_owned());
+    if sid.is_empty()
+        || req.text.trim().is_empty()
+        || req.text.chars().count() > MAX_SEND_CHARS
+        || req.instance_id.as_deref() == Some("")
+    {
         return bad_request();
     }
-    // ② 设备身份（防御 403 + 花名）
     let Some((device_id, device_name)) = device_identity(&st, &headers) else {
         return forbidden_defense();
     };
-    let (_policy_permit, _policy_session) = match legacy_policy_permit(&st, &sid).await {
-        Ok(permit) => permit,
-        Err(response) => return response,
-    };
+    // 这个值不是认证凭据：它只能把客户端预检绑定到本次已认证设备。
+    if let Some(scope) = headers.get("x-tuvis-dsh-retry-scope") {
+        if scope.as_bytes() != dsh_retry_device_scope(&device_id).as_bytes() {
+            return json_no_store(
+                StatusCode::CONFLICT,
+                serde_json::json!({ "error": "dsh_retry_scope_changed" }),
+            );
+        }
+    }
+    let admission = st
+        .dsh_control
+        .capture_http_send_admission(req.instance_id.as_deref());
+    if let Some(response) =
+        replay_dsh_send_at_entry(&st, &req, &sid, &device_id, &device_name, false).await
+    {
+        return response;
+    }
     // ③ 会话查找（spawn_blocking：扫描是重活）+ 路由判定
     let probe_st = st.clone();
-    let (session, pairing_ambiguous) =
-        match policy::spawn_blocking(_policy_permit.clone(), move || {
-            let session = _policy_session;
-            // C7：配对不确定集合与快照同段取得（缝 = 运行进程表；生产为 sysinfo 全量
-            // 扫描，与 session_source 同为同步重活，不留在 async worker）
-            let ambiguous = pairing_ambiguous_set(&probe_st);
-            (session, ambiguous)
-        })
-        .await
-        {
-            Ok(v) => v,
-            Err(e) => {
-                log::error!("session-send 会话扫描任务异常: {e}");
-                return json_no_store(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    serde_json::json!({ "error": "internal" }),
-                );
-            }
-        };
-    let Some(session) = session else {
-        return json_no_store(
-            StatusCode::NOT_FOUND,
-            serde_json::json!({ "error": "no_session" }),
+    let probe_sid = sid.clone();
+    let probe_instance = req.instance_id.clone();
+    let (session, pairing_ambiguous) = match tokio::task::spawn_blocking(move || {
+        let session = find_request_session_with_policy(
+            &probe_st,
+            &probe_sid,
+            probe_instance.as_deref(),
+            true,
         );
+        // C7：配对不确定集合与快照同段取得（缝 = 运行进程表；生产为 sysinfo 全量
+        // 扫描，与 session_source 同为同步重活，不留在 async worker）
+        let ambiguous = pairing_ambiguous_set(&probe_st);
+        (session, ambiguous)
+    })
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            log::error!("session-send 会话扫描任务异常: {e}");
+            if let Some(response) =
+                replay_dsh_send_at_entry(&st, &req, &sid, &device_id, &device_name, true).await
+            {
+                return response;
+            }
+            return json_no_store(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                serde_json::json!({ "error": "internal" }),
+            );
+        }
+    };
+    let session = match session {
+        Ok(Some(session)) => session,
+        missing => {
+            if let Some(response) =
+                replay_dsh_send_at_entry(&st, &req, &sid, &device_id, &device_name, true).await
+            {
+                return response;
+            }
+            return if matches!(missing, Ok(None)) && req.instance_id.is_none() {
+                json_no_store(
+                    StatusCode::NOT_FOUND,
+                    serde_json::json!({"error":"no_session"}),
+                )
+            } else {
+                json_no_store(
+                    StatusCode::FORBIDDEN,
+                    serde_json::json!({"error":"session_ownership_unproven", "reasonCode":"DSH_SESSION_OWNERSHIP_UNPROVEN"}),
+                )
+            };
+        }
+    };
+    let _policy_permit = match policy::acquire_legacy(&st.store, session.agent_type.clone()) {
+        Ok(permit) => permit,
+        Err(_) => return legacy_disabled_response(),
     };
     // ③b **ZCode 路由边界（T7.1）**：官方控制接口是唯一写通道——旧 session-send
     //     在路由/注入/入队**之前** 409 兼容拒绝（M11 无头门已退役，绝不让 ZCode
@@ -1702,6 +2774,41 @@ pub async fn session_send(
             &action_id,
             req.queue_only.unwrap_or(false),
             req.bypass_paused_queue.unwrap_or(false),
+        )
+        .await;
+    }
+    // ④c DSH Desktop 会话 → dsh_control hub（T10 既有发送入口接线，复审 P1-1）：
+    //    **在终端路由/tool_gate 之前委派**（DSH 会话没有终端注入面——不接线时这里
+    //    恒 403 blackbox「dsh 写通道另评」）。actionId 必填（账本幂等键，不代造）；
+    //    回执 = Codex 风格 status+actionId，状态如实（queued/accepted/failed/
+    //    unknown_delivery），不冒充注入器 success。中文/换行/万字界限由 ① 的
+    //    MAX_SEND_CHARS 与载荷透传保证。
+    if session.agent_type.tool_id() == "dsh" {
+        let action_id = req
+            .action_id
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or("")
+            .to_string();
+        if action_id.is_empty() {
+            return json_no_store(
+                StatusCode::BAD_REQUEST,
+                serde_json::json!({
+                    "error": "bad_request",
+                    "reasonCode": "action_id_required",
+                }),
+            );
+        }
+        return dsh_send_via_hub(
+            &st,
+            &session,
+            &device_id,
+            &device_name,
+            &req.text,
+            &action_id,
+            req.queue_only.unwrap_or(false),
+            req.bypass_paused_queue.unwrap_or(false),
+            admission,
         )
         .await;
     }
@@ -2071,6 +3178,7 @@ pub(crate) const NATIVE_PENDING_REASON_ZH: &str =
 /// 或 {injectable:false, reasonCode, reason}。快照是同步阻塞扫描，spawn_blocking 包裹。
 pub async fn session_send_info(
     State(st): State<Arc<RemoteState>>,
+    headers: axum::http::HeaderMap,
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
     let Some(sid) = params
@@ -2080,25 +3188,149 @@ pub async fn session_send_info(
     else {
         return bad_request();
     };
-    let probe_st = st.clone();
+    // R05（复审 P2）：send-info 按实例限定定位（缺 instanceId 且快照唯一 → 兼容；
+    // 多义 → 归属不明拒绝）。
+    let instance = params
+        .get("instanceId")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let explicit_instance = instance.is_some();
     let probe_sid = sid.clone();
-    let session =
-        match tokio::task::spawn_blocking(move || find_session_sync(&probe_st, &probe_sid)).await {
-            Ok(v) => v,
-            Err(e) => {
-                log::error!("session-send-info 会话扫描任务异常: {e}");
-                return json_no_store(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    serde_json::json!({ "error": "internal" }),
+    let with_scope = |status, mut view: serde_json::Value| {
+        if let Some(device) = super::gate::extract_device(&headers) {
+            view["dshRetryScope"] = serde_json::json!(dsh_retry_device_scope(&device));
+        }
+        json_no_store(status, view)
+    };
+    let probe_st = st.clone();
+    let session = match tokio::task::spawn_blocking(move || {
+        find_request_session(&probe_st, &probe_sid, instance.as_deref())
+    })
+    .await
+    {
+        Ok(Ok(v)) => v,
+        Ok(Err(())) => {
+            return json_no_store(
+                StatusCode::FORBIDDEN,
+                serde_json::json!({ "error": "ambiguous_session" }),
+            );
+        }
+        Err(e) => {
+            log::error!("session-send-info 会话扫描任务异常: {e}");
+            return json_no_store(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                serde_json::json!({ "error": "internal" }),
+            );
+        }
+    };
+    let Some(session) = session else {
+        let view = serde_json::json!({ "error": "no_session" });
+        return if explicit_instance {
+            // Off 历史没有活会话，但当前设备仍可只读核对自己的旧动作。
+            with_scope(StatusCode::NOT_FOUND, view)
+        } else {
+            json_no_store(StatusCode::NOT_FOUND, view)
+        };
+    };
+    // DSH 会话（T10/P1-1c）：输入区可用性由 dsh_control 装配与写门决定——终端
+    // 路由矩阵不适用（DSH 会话今天在终端矩阵里恒 blackbox「写通道另评」）。
+    // **能力门申报（复审 M7）**：本分支未消费 capability::evaluate / 契约证据，
+    // 按「已装配即放行」运行；T20 能力门接线后按 build 契约逐操作收紧（届时
+    // 未知 build 的 Send 关闭而非默认放行）。绑定/宿主活性在首发时校验（探针
+    // 失败如实 503）——此处不预检（Min7：避免每次输入区渲染都全量扫描）。
+    if session.agent_type.tool_id() == "dsh" {
+        let hub = &st.dsh_control;
+        if !hub.is_wired() {
+            return with_scope(
+                StatusCode::OK,
+                serde_json::json!({
+                    "injectable": false,
+                    "reasonCode": "DSH_UNSUPPORTED",
+                }),
+            );
+        }
+        if !hub.write_gate_open() {
+            return with_scope(
+                StatusCode::OK,
+                serde_json::json!({
+                    "injectable": false,
+                    "reasonCode": "DSH_ACTION_WRITE_GATED",
+                }),
+            );
+        }
+        if let Some(instance) = session.dsh_instance_id.clone() {
+            let hub = Arc::clone(hub);
+            let gate = tokio::task::spawn_blocking(move || {
+                hub.check_switch_gate(&instance)?;
+                if crate::services::dsh_control::production::closing_snapshot(&instance).0 {
+                    return Err(crate::services::dsh_control::error::DshError::new(
+                        crate::services::dsh_control::error::codes::SWITCH_OFF,
+                        "DSH instance is closing",
+                    ));
+                }
+                Ok(())
+            })
+            .await;
+            let code = match gate {
+                Ok(Ok(())) => None,
+                Ok(Err(error)) => Some(error.code),
+                Err(_) => Some(crate::services::dsh_control::error::codes::ACTION_WRITE_GATED),
+            };
+            if let Some(code) = code {
+                return with_scope(
+                    StatusCode::OK,
+                    serde_json::json!({
+                        "injectable": false,
+                        "reasonCode": code,
+                        "attachmentUnavailableReasonCode": code,
+                    }),
                 );
             }
+        }
+        // P1-2：能力门与发送同一判定、同一开关缝。
+        let source = std::sync::Arc::clone(&st.dsh_auto_adapt_source);
+        let auto_adapt = tokio::task::spawn_blocking(move || source())
+            .await
+            .unwrap_or(true);
+        let gate = hub
+            .send_session_gate_status(auto_adapt, &session.id, session.dsh_instance_id.as_deref())
+            .await;
+        return match gate {
+            Ok(status) if status.allowed => {
+                let code = if session.dsh_subagent == Some(true) {
+                    Some(crate::services::dsh_control::error::codes::SUBAGENT_READONLY)
+                } else if !std::path::Path::new(session.project_path.trim()).is_absolute() {
+                    Some(crate::services::dsh_control::error::codes::SESSION_OWNERSHIP_UNPROVEN)
+                } else {
+                    None
+                };
+                let mut view = serde_json::json!({
+                    "injectable": true,
+                    "channels": ["dsh_desktop"],
+                    "visibility": "after_refresh",
+                });
+                if let Some(code) = code {
+                    view["attachmentUnavailableReasonCode"] = serde_json::json!(code);
+                }
+                with_scope(StatusCode::OK, view)
+            }
+            Ok(status) => with_scope(
+                StatusCode::OK,
+                serde_json::json!({
+                    "injectable": false,
+                    "reasonCode": "DSH_CAPABILITY_DENIED",
+                    "reason": status.reason_code.unwrap_or_else(|| "capability_denied".into()),
+                }),
+            ),
+            Err(e) => with_scope(
+                StatusCode::OK,
+                serde_json::json!({
+                    "injectable": false,
+                    "reasonCode": e.code,
+                }),
+            ),
         };
-    let Some(session) = session else {
-        return json_no_store(
-            StatusCode::NOT_FOUND,
-            serde_json::json!({ "error": "no_session" }),
-        );
-    };
+    }
     if !policy::legacy_interaction_allowed(&st.store, session.agent_type.clone()) {
         let owned = match native_owned(&st, &sid) {
             Ok(owned) => owned,
@@ -2672,6 +3904,7 @@ pub(crate) mod attachment_test_hook {
 /// handler 的结构化预检对 >MAX 永不可达）。
 pub async fn session_attachment(
     State(st): State<Arc<RemoteState>>,
+    roots: Option<axum::Extension<crate::remote::files::ProtectedFileRoots>>,
     headers: axum::http::HeaderMap,
     axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
     Query(params): Query<HashMap<String, String>>,
@@ -2684,8 +3917,10 @@ pub async fn session_attachment(
     };
     let mut seen = std::collections::HashSet::new();
     for (key, _) in query_url.query_pairs() {
-        if matches!(key.as_ref(), "interaction_route" | "session_id" | "name")
-            && !seen.insert(key.into_owned())
+        if matches!(
+            key.as_ref(),
+            "interaction_route" | "session_id" | "name" | "instanceId"
+        ) && !seen.insert(key.into_owned())
         {
             return bad_request();
         }
@@ -2702,6 +3937,12 @@ pub async fn session_attachment(
     else {
         return bad_request();
     };
+    // ③ 设备身份（防御 403 + 花名）
+    let Some((device_id, device_name)) = device_identity(&st, &headers) else {
+        return forbidden_defense();
+    };
+    use crate::services::dsh_control::production::UploadAdmission;
+    let admission = UploadAdmission::capture(params.get("instanceId").map(String::as_str));
     // ② 容量上限（H07 D1 收口）：限长读取——超过 MAX_ATTACHMENT_BYTES 的请求体在
     // **读取过程**中即被拒绝（内存占用有界），响应契约 JSON 错误体；恰好等于上限
     // 的边界（to_bytes 允许 ≤limit）与超限（>limit 才 Err）同旧 `body.len() > MAX`
@@ -2716,10 +3957,6 @@ pub async fn session_attachment(
                 );
             }
         };
-    // ③ 设备身份（防御 403 + 花名）
-    let Some((device_id, device_name)) = device_identity(&st, &headers) else {
-        return forbidden_defense();
-    };
     // 原生路径先恢复已选目标，不能因看板下卡或同 ID 新卡改变目录。
     let requested_route = params
         .get("interaction_route")
@@ -2731,7 +3968,8 @@ pub async fn session_attachment(
         .filter(|value| !value.is_empty());
     if !matches!(requested_route, "legacy" | "opencode_native")
         || (requested_route == "legacy" && binding.is_some())
-        || (requested_route == "opencode_native" && binding.is_none())
+        || (requested_route == "opencode_native"
+            && (binding.is_none() || params.contains_key("instanceId")))
     {
         return bad_request();
     }
@@ -2773,27 +4011,56 @@ pub async fn session_attachment(
     } else {
         let probe_st = st.clone();
         let probe_sid = sid.clone();
-        let session =
-            match tokio::task::spawn_blocking(move || find_session_sync(&probe_st, &probe_sid))
-                .await
-            {
-                Ok(Some(session)) => session,
-                Ok(None) => {
-                    return json_no_store(
-                        StatusCode::NOT_FOUND,
-                        serde_json::json!({ "error": "no_session" }),
-                    )
-                }
-                Err(error) => {
-                    log::error!("session-attachment 会话扫描任务异常: {error}");
-                    return json_no_store(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        serde_json::json!({ "error": "internal" }),
-                    );
-                }
-            };
+        let probe_instance = params.get("instanceId").cloned();
+        let session = match tokio::task::spawn_blocking(move || {
+            find_request_session(&probe_st, &probe_sid, probe_instance.as_deref())
+        })
+        .await
+        {
+            Ok(Ok(Some(s))) => s,
+            Ok(Ok(None)) if !params.contains_key("instanceId") => {
+                return json_no_store(
+                    StatusCode::NOT_FOUND,
+                    serde_json::json!({ "error": "no_session" }),
+                );
+            }
+            Ok(_) => {
+                return json_no_store(
+                    StatusCode::FORBIDDEN,
+                    serde_json::json!({"error":"session_ownership_unproven", "reasonCode":"DSH_SESSION_OWNERSHIP_UNPROVEN"}),
+                )
+            }
+            Err(e) => {
+                log::error!("session-attachment 会话扫描任务异常: {e}");
+                return json_no_store(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    serde_json::json!({ "error": "internal" }),
+                );
+            }
+        };
         (session, None)
     };
+    if session.agent_type == crate::session::AgentType::Dsh {
+        if sid.contains('/')
+            || sid.contains('\\')
+            || sid.contains("..")
+            || sid.chars().any(|c| c.is_whitespace() || c.is_control())
+        {
+            return bad_request();
+        }
+        return session_dsh_attachment(
+            st,
+            roots,
+            device_id,
+            device_name,
+            sid,
+            raw_name,
+            session,
+            body,
+            admission,
+        )
+        .await;
+    }
     let policy_permit = if requested_route == "legacy" {
         match crate::services::opencode_native::policy::acquire_legacy(
             &st.store,
@@ -2923,30 +4190,16 @@ pub async fn session_attachment(
                         return Err(error);
                     }
                 };
-            endpoint_audit(
+            record_saved_attachment(
                 &write_state,
-                &device_id,
-                &device_name,
+                (&device_id, &device_name),
                 &tool,
                 &write_sid,
                 &write_name,
-                "attachment",
-                "ok",
+                &write_cwd,
+                &path,
+                size,
             );
-            if let Some(home) = (write_state.home_source)() {
-                crate::remote::attachments::append_index_entry(
-                    std::path::Path::new(&home),
-                    &crate::remote::attachments::AttachmentIndexEntry {
-                        project: write_cwd.to_string_lossy().into_owned(),
-                        session: write_sid,
-                        tool,
-                        name: crate::remote::attachments::sanitize_file_name(&write_name),
-                        path: path.to_string_lossy().into_owned(),
-                        size: size as u64,
-                        ts: (write_state.now_source)(),
-                    },
-                );
-            }
             Ok(Some((path, exclude_warning)))
         },
     )
@@ -2969,16 +4222,353 @@ pub async fn session_attachment(
             );
         }
     };
-    let mut response = serde_json::json!({
-        "path": path.to_string_lossy(),
-        "size": size,
-    });
-    // 附件已成功落盘；本地排除规则未确认追加时如实告知（用户可自行补写
-    // `.git/info/exclude` 或排查并发修改），不把警告冒称成功。
+    attachment_response(&path, size, exclude_warning)
+}
+
+fn attachment_response(
+    path: &std::path::Path,
+    size: usize,
+    exclude_warning: Option<String>,
+) -> Response {
+    let mut response = serde_json::json!({"path": path.to_string_lossy(), "size": size});
     if let Some(warning) = exclude_warning {
         response["excludeWarning"] = serde_json::Value::String(warning);
     }
     json_no_store(StatusCode::OK, response)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_saved_attachment(
+    st: &RemoteState,
+    (device_id, device_name): (&str, &str),
+    tool: &str,
+    session: &str,
+    raw_name: &str,
+    project: &std::path::Path,
+    path: &std::path::Path,
+    size: usize,
+) {
+    use super::attachments::{append_index_entry, sanitize_file_name, AttachmentIndexEntry};
+    endpoint_audit(
+        st,
+        device_id,
+        device_name,
+        tool,
+        session,
+        raw_name,
+        "attachment",
+        "ok",
+    );
+    if let Some(home) = (st.home_source)() {
+        append_index_entry(
+            std::path::Path::new(&home),
+            &AttachmentIndexEntry {
+                project: project.to_string_lossy().into_owned(),
+                session: session.to_owned(),
+                tool: tool.to_owned(),
+                name: sanitize_file_name(raw_name),
+                path: path.to_string_lossy().into_owned(),
+                size: size as u64,
+                ts: (st.now_source)(),
+            },
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn session_dsh_attachment(
+    st: Arc<RemoteState>,
+    _roots: Option<axum::Extension<crate::remote::files::ProtectedFileRoots>>,
+    device_id: String,
+    device_name: String,
+    sid: String,
+    raw_name: String,
+    session: crate::session::Session,
+    body: axum::body::Bytes,
+    admission: crate::services::dsh_control::production::UploadAdmission,
+) -> Response {
+    use crate::services::dsh_control::production::PublishDecisionError;
+    if session.dsh_subagent == Some(true) {
+        return json_no_store(
+            StatusCode::FORBIDDEN,
+            serde_json::json!({"error": "subagent_read_only", "reasonCode": "DSH_SUBAGENT_READONLY"}),
+        );
+    }
+    {
+        let instance = session.dsh_instance_id.clone();
+        let session_id = sid.clone();
+        let hub = Arc::clone(&st.dsh_control);
+        let owned = tokio::task::spawn_blocking(move || {
+            let id = instance.as_deref().ok_or_else(|| {
+                crate::services::dsh_control::error::DshError::new(
+                    crate::services::dsh_control::error::codes::SESSION_OWNERSHIP_UNPROVEN,
+                    "missing instance",
+                )
+            })?;
+            hub.resolve_owned_session(id, &session_id)
+        })
+        .await;
+        match owned {
+            Ok(Ok(_)) => {
+                if !st.dsh_control.write_gate_open() {
+                    return json_no_store(
+                        StatusCode::FORBIDDEN,
+                        serde_json::json!({
+                            "error": "dsh_attachment_unavailable",
+                            "reasonCode": crate::services::dsh_control::error::codes::ACTION_WRITE_GATED,
+                        }),
+                    );
+                }
+                // P1-1 开关执行门（附件写盘）：开关关闭的实例不落任何附件写——
+                // 归属核验通过也不放行（拒绝事实源 = 持久化开关记录）。判定含
+                // 小文件读 → spawn_blocking（async worker 不做同步 IO）；join
+                // 失败按 500 如实上报（不冒放行）。
+                if let Some(instance_id) = session.dsh_instance_id.as_deref() {
+                    let gate_hub = Arc::clone(&st.dsh_control);
+                    let gate_instance = instance_id.to_owned();
+                    let gate = tokio::task::spawn_blocking(move || {
+                        gate_hub.check_switch_gate(&gate_instance)
+                    })
+                    .await;
+                    match gate {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => {
+                            return json_no_store(
+                                StatusCode::FORBIDDEN,
+                                serde_json::json!({
+                                    "error": "dsh_attachment_unavailable",
+                                    "reasonCode": error.code,
+                                }),
+                            );
+                        }
+                        Err(e) => {
+                            log::error!("session-attachment 开关门任务异常: {e}");
+                            return json_no_store(
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                serde_json::json!({ "error": "internal" }),
+                            );
+                        }
+                    }
+                }
+            }
+            Ok(Err(e)) => {
+                use crate::services::dsh_control::error::codes;
+                let code = match e.code {
+                    codes::INSTANCE_SWITCHED => codes::INSTANCE_SWITCHED,
+                    codes::HOST_NOT_RUNNING | codes::HOST_LISTENER_MISSING => {
+                        codes::HOST_NOT_RUNNING
+                    }
+                    _ => codes::SESSION_OWNERSHIP_UNPROVEN,
+                };
+                return json_no_store(
+                    StatusCode::FORBIDDEN,
+                    serde_json::json!({"error": "dsh_attachment_unavailable", "reasonCode": code}),
+                );
+            }
+            Err(_) => {
+                return json_no_store(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    serde_json::json!({"error": "internal"}),
+                )
+            }
+        }
+    }
+    let cwd = session.project_path.trim().to_string();
+    if cwd.is_empty() || !std::path::Path::new(&cwd).is_absolute() {
+        // 与 resume 的 no_cwd 同源口径（该会话没有项目目录信息）
+        return json_no_store(
+            StatusCode::NOT_FOUND,
+            serde_json::json!({ "error": "no_cwd" }),
+        );
+    }
+    // 三轮 C：已绑定 ZCode 会话的附件必须落在其精确绑定工作区内。
+    if let Err((status, body)) =
+        ensure_project_matches_bound_workspace(st.zcode_hub().as_ref(), &sid, &cwd)
+    {
+        return json_no_store(status, body);
+    }
+    let tool = session.agent_type.tool_id().to_string();
+    // ⑤ 查询只解析归属，不能把当前代次补给异步扫描前的旧请求。
+    let accepted = match session
+        .dsh_instance_id
+        .as_deref()
+        .map(|id| admission.bind(id))
+    {
+        Some(Ok(accepted)) => Some(accepted),
+        None => None,
+        Some(Err(error)) => {
+            let (reason, code) = match error {
+                PublishDecisionError::InstanceClosing => ("instance_closing", "DSH_SWITCH_OFF"),
+                PublishDecisionError::StaleUploadGeneration => {
+                    ("stale_upload_generation", "DSH_SWITCH_OFF")
+                }
+                PublishDecisionError::InstanceSwitched => {
+                    ("instance_switched", "DSH_INSTANCE_SWITCHED")
+                }
+            };
+            return json_no_store(
+                StatusCode::CONFLICT,
+                serde_json::json!({ "error": reason, "reasonCode": code }),
+            );
+        }
+    };
+    let write_cwd = cwd.clone();
+    let write_sid = sid.clone();
+    let write_name = raw_name.clone();
+    let write_body = body;
+    let size = write_body.len();
+    // 目标 1（暂存方案）：写任务沿用受理时核验并捕获的目标（cwd/会话/实例/
+    // 代次——本闭包内零二次解析）。发布在 attachments 落盘函数内部完成：
+    // 预检（开关执行门盘读，锁外）→ 暂存写入（临界区外）→ 发布临界区
+    // （关闭旗标 + 受理代次 + 选择镜像 + hard_link 原子不覆盖，与关闭注册表
+    // 同一次加锁）——「复核通过后、落盘前」的推进窗不存在。
+    let write_instance = session.dsh_instance_id.clone();
+    let write_hub = Arc::clone(&st.dsh_control);
+    struct CancelUpload(Arc<std::sync::atomic::AtomicBool>);
+    impl Drop for CancelUpload {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    let request = write_instance
+        .as_ref()
+        .map(|_| CancelUpload(Arc::default()));
+    let request_cancelled = request.as_ref().map(|cancel| Arc::clone(&cancel.0));
+    let write_state = Arc::clone(&st);
+    let write_device = device_id.clone();
+    let written = tokio::task::spawn_blocking(move || {
+        if !write_state.store.with(|conn| {
+            crate::remote::pairing::device_valid(
+                conn,
+                &write_device,
+                chrono::Utc::now().timestamp_millis(),
+            )
+        }) {
+            return None;
+        }
+
+        // 预检闭包 = 开关执行门复核（盘读，临界区外）：持久化开关记录不在
+        // 开启窗口 → 拒。关闭/代次/镜像复核已收进发布临界区（内存，同锁）。
+        let publish_gate = write_instance.clone().map(|instance_id| {
+            let hub = Arc::clone(&write_hub);
+            move || -> Option<crate::remote::attachments::PublishRefusal> {
+                use crate::remote::attachments::PublishRefusal;
+                match hub.check_switch_gate(&instance_id) {
+                    Ok(()) => None,
+                    Err(error) => Some(PublishRefusal::SwitchGate(error)),
+                }
+            }
+        });
+        // Option<&C> → Option<&dyn Fn> 需要显式去容器强制（外层 Option 不自动
+        // unsize）。
+        let publish_ref: Option<
+            &(dyn Fn() -> Option<crate::remote::attachments::PublishRefusal> + Send + Sync),
+        > = publish_gate.as_ref().map(|gate| {
+            let gate: &(dyn Fn() -> Option<crate::remote::attachments::PublishRefusal>
+                  + Send
+                  + Sync) = gate;
+            gate
+        });
+        Some(
+            crate::remote::attachments::write_attachment_with_cancellation(
+                std::path::Path::new(&write_cwd),
+                &write_sid,
+                &write_name,
+                &write_body,
+                publish_ref,
+                // 目标 1：发布认领 =（受理时核验的实例, 受理代次）。发布走
+                // 暂存+临界区（拒绝/失败零正式文件零暂存残留）。
+                write_instance
+                    .as_deref()
+                    .zip(accepted.map(|(generation, _)| generation)),
+                crate::remote::attachments::AttachmentWriteContext {
+                    cancelled: request_cancelled.as_deref(),
+                    selection_revision: accepted.map(|(_, revision)| revision),
+                    #[cfg(unix)]
+                    protected_roots: _roots.as_ref().map(|extension| &extension.0),
+                },
+            ),
+        )
+    })
+    .await;
+    let path = match written {
+        Ok(None) => return forbidden_defense(),
+        Ok(Some(Ok(p))) => p,
+        Ok(Some(Err(crate::remote::attachments::AttachmentWriteError::Refused(
+            crate::remote::attachments::PublishRefusal::InstanceClosing,
+        )))) => {
+            // 发布拒绝（关闭面）：正式文件从未出现（临界区拒在 hard_link 前
+            // 或预检拒在暂存写入前），暂存已清理。409 + 机器码。
+            return json_no_store(
+                axum::http::StatusCode::CONFLICT,
+                serde_json::json!({ "error": "instance_closing", "reasonCode": "DSH_SWITCH_OFF" }),
+            );
+        }
+        Ok(Some(Err(crate::remote::attachments::AttachmentWriteError::Refused(
+            crate::remote::attachments::PublishRefusal::StaleUploadGeneration,
+        )))) => {
+            // 发布拒绝（代次失配面）：受理后关闭落地/关闭+重开/切走推进过
+            // 实例代次——旧上传不按新开关状态写盘。与 InstanceClosing 同族
+            // （409 + 机器码 DSH_SWITCH_OFF），error 区分拒绝面。
+            return json_no_store(
+                axum::http::StatusCode::CONFLICT,
+                serde_json::json!({
+                    "error": "stale_upload_generation",
+                    "reasonCode": "DSH_SWITCH_OFF"
+                }),
+            );
+        }
+        Ok(Some(Err(crate::remote::attachments::AttachmentWriteError::Refused(
+            crate::remote::attachments::PublishRefusal::InstanceSwitched,
+        )))) => {
+            // 发布拒绝（选择切换面）：翻转落盘后到达的旧上传不得落进已切走
+            // 的实例。与发送 INSTANCE_SWITCHED 同码族（409）。
+            return json_no_store(
+                axum::http::StatusCode::CONFLICT,
+                serde_json::json!({
+                    "error": "instance_switched",
+                    "reasonCode": "DSH_INSTANCE_SWITCHED"
+                }),
+            );
+        }
+        Ok(Some(Err(crate::remote::attachments::AttachmentWriteError::Refused(
+            crate::remote::attachments::PublishRefusal::SwitchGate(error),
+        )))) => {
+            // 发布点拒绝（开关门面）：与入口门拒绝同一响应形态（403 + 门码）。
+            return json_no_store(
+                StatusCode::FORBIDDEN,
+                serde_json::json!({
+                    "error": "dsh_attachment_unavailable",
+                    "reasonCode": error.code,
+                }),
+            );
+        }
+        Ok(Some(Err(e))) => {
+            log::error!("session-attachment 落盘失败: {e}");
+            return json_no_store(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                serde_json::json!({ "error": "io" }),
+            );
+        }
+        Err(e) => {
+            log::error!("session-attachment 写盘任务异常: {e}");
+            return json_no_store(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                serde_json::json!({ "error": "internal" }),
+            );
+        }
+    };
+    record_saved_attachment(
+        &st,
+        (&device_id, &device_name),
+        &tool,
+        &sid,
+        &raw_name,
+        std::path::Path::new(&cwd),
+        &path,
+        size,
+    );
+    attachment_response(&path, size, None)
 }
 
 // ==== M8 Task 11：审批端点（session-approve-options / session-approve）====
@@ -4819,6 +6409,8 @@ impl PlanFeedbackTerminal for PlanFeedbackClosures<'_> {
 #[serde(rename_all = "camelCase")]
 pub struct ArchivedSessionDto {
     pub session_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instance_id: Option<String>,
     pub agent_type: String,
     pub project_path: String,
     pub project_name: String,
@@ -4847,36 +6439,41 @@ pub async fn sessions_archived(
     let resp = tokio::task::spawn_blocking(move || {
         let cutoff = chrono::Utc::now() - chrono::Duration::days(days);
         let live = (st2.session_source)();
-        let live_ids: std::collections::HashSet<String> =
-            live.sessions.iter().map(|s| s.id.clone()).collect();
-        let mut items: Vec<(chrono::DateTime<chrono::Utc>, ArchivedSessionDto)> =
-            (st2.archive_source)()
-                .into_iter()
-                .filter_map(|row| {
-                    if live_ids.contains(&row.session_id) {
-                        return None;
-                    }
-                    let seen = chrono::DateTime::parse_from_rfc3339(&row.last_seen)
-                        .ok()?
-                        .with_timezone(&chrono::Utc);
-                    if seen < cutoff {
-                        return None;
-                    }
-                    Some((
-                        seen,
-                        ArchivedSessionDto {
-                            session_id: row.session_id,
-                            agent_type: row.agent_type,
-                            project_path: row.project_path,
-                            project_name: row.project_name,
-                            title: row.title,
-                            last_status: row.last_status,
-                            last_seen_at: row.last_seen,
-                            hidden_alive: false,
-                        },
-                    ))
-                })
-                .collect();
+        let live_ids: HashSet<_> = live
+            .sessions
+            .iter()
+            .map(|s| (s.id.as_str(), s.dsh_instance_id.as_deref()))
+            .collect();
+        let mut items: Vec<(chrono::DateTime<chrono::Utc>, ArchivedSessionDto)> = (st2
+            .archive_source)(
+        )
+        .into_iter()
+        .filter_map(|row| {
+            if live_ids.contains(&(row.session_id.as_str(), row.dsh_instance_id.as_deref())) {
+                return None;
+            }
+            let seen = chrono::DateTime::parse_from_rfc3339(&row.last_seen)
+                .ok()?
+                .with_timezone(&chrono::Utc);
+            if seen < cutoff {
+                return None;
+            }
+            Some((
+                seen,
+                ArchivedSessionDto {
+                    session_id: row.session_id,
+                    instance_id: row.dsh_instance_id,
+                    agent_type: row.agent_type,
+                    project_path: row.project_path,
+                    project_name: row.project_name,
+                    title: row.title,
+                    last_status: row.last_status,
+                    last_seen_at: row.last_seen,
+                    hidden_alive: false,
+                },
+            ))
+        })
+        .collect();
         // 软归档活会话合成条目（体验批二）：看板隐藏集合 ∩ 活快照——会话还活着，
         // 历史页把它列出来（hiddenAlive 标记，详情页动作=移回看板），不列则手机上
         // 找不到任何入口找回它。畸形 last_activity_at 按当前时间兜底（排序占位）
@@ -4893,6 +6490,7 @@ pub async fn sessions_archived(
                 seen,
                 ArchivedSessionDto {
                     session_id: s.id.clone(),
+                    instance_id: s.dsh_instance_id.clone(),
                     agent_type: s.agent_type.tool_id().to_string(),
                     project_path: s.project_path.clone(),
                     project_name: s.project_name.clone(),
@@ -4954,7 +6552,13 @@ pub async fn sessions_archived_delete(
         return bad_request();
     }
     let target: Option<String> = if all { None } else { sid };
-    let deleted = (st.archive_delete)(target.as_deref());
+    let deleted = match (target.as_deref(), params.get("instanceId")) {
+        (Some(sid), Some(instance)) if !instance.is_empty() => st.store.with(|conn| {
+            crate::database::dao::archive::delete_instance_archive_conn(conn, sid, instance)
+        }),
+        (_, Some(_)) => return bad_request(),
+        _ => (st.archive_delete)(target.as_deref()),
+    };
     json_no_store(
         StatusCode::OK,
         serde_json::json!({ "ok": true, "deleted": deleted }),
@@ -5115,7 +6719,7 @@ pub async fn session_hide(
         let tool = s.agent_type.tool_id().to_string();
         // 与桌面端「叉」同源：删未读池行 + 已读 tombstone——未读是 24h 持久标记，
         // 不消费它会被看板过滤外的任何「未读即活动」逻辑反复拉回
-        (st2.unread_mark_read)(&tool, &s.id);
+        (st2.unread_mark_read)(&tool, &s.id, s.dsh_instance_id.as_deref());
         (st2.board_hidden_hide)(&s.id);
         // F5：写入完成后立即排 Action 重算，手机后续 REST/SSE 对账可读到隐藏状态。
         crate::adapter::scan_bus::request_scan(crate::adapter::scan_bus::ScanReason::Action);
@@ -8493,6 +10097,8 @@ pub async fn session_open(
                         jump_supported: false,
                         unread: false,
                         unread_turned_green_at_ms: None,
+                        dsh_instance_id: None,
+                        dsh_subagent: None,
                     }
                 }
             };
@@ -11898,6 +13504,22 @@ mod tests {
     use super::*;
     use crate::remote::content::SessionMessage;
 
+    /// 发现②预算回归锁：只读根解析错误 → HTTP 状态映射**单点**
+    /// [`readonly_root_error_status`]——DSH_READ_TIMEOUT（预算内未完成）→ 504
+    /// GATEWAY_TIMEOUT（「读取超时，点重试」）；其余（归属不可证明等）→ 403，
+    /// 不把门拒绝伪装成超时、也不把超时伪装成归属拒绝。
+    #[test]
+    fn readonly_root_error_maps_timeout_to_504_and_rest_to_403() {
+        use crate::services::dsh_control::error::{codes, DshError};
+        let timeout = DshError::new(codes::READ_TIMEOUT, "budget exceeded");
+        assert_eq!(
+            readonly_root_error_status(&timeout),
+            StatusCode::GATEWAY_TIMEOUT
+        );
+        let unproven = DshError::new(codes::SESSION_OWNERSHIP_UNPROVEN, "identity unproven");
+        assert_eq!(readonly_root_error_status(&unproven), StatusCode::FORBIDDEN);
+    }
+
     /// Task 6 回归锁：SSE 首帧快照帧必须携带 `version`（客户端据此做快照对账/纠偏）。
     /// 帧构造单点 = [`snapshot_frame_for_test`]（handler 与测试共用），本用例钉住字段在场。
     #[tokio::test]
@@ -12542,6 +14164,8 @@ mod tests {
             tool_name: None,
             tool_args: None,
             collapsed: false,
+            media: Vec::new(),
+            blocks: Vec::new(),
         }
     }
 
@@ -13837,4 +15461,201 @@ mod plan_feedback_tests {
         );
         assert_eq!(last, fresh, "命中拍行集 = screen_tail 消费面");
     }
+}
+
+/// GET /m/api/v1/dsh-console-entry?session_id=&instanceId=
+///
+/// 为**已配对设备**签发一次性控制台入口（同源 `/console/<capability>/` 路径）。
+///
+/// 放行条件（缺一不可，任一不满足都不签发）：
+/// 1. 设备已配对（gate 已保证；此处再取一次 device 以便绑定）；
+/// 2. 会话存在且**归属可证**（同名跨实例歧义 → 拒绝）；
+/// 3. 目标实例已登记、当代活体唯一、home 归属已核验（`resolve_upstream`）。
+///
+/// 返回的 `url` **只含不透明能力令牌**，不含宿主凭据；令牌不落日志、不进审计。
+/// 控制台自身在 opaque sandbox 中运行，不与主站共享浏览器权限域。
+pub async fn dsh_console_entry(
+    State(st): State<Arc<RemoteState>>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    let Some(device_id) = super::gate::extract_device(&headers) else {
+        return json_no_store(
+            StatusCode::FORBIDDEN,
+            serde_json::json!({ "error": "device_unpaired" }),
+        );
+    };
+    let Some(sid) = params
+        .get("session_id")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    else {
+        return bad_request();
+    };
+    let instance = params
+        .get("instanceId")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    // 销项复审 P1：关闭即效面——「正在关闭」的实例不发新票据（先于开关门）。
+    if let Some(instance_ref) = instance.as_deref() {
+        if crate::services::dsh_control::production::is_closing(instance_ref) {
+            return json_no_store(
+                axum::http::StatusCode::CONFLICT,
+                serde_json::json!({ "error": "instance_closing", "reasonCode": "DSH_SWITCH_OFF" }),
+            );
+        }
+    }
+
+    let mount = st
+        .dsh_console_mount
+        .clone()
+        .unwrap_or_else(|| std::sync::Arc::clone(crate::remote::console_mount::production()));
+    let sequence = mount.revocation_sequence();
+    let probe_st = st.clone();
+    let found = tokio::task::spawn_blocking(move || {
+        find_request_session(&probe_st, &sid, instance.as_deref())
+    })
+    .await;
+    let target_instance = match found {
+        Ok(Ok(Some(session))) => {
+            // A06 写入口（2026-11-15 补证批）：子 Agent 会话无控制台写面——
+            // 与发送/附件两道闸同款（`subagent_read_only`）。此前只靠扫描侧
+            // 「子 Agent 不出卡」的结构保证，端点自身无执行门；补齐对称防线，
+            // 先于开关门与票据签发。
+            if session.dsh_subagent == Some(true) {
+                return json_no_store(
+                    StatusCode::FORBIDDEN,
+                    serde_json::json!({
+                        "error": "subagent_read_only",
+                        "reasonCode": "DSH_SUBAGENT_READONLY"
+                    }),
+                );
+            }
+            session.dsh_instance_id
+        }
+        Ok(Ok(None)) => {
+            return json_no_store(
+                StatusCode::NOT_FOUND,
+                serde_json::json!({ "error": "session_not_found" }),
+            )
+        }
+        Ok(Err(())) => {
+            return json_no_store(
+                StatusCode::FORBIDDEN,
+                serde_json::json!({ "error": "ambiguous_session" }),
+            )
+        }
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    let Some(target_instance) = target_instance else {
+        return json_no_store(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            serde_json::json!({ "error": "session_has_no_instance" }),
+        );
+    };
+    // P1-1 开关执行门（控制台准入）：开关关闭的实例不签发控制台入口票据、不登记
+    // 挂载能力（拒绝事实源 = 持久化开关记录；与发送/附件/授权提交同一口径）。
+    // 判定含小文件读 → spawn_blocking（async worker 不做同步 IO）。
+    let gate_hub = Arc::clone(&st.dsh_control);
+    let gate_instance = target_instance.clone();
+    let switch_gate =
+        tokio::task::spawn_blocking(move || gate_hub.check_switch_gate(&gate_instance)).await;
+    match switch_gate {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            return json_no_store(
+                StatusCode::SERVICE_UNAVAILABLE,
+                serde_json::json!({ "error": error.code }),
+            );
+        }
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64;
+    let issued =
+        super::console_capability::issue_bootstrap(&target_instance, &device_id, now, |instance| {
+            match st.dsh_console_upstream_source.as_ref() {
+                Some(resolve) => resolve(instance),
+                None => {
+                    let registry = crate::services::dsh_control::production::production_registry()?;
+                    super::console_upstream::resolve_upstream(&registry, instance)
+                }
+            }
+        });
+    match issued {
+        Ok(record) => {
+            // M02：**入口只签发票据**，不直接给可用 URL。
+            //
+            // 票据 = 一次性、60 秒、绑设备 + 实例 + epoch + authority；它必须由
+            // 同一台已配对设备通过 `dsh-console-redeem` 兑换成页面会话。这样地址栏
+            // 里那枚即使被分享也换不出会话。
+            let ticket = record.token.clone();
+            if let Err(error) = mount.register_if_current(record, sequence) {
+                return json_no_store(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    serde_json::json!({ "error": error }),
+                );
+            }
+            json_no_store(StatusCode::OK, serde_json::json!({ "ticket": ticket }))
+        }
+        Err(e) => json_no_store(
+            StatusCode::SERVICE_UNAVAILABLE,
+            serde_json::json!({ "error": e.code }),
+        ),
+    }
+}
+
+/// M02：已配对设备的**票据兑换**入口（POST）。
+///
+/// 语义：
+/// * 只接受带上有效设备 cookie 的请求（与签发同一 gate）；
+/// * 票据必须存在、未到期、未消费，且**签发它的设备**就是本次请求的设备；
+/// * 通过后**原子消费**（同一把锁内校验 + 摘除 + 换发会话），失败不得烧掉票据；
+/// * 返回相对 URL，由浏览器按当前渠道 origin 解析（四渠道共用）。
+pub async fn dsh_console_redeem(
+    State(st): State<Arc<RemoteState>>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let Some(device_id) = super::gate::extract_device(&headers) else {
+        return json_no_store(
+            StatusCode::FORBIDDEN,
+            serde_json::json!({ "error": "device_unpaired" }),
+        );
+    };
+    let parsed: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(value) => value,
+        Err(_) => return bad_request(),
+    };
+    let Some(ticket) = parsed
+        .get("ticket")
+        .and_then(|t| t.as_str())
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+    else {
+        // 与「未知票据」同一响应：不区分「没给」与「给了但错」。
+        return forbidden_console_redeem();
+    };
+    // 生产用进程单例；测试可注入自己的 mount（否则请求打的是空单例）。
+    let mount = st
+        .dsh_console_mount
+        .clone()
+        .unwrap_or_else(|| std::sync::Arc::clone(crate::remote::console_mount::production()));
+    match mount.redeem_bootstrap_for_device(ticket, &device_id) {
+        Some(session_token) => json_no_store(
+            StatusCode::OK,
+            serde_json::json!({ "url": format!("/console/{session_token}/") }),
+        ),
+        None => forbidden_console_redeem(),
+    }
+}
+
+/// 兑换失败的统一响应（不区分「票据不存在 / 已用 / 过期 / 错设备」）。
+fn forbidden_console_redeem() -> Response {
+    json_no_store(
+        StatusCode::FORBIDDEN,
+        serde_json::json!({ "error": "console_redeem_refused" }),
+    )
 }
