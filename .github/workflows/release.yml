@@ -3,16 +3,27 @@ name: Release
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      recover_v068:
+        description: Rebuild the existing v0.6.8 tag with the macOS packaging-only fix
+        required: true
+        type: boolean
+        default: false
 
 permissions:
   contents: write
 
 concurrency:
-  group: release-${{ github.ref_name }}
+  group: release-${{ github.event_name == 'workflow_dispatch' && 'v0.6.8' || github.ref_name }}
   cancel-in-progress: true
+
+env:
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && 'v0.6.8' || github.ref_name }}
 
 jobs:
   release:
+    if: github.event_name == 'push' || (github.ref == 'refs/heads/main' && inputs.recover_v068)
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -23,6 +34,17 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ env.RELEASE_TAG }}
+
+      - name: Apply v0.6.8 macOS packaging fix
+        if: runner.os == 'macOS' && github.event_name == 'workflow_dispatch'
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = 6cd8dfe48b844d161b1386b7f31ff0f992f3e428
+          mkdir -p src-tauri/examples
+          mv src-tauri/src/bin/dsh-g1-driver.rs src-tauri/examples/dsh-g1-driver.rs
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
@@ -97,7 +119,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p release-assets
-          VERSION="${GITHUB_REF_NAME#v}"
+          VERSION="${RELEASE_TAG#v}"
           DMG=$(find src-tauri/target -name "*.dmg" -type f | head -1 || true)
           TAR=$(find src-tauri/target -name "*.app.tar.gz" -type f | head -1 || true)
           if [ -z "$DMG" ]; then
@@ -118,7 +140,7 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           New-Item -ItemType Directory -Force -Path release-assets | Out-Null
-          $VERSION = $env:GITHUB_REF_NAME.Substring(1)
+          $VERSION = $env:RELEASE_TAG.Substring(1)
           $setup = Get-ChildItem -Path 'src-tauri/target/release/bundle/nsis' -Recurse -Include *.exe -ErrorAction SilentlyContinue | Select-Object -First 1
           if ($null -eq $setup) { throw 'No NSIS setup.exe found' }
           Copy-Item $setup.FullName "release-assets/Tuvis-$VERSION-Windows-x64-setup.exe"
@@ -144,7 +166,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.ref }}
+          ref: refs/tags/${{ env.RELEASE_TAG }}
 
       - name: Download built artifacts
         uses: actions/download-artifact@v4
@@ -157,10 +179,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          VERSION="${GITHUB_REF_NAME#v}"
+          VERSION="${RELEASE_TAG#v}"
           BODY="$RUNNER_TEMP/body.md"
           {
-            echo "## Tuvis ${GITHUB_REF_NAME}"
+            echo "## Tuvis ${RELEASE_TAG}"
             echo ""
             echo "### 下载"
             echo ""
@@ -174,6 +196,9 @@ jobs:
             echo ""
             if [ -f "docs/release-notes/v${VERSION}.md" ]; then
               cat "docs/release-notes/v${VERSION}.md"
+              if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then
+                printf '\n%s\n' 'macOS 安装包从 v0.6.8 标签源码重建，打包前将 G1 诊断工具移出应用二进制目录。'
+              fi
             else
               echo "_本次更新内容见上方下载清单。_"
             fi
@@ -183,7 +208,7 @@ jobs:
       - name: Upload Release Assets
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.ref_name }}
+          tag_name: ${{ env.RELEASE_TAG }}
           body_path: ${{ env.RELEASE_BODY_PATH }}
           # 直接发正式版（用户裁决 2026-10-10：不再走草稿人工验收）。注意时序：
           # 本 job 先发布 release，assemble-latest-json 随后补传 latest.json——
@@ -206,7 +231,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.ref }}
+          ref: refs/tags/${{ env.RELEASE_TAG }}
 
       - name: Download release assets
         env:
@@ -214,13 +239,13 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dl
-          gh release download "$GITHUB_REF_NAME" --dir dl --repo "$GITHUB_REPOSITORY"
+          gh release download "$RELEASE_TAG" --dir dl --repo "$GITHUB_REPOSITORY"
           ls -la dl/
 
       - name: Generate latest.json
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ github.ref_name }}
+          TAG: ${{ env.RELEASE_TAG }}
           REPO: ${{ github.repository }}
         run: |
           node <<'NODE'
@@ -261,4 +286,4 @@ jobs:
         if: hashFiles('latest.json') != ''
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release upload "$GITHUB_REF_NAME" latest.json --clobber --repo "$GITHUB_REPOSITORY"
+        run: gh release upload "$RELEASE_TAG" latest.json --clobber --repo "$GITHUB_REPOSITORY"
