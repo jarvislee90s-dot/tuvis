@@ -29,7 +29,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use multi_agents_manager_lib::services::dsh_control::error::{codes, DshError};
 use multi_agents_manager_lib::services::dsh_control::install::{
@@ -931,7 +931,6 @@ impl Bench {
     }
 }
 
-/// 轮询到目标阶段（后台作业驱动的确定性观测面；超时即失败并带上最后状态）。
 // ============================================================
 // brief 指定四用例
 // ============================================================
@@ -3209,11 +3208,11 @@ ELECTRON_RUN_AS_NODE=1 exec "$resources/MacOS/DeepSeek Harness" --expose-interna
     assert!(cleared["cliPending"].is_null());
     assert_eq!(cleared["cliUnresolved"], false);
     // 终态回执可能先于任务析构释放活动锁；只对 JOB_BUSY 等待锁释放。
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
     let b_id = loop {
         match second.start(ManagementKind::Uninstall) {
             Ok(id) => break id,
-            Err(error) if error.code == codes::JOB_BUSY && Instant::now() < deadline => {
+            Err(error) if error.code == codes::JOB_BUSY && std::time::Instant::now() < deadline => {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
             Err(error) => panic!("B 获取锁后应刷新账本: {error}"),
