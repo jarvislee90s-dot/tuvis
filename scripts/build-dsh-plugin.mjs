@@ -8,7 +8,7 @@
  *
  * 确定性（同输入必出同字节）：
  *   1. tar 条目按路径排序；全部条目 mtime = 0（epoch）、uid/gid = 0、uname/gname 空；
- *   2. gzip 不写时间戳（zlib mtime: 0），无原始文件名；
+ *   2. gzip 使用固定版本的 fflate，mtime 为 0，无原始文件名；
  *   3. 包内 package.json 按**固定键序白名单**重建（剥掉 scripts/devDependencies），
  *      不直接序列化源文件，键序与内容与开发者本机无关；
  *   4. 归档内只有相对路径，绝无绝对开发路径；
@@ -38,7 +38,8 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { gzipSync, gunzipSync } from "node:zlib";
+import { gunzipSync } from "node:zlib";
+import { gzipSync } from "fflate";
 
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(scriptDir, "..");
@@ -213,8 +214,8 @@ export function buildReleaseArtifacts({ outDir, libDir = join(packageDir, "lib")
   }
 
   const tarBuffer = buildTarBuffer(entries);
-  // 确定性 gzip：不写 mtime、不写原文件名。
-  const tarball = gzipSync(tarBuffer, { mtime: 0 });
+  // 固定压缩实现，避免 Node 所带 zlib 随平台和版本改变归档字节。
+  const tarball = Buffer.from(gzipSync(tarBuffer, { mtime: 0 }));
   const sha256 = createHash("sha256").update(tarball).digest("hex");
   const manifest = {
     pluginVersion: source.version,
