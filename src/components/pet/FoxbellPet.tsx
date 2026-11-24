@@ -134,9 +134,16 @@ export function FoxbellPet() {
   const lookStop = useRef<(() => void) | null>(null);
   const genRef = useRef({ transient: 0, look: 0 });
 
+  const deferredTimers = useRef(new Set<number>());
   const later = useRef((fn: () => void, ms: number) => {
-    const id = window.setTimeout(fn, ms);
-    return () => window.clearTimeout(id);
+    const id = window.setTimeout(() => {
+      if (deferredTimers.current.delete(id)) fn();
+    }, ms);
+    deferredTimers.current.add(id);
+    return () => {
+      deferredTimers.current.delete(id);
+      window.clearTimeout(id);
+    };
   }).current;
 
   const cancelStep = () => {
@@ -535,7 +542,10 @@ export function FoxbellPet() {
   useEffect(() => {
     stepLoop();
     scheduleNextLook();
+    const timers = deferredTimers.current;
     return () => {
+      for (const id of timers) window.clearTimeout(id);
+      timers.clear();
       cancelStep();
       stopLook();
       invalidateLookChain();

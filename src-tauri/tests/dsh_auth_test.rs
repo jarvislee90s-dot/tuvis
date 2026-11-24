@@ -5317,12 +5317,21 @@ struct GenerationSwapClock {
 impl DshClock for GenerationSwapClock {
     fn now_ms(&self) -> i64 {
         use std::sync::atomic::Ordering;
-        if self
-            .reads_until_swap
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
-            == Ok(1)
-        {
-            self.procs.set_host_started_at(HOST_STARTED_AT + 1_000);
+        let mut remaining = self.reads_until_swap.load(Ordering::SeqCst);
+        while let Some(next) = remaining.checked_sub(1) {
+            match self.reads_until_swap.compare_exchange_weak(
+                remaining,
+                next,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(1) => {
+                    self.procs.set_host_started_at(HOST_STARTED_AT + 1_000);
+                    break;
+                }
+                Ok(_) => break,
+                Err(actual) => remaining = actual,
+            }
         }
         HOST_STARTED_AT
     }
