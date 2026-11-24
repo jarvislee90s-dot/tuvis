@@ -24,6 +24,7 @@ _Only versions translated so far are listed here; the full history lives in the
 
 ### Fixed
 
+- The Windows update dialog now scrolls its notes in short windows and keeps the title, close button, and update actions visible.
 - Codex Desktop remote stops and queue state reconcile more reliably. Priority sends, resuming an empty paused queue, and switching message sources give clearer results.
 - OpenCode attachments use the exact verified workspace. Process termination is rejected when process ownership cannot be established.
 
