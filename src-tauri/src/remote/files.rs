@@ -256,9 +256,7 @@ pub fn read_file_safe_with_roots(
         let cwd = Path::new(session_cwd).canonicalize()?;
         full = cwd.join(full);
     }
-    let canon = full
-        .canonicalize()
-        .map_err(|_| FileRejectReason::NotFound)?;
+    let canon = full.canonicalize()?;
     #[cfg(unix)]
     let verified_components = snapshot_file_components(&canon)?;
     // 目录准入：D22（2026-11-12 用户裁决，见 MASTER-PLAN §0.2）起**取消**——
