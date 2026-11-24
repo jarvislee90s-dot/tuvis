@@ -675,6 +675,16 @@ function expectReferenceGet(url: URL, method: string, refId: string) {
   ]);
 }
 
+async function revealDshImage(row: HTMLElement, name: string) {
+  const button = within(row).getByRole("button", { name });
+  const observer = await waitFor(() => {
+    const current = MockIntersectionObserver.instances.find((item) => item.elements.has(button));
+    expect(current).toBeDefined();
+    return current!;
+  });
+  act(() => observer.trigger(button));
+}
+
 describe("SessionDetail × DSH 媒体引用（T03）", () => {
   beforeEach(() => {
     vi.stubGlobal("innerWidth", 390);
@@ -684,7 +694,7 @@ describe("SessionDetail × DSH 媒体引用（T03）", () => {
   it("纯图片消息在自身气泡渲染，并可打开图片预览", async () => {
     const reads = mountDsh();
     const row = await screen.findByTestId("msg-2");
-    act(() => MockIntersectionObserver.triggerAll());
+    await revealDshImage(row, pureImage.name);
     await within(row).findByRole("img", { name: pureImage.name });
 
     fireEvent.click(within(row).getByRole("button", { name: /pure\.png/ }));
@@ -699,8 +709,9 @@ describe("SessionDetail × DSH 媒体引用（T03）", () => {
 
   it("图文气泡按 blocks 顺序显示文字、图片、文字，不重复显示兼容正文", async () => {
     mountDsh();
-    const row = within(await screen.findByTestId("msg-3"));
-    act(() => MockIntersectionObserver.triggerAll());
+    const message = await screen.findByTestId("msg-3");
+    await revealDshImage(message, mixedImage.name);
+    const row = within(message);
     const image = await row.findByRole("img", { name: mixedImage.name });
     precedes(row.getByText("图片前面的文字"), image);
     precedes(image, row.getByText("图片后面的文字"));
@@ -709,8 +720,9 @@ describe("SessionDetail × DSH 媒体引用（T03）", () => {
 
   it("图片引用读取失败时以可读说明替代图片，保留该条图文气泡的两段文字", async () => {
     mountDsh({ failMixedImage: true });
-    const row = within(await screen.findByTestId("msg-3"));
-    act(() => MockIntersectionObserver.triggerAll());
+    const message = await screen.findByTestId("msg-3");
+    await revealDshImage(message, mixedImage.name);
+    const row = within(message);
     const placeholder = await row.findByText(/无法|失败|不可用|未找到|不存在/);
     precedes(row.getByText("图片前面的文字"), placeholder);
     precedes(placeholder, row.getByText("图片后面的文字"));
