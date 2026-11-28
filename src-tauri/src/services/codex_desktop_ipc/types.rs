@@ -221,6 +221,21 @@ pub enum ActionState {
 pub enum ControlRoute {
     DesktopIpc,
     HeadlessCompat,
+    /// macOS Accessibility 直写通道：**在同一 App 内**向已是当前会话的目标提交纯文本。
+    ///
+    /// # 与 `DesktopIpc` 的区别（刻意不同）
+    ///
+    /// | 面 | `DesktopIpc` | `DesktopAx` |
+    /// | --- | --- | --- |
+    /// | 传输 | IPC 信封 | AX 元素操作 |
+    /// | 「已受理」的含义 | App 回执 | 无受理概念，只有只读观察 |
+    /// | 送达确认 | 回合/记录绑定 | 消息出现 + 编辑器被消费 |
+    /// | 归因上限 | 可到 `Verified` | 无 App 契约时到 `MaybeSubmitted` |
+    ///
+    /// **不得**把 AX 动作记成 `DesktopIpc`：那会让 IPC 专属的去重、屏障与
+    /// 完成证据逻辑误以为拿到了 App 回执。凡是按 `route == DesktopIpc` 判断的地方，
+    /// AX 动作都必须落到"不是 IPC"那一侧，并由调用方**显式**处理。
+    DesktopAx,
     None,
 }
 

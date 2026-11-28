@@ -245,6 +245,7 @@ export interface SessionMessage {
 export interface SessionMessagesPage {
   messages: SessionMessage[];
   truncated: boolean;
+  codexSavedSource?: "rollout" | "thread_history";
   /** N06：只读模型/思考强度摘要（DSH 专属可选键）。缺失 = 无证，不显示。 */
   dshModelSummary?: DshModelSummary;
 }
@@ -268,7 +269,8 @@ export async function fetchSessionMessages(
   sessionId: string,
   limit: number,
   instanceId?: string,
-  history = false
+  history = false,
+  codexSavedSource?: "thread_history"
 ): Promise<SessionMessagesPage> {
   const q = new URLSearchParams({
     agent_type: agentType,
@@ -277,6 +279,7 @@ export async function fetchSessionMessages(
   });
   if (instanceId !== undefined) q.set("instanceId", instanceId);
   if (history && agentType === "dsh") q.set("history", "1");
+  if (codexSavedSource && agentType === "codex") q.set("codex_saved_source", codexSavedSource);
   let r: Response;
   try {
     r = await fetch(`/m/api/v1/session-messages?${q}`);
@@ -290,11 +293,15 @@ export async function fetchSessionMessages(
   const j = (await r.json()) as {
     messages?: SessionMessage[];
     truncated?: boolean;
+    codexSavedSource?: unknown;
     dshModelSummary?: DshModelSummary;
   };
   return {
     messages: Array.isArray(j.messages) ? j.messages : [],
     truncated: j.truncated === true,
+    ...(j.codexSavedSource === "rollout" || j.codexSavedSource === "thread_history"
+      ? { codexSavedSource: j.codexSavedSource }
+      : {}),
     ...(j.dshModelSummary ? { dshModelSummary: j.dshModelSummary } : {}),
   };
 }
@@ -394,6 +401,18 @@ export function fetchDshMedia(
   if (!instanceId) return Promise.reject(new ApiError(403, "missing DSH instance"));
   const q = new URLSearchParams({ instanceId, sessionId, refId });
   return fetchFilePayload(`/m/api/v1/dsh/media?${q}`, onProgress, signal);
+}
+
+/** P1-UPLOAD：按 `(device_id, session_id, attachment_id)` 读取 Tuvis 自管暂存附件预览。 */
+export function fetchStagedAttachmentPreview(
+  sessionId: string,
+  attachmentId: string,
+  onProgress?: (loaded: number, total: number | null) => void,
+  signal?: AbortSignal
+): Promise<FilePayload> {
+  if (signal?.aborted) throw new DOMException("aborted", "AbortError");
+  const q = new URLSearchParams({ session_id: sessionId, attachment_id: attachmentId });
+  return fetchFilePayload(`/m/api/v1/session-attachment/preview?${q}`, onProgress, signal);
 }
 
 async function fetchFilePayload(
@@ -573,12 +592,23 @@ export interface OpenCodeRoutingView {
 }
 export interface SendInfo {
   openCodeRouting?: OpenCodeRoutingView;
+  /** **可发送通道**（2026-11-28 AX 通道接入）。
+   *
+   *  - 缺省 / `undefined`：走既有 Desktop IPC 判定；
+   *  - `"desktop_ax"`：本条会话由 **macOS AX 直写通道**服务。
+   *
+   *  客户端据此**不再**用 Desktop IPC 的投影状态（`codexState.stale` /
+   *  `availability`）判"桌面端未连接"——那是另一条通道的结论，
+   *  在 AX 通道下既不适用也不该阻断发送。 */
+  route?: "desktop_ax" | "desktop_ipc";
   injectable: boolean;
   reasonCode?: string;
   reason?: string;
   channels?: string[];
   visibility?: "realtime" | "after_refresh";
   attachmentUnavailableReasonCode?: string;
+  /** 可暂存并预览，不能作为消息附件提交。 */
+  attachmentUploadOnly?: boolean;
   /** 配对设备的重试分区，不是授权凭据。 */
   dshRetryScope?: string;
   /**
@@ -816,6 +846,36 @@ export type SendResult =
    *  unknown_delivery=投递结果未知（**绝不自动重试**）；not_sent=零投递（同 actionId
    *  重试安全）；rejected=明确拒绝。 */
   | { status: "desktop_ipc"; receipt: ActionReceipt }
+  /** **macOS AX 直写回执**（阶段一：目标已是当前会话才发送）。
+   *
+   * 四档**互不替代**，手机端必须按 `status` 分别处理：
+   *
+   * | status | 含义 | 草稿 | 能否自动重试 |
+   * | --- | --- | --- | --- |
+   * | `desktop_ax_delivered` | 原线程已确认收到（消息出现 + 编辑器被消费） | **可清** | — |
+   * | `desktop_ax_not_touched` | 明确没碰过输入框（目标不是当前会话 / 不可核验等） | **保留** | 可（用户手动再发） |
+   * | `desktop_ax_touched_not_submitted` | 桌面可能留有未发内容，明确没提交 | **保留** | **不可**（需先到 Mac 上处理） |
+   * | `desktop_ax_maybe_submitted` | 已按下但未确认，或出现重复风险 | **保留** | **绝不可**（可能已发） |
+   * | `desktop_ax_unavailable` | 通道不可用（无辅助功能权限 / 宿主身份取不到） | **保留** | 可（环境修好后） |
+   *
+   * 判据见 `reasonCode`；`needsMacConfirmation` 为真时手机必须显示"请到 Mac 上确认"。
+   */
+  | {
+      status:
+        | "desktop_ax_delivered"
+        | "desktop_ax_not_touched"
+        | "desktop_ax_touched_not_submitted"
+        | "desktop_ax_maybe_submitted"
+        | "desktop_ax_unavailable";
+      route: "desktop_ax";
+      actionId: string;
+      phase?: string;
+      reasonCode?: string;
+      draftMayBeKept?: boolean;
+      desktopMayHoldUnsent?: boolean;
+      desktopViewMayHaveChanged?: boolean;
+      needsMacConfirmation?: boolean;
+    }
   /** **DSH Desktop 原生回执**（T10）：receipt 与 Rust `dsh_control::model::ActionReceipt`
    *  逐字段对应（camelCase）。queued=忙态排队（同会话效果落地后自动推进，客户端零
    *  重试）；accepted=宿主受理（≠成功）；failed=明确失败（同 actionId 换 payload 前
@@ -849,7 +909,8 @@ export async function sessionSend(
   bypassPausedQueue?: boolean,
   instanceId?: string,
   signal?: AbortSignal,
-  dshRetryScope?: string
+  dshRetryScope?: string,
+  codexRoute?: SendInfo["route"]
 ): Promise<SendResult> {
   let r: Response;
   try {
@@ -867,6 +928,7 @@ export async function sessionSend(
         ...(actionId !== undefined ? { actionId } : {}),
         ...(bypassPausedQueue ? { bypassPausedQueue: true } : {}),
         ...(instanceId !== undefined ? { instanceId } : {}),
+        ...(codexRoute !== undefined ? { codexRoute } : {}),
       }),
     });
   } catch (e) {
@@ -911,9 +973,15 @@ export async function uploadAttachment(
   onProgress?: (loaded: number, total: number) => void,
   context?:
     | { route: "opencode_native"; bindingToken: string }
-    | { route: "legacy" }
+    | { route: "legacy" | "codex_desktop_staging" }
     | { instanceId: string; route?: never }
-): Promise<{ path: string; size: number; excludeWarning?: string } | null> {
+): Promise<{
+  path?: string;
+  attachmentId?: string;
+  fileName?: string;
+  size: number;
+  excludeWarning?: string;
+} | null> {
   if (signal?.aborted) {
     throw new ApiError(
       null,
@@ -923,75 +991,81 @@ export async function uploadAttachment(
   const q = new URLSearchParams({ session_id: sessionId, name: file.name });
   if (context?.route) q.set("interaction_route", context.route);
   if (context && "instanceId" in context) q.set("instanceId", context.instanceId);
-  return new Promise<{ path: string; size: number; excludeWarning?: string } | null>(
-    (resolve, reject) => {
-      const xhr = new XMLHttpRequest();
-      xhr.open("POST", `/m/api/v1/session-attachment?${q}`);
-      xhr.setRequestHeader("content-type", "application/octet-stream");
-      if (context?.route === "opencode_native")
-        xhr.setRequestHeader("x-opencode-expected-binding", context.bindingToken);
-      const onAbort = () => xhr.abort(); // 既有取消语义：上传中移除 chip = 中断上传
-      signal?.addEventListener("abort", onAbort, { once: true });
-      // 终态收尾：摘掉 abort 监听（removeEventListener 幂等；resolve/reject 对已
-      // 结算 promise 是 no-op，晚到的 onload/onabort 无需额外旗标）
-      const finish = () => signal?.removeEventListener("abort", onAbort);
-      // 上传进度（§C5）：先于 send() 注册——顺序错收不到事件
-      xhr.upload.onprogress = (e) => {
-        onProgress?.(e.loaded, e.total);
-      };
-      xhr.onload = () => {
-        finish();
-        if (xhr.status >= 200 && xhr.status < 300) {
-          try {
-            resolve(
-              JSON.parse(xhr.responseText) as {
-                path: string;
-                size: number;
-                excludeWarning?: string;
-              }
-            );
-          } catch {
-            reject(new ApiError(xhr.status, `session-attachment ${xhr.status}`));
-          }
-          return;
-        }
-        // 非 2xx：错误码在响应体 error 字段（no_cwd / too_large 等），对齐 fetch 版
-        let reason = `session-attachment ${xhr.status}`;
-        let data: Record<string, unknown> | null = null;
+  return new Promise<{
+    path?: string;
+    attachmentId?: string;
+    fileName?: string;
+    size: number;
+    excludeWarning?: string;
+  } | null>((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", `/m/api/v1/session-attachment?${q}`);
+    xhr.setRequestHeader("content-type", "application/octet-stream");
+    if (context?.route === "opencode_native")
+      xhr.setRequestHeader("x-opencode-expected-binding", context.bindingToken);
+    const onAbort = () => xhr.abort(); // 既有取消语义：上传中移除 chip = 中断上传
+    signal?.addEventListener("abort", onAbort, { once: true });
+    // 终态收尾：摘掉 abort 监听（removeEventListener 幂等；resolve/reject 对已
+    // 结算 promise 是 no-op，晚到的 onload/onabort 无需额外旗标）
+    const finish = () => signal?.removeEventListener("abort", onAbort);
+    // 上传进度（§C5）：先于 send() 注册——顺序错收不到事件
+    xhr.upload.onprogress = (e) => {
+      onProgress?.(e.loaded, e.total);
+    };
+    xhr.onload = () => {
+      finish();
+      if (xhr.status >= 200 && xhr.status < 300) {
         try {
-          data = JSON.parse(xhr.responseText) as Record<string, unknown>;
-          if (typeof data?.reasonCode === "string") reason = data.reasonCode;
-          else if (typeof data?.error === "string") reason = data.error;
+          resolve(
+            JSON.parse(xhr.responseText) as {
+              path?: string;
+              attachmentId?: string;
+              fileName?: string;
+              size: number;
+              excludeWarning?: string;
+            }
+          );
         } catch {
-          /* 响应体非 JSON：保留默认 reason */
+          reject(new ApiError(xhr.status, `session-attachment ${xhr.status}`));
         }
-        if (xhr.status === 403 && data?.error === "forbidden" && !data.reasonCode)
-          return resolve(null);
-        reject(new ApiError(xhr.status, reason, data));
-      };
-      xhr.onerror = () => {
-        finish();
-        reject(
-          new ApiError(
-            null,
-            // M5 Task 7（g5）：补齐 errcode 码——无码原文会绕过 formatInvokeError
-            // （英文界面下裸显中文），有码则映射 errors.mobileNetworkFail 双语模板
-            `MOBILE_NETWORK_FAIL:session-attachment: session-attachment 网络异常: ${String(xhr.statusText || "network error")}`
-          )
-        );
-      };
-      xhr.onabort = () => {
-        finish();
-        reject(
-          new ApiError(
-            null,
-            `MOBILE_NETWORK_FAIL:session-attachment: session-attachment 网络异常: AbortError（上传已取消）`
-          )
-        );
-      };
-      xhr.send(file); // File 直传——XHR 原生跟踪 Blob 的上传字节
-    }
-  );
+        return;
+      }
+      // 非 2xx：错误码在响应体 error 字段（no_cwd / too_large 等），对齐 fetch 版
+      let reason = `session-attachment ${xhr.status}`;
+      let data: Record<string, unknown> | null = null;
+      try {
+        data = JSON.parse(xhr.responseText) as Record<string, unknown>;
+        if (typeof data?.reasonCode === "string") reason = data.reasonCode;
+        else if (typeof data?.error === "string") reason = data.error;
+      } catch {
+        /* 响应体非 JSON：保留默认 reason */
+      }
+      if (xhr.status === 403 && data?.error === "forbidden" && !data.reasonCode)
+        return resolve(null);
+      reject(new ApiError(xhr.status, reason, data));
+    };
+    xhr.onerror = () => {
+      finish();
+      reject(
+        new ApiError(
+          null,
+          // M5 Task 7（g5）：补齐 errcode 码——无码原文会绕过 formatInvokeError
+          // （英文界面下裸显中文），有码则映射 errors.mobileNetworkFail 双语模板
+          `MOBILE_NETWORK_FAIL:session-attachment: session-attachment 网络异常: ${String(xhr.statusText || "network error")}`
+        )
+      );
+    };
+    xhr.onabort = () => {
+      finish();
+      reject(
+        new ApiError(
+          null,
+          `MOBILE_NETWORK_FAIL:session-attachment: session-attachment 网络异常: AbortError（上传已取消）`
+        )
+      );
+    };
+    xhr.send(file); // File 直传——XHR 原生跟踪 Blob 的上传字节
+  });
 }
 
 /** 排队条目视图（GET /session-queue 的 items 元素，camelCase 契约）：position =
@@ -1001,11 +1075,14 @@ export interface QueueItemView {
   content: string;
   enqueuedAt: number;
   position: number;
+  agentType?: string;
+  editable?: boolean;
 }
 
 /** 拉取该会话待发队列（FIFO，W4 排队指示/轮询刷新的数据源）。非 2xx → 抛 ApiError */
-export async function fetchQueue(sessionId: string): Promise<QueueItemView[]> {
+export async function fetchQueue(sessionId: string, agentType?: string): Promise<QueueItemView[]> {
   const q = new URLSearchParams({ session_id: sessionId });
+  if (agentType) q.set("agent_type", agentType);
   let r: Response;
   try {
     r = await fetch(`/m/api/v1/session-queue?${q}`);
@@ -1059,14 +1136,15 @@ export async function queueJump(sessionId: string, itemId: number): Promise<Queu
  *  → 404 not_found → 抛 ApiError（调用方按「已不在队列」收敛，不作失败提示） */
 export async function queueRetract(
   sessionId: string,
-  itemId: number
+  itemId: number,
+  agentType?: string
 ): Promise<{ ok: true } | { status: "failed"; error: string }> {
   let r: Response;
   try {
     r = await fetch("/m/api/v1/session-queue/retract", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ sessionId, itemId }),
+      body: JSON.stringify(agentType ? { sessionId, itemId, agentType } : { sessionId, itemId }),
     });
   } catch (e) {
     throw new ApiError(

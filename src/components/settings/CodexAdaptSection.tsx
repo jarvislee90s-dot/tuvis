@@ -12,6 +12,7 @@
 //   `remote.codex_auto_adapt_hint_seen`，不随 build 重复弹出；
 // - 报告入口（R5 前身）：`src/lib/reportIssue` 统一事件，payload 只含安全引用；
 //   诊断服务未部署 → 明确「诊断服务未开启」+ 复制摘要出口，不伪造成功。
+import CodexDesktopDiagnostic from "@/components/CodexDesktopDiagnostic";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { SETTINGS_FIELD } from "@/components/settings/typography";
@@ -310,7 +311,8 @@ export function CodexAdaptSection({
                       ? t("settings.remote.codexAdaptAttemptableSendYes")
                       : t("settings.remote.codexAdaptAttemptableSendNo")
                   } · ${
-                    adapt.connectionEpoch > 0
+                    adapt.desktopObservation?.endpoint === "connected" ||
+                    (!adapt.desktopObservation && adapt.connectionEpoch > 0)
                       ? t("settings.remote.codexAdaptConnected", { n: adapt.connectionEpoch })
                       : t("settings.remote.codexAdaptDisconnected")
                   }`}
@@ -332,6 +334,9 @@ export function CodexAdaptSection({
                 : t("settings.remote.codexAdaptLastFailureNone")}
             </span>
           </div>
+          {adapt?.desktopObservation && (
+            <CodexDesktopDiagnostic observation={adapt.desktopObservation} />
+          )}
           {/* 手动刷新（只读；终审裁定改名「刷新状态」——原「重新检查」暗示可触发
               重探，实际只刷新快照）：刷新当前适配状态快照——不含测试发送或审批；
               重新探测在下次连接时自动进行 */}

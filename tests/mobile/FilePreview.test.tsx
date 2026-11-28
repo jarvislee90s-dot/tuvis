@@ -465,4 +465,38 @@ describe("FilePreview 定位最近引用（Task 7）", () => {
     await screen.findByTestId("preview-code");
     expect(screen.queryByTestId("preview-locate")).toBeNull();
   });
+
+  it("P1-UPLOAD：stagedAttachmentId 走受控 /session-attachment/preview 而不调用通用 /file", async () => {
+    const fetchSpy = vi.fn(
+      async () =>
+        new Response(new Uint8Array([0x89, 0x50, 0x4e, 0x47]), {
+          status: 200,
+          headers: { "content-type": "image/png" },
+        })
+    );
+    vi.stubGlobal("fetch", fetchSpy);
+    const revokeSpy = vi.spyOn(URL, "revokeObjectURL").mockImplementation(() => undefined);
+    const createSpy = vi.spyOn(URL, "createObjectURL").mockReturnValue("blob:staged-png");
+    try {
+      render(
+        <FilePreview
+          session={makeSession()}
+          filePath="shot.png"
+          stagedAttachmentId="0123456789abcdef0123456789abcdef"
+          mode="fullscreen"
+        />
+      );
+      const img = (await screen.findByTestId("preview-image")) as HTMLImageElement;
+      expect(img.src).toBe("blob:staged-png");
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+      const url = String(fetchSpy.mock.calls[0]?.[0] ?? "");
+      expect(url).toContain(
+        "/m/api/v1/session-attachment/preview?session_id=sess-1&attachment_id=0123456789abcdef0123456789abcdef"
+      );
+      expect(url).not.toContain("/m/api/v1/file");
+    } finally {
+      createSpy.mockRestore();
+      revokeSpy.mockRestore();
+    }
+  });
 });

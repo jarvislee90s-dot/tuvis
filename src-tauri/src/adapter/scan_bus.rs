@@ -210,7 +210,15 @@ fn scan_request_at_for_test(reason: ScanReason, arrived_at: Instant) -> ScanRequ
     scan_request_with_clock(reason, || arrived_at)
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct RawFileSessionIdentity {
+    pub sessions: Vec<crate::session::Session>,
+    pub suppressed_conflict_ids: std::collections::HashSet<String>,
+}
+
 static LAST: Lazy<Mutex<Option<Arc<Snapshot>>>> = Lazy::new(|| Mutex::new(None));
+static LAST_RAW_IDENTITY: Lazy<Mutex<RawFileSessionIdentity>> =
+    Lazy::new(|| Mutex::new(RawFileSessionIdentity::default()));
 static VERSION: AtomicU64 = AtomicU64::new(0);
 /// 扫描纪元：只在**扫描启动**时自增（不是发布时），供 F5 判定「某次扫描是否晚于变更」
 static SCAN_EPOCH: AtomicU64 = AtomicU64::new(0);
@@ -453,6 +461,15 @@ fn current_snapshot_or_scan() -> Arc<Snapshot> {
 
 pub fn current_or_scan() -> SessionsResponse {
     current_snapshot_or_scan().data.clone()
+}
+
+/// 候选 `/file` 专用：返回去重、白名单过滤与 CLI/Desktop 抑制前的原始会话身份集（冷启动时触发首扫）。
+pub fn current_or_scan_raw_identity() -> RawFileSessionIdentity {
+    let _ = current_snapshot_or_scan();
+    LAST_RAW_IDENTITY
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
 }
 
 /// 读取版本化快照；DTO 的元数据与 data 从同一个 Arc 拷贝。
@@ -1034,7 +1051,12 @@ fn scan_once_authorized_until_impl(
     };
     // 提交段在**等待线程**执行（单飞内串行）；超时的 detached 旧线程只持有
     // 纯遍历产物 WalkedScan，自愈恢复后无处提交（Important-2 结构保证）。
+    let raw_identity = RawFileSessionIdentity {
+        sessions: walked.raw_sessions.clone(),
+        suppressed_conflict_ids: walked.suppressed_conflict_ids.clone(),
+    };
     let data = super::get_all_sessions_commit(walked);
+    *LAST_RAW_IDENTITY.lock().unwrap_or_else(|e| e.into_inner()) = raw_identity;
     let duration = started.elapsed();
     LAST_SCAN_DURATION_MS.store(duration.as_millis() as u64, Ordering::Relaxed);
     let snap = publish(data, started_ms, epoch);
@@ -2422,6 +2444,8 @@ mod tests {
             std::thread::sleep(Duration::from_millis(1200));
             crate::adapter::WalkedScan {
                 sessions: vec![],
+                raw_sessions: vec![],
+                suppressed_conflict_ids: std::collections::HashSet::new(),
                 running_tools: Vec::new(),
                 workbuddy_host_alive: false,
                 observations: Vec::new(),

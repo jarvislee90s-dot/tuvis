@@ -483,6 +483,50 @@ impl ActionStore {
         })
     }
 
+    /// **登记 + 立即冻结通道**（单事务；AX 通道用）。
+    ///
+    /// `queued` 语义是「零副作用可重来」。AX 通道登记即意味着"确定要发"，
+    /// 不能留下可被当作没发生的 queued 行（见 `insert_reserved_conn_signed` 文档）。
+    /// 返回 `None` 表示同 ID 已存在（调用方按 `Duplicate` 处理，绝不覆盖）。
+    pub fn register_reserved(
+        &self,
+        ctx: &ActionContext,
+        kind: ActionKind,
+        payload_hash: &str,
+        route: ControlRoute,
+    ) -> Result<Option<CodexActionView>, StoreError> {
+        let client_message_id = new_uuid();
+        let action_id = ctx.action_id.clone();
+        let device_id = ctx.device_id.clone();
+        let device_name = ctx.device_name.clone();
+        let thread_id = ctx.key.thread_id.clone();
+        let kind_s = kind_str(kind);
+        let payload_hash = payload_hash.to_string();
+        self.with(move |c| {
+            let row = dao::insert_reserved_conn_signed(
+                c,
+                &action_id,
+                &device_id,
+                &device_name,
+                &thread_id,
+                kind_s,
+                None,
+                None,
+                &payload_hash,
+                None,
+                None,
+                &client_message_id,
+                route,
+                now_ms(),
+            )
+            .map_err(db_err)?;
+            match row {
+                Some(row) => view_of(c, row).map(Some).map_err(db_err),
+                None => Ok(None),
+            }
+        })
+    }
+
     /// FIFO 队首（seq 升序），供重启后调度取得全部发送输入。
     pub fn next_queued(&self, key: &ThreadKey) -> Result<Option<QueuedAction>, StoreError> {
         self.with(|c| {
@@ -1005,6 +1049,40 @@ impl ActionStore {
         self.with(|c| dao::get_row(c, action_id).map_err(db_err))
     }
 
+    /// 与 [`Self::unknown_desktop_ipc_sends_for_thread`] 同形，但只取 **AX 通道**的动作。
+    ///
+    /// # 为什么必须分成两条
+    ///
+    /// AX 动作的 `state = 'unknown'` 含义与 IPC 不同：IPC 的 unknown 可能对应一个在飞的
+    /// 信封与回合，可以由 IPC 侧的证据收敛；AX 没有信封、没有回合，只能靠
+    /// 「消息是否出现 + 编辑器是否被消费」这两条只读观察收敛。
+    /// 把两类混在一条查询里，会让任一方的恢复逻辑拿到不属于自己的动作。
+    pub fn unknown_desktop_ax_sends_for_thread(
+        &self,
+        thread_id: &str,
+    ) -> Result<Vec<(String, String)>, StoreError> {
+        self.with(|c| {
+            let mut stmt = c
+                .prepare(
+                    "SELECT action_id, client_message_id FROM codex_actions \
+                     WHERE thread_id = ?1 AND state = 'unknown' AND kind = 'send' \
+                     AND route = 'desktop_ax' AND client_message_id != '' \
+                     ORDER BY created_at, action_id",
+                )
+                .map_err(db_err)?;
+            let rows = stmt
+                .query_map([thread_id], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                })
+                .map_err(db_err)?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row.map_err(db_err)?);
+            }
+            Ok(out)
+        })
+    }
+
     /// T1（B6-01/X0）：归账候选——本线程**已实际派发**（有正式消息身份）且仍处
     /// Unknown 的普通 desktop_ipc 发送。只给正式回显归账用；`Reserved` 的自动
     /// 提权、运行中异步答题、其他 route/kind 均不在候选集。
@@ -1030,6 +1108,40 @@ impl ActionStore {
             Ok(out)
         })
         .unwrap_or_default()
+    }
+
+    /// 本线程**仍然武装着保守屏障**的未决发送（任何通道）。
+    ///
+    /// # 为什么不是"所有 unknown 行"
+    ///
+    /// `state='unknown'` 表达"投递结果不明"，但它**不等于**当前阻塞写入门。
+    /// 产品既有的准入判据是 `compat_outstanding = 1`（见 `compat_fences_conn` 与
+    /// `force_release_barrier_conn` 的 CAS 条件）：启动恢复产生的 unknown 行
+    /// （`aborted_dispatch_unknown`）里，只有 `TURN_FENCE_ELIGIBLE` 的那部分才
+    /// 置 1；其余是**已收敛的审计事实**，既有 IPC 路径不会再因它们拦新写入。
+    ///
+    /// AX 的跨通道屏障必须与这个口径**逐字一致**：若按"所有 unknown"拦，
+    /// 会把历史残留当成活跃屏障，让会话永久不可写（实机：`hi` 线程有 3 条
+    /// 2026-10-30/31 的恢复残留，其中 2 条 `compat_outstanding=0`）。
+    pub fn armed_barriers_for_thread(&self, thread_id: &str) -> Result<Vec<String>, StoreError> {
+        self.with(|c| {
+            let mut stmt = c
+                .prepare(
+                    "SELECT action_id FROM codex_actions \
+                     WHERE thread_id = ?1 AND compat_outstanding = 1 \
+                     AND (state IN ('unknown', 'accepted') OR (route = 'desktop_ax' AND state = 'reserved')) \
+                     AND barrier_force_released_at IS NULL ORDER BY seq ASC",
+                )
+                .map_err(db_err)?;
+            let rows = stmt
+                .query_map([thread_id], |r| r.get::<_, String>(0))
+                .map_err(db_err)?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row.map_err(db_err)?);
+            }
+            Ok(out)
+        })
     }
 
     /// 读动作的持久 Turn 绑定槽位（`compat_turn_id`；核对 DTO 与 force-continue

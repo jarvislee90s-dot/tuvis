@@ -91,6 +91,12 @@ export interface CodexAdaptProbeStatus {
 }
 
 /** 适配状态 DTO（S5 设置页详情的唯一数据源；R1 诊断快照同源）。 */
+export interface CodexDesktopObservation {
+  endpoint: string;
+  accessibility: string;
+  thread: string;
+}
+
 export interface CodexAdaptStatus {
   autoAdaptEnabled: boolean;
   autoAdaptExplicit: boolean | null;
@@ -102,6 +108,7 @@ export interface CodexAdaptStatus {
   evidenced: CodexEvidencedSet;
   schemaEvidence: CodexSchemaEvidence | null;
   lastFailure: CodexFailureObservation | null;
+  desktopObservation?: CodexDesktopObservation;
   probeStatus: CodexAdaptProbeStatus;
 }
 

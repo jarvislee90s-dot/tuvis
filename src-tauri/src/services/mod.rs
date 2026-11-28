@@ -1,7 +1,16 @@
 // Services 统一入口 - 业务逻辑按功能域拆分到子目录
 
 pub mod codex_control;
+#[cfg(target_os = "macos")]
+pub mod codex_desktop_ax_bindings;
+#[cfg(target_os = "macos")]
+pub mod codex_desktop_ax_ledger;
+pub mod codex_desktop_ax_macos;
+#[cfg(target_os = "macos")]
+pub mod codex_desktop_ax_sample;
+pub mod codex_desktop_ax_sender;
 pub mod codex_desktop_ipc;
+pub mod codex_desktop_window;
 // DSH Desktop 远控控制面（T01：契约样本、领域 DTO 与错误边界）
 pub(crate) mod codex_question_skip;
 pub mod dsh_control;

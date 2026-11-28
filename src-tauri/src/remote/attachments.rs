@@ -575,7 +575,7 @@ pub fn write_attachment_with_exclude_warning(
     bytes: &[u8],
 ) -> std::io::Result<(PathBuf, Option<String>)> {
     #[cfg(unix)]
-    return write_attachment_unix(cwd, session_id, raw_name, bytes);
+    return write_attachment_unix(cwd, session_id, raw_name, bytes, true);
     #[cfg(not(unix))]
     {
         let dir = attachment_dir(cwd, session_id);
@@ -588,12 +588,36 @@ pub fn write_attachment_with_exclude_warning(
     }
 }
 
+/// 在暂存文件落盘前验证 PNG，不让压缩数据放大占用无限的内存。
+#[cfg(target_os = "macos")]
+pub(super) fn valid_staged_png(bytes: &[u8]) -> bool {
+    const DECODE_LIMIT: usize = 32 * 1024 * 1024;
+    let mut decoder = png::Decoder::new(std::io::Cursor::new(bytes));
+    decoder.set_limits(png::Limits {
+        bytes: DECODE_LIMIT,
+    });
+    let Ok(mut reader) = decoder.read_info() else {
+        return false;
+    };
+    if reader.info().animation_control.is_some() {
+        return false;
+    }
+    let Some(size) = reader
+        .output_buffer_size()
+        .filter(|size| *size <= DECODE_LIMIT)
+    else {
+        return false;
+    };
+    reader.next_frame(&mut vec![0; size]).is_ok() && reader.finish().is_ok()
+}
+
 #[cfg(unix)]
 fn write_attachment_unix(
     cwd: &Path,
     session_id: &str,
     raw_name: &str,
     bytes: &[u8],
+    create_cwd: bool,
 ) -> std::io::Result<(PathBuf, Option<String>)> {
     use std::ffi::{CStr, CString};
     use std::io::{Read, Write};
@@ -809,7 +833,9 @@ fn write_attachment_unix(
     // 与 `write_attachment`（非 unix 路径）同口径：目标项目目录可能尚未创建
     // （新建会话/合成工作区），先幂等建目录再以 O_NOFOLLOW 打开真实目录。
     // 不做这一步会把「目录不存在」当成 500 写盘失败，而不是正常创建附件目录。
-    std::fs::create_dir_all(cwd)?;
+    if create_cwd {
+        std::fs::create_dir_all(cwd)?;
+    }
     let root = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
@@ -1090,6 +1116,388 @@ pub fn prune_index_for_project(home: &Path, project: &str) {
         }
         Err(e) => log::warn!("附件索引序列化失败: {e}"),
     }
+}
+
+/// P1-UPLOAD：Tuvis 自管隔离暂存根（`<home>/.tuvis/codex-staging/`）。
+/// 不写入会话项目目录，也不触碰 `.git/info/exclude`；手机只拿不透明 `attachment_id`，
+/// 预览时按 `(device_id, session_id, attachment_id)` 核权后读取。
+#[cfg(target_os = "macos")]
+const CODEX_STAGING_DIR: &str = "codex-staging";
+#[cfg(target_os = "macos")]
+const CODEX_STAGING_META_MAX_BYTES: u64 = 16 * 1024;
+#[cfg(target_os = "macos")]
+pub const CODEX_STAGING_MAX_IMAGE_BYTES: u64 = 5 * 1024 * 1024;
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct StagedAttachmentMeta {
+    pub attachment_id: String,
+    pub device_id: String,
+    pub session_id: String,
+    pub file_name: String,
+    pub size: u64,
+    pub ts: i64,
+    #[serde(default)]
+    pub mime: Option<String>,
+    /// 落盘内容的 SHA-256（十六进制）。预览时必须与实际打开的文件重新计算值一致，
+    /// 同长度替换/错位记录都不能冒充原附件。旧记录缺该字段 → 拒绝读取（fail-closed）。
+    #[serde(default)]
+    pub sha256: Option<String>,
+}
+
+/// 暂存内容摘要（小写十六进制，64 字符）。
+#[cfg(target_os = "macos")]
+pub fn staged_digest(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// 暂存 files 目录内现存文件的 (dev, ino) 清单（有界扫描；目录不存在 → 空）。
+/// 通用 `/file` 用它做**按 inode 的别名拒绝**——同一对象换个路径/硬链接也不能
+/// 被当普通文件放行。扫描上限 [`STAGING_IDENTITY_SCAN_MAX`] 项。
+#[cfg(target_os = "macos")]
+// `Err(())` 不是错误信息缺失，而是刻意的"结论不可得"信号：调用方只能 fail-closed。
+// 换成具名错误类型不会增加信息，反而暗示可分类处理。
+#[allow(clippy::result_unit_err)]
+pub fn staging_file_identities(home: &Path) -> Result<Vec<(u64, u64)>, ()> {
+    use std::os::unix::fs::MetadataExt as _;
+    const STAGING_IDENTITY_SCAN_MAX: usize = 4096;
+    let files_dir = home.join(".tuvis").join(CODEX_STAGING_DIR).join("files");
+    let entries = match std::fs::read_dir(&files_dir) {
+        Ok(entries) => entries,
+        // 目录不存在 = 本进程从未暂存过（可证空集）
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        // 不可读/非目录 = 结论不可得 → 调用方必须拒绝（fail-closed）
+        Err(_) => return Err(()),
+    };
+    let mut out = Vec::new();
+    for entry in entries {
+        if out.len() >= STAGING_IDENTITY_SCAN_MAX {
+            // 超出扫描上限 = 清单不完整 → 不可下结论
+            return Err(());
+        }
+        let Ok(entry) = entry else { return Err(()) };
+        let Ok(meta) = entry.metadata() else {
+            return Err(());
+        };
+        if meta.is_file() {
+            out.push((meta.dev(), meta.ino()));
+        }
+    }
+    Ok(out)
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StagedPreviewError {
+    InvalidId,
+    NotFound,
+    Forbidden,
+    TooLarge,
+    Io,
+}
+
+#[cfg(target_os = "macos")]
+pub fn is_valid_staged_id(id: &str) -> bool {
+    id.len() == 32 && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+#[cfg(target_os = "macos")]
+mod unix_staging {
+    use std::ffi::CString;
+    use std::fs::File;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::path::Path;
+
+    fn cstr(s: &str) -> Result<CString, String> {
+        CString::new(s).map_err(|_| "invalid staging path component".to_owned())
+    }
+
+    pub(super) fn open_root_dir(path: &Path) -> Result<File, std::io::Error> {
+        use std::os::unix::ffi::OsStrExt;
+        let c = CString::new(path.as_os_str().as_bytes())
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid path"))?;
+        let fd = unsafe {
+            libc::open(
+                c.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
+
+    pub(super) fn ensure_dir_at(parent: &File, name: &str) -> Result<File, String> {
+        let cname = cstr(name)?;
+        let rc = unsafe { libc::mkdirat(parent.as_raw_fd(), cname.as_ptr(), 0o700) };
+        if rc < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() != std::io::ErrorKind::AlreadyExists {
+                return Err(format!("mkdirat {name} failed: {err}"));
+            }
+        }
+        let fd = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                cname.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(format!(
+                "openat dir {name} failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
+
+    pub(super) fn open_dir_at(parent: &File, name: &str) -> Result<File, std::io::Error> {
+        let cname = CString::new(name)
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid name"))?;
+        let fd = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                cname.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
+
+    pub(super) fn create_file_at(parent: &File, name: &str) -> Result<File, String> {
+        let cname = cstr(name)?;
+        let fd = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                cname.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o600 as libc::c_uint,
+            )
+        };
+        if fd < 0 {
+            return Err(format!(
+                "create file {name} failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
+
+    pub(super) fn open_file_at(parent: &File, name: &str) -> Result<File, std::io::Error> {
+        let cname = CString::new(name)
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid name"))?;
+        let fd = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                cname.as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
+
+    pub(super) fn unlink_at(parent: &File, name: &str) {
+        if let Ok(cname) = CString::new(name) {
+            unsafe {
+                libc::unlinkat(parent.as_raw_fd(), cname.as_ptr(), 0);
+            }
+        }
+    }
+}
+
+/// 将 Codex Desktop 暂存附件写入 Tuvis 自管隔离目录（零项目树、零 `.git/info/exclude` 变更）。
+#[cfg(target_os = "macos")]
+pub fn write_tuvis_staged_attachment(
+    home: &Path,
+    device_id: &str,
+    session_id: &str,
+    raw_name: &str,
+    bytes: &[u8],
+    now_ms: i64,
+) -> Result<StagedAttachmentMeta, String> {
+    if bytes.len() as u64 > CODEX_STAGING_MAX_IMAGE_BYTES {
+        return Err("staged attachment exceeds maximum PNG size".to_owned());
+    }
+    if !valid_staged_png(bytes) {
+        return Err("staged attachment is not a valid PNG".to_owned());
+    }
+    let attachment_id = format!("{:032x}", rand::random::<u128>());
+    let file_name = sanitize_file_name(raw_name);
+    let meta = StagedAttachmentMeta {
+        attachment_id: attachment_id.clone(),
+        device_id: device_id.to_owned(),
+        session_id: session_id.to_owned(),
+        file_name,
+        size: bytes.len() as u64,
+        ts: now_ms,
+        mime: Some("image/png".to_owned()),
+        sha256: Some(staged_digest(bytes)),
+    };
+    let meta_json =
+        serde_json::to_vec(&meta).map_err(|e| format!("serialize staged meta failed: {e}"))?;
+    let meta_name = format!("{attachment_id}.json");
+
+    #[cfg(unix)]
+    {
+        let home_dir = unix_staging::open_root_dir(home)
+            .map_err(|e| format!("open staging home failed: {e}"))?;
+        let tuvis_dir = unix_staging::ensure_dir_at(&home_dir, ".tuvis")?;
+        let root_dir = unix_staging::ensure_dir_at(&tuvis_dir, CODEX_STAGING_DIR)?;
+        let files_dir = unix_staging::ensure_dir_at(&root_dir, "files")?;
+        let meta_dir = unix_staging::ensure_dir_at(&root_dir, "meta")?;
+
+        let mut data_file = unix_staging::create_file_at(&files_dir, &attachment_id)?;
+        if let Err(e) = std::io::Write::write_all(&mut data_file, bytes) {
+            unix_staging::unlink_at(&files_dir, &attachment_id);
+            return Err(format!("write staged file failed: {e}"));
+        }
+        let mut meta_file = match unix_staging::create_file_at(&meta_dir, &meta_name) {
+            Ok(f) => f,
+            Err(e) => {
+                unix_staging::unlink_at(&files_dir, &attachment_id);
+                return Err(e);
+            }
+        };
+        if let Err(e) = std::io::Write::write_all(&mut meta_file, &meta_json) {
+            unix_staging::unlink_at(&meta_dir, &meta_name);
+            unix_staging::unlink_at(&files_dir, &attachment_id);
+            return Err(format!("write staged meta failed: {e}"));
+        }
+        Ok(meta)
+    }
+
+    #[cfg(not(unix))]
+    {
+        let tuvis_dir = home.join(".tuvis");
+        let root = tuvis_dir.join(CODEX_STAGING_DIR);
+        let files_dir = root.join("files");
+        let meta_dir = root.join("meta");
+        ensure_private_dir(&tuvis_dir)?;
+        ensure_private_dir(&root)?;
+        ensure_private_dir(&files_dir)?;
+        ensure_private_dir(&meta_dir)?;
+        let data_path = files_dir.join(&attachment_id);
+        let meta_path = meta_dir.join(&meta_name);
+        std::fs::write(&data_path, bytes).map_err(|e| format!("write staged file failed: {e}"))?;
+        if let Err(e) = std::fs::write(&meta_path, &meta_json) {
+            let _ = std::fs::remove_file(&data_path);
+            return Err(format!("write staged meta failed: {e}"));
+        }
+        Ok(meta)
+    }
+}
+
+/// 按 `(device_id, session_id, attachment_id)` 核权读取 Tuvis 自管暂存附件。
+#[cfg(target_os = "macos")]
+pub fn read_tuvis_staged_attachment(
+    home: &Path,
+    device_id: &str,
+    session_id: &str,
+    attachment_id: &str,
+) -> Result<(Vec<u8>, String, String), StagedPreviewError> {
+    if !is_valid_staged_id(attachment_id) {
+        return Err(StagedPreviewError::InvalidId);
+    }
+    let meta_name = format!("{attachment_id}.json");
+
+    let (meta_file, files_dir) = {
+        let map_open_err = |e: std::io::Error| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                StagedPreviewError::NotFound
+            } else {
+                StagedPreviewError::Forbidden
+            }
+        };
+        let home_dir = unix_staging::open_root_dir(home).map_err(map_open_err)?;
+        let tuvis_dir = unix_staging::open_dir_at(&home_dir, ".tuvis").map_err(map_open_err)?;
+        let root_dir =
+            unix_staging::open_dir_at(&tuvis_dir, CODEX_STAGING_DIR).map_err(map_open_err)?;
+        let files_dir = unix_staging::open_dir_at(&root_dir, "files").map_err(map_open_err)?;
+        let meta_dir = unix_staging::open_dir_at(&root_dir, "meta").map_err(map_open_err)?;
+        let meta_file = unix_staging::open_file_at(&meta_dir, &meta_name).map_err(map_open_err)?;
+        (meta_file, files_dir)
+    };
+
+    let meta_fs = meta_file.metadata().map_err(|_| StagedPreviewError::Io)?;
+    if !meta_fs.is_file() || meta_fs.len() > CODEX_STAGING_META_MAX_BYTES {
+        return Err(StagedPreviewError::Forbidden);
+    }
+    let mut meta_bytes = Vec::with_capacity(meta_fs.len() as usize);
+    std::io::Read::read_to_end(
+        &mut std::io::Read::take(meta_file, CODEX_STAGING_META_MAX_BYTES + 1),
+        &mut meta_bytes,
+    )
+    .map_err(|_| StagedPreviewError::Io)?;
+    if meta_bytes.len() as u64 > CODEX_STAGING_META_MAX_BYTES {
+        return Err(StagedPreviewError::Forbidden);
+    }
+    let meta: StagedAttachmentMeta =
+        serde_json::from_slice(&meta_bytes).map_err(|_| StagedPreviewError::Forbidden)?;
+    if meta.attachment_id != attachment_id
+        || meta.device_id != device_id
+        || meta.session_id != session_id
+        || meta.mime.as_deref().is_some_and(|m| m != "image/png")
+    {
+        return Err(StagedPreviewError::Forbidden);
+    }
+    if meta.size > CODEX_STAGING_MAX_IMAGE_BYTES {
+        return Err(StagedPreviewError::TooLarge);
+    }
+
+    let data_file = unix_staging::open_file_at(&files_dir, attachment_id).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            StagedPreviewError::NotFound
+        } else {
+            StagedPreviewError::Forbidden
+        }
+    })?;
+
+    let data_fs = data_file.metadata().map_err(|_| StagedPreviewError::Io)?;
+    if !data_fs.is_file() {
+        return Err(StagedPreviewError::Forbidden);
+    }
+    if data_fs.len() > CODEX_STAGING_MAX_IMAGE_BYTES {
+        return Err(StagedPreviewError::TooLarge);
+    }
+    if data_fs.len() != meta.size {
+        return Err(StagedPreviewError::Forbidden);
+    }
+    let mut bytes = Vec::with_capacity(data_fs.len() as usize);
+    std::io::Read::read_to_end(
+        &mut std::io::Read::take(data_file, CODEX_STAGING_MAX_IMAGE_BYTES + 1),
+        &mut bytes,
+    )
+    .map_err(|_| StagedPreviewError::Io)?;
+    if bytes.len() as u64 > CODEX_STAGING_MAX_IMAGE_BYTES {
+        return Err(StagedPreviewError::TooLarge);
+    }
+    if bytes.len() as u64 != meta.size || !valid_staged_png(&bytes) {
+        return Err(StagedPreviewError::Forbidden);
+    }
+    // 记录↔实际打开文件的绑定：摘要必须与落盘时一致（同长度替换/错位记录拒绝）。
+    // 旧记录缺摘要 → 同样拒绝（fail-closed，不放行无法绑定的对象）。
+    let Some(recorded) = meta.sha256.as_deref().filter(|v| v.len() == 64) else {
+        return Err(StagedPreviewError::Forbidden);
+    };
+    if staged_digest(&bytes) != recorded {
+        return Err(StagedPreviewError::Forbidden);
+    }
+    Ok((bytes, "image/png".to_owned(), meta.file_name))
 }
 
 /// 项目附件占用统计（IO：递归走 <project>/.tuvis-attachments）；目录不存在 → (0, 0)

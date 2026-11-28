@@ -747,9 +747,17 @@ pub struct RemoteState {
 /// API 子路由：业务端点 + /pair/pin + 内层 fallback（未知 API 路径直接 403）+ gate 内层 layer。
 /// 注意：gate 在 `with_state` 之前 `layer`，故它包裹的是**本子路由已注册的全部端点与 fallback**；
 /// 之后 Task 7 从外部追加的静态路由不在本子路由内，天然不过闸（结构隔离，非顺序巧合）。
+pub type CandidatePolicySource =
+    Arc<dyn Fn() -> super::candidate_read_scope::CandidatePolicy + Send + Sync>;
+
+pub type RawFileSessionSource =
+    Arc<dyn Fn() -> Option<crate::adapter::scan_bus::RawFileSessionIdentity> + Send + Sync>;
+
 fn api_router(
     state: Arc<RemoteState>,
     roots: super::files::ProtectedFileRoots,
+    policy_source: CandidatePolicySource,
+    raw_sessions_source: RawFileSessionSource,
 ) -> Router<Arc<RemoteState>> {
     Router::new()
         .route("/sessions", get(api::sessions))
@@ -1014,6 +1022,19 @@ fn api_router(
             "/session-attachment",
             post(api::session_attachment).layer(axum::Extension(roots)),
         )
+        .merge({
+            #[cfg(target_os = "macos")]
+            {
+                Router::new().route(
+                    "/session-attachment/preview",
+                    get(api::session_attachment_preview),
+                )
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                Router::new()
+            }
+        })
         // M6R–M9R Task 11：一键 resume 端点（R5，PIN 门禁内层 gate 结构性覆盖，
         // 新端点不需要各自鉴权代码；spawn 缝注入使测试零真开窗）
         .route("/session-open", post(api::session_open))
@@ -1045,6 +1066,8 @@ fn api_router(
         // `/m/api/v1/nope` 会落到外层 fallback（Task 7 的静态兜底 → 200 静态内容），
         // 绕开"所有 /m/api/* 过 gate（403）"这条安全不变量（评审实测确认）
         .fallback(|| async { axum::http::StatusCode::FORBIDDEN })
+        .layer(axum::Extension(policy_source))
+        .layer(axum::Extension(raw_sessions_source))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             super::gate::gate,
@@ -1062,8 +1085,25 @@ pub fn router_with_file_roots(
     state: Arc<RemoteState>,
     roots: super::files::ProtectedFileRoots,
 ) -> Router {
+    router_with_candidate_scope(
+        state,
+        roots,
+        Arc::new(|| super::candidate_read_scope::policy().clone()),
+        Arc::new(|| None),
+    )
+}
+
+pub fn router_with_candidate_scope(
+    state: Arc<RemoteState>,
+    roots: super::files::ProtectedFileRoots,
+    policy_source: CandidatePolicySource,
+    raw_sessions_source: RawFileSessionSource,
+) -> Router {
     Router::new()
-        .nest("/m/api/v1", api_router(state.clone(), roots))
+        .nest(
+            "/m/api/v1",
+            api_router(state.clone(), roots, policy_source, raw_sessions_source),
+        )
         // 裸前缀带尾斜杠 `/m/api/v1/` 实测**不**匹配 nest 的 catch-all（matchit 的 `{*rest}`
         // 要求至少一个非空段，也不做尾斜杠归一化），会落到外层静态 fallback → 200。
         // 与"所有 /m/api/* 过 gate（403）"冲突，故显式 403 收口（any：方法无关一律 403）。
@@ -1154,13 +1194,164 @@ pub fn router_with_static(state: Arc<RemoteState>) -> Router {
         .dsh_console_mount
         .clone()
         .unwrap_or_else(|| Arc::clone(super::console_mount::production()));
-    router_with_file_roots(state, Arc::new(production_file_roots))
+    router_with_candidate_scope(
+        state,
+        Arc::new(production_file_roots),
+        Arc::new(|| super::candidate_read_scope::policy().clone()),
+        Arc::new(|| Some(crate::adapter::scan_bus::current_or_scan_raw_identity())),
+    )
+    .route("/m", get(mobile_index))
+    // H09：控制台同源挂载。**独立子树**，不经过 `/m/api/v1` 的 gate，也不认
+    // `mam_device` cookie——授权只由 `/console/<capability>/` 的路径令牌承担，
+    // 且所有响应强制 opaque sandbox CSP（见 `console_mount` 模块文档）。
+    .merge(super::console_mount::router(mount))
+    .fallback(static_fallback)
+}
+
+/// 合成 Mac 交测进程只挂可审计的入口：不启动生产 watcher、派发器和旧 IPC，
+/// 不将生产全盘预览或 SSE 挂到这个进程。发布构建不含此装配。
+#[cfg(all(target_os = "macos", debug_assertions))]
+#[doc(hidden)]
+pub fn mac_p1_fixture_router(
+    state: Arc<RemoteState>,
+    advance: Arc<dyn Fn() -> std::io::Result<()> + Send + Sync>,
+) -> Router {
+    use axum::routing::{get, post};
+    let api = Router::new()
+        .route("/pair/pin", post(api::pair_pin))
+        .route("/sessions", get(api::sessions))
+        .route("/host", get(api::host))
+        .route("/ui-config", get(api::ui_config))
+        .route("/channel", get(api::channel_info))
+        .route("/session-messages", get(api::session_messages))
+        .route("/session-send-info", get(api::session_send_info))
+        .route(
+            "/codex/adapt-status",
+            get(super::codex_adapt::codex_adapt_status),
+        )
+        .route("/session-attachment", post(mac_p1_fixture_upload))
+        .route(
+            "/session-attachment/preview",
+            get(api::session_attachment_preview),
+        )
+        .route("/file", get(mac_p1_fixture_file))
+        .route(
+            "/fixture/advance",
+            post(move || async move {
+                match tokio::task::spawn_blocking(move || advance()).await {
+                    Ok(Ok(())) => axum::http::StatusCode::NO_CONTENT,
+                    _ => axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                }
+            }),
+        )
+        .fallback(|| async { axum::http::StatusCode::FORBIDDEN })
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            super::gate::gate,
+        ));
+    Router::new()
+        .nest("/m/api/v1", api)
         .route("/m", get(mobile_index))
-        // H09：控制台同源挂载。**独立子树**，不经过 `/m/api/v1` 的 gate，也不认
-        // `mam_device` cookie——授权只由 `/console/<capability>/` 的路径令牌承担，
-        // 且所有响应强制 opaque sandbox CSP（见 `console_mount` 模块文档）。
-        .merge(super::console_mount::router(mount))
         .fallback(static_fallback)
+        .route("/m/p1-fixture", get(|| async {
+            axum::response::Html(r#"<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>Mac P1 合成夹具</title><h1>Mac P1 合成夹具</h1><p>先在此浏览器打开 <a href="/m/">Tuvis 配对页</a> 完成配对。</p><button id="advance">给合成 A 增加一条落盘回复</button><p id="status" role="status"></p><script>document.getElementById('advance').onclick=async()=>{const r=await fetch('/m/api/v1/fixture/advance',{method:'POST'});document.getElementById('status').textContent=r.ok?'合成 A 已更新。在手机刷新 A。':'更新失败，请先完成配对。'}</script></html>"#)
+        }))
+        .layer(axum::middleware::from_fn(mac_p1_fixture_cookie))
+        .with_state(state)
+}
+
+/// 浏览器 cookie 不按端口隔离。用独立名字与生产门禁/配对处理器适配，不读写日用凭据。
+#[cfg(all(target_os = "macos", debug_assertions))]
+async fn mac_p1_fixture_cookie(
+    mut req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    use axum::http::{header, HeaderValue};
+    const FIXTURE: &str = "tuvis_mac_p1_device";
+    let value = req
+        .headers()
+        .get_all(header::COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(';'))
+        .filter_map(|cookie| cookie.trim().split_once('='))
+        .find_map(|(name, value)| (name == FIXTURE).then_some(value))
+        .and_then(|value| {
+            HeaderValue::from_str(&format!("{}={value}", super::gate::COOKIE_NAME)).ok()
+        });
+    req.headers_mut().remove(header::COOKIE);
+    if let Some(value) = value {
+        req.headers_mut().insert(header::COOKIE, value);
+    }
+    let mut response = next.run(req).await;
+    let headers = response.headers_mut();
+    let renamed = headers
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .filter_map(|value| {
+            let (name, rest) = value.to_str().ok()?.split_once('=')?;
+            if name != super::gate::COOKIE_NAME {
+                return None;
+            }
+            HeaderValue::from_str(&format!("{FIXTURE}={rest}")).ok()
+        })
+        .collect::<Vec<_>>();
+    headers.remove(header::SET_COOKIE);
+    for value in renamed {
+        headers.append(header::SET_COOKIE, value);
+    }
+    response
+}
+
+#[cfg(all(target_os = "macos", debug_assertions))]
+async fn mac_p1_fixture_upload(
+    axum::extract::State(state): axum::extract::State<Arc<RemoteState>>,
+    headers: axum::http::HeaderMap,
+    raw: axum::extract::RawQuery,
+    query: axum::extract::Query<std::collections::HashMap<String, String>>,
+    body: axum::body::Body,
+) -> Response {
+    if query.get("interaction_route").map(String::as_str) != Some("codex_desktop_staging") {
+        return axum::http::StatusCode::FORBIDDEN.into_response();
+    }
+    api::session_attachment(axum::extract::State(state), None, headers, raw, query, body).await
+}
+
+#[cfg(all(target_os = "macos", debug_assertions))]
+async fn mac_p1_fixture_file(
+    axum::extract::State(state): axum::extract::State<Arc<RemoteState>>,
+    query: axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Result<Response, axum::http::StatusCode> {
+    use axum::http::StatusCode;
+    let sid = query.get("session_id").ok_or(StatusCode::BAD_REQUEST)?;
+    let path = std::path::Path::new(query.get("path").ok_or(StatusCode::BAD_REQUEST)?);
+    let session = (state.session_source)()
+        .sessions
+        .into_iter()
+        .find(|session| &session.id == sid)
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let base = super::attachments::attachment_dir(std::path::Path::new(&session.project_path), sid);
+    let name = path
+        .strip_prefix(&base)
+        .ok()
+        .and_then(|name| {
+            let mut parts = name.components();
+            match (parts.next(), parts.next()) {
+                (Some(std::path::Component::Normal(name)), None) => Some(name.to_owned()),
+                _ => None,
+            }
+        })
+        .ok_or(StatusCode::FORBIDDEN)?;
+    let exact = base.join(name);
+    let outcome = tokio::task::spawn_blocking(move || {
+        match super::files::read_fixture_file(exact.to_str().unwrap_or_default()) {
+            Ok((bytes, mime)) => api::FileReadOutcome::Found(bytes, mime),
+            Err(error) => api::FileReadOutcome::Rejected(error),
+        }
+    })
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    api::file_read_response(outcome)
 }
 
 pub async fn serve(bind: &str, port: u16, state: Arc<RemoteState>) -> Result<(), String> {
@@ -3160,6 +3351,7 @@ mod tests {
                         truncated: false,
                         cwd: None,
                         older_before: None,
+                        codex_saved_source: None,
                         dsh_model_summary: None,
                     })
                 } else {
@@ -3359,6 +3551,7 @@ mod tests {
                         truncated: false,
                         cwd: None,
                         older_before: None,
+                        codex_saved_source: None,
                         dsh_model_summary: None,
                     })
                 } else {
@@ -6117,6 +6310,7 @@ mod tests {
                     truncated: false,
                     cwd: None,
                     older_before: None,
+                    codex_saved_source: None,
                     dsh_model_summary: None,
                 }),
                 None => Err("测试桩：未注入内容源".to_string()),
@@ -9894,6 +10088,7 @@ mod tests {
                     truncated: false,
                     cwd: None,
                     older_before: None,
+                    codex_saved_source: None,
                     dsh_model_summary: None,
                 }),
                 // kimi：同形（本机 wire 的 3 问题实录缩录为 2 题）
@@ -9902,6 +10097,7 @@ mod tests {
                     truncated: false,
                     cwd: None,
                     older_before: None,
+                    codex_saved_source: None,
                     dsh_model_summary: None,
                 }),
                 _ => Err("无消息".to_string()),
@@ -11103,6 +11299,7 @@ mod tests {
             truncated: false,
             cwd: None,
             older_before: None,
+            codex_saved_source: None,
             dsh_model_summary: None,
         };
         let state = question_state_with_msgs(
@@ -11182,6 +11379,7 @@ mod tests {
             truncated: false,
             cwd: None,
             older_before: None,
+            codex_saved_source: None,
             dsh_model_summary: None,
         };
         let state = question_state_with_msgs(
@@ -11250,6 +11448,7 @@ mod tests {
             truncated: false,
             cwd: None,
             older_before: None,
+            codex_saved_source: None,
             dsh_model_summary: None,
         };
         let state = question_state_with_msgs(
@@ -11298,6 +11497,7 @@ mod tests {
             truncated: false,
             cwd: None,
             older_before: None,
+            codex_saved_source: None,
             dsh_model_summary: None,
         };
         // 2026-10-03：select 走焦点守卫编排 → 需要屏读缝（焦点在选项行 → 守卫不触发）
@@ -11364,6 +11564,7 @@ mod tests {
             truncated: false,
             cwd: None,
             older_before: None,
+            codex_saved_source: None,
             dsh_model_summary: None,
         };
         let state = question_state_with_msgs(
@@ -11454,6 +11655,7 @@ mod tests {
             truncated: false,
             cwd: None,
             older_before: None,
+            codex_saved_source: None,
             dsh_model_summary: None,
         }
     }
@@ -11465,6 +11667,7 @@ mod tests {
             truncated: false,
             cwd: None,
             older_before: None,
+            codex_saved_source: None,
             dsh_model_summary: None,
         }
     }
@@ -11493,6 +11696,7 @@ mod tests {
             truncated: false,
             cwd: None,
             older_before: None,
+            codex_saved_source: None,
             dsh_model_summary: None,
         }
     }
@@ -11598,6 +11802,7 @@ mod tests {
                     truncated: false,
                     cwd: None,
                     older_before: None,
+                    codex_saved_source: None,
                     dsh_model_summary: None,
                 }),
                 "sess_av" => Ok(plan_then_tool_event_page()),
@@ -11704,6 +11909,7 @@ mod tests {
                     truncated: false,
                     cwd: None,
                     older_before: None,
+                    codex_saved_source: None,
                     dsh_model_summary: None,
                 }),
                 _ => Err("无消息".to_string()),
@@ -11913,6 +12119,7 @@ mod tests {
                     truncated: false,
                     cwd: None,
                     older_before: None,
+                    codex_saved_source: None,
                     dsh_model_summary: None,
                 }),
                 _ => Err("无消息".to_string()),
@@ -12111,6 +12318,7 @@ mod tests {
                     truncated: false,
                     cwd: None,
                     older_before: None,
+                    codex_saved_source: None,
                     dsh_model_summary: None,
                 }),
                 // 审批已关：计划之后有工具事件（ExitPlanMode 回执）→ 预期态清除
@@ -20154,6 +20362,7 @@ mod tests {
                         truncated: false,
                         cwd: None,
                         older_before: None,
+                        codex_saved_source: None,
                         dsh_model_summary: None,
                     })
                 },
@@ -20278,6 +20487,7 @@ mod tests {
                         } else {
                             None
                         },
+                        codex_saved_source: None,
                         dsh_model_summary: None,
                     })
                 },
@@ -20306,6 +20516,7 @@ mod tests {
                         truncated: true,
                         cwd: None,
                         older_before: None,
+                        codex_saved_source: None,
                         dsh_model_summary: None,
                     })
                 },

@@ -6355,3 +6355,288 @@ async fn p11_residual_barrier_does_not_freeze_queue_relay() {
         "那条老记录状态不变、不被重发"
     );
 }
+
+// ============================================================
+// R2（2026-11-30 返工）：AX 持久账本的防重与跨通道屏障
+//
+// 这些用例只验证**账本层**（`SqliteActionJournal` ↔ `ActionStore`），
+// 不触碰真实 AX。要点：
+//   - 同 action_id 第二次登记必须 Duplicate，不覆盖既有阶段；
+//   - 重启后 `reserved` 变 `unknown`，恢复成"可能已碰编辑器"而不是"零副作用"；
+//   - 同 ID 换载荷 / 换设备 / 换线程必须被拒；
+//   - 旧 `desktop_ipc` 未决行不能被 AX 顶掉。
+// ============================================================
+mod ax_ledger {
+    use super::*;
+    use multi_agents_manager_lib::services::codex_desktop_ax_ledger::SqliteActionJournal;
+    use multi_agents_manager_lib::services::codex_desktop_ax_sender::{
+        ActionJournal, ActionPhase, JournalError, TargetKey,
+    };
+
+    fn target_key(thread: &str) -> TargetKey {
+        TargetKey {
+            device_id: "dev-1".into(),
+            host: multi_agents_manager_lib::services::codex_desktop_window::HostIdentity {
+                pid: 2075,
+                launch_generation: 1_795_773_975,
+                login_session: 501,
+            },
+            session_row_id: "row-A".into(),
+            project_group: "g0".into(),
+            view_generation: 1_795_773_975,
+            binding_generation: 1,
+            thread_id: thread.into(),
+            title_hash: "8f434346648f".into(),
+            workspace_key: "ws".into(),
+            project_label_hash: "ws".into(),
+        }
+    }
+
+    fn journal(h: &Harness, thread: &str) -> SqliteActionJournal {
+        SqliteActionJournal::new(
+            h.store.clone(),
+            "dev-1".to_string(),
+            "iPhone".to_string(),
+            "local".to_string(),
+            thread.to_string(),
+        )
+    }
+
+    #[test]
+    fn same_action_id_second_register_is_duplicate_and_keeps_phase() {
+        let h = harness();
+        let key = target_key(THREAD);
+        let mut j = journal(&h, THREAD);
+        assert!(matches!(j.register("ax-1", &key, "hello"), Ok(())));
+        // 登记内部会 `reserve`（queued→reserved）以冻结 AX 通道，
+        // 所以账本层读回来是"写路径内"（保守），不是 `Registered`。
+        // 且必须是 `AboutToSubmit` 而不是 `AboutToFill`：前者
+        // `may_have_submitted() == true`，后者为 false——后者会把"可能已提交"
+        // 降级成"明确未提交"。
+        assert_eq!(j.phase("ax-1"), Some(ActionPhase::AboutToSubmit));
+
+        // 推进到"可能已碰编辑器"
+        j.advance("ax-1", ActionPhase::AboutToFill).unwrap();
+        j.advance("ax-1", ActionPhase::Filled).unwrap();
+
+        // 同 ID 再登记：必须是 Duplicate，且阶段不被洗回 Registered
+        let mut j2 = journal(&h, THREAD);
+        assert_eq!(
+            j2.register("ax-1", &key, "hello"),
+            Err(JournalError::Duplicate)
+        );
+        assert_eq!(
+            j2.phase("ax-1"),
+            Some(ActionPhase::AboutToSubmit),
+            "重复登记不得把'可能已提交'洗成'刚登记'"
+        );
+    }
+
+    /// 复审 Important-2：登记与冻结通道必须**同一事务**。
+    ///
+    /// 判据不是"内部调了几个函数"，而是**可观察状态**：登记成功后绝不能出现
+    /// `state='queued'` 这种"零副作用可重来"的中间态。`queued` 在重启清理里
+    /// 会被当作没发生，而手机端可能已收到"处理中"。
+    #[test]
+    fn register_never_leaves_a_queued_row_claiming_zero_side_effect() {
+        let h = harness();
+        let key = target_key(THREAD);
+        let mut j = journal(&h, THREAD);
+        assert!(j.register("ax-single-tx", &key, "hello").is_ok());
+
+        // 账本状态必须是"写路径内"（reserved→AboutToSubmit），不是 Queued。
+        assert_eq!(
+            j.phase("ax-single-tx"),
+            Some(ActionPhase::AboutToSubmit),
+            "登记成功即已进入写路径，不得残留 queued 语义"
+        );
+        let persisted = h
+            .store
+            .get_for_device("ax-single-tx", "dev-1")
+            .expect("query")
+            .expect("登记必须已持久化");
+        assert_eq!(
+            persisted.state,
+            ActionState::Reserved,
+            "生产导航前必须已有 reserved 动作行"
+        );
+    }
+
+    /// AX 登记后与 UnknownDelivery 结算后，原 action_id 都必须在活屏障集合里。
+    #[test]
+    fn reserved_and_unknown_keep_original_action_as_armed_barrier() {
+        let h = harness();
+        let action_id = "ax-unknown-barrier";
+        let ctx = h.ctx(action_id, ActionKind::Send);
+        let registered = h
+            .store
+            .register_reserved(
+                &ctx,
+                ActionKind::Send,
+                "ax-unknown-hash",
+                ControlRoute::DesktopAx,
+            )
+            .expect("register reserved")
+            .expect("new action row");
+        assert_eq!(registered.state, ActionState::Reserved);
+        assert_eq!(h.state_of(action_id), ActionState::Reserved);
+        assert_eq!(
+            h.store
+                .armed_barriers_for_thread(THREAD)
+                .expect("query barriers"),
+            vec![action_id.to_string()],
+            "生产导航前，reserved AX 动作必须以原 action_id 作为活跃跨通道占位"
+        );
+
+        let j = journal(&h, THREAD);
+        assert!(
+            j.settle(action_id, Delivery::UnknownDelivery, Some("ax_uncertain")),
+            "UnknownDelivery 必须成功结算"
+        );
+        assert_eq!(h.state_of(action_id), ActionState::Unknown);
+        assert_eq!(
+            h.store
+                .armed_barriers_for_thread(THREAD)
+                .expect("query barriers"),
+            vec![action_id.to_string()],
+            "结算为未知投递后，原 action_id 必须继续留在活屏障中"
+        );
+    }
+
+    /// 单事务失败路径：同 ID 已存在时**不得**产生第二行、也不得改写既有行。
+    #[test]
+    fn single_tx_register_does_not_overwrite_existing_row() {
+        let h = harness();
+        let key = target_key(THREAD);
+        let mut j = journal(&h, THREAD);
+        j.register("ax-dup", &key, "first").unwrap();
+        let first_hash = j.payload_hash_of("ax-dup");
+
+        // 换载荷再登记：必须被拒（同 ID 换内容），且原行不变。
+        let mut j2 = journal(&h, THREAD);
+        assert_eq!(
+            j2.register("ax-dup", &key, "second"),
+            Err(JournalError::Duplicate)
+        );
+        assert_eq!(
+            j2.payload_hash_of("ax-dup"),
+            first_hash,
+            "同 ID 换载荷必须被拒，原行不得被改写"
+        );
+    }
+
+    #[test]
+    fn restart_makes_reserved_unknown_and_conservative() {
+        let mut h = harness();
+        let key = target_key(THREAD);
+        let mut j = journal(&h, THREAD);
+        j.register("ax-2", &key, "hello").unwrap();
+        j.advance("ax-2", ActionPhase::Filled).unwrap();
+
+        // 进程重启：reserved → unknown（既有启动恢复逻辑）
+        h.restart();
+
+        let j2 = journal(&h, THREAD);
+        assert_eq!(
+            j2.phase("ax-2"),
+            Some(ActionPhase::AboutToSubmit),
+            "重启后 unknown 必须恢复成'可能已提交'（最保守），不能是零副作用、\n             也不能是 AboutToFill（那会把可能已提交降级成明确未提交）"
+        );
+        assert!(j2.exists("ax-2"));
+        assert_eq!(
+            h.store
+                .armed_barriers_for_thread(THREAD)
+                .expect("query barriers"),
+            vec!["ax-2".to_string()],
+            "重启恢复的 AX 未知动作必须以原 action_id 留在活屏障中"
+        );
+    }
+
+    #[test]
+    fn same_id_with_different_payload_is_detected_by_hash() {
+        let h = harness();
+        let key = target_key(THREAD);
+        let mut j = journal(&h, THREAD);
+        j.register("ax-3", &key, "hello").unwrap();
+
+        let want =
+            multi_agents_manager_lib::services::codex_desktop_window::sha256_prefix12("hello");
+        assert_eq!(j.payload_hash_of("ax-3").as_deref(), Some(want.as_str()));
+        let other =
+            multi_agents_manager_lib::services::codex_desktop_window::sha256_prefix12("bye");
+        assert_ne!(want, other);
+    }
+
+    #[test]
+    fn register_rejects_thread_mismatch() {
+        let h = harness();
+        let mut j = journal(&h, THREAD);
+        let wrong = target_key("another-thread");
+        assert_eq!(
+            j.register("ax-4", &wrong, "hello"),
+            Err(JournalError::Storage),
+            "同账本实例不得登记别的线程"
+        );
+    }
+
+    #[test]
+    fn verified_settles_to_accepted() {
+        let h = harness();
+        let key = target_key(THREAD);
+        let mut j = journal(&h, THREAD);
+        j.register("ax-5", &key, "hello").unwrap();
+        j.advance("ax-5", ActionPhase::Verified).unwrap();
+        assert_eq!(j.phase("ax-5"), Some(ActionPhase::Verified));
+        // 账本状态应为 Accepted
+        let (_, _, _, snap) = h.store.action_identity("ax-5").expect("row");
+        assert_eq!(
+            snap.state,
+            multi_agents_manager_lib::services::codex_desktop_ipc::types::ActionState::Accepted
+        );
+    }
+
+    #[test]
+    fn ledger_stores_real_device_not_action_id() {
+        // R2：`device_id` 必须是真实鉴权设备，**不能**是 action_id。
+        // 旧实现把 action_id 填进 device_id，使跨设备去重与审计全部失真。
+        let h = harness();
+        let key = target_key(THREAD);
+        let mut j = journal(&h, THREAD);
+        j.register("ax-devid", &key, "hello").unwrap();
+
+        let (device, thread, _, _) = h.store.action_identity("ax-devid").expect("row");
+        assert_eq!(device, "dev-1", "账本里的 device_id 必须是真实设备");
+        assert_ne!(device, "ax-devid", "绝不能拿 action_id 冒充设备");
+        assert_eq!(thread, THREAD);
+    }
+
+    #[test]
+    fn existing_desktop_ipc_action_cannot_be_reused_by_ax() {
+        // 旧 IPC 未决行（unknown）在场时，AX 用同 ID 登记必须被拒。
+        let h = harness();
+        let ctx = h.ctx("ipc-1", ActionKind::Send);
+        h.store
+            .register(&ctx, ActionKind::Send, None, None, "hash", None)
+            .expect("ipc register");
+        h.store
+            .reserve("ipc-1", ControlRoute::DesktopIpc)
+            .expect("reserve");
+        h.store
+            .finish(&ActionReceipt {
+                action_id: "ipc-1".into(),
+                delivery: Delivery::UnknownDelivery,
+                route: ControlRoute::DesktopIpc,
+                turn_id: None,
+                envelope_id: None,
+                reason_code: None,
+            })
+            .expect("finish unknown");
+
+        let mut j = journal(&h, THREAD);
+        assert_eq!(
+            j.register("ipc-1", &target_key(THREAD), "hash"),
+            Err(JournalError::Duplicate),
+            "AX 不得顶掉历史未决的 IPC 动作"
+        );
+    }
+}

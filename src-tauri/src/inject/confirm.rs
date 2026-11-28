@@ -1023,6 +1023,7 @@ mod tests {
             truncated: false,
             cwd: None,
             older_before: None,
+            codex_saved_source: None,
             dsh_model_summary: None,
         };
         assert!(stamp_hit_in_page(&pg, stamp));
@@ -1032,6 +1033,7 @@ mod tests {
             truncated: false,
             cwd: None,
             older_before: None,
+            codex_saved_source: None,
             dsh_model_summary: None,
         };
         assert!(!stamp_hit_in_page(&pg2, stamp));
@@ -1044,6 +1046,7 @@ mod tests {
             truncated: false,
             cwd: None,
             older_before: None,
+            codex_saved_source: None,
             dsh_model_summary: None,
         };
         assert!(stamp_hit_in_page(&pg3, stamp));
@@ -1078,6 +1081,7 @@ mod tests {
             truncated: false,
             cwd: None,
             older_before: None,
+            codex_saved_source: None,
             dsh_model_summary: None,
         };
         assert!(!stamp_hit_in_page(&pg, stamp));
@@ -1090,6 +1094,7 @@ mod tests {
             truncated: false,
             cwd: None,
             older_before: None,
+            codex_saved_source: None,
             dsh_model_summary: None,
         };
         assert!(stamp_hit_in_page(&pg2, stamp));

@@ -2,6 +2,7 @@
 // - 旧 session.status=idle/finished 不得隐藏 Codex 能力、pending、屏障与队列；
 // - 队列刷新由**本地信号**驱动（投影 revision 变化 / 发送回执），不要求 Desktop 出新帧；
 // - revision=null 的兼容模式同样成立；换会话不串台。
+import { useState } from "react";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { useLayoutEffect } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -301,6 +302,7 @@ describe("SessionDetail × Codex IPC：恢复入口与队列刷新", () => {
     expect(await screen.findByTestId("codex-queue-row-compat-a")).toBeTruthy();
     expect(screen.getByTestId("codex-queue-retract-compat-a")).toBeTruthy();
     expect(screen.getByTestId("codex-stale-note")).toBeTruthy();
+    expect(await screen.findByTestId("codex-history-source")).toBeVisible();
   });
 
   it("F：revision=null 兼容超时 → 不离开页面也能看到屏障与恢复入口", async () => {
@@ -316,7 +318,7 @@ describe("SessionDetail × Codex IPC：恢复入口与队列刷新", () => {
     };
     render(<SessionDetail session={makeSession({ status: "idle" })} onBack={() => {}} />);
     const es = await waitFor(() => MockEventSource.latest());
-    emit(es, "snapshot", projection({ revision: null, stale: true, availability: "compat_only" }));
+    emit(es, "snapshot", projection({ revision: null, stale: false, availability: "compat_only" }));
     const input = await screen.findByTestId("composer-input");
     fireEvent.change(input, { target: { value: "兼容超时消息" } });
     fireEvent.click(screen.getByTestId("composer-send"));
@@ -466,13 +468,15 @@ describe("SessionDetail × Codex IPC：R6 后端真实状态变化驱动 send-in
       reason: "该版本暂不能远程发送",
     };
     emit(es, "state", projection({ revision: 5, availability: "read_only" }));
-    // composer 重拉 send-info（静态门拒绝）→ 输入区置灰 + 原因码
+    // composer 重拉 send-info（静态门拒绝）→ 保留本地草稿编辑，但发送禁用并给出原因码
     await waitFor(() => {
-      expect((screen.getByTestId("composer-input") as HTMLTextAreaElement).disabled).toBe(true);
+      expect(screen.getByTestId("send-disabled-reason").textContent).toContain(
+        "capability_unverified"
+      );
     });
-    expect(screen.getByTestId("send-disabled-reason").textContent).toContain(
-      "capability_unverified"
-    );
+    expect((screen.getByTestId("composer-input") as HTMLTextAreaElement).disabled).toBe(false);
+    expect(screen.getByTestId("composer-local-draft-note")).toBeTruthy();
+    expect((screen.getByTestId("composer-send") as HTMLButtonElement).disabled).toBe(true);
     // 重开 → availability 翻回（生产 republish 第二帧，revision 仍不变）→ 解禁
     sendInfoResponse = {
       injectable: true,
@@ -481,7 +485,7 @@ describe("SessionDetail × Codex IPC：R6 后端真实状态变化驱动 send-in
     };
     emit(es, "state", projection({ revision: 5, availability: "controllable" }));
     await waitFor(() => {
-      expect((screen.getByTestId("composer-input") as HTMLTextAreaElement).disabled).toBe(false);
+      expect(screen.queryByTestId("send-disabled-reason")).toBeNull();
     });
   });
 
@@ -2233,6 +2237,39 @@ describe("SessionDetail × Codex IPC：A5.3 Codex/通用消息源切换", () => 
     expect(screen.getByText(nextFile)).toBeVisible();
   });
 
+  it("过期镜像回退到独立已落盘页，重复刷新不拼接旧投影", async () => {
+    installFetch();
+    const disk = "A 的已落盘新回复";
+    messagesResponse = {
+      messages: [{ seq: 1, kind: "assistant", content: disk }],
+      truncated: true,
+      codexSavedSource: "thread_history",
+    };
+    render(<SessionDetail session={makeSession({ status: "idle" })} onBack={() => {}} />);
+    await screen.findByText(disk);
+    const es = await waitFor(() => MockEventSource.latest());
+    const old = "A 的旧 IPC 消息";
+    emit(es, "snapshot", projection({ messages: [projectedMessage("old", old)] }));
+    expect(await screen.findByText(old)).toBeVisible();
+    expect(screen.queryByText(disk)).toBeNull();
+    expect(screen.getByTestId("codex-history-source")).toHaveAttribute("data-source", "ipc");
+    emit(
+      es,
+      "snapshot",
+      projection({ revision: 6, stale: true, messages: [projectedMessage("old", old)] })
+    );
+    expect(await screen.findByText(old)).toBeVisible();
+    expect(screen.getByTestId("codex-history-source")).toHaveAttribute("data-source", "snapshot");
+    fireEvent.click(await screen.findByTestId("codex-history-source-choice"));
+    expect(await screen.findByText(disk)).toBeVisible();
+    expect(screen.queryByText(old)).toBeNull();
+    expect(screen.getByTestId("codex-history-source")).toHaveAttribute("data-source", "sqlite");
+    expect(screen.getByTestId("load-more")).toBeVisible();
+    fireEvent.click(screen.getByTestId("detail-refresh"));
+    await waitFor(() => expect(screen.getAllByText(disk)).toHaveLength(1));
+    expect(sendCalls).toHaveLength(0);
+  });
+
   it("A5.3-b：Codex 投影激活期间零通用历史请求（加载更早不触发 session-messages）", async () => {
     installFetch();
     queueResponse = {
@@ -2256,5 +2293,529 @@ describe("SessionDetail × Codex IPC：A5.3 Codex/通用消息源切换", () => 
       String(u).includes("/session-messages")
     ).length;
     expect(messageCallsAfter).toBe(messageCallsBefore);
+  });
+
+  it("ax_route_keeps_text_send_available_when_ipc_projection_is_stale", async () => {
+    installFetch();
+    sendInfoResponse = {
+      injectable: true,
+      channels: ["desktop_ax"],
+      visibility: "realtime",
+      route: "desktop_ax",
+    };
+    render(<SessionDetail session={makeSession()} onBack={() => {}} />);
+    const es = await waitFor(() => MockEventSource.latest());
+    emit(es, "snapshot", projection({ revision: 9, stale: true }));
+
+    const input = (await screen.findByTestId("composer-input")) as HTMLTextAreaElement;
+    fireEvent.change(input, { target: { value: "AX stale text" } });
+    expect(await screen.findByTestId("codex-ax-send-note")).toBeVisible();
+    expect(input.disabled).toBe(false);
+    expect(input.value).toBe("AX stale text");
+    expect((screen.getByTestId("composer-send") as HTMLButtonElement).disabled).toBe(false);
+    expect(screen.queryByTestId("send-disabled-reason")).toBeNull();
+    expect(screen.queryByTestId("composer-local-draft-note")).toBeNull();
+    expect(screen.queryByTestId("codex-stale-note")).toBeNull();
+    expect(sendCalls).toHaveLength(0);
+  });
+
+  it("ax_route_keeps_text_send_available_before_ipc_projection_connects", async () => {
+    installFetch();
+    sendInfoResponse = {
+      injectable: true,
+      channels: ["desktop_ax"],
+      visibility: "realtime",
+      route: "desktop_ax",
+    };
+    render(<SessionDetail session={makeSession()} onBack={() => {}} />);
+
+    const input = (await screen.findByTestId("composer-input")) as HTMLTextAreaElement;
+    fireEvent.change(input, { target: { value: "AX before IPC" } });
+    expect(await screen.findByTestId("codex-ax-send-note")).toBeVisible();
+    expect(input.disabled).toBe(false);
+    expect(input.value).toBe("AX before IPC");
+    expect((screen.getByTestId("composer-send") as HTMLButtonElement).disabled).toBe(false);
+    expect(screen.queryByTestId("send-disabled-reason")).toBeNull();
+    expect(screen.queryByTestId("composer-local-draft-note")).toBeNull();
+    expect(screen.queryByTestId("codex-stale-note")).toBeNull();
+    expect(sendCalls).toHaveLength(0);
+  });
+
+  it("Task2：同 revision 变 stale 触发 send-info 刷新并立即禁发，零 session-send POST", async () => {
+    installFetch();
+    render(<SessionDetail session={makeSession({ status: "idle" })} onBack={() => {}} />);
+    const es = await waitFor(() => MockEventSource.latest());
+    emit(es, "snapshot", projection({ revision: 9, stale: false }));
+    const input = await screen.findByTestId("composer-input");
+    fireEvent.change(input, { target: { value: "同 revision 断联" } });
+    expect((screen.getByTestId("composer-send") as HTMLButtonElement).disabled).toBe(false);
+
+    const sendInfoBefore = fetchMock.mock.calls.filter(([u]) =>
+      String(u).includes("/session-send-info")
+    ).length;
+    emit(es, "state", projection({ revision: 9, stale: true }));
+
+    await waitFor(() => {
+      const sendInfoAfter = fetchMock.mock.calls.filter(([u]) =>
+        String(u).includes("/session-send-info")
+      ).length;
+      expect(sendInfoAfter).toBeGreaterThan(sendInfoBefore);
+    });
+    expect((screen.getByTestId("composer-send") as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.click(screen.getByTestId("composer-send"));
+    expect(sendCalls).toHaveLength(0);
+  });
+
+  it("Task2：stale + compat_only 首帧禁发、禁恢复/插队/强行继续，仅保留本地撤回与转草稿", async () => {
+    installFetch();
+    queueResponse = {
+      actions: [{ actionId: "q-compat-1", state: "queued", position: 1, receipt: null }],
+      blockedReasonCode: "compat_outstanding",
+      blockedActionIds: ["q-compat-1"],
+      queuePaused: true,
+    };
+    render(<SessionDetail session={makeSession({ status: "idle" })} onBack={() => {}} />);
+    const es = await waitFor(() => MockEventSource.latest());
+    emit(es, "snapshot", projection({ revision: null, stale: true, availability: "compat_only" }));
+
+    expect(await screen.findByTestId("codex-queue-row-q-compat-1")).toBeTruthy();
+    expect(screen.queryByTestId("codex-queue-force-continue")).toBeNull();
+    expect(screen.queryByTestId("codex-queue-resume")).toBeNull();
+    expect(screen.queryByTestId("codex-queue-prioritize-q-compat-1")).toBeNull();
+    expect(screen.getByTestId("codex-queue-retract-q-compat-1")).toBeTruthy();
+    expect(screen.getByTestId("codex-queue-edit-q-compat-1")).toBeTruthy();
+
+    const input = await screen.findByTestId("composer-input");
+    fireEvent.change(input, { target: { value: "断联草稿" } });
+    expect((screen.getByTestId("composer-send") as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.click(screen.getByTestId("composer-send"));
+    expect(sendCalls).toHaveLength(0);
+  });
+
+  it("Task3：A 发起取稿→回看板→重进 A 写新稿→旧请求迟到成功，新稿与取回原文均保留且零自动发送", async () => {
+    installFetch();
+    let resolveEdit!: (res: Response) => void;
+    queueResponse = {
+      actions: [{ actionId: "edit-a1", state: "queued", position: 1, receipt: null }],
+      blockedReasonCode: null,
+    };
+    const baseFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url === "/m/api/v1/codex/queue/edit") {
+        return new Promise<Response>((resolve) => {
+          resolveEdit = resolve;
+        });
+      }
+      return baseFetch(input, init);
+    }) as typeof fetch;
+
+    const draftsState = {
+      composer: {} as Record<string, { text: string; revision: number }>,
+      edit: {} as Record<
+        string,
+        Array<{ sessionId: string; actionId: string; text: string; sessionKey?: string }>
+      >,
+    };
+    const Harness = ({ session }: { session: ReturnType<typeof makeSession> | null }) => {
+      const [composerDrafts, setComposerDrafts] = useState(draftsState.composer);
+      const [editDrafts, setEditDrafts] = useState(draftsState.edit);
+      if (!session) return <div data-testid="board-view" />;
+      return (
+        <SessionDetail
+          session={session}
+          onBack={() => {}}
+          composerDrafts={composerDrafts}
+          onComposerDraftsChange={setComposerDrafts}
+          editDrafts={editDrafts}
+          onEditDraftsChange={setEditDrafts}
+        />
+      );
+    };
+
+    const sessA = makeSession({ id: "sess-a", status: "idle" });
+    const { rerender } = render(<Harness session={sessA} />);
+    const es = await waitFor(() => MockEventSource.latest());
+    emit(es, "snapshot", projection({ revision: 1, stale: true }));
+    fireEvent.click(await screen.findByTestId("codex-queue-edit-edit-a1"));
+
+    // 返回看板（SessionDetail 卸载）
+    rerender(<Harness session={null} />);
+    expect(screen.getByTestId("board-view")).toBeTruthy();
+
+    // 重进 A 并写新稿
+    rerender(<Harness session={sessA} />);
+    const input = (await screen.findByTestId("composer-input")) as HTMLTextAreaElement;
+    fireEvent.change(input, { target: { value: "新写手机草稿" } });
+    expect(input.value).toBe("新写手机草稿");
+
+    // 迟到的取稿响应到达
+    await act(async () => {
+      resolveEdit(
+        new Response(JSON.stringify({ actionId: "edit-a1", text: "旧待发原文" }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        })
+      );
+    });
+
+    expect((screen.getByTestId("composer-input") as HTMLTextAreaElement).value).toBe(
+      "新写手机草稿"
+    );
+    expect(await screen.findByTestId("composer-edit-choice")).toBeTruthy();
+    expect(screen.getByTestId("composer-edit-preview").textContent).toContain("旧待发原文");
+    expect(sendCalls).toHaveLength(0);
+
+    // 切到同 ID 不同工具（claude）或不同会话 B，零串写
+    rerender(
+      <Harness session={makeSession({ id: "sess-a", agentType: "claude", form: undefined })} />
+    );
+    expect(((await screen.findByTestId("composer-input")) as HTMLTextAreaElement).value).toBe("");
+    expect(screen.queryByTestId("composer-edit-choice")).toBeNull();
+  });
+
+  it("Task4：同 ID App 选 SQLite → 切 CLI 立即走默认读链且丢弃迟到 App 回包，切回 App 不带旧选源", async () => {
+    installFetch();
+    let resolveAppSqlite!: (res: Response) => void;
+    const messageUrls: string[] = [];
+    const baseFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.includes("/m/api/v1/session-messages")) {
+        messageUrls.push(url);
+        if (url.includes("codex_saved_source=thread_history")) {
+          return new Promise<Response>((resolve) => {
+            resolveAppSqlite = resolve;
+          });
+        }
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              messages: [{ seq: 1, role: "assistant", kind: "message", content: "CLI默认历史" }],
+              truncated: false,
+              codexSavedSource: "rollout",
+            }),
+            { status: 200, headers: { "Content-Type": "application/json" } }
+          )
+        );
+      }
+      return baseFetch(input, init);
+    }) as typeof fetch;
+
+    const appSession = makeSession({ id: "same-thread", agentType: "codex", form: "app" });
+    const cliSession = makeSession({ id: "same-thread", agentType: "codex", form: undefined });
+    const { rerender } = render(<SessionDetail session={appSession} onBack={() => {}} />);
+    const es = await waitFor(() => MockEventSource.latest());
+    emit(es, "snapshot", projection({ revision: 3, stale: true }));
+
+    const sqliteBtn = await screen.findByTestId("codex-sqlite-history-choice");
+    fireEvent.click(sqliteBtn);
+    await waitFor(() =>
+      expect(messageUrls.some((u) => u.includes("codex_saved_source=thread_history"))).toBe(true)
+    );
+
+    // 切到同 ID CLI：立即走 CLI 默认读链，不带 codex_saved_source=thread_history
+    const countBeforeCli = messageUrls.length;
+    rerender(<SessionDetail session={cliSession} onBack={() => {}} />);
+    await waitFor(() => expect(messageUrls.length).toBeGreaterThan(countBeforeCli));
+    const cliUrls = messageUrls.slice(countBeforeCli);
+    expect(cliUrls.every((u) => !u.includes("codex_saved_source=thread_history"))).toBe(true);
+    expect(await screen.findByText("CLI默认历史")).toBeTruthy();
+
+    // 迟到的旧 App SQLite 回包到达 → 丢弃，不覆盖 CLI 历史
+    await act(async () => {
+      resolveAppSqlite(
+        new Response(
+          JSON.stringify({
+            messages: [{ seq: 1, role: "assistant", kind: "message", content: "迟到AppSQLite" }],
+            truncated: false,
+            codexSavedSource: "thread_history",
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } }
+        )
+      );
+    });
+    expect(screen.queryByText("迟到AppSQLite")).toBeNull();
+    expect(screen.getByText("CLI默认历史")).toBeTruthy();
+
+    // 切回 App：不携带上次 SQLite 选源
+    const countBeforeReApp = messageUrls.length;
+    rerender(<SessionDetail session={appSession} onBack={() => {}} />);
+    await waitFor(() => expect(messageUrls.length).toBeGreaterThan(countBeforeReApp));
+    const reAppUrls = messageUrls.slice(countBeforeReApp);
+    expect(reAppUrls.every((u) => !u.includes("codex_saved_source=thread_history"))).toBe(true);
+  });
+
+  it("Task2：同 ID CLI → App 空首帧立即作废旧 CLI 发送资格并保留草稿", async () => {
+    installFetch();
+    let resolveAppSendInfo!: (res: Response) => void;
+    const baseFetch = globalThis.fetch;
+    let sendInfoCount = 0;
+    globalThis.fetch = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.includes("/m/api/v1/session-send-info")) {
+        sendInfoCount += 1;
+        if (sendInfoCount >= 2) {
+          return new Promise<Response>((resolve) => {
+            resolveAppSendInfo = resolve;
+          });
+        }
+      }
+      return baseFetch(input, init);
+    }) as typeof fetch;
+
+    const cliSession = makeSession({ id: "same-thread-2", agentType: "codex", form: undefined });
+    const appSession = makeSession({ id: "same-thread-2", agentType: "codex", form: "app" });
+    const { rerender } = render(<SessionDetail session={cliSession} onBack={() => {}} />);
+    const input = (await screen.findByTestId("composer-input")) as HTMLTextAreaElement;
+    fireEvent.change(input, { target: { value: "保留的本地草稿" } });
+    expect((screen.getByTestId("composer-send") as HTMLButtonElement).disabled).toBe(false);
+
+    // 切入受限 App（空首帧，App send-info 尚未返回）：旧 CLI injectable 立即失效，草稿不丢
+    rerender(<SessionDetail session={appSession} onBack={() => {}} />);
+    expect((screen.getByTestId("composer-input") as HTMLTextAreaElement).value).toBe(
+      "保留的本地草稿"
+    );
+    expect((screen.getByTestId("composer-send") as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.click(screen.getByTestId("composer-send"));
+    expect(sendCalls).toHaveLength(0);
+
+    await act(async () => {
+      resolveAppSendInfo(
+        new Response(JSON.stringify({ injectable: false, reasonCode: "capability_unverified" }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        })
+      );
+    });
+    expect((screen.getByTestId("composer-send") as HTMLButtonElement).disabled).toBe(true);
+    expect(sendCalls).toHaveLength(0);
+  });
+
+  it("Task3：用户中途主动清空草稿也算改稿，迟到取稿留作候选不自动填回；消费后重挂收重复回执不覆盖", async () => {
+    installFetch();
+    let resolveEdit!: (res: Response) => void;
+    queueResponse = {
+      actions: [{ actionId: "edit-clear-1", state: "queued", position: 1, receipt: null }],
+      blockedReasonCode: null,
+    };
+    const baseFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url === "/m/api/v1/codex/queue/edit") {
+        return new Promise<Response>((resolve) => {
+          resolveEdit = resolve;
+        });
+      }
+      return baseFetch(input, init);
+    }) as typeof fetch;
+
+    const consumed = new Map<string, Set<string>>();
+    const isEditDraftConsumed = (key: string, actionId: string) =>
+      consumed.get(key)?.has(actionId) === true;
+    const onEditDraftConsumed = (key: string, actionId: string) => {
+      const s = consumed.get(key) ?? new Set<string>();
+      s.add(actionId);
+      consumed.set(key, s);
+    };
+
+    const Harness = ({ session }: { session: ReturnType<typeof makeSession> | null }) => {
+      const [composerDrafts, setComposerDrafts] = useState<
+        Record<string, { text: string; revision: number }>
+      >({});
+      const [editDrafts, setEditDrafts] = useState<
+        Record<
+          string,
+          Array<{
+            sessionId: string;
+            actionId: string;
+            text: string;
+            sessionKey?: string;
+            sourceDraftRevision?: number;
+          }>
+        >
+      >({});
+      if (!session) return <div data-testid="board-view" />;
+      return (
+        <SessionDetail
+          session={session}
+          onBack={() => {}}
+          composerDrafts={composerDrafts}
+          onComposerDraftsChange={setComposerDrafts}
+          editDrafts={editDrafts}
+          onEditDraftsChange={setEditDrafts}
+          isEditDraftConsumed={isEditDraftConsumed}
+          onEditDraftConsumed={onEditDraftConsumed}
+        />
+      );
+    };
+
+    const sessA = makeSession({ id: "sess-clear", status: "idle" });
+    const { rerender } = render(<Harness session={sessA} />);
+    const es = await waitFor(() => MockEventSource.latest());
+    emit(es, "snapshot", projection({ revision: 1, stale: true }));
+
+    // 写草稿后点取稿，随后主动清空草稿（revision 已前进）
+    const input = (await screen.findByTestId("composer-input")) as HTMLTextAreaElement;
+    fireEvent.change(input, { target: { value: "临时文本" } });
+    fireEvent.click(await screen.findByTestId("codex-queue-edit-edit-clear-1"));
+    fireEvent.change(screen.getByTestId("composer-input"), { target: { value: "" } });
+    expect((screen.getByTestId("composer-input") as HTMLTextAreaElement).value).toBe("");
+
+    await act(async () => {
+      resolveEdit(
+        new Response(JSON.stringify({ actionId: "edit-clear-1", text: "撤回的原文" }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        })
+      );
+    });
+
+    // 用户中途清空也算改稿：原文不自动填回，而是留作候选确认
+    expect((screen.getByTestId("composer-input") as HTMLTextAreaElement).value).toBe("");
+    expect(await screen.findByTestId("composer-edit-choice")).toBeTruthy();
+    expect(screen.getByTestId("composer-edit-preview").textContent).toContain("撤回的原文");
+
+    // 确认替换并消费后，返回看板再进入（卸载重挂），同 actionId 已被标记消费
+    fireEvent.click(screen.getByText("Replace draft"));
+    expect((screen.getByTestId("composer-input") as HTMLTextAreaElement).value).toBe("撤回的原文");
+    rerender(<Harness session={null} />);
+    rerender(<Harness session={sessA} />);
+    expect(
+      isEditDraftConsumed(JSON.stringify(["codex", undefined, "sess-clear"]), "edit-clear-1")
+    ).toBe(true);
+    expect(sendCalls).toHaveLength(0);
+  });
+
+  it("Task4：App SQLite 已显示后切同 ID CLI，加载期与默认读取失败期均不显示旧 App 内容", async () => {
+    installFetch();
+    let resolveCli!: (res: Response) => void;
+    let rejectNextCli = false;
+    const baseFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.includes("/m/api/v1/session-messages")) {
+        if (url.includes("codex_saved_source=thread_history")) {
+          return Promise.resolve(
+            new Response(
+              JSON.stringify({
+                messages: [
+                  { seq: 1, role: "assistant", kind: "message", content: "AppSQLite已落地正文" },
+                ],
+                truncated: false,
+                codexSavedSource: "thread_history",
+              }),
+              { status: 200, headers: { "Content-Type": "application/json" } }
+            )
+          );
+        }
+        if (rejectNextCli) {
+          return Promise.resolve(new Response("err", { status: 500 }));
+        }
+        if (url.includes("same-thread-4")) {
+          return new Promise<Response>((resolve) => {
+            resolveCli = resolve;
+          });
+        }
+      }
+      return baseFetch(input, init);
+    }) as typeof fetch;
+
+    const appSession = makeSession({ id: "same-thread-4", agentType: "codex", form: "app" });
+    const cliSession = makeSession({ id: "same-thread-4", agentType: "codex", form: undefined });
+    const { rerender } = render(<SessionDetail session={appSession} onBack={() => {}} />);
+    const es = await waitFor(() => MockEventSource.latest());
+    emit(es, "snapshot", projection({ revision: 3, stale: true }));
+
+    // 先在 App 切到 SQLite 并看到正文落地
+    fireEvent.click(await screen.findByTestId("codex-sqlite-history-choice"));
+    expect(await screen.findByText("AppSQLite已落地正文")).toBeTruthy();
+
+    // 切同 ID CLI（先模拟失败）：不等下一个请求，旧 App 内容立即消失，失败期也不显示旧 App 内容
+    rejectNextCli = true;
+    rerender(<SessionDetail session={cliSession} onBack={() => {}} />);
+    expect(screen.queryByText("AppSQLite已落地正文")).toBeNull();
+    expect(screen.queryByTestId("codex-history-source")).toBeNull();
+    await waitFor(() => expect(screen.getByTestId("detail-retry")).toBeTruthy());
+    expect(screen.queryByText("AppSQLite已落地正文")).toBeNull();
+
+    // 点重试进入加载期：同样不显示旧 App 内容，随后正常展示 CLI 默认历史
+    rejectNextCli = false;
+    fireEvent.click(screen.getByTestId("detail-retry"));
+    expect(screen.queryByText("AppSQLite已落地正文")).toBeNull();
+    await act(async () => {
+      resolveCli(
+        new Response(
+          JSON.stringify({
+            messages: [{ seq: 1, role: "assistant", kind: "message", content: "CLI正常历史" }],
+            truncated: false,
+            codexSavedSource: "rollout",
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } }
+        )
+      );
+    });
+    expect(await screen.findByText("CLI正常历史")).toBeTruthy();
+  });
+
+  it("Task6：上传 PNG → 预览 → 切分屏 → 关闭，同一条目仍保留且可再次预览（零 Codex 派发）", async () => {
+    installFetch();
+    sendInfoResponse = {
+      injectable: false,
+      reasonCode: "capability_unverified",
+      attachmentUploadOnly: true,
+    };
+    const MockUploadXhr = class {
+      upload: { onprogress: ((e: ProgressEvent) => void) | null } = { onprogress: null };
+      onload: (() => void) | null = null;
+      onerror: (() => void) | null = null;
+      onabort: (() => void) | null = null;
+      status = 200;
+      responseText = JSON.stringify({
+        attachmentId: "0123456789abcdef0123456789abcdef",
+        fileName: "sample.png",
+        size: 16,
+      });
+      open() {}
+      setRequestHeader() {}
+      abort() {
+        this.onabort?.();
+      }
+      send() {
+        queueMicrotask(() => this.onload?.());
+      }
+    };
+    vi.stubGlobal("XMLHttpRequest", MockUploadXhr);
+    try {
+      render(
+        <SessionDetail session={makeSession({ id: "sess-preview-layout" })} onBack={() => {}} />
+      );
+      const es = await waitFor(() => MockEventSource.latest());
+      emit(es, "snapshot", projection({ revision: 2, stale: true }));
+
+      await waitFor(() =>
+        expect((screen.getByTestId("attach-add") as HTMLButtonElement).disabled).toBe(false)
+      );
+      const fileInput = screen.getByTestId("attach-file-input");
+      fireEvent.change(fileInput, {
+        target: { files: [new File(["pngbytes"], "sample.png", { type: "image/png" })] },
+      });
+
+      const previewBtn = await screen.findByRole("button", { name: "sample.png" });
+      fireEvent.click(previewBtn);
+      expect(await screen.findByTestId("preview-shell")).toBeTruthy();
+
+      // 切分屏（MessageComposer 跨布局分支重挂）→ 关闭预览 → 同一条目仍在且可再次预览
+      fireEvent.click(screen.getByTestId("preview-toggle-split"));
+      expect(screen.getByRole("button", { name: "sample.png" })).toBeTruthy();
+      fireEvent.click(screen.getByTestId("preview-close"));
+      expect(screen.queryByTestId("preview-shell")).toBeNull();
+      const previewAgain = screen.getByRole("button", { name: "sample.png" });
+      fireEvent.click(previewAgain);
+      expect(await screen.findByTestId("preview-shell")).toBeTruthy();
+      expect(sendCalls).toHaveLength(0);
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 });

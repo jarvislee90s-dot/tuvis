@@ -17,7 +17,13 @@ import { ArrowLeft, Crosshair, X } from "lucide-react";
 import i18n from "@/i18n";
 import PreviewModeSwitcher, { type PreviewMode } from "./PreviewModeSwitcher";
 import { fileKindOf } from "./FilePanel";
-import { ApiError, fetchDshMedia, fetchFile, type FilePayload } from "./api";
+import {
+  ApiError,
+  fetchDshMedia,
+  fetchFile,
+  fetchStagedAttachmentPreview,
+  type FilePayload,
+} from "./api";
 import { etaRemainingText, formatBytes, transferRateBps, type TransferSample } from "./board-logic";
 import type { Session } from "@/types/session";
 
@@ -27,6 +33,7 @@ interface FilePreviewProps {
   /** 待预览的文件路径（绝对或相对项目目录，端点侧 read_file_safe 解析） */
   filePath: string;
   mediaRefId?: string;
+  stagedAttachmentId?: string;
   /** 呈现形态：split=上对话下文件 / split-h=左对话右文件 / fullscreen=全屏浮层
    *  （只影响容器布局语义，布局本身由 SessionDetail 承担） */
   mode: PreviewMode;
@@ -111,6 +118,7 @@ export default function FilePreview({
   session,
   filePath,
   mediaRefId,
+  stagedAttachmentId,
   mode,
   onModeChange,
   onBack,
@@ -188,9 +196,11 @@ export default function FilePreview({
       firstSampleRef.current = first;
       setProgress({ loaded, total, rateBps: transferRateBps(first, { loaded, atMs }) });
     };
-    const read = mediaRefId
-      ? fetchDshMedia(session.dshInstanceId, session.id, mediaRefId, onProgress, ctrl.signal)
-      : fetchFile(session.id, filePath, onProgress, ctrl.signal, session.dshInstanceId);
+    const read = stagedAttachmentId
+      ? fetchStagedAttachmentPreview(session.id, stagedAttachmentId, onProgress, ctrl.signal)
+      : mediaRefId
+        ? fetchDshMedia(session.dshInstanceId, session.id, mediaRefId, onProgress, ctrl.signal)
+        : fetchFile(session.id, filePath, onProgress, ctrl.signal, session.dshInstanceId);
     read
       .then((p) => {
         if (!alive) {
@@ -214,7 +224,15 @@ export default function FilePreview({
       ctrl.abort();
       if (objectUrl) URL.revokeObjectURL(objectUrl);
     };
-  }, [session.id, session.dshInstanceId, filePath, mediaRefId, retryTick, refreshKey]);
+  }, [
+    session.id,
+    session.dshInstanceId,
+    filePath,
+    mediaRefId,
+    stagedAttachmentId,
+    retryTick,
+    refreshKey,
+  ]);
 
   // 路径末段作标题（分隔符双态：win 反斜杠 / unix 斜杠）
   const baseName = filePath.split(/[\\/]/).pop() || filePath;

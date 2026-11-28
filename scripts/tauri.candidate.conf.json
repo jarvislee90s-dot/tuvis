@@ -1,0 +1,7 @@
+{
+  "productName": "Tuvis Candidate",
+  "identifier": "com.jarvis.tuvis.candidate",
+  "bundle": {
+    "createUpdaterArtifacts": false
+  }
+}

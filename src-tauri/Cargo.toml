@@ -166,6 +166,7 @@ http = "1"
 libc = "0.2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
+png = "0.18.1"
 keyring = { version = "=3.6.3", default-features = false, features = ["apple-native"] }
 
 # Linux 用同步 Secret Service 后端：crypto-rust 为纯 Rust 加密，vendored 避免新增

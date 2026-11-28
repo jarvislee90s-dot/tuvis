@@ -2639,6 +2639,21 @@ impl DesktopIpcAdapter {
         &self,
         auto_adapt_explicit: Option<bool>,
     ) -> super::adapt_status::CodexAdaptStatus {
+        self.adapt_status_inner(auto_adapt_explicit, true).await
+    }
+
+    pub async fn adapt_status_cached(
+        &self,
+        auto_adapt_explicit: Option<bool>,
+    ) -> super::adapt_status::CodexAdaptStatus {
+        self.adapt_status_inner(auto_adapt_explicit, false).await
+    }
+
+    async fn adapt_status_inner(
+        &self,
+        auto_adapt_explicit: Option<bool>,
+        resolve_fingerprint: bool,
+    ) -> super::adapt_status::CodexAdaptStatus {
         use super::adapt_status::{
             AttemptableSet, CodexAdaptStatus, EvidencedSet, FailureObservation, SchemaEvidenceDto,
         };
@@ -2654,7 +2669,8 @@ impl DesktopIpcAdapter {
             self.last_resolved_evidence_opt() == Some(super::profile::EvidenceLevel::Shipped);
         let target = self.probe_target_snapshot();
         let probe_key = match &target {
-            Some(t) => Some(self.resolve_probe_key(t).await),
+            Some(t) if resolve_fingerprint => Some(self.resolve_probe_key(t).await),
+            Some(t) => t.key.clone(),
             None => None,
         };
         let ledger = self.probe_ledger();
@@ -2725,7 +2741,7 @@ impl DesktopIpcAdapter {
             } else {
                 Some(profile.build.clone())
             },
-            probe_key,
+            probe_key: probe_key.clone(),
             connection_epoch: self.inner.epoch.load(Ordering::SeqCst),
             attemptable: AttemptableSet {
                 send: caps.send && (gate_on || shipped),
@@ -2743,7 +2759,24 @@ impl DesktopIpcAdapter {
                 evidenced_at: at,
             }),
             last_failure,
-            probe_status: self.probe_status().await,
+            probe_status: if resolve_fingerprint {
+                self.probe_status().await
+            } else {
+                target
+                    .as_ref()
+                    .zip(probe_key.as_ref())
+                    .and_then(|(target, key)| {
+                        self.inner
+                            .probe_status_cache
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .value
+                            .as_ref()
+                            .filter(|(epoch, current, _)| *epoch == target.epoch && current == key)
+                            .map(|(_, _, status)| status.clone())
+                    })
+                    .unwrap_or_else(ProbeStatus::idle)
+            },
         }
     }
 
@@ -4883,6 +4916,68 @@ impl DesktopIpcAdapter {
             .into_iter()
             .map(|(operation, status)| (operation, status.support))
             .collect()
+    }
+
+    /// 只读诊断不建立连接、不生成投影事件、不写穿交互提示。
+    pub async fn desktop_observation(
+        &self,
+        key: Option<&ThreadKey>,
+    ) -> super::adapt_status::DesktopObservation {
+        let epoch = self.inner.epoch.load(Ordering::SeqCst);
+        let connected = self
+            .inner
+            .conn
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|conn| !conn.is_closed() && conn.epoch() == epoch);
+        let mirrors = self.inner.mirrors.lock().await;
+        let same_epoch = self.inner.epoch.load(Ordering::SeqCst) == epoch;
+        let connected = connected && same_epoch;
+        let mirror = key
+            .and_then(|key| mirrors.get(key))
+            .filter(|m| m.revision().is_some());
+        super::adapt_status::DesktopObservation {
+            endpoint: if connected {
+                "connected"
+            } else {
+                "ownership_unknown"
+            },
+            accessibility: super::adapt_status::accessibility_status(),
+            thread: match mirror {
+                Some(m) if connected && !m.is_stale() => "ipc_observed",
+                Some(_) => "stale",
+                None => "unknown",
+            },
+        }
+    }
+
+    pub fn diagnostic_operations(&self, key: Option<&ThreadKey>) -> EffectiveOperations {
+        let observed = key.and_then(|key| {
+            self.inner
+                .interaction_facts
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(key)
+                .filter(|facts| !facts.stale)
+                .map(|facts| {
+                    (
+                        facts.runtime_status.clone(),
+                        !facts.pending.is_empty(),
+                        facts.queue_paused,
+                    )
+                })
+        });
+        let (runtime, pending, paused) =
+            observed.unwrap_or_else(|| ("unknown".into(), false, false));
+        let mut operations = self.compute_operations(runtime, pending, paused);
+        if self.send_gate_static_cached().is_err() {
+            if let Some(send) = operations.operations.get_mut(&CodexOperation::Send) {
+                send.allowed = false;
+                send.reason_code = Some("capability_unverified".into());
+            }
+        }
+        operations
     }
 
     /// T02：逐操作有效集合（异步入口：先用已装载/持久证据，缺则只读识别一次）。

@@ -1073,6 +1073,14 @@ pub trait AgentAdapter: Send + Sync {
         Vec::new()
     }
 
+    /// 候选 `/file` 冲突证据：随同一次扫描返回展示层抑制前同 ID 冲突列表（无共享槽）。
+    fn find_sessions_with_conflicts(
+        &self,
+        processes: &[AgentProcess],
+    ) -> (Vec<Session>, Vec<String>) {
+        (self.find_sessions(processes), Vec::new())
+    }
+
     fn hook_supported(&self) -> bool {
         false
     }
@@ -2460,6 +2468,10 @@ mod candidate_whitelist_tests {
 pub(crate) struct WalkedScan {
     /// 已去重、宿主存活过滤后的会话集（遍历段终态，交提交段定型）
     pub(crate) sessions: Vec<Session>,
+    /// 去重与候选白名单过滤前的原始会话身份集（供候选 `/file` 冲突证据核验）
+    pub(crate) raw_sessions: Vec<Session>,
+    /// 被展示层抑制（如 CLI `cli_claimed_ids` 压掉 Desktop 同 ID）的冲突会话 ID
+    pub(crate) suppressed_conflict_ids: std::collections::HashSet<String>,
     /// 本轮有进程的工具 id（提交段记录 RUNNING_TOOLS 节奏信号用）
     pub(crate) running_tools: Vec<&'static str>,
     /// WorkBuddy 宿主哨兵判定（提交段并入在跑工具记录用）
@@ -2559,14 +2571,15 @@ pub(crate) fn get_all_sessions_walk() -> WalkedScan {
 
     // Phase 2: 解析会话（文件 I/O）
     let mut all_sessions: Vec<Session> = Vec::new();
+    let mut suppressed_conflict_ids = std::collections::HashSet::new();
     for (adapter, processes) in adapters.iter().zip(all_processes.iter()) {
         // L1 零进程零解析（会话扫描预算契约，见 AgentAdapter::find_sessions 文档与
         // monitor::session_scan）：无进程 = 无会话，跳过该工具全部文件 / DB 扫描。
         // 中心化守卫——新工具注册进 get_all_adapters() 即自动受保护
-        let sessions = if processes.is_empty() {
-            Vec::new()
+        let (sessions, conflicts) = if processes.is_empty() {
+            (Vec::new(), Vec::new())
         } else {
-            adapter.find_sessions(processes)
+            adapter.find_sessions_with_conflicts(processes)
         };
         // 每个 adapter 每轮一行，INFO 会按轮次无限刷屏（挂机档 30s/轮也照涨），降为 DEBUG；
         // 人工排障所需的跃迁信息仍由 scan_bus 的 `mode →` INFO 承担
@@ -2577,7 +2590,11 @@ pub(crate) fn get_all_sessions_walk() -> WalkedScan {
             sessions.len()
         );
         all_sessions.extend(sessions);
+        suppressed_conflict_ids.extend(conflicts);
     }
+
+    // 候选 `/file` 冲突证据：保留去重前的全量会话身份，避免同工具重复来源或跨工具同 ID 被提前折叠。
+    let raw_sessions = all_sessions.clone();
 
     // 会话级去重（见 dedup_sessions 注释）
     dedup_sessions(&mut all_sessions);
@@ -2620,6 +2637,8 @@ pub(crate) fn get_all_sessions_walk() -> WalkedScan {
         crate::monitor::workbuddy_parser::compensate_vanished_heartbeats_prepare();
     WalkedScan {
         sessions: all_sessions,
+        raw_sessions,
+        suppressed_conflict_ids,
         running_tools,
         workbuddy_host_alive,
         observations,
@@ -2635,6 +2654,8 @@ pub(crate) fn get_all_sessions_walk() -> WalkedScan {
 pub(crate) fn get_all_sessions_commit(walked: WalkedScan) -> SessionsResponse {
     let WalkedScan {
         sessions: mut all_sessions,
+        raw_sessions: _,
+        suppressed_conflict_ids: _,
         running_tools,
         workbuddy_host_alive,
         observations,

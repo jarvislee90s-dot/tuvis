@@ -5969,6 +5969,7 @@ dependencies = [
  "libc",
  "log",
  "once_cell",
+ "png 0.18.1",
  "rand 0.10.2",
  "reqwest 0.12.28",
  "rusqlite",

@@ -69,6 +69,35 @@ pub struct FailureObservation {
     pub next_retry_at: Option<i64>,
 }
 
+/// 显示事实，不授予任何操作资格。AX 授权不代表存在可定位的窗口或线程。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopObservation {
+    pub endpoint: &'static str,
+    pub accessibility: &'static str,
+    pub thread: &'static str,
+}
+
+pub(super) fn accessibility_status() -> &'static str {
+    #[cfg(target_os = "macos")]
+    {
+        #[link(name = "ApplicationServices", kind = "framework")]
+        extern "C" {
+            fn AXIsProcessTrusted() -> bool;
+        }
+        // SAFETY: 系统 API 无参数、无提示，仅查询当前进程的正常 AX 授权。
+        if unsafe { AXIsProcessTrusted() } {
+            "authorized"
+        } else {
+            "not_authorized"
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        "not_applicable"
+    }
+}
+
 /// T08：**移动端适配详情**（F08）——系统/Tuvis/Desktop 版本、逐能力状态、证据来源、
 /// 最近失败与首次提示。**不含**包路径、原始源码或任何正文（诊断最小面）。
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -76,6 +105,8 @@ pub struct FailureObservation {
 pub struct CodexAdaptDetails {
     /// 本机 Desktop 会话 id（授权校验后的回显）。
     pub session_id: String,
+    pub desktop_observation: DesktopObservation,
+    pub result_unknown: Option<bool>,
     /// 系统版本（OS + 版本；诊断用，不含机器名）。
     pub system_version: String,
     /// Tuvis 版本。

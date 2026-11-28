@@ -2156,6 +2156,30 @@ describe("CodexQueuePanel stop pause", () => {
     expect(screen.getByTestId("codex-queue-resume")).toBeTruthy();
   });
 
+  it("P1-LOCAL-QUEUE：断联模式仅保留编辑回草稿与撤回，不提供恢复派发、人工解除或插队", async () => {
+    installFetch();
+    const disconnectedView = queueView(
+      [action({ actionId: "q-local-1", state: "queued", position: 1 })],
+      "native_delivery_unknown",
+      ["act-unk"],
+      true,
+      true
+    );
+    routes.queue = [disconnectedView];
+    const onEditDraft = vi.fn();
+    await renderLoadedPanel(
+      <CodexQueuePanel sessionId="s1" onEditDraft={onEditDraft} disconnected />
+    );
+
+    expect(screen.getByTestId("codex-queue-row-q-local-1")).toBeTruthy();
+    expect(screen.getByTestId("codex-queue-edit-q-local-1")).toBeTruthy();
+    expect(screen.getByTestId("codex-queue-retract-q-local-1")).toBeTruthy();
+    expect(screen.getByTestId("codex-queue-local-paused")).toBeTruthy();
+    expect(screen.queryByTestId("codex-queue-resume")).toBeNull();
+    expect(screen.queryByTestId("codex-queue-force-continue")).toBeNull();
+    expect(screen.queryByTestId("codex-queue-prioritize-q-local-1")).toBeNull();
+  });
+
   // 线程级暂停只存在于本设备 actions=[] 时，空队列自隐不得吞掉唯一的人工出口。
   it.each([
     { name: "no barrier code", blockedReasonCode: null },
@@ -2191,5 +2215,47 @@ describe("CodexQueuePanel stop pause", () => {
 
     expect(screen.queryByTestId("codex-queue-panel")).toBeNull();
     expect(screen.queryByTestId("codex-queue-resume")).toBeNull();
+  });
+
+  it("stops batch force-continue immediately when disconnected flips true mid-loop", async () => {
+    installFetch();
+    routes.queue = [
+      queueView([], "native_delivery_unknown", ["b1", "b2"], false, false),
+      queueView([], "native_delivery_unknown", ["b2"], false, false),
+    ];
+    let resolveFirst!: (res: Response) => void;
+    const forceCalls: string[] = [];
+    const baseFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url === "/m/api/v1/codex/queue/force-continue") {
+        forceCalls.push(String(init?.body ?? ""));
+        if (forceCalls.length === 1) {
+          return new Promise<Response>((resolve) => {
+            resolveFirst = resolve;
+          });
+        }
+      }
+      return baseFetch(input, init);
+    }) as typeof fetch;
+
+    const { rerender } = render(<CodexQueuePanel sessionId="s1" />);
+    await screen.findByTestId("codex-queue-force-continue");
+    fireEvent.click(screen.getByTestId("codex-queue-force-continue"));
+    fireEvent.click(screen.getByTestId("codex-queue-force-yes"));
+    await waitFor(() => expect(forceCalls).toHaveLength(1));
+
+    rerender(<CodexQueuePanel sessionId="s1" disconnected />);
+    await act(async () => {
+      resolveFirst(
+        new Response(
+          JSON.stringify({ actionId: "b1", state: "accepted", position: null, receipt: null }),
+          { status: 200, headers: { "Content-Type": "application/json" } }
+        )
+      );
+    });
+    await act(async () => {});
+
+    expect(forceCalls).toHaveLength(1);
   });
 });

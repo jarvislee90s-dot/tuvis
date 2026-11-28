@@ -286,27 +286,44 @@ fn codex_host_process(app_processes: &[AgentProcess]) -> Option<&AgentProcess> {
 /// (mtime,size) 摘要缓存（纯内容 digest）；24h 新鲜窗口 + 活跃进程匹配失败回退全量。
 /// SQLite 路线查询即过滤，仅受 L1 约束。
 pub fn get_codex_sessions(processes: &[AgentProcess]) -> Vec<Session> {
+    get_codex_sessions_with_conflicts(processes).0
+}
+
+/// 同 [`get_codex_sessions`]，同时返回本轮被 `cli_claimed_ids` 抑制的 Desktop 同 ID 列表
+///（随同一次调用作为局部返回值返回，不经进程级共享槽）。
+pub fn get_codex_sessions_with_conflicts(
+    processes: &[AgentProcess],
+) -> (Vec<Session>, Vec<String>) {
     let sessions_dir = dirs::home_dir()
         .map(|h| h.join(".codex").join("sessions"))
         .unwrap_or_default();
-    scan_codex_sessions(&sessions_dir, processes, SystemTime::now())
+    scan_codex_sessions_with_conflicts(&sessions_dir, processes, SystemTime::now())
 }
 
-/// 可注入核心（目录 / 时钟；测试驱动 L3 窗口与回退路径，不触真实 ~/.codex）
+#[cfg(test)]
 fn scan_codex_sessions(
     sessions_dir: &Path,
     processes: &[AgentProcess],
     now: SystemTime,
 ) -> Vec<Session> {
+    scan_codex_sessions_with_conflicts(sessions_dir, processes, now).0
+}
+
+/// 可注入核心（目录 / 时钟；测试驱动 L3 窗口与回退路径，不触真实 ~/.codex）
+fn scan_codex_sessions_with_conflicts(
+    sessions_dir: &Path,
+    processes: &[AgentProcess],
+    now: SystemTime,
+) -> (Vec<Session>, Vec<String>) {
     let mut sessions = Vec::new();
     // L1 纵深防御：零进程零解析（编排层已统一短路，直调/测试路径同样不扫）
     if processes.is_empty() {
         info!("Codex: 0 sessions from 0 processes");
-        return sessions;
+        return (sessions, Vec::new());
     }
 
     if !sessions_dir.exists() {
-        return sessions;
+        return (sessions, Vec::new());
     }
 
     // 全量收集（mtime 倒序）；mtimes 同时供 Phase 1 年龄现算与 Phase 2 新鲜过滤复用
@@ -370,6 +387,7 @@ fn scan_codex_sessions(
         .collect();
     // review F2：宿主判定口径与 monitor::host::is_host_process 一致
     // （ChatGPT 主进程/chatgpt.exe 才算宿主；CLI 同名 exe、内嵌框架进程不算）
+    let mut suppressed_conflicts = Vec::new();
     if let Some(host) = codex_host_process(&app_processes) {
         // CLI 认领（Phase 1 已占用的文件）对应的会话 id——同一会话不得重复出 APP 卡
         let cli_claimed_ids: HashSet<String> = matched_file_indices
@@ -390,12 +408,14 @@ fn scan_codex_sessions(
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
-        sessions.extend(super::codex_thread_parser::build_sessions(
+        let (app_sessions, conflicts) = super::codex_thread_parser::build_sessions_with_conflicts(
             &roots,
             host,
             now_s,
             &cli_claimed_ids,
-        ));
+        );
+        suppressed_conflicts = conflicts;
+        sessions.extend(app_sessions);
     }
 
     // L2 缓存收敛：清掉已消失文件的孤儿条目
@@ -407,7 +427,7 @@ fn scan_codex_sessions(
         sessions.len(),
         processes.len()
     );
-    sessions
+    (sessions, suppressed_conflicts)
 }
 
 /// Phase 1 匹配一轮：返回「有合法 cwd 但仍未匹配」的进程数（>0 时调用方决定回退）
@@ -1797,5 +1817,218 @@ mod report_flag_tests {
             "非绿会话不触发锚收集（预算闸）"
         );
         crate::monitor::subagents::reset_cache_for_tests();
+    }
+
+    #[derive(Clone, Copy)]
+    enum InterleaveOrder {
+        /// 窃取：轮1产出 → 轮2产出 → 轮1取证 → 轮2取证
+        Steal,
+        /// 覆盖：轮1产出 → 轮2产出 → 轮2取证 → 轮1取证
+        Overwrite,
+    }
+
+    fn setup_conflict_fixture(
+        root: &Path,
+        conflict_id: &str,
+        desktop_only_id: &str,
+        now_s: i64,
+    ) -> (PathBuf, Vec<AgentProcess>) {
+        let sessions_dir = root.join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let proj = root.join(format!("proj-{conflict_id}"));
+        std::fs::create_dir_all(&proj).unwrap();
+        let rollout = sessions_dir.join(format!("rollout-{conflict_id}.jsonl"));
+        let meta_line = serde_json::json!({
+            "type": "session_meta",
+            "payload": {
+                "id": conflict_id,
+                "cwd": proj,
+            }
+        })
+        .to_string();
+        std::fs::write(&rollout, format!("{meta_line}\n")).unwrap();
+
+        let conn = rusqlite::Connection::open(root.join("state_5.sqlite")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE threads (
+                id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL DEFAULT '',
+                created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+                source TEXT NOT NULL DEFAULT 'app', model_provider TEXT NOT NULL DEFAULT '',
+                cwd TEXT NOT NULL, title TEXT NOT NULL DEFAULT '',
+                sandbox_policy TEXT NOT NULL DEFAULT '', approval_mode TEXT NOT NULL DEFAULT '',
+                tokens_used INTEGER NOT NULL DEFAULT 0, has_user_event INTEGER NOT NULL DEFAULT 0,
+                archived INTEGER NOT NULL DEFAULT 0, archived_at INTEGER,
+                git_sha TEXT, git_branch TEXT, git_origin_url TEXT,
+                cli_version TEXT NOT NULL DEFAULT '', first_user_message TEXT,
+                agent_nickname TEXT, agent_role TEXT, memory_mode TEXT NOT NULL DEFAULT 'enabled'
+            );",
+        )
+        .unwrap();
+        for id in [conflict_id, desktop_only_id] {
+            conn.execute(
+                "INSERT INTO threads (id, rollout_path, created_at, updated_at, source, cwd, title, archived)
+                 VALUES (?1, '', ?2, ?3, 'app', ?4, ?1, 0)",
+                rusqlite::params![id, now_s - 10, now_s - 5, proj.to_str().unwrap()],
+            )
+            .unwrap();
+        }
+        drop(conn);
+
+        let procs = vec![
+            AgentProcess {
+                pid: 101,
+                cpu_usage: 0.0,
+                cwd: Some(proj),
+                exe: None,
+                form: ProcessForm::Cli,
+            },
+            AgentProcess {
+                pid: 102,
+                cpu_usage: 0.0,
+                cwd: None,
+                exe: Some("/Applications/ChatGPT.app/Contents/MacOS/ChatGPT".into()),
+                form: ProcessForm::App,
+            },
+        ];
+        (sessions_dir, procs)
+    }
+
+    fn run_deterministic_interleaved_scans<F, C>(order: InterleaveOrder, scan_and_prepare: F)
+    where
+        F: Fn(&Path, &[AgentProcess], SystemTime) -> (Vec<Session>, C) + Sync,
+        C: FnOnce() -> Vec<String> + Send,
+    {
+        let tmp_a = tempfile::tempdir().unwrap();
+        let tmp_b = tempfile::tempdir().unwrap();
+        let now = SystemTime::now();
+        let now_s = now.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+        let (sessions_a, procs_a) =
+            setup_conflict_fixture(tmp_a.path(), "shared-id-a", "desktop-only-a", now_s);
+        let (sessions_b, procs_b) =
+            setup_conflict_fixture(tmp_b.path(), "shared-id-b", "desktop-only-b", now_s);
+
+        // 确定性同步点（产出与取证边界）：0=初始，1=轮1已产出，2=轮2已产出，3=先取者已取走
+        let phase = std::sync::Arc::new((std::sync::Mutex::new(0u8), std::sync::Condvar::new()));
+        let wait_phase = |target: u8| {
+            let (lock, cv) = &*phase;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let mut g = lock.lock().unwrap();
+            while *g < target {
+                let now = std::time::Instant::now();
+                if now >= deadline {
+                    panic!(
+                        "等待并发扫描同步阶段 {target} 超时（当前阶段 {}，可能工作线程已 panic）",
+                        *g
+                    );
+                }
+                let (next_g, timeout_res) = cv.wait_timeout(g, deadline - now).unwrap();
+                g = next_g;
+                if timeout_res.timed_out() && *g < target {
+                    panic!(
+                        "等待并发扫描同步阶段 {target} 超时（当前阶段 {}，可能工作线程已 panic）",
+                        *g
+                    );
+                }
+            }
+        };
+        let set_phase = |next: u8| {
+            let (lock, cv) = &*phase;
+            let mut g = lock.lock().unwrap();
+            *g = next;
+            cv.notify_all();
+        };
+
+        let ((sess_a, conf_a), (sess_b, conf_b)) = std::thread::scope(|s| {
+            let h1 = s.spawn(|| {
+                let (sessions, consume_conflicts) = scan_and_prepare(&sessions_a, &procs_a, now);
+                set_phase(1);
+                match order {
+                    InterleaveOrder::Steal => {
+                        wait_phase(2);
+                        let conflicts = consume_conflicts();
+                        set_phase(3);
+                        (sessions, conflicts)
+                    }
+                    InterleaveOrder::Overwrite => {
+                        wait_phase(3);
+                        let conflicts = consume_conflicts();
+                        (sessions, conflicts)
+                    }
+                }
+            });
+            let h2 = s.spawn(|| {
+                wait_phase(1);
+                let (sessions, consume_conflicts) = scan_and_prepare(&sessions_b, &procs_b, now);
+                set_phase(2);
+                match order {
+                    InterleaveOrder::Steal => {
+                        wait_phase(3);
+                        let conflicts = consume_conflicts();
+                        (sessions, conflicts)
+                    }
+                    InterleaveOrder::Overwrite => {
+                        let conflicts = consume_conflicts();
+                        set_phase(3);
+                        (sessions, conflicts)
+                    }
+                }
+            });
+            (h1.join().unwrap(), h2.join().unwrap())
+        });
+
+        let normalize_sessions = |sessions: &[Session]| -> Vec<(String, u8)> {
+            let mut out: Vec<(String, u8)> = sessions
+                .iter()
+                .map(|s| {
+                    let form_rank = match s.form {
+                        ProcessForm::Cli => 0,
+                        ProcessForm::App => 1,
+                    };
+                    (s.id.clone(), form_rank)
+                })
+                .collect();
+            out.sort();
+            out
+        };
+        let mut expected_a = vec![
+            ("desktop-only-a".to_string(), 1u8),
+            ("shared-id-a".to_string(), 0u8),
+        ];
+        expected_a.sort();
+        let mut expected_b = vec![
+            ("desktop-only-b".to_string(), 1u8),
+            ("shared-id-b".to_string(), 0u8),
+        ];
+        expected_b.sort();
+        assert_eq!(
+            normalize_sessions(&sess_a),
+            expected_a,
+            "轮1会话集合 (id, form) 必须精确匹配"
+        );
+        assert_eq!(
+            normalize_sessions(&sess_b),
+            expected_b,
+            "轮2会话集合 (id, form) 必须精确匹配"
+        );
+        assert_eq!(conf_a, vec!["shared-id-a".to_string()], "轮1冲突归属错乱");
+        assert_eq!(conf_b, vec!["shared-id-b".to_string()], "轮2冲突归属错乱");
+    }
+
+    #[test]
+    fn concurrent_codex_scans_steal_order_preserves_conflicts() {
+        let local_return_scan = |dir: &Path, procs: &[AgentProcess], now: SystemTime| {
+            let (sessions, conflicts) = scan_codex_sessions_with_conflicts(dir, procs, now);
+            (sessions, move || conflicts)
+        };
+        run_deterministic_interleaved_scans(InterleaveOrder::Steal, local_return_scan);
+    }
+
+    #[test]
+    fn concurrent_codex_scans_overwrite_order_preserves_conflicts() {
+        let local_return_scan = |dir: &Path, procs: &[AgentProcess], now: SystemTime| {
+            let (sessions, conflicts) = scan_codex_sessions_with_conflicts(dir, procs, now);
+            (sessions, move || conflicts)
+        };
+        run_deterministic_interleaved_scans(InterleaveOrder::Overwrite, local_return_scan);
     }
 }

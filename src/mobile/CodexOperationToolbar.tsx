@@ -63,6 +63,9 @@ export interface CodexOperationToolbarProps {
   /** C03：沿用的展示身份**尚未通过本代际内容 SHA 核验**（「待核对」）。与
    *  「连接恢复中」并列如实显示，不改变芯片判定与任何资格。 */
   identityPending?: boolean;
+  /** P1-DIAG：当前镜像已过期/断联。过期镜像且非同身份重连窗时，不把
+   *  `allowed=false` 的静态/历史支持操作列为「可用操作」。 */
+  stale?: boolean;
 }
 
 export default function CodexOperationToolbar({
@@ -70,6 +73,7 @@ export default function CodexOperationToolbar({
   onOpenDetails,
   reconnecting,
   identityPending,
+  stale,
 }: CodexOperationToolbarProps) {
   const { supported, known } = useMemo(() => {
     if (!operations) return { supported: [], known: false };
@@ -77,13 +81,21 @@ export default function CodexOperationToolbar({
       CodexOperation,
       NonNullable<CodexEffectiveOperations["operations"][CodexOperation]>,
     ][];
+    const hideDisallowed = stale === true && !reconnecting;
     return {
-      // T03：芯片 = 已实现**且已支持**的操作（稳定位置）；`allowed` 只决定是否
-      // 在详情中解释当前原因，主行不重复铺开。
-      supported: entries.filter(([, status]) => supportOf(status) === "supported"),
+      // T03：正常连接或同身份重连窗内按支持态保持芯片稳定；
+      // P1-DIAG：过期镜像（非重连沿用）或未过审能力门（capability_unverified）
+      // 均不是当前可执行，不与适配详情「不可用」自相矛盾。
+      supported: entries.filter(([, status]) => {
+        if (supportOf(status) !== "supported") return false;
+        if (hideDisallowed || (!status.allowed && status.reasonCode === "capability_unverified")) {
+          return false;
+        }
+        return true;
+      }),
       known: true,
     };
-  }, [operations]);
+  }, [operations, reconnecting, stale]);
 
   return (
     <div data-testid="codex-ops-row" className="flex min-w-0 items-center gap-2 text-xs">
@@ -91,7 +103,9 @@ export default function CodexOperationToolbar({
         data-testid="codex-ops-chips"
         className="flex min-w-0 flex-1 items-center gap-2 overflow-x-auto whitespace-nowrap"
       >
-        <span className="shrink-0 text-[var(--mut)]">{i18n.t("mobile.codex.ops.row")}</span>
+        <span className="shrink-0 text-[var(--mut)]">
+          {reconnecting ? i18n.t("mobile.codex.ops.rowHistorical") : i18n.t("mobile.codex.ops.row")}
+        </span>
         {!known ? (
           <span className="shrink-0 text-[var(--mut)]">{i18n.t("mobile.codex.async.unknown")}</span>
         ) : (

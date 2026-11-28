@@ -73,6 +73,9 @@ pub(crate) fn route_to_str(r: ControlRoute) -> &'static str {
     match r {
         ControlRoute::DesktopIpc => "desktop_ipc",
         ControlRoute::HeadlessCompat => "headless_compat",
+        // 独立取值：AX 动作不得在库里冒充 IPC，否则按 route 判 IPC 的去重、
+        // 屏障与完成证据逻辑会误以为拿到了 App 回执。
+        ControlRoute::DesktopAx => "desktop_ax",
         ControlRoute::None => "none",
     }
 }
@@ -81,6 +84,7 @@ fn route_from_str(s: &str) -> Option<ControlRoute> {
     match s {
         "desktop_ipc" => Some(ControlRoute::DesktopIpc),
         "headless_compat" => Some(ControlRoute::HeadlessCompat),
+        "desktop_ax" => Some(ControlRoute::DesktopAx),
         "none" => Some(ControlRoute::None),
         _ => None,
     }
@@ -454,9 +458,8 @@ fn recover_one_conn(conn: &Connection, action_id: &str, now_ms: i64) -> rusqlite
     // 重启恢复不得 out0→1）。
     let sql = format!(
         "UPDATE codex_actions SET state = 'unknown', receipt_json = ?2, updated_at = ?3,
- compat_outstanding = CASE WHEN route = 'desktop_ipc'
- AND kind IN ('send', 'async_question') AND {eligible}
- AND NOT {p}
+ compat_outstanding = CASE WHEN (route = 'desktop_ipc' AND kind IN ('send', 'async_question') AND {eligible}
+ OR route = 'desktop_ax' AND kind = 'send') AND NOT {p}
  THEN 1 ELSE compat_outstanding END,
  compat_turn_id = CASE WHEN route = 'desktop_ipc'
  AND kind IN ('send', 'async_question') AND {eligible}
@@ -512,6 +515,93 @@ pub(crate) fn reserve_conn(
     )?;
     tx.commit()?;
     Ok(true)
+}
+
+/// **登记 + 立即冻结通道**（单事务）。
+///
+/// # 为什么必须是一个事务
+///
+/// `register` 之后若进程在 `reserve` 之前死掉，会留下 `state='queued'` 且
+/// `route='none'` 的行。`queued` 在语义上等于「**零副作用、可安全重来**」——
+/// 但对 AX 通道而言这是假的：调用方是"确定要发"才登记的，留下 queued 行会让
+/// 重启后的清理逻辑把它当没发生，而手机端可能已经收到"处理中"。
+///
+/// 本函数把两步合成一次提交：要么都成（reserved + 通道已冻结），要么都不成
+/// （无行）。语义上等价于「登记即进入写路径」。
+#[allow(clippy::too_many_arguments)] // 参数与 insert_action_conn_signed 一一对应；少传一个就会静默用默认值
+pub(crate) fn insert_reserved_conn_signed(
+    conn: &Connection,
+    action_id: &str,
+    device_id: &str,
+    device_name: &str,
+    thread_id: &str,
+    kind: &str,
+    request_key: Option<&str>,
+    context_token: Option<&str>,
+    payload_hash: &str,
+    raw_text: Option<&str>,
+    signature_applied: Option<bool>,
+    client_message_id: &str,
+    route: ControlRoute,
+    now_ms: i64,
+) -> rusqlite::Result<Option<ActionRow>> {
+    let tx = conn.unchecked_transaction()?;
+    // 已存在 → 不覆盖（调用方按 Duplicate 处理）。
+    if get_row(&tx, action_id)?.is_some() {
+        return Ok(None);
+    }
+    if route == ControlRoute::DesktopAx
+        && tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM codex_actions WHERE thread_id = ?1 \
+             AND (state = 'reserved' OR (compat_outstanding = 1 AND barrier_force_released_at IS NULL)))",
+            [thread_id],
+            |row| row.get::<_, bool>(0),
+        )?
+    {
+        return Ok(None);
+    }
+    insert_action_conn_signed(
+        &tx,
+        action_id,
+        device_id,
+        device_name,
+        thread_id,
+        kind,
+        request_key,
+        context_token,
+        payload_hash,
+        raw_text,
+        signature_applied,
+        client_message_id,
+        now_ms,
+    )?;
+    let n = tx.execute(
+        "UPDATE codex_actions SET state = 'reserved', route = ?2, queued_text = NULL, \
+ updated_at = ?3, compat_outstanding = CASE WHEN ?2 = 'desktop_ax' THEN 1 ELSE compat_outstanding END \
+ WHERE action_id = ?1 AND state = 'queued'",
+        params![action_id, route_to_str(route), now_ms],
+    )?;
+    if n == 0 {
+        // 刚插入却 CAS 不到，只可能是并发删/改 —— 回滚，不留半截行。
+        return Ok(None);
+    }
+    let Some(row) = get_row(&tx, action_id)? else {
+        return Ok(None);
+    };
+    super::write_audit::record_conn_checked(
+        &tx,
+        now_ms,
+        &row.device_id,
+        &row.device_name,
+        "codex",
+        &row.thread_id,
+        "codex_desktop_ipc",
+        audit_action_of(&row.kind),
+        &audit_summary(&row),
+        "reserved",
+    )?;
+    tx.commit()?;
+    Ok(Some(row))
 }
 
 /// 异步答题的 reserve 胜者同事务冻结路径、效果归属与起始审计；重放不能改写。
@@ -1039,8 +1129,10 @@ pub(crate) fn finish_conn(
     let receipt_json = serde_json::to_string(receipt)
         .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
     let state = state_to_str(delivery_to_state(receipt.delivery));
-    if receipt.delivery == Delivery::NotSent {
-        // 明确零投递：无 Turn 产生，fence 与落账同事务清除
+    if receipt.delivery == Delivery::NotSent
+        || (row.route == ControlRoute::DesktopAx && receipt.delivery == Delivery::Accepted)
+    {
+        // AX 确认送达使用只读归因，不接 IPC Turn 栅栏。
         conn.execute(
             "UPDATE codex_actions SET state = ?2, receipt_json = ?3, updated_at = ?4, \
  compat_outstanding = 0, compat_message_id = NULL, compat_turn_id = NULL, \
@@ -2253,8 +2345,12 @@ pub(crate) fn claim_write_right_conn(
     now_ms: i64,
 ) -> rusqlite::Result<bool> {
     let n = conn.execute(
-        "INSERT INTO codex_write_revoke (action_id, claimed_at) VALUES (?1, ?2) \
- ON CONFLICT(action_id) DO UPDATE SET claimed_at = excluded.claimed_at \
+        "INSERT INTO codex_write_revoke (action_id, claimed_at) \
+ SELECT ?1, ?2 WHERE NOT EXISTS (\
+   SELECT 1 FROM codex_actions AS own JOIN codex_actions AS ax ON ax.thread_id = own.thread_id \
+   WHERE own.action_id = ?1 AND ax.action_id <> own.action_id AND ax.route = 'desktop_ax' \
+   AND ax.compat_outstanding = 1 AND ax.barrier_force_released_at IS NULL\
+ ) ON CONFLICT(action_id) DO UPDATE SET claimed_at = excluded.claimed_at \
  WHERE revoked_at IS NULL",
         params![action_id, now_ms],
     )?;
