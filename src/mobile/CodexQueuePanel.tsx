@@ -309,11 +309,22 @@ export default function CodexQueuePanel({
   onQueueStateChanged,
   turnControl,
   onEditDraft,
+  draftRevision,
   keepEditDraftOnUnmount = false,
+  disconnected = false,
 }: {
-  onEditDraft?: (draft: { sessionId: string; actionId: string; text: string }) => void;
+  onEditDraft?: (draft: {
+    sessionId: string;
+    actionId: string;
+    text: string;
+    sourceDraftRevision?: number;
+  }) => void;
+  draftRevision?: number;
   /** 由按会话持有草稿的父组件接收已成功取回的正文。 */
   keepEditDraftOnUnmount?: boolean;
+  /** P1-LOCAL-QUEUE：桌面端未连接/无活投影时，仅允许查看、转草稿与撤回未派发项，
+   *  不提供恢复派发、人工强行继续或插队。 */
+  disconnected?: boolean;
   sessionId: string;
   /** R11：外部刷新信号（单调递增 tick）。每次递增 → 去抖重拉一次队列视图；
    *  触发源：a) 投影跃迁（SessionDetail）；b) 发送入队回执（MessageComposer）。
@@ -345,6 +356,17 @@ export default function CodexQueuePanel({
   const [resumeBusy, setResumeBusy] = useState(false);
   /** T06：优先处理的确认臂（哪个 queued 行处于确认态；未确认不发任何请求） */
   const [prioritizeArmedId, setPrioritizeArmedId] = useState<string | null>(null);
+  /* eslint-disable react-hooks/refs -- 断联必须当帧生效：队列 tick 在断联瞬间
+     到达时会读它决定是否继续轮询/发起操作。 */
+  const disconnectedRef = useRef(disconnected);
+  disconnectedRef.current = disconnected;
+  /* eslint-enable react-hooks/refs */
+  useEffect(() => {
+    if (disconnected) {
+      setPrioritizeArmedId(null);
+      setForceArmed(false);
+    }
+  }, [disconnected]);
   /** 每次挂载默认展开。收起只隐藏界面，刷新和空队列自隐都保留用户选择，
    *  确认状态、在途操作和提示也继续保存在组件中。 */
   const [expanded, setExpanded] = useState(true);
@@ -481,13 +503,22 @@ export default function CodexQueuePanel({
   const edit = async (actionId: string) => {
     if (operationBusy) return;
     const sid = sessionId;
+    const capturedDraftRevision = draftRevision;
     stopQueueObservation();
     setBusyId(actionId);
     setNote(null);
     try {
       const result = await editCodexQueueMessage(sid, actionId);
+      if (result.actionId !== actionId) return;
       if (sessionRef.current !== sid && !keepEditDraftOnUnmount) return;
-      onEditDraft?.({ sessionId: sid, ...result });
+      onEditDraft?.({
+        sessionId: sid,
+        actionId: result.actionId,
+        text: result.text,
+        ...(capturedDraftRevision !== undefined
+          ? { sourceDraftRevision: capturedDraftRevision }
+          : {}),
+      });
     } catch (e) {
       if (sessionRef.current !== sid) return;
       setNote(
@@ -537,7 +568,8 @@ export default function CodexQueuePanel({
   // （2026-10-19 复审 Minor：一败全停修复）；仅真失败（网络/5xx/403 等）→
   // 显示错误不静默（已成功的保留——重拉以服务端账本为权威）。
   const forceContinue = useCallback(async () => {
-    if (operationBusy) return;
+    if (disconnectedRef.current || disconnected || operationBusy) return;
+    const sid = sessionId;
     const ids = view?.blockedActionIds ?? [];
     setForceArmed(false);
     if (ids.length === 0) return;
@@ -546,25 +578,31 @@ export default function CodexQueuePanel({
     setNote(null);
     try {
       for (const id of ids) {
+        if (disconnectedRef.current || sessionRef.current !== sid) break;
         try {
           await forceContinueCodexAction(id);
         } catch (e) {
           if (!isPerIdSettledRefusal(e)) throw e; // 真失败：中断，剩余未解除
         }
+        if (disconnectedRef.current || sessionRef.current !== sid) break;
       }
     } catch (e) {
-      const message = e instanceof ApiError ? apiErrorReason(e) : String(e);
-      setNote(i18n.t("mobile.codex.queue.forceContinueFailed", { message }));
+      if (sessionRef.current === sid) {
+        const message = e instanceof ApiError ? apiErrorReason(e) : String(e);
+        setNote(i18n.t("mobile.codex.queue.forceContinueFailed", { message }));
+      }
     } finally {
-      setForceBusy(false);
-      await load();
+      if (sessionRef.current === sid) {
+        setForceBusy(false);
+        await load();
+      }
     }
-  }, [operationBusy, view, load, stopQueueObservation]);
+  }, [disconnected, operationBusy, sessionId, view, load, stopQueueObservation]);
 
   // S5：恢复被打断暂停的队列（唯一解除出口；幂等——未暂停同样 200 paused:false）。
   // 成功/失败都重拉：暂停态以服务端为唯一权威。
   const resumeQueue = useCallback(async () => {
-    if (operationBusy) return;
+    if (disconnectedRef.current || disconnected || operationBusy) return;
     stopQueueObservation();
     setResumeBusy(true);
     setNote(null);
@@ -579,7 +617,7 @@ export default function CodexQueuePanel({
       // F8：暂停解除 → 同页 composer 的 send-info（queuePaused）已过期，通知重拉
       onQueueStateChanged?.();
     }
-  }, [operationBusy, sessionId, load, onQueueStateChanged, stopQueueObservation]);
+  }, [disconnected, operationBusy, sessionId, load, onQueueStateChanged, stopQueueObservation]);
 
   const observeQueue = useCallback(
     (isCurrent: () => boolean) => {
@@ -614,7 +652,7 @@ export default function CodexQueuePanel({
   // 的行；本入口只对单条显式触发，不提供/不暗示 FIFO 拖动排序。
   const prioritize = useCallback(
     async (actionId: string) => {
-      if (operationBusy) return;
+      if (disconnectedRef.current || disconnected || operationBusy) return;
       const armedId = prioritizeArmedId;
       setPrioritizeArmedId(null);
       if (armedId !== actionId) return; // 确认臂与执行按钮必须同一条
@@ -711,6 +749,7 @@ export default function CodexQueuePanel({
         if (note === null) prioritySnapshotRef.current = null;
         // 自动 FIFO 可在插队被拒或派发结果未知后接手。短窗只观察队列，仍可见后续回队。
         if (
+          !disconnectedRef.current &&
           matches &&
           ((queuedRefusal &&
             ["busy_before_write", "barrier_outstanding", "dispatch_in_flight"].includes(
@@ -740,6 +779,7 @@ export default function CodexQueuePanel({
       if (note !== null) setNote(note);
     },
     [
+      disconnected,
       operationBusy,
       prioritizeArmedId,
       turnControl,
@@ -886,7 +926,7 @@ export default function CodexQueuePanel({
                       : "mobile.codex.queue.pausedNote"
                   )}
                 </p>
-                {(!stopPauseAutoResumes || manualStopPauseRecovery) && (
+                {!disconnected && (!stopPauseAutoResumes || manualStopPauseRecovery) && (
                   <button
                     type="button"
                     data-testid="codex-queue-resume"
@@ -901,10 +941,18 @@ export default function CodexQueuePanel({
                 )}
               </div>
             )}
+          {disconnected && view.actions.some((a) => a.state === "queued") && (
+            <p
+              data-testid="codex-queue-local-paused"
+              className="mt-1 text-xs text-amber-700 dark:text-amber-400"
+            >
+              {i18n.t("mobile.codex.queue.localPausedDisconnected")}
+            </p>
+          )}
           {/* 人工解除（无出口屏障复审 Important）：两步确认——未确认不发任何请求；
           文案如实说明风险（消息可能实际已投出，继续后续消息可能造成重复内容）。
           人工解除是显式覆盖，「无自动恢复路径」的说明语义不变。 */}
-          {canForceContinue && !forceArmed && (
+          {!disconnected && canForceContinue && !forceArmed && (
             <button
               type="button"
               data-testid="codex-queue-force-continue"
@@ -918,7 +966,7 @@ export default function CodexQueuePanel({
               {i18n.t("mobile.codex.queue.forceContinue")}
             </button>
           )}
-          {canForceContinue && forceArmed && (
+          {!disconnected && canForceContinue && forceArmed && (
             <span
               data-testid="codex-queue-force-confirm"
               className="mt-1 flex w-full flex-wrap items-center gap-2 rounded-lg bg-amber-500/10 px-2 py-1 text-[11px] text-amber-700 dark:text-amber-300"
@@ -991,7 +1039,7 @@ export default function CodexQueuePanel({
                 暂停空闲仅确认本条越队；共享停止入口在飞时同样锁住）。这不是
                 FIFO 拖动排序：只对单条显式触发，越队授权由服务端按原 action
                 一次性发放，其余行位次原样。 */}
-                {a.state === "queued" && (
+                {!disconnected && a.state === "queued" && (
                   <button
                     type="button"
                     data-testid={`codex-queue-prioritize-${a.actionId}`}
@@ -1038,6 +1086,7 @@ export default function CodexQueuePanel({
           {/* T06：优先处理确认臂（两步确认；文案按运行态分流——运行中披露停止风险，
           暂停空闲只确认越队；未确认不发任何请求） */}
           {(() => {
+            if (disconnected) return null;
             const armedRow = prioritizeArmedId
               ? view.actions.find((a) => a.actionId === prioritizeArmedId && a.state === "queued")
               : null;

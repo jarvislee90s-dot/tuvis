@@ -321,6 +321,16 @@ pub struct MessagesPage {
     /// `last_used`——不把历史或目录默认冒充当前选择。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dsh_model_summary: Option<DshModelSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_saved_source: Option<CodexSavedSource>,
+}
+
+/// 由实际产出 Codex 消息页的解析分支填写，不反映前端请求偏好。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodexSavedSource {
+    Rollout,
+    ThreadHistory,
 }
 
 /// N06：控制台按钮旁展示的只读模型/思考强度摘要。
@@ -424,6 +434,8 @@ pub(crate) fn read_session_messages_impl(
         "zcode" => read_zcode_messages_with(home, session_id, limit),
         "dsh" => read_dsh_messages_with(home, dsh_env_home, session_id, limit, skip),
         "claude" => read_claude_messages_with(home, session_id, limit),
+        // CLI 基线（Task 4B）：rollout 成功即用 rollout，仅未命中才回退 SQLite——
+        // 与 P1 之前的成功路径逐字同义，不因共享读取器改选来源。
         "codex" => read_codex_messages_with(home, session_id, limit),
         "kimi" => read_kimi_messages_with(home, kimi_env_home, session_id, limit),
         "workbuddy" => read_workbuddy_messages_with(home, session_id, limit),
@@ -431,6 +443,30 @@ pub(crate) fn read_session_messages_impl(
         "openclaw" => read_openclaw_messages_with(home, session_id, limit),
         _ => Err(format!("CONTENT_UNKNOWN_TOOL: 未知工具: {agent_type}")),
     }
+}
+
+/// 显式声明形态的读链（候选/App 分支用）：`app_form = true` 时对 Codex 使用
+/// App 专用选择（元数据空壳回退、可对位投影替换）；`false` 与 [`read_session_messages_with`]
+/// 逐字一致（CLI 基线）。其它工具忽略该标志。
+pub(crate) fn read_session_messages_with_form(
+    home: &Path,
+    agent_type: &str,
+    session_id: &str,
+    limit: usize,
+    app_form: bool,
+) -> Result<MessagesPage, String> {
+    if agent_type == "codex" && app_form {
+        if session_id.trim().is_empty() {
+            return Err("CONTENT_SESSION_ID_EMPTY: session_id 为空".to_string());
+        }
+        if session_id.contains(['/', '\\', '\0']) || session_id.contains("..") {
+            return Err(format!(
+                "CONTENT_SESSION_ID_INVALID: session_id 含非法字符: {session_id}"
+            ));
+        }
+        return read_codex_app_messages_with(home, session_id, limit.clamp(1, 1000));
+    }
+    read_session_messages_with(home, agent_type, session_id, limit)
 }
 
 // ============================================================
@@ -456,6 +492,7 @@ fn page(msgs: Vec<SessionMessage>, limit: usize, truncated: bool) -> MessagesPag
         truncated,
         cwd: None,
         older_before: None,
+        codex_saved_source: None,
         dsh_model_summary: None,
     }
 }
@@ -777,6 +814,7 @@ fn read_zcode_projection_with(
             cwd: None,
             // ZCode SQLite 读取面不支持续页游标（键缺席，与同文件其它非 DSH 面一致）
             older_before: None,
+            codex_saved_source: None,
             dsh_model_summary: None,
         },
         source_anchors,
@@ -1755,19 +1793,151 @@ fn read_codex_messages_with(
     session_id: &str,
     limit: usize,
 ) -> Result<MessagesPage, String> {
-    // 路线 1：rollout JSONL（CLI 前端线路；两条线路共享同一会话 id 空间——
-    // codex_thread_parser 以 rollout session id 排除 DB 侧重复出卡，即此结论）
-    if let Ok(msgs) = read_codex_rollout_with(home, session_id, limit) {
-        return Ok(msgs);
+    // CLI 基线（Task 4B）：**成功即用 rollout**，不改选来源；仅 rollout 未命中
+    // 才回退 thread_history 投影（P1 之前的生产行为，逐字保持）。
+    if let Ok(msgs) = read_codex_rollout_with(home, session_id, limit, false) {
+        return Ok(msgs.0);
     }
-    // 路线 2：thread_history_*.sqlite 内容投影（APP 线路；remote_control 活跃对话
-    // 投影滞后属上游限制，此处如实返回已投影内容）
     if let Ok(msgs) = read_codex_thread_with(home, session_id, limit) {
         return Ok(msgs);
     }
     Err(format!(
         "codex 会话不存在（rollout 与 thread history 均未命中）: {session_id}"
     ))
+}
+
+/// App 形态专用（P1 新增能力只在此分支生效）：元数据空壳回退独立投影；rollout
+/// 成功但正文为空且可完整对位时，用同代际 SQLite 投影替换。CLI 永不走本函数。
+fn read_codex_app_messages_with(
+    home: &Path,
+    session_id: &str,
+    limit: usize,
+) -> Result<MessagesPage, String> {
+    // 路线 1：rollout JSONL（CLI 前端线路；两条线路共享同一会话 id 空间——
+    // codex_thread_parser 以 rollout session id 排除 DB 侧重复出卡，即此结论）
+    let rollout = read_codex_rollout_with(home, session_id, limit, true);
+    if let Ok((msgs, false)) = rollout {
+        return Ok(msgs);
+    }
+    // 只有确证 rollout 是合法元数据空壳（或未找到）才使用独立的同线程投影。
+    // 已有正文/未知格式绝不靠时间、同文或展示序号换源或拼接。
+    if let Ok(mut msgs) = read_codex_thread_with(home, session_id, limit) {
+        if let Ok((metadata, true)) = &rollout {
+            msgs.cwd = metadata.cwd.clone();
+        }
+        return Ok(msgs);
+    }
+    if let Ok((msgs, true)) = rollout {
+        return Ok(msgs);
+    }
+    Err(format!(
+        "codex 会话不存在（rollout 与 thread history 均未命中）: {session_id}"
+    ))
+}
+
+/// 校验可比较的 paginated 代际。仅在两个水位都抵达完整边界且正式条目逐一
+/// 对位时使用 SQLite。未知事件、旧格式、缺号或超过预算都不据此换源。
+fn verified_codex_projection(
+    home: &Path,
+    rollout: &Path,
+    thread: &str,
+    limit: usize,
+) -> Option<MessagesPage> {
+    use std::io::Read as _;
+    let mut file = std::fs::File::open(rollout).ok()?;
+    let mut bytes = Vec::new();
+    const BUDGET: u64 = 512 * 1024;
+    (&mut file).take(BUDGET + 1).read_to_end(&mut bytes).ok()?;
+    if bytes.len() as u64 > BUDGET || bytes.last() != Some(&b'\n') {
+        return None;
+    }
+    let lines = bytes.strip_suffix(b"\n")?.split(|byte| *byte == b'\n');
+    let mut next_ordinal = 0_i64;
+    let mut expected = Vec::new();
+    for line in lines {
+        let entry: serde_json::Value = serde_json::from_slice(line).ok()?;
+        if entry.get("ordinal")?.as_i64()? != next_ordinal {
+            return None;
+        }
+        let tag = entry.get("type")?.as_str()?;
+        let payload = entry.get("payload")?;
+        match tag {
+            "session_meta" if next_ordinal == 0 && payload.get("id")?.as_str()? == thread => {}
+            "event_msg" if next_ordinal > 0 => match payload.get("type")?.as_str()? {
+                "task_started" | "task_complete" => {}
+                "item_completed" if payload.get("thread_id")?.as_str()? == thread => {
+                    let item = payload.get("item")?;
+                    let kind = item.get("type")?.as_str()?;
+                    if !matches!(
+                        kind,
+                        "userMessage"
+                            | "agentMessage"
+                            | "commandExecution"
+                            | "reasoning"
+                            | "fileChange"
+                    ) {
+                        return None;
+                    }
+                    expected.push((
+                        payload.get("turn_id")?.as_str()?.to_owned(),
+                        item.get("id")?.as_str()?.to_owned(),
+                        next_ordinal,
+                        kind.to_owned(),
+                    ));
+                }
+                _ => return None,
+            },
+            _ => return None,
+        }
+        next_ordinal += 1;
+    }
+    if expected.is_empty() {
+        return None;
+    }
+    let roots = crate::monitor::codex_thread_parser::CodexThreadRoots::from_home(home);
+    let state = crate::monitor::sqlite::open_readonly_with_timeout(&roots.state_db)?;
+    let indexed: String = state
+        .query_row(
+            "SELECT rollout_path FROM threads WHERE id = ?1",
+            [thread],
+            |row| row.get(0),
+        )
+        .ok()?;
+    if std::fs::canonicalize(indexed).ok()? != std::fs::canonicalize(rollout).ok()? {
+        return None;
+    }
+    let mut conn = crate::monitor::sqlite::open_readonly_with_timeout(&roots.history_db)?;
+    let tx = conn.transaction().ok()?;
+    let watermark: (u64, i64) = tx.query_row(
+        "SELECT next_rollout_byte_offset, next_rollout_ordinal FROM thread_history_projection_state WHERE thread_id = ?1",
+        [thread], |row| Ok((row.get::<_, i64>(0)?.try_into().unwrap_or(u64::MAX), row.get(1)?)),
+    ).ok()?;
+    if watermark != (bytes.len() as u64, next_ordinal) {
+        return None;
+    }
+    let actual = {
+        let mut stmt = tx.prepare("SELECT turn_id, item_id, updated_at_ordinal, item_type FROM thread_items WHERE thread_id = ?1 ORDER BY updated_at_ordinal LIMIT ?2").ok()?;
+        let rows = stmt
+            .query_map(
+                rusqlite::params![thread, expected.len() as i64 + 1],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .ok()?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().ok()?
+    };
+    if actual != expected || file.metadata().ok()?.len() != bytes.len() as u64 {
+        return None;
+    }
+    let mut page = read_codex_thread_rows(&tx, thread, limit).ok()?;
+    page.truncated |= expected.len() > limit;
+    Some(page)
 }
 
 /// rollout 递归收集（sessions/<y>/<m>/<d>/rollout-*.jsonl；codex_parser
@@ -1860,7 +2030,8 @@ fn read_codex_rollout_with(
     home: &Path,
     session_id: &str,
     limit: usize,
-) -> Result<MessagesPage, String> {
+    allow_projection: bool,
+) -> Result<(MessagesPage, bool), String> {
     let sessions_dir = home.join(".codex").join("sessions");
     let f = locate_codex_rollout(&sessions_dir, session_id)?;
     // Bug 1：字节窗随 limit 放大，头部截断经 truncated 上报
@@ -1869,11 +2040,32 @@ fn read_codex_rollout_with(
         line_budget(limit),
         byte_budget(limit),
     );
+    let metadata_only = !truncated
+        && matches!(lines.as_slice(), [line] if
+        serde_json::from_str::<serde_json::Value>(line).ok().is_some_and(|v|
+            v.get("type").and_then(|s| s.as_str()) == Some("session_meta") &&
+            v.pointer("/payload/id").and_then(|s| s.as_str()) == Some(session_id)));
     let mut pg = page(map_codex_lines(&lines), limit, truncated);
+    pg.codex_saved_source = Some(CodexSavedSource::Rollout);
+    // Task 4B：投影改选只属于 **App 选择器**；CLI 走同一读取器时不得在此改源。
+    if allow_projection
+        && !metadata_only
+        && pg.messages.is_empty()
+        && !truncated
+        && lines.first().is_some_and(|line| {
+            serde_json::from_str::<serde_json::Value>(line)
+                .ok()
+                .is_some_and(|entry| entry.get("ordinal").is_some())
+        })
+    {
+        if let Some(projected) = verified_codex_projection(home, &f, session_id, limit) {
+            pg = projected;
+        }
+    }
     // 会话产物批（2026-10-13）：cwd 作相对路径产物的解析基准。这里会**再读一次**
     // rollout 首行（rollout_session_id 已读过一次）——每请求 1 次、微秒级，代价可忽略
     pg.cwd = rollout_session_cwd(&f);
-    Ok(pg)
+    Ok((pg, metadata_only))
 }
 
 /// Codex 用户图片附件第二抽取源（#69）：rollout `event_msg` 行的 local_images
@@ -2165,7 +2357,7 @@ fn parse_patch_header(line: &str) -> Option<(&'static str, String)> {
 /// Codex APP 线路：thread_history_*.sqlite 的 thread_items（codex_thread_parser
 /// 的表/列实测布局；item_type ∈ userMessage/agentMessage/commandExecution/
 /// reasoning/fileChange/imageView/plan）
-fn read_codex_thread_with(
+pub(super) fn read_codex_thread_with(
     home: &Path,
     session_id: &str,
     limit: usize,
@@ -2174,6 +2366,14 @@ fn read_codex_thread_with(
     let roots = CodexThreadRoots::from_home(home);
     let conn = crate::monitor::sqlite::open_readonly_with_timeout(&roots.history_db)
         .ok_or_else(|| "codex thread history db 不可读".to_string())?;
+    read_codex_thread_rows(&conn, session_id, limit)
+}
+
+fn read_codex_thread_rows(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+    limit: usize,
+) -> Result<MessagesPage, String> {
     let sql = format!(
         "SELECT item_type, item_json, created_at_ms FROM thread_items \
          WHERE thread_id = ?1 ORDER BY rollout_ordinal DESC LIMIT {}",
@@ -2282,7 +2482,9 @@ fn read_codex_thread_with(
         }
     }
     // SQLite 查询自带 LIMIT：无「头部截断」语义（truncated 恒 false，Bug 1 契约）
-    Ok(page(out, limit, false))
+    let mut saved = page(out, limit, false);
+    saved.codex_saved_source = Some(CodexSavedSource::ThreadHistory);
+    Ok(saved)
 }
 
 // ============================================================
@@ -3606,6 +3808,7 @@ mod tests {
             truncated: false,
             cwd: None,
             older_before: None,
+            codex_saved_source: None,
             dsh_model_summary: None,
         };
         let obj = serde_json::to_value(&none_page).unwrap();
@@ -3621,6 +3824,7 @@ mod tests {
             truncated: false,
             cwd: Some("/w".to_string()),
             older_before: None,
+            codex_saved_source: None,
             dsh_model_summary: None,
         };
         let v = serde_json::to_value(&some_page).unwrap();
@@ -4712,14 +4916,15 @@ mod tests {
         // rollout 只有 meta（无内容条目）→ 应继续落空但不炸
         let pg = read_session_messages_with(tmp.path(), "codex", UUID, 200).unwrap();
         assert!(pg.messages.is_empty(), "仅 meta 的 rollout 映射为空");
+        assert_eq!(pg.codex_saved_source, Some(CodexSavedSource::Rollout));
         assert_eq!(
             pg.cwd.as_deref(),
             Some("/w"),
             "rollout 首行 session_meta.payload.cwd 必须透传（会话产物相对路径的解析基准）"
         );
 
-        // (b) APP 线路回退：thread_history sqlite（无 rollout 文件时）
-        std::fs::remove_file(&rollout).unwrap();
+        // (b) Task 4B：CLI 基线**保持 rollout 成功结果**（元数据空壳不换源）；
+        // 同 ID 元数据空壳的 SQLite 替代只发生在 App 分支。
         let hist = tmp.path().join(".codex/thread_history_1.sqlite");
         std::fs::create_dir_all(hist.parent().unwrap()).unwrap();
         let conn = Connection::open(&hist).unwrap();
@@ -4768,10 +4973,20 @@ mod tests {
             "fileChange",
             r#"{"type":"fileChange","changes":[{"path":"/w/a.rs","kind":{"type":"update"}}]}"#,
         );
-        let msgs = read_session_messages_with(tmp.path(), "codex", UUID, 200)
-            .unwrap()
-            .messages;
+        let page = read_session_messages_with_form(tmp.path(), "codex", UUID, 200, true).unwrap();
+        assert_eq!(
+            page.codex_saved_source,
+            Some(CodexSavedSource::ThreadHistory)
+        );
+        let msgs = page.messages;
         let kinds: Vec<&str> = msgs.iter().map(|m| m.kind.as_str()).collect();
+        assert_eq!(
+            read_session_messages_with_form(tmp.path(), "codex", UUID, 200, true)
+                .unwrap()
+                .cwd
+                .as_deref(),
+            Some("/w")
+        );
         assert_eq!(
             kinds,
             vec!["user", "thinking", "assistant", "tool-call", "tool-call"]
@@ -4788,6 +5003,17 @@ mod tests {
             .unwrap_or_default()
             .contains("git status"));
         assert!(msgs[4].content.contains("a.rs"), "fileChange 出路径摘要");
+        // CLI 仍按 rollout 成功结果返回（元数据空壳），不因共享读取器改选 SQLite
+        let cli_page = read_session_messages_with(tmp.path(), "codex", UUID, 200).unwrap();
+        assert_eq!(
+            cli_page.codex_saved_source,
+            Some(CodexSavedSource::Rollout),
+            "CLI 基线必须保持 rollout 选择"
+        );
+        assert!(
+            cli_page.messages.is_empty(),
+            "CLI 元数据空壳不换源（只有 App 分支才回退投影）"
+        );
         // 未知会话 → Err
         assert!(read_session_messages_with(
             tmp.path(),
@@ -4799,6 +5025,97 @@ mod tests {
     }
 
     /// rollout_session_cwd：payload.cwd 透传；缺失/空串/损坏/文件不存在一律 None
+    #[test]
+    fn codex_paginated_projection_requires_two_exact_watermarks_and_complete_ids() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join(".codex");
+        let sessions = root.join("sessions/2026/11/25");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let a = sessions.join(format!("rollout-2026-11-25-{UUID}.jsonl"));
+        let other = "ffffffff-ffff-4fff-8fff-ffffffffffff";
+        let records = [
+            serde_json::json!({"ordinal":0,"type":"session_meta","payload":{"id":UUID,"cwd":"/p1"}}),
+            serde_json::json!({"ordinal":1,"type":"event_msg","payload":{"type":"item_completed","thread_id":UUID,"turn_id":"turn-a","item":{"id":"u1","type":"userMessage"}}}),
+            serde_json::json!({"ordinal":2,"type":"event_msg","payload":{"type":"item_completed","thread_id":UUID,"turn_id":"turn-a","item":{"id":"a1","type":"agentMessage"}}}),
+        ];
+        let data = records
+            .iter()
+            .map(|item| format!("{item}\n"))
+            .collect::<String>();
+        std::fs::write(&a, &data).unwrap();
+        let state = Connection::open(root.join("state_5.sqlite")).unwrap();
+        state
+            .execute_batch("CREATE TABLE threads(id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL);")
+            .unwrap();
+        state
+            .execute(
+                "INSERT INTO threads VALUES(?1,?2)",
+                rusqlite::params![UUID, a.to_str().unwrap()],
+            )
+            .unwrap();
+        let db = Connection::open(root.join("thread_history_1.sqlite")).unwrap();
+        db.execute_batch("CREATE TABLE thread_history_projection_state(thread_id TEXT PRIMARY KEY, next_rollout_byte_offset INTEGER, next_rollout_ordinal INTEGER);
+            CREATE TABLE thread_items(thread_id TEXT, turn_id TEXT, item_id TEXT, rollout_ordinal INTEGER, updated_at_ordinal INTEGER, item_type TEXT, item_json TEXT, created_at_ms INTEGER);").unwrap();
+        let put = |thread: &str, id: &str, ordinal: i64, kind: &str, body: &str| {
+            db.execute(
+                "INSERT INTO thread_items VALUES(?1,'turn-a',?2,?3,?3,?4,?5,0)",
+                rusqlite::params![thread, id, ordinal, kind, body],
+            )
+            .unwrap();
+        };
+        put(
+            UUID,
+            "u1",
+            1,
+            "userMessage",
+            r#"{"content":[{"type":"text","text":"same"}]}"#,
+        );
+        put(UUID, "a1", 2, "agentMessage", r#"{"text":"A assistant"}"#);
+        put(other, "a1", 2, "agentMessage", r#"{"text":"B assistant"}"#);
+        // App 选择器才做投影改选/对位校验（CLI 基线保持 rollout）
+        let read = || read_codex_app_messages_with(home.path(), UUID, 50).unwrap();
+        db.execute(
+            "INSERT INTO thread_history_projection_state VALUES(?1,?2,2)",
+            rusqlite::params![UUID, data.len() as i64],
+        )
+        .unwrap();
+        assert!(read().messages.is_empty(), "单一水位不是证据");
+        db.execute(
+            "UPDATE thread_history_projection_state SET next_rollout_ordinal=3",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            read()
+                .messages
+                .iter()
+                .map(|m| m.content.as_str())
+                .collect::<Vec<_>>(),
+            vec!["same", "A assistant"]
+        );
+        assert_eq!(read().messages.len(), 2, "刷新不拼接也不重复");
+        assert!(
+            read_codex_app_messages_with(home.path(), UUID, 1)
+                .unwrap()
+                .truncated
+        );
+        db.execute(
+            "DELETE FROM thread_items WHERE thread_id=?1 AND item_id='u1'",
+            [UUID],
+        )
+        .unwrap();
+        assert!(read().messages.is_empty(), "投影缺条不能冒充完整页");
+        put(
+            UUID,
+            "u1",
+            1,
+            "userMessage",
+            r#"{"content":[{"type":"text","text":"same"}]}"#,
+        );
+        std::fs::write(&a, data.trim_end_matches('\n')).unwrap();
+        assert!(read().messages.is_empty(), "未完成行不参与水位");
+    }
+
     #[test]
     fn rollout_session_cwd_reads_payload_cwd_and_tolerates_absent_forms() {
         let tmp = tempfile::tempdir().unwrap();

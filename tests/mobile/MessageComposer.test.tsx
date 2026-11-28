@@ -1,4 +1,5 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { useState } from "react";
 import { afterEach, afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import MessageComposer from "@/mobile/MessageComposer";
 import type { DshActionReceipt, QueueItemView, SendInfo } from "@/mobile/api";
@@ -1969,6 +1970,95 @@ describe("移动端附件上传（2026-09-20）", () => {
     expect((screen.getByTestId("composer-input") as HTMLTextAreaElement).disabled).toBe(false);
   });
 
+  it("Mac Codex 写入不可用时独立暂存和预览，不派发消息", async () => {
+    installFetch();
+    const info = { injectable: false, attachmentUploadOnly: true };
+    routes.info = info;
+    const preview = vi.fn();
+    render(
+      <MessageComposer
+        session={{ id: "sess-1", agentType: "codex" }}
+        disableTerminalProbes
+        onPreviewAttachment={preview}
+      />
+    );
+    await screen.findByTestId("composer-input");
+    expect(screen.getByTestId("attach-add")).toBeEnabled();
+    expect(screen.getByTestId("composer-send")).toBeDisabled();
+
+    fireEvent.change(screen.getByTestId("attach-file-input"), {
+      target: { files: [pngFile("test.png")] },
+    });
+    expect(await screen.findByText("已上传，未发送")).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "test.png" }));
+    expect(preview).toHaveBeenCalledWith("E:/proj/.tuvis-attachments/s-1/1-a.bin");
+    fireEvent.click(screen.getByTestId("composer-send"));
+    expect(
+      fetchMock.mock.calls.some(
+        ([url, init]) => String(url).includes("session-send") && init?.method === "POST"
+      )
+    ).toBe(false);
+  });
+
+  it("P1-LOCAL-DRAFT：allowLocalDraft 且不可注入/不可上传时仍可编辑本地草稿、明示仅保存在 Tuvis 端且零发送", async () => {
+    installFetch();
+    routes.info = { injectable: false, attachmentUploadOnly: false };
+    render(
+      <MessageComposer
+        session={{ id: "sess-local-draft", agentType: "codex" }}
+        disableTerminalProbes
+        allowLocalDraft
+      />
+    );
+    const input = (await screen.findByTestId("composer-input")) as HTMLTextAreaElement;
+    expect(input).toBeEnabled();
+    expect(input.readOnly).toBe(false);
+    expect(screen.getByTestId("composer-local-draft-note").textContent).toContain("仅保存在 Tuvis 端");
+    fireEvent.change(input, { target: { value: "本地草稿内容" } });
+    expect(input.value).toBe("本地草稿内容");
+    expect(screen.getByTestId("composer-send")).toBeDisabled();
+    fireEvent.click(screen.getByTestId("composer-send"));
+    expect(
+      fetchMock.mock.calls.some(
+        ([url, init]) => String(url).includes("session-send") && init?.method === "POST"
+      )
+    ).toBe(false);
+  });
+
+  it("Mac Codex 仅暂存时，拖放进度可取消，迟到成功不恢复条目", async () => {
+    installFetch();
+    const info = { injectable: false, attachmentUploadOnly: true };
+    routes.info = info;
+    routes.attachHang = true;
+    routes.attachProgress = [3, 10];
+    render(<MessageComposer session={{ id: "sess-1", agentType: "codex" }} />);
+    await screen.findByTestId("composer-input");
+    fireEvent.drop(screen.getByTestId("message-composer"), {
+      dataTransfer: { files: [pngFile("cancel.png")] },
+    });
+    expect(await screen.findByTestId(/^attach-progress-bar-/)).toHaveStyle({ width: "30%" });
+    fireEvent.click(screen.getByTestId(/^attach-remove-/));
+    await act(async () => {
+      releaseAttach?.(new Response(JSON.stringify({ path: "/tmp/cancel.png", size: 3 })));
+    });
+    expect(screen.queryByTestId("attachment-chips")).toBeNull();
+    expect(sendCalls()).toHaveLength(0);
+  });
+
+  it("Mac Codex 仅暂存时，粘贴失败不显示已上传，也不发消息", async () => {
+    installFetch();
+    const info = { injectable: false, attachmentUploadOnly: true };
+    routes.info = info;
+    routes.attachStatus = 413;
+    render(<MessageComposer session={{ id: "sess-1", agentType: "codex" }} />);
+    fireEvent.paste(await screen.findByTestId("composer-input"), {
+      clipboardData: { files: [pngFile("too-big.png")] },
+    });
+    expect(await screen.findByText(/失败：too-big.png/)).toBeVisible();
+    expect(screen.queryByText("已上传，未发送")).toBeNull();
+    expect(sendCalls()).toHaveLength(0);
+  });
+
   describe("A05：macOS DSH 附件不可用", () => {
     async function renderDshComposerWithAttachmentRefusal() {
       installFetch();
@@ -3936,4 +4026,285 @@ it("dsh_identity_unverified_keeps_anchor：旧终态行身份无法确证——d
   });
   const secondBody = JSON.parse(String((sendCalls()[1][1] as RequestInit)?.body ?? "{}"));
   expect(secondBody.actionId).toBe(firstBody.actionId);
+});
+
+it("Task6：多文件上传批次在途切会话后立即中止且不续传下一张，新会话零残留 chip", async () => {
+  installFetch();
+  routes.sendInfo = {
+    injectable: false,
+    reasonCode: "capability_unverified",
+    attachmentUploadOnly: true,
+  };
+  routes.attachHang = true;
+
+  const { rerender } = render(
+    <MessageComposer session={{ id: "sess-a", agentType: "codex", form: "app" }} allowLocalDraft />
+  );
+  const opensBefore = attachOpens.length;
+  const fileInput = await screen.findByTestId("attach-file-input");
+  const f1 = new File(["1"], "a1.png", { type: "image/png" });
+  const f2 = new File(["2"], "a2.png", { type: "image/png" });
+  fireEvent.change(fileInput, { target: { files: [f1, f2] } });
+  await waitFor(() => expect(attachOpens).toHaveLength(opensBefore + 1));
+  const firstXhr = pendingAttachXhr!;
+
+  // 切到会话 B：在途上传立即收到 abort，B 无任何 chip
+  rerender(
+    <MessageComposer session={{ id: "sess-b", agentType: "codex", form: "app" }} allowLocalDraft />
+  );
+  expect(screen.queryByTestId("attach-chip")).toBeNull();
+
+  // 释放旧 A 第 1 张的迟到回包：不开始第 2 张，B 仍无 chip
+  await act(async () => {
+    firstXhr.respond(
+      200,
+      JSON.stringify({
+        attachmentId: "00000000000000000000000000000001",
+        fileName: "a1.png",
+        size: 1,
+      })
+    );
+  });
+  expect(attachOpens).toHaveLength(opensBefore + 1);
+  expect(screen.queryByTestId("attach-chip")).toBeNull();
+});
+
+// Task3：迟到的「修改」候选**未被采用**时，不得改动用户正写的新稿的正文、
+// 发送方式（queueOnly）或回执状态；采用后重挂仍保留只入队约束。
+describe("Task3：取回稿与只入队约束作为一个结果", () => {
+  it("迟到候选未采用：新稿正文、普通发送方式、回执均不变", async () => {
+    installFetch();
+    routes.queue = [queueItem({ id: 7, position: 1, content: "旧队列原文" })];
+    let resolveRetract!: (res: Response) => void;
+    const baseFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.includes("/session-queue/retract")) {
+        return new Promise<Response>((resolve) => {
+          resolveRetract = resolve;
+        });
+      }
+      return baseFetch(input, init);
+    }) as typeof fetch;
+
+    render(<MessageComposer session={{ id: "sess-1", agentType: "codex" }} />);
+    const input = (await screen.findByTestId("composer-input")) as HTMLTextAreaElement;
+    await act(async () => {
+      fireEvent.change(input, { target: { value: "用户正写的新稿" } });
+    });
+    fireEvent.click(await screen.findByTestId("queue-edit"));
+
+    // 回执到达时用户已有新稿 → 只作为候选保留
+    await act(async () => {
+      resolveRetract(new Response(JSON.stringify({ ok: true }), { status: 200 }));
+    });
+    await waitFor(() => expect(screen.getByTestId("composer-edit-choice")).toBeTruthy());
+    expect((screen.getByTestId("composer-input") as HTMLTextAreaElement).value).toBe(
+      "用户正写的新稿"
+    );
+
+    // 未采用就发送：不得带 queueOnly（旧候选不影响当前发送语义）
+    fireEvent.click(screen.getByTestId("composer-send"));
+    await waitFor(() => expect(sendCalls().length).toBe(1));
+    const body = JSON.parse(String((sendCalls()[0][1] as RequestInit).body ?? "{}"));
+    expect("queueOnly" in body).toBe(false);
+  });
+
+  it("采用候选后重挂：只入队约束随父层保留（受控 queueOnlyBySession）", async () => {
+    installFetch();
+    routes.queue = [queueItem({ id: 9, position: 1, content: "待取回原文" })];
+    const state = { queueOnly: false, text: "" };
+    const Harness = () => {
+      const [queueOnly, setQueueOnly] = useState(state.queueOnly);
+      const [text, setText] = useState(state.text);
+      state.queueOnly = queueOnly;
+      state.text = text;
+      return (
+        <MessageComposer
+          key={`k-${queueOnly}`}
+          session={{ id: "sess-1", agentType: "codex" }}
+          draftText={text}
+          onDraftTextChange={(value) =>
+            setText((current) => (typeof value === "function" ? value(current) : value))
+          }
+          queueOnlyBySession={queueOnly}
+          onQueueOnlyChange={setQueueOnly}
+        />
+      );
+    };
+    const { rerender } = render(<Harness />);
+    fireEvent.click(await screen.findByTestId("queue-edit"));
+    await waitFor(() => expect(screen.queryByTestId("queue-row-9")).toBeNull());
+    await waitFor(() => expect(state.queueOnly).toBe(true));
+
+    // 模拟跨布局重挂：新实例仍带父层只入队约束
+    rerender(<Harness key="remount" />);
+    const input = (await screen.findByTestId("composer-input")) as HTMLTextAreaElement;
+    expect(input.value).toBe("待取回原文");
+    fireEvent.click(screen.getByTestId("composer-send"));
+    await waitFor(() => expect(sendCalls().length).toBe(1));
+    const body = JSON.parse(String((sendCalls()[0][1] as RequestInit).body ?? "{}"));
+    expect(body.queueOnly).toBe(true);
+  });
+
+// ============================================================
+// macOS AX 直写回执（阶段一）：五档互不替代 + 草稿纪律
+// ============================================================
+describe("Desktop AX 回执（desktop_ax_*）", () => {
+  /** 发一条正文，返回输入框供断言草稿是否保留。 */
+  async function sendWith(receipt: Record<string, unknown>) {
+    installFetch();
+    routes.info = sendInfo();
+    routes.send = receipt;
+    render(<MessageComposer session={{ id: "sess-1" }} />);
+    const input = (await screen.findByTestId("composer-input")) as HTMLTextAreaElement;
+    fireEvent.change(input, { target: { value: "ax 测试正文" } });
+    fireEvent.click(screen.getByTestId("composer-send"));
+    return input;
+  }
+
+  it("delivered：已送达，草稿清空", async () => {
+    const input = await sendWith({
+      status: "desktop_ax_delivered",
+      route: "desktop_ax",
+      actionId: "a1",
+    });
+    const chip = await screen.findByTestId("send-receipt-desktop-ax");
+    expect(chip.getAttribute("data-variant")).toBe("delivered");
+    expect(chip.textContent).toContain("已送达");
+    await waitFor(() => expect(input.value).toBe(""));
+  });
+
+  it("not_touched：明确没碰输入框，草稿必须保留", async () => {
+    const input = await sendWith({
+      status: "desktop_ax_not_touched",
+      route: "desktop_ax",
+      actionId: "a2",
+      reasonCode: "ax_target_not_current",
+      draftMayBeKept: true,
+    });
+    const chip = await screen.findByTestId("send-receipt-desktop-ax");
+    expect(chip.getAttribute("data-variant")).toBe("notTouched");
+    expect(chip.getAttribute("data-reason")).toBe("ax_target_not_current");
+    expect(input.value).toBe("ax 测试正文");
+  });
+
+  it("touched_not_submitted：桌面可能留有未发内容，草稿保留且文案指路 Mac", async () => {
+    const input = await sendWith({
+      status: "desktop_ax_touched_not_submitted",
+      route: "desktop_ax",
+      actionId: "a3",
+      draftMayBeKept: true,
+      desktopMayHoldUnsent: true,
+    });
+    const chip = await screen.findByTestId("send-receipt-desktop-ax");
+    expect(chip.getAttribute("data-variant")).toBe("touchedNotSubmitted");
+    expect(chip.textContent).toContain("Mac");
+    expect(input.value).toBe("ax 测试正文");
+  });
+
+  it("maybe_submitted：可能已发送，草稿保留且文案要求先确认（不得写成未发送）", async () => {
+    const input = await sendWith({
+      status: "desktop_ax_maybe_submitted",
+      route: "desktop_ax",
+      actionId: "a4",
+      draftMayBeKept: true,
+      needsMacConfirmation: true,
+    });
+    const chip = await screen.findByTestId("send-receipt-desktop-ax");
+    expect(chip.getAttribute("data-variant")).toBe("maybeSubmitted");
+    expect(chip.textContent).not.toContain("未发送");
+    expect(chip.textContent).toContain("确认");
+    expect(input.value).toBe("ax 测试正文");
+  });
+
+  it("unavailable：通道不可用，草稿保留", async () => {
+    const input = await sendWith({
+      status: "desktop_ax_unavailable",
+      route: "desktop_ax",
+      actionId: "a5",
+      reasonCode: "ax_not_trusted",
+      draftMayBeKept: true,
+    });
+    const chip = await screen.findByTestId("send-receipt-desktop-ax");
+    expect(chip.getAttribute("data-variant")).toBe("unavailable");
+    expect(input.value).toBe("ax 测试正文");
+  });
+});
+
+// ============================================================
+// R1（2026-11-30 返工）：AX 路由必须真的发出去
+//
+// 三处已知接线缺口，全部在客户端：
+//  1. `handleSend` 第一行硬拦 `codexDisconnected`；
+//  2. `staleTarget()` 把 `codexDisconnectedRef` 算进失效判据；
+//  3. `needsActionId` 只认 `headless_codex_*`，`desktop_ax` 不生成 actionId。
+// 前两条让 IPC 断线连带禁掉 AX；第三条让 AX 请求必然被服务端以
+// `action_id_required` 拒绝。三条都不在按钮可用性上体现，所以要断 POST。
+// ============================================================
+describe("R1 AX 路由：IPC 断线不得连带禁掉 AX", () => {
+  /** AX 路由的 send-info（服务端在某开关开启时就这么回）。 */
+  function axSendInfo(): SendInfo {
+    return sendInfo({
+      injectable: true,
+      channels: ["desktop_ax"],
+      // 服务端新字段：明确告知本条会话由 AX 通道服务
+      route: "desktop_ax",
+    } as Partial<SendInfo>);
+  }
+
+  it("IPC 断开 + AX 可注入 → 仍发一次 POST，且带非空 actionId", async () => {
+    installFetch();
+    routes.info = axSendInfo();
+    routes.send = { status: "desktop_ax_delivered", route: "desktop_ax", actionId: "ax-1" };
+    render(<MessageComposer session={{ id: "sess-1" }} codexDisconnected />);
+    const input = (await screen.findByTestId("composer-input")) as HTMLTextAreaElement;
+    fireEvent.change(input, { target: { value: "R1 正文" } });
+    fireEvent.click(screen.getByTestId("composer-send"));
+
+    // 必须真的发出去了（不是"按钮亮了但点不动"）
+    await waitFor(() => expect(sendCalls().length).toBe(1));
+    const body = JSON.parse(String((sendCalls()[0][1] as RequestInit).body ?? "{}"));
+    expect(typeof body.actionId).toBe("string");
+    expect(body.actionId.length).toBeGreaterThan(0);
+    expect(body.sessionId).toBe("sess-1");
+    expect(body.text).toBe("R1 正文");
+  });
+
+  it("迟到回执不因 IPC 断开被判失效", async () => {
+    installFetch();
+    routes.info = axSendInfo();
+    let release!: (r: Response) => void;
+    routes.sendHang = true;
+    render(<MessageComposer session={{ id: "sess-1" }} codexDisconnected />);
+    const input = (await screen.findByTestId("composer-input")) as HTMLTextAreaElement;
+    fireEvent.change(input, { target: { value: "迟到回执" } });
+    fireEvent.click(screen.getByTestId("composer-send"));
+    await waitFor(() => expect(sendCalls().length).toBe(1));
+
+    // 放行回执：即使 codexDisconnected 为真，也应正常落回执并清草稿
+    await act(async () => {
+      release = releaseSend!;
+      release(
+        Response.json({ status: "desktop_ax_delivered", route: "desktop_ax", actionId: "ax-2" })
+      );
+    });
+    const chip = await screen.findByTestId("send-receipt-desktop-ax");
+    expect(chip.getAttribute("data-variant")).toBe("delivered");
+    await waitFor(() => expect(input.value).toBe(""));
+  });
+
+  it("IPC 断开且无 AX 资格 → 仍禁用（不因本轮改动放宽）", async () => {
+    installFetch();
+    // 无 route 字段、injectable=false：纯 IPC 会话
+    routes.info = sendInfo({ injectable: false, reasonCode: "capability_unverified" });
+    render(<MessageComposer session={{ id: "sess-1" }} codexDisconnected />);
+    const input = (await screen.findByTestId("composer-input")) as HTMLTextAreaElement;
+    fireEvent.change(input, { target: { value: "不该发" } });
+    fireEvent.click(screen.getByTestId("composer-send"));
+    // 零调用
+    await flushAsync();
+    expect(sendCalls().length).toBe(0);
+  });
+});
 });

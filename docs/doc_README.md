@@ -12,12 +12,15 @@
 
 - [项目宪法](MASTER-PLAN.md)：最高设计依据；未经用户明确同意不得修改。
 - [规格与设计](engineering/specs/)：需求、设计、行为与验收口径。
+- [Codex Desktop 原会话远程操控总体设计](engineering/specs/2026-11-25-Codex-Desktop连接诊断与能力边界.md)：完整能力愿景、原窗口与原生通道的分阶段路线、默认安装证据边界和完成台账。
+- [Codex Desktop macOS 原会话纯文本热修](engineering/specs/codex-desktop-macos-text-hotfix.md)：逐通道的纯文本实现、保护边界及实测范围。
 - [OpenCode 原生功能总表](engineering/specs/2026-11-01-OpenCode原生功能总表.md)：存量、增量与完整产品验收分开；逐启动形态的证据范围与未闭合项。
 - [OpenCode 远程写入原生化收口与复查标准](engineering/specs/2026-11-23-OpenCode远程写入原生化收口与复查标准.md)：写入、队列、恢复契约与逐操作通道矩阵；旧路径退役与双向复查口径。
 - [CLI 整组答题与双端一致性顶层设计](engineering/specs/2026-10-29-CLI整组答题与双端一致性顶层设计.md)：跨 CLI 的答题卡语义与双端一致性公共规格（公共规格，非 OpenCode 专用）。
 - [DSH 代际路径缓存](engineering/specs/2026-11-01-f9-dsh-generation-path-cache.md) / [dsh 监控适配器计划](engineering/plans/2026-09-14-m1-dsh-monitoring-adapter.md)：dsh 会话扫描缓存预算与适配器实施口径。
 - [WorkBuddy 5.9.3 子代理与看板 Spec](engineering/specs/2026-10-30-workbuddy-5.9.3-subagents-and-board-spec.md) / [设计](engineering/specs/2026-10-30-workbuddy-5.9.3-subagents-and-board-design.md)：5.9.3 子代理漏采与心跳冻结掉线。
 - [实施计划](engineering/plans/)：当前/历史执行计划；executor prompt 不入库。
+- [Codex Desktop Windows 联调交接](engineering/acceptance/codex-desktop-windows-hotfix-handoff.md)：从 Draft PR 构建，验证最新版 IPC 与旧版回归，并按证据回填。
 - [Codex 答题卡修复与升级兼容执行手册](engineering/plans/2026-11-05-codex-答题卡修复与升级兼容执行手册.md)：PR #202 三项缺陷的修法、回归与验收，以及后续持久化、历史核对和版本兼容工作单。
 - [WorkBuddy 5.9.3 TDD 执行计划](engineering/plans/2026-10-30-workbuddy-5.9.3-subagents-and-board-tdd.md)：R1/R2 任务、停止点与回滚。
 - [人工裁决台账](engineering/decisions/)：用户裁决、推翻与边界；只记决定，不记 agent 返工过程。

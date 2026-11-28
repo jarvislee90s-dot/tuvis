@@ -2299,3 +2299,211 @@ describe("B6 X0 后到送达证据", () => {
     }
   });
 });
+
+describe("CodexSendFlow：断联后禁止发送与恢复派发，仅保留只读核对", () => {
+  it("codexDisconnected 即使缓存 sendInfo.injectable=true 也禁用发送并零 session-send POST", async () => {
+    installFetch();
+    const { rerender } = render(<MessageComposer session={{ id: "sess-1" }} />);
+    await flushAsync();
+
+    const input = screen.getByTestId("composer-input") as HTMLTextAreaElement;
+    await act(async () => {
+      fireEvent.change(input, { target: { value: "断联前草稿" } });
+    });
+    expect((screen.getByTestId("composer-send") as HTMLButtonElement).disabled).toBe(false);
+
+    rerender(<MessageComposer session={{ id: "sess-1" }} codexDisconnected />);
+    expect((screen.getByTestId("composer-send") as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.click(screen.getByTestId("composer-send"));
+    await flushAsync();
+
+    const sendCalls = fetchMock.mock.calls.filter(([u]) => String(u) === "/m/api/v1/session-send");
+    expect(sendCalls).toHaveLength(0);
+  });
+
+  it("CodexSendRecoveryPanel 断联后即使已展开人工继续风险也隐藏/禁用派发，只读核对仍可用", async () => {
+    vi.useFakeTimers();
+    installFetch();
+    routes.sendHang = true;
+    const { rerender } = render(<MessageComposer session={{ id: "sess-1" }} />);
+    await flushAsync();
+
+    const input = screen.getByTestId("composer-input") as HTMLTextAreaElement;
+    await act(async () => {
+      fireEvent.change(input, { target: { value: "待核对消息" } });
+    });
+    await flushAsync();
+    fireEvent.click(screen.getByTestId("composer-send"));
+    await flushAsync();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(30_000);
+    });
+
+    routes.verifyQueue = [
+      {
+        actionId: "act-1",
+        stage: "dispatching",
+        outcome: "unresolved",
+        turnId: null,
+        runLimitReleased: false,
+        reasonCode: null,
+        verifiedAt: 1,
+      },
+    ];
+    fireEvent.click(screen.getByTestId("codex-recovery-check"));
+    await flushAsync();
+    fireEvent.click(screen.getByTestId("codex-recovery-resend"));
+    expect(screen.getByTestId("codex-recovery-resend-confirm")).toBeTruthy();
+
+    rerender(<MessageComposer session={{ id: "sess-1" }} codexDisconnected />);
+    expect(screen.queryByTestId("codex-recovery-resend")).toBeNull();
+    expect(screen.queryByTestId("codex-recovery-resend-confirm")).toBeNull();
+    expect(screen.queryByTestId("codex-recovery-release")).toBeNull();
+
+    // 只读核对仍可点
+    routes.verifyQueue = [
+      {
+        actionId: "act-1",
+        stage: "settled",
+        outcome: "delivered",
+        turnId: "turn-9",
+        runLimitReleased: false,
+        reasonCode: null,
+        verifiedAt: 2,
+      },
+    ];
+    fireEvent.click(screen.getByTestId("codex-recovery-check"));
+    await flushAsync();
+    expect(verifyUrls.length).toBeGreaterThanOrEqual(2);
+    expect(resumeBodies).toHaveLength(0);
+    expect(
+      fetchMock.mock.calls.filter(([u]) => String(u).includes("/force-continue"))
+    ).toHaveLength(0);
+  });
+
+  it("异步 probeCardPresence 回包后若已断联，取消提交并零 session-send POST", async () => {
+    installFetch();
+    let resolveProbe!: (res: Response) => void;
+    const baseFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.includes("/session-approve-options") || url.includes("/session-question")) {
+        return new Promise<Response>((resolve) => {
+          resolveProbe = resolve;
+        });
+      }
+      return baseFetch(input, init);
+    }) as typeof fetch;
+
+    const { rerender } = render(<MessageComposer session={{ id: "sess-1", form: "app" }} />);
+    await flushAsync();
+
+    const input = screen.getByTestId("composer-input") as HTMLTextAreaElement;
+    await act(async () => {
+      fireEvent.change(input, { target: { value: "异步前探断联" } });
+    });
+    fireEvent.click(screen.getByTestId("composer-send"));
+
+    rerender(<MessageComposer session={{ id: "sess-1", form: "app" }} codexDisconnected />);
+    await act(async () => {
+      resolveProbe(
+        new Response(
+          JSON.stringify({ available: false, options: [], verifiedWith: "t", drift: false }),
+          { status: 200, headers: { "Content-Type": "application/json" } }
+        )
+      );
+    });
+    await flushAsync();
+
+    const sendCalls = fetchMock.mock.calls.filter(([u]) => String(u) === "/m/api/v1/session-send");
+    expect(sendCalls).toHaveLength(0);
+  });
+
+  it("延迟预检经 CLI→App→同 ID CLI（身份回到原值）后，旧点击零提交；新点击正常发送", async () => {
+    installFetch();
+    const pendingProbes: Array<(res: Response) => void> = [];
+    const baseFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.includes("/session-approve-options") || url.includes("/session-question")) {
+        return new Promise<Response>((resolve) => {
+          pendingProbes.push(resolve);
+        });
+      }
+      return baseFetch(input, init);
+    }) as typeof fetch;
+
+    const plain = { available: false, options: [], verifiedWith: "t", drift: false };
+    const okProbe = () =>
+      new Response(JSON.stringify(plain), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+
+    // 起始形态：CLI（可发送）
+    const cli = { id: "sess-cycle", agentType: "codex", form: undefined };
+    const app = { id: "sess-cycle", agentType: "codex", form: "app" };
+    const { rerender } = render(<MessageComposer session={cli} />);
+    await flushAsync();
+
+    const input = screen.getByTestId("composer-input") as HTMLTextAreaElement;
+    await act(async () => {
+      fireEvent.change(input, { target: { value: "旧点击内容" } });
+    });
+    fireEvent.click(screen.getByTestId("composer-send"));
+    await flushAsync();
+    expect(pendingProbes.length).toBeGreaterThan(0);
+    const staleProbes = pendingProbes.slice();
+
+    // CLI → App → 同 ID CLI：身份字符串回到原值，但代际已前进两次
+    rerender(<MessageComposer session={app} />);
+    await flushAsync();
+    rerender(<MessageComposer session={cli} />);
+    await flushAsync();
+
+    // 旧点击的预检此时才回包：不得提交
+    await act(async () => {
+      staleProbes.forEach((resolve) => resolve(okProbe()));
+    });
+    await flushAsync();
+    let sendCalls = fetchMock.mock.calls.filter(([u]) => String(u) === "/m/api/v1/session-send");
+    expect(sendCalls).toHaveLength(0);
+
+    // 有效新点击仍可正常走原路径
+    const pendingBeforeNew = pendingProbes.length;
+    const input2 = screen.getByTestId("composer-input") as HTMLTextAreaElement;
+    await act(async () => {
+      fireEvent.change(input2, { target: { value: "新点击内容" } });
+    });
+    fireEvent.click(screen.getByTestId("composer-send"));
+    await flushAsync();
+    expect(pendingProbes.length).toBeGreaterThan(pendingBeforeNew);
+    const newProbes = pendingProbes.slice(pendingBeforeNew);
+    await act(async () => {
+      newProbes.forEach((resolve) => resolve(okProbe()));
+    });
+    await flushAsync();
+    sendCalls = fetchMock.mock.calls.filter(([u]) => String(u) === "/m/api/v1/session-send");
+    expect(sendCalls).toHaveLength(1);
+  });
+
+  it("断联时旧队列「立即发送」零派发请求", async () => {
+    installFetch();
+    routes.queue = [
+      {
+        items: [{ id: 7, content: "旧队列条目", enqueuedAt: 1, position: 1, agentType: "codex" }],
+      } as never,
+    ];
+    render(<MessageComposer session={{ id: "sess-1", agentType: "codex" }} codexDisconnected />);
+    await flushAsync();
+    const jumpBtn = screen.queryByTestId("queue-jump");
+    if (jumpBtn !== null) {
+      fireEvent.click(jumpBtn);
+      await flushAsync();
+    }
+    const jumpCalls = fetchMock.mock.calls.filter(([u]) =>
+      String(u).includes("/session-queue/jump")
+    );
+    expect(jumpCalls).toHaveLength(0);
+  });
+});

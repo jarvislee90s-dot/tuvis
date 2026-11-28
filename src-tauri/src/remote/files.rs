@@ -246,19 +246,144 @@ pub(super) fn protected_attachment_metadata_path(path: &Path, roots: &[PathBuf])
 pub fn read_file_safe_with_roots(
     session_cwd: &str,
     path: &str,
-    _home: Option<&str>,
+    home: Option<&str>,
     _protected_roots: &[PathBuf],
+) -> Result<(Vec<u8>, String), FileRejectReason> {
+    read_file_at(session_cwd, path, false, home, None)
+}
+
+/// 候选 `/file` 专用入口：必须显式提供已验证的候选授权范围与批准会话，
+/// 并随同实际打开句柄核验；日用预览请调用 `read_file_safe_with_roots`。
+pub fn read_file_safe_candidate(
+    session_cwd: &str,
+    path: &str,
+    home: Option<&str>,
+    _protected_roots: &[PathBuf],
+    scope: &super::candidate_read_scope::CandidateReadScope,
+    session_id: &str,
+) -> Result<(Vec<u8>, String), FileRejectReason> {
+    if !scope.allows("codex", session_id) {
+        return Err(FileRejectReason::PermissionDenied);
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (session_cwd, path, home);
+        return Err(FileRejectReason::PermissionDenied);
+    }
+    #[cfg(unix)]
+    read_file_at(session_cwd, path, false, home, Some((scope, session_id)))
+}
+
+#[cfg(unix)]
+pub(super) fn open_verified_dir_identity(path: &Path) -> Result<(PathBuf, u64, u64), String> {
+    use std::os::unix::fs::MetadataExt as _;
+    let canon = path
+        .canonicalize()
+        .map_err(|e| format!("目录不可解析 {}: {e}", path.display()))?;
+    let components = snapshot_file_components(&canon)
+        .map_err(|e| format!("目录组件快照失败 {}: {}", canon.display(), e.message()))?;
+    let opened = open_verified_components(&components)
+        .map_err(|e| format!("目录受控打开失败 {}: {}", canon.display(), e.message()))?;
+    let meta = opened
+        .metadata()
+        .map_err(|e| format!("读取目录身份失败 {}: {e}", canon.display()))?;
+    if !meta.is_dir() {
+        return Err(format!("路径不是目录: {}", canon.display()));
+    }
+    Ok((canon, meta.dev(), meta.ino()))
+}
+
+#[cfg(all(target_os = "macos", debug_assertions))]
+pub(super) fn read_fixture_file(path: &str) -> Result<(Vec<u8>, String), FileRejectReason> {
+    read_file_at("", path, true, None, None)
+}
+
+#[cfg(target_os = "macos")]
+fn is_tuvis_codex_staging_path(canon: &Path, home: Option<&str>) -> bool {
+    let Some(home) = home else {
+        return false;
+    };
+    let staging = Path::new(home).join(".tuvis").join("codex-staging");
+    let folded_canon = fold_data_volume_alias(canon);
+    if path_within(&folded_canon, &fold_data_volume_alias(&staging)) {
+        return true;
+    }
+    if let Ok(canon_staging) = staging.canonicalize() {
+        if path_within(&folded_canon, &fold_data_volume_alias(&canon_staging)) {
+            return true;
+        }
+    }
+    false
+}
+
+fn read_file_at(
+    session_cwd: &str,
+    path: &str,
+    exact: bool,
+    #[cfg_attr(not(target_os = "macos"), allow(unused_variables))] home: Option<&str>,
+    #[cfg_attr(not(unix), allow(unused_variables))] candidate: Option<(
+        &super::candidate_read_scope::CandidateReadScope,
+        &str,
+    )>,
 ) -> Result<(Vec<u8>, String), FileRejectReason> {
     if path.trim().is_empty() {
         return Err(FileRejectReason::NotFound);
     }
-    // 相对路径仍按会话 cwd 解析（cwd 本身不构成边界——全盘语义下仅作解析基准）
+    #[cfg(not(unix))]
+    if candidate.is_some() {
+        return Err(FileRejectReason::PermissionDenied);
+    }
+    // 候选模式：批准根固定身份与会话绑定项目目录必须在路径解析前就绪；
+    // 未绑定或身份不符的项目 cwd 不得作为相对路径基点或授权根。
+    #[cfg(unix)]
+    let candidate_roots: Option<(u64, u64, Option<&super::candidate_read_scope::VerifiedDir>)> =
+        if let Some((scope, session_id)) = candidate {
+            if !scope.allows("codex", session_id) {
+                return Err(FileRejectReason::PermissionDenied);
+            }
+            let Some((root_dev, root_ino)) = scope.root_identity else {
+                return Err(FileRejectReason::PermissionDenied);
+            };
+            let verified_project = scope.session_projects.get(session_id).and_then(|proj| {
+                let trimmed = session_cwd.trim();
+                if trimmed.is_empty() {
+                    return None;
+                }
+                let (_, cwd_dev, cwd_ino) = open_verified_dir_identity(Path::new(trimmed)).ok()?;
+                (cwd_dev == proj.dev && cwd_ino == proj.ino).then_some(proj)
+            });
+            Some((root_dev, root_ino, verified_project))
+        } else {
+            None
+        };
+    // 相对路径：候选仅允许以与批准会话绑定的已验证项目目录为基点；
+    // 日用全盘语义仍按会话 cwd 解析。
     let mut full = PathBuf::from(path.trim());
     if full.is_relative() {
-        let cwd = Path::new(session_cwd).canonicalize()?;
-        full = cwd.join(full);
+        #[cfg(unix)]
+        if let Some((_, _, verified_project)) = candidate_roots {
+            let Some(proj) = verified_project else {
+                return Err(FileRejectReason::PermissionDenied);
+            };
+            full = proj.path.join(full);
+        } else {
+            let cwd = Path::new(session_cwd).canonicalize()?;
+            full = cwd.join(full);
+        }
+        #[cfg(not(unix))]
+        {
+            let cwd = Path::new(session_cwd).canonicalize()?;
+            full = cwd.join(full);
+        }
     }
-    let canon = full.canonicalize()?;
+    // 合成服务只打开调用方已验证的绝对路径。禁止先解引用再取组件快照。
+    let canon = if exact { full } else { full.canonicalize()? };
+    // P1-UPLOAD：Tuvis 自管暂存区只能经受控 /session-attachment/preview 按
+    // (device_id, session_id, attachment_id) 读取，通用 /file 不得绕过核权。
+    #[cfg(target_os = "macos")]
+    if !exact && is_tuvis_codex_staging_path(&canon, home) {
+        return Err(FileRejectReason::PermissionDenied);
+    }
     #[cfg(unix)]
     let verified_components = snapshot_file_components(&canon)?;
     // 目录准入：D22（2026-11-12 用户裁决，见 MASTER-PLAN §0.2）起**取消**——
@@ -273,10 +398,55 @@ pub fn read_file_safe_with_roots(
         hook("before_open", &canon);
     }
     #[cfg(unix)]
-    let file = open_verified_components(&verified_components)?;
+    let (file, parent_file) = open_verified_components_with_parent(&verified_components)?;
     #[cfg(not(unix))]
     let file = std::fs::File::open(&canon).map_err(|_| FileRejectReason::NotFound)?;
+    #[cfg(unix)]
+    let file = file;
     let meta = file.metadata().map_err(|_| FileRejectReason::Io)?;
+    // 候选授权绑定到本次 `openat` 实际打开并即将读取的同一个文件对象，
+    // 要求批准根与绑定项目目录的活体 `(dev, ino)` 与批准时固定的身份一致，
+    // 且拒绝无法证明单一归属的多硬链接对象（nlink != 1）。
+    #[cfg(unix)]
+    if let Some((scope, _)) = candidate {
+        let Some((root_dev, root_ino, verified_project)) = candidate_roots else {
+            return Err(FileRejectReason::PermissionDenied);
+        };
+        if std::os::unix::fs::MetadataExt::nlink(&meta) != 1 {
+            return Err(FileRejectReason::PermissionDenied);
+        }
+        let verified_proj = verified_project.map(|p| (p.path.as_path(), p.dev, p.ino));
+        if !object_within_roots(
+            &file,
+            &parent_file,
+            &verified_components,
+            (scope.root.as_path(), root_dev, root_ino),
+            verified_proj,
+        ) {
+            return Err(FileRejectReason::PermissionDenied);
+        }
+    }
+    // P1-UPLOAD（Task 5）：暂存对象专用访问边界不只按文字路径判断——同一 inode
+    // 的别名（硬链接/外层目录换名）经通用 `/file` 也一律拒绝。比对的是**实际
+    // 打开句柄**的 (dev, ino) 与暂存 files 目录内清单，而非请求方给的路径文本。
+    #[cfg(target_os = "macos")]
+    if !exact {
+        use std::os::unix::fs::MetadataExt as _;
+        if let Some(home) = home {
+            match crate::remote::attachments::staging_file_identities(Path::new(home)) {
+                // 清单不完整/不可读 = 无法证明不是暂存对象 → 拒绝（fail-closed）
+                Err(()) => return Err(FileRejectReason::PermissionDenied),
+                Ok(staged) if staged.contains(&(meta.dev(), meta.ino())) => {
+                    return Err(FileRejectReason::PermissionDenied)
+                }
+                Ok(_) => {}
+            }
+        }
+    }
+    #[cfg(unix)]
+    if exact && std::os::unix::fs::MetadataExt::nlink(&meta) != 1 {
+        return Err(FileRejectReason::Sensitive);
+    }
     if !meta.is_file() {
         return Err(FileRejectReason::NotFile);
     }
@@ -342,6 +512,80 @@ pub(crate) fn install_stat_read_mutator(mutator: Option<StatReadMutator>) -> imp
     Guard
 }
 
+/// 已打开文件句柄是否为某个批准目录本身的对象级后代。
+/// 复用本次 `openat` 遍历的 `verified_components` 祖先链与父目录 fd，
+/// 并通过 `open_verified_components` 打开每个批准根取活体 `(dev, ino)`；
+/// 复杂度为路径深度常量级，不做目录树枚举，也不用请求路径文字前缀放行。
+#[cfg(unix)]
+fn verify_live_root(root: &Path, approved_dev: u64, approved_ino: u64) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    let Ok(root_canon) = root.canonicalize() else {
+        return false;
+    };
+    let Ok(components) = snapshot_file_components(&root_canon) else {
+        return false;
+    };
+    let Ok(opened_root) = open_verified_components(&components) else {
+        return false;
+    };
+    let Ok(opened_root_meta) = opened_root.metadata() else {
+        return false;
+    };
+    opened_root_meta.is_dir()
+        && opened_root_meta.dev() == approved_dev
+        && opened_root_meta.ino() == approved_ino
+}
+
+#[cfg(unix)]
+fn object_within_roots(
+    file: &std::fs::File,
+    parent_file: &std::fs::File,
+    verified_components: &[(std::ffi::OsString, u64, u64)],
+    approved_root: (&Path, u64, u64),
+    verified_project: Option<(&Path, u64, u64)>,
+) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    let Ok(meta) = file.metadata() else {
+        return false;
+    };
+    let Ok(parent_meta) = parent_file.metadata() else {
+        return false;
+    };
+    if !meta.is_file() || !parent_meta.is_dir() {
+        return false;
+    }
+    let Some((_, file_dev, file_ino)) = verified_components.last() else {
+        return false;
+    };
+    if meta.dev() != *file_dev || meta.ino() != *file_ino {
+        return false;
+    }
+    let ancestors = &verified_components[..verified_components.len().saturating_sub(1)];
+    let Some((_, parent_dev, parent_ino)) = ancestors.last() else {
+        return false;
+    };
+    if parent_meta.dev() != *parent_dev || parent_meta.ino() != *parent_ino {
+        return false;
+    }
+    // 独立必过条件：批准根活体身份必须与批准时固定的 (dev, ino) 一致，
+    // 即使绑定项目根匹配，批准根失效/被替换也一律拒绝。
+    let (root_path, root_dev, root_ino) = approved_root;
+    if !verify_live_root(root_path, root_dev, root_ino) {
+        return false;
+    }
+    let matches_dir = |dev: u64, ino: u64| {
+        (parent_meta.dev() == dev && parent_meta.ino() == ino)
+            || ancestors.iter().any(|(_, d, i)| *d == dev && *i == ino)
+    };
+    if matches_dir(root_dev, root_ino) {
+        return true;
+    }
+    if let Some((proj_path, proj_dev, proj_ino)) = verified_project {
+        return verify_live_root(proj_path, proj_dev, proj_ino) && matches_dir(proj_dev, proj_ino);
+    }
+    false
+}
+
 #[cfg(unix)]
 fn snapshot_file_components(
     path: &Path,
@@ -370,12 +614,25 @@ fn snapshot_file_components(
 fn open_verified_components(
     components: &[(std::ffi::OsString, u64, u64)],
 ) -> Result<std::fs::File, FileRejectReason> {
+    open_verified_components_with_parent(components).map(|(file, _)| file)
+}
+
+/// 返回本次 openat 实际打开的末级文件，以及同次遍历持有的父目录 fd。
+/// 父 fd 供候选对象级范围核验使用，避免 reopen/路径二次解析。
+#[cfg(unix)]
+fn open_verified_components_with_parent(
+    components: &[(std::ffi::OsString, u64, u64)],
+) -> Result<(std::fs::File, std::fs::File), FileRejectReason> {
     use std::ffi::CString;
     use std::os::fd::{AsRawFd, FromRawFd};
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::MetadataExt;
 
+    if components.is_empty() {
+        return Err(FileRejectReason::NotFile);
+    }
     let mut directory = std::fs::File::open("/").map_err(|_| FileRejectReason::Io)?;
+    let mut parent = std::fs::File::open("/").map_err(|_| FileRejectReason::Io)?;
     for (index, (name, dev, ino)) in components.iter().enumerate() {
         let name = CString::new(name.as_bytes()).map_err(|_| FileRejectReason::NotFound)?;
         let mut flags = libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK;
@@ -410,9 +667,10 @@ fn open_verified_components(
         if meta.dev() != *dev || meta.ino() != *ino {
             return Err(FileRejectReason::Sensitive);
         }
+        parent = directory;
         directory = opened;
     }
-    Ok(directory)
+    Ok((directory, parent))
 }
 
 /// 路径包含判定（canonicalize 之后的双方）：Windows 语义自动分派

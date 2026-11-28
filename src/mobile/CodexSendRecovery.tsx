@@ -42,6 +42,8 @@ export interface CodexSendRecoveryProps {
   onRetryNewAction: (predecessorActionId: string) => void;
   /** 统一报告入口（composer 注入安全引用；诊断服务未部署时由 composer 呈现不可用出口） */
   onReportIssue: (errorCode: string | null) => void;
+  /** 断联时禁止人工继续（创建后继）与解除屏障，仅保留只读原动作核对与报告。 */
+  disconnected?: boolean;
   /** W2：resumed / already_resumed 的后继结果上抛——composer 释放原动作锚并按
    *  五分类接管呈现（NotSent → 标准 chip + 重试沿后继；Queued → 位次 chip；
    *  Unknown → 面板按后继 ID 重挂）。Accepted 仍由本面板呈现「已重新发送」；
@@ -84,10 +86,16 @@ export default function CodexSendRecoveryPanel({
   deadlineExceeded = false,
   initialReasonCode,
   resumedFrom = null,
+  disconnected = false,
   onRetryNewAction,
   onReportIssue,
   onSuccessorResolved,
 }: CodexSendRecoveryProps) {
+  /* eslint-disable-next-line react-hooks/refs -- 断联必须在当帧生效：延一帧会让
+     断联瞬间到达的回包仍按"在线"处理，误开人工继续/解除屏障。 */
+  const disconnectedRef = useRef(disconnected);
+  /* eslint-disable-next-line react-hooks/refs -- 同上。 */
+  disconnectedRef.current = disconnected;
   const [verifying, setVerifying] = useState(false);
   const [result, setResult] = useState<RecoveryResult | null>(null);
   const [note, setNote] = useState<string | null>(null);
@@ -97,6 +105,9 @@ export default function CodexSendRecoveryPanel({
   const [checkAnchor, setCheckAnchor] = useState(actionId);
   /** 人工新发两步确认：未确认不发任何请求（先展示三件风险） */
   const [resendArmed, setResendArmed] = useState(false);
+  useEffect(() => {
+    if (disconnected) setResendArmed(false);
+  }, [disconnected]);
   const [resendBusy, setResendBusy] = useState(false);
   const [releaseBusy, setReleaseBusy] = useState(false);
   /** T1：本锚已确立 delivered 的单调镜像（自动/手动任一路径置位；换锚复位）。
@@ -178,7 +189,7 @@ export default function CodexSendRecoveryPanel({
   // W2：靶向 = 产生该结论的核对锚（核对后继 accepted_unbound 时沿后继解除）
   const releaseRunLimit = useCallback(
     async (target: string) => {
-      if (releaseBusy) return;
+      if (disconnectedRef.current || releaseBusy) return;
       setReleaseBusy(true);
       setNote(null);
       try {
@@ -213,7 +224,7 @@ export default function CodexSendRecoveryPanel({
 
   // ---- 人工继续（S4）：两步确认（三件风险）→ 唯一后继 ----
   const doManualResume = useCallback(async () => {
-    if (resendBusy) return;
+    if (disconnectedRef.current || resendBusy) return;
     setResendArmed(false);
     setResendBusy(true);
     setNote(null);
@@ -456,7 +467,7 @@ export default function CodexSendRecoveryPanel({
       )}
       {/* 明确未送达 → 重试（新动作，composer 展示关联；绝不重放原失败动作）。
           W2：靶向产生结论的核对锚（后继的未送达 → 重试沿后继 ID） */}
-      {notDeliveredAnchor !== null && (
+      {!disconnected && notDeliveredAnchor !== null && (
         <button
           type="button"
           data-testid="codex-recovery-retry"
@@ -468,7 +479,7 @@ export default function CodexSendRecoveryPanel({
       )}
       {/* 已受理无 turnId → 只解除运行限制（不重发原消息；新鲜可输入前置在服务端）。
           W2：靶向产生结论的核对锚 */}
-      {unboundAnchor !== null && (
+      {!disconnected && unboundAnchor !== null && (
         <button
           type="button"
           data-testid="codex-recovery-release"
@@ -482,7 +493,7 @@ export default function CodexSendRecoveryPanel({
         </button>
       )}
       {/* 无结论 → 人工新发（两步确认；三件风险如实披露后才可确认） */}
-      {showResend && !resendArmed && (
+      {!disconnected && showResend && !resendArmed && (
         <button
           type="button"
           data-testid="codex-recovery-resend"
@@ -496,7 +507,7 @@ export default function CodexSendRecoveryPanel({
           {i18n.t("mobile.codex.composer.recoveryResend")}
         </button>
       )}
-      {showResend && resendArmed && (
+      {!disconnected && showResend && resendArmed && (
         <div
           data-testid="codex-recovery-resend-risks"
           className="mt-1.5 rounded-lg bg-amber-500/10 px-2 py-1.5 dark:bg-amber-400/10"

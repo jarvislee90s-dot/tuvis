@@ -47,6 +47,7 @@ import PendingRequestCard, { CodexAvailabilityBanner } from "./PendingRequestCar
 import AsyncQuestionGroupCard from "./AsyncQuestionGroupCard";
 import CodexOperationToolbar from "./CodexOperationToolbar";
 import CodexAdaptSheet from "./CodexAdaptSheet";
+import { codexAxStatusCopy } from "./codex-ax-status";
 import QuestionSkipControls from "./QuestionSkipControls";
 import {
   fetchCodexAdaptStatus,
@@ -89,12 +90,15 @@ import { boundedCodexHistoryWindow } from "./codex-history";
 import BookmarkBar from "./BookmarkBar";
 import FilePanel, { type FilePanelEntry } from "./FilePanel";
 import FilePreview from "./FilePreview";
-import MessageComposer, { type ComposerDraftRequest } from "./MessageComposer";
+import MessageComposer, {
+  type ComposerAttachment,
+  type ComposerDraftRequest,
+} from "./MessageComposer";
 import ZcodeControlPanel from "./ZcodeControlPanel";
 // T05：页面共享停止控制器（composer 主按钮/紧凑入口与队列面板打断共用同一实例）
 import { useCodexTurnControl } from "./useCodexTurnControl";
 import DshInlineMedia from "./DshInlineMedia";
-import type { DshMediaReference, DshModelSummary } from "./api";
+import type { DshMediaReference, DshModelSummary, SendInfo } from "./api";
 import PreviewModeSwitcher, { type PreviewMode } from "./PreviewModeSwitcher";
 import SplitHandle from "./SplitHandle";
 import {
@@ -139,12 +143,32 @@ const POLL_FOLLOW_THRESHOLD_PX = 120;
  *  文件栏侧同步加 maxHeight = 100% - 该值，两处同源（常量单点） */
 const SPLIT_CONVERSATION_MIN_PX = 120;
 
+export type SessionComposerDraftMap = Record<string, { text: string; revision: number }>;
+export type SessionEditDraftMap = Record<string, ComposerDraftRequest[]>;
+/** Task3：按会话键持有的「只入队」约束（与草稿同标签页范围，不跨刷新持久化）。 */
+export type SessionQueueOnlyMap = Record<string, boolean>;
+
 interface SessionDetailProps {
   /** 完整会话对象（Task 8 裁决：详情页需要 status 判定自动折叠、projectName 页头、
    *  agentType；比传 id+agentType 再反查简单） */
   session: Session;
   /** 返回看板 */
   onBack: () => void;
+  /** P1-LOCAL-DRAFT：同标签页返回看板再进入时保留按会话隔离的本地草稿与队列回填稿。 */
+  composerDrafts?: SessionComposerDraftMap;
+  onComposerDraftsChange?: import("react").Dispatch<
+    import("react").SetStateAction<SessionComposerDraftMap>
+  >;
+  editDrafts?: SessionEditDraftMap;
+  onEditDraftsChange?: import("react").Dispatch<
+    import("react").SetStateAction<SessionEditDraftMap>
+  >;
+  isEditDraftConsumed?: (sessionKey: string, actionId: string) => boolean;
+  onEditDraftConsumed?: (sessionKey: string, actionId: string) => void;
+  queueOnlyDrafts?: SessionQueueOnlyMap;
+  onQueueOnlyDraftsChange?: import("react").Dispatch<
+    import("react").SetStateAction<SessionQueueOnlyMap>
+  >;
 }
 
 /** 预览区状态（T1 sheet 化，2026-10-09：原 list/file/subagent 三形联合的等价重构
@@ -160,7 +184,7 @@ type PreviewState = {
   sheet: "files" | "subagents";
   open:
     | { kind: "none" }
-    | { kind: "file"; path: string; mediaRefId?: string }
+    | { kind: "file"; path: string; mediaRefId?: string; stagedAttachmentId?: string }
     | { kind: "subagent"; id: string };
   mode: PreviewMode;
   backToList: boolean;
@@ -434,27 +458,68 @@ export default function SessionDetail(props: SessionDetailProps) {
   const appForm = agentType === "codex" && form === "app";
   // 同线程切换 App/CLI 时保留发送组件；跨会话才重挂。
   const sessionKey = JSON.stringify([agentType, props.session.dshInstanceId, id]);
-  const [composerDrafts, setComposerDrafts] = useState<
-    Record<string, { text: string; revision: number }>
-  >({});
-  const [editDrafts, setEditDrafts] = useState<Record<string, ComposerDraftRequest[]>>({});
+  const [localComposerDrafts, setLocalComposerDrafts] = useState<SessionComposerDraftMap>({});
+  const [localEditDrafts, setLocalEditDrafts] = useState<SessionEditDraftMap>({});
+  const localConsumedEditIdsRef = useRef<Record<string, Set<string>>>({});
+  const composerDrafts = props.composerDrafts ?? localComposerDrafts;
+  const setComposerDrafts = props.onComposerDraftsChange ?? setLocalComposerDrafts;
+  const editDrafts = props.editDrafts ?? localEditDrafts;
+  const setEditDrafts = props.onEditDraftsChange ?? setLocalEditDrafts;
+  const isConsumedForKey = useCallback(
+    (actionId: string) => {
+      if (props.isEditDraftConsumed) return props.isEditDraftConsumed(sessionKey, actionId);
+      return localConsumedEditIdsRef.current[sessionKey]?.has(actionId) === true;
+    },
+    [props.isEditDraftConsumed, sessionKey]
+  );
   const enqueueEditDraft = useCallback(
     (draft: ComposerDraftRequest) => {
-      setEditDrafts((current) => ({
-        ...current,
-        [sessionKey]: [...(current[sessionKey] ?? []), draft],
-      }));
+      const targetKey = draft.sessionKey ?? sessionKey;
+      const alreadyConsumed = props.isEditDraftConsumed
+        ? props.isEditDraftConsumed(targetKey, draft.actionId)
+        : localConsumedEditIdsRef.current[targetKey]?.has(draft.actionId) === true;
+      if (alreadyConsumed) return;
+      setEditDrafts((current) => {
+        const existing = current[targetKey] ?? [];
+        if (existing.some((item) => item.actionId === draft.actionId)) return current;
+        return {
+          ...current,
+          [targetKey]: [...existing, { ...draft, sessionKey: targetKey }],
+        };
+      });
     },
-    [sessionKey]
+    [props.isEditDraftConsumed, sessionKey, setEditDrafts]
   );
   const consumeEditDraft = useCallback(
     (actionId: string) => {
+      if (props.onEditDraftConsumed) {
+        props.onEditDraftConsumed(sessionKey, actionId);
+      } else {
+        const existing = localConsumedEditIdsRef.current[sessionKey] ?? new Set<string>();
+        existing.add(actionId);
+        localConsumedEditIdsRef.current[sessionKey] = existing;
+      }
       setEditDrafts((current) => ({
         ...current,
         [sessionKey]: (current[sessionKey] ?? []).filter((draft) => draft.actionId !== actionId),
       }));
     },
-    [sessionKey]
+    [props.onEditDraftConsumed, sessionKey, setEditDrafts]
+  );
+  const [localQueueOnlyDrafts, setLocalQueueOnlyDrafts] = useState<SessionQueueOnlyMap>({});
+  const queueOnlyDrafts = props.queueOnlyDrafts ?? localQueueOnlyDrafts;
+  const setQueueOnlyDrafts = props.onQueueOnlyDraftsChange ?? setLocalQueueOnlyDrafts;
+  const setQueueOnlyForSession = useCallback(
+    (value: boolean) => {
+      setQueueOnlyDrafts((current) => {
+        if ((current[sessionKey] === true) === value) return current;
+        const next = { ...current };
+        if (value) next[sessionKey] = true;
+        else delete next[sessionKey];
+        return next;
+      });
+    },
+    [sessionKey, setQueueOnlyDrafts]
   );
   const changeDraftText = useCallback(
     (value: import("react").SetStateAction<string>, expectedRevision?: number) => {
@@ -471,7 +536,7 @@ export default function SessionDetail(props: SessionDetailProps) {
         };
       });
     },
-    [sessionKey]
+    [sessionKey, setComposerDrafts]
   );
   return (
     <SessionDetailContent
@@ -490,6 +555,9 @@ export default function SessionDetail(props: SessionDetailProps) {
       changeDraftText={changeDraftText}
       enqueueEditDraft={enqueueEditDraft}
       consumeEditDraft={consumeEditDraft}
+      isEditDraftConsumed={isConsumedForKey}
+      queueOnlyBySession={queueOnlyDrafts[sessionKey] === true}
+      onQueueOnlyChange={setQueueOnlyForSession}
     />
   );
 }
@@ -511,6 +579,9 @@ interface SessionDetailContentProps extends SessionDetailProps {
   ) => void;
   enqueueEditDraft: (draft: ComposerDraftRequest) => void;
   consumeEditDraft: (actionId: string) => void;
+  isEditDraftConsumed: (actionId: string) => boolean;
+  queueOnlyBySession: boolean;
+  onQueueOnlyChange: (value: boolean) => void;
 }
 
 function SessionDetailContent({
@@ -529,8 +600,26 @@ function SessionDetailContent({
   changeDraftText,
   enqueueEditDraft,
   consumeEditDraft,
+  isEditDraftConsumed,
+  queueOnlyBySession,
+  onQueueOnlyChange,
 }: SessionDetailContentProps) {
-  const [messages, setMessages] = useState<SessionMessage[] | null>(null);
+  const contentIdentity = JSON.stringify([
+    session.agentType,
+    session.dshInstanceId ?? null,
+    session.id,
+    appForm,
+  ]);
+  const [messagesState, setMessagesState] = useState<{
+    identity: string;
+    messages: SessionMessage[];
+    codexSavedSource?: "rollout" | "thread_history";
+    truncated: boolean;
+  } | null>(null);
+  const messages = messagesState?.identity === contentIdentity ? messagesState.messages : null;
+  const codexSavedSource =
+    messagesState?.identity === contentIdentity ? messagesState.codexSavedSource : undefined;
+  const truncated = messagesState?.identity === contentIdentity ? messagesState.truncated : false;
   // ===== Codex Desktop IPC 投影（A snapshot）=====
   // 仅 Codex 会话订阅（其余工具 enabled=false 零开销）。可用性按服务端数据渲染：
   // - controllable / send_only / read_only：投影**替换** Codex 会话实时内容源（不与
@@ -615,6 +704,20 @@ function SessionDetailContent({
   // send_gate_static 的展示面单点；本组件不另发请求不另判）。能力横幅据此在
   // 可尝试时不再宣称「暂不能远程发送」（设计 §3.4）。换会话由 composer 重报。
   const [codexSendGate, setCodexSendGate] = useState<boolean | undefined>(undefined);
+  const [codexSendInfo, setCodexSendInfo] = useState<{
+    identity: string;
+    info: SendInfo | null;
+  } | null>(null);
+  const onCodexSendInfo = useCallback(
+    (info: SendInfo | null) => setCodexSendInfo({ identity: contentIdentity, info }),
+    [contentIdentity]
+  );
+  const axSendInfo =
+    appForm &&
+    codexSendInfo?.identity === contentIdentity &&
+    codexSendInfo.info?.route === "desktop_ax"
+      ? codexSendInfo.info
+      : null;
   /** 任务 9：交互路由（唯一来源 = MessageComposer 读到的 send-info 可选字段）。
    *  原生路由下**不挂**旧终端写控件（QuestionCard / ApproveCard / ModeBar）——
    *  这些控件的写动作在服务端已被 409 挡下，挂在界面上只会制造「点了没反应」的
@@ -690,11 +793,12 @@ function SessionDetailContent({
   const codexRevisionNow = codexState?.revision ?? null;
   // R-T4：队列暂停事实（旧载荷缺省 undefined → 与 false 同签——只有真实翻转才触发）
   const codexQueuePaused = codexState?.queuePaused === true;
+  const codexStale = codexState?.stale === true;
   const prevFrameSigRef = useRef<string | null>(null);
   const sendInfoDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const sendInfoFirstPendingAtRef = useRef<number | null>(null);
   useEffect(() => {
-    // 帧签名：档位 / 运行态 / pending 数 / revision / 队列暂停任一变化 = 一帧事件。
+    // 帧签名：档位 / 运行态 / pending 数 / revision / 队列暂停 / stale 任一变化 = 一帧事件。
     // 首拍（null → 首帧）不触发——composer 挂载时本来就会拉一次。
     // Gate F 修正：挂载渲染（codexState=null）**不是帧**——不写哨兵。此前哨兵在
     // 挂载即被写成 null 态签名字符串，导致首帧（snapshot）被误判为变化：去抖
@@ -703,12 +807,12 @@ function SessionDetailContent({
     const sig =
       codexAvailability === null
         ? null
-        : `${codexAvailability}|${codexRuntime}|${codexPendingCount}|${codexRevisionNow}|${codexQueuePaused ? "paused" : "resumed"}`;
+        : `${codexAvailability}|${codexRuntime}|${codexPendingCount}|${codexRevisionNow}|${codexQueuePaused ? "paused" : "resumed"}|${codexStale ? "stale" : "fresh"}`;
     if (sig === null) return;
     const prev = prevFrameSigRef.current;
     prevFrameSigRef.current = sig;
     // 首帧（prev=null = 哨兵未置）只记录不触发——composer 挂载时本来就拉一次；
-    // 此后只有签名真变化（availability/runtimeStatus/pending 数/revision/queuePaused）
+    // 此后只有签名真变化（availability/runtimeStatus/pending 数/revision/queuePaused/stale）
     // 才触发。
     if (prev === null || prev === sig) return;
     // 去抖 + 上限等待（CodexQueuePanel 同款：合并流式帧、不被流式饿死）
@@ -728,6 +832,7 @@ function SessionDetailContent({
     codexPendingCount,
     codexRevisionNow,
     codexQueuePaused,
+    codexStale,
     bumpSendInfo,
   ]);
   useEffect(
@@ -741,20 +846,9 @@ function SessionDetailContent({
   );
   // R16：**稳定来源路由**——Codex App 会话只走投影+新控件，断链也不回旧 TUI 卡；
   // CLI 会话保持旧的终端卡路径。
+  const [adaptResultUnknown, setAdaptResultUnknown] = useState(false);
   useEffect(() => {
-    if (!appForm) return;
-    let alive = true;
-    void (async () => {
-      try {
-        const details = await fetchCodexAdaptStatus(session.id);
-        if (alive) setAdaptHintVisible(!details.hintSeen);
-      } catch {
-        // 读不到详情不打扰用户（提示只是辅助）。
-      }
-    })();
-    return () => {
-      alive = false;
-    };
+    setAdaptResultUnknown(false);
   }, [appForm, session.id]);
   const dismissAdaptHint = useCallback(() => {
     setAdaptHintVisible(false);
@@ -1101,6 +1195,18 @@ function SessionDetailContent({
     (codexState.availability === "controllable" ||
       codexState.availability === "send_only" ||
       codexState.availability === "read_only");
+  // IPC 序号和落盘序号不可比较。过期时显式切换整页，不静默回退或混排。
+  const [preferCodexDisk, setPreferCodexDisk] = useState(false);
+  const [showCodexSqlite, setShowCodexSqlite] = useState(false);
+  useEffect(() => {
+    setShowCodexSqlite(false);
+    setPreferCodexDisk(false);
+  }, [appForm, session.id, session.agentType, session.dshInstanceId]);
+  const effectiveShowCodexSqlite = appForm && showCodexSqlite;
+  const canChooseCodexDisk =
+    codexProjectionActive && codexState?.stale === true && !!messages?.length;
+  const codexProjectionBody =
+    codexProjectionActive && !effectiveShowCodexSqlite && !(canChooseCodexDisk && preferCodexDisk);
   // R07（能力事实同源 + 真实重连展示）：页面同版 `effectiveOperations` 是工具栏与
   // 适配详情**共同**的事实源。展示缓存按 `capabilityIdentity` 键控——同一完整目标
   // 在真实重连（stale、证据槽换代失配）期间沿用上次支持展示；identity 变化即清。
@@ -1133,13 +1239,30 @@ function SessionDetailContent({
   );
   // 头部截断标记（Bug 1，M3 验收）：后端字节窗切掉文件头时为 true——
   // 即使本页条数 < limit 也存在更早内容，按钮必须可见
-  const [truncated, setTruncated] = useState(false);
   const [error, setError] = useState<LoadError | null>(null);
   const [loading, setLoading] = useState(true);
   // 「加载更早消息」：limit 递增整页重拉（后端取文件序尾部 limit 条）
   const [limit, setLimit] = useState(PAGE_LIMIT);
   // 手动刷新信号（页头刷新按钮/错误重试）；F6 轮询同样 bump 此信号复用重拉链路
   const [refreshTick, setRefreshTick] = useState(0);
+  useEffect(() => {
+    if (!appForm) return;
+    let alive = true;
+    void (async () => {
+      try {
+        const details = await fetchCodexAdaptStatus(session.id);
+        if (alive) {
+          setAdaptHintVisible(!details.hintSeen);
+          setAdaptResultUnknown(details.resultUnknown === true);
+        }
+      } catch {
+        // 读不到详情不打扰用户（提示只是辅助）。
+      }
+    })();
+    return () => {
+      alive = false;
+    };
+  }, [appForm, session.id, refreshTick, queueTick]);
   // 折叠覆盖表：seq → 强制折叠/展开；缺省走默认折叠语义（见 isCollapsed）
   const [expandedOverride, setExpandedOverride] = useState<Map<number, boolean>>(new Map());
   // 过程一键折叠模式位（2026-10-04 修复「点了没反应」）：true = 全部过程消息
@@ -1325,11 +1448,16 @@ function SessionDetailContent({
       inflight = true;
       setLoading(true);
       setError(null);
+      const reqIdentity = contentIdentity;
       fetchSessionMessages(session.agentType, session.id, limit)
         .then((pg) => {
           if (!alive) return;
-          setMessages(pg.messages);
-          setTruncated(pg.truncated);
+          setMessagesState({
+            identity: reqIdentity,
+            messages: pg.messages,
+            codexSavedSource: pg.codexSavedSource,
+            truncated: pg.truncated,
+          });
         })
         .catch((e: unknown) => {
           if (alive) setError({ status: e instanceof ApiError ? e.status : null });
@@ -1355,6 +1483,7 @@ function SessionDetailContent({
 
   // 消息流拉取：挂载 / limit 变化 / 手动刷新时重拉（整页替换；M3 不做增量追加
   // 与滚动位置保持——「加载更多」按钮替代无限滚动的裁决即含此简化）
+  const messagesRequestRef = useRef(0);
   useEffect(() => {
     if (session.agentType === "opencode") {
       if (lastNativeHistoryTick.current !== refreshTick) nativeHistoryReload.current?.();
@@ -1362,25 +1491,48 @@ function SessionDetailContent({
       return;
     }
     let alive = true;
+    const reqId = ++messagesRequestRef.current;
+    const reqIdentity = contentIdentity;
     setLoading(true);
     setError(null);
-    fetchSessionMessages(session.agentType, session.id, limit, session.dshInstanceId)
+    fetchSessionMessages(
+      session.agentType,
+      session.id,
+      limit,
+      session.dshInstanceId,
+      false,
+      effectiveShowCodexSqlite ? "thread_history" : undefined
+    )
       .then((pg) => {
-        if (!alive) return;
-        setMessages(pg.messages);
-        setTruncated(pg.truncated);
+        if (!alive || reqId !== messagesRequestRef.current) return;
+        setMessagesState({
+          identity: reqIdentity,
+          messages: pg.messages,
+          codexSavedSource: pg.codexSavedSource,
+          truncated: pg.truncated,
+        });
         setDshModelSummary(pg.dshModelSummary ?? null);
       })
       .catch((e: unknown) => {
-        if (alive) setError({ status: e instanceof ApiError ? e.status : null });
+        if (alive && reqId === messagesRequestRef.current) {
+          setError({ status: e instanceof ApiError ? e.status : null });
+        }
       })
       .finally(() => {
-        if (alive) setLoading(false);
+        if (alive && reqId === messagesRequestRef.current) setLoading(false);
       });
     return () => {
       alive = false;
     };
-  }, [session.agentType, session.id, session.dshInstanceId, limit, refreshTick]);
+  }, [
+    session.agentType,
+    session.id,
+    session.dshInstanceId,
+    appForm,
+    limit,
+    refreshTick,
+    effectiveShowCodexSqlite,
+  ]);
 
   // F6：页面可见期间每 10s 静默轮询刷新会话内容。复用 refreshTick 信号走上方既有
   // 重拉链路（拉取 / alive 清理 / 错误态单点），手动刷新与看板 SSE 均零改动。
@@ -1623,6 +1775,17 @@ function SessionDetailContent({
     },
     [defaultPreviewMode]
   );
+
+  // 暂存条目和在途上传由 composer 持有，预览不得切换当前对话布局。
+  const previewStagedAttachment = useCallback((path: string, stagedAttachmentId?: string) => {
+    setPreview((p) => ({
+      sheet: "files",
+      open: { kind: "file", path, stagedAttachmentId },
+      mode: p?.mode ?? "fullscreen",
+      backToList: false,
+      openSeq: (p?.openSeq ?? 0) + 1,
+    }));
+  }, []);
 
   // 从文件看板进入单文件预览（M3+）：backToList=true → 预览页头显示返回按钮；
   // 布局沿用当前 mode（往返保持，用户裁决「布局保持」）
@@ -2264,7 +2427,7 @@ function SessionDetailContent({
       processToggle={
         nativeConversation
           ? nativeProcessToggle
-          : !codexProjectionActive && toggleableMessages.length > 0
+          : !codexProjectionBody && toggleableMessages.length > 0
             ? {
                 allCollapsed: collapsedCount === toggleableMessages.length,
                 onToggle: collapsedCount === toggleableMessages.length ? expandAll : collapseAll,
@@ -2390,6 +2553,40 @@ function SessionDetailContent({
       {/* 2026-10-20 复审 P2：Codex 控件**不跟随**旧 `isSummary`（idle/finished 时
           QuestionCard 的总结态隐藏条件）；能力、pending、屏障与队列按投影真实状态
           展示。QuestionCard 仍保持原总结态门（终端卡行为不变）。 */}
+      {appForm && adaptResultUnknown && (
+        <p
+          data-testid="codex-result-unknown-note"
+          className="rounded-xl border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300"
+        >
+          {i18n.t("mobile.codex.adapt.diag_result_unknown")}
+        </p>
+      )}
+      {appForm && codexState === null && (
+        <button
+          type="button"
+          className="self-start px-3 py-1 text-xs underline"
+          onClick={() => setCodexAdaptOpen(true)}
+        >
+          {i18n.t("mobile.codex.adapt.title")}
+        </button>
+      )}
+      {codexAdaptOpen && (
+        <CodexAdaptSheet
+          key={`codex-adapt-${session.id}`}
+          sessionId={session.id}
+          open={codexAdaptOpen}
+          onClose={() => setCodexAdaptOpen(false)}
+          // R07：能力表消费**页面同版**事实（含展示缓存补过的 support），
+          // 不读独立 GET 的旧快照。
+          effectiveOperations={codexDisplay.operations}
+          axSendInfo={axSendInfo}
+        />
+      )}
+      {axSendInfo !== null && (
+        <p data-testid="codex-ax-send-note" className="text-xs text-[var(--mut)]">
+          {codexAxStatusCopy(axSendInfo)}
+        </p>
+      )}
       {codexState !== null ? (
         <>
           {/* R16：App 会话不再挂"总能力徽标"（逐操作工具栏已承担解释职责）；
@@ -2403,7 +2600,8 @@ function SessionDetailContent({
               sendAttemptable={codexSendGate}
             />
           ) : (
-            // R16：App 会话去掉"总能力徽标"，但**stale（断链/换代）必须如实显示**。
+            // 已选 AX 时，IPC 断链只在详情解释，不否定独立发送通道。
+            axSendInfo === null &&
             codexState.stale && (
               <p
                 data-testid="codex-stale-note"
@@ -2434,19 +2632,9 @@ function SessionDetailContent({
             operations={codexDisplay.operations}
             reconnecting={codexDisplay.reconnecting}
             identityPending={codexDisplay.identityPending}
+            stale={codexState.stale}
             onOpenDetails={() => setCodexAdaptOpen(true)}
           />
-          {codexAdaptOpen && (
-            <CodexAdaptSheet
-              key={`codex-adapt-${session.id}`}
-              sessionId={session.id}
-              open={codexAdaptOpen}
-              onClose={() => setCodexAdaptOpen(false)}
-              // R07：能力表消费**页面同版**事实（含展示缓存补过的 support），
-              // 不读独立 GET 的旧快照。
-              effectiveOperations={codexDisplay.operations}
-            />
-          )}
           {/* 2026-10-28 用户裁决：只展示当前有效交互卡——当前可答组，或本机
               已发出过动作的待核对组；已答/无锚 unknown 不再有历史入口。 */}
           {codexProjectionActive && (
@@ -2499,7 +2687,7 @@ function SessionDetailContent({
                         request={p}
                         writeLocked={codexState.stale}
                         onLocalSkip={
-                          p.kind === "user_input"
+                          p.kind === "user_input" || codexState.stale
                             ? () => pendingSkip(p.requestKey, p.contextToken)
                             : undefined
                         }
@@ -2663,7 +2851,9 @@ function SessionDetailContent({
             refreshSignal={queueTick}
             onQueueStateChanged={bumpSendInfo}
             onEditDraft={enqueueEditDraft}
+            draftRevision={draftTextRevision}
             keepEditDraftOnUnmount
+            disconnected={codexState.stale || codexState.availability === "unavailable"}
             turnControl={appForm ? codexTurnControl : undefined}
           />
           {!codexProjectionActive && !isSummary && !appForm && !dshQuestionInstance && (
@@ -2671,13 +2861,26 @@ function SessionDetailContent({
           )}
         </>
       ) : appForm ? (
-        // App 会话尚无投影：如实显示"连接中"，**不回退终端屏读卡**。
-        <p
-          data-testid="codex-connecting"
-          className="rounded-xl border border-[var(--bd)] bg-[var(--cd)] px-3 py-2 text-xs text-[var(--mut)]"
-        >
-          {i18n.t("mobile.codex.ops.connecting")}
-        </p>
+        // App 会话尚无投影：如实显示"连接中"并仍可查看/管理本设备未派发的 Tuvis 本地待发项，
+        // **不回退终端屏读卡**。
+        <>
+          <p
+            data-testid="codex-connecting"
+            className="rounded-xl border border-[var(--bd)] bg-[var(--cd)] px-3 py-2 text-xs text-[var(--mut)]"
+          >
+            {i18n.t("mobile.codex.ops.connecting")}
+          </p>
+          <CodexQueuePanel
+            key={`codex-queue-${session.id}`}
+            sessionId={session.id}
+            refreshSignal={queueTick}
+            onQueueStateChanged={bumpSendInfo}
+            onEditDraft={enqueueEditDraft}
+            draftRevision={draftTextRevision}
+            keepEditDraftOnUnmount
+            disconnected
+          />
+        </>
       ) : (
         // ZCode：原生 pending 只在 `ZcodeControlPanel` 里渲染（R1）；旧终端问答卡
         // 一律不挂载——它不是原生降级卡，残留只会与官方卡并存。
@@ -2755,6 +2958,20 @@ function SessionDetailContent({
   //   正文/文件/子 agent 这条既有读取链完全不受影响（本页照常渲染）；
   // - 非 ZCode 会话逐字走原 MessageComposer（零回归）。
   // 两处布局分支（分屏对话列 / 正文列）共用同一份选择逻辑，钥匙前缀互异。
+  // **AX 通道下不看 Desktop IPC 的投影状态**（2026-11-28）。
+  //
+  // `codexState` 是 Desktop IPC 通道的投影；`stale` / `unavailable` 描述的是
+  // **IPC 是否连着**，与 macOS AX 通道无关。AX 通道由 `send-info` 的
+  // `route: "desktop_ax"` 单独申报，若这里仍按 IPC 状态判"桌面端未连接"，
+  // 手机端会在本地直接禁用输入框——AX 通道永远走不到（实测就是这个问题）。
+  //
+  // 判据放在 `MessageComposer` 内部更合适（它才拿得到 `sendInfo.route`），
+  // 这里保留原语义供 IPC 路径使用；AX 场景由 composer 覆盖。
+  const codexDisconnected =
+    appForm &&
+    codexState !== null &&
+    (codexState.stale === true || codexState.availability === "unavailable");
+  const [composerAttachments, setComposerAttachments] = useState<ComposerAttachment[]>([]);
   const composerArea =
     session.agentType === "zcode" ? (
       <ZcodeControlPanel key={`zcode-composer-${session.id}`} sessionId={session.id} />
@@ -2762,6 +2979,12 @@ function SessionDetailContent({
       <MessageComposer
         editDraft={editDraft}
         onEditDraftConsumed={consumeEditDraft}
+        onEnqueueEditDraft={enqueueEditDraft}
+        isEditDraftConsumed={isEditDraftConsumed}
+        queueOnlyBySession={queueOnlyBySession}
+        onQueueOnlyChange={onQueueOnlyChange}
+        attachments={composerAttachments}
+        onAttachmentsChange={setComposerAttachments}
         draftText={draftText}
         draftTextRevision={draftTextRevision}
         onDraftTextChange={changeDraftText}
@@ -2769,6 +2992,7 @@ function SessionDetailContent({
         session={session}
         onQueueChanged={bumpQueue}
         onSendGate={setCodexSendGate}
+        onSendInfo={onCodexSendInfo}
         onInteractionRoute={handleInteractionRoute}
         conversationTarget={conversationTarget}
         showConversation={nativeConversation}
@@ -2776,15 +3000,78 @@ function SessionDetailContent({
         onNativeSnapshot={handleNativeSnapshot}
         refreshSendInfoSignal={sendInfoTick}
         disableTerminalProbes={appForm}
+        allowLocalDraft={appForm}
+        codexDisconnected={codexDisconnected}
+        onPreviewAttachment={previewStagedAttachment}
         turnControl={appForm ? codexTurnControl : undefined}
         dshTurnControl={session.agentType === "dsh" ? dshTurnControl : undefined}
       />
     );
 
   // 消息区（split 布局复用同一份 JSX）
+  const historySource = !appForm
+    ? null
+    : codexProjectionBody
+      ? codexState?.contentState === "ready" || codex.loadedMessages.length > 0
+        ? codexState?.stale
+          ? "snapshot"
+          : "ipc"
+        : null
+      : messages === null
+        ? null
+        : codexSavedSource === "thread_history"
+          ? "sqlite"
+          : (codexSavedSource ?? "saved");
+  const historySourceCopy = {
+    snapshot: "mobile.detail.codexSnapshotSource",
+    ipc: "mobile.detail.codexIpcSource",
+    sqlite: "mobile.detail.codexSqliteSource",
+    rollout: "mobile.detail.codexRolloutSource",
+    saved: "mobile.detail.codexHistorySource",
+  } as const;
   const messageArea = (
     <>
-      {codexProjectionActive && codexState !== null && (
+      {appForm && (!codexProjectionBody || codexState?.stale) && (
+        <button
+          type="button"
+          data-testid="codex-sqlite-history-choice"
+          onClick={() => {
+            setMessagesState(null);
+            setShowCodexSqlite((previous) => !previous);
+          }}
+          className="mb-2 block text-xs text-[var(--mut)] underline"
+        >
+          {i18n.t(
+            showCodexSqlite
+              ? "mobile.detail.codexShowDefaultHistory"
+              : "mobile.detail.codexShowSqliteHistory"
+          )}
+        </button>
+      )}
+      {canChooseCodexDisk && !showCodexSqlite && (
+        <button
+          type="button"
+          data-testid="codex-history-source-choice"
+          onClick={() => setPreferCodexDisk((previous) => !previous)}
+          className="mb-2 block text-xs text-[var(--mut)] underline"
+        >
+          {i18n.t(
+            preferCodexDisk
+              ? "mobile.detail.codexShowLastSnapshot"
+              : "mobile.detail.codexShowSavedMessages"
+          )}
+        </button>
+      )}
+      {historySource && (
+        <p
+          data-testid="codex-history-source"
+          data-source={historySource}
+          className="mb-2 text-xs text-[var(--mut)]"
+        >
+          {i18n.t(historySourceCopy[historySource])}
+        </p>
+      )}
+      {codexProjectionBody && codexState !== null && (
         <div
           data-testid="codex-projection"
           data-availability={codexState.availability}
@@ -2883,7 +3170,7 @@ function SessionDetailContent({
       )}
       {/* 总结模式提示行（Bug 8）：仅总结模式且有可折叠过程消息时出现。
           原生投影取代通用消息源时，通用折叠控件一并隐藏，不得操作隐藏源 */}
-      {!codexProjectionActive &&
+      {!codexProjectionBody &&
         !nativeConversation &&
         isSummary &&
         toggleableMessages.length > 0 && (
@@ -2937,7 +3224,7 @@ function SessionDetailContent({
         </div>
       )}
       {!nativeConversation &&
-        !codexProjectionActive &&
+        !codexProjectionBody &&
         messages !== null &&
         !error &&
         messages.length === 0 && (
@@ -2981,7 +3268,7 @@ function SessionDetailContent({
         </button>
       )}
       <div ref={setConversationTarget} />
-      {!codexProjectionActive && !nativeConversation && hasLoadMore && (
+      {!codexProjectionBody && !nativeConversation && hasLoadMore && (
         <div className="pt-1 pb-3 text-center">
           <button
             type="button"
@@ -2999,110 +3286,105 @@ function SessionDetailContent({
           </button>
         </div>
       )}
-      {!nativeConversation &&
-        !codexProjectionActive &&
-        messages !== null &&
-        messages.length > 0 && (
-          <ul className="space-y-2 pb-4">
-            {messages.map((m) => {
-              const collapsed = isCollapsed(m);
-              const toggleable = isToggleable(m);
-              const isUser = m.kind === "user";
-              const msgBookmark = bookmarkByAnchor.get(messageAnchor(m));
-              const renderMedia = (item: DshMediaReference) => (
-                <DshInlineMedia
-                  key={JSON.stringify([session.dshInstanceId, session.id, item.refId])}
-                  media={item}
-                  instanceId={session.dshInstanceId}
-                  sessionId={session.id}
-                  onOpen={() => openDshMedia(item)}
-                />
-              );
-              const dshMedia = session.agentType === "dsh" ? (m.media ?? []) : [];
-              // 交付件是阅读入口，不属于可折叠的工具参数或执行过程。
-              const isDelivery = (item: DshMediaReference) =>
-                toggleable &&
-                m.kind === "tool-call" &&
-                m.toolName === "present" &&
-                item.kind === "file";
-              const deliveries = dshMedia.filter(isDelivery);
-              const inlineMedia = dshMedia.filter((item) => !isDelivery(item));
-              const mediaByRef = new Map(inlineMedia.map((media) => [media.refId, media]));
-              const body = !inlineMedia.length ? (
-                renderBody(m)
-              ) : m.blocks?.length ? (
-                <div>
-                  {m.blocks.map((block, index) => {
-                    if (block.kind === "text")
-                      return (
-                        <div key={index} className="whitespace-pre-wrap">
-                          {renderLinkifiedText(block.text)}
-                        </div>
-                      );
-                    const item = mediaByRef.get(block.refId);
-                    return item ? renderMedia(item) : null;
-                  })}
-                </div>
-              ) : (
-                <>
-                  {renderBody(m)}
-                  {inlineMedia.map(renderMedia)}
-                </>
-              );
-              return (
-                <li
-                  key={m.seq}
-                  data-testid={`msg-${m.seq}`}
-                  data-kind={m.kind}
-                  data-seq={m.seq}
+      {!nativeConversation && !codexProjectionBody && messages !== null && messages.length > 0 && (
+        <ul className="space-y-2 pb-4">
+          {messages.map((m) => {
+            const collapsed = isCollapsed(m);
+            const toggleable = isToggleable(m);
+            const isUser = m.kind === "user";
+            const msgBookmark = bookmarkByAnchor.get(messageAnchor(m));
+            const renderMedia = (item: DshMediaReference) => (
+              <DshInlineMedia
+                key={JSON.stringify([session.dshInstanceId, session.id, item.refId])}
+                media={item}
+                instanceId={session.dshInstanceId}
+                sessionId={session.id}
+                onOpen={() => openDshMedia(item)}
+              />
+            );
+            const dshMedia = session.agentType === "dsh" ? (m.media ?? []) : [];
+            // 交付件是阅读入口，不属于可折叠的工具参数或执行过程。
+            const isDelivery = (item: DshMediaReference) =>
+              toggleable &&
+              m.kind === "tool-call" &&
+              m.toolName === "present" &&
+              item.kind === "file";
+            const deliveries = dshMedia.filter(isDelivery);
+            const inlineMedia = dshMedia.filter((item) => !isDelivery(item));
+            const mediaByRef = new Map(inlineMedia.map((media) => [media.refId, media]));
+            const body = !inlineMedia.length ? (
+              renderBody(m)
+            ) : m.blocks?.length ? (
+              <div>
+                {m.blocks.map((block, index) => {
+                  if (block.kind === "text")
+                    return (
+                      <div key={index} className="whitespace-pre-wrap">
+                        {renderLinkifiedText(block.text)}
+                      </div>
+                    );
+                  const item = mediaByRef.get(block.refId);
+                  return item ? renderMedia(item) : null;
+                })}
+              </div>
+            ) : (
+              <>
+                {renderBody(m)}
+                {inlineMedia.map(renderMedia)}
+              </>
+            );
+            return (
+              <li
+                key={m.seq}
+                data-testid={`msg-${m.seq}`}
+                data-kind={m.kind}
+                data-seq={m.seq}
+                className={
+                  isUser ? "relative flex flex-col items-end" : "relative flex flex-col items-start"
+                }
+              >
+                {/* 书签角标（M3+）：该消息命中书签时在气泡左上显示色点 */}
+                {msgBookmark && (
+                  <span
+                    data-testid={`msg-bookmark-${m.seq}`}
+                    title={i18n.t("mobile.detail.bookmarkTitle", {
+                      preview: msgBookmark.preview,
+                    })}
+                    className="absolute -top-1 -left-1 h-2.5 w-2.5 rounded-full ring-2 ring-[var(--pg)]"
+                    style={{ backgroundColor: msgBookmark.color }}
+                  />
+                )}
+                <div
                   className={
                     isUser
-                      ? "relative flex flex-col items-end"
-                      : "relative flex flex-col items-start"
+                      ? "max-w-[85%] rounded-2xl rounded-br-sm border border-[var(--cb)] bg-[var(--bub)] px-3 py-2"
+                      : "w-full rounded-2xl rounded-bl-sm border border-[var(--cb)] bg-[var(--cbg)] px-3 py-2"
                   }
                 >
-                  {/* 书签角标（M3+）：该消息命中书签时在气泡左上显示色点 */}
-                  {msgBookmark && (
-                    <span
-                      data-testid={`msg-bookmark-${m.seq}`}
-                      title={i18n.t("mobile.detail.bookmarkTitle", {
-                        preview: msgBookmark.preview,
-                      })}
-                      className="absolute -top-1 -left-1 h-2.5 w-2.5 rounded-full ring-2 ring-[var(--pg)]"
-                      style={{ backgroundColor: msgBookmark.color }}
-                    />
+                  {toggleable ? (
+                    <>
+                      <button
+                        type="button"
+                        data-testid={`msg-${m.seq}-toggle`}
+                        aria-expanded={!collapsed}
+                        onClick={() => toggleCollapsed(m)}
+                        className="-mx-1 flex w-[calc(100%+8px)] items-center gap-1 rounded-lg px-1 py-0.5 text-left text-xs text-[var(--mut)] hover:bg-[var(--cb)]/60 dark:hover:bg-[var(--btnp)]"
+                      >
+                        {collapsed ? <ChevronRight size={13} /> : <ChevronDown size={13} />}
+                        <span className="truncate">{collapsedLabel(m)}</span>
+                      </button>
+                      {!collapsed && <div className="mt-1">{body}</div>}
+                    </>
+                  ) : (
+                    body
                   )}
-                  <div
-                    className={
-                      isUser
-                        ? "max-w-[85%] rounded-2xl rounded-br-sm border border-[var(--cb)] bg-[var(--bub)] px-3 py-2"
-                        : "w-full rounded-2xl rounded-bl-sm border border-[var(--cb)] bg-[var(--cbg)] px-3 py-2"
-                    }
-                  >
-                    {toggleable ? (
-                      <>
-                        <button
-                          type="button"
-                          data-testid={`msg-${m.seq}-toggle`}
-                          aria-expanded={!collapsed}
-                          onClick={() => toggleCollapsed(m)}
-                          className="-mx-1 flex w-[calc(100%+8px)] items-center gap-1 rounded-lg px-1 py-0.5 text-left text-xs text-[var(--mut)] hover:bg-[var(--cb)]/60 dark:hover:bg-[var(--btnp)]"
-                        >
-                          {collapsed ? <ChevronRight size={13} /> : <ChevronDown size={13} />}
-                          <span className="truncate">{collapsedLabel(m)}</span>
-                        </button>
-                        {!collapsed && <div className="mt-1">{body}</div>}
-                      </>
-                    ) : (
-                      body
-                    )}
-                    {deliveries.map(renderMedia)}
-                  </div>
-                </li>
-              );
-            })}
-          </ul>
-        )}
+                  {deliveries.map(renderMedia)}
+                </div>
+              </li>
+            );
+          })}
+        </ul>
+      )}
     </>
   );
 
@@ -3198,7 +3480,7 @@ function SessionDetailContent({
         loading={fileLoading}
         onScopeChange={setFileScope}
         onOpenFile={openFileFromList}
-        onLocate={codexProjectionActive ? locateFromPanel : undefined}
+        onLocate={codexProjectionBody ? locateFromPanel : undefined}
         fontScale={fontScale}
       />
     ) : subagentsShown ? (
@@ -3226,12 +3508,13 @@ function SessionDetailContent({
         session={session}
         filePath={preview.open.path}
         mediaRefId={preview.open.mediaRefId}
+        stagedAttachmentId={preview.open.stagedAttachmentId}
         mode={preview.mode}
         fontScale={fontScale}
         refreshKey={preview.openSeq}
         onBack={preview.backToList ? backToBoard : undefined}
         onLocate={
-          codexProjectionActive && openFilePath !== null
+          codexProjectionBody && openFilePath !== null
             ? () => locateFileInMessages(openFilePath)
             : undefined
         }

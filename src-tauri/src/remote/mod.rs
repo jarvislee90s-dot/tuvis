@@ -5,7 +5,10 @@ pub mod api;
 #[cfg(test)]
 pub mod attachment_fixtures;
 pub mod attachments;
+pub mod candidate_read_scope;
 pub mod codex_adapt;
+#[cfg(target_os = "macos")]
+pub mod codex_ax_send;
 pub mod codex_evidence;
 pub mod codex_ipc;
 pub mod codex_question_skip;
@@ -300,8 +303,10 @@ pub async fn codex_adapt_status() -> Result<serde_json::Value, String> {
             crate::database::dao::settings::get_setting_conn(c, KEY_AUTO_ADAPT).as_deref(),
         )
     });
-    let status = hub.adapter.adapt_status(explicit).await;
-    serde_json::to_value(status).map_err(|e| format!("codex_adapt_status: {e}"))
+    let status = hub.adapter.adapt_status_cached(explicit).await;
+    let mut value = serde_json::to_value(status).map_err(|e| format!("codex_adapt_status: {e}"))?;
+    value["desktopObservation"] = serde_json::json!(hub.adapter.desktop_observation(None).await);
+    Ok(value)
 }
 
 /// 兼容发送开关读取（**store 缝版本**）：直用调用方传入的 conn（锁内只做这一条
@@ -781,8 +786,13 @@ static STATE: Lazy<std::sync::Arc<server::RemoteState>> = Lazy::new(|| {
         //（桌面外观配置器经 set_setting 命令写入）；未配置 → None → 端点回落默认值
         ui_config_source: Box::new(|| crate::database::get_setting("remote_ui_config")),
         // P8 数据同源：显示路径读扫描总线的成功快照（初始化首扫未发布时等待；之后不触发
-        // 补扫，陈旧上限 = 档位）
-        session_source: Box::new(crate::adapter::scan_bus::current_or_scan),
+        // 补扫，陈旧上限 = 档位）。
+        // 候选读取范围（见 `candidate_read_scope`）：scope 生效时快照按批准会话
+        // 白名单过滤——候选页面结构上无法看到未批准线程。
+        session_source: Box::new(|| {
+            let snap = crate::adapter::scan_bus::current_or_scan();
+            scope_filter_sessions(snap)
+        }),
         // 动作路径专用：保证快照新鲜——龄超 2s 补扫并等待（上限 3s）；超时按现有
         // 快照降级继续并告警（F3 degraded 标记：本任务只落日志，API 契约留待后续）
         fresh_session_source: Box::new(|| {
@@ -796,7 +806,7 @@ static STATE: Lazy<std::sync::Arc<server::RemoteState>> = Lazy::new(|| {
                     snap.scanned_at.elapsed()
                 );
             }
-            snap.data.clone()
+            scope_filter_sessions(snap.data.clone())
         }),
         // C7 配对不确定信号缝（spec §5）：运行进程 (工具, 项目) 表 = sysinfo 全量
         // 快照 + 桌面跳转门同款收集函数（同一实现单点，桌面门零改动）。非 Windows
@@ -911,8 +921,12 @@ static STATE: Lazy<std::sync::Arc<server::RemoteState>> = Lazy::new(|| {
         // M3 Task 1：host 载荷同源直调（P8b 读 settings + enabledTools 读 DB，注入缝供测试）
         host_source: Box::new(host_info),
         // M3 Task 7：会话内容同源直调（八工具统一出口 content::read_session_messages，
-        // 注入缝供端点测试；生产签名 fn(&str,&str,usize) 与 trait 对象形态一致）
-        message_source: Box::new(content::read_session_messages),
+        // 注入缝供端点测试；生产签名 fn(&str,&str,usize) 与 trait 对象形态一致）。
+        // 候选读取范围：scope 生效时只读批准根 + 批准会话，越界/未配置一律拒绝
+        //（不回退通用读源）。日用构建 scope 恒不生效，行为不变。
+        message_source: Box::new(|agent: &str, sid: &str, limit: usize| {
+            scope_read_messages(agent, sid, limit)
+        }),
         // M3 Task 8：文件路径源同源直调（files::extract_file_paths 内部复用 content
         // 层读取，注入缝供端点测试）
         path_source: Box::new(files::extract_file_paths),
@@ -1009,8 +1023,10 @@ static STATE: Lazy<std::sync::Arc<server::RemoteState>> = Lazy::new(|| {
         // 未声明的通道（如 tailscale Funnel）结构性回落全局桶（见 gate::rate_bucket_key）
         rate_bucket_channels_source: Box::new(rate_bucket_channels_from_snapshot),
         // M5 P2-a 追记：敏感黑名单的主目录基准（真实 home；取不到时 read_file_safe
-        // 走全段保守匹配分支）
-        home_source: Box::new(real_home_dir),
+        // 走全段保守匹配分支）。
+        // 候选读取范围：scope 生效时恒返回批准根——显式 SQLite 读取与文件预览都
+        // 无法指向真实 home。
+        home_source: Box::new(scope_home_dir),
         // 三终端语言自适应（C-3）：桌面当前语言内存源（前端经 set_desktop_language
         // 命令推送；STATE 单例持有，推送与 /host 下发同源）
         desktop_language: language::LanguageSource::default(),
@@ -1306,6 +1322,64 @@ fn channel_hosts(c: &tunnel::ChannelStatus) -> Vec<String> {
 /// `read_file_safe` 随之走全段保守匹配分支（fail-closed）。
 fn real_home_dir() -> Option<String> {
     dirs::home_dir().and_then(|h| h.to_str().map(str::to_string))
+}
+
+/// 候选读取范围生效时按批准会话白名单过滤扫描快照；Invalid 策略过滤为空
+///（fail-closed）；非候选（Absent）原样返回（日用零变化）。
+fn scope_filter_sessions(
+    mut snapshot: crate::session::SessionsResponse,
+) -> crate::session::SessionsResponse {
+    match candidate_read_scope::policy() {
+        candidate_read_scope::CandidatePolicy::Absent => {}
+        candidate_read_scope::CandidatePolicy::Active(scope) => {
+            snapshot
+                .sessions
+                .retain(|s| scope.allows(s.agent_type.tool_id(), &s.id));
+            snapshot.total_count = snapshot.sessions.len();
+            snapshot.waiting_count = snapshot
+                .sessions
+                .iter()
+                .filter(|s| matches!(s.status, crate::session::SessionStatus::Waiting))
+                .count();
+        }
+        candidate_read_scope::CandidatePolicy::Invalid(_) => {
+            snapshot.sessions.clear();
+            snapshot.total_count = 0;
+            snapshot.waiting_count = 0;
+        }
+    }
+    snapshot
+}
+
+/// 读链 home：Active → 批准根；Invalid → None（拒绝）；Absent → 真实 home。
+fn scope_home_dir() -> Option<String> {
+    match candidate_read_scope::policy() {
+        candidate_read_scope::CandidatePolicy::Active(scope) => scope.home_string(),
+        candidate_read_scope::CandidatePolicy::Invalid(_) => None,
+        candidate_read_scope::CandidatePolicy::Absent => real_home_dir(),
+    }
+}
+
+/// 正文读链：Active → 批准根 + 批准会话；Invalid → 拒绝；Absent → 生产基线。
+fn scope_read_messages(
+    agent_type: &str,
+    session_id: &str,
+    limit: usize,
+) -> Result<content::MessagesPage, String> {
+    match candidate_read_scope::policy() {
+        candidate_read_scope::CandidatePolicy::Active(scope) => {
+            if !scope.allows(agent_type, session_id) {
+                return Err(format!(
+                    "CANDIDATE_READ_SCOPE_DENIED: 会话不在候选批准范围内: {agent_type}/{session_id}"
+                ));
+            }
+            content::read_session_messages_with(&scope.root, agent_type, session_id, limit)
+        }
+        candidate_read_scope::CandidatePolicy::Invalid(error) => Err(error.clone()),
+        candidate_read_scope::CandidatePolicy::Absent => {
+            content::read_session_messages(agent_type, session_id, limit)
+        }
+    }
 }
 
 /// 最近一次解析成功的命名地址（P2-c 自动记忆，tunnel.rs 摄取点写入）

@@ -911,9 +911,17 @@ export default function PendingRequestCard({
           {i18n.t("mobile.codex.pending.writeLocked")}
         </p>
       )}
+      {writeLocked && (
+        <p
+          data-testid="pending-stale-note"
+          className="mt-1 text-xs text-amber-700 dark:text-amber-400"
+        >
+          {i18n.t("mobile.codex.pending.staleSnapshotNote")}
+        </p>
+      )}
 
       {/* 动作区：command/permissions 两按钮；user_input 提交；unsupported 无按钮 */}
-      {(operable || (isInput && onLocalSkip)) && (
+      {(operable || ((isInput || writeLocked) && onLocalSkip)) && (
         <div className="mt-2 flex flex-wrap items-center gap-2">
           {operable &&
             (isInput ? (
@@ -1010,7 +1018,7 @@ export default function PendingRequestCard({
                 )}
               </>
             ))}
-          {isInput && onLocalSkip && (
+          {(isInput || writeLocked) && onLocalSkip && (
             <button
               type="button"
               data-testid="codex-pending-local-skip"

@@ -1425,6 +1425,8 @@ export function newActionId(): string {
 
 /** 适配详情（GET /codex/adapt-status；**不携包路径/源码**）。 */
 export interface CodexAdaptDetails {
+  desktopObservation?: import("@/lib/api/remote").CodexDesktopObservation;
+  resultUnknown?: boolean | null;
   sessionId: string;
   systemVersion: string;
   tuvisVersion: string;
@@ -1481,6 +1483,8 @@ function asAdaptDetails(v: unknown): CodexAdaptDetails {
     autoAdaptEnabled: d.autoAdaptEnabled,
     hintSeen: d.hintSeen,
     effectiveOperations: asEffectiveOperations(d.effectiveOperations),
+    desktopObservation: d.desktopObservation,
+    resultUnknown: typeof d.resultUnknown === "boolean" ? d.resultUnknown : null,
     lastFailure:
       d.lastFailure && typeof d.lastFailure === "object"
         ? {

@@ -1,10 +1,14 @@
-import { useCallback, useState } from "react";
+import { useCallback, useRef, useState } from "react";
 import { Toaster } from "sonner";
 import ArchiveBoard from "./ArchiveBoard";
 import ArchiveDetail from "./ArchiveDetail";
 import Board from "./Board";
 import PairPage from "./PairPage";
-import SessionDetail from "./SessionDetail";
+import SessionDetail, {
+  type SessionComposerDraftMap,
+  type SessionEditDraftMap,
+  type SessionQueueOnlyMap,
+} from "./SessionDetail";
 import type { ArchivedSession } from "./api";
 import type { Session } from "@/types/session";
 
@@ -33,6 +37,20 @@ export default function App() {
   // 对齐到 Board 既有轮询数据（SSE 跃迁/快照 + 降级 3s 轮询）——停留详情期间
   // status 自动更新（红卡/总结横幅自动切换），无需重进页面
   const [selected, setSelected] = useState<Session | null>(null);
+  const [composerDrafts, setComposerDrafts] = useState<SessionComposerDraftMap>({});
+  const [editDrafts, setEditDrafts] = useState<SessionEditDraftMap>({});
+  // Task3：「修改」取回稿的只入队约束与草稿同层持有——返回看板再进入同一会话时
+  // 仍按草稿范围保留（不做跨刷新/跨设备持久化）。
+  const [queueOnlyDrafts, setQueueOnlyDrafts] = useState<SessionQueueOnlyMap>({});
+  const consumedEditIdsRef = useRef<Record<string, Set<string>>>({});
+  const isEditDraftConsumed = useCallback((sessionKey: string, actionId: string) => {
+    return consumedEditIdsRef.current[sessionKey]?.has(actionId) === true;
+  }, []);
+  const markEditDraftConsumed = useCallback((sessionKey: string, actionId: string) => {
+    const existing = consumedEditIdsRef.current[sessionKey] ?? new Set<string>();
+    existing.add(actionId);
+    consumedEditIdsRef.current[sessionKey] = existing;
+  }, []);
   // 历史会话区（spec §7.1）：historyOpen = 历史页开关；archiveSelected = 当前查看的
   // 归档会话（历史页 → 归档详情）。激活回执（onActivated）一次清两级——乐观回看板
   const [historyOpen, setHistoryOpen] = useState(false);
@@ -82,6 +100,14 @@ export default function App() {
           key={`${selected.agentType}:${selected.dshInstanceId ?? ""}:${selected.id}`}
           session={selected}
           onBack={onBackToBoard}
+          composerDrafts={composerDrafts}
+          onComposerDraftsChange={setComposerDrafts}
+          editDrafts={editDrafts}
+          onEditDraftsChange={setEditDrafts}
+          queueOnlyDrafts={queueOnlyDrafts}
+          onQueueOnlyDraftsChange={setQueueOnlyDrafts}
+          isEditDraftConsumed={isEditDraftConsumed}
+          onEditDraftConsumed={markEditDraftConsumed}
         />
       )}
       {paired === true && historyOpen && !archiveSelected && (

@@ -92,14 +92,25 @@ pub fn run() {
     // 不满足 → 「请通过候选启动脚本打开」并立即退出。真实构建 identifier 不同，
     // 本分支恒跳过（行为零变化）。
     let context = tauri::generate_context!();
-    if context.config().identifier == candidate_guard::CANDIDATE_IDENTIFIER {
+    let candidate_policy = if context.config().identifier == candidate_guard::CANDIDATE_IDENTIFIER {
+        if !cfg!(debug_assertions) {
+            candidate_guard::exit_as_candidate(
+                "候选构建仅支持 debug 模式，禁止以 release 形态启动",
+            );
+        }
+        remote::candidate_read_scope::mark_candidate_build();
         let env = candidate_guard::CandidateStartupEnv::from_process_env();
         if let Err(error) =
             candidate_guard::verify_candidate_startup(&env, std::env::current_exe().ok())
         {
             candidate_guard::exit_as_candidate(&error);
         }
-    }
+        // 启动核验通过后立即固定 CandidatePolicy（含批准根与项目目录的 dev/ino），
+        // 避免延迟到首次 /file 读取才固定而被启动后替换的目录绕过。
+        Some(remote::candidate_read_scope::policy())
+    } else {
+        None
+    };
     // 日志**写文件**而非 stderr（2026-10-03 终端污染事故）：debug exe 以分离方式
     // 启动时没有自己的控制台，AttachConsole 读屏/注入期间其它线程的 stderr 写入
     // 会落进**被附加的外部终端**（活体实证：claude TUI 表单行被 兔维斯 WARN 日志
@@ -130,6 +141,9 @@ pub fn run() {
             .try_init(),
         None => builder.try_init(), // 回落 stderr：终端污染可能复发（M4 申报——可检测）
     };
+    if let Some(error) = remote::candidate_read_scope::fixed_invalid_error(candidate_policy) {
+        log::error!("候选读取范围配置非法，读链按全拒策略运行: {error}");
+    }
     // **panic 消息也写日志文件**（评审 M3）：默认 panic hook 写 stderr，AttachConsole
     // 竞态下同样会污染外部终端。包一层：先落文件再交还原 hook。
     let panic_target = dirs::home_dir().map(|h| h.join(".tuvis").join("logs").join("mam.log"));
@@ -197,6 +211,18 @@ pub fn run() {
                 if let Some(window) = app.get_webview_window("main") {
                     window.open_devtools();
                 }
+            }
+            // macOS AX 通道：可选地在启动时**主动请求**辅助功能权限。
+            //
+            // 为什么需要这条：本机 macOS 的「隐私与安全性」面板不列「辅助功能」，
+            // 无法手动把裸二进制加进去；只有 App 自己调用带 prompt 的
+            // `AXIsProcessTrustedWithOptions`，系统才会弹出授权对话框并把本进程
+            // 加进 TCC 列表。
+            //
+            // 只在 `TUVIS_CODEX_AX_REQUEST_TRUST=1` 时触发——正常启动不弹任何对话框。
+            #[cfg(all(target_os = "macos", debug_assertions))]
+            if std::env::var("TUVIS_CODEX_AX_REQUEST_TRUST").as_deref() == Ok("1") {
+                crate::services::codex_desktop_ax_bindings::request_trust_with_prompt();
             }
             // 桌宠窗口：延迟创建（spec §4.1）。不能在 setup 里立即建——Windows 上主窗口
             // WebView2 控制器初始化期存在竞态，立即创建会偶发 E_INVALIDARG 且被

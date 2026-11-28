@@ -23,9 +23,7 @@ use std::sync::Arc;
 use crate::session::ProcessForm;
 
 use super::api::json_no_store;
-use super::codex_ipc::{
-    bad_request, find_session_display_sync, find_session_sync, resolve_session_thread,
-};
+use super::codex_ipc::{bad_request, find_session_sync, resolve_session_thread};
 use super::server::RemoteState;
 
 /// `GET /codex/adapt-status` 查询参数。
@@ -54,10 +52,14 @@ fn desktop_only(session: &crate::session::Session) -> bool {
 async fn load_session(st: &Arc<RemoteState>, session_id: &str) -> Option<crate::session::Session> {
     let probe_st = st.clone();
     let probe_sid = session_id.to_string();
-    tokio::task::spawn_blocking(move || find_session_display_sync(&probe_st, &probe_sid))
-        .await
-        .ok()
-        .flatten()
+    tokio::task::spawn_blocking(move || {
+        super::api::unique_file_session((probe_st.session_source)().sessions, &probe_sid, None)
+            .ok()
+            .flatten()
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 /// 动作 POST /codex/adapt-settings 的会话定位：写设置前取新鲜快照（Task 4 F3）。
@@ -77,7 +79,8 @@ async fn load_session_fresh(
 async fn build_details(
     st: &Arc<RemoteState>,
     session: &crate::session::Session,
-    key: &crate::services::codex_desktop_ipc::types::ThreadKey,
+    key: Option<&crate::services::codex_desktop_ipc::types::ThreadKey>,
+    device_id: Option<&str>,
 ) -> crate::services::codex_desktop_ipc::adapt_status::CodexAdaptDetails {
     use crate::services::codex_desktop_ipc::adapt_status::CodexAdaptDetails;
     let adapter = &st.codex_control.adapter;
@@ -100,7 +103,13 @@ async fn build_details(
             )
         })
         .unwrap_or((true, false));
-    let status = adapter.adapt_status(None).await;
+    let status = adapter.adapt_status_cached(None).await;
+    let result_unknown = key.zip(device_id).and_then(|(key, device_id)| {
+        st.store.with(|conn| conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM codex_actions WHERE thread_id = ?1 AND device_id = ?2 AND state = 'unknown')",
+            rusqlite::params![key.thread_id, device_id], |row| row.get(0),
+        )).ok()
+    });
     CodexAdaptDetails {
         session_id: session.id.clone(),
         system_version: system_version(),
@@ -108,7 +117,9 @@ async fn build_details(
         desktop_build: status.desktop_build.clone(),
         auto_adapt_enabled,
         hint_seen,
-        effective_operations: adapter.effective_operations(key).await,
+        effective_operations: adapter.diagnostic_operations(key),
+        desktop_observation: adapter.desktop_observation(key).await,
+        result_unknown,
         last_failure: status.last_failure.clone(),
     }
 }
@@ -128,9 +139,9 @@ pub async fn codex_adapt_status(
     headers: HeaderMap,
     Query(query): Query<AdaptStatusQuery>,
 ) -> Response {
-    if super::codex_ipc::device_identity(st.as_ref(), &headers).is_none() {
+    let Some((device_id, _)) = super::codex_ipc::device_identity(st.as_ref(), &headers) else {
         return super::codex_ipc::forbidden_defense();
-    }
+    };
     let session_id = query.session_id.trim().to_string();
     if session_id.is_empty() {
         return bad_request();
@@ -141,10 +152,9 @@ pub async fn codex_adapt_status(
     if !desktop_only(&session) {
         return super::codex_ipc::not_found();
     }
-    let Some(key) = resolve_session_thread(&st, &session) else {
-        return super::codex_ipc::not_found();
-    };
-    let details = build_details(&st, &session, &key).await;
+    // 展示路径不改 session 映射；UUID 只是已装载 IPC 镜像的查询键，不是 AX 对位证据。
+    let key = super::codex_ipc::diagnostic_thread_key(&session);
+    let details = build_details(&st, &session, key.as_ref(), Some(&device_id)).await;
     json_no_store(
         StatusCode::OK,
         serde_json::to_value(&details).unwrap_or_else(|_| serde_json::json!({})),
@@ -161,9 +171,9 @@ pub async fn codex_adapt_settings(
         Ok(value) => value,
         Err(_) => return bad_request(),
     };
-    if super::codex_ipc::device_identity(st.as_ref(), &headers).is_none() {
+    let Some((device_id, _)) = super::codex_ipc::device_identity(st.as_ref(), &headers) else {
         return super::codex_ipc::forbidden_defense();
-    }
+    };
     let session_id = change.session_id.trim().to_string();
     if session_id.is_empty() {
         return bad_request();
@@ -202,7 +212,7 @@ pub async fn codex_adapt_settings(
             serde_json::json!({ "error": "internal" }),
         );
     }
-    let details = build_details(&st, &session, &key).await;
+    let details = build_details(&st, &session, Some(&key), Some(&device_id)).await;
     json_no_store(
         StatusCode::OK,
         serde_json::to_value(&details).unwrap_or_else(|_| serde_json::json!({})),

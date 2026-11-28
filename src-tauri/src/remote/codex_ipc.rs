@@ -3369,6 +3369,10 @@ pub(crate) fn find_session_display_sync(
         .find(|s| s.id == session_id)
 }
 
+pub(crate) fn diagnostic_thread_key(session: &crate::session::Session) -> Option<ThreadKey> {
+    resolve_thread(None, &session.id).map(|thread| local_key(&thread.id))
+}
+
 /// session → local ThreadKey（服务端 resolve_thread 单点：rollout 文件名 UUID 权威 →
 /// 仅 UUID 形态会话号回退；非 codex / 无法解析 → None——HTTP 层 404）。
 /// Source/live（合同 §6）：以带票的 resolver 结果装载 session→ThreadKey 映射事实
@@ -4764,6 +4768,16 @@ pub async fn action_manual_resume(
         Ok(None) => {},
         Err(_) => return error_body(StatusCode::INTERNAL_SERVER_ERROR, "internal", None),
     }
+    // Task2（复审 6）：人工继续会解除屏障并创建后继——与 force_continue 同一受限
+    // 目标守卫，必须在事务前拒绝（受限目标零持久变更、零后继）。
+    let resume_key = local_key(&action_thread_id(store, &action_id));
+    if reject_restricted_target(&st, &resume_key).await {
+        return error_body(
+            StatusCode::CONFLICT,
+            "target_disconnected",
+            Some("CODEX_TARGET_DISCONNECTED: 目标当前不可确认，无法人工继续"),
+        );
+    }
     let resumed = store.manual_resume(
         &action_id,
         &device_id,
@@ -5231,6 +5245,13 @@ pub async fn queue_force_continue(
     let Some((device_id, _)) = device_identity(st.as_ref(), &headers) else {
         return forbidden_defense();
     };
+    if let Err(code) = st.codex_control.send_gate_static() {
+        let (status, reason) = static_gate_refusal(code);
+        return json_no_store(
+            status,
+            serde_json::json!({ "error": code, "reasonCode": code, "reason": reason }),
+        );
+    }
     let store = st.codex_control.router.store();
     match store.get_for_device(&action_id, &device_id) {
         Ok(Some(_)) => {}
@@ -5242,6 +5263,17 @@ pub async fn queue_force_continue(
         Ok(id) => id,
         Err(_) => return error_body(StatusCode::INTERNAL_SERVER_ERROR, "internal", None),
     };
+    let key = local_key(&action_thread_id(store, &action_id));
+    // Task2：受限目标（静态门关闭 / 候选授权范围内）在**任何持久变更前**拒绝；
+    // 过期/无镜像投影不是放行证据。已获明确证据的旧原生通道（静态门开、非候选
+    // 范围）继续按既有账本资格处理，不因本项被误禁。
+    if reject_restricted_target(&st, &key).await {
+        return error_body(
+            StatusCode::CONFLICT,
+            "target_disconnected",
+            Some("CODEX_TARGET_DISCONNECTED: 目标当前不可确认，无法恢复派发"),
+        );
+    }
     // S4 前置（设计 §6.1「已受理无 turnId 的显式解除……仍要求新鲜目标状态可输入、
     // 无 pending」）：accepted 且**未绑 Turn** 的行（本出口的主体）解除前必须经
     // 新鲜判定——pending 在场或状态不可确认 → 409 不解除（屏障保留）。unknown 行
@@ -5366,6 +5398,22 @@ pub async fn queue_resume(
     let Some(key) = resolve_session_thread(&st, &session) else {
         return not_found();
     };
+    if let Err(code) = st.codex_control.send_gate_static() {
+        let (status, reason) = static_gate_refusal(code);
+        return json_no_store(
+            status,
+            serde_json::json!({ "error": code, "reasonCode": code, "reason": reason }),
+        );
+    }
+    // Task2：受限目标（静态门关闭 / 候选授权范围内）在**任何持久变更前**拒绝；
+    // 过期/无镜像投影不是放行证据。已获明确证据的旧原生通道不变。
+    if reject_restricted_target(&st, &key).await {
+        return error_body(
+            StatusCode::CONFLICT,
+            "target_disconnected",
+            Some("CODEX_TARGET_DISCONNECTED: 目标当前不可确认，无法恢复派发"),
+        );
+    }
     let store = st.codex_control.router.store();
     match store.clear_queue_pause(&key) {
         Ok(true) => {
@@ -5432,6 +5480,22 @@ async fn fresh_send_gate(hub: &CodexControlHub, key: &ThreadKey) -> SendGate {
         Ok(Ok(Ok(p))) => classify_send_gate(&p),
         _ => SendGate::StateUnknown,
     }
+}
+
+/// Task2：受限目标判定（恢复派发/人工解除共用的持久变更前守卫）。
+///
+/// 受限 = ①静态发送门关闭（该构建/自动适配不允许写）；或②候选授权读取范围生效
+///（本次 P1 交测实例只批准一个只读观察线程）；且该线程投影已过期/无镜像。
+/// 「静态门开 + 非候选范围」的旧原生通道不在此列——它已有明确当前证据，不能被
+/// 本项误禁。
+async fn reject_restricted_target(st: &Arc<RemoteState>, key: &ThreadKey) -> bool {
+    if st.codex_control.send_gate_static().is_err() {
+        return true;
+    }
+    if crate::remote::candidate_read_scope::active_scope().is_none() {
+        return false;
+    }
+    st.codex_control.adapter.projection(key).await.stale
 }
 
 /// 动作的 thread_id（单点读；读取失败保守回空——调用方 ensure 会对空 thread 保守

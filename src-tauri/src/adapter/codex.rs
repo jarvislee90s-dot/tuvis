@@ -24,6 +24,13 @@ impl AgentAdapter for CodexAdapter {
         monitor::codex_parser::get_codex_sessions(processes)
     }
 
+    fn find_sessions_with_conflicts(
+        &self,
+        processes: &[AgentProcess],
+    ) -> (Vec<Session>, Vec<String>) {
+        monitor::codex_parser::get_codex_sessions_with_conflicts(processes)
+    }
+
     fn base_dir(&self) -> std::path::PathBuf {
         dirs::home_dir().unwrap_or_default().join(".codex")
     }

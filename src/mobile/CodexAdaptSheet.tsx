@@ -12,6 +12,9 @@
  */
 import { useCallback, useEffect, useRef, useState } from "react";
 import i18n from "@/i18n";
+import CodexDesktopDiagnostic from "@/components/CodexDesktopDiagnostic";
+import type { SendInfo } from "./api";
+import { codexAxStatusCopy } from "./codex-ax-status";
 import {
   fetchCodexAdaptStatus,
   supportOf,
@@ -29,6 +32,7 @@ export interface CodexAdaptSheetProps {
    *  R07：能力表**只**渲染它；缺省 = 页面还没给出事实 → 不渲染能力表
    *  （不用独立 GET 的旧快照冒充）。 */
   effectiveOperations?: CodexEffectiveOperations;
+  axSendInfo?: SendInfo | null;
 }
 
 export default function CodexAdaptSheet({
@@ -36,6 +40,7 @@ export default function CodexAdaptSheet({
   open,
   onClose,
   effectiveOperations,
+  axSendInfo,
 }: CodexAdaptSheetProps) {
   const [details, setDetails] = useState<CodexAdaptDetails | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -136,6 +141,14 @@ export default function CodexAdaptSheet({
               {details.autoAdaptEnabled ? "ON" : "OFF"}
             </button>
           </dd>
+          {details.desktopObservation && (
+            <CodexDesktopDiagnostic observation={details.desktopObservation} />
+          )}
+          {details.resultUnknown === true && (
+            <p className="text-xs text-amber-700 dark:text-amber-300">
+              {i18n.t("mobile.codex.adapt.diag_result_unknown")}
+            </p>
+          )}
           <dt className="text-[var(--mut)]">{i18n.t("mobile.codex.adapt.latestFailure")}</dt>
           <dd data-testid="codex-adapt-failure">
             {details.lastFailure
@@ -144,42 +157,50 @@ export default function CodexAdaptSheet({
           </dd>
         </dl>
       )}
+      {axSendInfo && (
+        <p data-testid="codex-adapt-ax-send" className="mt-2 text-xs">
+          {codexAxStatusCopy(axSendInfo)}
+        </p>
+      )}
       {effectiveOperations && (
-        <ul data-testid="codex-adapt-ops" className="mt-2 space-y-1 text-xs">
-          {(
-            Object.entries(effectiveOperations.operations) as [
-              string,
-              NonNullable<
-                CodexEffectiveOperations["operations"][keyof CodexEffectiveOperations["operations"]]
-              >,
-            ][]
-          )
-            .filter(([, status]) => status.implemented)
-            .map(([operation, status]) => (
-              <li
-                key={operation}
-                data-testid={`codex-adapt-op-${operation}`}
-                data-allowed={status.allowed ? "true" : "false"}
-                data-support={supportOf(status)}
-                className="flex flex-wrap items-center gap-x-2 gap-y-0.5"
-              >
-                <span className="font-medium">{codexOperationLabel(operation)}</span>
-                {/* T03：支持状态（稳定展示）与当前资格（allowed + 原因）分开说。 */}
-                <span className="text-[var(--mut)]">{codexSupportText(supportOf(status))}</span>
-                <span className={status.allowed ? "text-emerald-600" : "text-[var(--mut)]"}>
-                  {status.allowed
-                    ? i18n.t("mobile.codex.ops.allowed")
-                    : i18n.t("mobile.codex.ops.blocked")}
-                </span>
-                <span className="text-[var(--mut)]">
-                  {i18n.t("mobile.codex.ops.evidence")}: {status.evidence}
-                </span>
-                {status.reasonCode && (
-                  <span className="text-[var(--mut)]">{codexReasonText(status.reasonCode)}</span>
-                )}
-              </li>
-            ))}
-        </ul>
+        <section className="mt-2 text-xs" aria-label={i18n.t("mobile.codex.adapt.ipcOperations")}>
+          <h3 className="font-medium">{i18n.t("mobile.codex.adapt.ipcOperations")}</h3>
+          <ul data-testid="codex-adapt-ops" className="mt-1 space-y-1">
+            {(
+              Object.entries(effectiveOperations.operations) as [
+                string,
+                NonNullable<
+                  CodexEffectiveOperations["operations"][keyof CodexEffectiveOperations["operations"]]
+                >,
+              ][]
+            )
+              .filter(([, status]) => status.implemented)
+              .map(([operation, status]) => (
+                <li
+                  key={operation}
+                  data-testid={`codex-adapt-op-${operation}`}
+                  data-allowed={status.allowed ? "true" : "false"}
+                  data-support={supportOf(status)}
+                  className="flex flex-wrap items-center gap-x-2 gap-y-0.5"
+                >
+                  <span className="font-medium">{codexOperationLabel(operation)}</span>
+                  {/* T03：支持状态（稳定展示）与当前资格（allowed + 原因）分开说。 */}
+                  <span className="text-[var(--mut)]">{codexSupportText(supportOf(status))}</span>
+                  <span className={status.allowed ? "text-emerald-600" : "text-[var(--mut)]"}>
+                    {status.allowed
+                      ? i18n.t("mobile.codex.ops.allowed")
+                      : i18n.t("mobile.codex.ops.blocked")}
+                  </span>
+                  <span className="text-[var(--mut)]">
+                    {i18n.t("mobile.codex.ops.evidence")}: {status.evidence}
+                  </span>
+                  {status.reasonCode && (
+                    <span className="text-[var(--mut)]">{codexReasonText(status.reasonCode)}</span>
+                  )}
+                </li>
+              ))}
+          </ul>
+        </section>
       )}
       {details && !details.hintSeen && (
         <div data-testid="codex-adapt-hint" className="mt-2 rounded-lg bg-[var(--cb)] p-2 text-xs">

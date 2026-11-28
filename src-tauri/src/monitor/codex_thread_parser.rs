@@ -124,21 +124,38 @@ pub fn build_sessions(
     now_s: i64,
     cli_claimed_ids: &HashSet<String>,
 ) -> Vec<Session> {
+    build_sessions_with_conflicts(roots, host, now_s, cli_claimed_ids).0
+}
+
+/// 同 [`build_sessions`]，但同时返回被 `cli_claimed_ids` 抑制的 Desktop 同 ID 列表，
+/// 供候选 `/file` 在展示层抑制之前保留 CLI/Desktop 冲突证据。
+pub fn build_sessions_with_conflicts(
+    roots: &CodexThreadRoots,
+    host: &AgentProcess,
+    now_s: i64,
+    cli_claimed_ids: &HashSet<String>,
+) -> (Vec<Session>, Vec<String>) {
     // 会话真相源打不开 → 整体降级为空（缺库/锁死/损坏不影响其他工具）
     let Some(conn) = open_readonly_with_timeout(&roots.state_db) else {
         debug!("Codex threads: state db 不可读，跳过 {:?}", roots.state_db);
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     };
     let threads = list_recent_threads(&conn, now_s);
+    let suppressed_conflicts: Vec<String> = threads
+        .iter()
+        .filter(|t| cli_claimed_ids.contains(&t.id))
+        .map(|t| t.id.clone())
+        .collect();
     // 内容投影库可选：缺失/锁死只损失精确状态推导，不阻卡
     let history = open_readonly_with_timeout(&roots.history_db);
     let descendants = load_descendant_activity(&conn, now_s);
 
-    threads
+    let sessions = threads
         .iter()
         .filter(|t| !cli_claimed_ids.contains(&t.id))
         .filter_map(|t| build_one(history.as_ref(), t, &descendants, host, now_s))
-        .collect()
+        .collect();
+    (sessions, suppressed_conflicts)
 }
 
 /// 近期会话枚举：24h 窗口 + archived 过滤 + 排除 subagent 源（source 为 JSON 结构
@@ -959,6 +976,48 @@ mod tests {
         assert!(
             via_home.state_db.starts_with(&codex_dir),
             "不得拼出 .codex/.codex"
+        );
+    }
+
+    #[test]
+    fn build_sessions_with_conflicts_preserves_cli_claimed_desktop_ids() {
+        let tmp = tempfile::tempdir().unwrap();
+        let roots = fixture_roots(tmp.path());
+        let now_s = 1_700_000_000;
+        let conn = build_state_db(&roots.state_db);
+        insert_thread(
+            &conn,
+            "shared-cli-desktop-id",
+            tmp.path().to_str().unwrap(),
+            "shared",
+            now_s - 5,
+            false,
+            "app",
+            "",
+            "",
+        );
+        insert_thread(
+            &conn,
+            "desktop-only-id",
+            tmp.path().to_str().unwrap(),
+            "desktop-only",
+            now_s - 5,
+            false,
+            "app",
+            "",
+            "",
+        );
+        drop(conn);
+        let mut claimed = HashSet::new();
+        claimed.insert("shared-cli-desktop-id".to_string());
+        let host = fake_host();
+        let (sessions, conflicts) = build_sessions_with_conflicts(&roots, &host, now_s, &claimed);
+        assert_eq!(sessions.len(), 1, "展示层仍只出 desktop-only-id");
+        assert_eq!(sessions[0].id, "desktop-only-id");
+        assert_eq!(
+            conflicts,
+            vec!["shared-cli-desktop-id".to_string()],
+            "被 cli_claimed_ids 抑制的同 ID 冲突证据必须独立保留"
         );
     }
 }

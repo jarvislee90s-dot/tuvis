@@ -252,6 +252,7 @@ fn question_message_page(
         truncated: false,
         cwd: None,
         older_before: None,
+        codex_saved_source: None,
         dsh_model_summary: None,
     }
 }
@@ -488,9 +489,24 @@ fn fixture_on(
 ) -> Fixture {
     // 把 HOME/全局库重定向到可写 temp（沙箱内也不再触碰真实 ~/.tuvis）。
     support::setup();
+    let state = fixture_state(conn.clone(), sessions, hub_builder);
+    let app = router(state.clone());
+    Fixture {
+        conn,
+        state,
+        app,
+        peer,
+    }
+}
+
+fn fixture_state(
+    conn: SharedConn,
+    sessions: Vec<Session>,
+    hub_builder: impl FnOnce(DeviceStore) -> Arc<CodexControlHub>,
+) -> Arc<RemoteState> {
     let store = DeviceStore::Owned(conn.clone());
     let has_question_page = sessions.iter().any(|s| s.agent_type.tool_id() == "codex");
-    let state = Arc::new(RemoteState {
+    Arc::new(RemoteState {
         ui_config_source: Box::new(|| None),
         subagent_source: std::collections::HashMap::new(),
         subagent_message_source: std::collections::HashMap::new(),
@@ -540,7 +556,7 @@ fn fixture_on(
         now_source: Box::new(|| chrono::Utc::now().timestamp_millis()),
         via_hosts_source: Box::new(|| None),
         rate_bucket_channels_source: Box::new(Vec::new),
-        home_source: Box::new(|| None),
+        home_source: Box::new(|| std::env::var("HOME").ok()),
         injector: Arc::new(multi_agents_manager_lib::inject::engine::RealInjector),
         resume_spawner: Arc::new(|_: &multi_agents_manager_lib::inject::resume::SpawnSpec| Ok(())),
         create_hub: Arc::new(multi_agents_manager_lib::remote::server::CreateTaskHub::stub()),
@@ -562,14 +578,7 @@ fn fixture_on(
                 DeviceStore::Owned(conn.clone()),
             ),
         ),
-    });
-    let app = router(state.clone());
-    Fixture {
-        conn,
-        state,
-        app,
-        peer,
-    }
+    })
 }
 
 impl Fixture {
@@ -2048,7 +2057,10 @@ async fn send_info_h3_off_ipc_available_injectable_true() {
 /// 把「能力未验证」误报成「无头未开」）。
 #[tokio::test]
 async fn send_info_h3_off_ipc_unavailable_still_disabled() {
-    let f = fixture_disabled(vec![codex_app_session(THREAD)]);
+    let project = tempfile::tempdir().unwrap();
+    let mut session = codex_app_session(THREAD);
+    session.project_path = project.path().to_string_lossy().into_owned();
+    let f = fixture_disabled(vec![session]);
     let r = f
         .app
         .clone()
@@ -2063,6 +2075,675 @@ async fn send_info_h3_off_ipc_unavailable_still_disabled() {
     let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
     assert_eq!(v["injectable"], serde_json::json!(false));
     assert_eq!(v["reasonCode"], "capability_unverified", "{v}");
+    if cfg!(target_os = "macos") {
+        assert_eq!(v["attachmentUploadOnly"], true, "{v}");
+    } else {
+        assert!(v.get("attachmentUploadOnly").is_none(), "{v}");
+    }
+}
+
+#[tokio::test]
+async fn send_info_with_no_project_does_not_offer_attachment_staging() {
+    let mut session = codex_app_session(THREAD);
+    session.project_path.clear();
+    let f = fixture_disabled(vec![session]);
+    let r = f
+        .app
+        .oneshot(req(
+            "GET",
+            &format!("/m/api/v1/session-send-info?session_id={THREAD}"),
+            Some(COOKIE),
+            None,
+        ))
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    assert_eq!(v["injectable"], false, "{v}");
+    assert!(v.get("attachmentUploadOnly").is_none(), "{v}");
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn codex_staging_never_recreates_a_removed_project() {
+    let root = tempfile::tempdir().unwrap();
+    let removed = root.path().join("removed project ");
+    let mut session = codex_app_session(THREAD);
+    session.project_path = removed.to_string_lossy().into_owned();
+    let fixture = fixture_disabled(vec![session]);
+    let request = axum::http::Request::post(format!(
+        "/m/api/v1/session-attachment?session_id={THREAD}&name=sample.txt&interaction_route=codex_desktop_staging"
+    ))
+    .header("cookie", COOKIE)
+    .header("content-type", "application/octet-stream")
+    .body(axum::body::Body::from("p1-sample"))
+    .unwrap();
+    let response = fixture.app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), 404);
+    assert!(body_string(response).await.contains("no_cwd"));
+    assert!(!removed.exists());
+    assert!(!root.path().join("removed project").exists());
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn codex_staging_png_roundtrips_and_rejects_ambiguous_or_wrong_session() {
+    use base64::Engine as _;
+    use http_body_util::BodyExt as _;
+    let root = tempfile::tempdir().unwrap();
+    let mut a = codex_app_session(THREAD);
+    a.project_path = root
+        .path()
+        .join("project A ")
+        .to_string_lossy()
+        .into_owned();
+    std::fs::create_dir(&a.project_path).unwrap();
+    let git_info = std::path::Path::new(&a.project_path)
+        .join(".git")
+        .join("info");
+    std::fs::create_dir_all(&git_info).unwrap();
+    let exclude_file = git_info.join("exclude");
+    std::fs::write(&exclude_file, "# existing\n").unwrap();
+    let mut b = codex_app_session("019d0000-0000-7000-8000-0000000000bb");
+    b.project_path = root.path().join("project B").to_string_lossy().into_owned();
+    std::fs::create_dir(&b.project_path).unwrap();
+    let mut other = a.clone();
+    other.project_path = b.project_path.clone();
+    let png = base64::engine::general_purpose::STANDARD.decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAFElEQVR4nGP4z8DAAMIM////ZwAAHu8E/KPItPcAAAAASUVORK5CYII="
+    ).unwrap();
+    let post = |session_id: &str, cookie: Option<&str>| {
+        let mut request = axum::http::Request::post(format!(
+            "/m/api/v1/session-attachment?session_id={session_id}&name=sample.png&interaction_route=codex_desktop_staging"
+        )).header("content-type", "application/octet-stream");
+        if let Some(cookie) = cookie {
+            request = request.header("cookie", cookie);
+        }
+        request.body(axum::body::Body::from(png.clone())).unwrap()
+    };
+    let multi = fixture_disabled(vec![a.clone(), other.clone()]);
+    let refusal = multi.app.oneshot(post(THREAD, Some(COOKIE))).await.unwrap();
+    assert_eq!(refusal.status(), 403);
+    assert!(body_string(refusal).await.contains("ambiguous_session"));
+    let f = fixture_disabled(vec![a.clone(), b.clone()]);
+    seed_device(&f.conn, "dev-2", "OtherPhone");
+    assert_eq!(
+        f.app
+            .clone()
+            .oneshot(post("wrong-session", Some(COOKIE)))
+            .await
+            .unwrap()
+            .status(),
+        404
+    );
+    assert_eq!(
+        f.app
+            .clone()
+            .oneshot(post(THREAD, None))
+            .await
+            .unwrap()
+            .status(),
+        403
+    );
+    assert!(!std::path::Path::new(&a.project_path)
+        .join(".tuvis-attachments")
+        .exists());
+    assert!(!std::path::Path::new(&other.project_path)
+        .join(".tuvis-attachments")
+        .exists());
+    let (parts, _) = post(THREAD, Some(COOKIE)).into_parts();
+    let broken = axum::http::Request::from_parts(parts, axum::body::Body::from(png[..40].to_vec()));
+    let rejected = f.app.clone().oneshot(broken).await.unwrap();
+    assert_eq!(rejected.status(), 422);
+    assert!(body_string(rejected).await.contains("invalid_png"));
+    assert!(!std::path::Path::new(&a.project_path)
+        .join(".tuvis-attachments")
+        .exists());
+    let uploaded = f
+        .app
+        .clone()
+        .oneshot(post(THREAD, Some(COOKIE)))
+        .await
+        .unwrap();
+    assert_eq!(uploaded.status(), 200);
+    let response: serde_json::Value = serde_json::from_str(&body_string(uploaded).await).unwrap();
+    // P1-UPLOAD：Tuvis 自管隔离暂存——不下发本机路径，不写项目树，不改 .git/info/exclude
+    assert!(response.get("path").is_none());
+    let attachment_id = response["attachmentId"].as_str().unwrap();
+    assert_eq!(attachment_id.len(), 32);
+    assert!(!std::path::Path::new(&a.project_path)
+        .join(".tuvis-attachments")
+        .exists());
+    assert_eq!(
+        std::fs::read_to_string(&exclude_file).unwrap(),
+        "# existing\n"
+    );
+    // 错会话 / 错设备 / 非法 ID 预览一律拒绝
+    let wrong_session = f
+        .app
+        .clone()
+        .oneshot(req(
+            "GET",
+            &format!(
+                "/m/api/v1/session-attachment/preview?session_id={}&attachment_id={attachment_id}",
+                b.id
+            ),
+            Some(COOKIE),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(wrong_session.status(), 403);
+    let wrong_device = f
+        .app
+        .clone()
+        .oneshot(req(
+            "GET",
+            &format!(
+                "/m/api/v1/session-attachment/preview?session_id={THREAD}&attachment_id={attachment_id}"
+            ),
+            Some("mam_device=dev-2"),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(wrong_device.status(), 403);
+    let invalid_id = f
+        .app
+        .clone()
+        .oneshot(req(
+            "GET",
+            &format!(
+                "/m/api/v1/session-attachment/preview?session_id={THREAD}&attachment_id=../etc"
+            ),
+            Some(COOKIE),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(invalid_id.status(), 400);
+    // 通用 /file 端点不得绕过受控预览直接读 Tuvis 暂存区明文
+    let staged_abs = std::path::PathBuf::from(std::env::var("HOME").unwrap())
+        .join(".tuvis")
+        .join("codex-staging")
+        .join("files")
+        .join(attachment_id);
+    let mut bypass_url = reqwest::Url::parse("http://localhost/m/api/v1/file").unwrap();
+    bypass_url
+        .query_pairs_mut()
+        .append_pair("session_id", THREAD)
+        .append_pair("path", &staged_abs.to_string_lossy());
+    let generic_bypass = f
+        .app
+        .clone()
+        .oneshot(req(
+            "GET",
+            &format!("/m/api/v1/file?{}", bypass_url.query().unwrap()),
+            Some("mam_device=dev-2"),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(generic_bypass.status(), 403);
+    // 同设备同会话受控预览返回原 PNG 字节
+    let preview = f
+        .app
+        .oneshot(req(
+            "GET",
+            &format!(
+                "/m/api/v1/session-attachment/preview?session_id={THREAD}&attachment_id={attachment_id}"
+            ),
+            Some(COOKIE),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(preview.status(), 200);
+    assert_eq!(preview.headers()["content-type"], "image/png");
+    assert_eq!(
+        preview
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .as_ref(),
+        png
+    );
+    for conn in [f.conn, multi.conn] {
+        let actions: i64 = conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM codex_actions", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(actions, 0);
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn codex_staging_aborted_body_does_not_write_or_dispatch() {
+    let root = tempfile::tempdir().unwrap();
+    let mut a = codex_app_session(THREAD);
+    a.project_path = root.path().to_string_lossy().into_owned();
+    let f = fixture_disabled(vec![a]);
+    let stream = futures::stream::iter([
+        Ok(axum::body::Bytes::from_static(b"partial")),
+        Err(std::io::Error::new(
+            std::io::ErrorKind::ConnectionAborted,
+            "fixture abort",
+        )),
+    ]);
+    let request = axum::http::Request::post(format!(
+        "/m/api/v1/session-attachment?session_id={THREAD}&name=partial.png&interaction_route=codex_desktop_staging"
+    )).header("cookie", COOKIE).header("content-type", "application/octet-stream")
+        .body(axum::body::Body::from_stream(stream)).unwrap();
+    assert!(!f.app.oneshot(request).await.unwrap().status().is_success());
+    assert!(!root.path().join(".tuvis-attachments").exists());
+    let actions: i64 = f
+        .conn
+        .lock()
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM codex_actions", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(actions, 0);
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn codex_staging_rejects_non_png_oversize_truncated_sidecar_mismatch_and_revoked_device() {
+    use base64::Engine as _;
+    let root = tempfile::tempdir().unwrap();
+    let mut a = codex_app_session(THREAD);
+    a.project_path = root.path().to_string_lossy().into_owned();
+    let f = fixture_disabled(vec![a]);
+    let home = std::path::PathBuf::from((f.state.home_source)().unwrap());
+
+    // 1. 非 PNG（即使后缀不是 .png）必须拒绝（422 invalid_png）
+    let req_txt = axum::http::Request::post(format!(
+        "/m/api/v1/session-attachment?session_id={THREAD}&name=notes.txt&interaction_route=codex_desktop_staging"
+    ))
+    .header("cookie", COOKIE)
+    .header("content-type", "application/octet-stream")
+    .body(axum::body::Body::from(b"plain text".to_vec()))
+    .unwrap();
+    assert_eq!(f.app.clone().oneshot(req_txt).await.unwrap().status(), 422);
+
+    // 2. 超出统一 PNG 上限（> 5MB）必须拒绝（413）
+    let oversize = vec![0u8; (5 * 1024 * 1024) + 1];
+    let req_big = axum::http::Request::post(format!(
+        "/m/api/v1/session-attachment?session_id={THREAD}&name=big.png&interaction_route=codex_desktop_staging"
+    ))
+    .header("cookie", COOKIE)
+    .header("content-type", "application/octet-stream")
+    .body(axum::body::Body::from(oversize))
+    .unwrap();
+    assert_eq!(f.app.clone().oneshot(req_big).await.unwrap().status(), 413);
+
+    // 3. 长文件名导致截断丢后缀时，合法 PNG 仍按格式事实成功上传并预览为 image/png
+    let long_name = format!("{}_final_image.png", "a".repeat(220));
+    let png = base64::engine::general_purpose::STANDARD
+        .decode("iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAFElEQVR4nGP4z8DAAMIM////ZwAAHu8E/KPItPcAAAAASUVORK5CYII=")
+        .unwrap();
+    let req_long = axum::http::Request::post(format!(
+        "/m/api/v1/session-attachment?session_id={THREAD}&name={long_name}&interaction_route=codex_desktop_staging"
+    ))
+    .header("cookie", COOKIE)
+    .header("content-type", "application/octet-stream")
+    .body(axum::body::Body::from(png.clone()))
+    .unwrap();
+    let up_res = f.app.clone().oneshot(req_long).await.unwrap();
+    assert_eq!(up_res.status(), 200);
+    let up_json: serde_json::Value = serde_json::from_str(&body_string(up_res).await).unwrap();
+    let attachment_id = up_json["attachmentId"].as_str().unwrap().to_owned();
+
+    let prev_res = f
+        .app
+        .clone()
+        .oneshot(req(
+            "GET",
+            &format!("/m/api/v1/session-attachment/preview?session_id={THREAD}&attachment_id={attachment_id}"),
+            Some(COOKIE),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(prev_res.status(), 200);
+    assert_eq!(prev_res.headers().get("content-type").unwrap(), "image/png");
+
+    // 4. 侧车记录 attachment_id 错位 → 403
+    let meta_path = home
+        .join(".tuvis")
+        .join("codex-staging")
+        .join("meta")
+        .join(format!("{attachment_id}.json"));
+    let orig_meta = std::fs::read(&meta_path).unwrap();
+    let mut swapped: serde_json::Value = serde_json::from_slice(&orig_meta).unwrap();
+    swapped["attachment_id"] = serde_json::json!("ffffffffffffffffffffffffffffffff");
+    std::fs::write(&meta_path, serde_json::to_vec(&swapped).unwrap()).unwrap();
+    let mismatch_res = f
+        .app
+        .clone()
+        .oneshot(req(
+            "GET",
+            &format!("/m/api/v1/session-attachment/preview?session_id={THREAD}&attachment_id={attachment_id}"),
+            Some(COOKIE),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(mismatch_res.status(), 403);
+    std::fs::write(&meta_path, &orig_meta).unwrap();
+
+    // 5. 实际文件被截短 → 403
+    let data_path = home
+        .join(".tuvis")
+        .join("codex-staging")
+        .join("files")
+        .join(&attachment_id);
+    std::fs::write(&data_path, &png[..8]).unwrap();
+    let trunc_res = f
+        .app
+        .clone()
+        .oneshot(req(
+            "GET",
+            &format!("/m/api/v1/session-attachment/preview?session_id={THREAD}&attachment_id={attachment_id}"),
+            Some(COOKIE),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(trunc_res.status(), 403);
+    std::fs::write(&data_path, &png).unwrap();
+
+    // 5b. 同长度有效 PNG 替换（记录↔实际文件绑定）：摘要不符 → 403
+    let mut evil = png.clone();
+    // 翻转 IDAT 前的一个字节制造不同内容（仍为合法 PNG 长度不变）
+    let idx = evil.len() / 2;
+    evil[idx] ^= 0x01;
+    std::fs::write(&data_path, &evil).unwrap();
+    let replaced = f
+        .app
+        .clone()
+        .oneshot(req(
+            "GET",
+            &format!("/m/api/v1/session-attachment/preview?session_id={THREAD}&attachment_id={attachment_id}"),
+            Some(COOKIE),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert!(
+        replaced.status() == 403,
+        "同长度替换必须被摘要绑定拒绝，实际 {}",
+        replaced.status()
+    );
+    std::fs::write(&data_path, &png).unwrap();
+
+    // 5c. 旧记录缺摘要 → 拒绝（fail-closed）
+    let mut no_digest: serde_json::Value = serde_json::from_slice(&orig_meta).unwrap();
+    no_digest.as_object_mut().unwrap().remove("sha256");
+    std::fs::write(&meta_path, serde_json::to_vec(&no_digest).unwrap()).unwrap();
+    let no_digest_res = f
+        .app
+        .clone()
+        .oneshot(req(
+            "GET",
+            &format!("/m/api/v1/session-attachment/preview?session_id={THREAD}&attachment_id={attachment_id}"),
+            Some(COOKIE),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(no_digest_res.status(), 403);
+    std::fs::write(&meta_path, &orig_meta).unwrap();
+
+    // 5d. 暂存对象的硬链接别名：通用 /file 按 inode 拒绝（不只按路径文本）
+    let alias = root.path().join("alias.png");
+    if std::fs::hard_link(&data_path, &alias).is_ok() {
+        let alias_res = f
+            .app
+            .clone()
+            .oneshot(req(
+                "GET",
+                &format!(
+                    "/m/api/v1/file?session_id={THREAD}&path={}",
+                    alias.to_string_lossy()
+                ),
+                Some(COOKIE),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            alias_res.status(),
+            403,
+            "暂存对象的别名不得经通用 /file 暴露"
+        );
+    }
+
+    // 6. 吊销设备后预览被拒（403）
+    DeviceStore::Owned(f.conn.clone()).with(|c| revoke_device(c, "dev-1").unwrap());
+    let revoked_res = f
+        .app
+        .clone()
+        .oneshot(req(
+            "GET",
+            &format!("/m/api/v1/session-attachment/preview?session_id={THREAD}&attachment_id={attachment_id}"),
+            Some(COOKIE),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(revoked_res.status(), 403);
+    assert!(!root.path().join(".tuvis-attachments").exists());
+}
+
+#[tokio::test]
+async fn codex_diagnostic_unknown_without_connecting_or_inventing_a_failed_operation() {
+    let f = fixture_disabled(vec![codex_app_session(THREAD)]);
+    let response = f
+        .app
+        .oneshot(req(
+            "GET",
+            &format!("/m/api/v1/codex/adapt-status?sessionId={THREAD}"),
+            Some(COOKIE),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let value: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
+    assert_eq!(value["desktopObservation"]["endpoint"], "ownership_unknown");
+    assert_eq!(value["desktopObservation"]["thread"], "unknown");
+    assert!(value["lastFailure"].is_null());
+}
+
+/// 只读现场核证使用显式单会话根；默认回归不读任何真实会话。
+#[cfg(target_os = "macos")]
+#[tokio::test]
+#[ignore = "仅用于已明确授权的单线程落盘核证"]
+async fn mac_p1_authorized_thread_read_http() {
+    let home = std::path::PathBuf::from(std::env::var_os("TUVIS_P1_AUTHORIZED_READ_ROOT").unwrap());
+    let sid = std::env::var("TUVIS_P1_AUTHORIZED_READ_ID").unwrap();
+    assert!(multi_agents_manager_lib::inject::headless::codex::is_uuid(
+        &sid
+    ));
+    let entries = std::fs::read_dir(home.join(".codex/sessions"))
+        .unwrap()
+        .collect::<std::io::Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(entries.len(), 1, "只能核证本次明确授权的一条 rollout");
+    assert!(entries[0].file_name().to_string_lossy().contains(&sid));
+    let expected_user = std::env::var("TUVIS_P1_AUTHORIZED_EXPECT_USER").unwrap();
+    let expected_reply = std::env::var("TUVIS_P1_AUTHORIZED_EXPECT_REPLY").unwrap();
+    let conn = shared_conn();
+    seed_device(&conn, "dev-1", "P1 read verifier");
+    let mut card = codex_app_session(&sid);
+    card.pid = 0;
+    let mut state = fixture_state(conn, vec![card], |store| {
+        Arc::new(CodexControlHub::disabled_with_store(store))
+    });
+    let allowed = sid.clone();
+    Arc::get_mut(&mut state).unwrap().message_source = Box::new(move |agent, thread, limit| {
+        if agent != "codex" || thread != allowed {
+            return Err("会话不在已授权核证范围".into());
+        }
+        multi_agents_manager_lib::remote::content::read_session_messages_with(
+            &home, agent, thread, limit,
+        )
+    });
+    let app = router(state);
+    let url = format!("/m/api/v1/session-messages?agent_type=codex&session_id={sid}");
+    let unauthorized = app
+        .clone()
+        .oneshot(req("GET", &url, None, None))
+        .await
+        .unwrap();
+    assert_eq!(unauthorized.status(), 403);
+    for _ in 0..2 {
+        let response = app
+            .clone()
+            .oneshot(req("GET", &url, Some(COOKIE), None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let page: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
+        let matches = |item: &serde_json::Value, role: &str, text: &str| {
+            item["role"].as_str() == Some(role)
+                && item["content"].as_str().map(str::trim) == Some(text)
+        };
+        assert_eq!(page["codexSavedSource"], "rollout");
+        let messages = page["messages"].as_array().unwrap();
+        assert!(
+            messages.iter().enumerate().any(|(i, item)| {
+                matches(item, "user", &expected_user)
+                    && messages[i + 1..]
+                        .iter()
+                        .any(|item| matches(item, "assistant", &expected_reply))
+            }),
+            "只核对正式消息顺序，不输出会话内容"
+        );
+    }
+}
+
+/// 独立进程内的合成 A/B，绝不调用 Tauri run、生产 serve、Hook 或进程扫描启动。
+#[cfg(all(target_os = "macos", debug_assertions))]
+#[tokio::test]
+#[ignore = "手动合成 Mac /m 交测进程"]
+async fn mac_p1_fixture_serve() {
+    let pin_path = std::env::var_os("TUVIS_P1_PIN_FILE").expect("需要 0600 测试 PIN 文件");
+    let pin_meta = std::fs::symlink_metadata(&pin_path).unwrap();
+    use std::os::unix::fs::PermissionsExt as _;
+    assert!(pin_meta.is_file() && pin_meta.permissions().mode() & 0o777 == 0o600);
+    let pin = std::fs::read_to_string(pin_path).unwrap();
+    assert!(multi_agents_manager_lib::remote::pin::validate_pin(&pin));
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().canonicalize().unwrap();
+    std::env::set_var("HOME", &home);
+    std::env::set_var("TUVIS_HOME", &home);
+    let rollouts = home.join(".codex/sessions/2026/11/25");
+    std::fs::create_dir_all(&rollouts).unwrap();
+    let mut sessions = Vec::new();
+    for (name, sid) in [("A", THREAD), ("B", "0f1e2d3c-1111-4222-8333-444455556667")] {
+        let project = home.join(format!("fixture-{name}"));
+        std::fs::create_dir(&project).unwrap();
+        let mut session = codex_app_session(sid);
+        session.pid = 0;
+        session.project_name = format!("Mac P1 synthetic {name}");
+        session.project_path = project.to_string_lossy().into_owned();
+        let meta = serde_json::json!({"type":"session_meta","payload":{"id":sid, "cwd":project}});
+        let user = serde_json::json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":format!("P1 fixture {name} input")}]}});
+        let reply = serde_json::json!({"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":format!("P1 fixture {name} reply")}]}});
+        std::fs::write(
+            rollouts.join(format!("rollout-2026-11-25-{sid}.jsonl")),
+            format!("{meta}\n{user}\n{reply}\n"),
+        )
+        .unwrap();
+        sessions.push(session);
+    }
+    // 两种来源故意不同。UI 显式查看 SQLite 时必须拿到整页，而不是按正文去重。
+    let db = rusqlite::Connection::open(home.join(".codex/thread_history_1.sqlite")).unwrap();
+    db.execute_batch("CREATE TABLE thread_items(thread_id TEXT, item_type TEXT, item_json TEXT, created_at_ms INTEGER, rollout_ordinal INTEGER);").unwrap();
+    for (offset, (kind, text)) in [
+        (
+            "userMessage",
+            serde_json::json!({"content":[{"type":"text","text":"P1 fixture A input"}]}),
+        ),
+        (
+            "agentMessage",
+            serde_json::json!({"text":"P1 fixture A SQLite-only reply"}),
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        db.execute(
+            "INSERT INTO thread_items VALUES(?1,?2,?3,0,?4)",
+            rusqlite::params![THREAD, kind, text.to_string(), offset as i64],
+        )
+        .unwrap();
+    }
+    drop(db);
+    let allowed: Vec<_> = sessions.iter().map(|session| session.id.clone()).collect();
+    let conn = shared_conn();
+    let mut state = fixture_state(conn, sessions, |store| {
+        Arc::new(CodexControlHub::disabled_with_store(store))
+    });
+    let cfg = Arc::get_mut(&mut state).expect("没有启动任何后台消费者");
+    let read_home = home.clone();
+    cfg.message_source = Box::new(move |agent, sid, limit| {
+        if agent != "codex" || !allowed.iter().any(|id| id == sid) {
+            return Err("not a fixture session".into());
+        }
+        multi_agents_manager_lib::remote::content::read_session_messages_with(
+            &read_home, agent, sid, limit,
+        )
+    });
+    let home_source = home.clone();
+    cfg.home_source = Box::new(move || Some(home_source.to_string_lossy().into_owned()));
+    let pin = pin.trim().to_owned();
+    cfg.pin_source = Box::new(move || Some(pin.clone()));
+    cfg.host_source = Box::new(|| {
+        serde_json::json!({
+            "host":{"name":"Mac P1 synthetic only", "platform":"macos"},
+            "enabledTools":["codex"], "installedTools":[],
+        })
+    });
+    let bind: std::net::Ipv4Addr = std::env::var("TUVIS_P1_BIND")
+        .unwrap_or_else(|_| "127.0.0.1".into())
+        .parse()
+        .unwrap();
+    assert!(bind.is_loopback() || bind.is_private());
+    let listener = tokio::net::TcpListener::bind((bind, 0)).await.unwrap();
+    let address = listener.local_addr().unwrap();
+    println!(
+        "Mac P1 synthetic only: http://{address}/m/ · isolated root {}",
+        home.display()
+    );
+    let a_file = rollouts.join(format!("rollout-2026-11-25-{THREAD}.jsonl"));
+    let initial_a = std::fs::read_to_string(&a_file).unwrap();
+    let next = serde_json::json!({"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"P1 fixture A new saved reply"}]}});
+    let advanced = format!("{initial_a}{next}\n");
+    let advance_guard = std::sync::Mutex::new(());
+    let app = multi_agents_manager_lib::remote::server::mac_p1_fixture_router(
+        state,
+        Arc::new(move || {
+            let _guard = advance_guard.lock().unwrap();
+            let next_file = a_file.with_extension("next");
+            std::fs::write(&next_file, &advanced)?;
+            std::fs::rename(next_file, &a_file)
+        }),
+    );
+    // 临时交测入口自动关闭，不装常驻服务；配对数据只在本进程的私有内存库。
+    let _ = tokio::time::timeout(Duration::from_secs(60 * 60), async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap()
+    })
+    .await;
 }
 
 // ============================================================
@@ -33216,4 +33897,314 @@ async fn b05_batch_leader_single_frame_members_read_accepted() {
     }
     // 合批后无其他帧（单帧合同）。
     assert!(!peer_has_traffic(&mut peer).await, "合批后无其他帧");
+}
+
+#[tokio::test]
+async fn task2_queue_resume_and_force_continue_reject_when_static_gate_disabled_without_mutating_store(
+) {
+    let f = fixture_with(
+        vec![codex_app_session(THREAD)],
+        |store| Arc::new(CodexControlHub::disabled_with_store(store)),
+        None,
+    );
+    let key = f.thread_key();
+    f.hub_store()
+        .set_queue_pause(&key, "manual_test", "act-pause", None)
+        .unwrap();
+    seed_unknown_barrier(&f.hub_store(), "act-unk-disabled");
+
+    let r_resume = f
+        .app
+        .clone()
+        .oneshot(req(
+            "POST",
+            "/m/api/v1/codex/queue/resume",
+            Some(COOKIE),
+            Some(serde_json::json!({ "sessionId": THREAD }).to_string()),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r_resume.status(), 403);
+    assert!(
+        f.hub_store().queue_pause(&key).unwrap().is_some(),
+        "queue_resume 拒绝后队列暂停必须保持"
+    );
+
+    let r_force = force_continue(&f, Some(COOKIE), "act-unk-disabled").await;
+    assert_eq!(r_force.status(), 403);
+    assert!(
+        f.hub_store().has_compat_fence(&key).unwrap(),
+        "force_continue 拒绝后屏障必须保持"
+    );
+}
+
+/// **R2 第 4 bullet 的 HTTP 层回归**：AX 通道真的经过真实 Router，不是只测状态机。
+///
+/// 三条断言分别对应计划原文：
+/// 1. 「AX 打开仍不可绕过历史 unknown」——`desktop_ipc` 未决行必须让 AX 写入被拒；
+/// 2. 「缺 `actionId` 被拒」——不带 actionId 的请求不得进入写入；
+/// 3. 「合格 AX 请求可带同 ID 核对」——`send-info` 申报 `route=desktop_ax`。
+///
+/// 前两条都在触碰 AX 之前返回（这正是 I5 要求的顺序），因此**不需要真实辅助功能权限**。
+#[cfg(target_os = "macos")]
+mod ax_http_gate {
+    use super::*;
+    use axum::http::StatusCode;
+
+    /// 进程级开关守卫：`TUVIS_CODEX_AX_SEND` 是全局环境变量，并行用例会互相干扰。
+    /// 本测试模块内用同一把锁串行化，并在 Drop 时还原（含 panic 路径）。
+    struct AxSwitchGuard {
+        _g: std::sync::MutexGuard<'static, ()>,
+        prev: Option<String>,
+    }
+
+    impl AxSwitchGuard {
+        fn on() -> Self {
+            static LOCK: StdMutex<()> = StdMutex::new(());
+            let g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let prev = std::env::var("TUVIS_CODEX_AX_SEND").ok();
+            std::env::set_var("TUVIS_CODEX_AX_SEND", "1");
+            Self { _g: g, prev }
+        }
+    }
+
+    impl Drop for AxSwitchGuard {
+        fn drop(&mut self) {
+            match self.prev.take() {
+                Some(v) => std::env::set_var("TUVIS_CODEX_AX_SEND", v),
+                None => std::env::remove_var("TUVIS_CODEX_AX_SEND"),
+            }
+        }
+    }
+
+    /// 开关打开 + 设备鉴权通过时，`send-info` 应申报 AX 可尝试。
+    #[tokio::test]
+    async fn send_info_reports_desktop_ax_route_when_switch_on() {
+        let f = fixture_ipc(vec![codex_app_session(THREAD)]);
+        let uri = format!("/m/api/v1/session-send-info?session_id={THREAD}");
+        let _guard = AxSwitchGuard::on();
+        let res = f
+            .app
+            .clone()
+            .oneshot(req("GET", &uri, Some(COOKIE), None))
+            .await
+            .unwrap();
+        let status = res.status();
+        let body = body_string(res).await;
+        assert_eq!(status, StatusCode::OK, "send-info 恒 200；body={body}");
+        let v: serde_json::Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(
+            v.get("route").and_then(|r| r.as_str()),
+            Some("desktop_ax"),
+            "开关打开且有设备鉴权时应申报 AX 路由；body={body}"
+        );
+        assert_eq!(
+            v.get("injectable").and_then(|r| r.as_bool()),
+            Some(true),
+            "AX 通道可尝试；body={body}"
+        );
+    }
+
+    /// **历史 `desktop_ipc` 未决行不得被 AX 开关绕过。**
+    #[tokio::test]
+    async fn ax_switch_cannot_bypass_historic_ipc_unknown() {
+        let f = fixture_ipc(vec![codex_app_session(THREAD)]);
+        // 用既有统一终态构造历史未决（与生产同路径，不新造语义）。
+        seed_unknown_barrier(&f.hub_store(), "legacy-ipc-1");
+        let body = send_body("ax-should-not-send", Some("ax-after-unknown"), false);
+        let _guard = AxSwitchGuard::on();
+        let res = f
+            .app
+            .clone()
+            .oneshot(req(
+                "POST",
+                "/m/api/v1/session-send",
+                Some(COOKIE),
+                Some(body),
+            ))
+            .await
+            .unwrap();
+        let status = res.status();
+        let out = body_string(res).await;
+        assert_eq!(status, StatusCode::OK, "业务拒绝走 200；body={out}");
+        let v: serde_json::Value = serde_json::from_str(&out).expect("json");
+        assert_eq!(
+            v.get("reasonCode").and_then(|r| r.as_str()),
+            Some("ax_action_unresolved"),
+            "历史 IPC 未决必须阻断 AX 新写；body={out}"
+        );
+        assert_eq!(
+            v.get("status").and_then(|r| r.as_str()),
+            Some("desktop_ax_not_touched"),
+            "拒绝必须是零副作用档；body={out}"
+        );
+        // 且不得为这条请求留下任何账本行（拒绝发生在登记之前）。
+        assert!(
+            f.hub_store()
+                .get_for_device("ax-after-unknown", "dev-1")
+                .unwrap()
+                .is_none(),
+            "被屏障拒绝的请求不得落账"
+        );
+    }
+
+    /// AX 通道可用时，普通忙态仍留在原生 IPC 队列，不得改走 AX。
+    #[tokio::test]
+    async fn send_info_with_ipc_busy_keeps_native_queue_instead_of_ax() {
+        let mut f = fixture_ipc(vec![codex_app_session(THREAD)]);
+        let mut peer = f.peer.take().unwrap();
+        let (_sse, _) = sse_hold_ensure(&f, &mut peer, THREAD, vec![], "idle").await;
+        push_snapshot(&mut peer, THREAD, 8, "active", vec![]).await;
+        wait_snapshot_applied(&f, 8, true).await;
+
+        let _guard = AxSwitchGuard::on();
+        let res = f
+            .app
+            .clone()
+            .oneshot(req(
+                "GET",
+                &format!("/m/api/v1/session-send-info?session_id={THREAD}"),
+                Some(COOKIE),
+                None,
+            ))
+            .await
+            .unwrap();
+        let status = res.status();
+        let body = body_string(res).await;
+        assert_eq!(status, StatusCode::OK, "send-info 恒 200；body={body}");
+        let v: serde_json::Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(v["injectable"], true, "忙态可留队；body={body}");
+        assert_ne!(
+            v["route"].as_str(),
+            Some("desktop_ax"),
+            "已知忙态必须保留 IPC 队列，不得被 AX 开关抢走；body={body}"
+        );
+        assert_eq!(
+            v["channels"],
+            serde_json::json!(["headless_codex_queue", "headless_codex_exec"]),
+            "忙态仍申报原生队列通道；body={body}"
+        );
+        assert!(
+            !peer_has_traffic(&mut peer).await,
+            "send-info 不得因 AX 开关产生 IPC 写入"
+        );
+    }
+
+    /// AX 通道可用时，未处理审批仍走原生 IPC 审批门，不得改走 AX。
+    #[tokio::test]
+    async fn send_info_with_ipc_pending_keeps_native_approval_instead_of_ax() {
+        let mut f = fixture_ipc(vec![codex_app_session(THREAD)]);
+        let mut peer = f.peer.take().unwrap();
+        let (_sse, _) = sse_hold_ensure(
+            &f,
+            &mut peer,
+            THREAD,
+            vec![serde_json::json!({
+                "id": 21,
+                "method": "item/commandExecution/requestApproval",
+                "params": { "command": "pnpm test", "cwd": "/tmp/proj", "reason": "test" }
+            })],
+            "idle",
+        )
+        .await;
+
+        let _guard = AxSwitchGuard::on();
+        let res = f
+            .app
+            .clone()
+            .oneshot(req(
+                "GET",
+                &format!("/m/api/v1/session-send-info?session_id={THREAD}"),
+                Some(COOKIE),
+                None,
+            ))
+            .await
+            .unwrap();
+        let status = res.status();
+        let body = body_string(res).await;
+        assert_eq!(status, StatusCode::OK, "send-info 恒 200；body={body}");
+        let v: serde_json::Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(v["injectable"], false, "审批必须先处理；body={body}");
+        assert_eq!(v["reasonCode"], "native_pending", "body={body}");
+        assert_ne!(
+            v["route"].as_str(),
+            Some("desktop_ax"),
+            "审批在场不得被 AX 开关绕过；body={body}"
+        );
+        assert!(
+            !peer_has_traffic(&mut peer).await,
+            "send-info 不得因 AX 开关产生 IPC 写入"
+        );
+    }
+
+    /// **未武装的 `unknown` 行不得拦新写入**（实机回归）。
+    ///
+    /// 启动恢复产生的 `aborted_dispatch_unknown` 行里，只有 `TURN_FENCE_ELIGIBLE`
+    /// 的那部分会把 `compat_outstanding` 置 1。其余是**已收敛的审计事实**，
+    /// 既有 IPC 路径不会因它们拦新发送。
+    ///
+    /// 实机现场（2026-11-30）：`hi` 线程有 3 条 2026-10-30/31 的恢复残留，其中
+    /// 2 条 `compat_outstanding = 0`。若按"所有 unknown"拦，会话永久不可写——
+    /// 手机端会一直显示 `ax_action_unresolved`。
+    #[tokio::test]
+    async fn unarmed_unknown_rows_do_not_block_new_writes() {
+        let f = fixture_ipc(vec![codex_app_session(THREAD)]);
+        // 造一条"已收敛但仍是 unknown"的行：直接改 compat_outstanding = 0。
+        seed_unknown_barrier(&f.hub_store(), "settled-unknown-1");
+        f.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE codex_actions SET compat_outstanding = 0 WHERE action_id = 'settled-unknown-1'",
+                [],
+            )
+            .unwrap();
+
+        // 屏障查询不应再看到它。
+        assert!(
+            f.hub_store()
+                .armed_barriers_for_thread(THREAD)
+                .unwrap()
+                .is_empty(),
+            "未武装的 unknown 行不得出现在活跃屏障列表里"
+        );
+
+        // 对照：仍武装时必须被看到（证明上面不是"查询恒空"）。
+        seed_unknown_barrier(&f.hub_store(), "armed-1");
+        assert_eq!(
+            f.hub_store().armed_barriers_for_thread(THREAD).unwrap(),
+            vec!["armed-1".to_string()],
+            "武装屏障必须被查到"
+        );
+    }
+
+    /// 缺 `actionId` 的 AX 请求必须被拒——不能靠服务端补一个 ID 蒙过去。
+    #[tokio::test]
+    async fn ax_send_without_action_id_is_refused() {
+        let f = fixture_ipc(vec![codex_app_session(THREAD)]);
+        let body = send_body("no-action-id", None, false);
+        let _guard = AxSwitchGuard::on();
+        let res = f
+            .app
+            .clone()
+            .oneshot(req(
+                "POST",
+                "/m/api/v1/session-send",
+                Some(COOKIE),
+                Some(body),
+            ))
+            .await
+            .unwrap();
+        let status = res.status();
+        let out = body_string(res).await;
+        // 缺 `actionId` 是**请求构造错误**，不是业务侧拒绝：400 + 稳定码。
+        // 关键是它发生在任何写入之前，且不会被服务端补一个 ID 蒙过去。
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body={out}");
+        let v: serde_json::Value = serde_json::from_str(&out).expect("json");
+        assert_eq!(
+            v.get("reasonCode").and_then(|r| r.as_str()),
+            Some("action_id_required"),
+            "必须是明确的 actionId 缺失拒绝；body={out}"
+        );
+    }
 }

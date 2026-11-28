@@ -127,13 +127,27 @@ export interface ComposerDraftRequest {
   sessionId: string;
   actionId: string;
   text: string;
+  sessionKey?: string;
+  sourceDraftRevision?: number;
+  queueOnly?: boolean;
 }
+
+export type ComposerAttachment = PendingAttachment & { uploadOnly?: boolean };
 
 import type { DshTurnControl } from "./useDshTurnControl";
 
 interface MessageComposerProps {
   editDraft?: ComposerDraftRequest | null;
   onEditDraftConsumed?: (actionId: string) => void;
+  onEnqueueEditDraft?: (draft: ComposerDraftRequest) => void;
+  isEditDraftConsumed?: (actionId: string) => boolean;
+  /** Task3：只入队约束的父层权威值（与草稿同标签页范围）；缺省用组件本地态。 */
+  queueOnlyBySession?: boolean;
+  onQueueOnlyChange?: (value: boolean) => void;
+  attachments?: ComposerAttachment[];
+  onAttachmentsChange?: import("react").Dispatch<
+    import("react").SetStateAction<ComposerAttachment[]>
+  >;
   draftText?: string;
   /** 受控正文的版本跨 Composer 重挂，由草稿持有方原子比较并清理。 */
   draftTextRevision?: number;
@@ -153,14 +167,21 @@ interface MessageComposerProps {
    *  判据：injectable=true，或 reasonCode 非两能力码（native_pending 等非能力
    *  拒绝不算「不能发送」的能力结论）。拉取失败不回调（横幅维持原状，不猜）。 */
   onSendGate?: (attemptable: boolean) => void;
+  onSendInfo?: (info: SendInfo | null) => void;
   /** F8：send-info 外部刷新信号（单调递增 tick；0 = 尚无信号不拉）。触发源 =
    *  同页打断受理/恢复队列（队列暂停态可能翻转）与投影能力档位翻转（设置页
    *  关闭/重开自动适配）——事件驱动重拉，不做时刻轮询、不引 Tauri channel。 */
   refreshSendInfoSignal?: number;
-  /** 会话（本组件只消费 id；`agentType` 仅在「是否可能走原生路由」判定里用一下）。 */
-  session: { id: string; agentType?: string; dshInstanceId?: string };
+  /** 会话（本组件只消费 id；`agentType`/`form` 绑定请求与资格身份）。 */
+  session: { id: string; agentType?: string; dshInstanceId?: string; form?: string };
   /** H12：Desktop(App) 形态禁用终端审批/问答探针（App 发送期间零 TUI 请求）。 */
   disableTerminalProbes?: boolean;
+  /** P1-LOCAL-DRAFT：即使不可注入、不可上传或断联，仍保留 Tuvis 本地草稿编辑。 */
+  allowLocalDraft?: boolean;
+  /** Task2：Codex Desktop 断联（stale / unavailable）时立即禁止所有派发与恢复续投，
+   *  不被旧缓存 sendInfo.injectable 掩盖。 */
+  codexDisconnected?: boolean;
+  onPreviewAttachment?: (path: string, stagedAttachmentId?: string) => void;
   /** T05：页面共享停止控制器（SessionDetail 持有单例，composer/队列面板共用——
    *  stopping 期间多入口互斥，不会各发一次打断）。未提供 = 非 Codex App 会话，
    *  无停止面（行为与既有版本完全一致）。 */
@@ -233,6 +254,42 @@ type Receipt =
       /** W2：本动作是原动作人工继续创建的后继时携带原动作 ID（父子关系展示，
        *  面板据此渲染「原动作 → 本后继」关联行） */
       resumedFrom?: string | null;
+      /** Task2：产生该恢复面板时的完整目标形态身份；切出 App 形态后禁止重新开放恢复派发。 */
+      originIdentity?: string;
+    }
+  | {
+      /** **macOS AX 直写回执**（阶段一：目标已是当前会话才发送）。
+       *
+       *  五档互不替代，`variant` 决定文案与"能否重试"：
+       *  - `delivered`：已确认送达（草稿可清）
+       *  - `notTouched`：明确没碰输入框（草稿保留，可手动再发）
+       *  - `touchedNotSubmitted`：桌面可能留有未发内容（草稿保留，**无重试**）
+       *  - `maybeSubmitted`：已按下但未确认 / 重复风险（草稿保留，**无重试**，需 Mac 确认）
+       *  - `unavailable`：通道不可用（草稿保留）
+       */
+      kind: "desktopAx";
+      variant:
+        "delivered" | "notTouched" | "touchedNotSubmitted" | "maybeSubmitted" | "unavailable";
+      desktopViewMayHaveChanged?: boolean;
+      actionId: string;
+      /** 原文（供人工核对；不渲染全文） */
+      text: string;
+      reasonCode?: string;
+    }
+  | {
+      /** **AX 未确认**（2026-11-30 C4）。
+       *
+       *  与 `codexUnknown` 的区别：后者会挂 IPC 专用的
+       *  `CodexSendRecoveryPanel`（核对走 `/codex/action/verify`，人工继续走
+       *  `/codex/action/manual-resume`）——那对 AX 动作是错的通道。
+       *
+       *  这里**保留 `actionId` 作为幂等锚**：用户可再次点发送，服务端会按同 ID
+       *  只读核对而不是重发。绝不清空锚、绝不换 ID 重投。
+       */
+      kind: "desktopAxUnconfirmed";
+      actionId: string;
+      text: string;
+      reasonCode?: string;
     }
   | {
       /** **兼容通道回执**（Codex APP 兼容发送）：后端 headless 封套原样透出。 */
@@ -350,6 +407,29 @@ function notSentReasonCopy(reasonCode: string | null): string | null {
 
 /** T3：不可发送原因的可读文案——DSH 机器码走 `errors.*` 双语词表
  *  （dshReasonCopy，每码一句准确原因），其余回落服务端 reason / 通用文案。 */
+/** AX 回执的文案：`reasonCode` 已知时给**具体**原因，不要一律说"桌面不在该会话"
+ *  （复审 Minor-3：明明停在目标会话上却提示"不在该会话"，会把人带偏）。 */
+function desktopAxCopy(variant: string, reasonCode: string | undefined): string {
+  const byReason: Record<string, string> = {
+    ax_draft_present: "mobile.codex.composer.desktopAx_reason_draftPresent",
+    ax_action_unresolved: "mobile.codex.composer.desktopAx_reason_unresolved",
+    ax_session_busy: "mobile.codex.composer.desktopAx_reason_busy",
+    ax_action_id_reused_with_different_payload_or_target:
+      "mobile.codex.composer.desktopAx_reason_idReused",
+    ax_queue_only_unsupported: "mobile.codex.composer.desktopAx_reason_queueOnly",
+    ax_not_trusted: "mobile.codex.composer.desktopAx_reason_noPermission",
+    ax_target_not_current: "mobile.codex.composer.desktopAx_reason_targetNotCurrent",
+  };
+  if (reasonCode !== undefined && byReason[reasonCode] !== undefined) {
+    return i18n.t(byReason[reasonCode]);
+  }
+  return i18n.t(`mobile.codex.composer.desktopAx_${variant}`);
+}
+
+function isAxRoute(info: SendInfo | null): boolean {
+  return info?.route === "desktop_ax";
+}
+
 function sendDisabledCopy(info: SendInfo): string {
   const mapped = info.reasonCode ? dshReasonCopy(info.reasonCode) : null;
   return mapped ?? info.reason ?? i18n.t("mobile.composer.sendDisabledFallback");
@@ -448,19 +528,71 @@ export default function MessageComposer({
   showConversation,
   nativeProcessFold,
   onSendGate,
+  onSendInfo,
   onInteractionRoute,
   refreshSendInfoSignal = 0,
   disableTerminalProbes = false,
+  allowLocalDraft = false,
+  codexDisconnected = false,
+  onPreviewAttachment,
   turnControl,
   dshTurnControl,
   editDraft,
   onEditDraftConsumed,
+  onEnqueueEditDraft,
+  isEditDraftConsumed,
+  queueOnlyBySession,
+  onQueueOnlyChange,
+  attachments: attachmentsProp,
+  onAttachmentsChange,
   draftText,
   draftTextRevision,
   onDraftTextChange,
 }: MessageComposerProps) {
   // OpenCode 策略未知时保留原生入口，旧工具等待 send-info。
-  const [sendInfo, setSendInfo] = useState<SendInfo | null>(null);
+  const currentTargetIdentity = JSON.stringify([
+    session.agentType ?? null,
+    session.dshInstanceId ?? null,
+    session.id,
+    session.form ?? null,
+  ]);
+  const currentTargetIdentityRef = useRef(currentTargetIdentity);
+  /* eslint-disable react-hooks/refs -- 以下 3 处必须在**本次渲染内**对在飞回调可见：
+     身份 / sendInfo / 可发送性任一变化若延到 useEffect，会留下"旧值仍有效"的一帧窗口，
+     过期回调据此继续发送 = 双投风险。这是刻意保留的 render 期 ref 写入。 */
+  const [sendInfoState, setSendInfoState] = useState<{
+    identity: string;
+    info: SendInfo;
+  } | null>(null);
+  const sendInfo = sendInfoState?.identity === currentTargetIdentity ? sendInfoState.info : null;
+  const sendInfoRef = useRef<SendInfo | null>(sendInfo);
+  sendInfoRef.current = sendInfo;
+  /** Task2：**单调目标代际**——形态/目标/资格/连接任一变化即 +1。身份字符串
+   *  回到原值（CLI→App→同 ID CLI）时代际仍然前进，旧 await 回包因此不可复活。 */
+  const targetGenerationRef = useRef(0);
+  const targetGenerationSeenRef = useRef(currentTargetIdentity);
+  /* 代际必须与"身份变化"同一次渲染内递增（抗竞态核心）。 */
+  if (targetGenerationSeenRef.current !== currentTargetIdentity) {
+    targetGenerationSeenRef.current = currentTargetIdentity;
+    targetGenerationRef.current += 1;
+  }
+  const codexDisconnectedRef = useRef(codexDisconnected);
+  if (codexDisconnectedRef.current !== codexDisconnected) {
+    codexDisconnectedRef.current = codexDisconnected;
+    // **AX 路由下不推进目标代际**（复审 Important-4）。
+    //
+    // `codexDisconnected` 是 Desktop IPC 的连接状态；IPC 抖动与 AX 目标无关。
+    // 若这里无条件 +1，一次在途 AX 发送会在 `probeCardPresence` 等待期被
+    // `staleTarget()` 误判失效（静默丢弃回执）。
+    //
+    // 判据：本条会话由 AX 通道服务时，连接抖动不构成"目标变了"。
+    if (!isAxRoute(sendInfoRef.current)) {
+      targetGenerationRef.current += 1;
+    }
+  }
+  /* eslint-enable react-hooks/refs */
+  const injectableNowRef = useRef(false);
+  const unmountedRef = useRef(false);
   const [infoReady, setInfoReady] = useState(false);
   const [localSendInfoTick, setLocalSendInfoTick] = useState(0);
   const sendInfoRequestRef = useRef(0);
@@ -470,6 +602,7 @@ export default function MessageComposer({
     route: 0,
     sessionId: session.id,
     instanceId: session.dshInstanceId,
+    form: session.form,
   });
   const [localText, setLocalText] = useState("");
   const text = draftText ?? localText;
@@ -532,7 +665,7 @@ export default function MessageComposer({
     let events: EventSource;
     const invalidate = () => {
       routingGeneration.current += 1;
-      setSendInfo(null);
+      setSendInfoState(null);
       setInfoReady(false);
       setRouteFallback(null);
     };
@@ -574,7 +707,10 @@ export default function MessageComposer({
   /** 待发附件（2026-09-20）：uploading → ready（含落盘绝对路径）/ failed；
    *  发送时仅 ready 的拼内联标记行，failed 不上送（用户裁决：不做通用美化，
    *  附件路径是给 agent 读的） */
-  const [attachments, setAttachments] = useState<PendingAttachment[]>([]);
+  const [localAttachments, setLocalAttachments] = useState<ComposerAttachment[]>([]);
+  const attachments = attachmentsProp ?? localAttachments;
+  const setAttachments = onAttachmentsChange ?? setLocalAttachments;
+  const uploadEpochRef = useRef(0);
   /** 附件「?」说明展开态（2026-09-20 知情披露）：点开才显示，不平铺常驻 */
   const [attachHintOpen, setAttachHintOpen] = useState(false);
   /** 会话无项目目录（服务端 404 no_cwd 一次即知）：禁用上传钮（与 R5 禁用口径同源） */
@@ -663,27 +799,71 @@ export default function MessageComposer({
     },
     [draftTextRevision, onDraftTextChange, setText]
   );
+  const composerSessionKey = JSON.stringify([session.agentType, session.dshInstanceId, session.id]);
+  const matchesEditDraftSession = useCallback(
+    (draft: ComposerDraftRequest | null | undefined) =>
+      !!draft &&
+      draft.sessionId === session.id &&
+      (draft.sessionKey === undefined || draft.sessionKey === composerSessionKey),
+    [session.id, composerSessionKey]
+  );
   const [pendingEdits, setPendingEdits] = useState<ComposerDraftRequest[]>([]);
+  const currentDraftRevision = draftTextRevision ?? draftVersionRef.current;
+  const editHasConflict = useCallback(
+    (draft: ComposerDraftRequest) =>
+      text.length > 0 ||
+      (draft.sourceDraftRevision !== undefined &&
+        draft.sourceDraftRevision !== currentDraftRevision),
+    [text, currentDraftRevision]
+  );
+  /* eslint-disable react-hooks/refs -- 纯函数判断（无 ref 读取）；规则对三元+非空断言的误报。 */
   const pendingEdit = onEditDraftConsumed
-    ? editDraft?.sessionId === session.id && text.length > 0
-      ? editDraft
+    ? matchesEditDraftSession(editDraft) && editHasConflict(editDraft!)
+      ? editDraft!
       : undefined
-    : pendingEdits.find((draft) => draft.sessionId === session.id);
+    : pendingEdits.find(matchesEditDraftSession);
+  /* eslint-enable react-hooks/refs */
   const consumedEditRef = useRef<ComposerDraftRequest | null>(null);
+  /* eslint-disable-next-line react-hooks/refs -- 仅在事件处理器内读写，render 期不取值。 */
+  const consumedActionIdsRef = useRef<Set<string>>(new Set());
   useEffect(() => {
-    if (!editDraft || editDraft.sessionId !== session.id || consumedEditRef.current === editDraft)
+    consumedActionIdsRef.current.clear();
+    consumedEditRef.current = null;
+  }, [composerSessionKey]);
+  useEffect(() => {
+    if (
+      !editDraft ||
+      !matchesEditDraftSession(editDraft) ||
+      consumedEditRef.current === editDraft ||
+      consumedActionIdsRef.current.has(editDraft.actionId) ||
+      isEditDraftConsumed?.(editDraft.actionId)
+    )
       return;
-    consumedEditRef.current = editDraft;
-    if (text.length > 0 || pendingEdits.some((draft) => draft.sessionId === session.id)) {
-      if (!onEditDraftConsumed) setPendingEdits((current) => [...current, editDraft]);
+    if (editHasConflict(editDraft) || pendingEdits.some(matchesEditDraftSession)) {
+      if (!onEditDraftConsumed) {
+        consumedEditRef.current = editDraft;
+        consumedActionIdsRef.current.add(editDraft.actionId);
+        setPendingEdits((current) => [...current, editDraft]);
+      }
     } else {
+      consumedEditRef.current = editDraft;
+      consumedActionIdsRef.current.add(editDraft.actionId);
       draftVersionRef.current += 1;
       textVersionRef.current += 1;
       setText(editDraft.text);
+      if (editDraft.queueOnly) setQueueOnlyNext(true);
       onEditDraftConsumed?.(editDraft.actionId);
       inputRef.current?.focus();
     }
-  }, [editDraft, session.id, text, pendingEdits, onEditDraftConsumed, setText]);
+  }, [
+    editDraft,
+    matchesEditDraftSession,
+    editHasConflict,
+    pendingEdits,
+    onEditDraftConsumed,
+    isEditDraftConsumed,
+    setText,
+  ]);
 
   /** S5：重试关联——明确未送达后用户点「重试」时记录原动作 ID（安全引用，展示前 8 位） */
   const retriedFromRef = useRef<string | null>(null);
@@ -717,7 +897,11 @@ export default function MessageComposer({
    *  会话转闲跃迁后事件臂即时放行；已空闲且无跃迁时由 60s 周期兜底放行（可达
    *  分钟级）。队列存储不携带该标志（后端仅影响入队决策，flush 循环对
    *  queueOnly 项与普通队列项同权） */
-  const [queueOnlyNext, setQueueOnlyNext] = useState(false);
+  const [localQueueOnlyNext, setLocalQueueOnlyNext] = useState(false);
+  /** Task3：采用「修改」候选后，只入队约束需与该会话草稿一起跨布局重挂保留；
+   *  父层提供受控值时以父层为权威（同标签页范围，不做跨刷新持久化）。 */
+  const queueOnlyNext = queueOnlyBySession ?? localQueueOnlyNext;
+  const setQueueOnlyNext = onQueueOnlyChange ?? setLocalQueueOnlyNext;
   /** 终端卡片在场态（丁T3 接入②）：挂载/换会话拉一次 + **发送时刻复探**（快照会
    *  陈旧——对话框可能在挂载之后才出现，而复探是发送前的最后一道前端闸）。
    *  探针失败 = 不在场（能力缺失不阻断，与后端同裁决；见文件头注释）。 */
@@ -767,8 +951,9 @@ export default function MessageComposer({
     let alive = true;
     setInfoReady(false);
     // 换会话即弃修改重发标志（D6）：queueOnlyNext 是上一个会话「修改」的遗愿，
-    // 不得泄漏到新会话的首发（保守方向虽无害，语义上仍属错位）
-    setQueueOnlyNext(false);
+    // 不得泄漏到新会话的首发（保守方向虽无害，语义上仍属错位）。
+    // 父层受控时由父层按会话键持有同一语义（不在此清父层权威值）。
+    if (onQueueOnlyChange === undefined) setQueueOnlyNext(false);
     // C04：「本条先发送」越队标志已随按钮移除；报告展开态同属上一会话的遗愿，一并清
     setReportUnavailable(false);
     // actionId 同理——一次用户动作不跨会话，切换即清（下一条消息是新动作）
@@ -783,15 +968,17 @@ export default function MessageComposer({
     }
     const generation = routingGeneration.current;
     const request = ++sendInfoRequestRef.current;
+    const requestIdentity = currentTargetIdentity;
     fetchSendInfo(session.id, session.dshInstanceId)
       .then((info) => {
         if (
           !alive ||
           request !== sendInfoRequestRef.current ||
-          generation !== routingGeneration.current
+          generation !== routingGeneration.current ||
+          currentTargetIdentityRef.current !== requestIdentity
         )
           return;
-        setSendInfo(info);
+        setSendInfoState(info ? { identity: requestIdentity, info } : null);
         setInfoReady(info !== null);
         // S5：静态门结论上报（能力横幅的「可尝试」唯一来源）
         if (info !== null) {
@@ -802,17 +989,26 @@ export default function MessageComposer({
         if (
           !alive ||
           generation !== routingGeneration.current ||
-          request !== sendInfoRequestRef.current
+          request !== sendInfoRequestRef.current ||
+          currentTargetIdentityRef.current !== requestIdentity
         )
           return;
         setInfoReady(false);
         // 原生策略未知时保持禁旧；这里只决定入口，不宣称原生已经认领。
-        setSendInfo(null);
+        setSendInfoState(null);
       });
     return () => {
       alive = false;
     };
-  }, [session.id, session.dshInstanceId, session.agentType, onSendGate, onInteractionRoute]);
+  }, [
+    session.id,
+    session.dshInstanceId,
+    session.agentType,
+    session.form,
+    currentTargetIdentity,
+    onSendGate,
+    onInteractionRoute,
+  ]);
 
   // F8：外部信号（同页打断受理 / 恢复队列 / 投影能力档位翻转）→ 事件驱动重拉
   // send-info（队列暂停态、静态门结论都可能已变）。失败静默——下一次信号或重挂
@@ -822,13 +1018,16 @@ export default function MessageComposer({
   useEffect(() => {
     const previous = seenSendInfoSignalsRef.current;
     const targetChanged =
-      previous.sessionId !== session.id || previous.instanceId !== session.dshInstanceId;
+      previous.sessionId !== session.id ||
+      previous.instanceId !== session.dshInstanceId ||
+      previous.form !== session.form;
     seenSendInfoSignalsRef.current = {
       external: refreshSendInfoSignal,
       local: localSendInfoTick,
       route: routeReloadTick,
       sessionId: session.id,
       instanceId: session.dshInstanceId,
+      form: session.form,
     };
     if (
       targetChanged ||
@@ -840,16 +1039,18 @@ export default function MessageComposer({
     let alive = true;
     const generation = routingGeneration.current;
     const request = ++sendInfoRequestRef.current;
+    const requestIdentity = currentTargetIdentity;
     fetchSendInfo(session.id, session.dshInstanceId)
       .then((info) => {
         if (
           !alive ||
           request !== sendInfoRequestRef.current ||
           generation !== routingGeneration.current ||
+          currentTargetIdentityRef.current !== requestIdentity ||
           info === null
         )
           return;
-        setSendInfo(info);
+        setSendInfoState({ identity: requestIdentity, info });
         setInfoReady(true);
         onSendGate?.(sendGateAttemptable(info));
       })
@@ -866,6 +1067,8 @@ export default function MessageComposer({
     session.dshInstanceId,
     session.id,
     session.agentType,
+    session.form,
+    currentTargetIdentity,
     onSendGate,
     onInteractionRoute,
   ]);
@@ -879,7 +1082,7 @@ export default function MessageComposer({
     if (nativeRoute || waitForRoute) return;
     let alive = true;
     setQueueItems([]);
-    fetchQueue(session.id)
+    fetchQueue(session.id, session.agentType)
       .then((items) => {
         if (alive) setQueueItems(items);
       })
@@ -996,7 +1199,24 @@ export default function MessageComposer({
 
   // A5：ZCode 会话的只读控制面已迁移到 ZcodeControlPanel（SessionDetail 的 ZCode
   // 挂载点不再走本组件）——本组件保留的是非 ZCode 会话的既有终端注入路径。
-  const injectable = sendInfo !== null && sendInfo.injectable;
+  // **AX 直写通道下忽略 `codexDisconnected`**（2026-11-28）。
+  //
+  // `codexDisconnected` 是 Desktop IPC 投影的状态（父组件按 `codexState.stale` /
+  // `availability` 算出来）。IPC 断链**不**代表 AX 通道不可用——两者是独立通道。
+  // 实测：手机端因 IPC 投影 stale 而在本地禁用输入框，AX 发送根本走不到。
+  //
+  // 判据：`sendInfo.route === "desktop_ax"` 时，以 send-info 的 `injectable` 为准。
+  const axRoute = isAxRoute(sendInfo);
+  useEffect(() => {
+    onSendInfo?.(sendInfo);
+  }, [onSendInfo, sendInfo]);
+  const injectable = (axRoute || !codexDisconnected) && sendInfo !== null && sendInfo.injectable;
+  /* eslint-disable react-hooks/refs -- 可发送性翻转必须当帧生效（见上方块级说明）。 */
+  if (injectableNowRef.current !== injectable) {
+    injectableNowRef.current = injectable;
+    targetGenerationRef.current += 1;
+  }
+  /* eslint-enable react-hooks/refs */
 
   /** S5：发送静态门的「可尝试」判据（send-info 展示面单点的消费；不复刻能力策略
    *  ——只区分「两能力码拒绝」与「其余一切」）。native_pending / queue_paused 等
@@ -1049,16 +1269,31 @@ export default function MessageComposer({
 
   const dshRunning = dshTurnControl?.running === true;
   const handleSend = useCallback(async () => {
-    if (dshRunning) return;
+    // **AX 路由下 `codexDisconnected` 不参与拦截**（2026-11-30 R1）。
+    //
+    // 它是 Desktop IPC 投影的状态；IPC 断线不代表 AX 通道不可用。旧实现在这里
+    // 第一行就 return，导致按钮虽可用（`injectable` 已按 route 修正）却点了没反应。
+    const axRouteNow = isAxRoute(sendInfo);
+    if ((!axRouteNow && codexDisconnected) || dshRunning) return;
     const body = text.trim();
     if (!body || sending || busy || sendInfo === null || !sendInfo.injectable) return;
-    if (attachments.some((a) => a.status === "uploading")) return; // 上传中禁发（防消息先于落盘）
+    if (attachments.some((a) => !a.uploadOnly && a.status === "uploading")) return; // 上传中禁发（防消息先于落盘）
     const dshChannel = sendInfo.channels?.includes("dsh_desktop") ?? false;
     if (dshChannel && dshSendingRef.current) return;
     setSending(true);
     // S5：本次发送的代际（迟到响应作废判据；见 sendEpochRef 声明处）
     const myEpoch = ++sendEpochRef.current;
+    const myTargetIdentity = currentTargetIdentityRef.current;
+    const myTargetGeneration = targetGenerationRef.current;
     const staleEpoch = () => sendEpochRef.current !== myEpoch;
+    // Task2：目标代际前进（形态/目标/资格/连接变化）即视同本发失效——即使身份
+    // 字符串回到原值（CLI→App→同 ID CLI）也不复活。
+    // AX 路由下 `codexDisconnectedRef` 不参与失效判定：IPC 断线不该让
+    // 一次正在进行的 AX 发送被判失效（否则回执永远落不了地）。
+    const staleTarget = () =>
+      unmountedRef.current ||
+      targetGenerationRef.current !== myTargetGeneration ||
+      (!axRouteNow && codexDisconnectedRef.current);
     // ===== F6：点击即建立 30 秒前台总预算（S3 前台统一预算的前台面）=====
     // 预算覆盖**整次编排**：前置卡片探测 + session-send 消费同一窗——此前计时器
     // 在探测之后才武装，探测挂起即可无限转圈。计时器/到期标记/回执写入全部按
@@ -1066,7 +1301,9 @@ export default function MessageComposer({
     // 计时器、转圈与回执槽（finally 一并承担所有出口的计时器清理）。
     // 附件标记行与 actionId 在点击时一次算定（handleSend 闭包已把 text/attachments
     // 定格在点击帧——与探测后计算逐字等价）。
-    const submittedAttachments = attachments.filter((a) => a.status === "ready" && a.path);
+    const submittedAttachments = attachments.filter(
+      (a) => !a.uploadOnly && a.status === "ready" && a.path
+    );
     const markup = attachmentMarkup(submittedAttachments);
     const submittedTextVersion = draftTextRevision ?? textVersionRef.current;
     const fullText = markup ? `${text}\n${markup}` : text;
@@ -1079,7 +1316,14 @@ export default function MessageComposer({
     const submittedDraftVersion = draftVersionRef.current;
     // DSH Desktop（T10）同样要求 actionId（账本幂等键：同 ID 同载荷 = 运输重试，
     // 换载荷 = 新逻辑发送）；send-info 的 channels 携 "dsh_desktop"。
-    const needsActionId = sendInfo.channels?.some((c) => c.startsWith("headless_codex_"));
+    // **AX 通道同样需要 actionId**（2026-11-30 R1）。
+    //
+    // 服务端 AX 分支以 `action_id` 为幂等键：缺了直接 `400 action_id_required`。
+    // 旧判据只看 `headless_codex_*` 前缀，`desktop_ax` 不匹配 → 从不生成。
+    const needsActionId =
+      sendInfo.channels?.some((c) => c.startsWith("headless_codex_")) ||
+      sendInfo.channels?.includes("desktop_ax") === true ||
+      sendInfo.route === "desktop_ax";
     const dshIdentity = dshChannel
       ? {
           payload: digestDshSend(JSON.stringify({ text: fullText, queueOnly: queueOnlyNext })),
@@ -1128,7 +1372,25 @@ export default function MessageComposer({
     };
     // M1（复审）：DSH 不进 Codex 的 30 秒预算/恢复面板——挂出 codexUnknown 后
     // 核对端点固定为 /codex/action/*，对 DSH 必 404，用户无出路。
-    if (actionId !== undefined && !dshChannel) {
+    if (actionId !== undefined && !dshChannel && axRouteNow) {
+      // AX 路由：预算到期 → 只报"未确认"，**保留 actionId 锚**，不挂 IPC 面板。
+      myTimer = setTimeout(() => {
+        myTimer = null;
+        if (deadlineTimerRef.current?.epoch === myEpoch) deadlineTimerRef.current = null;
+        if (staleEpoch()) return;
+        myExpired = true;
+        setSending(false);
+        if (actionId !== undefined) {
+          codexActionIdRef.current = actionId;
+        }
+        setReceipt({
+          kind: "desktopAxUnconfirmed",
+          actionId: actionId ?? "",
+          text: fullText,
+        });
+      }, FRONT_DEADLINE_MS);
+      deadlineTimerRef.current = { epoch: myEpoch, timer: myTimer };
+    } else if (actionId !== undefined && !dshChannel) {
       myTimer = setTimeout(() => {
         myTimer = null;
         if (deadlineTimerRef.current?.epoch === myEpoch) deadlineTimerRef.current = null;
@@ -1142,6 +1404,7 @@ export default function MessageComposer({
           text: fullText,
           reasonCode: null,
           deadline: true,
+          originIdentity: myTargetIdentity,
         });
         // Q2：待确认现场自此归属本动作（回调落地据此核对）
         codexRecoveryOwnerRef.current = {
@@ -1171,14 +1434,13 @@ export default function MessageComposer({
       //
       // 拦截时输入框内容**保留**（与 failed 态同口径：用户可复制到卡片输入框或终端）。
       const presence = await probeCardPresence();
-      // R7（F6 前端半边）：前探也是异步边界——恢复后先核**发送归属**（代际），
-      // 再写 cardPresence 或分流。A 前探挂起、B 先开始后 A 迟到返回（真实可达：
-      // api.rs:2589 审批扫描不排除 App，rollout 尾部 proposed_plan 经 plan_pending
-      // 在 :2921 返回 available=true）→ A 的拦截结果不得驱动 B 的分流/回执。
-      // 只核代际不核本发预算：A 自己超时（面板已接管呈现）后其发送照常继续——
-      // 既有 F6 语义（f6_probe：探测晚到 → 发送照发 → 迟到回执不覆盖面板），
-      // 本发预算的写状态闸在下游回执点（myExpired）。
-      if (staleEpoch()) return;
+      if (
+        staleTarget() ||
+        staleEpoch() ||
+        currentTargetIdentityRef.current !== myTargetIdentity ||
+        !sendInfoRef.current?.injectable
+      )
+        return;
       setCardPresence(presence);
       if (presence === "approve") {
         setReceipt({ kind: "blocked", message: APPROVE_PRESENT_RECEIPT });
@@ -1208,6 +1470,8 @@ export default function MessageComposer({
         // [`questionAnswerErrorCopy`]（与卡内**同一函数**，两入口不漂移）。
         let res: Awaited<ReturnType<typeof sessionQuestionAnswer>>;
         try {
+          // Task2：真正发起提交前再核一次当前目标代际与资格（预检回包后仍可能变）
+          if (staleTarget() || !sendInfoRef.current?.injectable) return;
           res = await sessionQuestionAnswer(session.id, "freeText", undefined, text);
         } catch (err) {
           setReceipt({
@@ -1243,7 +1507,15 @@ export default function MessageComposer({
       // D6：修改重发的下一次发送带 queueOnly=true 强制入队，消费即清——本次发送
       // 失败的话，用户重试走的是普通发送语义（后端失败行已退出 pending，可重发）
       const forceQueue = queueOnlyNext;
-      if (!dshChannel) setQueueOnlyNext(false);
+      const submitRevision = draftTextRevision ?? draftVersionRef.current;
+      // Task2：实际发起提交前的最后一道核验（预检/应答回包后目标或资格可能已变）
+      if (staleTarget() || currentTargetIdentityRef.current !== myTargetIdentity) return;
+      // Task3：只在「仍提交同一份草稿」时消费只入队约束——预检期间新取回稿被采用
+      //（版本已前移）时不得替它清标志。
+      if (!dshChannel) {
+        const nowRevision = draftTextRevision ?? draftVersionRef.current;
+        if (nowRevision === submitRevision) setQueueOnlyNext(false);
+      }
       // 多行原样上行（trim 只用于判空，不改写正文——归一在服务端）。
       // **actionId / fullText 已在点击时算定**（F6：预算与载荷键控见函数头）。
       // C04：「本条先发送」的越队授权已收敛到队列区（T06 按行两步确认）——composer
@@ -1268,7 +1540,8 @@ export default function MessageComposer({
         undefined,
         session.dshInstanceId,
         dshController?.signal,
-        sendInfo.dshRetryScope
+        sendInfo.dshRetryScope,
+        sendInfo.route
       );
       const res = dshController
         ? await Promise.race([
@@ -1346,6 +1619,7 @@ export default function MessageComposer({
             text: fullText,
             reasonCode: res.receipt.reasonCode,
             deadline: false,
+            originIdentity: myTargetIdentity,
           });
           // Q2：待确认现场自此归属本动作（回调落地据此核对）
           codexRecoveryOwnerRef.current = {
@@ -1425,15 +1699,97 @@ export default function MessageComposer({
           setText("");
           setAttachments([]);
         }
-      } else {
+      } else if (
+        res.status === "desktop_ax_delivered" ||
+        res.status === "desktop_ax_not_touched" ||
+        res.status === "desktop_ax_touched_not_submitted" ||
+        res.status === "desktop_ax_maybe_submitted" ||
+        res.status === "desktop_ax_unavailable"
+      ) {
+        // **macOS AX 直写回执**（阶段一）。四档互不替代，按 status 分流。
+        //
+        // 核心纪律：除 `delivered` 外**一律保留草稿**。AX 通道没有"已受理"概念，
+        // 也没法撤销；手机端不能替用户判断桌面到底有没有留下内容。
+        codexActionIdRef.current = null;
+        codexActionPayloadRef.current = null;
+        switch (res.status) {
+          case "desktop_ax_delivered":
+            // 原线程已确认收到（消息出现 + 编辑器被消费）。
+            if (draftVersionRef.current === submittedDraftVersion) {
+              setText("");
+              setAttachments([]);
+            }
+            setReceipt({
+              kind: "desktopAx",
+              variant: "delivered",
+              actionId: res.actionId,
+              text: fullText,
+              reasonCode: res.reasonCode,
+              desktopViewMayHaveChanged: res.desktopViewMayHaveChanged,
+            });
+            break;
+          case "desktop_ax_not_touched":
+            // 明确没碰过输入框：桌面没有残留，重试是安全的（由用户手动发起）。
+            setReceipt({
+              kind: "desktopAx",
+              variant: "notTouched",
+              actionId: res.actionId,
+              text: fullText,
+              reasonCode: res.reasonCode,
+              desktopViewMayHaveChanged: res.desktopViewMayHaveChanged,
+            });
+            break;
+          case "desktop_ax_touched_not_submitted":
+            // 桌面**可能留有未发内容**。保留草稿，提示去 Mac 上处理。
+            setReceipt({
+              kind: "desktopAx",
+              variant: "touchedNotSubmitted",
+              actionId: res.actionId,
+              text: fullText,
+              reasonCode: res.reasonCode,
+              desktopViewMayHaveChanged: res.desktopViewMayHaveChanged,
+            });
+            break;
+          case "desktop_ax_maybe_submitted":
+            // 已按下但未确认，或出现重复风险。**绝不自动重发**；需人确认。
+            setReceipt({
+              kind: "desktopAx",
+              variant: "maybeSubmitted",
+              actionId: res.actionId,
+              text: fullText,
+              reasonCode: res.reasonCode,
+              desktopViewMayHaveChanged: res.desktopViewMayHaveChanged,
+            });
+            break;
+          default:
+            // desktop_ax_unavailable：通道不可用（无权限 / 宿主身份取不到）。
+            setReceipt({
+              kind: "desktopAx",
+              variant: "unavailable",
+              actionId: res.actionId,
+              text: fullText,
+              reasonCode: res.reasonCode,
+              desktopViewMayHaveChanged: res.desktopViewMayHaveChanged,
+            });
+            break;
+        }
+        onQueueChanged?.();
+      } else if (res.status === "failed") {
         setReceipt({ kind: "failed", error: formatInvokeError(res.error, i18n.t) });
       }
+      // 其余 status（headless 等）由既有分支处理；到这里说明是无匹配形态，
+      // 不静默当作失败——没有 receipt 就是没有对用户宣称任何结论。
     } catch (e) {
       // S5/F6：代际已前进（新发送已开）或本次预算已到期移交面板的迟到异常，
       // 一律作废不回写（计时器清理解释权在 finally，按闭包归属）
       if (staleEpoch()) return;
       if (myExpired) return;
       if (e instanceof ApiError) {
+        if (e.data?.reasonCode === "codex_send_route_changed") {
+          setLocalSendInfoTick((tick) => tick + 1);
+          setReceipt({ kind: "blocked", message: i18n.t("mobile.codex.adapt.sendRouteChanged") });
+          return;
+        }
         // S5 分诊：Codex 路径上**非确定性失败**（网络层/5xx/408——代理可能在服务端
         // 已处理后返回错误）= 提交结果未知 → 待确认面板（沿同 ID 只读核对，绝不
         // 换 ID 重投）；确定性拒绝（4xx 状态码在响应在手）才落 failed 可重试。
@@ -1499,6 +1855,7 @@ export default function MessageComposer({
             text: fullText,
             reasonCode: null,
             deadline: false,
+            originIdentity: myTargetIdentity,
           });
           // Q2：待确认现场自此归属本动作（回调落地据此核对）
           codexRecoveryOwnerRef.current = {
@@ -1528,12 +1885,23 @@ export default function MessageComposer({
       } else if (armedCodexActionId !== null && !dshChannel) {
         // 非 ApiError 异常（网络层断开等）：Codex 路径提交结果未知 → 待确认面板
         //（核对锚保留：同载荷重按 = 运输重试，绝不换 ID 重投）
+        if (axRouteNow) {
+          // AX 路由：保留锚，不挂 IPC 恢复面板。
+          if (actionId !== undefined) codexActionIdRef.current = actionId;
+          setReceipt({
+            kind: "desktopAxUnconfirmed",
+            actionId: armedCodexActionId,
+            text: fullText,
+          });
+          return;
+        }
         setReceipt({
           kind: "codexUnknown",
           actionId: armedCodexActionId,
           text: fullText,
           reasonCode: null,
           deadline: false,
+          originIdentity: myTargetIdentity,
         });
         // Q2：待确认现场自此归属本动作（回调落地据此核对）
         codexRecoveryOwnerRef.current = {
@@ -1575,6 +1943,7 @@ export default function MessageComposer({
     discardDshArm,
     recordDshReceipt,
     findDshRetry,
+    codexDisconnected,
   ]);
 
   // S5：明确未送达后的「重试」——创建**关联的新动作**（新 actionId），不永远重放
@@ -1584,13 +1953,13 @@ export default function MessageComposer({
   // （「永远重放原失败」正是本按钮要消灭的形态）。
   const retryNotSent = useCallback(
     (predecessorActionId: string) => {
-      if (sending || busy) return;
+      if (codexDisconnected || sending || busy) return;
       codexActionIdRef.current = null;
       codexActionPayloadRef.current = null;
       retriedFromRef.current = predecessorActionId;
       void handleSend();
     },
-    [sending, busy, handleSend]
+    [codexDisconnected, sending, busy, handleSend]
   );
 
   // W2（复审 round 5）：人工继续后继的真实结果按五分类接管。resumed 响应的
@@ -1636,7 +2005,7 @@ export default function MessageComposer({
         codexReceiptSetAtRef.current = Date.now();
         if (draftUnchanged) {
           clearTextAtVersion(owner.textVersion);
-          setAttachments([]);
+          setAttachments((prev) => prev.filter((a) => a.uploadOnly));
         }
         setReceipt({
           kind: "codexQueued",
@@ -1655,6 +2024,7 @@ export default function MessageComposer({
           reasonCode: r.reasonCode,
           deadline: false,
           resumedFrom: info.originalActionId,
+          originIdentity: currentTargetIdentityRef.current,
         });
         // Q2：恢复现场随面板切到后继——归属快照同刻重登记（该后继自己的人工
         // 继续/迟到响应此后沿新快照核对归属）。Q2（复审 round 7）：后继**继承
@@ -1677,8 +2047,10 @@ export default function MessageComposer({
 
   // S5/F6：卸载清理当前发送的 30 秒计时器（挂起 promise 的迟到回调经代际/闭包
   // 作废；这里只兜底清掉真实挂在事件循环上的那一个）
-  useEffect(
-    () => () => {
+  useEffect(() => {
+    unmountedRef.current = false;
+    return () => {
+      unmountedRef.current = true;
       if (dshSendingRef.current) {
         // 父页草稿会跨分屏重挂保留，卸载的发送闭包不能再调用其清空回调。
         sendEpochRef.current += 1;
@@ -1688,9 +2060,8 @@ export default function MessageComposer({
         clearTimeout(deadlineTimerRef.current.timer);
         deadlineTimerRef.current = null;
       }
-    },
-    []
-  );
+    };
+  }, []);
 
   // P2-7 失败对账（插队/撤回/修改共用）：失败后复核 /session-queue——
   // - 条目仍在 pending → 恢复排队视图（刷新队位，行同步更新，「立即发送/修改/撤回」
@@ -1754,10 +2125,15 @@ export default function MessageComposer({
   const handleJump = useCallback(
     async (item: QueueItemView) => {
       if (busy) return;
+      // Task2：旧队列「立即发送」与常规发送共用同一目标/资格；断联或不可注入
+      // 时不得派发（只保留本地编辑与撤回）。
+      if (!injectableNowRef.current || codexDisconnectedRef.current) return;
       const { id: itemId, position, content } = item;
+      const jumpGeneration = targetGenerationRef.current;
       setBusy(true);
       try {
         const j = await queueJump(session.id, itemId);
+        if (targetGenerationRef.current !== jumpGeneration) return;
         if (j.status === "delivered") {
           // 本地认知翻转：该条已出队（时序防御见 queueMutatedAtRef 声明处）
           queueMutatedAtRef.current = Date.now();
@@ -1802,7 +2178,7 @@ export default function MessageComposer({
     async (itemId: number, position: number, content: string, onConfirmed: () => void) => {
       setBusy(true);
       try {
-        const r = await queueRetract(session.id, itemId);
+        const r = await queueRetract(session.id, itemId, session.agentType);
         if ("ok" in r) {
           /* 服务端确认已撤（{ok:true}）：免复核，直接收敛（评审必须1——撤回目的已达成）；
              行同步移除（快路径不拉队列，列表即权威呈现）。本地认知翻转前移，作废
@@ -1857,20 +2233,83 @@ export default function MessageComposer({
    *  D6：确认出队后置 queueOnlyNext——修改后的重发一律入队（防「文件说闲、
    *  TUI 实忙」窗口变相插队）；忙时失败/复核失败条目仍在队（onConfirmed 不触发）
    *  则不置标志，取消「修改」意图后的排队视图照旧 */
+  /* eslint-disable react-hooks/refs -- 这三个 ref 的读取点虽在事件/异步回调里，但
+     "换会话"的那一次渲染必须立刻让新值可见：延到 useEffect 会让换会话瞬间到达的
+     在途响应读到旧 sessionKey，把旧会话的行写进新会话（实测触发 6 条回归）。 */
+  const composerSessionKeyRef = useRef(composerSessionKey);
+  composerSessionKeyRef.current = composerSessionKey;
+  const draftTextRevisionRef = useRef(draftTextRevision);
+  draftTextRevisionRef.current = draftTextRevision;
+  const textRef = useRef(text);
+  textRef.current = text;
+  /* eslint-enable react-hooks/refs */
   const handleEdit = useCallback(
     async (item: QueueItemView) => {
       if (busy) return;
+      if (
+        item.editable === false ||
+        (item.agentType !== undefined &&
+          session.agentType !== undefined &&
+          item.agentType !== session.agentType)
+      )
+        return;
+      const capturedKey = composerSessionKeyRef.current;
+      const capturedSid = session.id;
+      const capturedDraftRevision = draftTextRevisionRef.current ?? draftVersionRef.current;
+      const actionId = `legacy-queue-${item.id}`;
       await retractWithOutcome(item.id, item.position, item.content, () => {
-        // Q2：「修改」回填 = 草稿被整体替换（版本前移）
-        draftVersionRef.current += 1;
-        textVersionRef.current += 1;
-        setText(stripMobileSignature(item.content).slice(0, MAX_SEND_CHARS));
-        setQueueOnlyNext(true);
-        setReceipt(null);
-        inputRef.current?.focus();
+        const recovered = stripMobileSignature(item.content).slice(0, MAX_SEND_CHARS);
+        if (onEnqueueEditDraft) {
+          // Task3：只把内容与「只入队」约束一起交给父层候选；**不**在此处给
+          // 用户当前正写的新稿设置 queueOnlyNext（未采用就不改发送语义）。
+          onEnqueueEditDraft({
+            sessionId: capturedSid,
+            actionId,
+            text: recovered,
+            sessionKey: capturedKey,
+            sourceDraftRevision: capturedDraftRevision,
+            queueOnly: true,
+          });
+          return;
+        }
+        const nowRev = draftTextRevisionRef.current ?? draftVersionRef.current;
+        const stillSameSession = composerSessionKeyRef.current === capturedKey;
+        if (
+          stillSameSession &&
+          textRef.current.length === 0 &&
+          nowRev === capturedDraftRevision &&
+          !consumedActionIdsRef.current.has(actionId)
+        ) {
+          // 真正采用候选：正文、只入队约束与回执状态在同一处更新
+          consumedActionIdsRef.current.add(actionId);
+          draftVersionRef.current += 1;
+          textVersionRef.current += 1;
+          setText(recovered);
+          setQueueOnlyNext(true);
+          setReceipt(null);
+          inputRef.current?.focus();
+        } else if (stillSameSession && !consumedActionIdsRef.current.has(actionId)) {
+          // 未采用：仅作为待确认候选保留（正文/发送方式/回执均不动）
+          consumedActionIdsRef.current.add(actionId);
+          setPendingEdits((current) =>
+            current.some((d) => d.actionId === actionId)
+              ? current
+              : [
+                  ...current,
+                  {
+                    sessionId: capturedSid,
+                    actionId,
+                    text: recovered,
+                    sessionKey: capturedKey,
+                    sourceDraftRevision: capturedDraftRevision,
+                    queueOnly: true,
+                  },
+                ]
+          );
+        }
       });
     },
-    [busy, retractWithOutcome, setText]
+    [busy, session.id, session.agentType, retractWithOutcome, onEnqueueEditDraft, setText]
   );
 
   // 附件上传（2026-09-20）：逐个上传 → chips 状态机（uploading → ready/failed）。
@@ -1882,10 +2321,43 @@ export default function MessageComposer({
   const attachmentUnavailableCopy = attachmentUnavailable
     ? i18n.t("errors.dshAttachmentMacosUnsafe")
     : null;
+  const uploadOnly = sendInfo?.attachmentUploadOnly === true;
+  const canUpload = (injectable || uploadOnly) && !noCwd && !attachmentUnavailable;
+  const canUploadRef = useRef(canUpload);
+  /* eslint-disable-next-line react-hooks/refs -- 上传回调内读取；延一帧会误判可上传性。 */
+  canUploadRef.current = canUpload;
+  const cancelInflightUploads = useCallback(() => {
+    uploadEpochRef.current += 1;
+    if (uploadCtrlsRef.current.size > 0) {
+      uploadCtrlsRef.current.forEach((ctrl) => ctrl.abort());
+      uploadCtrlsRef.current.clear();
+      uploadFirstSampleRef.current.clear();
+      setAttachments((prev) => prev.filter((a) => a.status !== "uploading"));
+    }
+  }, [setAttachments]);
+  useEffect(() => {
+    return () => {
+      cancelInflightUploads();
+    };
+  }, [composerSessionKey, cancelInflightUploads]);
+  useEffect(() => {
+    if (!canUpload) cancelInflightUploads();
+  }, [canUpload, cancelInflightUploads]);
   const addFiles = useCallback(
     async (files: File[]) => {
-      if (attachmentUnavailable) return;
+      if (!canUploadRef.current) return;
+      const batchEpoch = uploadEpochRef.current;
+      const batchKey = composerSessionKeyRef.current;
+      const batchSid = session.id;
+      const batchUploadOnly = uploadOnly;
+      const batchInstanceId = session.dshInstanceId;
       for (const f of files) {
+        if (
+          uploadEpochRef.current !== batchEpoch ||
+          composerSessionKeyRef.current !== batchKey ||
+          !canUploadRef.current
+        )
+          break;
         // Q2：附件增补也是草稿变更（版本前移）
         draftVersionRef.current += 1;
         const id = newAttachmentId();
@@ -1897,20 +2369,22 @@ export default function MessageComposer({
             name: f.name || (isImage ? i18n.t("mobile.composer.pastedImageName") : "file"),
             isImage,
             status: "uploading",
+            uploadOnly: batchUploadOnly,
           },
         ]);
-        // AbortController：上传中可取消（× 移除 = 中断上传 + 移除 chip）——
-        // 大文件（视频）上传耗时长，不可取消会被迫干等（2026-09-20 用户实测）
         const ctrl = new AbortController();
         uploadCtrlsRef.current.set(id, ctrl);
         try {
-          // §C5 上行进度：onProgress 是 uploadAttachment 的**第 4 参**（第 3 参是
-          // 既有 signal）。进度落 chip：已传字节 + 百分比（有 total 才有）+ 预估剩余
           const res = await uploadAttachment(
-            session.id,
+            batchSid,
             f,
             ctrl.signal,
             (loaded, total) => {
+              if (
+                uploadEpochRef.current !== batchEpoch ||
+                composerSessionKeyRef.current !== batchKey
+              )
+                return;
               const atMs = Date.now();
               const first = uploadFirstSampleRef.current.get(id) ?? { loaded, atMs };
               uploadFirstSampleRef.current.set(id, first);
@@ -1927,39 +2401,71 @@ export default function MessageComposer({
                 )
               );
             },
-            session.dshInstanceId ? { instanceId: session.dshInstanceId } : undefined
+            batchUploadOnly
+              ? { route: "codex_desktop_staging" }
+              : batchInstanceId
+                ? { instanceId: batchInstanceId }
+                : undefined
           );
           uploadFirstSampleRef.current.delete(id);
-          if (res === null) throw new ApiError(403, i18n.t("mobile.composer.deviceInvalid"));
+          if (uploadEpochRef.current !== batchEpoch || composerSessionKeyRef.current !== batchKey)
+            return;
+          if (res === null) {
+            throw new ApiError(403, i18n.t("mobile.composer.deviceInvalid"));
+          }
           setAttachments((prev) =>
             prev.map((a) =>
               a.id === id
-                ? { ...a, status: "ready", path: res.path, excludeWarning: res.excludeWarning }
+                ? {
+                    ...a,
+                    status: "ready",
+                    path: res.path,
+                    attachmentId: res.attachmentId,
+                    excludeWarning: res.excludeWarning,
+                  }
                 : a
             )
           );
         } catch (e) {
           uploadFirstSampleRef.current.delete(id);
+          if (uploadEpochRef.current !== batchEpoch || composerSessionKeyRef.current !== batchKey) {
+            return;
+          }
           if (ctrl.signal.aborted) {
             // 用户取消：chip 已随 removeAttachment 移除，静默收尾
             setAttachments((prev) => prev.filter((a) => a.id !== id));
             continue;
           }
+          const isAuthFail = e instanceof ApiError && e.status === 403;
           const isNoCwd = e instanceof ApiError && e.status === 404 && e.message === "no_cwd";
           if (isNoCwd) setNoCwd(true);
           const reason =
             e instanceof ApiError && isNoCwd
               ? i18n.t("mobile.composer.noCwdShort")
               : formatInvokeError(e instanceof ApiError ? e.message : String(e), i18n.t);
-          setAttachments((prev) =>
-            prev.map((a) => (a.id === id ? { ...a, status: "failed", error: reason } : a))
-          );
+          if (isAuthFail || isNoCwd) {
+            uploadEpochRef.current += 1;
+            uploadCtrlsRef.current.forEach((otherCtrl, otherId) => {
+              if (otherId !== id) otherCtrl.abort();
+            });
+            uploadCtrlsRef.current.clear();
+            uploadFirstSampleRef.current.clear();
+            setAttachments((prev) =>
+              prev
+                .filter((a) => a.id === id || a.status !== "uploading")
+                .map((a) => (a.id === id ? { ...a, status: "failed", error: reason } : a))
+            );
+          } else {
+            setAttachments((prev) =>
+              prev.map((a) => (a.id === id ? { ...a, status: "failed", error: reason } : a))
+            );
+          }
         } finally {
           uploadCtrlsRef.current.delete(id);
         }
       }
     },
-    [attachmentUnavailable, session.id, session.dshInstanceId]
+    [uploadOnly, session.id, session.dshInstanceId, setAttachments]
   );
 
   const removeAttachment = useCallback((id: string) => {
@@ -1975,15 +2481,15 @@ export default function MessageComposer({
   /** 粘贴图片（2026-09-20）：clipboard 里的图片文件走同上传链路（桌面浏览器粘贴
    *  最顺；移动端以 + 钮文件选择为主）。非图片粘贴放行默认文本行为 */
   const handlePaste = useCallback(
-    (e: ReactClipboardEvent<HTMLTextAreaElement>) => {
+    (e: ReactClipboardEvent<HTMLElement>) => {
       const images = Array.from(e.clipboardData?.files ?? []).filter((f) =>
         f.type.startsWith("image/")
       );
-      if (images.length === 0) return;
+      if (!canUpload || images.length === 0) return;
       e.preventDefault();
       void addFiles(images);
     },
-    [addFiles]
+    [addFiles, canUpload]
   );
 
   // OpenCode 默认保留原生连接与错误入口；旧流程仍等待 send-info。
@@ -2050,8 +2556,13 @@ export default function MessageComposer({
         update={dshReceipts.update}
       />
     ));
-  // 发送预检失败只隐藏输入；账本读不依赖当前写权限。
-  if ((!infoReady || sendInfo === null) && !dshRunning)
+  // 发送预检失败只隐藏输入；账本读与 P1-LOCAL-DRAFT 本地草稿不依赖当前写权限。
+  if (
+    (!infoReady || sendInfo === null) &&
+    !dshRunning &&
+    !allowLocalDraft &&
+    session.agentType !== "codex"
+  )
     return dshReceiptCards.length ? dshReceiptCards : null;
 
   const canSend =
@@ -2059,7 +2570,7 @@ export default function MessageComposer({
     !sending &&
     !busy &&
     text.trim().length > 0 &&
-    !attachments.some((a) => a.status === "uploading");
+    !attachments.some((a) => !a.uploadOnly && a.status === "uploading");
   // ===== T05：composer 主按钮按状态切换（spec §5 状态表）=====
   // - 「模型回合运行中」（控制器的新鲜投影事实）与「HTTP 投递中」（sending）是
   //   **两个状态**：停止按钮的可用性只看回合运行态 + canStop，**绝不看 sending/busy**；
@@ -2198,22 +2709,51 @@ export default function MessageComposer({
   };
 
   return (
-    <div data-testid="message-composer" className="shrink-0 border-t border-[var(--cb)] px-3 py-2">
+    <div
+      data-testid="message-composer"
+      className="shrink-0 border-t border-[var(--cb)] px-3 py-2"
+      onDragOver={
+        uploadOnly
+          ? (event) => {
+              if (event.dataTransfer.types.includes("Files")) event.preventDefault();
+            }
+          : undefined
+      }
+      onDrop={
+        uploadOnly
+          ? (event) => {
+              const files = Array.from(event.dataTransfer.files);
+              if (!files.length) return;
+              event.preventDefault();
+              void addFiles(files);
+            }
+          : undefined
+      }
+      onPaste={uploadOnly ? handlePaste : undefined}
+    >
       {/* 不可注入：同一处原因呈现（send-info 的 reason/reasonCode）。
           ZCode 会话不挂本组件（SessionDetail 路由到 ZcodeControlPanel），其只读原因
           面（配置/连接/离线）由面板就地申报。 */}
-      {pendingEdit?.sessionId === session.id && (
+      {matchesEditDraftSession(pendingEdit) && pendingEdit && (
         <div
           data-testid="composer-edit-choice"
           className="mb-2 flex flex-wrap items-center gap-2 text-xs"
         >
           <span>{i18n.t("mobile.codex.queue.editDraftConflict")}</span>
+          <span
+            data-testid="composer-edit-preview"
+            className="max-w-full truncate rounded bg-[var(--cb)] px-1.5 py-0.5 text-[var(--mut)]"
+          >
+            {pendingEdit.text}
+          </span>
           <button
             type="button"
             onClick={() => {
+              consumedActionIdsRef.current.add(pendingEdit.actionId);
               draftVersionRef.current += 1;
               textVersionRef.current += 1;
               setText(pendingEdit.text);
+              if (pendingEdit.queueOnly) setQueueOnlyNext(true);
               if (onEditDraftConsumed) onEditDraftConsumed(pendingEdit.actionId);
               else setPendingEdits((current) => current.filter((draft) => draft !== pendingEdit));
               inputRef.current?.focus();
@@ -2224,11 +2764,13 @@ export default function MessageComposer({
           <button
             type="button"
             onClick={() => {
+              consumedActionIdsRef.current.add(pendingEdit.actionId);
               draftVersionRef.current += 1;
               textVersionRef.current += 1;
               setText((current) =>
                 current ? `${current}\n\n${pendingEdit.text}` : pendingEdit.text
               );
+              if (pendingEdit.queueOnly) setQueueOnlyNext(true);
               if (onEditDraftConsumed) onEditDraftConsumed(pendingEdit.actionId);
               else setPendingEdits((current) => current.filter((draft) => draft !== pendingEdit));
               inputRef.current?.focus();
@@ -2297,6 +2839,11 @@ export default function MessageComposer({
           {sendInfo.reasonCode
             ? i18n.t("mobile.composer.sendDisabledCode", { code: sendInfo.reasonCode })
             : ""}
+        </p>
+      )}
+      {!injectable && allowLocalDraft && (
+        <p data-testid="composer-local-draft-note" className="mb-2 text-xs text-[var(--mut)]">
+          {i18n.t("mobile.composer.localDraftNote")}
         </p>
       )}
       {/* 丁T3 接入② / 丁T6 复评：终端卡片在场提示条（**输入区仍可用**——不把输入框
@@ -2474,6 +3021,42 @@ export default function MessageComposer({
               )}
             </>
           )}
+          {receipt.kind === "desktopAx" && (
+            // **macOS AX 直写回执**。五档互不替代：
+            //  delivered  → 绿色，可视为已送达
+            //  notTouched → 中性，明确没碰输入框（草稿在）
+            //  touchedNotSubmitted / maybeSubmitted → 琥珀，需人到 Mac 处理，**无重试**
+            //  unavailable → 中性，环境问题
+            <span
+              data-testid="send-receipt-desktop-ax"
+              data-variant={receipt.variant}
+              data-reason={receipt.reasonCode ?? ""}
+              className={
+                receipt.variant === "delivered"
+                  ? "rounded-full bg-emerald-500/10 px-2 py-0.5 text-xs text-emerald-700 dark:bg-emerald-400/10 dark:text-emerald-400"
+                  : receipt.variant === "touchedNotSubmitted" ||
+                      receipt.variant === "maybeSubmitted"
+                    ? "rounded-full bg-amber-500/10 px-2 py-0.5 text-xs text-amber-700 dark:bg-amber-400/10 dark:text-amber-400"
+                    : "rounded-full bg-[var(--cb)]/70 px-2 py-0.5 text-xs text-[var(--mut)]"
+              }
+            >
+              {desktopAxCopy(receipt.variant, receipt.reasonCode)}
+              {receipt.variant !== "delivered" && receipt.desktopViewMayHaveChanged
+                ? ` ${i18n.t("mobile.codex.adapt.desktopViewMayHaveChanged")}`
+                : null}
+            </span>
+          )}
+          {receipt.kind === "desktopAxUnconfirmed" && (
+            // AX 未确认：**琥珀**，说明可能已发送；保留 actionId 锚，
+            // 用户再点发送会按同 ID 只读核对（服务端不重发）。
+            <span
+              data-testid="send-receipt-desktop-ax-unconfirmed"
+              data-action-id={receipt.actionId}
+              className="rounded-full bg-amber-500/10 px-2 py-0.5 text-xs text-amber-700 dark:bg-amber-400/10 dark:text-amber-400"
+            >
+              {i18n.t("mobile.codex.composer.desktopAx_unconfirmed")}
+            </span>
+          )}
           {receipt.kind === "headless" && (
             <span
               data-testid="send-receipt-headless"
@@ -2505,6 +3088,11 @@ export default function MessageComposer({
             deadlineExceeded={receipt.deadline === true}
             initialReasonCode={receipt.reasonCode}
             resumedFrom={receipt.resumedFrom}
+            disconnected={
+              codexDisconnected ||
+              (receipt.originIdentity !== undefined &&
+                receipt.originIdentity !== currentTargetIdentity)
+            }
             onRetryNewAction={retryNotSent}
             onReportIssue={(code) => handleReportIssue(code, receipt.actionId)}
             onSuccessorResolved={handleSuccessorResolved}
@@ -2569,17 +3157,22 @@ export default function MessageComposer({
                 >
                   {i18n.t("mobile.composer.jumpNow")}
                 </button>
-                <button
-                  type="button"
-                  data-testid="queue-edit"
-                  disabled={busy || sending}
-                  onClick={() => {
-                    void handleEdit(item);
-                  }}
-                  className="rounded-full bg-amber-500/20 px-2 py-0.5 text-xs text-amber-700 disabled:opacity-40 dark:bg-amber-400/20 dark:text-amber-300"
-                >
-                  {i18n.t("mobile.composer.editAction")}
-                </button>
+                {item.editable !== false &&
+                  (item.agentType === undefined ||
+                    session.agentType === undefined ||
+                    item.agentType === session.agentType) && (
+                    <button
+                      type="button"
+                      data-testid="queue-edit"
+                      disabled={busy || sending}
+                      onClick={() => {
+                        void handleEdit(item);
+                      }}
+                      className="rounded-full bg-amber-500/20 px-2 py-0.5 text-xs text-amber-700 disabled:opacity-40 dark:bg-amber-400/20 dark:text-amber-300"
+                    >
+                      {i18n.t("mobile.composer.editAction")}
+                    </button>
+                  )}
                 <button
                   type="button"
                   data-testid="queue-retract"
@@ -2638,14 +3231,31 @@ export default function MessageComposer({
                         : "bg-[var(--cb)] text-[var(--mut)]"
                     }`}
                   >
-                    {uploading
-                      ? i18n.t("mobile.composer.uploadUploading", { name: a.name })
-                      : a.status === "failed"
-                        ? i18n.t("mobile.composer.uploadFailed", {
-                            name: a.name,
-                            error: a.error ?? "",
-                          })
-                        : a.name}
+                    {uploading ? (
+                      i18n.t("mobile.composer.uploadUploading", { name: a.name })
+                    ) : a.status === "failed" ? (
+                      i18n.t("mobile.composer.uploadFailed", {
+                        name: a.name,
+                        error: a.error ?? "",
+                      })
+                    ) : a.uploadOnly && (a.attachmentId || a.path) && onPreviewAttachment ? (
+                      <button
+                        type="button"
+                        className="underline"
+                        onClick={() =>
+                          a.attachmentId
+                            ? onPreviewAttachment(a.name, a.attachmentId)
+                            : onPreviewAttachment(a.path!)
+                        }
+                      >
+                        {a.name}
+                      </button>
+                    ) : (
+                      a.name
+                    )}
+                    {a.uploadOnly && a.status === "ready" && (
+                      <span>{i18n.t("mobile.composer.uploadedNotSent")}</span>
+                    )}
                     {excludeWarning && (
                       <span
                         data-testid="attach-exclude-warning"
@@ -2735,7 +3345,7 @@ export default function MessageComposer({
             data-testid="attach-add"
             aria-label={i18n.t("mobile.composer.attachAddAria")}
             aria-expanded={attachHintOpen}
-            disabled={!injectable || noCwd || attachmentUnavailable}
+            disabled={!canUpload}
             aria-describedby={attachmentUnavailable ? "composer-attachment-unavailable" : undefined}
             title={
               attachmentUnavailableCopy ??
@@ -2772,12 +3382,15 @@ export default function MessageComposer({
             if (sendInfo?.channels?.includes("dsh_desktop")) releaseSettledDsh();
             setText(e.target.value.slice(0, MAX_SEND_CHARS));
           }}
-          onPaste={handlePaste}
+          onPaste={uploadOnly ? undefined : handlePaste}
           rows={2}
-          disabled={!injectable}
+          disabled={!injectable && !uploadOnly && !allowLocalDraft}
+          readOnly={!injectable && !allowLocalDraft}
           placeholder={
             !injectable
-              ? i18n.t("mobile.composer.sendDisabledFallback")
+              ? allowLocalDraft
+                ? i18n.t("mobile.composer.localDraftPlaceholder")
+                : i18n.t("mobile.composer.sendDisabledFallback")
               : cardPresence === "questionFreeText"
                 ? i18n.t(QUESTION_FREETEXT_PLACEHOLDER)
                 : cardPresence === "questionBlocked"

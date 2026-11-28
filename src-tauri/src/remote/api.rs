@@ -28,10 +28,49 @@ use crate::services::opencode_native::policy;
 /// 不再跟踪管理，恢复只有历史页「移回看板」一条路。counts 按过滤后重算。
 /// GET /sessions 与 SSE snapshot 帧共用本函数——两个入口口径一致，隐藏卡片
 /// 不会经另一通道诈尸。
+/// 候选读取范围收紧（Task 4A）：`Active` → 只保留批准会话；`Invalid` → 清空；
+/// 非候选（`Absent`）原样返回。所有**会话快照类**读面（看板/SSE/文件面板）
+/// 共用本函数，避免只收口主快照而漏掉旁路。
+pub(crate) fn apply_candidate_scope_to_sessions(
+    mut resp: crate::session::SessionsResponse,
+) -> crate::session::SessionsResponse {
+    use crate::remote::candidate_read_scope::{policy, CandidatePolicy};
+    match policy() {
+        CandidatePolicy::Absent => resp,
+        CandidatePolicy::Active(scope) => {
+            resp.sessions
+                .retain(|s| scope.allows(s.agent_type.tool_id(), &s.id));
+            resp.total_count = resp.sessions.len();
+            resp.waiting_count = resp
+                .sessions
+                .iter()
+                .filter(|s| matches!(s.status, crate::session::SessionStatus::Waiting))
+                .count();
+            resp
+        }
+        CandidatePolicy::Invalid(_) => crate::session::SessionsResponse {
+            sessions: Vec::new(),
+            total_count: 0,
+            waiting_count: 0,
+        },
+    }
+}
+
+/// 单个会话在此进程是否允许被读取/扫描（候选范围内只允许批准会话）。
+pub(crate) fn candidate_scope_allows_session(agent: &str, sid: &str) -> bool {
+    use crate::remote::candidate_read_scope::{policy, CandidatePolicy};
+    match policy() {
+        CandidatePolicy::Absent => true,
+        CandidatePolicy::Active(scope) => scope.allows(agent, sid),
+        CandidatePolicy::Invalid(_) => false,
+    }
+}
+
 fn apply_board_hidden(
     st: &Arc<RemoteState>,
     mut resp: crate::session::SessionsResponse,
 ) -> crate::session::SessionsResponse {
+    resp = apply_candidate_scope_to_sessions(resp);
     let hidden: std::collections::HashSet<String> = (st.board_hidden_ids)().into_iter().collect();
     if hidden.is_empty() {
         return resp;
@@ -689,6 +728,10 @@ pub async fn events(
         // Lagged（消费者落后超通道容量）与 Closed 均非致命：broadcast 丢最旧事件是通道
         // 语义（宁可缺边沿也不阻塞 watcher 生产端），重连时的全量快照负责校正——丢弃该条继续流
         let e = msg.ok()?;
+        // Task 4A：候选范围内只转发批准会话的跃迁（快照已同源过滤）
+        if !candidate_scope_allows_session(&e.agent_type, &e.session_id) {
+            return None;
+        }
         match serde_json::to_string(&e) {
             Ok(data) => Some(Ok(sse::Event::default().event("transition").data(data))),
             Err(err) => {
@@ -1256,6 +1299,10 @@ pub async fn session_files(
     else {
         return Err(StatusCode::BAD_REQUEST);
     };
+    // Task 4A：候选范围内只允许批准会话（越界一律 403，不回退通用读源）
+    if !candidate_scope_allows_session(&agent, &sid) {
+        return Err(StatusCode::FORBIDDEN);
+    }
     // 追溯档位（M3+ 用户裁决 3）：缺省 200，与详情页默认 limit 同标尺
     let limit = params
         .get("limit")
@@ -1344,6 +1391,10 @@ pub async fn session_subagents(
     else {
         return Err(StatusCode::BAD_REQUEST);
     };
+    // Task 4A：候选范围内只允许批准会话的子 Agent 读面
+    if !candidate_scope_allows_session(&agent, &sid) {
+        return Err(StatusCode::FORBIDDEN);
+    }
     // 可选实例身份：旧客户端/非 DSH 工具省略；DSH 生产源自行拒绝缺省。
     let instance = params
         .get("instanceId")
@@ -1453,6 +1504,7 @@ pub async fn session_subagent_messages(
                     truncated: false,
                     cwd: None,
                     older_before: None,
+                    codex_saved_source: None,
                     dsh_model_summary: None,
                 },
                 false,
@@ -1495,7 +1547,7 @@ pub async fn session_subagent_messages(
 /// - Rejected：敏感目录 / 不存在 / 过大 / 目录 / 读取失败 → 一律 403，**响应体
 ///   带结构化原因**（M5 P2-a 用户裁决：原因写在报错处便于排障。原「空体防探测」
 ///   随边界全盘放开退役——原因仅暴露给已过闸设备，PIN + cookie 已是门槛）。
-enum FileReadOutcome {
+pub(super) enum FileReadOutcome {
     Found(Vec<u8>, String),
     NoSession,
     Rejected(crate::remote::files::FileRejectReason),
@@ -1514,6 +1566,8 @@ enum FileReadOutcome {
 pub async fn read_file(
     State(st): State<Arc<RemoteState>>,
     axum::Extension(roots): axum::Extension<crate::remote::files::ProtectedFileRoots>,
+    axum::Extension(policy_source): axum::Extension<super::server::CandidatePolicySource>,
+    axum::Extension(raw_sessions_source): axum::Extension<super::server::RawFileSessionSource>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Response, StatusCode> {
     let Some(sid) = params
@@ -1537,46 +1591,82 @@ pub async fn read_file(
         .filter(|s| !s.is_empty());
     let st = st.clone();
     let outcome = tokio::task::spawn_blocking(move || {
-        // 数据同源铁律 3：cwd 直调注入的会话源（生产 = scan_bus::current_or_scan，
-        // 与看板同一份快照），不另立查找函数
-        let resp = (st.session_source)();
-        // DSH 会话：按 (dsh, instance, sid) 三元组精确定位——缺 instanceId 且
-        // 快照唯一 → 兼容放行；多义 → 拒绝（不取首卡）。
-        // R05 复审残留：**非 DSH 工具忽略实例参数**——其他工具无实例语义，
-        // 跨工具同 ID 时不得因携带实例参数而错误命中非 DSH 卡。
-        let matches = |s: &crate::session::Session| {
-            if s.agent_type.tool_id() != "dsh" {
-                return instance.is_none() && s.id == sid;
+        // 先判候选策略：Invalid 必须在调用任何会话源前短路，避免触发冷启动扫描。
+        let candidate_policy = policy_source();
+        match &candidate_policy {
+            crate::remote::candidate_read_scope::CandidatePolicy::Invalid(_) => {
+                FileReadOutcome::Rejected(crate::remote::files::FileRejectReason::PermissionDenied)
             }
-            match (&instance, &s.dsh_instance_id) {
-                (Some(i), Some(si)) => i == si && s.id == sid,
-                (Some(_), None) => false,
-                (None, _) => s.id == sid,
+            crate::remote::candidate_read_scope::CandidatePolicy::Active(scope) => {
+                // 候选模式使用保留跨工具/同工具/CLI-Desktop 冲突证据的原始会话源，在过滤前拒绝歧义。
+                let sessions = match raw_sessions_source() {
+                    Some(raw) => {
+                        if raw.suppressed_conflict_ids.contains(&sid) {
+                            return FileReadOutcome::NoSession;
+                        }
+                        raw.sessions
+                    }
+                    None => (st.session_source)().sessions,
+                };
+                let Ok(Some(session)) = unique_file_session(sessions, &sid, instance.as_deref())
+                else {
+                    return FileReadOutcome::NoSession;
+                };
+                let agent = session.agent_type.tool_id();
+                if !scope.allows(agent, &sid) {
+                    return FileReadOutcome::NoSession;
+                }
+                let home = (st.home_source)();
+                let roots = match roots() {
+                    Ok(roots) => roots,
+                    Err(_) => {
+                        return FileReadOutcome::Rejected(
+                            crate::remote::files::FileRejectReason::Sensitive,
+                        )
+                    }
+                };
+                match crate::remote::files::read_file_safe_candidate(
+                    &session.project_path,
+                    &path,
+                    home.as_deref(),
+                    &roots,
+                    scope,
+                    &sid,
+                ) {
+                    Ok((bytes, mime)) => FileReadOutcome::Found(bytes, mime),
+                    Err(e) => FileReadOutcome::Rejected(e),
+                }
             }
-        };
-        let mut hits: Vec<_> = resp.sessions.iter().filter(|s| matches(s)).collect();
-        let session = match hits.len() {
-            0 => return FileReadOutcome::NoSession,
-            1 => hits.pop().unwrap().clone(),
-            _ => return FileReadOutcome::NoSession, // 多义 = 归属不明，拒绝
-        };
-        // 敏感黑名单基准：经注入缝取真实 home（M5 P2-a 追记——直接传 None 曾使
-        // 主目录内黑名单整段失效，见 read_file_safe 文档）
-        let home = (st.home_source)();
-        let roots = match roots() {
-            Ok(roots) => roots,
-            Err(_) => {
-                return FileReadOutcome::Rejected(crate::remote::files::FileRejectReason::Sensitive)
+            crate::remote::candidate_read_scope::CandidatePolicy::Absent => {
+                // 数据同源铁律 3：cwd 直调注入的会话源（生产 = scan_bus::current_or_scan，
+                // 与看板同一份快照），不另立查找函数
+                let resp = (st.session_source)();
+                let Ok(Some(session)) =
+                    unique_file_session(resp.sessions, &sid, instance.as_deref())
+                else {
+                    return FileReadOutcome::NoSession;
+                };
+                // 敏感黑名单基准：经注入缝取真实 home（M5 P2-a 追记——直接传 None 曾使
+                // 主目录内黑名单整段失效，见 read_file_safe 文档）
+                let home = (st.home_source)();
+                let roots = match roots() {
+                    Ok(roots) => roots,
+                    Err(_) => {
+                        return FileReadOutcome::Rejected(
+                            crate::remote::files::FileRejectReason::Sensitive,
+                        )
+                    }
+                };
+                match crate::remote::files::read_file_safe_with_roots(
+                    &session.project_path,
+                    &path,
+                    home.as_deref(),
+                    &roots,
+                ) {
+                    Ok((bytes, mime)) => FileReadOutcome::Found(bytes, mime),
+                    Err(e) => FileReadOutcome::Rejected(e),
+                }
             }
-        };
-        match crate::remote::files::read_file_safe_with_roots(
-            &session.project_path,
-            &path,
-            home.as_deref(),
-            &roots,
-        ) {
-            Ok((bytes, mime)) => FileReadOutcome::Found(bytes, mime),
-            Err(e) => FileReadOutcome::Rejected(e),
         }
     })
     .await
@@ -1587,7 +1677,7 @@ pub async fn read_file(
     file_read_response(outcome)
 }
 
-fn file_read_response(outcome: FileReadOutcome) -> Result<Response, StatusCode> {
+pub(super) fn file_read_response(outcome: FileReadOutcome) -> Result<Response, StatusCode> {
     match outcome {
         FileReadOutcome::Found(bytes, mime) if mime.starts_with("image/") => Ok((
             // 门禁下的私有文件内容，禁止中间层缓存（sessions 同规）
@@ -1649,6 +1739,10 @@ pub async fn dsh_media(
             serde_json::json!({"error":"forbidden"}),
         )
     };
+    // Task 4A：候选授权范围只含 Codex 原线程——其它工具读面（含 DSH 媒体）全拒。
+    if crate::remote::candidate_read_scope::enforced() {
+        return forbidden();
+    }
     let Some(device) = super::gate::extract_device(&headers) else {
         return forbidden();
     };
@@ -1811,6 +1905,62 @@ pub(crate) fn read_session_messages_core(
     (st.message_source)(agent, sid, limit)
 }
 
+/// 与 [`read_session_messages_core`] 同源，但显式声明是否为 Codex App 形态：
+/// App 走 P1 新增的投影选择，CLI 保持基线 rollout 选择（Task 4B）。
+/// 形态无法唯一确定时按 CLI 处理（保守回到既有成功路径）。
+pub(crate) fn read_session_messages_core_for_form(
+    st: &RemoteState,
+    agent: &str,
+    sid: &str,
+    limit: usize,
+    app_form: bool,
+) -> Result<crate::remote::content::MessagesPage, String> {
+    if agent != "codex" || !app_form {
+        return read_session_messages_core(st, agent, sid, limit);
+    }
+    // 候选读取范围：scope 生效时只读批准根 + 批准会话（越界拒绝，不回退）。
+    if let Some(error) = crate::remote::candidate_read_scope::scope_config_error() {
+        return Err(error);
+    }
+    if let Some(scope) = crate::remote::candidate_read_scope::active_scope() {
+        if !scope.allows(agent, sid) {
+            return Err(format!(
+                "CANDIDATE_READ_SCOPE_DENIED: 会话不在候选批准范围内: {agent}/{sid}"
+            ));
+        }
+        return crate::remote::content::read_session_messages_with_form(
+            &scope.root,
+            agent,
+            sid,
+            limit,
+            true,
+        );
+    }
+    let Some(home) = (st.home_source)() else {
+        return read_session_messages_core(st, agent, sid, limit);
+    };
+    crate::remote::content::read_session_messages_with_form(
+        std::path::Path::new(&home),
+        agent,
+        sid,
+        limit,
+        true,
+    )
+}
+
+/// 会话是否为 Codex Desktop App 形态（从同一已授权快照解析；缺失/歧义 → None）。
+fn codex_app_form_for(st: &RemoteState, sid: &str) -> Option<bool> {
+    let sessions = (st.session_source)().sessions;
+    let mut matches = sessions
+        .iter()
+        .filter(|s| s.id == sid && s.agent_type == crate::session::AgentType::Codex);
+    let first = matches.next()?;
+    if matches.next().is_some() {
+        return None;
+    }
+    Some(codex_app_form(first))
+}
+
 /// GET /m/api/v1/session-messages?agent_type=&session_id=&limit=（M3 Task 7，C2 后端）
 /// 八工具统一内容出口（P9）：`{messages: [{seq, role, content, kind, ts, toolName?,
 /// toolArgs?, collapsed}]}`（SessionMessage camelCase 序列化）。
@@ -1853,6 +2003,10 @@ pub async fn session_messages(
         .get("before")
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(0);
+    // Task 4A：候选授权范围在**进入任何读源之前**生效（默认读源与显式 SQLite 一致）
+    if !candidate_scope_allows_session(&agent, &sid) {
+        return Err(StatusCode::FORBIDDEN);
+    }
     // message_source 不可 clone（Box<dyn Fn>）：整体 move 进阻塞线程池调用（与
     // sessions handler 捕获 session_source 的写法一致）；agent/sid 移动副本进闭包，
     // 原值保留给失败分支的日志
@@ -1860,7 +2014,43 @@ pub async fn session_messages(
     let agent_ref = agent.clone();
     let instance_id = params.get("instanceId").cloned();
     let history = params.get("history").is_some_and(|flag| flag == "1");
+    let sqlite_history = params
+        .get("codex_saved_source")
+        .is_some_and(|source| source == "thread_history");
     let result = tokio::task::spawn_blocking(move || {
+        if sqlite_history {
+            if agent_ref != "codex" {
+                return Err(StatusCode::BAD_REQUEST);
+            }
+            let session = unique_file_session((st.session_source)().sessions, &sid, None)
+                .ok()
+                .flatten()
+                .filter(codex_app_form)
+                .ok_or(StatusCode::NOT_FOUND)?;
+            // 候选读取范围：显式 SQLite 与默认读源共用同一批准根/会话范围
+            //（越界直接拒绝，不回退通用读源）。日用构建 scope 恒不生效。
+            if let Some(error) = crate::remote::candidate_read_scope::scope_config_error() {
+                log::warn!("候选显式 SQLite 读取被拒（范围配置非法）: {error}");
+                return Err(StatusCode::FORBIDDEN);
+            }
+            if let Some(scope) = crate::remote::candidate_read_scope::active_scope() {
+                if !scope.allows(session.agent_type.tool_id(), &session.id) {
+                    log::warn!(
+                        "候选显式 SQLite 读取被拒（会话不在批准范围）: {}/{}",
+                        session.agent_type.tool_id(),
+                        session.id
+                    );
+                    return Err(StatusCode::FORBIDDEN);
+                }
+            }
+            let home = (st.home_source)().ok_or(StatusCode::NOT_FOUND)?;
+            return crate::remote::content::read_codex_thread_with(
+                std::path::Path::new(&home),
+                &session.id,
+                limit.clamp(1, 1000),
+            )
+            .map_err(|_| StatusCode::NOT_FOUND);
+        }
         if agent_ref == "dsh" {
             // 归档已记录实例时，离线读不能绕过该记录改读同名会话。
             let (mut archived, mut another_instance) = (false, false);
@@ -1903,8 +2093,21 @@ pub async fn session_messages(
             )
             .map_err(|_| StatusCode::NOT_FOUND)
         } else {
-            read_session_messages_core(&st, agent_ref.as_str(), sid.as_str(), limit)
-                .map_err(|_| StatusCode::NOT_FOUND)
+            // Task 4B：Codex 的 App 形态才使用 P1 新增投影选择；CLI 保持基线
+            // rollout 选择。形态歧义/未知按 CLI 处理（回到既有成功路径）。
+            let app_form = if agent_ref == "codex" {
+                codex_app_form_for(&st, &sid).unwrap_or(false)
+            } else {
+                false
+            };
+            read_session_messages_core_for_form(
+                &st,
+                agent_ref.as_str(),
+                sid.as_str(),
+                limit,
+                app_form,
+            )
+            .map_err(|_| StatusCode::NOT_FOUND)
         }
     })
     .await
@@ -1924,6 +2127,9 @@ pub async fn session_messages(
                 "messages": pg.messages,
                 "truncated": pg.truncated,
             });
+            if let Some(source) = pg.codex_saved_source {
+                payload["codexSavedSource"] = serde_json::json!(source);
+            }
             if let Some(cursor) = pg.older_before {
                 payload["olderBefore"] = serde_json::json!(cursor);
             }
@@ -1979,6 +2185,9 @@ pub struct SessionSendReq {
     /// 重发同 ID 由服务端账本去重（不代造——代造 = 双投风险面）。
     #[serde(default)]
     pub action_id: Option<String>,
+    /// 手机看到的 Codex 发送通道。资格变化时拒绝本次请求，不替用户换路。
+    #[serde(default)]
+    pub codex_route: Option<String>,
     /// **S2 一次性越队**：用户显式选择「保留旧队列暂停，本条先发送」（打断后队列
     /// 暂停时的二选一之一；另一选择 = 先调 `/codex/queue/resume` 恢复队列再发送）。
     /// 服务端据此为**本 action** 建绑定授权（持久、消费即失效）；不是全局开关，
@@ -1995,6 +2204,8 @@ pub struct QueueItemReq {
     #[serde(default)]
     pub session_id: String,
     pub item_id: Option<i64>,
+    #[serde(default, rename = "agentType")]
+    pub agent_type: Option<String>,
 }
 
 /// 状态码 + JSON 载荷的统一 no-store 响应（本文件各端点带状态码的 Json 回执共用
@@ -2098,6 +2309,30 @@ pub(crate) fn find_session_sync(
         .find(|s| s.id == session_id)
 }
 
+// 文件预览与暂存都不从同 ID 的多个候选中选首卡。
+pub(super) fn unique_file_session(
+    sessions: impl IntoIterator<Item = crate::session::Session>,
+    session_id: &str,
+    instance: Option<&str>,
+) -> Result<Option<crate::session::Session>, ()> {
+    let mut matches = sessions.into_iter().filter(|session| {
+        session.id == session_id
+            && match instance {
+                None => true,
+                Some(id) => {
+                    session.agent_type == crate::session::AgentType::Dsh
+                        && session.dsh_instance_id.as_deref() == Some(id)
+                }
+            }
+    });
+    let first = matches.next();
+    if matches.next().is_some() {
+        Err(())
+    } else {
+        Ok(first)
+    }
+}
+
 /// DSH 写入按实例与会话同时定位；未携实例的旧请求仅在快照唯一时兼容。
 fn find_request_session(
     st: &Arc<RemoteState>,
@@ -2113,11 +2348,33 @@ fn find_request_session_with_policy(
     instance_id: Option<&str>,
     prefer_retired_opencode: bool,
 ) -> Result<Option<crate::session::Session>, ()> {
-    let sessions: Vec<_> = (st.fresh_session_source)()
-        .sessions
+    request_session_candidates(
+        (st.fresh_session_source)().sessions,
+        session_id,
+        instance_id,
+        prefer_retired_opencode,
+        false,
+    )
+}
+
+fn request_session_candidates(
+    candidates: Vec<crate::session::Session>,
+    session_id: &str,
+    instance_id: Option<&str>,
+    prefer_retired_opencode: bool,
+    unique_mac_codex: bool,
+) -> Result<Option<crate::session::Session>, ()> {
+    let sessions: Vec<_> = candidates
         .into_iter()
         .filter(|s| s.id == session_id)
         .collect();
+    if unique_mac_codex
+        && cfg!(target_os = "macos")
+        && instance_id.is_none()
+        && sessions.iter().any(codex_app_form)
+    {
+        return unique_file_session(sessions, session_id, None);
+    }
     if let Some(id) = instance_id {
         let mut matches = sessions.into_iter().filter(|s| {
             s.agent_type == crate::session::AgentType::Dsh
@@ -2324,6 +2581,60 @@ fn headless_blocked(
 /// 同一判据；将来翻转协议臂时改本函数（或其调用点）即全端点同步。
 /// **GET 类端点不受门**（`session_mode` / `session_mode_menu_read` /
 /// `session_question` 读侧照常）；**CLI 形态零变化**。
+/// 该会话是否应走 AX 直写通道。
+///
+/// # 判据刻意保守
+///
+/// 静态候选条件，不采样 AX，不替代发送时对进程和线程的现场核证。
+#[cfg(target_os = "macos")]
+fn codex_ax_candidate(session: &crate::session::Session) -> bool {
+    std::env::var("TUVIS_CODEX_AX_SEND").as_deref() == Ok("1")
+        && codex_app_form(session)
+        && !session.id.trim().is_empty()
+        && session.pid != 0
+}
+
+/// 新动作选择 AX 的唯一入口。已知 IPC 门拒绝不能转化成 AX 写入资格。
+#[cfg(target_os = "macos")]
+async fn codex_ax_for_new_send(st: &RemoteState, session: &crate::session::Session) -> bool {
+    use crate::services::codex_desktop_ipc::capability::{CodexOperation, EvidenceSource};
+
+    if !codex_ax_candidate(session) {
+        return false;
+    }
+    let Some(key) = super::codex_ipc::resolve_session_thread(st, session) else {
+        return false;
+    };
+    let store = st.codex_control.router.store();
+    let Ok(queue_pause) = store.queue_pause(&key) else {
+        return false;
+    };
+    if queue_pause.is_some() && store.has_queued_for_thread(&key).unwrap_or(true) {
+        return false;
+    }
+
+    let ipc = st
+        .codex_control
+        .adapter
+        .projection_for_admission(&key)
+        .await;
+    if !ipc.pending.is_empty() || ipc.runtime_status == "active" {
+        return false;
+    }
+    if ipc.stale {
+        return true; // 当前没有活 IPC 投影；AX 仍须现场核证。
+    }
+    if ipc.runtime_status != "idle" {
+        return false;
+    }
+    let verified_ipc_send = ipc
+        .effective_operations
+        .operations
+        .get(&CodexOperation::Send)
+        .is_some_and(|status| status.allowed && status.evidence != EvidenceSource::None);
+    !verified_ipc_send
+}
+
 fn codex_app_form(session: &crate::session::Session) -> bool {
     session.agent_type.tool_id() == "codex"
         && matches!(session.form, crate::session::ProcessForm::App)
@@ -2729,10 +3040,6 @@ pub async fn session_send(
             serde_json::json!({ "error": ZCODE_OFFICIAL_CONTROL_REQUIRED }),
         );
     }
-    // ④ Codex APP → Desktop IPC control hub：**必须在 H3 门之前交给 hub**——只有
-    //    兼容分支受 H3（A 可用时 H3 关闭不挡 IPC）。判据：codex APP 形态 ∧ thread 可
-    //    解析。hub 分支内自管 actionId 契约 / desktop_ipc/codex_queued 回执 / 兜底交接
-    //    （兜底分支内部再受 H3）。
     // ③.5 任务 8 旧路径防双投屏障：取同会话旧写 read permit（与原生
     //   `select_native_route` 的 write permit 互斥），**持有到本次写入与结果记录
     //   （入队/直发/审计）全部结束**——在飞旧写期间切换路由必须等待，杜绝
@@ -2747,6 +3054,90 @@ pub async fn session_send(
     //    **所有 Codex APP 普通消息一律进统一 router**（spec F7/S5）：未知 build/未跟随/
     //    桌面不可达也先经登记→守卫→派发或排队（离线冻结留队等恢复），不得绕过持久
     //    去重；headless 只服务 headless 归属会话（H3 门见 ④b）。
+    // 通道只在首派前选择。旧动作的账本归属优先于当前连接和开关。
+    #[cfg(target_os = "macos")]
+    let use_ax = if codex_app_form(&session) {
+        use crate::services::codex_desktop_ipc::types::ControlRoute;
+
+        let recorded = req.action_id.as_deref().map(|id| {
+            st.store.with(|conn| {
+                crate::database::dao::codex_actions::get_row(conn, id)
+                    .map(|row| row.map(|row| row.route))
+            })
+        });
+        match recorded.transpose() {
+            Ok(Some(Some(ControlRoute::DesktopAx))) if codex_ax_candidate(&session) => true,
+            Ok(Some(Some(ControlRoute::DesktopAx))) | Err(_) => {
+                return json_no_store(
+                    StatusCode::CONFLICT,
+                    serde_json::json!({"error": "codex_send_route_changed", "reasonCode": "codex_send_route_changed"}),
+                );
+            }
+            Ok(Some(Some(_))) => false,
+            Ok(_) => codex_ax_for_new_send(&st, &session).await,
+        }
+    } else {
+        false
+    };
+    #[cfg(not(target_os = "macos"))]
+    let use_ax = false;
+    let selected_route = if use_ax { "desktop_ax" } else { "desktop_ipc" };
+    if req
+        .codex_route
+        .as_deref()
+        .is_some_and(|shown| !codex_app_form(&session) || shown != selected_route)
+    {
+        return json_no_store(
+            StatusCode::CONFLICT,
+            serde_json::json!({"error": "codex_send_route_changed", "reasonCode": "codex_send_route_changed"}),
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    if use_ax {
+        // **`queueOnly` 在 AX 路由下必须拒绝**（复审 Important-6）。
+        //
+        // `queueOnly: true` 的语义是"只入队、不要立即写桌面"。AX 通道没有队列，
+        // 直接填字并按发送键就违背了用户意图。如实拒绝并保留草稿。
+        if req.queue_only == Some(true) || req.bypass_paused_queue == Some(true) {
+            return json_no_store(
+                StatusCode::OK,
+                serde_json::json!({
+                    "status": "desktop_ax_not_touched",
+                    "error": "desktop_ax_refused",
+                    "reasonCode": "ax_queue_only_unsupported",
+                    "route": "desktop_ax",
+                    "actionId": req.action_id.as_deref().unwrap_or(""),
+                    "draftMayBeKept": true,
+                }),
+            );
+        }
+        let action_id = req
+            .action_id
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or("")
+            .to_string();
+        if action_id.is_empty() {
+            return json_no_store(
+                StatusCode::BAD_REQUEST,
+                serde_json::json!({
+                    "error": "bad_request",
+                    "reasonCode": "action_id_required",
+                }),
+            );
+        }
+        return super::codex_ax_send::session_send_via_ax(
+            &st,
+            &session,
+            &device_id,
+            &device_name,
+            &req.text,
+            &action_id,
+        )
+        .await;
+    }
+
     let hub_route = codex_app_form(&session);
     if hub_route {
         let action_id = req
@@ -3173,6 +3564,13 @@ fn hub_send_info_body(session: &crate::session::Session) -> serde_json::Value {
 pub(crate) const NATIVE_PENDING_REASON_ZH: &str =
     "桌面有待处理的审批或提问，请先在桌面处理，或打断当前回合后再发送";
 
+const CODEX_DESKTOP_STAGING: &str = "codex_desktop_staging";
+
+fn codex_staging_directory(project_path: &str) -> bool {
+    let path = std::path::Path::new(project_path);
+    path.is_absolute() && std::fs::symlink_metadata(path).is_ok_and(|meta| meta.is_dir())
+}
+
 /// GET /m/api/v1/session-send-info?session_id=（W4 输入区可用性矩阵）：
 /// 会话不在快照 → 404 no_session；路由判定 → 200 {injectable, channels, visibility}
 /// 或 {injectable:false, reasonCode, reason}。快照是同步阻塞扫描，spawn_blocking 包裹。
@@ -3204,7 +3602,13 @@ pub async fn session_send_info(
     };
     let probe_st = st.clone();
     let session = match tokio::task::spawn_blocking(move || {
-        find_request_session(&probe_st, &probe_sid, instance.as_deref())
+        request_session_candidates(
+            (probe_st.fresh_session_source)().sessions,
+            &probe_sid,
+            instance.as_deref(),
+            false,
+            true,
+        )
     })
     .await
     {
@@ -3412,16 +3816,61 @@ pub async fn session_send_info(
     // 「兼容发送开关放行」例外已随旧键退出所有门而移除（S1 拆线遗留的旧键读取点
     // 在此一并修正）。
     if codex_app_form(&session) {
+        let send_unavailable = |code: &str, reason: &str| {
+            let mut body = serde_json::json!({
+                "injectable": false,
+                "reasonCode": code,
+                "reason": reason,
+                "route": "desktop_ipc",
+            });
+            // 只是已有上传端点的入口提示，不放行任何 Codex 写操作。
+            if cfg!(target_os = "macos")
+                && super::gate::extract_device(&headers).is_some()
+                && codex_staging_directory(&session.project_path)
+            {
+                body["attachmentUploadOnly"] = serde_json::json!(true);
+            }
+            json_no_store(StatusCode::OK, body)
+        };
+        // 资格与 POST 共用选路；只申报可尝试，不在轮询时采样 AX 或操作桌面。
+        #[cfg(target_os = "macos")]
+        if super::gate::extract_device(&headers).is_some()
+            && codex_ax_for_new_send(&st, &session).await
+        {
+            // 与 POST 共用尚未解除的跨通道屏障；不误拦已收敛的历史记录。
+            if super::codex_ax_send::ax_send_blocked_by_barrier(
+                st.codex_control.router.store(),
+                &session.id,
+            ) {
+                return json_no_store(
+                    StatusCode::OK,
+                    serde_json::json!({
+                        "injectable": false,
+                        "reasonCode": "ax_action_unresolved",
+                        "reason": "该会话有未确认的发送动作，请先到 Mac 上核对",
+                        "route": "desktop_ax",
+                    }),
+                );
+            }
+            let mut body = serde_json::json!({
+                "injectable": true,
+                "channels": ["desktop_ax"],
+                "visibility": "after_refresh",
+                // 手机端据此刻意区分通道；未知字段对旧客户端无影响。
+                "route": "desktop_ax",
+            });
+            if cfg!(target_os = "macos")
+                && super::gate::extract_device(&headers).is_some()
+                && codex_staging_directory(&session.project_path)
+            {
+                body["attachmentUploadOnly"] = serde_json::json!(true);
+            }
+            return json_no_store(StatusCode::OK, body);
+        }
+
         if let Err(code) = st.codex_control.send_gate_static() {
             let (_, reason) = super::codex_ipc::static_gate_refusal(code);
-            return json_no_store(
-                StatusCode::OK,
-                serde_json::json!({
-                    "injectable": false,
-                    "reasonCode": code,
-                    "reason": reason,
-                }),
-            );
+            return send_unavailable(code, reason);
         }
         // S2 实时守卫的**展示面**：未处理原生请求在场 → 发送会被入队门拒绝（保留
         // 草稿）——输入区如实置灰并引导「先处理审批，或打断后发送」。状态不可确认
@@ -3429,14 +3878,7 @@ pub async fn session_send_info(
         if let Some(key) = super::codex_ipc::resolve_session_thread(&st, &session) {
             let (determinable, _busy, pending) = st.codex_control.adapter.send_gate_snapshot(&key);
             if determinable && pending {
-                return json_no_store(
-                    StatusCode::OK,
-                    serde_json::json!({
-                        "injectable": false,
-                        "reasonCode": NATIVE_PENDING_REASON,
-                        "reason": NATIVE_PENDING_REASON_ZH,
-                    }),
-                );
+                return send_unavailable(NATIVE_PENDING_REASON, NATIVE_PENDING_REASON_ZH);
             }
             // C02：不在读取路径删除持久暂停（并发新 token/在途 owner 无法由
             // 时间证明已结束）。这里只做**显示口径**：线程无旧队列可保护时，
@@ -3461,6 +3903,7 @@ pub async fn session_send_info(
             if queue_paused && has_older_queue {
                 let mut body = hub_send_info_body(&session);
                 body["queuePaused"] = serde_json::json!(true);
+                body["route"] = serde_json::json!("desktop_ipc");
                 return json_no_store(StatusCode::OK, body);
             }
         }
@@ -3531,6 +3974,9 @@ pub async fn session_send_info(
             }
         }
     };
+    if hub_route {
+        body["route"] = serde_json::json!("desktop_ipc");
+    }
     // 任务 8 / 评审 Blocker 1：路由提示有两种形态，前端据此决定「是否先挂原生面板」——
     //
     // * **已归原生**（`interactionRoute=opencode_native` + `interactionRouteReason`）：
@@ -3592,6 +4038,15 @@ pub async fn session_send_info(
 /// GET /m/api/v1/session-queue?session_id=（W4 排队视图）：该会话全部待发消息
 /// FIFO（position = 1 起的队位；content 已是入队时 compose 完成的最终注入文本）。
 /// 轻量 SQLite 查询（pending_for_session），无需 spawn_blocking（host handler 同口径）。
+fn is_ambiguous_tool_session(sessions: &[crate::session::Session], sid: &str, agent: &str) -> bool {
+    sessions
+        .iter()
+        .filter(|s| s.id == sid && s.agent_type.tool_id() == agent)
+        .take(2)
+        .count()
+        > 1
+}
+
 pub async fn session_queue(
     State(st): State<Arc<RemoteState>>,
     Query(params): Query<HashMap<String, String>>,
@@ -3603,12 +4058,25 @@ pub async fn session_queue(
     else {
         return bad_request();
     };
+    let agent_filter = params
+        .get("agent_type")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let ambiguous = match agent_filter.as_deref() {
+        Some(agent) => is_ambiguous_tool_session(&(st.session_source)().sessions, &sid, agent),
+        None => false,
+    };
     let items = st
         .store
         .with(|c| crate::database::dao::inject_queue::pending_for_session_conn(c, &sid));
     let views: Vec<serde_json::Value> = items
         .iter()
         .filter(|item| !policy::legacy_retired() || item.agent_type != "opencode")
+        .filter(|item| {
+            agent_filter
+                .as_deref()
+                .is_none_or(|agent| item.agent_type == agent)
+        })
         .enumerate()
         .map(|(i, it)| {
             serde_json::json!({
@@ -3616,6 +4084,8 @@ pub async fn session_queue(
                 "content": it.content,
                 "enqueuedAt": it.enqueued_at,
                 "position": i + 1,
+                "agentType": it.agent_type,
+                "editable": !ambiguous,
             })
         })
         .collect();
@@ -3808,11 +4278,24 @@ pub async fn session_queue_retract(
     let Some(_guard) = crate::inject::queue::try_acquire_inflight(&sid) else {
         return failed_body("RAPI_DELIVERY_BUSY: 投递进行中，请稍后重试".to_string());
     };
+    let agent_filter = req
+        .agent_type
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    if let Some(agent) = agent_filter {
+        if is_ambiguous_tool_session(&(st.session_source)().sessions, &sid, agent) {
+            return json_no_store(
+                StatusCode::CONFLICT,
+                serde_json::json!({ "error": "ambiguous_session" }),
+            );
+        }
+    }
     // 前查：拿条目供审计（agent_type / 已 compose 的 content），同时完成归属校验
     let target = st.store.with(|c| {
         crate::database::dao::inject_queue::pending_for_session_conn(c, &sid)
             .into_iter()
-            .find(|i| i.id == item_id)
+            .find(|i| i.id == item_id && agent_filter.is_none_or(|agent| i.agent_type == agent))
     });
     let Some(item) = target else {
         return json_no_store(
@@ -3820,6 +4303,14 @@ pub async fn session_queue_retract(
             serde_json::json!({ "error": "not_found" }),
         );
     };
+    if agent_filter.is_none()
+        && is_ambiguous_tool_session(&(st.session_source)().sessions, &sid, &item.agent_type)
+    {
+        return json_no_store(
+            StatusCode::CONFLICT,
+            serde_json::json!({ "error": "ambiguous_session" }),
+        );
+    }
     // macOS 的历史 OpenCode 待发项不能被旧普通撤回直接删掉：
     // 它可能已写出，显式本地处置必须走单独的核对流程。
     if policy::legacy_retired() && item.agent_type == "opencode" {
@@ -3943,21 +4434,8 @@ pub async fn session_attachment(
     };
     use crate::services::dsh_control::production::UploadAdmission;
     let admission = UploadAdmission::capture(params.get("instanceId").map(String::as_str));
-    // ② 容量上限（H07 D1 收口）：限长读取——超过 MAX_ATTACHMENT_BYTES 的请求体在
-    // **读取过程**中即被拒绝（内存占用有界），响应契约 JSON 错误体；恰好等于上限
-    // 的边界（to_bytes 允许 ≤limit）与超限（>limit 才 Err）同旧 `body.len() > MAX`
-    // 口径逐字节一致。参数校验（①）仍先行，错误优先级不变。
-    let body =
-        match axum::body::to_bytes(body, crate::remote::attachments::MAX_ATTACHMENT_BYTES).await {
-            Ok(body) => body,
-            Err(_) => {
-                return json_no_store(
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    serde_json::json!({ "error": "too_large" }),
-                );
-            }
-        };
-    // 原生路径先恢复已选目标，不能因看板下卡或同 ID 新卡改变目录。
+    // ② 路由与平台边界**先于任何请求体缓冲**（Task 5）：非 macOS 的暂存路由、
+    // 非法路由、绑定头错配在读取前即拒绝，不消耗缓冲、不触暂存文件。
     let requested_route = params
         .get("interaction_route")
         .map(String::as_str)
@@ -3966,13 +4444,38 @@ pub async fn session_attachment(
         .get("x-opencode-expected-binding")
         .and_then(|value| value.to_str().ok())
         .filter(|value| !value.is_empty());
-    if !matches!(requested_route, "legacy" | "opencode_native")
-        || (requested_route == "legacy" && binding.is_some())
+    let codex_staging = requested_route == CODEX_DESKTOP_STAGING;
+    if !matches!(
+        requested_route,
+        "legacy" | "opencode_native" | CODEX_DESKTOP_STAGING
+    ) || (codex_staging && (!cfg!(target_os = "macos") || params.contains_key("instanceId")))
+        || (requested_route != "opencode_native" && binding.is_some())
         || (requested_route == "opencode_native"
             && (binding.is_none() || params.contains_key("instanceId")))
     {
         return bad_request();
     }
+    // ③ 容量上限（H07 D1 收口）：限长读取——超过上限的请求体在**读取过程**中即
+    // 被拒绝（内存占用有界）。Codex 暂存按 PNG 专用上限（5MB）读取，不先按通用
+    // 20MB 缓冲再事后判；其余工具沿用原 20MB 契约。恰好等于上限的边界
+    //（to_bytes 允许 ≤limit）与超限（>limit 才 Err）同旧 `body.len() > MAX` 口径。
+    #[cfg(target_os = "macos")]
+    let body_limit = if codex_staging {
+        crate::remote::attachments::CODEX_STAGING_MAX_IMAGE_BYTES as usize
+    } else {
+        crate::remote::attachments::MAX_ATTACHMENT_BYTES
+    };
+    #[cfg(not(target_os = "macos"))]
+    let body_limit = crate::remote::attachments::MAX_ATTACHMENT_BYTES;
+    let body = match axum::body::to_bytes(body, body_limit).await {
+        Ok(body) => body,
+        Err(_) => {
+            return json_no_store(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                serde_json::json!({ "error": "too_large" }),
+            );
+        }
+    };
     let (session, fixed_target) = if requested_route == "opencode_native" {
         let restored = match st.opencode_native.restore_active_target(&sid) {
             Ok(restored) => restored,
@@ -4013,7 +4516,17 @@ pub async fn session_attachment(
         let probe_sid = sid.clone();
         let probe_instance = params.get("instanceId").cloned();
         let session = match tokio::task::spawn_blocking(move || {
-            find_request_session(&probe_st, &probe_sid, probe_instance.as_deref())
+            if codex_staging {
+                unique_file_session((probe_st.fresh_session_source)().sessions, &probe_sid, None)
+            } else {
+                request_session_candidates(
+                    (probe_st.fresh_session_source)().sessions,
+                    &probe_sid,
+                    probe_instance.as_deref(),
+                    false,
+                    true,
+                )
+            }
         })
         .await
         {
@@ -4022,6 +4535,12 @@ pub async fn session_attachment(
                 return json_no_store(
                     StatusCode::NOT_FOUND,
                     serde_json::json!({ "error": "no_session" }),
+                );
+            }
+            Ok(Err(())) if codex_staging => {
+                return json_no_store(
+                    StatusCode::FORBIDDEN,
+                    serde_json::json!({ "error": "ambiguous_session" }),
                 );
             }
             Ok(_) => {
@@ -4040,6 +4559,23 @@ pub async fn session_attachment(
         };
         (session, None)
     };
+    if cfg!(target_os = "macos") && !codex_staging && codex_app_form(&session) {
+        return json_no_store(
+            StatusCode::CONFLICT,
+            serde_json::json!({ "error": "codex_staging_required" }),
+        );
+    }
+    if codex_staging {
+        if !codex_app_form(&session) {
+            return forbidden_defense();
+        }
+        if !codex_staging_directory(&session.project_path) {
+            return json_no_store(
+                StatusCode::NOT_FOUND,
+                serde_json::json!({ "error": "no_cwd" }),
+            );
+        }
+    }
     if session.agent_type == crate::session::AgentType::Dsh {
         if sid.contains('/')
             || sid.contains('\\')
@@ -4127,10 +4663,14 @@ pub async fn session_attachment(
         }
     }
     // 原生附件必须写入已核验的精确路径，路径结尾的空格是目录名的一部分。
-    let cwd = fixed_target.as_ref().map_or_else(
-        || session.project_path.trim().to_owned(),
-        |target| target.directory.to_string_lossy().into_owned(),
-    );
+    let cwd = if codex_staging {
+        session.project_path.clone()
+    } else {
+        fixed_target.as_ref().map_or_else(
+            || session.project_path.trim().to_owned(),
+            |target| target.directory.to_string_lossy().into_owned(),
+        )
+    };
     if cwd.is_empty() {
         // 与 resume 的 no_cwd 同源口径（该会话没有项目目录信息）
         return json_no_store(
@@ -4146,6 +4686,25 @@ pub async fn session_attachment(
     }
     let tool = session.agent_type.tool_id().to_string();
     // ⑤ 写盘（spawn_blocking：同步 IO）+ 审计
+    #[cfg(target_os = "macos")]
+    if codex_staging {
+        if body.len() as u64 > super::attachments::CODEX_STAGING_MAX_IMAGE_BYTES {
+            return json_no_store(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                serde_json::json!({ "error": "too_large" }),
+            );
+        }
+        let candidate = body.clone();
+        if !tokio::task::spawn_blocking(move || super::attachments::valid_staged_png(&candidate))
+            .await
+            .unwrap_or(false)
+        {
+            return json_no_store(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                serde_json::json!({ "error": "invalid_png" }),
+            );
+        }
+    }
     let write_cwd = std::path::PathBuf::from(&cwd);
     let write_sid = sid.clone();
     let write_name = raw_name.clone();
@@ -4153,7 +4712,7 @@ pub async fn session_attachment(
     let size = write_body.len();
     let write_state = Arc::clone(&st);
     let written = tokio::task::spawn_blocking(
-        move || -> std::io::Result<Option<(std::path::PathBuf, Option<String>)>> {
+        move || -> std::io::Result<Option<StagedOrProjectAttachment>> {
             let _policy_permit = policy_permit;
             let _route_permit = route_permit;
             #[cfg(test)]
@@ -4167,6 +4726,49 @@ pub async fn session_attachment(
             });
             if !valid {
                 return Ok(None);
+            }
+            #[cfg(target_os = "macos")]
+            if codex_staging {
+                let Some(home) = (write_state.home_source)() else {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "staging home unavailable",
+                    ));
+                };
+                let meta = match crate::remote::attachments::write_tuvis_staged_attachment(
+                    std::path::Path::new(&home),
+                    &device_id,
+                    &write_sid,
+                    &write_name,
+                    &write_body,
+                    (write_state.now_source)(),
+                ) {
+                    Ok(meta) => meta,
+                    Err(error) => {
+                        endpoint_audit(
+                            &write_state,
+                            &device_id,
+                            &device_name,
+                            &tool,
+                            &write_sid,
+                            &write_name,
+                            "attachment",
+                            "failed",
+                        );
+                        return Err(std::io::Error::other(error));
+                    }
+                };
+                endpoint_audit(
+                    &write_state,
+                    &device_id,
+                    &device_name,
+                    &tool,
+                    &write_sid,
+                    &write_name,
+                    "attachment",
+                    "ok",
+                );
+                return Ok(Some(StagedOrProjectAttachment::TuvisStaged(meta)));
             }
             let (path, exclude_warning) =
                 match crate::remote::attachments::write_attachment_with_exclude_warning(
@@ -4200,11 +4802,14 @@ pub async fn session_attachment(
                 &path,
                 size,
             );
-            Ok(Some((path, exclude_warning)))
+            Ok(Some(StagedOrProjectAttachment::ProjectFile(
+                path,
+                exclude_warning,
+            )))
         },
     )
     .await;
-    let (path, exclude_warning) = match written {
+    let outcome = match written {
         Ok(Ok(Some(result))) => result,
         Ok(Ok(None)) => return forbidden_defense(),
         Ok(Err(e)) => {
@@ -4222,7 +4827,155 @@ pub async fn session_attachment(
             );
         }
     };
-    attachment_response(&path, size, exclude_warning)
+    match outcome {
+        #[cfg(target_os = "macos")]
+        StagedOrProjectAttachment::TuvisStaged(meta) => json_no_store(
+            StatusCode::OK,
+            serde_json::json!({
+                "attachmentId": meta.attachment_id,
+                "fileName": meta.file_name,
+                "size": size,
+            }),
+        ),
+        StagedOrProjectAttachment::ProjectFile(path, exclude_warning) => {
+            attachment_response(&path, size, exclude_warning)
+        }
+    }
+}
+
+enum StagedOrProjectAttachment {
+    #[cfg(target_os = "macos")]
+    TuvisStaged(crate::remote::attachments::StagedAttachmentMeta),
+    ProjectFile(std::path::PathBuf, Option<String>),
+}
+
+/// GET /m/api/v1/session-attachment/preview?session_id=&attachment_id=
+/// P1-UPLOAD：按 `(device_id, session_id, attachment_id)` 核权读取 Tuvis 自管暂存附件，
+/// 不放宽通用 `/file` 端点，也不向手机暴露任何本机路径。
+#[cfg(target_os = "macos")]
+pub async fn session_attachment_preview(
+    State(st): State<Arc<RemoteState>>,
+    headers: axum::http::HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    let Some(sid) = params
+        .get("session_id")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    else {
+        return json_no_store(
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({ "error": "missing_session_id" }),
+        );
+    };
+    let Some(attachment_id) = params
+        .get("attachment_id")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    else {
+        return json_no_store(
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({ "error": "missing_attachment_id" }),
+        );
+    };
+    if !crate::remote::attachments::is_valid_staged_id(&attachment_id) {
+        return json_no_store(
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({ "error": "invalid_attachment_id" }),
+        );
+    }
+    let Some((device_id, _)) = device_identity(st.as_ref(), &headers) else {
+        return forbidden_defense();
+    };
+    let read_state = st.clone();
+    let read_sid = sid.clone();
+    let read_id = attachment_id.clone();
+    let outcome = tokio::task::spawn_blocking(move || {
+        let valid = read_state.store.with(|conn| {
+            crate::remote::pairing::device_valid(
+                conn,
+                &device_id,
+                chrono::Utc::now().timestamp_millis(),
+            )
+        });
+        if !valid {
+            return Err(StatusCode::FORBIDDEN);
+        }
+        let session = match unique_file_session(
+            (read_state.fresh_session_source)().sessions,
+            &read_sid,
+            None,
+        ) {
+            Ok(Some(s)) => s,
+            Ok(None) => return Err(StatusCode::NOT_FOUND),
+            Err(()) => return Err(StatusCode::CONFLICT),
+        };
+        if !codex_app_form(&session) {
+            return Err(StatusCode::FORBIDDEN);
+        }
+        let Some(home) = (read_state.home_source)() else {
+            return Err(StatusCode::NOT_FOUND);
+        };
+        match crate::remote::attachments::read_tuvis_staged_attachment(
+            std::path::Path::new(&home),
+            &device_id,
+            &read_sid,
+            &read_id,
+        ) {
+            Ok((bytes, mime, _file_name)) => {
+                let still_valid = read_state.store.with(|conn| {
+                    crate::remote::pairing::device_valid(
+                        conn,
+                        &device_id,
+                        chrono::Utc::now().timestamp_millis(),
+                    )
+                });
+                if !still_valid {
+                    Err(StatusCode::FORBIDDEN)
+                } else {
+                    Ok(FileReadOutcome::Found(bytes, mime))
+                }
+            }
+            Err(crate::remote::attachments::StagedPreviewError::InvalidId) => {
+                Err(StatusCode::BAD_REQUEST)
+            }
+            Err(crate::remote::attachments::StagedPreviewError::NotFound) => {
+                Err(StatusCode::NOT_FOUND)
+            }
+            Err(crate::remote::attachments::StagedPreviewError::Forbidden) => {
+                Err(StatusCode::FORBIDDEN)
+            }
+            Err(crate::remote::attachments::StagedPreviewError::TooLarge) => Ok(
+                FileReadOutcome::Rejected(crate::remote::files::FileRejectReason::TooLarge),
+            ),
+            Err(crate::remote::attachments::StagedPreviewError::Io) => {
+                Err(StatusCode::INTERNAL_SERVER_ERROR)
+            }
+        }
+    })
+    .await;
+    match outcome {
+        Ok(Ok(file_outcome)) => {
+            file_read_response(file_outcome).unwrap_or_else(|code| code.into_response())
+        }
+        Ok(Err(StatusCode::BAD_REQUEST)) => json_no_store(
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({ "error": "invalid_attachment_id" }),
+        ),
+        Ok(Err(StatusCode::NOT_FOUND)) => json_no_store(
+            StatusCode::NOT_FOUND,
+            serde_json::json!({ "error": "not_found" }),
+        ),
+        Ok(Err(StatusCode::CONFLICT)) => json_no_store(
+            StatusCode::CONFLICT,
+            serde_json::json!({ "error": "ambiguous_session" }),
+        ),
+        Ok(Err(StatusCode::FORBIDDEN)) => forbidden_defense(),
+        Ok(Err(_)) | Err(_) => json_no_store(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            serde_json::json!({ "error": "internal" }),
+        ),
+    }
 }
 
 fn attachment_response(
@@ -13493,6 +14246,51 @@ mod tests {
             );
             std::fs::remove_dir_all(&as_private).ok();
         }
+    }
+
+    #[test]
+    fn file_read_rejects_unknown_session_candidate_does_not_require_scope() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let session = crate::session::Session {
+            id: "s-approved".into(),
+            agent_type: crate::session::AgentType::Codex,
+            project_name: "approved".into(),
+            project_path: root.join("project").to_string_lossy().into_owned(),
+            title: None,
+            git_branch: None,
+            github_url: None,
+            status: crate::session::SessionStatus::Idle,
+            last_message: None,
+            last_message_role: None,
+            last_message_subagent_report: false,
+            flap_from_subagent_activity: false,
+            last_activity_at: "2026-11-26T00:00:00Z".into(),
+            pid: 1,
+            cpu_usage: 0.0,
+            active_subagent_count: 0,
+            form: crate::session::ProcessForm::App,
+            jump_supported: false,
+            unread: false,
+            unread_turned_green_at_ms: None,
+            dsh_instance_id: None,
+            dsh_subagent: None,
+        };
+        let sessions = vec![session];
+        assert!(matches!(
+            unique_file_session(sessions.clone(), "s-unknown", None),
+            Ok(None)
+        ));
+        assert!(matches!(
+            unique_file_session(sessions.clone(), "s-approved", Some("wrong-instance")),
+            Ok(None)
+        ));
+        let mut duplicate = sessions.clone();
+        duplicate.push(duplicate[0].clone());
+        assert!(matches!(
+            unique_file_session(duplicate, "s-approved", None),
+            Err(())
+        ));
     }
 
     /// 三轮 C：一致性闸只对已绑定会话生效；未绑定（无 hub / 桥不知会话）直接放行。

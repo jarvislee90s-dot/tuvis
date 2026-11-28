@@ -400,3 +400,60 @@ it("only_capability_names_reasons_stay_in_details", () => {
   fireEvent.click(screen.getByTestId("codex-ops-details"));
   expect(open).toHaveBeenCalledTimes(1);
 });
+
+describe("P1-DIAG 操作资格与主行一致性", () => {
+  it("stale_without_reconnecting_hides_blocked_shipped_chips", () => {
+    render(
+      <CodexOperationToolbar
+        stale
+        operations={{
+          policyRevision: 12,
+          operations: {
+            send: {
+              implemented: true,
+              allowed: false,
+              requiresAutoAdapt: false,
+              evidence: "none",
+              support: "identifying",
+              reasonCode: "capability_unverified",
+            },
+            command_approval: {
+              implemented: true,
+              allowed: false,
+              requiresAutoAdapt: false,
+              evidence: "shipped",
+              support: "supported",
+              reasonCode: "operation_target_stale",
+            },
+          },
+        }}
+      />
+    );
+    expect(screen.queryByTestId("codex-ops-chip-command_approval")).toBeNull();
+    expect(screen.queryByTestId("codex-ops-chip-send")).toBeNull();
+    expect(screen.getByTestId("codex-ops-row").textContent).toContain(
+      i18n.t("mobile.codex.ops.noneAvailable")
+    );
+  });
+
+  it("capability_unverified_hides_chip_even_without_stale", () => {
+    render(
+      <CodexOperationToolbar
+        operations={{
+          policyRevision: 13,
+          operations: {
+            send: {
+              implemented: true,
+              allowed: false,
+              requiresAutoAdapt: false,
+              evidence: "shipped",
+              support: "supported",
+              reasonCode: "capability_unverified",
+            },
+          },
+        }}
+      />
+    );
+    expect(screen.queryByTestId("codex-ops-chip-send")).toBeNull();
+  });
+});

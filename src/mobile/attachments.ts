@@ -11,8 +11,10 @@ export type PendingAttachment = {
   name: string;
   isImage: boolean;
   status: "uploading" | "ready" | "failed";
-  /** 上传成功后的服务端落盘绝对路径（ready 才有）。 */
+  /** 上传成功后的服务端落盘绝对路径（ready 才有；Tuvis 自管隔离暂存不下发本机路径）。 */
   path?: string;
+  /** P1-UPLOAD：Tuvis 自管隔离暂存的不透明引用（按设备/会话核权预览，不含本机路径）。 */
+  attachmentId?: string;
   /** 失败原因（服务端错误码或本地化文案；failed 才有）。 */
   error?: string;
   loaded?: number;

@@ -612,6 +612,7 @@ fn question_page() -> multi_agents_manager_lib::remote::content::MessagesPage {
     use multi_agents_manager_lib::remote::content::{MessagesPage, SessionMessage};
     MessagesPage {
         older_before: None,
+        codex_saved_source: None,
         dsh_model_summary: None,
         messages: vec![SessionMessage {
             blocks: Vec::new(),
